@@ -5,10 +5,11 @@ WORKDIR /workspace
 RUN chown gradle:gradle /workspace
 COPY --chown=gradle:gradle build.gradle settings.gradle gradle.properties ./
 USER gradle
-RUN --mount=type=cache,target=/home/gradle/.gradle,uid=1000,gid=1000 \
+ARG GSB_BUILD_SCOPE=local
+RUN --mount=type=cache,id=${GSB_BUILD_SCOPE}-gradle,target=/home/gradle/.gradle,uid=1000,gid=1000,sharing=locked \
     gradle --no-daemon dependencies --configuration runtimeClasspath
 COPY --chown=gradle:gradle src/main ./src/main
-RUN --mount=type=cache,target=/home/gradle/.gradle,uid=1000,gid=1000 \
+RUN --mount=type=cache,id=${GSB_BUILD_SCOPE}-gradle,target=/home/gradle/.gradle,uid=1000,gid=1000,sharing=locked \
     gradle --no-daemon bootJar
 
 FROM eclipse-temurin:21-jre-jammy@sha256:61d6c7b34d36aee3f45d043101259f97f3c6d428dc2a6f75513789983c5e254f

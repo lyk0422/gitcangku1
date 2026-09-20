@@ -2,18 +2,15 @@ services:
   app:
     build:
       context: .
+      args:
+        GSB_BUILD_SCOPE: ${COMPOSE_PROJECT_NAME}
     init: true
-    ports:
-      - "127.0.0.1::8080"
     environment:
       DB_URL: "jdbc:mysql://db:3306/taskdb?sslMode=DISABLED&allowPublicKeyRetrieval=true&connectionTimeZone=Asia/Shanghai&forceConnectionTimeZoneToSession=true&connectTimeout=10000&socketTimeout=30000"
       DB_USER: taskuser
     secrets:
       - source: db_password
         target: spring.datasource.password
-        uid: "10001"
-        gid: "10001"
-        mode: 0400
     depends_on:
       db:
         condition: service_healthy
@@ -73,15 +70,45 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  gateway:
+    image: haproxy:3.0.27-alpine@sha256:30860bc97b3a4b1e48011ce0687d4ba1e4711344af8480c4bec85e3ff8411fee
+    user: "10001:10001"
+    init: true
+    ports:
+      - "127.0.0.1::8080"
+    volumes:
+      - ./docker/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      app:
+        condition: service_started
+    networks:
+      - local
+      - entrance
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 64m
+    cpus: 0.25
+    pids_limit: 64
+    stop_grace_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 networks:
   local:
     internal: true
+  entrance:
 
 volumes:
   database:
 
 secrets:
   db_password:
-    environment: GSB_DB_PASSWORD
+    file: ${GSB_DB_PASSWORD_FILE}
   db_root_password:
     environment: GSB_DB_ROOT_PASSWORD
