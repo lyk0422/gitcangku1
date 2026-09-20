@@ -1,0 +1,33 @@
+spring:
+  application:
+    name: gitcangku1
+  config:
+    import: "optional:configtree:/run/secrets/"
+  datasource:
+    url: ${DB_URL}
+    username: ${DB_USER}
+    hikari:
+      maximum-pool-size: 5
+      minimum-idle: 1
+      connection-timeout: 10000
+      validation-timeout: 3000
+  jackson:
+    time-zone: Asia/Shanghai
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
+
+server:
+  port: 8080
+  shutdown: graceful
+  error:
+    include-message: never
+    include-stacktrace: never
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      show-details: never

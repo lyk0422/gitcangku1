@@ -1,0 +1,87 @@
+services:
+  app:
+    build:
+      context: .
+    init: true
+    ports:
+      - "127.0.0.1::8080"
+    environment:
+      DB_URL: "jdbc:mysql://db:3306/taskdb?sslMode=DISABLED&allowPublicKeyRetrieval=true&connectionTimeZone=Asia/Shanghai&forceConnectionTimeZoneToSession=true&connectTimeout=10000&socketTimeout=30000"
+      DB_USER: taskuser
+    secrets:
+      - source: db_password
+        target: spring.datasource.password
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - local
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 768m
+    cpus: 1.0
+    pids_limit: 256
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  db:
+    image: mysql:8.4.8@sha256:2952e3be7807f06fc18de50b3ea1a632d5c70d63482ff7d7376fe3aa8999babf
+    environment:
+      MYSQL_DATABASE: taskdb
+      MYSQL_USER: taskuser
+      MYSQL_PASSWORD_FILE: /run/secrets/db_password
+      MYSQL_ROOT_PASSWORD_FILE: /run/secrets/db_root_password
+      TZ: Asia/Shanghai
+    command: ["--default-time-zone=+08:00", "--max-connections=50"]
+    secrets:
+      - db_password
+      - db_root_password
+    volumes:
+      - database:/var/lib/mysql
+    networks:
+      - local
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          MYSQL_PWD="$$(cat /run/secrets/db_password)"
+          mysql --protocol=TCP --host=127.0.0.1 --user="$${MYSQL_USER}"
+          --database="$${MYSQL_DATABASE}" --execute="SELECT 1" --silent >/dev/null
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 256
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  local:
+    internal: true
+
+volumes:
+  database:
+
+secrets:
+  db_password:
+    environment: GSB_DB_PASSWORD
+  db_root_password:
+    environment: GSB_DB_ROOT_PASSWORD
