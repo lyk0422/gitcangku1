@@ -1,0 +1,16 @@
+spring:
+  datasource:
+    url: jdbc:h2:mem:consent-test;MODE=MySQL;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+  sql:
+    init:
+      mode: always
+  jackson:
+    time-zone: Asia/Shanghai
+
+server:
+  error:
+    include-message: never
+    include-stacktrace: never

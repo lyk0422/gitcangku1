@@ -6,6 +6,9 @@ spring:
   datasource:
     url: ${DB_URL}
     username: ${DB_USER}
+  sql:
+    init:
+      mode: always
     hikari:
       maximum-pool-size: 5
       minimum-idle: 1
