@@ -13,6 +13,11 @@ spring:
       validation-timeout: 3000
   jackson:
     time-zone: Asia/Shanghai
+  sql:
+    init:
+      mode: always
+      encoding: UTF-8
+      continue-on-error: false
   lifecycle:
     timeout-per-shutdown-phase: 20s
 
