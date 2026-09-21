@@ -1,0 +1,16 @@
+spring:
+  application:
+    name: gitcangku1-test
+  datasource:
+    url: jdbc:h2:mem:consent-test;MODE=MySQL;DB_CLOSE_DELAY=-1
+    username: sa
+    driver-class-name: org.h2.Driver
+  sql:
+    init:
+      mode: always
+      encoding: UTF-8
+  jackson:
+    time-zone: Asia/Shanghai
+
+server:
+  port: 0
