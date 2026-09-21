@@ -1,0 +1,8 @@
+spring:
+  datasource:
+    url: jdbc:h2:mem:incidentdb;MODE=MySQL;DB_CLOSE_DELAY=-1
+    username: sa
+    password: ""
+  sql:
+    init:
+      mode: always
