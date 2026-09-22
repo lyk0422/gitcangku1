@@ -1,12 +1,17 @@
 package com.example.starter.incident;
 
 import com.example.starter.incident.dto.Requests.ActionRequest;
+import com.example.starter.incident.dto.Requests.EscalationAckRequest;
+import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
+import com.example.starter.incident.dto.Responses.EscalationCheckView;
+import com.example.starter.incident.dto.Responses.EscalationHistoryView;
+import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
 import com.example.starter.incident.dto.Responses.IncidentView;
 import com.example.starter.incident.dto.Responses.TransferView;
@@ -50,11 +55,19 @@ public class IncidentController {
     }
 
     /**
-     * 查询事件完整历史（状态流转、处置记录、交接记录）。
+     * 查询事件完整历史（状态流转、处置记录、交接记录、升级记录）。
      */
     @GetMapping("/{incidentKey}/history")
     public HistoryView history(@PathVariable String incidentKey) {
         return service.history(incidentKey);
+    }
+
+    /**
+     * 查询遏制期限、当前升级记录及完整升级历史；只读，不隐式写入。
+     */
+    @GetMapping("/{incidentKey}/escalations")
+    public EscalationHistoryView escalations(@PathVariable String incidentKey) {
+        return service.escalations(incidentKey);
     }
 
     /**
@@ -98,12 +111,31 @@ public class IncidentController {
     }
 
     /**
-     * 状态变更（仅当前指挥人，逐级前进）。
+     * 状态变更（仅当前指挥人，逐级前进）；进入 CONTAINED 时原子取消仍 OPEN 的升级记录。
      */
     @PostMapping("/{incidentKey}/status")
     public IncidentView changeStatus(@PathVariable String incidentKey,
                                      @RequestHeader("X-Actor-Id") String actor,
                                      @RequestBody StatusRequest req) {
         return service.changeStatus(incidentKey, actor, req);
+    }
+
+    /**
+     * 单事件“逾期未遏制”检查：仍为 COMMANDING 且当前时刻 ≥ 期限时追加一条 OPEN 升级记录。
+     */
+    @PostMapping("/{incidentKey}/escalations/check")
+    public EscalationCheckView checkEscalation(@PathVariable String incidentKey,
+                                               @RequestBody EscalationCheckRequest req) {
+        return service.checkEscalation(incidentKey, req);
+    }
+
+    /**
+     * 确认 OPEN 升级记录：仅操作当时的当前指挥人，提交非空处置说明后进入 ACKNOWLEDGED。
+     */
+    @PostMapping("/{incidentKey}/escalations/acknowledge")
+    public EscalationView acknowledgeEscalation(@PathVariable String incidentKey,
+                                                @RequestHeader("X-Actor-Id") String actor,
+                                                @RequestBody EscalationAckRequest req) {
+        return service.acknowledgeEscalation(incidentKey, actor, req);
     }
 }

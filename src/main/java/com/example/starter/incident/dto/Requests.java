@@ -34,4 +34,12 @@ public final class Requests {
     /** 状态变更请求：targetStatus 只允许 CONTAINED / RESOLVED / CLOSED。 */
     public record StatusRequest(String commandKey, String targetStatus) {
     }
+
+    /** 逾期未遏制检查请求：单事件手动检查入口，不做定时扫描。 */
+    public record EscalationCheckRequest(String commandKey) {
+    }
+
+    /** 升级确认请求：仅操作当时的当前指挥人可提交，dispositionNote 不能为空。 */
+    public record EscalationAckRequest(String commandKey, String dispositionNote) {
+    }
 }

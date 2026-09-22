@@ -4,8 +4,10 @@ spring:
   config:
     import: "optional:configtree:/run/secrets/"
   datasource:
-    url: ${DB_URL}
-    username: ${DB_USER}
+    # 本地默认嵌入式 H2（MODE=MySQL），无需外部数据库或 Docker；
+    # 容器/MySQL 部署由 DB_URL、DB_USER 覆盖，初始化脚本由 DB_SCHEMA_LOCATIONS 覆盖为 classpath:schema.sql。
+    url: ${DB_URL:jdbc:h2:mem:incident_local;MODE=MySQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1}
+    username: ${DB_USER:sa}
     hikari:
       maximum-pool-size: 5
       minimum-idle: 1
@@ -14,6 +16,7 @@ spring:
   sql:
     init:
       mode: always
+      schema-locations: ${DB_SCHEMA_LOCATIONS:classpath:schema-h2.sql}
   jackson:
     time-zone: Asia/Shanghai
   lifecycle:

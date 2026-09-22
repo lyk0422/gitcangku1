@@ -1,4 +1,6 @@
--- 测试用 H2（MySQL 兼容模式）schema，与生产 schema.sql 结构一致，去掉 H2 不兼容的 COMMENT 子句。
+-- 本地默认运行使用的 H2（MODE=MySQL）schema，与 MySQL 版 schema.sql 结构一致；
+-- H2 不支持建表内联 COMMENT，字段含义见 schema.sql 的中文注释与实体 Javadoc。
+-- 所有时间字段均为 UTC，精度到微秒。
 
 CREATE TABLE IF NOT EXISTS incidents (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
