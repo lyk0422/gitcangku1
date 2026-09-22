@@ -1,6 +1,7 @@
 spring:
   datasource:
-    url: jdbc:h2:mem:evidence-test;MODE=MySQL;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=10000
+    # 测试独立命名内存库（MySQL 兼容模式），与本地运行库隔离；场景间通过清理保证顺序无关。
+    url: jdbc:h2:mem:evidence_test;MODE=MySQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=10000
     username: sa
     password: ""
     driver-class-name: org.h2.Driver

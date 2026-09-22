@@ -1,5 +1,6 @@
 package com.example.starter.error;
 
+import jakarta.validation.ConstraintViolationException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
@@ -8,6 +9,7 @@ import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.MissingRequestHeaderException;
+import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
@@ -38,7 +40,8 @@ public class GlobalExceptionHandler {
                 .body(new ErrorBody(400, message, LocalDateTime.now()));
     }
 
-    @ExceptionHandler({MissingRequestHeaderException.class, HttpMessageNotReadableException.class})
+    @ExceptionHandler({MissingRequestHeaderException.class, HttpMessageNotReadableException.class,
+            ConstraintViolationException.class, MissingServletRequestParameterException.class})
     public ResponseEntity<ErrorBody> handleBadRequest(Exception ex) {
         return ResponseEntity.badRequest()
                 .body(new ErrorBody(400, "参数非法: " + ex.getMessage(), LocalDateTime.now()));
