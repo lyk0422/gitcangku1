@@ -26,6 +26,16 @@ CREATE TABLE IF NOT EXISTS rail_plan_occupancy (
 CREATE INDEX IF NOT EXISTS idx_rail_plan_occupancy_plan ON rail_plan_occupancy (plan_id);
 CREATE INDEX IF NOT EXISTS idx_rail_plan_occupancy_section ON rail_plan_occupancy (section_id, start_utc, end_utc);
 
+CREATE TABLE IF NOT EXISTS rail_plan_revision (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    predecessor_plan_id BIGINT NOT NULL,
+    successor_plan_id BIGINT NOT NULL,
+    created_at BIGINT NOT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT uk_rail_plan_revision_pred UNIQUE (predecessor_plan_id),
+    CONSTRAINT uk_rail_plan_revision_succ UNIQUE (successor_plan_id)
+);
+
 CREATE TABLE IF NOT EXISTS idempotency_record (
     id BIGINT NOT NULL AUTO_INCREMENT,
     op_type VARCHAR(16) NOT NULL,

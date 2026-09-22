@@ -86,6 +86,24 @@ public class PlanRepository {
     }
 
     /**
+     * 按主键查询计划（不加锁）。
+     */
+    public Optional<DayPlan> findById(long planId) {
+        return jdbc.query("SELECT id, schedule_key, op_date, version, status FROM rail_day_plan"
+                        + " WHERE id = ?",
+                PLAN_MAPPER, planId).stream().findFirst();
+    }
+
+    /**
+     * 按主键查询计划并加行级写锁，须在事务内调用。
+     */
+    public Optional<DayPlan> findByIdForUpdate(long planId) {
+        return jdbc.query("SELECT id, schedule_key, op_date, version, status FROM rail_day_plan"
+                        + " WHERE id = ? FOR UPDATE",
+                PLAN_MAPPER, planId).stream().findFirst();
+    }
+
+    /**
      * 整体替换计划的占用清单：先删后插，保持提交顺序。
      */
     public void replaceOccupancies(long planId, List<Occupancy> occupancies) {

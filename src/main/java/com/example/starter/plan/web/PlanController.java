@@ -5,6 +5,8 @@ import com.example.starter.plan.web.dto.CreatePlanRequest;
 import com.example.starter.plan.web.dto.PlanActionRequest;
 import com.example.starter.plan.web.dto.PlanResponse;
 import com.example.starter.plan.web.dto.PublishedSlotView;
+import com.example.starter.plan.web.dto.RescheduleChainResponse;
+import com.example.starter.plan.web.dto.RescheduleRequest;
 import com.example.starter.plan.web.dto.UpdateOccupanciesRequest;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
@@ -80,6 +82,23 @@ public class PlanController {
     @GetMapping("/plans/{scheduleKey}")
     public PlanResponse getPlan(@PathVariable String scheduleKey) {
         return service.getPlan(scheduleKey);
+    }
+
+    /**
+     * 原子改签：同一事务取消旧已发布计划、发布同运营日新草稿并追加前后继关联。
+     * 返回改签后生效的新计划明细。
+     */
+    @PostMapping("/reschedule")
+    public PlanResponse reschedule(@Valid @RequestBody RescheduleRequest request) {
+        return service.reschedule(request);
+    }
+
+    /**
+     * 改签链查询：返回从最早前驱到最后后继的完整有序计划链。
+     */
+    @GetMapping("/plans/{scheduleKey}/reschedule-chain")
+    public RescheduleChainResponse getRescheduleChain(@PathVariable String scheduleKey) {
+        return service.getRescheduleChain(scheduleKey);
     }
 
     /**
