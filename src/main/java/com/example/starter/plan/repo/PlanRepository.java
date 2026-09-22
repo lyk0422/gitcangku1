@@ -4,11 +4,13 @@ import com.example.starter.plan.model.DayPlan;
 import com.example.starter.plan.model.Occupancy;
 import com.example.starter.plan.model.PlanStatus;
 import com.example.starter.plan.model.PublishedSlot;
+import com.example.starter.plan.model.RescheduleLink;
 import java.sql.Date;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
 import java.time.Instant;
 import java.time.LocalDate;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
@@ -40,6 +42,12 @@ public class PlanRepository {
             rs.getString("section_id"),
             Instant.ofEpochMilli(rs.getLong("start_utc")),
             Instant.ofEpochMilli(rs.getLong("end_utc")));
+
+    private static final RowMapper<RescheduleLink> LINK_MAPPER = (rs, n) -> new RescheduleLink(
+            rs.getLong("id"),
+            rs.getLong("predecessor_plan_id"),
+            rs.getLong("successor_plan_id"),
+            rs.getLong("created_at"));
 
     private final JdbcTemplate jdbc;
 
@@ -74,6 +82,15 @@ public class PlanRepository {
         return jdbc.query("SELECT id, schedule_key, op_date, version, status FROM rail_day_plan"
                         + " WHERE schedule_key = ?",
                 PLAN_MAPPER, scheduleKey).stream().findFirst();
+    }
+
+    /**
+     * 按主键查询计划（不加锁），用于改签链遍历。
+     */
+    public Optional<DayPlan> findById(long planId) {
+        return jdbc.query("SELECT id, schedule_key, op_date, version, status FROM rail_day_plan"
+                        + " WHERE id = ?",
+                PLAN_MAPPER, planId).stream().findFirst();
     }
 
     /**
@@ -137,32 +154,63 @@ public class PlanRepository {
     }
 
     /**
-     * 查询指定运营日、指定区段集合上其他已发布计划的生效时隙（排除给定计划）。
+     * 查询指定运营日、指定区段集合上其他已发布计划的生效时隙（排除给定计划集合）。
      */
     public List<PublishedSlot> findPublishedSlots(LocalDate opDate, Collection<String> sectionIds,
-                                                  long excludePlanId) {
+                                                  Collection<Long> excludePlanIds) {
         if (sectionIds.isEmpty()) {
             return List.of();
         }
-        StringJoiner placeholders = new StringJoiner(", ");
-        sectionIds.forEach(s -> placeholders.add("?"));
-        String sql = "SELECT p.schedule_key, o.train_no, o.section_id, o.start_utc, o.end_utc"
-                + " FROM rail_plan_occupancy o JOIN rail_day_plan p ON p.id = o.plan_id"
-                + " WHERE p.status = 'PUBLISHED' AND p.op_date = ? AND p.id <> ?"
-                + " AND o.section_id IN (" + placeholders + ") ORDER BY o.section_id, o.start_utc";
-        Object[] args = new Object[sectionIds.size() + 2];
-        args[0] = Date.valueOf(opDate);
-        args[1] = excludePlanId;
-        int i = 2;
-        for (String sectionId : sectionIds) {
-            args[i++] = sectionId;
+        StringJoiner sectionPlaceholders = new StringJoiner(", ");
+        sectionIds.forEach(s -> sectionPlaceholders.add("?"));
+        StringBuilder sql = new StringBuilder(
+                "SELECT p.schedule_key, o.train_no, o.section_id, o.start_utc, o.end_utc"
+                        + " FROM rail_plan_occupancy o JOIN rail_day_plan p ON p.id = o.plan_id"
+                        + " WHERE p.status = 'PUBLISHED' AND p.op_date = ?");
+        List<Object> args = new ArrayList<>();
+        args.add(Date.valueOf(opDate));
+        if (!excludePlanIds.isEmpty()) {
+            StringJoiner excludePlaceholders = new StringJoiner(", ");
+            excludePlanIds.forEach(id -> excludePlaceholders.add("?"));
+            sql.append(" AND p.id NOT IN (").append(excludePlaceholders).append(')');
+            args.addAll(excludePlanIds);
         }
-        return jdbc.query(sql, (rs, n) -> new PublishedSlot(
+        sql.append(" AND o.section_id IN (").append(sectionPlaceholders)
+                .append(") ORDER BY o.section_id, o.start_utc");
+        args.addAll(sectionIds);
+        return jdbc.query(sql.toString(), (rs, n) -> new PublishedSlot(
                 rs.getString("schedule_key"),
                 rs.getString("train_no"),
                 rs.getString("section_id"),
                 Instant.ofEpochMilli(rs.getLong("start_utc")),
-                Instant.ofEpochMilli(rs.getLong("end_utc"))), args);
+                Instant.ofEpochMilli(rs.getLong("end_utc"))), args.toArray());
+    }
+
+    /**
+     * 追加改签前后继关联（不可变）；唯一约束冲突时抛出 DuplicateKeyException 由上层裁决。
+     */
+    public void insertRescheduleLink(long predecessorPlanId, long successorPlanId, long nowMillis) {
+        jdbc.update("INSERT INTO rail_plan_reschedule_link"
+                        + " (predecessor_plan_id, successor_plan_id, created_at) VALUES (?, ?, ?)",
+                predecessorPlanId, successorPlanId, nowMillis);
+    }
+
+    /**
+     * 查询以指定计划为直接前驱的改签关联（即该计划的直接后继）。
+     */
+    public Optional<RescheduleLink> findLinkByPredecessor(long predecessorPlanId) {
+        return jdbc.query("SELECT id, predecessor_plan_id, successor_plan_id, created_at"
+                        + " FROM rail_plan_reschedule_link WHERE predecessor_plan_id = ?",
+                LINK_MAPPER, predecessorPlanId).stream().findFirst();
+    }
+
+    /**
+     * 查询以指定计划为直接后继的改签关联（即该计划的直接前驱）。
+     */
+    public Optional<RescheduleLink> findLinkBySuccessor(long successorPlanId) {
+        return jdbc.query("SELECT id, predecessor_plan_id, successor_plan_id, created_at"
+                        + " FROM rail_plan_reschedule_link WHERE successor_plan_id = ?",
+                LINK_MAPPER, successorPlanId).stream().findFirst();
     }
 
     /**

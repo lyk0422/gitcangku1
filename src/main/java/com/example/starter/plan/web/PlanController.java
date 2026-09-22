@@ -5,6 +5,9 @@ import com.example.starter.plan.web.dto.CreatePlanRequest;
 import com.example.starter.plan.web.dto.PlanActionRequest;
 import com.example.starter.plan.web.dto.PlanResponse;
 import com.example.starter.plan.web.dto.PublishedSlotView;
+import com.example.starter.plan.web.dto.RescheduleChainResponse;
+import com.example.starter.plan.web.dto.RescheduleRequest;
+import com.example.starter.plan.web.dto.RescheduleResponse;
 import com.example.starter.plan.web.dto.UpdateOccupanciesRequest;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
@@ -25,7 +28,8 @@ import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * 铁路走廊日计划 API：草稿创建/整体替换、发布/取消、计划明细与已发布时隙查询。
+ * 铁路走廊日计划 API：草稿创建/整体替换、发布/取消、原子改签、
+ * 计划明细、改签链与已发布时隙查询。
  */
 @Validated
 @RestController
@@ -72,6 +76,24 @@ public class PlanController {
     public PlanResponse cancel(@PathVariable String scheduleKey,
                                @Valid @RequestBody PlanActionRequest request) {
         return service.cancel(scheduleKey, request.requestKey());
+    }
+
+    /**
+     * 原子改签：同一事务取消路径中的已发布旧计划并发布同运营日的新草稿，
+     * 追加不可变前后继关联；任一校验失败整体回滚。
+     */
+    @PostMapping("/plans/{scheduleKey}/reschedule")
+    public RescheduleResponse reschedule(@PathVariable String scheduleKey,
+                                         @Valid @RequestBody RescheduleRequest request) {
+        return service.reschedule(scheduleKey, request);
+    }
+
+    /**
+     * 查询包含指定计划在内的完整有序改签链。
+     */
+    @GetMapping("/plans/{scheduleKey}/reschedule-chain")
+    public RescheduleChainResponse getRescheduleChain(@PathVariable String scheduleKey) {
+        return service.getRescheduleChain(scheduleKey);
     }
 
     /**

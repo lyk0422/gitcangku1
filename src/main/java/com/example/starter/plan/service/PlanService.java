@@ -4,6 +4,7 @@ import com.example.starter.plan.model.DayPlan;
 import com.example.starter.plan.model.Occupancy;
 import com.example.starter.plan.model.PlanStatus;
 import com.example.starter.plan.model.PublishedSlot;
+import com.example.starter.plan.model.RescheduleLink;
 import com.example.starter.plan.repo.IdempotencyRepository;
 import com.example.starter.plan.repo.PlanRepository;
 import com.example.starter.plan.web.ApiException;
@@ -12,6 +13,10 @@ import com.example.starter.plan.web.dto.OccupancyRequest;
 import com.example.starter.plan.web.dto.OccupancyView;
 import com.example.starter.plan.web.dto.PlanResponse;
 import com.example.starter.plan.web.dto.PublishedSlotView;
+import com.example.starter.plan.web.dto.RescheduleChainItem;
+import com.example.starter.plan.web.dto.RescheduleChainResponse;
+import com.example.starter.plan.web.dto.RescheduleRequest;
+import com.example.starter.plan.web.dto.RescheduleResponse;
 import com.example.starter.plan.web.dto.UpdateOccupanciesRequest;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.nio.charset.StandardCharsets;
@@ -21,6 +26,7 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -34,10 +40,10 @@ import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 /**
- * 铁路走廊日计划核心业务：草稿创建/整体替换、发布、取消与查询。
+ * 铁路走廊日计划核心业务：草稿创建/整体替换、发布、取消、原子改签与查询。
  *
  * <p>并发与幂等约定：写操作按 (操作类型, requestKey) 幂等，同键同参重放返回首次成功结果，
- * 同键不同参返回 409；发布经全局发布锁串行化，同一计划的更新/发布/取消经行锁按事务提交顺序生效；
+ * 同键不同参返回 409；发布与改签经全局发布锁串行化，同一计划的更新/发布/取消/改签经行锁按事务提交顺序生效；
  * 仅成功结果写入幂等记录，失败（含 422 时隙冲突）不缓存、可修正后重试。
  */
 @Service
@@ -50,6 +56,7 @@ public class PlanService {
     private static final String OP_UPDATE = "UPDATE";
     private static final String OP_PUBLISH = "PUBLISH";
     private static final String OP_CANCEL = "CANCEL";
+    private static final String OP_RESCHEDULE = "RESCHEDULE";
 
     private final PlanRepository planRepo;
     private final IdempotencyRepository idemRepo;
@@ -149,7 +156,7 @@ public class PlanService {
                 List<Occupancy> occupancies = planRepo.findOccupancies(plan.id());
                 List<Map<String, Object>> conflicts = new ArrayList<>();
                 conflicts.addAll(findTrainOverlaps(scheduleKey, occupancies));
-                conflicts.addAll(findSectionConflicts(plan, occupancies));
+                conflicts.addAll(findSectionConflicts(plan, occupancies, List.of(plan.id())));
                 if (!conflicts.isEmpty()) {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "存在时隙冲突，计划保持草稿", conflicts);
@@ -194,6 +201,119 @@ public class PlanService {
     }
 
     /**
+     * 原子改签：全局发布锁内校验新草稿（列车内部重叠与跨计划区段冲突，仅排除旧计划占用），
+     * 通过后同一事务取消旧计划、发布新计划并追加不可变前后继关联。
+     * 任一步失败整体回滚：旧计划仍发布、新计划仍草稿，版本、占用与关联均不改变。
+     */
+    public RescheduleResponse reschedule(String oldScheduleKey, RescheduleRequest req) {
+        if (oldScheduleKey.equals(req.newScheduleKey())) {
+            throw badRequest("新旧计划必须不同: " + oldScheduleKey);
+        }
+        String hash = hashReschedule(oldScheduleKey, req);
+        Optional<RescheduleResponse> replay =
+                replayIfPresent(OP_RESCHEDULE, req.requestKey(), hash, RescheduleResponse.class);
+        if (replay.isPresent()) {
+            return replay.get();
+        }
+        try {
+            return tx.execute(status -> {
+                planRepo.acquirePublishLock();
+                DayPlan oldPlan = planRepo.findByKeyForUpdate(oldScheduleKey)
+                        .orElseThrow(() -> notFound(oldScheduleKey));
+                DayPlan newPlan = planRepo.findByKeyForUpdate(req.newScheduleKey())
+                        .orElseThrow(() -> notFound(req.newScheduleKey()));
+                if (oldPlan.status() != PlanStatus.PUBLISHED) {
+                    throw conflict("PLAN_STATE_CONFLICT",
+                            "仅已发布计划可改签，旧计划当前状态: " + oldPlan.status());
+                }
+                if (newPlan.status() != PlanStatus.DRAFT) {
+                    throw conflict("PLAN_STATE_CONFLICT",
+                            "改签新计划必须为草稿，当前状态: " + newPlan.status());
+                }
+                if (req.expectedOldVersion() != oldPlan.version()) {
+                    throw conflict("VERSION_CONFLICT",
+                            "expectedOldVersion=" + req.expectedOldVersion()
+                                    + " 与旧计划当前版本 " + oldPlan.version() + " 不一致");
+                }
+                if (req.expectedNewVersion() != newPlan.version()) {
+                    throw conflict("VERSION_CONFLICT",
+                            "expectedNewVersion=" + req.expectedNewVersion()
+                                    + " 与新计划当前版本 " + newPlan.version() + " 不一致");
+                }
+                if (!oldPlan.opDate().equals(newPlan.opDate())) {
+                    throw conflict("OP_DATE_MISMATCH",
+                            "新旧计划运营日必须相同: 旧=" + oldPlan.opDate() + " 新=" + newPlan.opDate());
+                }
+                if (planRepo.findLinkByPredecessor(oldPlan.id()).isPresent()) {
+                    throw conflict("LINK_CONFLICT", "旧计划已存在直接后继: " + oldScheduleKey);
+                }
+                if (planRepo.findLinkBySuccessor(newPlan.id()).isPresent()) {
+                    throw conflict("LINK_CONFLICT", "新计划已存在直接前驱: " + req.newScheduleKey());
+                }
+                List<Occupancy> occupancies = planRepo.findOccupancies(newPlan.id());
+                List<Map<String, Object>> conflicts = new ArrayList<>();
+                conflicts.addAll(findTrainOverlaps(req.newScheduleKey(), occupancies));
+                // 仅排除旧计划与自身占用，第三方已发布计划照常参与冲突裁决
+                conflicts.addAll(findSectionConflicts(newPlan, occupancies,
+                        List.of(newPlan.id(), oldPlan.id())));
+                if (!conflicts.isEmpty()) {
+                    throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
+                            "新草稿存在时隙冲突，改签未生效", conflicts);
+                }
+                long now = System.currentTimeMillis();
+                planRepo.updateStatus(oldPlan.id(), PlanStatus.CANCELLED, now);
+                planRepo.updateStatus(newPlan.id(), PlanStatus.PUBLISHED, now);
+                planRepo.insertRescheduleLink(oldPlan.id(), newPlan.id(), now);
+                RescheduleResponse response = new RescheduleResponse(
+                        loadPlan(oldScheduleKey), loadPlan(req.newScheduleKey()));
+                idemRepo.insert(OP_RESCHEDULE, req.requestKey(), hash, toJson(response), now);
+                return response;
+            });
+        } catch (DuplicateKeyException e) {
+            return replayIfPresent(OP_RESCHEDULE, req.requestKey(), hash, RescheduleResponse.class)
+                    .orElseThrow(() -> conflict("LINK_CONFLICT", "改签前后继关联冲突"));
+        }
+    }
+
+    /**
+     * 查询包含指定计划在内的完整有序改签链（从最前驱到最后继）；
+     * 无改签历史的计划链中仅含自身。计划不存在返回 404。
+     */
+    public RescheduleChainResponse getRescheduleChain(String scheduleKey) {
+        DayPlan plan = planRepo.findByKey(scheduleKey)
+                .orElseThrow(() -> notFound(scheduleKey));
+        List<DayPlan> predecessors = new ArrayList<>();
+        DayPlan cursor = plan;
+        while (true) {
+            Optional<RescheduleLink> link = planRepo.findLinkBySuccessor(cursor.id());
+            if (link.isEmpty()) {
+                break;
+            }
+            cursor = planRepo.findById(link.get().predecessorPlanId())
+                    .orElseThrow(() -> new IllegalStateException("改签链前驱缺失: " + link.get()));
+            predecessors.add(cursor);
+        }
+        Collections.reverse(predecessors);
+        List<DayPlan> chain = new ArrayList<>(predecessors);
+        chain.add(plan);
+        cursor = plan;
+        while (true) {
+            Optional<RescheduleLink> link = planRepo.findLinkByPredecessor(cursor.id());
+            if (link.isEmpty()) {
+                break;
+            }
+            cursor = planRepo.findById(link.get().successorPlanId())
+                    .orElseThrow(() -> new IllegalStateException("改签链后继缺失: " + link.get()));
+            chain.add(cursor);
+        }
+        List<RescheduleChainItem> items = chain.stream()
+                .map(p -> new RescheduleChainItem(p.scheduleKey(), p.opDate(), p.version(),
+                        p.status().name()))
+                .toList();
+        return new RescheduleChainResponse(scheduleKey, items);
+    }
+
+    /**
      * 按计划业务键查询明细（含历史占用），不存在返回 404。
      */
     public PlanResponse getPlan(String scheduleKey) {
@@ -207,7 +327,7 @@ public class PlanService {
      * 查询指定运营日与区段上当前已发布的生效时隙。
      */
     public List<PublishedSlotView> getPublishedSlots(LocalDate opDate, String sectionId) {
-        return planRepo.findPublishedSlots(opDate, List.of(sectionId), -1L).stream()
+        return planRepo.findPublishedSlots(opDate, List.of(sectionId), List.of(-1L)).stream()
                 .map(s -> new PublishedSlotView(s.scheduleKey(), s.trainNo(), s.sectionId(),
                         s.startUtc(), s.endUtc()))
                 .toList();
@@ -297,13 +417,17 @@ public class PlanService {
 
     /**
      * 与其他已发布计划在同日期、同区段上的重叠检测（左闭右开，相邻合法）。
+     *
+     * @param excludePlanIds 检测时排除的计划 id（发布为自身；改签为新旧两个计划）
      */
-    private List<Map<String, Object>> findSectionConflicts(DayPlan plan, List<Occupancy> occupancies) {
+    private List<Map<String, Object>> findSectionConflicts(DayPlan plan, List<Occupancy> occupancies,
+                                                           List<Long> excludePlanIds) {
         List<String> sectionIds = occupancies.stream()
                 .map(Occupancy::sectionId)
                 .collect(java.util.stream.Collectors.toCollection(TreeSet::new))
                 .stream().toList();
-        List<PublishedSlot> published = planRepo.findPublishedSlots(plan.opDate(), sectionIds, plan.id());
+        List<PublishedSlot> published = planRepo.findPublishedSlots(plan.opDate(), sectionIds,
+                excludePlanIds);
         List<Map<String, Object>> conflicts = new ArrayList<>();
         for (Occupancy o : occupancies) {
             for (PublishedSlot slot : published) {
@@ -332,12 +456,20 @@ public class PlanService {
      * 幂等重放：存在记录且参数一致返回首次结果；参数不一致抛 409。
      */
     private Optional<PlanResponse> replayIfPresent(String opType, String requestKey, String hash) {
+        return replayIfPresent(opType, requestKey, hash, PlanResponse.class);
+    }
+
+    /**
+     * 幂等重放（泛型）：存在记录且参数一致返回首次结果；参数不一致抛 409。
+     */
+    private <T> Optional<T> replayIfPresent(String opType, String requestKey, String hash,
+                                            Class<T> type) {
         return idemRepo.find(opType, requestKey).map(record -> {
             if (!record.requestHash().equals(hash)) {
                 throw conflict("IDEMPOTENT_KEY_REUSED",
                         "requestKey 已用于其他参数: " + requestKey);
             }
-            return fromJson(record.responseJson());
+            return fromJson(record.responseJson(), type);
         });
     }
 
@@ -367,6 +499,11 @@ public class PlanService {
         return sha256(opType + '\n' + scheduleKey);
     }
 
+    private String hashReschedule(String oldScheduleKey, RescheduleRequest req) {
+        return sha256(OP_RESCHEDULE + '\n' + oldScheduleKey + '\n' + req.newScheduleKey()
+                + '\n' + req.expectedOldVersion() + '\n' + req.expectedNewVersion());
+    }
+
     private void appendOccupancies(StringBuilder sb, List<OccupancyRequest> occupancies) {
         for (OccupancyRequest o : occupancies) {
             sb.append('\n').append(o.trainNo()).append('|').append(o.sectionId()).append('|')
@@ -389,7 +526,7 @@ public class PlanService {
         }
     }
 
-    private String toJson(PlanResponse response) {
+    private String toJson(Object response) {
         try {
             return objectMapper.writeValueAsString(response);
         } catch (Exception e) {
@@ -397,9 +534,9 @@ public class PlanService {
         }
     }
 
-    private PlanResponse fromJson(String json) {
+    private <T> T fromJson(String json, Class<T> type) {
         try {
-            return objectMapper.readValue(json, PlanResponse.class);
+            return objectMapper.readValue(json, type);
         } catch (Exception e) {
             throw new IllegalStateException("幂等响应反序列化失败", e);
         }
