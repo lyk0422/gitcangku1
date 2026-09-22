@@ -10,7 +10,6 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
-
 /**
  * 赛事计时处罚与成绩封榜 HTTP 接口。
  */
@@ -63,6 +62,23 @@ public class RaceController {
         return toResponse(raceService.revokePenalty(raceId, penaltyId, request));
     }
 
+    /** 一次性配置赛事检查点。 */
+    @PostMapping("/{raceId}/checkpoints")
+    public ResponseEntity<Object> configureCheckpoints(
+            @PathVariable String raceId,
+            @Valid @RequestBody ConfigureCheckpointsRequest request) {
+        return toResponse(raceService.configureCheckpoints(raceId, request));
+    }
+
+    /** 为选手提交检查点通过记录。 */
+    @PostMapping("/{raceId}/runners/{bib}/timings")
+    public ResponseEntity<Object> submitTiming(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody SubmitTimingRequest request) {
+        return toResponse(raceService.submitTiming(raceId, bib, request));
+    }
+
     /** 封榜。 */
     @PostMapping("/{raceId}/seal")
     public ResponseEntity<Object> sealRace(
@@ -81,6 +97,20 @@ public class RaceController {
     @GetMapping("/{raceId}/snapshot")
     public StandingResponse getSnapshot(@PathVariable String raceId) {
         return raceService.getSnapshot(raceId);
+    }
+
+    /** 查询单个选手的分段明细（按检查点顺序）。 */
+    @GetMapping("/{raceId}/runners/{bib}/timings")
+    public RunnerTimingResponse getRunnerTimings(
+            @PathVariable String raceId,
+            @PathVariable String bib) {
+        return raceService.getRunnerTimings(raceId, bib);
+    }
+
+    /** 查询赛事缺失检查点汇总。 */
+    @GetMapping("/{raceId}/missing-checkpoints")
+    public MissingCheckpointsResponse getMissingCheckpoints(@PathVariable String raceId) {
+        return raceService.getMissingCheckpoints(raceId);
     }
 
     private ResponseEntity<Object> toResponse(ServiceResult result) {
