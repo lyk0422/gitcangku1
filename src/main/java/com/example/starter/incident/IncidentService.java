@@ -1,15 +1,11 @@
 package com.example.starter.incident;
 
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
-import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
-import java.util.function.Supplier;
+import java.util.stream.Collectors;
 
 import com.example.starter.incident.dto.Requests.ActionRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
@@ -26,8 +22,6 @@ import com.example.starter.incident.dto.Responses.HistoryView;
 import com.example.starter.incident.dto.Responses.IncidentView;
 import com.example.starter.incident.dto.Responses.StatusChangeView;
 import com.example.starter.incident.dto.Responses.TransferView;
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -43,24 +37,22 @@ import org.springframework.transaction.annotation.Transactional;
 @Service
 public class IncidentService {
 
-    private static final String SEP = "\\u001F";
-
     /** 各严重等级的遏制时限（分钟），等级沿用上报值且不可修改。 */
     private static final Map<String, Long> CONTAINMENT_MINUTES = Map.of(
             "S1", 5L, "S2", 15L, "S3", 60L, "S4", 240L);
 
     private final IncidentRepository incidents;
     private final EscalationRepository escalations;
-    private final CommandKeyRepository commandKeys;
-    private final ObjectMapper objectMapper;
+    private final TaskRepository tasks;
+    private final IdempotentExecutor idempotent;
     private final Clock clock;
 
     public IncidentService(IncidentRepository incidents, EscalationRepository escalations,
-                           CommandKeyRepository commandKeys, ObjectMapper objectMapper, Clock clock) {
+                           TaskRepository tasks, IdempotentExecutor idempotent, Clock clock) {
         this.incidents = incidents;
         this.escalations = escalations;
-        this.commandKeys = commandKeys;
-        this.objectMapper = objectMapper;
+        this.tasks = tasks;
+        this.idempotent = idempotent;
         this.clock = clock;
     }
 
@@ -104,7 +96,7 @@ public class IncidentService {
     public IncidentView takeover(String incidentKey, String actor, TakeoverRequest req) {
         String commandKey = requireText(req.commandKey(), "commandKey");
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "takeover", hash(incidentKey, actor), IncidentView.class,
+        return idempotent.run(commandKey, "takeover", IdempotentExecutor.hash(incidentKey, actor), IncidentView.class,
                 () -> {
                     if (incident.status() != IncidentStatus.REPORTED) {
                         throw ApiException.illegalTransition(
@@ -129,7 +121,7 @@ public class IncidentService {
         String commandKey = requireText(req.commandKey(), "commandKey");
         String toCommander = requireText(req.toCommander(), "toCommander");
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "transfer_initiate", hash(incidentKey, actor, toCommander),
+        return idempotent.run(commandKey, "transfer_initiate", IdempotentExecutor.hash(incidentKey, actor, toCommander),
                 TransferView.class, () -> {
                     requireCommander(incident, actor);
                     if (incident.status() == IncidentStatus.RESOLVED
@@ -161,7 +153,7 @@ public class IncidentService {
     public IncidentView acceptTransfer(String incidentKey, String actor, TransferAcceptRequest req) {
         String commandKey = requireText(req.commandKey(), "commandKey");
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "transfer_accept", hash(incidentKey, actor), IncidentView.class,
+        return idempotent.run(commandKey, "transfer_accept", IdempotentExecutor.hash(incidentKey, actor), IncidentView.class,
                 () -> {
                     if (incident.status() == IncidentStatus.RESOLVED
                             || incident.status() == IncidentStatus.CLOSED) {
@@ -195,8 +187,8 @@ public class IncidentService {
         }
         Instant occurredAt = req.occurredAt().truncatedTo(ChronoUnit.MICROS);
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "action",
-                hash(incidentKey, actor, actionKey, actionType, note, occurredAt.toString()),
+        return idempotent.run(commandKey, "action",
+                IdempotentExecutor.hash(incidentKey, actor, actionKey, actionType, note, occurredAt.toString()),
                 ActionView.class, () -> {
                     requireCommander(incident, actor);
                     if (incident.status() == IncidentStatus.CLOSED) {
@@ -232,13 +224,23 @@ public class IncidentService {
             throw ApiException.badRequest("未知目标状态: " + target);
         }
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "status", hash(incidentKey, actor, target),
+        return idempotent.run(commandKey, "status", IdempotentExecutor.hash(incidentKey, actor, target),
                 IncidentView.class, () -> {
                     requireCommander(incident, actor);
                     IncidentStatus next = incident.status().next();
                     if (next == null || next != targetStatus) {
                         throw ApiException.illegalTransition(
                                 "不允许从 " + incident.status() + " 流转到 " + targetStatus);
+                    }
+                    if (targetStatus == IncidentStatus.RESOLVED) {
+                        List<Task> openTasks = tasks.listOpenTasksByIncident(incident.id());
+                        if (!openTasks.isEmpty()) {
+                            List<Map<String, String>> unfinished = openTasks.stream()
+                                    .map(t -> Map.of("groupCode", t.groupCode(), "taskKey", t.taskKey()))
+                                    .collect(Collectors.toList());
+                            throw ApiException.conflict(
+                                    "仍有处置任务未完成，事件不能进入 RESOLVED", unfinished);
+                        }
                     }
                     Instant now = now();
                     incidents.updateState(incident.id(), targetStatus, incident.commander(), now);
@@ -262,7 +264,7 @@ public class IncidentService {
     public EscalationHistoryView checkEscalation(String incidentKey, EscalationCheckRequest req) {
         String commandKey = requireText(req.commandKey(), "commandKey");
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "escalation_check", hash(incidentKey),
+        return idempotent.run(commandKey, "escalation_check", IdempotentExecutor.hash(incidentKey),
                 EscalationHistoryView.class, () -> {
                     var existing = escalations.findByIncident(incident.id());
                     if (existing.isPresent()) {
@@ -292,7 +294,7 @@ public class IncidentService {
         String commandKey = requireText(req.commandKey(), "commandKey");
         String note = requireText(req.note(), "note");
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "escalation_ack", hash(incidentKey, actor, note),
+        return idempotent.run(commandKey, "escalation_ack", IdempotentExecutor.hash(incidentKey, actor, note),
                 EscalationView.class, () -> {
                     requireCommander(incident, actor);
                     Escalation escalation = escalations.findByIncident(incident.id())
@@ -363,71 +365,18 @@ public class IncidentService {
                 .orElseThrow(() -> ApiException.notFound("事件不存在: " + incidentKey));
     }
 
-    private static void requireCommander(Incident incident, String actor) {
+    static void requireCommander(Incident incident, String actor) {
         if (incident.commander() == null || !incident.commander().equals(actor)) {
             throw ApiException.conflict("只有当前指挥人 "
                     + (incident.commander() == null ? "(无)" : incident.commander()) + " 能执行该操作");
         }
     }
 
-    private static String requireText(String value, String field) {
+    static String requireText(String value, String field) {
         if (value == null || value.isBlank()) {
             throw ApiException.badRequest(field + " 不能为空");
         }
         return value.strip();
-    }
-
-    /**
-     * 幂等执行：同键同参重放首次响应，同键改参 409；并发同键由唯一约束串行化。
-     */
-    private <T> T runIdempotent(String commandKey, String operation, String requestHash,
-                                Class<T> type, Supplier<T> business) {
-        var existing = commandKeys.find(commandKey);
-        if (existing.isPresent()) {
-            return replay(existing.get(), operation, requestHash, type);
-        }
-        try {
-            commandKeys.insertPlaceholder(commandKey, operation, requestHash, now());
-        } catch (DuplicateKeyException e) {
-            var committed = commandKeys.findForUpdate(commandKey)
-                    .orElseThrow(() -> ApiException.conflict("commandKey 处理冲突: " + commandKey));
-            return replay(committed, operation, requestHash, type);
-        }
-        T result = business.get();
-        commandKeys.fillResponse(commandKey, 200, toJson(result));
-        return result;
-    }
-
-    private <T> T replay(CommandKeyRecord record, String operation, String requestHash, Class<T> type) {
-        if (!record.operation().equals(operation) || !record.requestHash().equals(requestHash)) {
-            throw ApiException.conflict("commandKey 已被不同参数的请求使用: " + record.commandKey());
-        }
-        if (record.responseBody() == null) {
-            throw ApiException.conflict("commandKey 正在处理中: " + record.commandKey());
-        }
-        try {
-            return objectMapper.readValue(record.responseBody(), type);
-        } catch (JsonProcessingException e) {
-            throw new IllegalStateException("幂等响应反序列化失败", e);
-        }
-    }
-
-    private String toJson(Object value) {
-        try {
-            return objectMapper.writeValueAsString(value);
-        } catch (JsonProcessingException e) {
-            throw new IllegalStateException("响应序列化失败", e);
-        }
-    }
-
-    private static String hash(String... parts) {
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] out = digest.digest(String.join(SEP, parts).getBytes(StandardCharsets.UTF_8));
-            return HexFormat.of().formatHex(out);
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException(e);
-        }
     }
 
     private IncidentView toView(Incident incident, String pendingTransferTo) {

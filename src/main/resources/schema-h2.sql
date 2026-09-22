@@ -71,3 +71,34 @@ CREATE TABLE IF NOT EXISTS incident_escalations (
     updated_at TIMESTAMP(6) NOT NULL,
     CONSTRAINT uk_escalation_incident UNIQUE (incident_id)
 );
+
+-- 分组处置任务：每事件至多 20 个，task_key 事件内唯一；状态 OPEN/DONE/CANCELLED，仅允许 OPEN→DONE 或 OPEN→CANCELLED。
+CREATE TABLE IF NOT EXISTS incident_tasks (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    task_key VARCHAR(128) NOT NULL,
+    group_code VARCHAR(128) NOT NULL,
+    title VARCHAR(512) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    created_by VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    completed_at TIMESTAMP(6) NULL,
+    cancelled_at TIMESTAMP(6) NULL,
+    CONSTRAINT uk_task_key UNIQUE (incident_id, task_key)
+);
+
+-- 任务的跨事件阻塞边：当前事件任务 → 被阻塞目标事件；一个任务 0～5 条。
+CREATE TABLE IF NOT EXISTS incident_task_blocks (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    task_id BIGINT NOT NULL,
+    blocked_incident_id BIGINT NOT NULL,
+    blocked_incident_key VARCHAR(128) NOT NULL,
+    CONSTRAINT uk_task_block UNIQUE (task_id, blocked_incident_id)
+);
+
+-- 跨事件依赖图全局写锁：固定单行，创建任务事务先 SELECT ... FOR UPDATE 锁定该行，串行化环检测与边写入。
+CREATE TABLE IF NOT EXISTS task_graph_lock (
+    id BIGINT PRIMARY KEY
+);
+MERGE INTO task_graph_lock (id) KEY(id) VALUES (1);

@@ -71,3 +71,32 @@ CREATE TABLE IF NOT EXISTS incident_escalations (
     updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间',
     CONSTRAINT uk_escalation_incident UNIQUE (incident_id)
 ) COMMENT='遏制逾期升级记录表';
+
+CREATE TABLE IF NOT EXISTS incident_tasks (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    incident_id BIGINT NOT NULL COMMENT '所属事件 id，关联 incidents.id',
+    task_key VARCHAR(128) NOT NULL COMMENT '处置任务业务键，事件内唯一；每事件至多 20 个任务',
+    group_code VARCHAR(128) NOT NULL COMMENT '任务分组编码，非空；解决门禁按 group_code、task_key 返回未完成项',
+    title VARCHAR(512) NOT NULL COMMENT '任务标题，非空',
+    status VARCHAR(16) NOT NULL COMMENT '状态：OPEN 待办 / DONE 已完成 / CANCELLED 已取消；DONE 与 CANCELLED 均为终态，不允许回退',
+    created_by VARCHAR(128) NOT NULL COMMENT '创建人（创建时的当前指挥人）',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
+    updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间',
+    completed_at TIMESTAMP(6) NULL COMMENT '完成 UTC 时间；仅 DONE 有值，否则为空',
+    cancelled_at TIMESTAMP(6) NULL COMMENT '取消 UTC 时间；仅 CANCELLED 有值，否则为空',
+    CONSTRAINT uk_task_key UNIQUE (incident_id, task_key)
+) COMMENT='分组处置任务表';
+
+CREATE TABLE IF NOT EXISTS incident_task_blocks (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    task_id BIGINT NOT NULL COMMENT '发起依赖的任务 id，关联 incident_tasks.id',
+    blocked_incident_id BIGINT NOT NULL COMMENT '被阻塞目标事件 id，关联 incidents.id；目标必须存在且不能是任务所属事件自身',
+    blocked_incident_key VARCHAR(128) NOT NULL COMMENT '被阻塞目标事件业务键，冗余落库便于查询；阻塞解除状态查询时按目标事件当前状态计算',
+    CONSTRAINT uk_task_block UNIQUE (task_id, blocked_incident_id)
+) COMMENT='任务跨事件阻塞边表（当前事件任务依赖目标事件）';
+
+CREATE TABLE IF NOT EXISTS task_graph_lock (
+    id BIGINT PRIMARY KEY COMMENT '固定单行全局图锁主键，恒为 1'
+) COMMENT='跨事件依赖图写串行化锁表';
+
+INSERT IGNORE INTO task_graph_lock (id) VALUES (1);

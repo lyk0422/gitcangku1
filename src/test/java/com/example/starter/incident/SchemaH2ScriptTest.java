@@ -83,4 +83,66 @@ class SchemaH2ScriptTest {
             }
         }
     }
+
+    @Test
+    void h2Schema_enforcesTaskAndBlockConstraints() throws Exception {
+        String url = "jdbc:h2:mem:schema_h2_tasks;MODE=MySQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=0";
+        try (Connection con = DriverManager.getConnection(url, "sa", "")) {
+            ScriptUtils.executeSqlScript(con, new ClassPathResource("schema-h2.sql"));
+            Instant now = Instant.parse("2026-09-22T00:00:00Z");
+            try (Statement st = con.createStatement()) {
+                // 图锁单行存在
+                try (ResultSet rs = st.executeQuery("SELECT id FROM task_graph_lock")) {
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getLong("id")).isEqualTo(1L);
+                }
+
+                st.execute("INSERT INTO incidents (incident_key, severity, summary, reporter, status,"
+                        + " commander, created_at, updated_at) VALUES"
+                        + " ('IK-A','S1','s','r','CONTAINED','alice','" + Timestamp.from(now) + "','"
+                        + Timestamp.from(now) + "')");
+                st.execute("INSERT INTO incidents (incident_key, severity, summary, reporter, status,"
+                        + " commander, created_at, updated_at) VALUES"
+                        + " ('IK-B','S1','s','r','COMMANDING','bob','" + Timestamp.from(now) + "','"
+                        + Timestamp.from(now) + "')");
+                st.execute("INSERT INTO incident_tasks (incident_id, task_key, group_code, title,"
+                        + " status, created_by, created_at, updated_at, completed_at, cancelled_at)"
+                        + " VALUES (1,'T1','G','标题','OPEN','alice','" + Timestamp.from(now) + "','"
+                        + Timestamp.from(now) + "',NULL,NULL)");
+                st.execute("INSERT INTO incident_task_blocks (task_id, blocked_incident_id,"
+                        + " blocked_incident_key) VALUES (1,2,'IK-B')");
+
+                // task_key 事件内唯一
+                boolean dupTaskRejected = false;
+                try {
+                    st.execute("INSERT INTO incident_tasks (incident_id, task_key, group_code, title,"
+                            + " status, created_by, created_at, updated_at) VALUES"
+                            + " (1,'T1','G','重复','OPEN','alice','" + Timestamp.from(now) + "','"
+                            + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    dupTaskRejected = true;
+                }
+                assertThat(dupTaskRejected).isTrue();
+
+                // (task_id, blocked_incident_id) 唯一
+                boolean dupBlockRejected = false;
+                try {
+                    st.execute("INSERT INTO incident_task_blocks (task_id, blocked_incident_id,"
+                            + " blocked_incident_key) VALUES (1,2,'IK-B')");
+                } catch (Exception e) {
+                    dupBlockRejected = true;
+                }
+                assertThat(dupBlockRejected).isTrue();
+
+                // 条件完成只作用于 OPEN
+                int completed = st.executeUpdate(
+                        "UPDATE incident_tasks SET status='DONE', completed_at='" + Timestamp.from(now)
+                                + "' WHERE id = 1 AND status = 'OPEN'");
+                assertThat(completed).isEqualTo(1);
+                int secondComplete = st.executeUpdate(
+                        "UPDATE incident_tasks SET status='DONE' WHERE id = 1 AND status = 'OPEN'");
+                assertThat(secondComplete).isZero();
+            }
+        }
+    }
 }
