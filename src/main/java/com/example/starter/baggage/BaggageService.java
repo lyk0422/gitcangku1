@@ -1,5 +1,9 @@
 package com.example.starter.baggage;
 
+import java.time.Clock;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -13,15 +17,21 @@ import org.springframework.stereotype.Service;
 import com.example.starter.baggage.BaggageDtos.ArriveRequest;
 import com.example.starter.baggage.BaggageDtos.ArriveResponse;
 import com.example.starter.baggage.BaggageDtos.BagResponse;
+import com.example.starter.baggage.BaggageDtos.DiscrepancyArriveRequest;
+import com.example.starter.baggage.BaggageDtos.DiscrepancyArriveResponse;
+import com.example.starter.baggage.BaggageDtos.DiscrepancySnapshotResponse;
 import com.example.starter.baggage.BaggageDtos.ItineraryItem;
 import com.example.starter.baggage.BaggageDtos.LegResponse;
 import com.example.starter.baggage.BaggageDtos.LoadRequest;
 import com.example.starter.baggage.BaggageDtos.LoadResponse;
 import com.example.starter.baggage.BaggageDtos.ManifestResponse;
+import com.example.starter.baggage.BaggageDtos.RecoverRequest;
+import com.example.starter.baggage.BaggageDtos.RecoverResponse;
 import com.example.starter.baggage.BaggageDtos.RegisterBagRequest;
 import com.example.starter.baggage.BaggageDtos.RegisterLegRequest;
 import com.example.starter.baggage.BaggageDtos.SealRequest;
 import com.example.starter.baggage.BaggageDtos.SealResponse;
+import com.example.starter.baggage.BaggageDtos.ShortUnloadedItem;
 
 /**
  * 联程行李装载交接核心业务：航段/行李登记、批量装载、封舱、到达确认与查询。
@@ -36,15 +46,23 @@ public class BaggageService {
     private static final String LEG_SEALED = "SEALED";
     private static final String LEG_ARRIVED = "ARRIVED";
     private static final String BAG_IN_TRANSIT = "IN_TRANSIT";
+    private static final String BAG_SHORT_UNLOADED = "SHORT_UNLOADED";
+    private static final String BAG_RECOVERED = "RECOVERED";
     private static final String BAG_DELIVERED = "DELIVERED";
+    private static final String MODE_EXACT = "EXACT";
+    private static final String MODE_DISCREPANCY = "DISCREPANCY";
 
     private static final RowMapper<LegRow> LEG_MAPPER = (rs, rowNum) -> new LegRow(
             rs.getString("leg_id"), rs.getString("origin"), rs.getString("destination"),
-            rs.getString("status"), rs.getInt("version"), rs.getString("sealed_manifest"));
+            rs.getString("status"), rs.getInt("version"), rs.getString("sealed_manifest"),
+            rs.getString("arrival_mode"), rs.getString("actual_arrivals"),
+            rs.getString("short_manifest"), rs.getObject("arrived_at", LocalDateTime.class));
 
     private static final RowMapper<BagRow> BAG_MAPPER = (rs, rowNum) -> new BagRow(
             rs.getString("bag_tag"), rs.getString("current_location"),
-            rs.getInt("next_leg_index"), rs.getString("status"), rs.getString("loaded_leg_id"));
+            rs.getInt("next_leg_index"), rs.getString("status"), rs.getString("loaded_leg_id"),
+            rs.getString("short_leg_id"), rs.getString("short_destination"),
+            rs.getObject("short_registered_at", LocalDateTime.class));
 
     private static final RowMapper<ItineraryItem> ITINERARY_MAPPER = (rs, rowNum) -> new ItineraryItem(
             rs.getInt("seq"), rs.getString("leg_id"), rs.getString("origin"), rs.getString("destination"));
@@ -52,13 +70,16 @@ public class BaggageService {
     private final JdbcTemplate jdbcTemplate;
     private final IdempotencyService idempotencyService;
     private final ObjectMapper objectMapper;
+    private final Clock clock;
 
     public BaggageService(JdbcTemplate jdbcTemplate,
                           IdempotencyService idempotencyService,
-                          ObjectMapper objectMapper) {
+                          ObjectMapper objectMapper,
+                          Clock clock) {
         this.jdbcTemplate = jdbcTemplate;
         this.idempotencyService = idempotencyService;
         this.objectMapper = objectMapper;
+        this.clock = clock;
     }
 
     /** 登记航段：legId 唯一，初始状态 OPEN、版本 1。 */
@@ -92,6 +113,55 @@ public class BaggageService {
         ArrivePayload payload = new ArrivePayload(legId, sortedCopy(request.bagTags()));
         return idempotencyService.execute(request.requestId(), "ARRIVE", 200,
                 payload, ArriveResponse.class, () -> doArrive(legId, request));
+    }
+
+    /**
+     * 差异到达：仅 SEALED 航段可提交；实际袋号不得重复且为封舱清单子集，
+     * 实际到达者推进，缺失者转 SHORT_UNLOADED 并登记缺失航段/应到站/UTC 时刻。
+     */
+    public DiscrepancyArriveResponse arriveDiscrepancy(String legId, DiscrepancyArriveRequest request) {
+        DiscrepancyPayload payload = new DiscrepancyPayload(
+                legId, request.expectedVersion(), sortedCopy(request.actualBagTags()));
+        return idempotencyService.execute(request.requestId(), "ARRIVE_DISCREPANCY", 200,
+                payload, DiscrepancyArriveResponse.class, () -> doArriveDiscrepancy(legId, request));
+    }
+
+    /**
+     * 补到：仅 SHORT_UNLOADED 且缺失航段匹配的行李可补到；实际站须等于该航段到达站。
+     * 成功后移动行李并推进待乘索引，标记 RECOVERED；完成行程者转 DELIVERED。
+     */
+    public RecoverResponse recover(String bagTag, RecoverRequest request) {
+        RecoverPayload payload = new RecoverPayload(
+                bagTag, request.missingLegId(), request.actualStation());
+        return idempotencyService.execute(request.requestId(), "RECOVER", 200,
+                payload, RecoverResponse.class, () -> doRecover(bagTag, request));
+    }
+
+    /** 航段差异快照查询。 */
+    public DiscrepancySnapshotResponse getDiscrepancySnapshot(String legId) {
+        LegRow leg = findLeg(legId);
+        if (leg == null) {
+            throw ApiException.notFound("航段不存在: " + legId);
+        }
+        List<String> manifest = leg.sealedManifest() == null ? List.of() : readJsonList(leg.sealedManifest());
+        if (leg.arrivalMode() == null) {
+            return new DiscrepancySnapshotResponse(leg.legId(), leg.status(), leg.version(),
+                    null, manifest, null, null, null);
+        }
+        return new DiscrepancySnapshotResponse(leg.legId(), leg.status(), leg.version(),
+                leg.arrivalMode(), manifest, readJsonList(leg.actualArrivals()),
+                readJsonList(leg.shortManifest()), toUtcInstant(leg.arrivedAt()));
+    }
+
+    /** 未补到清单查询（全局，按短卸登记时刻、袋号排序）。 */
+    public List<ShortUnloadedItem> listShortUnloaded() {
+        return jdbcTemplate.query(
+                "SELECT bag_tag, short_leg_id, short_destination, short_registered_at FROM bag"
+                        + " WHERE status = ? ORDER BY short_registered_at, bag_tag",
+                (rs, rowNum) -> new ShortUnloadedItem(rs.getString("bag_tag"),
+                        rs.getString("short_leg_id"), rs.getString("short_destination"),
+                        toUtcInstant(rs.getObject("short_registered_at", LocalDateTime.class))),
+                BAG_SHORT_UNLOADED);
     }
 
     /** 行李轨迹查询。 */
@@ -154,8 +224,9 @@ public class BaggageService {
                     "INSERT INTO bag_itinerary (bag_tag, seq, leg_id, origin, destination) VALUES (?, ?, ?, ?, ?)",
                     request.bagTag(), i, leg.legId(), leg.origin(), leg.destination());
         }
+        insertTrace(request.bagTag(), "REGISTERED", null, legs.get(0).origin());
         return new BagResponse(request.bagTag(), legs.get(0).origin(), 0, BAG_IN_TRANSIT, null,
-                toItinerary(request.bagTag()));
+                toItinerary(request.bagTag()), toTrace(request.bagTag()));
     }
 
     private LoadResponse doLoad(String legId, LoadRequest request) {
@@ -180,7 +251,12 @@ public class BaggageService {
         }
         for (BagRow bag : bags) {
             jdbcTemplate.update("INSERT INTO load_record (bag_tag, leg_id) VALUES (?, ?)", bag.bagTag(), legId);
-            jdbcTemplate.update("UPDATE bag SET loaded_leg_id = ? WHERE bag_tag = ?", legId, bag.bagTag());
+            // 补后续运：装载后恢复在途状态；其余行李状态（IN_TRANSIT）不变
+            jdbcTemplate.update(
+                    "UPDATE bag SET loaded_leg_id = ?, status = CASE WHEN status = ? THEN ? ELSE status END"
+                            + " WHERE bag_tag = ?",
+                    legId, BAG_RECOVERED, BAG_IN_TRANSIT, bag.bagTag());
+            insertTrace(bag.bagTag(), "LOADED", legId, leg.origin());
         }
         int newVersion = leg.version() + 1;
         jdbcTemplate.update("UPDATE leg SET version = ? WHERE leg_id = ?", newVersion, legId);
@@ -212,24 +288,132 @@ public class BaggageService {
         if (actualSet.size() != actual.size() || !actualSet.equals(new HashSet<>(manifest))) {
             throw ApiException.unprocessable("实际袋号集合与封舱清单不一致");
         }
+        List<String> sortedActual = sortedCopy(actual);
+        LocalDateTime arrivedAt = nowUtc();
         for (String bagTag : manifest) {
             BagRow bag = lockBag(bagTag);
             int nextIndex = bag.nextLegIndex() + 1;
             int total = itineraryCount(bagTag);
-            String status = nextIndex >= total ? BAG_DELIVERED : BAG_IN_TRANSIT;
+            boolean finished = nextIndex >= total;
+            String status = finished ? BAG_DELIVERED : BAG_IN_TRANSIT;
             jdbcTemplate.update(
-                    "UPDATE bag SET current_location = ?, next_leg_index = ?, status = ?, loaded_leg_id = NULL"
+                    "UPDATE bag SET current_location = ?, next_leg_index = ?, status = ?, loaded_leg_id = NULL,"
+                            + " short_leg_id = NULL, short_destination = NULL"
                             + " WHERE bag_tag = ?",
                     leg.destination(), nextIndex, status, bagTag);
+            insertTrace(bagTag, "ARRIVED", legId, leg.destination());
+            if (finished) {
+                insertTrace(bagTag, "DELIVERED", legId, leg.destination());
+            }
         }
         jdbcTemplate.update("DELETE FROM load_record WHERE leg_id = ?", legId);
         int newVersion = leg.version() + 1;
-        jdbcTemplate.update("UPDATE leg SET status = ?, version = ? WHERE leg_id = ?",
-                LEG_ARRIVED, newVersion, legId);
+        jdbcTemplate.update(
+                "UPDATE leg SET status = ?, version = ?, arrival_mode = ?, actual_arrivals = ?,"
+                        + " short_manifest = ?, arrived_at = ? WHERE leg_id = ?",
+                LEG_ARRIVED, newVersion, MODE_EXACT, writeJson(sortedActual),
+                writeJson(List.of()), arrivedAt, legId);
         return new ArriveResponse(legId, LEG_ARRIVED, newVersion, manifest);
     }
 
+    private DiscrepancyArriveResponse doArriveDiscrepancy(String legId, DiscrepancyArriveRequest request) {
+        LegRow leg = lockLeg(legId);
+        checkVersion(leg, request.expectedVersion());
+        if (!LEG_SEALED.equals(leg.status())) {
+            throw ApiException.unprocessable("航段状态为 " + leg.status() + "，禁止差异到达");
+        }
+        List<String> manifest = readJsonList(leg.sealedManifest());
+        List<String> actual = request.actualBagTags();
+        Set<String> actualSet = new HashSet<>(actual);
+        if (actualSet.size() != actual.size()) {
+            throw ApiException.unprocessable("实际到达袋号不得重复");
+        }
+        if (!new HashSet<>(manifest).containsAll(actualSet)) {
+            throw ApiException.unprocessable("实际到达袋号必须是封舱清单的子集，存在清单外袋号");
+        }
+        List<String> sortedActual = sortedCopy(actual);
+        List<String> missing = manifest.stream().filter(tag -> !actualSet.contains(tag)).toList();
+
+        LocalDateTime registeredAt = nowUtc();
+        for (String bagTag : manifest) {
+            BagRow bag = lockBag(bagTag);
+            if (actualSet.contains(bagTag)) {
+                // 实际到达：按原规则移动到到达站并推进待乘索引
+                int nextIndex = bag.nextLegIndex() + 1;
+                int total = itineraryCount(bagTag);
+                boolean finished = nextIndex >= total;
+                String status = finished ? BAG_DELIVERED : BAG_IN_TRANSIT;
+                jdbcTemplate.update(
+                        "UPDATE bag SET current_location = ?, next_leg_index = ?, status = ?, loaded_leg_id = NULL"
+                                + " WHERE bag_tag = ?",
+                        leg.destination(), nextIndex, status, bagTag);
+                insertTrace(bagTag, "ARRIVED", legId, leg.destination());
+                if (finished) {
+                    insertTrace(bagTag, "DELIVERED", legId, leg.destination());
+                }
+            } else {
+                // 短卸：不移动、不推进待乘索引，登记缺失航段/应到站/UTC 时刻
+                jdbcTemplate.update(
+                        "UPDATE bag SET status = ?, loaded_leg_id = NULL, short_leg_id = ?,"
+                                + " short_destination = ?, short_registered_at = ? WHERE bag_tag = ?",
+                        BAG_SHORT_UNLOADED, legId, leg.destination(), registeredAt, bagTag);
+                insertTrace(bagTag, "SHORT_UNLOADED", legId, bag.currentLocation());
+            }
+        }
+        jdbcTemplate.update("DELETE FROM load_record WHERE leg_id = ?", legId);
+        int newVersion = leg.version() + 1;
+        jdbcTemplate.update(
+                "UPDATE leg SET status = ?, version = ?, arrival_mode = ?, actual_arrivals = ?,"
+                        + " short_manifest = ?, arrived_at = ? WHERE leg_id = ?",
+                LEG_ARRIVED, newVersion, MODE_DISCREPANCY, writeJson(sortedActual),
+                writeJson(missing), registeredAt, legId);
+        return new DiscrepancyArriveResponse(legId, LEG_ARRIVED, newVersion, MODE_DISCREPANCY,
+                sortedActual, missing, toUtcInstant(registeredAt));
+    }
+
+    private RecoverResponse doRecover(String bagTag, RecoverRequest request) {
+        BagRow bag = lockBag(bagTag);
+        if (bag == null) {
+            throw ApiException.notFound("行李不存在: " + bagTag);
+        }
+        if (!BAG_SHORT_UNLOADED.equals(bag.status())) {
+            throw ApiException.unprocessable(
+                    "行李 " + bagTag + " 状态为 " + bag.status() + "，仅 SHORT_UNLOADED 行李可补到");
+        }
+        if (!request.missingLegId().equals(bag.shortLegId())) {
+            throw ApiException.conflict(
+                    "补到缺失航段不匹配: 登记缺失航段为 " + bag.shortLegId()
+                            + "，提交为 " + request.missingLegId());
+        }
+        LegRow missingLeg = findLeg(request.missingLegId());
+        if (missingLeg == null || !request.actualStation().equals(missingLeg.destination())) {
+            throw ApiException.unprocessable(
+                    "实际到达站必须等于缺失航段 " + request.missingLegId() + " 的到达站 "
+                            + (missingLeg == null ? "(航段不存在)" : missingLeg.destination()));
+        }
+        int nextIndex = bag.nextLegIndex() + 1;
+        int total = itineraryCount(bagTag);
+        boolean finished = nextIndex >= total;
+        String status = finished ? BAG_DELIVERED : BAG_RECOVERED;
+        LocalDateTime recoveredAt = nowUtc();
+        jdbcTemplate.update(
+                "UPDATE bag SET current_location = ?, next_leg_index = ?, status = ?, loaded_leg_id = NULL,"
+                        + " short_leg_id = NULL, short_destination = NULL, short_registered_at = NULL"
+                        + " WHERE bag_tag = ?",
+                missingLeg.destination(), nextIndex, status, bagTag);
+        insertTrace(bagTag, "RECOVERED", missingLeg.legId(), missingLeg.destination());
+        if (finished) {
+            insertTrace(bagTag, "DELIVERED", missingLeg.legId(), missingLeg.destination());
+        }
+        return new RecoverResponse(bagTag, status, missingLeg.legId(),
+                missingLeg.destination(), nextIndex, toUtcInstant(recoveredAt));
+    }
+
     private void validateLoadable(BagRow bag, LegRow leg) {
+        if (BAG_SHORT_UNLOADED.equals(bag.status())) {
+            throw ApiException.unprocessable(
+                    "行李 " + bag.bagTag() + " 处于短卸未补到状态，补到前不得装载后续航段");
+        }
         if (bag.loadedLegId() != null) {
             throw ApiException.unprocessable("行李 " + bag.bagTag() + " 已装载到航段 " + bag.loadedLegId());
         }
@@ -255,15 +439,18 @@ public class BaggageService {
 
     private LegRow findLeg(String legId) {
         List<LegRow> rows = jdbcTemplate.query(
-                "SELECT leg_id, origin, destination, status, version, sealed_manifest FROM leg WHERE leg_id = ?",
+                "SELECT leg_id, origin, destination, status, version, sealed_manifest,"
+                        + " arrival_mode, actual_arrivals, short_manifest, arrived_at"
+                        + " FROM leg WHERE leg_id = ?",
                 LEG_MAPPER, legId);
         return rows.isEmpty() ? null : rows.get(0);
     }
 
     private LegRow lockLeg(String legId) {
         List<LegRow> rows = jdbcTemplate.query(
-                "SELECT leg_id, origin, destination, status, version, sealed_manifest FROM leg"
-                        + " WHERE leg_id = ? FOR UPDATE",
+                "SELECT leg_id, origin, destination, status, version, sealed_manifest,"
+                        + " arrival_mode, actual_arrivals, short_manifest, arrived_at"
+                        + " FROM leg WHERE leg_id = ? FOR UPDATE",
                 LEG_MAPPER, legId);
         if (rows.isEmpty()) {
             throw ApiException.notFound("航段不存在: " + legId);
@@ -273,15 +460,18 @@ public class BaggageService {
 
     private BagRow findBag(String bagTag) {
         List<BagRow> rows = jdbcTemplate.query(
-                "SELECT bag_tag, current_location, next_leg_index, status, loaded_leg_id FROM bag WHERE bag_tag = ?",
+                "SELECT bag_tag, current_location, next_leg_index, status, loaded_leg_id,"
+                        + " short_leg_id, short_destination, short_registered_at"
+                        + " FROM bag WHERE bag_tag = ?",
                 BAG_MAPPER, bagTag);
         return rows.isEmpty() ? null : rows.get(0);
     }
 
     private BagRow lockBag(String bagTag) {
         List<BagRow> rows = jdbcTemplate.query(
-                "SELECT bag_tag, current_location, next_leg_index, status, loaded_leg_id FROM bag"
-                        + " WHERE bag_tag = ? FOR UPDATE",
+                "SELECT bag_tag, current_location, next_leg_index, status, loaded_leg_id,"
+                        + " short_leg_id, short_destination, short_registered_at"
+                        + " FROM bag WHERE bag_tag = ? FOR UPDATE",
                 BAG_MAPPER, bagTag);
         return rows.isEmpty() ? null : rows.get(0);
     }
@@ -305,9 +495,40 @@ public class BaggageService {
                 ITINERARY_MAPPER, bagTag);
     }
 
+    private List<BaggageDtos.TraceEvent> toTrace(String bagTag) {
+        return jdbcTemplate.query(
+                "SELECT seq, event_type, leg_id, station, event_time FROM bag_trace_event"
+                        + " WHERE bag_tag = ? ORDER BY seq",
+                (rs, rowNum) -> new BaggageDtos.TraceEvent(rs.getInt("seq"),
+                        rs.getString("event_type"), rs.getString("leg_id"),
+                        rs.getString("station"),
+                        toUtcInstant(rs.getObject("event_time", LocalDateTime.class))),
+                bagTag);
+    }
+
+    /** 追加轨迹事件，事件号按该行李现有事件数顺延（调用方持 bag 行锁或处于登记事务中）。 */
+    private void insertTrace(String bagTag, String eventType, String legId, String station) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM bag_trace_event WHERE bag_tag = ?", Integer.class, bagTag);
+        int seq = count == null ? 0 : count;
+        jdbcTemplate.update(
+                "INSERT INTO bag_trace_event (bag_tag, seq, event_type, leg_id, station, event_time)"
+                        + " VALUES (?, ?, ?, ?, ?, ?)",
+                bagTag, seq, eventType, legId, station, nowUtc());
+    }
+
+    /** 当前时刻的 UTC 墙钟值（列按 UTC 解释，不做 JVM 时区换算）。 */
+    private LocalDateTime nowUtc() {
+        return LocalDateTime.ofInstant(Instant.now(clock), ZoneOffset.UTC);
+    }
+
+    private static String toUtcInstant(LocalDateTime utcWallTime) {
+        return utcWallTime.atOffset(ZoneOffset.UTC).toInstant().toString();
+    }
+
     private BagResponse toBagResponse(BagRow bag) {
         return new BagResponse(bag.bagTag(), bag.currentLocation(), bag.nextLegIndex(),
-                bag.status(), bag.loadedLegId(), toItinerary(bag.bagTag()));
+                bag.status(), bag.loadedLegId(), toItinerary(bag.bagTag()), toTrace(bag.bagTag()));
     }
 
     private static List<String> sortedCopy(List<String> values) {
@@ -332,11 +553,14 @@ public class BaggageService {
     }
 
     private record LegRow(String legId, String origin, String destination,
-                          String status, int version, String sealedManifest) {
+                          String status, int version, String sealedManifest,
+                          String arrivalMode, String actualArrivals,
+                          String shortManifest, LocalDateTime arrivedAt) {
     }
 
     private record BagRow(String bagTag, String currentLocation, int nextLegIndex,
-                          String status, String loadedLegId) {
+                          String status, String loadedLegId, String shortLegId,
+                          String shortDestination, LocalDateTime shortRegisteredAt) {
     }
 
     /** 装载幂等摘要参数：bagTags 已排序，顺序差异不视为异参。 */
@@ -349,5 +573,13 @@ public class BaggageService {
 
     /** 到达确认幂等摘要参数：bagTags 已排序，顺序差异不视为异参。 */
     private record ArrivePayload(String legId, List<String> bagTags) {
+    }
+
+    /** 差异到达幂等摘要参数：actualBagTags 已排序，顺序差异不视为异参。 */
+    private record DiscrepancyPayload(String legId, int expectedVersion, List<String> actualBagTags) {
+    }
+
+    /** 补到幂等摘要参数。 */
+    private record RecoverPayload(String bagTag, String missingLegId, String actualStation) {
     }
 }

@@ -1,5 +1,7 @@
 package com.example.starter.baggage;
 
+import java.util.List;
+
 import jakarta.validation.Valid;
 
 import org.springframework.http.HttpStatus;
@@ -14,14 +16,20 @@ import org.springframework.web.bind.annotation.RestController;
 import com.example.starter.baggage.BaggageDtos.ArriveRequest;
 import com.example.starter.baggage.BaggageDtos.ArriveResponse;
 import com.example.starter.baggage.BaggageDtos.BagResponse;
+import com.example.starter.baggage.BaggageDtos.DiscrepancyArriveRequest;
+import com.example.starter.baggage.BaggageDtos.DiscrepancyArriveResponse;
+import com.example.starter.baggage.BaggageDtos.DiscrepancySnapshotResponse;
 import com.example.starter.baggage.BaggageDtos.LegResponse;
 import com.example.starter.baggage.BaggageDtos.LoadRequest;
 import com.example.starter.baggage.BaggageDtos.LoadResponse;
 import com.example.starter.baggage.BaggageDtos.ManifestResponse;
+import com.example.starter.baggage.BaggageDtos.RecoverRequest;
+import com.example.starter.baggage.BaggageDtos.RecoverResponse;
 import com.example.starter.baggage.BaggageDtos.RegisterBagRequest;
 import com.example.starter.baggage.BaggageDtos.RegisterLegRequest;
 import com.example.starter.baggage.BaggageDtos.SealRequest;
 import com.example.starter.baggage.BaggageDtos.SealResponse;
+import com.example.starter.baggage.BaggageDtos.ShortUnloadedItem;
 
 /**
  * 联程行李装载交接 REST 入口。
@@ -60,13 +68,26 @@ public class BaggageController {
         return baggageService.seal(legId, request);
     }
 
-    /** 到达确认：实际袋号集合须与封舱清单完全一致。 */
+    /** 到达确认：实际袋号集合须与封舱清单完全一致（原精确入口，行为保持不变）。 */
     @PostMapping("/legs/{legId}/arrive")
     public ArriveResponse arrive(@PathVariable String legId, @Valid @RequestBody ArriveRequest request) {
         return baggageService.arrive(legId, request);
     }
 
-    /** 行李轨迹查询。 */
+    /** 差异到达：实际袋号为封舱清单子集（允许空集），缺失行李转短卸。 */
+    @PostMapping("/legs/{legId}/arrive-discrepancy")
+    public DiscrepancyArriveResponse arriveDiscrepancy(@PathVariable String legId,
+                                                       @Valid @RequestBody DiscrepancyArriveRequest request) {
+        return baggageService.arriveDiscrepancy(legId, request);
+    }
+
+    /** 补到：短卸行李在缺失航段的应到站补到并续运。 */
+    @PostMapping("/bags/{bagTag}/recover")
+    public RecoverResponse recover(@PathVariable String bagTag, @Valid @RequestBody RecoverRequest request) {
+        return baggageService.recover(bagTag, request);
+    }
+
+    /** 行李完整轨迹查询。 */
     @GetMapping("/bags/{bagTag}/trace")
     public BagResponse getBagTrace(@PathVariable String bagTag) {
         return baggageService.getBagTrace(bagTag);
@@ -76,5 +97,17 @@ public class BaggageController {
     @GetMapping("/legs/{legId}/manifest")
     public ManifestResponse getManifest(@PathVariable String legId) {
         return baggageService.getManifest(legId);
+    }
+
+    /** 航段差异快照查询。 */
+    @GetMapping("/legs/{legId}/discrepancy")
+    public DiscrepancySnapshotResponse getDiscrepancySnapshot(@PathVariable String legId) {
+        return baggageService.getDiscrepancySnapshot(legId);
+    }
+
+    /** 未补到清单查询。 */
+    @GetMapping("/short-unloaded")
+    public List<ShortUnloadedItem> listShortUnloaded() {
+        return baggageService.listShortUnloaded();
     }
 }
