@@ -110,6 +110,7 @@ class WaterApiTests {
         JsonNode node = postOk("/api/allocations",
                 allocationBody(key("ac"), allocationKey, windowId, userId, amount), actor);
         assertEquals("REQUESTED", node.get("status").asText());
+        assertEquals("0", node.get("heldVolume").asText(), "REQUESTED 申请持有额度为 0");
         return allocationKey;
     }
 

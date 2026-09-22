@@ -3,11 +3,14 @@ package com.example.starter.water;
 import com.example.starter.water.WaterRepository.AllocationRow;
 import com.example.starter.water.WaterRepository.CommandRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
+import com.example.starter.water.WaterRepository.TransferRow;
 import com.example.starter.water.WaterRepository.WindowRow;
 import com.example.starter.water.dto.Dtos.AllocationResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.TransferListResponse;
+import com.example.starter.water.dto.Dtos.TransferResponse;
 import com.example.starter.water.dto.Dtos.WindowResponse;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
@@ -128,7 +131,7 @@ public class WaterService {
             if (approved.add(allocation.amount()).compareTo(available) > 0) {
                 throw ApiException.quotaExceeded("批准后将超过当前可用总量 " + fmt(available));
             }
-            repository.updateAllocationStatus(allocation.id(), STATUS_APPROVED, nowNanos());
+            repository.updateAllocationStatus(allocation.id(), STATUS_APPROVED, allocation.amount(), nowNanos());
             return toAllocationResponse(repository.findAllocationByKey(allocationKey));
         });
     }
@@ -151,14 +154,128 @@ public class WaterService {
             if (STATUS_CANCELLED.equals(allocation.status())) {
                 throw ApiException.conflict("ALLOCATION_ALREADY_CANCELLED", "申请已取消，不能重复取消");
             }
-            repository.updateAllocationStatus(allocation.id(), STATUS_CANCELLED, nowNanos());
+            // 取消只释放当前持有额度；已转出的额度不追回，转入方持有的额度随其自身取消释放
+            repository.updateAllocationStatus(allocation.id(), STATUS_CANCELLED, BigDecimal.ZERO, nowNanos());
             return toAllocationResponse(repository.findAllocationByKey(allocationKey));
         });
     }
 
-    /** 创建限供：仅当当前已批准总量不超过拟定限供水量时允许。 */
-    public CurtailmentResponse createCurtailment(String commandKey, long windowId, String volume) {
+    /**
+     * 同窗口额度转让：源申请（本人 APPROVED）把目标申请原申请水量的全部额度转给同窗口、
+     * 不同用水户的 REQUESTED 目标申请。源扣减、目标批准、不可变流水在同一事务完成；
+     * 窗口已批准持有总量不变。冲突返回 409，持有不足返回 422。
+     */
+    public TransferResponse transferAllocation(String commandKey, String transferKey,
+                                               String sourceAllocationKey, String targetAllocationKey,
+                                               String actor) {
         requireKey("commandKey", commandKey);
+        requireKey("transferKey", transferKey);
+        requireKey("sourceAllocationKey", sourceAllocationKey);
+        requireKey("targetAllocationKey", targetAllocationKey);
+        requireKey("X-Actor-Id", actor);
+        if (sourceAllocationKey.equals(targetAllocationKey)) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "转出申请与转入申请不能相同");
+        }
+        String params = "ALLOCATION_TRANSFER|" + transferKey + "|" + sourceAllocationKey + "|"
+                + targetAllocationKey + "|" + actor;
+        return runCommand("ALLOCATION_TRANSFER", commandKey, params, TransferResponse.class, () -> {
+            if (repository.findTransferByKey(transferKey) != null) {
+                throw ApiException.conflict("TRANSFER_KEY_REUSED", "transferKey 已被使用: " + transferKey);
+            }
+            AllocationRow source = repository.findAllocationByKey(sourceAllocationKey);
+            if (source == null) {
+                throw ApiException.notFound("SOURCE_ALLOCATION_NOT_FOUND",
+                        "转出配水申请不存在: " + sourceAllocationKey);
+            }
+            AllocationRow target = repository.findAllocationByKey(targetAllocationKey);
+            if (target == null) {
+                throw ApiException.notFound("TARGET_ALLOCATION_NOT_FOUND",
+                        "转入配水申请不存在: " + targetAllocationKey);
+            }
+            // 锁定同一窗口行串行化与普通批准/取消/限供的并发
+            WindowRow window = lockWindowOf(source);
+            if (target.windowId() != source.windowId()) {
+                throw ApiException.conflict("TRANSFER_CROSS_WINDOW", "转出与转入申请必须属于同一供水窗口");
+            }
+            // 按主键升序锁定两条申请行，避免并发转让互相等待形成死锁；所有校验基于锁定后的最新状态
+            long firstId = Math.min(source.id(), target.id());
+            long secondId = Math.max(source.id(), target.id());
+            repository.lockAllocationById(firstId);
+            repository.lockAllocationById(secondId);
+            AllocationRow lockedSource = repository.findAllocationById(source.id());
+            AllocationRow lockedTarget = repository.findAllocationById(target.id());
+            if (!lockedSource.requester().equals(actor)) {
+                throw ApiException.conflict("NOT_OWNER", "只有转出申请的申请人本人可以发起转让");
+            }
+            if (lockedTarget.userId().equals(lockedSource.userId())) {
+                throw ApiException.conflict("TRANSFER_SAME_USER", "只能向不同用水户的申请转让额度");
+            }
+            if (!STATUS_APPROVED.equals(lockedSource.status())) {
+                throw ApiException.conflict("SOURCE_NOT_APPROVED", "转出申请必须为 APPROVED 状态");
+            }
+            if (!STATUS_REQUESTED.equals(lockedTarget.status())) {
+                throw ApiException.conflict("TARGET_NOT_REQUESTED", "转入申请必须为 REQUESTED 状态");
+            }
+            BigDecimal qty = lockedTarget.amount();
+            if (lockedSource.heldAmount().compareTo(qty) < 0) {
+                throw ApiException.quotaExceeded("转出申请当前持有额度 " + fmt(lockedSource.heldAmount())
+                        + " 不足，需要 " + fmt(qty));
+            }
+            long now = nowNanos();
+            // 条件更新：并发下保证两个来源争抢同一目标最多一次成功、一个来源并发转出不会变负
+            int decreased = repository.decreaseHeldAmountIfSufficient(lockedSource.id(), qty, now);
+            if (decreased == 0) {
+                throw ApiException.conflict("TRANSFER_CONFLICT", "转出额度并发变化，请重试");
+            }
+            int approved = repository.approveTargetWithHeldAmount(lockedTarget.id(), qty, now);
+            if (approved == 0) {
+                throw ApiException.conflict("TARGET_ALREADY_TAKEN", "转入申请已被其他转让或批准占用");
+            }
+            BigDecimal sourceHeldAfter = lockedSource.heldAmount().subtract(qty);
+            try {
+                repository.insertTransfer(transferKey, window.id(), lockedSource.id(), lockedTarget.id(),
+                        qty, sourceHeldAfter, now);
+            } catch (DuplicateKeyException e) {
+                throw ApiException.conflict("TRANSFER_KEY_REUSED", "transferKey 已被使用: " + transferKey);
+            }
+            return new TransferResponse(transferKey, window.id(), sourceAllocationKey, targetAllocationKey,
+                    fmt(qty), fmt(sourceHeldAfter), toIso(now));
+        });
+    }
+
+    /** 查询单个转让流水；不存在返回 404。 */
+    public TransferResponse getTransfer(String transferKey) {
+        requireKey("transferKey", transferKey);
+        TransferRow row = repository.findTransferByKey(transferKey);
+        if (row == null) {
+            throw ApiException.notFound("TRANSFER_NOT_FOUND", "转让流水不存在: " + transferKey);
+        }
+        AllocationRow source = repository.findAllocationById(row.sourceAllocationId());
+        AllocationRow target = repository.findAllocationById(row.targetAllocationId());
+        return new TransferResponse(row.transferKey(), row.windowId(), source.allocationKey(),
+                target.allocationKey(), fmt(row.amount()), fmt(row.sourceHeldAfter()),
+                toIso(row.createdNanos()));
+    }
+
+    /** 查询窗口全部转让流水；窗口不存在返回 404。 */
+    public TransferListResponse listTransfers(long windowId) {
+        WindowRow window = repository.findWindowById(windowId);
+        if (window == null) {
+            throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + windowId);
+        }
+        List<TransferResponse> transfers = repository.listTransfersByWindow(windowId).stream()
+                .map(row -> {
+                    AllocationRow source = repository.findAllocationById(row.sourceAllocationId());
+                    AllocationRow target = repository.findAllocationById(row.targetAllocationId());
+                    return new TransferResponse(row.transferKey(), row.windowId(),
+                            source.allocationKey(), target.allocationKey(), fmt(row.amount()),
+                            fmt(row.sourceHeldAfter()), toIso(row.createdNanos()));
+                }).toList();
+        return new TransferListResponse(windowId, transfers);
+    }
+
+    /** 创建限供：仅当当前已批准总量不超过拟定限供水量时允许。 */
+    public CurtailmentResponse createCurtailment(String commandKey, long windowId, String volume) {        requireKey("commandKey", commandKey);
         BigDecimal qty = parseAmount("volume", volume);
         String params = "CURTAILMENT_CREATE|" + windowId + "|" + qty.toPlainString();
         return runCommand("CURTAILMENT_CREATE", commandKey, params, CurtailmentResponse.class, () -> {
@@ -211,9 +328,10 @@ public class WaterService {
         CurtailmentRow active = repository.findActiveCurtailment(windowId);
         BigDecimal available = active != null ? active.volume() : window.plannedVolume();
         BigDecimal approved = repository.sumApprovedAmount(windowId);
+        BigDecimal approvedOriginal = repository.sumApprovedOriginalAmount(windowId);
         return new CapacityResponse(window.id(), fmt(window.plannedVolume()),
                 active != null ? fmt(active.volume()) : null, fmt(available), fmt(approved),
-                fmt(available.subtract(approved)));
+                fmt(approvedOriginal), fmt(available.subtract(approved)));
     }
 
     /** 查询窗口历史明细：窗口 + 全部申请 + 全部限供。 */
@@ -293,7 +411,8 @@ public class WaterService {
 
     private AllocationResponse toAllocationResponse(AllocationRow row) {
         return new AllocationResponse(row.allocationKey(), row.windowId(), row.userId(), fmt(row.amount()),
-                row.requester(), row.status(), toIso(row.createdNanos()), toIso(row.updatedNanos()));
+                fmt(row.heldAmount()), row.requester(), row.status(), toIso(row.createdNanos()),
+                toIso(row.updatedNanos()));
     }
 
     private CurtailmentResponse toCurtailmentResponse(CurtailmentRow row) {

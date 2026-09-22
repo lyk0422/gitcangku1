@@ -29,7 +29,23 @@ public final class Dtos {
 
     /** 配水申请视图。状态：REQUESTED / APPROVED / CANCELLED。 */
     public record AllocationResponse(String allocationKey, long windowId, String userId, String amount,
-                                     String requester, String status, String createdUtc, String updatedUtc) {
+                                     String heldVolume, String requester, String status,
+                                     String createdUtc, String updatedUtc) {
+    }
+
+    /** 同窗口额度转让命令；转出操作人由 X-Actor-Id 请求头提供，必须等于源申请的申请人。 */
+    public record TransferRequest(String commandKey, String transferKey, String sourceAllocationKey,
+                                  String targetAllocationKey) {
+    }
+
+    /** 转让流水视图（不可变）；sourceHeldVolumeAfter 为转让完成后源申请剩余持有额度。 */
+    public record TransferResponse(String transferKey, long windowId, String sourceAllocationKey,
+                                   String targetAllocationKey, String amount, String sourceHeldVolumeAfter,
+                                   String createdUtc) {
+    }
+
+    /** 窗口转让流水列表。 */
+    public record TransferListResponse(long windowId, List<TransferResponse> transfers) {
     }
 
     /** 仅含幂等键的命令（批准/取消申请、取消限供）。 */
@@ -45,9 +61,13 @@ public final class Dtos {
                                       String createdUtc, String cancelledUtc) {
     }
 
-    /** 窗口当前可用容量视图。 */
+    /**
+     * 窗口当前可用容量视图。approvedTotal 为 APPROVED 申请当前持有额度之和；
+     * approvedOriginalTotal 为这些申请原申请水量之和（仅供对比，可能大于持有额度）。
+     */
     public record CapacityResponse(long windowId, String plannedVolume, String activeCurtailmentVolume,
-                                   String availableTotal, String approvedTotal, String remaining) {
+                                   String availableTotal, String approvedTotal, String approvedOriginalTotal,
+                                   String remaining) {
     }
 
     /** 窗口历史明细：窗口本身 + 全部申请 + 全部限供记录。 */

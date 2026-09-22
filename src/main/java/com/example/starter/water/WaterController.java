@@ -8,6 +8,9 @@ import com.example.starter.water.dto.Dtos.CurtailmentRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
 import com.example.starter.water.dto.Dtos.SubmitAllocationRequest;
+import com.example.starter.water.dto.Dtos.TransferListResponse;
+import com.example.starter.water.dto.Dtos.TransferRequest;
+import com.example.starter.water.dto.Dtos.TransferResponse;
 import com.example.starter.water.dto.Dtos.WindowResponse;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -59,6 +62,26 @@ public class WaterController {
                                                @RequestBody CommandRequest request,
                                                @RequestHeader("X-Actor-Id") String actor) {
         return service.cancelAllocation(request.commandKey(), allocationKey, actor);
+    }
+
+    /** 同窗口额度转让（仅源申请的申请人本人）。 */
+    @PostMapping("/transfers")
+    public TransferResponse transferAllocation(@RequestBody TransferRequest request,
+                                               @RequestHeader("X-Actor-Id") String actor) {
+        return service.transferAllocation(request.commandKey(), request.transferKey(),
+                request.sourceAllocationKey(), request.targetAllocationKey(), actor);
+    }
+
+    /** 查询单个转让流水。 */
+    @GetMapping("/transfers/{transferKey}")
+    public TransferResponse getTransfer(@PathVariable String transferKey) {
+        return service.getTransfer(transferKey);
+    }
+
+    /** 查询窗口全部转让流水。 */
+    @GetMapping("/windows/{windowId}/transfers")
+    public TransferListResponse listTransfers(@PathVariable long windowId) {
+        return service.listTransfers(windowId);
     }
 
     /** 创建窗口限供。 */
