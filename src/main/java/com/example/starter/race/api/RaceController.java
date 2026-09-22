@@ -71,6 +71,23 @@ public class RaceController {
         return toResponse(raceService.sealRace(raceId, request));
     }
 
+    /** 一次性配置有序检查点（配置后不可修改）。 */
+    @PostMapping("/{raceId}/checkpoints")
+    public ResponseEntity<Object> configureCheckpoints(
+            @PathVariable String raceId,
+            @Valid @RequestBody ConfigureCheckpointsRequest request) {
+        return toResponse(raceService.configureCheckpoints(raceId, request));
+    }
+
+    /** 提交选手检查点通过记录。 */
+    @PostMapping("/{raceId}/runners/{bib}/splits")
+    public ResponseEntity<Object> recordSplit(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody RecordSplitRequest request) {
+        return toResponse(raceService.recordSplit(raceId, bib, request));
+    }
+
     /** 查询即时成绩（封榜后返回只读快照内容）。 */
     @GetMapping("/{raceId}/results")
     public StandingResponse getResults(@PathVariable String raceId) {
@@ -81,6 +98,19 @@ public class RaceController {
     @GetMapping("/{raceId}/snapshot")
     public StandingResponse getSnapshot(@PathVariable String raceId) {
         return raceService.getSnapshot(raceId);
+    }
+
+    /** 查询单个选手的分段明细（按检查点顺序，缺失为 null）。 */
+    @GetMapping("/{raceId}/runners/{bib}/splits")
+    public RunnerSplitsResponse getRunnerSplits(
+            @PathVariable String raceId, @PathVariable String bib) {
+        return raceService.getRunnerSplits(raceId, bib);
+    }
+
+    /** 赛事缺失检查点汇总（已完赛但未覆盖全部检查点的选手）。 */
+    @GetMapping("/{raceId}/missing-checkpoints")
+    public MissingCheckpointsResponse getMissingCheckpoints(@PathVariable String raceId) {
+        return raceService.getMissingCheckpoints(raceId);
     }
 
     private ResponseEntity<Object> toResponse(ServiceResult result) {

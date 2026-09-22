@@ -25,6 +25,17 @@ public class RaceRepository {
     private static final SnapshotEntryRowMapper SNAPSHOT_ENTRY_ROW_MAPPER =
             new SnapshotEntryRowMapper();
     private static final IdempotencyRowMapper IDEMPOTENCY_ROW_MAPPER = new IdempotencyRowMapper();
+    private static final CheckpointRowMapper CHECKPOINT_ROW_MAPPER = new CheckpointRowMapper();
+    private static final SplitTimeRowMapper SPLIT_TIME_ROW_MAPPER = new SplitTimeRowMapper();
+    private static final SnapshotSplitRowMapper SNAPSHOT_SPLIT_ROW_MAPPER =
+            new SnapshotSplitRowMapper();
+
+    /** 分段记录查询公共片段：关联检查点表取顺序号。 */
+    private static final String SPLIT_SELECT =
+            "SELECT s.timing_id, s.race_id, s.bib, s.checkpoint_code, c.seq, s.elapsed_ms, s.created_at "
+                    + "FROM split_time s "
+                    + "JOIN race_checkpoint c ON c.race_id = s.race_id "
+                    + "AND c.checkpoint_code = s.checkpoint_code";
 
     private final JdbcTemplate jdbcTemplate;
 
@@ -190,6 +201,121 @@ public class RaceRepository {
                 });
     }
 
+    /** 查询赛事全部检查点，按顺序号升序；未配置返回空列表。 */
+    public List<CheckpointRow> findCheckpoints(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT race_id, checkpoint_code, seq, created_at "
+                        + "FROM race_checkpoint WHERE race_id = ? ORDER BY seq",
+                CHECKPOINT_ROW_MAPPER, raceId);
+    }
+
+    /** 按赛事与检查点编码查询检查点。 */
+    public Optional<CheckpointRow> findCheckpoint(String raceId, String checkpointCode) {
+        return jdbcTemplate
+                .query("SELECT race_id, checkpoint_code, seq, created_at "
+                                + "FROM race_checkpoint WHERE race_id = ? AND checkpoint_code = ?",
+                        CHECKPOINT_ROW_MAPPER, raceId, checkpointCode)
+                .stream()
+                .findFirst();
+    }
+
+    /** 一次性配置检查点：按列表顺序赋顺序号1..N，同事务与版本推进原子提交。 */
+    public void insertCheckpoints(String raceId, List<String> checkpointCodes, long now) {
+        jdbcTemplate.batchUpdate(
+                "INSERT INTO race_checkpoint (race_id, checkpoint_code, seq, created_at) "
+                        + "VALUES (?, ?, ?, ?)",
+                checkpointCodes,
+                checkpointCodes.size(),
+                (ps, code) -> {
+                    ps.setString(1, raceId);
+                    ps.setString(2, code);
+                    ps.setInt(3, checkpointCodes.indexOf(code) + 1);
+                    ps.setLong(4, now);
+                });
+    }
+
+    /** 统计赛事已有分段记录数（用于“尚无任何分段记录时才可配置检查点”的前置校验）。 */
+    public int countSplitsForRace(String raceId) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM split_time WHERE race_id = ?", Integer.class, raceId);
+        return count == null ? 0 : count;
+    }
+
+    /** 按全局唯一分段计时ID查询分段记录。 */
+    public Optional<SplitTimeRow> findSplitByTimingId(String timingId) {
+        return jdbcTemplate
+                .query(SPLIT_SELECT + " WHERE s.timing_id = ?",
+                        SPLIT_TIME_ROW_MAPPER, timingId)
+                .stream()
+                .findFirst();
+    }
+
+    /** 按赛事、参赛号与检查点查询分段记录（同一选手同一检查点最多一条）。 */
+    public Optional<SplitTimeRow> findSplit(String raceId, String bib, String checkpointCode) {
+        return jdbcTemplate
+                .query(SPLIT_SELECT
+                                + " WHERE s.race_id = ? AND s.bib = ? AND s.checkpoint_code = ?",
+                        SPLIT_TIME_ROW_MAPPER, raceId, bib, checkpointCode)
+                .stream()
+                .findFirst();
+    }
+
+    /** 查询单选手全部分段记录，按检查点顺序升序（顺序稳定）。 */
+    public List<SplitTimeRow> findSplitsForRunner(String raceId, String bib) {
+        return jdbcTemplate.query(
+                SPLIT_SELECT + " WHERE s.race_id = ? AND s.bib = ? ORDER BY c.seq",
+                SPLIT_TIME_ROW_MAPPER, raceId, bib);
+    }
+
+    /** 查询赛事全部分段记录，按参赛号字典序、检查点顺序升序（顺序稳定）。 */
+    public List<SplitTimeRow> findSplitsForRace(String raceId) {
+        return jdbcTemplate.query(
+                SPLIT_SELECT + " WHERE s.race_id = ? ORDER BY s.bib, c.seq",
+                SPLIT_TIME_ROW_MAPPER, raceId);
+    }
+
+    /** 新增分段记录；timing_id 与 (race_id, bib, checkpoint_code) 唯一约束由数据库保证。 */
+    public void insertSplit(
+            String timingId,
+            String raceId,
+            String bib,
+            String checkpointCode,
+            long elapsedMs,
+            long now) {
+        jdbcTemplate.update(
+                "INSERT INTO split_time "
+                        + "(timing_id, race_id, bib, checkpoint_code, elapsed_ms, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?)",
+                timingId, raceId, bib, checkpointCode, elapsedMs, now);
+    }
+
+    /** 原子写入封榜快照的分段明细（含缺失检查点，elapsed_ms 为 NULL）。 */
+    public void insertSnapshotSplits(List<SnapshotSplitRow> splits) {
+        if (splits.isEmpty()) {
+            return;
+        }
+        jdbcTemplate.batchUpdate(
+                "INSERT INTO result_snapshot_split "
+                        + "(race_id, bib, checkpoint_code, seq, elapsed_ms) VALUES (?, ?, ?, ?, ?)",
+                splits,
+                splits.size(),
+                (ps, split) -> {
+                    ps.setString(1, split.raceId());
+                    ps.setString(2, split.bib());
+                    ps.setString(3, split.checkpointCode());
+                    ps.setInt(4, split.seq());
+                    ps.setObject(5, split.elapsedMs());
+                });
+    }
+
+    /** 查询封榜快照的分段明细，按参赛号字典序、检查点顺序升序。 */
+    public List<SnapshotSplitRow> findSnapshotSplits(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT race_id, bib, checkpoint_code, seq, elapsed_ms "
+                        + "FROM result_snapshot_split WHERE race_id = ? ORDER BY bib, seq",
+                SNAPSHOT_SPLIT_ROW_MAPPER, raceId);
+    }
+
     /** 按请求ID查询幂等记录。 */
     public Optional<IdempotencyRow> findIdempotency(String requestId) {
         return jdbcTemplate
@@ -236,9 +362,12 @@ public class RaceRepository {
 
     /** 测试辅助：清空全部业务数据，按外键依赖顺序删除。 */
     public void deleteAllForTesting() {
+        jdbcTemplate.update("DELETE FROM result_snapshot_split");
         jdbcTemplate.update("DELETE FROM result_snapshot_entry");
         jdbcTemplate.update("DELETE FROM result_snapshot");
         jdbcTemplate.update("DELETE FROM idempotency_record");
+        jdbcTemplate.update("DELETE FROM split_time");
+        jdbcTemplate.update("DELETE FROM race_checkpoint");
         jdbcTemplate.update("DELETE FROM penalty");
         jdbcTemplate.update("DELETE FROM runner");
         jdbcTemplate.update("DELETE FROM race");
@@ -296,6 +425,43 @@ public class RaceRepository {
                     rs.getLong("penalty_ms"),
                     (Long) rs.getObject("total_time_ms"),
                     rs.getInt("display_order"));
+        }
+    }
+
+    private static final class CheckpointRowMapper implements RowMapper<CheckpointRow> {
+        @Override
+        public CheckpointRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new CheckpointRow(
+                    rs.getString("race_id"),
+                    rs.getString("checkpoint_code"),
+                    rs.getInt("seq"),
+                    rs.getLong("created_at"));
+        }
+    }
+
+    private static final class SplitTimeRowMapper implements RowMapper<SplitTimeRow> {
+        @Override
+        public SplitTimeRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new SplitTimeRow(
+                    rs.getString("timing_id"),
+                    rs.getString("race_id"),
+                    rs.getString("bib"),
+                    rs.getString("checkpoint_code"),
+                    rs.getInt("seq"),
+                    rs.getLong("elapsed_ms"),
+                    rs.getLong("created_at"));
+        }
+    }
+
+    private static final class SnapshotSplitRowMapper implements RowMapper<SnapshotSplitRow> {
+        @Override
+        public SnapshotSplitRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new SnapshotSplitRow(
+                    rs.getString("race_id"),
+                    rs.getString("bib"),
+                    rs.getString("checkpoint_code"),
+                    rs.getInt("seq"),
+                    (Long) rs.getObject("elapsed_ms"));
         }
     }
 

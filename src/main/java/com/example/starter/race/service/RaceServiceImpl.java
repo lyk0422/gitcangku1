@@ -1,23 +1,33 @@
 package com.example.starter.race.service;
 
 import com.example.starter.race.api.AddPenaltyRequest;
+import com.example.starter.race.api.CheckpointConfigResponse;
+import com.example.starter.race.api.CheckpointInfo;
+import com.example.starter.race.api.ConfigureCheckpointsRequest;
 import com.example.starter.race.api.CreateRaceRequest;
+import com.example.starter.race.api.MissingCheckpointsResponse;
 import com.example.starter.race.api.RaceResponse;
+import com.example.starter.race.api.RecordSplitRequest;
 import com.example.starter.race.api.RegisterRunnerRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
+import com.example.starter.race.api.RunnerSplitsResponse;
 import com.example.starter.race.api.SealRaceRequest;
+import com.example.starter.race.api.SplitDetailResponse;
 import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
+import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.IdempotencyRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
 import com.example.starter.race.persistence.RunnerRow;
 import com.example.starter.race.persistence.SnapshotEntryRow;
 import com.example.starter.race.persistence.SnapshotRow;
+import com.example.starter.race.persistence.SnapshotSplitRow;
+import com.example.starter.race.persistence.SplitTimeRow;
 import com.example.starter.race.persistence.RaceRepository;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -30,10 +40,14 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.HexFormat;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.function.Supplier;
 
@@ -57,6 +71,8 @@ public class RaceServiceImpl implements RaceService {
     private static final long MAX_FINISH_TIME_MS = 86_400_000L;
     /** 加时处罚上界（毫秒），含端点：1小时。 */
     private static final long MAX_PENALTY_MS = 3_600_000L;
+    /** 单赛事检查点数量上界。 */
+    private static final int MAX_CHECKPOINTS = 20;
     /** 同键并发时等待先行者事务结束的上限（毫秒）。 */
     private static final long INFLIGHT_WAIT_MAX_MS = 30_000L;
 
@@ -222,7 +238,9 @@ public class RaceServiceImpl implements RaceService {
                     }
                     List<RunnerRow> runners = repository.findRunners(raceId);
                     List<PenaltyRow> penalties = repository.findPenalties(raceId);
-                    List<ResultEntry> entries = ResultCalculator.compute(runners, penalties);
+                    SplitView splitView = loadSplitView(raceId, runners);
+                    List<ResultEntry> entries = ResultCalculator.compute(
+                            runners, penalties, splitView.missingCheckpointBibs());
 
                     int newVersion = request.expectedVersion() + 1;
                     int updated = repository.sealIfOpenAtVersion(
@@ -246,9 +264,25 @@ public class RaceServiceImpl implements RaceService {
                     }
                     repository.insertSnapshot(new SnapshotRow(raceId, newVersion, now,
                             snapshotEntries));
+                    // 同一事务内固化每名选手的分段明细与缺失检查点（elapsed_ms 为 NULL 表示漏点）
+                    if (splitView.configured()) {
+                        List<SnapshotSplitRow> snapshotSplits = new ArrayList<>();
+                        for (RunnerRow runner : runners) {
+                            for (SplitDetailResponse detail
+                                    : splitView.splitsByBib().get(runner.bib())) {
+                                snapshotSplits.add(new SnapshotSplitRow(
+                                        raceId, runner.bib(), detail.checkpointCode(),
+                                        detail.seq(), detail.elapsedMillis()));
+                            }
+                        }
+                        repository.insertSnapshotSplits(snapshotSplits);
+                    }
                     return ServiceResult.ok(new StandingResponse(
                             raceId, newVersion, RaceStatus.SEALED, now,
-                            snapshotEntries.stream().map(ResponseMapper::toEntryResponse).toList()));
+                            entries.stream()
+                                    .map(entry -> ResponseMapper.toEntryResponse(
+                                            entry, splitView.splitsOf(entry.bib())))
+                                    .toList()));
                 });
     }
 
@@ -261,10 +295,17 @@ public class RaceServiceImpl implements RaceService {
             SnapshotRow snapshot = repository.findSnapshot(raceId)
                     .orElseThrow(() -> new IllegalStateException(
                             "赛事已封榜但缺少快照: " + raceId));
-            return ResponseMapper.snapshotStanding(snapshot);
+            return ResponseMapper.snapshotStanding(
+                    snapshot, snapshotSplitsByBib(raceId));
         }
+        List<RunnerRow> runners = repository.findRunners(raceId);
+        SplitView splitView = loadSplitView(raceId, runners);
         return ResponseMapper.liveStanding(
-                race, repository.findRunners(raceId), repository.findPenalties(raceId));
+                race,
+                runners,
+                repository.findPenalties(raceId),
+                splitView.missingCheckpointBibs(),
+                splitView.configured() ? splitView.splitsByBib() : null);
     }
 
     @Override
@@ -274,7 +315,162 @@ public class RaceServiceImpl implements RaceService {
                 .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
         SnapshotRow snapshot = repository.findSnapshot(raceId)
                 .orElseThrow(() -> new NotFoundException("赛事尚未封榜: " + raceId));
-        return ResponseMapper.snapshotStanding(snapshot);
+        return ResponseMapper.snapshotStanding(snapshot, snapshotSplitsByBib(raceId));
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult configureCheckpoints(String raceId, ConfigureCheckpointsRequest request) {
+        return withIdempotency(request.requestId(), "CONFIGURE_CHECKPOINTS",
+                orderedParams(
+                        "raceId", raceId,
+                        "checkpointCodes", request.checkpointCodes(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    List<String> codes = request.checkpointCodes();
+                    if (codes == null || codes.isEmpty() || codes.size() > MAX_CHECKPOINTS) {
+                        throw new BadRequestException("检查点数量必须在 1~20 之间");
+                    }
+                    for (String code : codes) {
+                        if (code == null || code.isBlank() || code.length() > 64) {
+                            throw new BadRequestException("checkpointCode 不能为空且长度不超过64");
+                        }
+                    }
+                    if (new HashSet<>(codes).size() != codes.size()) {
+                        throw new BadRequestException("checkpointCode 在赛事内必须唯一");
+                    }
+                    if (!repository.findCheckpoints(raceId).isEmpty()) {
+                        throw new ConflictException("检查点已配置，不可修改: " + raceId);
+                    }
+                    if (repository.countSplitsForRace(raceId) > 0) {
+                        throw new ConflictException("已存在分段记录，禁止配置检查点: " + raceId);
+                    }
+                    long now = clock.millis();
+                    bumpVersion(race, request.expectedVersion());
+                    repository.insertCheckpoints(raceId, codes, now);
+                    List<CheckpointInfo> checkpoints = new ArrayList<>(codes.size());
+                    for (int index = 0; index < codes.size(); index++) {
+                        checkpoints.add(new CheckpointInfo(codes.get(index), index + 1));
+                    }
+                    RaceRow refreshed = repository.findRace(raceId).orElseThrow();
+                    return ServiceResult.created(new CheckpointConfigResponse(
+                            raceId, refreshed.version(), checkpoints));
+                });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult recordSplit(String raceId, String bib, RecordSplitRequest request) {
+        return withIdempotency(request.requestId(), "RECORD_SPLIT",
+                orderedParams(
+                        "raceId", raceId,
+                        "bib", bib,
+                        "checkpointCode", request.checkpointCode(),
+                        "elapsedMillis", request.elapsedMillis(),
+                        "expectedVersion", request.expectedVersion(),
+                        "timingId", request.timingId()),
+                () -> {
+                    // timingId 业务幂等先于版本校验：同参重放原结果，异参409
+                    Optional<SplitTimeRow> existing =
+                            repository.findSplitByTimingId(request.timingId());
+                    if (existing.isPresent()) {
+                        SplitTimeRow row = existing.get();
+                        if (row.raceId().equals(raceId) && row.bib().equals(bib)
+                                && row.checkpointCode().equals(request.checkpointCode())
+                                && request.elapsedMillis() != null
+                                && row.elapsedMs() == request.elapsedMillis()) {
+                            return ServiceResult.created(ResponseMapper.toSplitTimeResponse(row));
+                        }
+                        throw new ConflictException(
+                                "timingId 已用于不同参数的分段记录: " + request.timingId());
+                    }
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    RunnerRow runner = requireRunner(raceId, bib);
+                    CheckpointRow checkpoint = repository
+                            .findCheckpoint(raceId, request.checkpointCode())
+                            .orElseThrow(() -> new NotFoundException(
+                                    "检查点不存在: " + request.checkpointCode()));
+                    if (request.elapsedMillis() == null) {
+                        throw new BadRequestException("分段记录必须携带 elapsedMillis");
+                    }
+                    long elapsedMs = request.elapsedMillis();
+                    if (elapsedMs < 1 || elapsedMs > MAX_FINISH_TIME_MS) {
+                        throw new BadRequestException("分段耗时毫秒数必须在 1~86400000 之间");
+                    }
+                    if (runner.finishTimeMs() != null && elapsedMs >= runner.finishTimeMs()) {
+                        throw new UnprocessableException(
+                                "分段耗时必须小于该选手原始完赛耗时: " + bib);
+                    }
+                    if (repository.findSplit(raceId, bib, request.checkpointCode()).isPresent()) {
+                        throw new ConflictException(
+                                "该选手在此检查点已有分段记录: " + request.checkpointCode());
+                    }
+                    validateAdjacentSplits(raceId, bib, checkpoint, elapsedMs);
+                    long now = clock.millis();
+                    bumpVersion(race, request.expectedVersion());
+                    try {
+                        repository.insertSplit(request.timingId(), raceId, bib,
+                                request.checkpointCode(), elapsedMs, now);
+                    } catch (DuplicateKeyException ex) {
+                        throw new ConflictException("分段记录唯一键冲突: " + request.timingId());
+                    }
+                    SplitTimeRow row = repository.findSplitByTimingId(request.timingId())
+                            .orElseThrow();
+                    return ServiceResult.created(ResponseMapper.toSplitTimeResponse(row));
+                });
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public RunnerSplitsResponse getRunnerSplits(String raceId, String bib) {
+        repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        requireRunner(raceId, bib);
+        List<CheckpointRow> checkpoints = repository.findCheckpoints(raceId);
+        Map<String, Long> elapsedByCode = new HashMap<>();
+        for (SplitTimeRow split : repository.findSplitsForRunner(raceId, bib)) {
+            elapsedByCode.put(split.checkpointCode(), split.elapsedMs());
+        }
+        List<SplitDetailResponse> splits = new ArrayList<>(checkpoints.size());
+        for (CheckpointRow checkpoint : checkpoints) {
+            splits.add(new SplitDetailResponse(checkpoint.checkpointCode(), checkpoint.seq(),
+                    elapsedByCode.get(checkpoint.checkpointCode())));
+        }
+        return new RunnerSplitsResponse(raceId, bib, splits);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public MissingCheckpointsResponse getMissingCheckpoints(String raceId) {
+        repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        List<CheckpointRow> checkpoints = repository.findCheckpoints(raceId);
+        List<MissingCheckpointsResponse.RunnerMissingResponse> missingRunners = new ArrayList<>();
+        if (!checkpoints.isEmpty()) {
+            Map<String, Set<String>> coveredByBib = new HashMap<>();
+            for (SplitTimeRow split : repository.findSplitsForRace(raceId)) {
+                coveredByBib.computeIfAbsent(split.bib(), key -> new HashSet<>())
+                        .add(split.checkpointCode());
+            }
+            for (RunnerRow runner : repository.findRunners(raceId)) {
+                if (runner.finishTimeMs() == null) {
+                    continue;
+                }
+                Set<String> covered = coveredByBib.getOrDefault(runner.bib(), Set.of());
+                List<String> missing = new ArrayList<>();
+                for (CheckpointRow checkpoint : checkpoints) {
+                    if (!covered.contains(checkpoint.checkpointCode())) {
+                        missing.add(checkpoint.checkpointCode());
+                    }
+                }
+                if (!missing.isEmpty()) {
+                    missingRunners.add(new MissingCheckpointsResponse.RunnerMissingResponse(
+                            runner.bib(), missing));
+                }
+            }
+        }
+        return new MissingCheckpointsResponse(raceId, missingRunners);
     }
 
     /**
@@ -422,6 +618,105 @@ public class RaceServiceImpl implements RaceService {
         } catch (InterruptedException ex) {
             Thread.currentThread().interrupt();
             throw new ConflictException("等待同键请求完成时被中断");
+        }
+    }
+
+    /**
+     * 相邻约束校验：新记录与已存在的前后相邻记录比较，
+     * 按检查点顺序耗时必须严格递增；违反抛出422且不写入。
+     * 并发安全由赛事版本条件 UPDATE 串行化保证（校验后 bumpVersion 失败即409重试）。
+     */
+    private void validateAdjacentSplits(
+            String raceId, String bib, CheckpointRow checkpoint, long elapsedMs) {
+        SplitTimeRow previous = null;
+        SplitTimeRow next = null;
+        for (SplitTimeRow split : repository.findSplitsForRunner(raceId, bib)) {
+            if (split.seq() < checkpoint.seq()) {
+                previous = split;
+            } else if (split.seq() > checkpoint.seq()) {
+                next = split;
+                break;
+            }
+        }
+        if (previous != null && previous.elapsedMs() >= elapsedMs) {
+            throw new UnprocessableException(
+                    "分段耗时必须大于前一检查点记录: " + previous.checkpointCode());
+        }
+        if (next != null && elapsedMs >= next.elapsedMs()) {
+            throw new UnprocessableException(
+                    "分段耗时必须小于后一检查点记录: " + next.checkpointCode());
+        }
+    }
+
+    /**
+     * 加载赛事分段视图：检查点配置、漏点选手集合（已完赛但未覆盖全部检查点）、
+     * 每名选手按检查点顺序排列的分段明细（缺失为 null）。未配置检查点时返回空视图。
+     */
+    private SplitView loadSplitView(String raceId, List<RunnerRow> runners) {
+        List<CheckpointRow> checkpoints = repository.findCheckpoints(raceId);
+        if (checkpoints.isEmpty()) {
+            return new SplitView(List.of(), Set.of(), Map.of());
+        }
+        Map<String, Map<String, Long>> elapsedByBib = new HashMap<>();
+        for (SplitTimeRow split : repository.findSplitsForRace(raceId)) {
+            elapsedByBib.computeIfAbsent(split.bib(), key -> new HashMap<>())
+                    .put(split.checkpointCode(), split.elapsedMs());
+        }
+        Set<String> missingCheckpointBibs = new HashSet<>();
+        Map<String, List<SplitDetailResponse>> splitsByBib = new LinkedHashMap<>();
+        for (RunnerRow runner : runners) {
+            Map<String, Long> elapsed = elapsedByBib.getOrDefault(runner.bib(), Map.of());
+            List<SplitDetailResponse> details = new ArrayList<>(checkpoints.size());
+            boolean hasMissing = false;
+            for (CheckpointRow checkpoint : checkpoints) {
+                Long elapsedMs = elapsed.get(checkpoint.checkpointCode());
+                if (elapsedMs == null) {
+                    hasMissing = true;
+                }
+                details.add(new SplitDetailResponse(
+                        checkpoint.checkpointCode(), checkpoint.seq(), elapsedMs));
+            }
+            splitsByBib.put(runner.bib(), details);
+            if (runner.finishTimeMs() != null && hasMissing) {
+                missingCheckpointBibs.add(runner.bib());
+            }
+        }
+        return new SplitView(checkpoints, missingCheckpointBibs, splitsByBib);
+    }
+
+    /** 读取封榜快照固化的分段明细，按参赛号分组；未配置检查点的赛事返回 null（响应省略 splits）。 */
+    private Map<String, List<SplitDetailResponse>> snapshotSplitsByBib(String raceId) {
+        List<SnapshotSplitRow> splits = repository.findSnapshotSplits(raceId);
+        if (splits.isEmpty()) {
+            return null;
+        }
+        Map<String, List<SplitDetailResponse>> splitsByBib = new LinkedHashMap<>();
+        for (SnapshotSplitRow split : splits) {
+            splitsByBib.computeIfAbsent(split.bib(), key -> new ArrayList<>())
+                    .add(new SplitDetailResponse(
+                            split.checkpointCode(), split.seq(), split.elapsedMs()));
+        }
+        return splitsByBib;
+    }
+
+    /**
+     * 分段视图。
+     *
+     * @param checkpoints           检查点配置（按顺序升序）；空表示赛事未配置检查点
+     * @param missingCheckpointBibs 已完赛但未覆盖全部检查点的选手参赛号
+     * @param splitsByBib           每名选手按检查点顺序排列的分段明细（缺失为 null）
+     */
+    private record SplitView(
+            List<CheckpointRow> checkpoints,
+            Set<String> missingCheckpointBibs,
+            Map<String, List<SplitDetailResponse>> splitsByBib) {
+
+        private boolean configured() {
+            return !checkpoints.isEmpty();
+        }
+
+        private List<SplitDetailResponse> splitsOf(String bib) {
+            return configured() ? splitsByBib.get(bib) : null;
         }
     }
 }

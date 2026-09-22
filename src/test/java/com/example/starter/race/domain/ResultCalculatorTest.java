@@ -119,4 +119,53 @@ class ResultCalculatorTest {
         assertThat(entries.get(1).penaltyMs()).isEqualTo(50L);
         assertThat(entries.get(1).totalTimeMs()).isEqualTo(250L);
     }
+
+    @Test
+    void 已完赛但漏点的选手为MISSING_CHECKPOINT且不参与排名() {
+        List<Runner> runners = List.of(
+                new Runner("a", 1000L),
+                new Runner("b", 2000L),
+                new Runner("c", 500L));
+
+        List<ResultEntry> entries = ResultCalculator.compute(
+                runners, List.of(), java.util.Set.of("b"));
+
+        assertThat(entries).extracting(ResultEntry::bib).containsExactly("c", "a", "b");
+        assertThat(entries).extracting(ResultEntry::status).containsExactly(
+                EntryStatus.RANKED, EntryStatus.RANKED, EntryStatus.MISSING_CHECKPOINT);
+        assertThat(entries).extracting(ResultEntry::rank).containsExactly(1, 2, null);
+        assertThat(entries.get(2).totalTimeMs()).isNull();
+    }
+
+    @Test
+    void 漏点集合为空时退化为原排名规则() {
+        List<Runner> runners = List.of(
+                new Runner("a", 1000L),
+                new Runner("b", 2000L));
+
+        List<ResultEntry> entries = ResultCalculator.compute(
+                runners, List.of(), java.util.Set.of());
+
+        assertThat(entries).extracting(ResultEntry::status)
+                .containsOnly(EntryStatus.RANKED);
+        assertThat(entries).extracting(ResultEntry::rank).containsExactly(1, 2);
+    }
+
+    @Test
+    void 取消资格优先于漏点且未计时不受漏点影响() {
+        List<Runner> runners = List.of(
+                new Runner("dq", 1000L),
+                new Runner("untimed", null),
+                new Runner("ok", 2000L));
+        List<Penalty> penalties = List.of(
+                new Penalty("dq", PenaltyType.DISQUALIFY, null, false));
+
+        List<ResultEntry> entries = ResultCalculator.compute(
+                runners, penalties, java.util.Set.of("dq", "untimed"));
+
+        assertThat(entries).extracting(ResultEntry::bib)
+                .containsExactly("ok", "dq", "untimed");
+        assertThat(entries).extracting(ResultEntry::status).containsExactly(
+                EntryStatus.RANKED, EntryStatus.DISQUALIFIED, EntryStatus.UNTIMED);
+    }
 }

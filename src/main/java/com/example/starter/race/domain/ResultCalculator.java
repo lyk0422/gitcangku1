@@ -14,6 +14,7 @@ import java.util.Map;
  *   <li>总耗时=原始完赛耗时+全部未撤销 ADD_TIME 加时之和；</li>
  *   <li>存在未撤销 DISQUALIFY 处罚时状态 DISQUALIFIED，不排名，全部撤销后恢复计算；</li>
  *   <li>原始耗时缺失（null）时状态 UNTIMED，不排名；</li>
+ *   <li>已有完赛耗时但未覆盖全部检查点时状态 MISSING_CHECKPOINT，不排名，覆盖齐全后恢复排名；</li>
  *   <li>正常选手按总耗时升序，同耗时同名次，下一名次跳过并列人数（1、1、3）；</li>
  *   <li>并列者及未排名者内部均按参赛号字典序展示。</li>
  * </ul>
@@ -24,7 +25,7 @@ public final class ResultCalculator {
     }
 
     /**
-     * 计算即时成绩。
+     * 计算即时成绩（无检查点概念，等价于漏点集合为空）。
      *
      * @param runnerView 全部选手视图（参赛号、原始完赛耗时）
      * @param penalties  全部处罚（含已撤销）
@@ -33,6 +34,21 @@ public final class ResultCalculator {
     public static List<ResultEntry> compute(
             List<? extends RunnerView> runnerView,
             List<? extends PenaltyView> penalties) {
+        return compute(runnerView, penalties, java.util.Set.of());
+    }
+
+    /**
+     * 计算即时成绩。
+     *
+     * @param runnerView             全部选手视图（参赛号、原始完赛耗时）
+     * @param penalties              全部处罚（含已撤销）
+     * @param missingCheckpointBibs  已完赛但未覆盖全部检查点的选手参赛号；未配置检查点的赛事传空集合
+     * @return 按展示顺序排列的成绩条目
+     */
+    public static List<ResultEntry> compute(
+            List<? extends RunnerView> runnerView,
+            List<? extends PenaltyView> penalties,
+            java.util.Set<String> missingCheckpointBibs) {
         Map<String, Aggregate> aggregates = new LinkedHashMap<>();
         for (RunnerView runner : runnerView) {
             aggregates.put(runner.bib(), new Aggregate(runner.bib(), runner.finishTimeMs()));
@@ -57,6 +73,9 @@ public final class ResultCalculator {
                 others.add(aggregate);
             } else if (aggregate.finishTimeMs == null) {
                 aggregate.status = EntryStatus.UNTIMED;
+                others.add(aggregate);
+            } else if (missingCheckpointBibs.contains(aggregate.bib)) {
+                aggregate.status = EntryStatus.MISSING_CHECKPOINT;
                 others.add(aggregate);
             } else {
                 aggregate.status = EntryStatus.RANKED;

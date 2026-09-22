@@ -198,4 +198,133 @@ class RaceApiH2Test extends AbstractRaceH2Test {
                                 """))
                 .andExpect(status().isConflict());
     }
+
+    @Test
+    void 分段计时全链路_配置_乱序提交_漏点_422_封榜() throws Exception {
+        mockMvc.perform(post("/api/races")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"raceId":"race-split-api","requestId":"sp-create"}
+                                """))
+                .andExpect(status().isCreated());
+
+        // 配置检查点（v1 -> v2）
+        mockMvc.perform(post("/api/races/race-split-api/checkpoints")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"checkpointCodes":["cp1","cp2"],"expectedVersion":1,
+                                 "requestId":"sp-cp"}
+                                """))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.version").value(2))
+                .andExpect(jsonPath("$.checkpoints[0].checkpointCode").value("cp1"))
+                .andExpect(jsonPath("$.checkpoints[0].seq").value(1))
+                .andExpect(jsonPath("$.checkpoints[1].seq").value(2));
+
+        // 重复配置 409
+        mockMvc.perform(post("/api/races/race-split-api/checkpoints")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"checkpointCodes":["cpA"],"expectedVersion":2,
+                                 "requestId":"sp-cp-again"}
+                                """))
+                .andExpect(status().isConflict());
+
+        // 登记选手（v2 -> v3）
+        mockMvc.perform(post("/api/races/race-split-api/runners")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"bib":"a","finishTimeMs":10000,"expectedVersion":2,
+                                 "requestId":"sp-reg-a"}
+                                """))
+                .andExpect(status().isCreated());
+
+        // 已完赛但未覆盖检查点 -> MISSING_CHECKPOINT 不排名
+        mockMvc.perform(get("/api/races/race-split-api/results"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.entries[0].status").value("MISSING_CHECKPOINT"))
+                .andExpect(jsonPath("$.entries[0].rank").doesNotExist())
+                .andExpect(jsonPath("$.entries[0].splits[0].checkpointCode").value("cp1"))
+                .andExpect(jsonPath("$.entries[0].splits[0].elapsedMillis").doesNotExist());
+
+        // 乱序提交：先 cp2 后 cp1（v3 -> v5）
+        mockMvc.perform(post("/api/races/race-split-api/runners/a/splits")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"checkpointCode":"cp2","elapsedMillis":5000,
+                                 "expectedVersion":3,"timingId":"t-2","requestId":"sp-s2"}
+                                """))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.timingId").value("t-2"))
+                .andExpect(jsonPath("$.seq").value(2));
+
+        // 相邻约束违反 -> 422，且不写入
+        mockMvc.perform(post("/api/races/race-split-api/runners/a/splits")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"checkpointCode":"cp1","elapsedMillis":9000,
+                                 "expectedVersion":4,"timingId":"t-1","requestId":"sp-s1"}
+                                """))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error").value("UNPROCESSABLE"));
+
+        // 修正后成功（v4 -> v5），恢复排名
+        mockMvc.perform(post("/api/races/race-split-api/runners/a/splits")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"checkpointCode":"cp1","elapsedMillis":1000,
+                                 "expectedVersion":4,"timingId":"t-1","requestId":"sp-s1"}
+                                """))
+                .andExpect(status().isCreated());
+        mockMvc.perform(get("/api/races/race-split-api/results"))
+                .andExpect(jsonPath("$.entries[0].status").value("RANKED"))
+                .andExpect(jsonPath("$.entries[0].rank").value(1))
+                .andExpect(jsonPath("$.entries[0].splits[0].elapsedMillis").value(1000))
+                .andExpect(jsonPath("$.entries[0].splits[1].elapsedMillis").value(5000));
+
+        // timingId 同参重放（旧版本号）仍返回原结果
+        mockMvc.perform(post("/api/races/race-split-api/runners/a/splits")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"checkpointCode":"cp1","elapsedMillis":1000,
+                                 "expectedVersion":3,"timingId":"t-1","requestId":"sp-s1-retry"}
+                                """))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.timingId").value("t-1"));
+        // timingId 异参 409
+        mockMvc.perform(post("/api/races/race-split-api/runners/a/splits")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"checkpointCode":"cp1","elapsedMillis":2000,
+                                 "expectedVersion":5,"timingId":"t-1","requestId":"sp-s1-diff"}
+                                """))
+                .andExpect(status().isConflict());
+
+        // 单选手分段查询与缺失汇总
+        mockMvc.perform(get("/api/races/race-split-api/runners/a/splits"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.splits[0].checkpointCode").value("cp1"))
+                .andExpect(jsonPath("$.splits[0].elapsedMillis").value(1000))
+                .andExpect(jsonPath("$.splits[1].elapsedMillis").value(5000));
+        mockMvc.perform(get("/api/races/race-split-api/missing-checkpoints"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.runners").isEmpty());
+
+        // 封榜（v5 -> v6）后禁止新增分段
+        mockMvc.perform(post("/api/races/race-split-api/seal")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"expectedVersion":5,"requestId":"sp-seal"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("SEALED"))
+                .andExpect(jsonPath("$.entries[0].splits[0].elapsedMillis").value(1000));
+        mockMvc.perform(post("/api/races/race-split-api/runners/a/splits")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"checkpointCode":"cp1","elapsedMillis":500,
+                                 "expectedVersion":6,"timingId":"t-9","requestId":"sp-s9"}
+                                """))
+                .andExpect(status().isConflict());
+    }
 }
