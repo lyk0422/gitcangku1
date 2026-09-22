@@ -4,10 +4,13 @@ import com.example.starter.firmware.api.CreateReleaseRequest;
 import com.example.starter.firmware.api.PullResponse;
 import com.example.starter.firmware.api.ReceiptRequest;
 import com.example.starter.firmware.api.RegisterDeviceRequest;
+import com.example.starter.firmware.api.ResumeReleaseRequest;
 import com.example.starter.firmware.domain.ReceiptResult;
+import com.example.starter.firmware.domain.ReleaseOrder;
 import com.example.starter.firmware.domain.ReleaseStatus;
 import com.example.starter.firmware.domain.TaskStatus;
 import com.example.starter.firmware.error.ApiException;
+import com.example.starter.firmware.repo.PauseRecordRepository;
 import com.example.starter.firmware.repo.ReleaseRepository;
 import com.example.starter.firmware.repo.TaskRepository;
 import com.example.starter.firmware.service.DeviceService;
@@ -54,6 +57,9 @@ class FirmwareConcurrencyTest {
     private ReleaseRepository releaseRepository;
 
     @Autowired
+    private PauseRecordRepository pauseRecordRepository;
+
+    @Autowired
     private JdbcTemplate jdbc;
 
     private ExecutorService executor;
@@ -61,6 +67,8 @@ class FirmwareConcurrencyTest {
     @BeforeEach
     void setUp() {
         jdbc.update("DELETE FROM rollout_task");
+        jdbc.update("DELETE FROM release_pause_record");
+        jdbc.update("DELETE FROM release_resume_record");
         jdbc.update("DELETE FROM release_order");
         jdbc.update("DELETE FROM device");
         jdbc.update("DELETE FROM idempotency_record");
@@ -227,5 +235,112 @@ class FirmwareConcurrencyTest {
         // 版本只加一次，证明重放而非重复执行
         assertThat(releaseService.findOrder(releaseId).version()).isEqualTo(2);
         assertThat(releaseService.findOrder(releaseId).ratio()).isEqualTo(60);
+    }
+
+    @Test
+    void 并发失败回执_统计不丢失且每轮至多一条暂停记录() throws Exception {
+        int devices = 8;
+        for (int i = 0; i < devices; i++) {
+            deviceService.register(new RegisterDeviceRequest("req-d" + i, "d" + i, "m1", "1.0.0", i));
+        }
+        long releaseId = releaseService.create(
+                new CreateReleaseRequest("req-r", "m1", "1.0.0", "2.0.0", 100, 2, 50)).releaseId();
+        List<Long> taskIds = new ArrayList<>();
+        for (int i = 0; i < devices; i++) {
+            taskIds.add(taskService.pull("d" + i, "req-p" + i).task().taskId());
+        }
+
+        List<Callable<Object>> tasks = new ArrayList<>();
+        for (int i = 0; i < devices; i++) {
+            long taskId = taskIds.get(i);
+            tasks.add(() -> taskService.receipt(taskId,
+                    new ReceiptRequest("req-rc" + taskId, ReceiptResult.FAILED)));
+        }
+        List<Object> results = runConcurrently(tasks);
+        assertThat(results).noneMatch(r -> r instanceof Exception);
+
+        ReleaseOrder order = releaseService.findOrder(releaseId);
+        assertThat(order.status()).isEqualTo(ReleaseStatus.PAUSED);
+        assertThat(order.roundFailed()).isEqualTo(devices);
+        assertThat(order.roundSuccess()).isZero();
+        // 并发回执串行通过发布单行锁：每轮至多一条暂停记录
+        assertThat(pauseRecordRepository.countByRelease(releaseId)).isEqualTo(1);
+    }
+
+    @Test
+    void 并发恢复与取消_按提交顺序产生唯一合法状态() throws Exception {
+        int cancelFirst = 0;
+        int resumeFirst = 0;
+        for (int round = 0; round < 10; round++) {
+            String model = "m" + round;
+            deviceService.register(new RegisterDeviceRequest("req-d" + round, "d" + round, model, "1.0.0", 1));
+            deviceService.register(new RegisterDeviceRequest("req-e" + round, "e" + round, model, "1.0.0", 2));
+            long releaseId = releaseService.create(
+                    new CreateReleaseRequest("req-r" + round, model, "1.0.0", "2.0.0", 100, 2, 50)).releaseId();
+            long t1 = taskService.pull("d" + round, "req-p1-" + round).task().taskId();
+            long t2 = taskService.pull("e" + round, "req-p2-" + round).task().taskId();
+            taskService.receipt(t1, new ReceiptRequest("req-f1-" + round, ReceiptResult.FAILED));
+            taskService.receipt(t2, new ReceiptRequest("req-f2-" + round, ReceiptResult.FAILED));
+            assertThat(releaseService.findOrder(releaseId).status()).isEqualTo(ReleaseStatus.PAUSED);
+            final int seq = round;
+
+            List<Object> results = runConcurrently(List.of(
+                    (Callable<Object>) () -> releaseService.resume(releaseId,
+                            new ResumeReleaseRequest("req-res" + seq, 1, "修复完成")),
+                    (Callable<Object>) () -> releaseService.cancel(releaseId, "req-can" + seq)));
+
+            Object resumeResult = results.get(0);
+            assertThat(results.get(1)).as("取消对既有发布单始终成功").isNotInstanceOf(Exception.class);
+            ReleaseOrder finalOrder = releaseService.findOrder(releaseId);
+            assertThat(finalOrder.status()).isEqualTo(ReleaseStatus.CANCELLED);
+            Long resumeRecords = jdbc.queryForObject(
+                    "SELECT COUNT(*) FROM release_resume_record WHERE release_id = ?", Long.class, releaseId);
+            if (resumeResult instanceof ApiException ae) {
+                // 取消先提交：恢复 409，版本与统计不变，无恢复记录
+                cancelFirst++;
+                assertThat(ae.status()).isEqualTo(HttpStatus.CONFLICT);
+                assertThat(ae.code()).isEqualTo("RELEASE_CANCELLED");
+                assertThat(resumeRecords).isZero();
+                assertThat(finalOrder.version()).isEqualTo(1);
+            } else {
+                // 恢复先提交：版本加一、开启第2轮，随后取消将其终结
+                resumeFirst++;
+                assertThat(resumeResult).isNotInstanceOf(Exception.class);
+                assertThat(resumeRecords).isEqualTo(1);
+                assertThat(finalOrder.version()).isEqualTo(2);
+            }
+        }
+        assertThat(cancelFirst + resumeFirst).isEqualTo(10);
+    }
+
+    @Test
+    void 并发同requestId恢复_重放一致且版本只加一次() throws Exception {
+        deviceService.register(new RegisterDeviceRequest("req-d1", "d1", "m1", "1.0.0", 1));
+        deviceService.register(new RegisterDeviceRequest("req-d2", "d2", "m1", "1.0.0", 2));
+        long releaseId = releaseService.create(
+                new CreateReleaseRequest("req-r", "m1", "1.0.0", "2.0.0", 100, 2, 50)).releaseId();
+        long t1 = taskService.pull("d1", "req-p1").task().taskId();
+        long t2 = taskService.pull("d2", "req-p2").task().taskId();
+        taskService.receipt(t1, new ReceiptRequest("req-f1", ReceiptResult.FAILED));
+        taskService.receipt(t2, new ReceiptRequest("req-f2", ReceiptResult.FAILED));
+        assertThat(releaseService.findOrder(releaseId).status()).isEqualTo(ReleaseStatus.PAUSED);
+
+        int threads = 6;
+        List<Callable<Object>> tasks = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            tasks.add(() -> releaseService.resume(releaseId,
+                    new ResumeReleaseRequest("req-same", 1, "修复完成")));
+        }
+        List<Object> results = runConcurrently(tasks);
+        assertThat(results).noneMatch(r -> r instanceof Exception);
+
+        ReleaseOrder order = releaseService.findOrder(releaseId);
+        assertThat(order.status()).isEqualTo(ReleaseStatus.ACTIVE);
+        assertThat(order.version()).isEqualTo(2);
+        assertThat(order.monitorRound()).isEqualTo(2);
+        assertThat(order.roundFailed()).isZero();
+        Long resumeRecords = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM release_resume_record WHERE release_id = ?", Long.class, releaseId);
+        assertThat(resumeRecords).isEqualTo(1);
     }
 }
