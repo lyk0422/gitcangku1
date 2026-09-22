@@ -4,7 +4,9 @@ import com.example.starter.batch.dto.ApproveRequest;
 import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
+import com.example.starter.batch.dto.LineageResponse;
 import com.example.starter.batch.dto.RecallRequest;
+import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpHeaders;
@@ -77,6 +79,23 @@ public class BatchController {
     @GetMapping("/available")
     public List<BatchResponse> available() {
         return service.listAvailable();
+    }
+
+    /**
+     * 将 RELEASED 批次一次拆分为 2～5 个全新子批；父批置 SPLIT。
+     */
+    @PostMapping("/{batchKey}/split")
+    public ResponseEntity<String> split(@PathVariable String batchKey,
+                                        @Valid @RequestBody SplitRequest request) {
+        return stored(service.split(batchKey, request));
+    }
+
+    /**
+     * 查询批次的祖先与后代血缘，包含各批自身状态及召回祖先信息。
+     */
+    @GetMapping("/{batchKey}/lineage")
+    public LineageResponse lineage(@PathVariable String batchKey) {
+        return service.lineage(batchKey);
     }
 
     /**

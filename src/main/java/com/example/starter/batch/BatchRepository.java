@@ -48,6 +48,12 @@ public class BatchRepository {
                              int responseStatus, String responseBody) {
     }
 
+    /**
+     * batch_lineage 表行记录：一条记录代表一次父子拆分关系，每个子批仅有一条。
+     */
+    public record LineageRow(long id, String parentKey, String childKey, String createdAt) {
+    }
+
     private static final RowMapper<BatchRow> BATCH_MAPPER = (rs, n) -> new BatchRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("product_code"),
             rs.getString("batch_no"), rs.getString("produced_at"),
@@ -70,6 +76,10 @@ public class BatchRepository {
     private static final RowMapper<CommandRow> COMMAND_MAPPER = (rs, n) -> new CommandRow(
             rs.getString("command_type"), rs.getString("command_key"), rs.getString("fingerprint"),
             rs.getInt("response_status"), rs.getString("response_body"));
+
+    private static final RowMapper<LineageRow> LINEAGE_MAPPER = (rs, n) -> new LineageRow(
+            rs.getLong("id"), rs.getString("parent_key"), rs.getString("child_key"),
+            rs.getString("created_at"));
 
     private final JdbcTemplate jdbc;
 
@@ -112,8 +122,42 @@ public class BatchRepository {
         jdbc.update("UPDATE batch SET status = ? WHERE batch_key = ?", status, batchKey);
     }
 
-    public List<BatchRow> findAvailableBatches() {
-        return jdbc.query("SELECT * FROM batch WHERE status <> 'RECALLED' ORDER BY id", BATCH_MAPPER);
+    /**
+     * 读取全部批次（按创建顺序）；可用性过滤（SPLIT、召回祖先后代）由服务层结合血缘图完成。
+     */
+    public List<BatchRow> findAllBatches() {
+        return jdbc.query("SELECT * FROM batch ORDER BY id", BATCH_MAPPER);
+    }
+
+    /**
+     * 写入一条父子拆分关系；uk_lineage_child 保证每个子批只有一个父批，关系不可改写。
+     */
+    public void insertLineage(String parentKey, String childKey, String createdAt) {
+        jdbc.update("INSERT INTO batch_lineage (parent_key, child_key, created_at) VALUES (?, ?, ?)",
+                parentKey, childKey, createdAt);
+    }
+
+    /**
+     * 查询某子批的唯一父子关系。
+     */
+    public Optional<LineageRow> findLineageByChild(String childKey) {
+        return jdbc.query("SELECT * FROM batch_lineage WHERE child_key = ?", LINEAGE_MAPPER, childKey)
+                .stream().findFirst();
+    }
+
+    /**
+     * 查询某父批一次拆分产生的全部子批关系（按写入顺序）。
+     */
+    public List<LineageRow> findLineageByParent(String parentKey) {
+        return jdbc.query("SELECT * FROM batch_lineage WHERE parent_key = ? ORDER BY id",
+                LINEAGE_MAPPER, parentKey);
+    }
+
+    /**
+     * 读取全量血缘关系；服务层据此在内存构建祖先/后代图，避免递归 CTE 的方言差异。
+     */
+    public List<LineageRow> findAllLineage() {
+        return jdbc.query("SELECT * FROM batch_lineage ORDER BY id", LINEAGE_MAPPER);
     }
 
     public Optional<TestRow> findTest(String batchKey, String testKey) {
