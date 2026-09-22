@@ -101,6 +101,39 @@ public class TranslationController {
                 () -> WriteResult.of(201, translationService.publish(documentId, request))).toResponseEntity();
     }
 
+    /**
+     * 新增术语版本：携带 expectedTermVersion 与 0~100 条完整规则集；成功后术语版本与草稿版本各加一，
+     * 已有版本不可覆盖（期望不符 409）。
+     */
+    @PutMapping("/{documentId}/terms")
+    public ResponseEntity<String> updateTerms(@PathVariable long documentId,
+                                              @Valid @RequestBody ApiDtos.UpdateTermsRequest request) {
+        String operation = "PUT /api/documents/" + documentId + "/terms";
+        return writeExecutor.execute(request.requestId(), hash(operation, request),
+                () -> WriteResult.of(201, translationService.updateTerms(documentId, request))).toResponseEntity();
+    }
+
+    /** 查询当前术语版本的不可变规则集。 */
+    @GetMapping("/{documentId}/terms")
+    public ResponseEntity<ApiDtos.TermVersionResponse> getCurrentTerms(@PathVariable long documentId) {
+        return ResponseEntity.ok(translationService.getTerms(documentId, null));
+    }
+
+    /** 查询指定术语版本的不可变规则集；版本 0 表示尚无术语表，版本不存在返回 404。 */
+    @GetMapping("/{documentId}/terms/{termVersion}")
+    public ResponseEntity<ApiDtos.TermVersionResponse> getTerms(@PathVariable long documentId,
+                                                                @PathVariable int termVersion) {
+        return ResponseEntity.ok(translationService.getTerms(documentId, termVersion));
+    }
+
+    /** 查询某译文的术语绑定状态：是否当前版本、当前源文命中规则的全部违规。 */
+    @GetMapping("/{documentId}/segments/{segmentId}/translations/{language}/term-status")
+    public ResponseEntity<ApiDtos.TranslationTermStatus> getTranslationTermStatus(
+            @PathVariable long documentId, @PathVariable String segmentId, @PathVariable String language) {
+        return ResponseEntity.ok(
+                translationService.getTranslationTermStatus(documentId, segmentId, language));
+    }
+
     /** 查询指定发布版本的只读快照。 */
     @GetMapping("/{documentId}/releases/{publishedVersion}")
     public ResponseEntity<String> getRelease(@PathVariable long documentId, @PathVariable int publishedVersion) {

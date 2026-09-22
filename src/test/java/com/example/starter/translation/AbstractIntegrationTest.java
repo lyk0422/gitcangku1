@@ -38,6 +38,8 @@ public abstract class AbstractIntegrationTest {
         jdbc.update("DELETE FROM approval");
         jdbc.update("DELETE FROM translation");
         jdbc.update("DELETE FROM segment");
+        jdbc.update("DELETE FROM term_rule");
+        jdbc.update("DELETE FROM term_version");
         jdbc.update("DELETE FROM release_snapshot");
         jdbc.update("DELETE FROM request_log");
         jdbc.update("DELETE FROM document");
