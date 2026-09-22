@@ -73,12 +73,12 @@ class ObservationConcurrencyTest {
         createObservation("obs-c1", "req-cc0");
 
         // 两个离线端都基于版本 1：一个改地点，一个改备注；互不冲突，应都生效
-        List<Callable<ObservationService.WriteOutcome>> tasks = List.of(
+        List<Callable<ObservationService.WriteOutcome<ObservationResponse>>> tasks = List.of(
                 () -> observationService.merge("obs-c1",
                         new MergeObservationRequest("req-cc1", 1, "站点B", "1.0", "初始备注")),
                 () -> observationService.merge("obs-c1",
                         new MergeObservationRequest("req-cc2", 1, "站点A", "1.0", "并发备注")));
-        List<ObservationService.WriteOutcome> outcomes = runConcurrently(tasks);
+        List<ObservationService.WriteOutcome<ObservationResponse>> outcomes = runConcurrently(tasks);
 
         assertThat(outcomes).allMatch(outcome -> outcome.status() == 200);
         ObservationResponse current = observationService.getCurrent("obs-c1");
@@ -141,12 +141,12 @@ class ObservationConcurrencyTest {
         createObservation("obs-c3", "req-ci0");
 
         // 同一 requestId、相同参数并发提交 4 次：全部返回同一结果，只产生一个新版本
-        List<Callable<ObservationService.WriteOutcome>> tasks = new ArrayList<>();
+        List<Callable<ObservationService.WriteOutcome<ObservationResponse>>> tasks = new ArrayList<>();
         for (int i = 0; i < 4; i++) {
             tasks.add(() -> observationService.merge("obs-c3",
                     new MergeObservationRequest("req-ci1", 1, "站点B", "2.0", "并发重放")));
         }
-        List<ObservationService.WriteOutcome> outcomes = runConcurrently(tasks);
+        List<ObservationService.WriteOutcome<ObservationResponse>> outcomes = runConcurrently(tasks);
 
         assertThat(outcomes).allMatch(outcome -> outcome.status() == 200);
         assertThat(outcomes).allMatch(outcome -> outcome.body().version() == 2);

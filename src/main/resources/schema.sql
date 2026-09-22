@@ -29,9 +29,31 @@ CREATE TABLE IF NOT EXISTS observation_version (
 CREATE TABLE IF NOT EXISTS request_log (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
     fingerprint VARCHAR(128) NOT NULL COMMENT '请求操作与参数的指纹，同键异参时判定 409',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：CREATE / MERGE / DELETE',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：CREATE / MERGE / DELETE / RESOLVE',
     response_status INT NULL COMMENT '成功响应的 HTTP 状态码；提交过程中暂为 NULL',
     response_body VARCHAR(4000) NULL COMMENT '成功响应体（JSON 原文），用于同键同参重放；提交过程中暂为 NULL',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '请求记录创建时间（服务器时区）',
     PRIMARY KEY (request_id)
 );
+
+-- 冲突解决记录表：每次成功解决追加一行不可变记录；未生成新观测版本时也记录（指向当前版本）。
+CREATE TABLE IF NOT EXISTS observation_resolution (
+    resolution_id VARCHAR(128) NOT NULL COMMENT '全局唯一解决标识',
+    observation_id VARCHAR(64) NOT NULL COMMENT '观测记录唯一标识',
+    base_version INT NOT NULL COMMENT '解决时使用的基线版本号',
+    previous_version INT NOT NULL COMMENT '解决前当前版本号',
+    result_version INT NOT NULL COMMENT '解决后版本号；未生成新版本时等于 previous_version',
+    version_created BOOLEAN NOT NULL COMMENT '是否生成了新观测版本：FALSE 表示解决结果与当前完全相同',
+    candidate_location VARCHAR(512) NOT NULL COMMENT '地点候选值（完整提交原文）',
+    candidate_reading VARCHAR(64) NOT NULL COMMENT '读数候选值（十进制字符串原文）',
+    candidate_note VARCHAR(1024) NOT NULL COMMENT '备注候选值',
+    conflict_fields VARCHAR(256) NOT NULL COMMENT '本次实际冲突字段，逗号分隔；无冲突时为空串',
+    selections VARCHAR(512) NOT NULL COMMENT '各冲突字段的人工选择（JSON：字段名 -> CURRENT/CANDIDATE）',
+    fingerprint VARCHAR(128) NOT NULL COMMENT '解决参数指纹，同一 resolution_id 异参判定 409',
+    operator VARCHAR(128) NOT NULL COMMENT '操作者标识',
+    resolved_at VARCHAR(40) NOT NULL COMMENT '解决时刻（UTC，ISO-8601）',
+    PRIMARY KEY (resolution_id)
+);
+
+-- 按观测记录查询解决历史的索引。
+CREATE INDEX IF NOT EXISTS idx_resolution_observation ON observation_resolution (observation_id);
