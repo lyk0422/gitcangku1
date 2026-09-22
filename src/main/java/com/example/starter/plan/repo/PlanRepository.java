@@ -4,6 +4,7 @@ import com.example.starter.plan.model.DayPlan;
 import com.example.starter.plan.model.Occupancy;
 import com.example.starter.plan.model.PlanStatus;
 import com.example.starter.plan.model.PublishedSlot;
+import com.example.starter.plan.model.Succession;
 import java.sql.Date;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
@@ -166,9 +167,61 @@ public class PlanRepository {
     }
 
     /**
+     * 按主键查询计划（不加锁）。
+     */
+    public Optional<DayPlan> findById(long planId) {
+        return jdbc.query("SELECT id, schedule_key, op_date, version, status FROM rail_day_plan"
+                        + " WHERE id = ?",
+                PLAN_MAPPER, planId).stream().findFirst();
+    }
+
+    /**
+     * 按主键查询计划并加行级写锁，须在事务内调用。
+     */
+    public Optional<DayPlan> findByIdForUpdate(long planId) {
+        return jdbc.query("SELECT id, schedule_key, op_date, version, status FROM rail_day_plan"
+                        + " WHERE id = ? FOR UPDATE",
+                PLAN_MAPPER, planId).stream().findFirst();
+    }
+
+    /**
+     * 追加不可变改签前后继关联。唯一约束保证一个计划最多一个直接前驱/后继，
+     * 冲突时抛出 DuplicateKeyException 由改签事务回滚。
+     */
+    public void insertSuccession(long predecessorPlanId, long successorPlanId, long nowMillis) {
+        jdbc.update("INSERT INTO rail_plan_succession"
+                        + " (predecessor_plan_id, successor_plan_id, created_at) VALUES (?, ?, ?)",
+                predecessorPlanId, successorPlanId, nowMillis);
+    }
+
+    /**
+     * 查询某计划的直接后继（不存在表示该计划是链上最新版本）。
+     */
+    public Optional<Succession> findSuccessionByPredecessor(long predecessorPlanId) {
+        return jdbc.query("SELECT id, predecessor_plan_id, successor_plan_id, created_at"
+                        + " FROM rail_plan_succession WHERE predecessor_plan_id = ?",
+                SUCCESSION_MAPPER, predecessorPlanId).stream().findFirst();
+    }
+
+    /**
+     * 查询某计划的直接前驱（不存在表示该计划是链上最早版本）。
+     */
+    public Optional<Succession> findSuccessionBySuccessor(long successorPlanId) {
+        return jdbc.query("SELECT id, predecessor_plan_id, successor_plan_id, created_at"
+                        + " FROM rail_plan_succession WHERE successor_plan_id = ?",
+                SUCCESSION_MAPPER, successorPlanId).stream().findFirst();
+    }
+
+    /**
      * 获取发布全局互斥锁（单行 FOR UPDATE），串行化所有发布事务。
      */
     public void acquirePublishLock() {
         jdbc.queryForObject("SELECT id FROM publish_lock WHERE id = 1 FOR UPDATE", Integer.class);
     }
+
+    private static final RowMapper<Succession> SUCCESSION_MAPPER = (rs, n) -> new Succession(
+            rs.getLong("id"),
+            rs.getLong("predecessor_plan_id"),
+            rs.getLong("successor_plan_id"),
+            rs.getLong("created_at"));
 }

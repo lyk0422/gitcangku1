@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS rail_plan_occupancy (
 
 CREATE TABLE IF NOT EXISTS idempotency_record (
     id BIGINT NOT NULL AUTO_INCREMENT COMMENT '主键',
-    op_type VARCHAR(16) NOT NULL COMMENT '操作类型：CREATE / UPDATE / PUBLISH / CANCEL',
+    op_type VARCHAR(16) NOT NULL COMMENT '操作类型：CREATE / UPDATE / PUBLISH / CANCEL / RESCHEDULE',
     request_key VARCHAR(128) NOT NULL COMMENT '客户端幂等键，同一操作类型内唯一',
     request_hash CHAR(64) NOT NULL COMMENT '请求参数规范化后的 SHA-256，同键不同参判定 409',
     response_json MEDIUMTEXT NOT NULL COMMENT '首次成功响应快照（JSON），重放原样返回',
@@ -38,8 +38,19 @@ CREATE TABLE IF NOT EXISTS idempotency_record (
 ) COMMENT='写操作幂等记录，仅缓存成功结果，失败不缓存可重试';
 
 CREATE TABLE IF NOT EXISTS publish_lock (
-    id INT NOT NULL COMMENT '锁行 id，固定为 1，发布时 SELECT ... FOR UPDATE 串行化',
+    id INT NOT NULL COMMENT '锁行 id，固定为 1，发布/改签时 SELECT ... FOR UPDATE 串行化',
     PRIMARY KEY (id)
-) COMMENT='发布全局互斥锁，保证并发发布同一区段最多一张成功';
+) COMMENT='发布/改签全局互斥锁，保证并发发布同一区段最多一张成功';
+
+-- 改签前后继关联：改签提交时追加，不可变；一个计划最多一个直接前驱和一个直接后继。
+CREATE TABLE IF NOT EXISTS rail_plan_succession (
+    id BIGINT NOT NULL AUTO_INCREMENT COMMENT '主键',
+    predecessor_plan_id BIGINT NOT NULL COMMENT '改签转出的旧计划 id，关联 rail_day_plan.id，改签后状态 CANCELLED，占用原样保留',
+    successor_plan_id BIGINT NOT NULL COMMENT '改签转入的新计划 id，关联 rail_day_plan.id，改签后状态 PUBLISHED',
+    created_at BIGINT NOT NULL COMMENT '关联创建时刻（即改签事务提交时刻），UTC 毫秒',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_succession_predecessor (predecessor_plan_id),
+    UNIQUE KEY uk_succession_successor (successor_plan_id)
+) COMMENT='日计划改签前后继不可变关联，后继可再次改签形成有序链';
 
 INSERT IGNORE INTO publish_lock (id) VALUES (1);

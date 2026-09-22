@@ -1,5 +1,6 @@
--- 测试库（H2）结构，与主 schema.sql（MySQL 方言）字段一一对应。
--- 所有时刻字段均为 UTC 毫秒时间戳；运营日期按 Asia/Shanghai 解释。
+-- 默认运行库结构（H2，MODE=MySQL 兼容），与主 schema.sql（MySQL 方言）字段一一对应。
+-- 所有时刻字段均为 UTC 毫秒时间戳（epoch millis，时区无关）；运营日期按 Asia/Shanghai 解释。
+-- 字段含义见 com.example.starter.plan.model 下记录类型的 Javadoc 与 MySQL 方言 schema.sql 的 COMMENT。
 
 CREATE TABLE IF NOT EXISTS rail_day_plan (
     id BIGINT NOT NULL AUTO_INCREMENT,

@@ -4,6 +4,7 @@ import com.example.starter.plan.model.DayPlan;
 import com.example.starter.plan.model.Occupancy;
 import com.example.starter.plan.model.PlanStatus;
 import com.example.starter.plan.model.PublishedSlot;
+import com.example.starter.plan.model.Succession;
 import com.example.starter.plan.repo.IdempotencyRepository;
 import com.example.starter.plan.repo.PlanRepository;
 import com.example.starter.plan.web.ApiException;
@@ -11,7 +12,9 @@ import com.example.starter.plan.web.dto.CreatePlanRequest;
 import com.example.starter.plan.web.dto.OccupancyRequest;
 import com.example.starter.plan.web.dto.OccupancyView;
 import com.example.starter.plan.web.dto.PlanResponse;
+import com.example.starter.plan.web.dto.PlanChainResponse;
 import com.example.starter.plan.web.dto.PublishedSlotView;
+import com.example.starter.plan.web.dto.RescheduleRequest;
 import com.example.starter.plan.web.dto.UpdateOccupanciesRequest;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.nio.charset.StandardCharsets;
@@ -50,6 +53,7 @@ public class PlanService {
     private static final String OP_UPDATE = "UPDATE";
     private static final String OP_PUBLISH = "PUBLISH";
     private static final String OP_CANCEL = "CANCEL";
+    private static final String OP_RESCHEDULE = "RESCHEDULE";
 
     private final PlanRepository planRepo;
     private final IdempotencyRepository idemRepo;
@@ -194,6 +198,122 @@ public class PlanService {
     }
 
     /**
+     * 原子改签：在同一事务内取消已发布旧计划、发布同运营日的新草稿，并追加不可变前后继关联。
+     *
+     * <p>全局发布锁内执行：先校验新草稿列车内部重叠及与其他已发布计划的区段冲突
+     * （此次校验仅排除旧计划占用，不排除任何第三方计划），再完成取消/发布/关联；
+     * 任一步失败整体回滚，旧计划仍发布、新计划仍草稿，版本、占用与关联均不变，
+     * 旧计划原始占用永不覆盖。幂等语义与其他写操作一致，失败不占用 requestKey。
+     */
+    public PlanResponse reschedule(RescheduleRequest req) {
+        if (req.oldScheduleKey().equals(req.newScheduleKey())) {
+            throw badRequest("改签的旧计划与新计划必须不同");
+        }
+        String hash = hashReschedule(req);
+        Optional<PlanResponse> replay = replayIfPresent(OP_RESCHEDULE, req.requestKey(), hash);
+        if (replay.isPresent()) {
+            return replay.get();
+        }
+        try {
+            return tx.execute(status -> {
+                planRepo.acquirePublishLock();
+                DayPlan oldPlan = planRepo.findByKeyForUpdate(req.oldScheduleKey())
+                        .orElseThrow(() -> notFound(req.oldScheduleKey()));
+                DayPlan newPlan = planRepo.findByKeyForUpdate(req.newScheduleKey())
+                        .orElseThrow(() -> notFound(req.newScheduleKey()));
+                if (oldPlan.id() == newPlan.id()) {
+                    throw badRequest("改签的旧计划与新计划必须不同");
+                }
+                if (!oldPlan.opDate().equals(newPlan.opDate())) {
+                    throw badRequest("改签新旧计划必须属于同一运营日（Asia/Shanghai）: "
+                            + oldPlan.opDate() + " / " + newPlan.opDate());
+                }
+                if (oldPlan.status() != PlanStatus.PUBLISHED) {
+                    throw conflict("PLAN_STATE_CONFLICT",
+                            "改签旧计划必须已发布，当前状态: " + oldPlan.status());
+                }
+                if (newPlan.status() != PlanStatus.DRAFT) {
+                    throw conflict("PLAN_STATE_CONFLICT",
+                            "改签新计划必须为草稿，当前状态: " + newPlan.status());
+                }
+                if (req.expectedOldVersion() != oldPlan.version()) {
+                    throw conflict("VERSION_CONFLICT",
+                            "旧计划 expectedVersion=" + req.expectedOldVersion()
+                                    + " 与当前版本 " + oldPlan.version() + " 不一致");
+                }
+                if (req.expectedNewVersion() != newPlan.version()) {
+                    throw conflict("VERSION_CONFLICT",
+                            "新计划 expectedVersion=" + req.expectedNewVersion()
+                                    + " 与当前版本 " + newPlan.version() + " 不一致");
+                }
+                if (planRepo.findSuccessionByPredecessor(oldPlan.id()).isPresent()) {
+                    throw conflict("SUCCESSION_CONFLICT",
+                            "旧计划已存在直接后继，不能重复改签: " + oldPlan.scheduleKey());
+                }
+                if (planRepo.findSuccessionBySuccessor(newPlan.id()).isPresent()) {
+                    throw conflict("SUCCESSION_CONFLICT",
+                            "新计划已存在直接前驱，不能重复关联: " + newPlan.scheduleKey());
+                }
+                List<Occupancy> newOccupancies = planRepo.findOccupancies(newPlan.id());
+                List<Map<String, Object>> conflicts = new ArrayList<>();
+                conflicts.addAll(findTrainOverlaps(newPlan.scheduleKey(), newOccupancies));
+                // 仅排除旧计划自身占用；任何第三方已发布计划仍参与冲突裁决。
+                conflicts.addAll(findSectionConflicts(newPlan, newOccupancies, oldPlan.id()));
+                if (!conflicts.isEmpty()) {
+                    throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
+                            "改签新草稿存在时隙冲突，旧计划保持发布、新计划保持草稿", conflicts);
+                }
+                long now = System.currentTimeMillis();
+                planRepo.updateStatus(oldPlan.id(), PlanStatus.CANCELLED, now);
+                planRepo.updateStatus(newPlan.id(), PlanStatus.PUBLISHED, now);
+                planRepo.insertSuccession(oldPlan.id(), newPlan.id(), now);
+                PlanResponse response = loadPlanById(newPlan.id());
+                idemRepo.insert(OP_RESCHEDULE, req.requestKey(), hash, toJson(response), now);
+                return response;
+            });
+        } catch (DuplicateKeyException e) {
+            return idemRepo.find(OP_RESCHEDULE, req.requestKey())
+                    .map(record -> {
+                        if (!record.requestHash().equals(hash)) {
+                            throw conflict("IDEMPOTENT_KEY_REUSED",
+                                    "requestKey 已用于其他参数: " + req.requestKey());
+                        }
+                        return fromJson(record.responseJson());
+                    })
+                    .orElseThrow(() -> conflict("SUCCESSION_CONFLICT",
+                            "改签关联已存在或 requestKey 冲突，改签未执行"));
+        }
+    }
+
+    /**
+     * 查询改签链：从任一版本计划出发，返回从最早版本到最新版本的完整有序链，
+     * 每一项携带该版本当时的占用快照；无改签记录时返回仅含自身的单元素链。
+     */
+    public PlanChainResponse getPlanChain(String scheduleKey) {
+        DayPlan target = planRepo.findByKey(scheduleKey)
+                .orElseThrow(() -> notFound(scheduleKey));
+        long headId = target.id();
+        while (true) {
+            Optional<Succession> predecessor = planRepo.findSuccessionBySuccessor(headId);
+            if (predecessor.isEmpty()) {
+                break;
+            }
+            headId = predecessor.get().predecessorPlanId();
+        }
+        List<PlanResponse> chain = new ArrayList<>();
+        long currentId = headId;
+        while (true) {
+            chain.add(loadPlanById(currentId));
+            Optional<Succession> successor = planRepo.findSuccessionByPredecessor(currentId);
+            if (successor.isEmpty()) {
+                break;
+            }
+            currentId = successor.get().successorPlanId();
+        }
+        return new PlanChainResponse(chain);
+    }
+
+    /**
      * 按计划业务键查询明细（含历史占用），不存在返回 404。
      */
     public PlanResponse getPlan(String scheduleKey) {
@@ -218,6 +338,16 @@ public class PlanService {
     private PlanResponse loadPlan(String scheduleKey) {
         DayPlan plan = planRepo.findByKey(scheduleKey)
                 .orElseThrow(() -> notFound(scheduleKey));
+        return toPlanResponse(plan);
+    }
+
+    private PlanResponse loadPlanById(long planId) {
+        DayPlan plan = planRepo.findById(planId)
+                .orElseThrow(() -> notFound("planId=" + planId));
+        return toPlanResponse(plan);
+    }
+
+    private PlanResponse toPlanResponse(DayPlan plan) {
         List<OccupancyView> views = planRepo.findOccupancies(plan.id()).stream()
                 .map(o -> new OccupancyView(o.trainNo(), o.sectionId(), o.startUtc(), o.endUtc()))
                 .toList();
@@ -299,11 +429,20 @@ public class PlanService {
      * 与其他已发布计划在同日期、同区段上的重叠检测（左闭右开，相邻合法）。
      */
     private List<Map<String, Object>> findSectionConflicts(DayPlan plan, List<Occupancy> occupancies) {
+        return findSectionConflicts(plan, occupancies, plan.id());
+    }
+
+    /**
+     * 与其他已发布计划的区段重叠检测，可指定排除的计划 id；
+     * 改签时排除旧计划占用（excludePlanId 为旧计划而非新草稿自身）。
+     */
+    private List<Map<String, Object>> findSectionConflicts(DayPlan plan, List<Occupancy> occupancies,
+                                                           long excludePlanId) {
         List<String> sectionIds = occupancies.stream()
                 .map(Occupancy::sectionId)
                 .collect(java.util.stream.Collectors.toCollection(TreeSet::new))
                 .stream().toList();
-        List<PublishedSlot> published = planRepo.findPublishedSlots(plan.opDate(), sectionIds, plan.id());
+        List<PublishedSlot> published = planRepo.findPublishedSlots(plan.opDate(), sectionIds, excludePlanId);
         List<Map<String, Object>> conflicts = new ArrayList<>();
         for (Occupancy o : occupancies) {
             for (PublishedSlot slot : published) {
@@ -365,6 +504,12 @@ public class PlanService {
 
     private String hashAction(String opType, String scheduleKey) {
         return sha256(opType + '\n' + scheduleKey);
+    }
+
+    private String hashReschedule(RescheduleRequest req) {
+        return sha256(String.join("\n",
+                OP_RESCHEDULE, req.oldScheduleKey(), String.valueOf(req.expectedOldVersion()),
+                req.newScheduleKey(), String.valueOf(req.expectedNewVersion())));
     }
 
     private void appendOccupancies(StringBuilder sb, List<OccupancyRequest> occupancies) {
