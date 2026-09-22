@@ -8,6 +8,7 @@ services:
     environment:
       DB_URL: "jdbc:mysql://db:3306/taskdb?sslMode=DISABLED&allowPublicKeyRetrieval=true&connectionTimeZone=Asia/Shanghai&forceConnectionTimeZoneToSession=true&connectTimeout=10000&socketTimeout=30000"
       DB_USER: taskuser
+      DB_DRIVER: com.mysql.cj.jdbc.Driver
     secrets:
       - source: db_password
         target: spring.datasource.password

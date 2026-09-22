@@ -4,6 +4,9 @@ import com.example.starter.evidence.dto.CommandRequest;
 import com.example.starter.evidence.dto.CustodyChainView;
 import com.example.starter.evidence.dto.EvidenceView;
 import com.example.starter.evidence.dto.IntakeRequest;
+import com.example.starter.evidence.dto.LoanCreateRequest;
+import com.example.starter.evidence.dto.LoanReturnRequest;
+import com.example.starter.evidence.dto.LoanView;
 import com.example.starter.evidence.dto.SealInspectionRequest;
 import com.example.starter.evidence.dto.TransferInitiateRequest;
 import jakarta.validation.Valid;
@@ -108,6 +111,42 @@ public class EvidenceController {
         StoredResponse response = idempotencyAdvisor.guard(request.commandKey(), hash,
                 () -> evidenceService.inspectSeal(actorId, evidenceKey, request, hash));
         return toEntity(response);
+    }
+
+    /**
+     * 限时借出：仅当前保管人，证物须 SEALED；进入 BORROWED，保管人不变。
+     */
+    @PostMapping("/{evidenceKey}/loans")
+    public ResponseEntity<String> borrow(@RequestHeader(ACTOR_HEADER) @NotBlank String actorId,
+                                         @PathVariable String evidenceKey,
+                                         @Valid @RequestBody LoanCreateRequest request) {
+        String hash = idempotencyAdvisor.hash(EvidenceService.OP_LOAN_BORROW, actorId,
+                evidenceKey, request);
+        StoredResponse response = idempotencyAdvisor.guard(request.commandKey(), hash,
+                () -> evidenceService.borrow(actorId, evidenceKey, request, hash));
+        return toEntity(response);
+    }
+
+    /**
+     * 确认归还：仅借出时的保管人；完好回到 SEALED，异常进入 SEAL_BROKEN。
+     */
+    @PostMapping("/{evidenceKey}/loans/return")
+    public ResponseEntity<String> returnLoan(@RequestHeader(ACTOR_HEADER) @NotBlank String actorId,
+                                             @PathVariable String evidenceKey,
+                                             @Valid @RequestBody LoanReturnRequest request) {
+        String hash = idempotencyAdvisor.hash(EvidenceService.OP_LOAN_RETURN, actorId,
+                evidenceKey, request);
+        StoredResponse response = idempotencyAdvisor.guard(request.commandKey(), hash,
+                () -> evidenceService.returnLoan(actorId, evidenceKey, request, hash));
+        return toEntity(response);
+    }
+
+    /**
+     * 按借用人查询未归还借出及逾期记录。
+     */
+    @GetMapping("/loans/by-borrower/{borrowerId}")
+    public List<LoanView> listActiveLoans(@PathVariable String borrowerId) {
+        return evidenceService.listActiveLoansByBorrower(borrowerId);
     }
 
     /**
