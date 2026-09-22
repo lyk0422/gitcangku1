@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS batch (
     product_code VARCHAR(64) NOT NULL COMMENT '产品编码，创建后不可修改',
     batch_no VARCHAR(64) NOT NULL COMMENT '批号，创建后不可修改',
     produced_at VARCHAR(40) NOT NULL COMMENT '生产时间，ISO-8601 UTC  instant 字符串',
-    status VARCHAR(32) NOT NULL COMMENT '批次状态：QUARANTINED/PENDING_RELEASE/RELEASE_REVIEW/RELEASED/REJECTED/RECALLED',
+    status VARCHAR(32) NOT NULL COMMENT '批次状态：QUARANTINED/PENDING_RELEASE/RELEASE_REVIEW/RELEASED/REJECTED/RECALLED/SPLIT',
     created_at VARCHAR(40) NOT NULL COMMENT '创建时间，ISO-8601 UTC instant 字符串',
     CONSTRAINT uk_batch_key UNIQUE (batch_key)
 );
@@ -47,8 +47,18 @@ CREATE TABLE IF NOT EXISTS recall (
     created_at VARCHAR(40) NOT NULL COMMENT '召回时间，ISO-8601 UTC instant 字符串'
 );
 
+CREATE TABLE IF NOT EXISTS batch_lineage (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键，同时作为后代查询的创建顺序依据',
+    child_batch_key VARCHAR(64) NOT NULL COMMENT '子批业务键；每个子批只有一个父批，关系创建后不可改写',
+    parent_batch_key VARCHAR(64) NOT NULL COMMENT '父批业务键，拆分成功后父批进入 SPLIT 状态',
+    split_command_key VARCHAR(64) NOT NULL COMMENT '产生该关系的拆分命令幂等键',
+    seq INT NOT NULL COMMENT '子批在拆分请求中的顺序，从 1 开始',
+    created_at VARCHAR(40) NOT NULL COMMENT '关系创建时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_lineage_child UNIQUE (child_batch_key)
+);
+
 CREATE TABLE IF NOT EXISTS command_log (
-    command_type VARCHAR(32) NOT NULL COMMENT '命令类型：CREATE_BATCH/SUBMIT_TEST/APPROVE/RECALL',
+    command_type VARCHAR(32) NOT NULL COMMENT '命令类型：CREATE_BATCH/SUBMIT_TEST/APPROVE/RECALL/SPLIT',
     command_key VARCHAR(64) NOT NULL COMMENT '命令幂等键；同类型同键同参重放返回首次结果，同键改参返回 409',
     fingerprint VARCHAR(64) NOT NULL COMMENT '业务参数（不含 commandKey）的 SHA-256 摘要，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行成功的 HTTP 状态码',

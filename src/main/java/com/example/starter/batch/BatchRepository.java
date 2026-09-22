@@ -48,6 +48,13 @@ public class BatchRepository {
                              int responseStatus, String responseBody) {
     }
 
+    /**
+     * batch_lineage 表行记录：拆分血缘关系，每个子批只有一个父批，创建后不可改写。
+     */
+    public record LineageRow(long id, String childBatchKey, String parentBatchKey,
+                             String splitCommandKey, int seq, String createdAt) {
+    }
+
     private static final RowMapper<BatchRow> BATCH_MAPPER = (rs, n) -> new BatchRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("product_code"),
             rs.getString("batch_no"), rs.getString("produced_at"),
@@ -70,6 +77,10 @@ public class BatchRepository {
     private static final RowMapper<CommandRow> COMMAND_MAPPER = (rs, n) -> new CommandRow(
             rs.getString("command_type"), rs.getString("command_key"), rs.getString("fingerprint"),
             rs.getInt("response_status"), rs.getString("response_body"));
+
+    private static final RowMapper<LineageRow> LINEAGE_MAPPER = (rs, n) -> new LineageRow(
+            rs.getLong("id"), rs.getString("child_batch_key"), rs.getString("parent_batch_key"),
+            rs.getString("split_command_key"), rs.getInt("seq"), rs.getString("created_at"));
 
     private final JdbcTemplate jdbc;
 
@@ -112,8 +123,13 @@ public class BatchRepository {
         jdbc.update("UPDATE batch SET status = ? WHERE batch_key = ?", status, batchKey);
     }
 
+    /**
+     * 当前可用候选批次：排除已召回与已拆分（SPLIT 父批不再可用）；
+     * 召回祖先后代的过滤在服务层按血缘关系完成。
+     */
     public List<BatchRow> findAvailableBatches() {
-        return jdbc.query("SELECT * FROM batch WHERE status <> 'RECALLED' ORDER BY id", BATCH_MAPPER);
+        return jdbc.query("SELECT * FROM batch WHERE status NOT IN ('RECALLED', 'SPLIT') ORDER BY id",
+                BATCH_MAPPER);
     }
 
     public Optional<TestRow> findTest(String batchKey, String testKey) {
@@ -168,5 +184,35 @@ public class BatchRepository {
                         + " response_status, response_body, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                 row.commandType(), row.commandKey(), row.fingerprint(),
                 row.responseStatus(), row.responseBody(), createdAt);
+    }
+
+    public void insertLineage(LineageRow row) {
+        jdbc.update("INSERT INTO batch_lineage (child_batch_key, parent_batch_key,"
+                        + " split_command_key, seq, created_at) VALUES (?, ?, ?, ?, ?)",
+                row.childBatchKey(), row.parentBatchKey(), row.splitCommandKey(),
+                row.seq(), row.createdAt());
+    }
+
+    /**
+     * 查询子批的父批键；根批次无父批返回空。
+     */
+    public Optional<String> findParent(String childBatchKey) {
+        return jdbc.query("SELECT parent_batch_key FROM batch_lineage WHERE child_batch_key = ?",
+                        (rs, n) -> rs.getString("parent_batch_key"), childBatchKey)
+                .stream().findFirst();
+    }
+
+    /**
+     * 全量血缘关系（按创建顺序），用于可用性过滤与后代查询的内存组装。
+     */
+    public List<LineageRow> findAllLineage() {
+        return jdbc.query("SELECT * FROM batch_lineage ORDER BY id", LINEAGE_MAPPER);
+    }
+
+    /**
+     * 全部存在召回记录的批次键。
+     */
+    public List<String> findRecalledBatchKeys() {
+        return jdbc.queryForList("SELECT batch_key FROM recall", String.class);
     }
 }

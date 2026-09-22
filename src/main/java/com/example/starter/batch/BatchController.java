@@ -4,7 +4,9 @@ import com.example.starter.batch.dto.ApproveRequest;
 import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
+import com.example.starter.batch.dto.LineageNodeResponse;
 import com.example.starter.batch.dto.RecallRequest;
+import com.example.starter.batch.dto.SplitBatchRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpHeaders;
@@ -85,6 +87,31 @@ public class BatchController {
     @GetMapping("/{batchKey}/history")
     public BatchHistoryResponse history(@PathVariable String batchKey) {
         return service.history(batchKey);
+    }
+
+    /**
+     * 拆分 RELEASED 父批为 2～5 个全新子批；父批同事务进入 SPLIT。
+     */
+    @PostMapping("/{batchKey}/split")
+    public ResponseEntity<String> split(@PathVariable String batchKey,
+                                        @Valid @RequestBody SplitBatchRequest request) {
+        return stored(service.split(batchKey, request));
+    }
+
+    /**
+     * 祖先查询：根到直接父批，含各批自身状态及导致不可用的召回祖先。
+     */
+    @GetMapping("/{batchKey}/ancestors")
+    public List<LineageNodeResponse> ancestors(@PathVariable String batchKey) {
+        return service.ancestors(batchKey);
+    }
+
+    /**
+     * 后代查询：全部后代批次，含各批自身状态及导致不可用的召回祖先。
+     */
+    @GetMapping("/{batchKey}/descendants")
+    public List<LineageNodeResponse> descendants(@PathVariable String batchKey) {
+        return service.descendants(batchKey);
     }
 
     private ResponseEntity<String> stored(StoredResponse response) {
