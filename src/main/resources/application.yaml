@@ -4,8 +4,9 @@ spring:
   config:
     import: "optional:configtree:/run/secrets/"
   datasource:
-    url: ${DB_URL}
-    username: ${DB_USER}
+    url: ${DB_URL:jdbc:h2:mem:local_demo;MODE=MySQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1}
+    username: ${DB_USER:sa}
+    driver-class-name: ${DB_DRIVER:org.h2.Driver}
     hikari:
       maximum-pool-size: 5
       minimum-idle: 1
@@ -14,6 +15,7 @@ spring:
   sql:
     init:
       mode: always
+      schema-locations: ${DB_SCHEMA:classpath:schema-h2.sql}
   jackson:
     time-zone: Asia/Shanghai
   lifecycle:

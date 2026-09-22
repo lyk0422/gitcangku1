@@ -1,4 +1,5 @@
--- 测试用 H2（MySQL 兼容模式）schema，与生产 schema.sql 结构一致，去掉 H2 不兼容的 COMMENT 子句。
+-- 本地默认运行用 H2（MySQL 兼容模式）schema，结构与 schema.sql（MySQL 8）一致，
+-- 去掉 H2 不兼容的 COMMENT 子句。所有时间字段均为 UTC。
 
 CREATE TABLE IF NOT EXISTS incidents (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,

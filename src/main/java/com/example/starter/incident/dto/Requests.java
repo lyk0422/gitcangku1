@@ -34,4 +34,12 @@ public final class Requests {
     /** 状态变更请求：targetStatus 只允许 CONTAINED / RESOLVED / CLOSED。 */
     public record StatusRequest(String commandKey, String targetStatus) {
     }
+
+    /** 遏制逾期检查请求：以注入 Clock 的当前时刻评估，不做定时扫描。 */
+    public record EscalationCheckRequest(String commandKey) {
+    }
+
+    /** 升级确认请求：note 为非空处置说明，操作人由 X-Actor-Id 指定且须为当前指挥人。 */
+    public record EscalationAckRequest(String commandKey, String note) {
+    }
 }

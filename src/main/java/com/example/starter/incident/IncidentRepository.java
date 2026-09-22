@@ -45,10 +45,12 @@ public class IncidentRepository {
             rs.getString("actor"), rs.getTimestamp("occurred_at").toInstant());
 
     private static Incident mapIncident(ResultSet rs) throws SQLException {
+        Timestamp deadline = rs.getTimestamp("deadline_at");
         return new Incident(rs.getLong("id"), rs.getString("incident_key"), rs.getString("severity"),
                 rs.getString("summary"), rs.getString("reporter"),
                 IncidentStatus.valueOf(rs.getString("status")), rs.getString("commander"),
-                rs.getTimestamp("created_at").toInstant(), rs.getTimestamp("updated_at").toInstant());
+                rs.getTimestamp("created_at").toInstant(), rs.getTimestamp("updated_at").toInstant(),
+                deadline == null ? null : deadline.toInstant());
     }
 
     /**
@@ -70,14 +72,14 @@ public class IncidentRepository {
     }
 
     /**
-     * 插入新事件，初始状态 REPORTED、无指挥人，返回生成主键。
+     * 插入新事件，初始状态 REPORTED、无指挥人、无遏制期限，返回生成主键。
      */
     public long insert(Incident incident) {
         KeyHolder keys = new GeneratedKeyHolder();
         jdbc.update(con -> {
             var ps = con.prepareStatement(
                     "INSERT INTO incidents (incident_key, severity, summary, reporter, status, commander,"
-                            + " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                            + " created_at, updated_at, deadline_at) VALUES (?,?,?,?,?,?,?,?,?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, incident.incidentKey());
             ps.setString(2, incident.severity());
@@ -87,9 +89,18 @@ public class IncidentRepository {
             ps.setString(6, incident.commander());
             ps.setTimestamp(7, Timestamp.from(incident.createdAt()));
             ps.setTimestamp(8, Timestamp.from(incident.updatedAt()));
+            ps.setTimestamp(9, incident.deadlineAt() == null ? null : Timestamp.from(incident.deadlineAt()));
             return ps;
         }, keys);
         return keys.getKey().longValue();
+    }
+
+    /**
+     * 首次接管时写入遏制期限（只写一次，交接不重置）。
+     */
+    public void updateDeadline(long id, Instant deadlineAt, Instant updatedAt) {
+        jdbc.update("UPDATE incidents SET deadline_at = ?, updated_at = ? WHERE id = ?",
+                Timestamp.from(deadlineAt), Timestamp.from(updatedAt), id);
     }
 
     /**

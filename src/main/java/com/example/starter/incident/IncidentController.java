@@ -1,12 +1,16 @@
 package com.example.starter.incident;
 
 import com.example.starter.incident.dto.Requests.ActionRequest;
+import com.example.starter.incident.dto.Requests.EscalationAckRequest;
+import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
+import com.example.starter.incident.dto.Responses.EscalationHistoryView;
+import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
 import com.example.starter.incident.dto.Responses.IncidentView;
 import com.example.starter.incident.dto.Responses.TransferView;
@@ -50,11 +54,39 @@ public class IncidentController {
     }
 
     /**
-     * 查询事件完整历史（状态流转、处置记录、交接记录）。
+     * 查询事件完整历史（状态流转、处置记录、交接记录、升级记录）。
      */
     @GetMapping("/{incidentKey}/history")
     public HistoryView history(@PathVariable String incidentKey) {
         return service.history(incidentKey);
+    }
+
+    /**
+     * 查询遏制期限、当前升级及完整升级历史（只读，不隐式写入）。
+     */
+    @GetMapping("/{incidentKey}/escalations")
+    public EscalationHistoryView escalations(@PathVariable String incidentKey) {
+        return service.escalationHistory(incidentKey);
+    }
+
+    /**
+     * 单事件遏制逾期检查：以服务端注入 Clock 的当前时刻评估，逾期且仍 COMMANDING
+     * 时追加一条 OPEN 升级记录；携带 commandKey，同键重放首次结果。
+     */
+    @PostMapping("/{incidentKey}/escalations/check")
+    public EscalationHistoryView checkEscalation(@PathVariable String incidentKey,
+                                                 @RequestBody EscalationCheckRequest req) {
+        return service.checkEscalation(incidentKey, req);
+    }
+
+    /**
+     * 确认 OPEN 升级记录（仅当前指挥人，提交非空处置说明）。
+     */
+    @PostMapping("/{incidentKey}/escalations/acknowledge")
+    public EscalationView acknowledgeEscalation(@PathVariable String incidentKey,
+                                                @RequestHeader("X-Actor-Id") String actor,
+                                                @RequestBody EscalationAckRequest req) {
+        return service.acknowledgeEscalation(incidentKey, actor, req);
     }
 
     /**

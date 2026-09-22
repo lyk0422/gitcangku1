@@ -3,19 +3,25 @@ package com.example.starter.incident;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Map;
 import java.util.function.Supplier;
 
 import com.example.starter.incident.dto.Requests.ActionRequest;
+import com.example.starter.incident.dto.Requests.EscalationAckRequest;
+import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
+import com.example.starter.incident.dto.Responses.EscalationHistoryView;
+import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
 import com.example.starter.incident.dto.Responses.IncidentView;
 import com.example.starter.incident.dto.Responses.StatusChangeView;
@@ -31,21 +37,35 @@ import org.springframework.transaction.annotation.Transactional;
  * 并发约定：所有写接口先 SELECT ... FOR UPDATE 锁定事件行，同事务内完成
  * 幂等键占位、业务校验与写入，保证并发请求按事务提交顺序生效。
  * 幂等约定：commandKey 全局唯一，同键同参重放首次响应，同键改参返回 409。
+ * 遏制期限：首次进入 COMMANDING 时以该次接管 UTC 时刻按等级确定
+ * （S1=5分钟、S2=15分钟、S3=60分钟、S4=240分钟），交接不重置。
  */
 @Service
 public class IncidentService {
 
     private static final String SEP = "\\u001F";
 
+    /** 各严重等级的遏制时限（分钟），等级沿用上报值且不可修改。 */
+    private static final Map<String, Long> CONTAINMENT_MINUTES = Map.of(
+            "S1", 5L, "S2", 15L, "S3", 60L, "S4", 240L);
+
     private final IncidentRepository incidents;
+    private final EscalationRepository escalations;
     private final CommandKeyRepository commandKeys;
     private final ObjectMapper objectMapper;
+    private final Clock clock;
 
-    public IncidentService(IncidentRepository incidents, CommandKeyRepository commandKeys,
-                           ObjectMapper objectMapper) {
+    public IncidentService(IncidentRepository incidents, EscalationRepository escalations,
+                           CommandKeyRepository commandKeys, ObjectMapper objectMapper, Clock clock) {
         this.incidents = incidents;
+        this.escalations = escalations;
         this.commandKeys = commandKeys;
         this.objectMapper = objectMapper;
+        this.clock = clock;
+    }
+
+    private Instant now() {
+        return clock.instant();
     }
 
     /**
@@ -63,9 +83,9 @@ public class IncidentService {
         if (incidents.findByKey(incidentKey).isPresent()) {
             throw ApiException.conflict("incidentKey 已存在: " + incidentKey);
         }
-        Instant now = Instant.now();
+        Instant now = now();
         Incident incident = new Incident(0L, incidentKey, severity, summary, reporter,
-                IncidentStatus.REPORTED, null, now, now);
+                IncidentStatus.REPORTED, null, now, now, null);
         long id;
         try {
             id = incidents.insert(incident);
@@ -77,7 +97,8 @@ public class IncidentService {
     }
 
     /**
-     * 首次接管：REPORTED → COMMANDING，记录当前指挥人。
+     * 首次接管：REPORTED → COMMANDING，记录当前指挥人，
+     * 并以该次接管 UTC 时刻按等级确定遏制期限（只写一次，交接不重置）。
      */
     @Transactional
     public IncidentView takeover(String incidentKey, String actor, TakeoverRequest req) {
@@ -89,8 +110,11 @@ public class IncidentService {
                         throw ApiException.illegalTransition(
                                 "仅 REPORTED 状态可接管，当前状态: " + incident.status());
                     }
-                    Instant now = Instant.now();
+                    Instant now = now();
+                    Instant deadline = now.plus(CONTAINMENT_MINUTES.get(incident.severity()),
+                            ChronoUnit.MINUTES);
                     incidents.updateState(incident.id(), IncidentStatus.COMMANDING, actor, now);
+                    incidents.updateDeadline(incident.id(), deadline, now);
                     incidents.insertStatusChange(new StatusChange(0L, incident.id(),
                             IncidentStatus.REPORTED, IncidentStatus.COMMANDING, actor, now));
                     return toView(incidents.findByKey(incidentKey).orElseThrow(), null);
@@ -122,7 +146,7 @@ public class IncidentService {
                     if (incidents.findPendingTransfer(incident.id()).isPresent()) {
                         throw ApiException.conflict("已存在待接受的交接，不能重复发起");
                     }
-                    Instant now = Instant.now();
+                    Instant now = now();
                     incidents.insertTransfer(new IncidentTransfer(0L, incident.id(),
                             incident.commander(), toCommander, TransferStatus.PENDING, now, null));
                     return toTransferView(incidents.findPendingTransfer(incident.id()).orElseThrow());
@@ -149,7 +173,7 @@ public class IncidentService {
                     if (!pending.toCommander().equals(actor)) {
                         throw ApiException.conflict("只有交接目标人 " + pending.toCommander() + " 能接受交接");
                     }
-                    Instant now = Instant.now();
+                    Instant now = now();
                     incidents.acceptTransfer(pending.id(), now);
                     incidents.updateState(incident.id(), incident.status(), pending.toCommander(), now);
                     return toView(incidents.findByKey(incidentKey).orElseThrow(), null);
@@ -186,7 +210,7 @@ public class IncidentService {
                         }
                         return toActionView(found);
                     }
-                    Instant now = Instant.now();
+                    Instant now = now();
                     incidents.insertAction(new IncidentAction(0L, incident.id(), actionKey, actionType,
                             note, occurredAt, actor, now));
                     return toActionView(incidents.findAction(incident.id(), actionKey).orElseThrow());
@@ -195,6 +219,7 @@ public class IncidentService {
 
     /**
      * 状态变更：仅当前指挥人可操作，仅允许 COMMANDING→CONTAINED→RESOLVED→CLOSED 逐级前进。
+     * 进入 CONTAINED 时同事务将仍 OPEN 的逾期升级记录原子置为 CANCELLED，已确认记录保留。
      */
     @Transactional
     public IncidentView changeStatus(String incidentKey, String actor, StatusRequest req) {
@@ -215,16 +240,79 @@ public class IncidentService {
                         throw ApiException.illegalTransition(
                                 "不允许从 " + incident.status() + " 流转到 " + targetStatus);
                     }
-                    Instant now = Instant.now();
+                    Instant now = now();
                     incidents.updateState(incident.id(), targetStatus, incident.commander(), now);
                     incidents.insertStatusChange(new StatusChange(0L, incident.id(),
                             incident.status(), targetStatus, actor, now));
+                    if (targetStatus == IncidentStatus.CONTAINED) {
+                        escalations.cancelOpenForIncident(incident.id(), now);
+                    }
                     return toView(incidents.findByKey(incidentKey).orElseThrow(), null);
                 });
     }
 
     /**
-     * 查询事件当前状态（含当前指挥人与待接受交接目标人）。
+     * 单事件遏制逾期检查：以注入 Clock 的当前时刻评估，不做定时扫描。
+     * 仅当事件仍为 COMMANDING、尚无升级记录且当前时刻 ≥ 接管时确定的期限时，
+     * 追加一条 OPEN 记录（保存期限、触发时刻、当时指挥人），每事件至多一条。
+     * 期限前或其他状态不产生记录；同键重放首次结果（含期限前的无记录结果），
+     * 失败不占键；需要重新评估必须更换 commandKey。
+     */
+    @Transactional
+    public EscalationHistoryView checkEscalation(String incidentKey, EscalationCheckRequest req) {
+        String commandKey = requireText(req.commandKey(), "commandKey");
+        Incident incident = lockIncident(incidentKey);
+        return runIdempotent(commandKey, "escalation_check", hash(incidentKey),
+                EscalationHistoryView.class, () -> {
+                    var existing = escalations.findByIncident(incident.id());
+                    if (existing.isPresent()) {
+                        return toEscalationHistory(incident, List.of(existing.get()));
+                    }
+                    Instant currentTime = now();
+                    if (incident.status() == IncidentStatus.COMMANDING
+                            && incident.deadlineAt() != null
+                            && !currentTime.isBefore(incident.deadlineAt())) {
+                        escalations.insert(new Escalation(0L, incident.id(), incident.deadlineAt(),
+                                currentTime, incident.commander(), EscalationStatus.OPEN,
+                                null, null, null, currentTime, currentTime));
+                    }
+                    return toEscalationHistory(incident,
+                            escalations.listByIncident(incident.id()));
+                });
+    }
+
+    /**
+     * 确认 OPEN 升级记录：仅操作当时的当前指挥人可确认（待接受期间目标人无确认权，
+     * 交接接受后旧指挥人失去确认权），提交非空处置说明后进入 ACKNOWLEDGED，
+     * 记录确认人与 UTC 时刻。已 CANCELLED/ACKNOWLEDGED 或不存在记录均为 409。
+     */
+    @Transactional
+    public EscalationView acknowledgeEscalation(String incidentKey, String actor,
+                                                EscalationAckRequest req) {
+        String commandKey = requireText(req.commandKey(), "commandKey");
+        String note = requireText(req.note(), "note");
+        Incident incident = lockIncident(incidentKey);
+        return runIdempotent(commandKey, "escalation_ack", hash(incidentKey, actor, note),
+                EscalationView.class, () -> {
+                    requireCommander(incident, actor);
+                    Escalation escalation = escalations.findByIncident(incident.id())
+                            .orElseThrow(() -> ApiException.conflict("当前没有可确认的升级记录"));
+                    if (escalation.status() != EscalationStatus.OPEN) {
+                        throw ApiException.conflict(
+                                "升级记录状态为 " + escalation.status() + "，不能确认");
+                    }
+                    Instant ackedAt = now();
+                    int updated = escalations.acknowledge(escalation.id(), note, actor, ackedAt);
+                    if (updated == 0) {
+                        throw ApiException.conflict("升级记录已被并发处理，不能确认");
+                    }
+                    return toEscalationView(
+                            escalations.findByIncident(incident.id()).orElseThrow());
+                });
+    }
+
+    /**
+     * 查询事件当前状态（含当前指挥人与待接受交接目标人）。只读，不隐式写入。
      */
     @Transactional(readOnly = true)
     public IncidentView get(String incidentKey) {
@@ -236,7 +324,17 @@ public class IncidentService {
     }
 
     /**
-     * 查询完整历史：事件本体、状态流转、处置记录、交接记录。
+     * 查询遏制期限、当前升级及完整升级历史；只读，不隐式写入。
+     */
+    @Transactional(readOnly = true)
+    public EscalationHistoryView escalationHistory(String incidentKey) {
+        Incident incident = incidents.findByKey(incidentKey)
+                .orElseThrow(() -> ApiException.notFound("事件不存在: " + incidentKey));
+        return toEscalationHistory(incident, escalations.listByIncident(incident.id()));
+    }
+
+    /**
+     * 查询完整历史：事件本体、状态流转、处置记录、交接记录、升级记录。
      */
     @Transactional(readOnly = true)
     public HistoryView history(String incidentKey) {
@@ -253,7 +351,10 @@ public class IncidentService {
                 .map(this::toActionView).toList();
         List<TransferView> transfers = incidents.listTransfers(incident.id()).stream()
                 .map(IncidentService::toTransferView).toList();
-        return new HistoryView(toView(incident, pendingTo), statusHistory, actions, transfers);
+        List<EscalationView> escalationList = escalations.listByIncident(incident.id()).stream()
+                .map(this::toEscalationView).toList();
+        return new HistoryView(toView(incident, pendingTo), statusHistory, actions, transfers,
+                escalationList);
     }
 
     private Incident lockIncident(String incidentKey) {
@@ -286,7 +387,7 @@ public class IncidentService {
             return replay(existing.get(), operation, requestHash, type);
         }
         try {
-            commandKeys.insertPlaceholder(commandKey, operation, requestHash, Instant.now());
+            commandKeys.insertPlaceholder(commandKey, operation, requestHash, now());
         } catch (DuplicateKeyException e) {
             var committed = commandKeys.findForUpdate(commandKey)
                     .orElseThrow(() -> ApiException.conflict("commandKey 处理冲突: " + commandKey));
@@ -332,7 +433,7 @@ public class IncidentService {
     private IncidentView toView(Incident incident, String pendingTransferTo) {
         return new IncidentView(incident.incidentKey(), incident.severity(), incident.summary(),
                 incident.reporter(), incident.status().name(), incident.commander(), pendingTransferTo,
-                incident.createdAt(), incident.updatedAt());
+                incident.createdAt(), incident.updatedAt(), incident.deadlineAt());
     }
 
     private ActionView toActionView(IncidentAction action) {
@@ -343,5 +444,20 @@ public class IncidentService {
     private static TransferView toTransferView(IncidentTransfer transfer) {
         return new TransferView(transfer.id(), transfer.fromCommander(), transfer.toCommander(),
                 transfer.status().name(), transfer.createdAt(), transfer.acceptedAt());
+    }
+
+    private EscalationView toEscalationView(Escalation escalation) {
+        return new EscalationView(escalation.id(), escalation.deadlineAt(), escalation.triggeredAt(),
+                escalation.triggeredCommander(), escalation.status().name(), escalation.note(),
+                escalation.acknowledgedBy(), escalation.acknowledgedAt(), escalation.createdAt());
+    }
+
+    /**
+     * 组装升级查询视图：current 为该事件当前（唯一）升级记录，无则 null。
+     */
+    private EscalationHistoryView toEscalationHistory(Incident incident, List<Escalation> list) {
+        List<EscalationView> views = list.stream().map(this::toEscalationView).toList();
+        EscalationView current = views.isEmpty() ? null : views.get(views.size() - 1);
+        return new EscalationHistoryView(incident.deadlineAt(), current, views);
     }
 }
