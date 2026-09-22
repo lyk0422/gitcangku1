@@ -29,9 +29,33 @@ CREATE TABLE IF NOT EXISTS observation_version (
 CREATE TABLE IF NOT EXISTS request_log (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
     fingerprint VARCHAR(128) NOT NULL COMMENT '请求操作与参数的指纹，同键异参时判定 409',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：CREATE / MERGE / DELETE',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：CREATE / MERGE / DELETE / RESOLVE',
     response_status INT NULL COMMENT '成功响应的 HTTP 状态码；提交过程中暂为 NULL',
     response_body VARCHAR(4000) NULL COMMENT '成功响应体（JSON 原文），用于同键同参重放；提交过程中暂为 NULL',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '请求记录创建时间（服务器时区）',
     PRIMARY KEY (request_id)
+);
+
+-- 冲突解决记录表：成功解决后原子写入，不可变、永不更新或删除。
+CREATE TABLE IF NOT EXISTS conflict_resolution (
+    resolution_id VARCHAR(128) NOT NULL COMMENT '全局唯一冲突解决记录标识',
+    observation_id VARCHAR(64) NOT NULL COMMENT '观测记录唯一标识',
+    request_id VARCHAR(128) NOT NULL COMMENT '生成该解决记录的请求标识（requestId）',
+    base_version INT NOT NULL COMMENT '解决时重读的三方合并基线版本号',
+    previous_version INT NOT NULL COMMENT '解决前当前版本号',
+    new_version INT NOT NULL COMMENT '解决后指向的版本号；无变化解决时等于 previous_version',
+    candidate_location VARCHAR(512) NOT NULL COMMENT '客户端提交的候选地点完整值',
+    candidate_reading VARCHAR(64) NOT NULL COMMENT '客户端提交的候选读数完整值（十进制原文，最多三位小数）',
+    candidate_note VARCHAR(1024) NOT NULL COMMENT '客户端提交的候选备注完整值',
+    conflict_fields VARCHAR(256) NOT NULL COMMENT '服务端重算出的冲突字段名列表（JSON 数组原文，固定顺序 location/reading/note）',
+    field_selections VARCHAR(512) NOT NULL COMMENT '各冲突字段的人工选择（JSON 对象原文，值为 CURRENT/CANDIDATE）',
+    operator VARCHAR(128) NOT NULL COMMENT '执行冲突解决的操作者标识',
+    content_changed BOOLEAN NOT NULL COMMENT '解决后内容是否变化：FALSE 表示未生成新观测版本，仅保存指向当前版本的记录',
+    resolved_at_utc TIMESTAMP NOT NULL COMMENT '解决完成时刻（UTC）',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录落库时间（服务器时区）',
+    PRIMARY KEY (resolution_id),
+    -- 同一观测记录内 requestId 唯一，支撑解决请求的同参重放/异参 409。
+    -- 不设置指向 observation_current 的外键：观测记录删除仅置墓碑（当前行保留），
+    -- 且不可变解决历史必须在任何数据清理/归档场景下继续可查。
+    UNIQUE (observation_id, request_id)
 );

@@ -1,5 +1,6 @@
 package com.example.starter.observation;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Min;
 import org.springframework.http.ResponseEntity;
@@ -11,8 +12,10 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.List;
+
 /**
- * 现场观测离线合并 API：创建、离线提交（三方合并）、删除、当前/历史版本查询。
+ * 现场观测离线合并 API：创建、离线提交（三方合并）、冲突显式解决、删除、当前/历史版本与解决记录查询。
  */
 @RestController
 @RequestMapping("/api/observations")
@@ -20,9 +23,11 @@ import org.springframework.web.bind.annotation.RestController;
 public class ObservationController {
 
     private final ObservationService observationService;
+    private final ObjectMapper objectMapper;
 
-    public ObservationController(ObservationService observationService) {
+    public ObservationController(ObservationService observationService, ObjectMapper objectMapper) {
         this.observationService = observationService;
+        this.objectMapper = objectMapper;
     }
 
     /**
@@ -69,5 +74,40 @@ public class ObservationController {
     public ObservationResponse getVersion(@PathVariable String observationId,
                                           @PathVariable @Min(1) int version) {
         return observationService.getVersion(observationId, version);
+    }
+
+    /**
+     * 显式冲突解决：提交候选值与冲突字段选择，原子生成新版本（或无变化）与不可变解决记录。
+     */
+    @PostMapping("/{observationId}/resolve")
+    public ResponseEntity<ResolutionResponse> resolve(@PathVariable String observationId,
+                                                      @Valid @RequestBody ResolveConflictRequest request) {
+        ObservationService.ResolveOutcome outcome = observationService.resolveConflict(observationId, request);
+        return ResponseEntity.status(outcome.status()).body(outcome.body());
+    }
+
+    /**
+     * 按全局唯一 resolutionId 查询解决记录。
+     */
+    @GetMapping("/resolutions/{resolutionId}")
+    public ResolutionResponse getResolution(@PathVariable String resolutionId) {
+        ResolutionRecord record = observationService.getResolution(resolutionId);
+        return resolutionResponse(record);
+    }
+
+    /**
+     * 按 observationId 查询解决历史，按版本先后排序。
+     */
+    @GetMapping("/{observationId}/resolutions")
+    public List<ResolutionResponse> listResolutions(@PathVariable String observationId) {
+        return observationService.listResolutions(observationId).stream()
+                .map(this::resolutionResponse)
+                .toList();
+    }
+
+    private ResolutionResponse resolutionResponse(ResolutionRecord record) {
+        ObservationSnapshot pointed = observationService.getVersionSnapshot(
+                record.observationId(), record.newVersion());
+        return ResolutionResponse.of(record, pointed, objectMapper);
     }
 }
