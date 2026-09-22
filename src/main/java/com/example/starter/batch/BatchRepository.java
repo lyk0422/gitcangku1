@@ -48,6 +48,12 @@ public class BatchRepository {
                              int responseStatus, String responseBody) {
     }
 
+    /**
+     * batch_lineage 表行记录：拆分父子关系，创建后不可改写。
+     */
+    public record LineageRow(long id, String parentKey, String childKey, int seq, String createdAt) {
+    }
+
     private static final RowMapper<BatchRow> BATCH_MAPPER = (rs, n) -> new BatchRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("product_code"),
             rs.getString("batch_no"), rs.getString("produced_at"),
@@ -70,6 +76,10 @@ public class BatchRepository {
     private static final RowMapper<CommandRow> COMMAND_MAPPER = (rs, n) -> new CommandRow(
             rs.getString("command_type"), rs.getString("command_key"), rs.getString("fingerprint"),
             rs.getInt("response_status"), rs.getString("response_body"));
+
+    private static final RowMapper<LineageRow> LINEAGE_MAPPER = (rs, n) -> new LineageRow(
+            rs.getLong("id"), rs.getString("parent_key"), rs.getString("child_key"),
+            rs.getInt("seq"), rs.getString("created_at"));
 
     private final JdbcTemplate jdbc;
 
@@ -168,5 +178,35 @@ public class BatchRepository {
                         + " response_status, response_body, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                 row.commandType(), row.commandKey(), row.fingerprint(),
                 row.responseStatus(), row.responseBody(), createdAt);
+    }
+
+    public void insertLineage(LineageRow row) {
+        jdbc.update("INSERT INTO batch_lineage (parent_key, child_key, seq, created_at)"
+                        + " VALUES (?, ?, ?, ?)",
+                row.parentKey(), row.childKey(), row.seq(), row.createdAt());
+    }
+
+    /**
+     * 全部血缘边（父→子），用于在内存中推导祖先链与后代集合；关系不可改写，只增不改。
+     */
+    public List<LineageRow> findAllLineage() {
+        return jdbc.query("SELECT * FROM batch_lineage ORDER BY id", LINEAGE_MAPPER);
+    }
+
+    /**
+     * 某批次的直接父批业务键；每个子批仅一个父批。
+     */
+    public Optional<String> findParentKey(String childKey) {
+        return jdbc.queryForList("SELECT parent_key FROM batch_lineage WHERE child_key = ?",
+                        String.class, childKey)
+                .stream().findFirst();
+    }
+
+    /**
+     * 全部被直接召回（RECALLED）的批次业务键。
+     */
+    public List<String> findRecalledKeys() {
+        return jdbc.queryForList("SELECT batch_key FROM batch WHERE status = 'RECALLED'",
+                String.class);
     }
 }

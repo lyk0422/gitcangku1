@@ -1,6 +1,7 @@
 spring:
   datasource:
-    url: jdbc:h2:mem:batchdb;MODE=MySQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1
+    # 测试专用独立命名内存库，与本地运行库隔离；JVM 退出后数据自动释放。
+    url: jdbc:h2:mem:batchdb_test;MODE=MySQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1
     driver-class-name: org.h2.Driver
     username: sa
     password: ""
