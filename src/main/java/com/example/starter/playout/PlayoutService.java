@@ -1,19 +1,24 @@
 package com.example.starter.playout;
 
 import com.example.starter.playout.PlayoutRepository.DraftRow;
+import com.example.starter.playout.PlayoutRepository.ChannelRow;
 import com.example.starter.playout.PlayoutRepository.GrantRow;
+import com.example.starter.playout.PlayoutRepository.OverrideRow;
 import com.example.starter.playout.PlayoutRepository.PublicationRow;
 import com.example.starter.playout.PlayoutRepository.PublicationSegmentRow;
 import com.example.starter.playout.PlayoutRepository.RequestRow;
 import com.example.starter.playout.PlayoutRepository.SegmentRow;
 import com.example.starter.playout.api.ApiException;
 import com.example.starter.playout.api.Dtos.AssetResponse;
+import com.example.starter.playout.api.Dtos.CancelEmergencyOverrideRequest;
 import com.example.starter.playout.api.Dtos.ChannelResponse;
 import com.example.starter.playout.api.Dtos.CreateAssetRequest;
 import com.example.starter.playout.api.Dtos.CreateChannelRequest;
+import com.example.starter.playout.api.Dtos.CreateEmergencyOverrideRequest;
 import com.example.starter.playout.api.Dtos.CreateGrantRequest;
 import com.example.starter.playout.api.Dtos.DecisionSource;
 import com.example.starter.playout.api.Dtos.DraftResponse;
+import com.example.starter.playout.api.Dtos.EmergencyOverrideResponse;
 import com.example.starter.playout.api.Dtos.FallbackReason;
 import com.example.starter.playout.api.Dtos.GrantResponse;
 import com.example.starter.playout.api.Dtos.PlayoutDecisionResponse;
@@ -57,6 +62,14 @@ public class PlayoutService {
     private static final String OP_REPLACE_DRAFT = "REPLACE_DRAFT";
     private static final String OP_PUBLISH = "PUBLISH";
     private static final String OP_REVOKE_GRANT = "REVOKE_GRANT";
+    private static final String OP_CREATE_OVERRIDE = "CREATE_OVERRIDE";
+    private static final String OP_CANCEL_OVERRIDE = "CANCEL_OVERRIDE";
+
+    /** 插播时长上限（含）：30 分钟。 */
+    private static final long OVERRIDE_MAX_DURATION_MS = 30L * 60 * 1000;
+
+    private static final String STATUS_ACTIVE = "ACTIVE";
+    private static final String STATUS_CANCELLED = "CANCELLED";
 
     private final PlayoutRepository repo;
     private final ObjectMapper objectMapper;
@@ -137,6 +150,136 @@ public class PlayoutService {
             return new GrantResponse(grant.id(), grant.channelId(), grant.assetId(),
                     atMs(grant.validFromMs()), atMs(grant.validToMs()), true);
         });
+    }
+
+    // ---------- 紧急插播 ----------
+
+    /**
+     * 创建紧急插播：创建即 ACTIVE，独立于日草稿与发布快照。
+     * 同频道同优先级 ACTIVE 区间不得重叠（相邻合法），不同优先级允许重叠。
+     * 指定授权必须未撤销、属于该频道与素材，并完整覆盖插播区间；授权撤销与本方法并发时按
+     * 事务提交顺序处理（撤销先提交则 422）。同 requestId 同参重放返回首次结果，改参 409；
+     * overrideKey 已存在但不是本次幂等请求产生的，返回 409。
+     */
+    @Transactional
+    public EmergencyOverrideResponse createOverride(CreateEmergencyOverrideRequest request) {
+        long startMs = toMs(request.start());
+        long endMs = toMs(request.end());
+        String hash = sha256(OP_CREATE_OVERRIDE + "|" + request.overrideKey() + "|"
+                + request.channelId() + "|" + request.assetId() + "|" + request.grantId()
+                + "|" + request.priority() + "|" + startMs + "|" + endMs);
+        return idempotent(request.requestId(), OP_CREATE_OVERRIDE, hash,
+                EmergencyOverrideResponse.class, () -> {
+                    validateOverrideWindow(request.start(), startMs, endMs);
+                    String channelId = request.channelId();
+                    // 频道行锁：串行化同频道插播创建，杜绝并发下的同级重叠幻读。
+                    ChannelRow channel = repo.findChannelForUpdate(channelId)
+                            .orElseThrow(() -> ApiException.notFound("频道不存在: " + channelId));
+                    // 重复键优先判 409：键全局唯一且取消后也不释放，不受其它参数合法性影响。
+                    if (repo.findOverride(request.overrideKey()).isPresent()) {
+                        throw ApiException.conflict("OVERRIDE_KEY_EXISTS",
+                                "插播 overrideKey 已存在: " + request.overrideKey());
+                    }
+                    if (repo.findAsset(request.assetId()).isEmpty()) {
+                        throw ApiException.notFound("素材不存在: " + request.assetId());
+                    }
+                    if (channel.fallbackAssetId().equals(request.assetId())) {
+                        throw ApiException.unprocessable("FALLBACK_ASSET_NOT_GRANTABLE",
+                                "插播素材不得为频道保底素材");
+                    }
+                    // 授权行锁：若撤销事务先提交，这里读到的是已撤销状态并 422；
+                    // 若本事务先提交，撤销随后提交，播出查询将通过授权实时状态排除该插播。
+                    GrantRow grant = repo.findGrantForUpdate(request.grantId())
+                            .orElseThrow(() -> ApiException.notFound(
+                                    "授权不存在: " + request.grantId()));
+                    validateGrantCovers(grant, channelId, request.assetId(), startMs, endMs);
+                    List<OverrideRow> overlaps = repo.findActiveOverlapsForCreate(
+                            channelId, request.priority(), startMs, endMs);
+                    if (!overlaps.isEmpty()) {
+                        throw ApiException.conflict("OVERRIDE_OVERLAP",
+                                "同频道同优先级的 ACTIVE 插播区间重叠: " + overlaps.get(0).overrideKey());
+                    }
+                    try {
+                        repo.insertOverride(request.overrideKey(), channelId, request.assetId(),
+                                grant.id(), request.priority(), startMs, endMs, nowMs());
+                    } catch (DuplicateKeyException e) {
+                        throw ApiException.conflict("OVERRIDE_KEY_EXISTS",
+                                "插播 overrideKey 已存在: " + request.overrideKey());
+                    }
+                    return toOverrideResponse(repo.findOverride(request.overrideKey()).orElseThrow());
+                });
+    }
+
+    /** 取消紧急插播；ACTIVE 才可取消，取消后释放同级冲突范围且不可被重放创建复活。 */
+    @Transactional
+    public EmergencyOverrideResponse cancelOverride(String overrideKey,
+                                                    CancelEmergencyOverrideRequest request) {
+        String hash = sha256(OP_CANCEL_OVERRIDE + "|" + overrideKey);
+        return idempotent(request.requestId(), OP_CANCEL_OVERRIDE, hash,
+                EmergencyOverrideResponse.class, () -> {
+                    OverrideRow override = repo.findOverride(overrideKey)
+                            .orElseThrow(() -> ApiException.notFound(
+                                    "插播不存在: " + overrideKey));
+                    if (STATUS_CANCELLED.equals(override.status())) {
+                        throw ApiException.conflict("OVERRIDE_ALREADY_CANCELLED",
+                                "插播已取消: " + overrideKey);
+                    }
+                    int updated = repo.cancelOverride(overrideKey, request.requestId(), nowMs());
+                    if (updated == 0) {
+                        throw ApiException.conflict("OVERRIDE_ALREADY_CANCELLED",
+                                "插播已取消: " + overrideKey);
+                    }
+                    return toOverrideResponse(repo.findOverride(overrideKey).orElseThrow());
+                });
+    }
+
+    /** 插播明细：ACTIVE 与 CANCELLED 均可查询，保留取消情况及原授权关联，不随授权撤销换绑。 */
+    @Transactional(readOnly = true)
+    public EmergencyOverrideResponse getOverride(String overrideKey) {
+        OverrideRow override = repo.findOverride(overrideKey)
+                .orElseThrow(() -> ApiException.notFound("插播不存在: " + overrideKey));
+        return toOverrideResponse(override);
+    }
+
+    /** 校验插播时间窗：终点大于起点、时长不超过 30 分钟、起止同属 Asia/Shanghai 日历日。 */
+    private void validateOverrideWindow(OffsetDateTime start, long startMs, long endMs) {
+        if (endMs <= startMs) {
+            throw ApiException.badRequest("插播结束时间必须大于开始时间");
+        }
+        if (endMs - startMs > OVERRIDE_MAX_DURATION_MS) {
+            throw ApiException.badRequest("插播时长必须在 (0, 30 分钟] 内");
+        }
+        LocalDate startDay = start.atZoneSameInstant(ZONE).toLocalDate();
+        LocalDate endDay = OffsetDateTime.ofInstant(Instant.ofEpochMilli(endMs), ZONE)
+                .toLocalDate();
+        if (!startDay.equals(endDay)) {
+            throw ApiException.badRequest("插播开始与结束必须为同一业务日（Asia/Shanghai）");
+        }
+    }
+
+    /** 校验指定授权未撤销、属于该频道与素材、并完整覆盖 [startMs, endMs)，否则 422。 */
+    private void validateGrantCovers(GrantRow grant, String channelId, String assetId,
+                                     long startMs, long endMs) {
+        if (grant.revoked()) {
+            throw ApiException.unprocessable("GRANT_INVALID",
+                    "指定授权已撤销: " + grant.id());
+        }
+        if (!grant.channelId().equals(channelId) || !grant.assetId().equals(assetId)) {
+            throw ApiException.unprocessable("GRANT_MISMATCH",
+                    "指定授权不属于该频道或素材: " + grant.id());
+        }
+        if (grant.validFromMs() > startMs || grant.validToMs() < endMs) {
+            throw ApiException.unprocessable("GRANT_NOT_COVERING",
+                    "指定授权未完整覆盖插播区间: " + grant.id());
+        }
+    }
+
+    private static EmergencyOverrideResponse toOverrideResponse(OverrideRow row) {
+        return new EmergencyOverrideResponse(row.overrideKey(), row.channelId(), row.assetId(),
+                row.grantId(), row.priority(), atMs(row.startMs()), atMs(row.endMs()),
+                row.status(), atMs(row.createdAtMs()),
+                row.cancelRequestId(),
+                row.cancelledAtMs() == null ? null : atMs(row.cancelledAtMs()));
     }
 
     // ---------- 草稿 ----------
@@ -233,8 +376,9 @@ public class PlayoutService {
     // ---------- 播出决定 ----------
 
     /**
-     * 按频道与时刻查询播出决定。命中有效片段返回节目素材；无已发布编排、空档或授权已撤销时
-     * 返回保底素材及明确原因。撤销判定基于授权当前状态，不改写历史快照。
+     * 按频道与时刻查询播出决定。优先选择区间命中、ACTIVE 且指定授权当前未撤销的最高优先级插播
+     * （优先级数字小者优先）；最高优先级候选授权失效时自动落到仍有效的低优先级插播。
+     * 无有效插播候选才沿用原节目与保底逻辑。查询不改变任何状态，到结束时刻不再命中。
      */
     @Transactional(readOnly = true)
     public PlayoutDecisionResponse playoutDecision(String channelId, OffsetDateTime at) {
@@ -242,6 +386,13 @@ public class PlayoutService {
                 .orElseThrow(() -> ApiException.notFound("频道不存在: " + channelId));
         long atMs = toMs(at);
         LocalDate businessDay = at.atZoneSameInstant(ZONE).toLocalDate();
+
+        Optional<OverrideRow> override = repo.findActiveOverrideAt(channelId, atMs);
+        if (override.isPresent()) {
+            OverrideRow hit = override.get();
+            return new PlayoutDecisionResponse(channelId, at, hit.assetId(),
+                    DecisionSource.EMERGENCY, null, null, null, hit.overrideKey());
+        }
 
         Optional<PublicationRow> publication = repo.findLatestPublication(channelId, businessDay);
         if (publication.isEmpty()) {
@@ -262,11 +413,11 @@ public class PlayoutService {
             return new PlayoutDecisionResponse(channelId, at, channel.fallbackAssetId(),
                     DecisionSource.FALLBACK,
                     FallbackReason.GRANT_REVOKED,
-                    publication.get().id(), hit.segmentId());
+                    publication.get().id(), hit.segmentId(), null);
         }
         return new PlayoutDecisionResponse(channelId, at, hit.assetId(),
                 DecisionSource.PROGRAM, null,
-                publication.get().id(), hit.segmentId());
+                publication.get().id(), hit.segmentId(), null);
     }
 
     // ---------- 内部方法 ----------
@@ -396,7 +547,7 @@ public class PlayoutService {
     private PlayoutDecisionResponse fallback(String channelId, OffsetDateTime at, String assetId,
                                              FallbackReason reason) {
         return new PlayoutDecisionResponse(channelId, at, assetId,
-                DecisionSource.FALLBACK, reason, null, null);
+                DecisionSource.FALLBACK, reason, null, null, null);
     }
 
     private static long toMs(OffsetDateTime time) {

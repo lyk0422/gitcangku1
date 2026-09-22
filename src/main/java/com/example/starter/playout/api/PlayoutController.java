@@ -2,11 +2,14 @@ package com.example.starter.playout.api;
 
 import com.example.starter.playout.PlayoutService;
 import com.example.starter.playout.api.Dtos.AssetResponse;
+import com.example.starter.playout.api.Dtos.CancelEmergencyOverrideRequest;
 import com.example.starter.playout.api.Dtos.ChannelResponse;
 import com.example.starter.playout.api.Dtos.CreateAssetRequest;
 import com.example.starter.playout.api.Dtos.CreateChannelRequest;
+import com.example.starter.playout.api.Dtos.CreateEmergencyOverrideRequest;
 import com.example.starter.playout.api.Dtos.CreateGrantRequest;
 import com.example.starter.playout.api.Dtos.DraftResponse;
+import com.example.starter.playout.api.Dtos.EmergencyOverrideResponse;
 import com.example.starter.playout.api.Dtos.GrantResponse;
 import com.example.starter.playout.api.Dtos.PlayoutDecisionResponse;
 import com.example.starter.playout.api.Dtos.PublishRequest;
@@ -93,6 +96,27 @@ public class PlayoutController {
                                            @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME)
                                            OffsetDateTime at) {
         return service.playoutDecision(channelId, at);
+    }
+
+    /** 创建紧急插播（幂等：同 requestId 同参返回首次结果，改参 409）。 */
+    @PostMapping("/emergency-overrides")
+    public EmergencyOverrideResponse createOverride(
+            @Valid @RequestBody CreateEmergencyOverrideRequest request) {
+        return service.createOverride(request);
+    }
+
+    /** 取消紧急插播（幂等：只可取消一次，重放返回首次结果）。 */
+    @PostMapping("/emergency-overrides/{overrideKey}/cancel")
+    public EmergencyOverrideResponse cancelOverride(@PathVariable @NotBlank String overrideKey,
+                                                    @Valid @RequestBody
+                                                    CancelEmergencyOverrideRequest request) {
+        return service.cancelOverride(overrideKey, request);
+    }
+
+    /** 紧急插播明细：ACTIVE / CANCELLED 均可查，保留取消情况与原授权关联。 */
+    @GetMapping("/emergency-overrides/{overrideKey}")
+    public EmergencyOverrideResponse getOverride(@PathVariable @NotBlank String overrideKey) {
+        return service.getOverride(overrideKey);
     }
 
     private static LocalDate parseBusinessDay(String businessDay) {

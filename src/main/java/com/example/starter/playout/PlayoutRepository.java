@@ -63,6 +63,13 @@ public class PlayoutRepository {
                              String responseBody) {
     }
 
+    /** 紧急插播行。status 为 ACTIVE / CANCELLED；取消信息仅在 CANCELLED 时非空。 */
+    public record OverrideRow(String overrideKey, String channelId, String assetId,
+                              long grantId, int priority, long startMs, long endMs,
+                              String status, long createdAtMs,
+                              String cancelRequestId, Long cancelledAtMs) {
+    }
+
     private static final RowMapper<AssetRow> ASSET_MAPPER = (rs, n) ->
             new AssetRow(rs.getString("id"), rs.getLong("duration_ms"));
 
@@ -94,6 +101,14 @@ public class PlayoutRepository {
     private static final RowMapper<RequestRow> REQUEST_MAPPER = (rs, n) ->
             new RequestRow(rs.getString("request_id"), rs.getString("operation"),
                     rs.getString("params_hash"), rs.getString("response_body"));
+
+    private static final RowMapper<OverrideRow> OVERRIDE_MAPPER = (rs, n) ->
+            new OverrideRow(rs.getString("override_key"), rs.getString("channel_id"),
+                    rs.getString("asset_id"), rs.getLong("grant_id"), rs.getInt("priority"),
+                    rs.getLong("start_ms"), rs.getLong("end_ms"), rs.getString("status"),
+                    rs.getLong("created_at_ms"),
+                    rs.getString("cancel_request_id"),
+                    (Long) rs.getObject("cancelled_at_ms"));
 
     // ---------- 素材 ----------
 
@@ -288,5 +303,73 @@ public class PlayoutRepository {
     /** 判断是否为唯一键冲突（草稿首建、发布版本、请求 ID 等并发场景）。 */
     public static boolean isDuplicateKey(RuntimeException ex) {
         return ex instanceof DuplicateKeyException;
+    }
+
+    // ---------- 紧急插播 ----------
+
+    public void insertOverride(String overrideKey, String channelId, String assetId, long grantId,
+                               int priority, long startMs, long endMs, long createdAtMs) {
+        jdbc.update("INSERT INTO playout_emergency_override"
+                        + " (override_key, channel_id, asset_id, grant_id, priority, start_ms, end_ms,"
+                        + "  status, created_at_ms)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?)",
+                overrideKey, channelId, assetId, grantId, priority, startMs, endMs, createdAtMs);
+    }
+
+    public Optional<OverrideRow> findOverride(String overrideKey) {
+        return jdbc.query("SELECT override_key, channel_id, asset_id, grant_id, priority,"
+                        + " start_ms, end_ms, status, created_at_ms, cancel_request_id, cancelled_at_ms"
+                        + " FROM playout_emergency_override WHERE override_key = ?",
+                OVERRIDE_MAPPER, overrideKey).stream().findFirst();
+    }
+
+    /** 锁定频道行：串行化同频道的插播创建，保证并发同级重叠校验幻读安全。 */
+    public Optional<ChannelRow> findChannelForUpdate(String channelId) {
+        return jdbc.query("SELECT id, fallback_asset_id FROM playout_channel"
+                + " WHERE id = ? FOR UPDATE", CHANNEL_MAPPER, channelId).stream().findFirst();
+    }
+
+    /** 按主键锁定授权行：与授权撤销按事务提交顺序串行化。 */
+    public Optional<GrantRow> findGrantForUpdate(long grantId) {
+        return jdbc.query("SELECT id, channel_id, asset_id, valid_from_ms, valid_to_ms, revoked"
+                + " FROM playout_grant WHERE id = ? FOR UPDATE", GRANT_MAPPER, grantId)
+                .stream().findFirst();
+    }
+
+    /**
+     * 查找同频道同优先级且与 [startMs, endMs) 重叠的 ACTIVE 插播（相邻区间 start==end 不算重叠）。
+     * 调用方须先持有频道行锁。
+     */
+    public List<OverrideRow> findActiveOverlapsForCreate(String channelId, int priority,
+                                                          long startMs, long endMs) {
+        return jdbc.query("SELECT override_key, channel_id, asset_id, grant_id, priority,"
+                        + " start_ms, end_ms, status, created_at_ms, cancel_request_id, cancelled_at_ms"
+                        + " FROM playout_emergency_override"
+                        + " WHERE channel_id = ? AND status = 'ACTIVE' AND priority = ?"
+                        + " AND start_ms < ? AND end_ms > ?",
+                OVERRIDE_MAPPER, channelId, priority, endMs, startMs);
+    }
+
+    /**
+     * 查询某频道时刻命中、ACTIVE 且指定授权当前未撤销的插播，按优先级升序（数字小者优先）取最高优先级。
+     */
+    public Optional<OverrideRow> findActiveOverrideAt(String channelId, long atMs) {
+        return jdbc.query("SELECT o.override_key, o.channel_id, o.asset_id, o.grant_id, o.priority,"
+                        + " o.start_ms, o.end_ms, o.status, o.created_at_ms,"
+                        + " o.cancel_request_id, o.cancelled_at_ms"
+                        + " FROM playout_emergency_override o"
+                        + " JOIN playout_grant g ON g.id = o.grant_id"
+                        + " WHERE o.channel_id = ? AND o.status = 'ACTIVE' AND g.revoked = 0"
+                        + " AND o.start_ms <= ? AND o.end_ms > ?"
+                        + " ORDER BY o.priority ASC, o.start_ms DESC, o.override_key ASC LIMIT 1",
+                OVERRIDE_MAPPER, channelId, atMs, atMs).stream().findFirst();
+    }
+
+    /** 取消插播；返回受影响行数，0 表示不存在或已取消。 */
+    public int cancelOverride(String overrideKey, String cancelRequestId, long cancelledAtMs) {
+        return jdbc.update("UPDATE playout_emergency_override"
+                        + " SET status = 'CANCELLED', cancel_request_id = ?, cancelled_at_ms = ?"
+                        + " WHERE override_key = ? AND status = 'ACTIVE'",
+                cancelRequestId, cancelledAtMs, overrideKey);
     }
 }

@@ -1,4 +1,4 @@
--- 测试用 H2（MySQL 兼容模式）表结构，与 src/main/resources/schema.sql 字段一一对应。
+-- 本地默认运行用 H2（MySQL 兼容模式）表结构，与 schema.sql（MySQL 8）字段一一对应。
 -- 列含义见 schema.sql 中的中文 COMMENT：*_ms 为 UTC 纪元毫秒，business_day 为 Asia/Shanghai 日历日。
 
 CREATE TABLE IF NOT EXISTS playout_asset (
@@ -62,8 +62,8 @@ CREATE TABLE IF NOT EXISTS playout_publication_segment (
     segment_id     VARCHAR(64) NOT NULL,
     asset_id       VARCHAR(64) NOT NULL,
     grant_id       BIGINT      NOT NULL,
-    start_ms       BIGINT      NOT NULL,
-    end_ms         BIGINT      NOT NULL
+    start_ms      BIGINT      NOT NULL,
+    end_ms        BIGINT      NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pub_segment ON playout_publication_segment (publication_id);
 

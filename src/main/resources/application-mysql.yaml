@@ -1,0 +1,14 @@
+# MySQL（Docker Compose）profile：通过 DB_URL / DB_USER 与 configtree 密码连接外部 MySQL 8。
+# 本地开发与测试默认使用 local（H2 内存库），无需启动本 profile。
+spring:
+  datasource:
+    url: ${DB_URL}
+    username: ${DB_USER}
+    hikari:
+      maximum-pool-size: 5
+      minimum-idle: 1
+      connection-timeout: 10000
+      validation-timeout: 3000
+  sql:
+    init:
+      schema-locations: classpath:schema.sql

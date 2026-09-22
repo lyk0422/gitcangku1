@@ -74,9 +74,25 @@ CREATE TABLE IF NOT EXISTS playout_publication_segment (
 
 CREATE TABLE IF NOT EXISTS playout_request (
     request_id    VARCHAR(64)  NOT NULL COMMENT '幂等请求 ID，客户端生成',
-    operation     VARCHAR(32)  NOT NULL COMMENT '操作类型：REPLACE_DRAFT / PUBLISH / REVOKE_GRANT',
+    operation     VARCHAR(32)  NOT NULL COMMENT '操作类型：REPLACE_DRAFT / PUBLISH / REVOKE_GRANT / CREATE_OVERRIDE / CANCEL_OVERRIDE',
     params_hash   VARCHAR(64)  NOT NULL COMMENT '业务参数（不含 requestId）的 SHA-256，十六进制',
     response_body TEXT         NULL COMMENT '成功时的响应 JSON；失败请求回滚不占用 requestId',
     created_at_ms BIGINT       NOT NULL COMMENT '记录创建时间，UTC 纪元毫秒',
     PRIMARY KEY (request_id)
 ) COMMENT = '幂等去重表，与业务结果同事务提交';
+
+CREATE TABLE IF NOT EXISTS playout_emergency_override (
+    override_key      VARCHAR(64) NOT NULL COMMENT '插播全局唯一键，客户端指定，创建后不可复用',
+    channel_id        VARCHAR(64) NOT NULL COMMENT '插播频道 ID',
+    asset_id          VARCHAR(64) NOT NULL COMMENT '插播普通素材 ID（不得为频道保底素材）',
+    grant_id          BIGINT      NOT NULL COMMENT '创建时指定的授权 ID；取消或授权撤销后也不自动换绑其他授权',
+    priority          INT         NOT NULL COMMENT '优先级，整数 1～9，1 最高、9 最低；数字小者优先播出',
+    start_ms          BIGINT      NOT NULL COMMENT '插播开始（含），UTC 纪元毫秒',
+    end_ms            BIGINT      NOT NULL COMMENT '插播结束（不含），UTC 纪元毫秒；与开始同属 Asia/Shanghai 日历日，时长满足 0 < end-start <= 30 分钟',
+    status            VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE 生效中（创建即此状态）；CANCELLED 已取消（终态，不可改写、不可复活）',
+    created_at_ms     BIGINT      NOT NULL COMMENT '创建时间，UTC 纪元毫秒',
+    cancel_request_id VARCHAR(64) NULL COMMENT '取消操作的幂等请求 ID；未取消时为 NULL',
+    cancelled_at_ms   BIGINT      NULL COMMENT '取消时间，UTC 纪元毫秒；未取消时为 NULL',
+    PRIMARY KEY (override_key),
+    KEY idx_override_channel (channel_id, status, priority, start_ms, end_ms)
+) COMMENT = '紧急插播表：独立于日草稿与发布快照，创建即 ACTIVE，只可取消；同频道同优先级 ACTIVE 区间不得重叠';

@@ -6,6 +6,7 @@ services:
         GSB_BUILD_SCOPE: ${COMPOSE_PROJECT_NAME}
     init: true
     environment:
+      SPRING_PROFILES_ACTIVE: mysql
       DB_URL: "jdbc:mysql://db:3306/taskdb?sslMode=DISABLED&allowPublicKeyRetrieval=true&connectionTimeZone=Asia/Shanghai&forceConnectionTimeZoneToSession=true&connectTimeout=10000&socketTimeout=30000"
       DB_USER: taskuser
     secrets:

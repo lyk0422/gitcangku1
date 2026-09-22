@@ -1,11 +1,14 @@
 spring:
   application:
     name: gitcangku1
+  # 默认 local：嵌入式 H2 内存库（MODE=MySQL），无需外部数据库；
+  # Docker/Compose 的 MySQL 入口通过 SPRING_PROFILES_ACTIVE=mysql 启用下面的 DB_URL 配置。
+  profiles:
+    active: ${SPRING_PROFILES_ACTIVE:local}
   config:
     import: "optional:configtree:/run/secrets/"
+  # 数据源连接信息由具体 profile 提供：local=嵌入式 H2（默认），mysql=外部 MySQL（DB_URL/DB_USER/密钥）。
   datasource:
-    url: ${DB_URL}
-    username: ${DB_USER}
     hikari:
       maximum-pool-size: 5
       minimum-idle: 1
