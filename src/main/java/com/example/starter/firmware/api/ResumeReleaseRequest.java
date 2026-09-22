@@ -1,0 +1,15 @@
+package com.example.starter.firmware.api;
+
+import jakarta.validation.constraints.Min;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
+
+/**
+ * 人工恢复请求：仅 PAUSED 可恢复为 ACTIVE；expectedVersion 必须等于当前版本，
+ * 成功后版本加一并开启新监控轮次。
+ */
+public record ResumeReleaseRequest(
+        @NotBlank @Size(max = 64) String requestId,
+        @Min(1) int expectedVersion,
+        @NotBlank @Size(max = 256) String reason) {
+}

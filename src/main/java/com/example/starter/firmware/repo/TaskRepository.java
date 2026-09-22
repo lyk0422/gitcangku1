@@ -1,5 +1,6 @@
 package com.example.starter.firmware.repo;
 
+import com.example.starter.firmware.domain.MonitoringStats;
 import com.example.starter.firmware.domain.ReceiptResult;
 import com.example.starter.firmware.domain.RolloutTask;
 import com.example.starter.firmware.domain.TaskStatus;
@@ -62,9 +63,22 @@ public class TaskRepository {
                 MAPPER, releaseId, deviceId).stream().findFirst();
     }
 
-    public void complete(long id, ReceiptResult result) {
-        jdbc.update("UPDATE rollout_task SET status = ?, first_result = ?, updated_at = CURRENT_TIMESTAMP"
-                + " WHERE id = ?", result.name(), result.name(), id);
+    public void complete(long id, ReceiptResult result, int monitorRound) {
+        jdbc.update("UPDATE rollout_task SET status = ?, first_result = ?, first_result_round = ?,"
+                + " updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                result.name(), result.name(), monitorRound, id);
+    }
+
+    /**
+     * 统计指定监控轮次内首次进入 SUCCESS/FAILED 的任务数；CANCELLED 与重复回执不计入。
+     */
+    public MonitoringStats statsForRound(long releaseId, int monitorRound) {
+        return jdbc.queryForObject(
+                "SELECT COALESCE(SUM(CASE WHEN first_result = 'SUCCESS' THEN 1 ELSE 0 END), 0) AS sc,"
+                        + " COALESCE(SUM(CASE WHEN first_result = 'FAILED' THEN 1 ELSE 0 END), 0) AS fc"
+                        + " FROM rollout_task WHERE release_id = ? AND first_result_round = ?",
+                (rs, rowNum) -> new MonitoringStats(rs.getLong("sc"), rs.getLong("fc")),
+                releaseId, monitorRound);
     }
 
     public int cancelPendingByRelease(long releaseId) {
