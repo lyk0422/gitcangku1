@@ -92,13 +92,41 @@ public class TranslationController {
                         documentId, segmentId, language, actorId, request))).toResponseEntity();
     }
 
-    /** 发布：全部段落全部目标语言均有有效批准时原子生成只读快照并递增发布版本。 */
+    /** 发布：全部段落全部目标语言均有有效批准且术语校验通过时原子生成只读快照并递增发布版本。 */
     @PostMapping("/{documentId}/publish")
     public ResponseEntity<String> publish(@PathVariable long documentId,
                                           @Valid @RequestBody ApiDtos.PublishRequest request) {
         String operation = "POST /api/documents/" + documentId + "/publish";
         return writeExecutor.execute(request.requestId(), hash(operation, request),
                 () -> WriteResult.of(201, translationService.publish(documentId, request))).toResponseEntity();
+    }
+
+    /** 新增术语版本：不可变快照，术语版本与草稿版本各加一；已有版本不可覆盖。 */
+    @PutMapping("/{documentId}/terms")
+    public ResponseEntity<String> updateTerms(@PathVariable long documentId,
+                                              @Valid @RequestBody ApiDtos.UpdateTermsRequest request) {
+        String operation = "PUT /api/documents/" + documentId + "/terms";
+        return writeExecutor.execute(request.requestId(), hash(operation, request),
+                () -> WriteResult.of(201, translationService.updateTerms(documentId, request))).toResponseEntity();
+    }
+
+    /** 查询当前术语版本及完整规则集。 */
+    @GetMapping("/{documentId}/terms")
+    public ResponseEntity<ApiDtos.TermVersionView> getCurrentTerms(@PathVariable long documentId) {
+        return ResponseEntity.ok(translationService.getCurrentTerms(documentId));
+    }
+
+    /** 查询指定术语版本的不可变规则集。 */
+    @GetMapping("/{documentId}/terms/{termVersion}")
+    public ResponseEntity<ApiDtos.TermVersionView> getTerms(@PathVariable long documentId,
+                                                            @PathVariable int termVersion) {
+        return ResponseEntity.ok(translationService.getTerms(documentId, termVersion));
+    }
+
+    /** 查询全部译文的术语状态：绑定版本、是否过期及当前规则下的违规术语。 */
+    @GetMapping("/{documentId}/terms/status")
+    public ResponseEntity<ApiDtos.TermStatusResponse> getTermStatus(@PathVariable long documentId) {
+        return ResponseEntity.ok(translationService.getTermStatus(documentId));
     }
 
     /** 查询指定发布版本的只读快照。 */

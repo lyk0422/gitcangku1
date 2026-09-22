@@ -39,6 +39,8 @@ public abstract class AbstractIntegrationTest {
         jdbc.update("DELETE FROM translation");
         jdbc.update("DELETE FROM segment");
         jdbc.update("DELETE FROM release_snapshot");
+        jdbc.update("DELETE FROM term_rule");
+        jdbc.update("DELETE FROM term_version");
         jdbc.update("DELETE FROM request_log");
         jdbc.update("DELETE FROM document");
     }
@@ -118,6 +120,14 @@ public abstract class AbstractIntegrationTest {
         String body = "{\"requestId\":\"" + requestId + "\",\"expectedDraftVersion\":" + expectedDraftVersion
                 + ",\"expectedPublishedVersion\":" + expectedPublishedVersion + "}";
         return postJson("/api/documents/" + documentId + "/publish", body);
+    }
+
+    /** 新增术语版本：rulesJson 为规则数组 JSON。 */
+    protected ApiResult updateTerms(long documentId, int expectedTermVersion, String rulesJson,
+                                    String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"expectedTermVersion\":" + expectedTermVersion
+                + ",\"rules\":" + rulesJson + "}";
+        return putJson("/api/documents/" + documentId + "/terms", body);
     }
 
     /** HTTP 响应结果：状态码与 JSON 响应体。 */

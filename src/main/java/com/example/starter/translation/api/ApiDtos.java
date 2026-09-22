@@ -1,5 +1,6 @@
 package com.example.starter.translation.api;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
@@ -64,6 +65,21 @@ public final class ApiDtos {
             @PositiveOrZero(message = "expectedPublishedVersion 不能为负数") int expectedPublishedVersion) {
     }
 
+    /** 术语规则输入：sourceTerm 区分大小写，requiredTranslation 非空。 */
+    public record TermRuleInput(
+            @NotBlank(message = "sourceTerm 不能为空") @Size(max = 512) String sourceTerm,
+            @NotBlank(message = "language 不能为空") String language,
+            @NotBlank(message = "requiredTranslation 不能为空") @Size(max = 2048) String requiredTranslation) {
+    }
+
+    /** 新增术语版本请求：携带期望的当前术语版本与完整规则集（0~100 条）。 */
+    public record UpdateTermsRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @PositiveOrZero(message = "expectedTermVersion 不能为负数") int expectedTermVersion,
+            @NotNull(message = "rules 不能为空") @Size(max = 100, message = "术语规则最多 100 条")
+            List<@Valid TermRuleInput> rules) {
+    }
+
     /** 建文档响应。 */
     public record DocumentResponse(long documentId, int draftVersion, int publishedVersion,
                                    List<String> targetLanguages) {
@@ -75,7 +91,8 @@ public final class ApiDtos {
 
     /** 译文提交响应。 */
     public record TranslationResponse(long documentId, String segmentId, String language,
-                                      int translationVersion, int sourceVersion, int draftVersion) {
+                                      int translationVersion, int sourceVersion, int termVersion,
+                                      int draftVersion) {
     }
 
     /** 译文批准响应。 */
@@ -87,7 +104,32 @@ public final class ApiDtos {
     public record PublishResponse(long documentId, int publishedVersion) {
     }
 
-    /** 统一错误响应。 */
-    public record ErrorResponse(String error, String message) {
+    /** 术语规则视图。 */
+    public record TermRuleView(String sourceTerm, String language, String requiredTranslation) {
+    }
+
+    /** 新增术语版本响应。 */
+    public record TermVersionResponse(long documentId, int termVersion, int ruleCount, int draftVersion) {
+    }
+
+    /** 术语版本查询视图：版本号与完整规则集。 */
+    public record TermVersionView(long documentId, int termVersion, List<TermRuleView> rules) {
+    }
+
+    /** 单条译文的术语状态：绑定版本、是否过期及当前规则下的违规术语。 */
+    public record TranslationTermStatus(String segmentId, String language, int translationVersion,
+                                        int termVersion, boolean termStale, List<TermRuleView> violations) {
+    }
+
+    /** 译文术语状态查询响应。 */
+    public record TermStatusResponse(long documentId, int termVersion, List<TranslationTermStatus> translations) {
+    }
+
+    /** 统一错误响应；violations 仅在术语违规 422 时返回，含全部违规术语。 */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public record ErrorResponse(String error, String message, List<TermRuleView> violations) {
+        public ErrorResponse(String error, String message) {
+            this(error, message, null);
+        }
     }
 }

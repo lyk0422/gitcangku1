@@ -11,15 +11,16 @@ public final class Rows {
     }
 
     /**
-     * 文档：全局唯一 documentId，含 1~5 种目标语言及草稿/发布版本。
+     * 文档：全局唯一 documentId，含 1~5 种目标语言及草稿/发布/术语版本。
      *
      * @param documentId       全局唯一文档 ID，自增
      * @param targetLanguages  目标语言列表，小写语言码，1~5 种
-     * @param draftVersion     文档草稿版本，从 1 开始；增段落或修改源文/译文时加一
+     * @param draftVersion     文档草稿版本，从 1 开始；增段落或修改源文/译文/术语时加一
      * @param publishedVersion 已发布版本号，从 0 开始，每次成功发布加一
+     * @param termVersion      当前术语版本，从 0 开始（0 表示尚未建立术语版本）
      */
     public record DocumentRow(long documentId, List<String> targetLanguages,
-                              int draftVersion, int publishedVersion) {
+                              int draftVersion, int publishedVersion, int termVersion) {
     }
 
     /**
@@ -33,7 +34,7 @@ public final class Rows {
     }
 
     /**
-     * 译文：按段落与语言唯一，保存正文、作者、所依据源文版本及递增译文版本。
+     * 译文：按段落与语言唯一，保存正文、作者、所依据源文版本、绑定术语版本及递增译文版本。
      *
      * @param segmentId          所属段落 ID
      * @param language           目标语言码，小写
@@ -41,9 +42,20 @@ public final class Rows {
      * @param author             译文作者，取提交时 X-Actor-Id
      * @param sourceVersion      译文所依据的源文版本；提交时必须等于当前源文版本
      * @param translationVersion 译文版本，从 1 开始，每次重新提交加一
+     * @param termVersion        译文提交时绑定的术语版本；不等于当前术语版本时视为术语过期
      */
     public record TranslationRow(String segmentId, String language, String content, String author,
-                                 int sourceVersion, int translationVersion) {
+                                 int sourceVersion, int translationVersion, int termVersion) {
+    }
+
+    /**
+     * 术语规则：属于某术语版本的不可变规则，按 sourceTerm 与目标语言唯一。
+     *
+     * @param sourceTerm          源文术语，Unicode 原文、区分大小写，按连续子串匹配
+     * @param language            目标语言码，小写
+     * @param requiredTranslation 该术语在目标语言中的必译文本，非空
+     */
+    public record TermRuleRow(String sourceTerm, String language, String requiredTranslation) {
     }
 
     /**

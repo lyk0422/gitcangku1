@@ -139,4 +139,103 @@ class ConcurrencyTest extends AbstractIntegrationTest {
             assertThat(publishedVersion).isZero();
         }
     }
+
+    @Test
+    @DisplayName("发布与术语更新并发：只发布更新前完整状态或因版本变化失败，不产生混合快照")
+    void concurrentPublishAndTermUpdate() throws Exception {
+        long docId = createDocument(newRequestId(), "[\"en\"]",
+                "[{\"segmentId\":\"s1\",\"sourceText\":\"机器学习\"}]");
+        updateTerms(docId, 0,
+                "[{\"sourceTerm\":\"机器学习\",\"language\":\"en\",\"requiredTranslation\":\"machine learning\"}]",
+                newRequestId());
+        submitTranslation(docId, "s1", "en", "alice", "machine learning", 1, newRequestId());
+        approve(docId, "s1", "en", "bob", 1, newRequestId());
+        // 当前草稿版本 3、发布版本 0、术语版本 1
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        CountDownLatch gate = new CountDownLatch(1);
+        Future<ApiResult> publishFuture = pool.submit(() -> {
+            gate.await();
+            return publish(docId, 3, 0, newRequestId());
+        });
+        Future<ApiResult> termsFuture = pool.submit(() -> {
+            gate.await();
+            return updateTerms(docId, 1,
+                    "[{\"sourceTerm\":\"机器学习\",\"language\":\"en\",\"requiredTranslation\":\"ML\"}]",
+                    newRequestId());
+        });
+        gate.countDown();
+        ApiResult publishResult = publishFuture.get(30, TimeUnit.SECONDS);
+        ApiResult termsResult = termsFuture.get(30, TimeUnit.SECONDS);
+        pool.shutdown();
+
+        // 术语更新必然成功；发布要么成功（先于术语更新，快照固化术语版本 1），要么 409（草稿版本已变）
+        assertThat(termsResult.status()).isEqualTo(201);
+        assertThat(publishResult.status()).isIn(201, 409);
+
+        Integer draftVersion = jdbc.queryForObject(
+                "SELECT draft_version FROM document WHERE document_id = ?", Integer.class, docId);
+        Integer termVersion = jdbc.queryForObject(
+                "SELECT term_version FROM document WHERE document_id = ?", Integer.class, docId);
+        Integer publishedVersion = jdbc.queryForObject(
+                "SELECT published_version FROM document WHERE document_id = ?", Integer.class, docId);
+        Integer snapshots = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM release_snapshot WHERE document_id = ?", Integer.class, docId);
+
+        assertThat(draftVersion).isEqualTo(4);
+        assertThat(termVersion).isEqualTo(2);
+        assertThat(snapshots).isEqualTo(publishedVersion);
+        if (publishResult.status() == 201) {
+            // 发布先于术语更新：快照为更新前完整状态（术语版本 1、旧规则集）
+            assertThat(publishedVersion).isEqualTo(1);
+            ApiResult release = getJson("/api/documents/" + docId + "/releases/1");
+            assertThat(release.status()).isEqualTo(200);
+            assertThat(release.body().get("termVersion").asInt()).isEqualTo(1);
+            assertThat(release.body().get("terms").get(0).get("requiredTranslation").asText())
+                    .isEqualTo("machine learning");
+        } else {
+            // 术语更新先于发布：期望草稿版本不符，发布 409 且无快照
+            assertThat(publishedVersion).isZero();
+        }
+    }
+
+    @Test
+    @DisplayName("并发术语更新：同一期望版本仅一个成功，术语版本无丢失更新")
+    void concurrentTermUpdates() throws Exception {
+        long docId = createDocument(newRequestId(), "[\"en\"]", "[]");
+        int threads = 4;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch gate = new CountDownLatch(1);
+        List<Future<ApiResult>> futures = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            final int n = i;
+            futures.add(pool.submit(() -> {
+                gate.await();
+                return updateTerms(docId, 0,
+                        "[{\"sourceTerm\":\"术语" + n + "\",\"language\":\"en\","
+                                + "\"requiredTranslation\":\"term" + n + "\"}]", newRequestId());
+            }));
+        }
+        gate.countDown();
+        int success = 0;
+        int conflict = 0;
+        for (Future<ApiResult> future : futures) {
+            int status = future.get(30, TimeUnit.SECONDS).status();
+            if (status == 201) {
+                success++;
+            } else if (status == 409) {
+                conflict++;
+            }
+        }
+        pool.shutdown();
+
+        assertThat(success).isEqualTo(1);
+        assertThat(conflict).isEqualTo(threads - 1);
+        assertThat(jdbc.queryForObject(
+                "SELECT COUNT(*) FROM term_version WHERE document_id = ?", Integer.class, docId))
+                .isEqualTo(1);
+        Integer termVersion = jdbc.queryForObject(
+                "SELECT term_version FROM document WHERE document_id = ?", Integer.class, docId);
+        assertThat(termVersion).isEqualTo(1);
+    }
 }
