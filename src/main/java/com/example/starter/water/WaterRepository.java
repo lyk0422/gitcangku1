@@ -25,9 +25,15 @@ public class WaterRepository {
                             BigDecimal plannedVolume, long createdNanos) {
     }
 
-    /** 配水申请行。 */
+    /** 配水申请行；amount 为不可改写的原申请水量，heldAmount 为当前持有额度。 */
     public record AllocationRow(long id, String allocationKey, long windowId, String userId, BigDecimal amount,
-                                String requester, String status, long createdNanos, long updatedNanos) {
+                                BigDecimal heldAmount, String requester, String status,
+                                long createdNanos, long updatedNanos) {
+    }
+
+    /** 转让流水行，创建后不可变。 */
+    public record TransferRow(long id, String transferKey, long windowId, String sourceAllocationKey,
+                              String targetAllocationKey, BigDecimal amount, String actor, long createdNanos) {
     }
 
     /** 限供行。 */
@@ -47,8 +53,18 @@ public class WaterRepository {
 
     private static final RowMapper<AllocationRow> ALLOCATION_MAPPER = (rs, n) -> new AllocationRow(
             rs.getLong("id"), rs.getString("allocation_key"), rs.getLong("window_id"),
-            rs.getString("user_id"), rs.getBigDecimal("amount"), rs.getString("requester"),
-            rs.getString("status"), rs.getLong("created_nanos"), rs.getLong("updated_nanos"));
+            rs.getString("user_id"), rs.getBigDecimal("amount"), rs.getBigDecimal("held_amount"),
+            rs.getString("requester"), rs.getString("status"),
+            rs.getLong("created_nanos"), rs.getLong("updated_nanos"));
+
+    private static final String ALLOCATION_SELECT =
+            "SELECT id, allocation_key, window_id, user_id, amount, held_amount, requester, status,"
+                    + " created_nanos, updated_nanos";
+
+    private static final RowMapper<TransferRow> TRANSFER_MAPPER = (rs, n) -> new TransferRow(
+            rs.getLong("id"), rs.getString("transfer_key"), rs.getLong("window_id"),
+            rs.getString("source_allocation_key"), rs.getString("target_allocation_key"),
+            rs.getBigDecimal("amount"), rs.getString("actor"), rs.getLong("created_nanos"));
 
     private static final RowMapper<CurtailmentRow> CURTAILMENT_MAPPER = (rs, n) -> new CurtailmentRow(
             rs.getLong("id"), rs.getLong("window_id"), rs.getBigDecimal("volume"), rs.getString("status"),
@@ -120,8 +136,8 @@ public class WaterRepository {
         KeyHolder keys = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO allocation (allocation_key, window_id, user_id, amount, requester, status, created_nanos, updated_nanos)"
-                            + " VALUES (?, ?, ?, ?, ?, 'REQUESTED', ?, ?)", Statement.RETURN_GENERATED_KEYS);
+                    "INSERT INTO allocation (allocation_key, window_id, user_id, amount, held_amount, requester, status, created_nanos, updated_nanos)"
+                            + " VALUES (?, ?, ?, ?, 0, ?, 'REQUESTED', ?, ?)", Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, allocationKey);
             ps.setLong(2, windowId);
             ps.setString(3, userId);
@@ -137,24 +153,45 @@ public class WaterRepository {
     /** 按业务键查询申请，不存在返回 null。 */
     public AllocationRow findAllocationByKey(String allocationKey) {
         try {
-            return jdbc.queryForObject(
-                    "SELECT id, allocation_key, window_id, user_id, amount, requester, status, created_nanos, updated_nanos"
-                            + " FROM allocation WHERE allocation_key = ?", ALLOCATION_MAPPER, allocationKey);
+            return jdbc.queryForObject(ALLOCATION_SELECT + " FROM allocation WHERE allocation_key = ?",
+                    ALLOCATION_MAPPER, allocationKey);
         } catch (EmptyResultDataAccessException e) {
             return null;
         }
     }
 
-    /** 更新申请状态与变更时间。 */
-    public void updateAllocationStatus(long id, String status, long updatedNanos) {
-        jdbc.update("UPDATE allocation SET status = ?, updated_nanos = ? WHERE id = ?",
-                status, updatedNanos, id);
+    /** 按业务键锁定申请行（FOR UPDATE），用于串行化转让的源/目标争用，不存在返回 null。 */
+    public AllocationRow lockAllocationByKey(String allocationKey) {
+        try {
+            return jdbc.queryForObject(
+                    ALLOCATION_SELECT + " FROM allocation WHERE allocation_key = ? FOR UPDATE",
+                    ALLOCATION_MAPPER, allocationKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
     }
 
-    /** 窗口当前所有 APPROVED 申请水量之和（BigDecimal 精确求和），无则 0。 */
+    /**
+     * 更新申请状态与变更时间，并同步持有额度：批准时持有额度等于原申请水量，取消时归零，
+     * REQUESTED 保持当前持有额度不变。
+     */
+    public void updateAllocationStatus(long id, String status, long updatedNanos) {
+        jdbc.update("UPDATE allocation SET status = ?, updated_nanos = ?,"
+                + " held_amount = CASE WHEN ? = 'APPROVED' THEN amount WHEN ? = 'CANCELLED' THEN 0"
+                + " ELSE held_amount END WHERE id = ?",
+                status, updatedNanos, status, status, id);
+    }
+
+    /** 转让扣减源持有额度（不得为负由事务内校验保证）并记录变更时间。 */
+    public void decrementHeldAmount(long id, BigDecimal delta, long updatedNanos) {
+        jdbc.update("UPDATE allocation SET held_amount = held_amount - ?, updated_nanos = ? WHERE id = ?",
+                delta, updatedNanos, id);
+    }
+
+    /** 窗口当前所有 APPROVED 申请的当前持有额度之和（BigDecimal 精确求和），无则 0。 */
     public BigDecimal sumApprovedAmount(long windowId) {
         BigDecimal sum = jdbc.queryForObject(
-                "SELECT COALESCE(SUM(amount), 0) FROM allocation WHERE window_id = ? AND status = 'APPROVED'",
+                "SELECT COALESCE(SUM(held_amount), 0) FROM allocation WHERE window_id = ? AND status = 'APPROVED'",
                 BigDecimal.class, windowId);
         return sum == null ? BigDecimal.ZERO : sum;
     }
@@ -194,8 +231,49 @@ public class WaterRepository {
     /** 窗口全部申请，按主键升序。 */
     public List<AllocationRow> listAllocations(long windowId) {
         return jdbc.query(
-                "SELECT id, allocation_key, window_id, user_id, amount, requester, status, created_nanos, updated_nanos"
-                        + " FROM allocation WHERE window_id = ? ORDER BY id", ALLOCATION_MAPPER, windowId);
+                ALLOCATION_SELECT + " FROM allocation WHERE window_id = ? ORDER BY id",
+                ALLOCATION_MAPPER, windowId);
+    }
+
+    /** 插入不可变转让流水并返回主键。 */
+    public long insertTransfer(String transferKey, long windowId, String sourceAllocationKey,
+                               String targetAllocationKey, BigDecimal amount, String actor, long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO transfer (transfer_key, window_id, source_allocation_key,"
+                            + " target_allocation_key, amount, actor, created_nanos)"
+                            + " VALUES (?, ?, ?, ?, ?, ?, ?)", Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, transferKey);
+            ps.setLong(2, windowId);
+            ps.setString(3, sourceAllocationKey);
+            ps.setString(4, targetAllocationKey);
+            ps.setBigDecimal(5, amount);
+            ps.setString(6, actor);
+            ps.setLong(7, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 按业务键查询转让流水，不存在返回 null。 */
+    public TransferRow findTransferByKey(String transferKey) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT id, transfer_key, window_id, source_allocation_key, target_allocation_key,"
+                            + " amount, actor, created_nanos FROM transfer WHERE transfer_key = ?",
+                    TRANSFER_MAPPER, transferKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 窗口全部转让流水（不可变），按主键升序。 */
+    public List<TransferRow> listTransfers(long windowId) {
+        return jdbc.query(
+                "SELECT id, transfer_key, window_id, source_allocation_key, target_allocation_key,"
+                        + " amount, actor, created_nanos FROM transfer WHERE window_id = ? ORDER BY id",
+                TRANSFER_MAPPER, windowId);
     }
 
     /** 窗口全部限供记录（含已取消），按主键升序。 */

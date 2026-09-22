@@ -3,11 +3,14 @@ package com.example.starter.water;
 import com.example.starter.water.WaterRepository.AllocationRow;
 import com.example.starter.water.WaterRepository.CommandRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
+import com.example.starter.water.WaterRepository.TransferRow;
 import com.example.starter.water.WaterRepository.WindowRow;
 import com.example.starter.water.dto.Dtos.AllocationResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.TransferListResponse;
+import com.example.starter.water.dto.Dtos.TransferResponse;
 import com.example.starter.water.dto.Dtos.WindowResponse;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
@@ -115,6 +118,8 @@ public class WaterService {
                 throw ApiException.notFound("ALLOCATION_NOT_FOUND", "配水申请不存在: " + allocationKey);
             }
             WindowRow window = lockWindowOf(allocation);
+            // 窗口锁内重读申请，避免与转让/取消并发时使用过期状态与持有额度
+            allocation = repository.lockAllocationByKey(allocationKey);
             switch (allocation.status()) {
                 case STATUS_CANCELLED ->
                         throw ApiException.conflict("ALLOCATION_CANCELLED", "已取消的申请不能批准");
@@ -145,6 +150,8 @@ public class WaterService {
                 throw ApiException.notFound("ALLOCATION_NOT_FOUND", "配水申请不存在: " + allocationKey);
             }
             lockWindowOf(allocation);
+            // 窗口锁内重读申请，避免与转让/并发取消使用过期状态
+            allocation = repository.lockAllocationByKey(allocationKey);
             if (!allocation.requester().equals(actor)) {
                 throw ApiException.conflict("NOT_OWNER", "只有申请人本人可以取消该申请");
             }
@@ -154,6 +161,84 @@ public class WaterService {
             repository.updateAllocationStatus(allocation.id(), STATUS_CANCELLED, nowNanos());
             return toAllocationResponse(repository.findAllocationByKey(allocationKey));
         });
+    }
+
+    /**
+     * 同窗口额度原子转让：源申请人（actor）把自己 APPROVED 申请的额度转给同窗口、不同用水户的
+     * REQUESTED 目标申请，转让额等于目标原申请水量的全部额度。
+     * 源扣减、目标批准、不可变流水在同一事务完成，窗口已批准总量不变；失败回滚无任何额度变化。
+     */
+    public TransferResponse transferAllocation(String commandKey, String transferKey, String sourceAllocationKey,
+                                               String targetAllocationKey, String actor) {
+        requireKey("commandKey", commandKey);
+        requireKey("transferKey", transferKey);
+        requireKey("sourceAllocationKey", sourceAllocationKey);
+        requireKey("targetAllocationKey", targetAllocationKey);
+        requireKey("X-Actor-Id", actor);
+        String params = "TRANSFER|" + transferKey + "|" + sourceAllocationKey + "|" + targetAllocationKey + "|"
+                + actor;
+        return runCommand("TRANSFER", commandKey, params, TransferResponse.class, () -> {
+            if (repository.findTransferByKey(transferKey) != null) {
+                throw ApiException.conflict("TRANSFER_KEY_REUSED", "transferKey 已被使用: " + transferKey);
+            }
+            AllocationRow source = repository.findAllocationByKey(sourceAllocationKey);
+            if (source == null) {
+                throw ApiException.notFound("SOURCE_ALLOCATION_NOT_FOUND",
+                        "转出申请不存在: " + sourceAllocationKey);
+            }
+            AllocationRow target = repository.findAllocationByKey(targetAllocationKey);
+            if (target == null) {
+                throw ApiException.notFound("TARGET_ALLOCATION_NOT_FOUND",
+                        "转入申请不存在: " + targetAllocationKey);
+            }
+            // 先锁窗口行，与普通批准、取消、限供调整按事务提交顺序串行裁决
+            lockWindowOf(source);
+            // 窗口锁内再锁定源/目标申请行，得到最新状态与持有额度
+            AllocationRow lockedSource = repository.lockAllocationByKey(sourceAllocationKey);
+            AllocationRow lockedTarget = repository.lockAllocationByKey(targetAllocationKey);
+            if (!lockedSource.requester().equals(actor)) {
+                throw ApiException.conflict("NOT_OWNER", "只有转出申请人本人可以发起转让");
+            }
+            if (!STATUS_APPROVED.equals(lockedSource.status())) {
+                throw ApiException.conflict("SOURCE_NOT_APPROVED", "转出申请必须为 APPROVED 状态");
+            }
+            if (!STATUS_REQUESTED.equals(lockedTarget.status())) {
+                throw ApiException.conflict("TARGET_NOT_REQUESTED", "转入申请必须为 REQUESTED 状态");
+            }
+            if (lockedSource.windowId() != lockedTarget.windowId()) {
+                throw ApiException.conflict("DIFFERENT_WINDOW", "转让双方必须属于同一供水窗口");
+            }
+            if (lockedSource.userId().equals(lockedTarget.userId())) {
+                throw ApiException.conflict("SAME_USER", "转让双方必须属于不同用水户");
+            }
+            BigDecimal amount = lockedTarget.amount();
+            if (lockedSource.heldAmount().compareTo(amount) < 0) {
+                throw ApiException.quotaExceeded("源申请当前持有额度 " + fmt(lockedSource.heldAmount())
+                        + " 不足，无法转让 " + fmt(amount));
+            }
+            long now = nowNanos();
+            repository.decrementHeldAmount(lockedSource.id(), amount, now);
+            repository.updateAllocationStatus(lockedTarget.id(), STATUS_APPROVED, now);
+            try {
+                repository.insertTransfer(transferKey, lockedSource.windowId(), sourceAllocationKey,
+                        targetAllocationKey, amount, actor, now);
+            } catch (DuplicateKeyException e) {
+                // 并发复用同一 transferKey（换 commandKey）：事务回滚，额度无变化
+                throw ApiException.conflict("TRANSFER_KEY_REUSED", "transferKey 已被使用: " + transferKey);
+            }
+            return toTransferResponse(repository.findTransferByKey(transferKey));
+        });
+    }
+
+    /** 查询窗口全部转让流水（不可变），按发生顺序返回。 */
+    public TransferListResponse getTransfers(long windowId) {
+        WindowRow window = repository.findWindowById(windowId);
+        if (window == null) {
+            throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + windowId);
+        }
+        List<TransferResponse> transfers = repository.listTransfers(windowId).stream()
+                .map(this::toTransferResponse).toList();
+        return new TransferListResponse(windowId, transfers);
     }
 
     /** 创建限供：仅当当前已批准总量不超过拟定限供水量时允许。 */
@@ -293,7 +378,13 @@ public class WaterService {
 
     private AllocationResponse toAllocationResponse(AllocationRow row) {
         return new AllocationResponse(row.allocationKey(), row.windowId(), row.userId(), fmt(row.amount()),
-                row.requester(), row.status(), toIso(row.createdNanos()), toIso(row.updatedNanos()));
+                fmt(row.heldAmount()), row.requester(), row.status(),
+                toIso(row.createdNanos()), toIso(row.updatedNanos()));
+    }
+
+    private TransferResponse toTransferResponse(TransferRow row) {
+        return new TransferResponse(row.transferKey(), row.windowId(), row.sourceAllocationKey(),
+                row.targetAllocationKey(), fmt(row.amount()), row.actor(), toIso(row.createdNanos()));
     }
 
     private CurtailmentResponse toCurtailmentResponse(CurtailmentRow row) {

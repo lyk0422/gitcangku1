@@ -8,6 +8,9 @@ import com.example.starter.water.dto.Dtos.CurtailmentRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
 import com.example.starter.water.dto.Dtos.SubmitAllocationRequest;
+import com.example.starter.water.dto.Dtos.TransferListResponse;
+import com.example.starter.water.dto.Dtos.TransferRequest;
+import com.example.starter.water.dto.Dtos.TransferResponse;
 import com.example.starter.water.dto.Dtos.WindowResponse;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -73,6 +76,20 @@ public class WaterController {
     public CurtailmentResponse cancelCurtailment(@PathVariable long windowId,
                                                  @RequestBody CommandRequest request) {
         return service.cancelCurtailment(request.commandKey(), windowId);
+    }
+
+    /** 同窗口额度原子转让（仅源申请人本人）。 */
+    @PostMapping("/transfers")
+    public TransferResponse transfer(@RequestBody TransferRequest request,
+                                     @RequestHeader("X-Actor-Id") String actor) {
+        return service.transferAllocation(request.commandKey(), request.transferKey(),
+                request.sourceAllocationKey(), request.targetAllocationKey(), actor);
+    }
+
+    /** 查询窗口转让流水。 */
+    @GetMapping("/windows/{windowId}/transfers")
+    public TransferListResponse getTransfers(@PathVariable long windowId) {
+        return service.getTransfers(windowId);
     }
 
     /** 查询窗口当前可用容量。 */
