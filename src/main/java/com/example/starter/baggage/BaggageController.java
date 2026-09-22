@@ -14,14 +14,20 @@ import org.springframework.web.bind.annotation.RestController;
 import com.example.starter.baggage.BaggageDtos.ArriveRequest;
 import com.example.starter.baggage.BaggageDtos.ArriveResponse;
 import com.example.starter.baggage.BaggageDtos.BagResponse;
+import com.example.starter.baggage.BaggageDtos.DifferenceArriveRequest;
+import com.example.starter.baggage.BaggageDtos.DifferenceArriveResponse;
+import com.example.starter.baggage.BaggageDtos.LegDifferenceResponse;
 import com.example.starter.baggage.BaggageDtos.LegResponse;
 import com.example.starter.baggage.BaggageDtos.LoadRequest;
 import com.example.starter.baggage.BaggageDtos.LoadResponse;
 import com.example.starter.baggage.BaggageDtos.ManifestResponse;
+import com.example.starter.baggage.BaggageDtos.RecoverRequest;
+import com.example.starter.baggage.BaggageDtos.RecoverResponse;
 import com.example.starter.baggage.BaggageDtos.RegisterBagRequest;
 import com.example.starter.baggage.BaggageDtos.RegisterLegRequest;
 import com.example.starter.baggage.BaggageDtos.SealRequest;
 import com.example.starter.baggage.BaggageDtos.SealResponse;
+import com.example.starter.baggage.BaggageDtos.ShortListResponse;
 
 /**
  * 联程行李装载交接 REST 入口。
@@ -66,7 +72,20 @@ public class BaggageController {
         return baggageService.arrive(legId, request);
     }
 
-    /** 行李轨迹查询。 */
+    /** 差异到达：实际袋号集合须为封舱清单子集，缺失行李转短卸。 */
+    @PostMapping("/legs/{legId}/arrive-difference")
+    public DifferenceArriveResponse arriveDifference(@PathVariable String legId,
+                                                     @Valid @RequestBody DifferenceArriveRequest request) {
+        return baggageService.arriveDifference(legId, request);
+    }
+
+    /** 补到：短卸行李在缺失航段的应到站实际到达后恢复行程。 */
+    @PostMapping("/bags/recover")
+    public RecoverResponse recover(@Valid @RequestBody RecoverRequest request) {
+        return baggageService.recover(request);
+    }
+
+    /** 行李完整轨迹查询。 */
     @GetMapping("/bags/{bagTag}/trace")
     public BagResponse getBagTrace(@PathVariable String bagTag) {
         return baggageService.getBagTrace(bagTag);
@@ -76,5 +95,17 @@ public class BaggageController {
     @GetMapping("/legs/{legId}/manifest")
     public ManifestResponse getManifest(@PathVariable String legId) {
         return baggageService.getManifest(legId);
+    }
+
+    /** 航段差异快照查询：返回只读封舱清单与差异到达实际集合。 */
+    @GetMapping("/legs/{legId}/difference")
+    public LegDifferenceResponse getDifference(@PathVariable String legId) {
+        return baggageService.getDifference(legId);
+    }
+
+    /** 未补到短卸行李清单查询。 */
+    @GetMapping("/bags/short-unloaded")
+    public ShortListResponse listShortUnloaded() {
+        return baggageService.listShortUnloaded();
     }
 }

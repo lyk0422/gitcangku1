@@ -50,6 +50,21 @@ public final class BaggageDtos {
             @NotNull(message = "bagTags 不能为空") List<@NotBlank(message = "bagTag 不能为空") String> bagTags) {
     }
 
+    /** 差异到达请求：实际袋号集合须为封舱清单子集（允许空集），expectedVersion 做并发版本校验。 */
+    public record DifferenceArriveRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotNull(message = "expectedVersion 不能为空") Integer expectedVersion,
+            @NotNull(message = "bagTags 不能为空") List<@NotBlank(message = "bagTag 不能为空") String> bagTags) {
+    }
+
+    /** 补到请求：短卸行李在缺失航段的应到站实际到达。 */
+    public record RecoverRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotBlank(message = "bagTag 不能为空") String bagTag,
+            @NotBlank(message = "missingLegId 不能为空") String missingLegId,
+            @NotBlank(message = "actualStation 不能为空") String actualStation) {
+    }
+
     /** 航段响应。 */
     public record LegResponse(String legId, String origin, String destination,
                               String status, int version) {
@@ -59,9 +74,16 @@ public final class BaggageDtos {
     public record ItineraryItem(int seq, String legId, String origin, String destination) {
     }
 
-    /** 行李响应。 */
+    /** 行李轨迹事件。 */
+    public record TraceEvent(int seq, String eventType, String legId,
+                             String location, String eventTime) {
+    }
+
+    /** 行李响应：含完整事件轨迹。 */
     public record BagResponse(String bagTag, String currentLocation, int nextLegIndex,
-                              String status, String loadedLegId, List<ItineraryItem> itinerary) {
+                              String status, String loadedLegId, List<ItineraryItem> itinerary,
+                              String shortLegId, String shortDestination, String shortRegisteredAt,
+                              List<TraceEvent> events) {
     }
 
     /** 批量装载响应。 */
@@ -76,7 +98,31 @@ public final class BaggageDtos {
     public record ArriveResponse(String legId, String status, int version, List<String> arrived) {
     }
 
+    /** 差异到达响应：arrived 为实际到达，shortUnloaded 为清单中缺失并转短卸的袋号。 */
+    public record DifferenceArriveResponse(String legId, String status, int version,
+                                           List<String> arrived, List<String> shortUnloaded) {
+    }
+
+    /** 补到响应。 */
+    public record RecoverResponse(String bagTag, String status, String currentLocation,
+                                  int nextLegIndex, String recoveredLegId) {
+    }
+
     /** 封舱清单查询响应。 */
     public record ManifestResponse(String legId, String status, int version, List<String> manifest) {
+    }
+
+    /** 航段差异快照响应：arrivalType 为 EXACT/DIFF，actual 仅差异到达时有值。 */
+    public record LegDifferenceResponse(String legId, String status, int version,
+                                        List<String> manifest, String arrivalType, List<String> actual) {
+    }
+
+    /** 未补到行李清单项。 */
+    public record ShortItem(String bagTag, String missingLegId, String expectedStation,
+                            String registeredAt, int nextLegIndex, String currentLocation) {
+    }
+
+    /** 未补到清单响应。 */
+    public record ShortListResponse(List<ShortItem> shortUnloaded) {
     }
 }
