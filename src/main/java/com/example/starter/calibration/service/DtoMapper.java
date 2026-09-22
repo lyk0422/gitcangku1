@@ -41,12 +41,23 @@ final class DtoMapper {
                 cert.createdAt());
     }
 
-    static MeasurementResponse toResponse(Measurement m, boolean certificateRevoked,
+    /**
+     * 映射测量版本明细。
+     *
+     * @param m                  测量版本
+     * @param latest             该版本是否为当前最新版本（旧版本即使已放行也不可用）
+     * @param latestRevision     该键当前最新修订号
+     * @param certificateRevoked 该版本关联证书是否已撤销
+     * @param releases           该版本放行历史
+     */
+    static MeasurementResponse toResponse(Measurement m, boolean latest, int latestRevision,
+                                          boolean certificateRevoked,
                                           List<ReleaseRecord> releases) {
-        boolean usable = m.status() == MeasurementStatus.RELEASED && !certificateRevoked;
+        boolean usable = latest && m.status() == MeasurementStatus.RELEASED && !certificateRevoked;
         return new MeasurementResponse(
                 m.id(),
                 m.measurementKey(),
+                m.revision(),
                 m.instrumentId(),
                 m.measuredAt(),
                 format(m.rawReading()),
@@ -59,6 +70,11 @@ final class DtoMapper {
                 m.passed(),
                 m.status().name(),
                 usable,
+                latestRevision,
+                m.revisionReason(),
+                m.requestId(),
+                m.revisedBy(),
+                m.revisedAt(),
                 m.createdAt(),
                 releases.stream().map(DtoMapper::toResponse).toList());
     }
