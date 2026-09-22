@@ -54,4 +54,28 @@ public final class Responses {
     public record EscalationHistoryView(Instant deadlineAt, EscalationView current,
                                         List<EscalationView> history) {
     }
+
+    /**
+     * 任务阻塞事件视图：incidentStatus 为查询时目标事件的当前状态（不写回依赖任务）；
+     * resolved 表示该事件已进入 CONTAINED/RESOLVED/CLOSED，阻塞已解除。
+     */
+    public record TaskBlockerView(String incidentKey, String incidentStatus, boolean resolved) {
+    }
+
+    /**
+     * 处置任务视图：blockers 按阻塞事件键排序；doneBy/doneAt 仅 DONE 有值，
+     * cancelledBy/cancelledAt 仅 CANCELLED 有值。
+     */
+    public record TaskView(String taskKey, String groupCode, String title, String status,
+                           List<TaskBlockerView> blockers, String createdBy, Instant createdAt,
+                           String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt) {
+    }
+
+    /** 按事件分组的任务列表视图：tasks 按创建顺序返回。 */
+    public record IncidentTasksView(String incidentKey, List<TaskView> tasks) {
+    }
+
+    /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
+    public record UnfinishedTaskView(String groupCode, String taskKey) {
+    }
 }

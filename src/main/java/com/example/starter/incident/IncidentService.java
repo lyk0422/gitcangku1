@@ -6,9 +6,12 @@ import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
+import java.util.EnumSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Supplier;
 
 import com.example.starter.incident.dto.Requests.ActionRequest;
@@ -17,15 +20,21 @@ import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
+import com.example.starter.incident.dto.Requests.TaskActionRequest;
+import com.example.starter.incident.dto.Requests.TaskCreateRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
 import com.example.starter.incident.dto.Responses.EscalationHistoryView;
 import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
+import com.example.starter.incident.dto.Responses.IncidentTasksView;
 import com.example.starter.incident.dto.Responses.IncidentView;
 import com.example.starter.incident.dto.Responses.StatusChangeView;
+import com.example.starter.incident.dto.Responses.TaskBlockerView;
+import com.example.starter.incident.dto.Responses.TaskView;
 import com.example.starter.incident.dto.Responses.TransferView;
+import com.example.starter.incident.dto.Responses.UnfinishedTaskView;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
@@ -49,16 +58,29 @@ public class IncidentService {
     private static final Map<String, Long> CONTAINMENT_MINUTES = Map.of(
             "S1", 5L, "S2", 15L, "S3", 60L, "S4", 240L);
 
+    /** 每事件处置任务上限。 */
+    private static final int MAX_TASKS_PER_INCIDENT = 20;
+
+    /** 每任务阻塞事件上限。 */
+    private static final int MAX_BLOCKERS_PER_TASK = 5;
+
+    /** 视为阻塞已解除的目标事件状态。 */
+    private static final Set<IncidentStatus> UNBLOCKING_STATUSES = EnumSet.of(
+            IncidentStatus.CONTAINED, IncidentStatus.RESOLVED, IncidentStatus.CLOSED);
+
     private final IncidentRepository incidents;
     private final EscalationRepository escalations;
+    private final IncidentTaskRepository tasks;
     private final CommandKeyRepository commandKeys;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public IncidentService(IncidentRepository incidents, EscalationRepository escalations,
-                           CommandKeyRepository commandKeys, ObjectMapper objectMapper, Clock clock) {
+                           IncidentTaskRepository tasks, CommandKeyRepository commandKeys,
+                           ObjectMapper objectMapper, Clock clock) {
         this.incidents = incidents;
         this.escalations = escalations;
+        this.tasks = tasks;
         this.commandKeys = commandKeys;
         this.objectMapper = objectMapper;
         this.clock = clock;
@@ -240,6 +262,17 @@ public class IncidentService {
                         throw ApiException.illegalTransition(
                                 "不允许从 " + incident.status() + " 流转到 " + targetStatus);
                     }
+                    if (targetStatus == IncidentStatus.RESOLVED) {
+                        // 解决门禁：全部处置任务进入 DONE/CANCELLED 后才可解决
+                        List<UnfinishedTaskView> unfinished = tasks
+                                .listOpenByIncident(incident.id()).stream()
+                                .map(t -> new UnfinishedTaskView(t.groupCode(), t.taskKey()))
+                                .toList();
+                        if (!unfinished.isEmpty()) {
+                            throw ApiException.conflict(
+                                    "仍有未完成的处置任务，不能进入 RESOLVED", unfinished);
+                        }
+                    }
                     Instant now = now();
                     incidents.updateState(incident.id(), targetStatus, incident.commander(), now);
                     incidents.insertStatusChange(new StatusChange(0L, incident.id(),
@@ -357,6 +390,163 @@ public class IncidentService {
                 escalationList);
     }
 
+    /**
+     * 创建处置任务：仅当前指挥人；taskKey 事件内唯一；阻塞事件 0~5 个、必须存在且非自身；
+     * 创建时在依赖图全局锁内做环检测，拒绝直接或间接环（409 且不留部分任务或边）。
+     * taskKey 幂等：同键同内容（含阻塞集合）返回首次任务，同键不同内容返回 409。
+     */
+    @Transactional
+    public TaskView createTask(String incidentKey, String actor, TaskCreateRequest req) {
+        String commandKey = requireText(req.commandKey(), "commandKey");
+        String taskKey = requireText(req.taskKey(), "taskKey");
+        String groupCode = requireText(req.groupCode(), "groupCode");
+        String title = requireText(req.title(), "title");
+        List<String> blockerKeys = req.blockerIncidentKeys() == null ? List.of()
+                : req.blockerIncidentKeys().stream()
+                        .map(k -> requireText(k, "blockerIncidentKey"))
+                        .distinct()
+                        .toList();
+        if (blockerKeys.size() > MAX_BLOCKERS_PER_TASK) {
+            throw ApiException.badRequest("阻塞事件最多 " + MAX_BLOCKERS_PER_TASK + " 个");
+        }
+        if (blockerKeys.contains(incidentKey)) {
+            throw ApiException.badRequest("阻塞事件不能是事件自身: " + incidentKey);
+        }
+        Incident incident = lockIncident(incidentKey);
+        return runIdempotent(commandKey, "task_create",
+                hash(incidentKey, actor, taskKey, groupCode, title, String.join(",", blockerKeys)),
+                TaskView.class, () -> {
+                    requireCommander(incident, actor);
+                    if (incident.status() == IncidentStatus.CLOSED) {
+                        throw ApiException.illegalTransition("事件已关闭，不能再创建处置任务");
+                    }
+                    var existing = tasks.findByKey(incident.id(), taskKey);
+                    if (existing.isPresent()) {
+                        IncidentTask found = existing.get();
+                        List<String> existingBlockers = incidents.listBlockingIncidents(found.id())
+                                .stream().map(Incident::incidentKey).sorted().toList();
+                        List<String> requested = blockerKeys.stream().sorted().toList();
+                        if (!found.sameContent(groupCode, title)
+                                || !existingBlockers.equals(requested)) {
+                            throw ApiException.conflict("taskKey 已被不同内容使用: " + taskKey);
+                        }
+                        return toTaskView(found);
+                    }
+                    if (tasks.countByIncident(incident.id()) >= MAX_TASKS_PER_INCIDENT) {
+                        throw ApiException.conflict("每个事件最多创建 " + MAX_TASKS_PER_INCIDENT
+                                + " 个处置任务");
+                    }
+                    List<Incident> blockers = new ArrayList<>();
+                    for (String blockerKey : blockerKeys) {
+                        blockers.add(incidents.findByKey(blockerKey)
+                                .orElseThrow(() -> ApiException.notFound(
+                                        "阻塞事件不存在: " + blockerKey)));
+                    }
+                    // 全局图锁：串行化环检测与边写入，并发反向依赖下最终图无环
+                    tasks.lockGraph();
+                    for (Incident blocker : blockers) {
+                        if (tasks.isReachable(blocker.id(), incident.id())) {
+                            throw ApiException.conflict("阻塞关系会形成环: "
+                                    + blocker.incidentKey() + " 已直接或间接依赖 " + incidentKey);
+                        }
+                    }
+                    Instant now = now();
+                    long taskId = tasks.insert(new IncidentTask(0L, incident.id(), taskKey,
+                            groupCode, title, TaskStatus.OPEN, actor, null, null, null, null,
+                            now, now));
+                    for (Incident blocker : blockers) {
+                        tasks.insertBlocker(taskId, blocker.id(), now);
+                    }
+                    return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
+                });
+    }
+
+    /**
+     * 完成任务：仅当前指挥人；仅 OPEN 可完成；全部阻塞事件进入
+     * CONTAINED/RESOLVED/CLOSED 后才可完成，否则 409 并返回未解除事件列表。
+     * DONE/CANCELLED 为终态，重复操作按 commandKey 幂等规则返回首次结果。
+     */
+    @Transactional
+    public TaskView completeTask(String incidentKey, String taskKey, String actor,
+                                 TaskActionRequest req) {
+        String commandKey = requireText(req.commandKey(), "commandKey");
+        Incident incident = lockIncident(incidentKey);
+        return runIdempotent(commandKey, "task_complete", hash(incidentKey, taskKey, actor),
+                TaskView.class, () -> {
+                    requireCommander(incident, actor);
+                    IncidentTask task = tasks.findByKey(incident.id(), taskKey)
+                            .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
+                    if (task.status() != TaskStatus.OPEN) {
+                        throw ApiException.conflict(
+                                "任务已处于终态 " + task.status() + "，不能完成");
+                    }
+                    List<String> unresolved = unresolvedBlockers(task.id());
+                    if (!unresolved.isEmpty()) {
+                        throw ApiException.conflict("存在未解除阻塞的事件: "
+                                + String.join(",", unresolved), List.copyOf(unresolved));
+                    }
+                    tasks.markDone(task.id(), actor, now());
+                    return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
+                });
+    }
+
+    /**
+     * 取消任务：仅当前指挥人；仅 OPEN 可取消；DONE/CANCELLED 为终态，
+     * 重复操作按 commandKey 幂等规则返回首次结果。
+     */
+    @Transactional
+    public TaskView cancelTask(String incidentKey, String taskKey, String actor,
+                               TaskActionRequest req) {
+        String commandKey = requireText(req.commandKey(), "commandKey");
+        Incident incident = lockIncident(incidentKey);
+        return runIdempotent(commandKey, "task_cancel", hash(incidentKey, taskKey, actor),
+                TaskView.class, () -> {
+                    requireCommander(incident, actor);
+                    IncidentTask task = tasks.findByKey(incident.id(), taskKey)
+                            .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
+                    if (task.status() != TaskStatus.OPEN) {
+                        throw ApiException.conflict(
+                                "任务已处于终态 " + task.status() + "，不能取消");
+                    }
+                    tasks.markCancelled(task.id(), actor, now());
+                    return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
+                });
+    }
+
+    /**
+     * 按事件分组查询任务（含阻塞状态，按目标事件当前状态计算）。只读，不隐式写入。
+     */
+    @Transactional(readOnly = true)
+    public IncidentTasksView listTasks(String incidentKey) {
+        Incident incident = incidents.findByKey(incidentKey)
+                .orElseThrow(() -> ApiException.notFound("事件不存在: " + incidentKey));
+        List<TaskView> views = tasks.listByIncident(incident.id()).stream()
+                .map(this::toTaskView).toList();
+        return new IncidentTasksView(incident.incidentKey(), views);
+    }
+
+    /**
+     * 查询单任务明细（含阻塞状态）。只读，不隐式写入。
+     */
+    @Transactional(readOnly = true)
+    public TaskView getTask(String incidentKey, String taskKey) {
+        Incident incident = incidents.findByKey(incidentKey)
+                .orElseThrow(() -> ApiException.notFound("事件不存在: " + incidentKey));
+        IncidentTask task = tasks.findByKey(incident.id(), taskKey)
+                .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
+        return toTaskView(task);
+    }
+
+    /**
+     * 仍未解除阻塞的事件键列表：目标事件未进入 CONTAINED/RESOLVED/CLOSED 即未解除。
+     */
+    private List<String> unresolvedBlockers(long taskId) {
+        return incidents.listBlockingIncidents(taskId).stream()
+                .filter(b -> !UNBLOCKING_STATUSES.contains(b.status()))
+                .map(Incident::incidentKey)
+                .toList();
+    }
+
     private Incident lockIncident(String incidentKey) {
         requireText(incidentKey, "incidentKey");
         return incidents.lockByKey(incidentKey)
@@ -439,6 +629,19 @@ public class IncidentService {
     private ActionView toActionView(IncidentAction action) {
         return new ActionView(action.actionKey(), action.actionType(), action.note(),
                 action.occurredAt(), action.actor(), action.createdAt());
+    }
+
+    /**
+     * 组装任务视图：阻塞状态按目标事件查询时的当前状态计算，不写回依赖任务。
+     */
+    private TaskView toTaskView(IncidentTask task) {
+        List<TaskBlockerView> blockers = incidents.listBlockingIncidents(task.id()).stream()
+                .map(b -> new TaskBlockerView(b.incidentKey(), b.status().name(),
+                        UNBLOCKING_STATUSES.contains(b.status())))
+                .toList();
+        return new TaskView(task.taskKey(), task.groupCode(), task.title(), task.status().name(),
+                blockers, task.createdBy(), task.createdAt(), task.doneBy(), task.doneAt(),
+                task.cancelledBy(), task.cancelledAt());
     }
 
     private static TransferView toTransferView(IncidentTransfer transfer) {

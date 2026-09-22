@@ -71,3 +71,32 @@ CREATE TABLE IF NOT EXISTS incident_escalations (
     updated_at TIMESTAMP(6) NOT NULL,
     CONSTRAINT uk_escalation_incident UNIQUE (incident_id)
 );
+
+CREATE TABLE IF NOT EXISTS incident_tasks (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    task_key VARCHAR(128) NOT NULL,
+    group_code VARCHAR(64) NOT NULL,
+    title VARCHAR(512) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    created_by VARCHAR(128) NOT NULL,
+    done_by VARCHAR(128) NULL,
+    done_at TIMESTAMP(6) NULL,
+    cancelled_by VARCHAR(128) NULL,
+    cancelled_at TIMESTAMP(6) NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_task_key UNIQUE (incident_id, task_key)
+);
+
+CREATE TABLE IF NOT EXISTS incident_task_blockers (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    task_id BIGINT NOT NULL,
+    blocker_incident_id BIGINT NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_task_blocker UNIQUE (task_id, blocker_incident_id)
+);
+
+CREATE TABLE IF NOT EXISTS task_graph_lock (
+    id TINYINT PRIMARY KEY
+);

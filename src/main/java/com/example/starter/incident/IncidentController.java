@@ -6,13 +6,17 @@ import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
+import com.example.starter.incident.dto.Requests.TaskActionRequest;
+import com.example.starter.incident.dto.Requests.TaskCreateRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
 import com.example.starter.incident.dto.Responses.EscalationHistoryView;
 import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
+import com.example.starter.incident.dto.Responses.IncidentTasksView;
 import com.example.starter.incident.dto.Responses.IncidentView;
+import com.example.starter.incident.dto.Responses.TaskView;
 import com.example.starter.incident.dto.Responses.TransferView;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -137,5 +141,51 @@ public class IncidentController {
                                      @RequestHeader("X-Actor-Id") String actor,
                                      @RequestBody StatusRequest req) {
         return service.changeStatus(incidentKey, actor, req);
+    }
+
+    /**
+     * 创建处置任务（仅当前指挥人；阻塞事件 0~5 个，拒绝环依赖）。
+     */
+    @PostMapping("/{incidentKey}/tasks")
+    public TaskView createTask(@PathVariable String incidentKey,
+                               @RequestHeader("X-Actor-Id") String actor,
+                               @RequestBody TaskCreateRequest req) {
+        return service.createTask(incidentKey, actor, req);
+    }
+
+    /**
+     * 按事件分组查询任务（含阻塞状态，只读）。
+     */
+    @GetMapping("/{incidentKey}/tasks")
+    public IncidentTasksView listTasks(@PathVariable String incidentKey) {
+        return service.listTasks(incidentKey);
+    }
+
+    /**
+     * 查询单任务明细（含阻塞状态，只读）。
+     */
+    @GetMapping("/{incidentKey}/tasks/{taskKey}")
+    public TaskView getTask(@PathVariable String incidentKey, @PathVariable String taskKey) {
+        return service.getTask(incidentKey, taskKey);
+    }
+
+    /**
+     * 完成任务（仅当前指挥人；全部阻塞解除后才可完成）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/complete")
+    public TaskView completeTask(@PathVariable String incidentKey, @PathVariable String taskKey,
+                                 @RequestHeader("X-Actor-Id") String actor,
+                                 @RequestBody TaskActionRequest req) {
+        return service.completeTask(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 取消任务（仅当前指挥人；仅 OPEN 可取消）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/cancel")
+    public TaskView cancelTask(@PathVariable String incidentKey, @PathVariable String taskKey,
+                               @RequestHeader("X-Actor-Id") String actor,
+                               @RequestBody TaskActionRequest req) {
+        return service.cancelTask(incidentKey, taskKey, actor, req);
     }
 }

@@ -46,6 +46,8 @@ class EscalationApiTest {
         jdbc.update("DELETE FROM incident_status_history");
         jdbc.update("DELETE FROM incident_transfers");
         jdbc.update("DELETE FROM incident_actions");
+        jdbc.update("DELETE FROM incident_task_blockers");
+        jdbc.update("DELETE FROM incident_tasks");
         jdbc.update("DELETE FROM incidents");
         ((ControllableClock) clock).setInstant(T0);
     }

@@ -80,6 +80,34 @@ class SchemaH2ScriptTest {
                     assertThat(rs.getTimestamp("deadline_at").toInstant())
                             .isEqualTo(now.plusSeconds(300));
                 }
+
+                // 处置任务：(incident_id, task_key) 唯一
+                st.execute("INSERT INTO incident_tasks (incident_id, task_key, group_code, title,"
+                        + " status, created_by, created_at, updated_at) VALUES (1,'T-1','G','t',"
+                        + "'OPEN','alice','" + Timestamp.from(now) + "','" + Timestamp.from(now)
+                        + "')");
+                boolean duplicateTaskRejected = false;
+                try {
+                    st.execute("INSERT INTO incident_tasks (incident_id, task_key, group_code,"
+                            + " title, status, created_by, created_at, updated_at) VALUES"
+                            + " (1,'T-1','G','t2','OPEN','alice','" + Timestamp.from(now) + "','"
+                            + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateTaskRejected = true;
+                }
+                assertThat(duplicateTaskRejected).isTrue();
+
+                // 阻塞边：(task_id, blocker_incident_id) 唯一
+                st.execute("INSERT INTO incident_task_blockers (task_id, blocker_incident_id,"
+                        + " created_at) VALUES (1,1,'" + Timestamp.from(now) + "')");
+                boolean duplicateBlockerRejected = false;
+                try {
+                    st.execute("INSERT INTO incident_task_blockers (task_id, blocker_incident_id,"
+                            + " created_at) VALUES (1,1,'" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateBlockerRejected = true;
+                }
+                assertThat(duplicateBlockerRejected).isTrue();
             }
         }
     }

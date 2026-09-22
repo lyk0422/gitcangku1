@@ -216,4 +216,15 @@ public class IncidentRepository {
         return jdbc.query("SELECT * FROM incident_status_history WHERE incident_id = ? ORDER BY id",
                 STATUS_MAPPER, incidentId);
     }
+
+    /**
+     * 查询任务的全部阻塞事件（含当前状态），按事件键排序返回。
+     * 阻塞解除不写回依赖任务，查询时按目标事件当前状态计算。
+     */
+    public List<Incident> listBlockingIncidents(long taskId) {
+        return jdbc.query("SELECT i.* FROM incident_task_blockers b"
+                        + " JOIN incidents i ON i.id = b.blocker_incident_id"
+                        + " WHERE b.task_id = ? ORDER BY i.incident_key",
+                INCIDENT_MAPPER, taskId);
+    }
 }

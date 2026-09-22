@@ -15,20 +15,21 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 public class GlobalExceptionHandler {
 
     /**
-     * 错误响应体：code 为机器可区分错误码，message 为人读描述。
+     * 错误响应体：code 为机器可区分错误码，message 为人读描述；
+     * details 为可选结构化明细（如解决门禁未完成项、未解除阻塞的事件键列表），无则 null。
      */
-    public record ErrorBody(String code, String message) {
+    public record ErrorBody(String code, String message, Object details) {
     }
 
     @ExceptionHandler(ApiException.class)
     public ResponseEntity<ErrorBody> handleApi(ApiException ex) {
         return ResponseEntity.status(ex.status())
-                .body(new ErrorBody(ex.code(), ex.getMessage()));
+                .body(new ErrorBody(ex.code(), ex.getMessage(), ex.details()));
     }
 
     @ExceptionHandler({HttpMessageNotReadableException.class, MissingRequestHeaderException.class})
     public ResponseEntity<ErrorBody> handleBadRequest(Exception ex) {
         return ResponseEntity.status(HttpStatus.BAD_REQUEST)
-                .body(new ErrorBody("BAD_REQUEST", "请求格式非法: " + ex.getMessage()));
+                .body(new ErrorBody("BAD_REQUEST", "请求格式非法: " + ex.getMessage(), null));
     }
 }

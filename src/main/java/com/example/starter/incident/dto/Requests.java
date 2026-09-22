@@ -1,6 +1,7 @@
 package com.example.starter.incident.dto;
 
 import java.time.Instant;
+import java.util.List;
 
 /**
  * 写接口请求体集合。commandKey 为调用方幂等键；occurredAt 为 UTC 时间。
@@ -41,5 +42,17 @@ public final class Requests {
 
     /** 升级确认请求：note 为非空处置说明，操作人由 X-Actor-Id 指定且须为当前指挥人。 */
     public record EscalationAckRequest(String commandKey, String note) {
+    }
+
+    /**
+     * 处置任务创建请求：taskKey 事件内唯一；groupCode、title 非空；
+     * blockerIncidentKeys 为 0~5 个阻塞事件键，必须存在且不能是自身，重复键按去重处理。
+     */
+    public record TaskCreateRequest(String commandKey, String taskKey, String groupCode,
+                                    String title, List<String> blockerIncidentKeys) {
+    }
+
+    /** 任务完成/取消请求，操作人由 X-Actor-Id 指定且须为当前指挥人。 */
+    public record TaskActionRequest(String commandKey) {
     }
 }
