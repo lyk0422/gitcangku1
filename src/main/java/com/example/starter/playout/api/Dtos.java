@@ -1,5 +1,7 @@
 package com.example.starter.playout.api;
 
+import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Positive;
@@ -105,9 +107,9 @@ public final class Dtos {
             long draftVersion) {
     }
 
-    /** 播出决定来源：PROGRAM 命中节目片段，FALLBACK 返回保底素材。 */
+    /** 播出决定来源：EMERGENCY 命中紧急插播，PROGRAM 命中节目片段，FALLBACK 返回保底素材。 */
     public enum DecisionSource {
-        PROGRAM, FALLBACK
+        EMERGENCY, PROGRAM, FALLBACK
     }
 
     /** 保底原因：无已发布编排 / 处于空档 / 覆盖片段的授权已撤销。 */
@@ -115,7 +117,7 @@ public final class Dtos {
         NO_PUBLISHED_SCHEDULE, GAP, GRANT_REVOKED
     }
 
-    /** 播出决定响应；source 为 FALLBACK 时 reason 非空。 */
+    /** 播出决定响应；source 为 FALLBACK 时 reason 非空；source 为 EMERGENCY 时 overrideKey 非空。 */
     public record PlayoutDecisionResponse(
             String channelId,
             OffsetDateTime at,
@@ -123,7 +125,47 @@ public final class Dtos {
             DecisionSource source,
             FallbackReason reason,
             Long publicationId,
-            String segmentId) {
+            String segmentId,
+            String overrideKey) {
+    }
+
+    /** 紧急插播状态：创建即 ACTIVE，取消后为 CANCELLED，均为终态语义（ACTIVE 只能转为 CANCELLED）。 */
+    public enum OverrideStatus {
+        ACTIVE, CANCELLED
+    }
+
+    /**
+     * 创建限时紧急插播请求。区间 [start, end) 左闭右开、同处一个 Asia/Shanghai 业务日、
+     * 时长大于 0 且不超过 30 分钟；priority 取值 1～9；grantId 必须属于该频道与素材并完整覆盖区间。
+     */
+    public record CreateEmergencyOverrideRequest(
+            @NotBlank String requestId,
+            @NotBlank String overrideKey,
+            @NotBlank String channelId,
+            @NotBlank String assetId,
+            @NotNull @Positive Long grantId,
+            @NotNull @Min(1) @Max(9) Integer priority,
+            @NotNull OffsetDateTime start,
+            @NotNull OffsetDateTime end) {
+    }
+
+    /** 取消紧急插播请求（幂等）。 */
+    public record CancelEmergencyOverrideRequest(@NotBlank String requestId) {
+    }
+
+    /** 紧急插播明细响应，保存取消情况与原授权关联，不随授权撤销自动换绑。 */
+    public record EmergencyOverrideResponse(
+            String overrideKey,
+            String channelId,
+            String assetId,
+            long grantId,
+            int priority,
+            OffsetDateTime start,
+            OffsetDateTime end,
+            OverrideStatus status,
+            String cancelRequestId,
+            OffsetDateTime cancelledAt,
+            OffsetDateTime createdAt) {
     }
 
     /** 统一错误响应体。 */

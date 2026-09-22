@@ -5,9 +5,12 @@ import com.example.starter.playout.api.Dtos.AssetResponse;
 import com.example.starter.playout.api.Dtos.ChannelResponse;
 import com.example.starter.playout.api.Dtos.CreateAssetRequest;
 import com.example.starter.playout.api.Dtos.CreateChannelRequest;
+import com.example.starter.playout.api.Dtos.CreateEmergencyOverrideRequest;
 import com.example.starter.playout.api.Dtos.CreateGrantRequest;
 import com.example.starter.playout.api.Dtos.DraftResponse;
+import com.example.starter.playout.api.Dtos.EmergencyOverrideResponse;
 import com.example.starter.playout.api.Dtos.GrantResponse;
+import com.example.starter.playout.api.Dtos.CancelEmergencyOverrideRequest;
 import com.example.starter.playout.api.Dtos.PlayoutDecisionResponse;
 import com.example.starter.playout.api.Dtos.PublishRequest;
 import com.example.starter.playout.api.Dtos.PublishResponse;
@@ -93,6 +96,27 @@ public class PlayoutController {
                                            @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME)
                                            OffsetDateTime at) {
         return service.playoutDecision(channelId, at);
+    }
+
+    /** 创建限时紧急插播（创建即 ACTIVE，携带 requestId 幂等）。 */
+    @PostMapping("/emergency-overrides")
+    public EmergencyOverrideResponse createEmergencyOverride(
+            @Valid @RequestBody CreateEmergencyOverrideRequest request) {
+        return service.createEmergencyOverride(request);
+    }
+
+    /** 取消紧急插播（仅 ACTIVE 可取消，携带 requestId 幂等）。 */
+    @PostMapping("/emergency-overrides/{overrideKey}/cancel")
+    public EmergencyOverrideResponse cancelEmergencyOverride(
+            @PathVariable @NotBlank String overrideKey,
+            @Valid @RequestBody CancelEmergencyOverrideRequest request) {
+        return service.cancelEmergencyOverride(overrideKey, request.requestId());
+    }
+
+    /** 查询紧急插播明细，ACTIVE/CANCELLED 均返回，保留取消情况与原授权关联。 */
+    @GetMapping("/emergency-overrides/{overrideKey}")
+    public EmergencyOverrideResponse emergencyOverride(@PathVariable @NotBlank String overrideKey) {
+        return service.getEmergencyOverride(overrideKey);
     }
 
     private static LocalDate parseBusinessDay(String businessDay) {

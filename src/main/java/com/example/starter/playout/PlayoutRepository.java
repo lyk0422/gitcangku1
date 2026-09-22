@@ -63,6 +63,16 @@ public class PlayoutRepository {
                              String responseBody) {
     }
 
+    /** 紧急插播行；status 为 ACTIVE / CANCELLED，grantId 始终保留创建时指定的原授权关联。 */
+    public record OverrideRow(String overrideKey, String channelId, String assetId, long grantId,
+                              int priority, long startMs, long endMs, LocalDate businessDay,
+                              String status, String cancelRequestId, Long cancelledAtMs,
+                              long createdAtMs) {
+        public boolean active() {
+            return "ACTIVE".equals(status);
+        }
+    }
+
     private static final RowMapper<AssetRow> ASSET_MAPPER = (rs, n) ->
             new AssetRow(rs.getString("id"), rs.getLong("duration_ms"));
 
@@ -94,6 +104,14 @@ public class PlayoutRepository {
     private static final RowMapper<RequestRow> REQUEST_MAPPER = (rs, n) ->
             new RequestRow(rs.getString("request_id"), rs.getString("operation"),
                     rs.getString("params_hash"), rs.getString("response_body"));
+
+    private static final RowMapper<OverrideRow> OVERRIDE_MAPPER = (rs, n) ->
+            new OverrideRow(rs.getString("override_key"), rs.getString("channel_id"),
+                    rs.getString("asset_id"), rs.getLong("grant_id"), rs.getInt("priority"),
+                    rs.getLong("start_ms"), rs.getLong("end_ms"),
+                    rs.getDate("business_day").toLocalDate(), rs.getString("status"),
+                    rs.getString("cancel_request_id"),
+                    (Long) rs.getObject("cancelled_at_ms"), rs.getLong("created_at_ms"));
 
     // ---------- 素材 ----------
 
@@ -141,6 +159,13 @@ public class PlayoutRepository {
     public Optional<GrantRow> findGrant(long id) {
         return jdbc.query("SELECT id, channel_id, asset_id, valid_from_ms, valid_to_ms, revoked"
                 + " FROM playout_grant WHERE id = ?", GRANT_MAPPER, id).stream().findFirst();
+    }
+
+    /** 按 ID 查询授权并加行锁，用于紧急插播创建与授权撤销按提交顺序串行化。 */
+    public Optional<GrantRow> findGrantForUpdate(long id) {
+        return jdbc.query("SELECT id, channel_id, asset_id, valid_from_ms, valid_to_ms, revoked"
+                + " FROM playout_grant WHERE id = ? FOR UPDATE", GRANT_MAPPER, id)
+                .stream().findFirst();
     }
 
     /** 撤销授权；返回受影响行数，0 表示不存在或已撤销。 */
@@ -288,5 +313,72 @@ public class PlayoutRepository {
     /** 判断是否为唯一键冲突（草稿首建、发布版本、请求 ID 等并发场景）。 */
     public static boolean isDuplicateKey(RuntimeException ex) {
         return ex instanceof DuplicateKeyException;
+    }
+
+    // ---------- 紧急插播 ----------
+
+    public void insertOverride(String overrideKey, String channelId, String assetId, long grantId,
+                               int priority, long startMs, long endMs, LocalDate businessDay,
+                               long createdAtMs) {
+        jdbc.update("INSERT INTO playout_emergency_override"
+                        + " (override_key, channel_id, asset_id, grant_id, priority, start_ms, end_ms,"
+                        + "  business_day, status, created_at_ms)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?)",
+                overrideKey, channelId, assetId, grantId, priority, startMs, endMs,
+                Date.valueOf(businessDay), createdAtMs);
+    }
+
+    public Optional<OverrideRow> findOverride(String overrideKey) {
+        return jdbc.query("SELECT override_key, channel_id, asset_id, grant_id, priority, start_ms,"
+                        + " end_ms, business_day, status, cancel_request_id, cancelled_at_ms, created_at_ms"
+                        + " FROM playout_emergency_override WHERE override_key = ?",
+                OVERRIDE_MAPPER, overrideKey).stream().findFirst();
+    }
+
+    /** 按全局键查询并加行锁。 */
+    public Optional<OverrideRow> findOverrideForUpdate(String overrideKey) {
+        return jdbc.query("SELECT override_key, channel_id, asset_id, grant_id, priority, start_ms,"
+                        + " end_ms, business_day, status, cancel_request_id, cancelled_at_ms, created_at_ms"
+                        + " FROM playout_emergency_override WHERE override_key = ? FOR UPDATE",
+                OVERRIDE_MAPPER, overrideKey).stream().findFirst();
+    }
+
+    /** 锁定频道行，串行化同频道的插播创建/取消，避免并发区间漏判（H2 无间隙锁，MySQL 下同样安全）。 */
+    public void lockChannelForUpdate(String channelId) {
+        jdbc.queryForList("SELECT id FROM playout_channel WHERE id = ? FOR UPDATE", channelId);
+    }
+
+    /**
+     * 同频道、同优先级、状态 ACTIVE 且与 [startMs, endMs) 相交的插播（区间左闭右开：
+     * 相邻 start == end 不算相交）。须在持频道锁后调用。
+     */
+    public List<OverrideRow> findActiveOverlappingForUpdate(String channelId, int priority,
+                                                            long startMs, long endMs) {
+        return jdbc.query("SELECT override_key, channel_id, asset_id, grant_id, priority, start_ms,"
+                        + " end_ms, business_day, status, cancel_request_id, cancelled_at_ms, created_at_ms"
+                        + " FROM playout_emergency_override"
+                        + " WHERE channel_id = ? AND status = 'ACTIVE' AND priority = ?"
+                        + " AND start_ms < ? AND end_ms > ?"
+                        + " ORDER BY start_ms, override_key FOR UPDATE",
+                OVERRIDE_MAPPER, channelId, priority, endMs, startMs);
+    }
+
+    /** 命中某时刻的 ACTIVE 插播，按优先级从高到低排序（同级区间不重叠，排序结果确定）。 */
+    public List<OverrideRow> findActiveOverridesAt(String channelId, long atMs) {
+        return jdbc.query("SELECT override_key, channel_id, asset_id, grant_id, priority, start_ms,"
+                        + " end_ms, business_day, status, cancel_request_id, cancelled_at_ms, created_at_ms"
+                        + " FROM playout_emergency_override"
+                        + " WHERE channel_id = ? AND status = 'ACTIVE'"
+                        + " AND start_ms <= ? AND end_ms > ?"
+                        + " ORDER BY priority DESC, start_ms ASC, override_key ASC",
+                OVERRIDE_MAPPER, channelId, atMs, atMs);
+    }
+
+    /** 取消插播；返回受影响行数，0 表示不存在或已取消。 */
+    public int cancelOverride(String overrideKey, String cancelRequestId, long cancelledAtMs) {
+        return jdbc.update("UPDATE playout_emergency_override"
+                        + " SET status = 'CANCELLED', cancel_request_id = ?, cancelled_at_ms = ?"
+                        + " WHERE override_key = ? AND status = 'ACTIVE'",
+                cancelRequestId, cancelledAtMs, overrideKey);
     }
 }
