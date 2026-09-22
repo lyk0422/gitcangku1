@@ -1,0 +1,18 @@
+spring:
+  application:
+    name: gitcangku1-test
+  datasource:
+    # 测试专用命名内存库；不加 DB_CLOSE_DELAY，上下文关闭连接池后数据库自动释放
+    url: jdbc:h2:mem:test_demo;MODE=MySQL;DATABASE_TO_LOWER=TRUE
+    username: sa
+    driver-class-name: org.h2.Driver
+    hikari:
+      maximum-pool-size: 5
+      minimum-idle: 1
+      connection-timeout: 10000
+      validation-timeout: 3000
+  sql:
+    init:
+      mode: embedded
+  jackson:
+    time-zone: Asia/Shanghai
