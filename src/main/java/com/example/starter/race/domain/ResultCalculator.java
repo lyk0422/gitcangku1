@@ -14,7 +14,8 @@ import java.util.Set;
  *
  * <p>规则：
  * <ul>
- *   <li>总耗时=原始完赛耗时+全部未撤销 ADD_TIME 加时之和；</li>
+ *   <li>总耗时=原始完赛耗时+全部未撤销 ADD_TIME 加时之和；
+ *       净总耗时=净完赛耗时（扣除中止补偿）+加时，排名与并列判定以净总耗时为准；</li>
  *   <li>存在未撤销 DISQUALIFY 处罚时状态 DISQUALIFIED，不排名，全部撤销后恢复计算；</li>
  *   <li>原始耗时缺失（null）时状态 UNTIMED，不排名；</li>
  *   <li>赛事配置了检查点时：已有完赛耗时但未覆盖全部检查点的选手状态
@@ -58,7 +59,8 @@ public final class ResultCalculator {
         Map<String, Aggregate> aggregates = new LinkedHashMap<>();
         for (RunnerView runner : runnerView) {
             aggregates.put(runner.bib(),
-                    new Aggregate(runner.bib(), runner.finishTimeMs(), orderedCheckpoints));
+                    new Aggregate(runner.bib(), runner.finishTimeMs(),
+                            runner.netFinishTimeMs(), orderedCheckpoints));
         }
 
         // 仅统计属于已配置检查点的分段（数据库外键已保证，这里做防御性过滤）。
@@ -101,12 +103,13 @@ public final class ResultCalculator {
             } else {
                 aggregate.status = EntryStatus.RANKED;
                 aggregate.totalTimeMs = aggregate.finishTimeMs + aggregate.penaltyMs;
+                aggregate.netTotalTimeMs = aggregate.netFinishTimeMs + aggregate.penaltyMs;
                 ranked.add(aggregate);
             }
         }
 
         ranked.sort(Comparator
-                .comparingLong((Aggregate a) -> a.totalTimeMs)
+                .comparingLong((Aggregate a) -> a.netTotalTimeMs)
                 .thenComparing(a -> a.bib));
         others.sort(Comparator.comparing(a -> a.bib));
 
@@ -114,7 +117,7 @@ public final class ResultCalculator {
         while (index < ranked.size()) {
             int groupEnd = index + 1;
             while (groupEnd < ranked.size()
-                    && ranked.get(groupEnd).totalTimeMs == ranked.get(index).totalTimeMs) {
+                    && ranked.get(groupEnd).netTotalTimeMs == ranked.get(index).netTotalTimeMs) {
                 groupEnd++;
             }
             int rank = index + 1;
@@ -139,6 +142,11 @@ public final class ResultCalculator {
         String bib();
 
         Long finishTimeMs();
+
+        /** 净完赛耗时（扣除中止补偿后）；默认等于原始完赛耗时（无中止事件的赛事）。 */
+        default Long netFinishTimeMs() {
+            return finishTimeMs();
+        }
     }
 
     /** 处罚视图。 */
@@ -156,6 +164,7 @@ public final class ResultCalculator {
     private static final class Aggregate {
         private final String bib;
         private final Long finishTimeMs;
+        private final Long netFinishTimeMs;
         private final List<CheckpointView> checkpoints;
         private final Set<String> coveredCodes = new HashSet<>();
         private long penaltyMs;
@@ -163,10 +172,16 @@ public final class ResultCalculator {
         private EntryStatus status;
         private int rank;
         private long totalTimeMs;
+        private long netTotalTimeMs;
 
-        private Aggregate(String bib, Long finishTimeMs, List<CheckpointView> checkpoints) {
+        private Aggregate(
+                String bib,
+                Long finishTimeMs,
+                Long netFinishTimeMs,
+                List<CheckpointView> checkpoints) {
             this.bib = bib;
             this.finishTimeMs = finishTimeMs;
+            this.netFinishTimeMs = netFinishTimeMs;
             this.checkpoints = checkpoints;
         }
 
@@ -188,6 +203,8 @@ public final class ResultCalculator {
                     finishTimeMs,
                     penaltyMs,
                     status == EntryStatus.RANKED ? totalTimeMs : null,
+                    netFinishTimeMs,
+                    status == EntryStatus.RANKED ? netTotalTimeMs : null,
                     checkpoints.size(),
                     coveredCodes.size(),
                     missingCheckpoints());

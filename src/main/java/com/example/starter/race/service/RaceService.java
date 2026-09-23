@@ -1,9 +1,11 @@
 package com.example.starter.race.service;
 
 import com.example.starter.race.api.AddPenaltyRequest;
+import com.example.starter.race.api.CompensationDetailResponse;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
 import com.example.starter.race.api.CreateRaceRequest;
 import com.example.starter.race.api.RegisterRunnerRequest;
+import com.example.starter.race.api.ResumeRaceRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
 import com.example.starter.race.api.MissingCheckpointsResponse;
@@ -11,6 +13,8 @@ import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.api.SubmitTimingRequest;
+import com.example.starter.race.api.SuspendRaceRequest;
+import com.example.starter.race.api.SuspensionHistoryResponse;
 
 /**
  * 赛事成绩封榜应用服务；每个写方法在单个数据库事务内完成
@@ -47,6 +51,25 @@ public interface RaceService {
 
     /** 封榜：校验版本并原子保存只读成绩快照（含每名选手分段明细与缺失检查点）。 */
     ServiceResult sealRace(String raceId, SealRaceRequest request);
+
+    /**
+     * 登记中止事件：赛事由 OPEN 转 SUSPENDED，期间仅允许恢复；
+     * 与既有事件窗口重叠返回422，赛事非 OPEN 或版本冲突返回409。
+     */
+    ServiceResult suspendRace(String raceId, SuspendRaceRequest request);
+
+    /**
+     * 恢复中止事件：resumeElapsedMs 必须大于 startElapsedMs；
+     * 在同一事务内重算全部选手净分段、净完赛与漏点，任一净不变量违反返回422且事件不落库；
+     * 成功后赛事回到 OPEN 且版本加一。
+     */
+    ServiceResult resumeRace(String raceId, String eventKey, ResumeRaceRequest request);
+
+    /** 查询赛事中止事件历史（含中止中与已恢复），只读。 */
+    SuspensionHistoryResponse getSuspensionEvents(String raceId);
+
+    /** 查询单个已恢复中止事件的全体选手补偿明细，只读；事件未恢复为409。 */
+    CompensationDetailResponse getCompensations(String raceId, String eventKey);
 
     /** 查询即时成绩（OPEN 实时计算；SEALED 返回封榜快照）。 */
     StandingResponse getResults(String raceId);

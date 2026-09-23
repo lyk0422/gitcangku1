@@ -87,6 +87,37 @@ public class RaceController {
         return toResponse(raceService.sealRace(raceId, request));
     }
 
+    /** 登记中止事件：赛事转为 SUSPENDED。 */
+    @PostMapping("/{raceId}/suspensions")
+    public ResponseEntity<Object> suspendRace(
+            @PathVariable String raceId,
+            @Valid @RequestBody SuspendRaceRequest request) {
+        return toResponse(raceService.suspendRace(raceId, request));
+    }
+
+    /** 恢复中止事件：重算全部选手净计时后赛事回到 OPEN。 */
+    @PostMapping("/{raceId}/suspensions/{eventKey}/resume")
+    public ResponseEntity<Object> resumeRace(
+            @PathVariable String raceId,
+            @PathVariable String eventKey,
+            @Valid @RequestBody ResumeRaceRequest request) {
+        return toResponse(raceService.resumeRace(raceId, eventKey, request));
+    }
+
+    /** 查询赛事中止事件历史（只读）。 */
+    @GetMapping("/{raceId}/suspensions")
+    public SuspensionHistoryResponse getSuspensionEvents(@PathVariable String raceId) {
+        return raceService.getSuspensionEvents(raceId);
+    }
+
+    /** 查询单个中止事件的全体选手补偿明细（只读）。 */
+    @GetMapping("/{raceId}/suspensions/{eventKey}/compensations")
+    public CompensationDetailResponse getCompensations(
+            @PathVariable String raceId,
+            @PathVariable String eventKey) {
+        return raceService.getCompensations(raceId, eventKey);
+    }
+
     /** 查询即时成绩（封榜后返回只读快照内容）。 */
     @GetMapping("/{raceId}/results")
     public StandingResponse getResults(@PathVariable String raceId) {

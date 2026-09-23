@@ -7,6 +7,7 @@ import com.example.starter.race.api.ResultEntryResponse;
 import com.example.starter.race.api.RunnerResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.StandingResponse;
+import com.example.starter.race.api.SuspensionEventResponse;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
@@ -18,6 +19,7 @@ import com.example.starter.race.persistence.RunnerRow;
 import com.example.starter.race.persistence.SnapshotCheckpointRow;
 import com.example.starter.race.persistence.SnapshotEntryRow;
 import com.example.starter.race.persistence.SnapshotRow;
+import com.example.starter.race.persistence.SuspensionEventRow;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -46,9 +48,15 @@ final class ResponseMapper {
                 row.elapsedMillis(), row.createdAt());
     }
 
+    static SuspensionEventResponse toSuspensionEventResponse(SuspensionEventRow row) {
+        return new SuspensionEventResponse(
+                row.eventKey(), row.raceId(), row.checkpointCode(), row.startElapsedMs(),
+                row.resumeElapsedMs(), row.status(), row.createdAt(), row.resumedAt());
+    }
+
     static StandingResponse liveStanding(
             RaceRow race,
-            List<RunnerRow> runners,
+            List<? extends ResultCalculator.RunnerView> runners,
             List<PenaltyRow> penalties,
             List<CheckpointRow> checkpoints,
             List<CheckpointTimingRow> timings) {
@@ -79,6 +87,8 @@ final class ResponseMapper {
                 entry.finishTimeMs(),
                 entry.penaltyMs(),
                 entry.totalTimeMs(),
+                entry.netFinishTimeMs(),
+                entry.netTotalTimeMs(),
                 entry.checkpointCount(),
                 entry.coveredCheckpointCount(),
                 entry.missingCheckpoints());
@@ -92,6 +102,8 @@ final class ResponseMapper {
                 entry.finishTimeMs(),
                 entry.penaltyMs(),
                 entry.totalTimeMs(),
+                entry.netFinishTimeMs(),
+                entry.netTotalTimeMs(),
                 entry.checkpointCount(),
                 entry.coveredCheckpointCount(),
                 entry.missingCheckpoints());
@@ -99,13 +111,15 @@ final class ResponseMapper {
 
     /**
      * 组装单个选手的分段明细：按检查点顺序，把已有通过记录映射到对应检查点，
-     * 未通过的检查点 elapsedMillis/timingId 为 null。
+     * 未通过的检查点 elapsedMillis/netElapsedMillis/timingId 为 null。
      */
     static RunnerTimingResponse runnerTiming(
             RaceRow race,
             RunnerRow runner,
             List<CheckpointRow> checkpoints,
-            List<CheckpointTimingRow> timings) {
+            List<CheckpointTimingRow> timings,
+            Map<String, Long> netElapsedByCheckpoint,
+            Long netFinishTimeMs) {
         Map<String, CheckpointTimingRow> byCode = new LinkedHashMap<>();
         for (CheckpointTimingRow timing : timings) {
             byCode.put(timing.checkpointCode(), timing);
@@ -117,19 +131,28 @@ final class ResponseMapper {
                             checkpoint.checkpointCode(),
                             checkpoint.position(),
                             timing == null ? null : timing.elapsedMillis(),
+                            timing == null
+                                    ? null
+                                    : netElapsedByCheckpoint.get(checkpoint.checkpointCode()),
                             timing == null ? null : timing.timingId());
                 })
                 .toList();
         return new RunnerTimingResponse(
-                race.raceId(), runner.bib(), race.version(), runner.finishTimeMs(), passes);
+                race.raceId(), runner.bib(), race.version(),
+                runner.finishTimeMs(), netFinishTimeMs, passes);
     }
 
-    /** 由封榜快照中的分段明细组装单选手分段视图（缺失检查点 elapsedMillis/timingId 为 null）。 */
+    /** 由封榜快照中的分段明细组装单选手分段视图（缺失检查点耗时字段为 null）。 */
     static RunnerTimingResponse snapshotRunnerTiming(
             SnapshotRow snapshot,
             String bib,
             Long finishTimeMs,
             List<CheckpointRow> checkpoints) {
+        Long netFinishTimeMs = snapshot.entries().stream()
+                .filter(entry -> entry.bib().equals(bib))
+                .map(SnapshotEntryRow::netFinishTimeMs)
+                .findFirst()
+                .orElse(finishTimeMs);
         Map<String, SnapshotCheckpointRow> byCode = new LinkedHashMap<>();
         for (SnapshotCheckpointRow detail : snapshot.checkpoints()) {
             if (detail.bib().equals(bib)) {
@@ -141,14 +164,15 @@ final class ResponseMapper {
                     SnapshotCheckpointRow detail = byCode.get(checkpoint.checkpointCode());
                     if (detail == null) {
                         return new CheckpointPassResponse(
-                                checkpoint.checkpointCode(), checkpoint.position(), null, null);
+                                checkpoint.checkpointCode(), checkpoint.position(),
+                                null, null, null);
                     }
                     return new CheckpointPassResponse(
                             detail.checkpointCode(), detail.position(),
-                            detail.elapsedMillis(), detail.timingId());
+                            detail.elapsedMillis(), detail.netElapsedMillis(), detail.timingId());
                 })
                 .toList();
         return new RunnerTimingResponse(
-                snapshot.raceId(), bib, snapshot.version(), finishTimeMs, passes);
+                snapshot.raceId(), bib, snapshot.version(), finishTimeMs, netFinishTimeMs, passes);
     }
 }

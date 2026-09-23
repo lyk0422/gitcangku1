@@ -3,6 +3,7 @@ package com.example.starter.race.persistence;
 import com.example.starter.race.domain.EntryStatus;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
+import com.example.starter.race.domain.SuspensionStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
@@ -30,6 +31,10 @@ public class RaceRepository {
             new CheckpointTimingRowMapper();
     private static final SnapshotCheckpointRowMapper SNAPSHOT_CHECKPOINT_ROW_MAPPER =
             new SnapshotCheckpointRowMapper();
+    private static final SuspensionEventRowMapper SUSPENSION_EVENT_ROW_MAPPER =
+            new SuspensionEventRowMapper();
+    private static final SnapshotSuspensionRowMapper SNAPSHOT_SUSPENSION_ROW_MAPPER =
+            new SnapshotSuspensionRowMapper();
 
     private final JdbcTemplate jdbcTemplate;
 
@@ -188,14 +193,21 @@ public class RaceRepository {
         SnapshotRow header = headers.getFirst();
         List<SnapshotEntryRow> entryRows = jdbcTemplate.query(
                 "SELECT race_id, bib, rank_no, status, finish_time_ms, penalty_ms, total_time_ms, "
+                        + "net_finish_time_ms, net_total_time_ms, "
                         + "display_order, checkpoint_count, covered_checkpoint_count "
                         + "FROM result_snapshot_entry WHERE race_id = ? ORDER BY display_order",
                 SNAPSHOT_ENTRY_ROW_MAPPER, raceId);
         List<SnapshotCheckpointRow> checkpoints = jdbcTemplate.query(
-                "SELECT race_id, bib, checkpoint_code, position, elapsed_millis, timing_id "
+                "SELECT race_id, bib, checkpoint_code, position, elapsed_millis, "
+                        + "net_elapsed_millis, timing_id "
                         + "FROM result_snapshot_checkpoint WHERE race_id = ? "
                         + "ORDER BY bib, position",
                 SNAPSHOT_CHECKPOINT_ROW_MAPPER, raceId);
+        List<SnapshotSuspensionRow> suspensions = jdbcTemplate.query(
+                "SELECT race_id, event_key, checkpoint_code, start_elapsed_ms, resume_elapsed_ms "
+                        + "FROM result_snapshot_suspension WHERE race_id = ? "
+                        + "ORDER BY start_elapsed_ms, event_key",
+                SNAPSHOT_SUSPENSION_ROW_MAPPER, raceId);
         // 缺失检查点由明细表中 elapsed_millis 为 NULL 的行派生，保持展示顺序稳定。
         java.util.Map<String, List<String>> missingByBib = new java.util.LinkedHashMap<>();
         for (SnapshotCheckpointRow detail : checkpoints) {
@@ -208,12 +220,13 @@ public class RaceRepository {
                 .map(entry -> new SnapshotEntryRow(
                         entry.raceId(), entry.bib(), entry.rank(), entry.status(),
                         entry.finishTimeMs(), entry.penaltyMs(), entry.totalTimeMs(),
+                        entry.netFinishTimeMs(), entry.netTotalTimeMs(),
                         entry.displayOrder(), entry.checkpointCount(),
                         entry.coveredCheckpointCount(),
                         missingByBib.getOrDefault(entry.bib(), List.of())))
                 .toList();
         return Optional.of(new SnapshotRow(header.raceId(), header.version(), header.sealedAt(),
-                entries, checkpoints));
+                entries, checkpoints, suspensions));
     }
 
     /** 新建赛事，初始版本1、状态OPEN。 */
@@ -284,6 +297,74 @@ public class RaceRepository {
                 newVersion, raceId, expectedVersion);
     }
 
+    /**
+     * 条件中止：仅当赛事仍为 OPEN 且版本等于 expectedVersion 时转为 SUSPENDED 并推进版本。
+     *
+     * @return 受影响行数；0 表示不存在、非 OPEN 或版本不匹配
+     */
+    public int suspendRaceIfOpenAtVersion(String raceId, int expectedVersion, int newVersion) {
+        return jdbcTemplate.update(
+                "UPDATE race SET version = ?, status = 'SUSPENDED' "
+                        + "WHERE race_id = ? AND version = ? AND status = 'OPEN'",
+                newVersion, raceId, expectedVersion);
+    }
+
+    /**
+     * 条件恢复：仅当赛事仍为 SUSPENDED 且版本等于 expectedVersion 时回到 OPEN 并推进版本。
+     *
+     * @return 受影响行数；0 表示不存在、非 SUSPENDED 或版本不匹配
+     */
+    public int resumeRaceIfSuspendedAtVersion(String raceId, int expectedVersion, int newVersion) {
+        return jdbcTemplate.update(
+                "UPDATE race SET version = ?, status = 'OPEN' "
+                        + "WHERE race_id = ? AND version = ? AND status = 'SUSPENDED'",
+                newVersion, raceId, expectedVersion);
+    }
+
+    /** 新增中止事件（eventKey 全局唯一由主键保证）。 */
+    public void insertSuspensionEvent(SuspensionEventRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO suspension_event "
+                        + "(event_key, race_id, checkpoint_code, checkpoint_position, "
+                        + "start_elapsed_ms, resume_elapsed_ms, status, created_at, resumed_at) "
+                        + "VALUES (?, ?, ?, ?, ?, NULL, 'SUSPENDED', ?, NULL)",
+                row.eventKey(), row.raceId(), row.checkpointCode(), row.checkpointPosition(),
+                row.startElapsedMs(), row.createdAt());
+    }
+
+    /** 按全局事件Key查询中止事件。 */
+    public Optional<SuspensionEventRow> findSuspensionEvent(String eventKey) {
+        return jdbcTemplate
+                .query("SELECT event_key, race_id, checkpoint_code, checkpoint_position, "
+                                + "start_elapsed_ms, resume_elapsed_ms, status, created_at, resumed_at "
+                                + "FROM suspension_event WHERE event_key = ?",
+                        SUSPENSION_EVENT_ROW_MAPPER, eventKey)
+                .stream()
+                .findFirst();
+    }
+
+    /** 查询赛事全部中止事件，按中止开始耗时与事件Key升序。 */
+    public List<SuspensionEventRow> findSuspensionEvents(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT event_key, race_id, checkpoint_code, checkpoint_position, "
+                        + "start_elapsed_ms, resume_elapsed_ms, status, created_at, resumed_at "
+                        + "FROM suspension_event WHERE race_id = ? "
+                        + "ORDER BY start_elapsed_ms, event_key",
+                SUSPENSION_EVENT_ROW_MAPPER, raceId);
+    }
+
+    /**
+     * 标记中止事件已恢复：仅对仍处于 SUSPENDED 的事件生效。
+     *
+     * @return 受影响行数；0 表示事件不存在或已恢复
+     */
+    public int markSuspensionResumed(String eventKey, long resumeElapsedMs, long now) {
+        return jdbcTemplate.update(
+                "UPDATE suspension_event SET resume_elapsed_ms = ?, status = 'RESUMED', resumed_at = ? "
+                        + "WHERE event_key = ? AND status = 'SUSPENDED'",
+                resumeElapsedMs, now, eventKey);
+    }
+
     /** 原子写入封榜快照头表、全部条目以及每名选手的分段明细。 */
     public void insertSnapshot(SnapshotRow snapshot) {
         jdbcTemplate.update(
@@ -292,8 +373,9 @@ public class RaceRepository {
         jdbcTemplate.batchUpdate(
                 "INSERT INTO result_snapshot_entry "
                         + "(race_id, bib, rank_no, status, finish_time_ms, penalty_ms, total_time_ms, "
+                        + "net_finish_time_ms, net_total_time_ms, "
                         + "display_order, checkpoint_count, covered_checkpoint_count) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 snapshot.entries(),
                 snapshot.entries().size(),
                 (ps, entry) -> {
@@ -304,14 +386,17 @@ public class RaceRepository {
                     ps.setObject(5, entry.finishTimeMs());
                     ps.setLong(6, entry.penaltyMs());
                     ps.setObject(7, entry.totalTimeMs());
-                    ps.setInt(8, entry.displayOrder());
-                    ps.setInt(9, entry.checkpointCount());
-                    ps.setInt(10, entry.coveredCheckpointCount());
+                    ps.setObject(8, entry.netFinishTimeMs());
+                    ps.setObject(9, entry.netTotalTimeMs());
+                    ps.setInt(10, entry.displayOrder());
+                    ps.setInt(11, entry.checkpointCount());
+                    ps.setInt(12, entry.coveredCheckpointCount());
                 });
         jdbcTemplate.batchUpdate(
                 "INSERT INTO result_snapshot_checkpoint "
-                        + "(race_id, bib, checkpoint_code, position, elapsed_millis, timing_id) "
-                        + "VALUES (?, ?, ?, ?, ?, ?)",
+                        + "(race_id, bib, checkpoint_code, position, elapsed_millis, "
+                        + "net_elapsed_millis, timing_id) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 snapshot.checkpoints(),
                 snapshot.checkpoints().size(),
                 (ps, detail) -> {
@@ -320,7 +405,21 @@ public class RaceRepository {
                     ps.setString(3, detail.checkpointCode());
                     ps.setInt(4, detail.position());
                     ps.setObject(5, detail.elapsedMillis());
-                    ps.setString(6, detail.timingId());
+                    ps.setObject(6, detail.netElapsedMillis());
+                    ps.setString(7, detail.timingId());
+                });
+        jdbcTemplate.batchUpdate(
+                "INSERT INTO result_snapshot_suspension "
+                        + "(race_id, event_key, checkpoint_code, start_elapsed_ms, resume_elapsed_ms) "
+                        + "VALUES (?, ?, ?, ?, ?)",
+                snapshot.suspensions(),
+                snapshot.suspensions().size(),
+                (ps, suspension) -> {
+                    ps.setString(1, suspension.raceId());
+                    ps.setString(2, suspension.eventKey());
+                    ps.setString(3, suspension.checkpointCode());
+                    ps.setLong(4, suspension.startElapsedMs());
+                    ps.setLong(5, suspension.resumeElapsedMs());
                 });
     }
 
@@ -370,10 +469,12 @@ public class RaceRepository {
 
     /** 测试辅助：清空全部业务数据，按外键依赖顺序删除。 */
     public void deleteAllForTesting() {
+        jdbcTemplate.update("DELETE FROM result_snapshot_suspension");
         jdbcTemplate.update("DELETE FROM result_snapshot_checkpoint");
         jdbcTemplate.update("DELETE FROM result_snapshot_entry");
         jdbcTemplate.update("DELETE FROM result_snapshot");
         jdbcTemplate.update("DELETE FROM idempotency_record");
+        jdbcTemplate.update("DELETE FROM suspension_event");
         jdbcTemplate.update("DELETE FROM checkpoint_timing");
         jdbcTemplate.update("DELETE FROM checkpoint");
         jdbcTemplate.update("DELETE FROM penalty");
@@ -432,6 +533,8 @@ public class RaceRepository {
                     (Long) rs.getObject("finish_time_ms"),
                     rs.getLong("penalty_ms"),
                     (Long) rs.getObject("total_time_ms"),
+                    (Long) rs.getObject("net_finish_time_ms"),
+                    (Long) rs.getObject("net_total_time_ms"),
                     rs.getInt("display_order"),
                     rs.getInt("checkpoint_count"),
                     rs.getInt("covered_checkpoint_count"),
@@ -474,7 +577,37 @@ public class RaceRepository {
                     rs.getString("checkpoint_code"),
                     rs.getInt("position"),
                     (Long) rs.getObject("elapsed_millis"),
+                    (Long) rs.getObject("net_elapsed_millis"),
                     rs.getString("timing_id"));
+        }
+    }
+
+    private static final class SuspensionEventRowMapper implements RowMapper<SuspensionEventRow> {
+        @Override
+        public SuspensionEventRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new SuspensionEventRow(
+                    rs.getString("event_key"),
+                    rs.getString("race_id"),
+                    rs.getString("checkpoint_code"),
+                    rs.getInt("checkpoint_position"),
+                    rs.getLong("start_elapsed_ms"),
+                    (Long) rs.getObject("resume_elapsed_ms"),
+                    SuspensionStatus.valueOf(rs.getString("status")),
+                    rs.getLong("created_at"),
+                    (Long) rs.getObject("resumed_at"));
+        }
+    }
+
+    private static final class SnapshotSuspensionRowMapper
+            implements RowMapper<SnapshotSuspensionRow> {
+        @Override
+        public SnapshotSuspensionRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new SnapshotSuspensionRow(
+                    rs.getString("race_id"),
+                    rs.getString("event_key"),
+                    rs.getString("checkpoint_code"),
+                    rs.getLong("start_elapsed_ms"),
+                    rs.getLong("resume_elapsed_ms"));
         }
     }
 
