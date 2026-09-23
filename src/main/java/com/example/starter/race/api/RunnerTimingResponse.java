@@ -11,6 +11,7 @@ import java.util.List;
  * @param bib          参赛号
  * @param version      查询时的赛事版本（只读查询不修改版本）
  * @param finishTimeMs 该选手原始完赛耗时（毫秒）；尚无完赛计时为 null
+ * @param netFinishTimeMs 该选手净完赛耗时（毫秒）；尚无完赛计时为 null，无中止事件时等于原始值
  * @param checkpoints  按 position 升序的分段明细；未配置检查点的赛事为空列表
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
@@ -19,6 +20,7 @@ public record RunnerTimingResponse(
         String bib,
         int version,
         Long finishTimeMs,
+        Long netFinishTimeMs,
         List<CheckpointPassResponse> checkpoints
 ) {
 }

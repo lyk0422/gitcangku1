@@ -7,7 +7,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-
 /**
  * 成绩排名纯逻辑：依据选手原始耗时、处罚列表与检查点覆盖情况计算榜单，
  * 不涉及数据库与时间。
@@ -29,27 +28,40 @@ public final class ResultCalculator {
     private ResultCalculator() {
     }
 
-    /** 未配置检查点的赛事使用的兼容入口：无检查点、无分段记录。 */
+    /** 未配置检查点的赛事使用的兼容入口：无检查点、无分段记录、无补偿。 */
     public static List<ResultEntry> compute(
             List<? extends RunnerView> runnerView,
             List<? extends PenaltyView> penalties) {
-        return compute(runnerView, penalties, List.of(), List.of());
+        return compute(runnerView, penalties, List.of(), List.of(), Map.of(), Map.of());
+    }
+
+    /** 无中止补偿口径：净完赛等于原始完赛、完赛补偿为0。 */
+    public static List<ResultEntry> compute(
+            List<? extends RunnerView> runnerView,
+            List<? extends PenaltyView> penalties,
+            List<? extends CheckpointView> checkpoints,
+            List<? extends TimingView> timings) {
+        return compute(runnerView, penalties, checkpoints, timings, Map.of(), Map.of());
     }
 
     /**
      * 计算即时成绩。
      *
-     * @param runnerView  全部选手视图（参赛号、原始完赛耗时）
-     * @param penalties   全部处罚（含已撤销）
-     * @param checkpoints 赛事检查点配置（按 position 排序后使用）；为空表示赛事未配置检查点
-     * @param timings     全部选手的分段通过记录
+     * @param runnerView             全部选手视图（参赛号、原始完赛耗时）
+     * @param penalties              全部处罚（含已撤销）
+     * @param checkpoints            赛事检查点配置（按 position 排序后使用）；为空表示赛事未配置检查点
+     * @param timings                全部选手的分段通过记录
+     * @param netFinishByBib         每名选手净完赛耗时；缺省（无中止事件）时等于原始完赛
+     * @param finishCompensationByBib 每名选手完赛口径累计补偿毫秒数；缺省为0
      * @return 按展示顺序排列的成绩条目
      */
     public static List<ResultEntry> compute(
             List<? extends RunnerView> runnerView,
             List<? extends PenaltyView> penalties,
             List<? extends CheckpointView> checkpoints,
-            List<? extends TimingView> timings) {
+            List<? extends TimingView> timings,
+            Map<String, Long> netFinishByBib,
+            Map<String, Long> finishCompensationByBib) {
         List<CheckpointView> orderedCheckpoints = new ArrayList<>(checkpoints);
         orderedCheckpoints.sort(Comparator.comparingInt(CheckpointView::position)
                 .thenComparing(CheckpointView::checkpointCode));
@@ -57,8 +69,11 @@ public final class ResultCalculator {
 
         Map<String, Aggregate> aggregates = new LinkedHashMap<>();
         for (RunnerView runner : runnerView) {
-            aggregates.put(runner.bib(),
-                    new Aggregate(runner.bib(), runner.finishTimeMs(), orderedCheckpoints));
+            Long netFinish = netFinishByBib.getOrDefault(runner.bib(), runner.finishTimeMs());
+            long finishCompensation = finishCompensationByBib.getOrDefault(runner.bib(), 0L);
+            aggregates.put(runner.bib(), new Aggregate(
+                    runner.bib(), runner.finishTimeMs(), netFinish, finishCompensation,
+                    orderedCheckpoints));
         }
 
         // 仅统计属于已配置检查点的分段（数据库外键已保证，这里做防御性过滤）。
@@ -100,7 +115,7 @@ public final class ResultCalculator {
                 others.add(aggregate);
             } else {
                 aggregate.status = EntryStatus.RANKED;
-                aggregate.totalTimeMs = aggregate.finishTimeMs + aggregate.penaltyMs;
+                aggregate.totalTimeMs = aggregate.netFinishTimeMs + aggregate.penaltyMs;
                 ranked.add(aggregate);
             }
         }
@@ -156,6 +171,8 @@ public final class ResultCalculator {
     private static final class Aggregate {
         private final String bib;
         private final Long finishTimeMs;
+        private final Long netFinishTimeMs;
+        private final long finishCompensationMs;
         private final List<CheckpointView> checkpoints;
         private final Set<String> coveredCodes = new HashSet<>();
         private long penaltyMs;
@@ -164,9 +181,16 @@ public final class ResultCalculator {
         private int rank;
         private long totalTimeMs;
 
-        private Aggregate(String bib, Long finishTimeMs, List<CheckpointView> checkpoints) {
+        private Aggregate(
+                String bib,
+                Long finishTimeMs,
+                Long netFinishTimeMs,
+                long finishCompensationMs,
+                List<CheckpointView> checkpoints) {
             this.bib = bib;
             this.finishTimeMs = finishTimeMs;
+            this.netFinishTimeMs = netFinishTimeMs;
+            this.finishCompensationMs = finishCompensationMs;
             this.checkpoints = checkpoints;
         }
 
@@ -186,7 +210,9 @@ public final class ResultCalculator {
                     status == EntryStatus.RANKED ? rank : null,
                     status,
                     finishTimeMs,
+                    netFinishTimeMs,
                     penaltyMs,
+                    finishCompensationMs,
                     status == EntryStatus.RANKED ? totalTimeMs : null,
                     checkpoints.size(),
                     coveredCodes.size(),

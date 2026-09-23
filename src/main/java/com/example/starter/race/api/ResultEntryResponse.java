@@ -8,15 +8,17 @@ import java.util.List;
 /**
  * 成绩榜中的单个条目。
  *
- * @param bib                    参赛号
- * @param rank                   名次（并列同名次并跳号）；非 RANKED 为 null
- * @param status                RANKED / UNTIMED / MISSING_CHECKPOINT / DISQUALIFIED
- * @param finishTimeMs          原始完赛耗时毫秒；计时缺失为 null
- * @param penaltyMs             生效加时合计毫秒数
- * @param totalTimeMs           总耗时毫秒；未排名为 null
- * @param checkpointCount       赛事检查点总数；未配置检查点为 0
- * @param coveredCheckpointCount 该选手已覆盖检查点数量
- * @param missingCheckpoints    缺失检查点代码，按检查点顺序排列；无缺失为空列表
+ * @param bib                     参赛号
+ * @param rank                    名次（并列同名次并跳号）；非 RANKED 为 null
+ * @param status                  RANKED / UNTIMED / MISSING_CHECKPOINT / DISQUALIFIED
+ * @param finishTimeMs            原始完赛耗时毫秒；计时缺失为 null
+ * @param netFinishTimeMs         净完赛耗时毫秒=原始完赛-完赛口径累计补偿；无中止事件时等于原始值
+ * @param penaltyMs               生效加时合计毫秒数
+ * @param finishCompensationMs    完赛口径累计补偿毫秒数，未受影响为 0
+ * @param totalTimeMs             总耗时=净完赛+生效加时（毫秒）；未排名为 null
+ * @param checkpointCount         赛事检查点总数；未配置检查点为 0
+ * @param coveredCheckpointCount  该选手已覆盖检查点数量
+ * @param missingCheckpoints      缺失检查点代码，按检查点顺序排列；无缺失为空列表
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public record ResultEntryResponse(
@@ -24,7 +26,9 @@ public record ResultEntryResponse(
         Integer rank,
         EntryStatus status,
         Long finishTimeMs,
+        Long netFinishTimeMs,
         long penaltyMs,
+        long finishCompensationMs,
         Long totalTimeMs,
         int checkpointCount,
         int coveredCheckpointCount,

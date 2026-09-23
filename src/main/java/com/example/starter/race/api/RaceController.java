@@ -87,6 +87,34 @@ public class RaceController {
         return toResponse(raceService.sealRace(raceId, request));
     }
 
+    /** 登记中止事件，赛事转 SUSPENDED。 */
+    @PostMapping("/{raceId}/suspensions")
+    public ResponseEntity<Object> suspendRace(
+            @PathVariable String raceId,
+            @Valid @RequestBody SuspendRaceRequest request) {
+        return toResponse(raceService.suspendRace(raceId, request));
+    }
+
+    /** 恢复赛事并在单事务内一致重算净计时与排名版本。 */
+    @PostMapping("/{raceId}/resumptions")
+    public ResponseEntity<Object> resumeRace(
+            @PathVariable String raceId,
+            @Valid @RequestBody ResumeRaceRequest request) {
+        return toResponse(raceService.resumeRace(raceId, request));
+    }
+
+    /** 查询中止恢复事件历史（只读）。 */
+    @GetMapping("/{raceId}/suspensions")
+    public SuspensionHistoryResponse getSuspensionHistory(@PathVariable String raceId) {
+        return raceService.getSuspensionHistory(raceId);
+    }
+
+    /** 查询每名选手的中止补偿明细（只读）。 */
+    @GetMapping("/{raceId}/compensations")
+    public CompensationResponse getCompensations(@PathVariable String raceId) {
+        return raceService.getCompensations(raceId);
+    }
+
     /** 查询即时成绩（封榜后返回只读快照内容）。 */
     @GetMapping("/{raceId}/results")
     public StandingResponse getResults(@PathVariable String raceId) {

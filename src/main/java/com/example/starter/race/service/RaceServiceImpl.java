@@ -3,11 +3,13 @@ package com.example.starter.race.service;
 import com.example.starter.race.api.AddPenaltyRequest;
 import com.example.starter.race.api.CheckpointResponse;
 import com.example.starter.race.api.CheckpointsConfigResponse;
+import com.example.starter.race.api.CompensationResponse;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
 import com.example.starter.race.api.CreateRaceRequest;
 import com.example.starter.race.api.MissingCheckpointsResponse;
 import com.example.starter.race.api.RaceResponse;
 import com.example.starter.race.api.RegisterRunnerRequest;
+import com.example.starter.race.api.ResumeRaceRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
 import com.example.starter.race.api.RunnerMissingCheckpointsResponse;
@@ -15,20 +17,30 @@ import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.api.SubmitTimingRequest;
+import com.example.starter.race.api.SuspendRaceRequest;
+import com.example.starter.race.api.SuspensionEventResponse;
+import com.example.starter.race.api.SuspensionHistoryResponse;
 import com.example.starter.race.domain.CheckpointRules;
+import com.example.starter.race.domain.NetCalculator;
+import com.example.starter.race.domain.NetTimeInvalidException;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
+import com.example.starter.race.domain.SuspensionView;
 import com.example.starter.race.persistence.CheckpointRow;
+import com.example.starter.race.persistence.CheckpointTimingNetRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
 import com.example.starter.race.persistence.IdempotencyRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
+import com.example.starter.race.persistence.RunnerNetRow;
 import com.example.starter.race.persistence.RunnerRow;
 import com.example.starter.race.persistence.SnapshotCheckpointRow;
 import com.example.starter.race.persistence.SnapshotEntryRow;
 import com.example.starter.race.persistence.SnapshotRow;
+import com.example.starter.race.persistence.SnapshotSuspensionRow;
+import com.example.starter.race.persistence.SuspensionEventRow;
 import com.example.starter.race.persistence.RaceRepository;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -153,6 +165,15 @@ public class RaceServiceImpl implements RaceService {
                             raceId, request.bib(), request.finishTimeMs(), now);
                     if (updated == 0) {
                         throw new NotFoundException("选手不存在: " + request.bib());
+                    }
+                    // 完赛耗时变更后，同事务按已恢复事件重算该选手净完赛与净分段，破坏不变量则422回滚。
+                    List<SuspensionEventRow> resumedSuspensions =
+                            repository.findResumedSuspensions(raceId);
+                    if (!resumedSuspensions.isEmpty()) {
+                        recomputeSingleRunnerNet(
+                                raceId, request.bib(), request.finishTimeMs(), now,
+                                resumedSuspensions,
+                                repository.findTimingsForRunner(raceId, request.bib()));
                     }
                     RunnerRow refreshedRunner =
                             repository.findRunner(raceId, request.bib()).orElseThrow();
@@ -303,6 +324,17 @@ public class RaceServiceImpl implements RaceService {
                     if (violation != null) {
                         throw new UnprocessableEntityException(violation);
                     }
+                    // 落在任一已恢复中止窗口 [start,resume) 的记录拒绝（不写入）。
+                    List<SuspensionEventRow> resumedSuspensions =
+                            repository.findResumedSuspensions(raceId);
+                    for (SuspensionEventRow suspension : resumedSuspensions) {
+                        if (elapsedMillis >= suspension.startElapsedMs()
+                                && elapsedMillis < suspension.resumeElapsedMs()) {
+                            throw new UnprocessableEntityException(
+                                    "分段耗时落在中止区间[start,resume)内，禁止提交: eventKey="
+                                            + suspension.eventKey());
+                        }
+                    }
                     bumpVersion(race, request.expectedVersion());
                     long now = clock.millis();
                     CheckpointTimingRow row = new CheckpointTimingRow(
@@ -320,10 +352,44 @@ public class RaceServiceImpl implements RaceService {
                         throw new UnprocessableEntityException(
                                 "同一选手同一检查点最多一条分段记录");
                     }
+                    // 与已恢复事件的净口径保持一致：同事务重算并覆盖该选手净值；
+                    // 若破坏净不变量则整体回滚（422），新分段与版本推进均不落库。
+                    if (!resumedSuspensions.isEmpty()) {
+                        recomputeSingleRunnerNet(
+                                raceId, runner.bib(), runner.finishTimeMs(), now,
+                                resumedSuspensions,
+                                repository.findTimingsForRunner(raceId, bib));
+                    }
                     CheckpointTimingRow saved =
                             repository.findTiming(request.timingId()).orElseThrow();
                     return ServiceResult.created(ResponseMapper.toTimingResponse(saved));
                 });
+    }
+
+    /**
+     * 在写事务内重算单个选手净值并覆盖落库；净不变量被破坏时抛出422，由事务回滚。
+     */
+    private void recomputeSingleRunnerNet(
+            String raceId,
+            String bib,
+            Long finishTimeMs,
+            long now,
+            List<? extends SuspensionView> resumedSuspensions,
+            List<CheckpointTimingRow> runnerTimings) {
+        NetCalculator.NetRunnerResult net;
+        try {
+            net = NetCalculator.computeRunner(finishTimeMs, runnerTimings, resumedSuspensions);
+        } catch (NetTimeInvalidException ex) {
+            throw new UnprocessableEntityException(ex.getMessage());
+        }
+        repository.deleteCheckpointNetsForRunner(raceId, bib);
+        for (NetCalculator.NetCheckpoint cp : net.checkpoints()) {
+            repository.upsertCheckpointNet(new CheckpointTimingNetRow(
+                    raceId, bib, cp.checkpointCode(), cp.position(),
+                    cp.netElapsedMs(), cp.compensationMs(), now));
+        }
+        repository.upsertRunnerNet(new RunnerNetRow(
+                raceId, bib, net.netFinishTimeMs(), net.finishCompensationMs(), now));
     }
 
     private ServiceResult replayTimingOrConflict(
@@ -355,12 +421,20 @@ public class RaceServiceImpl implements RaceService {
                     if (race.status() == RaceStatus.SEALED) {
                         throw new ConflictException("赛事已封榜: " + raceId);
                     }
+                    if (race.status() == RaceStatus.SUSPENDED) {
+                        throw new ConflictException("赛事处于中止状态，须先恢复才能封榜: " + raceId);
+                    }
                     List<RunnerRow> runners = repository.findRunners(raceId);
                     List<PenaltyRow> penalties = repository.findPenalties(raceId);
                     List<CheckpointRow> checkpoints = repository.findCheckpoints(raceId);
                     List<CheckpointTimingRow> timings = repository.findAllTimings(raceId);
-                    List<ResultEntry> entries =
-                            ResultCalculator.compute(runners, penalties, checkpoints, timings);
+                    List<SuspensionEventRow> resumedSuspensions =
+                            repository.findResumedSuspensions(raceId);
+                    Map<String, NetCalculator.NetRunnerResult> netByBib =
+                            computeNetResults(runners, timings, resumedSuspensions);
+                    List<ResultEntry> entries = ResultCalculator.compute(
+                            runners, penalties, checkpoints, timings,
+                            netFinishMap(netByBib), finishCompensationMap(netByBib));
 
                     int newVersion = request.expectedVersion() + 1;
                     int updated = repository.sealIfOpenAtVersion(
@@ -378,18 +452,32 @@ public class RaceServiceImpl implements RaceService {
                                 entry.rank(),
                                 entry.status(),
                                 entry.finishTimeMs(),
+                                entry.netFinishTimeMs(),
                                 entry.penaltyMs(),
+                                entry.finishCompensationMs(),
                                 entry.totalTimeMs(),
                                 order,
                                 entry.checkpointCount(),
                                 entry.coveredCheckpointCount(),
                                 entry.missingCheckpoints()));
                     }
-                    // 在同一封榜事务内固化每名选手 × 每个检查点的明细，缺失行耗时为 null。
+                    // 在同一封榜事务内固化每名选手 × 每个检查点的原始/净明细，缺失行耗时为 null。
                     List<SnapshotCheckpointRow> snapshotCheckpoints =
-                            buildSnapshotCheckpoints(raceId, runners, checkpoints, timings);
-                    repository.insertSnapshot(new SnapshotRow(raceId, newVersion, now,
-                            snapshotEntries, snapshotCheckpoints));
+                            buildSnapshotCheckpoints(raceId, runners, checkpoints, timings, netByBib);
+                    // 冻结完整事件版本（封榜仅允许 OPEN，故事件均已恢复，但仍按登记原样固化）。
+                    List<SuspensionEventRow> allSuspensions = repository.findSuspensions(raceId);
+                    List<SnapshotSuspensionRow> frozenSuspensions = new ArrayList<>();
+                    for (int order = 0; order < allSuspensions.size(); order++) {
+                        SuspensionEventRow event = allSuspensions.get(order);
+                        frozenSuspensions.add(new SnapshotSuspensionRow(
+                                raceId, event.eventKey(), event.checkpointCode(),
+                                event.checkpointPosition(), event.startElapsedMs(),
+                                event.resumeElapsedMs(), event.durationMs(),
+                                event.status(), order));
+                    }
+                    repository.insertSnapshot(new SnapshotRow(
+                            raceId, newVersion, now, allSuspensions.size(),
+                            snapshotEntries, snapshotCheckpoints, frozenSuspensions));
                     return ServiceResult.ok(new StandingResponse(
                             raceId, newVersion, RaceStatus.SEALED, now,
                             snapshotEntries.stream().map(ResponseMapper::toEntryResponse).toList()));
@@ -407,12 +495,22 @@ public class RaceServiceImpl implements RaceService {
                             "赛事已封榜但缺少快照: " + raceId));
             return ResponseMapper.snapshotStanding(snapshot);
         }
+        List<RunnerRow> runners = repository.findRunners(raceId);
+        List<PenaltyRow> penalties = repository.findPenalties(raceId);
+        List<CheckpointRow> checkpoints = repository.findCheckpoints(raceId);
+        List<CheckpointTimingRow> timings = repository.findAllTimings(raceId);
+        List<SuspensionEventRow> resumedSuspensions =
+                repository.findResumedSuspensions(raceId);
+        Map<String, NetCalculator.NetRunnerResult> netByBib =
+                computeNetResults(runners, timings, resumedSuspensions);
         return ResponseMapper.liveStanding(
                 race,
-                repository.findRunners(raceId),
-                repository.findPenalties(raceId),
-                repository.findCheckpoints(raceId),
-                repository.findAllTimings(raceId));
+                runners,
+                penalties,
+                checkpoints,
+                timings,
+                netFinishMap(netByBib),
+                finishCompensationMap(netByBib));
     }
 
     @Override
@@ -430,8 +528,21 @@ public class RaceServiceImpl implements RaceService {
             return ResponseMapper.snapshotRunnerTiming(
                     snapshot, bib, runner.finishTimeMs(), checkpoints);
         }
+        List<CheckpointTimingRow> runnerTimings =
+                repository.findTimingsForRunner(raceId, bib);
+        List<SuspensionEventRow> resumedSuspensions =
+                repository.findResumedSuspensions(raceId);
+        NetCalculator.NetRunnerResult net = NetCalculator.computeRunner(
+                runner.finishTimeMs(), runnerTimings, resumedSuspensions);
+        Map<String, CheckpointTimingNetRow> netByCode = new TreeMap<>();
+        for (NetCalculator.NetCheckpoint cp : net.checkpoints()) {
+            netByCode.put(cp.checkpointCode(), new CheckpointTimingNetRow(
+                    raceId, bib, cp.checkpointCode(), cp.position(),
+                    cp.netElapsedMs(), cp.compensationMs(), clock.millis()));
+        }
         return ResponseMapper.runnerTiming(
-                race, runner, checkpoints, repository.findTimingsForRunner(raceId, bib));
+                race, runner, checkpoints, runnerTimings,
+                netByCode, net.netFinishTimeMs());
     }
 
     @Override
@@ -552,6 +663,9 @@ public class RaceServiceImpl implements RaceService {
                 .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
         if (race.status() == RaceStatus.SEALED) {
             throw new ConflictException("赛事已封榜，禁止写入: " + raceId);
+        }
+        if (race.status() == RaceStatus.SUSPENDED) {
+            throw new ConflictException("赛事处于中止状态，仅允许提交恢复: " + raceId);
         }
         if (race.version() != expectedVersion) {
             throw new ConflictException("版本冲突: expected=" + expectedVersion
@@ -674,25 +788,36 @@ public class RaceServiceImpl implements RaceService {
 
     /**
      * 构造封榜快照的全部分段明细：每名选手 × 每个检查点一行，
-     * 已有通过记录固化耗时与 timingId，缺失检查点对应字段为 null；顺序为参赛号、检查点顺序。
+     * 已有通过记录固化原始/净耗时、补偿与 timingId，缺失检查点对应字段为 null；
+     * 顺序为参赛号、检查点顺序。
      */
     private List<SnapshotCheckpointRow> buildSnapshotCheckpoints(
             String raceId,
             List<RunnerRow> runners,
             List<CheckpointRow> checkpoints,
-            List<CheckpointTimingRow> timings) {
+            List<CheckpointTimingRow> timings,
+            Map<String, NetCalculator.NetRunnerResult> netByBib) {
         Map<String, Map<String, CheckpointTimingRow>> byBibAndCode = new TreeMap<>();
         for (CheckpointTimingRow timing : timings) {
             byBibAndCode
                     .computeIfAbsent(timing.bib(), key -> new TreeMap<>())
                     .put(timing.checkpointCode(), timing);
         }
+        Map<String, Map<String, NetCalculator.NetCheckpoint>> netByBibAndCode = new TreeMap<>();
+        for (Map.Entry<String, NetCalculator.NetRunnerResult> entry : netByBib.entrySet()) {
+            Map<String, NetCalculator.NetCheckpoint> byCode = new TreeMap<>();
+            for (NetCalculator.NetCheckpoint cp : entry.getValue().checkpoints()) {
+                byCode.put(cp.checkpointCode(), cp);
+            }
+            netByBibAndCode.put(entry.getKey(), byCode);
+        }
         List<SnapshotCheckpointRow> rows = new ArrayList<>();
         // runners 已按参赛号字典序返回，保证无分段记录的选手也被完整固化为“全部缺失”。
         for (RunnerRow runner : runners) {
             appendSnapshotCheckpointRows(
                     rows, raceId, runner.bib(), checkpoints,
-                    byBibAndCode.getOrDefault(runner.bib(), Map.of()));
+                    byBibAndCode.getOrDefault(runner.bib(), Map.of()),
+                    netByBibAndCode.getOrDefault(runner.bib(), Map.of()));
         }
         return rows;
     }
@@ -702,19 +827,269 @@ public class RaceServiceImpl implements RaceService {
             String raceId,
             String bib,
             List<CheckpointRow> checkpoints,
-            Map<String, CheckpointTimingRow> timingByCode) {
+            Map<String, CheckpointTimingRow> timingByCode,
+            Map<String, NetCalculator.NetCheckpoint> netByCode) {
         for (CheckpointRow checkpoint : checkpoints) {
             CheckpointTimingRow timing = timingByCode.get(checkpoint.checkpointCode());
             if (timing == null) {
                 rows.add(new SnapshotCheckpointRow(
                         raceId, bib, checkpoint.checkpointCode(),
-                        checkpoint.position(), null, null));
+                        checkpoint.position(), null, null, 0L, null));
             } else {
+                NetCalculator.NetCheckpoint net = netByCode.get(checkpoint.checkpointCode());
+                long netElapsed = net == null ? timing.elapsedMillis() : net.netElapsedMs();
+                long compensation = net == null ? 0L : net.compensationMs();
                 rows.add(new SnapshotCheckpointRow(
                         raceId, bib, checkpoint.checkpointCode(),
-                        checkpoint.position(), timing.elapsedMillis(), timing.timingId()));
+                        checkpoint.position(), timing.elapsedMillis(), netElapsed,
+                        compensation, timing.timingId()));
             }
         }
+    }
+
+    // ==================== 中止恢复与净计时 ====================
+
+    /**
+     * 基于原始计时与全部已恢复事件计算每名选手的净结果（纯函数，不读不写净值表）。
+     * 净不变量被破坏时抛出 {@link NetTimeInvalidException}，由调用方映射为422。
+     */
+    private Map<String, NetCalculator.NetRunnerResult> computeNetResults(
+            List<RunnerRow> runners,
+            List<CheckpointTimingRow> timings,
+            List<? extends SuspensionView> resumedSuspensions) {
+        Map<String, List<CheckpointTimingRow>> timingsByBib = new TreeMap<>();
+        for (CheckpointTimingRow timing : timings) {
+            timingsByBib.computeIfAbsent(timing.bib(), key -> new ArrayList<>()).add(timing);
+        }
+        Map<String, NetCalculator.NetRunnerResult> result = new TreeMap<>();
+        for (RunnerRow runner : runners) {
+            result.put(runner.bib(), NetCalculator.computeRunner(
+                    runner.finishTimeMs(),
+                    timingsByBib.getOrDefault(runner.bib(), List.of()),
+                    resumedSuspensions));
+        }
+        return result;
+    }
+
+    private static Map<String, Long> netFinishMap(Map<String, NetCalculator.NetRunnerResult> netByBib) {
+        Map<String, Long> map = new TreeMap<>();
+        for (Map.Entry<String, NetCalculator.NetRunnerResult> entry : netByBib.entrySet()) {
+            map.put(entry.getKey(), entry.getValue().netFinishTimeMs());
+        }
+        return map;
+    }
+
+    private static Map<String, Long> finishCompensationMap(
+            Map<String, NetCalculator.NetRunnerResult> netByBib) {
+        Map<String, Long> map = new TreeMap<>();
+        for (Map.Entry<String, NetCalculator.NetRunnerResult> entry : netByBib.entrySet()) {
+            map.put(entry.getKey(), entry.getValue().finishCompensationMs());
+        }
+        return map;
+    }
+
+    /**
+     * 恢复成功后把净结果一致覆盖到净值表：先清空该选手旧净分段再写入，
+     * 保证“不能半重算”，并同步净完赛口径。
+     */
+    private void persistNetResults(
+            String raceId,
+            List<RunnerRow> runners,
+            Map<String, NetCalculator.NetRunnerResult> netByBib,
+            long now) {
+        for (RunnerRow runner : runners) {
+            String bib = runner.bib();
+            NetCalculator.NetRunnerResult net = netByBib.get(bib);
+            if (net == null) {
+                continue;
+            }
+            repository.deleteCheckpointNetsForRunner(raceId, bib);
+            for (NetCalculator.NetCheckpoint cp : net.checkpoints()) {
+                repository.upsertCheckpointNet(new CheckpointTimingNetRow(
+                        raceId, bib, cp.checkpointCode(), cp.position(),
+                        cp.netElapsedMs(), cp.compensationMs(), now));
+            }
+            repository.upsertRunnerNet(new RunnerNetRow(
+                    raceId, bib, net.netFinishTimeMs(), net.finishCompensationMs(), now));
+        }
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult suspendRace(String raceId, SuspendRaceRequest request) {
+        return withIdempotency(request.requestId(), "SUSPEND_RACE",
+                orderedParams(
+                        "raceId", raceId,
+                        "eventKey", request.eventKey(),
+                        "checkpointKey", request.checkpointKey(),
+                        "startElapsedMs", request.startElapsedMs(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    // 起始检查点必须存在；其顺序在登记时固化，后续配置不可变。
+                    CheckpointRow checkpoint = repository
+                            .findCheckpoint(raceId, request.checkpointKey())
+                            .orElseThrow(() -> new NotFoundException(
+                                    "受影响起始检查点不存在: " + request.checkpointKey()));
+                    if (repository.findSuspension(request.eventKey()).isPresent()) {
+                        throw new ConflictException("eventKey 已存在: " + request.eventKey());
+                    }
+                    // 多个中止事件须互不重叠：与任一已恢复事件的恢复时刻比较。
+                    long start = request.startElapsedMs();
+                    for (SuspensionEventRow past : repository.findResumedSuspensions(raceId)) {
+                        if (start < past.resumeElapsedMs()) {
+                            throw new UnprocessableEntityException(
+                                    "中止事件与既有中止区间重叠: eventKey=" + past.eventKey());
+                        }
+                    }
+                    int newVersion = request.expectedVersion() + 1;
+                    int updated = repository.suspendIfOpenAtVersion(
+                            raceId, request.expectedVersion(), newVersion);
+                    if (updated == 0) {
+                        throw new ConflictException("版本冲突或赛事当前不可中止");
+                    }
+                    long now = clock.millis();
+                    SuspensionEventRow row = new SuspensionEventRow(
+                            request.eventKey(), raceId, request.checkpointKey(),
+                            checkpoint.position(), start, null, null, "SUSPENDED",
+                            newVersion, null, now, null);
+                    try {
+                        repository.insertSuspension(row);
+                    } catch (DuplicateKeyException ex) {
+                        throw new ConflictException("eventKey 已存在: " + request.eventKey());
+                    }
+                    SuspensionEventRow saved =
+                            repository.findSuspension(request.eventKey()).orElseThrow();
+                    return ServiceResult.created(ResponseMapper.suspensionEvent(saved));
+                });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult resumeRace(String raceId, ResumeRaceRequest request) {
+        return withIdempotency(request.requestId(), "RESUME_RACE",
+                orderedParams(
+                        "raceId", raceId,
+                        "eventKey", request.eventKey(),
+                        "resumeElapsedMs", request.resumeElapsedMs(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    // 恢复走独立状态条件，不经过 requireOpenRace（当前应为 SUSPENDED）。
+                    RaceRow race = repository.findRaceForUpdate(raceId)
+                            .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+                    if (race.status() == RaceStatus.SEALED) {
+                        throw new ConflictException("赛事已封榜，禁止恢复: " + raceId);
+                    }
+                    SuspensionEventRow event = repository.findSuspension(request.eventKey())
+                            .orElseThrow(() -> new NotFoundException(
+                                    "中止事件不存在: " + request.eventKey()));
+                    if (!event.raceId().equals(raceId)) {
+                        throw new NotFoundException("中止事件不属于该赛事: " + request.eventKey());
+                    }
+                    if (event.resumed()) {
+                        throw new ConflictException("中止事件已恢复: " + request.eventKey());
+                    }
+                    long resume = request.resumeElapsedMs();
+                    if (resume <= event.startElapsedMs()) {
+                        throw new BadRequestException(
+                                "resumeElapsedMs 必须严格大于 startElapsedMs");
+                    }
+                    if (race.version() != request.expectedVersion()) {
+                        throw new ConflictException("版本冲突: expected="
+                                + request.expectedVersion() + ", actual=" + race.version());
+                    }
+                    // 不重叠：恢复时刻不得早于任一已恢复事件的恢复时刻（事件按时间排列）。
+                    for (SuspensionEventRow past : repository.findResumedSuspensions(raceId)) {
+                        if (resume < past.resumeElapsedMs()) {
+                            throw new UnprocessableEntityException(
+                                    "恢复事件与既有中止区间重叠: eventKey=" + past.eventKey());
+                        }
+                    }
+
+                    List<RunnerRow> runners = repository.findRunners(raceId);
+                    List<CheckpointTimingRow> timings = repository.findAllTimings(raceId);
+                    List<SuspensionEventRow> pastResumed =
+                            repository.findResumedSuspensions(raceId);
+
+                    // 落在本次窗口 [start,resume) 内的已存原始记录与“中止期间无计时”矛盾，
+                    // 恢复整体拒绝（422），事件不落库、状态不转回。
+                    long startElapsed = event.startElapsedMs();
+                    for (CheckpointTimingRow timing : timings) {
+                        if (timing.elapsedMillis() >= startElapsed
+                                && timing.elapsedMillis() < resume) {
+                            throw new UnprocessableEntityException(
+                                    "存在落在中止区间[start,resume)内的分段记录，禁止恢复: bib="
+                                            + timing.bib() + ", checkpoint="
+                                            + timing.checkpointCode());
+                        }
+                    }
+
+                    // 组装“含本次事件”的已恢复事件视图，先做一次全量净重算校验。
+                    long duration = resume - event.startElapsedMs();
+                    SuspensionEventRow candidate = new SuspensionEventRow(
+                            event.eventKey(), raceId, event.checkpointCode(),
+                            event.checkpointPosition(), event.startElapsedMs(),
+                            resume, duration, "RESUMED",
+                            event.versionAfterSuspend(), null, event.createdAt(), clock.millis());
+                    List<SuspensionView> withCandidate = new ArrayList<>(pastResumed);
+                    withCandidate.add(candidate);
+                    Map<String, NetCalculator.NetRunnerResult> netByBib;
+                    try {
+                        netByBib = computeNetResults(runners, timings, withCandidate);
+                    } catch (NetTimeInvalidException ex) {
+                        // 净不变量被破坏：422 且恢复事件不落库、状态不转回。
+                        throw new UnprocessableEntityException(ex.getMessage());
+                    }
+
+                    int newVersion = request.expectedVersion() + 1;
+                    int stateUpdated = repository.resumeIfSuspendedAtVersion(
+                            raceId, request.expectedVersion(), newVersion);
+                    if (stateUpdated == 0) {
+                        throw new ConflictException("版本冲突或赛事当前不处于中止状态");
+                    }
+                    long now = clock.millis();
+                    int eventUpdated = repository.markSuspensionResumed(
+                            request.eventKey(), resume, duration, newVersion, now);
+                    if (eventUpdated == 0) {
+                        throw new ConflictException("中止事件已被并发恢复: " + request.eventKey());
+                    }
+                    // 在同一事务内一致覆盖全部选手净分段、净完赛；异常则整体回滚不半重算。
+                    persistNetResults(raceId, runners, netByBib, now);
+
+                    SuspensionEventRow saved =
+                            repository.findSuspension(request.eventKey()).orElseThrow();
+                    return ServiceResult.ok(ResponseMapper.suspensionEvent(saved));
+                });
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public SuspensionHistoryResponse getSuspensionHistory(String raceId) {
+        RaceRow race = repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        return ResponseMapper.suspensionHistory(race, repository.findSuspensions(raceId));
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public CompensationResponse getCompensations(String raceId) {
+        RaceRow race = repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        List<RunnerRow> runners = repository.findRunners(raceId);
+        List<CheckpointRow> checkpoints = repository.findCheckpoints(raceId);
+        if (race.status() == RaceStatus.SEALED) {
+            SnapshotRow snapshot = repository.findSnapshot(raceId)
+                    .orElseThrow(() -> new IllegalStateException(
+                            "赛事已封榜但缺少快照: " + raceId));
+            return ResponseMapper.snapshotCompensation(snapshot, runners, checkpoints);
+        }
+        List<CheckpointTimingRow> timings = repository.findAllTimings(raceId);
+        // SUSPENDED 期间上一事件的净结果仍可只读展示：仅统计已恢复事件，与榜单口径一致。
+        List<SuspensionEventRow> resumed = repository.findResumedSuspensions(raceId);
+        Map<String, NetCalculator.NetRunnerResult> netByBib =
+                computeNetResults(runners, timings, resumed);
+        return ResponseMapper.compensation(
+                raceId, race.version(), runners, checkpoints, netByBib);
     }
 
     /** 判断唯一约束异常是否源自指定约束（H2 异常信息中的约束名可能为大写）。 */

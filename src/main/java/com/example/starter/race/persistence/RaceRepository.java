@@ -30,6 +30,13 @@ public class RaceRepository {
             new CheckpointTimingRowMapper();
     private static final SnapshotCheckpointRowMapper SNAPSHOT_CHECKPOINT_ROW_MAPPER =
             new SnapshotCheckpointRowMapper();
+    private static final SuspensionEventRowMapper SUSPENSION_EVENT_ROW_MAPPER =
+            new SuspensionEventRowMapper();
+    private static final RunnerNetRowMapper RUNNER_NET_ROW_MAPPER = new RunnerNetRowMapper();
+    private static final CheckpointTimingNetRowMapper CHECKPOINT_TIMING_NET_ROW_MAPPER =
+            new CheckpointTimingNetRowMapper();
+    private static final SnapshotSuspensionRowMapper SNAPSHOT_SUSPENSION_ROW_MAPPER =
+            new SnapshotSuspensionRowMapper();
 
     private final JdbcTemplate jdbcTemplate;
 
@@ -172,30 +179,38 @@ public class RaceRepository {
                 });
     }
 
-    /** 查询封榜快照（含全部条目与分段明细）；未封榜返回 empty。 */
+    /** 查询封榜快照（含全部条目、分段净值明细与冻结事件）；未封榜返回 empty。 */
     public Optional<SnapshotRow> findSnapshot(String raceId) {
         List<SnapshotRow> headers = jdbcTemplate.query(
-                "SELECT race_id, version, sealed_at FROM result_snapshot WHERE race_id = ?",
+                "SELECT race_id, version, event_version, sealed_at FROM result_snapshot WHERE race_id = ?",
                 (rs, rowNum) -> new SnapshotRow(
                         rs.getString("race_id"),
                         rs.getInt("version"),
                         rs.getLong("sealed_at"),
-                        List.of()),
+                        rs.getInt("event_version"),
+                        List.of(), List.of(), List.of()),
                 raceId);
         if (headers.isEmpty()) {
             return Optional.empty();
         }
         SnapshotRow header = headers.getFirst();
         List<SnapshotEntryRow> entryRows = jdbcTemplate.query(
-                "SELECT race_id, bib, rank_no, status, finish_time_ms, penalty_ms, total_time_ms, "
-                        + "display_order, checkpoint_count, covered_checkpoint_count "
+                "SELECT race_id, bib, rank_no, status, finish_time_ms, net_finish_time_ms, "
+                        + "penalty_ms, finish_compensation_ms, total_time_ms, display_order, "
+                        + "checkpoint_count, covered_checkpoint_count "
                         + "FROM result_snapshot_entry WHERE race_id = ? ORDER BY display_order",
                 SNAPSHOT_ENTRY_ROW_MAPPER, raceId);
         List<SnapshotCheckpointRow> checkpoints = jdbcTemplate.query(
-                "SELECT race_id, bib, checkpoint_code, position, elapsed_millis, timing_id "
+                "SELECT race_id, bib, checkpoint_code, position, elapsed_millis, net_elapsed_ms, "
+                        + "compensation_ms, timing_id "
                         + "FROM result_snapshot_checkpoint WHERE race_id = ? "
                         + "ORDER BY bib, position",
                 SNAPSHOT_CHECKPOINT_ROW_MAPPER, raceId);
+        List<SnapshotSuspensionRow> suspensions = jdbcTemplate.query(
+                "SELECT race_id, event_key, checkpoint_code, checkpoint_position, "
+                        + "start_elapsed_ms, resume_elapsed_ms, duration_ms, status, display_order "
+                        + "FROM result_snapshot_suspension WHERE race_id = ? ORDER BY display_order",
+                SNAPSHOT_SUSPENSION_ROW_MAPPER, raceId);
         // 缺失检查点由明细表中 elapsed_millis 为 NULL 的行派生，保持展示顺序稳定。
         java.util.Map<String, List<String>> missingByBib = new java.util.LinkedHashMap<>();
         for (SnapshotCheckpointRow detail : checkpoints) {
@@ -207,13 +222,14 @@ public class RaceRepository {
         List<SnapshotEntryRow> entries = entryRows.stream()
                 .map(entry -> new SnapshotEntryRow(
                         entry.raceId(), entry.bib(), entry.rank(), entry.status(),
-                        entry.finishTimeMs(), entry.penaltyMs(), entry.totalTimeMs(),
+                        entry.finishTimeMs(), entry.netFinishTimeMs(), entry.penaltyMs(),
+                        entry.finishCompensationMs(), entry.totalTimeMs(),
                         entry.displayOrder(), entry.checkpointCount(),
                         entry.coveredCheckpointCount(),
                         missingByBib.getOrDefault(entry.bib(), List.of())))
                 .toList();
         return Optional.of(new SnapshotRow(header.raceId(), header.version(), header.sealedAt(),
-                entries, checkpoints));
+                header.eventVersion(), entries, checkpoints, suspensions));
     }
 
     /** 新建赛事，初始版本1、状态OPEN。 */
@@ -284,16 +300,169 @@ public class RaceRepository {
                 newVersion, raceId, expectedVersion);
     }
 
-    /** 原子写入封榜快照头表、全部条目以及每名选手的分段明细。 */
+    /**
+     * 条件中止：仅当赛事为 OPEN 且版本等于 expectedVersion 时转为 SUSPENDED 并推进版本。
+     *
+     * @return 受影响行数；0 表示不存在、非 OPEN（已中止/已封榜）或版本不匹配
+     */
+    public int suspendIfOpenAtVersion(String raceId, int expectedVersion, int newVersion) {
+        return jdbcTemplate.update(
+                "UPDATE race SET version = ?, status = 'SUSPENDED' "
+                        + "WHERE race_id = ? AND version = ? AND status = 'OPEN'",
+                newVersion, raceId, expectedVersion);
+    }
+
+    /**
+     * 条件恢复：仅当赛事为 SUSPENDED 且版本等于 expectedVersion 时转回 OPEN 并推进版本。
+     *
+     * @return 受影响行数；0 表示不存在、非 SUSPENDED 或版本不匹配
+     */
+    public int resumeIfSuspendedAtVersion(String raceId, int expectedVersion, int newVersion) {
+        return jdbcTemplate.update(
+                "UPDATE race SET version = ?, status = 'OPEN' "
+                        + "WHERE race_id = ? AND version = ? AND status = 'SUSPENDED'",
+                newVersion, raceId, expectedVersion);
+    }
+
+    /** 新增中止事件登记行（赛事内 eventKey 唯一由约束保证）。 */
+    public void insertSuspension(SuspensionEventRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO suspension_event "
+                        + "(event_key, race_id, checkpoint_code, checkpoint_position, "
+                        + "start_elapsed_ms, resume_elapsed_ms, duration_ms, status, "
+                        + "version_after_suspend, version_after_resume, created_at, resumed_at) "
+                        + "VALUES (?, ?, ?, ?, ?, NULL, NULL, 'SUSPENDED', ?, NULL, ?, NULL)",
+                row.eventKey(), row.raceId(), row.checkpointCode(), row.checkpointPosition(),
+                row.startElapsedMs(), row.versionAfterSuspend(), row.createdAt());
+    }
+
+    /**
+     * 条件恢复事件：仅当该事件仍为 SUSPENDED 时写入恢复时刻、时长与恢复后版本。
+     *
+     * @return 受影响行数；0 表示事件不存在或已恢复
+     */
+    public int markSuspensionResumed(
+            String eventKey, long resumeElapsedMs, long durationMs,
+            int versionAfterResume, long now) {
+        return jdbcTemplate.update(
+                "UPDATE suspension_event SET resume_elapsed_ms = ?, duration_ms = ?, "
+                        + "status = 'RESUMED', version_after_resume = ?, resumed_at = ? "
+                        + "WHERE event_key = ? AND status = 'SUSPENDED'",
+                resumeElapsedMs, durationMs, versionAfterResume, now, eventKey);
+    }
+
+    /** 查询赛事下全部中止恢复事件（含中止中），按登记时间与事件键排列。 */
+    public List<SuspensionEventRow> findSuspensions(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT event_key, race_id, checkpoint_code, checkpoint_position, "
+                        + "start_elapsed_ms, resume_elapsed_ms, duration_ms, status, "
+                        + "version_after_suspend, version_after_resume, created_at, resumed_at "
+                        + "FROM suspension_event WHERE race_id = ? ORDER BY created_at, event_key",
+                SUSPENSION_EVENT_ROW_MAPPER, raceId);
+    }
+
+    /** 查询赛事下全部已恢复事件（参与净计时），按登记时间排列。 */
+    public List<SuspensionEventRow> findResumedSuspensions(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT event_key, race_id, checkpoint_code, checkpoint_position, "
+                        + "start_elapsed_ms, resume_elapsed_ms, duration_ms, status, "
+                        + "version_after_suspend, version_after_resume, created_at, resumed_at "
+                        + "FROM suspension_event WHERE race_id = ? AND status = 'RESUMED' "
+                        + "ORDER BY created_at, event_key",
+                SUSPENSION_EVENT_ROW_MAPPER, raceId);
+    }
+
+    /** 按事件键查询中止事件。 */
+    public Optional<SuspensionEventRow> findSuspension(String eventKey) {
+        return jdbcTemplate
+                .query("SELECT event_key, race_id, checkpoint_code, checkpoint_position, "
+                                + "start_elapsed_ms, resume_elapsed_ms, duration_ms, status, "
+                                + "version_after_suspend, version_after_resume, created_at, resumed_at "
+                                + "FROM suspension_event WHERE event_key = ?",
+                        SUSPENSION_EVENT_ROW_MAPPER, eventKey)
+                .stream()
+                .findFirst();
+    }
+
+    /** 查询赛事当前中止中（未恢复）的事件；正常至多一条。 */
+    public Optional<SuspensionEventRow> findActiveSuspension(String raceId) {
+        return jdbcTemplate
+                .query("SELECT event_key, race_id, checkpoint_code, checkpoint_position, "
+                                + "start_elapsed_ms, resume_elapsed_ms, duration_ms, status, "
+                                + "version_after_suspend, version_after_resume, created_at, resumed_at "
+                                + "FROM suspension_event WHERE race_id = ? AND status = 'SUSPENDED' "
+                                + "ORDER BY created_at, event_key",
+                        SUSPENSION_EVENT_ROW_MAPPER, raceId)
+                .stream()
+                .findFirst();
+    }
+
+    /** 覆盖写入某选手净完赛口径（恢复重算时先删后插）。 */
+    public void upsertRunnerNet(RunnerNetRow row) {
+        jdbcTemplate.update(
+                "MERGE INTO runner_net "
+                        + "(race_id, bib, net_finish_time_ms, finish_compensation_ms, updated_at) "
+                        + "KEY (race_id, bib) VALUES (?, ?, ?, ?, ?)",
+                row.raceId(), row.bib(), row.netFinishTimeMs(),
+                row.finishCompensationMs(), row.updatedAt());
+    }
+
+    /** 查询赛事下全部选手净完赛口径，按参赛号字典序排列。 */
+    public List<RunnerNetRow> findRunnerNets(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT race_id, bib, net_finish_time_ms, finish_compensation_ms, updated_at "
+                        + "FROM runner_net WHERE race_id = ? ORDER BY bib",
+                RUNNER_NET_ROW_MAPPER, raceId);
+    }
+
+    /** 覆盖写入某选手某检查点净分段（恢复重算时先删后插）。 */
+    public void upsertCheckpointNet(CheckpointTimingNetRow row) {
+        jdbcTemplate.update(
+                "MERGE INTO checkpoint_timing_net "
+                        + "(race_id, bib, checkpoint_code, position, net_elapsed_ms, "
+                        + "compensation_ms, updated_at) "
+                        + "KEY (race_id, bib, checkpoint_code) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                row.raceId(), row.bib(), row.checkpointCode(), row.position(),
+                row.netElapsedMs(), row.compensationMs(), row.updatedAt());
+    }
+
+    /** 删除某选手全部净分段（恢复重算前清空，确保已删除的原始分段不留净值）。 */
+    public void deleteCheckpointNetsForRunner(String raceId, String bib) {
+        jdbcTemplate.update(
+                "DELETE FROM checkpoint_timing_net WHERE race_id = ? AND bib = ?", raceId, bib);
+    }
+
+    /** 查询某选手全部净分段，按 position 升序。 */
+    public List<CheckpointTimingNetRow> findCheckpointNetsForRunner(String raceId, String bib) {
+        return jdbcTemplate.query(
+                "SELECT race_id, bib, checkpoint_code, position, net_elapsed_ms, "
+                        + "compensation_ms, updated_at FROM checkpoint_timing_net "
+                        + "WHERE race_id = ? AND bib = ? ORDER BY position",
+                CHECKPOINT_TIMING_NET_ROW_MAPPER, raceId, bib);
+    }
+
+    /** 查询赛事下全部净分段，按参赛号与 position 排列。 */
+    public List<CheckpointTimingNetRow> findAllCheckpointNets(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT race_id, bib, checkpoint_code, position, net_elapsed_ms, "
+                        + "compensation_ms, updated_at FROM checkpoint_timing_net "
+                        + "WHERE race_id = ? ORDER BY bib, position",
+                CHECKPOINT_TIMING_NET_ROW_MAPPER, raceId);
+    }
+
+    /** 原子写入封榜快照头表（含事件版本）、全部条目净值、分段净值明细与冻结事件。 */
     public void insertSnapshot(SnapshotRow snapshot) {
         jdbcTemplate.update(
-                "INSERT INTO result_snapshot (race_id, version, sealed_at) VALUES (?, ?, ?)",
-                snapshot.raceId(), snapshot.version(), snapshot.sealedAt());
+                "INSERT INTO result_snapshot (race_id, version, event_version, sealed_at) "
+                        + "VALUES (?, ?, ?, ?)",
+                snapshot.raceId(), snapshot.version(), snapshot.eventVersion(),
+                snapshot.sealedAt());
         jdbcTemplate.batchUpdate(
                 "INSERT INTO result_snapshot_entry "
-                        + "(race_id, bib, rank_no, status, finish_time_ms, penalty_ms, total_time_ms, "
-                        + "display_order, checkpoint_count, covered_checkpoint_count) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        + "(race_id, bib, rank_no, status, finish_time_ms, net_finish_time_ms, "
+                        + "penalty_ms, finish_compensation_ms, total_time_ms, display_order, "
+                        + "checkpoint_count, covered_checkpoint_count) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 snapshot.entries(),
                 snapshot.entries().size(),
                 (ps, entry) -> {
@@ -302,16 +471,19 @@ public class RaceRepository {
                     ps.setObject(3, entry.rank());
                     ps.setString(4, entry.status().name());
                     ps.setObject(5, entry.finishTimeMs());
-                    ps.setLong(6, entry.penaltyMs());
-                    ps.setObject(7, entry.totalTimeMs());
-                    ps.setInt(8, entry.displayOrder());
-                    ps.setInt(9, entry.checkpointCount());
-                    ps.setInt(10, entry.coveredCheckpointCount());
+                    ps.setObject(6, entry.netFinishTimeMs());
+                    ps.setLong(7, entry.penaltyMs());
+                    ps.setLong(8, entry.finishCompensationMs());
+                    ps.setObject(9, entry.totalTimeMs());
+                    ps.setInt(10, entry.displayOrder());
+                    ps.setInt(11, entry.checkpointCount());
+                    ps.setInt(12, entry.coveredCheckpointCount());
                 });
         jdbcTemplate.batchUpdate(
                 "INSERT INTO result_snapshot_checkpoint "
-                        + "(race_id, bib, checkpoint_code, position, elapsed_millis, timing_id) "
-                        + "VALUES (?, ?, ?, ?, ?, ?)",
+                        + "(race_id, bib, checkpoint_code, position, elapsed_millis, "
+                        + "net_elapsed_ms, compensation_ms, timing_id) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 snapshot.checkpoints(),
                 snapshot.checkpoints().size(),
                 (ps, detail) -> {
@@ -320,8 +492,30 @@ public class RaceRepository {
                     ps.setString(3, detail.checkpointCode());
                     ps.setInt(4, detail.position());
                     ps.setObject(5, detail.elapsedMillis());
-                    ps.setString(6, detail.timingId());
+                    ps.setObject(6, detail.netElapsedMs());
+                    ps.setLong(7, detail.compensationMs());
+                    ps.setString(8, detail.timingId());
                 });
+        if (!snapshot.suspensions().isEmpty()) {
+            jdbcTemplate.batchUpdate(
+                    "INSERT INTO result_snapshot_suspension "
+                            + "(race_id, event_key, checkpoint_code, checkpoint_position, "
+                            + "start_elapsed_ms, resume_elapsed_ms, duration_ms, status, display_order) "
+                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    snapshot.suspensions(),
+                    snapshot.suspensions().size(),
+                    (ps, event) -> {
+                        ps.setString(1, event.raceId());
+                        ps.setString(2, event.eventKey());
+                        ps.setString(3, event.checkpointCode());
+                        ps.setInt(4, event.checkpointPosition());
+                        ps.setLong(5, event.startElapsedMs());
+                        ps.setObject(6, event.resumeElapsedMs());
+                        ps.setObject(7, event.durationMs());
+                        ps.setString(8, event.status());
+                        ps.setInt(9, event.displayOrder());
+                    });
+        }
     }
 
     /** 按请求ID查询幂等记录。 */
@@ -370,12 +564,16 @@ public class RaceRepository {
 
     /** 测试辅助：清空全部业务数据，按外键依赖顺序删除。 */
     public void deleteAllForTesting() {
+        jdbcTemplate.update("DELETE FROM result_snapshot_suspension");
         jdbcTemplate.update("DELETE FROM result_snapshot_checkpoint");
         jdbcTemplate.update("DELETE FROM result_snapshot_entry");
         jdbcTemplate.update("DELETE FROM result_snapshot");
         jdbcTemplate.update("DELETE FROM idempotency_record");
+        jdbcTemplate.update("DELETE FROM checkpoint_timing_net");
+        jdbcTemplate.update("DELETE FROM runner_net");
         jdbcTemplate.update("DELETE FROM checkpoint_timing");
         jdbcTemplate.update("DELETE FROM checkpoint");
+        jdbcTemplate.update("DELETE FROM suspension_event");
         jdbcTemplate.update("DELETE FROM penalty");
         jdbcTemplate.update("DELETE FROM runner");
         jdbcTemplate.update("DELETE FROM race");
@@ -430,7 +628,9 @@ public class RaceRepository {
                     (Integer) rs.getObject("rank_no"),
                     EntryStatus.valueOf(rs.getString("status")),
                     (Long) rs.getObject("finish_time_ms"),
+                    (Long) rs.getObject("net_finish_time_ms"),
                     rs.getLong("penalty_ms"),
+                    rs.getLong("finish_compensation_ms"),
                     (Long) rs.getObject("total_time_ms"),
                     rs.getInt("display_order"),
                     rs.getInt("checkpoint_count"),
@@ -474,7 +674,72 @@ public class RaceRepository {
                     rs.getString("checkpoint_code"),
                     rs.getInt("position"),
                     (Long) rs.getObject("elapsed_millis"),
+                    (Long) rs.getObject("net_elapsed_ms"),
+                    rs.getLong("compensation_ms"),
                     rs.getString("timing_id"));
+        }
+    }
+
+    private static final class SuspensionEventRowMapper implements RowMapper<SuspensionEventRow> {
+        @Override
+        public SuspensionEventRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new SuspensionEventRow(
+                    rs.getString("event_key"),
+                    rs.getString("race_id"),
+                    rs.getString("checkpoint_code"),
+                    rs.getInt("checkpoint_position"),
+                    rs.getLong("start_elapsed_ms"),
+                    (Long) rs.getObject("resume_elapsed_ms"),
+                    (Long) rs.getObject("duration_ms"),
+                    rs.getString("status"),
+                    rs.getInt("version_after_suspend"),
+                    (Integer) rs.getObject("version_after_resume"),
+                    rs.getLong("created_at"),
+                    (Long) rs.getObject("resumed_at"));
+        }
+    }
+
+    private static final class RunnerNetRowMapper implements RowMapper<RunnerNetRow> {
+        @Override
+        public RunnerNetRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new RunnerNetRow(
+                    rs.getString("race_id"),
+                    rs.getString("bib"),
+                    (Long) rs.getObject("net_finish_time_ms"),
+                    rs.getLong("finish_compensation_ms"),
+                    rs.getLong("updated_at"));
+        }
+    }
+
+    private static final class CheckpointTimingNetRowMapper
+            implements RowMapper<CheckpointTimingNetRow> {
+        @Override
+        public CheckpointTimingNetRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new CheckpointTimingNetRow(
+                    rs.getString("race_id"),
+                    rs.getString("bib"),
+                    rs.getString("checkpoint_code"),
+                    rs.getInt("position"),
+                    rs.getLong("net_elapsed_ms"),
+                    rs.getLong("compensation_ms"),
+                    rs.getLong("updated_at"));
+        }
+    }
+
+    private static final class SnapshotSuspensionRowMapper
+            implements RowMapper<SnapshotSuspensionRow> {
+        @Override
+        public SnapshotSuspensionRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new SnapshotSuspensionRow(
+                    rs.getString("race_id"),
+                    rs.getString("event_key"),
+                    rs.getString("checkpoint_code"),
+                    rs.getInt("checkpoint_position"),
+                    rs.getLong("start_elapsed_ms"),
+                    (Long) rs.getObject("resume_elapsed_ms"),
+                    (Long) rs.getObject("duration_ms"),
+                    rs.getString("status"),
+                    rs.getInt("display_order"));
         }
     }
 
