@@ -403,7 +403,7 @@ public class EvidenceService {
 
     private EvidenceView toView(Evidence evidence) {
         return new EvidenceView(evidence.evidenceKey(), evidence.caseKey(), evidence.category(),
-                evidence.sealNo(), evidence.custodianId(), evidence.status(),
+                evidence.sealNo(), evidence.custodianId(), evidence.status(), evidence.version(),
                 evidence.createdAt(), evidence.updatedAt());
     }
 
