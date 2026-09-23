@@ -68,7 +68,21 @@ public class WriteExecutor {
                 }
                 return new WriteResult(log.responseStatus(), log.responseBody());
             }
-            WriteResult result = action.get();
+            WriteResult result;
+            try {
+                result = action.get();
+            } catch (ApiException ex) {
+                // 业务动作可能在文档行锁上排队后，因先提交的同键写操作而失败（如期望版本不符）；
+                // 若同 requestId 的成功记录此刻已提交，则为重放而非冲突，回滚本事务后重放原结果。
+                Optional<RequestLogRow> concurrent = repository.findRequestLog(requestId);
+                if (concurrent.isPresent()) {
+                    if (concurrent.get().requestHash().equals(requestHash)) {
+                        throw new WriteResult.ReplaySignal(requestId, ex);
+                    }
+                    throw ApiException.conflict("requestId 已使用且请求参数不同: " + requestId);
+                }
+                throw ex;
+            }
             try {
                 repository.insertRequestLog(requestId, requestHash, result.status(), result.body());
             } catch (DuplicateKeyException e) {

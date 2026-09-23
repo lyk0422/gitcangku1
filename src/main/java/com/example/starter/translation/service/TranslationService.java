@@ -48,8 +48,9 @@ public class TranslationService {
             throw ApiException.unprocessable("初始段落 segmentId 重复");
         }
         long documentId = repository.insertDocument(languages);
+        int position = 1;
         for (ApiDtos.SegmentInput segment : segments) {
-            repository.insertSegment(documentId, segment.segmentId(), segment.sourceText());
+            repository.insertSegment(documentId, segment.segmentId(), segment.sourceText(), position++);
         }
         return new ApiDtos.DocumentResponse(documentId, 1, 0, languages);
     }
@@ -58,10 +59,11 @@ public class TranslationService {
     @Transactional
     public ApiDtos.SegmentResponse addSegment(long documentId, ApiDtos.AddSegmentRequest request) {
         DocumentRow document = lockDocument(documentId);
-        if (repository.findSegment(documentId, request.segmentId()).isPresent()) {
+        if (repository.findAnySegment(documentId, request.segmentId()).isPresent()) {
             throw ApiException.conflict("段落已存在: " + request.segmentId());
         }
-        repository.insertSegment(documentId, request.segmentId(), request.sourceText());
+        int position = repository.listSegments(documentId).size() + 1;
+        repository.insertSegment(documentId, request.segmentId(), request.sourceText(), position);
         int draftVersion = bumpDraftVersion(document);
         return new ApiDtos.SegmentResponse(documentId, request.segmentId(), 1, draftVersion);
     }
@@ -163,13 +165,18 @@ public class TranslationService {
             }
             rules.add(new TermRuleRow(input.sourceTerm(), language, input.requiredTranslation()));
         }
-        int termVersion = document.termVersion() + 1;
+        int termVersion = repository.advanceTermVersionIfMatches(documentId, request.expectedTermVersion());
+        if (termVersion < 0) {
+            throw ApiException.conflict("术语版本冲突：术语版本已被并发更新，与期望的 "
+                    + request.expectedTermVersion() + " 不一致");
+        }
         repository.insertTermVersion(documentId, termVersion);
         for (TermRuleRow rule : rules) {
             repository.insertTermRule(documentId, termVersion, rule);
         }
-        repository.updateTermVersion(documentId, termVersion);
-        int draftVersion = bumpDraftVersion(document);
+        int draftVersion = repository.findDocument(documentId)
+                .orElseThrow(() -> ApiException.notFound("文档不存在: " + documentId))
+                .draftVersion();
         return new ApiDtos.TermVersionResponse(documentId, termVersion, rules.size(), draftVersion);
     }
 
@@ -229,10 +236,14 @@ public class TranslationService {
         if (!termViolations.isEmpty()) {
             throw ApiException.termViolation("译文违反 " + termViolations.size() + " 条术语规则", termViolations);
         }
-        int publishedVersion = document.publishedVersion() + 1;
+        int publishedVersion = repository.advancePublishedVersionIfMatches(documentId,
+                request.expectedDraftVersion(), request.expectedPublishedVersion());
+        if (publishedVersion < 0) {
+            throw ApiException.conflict("版本冲突：草稿或发布版本已被并发修改，与期望的 "
+                    + request.expectedDraftVersion() + "/" + request.expectedPublishedVersion() + " 不一致");
+        }
         repository.insertSnapshot(documentId, publishedVersion,
                 buildSnapshotJson(document, publishedVersion, segments, translations, approvals, termRules));
-        repository.updatePublishedVersion(documentId, publishedVersion);
         return new ApiDtos.PublishResponse(documentId, publishedVersion);
     }
 
@@ -302,9 +313,7 @@ public class TranslationService {
     }
 
     private int bumpDraftVersion(DocumentRow document) {
-        int draftVersion = document.draftVersion() + 1;
-        repository.updateDraftVersion(document.documentId(), draftVersion);
-        return draftVersion;
+        return repository.incrementDraftVersion(document.documentId());
     }
 
     private static String key(String segmentId, String language) {

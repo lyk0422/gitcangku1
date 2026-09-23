@@ -2,9 +2,13 @@ package com.example.starter.translation.repo;
 
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
+import com.example.starter.translation.domain.Rows.ReferenceCandidateRow;
 import com.example.starter.translation.domain.Rows.RequestLogRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
+import com.example.starter.translation.domain.Rows.SourceLineageRow;
+import com.example.starter.translation.domain.Rows.StructureChangeRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
+import com.example.starter.translation.domain.Rows.TranslationLineageRow;
 import com.example.starter.translation.domain.Rows.TranslationRow;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
@@ -32,7 +36,8 @@ public class TranslationRepository {
             rs.getInt("term_version"));
 
     private static final RowMapper<SegmentRow> SEGMENT_MAPPER = (rs, n) -> new SegmentRow(
-            rs.getString("segment_id"), rs.getString("source_text"), rs.getInt("source_version"));
+            rs.getString("segment_id"), rs.getString("source_text"), rs.getInt("source_version"),
+            rs.getString("status"), rs.getInt("position"));
 
     private static final RowMapper<TranslationRow> TRANSLATION_MAPPER = (rs, n) -> new TranslationRow(
             rs.getString("segment_id"), rs.getString("language"), rs.getString("content"),
@@ -88,36 +93,136 @@ public class TranslationRepository {
         return rows.stream().findFirst();
     }
 
-    public void updateDraftVersion(long documentId, int draftVersion) {
-        jdbc.update("UPDATE document SET draft_version = ? WHERE document_id = ?", draftVersion, documentId);
+    /**
+     * 原子自增草稿版本并返回新版本：UPDATE 在行写锁上按最新已提交值求值，
+     * 避免长事务在 FOR UPDATE 排队后基于过期快照自增造成丢失更新。
+     */
+    public int incrementDraftVersion(long documentId) {
+        int updated = jdbc.update(
+                "UPDATE document SET draft_version = draft_version + 1 WHERE document_id = ?", documentId);
+        if (updated == 0) {
+            throw new IllegalStateException("文档不存在: " + documentId);
+        }
+        Integer draftVersion = jdbc.queryForObject(
+                "SELECT draft_version FROM document WHERE document_id = ?", Integer.class, documentId);
+        if (draftVersion == null) {
+            throw new IllegalStateException("文档不存在: " + documentId);
+        }
+        return draftVersion;
     }
 
-    public void updatePublishedVersion(long documentId, int publishedVersion) {
-        jdbc.update("UPDATE document SET published_version = ? WHERE document_id = ?", publishedVersion, documentId);
+    /**
+     * 结构修订提交闸门：仅当草稿版本与术语版本仍与提交期望一致时才原子自增草稿版本。
+     * 并发的源文/译文/术语更新或发布会使条件失配，返回 0 由调用方转 409 整体回滚。
+     */
+    public int incrementDraftVersionIfMatches(long documentId, int expectedDraftVersion, int expectedTermVersion) {
+        return jdbc.update(
+                "UPDATE document SET draft_version = draft_version + 1 "
+                        + "WHERE document_id = ? AND draft_version = ? AND term_version = ?",
+                documentId, expectedDraftVersion, expectedTermVersion);
     }
 
-    public void updateTermVersion(long documentId, int termVersion) {
-        jdbc.update("UPDATE document SET term_version = ? WHERE document_id = ?", termVersion, documentId);
+    /**
+     * 术语版本提交闸门：仅当当前术语版本仍等于期望版本时，原子地把术语版本与草稿版本各加一，
+     * 返回新术语版本；并发术语更新会使条件失配，返回 -1 由调用方转 409。
+     */
+    public int advanceTermVersionIfMatches(long documentId, int expectedTermVersion) {
+        int updated = jdbc.update(
+                "UPDATE document SET term_version = term_version + 1, draft_version = draft_version + 1 "
+                        + "WHERE document_id = ? AND term_version = ?",
+                documentId, expectedTermVersion);
+        if (updated == 0) {
+            return -1;
+        }
+        Integer termVersion = jdbc.queryForObject(
+                "SELECT term_version FROM document WHERE document_id = ?", Integer.class, documentId);
+        if (termVersion == null) {
+            throw new IllegalStateException("文档不存在: " + documentId);
+        }
+        return termVersion;
     }
 
-    public void insertSegment(long documentId, String segmentId, String sourceText) {
-        jdbc.update("INSERT INTO segment (document_id, segment_id, source_text, source_version) VALUES (?, ?, ?, 1)",
-                documentId, segmentId, sourceText);
+    /**
+     * 发布提交闸门：仅当草稿版本与发布版本仍等于期望版本时才原子自增发布版本，
+     * 返回新发布版本；并发的结构修订或源文/译文更新会改变草稿版本，返回 -1 由调用方转 409。
+     */
+    public int advancePublishedVersionIfMatches(long documentId, int expectedDraftVersion,
+                                                int expectedPublishedVersion) {
+        int updated = jdbc.update(
+                "UPDATE document SET published_version = published_version + 1 "
+                        + "WHERE document_id = ? AND draft_version = ? AND published_version = ?",
+                documentId, expectedDraftVersion, expectedPublishedVersion);
+        if (updated == 0) {
+            return -1;
+        }
+        Integer publishedVersion = jdbc.queryForObject(
+                "SELECT published_version FROM document WHERE document_id = ?", Integer.class, documentId);
+        if (publishedVersion == null) {
+            throw new IllegalStateException("文档不存在: " + documentId);
+        }
+        return publishedVersion;
     }
 
-    public Optional<SegmentRow> findSegment(long documentId, String segmentId) {
+    /** 插入当前段落：源文版本 1，status 由调用方指定位置（追加在当前结构末尾）。 */
+    public void insertSegment(long documentId, String segmentId, String sourceText, int position) {
+        jdbc.update("INSERT INTO segment (document_id, segment_id, source_text, source_version, status, position) "
+                + "VALUES (?, ?, ?, 1, 'CURRENT', ?)",
+                documentId, segmentId, sourceText, position);
+    }
+
+    /** 插入结构修订产生的新段：源文版本 1，状态 CURRENT。 */
+    public void insertNewSegment(long documentId, String segmentId, String sourceText, int position) {
+        jdbc.update("INSERT INTO segment (document_id, segment_id, source_text, source_version, status, position) "
+                + "VALUES (?, ?, ?, 1, 'CURRENT', ?)",
+                documentId, segmentId, sourceText, position);
+    }
+
+    /** 判断段落键是否在任意文档中已存在（含已淘汰段），用于结构修订新段键的全局唯一校验。 */
+    public boolean segmentKeyExistsGlobally(String segmentId) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM segment WHERE segment_id = ?", Integer.class, segmentId);
+        return count != null && count > 0;
+    }
+
+    /** 查询任意状态段落（含 SUPERSEDED），结构修订血缘校验需要读取旧段。 */
+    public Optional<SegmentRow> findAnySegment(long documentId, String segmentId) {
         List<SegmentRow> rows = jdbc.query(
-                "SELECT segment_id, source_text, source_version FROM segment "
+                "SELECT segment_id, source_text, source_version, status, position FROM segment "
                         + "WHERE document_id = ? AND segment_id = ?",
                 SEGMENT_MAPPER, documentId, segmentId);
         return rows.stream().findFirst();
     }
 
+    public Optional<SegmentRow> findSegment(long documentId, String segmentId) {
+        return findAnySegment(documentId, segmentId).filter(SegmentRow::current);
+    }
+
+    /** 列出当前有效段落，按结构顺序排列。 */
     public List<SegmentRow> listSegments(long documentId) {
         return jdbc.query(
-                "SELECT segment_id, source_text, source_version FROM segment "
-                        + "WHERE document_id = ? ORDER BY segment_id",
+                "SELECT segment_id, source_text, source_version, status, position FROM segment "
+                        + "WHERE document_id = ? AND status = 'CURRENT' ORDER BY position",
                 SEGMENT_MAPPER, documentId);
+    }
+
+    /** 列出全部段落（含 SUPERSEDED），按位置与键排序，用于结构查询。 */
+    public List<SegmentRow> listAllSegments(long documentId) {
+        return jdbc.query(
+                "SELECT segment_id, source_text, source_version, status, position FROM segment "
+                        + "WHERE document_id = ? ORDER BY position, segment_id",
+                SEGMENT_MAPPER, documentId);
+    }
+
+    /** 旧段标记为 SUPERSEDED，保留淘汰时位置序号，不再参与当前结构。 */
+    public void markSegmentSuperseded(long documentId, String segmentId) {
+        jdbc.update("UPDATE segment SET status = 'SUPERSEDED' WHERE document_id = ? AND segment_id = ?",
+                documentId, segmentId);
+    }
+
+    /** 更新当前段位置，结构修订后重排当前结构。 */
+    public void updateSegmentPosition(long documentId, String segmentId, int position) {
+        jdbc.update("UPDATE segment SET position = ? WHERE document_id = ? AND segment_id = ?",
+                position, documentId, segmentId);
     }
 
     public void updateSegmentSource(long documentId, String segmentId, String sourceText, int sourceVersion) {
@@ -241,4 +346,105 @@ public class TranslationRepository {
         jdbc.update("INSERT INTO request_log (request_id, request_hash, response_status, response_body) "
                 + "VALUES (?, ?, ?, ?)", requestId, requestHash, responseStatus, responseBody);
     }
+
+    /** 插入结构修订事务记录（changeKey 文档内唯一，重复由主键约束兜底抛 409）。 */
+    public void insertStructureChange(long documentId, StructureChangeRow row) {
+        jdbc.update("INSERT INTO structure_change (document_id, change_key, change_type, draft_version) "
+                        + "VALUES (?, ?, ?, ?)",
+                documentId, row.changeKey(), row.changeType(), row.draftVersion());
+    }
+
+    public Optional<StructureChangeRow> findStructureChange(long documentId, String changeKey) {
+        List<StructureChangeRow> rows = jdbc.query(
+                "SELECT change_key, change_type, draft_version FROM structure_change "
+                        + "WHERE document_id = ? AND change_key = ?",
+                (rs, n) -> new StructureChangeRow(rs.getString(1), rs.getString(2), rs.getInt(3)),
+                documentId, changeKey);
+        return rows.stream().findFirst();
+    }
+
+    /** 插入一条源段血缘。 */
+    public void insertSourceLineage(long documentId, SourceLineageRow row) {
+        jdbc.update("INSERT INTO source_lineage (document_id, new_segment_id, old_segment_id, ordinal) "
+                        + "VALUES (?, ?, ?, ?)",
+                documentId, row.newSegmentId(), row.oldSegmentId(), row.ordinal());
+    }
+
+    /** 查询新段的源段血缘，按顺序排列；跨语言血缘查询用于沿链向上追溯。 */
+    public List<SourceLineageRow> listSourceLineageByNew(long documentId, String newSegmentId) {
+        return jdbc.query(
+                "SELECT new_segment_id, old_segment_id, ordinal FROM source_lineage "
+                        + "WHERE document_id = ? AND new_segment_id = ? ORDER BY ordinal",
+                SOURCE_LINEAGE_MAPPER, documentId, newSegmentId);
+    }
+
+    /** 查询旧段被哪些新段继承（双向血缘的反向边），按新段与顺序排列。 */
+    public List<SourceLineageRow> listSourceLineageByOld(long documentId, String oldSegmentId) {
+        return jdbc.query(
+                "SELECT new_segment_id, old_segment_id, ordinal FROM source_lineage "
+                        + "WHERE document_id = ? AND old_segment_id = ? ORDER BY new_segment_id, ordinal",
+                SOURCE_LINEAGE_MAPPER, documentId, oldSegmentId);
+    }
+
+    /** 插入一条跨语言译文血缘。 */
+    public void insertTranslationLineage(long documentId, TranslationLineageRow row) {
+        jdbc.update("INSERT INTO translation_lineage (document_id, new_segment_id, language, old_segment_id, ordinal) "
+                        + "VALUES (?, ?, ?, ?, ?)",
+                documentId, row.newSegmentId(), row.language(), row.oldSegmentId(), row.ordinal());
+    }
+
+    /** 查询某语言下新段的有序旧译文片段来源。 */
+    public List<TranslationLineageRow> listTranslationLineage(long documentId, String newSegmentId,
+                                                              String language) {
+        return jdbc.query(
+                "SELECT new_segment_id, language, old_segment_id, ordinal FROM translation_lineage "
+                        + "WHERE document_id = ? AND new_segment_id = ? AND language = ? ORDER BY ordinal",
+                TRANSLATION_LINEAGE_MAPPER, documentId, newSegmentId, language);
+    }
+
+    /** 查询某语言下引用了指定旧段译文的全部新段（反向边）。 */
+    public List<TranslationLineageRow> listTranslationLineageByOld(long documentId, String oldSegmentId,
+                                                                   String language) {
+        return jdbc.query(
+                "SELECT new_segment_id, language, old_segment_id, ordinal FROM translation_lineage "
+                        + "WHERE document_id = ? AND old_segment_id = ? AND language = ? "
+                        + "ORDER BY new_segment_id, ordinal",
+                TRANSLATION_LINEAGE_MAPPER, documentId, oldSegmentId, language);
+    }
+
+    /** 插入 REFERENCE 候选（按新段+语言唯一）。 */
+    public void insertReferenceCandidate(long documentId, ReferenceCandidateRow row) {
+        jdbc.update("INSERT INTO reference_candidate (document_id, segment_id, language, content, fragment_boundaries) "
+                        + "VALUES (?, ?, ?, ?, ?)",
+                documentId, row.segmentId(), row.language(), row.content(), row.fragmentBoundaries());
+    }
+
+    /** 查询新段某语言的 REFERENCE 候选。 */
+    public Optional<ReferenceCandidateRow> findReferenceCandidate(long documentId, String segmentId,
+                                                                  String language) {
+        List<ReferenceCandidateRow> rows = jdbc.query(
+                "SELECT segment_id, language, content, fragment_boundaries FROM reference_candidate "
+                        + "WHERE document_id = ? AND segment_id = ? AND language = ?",
+                REFERENCE_CANDIDATE_MAPPER, documentId, segmentId, language);
+        return rows.stream().findFirst();
+    }
+
+    /** 列出文档全部 REFERENCE 候选，按段与语言排序。 */
+    public List<ReferenceCandidateRow> listReferenceCandidates(long documentId) {
+        return jdbc.query(
+                "SELECT segment_id, language, content, fragment_boundaries FROM reference_candidate "
+                        + "WHERE document_id = ? ORDER BY segment_id, language",
+                REFERENCE_CANDIDATE_MAPPER, documentId);
+    }
+
+    private static final RowMapper<SourceLineageRow> SOURCE_LINEAGE_MAPPER = (rs, n) -> new SourceLineageRow(
+            rs.getString("new_segment_id"), rs.getString("old_segment_id"), rs.getInt("ordinal"));
+
+    private static final RowMapper<TranslationLineageRow> TRANSLATION_LINEAGE_MAPPER = (rs, n) ->
+            new TranslationLineageRow(rs.getString("new_segment_id"), rs.getString("language"),
+                    rs.getString("old_segment_id"), rs.getInt("ordinal"));
+
+    private static final RowMapper<ReferenceCandidateRow> REFERENCE_CANDIDATE_MAPPER = (rs, n) ->
+            new ReferenceCandidateRow(rs.getString("segment_id"), rs.getString("language"),
+                    rs.getString("content"), rs.getString("fragment_boundaries"));
 }

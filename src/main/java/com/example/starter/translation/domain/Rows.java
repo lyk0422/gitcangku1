@@ -24,13 +24,65 @@ public final class Rows {
     }
 
     /**
-     * 段落：文档内唯一 segmentId，含源文及源文版本。
+     * 段落：文档内唯一 segmentId，含源文、源文版本、状态与当前顺序。
      *
      * @param segmentId     文档内唯一段落 ID
      * @param sourceText    源文正文，UTF-8
      * @param sourceVersion 源文版本，从 1 开始，每次源文修订加一
+     * @param status        段落状态：CURRENT 当前有效；SUPERSEDED 已被结构修订取代
+     * @param position      当前顺序，从 1 开始按文档当前结构连续编号
      */
-    public record SegmentRow(String segmentId, String sourceText, int sourceVersion) {
+    public record SegmentRow(String segmentId, String sourceText, int sourceVersion,
+                             String status, int position) {
+
+        /** 是否为当前有效段落。 */
+        public boolean current() {
+            return "CURRENT".equals(status);
+        }
+    }
+
+    /**
+     * 结构修订事务：changeKey 文档内唯一，记录拆分/合并类型与原子生成的新草稿版本。
+     *
+     * @param changeKey    结构修订事务键
+     * @param changeType   SPLIT 拆分或 MERGE 合并
+     * @param draftVersion 成功后原子生成的文档草稿版本
+     */
+    public record StructureChangeRow(String changeKey, String changeType, int draftVersion) {
+    }
+
+    /**
+     * 源段血缘：新段到旧段的一条有序来源。
+     *
+     * @param newSegmentId 结构修订产生的新段 ID
+     * @param oldSegmentId 被取代的旧段 ID
+     * @param ordinal      来源顺序，从 1 开始
+     */
+    public record SourceLineageRow(String newSegmentId, String oldSegmentId, int ordinal) {
+    }
+
+    /**
+     * 跨语言译文血缘：某语言下新段到旧译文片段的一条有序来源。
+     *
+     * @param newSegmentId 新段 ID
+     * @param language     目标语言码，小写
+     * @param oldSegmentId 旧译文所属旧段 ID
+     * @param ordinal      片段拼接顺序，从 1 开始
+     */
+    public record TranslationLineageRow(String newSegmentId, String language,
+                                        String oldSegmentId, int ordinal) {
+    }
+
+    /**
+     * REFERENCE 候选：结构修订后按血缘有序拼接的旧译文与片段边界。
+     *
+     * @param segmentId          新段 ID
+     * @param language           目标语言码，小写
+     * @param content            拼接后的候选内容
+     * @param fragmentBoundaries 各片段结束位置（不含）的 JSON 整数数组
+     */
+    public record ReferenceCandidateRow(String segmentId, String language,
+                                        String content, String fragmentBoundaries) {
     }
 
     /**

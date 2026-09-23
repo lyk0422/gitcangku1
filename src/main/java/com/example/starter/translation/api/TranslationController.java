@@ -1,5 +1,6 @@
 package com.example.starter.translation.api;
 
+import com.example.starter.translation.service.StructureChangeService;
 import com.example.starter.translation.service.TranslationService;
 import com.example.starter.translation.service.WriteExecutor;
 import com.example.starter.translation.service.WriteResult;
@@ -14,6 +15,7 @@ import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.nio.charset.StandardCharsets;
@@ -30,12 +32,16 @@ import java.util.HexFormat;
 public class TranslationController {
 
     private final TranslationService translationService;
+    private final StructureChangeService structureChangeService;
     private final WriteExecutor writeExecutor;
     private final ObjectMapper objectMapper;
 
-    public TranslationController(TranslationService translationService, WriteExecutor writeExecutor,
+    public TranslationController(TranslationService translationService,
+                                 StructureChangeService structureChangeService,
+                                 WriteExecutor writeExecutor,
                                  ObjectMapper objectMapper) {
         this.translationService = translationService;
+        this.structureChangeService = structureChangeService;
         this.writeExecutor = writeExecutor;
         this.objectMapper = objectMapper;
     }
@@ -108,6 +114,30 @@ public class TranslationController {
         String operation = "PUT /api/documents/" + documentId + "/terms";
         return writeExecutor.execute(request.requestId(), hash(operation, request),
                 () -> WriteResult.of(201, translationService.updateTerms(documentId, request))).toResponseEntity();
+    }
+
+    /** 结构修订：一次 changeKey 原子拆分一段或合并且连续多段，保存源段与跨语言双向血缘。 */
+    @PostMapping("/{documentId}/structure-changes")
+    public ResponseEntity<String> changeStructure(@PathVariable long documentId,
+                                                  @Valid @RequestBody ApiDtos.StructureChangeRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/structure-changes";
+        return writeExecutor.execute(request.requestId(), hash(operation, request),
+                () -> WriteResult.of(201, structureChangeService.changeStructure(documentId, request)))
+                .toResponseEntity();
+    }
+
+    /** 查询当前结构：文档版本、目标语言与按顺序排列的当前段落，只读。 */
+    @GetMapping("/{documentId}/structure")
+    public ResponseEntity<ApiDtos.StructureResponse> getStructure(@PathVariable long documentId) {
+        return ResponseEntity.ok(structureChangeService.getStructure(documentId));
+    }
+
+    /** 查询跨语言血缘：可通过 segmentId 限定单段，缺省返回文档全部结构修订血缘，只读。 */
+    @GetMapping("/{documentId}/lineage")
+    public ResponseEntity<ApiDtos.LineageResponse> getLineage(
+            @PathVariable long documentId,
+            @RequestParam(name = "segmentId", required = false) String segmentId) {
+        return ResponseEntity.ok(structureChangeService.getLineage(documentId, segmentId));
     }
 
     /** 查询当前术语版本及完整规则集。 */

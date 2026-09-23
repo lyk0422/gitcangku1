@@ -80,6 +80,88 @@ public final class ApiDtos {
             List<@Valid TermRuleInput> rules) {
     }
 
+    /** 新段输入：新段键全局唯一，源文非空。 */
+    public record NewSegmentInput(
+            @NotBlank(message = "newSegmentId 不能为空") @Size(max = 64) String newSegmentId,
+            @NotBlank(message = "sourceText 不能为空") String sourceText) {
+    }
+
+    /** 旧源段版本校验项。 */
+    public record OldSegmentVersion(
+            @NotBlank(message = "segmentId 不能为空") @Size(max = 64) String segmentId,
+            @Positive(message = "sourceVersion 必须为正数") int sourceVersion) {
+    }
+
+    /** 某语言当前术语版本校验项。 */
+    public record LanguageTermVersion(
+            @NotBlank(message = "language 不能为空") String language,
+            @PositiveOrZero(message = "termVersion 不能为负数") int termVersion) {
+    }
+
+    /** 某语言下一个新段到旧译文片段的有序来源映射。 */
+    public record NewSegmentMapping(
+            @NotBlank(message = "newSegmentId 不能为空") @Size(max = 64) String newSegmentId,
+            @NotNull(message = "oldSegmentIds 不能为空") @Size(min = 1, max = 5)
+            List<@NotBlank(message = "旧段 ID 不能为空") String> oldSegmentIds) {
+    }
+
+    /** 某语言全部新段的有序映射集合。 */
+    public record LanguageMapping(
+            @NotBlank(message = "language 不能为空") String language,
+            @NotNull(message = "mappings 不能为空") @Size(min = 1, max = 5)
+            List<@Valid NewSegmentMapping> mappings) {
+    }
+
+    /**
+     * 结构修订请求：一次 changeKey 执行拆分（1→2~5）或合并（2~5→1），不允许混合。
+     * 携带期望文档版本、各旧源段版本、涉及语言当前术语版本，以及每个目标语言的完整有序映射。
+     */
+    public record StructureChangeRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @NotBlank(message = "changeKey 不能为空") @Size(max = 128) String changeKey,
+            @NotNull(message = "newSegments 不能为空") @Size(min = 1, max = 5)
+            List<@Valid NewSegmentInput> newSegments,
+            @NotNull(message = "oldSegments 不能为空") @Size(min = 1, max = 5)
+            List<@Valid OldSegmentVersion> oldSegments,
+            @NotNull(message = "languageTermVersions 不能为空") @Size(min = 1, max = 5)
+            List<@Valid LanguageTermVersion> languageTermVersions,
+            @NotNull(message = "mappings 不能为空") @Size(min = 1, max = 5)
+            List<@Valid LanguageMapping> mappings,
+            @Positive(message = "expectedDocumentVersion 必须为正数") int expectedDocumentVersion) {
+    }
+
+    /** 结构修订成功响应。 */
+    public record StructureChangeResponse(long documentId, String changeKey, String changeType,
+                                          int draftVersion, List<String> newSegmentIds) {
+    }
+
+    /** 当前结构中的段落视图。 */
+    public record StructureSegmentView(String segmentId, String sourceText, int sourceVersion, int position) {
+    }
+
+    /** 当前结构只读视图。 */
+    public record StructureResponse(long documentId, int draftVersion, List<String> targetLanguages,
+                                    List<StructureSegmentView> segments) {
+    }
+
+    /** 一条有序血缘边视图。 */
+    public record LineageEdgeView(String newSegmentId, String oldSegmentId, int ordinal) {
+    }
+
+    /** 某语言下新段的 REFERENCE 候选与片段边界视图。 */
+    public record ReferenceCandidateView(String segmentId, String language, String content,
+                                         List<Integer> fragmentBoundaries, List<LineageEdgeView> sources) {
+    }
+
+    /** 跨语言血缘只读视图：源段血缘 + 每语言译文血缘与 REFERENCE 候选。 */
+    public record LineageResponse(long documentId, List<LineageEdgeView> sourceLineage,
+                                  List<LanguageLineageView> languages) {
+    }
+
+    /** 单语言的译文血缘视图。 */
+    public record LanguageLineageView(String language, List<ReferenceCandidateView> candidates) {
+    }
+
     /** 建文档响应。 */
     public record DocumentResponse(long documentId, int draftVersion, int publishedVersion,
                                    List<String> targetLanguages) {

@@ -22,13 +22,17 @@ CREATE TABLE IF NOT EXISTS segment (
     segment_id VARCHAR(64) NOT NULL,
     source_text LONGTEXT NOT NULL,
     source_version INT NOT NULL,
+    status VARCHAR(16) NOT NULL DEFAULT 'CURRENT',
+    position INT NOT NULL,
     PRIMARY KEY (document_id, segment_id)
 );
-COMMENT ON TABLE segment IS '段落：文档内唯一 segmentId，含源文及源文版本';
+COMMENT ON TABLE segment IS '段落：文档内唯一 segmentId，含源文、源文版本、状态与当前顺序';
 COMMENT ON COLUMN segment.document_id IS '所属文档 ID';
-COMMENT ON COLUMN segment.segment_id IS '文档内唯一段落 ID';
+COMMENT ON COLUMN segment.segment_id IS '文档内唯一段落 ID；结构修订产生的新段全局不与任何已有段键重复';
 COMMENT ON COLUMN segment.source_text IS '源文正文，UTF-8';
 COMMENT ON COLUMN segment.source_version IS '源文版本，从 1 开始，每次源文修订加一';
+COMMENT ON COLUMN segment.status IS '段落状态：CURRENT 为当前有效段，SUPERSEDED 为已被结构修订取代的旧段';
+COMMENT ON COLUMN segment.position IS '当前段落顺序，从 1 开始按文档当前结构连续编号；SUPERSEDED 段保留淘汰时序号，不再参与排序';
 
 CREATE TABLE IF NOT EXISTS translation (
     document_id BIGINT NOT NULL,
@@ -110,6 +114,68 @@ COMMENT ON COLUMN term_rule.term_version IS '所属术语版本号';
 COMMENT ON COLUMN term_rule.source_term IS '源文术语，Unicode 原文、区分大小写，按连续子串匹配';
 COMMENT ON COLUMN term_rule.language IS '目标语言码，小写';
 COMMENT ON COLUMN term_rule.required_translation IS '该术语在目标语言中的必译文本，非空';
+
+CREATE TABLE IF NOT EXISTS structure_change (
+    document_id BIGINT NOT NULL,
+    change_key VARCHAR(128) NOT NULL,
+    change_type VARCHAR(8) NOT NULL,
+    draft_version INT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (document_id, change_key)
+);
+COMMENT ON TABLE structure_change IS '结构修订事务：changeKey 文档内唯一，记录拆分/合并类型与原子生成的新文档草稿版本';
+COMMENT ON COLUMN structure_change.document_id IS '所属文档 ID';
+COMMENT ON COLUMN structure_change.change_key IS '结构修订事务键，文档内唯一，重复提交返回 409';
+COMMENT ON COLUMN structure_change.change_type IS '操作类型：SPLIT 为一段拆多段，MERGE 为多连续段合为一段；不允许混合';
+COMMENT ON COLUMN structure_change.draft_version IS '本次结构修订成功后原子生成的文档草稿版本';
+COMMENT ON COLUMN structure_change.created_at IS '结构修订提交时间，数据库默认时区';
+
+CREATE TABLE IF NOT EXISTS source_lineage (
+    document_id BIGINT NOT NULL,
+    new_segment_id VARCHAR(64) NOT NULL,
+    old_segment_id VARCHAR(64) NOT NULL,
+    ordinal INT NOT NULL,
+    PRIMARY KEY (document_id, new_segment_id, ordinal),
+    UNIQUE (document_id, new_segment_id, old_segment_id)
+);
+COMMENT ON TABLE source_lineage IS '源段双向血缘：新段到旧段的有序来源；拆分时一个旧段按序对应多个新段，合并时一个新段按序来源多个旧段';
+COMMENT ON COLUMN source_lineage.document_id IS '所属文档 ID';
+COMMENT ON COLUMN source_lineage.new_segment_id IS '结构修订产生的新段 ID';
+COMMENT ON COLUMN source_lineage.old_segment_id IS '被取代（SUPERSEDED）的旧段 ID';
+COMMENT ON COLUMN source_lineage.ordinal IS '旧来源在新段映射中的顺序，从 1 开始，保证拼接与片段边界有序';
+
+CREATE TABLE IF NOT EXISTS translation_lineage (
+    document_id BIGINT NOT NULL,
+    new_segment_id VARCHAR(64) NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    old_segment_id VARCHAR(64) NOT NULL,
+    ordinal INT NOT NULL,
+    PRIMARY KEY (document_id, new_segment_id, language, ordinal),
+    UNIQUE (document_id, new_segment_id, language, old_segment_id)
+);
+COMMENT ON TABLE translation_lineage IS '跨语言译文血缘：每个新段、每种目标语言到旧译文片段的有序来源映射';
+COMMENT ON COLUMN translation_lineage.document_id IS '所属文档 ID';
+COMMENT ON COLUMN translation_lineage.new_segment_id IS '结构修订产生的新段 ID';
+COMMENT ON COLUMN translation_lineage.language IS '目标语言码，小写；结构修订要求覆盖文档全部目标语言';
+COMMENT ON COLUMN translation_lineage.old_segment_id IS '旧译文所属旧段 ID，必须与源段血缘中的旧段集合一致';
+COMMENT ON COLUMN translation_lineage.ordinal IS '旧译文片段在新段候选中的拼接顺序，从 1 开始';
+
+CREATE TABLE IF NOT EXISTS reference_candidate (
+    document_id BIGINT NOT NULL,
+    segment_id VARCHAR(64) NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    content LONGTEXT NOT NULL,
+    fragment_boundaries VARCHAR(2048) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (document_id, segment_id, language)
+);
+COMMENT ON TABLE reference_candidate IS 'REFERENCE 候选：结构修订后按血缘有序拼接旧译文形成的只读参考内容及片段边界；非译文、不可批准、不可发布';
+COMMENT ON COLUMN reference_candidate.document_id IS '所属文档 ID';
+COMMENT ON COLUMN reference_candidate.segment_id IS '新段 ID';
+COMMENT ON COLUMN reference_candidate.language IS '目标语言码，小写';
+COMMENT ON COLUMN reference_candidate.content IS '按 ordinal 顺序拼接的旧译文内容，字符直接拼接';
+COMMENT ON COLUMN reference_candidate.fragment_boundaries IS '各片段结束位置（不含）的 JSON 整数数组，按序对应翻译血缘片段';
+COMMENT ON COLUMN reference_candidate.created_at IS '候选生成时间，数据库默认时区';
 
 CREATE TABLE IF NOT EXISTS request_log (
     request_id VARCHAR(128) PRIMARY KEY,
