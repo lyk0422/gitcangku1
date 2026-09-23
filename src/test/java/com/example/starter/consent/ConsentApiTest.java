@@ -6,6 +6,7 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Callable;
@@ -20,19 +21,24 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
 
+import com.example.starter.consent.dto.GrantRequest;
 import com.example.starter.consent.dto.RecordWriteRequest;
 
 /**
- * 本地数据授权 API 集成测试：覆盖主流程、失败分支、幂等与并发边界。
+ * 本地数据授权 API 集成测试：覆盖主流程、失败分支、幂等与并发边界（真实 H2 数据库）。
  */
 @SpringBootTest
 @AutoConfigureMockMvc
+@Import(TestClockConfiguration.class)
 class ConsentApiTest {
+
+    private static final Instant EXPIRES_AT = TestClockConfiguration.BASE_TIME.plusSeconds(3600);
 
     @Autowired
     private MockMvc mockMvc;
@@ -46,6 +52,7 @@ class ConsentApiTest {
     @BeforeEach
     void cleanTables() {
         jdbc.update("DELETE FROM consent_record");
+        jdbc.update("DELETE FROM consent_delegation");
         jdbc.update("DELETE FROM consent_grant");
         jdbc.update("DELETE FROM idempotency_request");
     }
@@ -54,8 +61,8 @@ class ConsentApiTest {
         return mockMvc.perform(post("/api/v1/consents/grants")
                 .contentType(MediaType.APPLICATION_JSON)
                 .content("""
-                        {"requestId":"%s","subjectKey":"%s","purpose":"%s"}
-                        """.formatted(requestId, subjectKey, purpose)));
+                        {"requestId":"%s","subjectKey":"%s","purpose":"%s","expiresAt":"%s"}
+                        """.formatted(requestId, subjectKey, purpose, EXPIRES_AT)));
     }
 
     private ResultActions write(String requestId, String subjectKey, String purpose,
@@ -63,7 +70,8 @@ class ConsentApiTest {
         return mockMvc.perform(post("/api/v1/records")
                 .contentType(MediaType.APPLICATION_JSON)
                 .content("""
-                        {"requestId":"%s","subjectKey":"%s","purpose":"%s","recordKey":"%s","payload":"%s"}
+                        {"requestId":"%s","subjectKey":"%s","purpose":"%s","recordKey":"%s","payload":"%s",
+                         "delegationPath":[],"edgeVersions":[]}
                         """.formatted(requestId, subjectKey, purpose, recordKey, payload)));
     }
 
@@ -83,8 +91,8 @@ class ConsentApiTest {
     }
 
     private int count(String sql, Object... args) {
-        Integer count = jdbc.queryForObject(sql, Integer.class, args);
-        return count == null ? 0 : count;
+        Integer cnt = jdbc.queryForObject(sql, Integer.class, args);
+        return cnt == null ? 0 : cnt;
     }
 
     // ---------- 授权主流程 ----------
@@ -94,7 +102,8 @@ class ConsentApiTest {
         grant("g-1", "subj-a", "RESEARCH")
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.epoch").value(1))
-                .andExpect(jsonPath("$.status").value("ACTIVE"));
+                .andExpect(jsonPath("$.status").value("ACTIVE"))
+                .andExpect(jsonPath("$.expiresAt").value(EXPIRES_AT.toString()));
 
         // 当前授权仍有效时重复授权返回原 epoch，不新增代次
         grant("g-2", "subj-a", "RESEARCH")
@@ -131,6 +140,18 @@ class ConsentApiTest {
                 .andExpect(jsonPath("$.status").value("ACTIVE"));
     }
 
+    @Test
+    void grantAfterExpiryGeneratesNextEpochWithoutRevocation() throws Exception {
+        grant("g-1", "subj-a", "RESEARCH").andExpect(status().isOk());
+        // 到期（但未撤回，status 仍为 ACTIVE）后再次授权，产生下一代
+        jdbc.update("UPDATE consent_grant SET expires_at = ? WHERE subject_key = 'subj-a'",
+                java.sql.Timestamp.from(TestClockConfiguration.BASE_TIME.minusSeconds(1)));
+        grant("g-2", "subj-a", "RESEARCH")
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.epoch").value(2));
+        assertThat(count("SELECT COUNT(*) FROM consent_grant WHERE subject_key = 'subj-a'")).isEqualTo(2);
+    }
+
     // ---------- 写入与查询主流程 ----------
 
     @Test
@@ -139,10 +160,14 @@ class ConsentApiTest {
         write("w-1", "subj-a", "RESEARCH", "rec-1", "payload-1")
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.epoch").value(1))
-                .andExpect(jsonPath("$.recordKey").value("rec-1"));
+                .andExpect(jsonPath("$.recordKey").value("rec-1"))
+                .andExpect(jsonPath("$.delegationPath").isArray())
+                .andExpect(jsonPath("$.edgeVersions").isArray())
+                .andExpect(jsonPath("$.evaluatedAt").value(TestClockConfiguration.BASE_TIME.toString()));
         read("subj-a", "RESEARCH", "rec-1")
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.payload").value("payload-1"));
+                .andExpect(jsonPath("$.payload").value("payload-1"))
+                .andExpect(jsonPath("$.evaluatedAt").exists());
     }
 
     @Test
@@ -182,6 +207,35 @@ class ConsentApiTest {
         write("w-1", "subj-a", "RESEARCH", "rec-1", "payload-2")
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("REQUEST_ID_CONFLICT"));
+    }
+
+    // ---------- 到期语义 ----------
+
+    @Test
+    void expiredGrantRejectsWriteAndReadWith403() throws Exception {
+        grant("g-1", "subj-a", "RESEARCH").andExpect(status().isOk());
+        write("w-1", "subj-a", "RESEARCH", "rec-1", "payload-1").andExpect(status().isOk());
+        jdbc.update("UPDATE consent_grant SET expires_at = ? WHERE subject_key = 'subj-a'",
+                java.sql.Timestamp.from(TestClockConfiguration.BASE_TIME.minusSeconds(1)));
+        write("w-2", "subj-a", "RESEARCH", "rec-2", "payload-2")
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.code").value("GRANT_EXPIRED"));
+        read("subj-a", "RESEARCH", "rec-1")
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.code").value("GRANT_EXPIRED"));
+        // 已写入数据物理保留
+        assertThat(count("SELECT COUNT(*) FROM consent_record")).isEqualTo(1);
+    }
+
+    @Test
+    void writeReplayAfterExpiryCannotBypassGrantState() throws Exception {
+        grant("g-1", "subj-a", "RESEARCH").andExpect(status().isOk());
+        write("w-1", "subj-a", "RESEARCH", "rec-1", "payload-1").andExpect(status().isOk());
+        jdbc.update("UPDATE consent_grant SET expires_at = ? WHERE subject_key = 'subj-a'",
+                java.sql.Timestamp.from(TestClockConfiguration.BASE_TIME.minusSeconds(1)));
+        write("w-1", "subj-a", "RESEARCH", "rec-1", "payload-1")
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.code").value("GRANT_EXPIRED"));
     }
 
     // ---------- 撤回与 410 语义 ----------
@@ -282,7 +336,18 @@ class ConsentApiTest {
     void missingRequestIdReturns400() throws Exception {
         mockMvc.perform(post("/api/v1/consents/grants")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"subjectKey\":\"subj-a\",\"purpose\":\"RESEARCH\"}"))
+                        .content("""
+                                {"subjectKey":"subj-a","purpose":"RESEARCH","expiresAt":"%s"}
+                                """.formatted(EXPIRES_AT)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("INVALID_ARGUMENT"));
+    }
+
+    @Test
+    void missingExpiresAtReturns400() throws Exception {
+        mockMvc.perform(post("/api/v1/consents/grants")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"requestId\":\"g-1\",\"subjectKey\":\"subj-a\",\"purpose\":\"RESEARCH\"}"))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.code").value("INVALID_ARGUMENT"));
     }
@@ -291,7 +356,9 @@ class ConsentApiTest {
     void invalidPurposeReturns400() throws Exception {
         mockMvc.perform(post("/api/v1/consents/grants")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"requestId\":\"g-1\",\"subjectKey\":\"subj-a\",\"purpose\":\"MARKETING\"}"))
+                        .content("""
+                                {"requestId":"g-1","subjectKey":"subj-a","purpose":"MARKETING","expiresAt":"%s"}
+                                """.formatted(EXPIRES_AT)))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.code").value("INVALID_ARGUMENT"));
     }
@@ -382,7 +449,8 @@ class ConsentApiTest {
                 ready.countDown();
                 start.await();
                 return consentService.write(new RecordWriteRequest(
-                        requestId, "subj-a", Purpose.RESEARCH, "rec-1", "same-payload")).payload();
+                        requestId, "subj-a", Purpose.RESEARCH, "rec-1", "same-payload",
+                        List.of(), List.of())).payload();
             });
         }
         List<Future<String>> futures = new ArrayList<>();
@@ -411,8 +479,8 @@ class ConsentApiTest {
             tasks.add(() -> {
                 ready.countDown();
                 start.await();
-                return consentService.grant(
-                        new com.example.starter.consent.dto.GrantRequest(requestId, "subj-c", Purpose.RESEARCH)).epoch();
+                return consentService.grant(new GrantRequest(
+                        requestId, "subj-c", Purpose.RESEARCH, EXPIRES_AT)).epoch();
             });
         }
         List<Future<Integer>> futures = new ArrayList<>();
