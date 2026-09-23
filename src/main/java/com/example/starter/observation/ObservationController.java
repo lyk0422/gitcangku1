@@ -110,4 +110,29 @@ public class ObservationController {
                 record.observationId(), record.newVersion());
         return ResolutionResponse.of(record, pointed, objectMapper);
     }
+
+    /**
+     * 重复观测簇候选预览：冻结提交集合内每条记录的代次、设备、时间与字段值（只读）。
+     */
+    @PostMapping("/cluster-preview")
+    public ClusterPreviewResponse previewCluster(@Valid @RequestBody ClusterPreviewRequest request) {
+        return observationService.previewCluster(request);
+    }
+
+    /**
+     * 提交重复观测簇归并：原子创建 canonical 主记录与字段级来源证据，成员置 MERGED。
+     */
+    @PostMapping("/clusters")
+    public ResponseEntity<ClusterResponse> commitCluster(@Valid @RequestBody ClusterMergeRequest request) {
+        ObservationService.ClusterOutcome outcome = observationService.commitCluster(request);
+        return ResponseEntity.status(outcome.status()).body(outcome.body());
+    }
+
+    /**
+     * 按 clusterKey 查询归并簇：返回主记录、成员与字段级来源，只读。
+     */
+    @GetMapping("/clusters/{clusterKey}")
+    public ClusterResponse getCluster(@PathVariable String clusterKey) {
+        return observationService.getCluster(clusterKey);
+    }
 }

@@ -12,7 +12,10 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
+import java.time.OffsetDateTime;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
@@ -50,17 +53,20 @@ public class ObservationService {
     private final ObservationRepository observationRepository;
     private final RequestLogRepository requestLogRepository;
     private final ResolutionRepository resolutionRepository;
+    private final ClusterRepository clusterRepository;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public ObservationService(ObservationRepository observationRepository,
                               RequestLogRepository requestLogRepository,
                               ResolutionRepository resolutionRepository,
+                              ClusterRepository clusterRepository,
                               ObjectMapper objectMapper,
                               Clock clock) {
         this.observationRepository = observationRepository;
         this.requestLogRepository = requestLogRepository;
         this.resolutionRepository = resolutionRepository;
+        this.clusterRepository = clusterRepository;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -84,8 +90,11 @@ public class ObservationService {
         if (observationRepository.findCurrentForUpdate(request.observationId()).isPresent()) {
             throw ApiException.conflict("observation already exists: " + request.observationId(), null);
         }
+        Instant observedAt = parseObservedAt(request.observedAt());
         ObservationSnapshot snapshot = new ObservationSnapshot(request.observationId(), 1,
-                request.location(), request.reading(), request.note(), false);
+                request.location(), request.reading(), request.note(), false,
+                request.siteKey(), request.observationType(), observedAt, request.deviceId(),
+                RecordStatus.ACTIVE, RecordOrigin.RAW, null);
         try {
             observationRepository.insertCurrent(snapshot);
         } catch (DuplicateKeyException e) {
@@ -117,6 +126,12 @@ public class ObservationService {
         if (current.deleted()) {
             throw ApiException.gone("observation already deleted: " + observationId);
         }
+        if (current.status() == RecordStatus.MERGED) {
+            // 已归并记录拒绝后续离线更新，也不得通过合并恢复为活跃
+            throw ApiException.conflict(
+                    "observation already merged into canonical record: " + current.mergedInto(),
+                    current.version());
+        }
         ObservationSnapshot base = observationRepository.findVersion(observationId, request.baseVersion())
                 .orElseThrow(() -> ApiException.notFound(
                         "base version not found: " + observationId + "@" + request.baseVersion()));
@@ -132,13 +147,17 @@ public class ObservationService {
         }
 
         ObservationSnapshot merged = new ObservationSnapshot(observationId, current.version(),
-                mergedLocation, mergedReading, mergedNote, false);
+                mergedLocation, mergedReading, mergedNote, false,
+                current.siteKey(), current.observationType(), current.observedAt(), current.deviceId(),
+                current.status(), current.origin(), current.mergedInto());
         if (sameContent(merged, current)) {
             // 合并结果与当前完全相同：返回当前版本，不加版本
             return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(current));
         }
         ObservationSnapshot next = new ObservationSnapshot(observationId, current.version() + 1,
-                mergedLocation, mergedReading, mergedNote, false);
+                mergedLocation, mergedReading, mergedNote, false,
+                current.siteKey(), current.observationType(), current.observedAt(), current.deviceId(),
+                current.status(), current.origin(), current.mergedInto());
         observationRepository.updateCurrent(next);
         observationRepository.insertVersion(next);
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(next));
@@ -164,11 +183,19 @@ public class ObservationService {
         if (current.deleted()) {
             throw ApiException.gone("observation already deleted: " + observationId);
         }
+        if (current.status() == RecordStatus.MERGED) {
+            // 已归并记录拒绝删除等后续变更，历史仍可查
+            throw ApiException.conflict(
+                    "observation already merged into canonical record: " + current.mergedInto(),
+                    current.version());
+        }
         if (request.expectedVersion() != current.version()) {
             throw ApiException.conflict("expectedVersion mismatch", current.version());
         }
         ObservationSnapshot tombstone = new ObservationSnapshot(observationId, current.version() + 1,
-                null, null, null, true);
+                null, null, null, true,
+                current.siteKey(), current.observationType(), current.observedAt(), current.deviceId(),
+                current.status(), current.origin(), current.mergedInto());
         observationRepository.markDeleted(observationId, tombstone.version());
         observationRepository.insertVersion(tombstone);
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(tombstone));
@@ -222,6 +249,12 @@ public class ObservationService {
         if (current.deleted()) {
             throw ApiException.gone("observation already deleted: " + observationId);
         }
+        if (current.status() == RecordStatus.MERGED) {
+            // 已归并记录拒绝冲突解决与恢复
+            throw ApiException.conflict(
+                    "observation already merged into canonical record: " + current.mergedInto(),
+                    current.version());
+        }
 
         if (request.expectedCurrentVersion() != current.version()) {
             throw ApiException.conflict("expectedCurrentVersion mismatch", current.version());
@@ -253,12 +286,16 @@ public class ObservationService {
                 base.note(), current.note(), request.note(), false);
 
         ObservationSnapshot merged = new ObservationSnapshot(observationId, current.version(),
-                resolvedLocation, resolvedReading, resolvedNote, false);
+                resolvedLocation, resolvedReading, resolvedNote, false,
+                current.siteKey(), current.observationType(), current.observedAt(), current.deviceId(),
+                current.status(), current.origin(), current.mergedInto());
         boolean contentChanged = !sameContent(merged, current);
         int newVersion = contentChanged ? current.version() + 1 : current.version();
         if (contentChanged) {
             ObservationSnapshot next = new ObservationSnapshot(observationId, newVersion,
-                    resolvedLocation, resolvedReading, resolvedNote, false);
+                    resolvedLocation, resolvedReading, resolvedNote, false,
+                    current.siteKey(), current.observationType(), current.observedAt(), current.deviceId(),
+                    current.status(), current.origin(), current.mergedInto());
             observationRepository.updateCurrent(next);
             observationRepository.insertVersion(next);
         }
@@ -285,7 +322,10 @@ public class ObservationService {
         }
 
         ObservationSnapshot pointed = contentChanged
-                ? new ObservationSnapshot(observationId, newVersion, resolvedLocation, resolvedReading, resolvedNote, false)
+                ? new ObservationSnapshot(observationId, newVersion,
+                        resolvedLocation, resolvedReading, resolvedNote, false,
+                        current.siteKey(), current.observationType(), current.observedAt(), current.deviceId(),
+                        current.status(), current.origin(), current.mergedInto())
                 : current;
         return completeResolve(request.requestId(), HttpStatus.OK,
                 ResolutionResponse.of(record, pointed, objectMapper));
@@ -329,6 +369,377 @@ public class ObservationService {
                 .orElseThrow(() -> ApiException.notFound(
                         "version not found: " + observationId + "@" + version));
         return ObservationResponse.of(snapshot);
+    }
+
+    // ---------- 重复观测簇归并 ----------
+
+    /**
+     * 候选簇预览：只读冻结提交集合内每条记录的代次、设备、时间与字段值，不落库、不改状态。
+     * 候选资格完全由提交的完整集合决定：键唯一、2-20 条、活跃未归并、非墓碑、RAW 来源、
+     * 相同 siteKey/type、观测时间最大差不超过 60 秒；任一条不满足返回 409（键不存在为 404）。
+     */
+    @Transactional(readOnly = true)
+    public ClusterPreviewResponse previewCluster(ClusterPreviewRequest request) {
+        List<String> recordKeys = normalizeKeys(request.recordKeys());
+        List<ObservationSnapshot> snapshots = loadClusterCandidates(recordKeys);
+        return buildPreview(snapshots);
+    }
+
+    /**
+     * 重复观测簇归并提交：校验冻结代次/状态/时间范围/字段来源后，原子创建 canonical 主记录、
+     * 字段级不可变证据并把成员置 MERGED。任一成员在此期间更新、墓碑化或被归并，
+     * 或字段遗漏/多选/来源越界，均整体 409 回滚，失败不占用 requestId/clusterKey。
+     */
+    @Transactional
+    public ClusterOutcome commitCluster(ClusterMergeRequest request) {
+        List<String> memberKeys = normalizeMemberKeys(request.members());
+        Map<String, Integer> generationsByKey = normalizeGenerations(request.members(), memberKeys);
+        Map<String, String> sourcesByField = normalizeFieldSources(request.fieldSources());
+
+        String memberPart = memberKeys.stream()
+                .map(key -> key + ":" + generationsByKey.get(key))
+                .collect(java.util.stream.Collectors.joining(","));
+        String sourcePart = sourcesByField.entrySet().stream()
+                .map(entry -> entry.getKey() + ":" + entry.getValue())
+                .collect(java.util.stream.Collectors.joining(","));
+        String fingerprint = fingerprint("CLUSTER_MERGE", request.clusterKey(), request.canonicalRecordId(),
+                request.operator(), memberPart, sourcePart);
+
+        ClusterOutcome replayed = checkClusterReplay(request.requestId(), fingerprint);
+        if (replayed != null) {
+            return replayed;
+        }
+        ClusterOutcome concurrent = insertClusterPlaceholder(request.requestId(), fingerprint);
+        if (concurrent != null) {
+            return concurrent;
+        }
+
+        // clusterKey 全局唯一：同参重放已在 request_log 阶段返回；任何已存在的簇均为异参冲突。
+        if (clusterRepository.findHeader(request.clusterKey()).isPresent()) {
+            throw ApiException.conflict("clusterKey already used: " + request.clusterKey(), null);
+        }
+
+        // 对全部成员按键排序加行锁，与离线合并/冲突解决/删除按提交顺序串行化，不丢已提交代次。
+        List<ObservationSnapshot> members = observationRepository.findCurrentForUpdate(memberKeys);
+        if (members.size() != memberKeys.size()) {
+            throw ApiException.notFound("one or more cluster members do not exist: " + request.clusterKey());
+        }
+        Map<String, ObservationSnapshot> memberByKey = new LinkedHashMap<>();
+        for (ObservationSnapshot member : members) {
+            memberByKey.put(member.observationId(), member);
+        }
+        validateClusterCandidates(members);
+        for (String key : memberKeys) {
+            ObservationSnapshot member = memberByKey.get(key);
+            if (member.version() != generationsByKey.get(key)) {
+                // 预览后记录发生过更新：冻结代次失效，拒绝整次归并
+                throw ApiException.conflict(
+                        "member generation changed since preview: " + key, member.version());
+            }
+        }
+
+        if (memberKeys.contains(request.canonicalRecordId())) {
+            throw ApiException.conflict(
+                    "canonical record key must not be a cluster member: " + request.canonicalRecordId(), null);
+        }
+        if (observationRepository.findCurrent(request.canonicalRecordId()).isPresent()) {
+            // 新主记录键与既有记录键冲突（含已是其他簇 canonical 的键）
+            throw ApiException.conflict(
+                    "canonical record key already exists: " + request.canonicalRecordId(), null);
+        }
+
+        // 每个业务字段恰好选择一次，来源必须在簇成员内。
+        if (!sourcesByField.keySet().equals(new java.util.HashSet<>(FIELDS))) {
+            List<String> missing = new ArrayList<>(FIELDS);
+            missing.removeAll(sourcesByField.keySet());
+            List<String> extra = new ArrayList<>(sourcesByField.keySet());
+            extra.removeAll(FIELDS);
+            List<String> problems = new ArrayList<>();
+            if (!missing.isEmpty()) {
+                problems.add("missing field sources: " + String.join(", ", missing));
+            }
+            if (!extra.isEmpty()) {
+                problems.add("unexpected field sources: " + String.join(", ", extra));
+            }
+            throw ApiException.conflict(
+                    "every business field must be sourced exactly once; " + String.join("; ", problems), null);
+        }
+        for (Map.Entry<String, String> entry : sourcesByField.entrySet()) {
+            if (!memberByKey.containsKey(entry.getValue())) {
+                throw ApiException.conflict(
+                        "source for field '" + entry.getKey() + "' is not a cluster member: "
+                                + entry.getValue(), null);
+            }
+        }
+
+        ObservationSnapshot anchor = members.get(0);
+        Instant observedFrom = members.stream().map(ObservationSnapshot::observedAt).min(Instant::compareTo).orElseThrow();
+        Instant observedTo = members.stream().map(ObservationSnapshot::observedAt).max(Instant::compareTo).orElseThrow();
+
+        String canonicalLocation = memberByKey.get(sourcesByField.get("location")).location();
+        String canonicalReading = memberByKey.get(sourcesByField.get("reading")).reading();
+        String canonicalNote = memberByKey.get(sourcesByField.get("note")).note();
+
+        ObservationSnapshot canonical = new ObservationSnapshot(request.canonicalRecordId(), 1,
+                canonicalLocation, canonicalReading, canonicalNote, false,
+                anchor.siteKey(), anchor.observationType(), observedFrom, null,
+                RecordStatus.ACTIVE, RecordOrigin.CANONICAL, null);
+        try {
+            observationRepository.insertCurrent(canonical);
+        } catch (DuplicateKeyException e) {
+            // 并发下主记录键被其他事务抢先占用：整体回滚，不占键
+            throw ApiException.conflict(
+                    "canonical record key already exists: " + request.canonicalRecordId(), null);
+        }
+        observationRepository.insertVersion(canonical);
+
+        for (String key : memberKeys) {
+            observationRepository.markMerged(key, request.canonicalRecordId());
+        }
+
+        ClusterHeader header = new ClusterHeader(request.clusterKey(), request.canonicalRecordId(),
+                anchor.siteKey(), anchor.observationType(), observedFrom, observedTo, members.size(),
+                request.requestId(), request.operator(), Instant.now(clock));
+        try {
+            clusterRepository.insertHeader(header);
+        } catch (DuplicateKeyException e) {
+            // clusterKey 并发复用：数据库唯一约束兜底，整体回滚
+            throw ApiException.conflict("clusterKey already used: " + request.clusterKey(), null);
+        }
+        for (String key : memberKeys) {
+            ObservationSnapshot member = memberByKey.get(key);
+            clusterRepository.insertMember(new ClusterMemberRecord(request.clusterKey(), key,
+                    member.version(), member.siteKey(), member.observationType(), member.deviceId(),
+                    member.observedAt(), member.location(), member.reading(), member.note()));
+        }
+        for (String field : FIELDS) {
+            ObservationSnapshot source = memberByKey.get(sourcesByField.get(field));
+            String value = switch (field) {
+                case "location" -> source.location();
+                case "reading" -> source.reading();
+                default -> source.note();
+            };
+            clusterRepository.insertFieldSource(new ClusterFieldSourceRecord(
+                    request.clusterKey(), field, source.observationId(), source.version(), value));
+        }
+
+        ClusterResponse body = ClusterResponse.of(header, canonical,
+                clusterRepository.findMembers(request.clusterKey()),
+                clusterRepository.findFieldSources(request.clusterKey()));
+        return completeCluster(request.requestId(), HttpStatus.CREATED, body);
+    }
+
+    /**
+     * 按 clusterKey 查询归并簇：返回主记录、成员冻结快照与字段级来源，只读。
+     */
+    @Transactional(readOnly = true)
+    public ClusterResponse getCluster(String clusterKey) {
+        ClusterHeader header = clusterRepository.findHeader(clusterKey)
+                .orElseThrow(() -> ApiException.notFound("cluster not found: " + clusterKey));
+        List<ClusterMemberRecord> memberRecords = clusterRepository.findMembers(clusterKey);
+        List<ClusterFieldSourceRecord> sourceRecords = clusterRepository.findFieldSources(clusterKey);
+        ObservationSnapshot canonical = observationRepository.findCurrent(header.canonicalRecordId())
+                .orElseThrow(() -> new IllegalStateException(
+                        "canonical record missing for cluster: " + clusterKey));
+        return ClusterResponse.of(header, canonical, memberRecords, sourceRecords);
+    }
+
+    /**
+     * 归并提交结果：HTTP 状态码与归并响应体。
+     */
+    public record ClusterOutcome(int status, ClusterResponse body) {
+    }
+
+    // ---------- 重复观测簇辅助逻辑 ----------
+
+    /**
+     * 归一化预览记录键：去空白判空、去重并按键排序；重复键按冲突处理（集合必须唯一）。
+     */
+    private List<String> normalizeKeys(List<String> rawKeys) {
+        List<String> keys = rawKeys.stream()
+                .map(key -> key == null ? null : key.trim())
+                .peek(key -> {
+                    if (key == null || key.isEmpty()) {
+                        throw ApiException.badRequest("recordKey must not be blank");
+                    }
+                })
+                .sorted()
+                .toList();
+        if (new java.util.HashSet<>(keys).size() != keys.size()) {
+            throw ApiException.conflict("cluster record keys must be unique", null);
+        }
+        return keys;
+    }
+
+    /**
+     * 归一化提交成员：记录键去重、排序；重复键（即使代次相同）按冲突处理。
+     */
+    private List<String> normalizeMemberKeys(List<ClusterMergeRequest.MemberGeneration> members) {
+        List<String> keys = members.stream()
+                .map(member -> member.recordKey().trim())
+                .sorted()
+                .toList();
+        if (new java.util.HashSet<>(keys).size() != keys.size()) {
+            throw ApiException.conflict("cluster members must be unique", null);
+        }
+        return keys;
+    }
+
+    /**
+     * 提取“记录键 -> 冻结代次”映射，键顺序由已归一化的 memberKeys 决定。
+     */
+    private Map<String, Integer> normalizeGenerations(List<ClusterMergeRequest.MemberGeneration> members,
+                                                      List<String> memberKeys) {
+        Map<String, Integer> generations = new LinkedHashMap<>();
+        for (ClusterMergeRequest.MemberGeneration member : members) {
+            generations.put(member.recordKey().trim(), member.generation());
+        }
+        for (String key : memberKeys) {
+            if (generations.get(key) == null || generations.get(key) < 1) {
+                throw ApiException.badRequest("member generation must be positive: " + key);
+            }
+        }
+        return generations;
+    }
+
+    /**
+     * 归一化字段来源映射：键去空白并按字段名排序，来源键去空白；恰好覆盖校验在提交事务内完成。
+     */
+    private Map<String, String> normalizeFieldSources(Map<String, ClusterMergeRequest.FieldSource> raw) {
+        Map<String, String> normalized = new java.util.TreeMap<>();
+        for (Map.Entry<String, ClusterMergeRequest.FieldSource> entry : raw.entrySet()) {
+            String field = entry.getKey() == null ? null : entry.getKey().trim();
+            String source = entry.getValue() == null || entry.getValue().sourceRecordKey() == null
+                    ? null : entry.getValue().sourceRecordKey().trim();
+            if (field == null || field.isEmpty() || source == null || source.isEmpty()) {
+                throw ApiException.badRequest("field source must name a field and a sourceRecordKey");
+            }
+            normalized.put(field, source);
+        }
+        return normalized;
+    }
+
+    /**
+     * 只读加载候选集合并校验候选资格，返回按记录键排序的快照。
+     */
+    private List<ObservationSnapshot> loadClusterCandidates(List<String> recordKeys) {
+        List<ObservationSnapshot> snapshots = new ArrayList<>();
+        for (String key : recordKeys) {
+            ObservationSnapshot snapshot = observationRepository.findCurrent(key)
+                    .orElseThrow(() -> ApiException.notFound("observation not found: " + key));
+            snapshots.add(snapshot);
+        }
+        snapshots.sort(java.util.Comparator.comparing(ObservationSnapshot::observationId));
+        validateClusterCandidates(snapshots);
+        return snapshots;
+    }
+
+    /**
+     * 校验候选集合：均为活跃、未归并、非墓碑、RAW 来源，相同 siteKey/type，观测时间最大差不超过 60 秒。
+     */
+    private void validateClusterCandidates(List<ObservationSnapshot> snapshots) {
+        String siteKey = snapshots.get(0).siteKey();
+        String type = snapshots.get(0).observationType();
+        for (ObservationSnapshot snapshot : snapshots) {
+            if (snapshot.deleted()) {
+                throw ApiException.conflict(
+                        "cluster member is tombstoned: " + snapshot.observationId(), snapshot.version());
+            }
+            if (snapshot.status() == RecordStatus.MERGED) {
+                throw ApiException.conflict(
+                        "cluster member already merged: " + snapshot.observationId(), snapshot.version());
+            }
+            if (snapshot.origin() == RecordOrigin.CANONICAL) {
+                // canonical 主记录不得再次入簇，防止形成归并链环
+                throw ApiException.conflict(
+                        "canonical record cannot be a cluster member: " + snapshot.observationId(),
+                        snapshot.version());
+            }
+            if (!Objects.equals(siteKey, snapshot.siteKey()) || !Objects.equals(type, snapshot.observationType())) {
+                throw ApiException.conflict(
+                        "cluster members must share the same siteKey and type: " + snapshot.observationId(),
+                        snapshot.version());
+            }
+            if (snapshot.observedAt() == null) {
+                throw ApiException.conflict(
+                        "cluster member has no observedAt: " + snapshot.observationId(), snapshot.version());
+            }
+        }
+        Instant from = snapshots.stream().map(ObservationSnapshot::observedAt).min(Instant::compareTo).orElseThrow();
+        Instant to = snapshots.stream().map(ObservationSnapshot::observedAt).max(Instant::compareTo).orElseThrow();
+        if (Duration.between(from, to).compareTo(Duration.ofSeconds(60)) > 0) {
+            throw ApiException.conflict(
+                    "observedAt range of cluster members exceeds 60 seconds: "
+                            + Duration.between(from, to).toSeconds() + "s", null);
+        }
+    }
+
+    /**
+     * 由候选快照组装只读预览：成员按记录键排序，时间范围取观测时刻的最小/最大值。
+     */
+    private ClusterPreviewResponse buildPreview(List<ObservationSnapshot> snapshots) {
+        Instant from = snapshots.stream().map(ObservationSnapshot::observedAt).min(Instant::compareTo).orElseThrow();
+        Instant to = snapshots.stream().map(ObservationSnapshot::observedAt).max(Instant::compareTo).orElseThrow();
+        List<ClusterMemberPreview> members = snapshots.stream()
+                .map(snapshot -> new ClusterMemberPreview(
+                        snapshot.observationId(), snapshot.version(), snapshot.siteKey(),
+                        snapshot.observationType(), snapshot.deviceId(), snapshot.observedAt(),
+                        snapshot.location(), snapshot.reading(), snapshot.note()))
+                .toList();
+        return new ClusterPreviewResponse(snapshots.get(0).siteKey(), snapshots.get(0).observationType(),
+                from, to, List.copyOf(members));
+    }
+
+    /**
+     * 归并请求的 requestId 幂等检查：同键同参返回原成功结果；同键异参返回 409；无记录返回 null。
+     */
+    private ClusterOutcome checkClusterReplay(String requestId, String fingerprint) {
+        Optional<RequestLogEntry> existing = requestLogRepository.find(requestId);
+        if (existing.isEmpty()) {
+            return null;
+        }
+        RequestLogEntry entry = existing.get();
+        if (!entry.fingerprint().equals(fingerprint)) {
+            throw ApiException.conflict("requestId reused with different parameters: " + requestId, null);
+        }
+        return new ClusterOutcome(entry.responseStatus(), readClusterBody(entry.responseBody()));
+    }
+
+    /**
+     * 归并请求的占位写入，语义与其他写操作一致：并发同键冲突后读已提交记录，同参重放、异参 409。
+     */
+    private ClusterOutcome insertClusterPlaceholder(String requestId, String fingerprint) {
+        try {
+            requestLogRepository.insertPlaceholder(requestId, fingerprint, "CLUSTER_MERGE");
+            return null;
+        } catch (DuplicateKeyException e) {
+            RequestLogEntry entry = requestLogRepository.find(requestId)
+                    .orElseThrow(() -> ApiException.conflict("requestId conflict: " + requestId, null));
+            if (!entry.fingerprint().equals(fingerprint)) {
+                throw ApiException.conflict("requestId reused with different parameters: " + requestId, null);
+            }
+            return new ClusterOutcome(entry.responseStatus(), readClusterBody(entry.responseBody()));
+        }
+    }
+
+    /**
+     * 归并成功后回填去重记录响应，与 canonical 主记录、成员状态变更、不可变证据同事务提交。
+     */
+    private ClusterOutcome completeCluster(String requestId, HttpStatus status, ClusterResponse body) {
+        try {
+            requestLogRepository.complete(requestId, status.value(), objectMapper.writeValueAsString(body));
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("failed to serialize cluster response", e);
+        }
+        return new ClusterOutcome(status.value(), body);
+    }
+
+    private ClusterResponse readClusterBody(String json) {
+        try {
+            return objectMapper.readValue(json, ClusterResponse.class);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("failed to deserialize stored cluster response", e);
+        }
     }
 
     /**
@@ -375,6 +786,17 @@ public class ObservationService {
             return Objects.equals(left, right);
         }
         return new BigDecimal(left).compareTo(new BigDecimal(right)) == 0;
+    }
+
+    /**
+     * 解析请求中的观测发生时刻：接受 ISO-8601（含偏移，如 2026-09-23T10:00:00Z），统一为 UTC Instant。
+     */
+    private Instant parseObservedAt(String raw) {
+        try {
+            return OffsetDateTime.parse(raw).toInstant();
+        } catch (DateTimeParseException e) {
+            throw ApiException.badRequest("observedAt must be an ISO-8601 date-time with offset: " + raw);
+        }
     }
 
     /**

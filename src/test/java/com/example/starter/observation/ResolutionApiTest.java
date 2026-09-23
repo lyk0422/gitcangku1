@@ -65,6 +65,10 @@ class ResolutionApiTest {
         body.put("location", location);
         body.put("reading", reading);
         body.put("note", note);
+        body.put("siteKey", "SITE-1");
+        body.put("observationType", "TEMP");
+        body.put("observedAt", "2026-09-23T10:00:00Z");
+        body.put("deviceId", "dev-1");
         return mockMvc.perform(post("/api/observations")
                 .contentType(MediaType.APPLICATION_JSON)
                 .content(objectMapper.writeValueAsString(body)));
