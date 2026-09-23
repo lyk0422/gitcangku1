@@ -10,6 +10,8 @@ CREATE TABLE IF NOT EXISTS evidence (
     seal_no VARCHAR(64) NOT NULL COMMENT '封条编号，入库后不可修改',
     custodian_id VARCHAR(64) NOT NULL COMMENT '当前保管人（操作人标识），交接接受后原子切换；借出期间不变',
     status VARCHAR(20) NOT NULL COMMENT '证物状态：SEALED 已封存 / TRANSFER_PENDING 待接收 / BORROWED 借出未归还 / SEAL_BROKEN 封条异常（终态）',
+    version BIGINT NOT NULL DEFAULT 0 COMMENT '乐观锁版本：保管人或状态每发生一次变更加 1；联合取样二次确认据此判定母样是否变化',
+    aliquot_child TINYINT NOT NULL DEFAULT 0 COMMENT '是否为联合取样生成的子样：1 子样（独立走保管链且不可再取样）/ 0 普通证物',
     created_at DATETIME(6) NOT NULL COMMENT '入库时间，Asia/Shanghai',
     updated_at DATETIME(6) NOT NULL COMMENT '最近一次状态或保管人变更时间，Asia/Shanghai',
     CONSTRAINT uk_evidence_key UNIQUE (evidence_key)
@@ -65,10 +67,75 @@ CREATE TABLE IF NOT EXISTS command_log (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     command_key VARCHAR(64) NOT NULL COMMENT '幂等命令键，全局唯一',
     actor_id VARCHAR(64) NOT NULL COMMENT '发起操作人',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN/SAMPLE_REGISTER/ALIQUOT_APPLY/ALIQUOT_FIRST_CONFIRM/ALIQUOT_SECOND_CONFIRM/ALIQUOT_REJECT/ALIQUOT_CANCEL',
     request_hash VARCHAR(64) NOT NULL COMMENT '请求参数规范化后的 SHA-256，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行的 HTTP 状态码',
     response_body TEXT NOT NULL COMMENT '首次执行的响应体 JSON，重放时原样返回',
     created_at DATETIME(6) NOT NULL COMMENT '首次执行时间，Asia/Shanghai',
     CONSTRAINT uk_command_key UNIQUE (command_key)
+);
+
+-- 母样台账：母样首次参与联合取样前登记，sample_key 与 evidence.evidence_key 相同；
+-- 总量与单位登记后不可修改；余额 = 总量 - 预留 - 耗用。
+CREATE TABLE IF NOT EXISTS sample_ledger (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    sample_key VARCHAR(128) NOT NULL COMMENT '母样业务键，与证物键相同，全局唯一，登记后不可修改',
+    total_quantity BIGINT NOT NULL COMMENT '登记总量，正整数，登记后不可修改；单位见 unit',
+    unit VARCHAR(32) NOT NULL COMMENT '计量单位（如 ML/G），登记后不可修改',
+    created_at DATETIME(6) NOT NULL COMMENT '登记时间，Asia/Shanghai',
+    CONSTRAINT uk_sample_key UNIQUE (sample_key)
+);
+
+-- 联合取样单：一单跨 2～20 件不同母样；申请成功即原子预留，两次不同审核人顺序确认后转为耗用。
+CREATE TABLE IF NOT EXISTS aliquot_request (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    aliquot_key VARCHAR(128) NOT NULL COMMENT '联合取样单业务键，全局唯一，申请后不可修改',
+    applicant_id VARCHAR(64) NOT NULL COMMENT '申请人（申请时全部母样的当前保管人）',
+    status VARCHAR(20) NOT NULL COMMENT '取样单状态：RESERVED 已预留待审核 / CONSUMED 已耗用 / REJECTED 已拒绝 / CANCELLED 已取消',
+    version BIGINT NOT NULL DEFAULT 0 COMMENT '申请版本：首次确认后加 1；二次确认必须携带该版本',
+    first_reviewer VARCHAR(64) NULL COMMENT '第一审核人；NULL 表示尚无审核（审核前可取消）',
+    second_reviewer VARCHAR(64) NULL COMMENT '第二审核人；NULL 表示未完成二次确认',
+    first_confirmed_at DATETIME(6) NULL COMMENT '第一次确认时间；NULL 表示未确认',
+    second_confirmed_at DATETIME(6) NULL COMMENT '第二次确认时间（耗用完成时间）；NULL 表示未完成',
+    rejected_at DATETIME(6) NULL COMMENT '拒绝时间；NULL 表示未拒绝',
+    rejected_by VARCHAR(64) NULL COMMENT '拒绝审核人；NULL 表示未拒绝',
+    cancelled_at DATETIME(6) NULL COMMENT '审核前取消时间；NULL 表示未取消',
+    created_at DATETIME(6) NOT NULL COMMENT '申请时间（预留建立时间），Asia/Shanghai',
+    updated_at DATETIME(6) NOT NULL COMMENT '最近一次审核/取消/拒绝/耗用时间，Asia/Shanghai',
+    CONSTRAINT uk_aliquot_key UNIQUE (aliquot_key)
+);
+
+-- 联合取样单母样明细：申请时按各母样当前版本快照写入；数量为预留数量，耗用成功后转为已耗用。
+CREATE TABLE IF NOT EXISTS aliquot_request_item (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    request_id BIGINT NOT NULL COMMENT '所属联合取样单 id',
+    sample_key VARCHAR(128) NOT NULL COMMENT '母样业务键',
+    quantity BIGINT NOT NULL COMMENT '从该母样取用量，正整数；申请后不可修改',
+    sample_version BIGINT NOT NULL COMMENT '申请时母样版本快照；二次确认时与当前版本不一致则 409',
+    created_at DATETIME(6) NOT NULL COMMENT '明细创建时间，Asia/Shanghai',
+    CONSTRAINT uk_request_sample UNIQUE (request_id, sample_key),
+    KEY idx_item_sample (sample_key)
+);
+
+-- 取样审核历史：只追加、不可变；seq=1 第一次确认，seq=2 第二次确认。
+CREATE TABLE IF NOT EXISTS aliquot_review (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    request_id BIGINT NOT NULL COMMENT '所属联合取样单 id',
+    seq INT NOT NULL COMMENT '审核顺序：1 第一次确认 / 2 第二次确认',
+    reviewer_id VARCHAR(64) NOT NULL COMMENT '审核人，两人须不同且都不能是任一母样当前保管人',
+    created_at DATETIME(6) NOT NULL COMMENT '审核提交时间，Asia/Shanghai',
+    KEY idx_review_request (request_id)
+);
+
+-- 母样耗用与子样映射：耗用成功时一次写入，不可变；每件母样生成一个 SEALED 子样。
+CREATE TABLE IF NOT EXISTS aliquot_consumption (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    request_id BIGINT NOT NULL COMMENT '所属联合取样单 id',
+    sample_key VARCHAR(128) NOT NULL COMMENT '被耗用的母样业务键',
+    quantity BIGINT NOT NULL COMMENT '本次耗用数量，正整数',
+    child_evidence_key VARCHAR(128) NOT NULL COMMENT '生成的 SEALED 子样证物键，独立走保管链且不可再取样',
+    created_at DATETIME(6) NOT NULL COMMENT '耗用（子样生成）时间，Asia/Shanghai',
+    CONSTRAINT uk_child_evidence UNIQUE (child_evidence_key),
+    KEY idx_consumption_sample (sample_key),
+    KEY idx_consumption_request (request_id)
 );
