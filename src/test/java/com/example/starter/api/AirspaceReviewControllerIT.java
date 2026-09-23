@@ -254,4 +254,82 @@ class AirspaceReviewControllerIT {
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("ZONE_ALREADY_REVOKED"));
     }
+
+    @Test
+    @DisplayName("限时窗口：时间相交 BLOCKED、仅端点相接 CLEAR；快照返回双方窗口")
+    void timeWindowedReviewOverHttp() throws Exception {
+        // 限时航线 [1000,2000) 水平穿过 y=10
+        mockMvc.perform(post("/api/airspace/routes")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"t1","requestId":"req-t-route",
+                                 "windowStart":1000,"windowEnd":2000,
+                                 "points":[{"x":0,"y":10},{"x":100,"y":10}]}"""))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.windowStart").value(1000))
+                .andExpect(jsonPath("$.data.windowEnd").value(2000));
+
+        // 限时区域 [1500,2500) 几何穿过 → 时间相交 → BLOCKED，且回传双方窗口快照
+        mockMvc.perform(post("/api/airspace/zones")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"zoneId":"tz1","xMin":40,"yMin":5,"xMax":60,"yMax":15,
+                                 "windowStart":1500,"windowEnd":2500,"requestId":"req-t-zone-1"}"""))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.airspaceVersion").value(1));
+        mockMvc.perform(post("/api/airspace/reviews")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"t1","routeVersion":1,"airspaceVersion":1,
+                                 "requestId":"req-t-review-blocked"}"""))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.conclusion").value("BLOCKED"))
+                .andExpect(jsonPath("$.data.hitZoneIds[0]").value("tz1"))
+                .andExpect(jsonPath("$.data.routeWindowStart").value(1000))
+                .andExpect(jsonPath("$.data.routeWindowEnd").value(2000))
+                .andExpect(jsonPath("$.data.hits[0].zoneId").value("tz1"))
+                .andExpect(jsonPath("$.data.hits[0].windowStart").value(1500))
+                .andExpect(jsonPath("$.data.hits[0].windowEnd").value(2500));
+
+        // 再建一个区域，窗口 [2000,3000) 仅与航线端点相接 → 时间不相交
+        mockMvc.perform(post("/api/airspace/zones")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"zoneId":"tz2","xMin":40,"yMin":5,"xMax":60,"yMax":15,
+                                 "windowStart":2000,"windowEnd":3000,"requestId":"req-t-zone-2"}"""))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.airspaceVersion").value(2));
+        mockMvc.perform(post("/api/airspace/reviews")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"t1","routeVersion":1,"airspaceVersion":2,
+                                 "requestId":"req-t-review-touch"}"""))
+                .andExpect(status().isCreated())
+                // tz1 时间相交仍 BLOCKED，tz2 仅端点相接不计入
+                .andExpect(jsonPath("$.data.conclusion").value("BLOCKED"))
+                .andExpect(jsonPath("$.data.hitZoneIds.length()").value(1))
+                .andExpect(jsonPath("$.data.hitZoneIds[0]").value("tz1"));
+    }
+
+    @Test
+    @DisplayName("非法时间窗口 400：仅给一个端点或开始不早于结束")
+    void invalidTimeWindowOverHttp() throws Exception {
+        // 仅提供 windowStart
+        mockMvc.perform(post("/api/airspace/zones")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"zoneId":"tw1","xMin":0,"yMin":0,"xMax":10,"yMax":10,
+                                 "windowStart":1000,"requestId":"req-tw1"}"""))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("INVALID_TIME_WINDOW"));
+        // 开始不早于结束
+        mockMvc.perform(post("/api/airspace/routes")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"tw2","requestId":"req-tw2",
+                                 "windowStart":2000,"windowEnd":2000,
+                                 "points":[{"x":0,"y":0},{"x":1,"y":1}]}"""))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("INVALID_TIME_WINDOW"));
+    }
 }

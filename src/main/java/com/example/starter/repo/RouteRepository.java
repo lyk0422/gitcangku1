@@ -1,6 +1,7 @@
 package com.example.starter.repo;
 
 import com.example.starter.domain.Point;
+import com.example.starter.domain.TimeWindow;
 import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
@@ -19,12 +20,14 @@ public class RouteRepository {
         this.jdbc = jdbc;
     }
 
-    /** 按 routeId 查询航线（含当前版本点列），不存在返回 null。 */
+    /** 按 routeId 查询航线（含当前版本点列与窗口），不存在返回 null。 */
     public RoutePo findRoute(String routeId) {
         Integer version;
+        TimeWindow window;
         try {
             version = jdbc.queryForObject(
                     "SELECT version FROM route WHERE route_id = ?", Integer.class, routeId);
+            window = findWindow(routeId);
         } catch (EmptyResultDataAccessException ex) {
             return null;
         }
@@ -32,14 +35,14 @@ public class RouteRepository {
             return null;
         }
         List<Point> points = findPoints(routeId);
-        return new RoutePo(routeId, version, points);
+        return new RoutePo(routeId, version, points, window);
     }
 
     /**
-     * 在当前事务内对航线行做真实更新（touch 加一）取得行级排他锁，并读取航线（含点列）。
+     * 在当前事务内对航线行做真实更新（touch 加一）取得行级排他锁，并读取航线（含点列与窗口）。
      *
      * <p>更新为不同的值确保 H2/MySQL 不跳过加锁；与替换操作的行更新互斥，
-     * 保证审核读到的航线版本与点列来自一致状态。</p>
+     * 保证审核读到的航线版本、点列与窗口来自一致状态。</p>
      *
      * @return 航线当前状态；航线不存在返回 null（更新 0 行）
      */
@@ -55,7 +58,16 @@ public class RouteRepository {
             return null;
         }
         List<Point> points = findPoints(routeId);
-        return new RoutePo(routeId, version, points);
+        return new RoutePo(routeId, version, points, findWindow(routeId));
+    }
+
+    private TimeWindow findWindow(String routeId) {
+        return jdbc.queryForObject(
+                "SELECT window_start, window_end FROM route WHERE route_id = ?",
+                (rs, n) -> new TimeWindow(
+                        (Long) rs.getObject("window_start"),
+                        (Long) rs.getObject("window_end")),
+                routeId);
     }
 
     private List<Point> findPoints(String routeId) {
@@ -64,23 +76,27 @@ public class RouteRepository {
                 (rs, n) -> new Point(rs.getInt("x"), rs.getInt("y")), routeId);
     }
 
-    /** 创建航线（初始版本 1）并写入点列（调用方负责事务）。 */
-    public void insertRoute(String routeId, List<Point> points) {
-        jdbc.update("INSERT INTO route (route_id, version, touch) VALUES (?, 1, 0)", routeId);
+    /** 创建航线（初始版本 1）并写入点列与整体窗口（调用方负责事务）。 */
+    public void insertRoute(String routeId, List<Point> points, TimeWindow window) {
+        jdbc.update(
+                "INSERT INTO route (route_id, version, touch, window_start, window_end) "
+                        + "VALUES (?, 1, 0, ?, ?)",
+                routeId, window.startMs(), window.endMs());
         insertPoints(routeId, points);
     }
 
     /**
-     * 条件更新航线版本：仅当当前版本等于 expectedVersion 时加一（同时推进 touch
-     * 以持有行写锁，与审核事务互斥）。
+     * 条件更新航线版本：仅当当前版本等于 expectedVersion 时加一、推进 touch 以持有行写锁，
+     * 并整体写入新窗口（与审核事务互斥）。即使仅窗口改变，版本也一定推进。
      *
      * @return 更新行数；0 表示版本不匹配
      */
-    public int compareAndIncrementVersion(String routeId, int expectedVersion) {
+    public int compareAndIncrementVersion(String routeId, int expectedVersion, TimeWindow window) {
         return jdbc.update(
-                "UPDATE route SET version = version + 1, touch = touch + 1 "
+                "UPDATE route SET version = version + 1, touch = touch + 1, "
+                        + "window_start = ?, window_end = ? "
                         + "WHERE route_id = ? AND version = ?",
-                routeId, expectedVersion);
+                window.startMs(), window.endMs(), routeId, expectedVersion);
     }
 
     /** 删除航线旧点列（调用方负责事务）。 */

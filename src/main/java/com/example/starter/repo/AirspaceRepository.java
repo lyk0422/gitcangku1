@@ -27,7 +27,9 @@ public class AirspaceRepository {
             rs.getInt("y_max"),
             rs.getString("status"),
             rs.getLong("created_version"),
-            (Long) rs.getObject("revoked_version"));
+            (Long) rs.getObject("revoked_version"),
+            (Long) rs.getObject("window_start"),
+            (Long) rs.getObject("window_end"));
 
     /** 读取当前全局空域版本（单行）。 */
     public long getGlobalVersion() {
@@ -40,7 +42,8 @@ public class AirspaceRepository {
     public ZonePo findZone(String zoneId) {
         try {
             return jdbc.queryForObject(
-                    "SELECT zone_id, x_min, y_min, x_max, y_max, status, created_version, revoked_version "
+                    "SELECT zone_id, x_min, y_min, x_max, y_max, status, created_version, "
+                            + "revoked_version, window_start, window_end "
                             + "FROM no_fly_zone WHERE zone_id = ?", ZONE_MAPPER, zoneId);
         } catch (EmptyResultDataAccessException ex) {
             return null;
@@ -50,7 +53,8 @@ public class AirspaceRepository {
     /** 查询全部有效（ACTIVE）禁飞区。 */
     public List<ZonePo> findActiveZones() {
         return jdbc.query(
-                "SELECT zone_id, x_min, y_min, x_max, y_max, status, created_version, revoked_version "
+                "SELECT zone_id, x_min, y_min, x_max, y_max, status, created_version, "
+                        + "revoked_version, window_start, window_end "
                         + "FROM no_fly_zone WHERE status = 'ACTIVE' ORDER BY zone_id",
                 ZONE_MAPPER);
     }
@@ -58,10 +62,12 @@ public class AirspaceRepository {
     /** 创建禁飞区（调用方负责事务与版本递增）。 */
     public void insertZone(ZonePo zone) {
         jdbc.update("INSERT INTO no_fly_zone "
-                        + "(zone_id, x_min, y_min, x_max, y_max, status, created_version, revoked_version) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        + "(zone_id, x_min, y_min, x_max, y_max, status, created_version, "
+                        + "revoked_version, window_start, window_end) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 zone.zoneId(), zone.xMin(), zone.yMin(), zone.xMax(), zone.yMax(),
-                zone.status(), zone.createdVersion(), zone.revokedVersion());
+                zone.status(), zone.createdVersion(), zone.revokedVersion(),
+                zone.windowStart(), zone.windowEnd());
     }
 
     /** 撤销禁飞区并记录撤销生效版本（调用方负责事务与版本递增）。 */
