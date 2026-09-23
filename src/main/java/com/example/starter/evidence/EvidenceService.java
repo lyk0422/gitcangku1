@@ -9,6 +9,8 @@ import com.example.starter.evidence.dto.IntakeRequest;
 import com.example.starter.evidence.dto.LoanCreateRequest;
 import com.example.starter.evidence.dto.LoanReturnRequest;
 import com.example.starter.evidence.dto.LoanView;
+import com.example.starter.evidence.dto.ResealApplyRequest;
+import com.example.starter.evidence.dto.ResealView;
 import com.example.starter.evidence.dto.SealInspectionRequest;
 import com.example.starter.evidence.dto.TransferInitiateRequest;
 import com.example.starter.evidence.dto.TransferView;
@@ -35,6 +37,14 @@ public class EvidenceService {
     static final String OP_SEAL_INSPECTION = "SEAL_INSPECTION";
     static final String OP_LOAN_BORROW = "LOAN_BORROW";
     static final String OP_LOAN_RETURN = "LOAN_RETURN";
+    static final String OP_RESEAL_APPLY = "RESEAL_APPLY";
+    static final String OP_RESEAL_CONFIRM = "RESEAL_CONFIRM";
+    static final String OP_RESEAL_CANCEL = "RESEAL_CANCEL";
+
+    /** 封条来源：入库初始封条。 */
+    static final String SEAL_SOURCE_INTAKE = "INTAKE";
+    /** 封条来源：双人重新封存新封条。 */
+    static final String SEAL_SOURCE_RESEAL = "RESEAL";
 
     /**
      * 借出最长期限：72 小时。
@@ -45,6 +55,8 @@ public class EvidenceService {
     private final TransferRecordRepository transferRepository;
     private final SealInspectionRepository inspectionRepository;
     private final LoanRecordRepository loanRepository;
+    private final SealHistoryRepository sealHistoryRepository;
+    private final ResealApplicationRepository resealRepository;
     private final CommandLogRepository commandLogRepository;
     private final ObjectMapper objectMapper;
     private final EvidenceClock clock;
@@ -53,6 +65,8 @@ public class EvidenceService {
                            TransferRecordRepository transferRepository,
                            SealInspectionRepository inspectionRepository,
                            LoanRecordRepository loanRepository,
+                           SealHistoryRepository sealHistoryRepository,
+                           ResealApplicationRepository resealRepository,
                            CommandLogRepository commandLogRepository,
                            ObjectMapper objectMapper,
                            EvidenceClock clock) {
@@ -60,6 +74,8 @@ public class EvidenceService {
         this.transferRepository = transferRepository;
         this.inspectionRepository = inspectionRepository;
         this.loanRepository = loanRepository;
+        this.sealHistoryRepository = sealHistoryRepository;
+        this.resealRepository = resealRepository;
         this.commandLogRepository = commandLogRepository;
         this.objectMapper = objectMapper;
         this.clock = clock;
@@ -80,6 +96,9 @@ public class EvidenceService {
         LocalDateTime now = LocalDateTime.now();
         evidenceRepository.insert(request.evidenceKey(), request.caseKey(), request.category(),
                 request.sealNo(), actorId, now);
+        // 初始封条进入封条历史，作为后续重新封存“新封条不得与任一历史封条相同”的基准。
+        sealHistoryRepository.insert(request.evidenceKey(), request.sealNo(),
+                SEAL_SOURCE_INTAKE, now);
         Evidence evidence = evidenceRepository.findByKey(request.evidenceKey()).orElseThrow();
         return record(request.commandKey(), OP_INTAKE, actorId, requestHash, 201, toView(evidence));
     }
@@ -238,6 +257,9 @@ public class EvidenceService {
             throw ApiException.badRequest("借用人不能与当前保管人相同");
         }
         requireCustodian(evidence, actorId);
+        if (resealRepository.findPendingByEvidenceKey(evidenceKey).isPresent()) {
+            throw ApiException.conflict("重新封存待见证人确认期间禁止借出: " + evidenceKey);
+        }
         if (evidence.status() == EvidenceStatus.SEAL_BROKEN) {
             throw ApiException.unprocessable("封条已异常，禁止借出: " + evidenceKey);
         }
@@ -317,6 +339,138 @@ public class EvidenceService {
     }
 
     /**
+     * 申请双人重新封存：仅 SEAL_BROKEN 且无未归还借出、无待接收交接证物的当前保管人可申请。
+     * 见证人必须与申请人不同，新封条不得与本证物任一历史封条相同；每件证物至多一笔 PENDING。
+     * 申请不改变当前封条与异常状态。resealKey 全局唯一，失败不占用幂等命令键也不留下申请占位。
+     */
+    @Transactional
+    public StoredResponse applyReseal(String actorId, String evidenceKey,
+                                      ResealApplyRequest request, String requestHash) {
+        Optional<StoredResponse> replay = checkReplay(request.commandKey(), requestHash);
+        if (replay.isPresent()) {
+            return replay.get();
+        }
+        Evidence evidence = lockEvidence(evidenceKey);
+        // 并发下本事务可能在证物行锁上等待；持锁后复查幂等日志，重放先提交事务的首次结果。
+        replay = checkReplay(request.commandKey(), requestHash);
+        if (replay.isPresent()) {
+            return replay.get();
+        }
+        requireCustodian(evidence, actorId);
+        if (request.witnessId().equals(actorId)) {
+            throw ApiException.badRequest("见证人不能与申请保管人相同");
+        }
+        if (evidence.status() != EvidenceStatus.SEAL_BROKEN) {
+            throw ApiException.conflict("仅封条异常（SEAL_BROKEN）证物可申请重新封存: " + evidenceKey);
+        }
+        if (transferRepository.findPendingByEvidenceKey(evidenceKey).isPresent()) {
+            throw ApiException.conflict("存在待接收交接，禁止申请重新封存: " + evidenceKey);
+        }
+        if (loanRepository.findActiveByEvidenceKey(evidenceKey).isPresent()) {
+            throw ApiException.conflict("存在未归还借出，禁止申请重新封存: " + evidenceKey);
+        }
+        if (resealRepository.findPendingByEvidenceKey(evidenceKey).isPresent()) {
+            throw ApiException.conflict("证物已存在待见证的重新封存申请: " + evidenceKey);
+        }
+        if (sealHistoryRepository.existsSeal(evidenceKey, request.newSealNo())) {
+            throw ApiException.conflict("新封条号与本证物历史封条重复: " + request.newSealNo());
+        }
+        if (resealRepository.findByResealKey(request.resealKey()).isPresent()) {
+            throw ApiException.conflict("重新封存键已存在: " + request.resealKey());
+        }
+        LocalDateTime now = LocalDateTime.now();
+        resealRepository.insert(request.resealKey(), evidenceKey, actorId, request.witnessId(),
+                request.reason(), request.newSealNo(), now);
+        ResealApplication created = resealRepository.findByResealKey(request.resealKey()).orElseThrow();
+        return record(request.commandKey(), OP_RESEAL_APPLY, actorId, requestHash,
+                200, toView(created));
+    }
+
+    /**
+     * 见证人确认重新封存：仅申请指定见证人可确认。确认须再次满足原保管人未变、证物仍异常、
+     * 无未归还借出且无待接收交接；同一事务原子将申请置 CONFIRMED、证物恢复 SEALED 并换用新封条、
+     * 追加封条历史与保管链确认快照。仅一个确认/撤销终态可成功。
+     */
+    @Transactional
+    public StoredResponse confirmReseal(String actorId, String evidenceKey, String resealKey,
+                                        CommandRequest request, String requestHash) {
+        Optional<StoredResponse> replay = checkReplay(request.commandKey(), requestHash);
+        if (replay.isPresent()) {
+            return replay.get();
+        }
+        Evidence evidence = lockEvidence(evidenceKey);
+        // 并发下本事务可能在证物行锁上等待；持锁后复查幂等日志，重放先提交事务的首次结果。
+        replay = checkReplay(request.commandKey(), requestHash);
+        if (replay.isPresent()) {
+            return replay.get();
+        }
+        ResealApplication application = requirePendingReseal(evidenceKey, resealKey);
+        if (!application.witnessId().equals(actorId)) {
+            throw ApiException.conflict("仅申请指定见证人可确认重新封存: " + actorId);
+        }
+        if (!application.applicantId().equals(evidence.custodianId())) {
+            throw ApiException.conflict("原保管人已变更，不能确认重新封存: " + evidenceKey);
+        }
+        if (evidence.status() != EvidenceStatus.SEAL_BROKEN) {
+            throw ApiException.conflict("证物已不再是封条异常状态，不能确认重新封存: " + evidenceKey);
+        }
+        if (transferRepository.findPendingByEvidenceKey(evidenceKey).isPresent()) {
+            throw ApiException.conflict("存在待接收交接，不能确认重新封存: " + evidenceKey);
+        }
+        if (loanRepository.findActiveByEvidenceKey(evidenceKey).isPresent()) {
+            throw ApiException.conflict("存在未归还借出，不能确认重新封存: " + evidenceKey);
+        }
+        // 防御性复查：新封条仍不得与历史封条重复（申请后封条历史不会缩减）。
+        if (sealHistoryRepository.existsSeal(evidenceKey, application.newSealNo())) {
+            throw ApiException.conflict("新封条号与本证物历史封条重复: " + application.newSealNo());
+        }
+        LocalDateTime nowShanghai = LocalDateTime.now();
+        LocalDateTime nowUtc = clock.nowUtc();
+        // 先做终态条件更新：确认与撤销竞争时，仅当仍为 PENDING 的一方成功，失败者整体回滚。
+        if (!resealRepository.confirm(application.id(), evidence.sealNo(),
+                application.newSealNo(), nowUtc)) {
+            throw ApiException.conflict("重新封存申请已被处理: " + resealKey);
+        }
+        sealHistoryRepository.insert(evidenceKey, application.newSealNo(), SEAL_SOURCE_RESEAL,
+                nowShanghai);
+        evidenceRepository.updateSeal(evidenceKey, application.newSealNo(), EvidenceStatus.SEALED,
+                nowShanghai);
+        ResealApplication confirmed = resealRepository.findByResealKey(resealKey).orElseThrow();
+        return record(request.commandKey(), OP_RESEAL_CONFIRM, actorId, requestHash,
+                200, toView(confirmed));
+    }
+
+    /**
+     * 申请人撤销重新封存：仅申请人可撤销，证物保持异常且不换封条；申请置 CANCELLED（终态）。
+     */
+    @Transactional
+    public StoredResponse cancelReseal(String actorId, String evidenceKey, String resealKey,
+                                       CommandRequest request, String requestHash) {
+        Optional<StoredResponse> replay = checkReplay(request.commandKey(), requestHash);
+        if (replay.isPresent()) {
+            return replay.get();
+        }
+        Evidence evidence = lockEvidence(evidenceKey);
+        // 并发下本事务可能在证物行锁上等待；持锁后复查幂等日志，重放先提交事务的首次结果。
+        replay = checkReplay(request.commandKey(), requestHash);
+        if (replay.isPresent()) {
+            return replay.get();
+        }
+        ResealApplication application = requirePendingReseal(evidenceKey, resealKey);
+        if (!application.applicantId().equals(actorId)) {
+            throw ApiException.conflict("仅申请人可撤销重新封存: " + actorId);
+        }
+        LocalDateTime nowUtc = clock.nowUtc();
+        // 终态条件更新：与确认竞争时仅一方成功；撤销不换封条、不改证物状态。
+        if (!resealRepository.cancel(application.id(), nowUtc)) {
+            throw ApiException.conflict("重新封存申请已被处理: " + resealKey);
+        }
+        ResealApplication cancelled = resealRepository.findByResealKey(resealKey).orElseThrow();
+        return record(request.commandKey(), OP_RESEAL_CANCEL, actorId, requestHash,
+                200, toView(cancelled));
+    }
+
+    /**
      * 按借用人查询未归还借出及逾期记录（逾期仅为查询时刻标识，不改变任何状态）。
      */
     @Transactional(readOnly = true)
@@ -336,7 +490,7 @@ public class EvidenceService {
     }
 
     /**
-     * 查询完整保管链：证物当前状态 + 全部交接记录 + 全部借出记录 + 全部核验记录。
+     * 查询完整保管链：证物当前状态 + 全部交接记录 + 全部借出记录 + 全部核验记录 + 全部重新封存申请。
      */
     @Transactional(readOnly = true)
     public CustodyChainView custodyChain(String evidenceKey) {
@@ -348,7 +502,9 @@ public class EvidenceService {
                 .stream().map(this::toView).toList();
         List<InspectionView> inspections = inspectionRepository.findByEvidenceKey(evidenceKey)
                 .stream().map(this::toView).toList();
-        return new CustodyChainView(toView(evidence), transfers, loans, inspections);
+        List<ResealView> reseals = resealRepository.findByEvidenceKey(evidenceKey)
+                .stream().map(this::toView).toList();
+        return new CustodyChainView(toView(evidence), transfers, loans, inspections, reseals);
     }
 
     private Evidence lockEvidence(String evidenceKey) {
@@ -374,6 +530,27 @@ public class EvidenceService {
         }
         return transferRepository.findPendingByEvidenceKey(evidenceKey)
                 .orElseThrow(() -> ApiException.conflict("证物不存在待接收交接: " + evidenceKey));
+    }
+
+    /**
+     * 定位指定的待见证重新封存申请：resealKey 必须存在、属于该证物且仍为 PENDING（终态不可再决定）。
+     */
+    private ResealApplication requirePendingReseal(String evidenceKey, String resealKey) {
+        ResealApplication application = resealRepository.findByResealKey(resealKey)
+                .orElseThrow(() -> ApiException.notFound("重新封存申请不存在: " + resealKey));
+        if (!application.evidenceKey().equals(evidenceKey)) {
+            throw ApiException.notFound("重新封存申请不属于该证物: " + resealKey);
+        }
+        if (application.status() != ResealStatus.PENDING) {
+            throw ApiException.conflict("重新封存申请已结束，不可再次处理: " + resealKey);
+        }
+        // 状态须与当前证物唯一的 PENDING 申请一致（防御并发脏读）。
+        ResealApplication pending = resealRepository.findPendingByEvidenceKey(evidenceKey)
+                .orElseThrow(() -> ApiException.conflict("证物不存在待见证的重新封存申请: " + evidenceKey));
+        if (!pending.id().equals(application.id())) {
+            throw ApiException.conflict("重新封存申请已结束，不可再次处理: " + resealKey);
+        }
+        return application;
     }
 
     private Optional<StoredResponse> checkReplay(String commandKey, String requestHash) {
@@ -415,6 +592,13 @@ public class EvidenceService {
     private InspectionView toView(SealInspection inspection) {
         return new InspectionView(inspection.evidenceKey(), inspection.inspectorId(),
                 inspection.passed(), inspection.note(), inspection.createdAt());
+    }
+
+    private ResealView toView(ResealApplication application) {
+        return new ResealView(application.resealKey(), application.evidenceKey(),
+                application.applicantId(), application.witnessId(), application.reason(),
+                application.newSealNo(), application.status(), application.oldSealNo(),
+                application.confirmedSealNo(), application.appliedAt(), application.decidedAt());
     }
 
     private LoanView toView(LoanRecord loan) {

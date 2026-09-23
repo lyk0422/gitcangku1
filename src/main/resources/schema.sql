@@ -7,9 +7,9 @@ CREATE TABLE IF NOT EXISTS evidence (
     evidence_key VARCHAR(64) NOT NULL COMMENT '证物业务键，全局唯一，入库后不可修改',
     case_key VARCHAR(64) NOT NULL COMMENT '所属案件键，入库后不可修改',
     category VARCHAR(64) NOT NULL COMMENT '证物类别，入库后不可修改',
-    seal_no VARCHAR(64) NOT NULL COMMENT '封条编号，入库后不可修改',
+    seal_no VARCHAR(64) NOT NULL COMMENT '封条编号，入库时确定；仅可在重新封存确认后换用新封条，历史封条不可再用',
     custodian_id VARCHAR(64) NOT NULL COMMENT '当前保管人（操作人标识），交接接受后原子切换；借出期间不变',
-    status VARCHAR(20) NOT NULL COMMENT '证物状态：SEALED 已封存 / TRANSFER_PENDING 待接收 / BORROWED 借出未归还 / SEAL_BROKEN 封条异常（终态）',
+    status VARCHAR(20) NOT NULL COMMENT '证物状态：SEALED 已封存 / TRANSFER_PENDING 待接收 / BORROWED 借出未归还 / SEAL_BROKEN 封条异常（仅可经双人重新封存恢复 SEALED）',
     created_at DATETIME(6) NOT NULL COMMENT '入库时间，Asia/Shanghai',
     updated_at DATETIME(6) NOT NULL COMMENT '最近一次状态或保管人变更时间，Asia/Shanghai',
     CONSTRAINT uk_evidence_key UNIQUE (evidence_key)
@@ -65,10 +65,41 @@ CREATE TABLE IF NOT EXISTS command_log (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     command_key VARCHAR(64) NOT NULL COMMENT '幂等命令键，全局唯一',
     actor_id VARCHAR(64) NOT NULL COMMENT '发起操作人',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN/RESEAL_APPLY/RESEAL_CONFIRM/RESEAL_CANCEL',
     request_hash VARCHAR(64) NOT NULL COMMENT '请求参数规范化后的 SHA-256，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行的 HTTP 状态码',
     response_body TEXT NOT NULL COMMENT '首次执行的响应体 JSON，重放时原样返回',
     created_at DATETIME(6) NOT NULL COMMENT '首次执行时间，Asia/Shanghai',
     CONSTRAINT uk_command_key UNIQUE (command_key)
+);
+
+-- 证物封条历史：每件证物用过的每个封条号一行；(evidence_key, seal_no) 唯一，
+-- 从数据库层保证重新封存的新封条不得与本证物任一历史封条相同。入库时写入初始封条。
+CREATE TABLE IF NOT EXISTS seal_history (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    evidence_key VARCHAR(64) NOT NULL COMMENT '关联证物业务键',
+    seal_no VARCHAR(64) NOT NULL COMMENT '该证物曾使用的封条编号，含初始封条与历次重新封存新封条',
+    source VARCHAR(32) NOT NULL COMMENT '封条来源：INTAKE 入库初始封条 / RESEAL 重新封存新封条',
+    created_at DATETIME(6) NOT NULL COMMENT '该封条启用时间，Asia/Shanghai',
+    CONSTRAINT uk_seal_history_evidence_no UNIQUE (evidence_key, seal_no),
+    KEY idx_seal_history_evidence (evidence_key)
+);
+
+-- 双人重新封存申请：只追加；每件证物至多一笔 PENDING（由证物行锁 + 服务校验保证），
+-- CONFIRMED/CANCELLED 均为终态。reseal_key 全局唯一，可被不同命令键复用检查（复用返回 409）。
+CREATE TABLE IF NOT EXISTS reseal_application (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    reseal_key VARCHAR(64) NOT NULL COMMENT '重新封存业务键，全局唯一，申请时由当前保管人提交',
+    evidence_key VARCHAR(64) NOT NULL COMMENT '关联证物业务键',
+    applicant_id VARCHAR(64) NOT NULL COMMENT '申请人（申请时的当前保管人），仅本人可撤销',
+    witness_id VARCHAR(64) NOT NULL COMMENT '指定见证人，必须与申请人不同，仅本人可确认',
+    reason VARCHAR(512) NOT NULL COMMENT '重新封存原因，非空',
+    new_seal_no VARCHAR(64) NOT NULL COMMENT '拟换用的新封条号，不得与本证物任一历史封条相同',
+    status VARCHAR(20) NOT NULL COMMENT '申请状态：PENDING 待见证 / CONFIRMED 见证人已确认（终态）/ CANCELLED 申请人已撤销（终态）',
+    old_seal_no VARCHAR(64) NULL COMMENT '确认快照：确认前的旧封条号；NULL 表示尚未确认',
+    confirmed_seal_no VARCHAR(64) NULL COMMENT '确认快照：确认后启用的新封条号；NULL 表示尚未确认',
+    applied_at DATETIME(6) NOT NULL COMMENT '申请提交时间，Asia/Shanghai',
+    decided_at DATETIME(6) NULL COMMENT '确认或撤销的 UTC 时刻（确认快照）；NULL 表示仍待见证',
+    CONSTRAINT uk_reseal_key UNIQUE (reseal_key),
+    KEY idx_reseal_evidence (evidence_key)
 );

@@ -7,8 +7,10 @@ import com.example.starter.evidence.dto.IntakeRequest;
 import com.example.starter.evidence.dto.LoanCreateRequest;
 import com.example.starter.evidence.dto.LoanReturnRequest;
 import com.example.starter.evidence.dto.LoanView;
+import com.example.starter.evidence.dto.ResealApplyRequest;
 import com.example.starter.evidence.dto.SealInspectionRequest;
 import com.example.starter.evidence.dto.TransferInitiateRequest;
+import com.example.starter.evidence.dto.TransferView;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import org.springframework.http.HttpStatus;
@@ -23,7 +25,9 @@ import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * 证物封存交接 API。所有操作人通过 X-Actor-Id 请求头提供；
@@ -139,6 +143,63 @@ public class EvidenceController {
         StoredResponse response = idempotencyAdvisor.guard(request.commandKey(), hash,
                 () -> evidenceService.returnLoan(actorId, evidenceKey, request, hash));
         return toEntity(response);
+    }
+
+    /**
+     * 申请双人重新封存：仅 SEAL_BROKEN 且无借出/待交接证物的当前保管人可申请。
+     * 提交全局唯一 resealKey、新封条号、非空原因及不同于自己的见证人；申请不改变当前状态。
+     */
+    @PostMapping("/{evidenceKey}/reseals")
+    public ResponseEntity<String> applyReseal(@RequestHeader(ACTOR_HEADER) @NotBlank String actorId,
+                                              @PathVariable String evidenceKey,
+                                              @Valid @RequestBody ResealApplyRequest request) {
+        String hash = idempotencyAdvisor.hash(EvidenceService.OP_RESEAL_APPLY, actorId,
+                evidenceKey, request);
+        StoredResponse response = idempotencyAdvisor.guard(request.commandKey(), hash,
+                () -> evidenceService.applyReseal(actorId, evidenceKey, request, hash));
+        return toEntity(response);
+    }
+
+    /**
+     * 见证人确认重新封存：仅申请指定见证人；原子恢复 SEALED、换用新封条并追加确认快照。
+     */
+    @PostMapping("/{evidenceKey}/reseals/{resealKey}/confirm")
+    public ResponseEntity<String> confirmReseal(@RequestHeader(ACTOR_HEADER) @NotBlank String actorId,
+                                                @PathVariable String evidenceKey,
+                                                @PathVariable String resealKey,
+                                                @Valid @RequestBody CommandRequest request) {
+        String hash = idempotencyAdvisor.hash(EvidenceService.OP_RESEAL_CONFIRM, actorId,
+                evidenceKey + "|" + resealKey, request);
+        StoredResponse response = idempotencyAdvisor.guard(request.commandKey(), hash,
+                () -> evidenceService.confirmReseal(actorId, evidenceKey, resealKey, request, hash));
+        return toEntity(response);
+    }
+
+    /**
+     * 申请人撤销重新封存：仅申请人；置 CANCELLED，不换封条、不改状态。
+     */
+    @PostMapping("/{evidenceKey}/reseals/{resealKey}/cancel")
+    public ResponseEntity<String> cancelReseal(@RequestHeader(ACTOR_HEADER) @NotBlank String actorId,
+                                               @PathVariable String evidenceKey,
+                                               @PathVariable String resealKey,
+                                               @Valid @RequestBody CommandRequest request) {
+        String hash = idempotencyAdvisor.hash(EvidenceService.OP_RESEAL_CANCEL, actorId,
+                evidenceKey + "|" + resealKey, request);
+        StoredResponse response = idempotencyAdvisor.guard(request.commandKey(), hash,
+                () -> evidenceService.cancelReseal(actorId, evidenceKey, resealKey, request, hash));
+        return toEntity(response);
+    }
+
+    /**
+     * 查询证物双人重新封存申请历史与证物当前状态。
+     */
+    @GetMapping("/{evidenceKey}/reseals")
+    public Map<String, Object> listReseals(@PathVariable String evidenceKey) {
+        CustodyChainView chain = evidenceService.custodyChain(evidenceKey);
+        Map<String, Object> view = new LinkedHashMap<>();
+        view.put("evidence", chain.evidence());
+        view.put("reseals", chain.reseals());
+        return view;
     }
 
     /**
