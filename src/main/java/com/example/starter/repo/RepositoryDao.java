@@ -1,8 +1,11 @@
 package com.example.starter.repo;
 
+import com.example.starter.domain.ArtifactSignature;
 import com.example.starter.domain.ArtifactVersion;
 import com.example.starter.domain.DependencyRange;
 import com.example.starter.domain.RepositorySnapshot;
+import com.example.starter.domain.SignaturePolicy;
+import com.example.starter.domain.TrustedKey;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.support.GeneratedKeyHolder;
 import org.springframework.jdbc.support.KeyHolder;
@@ -16,6 +19,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.stream.Collectors;
 
 /**
@@ -56,9 +60,11 @@ public class RepositoryDao {
      */
     public RepositorySnapshot loadSnapshot() {
         List<ArtifactRow> rows = jdbcTemplate.query(
-                "SELECT id, name, version, withdrawn FROM artifact ORDER BY name ASC, version DESC",
+                "SELECT id, name, version, withdrawn, content_digest FROM artifact "
+                        + "ORDER BY name ASC, version DESC",
                 (rs, n) -> new ArtifactRow(rs.getLong("id"), rs.getString("name"),
-                        rs.getInt("version"), rs.getInt("withdrawn") == 1));
+                        rs.getInt("version"), rs.getInt("withdrawn") == 1,
+                        rs.getString("content_digest")));
 
         List<DepRow> depRows = jdbcTemplate.query(
                 "SELECT artifact_id, name, minimum_version, maximum_version FROM artifact_dependency",
@@ -73,7 +79,7 @@ public class RepositoryDao {
         for (ArtifactRow row : rows) {
             List<DependencyRange> deps = depsByArtifact.getOrDefault(row.id(), List.of());
             ArtifactVersion version = new ArtifactVersion(row.id(), row.name(), row.version(),
-                    row.withdrawn(), List.copyOf(deps));
+                    row.withdrawn(), row.contentDigest(), List.copyOf(deps));
             artifacts.computeIfAbsent(row.name(), k -> new ArrayList<>()).add(version);
         }
         return new RepositorySnapshot(getRepositoryVersion(), Map.copyOf(artifacts));
@@ -102,15 +108,17 @@ public class RepositoryDao {
     }
 
     /** 新增制品版本，返回自增主键。 */
-    public long insertArtifact(String name, int version, Instant createdAt) {
+    public long insertArtifact(String name, int version, String contentDigest, Instant createdAt) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbcTemplate.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO artifact (name, version, withdrawn, created_at) VALUES (?, ?, 0, ?)",
+                    "INSERT INTO artifact (name, version, withdrawn, content_digest, created_at) "
+                            + "VALUES (?, ?, 0, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, name);
             ps.setInt(2, version);
-            ps.setTimestamp(3, Timestamp.from(createdAt));
+            ps.setString(3, contentDigest);
+            ps.setTimestamp(4, Timestamp.from(createdAt));
             return ps;
         }, keyHolder);
         Number key = keyHolder.getKey();
@@ -131,9 +139,11 @@ public class RepositoryDao {
     /** 读取单个制品版本（含依赖），不存在返回 null。 */
     public ArtifactVersion loadArtifact(String name, int version) {
         List<ArtifactRow> rows = jdbcTemplate.query(
-                "SELECT id, name, version, withdrawn FROM artifact WHERE name = ? AND version = ?",
+                "SELECT id, name, version, withdrawn, content_digest FROM artifact "
+                        + "WHERE name = ? AND version = ?",
                 (rs, n) -> new ArtifactRow(rs.getLong("id"), rs.getString("name"),
-                        rs.getInt("version"), rs.getInt("withdrawn") == 1),
+                        rs.getInt("version"), rs.getInt("withdrawn") == 1,
+                        rs.getString("content_digest")),
                 name, version);
         if (rows.isEmpty()) {
             return null;
@@ -145,7 +155,7 @@ public class RepositoryDao {
                         rs.getInt("minimum_version"), rs.getInt("maximum_version")),
                 row.id());
         return new ArtifactVersion(row.id(), row.name(), row.version(), row.withdrawn(),
-                List.copyOf(deps));
+                row.contentDigest(), List.copyOf(deps));
     }
 
     /** 仓库版本号加一，返回加一后的版本号（须在持有行锁时调用）。 */
@@ -186,11 +196,13 @@ public class RepositoryDao {
         return key.longValue();
     }
 
-    /** 新增锁文件精确版本条目。 */
-    public void insertLockEntry(long lockFileId, String name, int version) {
+    /** 新增锁文件精确版本条目（含冻结的签名验证证据）。 */
+    public void insertLockEntry(long lockFileId, String name, int version, String contentDigest,
+                                Long policyVersion, String signatureKeyIds) {
         jdbcTemplate.update(
-                "INSERT INTO lock_file_entry (lock_file_id, name, version) VALUES (?, ?, ?)",
-                lockFileId, name, version);
+                "INSERT INTO lock_file_entry (lock_file_id, name, version, content_digest, "
+                        + "policy_version, signature_key_ids) VALUES (?, ?, ?, ?, ?, ?)",
+                lockFileId, name, version, contentDigest, policyVersion, signatureKeyIds);
     }
 
     /** 幂等记录视图。 */
@@ -238,8 +250,9 @@ public class RepositoryDao {
                               long repositoryVersion, Instant createdAt) {
     }
 
-    /** 锁文件条目行。 */
-    public record LockEntryRow(long lockFileId, String name, int version) {
+    /** 锁文件条目行（含冻结的签名验证证据）。 */
+    public record LockEntryRow(long lockFileId, String name, int version,
+                               String contentDigest, Long policyVersion, String signatureKeyIds) {
     }
 
     /** 查询全部历史锁文件，按 ID 升序。 */
@@ -267,14 +280,196 @@ public class RepositoryDao {
     /** 查询某锁文件的全部条目，按名称升序。 */
     public List<LockEntryRow> listLockEntries(long lockFileId) {
         return jdbcTemplate.query(
-                "SELECT lock_file_id, name, version FROM lock_file_entry "
-                        + "WHERE lock_file_id = ? ORDER BY name ASC",
+                "SELECT lock_file_id, name, version, content_digest, policy_version, signature_key_ids "
+                        + "FROM lock_file_entry WHERE lock_file_id = ? ORDER BY name ASC",
                 (rs, n) -> new LockEntryRow(rs.getLong("lock_file_id"),
-                        rs.getString("name"), rs.getInt("version")),
+                        rs.getString("name"), rs.getInt("version"),
+                        rs.getString("content_digest"),
+                        (Long) rs.getObject("policy_version"),
+                        rs.getString("signature_key_ids")),
                 lockFileId);
     }
 
-    private record ArtifactRow(long id, String name, int version, boolean withdrawn) {
+    private record ArtifactRow(long id, String name, int version, boolean withdrawn,
+                               String contentDigest) {
+    }
+
+    // ------------------------------------------------------------------
+    // 签名策略、可信钥匙与制品签名
+    // ------------------------------------------------------------------
+
+    /** 是否已存在指定版本的策略。 */
+    public boolean policyExists(long policyVersion) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM signature_policy WHERE policy_version = ?",
+                Integer.class, policyVersion);
+        return count != null && count > 0;
+    }
+
+    /** 已发布的最高策略版本号，无记录返回 0。 */
+    public long maxPolicyVersion() {
+        Long max = jdbcTemplate.queryForObject(
+                "SELECT COALESCE(MAX(policy_version), 0) FROM signature_policy", Long.class);
+        return max == null ? 0L : max;
+    }
+
+    /** 新增策略版本主记录。 */
+    public void insertPolicy(long policyVersion, int thresholdM,
+                             Instant effectiveAt, Instant createdAt) {
+        jdbcTemplate.update(
+                "INSERT INTO signature_policy (policy_version, threshold_m, effective_at, created_at) "
+                        + "VALUES (?, ?, ?, ?)",
+                ps -> {
+                    ps.setLong(1, policyVersion);
+                    ps.setInt(2, thresholdM);
+                    ps.setTimestamp(3, Timestamp.from(effectiveAt));
+                    ps.setTimestamp(4, Timestamp.from(createdAt));
+                });
+    }
+
+    /** 写入策略版本的一个可信 keyId（ordinal 为排序序号）。 */
+    public void insertPolicyKey(long policyVersion, String keyId, int ordinal) {
+        jdbcTemplate.update(
+                "INSERT INTO policy_key (policy_version, key_id, ordinal) VALUES (?, ?, ?)",
+                policyVersion, keyId, ordinal);
+    }
+
+    /** 读取指定策略版本，不存在返回 null（keyIds 按 ordinal 升序）。 */
+    public SignaturePolicy loadPolicy(long policyVersion) {
+        List<PolicyRow> rows = jdbcTemplate.query(
+                "SELECT p.policy_version, p.threshold_m, p.effective_at, p.created_at, "
+                        + "k.key_id FROM signature_policy p "
+                        + "LEFT JOIN policy_key k ON k.policy_version = p.policy_version "
+                        + "WHERE p.policy_version = ? ORDER BY k.ordinal ASC",
+                (rs, n) -> new PolicyRow(rs.getLong("policy_version"),
+                        rs.getInt("threshold_m"),
+                        rs.getTimestamp("effective_at").toInstant(),
+                        rs.getTimestamp("created_at").toInstant(),
+                        rs.getString("key_id")),
+                policyVersion);
+        if (rows.isEmpty()) {
+            return null;
+        }
+        PolicyRow head = rows.get(0);
+        List<String> keyIds = rows.stream().map(PolicyRow::keyId).filter(Objects::nonNull).toList();
+        return new SignaturePolicy(head.policyVersion(), keyIds, head.thresholdM(),
+                head.effectiveAt(), head.createdAt());
+    }
+
+    /**
+     * 选择在指定时刻（事务快照内）已生效的最高版本策略，无生效策略返回 null。
+     */
+    public SignaturePolicy loadEffectivePolicy(Instant now) {
+        Long version = jdbcTemplate.queryForObject(
+                "SELECT MAX(policy_version) FROM signature_policy WHERE effective_at <= ?",
+                Long.class, Timestamp.from(now));
+        if (version == null || version == 0L) {
+            return null;
+        }
+        return loadPolicy(version);
+    }
+
+    /** 查询全部已发布策略，按版本号升序。 */
+    public List<SignaturePolicy> listPolicies() {
+        List<Long> versions = jdbcTemplate.queryForList(
+                "SELECT policy_version FROM signature_policy ORDER BY policy_version ASC",
+                Long.class);
+        List<SignaturePolicy> result = new ArrayList<>();
+        for (Long v : versions) {
+            result.add(loadPolicy(v));
+        }
+        return result;
+    }
+
+    /** 钥匙是否已出现在 trusted_key 中（无论撤销与否）。 */
+    public boolean trustedKeyExists(String keyId) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM trusted_key WHERE key_id = ?", Integer.class, keyId);
+        return count != null && count > 0;
+    }
+
+    /** 登记新可信钥匙；随首个引用它的策略发布时调用。 */
+    public void insertTrustedKey(String keyId, Instant createdAt) {
+        jdbcTemplate.update(
+                "INSERT INTO trusted_key (key_id, created_at, revoked_at) VALUES (?, ?, NULL)",
+                keyId, Timestamp.from(createdAt));
+    }
+
+    /** 读取钥匙状态，不存在返回 null。 */
+    public TrustedKey loadTrustedKey(String keyId) {
+        List<TrustedKey> keys = jdbcTemplate.query(
+                "SELECT key_id, created_at, revoked_at FROM trusted_key WHERE key_id = ?",
+                (rs, n) -> new TrustedKey(rs.getString("key_id"),
+                        rs.getTimestamp("created_at").toInstant(),
+                        rs.getTimestamp("revoked_at") == null
+                                ? null : rs.getTimestamp("revoked_at").toInstant()),
+                keyId);
+        return keys.isEmpty() ? null : keys.get(0);
+    }
+
+    /** 撤销钥匙，仅当当前未撤销时生效，返回受影响行数。 */
+    public int revokeTrustedKey(String keyId, Instant revokedAt) {
+        return jdbcTemplate.update(
+                "UPDATE trusted_key SET revoked_at = ? WHERE key_id = ? AND revoked_at IS NULL",
+                Timestamp.from(revokedAt), keyId);
+    }
+
+    /** 查询全部可信钥匙，按 keyId 升序。 */
+    public List<TrustedKey> listTrustedKeys() {
+        return jdbcTemplate.query(
+                "SELECT key_id, created_at, revoked_at FROM trusted_key ORDER BY key_id ASC",
+                (rs, n) -> new TrustedKey(rs.getString("key_id"),
+                        rs.getTimestamp("created_at").toInstant(),
+                        rs.getTimestamp("revoked_at") == null
+                                ? null : rs.getTimestamp("revoked_at").toInstant()));
+    }
+
+    /** 为制品版本追加签名，返回自增主键。 */
+    public long insertSignature(long artifactId, String keyId, String digest, Instant createdAt) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbcTemplate.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO artifact_signature (artifact_id, key_id, digest, created_at) "
+                            + "VALUES (?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setLong(1, artifactId);
+            ps.setString(2, keyId);
+            ps.setString(3, digest);
+            ps.setTimestamp(4, Timestamp.from(createdAt));
+            return ps;
+        }, keyHolder);
+        Number key = keyHolder.getKey();
+        if (key == null) {
+            throw new IllegalStateException("插入签名未获取自增主键");
+        }
+        return key.longValue();
+    }
+
+    /** 查询某制品版本的全部签名，按 keyId 升序；撤销不改写历史签名。 */
+    public List<ArtifactSignature> listSignatures(long artifactId) {
+        return jdbcTemplate.query(
+                "SELECT artifact_id, key_id, digest, created_at FROM artifact_signature "
+                        + "WHERE artifact_id = ? ORDER BY key_id ASC",
+                (rs, n) -> new ArtifactSignature(rs.getLong("artifact_id"),
+                        rs.getString("key_id"), rs.getString("digest"),
+                        rs.getTimestamp("created_at").toInstant()),
+                artifactId);
+    }
+
+    /** 查询某制品版本的全部签名，按 keyId 升序。 */
+    public List<ArtifactSignature> listSignaturesByName(String name, int version) {
+        return jdbcTemplate.query(
+                "SELECT s.artifact_id, s.key_id, s.digest, s.created_at "
+                        + "FROM artifact_signature s JOIN artifact a ON a.id = s.artifact_id "
+                        + "WHERE a.name = ? AND a.version = ? ORDER BY s.key_id ASC",
+                (rs, n) -> new ArtifactSignature(rs.getLong("artifact_id"),
+                        rs.getString("key_id"), rs.getString("digest"),
+                        rs.getTimestamp("created_at").toInstant()),
+                name, version);
+    }
+
+    private record PolicyRow(long policyVersion, int thresholdM, Instant effectiveAt,
+                             Instant createdAt, String keyId) {
     }
 
     private record DepRow(long artifactId, String name, int minimumVersion, int maximumVersion) {

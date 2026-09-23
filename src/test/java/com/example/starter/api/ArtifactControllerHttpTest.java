@@ -37,9 +37,13 @@ class ArtifactControllerHttpTest {
     void cleanDatabase() {
         jdbcTemplate.update("DELETE FROM lock_file_entry");
         jdbcTemplate.update("DELETE FROM lock_file");
+        jdbcTemplate.update("DELETE FROM artifact_signature");
         jdbcTemplate.update("DELETE FROM artifact_dependency");
         jdbcTemplate.update("DELETE FROM artifact");
         jdbcTemplate.update("DELETE FROM idempotent_request");
+        jdbcTemplate.update("DELETE FROM policy_key");
+        jdbcTemplate.update("DELETE FROM signature_policy");
+        jdbcTemplate.update("DELETE FROM trusted_key");
         jdbcTemplate.update("UPDATE repository_state SET version = 0 WHERE id = 1");
     }
 
