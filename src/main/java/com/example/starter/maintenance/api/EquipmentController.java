@@ -17,6 +17,8 @@ import com.example.starter.maintenance.api.dto.AddReadingRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
+import com.example.starter.maintenance.api.dto.MeterChainResponse;
+import com.example.starter.maintenance.api.dto.MeterReplacementRequest;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
 import com.example.starter.maintenance.api.dto.RegisterEquipmentRequest;
 import com.example.starter.maintenance.api.dto.ReviseReadingRequest;
@@ -92,5 +94,22 @@ public class EquipmentController {
     @GetMapping("/{equipmentId}/maintenances")
     public List<MaintenanceResponse> listMaintenances(@PathVariable String equipmentId) {
         return service.listMaintenances(equipmentId);
+    }
+
+    /**
+     * 工时表更换：提交旧表最后一条读数版本与申报最终读数、新表 meterKey 及起始读数；
+     * 成功后旧表 CLOSED、新表 ACTIVE 并冻结 offset，返回完整链快照（同 requestId 同参重放该快照）。
+     */
+    @PostMapping("/{equipmentId}/meter-replacements")
+    @ResponseStatus(HttpStatus.CREATED)
+    public MeterChainResponse replaceMeter(@PathVariable String equipmentId,
+                                           @Valid @RequestBody MeterReplacementRequest req) {
+        return service.replaceMeter(equipmentId, req);
+    }
+
+    /** 更换链与重算版本只读查询：全部工时表（含 offset 与最后有效读数）、更换记录、recalcVersion。 */
+    @GetMapping("/{equipmentId}/meter-chain")
+    public MeterChainResponse getMeterChain(@PathVariable String equipmentId) {
+        return service.getMeterChain(equipmentId);
     }
 }

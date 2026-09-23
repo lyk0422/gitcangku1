@@ -49,6 +49,8 @@ class EquipmentConcurrencyTests {
         jdbc.update("DELETE FROM maintenance");
         jdbc.update("DELETE FROM reading_revision");
         jdbc.update("DELETE FROM reading");
+        jdbc.update("DELETE FROM meter_replacement");
+        jdbc.update("DELETE FROM meter");
         jdbc.update("DELETE FROM equipment");
         executor = Executors.newFixedThreadPool(8);
     }

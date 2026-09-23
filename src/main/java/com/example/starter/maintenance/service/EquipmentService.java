@@ -11,6 +11,8 @@ import com.example.starter.maintenance.api.dto.AddReadingRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
+import com.example.starter.maintenance.api.dto.MeterChainResponse;
+import com.example.starter.maintenance.api.dto.MeterReplacementRequest;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
 import com.example.starter.maintenance.api.dto.RegisterEquipmentRequest;
 import com.example.starter.maintenance.api.dto.ReviseReadingRequest;
@@ -48,6 +50,18 @@ public class EquipmentService {
 
     public MaintenanceResponse completeMaintenance(String equipmentId, CompleteMaintenanceRequest req) {
         return txService.completeMaintenance(equipmentId, req);
+    }
+
+    public MeterChainResponse replaceMeter(String equipmentId, MeterReplacementRequest req) {
+        String fingerprint = equipmentId + "|" + req.replacementKey() + "|" + req.newMeterKey()
+                + "|" + req.oldLastReadingVersion() + "|" + req.finalRawHours()
+                + "|" + req.initialRawHours() + "|" + req.expectedVersion();
+        return recoverDuplicateKey(req.requestId(), "REPLACE_METER", fingerprint,
+                MeterChainResponse.class, () -> txService.replaceMeter(equipmentId, req));
+    }
+
+    public MeterChainResponse getMeterChain(String equipmentId) {
+        return txService.getMeterChain(equipmentId);
     }
 
     public StatusResponse getStatus(String equipmentId) {
