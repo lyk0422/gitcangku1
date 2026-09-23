@@ -234,6 +234,8 @@ public class PlayoutService {
                 repo.insertPublicationSegment(publicationId, segment.id(), segment.assetId(),
                         grantIds.get(i), segment.startMs(), segment.endMs());
             }
+            // 发布提交即递增频道编排版本，作为主备链路缓存一致性与切换冻结的基准。
+            repo.bumpScheduleVersion(channelId);
             return new PublishResponse(publicationId, channelId, businessDay.toString(),
                     newVersion, draft.version());
         });

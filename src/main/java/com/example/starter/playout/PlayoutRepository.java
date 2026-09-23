@@ -137,6 +137,28 @@ public class PlayoutRepository {
                 CHANNEL_MAPPER, id).stream().findFirst();
     }
 
+    /** 频道当前编排版本（schedule_version），无行时抛异常（频道须先存在）。 */
+    public long getScheduleVersion(String channelId) {
+        Long version = jdbc.queryForObject(
+                "SELECT schedule_version FROM playout_channel WHERE id = ?",
+                Long.class, channelId);
+        return version == null ? 0L : version;
+    }
+
+    /** 锁定频道行（FOR UPDATE）并返回当前编排版本，用于发布与切换按提交顺序串行。 */
+    public long lockChannelAndGetVersion(String channelId) {
+        Long version = jdbc.queryForObject(
+                "SELECT schedule_version FROM playout_channel WHERE id = ? FOR UPDATE",
+                Long.class, channelId);
+        return version == null ? 0L : version;
+    }
+
+    /** 发布成功后在同事务递增频道编排版本。 */
+    public int bumpScheduleVersion(String channelId) {
+        return jdbc.update("UPDATE playout_channel SET schedule_version = schedule_version + 1"
+                + " WHERE id = ?", channelId);
+    }
+
     // ---------- 授权 ----------
 
     public long insertGrant(String channelId, String assetId, long validFromMs, long validToMs,
@@ -245,6 +267,13 @@ public class PlayoutRepository {
                         + " WHERE channel_id = ? AND business_day = ?",
                 Long.class, channelId, Date.valueOf(businessDay));
         return version == null ? 0L : version;
+    }
+
+    /** 指定业务日已发布版本升序列表，作为切换冻结的编排证据。 */
+    public List<Long> findPublicationVersions(String channelId, LocalDate businessDay) {
+        return jdbc.queryForList("SELECT published_version FROM playout_publication"
+                        + " WHERE channel_id = ? AND business_day = ? ORDER BY published_version",
+                Long.class, channelId, Date.valueOf(businessDay));
     }
 
     public long insertPublication(String channelId, LocalDate businessDay, long publishedVersion,
