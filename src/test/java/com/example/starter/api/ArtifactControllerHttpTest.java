@@ -35,8 +35,13 @@ class ArtifactControllerHttpTest {
 
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM lock_substitution_step");
         jdbcTemplate.update("DELETE FROM lock_file_entry");
         jdbcTemplate.update("DELETE FROM lock_file");
+        jdbcTemplate.update("DELETE FROM substitution_alternative");
+        jdbcTemplate.update("DELETE FROM substitution_rule");
+        jdbcTemplate.update("DELETE FROM substitution_policy");
+        jdbcTemplate.update("DELETE FROM artifact_platform");
         jdbcTemplate.update("DELETE FROM artifact_dependency");
         jdbcTemplate.update("DELETE FROM artifact");
         jdbcTemplate.update("DELETE FROM idempotent_request");
@@ -217,5 +222,67 @@ class ArtifactControllerHttpTest {
                 new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
                 JsonNode.class);
         assertThat(lockOnWithdrawn.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+    }
+
+    @Test
+    void publishPolicyAndPlatformLockWithFrozenSubstitutionSnapshot() {
+        // app:1 -> old[1,1]；old:1 撤回；good:1。
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("app", 1, dependency("old", 1, 1)),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("old", 1),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        restTemplate.exchange("/api/artifacts/old/versions/1/withdraw", HttpMethod.POST,
+                new HttpEntity<>("", jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("good", 1),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+
+        String policyBody = "{\"policyKey\":\"http-pol\",\"rules\":["
+                + "{\"sourcePattern\":\"old:1\",\"targetPlatform\":\"linux-x86_64\","
+                + "\"effectiveAt\":\"2025-01-01T00:00:00Z\","
+                + "\"alternatives\":[{\"name\":\"good\",\"version\":1}]}]}";
+        ResponseEntity<JsonNode> policy = restTemplate.postForEntity("/api/artifacts/policies",
+                new HttpEntity<>(policyBody, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(policy.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        long policyVersion = policy.getBody().path("policyVersion").asLong();
+
+        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"expectedRepositoryVersion\":5,"
+                + "\"platform\":\"linux-x86_64\"}";
+        ResponseEntity<JsonNode> lock = restTemplate.postForEntity("/api/artifacts/locks",
+                new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(lock.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(lock.getBody().path("policyVersion").asLong()).isEqualTo(policyVersion);
+        assertThat(lock.getBody().path("platform").asText()).isEqualTo("linux-x86_64");
+        JsonNode steps = lock.getBody().path("substitutions");
+        assertThat(steps).hasSize(1);
+        assertThat(steps.get(0).path("originalName").asText()).isEqualTo("old");
+        assertThat(steps.get(0).path("finalName").asText()).isEqualTo("good");
+
+        // 策略只读查询，稳定排序。
+        ResponseEntity<JsonNode> list = restTemplate.getForEntity(
+                "/api/artifacts/policies", JsonNode.class);
+        assertThat(list.getBody()).hasSize(1);
+        assertThat(list.getBody().get(0).path("policyVersion").asLong()).isEqualTo(policyVersion);
+
+        ResponseEntity<JsonNode> one = restTemplate.getForEntity(
+                "/api/artifacts/policies/{v}", JsonNode.class, policyVersion);
+        assertThat(one.getStatusCode()).isEqualTo(HttpStatus.OK);
+    }
+
+    @Test
+    void overlappingPolicyRulesReturn422() {
+        String policyBody = "{\"policyKey\":\"bad\",\"rules\":["
+                + "{\"sourcePattern\":\"old:1\",\"targetPlatform\":\"p\",\"effectiveAt\":\"2025-01-01T00:00:00Z\","
+                + "\"alternatives\":[{\"name\":\"a\",\"version\":1}]},"
+                + "{\"sourcePattern\":\"old:*\",\"targetPlatform\":\"p\",\"effectiveAt\":\"2025-01-01T00:00:00Z\","
+                + "\"alternatives\":[{\"name\":\"b\",\"version\":1}]}]}";
+        ResponseEntity<JsonNode> response = restTemplate.postForEntity("/api/artifacts/policies",
+                new HttpEntity<>(policyBody, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
     }
 }

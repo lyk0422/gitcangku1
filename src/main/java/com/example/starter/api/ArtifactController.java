@@ -3,6 +3,8 @@ package com.example.starter.api;
 import com.example.starter.api.dto.ArtifactResponse;
 import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
+import com.example.starter.api.dto.PolicyResponse;
+import com.example.starter.api.dto.PublishPolicyRequest;
 import com.example.starter.api.dto.RegisterArtifactRequest;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Positive;
@@ -50,6 +52,36 @@ public class ArtifactController {
         return artifactService.withdrawArtifact(requestId, name, version);
     }
 
+    /** 恢复已撤回的制品版本；不影响历史锁解释。 */
+    @PostMapping("/{name}/versions/{version}/restore")
+    public ArtifactResponse restore(
+            @RequestHeader("X-Request-Id") String requestId,
+            @PathVariable String name,
+            @PathVariable @Positive int version) {
+        return artifactService.restoreArtifact(requestId, name, version);
+    }
+
+    /** 发布一套整体激活的依赖替代策略。 */
+    @PostMapping("/policies")
+    public ResponseEntity<PolicyResponse> publishPolicy(
+            @RequestHeader("X-Request-Id") String requestId,
+            @Valid @RequestBody PublishPolicyRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(artifactService.publishPolicy(requestId, request));
+    }
+
+    /** 查询全部策略版本，按版本号升序稳定排序。 */
+    @GetMapping("/policies")
+    public List<PolicyResponse> listPolicies() {
+        return artifactService.listPolicies();
+    }
+
+    /** 按版本号查询单个策略。 */
+    @GetMapping("/policies/{policyVersion}")
+    public PolicyResponse getPolicy(@PathVariable long policyVersion) {
+        return artifactService.getPolicy(policyVersion);
+    }
+
     /** 创建锁文件。 */
     @PostMapping("/locks")
     public ResponseEntity<LockFileResponse> lock(
@@ -64,7 +96,7 @@ public class ArtifactController {
         return artifactService.listLocks();
     }
 
-    /** 按 ID 查询单个锁文件。 */
+    /** 按 ID 查询单个锁文件（含冻结的替代解释快照）。 */
     @GetMapping("/locks/{id}")
     public LockFileResponse getLock(@PathVariable long id) {
         return artifactService.getLock(id);
