@@ -7,6 +7,8 @@ import com.example.starter.evidence.dto.IntakeRequest;
 import com.example.starter.evidence.dto.LoanCreateRequest;
 import com.example.starter.evidence.dto.LoanReturnRequest;
 import com.example.starter.evidence.dto.LoanView;
+import com.example.starter.evidence.dto.ResealDecisionRequest;
+import com.example.starter.evidence.dto.ResealRequest;
 import com.example.starter.evidence.dto.SealInspectionRequest;
 import com.example.starter.evidence.dto.TransferInitiateRequest;
 import jakarta.validation.Valid;
@@ -138,6 +140,49 @@ public class EvidenceController {
                 evidenceKey, request);
         StoredResponse response = idempotencyAdvisor.guard(request.commandKey(), hash,
                 () -> evidenceService.returnLoan(actorId, evidenceKey, request, hash));
+        return toEntity(response);
+    }
+
+    /**
+     * 申请异常证物双人重新封存：仅当前保管人，证物须 SEAL_BROKEN 且无未归还借出、无待接收交接；
+     * 申请不改变当前封条与异常状态。
+     */
+    @PostMapping("/{evidenceKey}/reseals")
+    public ResponseEntity<String> applyReseal(@RequestHeader(ACTOR_HEADER) @NotBlank String actorId,
+                                              @PathVariable String evidenceKey,
+                                              @Valid @RequestBody ResealRequest request) {
+        String hash = idempotencyAdvisor.hash(EvidenceService.OP_RESEAL_APPLY, actorId,
+                evidenceKey, request);
+        StoredResponse response = idempotencyAdvisor.guard(request.commandKey(), hash,
+                () -> evidenceService.applyReseal(actorId, evidenceKey, request, hash));
+        return toEntity(response);
+    }
+
+    /**
+     * 确认重新封存：仅指定见证人；原子置 CONFIRMED、恢复 SEALED 并换用新封条。
+     */
+    @PostMapping("/{evidenceKey}/reseals/confirm")
+    public ResponseEntity<String> confirmReseal(@RequestHeader(ACTOR_HEADER) @NotBlank String actorId,
+                                                @PathVariable String evidenceKey,
+                                                @Valid @RequestBody ResealDecisionRequest request) {
+        String hash = idempotencyAdvisor.hash(EvidenceService.OP_RESEAL_CONFIRM, actorId,
+                evidenceKey, request);
+        StoredResponse response = idempotencyAdvisor.guard(request.commandKey(), hash,
+                () -> evidenceService.confirmReseal(actorId, evidenceKey, request, hash));
+        return toEntity(response);
+    }
+
+    /**
+     * 撤销重新封存：仅申请人；置 CANCELLED 终态，不换封条。
+     */
+    @PostMapping("/{evidenceKey}/reseals/cancel")
+    public ResponseEntity<String> cancelReseal(@RequestHeader(ACTOR_HEADER) @NotBlank String actorId,
+                                               @PathVariable String evidenceKey,
+                                               @Valid @RequestBody ResealDecisionRequest request) {
+        String hash = idempotencyAdvisor.hash(EvidenceService.OP_RESEAL_CANCEL, actorId,
+                evidenceKey, request);
+        StoredResponse response = idempotencyAdvisor.guard(request.commandKey(), hash,
+                () -> evidenceService.cancelReseal(actorId, evidenceKey, request, hash));
         return toEntity(response);
     }
 

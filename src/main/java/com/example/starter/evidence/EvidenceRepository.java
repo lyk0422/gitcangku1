@@ -77,6 +77,15 @@ public class EvidenceRepository {
     }
 
     /**
+     * 重新封存确认：原子换用新封条并恢复 SEALED（仅在重新封存确认事务内调用）。
+     */
+    public void updateSealAndStatus(String evidenceKey, String newSealNo, LocalDateTime now) {
+        jdbc.update(
+                "UPDATE evidence SET seal_no = ?, status = ?, updated_at = ? WHERE evidence_key = ?",
+                newSealNo, EvidenceStatus.SEALED.name(), now, evidenceKey);
+    }
+
+    /**
      * 查询指定保管人当前可交接的证物（本人保管且状态 SEALED）。
      */
     public List<Evidence> findTransferable(String custodianId) {

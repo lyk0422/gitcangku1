@@ -7,9 +7,9 @@ CREATE TABLE IF NOT EXISTS evidence (
     evidence_key VARCHAR(64) NOT NULL COMMENT '证物业务键，全局唯一，入库后不可修改',
     case_key VARCHAR(64) NOT NULL COMMENT '所属案件键，入库后不可修改',
     category VARCHAR(64) NOT NULL COMMENT '证物类别，入库后不可修改',
-    seal_no VARCHAR(64) NOT NULL COMMENT '封条编号，入库后不可修改',
+    seal_no VARCHAR(64) NOT NULL COMMENT '当前封条编号，入库后仅在重新封存确认时换用新封条',
     custodian_id VARCHAR(64) NOT NULL COMMENT '当前保管人（操作人标识），交接接受后原子切换；借出期间不变',
-    status VARCHAR(20) NOT NULL COMMENT '证物状态：SEALED 已封存 / TRANSFER_PENDING 待接收 / BORROWED 借出未归还 / SEAL_BROKEN 封条异常（终态）',
+    status VARCHAR(20) NOT NULL COMMENT '证物状态：SEALED 已封存 / TRANSFER_PENDING 待接收 / BORROWED 借出未归还 / SEAL_BROKEN 封条异常（仅可经双人重新封存确认解除）',
     created_at DATETIME(6) NOT NULL COMMENT '入库时间，Asia/Shanghai',
     updated_at DATETIME(6) NOT NULL COMMENT '最近一次状态或保管人变更时间，Asia/Shanghai',
     CONSTRAINT uk_evidence_key UNIQUE (evidence_key)
@@ -60,12 +60,31 @@ CREATE TABLE IF NOT EXISTS loan_record (
     KEY idx_loan_borrower_status (borrower_id, status)
 );
 
+-- 异常证物双人重新封存申请：只追加；每件证物至多一笔 PENDING（由证物行锁保证）。
+-- 申请不改变当前封条与异常状态；确认原子置 CONFIRMED、证物恢复 SEALED 并换用新封条；
+-- 撤销置 CANCELLED 不换封条；两者均为终态。reseal_key 全局唯一。
+CREATE TABLE IF NOT EXISTS reseal_application (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    reseal_key VARCHAR(64) NOT NULL COMMENT '重新封存业务键，全局唯一；换命令键复用该键返回 409',
+    evidence_key VARCHAR(64) NOT NULL COMMENT '关联证物业务键',
+    applicant_id VARCHAR(64) NOT NULL COMMENT '申请人（申请时的当前保管人），只有其可撤销',
+    witness_id VARCHAR(64) NOT NULL COMMENT '指定见证人，必须与申请人不同，只有其可确认',
+    previous_seal_no VARCHAR(64) NOT NULL COMMENT '申请时（确认前）的封条号，作为确认快照的前封条',
+    new_seal_no VARCHAR(64) NOT NULL COMMENT '新封条号，确认后启用；不得与本证物任一历史封条相同',
+    reason VARCHAR(512) NOT NULL COMMENT '重新封存原因，非空',
+    status VARCHAR(20) NOT NULL COMMENT '申请状态：PENDING 待确认 / CONFIRMED 已确认 / CANCELLED 已撤销（后两者终态）',
+    created_at DATETIME(6) NOT NULL COMMENT '申请时刻，UTC',
+    decided_at DATETIME(6) NULL COMMENT '确认或撤销时刻，UTC；NULL 表示待确认',
+    CONSTRAINT uk_reseal_key UNIQUE (reseal_key),
+    KEY idx_reseal_evidence (evidence_key)
+);
+
 -- 幂等命令日志：command_key 全局唯一；同键同参重放返回首次结果，同键改参返回 409。
 CREATE TABLE IF NOT EXISTS command_log (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     command_key VARCHAR(64) NOT NULL COMMENT '幂等命令键，全局唯一',
     actor_id VARCHAR(64) NOT NULL COMMENT '发起操作人',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN/RESEAL_APPLY/RESEAL_CONFIRM/RESEAL_CANCEL',
     request_hash VARCHAR(64) NOT NULL COMMENT '请求参数规范化后的 SHA-256，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行的 HTTP 状态码',
     response_body TEXT NOT NULL COMMENT '首次执行的响应体 JSON，重放时原样返回',
