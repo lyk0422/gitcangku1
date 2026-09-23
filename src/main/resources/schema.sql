@@ -111,6 +111,68 @@ COMMENT ON COLUMN term_rule.source_term IS '源文术语，Unicode 原文、区�
 COMMENT ON COLUMN term_rule.language IS '目标语言码，小写';
 COMMENT ON COLUMN term_rule.required_translation IS '该术语在目标语言中的必译文本，非空';
 
+CREATE TABLE IF NOT EXISTS term_retirement (
+    retirement_key VARCHAR(128) PRIMARY KEY,
+    document_id BIGINT NOT NULL,
+    term_version INT NOT NULL,
+    replacement_version INT NOT NULL,
+    effective_from VARCHAR(64) NOT NULL,
+    effective_to VARCHAR(64) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    impact_json LONGTEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    activated_at TIMESTAMP NULL
+);
+COMMENT ON TABLE term_retirement IS '术语版本退役单：全局唯一 retirementKey，含左闭右开 UTC 生效窗口、替代版本与状态';
+COMMENT ON COLUMN term_retirement.retirement_key IS '全局唯一退役单键';
+COMMENT ON COLUMN term_retirement.document_id IS '所属文档 ID';
+COMMENT ON COLUMN term_retirement.term_version IS '被退役的术语版本号';
+COMMENT ON COLUMN term_retirement.replacement_version IS '替代术语版本号，创建时必须为 ACTIVE';
+COMMENT ON COLUMN term_retirement.effective_from IS '生效窗口起点（含），ISO-8601 UTC 文本';
+COMMENT ON COLUMN term_retirement.effective_to IS '生效窗口终点（不含），ISO-8601 UTC 文本；窗口结束后不自动恢复';
+COMMENT ON COLUMN term_retirement.status IS '退役单状态：PENDING 已创建未激活，ACTIVATED 已激活并冻结影响快照';
+COMMENT ON COLUMN term_retirement.impact_json IS '激活时冻结的影响快照 JSON；未激活为 NULL';
+COMMENT ON COLUMN term_retirement.created_at IS '创建时间，数据库默认时区';
+COMMENT ON COLUMN term_retirement.activated_at IS '激活时间，数据库默认时区；未激活为 NULL';
+
+CREATE TABLE IF NOT EXISTS retirement_snapshot_impact (
+    retirement_key VARCHAR(128) NOT NULL,
+    document_id BIGINT NOT NULL,
+    published_version INT NOT NULL,
+    segment_id VARCHAR(64) NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    hit_terms VARCHAR(2048) NOT NULL,
+    PRIMARY KEY (retirement_key, published_version, segment_id, language)
+);
+COMMENT ON TABLE retirement_snapshot_impact IS '退役影响的历史发布标记：已发布快照保持不可变，仅记录受影响位置与实际命中的术语';
+COMMENT ON COLUMN retirement_snapshot_impact.retirement_key IS '所属退役单键';
+COMMENT ON COLUMN retirement_snapshot_impact.document_id IS '所属文档 ID';
+COMMENT ON COLUMN retirement_snapshot_impact.published_version IS '受影响的发布版本号';
+COMMENT ON COLUMN retirement_snapshot_impact.segment_id IS '受影响段落 ID';
+COMMENT ON COLUMN retirement_snapshot_impact.language IS '受影响译文语言码，小写';
+COMMENT ON COLUMN retirement_snapshot_impact.hit_terms IS '实际命中的术语位置 JSON 数组，元素为 {sourceTerm, index}，index 为源文中首次命中偏移';
+
+CREATE TABLE IF NOT EXISTS retirement_migration (
+    retirement_key VARCHAR(128) NOT NULL,
+    document_id BIGINT NOT NULL,
+    segment_id VARCHAR(64) NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    old_digest VARCHAR(64) NOT NULL,
+    new_digest VARCHAR(64) NOT NULL,
+    rule_version INT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (retirement_key, segment_id, language)
+);
+COMMENT ON TABLE retirement_migration IS '草稿迁移记录：成功迁移逐稿保存旧/新文本摘要及校验所用规则版本';
+COMMENT ON COLUMN retirement_migration.retirement_key IS '所属退役单键';
+COMMENT ON COLUMN retirement_migration.document_id IS '所属文档 ID';
+COMMENT ON COLUMN retirement_migration.segment_id IS '迁移段落 ID';
+COMMENT ON COLUMN retirement_migration.language IS '迁移译文语言码，小写';
+COMMENT ON COLUMN retirement_migration.old_digest IS '迁移前译文正文的 SHA-256 摘要（十六进制）';
+COMMENT ON COLUMN retirement_migration.new_digest IS '迁移后译文正文的 SHA-256 摘要（十六进制）';
+COMMENT ON COLUMN retirement_migration.rule_version IS '迁移校验所用的替代术语版本号';
+COMMENT ON COLUMN retirement_migration.created_at IS '迁移时间，数据库默认时区';
+
 CREATE TABLE IF NOT EXISTS request_log (
     request_id VARCHAR(128) PRIMARY KEY,
     request_hash VARCHAR(64) NOT NULL,

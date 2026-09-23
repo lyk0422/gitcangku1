@@ -6,6 +6,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.context.annotation.Import;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
@@ -13,6 +14,7 @@ import org.springframework.test.web.servlet.MvcResult;
 import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
 import org.springframework.test.web.servlet.request.MockMvcRequestBuilders;
 
+import java.time.Instant;
 import java.util.UUID;
 
 /**
@@ -22,7 +24,11 @@ import java.util.UUID;
 @SpringBootTest
 @AutoConfigureMockMvc
 @ActiveProfiles("test")
+@Import(TestClockConfiguration.class)
 public abstract class AbstractIntegrationTest {
+
+    /** 测试默认时刻：2026-01-01T00:00:00Z，每个用例前重置。 */
+    protected static final Instant TEST_NOW = Instant.parse("2026-01-01T00:00:00Z");
 
     @Autowired
     protected MockMvc mockMvc;
@@ -33,8 +39,14 @@ public abstract class AbstractIntegrationTest {
     @Autowired
     protected ObjectMapper objectMapper;
 
+    @Autowired
+    protected MutableClock clock;
+
     @BeforeEach
     void cleanTables() {
+        jdbc.update("DELETE FROM retirement_migration");
+        jdbc.update("DELETE FROM retirement_snapshot_impact");
+        jdbc.update("DELETE FROM term_retirement");
         jdbc.update("DELETE FROM approval");
         jdbc.update("DELETE FROM translation");
         jdbc.update("DELETE FROM segment");
@@ -43,6 +55,7 @@ public abstract class AbstractIntegrationTest {
         jdbc.update("DELETE FROM term_version");
         jdbc.update("DELETE FROM request_log");
         jdbc.update("DELETE FROM document");
+        clock.setInstant(TEST_NOW);
     }
 
     protected String newRequestId() {
@@ -128,6 +141,37 @@ public abstract class AbstractIntegrationTest {
         String body = "{\"requestId\":\"" + requestId + "\",\"expectedTermVersion\":" + expectedTermVersion
                 + ",\"rules\":" + rulesJson + "}";
         return putJson("/api/documents/" + documentId + "/terms", body);
+    }
+
+    /** 创建术语版本退役单：窗口为 ISO-8601 UTC 文本。 */
+    protected ApiResult createRetirement(long documentId, String retirementKey, int termVersion,
+                                         int replacementVersion, String effectiveFrom, String effectiveTo,
+                                         String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"retirementKey\":\"" + retirementKey
+                + "\",\"termVersion\":" + termVersion + ",\"replacementVersion\":" + replacementVersion
+                + ",\"effectiveFrom\":\"" + effectiveFrom + "\",\"effectiveTo\":\"" + effectiveTo + "\"}";
+        return postJson("/api/documents/" + documentId + "/term-retirements", body);
+    }
+
+    /** 激活退役单。 */
+    protected ApiResult activateRetirement(long documentId, String retirementKey, String requestId)
+            throws Exception {
+        return postJson("/api/documents/" + documentId + "/term-retirements/" + retirementKey + "/activate",
+                "{\"requestId\":\"" + requestId + "\"}");
+    }
+
+    /** 退役影响查询。 */
+    protected ApiResult getRetirementImpact(long documentId, String retirementKey) throws Exception {
+        return getJson("/api/documents/" + documentId + "/term-retirements/" + retirementKey + "/impact");
+    }
+
+    /** 草稿迁移：draftsJson 为草稿替换数组 JSON。 */
+    protected ApiResult migrateDrafts(long documentId, String retirementKey, String actorId,
+                                      int expectedVersion, String draftsJson, String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"expectedVersion\":" + expectedVersion
+                + ",\"drafts\":" + draftsJson + "}";
+        return postJson("/api/documents/" + documentId + "/term-retirements/" + retirementKey + "/migrate-drafts",
+                body, actorId);
     }
 
     /** HTTP 响应结果：状态码与 JSON 响应体。 */

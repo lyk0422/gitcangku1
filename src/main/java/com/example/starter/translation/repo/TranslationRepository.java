@@ -3,6 +3,7 @@ package com.example.starter.translation.repo;
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
 import com.example.starter.translation.domain.Rows.RequestLogRow;
+import com.example.starter.translation.domain.Rows.RetirementRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
 import com.example.starter.translation.domain.Rows.TranslationRow;
@@ -15,6 +16,7 @@ import org.springframework.stereotype.Repository;
 import java.sql.PreparedStatement;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -240,5 +242,74 @@ public class TranslationRepository {
     public void insertRequestLog(String requestId, String requestHash, int responseStatus, String responseBody) {
         jdbc.update("INSERT INTO request_log (request_id, request_hash, response_status, response_body) "
                 + "VALUES (?, ?, ?, ?)", requestId, requestHash, responseStatus, responseBody);
+    }
+
+    /** 退役单行映射：生效窗口以 ISO-8601 UTC 文本存储。 */
+    private static final RowMapper<RetirementRow> RETIREMENT_MAPPER = (rs, n) -> new RetirementRow(
+            rs.getString("retirement_key"), rs.getLong("document_id"),
+            rs.getInt("term_version"), rs.getInt("replacement_version"),
+            rs.getString("effective_from"), rs.getString("effective_to"),
+            rs.getString("status"), rs.getString("impact_json"));
+
+    /** 插入退役单（PENDING）；retirementKey 全局唯一，冲突时抛 DuplicateKeyException。 */
+    public void insertRetirement(RetirementRow row) {
+        jdbc.update("INSERT INTO term_retirement (retirement_key, document_id, term_version, "
+                        + "replacement_version, effective_from, effective_to, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                row.retirementKey(), row.documentId(), row.termVersion(), row.replacementVersion(),
+                row.effectiveFrom(), row.effectiveTo(), row.status());
+    }
+
+    /** 按全局唯一键查询退役单。 */
+    public Optional<RetirementRow> findRetirement(String retirementKey) {
+        List<RetirementRow> rows = jdbc.query(
+                "SELECT retirement_key, document_id, term_version, replacement_version, effective_from, "
+                        + "effective_to, status, impact_json FROM term_retirement WHERE retirement_key = ?",
+                RETIREMENT_MAPPER, retirementKey);
+        return rows.stream().findFirst();
+    }
+
+    /** 查询文档全部退役单，按创建键排序保证稳定输出。 */
+    public List<RetirementRow> listRetirements(long documentId) {
+        return jdbc.query(
+                "SELECT retirement_key, document_id, term_version, replacement_version, effective_from, "
+                        + "effective_to, status, impact_json FROM term_retirement "
+                        + "WHERE document_id = ? ORDER BY retirement_key",
+                RETIREMENT_MAPPER, documentId);
+    }
+
+    /** 激活退役单：置状态 ACTIVATED、冻结影响快照并记录激活时间。 */
+    public void activateRetirement(String retirementKey, String impactJson) {
+        jdbc.update("UPDATE term_retirement SET status = 'ACTIVATED', impact_json = ?, "
+                + "activated_at = CURRENT_TIMESTAMP WHERE retirement_key = ?", impactJson, retirementKey);
+    }
+
+    /** 记录一条历史发布受影响标记（快照本身不可变，仅落标记）。 */
+    public void insertSnapshotImpact(String retirementKey, long documentId, int publishedVersion,
+                                     String segmentId, String language, String hitTermsJson) {
+        jdbc.update("INSERT INTO retirement_snapshot_impact (retirement_key, document_id, published_version, "
+                        + "segment_id, language, hit_terms) VALUES (?, ?, ?, ?, ?, ?)",
+                retirementKey, documentId, publishedVersion, segmentId, language, hitTermsJson);
+    }
+
+    /** 查询文档全部发布快照（版本号与快照 JSON），按发布版本升序。 */
+    public List<Map.Entry<Integer, String>> listSnapshotJsons(long documentId) {
+        return jdbc.query(
+                "SELECT published_version, snapshot_json FROM release_snapshot "
+                        + "WHERE document_id = ? ORDER BY published_version",
+                (rs, n) -> Map.entry(rs.getInt(1), rs.getString(2)), documentId);
+    }
+
+    /** 删除指定段落与语言的批准（退役激活时撤回 APPROVED 为 DRAFT）。 */
+    public void deleteApproval(long documentId, String segmentId, String language) {
+        jdbc.update("DELETE FROM approval WHERE document_id = ? AND segment_id = ? AND language = ?",
+                documentId, segmentId, language);
+    }
+
+    /** 记录一条草稿迁移结果：旧/新文本摘要与校验所用规则版本。 */
+    public void insertMigration(String retirementKey, long documentId, String segmentId, String language,
+                                String oldDigest, String newDigest, int ruleVersion) {
+        jdbc.update("INSERT INTO retirement_migration (retirement_key, document_id, segment_id, language, "
+                        + "old_digest, new_digest, rule_version) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                retirementKey, documentId, segmentId, language, oldDigest, newDigest, ruleVersion);
     }
 }

@@ -82,4 +82,20 @@ public final class Rows {
     public record RequestLogRow(String requestId, String requestHash,
                                 int responseStatus, String responseBody) {
     }
+
+    /**
+     * 术语版本退役单：全局唯一 retirementKey，含左闭右开 UTC 生效窗口、替代版本与状态。
+     *
+     * @param retirementKey      全局唯一退役单键
+     * @param documentId         所属文档 ID
+     * @param termVersion        被退役的术语版本号
+     * @param replacementVersion 替代术语版本号，创建时必须为 ACTIVE
+     * @param effectiveFrom      生效窗口起点（含），ISO-8601 UTC 文本
+     * @param effectiveTo        生效窗口终点（不含），ISO-8601 UTC 文本；窗口结束后不自动恢复
+     * @param status             退役单状态：PENDING 已创建未激活，ACTIVATED 已激活并冻结影响快照
+     * @param impactJson         激活时冻结的影响快照 JSON；未激活为 null
+     */
+    public record RetirementRow(String retirementKey, long documentId, int termVersion, int replacementVersion,
+                                String effectiveFrom, String effectiveTo, String status, String impactJson) {
+    }
 }

@@ -32,10 +32,13 @@ public class TranslationService {
 
     private final TranslationRepository repository;
     private final ObjectMapper objectMapper;
+    private final java.time.Clock clock;
 
-    public TranslationService(TranslationRepository repository, ObjectMapper objectMapper) {
+    public TranslationService(TranslationRepository repository, ObjectMapper objectMapper,
+                              java.time.Clock clock) {
         this.repository = repository;
         this.objectMapper = objectMapper;
+        this.clock = clock;
     }
 
     /** 建文档：1~5 种目标语言，可携带初始段落，初始草稿版本 1、发布版本 0。 */
@@ -132,6 +135,10 @@ public class TranslationService {
             throw ApiException.unprocessable("译文基于源文版本 " + translation.sourceVersion()
                     + "，当前源文版本 " + segment.sourceVersion() + "，译文待更新，不能批准");
         }
+        if (retiredTermVersions(documentId).contains(translation.termVersion())) {
+            throw ApiException.unprocessable("译文绑定的术语版本 " + translation.termVersion()
+                    + " 已过退役生效时刻，不能批准");
+        }
         repository.upsertApproval(documentId, new ApprovalRow(segmentId, normalizedLanguage, actorId,
                 segment.sourceVersion(), translation.translationVersion()));
         return new ApiDtos.ApprovalResponse(documentId, segmentId, normalizedLanguage, actorId,
@@ -194,6 +201,7 @@ public class TranslationService {
         Map<String, ApprovalRow> approvals = repository.listApprovals(documentId).stream()
                 .collect(Collectors.toMap(a -> key(a.segmentId(), a.language()), Function.identity()));
         List<TermRuleRow> termRules = repository.listTermRules(documentId, document.termVersion());
+        Set<Integer> retiredVersions = retiredTermVersions(documentId);
         List<ApiDtos.TermRuleView> termViolations = new ArrayList<>();
         for (SegmentRow segment : segments) {
             for (String language : document.targetLanguages()) {
@@ -211,6 +219,10 @@ public class TranslationService {
                     throw ApiException.unprocessable("译文术语版本过期: " + segment.segmentId() + "/" + language
                             + " 绑定术语版本 " + translation.termVersion()
                             + "，当前术语版本 " + document.termVersion());
+                }
+                if (retiredVersions.contains(translation.termVersion())) {
+                    throw ApiException.unprocessable("译文绑定的术语版本 " + translation.termVersion()
+                            + " 已过退役生效时刻: " + segment.segmentId() + "/" + language + "，不能发布");
                 }
                 ApprovalRow approval = approvals.get(key(segment.segmentId(), language));
                 if (approval == null) {
@@ -307,6 +319,11 @@ public class TranslationService {
         return draftVersion;
     }
 
+    /** 当前时刻已退役的术语版本集合：已激活退役单且生效窗口起点不晚于当前；窗口结束后不自动恢复。 */
+    private Set<Integer> retiredTermVersions(long documentId) {
+        return RetirementService.retiredTermVersions(repository.listRetirements(documentId), clock.instant());
+    }
+
     private static String key(String segmentId, String language) {
         return segmentId + " " + language;
     }
@@ -327,8 +344,8 @@ public class TranslationService {
      * 术语违规判定：源文按 Unicode 原文、区分大小写做连续子串匹配；仅源文命中 sourceTerm 的规则参与校验，
      * 译文正文（同样区分大小写）不含 requiredTranslation 即为违规。返回全部违规规则。
      */
-    private static List<ApiDtos.TermRuleView> findViolations(String sourceText, String language, String content,
-                                                             List<TermRuleRow> rules) {
+    static List<ApiDtos.TermRuleView> findViolations(String sourceText, String language, String content,
+                                                     List<TermRuleRow> rules) {
         List<ApiDtos.TermRuleView> violations = new ArrayList<>();
         for (TermRuleRow rule : rules) {
             if (rule.language().equals(language) && sourceText.contains(rule.sourceTerm())

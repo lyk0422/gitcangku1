@@ -1,5 +1,6 @@
 package com.example.starter.translation.api;
 
+import com.example.starter.translation.service.RetirementService;
 import com.example.starter.translation.service.TranslationService;
 import com.example.starter.translation.service.WriteExecutor;
 import com.example.starter.translation.service.WriteResult;
@@ -20,6 +21,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
+import java.util.List;
 
 /**
  * 多语种段落修订与发布快照 REST API。
@@ -30,12 +32,14 @@ import java.util.HexFormat;
 public class TranslationController {
 
     private final TranslationService translationService;
+    private final RetirementService retirementService;
     private final WriteExecutor writeExecutor;
     private final ObjectMapper objectMapper;
 
-    public TranslationController(TranslationService translationService, WriteExecutor writeExecutor,
-                                 ObjectMapper objectMapper) {
+    public TranslationController(TranslationService translationService, RetirementService retirementService,
+                                 WriteExecutor writeExecutor, ObjectMapper objectMapper) {
         this.translationService = translationService;
+        this.retirementService = retirementService;
         this.writeExecutor = writeExecutor;
         this.objectMapper = objectMapper;
     }
@@ -134,6 +138,61 @@ public class TranslationController {
     public ResponseEntity<String> getRelease(@PathVariable long documentId, @PathVariable int publishedVersion) {
         return ResponseEntity.ok().contentType(MediaType.APPLICATION_JSON)
                 .body(translationService.getRelease(documentId, publishedVersion));
+    }
+
+    /** 创建术语版本退役单：校验窗口、替代版本 ACTIVE、无替代环、窗口不重叠；仅预览影响，不改写内容。 */
+    @PostMapping("/{documentId}/term-retirements")
+    public ResponseEntity<String> createRetirement(@PathVariable long documentId,
+                                                   @Valid @RequestBody ApiDtos.CreateRetirementRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/term-retirements";
+        return writeExecutor.execute(request.requestId(), hash(operation, request),
+                () -> WriteResult.of(201, retirementService.createRetirement(documentId, request)))
+                .toResponseEntity();
+    }
+
+    /** 激活退役单：一个事务内重算影响集合并冻结快照，撤回仍绑定退役术语的 APPROVED 译文。 */
+    @PostMapping("/{documentId}/term-retirements/{retirementKey}/activate")
+    public ResponseEntity<String> activateRetirement(@PathVariable long documentId,
+                                                     @PathVariable String retirementKey,
+                                                     @Valid @RequestBody ApiDtos.ActivateRetirementRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/term-retirements/" + retirementKey + "/activate";
+        return writeExecutor.execute(request.requestId(), hash(operation, request),
+                () -> WriteResult.of(200, retirementService.activateRetirement(documentId, retirementKey)))
+                .toResponseEntity();
+    }
+
+    /** 退役影响查询：只读、稳定排序；未激活返回实时预览，已激活返回冻结快照。 */
+    @GetMapping("/{documentId}/term-retirements/{retirementKey}/impact")
+    public ResponseEntity<ApiDtos.RetirementResponse> getRetirementImpact(@PathVariable long documentId,
+                                                                          @PathVariable String retirementKey) {
+        return ResponseEntity.ok(retirementService.getImpact(documentId, retirementKey));
+    }
+
+    /**
+     * 草稿迁移：提交完整草稿集合、expectedVersion 与逐段替换结果；必须恰好覆盖仍受影响的全部草稿，
+     * 替换后通过替代版本规则校验，遗漏、多余或任一违规整体 422。请求摘要对草稿集合排序规范化，换序等价。
+     */
+    @PostMapping("/{documentId}/term-retirements/{retirementKey}/migrate-drafts")
+    public ResponseEntity<String> migrateDrafts(@PathVariable long documentId,
+                                                @PathVariable String retirementKey,
+                                                @RequestHeader("X-Actor-Id") String actorId,
+                                                @Valid @RequestBody ApiDtos.MigrateDraftsRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/term-retirements/" + retirementKey
+                + "/migrate-drafts";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, canonical(request)),
+                () -> WriteResult.of(200, retirementService.migrateDrafts(
+                        documentId, retirementKey, actorId, request))).toResponseEntity();
+    }
+
+    /** 迁移请求规范化：草稿集合按段落与语言排序、语言码统一小写，使集合换序的请求摘要等价。 */
+    private static ApiDtos.MigrateDraftsRequest canonical(ApiDtos.MigrateDraftsRequest request) {
+        List<ApiDtos.DraftReplacement> sorted = request.drafts().stream()
+                .map(d -> new ApiDtos.DraftReplacement(d.segmentId(),
+                        d.language().trim().toLowerCase(java.util.Locale.ROOT), d.content()))
+                .sorted((a, b) -> (a.segmentId() + " " + a.language())
+                        .compareTo(b.segmentId() + " " + b.language()))
+                .toList();
+        return new ApiDtos.MigrateDraftsRequest(request.requestId(), request.expectedVersion(), sorted);
     }
 
     /** 计算请求摘要：操作（含路径变量）+ 操作者 + 规范化请求体的 SHA-256。 */

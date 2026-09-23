@@ -8,6 +8,7 @@ import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.PositiveOrZero;
 import jakarta.validation.constraints.Size;
 
+import java.time.Instant;
 import java.util.List;
 
 /**
@@ -131,5 +132,70 @@ public final class ApiDtos {
         public ErrorResponse(String error, String message) {
             this(error, message, null);
         }
+    }
+
+    /** 创建术语版本退役单请求：左闭右开 UTC 生效窗口、同语言替代版本与全局唯一 retirementKey。 */
+    public record CreateRetirementRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @NotBlank(message = "retirementKey 不能为空") @Size(max = 128) String retirementKey,
+            @Positive(message = "termVersion 必须为正数") int termVersion,
+            @Positive(message = "replacementVersion 必须为正数") int replacementVersion,
+            @NotNull(message = "effectiveFrom 不能为空") Instant effectiveFrom,
+            @NotNull(message = "effectiveTo 不能为空") Instant effectiveTo) {
+    }
+
+    /** 激活退役单请求。 */
+    public record ActivateRetirementRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId) {
+    }
+
+    /** 单条草稿替换结果：迁移后译文正文须通过替代版本规则校验。 */
+    public record DraftReplacement(
+            @NotBlank(message = "segmentId 不能为空") @Size(max = 64) String segmentId,
+            @NotBlank(message = "language 不能为空") String language,
+            @NotBlank(message = "content 不能为空") String content) {
+    }
+
+    /** 草稿迁移请求：expectedVersion 为期望的文档草稿版本；drafts 必须恰好覆盖仍受影响的全部草稿。 */
+    public record MigrateDraftsRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @Positive(message = "expectedVersion 必须为正数") int expectedVersion,
+            @NotNull(message = "drafts 不能为空") @Size(max = 500, message = "草稿集合最多 500 条")
+            List<@Valid DraftReplacement> drafts) {
+    }
+
+    /** 术语命中位置：源文术语及其在源文中首次命中的字符偏移。 */
+    public record TermHit(String sourceTerm, int index) {
+    }
+
+    /** 受影响的草稿/已批准译文版本条目。 */
+    public record ImpactEntry(String segmentId, String language, int translationVersion, String state,
+                              List<TermHit> hits) {
+    }
+
+    /** 受影响的历史发布快照条目。 */
+    public record PublishedImpactEntry(int publishedVersion, String segmentId, String language,
+                                       List<TermHit> hits) {
+    }
+
+    /** 退役影响清单：按状态分组的受影响译文版本，稳定排序。 */
+    public record RetirementImpact(List<ImpactEntry> drafts, List<ImpactEntry> approved,
+                                   List<PublishedImpactEntry> published) {
+    }
+
+    /** 退役单响应：含当前状态与影响清单（创建时为预览，激活后为冻结快照）。 */
+    public record RetirementResponse(String retirementKey, long documentId, int termVersion,
+                                     int replacementVersion, String status, Instant effectiveFrom,
+                                     Instant effectiveTo, RetirementImpact impact) {
+    }
+
+    /** 单条迁移结果：递增后的译文版本、旧/新文本摘要及校验所用规则版本。 */
+    public record MigrationEntry(String segmentId, String language, int translationVersion,
+                                 String oldDigest, String newDigest, int ruleVersion) {
+    }
+
+    /** 草稿迁移响应。 */
+    public record MigrateDraftsResponse(String retirementKey, long documentId, int migratedCount,
+                                        int draftVersion, List<MigrationEntry> entries) {
     }
 }
