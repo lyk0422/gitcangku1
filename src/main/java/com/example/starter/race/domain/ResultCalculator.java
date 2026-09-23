@@ -76,7 +76,7 @@ public final class ResultCalculator {
 
         for (PenaltyView penalty : penalties) {
             Aggregate aggregate = aggregates.get(penalty.bib());
-            if (aggregate == null || penalty.revoked()) {
+            if (aggregate == null || penalty.revoked() || penalty.superseded()) {
                 continue;
             }
             if (penalty.type() == PenaltyType.DISQUALIFY) {
@@ -150,6 +150,14 @@ public final class ResultCalculator {
         Long amountMs();
 
         boolean revoked();
+
+        /**
+         * 是否已被 REPLACE 裁决的新版本取代；被取代的历史版本不参与成绩计算。
+         * 默认 false 以兼容纯逻辑测试中不关心版本链的简易处罚视图。
+         */
+        default boolean superseded() {
+            return false;
+        }
     }
 
     /** 单选手聚合中间态。 */

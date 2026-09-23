@@ -113,6 +113,38 @@ public class RaceController {
         return raceService.getMissingCheckpoints(raceId);
     }
 
+    /** 提交处罚申诉（受理冻结，状态 PENDING）。 */
+    @PostMapping("/{raceId}/penalties/{penaltyId}/appeals")
+    public ResponseEntity<Object> submitAppeal(
+            @PathVariable String raceId,
+            @PathVariable String penaltyId,
+            @Valid @RequestBody SubmitAppealRequest request) {
+        return toResponse(raceService.submitAppeal(raceId, penaltyId, request));
+    }
+
+    /** 赛事干事提交申诉裁决意见（第一人建议 / 第二人确认或驳回）。 */
+    @PostMapping("/{raceId}/appeals/{appealKey}/opinions")
+    public ResponseEntity<Object> submitAppealOpinion(
+            @PathVariable String raceId,
+            @PathVariable String appealKey,
+            @Valid @RequestBody AppealOpinionRequest request) {
+        return toResponse(raceService.submitAppealOpinion(raceId, appealKey, request));
+    }
+
+    /** 查询单个申诉证据（只读）。 */
+    @GetMapping("/{raceId}/appeals/{appealKey}")
+    public AppealResponse getAppeal(
+            @PathVariable String raceId,
+            @PathVariable String appealKey) {
+        return raceService.getAppeal(raceId, appealKey);
+    }
+
+    /** 查询赛事全部申诉证据（只读，稳定排序）。 */
+    @GetMapping("/{raceId}/appeals")
+    public AppealsResponse getAppeals(@PathVariable String raceId) {
+        return raceService.getAppeals(raceId);
+    }
+
     private ResponseEntity<Object> toResponse(ServiceResult result) {
         return ResponseEntity.status(result.status()).body(result.body());
     }

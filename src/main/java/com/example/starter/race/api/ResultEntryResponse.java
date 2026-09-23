@@ -17,6 +17,7 @@ import java.util.List;
  * @param checkpointCount       赛事检查点总数；未配置检查点为 0
  * @param coveredCheckpointCount 该选手已覆盖检查点数量
  * @param missingCheckpoints    缺失检查点代码，按检查点顺序排列；无缺失为空列表
+ * @param appealPending         该选手是否存在待决（PENDING）处罚申诉；申诉冻结期间榜单仍按原处罚计算
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public record ResultEntryResponse(
@@ -28,6 +29,22 @@ public record ResultEntryResponse(
         Long totalTimeMs,
         int checkpointCount,
         int coveredCheckpointCount,
-        List<String> missingCheckpoints
+        List<String> missingCheckpoints,
+        boolean appealPending
 ) {
+
+    /** 无待决申诉场景的兼容构造器：appealPending=false。 */
+    public ResultEntryResponse(
+            String bib,
+            Integer rank,
+            EntryStatus status,
+            Long finishTimeMs,
+            long penaltyMs,
+            Long totalTimeMs,
+            int checkpointCount,
+            int coveredCheckpointCount,
+            List<String> missingCheckpoints) {
+        this(bib, rank, status, finishTimeMs, penaltyMs, totalTimeMs, checkpointCount,
+                coveredCheckpointCount, missingCheckpoints, false);
+    }
 }
