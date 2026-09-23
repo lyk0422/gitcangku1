@@ -113,6 +113,46 @@ public class RaceController {
         return raceService.getMissingCheckpoints(raceId);
     }
 
+    /** 提交处罚申诉（受理并冻结，状态 PENDING）。 */
+    @PostMapping("/{raceId}/appeals")
+    public ResponseEntity<Object> submitAppeal(
+            @PathVariable String raceId,
+            @Valid @RequestBody SubmitAppealRequest request) {
+        return toResponse(raceService.submitAppeal(raceId, request));
+    }
+
+    /** 第一名赛事干事提交裁决建议。 */
+    @PostMapping("/{raceId}/appeals/{appealKey}/recommendation")
+    public ResponseEntity<Object> recommendAppeal(
+            @PathVariable String raceId,
+            @PathVariable String appealKey,
+            @Valid @RequestBody RecommendAppealRequest request) {
+        return toResponse(raceService.recommendAppeal(raceId, appealKey, request));
+    }
+
+    /** 第二名赛事干事确认相同建议或驳回。 */
+    @PostMapping("/{raceId}/appeals/{appealKey}/confirmation")
+    public ResponseEntity<Object> confirmAppeal(
+            @PathVariable String raceId,
+            @PathVariable String appealKey,
+            @Valid @RequestBody ConfirmAppealRequest request) {
+        return toResponse(raceService.confirmAppeal(raceId, appealKey, request));
+    }
+
+    /** 查询赛事全部申诉证据（只读、稳定排序）。 */
+    @GetMapping("/{raceId}/appeals")
+    public AppealListResponse listAppeals(@PathVariable String raceId) {
+        return raceService.listAppeals(raceId);
+    }
+
+    /** 查询单个申诉证据（只读）。 */
+    @GetMapping("/{raceId}/appeals/{appealKey}")
+    public AppealResponse getAppeal(
+            @PathVariable String raceId,
+            @PathVariable String appealKey) {
+        return raceService.getAppeal(raceId, appealKey);
+    }
+
     private ResponseEntity<Object> toResponse(ServiceResult result) {
         return ResponseEntity.status(result.status()).body(result.body());
     }

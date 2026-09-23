@@ -37,7 +37,7 @@ final class ResponseMapper {
 
     static PenaltyResponse toPenaltyResponse(PenaltyRow row) {
         return new PenaltyResponse(row.penaltyId(), row.bib(), row.type(), row.amountMs(),
-                row.revoked(), row.createdAt(), row.revokedAt());
+                row.revoked(), row.version(), row.createdAt(), row.revokedAt());
     }
 
     static CheckpointTimingResponse toTimingResponse(CheckpointTimingRow row) {
@@ -51,7 +51,8 @@ final class ResponseMapper {
             List<RunnerRow> runners,
             List<PenaltyRow> penalties,
             List<CheckpointRow> checkpoints,
-            List<CheckpointTimingRow> timings) {
+            List<CheckpointTimingRow> timings,
+            java.util.Set<String> appealPendingBibs) {
         List<ResultEntry> entries = ResultCalculator.compute(
                 runners, penalties, checkpoints, timings);
         return new StandingResponse(
@@ -59,7 +60,9 @@ final class ResponseMapper {
                 race.version(),
                 race.status(),
                 null,
-                entries.stream().map(ResponseMapper::toEntryResponse).toList());
+                entries.stream()
+                        .map(entry -> toEntryResponse(entry, appealPendingBibs.contains(entry.bib())))
+                        .toList());
     }
 
     static StandingResponse snapshotStanding(SnapshotRow snapshot) {
@@ -71,7 +74,7 @@ final class ResponseMapper {
                 snapshot.entries().stream().map(ResponseMapper::toEntryResponse).toList());
     }
 
-    static ResultEntryResponse toEntryResponse(ResultEntry entry) {
+    static ResultEntryResponse toEntryResponse(ResultEntry entry, boolean appealPending) {
         return new ResultEntryResponse(
                 entry.bib(),
                 entry.rank(),
@@ -81,7 +84,8 @@ final class ResponseMapper {
                 entry.totalTimeMs(),
                 entry.checkpointCount(),
                 entry.coveredCheckpointCount(),
-                entry.missingCheckpoints());
+                entry.missingCheckpoints(),
+                appealPending);
     }
 
     static ResultEntryResponse toEntryResponse(SnapshotEntryRow entry) {
@@ -94,7 +98,8 @@ final class ResponseMapper {
                 entry.totalTimeMs(),
                 entry.checkpointCount(),
                 entry.coveredCheckpointCount(),
-                entry.missingCheckpoints());
+                entry.missingCheckpoints(),
+                false);
     }
 
     /**

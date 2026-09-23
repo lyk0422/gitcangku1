@@ -11,6 +11,7 @@ import com.fasterxml.jackson.annotation.JsonInclude;
  * @param type      ADD_TIME / DISQUALIFY
  * @param amountMs  加时毫秒数；取消资格为 null
  * @param revoked   是否已撤销
+ * @param version   处罚版本号，从1开始；撤销或裁决替换时加一
  * @param createdAt 新增时间，Unix毫秒时间戳
  * @param revokedAt 撤销时间，Unix毫秒时间戳；未撤销为 null
  */
@@ -21,6 +22,7 @@ public record PenaltyResponse(
         PenaltyType type,
         Long amountMs,
         boolean revoked,
+        int version,
         long createdAt,
         Long revokedAt
 ) {

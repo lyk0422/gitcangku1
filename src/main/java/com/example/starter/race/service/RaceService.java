@@ -1,8 +1,12 @@
 package com.example.starter.race.service;
 
 import com.example.starter.race.api.AddPenaltyRequest;
+import com.example.starter.race.api.AppealListResponse;
+import com.example.starter.race.api.AppealResponse;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
+import com.example.starter.race.api.ConfirmAppealRequest;
 import com.example.starter.race.api.CreateRaceRequest;
+import com.example.starter.race.api.RecommendAppealRequest;
 import com.example.starter.race.api.RegisterRunnerRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
@@ -10,6 +14,7 @@ import com.example.starter.race.api.MissingCheckpointsResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
+import com.example.starter.race.api.SubmitAppealRequest;
 import com.example.starter.race.api.SubmitTimingRequest;
 
 /**
@@ -59,4 +64,25 @@ public interface RaceService {
 
     /** 查询赛事全部选手缺失检查点汇总，按参赛号与检查点顺序稳定返回；只读。 */
     MissingCheckpointsResponse getMissingCheckpoints(String raceId);
+
+    /**
+     * 提交处罚申诉：仅本人已生效且未申诉的处罚、finishAt（完赛耗时落库时间）后30分钟内可受理；
+     * 受理时冻结处罚、原始/净成绩、分段判定与榜单版本，状态 PENDING，不推进赛事版本。
+     */
+    ServiceResult submitAppeal(String raceId, SubmitAppealRequest request);
+
+    /** 第一名赛事干事提交裁决建议（UPHOLD/REMOVE/REPLACE）；不推进赛事版本。 */
+    ServiceResult recommendAppeal(String raceId, String appealKey, RecommendAppealRequest request);
+
+    /**
+     * 第二名赛事干事确认与第一人完全相同的建议或驳回；
+     * 确认时在同一事务内重读版本、应用裁决并重算完整榜单，只生成一个新榜单版本。
+     */
+    ServiceResult confirmAppeal(String raceId, String appealKey, ConfirmAppealRequest request);
+
+    /** 查询赛事全部申诉证据，按受理时间与申诉键稳定排序；只读。 */
+    AppealListResponse listAppeals(String raceId);
+
+    /** 查询单个申诉证据；不存在为404；只读。 */
+    AppealResponse getAppeal(String raceId, String appealKey);
 }

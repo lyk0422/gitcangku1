@@ -1,5 +1,6 @@
 package com.example.starter.race.persistence;
 
+import com.example.starter.race.domain.AppealStatus;
 import com.example.starter.race.domain.EntryStatus;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
@@ -30,6 +31,9 @@ public class RaceRepository {
             new CheckpointTimingRowMapper();
     private static final SnapshotCheckpointRowMapper SNAPSHOT_CHECKPOINT_ROW_MAPPER =
             new SnapshotCheckpointRowMapper();
+    private static final AppealRowMapper APPEAL_ROW_MAPPER = new AppealRowMapper();
+    private static final PenaltyRevisionRowMapper PENALTY_REVISION_ROW_MAPPER =
+            new PenaltyRevisionRowMapper();
 
     private final JdbcTemplate jdbcTemplate;
 
@@ -80,7 +84,7 @@ public class RaceRepository {
     /** 查询赛事下全部处罚（含已撤销），按新增时间与处罚ID排列。 */
     public List<PenaltyRow> findPenalties(String raceId) {
         return jdbcTemplate.query(
-                "SELECT penalty_id, race_id, bib, type, amount_ms, revoked, created_at, revoked_at "
+                "SELECT penalty_id, race_id, bib, type, amount_ms, revoked, version, created_at, revoked_at "
                         + "FROM penalty WHERE race_id = ? ORDER BY created_at, penalty_id",
                 PENALTY_ROW_MAPPER, raceId);
     }
@@ -88,7 +92,7 @@ public class RaceRepository {
     /** 按全局处罚ID查询处罚。 */
     public Optional<PenaltyRow> findPenalty(String penaltyId) {
         return jdbcTemplate
-                .query("SELECT penalty_id, race_id, bib, type, amount_ms, revoked, created_at, revoked_at "
+                .query("SELECT penalty_id, race_id, bib, type, amount_ms, revoked, version, created_at, revoked_at "
                                 + "FROM penalty WHERE penalty_id = ?",
                         PENALTY_ROW_MAPPER, penaltyId)
                 .stream()
@@ -253,10 +257,11 @@ public class RaceRepository {
                 penaltyId, raceId, bib, type.name(), amountMs, now);
     }
 
-    /** 撤销处罚，仅对当前未撤销的处罚生效；返回受影响行数。 */
+    /** 撤销处罚并推进处罚版本，仅对当前未撤销的处罚生效；返回受影响行数。 */
     public int markPenaltyRevoked(String penaltyId, long now) {
         return jdbcTemplate.update(
-                "UPDATE penalty SET revoked = TRUE, revoked_at = ? WHERE penalty_id = ? AND revoked = FALSE",
+                "UPDATE penalty SET revoked = TRUE, revoked_at = ?, version = version + 1 "
+                        + "WHERE penalty_id = ? AND revoked = FALSE",
                 now, penaltyId);
     }
 
@@ -368,8 +373,168 @@ public class RaceRepository {
                 responseStatus, responseBody, requestId);
     }
 
+    /** appeal 表全列，供各查询复用。 */
+    private static final String APPEAL_COLUMNS =
+            "appeal_key, race_id, bib, penalty_id, reason, status, penalty_version, "
+                    + "frozen_penalty_type, frozen_penalty_amount_ms, frozen_finish_time_ms, "
+                    + "frozen_penalty_ms, frozen_total_time_ms, frozen_rank, frozen_status, "
+                    + "frozen_segments, leaderboard_version, "
+                    + "first_official_id, first_decision, first_replacement_ms, first_at, "
+                    + "second_official_id, second_action, second_decision, second_replacement_ms, "
+                    + "second_at, leaderboard_before, leaderboard_after, new_leaderboard_version, "
+                    + "created_at, decided_at";
+
+    /** 受理申诉：写入冻结快照，状态 PENDING。 */
+    public void insertAppeal(AppealRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO appeal (" + APPEAL_COLUMNS + ") VALUES ("
+                        + "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                        + "?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                row.appealKey(), row.raceId(), row.bib(), row.penaltyId(), row.reason(),
+                row.status().name(), row.penaltyVersion(), row.frozenPenaltyType(),
+                row.frozenPenaltyAmountMs(), row.frozenFinishTimeMs(), row.frozenPenaltyMs(),
+                row.frozenTotalTimeMs(), row.frozenRank(), row.frozenStatus(),
+                row.frozenSegments(), row.leaderboardVersion(),
+                row.firstOfficialId(), row.firstDecision(), row.firstReplacementMs(), row.firstAt(),
+                row.secondOfficialId(), row.secondAction(), row.secondDecision(),
+                row.secondReplacementMs(), row.secondAt(),
+                row.leaderboardBefore(), row.leaderboardAfter(), row.newLeaderboardVersion(),
+                row.createdAt(), row.decidedAt());
+    }
+
+    /** 按申诉键查询申诉。 */
+    public Optional<AppealRow> findAppeal(String appealKey) {
+        return jdbcTemplate
+                .query("SELECT " + APPEAL_COLUMNS + " FROM appeal WHERE appeal_key = ?",
+                        APPEAL_ROW_MAPPER, appealKey)
+                .stream()
+                .findFirst();
+    }
+
+    /** 行锁方式查询申诉：与裁决事务串行化。 */
+    public Optional<AppealRow> findAppealForUpdate(String appealKey) {
+        return jdbcTemplate
+                .query("SELECT " + APPEAL_COLUMNS + " FROM appeal WHERE appeal_key = ? FOR UPDATE",
+                        APPEAL_ROW_MAPPER, appealKey)
+                .stream()
+                .findFirst();
+    }
+
+    /** 查询赛事全部申诉，按受理时间与申诉键稳定排序。 */
+    public List<AppealRow> findAppeals(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT " + APPEAL_COLUMNS + " FROM appeal WHERE race_id = ? "
+                        + "ORDER BY created_at, appeal_key",
+                APPEAL_ROW_MAPPER, raceId);
+    }
+
+    /** 统计赛事待决申诉数（封榜门禁：>0 禁止封榜）。 */
+    public int countPendingAppeals(String raceId) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM appeal WHERE race_id = ? AND status = 'PENDING'",
+                Integer.class, raceId);
+        return count == null ? 0 : count;
+    }
+
+    /** 查询赛事下有待决申诉的选手参赛号，按参赛号排序（用于榜单“申诉中”标记）。 */
+    public List<String> findPendingAppealBibs(String raceId) {
+        return jdbcTemplate.queryForList(
+                "SELECT DISTINCT bib FROM appeal WHERE race_id = ? AND status = 'PENDING' "
+                        + "ORDER BY bib",
+                String.class, raceId);
+    }
+
+    /**
+     * 记录第一人建议并清空上一轮第二人意见；仅当申诉仍 PENDING 且当前无第一人建议时生效。
+     *
+     * @return 受影响行数；0 表示申诉不存在、非 PENDING 或已有未驳回建议
+     */
+    public int recordFirstOpinion(
+            String appealKey, String officialId, String decision, Long replacementMs, long now) {
+        return jdbcTemplate.update(
+                "UPDATE appeal SET first_official_id = ?, first_decision = ?, "
+                        + "first_replacement_ms = ?, first_at = ?, "
+                        + "second_official_id = NULL, second_action = NULL, second_decision = NULL, "
+                        + "second_replacement_ms = NULL, second_at = NULL "
+                        + "WHERE appeal_key = ? AND status = 'PENDING' AND first_official_id IS NULL",
+                officialId, decision, replacementMs, now, appealKey);
+    }
+
+    /**
+     * 第二人驳回：清空第一人建议并记录驳回意见，申诉保持 PENDING 等待新一轮建议。
+     *
+     * @return 受影响行数；0 表示申诉不存在、非 PENDING 或尚无第一人建议
+     */
+    public int rejectFirstOpinion(String appealKey, String secondOfficialId, long now) {
+        return jdbcTemplate.update(
+                "UPDATE appeal SET first_official_id = NULL, first_decision = NULL, "
+                        + "first_replacement_ms = NULL, first_at = NULL, "
+                        + "second_official_id = ?, second_action = 'REJECT', second_decision = NULL, "
+                        + "second_replacement_ms = NULL, second_at = ? "
+                        + "WHERE appeal_key = ? AND status = 'PENDING' AND first_official_id IS NOT NULL",
+                secondOfficialId, now, appealKey);
+    }
+
+    /**
+     * 确认裁决：写入第二人确认意见、最终状态与重算前后榜单快照；仅当仍 PENDING 时生效。
+     *
+     * @return 受影响行数；0 表示申诉不存在或已被其他事务裁决
+     */
+    public int completeAppealDecision(
+            String appealKey,
+            String newStatus,
+            String secondOfficialId,
+            String secondDecision,
+            Long secondReplacementMs,
+            long now,
+            String leaderboardBefore,
+            String leaderboardAfter,
+            int newLeaderboardVersion) {
+        return jdbcTemplate.update(
+                "UPDATE appeal SET status = ?, second_official_id = ?, second_action = 'CONFIRM', "
+                        + "second_decision = ?, second_replacement_ms = ?, second_at = ?, "
+                        + "leaderboard_before = ?, leaderboard_after = ?, "
+                        + "new_leaderboard_version = ?, decided_at = ? "
+                        + "WHERE appeal_key = ? AND status = 'PENDING'",
+                newStatus, secondOfficialId, secondDecision, secondReplacementMs, now,
+                leaderboardBefore, leaderboardAfter, newLeaderboardVersion, now, appealKey);
+    }
+
+    /**
+     * REPLACE 裁决：以替代罚时生成处罚新版本，仅当版本与冻结一致且未撤销时生效。
+     *
+     * @return 受影响行数；0 表示处罚版本已变化或已撤销
+     */
+    public int replacePenaltyVersion(String penaltyId, long replacementMs, int expectedVersion) {
+        return jdbcTemplate.update(
+                "UPDATE penalty SET type = 'ADD_TIME', amount_ms = ?, version = version + 1 "
+                        + "WHERE penalty_id = ? AND version = ? AND revoked = FALSE",
+                replacementMs, penaltyId, expectedVersion);
+    }
+
+    /** 记录被 REPLACE 替换的处罚旧版本，关联新旧版本与申诉键。 */
+    public void insertPenaltyRevision(PenaltyRevisionRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO penalty_revision "
+                        + "(penalty_id, version, type, amount_ms, superseded_by_version, "
+                        + "appeal_key, superseded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                row.penaltyId(), row.version(), row.type().name(), row.amountMs(),
+                row.supersededByVersion(), row.appealKey(), row.supersededAt());
+    }
+
+    /** 查询处罚的全部历史版本，按版本号升序。 */
+    public List<PenaltyRevisionRow> findPenaltyRevisions(String penaltyId) {
+        return jdbcTemplate.query(
+                "SELECT penalty_id, version, type, amount_ms, superseded_by_version, "
+                        + "appeal_key, superseded_at FROM penalty_revision "
+                        + "WHERE penalty_id = ? ORDER BY version",
+                PENALTY_REVISION_ROW_MAPPER, penaltyId);
+    }
+
     /** 测试辅助：清空全部业务数据，按外键依赖顺序删除。 */
     public void deleteAllForTesting() {
+        jdbcTemplate.update("DELETE FROM appeal");
+        jdbcTemplate.update("DELETE FROM penalty_revision");
         jdbcTemplate.update("DELETE FROM result_snapshot_checkpoint");
         jdbcTemplate.update("DELETE FROM result_snapshot_entry");
         jdbcTemplate.update("DELETE FROM result_snapshot");
@@ -416,6 +581,7 @@ public class RaceRepository {
                     PenaltyType.valueOf(rs.getString("type")),
                     (Long) rs.getObject("amount_ms"),
                     rs.getBoolean("revoked"),
+                    rs.getInt("version"),
                     rs.getLong("created_at"),
                     (Long) rs.getObject("revoked_at"));
         }
@@ -488,6 +654,57 @@ public class RaceRepository {
                     rs.getInt("response_status"),
                     rs.getString("response_body"),
                     rs.getLong("created_at"));
+        }
+    }
+
+    private static final class AppealRowMapper implements RowMapper<AppealRow> {
+        @Override
+        public AppealRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new AppealRow(
+                    rs.getString("appeal_key"),
+                    rs.getString("race_id"),
+                    rs.getString("bib"),
+                    rs.getString("penalty_id"),
+                    rs.getString("reason"),
+                    AppealStatus.valueOf(rs.getString("status")),
+                    rs.getInt("penalty_version"),
+                    rs.getString("frozen_penalty_type"),
+                    (Long) rs.getObject("frozen_penalty_amount_ms"),
+                    (Long) rs.getObject("frozen_finish_time_ms"),
+                    rs.getLong("frozen_penalty_ms"),
+                    (Long) rs.getObject("frozen_total_time_ms"),
+                    (Integer) rs.getObject("frozen_rank"),
+                    rs.getString("frozen_status"),
+                    rs.getString("frozen_segments"),
+                    rs.getInt("leaderboard_version"),
+                    rs.getString("first_official_id"),
+                    rs.getString("first_decision"),
+                    (Long) rs.getObject("first_replacement_ms"),
+                    (Long) rs.getObject("first_at"),
+                    rs.getString("second_official_id"),
+                    rs.getString("second_action"),
+                    rs.getString("second_decision"),
+                    (Long) rs.getObject("second_replacement_ms"),
+                    (Long) rs.getObject("second_at"),
+                    rs.getString("leaderboard_before"),
+                    rs.getString("leaderboard_after"),
+                    (Integer) rs.getObject("new_leaderboard_version"),
+                    rs.getLong("created_at"),
+                    (Long) rs.getObject("decided_at"));
+        }
+    }
+
+    private static final class PenaltyRevisionRowMapper implements RowMapper<PenaltyRevisionRow> {
+        @Override
+        public PenaltyRevisionRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new PenaltyRevisionRow(
+                    rs.getString("penalty_id"),
+                    rs.getInt("version"),
+                    PenaltyType.valueOf(rs.getString("type")),
+                    (Long) rs.getObject("amount_ms"),
+                    rs.getInt("superseded_by_version"),
+                    rs.getString("appeal_key"),
+                    rs.getLong("superseded_at"));
         }
     }
 }

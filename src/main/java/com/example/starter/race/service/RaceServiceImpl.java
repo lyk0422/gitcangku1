@@ -1,28 +1,39 @@
 package com.example.starter.race.service;
 
 import com.example.starter.race.api.AddPenaltyRequest;
+import com.example.starter.race.api.AppealListResponse;
+import com.example.starter.race.api.AppealResponse;
 import com.example.starter.race.api.CheckpointResponse;
 import com.example.starter.race.api.CheckpointsConfigResponse;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
+import com.example.starter.race.api.ConfirmAppealRequest;
 import com.example.starter.race.api.CreateRaceRequest;
 import com.example.starter.race.api.MissingCheckpointsResponse;
 import com.example.starter.race.api.RaceResponse;
+import com.example.starter.race.api.RecommendAppealRequest;
 import com.example.starter.race.api.RegisterRunnerRequest;
+import com.example.starter.race.api.ResultEntryResponse;
 import com.example.starter.race.api.ReviseTimeRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
 import com.example.starter.race.api.RunnerMissingCheckpointsResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
+import com.example.starter.race.api.SubmitAppealRequest;
 import com.example.starter.race.api.SubmitTimingRequest;
+import com.example.starter.race.domain.AppealDecision;
+import com.example.starter.race.domain.AppealStatus;
 import com.example.starter.race.domain.CheckpointRules;
+import com.example.starter.race.domain.ConfirmAction;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
+import com.example.starter.race.persistence.AppealRow;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
 import com.example.starter.race.persistence.IdempotencyRow;
+import com.example.starter.race.persistence.PenaltyRevisionRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
 import com.example.starter.race.persistence.RunnerRow;
@@ -41,9 +52,11 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.TreeMap;
 import java.util.function.Supplier;
@@ -70,6 +83,8 @@ public class RaceServiceImpl implements RaceService {
     private static final long MAX_PENALTY_MS = 3_600_000L;
     /** 同键并发时等待先行者事务结束的上限（毫秒）。 */
     private static final long INFLIGHT_WAIT_MAX_MS = 30_000L;
+    /** 申诉窗口：finishAt（完赛耗时落库时间）后30分钟（毫秒）。 */
+    private static final long APPEAL_WINDOW_MS = 1_800_000L;
 
     private final RaceRepository repository;
     private final Clock clock;
@@ -355,6 +370,10 @@ public class RaceServiceImpl implements RaceService {
                     if (race.status() == RaceStatus.SEALED) {
                         throw new ConflictException("赛事已封榜: " + raceId);
                     }
+                    // 封榜门禁：存在待决申诉时禁止封榜。
+                    if (repository.countPendingAppeals(raceId) > 0) {
+                        throw new ConflictException("存在待决申诉，禁止封榜: " + raceId);
+                    }
                     List<RunnerRow> runners = repository.findRunners(raceId);
                     List<PenaltyRow> penalties = repository.findPenalties(raceId);
                     List<CheckpointRow> checkpoints = repository.findCheckpoints(raceId);
@@ -412,7 +431,8 @@ public class RaceServiceImpl implements RaceService {
                 repository.findRunners(raceId),
                 repository.findPenalties(raceId),
                 repository.findCheckpoints(raceId),
-                repository.findAllTimings(raceId));
+                repository.findAllTimings(raceId),
+                new java.util.HashSet<>(repository.findPendingAppealBibs(raceId)));
     }
 
     @Override
@@ -723,5 +743,366 @@ public class RaceServiceImpl implements RaceService {
         String message = cause.getMessage();
         return message != null
                 && message.toUpperCase(java.util.Locale.ROOT).contains(constraintName.toUpperCase(java.util.Locale.ROOT));
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult submitAppeal(String raceId, SubmitAppealRequest request) {
+        return withIdempotency(request.requestId(), "SUBMIT_APPEAL",
+                orderedParams(
+                        "raceId", raceId,
+                        "appealKey", request.appealKey(),
+                        "bib", request.bib(),
+                        "penaltyId", request.penaltyId(),
+                        "penaltyVersion", request.penaltyVersion(),
+                        "reason", request.reason(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    // 受理不推进赛事版本：冻结的榜单版本即当前版本，版本不变时裁决才允许确认。
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    RunnerRow runner = requireRunner(raceId, request.bib());
+                    PenaltyRow penalty = repository.findPenalty(request.penaltyId())
+                            .orElseThrow(() -> new NotFoundException(
+                                    "处罚不存在: " + request.penaltyId()));
+                    if (!penalty.raceId().equals(raceId)) {
+                        throw new NotFoundException("处罚不属于该赛事: " + request.penaltyId());
+                    }
+                    if (!penalty.bib().equals(request.bib())) {
+                        throw new UnprocessableEntityException("只能申诉本人的处罚: " + request.penaltyId());
+                    }
+                    if (penalty.revoked()) {
+                        throw new ConflictException("处罚已撤销，不可申诉: " + request.penaltyId());
+                    }
+                    if (penalty.version() != request.penaltyVersion()) {
+                        throw new ConflictException("处罚版本不一致: expected="
+                                + request.penaltyVersion() + ", actual=" + penalty.version());
+                    }
+                    // 申诉窗口：finishAt（完赛耗时最近一次落库时间）后30分钟内。
+                    if (runner.finishTimeMs() == null) {
+                        throw new UnprocessableEntityException("选手尚无完赛耗时，不在申诉窗口内: " + request.bib());
+                    }
+                    long now = clock.millis();
+                    if (now > runner.updatedAt() + APPEAL_WINDOW_MS) {
+                        throw new UnprocessableEntityException("申诉窗口已截止（finishAt后30分钟）: " + request.bib());
+                    }
+                    List<CheckpointRow> checkpoints = repository.findCheckpoints(raceId);
+                    List<CheckpointTimingRow> timings = repository.findAllTimings(raceId);
+                    List<ResultEntry> entries = ResultCalculator.compute(
+                            repository.findRunners(raceId), repository.findPenalties(raceId),
+                            checkpoints, timings);
+                    ResultEntry own = entries.stream()
+                            .filter(entry -> entry.bib().equals(request.bib()))
+                            .findFirst()
+                            .orElseThrow();
+                    List<AppealResponse.Segment> segments = buildFrozenSegments(
+                            checkpoints, timings, request.bib());
+                    AppealRow row = new AppealRow(
+                            request.appealKey(), raceId, request.bib(), request.penaltyId(),
+                            request.reason(), AppealStatus.PENDING, penalty.version(),
+                            penalty.type().name(), penalty.amountMs(),
+                            own.finishTimeMs(), own.penaltyMs(), own.totalTimeMs(),
+                            own.rank(), own.status().name(), writeJson(segments),
+                            race.version(),
+                            null, null, null, null,
+                            null, null, null, null, null,
+                            null, null, null, now, null);
+                    try {
+                        repository.insertAppeal(row);
+                    } catch (DuplicateKeyException ex) {
+                        if (constraintMatches(ex, "uk_appeal_penalty")) {
+                            throw new ConflictException("该处罚已存在申诉: " + request.penaltyId());
+                        }
+                        throw new ConflictException("appealKey已存在: " + request.appealKey());
+                    }
+                    return ServiceResult.created(toAppealResponse(
+                            repository.findAppeal(request.appealKey()).orElseThrow()));
+                });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult recommendAppeal(
+            String raceId, String appealKey, RecommendAppealRequest request) {
+        return withIdempotency(request.requestId(), "RECOMMEND_APPEAL",
+                orderedParams(
+                        "raceId", raceId,
+                        "appealKey", appealKey,
+                        "officialId", request.officialId(),
+                        "decision", request.decision(),
+                        "replacementMs", request.replacementMs()),
+                () -> {
+                    requireOpenRaceForAppeal(raceId);
+                    AppealRow appeal = requirePendingAppeal(raceId, appealKey);
+                    if (appeal.firstOfficialId() != null) {
+                        throw new ConflictException("已存在待确认的第一人建议: " + appealKey);
+                    }
+                    AppealDecision decision = parseAppealDecision(request.decision());
+                    validateReplacement(decision, request.replacementMs());
+                    long now = clock.millis();
+                    int updated = repository.recordFirstOpinion(
+                            appealKey, request.officialId(), decision.name(),
+                            request.replacementMs(), now);
+                    if (updated == 0) {
+                        throw new ConflictException("申诉状态已变化: " + appealKey);
+                    }
+                    return ServiceResult.ok(toAppealResponse(
+                            repository.findAppeal(appealKey).orElseThrow()));
+                });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult confirmAppeal(
+            String raceId, String appealKey, ConfirmAppealRequest request) {
+        return withIdempotency(request.requestId(), "CONFIRM_APPEAL",
+                orderedParams(
+                        "raceId", raceId,
+                        "appealKey", appealKey,
+                        "officialId", request.officialId(),
+                        "action", request.action(),
+                        "decision", request.decision(),
+                        "replacementMs", request.replacementMs()),
+                () -> {
+                    RaceRow race = requireOpenRaceForAppeal(raceId);
+                    AppealRow appeal = requirePendingAppeal(raceId, appealKey);
+                    if (appeal.firstOfficialId() == null) {
+                        throw new ConflictException("尚无第一人建议，不能确认或驳回: " + appealKey);
+                    }
+                    ConfirmAction action = parseConfirmAction(request.action());
+                    if (request.officialId().equals(appeal.firstOfficialId())) {
+                        throw new UnprocessableEntityException(
+                                "第二名裁决人不能与第一人相同: " + request.officialId());
+                    }
+                    long now = clock.millis();
+                    if (action == ConfirmAction.REJECT) {
+                        if (request.decision() != null || request.replacementMs() != null) {
+                            throw new BadRequestException("驳回不得携带建议内容");
+                        }
+                        int rejected = repository.rejectFirstOpinion(
+                                appealKey, request.officialId(), now);
+                        if (rejected == 0) {
+                            throw new ConflictException("申诉状态已变化: " + appealKey);
+                        }
+                        return ServiceResult.ok(toAppealResponse(
+                                repository.findAppeal(appealKey).orElseThrow()));
+                    }
+                    return confirmRecommendation(race, appeal, request, now);
+                });
+    }
+
+    /**
+     * 确认路径：校验建议一致性与受理后版本未变，同事务内应用裁决、
+     * 重算完整榜单并只推进一次榜单版本；任一校验失败整体回滚，申诉仍 PENDING。
+     */
+    private ServiceResult confirmRecommendation(
+            RaceRow race, AppealRow appeal, ConfirmAppealRequest request, long now) {
+        AppealDecision decision = parseAppealDecision(request.decision());
+        validateReplacement(decision, request.replacementMs());
+        if (!decision.name().equals(appeal.firstDecision())
+                || !Objects.equals(request.replacementMs(), appeal.firstReplacementMs())) {
+            throw new UnprocessableEntityException("第二人只能确认与第一人完全相同的建议");
+        }
+        String raceId = race.raceId();
+        String appealKey = appeal.appealKey();
+        // 重新读取版本：赛事版本覆盖计时修订/分段判定/处罚变更，处罚版本覆盖处罚自身变化。
+        if (race.version() != appeal.leaderboardVersion()) {
+            throw new ConflictException("受理后赛事版本已变化，禁止裁决: expected="
+                    + appeal.leaderboardVersion() + ", actual=" + race.version());
+        }
+        PenaltyRow penalty = repository.findPenalty(appeal.penaltyId()).orElseThrow();
+        if (penalty.revoked() || penalty.version() != appeal.penaltyVersion()) {
+            throw new ConflictException("受理后处罚版本已变化，禁止裁决: " + appeal.penaltyId());
+        }
+        List<RunnerRow> runners = repository.findRunners(raceId);
+        List<CheckpointRow> checkpoints = repository.findCheckpoints(raceId);
+        List<CheckpointTimingRow> timings = repository.findAllTimings(raceId);
+        List<ResultEntry> beforeEntries = ResultCalculator.compute(
+                runners, repository.findPenalties(raceId), checkpoints, timings);
+        switch (decision) {
+            case UPHOLD -> {
+                // 维持处罚，不变更。
+            }
+            case REMOVE -> {
+                int revoked = repository.markPenaltyRevoked(penalty.penaltyId(), now);
+                if (revoked == 0) {
+                    throw new ConflictException("处罚状态已变化: " + penalty.penaltyId());
+                }
+            }
+            case REPLACE -> {
+                int replaced = repository.replacePenaltyVersion(
+                        penalty.penaltyId(), request.replacementMs(), appeal.penaltyVersion());
+                if (replaced == 0) {
+                    throw new ConflictException("处罚版本已变化: " + penalty.penaltyId());
+                }
+                repository.insertPenaltyRevision(new PenaltyRevisionRow(
+                        penalty.penaltyId(), penalty.version(), penalty.type(), penalty.amountMs(),
+                        penalty.version() + 1, appealKey, now));
+            }
+        }
+        List<ResultEntry> afterEntries = ResultCalculator.compute(
+                runners, repository.findPenalties(raceId), checkpoints, timings);
+        // 恰好推进一次榜单版本；条件更新失败则整体回滚（含处罚变更）。
+        int newVersion = appeal.leaderboardVersion() + 1;
+        int bumped = repository.bumpVersionIfOpen(raceId, appeal.leaderboardVersion());
+        if (bumped == 0) {
+            throw new ConflictException("版本冲突或赛事已封榜");
+        }
+        AppealStatus newStatus = switch (decision) {
+            case UPHOLD -> AppealStatus.UPHELD;
+            case REMOVE -> AppealStatus.REMOVED;
+            case REPLACE -> AppealStatus.REPLACED;
+        };
+        String beforeJson = writeJson(beforeEntries.stream()
+                .map(entry -> ResponseMapper.toEntryResponse(entry, false)).toList());
+        String afterJson = writeJson(afterEntries.stream()
+                .map(entry -> ResponseMapper.toEntryResponse(entry, false)).toList());
+        int completed = repository.completeAppealDecision(
+                appealKey, newStatus.name(), request.officialId(), decision.name(),
+                request.replacementMs(), now, beforeJson, afterJson, newVersion);
+        if (completed == 0) {
+            throw new ConflictException("申诉状态已变化: " + appealKey);
+        }
+        return ServiceResult.ok(toAppealResponse(
+                repository.findAppeal(appealKey).orElseThrow()));
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public AppealListResponse listAppeals(String raceId) {
+        repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        return new AppealListResponse(raceId, repository.findAppeals(raceId).stream()
+                .map(this::toAppealResponse)
+                .toList());
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public AppealResponse getAppeal(String raceId, String appealKey) {
+        repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        AppealRow appeal = repository.findAppeal(appealKey)
+                .orElseThrow(() -> new NotFoundException("申诉不存在: " + appealKey));
+        if (!appeal.raceId().equals(raceId)) {
+            throw new NotFoundException("申诉不属于该赛事: " + appealKey);
+        }
+        return toAppealResponse(appeal);
+    }
+
+    /** 取赛事行写锁并校验未封榜（裁决相关写操作的公共前置）。 */
+    private RaceRow requireOpenRaceForAppeal(String raceId) {
+        RaceRow race = repository.findRaceForUpdate(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        if (race.status() == RaceStatus.SEALED) {
+            throw new ConflictException("赛事已封榜，禁止申诉裁决: " + raceId);
+        }
+        return race;
+    }
+
+    /** 行锁查询申诉并校验归属赛事且仍待裁决。 */
+    private AppealRow requirePendingAppeal(String raceId, String appealKey) {
+        AppealRow appeal = repository.findAppealForUpdate(appealKey)
+                .orElseThrow(() -> new NotFoundException("申诉不存在: " + appealKey));
+        if (!appeal.raceId().equals(raceId)) {
+            throw new NotFoundException("申诉不属于该赛事: " + appealKey);
+        }
+        if (appeal.status() != AppealStatus.PENDING) {
+            throw new ConflictException("申诉已裁决: " + appealKey);
+        }
+        return appeal;
+    }
+
+    /** 构造受理冻结的分段判定：按检查点顺序，缺失检查点耗时与记录ID为 null。 */
+    private List<AppealResponse.Segment> buildFrozenSegments(
+            List<CheckpointRow> checkpoints, List<CheckpointTimingRow> timings, String bib) {
+        Map<String, CheckpointTimingRow> timingByCode = new HashMap<>();
+        for (CheckpointTimingRow timing : timings) {
+            if (timing.bib().equals(bib)) {
+                timingByCode.put(timing.checkpointCode(), timing);
+            }
+        }
+        List<AppealResponse.Segment> segments = new ArrayList<>(checkpoints.size());
+        for (CheckpointRow checkpoint : checkpoints) {
+            CheckpointTimingRow timing = timingByCode.get(checkpoint.checkpointCode());
+            segments.add(new AppealResponse.Segment(
+                    checkpoint.checkpointCode(), checkpoint.position(),
+                    timing == null ? null : timing.elapsedMillis(),
+                    timing == null ? null : timing.timingId()));
+        }
+        return segments;
+    }
+
+    private static AppealDecision parseAppealDecision(String decision) {
+        if (decision == null) {
+            throw new BadRequestException("必须携带建议类型: UPHOLD/REMOVE/REPLACE");
+        }
+        try {
+            return AppealDecision.valueOf(decision);
+        } catch (IllegalArgumentException ex) {
+            throw new BadRequestException("未知建议类型: " + decision);
+        }
+    }
+
+    private static ConfirmAction parseConfirmAction(String action) {
+        try {
+            return ConfirmAction.valueOf(action);
+        } catch (IllegalArgumentException ex) {
+            throw new BadRequestException("未知确认动作: " + action);
+        }
+    }
+
+    /** REPLACE 必须携带 0~3600000 毫秒的替代罚时；其余建议不得携带。 */
+    private static void validateReplacement(AppealDecision decision, Long replacementMs) {
+        if (decision == AppealDecision.REPLACE) {
+            if (replacementMs == null) {
+                throw new BadRequestException("REPLACE 建议必须携带替代罚时 replacementMs");
+            }
+            if (replacementMs < 0 || replacementMs > MAX_PENALTY_MS) {
+                throw new BadRequestException("替代罚时必须在 0~3600000 毫秒之间");
+            }
+        } else if (replacementMs != null) {
+            throw new BadRequestException("非 REPLACE 建议不得携带 replacementMs");
+        }
+    }
+
+    /** 行记录转申诉证据响应：解析冻结分段与重算前后榜单快照 JSON。 */
+    private AppealResponse toAppealResponse(AppealRow row) {
+        AppealResponse.Freeze freeze = new AppealResponse.Freeze(
+                row.frozenPenaltyType(), row.frozenPenaltyAmountMs(), row.frozenFinishTimeMs(),
+                row.frozenPenaltyMs(), row.frozenTotalTimeMs(), row.frozenRank(),
+                row.frozenStatus(), readSegmentsJson(row.frozenSegments()),
+                row.leaderboardVersion());
+        AppealResponse.Opinion first = row.firstOfficialId() == null ? null
+                : new AppealResponse.Opinion(row.firstOfficialId(), "RECOMMEND",
+                        row.firstDecision(), row.firstReplacementMs(), row.firstAt());
+        AppealResponse.Opinion second = row.secondOfficialId() == null ? null
+                : new AppealResponse.Opinion(row.secondOfficialId(), row.secondAction(),
+                        row.secondDecision(), row.secondReplacementMs(), row.secondAt());
+        List<ResultEntryResponse> before = row.leaderboardBefore() == null ? null
+                : readLeaderboardJson(row.leaderboardBefore());
+        List<ResultEntryResponse> after = row.leaderboardAfter() == null ? null
+                : readLeaderboardJson(row.leaderboardAfter());
+        return new AppealResponse(
+                row.appealKey(), row.raceId(), row.bib(), row.penaltyId(), row.status(),
+                row.reason(), row.penaltyVersion(), freeze, first, second,
+                before, after, row.newLeaderboardVersion(), row.createdAt(), row.decidedAt());
+    }
+
+    private List<AppealResponse.Segment> readSegmentsJson(String json) {
+        try {
+            return objectMapper.readValue(json, objectMapper.getTypeFactory()
+                    .constructCollectionType(List.class, AppealResponse.Segment.class));
+        } catch (com.fasterxml.jackson.core.JsonProcessingException ex) {
+            throw new IllegalStateException("解析冻结分段判定失败", ex);
+        }
+    }
+
+    private List<ResultEntryResponse> readLeaderboardJson(String json) {
+        try {
+            return objectMapper.readValue(json, objectMapper.getTypeFactory()
+                    .constructCollectionType(List.class, ResultEntryResponse.class));
+        } catch (com.fasterxml.jackson.core.JsonProcessingException ex) {
+            throw new IllegalStateException("解析榜单快照失败", ex);
+        }
     }
 }
