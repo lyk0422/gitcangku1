@@ -33,7 +33,7 @@ public final class Dtos {
      * 转出时等额扣减，取消时归零；持有额度恰为零的已转出申请仍为 APPROVED）。
      */
     public record AllocationResponse(String allocationKey, long windowId, String userId, String amount,
-                                     String heldAmount, String requester, String status,
+                                     String heldAmount, String requester, String status, long version,
                                      String createdUtc, String updatedUtc) {
     }
 
@@ -72,6 +72,43 @@ public final class Dtos {
     /** 窗口历史明细：窗口本身 + 全部申请 + 全部限供记录。 */
     public record HistoryResponse(WindowResponse window, List<AllocationResponse> allocations,
                                   List<CurtailmentResponse> curtailments) {
+    }
+
+    /**
+     * 批量净额清算提交命令。
+     * requestId 为请求幂等键（同 requestId 同参重放，异参 409）；settlementKey 为成功批次全局唯一键；
+     * subjects 必须为指令涉及的全部主体“申请键 + 当前额度版本”的完整集合（不遗漏、不多余）。
+     */
+    public record SettlementRequest(String commandKey, String requestId, String settlementKey, Long windowId,
+                                    List<SettlementInstruction> instructions, List<SubjectVersion> subjects) {
+    }
+
+    /** 清算指令：from 转出、to 转入，volume 为正整数体积（立方米），instructionKey 全局唯一，禁止自转。 */
+    public record SettlementInstruction(String instructionKey, String from, String to, String volume) {
+    }
+
+    /** 主体版本：allocationKey 主体申请键，version 提交方认知的当前额度版本。 */
+    public record SubjectVersion(String allocationKey, long version) {
+    }
+
+    /** 清算批次视图，创建后不可变。 */
+    public record SettlementResponse(String settlementKey, String requestId, long windowId,
+                                     int instructionCount, List<SettlementInstructionView> instructions,
+                                     List<SubjectSnapshotView> subjects, String createdUtc) {
+    }
+
+    /** 清算指令视图：严格按提交输入顺序返回（含相同主体对的多条与成环指令）。 */
+    public record SettlementInstructionView(int seqNo, String instructionKey, String from, String to,
+                                            String volume) {
+    }
+
+    /** 主体净额快照视图：净额、清算前后余额与版本；净额为 0 的主体同样出现。 */
+    public record SubjectSnapshotView(String allocationKey, String netChange, String balanceBefore,
+                                      String balanceAfter, long versionBefore, long versionAfter) {
+    }
+
+    /** 主体清算历史：按提交顺序返回该主体参与过的全部成功批次快照。 */
+    public record SubjectSettlementHistoryResponse(String allocationKey, List<SubjectSnapshotView> settlements) {
     }
 
     /** 统一错误响应体。 */

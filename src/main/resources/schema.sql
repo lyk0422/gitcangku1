@@ -26,15 +26,16 @@ CREATE TABLE IF NOT EXISTS allocation (
     window_id BIGINT NOT NULL COMMENT '所属供水窗口 ID',
     user_id VARCHAR(128) NOT NULL COMMENT '用水户 ID',
     amount DECIMAL(19,3) NOT NULL COMMENT '原申请水量，单位立方米，最多 3 位小数，创建后不可改写',
-    held_amount DECIMAL(19,3) NOT NULL DEFAULT 0 COMMENT '当前持有额度，单位立方米；批准时等于原申请水量，取消时归零，转出时等额扣减',
+    held_amount DECIMAL(19,3) NOT NULL DEFAULT 0 COMMENT '当前持有额度，单位立方米；批准时等于原申请水量，取消时归零，单笔转让等额扣减，批量清算按净额增减；净收入后可能高于原申请水量，但恒非负',
     requester VARCHAR(128) NOT NULL COMMENT '申请人（X-Actor-Id）',
     status VARCHAR(16) NOT NULL COMMENT '状态：REQUESTED 已申请 / APPROVED 已批准 / CANCELLED 已取消（不可恢复）',
+    version BIGINT NOT NULL DEFAULT 0 COMMENT '当前额度版本；每参与一次成功清算批次加一（净额为 0 也加一），用于提交清算时的乐观版本校验',
     created_nanos BIGINT NOT NULL COMMENT '创建时间，UTC 纳秒时间戳',
     updated_nanos BIGINT NOT NULL COMMENT '最近状态变更时间，UTC 纳秒时间戳',
     CONSTRAINT uk_allocation_key UNIQUE (allocation_key),
     CONSTRAINT fk_allocation_window FOREIGN KEY (window_id) REFERENCES supply_window (id),
-    CONSTRAINT chk_allocation_held CHECK (held_amount >= 0 AND held_amount <= amount)
-) COMMENT='配水申请';
+    CONSTRAINT chk_allocation_held CHECK (held_amount >= 0)
+) COMMENT='配水申请；清算批次中即持有额度的转让主体，净收入后持有额度可高于原申请水量，恒非负';
 
 CREATE TABLE IF NOT EXISTS transfer (
     id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '转让流水主键',
@@ -51,8 +52,50 @@ CREATE TABLE IF NOT EXISTS transfer (
 
 CREATE TABLE IF NOT EXISTS command_log (
     command_key VARCHAR(128) PRIMARY KEY COMMENT '命令幂等键',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：WINDOW_CREATE/ALLOCATION_SUBMIT/ALLOCATION_APPROVE/ALLOCATION_CANCEL/CURTAILMENT_CREATE/CURTAILMENT_CANCEL/TRANSFER',
-    params VARCHAR(2048) NOT NULL COMMENT '规范化请求参数串，用于同键改参检测',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：WINDOW_CREATE/ALLOCATION_SUBMIT/ALLOCATION_APPROVE/ALLOCATION_CANCEL/CURTAILMENT_CREATE/CURTAILMENT_CANCEL/TRANSFER/SETTLEMENT_SUBMIT',
+    params MEDIUMTEXT NOT NULL COMMENT '规范化请求参数串，用于同键改参检测（清算批次最多 100 条指令，故使用大文本）',
     response MEDIUMTEXT NULL COMMENT '首次成功响应 JSON；命令事务提交前写入',
     created_nanos BIGINT NOT NULL COMMENT '创建时间，UTC 纳秒时间戳'
 ) COMMENT='命令幂等日志，同键同参重放返回首次结果，同键改参返回 409';
+
+CREATE TABLE IF NOT EXISTS settlement_batch (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '清算批次主键',
+    settlement_key VARCHAR(128) NOT NULL COMMENT '清算批次业务键，全局唯一（同 requestId 失败重试后可能换键，成功批次永不复用）',
+    request_id VARCHAR(128) NOT NULL COMMENT '提交方请求幂等键 requestId；同 requestId 同参重放，异参 409',
+    command_key VARCHAR(128) NOT NULL COMMENT '命令幂等键（commandKey）',
+    window_id BIGINT NOT NULL COMMENT '所属供水窗口 ID（批次内全部指令必须同窗口）',
+    instruction_count INT NOT NULL COMMENT '本批指令条数，范围 1～100',
+    created_nanos BIGINT NOT NULL COMMENT '批次提交时间，UTC 纳秒时间戳',
+    CONSTRAINT uk_settlement_key UNIQUE (settlement_key),
+    CONSTRAINT uk_settlement_command UNIQUE (command_key),
+    CONSTRAINT uk_settlement_request UNIQUE (request_id),
+    CONSTRAINT fk_settlement_window FOREIGN KEY (window_id) REFERENCES supply_window (id)
+) COMMENT='配水转让网络批量净额清算批次，成功提交后不可变；失败不留任何批次/指令/快照记录；requestId 成功后唯一，同 requestId 同参重放、异参 409';
+
+CREATE TABLE IF NOT EXISTS settlement_instruction (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '清算指令主键',
+    batch_id BIGINT NOT NULL COMMENT '所属清算批次 ID',
+    seq_no INT NOT NULL COMMENT '指令在提交请求中的序号（从 0 开始），历史按原输入顺序保留',
+    instruction_key VARCHAR(128) NOT NULL COMMENT '指令业务键，全局唯一；已被其他成功批次使用即 409，失败批次不占键',
+    from_allocation_key VARCHAR(128) NOT NULL COMMENT '转出申请业务键（转出主体，禁止与转入主体相同）',
+    to_allocation_key VARCHAR(128) NOT NULL COMMENT '转入申请业务键（转入主体）',
+    volume DECIMAL(19,3) NOT NULL COMMENT '指令转让体积，单位立方米，正整数，最多 3 位小数',
+    created_nanos BIGINT NOT NULL COMMENT '批次提交时间，UTC 纳秒时间戳（与批次相同）',
+    CONSTRAINT uk_settlement_instruction_key UNIQUE (instruction_key),
+    CONSTRAINT fk_settlement_instruction_batch FOREIGN KEY (batch_id) REFERENCES settlement_batch (id),
+    CONSTRAINT chk_settlement_instruction_seq CHECK (seq_no >= 0),
+    CONSTRAINT chk_settlement_instruction_volume CHECK (volume > 0)
+) COMMENT='清算批次原始指令，按输入顺序不可变保留；相同主体对可重复出现，环合法';
+
+CREATE TABLE IF NOT EXISTS settlement_subject_snapshot (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主体快照主键',
+    batch_id BIGINT NOT NULL COMMENT '所属清算批次 ID',
+    allocation_key VARCHAR(128) NOT NULL COMMENT '主体（配水申请）业务键；批次涉及的全部主体均有一行，含净额为 0 者',
+    net_change DECIMAL(19,3) NOT NULL COMMENT '该主体本批净变化，单位立方米；正为净收入、负为净支出、0 表示收支抵消（仍参与版本校验并加一）',
+    balance_before DECIMAL(19,3) NOT NULL COMMENT '清算前持有额度，单位立方米',
+    balance_after DECIMAL(19,3) NOT NULL COMMENT '清算后持有额度，单位立方米；净额为 0 时与前值相同',
+    version_before BIGINT NOT NULL COMMENT '清算前主体额度版本',
+    version_after BIGINT NOT NULL COMMENT '清算后主体额度版本（全部涉及主体均加一）',
+    CONSTRAINT fk_settlement_snapshot_batch FOREIGN KEY (batch_id) REFERENCES settlement_batch (id),
+    CONSTRAINT uk_settlement_snapshot_batch_subject UNIQUE (batch_id, allocation_key)
+) COMMENT='清算批次主体净额快照，不可变；所有主体净额之和严格为 0，总额度守恒';

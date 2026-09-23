@@ -3,12 +3,20 @@ package com.example.starter.water;
 import com.example.starter.water.WaterRepository.AllocationRow;
 import com.example.starter.water.WaterRepository.CommandRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
+import com.example.starter.water.WaterRepository.SettlementBatchRow;
+import com.example.starter.water.WaterRepository.SettlementSnapshotRow;
 import com.example.starter.water.WaterRepository.TransferRow;
 import com.example.starter.water.WaterRepository.WindowRow;
 import com.example.starter.water.dto.Dtos.AllocationResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.SettlementInstruction;
+import com.example.starter.water.dto.Dtos.SettlementInstructionView;
+import com.example.starter.water.dto.Dtos.SettlementResponse;
+import com.example.starter.water.dto.Dtos.SubjectSettlementHistoryResponse;
+import com.example.starter.water.dto.Dtos.SubjectSnapshotView;
+import com.example.starter.water.dto.Dtos.SubjectVersion;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferResponse;
 import com.example.starter.water.dto.Dtos.WindowResponse;
@@ -21,7 +29,13 @@ import org.springframework.transaction.support.TransactionTemplate;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
@@ -316,6 +330,273 @@ public class WaterService {
     }
 
     // ------------------------------------------------------------------
+    // 批量净额清算
+    // ------------------------------------------------------------------
+
+    /** 解析后的清算指令：保留输入顺序 seqNo。 */
+    private record ParsedInstruction(int seqNo, String instructionKey, String from, String to,
+                                    BigDecimal volume) {
+    }
+
+    /**
+     * 提交同窗口批量净额清算批次。
+     *
+     * <p>规则：1～100 条有向指令、正整数体积、指令键批内唯一且禁止自转；提交方必须给出全部涉及主体的
+     * “申请键 + 当前额度版本”完整集合。事务内先锁窗口行（与单笔转让/限供按提交顺序串行），再按 id 升序
+     * 锁定全部主体行得到一致读视图：主体必须全部存在、属于同一窗口且为 APPROVED、版本完全匹配；
+     * 指令键未被其他成功批次占用；按主体求净变化后任一转出方清算后持有为负则 422。
+     * 成功后一次更新所有非零净额主体（净额为 0 者仅版本加一），全部涉及主体版本加一，
+     * 并写入批次、原指令（输入顺序）与主体前后余额/净额的不可变快照；净额和恒为 0，总额度严格守恒。</p>
+     *
+     * <p>幂等：requestId 同参（含指令顺序）完全相同才重放首次结果，异参 409，失败不占任何键；
+     * settlementKey 全局唯一。</p>
+     */
+    public SettlementResponse submitSettlement(String commandKey, String requestId, String settlementKey,
+                                               Long windowId, List<SettlementInstruction> instructions,
+                                               List<SubjectVersion> subjects) {
+        requireKey("commandKey", commandKey);
+        requireKey("requestId", requestId);
+        requireKey("settlementKey", settlementKey);
+        if (windowId == null) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "windowId 不能为空");
+        }
+        if (instructions == null || instructions.isEmpty() || instructions.size() > 100) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "instructions 必须包含 1～100 条指令");
+        }
+        if (subjects == null || subjects.isEmpty()) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "subjects 必须包含全部涉及主体的版本集合");
+        }
+
+        List<ParsedInstruction> parsed = new ArrayList<>(instructions.size());
+        Set<String> batchInstructionKeys = new HashSet<>();
+        Set<String> involved = new TreeSet<>();
+        for (int i = 0; i < instructions.size(); i++) {
+            SettlementInstruction instruction = instructions.get(i);
+            if (instruction == null) {
+                throw ApiException.badRequest("INVALID_ARGUMENT", "第 " + i + " 条指令不能为空");
+            }
+            requireKey("instructionKey", instruction.instructionKey());
+            requireKey("from", instruction.from());
+            requireKey("to", instruction.to());
+            if (instruction.from().equals(instruction.to())) {
+                throw ApiException.badRequest("INVALID_ARGUMENT",
+                        "第 " + i + " 条指令禁止自转: " + instruction.from());
+            }
+            BigDecimal volume = parseAmount("volume", instruction.volume());
+            if (volume.stripTrailingZeros().scale() > 0) {
+                throw ApiException.badRequest("INVALID_ARGUMENT",
+                        "第 " + i + " 条指令体积必须为正整数（立方米）: " + instruction.volume());
+            }
+            if (!batchInstructionKeys.add(instruction.instructionKey())) {
+                throw ApiException.badRequest("INVALID_ARGUMENT",
+                        "instructionKey 在批次内重复: " + instruction.instructionKey());
+            }
+            parsed.add(new ParsedInstruction(i, instruction.instructionKey(), instruction.from(),
+                    instruction.to(), volume));
+            involved.add(instruction.from());
+            involved.add(instruction.to());
+        }
+
+        Map<String, Long> expectedVersions = new TreeMap<>();
+        for (SubjectVersion subject : subjects) {
+            if (subject == null) {
+                throw ApiException.badRequest("INVALID_ARGUMENT", "subjects 不能包含空元素");
+            }
+            requireKey("allocationKey", subject.allocationKey());
+            if (subject.version() < 0) {
+                throw ApiException.badRequest("INVALID_ARGUMENT",
+                        "主体版本不能为负: " + subject.allocationKey());
+            }
+            if (expectedVersions.put(subject.allocationKey(), subject.version()) != null) {
+                throw ApiException.badRequest("INVALID_ARGUMENT",
+                        "主体在版本集合中重复: " + subject.allocationKey());
+            }
+        }
+        if (!expectedVersions.keySet().equals(involved)) {
+            throw ApiException.conflict("VERSION_SET_MISMATCH",
+                    "主体版本集合必须与指令涉及主体完全一致（不得遗漏或多余）");
+        }
+
+        // 规范化参数串：指令保留输入顺序（顺序有业务意义），主体集合按键排序规范化
+        StringBuilder paramsBuilder = new StringBuilder("SETTLEMENT|").append(requestId).append('|')
+                .append(settlementKey).append('|').append(windowId).append('|').append(parsed.size());
+        for (ParsedInstruction instruction : parsed) {
+            paramsBuilder.append("|I:").append(instruction.instructionKey()).append('>')
+                    .append(instruction.from()).append('>').append(instruction.to()).append('>')
+                    .append(instruction.volume().toPlainString());
+        }
+        for (Map.Entry<String, Long> subject : expectedVersions.entrySet()) {
+            paramsBuilder.append("|S:").append(subject.getKey()).append('=').append(subject.getValue());
+        }
+        String params = paramsBuilder.toString();
+
+        return runCommand("SETTLEMENT_SUBMIT", commandKey, params, SettlementResponse.class, () -> {
+            // requestId 独立幂等：换 commandKey 重试时，完全同参重放、异参 409
+            SettlementBatchRow byRequest = repository.findSettlementByRequestId(requestId);
+            if (byRequest != null) {
+                CommandRow priorCommand = repository.findCommand(byRequest.commandKey());
+                if (priorCommand != null && params.equals(priorCommand.params())) {
+                    return toSettlementResponse(byRequest);
+                }
+                throw ApiException.conflict("REQUEST_ID_REUSED", "相同 requestId 但参数不同，拒绝重放");
+            }
+            if (repository.findSettlementByKey(settlementKey) != null) {
+                throw ApiException.conflict("SETTLEMENT_KEY_REUSED",
+                        "settlementKey 已被使用: " + settlementKey);
+            }
+
+            // 窗口锁：与单笔转让、限供、普通批准按事务提交顺序串行裁决
+            WindowRow window = repository.lockWindowById(windowId);
+            if (window == null) {
+                throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + windowId);
+            }
+
+            // 一致读视图：按 id 升序锁定全部涉及主体，避免多批次交叉锁死锁
+            List<AllocationRow> lockedRows = repository.lockAllocationsByKeys(involved);
+            if (lockedRows.size() != involved.size()) {
+                throw ApiException.notFound("SUBJECT_NOT_FOUND", "清算涉及的主体申请不存在");
+            }
+            Map<String, AllocationRow> locked = new TreeMap<>();
+            for (AllocationRow row : lockedRows) {
+                if (row.windowId() != windowId) {
+                    throw ApiException.conflict("CROSS_WINDOW",
+                            "清算指令涉及的主体必须全部属于窗口 " + windowId);
+                }
+                if (!STATUS_APPROVED.equals(row.status())) {
+                    throw ApiException.conflict("SUBJECT_NOT_APPROVED",
+                            "主体处于限供/非批准状态，不能参与清算: " + row.allocationKey());
+                }
+                long expected = expectedVersions.get(row.allocationKey());
+                if (row.version() != expected) {
+                    throw ApiException.conflict("VERSION_MISMATCH",
+                            "主体 " + row.allocationKey() + " 当前版本 " + row.version()
+                                    + " 与提交版本 " + expected + " 不一致");
+                }
+                locked.put(row.allocationKey(), row);
+            }
+
+            // 指令键全局唯一：已被其他成功批次使用即整批拒绝（失败批次不占键）
+            for (ParsedInstruction instruction : parsed) {
+                if (repository.existsSettlementInstructionKey(instruction.instructionKey())) {
+                    throw ApiException.conflict("INSTRUCTION_KEY_REUSED",
+                            "instructionKey 已被其他清算批次使用: " + instruction.instructionKey());
+                }
+            }
+
+            // 按主体求净变化
+            Map<String, BigDecimal> netChanges = new TreeMap<>();
+            for (String key : involved) {
+                netChanges.put(key, BigDecimal.ZERO);
+            }
+            for (ParsedInstruction instruction : parsed) {
+                netChanges.merge(instruction.from(), instruction.volume().negate(), BigDecimal::add);
+                netChanges.merge(instruction.to(), instruction.volume(), BigDecimal::add);
+            }
+
+            // 一致视图下裁决：任一转出方清算后可用额度为负 -> 422
+            for (Map.Entry<String, BigDecimal> entry : netChanges.entrySet()) {
+                BigDecimal after = locked.get(entry.getKey()).heldAmount().add(entry.getValue());
+                if (after.signum() < 0) {
+                    throw ApiException.quotaExceeded("主体 " + entry.getKey() + " 清算后可用额度为 "
+                            + fmt(after) + "，持有额度不足");
+                }
+            }
+            BigDecimal netSum = netChanges.values().stream().reduce(BigDecimal.ZERO, BigDecimal::add);
+            if (netSum.signum() != 0) {
+                throw new IllegalStateException("净额之和必须为 0，实际: " + netSum.toPlainString());
+            }
+
+            long now = nowNanos();
+            long batchId;
+            try {
+                batchId = repository.insertSettlementBatch(settlementKey, requestId, commandKey, windowId,
+                        parsed.size(), now);
+            } catch (DuplicateKeyException e) {
+                // 并发：不同 commandKey 但 requestId/settlementKey 撞唯一约束
+                SettlementBatchRow concurrent = repository.findSettlementByRequestId(requestId);
+                if (concurrent != null) {
+                    CommandRow priorCommand = repository.findCommand(concurrent.commandKey());
+                    if (priorCommand != null && params.equals(priorCommand.params())) {
+                        return toSettlementResponse(concurrent);
+                    }
+                }
+                if (repository.findSettlementByKey(settlementKey) != null) {
+                    throw ApiException.conflict("SETTLEMENT_KEY_REUSED",
+                            "settlementKey 已被使用: " + settlementKey);
+                }
+                throw ApiException.conflict("SETTLEMENT_CONFLICT", "清算批次并发冲突，请重试");
+            }
+
+            // 一次更新全部涉及主体：非零净额增减余额，净额为 0 仅版本加一；所有主体版本均加一
+            for (Map.Entry<String, BigDecimal> entry : netChanges.entrySet()) {
+                AllocationRow row = locked.get(entry.getKey());
+                BigDecimal net = entry.getValue();
+                if (net.signum() == 0) {
+                    repository.incrementAllocationVersion(row.id(), now);
+                } else {
+                    repository.applySettlementNetChange(row.id(), net, now);
+                }
+            }
+
+            // 不可变快照：原指令输入顺序 + 主体净额与前后余额/版本
+            for (ParsedInstruction instruction : parsed) {
+                try {
+                    repository.insertSettlementInstruction(batchId, instruction.seqNo(),
+                            instruction.instructionKey(), instruction.from(), instruction.to(),
+                            instruction.volume(), now);
+                } catch (DuplicateKeyException e) {
+                    throw ApiException.conflict("INSTRUCTION_KEY_REUSED",
+                            "instructionKey 已被其他清算批次使用: " + instruction.instructionKey());
+                }
+            }
+            for (Map.Entry<String, BigDecimal> entry : netChanges.entrySet()) {
+                AllocationRow row = locked.get(entry.getKey());
+                BigDecimal balanceAfter = row.heldAmount().add(entry.getValue());
+                repository.insertSettlementSnapshot(batchId, entry.getKey(), entry.getValue(),
+                        row.heldAmount(), balanceAfter, row.version(), row.version() + 1);
+            }
+
+            return toSettlementResponse(repository.findSettlementByKey(settlementKey));
+        });
+    }
+
+    /** 查询清算批次详情（只读）：批次头 + 原指令（输入顺序）+ 全部主体净额快照。 */
+    public SettlementResponse getSettlement(String settlementKey) {
+        requireKey("settlementKey", settlementKey);
+        SettlementBatchRow batch = repository.findSettlementByKey(settlementKey);
+        if (batch == null) {
+            throw ApiException.notFound("SETTLEMENT_NOT_FOUND", "清算批次不存在: " + settlementKey);
+        }
+        return toSettlementResponse(batch);
+    }
+
+    /** 按主体查询其参与过的全部清算快照（只读，按批次提交顺序）。 */
+    public SubjectSettlementHistoryResponse getSubjectSettlementHistory(String allocationKey) {
+        requireKey("allocationKey", allocationKey);
+        if (repository.findAllocationByKey(allocationKey) == null) {
+            throw ApiException.notFound("ALLOCATION_NOT_FOUND", "配水申请不存在: " + allocationKey);
+        }
+        List<SubjectSnapshotView> snapshots = repository.listSubjectSettlementHistory(allocationKey).stream()
+                .map(this::toSnapshotView).toList();
+        return new SubjectSettlementHistoryResponse(allocationKey, snapshots);
+    }
+
+    private SettlementResponse toSettlementResponse(SettlementBatchRow batch) {
+        List<SettlementInstructionView> instructions = repository.listSettlementInstructions(batch.id())
+                .stream().map(row -> new SettlementInstructionView(row.seqNo(), row.instructionKey(),
+                        row.fromAllocationKey(), row.toAllocationKey(), fmt(row.volume()))).toList();
+        List<SubjectSnapshotView> subjects = repository.listSettlementSnapshots(batch.id()).stream()
+                .map(this::toSnapshotView).toList();
+        return new SettlementResponse(batch.settlementKey(), batch.requestId(), batch.windowId(),
+                batch.instructionCount(), instructions, subjects, toIso(batch.createdNanos()));
+    }
+
+    private SubjectSnapshotView toSnapshotView(SettlementSnapshotRow row) {
+        return new SubjectSnapshotView(row.allocationKey(), fmt(row.netChange()), fmt(row.balanceBefore()),
+                fmt(row.balanceAfter()), row.versionBefore(), row.versionAfter());
+    }
+
+    // ------------------------------------------------------------------
     // 幂等命令框架
     // ------------------------------------------------------------------
 
@@ -378,7 +659,7 @@ public class WaterService {
 
     private AllocationResponse toAllocationResponse(AllocationRow row) {
         return new AllocationResponse(row.allocationKey(), row.windowId(), row.userId(), fmt(row.amount()),
-                fmt(row.heldAmount()), row.requester(), row.status(),
+                fmt(row.heldAmount()), row.requester(), row.status(), row.version(),
                 toIso(row.createdNanos()), toIso(row.updatedNanos()));
     }
 
