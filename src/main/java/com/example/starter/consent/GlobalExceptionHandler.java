@@ -11,6 +11,8 @@ import org.springframework.web.method.annotation.HandlerMethodValidationExceptio
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
+import com.example.starter.consent.dto.BatchRejectedResponse;
+
 /**
  * 全局异常处理：把业务异常与参数错误统一转换为带稳定业务码的错误响应。
  */
@@ -21,6 +23,12 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorResponse> handleApi(ApiException ex) {
         return ResponseEntity.status(ex.getStatus())
                 .body(new ErrorResponse(ex.getCode(), ex.getMessage()));
+    }
+
+    @ExceptionHandler(BatchRejectedException.class)
+    public ResponseEntity<BatchRejectedResponse> handleBatchRejected(BatchRejectedException ex) {
+        return ResponseEntity.status(ex.getStatus())
+                .body(new BatchRejectedResponse("BATCH_REJECTED", ex.getFailures()));
     }
 
     @ExceptionHandler({

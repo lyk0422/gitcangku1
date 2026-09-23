@@ -8,6 +8,8 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import com.example.starter.consent.dto.BatchQueryRequest;
+import com.example.starter.consent.dto.BatchQueryResponse;
 import com.example.starter.consent.dto.GrantRequest;
 import com.example.starter.consent.dto.GrantResponse;
 import com.example.starter.consent.dto.RecordResponse;
@@ -18,7 +20,7 @@ import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 
 /**
- * 本地数据授权 API：授权、记录写入、撤回与查询。
+ * 本地数据授权 API：授权、记录写入、撤回、单条查询与固定授权代次的原子批量查询。
  */
 @Validated
 @RestController
@@ -39,6 +41,11 @@ public class ConsentController {
     @PostMapping("/consents/revocations")
     public GrantResponse revoke(@Valid @RequestBody RevokeRequest request) {
         return consentService.revoke(request);
+    }
+
+    @PostMapping("/records/batch-queries")
+    public BatchQueryResponse batchQuery(@Valid @RequestBody BatchQueryRequest request) {
+        return consentService.batchQuery(request);
     }
 
     @PostMapping("/records")
