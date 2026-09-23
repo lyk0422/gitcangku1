@@ -78,4 +78,49 @@ public final class Responses {
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
     }
+
+    /**
+     * 联合交接 OPEN 任务摘要：taskKey、版本（完成/取消时递增）、状态及
+     * 排序后依赖（阻塞事件键升序）。
+     */
+    public record HandoverTaskSummary(String taskKey, int version, String status,
+                                      List<String> dependencies) {
+    }
+
+    /** 联合交接未确认（OPEN）升级摘要：升级记录 id 与版本（确认/取消时递增）。 */
+    public record HandoverEscalationSummary(long escalationId, int version) {
+    }
+
+    /**
+     * 联合交接单事件摘要：冻结当前指挥人、状态、全部 OPEN 任务摘要与未确认升级摘要。
+     */
+    public record HandoverIncidentSummary(String incidentKey, String commander, String status,
+                                          List<HandoverTaskSummary> openTasks,
+                                          List<HandoverEscalationSummary> unacknowledgedEscalations) {
+    }
+
+    /** 联合交接完整摘要：闭包事件按事件键升序；接受时需原样提交。 */
+    public record HandoverSummary(List<HandoverIncidentSummary> incidents) {
+    }
+
+    /**
+     * 联合交接单视图：incidentKeys 为闭包事件键升序列表；
+     * acceptedAt 仅 ACCEPTED 有值。
+     */
+    public record HandoverView(long id, String handoverKey, String fromCommander,
+                               String toCommander, String status, int incidentCount,
+                               List<String> incidentKeys, Instant createdAt, Instant acceptedAt) {
+    }
+
+    /**
+     * 联合交接详情视图：handoverVersion 为摘要的 SHA-256 摘要。
+     * PENDING 时为当前状态实时重算的预览；ACCEPTED 时为接受时保存的不可变快照。
+     */
+    public record HandoverDetailView(HandoverView handover, HandoverSummary summary,
+                                     String handoverVersion) {
+    }
+
+    /** 事件维度的联合交接历史视图：handovers 按发起顺序返回。 */
+    public record HandoverHistoryView(String incidentKey, List<HandoverView> handovers) {
+    }
 }

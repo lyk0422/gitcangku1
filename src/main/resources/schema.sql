@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS incident_status_history (
 CREATE TABLE IF NOT EXISTS command_keys (
     id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
     command_key VARCHAR(128) NOT NULL COMMENT '调用方幂等键，全局唯一',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：takeover/transfer_initiate/transfer_accept/action/status/escalation_check/escalation_ack/task_create/task_complete/task_cancel',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：takeover/transfer_initiate/transfer_accept/action/status/escalation_check/escalation_ack/task_create/task_complete/task_cancel/handover_initiate/handover_accept',
     request_hash VARCHAR(64) NOT NULL COMMENT '规范化请求参数的 SHA-256 摘要，用于同键改参检测',
     response_status INT NULL COMMENT '首次成功的 HTTP 状态码；事务提交前必写入',
     response_body MEDIUMTEXT NULL COMMENT '首次成功响应 JSON，用于同键同参重放',
@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS incident_escalations (
     triggered_at TIMESTAMP(6) NOT NULL COMMENT '逾期触发检查的 UTC 时刻（当前时刻 ≥ 期限）',
     triggered_commander VARCHAR(128) NOT NULL COMMENT '触发当时的当前指挥人',
     status VARCHAR(16) NOT NULL COMMENT '状态：OPEN 待确认 / ACKNOWLEDGED 已确认 / CANCELLED 遏制时取消；仅允许 OPEN→ACKNOWLEDGED 或 OPEN→CANCELLED',
+    version INT NOT NULL DEFAULT 1 COMMENT '版本号，初始 1；确认/取消时递增，用于联合交接快照一致性比对',
     note VARCHAR(1024) NULL COMMENT '确认时提交的非空处置说明；仅 ACKNOWLEDGED 有值，否则为空',
     acknowledged_by VARCHAR(128) NULL COMMENT '确认人（操作当时的当前指挥人）；仅 ACKNOWLEDGED 有值，否则为空',
     acknowledged_at TIMESTAMP(6) NULL COMMENT '确认 UTC 时刻；仅 ACKNOWLEDGED 有值，否则为空',
@@ -79,6 +80,7 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     group_code VARCHAR(64) NOT NULL COMMENT '分组编码，非空',
     title VARCHAR(512) NOT NULL COMMENT '任务标题，非空',
     status VARCHAR(16) NOT NULL COMMENT '状态：OPEN 待处理 / DONE 已完成 / CANCELLED 已取消；仅允许 OPEN→DONE 或 OPEN→CANCELLED，DONE 与 CANCELLED 为终态',
+    version INT NOT NULL DEFAULT 1 COMMENT '版本号，初始 1；完成/取消时递增，用于联合交接快照一致性比对',
     created_by VARCHAR(128) NOT NULL COMMENT '创建人（创建时的当前指挥人）',
     done_by VARCHAR(128) NULL COMMENT '完成人（操作时的当前指挥人）；仅 DONE 有值，否则为空',
     done_at TIMESTAMP(6) NULL COMMENT '完成 UTC 时间；仅 DONE 有值，否则为空',
@@ -100,3 +102,25 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY COMMENT '固定为 1 的单行锁；创建任务时 SELECT ... FOR UPDATE 持有，串行化环检测与写入，保证并发反向依赖最终图无环'
 ) COMMENT='任务依赖图全局锁表';
+
+CREATE TABLE IF NOT EXISTS incident_handovers (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    handover_key VARCHAR(128) NOT NULL COMMENT '联合交接业务键，全局唯一',
+    from_commander VARCHAR(128) NOT NULL COMMENT '发起人（发起时闭包全部事件的当前指挥人）',
+    to_commander VARCHAR(128) NOT NULL COMMENT '接收人（指定的新指挥人），必须与发起人不同',
+    status VARCHAR(16) NOT NULL COMMENT '状态：PENDING 待接受 / ACCEPTED 已接受；接受后不可再变更',
+    incident_count INT NOT NULL COMMENT '闭包事件数（2~20）',
+    closure_json MEDIUMTEXT NOT NULL COMMENT '发起时闭包事件键列表（按事件键升序）JSON，不可变',
+    snapshot_json MEDIUMTEXT NULL COMMENT '接受时保存的不可变闭包快照 JSON（每事件指挥人/状态/OPEN任务版本与排序依赖/未确认升级版本）；PENDING 为空',
+    handover_version VARCHAR(64) NULL COMMENT '接受时实际对应的交接版本（闭包摘要的 SHA-256 十六进制）；PENDING 为空',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '发起 UTC 时间',
+    accepted_at TIMESTAMP(6) NULL COMMENT '接受 UTC 时间；仅 ACCEPTED 有值，否则为空',
+    CONSTRAINT uk_handover_key UNIQUE (handover_key)
+) COMMENT='联合指挥交接单表';
+
+CREATE TABLE IF NOT EXISTS incident_handover_incidents (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    handover_id BIGINT NOT NULL COMMENT '所属联合交接单 id，关联 incident_handovers.id',
+    incident_id BIGINT NOT NULL COMMENT '闭包事件 id，关联 incidents.id',
+    CONSTRAINT uk_handover_incident UNIQUE (handover_id, incident_id)
+) COMMENT='联合交接闭包事件成员表';

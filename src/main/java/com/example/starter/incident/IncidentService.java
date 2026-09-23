@@ -195,6 +195,10 @@ public class IncidentService {
                     if (!pending.toCommander().equals(actor)) {
                         throw ApiException.conflict("只有交接目标人 " + pending.toCommander() + " 能接受交接");
                     }
+                    if (!pending.fromCommander().equals(incident.commander())) {
+                        // 发起后指挥权已被其他操作（如联合交接）切换，原交接单失效
+                        throw ApiException.conflict("交接发起后指挥人已变更，该交接单已失效");
+                    }
                     Instant now = now();
                     incidents.acceptTransfer(pending.id(), now);
                     incidents.updateState(incident.id(), incident.status(), pending.toCommander(), now);
@@ -306,7 +310,7 @@ public class IncidentService {
                             && incident.deadlineAt() != null
                             && !currentTime.isBefore(incident.deadlineAt())) {
                         escalations.insert(new Escalation(0L, incident.id(), incident.deadlineAt(),
-                                currentTime, incident.commander(), EscalationStatus.OPEN,
+                                currentTime, incident.commander(), EscalationStatus.OPEN, 1,
                                 null, null, null, currentTime, currentTime));
                     }
                     return toEscalationHistory(incident,
@@ -452,7 +456,7 @@ public class IncidentService {
                     }
                     Instant now = now();
                     long taskId = tasks.insert(new IncidentTask(0L, incident.id(), taskKey,
-                            groupCode, title, TaskStatus.OPEN, actor, null, null, null, null,
+                            groupCode, title, TaskStatus.OPEN, 1, actor, null, null, null, null,
                             now, now));
                     for (Incident blocker : blockers) {
                         tasks.insertBlocker(taskId, blocker.id(), now);

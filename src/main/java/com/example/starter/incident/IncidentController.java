@@ -13,6 +13,7 @@ import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
 import com.example.starter.incident.dto.Responses.EscalationHistoryView;
 import com.example.starter.incident.dto.Responses.EscalationView;
+import com.example.starter.incident.dto.Responses.HandoverHistoryView;
 import com.example.starter.incident.dto.Responses.HistoryView;
 import com.example.starter.incident.dto.Responses.IncidentTasksView;
 import com.example.starter.incident.dto.Responses.IncidentView;
@@ -36,9 +37,11 @@ import org.springframework.web.bind.annotation.RestController;
 public class IncidentController {
 
     private final IncidentService service;
+    private final HandoverService handoverService;
 
-    public IncidentController(IncidentService service) {
+    public IncidentController(IncidentService service, HandoverService handoverService) {
         this.service = service;
+        this.handoverService = handoverService;
     }
 
     /**
@@ -187,5 +190,13 @@ public class IncidentController {
                                @RequestHeader("X-Actor-Id") String actor,
                                @RequestBody TaskActionRequest req) {
         return service.cancelTask(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 查询事件参与的联合交接历史（只读，不写数据）。
+     */
+    @GetMapping("/{incidentKey}/handovers")
+    public HandoverHistoryView handovers(@PathVariable String incidentKey) {
+        return handoverService.historyForIncident(incidentKey);
     }
 }

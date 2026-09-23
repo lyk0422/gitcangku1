@@ -37,6 +37,7 @@ public class EscalationRepository {
                 rs.getTimestamp("triggered_at").toInstant(),
                 rs.getString("triggered_commander"),
                 EscalationStatus.valueOf(rs.getString("status")),
+                rs.getInt("version"),
                 rs.getString("note"), rs.getString("acknowledged_by"),
                 ackedAt == null ? null : ackedAt.toInstant(),
                 rs.getTimestamp("created_at").toInstant(),
@@ -84,7 +85,8 @@ public class EscalationRepository {
      * 已被取消的记录更新行数为 0。
      */
     public int acknowledge(long id, String note, String acknowledgedBy, Instant acknowledgedAt) {
-        return jdbc.update("UPDATE incident_escalations SET status = 'ACKNOWLEDGED', note = ?,"
+        return jdbc.update("UPDATE incident_escalations SET status = 'ACKNOWLEDGED',"
+                        + " version = version + 1, note = ?,"
                         + " acknowledged_by = ?, acknowledged_at = ?, updated_at = ?"
                         + " WHERE id = ? AND status = 'OPEN'",
                 note, acknowledgedBy, Timestamp.from(acknowledgedAt), Timestamp.from(acknowledgedAt), id);
@@ -95,7 +97,8 @@ public class EscalationRepository {
      * 返回被取消的记录数（0 或 1）。
      */
     public int cancelOpenForIncident(long incidentId, Instant cancelledAt) {
-        return jdbc.update("UPDATE incident_escalations SET status = 'CANCELLED', updated_at = ?"
+        return jdbc.update("UPDATE incident_escalations SET status = 'CANCELLED',"
+                        + " version = version + 1, updated_at = ?"
                         + " WHERE incident_id = ? AND status = 'OPEN'",
                 Timestamp.from(cancelledAt), incidentId);
     }

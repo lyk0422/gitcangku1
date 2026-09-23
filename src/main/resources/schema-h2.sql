@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS incident_escalations (
     triggered_at TIMESTAMP(6) NOT NULL,
     triggered_commander VARCHAR(128) NOT NULL,
     status VARCHAR(16) NOT NULL,
+    version INT NOT NULL DEFAULT 1,
     note VARCHAR(1024) NULL,
     acknowledged_by VARCHAR(128) NULL,
     acknowledged_at TIMESTAMP(6) NULL,
@@ -79,6 +80,7 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     group_code VARCHAR(64) NOT NULL,
     title VARCHAR(512) NOT NULL,
     status VARCHAR(16) NOT NULL,
+    version INT NOT NULL DEFAULT 1,
     created_by VARCHAR(128) NOT NULL,
     done_by VARCHAR(128) NULL,
     done_at TIMESTAMP(6) NULL,
@@ -99,4 +101,26 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS incident_handovers (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    handover_key VARCHAR(128) NOT NULL,
+    from_commander VARCHAR(128) NOT NULL,
+    to_commander VARCHAR(128) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    incident_count INT NOT NULL,
+    closure_json CLOB NOT NULL,
+    snapshot_json CLOB NULL,
+    handover_version VARCHAR(64) NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    accepted_at TIMESTAMP(6) NULL,
+    CONSTRAINT uk_handover_key UNIQUE (handover_key)
+);
+
+CREATE TABLE IF NOT EXISTS incident_handover_incidents (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    handover_id BIGINT NOT NULL,
+    incident_id BIGINT NOT NULL,
+    CONSTRAINT uk_handover_incident UNIQUE (handover_id, incident_id)
 );

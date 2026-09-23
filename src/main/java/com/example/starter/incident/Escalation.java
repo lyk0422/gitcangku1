@@ -7,6 +7,7 @@ import java.time.Instant;
  * deadlineAt 为首次接管 COMMANDING 时按等级确定的遏制期限（UTC），交接不重置；
  * triggeredAt 为检查入口发现逾期的触发 UTC 时刻；triggeredCommander 为触发当时的指挥人；
  * note/acknowledgedBy/acknowledgedAt 仅 ACKNOWLEDGED 状态有值，其余为空。
+ * version 初始 1，确认/取消时递增，用于联合交接快照一致性比对。
  */
 public record Escalation(
         long id,
@@ -15,6 +16,7 @@ public record Escalation(
         Instant triggeredAt,
         String triggeredCommander,
         EscalationStatus status,
+        int version,
         String note,
         String acknowledgedBy,
         Instant acknowledgedAt,

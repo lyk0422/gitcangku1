@@ -108,6 +108,50 @@ class SchemaH2ScriptTest {
                     duplicateBlockerRejected = true;
                 }
                 assertThat(duplicateBlockerRejected).isTrue();
+
+                // 任务版本列默认 1
+                try (ResultSet rs = st.executeQuery(
+                        "SELECT version FROM incident_tasks WHERE id = 1")) {
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getInt("version")).isEqualTo(1);
+                }
+
+                // 联合交接单：handover_key 唯一
+                st.execute("INSERT INTO incident_handovers (handover_key, from_commander,"
+                        + " to_commander, status, incident_count, closure_json, created_at)"
+                        + " VALUES ('HO-1','alice','bob','PENDING',2,'[\"INC-A\",\"INC-B\"]','"
+                        + Timestamp.from(now) + "')");
+                boolean duplicateHandoverRejected = false;
+                try {
+                    st.execute("INSERT INTO incident_handovers (handover_key, from_commander,"
+                            + " to_commander, status, incident_count, closure_json, created_at)"
+                            + " VALUES ('HO-1','alice','carol','PENDING',2,'[]','"
+                            + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateHandoverRejected = true;
+                }
+                assertThat(duplicateHandoverRejected).isTrue();
+
+                // 闭包成员：(handover_id, incident_id) 唯一
+                st.execute("INSERT INTO incident_handover_incidents (handover_id, incident_id)"
+                        + " VALUES (1,1)");
+                boolean duplicateMemberRejected = false;
+                try {
+                    st.execute("INSERT INTO incident_handover_incidents (handover_id,"
+                            + " incident_id) VALUES (1,1)");
+                } catch (Exception e) {
+                    duplicateMemberRejected = true;
+                }
+                assertThat(duplicateMemberRejected).isTrue();
+
+                // 条件接受只作用于 PENDING：已接受后再次接受更新 0 行
+                int accepted = st.executeUpdate("UPDATE incident_handovers SET status='ACCEPTED',"
+                        + " handover_version='v', accepted_at='" + Timestamp.from(now)
+                        + "' WHERE id = 1 AND status = 'PENDING'");
+                assertThat(accepted).isEqualTo(1);
+                int reAccept = st.executeUpdate("UPDATE incident_handovers SET status='ACCEPTED'"
+                        + " WHERE id = 1 AND status = 'PENDING'");
+                assertThat(reAccept).isZero();
             }
         }
     }

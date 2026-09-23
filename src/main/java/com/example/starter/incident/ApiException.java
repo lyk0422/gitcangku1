@@ -4,7 +4,7 @@ import org.springframework.http.HttpStatus;
 
 /**
  * 业务异常：携带可区分的 HTTP 状态码与错误码。
- * 400 参数非法，404 资源不存在，409 权限/状态/幂等冲突，422 非法状态流转。
+ * 400 参数非法，403 无权操作，404 资源不存在，409 权限/状态/幂等冲突，422 非法状态流转。
  */
 public class ApiException extends RuntimeException {
 
@@ -42,6 +42,11 @@ public class ApiException extends RuntimeException {
         return new ApiException(HttpStatus.NOT_FOUND, "NOT_FOUND", message, null);
     }
 
+    /** 403：无权操作（如混入非本人指挥的事件、非指定接收人接受联合交接）。 */
+    public static ApiException forbidden(String message) {
+        return new ApiException(HttpStatus.FORBIDDEN, "FORBIDDEN", message, null);
+    }
+
     /** 409：权限冲突、状态冲突或幂等键冲突。 */
     public static ApiException conflict(String message) {
         return new ApiException(HttpStatus.CONFLICT, "CONFLICT", message, null);
@@ -55,5 +60,11 @@ public class ApiException extends RuntimeException {
     /** 422：非法状态流转。 */
     public static ApiException illegalTransition(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "ILLEGAL_TRANSITION", message, null);
+    }
+
+    /** 422：联合交接提交集合未覆盖依赖闭包，details 为缺失事件键列表。 */
+    public static ApiException closureIncomplete(String message, Object details) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "CLOSURE_INCOMPLETE",
+                message, details);
     }
 }

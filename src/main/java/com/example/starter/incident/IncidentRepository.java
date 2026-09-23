@@ -72,6 +72,32 @@ public class IncidentRepository {
     }
 
     /**
+     * 按 id 集合查询事件（不加锁），按 id 升序返回，用于联合交接闭包加载。
+     */
+    public List<Incident> listByIds(List<Long> ids) {
+        if (ids.isEmpty()) {
+            return List.of();
+        }
+        String placeholders = String.join(", ", ids.stream().map(id -> "?").toList());
+        return jdbc.query("SELECT * FROM incidents WHERE id IN (" + placeholders + ") ORDER BY id",
+                INCIDENT_MAPPER, ids.toArray());
+    }
+
+    /**
+     * 按 id 集合锁定事件行（SELECT ... FOR UPDATE），按 id 升序加锁，
+     * 供联合交接多行加锁使用；所有多行加锁路径统一按 id 升序，避免死锁。
+     */
+    public List<Incident> lockByIds(List<Long> ids) {
+        if (ids.isEmpty()) {
+            return List.of();
+        }
+        String placeholders = String.join(", ", ids.stream().map(id -> "?").toList());
+        return jdbc.query("SELECT * FROM incidents WHERE id IN (" + placeholders
+                        + ") ORDER BY id FOR UPDATE",
+                INCIDENT_MAPPER, ids.toArray());
+    }
+
+    /**
      * 插入新事件，初始状态 REPORTED、无指挥人、无遏制期限，返回生成主键。
      */
     public long insert(Incident incident) {
