@@ -5,6 +5,9 @@ spring:
     driver-class-name: org.h2.Driver
     username: sa
     password: ""
+    # 并发用例需要同时持有多个连接（并发工作者 + 外部锁线程），池容量须大于最大并发度。
+    hikari:
+      maximum-pool-size: 16
   sql:
     init:
       mode: always

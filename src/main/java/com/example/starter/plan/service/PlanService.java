@@ -45,6 +45,10 @@ import org.springframework.transaction.support.TransactionTemplate;
  * <p>并发与幂等约定：写操作按 (操作类型, requestKey) 幂等，同键同参重放返回首次成功结果，
  * 同键不同参返回 409；发布与改签经全局发布锁串行化，同一计划的更新/发布/取消/改签经行锁按事务提交顺序生效；
  * 仅成功结果写入幂等记录，失败（含 422 时隙冲突）不缓存、可修正后重试。
+ *
+ * <p>幂等复查双段进行：事务外先行快速重放；事务内在串行化锁（发布锁或行锁）之后再次复查，
+ * 保证与首次成功并发进入竞争窗口的同键请求一律重放首次响应快照，
+ * 而不会因等待期间计划状态/版本已变化误判为状态或版本冲突。
  */
 @Service
 public class PlanService {
@@ -84,6 +88,11 @@ public class PlanService {
         }
         try {
             return tx.execute(status -> {
+                // 事务内复查：并发下同键请求可能已通过事务外检查，此处裁决重放而非误报 scheduleKey 冲突
+                Optional<PlanResponse> replayed = replayIfPresent(OP_CREATE, req.requestKey(), hash);
+                if (replayed.isPresent()) {
+                    return replayed.get();
+                }
                 if (planRepo.findByKey(req.scheduleKey()).isPresent()) {
                     throw conflict("SCHEDULE_KEY_EXISTS", "scheduleKey 已存在: " + req.scheduleKey());
                 }
@@ -113,6 +122,11 @@ public class PlanService {
             return tx.execute(status -> {
                 DayPlan plan = planRepo.findByKeyForUpdate(scheduleKey)
                         .orElseThrow(() -> notFound(scheduleKey));
+                // 行锁后复查：同键并发重放在此返回首次快照，不误判版本冲突
+                Optional<PlanResponse> replayed = replayIfPresent(OP_UPDATE, req.requestKey(), hash);
+                if (replayed.isPresent()) {
+                    return replayed.get();
+                }
                 if (plan.status() != PlanStatus.DRAFT) {
                     throw conflict("PLAN_STATE_CONFLICT",
                             "仅草稿可修改占用，当前状态: " + plan.status());
@@ -147,6 +161,11 @@ public class PlanService {
         try {
             return tx.execute(status -> {
                 planRepo.acquirePublishLock();
+                // 发布锁后复查：同键并发重放在此返回首次快照，不误判状态冲突
+                Optional<PlanResponse> replayed = replayIfPresent(OP_PUBLISH, requestKey, hash);
+                if (replayed.isPresent()) {
+                    return replayed.get();
+                }
                 DayPlan plan = planRepo.findByKeyForUpdate(scheduleKey)
                         .orElseThrow(() -> notFound(scheduleKey));
                 if (plan.status() != PlanStatus.DRAFT) {
@@ -185,6 +204,11 @@ public class PlanService {
             return tx.execute(status -> {
                 DayPlan plan = planRepo.findByKeyForUpdate(scheduleKey)
                         .orElseThrow(() -> notFound(scheduleKey));
+                // 行锁后复查：同键并发重放在此返回首次快照，不误判状态冲突
+                Optional<PlanResponse> replayed = replayIfPresent(OP_CANCEL, requestKey, hash);
+                if (replayed.isPresent()) {
+                    return replayed.get();
+                }
                 if (plan.status() != PlanStatus.PUBLISHED) {
                     throw conflict("PLAN_STATE_CONFLICT",
                             "仅已发布计划可取消，当前状态: " + plan.status());
@@ -218,6 +242,13 @@ public class PlanService {
         try {
             return tx.execute(status -> {
                 planRepo.acquirePublishLock();
+                // 发布锁后复查：同键同参的并发/后续重放一律返回首次成功快照，
+                // 即使等待期间旧计划已取消、新计划已发布或已继续改签，也不误判状态/版本冲突
+                Optional<RescheduleResponse> replayed =
+                        replayIfPresent(OP_RESCHEDULE, req.requestKey(), hash, RescheduleResponse.class);
+                if (replayed.isPresent()) {
+                    return replayed.get();
+                }
                 DayPlan oldPlan = planRepo.findByKeyForUpdate(oldScheduleKey)
                         .orElseThrow(() -> notFound(oldScheduleKey));
                 DayPlan newPlan = planRepo.findByKeyForUpdate(req.newScheduleKey())
