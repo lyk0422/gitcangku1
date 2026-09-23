@@ -15,9 +15,11 @@ public class BatchRepository {
 
     /**
      * batch 表行记录；id 同时作为同批次事件的提交顺序依据。
+     * holderPlant 为当前持有厂，version 为乐观版本号（跨厂接收成功后加一）。
      */
     public record BatchRow(long id, String batchKey, String productCode, String batchNo,
-                           String producedAt, String status, String createdAt) {
+                           String producedAt, String status, String holderPlant, long version,
+                           String createdAt) {
     }
 
     /**
@@ -57,7 +59,8 @@ public class BatchRepository {
     private static final RowMapper<BatchRow> BATCH_MAPPER = (rs, n) -> new BatchRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("product_code"),
             rs.getString("batch_no"), rs.getString("produced_at"),
-            rs.getString("status"), rs.getString("created_at"));
+            rs.getString("status"), rs.getString("holder_plant"), rs.getLong("version"),
+            rs.getString("created_at"));
 
     private static final RowMapper<TestRow> TEST_MAPPER = (rs, n) -> new TestRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("test_key"),
@@ -101,10 +104,10 @@ public class BatchRepository {
     }
 
     public void insertBatch(BatchRow row) {
-        jdbc.update("INSERT INTO batch (batch_key, product_code, batch_no, produced_at, status, created_at)"
-                        + " VALUES (?, ?, ?, ?, ?, ?)",
+        jdbc.update("INSERT INTO batch (batch_key, product_code, batch_no, produced_at, status,"
+                        + " holder_plant, version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 row.batchKey(), row.productCode(), row.batchNo(), row.producedAt(),
-                row.status(), row.createdAt());
+                row.status(), row.holderPlant(), row.version(), row.createdAt());
     }
 
     public void insertRequiredTest(String batchKey, String testItem, int seq) {
@@ -120,6 +123,29 @@ public class BatchRepository {
 
     public void updateStatus(String batchKey, String status) {
         jdbc.update("UPDATE batch SET status = ? WHERE batch_key = ?", status, batchKey);
+    }
+
+    /**
+     * 跨厂发运：批次转为在途状态，持有厂与版本不变（取消时据此恢复）。
+     */
+    public void updateStatusInTransit(String batchKey) {
+        jdbc.update("UPDATE batch SET status = 'IN_TRANSIT' WHERE batch_key = ?", batchKey);
+    }
+
+    /**
+     * 跨厂接收成功：批次在目标厂落定 QUARANTINED，持有厂一次性切换且版本加一。
+     */
+    public void applyReceipt(String batchKey, String holderPlant, long newVersion) {
+        jdbc.update("UPDATE batch SET status = 'QUARANTINED', holder_plant = ?, version = ?"
+                        + " WHERE batch_key = ?", holderPlant, newVersion, batchKey);
+    }
+
+    /**
+     * 跨厂取消：原子恢复发运前状态与版本；持有厂始终未离开源厂，无需恢复。
+     */
+    public void restoreStatusAndVersion(String batchKey, String status, long version) {
+        jdbc.update("UPDATE batch SET status = ?, version = ? WHERE batch_key = ?",
+                status, version, batchKey);
     }
 
     public List<BatchRow> findAvailableBatches() {

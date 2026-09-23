@@ -58,6 +58,11 @@ public class BatchService {
 
     private static final int IDEMPOTENCY_MAX_ATTEMPTS = 3;
 
+    /**
+     * 批次创建时的默认持有厂；跨厂移交接收成功后由目标厂标识替代。
+     */
+    public static final String DEFAULT_HOLDER_PLANT = "MAIN";
+
     private final BatchRepository repo;
     private final TransactionTemplate tx;
     private final ObjectMapper objectMapper;
@@ -86,7 +91,8 @@ public class BatchService {
             });
             String now = now();
             repo.insertBatch(new BatchRepository.BatchRow(0L, req.batchKey(), req.productCode(),
-                    req.batchNo(), req.producedAt().toString(), BatchStatus.QUARANTINED.name(), now));
+                    req.batchNo(), req.producedAt().toString(), BatchStatus.QUARANTINED.name(),
+                    BatchService.DEFAULT_HOLDER_PLANT, 0L, now));
             for (int i = 0; i < items.size(); i++) {
                 repo.insertRequiredTest(req.batchKey(), items.get(i), i + 1);
             }
@@ -123,7 +129,8 @@ public class BatchService {
             BatchStatus status = BatchStatus.valueOf(batch.status());
             assertNoRecalledAncestor(batchKey);
             if (status == BatchStatus.REJECTED || status == BatchStatus.RELEASED
-                    || status == BatchStatus.RECALLED || status == BatchStatus.SPLIT) {
+                    || status == BatchStatus.RECALLED || status == BatchStatus.SPLIT
+                    || status == BatchStatus.IN_TRANSIT) {
                 throw ApiException.conflict("批次状态 " + status + " 不允许提交检验");
             }
             List<String> required = repo.findRequiredTests(batchKey);
@@ -221,18 +228,20 @@ public class BatchService {
         String actor = actorId.trim();
         String fingerprint = fingerprint("recall", batchKey, actor, req.reason());
         return executeIdempotent(CMD_RECALL, req.commandKey(), fingerprint, () -> {
+            // 先按全局键序锁定被召回批次及其全部后代（并集统一排序），与跨厂接收对同一批次闭包的
+            // 行锁顺序保持一致，避免并发召回/接收间 ABBA 死锁；状态校验在全部行锁取得后进行。
+            List<String> lockedKeys = new ArrayList<>();
+            lockedKeys.add(batchKey);
+            lockedKeys.addAll(descendantKeys(batchKey));
+            Collections.sort(lockedKeys);
+            for (String lockedKey : lockedKeys) {
+                repo.findBatchForUpdate(lockedKey);
+            }
             BatchRepository.BatchRow batch = repo.findBatchForUpdate(batchKey)
                     .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
             BatchStatus status = BatchStatus.valueOf(batch.status());
             if (status != BatchStatus.RELEASED && status != BatchStatus.SPLIT) {
                 throw ApiException.conflict("批次状态 " + status + " 不允许召回，仅 RELEASED 或 SPLIT 可召回");
-            }
-            // 逐行锁定全部后代（按业务键排序保证锁顺序确定）：与后代上的检验/批准/拆分
-            // 互斥，按事务提交顺序裁决——召回先提交则后代新操作看到召回并返回 422。
-            List<String> descendants = descendantKeys(batchKey);
-            Collections.sort(descendants);
-            for (String descendantKey : descendants) {
-                repo.findBatchForUpdate(descendantKey);
             }
             String now = now();
             repo.insertRecall(new BatchRepository.RecallRow(0L, batchKey, req.commandKey(),
@@ -253,6 +262,7 @@ public class BatchService {
         Set<String> recalled = new HashSet<>(repo.findRecalledKeys());
         return repo.findAvailableBatches().stream()
                 .filter(b -> !BatchStatus.SPLIT.name().equals(b.status()))
+                .filter(b -> !BatchStatus.IN_TRANSIT.name().equals(b.status()))
                 .filter(b -> recalledAncestor(b.batchKey(), parentOf, recalled).isEmpty())
                 .map(this::toBatchResponse)
                 .toList();
@@ -459,7 +469,8 @@ public class BatchService {
             for (int i = 0; i < children.size(); i++) {
                 SplitRequest.ChildSpec spec = children.get(i);
                 repo.insertBatch(new BatchRepository.BatchRow(0L, spec.batchKey(), parent.productCode(),
-                        spec.batchNo(), parent.producedAt(), BatchStatus.QUARANTINED.name(), now));
+                        spec.batchNo(), parent.producedAt(), BatchStatus.QUARANTINED.name(),
+                        parent.holderPlant(), 0L, now));
                 for (int j = 0; j < required.size(); j++) {
                     repo.insertRequiredTest(spec.batchKey(), required.get(j), j + 1);
                 }
