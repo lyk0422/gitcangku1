@@ -7,6 +7,7 @@ import java.time.Instant;
  *
  * @param maintenanceId             保养记录标识
  * @param equipmentId               所属设备标识
+ * @param itemCode                  保养项目编码（旧接口固定为 DEFAULT）
  * @param readingId                 锚点读数标识
  * @param anchorRevisionNo          锚点读数在保养完成时的修订号
  * @param anchorSampledAt           锚点读数的 UTC 采样时刻（快照）
@@ -17,6 +18,7 @@ import java.time.Instant;
 public record MaintenanceResponse(
         long maintenanceId,
         String equipmentId,
+        String itemCode,
         String readingId,
         int anchorRevisionNo,
         Instant anchorSampledAt,

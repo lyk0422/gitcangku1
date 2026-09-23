@@ -10,18 +10,18 @@ import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
 /**
- * 统一错误响应：{"code": "...", "message": "..."}。
+ * 统一错误响应：{"code": "...", "message": "...", "details": ...}，details 无内容时省略。
  */
 @RestControllerAdvice
 public class ApiExceptionHandler {
 
-    public record ErrorBody(String code, String message) {
+    public record ErrorBody(String code, String message, Object details) {
     }
 
     @ExceptionHandler(ApiException.class)
     public ResponseEntity<ErrorBody> handleApi(ApiException ex) {
         return ResponseEntity.status(ex.status())
-                .body(new ErrorBody(ex.code(), ex.getMessage()));
+                .body(new ErrorBody(ex.code(), ex.getMessage(), ex.details()));
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
@@ -30,12 +30,12 @@ public class ApiExceptionHandler {
                 .map(error -> error.getField() + " " + error.getDefaultMessage())
                 .collect(Collectors.joining("; "));
         return ResponseEntity.status(HttpStatus.BAD_REQUEST)
-                .body(new ErrorBody("VALIDATION_FAILED", message));
+                .body(new ErrorBody("VALIDATION_FAILED", message, null));
     }
 
     @ExceptionHandler(HttpMessageNotReadableException.class)
     public ResponseEntity<ErrorBody> handleUnreadable(HttpMessageNotReadableException ex) {
         return ResponseEntity.status(HttpStatus.BAD_REQUEST)
-                .body(new ErrorBody("MALFORMED_REQUEST", "请求报文无法解析"));
+                .body(new ErrorBody("MALFORMED_REQUEST", "请求报文无法解析", null));
     }
 }

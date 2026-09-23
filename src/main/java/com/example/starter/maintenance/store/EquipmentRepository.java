@@ -15,6 +15,7 @@ import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.stereotype.Repository;
 
 import com.example.starter.maintenance.domain.Equipment;
+import com.example.starter.maintenance.domain.MaintenanceItem;
 import com.example.starter.maintenance.domain.MaintenanceRecord;
 import com.example.starter.maintenance.domain.Reading;
 
@@ -50,9 +51,16 @@ public class EquipmentRepository {
             rs.getLong("cumulative_minutes"),
             rs.getInt("revision_no"));
 
+    private static final RowMapper<MaintenanceItem> ITEM_MAPPER = (rs, rowNum) -> new MaintenanceItem(
+            rs.getString("equipment_id"),
+            rs.getString("item_code"),
+            rs.getLong("maintenance_period_minutes"),
+            readInstant(rs, "created_at"));
+
     private static final RowMapper<MaintenanceRecord> MAINTENANCE_MAPPER = (rs, rowNum) -> new MaintenanceRecord(
             rs.getLong("maintenance_id"),
             rs.getString("equipment_id"),
+            rs.getString("item_code"),
             rs.getString("reading_id"),
             rs.getInt("anchor_revision_no"),
             readInstant(rs, "anchor_sampled_at"),
@@ -85,6 +93,38 @@ public class EquipmentRepository {
 
     public void incrementVersion(String equipmentId) {
         jdbc.update("UPDATE equipment SET version = version + 1 WHERE equipment_id = ?", equipmentId);
+    }
+
+    // ---------- 保养项目 ----------
+
+    /** 登记设备时迁移生成 DEFAULT 项目，或新增接口创建额外项目；创建后不可修改或删除。 */
+    public void insertItem(MaintenanceItem item) {
+        jdbc.update("INSERT INTO maintenance_item (equipment_id, item_code,"
+                        + " maintenance_period_minutes, created_at) VALUES (?, ?, ?, ?)",
+                item.equipmentId(), item.itemCode(), item.maintenancePeriodMinutes(), utc(item.createdAt()));
+    }
+
+    public Optional<MaintenanceItem> findItem(String equipmentId, String itemCode) {
+        List<MaintenanceItem> rows = jdbc.query(
+                "SELECT equipment_id, item_code, maintenance_period_minutes, created_at"
+                        + " FROM maintenance_item WHERE equipment_id = ? AND item_code = ?",
+                ITEM_MAPPER, equipmentId, itemCode);
+        return rows.stream().findFirst();
+    }
+
+    /** 全部项目，按 item_code 字典序升序。 */
+    public List<MaintenanceItem> listItems(String equipmentId) {
+        return jdbc.query(
+                "SELECT equipment_id, item_code, maintenance_period_minutes, created_at"
+                        + " FROM maintenance_item WHERE equipment_id = ? ORDER BY item_code ASC",
+                ITEM_MAPPER, equipmentId);
+    }
+
+    public int countItems(String equipmentId) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM maintenance_item WHERE equipment_id = ?",
+                Integer.class, equipmentId);
+        return count == null ? 0 : count;
     }
 
     // ---------- 读数 ----------
@@ -178,25 +218,26 @@ public class EquipmentRepository {
     public record RevisionRow(int revisionNo, long cumulativeMinutes, String requestId, Instant createdAt) {
     }
 
-    // ---------- 保养记录 ----------
+    // ---------- 保养记录（按项目独立） ----------
 
-    public long insertMaintenance(String equipmentId, String readingId, int anchorRevisionNo,
-                                  Instant anchorSampledAt, long anchorCumulativeMinutes,
-                                  String requestId, Instant completedAt) {
+    public long insertMaintenance(String equipmentId, String itemCode, String readingId,
+                                  int anchorRevisionNo, Instant anchorSampledAt,
+                                  long anchorCumulativeMinutes, String requestId, Instant completedAt) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(connection -> {
             PreparedStatement ps = connection.prepareStatement(
-                    "INSERT INTO maintenance (equipment_id, reading_id, anchor_revision_no,"
+                    "INSERT INTO maintenance (equipment_id, item_code, reading_id, anchor_revision_no,"
                             + " anchor_sampled_at, anchor_cumulative_minutes, request_id, completed_at)"
-                            + " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            + " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, equipmentId);
-            ps.setString(2, readingId);
-            ps.setInt(3, anchorRevisionNo);
-            ps.setObject(4, utc(anchorSampledAt));
-            ps.setLong(5, anchorCumulativeMinutes);
-            ps.setString(6, requestId);
-            ps.setObject(7, utc(completedAt));
+            ps.setString(2, itemCode);
+            ps.setString(3, readingId);
+            ps.setInt(4, anchorRevisionNo);
+            ps.setObject(5, utc(anchorSampledAt));
+            ps.setLong(6, anchorCumulativeMinutes);
+            ps.setString(7, requestId);
+            ps.setObject(8, utc(completedAt));
             return ps;
         }, keyHolder);
         Number key = keyHolder.getKey();
@@ -206,32 +247,44 @@ public class EquipmentRepository {
         return key.longValue();
     }
 
-    /** 最近一次保养（锚点时间最大者；锚点时间严格递增，故唯一）。 */
-    public Optional<MaintenanceRecord> findLastMaintenance(String equipmentId) {
+    /** 指定项目最近一次保养（锚点时间最大者；项目内锚点时间严格递增，故唯一）。 */
+    public Optional<MaintenanceRecord> findLastMaintenance(String equipmentId, String itemCode) {
         List<MaintenanceRecord> rows = jdbc.query(
-                "SELECT maintenance_id, equipment_id, reading_id, anchor_revision_no,"
+                "SELECT maintenance_id, equipment_id, item_code, reading_id, anchor_revision_no,"
                         + " anchor_sampled_at, anchor_cumulative_minutes, completed_at"
-                        + " FROM maintenance WHERE equipment_id = ?"
+                        + " FROM maintenance WHERE equipment_id = ? AND item_code = ?"
                         + " ORDER BY anchor_sampled_at DESC, maintenance_id DESC LIMIT 1",
-                MAINTENANCE_MAPPER, equipmentId);
+                MAINTENANCE_MAPPER, equipmentId, itemCode);
         return rows.stream().findFirst();
     }
 
-    public List<MaintenanceRecord> listMaintenances(String equipmentId) {
+    /** 指定项目保养历史，按锚点时间升序稳定排序（同刻再按记录主键升序）。 */
+    public List<MaintenanceRecord> listMaintenances(String equipmentId, String itemCode) {
         return jdbc.query(
-                "SELECT maintenance_id, equipment_id, reading_id, anchor_revision_no,"
+                "SELECT maintenance_id, equipment_id, item_code, reading_id, anchor_revision_no,"
                         + " anchor_sampled_at, anchor_cumulative_minutes, completed_at"
-                        + " FROM maintenance WHERE equipment_id = ?"
+                        + " FROM maintenance WHERE equipment_id = ? AND item_code = ?"
                         + " ORDER BY anchor_sampled_at ASC, maintenance_id ASC",
-                MAINTENANCE_MAPPER, equipmentId);
+                MAINTENANCE_MAPPER, equipmentId, itemCode);
     }
 
-    /** 该读数是否已被任意历史保养记录锚定（锚定后不可修订）。 */
+    /** 该读数是否已被设备上任意项目的保养记录引用（引用后不可修订）。 */
     public boolean existsMaintenanceAnchoringReading(String equipmentId, String readingId) {
         Integer count = jdbc.queryForObject(
                 "SELECT COUNT(*) FROM maintenance WHERE equipment_id = ? AND reading_id = ?",
                 Integer.class, equipmentId, readingId);
         return count != null && count > 0;
+    }
+
+    /**
+     * 引用指定读数的全部项目编码（去重、字典序升序），用于修订拦截的 409 响应。
+     * 同一读数可被多个不同项目的保养记录引用，每个项目仅列出一次。
+     */
+    public List<String> findItemCodesAnchoringReading(String equipmentId, String readingId) {
+        return jdbc.queryForList(
+                "SELECT DISTINCT item_code FROM maintenance"
+                        + " WHERE equipment_id = ? AND reading_id = ? ORDER BY item_code ASC",
+                String.class, equipmentId, readingId);
     }
 
     // ---------- 幂等去重 ----------

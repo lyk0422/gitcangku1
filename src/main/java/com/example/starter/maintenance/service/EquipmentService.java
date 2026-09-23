@@ -7,9 +7,13 @@ import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 
 import com.example.starter.maintenance.api.ApiException;
+import com.example.starter.maintenance.api.dto.AddMaintenanceItemRequest;
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
+import com.example.starter.maintenance.api.dto.ItemStatusResponse;
+import com.example.starter.maintenance.api.dto.ItemStatusSummaryResponse;
+import com.example.starter.maintenance.api.dto.MaintenanceItemResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
 import com.example.starter.maintenance.api.dto.RegisterEquipmentRequest;
@@ -38,6 +42,10 @@ public class EquipmentService {
                 EquipmentResponse.class, () -> txService.register(req));
     }
 
+    public MaintenanceItemResponse addItem(String equipmentId, AddMaintenanceItemRequest req) {
+        return txService.addItem(equipmentId, req);
+    }
+
     public ReadingResponse addReading(String equipmentId, AddReadingRequest req) {
         return txService.addReading(equipmentId, req);
     }
@@ -54,6 +62,14 @@ public class EquipmentService {
         return txService.getStatus(equipmentId);
     }
 
+    public ItemStatusResponse getItemStatus(String equipmentId, String itemCode) {
+        return txService.getItemStatus(equipmentId, itemCode);
+    }
+
+    public ItemStatusSummaryResponse getItemStatusSummary(String equipmentId) {
+        return txService.getItemStatusSummary(equipmentId);
+    }
+
     public List<ReadingResponse> listReadings(String equipmentId) {
         return txService.listReadings(equipmentId);
     }
@@ -64,6 +80,10 @@ public class EquipmentService {
 
     public List<MaintenanceResponse> listMaintenances(String equipmentId) {
         return txService.listMaintenances(equipmentId);
+    }
+
+    public List<MaintenanceResponse> listItemMaintenances(String equipmentId, String itemCode) {
+        return txService.listItemMaintenances(equipmentId, itemCode);
     }
 
     /**
