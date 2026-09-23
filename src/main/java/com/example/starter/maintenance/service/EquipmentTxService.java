@@ -82,7 +82,11 @@ public class EquipmentTxService {
                             req.cumulativeMinutes(), req.requestId(), now);
                     repository.incrementVersion(equipmentId);
                     return new ReadingResponse(equipmentId, req.readingId(), req.sampledAt(),
-                            req.cumulativeMinutes(), 1, false, equipment.version() + 1);
+                            req.cumulativeMinutes(),
+                            java.math.BigDecimal.valueOf(req.cumulativeMinutes())
+                                    .divide(com.example.starter.maintenance.domain.Reading.HOURS_PER_SIXTY,
+                                            6, java.math.RoundingMode.HALF_UP),
+                            1, false, equipment.version() + 1);
                 });
     }
 
@@ -109,10 +113,14 @@ public class EquipmentTxService {
                     repository.updateReadingValue(equipmentId, readingId, req.cumulativeMinutes(),
                             newRevisionNo, now);
                     repository.insertRevision(equipmentId, readingId, newRevisionNo,
-                            req.cumulativeMinutes(), req.requestId(), now);
+                            req.cumulativeMinutes(), "REVISE", req.requestId(), now);
                     repository.incrementVersion(equipmentId);
                     return new ReadingResponse(equipmentId, readingId, reading.sampledAt(),
-                            req.cumulativeMinutes(), newRevisionNo, false, equipment.version() + 1);
+                            req.cumulativeMinutes(),
+                            java.math.BigDecimal.valueOf(req.cumulativeMinutes())
+                                    .divide(com.example.starter.maintenance.domain.Reading.HOURS_PER_SIXTY,
+                                            6, java.math.RoundingMode.HALF_UP),
+                            newRevisionNo, false, equipment.version() + 1);
                 });
     }
 
@@ -174,7 +182,7 @@ public class EquipmentTxService {
                 .orElseThrow(() -> equipmentNotFound(equipmentId));
         return repository.listReadings(equipmentId).stream()
                 .map(reading -> new ReadingResponse(equipmentId, reading.readingId(), reading.sampledAt(),
-                        reading.cumulativeMinutes(), reading.revisionNo(),
+                        reading.cumulativeMinutes(), reading.cumulativeHours(), reading.revisionNo(),
                         repository.existsMaintenanceAnchoringReading(equipmentId, reading.readingId()),
                         equipment.version()))
                 .toList();

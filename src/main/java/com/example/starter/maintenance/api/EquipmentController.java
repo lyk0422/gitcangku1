@@ -15,6 +15,10 @@ import org.springframework.web.bind.annotation.RestController;
 
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
+import com.example.starter.maintenance.api.dto.DriftCorrectionRequest;
+import com.example.starter.maintenance.api.dto.DriftEvidenceResponse;
+import com.example.starter.maintenance.api.dto.DriftPreviewResponse;
+import com.example.starter.maintenance.api.dto.DriftActivateResponse;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
@@ -92,5 +96,29 @@ public class EquipmentController {
     @GetMapping("/{equipmentId}/maintenances")
     public List<MaintenanceResponse> listMaintenances(@PathVariable String equipmentId) {
         return service.listMaintenances(equipmentId);
+    }
+
+    // ---------- 时钟漂移修正 ----------
+
+    /** 预览：返回区间内全部读数的旧值、新值、插值段与受影响保养项目，不写数据。 */
+    @PostMapping("/{equipmentId}/drift-corrections/preview")
+    public DriftPreviewResponse previewCorrection(@PathVariable String equipmentId,
+                                                  @Valid @RequestBody DriftCorrectionRequest req) {
+        return service.previewCorrection(equipmentId, req);
+    }
+
+    /** 激活：一个事务内重读校验、生成读数新版本并整体重算保养项目，只产生一个快照版本。 */
+    @PostMapping("/{equipmentId}/drift-corrections")
+    @ResponseStatus(HttpStatus.CREATED)
+    public DriftActivateResponse activateCorrection(@PathVariable String equipmentId,
+                                                    @Valid @RequestBody DriftCorrectionRequest req) {
+        return service.activateCorrection(equipmentId, req);
+    }
+
+    /** 证据查询：只读，读数按采样时刻、读数标识稳定排序。 */
+    @GetMapping("/{equipmentId}/drift-corrections/{correctionKey}")
+    public DriftEvidenceResponse getCorrectionEvidence(@PathVariable String equipmentId,
+                                                       @PathVariable String correctionKey) {
+        return service.getCorrectionEvidence(equipmentId, correctionKey);
     }
 }

@@ -9,6 +9,10 @@ import org.springframework.stereotype.Service;
 import com.example.starter.maintenance.api.ApiException;
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
+import com.example.starter.maintenance.api.dto.DriftActivateResponse;
+import com.example.starter.maintenance.api.dto.DriftCorrectionRequest;
+import com.example.starter.maintenance.api.dto.DriftEvidenceResponse;
+import com.example.starter.maintenance.api.dto.DriftPreviewResponse;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
@@ -26,10 +30,13 @@ public class EquipmentService {
 
     private final EquipmentTxService txService;
     private final IdempotencyService idempotency;
+    private final DriftCorrectionTxService driftTxService;
 
-    public EquipmentService(EquipmentTxService txService, IdempotencyService idempotency) {
+    public EquipmentService(EquipmentTxService txService, IdempotencyService idempotency,
+                            DriftCorrectionTxService driftTxService) {
         this.txService = txService;
         this.idempotency = idempotency;
+        this.driftTxService = driftTxService;
     }
 
     public EquipmentResponse register(RegisterEquipmentRequest req) {
@@ -64,6 +71,22 @@ public class EquipmentService {
 
     public List<MaintenanceResponse> listMaintenances(String equipmentId) {
         return txService.listMaintenances(equipmentId);
+    }
+
+    // ---------- 时钟漂移修正 ----------
+
+    public DriftPreviewResponse previewCorrection(String equipmentId, DriftCorrectionRequest req) {
+        return driftTxService.preview(equipmentId, req);
+    }
+
+    public DriftActivateResponse activateCorrection(String equipmentId, DriftCorrectionRequest req) {
+        return recoverDuplicateKey(req.requestId(), "DRIFT_CORRECTION",
+                DriftCorrectionTxService.fingerprint(req),
+                DriftActivateResponse.class, () -> driftTxService.activate(equipmentId, req));
+    }
+
+    public DriftEvidenceResponse getCorrectionEvidence(String equipmentId, String correctionKey) {
+        return driftTxService.evidence(equipmentId, correctionKey);
     }
 
     /**
