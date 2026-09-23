@@ -47,6 +47,11 @@ public class ApiException extends RuntimeException {
         return new ApiException(HttpStatus.CONFLICT, "CONFLICT", message, null);
     }
 
+    /** 403：操作人不是事件当前指挥人等归属冲突。 */
+    public static ApiException forbidden(String message) {
+        return new ApiException(HttpStatus.FORBIDDEN, "FORBIDDEN", message, null);
+    }
+
     /** 409：携带结构化明细的冲突（如解决门禁未完成项、任务未解除阻塞事件列表）。 */
     public static ApiException conflict(String message, Object details) {
         return new ApiException(HttpStatus.CONFLICT, "CONFLICT", message, details);
@@ -55,5 +60,10 @@ public class ApiException extends RuntimeException {
     /** 422：非法状态流转。 */
     public static ApiException illegalTransition(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "ILLEGAL_TRANSITION", message, null);
+    }
+
+    /** 422：携带结构化明细的状态冲突（如联合交接闭包未覆盖的缺失事件列表）。 */
+    public static ApiException unprocessableEntity(String code, String message, Object details) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, code, message, details);
     }
 }

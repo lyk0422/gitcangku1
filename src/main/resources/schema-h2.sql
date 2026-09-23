@@ -100,3 +100,64 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
 );
+
+-- 联合交接单：预览冻结时创建（PENDING），接受成功后置 ACCEPTED；不支持部分接管。
+CREATE TABLE IF NOT EXISTS joint_handovers (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    handover_key VARCHAR(128) NOT NULL,
+    from_commander VARCHAR(128) NOT NULL,
+    to_commander VARCHAR(128) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    handover_version VARCHAR(64) NOT NULL,
+    closure_keys CLOB NOT NULL,
+    frozen_summary CLOB NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    accepted_at TIMESTAMP(6) NULL,
+    CONSTRAINT uk_joint_handover_key UNIQUE (handover_key)
+);
+
+-- 联合交接闭包成员：预览时写入，便于待接受重叠校验与历史查询。
+CREATE TABLE IF NOT EXISTS joint_handover_members (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    handover_id BIGINT NOT NULL,
+    incident_id BIGINT NOT NULL,
+    ordinal INT NOT NULL,
+    CONSTRAINT uk_joint_handover_member UNIQUE (handover_id, incident_id)
+);
+
+-- 不可变闭包快照：仅在接受成功的同一事务写入，之后不再修改。
+CREATE TABLE IF NOT EXISTS joint_handover_snapshot_incidents (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    handover_id BIGINT NOT NULL,
+    incident_id BIGINT NOT NULL,
+    incident_key VARCHAR(128) NOT NULL,
+    commander VARCHAR(128) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    version_at TIMESTAMP(6) NOT NULL,
+    ordinal INT NOT NULL,
+    CONSTRAINT uk_snapshot_incident UNIQUE (handover_id, incident_id)
+);
+
+CREATE TABLE IF NOT EXISTS joint_handover_snapshot_tasks (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    handover_id BIGINT NOT NULL,
+    incident_id BIGINT NOT NULL,
+    task_id BIGINT NOT NULL,
+    task_key VARCHAR(128) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    version_at TIMESTAMP(6) NOT NULL,
+    blocker_keys CLOB NOT NULL,
+    ordinal INT NOT NULL,
+    CONSTRAINT uk_snapshot_task UNIQUE (handover_id, task_id)
+);
+
+CREATE TABLE IF NOT EXISTS joint_handover_snapshot_escalations (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    handover_id BIGINT NOT NULL,
+    incident_id BIGINT NOT NULL,
+    escalation_id BIGINT NOT NULL,
+    version_at TIMESTAMP(6) NOT NULL,
+    ordinal INT NOT NULL,
+    CONSTRAINT uk_snapshot_escalation UNIQUE (handover_id, escalation_id)
+);

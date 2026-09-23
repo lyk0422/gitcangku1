@@ -100,3 +100,61 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY COMMENT '固定为 1 的单行锁；创建任务时 SELECT ... FOR UPDATE 持有，串行化环检测与写入，保证并发反向依赖最终图无环'
 ) COMMENT='任务依赖图全局锁表';
+
+CREATE TABLE IF NOT EXISTS joint_handovers (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    handover_key VARCHAR(128) NOT NULL COMMENT '联合交接业务键，调用方提供，全局唯一',
+    from_commander VARCHAR(128) NOT NULL COMMENT '发起人（发起时全部闭包事件的同一当前指挥人）',
+    to_commander VARCHAR(128) NOT NULL COMMENT '指定接收人；仅其本人可接受',
+    status VARCHAR(16) NOT NULL COMMENT '状态：PENDING 待接受 / ACCEPTED 已接受；终态事件或非指定接收人拒绝',
+    handover_version VARCHAR(64) NOT NULL COMMENT '冻结摘要 SHA-256，接受时提交 expectedHandoverVersion 比对',
+    closure_keys MEDIUMTEXT NOT NULL COMMENT '闭包事件键有序 JSON 数组（排序），提交集合必须恰好覆盖',
+    frozen_summary MEDIUMTEXT NOT NULL COMMENT '冻结摘要 JSON：每事件指挥人/状态、OPEN 任务版本状态及排序依赖、未确认升级版本',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '预览冻结 UTC 时间',
+    updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间',
+    accepted_at TIMESTAMP(6) NULL COMMENT '接受 UTC 时间；仅 ACCEPTED 有值，否则为空',
+    CONSTRAINT uk_joint_handover_key UNIQUE (handover_key)
+) COMMENT='联合指挥交接单表';
+
+CREATE TABLE IF NOT EXISTS joint_handover_members (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    handover_id BIGINT NOT NULL COMMENT '所属联合交接单 id，关联 joint_handovers.id',
+    incident_id BIGINT NOT NULL COMMENT '闭包事件 id，关联 incidents.id',
+    ordinal INT NOT NULL COMMENT '闭包内排序序号（按事件键排序，从 0 开始）',
+    CONSTRAINT uk_joint_handover_member UNIQUE (handover_id, incident_id)
+) COMMENT='联合交接闭包成员表';
+
+CREATE TABLE IF NOT EXISTS joint_handover_snapshot_incidents (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    handover_id BIGINT NOT NULL COMMENT '所属联合交接单 id，关联 joint_handovers.id',
+    incident_id BIGINT NOT NULL COMMENT '事件 id，关联 incidents.id',
+    incident_key VARCHAR(128) NOT NULL COMMENT '事件业务键快照',
+    commander VARCHAR(128) NOT NULL COMMENT '切换时（=接受时）事件指挥人快照',
+    status VARCHAR(16) NOT NULL COMMENT '切换时事件状态快照：REPORTED/COMMANDING/CONTAINED/RESOLVED/CLOSED',
+    version_at TIMESTAMP(6) NOT NULL COMMENT '该行状态对应的事件 updated_at（UTC 版本）',
+    ordinal INT NOT NULL COMMENT '快照内排序序号（按事件键排序，从 0 开始）',
+    CONSTRAINT uk_snapshot_incident UNIQUE (handover_id, incident_id)
+) COMMENT='联合交接不可变事件快照表';
+
+CREATE TABLE IF NOT EXISTS joint_handover_snapshot_tasks (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    handover_id BIGINT NOT NULL COMMENT '所属联合交接单 id，关联 joint_handovers.id',
+    incident_id BIGINT NOT NULL COMMENT '任务所属事件 id',
+    task_id BIGINT NOT NULL COMMENT '任务 id，关联 incident_tasks.id',
+    task_key VARCHAR(128) NOT NULL COMMENT '任务业务键快照',
+    status VARCHAR(16) NOT NULL COMMENT '切换时任务状态快照：OPEN/DONE/CANCELLED（仅冻结时 OPEN 的任务入快照）',
+    version_at TIMESTAMP(6) NOT NULL COMMENT '该行状态对应的任务 updated_at（UTC 版本）',
+    blocker_keys MEDIUMTEXT NOT NULL COMMENT '任务阻塞事件键的排序 JSON 数组快照（阻塞解除状态按冻结时计算）',
+    ordinal INT NOT NULL COMMENT '快照内排序序号（事件键、任务键排序，从 0 开始）',
+    CONSTRAINT uk_snapshot_task UNIQUE (handover_id, task_id)
+) COMMENT='联合交接不可变 OPEN 任务快照表';
+
+CREATE TABLE IF NOT EXISTS joint_handover_snapshot_escalations (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    handover_id BIGINT NOT NULL COMMENT '所属联合交接单 id，关联 joint_handovers.id',
+    incident_id BIGINT NOT NULL COMMENT '升级记录所属事件 id',
+    escalation_id BIGINT NOT NULL COMMENT '未确认升级记录 id，关联 incident_escalations.id',
+    version_at TIMESTAMP(6) NOT NULL COMMENT '升级记录 updated_at（UTC 版本）；OPEN 升级变化即版本变化',
+    ordinal INT NOT NULL COMMENT '快照内排序序号（按事件键排序，从 0 开始）',
+    CONSTRAINT uk_snapshot_escalation UNIQUE (handover_id, escalation_id)
+) COMMENT='联合交接不可变未确认升级快照表';

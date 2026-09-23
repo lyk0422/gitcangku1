@@ -78,4 +78,57 @@ public final class Responses {
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
     }
+
+    /**
+     * 冻结摘要中的单个 OPEN 任务：version 为任务 updatedAt（UTC 版本），
+     * blockerKeys 为排序后的阻塞事件键（未完成阻塞关系）。
+     */
+    public record HandoverTaskSummary(String taskKey, String status, Instant version,
+                                      List<String> blockerKeys) {
+    }
+
+    /**
+     * 冻结摘要中的单个事件：commander/status 为冻结时值，version 为事件 updatedAt；
+     * openTasks 含全部 OPEN 任务的版本、状态及排序后依赖；
+     * unacknowledgedEscalationVersion 为未确认（OPEN）升级的 updatedAt 版本，无则 null。
+     */
+    public record HandoverIncidentSummary(String incidentKey, String commander, String status,
+                                          Instant version, List<HandoverTaskSummary> openTasks,
+                                          Instant unacknowledgedEscalationVersion) {
+    }
+
+    /**
+     * 联合交接完整冻结摘要：closureIncidentKeys 为排序后的闭包事件键，
+     * incidents 按事件键排序，接收人接受时须原样回传。
+     */
+    public record HandoverSummary(String fromCommander, String toCommander,
+                                  List<String> closureIncidentKeys, List<HandoverIncidentSummary> incidents) {
+    }
+
+    /** 联合交接视图：摘要随预览返回，接受时原样回传。 */
+    public record HandoverView(String handoverKey, String fromCommander, String toCommander,
+                               String status, String handoverVersion, List<String> closureIncidentKeys,
+                               HandoverSummary summary, Instant createdAt, Instant acceptedAt) {
+    }
+
+    /** 不可变闭包快照中的事件行。 */
+    public record SnapshotIncidentView(String incidentKey, String commander, String status,
+                                       Instant versionAt) {
+    }
+
+    /** 不可变闭包快照中的 OPEN 任务行（含排序后依赖）。 */
+    public record SnapshotTaskView(String incidentKey, String taskKey, String status,
+                                   Instant versionAt, List<String> blockerKeys) {
+    }
+
+    /** 不可变闭包快照中的未确认升级行。 */
+    public record SnapshotEscalationView(String incidentKey, long escalationId, Instant versionAt) {
+    }
+
+    /** 接受成功后保存的不可变闭包快照，对应切换时一致状态。 */
+    public record HandoverSnapshotView(String handoverKey, String fromCommander, String toCommander,
+                                       Instant acceptedAt, List<SnapshotIncidentView> incidents,
+                                       List<SnapshotTaskView> tasks,
+                                       List<SnapshotEscalationView> escalations) {
+    }
 }

@@ -55,4 +55,20 @@ public final class Requests {
     /** 任务完成/取消请求，操作人由 X-Actor-Id 指定且须为当前指挥人。 */
     public record TaskActionRequest(String commandKey) {
     }
+
+    /**
+     * 联合交接预览冻结请求：当前指挥人选择 2~20 个未解决事件发起，
+     * 系统沿 OPEN 任务的未完成阻塞关系计算闭包；提交集合必须恰好覆盖闭包。
+     */
+    public record HandoverFreezeRequest(String commandKey, String handoverKey, String toCommander,
+                                        List<String> incidentKeys) {
+    }
+
+    /**
+     * 联合交接接受请求：仅指定接收人可接受；须回传冻结时的完整摘要与
+     * expectedHandoverVersion，任一变化返回 409。
+     */
+    public record HandoverAcceptRequest(String commandKey, String expectedHandoverVersion,
+                                        Responses.HandoverSummary summary) {
+    }
 }
