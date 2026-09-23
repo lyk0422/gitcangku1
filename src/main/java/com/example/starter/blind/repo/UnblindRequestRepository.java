@@ -87,6 +87,16 @@ public class UnblindRequestRepository {
     }
 
     /**
+     * 查询实验全部已批准揭盲：不可删除的知情历史，轮换预览/激活据此计算知情冲突。
+     */
+    public List<UnblindRequestRow> findApprovedByExperiment(String experimentId) {
+        return jdbc.query(
+                "SELECT " + COLUMNS + " FROM unblind_request "
+                        + "WHERE experiment_id = ? AND status = 'APPROVED' ORDER BY id",
+                MAPPER, experimentId);
+    }
+
+    /**
      * 批准：仅 PENDING 可批准，写入处理代码、批准人与时间，并释放待审唯一占位。
      *
      * @return 受影响行数；0 表示不存在或已批准

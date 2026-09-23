@@ -4,15 +4,20 @@ CREATE TABLE IF NOT EXISTS experiment (
     id          VARCHAR(64)  NOT NULL,
     block_count INT          NOT NULL,
     status      VARCHAR(16)  NOT NULL,
+    owner_actor VARCHAR(64)  NOT NULL,
+    version     INT          NOT NULL,
     created_at  BIGINT       NOT NULL,
     CONSTRAINT pk_experiment PRIMARY KEY (id),
     CONSTRAINT ck_experiment_block_count CHECK (block_count BETWEEN 2 AND 8),
-    CONSTRAINT ck_experiment_status CHECK (status IN ('OPEN', 'CLOSED'))
+    CONSTRAINT ck_experiment_status CHECK (status IN ('OPEN', 'CLOSED')),
+    CONSTRAINT ck_experiment_version CHECK (version >= 1)
 );
 COMMENT ON TABLE  experiment IS '实验表，experimentId 全局唯一，创建后区组数量与席位内容不可修改';
 COMMENT ON COLUMN experiment.id IS '实验编号，业务唯一，创建时由请求给定';
 COMMENT ON COLUMN experiment.block_count IS '区组数量，取值2~8，创建时固定，每组固定4个席位';
-COMMENT ON COLUMN experiment.status IS '实验状态：OPEN=开放登记；CLOSED=已关闭，关闭后拒绝新增分配';
+COMMENT ON COLUMN experiment.status IS '实验状态：OPEN=开放登记；CLOSED=已关闭，关闭后拒绝新增分配与职责轮换';
+COMMENT ON COLUMN experiment.owner_actor IS '实验负责人操作者编号（创建人），仅其本人可发起职责轮换';
+COMMENT ON COLUMN experiment.version IS '实验乐观版本号，从1开始；新增分配、退组、揭盲批准、关闭、轮换激活时递增';
 COMMENT ON COLUMN experiment.created_at IS '创建时间，Unix 毫秒，UTC';
 
 CREATE TABLE IF NOT EXISTS seat (
@@ -112,3 +117,99 @@ COMMENT ON COLUMN idempotent_request.fingerprint IS '请求参数指纹（含路
 COMMENT ON COLUMN idempotent_request.response_status IS '首次成功响应的 HTTP 状态码，重放时原样返回';
 COMMENT ON COLUMN idempotent_request.response_body IS '首次成功响应体 JSON，重放时原样返回';
 COMMENT ON COLUMN idempotent_request.created_at IS '记录时间，Unix 毫秒，UTC';
+
+CREATE TABLE IF NOT EXISTS access_generation (
+    id                    BIGINT      NOT NULL AUTO_INCREMENT,
+    experiment_id         VARCHAR(64) NOT NULL,
+    generation_no         INT         NOT NULL,
+    rotation_key          VARCHAR(64),
+    status                VARCHAR(16) NOT NULL,
+    issued_at             BIGINT      NOT NULL,
+    effective_at          BIGINT      NOT NULL,
+    ended_at              BIGINT,
+    active_experiment_key VARCHAR(64),
+    CONSTRAINT pk_access_generation PRIMARY KEY (id),
+    CONSTRAINT uq_generation_exp_no UNIQUE (experiment_id, generation_no),
+    CONSTRAINT uq_generation_active UNIQUE (active_experiment_key),
+    CONSTRAINT ck_generation_status CHECK (status IN ('ACTIVE', 'ENDED')),
+    CONSTRAINT ck_generation_no CHECK (generation_no >= 1)
+);
+COMMENT ON TABLE  access_generation IS '授权代次表；同一实验任意时刻至多一个 ACTIVE 代次，由 active_experiment_key 唯一索引保证';
+COMMENT ON COLUMN access_generation.id IS '代次自增主键';
+COMMENT ON COLUMN access_generation.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN access_generation.generation_no IS '实验内代次序号，从1开始递增；数据提交按事务提交顺序归属该序号';
+COMMENT ON COLUMN access_generation.rotation_key IS '生成本代次的轮换单号；实验创建时的初始代次为 NULL';
+COMMENT ON COLUMN access_generation.status IS '代次状态：ACTIVE=当前有效；ENDED=已被轮换原子结束，旧令牌一律拒绝';
+COMMENT ON COLUMN access_generation.issued_at IS '代次签发时间，Unix 毫秒，UTC';
+COMMENT ON COLUMN access_generation.effective_at IS '代次生效时刻，Unix 毫秒，UTC；此前新代次令牌不可用';
+COMMENT ON COLUMN access_generation.ended_at IS '代次结束时间，Unix 毫秒，UTC；NULL 表示仍有效';
+COMMENT ON COLUMN access_generation.active_experiment_key IS '活动占位列：ACTIVE 时等于 experiment_id，ENDED 置 NULL；唯一索引保证单活动代次';
+
+CREATE TABLE IF NOT EXISTS access_grant (
+    id             BIGINT       NOT NULL AUTO_INCREMENT,
+    generation_id  BIGINT       NOT NULL,
+    experiment_id  VARCHAR(64)  NOT NULL,
+    actor_id       VARCHAR(64)  NOT NULL,
+    role_type      VARCHAR(32)  NOT NULL,
+    visible_fields VARCHAR(200) NOT NULL,
+    created_at     BIGINT       NOT NULL,
+    CONSTRAINT pk_access_grant PRIMARY KEY (id),
+    CONSTRAINT uq_grant UNIQUE (generation_id, actor_id, role_type),
+    CONSTRAINT ck_grant_role CHECK (role_type IN ('DATA_COLLECTOR', 'RANDOMIZATION_CUSTODIAN', 'SAFETY_REVIEWER'))
+);
+COMMENT ON TABLE  access_grant IS '最小知情授权表；每条记录为某代次下一人一角色的最小可见字段集合，随代次结束整体失效';
+COMMENT ON COLUMN access_grant.id IS '授权自增主键';
+COMMENT ON COLUMN access_grant.generation_id IS '所属授权代次主键';
+COMMENT ON COLUMN access_grant.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN access_grant.actor_id IS '被授权人操作者编号';
+COMMENT ON COLUMN access_grant.role_type IS '职责类型：DATA_COLLECTOR=数据采集；RANDOMIZATION_CUSTODIAN=随机化保管；SAFETY_REVIEWER=安全审阅';
+COMMENT ON COLUMN access_grant.visible_fields IS '该角色所需最小字段清单，逗号分隔；不得含超出职责的盲底字段';
+COMMENT ON COLUMN access_grant.created_at IS '授权签发时间，Unix 毫秒，UTC';
+
+CREATE TABLE IF NOT EXISTS role_rotation (
+    rotation_key                VARCHAR(64)  NOT NULL,
+    experiment_id               VARCHAR(64)  NOT NULL,
+    request_id                  VARCHAR(64)  NOT NULL,
+    actor_id                    VARCHAR(64)  NOT NULL,
+    expected_experiment_version INT          NOT NULL,
+    before_generation_no        INT          NOT NULL,
+    after_generation_no         INT          NOT NULL,
+    before_roster_json          CLOB         NOT NULL,
+    after_roster_json           CLOB         NOT NULL,
+    knowledge_basis_json        CLOB         NOT NULL,
+    effective_at                BIGINT       NOT NULL,
+    activated_at                BIGINT       NOT NULL,
+    CONSTRAINT pk_role_rotation PRIMARY KEY (rotation_key)
+);
+COMMENT ON TABLE  role_rotation IS '职责轮换单；仅记录激活成功的轮换，失败整单回滚不占 rotationKey；前后名册与知情依据为审计证据';
+COMMENT ON COLUMN role_rotation.rotation_key IS '轮换单号，全局唯一';
+COMMENT ON COLUMN role_rotation.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN role_rotation.request_id IS '激活请求的幂等键（X-Request-Id）';
+COMMENT ON COLUMN role_rotation.actor_id IS '发起轮换的实验负责人操作者编号';
+COMMENT ON COLUMN role_rotation.expected_experiment_version IS '请求携带的期望实验版本号，激活时与当前版本比对，不一致整单 409';
+COMMENT ON COLUMN role_rotation.before_generation_no IS '轮换前活动授权代次序号';
+COMMENT ON COLUMN role_rotation.after_generation_no IS '轮换后新授权代次序号';
+COMMENT ON COLUMN role_rotation.before_roster_json IS '轮换前角色名册快照 JSON（审计证据，只读）';
+COMMENT ON COLUMN role_rotation.after_roster_json IS '轮换后目标角色名册 JSON（审计证据，只读）';
+COMMENT ON COLUMN role_rotation.knowledge_basis_json IS '激活时不可删除的知情历史快照 JSON：已通过揭盲知悉分组的人员与受试者依据';
+COMMENT ON COLUMN role_rotation.effective_at IS '新代次生效时刻，Unix 毫秒，UTC';
+COMMENT ON COLUMN role_rotation.activated_at IS '轮换激活时间，Unix 毫秒，UTC';
+
+CREATE TABLE IF NOT EXISTS subject_data (
+    id              BIGINT       NOT NULL AUTO_INCREMENT,
+    experiment_id   VARCHAR(64)  NOT NULL,
+    participant_id  VARCHAR(64)  NOT NULL,
+    collector_actor VARCHAR(64)  NOT NULL,
+    generation_no   INT          NOT NULL,
+    payload         VARCHAR(1000) NOT NULL,
+    submitted_at    BIGINT       NOT NULL,
+    CONSTRAINT pk_subject_data PRIMARY KEY (id)
+);
+COMMENT ON TABLE  subject_data IS '受试者数据提交表；每条写入按事务提交顺序归属提交时活动的授权代次';
+COMMENT ON COLUMN subject_data.id IS '数据自增主键';
+COMMENT ON COLUMN subject_data.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN subject_data.participant_id IS '合成受试者编号，非真实医疗数据';
+COMMENT ON COLUMN subject_data.collector_actor IS '提交人操作者编号，须持有当前代次 DATA_COLLECTOR 授权';
+COMMENT ON COLUMN subject_data.generation_no IS '写入归属的授权代次序号，按事务提交时活动代次确定';
+COMMENT ON COLUMN subject_data.payload IS '合成数据内容，非真实医疗数据';
+COMMENT ON COLUMN subject_data.submitted_at IS '提交时间，Unix 毫秒，UTC';

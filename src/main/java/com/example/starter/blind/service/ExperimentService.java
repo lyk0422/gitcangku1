@@ -10,6 +10,7 @@ import com.example.starter.blind.repo.AllocationRepository.VacantSeat;
 import com.example.starter.blind.repo.ExperimentRepository;
 import com.example.starter.blind.repo.ExperimentRepository.ExperimentRow;
 import com.example.starter.blind.repo.ExperimentRepository.SeatRow;
+import com.example.starter.blind.repo.RotationRepository;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -29,25 +30,29 @@ public class ExperimentService {
 
     private final ExperimentRepository experimentRepository;
     private final AllocationRepository allocationRepository;
+    private final RotationRepository rotationRepository;
     private final BlindCodeGenerator blindCodeGenerator;
     private final Clock clock;
 
     public ExperimentService(ExperimentRepository experimentRepository,
                              AllocationRepository allocationRepository,
+                             RotationRepository rotationRepository,
                              BlindCodeGenerator blindCodeGenerator,
                              Clock clock) {
         this.experimentRepository = experimentRepository;
         this.allocationRepository = allocationRepository;
+        this.rotationRepository = rotationRepository;
         this.blindCodeGenerator = blindCodeGenerator;
         this.clock = clock;
     }
 
     /**
      * 创建实验并固定席位：每区组按席位顺序两个 A、两个 B。
+     * 同时签发初始授权代次（generationNo=1，无授权条目），保证任意时刻至多一个活动代次。
      * 不记录任何处理映射到日志。
      */
     @Transactional
-    public ExperimentView createExperiment(String experimentId, int blockCount) {
+    public ExperimentView createExperiment(String experimentId, int blockCount, String ownerActor) {
         if (experimentId == null || experimentId.isBlank()) {
             throw ApiException.badRequest("experimentId 不能为空");
         }
@@ -56,7 +61,8 @@ public class ExperimentService {
         }
         long now = clock.nowMillis();
         experimentRepository.insertExperiment(
-                new ExperimentRow(experimentId, blockCount, "OPEN", now));
+                new ExperimentRow(experimentId, blockCount, "OPEN", ownerActor, 1, now));
+        rotationRepository.insertGeneration(experimentId, 1, null, "ACTIVE", now, now);
         List<SeatRow> seats = new ArrayList<>(blockCount * SEATS_PER_BLOCK);
         for (int blockNo = 1; blockNo <= blockCount; blockNo++) {
             for (int seatNo = 1; seatNo <= SEATS_PER_BLOCK; seatNo++) {
@@ -104,6 +110,8 @@ public class ExperimentService {
         long now = clock.nowMillis();
         AllocationRow inserted = insertWithUniqueBlindCode(experimentId, participantId, actorId,
                 vacant, now);
+        // 新增受试者属于范围变化：递增实验版本，使进行中的轮换单失效。
+        experimentRepository.incrementVersion(experimentId);
         return toView(inserted);
     }
 
@@ -135,14 +143,24 @@ public class ExperimentService {
 
     /**
      * 退组：状态置为 WITHDRAWN 并记录时间；席位不释放、已有分配不重排。
+     * 受试者范围变化递增实验版本；实验行锁与轮换、数据提交串行化。
      */
     @Transactional
     public AllocationView withdraw(String experimentId, String participantId) {
-        AllocationRow allocation = mustFindAllocation(experimentId, participantId);
+        ExperimentRow experiment = experimentRepository.lockById(experimentId);
+        if (experiment == null) {
+            throw ApiException.notFound("实验不存在: " + experimentId);
+        }
+        AllocationRow allocation =
+                allocationRepository.findByExperimentAndParticipant(experimentId, participantId);
+        if (allocation == null) {
+            throw ApiException.notFound("参与者尚未在该实验登记");
+        }
         if ("WITHDRAWN".equals(allocation.status())) {
             throw ApiException.conflict("参与者已退组");
         }
         allocationRepository.markWithdrawn(allocation.id(), clock.nowMillis());
+        experimentRepository.incrementVersion(experimentId);
         AllocationRow refreshed =
                 allocationRepository.findByExperimentAndParticipant(experimentId, participantId);
         return toView(refreshed);

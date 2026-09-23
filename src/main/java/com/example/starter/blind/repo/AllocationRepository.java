@@ -63,6 +63,15 @@ public class AllocationRepository {
         return rows.isEmpty() ? null : rows.get(0);
     }
 
+    /** 查询实验全部分配（含盲底字段，仅供服务层内部计算可见范围）。 */
+    public List<AllocationRow> findByExperiment(String experimentId) {
+        return jdbc.query(
+                "SELECT id, experiment_id, participant_id, block_no, seat_no, blind_code, status, "
+                        + "assigned_actor, assigned_at, withdrawn_at "
+                        + "FROM allocation WHERE experiment_id = ? ORDER BY id",
+                ALLOCATION_MAPPER, experimentId);
+    }
+
     /**
      * 原子领取按区组、席位顺序排列的第一个空位：把尚未被占用的最小 block_no/seat_no
      * 关联给新参与者。依赖 allocation(experiment_id, block_no, seat_no) 唯一索引兜底并发。

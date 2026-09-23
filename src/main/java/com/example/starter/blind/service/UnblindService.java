@@ -73,6 +73,7 @@ public class UnblindService {
 
     /**
      * REVIEWER 批准申请；批准人不得是申请人本人。
+     * 先锁实验行（与职责轮换、数据提交串行化），批准产生新知情事实，递增实验版本。
      */
     @Transactional
     public UnblindRequestView approve(String unblindRequestId, String reviewerActor) {
@@ -97,6 +98,10 @@ public class UnblindService {
         long now = clock.nowMillis();
         unblindRequestRepository.approve(unblindRequestId, reviewerActor,
                 seat.treatment(), now);
+        // 新增揭盲属于知情历史变化：锁定实验行并递增版本，使进行中的轮换单失效。
+        if (experimentRepository.lockById(row.experimentId()) != null) {
+            experimentRepository.incrementVersion(row.experimentId());
+        }
         return new UnblindRequestView(row.id(), row.experimentId(), row.participantId(),
                 row.reason(), row.applicantActor(), reviewerActor, "APPROVED",
                 row.createdAt(), now);
