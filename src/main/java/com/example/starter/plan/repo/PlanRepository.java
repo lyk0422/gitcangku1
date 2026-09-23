@@ -103,6 +103,21 @@ public class PlanRepository {
     }
 
     /**
+     * 按主键集合加行级写锁并返回计划（按 id 升序），须在事务内调用。
+     * 封锁激活用它一次性、按统一顺序锁定全部旧计划与替代计划，避免与取消/改签并发死锁。
+     */
+    public List<DayPlan> findByIdsForUpdate(Collection<Long> ids) {
+        if (ids.isEmpty()) {
+            return List.of();
+        }
+        StringJoiner placeholders = new StringJoiner(", ");
+        ids.forEach(id -> placeholders.add("?"));
+        return jdbc.query("SELECT id, schedule_key, op_date, version, status FROM rail_day_plan"
+                        + " WHERE id IN (" + placeholders + ") ORDER BY id FOR UPDATE",
+                PLAN_MAPPER, ids.toArray());
+    }
+
+    /**
      * 整体替换计划的占用清单：先删后插，保持提交顺序。
      */
     public void replaceOccupancies(long planId, List<Occupancy> occupancies) {

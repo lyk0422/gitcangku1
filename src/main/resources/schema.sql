@@ -17,7 +17,7 @@ COMMENT ON COLUMN rail_day_plan.id IS '主键';
 COMMENT ON COLUMN rail_day_plan.schedule_key IS '计划业务键，全局唯一，取消后仍保留历史';
 COMMENT ON COLUMN rail_day_plan.op_date IS '运营日期（Asia/Shanghai 日历日）';
 COMMENT ON COLUMN rail_day_plan.version IS '计划版本，草稿占用整体替换成功一次加一';
-COMMENT ON COLUMN rail_day_plan.status IS '计划状态：DRAFT 草稿 / PUBLISHED 已发布 / CANCELLED 已取消';
+COMMENT ON COLUMN rail_day_plan.status IS '计划状态：DRAFT 草稿 / PUBLISHED 已发布 / CANCELLED 已取消 / SUSPENDED 封锁切换挂起';
 COMMENT ON COLUMN rail_day_plan.created_at IS '创建时刻，UTC 毫秒';
 COMMENT ON COLUMN rail_day_plan.updated_at IS '最近变更时刻，UTC 毫秒';
 
@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS idempotency_record (
 );
 COMMENT ON TABLE idempotency_record IS '写操作幂等记录，仅缓存成功结果，失败不缓存可重试';
 COMMENT ON COLUMN idempotency_record.id IS '主键';
-COMMENT ON COLUMN idempotency_record.op_type IS '操作类型：CREATE / UPDATE / PUBLISH / CANCEL / RESCHEDULE';
+COMMENT ON COLUMN idempotency_record.op_type IS '操作类型：CREATE / UPDATE / PUBLISH / CANCEL / RESCHEDULE / SWITCH_REGISTER / SWITCH_ACTIVATE';
 COMMENT ON COLUMN idempotency_record.request_key IS '客户端幂等键，同一操作类型内唯一';
 COMMENT ON COLUMN idempotency_record.request_hash IS '请求参数规范化后的 SHA-256，同键不同参判定 409';
 COMMENT ON COLUMN idempotency_record.response_json IS '首次成功响应快照（JSON），重放原样返回';
@@ -83,3 +83,44 @@ COMMENT ON TABLE publish_lock IS '发布/改签全局互斥锁，保证并发发
 COMMENT ON COLUMN publish_lock.id IS '锁行 id，固定为 1，发布与改签时 SELECT ... FOR UPDATE 串行化';
 
 MERGE INTO publish_lock KEY(id) VALUES (1);
+
+CREATE TABLE IF NOT EXISTS rail_section_switch (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    switch_key VARCHAR(64) NOT NULL,
+    section_id VARCHAR(64) NOT NULL,
+    start_utc BIGINT NOT NULL,
+    end_utc BIGINT NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    snapshot_json CLOB,
+    created_at BIGINT NOT NULL,
+    updated_at BIGINT NOT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT uk_rail_section_switch_key UNIQUE (switch_key)
+);
+COMMENT ON TABLE rail_section_switch IS '区段封锁切换单，登记封锁区段与左闭右开 UTC 窗口；REGISTERED 可激活，ACTIVE 为终态';
+COMMENT ON COLUMN rail_section_switch.id IS '主键';
+COMMENT ON COLUMN rail_section_switch.switch_key IS '切换单业务键，全局唯一，登记后不可换请求复用';
+COMMENT ON COLUMN rail_section_switch.section_id IS '封锁区段 ID';
+COMMENT ON COLUMN rail_section_switch.start_utc IS '封锁窗口开始时刻（含），UTC 毫秒';
+COMMENT ON COLUMN rail_section_switch.end_utc IS '封锁窗口结束时刻（不含），UTC 毫秒，必须晚于 start_utc';
+COMMENT ON COLUMN rail_section_switch.status IS '切换单状态：REGISTERED 已登记待激活 / ACTIVE 已激活终态';
+COMMENT ON COLUMN rail_section_switch.snapshot_json IS '激活成功后的完整切换快照（JSON），不可变；登记态为 NULL';
+COMMENT ON COLUMN rail_section_switch.created_at IS '创建时刻，UTC 毫秒';
+COMMENT ON COLUMN rail_section_switch.updated_at IS '最近变更时刻，UTC 毫秒';
+
+CREATE TABLE IF NOT EXISTS rail_plan_replacement_link (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    switch_id BIGINT NOT NULL,
+    old_plan_id BIGINT NOT NULL,
+    replacement_plan_id BIGINT NOT NULL,
+    created_at BIGINT NOT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT uk_replacement_link_old UNIQUE (old_plan_id),
+    CONSTRAINT uk_replacement_link_replacement UNIQUE (replacement_plan_id)
+);
+COMMENT ON TABLE rail_plan_replacement_link IS '封锁切换一对一替代关联，随激活事务写入后不可变；旧计划与替代计划均全表唯一';
+COMMENT ON COLUMN rail_plan_replacement_link.id IS '主键';
+COMMENT ON COLUMN rail_plan_replacement_link.switch_id IS '所属切换单 id，关联 rail_section_switch.id';
+COMMENT ON COLUMN rail_plan_replacement_link.old_plan_id IS '被挂起旧计划 id，关联 rail_day_plan.id，全表唯一';
+COMMENT ON COLUMN rail_plan_replacement_link.replacement_plan_id IS '替代旧计划的新计划 id，关联 rail_day_plan.id，全表唯一';
+COMMENT ON COLUMN rail_plan_replacement_link.created_at IS '关联创建时刻，UTC 毫秒';
