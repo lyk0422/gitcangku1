@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS incidents (
     reporter VARCHAR(128) NOT NULL,
     status VARCHAR(16) NOT NULL,
     commander VARCHAR(128) NULL,
+    version BIGINT NOT NULL DEFAULT 0,
     deadline_at TIMESTAMP(6) NULL,
     created_at TIMESTAMP(6) NOT NULL,
     updated_at TIMESTAMP(6) NOT NULL,
@@ -64,6 +65,7 @@ CREATE TABLE IF NOT EXISTS incident_escalations (
     triggered_at TIMESTAMP(6) NOT NULL,
     triggered_commander VARCHAR(128) NOT NULL,
     status VARCHAR(16) NOT NULL,
+    version BIGINT NOT NULL DEFAULT 0,
     note VARCHAR(1024) NULL,
     acknowledged_by VARCHAR(128) NULL,
     acknowledged_at TIMESTAMP(6) NULL,
@@ -79,6 +81,7 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     group_code VARCHAR(64) NOT NULL,
     title VARCHAR(512) NOT NULL,
     status VARCHAR(16) NOT NULL,
+    version BIGINT NOT NULL DEFAULT 0,
     created_by VARCHAR(128) NOT NULL,
     done_by VARCHAR(128) NULL,
     done_at TIMESTAMP(6) NULL,
@@ -99,4 +102,45 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS joint_handovers (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    handover_key VARCHAR(128) NOT NULL,
+    from_commander VARCHAR(128) NOT NULL,
+    to_commander VARCHAR(128) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    handover_version VARCHAR(64) NOT NULL,
+    submitted_incident_keys CLOB NOT NULL,
+    closure_incident_keys CLOB NOT NULL,
+    frozen_summary CLOB NULL,
+    accepted_at TIMESTAMP(6) NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_joint_handover_key UNIQUE (handover_key)
+);
+
+CREATE TABLE IF NOT EXISTS joint_handover_incidents (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    handover_id BIGINT NOT NULL,
+    incident_id BIGINT NOT NULL,
+    incident_key VARCHAR(128) NOT NULL,
+    in_submitted BOOLEAN NOT NULL,
+    in_closure BOOLEAN NOT NULL,
+    seq_no INT NOT NULL,
+    CONSTRAINT uk_joint_handover_incident UNIQUE (handover_id, incident_id)
+);
+
+CREATE TABLE IF NOT EXISTS joint_handover_snapshots (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    handover_id BIGINT NOT NULL,
+    incident_id BIGINT NOT NULL,
+    incident_key VARCHAR(128) NOT NULL,
+    commander VARCHAR(128) NULL,
+    incident_status VARCHAR(16) NOT NULL,
+    incident_version BIGINT NOT NULL,
+    open_tasks_json CLOB NOT NULL,
+    escalation_version BIGINT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_joint_handover_snapshot UNIQUE (handover_id, incident_id)
 );

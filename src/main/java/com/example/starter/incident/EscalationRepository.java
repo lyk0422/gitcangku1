@@ -37,6 +37,7 @@ public class EscalationRepository {
                 rs.getTimestamp("triggered_at").toInstant(),
                 rs.getString("triggered_commander"),
                 EscalationStatus.valueOf(rs.getString("status")),
+                rs.getLong("version"),
                 rs.getString("note"), rs.getString("acknowledged_by"),
                 ackedAt == null ? null : ackedAt.toInstant(),
                 rs.getTimestamp("created_at").toInstant(),
@@ -51,8 +52,8 @@ public class EscalationRepository {
         jdbc.update(con -> {
             var ps = con.prepareStatement(
                     "INSERT INTO incident_escalations (incident_id, deadline_at, triggered_at,"
-                            + " triggered_commander, status, note, acknowledged_by, acknowledged_at,"
-                            + " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                            + " triggered_commander, status, version, note, acknowledged_by,"
+                            + " acknowledged_at, created_at, updated_at) VALUES (?,?,?,?,?,0,?,?,?,?,?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setLong(1, escalation.incidentId());
             ps.setTimestamp(2, Timestamp.from(escalation.deadlineAt()));
@@ -85,18 +86,18 @@ public class EscalationRepository {
      */
     public int acknowledge(long id, String note, String acknowledgedBy, Instant acknowledgedAt) {
         return jdbc.update("UPDATE incident_escalations SET status = 'ACKNOWLEDGED', note = ?,"
-                        + " acknowledged_by = ?, acknowledged_at = ?, updated_at = ?"
-                        + " WHERE id = ? AND status = 'OPEN'",
+                        + " acknowledged_by = ?, acknowledged_at = ?, version = version + 1,"
+                        + " updated_at = ? WHERE id = ? AND status = 'OPEN'",
                 note, acknowledgedBy, Timestamp.from(acknowledgedAt), Timestamp.from(acknowledgedAt), id);
     }
 
     /**
-     * 遏制提交时将事件仍 OPEN 的记录原子置为 CANCELLED；已确认记录保留。
+     * 遏制提交时将事件仍 OPEN 的记录原子置为 CANCELLED；已确认记录保留。版本号加 1。
      * 返回被取消的记录数（0 或 1）。
      */
     public int cancelOpenForIncident(long incidentId, Instant cancelledAt) {
-        return jdbc.update("UPDATE incident_escalations SET status = 'CANCELLED', updated_at = ?"
-                        + " WHERE incident_id = ? AND status = 'OPEN'",
+        return jdbc.update("UPDATE incident_escalations SET status = 'CANCELLED', version = version + 1,"
+                        + " updated_at = ? WHERE incident_id = ? AND status = 'OPEN'",
                 Timestamp.from(cancelledAt), incidentId);
     }
 
@@ -106,5 +107,17 @@ public class EscalationRepository {
     public List<Escalation> listByIncident(long incidentId) {
         return jdbc.query("SELECT * FROM incident_escalations WHERE incident_id = ? ORDER BY id",
                 MAPPER, incidentId);
+    }
+
+    /**
+     * 批量查询多个事件的升级记录，按事件 id、记录 id 排序返回（联合交接冻结未确认升级用）。
+     */
+    public List<Escalation> listByIncidents(List<Long> incidentIds) {
+        if (incidentIds.isEmpty()) {
+            return List.of();
+        }
+        String placeholders = String.join(",", incidentIds.stream().map(x -> "?").toList());
+        return jdbc.query("SELECT * FROM incident_escalations WHERE incident_id IN (" + placeholders
+                + ") ORDER BY incident_id, id", MAPPER, incidentIds.toArray());
     }
 }

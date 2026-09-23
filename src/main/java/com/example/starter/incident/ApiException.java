@@ -52,8 +52,18 @@ public class ApiException extends RuntimeException {
         return new ApiException(HttpStatus.CONFLICT, "CONFLICT", message, details);
     }
 
+    /** 403：提交集合混入非当前指挥人指挥的事件。 */
+    public static ApiException forbidden(String message) {
+        return new ApiException(HttpStatus.FORBIDDEN, "FORBIDDEN", message, null);
+    }
+
     /** 422：非法状态流转。 */
     public static ApiException illegalTransition(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "ILLEGAL_TRANSITION", message, null);
+    }
+
+    /** 422：提交集合未恰好覆盖依赖闭包，details 为缺失事件键排序列表。 */
+    public static ApiException closureIncomplete(String message, Object details) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "CLOSURE_MISMATCH", message, details);
     }
 }

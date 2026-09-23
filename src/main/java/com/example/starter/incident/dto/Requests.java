@@ -3,6 +3,8 @@ package com.example.starter.incident.dto;
 import java.time.Instant;
 import java.util.List;
 
+import com.example.starter.incident.dto.Responses.HandoverSummaryView;
+
 /**
  * 写接口请求体集合。commandKey 为调用方幂等键；occurredAt 为 UTC 时间。
  */
@@ -54,5 +56,23 @@ public final class Requests {
 
     /** 任务完成/取消请求，操作人由 X-Actor-Id 指定且须为当前指挥人。 */
     public record TaskActionRequest(String commandKey) {
+    }
+
+    /**
+     * 联合交接发起请求：handoverKey 全局唯一；toCommander 为指定接收人；
+     * incidentKeys 为当前指挥人选择的 2~20 个未解决事件，提交集合必须恰好覆盖
+     * 从这些事件 OPEN 任务沿未完成阻塞关系计算出的依赖闭包。
+     */
+    public record HandoverInitiateRequest(String commandKey, String handoverKey, String toCommander,
+                                          List<String> incidentKeys) {
+    }
+
+    /**
+     * 联合交接接受请求：操作人由 X-Actor-Id 指定且须为交接单指定接收人；
+     * expectedHandoverVersion 须等于发起返回的 handoverVersion；
+     * summary 为发起返回的完整冻结摘要，逐字段比对，任一事件/任务/依赖/升级变化返回 409。
+     */
+    public record HandoverAcceptRequest(String commandKey, String expectedHandoverVersion,
+                                        HandoverSummaryView summary) {
     }
 }

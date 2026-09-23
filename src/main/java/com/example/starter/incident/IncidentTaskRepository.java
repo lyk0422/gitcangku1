@@ -48,6 +48,7 @@ public class IncidentTaskRepository {
                 rs.getLong("id"), rs.getLong("incident_id"), rs.getString("task_key"),
                 rs.getString("group_code"), rs.getString("title"),
                 TaskStatus.valueOf(rs.getString("status")),
+                rs.getLong("version"),
                 rs.getString("created_by"), rs.getString("done_by"),
                 doneAt == null ? null : doneAt.toInstant(),
                 rs.getString("cancelled_by"),
@@ -70,8 +71,8 @@ public class IncidentTaskRepository {
         jdbc.update(con -> {
             var ps = con.prepareStatement(
                     "INSERT INTO incident_tasks (incident_id, task_key, group_code, title, status,"
-                            + " created_by, done_by, done_at, cancelled_by, cancelled_at,"
-                            + " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                            + " version, created_by, done_by, done_at, cancelled_by, cancelled_at,"
+                            + " created_at, updated_at) VALUES (?,?,?,?,?,0,?,?,?,?,?,?,?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setLong(1, task.incidentId());
             ps.setString(2, task.taskKey());
@@ -117,6 +118,52 @@ public class IncidentTaskRepository {
     }
 
     /**
+     * 批量查询多个事件的全部 OPEN 任务，按事件 id、任务 id 排序返回（联合交接冻结用）。
+     */
+    public List<IncidentTask> listOpenByIncidents(List<Long> incidentIds) {
+        if (incidentIds.isEmpty()) {
+            return List.of();
+        }
+        String placeholders = String.join(",", incidentIds.stream().map(x -> "?").toList());
+        return jdbc.query("SELECT * FROM incident_tasks WHERE status = 'OPEN' AND incident_id IN ("
+                + placeholders + ") ORDER BY incident_id, id", TASK_MAPPER, incidentIds.toArray());
+    }
+
+    /**
+     * 任务与阻塞事件 id 的关联（联合交接冻结任务依赖用）。
+     */
+    public record TaskBlockerRef(long taskId, long blockerIncidentId) {
+    }
+
+    /**
+     * 查询给定事件集合内全部 OPEN 任务产生的跨事件阻塞边（任务所属事件 → 阻塞事件），
+     * 联合交接依赖闭包计算用：仅未完成（OPEN）任务的未完成阻塞关系参与。
+     */
+    public List<Edge> listOpenBlockerEdgesByFromIncidents(List<Long> incidentIds) {
+        if (incidentIds.isEmpty()) {
+            return List.of();
+        }
+        String placeholders = String.join(",", incidentIds.stream().map(x -> "?").toList());
+        return jdbc.query("SELECT t.incident_id, b.blocker_incident_id FROM incident_task_blockers b"
+                        + " JOIN incident_tasks t ON t.id = b.task_id"
+                        + " WHERE t.status = 'OPEN' AND t.incident_id IN (" + placeholders + ")",
+                (rs, n) -> new Edge(rs.getLong(1), rs.getLong(2)), incidentIds.toArray());
+    }
+
+    /**
+     * 批量查询给定任务的全部阻塞边，按任务 id、阻塞事件 id 排序返回。
+     */
+    public List<TaskBlockerRef> listBlockersForTasks(List<Long> taskIds) {
+        if (taskIds.isEmpty()) {
+            return List.of();
+        }
+        String placeholders = String.join(",", taskIds.stream().map(x -> "?").toList());
+        return jdbc.query("SELECT task_id, blocker_incident_id FROM incident_task_blockers"
+                        + " WHERE task_id IN (" + placeholders + ") ORDER BY task_id, blocker_incident_id",
+                (rs, n) -> new TaskBlockerRef(rs.getLong(1), rs.getLong(2)), taskIds.toArray());
+    }
+
+    /**
      * 统计事件任务数（每事件至多 20 个）。
      */
     public int countByIncident(long incidentId) {
@@ -126,20 +173,20 @@ public class IncidentTaskRepository {
     }
 
     /**
-     * 将 OPEN 任务置为 DONE，记录完成人与 UTC 时刻。
+     * 将 OPEN 任务置为 DONE，记录完成人与 UTC 时刻，版本号加 1。
      */
     public void markDone(long id, String actor, Instant at) {
         jdbc.update("UPDATE incident_tasks SET status = 'DONE', done_by = ?, done_at = ?,"
-                        + " updated_at = ? WHERE id = ?",
+                        + " version = version + 1, updated_at = ? WHERE id = ?",
                 actor, Timestamp.from(at), Timestamp.from(at), id);
     }
 
     /**
-     * 将 OPEN 任务置为 CANCELLED，记录取消人与 UTC 时刻。
+     * 将 OPEN 任务置为 CANCELLED，记录取消人与 UTC 时刻，版本号加 1。
      */
     public void markCancelled(long id, String actor, Instant at) {
         jdbc.update("UPDATE incident_tasks SET status = 'CANCELLED', cancelled_by = ?,"
-                        + " cancelled_at = ?, updated_at = ? WHERE id = ?",
+                        + " cancelled_at = ?, version = version + 1, updated_at = ? WHERE id = ?",
                 actor, Timestamp.from(at), Timestamp.from(at), id);
     }
 

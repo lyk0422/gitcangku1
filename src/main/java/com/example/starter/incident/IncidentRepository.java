@@ -49,6 +49,7 @@ public class IncidentRepository {
         return new Incident(rs.getLong("id"), rs.getString("incident_key"), rs.getString("severity"),
                 rs.getString("summary"), rs.getString("reporter"),
                 IncidentStatus.valueOf(rs.getString("status")), rs.getString("commander"),
+                rs.getLong("version"),
                 rs.getTimestamp("created_at").toInstant(), rs.getTimestamp("updated_at").toInstant(),
                 deadline == null ? null : deadline.toInstant());
     }
@@ -72,6 +73,43 @@ public class IncidentRepository {
     }
 
     /**
+     * 按主键集合按固定顺序（id 升序）锁定事件行，用于联合交接整体加锁，
+     * 避免多个交叉集合事务间出现加锁顺序死锁。
+     */
+    public List<Incident> lockByIdsOrdered(List<Long> ids) {
+        if (ids.isEmpty()) {
+            return List.of();
+        }
+        String placeholders = String.join(",", ids.stream().map(x -> "?").toList());
+        return jdbc.query("SELECT * FROM incidents WHERE id IN (" + placeholders
+                + ") ORDER BY id FOR UPDATE", INCIDENT_MAPPER, ids.toArray());
+    }
+
+    /**
+     * 按主键批量查询事件（不加锁），按 id 升序返回。
+     */
+    public List<Incident> listByIdsOrdered(List<Long> ids) {
+        if (ids.isEmpty()) {
+            return List.of();
+        }
+        String placeholders = String.join(",", ids.stream().map(x -> "?").toList());
+        return jdbc.query("SELECT * FROM incidents WHERE id IN (" + placeholders + ") ORDER BY id",
+                INCIDENT_MAPPER, ids.toArray());
+    }
+
+    /**
+     * 按业务键集合批量查询事件（不加锁），按 id 升序返回；不存在的键不在结果中。
+     */
+    public List<Incident> findAllByKeysOrdered(List<String> keys) {
+        if (keys.isEmpty()) {
+            return List.of();
+        }
+        String placeholders = String.join(",", keys.stream().map(x -> "?").toList());
+        return jdbc.query("SELECT * FROM incidents WHERE incident_key IN (" + placeholders
+                + ") ORDER BY id", INCIDENT_MAPPER, keys.toArray());
+    }
+
+    /**
      * 插入新事件，初始状态 REPORTED、无指挥人、无遏制期限，返回生成主键。
      */
     public long insert(Incident incident) {
@@ -79,7 +117,7 @@ public class IncidentRepository {
         jdbc.update(con -> {
             var ps = con.prepareStatement(
                     "INSERT INTO incidents (incident_key, severity, summary, reporter, status, commander,"
-                            + " created_at, updated_at, deadline_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                            + " version, created_at, updated_at, deadline_at) VALUES (?,?,?,?,?,?,0,?,?,?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, incident.incidentKey());
             ps.setString(2, incident.severity());
@@ -104,11 +142,21 @@ public class IncidentRepository {
     }
 
     /**
-     * 更新事件状态与指挥人（commander 可为 null 表示不变更时传入原值）。
+     * 更新事件状态与指挥人（commander 可为 null 表示不变更时传入原值），版本号加 1。
      */
     public void updateState(long id, IncidentStatus status, String commander, Instant updatedAt) {
-        jdbc.update("UPDATE incidents SET status = ?, commander = ?, updated_at = ? WHERE id = ?",
+        jdbc.update("UPDATE incidents SET status = ?, commander = ?, version = version + 1,"
+                        + " updated_at = ? WHERE id = ?",
                 status.name(), commander, Timestamp.from(updatedAt), id);
+    }
+
+    /**
+     * 联合交接接受时整体切换指挥人：状态不变，指挥人改为接收人，版本号加 1。
+     */
+    public void switchCommander(long id, String commander, Instant updatedAt) {
+        jdbc.update("UPDATE incidents SET commander = ?, version = version + 1, updated_at = ?"
+                        + " WHERE id = ?",
+                commander, Timestamp.from(updatedAt), id);
     }
 
     /**

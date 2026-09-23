@@ -108,6 +108,54 @@ class SchemaH2ScriptTest {
                     duplicateBlockerRejected = true;
                 }
                 assertThat(duplicateBlockerRejected).isTrue();
+
+                // 联合交接：handover_key 全局唯一
+                st.execute("INSERT INTO joint_handovers (handover_key, from_commander,"
+                        + " to_commander, status, handover_version, submitted_incident_keys,"
+                        + " closure_incident_keys, frozen_summary, created_at, updated_at) VALUES"
+                        + " ('HK-1','alice','bob','PENDING','v1','[\"IK-1\"]','[\"IK-1\"]',"
+                        + "'{}','" + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                boolean duplicateHandoverRejected = false;
+                try {
+                    st.execute("INSERT INTO joint_handovers (handover_key, from_commander,"
+                            + " to_commander, status, handover_version, submitted_incident_keys,"
+                            + " closure_incident_keys, frozen_summary, created_at, updated_at) VALUES"
+                            + " ('HK-1','alice','carol','PENDING','v2','[\"IK-1\"]','[\"IK-1\"]',"
+                            + "'{}','" + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateHandoverRejected = true;
+                }
+                assertThat(duplicateHandoverRejected).isTrue();
+
+                // 闭包事件行与快照行：(handover_id, incident_id) 唯一
+                st.execute("INSERT INTO joint_handover_incidents (handover_id, incident_id,"
+                        + " incident_key, in_submitted, in_closure, seq_no) VALUES"
+                        + " (1,1,'IK-1',TRUE,TRUE,0)");
+                boolean duplicateClosureRowRejected = false;
+                try {
+                    st.execute("INSERT INTO joint_handover_incidents (handover_id, incident_id,"
+                            + " incident_key, in_submitted, in_closure, seq_no) VALUES"
+                            + " (1,1,'IK-1',TRUE,TRUE,0)");
+                } catch (Exception e) {
+                    duplicateClosureRowRejected = true;
+                }
+                assertThat(duplicateClosureRowRejected).isTrue();
+
+                st.execute("INSERT INTO joint_handover_snapshots (handover_id, incident_id,"
+                        + " incident_key, commander, incident_status, incident_version,"
+                        + " open_tasks_json, escalation_version, created_at) VALUES"
+                        + " (1,1,'IK-1','bob','COMMANDING',2,'[]',NULL,'" + Timestamp.from(now) + "')");
+                boolean duplicateSnapshotRejected = false;
+                try {
+                    st.execute("INSERT INTO joint_handover_snapshots (handover_id, incident_id,"
+                            + " incident_key, commander, incident_status, incident_version,"
+                            + " open_tasks_json, escalation_version, created_at) VALUES"
+                            + " (1,1,'IK-1','bob','COMMANDING',2,'[]',NULL,'" + Timestamp.from(now)
+                            + "')");
+                } catch (Exception e) {
+                    duplicateSnapshotRejected = true;
+                }
+                assertThat(duplicateSnapshotRejected).isTrue();
             }
         }
     }

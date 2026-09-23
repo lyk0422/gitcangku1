@@ -107,7 +107,7 @@ public class IncidentService {
         }
         Instant now = now();
         Incident incident = new Incident(0L, incidentKey, severity, summary, reporter,
-                IncidentStatus.REPORTED, null, now, now, null);
+                IncidentStatus.REPORTED, null, 0L, now, now, null);
         long id;
         try {
             id = incidents.insert(incident);
@@ -306,7 +306,7 @@ public class IncidentService {
                             && incident.deadlineAt() != null
                             && !currentTime.isBefore(incident.deadlineAt())) {
                         escalations.insert(new Escalation(0L, incident.id(), incident.deadlineAt(),
-                                currentTime, incident.commander(), EscalationStatus.OPEN,
+                                currentTime, incident.commander(), EscalationStatus.OPEN, 0L,
                                 null, null, null, currentTime, currentTime));
                     }
                     return toEscalationHistory(incident,
@@ -452,7 +452,7 @@ public class IncidentService {
                     }
                     Instant now = now();
                     long taskId = tasks.insert(new IncidentTask(0L, incident.id(), taskKey,
-                            groupCode, title, TaskStatus.OPEN, actor, null, null, null, null,
+                            groupCode, title, TaskStatus.OPEN, 0L, actor, null, null, null, null,
                             now, now));
                     for (Incident blocker : blockers) {
                         tasks.insertBlocker(taskId, blocker.id(), now);

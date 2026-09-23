@@ -78,4 +78,75 @@ public final class Responses {
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
     }
+
+    /**
+     * 联合交接冻结的 OPEN 任务摘要：version 为任务版本号；status 为冻结时状态（OPEN）；
+     * blockers 为按阻塞事件键排序后的依赖列表。
+     */
+    public record HandoverOpenTaskView(String taskKey, long version, String status,
+                                       List<String> blockers) {
+    }
+
+    /**
+     * 联合交接冻结的单事件摘要：commander/status/incidentVersion 为冻结时指挥人、状态与版本；
+     * openTasks 为全部 OPEN 任务（按任务键排序）；
+     * escalationVersion 为未确认（OPEN）升级的版本，无未确认升级时为 null。
+     */
+    public record HandoverIncidentSummaryView(String incidentKey, String commander, String status,
+                                              long incidentVersion,
+                                              List<HandoverOpenTaskView> openTasks,
+                                              Long escalationVersion) {
+    }
+
+    /**
+     * 联合交接完整冻结摘要：incidents 按事件键排序，接收人接受时须原样提交。
+     */
+    public record HandoverSummaryView(List<HandoverIncidentSummaryView> incidents) {
+    }
+
+    /**
+     * 联合交接视图：submittedIncidentKeys 保留发起提交集合（去重后按提交顺序）；
+     * closureIncidentKeys 为依赖闭包（按事件键排序，不可变）；
+     * missingIncidentKeys 仅在提交集合遗漏闭包事件时返回（422 响应体携带），正常为 null；
+     * summary 为冻结完整摘要；acceptedAt 仅 ACCEPTED 有值。
+     */
+    public record HandoverView(String handoverKey, String fromCommander, String toCommander,
+                               String status, String handoverVersion,
+                               List<String> submittedIncidentKeys, List<String> closureIncidentKeys,
+                               List<String> missingIncidentKeys, HandoverSummaryView summary,
+                               Instant acceptedAt, Instant createdAt) {
+    }
+
+    /**
+     * 闭包事件行视图：inSubmitted 表示是否由发起方提交（false 为闭包自动补全）；
+     * seqNo 为按事件键排序后的闭包序号。
+     */
+    public record HandoverClosureIncidentView(String incidentKey, boolean inSubmitted, int seqNo) {
+    }
+
+    /**
+     * 接受时保存的不可变慢照视图（每事件一行），字段含义与 {@link HandoverIncidentSummaryView}
+     * 一致，但取自切换指挥权的同一事务，保证快照与切换时状态一致。
+     */
+    public record HandoverSnapshotView(String incidentKey, String commander, String incidentStatus,
+                                       long incidentVersion, List<HandoverOpenTaskView> openTasks,
+                                       Long escalationVersion) {
+    }
+
+    /**
+     * 联合交接闭包详情：交接单视图 + 闭包事件行 + 不可变闭包快照（PENDING 时为空列表）。
+     */
+    public record HandoverDetailView(HandoverView handover,
+                                     List<HandoverClosureIncidentView> closureIncidents,
+                                     List<HandoverSnapshotView> snapshots) {
+    }
+
+    /** 联合交接历史项：交接单视图 + 闭包事件行。 */
+    public record HandoverHistoryItemView(HandoverView handover,
+                                          List<HandoverClosureIncidentView> closureIncidents) {
+    }
+
+    /** 联合交接历史视图：按发起顺序倒序。 */
+    public record HandoverHistoryView(String commander, List<HandoverHistoryItemView> handovers) {
+    }
 }
