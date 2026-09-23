@@ -44,4 +44,9 @@ public class ApiException extends RuntimeException {
     public static ApiException unprocessable(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "NO_MATCHING_CERTIFICATE", message);
     }
+
+    /** 422：血缘非法（成环、子级窗口超出父级窗口等）。 */
+    public static ApiException unprocessableLineage(String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "LINEAGE_INVALID", message);
+    }
 }

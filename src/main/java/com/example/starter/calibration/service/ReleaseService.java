@@ -18,11 +18,13 @@ import com.example.starter.calibration.model.Certificate;
 import com.example.starter.calibration.model.Measurement;
 import com.example.starter.calibration.model.MeasurementStatus;
 import com.example.starter.calibration.repo.CertificateRepository;
+import com.example.starter.calibration.repo.DomainStateRepository;
 import com.example.starter.calibration.repo.MeasurementRepository;
 import com.example.starter.calibration.repo.ReleaseRepository;
 
 /**
  * 批量放行服务：每批 1～50 条，整批原子生效；任一项不满足条件则整批拒绝（409）并返回各项原因。
+ * 放行在领域版本行锁内串行化，失效激活先提交时受影响记录已非 PENDING，整批拒绝。
  */
 @Service
 public class ReleaseService {
@@ -33,13 +35,16 @@ public class ReleaseService {
     private final MeasurementRepository measurements;
     private final CertificateRepository certificates;
     private final ReleaseRepository releases;
+    private final DomainStateRepository domainState;
 
     public ReleaseService(MeasurementRepository measurements,
                           CertificateRepository certificates,
-                          ReleaseRepository releases) {
+                          ReleaseRepository releases,
+                          DomainStateRepository domainState) {
         this.measurements = measurements;
         this.certificates = certificates;
         this.releases = releases;
+        this.domainState = domainState;
     }
 
     /**
@@ -57,6 +62,9 @@ public class ReleaseService {
         if (distinct.size() != orderedKeys.size()) {
             throw ApiException.badRequest("批量放行包含重复测量键");
         }
+
+        // 领域版本行锁：与失效激活、血缘新增、测量提交按提交顺序串行化。
+        domainState.currentVersionForUpdate();
 
         List<ItemFailure> failures = new ArrayList<>();
         List<Measurement> approved = new ArrayList<>();
@@ -102,6 +110,7 @@ public class ReleaseService {
             measurements.markReleased(measurement.id());
             releases.insert(batchId, measurement.id(), releaser, releasedAt);
         }
+        domainState.increment();
         return new ReleaseResponse(batchId, releaser, releasedAt, orderedKeys);
     }
 }

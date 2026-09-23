@@ -54,11 +54,13 @@ final class DtoMapper {
                 format(m.upperLimit()),
                 m.submittedBy(),
                 m.certificateId(),
+                m.standardVersionId(),
                 format(m.computedValue()),
                 m.displayValue().toPlainString(),
                 m.passed(),
                 m.status().name(),
                 usable,
+                m.impactVersion(),
                 m.createdAt(),
                 releases.stream().map(DtoMapper::toResponse).toList());
     }
