@@ -48,8 +48,9 @@ public class TranslationService {
             throw ApiException.unprocessable("初始段落 segmentId 重复");
         }
         long documentId = repository.insertDocument(languages);
+        int position = 1;
         for (ApiDtos.SegmentInput segment : segments) {
-            repository.insertSegment(documentId, segment.segmentId(), segment.sourceText());
+            repository.insertSegment(documentId, segment.segmentId(), segment.sourceText(), position++);
         }
         return new ApiDtos.DocumentResponse(documentId, 1, 0, languages);
     }
@@ -58,10 +59,12 @@ public class TranslationService {
     @Transactional
     public ApiDtos.SegmentResponse addSegment(long documentId, ApiDtos.AddSegmentRequest request) {
         DocumentRow document = lockDocument(documentId);
-        if (repository.findSegment(documentId, request.segmentId()).isPresent()) {
+        if (repository.findSegment(documentId, request.segmentId()).isPresent()
+                || repository.findAnySegment(documentId, request.segmentId()).isPresent()) {
             throw ApiException.conflict("段落已存在: " + request.segmentId());
         }
-        repository.insertSegment(documentId, request.segmentId(), request.sourceText());
+        repository.insertSegment(documentId, request.segmentId(), request.sourceText(),
+                repository.maxPosition(documentId) + 1);
         int draftVersion = bumpDraftVersion(document);
         return new ApiDtos.SegmentResponse(documentId, request.segmentId(), 1, draftVersion);
     }
@@ -188,7 +191,7 @@ public class TranslationService {
                     + "、发布版本 " + document.publishedVersion() + "，与期望的 "
                     + request.expectedDraftVersion() + "/" + request.expectedPublishedVersion() + " 不一致");
         }
-        List<SegmentRow> segments = repository.listSegments(documentId);
+        List<SegmentRow> segments = repository.listCurrentSegments(documentId);
         Map<String, TranslationRow> translations = repository.listTranslations(documentId).stream()
                 .collect(Collectors.toMap(t -> key(t.segmentId(), t.language()), Function.identity()));
         Map<String, ApprovalRow> approvals = repository.listApprovals(documentId).stream()
@@ -275,14 +278,17 @@ public class TranslationService {
     public ApiDtos.TermStatusResponse getTermStatus(long documentId) {
         DocumentRow document = repository.findDocument(documentId)
                 .orElseThrow(() -> ApiException.notFound("文档不存在: " + documentId));
-        Map<String, SegmentRow> segments = repository.listSegments(documentId).stream()
+        Map<String, SegmentRow> segments = repository.listCurrentSegments(documentId).stream()
                 .collect(Collectors.toMap(SegmentRow::segmentId, Function.identity()));
         List<TermRuleRow> termRules = repository.listTermRules(documentId, document.termVersion());
         List<ApiDtos.TranslationTermStatus> statuses = new ArrayList<>();
         for (TranslationRow translation : repository.listTranslations(documentId)) {
+            // 仅当前结构中的段参与术语状态；SUPERSEDED 段的旧译文仅用于血缘与参考候选
             SegmentRow segment = segments.get(translation.segmentId());
-            List<ApiDtos.TermRuleView> violations = segment == null ? List.of()
-                    : findViolations(segment.sourceText(), translation.language(),
+            if (segment == null) {
+                continue;
+            }
+            List<ApiDtos.TermRuleView> violations = findViolations(segment.sourceText(), translation.language(),
                             translation.content(), termRules);
             statuses.add(new ApiDtos.TranslationTermStatus(translation.segmentId(), translation.language(),
                     translation.translationVersion(), translation.termVersion(),

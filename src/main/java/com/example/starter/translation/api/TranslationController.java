@@ -1,5 +1,6 @@
 package com.example.starter.translation.api;
 
+import com.example.starter.translation.service.StructureRevisionService;
 import com.example.starter.translation.service.TranslationService;
 import com.example.starter.translation.service.WriteExecutor;
 import com.example.starter.translation.service.WriteResult;
@@ -16,6 +17,7 @@ import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.List;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -30,12 +32,15 @@ import java.util.HexFormat;
 public class TranslationController {
 
     private final TranslationService translationService;
+    private final StructureRevisionService structureRevisionService;
     private final WriteExecutor writeExecutor;
     private final ObjectMapper objectMapper;
 
-    public TranslationController(TranslationService translationService, WriteExecutor writeExecutor,
-                                 ObjectMapper objectMapper) {
+    public TranslationController(TranslationService translationService,
+                                 StructureRevisionService structureRevisionService,
+                                 WriteExecutor writeExecutor, ObjectMapper objectMapper) {
         this.translationService = translationService;
+        this.structureRevisionService = structureRevisionService;
         this.writeExecutor = writeExecutor;
         this.objectMapper = objectMapper;
     }
@@ -108,6 +113,43 @@ public class TranslationController {
         String operation = "PUT /api/documents/" + documentId + "/terms";
         return writeExecutor.execute(request.requestId(), hash(operation, request),
                 () -> WriteResult.of(201, translationService.updateTerms(documentId, request))).toResponseEntity();
+    }
+
+    /** 结构修订：一次把一个当前段拆为 2~5 段或把 2~5 个连续当前段合为一段，原子生成新文档版本与跨语言血缘。 */
+    @PostMapping("/{documentId}/structure-changes")
+    public ResponseEntity<String> reviseStructure(@PathVariable long documentId,
+                                                 @Valid @RequestBody ApiDtos.StructureRevisionRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/structure-changes";
+        return writeExecutor.execute(request.requestId(), hash(operation, request),
+                () -> WriteResult.of(201, structureRevisionService.revise(documentId, request)))
+                .toResponseEntity();
+    }
+
+    /** 查询当前结构（版本与按序当前段），只读。 */
+    @GetMapping("/{documentId}/structure")
+    public ResponseEntity<ApiDtos.StructureView> getStructure(@PathVariable long documentId) {
+        return ResponseEntity.ok(structureRevisionService.getStructure(documentId));
+    }
+
+    /** 查询文档的全部结构修订摘要，只读。 */
+    @GetMapping("/{documentId}/structure-changes")
+    public ResponseEntity<List<ApiDtos.StructureChangeSummaryView>> listStructureChanges(
+            @PathVariable long documentId) {
+        return ResponseEntity.ok(structureRevisionService.listChanges(documentId));
+    }
+
+    /** 查询单次结构修订详情（源段血缘、跨语言译文片段血缘与参考候选），只读。 */
+    @GetMapping("/{documentId}/structure-changes/{changeKey}")
+    public ResponseEntity<ApiDtos.StructureChangeView> getStructureChange(@PathVariable long documentId,
+                                                                          @PathVariable String changeKey) {
+        return ResponseEntity.ok(structureRevisionService.getChange(documentId, changeKey));
+    }
+
+    /** 查询单段跨语言血缘：旧段 FORWARD、新段 BACKWARD、未参与修订的段 NONE，只读。 */
+    @GetMapping("/{documentId}/segments/{segmentId}/lineage")
+    public ResponseEntity<ApiDtos.SegmentLineageView> getSegmentLineage(@PathVariable long documentId,
+                                                                        @PathVariable String segmentId) {
+        return ResponseEntity.ok(structureRevisionService.getSegmentLineage(documentId, segmentId));
     }
 
     /** 查询当前术语版本及完整规则集。 */

@@ -37,6 +37,10 @@ public abstract class AbstractIntegrationTest {
     void cleanTables() {
         jdbc.update("DELETE FROM approval");
         jdbc.update("DELETE FROM translation");
+        jdbc.update("DELETE FROM translation_reference");
+        jdbc.update("DELETE FROM translation_lineage");
+        jdbc.update("DELETE FROM segment_lineage");
+        jdbc.update("DELETE FROM structure_change");
         jdbc.update("DELETE FROM segment");
         jdbc.update("DELETE FROM release_snapshot");
         jdbc.update("DELETE FROM term_rule");
@@ -128,6 +132,11 @@ public abstract class AbstractIntegrationTest {
         String body = "{\"requestId\":\"" + requestId + "\",\"expectedTermVersion\":" + expectedTermVersion
                 + ",\"rules\":" + rulesJson + "}";
         return putJson("/api/documents/" + documentId + "/terms", body);
+    }
+
+    /** 提交结构修订：body 为完整请求体 JSON。 */
+    protected ApiResult structureChange(long documentId, String body) throws Exception {
+        return postJson("/api/documents/" + documentId + "/structure-changes", body);
     }
 
     /** HTTP 响应结果：状态码与 JSON 响应体。 */
