@@ -71,16 +71,18 @@ public class IncidentService {
     private final IncidentRepository incidents;
     private final EscalationRepository escalations;
     private final IncidentTaskRepository tasks;
+    private final DependencyEdgeRepository dependencyEdges;
     private final CommandKeyRepository commandKeys;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public IncidentService(IncidentRepository incidents, EscalationRepository escalations,
-                           IncidentTaskRepository tasks, CommandKeyRepository commandKeys,
-                           ObjectMapper objectMapper, Clock clock) {
+                           IncidentTaskRepository tasks, DependencyEdgeRepository dependencyEdges,
+                           CommandKeyRepository commandKeys, ObjectMapper objectMapper, Clock clock) {
         this.incidents = incidents;
         this.escalations = escalations;
         this.tasks = tasks;
+        this.dependencyEdges = dependencyEdges;
         this.commandKeys = commandKeys;
         this.objectMapper = objectMapper;
         this.clock = clock;
@@ -444,18 +446,30 @@ public class IncidentService {
                     }
                     // 全局图锁：串行化环检测与边写入，并发反向依赖下最终图无环
                     tasks.lockGraph();
+                    Instant now = now();
+                    dependencyEdges.ensureMeta(now);
+                    long graphVersionBefore = dependencyEdges.lockMetaForVersion();
+                    boolean graphChanged = false;
                     for (Incident blocker : blockers) {
-                        if (tasks.isReachable(blocker.id(), incident.id())) {
+                        if (dependencyEdges.isReachable(blocker.id(), incident.id())) {
                             throw ApiException.conflict("阻塞关系会形成环: "
                                     + blocker.incidentKey() + " 已直接或间接依赖 " + incidentKey);
                         }
                     }
-                    Instant now = now();
                     long taskId = tasks.insert(new IncidentTask(0L, incident.id(), taskKey,
                             groupCode, title, TaskStatus.OPEN, actor, null, null, null, null,
                             now, now));
                     for (Incident blocker : blockers) {
                         tasks.insertBlocker(taskId, blocker.id(), now);
+                        // 权威边表承载全图（任务边 + 提案边）；重复声明同一条边不重复建行
+                        if (dependencyEdges.insertEdgeIfAbsent(incident.id(), blocker.id(),
+                                "TASK", taskId, now)) {
+                            graphChanged = true;
+                        }
+                    }
+                    // 任务新增边同样属于图变更：推进版本，使持有旧 expectedGraphVersion 的提案失配
+                    if (graphChanged) {
+                        dependencyEdges.bumpVersion(graphVersionBefore + 1, now);
                     }
                     return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
                 });

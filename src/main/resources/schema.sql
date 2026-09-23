@@ -98,5 +98,58 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 ) COMMENT='处置任务跨事件阻塞关系表（有向图边：所属任务事件 → 阻塞事件）';
 
 CREATE TABLE IF NOT EXISTS task_graph_lock (
-    id TINYINT PRIMARY KEY COMMENT '固定为 1 的单行锁；创建任务时 SELECT ... FOR UPDATE 持有，串行化环检测与写入，保证并发反向依赖最终图无环'
-) COMMENT='任务依赖图全局锁表';
+    id TINYINT PRIMARY KEY COMMENT '固定为 1 的单行锁；创建任务或激活提案时 SELECT ... FOR UPDATE 持有，串行化整张依赖图的环检测与写入，保证并发图变更最终图无环'
+) COMMENT='依赖图全局锁表';
+
+CREATE TABLE IF NOT EXISTS dependency_graph_meta (
+    id TINYINT PRIMARY KEY COMMENT '固定为 1 的图版本元数据单行',
+    graph_version BIGINT NOT NULL COMMENT '当前依赖图版本号，从 1 开始；每成功激活一个提案原子 +1，失败不改版本',
+    updated_at TIMESTAMP(6) NOT NULL COMMENT '最近版本推进 UTC 时间'
+) COMMENT='依赖图版本元数据表';
+
+CREATE TABLE IF NOT EXISTS incident_dependency_edges (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    from_incident_id BIGINT NOT NULL COMMENT '发起方事件 id：该事件下的处置任务依赖阻塞事件',
+    to_incident_id BIGINT NOT NULL COMMENT '被依赖（阻塞）事件 id，关联 incidents.id',
+    source VARCHAR(16) NOT NULL COMMENT '边来源：TASK 处置任务创建（ref_id=任务 id）/ PROPOSAL 提案激活（ref_id=提案 id）',
+    ref_id BIGINT NULL COMMENT '来源记录 id：TASK 时为 incident_tasks.id，PROPOSAL 时为 dependency_change_proposals.id',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
+    CONSTRAINT uk_dep_edge UNIQUE (from_incident_id, to_incident_id)
+) COMMENT='跨事件依赖图权威有向边表（from 事件任务依赖 to 事件）';
+
+CREATE TABLE IF NOT EXISTS dependency_change_proposals (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    proposal_key VARCHAR(128) NOT NULL COMMENT '提案业务键，全局唯一',
+    expected_graph_version BIGINT NOT NULL COMMENT '创建时声明的基线图版本；激活时须仍与当前版本一致，否则 409 不改图',
+    business_note VARCHAR(1024) NOT NULL COMMENT '业务说明，非空',
+    safety_reviewer VARCHAR(128) NOT NULL COMMENT '创建时指定的一名安全审核员标识（X-Actor-Id），冻结为名册席位',
+    created_by VARCHAR(128) NOT NULL COMMENT '提案创建人标识',
+    changes_json MEDIUMTEXT NOT NULL COMMENT '规范化（结构化去重、按 op/from/to 稳定排序、换序等价）后的 1~50 条增删边集合 JSON',
+    status VARCHAR(16) NOT NULL COMMENT '状态：PENDING 投票中 / ACTIVATED 已原子生效 / REJECTED 已否决；任一反对即 REJECTED',
+    activated_graph_version BIGINT NULL COMMENT '激活成功后生成的唯一新图版本号；PENDING/REJECTED 为空',
+    before_edges_json MEDIUMTEXT NULL COMMENT '激活前全量边集快照 JSON（稳定排序）；仅 ACTIVATED 有值',
+    after_edges_json MEDIUMTEXT NULL COMMENT '激活后全量边集快照 JSON（稳定排序）；仅 ACTIVATED 有值',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
+    activated_at TIMESTAMP(6) NULL COMMENT '激活 UTC 时间；仅 ACTIVATED 有值，否则为空',
+    CONSTRAINT uk_proposal_key UNIQUE (proposal_key),
+    CONSTRAINT uk_activated_graph_version UNIQUE (activated_graph_version)
+) COMMENT='依赖图变更提案表';
+
+CREATE TABLE IF NOT EXISTS proposal_roster_entries (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    proposal_id BIGINT NOT NULL COMMENT '所属提案 id，关联 dependency_change_proposals.id',
+    incident_id BIGINT NULL COMMENT 'COMMANDER 席位绑定的受影响事件 id；SAFETY_REVIEWER 席位为空',
+    person_id VARCHAR(128) NOT NULL COMMENT '被冻结人员标识（创建时现任指挥官或安全审核员）；同一人员可占多行席位',
+    role VARCHAR(16) NOT NULL COMMENT '席位角色：COMMANDER 受影响事件指挥官 / SAFETY_REVIEWER 安全审核员',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '名册冻结 UTC 时间'
+) COMMENT='提案不可变投票名册表（后续指挥交接不改写）';
+
+CREATE TABLE IF NOT EXISTS proposal_votes (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    proposal_id BIGINT NOT NULL COMMENT '所属提案 id',
+    person_id VARCHAR(128) NOT NULL COMMENT '投票人员标识；(proposal_id, person_id) 唯一，兼任多席位仍只计一票但覆盖其全部席位',
+    choice VARCHAR(8) NOT NULL COMMENT '票决：YES 赞成 / NO 反对；只能首次投出，不可更改',
+    voted_at TIMESTAMP(6) NOT NULL COMMENT '投票 UTC 时间',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '落库 UTC 时间',
+    CONSTRAINT uk_proposal_vote UNIQUE (proposal_id, person_id)
+) COMMENT='提案按人员票决表';

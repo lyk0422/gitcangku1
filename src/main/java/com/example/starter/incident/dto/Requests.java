@@ -55,4 +55,25 @@ public final class Requests {
     /** 任务完成/取消请求，操作人由 X-Actor-Id 指定且须为当前指挥人。 */
     public record TaskActionRequest(String commandKey) {
     }
+
+    /**
+     * 单条依赖图边变更：op 为 ADD/DELETE；fromIncidentKey 事件的任务依赖
+     * toIncidentKey 事件（阻塞关系）。请求中换序、重复由服务端结构化规范化。
+     */
+    public record EdgeChangeRequest(String op, String fromIncidentKey, String toIncidentKey) {
+    }
+
+    /**
+     * 依赖图变更提案创建请求：proposalKey 全局唯一；requestId 为调用方幂等键；
+     * expectedGraphVersion 必须匹配当前图版本；changes 1~50 条结构化去重；
+     * safetyReviewer 为一名安全审核员；businessNote 为业务说明。
+     */
+    public record ProposalCreateRequest(String requestId, String proposalKey,
+                                        long expectedGraphVersion, String businessNote,
+                                        String safetyReviewer, List<EdgeChangeRequest> changes) {
+    }
+
+    /** 提案投票请求：requestId 幂等；choice 仅 YES/NO，只能投首次。 */
+    public record ProposalVoteRequest(String requestId, String choice) {
+    }
 }

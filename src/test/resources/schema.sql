@@ -99,3 +99,56 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
 );
+
+CREATE TABLE IF NOT EXISTS dependency_graph_meta (
+    id TINYINT PRIMARY KEY,
+    graph_version BIGINT NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS incident_dependency_edges (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    from_incident_id BIGINT NOT NULL,
+    to_incident_id BIGINT NOT NULL,
+    source VARCHAR(16) NOT NULL,
+    ref_id BIGINT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_dep_edge UNIQUE (from_incident_id, to_incident_id)
+);
+
+CREATE TABLE IF NOT EXISTS dependency_change_proposals (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    proposal_key VARCHAR(128) NOT NULL,
+    expected_graph_version BIGINT NOT NULL,
+    business_note VARCHAR(1024) NOT NULL,
+    safety_reviewer VARCHAR(128) NOT NULL,
+    created_by VARCHAR(128) NOT NULL,
+    changes_json CLOB NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    activated_graph_version BIGINT NULL,
+    before_edges_json CLOB NULL,
+    after_edges_json CLOB NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    activated_at TIMESTAMP(6) NULL,
+    CONSTRAINT uk_proposal_key UNIQUE (proposal_key),
+    CONSTRAINT uk_activated_graph_version UNIQUE (activated_graph_version)
+);
+
+CREATE TABLE IF NOT EXISTS proposal_roster_entries (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    proposal_id BIGINT NOT NULL,
+    incident_id BIGINT NULL,
+    person_id VARCHAR(128) NOT NULL,
+    role VARCHAR(16) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS proposal_votes (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    proposal_id BIGINT NOT NULL,
+    person_id VARCHAR(128) NOT NULL,
+    choice VARCHAR(8) NOT NULL,
+    voted_at TIMESTAMP(6) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_proposal_vote UNIQUE (proposal_id, person_id)
+);

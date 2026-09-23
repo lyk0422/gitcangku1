@@ -78,4 +78,41 @@ public final class Responses {
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
     }
+
+    /** 依赖边视图：fromIncidentKey 的任务依赖 toIncidentKey；source 为 TASK/PROPOSAL。 */
+    public record DependencyEdgeView(String fromIncidentKey, String toIncidentKey,
+                                     String source, Long refId) {
+    }
+
+    /** 提案中的结构化边变更视图：op 为 ADD/DELETE，列表稳定排序、换序等价。 */
+    public record EdgeChangeView(String op, String fromIncidentKey, String toIncidentKey) {
+    }
+
+    /** 名册席位视图：role 为 COMMANDER/SAFETY_REVIEWER；COMMANDER 席位带 incidentKey。 */
+    public record RosterEntryView(String personId, String role, String incidentKey) {
+    }
+
+    /** 票决视图：按人员一票。 */
+    public record VoteView(String personId, String choice, Instant votedAt) {
+    }
+
+    /**
+     * 提案视图：含状态、期望/激活图版本、规范化变更、冻结名册与已投票决（稳定排序）。
+     * beforeEdges/afterEdges 仅 ACTIVATED 有值（前后边集快照）。
+     */
+    public record ProposalView(String proposalKey, long expectedGraphVersion,
+                               String status, String businessNote, String safetyReviewer,
+                               String createdBy, Instant createdAt, Instant activatedAt,
+                               Long activatedGraphVersion,
+                               List<EdgeChangeView> changes,
+                               List<RosterEntryView> roster,
+                               List<VoteView> votes,
+                               List<DependencyEdgeView> beforeEdges,
+                               List<DependencyEdgeView> afterEdges) {
+    }
+
+    /** 图版本证据视图：当前版本号、当前全量边（稳定排序）及在该版本生效的提案键（无则 null）。 */
+    public record GraphEvidenceView(long graphVersion, List<DependencyEdgeView> edges,
+                                    String activatedProposalKey) {
+    }
 }

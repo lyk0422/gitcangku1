@@ -72,6 +72,20 @@ public class IncidentRepository {
     }
 
     /**
+     * 按一批事件 id 查询，返回 id → 事件的映射（用于名册席位还原事件业务键）。
+     * 传入空列表时直接返回空映射，不触发 IN () 语法问题。
+     */
+    public java.util.Map<Long, Incident> findByIds(List<Long> ids) {
+        if (ids == null || ids.isEmpty()) {
+            return java.util.Map.of();
+        }
+        String placeholders = String.join(",", ids.stream().map(i -> "?").toList());
+        return jdbc.query("SELECT * FROM incidents WHERE id IN (" + placeholders + ")",
+                INCIDENT_MAPPER, ids.toArray()).stream()
+                .collect(java.util.stream.Collectors.toMap(Incident::id, i -> i));
+    }
+
+    /**
      * 插入新事件，初始状态 REPORTED、无指挥人、无遏制期限，返回生成主键。
      */
     public long insert(Incident incident) {

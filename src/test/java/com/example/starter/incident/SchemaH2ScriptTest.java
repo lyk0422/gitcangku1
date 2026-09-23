@@ -108,6 +108,86 @@ class SchemaH2ScriptTest {
                     duplicateBlockerRejected = true;
                 }
                 assertThat(duplicateBlockerRejected).isTrue();
+
+                // 图版本元数据：单行 id=1，重复插入被主键拒绝
+                st.execute("INSERT INTO dependency_graph_meta (id, graph_version, updated_at)"
+                        + " VALUES (1,1,'" + Timestamp.from(now) + "')");
+                boolean duplicateMetaRejected = false;
+                try {
+                    st.execute("INSERT INTO dependency_graph_meta (id, graph_version, updated_at)"
+                            + " VALUES (1,2,'" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateMetaRejected = true;
+                }
+                assertThat(duplicateMetaRejected).isTrue();
+
+                // 权威依赖边：(from_incident_id, to_incident_id) 结构化唯一
+                st.execute("INSERT INTO incident_dependency_edges (from_incident_id, to_incident_id,"
+                        + " source, ref_id, created_at) VALUES (1,1,'PROPOSAL',NULL,'"
+                        + Timestamp.from(now) + "')");
+                boolean duplicateEdgeRejected = false;
+                try {
+                    st.execute("INSERT INTO incident_dependency_edges (from_incident_id, to_incident_id,"
+                            + " source, ref_id, created_at) VALUES (1,1,'TASK',1,'"
+                            + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateEdgeRejected = true;
+                }
+                assertThat(duplicateEdgeRejected).isTrue();
+
+                // 提案：proposal_key 唯一；activated_graph_version 唯一（多个 NULL 允许）
+                st.execute("INSERT INTO dependency_change_proposals (proposal_key, expected_graph_version,"
+                        + " business_note, safety_reviewer, created_by, changes_json, status,"
+                        + " created_at) VALUES ('P-1',1,'n','sec','alice','[]','PENDING','"
+                        + Timestamp.from(now) + "')");
+                st.execute("INSERT INTO dependency_change_proposals (proposal_key, expected_graph_version,"
+                        + " business_note, safety_reviewer, created_by, changes_json, status,"
+                        + " created_at) VALUES ('P-2',1,'n','sec','alice','[]','PENDING','"
+                        + Timestamp.from(now) + "')");
+                boolean duplicateProposalRejected = false;
+                try {
+                    st.execute("INSERT INTO dependency_change_proposals (proposal_key,"
+                            + " expected_graph_version, business_note, safety_reviewer, created_by,"
+                            + " changes_json, status, created_at) VALUES ('P-1',1,'n','sec','alice',"
+                            + "'[]','PENDING','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateProposalRejected = true;
+                }
+                assertThat(duplicateProposalRejected).isTrue();
+                // 激活版本号唯一：同一版本不能被两个提案占用
+                int firstActivated = st.executeUpdate("UPDATE dependency_change_proposals"
+                        + " SET status='ACTIVATED', activated_graph_version=2 WHERE id=1");
+                assertThat(firstActivated).isEqualTo(1);
+                boolean duplicateVersionRejected = false;
+                try {
+                    st.executeUpdate("UPDATE dependency_change_proposals"
+                            + " SET status='ACTIVATED', activated_graph_version=2 WHERE id=2");
+                } catch (Exception e) {
+                    duplicateVersionRejected = true;
+                }
+                assertThat(duplicateVersionRejected).isTrue();
+
+                // 名册可冻结同一人员的多个席位（不冲突）
+                st.execute("INSERT INTO proposal_roster_entries (proposal_id, incident_id, person_id,"
+                        + " role, created_at) VALUES (1,1,'alice','COMMANDER','"
+                        + Timestamp.from(now) + "')");
+                st.execute("INSERT INTO proposal_roster_entries (proposal_id, incident_id, person_id,"
+                        + " role, created_at) VALUES (1,NULL,'alice','SAFETY_REVIEWER','"
+                        + Timestamp.from(now) + "')");
+
+                // 票决：(proposal_id, person_id) 唯一，兼任多席位也只允许一票
+                st.execute("INSERT INTO proposal_votes (proposal_id, person_id, choice, voted_at,"
+                        + " created_at) VALUES (1,'alice','YES','" + Timestamp.from(now) + "','"
+                        + Timestamp.from(now) + "')");
+                boolean duplicateVoteRejected = false;
+                try {
+                    st.execute("INSERT INTO proposal_votes (proposal_id, person_id, choice, voted_at,"
+                            + " created_at) VALUES (1,'alice','NO','" + Timestamp.from(now) + "','"
+                            + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateVoteRejected = true;
+                }
+                assertThat(duplicateVoteRejected).isTrue();
             }
         }
     }

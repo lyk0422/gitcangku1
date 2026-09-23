@@ -42,6 +42,11 @@ class IncidentConcurrencyTest {
     @BeforeEach
     void clean() {
         jdbc.update("DELETE FROM command_keys");
+        jdbc.update("DELETE FROM proposal_votes");
+        jdbc.update("DELETE FROM proposal_roster_entries");
+        jdbc.update("DELETE FROM dependency_change_proposals");
+        jdbc.update("DELETE FROM incident_dependency_edges");
+        jdbc.update("UPDATE dependency_graph_meta SET graph_version = 1");
         jdbc.update("DELETE FROM incident_status_history");
         jdbc.update("DELETE FROM incident_transfers");
         jdbc.update("DELETE FROM incident_actions");
