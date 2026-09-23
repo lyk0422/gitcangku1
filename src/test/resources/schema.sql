@@ -99,3 +99,65 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
 );
+
+CREATE TABLE IF NOT EXISTS plans (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    plan_key VARCHAR(128) NOT NULL,
+    active_version_id BIGINT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_plans_key UNIQUE (plan_key)
+);
+
+CREATE TABLE IF NOT EXISTS plan_versions (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    plan_id BIGINT NOT NULL,
+    version_no INT NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    base_version_id BIGINT NULL,
+    expected_version INT NOT NULL,
+    created_by VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_plan_version UNIQUE (plan_id, version_no)
+);
+
+CREATE TABLE IF NOT EXISTS plan_tasks (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    version_id BIGINT NOT NULL,
+    task_id VARCHAR(128) NOT NULL,
+    incident_key VARCHAR(128) NOT NULL,
+    group_code VARCHAR(64) NOT NULL,
+    title VARCHAR(512) NOT NULL,
+    assignee VARCHAR(128) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    completed_by VARCHAR(128) NULL,
+    completed_at TIMESTAMP(6) NULL,
+    CONSTRAINT uk_plan_task UNIQUE (version_id, task_id)
+);
+
+CREATE TABLE IF NOT EXISTS plan_edges (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    version_id BIGINT NOT NULL,
+    from_task_id VARCHAR(128) NOT NULL,
+    to_task_id VARCHAR(128) NOT NULL,
+    CONSTRAINT uk_plan_edge UNIQUE (version_id, from_task_id, to_task_id)
+);
+
+CREATE TABLE IF NOT EXISTS plan_merges (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    plan_id BIGINT NOT NULL,
+    merge_key VARCHAR(128) NOT NULL,
+    request_id VARCHAR(128) NOT NULL,
+    request_hash VARCHAR(64) NOT NULL,
+    base_version_id BIGINT NOT NULL,
+    left_version_id BIGINT NOT NULL,
+    right_version_id BIGINT NOT NULL,
+    left_expected INT NOT NULL,
+    right_expected INT NOT NULL,
+    result_version_id BIGINT NOT NULL,
+    diff_json CLOB NOT NULL,
+    resolutions_json CLOB NOT NULL,
+    created_by VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_merge_key UNIQUE (merge_key),
+    CONSTRAINT uk_merge_request UNIQUE (request_id)
+);

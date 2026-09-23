@@ -108,6 +108,85 @@ class SchemaH2ScriptTest {
                     duplicateBlockerRejected = true;
                 }
                 assertThat(duplicateBlockerRejected).isTrue();
+
+                // 方案：plan_key 唯一
+                st.execute("INSERT INTO plans (plan_key, active_version_id, created_at) VALUES"
+                        + " ('PLAN-1',NULL,'" + Timestamp.from(now) + "')");
+                boolean duplicatePlanRejected = false;
+                try {
+                    st.execute("INSERT INTO plans (plan_key, active_version_id, created_at)"
+                            + " VALUES ('PLAN-1',NULL,'" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicatePlanRejected = true;
+                }
+                assertThat(duplicatePlanRejected).isTrue();
+
+                // 方案版本：(plan_id, version_no) 唯一
+                st.execute("INSERT INTO plan_versions (plan_id, version_no, status,"
+                        + " base_version_id, expected_version, created_by, created_at) VALUES"
+                        + " (1,1,'PUBLISHED',NULL,1,'alice','" + Timestamp.from(now) + "')");
+                boolean duplicateVersionRejected = false;
+                try {
+                    st.execute("INSERT INTO plan_versions (plan_id, version_no, status,"
+                            + " base_version_id, expected_version, created_by, created_at) VALUES"
+                            + " (1,1,'DRAFT',NULL,1,'alice','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateVersionRejected = true;
+                }
+                assertThat(duplicateVersionRejected).isTrue();
+
+                // 方案任务：(version_id, task_id) 唯一；依赖边：(version_id, from, to) 唯一
+                st.execute("INSERT INTO plan_tasks (version_id, task_id, incident_key, group_code,"
+                        + " title, assignee, status, completed_by, completed_at) VALUES"
+                        + " (1,'T-1','INC-1','G','t','alice','PENDING',NULL,NULL)");
+                boolean duplicatePlanTaskRejected = false;
+                try {
+                    st.execute("INSERT INTO plan_tasks (version_id, task_id, incident_key,"
+                            + " group_code, title, assignee, status, completed_by, completed_at)"
+                            + " VALUES (1,'T-1','INC-1','G','t2','alice','PENDING',NULL,NULL)");
+                } catch (Exception e) {
+                    duplicatePlanTaskRejected = true;
+                }
+                assertThat(duplicatePlanTaskRejected).isTrue();
+                st.execute("INSERT INTO plan_edges (version_id, from_task_id, to_task_id)"
+                        + " VALUES (1,'T-1','T-2')");
+                boolean duplicatePlanEdgeRejected = false;
+                try {
+                    st.execute("INSERT INTO plan_edges (version_id, from_task_id, to_task_id)"
+                            + " VALUES (1,'T-1','T-2')");
+                } catch (Exception e) {
+                    duplicatePlanEdgeRejected = true;
+                }
+                assertThat(duplicatePlanEdgeRejected).isTrue();
+
+                // 合并证据：merge_key 与 request_id 全局唯一
+                st.execute("INSERT INTO plan_merges (plan_id, merge_key, request_id, request_hash,"
+                        + " base_version_id, left_version_id, right_version_id, left_expected,"
+                        + " right_expected, result_version_id, diff_json, resolutions_json,"
+                        + " created_by, created_at) VALUES (1,'MG-1','REQ-1','h',1,1,1,1,1,1,"
+                        + " '{}','[]','alice','" + Timestamp.from(now) + "')");
+                boolean duplicateMergeKeyRejected = false;
+                try {
+                    st.execute("INSERT INTO plan_merges (plan_id, merge_key, request_id,"
+                            + " request_hash, base_version_id, left_version_id, right_version_id,"
+                            + " left_expected, right_expected, result_version_id, diff_json,"
+                            + " resolutions_json, created_by, created_at) VALUES (1,'MG-1','REQ-2',"
+                            + " 'h2',1,1,1,1,1,1,'{}','[]','alice','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateMergeKeyRejected = true;
+                }
+                assertThat(duplicateMergeKeyRejected).isTrue();
+                boolean duplicateRequestIdRejected = false;
+                try {
+                    st.execute("INSERT INTO plan_merges (plan_id, merge_key, request_id,"
+                            + " request_hash, base_version_id, left_version_id, right_version_id,"
+                            + " left_expected, right_expected, result_version_id, diff_json,"
+                            + " resolutions_json, created_by, created_at) VALUES (1,'MG-2','REQ-1',"
+                            + " 'h3',1,1,1,1,1,1,'{}','[]','alice','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateRequestIdRejected = true;
+                }
+                assertThat(duplicateRequestIdRejected).isTrue();
             }
         }
     }

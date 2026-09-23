@@ -100,3 +100,65 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY COMMENT '固定为 1 的单行锁；创建任务时 SELECT ... FOR UPDATE 持有，串行化环检测与写入，保证并发反向依赖最终图无环'
 ) COMMENT='任务依赖图全局锁表';
+
+CREATE TABLE IF NOT EXISTS plans (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    plan_key VARCHAR(128) NOT NULL COMMENT '方案业务键，全局唯一',
+    active_version_id BIGINT NULL COMMENT '当前活动 planVersion id，关联 plan_versions.id；仅发布成功的合并/初始版本可成为活动版本',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
+    CONSTRAINT uk_plans_key UNIQUE (plan_key)
+) COMMENT='处置方案主表；写路径先 SELECT ... FOR UPDATE 锁定方案行，串行化合并发布、任务执行与草稿变更';
+
+CREATE TABLE IF NOT EXISTS plan_versions (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    plan_id BIGINT NOT NULL COMMENT '所属方案 id，关联 plans.id',
+    version_no INT NOT NULL COMMENT '方案内单调递增版本号，从 1 开始',
+    status VARCHAR(16) NOT NULL COMMENT '状态：PUBLISHED 已发布 / DRAFT 草稿修订 / MERGED 已被合并的草稿；PUBLISHED 与 MERGED 不可变',
+    base_version_id BIGINT NULL COMMENT '草稿/合并版本的共同祖先版本 id；初始版本为空',
+    expected_version INT NOT NULL COMMENT '草稿乐观锁序号，创建为 1，每次草稿变更加 1；合并提交时须携带并匹配',
+    created_by VARCHAR(128) NOT NULL COMMENT '创建人（X-Actor-Id）',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
+    CONSTRAINT uk_plan_version UNIQUE (plan_id, version_no)
+) COMMENT='方案版本表；PUBLISHED 版本任务集/边集不可变，仅活动版本任务执行状态可前进';
+
+CREATE TABLE IF NOT EXISTS plan_tasks (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    version_id BIGINT NOT NULL COMMENT '所属版本 id，关联 plan_versions.id',
+    task_id VARCHAR(128) NOT NULL COMMENT '稳定任务标识，版本内唯一，跨版本沿用同一 taskId 进行三方比较',
+    incident_key VARCHAR(128) NOT NULL COMMENT '任务所属事件键，关联 incidents.incident_key；跨事件边权限与状态校验依据',
+    group_code VARCHAR(64) NOT NULL COMMENT '分组编码，非空',
+    title VARCHAR(512) NOT NULL COMMENT '任务标题，非空',
+    assignee VARCHAR(128) NOT NULL COMMENT '负责人，非空；正在执行（IN_PROGRESS）任务不可更换',
+    status VARCHAR(16) NOT NULL COMMENT '状态：PENDING 待执行 / IN_PROGRESS 执行中 / COMPLETED 已完成；COMPLETED 状态与完成事实不可回退',
+    completed_by VARCHAR(128) NULL COMMENT '完成人；仅 COMPLETED 有值，否则为空',
+    completed_at TIMESTAMP(6) NULL COMMENT '完成 UTC 时间；仅 COMPLETED 有值，否则为空',
+    CONSTRAINT uk_plan_task UNIQUE (version_id, task_id)
+) COMMENT='方案版本任务快照表';
+
+CREATE TABLE IF NOT EXISTS plan_edges (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    version_id BIGINT NOT NULL COMMENT '所属版本 id，关联 plan_versions.id',
+    from_task_id VARCHAR(128) NOT NULL COMMENT '前置任务 taskId（先决条件方）',
+    to_task_id VARCHAR(128) NOT NULL COMMENT '后继任务 taskId（依赖方）；不得成环、不得引用不存在任务',
+    CONSTRAINT uk_plan_edge UNIQUE (version_id, from_task_id, to_task_id)
+) COMMENT='方案版本任务依赖边表（有向图边：前置任务 → 后继任务）';
+
+CREATE TABLE IF NOT EXISTS plan_merges (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    plan_id BIGINT NOT NULL COMMENT '所属方案 id，关联 plans.id',
+    merge_key VARCHAR(128) NOT NULL COMMENT '合并业务键，全局唯一；异参同键冲突',
+    request_id VARCHAR(128) NOT NULL COMMENT '调用方幂等键，全局唯一；同参重放首次快照，异参 409，失败不占键',
+    request_hash VARCHAR(64) NOT NULL COMMENT '规范化请求参数（冲突解决项按键排序）的 SHA-256 摘要',
+    base_version_id BIGINT NOT NULL COMMENT '共同祖先版本 id',
+    left_version_id BIGINT NOT NULL COMMENT '左侧草稿版本 id',
+    right_version_id BIGINT NOT NULL COMMENT '右侧草稿版本 id',
+    left_expected INT NOT NULL COMMENT '提交时左侧草稿 expectedVersion 快照',
+    right_expected INT NOT NULL COMMENT '提交时右侧草稿 expectedVersion 快照',
+    result_version_id BIGINT NOT NULL COMMENT '合并产生的新 PUBLISHED 版本 id，关联 plan_versions.id',
+    diff_json MEDIUMTEXT NOT NULL COMMENT '冻结的三方差异 JSON（自动采用项与全部显式冲突）',
+    resolutions_json MEDIUMTEXT NOT NULL COMMENT '冻结的全部冲突解决 JSON（LEFT/RIGHT/MANUAL 及手工内容）',
+    created_by VARCHAR(128) NOT NULL COMMENT '合并操作人（X-Actor-Id）',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '合并发布 UTC 时间',
+    CONSTRAINT uk_merge_key UNIQUE (merge_key),
+    CONSTRAINT uk_merge_request UNIQUE (request_id)
+) COMMENT='方案三方合并证据表；仅发布成功时写入，失败事务回滚不占键';
