@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS bag (
     current_location    VARCHAR(64)  NOT NULL COMMENT '当前所在站点代码',
     next_leg_index      INT          NOT NULL DEFAULT 0 COMMENT '待乘航段在行程中的下标（0 起），等于行程长度表示已完成；短卸不推进',
     status              VARCHAR(16)  NOT NULL DEFAULT 'IN_TRANSIT' COMMENT '行李状态：IN_TRANSIT 在途/SHORT_UNLOADED 短卸待补/RECOVERED 已补到在途/DELIVERED 已交付',
+    route_version       INT          NOT NULL DEFAULT 1 COMMENT '行程版本：初始 1，每次剩余行程改派成功后加一',
     loaded_leg_id       VARCHAR(64)  NULL COMMENT '当前已装载到的航段，未装载为 NULL',
     short_leg_id        VARCHAR(64)  NULL COMMENT '短卸缺失航段标识，仅 SHORT_UNLOADED 状态非 NULL',
     short_destination   VARCHAR(64)  NULL COMMENT '短卸应到站点代码，仅 SHORT_UNLOADED 状态非 NULL',
@@ -48,12 +49,25 @@ CREATE TABLE IF NOT EXISTS load_record (
     PRIMARY KEY (bag_tag)
 );
 
+-- 剩余行程改派历史：每次成功改派保存改派前后完整行程只读快照
+CREATE TABLE IF NOT EXISTS bag_reroute_history (
+    id              BIGINT AUTO_INCREMENT NOT NULL COMMENT '改派历史自增主键',
+    bag_tag         VARCHAR(64)  NOT NULL COMMENT '行李牌号',
+    route_version   INT          NOT NULL COMMENT '改派后的行程版本（改派前为该值减一）',
+    before_itinerary CLOB        NOT NULL COMMENT '改派前完整行程只读快照（JSON 数组，含 seq/legId/origin/destination）',
+    after_itinerary  CLOB        NOT NULL COMMENT '改派后完整行程只读快照（JSON 数组，含 seq/legId/origin/destination）',
+    prefix_size     INT          NOT NULL COMMENT '保留的已完成航段前缀数量，新后缀自该下标起',
+    rerouted_at     TIMESTAMP WITH TIME ZONE NOT NULL COMMENT '改派提交时刻（UTC）',
+    PRIMARY KEY (id),
+    UNIQUE (bag_tag, route_version)
+);
+
 -- 行李实际事件流：支撑完整轨迹查询，(bag_tag, seq) 唯一保证每件行李事件顺序不重复
 CREATE TABLE IF NOT EXISTS bag_event (
     id         BIGINT AUTO_INCREMENT NOT NULL COMMENT '事件自增主键',
     bag_tag    VARCHAR(64)  NOT NULL COMMENT '行李牌号',
     seq        INT          NOT NULL COMMENT '该行李内事件顺序，0 起递增',
-    event_type VARCHAR(32)  NOT NULL COMMENT '事件类型：REGISTERED 登记/LOADED 装载/UNLOADED 到达卸下/SHORT_UNLOADED 短卸/RECOVERED 补到/DELIVERED 交付',
+    event_type VARCHAR(32)  NOT NULL COMMENT '事件类型：REGISTERED 登记/LOADED 装载/UNLOADED 到达卸下/SHORT_UNLOADED 短卸/RECOVERED 补到/REROUTED 剩余行程改派/DELIVERED 交付',
     leg_id     VARCHAR(64)  NULL COMMENT '关联航段标识，与航段无关的事件为 NULL',
     location   VARCHAR(64)  NULL COMMENT '事件发生后行李所在站点代码',
     event_time TIMESTAMP WITH TIME ZONE NOT NULL COMMENT '事件发生时刻（UTC）',
@@ -64,7 +78,7 @@ CREATE TABLE IF NOT EXISTS bag_event (
 -- 幂等去重：仅记录成功请求；同 requestId 同参数重放原结果，异参数返回 409
 CREATE TABLE IF NOT EXISTS request_log (
     request_id      VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
-    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER',
+    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER/REROUTE',
     request_hash    VARCHAR(64)  NOT NULL COMMENT '请求参数（不含 requestId）的 SHA-256 摘要',
     response_status INT          NOT NULL COMMENT '原成功响应的 HTTP 状态码',
     response_body   CLOB         NOT NULL COMMENT '原成功响应体（JSON）',

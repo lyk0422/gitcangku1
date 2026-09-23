@@ -65,6 +65,19 @@ public final class BaggageDtos {
             @NotBlank(message = "actualStation 不能为空") String actualStation) {
     }
 
+    /**
+     * 剩余行程改派请求：expectedRouteVersion 为当前行程版本，
+     * newLegIds 为 1~5 个有序新航段，替换待乘后缀（已完成前缀保留）。
+     */
+    public record RerouteRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotBlank(message = "bagTag 不能为空") String bagTag,
+            @NotNull(message = "expectedRouteVersion 不能为空") Integer expectedRouteVersion,
+            @NotNull(message = "newLegIds 不能为空")
+            @Size(min = 1, max = 5, message = "新后缀航段数必须为 1~5")
+            List<@NotBlank(message = "航段不能为空") String> newLegIds) {
+    }
+
     /** 航段响应。 */
     public record LegResponse(String legId, String origin, String destination,
                               String status, int version) {
@@ -81,7 +94,8 @@ public final class BaggageDtos {
 
     /** 行李响应：含完整事件轨迹。 */
     public record BagResponse(String bagTag, String currentLocation, int nextLegIndex,
-                              String status, String loadedLegId, List<ItineraryItem> itinerary,
+                              String status, int routeVersion, String loadedLegId,
+                              List<ItineraryItem> itinerary,
                               String shortLegId, String shortDestination, String shortRegisteredAt,
                               List<TraceEvent> events) {
     }
@@ -124,5 +138,23 @@ public final class BaggageDtos {
 
     /** 未补到清单响应。 */
     public record ShortListResponse(List<ShortItem> shortUnloaded) {
+    }
+
+    /** 改派响应：含改派后版本、保留前缀长度与改派后完整行程。 */
+    public record RerouteResponse(String bagTag, int routeVersion, int prefixSize,
+                                  String currentLocation, int nextLegIndex,
+                                  List<ItineraryItem> itinerary) {
+    }
+
+    /** 单次改派历史项：改派前后完整行程、版本及 UTC 时刻。 */
+    public record RerouteHistoryItem(int routeVersion, int prefixSize,
+                                     List<ItineraryItem> beforeItinerary,
+                                     List<ItineraryItem> afterItinerary,
+                                     String reroutedAt) {
+    }
+
+    /** 改派历史响应：按版本升序。 */
+    public record RerouteHistoryResponse(String bagTag, int currentVersion,
+                                         List<RerouteHistoryItem> history) {
     }
 }

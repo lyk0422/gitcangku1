@@ -25,6 +25,9 @@ import com.example.starter.baggage.BaggageDtos.RecoverRequest;
 import com.example.starter.baggage.BaggageDtos.RecoverResponse;
 import com.example.starter.baggage.BaggageDtos.RegisterBagRequest;
 import com.example.starter.baggage.BaggageDtos.RegisterLegRequest;
+import com.example.starter.baggage.BaggageDtos.RerouteHistoryResponse;
+import com.example.starter.baggage.BaggageDtos.RerouteRequest;
+import com.example.starter.baggage.BaggageDtos.RerouteResponse;
 import com.example.starter.baggage.BaggageDtos.SealRequest;
 import com.example.starter.baggage.BaggageDtos.SealResponse;
 import com.example.starter.baggage.BaggageDtos.ShortListResponse;
@@ -83,6 +86,18 @@ public class BaggageController {
     @PostMapping("/bags/recover")
     public RecoverResponse recover(@Valid @RequestBody RecoverRequest request) {
         return baggageService.recover(request);
+    }
+
+    /** 补到：短卸行李在缺失航段的应到站实际到达后恢复行程。 */
+    @PostMapping("/bags/reroute")
+    public RerouteResponse reroute(@Valid @RequestBody RerouteRequest request) {
+        return baggageService.reroute(request);
+    }
+
+    /** 改派历史查询：返回该行李全部成功改派的前后完整行程、版本及 UTC 时刻。 */
+    @GetMapping("/bags/{bagTag}/reroute-history")
+    public RerouteHistoryResponse getRerouteHistory(@PathVariable String bagTag) {
+        return baggageService.getRerouteHistory(bagTag);
     }
 
     /** 行李完整轨迹查询。 */
