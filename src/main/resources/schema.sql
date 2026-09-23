@@ -61,10 +61,61 @@ CREATE TABLE IF NOT EXISTS bag_event (
     UNIQUE (bag_tag, seq)
 );
 
+-- 容器：container_id 全局唯一，seal_no 全局唯一（未封舱为 NULL），状态 OPEN -> SEALED -> CLOSED_REPACKED
+CREATE TABLE IF NOT EXISTS container (
+    container_id   VARCHAR(64) NOT NULL COMMENT '容器编号，全局唯一',
+    leg_id         VARCHAR(64) NOT NULL COMMENT '所属航段标识',
+    handover_point VARCHAR(64) NOT NULL COMMENT '交接点代码',
+    status         VARCHAR(16) NOT NULL DEFAULT 'OPEN' COMMENT '容器状态：OPEN 可装箱/SEALED 已封签/CLOSED_REPACKED 重封后关闭',
+    version        INT         NOT NULL DEFAULT 1 COMMENT '乐观锁版本，装箱/封签/重封关闭后递增',
+    seal_no        VARCHAR(64) NULL COMMENT '封签号，全局唯一，SEALED 起非 NULL，关闭后保留作历史证据',
+    created_at     TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    PRIMARY KEY (container_id),
+    UNIQUE (seal_no)
+);
+
+-- 容器当前清单：bag_tag 为主键，保证一件行李任一时刻只属于一个有效容器
+CREATE TABLE IF NOT EXISTS container_bag (
+    bag_tag      VARCHAR(64) NOT NULL COMMENT '行李牌号',
+    container_id VARCHAR(64) NOT NULL COMMENT '当前所属容器编号',
+    assigned_at  TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '进入当前容器时间',
+    PRIMARY KEY (bag_tag)
+);
+
+-- 行李容器链：逐项保留行李经过的全部容器，(bag_tag, seq) 唯一保证链顺序不重复
+CREATE TABLE IF NOT EXISTS bag_container_history (
+    id           BIGINT AUTO_INCREMENT NOT NULL COMMENT '自增主键',
+    bag_tag      VARCHAR(64) NOT NULL COMMENT '行李牌号',
+    seq          INT         NOT NULL COMMENT '容器链顺序，0 起递增',
+    container_id VARCHAR(64) NOT NULL COMMENT '经过的容器编号',
+    entered_at   TIMESTAMP WITH TIME ZONE NOT NULL COMMENT '进入该容器时刻（UTC）',
+    PRIMARY KEY (id),
+    UNIQUE (bag_tag, seq)
+);
+
+-- 容器重封单：repack_key 唯一，操作人与复核人双人确认后在一个事务内原子激活
+CREATE TABLE IF NOT EXISTS reseal_order (
+    repack_key         VARCHAR(64) NOT NULL COMMENT '重封单唯一键',
+    operator_id        VARCHAR(64) NOT NULL COMMENT '操作人标识',
+    reviewer_id        VARCHAR(64) NOT NULL COMMENT '复核人标识，须与操作人不同',
+    leg_id             VARCHAR(64) NOT NULL COMMENT '源容器共同所属航段',
+    handover_point     VARCHAR(64) NOT NULL COMMENT '源容器共同交接点代码',
+    status             VARCHAR(16) NOT NULL DEFAULT 'PENDING_CONFIRM' COMMENT '单状态：PENDING_CONFIRM 待双人确认/ACTIVATED 已激活',
+    operator_confirmed BOOLEAN     NOT NULL DEFAULT FALSE COMMENT '操作人是否已确认',
+    reviewer_confirmed BOOLEAN     NOT NULL DEFAULT FALSE COMMENT '复核人是否已确认',
+    sources_json       CLOB        NOT NULL COMMENT '请求的源容器清单（含 expectedVersion 与旧封签，按容器号排序，JSON）',
+    targets_json       CLOB        NOT NULL COMMENT '请求的目标精确分区（含新容器号、新封签与袋号集合，按容器号排序，JSON）',
+    before_snapshot    CLOB        NULL COMMENT '激活前源容器实际清单快照（JSON），未激活为 NULL',
+    after_snapshot     CLOB        NULL COMMENT '激活后目标容器清单快照（JSON），未激活为 NULL',
+    created_at         TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    activated_at       TIMESTAMP WITH TIME ZONE NULL COMMENT '激活时刻（UTC），未激活为 NULL',
+    PRIMARY KEY (repack_key)
+);
+
 -- 幂等去重：仅记录成功请求；同 requestId 同参数重放原结果，异参数返回 409
 CREATE TABLE IF NOT EXISTS request_log (
     request_id      VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
-    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER',
+    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER/CONTAINER_CREATE/CONTAINER_LOAD/CONTAINER_SEAL/RESEAL_CREATE/RESEAL_CONFIRM',
     request_hash    VARCHAR(64)  NOT NULL COMMENT '请求参数（不含 requestId）的 SHA-256 摘要',
     response_status INT          NOT NULL COMMENT '原成功响应的 HTTP 状态码',
     response_body   CLOB         NOT NULL COMMENT '原成功响应体（JSON）',
