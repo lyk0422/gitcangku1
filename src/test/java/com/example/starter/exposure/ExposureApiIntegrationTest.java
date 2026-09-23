@@ -108,8 +108,10 @@ class ExposureApiIntegrationTest {
     void cleanAndReset() {
         jdbc.update("DELETE FROM idempotency_record");
         jdbc.update("DELETE FROM exposure_reservation");
+        jdbc.update("DELETE FROM quota_placement_ledger");
         jdbc.update("DELETE FROM quota_visitor_ledger");
         jdbc.update("DELETE FROM quota_total_ledger");
+        jdbc.update("DELETE FROM placement");
         jdbc.update("DELETE FROM campaign");
         mutableClock().setInstant(BASE);
     }
@@ -139,13 +141,13 @@ class ExposureApiIntegrationTest {
         assertNull(r.terminalAtUtc());
         assertNotNull(r.reservationId());
 
-        QuotaResponse total = service.queryQuota("c1", null, LocalDate.of(2026, 9, 22));
+        QuotaResponse total = service.queryQuota("c1", null, null, LocalDate.of(2026, 9, 22));
         assertEquals(10, total.dailyTotalCap());
         assertEquals(1, total.usedTotal());
         assertEquals(9, total.remainingTotal());
         assertNull(total.usedVisitor());
 
-        QuotaResponse visitor = service.queryQuota("c1", "v1", LocalDate.of(2026, 9, 22));
+        QuotaResponse visitor = service.queryQuota("c1", "v1", null, LocalDate.of(2026, 9, 22));
         assertEquals(2, visitor.perVisitorDailyCap());
         assertEquals(1, visitor.usedVisitor());
         assertEquals(1, visitor.remainingVisitor());
@@ -172,8 +174,8 @@ class ExposureApiIntegrationTest {
                 new ReservationActionRequest("req-ok2"));
         assertEquals("CONFIRMED", again.status().name());
 
-        assertEquals(1, service.queryQuota("c1", "v1", LocalDate.of(2026, 9, 22)).usedVisitor());
-        assertEquals(1, service.queryQuota("c1", null, LocalDate.of(2026, 9, 22)).usedTotal());
+        assertEquals(1, service.queryQuota("c1", "v1", null, LocalDate.of(2026, 9, 22)).usedVisitor());
+        assertEquals(1, service.queryQuota("c1", null, null, LocalDate.of(2026, 9, 22)).usedTotal());
     }
 
     @Test
@@ -193,7 +195,7 @@ class ExposureApiIntegrationTest {
                 new ReservationActionRequest("req-x2"));
         assertEquals("CANCELLED", again.status().name());
 
-        QuotaResponse quota = service.queryQuota("c1", "v1", LocalDate.of(2026, 9, 22));
+        QuotaResponse quota = service.queryQuota("c1", "v1", null, LocalDate.of(2026, 9, 22));
         assertEquals(0, quota.usedTotal());
         assertEquals(0, quota.usedVisitor());
         assertEquals(1, quota.remainingTotal());
@@ -234,7 +236,7 @@ class ExposureApiIntegrationTest {
         assertEquals("EXPIRED", detail.status().name());
         assertEquals(BASE.toEpochMilli() + 60_000L, detail.terminalAtUtc());
 
-        QuotaResponse quota = service.queryQuota("c1", "v1", LocalDate.of(2026, 9, 22));
+        QuotaResponse quota = service.queryQuota("c1", "v1", null, LocalDate.of(2026, 9, 22));
         assertEquals(0, quota.usedTotal());
         assertEquals(0, quota.usedVisitor());
     }
@@ -254,8 +256,8 @@ class ExposureApiIntegrationTest {
         assertEquals("CONFIRMED", confirmed.status().name());
 
         // 原 UTC 日仍计数，新 UTC 日额度全新
-        assertEquals(1, service.queryQuota("c1", "v1", LocalDate.of(2026, 9, 22)).usedTotal());
-        QuotaResponse nextDay = service.queryQuota("c1", "v1", LocalDate.of(2026, 9, 23));
+        assertEquals(1, service.queryQuota("c1", "v1", null, LocalDate.of(2026, 9, 22)).usedTotal());
+        QuotaResponse nextDay = service.queryQuota("c1", "v1", null, LocalDate.of(2026, 9, 23));
         assertEquals(0, nextDay.usedTotal());
         assertEquals(0, nextDay.usedVisitor());
         assertEquals(10, nextDay.remainingTotal());
@@ -271,10 +273,10 @@ class ExposureApiIntegrationTest {
         assert429(() -> service.apply(new ApplyExposureRequest("req-a3", "c1", "v3")));
         assert429(() -> service.apply(new ApplyExposureRequest("req-a4", "c1", "v1")));
 
-        QuotaResponse quota = service.queryQuota("c1", null, LocalDate.of(2026, 9, 22));
+        QuotaResponse quota = service.queryQuota("c1", null, null, LocalDate.of(2026, 9, 22));
         assertEquals(2, quota.usedTotal());
         assertEquals(0, quota.remainingTotal());
-        assertEquals(0, service.queryQuota("c1", "v3", LocalDate.of(2026, 9, 22)).usedVisitor());
+        assertEquals(0, service.queryQuota("c1", "v3", null, LocalDate.of(2026, 9, 22)).usedVisitor());
     }
 
     @Test
@@ -285,7 +287,7 @@ class ExposureApiIntegrationTest {
 
         ReservationResponse replay = service.apply(new ApplyExposureRequest("key-1", "c1", "v1"));
         assertEquals(first.reservationId(), replay.reservationId());
-        assertEquals(1, service.queryQuota("c1", null, LocalDate.of(2026, 9, 22)).usedTotal());
+        assertEquals(1, service.queryQuota("c1", null, null, LocalDate.of(2026, 9, 22)).usedTotal());
 
         // 同键异参（不同访客）→ 409
         assert409(() -> service.apply(new ApplyExposureRequest("key-1", "c1", "v2")));
@@ -298,7 +300,7 @@ class ExposureApiIntegrationTest {
         service.cancel(first.reservationId(), new ReservationActionRequest("req-x1"));
         ReservationResponse retried = service.apply(new ApplyExposureRequest("key-fail", "c1", "v2"));
         assertEquals("RESERVED", retried.status().name());
-        assertEquals(1, service.queryQuota("c1", null, LocalDate.of(2026, 9, 22)).usedTotal());
+        assertEquals(1, service.queryQuota("c1", null, null, LocalDate.of(2026, 9, 22)).usedTotal());
     }
 
     @Test
@@ -307,7 +309,7 @@ class ExposureApiIntegrationTest {
         service.createCampaign(createReq("req-c1", "c1", 10, 2));
         assert409(() -> service.createCampaign(createReq("req-c2", "c1", 20, 3)));
         assert404(() -> service.getReservation("nonexistent"));
-        assert404(() -> service.queryQuota("nope", null, LocalDate.of(2026, 9, 22)));
+        assert404(() -> service.queryQuota("nope", null, null, LocalDate.of(2026, 9, 22)));
     }
 
     @Test
