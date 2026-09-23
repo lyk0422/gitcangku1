@@ -56,7 +56,7 @@ public class ExperimentService {
         }
         long now = clock.nowMillis();
         experimentRepository.insertExperiment(
-                new ExperimentRow(experimentId, blockCount, "OPEN", now));
+                new ExperimentRow(experimentId, blockCount, "OPEN", now, 0, null));
         List<SeatRow> seats = new ArrayList<>(blockCount * SEATS_PER_BLOCK);
         for (int blockNo = 1; blockNo <= blockCount; blockNo++) {
             for (int seatNo = 1; seatNo <= SEATS_PER_BLOCK; seatNo++) {
@@ -67,13 +67,13 @@ public class ExperimentService {
         }
         seats.forEach(experimentRepository::insertSeat);
         return new ExperimentView(experimentId, blockCount, SEATS_PER_BLOCK,
-                blockCount * SEATS_PER_BLOCK, "OPEN", now);
+                blockCount * SEATS_PER_BLOCK, "OPEN", 0, now);
     }
 
     public ExperimentView getExperiment(String experimentId) {
         ExperimentRow row = mustFindExperiment(experimentId);
         return new ExperimentView(row.id(), row.blockCount(), SEATS_PER_BLOCK,
-                row.blockCount() * SEATS_PER_BLOCK, row.status(), row.createdAt());
+                row.blockCount() * SEATS_PER_BLOCK, row.status(), row.roleVersion(), row.createdAt());
     }
 
     /**
@@ -138,6 +138,10 @@ public class ExperimentService {
      */
     @Transactional
     public AllocationView withdraw(String experimentId, String participantId) {
+        // 与职责轮换在同一实验行锁上串行：退组改变受试者“未结束”状态集合。
+        if (experimentRepository.lockById(experimentId) == null) {
+            throw ApiException.notFound("实验不存在: " + experimentId);
+        }
         AllocationRow allocation = mustFindAllocation(experimentId, participantId);
         if ("WITHDRAWN".equals(allocation.status())) {
             throw ApiException.conflict("参与者已退组");
@@ -162,7 +166,8 @@ public class ExperimentService {
         }
         experimentRepository.markClosed(experimentId);
         return new ExperimentView(experiment.id(), experiment.blockCount(), SEATS_PER_BLOCK,
-                experiment.blockCount() * SEATS_PER_BLOCK, "CLOSED", experiment.createdAt());
+                experiment.blockCount() * SEATS_PER_BLOCK, "CLOSED",
+                experiment.roleVersion(), experiment.createdAt());
     }
 
     /**

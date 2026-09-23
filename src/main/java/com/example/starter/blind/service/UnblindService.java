@@ -73,9 +73,19 @@ public class UnblindService {
 
     /**
      * REVIEWER 批准申请；批准人不得是申请人本人。
+     * 先锁实验行再锁申请行，与职责轮换激活在同一把实验行锁上串行，
+     * 保证激活事务重新读取揭盲记录时不会漏掉并发新增的批准揭盲。
      */
     @Transactional
     public UnblindRequestView approve(String unblindRequestId, String reviewerActor) {
+        UnblindRequestRow prefetch = unblindRequestRepository.findById(unblindRequestId);
+        if (prefetch == null) {
+            throw ApiException.notFound("揭盲申请不存在: " + unblindRequestId);
+        }
+        // 与轮换/登记互斥：批准会新增不可删除的知情事实，必须串行化。
+        if (experimentRepository.lockById(prefetch.experimentId()) == null) {
+            throw ApiException.notFound("揭盲申请不存在: " + unblindRequestId);
+        }
         UnblindRequestRow row = unblindRequestRepository.lockById(unblindRequestId);
         if (row == null) {
             throw ApiException.notFound("揭盲申请不存在: " + unblindRequestId);

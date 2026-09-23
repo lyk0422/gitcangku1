@@ -27,6 +27,23 @@ public class UnblindRequestRepository {
             Long reviewedAt) {
     }
 
+    /**
+     * 不可删除的知情历史依据：某操作者经批准的揭盲申请获知某受试者分组。
+     * 不携带 treatment，轮换冲突判定只需要“谁对谁知情”及依据编号。
+     */
+    public record KnowledgeRow(
+            String unblindRequestId,
+            String participantId,
+            String actorId,
+            long reviewedAt) {
+    }
+
+    private static final RowMapper<KnowledgeRow> KNOWLEDGE_MAPPER = (rs, n) -> new KnowledgeRow(
+            rs.getString("id"),
+            rs.getString("participant_id"),
+            rs.getString("applicant_actor"),
+            rs.getLong("reviewed_at"));
+
     private static final RowMapper<UnblindRequestRow> MAPPER = (rs, n) -> new UnblindRequestRow(
             rs.getString("id"),
             rs.getString("experiment_id"),
@@ -96,5 +113,16 @@ public class UnblindRequestRepository {
                         + "treatment = ?, reviewed_at = ?, pending_allocation_id = NULL "
                         + "WHERE id = ? AND status = 'PENDING'",
                 reviewerActor, treatment, reviewedAt, requestId);
+    }
+
+    /**
+     * 查询某实验全部“已批准揭盲”的不可删除知情历史：申请人即获知该受试者分组的人。
+     * 知情事实长期保留，不因退组、关闭或轮换而删除。
+     */
+    public List<KnowledgeRow> findApprovedKnowledge(String experimentId) {
+        return jdbc.query(
+                "SELECT id, participant_id, applicant_actor, reviewed_at FROM unblind_request "
+                        + "WHERE experiment_id = ? AND status = 'APPROVED'",
+                KNOWLEDGE_MAPPER, experimentId);
     }
 }

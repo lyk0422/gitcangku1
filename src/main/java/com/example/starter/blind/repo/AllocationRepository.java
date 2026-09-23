@@ -94,6 +94,17 @@ public class AllocationRepository {
     }
 
     /**
+     * 查询实验内全部“未结束”受试者（状态 ASSIGNED，在组）；退组（WITHDRAWN）视为已结束，
+     * 不纳入采集者可见范围与知情冲突计算。按参与者编号升序。
+     */
+    public List<String> findActiveParticipantIds(String experimentId) {
+        return jdbc.queryForList(
+                "SELECT participant_id FROM allocation WHERE experiment_id = ? AND status = 'ASSIGNED' "
+                        + "ORDER BY participant_id",
+                String.class, experimentId);
+    }
+
+    /**
      * 退组：仅 ASSIGNED -> WITHDRAWN，不释放席位。
      *
      * @return 受影响行数；0 表示不存在或已退组
