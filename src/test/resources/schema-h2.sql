@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS playout_asset (
 CREATE TABLE IF NOT EXISTS playout_channel (
     id                VARCHAR(64) NOT NULL PRIMARY KEY,
     fallback_asset_id VARCHAR(64) NOT NULL,
+    version           BIGINT      NOT NULL DEFAULT 0,
     created_at_ms     BIGINT      NOT NULL
 );
 
@@ -91,3 +92,70 @@ CREATE TABLE IF NOT EXISTS playout_emergency_override (
 );
 CREATE INDEX IF NOT EXISTS idx_override_playout
     ON playout_emergency_override (channel_id, status, start_ms, end_ms, priority);
+
+-- 频道主备链路配置：每频道 PRIMARY/BACKUP 各一条，role 取值 PRIMARY/BACKUP。
+CREATE TABLE IF NOT EXISTS playout_link (
+    channel_id    VARCHAR(64) NOT NULL,
+    role          VARCHAR(16) NOT NULL,
+    link_id       VARCHAR(64) NOT NULL,
+    healthy       TINYINT(1)  NOT NULL DEFAULT 1,
+    cached_schedule_version BIGINT NOT NULL DEFAULT 0,
+    cached_override_signature VARCHAR(128) NULL,
+    updated_at_ms BIGINT      NOT NULL,
+    PRIMARY KEY (channel_id, role)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uk_link_channel_link
+    ON playout_link (channel_id, link_id);
+
+-- 链路租约：active_marker 为活动标记（ACTIVE='A'，其余 NULL），唯一索引保证每频道至多一条 ACTIVE。
+CREATE TABLE IF NOT EXISTS playout_lease (
+    id            BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    channel_id    VARCHAR(64)  NOT NULL,
+    link_id       VARCHAR(64)  NOT NULL,
+    generation    BIGINT       NOT NULL,
+    status        VARCHAR(16)  NOT NULL,
+    active_marker VARCHAR(8)   NULL,
+    cut_sequence  BIGINT       NOT NULL,
+    schedule_snapshot TEXT    NULL,
+    override_snapshot TEXT    NULL,
+    started_at_ms BIGINT       NOT NULL,
+    ended_at_ms   BIGINT       NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uk_lease_generation
+    ON playout_lease (channel_id, generation);
+CREATE UNIQUE INDEX IF NOT EXISTS uk_lease_active
+    ON playout_lease (channel_id, active_marker);
+
+-- 切换单：failoverKey 全局唯一；status 为 ACTIVATED / REJECTED。
+CREATE TABLE IF NOT EXISTS playout_failover_order (
+    failover_key       VARCHAR(64) NOT NULL PRIMARY KEY,
+    channel_id         VARCHAR(64) NOT NULL,
+    channel_version    BIGINT      NOT NULL,
+    source_link_id     VARCHAR(64) NOT NULL,
+    target_link_id     VARCHAR(64) NOT NULL,
+    source_last_sequence  BIGINT   NOT NULL,
+    target_last_sequence  BIGINT   NOT NULL,
+    cutover_at_ms      BIGINT      NOT NULL,
+    status             VARCHAR(16) NOT NULL,
+    reject_code        VARCHAR(48) NULL,
+    new_generation     BIGINT      NULL,
+    cut_sequence       BIGINT      NULL,
+    created_request_id VARCHAR(64) NOT NULL,
+    created_at_ms      BIGINT      NOT NULL,
+    activated_at_ms    BIGINT      NULL
+);
+
+-- 链路回执：同一链路同一世代同一 sequence 唯一（源 CURRENT 与目标 CACHED 允许同 sequence 并存）。
+CREATE TABLE IF NOT EXISTS playout_receipt (
+    id            BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    channel_id    VARCHAR(64)  NOT NULL,
+    link_id       VARCHAR(64)  NOT NULL,
+    generation    BIGINT       NOT NULL,
+    sequence_no   BIGINT       NOT NULL,
+    received_at_ms BIGINT      NOT NULL,
+    disposition   VARCHAR(16)  NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uk_receipt_once
+    ON playout_receipt (channel_id, link_id, generation, sequence_no);
+CREATE INDEX IF NOT EXISTS idx_receipt_channel_gen
+    ON playout_receipt (channel_id, generation, sequence_no);

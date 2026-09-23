@@ -34,6 +34,10 @@ public class PlayoutRepository {
     public record ChannelRow(String id, String fallbackAssetId) {
     }
 
+    /** 频道版本行，用于主备切换事务内加锁重验。 */
+    public record ChannelVersionRow(String id, long version) {
+    }
+
     /** 授权行。 */
     public record GrantRow(long id, String channelId, String assetId,
                            long validFromMs, long validToMs, boolean revoked) {
@@ -78,6 +82,9 @@ public class PlayoutRepository {
 
     private static final RowMapper<ChannelRow> CHANNEL_MAPPER = (rs, n) ->
             new ChannelRow(rs.getString("id"), rs.getString("fallback_asset_id"));
+
+    private static final RowMapper<ChannelVersionRow> CHANNEL_VERSION_MAPPER = (rs, n) ->
+            new ChannelVersionRow(rs.getString("id"), rs.getLong("version"));
 
     private static final RowMapper<GrantRow> GRANT_MAPPER = (rs, n) ->
             new GrantRow(rs.getLong("id"), rs.getString("channel_id"), rs.getString("asset_id"),
@@ -135,6 +142,30 @@ public class PlayoutRepository {
     public Optional<ChannelRow> findChannel(String id) {
         return jdbc.query("SELECT id, fallback_asset_id FROM playout_channel WHERE id = ?",
                 CHANNEL_MAPPER, id).stream().findFirst();
+    }
+
+    /** 读取频道版本；频道不存在时返回 -1。 */
+    public long findChannelVersion(String id) {
+        Long version = jdbc.queryForObject(
+                "SELECT version FROM playout_channel WHERE id = ?", Long.class, id);
+        return version == null ? -1L : version;
+    }
+
+    /** 锁频道行并返回频道版本；不存在返回空，用于切换事务内对编排/插播变化重验。 */
+    public Optional<ChannelVersionRow> lockChannelVersion(String id) {
+        return jdbc.query("SELECT id, version FROM playout_channel WHERE id = ? FOR UPDATE",
+                CHANNEL_VERSION_MAPPER, id).stream().findFirst();
+    }
+
+    /** 频道版本乐观递增；返回受影响行数，0 表示版本不符或频道不存在。 */
+    public int bumpChannelVersion(String id, long expectedVersion) {
+        return jdbc.update("UPDATE playout_channel SET version = version + 1"
+                + " WHERE id = ? AND version = ?", id, expectedVersion);
+    }
+
+    /** 频道版本无条件递增，用于编排发布、插播开始/结束等已提交的频道级状态变化。 */
+    public int incrementChannelVersion(String id) {
+        return jdbc.update("UPDATE playout_channel SET version = version + 1 WHERE id = ?", id);
     }
 
     // ---------- 授权 ----------

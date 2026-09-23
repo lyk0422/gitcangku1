@@ -234,6 +234,8 @@ public class PlayoutService {
                 repo.insertPublicationSegment(publicationId, segment.id(), segment.assetId(),
                         grantIds.get(i), segment.startMs(), segment.endMs());
             }
+            // 频道级编排状态变化：递增频道版本，使持有旧版本的待激活切换单在重验时失败。
+            repo.incrementChannelVersion(channelId);
             return new PublishResponse(publicationId, channelId, businessDay.toString(),
                     newVersion, draft.version());
         });
@@ -383,6 +385,8 @@ public class PlayoutService {
             throw ApiException.conflict("DUPLICATE_OVERRIDE_KEY",
                     "紧急插播 overrideKey 已存在: " + request.overrideKey());
         }
+        // 插播开始是频道级状态变化：递增频道版本，供切换单事务重验插播栈是否同步。
+        repo.incrementChannelVersion(request.channelId());
         return new EmergencyOverrideResponse(request.overrideKey(), request.channelId(),
                 request.assetId(), request.grantId(), request.priority(),
                 request.start(), request.end(), OverrideStatus.ACTIVE, null, null,
@@ -407,6 +411,8 @@ public class PlayoutService {
                 throw ApiException.conflict("OVERRIDE_NOT_ACTIVE",
                         "紧急插播已取消，不能重复取消: " + overrideKey);
             }
+            // 插播结束是频道级状态变化：递增频道版本。
+            repo.incrementChannelVersion(existing.channelId());
             return toOverrideResponse(repo.findOverrideForUpdate(overrideKey).orElseThrow());
         });
     }
