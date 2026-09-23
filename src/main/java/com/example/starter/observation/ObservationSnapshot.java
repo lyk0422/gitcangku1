@@ -4,6 +4,7 @@ package com.example.starter.observation;
  * 观测记录快照：对应 observation_current 当前状态或 observation_version 历史版本的一行。
  *
  * @param observationId 观测记录唯一标识
+ * @param surveyId      所属调查问卷标识；未归属任何关联观测簇时为 null
  * @param version       版本号，从 1 开始
  * @param location      观测地点（可编辑字段）；删除墓碑版本为 null
  * @param reading       观测读数，十进制字符串，最多三位小数，比较按数值；删除墓碑版本为 null
@@ -12,6 +13,7 @@ package com.example.starter.observation;
  */
 public record ObservationSnapshot(
         String observationId,
+        String surveyId,
         int version,
         String location,
         String reading,

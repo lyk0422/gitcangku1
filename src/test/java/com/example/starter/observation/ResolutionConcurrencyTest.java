@@ -68,7 +68,7 @@ class ResolutionConcurrencyTest {
 
     private void setupLocationConflict(String observationId, String tag) {
         observationService.create(new CreateObservationRequest(
-                "req-" + tag + "-0", observationId, "站点A", "1.0", "备注"));
+                "req-" + tag + "-0", observationId, null, "站点A", "1.0", "备注"));
         observationService.merge(observationId, new MergeObservationRequest(
                 "req-" + tag + "-1", 1, "站点B", "1.0", "备注"));
         // 离线端基于 v1 改站点C：与服务端站点B 冲突，普通合并失败不占键
