@@ -5,15 +5,8 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.sql.Timestamp;
 import java.time.Instant;
-import java.util.ArrayDeque;
-import java.util.ArrayList;
-import java.util.Deque;
-import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
-import java.util.Set;
 
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -54,12 +47,6 @@ public class IncidentTaskRepository {
                 cancelledAt == null ? null : cancelledAt.toInstant(),
                 rs.getTimestamp("created_at").toInstant(),
                 rs.getTimestamp("updated_at").toInstant());
-    }
-
-    /**
-     * 依赖图有向边：fromIncidentId（任务所属事件）→ toIncidentId（阻塞事件）。
-     */
-    public record Edge(long fromIncidentId, long toIncidentId) {
     }
 
     /**
@@ -126,6 +113,30 @@ public class IncidentTaskRepository {
     }
 
     /**
+     * 判断事件是否存在仍 OPEN 的任务声明指定阻塞边（进行中任务的强制依赖边）。
+     * 提案激活删除边时用于强制边校验。
+     */
+    public boolean hasOpenTaskDeclaring(long incidentId, long blockerIncidentId) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM incident_tasks t"
+                        + " JOIN incident_task_blockers b ON b.task_id = t.id"
+                        + " WHERE t.incident_id = ? AND t.status = 'OPEN'"
+                        + " AND b.blocker_incident_id = ?",
+                Integer.class, incidentId, blockerIncidentId);
+        return count != null && count > 0;
+    }
+
+    /**
+     * 判断事件是否存在 DONE 任务。提案激活新增边时用于已完成任务前置依赖校验。
+     */
+    public boolean hasDoneTask(long incidentId) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM incident_tasks WHERE incident_id = ? AND status = 'DONE'",
+                Integer.class, incidentId);
+        return count != null && count > 0;
+    }
+
+    /**
      * 将 OPEN 任务置为 DONE，记录完成人与 UTC 时刻。
      */
     public void markDone(long id, String actor, Instant at) {
@@ -163,41 +174,5 @@ public class IncidentTaskRepository {
         }
         jdbc.queryForObject("SELECT id FROM task_graph_lock WHERE id = ? FOR UPDATE",
                 Long.class, GRAPH_LOCK_ID);
-    }
-
-    /**
-     * 环检测：在依赖图中判断从 fromIncidentId 出发沿阻塞边是否可达 toIncidentId。
-     * 调用前必须已持有 lockGraph() 全局锁，保证检测与后续边写入串行一致。
-     * 所有状态的任务边均参与构图（保守策略：已终态任务的依赖边仍阻止成环）。
-     */
-    public boolean isReachable(long fromIncidentId, long toIncidentId) {
-        if (fromIncidentId == toIncidentId) {
-            return true;
-        }
-        List<Edge> edges = jdbc.query(
-                "SELECT t.incident_id, b.blocker_incident_id FROM incident_task_blockers b"
-                        + " JOIN incident_tasks t ON t.id = b.task_id",
-                (rs, n) -> new Edge(rs.getLong(1), rs.getLong(2)));
-        Map<Long, List<Long>> adjacency = new HashMap<>();
-        for (Edge edge : edges) {
-            adjacency.computeIfAbsent(edge.fromIncidentId(), k -> new ArrayList<>())
-                    .add(edge.toIncidentId());
-        }
-        Set<Long> visited = new HashSet<>();
-        Deque<Long> queue = new ArrayDeque<>();
-        queue.add(fromIncidentId);
-        visited.add(fromIncidentId);
-        while (!queue.isEmpty()) {
-            long current = queue.poll();
-            for (Long next : adjacency.getOrDefault(current, List.of())) {
-                if (next == toIncidentId) {
-                    return true;
-                }
-                if (visited.add(next)) {
-                    queue.add(next);
-                }
-            }
-        }
-        return false;
     }
 }

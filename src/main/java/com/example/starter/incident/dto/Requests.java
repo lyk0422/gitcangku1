@@ -55,4 +55,30 @@ public final class Requests {
     /** 任务完成/取消请求，操作人由 X-Actor-Id 指定且须为当前指挥人。 */
     public record TaskActionRequest(String commandKey) {
     }
+
+    /**
+     * 提案边条目：operation 为 ADD/REMOVE；from/to 为事件业务键。
+     * 边集合按 (operation, from, to) 结构化去重，换序等价。
+     */
+    public record GraphProposalEdgeRequest(String operation, String fromIncidentKey,
+                                           String toIncidentKey) {
+    }
+
+    /**
+     * 依赖图变更提案创建请求：requestId 为调用方幂等键；proposalKey 全局唯一；
+     * expectedGraphVersion 为提案基于的图版本；edges 去重后 1~50 条。
+     */
+    public record GraphProposalCreateRequest(String requestId, String proposalKey,
+                                             Long expectedGraphVersion, String rationale,
+                                             String safetyReviewer,
+                                             List<GraphProposalEdgeRequest> edges) {
+    }
+
+    /** 提案投票请求：decision 为 APPROVE/REJECT，操作人由 X-Actor-Id 指定且须为名册成员。 */
+    public record GraphVoteRequest(String requestId, String decision) {
+    }
+
+    /** 提案激活请求，操作人由 X-Actor-Id 指定且须为名册成员。 */
+    public record GraphActivateRequest(String requestId) {
+    }
 }

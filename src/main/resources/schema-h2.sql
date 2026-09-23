@@ -100,3 +100,68 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
 );
+
+CREATE TABLE IF NOT EXISTS graph_edges (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    from_incident_id BIGINT NOT NULL,
+    to_incident_id BIGINT NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_graph_edge UNIQUE (from_incident_id, to_incident_id)
+);
+
+CREATE TABLE IF NOT EXISTS graph_version (
+    id TINYINT PRIMARY KEY,
+    version BIGINT NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS graph_proposals (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    proposal_key VARCHAR(128) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    rationale VARCHAR(1024) NOT NULL,
+    proposer VARCHAR(128) NOT NULL,
+    safety_reviewer VARCHAR(128) NOT NULL,
+    expected_graph_version BIGINT NOT NULL,
+    applied_graph_version BIGINT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_graph_proposal_key UNIQUE (proposal_key)
+);
+
+CREATE TABLE IF NOT EXISTS graph_proposal_edges (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    proposal_id BIGINT NOT NULL,
+    operation VARCHAR(8) NOT NULL,
+    from_incident_id BIGINT NOT NULL,
+    to_incident_id BIGINT NOT NULL,
+    CONSTRAINT uk_graph_proposal_edge UNIQUE (proposal_id, operation, from_incident_id, to_incident_id)
+);
+
+CREATE TABLE IF NOT EXISTS graph_proposal_roster (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    proposal_id BIGINT NOT NULL,
+    role VARCHAR(16) NOT NULL,
+    incident_id BIGINT NOT NULL,
+    person VARCHAR(128) NOT NULL,
+    CONSTRAINT uk_graph_roster UNIQUE (proposal_id, role, incident_id)
+);
+
+CREATE TABLE IF NOT EXISTS graph_proposal_votes (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    proposal_id BIGINT NOT NULL,
+    person VARCHAR(128) NOT NULL,
+    decision VARCHAR(8) NOT NULL,
+    voted_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_graph_vote UNIQUE (proposal_id, person)
+);
+
+CREATE TABLE IF NOT EXISTS graph_snapshots (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    proposal_id BIGINT NOT NULL,
+    phase VARCHAR(8) NOT NULL,
+    graph_version BIGINT NOT NULL,
+    from_incident_id BIGINT NOT NULL,
+    to_incident_id BIGINT NOT NULL,
+    CONSTRAINT uk_graph_snapshot UNIQUE (proposal_id, phase, from_incident_id, to_incident_id)
+);

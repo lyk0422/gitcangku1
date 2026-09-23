@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS incident_status_history (
 CREATE TABLE IF NOT EXISTS command_keys (
     id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
     command_key VARCHAR(128) NOT NULL COMMENT '调用方幂等键，全局唯一',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：takeover/transfer_initiate/transfer_accept/action/status/escalation_check/escalation_ack/task_create/task_complete/task_cancel',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：takeover/transfer_initiate/transfer_accept/action/status/escalation_check/escalation_ack/task_create/task_complete/task_cancel/graph_propose/graph_vote/graph_activate',
     request_hash VARCHAR(64) NOT NULL COMMENT '规范化请求参数的 SHA-256 摘要，用于同键改参检测',
     response_status INT NULL COMMENT '首次成功的 HTTP 状态码；事务提交前必写入',
     response_body MEDIUMTEXT NULL COMMENT '首次成功响应 JSON，用于同键同参重放',
@@ -100,3 +100,68 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY COMMENT '固定为 1 的单行锁；创建任务时 SELECT ... FOR UPDATE 持有，串行化环检测与写入，保证并发反向依赖最终图无环'
 ) COMMENT='任务依赖图全局锁表';
+
+CREATE TABLE IF NOT EXISTS graph_edges (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    from_incident_id BIGINT NOT NULL COMMENT '依赖方事件 id（边起点，被阻塞方），关联 incidents.id',
+    to_incident_id BIGINT NOT NULL COMMENT '被依赖事件 id（边终点，阻塞方），关联 incidents.id',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '边写入 UTC 时间',
+    CONSTRAINT uk_graph_edge UNIQUE (from_incident_id, to_incident_id)
+) COMMENT='跨事件依赖图当前边集（任务阻塞创建与提案激活共同维护）';
+
+CREATE TABLE IF NOT EXISTS graph_version (
+    id TINYINT PRIMARY KEY COMMENT '固定为 1 的单行',
+    version BIGINT NOT NULL COMMENT '当前依赖图版本号；每次边集实际变更（任务新增边或提案激活）单调递增 1',
+    updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间'
+) COMMENT='依赖图版本单行表';
+
+CREATE TABLE IF NOT EXISTS graph_proposals (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    proposal_key VARCHAR(128) NOT NULL COMMENT '提案业务键，全局唯一',
+    status VARCHAR(16) NOT NULL COMMENT '状态：PENDING 投票中 / APPROVED 已达法定人数待激活 / REJECTED 已否决 / ACTIVATED 已激活',
+    rationale VARCHAR(1024) NOT NULL COMMENT '业务说明，非空',
+    proposer VARCHAR(128) NOT NULL COMMENT '提案人（创建时的 X-Actor-Id）',
+    safety_reviewer VARCHAR(128) NOT NULL COMMENT '安全审核员（创建时指定，占名册一个席位）',
+    expected_graph_version BIGINT NOT NULL COMMENT '提案基于的依赖图版本；激活时须仍匹配，否则整案 409',
+    applied_graph_version BIGINT NULL COMMENT '激活生成的新图版本；仅 ACTIVATED 有值，否则为空',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
+    updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间',
+    CONSTRAINT uk_graph_proposal_key UNIQUE (proposal_key)
+) COMMENT='依赖图变更提案表';
+
+CREATE TABLE IF NOT EXISTS graph_proposal_edges (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    proposal_id BIGINT NOT NULL COMMENT '所属提案 id，关联 graph_proposals.id',
+    operation VARCHAR(8) NOT NULL COMMENT '边操作：ADD 新增 / REMOVE 删除',
+    from_incident_id BIGINT NOT NULL COMMENT '依赖方事件 id，关联 incidents.id',
+    to_incident_id BIGINT NOT NULL COMMENT '被依赖事件 id，关联 incidents.id',
+    CONSTRAINT uk_graph_proposal_edge UNIQUE (proposal_id, operation, from_incident_id, to_incident_id)
+) COMMENT='提案边集（结构化去重后 1~50 条，换序等价）';
+
+CREATE TABLE IF NOT EXISTS graph_proposal_roster (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    proposal_id BIGINT NOT NULL COMMENT '所属提案 id，关联 graph_proposals.id',
+    role VARCHAR(16) NOT NULL COMMENT '席位角色：COMMANDER 受影响事件指挥官 / SAFETY_REVIEWER 安全审核员',
+    incident_id BIGINT NOT NULL COMMENT '受影响事件 id；SAFETY_REVIEWER 席位固定为 0 表示不属于任何事件',
+    person VARCHAR(128) NOT NULL COMMENT '席位人员（创建时冻结；兼任多席位仍只投一票，一票同时满足其全部席位）',
+    CONSTRAINT uk_graph_roster UNIQUE (proposal_id, role, incident_id)
+) COMMENT='提案不可变投票名册（创建时冻结，后续指挥交接不改写）';
+
+CREATE TABLE IF NOT EXISTS graph_proposal_votes (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    proposal_id BIGINT NOT NULL COMMENT '所属提案 id，关联 graph_proposals.id',
+    person VARCHAR(128) NOT NULL COMMENT '投票人，须为名册成员；每人仅首票有效',
+    decision VARCHAR(8) NOT NULL COMMENT '表决：APPROVE 赞成 / REJECT 反对；任一反对即整案 REJECTED',
+    voted_at TIMESTAMP(6) NOT NULL COMMENT '投票 UTC 时间',
+    CONSTRAINT uk_graph_vote UNIQUE (proposal_id, person)
+) COMMENT='提案票决表';
+
+CREATE TABLE IF NOT EXISTS graph_snapshots (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    proposal_id BIGINT NOT NULL COMMENT '所属提案 id，关联 graph_proposals.id',
+    phase VARCHAR(8) NOT NULL COMMENT '快照阶段：BEFORE 激活前 / AFTER 激活后',
+    graph_version BIGINT NOT NULL COMMENT '该快照对应的依赖图版本',
+    from_incident_id BIGINT NOT NULL COMMENT '依赖方事件 id，关联 incidents.id',
+    to_incident_id BIGINT NOT NULL COMMENT '被依赖事件 id，关联 incidents.id',
+    CONSTRAINT uk_graph_snapshot UNIQUE (proposal_id, phase, from_incident_id, to_incident_id)
+) COMMENT='提案激活前后完整边集快照（按 graphVersion 还原提案证据）';

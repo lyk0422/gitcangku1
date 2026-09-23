@@ -72,16 +72,18 @@ public class IncidentService {
     private final EscalationRepository escalations;
     private final IncidentTaskRepository tasks;
     private final CommandKeyRepository commandKeys;
+    private final DependencyGraphRepository graph;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public IncidentService(IncidentRepository incidents, EscalationRepository escalations,
                            IncidentTaskRepository tasks, CommandKeyRepository commandKeys,
-                           ObjectMapper objectMapper, Clock clock) {
+                           DependencyGraphRepository graph, ObjectMapper objectMapper, Clock clock) {
         this.incidents = incidents;
         this.escalations = escalations;
         this.tasks = tasks;
         this.commandKeys = commandKeys;
+        this.graph = graph;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -442,10 +444,12 @@ public class IncidentService {
                                 .orElseThrow(() -> ApiException.notFound(
                                         "阻塞事件不存在: " + blockerKey)));
                     }
-                    // 全局图锁：串行化环检测与边写入，并发反向依赖下最终图无环
+                    // 全局图锁：串行化环检测与边写入（与提案激活共用同一把锁），并发反向依赖下最终图无环
                     tasks.lockGraph();
+                    List<DependencyGraphRepository.GraphEdge> currentEdges = graph.listEdges();
                     for (Incident blocker : blockers) {
-                        if (tasks.isReachable(blocker.id(), incident.id())) {
+                        if (DependencyGraphRepository.isReachable(currentEdges,
+                                blocker.id(), incident.id())) {
                             throw ApiException.conflict("阻塞关系会形成环: "
                                     + blocker.incidentKey() + " 已直接或间接依赖 " + incidentKey);
                         }
@@ -454,8 +458,15 @@ public class IncidentService {
                     long taskId = tasks.insert(new IncidentTask(0L, incident.id(), taskKey,
                             groupCode, title, TaskStatus.OPEN, actor, null, null, null, null,
                             now, now));
+                    boolean graphChanged = false;
                     for (Incident blocker : blockers) {
                         tasks.insertBlocker(taskId, blocker.id(), now);
+                        graphChanged |= graph.insertEdgeIfAbsent(incident.id(), blocker.id(), now);
+                    }
+                    if (graphChanged) {
+                        // 边集实际变更：图版本单调递增，提案激活按版本匹配收敛
+                        graph.ensureVersionRow(now);
+                        graph.bumpVersion(now);
                     }
                     return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
                 });

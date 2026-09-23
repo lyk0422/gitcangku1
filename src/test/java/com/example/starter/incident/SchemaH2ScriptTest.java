@@ -108,6 +108,48 @@ class SchemaH2ScriptTest {
                     duplicateBlockerRejected = true;
                 }
                 assertThat(duplicateBlockerRejected).isTrue();
+
+                // 依赖图边：(from_incident_id, to_incident_id) 唯一
+                st.execute("INSERT INTO graph_edges (from_incident_id, to_incident_id, created_at)"
+                        + " VALUES (1,1,'" + Timestamp.from(now) + "')");
+                boolean duplicateGraphEdgeRejected = false;
+                try {
+                    st.execute("INSERT INTO graph_edges (from_incident_id, to_incident_id,"
+                            + " created_at) VALUES (1,1,'" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateGraphEdgeRejected = true;
+                }
+                assertThat(duplicateGraphEdgeRejected).isTrue();
+
+                // 提案：proposal_key 全局唯一
+                st.execute("INSERT INTO graph_proposals (proposal_key, status, rationale, proposer,"
+                        + " safety_reviewer, expected_graph_version, applied_graph_version,"
+                        + " created_at, updated_at) VALUES ('GP-1','PENDING','r','pm','carol',0,"
+                        + "NULL,'" + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                boolean duplicateProposalRejected = false;
+                try {
+                    st.execute("INSERT INTO graph_proposals (proposal_key, status, rationale,"
+                            + " proposer, safety_reviewer, expected_graph_version,"
+                            + " applied_graph_version, created_at, updated_at) VALUES ('GP-1',"
+                            + "'PENDING','r2','pm','carol',0,NULL,'" + Timestamp.from(now) + "','"
+                            + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateProposalRejected = true;
+                }
+                assertThat(duplicateProposalRejected).isTrue();
+
+                // 票决：(proposal_id, person) 唯一，每人仅首票
+                st.execute("INSERT INTO graph_proposal_votes (proposal_id, person, decision,"
+                        + " voted_at) VALUES (1,'alice','APPROVE','" + Timestamp.from(now) + "')");
+                boolean duplicateVoteRejected = false;
+                try {
+                    st.execute("INSERT INTO graph_proposal_votes (proposal_id, person, decision,"
+                            + " voted_at) VALUES (1,'alice','REJECT','" + Timestamp.from(now)
+                            + "')");
+                } catch (Exception e) {
+                    duplicateVoteRejected = true;
+                }
+                assertThat(duplicateVoteRejected).isTrue();
             }
         }
     }

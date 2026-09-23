@@ -78,4 +78,40 @@ public final class Responses {
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
     }
+
+    /** 依赖图边视图：fromIncidentKey 依赖 toIncidentKey（被其阻塞）。 */
+    public record GraphEdgeView(String fromIncidentKey, String toIncidentKey) {
+    }
+
+    /** 当前依赖图视图：version 为当前图版本，edges 按事件键稳定排序。 */
+    public record GraphView(long version, List<GraphEdgeView> edges) {
+    }
+
+    /** 提案边条目视图：operation 为 ADD/REMOVE。 */
+    public record ProposalEdgeView(String operation, String fromIncidentKey, String toIncidentKey) {
+    }
+
+    /** 名册席位视图：incidentKey 仅 COMMANDER 席位有值，SAFETY_REVIEWER 为 null。 */
+    public record RosterSeatView(String role, String incidentKey, String person) {
+    }
+
+    /** 票决视图。 */
+    public record VoteView(String person, String decision, Instant votedAt) {
+    }
+
+    /** 边集快照视图：graphVersion 为该快照对应的图版本，edges 按事件键稳定排序。 */
+    public record GraphSnapshotView(long graphVersion, List<GraphEdgeView> edges) {
+    }
+
+    /**
+     * 提案视图：edges 为提案边集（按操作与事件键稳定排序）；roster 为创建时冻结的
+     * 不可变名册；votes 为已记录票决；beforeSnapshot/afterSnapshot 仅 ACTIVATED 有值。
+     */
+    public record ProposalView(String proposalKey, String status, String rationale, String proposer,
+                               String safetyReviewer, long expectedGraphVersion,
+                               Long appliedGraphVersion, List<ProposalEdgeView> edges,
+                               List<RosterSeatView> roster, List<VoteView> votes,
+                               GraphSnapshotView beforeSnapshot, GraphSnapshotView afterSnapshot,
+                               Instant createdAt, Instant updatedAt) {
+    }
 }
