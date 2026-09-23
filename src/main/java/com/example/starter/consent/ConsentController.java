@@ -48,7 +48,7 @@ public class ConsentController {
 
     @GetMapping("/records")
     public RecordResponse read(@RequestParam @NotBlank String subjectKey,
-                               @RequestParam Purpose purpose,
+                               @RequestParam @NotBlank String purpose,
                                @RequestParam @NotBlank String recordKey) {
         return consentService.read(subjectKey, purpose, recordKey);
     }

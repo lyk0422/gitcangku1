@@ -36,6 +36,13 @@ public class ApiException extends RuntimeException {
         return new ApiException(HttpStatus.CONFLICT, code, message);
     }
 
+    /**
+     * 422：请求结构正确但业务语义不满足（如范围越界、预览结果不一致）。
+     */
+    public static ApiException unprocessable(String code, String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, code, message);
+    }
+
     public static ApiException gone(String code, String message) {
         return new ApiException(HttpStatus.GONE, code, message);
     }

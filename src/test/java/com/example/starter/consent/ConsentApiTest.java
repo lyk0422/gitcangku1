@@ -15,13 +15,11 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.http.MediaType;
-import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
 
@@ -32,23 +30,13 @@ import com.example.starter.consent.dto.RecordWriteRequest;
  */
 @SpringBootTest
 @AutoConfigureMockMvc
-class ConsentApiTest {
+class ConsentApiTest extends DatabaseFixture {
 
     @Autowired
     private MockMvc mockMvc;
 
     @Autowired
-    private JdbcTemplate jdbc;
-
-    @Autowired
     private ConsentService consentService;
-
-    @BeforeEach
-    void cleanTables() {
-        jdbc.update("DELETE FROM consent_record");
-        jdbc.update("DELETE FROM consent_grant");
-        jdbc.update("DELETE FROM idempotency_request");
-    }
 
     private ResultActions grant(String requestId, String subjectKey, String purpose) throws Exception {
         return mockMvc.perform(post("/api/v1/consents/grants")
@@ -63,8 +51,17 @@ class ConsentApiTest {
         return mockMvc.perform(post("/api/v1/records")
                 .contentType(MediaType.APPLICATION_JSON)
                 .content("""
-                        {"requestId":"%s","subjectKey":"%s","purpose":"%s","recordKey":"%s","payload":"%s"}
+                        {"requestId":"%s","subjectKey":"%s","purpose":"%s","recordKey":"%s","payload":"%s","recordAttribute":10}
                         """.formatted(requestId, subjectKey, purpose, recordKey, payload)));
+    }
+
+    private ResultActions write(String requestId, String subjectKey, String purpose,
+                                String recordKey, String payload, long attribute) throws Exception {
+        return mockMvc.perform(post("/api/v1/records")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("""
+                        {"requestId":"%s","subjectKey":"%s","purpose":"%s","recordKey":"%s","payload":"%s","recordAttribute":%d}
+                        """.formatted(requestId, subjectKey, purpose, recordKey, payload, attribute)));
     }
 
     private ResultActions revoke(String requestId, String subjectKey, String purpose, int epoch) throws Exception {
@@ -80,11 +77,6 @@ class ConsentApiTest {
                 .param("subjectKey", subjectKey)
                 .param("purpose", purpose)
                 .param("recordKey", recordKey));
-    }
-
-    private int count(String sql, Object... args) {
-        Integer count = jdbc.queryForObject(sql, Integer.class, args);
-        return count == null ? 0 : count;
     }
 
     // ---------- 授权主流程 ----------
@@ -288,12 +280,12 @@ class ConsentApiTest {
     }
 
     @Test
-    void invalidPurposeReturns400() throws Exception {
+    void unknownPurposeReturns404() throws Exception {
         mockMvc.perform(post("/api/v1/consents/grants")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"requestId\":\"g-1\",\"subjectKey\":\"subj-a\",\"purpose\":\"MARKETING\"}"))
-                .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.code").value("INVALID_ARGUMENT"));
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.code").value("PURPOSE_NOT_ACTIVE"));
     }
 
     @Test
@@ -382,7 +374,7 @@ class ConsentApiTest {
                 ready.countDown();
                 start.await();
                 return consentService.write(new RecordWriteRequest(
-                        requestId, "subj-a", Purpose.RESEARCH, "rec-1", "same-payload")).payload();
+                        requestId, "subj-a", Purpose.RESEARCH, "rec-1", "same-payload", 10L)).payload();
             });
         }
         List<Future<String>> futures = new ArrayList<>();
