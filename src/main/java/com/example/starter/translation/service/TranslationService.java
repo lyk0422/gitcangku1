@@ -71,7 +71,7 @@ public class TranslationService {
     public ApiDtos.SegmentResponse reviseSource(long documentId, String segmentId,
                                               ApiDtos.ReviseSourceRequest request) {
         DocumentRow document = lockDocument(documentId);
-        SegmentRow segment = findSegmentOrThrow(documentId, segmentId);
+        SegmentRow segment = findCurrentSegmentOrThrow(documentId, segmentId);
         int sourceVersion = segment.sourceVersion() + 1;
         repository.updateSegmentSource(documentId, segmentId, request.sourceText(), sourceVersion);
         int draftVersion = bumpDraftVersion(document);
@@ -91,7 +91,7 @@ public class TranslationService {
         if (!document.targetLanguages().contains(normalizedLanguage)) {
             throw ApiException.unprocessable("语言不在文档目标语言中: " + normalizedLanguage);
         }
-        SegmentRow segment = findSegmentOrThrow(documentId, segmentId);
+        SegmentRow segment = findCurrentSegmentOrThrow(documentId, segmentId);
         if (request.sourceVersion() != segment.sourceVersion()) {
             throw ApiException.unprocessable("译文所依据的源文版本 " + request.sourceVersion()
                     + " 与当前源文版本 " + segment.sourceVersion() + " 不匹配");
@@ -117,7 +117,7 @@ public class TranslationService {
                                                        String actorId, ApiDtos.ApproveTranslationRequest request) {
         lockDocument(documentId);
         String normalizedLanguage = normalizeLanguage(language);
-        SegmentRow segment = findSegmentOrThrow(documentId, segmentId);
+        SegmentRow segment = findCurrentSegmentOrThrow(documentId, segmentId);
         TranslationRow translation = repository.findTranslation(documentId, segmentId, normalizedLanguage)
                 .orElseThrow(() -> ApiException.notFound(
                         "译文不存在: " + segmentId + "/" + normalizedLanguage));
@@ -281,9 +281,12 @@ public class TranslationService {
         List<ApiDtos.TranslationTermStatus> statuses = new ArrayList<>();
         for (TranslationRow translation : repository.listTranslations(documentId)) {
             SegmentRow segment = segments.get(translation.segmentId());
-            List<ApiDtos.TermRuleView> violations = segment == null ? List.of()
-                    : findViolations(segment.sourceText(), translation.language(),
-                            translation.content(), termRules);
+            // 结构修订废止段的旧译文仅作 REFERENCE 来源，不再参与术语状态
+            if (segment == null) {
+                continue;
+            }
+            List<ApiDtos.TermRuleView> violations = findViolations(segment.sourceText(), translation.language(),
+                    translation.content(), termRules);
             statuses.add(new ApiDtos.TranslationTermStatus(translation.segmentId(), translation.language(),
                     translation.translationVersion(), translation.termVersion(),
                     translation.termVersion() != document.termVersion(), violations));
@@ -299,6 +302,15 @@ public class TranslationService {
     private SegmentRow findSegmentOrThrow(long documentId, String segmentId) {
         return repository.findSegment(documentId, segmentId)
                 .orElseThrow(() -> ApiException.notFound("段落不存在: " + segmentId));
+    }
+
+    /** 结构修订后旧段为 SUPERSEDED，源文/译文/批准更新一律拒绝。 */
+    private SegmentRow findCurrentSegmentOrThrow(long documentId, String segmentId) {
+        SegmentRow segment = findSegmentOrThrow(documentId, segmentId);
+        if (!segment.current()) {
+            throw ApiException.unprocessable("段落已被结构修订废止，不能再修改: " + segmentId);
+        }
+        return segment;
     }
 
     private int bumpDraftVersion(DocumentRow document) {

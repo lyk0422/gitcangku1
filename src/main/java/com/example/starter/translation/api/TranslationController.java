@@ -1,5 +1,6 @@
 package com.example.starter.translation.api;
 
+import com.example.starter.translation.service.StructureChangeService;
 import com.example.starter.translation.service.TranslationService;
 import com.example.starter.translation.service.WriteExecutor;
 import com.example.starter.translation.service.WriteResult;
@@ -30,12 +31,16 @@ import java.util.HexFormat;
 public class TranslationController {
 
     private final TranslationService translationService;
+    private final StructureChangeService structureChangeService;
     private final WriteExecutor writeExecutor;
     private final ObjectMapper objectMapper;
 
-    public TranslationController(TranslationService translationService, WriteExecutor writeExecutor,
+    public TranslationController(TranslationService translationService,
+                                 StructureChangeService structureChangeService,
+                                 WriteExecutor writeExecutor,
                                  ObjectMapper objectMapper) {
         this.translationService = translationService;
+        this.structureChangeService = structureChangeService;
         this.writeExecutor = writeExecutor;
         this.objectMapper = objectMapper;
     }
@@ -134,6 +139,32 @@ public class TranslationController {
     public ResponseEntity<String> getRelease(@PathVariable long documentId, @PathVariable int publishedVersion) {
         return ResponseEntity.ok().contentType(MediaType.APPLICATION_JSON)
                 .body(translationService.getRelease(documentId, publishedVersion));
+    }
+
+    /**
+     * 结构修订：一次 changeKey 完成 SPLIT（1 段拆 2~5 段）或 MERGE（2~5 个连续段合 1 段），
+     * 原子生成新文档版本、废止旧段、保存源段与各语言双向血缘及 REFERENCE 候选。
+     */
+    @PostMapping("/{documentId}/structure-changes")
+    public ResponseEntity<String> changeStructure(@PathVariable long documentId,
+                                                  @Valid @RequestBody ApiDtos.StructureChangeRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/structure-changes";
+        return writeExecutor.execute(request.requestId(), hash(operation, request),
+                () -> WriteResult.of(201, structureChangeService.changeStructure(documentId, request)))
+                .toResponseEntity();
+    }
+
+    /** 查询当前结构（文档版本与按位置有序的当前段），只读。 */
+    @GetMapping("/{documentId}/structure")
+    public ResponseEntity<ApiDtos.CurrentStructureResponse> getCurrentStructure(@PathVariable long documentId) {
+        return ResponseEntity.ok(structureChangeService.getCurrentStructure(documentId));
+    }
+
+    /** 查询指定段的跨语言血缘（源段双向血缘与各语言 REFERENCE 候选及片段边界），只读。 */
+    @GetMapping("/{documentId}/segments/{segmentId}/lineage")
+    public ResponseEntity<ApiDtos.LineageResponse> getLineage(@PathVariable long documentId,
+                                                              @PathVariable String segmentId) {
+        return ResponseEntity.ok(structureChangeService.getLineage(documentId, segmentId));
     }
 
     /** 计算请求摘要：操作（含路径变量）+ 操作者 + 规范化请求体的 SHA-256。 */

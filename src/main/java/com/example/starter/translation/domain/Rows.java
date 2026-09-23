@@ -24,13 +24,16 @@ public final class Rows {
     }
 
     /**
-     * 段落：文档内唯一 segmentId，含源文及源文版本。
+     * 段落：文档内唯一 segmentId，含源文、源文版本、当前结构位置与状态。
      *
-     * @param segmentId     文档内唯一段落 ID
+     * @param segmentId     文档内唯一段落 ID（含已废止段）
      * @param sourceText    源文正文，UTF-8
-     * @param sourceVersion 源文版本，从 1 开始，每次源文修订加一
+     * @param sourceVersion 源文版本，从 1 开始，每次源文修订加一；结构修订新段从 1 开始
+     * @param position      当前结构中的从 0 开始的连续位置序号；SUPERSEDED 段保留被替换时的位置
+     * @param current       是否为当前结构中的段；false 表示已被结构修订废止（SUPERSEDED）
      */
-    public record SegmentRow(String segmentId, String sourceText, int sourceVersion) {
+    public record SegmentRow(String segmentId, String sourceText, int sourceVersion,
+                             int position, boolean current) {
     }
 
     /**
@@ -81,5 +84,59 @@ public final class Rows {
      */
     public record RequestLogRow(String requestId, String requestHash,
                                 int responseStatus, String responseBody) {
+    }
+
+    /**
+     * 结构修订事务记录。
+     *
+     * @param changeKey                 全局唯一结构修订键
+     * @param operation                 操作类型：SPLIT=拆分，MERGE=合并
+     * @param documentVersion           修订成功后生成的文档草稿版本
+     * @param expectedDocumentVersion   提交时携带的期望文档草稿版本
+     */
+    public record StructureChangeRow(String changeKey, String operation,
+                                     int documentVersion, int expectedDocumentVersion) {
+    }
+
+    /**
+     * 源段结构血缘行：旧源段与新源段的有序对应。
+     *
+     * @param changeKey        所属结构修订键
+     * @param oldSegmentId     旧源段 ID
+     * @param oldSourceVersion 修订时旧源段的源文版本
+     * @param newSegmentId     新源段 ID
+     * @param ordinal          有序序号：拆分时为新段顺序，合并时为旧段连续顺序
+     */
+    public record SegmentLineageRow(String changeKey, String oldSegmentId, int oldSourceVersion,
+                                    String newSegmentId, int ordinal) {
+    }
+
+    /**
+     * 新段旧译文 REFERENCE 候选：按有序映射直接拼接的旧译文正文。
+     *
+     * @param changeKey    生成该候选的结构修订键
+     * @param newSegmentId 候选所属新源段 ID
+     * @param language     目标语言码，小写
+     * @param content      按映射顺序直接拼接的旧译文正文（无分隔符）
+     */
+    public record TranslationReferenceRow(String changeKey, String newSegmentId,
+                                          String language, String content) {
+    }
+
+    /**
+     * 跨语言译文血缘片段：新段到旧译文片段的有序来源映射及字符边界。
+     *
+     * @param changeKey              所属结构修订键
+     * @param newSegmentId           新源段 ID
+     * @param language               目标语言码，小写
+     * @param oldSegmentId           旧译文所属旧源段 ID
+     * @param oldTranslationVersion  修订时旧译文的译文版本
+     * @param ordinal                同一新段同一语言内从 0 开始的有序片段序号
+     * @param startOffset            片段在拼接候选中的起始字符偏移（含）
+     * @param endOffset              片段在拼接候选中的结束字符偏移（不含）
+     */
+    public record LineageFragmentRow(String changeKey, String newSegmentId, String language,
+                                     String oldSegmentId, int oldTranslationVersion,
+                                     int ordinal, int startOffset, int endOffset) {
     }
 }

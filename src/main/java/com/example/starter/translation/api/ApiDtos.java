@@ -132,4 +132,98 @@ public final class ApiDtos {
             this(error, message, null);
         }
     }
+
+    /** 结构修订中的新段输入：新段键全局（文档内全部历史段）唯一，源文本非空。 */
+    public record StructureSegmentInput(
+            @NotBlank(message = "segmentId 不能为空") @Size(max = 64) String segmentId,
+            @NotBlank(message = "sourceText 不能为空") String sourceText) {
+    }
+
+    /** 新段到某旧译文片段的一条有序来源：旧段 ID 与修订时期望的译文版本（0 表示旧段尚无译文）。 */
+    public record StructureFragmentInput(
+            @NotBlank(message = "片段 segmentId 不能为空") @Size(max = 64) String segmentId,
+            @PositiveOrZero(message = "translationVersion 不能为负数") int translationVersion) {
+    }
+
+    /** 单个新段在单个目标语言上的有序来源映射。 */
+    public record StructureMappingInput(
+            @NotBlank(message = "newSegmentId 不能为空") @Size(max = 64) String newSegmentId,
+            @NotBlank(message = "language 不能为空") String language,
+            @NotNull(message = "fragments 不能为空") @Size(min = 1, max = 5, message = "片段数须为 1~5")
+            List<@Valid StructureFragmentInput> fragments) {
+    }
+
+    /** 拆分输入：一个当前段拆为 2~5 个新段，并携带该旧段的期望源文版本。 */
+    public record StructureSplitInput(
+            @NotBlank(message = "segmentId 不能为空") @Size(max = 64) String segmentId,
+            @Positive(message = "expectedSourceVersion 必须为正数") int expectedSourceVersion,
+            @NotNull(message = "newSegments 不能为空") @Size(min = 2, max = 5, message = "拆分新段须为 2~5 个")
+            List<@Valid StructureSegmentInput> newSegments) {
+    }
+
+    /** 合并输入：2~5 个连续当前段合为一个新段，segmentIds 与期望源文版本按位置一一对应。 */
+    public record StructureMergeInput(
+            @NotNull(message = "segmentIds 不能为空") @Size(min = 2, max = 5, message = "合并旧段须为 2~5 个")
+            List<@NotBlank(message = "segmentId 不能为空") String> segmentIds,
+            @NotNull(message = "expectedSourceVersions 不能为空")
+            List<@Positive(message = "expectedSourceVersion 必须为正数") Integer> expectedSourceVersions,
+            @NotNull(message = "newSegment 不能为空") @Valid StructureSegmentInput newSegment) {
+    }
+
+    /**
+     * 结构修订请求：一次 changeKey 只能做 SPLIT 或 MERGE 一种操作；
+     * 携带期望文档版本、各旧源段版本、涉及语言当前术语版本及每个新段每语言的有序来源映射。
+     */
+    public record StructureChangeRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @NotBlank(message = "changeKey 不能为空") @Size(max = 128) String changeKey,
+            @NotBlank(message = "operation 不能为空") String operation,
+            @Positive(message = "expectedDocumentVersion 必须为正数") int expectedDocumentVersion,
+            @PositiveOrZero(message = "expectedTermVersion 不能为负数") int expectedTermVersion,
+            @Valid StructureSplitInput split,
+            @Valid StructureMergeInput merge,
+            @NotNull(message = "mappings 不能为空")
+            List<@Valid StructureMappingInput> mappings) {
+    }
+
+    /** 当前结构中的段落视图：含位置与源文版本。 */
+    public record StructureSegmentView(String segmentId, String sourceText, int sourceVersion, int position) {
+    }
+
+    /** 译文血缘片段视图：旧段、旧译文版本、序号及在拼接候选中的字符边界。 */
+    public record LineageFragmentView(String segmentId, int translationVersion, int ordinal,
+                                      int startOffset, int endOffset) {
+    }
+
+    /** 新段某语言的 REFERENCE 候选视图：拼接正文与全部有序片段边界。 */
+    public record ReferenceView(String changeKey, String segmentId, String language, String content,
+                                List<LineageFragmentView> fragments) {
+    }
+
+    /** 结构修订成功响应：新文档版本、新段及各语言 REFERENCE 候选。 */
+    public record StructureChangeResponse(long documentId, String changeKey, String operation,
+                                          int documentVersion, List<StructureSegmentView> segments,
+                                          List<ReferenceView> references) {
+    }
+
+    /** 当前结构只读查询响应。 */
+    public record CurrentStructureResponse(long documentId, int documentVersion,
+                                           List<StructureSegmentView> segments) {
+    }
+
+    /** 源段结构血缘边视图：对端段 ID、所属修订与序号；SPLIT 一旧对多新，MERGE 多旧对一新。 */
+    public record SourceLineageEdgeView(String changeKey, String segmentId, int sourceVersion, int ordinal) {
+    }
+
+    /**
+     * 跨语言血缘只读查询响应：
+     * sources 为本段（作为新段）的旧源段来源；derived 为本段（作为旧段）派生出的新段；
+     * references 为新→旧方向的各语言 REFERENCE 候选；derivedTranslations 为旧→新方向的消费片段。
+     */
+    public record LineageResponse(long documentId, String segmentId, boolean current,
+                                  List<SourceLineageEdgeView> sources,
+                                  List<SourceLineageEdgeView> derived,
+                                  List<ReferenceView> references,
+                                  List<ReferenceView> derivedTranslations) {
+    }
 }
