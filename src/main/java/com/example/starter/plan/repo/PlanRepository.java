@@ -219,4 +219,20 @@ public class PlanRepository {
     public void acquirePublishLock() {
         jdbc.queryForObject("SELECT id FROM publish_lock WHERE id = 1 FOR UPDATE", Integer.class);
     }
+
+    /**
+     * 查询当前 PUBLISHED 计划在指定区段、与左闭右开窗口相交（start &lt; windowEnd 且 end &gt; windowStart）
+     * 的全部占用，按计划 id 与计划内序号升序。用于封锁窗口预览与激活时重新计算影响集合。
+     */
+    public List<Occupancy> findPublishedOccupanciesIntersecting(String sectionId,
+                                                                long windowStartUtc,
+                                                                long windowEndUtc) {
+        return jdbc.query("SELECT o.id, o.plan_id, o.seq, o.train_no, o.section_id,"
+                        + " o.start_utc, o.end_utc FROM rail_plan_occupancy o"
+                        + " JOIN rail_day_plan p ON p.id = o.plan_id"
+                        + " WHERE p.status = 'PUBLISHED' AND o.section_id = ?"
+                        + " AND o.start_utc < ? AND o.end_utc > ?"
+                        + " ORDER BY o.plan_id, o.seq",
+                OCCUPANCY_MAPPER, sectionId, windowEndUtc, windowStartUtc);
+    }
 }
