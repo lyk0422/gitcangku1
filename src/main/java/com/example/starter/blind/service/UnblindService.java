@@ -27,15 +27,18 @@ public class UnblindService {
     private final UnblindRequestRepository unblindRequestRepository;
     private final ExperimentService experimentService;
     private final ExperimentRepository experimentRepository;
+    private final ContaminationService contaminationService;
     private final Clock clock;
 
     public UnblindService(UnblindRequestRepository unblindRequestRepository,
                           ExperimentService experimentService,
                           ExperimentRepository experimentRepository,
+                          ContaminationService contaminationService,
                           Clock clock) {
         this.unblindRequestRepository = unblindRequestRepository;
         this.experimentService = experimentService;
         this.experimentRepository = experimentRepository;
+        this.contaminationService = contaminationService;
         this.clock = clock;
     }
 
@@ -86,6 +89,10 @@ public class UnblindService {
         if (row.applicantActor().equals(reviewerActor)) {
             throw ApiException.forbidden("批准人必须是不同于申请人的另一名 REVIEWER");
         }
+        // 审核隔离门禁：申请人或审核人一旦在目标参与者污染闭包内，即不得作为新审核人。
+        // 在批准事务内锁定该参与者边集，防止并发新增披露绕过门禁。
+        contaminationService.assertReviewerNotContaminated(
+                row.experimentId(), row.participantId(), reviewerActor);
         // 从数据库读取处理映射（盲底），批准时写入申请记录；处理代码不打日志。
         AllocationRow allocation =
                 experimentService.mustFindAllocationRow(row.experimentId(), row.participantId());
@@ -97,6 +104,10 @@ public class UnblindService {
         long now = clock.nowMillis();
         unblindRequestRepository.approve(unblindRequestId, reviewerActor,
                 seat.treatment(), now);
+        // 批准即向申请人披露处理代码：写入申请人种子污染边并生成首个 OPEN 闭包版本。
+        // 污染记录不扩大查询权限——处理代码仍仅申请人本人可查。
+        contaminationService.seedApprovedApplicant(
+                row.experimentId(), row.participantId(), row.applicantActor());
         return new UnblindRequestView(row.id(), row.experimentId(), row.participantId(),
                 row.reason(), row.applicantActor(), reviewerActor, "APPROVED",
                 row.createdAt(), now);

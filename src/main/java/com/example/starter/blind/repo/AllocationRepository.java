@@ -64,6 +64,19 @@ public class AllocationRepository {
     }
 
     /**
+     * 行级锁定（实验、参与者）分配行。分配行在参与者登记后恒定存在且不删除，
+     * 作为污染披露、版本计算、隔离发起与揭盲审核门禁的每参与者串行锚点。
+     */
+    public AllocationRow lockByExperimentAndParticipant(String experimentId, String participantId) {
+        List<AllocationRow> rows = jdbc.query(
+                "SELECT id, experiment_id, participant_id, block_no, seat_no, blind_code, status, "
+                        + "assigned_actor, assigned_at, withdrawn_at "
+                        + "FROM allocation WHERE experiment_id = ? AND participant_id = ? FOR UPDATE",
+                ALLOCATION_MAPPER, experimentId, participantId);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /**
      * 原子领取按区组、席位顺序排列的第一个空位：把尚未被占用的最小 block_no/seat_no
      * 关联给新参与者。依赖 allocation(experiment_id, block_no, seat_no) 唯一索引兜底并发。
      *

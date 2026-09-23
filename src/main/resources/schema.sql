@@ -112,3 +112,97 @@ COMMENT ON COLUMN idempotent_request.fingerprint IS '请求参数指纹（含路
 COMMENT ON COLUMN idempotent_request.response_status IS '首次成功响应的 HTTP 状态码，重放时原样返回';
 COMMENT ON COLUMN idempotent_request.response_body IS '首次成功响应体 JSON，重放时原样返回';
 COMMENT ON COLUMN idempotent_request.created_at IS '记录时间，Unix 毫秒，UTC';
+
+-- ===================== 揭盲泄露传播 =====================
+
+CREATE TABLE IF NOT EXISTS disclosure_event (
+    exposure_key       VARCHAR(64)  NOT NULL,
+    experiment_id      VARCHAR(64)  NOT NULL,
+    source_actor       VARCHAR(64)  NOT NULL,
+    participant_count  INT          NOT NULL,
+    receiver_count     INT          NOT NULL,
+    new_edges          INT          NOT NULL,
+    created_at         BIGINT       NOT NULL,
+    CONSTRAINT pk_disclosure_event PRIMARY KEY (exposure_key),
+    CONSTRAINT ck_disclosure_participant_count CHECK (participant_count >= 1),
+    CONSTRAINT ck_disclosure_receiver_count CHECK (receiver_count BETWEEN 1 AND 20),
+    CONSTRAINT ck_disclosure_new_edges CHECK (new_edges >= 0)
+);
+COMMENT ON TABLE  disclosure_event IS '泄露披露事件；披露源固定为登记人本人（X-Actor-Id），exposure_key 全局唯一，失败回滚不占键';
+COMMENT ON COLUMN disclosure_event.exposure_key IS '调用方提供的披露幂等键，全局唯一，重复登记返回 409';
+COMMENT ON COLUMN disclosure_event.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN disclosure_event.source_actor IS '披露源操作者编号，只能登记本人发出的披露，禁止伪造他人为源';
+COMMENT ON COLUMN disclosure_event.participant_count IS '去重后涉及的参与者数量，至少 1 个';
+COMMENT ON COLUMN disclosure_event.receiver_count IS '去重后直接接收披露的操作者数量，1~20';
+COMMENT ON COLUMN disclosure_event.new_edges IS '本次实际新增的污染边数量；已存在的重复边不新增';
+COMMENT ON COLUMN disclosure_event.created_at IS '登记时间，Unix 毫秒，UTC';
+
+CREATE TABLE IF NOT EXISTS contamination_edge (
+    id             BIGINT       NOT NULL AUTO_INCREMENT,
+    experiment_id  VARCHAR(64)  NOT NULL,
+    participant_id VARCHAR(64)  NOT NULL,
+    actor_id       VARCHAR(64)  NOT NULL,
+    source_actor   VARCHAR(64)  NOT NULL,
+    exposure_key   VARCHAR(64),
+    created_at     BIGINT       NOT NULL,
+    CONSTRAINT pk_contamination_edge PRIMARY KEY (id),
+    CONSTRAINT uq_contamination_edge UNIQUE (experiment_id, participant_id, actor_id)
+);
+COMMENT ON TABLE  contamination_edge IS '污染有向边（参与者→操作者）：该操作者已获知该参与者处理代码；重复边不新增，关闭版本不删除边';
+COMMENT ON COLUMN contamination_edge.id IS '污染边自增主键';
+COMMENT ON COLUMN contamination_edge.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN contamination_edge.participant_id IS '被获知处理代码的合成参与者编号';
+COMMENT ON COLUMN contamination_edge.actor_id IS '被污染操作者编号（已获知处理代码者），是污染闭包的计算对象';
+COMMENT ON COLUMN contamination_edge.source_actor IS '首次把该操作者带入闭包的披露源；揭盲批准种子边的来源为申请人本人';
+COMMENT ON COLUMN contamination_edge.exposure_key IS '产生该边的披露键；揭盲批准种子边为 NULL';
+COMMENT ON COLUMN contamination_edge.created_at IS '边首次写入时间，Unix 毫秒，UTC';
+
+CREATE TABLE IF NOT EXISTS contamination_version (
+    id             BIGINT       NOT NULL AUTO_INCREMENT,
+    experiment_id  VARCHAR(64)  NOT NULL,
+    participant_id VARCHAR(64)  NOT NULL,
+    version        INT          NOT NULL,
+    status         VARCHAR(16)  NOT NULL,
+    actors         CLOB         NOT NULL,
+    created_at     BIGINT       NOT NULL,
+    CONSTRAINT pk_contamination_version PRIMARY KEY (id),
+    CONSTRAINT uq_contamination_version UNIQUE (experiment_id, participant_id, version),
+    CONSTRAINT ck_contamination_version_status CHECK (status IN ('OPEN', 'CLOSED'))
+);
+COMMENT ON TABLE  contamination_version IS '污染闭包版本；同一参与者闭包变更（新增边）生成新版本 OPEN，隔离确认只关闭指定版本快照，不删边';
+COMMENT ON COLUMN contamination_version.id IS '版本自增主键';
+COMMENT ON COLUMN contamination_version.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN contamination_version.participant_id IS '参与者编号';
+COMMENT ON COLUMN contamination_version.version IS '版本号，同一参与者内从 1 递增';
+COMMENT ON COLUMN contamination_version.status IS '版本状态：OPEN=可继续追加披露；CLOSED=已被隔离单冻结审计快照';
+COMMENT ON COLUMN contamination_version.actors IS '该版本闭包操作者编号集合快照，JSON 数组，去重按字典序排序，不含处理代码';
+COMMENT ON COLUMN contamination_version.created_at IS '版本生成时间，Unix 毫秒，UTC';
+
+CREATE TABLE IF NOT EXISTS quarantine_order (
+    id              VARCHAR(64)  NOT NULL,
+    experiment_id   VARCHAR(64)  NOT NULL,
+    participant_id  VARCHAR(64)  NOT NULL,
+    version         INT          NOT NULL,
+    status          VARCHAR(16)  NOT NULL,
+    initiator_actor VARCHAR(64)  NOT NULL,
+    confirmer_actor VARCHAR(64),
+    closure_actors  CLOB         NOT NULL,
+    created_at      BIGINT       NOT NULL,
+    confirmed_at    BIGINT,
+    pending_key     VARCHAR(160),
+    CONSTRAINT pk_quarantine_order PRIMARY KEY (id),
+    CONSTRAINT uq_quarantine_pending UNIQUE (pending_key),
+    CONSTRAINT ck_quarantine_status CHECK (status IN ('OPEN', 'CLOSED'))
+);
+COMMENT ON TABLE  quarantine_order IS '污染隔离单；发起时冻结当前闭包与版本，须另一名不在闭包内的 COMPLIANCE 确认后关闭该版本';
+COMMENT ON COLUMN quarantine_order.id IS '隔离单编号，全局唯一，QO- 前缀';
+COMMENT ON COLUMN quarantine_order.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN quarantine_order.participant_id IS '被隔离观察的参与者编号';
+COMMENT ON COLUMN quarantine_order.version IS '发起时提交的闭包版本号；确认时该版本被置 CLOSED';
+COMMENT ON COLUMN quarantine_order.status IS '隔离单状态：OPEN=待确认；CLOSED=已确认并冻结审计快照';
+COMMENT ON COLUMN quarantine_order.initiator_actor IS '发起隔离单的合规负责人编号';
+COMMENT ON COLUMN quarantine_order.confirmer_actor IS '确认关闭的另一名合规负责人编号，且不在闭包内；未确认为 NULL';
+COMMENT ON COLUMN quarantine_order.closure_actors IS '发起时提交并冻结的闭包操作者快照，JSON 数组，不含处理代码';
+COMMENT ON COLUMN quarantine_order.created_at IS '发起时间，Unix 毫秒，UTC';
+COMMENT ON COLUMN quarantine_order.confirmed_at IS '确认时间，Unix 毫秒，UTC；NULL 表示未确认';
+COMMENT ON COLUMN quarantine_order.pending_key IS '待确认去重列：OPEN 时等于 experiment_id||participant_id，CLOSED 置 NULL；唯一索引保证同参与者至多一个待确认单';
