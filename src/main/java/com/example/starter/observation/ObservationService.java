@@ -71,7 +71,8 @@ public class ObservationService {
     @Transactional
     public WriteOutcome create(CreateObservationRequest request) {
         String fingerprint = fingerprint("CREATE", request.observationId(), request.location(),
-                request.reading(), request.note());
+                request.reading(), request.note(), request.siteKey(), request.type(),
+                request.observedAt() == null ? null : request.observedAt().toString(), request.deviceId());
         WriteOutcome replayed = checkReplay(request.requestId(), fingerprint);
         if (replayed != null) {
             return replayed;
@@ -85,7 +86,9 @@ public class ObservationService {
             throw ApiException.conflict("observation already exists: " + request.observationId(), null);
         }
         ObservationSnapshot snapshot = new ObservationSnapshot(request.observationId(), 1,
-                request.location(), request.reading(), request.note(), false);
+                request.location(), request.reading(), request.note(), false,
+                request.siteKey(), request.type(), request.observedAt(), request.deviceId(),
+                MergeStatus.ACTIVE);
         try {
             observationRepository.insertCurrent(snapshot);
         } catch (DuplicateKeyException e) {
@@ -117,6 +120,10 @@ public class ObservationService {
         if (current.deleted()) {
             throw ApiException.gone("observation already deleted: " + observationId);
         }
+        if (current.mergeStatus() == MergeStatus.MERGED) {
+            throw ApiException.conflict("observation already merged and rejects further updates: " + observationId,
+                    current.version());
+        }
         ObservationSnapshot base = observationRepository.findVersion(observationId, request.baseVersion())
                 .orElseThrow(() -> ApiException.notFound(
                         "base version not found: " + observationId + "@" + request.baseVersion()));
@@ -131,13 +138,13 @@ public class ObservationService {
             throw ApiException.mergeConflict(conflictFields, current.version());
         }
 
-        ObservationSnapshot merged = new ObservationSnapshot(observationId, current.version(),
+        ObservationSnapshot merged = withContent(current, current.version(),
                 mergedLocation, mergedReading, mergedNote, false);
         if (sameContent(merged, current)) {
             // 合并结果与当前完全相同：返回当前版本，不加版本
             return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(current));
         }
-        ObservationSnapshot next = new ObservationSnapshot(observationId, current.version() + 1,
+        ObservationSnapshot next = withContent(current, current.version() + 1,
                 mergedLocation, mergedReading, mergedNote, false);
         observationRepository.updateCurrent(next);
         observationRepository.insertVersion(next);
@@ -163,6 +170,10 @@ public class ObservationService {
                 .orElseThrow(() -> ApiException.notFound("observation not found: " + observationId));
         if (current.deleted()) {
             throw ApiException.gone("observation already deleted: " + observationId);
+        }
+        if (current.mergeStatus() == MergeStatus.MERGED) {
+            throw ApiException.conflict("observation already merged and cannot be deleted: " + observationId,
+                    current.version());
         }
         if (request.expectedVersion() != current.version()) {
             throw ApiException.conflict("expectedVersion mismatch", current.version());
@@ -223,6 +234,11 @@ public class ObservationService {
             throw ApiException.gone("observation already deleted: " + observationId);
         }
 
+        if (current.mergeStatus() == MergeStatus.MERGED) {
+            throw ApiException.conflict("observation already merged and rejects further conflict resolution: "
+                    + observationId, current.version());
+        }
+
         if (request.expectedCurrentVersion() != current.version()) {
             throw ApiException.conflict("expectedCurrentVersion mismatch", current.version());
         }
@@ -252,12 +268,12 @@ public class ObservationService {
         String resolvedNote = resolveFieldValue(noteConflict, selections.get("note"),
                 base.note(), current.note(), request.note(), false);
 
-        ObservationSnapshot merged = new ObservationSnapshot(observationId, current.version(),
+        ObservationSnapshot merged = withContent(current, current.version(),
                 resolvedLocation, resolvedReading, resolvedNote, false);
         boolean contentChanged = !sameContent(merged, current);
         int newVersion = contentChanged ? current.version() + 1 : current.version();
         if (contentChanged) {
-            ObservationSnapshot next = new ObservationSnapshot(observationId, newVersion,
+            ObservationSnapshot next = withContent(current, newVersion,
                     resolvedLocation, resolvedReading, resolvedNote, false);
             observationRepository.updateCurrent(next);
             observationRepository.insertVersion(next);
@@ -285,7 +301,7 @@ public class ObservationService {
         }
 
         ObservationSnapshot pointed = contentChanged
-                ? new ObservationSnapshot(observationId, newVersion, resolvedLocation, resolvedReading, resolvedNote, false)
+                ? withContent(current, newVersion, resolvedLocation, resolvedReading, resolvedNote, false)
                 : current;
         return completeResolve(request.requestId(), HttpStatus.OK,
                 ResolutionResponse.of(record, pointed, objectMapper));
@@ -368,6 +384,17 @@ public class ObservationService {
         return Objects.equals(merged.location(), current.location())
                 && Objects.equals(merged.note(), current.note())
                 && readingEquals(merged.reading(), current.reading());
+    }
+
+    /**
+     * 以当前快照的归并元数据（siteKey/type/observedAt/deviceId/归并状态）构造新内容版本，
+     * 保证离线合并与冲突解决只改业务字段，不改变分组维度与归并生命周期。
+     */
+    private ObservationSnapshot withContent(ObservationSnapshot current, int version,
+                                            String location, String reading, String note, boolean deleted) {
+        return new ObservationSnapshot(current.observationId(), version, location, reading, note, deleted,
+                current.siteKey(), current.obsType(), current.observedAt(), current.deviceId(),
+                current.mergeStatus());
     }
 
     private boolean readingEquals(String left, String right) {

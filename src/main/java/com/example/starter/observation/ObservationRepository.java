@@ -4,6 +4,10 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
 
+import java.sql.Timestamp;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -13,13 +17,21 @@ import java.util.Optional;
 @Repository
 public class ObservationRepository {
 
-    private static final RowMapper<ObservationSnapshot> SNAPSHOT_MAPPER = (rs, rowNum) -> new ObservationSnapshot(
-            rs.getString("observation_id"),
-            rs.getInt("version"),
-            rs.getString("location"),
-            rs.getString("reading"),
-            rs.getString("note"),
-            rs.getBoolean("deleted"));
+    private static final RowMapper<ObservationSnapshot> SNAPSHOT_MAPPER = (rs, rowNum) -> {
+        Timestamp observedAt = rs.getTimestamp("observed_at");
+        return new ObservationSnapshot(
+                rs.getString("observation_id"),
+                rs.getInt("version"),
+                rs.getString("location"),
+                rs.getString("reading"),
+                rs.getString("note"),
+                rs.getBoolean("deleted"),
+                rs.getString("site_key"),
+                rs.getString("obs_type"),
+                observedAt == null ? null : observedAt.toInstant(),
+                rs.getString("device_id"),
+                MergeStatus.fromValue(rs.getString("merge_status")));
+    };
 
     private final JdbcTemplate jdbcTemplate;
 
@@ -32,7 +44,8 @@ public class ObservationRepository {
      */
     public Optional<ObservationSnapshot> findCurrent(String observationId) {
         return jdbcTemplate.query(
-                        "SELECT observation_id, version, location, reading, note, deleted "
+                        "SELECT observation_id, version, location, reading, note, deleted, "
+                                + "site_key, obs_type, observed_at, device_id, merge_status "
                                 + "FROM observation_current WHERE observation_id = ?",
                         SNAPSHOT_MAPPER, observationId)
                 .stream().findFirst();
@@ -43,10 +56,24 @@ public class ObservationRepository {
      */
     public Optional<ObservationSnapshot> findCurrentForUpdate(String observationId) {
         return jdbcTemplate.query(
-                        "SELECT observation_id, version, location, reading, note, deleted "
+                        "SELECT observation_id, version, location, reading, note, deleted, "
+                                + "site_key, obs_type, observed_at, device_id, merge_status "
                                 + "FROM observation_current WHERE observation_id = ? FOR UPDATE",
                         SNAPSHOT_MAPPER, observationId)
                 .stream().findFirst();
+    }
+
+    /**
+     * 对给定记录键逐个加行锁（SELECT ... FOR UPDATE）并读取当前状态。
+     * 调用方须传入已升序去重的键，以保证簇事务与单记录写事务之间加锁顺序一致、避免死锁。
+     * 墓碑/已归并等状态不过滤，由业务层在锁内重读后判定；不存在的键不产生行。
+     */
+    public List<ObservationSnapshot> findCurrentForUpdate(List<String> orderedObservationIds) {
+        List<ObservationSnapshot> result = new ArrayList<>();
+        for (String observationId : orderedObservationIds) {
+            findCurrentForUpdate(observationId).ifPresent(result::add);
+        }
+        return result;
     }
 
     /**
@@ -54,10 +81,28 @@ public class ObservationRepository {
      */
     public Optional<ObservationSnapshot> findVersion(String observationId, int version) {
         return jdbcTemplate.query(
-                        "SELECT observation_id, version, location, reading, note, deleted "
+                        "SELECT observation_id, version, location, reading, note, deleted, "
+                                + "site_key, obs_type, observed_at, device_id, merge_status "
                                 + "FROM observation_version WHERE observation_id = ? AND version = ?",
                         SNAPSHOT_MAPPER, observationId, version)
                 .stream().findFirst();
+    }
+
+    /**
+     * 查找同一 siteKey + type 下、观测时刻落在 [from, to] 区间的活跃未归并未删除记录，
+     * 用于重复簇候选预览。只读、不加锁，不代表任何后台自动聚类结果。
+     */
+    public List<ObservationSnapshot> findActiveCandidates(String siteKey, String obsType,
+                                                          Instant from, Instant to) {
+        return jdbcTemplate.query(
+                "SELECT observation_id, version, location, reading, note, deleted, "
+                        + "site_key, obs_type, observed_at, device_id, merge_status "
+                        + "FROM observation_current "
+                        + "WHERE site_key = ? AND obs_type = ? AND deleted = FALSE AND merge_status = 'ACTIVE' "
+                        + "AND observed_at BETWEEN ? AND ? "
+                        + "ORDER BY observed_at ASC, observation_id ASC",
+                SNAPSHOT_MAPPER, siteKey, obsType,
+                Timestamp.from(from), Timestamp.from(to));
     }
 
     /**
@@ -65,10 +110,12 @@ public class ObservationRepository {
      */
     public void insertCurrent(ObservationSnapshot snapshot) {
         jdbcTemplate.update(
-                "INSERT INTO observation_current (observation_id, location, reading, note, version, deleted, updated_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                "INSERT INTO observation_current (observation_id, location, reading, note, version, deleted, "
+                        + "site_key, obs_type, observed_at, device_id, merge_status, updated_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                 snapshot.observationId(), snapshot.location(), snapshot.reading(), snapshot.note(),
-                snapshot.version(), snapshot.deleted());
+                snapshot.version(), snapshot.deleted(), snapshot.siteKey(), snapshot.obsType(),
+                toTimestamp(snapshot.observedAt()), snapshot.deviceId(), snapshot.mergeStatus().name());
     }
 
     /**
@@ -77,9 +124,12 @@ public class ObservationRepository {
     public void updateCurrent(ObservationSnapshot snapshot) {
         jdbcTemplate.update(
                 "UPDATE observation_current SET location = ?, reading = ?, note = ?, version = ?, deleted = ?, "
+                        + "site_key = ?, obs_type = ?, observed_at = ?, device_id = ?, merge_status = ?, "
                         + "updated_at = CURRENT_TIMESTAMP WHERE observation_id = ?",
                 snapshot.location(), snapshot.reading(), snapshot.note(),
-                snapshot.version(), snapshot.deleted(), snapshot.observationId());
+                snapshot.version(), snapshot.deleted(), snapshot.siteKey(), snapshot.obsType(),
+                toTimestamp(snapshot.observedAt()), snapshot.deviceId(),
+                snapshot.mergeStatus().name(), snapshot.observationId());
     }
 
     /**
@@ -93,13 +143,31 @@ public class ObservationRepository {
     }
 
     /**
+     * 将成员记录置为 MERGED：仅前进归并状态，内容字段与 generation（version）冻结不变。
+     */
+    public void markMerged(String observationId) {
+        jdbcTemplate.update(
+                "UPDATE observation_current SET merge_status = 'MERGED', updated_at = CURRENT_TIMESTAMP "
+                        + "WHERE observation_id = ?",
+                observationId);
+    }
+
+    /**
      * 追加一条完整版本快照，历史永不删除。
      */
     public void insertVersion(ObservationSnapshot snapshot) {
         jdbcTemplate.update(
-                "INSERT INTO observation_version (observation_id, version, location, reading, note, deleted, created_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                "INSERT INTO observation_version (observation_id, version, location, reading, note, deleted, "
+                        + "site_key, obs_type, observed_at, device_id, merge_status, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                 snapshot.observationId(), snapshot.version(), snapshot.location(),
-                snapshot.reading(), snapshot.note(), snapshot.deleted());
+                snapshot.reading(), snapshot.note(), snapshot.deleted(),
+                snapshot.siteKey(), snapshot.obsType(),
+                toTimestamp(snapshot.observedAt()), snapshot.deviceId(),
+                snapshot.mergeStatus().name());
+    }
+
+    private Timestamp toTimestamp(Instant instant) {
+        return instant == null ? null : Timestamp.from(instant);
     }
 }
