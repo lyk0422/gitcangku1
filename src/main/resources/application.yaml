@@ -4,13 +4,18 @@ spring:
   config:
     import: "optional:configtree:/run/secrets/"
   datasource:
-    url: ${DB_URL}
-    username: ${DB_USER}
+    # 默认为嵌入式 H2（MODE=MySQL）；提供 MySQL 的 DB_URL/DB_USER 时由 Spring 按 URL 自动推断驱动。
+    url: ${DB_URL:jdbc:h2:mem:restitution;MODE=MySQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=10000}
+    username: ${DB_USER:sa}
+    password: ${DB_PASSWORD:}
     hikari:
       maximum-pool-size: 5
       minimum-idle: 1
       connection-timeout: 10000
       validation-timeout: 3000
+  sql:
+    init:
+      mode: always
   jackson:
     time-zone: Asia/Shanghai
   lifecycle:
