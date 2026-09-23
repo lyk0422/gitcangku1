@@ -60,6 +60,17 @@ public class ObservationController {
     }
 
     /**
+     * 墓碑显式恢复：当前为墓碑且 expectedVersion 匹配时，从已存在的非墓碑历史版本复制内容，
+     * 生成墓碑版本 + 1 的新快照，合并代次加一。
+     */
+    @PostMapping("/{observationId}/restore")
+    public ResponseEntity<ObservationResponse> restore(@PathVariable String observationId,
+                                                       @Valid @RequestBody RestoreObservationRequest request) {
+        ObservationService.WriteOutcome outcome = observationService.restore(observationId, request);
+        return ResponseEntity.status(outcome.status()).body(outcome.body());
+    }
+
+    /**
      * 查询当前内容；墓碑只返回删除状态和版本。
      */
     @GetMapping("/{observationId}")
@@ -102,6 +113,16 @@ public class ObservationController {
     public List<ResolutionResponse> listResolutions(@PathVariable String observationId) {
         return observationService.listResolutions(observationId).stream()
                 .map(this::resolutionResponse)
+                .toList();
+    }
+
+    /**
+     * 按 observationId 查询墓碑恢复历史，按恢复时刻先后排序；只读，不写入。
+     */
+    @GetMapping("/{observationId}/restores")
+    public List<RestoreHistoryResponse> listRestores(@PathVariable String observationId) {
+        return observationService.listRestoreHistory(observationId).stream()
+                .map(RestoreHistoryResponse::of)
                 .toList();
     }
 

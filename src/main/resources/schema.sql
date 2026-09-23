@@ -4,19 +4,21 @@
 -- 观测记录当前状态表：每条观测记录一行，version 从 1 开始单调递增。
 CREATE TABLE IF NOT EXISTS observation_current (
     observation_id VARCHAR(64) NOT NULL COMMENT '观测记录唯一标识',
-    location VARCHAR(512) NOT NULL COMMENT '观测地点（可编辑字段）',
-    reading VARCHAR(64) NOT NULL COMMENT '观测读数，十进制字符串，最多三位小数，比较按数值（可编辑字段）',
-    note VARCHAR(1024) NOT NULL COMMENT '观测备注（可编辑字段）',
+    location VARCHAR(512) NOT NULL COMMENT '观测地点（可编辑字段）；墓碑行保留删除前原值但查询不返回',
+    reading VARCHAR(64) NOT NULL COMMENT '观测读数，十进制字符串，最多三位小数，比较按数值（可编辑字段）；墓碑行保留原值但查询不返回',
+    note VARCHAR(1024) NOT NULL COMMENT '观测备注（可编辑字段）；墓碑行保留原值但查询不返回',
     version INT NOT NULL COMMENT '当前版本号，从 1 开始',
+    generation INT NOT NULL DEFAULT 1 COMMENT '合并代次：初始 1，每次墓碑恢复加一，删除与普通合并/解决不变；merge/resolve 只接受同代次基线',
     deleted BOOLEAN NOT NULL DEFAULT FALSE COMMENT '是否已删除：TRUE 表示当前状态为删除墓碑',
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近一次变更时间（服务器时区）',
     PRIMARY KEY (observation_id)
 );
 
--- 观测记录版本快照表：每次成功变更（创建/合并/删除）追加一行完整快照，历史永不删除。
+-- 观测记录版本快照表：每次成功变更（创建/合并/删除/恢复）追加一行完整快照，历史永不删除。
 CREATE TABLE IF NOT EXISTS observation_version (
     observation_id VARCHAR(64) NOT NULL COMMENT '观测记录唯一标识',
     version INT NOT NULL COMMENT '版本号，从 1 开始，与 observation_current.version 对应',
+    generation INT NOT NULL DEFAULT 1 COMMENT '该快照生成时的合并代次：创建/普通合并/删除沿用当代次，恢复快照为新代次',
     location VARCHAR(512) NULL COMMENT '该版本观测地点快照；删除墓碑版本为 NULL',
     reading VARCHAR(64) NULL COMMENT '该版本观测读数快照（十进制字符串原文）；删除墓碑版本为 NULL',
     note VARCHAR(1024) NULL COMMENT '该版本观测备注快照；删除墓碑版本为 NULL',
@@ -29,7 +31,7 @@ CREATE TABLE IF NOT EXISTS observation_version (
 CREATE TABLE IF NOT EXISTS request_log (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
     fingerprint VARCHAR(128) NOT NULL COMMENT '请求操作与参数的指纹，同键异参时判定 409',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：CREATE / MERGE / DELETE / RESOLVE',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：CREATE / MERGE / DELETE / RESOLVE / RESTORE',
     response_status INT NULL COMMENT '成功响应的 HTTP 状态码；提交过程中暂为 NULL',
     response_body VARCHAR(4000) NULL COMMENT '成功响应体（JSON 原文），用于同键同参重放；提交过程中暂为 NULL',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '请求记录创建时间（服务器时区）',
@@ -58,4 +60,20 @@ CREATE TABLE IF NOT EXISTS conflict_resolution (
     -- 不设置指向 observation_current 的外键：观测记录删除仅置墓碑（当前行保留），
     -- 且不可变解决历史必须在任何数据清理/归档场景下继续可查。
     UNIQUE (observation_id, request_id)
+);
+
+-- 墓碑恢复历史表：每次成功恢复原子追加一行，记录恢复前后版本、来源版本、原因与 UTC 时刻。
+-- 仅追加、永不更新或删除；恢复失败随事务回滚，不留恢复历史。查询接口只读不写。
+CREATE TABLE IF NOT EXISTS restore_history (
+    observation_id VARCHAR(64) NOT NULL COMMENT '观测记录唯一标识',
+    request_id VARCHAR(128) NOT NULL COMMENT '生成该恢复记录的请求标识（requestId）',
+    previous_version INT NOT NULL COMMENT '恢复前当前墓碑版本号',
+    new_version INT NOT NULL COMMENT '恢复生成的新版本号（墓碑版本号 + 1，不回退）',
+    source_version INT NOT NULL COMMENT '恢复内容来源的历史非墓碑版本号（可跨代次）',
+    previous_generation INT NOT NULL COMMENT '恢复前合并代次',
+    new_generation INT NOT NULL COMMENT '恢复后合并代次（恢复前代次 + 1）',
+    reason VARCHAR(1024) NOT NULL COMMENT '非空恢复原因',
+    restored_at_utc TIMESTAMP NOT NULL COMMENT '恢复完成时刻（UTC）',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录落库时间（服务器时区）',
+    PRIMARY KEY (observation_id, request_id)
 );

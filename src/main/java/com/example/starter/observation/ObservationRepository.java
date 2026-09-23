@@ -16,6 +16,7 @@ public class ObservationRepository {
     private static final RowMapper<ObservationSnapshot> SNAPSHOT_MAPPER = (rs, rowNum) -> new ObservationSnapshot(
             rs.getString("observation_id"),
             rs.getInt("version"),
+            rs.getInt("generation"),
             rs.getString("location"),
             rs.getString("reading"),
             rs.getString("note"),
@@ -32,7 +33,7 @@ public class ObservationRepository {
      */
     public Optional<ObservationSnapshot> findCurrent(String observationId) {
         return jdbcTemplate.query(
-                        "SELECT observation_id, version, location, reading, note, deleted "
+                        "SELECT observation_id, version, generation, location, reading, note, deleted "
                                 + "FROM observation_current WHERE observation_id = ?",
                         SNAPSHOT_MAPPER, observationId)
                 .stream().findFirst();
@@ -43,7 +44,7 @@ public class ObservationRepository {
      */
     public Optional<ObservationSnapshot> findCurrentForUpdate(String observationId) {
         return jdbcTemplate.query(
-                        "SELECT observation_id, version, location, reading, note, deleted "
+                        "SELECT observation_id, version, generation, location, reading, note, deleted "
                                 + "FROM observation_current WHERE observation_id = ? FOR UPDATE",
                         SNAPSHOT_MAPPER, observationId)
                 .stream().findFirst();
@@ -54,36 +55,36 @@ public class ObservationRepository {
      */
     public Optional<ObservationSnapshot> findVersion(String observationId, int version) {
         return jdbcTemplate.query(
-                        "SELECT observation_id, version, location, reading, note, deleted "
+                        "SELECT observation_id, version, generation, location, reading, note, deleted "
                                 + "FROM observation_version WHERE observation_id = ? AND version = ?",
                         SNAPSHOT_MAPPER, observationId, version)
                 .stream().findFirst();
     }
 
     /**
-     * 插入新记录的当前状态（version = 1）。
+     * 插入新记录的当前状态（version = 1，generation = 1）。
      */
     public void insertCurrent(ObservationSnapshot snapshot) {
         jdbcTemplate.update(
-                "INSERT INTO observation_current (observation_id, location, reading, note, version, deleted, updated_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                "INSERT INTO observation_current (observation_id, location, reading, note, version, generation, "
+                        + "deleted, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                 snapshot.observationId(), snapshot.location(), snapshot.reading(), snapshot.note(),
-                snapshot.version(), snapshot.deleted());
+                snapshot.version(), snapshot.generation(), snapshot.deleted());
     }
 
     /**
-     * 更新当前状态为新版本内容。
+     * 更新当前状态为新版本内容，代次保持不变（普通合并/解决沿用当代次）。
      */
     public void updateCurrent(ObservationSnapshot snapshot) {
         jdbcTemplate.update(
-                "UPDATE observation_current SET location = ?, reading = ?, note = ?, version = ?, deleted = ?, "
-                        + "updated_at = CURRENT_TIMESTAMP WHERE observation_id = ?",
+                "UPDATE observation_current SET location = ?, reading = ?, note = ?, version = ?, generation = ?, "
+                        + "deleted = ?, updated_at = CURRENT_TIMESTAMP WHERE observation_id = ?",
                 snapshot.location(), snapshot.reading(), snapshot.note(),
-                snapshot.version(), snapshot.deleted(), snapshot.observationId());
+                snapshot.version(), snapshot.generation(), snapshot.deleted(), snapshot.observationId());
     }
 
     /**
-     * 将当前状态标记为删除墓碑：版本号前进，业务字段保留原值（查询时不返回）。
+     * 将当前状态标记为删除墓碑：版本号前进，代次不变，deleted 置 TRUE；业务字段保留原值（查询时不返回）。
      */
     public void markDeleted(String observationId, int newVersion) {
         jdbcTemplate.update(
@@ -93,13 +94,25 @@ public class ObservationRepository {
     }
 
     /**
+     * 墓碑恢复：版本号前进到新版本、代次加一、写入来源历史版本的地点/读数/备注并清除墓碑标记。
+     * 不回退版本号，不改写任何历史快照。
+     */
+    public void restoreCurrent(ObservationSnapshot restored) {
+        jdbcTemplate.update(
+                "UPDATE observation_current SET location = ?, reading = ?, note = ?, version = ?, generation = ?, "
+                        + "deleted = FALSE, updated_at = CURRENT_TIMESTAMP WHERE observation_id = ?",
+                restored.location(), restored.reading(), restored.note(),
+                restored.version(), restored.generation(), restored.observationId());
+    }
+
+    /**
      * 追加一条完整版本快照，历史永不删除。
      */
     public void insertVersion(ObservationSnapshot snapshot) {
         jdbcTemplate.update(
-                "INSERT INTO observation_version (observation_id, version, location, reading, note, deleted, created_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
-                snapshot.observationId(), snapshot.version(), snapshot.location(),
-                snapshot.reading(), snapshot.note(), snapshot.deleted());
+                "INSERT INTO observation_version (observation_id, version, generation, location, reading, note, "
+                        + "deleted, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                snapshot.observationId(), snapshot.version(), snapshot.generation(),
+                snapshot.location(), snapshot.reading(), snapshot.note(), snapshot.deleted());
     }
 }
