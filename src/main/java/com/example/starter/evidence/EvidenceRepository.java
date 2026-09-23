@@ -13,6 +13,7 @@ import java.util.Optional;
 /**
  * 证物表访问。状态与保管人变更必须先通过 {@link #findByKeyForUpdate} 锁定证物行，
  * 保证并发交接/取消/核验按事务提交顺序生效。
+ * 每次状态或保管人变更都会使 version 加 1，供联合取样二次确认携带版本比对。
  */
 @Repository
 public class EvidenceRepository {
@@ -26,17 +27,33 @@ public class EvidenceRepository {
     }
 
     /**
-     * 插入新证物，初始状态 SEALED，保管人为入库操作人。
+     * 插入新证物，初始状态 SEALED，保管人为入库操作人；普通证物类别 STANDARD。
      */
     public void insert(String evidenceKey, String caseKey, String category, String sealNo,
                        String custodianId, LocalDateTime now) {
         jdbc.update("""
                         INSERT INTO evidence
-                            (evidence_key, case_key, category, seal_no, custodian_id, status, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            (evidence_key, case_key, category, seal_no, custodian_id, status,
+                             sample_kind, version, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
                         """,
                 evidenceKey, caseKey, category, sealNo, custodianId,
-                EvidenceStatus.SEALED.name(), now, now);
+                EvidenceStatus.SEALED.name(), SampleKind.STANDARD.name(), now, now);
+    }
+
+    /**
+     * 插入联合取样成功后生成的子样证物：SEALED，类别 ALIQUOT，独立走保管链且不可再取样。
+     */
+    public void insertAliquot(String aliquotKey, String caseKey, String custodianId,
+                              LocalDateTime now) {
+        jdbc.update("""
+                        INSERT INTO evidence
+                            (evidence_key, case_key, category, seal_no, custodian_id, status,
+                             sample_kind, version, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                        """,
+                aliquotKey, caseKey, "ALIQUOT", "ALIQUOT-SEAL", custodianId,
+                EvidenceStatus.SEALED.name(), SampleKind.ALIQUOT.name(), now, now);
     }
 
     /**
@@ -58,21 +75,27 @@ public class EvidenceRepository {
     }
 
     /**
-     * 更新证物状态与保管人（交接接受时原子切换保管人）。
+     * 更新证物状态与保管人（交接接受时原子切换保管人），版本号加 1。
      */
     public void updateCustody(String evidenceKey, String custodianId, EvidenceStatus status,
                               LocalDateTime now) {
-        jdbc.update(
-                "UPDATE evidence SET custodian_id = ?, status = ?, updated_at = ? WHERE evidence_key = ?",
+        jdbc.update("""
+                        UPDATE evidence
+                        SET custodian_id = ?, status = ?, version = version + 1, updated_at = ?
+                        WHERE evidence_key = ?
+                        """,
                 custodianId, status.name(), now, evidenceKey);
     }
 
     /**
-     * 仅更新证物状态（交接发起/取消、核验失败）。
+     * 仅更新证物状态（交接发起/取消、核验失败），版本号加 1。
      */
     public void updateStatus(String evidenceKey, EvidenceStatus status, LocalDateTime now) {
-        jdbc.update(
-                "UPDATE evidence SET status = ?, updated_at = ? WHERE evidence_key = ?",
+        jdbc.update("""
+                        UPDATE evidence
+                        SET status = ?, version = version + 1, updated_at = ?
+                        WHERE evidence_key = ?
+                        """,
                 status.name(), now, evidenceKey);
     }
 
@@ -96,6 +119,8 @@ public class EvidenceRepository {
                     rs.getString("seal_no"),
                     rs.getString("custodian_id"),
                     EvidenceStatus.valueOf(rs.getString("status")),
+                    SampleKind.valueOf(rs.getString("sample_kind")),
+                    rs.getLong("version"),
                     rs.getObject("created_at", LocalDateTime.class),
                     rs.getObject("updated_at", LocalDateTime.class));
         }
