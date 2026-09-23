@@ -26,15 +26,16 @@ CREATE TABLE IF NOT EXISTS allocation (
     window_id BIGINT NOT NULL COMMENT '所属供水窗口 ID',
     user_id VARCHAR(128) NOT NULL COMMENT '用水户 ID',
     amount DECIMAL(19,3) NOT NULL COMMENT '原申请水量，单位立方米，最多 3 位小数，创建后不可改写',
-    held_amount DECIMAL(19,3) NOT NULL DEFAULT 0 COMMENT '当前持有额度，单位立方米；批准时等于原申请水量，取消时归零，转出时等额扣减',
+    held_amount DECIMAL(19,3) NOT NULL DEFAULT 0 COMMENT '尚未使用的当前持有额度（未用额度），单位立方米；批准时等于原申请水量，核销或转出时等额扣减，取消时归零',
+    used_amount DECIMAL(19,3) NOT NULL DEFAULT 0 COMMENT '累计已用水量，单位立方米；核销时等额增加且不允许冲销；申请即使 CANCELLED，已用量仍占窗口容量；旧数据按 0 解释',
     requester VARCHAR(128) NOT NULL COMMENT '申请人（X-Actor-Id）',
     status VARCHAR(16) NOT NULL COMMENT '状态：REQUESTED 已申请 / APPROVED 已批准 / CANCELLED 已取消（不可恢复）',
     created_nanos BIGINT NOT NULL COMMENT '创建时间，UTC 纳秒时间戳',
     updated_nanos BIGINT NOT NULL COMMENT '最近状态变更时间，UTC 纳秒时间戳',
     CONSTRAINT uk_allocation_key UNIQUE (allocation_key),
     CONSTRAINT fk_allocation_window FOREIGN KEY (window_id) REFERENCES supply_window (id),
-    CONSTRAINT chk_allocation_held CHECK (held_amount >= 0 AND held_amount <= amount)
-) COMMENT='配水申请';
+    CONSTRAINT chk_allocation_quota CHECK (held_amount >= 0 AND used_amount >= 0 AND held_amount + used_amount <= amount)
+) COMMENT='配水申请；held_amount 为未用额度，used_amount 为累计已用，二者之和不超过原申请水量';
 
 CREATE TABLE IF NOT EXISTS transfer (
     id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '转让流水主键',
@@ -49,9 +50,23 @@ CREATE TABLE IF NOT EXISTS transfer (
     CONSTRAINT fk_transfer_window FOREIGN KEY (window_id) REFERENCES supply_window (id)
 ) COMMENT='配水额度转让流水，与源扣减、目标批准同事务提交，创建后不可变，不提供撤销';
 
+CREATE TABLE IF NOT EXISTS water_usage (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '核销流水主键',
+    usage_key VARCHAR(128) NOT NULL COMMENT '用水核销业务键，全局唯一；换 commandKey 复用返回 409',
+    window_id BIGINT NOT NULL COMMENT '所属供水窗口 ID（等于申请所属窗口）',
+    allocation_key VARCHAR(128) NOT NULL COMMENT '被核销申请业务键（核销时必须 APPROVED，操作人须为原申请人）',
+    amount DECIMAL(19,3) NOT NULL COMMENT '本次核销量，单位立方米，大于 0，最多 3 位小数；不允许冲销',
+    used_after DECIMAL(19,3) NOT NULL COMMENT '核销后累计已用量，单位立方米，便于流水自描述',
+    held_after DECIMAL(19,3) NOT NULL COMMENT '核销后未用持有额度，单位立方米',
+    actor VARCHAR(128) NOT NULL COMMENT '操作人（原申请人，X-Actor-Id）',
+    created_nanos BIGINT NOT NULL COMMENT '核销时间，UTC 纳秒时间戳',
+    CONSTRAINT uk_water_usage_key UNIQUE (usage_key),
+    CONSTRAINT fk_usage_window FOREIGN KEY (window_id) REFERENCES supply_window (id)
+) COMMENT='实际用水核销流水，与持有额度扣减、已用量增加同事务提交，创建后不可变，不提供冲销';
+
 CREATE TABLE IF NOT EXISTS command_log (
     command_key VARCHAR(128) PRIMARY KEY COMMENT '命令幂等键',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：WINDOW_CREATE/ALLOCATION_SUBMIT/ALLOCATION_APPROVE/ALLOCATION_CANCEL/CURTAILMENT_CREATE/CURTAILMENT_CANCEL/TRANSFER',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：WINDOW_CREATE/ALLOCATION_SUBMIT/ALLOCATION_APPROVE/ALLOCATION_CANCEL/CURTAILMENT_CREATE/CURTAILMENT_CANCEL/TRANSFER/USAGE',
     params VARCHAR(2048) NOT NULL COMMENT '规范化请求参数串，用于同键改参检测',
     response MEDIUMTEXT NULL COMMENT '首次成功响应 JSON；命令事务提交前写入',
     created_nanos BIGINT NOT NULL COMMENT '创建时间，UTC 纳秒时间戳'

@@ -11,6 +11,9 @@ import com.example.starter.water.dto.Dtos.SubmitAllocationRequest;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferRequest;
 import com.example.starter.water.dto.Dtos.TransferResponse;
+import com.example.starter.water.dto.Dtos.UsageListResponse;
+import com.example.starter.water.dto.Dtos.UsageRequest;
+import com.example.starter.water.dto.Dtos.UsageResponse;
 import com.example.starter.water.dto.Dtos.WindowResponse;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -90,6 +93,26 @@ public class WaterController {
     @GetMapping("/windows/{windowId}/transfers")
     public TransferListResponse getTransfers(@PathVariable long windowId) {
         return service.getTransfers(windowId);
+    }
+
+    /** 实际用水核销（仅 APPROVED 申请的原申请人本人）。 */
+    @PostMapping("/usages")
+    public UsageResponse recordUsage(@RequestBody UsageRequest request,
+                                     @RequestHeader("X-Actor-Id") String actor) {
+        return service.recordUsage(request.commandKey(), request.usageKey(), request.allocationKey(),
+                request.amount(), actor);
+    }
+
+    /** 按全局唯一 usageKey 查询单笔核销流水。 */
+    @GetMapping("/usages/{usageKey}")
+    public UsageResponse getUsage(@PathVariable String usageKey) {
+        return service.getUsage(usageKey);
+    }
+
+    /** 查询窗口用水核销流水。 */
+    @GetMapping("/windows/{windowId}/usages")
+    public UsageListResponse getUsages(@PathVariable long windowId) {
+        return service.getUsages(windowId);
     }
 
     /** 查询窗口当前可用容量。 */

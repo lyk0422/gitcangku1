@@ -25,15 +25,23 @@ public class WaterRepository {
                             BigDecimal plannedVolume, long createdNanos) {
     }
 
-    /** 配水申请行；amount 为不可改写的原申请水量，heldAmount 为当前持有额度。 */
+    /**
+     * 配水申请行；amount 为不可改写的原申请水量，heldAmount 为尚未使用的持有额度（未用额度），
+     * usedAmount 为累计已用水量（不可冲销）。
+     */
     public record AllocationRow(long id, String allocationKey, long windowId, String userId, BigDecimal amount,
-                                BigDecimal heldAmount, String requester, String status,
+                                BigDecimal heldAmount, BigDecimal usedAmount, String requester, String status,
                                 long createdNanos, long updatedNanos) {
     }
 
     /** 转让流水行，创建后不可变。 */
     public record TransferRow(long id, String transferKey, long windowId, String sourceAllocationKey,
                               String targetAllocationKey, BigDecimal amount, String actor, long createdNanos) {
+    }
+
+    /** 用水核销流水行，创建后不可变，不提供冲销。 */
+    public record UsageRow(long id, String usageKey, long windowId, String allocationKey, BigDecimal amount,
+                           BigDecimal usedAfter, BigDecimal heldAfter, String actor, long createdNanos) {
     }
 
     /** 限供行。 */
@@ -54,17 +62,22 @@ public class WaterRepository {
     private static final RowMapper<AllocationRow> ALLOCATION_MAPPER = (rs, n) -> new AllocationRow(
             rs.getLong("id"), rs.getString("allocation_key"), rs.getLong("window_id"),
             rs.getString("user_id"), rs.getBigDecimal("amount"), rs.getBigDecimal("held_amount"),
-            rs.getString("requester"), rs.getString("status"),
+            rs.getBigDecimal("used_amount"), rs.getString("requester"), rs.getString("status"),
             rs.getLong("created_nanos"), rs.getLong("updated_nanos"));
 
     private static final String ALLOCATION_SELECT =
-            "SELECT id, allocation_key, window_id, user_id, amount, held_amount, requester, status,"
+            "SELECT id, allocation_key, window_id, user_id, amount, held_amount, used_amount, requester, status,"
                     + " created_nanos, updated_nanos";
 
     private static final RowMapper<TransferRow> TRANSFER_MAPPER = (rs, n) -> new TransferRow(
             rs.getLong("id"), rs.getString("transfer_key"), rs.getLong("window_id"),
             rs.getString("source_allocation_key"), rs.getString("target_allocation_key"),
             rs.getBigDecimal("amount"), rs.getString("actor"), rs.getLong("created_nanos"));
+
+    private static final RowMapper<UsageRow> USAGE_MAPPER = (rs, n) -> new UsageRow(
+            rs.getLong("id"), rs.getString("usage_key"), rs.getLong("window_id"),
+            rs.getString("allocation_key"), rs.getBigDecimal("amount"), rs.getBigDecimal("used_after"),
+            rs.getBigDecimal("held_after"), rs.getString("actor"), rs.getLong("created_nanos"));
 
     private static final RowMapper<CurtailmentRow> CURTAILMENT_MAPPER = (rs, n) -> new CurtailmentRow(
             rs.getLong("id"), rs.getLong("window_id"), rs.getBigDecimal("volume"), rs.getString("status"),
@@ -188,12 +201,34 @@ public class WaterRepository {
                 delta, updatedNanos, id);
     }
 
-    /** 窗口当前所有 APPROVED 申请的当前持有额度之和（BigDecimal 精确求和），无则 0。 */
+    /**
+     * 窗口当前所有 APPROVED 申请尚未使用的持有额度之和（BigDecimal 精确求和），无则 0。
+     * 窗口已占用量还需叠加 {@link #sumUsedAmount}（全部状态）。
+     */
     public BigDecimal sumApprovedAmount(long windowId) {
         BigDecimal sum = jdbc.queryForObject(
                 "SELECT COALESCE(SUM(held_amount), 0) FROM allocation WHERE window_id = ? AND status = 'APPROVED'",
                 BigDecimal.class, windowId);
         return sum == null ? BigDecimal.ZERO : sum;
+    }
+
+    /** 窗口全部申请（含 CANCELLED）累计已用水量之和，无则 0；已用量不可冲销，取消后仍占窗口容量。 */
+    public BigDecimal sumUsedAmount(long windowId) {
+        BigDecimal sum = jdbc.queryForObject(
+                "SELECT COALESCE(SUM(used_amount), 0) FROM allocation WHERE window_id = ?",
+                BigDecimal.class, windowId);
+        return sum == null ? BigDecimal.ZERO : sum;
+    }
+
+    /**
+     * 核销：同一条 SQL 内把未用额度等额扣减、累计已用量等额增加，并刷新变更时间。
+     * 仅当未用额度足够（held_amount - delta >= 0）时更新，返回受影响行数（0 表示不足）。
+     * 约束 chk_allocation_quota 进一步保证 held + used 不超过原申请水量且均非负。
+     */
+    public int consumeUsage(long id, BigDecimal delta, long updatedNanos) {
+        return jdbc.update("UPDATE allocation SET held_amount = held_amount - ?, used_amount = used_amount + ?,"
+                + " updated_nanos = ? WHERE id = ? AND held_amount >= ?",
+                delta, delta, updatedNanos, id, delta);
     }
 
     /** 插入限供（ACTIVE）并返回主键。 */
@@ -274,6 +309,48 @@ public class WaterRepository {
                 "SELECT id, transfer_key, window_id, source_allocation_key, target_allocation_key,"
                         + " amount, actor, created_nanos FROM transfer WHERE window_id = ? ORDER BY id",
                 TRANSFER_MAPPER, windowId);
+    }
+
+    /** 插入不可变用水核销流水并返回主键。 */
+    public long insertUsage(String usageKey, long windowId, String allocationKey, BigDecimal amount,
+                            BigDecimal usedAfter, BigDecimal heldAfter, String actor, long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO water_usage (usage_key, window_id, allocation_key, amount, used_after,"
+                            + " held_after, actor, created_nanos) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, usageKey);
+            ps.setLong(2, windowId);
+            ps.setString(3, allocationKey);
+            ps.setBigDecimal(4, amount);
+            ps.setBigDecimal(5, usedAfter);
+            ps.setBigDecimal(6, heldAfter);
+            ps.setString(7, actor);
+            ps.setLong(8, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 按业务键查询核销流水，不存在返回 null。 */
+    public UsageRow findUsageByKey(String usageKey) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT id, usage_key, window_id, allocation_key, amount, used_after, held_after,"
+                            + " actor, created_nanos FROM water_usage WHERE usage_key = ?",
+                    USAGE_MAPPER, usageKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 窗口全部核销流水（不可变），按主键升序。 */
+    public List<UsageRow> listUsages(long windowId) {
+        return jdbc.query(
+                "SELECT id, usage_key, window_id, allocation_key, amount, used_after, held_after,"
+                        + " actor, created_nanos FROM water_usage WHERE window_id = ? ORDER BY id",
+                USAGE_MAPPER, windowId);
     }
 
     /** 窗口全部限供记录（含已取消），按主键升序。 */
