@@ -68,7 +68,18 @@ public class WriteExecutor {
                 }
                 return new WriteResult(log.responseStatus(), log.responseBody());
             }
-            WriteResult result = action.get();
+            WriteResult result;
+            try {
+                result = action.get();
+            } catch (RuntimeException ex) {
+                // 并发下同键同参请求可能已先提交（例如乐观版本校验先于去重插入失败）：
+                // 此时优先重放首次成功结果，即使版本已前进也不报过期；无已提交记录则原样抛出。
+                RequestLogRow concurrent = repository.findRequestLog(requestId).orElse(null);
+                if (concurrent != null && concurrent.requestHash().equals(requestHash)) {
+                    throw new WriteResult.ReplaySignal(requestId, ex);
+                }
+                throw ex;
+            }
             try {
                 repository.insertRequestLog(requestId, requestHash, result.status(), result.body());
             } catch (DuplicateKeyException e) {

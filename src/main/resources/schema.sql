@@ -7,14 +7,16 @@ CREATE TABLE IF NOT EXISTS document (
     draft_version INT NOT NULL,
     published_version INT NOT NULL,
     term_version INT NOT NULL,
+    release_revision INT NOT NULL DEFAULT 0,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 COMMENT ON TABLE document IS '文档：全局唯一 documentId，含 1~5 种目标语言及草稿/发布/术语版本';
 COMMENT ON COLUMN document.document_id IS '全局唯一文档 ID，自增';
 COMMENT ON COLUMN document.target_languages IS '目标语言列表，逗号分隔的小写语言码，1~5 种';
 COMMENT ON COLUMN document.draft_version IS '文档草稿版本，从 1 开始；增段落或修改源文/译文/术语时加一';
-COMMENT ON COLUMN document.published_version IS '已发布版本号，从 0 开始，每次成功发布加一';
+COMMENT ON COLUMN document.published_version IS '已发布版本号，从 0 开始，每次成功发布加一；撤回复用，不复用编号';
 COMMENT ON COLUMN document.term_version IS '当前术语版本，从 0 开始（0 表示尚未建立术语版本），每次新增术语版本加一';
+COMMENT ON COLUMN document.release_revision IS '发布目录修订号，从 0 开始，每次成功发布或首次撤回加一；撤回非当前版本也推进';
 COMMENT ON COLUMN document.created_at IS '创建时间，数据库默认时区';
 
 CREATE TABLE IF NOT EXISTS segment (
@@ -84,6 +86,19 @@ COMMENT ON COLUMN release_snapshot.document_id IS '所属文档 ID';
 COMMENT ON COLUMN release_snapshot.published_version IS '发布版本号，从 1 开始';
 COMMENT ON COLUMN release_snapshot.snapshot_json IS '快照内容 JSON：全部段落源文及各语言译文、作者、审核人与版本号';
 COMMENT ON COLUMN release_snapshot.created_at IS '发布时间，数据库默认时区';
+
+CREATE TABLE IF NOT EXISTS release_revocation (
+    document_id BIGINT NOT NULL,
+    published_version INT NOT NULL,
+    reason VARCHAR(1024) NOT NULL,
+    revoked_at TIMESTAMP NOT NULL,
+    PRIMARY KEY (document_id, published_version)
+);
+COMMENT ON TABLE release_revocation IS '发布撤回记录：每个发布版本最多一条，永久有效；不删除或修改快照正文、术语及批准信息';
+COMMENT ON COLUMN release_revocation.document_id IS '所属文档 ID';
+COMMENT ON COLUMN release_revocation.published_version IS '被撤回的发布版本号';
+COMMENT ON COLUMN release_revocation.reason IS '撤回原因，非空，UTF-8';
+COMMENT ON COLUMN release_revocation.revoked_at IS '撤回时刻，UTC 时间戳（TIMESTAMP 存储，写入时转 UTC）';
 
 CREATE TABLE IF NOT EXISTS term_version (
     document_id BIGINT NOT NULL,

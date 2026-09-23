@@ -201,8 +201,7 @@ class ConcurrencyTest extends AbstractIntegrationTest {
 
     @Test
     @DisplayName("并发术语更新：同一期望版本仅一个成功，术语版本无丢失更新")
-    void concurrentTermUpdates() throws Exception {
-        long docId = createDocument(newRequestId(), "[\"en\"]", "[]");
+    void concurrentTermUpdates() throws Exception {        long docId = createDocument(newRequestId(), "[\"en\"]", "[]");
         int threads = 4;
         ExecutorService pool = Executors.newFixedThreadPool(threads);
         CountDownLatch gate = new CountDownLatch(1);
@@ -237,5 +236,138 @@ class ConcurrencyTest extends AbstractIntegrationTest {
         Integer termVersion = jdbc.queryForObject(
                 "SELECT term_version FROM document WHERE document_id = ?", Integer.class, docId);
         assertThat(termVersion).isEqualTo(1);
+    }
+
+    private long preparePublishedDoc() throws Exception {
+        long docId = createDocument(newRequestId(), "[\"en\"]",
+                "[{\"segmentId\":\"s1\",\"sourceText\":\"原文\"}]");
+        submitTranslation(docId, "s1", "en", "alice", "hello", 1, newRequestId());
+        approve(docId, "s1", "en", "bob", 1, newRequestId());
+        assertThat(publish(docId, 2, 0, newRequestId()).status()).isEqualTo(201);
+        // 发布后目录修订号为 1
+        return docId;
+    }
+
+    @Test
+    @DisplayName("并发撤回同一版本（不同 requestId）：仅一个成功，其余 409；修订号恰好加一且只有一条撤回记录")
+    void concurrentRevokeSameVersion() throws Exception {
+        long docId = preparePublishedDoc();
+        int threads = 6;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch gate = new CountDownLatch(1);
+        List<Future<ApiResult>> futures = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            futures.add(pool.submit(() -> {
+                gate.await();
+                return revoke(docId, 1, "并发撤回", 1, newRequestId());
+            }));
+        }
+        gate.countDown();
+        int success = 0;
+        int conflict = 0;
+        for (Future<ApiResult> future : futures) {
+            int status = future.get(30, TimeUnit.SECONDS).status();
+            if (status == 200) {
+                success++;
+            } else if (status == 409) {
+                conflict++;
+            }
+        }
+        pool.shutdown();
+
+        assertThat(success).isEqualTo(1);
+        assertThat(conflict).isEqualTo(threads - 1);
+        Integer revision = jdbc.queryForObject(
+                "SELECT release_revision FROM document WHERE document_id = ?", Integer.class, docId);
+        assertThat(revision).isEqualTo(2);
+        assertThat(jdbc.queryForObject(
+                "SELECT COUNT(*) FROM release_revocation WHERE document_id = ?", Integer.class, docId))
+                .isEqualTo(1);
+        // 当前可用：唯一版本已撤回 → null
+        ApiResult current = getJson("/api/documents/" + docId + "/releases/current");
+        assertThat(current.body().get("snapshot").isNull()).isTrue();
+    }
+
+    @Test
+    @DisplayName("并发撤回与发布：串行一致，修订号无丢失更新，当前可用始终为完整提交状态")
+    void concurrentRevokeAndPublish() throws Exception {
+        long docId = preparePublishedDoc();
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        CountDownLatch gate = new CountDownLatch(1);
+        // 撤回 v1：期望修订号 1；发布 v2：草稿 2、发布 1
+        Future<ApiResult> revokeFuture = pool.submit(() -> {
+            gate.await();
+            return revoke(docId, 1, "并发撤回", 1, newRequestId());
+        });
+        Future<ApiResult> publishFuture = pool.submit(() -> {
+            gate.await();
+            return publish(docId, 2, 1, newRequestId());
+        });
+        gate.countDown();
+        ApiResult revokeResult = revokeFuture.get(30, TimeUnit.SECONDS);
+        ApiResult publishResult = publishFuture.get(30, TimeUnit.SECONDS);
+        pool.shutdown();
+
+        // 文档行锁使二者串行：
+        // 顺序 A（撤回先）：撤回 200 修订号 1→2，发布 201 修订号 2→3、v1 仍撤回、当前 v2
+        // 顺序 B（发布先）：发布 201 修订号 1→2，撤回期望修订号过期 409、无撤回记录、当前 v2
+        assertThat(publishResult.status()).isEqualTo(201);
+        assertThat(revokeResult.status()).isIn(200, 409);
+
+        Integer revision = jdbc.queryForObject(
+                "SELECT release_revision FROM document WHERE document_id = ?", Integer.class, docId);
+        Integer publishedVersion = jdbc.queryForObject(
+                "SELECT published_version FROM document WHERE document_id = ?", Integer.class, docId);
+        Integer revocationCount = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM release_revocation WHERE document_id = ?", Integer.class, docId);
+        assertThat(publishedVersion).isEqualTo(2);
+        if (revokeResult.status() == 200) {
+            assertThat(revision).isEqualTo(3);
+            assertThat(revocationCount).isEqualTo(1);
+        } else {
+            assertThat(revision).isEqualTo(2);
+            assertThat(revocationCount).isZero();
+        }
+
+        // 任一顺序下当前可用只能是完整提交的 v2，不得短暂或最终指向已撤回版本
+        ApiResult current = getJson("/api/documents/" + docId + "/releases/current");
+        assertThat(current.status()).isEqualTo(200);
+        assertThat(current.body().get("releaseRevision").asInt()).isEqualTo(revision);
+        assertThat(current.body().get("snapshot").get("publishedVersion").asInt()).isEqualTo(2);
+    }
+
+    @Test
+    @DisplayName("并发同 requestId 撤回：仅执行一次，全部重放同一成功结果")
+    void concurrentSameRequestIdRevoke() throws Exception {
+        long docId = preparePublishedDoc();
+        String requestId = newRequestId();
+        int threads = 6;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch gate = new CountDownLatch(1);
+        List<Future<ApiResult>> futures = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            futures.add(pool.submit(() -> {
+                gate.await();
+                return revoke(docId, 1, "幂等并发撤回", 1, requestId);
+            }));
+        }
+        gate.countDown();
+        List<ApiResult> results = new ArrayList<>();
+        for (Future<ApiResult> future : futures) {
+            results.add(future.get(30, TimeUnit.SECONDS));
+        }
+        pool.shutdown();
+
+        for (ApiResult result : results) {
+            assertThat(result.status()).isEqualTo(200);
+            assertThat(result.body().get("releaseRevision").asInt()).isEqualTo(2);
+        }
+        assertThat(jdbc.queryForObject(
+                "SELECT COUNT(*) FROM release_revocation WHERE document_id = ?", Integer.class, docId))
+                .isEqualTo(1);
+        assertThat(jdbc.queryForObject(
+                "SELECT COUNT(*) FROM request_log WHERE request_id = ?", Integer.class, requestId))
+                .isEqualTo(1);
     }
 }

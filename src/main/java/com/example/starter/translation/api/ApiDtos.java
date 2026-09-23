@@ -65,6 +65,14 @@ public final class ApiDtos {
             @PositiveOrZero(message = "expectedPublishedVersion 不能为负数") int expectedPublishedVersion) {
     }
 
+    /** 撤回请求：指定发布版本、非空原因与期望的发布目录修订号做乐观校验。 */
+    public record RevokeReleaseRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @Positive(message = "publishedVersion 必须为正数") int publishedVersion,
+            @NotBlank(message = "reason 不能为空") @Size(max = 1024) String reason,
+            @PositiveOrZero(message = "expectedReleaseRevision 不能为负数") int expectedReleaseRevision) {
+    }
+
     /** 术语规则输入：sourceTerm 区分大小写，requiredTranslation 非空。 */
     public record TermRuleInput(
             @NotBlank(message = "sourceTerm 不能为空") @Size(max = 512) String sourceTerm,
@@ -102,6 +110,29 @@ public final class ApiDtos {
 
     /** 发布响应。 */
     public record PublishResponse(long documentId, int publishedVersion) {
+    }
+
+    /** 撤回响应：撤回时刻为 UTC，releaseRevision 为撤回后的发布目录修订号。 */
+    public record RevokeReleaseResponse(long documentId, int publishedVersion, String reason,
+                                        java.time.Instant revokedAt, int releaseRevision) {
+    }
+
+    /**
+     * 当前可用发布：未撤回版本中编号最大的完整快照及目录修订号；
+     * 全部撤回或从未发布时 snapshot 为 null（HTTP 仍为 200）。
+     */
+    public record CurrentReleaseResponse(long documentId, int releaseRevision,
+                                         com.fasterxml.jackson.databind.JsonNode snapshot) {
+    }
+
+    /** 发布目录条目：按发布编号排序，撤回的版本带原因与 UTC 撤回时刻，未撤回时后两者为 null。 */
+    public record ReleaseCatalogEntry(int publishedVersion, boolean revoked,
+                                      String reason, java.time.Instant revokedAt) {
+    }
+
+    /** 发布目录：含当前目录修订号与全部发布条目。 */
+    public record ReleaseCatalogResponse(long documentId, int releaseRevision,
+                                         List<ReleaseCatalogEntry> releases) {
     }
 
     /** 术语规则视图。 */

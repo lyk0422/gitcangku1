@@ -18,9 +18,10 @@ public final class Rows {
      * @param draftVersion     文档草稿版本，从 1 开始；增段落或修改源文/译文/术语时加一
      * @param publishedVersion 已发布版本号，从 0 开始，每次成功发布加一
      * @param termVersion      当前术语版本，从 0 开始（0 表示尚未建立术语版本）
+     * @param releaseRevision  发布目录修订号，从 0 开始，每次成功发布或首次撤回加一；撤回非当前版本也推进
      */
     public record DocumentRow(long documentId, List<String> targetLanguages,
-                              int draftVersion, int publishedVersion, int termVersion) {
+                              int draftVersion, int publishedVersion, int termVersion, int releaseRevision) {
     }
 
     /**
@@ -81,5 +82,15 @@ public final class Rows {
      */
     public record RequestLogRow(String requestId, String requestHash,
                                 int responseStatus, String responseBody) {
+    }
+
+    /**
+     * 发布撤回记录：每个发布版本最多一条，永久有效；不删除或修改快照正文、术语及批准信息。
+     *
+     * @param publishedVersion 被撤回的发布版本号
+     * @param reason           撤回原因，非空
+     * @param revokedAt        撤回 UTC 时刻
+     */
+    public record RevocationRow(int publishedVersion, String reason, java.time.Instant revokedAt) {
     }
 }

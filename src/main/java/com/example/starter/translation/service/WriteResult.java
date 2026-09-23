@@ -1,6 +1,8 @@
 package com.example.starter.translation.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.databind.json.JsonMapper;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 
@@ -9,7 +11,14 @@ import org.springframework.http.ResponseEntity;
  */
 public record WriteResult(int status, String body) {
 
-    private static final ObjectMapper MAPPER = new ObjectMapper();
+    /**
+     * 独立映射器：通过 ServiceLoader 注册 Jackson 扩展模块（如 JSR-310 时间模块），
+     * 并与 Spring Boot 默认保持一致地以 ISO-8601 字符串输出时间，避免 Instant 无法序列化。
+     */
+    private static final ObjectMapper MAPPER = JsonMapper.builder()
+            .findAndAddModules()
+            .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
+            .build();
 
     /** 以给定状态码序列化响应体。 */
     public static WriteResult of(int status, Object body) {

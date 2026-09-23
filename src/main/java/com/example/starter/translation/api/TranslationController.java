@@ -101,6 +101,19 @@ public class TranslationController {
                 () -> WriteResult.of(201, translationService.publish(documentId, request))).toResponseEntity();
     }
 
+    /**
+     * 撤回发布：指定发布版本、非空原因与期望目录修订号；撤回永久有效，
+     * 不删除或修改快照正文、术语及批准信息，目录修订号加一。
+     */
+    @PostMapping("/{documentId}/releases/revoke")
+    public ResponseEntity<String> revokeRelease(@PathVariable long documentId,
+                                                @Valid @RequestBody ApiDtos.RevokeReleaseRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/releases/revoke";
+        return writeExecutor.execute(request.requestId(), hash(operation, request),
+                () -> WriteResult.of(200, translationService.revokeRelease(documentId, request)))
+                .toResponseEntity();
+    }
+
     /** 新增术语版本：不可变快照，术语版本与草稿版本各加一；已有版本不可覆盖。 */
     @PutMapping("/{documentId}/terms")
     public ResponseEntity<String> updateTerms(@PathVariable long documentId,
@@ -129,11 +142,23 @@ public class TranslationController {
         return ResponseEntity.ok(translationService.getTermStatus(documentId));
     }
 
-    /** 查询指定发布版本的只读快照。 */
+    /** 查询指定发布版本的只读快照；即使已撤回也返回原始快照。 */
     @GetMapping("/{documentId}/releases/{publishedVersion}")
     public ResponseEntity<String> getRelease(@PathVariable long documentId, @PathVariable int publishedVersion) {
         return ResponseEntity.ok().contentType(MediaType.APPLICATION_JSON)
                 .body(translationService.getRelease(documentId, publishedVersion));
+    }
+
+    /** 查询当前可用发布：未撤回版本中编号最大的完整快照；全部撤回或从未发布返回 200、快照 null。 */
+    @GetMapping("/{documentId}/releases/current")
+    public ResponseEntity<ApiDtos.CurrentReleaseResponse> getCurrentRelease(@PathVariable long documentId) {
+        return ResponseEntity.ok(translationService.getCurrentRelease(documentId));
+    }
+
+    /** 查询发布目录与撤回历史：按发布编号排序，含撤回原因与 UTC 撤回时刻。 */
+    @GetMapping("/{documentId}/releases")
+    public ResponseEntity<ApiDtos.ReleaseCatalogResponse> getReleaseCatalog(@PathVariable long documentId) {
+        return ResponseEntity.ok(translationService.getReleaseCatalog(documentId));
     }
 
     /** 计算请求摘要：操作（含路径变量）+ 操作者 + 规范化请求体的 SHA-256。 */

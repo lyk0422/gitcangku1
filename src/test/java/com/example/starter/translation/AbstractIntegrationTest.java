@@ -38,6 +38,7 @@ public abstract class AbstractIntegrationTest {
         jdbc.update("DELETE FROM approval");
         jdbc.update("DELETE FROM translation");
         jdbc.update("DELETE FROM segment");
+        jdbc.update("DELETE FROM release_revocation");
         jdbc.update("DELETE FROM release_snapshot");
         jdbc.update("DELETE FROM term_rule");
         jdbc.update("DELETE FROM term_version");
@@ -120,6 +121,13 @@ public abstract class AbstractIntegrationTest {
         String body = "{\"requestId\":\"" + requestId + "\",\"expectedDraftVersion\":" + expectedDraftVersion
                 + ",\"expectedPublishedVersion\":" + expectedPublishedVersion + "}";
         return postJson("/api/documents/" + documentId + "/publish", body);
+    }
+
+    protected ApiResult revoke(long documentId, int publishedVersion, String reason,
+                               int expectedReleaseRevision, String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"publishedVersion\":" + publishedVersion
+                + ",\"reason\":\"" + reason + "\",\"expectedReleaseRevision\":" + expectedReleaseRevision + "}";
+        return postJson("/api/documents/" + documentId + "/releases/revoke", body);
     }
 
     /** 新增术语版本：rulesJson 为规则数组 JSON。 */

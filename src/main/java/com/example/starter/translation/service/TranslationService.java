@@ -4,14 +4,18 @@ import com.example.starter.translation.api.ApiDtos;
 import com.example.starter.translation.api.ApiException;
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
+import com.example.starter.translation.domain.Rows.RevocationRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
 import com.example.starter.translation.domain.Rows.TranslationRow;
 import com.example.starter.translation.repo.TranslationRepository;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Clock;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -32,10 +36,12 @@ public class TranslationService {
 
     private final TranslationRepository repository;
     private final ObjectMapper objectMapper;
+    private final Clock clock;
 
-    public TranslationService(TranslationRepository repository, ObjectMapper objectMapper) {
+    public TranslationService(TranslationRepository repository, ObjectMapper objectMapper, Clock clock) {
         this.repository = repository;
         this.objectMapper = objectMapper;
+        this.clock = clock;
     }
 
     /** 建文档：1~5 种目标语言，可携带初始段落，初始草稿版本 1、发布版本 0。 */
@@ -233,7 +239,72 @@ public class TranslationService {
         repository.insertSnapshot(documentId, publishedVersion,
                 buildSnapshotJson(document, publishedVersion, segments, translations, approvals, termRules));
         repository.updatePublishedVersion(documentId, publishedVersion);
+        int releaseRevision = document.releaseRevision() + 1;
+        repository.updateReleaseRevision(documentId, releaseRevision);
         return new ApiDtos.PublishResponse(documentId, publishedVersion);
+    }
+
+    /**
+     * 撤回发布：expectedReleaseRevision 必须等于当前发布目录修订号（不符 409）；
+     * 版本不存在 404、已撤回 409。撤回永久有效，不删除或修改快照正文、术语及批准信息，
+     * 不影响草稿、译文与批准状态；撤回非当前版本同样推进目录修订号。
+     */
+    @Transactional
+    public ApiDtos.RevokeReleaseResponse revokeRelease(long documentId, ApiDtos.RevokeReleaseRequest request) {
+        DocumentRow document = lockDocument(documentId);
+        if (document.releaseRevision() != request.expectedReleaseRevision()) {
+            throw ApiException.conflict("发布目录修订号冲突：当前修订号 " + document.releaseRevision()
+                    + "，与期望的 " + request.expectedReleaseRevision() + " 不一致");
+        }
+        int version = request.publishedVersion();
+        if (!repository.snapshotExists(documentId, version)) {
+            throw ApiException.notFound("发布版本不存在: " + documentId + "/" + version);
+        }
+        if (repository.findRevocation(documentId, version).isPresent()) {
+            throw ApiException.conflict("发布版本已撤回: " + version);
+        }
+        Instant revokedAt = Instant.now(clock);
+        repository.insertRevocation(documentId, version, request.reason(), revokedAt);
+        int releaseRevision = document.releaseRevision() + 1;
+        repository.updateReleaseRevision(documentId, releaseRevision);
+        return new ApiDtos.RevokeReleaseResponse(documentId, version, request.reason(),
+                revokedAt, releaseRevision);
+    }
+
+    /**
+     * 查询当前可用发布：返回未撤回版本中编号最大的完整快照（直接使用历史快照，不重新拼装）
+     * 及当前发布目录修订号；全部撤回或从未发布时返回 200、snapshot 为 null。
+     * 对文档行加写锁与发布/撤回串行，保证读到的修订号、撤回状态与快照为同一个已提交状态，
+     * 不会短暂返回已撤回版本。
+     */
+    @Transactional
+    public ApiDtos.CurrentReleaseResponse getCurrentRelease(long documentId) {
+        DocumentRow document = lockDocument(documentId);
+        JsonNode snapshot = repository.findLatestUnrevokedVersion(documentId)
+                .flatMap(version -> repository.findSnapshot(documentId, version))
+                .map(this::readSnapshotTree)
+                .orElse(null);
+        return new ApiDtos.CurrentReleaseResponse(documentId, document.releaseRevision(), snapshot);
+    }
+
+    /**
+     * 查询发布目录与撤回历史：按发布编号排序，撤回版本带原因与 UTC 撤回时刻，
+     * 未撤回版本 revoked=false、原因与时刻为 null；含当前发布目录修订号。
+     * 同样对文档行加写锁，与并发发布/撤回串行，保证目录与修订号是同一个已提交状态。
+     */
+    @Transactional
+    public ApiDtos.ReleaseCatalogResponse getReleaseCatalog(long documentId) {
+        DocumentRow document = lockDocument(documentId);
+        Map<Integer, RevocationRow> revocations = repository.listRevocations(documentId).stream()
+                .collect(Collectors.toMap(RevocationRow::publishedVersion, Function.identity()));
+        List<ApiDtos.ReleaseCatalogEntry> entries = new ArrayList<>();
+        for (Integer version : repository.listSnapshotVersions(documentId)) {
+            RevocationRow revocation = revocations.get(version);
+            entries.add(new ApiDtos.ReleaseCatalogEntry(version, revocation != null,
+                    revocation == null ? null : revocation.reason(),
+                    revocation == null ? null : revocation.revokedAt()));
+        }
+        return new ApiDtos.ReleaseCatalogResponse(documentId, document.releaseRevision(), entries);
     }
 
     /** 查询指定发布版本的只读快照 JSON；不存在返回 404。 */
@@ -345,6 +416,15 @@ public class TranslationService {
 
     private static ApiDtos.TermRuleView toRuleView(TermRuleRow rule) {
         return new ApiDtos.TermRuleView(rule.sourceTerm(), rule.language(), rule.requiredTranslation());
+    }
+
+    /** 将历史快照 JSON 字符串解析为 JsonNode，作为完整快照原样返回。 */
+    private JsonNode readSnapshotTree(String snapshotJson) {
+        try {
+            return objectMapper.readTree(snapshotJson);
+        } catch (Exception e) {
+            throw new IllegalStateException("快照解析失败", e);
+        }
     }
 
     /** 生成完整只读快照 JSON：全部段落源文及各语言译文、作者、审核人、版本号与固化的术语版本及规则集。 */
