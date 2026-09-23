@@ -35,4 +35,11 @@ public class ApiException extends RuntimeException {
     public static ApiException conflict(String code, String message) {
         return new ApiException(HttpStatus.CONFLICT, code, message);
     }
+
+    /**
+     * 422：请求语法正确但业务语义不合法（如配额后态越界、迁移已确认安装成功的设备）。
+     */
+    public static ApiException unprocessable(String code, String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, code, message);
+    }
 }
