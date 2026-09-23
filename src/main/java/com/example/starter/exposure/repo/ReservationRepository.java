@@ -76,6 +76,36 @@ public class ReservationRepository {
     }
 
     /**
+     * 行锁查询某公告下全部在途（RESERVED）预占单，用于撤回时冻结快照。
+     */
+    public List<Reservation> lockReservedByCampaign(String campaignId) {
+        return jdbc.query("SELECT " + COLUMNS + " FROM exposure_reservation "
+                        + "WHERE campaign_id = ? AND status = 'RESERVED' ORDER BY reservation_id FOR UPDATE",
+                MAPPER, campaignId);
+    }
+
+    /**
+     * 无锁查询某公告下已到期（now &gt;= expires_at_utc）但仍为 SETTLING 的预占单；
+     * 仅作扫描线索，终态变更前须按 撤回→快照项→预占 顺序重新加锁校验。
+     */
+    public List<Reservation> findExpiredSettling(String campaignId, long nowUtc) {
+        return jdbc.query("SELECT " + COLUMNS + " FROM exposure_reservation "
+                        + "WHERE campaign_id = ? AND status = 'SETTLING' AND expires_at_utc <= ?",
+                MAPPER, campaignId, nowUtc);
+    }
+
+    /**
+     * 撤回冻结 CAS：仅当仍为 RESERVED 时转 SETTLING（非终态，不写 terminal_at_utc）。
+     *
+     * @return 是否更新成功
+     */
+    public boolean markSettling(String reservationId) {
+        int rows = jdbc.update("UPDATE exposure_reservation SET status = 'SETTLING' "
+                + "WHERE reservation_id = ? AND status = 'RESERVED'", reservationId);
+        return rows == 1;
+    }
+
+    /**
      * 条件 CAS：仅当当前状态为 expect 时改为 target 并记录终态时刻。
      *
      * @return 是否更新成功（并发终态竞争时只有一个返回 true）
