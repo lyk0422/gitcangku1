@@ -4,8 +4,10 @@ import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.function.Supplier;
 
@@ -29,6 +31,10 @@ import com.example.starter.baggage.BaggageDtos.RecoverRequest;
 import com.example.starter.baggage.BaggageDtos.RecoverResponse;
 import com.example.starter.baggage.BaggageDtos.RegisterBagRequest;
 import com.example.starter.baggage.BaggageDtos.RegisterLegRequest;
+import com.example.starter.baggage.BaggageDtos.RerouteHistoryItem;
+import com.example.starter.baggage.BaggageDtos.RerouteHistoryResponse;
+import com.example.starter.baggage.BaggageDtos.RerouteRequest;
+import com.example.starter.baggage.BaggageDtos.RerouteResponse;
 import com.example.starter.baggage.BaggageDtos.SealRequest;
 import com.example.starter.baggage.BaggageDtos.SealResponse;
 import com.example.starter.baggage.BaggageDtos.ShortItem;
@@ -61,6 +67,7 @@ public class BaggageService {
     private static final String EVT_UNLOADED = "UNLOADED";
     private static final String EVT_SHORT = "SHORT_UNLOADED";
     private static final String EVT_RECOVERED = "RECOVERED";
+    private static final String EVT_REROUTED = "REROUTED";
     private static final String EVT_DELIVERED = "DELIVERED";
 
     private static final RowMapper<LegRow> LEG_MAPPER = (rs, rowNum) -> new LegRow(
@@ -70,7 +77,9 @@ public class BaggageService {
 
     private static final RowMapper<BagRow> BAG_MAPPER = (rs, rowNum) -> new BagRow(
             rs.getString("bag_tag"), rs.getString("current_location"),
-            rs.getInt("next_leg_index"), rs.getString("status"), rs.getString("loaded_leg_id"),
+            rs.getInt("next_leg_index"), rs.getString("status"),
+            rs.getInt("route_version"), rs.getString("registered_destination"),
+            rs.getString("loaded_leg_id"),
             rs.getString("short_leg_id"), rs.getString("short_destination"),
             getInstant(rs, "short_registered_at"));
 
@@ -160,6 +169,41 @@ public class BaggageService {
                 request, RecoverResponse.class, () -> doRecover(request));
     }
 
+    /**
+     * 剩余行程整体改派。
+     * 加锁顺序与装载/封舱一致：先按 leg_id 排序锁定全部新航段，再锁定行李行，
+     * 因此改派与同袋装载、新航段封舱、另一改派并发时严格按提交顺序裁决：
+     * 装载先提交则行李已装载（409）；新航段封舱先提交则航段非 OPEN（409）；
+     * 另一改派先提交则行程版本变化（409）。失败在同一事务内回滚，不产生部分后缀或历史。
+     */
+    public RerouteResponse reroute(RerouteRequest request) {
+        ReroutePayload payload = new ReroutePayload(
+                request.bagTag(), request.expectedRouteVersion(), List.copyOf(request.newLegIds()));
+        return idempotencyService.execute(request.requestId(), "REROUTE", 200,
+                payload, RerouteResponse.class, () -> doReroute(request));
+    }
+
+    /** 行李改派历史查询：按改派先后返回，行李不存在返回 404。 */
+    public RerouteHistoryResponse getRerouteHistory(String bagTag) {
+        if (findBag(bagTag) == null) {
+            throw ApiException.notFound("行李不存在: " + bagTag);
+        }
+        List<RerouteHistoryItem> history = jdbcTemplate.query(
+                "SELECT seq, from_route_version, to_route_version, prefix_legs,"
+                        + " before_itinerary, after_itinerary, rerouted_at"
+                        + " FROM bag_reroute_history WHERE bag_tag = ? ORDER BY seq",
+                (rs, rowNum) -> new RerouteHistoryItem(
+                        rs.getInt("seq"),
+                        rs.getInt("from_route_version"),
+                        rs.getInt("to_route_version"),
+                        readJsonValues(rs.getString("prefix_legs"), String.class),
+                        readJsonValues(rs.getString("before_itinerary"), ItineraryItem.class),
+                        readJsonValues(rs.getString("after_itinerary"), ItineraryItem.class),
+                        getInstant(rs, "rerouted_at").toString()),
+                bagTag);
+        return new RerouteHistoryResponse(bagTag, history);
+    }
+
     /** 行李完整轨迹查询。 */
     public BagResponse getBagTrace(String bagTag) {
         BagRow bag = findBag(bagTag);
@@ -238,9 +282,11 @@ public class BaggageService {
             }
         }
         String startStation = legs.get(0).origin();
+        String registeredDestination = legs.get(legs.size() - 1).destination();
         jdbcTemplate.update(
-                "INSERT INTO bag (bag_tag, current_location, next_leg_index, status) VALUES (?, ?, 0, ?)",
-                request.bagTag(), startStation, BAG_IN_TRANSIT);
+                "INSERT INTO bag (bag_tag, current_location, next_leg_index, status,"
+                        + " route_version, registered_destination) VALUES (?, ?, 0, ?, 1, ?)",
+                request.bagTag(), startStation, BAG_IN_TRANSIT, registeredDestination);
         for (int i = 0; i < legs.size(); i++) {
             LegRow leg = legs.get(i);
             jdbcTemplate.update(
@@ -400,6 +446,122 @@ public class BaggageService {
                 nextIndex, request.missingLegId());
     }
 
+    private RerouteResponse doReroute(RerouteRequest request) {
+        List<String> newLegIds = request.newLegIds();
+        if (new HashSet<>(newLegIds).size() != newLegIds.size()) {
+            throw ApiException.unprocessable("新后缀航段不得重复");
+        }
+        // 先按 leg_id 排序锁定全部新航段（与装载/封舱相同的加锁顺序），再锁定行李行
+        List<String> sortedLegIds = sortedCopy(newLegIds);
+        List<LegRow> lockedLegs = new ArrayList<>();
+        for (String legId : sortedLegIds) {
+            lockedLegs.add(lockLeg(legId));
+        }
+        BagRow bag = lockBag(request.bagTag());
+        if (bag == null) {
+            throw ApiException.notFound("行李不存在: " + request.bagTag());
+        }
+        if (bag.routeVersion() != request.expectedRouteVersion()) {
+            throw ApiException.conflict(
+                    "行程版本冲突: 期望 " + request.expectedRouteVersion()
+                            + "，当前 " + bag.routeVersion());
+        }
+        if (BAG_SHORT_UNLOADED.equals(bag.status())) {
+            throw ApiException.conflict(
+                    "行李 " + bag.bagTag() + " 尚处短卸状态，须先真实补到后才能改派");
+        }
+        if (bag.loadedLegId() != null || BAG_DELIVERED.equals(bag.status())) {
+            throw ApiException.conflict(
+                    "行李 " + bag.bagTag() + " 已"
+                            + (BAG_DELIVERED.equals(bag.status()) ? "送达" : "装载到航段 " + bag.loadedLegId())
+                            + "，不可改派");
+        }
+        int prefixLen = bag.nextLegIndex();
+        List<ItineraryItem> currentItinerary = toItinerary(bag.bagTag());
+        List<ItineraryItem> prefix = new ArrayList<>(currentItinerary.subList(0, prefixLen));
+        List<ItineraryItem> suffixLegs = new ArrayList<>();
+        Map<String, LegRow> legById = new HashMap<>();
+        for (LegRow leg : lockedLegs) {
+            legById.put(leg.legId(), leg);
+        }
+        for (String legId : newLegIds) {
+            LegRow leg = legById.get(legId);
+            if (!LEG_OPEN.equals(leg.status())) {
+                throw ApiException.conflict(
+                        "新航段 " + legId + " 状态为 " + leg.status() + "，不可装载，改派拒绝");
+            }
+            suffixLegs.add(new ItineraryItem(0, leg.legId(), leg.origin(), leg.destination()));
+        }
+        // 新后缀第一段起点必须等于当前位置，相邻新航段首尾衔接
+        if (!suffixLegs.get(0).origin().equals(bag.currentLocation())) {
+            throw ApiException.unprocessable(
+                    "新后缀首段起点 " + suffixLegs.get(0).origin()
+                            + " 必须等于当前位置 " + bag.currentLocation());
+        }
+        for (int i = 0; i + 1 < suffixLegs.size(); i++) {
+            if (!suffixLegs.get(i).destination().equals(suffixLegs.get(i + 1).origin())) {
+                throw ApiException.unprocessable(
+                        "新航段不连续: " + suffixLegs.get(i).legId()
+                                + " -> " + suffixLegs.get(i + 1).legId());
+            }
+        }
+        String finalDestination = suffixLegs.get(suffixLegs.size() - 1).destination();
+        if (!finalDestination.equals(bag.registeredDestination())) {
+            throw ApiException.unprocessable(
+                    "改派后最终目的地 " + finalDestination
+                            + " 与原登记目的地 " + bag.registeredDestination() + " 不一致");
+        }
+        // 前缀加新后缀合计不得超过 5 段，且完整行程不得重复航段
+        int total = prefixLen + suffixLegs.size();
+        if (total > 5) {
+            throw ApiException.unprocessable("改派后完整行程不得超过 5 段，当前为 " + total + " 段");
+        }
+        Set<String> completeLegIds = new HashSet<>();
+        for (ItineraryItem item : prefix) {
+            completeLegIds.add(item.legId());
+        }
+        for (ItineraryItem item : suffixLegs) {
+            if (!completeLegIds.add(item.legId())) {
+                throw ApiException.unprocessable("完整行程不得重复航段: " + item.legId());
+            }
+        }
+
+        List<ItineraryItem> beforeSnapshot = currentItinerary;
+        // 删除全部待乘后缀，重新写入新后缀（已完成前缀原样保留）
+        jdbcTemplate.update("DELETE FROM bag_itinerary WHERE bag_tag = ? AND seq >= ?",
+                bag.bagTag(), prefixLen);
+        List<ItineraryItem> afterItinerary = new ArrayList<>(prefix);
+        for (int i = 0; i < suffixLegs.size(); i++) {
+            ItineraryItem leg = suffixLegs.get(i);
+            int seq = prefixLen + i;
+            jdbcTemplate.update(
+                    "INSERT INTO bag_itinerary (bag_tag, seq, leg_id, origin, destination)"
+                            + " VALUES (?, ?, ?, ?, ?)",
+                    bag.bagTag(), seq, leg.legId(), leg.origin(), leg.destination());
+            afterItinerary.add(new ItineraryItem(seq, leg.legId(), leg.origin(), leg.destination()));
+        }
+        int fromVersion = bag.routeVersion();
+        int toVersion = fromVersion + 1;
+        // 位置与待乘索引不因改派而推进
+        jdbcTemplate.update("UPDATE bag SET route_version = ? WHERE bag_tag = ?",
+                toVersion, bag.bagTag());
+        Integer maxHistorySeq = jdbcTemplate.queryForObject(
+                "SELECT MAX(seq) FROM bag_reroute_history WHERE bag_tag = ?",
+                Integer.class, bag.bagTag());
+        int historySeq = maxHistorySeq == null ? 0 : maxHistorySeq + 1;
+        List<String> prefixLegIds = prefix.stream().map(ItineraryItem::legId).toList();
+        jdbcTemplate.update(
+                "INSERT INTO bag_reroute_history (bag_tag, seq, from_route_version, to_route_version,"
+                        + " prefix_legs, before_itinerary, after_itinerary, rerouted_at)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                bag.bagTag(), historySeq, fromVersion, toVersion,
+                writeJson(prefixLegIds), writeJson(beforeSnapshot), writeJson(afterItinerary),
+                OffsetDateTime.ofInstant(clock.get(), ZoneOffset.UTC));
+        insertEvent(bag.bagTag(), EVT_REROUTED, null, bag.currentLocation());
+        return new RerouteResponse(bag.bagTag(), bag.status(), bag.currentLocation(),
+                bag.nextLegIndex(), toVersion, afterItinerary);
+    }
+
     /** 实际到达行李的统一推进：移动到到达站、推进待乘索引，完成行程者交付。 */
     private void advanceArrivedBag(BagRow bag, String destination, String legId) {
         int nextIndex = bag.nextLegIndex() + 1;
@@ -473,8 +635,9 @@ public class BaggageService {
     }
 
     private static String bagSelect(boolean forUpdate) {
-        return "SELECT bag_tag, current_location, next_leg_index, status, loaded_leg_id,"
-                + " short_leg_id, short_destination, short_registered_at FROM bag WHERE bag_tag = ?"
+        return "SELECT bag_tag, current_location, next_leg_index, status, route_version,"
+                + " registered_destination, loaded_leg_id, short_leg_id, short_destination,"
+                + " short_registered_at FROM bag WHERE bag_tag = ?"
                 + (forUpdate ? " FOR UPDATE" : "");
     }
 
@@ -518,7 +681,8 @@ public class BaggageService {
 
     private BagResponse toBagResponse(BagRow bag) {
         return new BagResponse(bag.bagTag(), bag.currentLocation(), bag.nextLegIndex(),
-                bag.status(), bag.loadedLegId(), toItinerary(bag.bagTag()),
+                bag.status(), bag.routeVersion(), bag.registeredDestination(),
+                bag.loadedLegId(), toItinerary(bag.bagTag()),
                 bag.shortLegId(), bag.shortDestination(),
                 bag.shortRegisteredAt() == null ? null : bag.shortRegisteredAt().toString(),
                 toEvents(bag.bagTag()));
@@ -533,9 +697,9 @@ public class BaggageService {
         return values.stream().sorted().toList();
     }
 
-    private String writeJson(List<String> values) {
+    private String writeJson(Object value) {
         try {
-            return objectMapper.writeValueAsString(values);
+            return objectMapper.writeValueAsString(value);
         } catch (Exception ex) {
             throw new IllegalStateException("清单序列化失败", ex);
         }
@@ -550,13 +714,23 @@ public class BaggageService {
         }
     }
 
+    private <T> List<T> readJsonValues(String json, Class<T> elementType) {
+        try {
+            return objectMapper.readValue(json,
+                    objectMapper.getTypeFactory().constructCollectionType(List.class, elementType));
+        } catch (Exception ex) {
+            throw new IllegalStateException("快照反序列化失败", ex);
+        }
+    }
+
     private record LegRow(String legId, String origin, String destination,
                           String status, int version, String sealedManifest,
                           String arrivalType, String arrivalActual) {
     }
 
     private record BagRow(String bagTag, String currentLocation, int nextLegIndex,
-                          String status, String loadedLegId, String shortLegId,
+                          String status, int routeVersion, String registeredDestination,
+                          String loadedLegId, String shortLegId,
                           String shortDestination, Instant shortRegisteredAt) {
     }
 
@@ -574,5 +748,9 @@ public class BaggageService {
 
     /** 差异到达幂等摘要参数：bagTags 已排序，顺序差异不视为异参。 */
     private record DifferenceArrivePayload(String legId, int expectedVersion, List<String> bagTags) {
+    }
+
+    /** 改派幂等摘要参数：newLegIds 为有序列表，顺序差异视为异参。 */
+    private record ReroutePayload(String bagTag, int expectedRouteVersion, List<String> newLegIds) {
     }
 }

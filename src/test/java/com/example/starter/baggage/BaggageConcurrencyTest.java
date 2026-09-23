@@ -43,6 +43,7 @@ class BaggageConcurrencyTest {
 
     @BeforeEach
     void setUp() {
+        jdbcTemplate.update("DELETE FROM bag_reroute_history");
         jdbcTemplate.update("DELETE FROM bag_event");
         jdbcTemplate.update("DELETE FROM load_record");
         jdbcTemplate.update("DELETE FROM bag_itinerary");

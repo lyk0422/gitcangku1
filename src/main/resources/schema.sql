@@ -20,8 +20,10 @@ CREATE TABLE IF NOT EXISTS leg (
 CREATE TABLE IF NOT EXISTS bag (
     bag_tag             VARCHAR(64)  NOT NULL COMMENT '行李牌号，全局唯一',
     current_location    VARCHAR(64)  NOT NULL COMMENT '当前所在站点代码',
-    next_leg_index      INT          NOT NULL DEFAULT 0 COMMENT '待乘航段在行程中的下标（0 起），等于行程长度表示已完成；短卸不推进',
+    next_leg_index      INT          NOT NULL DEFAULT 0 COMMENT '待乘航段在行程中的下标（0 起），等于行程长度表示已完成；短卸与改派均不推进',
     status              VARCHAR(16)  NOT NULL DEFAULT 'IN_TRANSIT' COMMENT '行李状态：IN_TRANSIT 在途/SHORT_UNLOADED 短卸待补/RECOVERED 已补到在途/DELIVERED 已交付',
+    route_version       INT          NOT NULL DEFAULT 1 COMMENT '行程版本：登记初始为 1，每次剩余行程改派成功后加一',
+    registered_destination VARCHAR(64) NOT NULL COMMENT '原登记最终目的地站点代码，改派不得改变',
     loaded_leg_id       VARCHAR(64)  NULL COMMENT '当前已装载到的航段，未装载为 NULL',
     short_leg_id        VARCHAR(64)  NULL COMMENT '短卸缺失航段标识，仅 SHORT_UNLOADED 状态非 NULL',
     short_destination   VARCHAR(64)  NULL COMMENT '短卸应到站点代码，仅 SHORT_UNLOADED 状态非 NULL',
@@ -53,7 +55,7 @@ CREATE TABLE IF NOT EXISTS bag_event (
     id         BIGINT AUTO_INCREMENT NOT NULL COMMENT '事件自增主键',
     bag_tag    VARCHAR(64)  NOT NULL COMMENT '行李牌号',
     seq        INT          NOT NULL COMMENT '该行李内事件顺序，0 起递增',
-    event_type VARCHAR(32)  NOT NULL COMMENT '事件类型：REGISTERED 登记/LOADED 装载/UNLOADED 到达卸下/SHORT_UNLOADED 短卸/RECOVERED 补到/DELIVERED 交付',
+    event_type VARCHAR(32)  NOT NULL COMMENT '事件类型：REGISTERED 登记/LOADED 装载/UNLOADED 到达卸下/SHORT_UNLOADED 短卸/RECOVERED 补到/REROUTED 剩余行程改派/DELIVERED 交付',
     leg_id     VARCHAR(64)  NULL COMMENT '关联航段标识，与航段无关的事件为 NULL',
     location   VARCHAR(64)  NULL COMMENT '事件发生后行李所在站点代码',
     event_time TIMESTAMP WITH TIME ZONE NOT NULL COMMENT '事件发生时刻（UTC）',
@@ -61,10 +63,25 @@ CREATE TABLE IF NOT EXISTS bag_event (
     UNIQUE (bag_tag, seq)
 );
 
+-- 行李改派历史：每次剩余行程改派成功追加一条不可变快照，记录改派前后的完整行程与版本
+CREATE TABLE IF NOT EXISTS bag_reroute_history (
+    id               BIGINT AUTO_INCREMENT NOT NULL COMMENT '自增主键',
+    bag_tag          VARCHAR(64)  NOT NULL COMMENT '行李牌号',
+    seq              INT          NOT NULL COMMENT '该行李改派序号，0 起递增（第 1 次改派为 0）',
+    from_route_version INT        NOT NULL COMMENT '改派前行程版本（首次改派为 1）',
+    to_route_version INT          NOT NULL COMMENT '改派后行程版本',
+    prefix_legs      CLOB         NOT NULL COMMENT '保留的已完成航段前缀（JSON 数组，按顺序的 leg_id）',
+    before_itinerary CLOB         NOT NULL COMMENT '改派前完整行程快照（JSON 数组，元素含 seq/legId/origin/destination）',
+    after_itinerary  CLOB         NOT NULL COMMENT '改派后完整行程快照（JSON 数组，元素含 seq/legId/origin/destination）',
+    rerouted_at      TIMESTAMP WITH TIME ZONE NOT NULL COMMENT '改派提交时刻（UTC）',
+    PRIMARY KEY (id),
+    UNIQUE (bag_tag, seq)
+);
+
 -- 幂等去重：仅记录成功请求；同 requestId 同参数重放原结果，异参数返回 409
 CREATE TABLE IF NOT EXISTS request_log (
     request_id      VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
-    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER',
+    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER/REROUTE',
     request_hash    VARCHAR(64)  NOT NULL COMMENT '请求参数（不含 requestId）的 SHA-256 摘要',
     response_status INT          NOT NULL COMMENT '原成功响应的 HTTP 状态码',
     response_body   CLOB         NOT NULL COMMENT '原成功响应体（JSON）',

@@ -64,6 +64,7 @@ class BaggageShortUnloadTest {
 
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM bag_reroute_history");
         jdbcTemplate.update("DELETE FROM bag_event");
         jdbcTemplate.update("DELETE FROM load_record");
         jdbcTemplate.update("DELETE FROM bag_itinerary");
@@ -431,9 +432,11 @@ class BaggageShortUnloadTest {
                     "SELECT status FROM bag WHERE bag_tag = 'BAG_SHORT'", String.class);
             assertThat(shortStatus).isEqualTo("RECOVERED");
         } else {
-            // 装载先尝试且失败：整批不移动，补到完成后再装载必然成功
+            // 装载先尝试且失败：整批不移动；并发的补到可能已随之提交（再补返回 409），也可能尚未完成
             assertThat(okLoaded).isZero();
-            recover("BAG_SHORT", "LEG1", "SHA").andExpect(status().isOk());
+            int recoverStatus = recover("BAG_SHORT", "LEG1", "SHA").andReturn()
+                    .getResponse().getStatus();
+            assertThat(recoverStatus).isIn(200, 409);
             load("LEG2", 1, List.of("BAG_OK", "BAG_SHORT")).andExpect(status().isOk());
         }
     }
