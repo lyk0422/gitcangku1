@@ -71,4 +71,29 @@ public class ExposureController {
                                     @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate utcDate) {
         return exposureService.queryQuota(campaignId, visitorId, utcDate);
     }
+
+    /** 撤回一个公告版本：原子禁止该版本新预占，并冻结全部 PENDING 预占为 SETTLING 快照。 */
+    @PostMapping("/withdrawals")
+    public ResponseEntity<WithdrawalResponse> withdraw(@Valid @RequestBody WithdrawCampaignRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(exposureService.withdraw(request));
+    }
+
+    /** 撤回单只读视图：截点、快照及逐项决议。 */
+    @GetMapping("/withdrawals/{withdrawalKey}")
+    public WithdrawalResponse getWithdrawal(@PathVariable String withdrawalKey) {
+        return exposureService.getWithdrawal(withdrawalKey);
+    }
+
+    /** 发布方显式结算：提交快照完整预占版本集合；仍有可合法确认项时 409 且不变更。 */
+    @PostMapping("/withdrawals/{withdrawalKey}/settle")
+    public WithdrawalResponse settle(@PathVariable String withdrawalKey,
+                                     @Valid @RequestBody SettleWithdrawalRequest request) {
+        return exposureService.settle(withdrawalKey, request);
+    }
+
+    /** 提交快照内预占的回执：满足截点/预占时刻/有效期规则则确认，否则释放为 REJECTED。 */
+    @PostMapping("/receipts")
+    public ResponseEntity<ReceiptResponse> submitReceipt(@Valid @RequestBody ReceiptRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(exposureService.submitReceipt(request));
+    }
 }

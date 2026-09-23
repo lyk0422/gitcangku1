@@ -1,20 +1,34 @@
 package com.example.starter.exposure.exposure;
 
 import com.example.starter.exposure.domain.Campaign;
+import com.example.starter.exposure.domain.ExposureReceipt;
 import com.example.starter.exposure.domain.Reservation;
 import com.example.starter.exposure.domain.ReservationStatus;
+import com.example.starter.exposure.domain.SnapshotItemStatus;
+import com.example.starter.exposure.domain.Withdrawal;
+import com.example.starter.exposure.domain.WithdrawalItem;
+import com.example.starter.exposure.domain.WithdrawalStatus;
 import com.example.starter.exposure.repo.CampaignRepository;
 import com.example.starter.exposure.repo.IdempotencyRepository;
 import com.example.starter.exposure.repo.IdempotencyRepository.IdempotencyRecord;
 import com.example.starter.exposure.repo.LedgerRepository;
+import com.example.starter.exposure.repo.ReceiptRepository;
 import com.example.starter.exposure.repo.ReservationRepository;
+import com.example.starter.exposure.repo.WithdrawalItemRepository;
+import com.example.starter.exposure.repo.WithdrawalRepository;
 import com.example.starter.exposure.web.ApiException;
 import com.example.starter.exposure.web.ApplyExposureRequest;
 import com.example.starter.exposure.web.CampaignResponse;
 import com.example.starter.exposure.web.CreateCampaignRequest;
 import com.example.starter.exposure.web.QuotaResponse;
+import com.example.starter.exposure.web.ReceiptRequest;
+import com.example.starter.exposure.web.ReceiptResponse;
 import com.example.starter.exposure.web.ReservationActionRequest;
 import com.example.starter.exposure.web.ReservationResponse;
+import com.example.starter.exposure.web.SettleWithdrawalRequest;
+import com.example.starter.exposure.web.WithdrawCampaignRequest;
+import com.example.starter.exposure.web.WithdrawalItemResponse;
+import com.example.starter.exposure.web.WithdrawalResponse;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.http.HttpStatus;
@@ -23,7 +37,10 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Clock;
 import java.time.LocalDate;
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Supplier;
 
@@ -33,6 +50,11 @@ import java.util.function.Supplier;
  * <p>所有写操作以 requestId 为全局幂等键：同键同参重放原成功结果，异参 409；
  * 业务失败随事务回滚，不占幂等键。所有操作与额度查询先结算相关过期预占，
  * 不依赖后台定时器。终态竞争由行锁 + 状态 CAS 保证只允许一个终态。</p>
+ *
+ * <p>版本撤回：撤回在公告行锁内原子完成——禁止该版本新预占（申请与撤回在同一
+ * 公告行上串行），并把全部 PENDING 预占冻结为 SETTLING 快照；已确认曝光不回退。
+ * 回执/到期/结算对同一预占的终态竞争同样由行锁 + CAS 保证唯一终态，
+ * 快照项决议与预占终态在同一事务提交，公告/访客计数守恒。</p>
  */
 @Service
 public class ExposureServiceImpl implements ExposureService {
@@ -47,6 +69,9 @@ public class ExposureServiceImpl implements ExposureService {
     private final ReservationRepository reservationRepository;
     private final LedgerRepository ledgerRepository;
     private final IdempotencyRepository idempotencyRepository;
+    private final WithdrawalRepository withdrawalRepository;
+    private final WithdrawalItemRepository withdrawalItemRepository;
+    private final ReceiptRepository receiptRepository;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate txTemplate;
 
@@ -55,6 +80,9 @@ public class ExposureServiceImpl implements ExposureService {
                                ReservationRepository reservationRepository,
                                LedgerRepository ledgerRepository,
                                IdempotencyRepository idempotencyRepository,
+                               WithdrawalRepository withdrawalRepository,
+                               WithdrawalItemRepository withdrawalItemRepository,
+                               ReceiptRepository receiptRepository,
                                ObjectMapper objectMapper,
                                TransactionTemplate txTemplate) {
         this.clock = clock;
@@ -62,6 +90,9 @@ public class ExposureServiceImpl implements ExposureService {
         this.reservationRepository = reservationRepository;
         this.ledgerRepository = ledgerRepository;
         this.idempotencyRepository = idempotencyRepository;
+        this.withdrawalRepository = withdrawalRepository;
+        this.withdrawalItemRepository = withdrawalItemRepository;
+        this.receiptRepository = receiptRepository;
         this.objectMapper = objectMapper;
         this.txTemplate = txTemplate;
     }
@@ -80,6 +111,7 @@ public class ExposureServiceImpl implements ExposureService {
                             request.campaignId(),
                             request.dailyTotalCap(),
                             request.perVisitorDailyCap(),
+                            1,
                             clock.millis());
                     try {
                         campaignRepository.insert(campaign);
@@ -99,7 +131,18 @@ public class ExposureServiceImpl implements ExposureService {
                 ReservationResponse.class, () -> {
                     long now = clock.millis();
                     LocalDate utcDate = LocalDate.now(clock);
-                    Campaign campaign = requireCampaign(request.campaignId());
+                    // 公告行锁：与撤回在公告行上串行，保证撤回原子禁止新预占
+                    Campaign campaign = campaignRepository.lockById(request.campaignId())
+                            .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
+                                    "campaign not found: " + request.campaignId()));
+
+                    // 当前版本已被撤回：禁止新预占
+                    if (withdrawalRepository.existsByCampaignAndVersion(
+                            campaign.campaignId(), campaign.version())) {
+                        throw new ApiException(HttpStatus.CONFLICT,
+                                "campaign version withdrawn: " + campaign.campaignId()
+                                        + " v" + campaign.version());
+                    }
 
                     // 先结算该公告相关过期预占并释放额度
                     settleExpired(campaign.campaignId(), now);
@@ -124,6 +167,7 @@ public class ExposureServiceImpl implements ExposureService {
                     Reservation reservation = new Reservation(
                             reservationId,
                             campaign.campaignId(),
+                            campaign.version(),
                             request.visitorId(),
                             java.sql.Date.valueOf(utcDate),
                             ReservationStatus.RESERVED,
@@ -189,6 +233,197 @@ public class ExposureServiceImpl implements ExposureService {
         });
     }
 
+    @Override
+    public WithdrawalResponse withdraw(WithdrawCampaignRequest request) {
+        String fingerprint = request.withdrawalKey() + "|" + request.campaignId() + "|"
+                + request.campaignVersion() + "|" + request.cutoffAt();
+        return runIdempotent(request.requestId(), Operation.WITHDRAW, fingerprint,
+                WithdrawalResponse.class, () -> {
+                    long now = clock.millis();
+                    // 公告行锁：与申请串行，撤回后该版本不再产生新预占
+                    Campaign campaign = campaignRepository.lockById(request.campaignId())
+                            .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
+                                    "campaign not found: " + request.campaignId()));
+                    if (campaign.version() != request.campaignVersion()) {
+                        throw new ApiException(HttpStatus.CONFLICT,
+                                "campaign version mismatch: current " + campaign.version()
+                                        + ", requested " + request.campaignVersion());
+                    }
+                    if (withdrawalRepository.existsByCampaignAndVersion(
+                            campaign.campaignId(), campaign.version())) {
+                        throw new ApiException(HttpStatus.CONFLICT,
+                                "campaign version already withdrawn: " + campaign.campaignId()
+                                        + " v" + campaign.version());
+                    }
+
+                    Withdrawal withdrawal = new Withdrawal(
+                            request.withdrawalKey(),
+                            campaign.campaignId(),
+                            campaign.version(),
+                            request.cutoffAt(),
+                            WithdrawalStatus.SETTLING,
+                            now,
+                            null);
+                    try {
+                        withdrawalRepository.insert(withdrawal);
+                    } catch (DuplicateKeyException duplicate) {
+                        // withdrawalKey 或 (campaign,version) 并发唯一冲突
+                        throw new ApiException(HttpStatus.CONFLICT,
+                                "withdrawal key already exists: " + request.withdrawalKey());
+                    }
+
+                    // 冻结全部 PENDING(RESERVED) 预占为 SETTLING 快照；已确认曝光不回退
+                    List<Reservation> pending = reservationRepository.lockReservedByCampaignVersion(
+                            campaign.campaignId(), campaign.version());
+                    List<WithdrawalItemResponse> items = new ArrayList<>();
+                    for (Reservation reservation : pending) {
+                        WithdrawalItem item = new WithdrawalItem(
+                                withdrawal.withdrawalKey(),
+                                reservation.reservationId(),
+                                reservation.campaignVersion(),
+                                reservation.visitorId(),
+                                reservation.createdAtUtc(),
+                                reservation.expiresAtUtc(),
+                                SnapshotItemStatus.SETTLING,
+                                null,
+                                null);
+                        withdrawalItemRepository.insert(item);
+                        items.add(WithdrawalItemResponse.from(item));
+                    }
+                    return WithdrawalResponse.from(withdrawal, items);
+                });
+    }
+
+    @Override
+    public ReceiptResponse submitReceipt(ReceiptRequest request) {
+        String fingerprint = request.receiptKey() + "|" + request.reservationId() + "|"
+                + request.occurredAt();
+        return runIdempotent(request.requestId(), Operation.RECEIPT, fingerprint,
+                ReceiptResponse.class, () -> {
+                    long now = clock.millis();
+
+                    // receiptKey 唯一：同键同参重放原决议，异参 409
+                    var replayed = replayReceiptIfExists(request);
+                    if (replayed.isPresent()) {
+                        return replayed.get();
+                    }
+
+                    Reservation reservation = reservationRepository.lockById(request.reservationId())
+                            .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
+                                    "reservation not found: " + request.reservationId()));
+                    // 持预占行锁后重查：并发同键回执已提交时重放其决议，而非误判冲突
+                    var replayedAfterLock = replayReceiptIfExists(request);
+                    if (replayedAfterLock.isPresent()) {
+                        return replayedAfterLock.get();
+                    }
+                    WithdrawalItem item = withdrawalItemRepository
+                            .findByReservationId(request.reservationId())
+                            .orElseThrow(() -> new ApiException(HttpStatus.CONFLICT,
+                                    "reservation is not in a settling snapshot: "
+                                            + request.reservationId()));
+                    if (item.status() != SnapshotItemStatus.SETTLING) {
+                        throw new ApiException(HttpStatus.CONFLICT,
+                                "snapshot item already " + item.status() + ": "
+                                        + request.reservationId());
+                    }
+                    Withdrawal withdrawal = withdrawalRepository.findByKey(item.withdrawalKey())
+                            .orElseThrow(() -> new IllegalStateException(
+                                    "withdrawal missing: " + item.withdrawalKey()));
+
+                    // 仅 occurredAt 不早于预占时刻、早于截点，且提交时未过到期时刻才可确认
+                    boolean confirmable = request.occurredAt() >= item.reservedAtUtc()
+                            && request.occurredAt() < withdrawal.cutoffAtUtc()
+                            && now < item.expiresAtUtc();
+                    SnapshotItemStatus decision = confirmable
+                            ? SnapshotItemStatus.CONFIRMED : SnapshotItemStatus.REJECTED;
+                    ReservationStatus target = confirmable
+                            ? ReservationStatus.CONFIRMED : ReservationStatus.REJECTED;
+
+                    if (reservation.status() != ReservationStatus.RESERVED) {
+                        throw new ApiException(HttpStatus.CONFLICT,
+                                "reservation is " + reservation.status()
+                                        + ", cannot decide receipt");
+                    }
+                    if (!reservationRepository.compareAndSetStatus(
+                            reservation.reservationId(), ReservationStatus.RESERVED, target, now)) {
+                        throw new ApiException(HttpStatus.CONFLICT,
+                                "reservation state changed concurrently");
+                    }
+                    if (!confirmable) {
+                        // REJECTED 释放两级额度；固定顺序先总账后访客账
+                        ledgerRepository.releaseTotal(
+                                reservation.campaignId(), reservation.utcDate().toLocalDate());
+                        ledgerRepository.releaseVisitor(
+                                reservation.campaignId(), reservation.visitorId(),
+                                reservation.utcDate().toLocalDate());
+                    }
+                    if (!withdrawalItemRepository.decideIfSettling(
+                            item.reservationId(), decision, now,
+                            confirmable ? "RECEIPT_CONFIRMED" : "RECEIPT_REJECTED")) {
+                        throw new ApiException(HttpStatus.CONFLICT,
+                                "snapshot item decided concurrently");
+                    }
+                    ExposureReceipt receipt = new ExposureReceipt(
+                            request.receiptKey(), request.reservationId(),
+                            request.occurredAt(), decision, now);
+                    receiptRepository.insert(receipt);
+                    withdrawalRepository.completeIfAllTerminal(withdrawal.withdrawalKey(), now);
+                    return ReceiptResponse.from(receipt);
+                });
+    }
+
+    @Override
+    public WithdrawalResponse settle(String withdrawalKey, SettleWithdrawalRequest request) {
+        List<String> submittedKeys = request.items().stream()
+                .map(key -> key.reservationId() + ":" + key.campaignVersion())
+                .sorted()
+                .toList();
+        String fingerprint = withdrawalKey + "|" + String.join(",", submittedKeys);
+        return runIdempotent(request.requestId(), Operation.SETTLE, fingerprint,
+                WithdrawalResponse.class, () -> {
+                    long now = clock.millis();
+                    Withdrawal withdrawal = withdrawalRepository.findByKey(withdrawalKey)
+                            .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
+                                    "withdrawal not found: " + withdrawalKey));
+                    List<WithdrawalItem> allItems =
+                            withdrawalItemRepository.findByWithdrawalKey(withdrawalKey);
+
+                    // 提交的预占版本集合必须与快照完全一致
+                    Set<String> expected = new HashSet<>();
+                    for (WithdrawalItem item : allItems) {
+                        expected.add(item.reservationId() + ":" + item.campaignVersion());
+                    }
+                    if (!expected.equals(new HashSet<>(submittedKeys))) {
+                        throw new ApiException(HttpStatus.CONFLICT,
+                                "settlement set does not match snapshot: " + withdrawalKey);
+                    }
+
+                    List<WithdrawalItem> settling = allItems.stream()
+                            .filter(item -> item.status() == SnapshotItemStatus.SETTLING)
+                            .toList();
+                    // 仍存在可合法确认的项：保持 PENDING，整体不变更，返回 409（不猜测结果）
+                    for (WithdrawalItem item : settling) {
+                        if (item.reservedAtUtc() < withdrawal.cutoffAtUtc()
+                                && now < item.expiresAtUtc()) {
+                            throw new ApiException(HttpStatus.CONFLICT,
+                                    "snapshot item still confirmable: " + item.reservationId());
+                        }
+                    }
+                    // 全部未回执项已无法合法确认：按相同时间规则释放
+                    for (WithdrawalItem item : settling) {
+                        releaseUnconfirmable(item, now);
+                    }
+                    withdrawalRepository.completeIfAllTerminal(withdrawalKey, now);
+                    return loadWithdrawal(withdrawalKey);
+                });
+    }
+
+    @Override
+    public WithdrawalResponse getWithdrawal(String withdrawalKey) {
+        // 只读查询：不加锁、不触发任何状态变更
+        return loadWithdrawal(withdrawalKey);
+    }
+
     // ---- 内部辅助（作用域末尾） ----
 
     /** 幂等操作类型，同时标识存储响应的反序列化类型。 */
@@ -196,7 +431,10 @@ public class ExposureServiceImpl implements ExposureService {
         CREATE_CAMPAIGN,
         APPLY,
         CONFIRM,
-        CANCEL
+        CANCEL,
+        WITHDRAW,
+        RECEIPT,
+        SETTLE
     }
 
     /**
@@ -260,6 +498,13 @@ public class ExposureServiceImpl implements ExposureService {
         current = reservationRepository.lockById(reservationId).orElseThrow();
 
         if (current.status() == ReservationStatus.RESERVED) {
+            // 撤回快照内的预占只能由回执/到期/结算决议，确认/取消不得绕过截点规则
+            var snapshotItem = withdrawalItemRepository.findByReservationId(reservationId);
+            if (snapshotItem.isPresent()
+                    && snapshotItem.get().status() == SnapshotItemStatus.SETTLING) {
+                throw new ApiException(HttpStatus.CONFLICT,
+                        "reservation is in a settling snapshot, use receipt: " + reservationId);
+            }
             // 结算后仍为 RESERVED 说明 now < expiresAt，确认严格要求在到期时刻之前
             if (isConfirm) {
                 if (!reservationRepository.compareAndSetStatus(
@@ -278,7 +523,8 @@ public class ExposureServiceImpl implements ExposureService {
             }
         } else if (current.status() == ReservationStatus.CONFIRMED
                 || current.status() == ReservationStatus.CANCELLED
-                || current.status() == ReservationStatus.EXPIRED) {
+                || current.status() == ReservationStatus.EXPIRED
+                || current.status() == ReservationStatus.REJECTED) {
             boolean sameTerminal = isConfirm
                     ? current.status() == ReservationStatus.CONFIRMED
                     : current.status() == ReservationStatus.CANCELLED;
@@ -310,7 +556,8 @@ public class ExposureServiceImpl implements ExposureService {
 
     /**
      * 若传入预占单（调用方已持其行锁）已到期，则 CAS 转 EXPIRED 并释放两级额度；
-     * 未到期或已非 RESERVED 则不做任何变更。
+     * 未到期或已非 RESERVED 则不做任何变更。属于撤回快照的预占同步决议快照项，
+     * 并在快照全部终态后收口撤回单。
      */
     private void expireIfDue(Reservation reservation, long now) {
         if (reservation.status() == ReservationStatus.RESERVED
@@ -325,20 +572,91 @@ public class ExposureServiceImpl implements ExposureService {
                 ledgerRepository.releaseTotal(reservation.campaignId(), utcDate);
                 ledgerRepository.releaseVisitor(
                         reservation.campaignId(), reservation.visitorId(), utcDate);
+                withdrawalItemRepository.findByReservationId(reservation.reservationId())
+                        .ifPresent(item -> {
+                            if (item.status() == SnapshotItemStatus.SETTLING
+                                    && withdrawalItemRepository.decideIfSettling(
+                                            item.reservationId(), SnapshotItemStatus.EXPIRED,
+                                            now, "EXPIRED")) {
+                                withdrawalRepository.completeIfAllTerminal(
+                                        item.withdrawalKey(), now);
+                            }
+                        });
             }
         }
+    }
+
+    /**
+     * 若 receiptKey 已存在：同参返回原决议（重放），异参抛 409；不存在返回 empty。
+     */
+    private java.util.Optional<ReceiptResponse> replayReceiptIfExists(ReceiptRequest request) {
+        var existing = receiptRepository.findByKey(request.receiptKey());
+        if (existing.isEmpty()) {
+            return java.util.Optional.empty();
+        }
+        ExposureReceipt stored = existing.get();
+        if (!stored.reservationId().equals(request.reservationId())
+                || stored.occurredAtUtc() != request.occurredAt()) {
+            throw new ApiException(HttpStatus.CONFLICT,
+                    "receipt key reused with different parameters: " + request.receiptKey());
+        }
+        return java.util.Optional.of(ReceiptResponse.from(stored));
+    }
+
+    /**
+     * 结算释放一条已无法合法确认的未回执快照项：已到期记 EXPIRED，
+     * 无合法 occurredAt 区间（预占时刻不早于截点）记 REJECTED；
+     * 释放两级额度并决议快照项。并发回执/到期抢先终态时整体回滚，由调用方重试。
+     */
+    private void releaseUnconfirmable(WithdrawalItem item, long now) {
+        boolean expired = now >= item.expiresAtUtc();
+        ReservationStatus reservationTarget = expired
+                ? ReservationStatus.EXPIRED : ReservationStatus.REJECTED;
+        SnapshotItemStatus itemTarget = expired
+                ? SnapshotItemStatus.EXPIRED : SnapshotItemStatus.REJECTED;
+
+        Reservation reservation = reservationRepository.lockById(item.reservationId())
+                .orElseThrow(() -> new IllegalStateException(
+                        "reservation missing: " + item.reservationId()));
+        if (reservation.status() != ReservationStatus.RESERVED) {
+            throw new ApiException(HttpStatus.CONFLICT,
+                    "reservation state changed concurrently: " + item.reservationId());
+        }
+        if (!reservationRepository.compareAndSetStatus(
+                item.reservationId(), ReservationStatus.RESERVED, reservationTarget, now)) {
+            throw new ApiException(HttpStatus.CONFLICT,
+                    "reservation state changed concurrently: " + item.reservationId());
+        }
+        LocalDate utcDate = reservation.utcDate().toLocalDate();
+        ledgerRepository.releaseTotal(reservation.campaignId(), utcDate);
+        ledgerRepository.releaseVisitor(reservation.campaignId(), reservation.visitorId(), utcDate);
+        if (!withdrawalItemRepository.decideIfSettling(
+                item.reservationId(), itemTarget, now,
+                expired ? "SETTLED_EXPIRED" : "SETTLED_NO_VALID_OCCURRENCE")) {
+            throw new ApiException(HttpStatus.CONFLICT,
+                    "snapshot item decided concurrently: " + item.reservationId());
+        }
+    }
+
+    /**
+     * 读取撤回单及快照项并组装视图（只读）。
+     */
+    private WithdrawalResponse loadWithdrawal(String withdrawalKey) {
+        Withdrawal withdrawal = withdrawalRepository.findByKey(withdrawalKey)
+                .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
+                        "withdrawal not found: " + withdrawalKey));
+        List<WithdrawalItemResponse> items = withdrawalItemRepository
+                .findByWithdrawalKey(withdrawalKey)
+                .stream()
+                .map(WithdrawalItemResponse::from)
+                .toList();
+        return WithdrawalResponse.from(withdrawal, items);
     }
 
     private Campaign requireCampaign(String campaignId) {
         return campaignRepository.findById(campaignId)
                 .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
                         "campaign not found: " + campaignId));
-    }
-
-    private Reservation requireReservation(String reservationId) {
-        return reservationRepository.findById(reservationId)
-                .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
-                        "reservation not found: " + reservationId));
     }
 
     private String writeJson(Object value) {

@@ -26,6 +26,7 @@ public class ReservationRepository {
     private static final RowMapper<Reservation> MAPPER = (rs, rowNum) -> new Reservation(
             rs.getString("reservation_id"),
             rs.getString("campaign_id"),
+            rs.getInt("campaign_version"),
             rs.getString("visitor_id"),
             rs.getDate("utc_date"),
             ReservationStatus.valueOf(rs.getString("status")),
@@ -34,13 +35,14 @@ public class ReservationRepository {
             (Long) rs.getObject("terminal_at_utc"));
 
     private static final String COLUMNS =
-            "reservation_id, campaign_id, visitor_id, utc_date, status, "
+            "reservation_id, campaign_id, campaign_version, visitor_id, utc_date, status, "
                     + "created_at_utc, expires_at_utc, terminal_at_utc";
 
     public void insert(Reservation reservation) {
-        jdbc.update("INSERT INTO exposure_reservation (" + COLUMNS + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        jdbc.update("INSERT INTO exposure_reservation (" + COLUMNS + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 reservation.reservationId(),
                 reservation.campaignId(),
+                reservation.campaignVersion(),
                 reservation.visitorId(),
                 reservation.utcDate(),
                 reservation.status().name(),
@@ -73,6 +75,17 @@ public class ReservationRepository {
         return jdbc.query("SELECT " + COLUMNS + " FROM exposure_reservation "
                         + "WHERE campaign_id = ? AND status = 'RESERVED' AND expires_at_utc <= ? FOR UPDATE",
                 MAPPER, campaignId, nowUtc);
+    }
+
+    /**
+     * 行锁查询某公告指定版本下仍为 RESERVED 的预占单（撤回快照冻结用），
+     * 按预占单编号排序保证加锁顺序确定。
+     */
+    public List<Reservation> lockReservedByCampaignVersion(String campaignId, int campaignVersion) {
+        return jdbc.query("SELECT " + COLUMNS + " FROM exposure_reservation "
+                        + "WHERE campaign_id = ? AND campaign_version = ? AND status = 'RESERVED' "
+                        + "ORDER BY reservation_id FOR UPDATE",
+                MAPPER, campaignId, campaignVersion);
     }
 
     /**

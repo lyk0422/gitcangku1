@@ -28,29 +28,42 @@ public class CampaignRepository {
                     rs.getString("campaign_id"),
                     rs.getInt("daily_total_cap"),
                     rs.getInt("per_visitor_daily_cap"),
+                    rs.getInt("version"),
                     rs.getLong("created_at_utc"));
         }
     };
+
+    private static final String COLUMNS =
+            "campaign_id, daily_total_cap, per_visitor_daily_cap, version, created_at_utc";
 
     /**
      * 按编号查询公告。
      */
     public Optional<Campaign> findById(String campaignId) {
-        return jdbc.query("SELECT campaign_id, daily_total_cap, per_visitor_daily_cap, created_at_utc "
-                        + "FROM campaign WHERE campaign_id = ?", MAPPER, campaignId)
+        return jdbc.query("SELECT " + COLUMNS + " FROM campaign WHERE campaign_id = ?", MAPPER, campaignId)
                 .stream()
                 .findFirst();
     }
 
     /**
-     * 插入公告；编号冲突由调用方依据唯一约束处理。
+     * 行锁读取公告；用于申请与撤回在公告行上串行化，保证撤回原子禁止新预占。
+     */
+    public Optional<Campaign> lockById(String campaignId) {
+        return jdbc.query("SELECT " + COLUMNS + " FROM campaign WHERE campaign_id = ? FOR UPDATE",
+                        MAPPER, campaignId)
+                .stream()
+                .findFirst();
+    }
+
+    /**
+     * 插入公告；编号冲突由调用方依据唯一约束处理。版本号创建时固定为 1。
      */
     public void insert(Campaign campaign) {
-        jdbc.update("INSERT INTO campaign (campaign_id, daily_total_cap, per_visitor_daily_cap, created_at_utc) "
-                        + "VALUES (?, ?, ?, ?)",
+        jdbc.update("INSERT INTO campaign (" + COLUMNS + ") VALUES (?, ?, ?, ?, ?)",
                 campaign.campaignId(),
                 campaign.dailyTotalCap(),
                 campaign.perVisitorDailyCap(),
+                campaign.version(),
                 campaign.createdAtUtc());
     }
 }
