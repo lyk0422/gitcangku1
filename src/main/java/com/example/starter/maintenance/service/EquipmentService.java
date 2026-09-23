@@ -8,18 +8,21 @@ import org.springframework.stereotype.Service;
 
 import com.example.starter.maintenance.api.ApiException;
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
+import com.example.starter.maintenance.api.dto.ChainResponse;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
 import com.example.starter.maintenance.api.dto.RegisterEquipmentRequest;
+import com.example.starter.maintenance.api.dto.ReplacementResponse;
+import com.example.starter.maintenance.api.dto.ReplaceMeterRequest;
 import com.example.starter.maintenance.api.dto.ReviseReadingRequest;
 import com.example.starter.maintenance.api.dto.RevisionView;
 import com.example.starter.maintenance.api.dto.StatusResponse;
 
 /**
  * 设备工时保养外观服务：委托事务服务执行；并发下唯一键冲突（事务已回滚）时，
- * 优先按 requestId 重放已提交的成功结果，否则转换为 409 业务冲突。
+ * 优先按 requestId/replacementKey 重放已提交的成功结果，否则转换为 409 业务冲突。
  */
 @Service
 public class EquipmentService {
@@ -46,6 +49,15 @@ public class EquipmentService {
         return txService.reviseReading(equipmentId, readingId, req);
     }
 
+    public ReplacementResponse replaceMeter(String equipmentId, ReplaceMeterRequest req) {
+        String fingerprint = equipmentId + "|" + req.newMeterKey() + "|"
+                + req.finalRawHours().stripTrailingZeros().toPlainString() + "|"
+                + req.initialRawHours().stripTrailingZeros().toPlainString() + "|"
+                + req.expectedVersion() + "|" + req.lastReadingRevisionNo();
+        return recoverDuplicateKey(req.replacementKey(), "REPLACE_METER", fingerprint,
+                ReplacementResponse.class, () -> txService.replaceMeter(equipmentId, req));
+    }
+
     public MaintenanceResponse completeMaintenance(String equipmentId, CompleteMaintenanceRequest req) {
         return txService.completeMaintenance(equipmentId, req);
     }
@@ -64,6 +76,10 @@ public class EquipmentService {
 
     public List<MaintenanceResponse> listMaintenances(String equipmentId) {
         return txService.listMaintenances(equipmentId);
+    }
+
+    public ChainResponse getChain(String equipmentId) {
+        return txService.getChain(equipmentId);
     }
 
     /**

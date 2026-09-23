@@ -18,6 +18,7 @@ import org.springframework.test.web.servlet.MvcResult;
 
 /**
  * 设备工时保养 API 主流程与失败分支测试（真实 H2 内存库，MySQL 兼容模式）。
+ * 工时以小时登记（rawHours），保养周期仍为分钟；整小时读数与分钟换算为 60 倍关系。
  */
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -32,9 +33,11 @@ class EquipmentApiTests {
     @BeforeEach
     void cleanTables() {
         jdbc.update("DELETE FROM idempotency_request");
+        jdbc.update("DELETE FROM meter_chain_recompute");
         jdbc.update("DELETE FROM maintenance");
         jdbc.update("DELETE FROM reading_revision");
         jdbc.update("DELETE FROM reading");
+        jdbc.update("DELETE FROM meter");
         jdbc.update("DELETE FROM equipment");
     }
 
@@ -54,44 +57,53 @@ class EquipmentApiTests {
     }
 
     private void addReading(String equipmentId, String requestId, long expectedVersion,
-                            String readingId, String sampledAt, long cumulativeMinutes,
+                            String readingId, String sampledAt, double rawHours,
                             int expectedStatus) throws Exception {
         mockMvc.perform(post("/api/equipment/" + equipmentId + "/readings")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {"requestId":"%s","expectedVersion":%d,"readingId":"%s",
-                                 "sampledAt":"%s","cumulativeMinutes":%d}
+                                 "sampledAt":"%s","rawHours":%s}
                                 """.formatted(requestId, expectedVersion, readingId, sampledAt,
-                                cumulativeMinutes)))
+                                formatHours(rawHours))))
                 .andExpect(status().is(expectedStatus));
+    }
+
+    private static String formatHours(double hours) {
+        if (hours == Math.rint(hours)) {
+            return String.valueOf((long) hours);
+        }
+        return String.valueOf(hours);
     }
 
     // ---------- 主流程：登记 → 读数 → DUE → 保养 → OK → 历史 ----------
 
     @Test
     void mainFlow_statusTransitionsAndHistory() throws Exception {
-        register("eq-main", 100);
+        register("eq-main", 6000);
 
-        // 初始状态：累计工时 0，OK
+        // 初始状态：虚拟工时 0，OK；初始 ACTIVE 表 meterKey 等于设备标识
         mockMvc.perform(get("/api/equipment/eq-main/status"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.version").value(1))
-                .andExpect(jsonPath("$.latestCumulativeMinutes").value(0))
+                .andExpect(jsonPath("$.activeMeterKey").value("eq-main"))
+                .andExpect(jsonPath("$.latestVirtualMinutes").value(0))
                 .andExpect(jsonPath("$.runMinutes").value(0))
                 .andExpect(jsonPath("$.status").value("OK"));
 
         addReading("eq-main", "add-r1", 1, "r1", "2026-01-01T10:00:00Z", 50, 201);
         mockMvc.perform(get("/api/equipment/eq-main/status"))
-                .andExpect(jsonPath("$.runMinutes").value(50))
+                .andExpect(jsonPath("$.latestVirtualHours").value(50))
+                .andExpect(jsonPath("$.runMinutes").value(3000))
                 .andExpect(jsonPath("$.status").value("OK"));
 
-        // 达到保养周期 → DUE
+        // 达到保养周期（130h = 7800min >= 6000min）→ DUE
         addReading("eq-main", "add-r2", 2, "r2", "2026-01-01T11:00:00Z", 130, 201);
         mockMvc.perform(get("/api/equipment/eq-main/status"))
-                .andExpect(jsonPath("$.runMinutes").value(130))
+                .andExpect(jsonPath("$.runMinutes").value(7800))
                 .andExpect(jsonPath("$.status").value("DUE"));
 
-        // 完成保养：锚点 r2 修订号 1
+        // 完成保养：锚点 r2 修订号 1，虚拟工时 130h = 7800min
         mockMvc.perform(post("/api/equipment/eq-main/maintenances")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
@@ -99,26 +111,28 @@ class EquipmentApiTests {
                                 """))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.anchorSampledAt").value("2026-01-01T11:00:00Z"))
-                .andExpect(jsonPath("$.anchorCumulativeMinutes").value(130))
+                .andExpect(jsonPath("$.anchorVirtualHours").value(130))
+                .andExpect(jsonPath("$.anchorCumulativeMinutes").value(7800))
                 .andExpect(jsonPath("$.equipmentVersion").value(4));
 
         // 保养后本轮运行分钟从锚点重算
         mockMvc.perform(get("/api/equipment/eq-main/status"))
                 .andExpect(jsonPath("$.version").value(4))
-                .andExpect(jsonPath("$.lastMaintenanceAnchorCumulativeMinutes").value(130))
+                .andExpect(jsonPath("$.lastMaintenanceAnchorCumulativeMinutes").value(7800))
                 .andExpect(jsonPath("$.runMinutes").value(0))
                 .andExpect(jsonPath("$.status").value("OK"));
 
         addReading("eq-main", "add-r3", 4, "r3", "2026-01-01T12:00:00Z", 180, 201);
         mockMvc.perform(get("/api/equipment/eq-main/status"))
-                .andExpect(jsonPath("$.runMinutes").value(50))
+                .andExpect(jsonPath("$.runMinutes").value(3000))
                 .andExpect(jsonPath("$.status").value("OK"));
 
-        // 读数历史：按采样时刻升序，r2 已锚定
+        // 读数历史：按采样时刻升序，r2 已锚定，均挂在初始表
         mockMvc.perform(get("/api/equipment/eq-main/readings"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$", hasSize(3)))
                 .andExpect(jsonPath("$[0].readingId").value("r1"))
+                .andExpect(jsonPath("$[0].meterKey").value("eq-main"))
                 .andExpect(jsonPath("$[1].readingId").value("r2"))
                 .andExpect(jsonPath("$[1].anchored").value(true))
                 .andExpect(jsonPath("$[2].readingId").value("r3"));
@@ -129,25 +143,25 @@ class EquipmentApiTests {
                 .andExpect(jsonPath("$", hasSize(1)))
                 .andExpect(jsonPath("$[0].readingId").value("r2"))
                 .andExpect(jsonPath("$[0].anchorRevisionNo").value(1))
-                .andExpect(jsonPath("$[0].anchorCumulativeMinutes").value(130));
+                .andExpect(jsonPath("$[0].anchorCumulativeMinutes").value(7800));
 
         // 修订历史：初始登记为修订 1
         mockMvc.perform(get("/api/equipment/eq-main/readings/r2/revisions"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$", hasSize(1)))
                 .andExpect(jsonPath("$[0].revisionNo").value(1))
-                .andExpect(jsonPath("$[0].cumulativeMinutes").value(130));
+                .andExpect(jsonPath("$[0].rawHours").value(130));
     }
 
     // ---------- 设备登记 ----------
 
     @Test
     void register_duplicateEquipment_conflict() throws Exception {
-        register("eq-dup", 100);
+        register("eq-dup", 6000);
         mockMvc.perform(post("/api/equipment")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"requestId":"reg-dup-2","equipmentId":"eq-dup","maintenancePeriodMinutes":200}
+                                {"requestId":"reg-dup-2","equipmentId":"eq-dup","maintenancePeriodMinutes":12000}
                                 """))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("EQUIPMENT_EXISTS"));
@@ -167,7 +181,7 @@ class EquipmentApiTests {
         mockMvc.perform(post("/api/equipment")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"equipmentId":"eq-bad","maintenancePeriodMinutes":100}
+                                {"equipmentId":"eq-bad","maintenancePeriodMinutes":6000}
                                 """))
                 .andExpect(status().isBadRequest());
     }
@@ -176,7 +190,7 @@ class EquipmentApiTests {
 
     @Test
     void write_versionConflict_returns409() throws Exception {
-        register("eq-ver", 100);
+        register("eq-ver", 6000);
         addReading("eq-ver", "add-v1", 99, "r1", "2026-01-01T10:00:00Z", 10, 409);
         // 失败的写操作不改变版本
         mockMvc.perform(get("/api/equipment/eq-ver/status"))
@@ -186,7 +200,7 @@ class EquipmentApiTests {
         mockMvc.perform(post("/api/equipment/eq-ver/readings/r1/revisions")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"requestId":"rev-v1","expectedVersion":1,"cumulativeMinutes":20}
+                                {"requestId":"rev-v1","expectedVersion":1,"rawHours":20}
                                 """))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("VERSION_CONFLICT"));
@@ -196,7 +210,7 @@ class EquipmentApiTests {
 
     @Test
     void addReading_backfillMustSatisfyBothNeighbors() throws Exception {
-        register("eq-mono", 1000);
+        register("eq-mono", 60000);
         addReading("eq-mono", "m1", 1, "r1", "2026-01-01T10:00:00Z", 100, 201);
         addReading("eq-mono", "m2", 2, "r3", "2026-01-01T12:00:00Z", 300, 201);
 
@@ -219,7 +233,7 @@ class EquipmentApiTests {
 
     @Test
     void addReading_sameTimestampAndDuplicateId_rejected() throws Exception {
-        register("eq-same", 1000);
+        register("eq-same", 60000);
         addReading("eq-same", "s1", 1, "r1", "2026-01-01T10:00:00Z", 100, 201);
         // 同一设备同一时刻仅一条
         addReading("eq-same", "s2", 2, "r2", "2026-01-01T10:00:00Z", 150, 422);
@@ -227,23 +241,40 @@ class EquipmentApiTests {
         addReading("eq-same", "s3", 2, "r1", "2026-01-01T11:00:00Z", 150, 409);
     }
 
+    @Test
+    void addReading_negativeAndBelowInitial_rejected() throws Exception {
+        register("eq-neg", 60000);
+        // 负数被校验层拦截（400）
+        mockMvc.perform(post("/api/equipment/eq-neg/readings")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"requestId":"neg-1","expectedVersion":1,"readingId":"r1",
+                                 "sampledAt":"2026-01-01T10:00:00Z","rawHours":-1}
+                                """))
+                .andExpect(status().isBadRequest());
+        mockMvc.perform(get("/api/equipment/eq-neg/readings"))
+                .andExpect(jsonPath("$", hasSize(0)));
+    }
+
     // ---------- 修订 ----------
 
     @Test
     void revise_keepsHistoryAndValidatesNeighbors() throws Exception {
-        register("eq-rev", 1000);
+        register("eq-rev", 60000);
         addReading("eq-rev", "rv1", 1, "r1", "2026-01-01T10:00:00Z", 100, 201);
         addReading("eq-rev", "rv2", 2, "r2", "2026-01-01T11:00:00Z", 200, 201);
 
-        // 修订只改累计分钟，不改采样时刻；修订号 +1
+        // 修订只改原始工时，不改采样时刻；修订号 +1；虚拟工时同步
         mockMvc.perform(post("/api/equipment/eq-rev/readings/r1/revisions")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"requestId":"rv3","expectedVersion":3,"cumulativeMinutes":150}
+                                {"requestId":"rv3","expectedVersion":3,"rawHours":150}
                                 """))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.sampledAt").value("2026-01-01T10:00:00Z"))
-                .andExpect(jsonPath("$.cumulativeMinutes").value(150))
+                .andExpect(jsonPath("$.rawHours").value(150))
+                .andExpect(jsonPath("$.virtualHours").value(150))
+                .andExpect(jsonPath("$.virtualMinutes").value(9000))
                 .andExpect(jsonPath("$.revisionNo").value(2))
                 .andExpect(jsonPath("$.equipmentVersion").value(4));
 
@@ -251,22 +282,22 @@ class EquipmentApiTests {
         mockMvc.perform(get("/api/equipment/eq-rev/readings/r1/revisions"))
                 .andExpect(jsonPath("$", hasSize(2)))
                 .andExpect(jsonPath("$[0].revisionNo").value(1))
-                .andExpect(jsonPath("$[0].cumulativeMinutes").value(100))
+                .andExpect(jsonPath("$[0].rawHours").value(100))
                 .andExpect(jsonPath("$[1].revisionNo").value(2))
-                .andExpect(jsonPath("$[1].cumulativeMinutes").value(150));
+                .andExpect(jsonPath("$[1].rawHours").value(150));
 
         // 修订须同时符合前后相邻值
         mockMvc.perform(post("/api/equipment/eq-rev/readings/r1/revisions")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"requestId":"rv4","expectedVersion":4,"cumulativeMinutes":250}
+                                {"requestId":"rv4","expectedVersion":4,"rawHours":250}
                                 """))
                 .andExpect(status().isUnprocessableEntity())
                 .andExpect(jsonPath("$.code").value("READING_ORDER_VIOLATION"));
         mockMvc.perform(post("/api/equipment/eq-rev/readings/r2/revisions")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"requestId":"rv5","expectedVersion":4,"cumulativeMinutes":50}
+                                {"requestId":"rv5","expectedVersion":4,"rawHours":50}
                                 """))
                 .andExpect(status().isUnprocessableEntity());
     }
@@ -275,7 +306,7 @@ class EquipmentApiTests {
 
     @Test
     void maintenance_anchorRules() throws Exception {
-        register("eq-mnt", 1000);
+        register("eq-mnt", 60000);
         addReading("eq-mnt", "a1", 1, "r1", "2026-01-01T10:00:00Z", 100, 201);
         addReading("eq-mnt", "a2", 2, "r2", "2026-01-01T11:00:00Z", 200, 201);
 
@@ -317,7 +348,7 @@ class EquipmentApiTests {
         mockMvc.perform(post("/api/equipment/eq-mnt/readings/r1/revisions")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"requestId":"mn-3","expectedVersion":4,"cumulativeMinutes":120}
+                                {"requestId":"mn-3","expectedVersion":4,"rawHours":120}
                                 """))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("READING_ANCHORED"));
@@ -326,7 +357,7 @@ class EquipmentApiTests {
         mockMvc.perform(post("/api/equipment/eq-mnt/readings/r2/revisions")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"requestId":"mn-4","expectedVersion":4,"cumulativeMinutes":210}
+                                {"requestId":"mn-4","expectedVersion":4,"rawHours":210}
                                 """))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.revisionNo").value(2));
@@ -336,31 +367,32 @@ class EquipmentApiTests {
                                 {"requestId":"mn-5","expectedVersion":5,"readingId":"r2","anchorRevisionNo":2}
                                 """))
                 .andExpect(status().isCreated())
-                .andExpect(jsonPath("$.anchorCumulativeMinutes").value(210));
+                .andExpect(jsonPath("$.anchorVirtualHours").value(210))
+                .andExpect(jsonPath("$.anchorCumulativeMinutes").value(12600));
 
         // 保养记录保存锚点快照且不允许删除（无删除接口），历史完整
         mockMvc.perform(get("/api/equipment/eq-mnt/maintenances"))
                 .andExpect(jsonPath("$", hasSize(2)))
-                .andExpect(jsonPath("$[0].anchorCumulativeMinutes").value(100))
-                .andExpect(jsonPath("$[1].anchorCumulativeMinutes").value(210));
+                .andExpect(jsonPath("$[0].anchorCumulativeMinutes").value(6000))
+                .andExpect(jsonPath("$[1].anchorCumulativeMinutes").value(12600));
     }
 
     // ---------- 幂等 ----------
 
     @Test
     void idempotency_replayMismatchAndFailureNotOccupying() throws Exception {
-        register("eq-idem", 1000);
+        register("eq-idem", 60000);
 
         MvcResult first = postJson("/api/equipment/eq-idem/readings", """
                 {"requestId":"idem-1","expectedVersion":1,"readingId":"r1",
-                 "sampledAt":"2026-01-01T10:00:00Z","cumulativeMinutes":100}
+                 "sampledAt":"2026-01-01T10:00:00Z","rawHours":100}
                 """);
         assert first.getResponse().getStatus() == 201;
 
         // 同键同参：重放原成功结果，业务效果不重复
         MvcResult replay = postJson("/api/equipment/eq-idem/readings", """
                 {"requestId":"idem-1","expectedVersion":1,"readingId":"r1",
-                 "sampledAt":"2026-01-01T10:00:00Z","cumulativeMinutes":100}
+                 "sampledAt":"2026-01-01T10:00:00Z","rawHours":100}
                 """);
         assert replay.getResponse().getStatus() == 201;
         assert replay.getResponse().getContentAsString()
@@ -375,7 +407,7 @@ class EquipmentApiTests {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {"requestId":"idem-1","expectedVersion":1,"readingId":"r1",
-                                 "sampledAt":"2026-01-01T10:00:00Z","cumulativeMinutes":101}
+                                 "sampledAt":"2026-01-01T10:00:00Z","rawHours":101}
                                 """))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("REQUEST_ID_CONFLICT"));
@@ -403,13 +435,15 @@ class EquipmentApiTests {
                 .andExpect(status().isNotFound());
         mockMvc.perform(get("/api/equipment/nope/maintenances"))
                 .andExpect(status().isNotFound());
+        mockMvc.perform(get("/api/equipment/nope/meters"))
+                .andExpect(status().isNotFound());
         addReading("nope", "nf-1", 1, "r1", "2026-01-01T10:00:00Z", 1, 404);
 
-        register("eq-nf", 100);
+        register("eq-nf", 6000);
         mockMvc.perform(post("/api/equipment/eq-nf/readings/nope/revisions")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"requestId":"nf-2","expectedVersion":1,"cumulativeMinutes":10}
+                                {"requestId":"nf-2","expectedVersion":1,"rawHours":10}
                                 """))
                 .andExpect(status().isNotFound());
         mockMvc.perform(get("/api/equipment/eq-nf/readings/nope/revisions"))

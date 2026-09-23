@@ -46,9 +46,11 @@ class EquipmentConcurrencyTests {
     @BeforeEach
     void setUp() {
         jdbc.update("DELETE FROM idempotency_request");
+        jdbc.update("DELETE FROM meter_chain_recompute");
         jdbc.update("DELETE FROM maintenance");
         jdbc.update("DELETE FROM reading_revision");
         jdbc.update("DELETE FROM reading");
+        jdbc.update("DELETE FROM meter");
         jdbc.update("DELETE FROM equipment");
         executor = Executors.newFixedThreadPool(8);
     }
@@ -75,12 +77,12 @@ class EquipmentConcurrencyTests {
     /** 并发同 requestId 同参数：全部得到原成功结果，业务效果只发生一次。 */
     @Test
     void concurrentSameRequestId_replaysSingleEffect() throws Exception {
-        register("eq-cid", 1000);
+        register("eq-cid", 60000);
         int threads = 8;
         CountDownLatch gate = new CountDownLatch(1);
         String body = """
                 {"requestId":"cid-1","expectedVersion":1,"readingId":"r1",
-                 "sampledAt":"2026-01-01T10:00:00Z","cumulativeMinutes":100}
+                 "sampledAt":"2026-01-01T10:00:00Z","rawHours":100}
                 """;
         List<Future<MvcResult>> futures = new ArrayList<>();
         for (int i = 0; i < threads; i++) {
@@ -114,21 +116,21 @@ class EquipmentConcurrencyTests {
     /** 并发修订与完成保养（同一期望版本）：恰有一个成功，已完成保养的锚点不发生变化。 */
     @Test
     void concurrentReviseVsMaintenance_anchorStable() throws Exception {
-        register("eq-race", 1000);
+        register("eq-race", 60000);
         postJson("/api/equipment/eq-race/readings", """
                 {"requestId":"race-r1","expectedVersion":1,"readingId":"r1",
-                 "sampledAt":"2026-01-01T10:00:00Z","cumulativeMinutes":100}
+                 "sampledAt":"2026-01-01T10:00:00Z","rawHours":100}
                 """);
         postJson("/api/equipment/eq-race/readings", """
                 {"requestId":"race-r2","expectedVersion":2,"readingId":"r2",
-                 "sampledAt":"2026-01-01T11:00:00Z","cumulativeMinutes":200}
+                 "sampledAt":"2026-01-01T11:00:00Z","rawHours":200}
                 """);
 
         CountDownLatch gate = new CountDownLatch(1);
         Future<MvcResult> reviseFuture = executor.submit(() -> {
             gate.await(5, TimeUnit.SECONDS);
             return postJson("/api/equipment/eq-race/readings/r1/revisions", """
-                    {"requestId":"race-revise","expectedVersion":3,"cumulativeMinutes":150}
+                    {"requestId":"race-revise","expectedVersion":3,"rawHours":150}
                     """);
         });
         Future<MvcResult> maintenanceFuture = executor.submit(() -> {
@@ -156,34 +158,35 @@ class EquipmentConcurrencyTests {
                 .andExpect(jsonPath("$.version").value(4));
 
         if (maintenanceStatus == 201) {
-            // 保养胜出：锚点快照为修订号 1、工时 100，且之后不可再修订该读数
+            // 保养胜出：锚点快照为修订号 1、工时 100h，且之后不可再修订该读数
             mockMvc.perform(get("/api/equipment/eq-race/maintenances"))
                     .andExpect(jsonPath("$.length()").value(1))
                     .andExpect(jsonPath("$[0].anchorRevisionNo").value(1))
-                    .andExpect(jsonPath("$[0].anchorCumulativeMinutes").value(100));
+                    .andExpect(jsonPath("$[0].anchorVirtualHours").value(100));
             mockMvc.perform(get("/api/equipment/eq-race/readings/r1/revisions"))
                     .andExpect(jsonPath("$.length()").value(1));
-            Integer revisionNo = jdbc.queryForObject(
-                    "SELECT revision_no FROM reading WHERE equipment_id = 'eq-race' AND reading_id = 'r1'",
-                    Integer.class);
-            assertEquals(1, revisionNo, "保养锚定后读数修订号不得变化");
+            java.math.BigDecimal raw = jdbc.queryForObject(
+                    "SELECT raw_hours FROM reading WHERE equipment_id = 'eq-race' AND reading_id = 'r1'",
+                    java.math.BigDecimal.class);
+            assertEquals(0, raw.compareTo(new java.math.BigDecimal("100.000000")),
+                    "保养锚定后读数原始工时不得变化");
         } else {
-            // 修订胜出：无保养记录，读数修订号为 2、工时 150
+            // 修订胜出：无保养记录，读数修订号为 2、工时 150h
             mockMvc.perform(get("/api/equipment/eq-race/maintenances"))
                     .andExpect(jsonPath("$.length()").value(0));
             mockMvc.perform(get("/api/equipment/eq-race/readings/r1/revisions"))
                     .andExpect(jsonPath("$.length()").value(2));
-            Integer cumulative = jdbc.queryForObject(
-                    "SELECT cumulative_minutes FROM reading WHERE equipment_id = 'eq-race' AND reading_id = 'r1'",
-                    Integer.class);
-            assertEquals(150, cumulative);
+            java.math.BigDecimal raw = jdbc.queryForObject(
+                    "SELECT raw_hours FROM reading WHERE equipment_id = 'eq-race' AND reading_id = 'r1'",
+                    java.math.BigDecimal.class);
+            assertEquals(0, raw.compareTo(new java.math.BigDecimal("150.000000")));
         }
     }
 
     /** 并发不同 requestId 新增不同读数：串行化后均按版本推进，无丢失更新。 */
     @Test
     void concurrentDistinctWrites_noLostUpdate() throws Exception {
-        register("eq-par", 10000);
+        register("eq-par", 600000);
         int threads = 6;
         CountDownLatch gate = new CountDownLatch(1);
         List<Future<MvcResult>> futures = new ArrayList<>();
@@ -199,7 +202,7 @@ class EquipmentConcurrencyTests {
                     long version = Long.parseLong(body.replaceAll(".*\"version\":(\\d+).*", "$1"));
                     MvcResult write = postJson("/api/equipment/eq-par/readings", """
                             {"requestId":"par-%d","expectedVersion":%d,"readingId":"r-%d",
-                             "sampledAt":"2026-01-01T1%d:00:00Z","cumulativeMinutes":%d}
+                             "sampledAt":"2026-01-01T1%d:00:00Z","rawHours":%d}
                             """.formatted(index, version, index, index, 100L * (index + 1)));
                     if (write.getResponse().getStatus() == 201) {
                         return write;
