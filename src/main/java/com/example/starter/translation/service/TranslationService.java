@@ -139,6 +139,26 @@ public class TranslationService {
     }
 
     /**
+     * 撤批：删除段落语言的当前批准；段落或语言无译文记录返回 404，本来就无批准返回 422。
+     * 撤批后历史发布快照不受影响，但下一次发布/列车激活会因缺少批准而失败。
+     */
+    @Transactional
+    public ApiDtos.ApprovalResponse unapprove(long documentId, String segmentId, String language) {
+        lockDocument(documentId);
+        String normalizedLanguage = normalizeLanguage(language);
+        findSegmentOrThrow(documentId, segmentId);
+        TranslationRow translation = repository.findTranslation(documentId, segmentId, normalizedLanguage)
+                .orElseThrow(() -> ApiException.notFound(
+                        "译文不存在: " + segmentId + "/" + normalizedLanguage));
+        int deleted = repository.deleteApproval(documentId, segmentId, normalizedLanguage);
+        if (deleted == 0) {
+            throw ApiException.unprocessable("该段落语言当前没有批准: " + segmentId + "/" + normalizedLanguage);
+        }
+        return new ApiDtos.ApprovalResponse(documentId, segmentId, normalizedLanguage, null,
+                translation.translationVersion(), translation.sourceVersion());
+    }
+
+    /**
      * 新增术语版本：expectedTermVersion 必须等于当前术语版本（不符 409）；
      * 规则 0~100 条、按 sourceTerm 与目标语言唯一、语言须在文档目标语言中（不符 422）。
      * 成功后术语版本加一（已有版本不可覆盖），草稿版本加一；术语快照与草稿版本同一事务提交。

@@ -1,6 +1,7 @@
 package com.example.starter.translation.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 
@@ -9,7 +10,7 @@ import org.springframework.http.ResponseEntity;
  */
 public record WriteResult(int status, String body) {
 
-    private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final ObjectMapper MAPPER = new ObjectMapper().registerModule(new JavaTimeModule());
 
     /** 以给定状态码序列化响应体。 */
     public static WriteResult of(int status, Object body) {

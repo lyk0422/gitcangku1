@@ -1,5 +1,6 @@
 package com.example.starter.translation.domain;
 
+import java.time.Instant;
 import java.util.List;
 
 /**
@@ -81,5 +82,39 @@ public final class Rows {
      */
     public record RequestLogRow(String requestId, String requestHash,
                                 int responseStatus, String responseBody) {
+    }
+
+    /**
+     * 发布列车行：trainKey 唯一；READY 后冻结候选、源文摘要、术语版本与预检结果。
+     *
+     * @param trainKey              发布列车唯一键
+     * @param documentId            所属文档 ID
+     * @param sourceDocumentVersion 列车针对的源文档草稿版本
+     * @param scheduledAt           计划发布时间（UTC）
+     * @param status                状态：DRAFT/READY/CANCELLED/PUBLISHED
+     * @param candidatesJson        规范化（locale 排序）候选声明 JSON
+     * @param frozenJson            READY 冻结内容 JSON；DRAFT 时为 null
+     * @param releaseTrainVersion   成功发布后的统一版本号；未发布时为 null
+     * @param createdAt             创建时间（UTC）
+     * @param readyAt               冻结时间；未冻结时为 null
+     * @param publishedAt           发布时间；未发布时为 null
+     * @param cancelledAt           取消时间；未取消时为 null
+     */
+    public record ReleaseTrainRow(String trainKey, long documentId, int sourceDocumentVersion,
+                                  Instant scheduledAt, String status, String candidatesJson,
+                                  String frozenJson, Integer releaseTrainVersion,
+                                  String createdRequestId,
+                                  Instant createdAt, Instant readyAt, Instant publishedAt,
+                                  Instant cancelledAt) {
+    }
+
+    /**
+     * 发布指针行：文档内每个 locale 当前指向的发布列车版本。
+     *
+     * @param documentId          所属文档 ID
+     * @param locale              目标语言码，小写
+     * @param releaseTrainVersion 当前发布指针版本号
+     */
+    public record ReleasePointerRow(long documentId, String locale, int releaseTrainVersion) {
     }
 }

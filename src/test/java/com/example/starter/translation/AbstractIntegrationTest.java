@@ -39,6 +39,9 @@ public abstract class AbstractIntegrationTest {
         jdbc.update("DELETE FROM translation");
         jdbc.update("DELETE FROM segment");
         jdbc.update("DELETE FROM release_snapshot");
+        jdbc.update("DELETE FROM train_snapshot");
+        jdbc.update("DELETE FROM release_pointer");
+        jdbc.update("DELETE FROM release_train");
         jdbc.update("DELETE FROM term_rule");
         jdbc.update("DELETE FROM term_version");
         jdbc.update("DELETE FROM request_log");
@@ -68,6 +71,12 @@ public abstract class AbstractIntegrationTest {
 
     protected ApiResult getJson(String url) throws Exception {
         MvcResult result = mockMvc.perform(MockMvcRequestBuilders.get(url)).andReturn();
+        return toApiResult(result);
+    }
+
+    protected ApiResult deleteJson(String url, String body) throws Exception {
+        MvcResult result = mockMvc.perform(MockMvcRequestBuilders.delete(url)
+                .contentType("application/json").content(body)).andReturn();
         return toApiResult(result);
     }
 
@@ -128,6 +137,53 @@ public abstract class AbstractIntegrationTest {
         String body = "{\"requestId\":\"" + requestId + "\",\"expectedTermVersion\":" + expectedTermVersion
                 + ",\"rules\":" + rulesJson + "}";
         return putJson("/api/documents/" + documentId + "/terms", body);
+    }
+
+    /** 创建发布列车；candidatesJson 为候选数组 JSON，scheduledAt 用 ISO-8601 UTC 字符串。 */
+    protected ApiResult createTrain(long documentId, String trainKey, int sourceDocumentVersion,
+                                    String scheduledAt, String candidatesJson, String requestId)
+            throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"trainKey\":\"" + trainKey + "\","
+                + "\"sourceDocumentVersion\":" + sourceDocumentVersion + ",\"scheduledAt\":\"" + scheduledAt
+                + "\",\"candidates\":" + candidatesJson + "}";
+        return postJson("/api/documents/" + documentId + "/release-trains", body);
+    }
+
+    protected ApiResult trainPrecheck(String trainKey) throws Exception {
+        return getJson("/api/release-trains/" + trainKey + "/precheck");
+    }
+
+    protected ApiResult trainReady(String trainKey, String requestId) throws Exception {
+        return postJson("/api/release-trains/" + trainKey + "/ready",
+                "{\"requestId\":\"" + requestId + "\"}");
+    }
+
+    protected ApiResult trainCancel(String trainKey, String requestId) throws Exception {
+        return postJson("/api/release-trains/" + trainKey + "/cancel",
+                "{\"requestId\":\"" + requestId + "\"}");
+    }
+
+    protected ApiResult trainActivate(String trainKey, String requestId) throws Exception {
+        return postJson("/api/release-trains/" + trainKey + "/activate",
+                "{\"requestId\":\"" + requestId + "\"}");
+    }
+
+    protected ApiResult getTrain(String trainKey) throws Exception {
+        return getJson("/api/release-trains/" + trainKey);
+    }
+
+    protected ApiResult listTrainSnapshots(String trainKey) throws Exception {
+        return getJson("/api/release-trains/" + trainKey + "/snapshots");
+    }
+
+    protected ApiResult listReleasePointers(long documentId) throws Exception {
+        return getJson("/api/documents/" + documentId + "/release-pointers");
+    }
+
+    protected ApiResult unapprove(long documentId, String segmentId, String language, String requestId)
+            throws Exception {
+        return deleteJson("/api/documents/" + documentId + "/segments/" + segmentId
+                + "/translations/" + language + "/approval", "{\"requestId\":\"" + requestId + "\"}");
     }
 
     /** HTTP 响应结果：状态码与 JSON 响应体。 */

@@ -188,6 +188,12 @@ public class TranslationRepository {
         }
     }
 
+    /** 撤批：删除段落语言的批准行；返回是否删除了既有批准。 */
+    public int deleteApproval(long documentId, String segmentId, String language) {
+        return jdbc.update("DELETE FROM approval WHERE document_id = ? AND segment_id = ? AND language = ?",
+                documentId, segmentId, language);
+    }
+
     public void insertSnapshot(long documentId, int publishedVersion, String snapshotJson) {
         jdbc.update("INSERT INTO release_snapshot (document_id, published_version, snapshot_json) VALUES (?, ?, ?)",
                 documentId, publishedVersion, snapshotJson);
