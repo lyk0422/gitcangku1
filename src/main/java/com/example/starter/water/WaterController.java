@@ -7,6 +7,9 @@ import com.example.starter.water.dto.Dtos.CreateWindowRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.SettlementHistoryResponse;
+import com.example.starter.water.dto.Dtos.SettlementRequest;
+import com.example.starter.water.dto.Dtos.SettlementResponse;
 import com.example.starter.water.dto.Dtos.SubmitAllocationRequest;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferRequest;
@@ -102,5 +105,24 @@ public class WaterController {
     @GetMapping("/windows/{windowId}/history")
     public HistoryResponse getHistory(@PathVariable long windowId) {
         return service.getHistory(windowId);
+    }
+
+    /** 提交同窗口批量净额清算批次（1～100 条有向指令，携带全部涉及主体的当前额度版本）。 */
+    @PostMapping("/settlements")
+    public SettlementResponse settle(@RequestBody SettlementRequest request) {
+        return service.settleBatch(request.requestId(), request.settlementKey(), request.windowId(),
+                request.instructions(), request.versions());
+    }
+
+    /** 查询清算批次详情（不可变快照，只读）。 */
+    @GetMapping("/settlements/{settlementKey}")
+    public SettlementResponse getSettlement(@PathVariable String settlementKey) {
+        return service.getSettlement(settlementKey);
+    }
+
+    /** 按主体查询其参与过的全部清算批次（只读，按提交顺序）。 */
+    @GetMapping("/allocations/{allocationKey}/settlements")
+    public SettlementHistoryResponse getSettlementHistory(@PathVariable String allocationKey) {
+        return service.getSettlementHistory(allocationKey);
     }
 }

@@ -3,12 +3,21 @@ package com.example.starter.water;
 import com.example.starter.water.WaterRepository.AllocationRow;
 import com.example.starter.water.WaterRepository.CommandRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
+import com.example.starter.water.WaterRepository.SettlementInstructionRow;
+import com.example.starter.water.WaterRepository.SettlementLegRow;
+import com.example.starter.water.WaterRepository.SettlementRow;
 import com.example.starter.water.WaterRepository.TransferRow;
 import com.example.starter.water.WaterRepository.WindowRow;
 import com.example.starter.water.dto.Dtos.AllocationResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.SettlementHistoryResponse;
+import com.example.starter.water.dto.Dtos.SettlementInstructionRequest;
+import com.example.starter.water.dto.Dtos.SettlementInstructionResponse;
+import com.example.starter.water.dto.Dtos.SettlementLegResponse;
+import com.example.starter.water.dto.Dtos.SettlementResponse;
+import com.example.starter.water.dto.Dtos.SettlementVersionEntry;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferResponse;
 import com.example.starter.water.dto.Dtos.WindowResponse;
@@ -21,7 +30,13 @@ import org.springframework.transaction.support.TransactionTemplate;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
@@ -316,6 +331,255 @@ public class WaterService {
     }
 
     // ------------------------------------------------------------------
+    // 批量净额清算
+    // ------------------------------------------------------------------
+
+    private static final int MAX_SETTLEMENT_INSTRUCTIONS = 100;
+    private static final Pattern INTEGER_VOLUME_PATTERN = Pattern.compile("\\d{1,16}");
+
+    /**
+     * 同窗口批量净额清算：在单事务的一致读视图中校验全部指令与主体版本，按主体计算净额，
+     * 一次更新所有非零净额主体；所有涉及主体（含净额为 0 的环主体）版本均加一；
+     * 保存输入顺序指令、净额及前后余额的不可变快照。任一校验失败整批回滚，无任何记录。
+     */
+    public SettlementResponse settleBatch(String requestId, String settlementKey, Long windowId,
+                                          List<SettlementInstructionRequest> instructions,
+                                          List<SettlementVersionEntry> versions) {
+        requireKey("requestId", requestId);
+        requireKey("settlementKey", settlementKey);
+        if (windowId == null) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "windowId 不能为空");
+        }
+        List<SettlementInstructionRequest> input = instructions == null ? List.of() : instructions;
+        if (input.isEmpty() || input.size() > MAX_SETTLEMENT_INSTRUCTIONS) {
+            throw ApiException.badRequest("INVALID_ARGUMENT",
+                    "instructions 数量必须在 1～" + MAX_SETTLEMENT_INSTRUCTIONS + " 条之间");
+        }
+        // 规范化：指令按输入顺序；版本集合按键排序，均纳入幂等参数串
+        List<BigDecimal> volumes = new ArrayList<>(input.size());
+        Set<String> subjectKeys = new LinkedHashSet<>();
+        Set<String> instructionKeySet = new LinkedHashSet<>();
+        StringBuilder params = new StringBuilder("SETTLEMENT|").append(settlementKey).append('|')
+                .append(windowId).append('|').append(input.size()).append('|');
+        for (int i = 0; i < input.size(); i++) {
+            SettlementInstructionRequest ins = input.get(i);
+            if (ins == null) {
+                throw ApiException.badRequest("INVALID_ARGUMENT", "第 " + i + " 条指令为空");
+            }
+            requireKey("instructionKey", ins.instructionKey());
+            requireKey("from", ins.from());
+            requireKey("to", ins.to());
+            BigDecimal volume = parseIntegerVolume(ins.volume());
+            if (ins.from().equals(ins.to())) {
+                throw ApiException.conflict("SETTLEMENT_SELF_TRANSFER",
+                        "第 " + i + " 条指令禁止自转: " + ins.from());
+            }
+            if (!instructionKeySet.add(ins.instructionKey())) {
+                throw ApiException.conflict("SETTLEMENT_DUPLICATE_INSTRUCTION_KEY",
+                        "批次内 instructionKey 重复: " + ins.instructionKey());
+            }
+            volumes.add(volume);
+            subjectKeys.add(ins.from());
+            subjectKeys.add(ins.to());
+            params.append(i).append(':').append(ins.instructionKey()).append(',')
+                    .append(ins.from()).append('>').append(ins.to()).append('=').append(volume.toPlainString())
+                    .append(';');
+        }
+        params.append('|');
+        Map<String, Long> versionMap = new TreeMap<>();
+        if (versions != null) {
+            for (SettlementVersionEntry entry : versions) {
+                if (entry == null) {
+                    throw ApiException.badRequest("INVALID_ARGUMENT", "versions 中存在空项");
+                }
+                requireKey("allocationKey", entry.allocationKey());
+                if (entry.version() < 1) {
+                    throw ApiException.badRequest("INVALID_ARGUMENT",
+                            "version 必须为正整数: " + entry.allocationKey());
+                }
+                if (versionMap.put(entry.allocationKey(), entry.version()) != null) {
+                    throw ApiException.conflict("SETTLEMENT_DUPLICATE_VERSION",
+                            "versions 中主体重复: " + entry.allocationKey());
+                }
+            }
+        }
+        for (Map.Entry<String, Long> entry : versionMap.entrySet()) {
+            params.append(entry.getKey()).append('=').append(entry.getValue()).append(',');
+        }
+        // 版本集合必须与指令涉及主体集合完全一致：遗漏或多余均拒绝
+        if (!versionMap.keySet().equals(subjectKeys)) {
+            Set<String> missing = new LinkedHashSet<>(subjectKeys);
+            missing.removeAll(versionMap.keySet());
+            Set<String> extra = new LinkedHashSet<>(versionMap.keySet());
+            extra.removeAll(subjectKeys);
+            throw ApiException.conflict("SETTLEMENT_VERSION_MISMATCH",
+                    "主体版本集合必须恰好覆盖全部涉及主体；遗漏: " + missing + "，多余: " + extra);
+        }
+
+        String canonicalParams = params.toString();
+        return runCommand("SETTLEMENT", requestId, canonicalParams, SettlementResponse.class, () -> {
+            // 先锁窗口行，与单笔转让、批准、限供、其他清算按事务提交顺序串行裁决
+            WindowRow window = repository.lockWindowById(windowId);
+            if (window == null) {
+                throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + windowId);
+            }
+            // settlementKey 全局唯一（换 requestId 复用也拒绝）
+            if (repository.findSettlementByKey(settlementKey) != null) {
+                throw ApiException.conflict("SETTLEMENT_KEY_REUSED",
+                        "settlementKey 已被其他批次使用: " + settlementKey);
+            }
+            // 指令键全局唯一：已被其他成功批次使用则整批拒绝（失败批次不占键，不会落库）
+            int usedKeys = repository.countUsedInstructionKeys(instructionKeySet);
+            if (usedKeys > 0) {
+                throw ApiException.conflict("SETTLEMENT_INSTRUCTION_KEY_REUSED",
+                        "存在 " + usedKeys + " 个 instructionKey 已被其他批次使用");
+            }
+            // 一致读视图：按主键顺序锁定全部涉及主体
+            List<AllocationRow> locked = repository.lockAllocationsByKeys(subjectKeys);
+            Map<String, AllocationRow> rows = new LinkedHashMap<>();
+            for (AllocationRow row : locked) {
+                rows.put(row.allocationKey(), row);
+            }
+            for (String key : subjectKeys) {
+                AllocationRow row = rows.get(key);
+                if (row == null) {
+                    throw ApiException.notFound("ALLOCATION_NOT_FOUND", "清算主体不存在: " + key);
+                }
+                if (row.windowId() != windowId) {
+                    throw ApiException.conflict("SETTLEMENT_CROSS_WINDOW",
+                            "清算主体不属于窗口 " + windowId + ": " + key);
+                }
+                // 涉及主体必须为 APPROVED：CANCELLED 即主体限供；REQUESTED 无可用额度，
+                // 若接水会使其在 REQUESTED 状态持有额度，破坏已批准总额的严格守恒
+                if (!STATUS_APPROVED.equals(row.status())) {
+                    throw ApiException.conflict("SETTLEMENT_SUBJECT_NOT_AVAILABLE",
+                            "主体必须为 APPROVED 才能参与清算，当前 " + row.status() + ": " + key);
+                }
+                if (versionMap.get(key) != row.quotaVersion()) {
+                    throw ApiException.conflict("SETTLEMENT_VERSION_CONFLICT",
+                            "主体 " + key + " 额度版本已变化：提交 " + versionMap.get(key)
+                                    + "，当前 " + row.quotaVersion());
+                }
+            }
+            // 按主体计算净额：from 减、to 加
+            Map<String, BigDecimal> net = new LinkedHashMap<>();
+            for (String key : subjectKeys) {
+                net.put(key, BigDecimal.ZERO);
+            }
+            BigDecimal totalVolume = BigDecimal.ZERO;
+            for (int i = 0; i < input.size(); i++) {
+                SettlementInstructionRequest ins = input.get(i);
+                BigDecimal volume = volumes.get(i);
+                totalVolume = totalVolume.add(volume);
+                net.put(ins.from(), net.get(ins.from()).subtract(volume));
+                net.put(ins.to(), net.get(ins.to()).add(volume));
+            }
+            // 一致视图内计算清算后可用额度：任一转出方清算后为负即整批 422
+            for (Map.Entry<String, BigDecimal> entry : net.entrySet()) {
+                AllocationRow row = rows.get(entry.getKey());
+                BigDecimal after = row.heldAmount().add(entry.getValue());
+                if (after.signum() < 0) {
+                    throw ApiException.quotaExceeded("主体 " + entry.getKey() + " 清算后可用额度为负：当前 "
+                            + fmt(row.heldAmount()) + "，净变化 " + fmt(entry.getValue()));
+                }
+            }
+            long now = nowNanos();
+            long settlementId;
+            try {
+                settlementId = repository.insertSettlement(settlementKey, windowId, input.size(),
+                        totalVolume, now);
+            } catch (DuplicateKeyException e) {
+                // 并发复用同一 settlementKey（换 requestId）：整批回滚
+                throw ApiException.conflict("SETTLEMENT_KEY_REUSED",
+                        "settlementKey 已被其他批次使用: " + settlementKey);
+            }
+            // 保存输入顺序的原始指令快照
+            try {
+                for (int i = 0; i < input.size(); i++) {
+                    SettlementInstructionRequest ins = input.get(i);
+                    repository.insertSettlementInstruction(settlementId, i, ins.instructionKey(),
+                            ins.from(), ins.to(), volumes.get(i));
+                }
+            } catch (DuplicateKeyException e) {
+                // 并发批次抢先使用同一 instructionKey：整批回滚，失败不占键
+                throw ApiException.conflict("SETTLEMENT_INSTRUCTION_KEY_REUSED",
+                        "存在 instructionKey 已被其他批次使用");
+            }
+            // 一次更新所有非零净额主体；净额为 0 的主体仅版本加一；逐主体保存前后快照
+            for (String key : subjectKeys) {
+                AllocationRow row = rows.get(key);
+                BigDecimal change = net.get(key);
+                BigDecimal afterHeld = row.heldAmount().add(change);
+                if (change.signum() != 0) {
+                    int updated = repository.applySettlementNet(key, change, now);
+                    if (updated != 1) {
+                        // 防御性：锁内透支不应发生，发生则整批回滚
+                        throw ApiException.quotaExceeded("主体 " + key + " 清算更新失败（额度不足）");
+                    }
+                } else {
+                    repository.bumpAllocationVersion(key, now);
+                }
+                repository.insertSettlementLeg(settlementId, key, change, row.heldAmount(), afterHeld,
+                        row.quotaVersion(), row.quotaVersion() + 1);
+            }
+            return toSettlementResponse(repository.findSettlementByKey(settlementKey));
+        });
+    }
+
+    /** 查询清算批次详情（只读，不可变快照）。 */
+    public SettlementResponse getSettlement(String settlementKey) {
+        requireKey("settlementKey", settlementKey);
+        SettlementRow row = repository.findSettlementByKey(settlementKey);
+        if (row == null) {
+            throw ApiException.notFound("SETTLEMENT_NOT_FOUND", "清算批次不存在: " + settlementKey);
+        }
+        return toSettlementResponse(row);
+    }
+
+    /** 按主体查询其参与过的全部清算批次（只读，按提交顺序）。主体不存在返回 404。 */
+    public SettlementHistoryResponse getSettlementHistory(String allocationKey) {
+        requireKey("allocationKey", allocationKey);
+        if (repository.findAllocationByKey(allocationKey) == null) {
+            throw ApiException.notFound("ALLOCATION_NOT_FOUND", "配水申请不存在: " + allocationKey);
+        }
+        List<SettlementResponse> settlements = repository.listSettlementsByAllocationKey(allocationKey)
+                .stream().map(this::toSettlementResponse).toList();
+        return new SettlementHistoryResponse(allocationKey, settlements);
+    }
+
+    /** 解析正整数体积（无小数位）。 */
+    static BigDecimal parseIntegerVolume(String value) {
+        if (value == null || value.isBlank() || !INTEGER_VOLUME_PATTERN.matcher(value.trim()).matches()) {
+            throw ApiException.badRequest("INVALID_ARGUMENT",
+                    "volume 必须为正整数体积字符串: " + value);
+        }
+        BigDecimal volume = new BigDecimal(value.trim());
+        if (volume.signum() <= 0) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "volume 必须大于 0");
+        }
+        return volume;
+    }
+
+    private SettlementResponse toSettlementResponse(SettlementRow row) {
+        List<SettlementInstructionResponse> instructions =
+                repository.listSettlementInstructions(row.id()).stream().map(this::toInstructionResponse).toList();
+        List<SettlementLegResponse> legs = repository.listSettlementLegs(row.id()).stream()
+                .map(this::toLegResponse).toList();
+        return new SettlementResponse(row.settlementKey(), row.windowId(), row.instructionCount(),
+                fmt(row.totalVolume()), instructions, legs, toIso(row.createdNanos()));
+    }
+
+    private SettlementInstructionResponse toInstructionResponse(SettlementInstructionRow row) {
+        return new SettlementInstructionResponse(row.instructionIndex(), row.instructionKey(),
+                row.fromAllocationKey(), row.toAllocationKey(), fmt(row.volume()));
+    }
+
+    private SettlementLegResponse toLegResponse(SettlementLegRow row) {
+        return new SettlementLegResponse(row.allocationKey(), fmt(row.netChange()), fmt(row.beforeHeld()),
+                fmt(row.afterHeld()), row.beforeVersion(), row.afterVersion());
+    }
+
+    // ------------------------------------------------------------------
     // 幂等命令框架
     // ------------------------------------------------------------------
 
@@ -378,7 +642,7 @@ public class WaterService {
 
     private AllocationResponse toAllocationResponse(AllocationRow row) {
         return new AllocationResponse(row.allocationKey(), row.windowId(), row.userId(), fmt(row.amount()),
-                fmt(row.heldAmount()), row.requester(), row.status(),
+                fmt(row.heldAmount()), row.quotaVersion(), row.requester(), row.status(),
                 toIso(row.createdNanos()), toIso(row.updatedNanos()));
     }
 

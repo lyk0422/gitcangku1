@@ -25,9 +25,9 @@ public class WaterRepository {
                             BigDecimal plannedVolume, long createdNanos) {
     }
 
-    /** 配水申请行；amount 为不可改写的原申请水量，heldAmount 为当前持有额度。 */
+    /** 配水申请行；amount 为不可改写的原申请水量，heldAmount 为当前持有额度，quotaVersion 为额度版本。 */
     public record AllocationRow(long id, String allocationKey, long windowId, String userId, BigDecimal amount,
-                                BigDecimal heldAmount, String requester, String status,
+                                BigDecimal heldAmount, long quotaVersion, String requester, String status,
                                 long createdNanos, long updatedNanos) {
     }
 
@@ -39,6 +39,23 @@ public class WaterRepository {
     /** 限供行。 */
     public record CurtailmentRow(long id, long windowId, BigDecimal volume, String status, long createdNanos,
                                  Long cancelledNanos) {
+    }
+
+    /** 清算批次头行，提交成功后不可变。 */
+    public record SettlementRow(long id, String settlementKey, long windowId, int instructionCount,
+                                BigDecimal totalVolume, long createdNanos) {
+    }
+
+    /** 清算指令快照行。 */
+    public record SettlementInstructionRow(long id, long settlementId, int instructionIndex,
+                                           String instructionKey, String fromAllocationKey,
+                                           String toAllocationKey, BigDecimal volume) {
+    }
+
+    /** 清算主体净额快照行；净额为 0 也记录。 */
+    public record SettlementLegRow(long id, long settlementId, String allocationKey, BigDecimal netChange,
+                                   BigDecimal beforeHeld, BigDecimal afterHeld, long beforeVersion,
+                                   long afterVersion) {
     }
 
     /** 幂等命令行；response 为 null 表示响应尚未写回（同事务内）。 */
@@ -54,11 +71,11 @@ public class WaterRepository {
     private static final RowMapper<AllocationRow> ALLOCATION_MAPPER = (rs, n) -> new AllocationRow(
             rs.getLong("id"), rs.getString("allocation_key"), rs.getLong("window_id"),
             rs.getString("user_id"), rs.getBigDecimal("amount"), rs.getBigDecimal("held_amount"),
-            rs.getString("requester"), rs.getString("status"),
+            rs.getLong("quota_version"), rs.getString("requester"), rs.getString("status"),
             rs.getLong("created_nanos"), rs.getLong("updated_nanos"));
 
     private static final String ALLOCATION_SELECT =
-            "SELECT id, allocation_key, window_id, user_id, amount, held_amount, requester, status,"
+            "SELECT id, allocation_key, window_id, user_id, amount, held_amount, quota_version, requester, status,"
                     + " created_nanos, updated_nanos";
 
     private static final RowMapper<TransferRow> TRANSFER_MAPPER = (rs, n) -> new TransferRow(
@@ -74,6 +91,21 @@ public class WaterRepository {
     private static final RowMapper<CommandRow> COMMAND_MAPPER = (rs, n) -> new CommandRow(
             rs.getString("command_key"), rs.getString("operation"), rs.getString("params"),
             rs.getString("response"), rs.getLong("created_nanos"));
+
+    private static final RowMapper<SettlementRow> SETTLEMENT_MAPPER = (rs, n) -> new SettlementRow(
+            rs.getLong("id"), rs.getString("settlement_key"), rs.getLong("window_id"),
+            rs.getInt("instruction_count"), rs.getBigDecimal("total_volume"), rs.getLong("created_nanos"));
+
+    private static final RowMapper<SettlementInstructionRow> SETTLEMENT_INSTRUCTION_MAPPER = (rs, n) ->
+            new SettlementInstructionRow(rs.getLong("id"), rs.getLong("settlement_id"),
+                    rs.getInt("instruction_index"), rs.getString("instruction_key"),
+                    rs.getString("from_allocation_key"), rs.getString("to_allocation_key"),
+                    rs.getBigDecimal("volume"));
+
+    private static final RowMapper<SettlementLegRow> SETTLEMENT_LEG_MAPPER = (rs, n) -> new SettlementLegRow(
+            rs.getLong("id"), rs.getLong("settlement_id"), rs.getString("allocation_key"),
+            rs.getBigDecimal("net_change"), rs.getBigDecimal("before_held"), rs.getBigDecimal("after_held"),
+            rs.getLong("before_version"), rs.getLong("after_version"));
 
     private final JdbcTemplate jdbc;
 
@@ -173,19 +205,51 @@ public class WaterRepository {
 
     /**
      * 更新申请状态与变更时间，并同步持有额度：批准时持有额度等于原申请水量，取消时归零，
-     * REQUESTED 保持当前持有额度不变。
+     * REQUESTED 保持当前持有额度不变。任何实际状态变更都使额度版本加一。
      */
     public void updateAllocationStatus(long id, String status, long updatedNanos) {
         jdbc.update("UPDATE allocation SET status = ?, updated_nanos = ?,"
                 + " held_amount = CASE WHEN ? = 'APPROVED' THEN amount WHEN ? = 'CANCELLED' THEN 0"
-                + " ELSE held_amount END WHERE id = ?",
-                status, updatedNanos, status, status, id);
+                + " ELSE held_amount END,"
+                + " quota_version = CASE WHEN ? = 'REQUESTED' THEN quota_version ELSE quota_version + 1 END"
+                + " WHERE id = ?",
+                status, updatedNanos, status, status, status, id);
     }
 
-    /** 转让扣减源持有额度（不得为负由事务内校验保证）并记录变更时间。 */
+    /** 转让扣减源持有额度（不得为负由事务内校验保证），记录变更时间并使额度版本加一。 */
     public void decrementHeldAmount(long id, BigDecimal delta, long updatedNanos) {
-        jdbc.update("UPDATE allocation SET held_amount = held_amount - ?, updated_nanos = ? WHERE id = ?",
+        jdbc.update("UPDATE allocation SET held_amount = held_amount - ?, updated_nanos = ?,"
+                + " quota_version = quota_version + 1 WHERE id = ?",
                 delta, updatedNanos, id);
+    }
+
+    /**
+     * 批量清算按主体净额一次更新持有额度并使额度版本加一；仅当清算后不会为负时生效。
+     * 返回受影响行数，0 表示在锁定视图之外仍出现透支（防御性，正常不会发生）。
+     */
+    public int applySettlementNet(String allocationKey, BigDecimal netChange, long updatedNanos) {
+        return jdbc.update("UPDATE allocation SET held_amount = held_amount + ?, updated_nanos = ?,"
+                + " quota_version = quota_version + 1"
+                + " WHERE allocation_key = ? AND held_amount + ? >= 0",
+                netChange, updatedNanos, allocationKey, netChange);
+    }
+
+    /** 按主键顺序（避免多事务加锁死锁）锁定一批申请行（FOR UPDATE）。 */
+    public List<AllocationRow> lockAllocationsByKeys(java.util.Collection<String> allocationKeys) {
+        if (allocationKeys.isEmpty()) {
+            return List.of();
+        }
+        String placeholders = String.join(",", java.util.Collections.nCopies(allocationKeys.size(), "?"));
+        return jdbc.query(
+                ALLOCATION_SELECT + " FROM allocation WHERE allocation_key IN (" + placeholders
+                        + ") ORDER BY id FOR UPDATE",
+                ALLOCATION_MAPPER, allocationKeys.toArray());
+    }
+
+    /** 清算净额为 0 的主体不改变持有额度，但额度版本仍加一。 */
+    public void bumpAllocationVersion(String allocationKey, long updatedNanos) {
+        jdbc.update("UPDATE allocation SET quota_version = quota_version + 1, updated_nanos = ?"
+                + " WHERE allocation_key = ?", updatedNanos, allocationKey);
     }
 
     /** 窗口当前所有 APPROVED 申请的当前持有额度之和（BigDecimal 精确求和），无则 0。 */
@@ -303,5 +367,102 @@ public class WaterRepository {
     /** 写回命令首次成功响应。 */
     public void updateCommandResponse(String commandKey, String response) {
         jdbc.update("UPDATE command_log SET response = ? WHERE command_key = ?", response, commandKey);
+    }
+
+    /** 插入清算批次头并返回主键。 */
+    public long insertSettlement(String settlementKey, long windowId, int instructionCount,
+                                 BigDecimal totalVolume, long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO settlement (settlement_key, window_id, instruction_count, total_volume, created_nanos)"
+                            + " VALUES (?, ?, ?, ?, ?)", Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, settlementKey);
+            ps.setLong(2, windowId);
+            ps.setInt(3, instructionCount);
+            ps.setBigDecimal(4, totalVolume);
+            ps.setLong(5, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 插入一条原始指令快照（输入顺序）。 */
+    public void insertSettlementInstruction(long settlementId, int instructionIndex, String instructionKey,
+                                            String fromAllocationKey, String toAllocationKey,
+                                            BigDecimal volume) {
+        jdbc.update("INSERT INTO settlement_instruction (settlement_id, instruction_index, instruction_key,"
+                + " from_allocation_key, to_allocation_key, volume) VALUES (?, ?, ?, ?, ?, ?)",
+                settlementId, instructionIndex, instructionKey, fromAllocationKey, toAllocationKey, volume);
+    }
+
+    /** 插入一条主体净额与前后余额/版本快照（净额为 0 也插入）。 */
+    public void insertSettlementLeg(long settlementId, String allocationKey, BigDecimal netChange,
+                                    BigDecimal beforeHeld, BigDecimal afterHeld, long beforeVersion,
+                                    long afterVersion) {
+        jdbc.update("INSERT INTO settlement_leg (settlement_id, allocation_key, net_change, before_held,"
+                + " after_held, before_version, after_version) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                settlementId, allocationKey, netChange, beforeHeld, afterHeld, beforeVersion, afterVersion);
+    }
+
+    /** 按业务键查询清算批次头，不存在返回 null。 */
+    public SettlementRow findSettlementByKey(String settlementKey) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT id, settlement_key, window_id, instruction_count, total_volume, created_nanos"
+                            + " FROM settlement WHERE settlement_key = ?",
+                    SETTLEMENT_MAPPER, settlementKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 批次全部原始指令，按输入顺序（instruction_index 升序）。 */
+    public List<SettlementInstructionRow> listSettlementInstructions(long settlementId) {
+        return jdbc.query(
+                "SELECT id, settlement_id, instruction_index, instruction_key, from_allocation_key,"
+                        + " to_allocation_key, volume FROM settlement_instruction"
+                        + " WHERE settlement_id = ? ORDER BY instruction_index",
+                SETTLEMENT_INSTRUCTION_MAPPER, settlementId);
+    }
+
+    /** 批次全部主体净额快照，按申请主键排序以稳定展示顺序。 */
+    public List<SettlementLegRow> listSettlementLegs(long settlementId) {
+        return jdbc.query(
+                "SELECT l.id, l.settlement_id, l.allocation_key, l.net_change, l.before_held, l.after_held,"
+                        + " l.before_version, l.after_version FROM settlement_leg l"
+                        + " JOIN allocation a ON a.allocation_key = l.allocation_key"
+                        + " WHERE l.settlement_id = ? ORDER BY a.id",
+                SETTLEMENT_LEG_MAPPER, settlementId);
+    }
+
+    /** 判断指令键是否已被任何批次使用。 */
+    public boolean existsSettlementInstructionKey(String instructionKey) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM settlement_instruction WHERE instruction_key = ?",
+                Integer.class, instructionKey);
+        return count != null && count > 0;
+    }
+
+    /** 统计已被当前批次之外使用的指令键数量（用于一次性报告冲突键）。 */
+    public int countUsedInstructionKeys(java.util.Collection<String> instructionKeys) {
+        if (instructionKeys.isEmpty()) {
+            return 0;
+        }
+        String placeholders = String.join(",", java.util.Collections.nCopies(instructionKeys.size(), "?"));
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM settlement_instruction WHERE instruction_key IN (" + placeholders + ")",
+                Integer.class, instructionKeys.toArray());
+        return count == null ? 0 : count;
+    }
+
+    /** 查询某主体（申请业务键）参与过的全部清算批次，按批次提交顺序（主键升序）。 */
+    public List<SettlementRow> listSettlementsByAllocationKey(String allocationKey) {
+        return jdbc.query(
+                "SELECT DISTINCT s.id, s.settlement_key, s.window_id, s.instruction_count, s.total_volume,"
+                        + " s.created_nanos FROM settlement s"
+                        + " JOIN settlement_leg l ON l.settlement_id = s.id"
+                        + " WHERE l.allocation_key = ? ORDER BY s.id",
+                SETTLEMENT_MAPPER, allocationKey);
     }
 }
