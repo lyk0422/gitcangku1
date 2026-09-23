@@ -1,6 +1,10 @@
 package com.example.starter.playout.api;
 
+import com.example.starter.playout.LeaseService;
 import com.example.starter.playout.PlayoutService;
+import com.example.starter.playout.api.Dtos.AckSegmentRequest;
+import com.example.starter.playout.api.Dtos.AckSegmentResponse;
+import com.example.starter.playout.api.Dtos.AckView;
 import com.example.starter.playout.api.Dtos.AssetResponse;
 import com.example.starter.playout.api.Dtos.ChannelResponse;
 import com.example.starter.playout.api.Dtos.CreateAssetRequest;
@@ -11,9 +15,13 @@ import com.example.starter.playout.api.Dtos.DraftResponse;
 import com.example.starter.playout.api.Dtos.EmergencyOverrideResponse;
 import com.example.starter.playout.api.Dtos.GrantResponse;
 import com.example.starter.playout.api.Dtos.CancelEmergencyOverrideRequest;
+import com.example.starter.playout.api.Dtos.LeaseResponse;
 import com.example.starter.playout.api.Dtos.PlayoutDecisionResponse;
+import com.example.starter.playout.api.Dtos.PublicationReferencesResponse;
+import com.example.starter.playout.api.Dtos.PullLeaseRequest;
 import com.example.starter.playout.api.Dtos.PublishRequest;
 import com.example.starter.playout.api.Dtos.PublishResponse;
+import com.example.starter.playout.api.Dtos.RenewLeaseRequest;
 import com.example.starter.playout.api.Dtos.ReplaceDraftRequest;
 import com.example.starter.playout.api.Dtos.RevokeGrantRequest;
 import jakarta.validation.Valid;
@@ -32,6 +40,7 @@ import org.springframework.web.bind.annotation.RestController;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeParseException;
+import java.util.List;
 
 /**
  * 播出编排 REST API。成功响应统一 200；错误区分 400 参数错误、404 资源不存在、
@@ -43,9 +52,11 @@ import java.time.format.DateTimeParseException;
 public class PlayoutController {
 
     private final PlayoutService service;
+    private final LeaseService leaseService;
 
-    public PlayoutController(PlayoutService service) {
+    public PlayoutController(PlayoutService service, LeaseService leaseService) {
         this.service = service;
+        this.leaseService = leaseService;
     }
 
     /** 创建素材。 */
@@ -117,6 +128,44 @@ public class PlayoutController {
     @GetMapping("/emergency-overrides/{overrideKey}")
     public EmergencyOverrideResponse emergencyOverride(@PathVariable @NotBlank String overrideKey) {
         return service.getEmergencyOverride(overrideKey);
+    }
+
+    /** 边缘端拉取版本租约：绑定当时最新发布版本及一致快照；未过期重复拉取返回同一租约。 */
+    @PostMapping("/edge/pulls")
+    public LeaseResponse pullLease(@Valid @RequestBody PullLeaseRequest request) {
+        return leaseService.pullLease(request);
+    }
+
+    /** 续租：仅 ACTIVE 且未过期可续，推进 leaseEpoch、保持发布版本。 */
+    @PostMapping("/edge/leases/{leaseId}/renew")
+    public LeaseResponse renewLease(@PathVariable long leaseId,
+                                    @Valid @RequestBody RenewLeaseRequest request) {
+        return leaseService.renewLease(leaseId, request);
+    }
+
+    /** 分段确认：按快照顺序确认下一个未确认分段，ackKey 幂等。 */
+    @PostMapping("/edge/leases/{leaseId}/acks")
+    public AckSegmentResponse ackSegment(@PathVariable long leaseId,
+                                         @Valid @RequestBody AckSegmentRequest request) {
+        return leaseService.ackSegment(leaseId, request);
+    }
+
+    /** 租约明细查询（含分段与插播快照、确认进度），只读。 */
+    @GetMapping("/edge/leases/{leaseId}")
+    public LeaseResponse lease(@PathVariable long leaseId) {
+        return leaseService.getLease(leaseId);
+    }
+
+    /** 租约确认记录查询，只读。 */
+    @GetMapping("/edge/leases/{leaseId}/acks")
+    public List<AckView> leaseAcks(@PathVariable long leaseId) {
+        return leaseService.getLeaseAcks(leaseId);
+    }
+
+    /** 发布版本引用查询：未过期 ACTIVE 租约数与可清理标记，只读。 */
+    @GetMapping("/publications/{publicationId}/references")
+    public PublicationReferencesResponse publicationReferences(@PathVariable long publicationId) {
+        return leaseService.getPublicationReferences(publicationId);
     }
 
     private static LocalDate parseBusinessDay(String businessDay) {

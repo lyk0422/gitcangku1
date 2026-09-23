@@ -97,3 +97,68 @@ CREATE TABLE IF NOT EXISTS playout_emergency_override (
     PRIMARY KEY (override_key),
     KEY idx_override_playout (channel_id, status, start_ms, end_ms, priority)
 ) COMMENT = '限时紧急插播表；不改写日草稿与发布快照，同频道同优先级 ACTIVE 区间不得重叠';
+
+CREATE TABLE IF NOT EXISTS playout_lease (
+    id                BIGINT       NOT NULL AUTO_INCREMENT COMMENT '租约自增 ID',
+    client_key        VARCHAR(64)  NOT NULL COMMENT '边缘端客户端键，客户端指定',
+    channel_id        VARCHAR(64)  NOT NULL COMMENT '频道 ID',
+    business_day      DATE         NOT NULL COMMENT '业务日，Asia/Shanghai 日历日',
+    publication_id    BIGINT       NOT NULL COMMENT '绑定的发布快照 ID，租约期内不变',
+    published_version BIGINT       NOT NULL COMMENT '绑定的发布版本，租约期内不变',
+    lease_epoch       BIGINT       NOT NULL COMMENT '租约纪元，同客户端+频道+业务日内单调递增；续租推进',
+    status            VARCHAR(16)  NOT NULL COMMENT '状态：ACTIVE 生效中 / COMPLETED 全部确认完成 / EXPIRED 已过期；过期为惰性标记',
+    active_unique     TINYINT      NULL COMMENT 'ACTIVE 时固定为 1，其余为 NULL；配合唯一索引保证每客户端+频道+业务日最多一个 ACTIVE 租约',
+    ttl_ms            BIGINT       NOT NULL COMMENT '租约时长，单位毫秒；续租沿用同一时长',
+    expires_at_ms     BIGINT       NOT NULL COMMENT '到期时刻，UTC 纪元毫秒；到期判定为 now >= expires_at_ms',
+    created_at_ms     BIGINT       NOT NULL COMMENT '创建时间，UTC 纪元毫秒',
+    updated_at_ms     BIGINT       NOT NULL COMMENT '最近变更（续租/完成/过期）时间，UTC 纪元毫秒',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_lease_active (client_key, channel_id, business_day, active_unique),
+    KEY idx_lease_publication (publication_id, status, expires_at_ms)
+) COMMENT = '播出端版本租约表；租约绑定拉取时刻最新发布版本，历史不回写';
+
+CREATE TABLE IF NOT EXISTS playout_lease_segment (
+    id            BIGINT      NOT NULL AUTO_INCREMENT COMMENT '租约分段快照自增 ID',
+    lease_id      BIGINT      NOT NULL COMMENT '所属租约 ID',
+    seq           INT         NOT NULL COMMENT '分段顺序，从 0 起，按播出开始时间与分段 ID 排序，确认须按此顺序',
+    segment_id    VARCHAR(64) NOT NULL COMMENT '来源发布快照的分段 ID',
+    asset_id      VARCHAR(64) NOT NULL COMMENT '播出素材 ID',
+    grant_id      BIGINT      NOT NULL COMMENT '发布时选定的授权 ID',
+    grant_revoked TINYINT(1)  NOT NULL COMMENT '拉取快照时刻的授权撤销状态：0 未撤销，1 已撤销；快照不回写',
+    start_ms      BIGINT      NOT NULL COMMENT '播出开始（含），UTC 纪元毫秒',
+    end_ms        BIGINT      NOT NULL COMMENT '播出结束（不含），UTC 纪元毫秒',
+    acked         TINYINT(1)  NOT NULL DEFAULT 0 COMMENT '是否已确认：0 未确认，1 已确认',
+    ack_key       VARCHAR(64) NULL COMMENT '确认该分段的幂等键；未确认为 NULL',
+    played_at_ms  BIGINT      NULL COMMENT '边缘端上报的实际播出时刻，UTC 纪元毫秒；未确认为 NULL',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_lease_segment (lease_id, segment_id),
+    KEY idx_lease_segment_seq (lease_id, seq)
+) COMMENT = '租约分段快照表，拉取时生成，确认状态随 ack 推进，其余字段不回写';
+
+CREATE TABLE IF NOT EXISTS playout_lease_override (
+    id            BIGINT      NOT NULL AUTO_INCREMENT COMMENT '租约插播快照自增 ID',
+    lease_id      BIGINT      NOT NULL COMMENT '所属租约 ID',
+    override_key  VARCHAR(64) NOT NULL COMMENT '紧急插播键',
+    asset_id      VARCHAR(64) NOT NULL COMMENT '插播素材 ID',
+    grant_id      BIGINT      NOT NULL COMMENT '插播创建时指定的授权 ID',
+    grant_revoked TINYINT(1)  NOT NULL COMMENT '拉取快照时刻该授权的撤销状态：0 未撤销，1 已撤销；快照不回写',
+    priority      TINYINT     NOT NULL COMMENT '优先级，1～9，数字越大优先级越高',
+    start_ms      BIGINT      NOT NULL COMMENT '插播开始（含），UTC 纪元毫秒',
+    end_ms        BIGINT      NOT NULL COMMENT '插播结束（不含），UTC 纪元毫秒',
+    PRIMARY KEY (id),
+    KEY idx_lease_override (lease_id)
+) COMMENT = '租约插播快照表，拉取时生成，不回写';
+
+CREATE TABLE IF NOT EXISTS playout_lease_ack (
+    id            BIGINT      NOT NULL AUTO_INCREMENT COMMENT '确认记录自增 ID',
+    lease_id      BIGINT      NOT NULL COMMENT '所属租约 ID',
+    ack_key       VARCHAR(64) NOT NULL COMMENT '确认幂等键，客户端指定；同租约内唯一，失败不占键',
+    segment_id    VARCHAR(64) NOT NULL COMMENT '确认的分段 ID',
+    lease_epoch   BIGINT      NOT NULL COMMENT '确认时携带的租约纪元',
+    played_at_ms  BIGINT      NOT NULL COMMENT '边缘端上报的实际播出时刻，UTC 纪元毫秒，须落在分段时窗内',
+    acked_count   INT         NOT NULL COMMENT '本次确认完成后的累计已确认分段数，用于重放首次结果',
+    lease_status  VARCHAR(16) NOT NULL COMMENT '本次确认完成后的租约状态快照，用于重放首次结果',
+    created_at_ms BIGINT      NOT NULL COMMENT '确认受理时间，UTC 纪元毫秒',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_lease_ack (lease_id, ack_key)
+) COMMENT = '分段确认记录表，与确认状态同事务提交，失败回滚不占键';

@@ -291,6 +291,14 @@ public class PlayoutRepository {
                 PUBLICATION_SEGMENT_MAPPER, publicationId, atMs, atMs).stream().findFirst();
     }
 
+    /** 快照的全部片段，按播出开始时间与分段 ID 排序（租约快照顺序来源）。 */
+    public List<PublicationSegmentRow> findPublicationSegments(long publicationId) {
+        return jdbc.query("SELECT id, publication_id, segment_id, asset_id, grant_id, start_ms, end_ms"
+                        + " FROM playout_publication_segment"
+                        + " WHERE publication_id = ? ORDER BY start_ms, segment_id",
+                PUBLICATION_SEGMENT_MAPPER, publicationId);
+    }
+
     // ---------- 幂等请求记录 ----------
 
     /** 按请求 ID 查询并加行锁，用于去重判定。 */
@@ -380,5 +388,269 @@ public class PlayoutRepository {
                         + " SET status = 'CANCELLED', cancel_request_id = ?, cancelled_at_ms = ?"
                         + " WHERE override_key = ? AND status = 'ACTIVE'",
                 cancelRequestId, cancelledAtMs, overrideKey);
+    }
+
+    // ---------- 播出端版本租约 ----------
+
+    /** 租约行；status 为 ACTIVE / COMPLETED / EXPIRED，过期为惰性标记。 */
+    public record LeaseRow(long id, String clientKey, String channelId, LocalDate businessDay,
+                           long publicationId, long publishedVersion, long leaseEpoch,
+                           String status, long ttlMs, long expiresAtMs,
+                           long createdAtMs, long updatedAtMs) {
+        public boolean active() {
+            return "ACTIVE".equals(status);
+        }
+    }
+
+    /** 租约分段快照行；ackKey/playedAtMs 未确认为 NULL。 */
+    public record LeaseSegmentRow(long id, long leaseId, int seq, String segmentId, String assetId,
+                                  long grantId, boolean grantRevoked, long startMs, long endMs,
+                                  boolean acked, String ackKey, Long playedAtMs) {
+    }
+
+    /** 租约插播快照行。 */
+    public record LeaseOverrideRow(long id, long leaseId, String overrideKey, String assetId,
+                                   long grantId, boolean grantRevoked, int priority,
+                                   long startMs, long endMs) {
+    }
+
+    /** 分段确认记录行；ackedCount/leaseStatus 为本次确认完成后的快照，用于重放首次结果。 */
+    public record LeaseAckRow(long id, long leaseId, String ackKey, String segmentId,
+                              long leaseEpoch, long playedAtMs, int ackedCount,
+                              String leaseStatus, long createdAtMs) {
+    }
+
+    private static final RowMapper<LeaseRow> LEASE_MAPPER = (rs, n) ->
+            new LeaseRow(rs.getLong("id"), rs.getString("client_key"), rs.getString("channel_id"),
+                    rs.getDate("business_day").toLocalDate(), rs.getLong("publication_id"),
+                    rs.getLong("published_version"), rs.getLong("lease_epoch"),
+                    rs.getString("status"), rs.getLong("ttl_ms"), rs.getLong("expires_at_ms"),
+                    rs.getLong("created_at_ms"), rs.getLong("updated_at_ms"));
+
+    private static final RowMapper<LeaseSegmentRow> LEASE_SEGMENT_MAPPER = (rs, n) ->
+            new LeaseSegmentRow(rs.getLong("id"), rs.getLong("lease_id"), rs.getInt("seq"),
+                    rs.getString("segment_id"), rs.getString("asset_id"), rs.getLong("grant_id"),
+                    rs.getBoolean("grant_revoked"), rs.getLong("start_ms"), rs.getLong("end_ms"),
+                    rs.getBoolean("acked"), rs.getString("ack_key"),
+                    (Long) rs.getObject("played_at_ms"));
+
+    private static final RowMapper<LeaseOverrideRow> LEASE_OVERRIDE_MAPPER = (rs, n) ->
+            new LeaseOverrideRow(rs.getLong("id"), rs.getLong("lease_id"),
+                    rs.getString("override_key"), rs.getString("asset_id"), rs.getLong("grant_id"),
+                    rs.getBoolean("grant_revoked"), rs.getInt("priority"),
+                    rs.getLong("start_ms"), rs.getLong("end_ms"));
+
+    private static final RowMapper<LeaseAckRow> LEASE_ACK_MAPPER = (rs, n) ->
+            new LeaseAckRow(rs.getLong("id"), rs.getLong("lease_id"), rs.getString("ack_key"),
+                    rs.getString("segment_id"), rs.getLong("lease_epoch"),
+                    rs.getLong("played_at_ms"), rs.getInt("acked_count"),
+                    rs.getString("lease_status"), rs.getLong("created_at_ms"));
+
+    private static final String LEASE_COLUMNS = "id, client_key, channel_id, business_day,"
+            + " publication_id, published_version, lease_epoch, status, ttl_ms, expires_at_ms,"
+            + " created_at_ms, updated_at_ms";
+
+    private static final String LEASE_SEGMENT_COLUMNS = "id, lease_id, seq, segment_id, asset_id,"
+            + " grant_id, grant_revoked, start_ms, end_ms, acked, ack_key, played_at_ms";
+
+    private static final String LEASE_OVERRIDE_COLUMNS = "id, lease_id, override_key, asset_id,"
+            + " grant_id, grant_revoked, priority, start_ms, end_ms";
+
+    private static final String LEASE_ACK_COLUMNS = "id, lease_id, ack_key, segment_id,"
+            + " lease_epoch, played_at_ms, acked_count, lease_status, created_at_ms";
+
+    /** 创建租约，active_unique 固定为 1；唯一索引冲突时抛 DuplicateKeyException。 */
+    public long insertLease(String clientKey, String channelId, LocalDate businessDay,
+                            long publicationId, long publishedVersion, long leaseEpoch,
+                            long ttlMs, long expiresAtMs, long nowMs) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO playout_lease"
+                            + " (client_key, channel_id, business_day, publication_id,"
+                            + "  published_version, lease_epoch, status, active_unique, ttl_ms,"
+                            + "  expires_at_ms, created_at_ms, updated_at_ms)"
+                            + " VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', 1, ?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, clientKey);
+            ps.setString(2, channelId);
+            ps.setDate(3, Date.valueOf(businessDay));
+            ps.setLong(4, publicationId);
+            ps.setLong(5, publishedVersion);
+            ps.setLong(6, leaseEpoch);
+            ps.setLong(7, ttlMs);
+            ps.setLong(8, expiresAtMs);
+            ps.setLong(9, nowMs);
+            ps.setLong(10, nowMs);
+            return ps;
+        }, keyHolder);
+        return keyHolder.getKey().longValue();
+    }
+
+    /** 按 ID 查询租约。 */
+    public Optional<LeaseRow> findLease(long leaseId) {
+        return jdbc.query("SELECT " + LEASE_COLUMNS + " FROM playout_lease WHERE id = ?",
+                LEASE_MAPPER, leaseId).stream().findFirst();
+    }
+
+    /** 按 ID 查询租约并加行锁，用于续租与确认串行化。 */
+    public Optional<LeaseRow> findLeaseForUpdate(long leaseId) {
+        return jdbc.query("SELECT " + LEASE_COLUMNS + " FROM playout_lease WHERE id = ? FOR UPDATE",
+                LEASE_MAPPER, leaseId).stream().findFirst();
+    }
+
+    /** 查询客户端+频道+业务日的 ACTIVE 租约并加行锁；过期租约在拉取流程中惰性转为 EXPIRED。 */
+    public Optional<LeaseRow> findActiveLeaseForUpdate(String clientKey, String channelId,
+                                                       LocalDate businessDay) {
+        return jdbc.query("SELECT " + LEASE_COLUMNS + " FROM playout_lease"
+                        + " WHERE client_key = ? AND channel_id = ? AND business_day = ?"
+                        + " AND active_unique = 1 FOR UPDATE",
+                LEASE_MAPPER, clientKey, channelId, Date.valueOf(businessDay)).stream().findFirst();
+    }
+
+    /** 客户端+频道+业务日历史最大租约纪元，无历史时为 0。 */
+    public long maxLeaseEpoch(String clientKey, String channelId, LocalDate businessDay) {
+        Long epoch = jdbc.queryForObject(
+                "SELECT MAX(lease_epoch) FROM playout_lease"
+                        + " WHERE client_key = ? AND channel_id = ? AND business_day = ?",
+                Long.class, clientKey, channelId, Date.valueOf(businessDay));
+        return epoch == null ? 0L : epoch;
+    }
+
+    /** 惰性将 ACTIVE 租约标记为 EXPIRED 并释放 ACTIVE 唯一槽位；返回受影响行数。 */
+    public int markLeaseExpired(long leaseId, long updatedAtMs) {
+        return jdbc.update("UPDATE playout_lease"
+                        + " SET status = 'EXPIRED', active_unique = NULL, updated_at_ms = ?"
+                        + " WHERE id = ? AND status = 'ACTIVE'",
+                updatedAtMs, leaseId);
+    }
+
+    /** 续租：推进纪元并延长到期时刻，保持发布版本不变；仅 ACTIVE 生效。 */
+    public int renewLease(long leaseId, long newEpoch, long expiresAtMs, long updatedAtMs) {
+        return jdbc.update("UPDATE playout_lease"
+                        + " SET lease_epoch = ?, expires_at_ms = ?, updated_at_ms = ?"
+                        + " WHERE id = ? AND status = 'ACTIVE'",
+                newEpoch, expiresAtMs, updatedAtMs, leaseId);
+    }
+
+    /** 全部确认后完成租约并释放 ACTIVE 唯一槽位。 */
+    public int completeLease(long leaseId, long updatedAtMs) {
+        return jdbc.update("UPDATE playout_lease"
+                        + " SET status = 'COMPLETED', active_unique = NULL, updated_at_ms = ?"
+                        + " WHERE id = ? AND status = 'ACTIVE'",
+                updatedAtMs, leaseId);
+    }
+
+    public void insertLeaseSegment(long leaseId, int seq, String segmentId, String assetId,
+                                   long grantId, boolean grantRevoked, long startMs, long endMs) {
+        jdbc.update("INSERT INTO playout_lease_segment"
+                        + " (lease_id, seq, segment_id, asset_id, grant_id, grant_revoked,"
+                        + "  start_ms, end_ms, acked)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                leaseId, seq, segmentId, assetId, grantId, grantRevoked, startMs, endMs);
+    }
+
+    /** 租约分段快照，按确认顺序（seq）返回。 */
+    public List<LeaseSegmentRow> findLeaseSegments(long leaseId) {
+        return jdbc.query("SELECT " + LEASE_SEGMENT_COLUMNS + " FROM playout_lease_segment"
+                        + " WHERE lease_id = ? ORDER BY seq",
+                LEASE_SEGMENT_MAPPER, leaseId);
+    }
+
+    /** 下一个未确认分段（seq 最小）。 */
+    public Optional<LeaseSegmentRow> findNextUnackedSegment(long leaseId) {
+        return jdbc.query("SELECT " + LEASE_SEGMENT_COLUMNS + " FROM playout_lease_segment"
+                        + " WHERE lease_id = ? AND acked = 0 ORDER BY seq LIMIT 1",
+                LEASE_SEGMENT_MAPPER, leaseId).stream().findFirst();
+    }
+
+    /** 租约内指定分段。 */
+    public Optional<LeaseSegmentRow> findLeaseSegment(long leaseId, String segmentId) {
+        return jdbc.query("SELECT " + LEASE_SEGMENT_COLUMNS + " FROM playout_lease_segment"
+                        + " WHERE lease_id = ? AND segment_id = ?",
+                LEASE_SEGMENT_MAPPER, leaseId, segmentId).stream().findFirst();
+    }
+
+    /** 标记分段已确认；返回受影响行数，0 表示已确认或不存在。 */
+    public int markSegmentAcked(long leaseId, String segmentId, String ackKey, long playedAtMs) {
+        return jdbc.update("UPDATE playout_lease_segment"
+                        + " SET acked = 1, ack_key = ?, played_at_ms = ?"
+                        + " WHERE lease_id = ? AND segment_id = ? AND acked = 0",
+                ackKey, playedAtMs, leaseId, segmentId);
+    }
+
+    /** 未确认分段数。 */
+    public int countUnackedSegments(long leaseId) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM playout_lease_segment WHERE lease_id = ? AND acked = 0",
+                Integer.class, leaseId);
+        return count == null ? 0 : count;
+    }
+
+    public void insertLeaseOverride(long leaseId, String overrideKey, String assetId, long grantId,
+                                    boolean grantRevoked, int priority, long startMs, long endMs) {
+        jdbc.update("INSERT INTO playout_lease_override"
+                        + " (lease_id, override_key, asset_id, grant_id, grant_revoked, priority,"
+                        + "  start_ms, end_ms)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                leaseId, overrideKey, assetId, grantId, grantRevoked, priority, startMs, endMs);
+    }
+
+    /** 租约插播快照，按优先级降序、开始时间升序返回。 */
+    public List<LeaseOverrideRow> findLeaseOverrides(long leaseId) {
+        return jdbc.query("SELECT " + LEASE_OVERRIDE_COLUMNS + " FROM playout_lease_override"
+                        + " WHERE lease_id = ? ORDER BY priority DESC, start_ms, override_key",
+                LEASE_OVERRIDE_MAPPER, leaseId);
+    }
+
+    /** 记录分段确认；唯一索引 (lease_id, ack_key) 冲突时抛 DuplicateKeyException。 */
+    public void insertLeaseAck(long leaseId, String ackKey, String segmentId, long leaseEpoch,
+                               long playedAtMs, int ackedCount, String leaseStatus, long createdAtMs) {
+        jdbc.update("INSERT INTO playout_lease_ack"
+                        + " (lease_id, ack_key, segment_id, lease_epoch, played_at_ms,"
+                        + "  acked_count, lease_status, created_at_ms)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                leaseId, ackKey, segmentId, leaseEpoch, playedAtMs, ackedCount, leaseStatus,
+                createdAtMs);
+    }
+
+    /** 按幂等键查询确认记录。 */
+    public Optional<LeaseAckRow> findLeaseAck(long leaseId, String ackKey) {
+        return jdbc.query("SELECT " + LEASE_ACK_COLUMNS + " FROM playout_lease_ack"
+                        + " WHERE lease_id = ? AND ack_key = ?",
+                LEASE_ACK_MAPPER, leaseId, ackKey).stream().findFirst();
+    }
+
+    /** 租约全部确认记录，按受理顺序返回。 */
+    public List<LeaseAckRow> findLeaseAcks(long leaseId) {
+        return jdbc.query("SELECT " + LEASE_ACK_COLUMNS + " FROM playout_lease_ack"
+                        + " WHERE lease_id = ? ORDER BY id",
+                LEASE_ACK_MAPPER, leaseId);
+    }
+
+    /** 引用指定发布快照的未过期 ACTIVE 租约数（nowMs 为判定时刻，UTC 纪元毫秒）。 */
+    public long countUnexpiredActiveLeasesForPublication(long publicationId, long nowMs) {
+        Long count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM playout_lease"
+                        + " WHERE publication_id = ? AND status = 'ACTIVE' AND expires_at_ms > ?",
+                Long.class, publicationId, nowMs);
+        return count == null ? 0L : count;
+    }
+
+    /** 按 ID 查询发布快照。 */
+    public Optional<PublicationRow> findPublication(long publicationId) {
+        return jdbc.query("SELECT id, channel_id, business_day, published_version, draft_version"
+                        + " FROM playout_publication WHERE id = ?",
+                PUBLICATION_MAPPER, publicationId).stream().findFirst();
+    }
+
+    /** 某业务日状态为 ACTIVE 的紧急插播，按优先级降序、开始时间升序返回（拉取快照用）。 */
+    public List<OverrideRow> findActiveOverridesForDay(String channelId, LocalDate businessDay) {
+        return jdbc.query("SELECT override_key, channel_id, asset_id, grant_id, priority, start_ms,"
+                        + " end_ms, business_day, status, cancel_request_id, cancelled_at_ms, created_at_ms"
+                        + " FROM playout_emergency_override"
+                        + " WHERE channel_id = ? AND business_day = ? AND status = 'ACTIVE'"
+                        + " ORDER BY priority DESC, start_ms, override_key",
+                OVERRIDE_MAPPER, channelId, Date.valueOf(businessDay));
     }
 }
