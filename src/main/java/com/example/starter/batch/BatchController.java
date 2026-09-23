@@ -4,6 +4,7 @@ import com.example.starter.batch.dto.ApproveRequest;
 import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
+import com.example.starter.batch.dto.HoldingResponse;
 import com.example.starter.batch.dto.LineageEntryResponse;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.SplitRequest;
@@ -112,6 +113,14 @@ public class BatchController {
     @GetMapping("/{batchKey}/descendants")
     public List<LineageEntryResponse> descendants(@PathVariable String batchKey) {
         return service.listDescendants(batchKey);
+    }
+
+    /**
+     * 当前持有厂查询：只读，返回批次当前持有厂、版本号与状态。
+     */
+    @GetMapping("/{batchKey}/holding")
+    public HoldingResponse holding(@PathVariable String batchKey) {
+        return service.holding(batchKey);
     }
 
     private ResponseEntity<String> stored(StoredResponse response) {

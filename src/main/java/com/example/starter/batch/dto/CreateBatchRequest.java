@@ -9,6 +9,7 @@ import java.util.List;
 
 /**
  * 创建批次请求。producedAt 为 ISO-8601 UTC 时间；requiredTests 为 1～5 个必做检验项。
+ * holdingPlant 可选，为批次初始持有厂标识；缺省为 PLANT-DEFAULT。
  */
 public record CreateBatchRequest(
         @NotBlank(message = "commandKey 不能为空") String commandKey,
@@ -18,6 +19,7 @@ public record CreateBatchRequest(
         @NotNull(message = "producedAt 不能为空") Instant producedAt,
         @NotNull(message = "requiredTests 不能为空")
         @Size(min = 1, max = 5, message = "requiredTests 必须包含 1～5 个检验项")
-        List<@NotBlank(message = "检验项不能为空") String> requiredTests
+        List<@NotBlank(message = "检验项不能为空") String> requiredTests,
+        String holdingPlant
 ) {
 }
