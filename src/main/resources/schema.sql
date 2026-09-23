@@ -70,11 +70,13 @@ CREATE TABLE IF NOT EXISTS unblind_request (
     reviewer_actor          VARCHAR(64),
     status                  VARCHAR(16)  NOT NULL,
     treatment               VARCHAR(1),
+    exposure_key            VARCHAR(64),
     created_at              BIGINT       NOT NULL,
     reviewed_at             BIGINT,
     pending_allocation_id   BIGINT,
     CONSTRAINT pk_unblind_request PRIMARY KEY (id),
     CONSTRAINT uq_unblind_pending UNIQUE (pending_allocation_id),
+    CONSTRAINT uq_unblind_exposure_key UNIQUE (exposure_key),
     CONSTRAINT ck_unblind_status CHECK (status IN ('PENDING', 'APPROVED')),
     CONSTRAINT ck_unblind_treatment CHECK (treatment IS NULL OR treatment IN ('A', 'B'))
 );
@@ -88,6 +90,7 @@ COMMENT ON COLUMN unblind_request.applicant_actor IS '申请人操作者编号�
 COMMENT ON COLUMN unblind_request.reviewer_actor IS '批准的 REVIEWER 操作者编号，必须不同于申请人；未批准时为 NULL';
 COMMENT ON COLUMN unblind_request.status IS '申请状态：PENDING=待审；APPROVED=已批准';
 COMMENT ON COLUMN unblind_request.treatment IS '揭盲结果处理代码 A/B，批准时写入；NULL=尚未批准';
+COMMENT ON COLUMN unblind_request.exposure_key IS '泄露登记凭据，批准时生成、全局唯一，仅随揭盲结果返回申请人本人；NULL=尚未批准';
 COMMENT ON COLUMN unblind_request.created_at IS '申请时间，Unix 毫秒，UTC';
 COMMENT ON COLUMN unblind_request.reviewed_at IS '批准时间，Unix 毫秒，UTC；NULL 表示未批准';
 COMMENT ON COLUMN unblind_request.pending_allocation_id IS '待审去重列：待审时等于 allocation_id，终态置 NULL；唯一索引保证同一分配至多一个待审申请';
@@ -112,3 +115,118 @@ COMMENT ON COLUMN idempotent_request.fingerprint IS '请求参数指纹（含路
 COMMENT ON COLUMN idempotent_request.response_status IS '首次成功响应的 HTTP 状态码，重放时原样返回';
 COMMENT ON COLUMN idempotent_request.response_body IS '首次成功响应体 JSON，重放时原样返回';
 COMMENT ON COLUMN idempotent_request.created_at IS '记录时间，Unix 毫秒，UTC';
+
+-- ======================================================================
+-- 揭盲泄露传播、污染闭包版本与隔离单
+-- ======================================================================
+
+CREATE TABLE IF NOT EXISTS contamination_subject (
+    id                      BIGINT       NOT NULL AUTO_INCREMENT,
+    experiment_id           VARCHAR(64)  NOT NULL,
+    participant_id          VARCHAR(64)  NOT NULL,
+    current_version         INT          NOT NULL,
+    CONSTRAINT pk_contamination_subject PRIMARY KEY (id),
+    CONSTRAINT uq_contamination_subject UNIQUE (experiment_id, participant_id),
+    CONSTRAINT ck_subject_version CHECK (current_version >= 1)
+);
+COMMENT ON TABLE  contamination_subject IS '污染主体：每个被揭盲参与者一行，作为披露/门禁/隔离并发的行级串行锁载体';
+COMMENT ON COLUMN contamination_subject.id IS '污染主体自增主键';
+COMMENT ON COLUMN contamination_subject.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN contamination_subject.participant_id IS '合成参与者编号，污染闭包围绕其持密操作者集合';
+COMMENT ON COLUMN contamination_subject.current_version IS '当前开放污染闭包版本号，从1开始；冻结后新增披露自增并重新 OPEN';
+
+CREATE TABLE IF NOT EXISTS contamination_version (
+    id                      BIGINT       NOT NULL AUTO_INCREMENT,
+    subject_id              BIGINT       NOT NULL,
+    version_no              INT          NOT NULL,
+    status                  VARCHAR(16)  NOT NULL,
+    closure                 CLOB         NOT NULL,
+    edge_count              INT          NOT NULL,
+    created_at              BIGINT       NOT NULL,
+    frozen_at               BIGINT,
+    quarantine_id           VARCHAR(64),
+    CONSTRAINT pk_contamination_version PRIMARY KEY (id),
+    CONSTRAINT uq_contamination_version UNIQUE (subject_id, version_no),
+    CONSTRAINT ck_version_status CHECK (status IN ('OPEN', 'CLOSED')),
+    CONSTRAINT ck_version_edge_count CHECK (edge_count >= 1)
+);
+COMMENT ON TABLE  contamination_version IS '污染闭包版本：每次冻结后新增披露另开新版本；同一主体至多一个 OPEN 版本';
+COMMENT ON COLUMN contamination_version.id IS '版本自增主键';
+COMMENT ON COLUMN contamination_version.subject_id IS '所属污染主体主键';
+COMMENT ON COLUMN contamination_version.version_no IS '版本序号，主体内从1递增';
+COMMENT ON COLUMN contamination_version.status IS '版本状态：OPEN=开放中可随新披露更新；CLOSED=已隔离冻结，仅保留审计快照';
+COMMENT ON COLUMN contamination_version.closure IS '该版本闭包快照，操作者编号升序 JSON 数组，只含操作者不含处理代码';
+COMMENT ON COLUMN contamination_version.edge_count IS '该版本冻结或更新时的去重有向边数量';
+COMMENT ON COLUMN contamination_version.created_at IS '版本创建（首次开放）时间，Unix 毫秒，UTC';
+COMMENT ON COLUMN contamination_version.frozen_at IS '冻结（隔离关闭）时间，Unix 毫秒，UTC；NULL=未冻结';
+COMMENT ON COLUMN contamination_version.quarantine_id IS '关闭该版本的隔离单编号；NULL=尚未隔离';
+
+CREATE TABLE IF NOT EXISTS exposure_edge (
+    id                      BIGINT       NOT NULL AUTO_INCREMENT,
+    subject_id              BIGINT       NOT NULL,
+    source_actor            VARCHAR(64)  NOT NULL,
+    target_actor            VARCHAR(64)  NOT NULL,
+    edge_kind               VARCHAR(8)   NOT NULL,
+    created_at              BIGINT       NOT NULL,
+    CONSTRAINT pk_exposure_edge PRIMARY KEY (id),
+    CONSTRAINT uq_exposure_edge UNIQUE (subject_id, source_actor, target_actor),
+    CONSTRAINT ck_exposure_kind CHECK (edge_kind IN ('SEED', 'DIRECT'))
+);
+COMMENT ON TABLE  exposure_edge IS '操作者—参与者维度的去重有向披露边；边只增不删，重复登记不新增，隔离冻结不删除边';
+COMMENT ON COLUMN exposure_edge.id IS '披露边自增主键';
+COMMENT ON COLUMN exposure_edge.subject_id IS '所属污染主体（目标参与者）';
+COMMENT ON COLUMN exposure_edge.source_actor IS '披露源操作者：SEED=系统（批准揭盲的持密种子）；DIRECT=真实上游操作者';
+COMMENT ON COLUMN exposure_edge.target_actor IS '接收披露的操作者编号';
+COMMENT ON COLUMN exposure_edge.edge_kind IS '边类型：SEED=揭盲批准生成的持密种子边；DIRECT=持密者登记的直接披露边';
+COMMENT ON COLUMN exposure_edge.created_at IS '边登记时间，Unix 毫秒，UTC';
+
+CREATE TABLE IF NOT EXISTS exposure_record (
+    id                      BIGINT       NOT NULL AUTO_INCREMENT,
+    subject_id              BIGINT       NOT NULL,
+    edge_id                 BIGINT       NOT NULL,
+    source_actor            VARCHAR(64)  NOT NULL,
+    target_actor            VARCHAR(64)  NOT NULL,
+    recorded_by             VARCHAR(64)  NOT NULL,
+    created_at              BIGINT       NOT NULL,
+    CONSTRAINT pk_exposure_record PRIMARY KEY (id)
+);
+COMMENT ON TABLE  exposure_record IS '披露登记审计流水：每条去重新增边对应一条登记，记录登记人与披露源';
+COMMENT ON COLUMN exposure_record.id IS '披露登记自增主键';
+COMMENT ON COLUMN exposure_record.subject_id IS '所属污染主体';
+COMMENT ON COLUMN exposure_record.edge_id IS '对应披露边主键';
+COMMENT ON COLUMN exposure_record.source_actor IS '披露源操作者（SEED 边为系统标识）';
+COMMENT ON COLUMN exposure_record.target_actor IS '接收操作者编号';
+COMMENT ON COLUMN exposure_record.recorded_by IS '提交登记的操作者编号（持 exposureKey 的人或系统）';
+COMMENT ON COLUMN exposure_record.created_at IS '登记时间，Unix 毫秒，UTC';
+
+CREATE TABLE IF NOT EXISTS quarantine_order (
+    id                      VARCHAR(64)  NOT NULL,
+    experiment_id           VARCHAR(64)  NOT NULL,
+    participant_id          VARCHAR(64)  NOT NULL,
+    subject_id              BIGINT       NOT NULL,
+    version_no              INT          NOT NULL,
+    version_id              BIGINT       NOT NULL,
+    closure_snapshot        CLOB         NOT NULL,
+    initiator_actor         VARCHAR(64)  NOT NULL,
+    confirmer_actor         VARCHAR(64),
+    status                  VARCHAR(16)  NOT NULL,
+    created_at              BIGINT       NOT NULL,
+    confirmed_at            BIGINT,
+    pending_subject_id      BIGINT,
+    CONSTRAINT pk_quarantine_order PRIMARY KEY (id),
+    CONSTRAINT uq_quarantine_pending UNIQUE (pending_subject_id),
+    CONSTRAINT ck_quarantine_status CHECK (status IN ('OPEN', 'CONFIRMED'))
+);
+COMMENT ON TABLE  quarantine_order IS '隔离单：合规负责人提交参与者当前闭包与版本，另一名不在闭包的负责人确认后关闭该版本';
+COMMENT ON COLUMN quarantine_order.id IS '隔离单编号，全局唯一';
+COMMENT ON COLUMN quarantine_order.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN quarantine_order.participant_id IS '被隔离的合成参与者编号';
+COMMENT ON COLUMN quarantine_order.subject_id IS '污染主体主键';
+COMMENT ON COLUMN quarantine_order.version_no IS '发起时的开放版本序号';
+COMMENT ON COLUMN quarantine_order.version_id IS '发起时的开放版本主键';
+COMMENT ON COLUMN quarantine_order.closure_snapshot IS '发起时提交的完整闭包快照，操作者升序 JSON 数组，不含处理代码';
+COMMENT ON COLUMN quarantine_order.initiator_actor IS '发起隔离的合规负责人，必须不在该闭包内';
+COMMENT ON COLUMN quarantine_order.confirmer_actor IS '确认隔离的另一名合规负责人，必须不同于发起人且不在闭包内；NULL=未确认';
+COMMENT ON COLUMN quarantine_order.status IS '隔离单状态：OPEN=待确认；CONFIRMED=已确认并冻结版本';
+COMMENT ON COLUMN quarantine_order.created_at IS '发起时间，Unix 毫秒，UTC';
+COMMENT ON COLUMN quarantine_order.confirmed_at IS '确认时间，Unix 毫秒，UTC；NULL=未确认';

@@ -12,7 +12,7 @@ import java.util.List;
 @Repository
 public class UnblindRequestRepository {
 
-    /** 揭盲申请行。treatment 为盲底，仅批准后允许返回给申请人。 */
+    /** 揭盲申请行。treatment 为盲底，仅批准后允许返回给申请人；exposureKey 为泄露登记凭据。 */
     public record UnblindRequestRow(
             String id,
             String experimentId,
@@ -23,6 +23,7 @@ public class UnblindRequestRepository {
             String reviewerActor,
             String status,
             String treatment,
+            String exposureKey,
             long createdAt,
             Long reviewedAt) {
     }
@@ -37,12 +38,13 @@ public class UnblindRequestRepository {
             rs.getString("reviewer_actor"),
             rs.getString("status"),
             rs.getString("treatment"),
+            rs.getString("exposure_key"),
             rs.getLong("created_at"),
             (Long) rs.getObject("reviewed_at"));
 
     private static final String COLUMNS =
             "id, experiment_id, participant_id, allocation_id, reason, applicant_actor, "
-                    + "reviewer_actor, status, treatment, created_at, reviewed_at";
+                    + "reviewer_actor, status, treatment, exposure_key, created_at, reviewed_at";
 
     private final JdbcTemplate jdbc;
 
@@ -87,14 +89,26 @@ public class UnblindRequestRepository {
     }
 
     /**
-     * 批准：仅 PENDING 可批准，写入处理代码、批准人与时间，并释放待审唯一占位。
+     * 按泄露登记凭据定位已批准揭盲申请；凭据不存在或申请未批准时返回 null。
+     */
+    public UnblindRequestRow findApprovedByExposureKey(String exposureKey) {
+        List<UnblindRequestRow> rows = jdbc.query(
+                "SELECT " + COLUMNS + " FROM unblind_request "
+                        + "WHERE exposure_key = ? AND status = 'APPROVED'",
+                MAPPER, exposureKey);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /**
+     * 批准：仅 PENDING 可批准，写入处理代码、批准人、泄露登记凭据与时间，并释放待审唯一占位。
      *
      * @return 受影响行数；0 表示不存在或已批准
      */
-    public int approve(String requestId, String reviewerActor, String treatment, long reviewedAt) {
+    public int approve(String requestId, String reviewerActor, String treatment,
+                       String exposureKey, long reviewedAt) {
         return jdbc.update("UPDATE unblind_request SET status = 'APPROVED', reviewer_actor = ?, "
-                        + "treatment = ?, reviewed_at = ?, pending_allocation_id = NULL "
+                        + "treatment = ?, exposure_key = ?, reviewed_at = ?, pending_allocation_id = NULL "
                         + "WHERE id = ? AND status = 'PENDING'",
-                reviewerActor, treatment, reviewedAt, requestId);
+                reviewerActor, treatment, exposureKey, reviewedAt, requestId);
     }
 }

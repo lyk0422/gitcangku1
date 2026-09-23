@@ -5,11 +5,18 @@ import com.example.starter.blind.ActorContext;
 import com.example.starter.blind.ApiException;
 import com.example.starter.blind.RequestTokens;
 import com.example.starter.blind.dto.AllocationView;
+import com.example.starter.blind.dto.ContaminationVersionView;
+import com.example.starter.blind.dto.ContaminationView;
 import com.example.starter.blind.dto.CreateExperimentRequest;
+import com.example.starter.blind.dto.DownstreamExposureRequest;
 import com.example.starter.blind.dto.ExperimentView;
+import com.example.starter.blind.dto.ExposureRecordRequest;
+import com.example.starter.blind.dto.ExposureRecordView;
+import com.example.starter.blind.dto.QuarantineOrderView;
 import com.example.starter.blind.dto.UnblindApplyRequest;
 import com.example.starter.blind.dto.UnblindRequestView;
 import com.example.starter.blind.dto.UnblindResultView;
+import com.example.starter.blind.service.ContaminationService;
 import com.example.starter.blind.service.ExperimentService;
 import com.example.starter.blind.service.IdempotencyService;
 import com.example.starter.blind.service.UnblindService;
@@ -24,6 +31,7 @@ import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -40,18 +48,25 @@ public class BlindExperimentController {
     static final String OP_ALLOCATION_WITHDRAW = "allocation.withdraw";
     static final String OP_UNBLIND_APPLY = "unblind.apply";
     static final String OP_UNBLIND_APPROVE = "unblind.approve";
+    static final String OP_EXPOSURE_RECORD = "exposure.record";
+    static final String OP_EXPOSURE_RECORD_DOWNSTREAM = "exposure.record.downstream";
+    static final String OP_QUARANTINE_INITIATE = "quarantine.initiate";
+    static final String OP_QUARANTINE_CONFIRM = "quarantine.confirm";
 
     private final ExperimentService experimentService;
     private final UnblindService unblindService;
+    private final ContaminationService contaminationService;
     private final IdempotencyService idempotencyService;
     private final ActorContext actorContext;
 
     public BlindExperimentController(ExperimentService experimentService,
                                      UnblindService unblindService,
+                                     ContaminationService contaminationService,
                                      IdempotencyService idempotencyService,
                                      ActorContext actorContext) {
         this.experimentService = experimentService;
         this.unblindService = unblindService;
+        this.contaminationService = contaminationService;
         this.idempotencyService = idempotencyService;
         this.actorContext = actorContext;
     }
@@ -195,6 +210,116 @@ public class BlindExperimentController {
                 RequestTokens.requireId("unblindRequestId", unblindRequestId), actor.actorId());
     }
 
+    // ---------------- 泄露传播登记 ----------------
+
+    /**
+     * 持 exposureKey 登记申请人本人向 1～20 名操作者的直接披露；
+     * 披露源强制为当前操作者，接收人集合顺序不影响幂等判定。
+     */
+    @PostMapping("/exposures")
+    public ResponseEntity<String> recordExposure(
+            @Valid @RequestBody ExposureRecordRequest request,
+            @RequestHeader(IdempotencyService.HEADER_REQUEST_ID) String requestId) {
+        Actor actor = requireActor();
+        String exposureKey = request.exposureKey().trim();
+        String reqId = RequestTokens.requireRequestId(requestId);
+        String fingerprint = idempotencyService.fingerprint(OP_EXPOSURE_RECORD,
+                Map.of("exposureKey", exposureKey,
+                        "recipients", normalizedRecipients(request.recipients())));
+        return idempotencyService.runWrite(reqId, OP_EXPOSURE_RECORD, fingerprint, actor,
+                () -> IdempotencyService.WriteOutcome.of(HttpStatus.CREATED.value(),
+                        contaminationService.record(exposureKey, request.recipients(),
+                                actor.actorId())));
+    }
+
+    /**
+     * 接收人继续登记自己向更下游操作者的直接披露；资格由其是否已在闭包内强制判定。
+     */
+    @PostMapping("/experiments/{experimentId}/participants/{participantId}/exposures")
+    public ResponseEntity<String> recordDownstreamExposure(
+            @PathVariable String experimentId,
+            @PathVariable String participantId,
+            @Valid @RequestBody DownstreamExposureRequest request,
+            @RequestHeader(IdempotencyService.HEADER_REQUEST_ID) String requestId) {
+        Actor actor = requireActor();
+        String expId = RequestTokens.requireId("experimentId", experimentId);
+        String pid = RequestTokens.requireId("participantId", participantId);
+        String reqId = RequestTokens.requireRequestId(requestId);
+        String fingerprint = idempotencyService.fingerprint(OP_EXPOSURE_RECORD_DOWNSTREAM,
+                Map.of("experimentId", expId,
+                        "participantId", pid,
+                        "recipients", normalizedRecipients(request.recipients())));
+        return idempotencyService.runWrite(reqId, OP_EXPOSURE_RECORD_DOWNSTREAM, fingerprint, actor,
+                () -> IdempotencyService.WriteOutcome.of(HttpStatus.CREATED.value(),
+                        contaminationService.recordDownstream(expId, pid, request.recipients(),
+                                actor.actorId())));
+    }
+
+    /** 查询当前开放污染闭包与版本（不含处理代码）。 */
+    @GetMapping("/experiments/{experimentId}/participants/{participantId}/contamination")
+    public ContaminationView getContamination(@PathVariable String experimentId,
+                                              @PathVariable String participantId) {
+        requireActor();
+        return contaminationService.getContamination(
+                RequestTokens.requireId("experimentId", experimentId),
+                RequestTokens.requireId("participantId", participantId));
+    }
+
+    /** 查询某参与者全部闭包版本（含冻结审计快照，不含处理代码）。 */
+    @GetMapping("/experiments/{experimentId}/participants/{participantId}/contamination/versions")
+    public List<ContaminationVersionView> getContaminationVersions(
+            @PathVariable String experimentId,
+            @PathVariable String participantId) {
+        requireActor();
+        return contaminationService.listVersions(
+                RequestTokens.requireId("experimentId", experimentId),
+                RequestTokens.requireId("participantId", participantId));
+    }
+
+    // ---------------- 隔离单 ----------------
+
+    /** 合规负责人发起隔离：提交当前完整闭包与版本。 */
+    @PostMapping("/experiments/{experimentId}/participants/{participantId}/quarantine-orders")
+    public ResponseEntity<String> initiateQuarantine(
+            @PathVariable String experimentId,
+            @PathVariable String participantId,
+            @RequestHeader(IdempotencyService.HEADER_REQUEST_ID) String requestId) {
+        Actor actor = requireCompliance();
+        String expId = RequestTokens.requireId("experimentId", experimentId);
+        String pid = RequestTokens.requireId("participantId", participantId);
+        String reqId = RequestTokens.requireRequestId(requestId);
+        String fingerprint = idempotencyService.fingerprint(OP_QUARANTINE_INITIATE,
+                Map.of("experimentId", expId, "participantId", pid));
+        return idempotencyService.runWrite(reqId, OP_QUARANTINE_INITIATE, fingerprint, actor,
+                () -> IdempotencyService.WriteOutcome.of(HttpStatus.CREATED.value(),
+                        contaminationService.initiateQuarantine(expId, pid, actor.actorId())));
+    }
+
+    /** 另一名不在闭包内的合规负责人确认隔离并冻结版本快照。 */
+    @PostMapping("/quarantine-orders/{orderId}/confirmation")
+    public ResponseEntity<String> confirmQuarantine(
+            @PathVariable String orderId,
+            @RequestHeader(IdempotencyService.HEADER_REQUEST_ID) String requestId) {
+        Actor actor = requireCompliance();
+        String qoId = RequestTokens.requireId("orderId", orderId);
+        String reqId = RequestTokens.requireRequestId(requestId);
+        String fingerprint = idempotencyService.fingerprint(OP_QUARANTINE_CONFIRM,
+                Map.of("orderId", qoId));
+        return idempotencyService.runWrite(reqId, OP_QUARANTINE_CONFIRM, fingerprint, actor,
+                () -> IdempotencyService.WriteOutcome.of(HttpStatus.OK.value(),
+                        contaminationService.confirmQuarantine(qoId, actor.actorId())));
+    }
+
+    /** 查询某参与者隔离历史（不含处理代码）。 */
+    @GetMapping("/experiments/{experimentId}/participants/{participantId}/quarantine-orders")
+    public List<QuarantineOrderView> getQuarantineOrders(@PathVariable String experimentId,
+                                                         @PathVariable String participantId) {
+        requireActor();
+        return contaminationService.listQuarantineOrders(
+                RequestTokens.requireId("experimentId", experimentId),
+                RequestTokens.requireId("participantId", participantId));
+    }
+
     // ---------------- 权限辅助（先于幂等回放执行） ----------------
 
     private Actor requireActor() {
@@ -219,5 +344,25 @@ public class BlindExperimentController {
             throw ApiException.forbidden("仅 REVIEWER 可执行该操作");
         }
         return actor;
+    }
+
+    private Actor requireCompliance() {
+        Actor actor = requireActor();
+        if (!actor.isCompliance()) {
+            throw ApiException.forbidden("仅 COMPLIANCE 合规负责人可执行该操作");
+        }
+        return actor;
+    }
+
+    /**
+     * 幂等指纹中的接收人集合规范化：去空白、去重并升序，
+     * 使「同参集合换序重放」视为同参，真正增减成员才判异参 409。
+     */
+    private List<String> normalizedRecipients(List<String> recipients) {
+        return recipients.stream()
+                .map(String::trim)
+                .distinct()
+                .sorted()
+                .toList();
     }
 }
