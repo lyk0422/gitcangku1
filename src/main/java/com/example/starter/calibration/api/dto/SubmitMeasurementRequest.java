@@ -10,6 +10,7 @@ package com.example.starter.calibration.api.dto;
  * @param lowerLimit     合格下限（含端点），十进制字符串
  * @param upperLimit     合格上限（含端点），十进制字符串
  * @param submittedBy    提交人
+ * @param standardId     标准器版本业务键；提供时须存在当时有效的 VALID 版本，否则 422；缺省为 null 不绑定
  */
 public record SubmitMeasurementRequest(
         String measurementKey,
@@ -18,5 +19,6 @@ public record SubmitMeasurementRequest(
         String reading,
         String lowerLimit,
         String upperLimit,
-        String submittedBy) {
+        String submittedBy,
+        String standardId) {
 }
