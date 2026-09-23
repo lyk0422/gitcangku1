@@ -21,6 +21,13 @@ import com.example.starter.baggage.BaggageDtos.LegResponse;
 import com.example.starter.baggage.BaggageDtos.LoadRequest;
 import com.example.starter.baggage.BaggageDtos.LoadResponse;
 import com.example.starter.baggage.BaggageDtos.ManifestResponse;
+import com.example.starter.baggage.BaggageDtos.MisloadConfirmRequest;
+import com.example.starter.baggage.BaggageDtos.MisloadConfirmResponse;
+import com.example.starter.baggage.BaggageDtos.MisloadIncidentResponse;
+import com.example.starter.baggage.BaggageDtos.MisloadPreviewRequest;
+import com.example.starter.baggage.BaggageDtos.MisloadPreviewResponse;
+import com.example.starter.baggage.BaggageDtos.MisloadRegisterRequest;
+import com.example.starter.baggage.BaggageDtos.MisloadRegisterResponse;
 import com.example.starter.baggage.BaggageDtos.RecoverRequest;
 import com.example.starter.baggage.BaggageDtos.RecoverResponse;
 import com.example.starter.baggage.BaggageDtos.RegisterBagRequest;
@@ -37,9 +44,11 @@ import com.example.starter.baggage.BaggageDtos.ShortListResponse;
 public class BaggageController {
 
     private final BaggageService baggageService;
+    private final MisloadService misloadService;
 
-    public BaggageController(BaggageService baggageService) {
+    public BaggageController(BaggageService baggageService, MisloadService misloadService) {
         this.baggageService = baggageService;
+        this.misloadService = misloadService;
     }
 
     /** 登记航段。 */
@@ -107,5 +116,32 @@ public class BaggageController {
     @GetMapping("/bags/short-unloaded")
     public ShortListResponse listShortUnloaded() {
         return baggageService.listShortUnloaded();
+    }
+
+    /** 错装批次登记：2~50 件在同一实际航段到达但该航段不属于各自行程，整单原子。 */
+    @PostMapping("/misloads")
+    public ResponseEntity<MisloadRegisterResponse> registerMisload(
+            @Valid @RequestBody MisloadRegisterRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(misloadService.registerMisload(request));
+    }
+
+    /** 错装恢复路径预览：逐件提交 1~5 段路径并冻结版本/原剩余路径/恢复路径。 */
+    @PostMapping("/misloads/{incidentKey}/preview")
+    public MisloadPreviewResponse previewMisload(@PathVariable String incidentKey,
+                                                 @Valid @RequestBody MisloadPreviewRequest request) {
+        return misloadService.previewMisload(incidentKey, request);
+    }
+
+    /** 错装改派确认：重新校验全部状态与路径后原子关闭事件、替换剩余路径并推进代次。 */
+    @PostMapping("/misloads/{incidentKey}/confirm")
+    public MisloadConfirmResponse confirmMisload(@PathVariable String incidentKey,
+                                                 @Valid @RequestBody MisloadConfirmRequest request) {
+        return misloadService.confirmMisload(incidentKey, request);
+    }
+
+    /** 错装批次与逐件路径血缘查询，只读。 */
+    @GetMapping("/misloads/{incidentKey}")
+    public MisloadIncidentResponse getIncident(@PathVariable String incidentKey) {
+        return misloadService.getIncident(incidentKey);
     }
 }
