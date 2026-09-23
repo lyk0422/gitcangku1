@@ -5,7 +5,7 @@
 CREATE TABLE IF NOT EXISTS race (
     race_id VARCHAR(64) NOT NULL COMMENT '赛事ID，全局唯一',
     version INT NOT NULL COMMENT '版本号，从1开始，每次写操作加一',
-    status VARCHAR(16) NOT NULL COMMENT '赛事状态：OPEN-开放可写，SEALED-已封榜只读',
+    status VARCHAR(16) NOT NULL COMMENT '赛事状态：OPEN-开放可写，SUSPENDED-中止中（仅允许恢复），SEALED-已封榜只读',
     created_at BIGINT NOT NULL COMMENT '创建时间，Unix毫秒时间戳',
     CONSTRAINT pk_race PRIMARY KEY (race_id)
 );
@@ -51,7 +51,8 @@ CREATE TABLE IF NOT EXISTS result_snapshot_entry (
     status VARCHAR(24) NOT NULL COMMENT '成绩状态：RANKED-参与排名，UNTIMED-计时缺失，MISSING_CHECKPOINT-有完赛但未覆盖全部检查点，DISQUALIFIED-取消资格',
     finish_time_ms BIGINT COMMENT '原始完赛耗时（毫秒）；计时缺失为NULL',
     penalty_ms BIGINT NOT NULL COMMENT '生效（未撤销）加时处罚合计毫秒数，无加时为0',
-    total_time_ms BIGINT COMMENT '总耗时=原始完赛耗时+生效加时（毫秒）；未排名时为NULL',
+    total_time_ms BIGINT COMMENT '总耗时=净完赛耗时+生效加时（毫秒），排名依据；未排名时为NULL',
+    net_finish_time_ms BIGINT COMMENT '净完赛耗时（毫秒）=原始完赛耗时扣除受影响中止时长；计时缺失为NULL',
     checkpoint_count INT NOT NULL DEFAULT 0 COMMENT '赛事检查点总数；未配置检查点为0',
     covered_checkpoint_count INT NOT NULL DEFAULT 0 COMMENT '封榜时该选手已覆盖检查点数量；缺失检查点由result_snapshot_checkpoint中elapsed_millis为NULL的行固化',
     display_order INT NOT NULL COMMENT '展示顺序，从0开始：先名次顺序，并列者按参赛号字典序，其余按参赛号字典序',
@@ -89,15 +90,42 @@ CREATE TABLE IF NOT EXISTS result_snapshot_checkpoint (
     bib VARCHAR(64) NOT NULL COMMENT '参赛号',
     checkpoint_code VARCHAR(64) NOT NULL COMMENT '检查点代码',
     position INT NOT NULL COMMENT '检查点顺序，从1递增',
-    elapsed_millis BIGINT COMMENT '封榜时该选手通过该检查点的累计耗时（毫秒）；缺失检查点为NULL',
+    elapsed_millis BIGINT COMMENT '封榜时该选手通过该检查点的原始累计耗时（毫秒）；缺失检查点为NULL',
+    net_elapsed_millis BIGINT COMMENT '封榜时该检查点净耗时（毫秒）=原始耗时扣除受影响中止时长；缺失检查点为NULL',
     timing_id VARCHAR(128) COMMENT '分段记录ID；缺失检查点为NULL',
     CONSTRAINT pk_snapshot_checkpoint PRIMARY KEY (race_id, bib, checkpoint_code),
     CONSTRAINT fk_snapshot_checkpoint_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
 );
 
+CREATE TABLE IF NOT EXISTS race_event (
+    event_key VARCHAR(64) NOT NULL COMMENT '中止事件ID，全局唯一',
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    checkpoint_key VARCHAR(64) NOT NULL COMMENT '受影响起始检查点代码：中止开始前已通过该检查点的选手补偿0',
+    checkpoint_position INT NOT NULL COMMENT '受影响起始检查点顺序（登记时固化），用于受影响判定',
+    start_elapsed_ms BIGINT NOT NULL COMMENT '中止开始累计耗时点（毫秒，1~86400000），须不小于此前全部恢复点',
+    resume_elapsed_ms BIGINT COMMENT '恢复累计耗时点（毫秒），必须大于start_elapsed_ms；未恢复为NULL',
+    status VARCHAR(16) NOT NULL COMMENT '事件状态：SUSPENDED-中止中（未恢复），RESUMED-已恢复',
+    created_at BIGINT NOT NULL COMMENT '中止登记时间，Unix毫秒时间戳',
+    resumed_at BIGINT COMMENT '恢复登记时间，Unix毫秒时间戳；未恢复为NULL',
+    CONSTRAINT pk_race_event PRIMARY KEY (event_key),
+    CONSTRAINT fk_race_event_race FOREIGN KEY (race_id) REFERENCES race (race_id),
+    INDEX idx_race_event_race (race_id)
+);
+
+CREATE TABLE IF NOT EXISTS result_snapshot_event (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属快照的赛事ID',
+    event_key VARCHAR(64) NOT NULL COMMENT '中止事件ID',
+    checkpoint_key VARCHAR(64) NOT NULL COMMENT '受影响起始检查点代码',
+    start_elapsed_ms BIGINT NOT NULL COMMENT '中止开始累计耗时点（毫秒）',
+    resume_elapsed_ms BIGINT NOT NULL COMMENT '恢复累计耗时点（毫秒）；封榜时只允许已恢复事件，故非空',
+    event_order INT NOT NULL COMMENT '事件顺序，从0开始，按中止开始点升序',
+    CONSTRAINT pk_snapshot_event PRIMARY KEY (race_id, event_key),
+    CONSTRAINT fk_snapshot_event_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
+);
+
 CREATE TABLE IF NOT EXISTS idempotency_record (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求ID（写操作幂等键）',
-    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE',
+    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE/SUSPEND_RACE/RESUME_RACE',
     request_digest CHAR(64) NOT NULL COMMENT '请求参数（requestId除外，含expectedVersion）规范化JSON的SHA-256摘要',
     response_status INT NOT NULL COMMENT '原成功请求的HTTP状态码，重放时原样返回',
     response_body TEXT COMMENT '原成功响应体JSON，重放时原样返回',

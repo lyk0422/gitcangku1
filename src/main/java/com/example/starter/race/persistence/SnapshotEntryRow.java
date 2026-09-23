@@ -13,7 +13,8 @@ import java.util.List;
  * @param status                    成绩状态
  * @param finishTimeMs              原始完赛耗时（毫秒）；计时缺失为 null
  * @param penaltyMs                 生效加时合计毫秒数
- * @param totalTimeMs               总耗时毫秒数；未排名为 null
+ * @param totalTimeMs               总耗时=净完赛耗时+生效加时（毫秒），排名依据；未排名为 null
+ * @param netFinishTimeMs           净完赛耗时（毫秒）=原始完赛耗时扣除受影响中止时长；计时缺失为 null
  * @param displayOrder              展示顺序，从0开始
  * @param checkpointCount           赛事检查点总数；未配置检查点为 0
  * @param coveredCheckpointCount    该选手已覆盖检查点数量
@@ -27,13 +28,31 @@ public record SnapshotEntryRow(
         Long finishTimeMs,
         long penaltyMs,
         Long totalTimeMs,
+        Long netFinishTimeMs,
         int displayOrder,
         int checkpointCount,
         int coveredCheckpointCount,
         List<String> missingCheckpoints
 ) {
 
-    /** 兼容旧调用的构造器：检查点计数为 0、缺失列表为空。 */
+    /** 无中止事件赛事的兼容构造器：净完赛耗时等于原始完赛耗时。 */
+    public SnapshotEntryRow(
+            String raceId,
+            String bib,
+            Integer rank,
+            EntryStatus status,
+            Long finishTimeMs,
+            long penaltyMs,
+            Long totalTimeMs,
+            int displayOrder,
+            int checkpointCount,
+            int coveredCheckpointCount,
+            List<String> missingCheckpoints) {
+        this(raceId, bib, rank, status, finishTimeMs, penaltyMs, totalTimeMs, finishTimeMs,
+                displayOrder, checkpointCount, coveredCheckpointCount, missingCheckpoints);
+    }
+
+    /** 兼容旧调用的构造器：检查点计数为 0、缺失列表为空、净值等于原始值。 */
     public SnapshotEntryRow(
             String raceId,
             String bib,
@@ -43,7 +62,7 @@ public record SnapshotEntryRow(
             long penaltyMs,
             Long totalTimeMs,
             int displayOrder) {
-        this(raceId, bib, rank, status, finishTimeMs, penaltyMs, totalTimeMs, displayOrder,
-                0, 0, List.of());
+        this(raceId, bib, rank, status, finishTimeMs, penaltyMs, totalTimeMs, finishTimeMs,
+                displayOrder, 0, 0, List.of());
     }
 }

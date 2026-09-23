@@ -12,8 +12,9 @@ import java.util.List;
  * @param rank                   名次（并列同名次并跳号）；非 RANKED 为 null
  * @param status                RANKED / UNTIMED / MISSING_CHECKPOINT / DISQUALIFIED
  * @param finishTimeMs          原始完赛耗时毫秒；计时缺失为 null
+ * @param netFinishTimeMs       净完赛耗时毫秒=原始完赛耗时扣除受影响中止时长；计时缺失为 null
  * @param penaltyMs             生效加时合计毫秒数
- * @param totalTimeMs           总耗时毫秒；未排名为 null
+ * @param totalTimeMs           总耗时毫秒=净完赛耗时+生效加时，排名依据；未排名为 null
  * @param checkpointCount       赛事检查点总数；未配置检查点为 0
  * @param coveredCheckpointCount 该选手已覆盖检查点数量
  * @param missingCheckpoints    缺失检查点代码，按检查点顺序排列；无缺失为空列表
@@ -24,10 +25,26 @@ public record ResultEntryResponse(
         Integer rank,
         EntryStatus status,
         Long finishTimeMs,
+        Long netFinishTimeMs,
         long penaltyMs,
         Long totalTimeMs,
         int checkpointCount,
         int coveredCheckpointCount,
         List<String> missingCheckpoints
 ) {
+
+    /** 无中止事件场景的兼容构造器：净完赛耗时等于原始完赛耗时。 */
+    public ResultEntryResponse(
+            String bib,
+            Integer rank,
+            EntryStatus status,
+            Long finishTimeMs,
+            long penaltyMs,
+            Long totalTimeMs,
+            int checkpointCount,
+            int coveredCheckpointCount,
+            List<String> missingCheckpoints) {
+        this(bib, rank, status, finishTimeMs, finishTimeMs, penaltyMs, totalTimeMs,
+                checkpointCount, coveredCheckpointCount, missingCheckpoints);
+    }
 }
