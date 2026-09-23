@@ -1,6 +1,6 @@
 spring:
   datasource:
-    url: jdbc:h2:mem:consent-test;MODE=MySQL;DB_CLOSE_DELAY=-1
+    url: jdbc:h2:mem:consent-test;MODE=MySQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=20000
     driver-class-name: org.h2.Driver
     username: sa
     password: ""

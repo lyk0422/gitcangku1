@@ -25,8 +25,8 @@ CREATE TABLE IF NOT EXISTS consent_record (
 -- 幂等请求表：成功结果与业务变更同事务保存，失败请求不占用 requestId
 CREATE TABLE IF NOT EXISTS idempotency_request (
     request_id VARCHAR(128) NOT NULL COMMENT '幂等请求标识',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：GRANT 授权 / WRITE 写入 / REVOKE 撤回',
-    params_fingerprint VARCHAR(512) NOT NULL COMMENT '规范化参数指纹，用于检测同 requestId 参数变更',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：GRANT 授权 / WRITE 写入 / REVOKE 撤回 / BATCH_QUERY 批量查询',
+    params_fingerprint TEXT NOT NULL COMMENT '规范化参数指纹，用于检测同 requestId 参数变更；批量查询含最多 50 项，长度可能超过 512',
     response_body TEXT NOT NULL COMMENT '成功响应快照（JSON）',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间（服务器时区 Asia/Shanghai）',
     PRIMARY KEY (request_id)

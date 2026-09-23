@@ -71,6 +71,31 @@ public class ConsentRepository {
         return rows.stream().findFirst();
     }
 
+    /**
+     * 读取指定主体＋用途的最新代次并对该行加排他行锁（FOR UPDATE）。
+     *
+     * <p>用于批量查询与撤回的提交顺序裁决：锁定后，并发撤回必须等待本事务提交；
+     * 反之撤回先提交时本查询会等到已撤回状态，从而按实际提交顺序给出结果。
+     */
+    Optional<GrantRow> findLatestGrantForUpdate(String subjectKey, Purpose purpose) {
+        List<GrantRow> rows = jdbc.query(
+                "SELECT subject_key, purpose, epoch, status FROM consent_grant"
+                        + " WHERE subject_key = ? AND purpose = ? ORDER BY epoch DESC LIMIT 1 FOR UPDATE",
+                GRANT_MAPPER, subjectKey, purpose.name());
+        return rows.stream().findFirst();
+    }
+
+    /**
+     * 读取指定代次并对该行加排他行锁，用于重放时重新核对授权状态。
+     */
+    Optional<GrantRow> findGrantForUpdate(String subjectKey, Purpose purpose, int epoch) {
+        List<GrantRow> rows = jdbc.query(
+                "SELECT subject_key, purpose, epoch, status FROM consent_grant"
+                        + " WHERE subject_key = ? AND purpose = ? AND epoch = ? FOR UPDATE",
+                GRANT_MAPPER, subjectKey, purpose.name(), epoch);
+        return rows.stream().findFirst();
+    }
+
     void insertGrant(String subjectKey, Purpose purpose, int epoch, String requestId) {
         jdbc.update(
                 "INSERT INTO consent_grant (subject_key, purpose, epoch, status, request_id)"

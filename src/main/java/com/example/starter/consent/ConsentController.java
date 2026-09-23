@@ -8,6 +8,8 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import com.example.starter.consent.dto.BatchQueryRequest;
+import com.example.starter.consent.dto.BatchQueryResponse;
 import com.example.starter.consent.dto.GrantRequest;
 import com.example.starter.consent.dto.GrantResponse;
 import com.example.starter.consent.dto.RecordResponse;
@@ -51,5 +53,10 @@ public class ConsentController {
                                @RequestParam Purpose purpose,
                                @RequestParam @NotBlank String recordKey) {
         return consentService.read(subjectKey, purpose, recordKey);
+    }
+
+    @PostMapping("/records/batch-query")
+    public BatchQueryResponse batchQuery(@Valid @RequestBody BatchQueryRequest request) {
+        return consentService.batchQuery(request);
     }
 }

@@ -3,6 +3,8 @@ package com.example.starter.consent;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
+
+import com.example.starter.consent.dto.BatchFailureResponse;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -21,6 +23,12 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorResponse> handleApi(ApiException ex) {
         return ResponseEntity.status(ex.getStatus())
                 .body(new ErrorResponse(ex.getCode(), ex.getMessage()));
+    }
+
+    @ExceptionHandler(BatchQueryException.class)
+    public ResponseEntity<BatchFailureResponse> handleBatchQuery(BatchQueryException ex) {
+        return ResponseEntity.status(ex.getStatus())
+                .body(new BatchFailureResponse(ex.getFailures()));
     }
 
     @ExceptionHandler({
