@@ -73,24 +73,33 @@ CREATE TABLE IF NOT EXISTS unblind_request (
     created_at              BIGINT       NOT NULL,
     reviewed_at             BIGINT,
     pending_allocation_id   BIGINT,
+    expires_at              BIGINT,
+    handler_actor           VARCHAR(64),
+    terminated_at           BIGINT,
+    terminal_reason         VARCHAR(500),
     CONSTRAINT pk_unblind_request PRIMARY KEY (id),
     CONSTRAINT uq_unblind_pending UNIQUE (pending_allocation_id),
-    CONSTRAINT ck_unblind_status CHECK (status IN ('PENDING', 'APPROVED')),
+    CONSTRAINT ck_unblind_status CHECK (status IN
+        ('PENDING', 'APPROVED', 'CANCELLED', 'REJECTED', 'EXPIRED')),
     CONSTRAINT ck_unblind_treatment CHECK (treatment IS NULL OR treatment IN ('A', 'B'))
 );
-COMMENT ON TABLE  unblind_request IS '揭盲申请表；同一分配至多一个待审申请，须由另一名 REVIEWER 批准后申请人方可查看结果';
-COMMENT ON COLUMN unblind_request.id IS '揭盲申请编号，全局唯一';
+COMMENT ON TABLE  unblind_request IS '揭盲申请表；同一分配至多一个有效待审申请，须由另一名 REVIEWER 批准；可撤销/拒绝/到期终止，终态不可互转';
+COMMENT ON COLUMN unblind_request.id IS '揭盲申请编号，全局唯一；重新申请生成新编号，旧记录历史不可覆盖';
 COMMENT ON COLUMN unblind_request.experiment_id IS '所属实验编号';
 COMMENT ON COLUMN unblind_request.participant_id IS '被申请揭盲的合成参与者编号';
 COMMENT ON COLUMN unblind_request.allocation_id IS '对应分配主键';
 COMMENT ON COLUMN unblind_request.reason IS '揭盲原因，必填，非空';
-COMMENT ON COLUMN unblind_request.applicant_actor IS '申请人操作者编号，须为 COORDINATOR，且只有其本人能查询揭盲结果';
-COMMENT ON COLUMN unblind_request.reviewer_actor IS '批准的 REVIEWER 操作者编号，必须不同于申请人；未批准时为 NULL';
-COMMENT ON COLUMN unblind_request.status IS '申请状态：PENDING=待审；APPROVED=已批准';
-COMMENT ON COLUMN unblind_request.treatment IS '揭盲结果处理代码 A/B，批准时写入；NULL=尚未批准';
+COMMENT ON COLUMN unblind_request.applicant_actor IS '申请人操作者编号，须为 COORDINATOR，且只有其本人能查询揭盲结果或撤销申请';
+COMMENT ON COLUMN unblind_request.reviewer_actor IS '批准的 REVIEWER 操作者编号，必须不同于申请人；拒绝/撤销/到期时为 NULL';
+COMMENT ON COLUMN unblind_request.status IS '申请状态：PENDING=待审；APPROVED=已批准；CANCELLED=申请人撤销；REJECTED=审阅员拒绝；EXPIRED=到期（普通查询仅按时钟展示不落库，重新申请时同事务归档落库）';
+COMMENT ON COLUMN unblind_request.treatment IS '揭盲结果处理代码 A/B，仅批准时写入；NULL=未批准（拒绝/撤销/到期永不写入盲底）';
 COMMENT ON COLUMN unblind_request.created_at IS '申请时间，Unix 毫秒，UTC';
 COMMENT ON COLUMN unblind_request.reviewed_at IS '批准时间，Unix 毫秒，UTC；NULL 表示未批准';
-COMMENT ON COLUMN unblind_request.pending_allocation_id IS '待审去重列：待审时等于 allocation_id，终态置 NULL；唯一索引保证同一分配至多一个待审申请';
+COMMENT ON COLUMN unblind_request.pending_allocation_id IS '有效待审去重列：待审且未过期时等于 allocation_id，任意终态置 NULL；唯一索引保证同一分配至多一个有效待审申请';
+COMMENT ON COLUMN unblind_request.expires_at IS '到期时刻，Unix 毫秒，UTC，= created_at + validMinutes*60000；NULL 为历史 PENDING 数据，按 created_at + 30 分钟计算；已批准结果不追溯设限';
+COMMENT ON COLUMN unblind_request.handler_actor IS '终态处理人：批准/拒绝为对应 REVIEWER，撤销为申请人本人，到期归档为 NULL（不伪造人工处理人）；PENDING 时为 NULL';
+COMMENT ON COLUMN unblind_request.terminated_at IS '终态形成时间，Unix 毫秒，UTC：批准/拒绝/撤销为事务时钟当前时刻；到期固定为 expires_at；PENDING 时为 NULL';
+COMMENT ON COLUMN unblind_request.terminal_reason IS '终态原因：拒绝为必填的非空拒绝原因，撤销为“申请人主动撤销”，到期为“申请已过期”，批准/PENDING 为 NULL';
 
 CREATE TABLE IF NOT EXISTS idempotent_request (
     request_id      VARCHAR(64)  NOT NULL,
