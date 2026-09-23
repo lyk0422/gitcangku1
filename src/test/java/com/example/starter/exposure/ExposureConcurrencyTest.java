@@ -85,8 +85,10 @@ class ExposureConcurrencyTest {
     void clean() {
         jdbc.update("DELETE FROM idempotency_record");
         jdbc.update("DELETE FROM exposure_reservation");
+        jdbc.update("DELETE FROM quota_placement_ledger");
         jdbc.update("DELETE FROM quota_visitor_ledger");
         jdbc.update("DELETE FROM quota_total_ledger");
+        jdbc.update("DELETE FROM placement");
         jdbc.update("DELETE FROM campaign");
     }
 

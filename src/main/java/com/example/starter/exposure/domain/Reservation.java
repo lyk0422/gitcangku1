@@ -2,10 +2,11 @@ package com.example.starter.exposure.domain;
 
 /**
  * 曝光预占单 PO。额度所属日（{@link #utcDate}）固定为申请时刻的 UTC 日期，
- * 确认跨日也不迁移计数。
+ * 展示位（{@link #placementCode}）固定为申请时提交的展示位，确认跨日也不迁移计数或换位。
  *
  * @param reservationId 预占单编号
  * @param campaignId    所属公告编号
+ * @param placementCode 申请的展示位编号（旧申请接口等价于 DEFAULT）
  * @param visitorId     合成访客编号
  * @param utcDate       额度所属 UTC 日（java.time.LocalDate 对应的 java.sql.Date）
  * @param status        预占状态
@@ -16,6 +17,7 @@ package com.example.starter.exposure.domain;
 public record Reservation(
         String reservationId,
         String campaignId,
+        String placementCode,
         String visitorId,
         java.sql.Date utcDate,
         ReservationStatus status,

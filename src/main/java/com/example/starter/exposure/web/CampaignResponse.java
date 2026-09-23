@@ -7,13 +7,15 @@ import com.example.starter.exposure.domain.Campaign;
  *
  * @param campaignId          公告编号
  * @param dailyTotalCap       每 UTC 日总额度，单位次
- * @param perVisitorDailyCap  每访客每 UTC 日上限，单位次
+ * @param perVisitorDailyCap  每访客每 UTC 日上限（跨全部展示位共享），单位次
+ * @param configVersion       公告当前递增配置版本：创建时为 1，每新增一个展示位 +1
  * @param createdAtUtc        创建时刻，epoch 毫秒，UTC
  */
 public record CampaignResponse(
         String campaignId,
         int dailyTotalCap,
         int perVisitorDailyCap,
+        int configVersion,
         long createdAtUtc
 ) {
     public static CampaignResponse from(Campaign campaign) {
@@ -21,6 +23,7 @@ public record CampaignResponse(
                 campaign.campaignId(),
                 campaign.dailyTotalCap(),
                 campaign.perVisitorDailyCap(),
+                campaign.configVersion(),
                 campaign.createdAtUtc());
     }
 }

@@ -10,6 +10,7 @@ import java.time.LocalDate;
  *
  * @param reservationId 预占单编号
  * @param campaignId    所属公告编号
+ * @param placementCode 申请的展示位编号（旧申请接口为 DEFAULT）
  * @param visitorId     合成访客编号
  * @param utcDate       额度所属 UTC 日，格式 yyyy-MM-dd；固定为申请时的 UTC 日期
  * @param status        预占状态
@@ -20,6 +21,7 @@ import java.time.LocalDate;
 public record ReservationResponse(
         String reservationId,
         String campaignId,
+        String placementCode,
         String visitorId,
         LocalDate utcDate,
         ReservationStatus status,
@@ -31,6 +33,7 @@ public record ReservationResponse(
         return new ReservationResponse(
                 r.reservationId(),
                 r.campaignId(),
+                r.placementCode(),
                 r.visitorId(),
                 r.utcDate().toLocalDate(),
                 r.status(),

@@ -14,9 +14,11 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.time.LocalDate;
+import java.util.List;
 
 /**
- * 公告曝光频控 API。
+ * 公告曝光频控 API。支持公告、展示位与三层额度（公告当日总额度、
+ * 访客跨展示位每日共享上限、展示位每日额度）。
  */
 @RestController
 @RequestMapping("/api/exposure")
@@ -28,16 +30,40 @@ public class ExposureController {
         this.exposureService = exposureService;
     }
 
-    /** 创建公告（额度创建时固定）。 */
+    /** 创建公告（额度创建时固定），同时自动建立日额度等于公告总额度的 DEFAULT 展示位。 */
     @PostMapping("/campaigns")
     public ResponseEntity<CampaignResponse> createCampaign(@Valid @RequestBody CreateCampaignRequest request) {
         return ResponseEntity.status(HttpStatus.CREATED).body(exposureService.createCampaign(request));
     }
 
-    /** 申请曝光：创建 60 秒有效预占并占用两级额度。 */
+    /** 展示位列表（DEFAULT 在前）。 */
+    @GetMapping("/campaigns/{campaignId}/placements")
+    public List<PlacementResponse> listPlacements(@PathVariable String campaignId) {
+        return exposureService.listPlacements(campaignId);
+    }
+
+    /**
+     * 新增展示位：最多 20 个唯一 code，日额度 1～100000 且不得超过公告总额度，
+     * 创建后不可修改或删除；携带 expectedConfigVersion 与全局 requestId。
+     */
+    @PostMapping("/campaigns/{campaignId}/placements")
+    public ResponseEntity<PlacementResponse> createPlacement(@PathVariable String campaignId,
+                                                             @Valid @RequestBody CreatePlacementRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(exposureService.createPlacement(campaignId, request));
+    }
+
+    /** 申请曝光（旧接口）：等价于申请 DEFAULT 展示位，创建 60 秒有效预占并占用三层额度。 */
     @PostMapping("/reservations")
     public ResponseEntity<ReservationResponse> apply(@Valid @RequestBody ApplyExposureRequest request) {
         return ResponseEntity.status(HttpStatus.CREATED).body(exposureService.apply(request));
+    }
+
+    /** 按展示位申请曝光：同一事务同时取得三层额度，任一已满返回 429 且三层均不增加。 */
+    @PostMapping("/placement-reservations")
+    public ResponseEntity<ReservationResponse> applyPlacement(
+            @Valid @RequestBody ApplyPlacementExposureRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(exposureService.applyPlacement(request));
     }
 
     /** 预占明细。 */
@@ -53,7 +79,7 @@ public class ExposureController {
         return exposureService.confirm(reservationId, request);
     }
 
-    /** 取消预占：仅 RESERVED 可取消并释放两级额度。 */
+    /** 取消预占：仅 RESERVED 可取消并释放三层额度。 */
     @PostMapping("/reservations/{reservationId}/cancel")
     public ReservationResponse cancel(@PathVariable String reservationId,
                                       @Valid @RequestBody ReservationActionRequest request) {
@@ -61,14 +87,16 @@ public class ExposureController {
     }
 
     /**
-     * 按公告/访客/UTC 日查询额度；visitorId 缺省仅返回公告当日总额度。
+     * 按公告/访客/展示位/UTC 日查询三层额度；visitorId 缺省仅返回公告当日总额度；
+     * placementCode 缺省不返回展示位层（旧查询响应保持兼容），但仍可返回访客各展示位预占明细。
      * utcDate 缺省使用服务端当前 UTC 日。
      */
     @GetMapping("/campaigns/{campaignId}/quota")
     public QuotaResponse queryQuota(@PathVariable String campaignId,
                                     @RequestParam(required = false) String visitorId,
+                                    @RequestParam(required = false) String placementCode,
                                     @RequestParam(required = false)
                                     @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate utcDate) {
-        return exposureService.queryQuota(campaignId, visitorId, utcDate);
+        return exposureService.queryQuota(campaignId, visitorId, placementCode, utcDate);
     }
 }
