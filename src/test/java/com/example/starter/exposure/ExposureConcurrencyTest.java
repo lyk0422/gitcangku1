@@ -85,8 +85,10 @@ class ExposureConcurrencyTest {
     void clean() {
         jdbc.update("DELETE FROM idempotency_record");
         jdbc.update("DELETE FROM exposure_reservation");
+        jdbc.update("DELETE FROM quota_placement_ledger");
         jdbc.update("DELETE FROM quota_visitor_ledger");
         jdbc.update("DELETE FROM quota_total_ledger");
+        jdbc.update("DELETE FROM campaign_placement");
         jdbc.update("DELETE FROM campaign");
     }
 
@@ -136,7 +138,7 @@ class ExposureConcurrencyTest {
         assertEquals(threads - totalCap, rejected.get(), "其余请求必须为 429");
         assertEquals(totalCap, reservationIds.size(), "预占单编号必须唯一");
 
-        QuotaResponse quota = service.queryQuota("cap", null, DAY);
+        QuotaResponse quota = service.queryQuota("cap", null, null, DAY);
         assertEquals(totalCap, quota.usedTotal());
         assertEquals(0, quota.remainingTotal());
     }
@@ -238,6 +240,6 @@ class ExposureConcurrencyTest {
 
         assertEquals(0, errors.get(), "并发同键重放不应报错");
         assertEquals(1, reservationIds.size(), "业务只执行一次");
-        assertEquals(1, service.queryQuota("cap", "visitor-x", DAY).usedVisitor());
+        assertEquals(1, service.queryQuota("cap", "visitor-x", null, DAY).usedVisitor());
     }
 }
