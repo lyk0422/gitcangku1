@@ -168,6 +168,52 @@ public final class Dtos {
             OffsetDateTime createdAt) {
     }
 
+    /** 登记播出决定请求：将该频道该时刻的一次决策固化为不可变记录。 */
+    public record RegisterPlayoutDecisionRequest(
+            @NotBlank String requestId,
+            @NotBlank String playKey,
+            @NotBlank String channelId,
+            @NotNull OffsetDateTime at) {
+    }
+
+    /** 回执结果：PLAYED 已播出 / FAILED 播出失败。 */
+    public enum ReceiptResult {
+        PLAYED, FAILED
+    }
+
+    /** 回执状态：无回执时 PENDING，首次回执后固化为 PLAYED / FAILED。 */
+    public enum ReceiptStatus {
+        PENDING, PLAYED, FAILED
+    }
+
+    /** 提交播出回执请求；result 仅接受 PLAYED / FAILED，note 为非空说明。 */
+    public record SubmitReceiptRequest(
+            @NotBlank String requestId,
+            @NotBlank String result,
+            @NotBlank String note) {
+    }
+
+    /**
+     * 播出决定固化记录响应。receiptStatus 为 PENDING 时 receiptNote 与 receiptReportedAt 为 null；
+     * receiptReportedAt 为回执时刻（UTC 纪元毫秒换算，Asia/Shanghai 毫秒精度表示）。
+     */
+    public record PlayoutDecisionRecordResponse(
+            String playKey,
+            String channelId,
+            OffsetDateTime at,
+            String assetId,
+            DecisionSource source,
+            FallbackReason reason,
+            String overrideKey,
+            Long publicationId,
+            String segmentId,
+            Long grantId,
+            ReceiptStatus receiptStatus,
+            String receiptNote,
+            OffsetDateTime receiptReportedAt,
+            OffsetDateTime createdAt) {
+    }
+
     /** 统一错误响应体。 */
     public record ErrorResponse(String error, String message) {
     }

@@ -381,4 +381,88 @@ public class PlayoutRepository {
                         + " WHERE override_key = ? AND status = 'ACTIVE'",
                 cancelRequestId, cancelledAtMs, overrideKey);
     }
+
+    // ---------- 播出决定固化 ----------
+
+    /** 播出决定固化记录行；登记后不可变，grantId 为 NULL 表示保底无授权。 */
+    public record DecisionRow(String playKey, String channelId, long atMs, LocalDate businessDay,
+                              String assetId, String source, String reason, String overrideKey,
+                              Long publicationId, String segmentId, Long grantId,
+                              String requestId, long createdAtMs) {
+    }
+
+    /** 播出回执行；每个决定至多一份，首次提交后不可变。 */
+    public record ReceiptRow(String playKey, String result, String note,
+                             String requestId, long reportedAtMs) {
+    }
+
+    private static final RowMapper<DecisionRow> DECISION_MAPPER = (rs, n) ->
+            new DecisionRow(rs.getString("play_key"), rs.getString("channel_id"),
+                    rs.getLong("at_ms"), rs.getDate("business_day").toLocalDate(),
+                    rs.getString("asset_id"), rs.getString("source"), rs.getString("reason"),
+                    rs.getString("override_key"), (Long) rs.getObject("publication_id"),
+                    rs.getString("segment_id"), (Long) rs.getObject("grant_id"),
+                    rs.getString("request_id"), rs.getLong("created_at_ms"));
+
+    private static final RowMapper<ReceiptRow> RECEIPT_MAPPER = (rs, n) ->
+            new ReceiptRow(rs.getString("play_key"), rs.getString("result"), rs.getString("note"),
+                    rs.getString("request_id"), rs.getLong("reported_at_ms"));
+
+    private static final String DECISION_COLUMNS = "play_key, channel_id, at_ms, business_day,"
+            + " asset_id, source, reason, override_key, publication_id, segment_id, grant_id,"
+            + " request_id, created_at_ms";
+
+    public void insertDecision(DecisionRow row) {
+        jdbc.update("INSERT INTO playout_decision (" + DECISION_COLUMNS + ")"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                row.playKey(), row.channelId(), row.atMs(), Date.valueOf(row.businessDay()),
+                row.assetId(), row.source(), row.reason(), row.overrideKey(),
+                row.publicationId(), row.segmentId(), row.grantId(),
+                row.requestId(), row.createdAtMs());
+    }
+
+    public Optional<DecisionRow> findDecision(String playKey) {
+        return jdbc.query("SELECT " + DECISION_COLUMNS + " FROM playout_decision WHERE play_key = ?",
+                DECISION_MAPPER, playKey).stream().findFirst();
+    }
+
+    /** 按全局键查询并加行锁，用于登记去重与回执串行化。 */
+    public Optional<DecisionRow> findDecisionForUpdate(String playKey) {
+        return jdbc.query("SELECT " + DECISION_COLUMNS + " FROM playout_decision"
+                        + " WHERE play_key = ? FOR UPDATE",
+                DECISION_MAPPER, playKey).stream().findFirst();
+    }
+
+    /** 按频道与业务日查询固化决定，按播出时刻、playKey 排序。 */
+    public List<DecisionRow> findDecisionsByChannelAndDay(String channelId, LocalDate businessDay) {
+        return jdbc.query("SELECT " + DECISION_COLUMNS + " FROM playout_decision"
+                        + " WHERE channel_id = ? AND business_day = ?"
+                        + " ORDER BY at_ms, play_key",
+                DECISION_MAPPER, channelId, Date.valueOf(businessDay));
+    }
+
+    // ---------- 播出回执 ----------
+
+    public void insertReceipt(ReceiptRow row) {
+        jdbc.update("INSERT INTO playout_receipt (play_key, result, note, request_id, reported_at_ms)"
+                        + " VALUES (?, ?, ?, ?, ?)",
+                row.playKey(), row.result(), row.note(), row.requestId(), row.reportedAtMs());
+    }
+
+    public Optional<ReceiptRow> findReceipt(String playKey) {
+        return jdbc.query("SELECT play_key, result, note, request_id, reported_at_ms"
+                        + " FROM playout_receipt WHERE play_key = ?",
+                RECEIPT_MAPPER, playKey).stream().findFirst();
+    }
+
+    /** 命中某时刻的 ACTIVE 插播并加行锁（FOR UPDATE），用于登记时与取消按提交顺序串行化。 */
+    public List<OverrideRow> findActiveOverridesAtForUpdate(String channelId, long atMs) {
+        return jdbc.query("SELECT override_key, channel_id, asset_id, grant_id, priority, start_ms,"
+                        + " end_ms, business_day, status, cancel_request_id, cancelled_at_ms, created_at_ms"
+                        + " FROM playout_emergency_override"
+                        + " WHERE channel_id = ? AND status = 'ACTIVE'"
+                        + " AND start_ms <= ? AND end_ms > ?"
+                        + " ORDER BY priority DESC, start_ms ASC, override_key ASC FOR UPDATE",
+                OVERRIDE_MAPPER, channelId, atMs, atMs);
+    }
 }

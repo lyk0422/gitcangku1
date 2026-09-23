@@ -97,3 +97,30 @@ CREATE TABLE IF NOT EXISTS playout_emergency_override (
     PRIMARY KEY (override_key),
     KEY idx_override_playout (channel_id, status, start_ms, end_ms, priority)
 ) COMMENT = '限时紧急插播表；不改写日草稿与发布快照，同频道同优先级 ACTIVE 区间不得重叠';
+
+CREATE TABLE IF NOT EXISTS playout_decision (
+    play_key       VARCHAR(64) NOT NULL COMMENT '播出决定全局唯一键，客户端指定，登记后不变',
+    channel_id     VARCHAR(64) NOT NULL COMMENT '频道 ID',
+    at_ms          BIGINT      NOT NULL COMMENT '业务播出时刻，UTC 纪元毫秒',
+    business_day   DATE        NOT NULL COMMENT '播出时刻所在业务日，Asia/Shanghai 日历日',
+    asset_id       VARCHAR(64) NOT NULL COMMENT '决定播出的素材 ID',
+    source         VARCHAR(16) NOT NULL COMMENT '决定来源：EMERGENCY 命中插播 / PROGRAM 命中节目 / FALLBACK 保底',
+    reason         VARCHAR(32) NULL COMMENT '保底原因：NO_PUBLISHED_SCHEDULE / GAP / GRANT_REVOKED；非保底为 NULL',
+    override_key   VARCHAR(64) NULL COMMENT '命中的紧急插播键；source 为 EMERGENCY 时非空，否则为 NULL',
+    publication_id BIGINT      NULL COMMENT '命中的节目发布快照 ID；PROGRAM 及 GRANT_REVOKED 保底时非空，否则为 NULL',
+    segment_id     VARCHAR(64) NULL COMMENT '命中的发布快照片段 ID；PROGRAM 及 GRANT_REVOKED 保底时非空，否则为 NULL',
+    grant_id       BIGINT      NULL COMMENT '实际采用的授权 ID；保底无授权时为 NULL',
+    request_id     VARCHAR(64) NOT NULL COMMENT '登记操作的幂等请求 ID',
+    created_at_ms  BIGINT      NOT NULL COMMENT '登记时间，UTC 纪元毫秒',
+    PRIMARY KEY (play_key),
+    KEY idx_decision_channel_day (channel_id, business_day, at_ms)
+) COMMENT = '播出决定固化表，登记后不可变；同 playKey 同频道同时刻重登返回原决定';
+
+CREATE TABLE IF NOT EXISTS playout_receipt (
+    play_key       VARCHAR(64)  NOT NULL COMMENT '所属播出决定键，每个决定至多一份回执',
+    result         VARCHAR(16)  NOT NULL COMMENT '回执结果：PLAYED 已播出 / FAILED 播出失败',
+    note           VARCHAR(512) NOT NULL COMMENT '回执说明，非空',
+    request_id     VARCHAR(64)  NOT NULL COMMENT '回执操作的幂等请求 ID',
+    reported_at_ms BIGINT       NOT NULL COMMENT '回执时刻，UTC 纪元毫秒',
+    PRIMARY KEY (play_key)
+) COMMENT = '播出回执表，首次提交后不可变；仅记录回执，不触发重播或状态变更';

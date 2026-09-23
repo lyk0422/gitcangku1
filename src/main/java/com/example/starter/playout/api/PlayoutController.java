@@ -11,11 +11,14 @@ import com.example.starter.playout.api.Dtos.DraftResponse;
 import com.example.starter.playout.api.Dtos.EmergencyOverrideResponse;
 import com.example.starter.playout.api.Dtos.GrantResponse;
 import com.example.starter.playout.api.Dtos.CancelEmergencyOverrideRequest;
+import com.example.starter.playout.api.Dtos.PlayoutDecisionRecordResponse;
 import com.example.starter.playout.api.Dtos.PlayoutDecisionResponse;
 import com.example.starter.playout.api.Dtos.PublishRequest;
 import com.example.starter.playout.api.Dtos.PublishResponse;
+import com.example.starter.playout.api.Dtos.RegisterPlayoutDecisionRequest;
 import com.example.starter.playout.api.Dtos.ReplaceDraftRequest;
 import com.example.starter.playout.api.Dtos.RevokeGrantRequest;
+import com.example.starter.playout.api.Dtos.SubmitReceiptRequest;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import org.springframework.format.annotation.DateTimeFormat;
@@ -32,6 +35,7 @@ import org.springframework.web.bind.annotation.RestController;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeParseException;
+import java.util.List;
 
 /**
  * 播出编排 REST API。成功响应统一 200；错误区分 400 参数错误、404 资源不存在、
@@ -117,6 +121,35 @@ public class PlayoutController {
     @GetMapping("/emergency-overrides/{overrideKey}")
     public EmergencyOverrideResponse emergencyOverride(@PathVariable @NotBlank String overrideKey) {
         return service.getEmergencyOverride(overrideKey);
+    }
+
+    /** 登记播出决定：固化该频道该时刻的一次决策为不可变记录（幂等）。 */
+    @PostMapping("/playout-decisions")
+    public PlayoutDecisionRecordResponse registerDecision(
+            @Valid @RequestBody RegisterPlayoutDecisionRequest request) {
+        return service.registerDecision(request);
+    }
+
+    /** 提交播出回执：仅 PLAYED / FAILED 及非空说明，首次固化后不可变（幂等）。 */
+    @PostMapping("/playout-decisions/{playKey}/receipts")
+    public PlayoutDecisionRecordResponse submitReceipt(
+            @PathVariable @NotBlank String playKey,
+            @Valid @RequestBody SubmitReceiptRequest request) {
+        return service.submitReceipt(playKey, request);
+    }
+
+    /** 查询播出决定明细，无回执时 receiptStatus 为 PENDING。 */
+    @GetMapping("/playout-decisions/{playKey}")
+    public PlayoutDecisionRecordResponse getDecision(@PathVariable @NotBlank String playKey) {
+        return service.getDecision(playKey);
+    }
+
+    /** 按频道与业务日查询固化决定，按播出时刻、playKey 排序。 */
+    @GetMapping("/channels/{channelId}/playout-decisions")
+    public List<PlayoutDecisionRecordResponse> listDecisions(
+            @PathVariable @NotBlank String channelId,
+            @RequestParam String businessDay) {
+        return service.listDecisions(channelId, parseBusinessDay(businessDay));
     }
 
     private static LocalDate parseBusinessDay(String businessDay) {
