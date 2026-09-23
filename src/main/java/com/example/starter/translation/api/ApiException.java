@@ -57,4 +57,9 @@ public class ApiException extends RuntimeException {
     public static ApiException termViolation(String message, List<ApiDtos.TermRuleView> violations) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "TERM_VIOLATION", message, violations);
     }
+
+    /** 500：不应出现的内部不变量被破坏（如激活指针指向缺失策略版本）。 */
+    public static ApiException illegalState(String message) {
+        return new ApiException(HttpStatus.INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", message);
+    }
 }

@@ -4,6 +4,9 @@ import com.example.starter.translation.api.ApiDtos;
 import com.example.starter.translation.api.ApiException;
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
+import com.example.starter.translation.domain.Rows.ReviewPolicyRow;
+import com.example.starter.translation.domain.Rows.ReviewStage;
+import com.example.starter.translation.domain.Rows.ReviewVoteRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
 import com.example.starter.translation.domain.Rows.TranslationRow;
@@ -174,10 +177,11 @@ public class TranslationService {
     }
 
     /**
-     * 发布：校验期望版本（不符 409），再校验全部段落在全部目标语言均有有效批准（缺译或审核失效 422）、
-     * 译文绑定当前术语版本（过期 422）且满足当前术语规则（违规 422 并返回全部违规术语），
-     * 全部通过后原子生成完整只读快照（固化术语版本与实际规则集）并递增发布版本；
-     * 任何失败回滚，不产生部分快照。
+     * 发布：校验期望版本（不符 409），再在一个一致快照中校验全部段落在全部目标语言：
+     * 译文存在、基于当前源文版本、绑定当前术语版本且满足当前术语规则；
+     * 已配置双阶段评审策略的语言，LANGUAGE 与 COMPLIANCE 两阶段须均 PASSED 且四版本完全一致，
+     * 未配置策略的语言沿用单一批准校验。全部通过后原子生成只读快照、冻结采用的票版本集合并递增发布版本；
+     * 任何失败回滚，不产生部分快照或部分冻结。
      */
     @Transactional
     public ApiDtos.PublishResponse publish(long documentId, ApiDtos.PublishRequest request) {
@@ -193,8 +197,12 @@ public class TranslationService {
                 .collect(Collectors.toMap(t -> key(t.segmentId(), t.language()), Function.identity()));
         Map<String, ApprovalRow> approvals = repository.listApprovals(documentId).stream()
                 .collect(Collectors.toMap(a -> key(a.segmentId(), a.language()), Function.identity()));
+        Map<String, List<ReviewVoteRow>> reviewVotes = repository.listAllReviewVotes(documentId).stream()
+                .collect(Collectors.groupingBy(v -> key(v.segmentId(), v.language())));
+        Map<String, ReviewPolicyRow> activePolicies = loadActivePolicies(document);
         List<TermRuleRow> termRules = repository.listTermRules(documentId, document.termVersion());
         List<ApiDtos.TermRuleView> termViolations = new ArrayList<>();
+        List<ReviewVoteRow> adoptedVotes = new ArrayList<>();
         for (SegmentRow segment : segments) {
             for (String language : document.targetLanguages()) {
                 TranslationRow translation = translations.get(key(segment.segmentId(), language));
@@ -212,15 +220,30 @@ public class TranslationService {
                             + " 绑定术语版本 " + translation.termVersion()
                             + "，当前术语版本 " + document.termVersion());
                 }
-                ApprovalRow approval = approvals.get(key(segment.segmentId(), language));
-                if (approval == null) {
-                    throw ApiException.unprocessable(
-                            "缺少批准: " + segment.segmentId() + "/" + language);
-                }
-                if (approval.translationVersion() != translation.translationVersion()
-                        || approval.sourceVersion() != segment.sourceVersion()) {
-                    throw ApiException.unprocessable("批准已失效: " + segment.segmentId() + "/" + language
-                            + "，源文或译文版本已改变");
+                ReviewPolicyRow policy = activePolicies.get(language);
+                if (policy != null) {
+                    List<ReviewVoteRow> unitVotes = reviewVotes.getOrDefault(
+                            key(segment.segmentId(), language), List.of());
+                    for (ReviewStage stage : ReviewStage.values()) {
+                        ReviewGate.StageState state = ReviewGate.evaluate(policy, stage, unitVotes,
+                                segment.sourceVersion(), translation.translationVersion(), document.termVersion());
+                        if (!"PASSED".equals(state.view().status())) {
+                            throw ApiException.unprocessable("评审未通过: " + segment.segmentId() + "/" + language
+                                    + " " + stageName(stage) + " 当前状态 " + state.view().status());
+                        }
+                        adoptedVotes.addAll(state.adoptedApproves());
+                    }
+                } else {
+                    ApprovalRow approval = approvals.get(key(segment.segmentId(), language));
+                    if (approval == null) {
+                        throw ApiException.unprocessable(
+                                "缺少批准: " + segment.segmentId() + "/" + language);
+                    }
+                    if (approval.translationVersion() != translation.translationVersion()
+                            || approval.sourceVersion() != segment.sourceVersion()) {
+                        throw ApiException.unprocessable("批准已失效: " + segment.segmentId() + "/" + language
+                                + "，源文或译文版本已改变");
+                    }
                 }
                 termViolations.addAll(findViolations(
                         segment.sourceText(), language, translation.content(), termRules));
@@ -231,9 +254,26 @@ public class TranslationService {
         }
         int publishedVersion = document.publishedVersion() + 1;
         repository.insertSnapshot(documentId, publishedVersion,
-                buildSnapshotJson(document, publishedVersion, segments, translations, approvals, termRules));
+                buildSnapshotJson(document, publishedVersion, segments, translations, approvals, termRules,
+                        activePolicies, reviewVotes));
+        repository.insertReleaseVoteFreeze(documentId, publishedVersion, adoptedVotes);
         repository.updatePublishedVersion(documentId, publishedVersion);
         return new ApiDtos.PublishResponse(documentId, publishedVersion);
+    }
+
+    /** 加载文档各目标语言当前激活的不可变策略版本；无激活策略的语言不进入结果。 */
+    private Map<String, ReviewPolicyRow> loadActivePolicies(DocumentRow document) {
+        Map<String, ReviewPolicyRow> policies = new LinkedHashMap<>();
+        for (String language : document.targetLanguages()) {
+            repository.findActivePolicyVersion(document.documentId(), language)
+                    .flatMap(version -> repository.findReviewPolicy(document.documentId(), language, version))
+                    .ifPresent(policy -> policies.put(language, policy));
+        }
+        return policies;
+    }
+
+    private static String stageName(ReviewStage stage) {
+        return stage == ReviewStage.LANGUAGE ? "语言阶段" : "合规阶段";
     }
 
     /** 查询指定发布版本的只读快照 JSON；不存在返回 404。 */
@@ -347,16 +387,31 @@ public class TranslationService {
         return new ApiDtos.TermRuleView(rule.sourceTerm(), rule.language(), rule.requiredTranslation());
     }
 
-    /** 生成完整只读快照 JSON：全部段落源文及各语言译文、作者、审核人、版本号与固化的术语版本及规则集。 */
+    /**
+     * 生成完整只读快照 JSON：全部段落源文及各语言译文、作者、版本号与固化的术语版本及规则集。
+     * 单一批准语言记录 reviewer；双阶段评审语言在 review 中固化两阶段采用的票版本集合（发布时均为 APPROVE）。
+     */
     private String buildSnapshotJson(DocumentRow document, int publishedVersion, List<SegmentRow> segments,
                                      Map<String, TranslationRow> translations,
-                                     Map<String, ApprovalRow> approvals, List<TermRuleRow> termRules) {
+                                     Map<String, ApprovalRow> approvals, List<TermRuleRow> termRules,
+                                     Map<String, ReviewPolicyRow> activePolicies,
+                                     Map<String, List<ReviewVoteRow>> reviewVotes) {
         Map<String, Object> snapshot = new LinkedHashMap<>();
         snapshot.put("documentId", document.documentId());
         snapshot.put("publishedVersion", publishedVersion);
         snapshot.put("draftVersion", document.draftVersion());
         snapshot.put("termVersion", document.termVersion());
         snapshot.put("targetLanguages", document.targetLanguages());
+        List<Map<String, Object>> policyList = new ArrayList<>();
+        for (ReviewPolicyRow policy : activePolicies.values()) {
+            Map<String, Object> policyJson = new LinkedHashMap<>();
+            policyJson.put("language", policy.language());
+            policyJson.put("policyVersion", policy.policyVersion());
+            policyJson.put("languageQuorum", policy.languageQuorum());
+            policyJson.put("complianceQuorum", policy.complianceQuorum());
+            policyList.add(policyJson);
+        }
+        snapshot.put("reviewPolicies", policyList);
         List<Map<String, Object>> termList = new ArrayList<>();
         for (TermRuleRow rule : termRules) {
             Map<String, Object> termJson = new LinkedHashMap<>();
@@ -383,7 +438,15 @@ public class TranslationService {
                 translationJson.put("translationVersion", translation.translationVersion());
                 translationJson.put("sourceVersion", translation.sourceVersion());
                 translationJson.put("termVersion", translation.termVersion());
-                translationJson.put("reviewer", approval.reviewer());
+                if (approval != null) {
+                    translationJson.put("reviewer", approval.reviewer());
+                }
+                ReviewPolicyRow policy = activePolicies.get(language);
+                if (policy != null) {
+                    translationJson.put("review", buildReviewSnapshot(policy,
+                            reviewVotes.getOrDefault(key(segment.segmentId(), language), List.of()),
+                            segment.sourceVersion(), translation.translationVersion(), document.termVersion()));
+                }
                 translationList.add(translationJson);
             }
             segmentJson.put("translations", translationList);
@@ -395,5 +458,33 @@ public class TranslationService {
         } catch (Exception e) {
             throw new IllegalStateException("快照序列化失败", e);
         }
+    }
+
+    /** 构造双阶段评审快照：固化两阶段采用票的审核人、票版本与票 ID（仅计当前 APPROVE 票）。 */
+    private Map<String, Object> buildReviewSnapshot(ReviewPolicyRow policy, List<ReviewVoteRow> votes,
+                                                    int sourceVersion, int translationVersion, int termVersion) {
+        Map<String, Object> reviewJson = new LinkedHashMap<>();
+        reviewJson.put("policyVersion", policy.policyVersion());
+        List<Map<String, Object>> stages = new ArrayList<>();
+        for (ReviewStage stage : ReviewStage.values()) {
+            ReviewGate.StageState state = ReviewGate.evaluate(policy, stage, votes,
+                    sourceVersion, translationVersion, termVersion);
+            Map<String, Object> stageJson = new LinkedHashMap<>();
+            stageJson.put("stage", stage.name());
+            stageJson.put("quorum", state.view().quorum());
+            stageJson.put("status", state.view().status());
+            List<Map<String, Object>> adopted = new ArrayList<>();
+            for (ReviewVoteRow vote : state.adoptedApproves()) {
+                Map<String, Object> voteJson = new LinkedHashMap<>();
+                voteJson.put("voteId", vote.voteId());
+                voteJson.put("reviewer", vote.reviewer());
+                voteJson.put("voteVersion", vote.voteVersion());
+                adopted.add(voteJson);
+            }
+            stageJson.put("votes", adopted);
+            stages.add(stageJson);
+        }
+        reviewJson.put("stages", stages);
+        return reviewJson;
     }
 }

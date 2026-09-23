@@ -36,6 +36,10 @@ public abstract class AbstractIntegrationTest {
     @BeforeEach
     void cleanTables() {
         jdbc.update("DELETE FROM approval");
+        jdbc.update("DELETE FROM release_vote_freeze");
+        jdbc.update("DELETE FROM review_vote");
+        jdbc.update("DELETE FROM review_policy_active");
+        jdbc.update("DELETE FROM review_policy");
         jdbc.update("DELETE FROM translation");
         jdbc.update("DELETE FROM segment");
         jdbc.update("DELETE FROM release_snapshot");
@@ -128,6 +132,44 @@ public abstract class AbstractIntegrationTest {
         String body = "{\"requestId\":\"" + requestId + "\",\"expectedTermVersion\":" + expectedTermVersion
                 + ",\"rules\":" + rulesJson + "}";
         return putJson("/api/documents/" + documentId + "/terms", body);
+    }
+
+    /** 配置某语言双阶段评审策略版本。 */
+    protected ApiResult putPolicy(long documentId, String language, int expectedPolicyVersion,
+                                  String languageReviewersJson, int languageQuorum,
+                                  String complianceReviewersJson, int complianceQuorum,
+                                  String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"expectedPolicyVersion\":"
+                + expectedPolicyVersion + ","
+                + "\"languageStage\":{\"reviewers\":" + languageReviewersJson + ",\"quorum\":" + languageQuorum
+                + "},"
+                + "\"complianceStage\":{\"reviewers\":" + complianceReviewersJson + ",\"quorum\":"
+                + complianceQuorum + "}}";
+        return putJson("/api/documents/" + documentId + "/review-policies/" + language, body);
+    }
+
+    /** 投票/改票；expectedVoteVersion 为 null 时省略该字段（首次投票）。 */
+    protected ApiResult castVote(long documentId, String segmentId, String language, String actorId,
+                                 String stage, String decision, int sourceVersion, int translationVersion,
+                                 int termVersion, int policyVersion, Integer expectedVoteVersion, String voteKey,
+                                 String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"voteKey\":\"" + voteKey + "\","
+                + "\"stage\":\"" + stage + "\",\"decision\":\"" + decision + "\","
+                + "\"sourceVersion\":" + sourceVersion + ",\"translationVersion\":" + translationVersion
+                + ",\"termVersion\":" + termVersion + ",\"policyVersion\":" + policyVersion
+                + (expectedVoteVersion == null ? "" : ",\"expectedVoteVersion\":" + expectedVoteVersion)
+                + "}";
+        return postJson("/api/documents/" + documentId + "/segments/" + segmentId + "/translations/" + language
+                + "/votes", body, actorId);
+    }
+
+    protected ApiResult getMatrix(long documentId) throws Exception {
+        return getJson("/api/documents/" + documentId + "/review-matrix");
+    }
+
+    protected ApiResult getVotes(long documentId, String segmentId, String language) throws Exception {
+        return getJson("/api/documents/" + documentId + "/segments/" + segmentId
+                + "/translations/" + language + "/votes");
     }
 
     /** HTTP 响应结果：状态码与 JSON 响应体。 */

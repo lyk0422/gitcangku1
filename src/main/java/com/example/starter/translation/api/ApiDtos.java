@@ -132,4 +132,78 @@ public final class ApiDtos {
             this(error, message, null);
         }
     }
+
+    /** 单阶段策略配置：候选审核人集合与法定人数。 */
+    public record StagePolicyInput(
+            @NotNull(message = "reviewers 不能为空")
+            List<@NotBlank(message = "审核人不能为空") @Size(max = 128) String> reviewers,
+            @Positive(message = "quorum 必须为正数") int quorum) {
+    }
+
+    /**
+     * 新增（切换）某语言评审策略版本请求；expectedPolicyVersion 为当前激活版本（无策略时传 0），
+     * 不符返回 409。策略激活后仅作用于新投票。
+     */
+    public record PutReviewPolicyRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @PositiveOrZero(message = "expectedPolicyVersion 不能为负数") int expectedPolicyVersion,
+            @NotNull(message = "languageStage 不能为空") @Valid StagePolicyInput languageStage,
+            @NotNull(message = "complianceStage 不能为空") @Valid StagePolicyInput complianceStage) {
+    }
+
+    /** 评审策略视图：版本号与两阶段候选集合、法定人数。 */
+    public record ReviewPolicyView(int policyVersion, StagePolicyView languageStage,
+                                   StagePolicyView complianceStage) {
+    }
+
+    /** 单阶段策略视图。 */
+    public record StagePolicyView(List<String> reviewers, int quorum) {
+    }
+
+    /**
+     * 投票请求：审核人取 X-Actor-Id，对精确四版本在指定阶段投 APPROVE/REJECT；
+     * 改票（同段落/语言/阶段/审核人已有票）须携带 expectedVoteVersion。
+     */
+    public record CastVoteRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @NotBlank(message = "voteKey 不能为空") @Size(max = 128) String voteKey,
+            @NotBlank(message = "stage 不能为空") String stage,
+            @NotBlank(message = "decision 不能为空") String decision,
+            @Positive(message = "sourceVersion 必须为正数") int sourceVersion,
+            @Positive(message = "translationVersion 必须为正数") int translationVersion,
+            @PositiveOrZero(message = "termVersion 不能为负数") int termVersion,
+            @Positive(message = "policyVersion 必须为正数") int policyVersion,
+            Integer expectedVoteVersion) {
+    }
+
+    /** 投票响应：生成（或改票后）的票版本与阶段状态。 */
+    public record VoteResponse(long voteId, String voteKey, String segmentId, String language, String stage,
+                               String reviewer, String decision, int voteVersion, int sourceVersion,
+                               int translationVersion, int termVersion, int policyVersion, String stageStatus) {
+    }
+
+    /** 单阶段评审状态视图：阶段、法定人数、当前批准/拒绝数、状态与当前计票。 */
+    public record StageStatusView(String stage, int quorum, int approveCount, int rejectCount, String status,
+                                  List<VoteHistoryEntry> currentVotes) {
+    }
+
+    /** 单条历史票（只读审计）。 */
+    public record VoteHistoryEntry(long voteId, String voteKey, String stage, String reviewer, String decision,
+                                   int voteVersion, int sourceVersion, int translationVersion, int termVersion,
+                                   int policyVersion, boolean current, String requestId) {
+    }
+
+    /** 单个段落-语言的评审矩阵单元：当前版本、两阶段状态与当前票。 */
+    public record ReviewUnitView(String segmentId, String language, int sourceVersion, int translationVersion,
+                                 int termVersion, int policyVersion, List<StageStatusView> stages) {
+    }
+
+    /** 当前评审矩阵查询响应。 */
+    public record ReviewMatrixResponse(long documentId, List<ReviewUnitView> units) {
+    }
+
+    /** 历史票查询响应（含因版本变化而不计入法定人数的旧票）。 */
+    public record VoteHistoryResponse(long documentId, String segmentId, String language,
+                                      List<VoteHistoryEntry> votes) {
+    }
 }
