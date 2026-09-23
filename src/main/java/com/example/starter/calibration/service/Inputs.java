@@ -27,6 +27,23 @@ final class Inputs {
         return value.trim();
     }
 
+    /** 要求非空正整数；null、小于 1 均为 400。 */
+    static int requirePositive(Integer value, String field) {
+        if (value == null || value < 1) {
+            throw ApiException.badRequest(field + " 必须为不小于 1 的整数");
+        }
+        return value;
+    }
+
+    /** 修订原因：非空且长度受限，避免空原因修订。 */
+    static String requireReason(String value, int maxLength, String field) {
+        String reason = requireText(value, field);
+        if (reason.length() > maxLength) {
+            throw ApiException.badRequest(field + " 长度不能超过 " + maxLength + " 个字符");
+        }
+        return reason;
+    }
+
     static BigDecimal requireDecimal(String value, String field) {
         if (value == null || !DECIMAL.matcher(value.trim()).matches()) {
             throw ApiException.badRequest(field + " 必须为最多 6 位小数的十进制字符串");

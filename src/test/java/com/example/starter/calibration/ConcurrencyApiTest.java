@@ -44,7 +44,9 @@ class ConcurrencyApiTest {
     @BeforeEach
     void clean() {
         jdbc.update("DELETE FROM release_record");
+        jdbc.update("DELETE FROM measurement_revision_request");
         jdbc.update("DELETE FROM measurement");
+        jdbc.update("DELETE FROM measurement_head");
         jdbc.update("DELETE FROM calibration_certificate");
         jdbc.update("DELETE FROM instrument_lock");
     }
