@@ -4,6 +4,7 @@ import com.example.starter.water.WaterRepository.AllocationRow;
 import com.example.starter.water.WaterRepository.CommandRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
 import com.example.starter.water.WaterRepository.TransferRow;
+import com.example.starter.water.WaterRepository.UsageRow;
 import com.example.starter.water.WaterRepository.WindowRow;
 import com.example.starter.water.dto.Dtos.AllocationResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
@@ -11,6 +12,9 @@ import com.example.starter.water.dto.Dtos.CurtailmentResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferResponse;
+import com.example.starter.water.dto.Dtos.UsageConsumeResponse;
+import com.example.starter.water.dto.Dtos.UsageListResponse;
+import com.example.starter.water.dto.Dtos.UsageResponse;
 import com.example.starter.water.dto.Dtos.WindowResponse;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
@@ -32,7 +36,9 @@ import java.util.regex.Pattern;
  * 同键同参重放返回首次结果，同键改参返回 409。</p>
  *
  * <p>并发：批准申请与创建/取消限供在同一事务内先对窗口行 SELECT ... FOR UPDATE，
- * 按事务提交顺序生效，保证已批准总量永不超过最终可用总量。</p>
+ * 按事务提交顺序生效，保证窗口已占用量永不超过最终可用总量。核销与同申请的转让/取消
+ * 对申请行 SELECT ... FOR UPDATE 串行裁决；核销只在累计已用与未用持有额度间转移，
+ * 不改变窗口已占用量。</p>
  */
 @Service
 public class WaterService {
@@ -107,7 +113,7 @@ public class WaterService {
         });
     }
 
-    /** 批准申请：加入本申请后已批准总量不得超过当前可用总量，否则 422。 */
+    /** 批准申请：加入本申请后窗口已占用量（全部已用 + APPROVED 持有）不得超过当前可用总量，否则 422。 */
     public AllocationResponse approveAllocation(String commandKey, String allocationKey) {
         requireKey("commandKey", commandKey);
         requireKey("allocationKey", allocationKey);
@@ -129,16 +135,18 @@ public class WaterService {
                 }
             }
             BigDecimal available = availableTotal(window);
-            BigDecimal approved = repository.sumApprovedAmount(window.id());
-            if (approved.add(allocation.amount()).compareTo(available) > 0) {
-                throw ApiException.quotaExceeded("批准后将超过当前可用总量 " + fmt(available));
+            // 已占用量 = 全部申请累计已用量（含 CANCELLED）+ APPROVED 申请当前持有（未用）额度
+            BigDecimal occupied = occupiedTotal(window.id());
+            // 批准后该申请持有额度等于原申请水量，窗口占用等额增加
+            if (occupied.add(allocation.amount()).compareTo(available) > 0) {
+                throw ApiException.quotaExceeded("批准后窗口已占用量将超过当前可用总量 " + fmt(available));
             }
             repository.updateAllocationStatus(allocation.id(), STATUS_APPROVED, nowNanos());
             return toAllocationResponse(repository.findAllocationByKey(allocationKey));
         });
     }
 
-    /** 取消申请：仅申请人本人可取消 REQUESTED/APPROVED，取消不可恢复并立即释放水量。 */
+    /** 取消申请：仅申请人本人可取消 REQUESTED/APPROVED，取消不可恢复，仅释放未用持有额度，已用量保留并继续占窗口容量。 */
     public AllocationResponse cancelAllocation(String commandKey, String allocationKey, String actor) {
         requireKey("commandKey", commandKey);
         requireKey("allocationKey", allocationKey);
@@ -241,7 +249,76 @@ public class WaterService {
         return new TransferListResponse(windowId, transfers);
     }
 
-    /** 创建限供：仅当当前已批准总量不超过拟定限供水量时允许。 */
+    /**
+     * 实际用水核销：仅 APPROVED 申请的原申请人（actor）可核销，提交正水量、全局唯一 usageKey。
+     * 成功后等量扣减尚未使用的持有额度并累加累计已用量，同时写不可变核销流水；
+     * 持有额度不足返回 422；不允许冲销已用水量（不存在负数/撤销入口）。
+     * 核销只在已用与未用之间转移，不改变窗口已占用量；取消后不得再核销。
+     * 与同申请的转让/取消并发时由申请行 FOR UPDATE 串行裁决，任一失败整体回滚。
+     */
+    public UsageConsumeResponse consumeUsage(String commandKey, String usageKey, String allocationKey,
+                                             String amount, String actor) {
+        requireKey("commandKey", commandKey);
+        requireKey("usageKey", usageKey);
+        requireKey("allocationKey", allocationKey);
+        requireKey("X-Actor-Id", actor);
+        BigDecimal qty = parseAmount("amount", amount);
+        String params = "USAGE_CONSUME|" + usageKey + "|" + allocationKey + "|"
+                + qty.toPlainString() + "|" + actor;
+        return runCommand("USAGE_CONSUME", commandKey, params, UsageConsumeResponse.class, () -> {
+            if (repository.findUsageByKey(usageKey) != null) {
+                throw ApiException.conflict("USAGE_KEY_REUSED", "usageKey 已被使用: " + usageKey);
+            }
+            AllocationRow allocation = repository.findAllocationByKey(allocationKey);
+            if (allocation == null) {
+                throw ApiException.notFound("ALLOCATION_NOT_FOUND", "配水申请不存在: " + allocationKey);
+            }
+            // 仅锁申请行即与同申请的转让/取消互斥（它们锁窗口后再锁申请行，此处不再请求窗口锁，无死锁）；
+            // 核销不改变窗口占用总量，无需与其它申请的批准/限供互斥。
+            AllocationRow locked = repository.lockAllocationByKey(allocationKey);
+            if (!locked.requester().equals(actor)) {
+                throw ApiException.conflict("NOT_OWNER", "只有原申请人本人可以核销该申请");
+            }
+            if (STATUS_CANCELLED.equals(locked.status())) {
+                throw ApiException.conflict("ALLOCATION_CANCELLED", "已取消的申请不能核销");
+            }
+            if (!STATUS_APPROVED.equals(locked.status())) {
+                throw ApiException.conflict("ALLOCATION_NOT_APPROVED", "只有 APPROVED 申请可以核销");
+            }
+            if (locked.heldAmount().compareTo(qty) < 0) {
+                throw ApiException.quotaExceeded("申请当前持有额度（尚未使用）" + fmt(locked.heldAmount())
+                        + " 不足，无法核销 " + fmt(qty));
+            }
+            long now = nowNanos();
+            repository.consumeHeldAmount(locked.id(), qty, now);
+            try {
+                repository.insertUsage(usageKey, allocationKey, locked.windowId(), qty, actor, now);
+            } catch (DuplicateKeyException e) {
+                // 并发复用同一 usageKey（换 commandKey）：事务回滚，计数无变化
+                throw ApiException.conflict("USAGE_KEY_REUSED", "usageKey 已被使用: " + usageKey);
+            }
+            AllocationRow after = repository.findAllocationByKey(allocationKey);
+            // 核销不改变窗口占用总量，无需锁窗口即可读取当前有效总量上限
+            BigDecimal available = availableTotal(repository.findWindowById(locked.windowId()));
+            BigDecimal occupied = occupiedTotal(locked.windowId());
+            UsageResponse usage = toUsageResponse(repository.findUsageByKey(usageKey));
+            return new UsageConsumeResponse(usage, fmt(after.usedAmount()), fmt(after.heldAmount()),
+                    fmt(occupied), fmt(available), fmt(available.subtract(occupied)));
+        });
+    }
+
+    /** 查询窗口全部核销流水（不可变），按发生顺序返回。 */
+    public UsageListResponse getUsages(long windowId) {
+        WindowRow window = repository.findWindowById(windowId);
+        if (window == null) {
+            throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + windowId);
+        }
+        List<UsageResponse> usages = repository.listUsages(windowId).stream()
+                .map(this::toUsageResponse).toList();
+        return new UsageListResponse(windowId, usages);
+    }
+
+    /** 创建限供：仅当当前窗口已占用量（全部已用 + APPROVED 持有）不超过拟定限供水量时允许。 */
     public CurtailmentResponse createCurtailment(String commandKey, long windowId, String volume) {
         requireKey("commandKey", commandKey);
         BigDecimal qty = parseAmount("volume", volume);
@@ -257,10 +334,10 @@ public class WaterService {
             if (repository.findActiveCurtailment(windowId) != null) {
                 throw ApiException.conflict("CURTAILMENT_EXISTS", "窗口已存在生效中的限供");
             }
-            BigDecimal approved = repository.sumApprovedAmount(windowId);
-            if (approved.compareTo(qty) > 0) {
-                throw ApiException.conflict("CURTAILMENT_BELOW_APPROVED",
-                        "当前已批准总量 " + fmt(approved) + " 超过拟定限供水量 " + fmt(qty));
+            BigDecimal occupied = occupiedTotal(windowId);
+            if (occupied.compareTo(qty) > 0) {
+                throw ApiException.conflict("CURTAILMENT_BELOW_OCCUPIED",
+                        "当前窗口已占用量 " + fmt(occupied) + " 超过拟定限供水量 " + fmt(qty));
             }
             long id = repository.insertCurtailment(windowId, qty, nowNanos());
             return toCurtailmentResponse(repository.findActiveCurtailment(windowId));
@@ -295,13 +372,15 @@ public class WaterService {
         }
         CurtailmentRow active = repository.findActiveCurtailment(windowId);
         BigDecimal available = active != null ? active.volume() : window.plannedVolume();
-        BigDecimal approved = repository.sumApprovedAmount(windowId);
+        BigDecimal used = repository.sumUsedAmount(windowId);
+        BigDecimal approvedHeld = repository.sumApprovedAmount(windowId);
+        BigDecimal occupied = used.add(approvedHeld);
         return new CapacityResponse(window.id(), fmt(window.plannedVolume()),
-                active != null ? fmt(active.volume()) : null, fmt(available), fmt(approved),
-                fmt(available.subtract(approved)));
+                active != null ? fmt(active.volume()) : null, fmt(available), fmt(used), fmt(approvedHeld),
+                fmt(occupied), fmt(available.subtract(occupied)));
     }
 
-    /** 查询窗口历史明细：窗口 + 全部申请 + 全部限供。 */
+    /** 查询窗口历史明细：窗口 + 全部申请 + 全部限供 + 全部核销流水。 */
     public HistoryResponse getHistory(long windowId) {
         WindowRow window = repository.findWindowById(windowId);
         if (window == null) {
@@ -312,7 +391,9 @@ public class WaterService {
                 .map(this::toAllocationResponse).toList();
         List<CurtailmentResponse> curtailments = repository.listCurtailments(windowId).stream()
                 .map(this::toCurtailmentResponse).toList();
-        return new HistoryResponse(toWindowResponse(window, active), allocations, curtailments);
+        List<UsageResponse> usages = repository.listUsages(windowId).stream()
+                .map(this::toUsageResponse).toList();
+        return new HistoryResponse(toWindowResponse(window, active), allocations, curtailments, usages);
     }
 
     // ------------------------------------------------------------------
@@ -369,6 +450,15 @@ public class WaterService {
         return active != null ? active.volume() : window.plannedVolume();
     }
 
+    /**
+     * 窗口已占用量 = 全部申请（含 CANCELLED）累计已用量 + APPROVED 申请当前持有（未用）额度。
+     * 核销只在二者间转移、不改变占用总量；取消只释放未用持有额度，不释放已用部分。
+     * 调用方须已持有窗口行锁，以保证批准/限供裁决读同一快照。
+     */
+    private BigDecimal occupiedTotal(long windowId) {
+        return repository.sumUsedAmount(windowId).add(repository.sumApprovedAmount(windowId));
+    }
+
     private WindowResponse toWindowResponse(WindowRow row, CurtailmentRow active) {
         BigDecimal available = active != null ? active.volume() : row.plannedVolume();
         return new WindowResponse(row.id(), row.windowKey(), row.channelId(), toIso(row.startNanos()),
@@ -378,8 +468,13 @@ public class WaterService {
 
     private AllocationResponse toAllocationResponse(AllocationRow row) {
         return new AllocationResponse(row.allocationKey(), row.windowId(), row.userId(), fmt(row.amount()),
-                fmt(row.heldAmount()), row.requester(), row.status(),
+                fmt(row.heldAmount()), fmt(row.usedAmount()), row.requester(), row.status(),
                 toIso(row.createdNanos()), toIso(row.updatedNanos()));
+    }
+
+    private UsageResponse toUsageResponse(UsageRow row) {
+        return new UsageResponse(row.usageKey(), row.allocationKey(), row.windowId(), fmt(row.amount()),
+                row.actor(), toIso(row.createdNanos()));
     }
 
     private TransferResponse toTransferResponse(TransferRow row) {
