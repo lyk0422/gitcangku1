@@ -11,7 +11,10 @@ package com.example.starter.repo;
  * @param status         ACTIVE / REVOKED
  * @param createdVersion 创建后生效的全局空域版本
  * @param revokedVersion 撤销后生效的全局空域版本；null 表示仍有效
+ * @param windowStart    有效窗口起始（UTC epoch 毫秒，左闭）；与 windowEnd 成对为 null 表示全时有效
+ * @param windowEnd      有效窗口结束（UTC epoch 毫秒，右开）
  */
 public record ZonePo(String zoneId, int xMin, int yMin, int xMax, int yMax,
-                     String status, long createdVersion, Long revokedVersion) {
+                     String status, long createdVersion, Long revokedVersion,
+                     Long windowStart, Long windowEnd) {
 }

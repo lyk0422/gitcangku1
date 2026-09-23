@@ -254,4 +254,75 @@ class AirspaceReviewControllerIT {
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("ZONE_ALREADY_REVOKED"));
     }
+
+    @Test
+    @DisplayName("限时窗口：窗口不相交 CLEAR、相交 BLOCKED、非法窗口 400、快照含双方窗口")
+    void timeWindowOverHttp() throws Exception {
+        // 航线飞行窗口 [1000,2000)
+        mockMvc.perform(post("/api/airspace/routes")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"w1","requestId":"req-w-route",
+                                 "points":[{"x":0,"y":10},{"x":100,"y":10}],
+                                 "windowStart":1000,"windowEnd":2000}"""))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.version").value(1));
+
+        // 区域有效窗口 [3000,4000)：与航线窗口不相交 → CLEAR
+        mockMvc.perform(post("/api/airspace/zones")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"zoneId":"wz1","xMin":40,"yMin":5,"xMax":60,"yMax":15,
+                                 "windowStart":3000,"windowEnd":4000,"requestId":"req-w-zone1"}"""))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.airspaceVersion").value(1));
+
+        mockMvc.perform(post("/api/airspace/reviews")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"w1","routeVersion":1,"airspaceVersion":1,
+                                 "requestId":"req-w-review1"}"""))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.conclusion").value("CLEAR"))
+                .andExpect(jsonPath("$.data.routeWindowStart").value(1000))
+                .andExpect(jsonPath("$.data.routeWindowEnd").value(2000))
+                .andExpect(jsonPath("$.data.zoneWindows[0].zoneId").value("wz1"))
+                .andExpect(jsonPath("$.data.zoneWindows[0].windowStart").value(3000));
+
+        // 区域有效窗口 [1500,2500)：与航线窗口相交 → BLOCKED
+        mockMvc.perform(post("/api/airspace/zones")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"zoneId":"wz2","xMin":40,"yMin":5,"xMax":60,"yMax":15,
+                                 "windowStart":1500,"windowEnd":2500,"requestId":"req-w-zone2"}"""))
+                .andExpect(status().isCreated());
+
+        mockMvc.perform(post("/api/airspace/reviews")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"w1","routeVersion":1,"airspaceVersion":2,
+                                 "requestId":"req-w-review2"}"""))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.conclusion").value("BLOCKED"))
+                .andExpect(jsonPath("$.data.hitZoneIds[0]").value("wz2"));
+
+        // 窗口只给一端 → 400 INVALID_TIME_WINDOW
+        mockMvc.perform(post("/api/airspace/zones")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"zoneId":"wz3","xMin":0,"yMin":0,"xMax":10,"yMax":10,
+                                 "windowStart":100,"requestId":"req-w-bad1"}"""))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("INVALID_TIME_WINDOW"));
+
+        // 开始不严格早于结束 → 400
+        mockMvc.perform(post("/api/airspace/routes")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"w2","requestId":"req-w-bad2",
+                                 "points":[{"x":0,"y":0},{"x":10,"y":10}],
+                                 "windowStart":200,"windowEnd":200}"""))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("INVALID_TIME_WINDOW"));
+    }
 }

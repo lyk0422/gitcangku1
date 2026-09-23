@@ -14,7 +14,9 @@ import com.example.starter.api.dto.ZoneRevokeRequest;
 import com.example.starter.domain.Geometry;
 import com.example.starter.domain.Point;
 import com.example.starter.domain.ReviewConclusion;
+import com.example.starter.domain.TimeWindows;
 import com.example.starter.domain.ZoneStatus;
+import com.example.starter.domain.ZoneWindow;
 import com.example.starter.repo.AirspaceRepository;
 import com.example.starter.repo.DedupPo;
 import com.example.starter.repo.ReviewPo;
@@ -95,13 +97,15 @@ public class AirspaceReviewService {
                 throw new ApiException(HttpStatus.BAD_REQUEST, "INVALID_ZONE_RECTANGLE",
                         "禁飞区必须是非退化轴对齐矩形：xMin < xMax 且 yMin < yMax");
             }
+            validateWindow(request.windowStart(), request.windowEnd());
             if (airspaceRepo.findZone(request.zoneId()) != null) {
                 throw new ApiException(HttpStatus.CONFLICT, "ZONE_ALREADY_EXISTS",
                         "禁飞区已存在: " + request.zoneId());
             }
             long newVersion = airspaceRepo.incrementGlobalVersion();
             airspaceRepo.insertZone(new ZonePo(request.zoneId(), request.xMin(), request.yMin(),
-                    request.xMax(), request.yMax(), ZoneStatus.ACTIVE.name(), newVersion, null));
+                    request.xMax(), request.yMax(), ZoneStatus.ACTIVE.name(), newVersion, null,
+                    request.windowStart(), request.windowEnd()));
             return new MutationResponse(request.requestId(), false,
                     new ZoneResult(request.zoneId(), ZoneStatus.ACTIVE.name(), newVersion));
         });
@@ -133,21 +137,24 @@ public class AirspaceReviewService {
         return withIdempotency(request.requestId(), KIND_ROUTE_CREATE, canonicalHash(request), () -> {
             List<Point> points = toPoints(request.points());
             validatePointsDistinct(points);
+            validateWindow(request.windowStart(), request.windowEnd());
             if (routeRepo.findRoute(request.routeId()) != null) {
                 throw new ApiException(HttpStatus.CONFLICT, "ROUTE_ALREADY_EXISTS",
                         "航线已存在: " + request.routeId());
             }
-            routeRepo.insertRoute(request.routeId(), points);
+            routeRepo.insertRoute(request.routeId(), points,
+                    request.windowStart(), request.windowEnd());
             return new MutationResponse(request.requestId(), false,
                     new RouteResult(request.routeId(), 1));
         });
     }
 
-    /** 替换航线点列，expectedVersion 不匹配返回 409；成功版本加一。 */
+    /** 替换航线点列与飞行窗口，expectedVersion 不匹配返回 409；成功版本加一。 */
     public MutationResponse replaceRoute(RouteReplaceRequest request) {
         return withIdempotency(request.requestId(), KIND_ROUTE_REPLACE, canonicalHash(request), () -> {
             List<Point> points = toPoints(request.points());
             validatePointsDistinct(points);
+            validateWindow(request.windowStart(), request.windowEnd());
             RoutePo route = routeRepo.findRoute(request.routeId());
             if (route == null) {
                 throw new ApiException(HttpStatus.NOT_FOUND, "ROUTE_NOT_FOUND",
@@ -158,9 +165,11 @@ public class AirspaceReviewService {
                         "航线版本不匹配：expected=" + request.expectedVersion()
                                 + ", current=" + route.version());
             }
-            // 条件更新兜底并发替换：更新 0 行说明版本已被其他事务推进
+            // 条件更新兜底并发替换：更新 0 行说明版本已被其他事务推进；
+            // 窗口随替换整体重写，省略时（null 对）明确设为全时
             int updated = routeRepo.compareAndIncrementVersion(
-                    request.routeId(), request.expectedVersion());
+                    request.routeId(), request.expectedVersion(),
+                    request.windowStart(), request.windowEnd());
             if (updated == 0) {
                 throw new ApiException(HttpStatus.CONFLICT, "VERSION_CONFLICT",
                         "航线版本已变化，请使用最新 expectedVersion 重试");
@@ -198,8 +207,14 @@ public class AirspaceReviewService {
             // 持锁状态下读取全部有效禁飞区，与上面的版本号同属一个一致状态
             List<ZonePo> activeZones = airspaceRepo.findActiveZones();
             Set<String> hits = new TreeSet<>();
+            List<ZoneWindow> zoneWindows = new ArrayList<>(activeZones.size());
             for (ZonePo zone : activeZones) {
-                if (Geometry.polylineHitsRectangle(route.points(),
+                // 快照记录审核时刻每个有效区域的窗口，历史不随窗口修改而改变
+                zoneWindows.add(new ZoneWindow(zone.zoneId(), zone.windowStart(), zone.windowEnd()));
+                // 时间仅端点相接不相交；任一方全时则时间必相交
+                if (TimeWindows.overlaps(route.windowStart(), route.windowEnd(),
+                        zone.windowStart(), zone.windowEnd())
+                        && Geometry.polylineHitsRectangle(route.points(),
                         zone.xMin(), zone.yMin(), zone.xMax(), zone.yMax())) {
                     hits.add(zone.zoneId());
                 }
@@ -210,6 +225,7 @@ public class AirspaceReviewService {
             String reviewId = "rv_" + UUID.randomUUID();
             ReviewPo po = new ReviewPo(reviewId, request.routeId(), route.version(), globalVersion,
                     conclusion, new ArrayList<>(hits), List.copyOf(route.points()),
+                    route.windowStart(), route.windowEnd(), zoneWindows,
                     request.requestId(), nowMillis());
             reviewRepo.insertReview(po);
             return new MutationResponse(request.requestId(), false, toDto(po, conclusion, true));
@@ -340,13 +356,29 @@ public class AirspaceReviewService {
                 "航线至少需要两个不同的点");
     }
 
+    /**
+     * 校验可选时间窗口：起止必须成对提供，且开始严格早于结束（左闭右开）。
+     * 缺省一对（均 null）表示全时有效；非法时间参数返回 400。
+     */
+    private static void validateWindow(Long windowStart, Long windowEnd) {
+        if ((windowStart == null) != (windowEnd == null)) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "INVALID_TIME_WINDOW",
+                    "起止时刻必须成对提供：windowStart 与 windowEnd 同时给出或同时省略");
+        }
+        if (windowStart != null && windowStart >= windowEnd) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "INVALID_TIME_WINDOW",
+                    "开始时刻必须严格早于结束时刻（左闭右开区间）");
+        }
+    }
+
     private static ReviewResultDto toDto(ReviewPo po, String conclusion, Boolean current) {
         List<RoutePointDto> snapshot = new ArrayList<>(po.pointsSnapshot().size());
         for (Point p : po.pointsSnapshot()) {
             snapshot.add(new RoutePointDto(p.x(), p.y()));
         }
         return new ReviewResultDto(po.reviewId(), po.routeId(), po.routeVersion(),
-                po.airspaceVersion(), conclusion, List.copyOf(po.hitZoneIds()), snapshot, current);
+                po.airspaceVersion(), conclusion, List.copyOf(po.hitZoneIds()), snapshot,
+                po.routeWindowStart(), po.routeWindowEnd(), List.copyOf(po.zoneWindows()), current);
     }
 
     private long nowMillis() {
