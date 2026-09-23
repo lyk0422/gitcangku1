@@ -12,6 +12,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Clock;
+
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -32,10 +34,12 @@ public class TranslationService {
 
     private final TranslationRepository repository;
     private final ObjectMapper objectMapper;
+    private final Clock clock;
 
-    public TranslationService(TranslationRepository repository, ObjectMapper objectMapper) {
+    public TranslationService(TranslationRepository repository, ObjectMapper objectMapper, Clock clock) {
         this.repository = repository;
         this.objectMapper = objectMapper;
+        this.clock = clock;
     }
 
     /** 建文档：1~5 种目标语言，可携带初始段落，初始草稿版本 1、发布版本 0。 */
@@ -132,6 +136,11 @@ public class TranslationService {
             throw ApiException.unprocessable("译文基于源文版本 " + translation.sourceVersion()
                     + "，当前源文版本 " + segment.sourceVersion() + "，译文待更新，不能批准");
         }
+        if (repository.isTermVersionRetired(documentId, translation.termVersion(),
+                normalizedLanguage, clock.instant().toEpochMilli())) {
+            throw ApiException.unprocessable("译文绑定的术语版本 " + translation.termVersion()
+                    + " 已退役，不能新批准；请先迁移到替代版本: " + segmentId + "/" + normalizedLanguage);
+        }
         repository.upsertApproval(documentId, new ApprovalRow(segmentId, normalizedLanguage, actorId,
                 segment.sourceVersion(), translation.translationVersion()));
         return new ApiDtos.ApprovalResponse(documentId, segmentId, normalizedLanguage, actorId,
@@ -212,6 +221,11 @@ public class TranslationService {
                             + " 绑定术语版本 " + translation.termVersion()
                             + "，当前术语版本 " + document.termVersion());
                 }
+                if (repository.isTermVersionRetired(documentId, translation.termVersion(),
+                        language, clock.instant().toEpochMilli())) {
+                    throw ApiException.unprocessable("译文绑定的术语版本 " + translation.termVersion()
+                            + " 已退役，不能发布: " + segment.segmentId() + "/" + language);
+                }
                 ApprovalRow approval = approvals.get(key(segment.segmentId(), language));
                 if (approval == null) {
                     throw ApiException.unprocessable(
@@ -230,7 +244,7 @@ public class TranslationService {
             throw ApiException.termViolation("译文违反 " + termViolations.size() + " 条术语规则", termViolations);
         }
         int publishedVersion = document.publishedVersion() + 1;
-        repository.insertSnapshot(documentId, publishedVersion,
+        repository.insertSnapshot(documentId, publishedVersion, document.termVersion(),
                 buildSnapshotJson(document, publishedVersion, segments, translations, approvals, termRules));
         repository.updatePublishedVersion(documentId, publishedVersion);
         return new ApiDtos.PublishResponse(documentId, publishedVersion);

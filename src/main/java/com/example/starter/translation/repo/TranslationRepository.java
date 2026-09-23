@@ -2,8 +2,11 @@ package com.example.starter.translation.repo;
 
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
+import com.example.starter.translation.domain.Rows.DraftMigrationRow;
 import com.example.starter.translation.domain.Rows.RequestLogRow;
+import com.example.starter.translation.domain.Rows.RetirementImpactRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
+import com.example.starter.translation.domain.Rows.TermRetirementRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
 import com.example.starter.translation.domain.Rows.TranslationRow;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -188,9 +191,10 @@ public class TranslationRepository {
         }
     }
 
-    public void insertSnapshot(long documentId, int publishedVersion, String snapshotJson) {
-        jdbc.update("INSERT INTO release_snapshot (document_id, published_version, snapshot_json) VALUES (?, ?, ?)",
-                documentId, publishedVersion, snapshotJson);
+    public void insertSnapshot(long documentId, int publishedVersion, int termVersion, String snapshotJson) {
+        jdbc.update("INSERT INTO release_snapshot (document_id, published_version, term_version, snapshot_json) "
+                        + "VALUES (?, ?, ?, ?)",
+                documentId, publishedVersion, termVersion, snapshotJson);
     }
 
     /** 插入术语版本主记录（不可变，主键已存在时抛冲突）。 */
@@ -240,5 +244,173 @@ public class TranslationRepository {
     public void insertRequestLog(String requestId, String requestHash, int responseStatus, String responseBody) {
         jdbc.update("INSERT INTO request_log (request_id, request_hash, response_status, response_body) "
                 + "VALUES (?, ?, ?, ?)", requestId, requestHash, responseStatus, responseBody);
+    }
+
+    private static final RowMapper<TermRetirementRow> RETIREMENT_MAPPER = (rs, n) -> new TermRetirementRow(
+            rs.getLong("retirement_id"), rs.getLong("document_id"), rs.getString("retirement_key"),
+            rs.getInt("term_version"), rs.getString("language"), rs.getInt("replacement_version"),
+            rs.getLong("effective_from_utc"), rs.getLong("effective_to_utc"),
+            rs.getString("status"),
+            rs.getObject("activated_at_utc") == null ? null : rs.getLong("activated_at_utc"),
+            rs.getString("preview_json"), rs.getString("impact_snapshot_json"));
+
+    private static final RowMapper<RetirementImpactRow> IMPACT_MAPPER = (rs, n) -> new RetirementImpactRow(
+            rs.getLong("document_id"), rs.getLong("retirement_id"),
+            rs.getObject("published_version") == null ? null : rs.getInt("published_version"),
+            rs.getString("segment_id"), rs.getString("language"), rs.getString("kind"),
+            rs.getString("hit_terms_json"));
+
+    /** 插入退役单（初始状态 DRAFT），返回自增退役单 ID。 */
+    public long insertRetirement(long documentId, String retirementKey, int termVersion, String language,
+                                 int replacementVersion, long effectiveFromUtc, long effectiveToUtc,
+                                 String previewJson) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO term_retirement (document_id, retirement_key, term_version, language, "
+                            + "replacement_version, effective_from_utc, effective_to_utc, status, preview_json) "
+                            + "VALUES (?, ?, ?, ?, ?, ?, ?, '"
+                            + TermRetirementRow.STATUS_DRAFT + "', ?)",
+                    new String[]{"retirement_id"});
+            ps.setLong(1, documentId);
+            ps.setString(2, retirementKey);
+            ps.setInt(3, termVersion);
+            ps.setString(4, language);
+            ps.setInt(5, replacementVersion);
+            ps.setLong(6, effectiveFromUtc);
+            ps.setLong(7, effectiveToUtc);
+            ps.setString(8, previewJson);
+            return ps;
+        }, keyHolder);
+        Number key = keyHolder.getKey();
+        if (key == null) {
+            throw new IllegalStateException("退役单创建后未返回自增主键");
+        }
+        return key.longValue();
+    }
+
+    /** 按业务键查询退役单。 */
+    public Optional<TermRetirementRow> findRetirementByKey(long documentId, String retirementKey) {
+        List<TermRetirementRow> rows = jdbc.query(
+                "SELECT retirement_id, document_id, retirement_key, term_version, language, replacement_version, "
+                        + "effective_from_utc, effective_to_utc, status, activated_at_utc, preview_json, "
+                        + "impact_snapshot_json FROM term_retirement "
+                        + "WHERE document_id = ? AND retirement_key = ?",
+                RETIREMENT_MAPPER, documentId, retirementKey);
+        return rows.stream().findFirst();
+    }
+
+    /** 查询指定术语版本在指定语言下的全部退役单（用于窗口重叠与环检测）。 */
+    public List<TermRetirementRow> listRetirements(long documentId, int termVersion, String language) {
+        return jdbc.query(
+                "SELECT retirement_id, document_id, retirement_key, term_version, language, replacement_version, "
+                        + "effective_from_utc, effective_to_utc, status, activated_at_utc, preview_json, "
+                        + "impact_snapshot_json FROM term_retirement "
+                        + "WHERE document_id = ? AND term_version = ? AND language = ? "
+                        + "ORDER BY effective_from_utc, retirement_id",
+                RETIREMENT_MAPPER, documentId, termVersion, language);
+    }
+
+    /** 查询文档内全部退役单（用于替代环检测），按退役单 ID 稳定排序。 */
+    public List<TermRetirementRow> listAllRetirements(long documentId) {
+        return jdbc.query(
+                "SELECT retirement_id, document_id, retirement_key, term_version, language, replacement_version, "
+                        + "effective_from_utc, effective_to_utc, status, activated_at_utc, preview_json, "
+                        + "impact_snapshot_json FROM term_retirement "
+                        + "WHERE document_id = ? ORDER BY retirement_id",
+                RETIREMENT_MAPPER, documentId);
+    }
+
+    /** 激活退役单：置状态 ACTIVE、记录激活时刻并写入冻结的影响快照。 */
+    public void activateRetirement(long retirementId, long activatedAtUtc, String impactSnapshotJson) {
+        jdbc.update("UPDATE term_retirement SET status = '" + TermRetirementRow.STATUS_ACTIVE
+                        + "', activated_at_utc = ?, impact_snapshot_json = ? WHERE retirement_id = ?",
+                activatedAtUtc, impactSnapshotJson, retirementId);
+    }
+
+    /** 查询术语版本状态（ACTIVE/RETIRED）；版本不存在返回空。 */
+    public Optional<String> findTermVersionStatus(long documentId, int termVersion) {
+        List<String> rows = jdbc.query(
+                "SELECT status FROM term_version WHERE document_id = ? AND term_version = ?",
+                (rs, n) -> rs.getString(1), documentId, termVersion);
+        return rows.stream().findFirst();
+    }
+
+    /** 更新术语版本状态（退役激活后置为 RETIRED，不自动恢复）。 */
+    public void updateTermVersionStatus(long documentId, int termVersion, String status) {
+        jdbc.update("UPDATE term_version SET status = ? WHERE document_id = ? AND term_version = ?",
+                status, documentId, termVersion);
+    }
+
+    /**
+     * 判断指定术语版本在指定语言、指定 UTC 毫秒时刻是否已退役生效：
+     * 存在已激活退役单且窗口起（含）不晚于该时刻；窗口结束不恢复。
+     */
+    public boolean isTermVersionRetired(long documentId, int termVersion, String language, long nowUtcMillis) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM term_retirement WHERE document_id = ? AND term_version = ? AND language = ? "
+                        + "AND status = '" + TermRetirementRow.STATUS_ACTIVE + "' AND effective_from_utc <= ?",
+                Integer.class, documentId, termVersion, language, nowUtcMillis);
+        return count != null && count > 0;
+    }
+
+    /** 写入一条退役影响清单条目（预览或激活冻结）。 */
+    public void insertImpact(RetirementImpactRow row) {
+        jdbc.update("INSERT INTO retirement_impact (document_id, retirement_id, published_version, segment_id, "
+                        + "language, kind, hit_terms_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                row.documentId(), row.retirementId(), row.publishedVersion(), row.segmentId(),
+                row.language(), row.kind(), row.hitTermsJson());
+    }
+
+    /** 查询退役单的影响清单，按类型、发布版本、段落、语言稳定排序。 */
+    public List<RetirementImpactRow> listImpacts(long documentId, long retirementId) {
+        return jdbc.query(
+                "SELECT document_id, retirement_id, published_version, segment_id, language, kind, hit_terms_json "
+                        + "FROM retirement_impact WHERE document_id = ? AND retirement_id = ? "
+                        + "ORDER BY kind, published_version, segment_id, language",
+                IMPACT_MAPPER, documentId, retirementId);
+    }
+
+    /** 删除退役单的影响清单（激活前清除预览条目，重写冻结条目）。 */
+    public void deleteImpacts(long documentId, long retirementId) {
+        jdbc.update("DELETE FROM retirement_impact WHERE document_id = ? AND retirement_id = ?",
+                documentId, retirementId);
+    }
+
+    /** 查询绑定指定术语版本的发布版本号列表（历史受影响快照），按发布版本升序。 */
+    public List<Integer> listPublishedVersionsByTermVersion(long documentId, int termVersion) {
+        return jdbc.query(
+                "SELECT published_version FROM release_snapshot WHERE document_id = ? AND term_version = ? "
+                        + "ORDER BY published_version",
+                (rs, n) -> rs.getInt(1), documentId, termVersion);
+    }
+
+    /** 删除指定译文的批准（退役激活撤批）。 */
+    public void deleteApproval(long documentId, String segmentId, String language) {
+        jdbc.update("DELETE FROM approval WHERE document_id = ? AND segment_id = ? AND language = ?",
+                documentId, segmentId, language);
+    }
+
+    /** 写入一条草稿迁移记录。 */
+    public void insertMigration(DraftMigrationRow row) {
+        jdbc.update("INSERT INTO draft_migration (document_id, retirement_id, expected_version, rule_version, "
+                        + "old_summary, old_text_hash, new_summary, new_text_hash, segment_id, language, "
+                        + "created_at_utc, request_log_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                row.documentId(), row.retirementId(), row.expectedVersion(), row.ruleVersion(),
+                row.oldSummary(), row.oldTextHash(), row.newSummary(), row.newTextHash(),
+                row.segmentId(), row.language(), row.createdAtUtc(), row.requestLogId());
+    }
+
+    /** 查询退役单的全部草稿迁移记录，按段落、语言稳定排序。 */
+    public List<DraftMigrationRow> listMigrations(long documentId, long retirementId) {
+        return jdbc.query(
+                "SELECT document_id, retirement_id, expected_version, rule_version, old_summary, old_text_hash, "
+                        + "new_summary, new_text_hash, segment_id, language, created_at_utc, request_log_id "
+                        + "FROM draft_migration WHERE document_id = ? AND retirement_id = ? "
+                        + "ORDER BY segment_id, language",
+                (rs, n) -> new DraftMigrationRow(rs.getLong(1), rs.getLong(2), rs.getInt(3), rs.getInt(4),
+                        rs.getString(5), rs.getString(6), rs.getString(7), rs.getString(8),
+                        rs.getString(9), rs.getString(10), rs.getLong(11), rs.getString(12)),
+                documentId, retirementId);
     }
 }

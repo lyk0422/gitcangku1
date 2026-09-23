@@ -35,6 +35,9 @@ public abstract class AbstractIntegrationTest {
 
     @BeforeEach
     void cleanTables() {
+        jdbc.update("DELETE FROM draft_migration");
+        jdbc.update("DELETE FROM retirement_impact");
+        jdbc.update("DELETE FROM term_retirement");
         jdbc.update("DELETE FROM approval");
         jdbc.update("DELETE FROM translation");
         jdbc.update("DELETE FROM segment");
@@ -128,6 +131,38 @@ public abstract class AbstractIntegrationTest {
         String body = "{\"requestId\":\"" + requestId + "\",\"expectedTermVersion\":" + expectedTermVersion
                 + ",\"rules\":" + rulesJson + "}";
         return putJson("/api/documents/" + documentId + "/terms", body);
+    }
+
+    /** 创建术语版本退役单：窗口为左闭右开 UTC（ISO-8601）。 */
+    protected ApiResult createRetirement(long documentId, int termVersion, String language,
+                                         int replacementVersion, String effectiveFromUtc, String effectiveToUtc,
+                                         String retirementKey, String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"termVersion\":" + termVersion
+                + ",\"language\":\"" + language + "\",\"replacementVersion\":" + replacementVersion
+                + ",\"effectiveFromUtc\":\"" + effectiveFromUtc + "\",\"effectiveToUtc\":\"" + effectiveToUtc
+                + "\",\"retirementKey\":\"" + retirementKey + "\"}";
+        return postJson("/api/documents/" + documentId + "/retirements", body);
+    }
+
+    /** 激活退役单。 */
+    protected ApiResult activateRetirement(long documentId, String retirementKey, String requestId)
+            throws Exception {
+        return postJson("/api/documents/" + documentId + "/retirements/" + retirementKey + "/activate",
+                "{\"requestId\":\"" + requestId + "\"}");
+    }
+
+    /** 草稿原子迁移：entriesJson 为逐段替换结果数组 JSON。 */
+    protected ApiResult migrateDrafts(long documentId, String retirementKey, int expectedVersion,
+                                      String entriesJson, String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"expectedVersion\":" + expectedVersion
+                + ",\"entries\":" + entriesJson + "}";
+        return postJson("/api/documents/" + documentId + "/retirements/" + retirementKey + "/migrate-drafts",
+                body);
+    }
+
+    /** 查询退役单及影响清单。 */
+    protected ApiResult getRetirement(long documentId, String retirementKey) throws Exception {
+        return getJson("/api/documents/" + documentId + "/retirements/" + retirementKey);
     }
 
     /** HTTP 响应结果：状态码与 JSON 响应体。 */

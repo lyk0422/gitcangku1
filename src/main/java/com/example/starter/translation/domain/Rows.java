@@ -82,4 +82,75 @@ public final class Rows {
     public record RequestLogRow(String requestId, String requestHash,
                                 int responseStatus, String responseBody) {
     }
+
+    /**
+     * 术语版本退役单：指定退役术语版本、同语言替代版本与左闭右开 UTC 生效窗口。
+     *
+     * @param retirementId       退役单 ID，自增
+     * @param documentId         所属文档 ID
+     * @param retirementKey      退役单业务键，全局唯一
+     * @param termVersion        被退役的术语版本
+     * @param language           退役适用的目标语言码，小写
+     * @param replacementVersion 替代术语版本，创建与激活时均须 ACTIVE 且不形成替代环
+     * @param effectiveFromUtc   窗口起（含），UTC 毫秒
+     * @param effectiveToUtc     窗口止（不含），UTC 毫秒；窗口结束不自动恢复
+     * @param status             退役单状态：DRAFT 已创建未激活，ACTIVE 已激活
+     * @param activatedAtUtc     激活时刻 UTC 毫秒；未激活为 null
+     * @param previewJson        创建时生成的只读影响预览 JSON
+     * @param impactSnapshotJson 激活时冻结的影响集合 JSON；未激活为 null
+     */
+    public record TermRetirementRow(long retirementId, long documentId, String retirementKey,
+                                    int termVersion, String language, int replacementVersion,
+                                    long effectiveFromUtc, long effectiveToUtc,
+                                    String status, Long activatedAtUtc,
+                                    String previewJson, String impactSnapshotJson) {
+        /** 退役单状态：已创建未激活。 */
+        public static final String STATUS_DRAFT = "DRAFT";
+        /** 退役单状态：已激活，影响集合已冻结。 */
+        public static final String STATUS_ACTIVE = "ACTIVE";
+    }
+
+    /**
+     * 退役影响清单条目：创建预览与激活冻结各写一份；已发布快照不可变，仅登记历史影响。
+     *
+     * @param documentId       所属文档 ID
+     * @param retirementId     所属退役单 ID
+     * @param publishedVersion PUBLISHED 条目的发布版本号；DRAFT/APPROVED 条目为 null
+     * @param segmentId        条目段落 ID；仅受影响发布版本全部段落无术语命中时以 null 标记行登记
+     * @param language         目标语言码，小写
+     * @param kind             条目类型：DRAFT 普通草稿，APPROVED 激活时撤批，PUBLISHED 历史发布快照
+     * @param hitTermsJson     实际命中的术语位置 JSON 数组（sourceTerm 与字符偏移）
+     */
+    public record RetirementImpactRow(long documentId, long retirementId, Integer publishedVersion,
+                                      String segmentId, String language, String kind, String hitTermsJson) {
+        /** 影响类型：普通草稿。 */
+        public static final String KIND_DRAFT = "DRAFT";
+        /** 影响类型：已批准译文（激活时撤批）。 */
+        public static final String KIND_APPROVED = "APPROVED";
+        /** 影响类型：历史发布快照。 */
+        public static final String KIND_PUBLISHED = "PUBLISHED";
+    }
+
+    /**
+     * 草稿迁移记录：成功迁移逐稿增版，保存旧/新文本摘要、哈希与规则版本。
+     *
+     * @param documentId      所属文档 ID
+     * @param retirementId    所属退役单 ID
+     * @param expectedVersion 迁移命令声明的 expectedVersion（译文版本乐观校验）
+     * @param ruleVersion     替换校验使用的 replacementVersion（规则版本）
+     * @param oldSummary      旧文本摘要（SHA-256 前 32 字符）
+     * @param oldTextHash     旧文本完整 SHA-256
+     * @param newSummary      新文本摘要（SHA-256 前 32 字符）
+     * @param newTextHash     新文本完整 SHA-256
+     * @param segmentId       被迁移草稿的段落 ID
+     * @param language        被迁移草稿的语言码，小写
+     * @param createdAtUtc    迁移成功时间 UTC 毫秒
+     * @param requestLogId    关联的幂等请求 ID
+     */
+    public record DraftMigrationRow(long documentId, long retirementId, int expectedVersion,
+                                    int ruleVersion, String oldSummary, String oldTextHash,
+                                    String newSummary, String newTextHash,
+                                    String segmentId, String language,
+                                    long createdAtUtc, String requestLogId) {
+    }
 }

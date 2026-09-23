@@ -132,4 +132,63 @@ public final class ApiDtos {
             this(error, message, null);
         }
     }
+
+    /** 创建术语版本退役单请求：左闭右开 UTC 生效窗口（ISO-8601），同语言替代版本与文档内唯一 retirementKey。 */
+    public record CreateRetirementRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @Positive(message = "termVersion 必须为正数") int termVersion,
+            @NotBlank(message = "language 不能为空") String language,
+            @Positive(message = "replacementVersion 必须为正数") int replacementVersion,
+            @NotBlank(message = "effectiveFromUtc 不能为空") String effectiveFromUtc,
+            @NotBlank(message = "effectiveToUtc 不能为空") String effectiveToUtc,
+            @NotBlank(message = "retirementKey 不能为空") @Size(max = 128) String retirementKey) {
+    }
+
+    /** 激活退役单请求。 */
+    public record ActivateRetirementRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId) {
+    }
+
+    /** 实际命中的术语位置：sourceTerm 在源文中的字符偏移区间（左闭右开）。 */
+    public record HitTermView(String sourceTerm, int startOffset, int endOffset) {
+    }
+
+    /** 退役影响条目：DRAFT/APPROVED 按段落+语言，PUBLISHED 按发布版本+段落。 */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public record ImpactEntryView(String kind, Integer publishedVersion, String segmentId, String language,
+                                  List<HitTermView> hitTerms) {
+    }
+
+    /** 退役单视图：窗口、状态与影响清单（创建为预览，激活后为冻结快照，稳定排序）。 */
+    public record RetirementView(long documentId, String retirementKey, int termVersion, String language,
+                                 int replacementVersion, String effectiveFromUtc, String effectiveToUtc,
+                                 String status, List<ImpactEntryView> impact) {
+    }
+
+    /** 逐段替换结果：某段落某语言草稿的新正文。 */
+    public record MigrationEntryInput(
+            @NotBlank(message = "segmentId 不能为空") @Size(max = 64) String segmentId,
+            @NotBlank(message = "language 不能为空") String language,
+            @NotBlank(message = "content 不能为空") String content) {
+    }
+
+    /**
+     * 草稿迁移命令：一次覆盖预览中仍受影响的全部草稿；
+     * expectedVersion 为期望的文档草稿版本（乐观校验，不符 409）。
+     */
+    public record MigrateDraftsRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @Positive(message = "expectedVersion 必须为正数") int expectedVersion,
+            @NotNull(message = "entries 不能为空") List<@Valid MigrationEntryInput> entries) {
+    }
+
+    /** 单条草稿迁移结果：增版后的译文版本、旧/新文本摘要与规则版本。 */
+    public record MigrationResultView(String segmentId, String language, int translationVersion,
+                                      String oldSummary, String newSummary, int ruleVersion) {
+    }
+
+    /** 草稿迁移响应。 */
+    public record MigrateDraftsResponse(long documentId, String retirementKey, int migratedCount,
+                                        int draftVersion, List<MigrationResultView> migrations) {
+    }
 }
