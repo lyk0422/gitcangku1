@@ -72,25 +72,56 @@ CREATE TABLE IF NOT EXISTS unblind_request (
     treatment               VARCHAR(1),
     created_at              BIGINT       NOT NULL,
     reviewed_at             BIGINT,
+    expires_at              BIGINT       NOT NULL,
+    valid_minutes           INT          NOT NULL,
+    terminated_at           BIGINT,
+    terminate_reason        VARCHAR(500),
+    terminate_actor         VARCHAR(64),
     pending_allocation_id   BIGINT,
     CONSTRAINT pk_unblind_request PRIMARY KEY (id),
     CONSTRAINT uq_unblind_pending UNIQUE (pending_allocation_id),
-    CONSTRAINT ck_unblind_status CHECK (status IN ('PENDING', 'APPROVED')),
-    CONSTRAINT ck_unblind_treatment CHECK (treatment IS NULL OR treatment IN ('A', 'B'))
+    CONSTRAINT ck_unblind_status CHECK (status IN ('PENDING', 'APPROVED', 'CANCELLED', 'REJECTED', 'EXPIRED')),
+    CONSTRAINT ck_unblind_treatment CHECK (treatment IS NULL OR treatment IN ('A', 'B')),
+    CONSTRAINT ck_unblind_valid_minutes CHECK (valid_minutes BETWEEN 1 AND 60)
 );
-COMMENT ON TABLE  unblind_request IS '揭盲申请表；同一分配至多一个待审申请，须由另一名 REVIEWER 批准后申请人方可查看结果';
-COMMENT ON COLUMN unblind_request.id IS '揭盲申请编号，全局唯一';
+-- 兼容旧版表结构：旧库缺少终止机制列时补齐（全新建表已含这些列，以下语句幂等）。
+-- 必须在本列的 COMMENT 语句之前执行，保证旧库上新增列已存在。
+ALTER TABLE unblind_request ADD COLUMN IF NOT EXISTS expires_at BIGINT;
+ALTER TABLE unblind_request ADD COLUMN IF NOT EXISTS valid_minutes INT;
+ALTER TABLE unblind_request ADD COLUMN IF NOT EXISTS terminated_at BIGINT;
+ALTER TABLE unblind_request ADD COLUMN IF NOT EXISTS terminate_reason VARCHAR(500);
+ALTER TABLE unblind_request ADD COLUMN IF NOT EXISTS terminate_actor VARCHAR(64);
+-- 历史 PENDING 申请以原创建时间加 30 分钟计算有效期，原 APPROVED 结果不追溯设限（仅回填时间列）。
+UPDATE unblind_request SET valid_minutes = 30 WHERE valid_minutes IS NULL;
+UPDATE unblind_request SET expires_at = created_at + 30 * 60000 WHERE expires_at IS NULL;
+-- 回填完成后收紧为 NOT NULL；旧库 CHECK 仅允许 PENDING/APPROVED，需替换为含全部终态的约束，
+-- 否则历史 PENDING 到期后无法归档为 EXPIRED。全新库上同名约束先删后建，语句保持幂等。
+ALTER TABLE unblind_request ALTER COLUMN expires_at SET NOT NULL;
+ALTER TABLE unblind_request ALTER COLUMN valid_minutes SET NOT NULL;
+ALTER TABLE unblind_request DROP CONSTRAINT IF EXISTS ck_unblind_status;
+ALTER TABLE unblind_request ADD CONSTRAINT ck_unblind_status
+    CHECK (status IN ('PENDING', 'APPROVED', 'CANCELLED', 'REJECTED', 'EXPIRED'));
+ALTER TABLE unblind_request DROP CONSTRAINT IF EXISTS ck_unblind_valid_minutes;
+ALTER TABLE unblind_request ADD CONSTRAINT ck_unblind_valid_minutes
+    CHECK (valid_minutes BETWEEN 1 AND 60);
+COMMENT ON TABLE  unblind_request IS '揭盲申请表；同一参与者（按 allocation_id）至多一个有效待审申请，批准须由另一名 REVIEWER 完成，支持撤销/拒绝/到期终止';
+COMMENT ON COLUMN unblind_request.id IS '揭盲申请编号，全局唯一；重新申请生成新编号，历史记录不可覆盖';
 COMMENT ON COLUMN unblind_request.experiment_id IS '所属实验编号';
 COMMENT ON COLUMN unblind_request.participant_id IS '被申请揭盲的合成参与者编号';
 COMMENT ON COLUMN unblind_request.allocation_id IS '对应分配主键';
 COMMENT ON COLUMN unblind_request.reason IS '揭盲原因，必填，非空';
 COMMENT ON COLUMN unblind_request.applicant_actor IS '申请人操作者编号，须为 COORDINATOR，且只有其本人能查询揭盲结果';
-COMMENT ON COLUMN unblind_request.reviewer_actor IS '批准的 REVIEWER 操作者编号，必须不同于申请人；未批准时为 NULL';
-COMMENT ON COLUMN unblind_request.status IS '申请状态：PENDING=待审；APPROVED=已批准';
-COMMENT ON COLUMN unblind_request.treatment IS '揭盲结果处理代码 A/B，批准时写入；NULL=尚未批准';
+COMMENT ON COLUMN unblind_request.reviewer_actor IS '终态处理人（批准人/拒绝人）操作者编号，必须不同于申请人；撤销或到期时为 NULL';
+COMMENT ON COLUMN unblind_request.status IS '申请状态：PENDING=待审；APPROVED=已批准；CANCELLED=申请人撤销；REJECTED=审阅员拒绝；EXPIRED=到期未裁决';
+COMMENT ON COLUMN unblind_request.treatment IS '揭盲结果处理代码 A/B，批准时写入；NULL=尚未批准或申请终止';
 COMMENT ON COLUMN unblind_request.created_at IS '申请时间，Unix 毫秒，UTC';
-COMMENT ON COLUMN unblind_request.reviewed_at IS '批准时间，Unix 毫秒，UTC；NULL 表示未批准';
-COMMENT ON COLUMN unblind_request.pending_allocation_id IS '待审去重列：待审时等于 allocation_id，终态置 NULL；唯一索引保证同一分配至多一个待审申请';
+COMMENT ON COLUMN unblind_request.reviewed_at IS '裁决时间（批准/拒绝），Unix 毫秒，UTC；NULL 表示未裁决';
+COMMENT ON COLUMN unblind_request.expires_at IS '到期时刻，Unix 毫秒，UTC；等于 created_at + valid_minutes*60000，历史 PENDING 按创建时间加 30 分钟';
+COMMENT ON COLUMN unblind_request.valid_minutes IS '申请有效时长（分钟），取值1~60，缺省 30';
+COMMENT ON COLUMN unblind_request.terminated_at IS '终止时间，Unix 毫秒，UTC：撤销为提交时刻，到期固定为 expires_at；NULL 表示未终止';
+COMMENT ON COLUMN unblind_request.terminate_reason IS '终止原因：拒绝时为审阅员填写的非空原因，撤销时为申请人填写的原因，到期为 NULL';
+COMMENT ON COLUMN unblind_request.terminate_actor IS '终止处理人：撤销为申请人本人，拒绝为审阅员，到期为 NULL（不伪造人工处理人）';
+COMMENT ON COLUMN unblind_request.pending_allocation_id IS '有效待审去重列：PENDING 未到期时等于 allocation_id，终态或归档过期后置 NULL；唯一索引保证同一参与者至多一份有效待审';
 
 CREATE TABLE IF NOT EXISTS idempotent_request (
     request_id      VARCHAR(64)  NOT NULL,

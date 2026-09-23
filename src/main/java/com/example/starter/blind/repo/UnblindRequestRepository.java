@@ -7,7 +7,8 @@ import org.springframework.stereotype.Repository;
 import java.util.List;
 
 /**
- * 揭盲申请数据访问；同一分配至多一个待审申请由唯一列 pending_allocation_id 保证。
+ * 揭盲申请数据访问；同一参与者至多一个有效待审申请由唯一列 pending_allocation_id 保证。
+ * 到期（PENDING 且 now &gt;= expires_at）普通查询不写库，仅在新建申请的同一事务内归档。
  */
 @Repository
 public class UnblindRequestRepository {
@@ -24,7 +25,12 @@ public class UnblindRequestRepository {
             String status,
             String treatment,
             long createdAt,
-            Long reviewedAt) {
+            Long reviewedAt,
+            long expiresAt,
+            int validMinutes,
+            Long terminatedAt,
+            String terminateReason,
+            String terminateActor) {
     }
 
     private static final RowMapper<UnblindRequestRow> MAPPER = (rs, n) -> new UnblindRequestRow(
@@ -38,11 +44,17 @@ public class UnblindRequestRepository {
             rs.getString("status"),
             rs.getString("treatment"),
             rs.getLong("created_at"),
-            (Long) rs.getObject("reviewed_at"));
+            (Long) rs.getObject("reviewed_at"),
+            rs.getLong("expires_at"),
+            rs.getInt("valid_minutes"),
+            (Long) rs.getObject("terminated_at"),
+            rs.getString("terminate_reason"),
+            rs.getString("terminate_actor"));
 
     private static final String COLUMNS =
             "id, experiment_id, participant_id, allocation_id, reason, applicant_actor, "
-                    + "reviewer_actor, status, treatment, created_at, reviewed_at";
+                    + "reviewer_actor, status, treatment, created_at, reviewed_at, "
+                    + "expires_at, valid_minutes, terminated_at, terminate_reason, terminate_actor";
 
     private final JdbcTemplate jdbc;
 
@@ -51,15 +63,19 @@ public class UnblindRequestRepository {
     }
 
     /**
-     * 插入待审申请；若该分配已有待审申请，唯一索引 uq_unblind_pending 触发异常。
+     * 插入待审申请；若该参与者已有有效待审申请，唯一索引 uq_unblind_pending 触发异常。
      */
     public void insertPending(UnblindRequestRow row) {
         jdbc.update("INSERT INTO unblind_request ("
                         + "id, experiment_id, participant_id, allocation_id, reason, applicant_actor, "
-                        + "reviewer_actor, status, treatment, created_at, reviewed_at, pending_allocation_id"
-                        + ") VALUES (?, ?, ?, ?, ?, ?, NULL, 'PENDING', NULL, ?, NULL, ?)",
+                        + "reviewer_actor, status, treatment, created_at, reviewed_at, "
+                        + "expires_at, valid_minutes, terminated_at, terminate_reason, terminate_actor, "
+                        + "pending_allocation_id"
+                        + ") VALUES (?, ?, ?, ?, ?, ?, NULL, 'PENDING', NULL, ?, NULL, "
+                        + "?, ?, NULL, NULL, NULL, ?)",
                 row.id(), row.experimentId(), row.participantId(), row.allocationId(),
-                row.reason(), row.applicantActor(), row.createdAt(), row.allocationId());
+                row.reason(), row.applicantActor(), row.createdAt(),
+                row.expiresAt(), row.validMinutes(), row.allocationId());
     }
 
     public UnblindRequestRow findById(String requestId) {
@@ -69,7 +85,7 @@ public class UnblindRequestRepository {
     }
 
     /**
-     * 行级锁定申请，保证批准并发安全。
+     * 行级锁定申请，保证裁决并发安全。
      */
     public UnblindRequestRow lockById(String requestId) {
         List<UnblindRequestRow> rows = jdbc.query(
@@ -78,10 +94,14 @@ public class UnblindRequestRepository {
         return rows.isEmpty() ? null : rows.get(0);
     }
 
-    public UnblindRequestRow findPendingByAllocation(long allocationId) {
+    /**
+     * 行级锁定该参与者当前占据待审唯一占位的申请（不过滤状态/到期时间，
+     * 由服务层按事务内时钟裁决）；无占位时返回 null。
+     */
+    public UnblindRequestRow lockPendingHolderByAllocation(long allocationId) {
         List<UnblindRequestRow> rows = jdbc.query(
                 "SELECT " + COLUMNS + " FROM unblind_request "
-                        + "WHERE pending_allocation_id = ? AND status = 'PENDING'",
+                        + "WHERE pending_allocation_id = ? FOR UPDATE",
                 MAPPER, allocationId);
         return rows.isEmpty() ? null : rows.get(0);
     }
@@ -89,12 +109,51 @@ public class UnblindRequestRepository {
     /**
      * 批准：仅 PENDING 可批准，写入处理代码、批准人与时间，并释放待审唯一占位。
      *
-     * @return 受影响行数；0 表示不存在或已批准
+     * @return 受影响行数；0 表示不存在或已终态
      */
     public int approve(String requestId, String reviewerActor, String treatment, long reviewedAt) {
         return jdbc.update("UPDATE unblind_request SET status = 'APPROVED', reviewer_actor = ?, "
                         + "treatment = ?, reviewed_at = ?, pending_allocation_id = NULL "
                         + "WHERE id = ? AND status = 'PENDING'",
                 reviewerActor, treatment, reviewedAt, requestId);
+    }
+
+    /**
+     * 拒绝：仅 PENDING 可拒绝，写入拒绝人、非空原因与时间，并释放待审唯一占位。
+     *
+     * @return 受影响行数；0 表示不存在或已终态
+     */
+    public int reject(String requestId, String reviewerActor, String reason, long reviewedAt) {
+        return jdbc.update("UPDATE unblind_request SET status = 'REJECTED', reviewer_actor = ?, "
+                        + "reviewed_at = ?, terminate_reason = ?, terminate_actor = ?, "
+                        + "terminated_at = ?, pending_allocation_id = NULL "
+                        + "WHERE id = ? AND status = 'PENDING'",
+                reviewerActor, reviewedAt, reason, reviewerActor, reviewedAt, requestId);
+    }
+
+    /**
+     * 撤销：仅 PENDING 可撤销，记录撤销人、撤销原因（可空）与时间，并释放待审唯一占位。
+     *
+     * @return 受影响行数；0 表示不存在或已终态
+     */
+    public int cancel(String requestId, String applicantActor, String reason, long cancelledAt) {
+        return jdbc.update("UPDATE unblind_request SET status = 'CANCELLED', "
+                        + "terminate_reason = ?, terminate_actor = ?, terminated_at = ?, "
+                        + "pending_allocation_id = NULL "
+                        + "WHERE id = ? AND status = 'PENDING'",
+                reason, applicantActor, cancelledAt, requestId);
+    }
+
+    /**
+     * 归档到期占位：仅 PENDING 且已到期（now &gt;= expires_at）可归档，
+     * 终态 EXPIRED 的终止时间固定为 expiresAt，不写处理代码、不伪造处理人。
+     *
+     * @return 受影响行数；0 表示不存在、未到期或已终态
+     */
+    public int archiveExpired(String requestId, long now) {
+        return jdbc.update("UPDATE unblind_request SET status = 'EXPIRED', "
+                        + "terminated_at = expires_at, pending_allocation_id = NULL "
+                        + "WHERE id = ? AND status = 'PENDING' AND ? >= expires_at",
+                requestId, now);
     }
 }
