@@ -14,6 +14,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
 import java.io.IOException;
+import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
@@ -46,6 +47,20 @@ public class JacksonConfig {
             public OffsetDateTime deserialize(JsonParser parser, DeserializationContext context)
                     throws IOException {
                 return OffsetDateTime.parse(parser.getText(), DateTimeFormatter.ISO_OFFSET_DATE_TIME);
+            }
+        });
+        module.addSerializer(LocalDate.class, new JsonSerializer<>() {
+            @Override
+            public void serialize(LocalDate value, JsonGenerator gen, SerializerProvider serializers)
+                    throws IOException {
+                gen.writeString(DateTimeFormatter.ISO_LOCAL_DATE.format(value));
+            }
+        });
+        module.addDeserializer(LocalDate.class, new JsonDeserializer<>() {
+            @Override
+            public LocalDate deserialize(JsonParser parser, DeserializationContext context)
+                    throws IOException {
+                return LocalDate.parse(parser.getText(), DateTimeFormatter.ISO_LOCAL_DATE);
             }
         });
         return builder -> builder

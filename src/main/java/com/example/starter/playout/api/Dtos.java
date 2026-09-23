@@ -7,6 +7,7 @@ import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.PositiveOrZero;
 
+import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.util.List;
 
@@ -170,5 +171,97 @@ public final class Dtos {
 
     /** 统一错误响应体。 */
     public record ErrorResponse(String error, String message) {
+    }
+
+    // ---------- 播出端版本租约 ----------
+
+    /** 租约状态：ACTIVE 生效中 / COMPLETED 全部分段已确认 / EXPIRED 已过期（读取时按到期时间换算）。 */
+    public enum LeaseStatus {
+        ACTIVE, COMPLETED, EXPIRED
+    }
+
+    /**
+     * 播出端拉取租约请求。同客户端+业务日最多一个 ACTIVE 租约；requestId 幂等：
+     * 同键同参返回首次结果，改参 409，失败不占键。
+     */
+    public record PullLeaseRequest(
+            @NotBlank String requestId,
+            @NotBlank String clientKey,
+            @NotBlank String channelId,
+            @NotNull LocalDate businessDay) {
+    }
+
+    /** 租约分段快照元素；grantRevoked 为拉取时刻的授权判定，快照后不回写。 */
+    public record LeaseSegmentSnapshot(
+            int seq,
+            String segmentId,
+            String assetId,
+            long grantId,
+            boolean grantRevoked,
+            OffsetDateTime start,
+            OffsetDateTime end) {
+    }
+
+    /** 租约插播快照元素，记录拉取时刻 ACTIVE 的紧急插播。 */
+    public record LeaseOverrideSnapshot(
+            String overrideKey,
+            String assetId,
+            long grantId,
+            int priority,
+            OffsetDateTime start,
+            OffsetDateTime end) {
+    }
+
+    /** 租约明细响应：绑定发布版本与完整分段、授权判定、插播快照；续租推进 leaseEpoch 但版本不变。 */
+    public record LeaseResponse(
+            long leaseId,
+            String clientKey,
+            String channelId,
+            String businessDay,
+            long leaseEpoch,
+            LeaseStatus status,
+            long publicationId,
+            long publishedVersion,
+            OffsetDateTime expiresAt,
+            OffsetDateTime createdAt,
+            List<LeaseSegmentSnapshot> segments,
+            List<LeaseOverrideSnapshot> overrides) {
+    }
+
+    /** 续租请求（幂等）；仅 ACTIVE 且未过期的租约可续租。 */
+    public record RenewLeaseRequest(@NotBlank String requestId) {
+    }
+
+    /**
+     * 分段确认请求。只能按顺序确认下一个未确认分段；playedAt 须落在该段时窗 [start, end) 内；
+     * ackKey 幂等：同键同参返回首次结果，改参 409，失败不占键。
+     */
+    public record SegmentAckRequest(
+            @NotBlank String ackKey,
+            @NotNull @Positive Long leaseId,
+            @NotNull @Positive Long leaseEpoch,
+            @NotBlank String segmentId,
+            @NotNull OffsetDateTime playedAt) {
+    }
+
+    /** 分段确认响应；leaseStatus 为本次确认后的租约状态，全部确认后为 COMPLETED。 */
+    public record SegmentAckResponse(
+            String ackKey,
+            long leaseId,
+            long leaseEpoch,
+            String segmentId,
+            int seq,
+            OffsetDateTime playedAt,
+            int confirmedCount,
+            int totalCount,
+            LeaseStatus leaseStatus) {
+    }
+
+    /** 发布版本引用查询元素；cleanable 为 true 表示不存在引用该版本的未过期 ACTIVE 租约。 */
+    public record PublicationReferenceResponse(
+            long publicationId,
+            long publishedVersion,
+            long activeLeaseCount,
+            boolean cleanable) {
     }
 }

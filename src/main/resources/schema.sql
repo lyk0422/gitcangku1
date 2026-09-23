@@ -74,7 +74,7 @@ CREATE TABLE IF NOT EXISTS playout_publication_segment (
 
 CREATE TABLE IF NOT EXISTS playout_request (
     request_id    VARCHAR(64)  NOT NULL COMMENT '幂等请求 ID，客户端生成',
-    operation     VARCHAR(32)  NOT NULL COMMENT '操作类型：REPLACE_DRAFT / PUBLISH / REVOKE_GRANT / CREATE_OVERRIDE / CANCEL_OVERRIDE',
+    operation     VARCHAR(32)  NOT NULL COMMENT '操作类型：REPLACE_DRAFT / PUBLISH / REVOKE_GRANT / CREATE_OVERRIDE / CANCEL_OVERRIDE / PULL_LEASE / RENEW_LEASE',
     params_hash   VARCHAR(64)  NOT NULL COMMENT '业务参数（不含 requestId）的 SHA-256，十六进制',
     response_body TEXT         NULL COMMENT '成功时的响应 JSON；失败请求回滚不占用 requestId',
     created_at_ms BIGINT       NOT NULL COMMENT '记录创建时间，UTC 纪元毫秒',
@@ -97,3 +97,68 @@ CREATE TABLE IF NOT EXISTS playout_emergency_override (
     PRIMARY KEY (override_key),
     KEY idx_override_playout (channel_id, status, start_ms, end_ms, priority)
 ) COMMENT = '限时紧急插播表；不改写日草稿与发布快照，同频道同优先级 ACTIVE 区间不得重叠';
+
+CREATE TABLE IF NOT EXISTS playout_edge_client (
+    client_key    VARCHAR(64) NOT NULL COMMENT '播出端客户端键，客户端指定，创建后不变',
+    created_at_ms BIGINT      NOT NULL COMMENT '首次登记时间，UTC 纪元毫秒',
+    PRIMARY KEY (client_key)
+) COMMENT = '播出端客户端表，用于按客户端串行化租约拉取与续租';
+
+CREATE TABLE IF NOT EXISTS playout_lease (
+    id                BIGINT      NOT NULL AUTO_INCREMENT COMMENT '租约自增 ID',
+    client_key        VARCHAR(64) NOT NULL COMMENT '播出端客户端键',
+    channel_id        VARCHAR(64) NOT NULL COMMENT '绑定频道 ID',
+    business_day      DATE        NOT NULL COMMENT '业务日，Asia/Shanghai 日历日',
+    publication_id    BIGINT      NOT NULL COMMENT '绑定的发布快照 ID，租约存续期间不变，新发布不替换',
+    published_version BIGINT      NOT NULL COMMENT '绑定的发布版本号，冗余便于查询',
+    lease_epoch       BIGINT      NOT NULL COMMENT '租约纪元，每客户端+业务日从 1 起递增，续租推进',
+    status            VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE 生效中 / COMPLETED 全部确认 / EXPIRED 已过期',
+    expires_at_ms     BIGINT      NOT NULL COMMENT '租约到期时间（不含），UTC 纪元毫秒',
+    created_at_ms     BIGINT      NOT NULL COMMENT '租约创建时间，UTC 纪元毫秒',
+    renewed_at_ms     BIGINT      NULL COMMENT '最近续租时间，UTC 纪元毫秒；未续租为 NULL',
+    completed_at_ms   BIGINT      NULL COMMENT '全部分段确认完成时间，UTC 纪元毫秒；未完成为 NULL',
+    PRIMARY KEY (id),
+    KEY idx_lease_client (client_key, business_day, status),
+    KEY idx_lease_publication (publication_id, status, expires_at_ms)
+) COMMENT = '播出端版本租约表，每客户端+业务日最多一个 ACTIVE 租约';
+
+CREATE TABLE IF NOT EXISTS playout_lease_segment (
+    id            BIGINT      NOT NULL AUTO_INCREMENT COMMENT '租约分段快照自增 ID',
+    lease_id      BIGINT      NOT NULL COMMENT '所属租约 ID',
+    seq           INT         NOT NULL COMMENT '分段顺序，从 1 开始，按播出开始时间升序',
+    segment_id    VARCHAR(64) NOT NULL COMMENT '发布快照片段 ID',
+    asset_id      VARCHAR(64) NOT NULL COMMENT '播出素材 ID',
+    grant_id      BIGINT      NOT NULL COMMENT '发布时选定的授权 ID',
+    grant_revoked TINYINT(1)  NOT NULL COMMENT '拉取快照时刻的授权判定：0 未撤销，1 已撤销；快照后不回写',
+    start_ms      BIGINT      NOT NULL COMMENT '分段开始（含），UTC 纪元毫秒',
+    end_ms        BIGINT      NOT NULL COMMENT '分段结束（不含），UTC 纪元毫秒',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_lease_segment_seq (lease_id, seq)
+) COMMENT = '租约分段快照表，创建后只读不回写';
+
+CREATE TABLE IF NOT EXISTS playout_lease_override (
+    id           BIGINT      NOT NULL AUTO_INCREMENT COMMENT '租约插播快照自增 ID',
+    lease_id     BIGINT      NOT NULL COMMENT '所属租约 ID',
+    override_key VARCHAR(64) NOT NULL COMMENT '紧急插播键',
+    asset_id     VARCHAR(64) NOT NULL COMMENT '插播素材 ID',
+    grant_id     BIGINT      NOT NULL COMMENT '插播创建时指定的授权 ID',
+    priority     TINYINT     NOT NULL COMMENT '优先级，1～9，数字越大优先级越高',
+    start_ms     BIGINT      NOT NULL COMMENT '插播开始（含），UTC 纪元毫秒',
+    end_ms       BIGINT      NOT NULL COMMENT '插播结束（不含），UTC 纪元毫秒',
+    PRIMARY KEY (id),
+    KEY idx_lease_override (lease_id)
+) COMMENT = '租约插播快照表，记录拉取时刻 ACTIVE 插播，创建后只读不回写';
+
+CREATE TABLE IF NOT EXISTS playout_lease_ack (
+    id            BIGINT      NOT NULL AUTO_INCREMENT COMMENT '分段确认自增 ID',
+    ack_key       VARCHAR(64) NOT NULL COMMENT '确认幂等键，客户端生成，全局唯一；失败回滚不占键',
+    lease_id      BIGINT      NOT NULL COMMENT '所属租约 ID',
+    lease_epoch   BIGINT      NOT NULL COMMENT '确认时的租约纪元，须与租约当前纪元一致',
+    seq           INT         NOT NULL COMMENT '确认的分段顺序号，只能按顺序确认下一个未确认分段',
+    segment_id    VARCHAR(64) NOT NULL COMMENT '确认的分段 ID',
+    played_at_ms  BIGINT      NOT NULL COMMENT '播出端上报的实际播出时刻，UTC 纪元毫秒，须落在分段时窗内',
+    created_at_ms BIGINT      NOT NULL COMMENT '确认受理时间，UTC 纪元毫秒',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_lease_ack_key (ack_key),
+    UNIQUE KEY uk_lease_ack_seq (lease_id, seq)
+) COMMENT = '分段确认表，按分段顺序递增确认，确认后不回写';

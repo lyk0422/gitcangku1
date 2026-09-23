@@ -381,4 +381,22 @@ public class PlayoutRepository {
                         + " WHERE override_key = ? AND status = 'ACTIVE'",
                 cancelRequestId, cancelledAtMs, overrideKey);
     }
+
+    /** 发布快照的全部片段，按播出开始时间升序（供租约拉取生成完整分段快照）。 */
+    public List<PublicationSegmentRow> findPublicationSegments(long publicationId) {
+        return jdbc.query("SELECT id, publication_id, segment_id, asset_id, grant_id, start_ms, end_ms"
+                        + " FROM playout_publication_segment"
+                        + " WHERE publication_id = ? ORDER BY start_ms, segment_id",
+                PUBLICATION_SEGMENT_MAPPER, publicationId);
+    }
+
+    /** 某业务日当前 ACTIVE 的紧急插播，按开始时间排序；须在持频道锁后调用以保证快照一致。 */
+    public List<OverrideRow> findActiveOverridesForDay(String channelId, LocalDate businessDay) {
+        return jdbc.query("SELECT override_key, channel_id, asset_id, grant_id, priority, start_ms,"
+                        + " end_ms, business_day, status, cancel_request_id, cancelled_at_ms, created_at_ms"
+                        + " FROM playout_emergency_override"
+                        + " WHERE channel_id = ? AND business_day = ? AND status = 'ACTIVE'"
+                        + " ORDER BY start_ms, override_key",
+                OVERRIDE_MAPPER, channelId, Date.valueOf(businessDay));
+    }
 }

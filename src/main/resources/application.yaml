@@ -38,3 +38,7 @@ management:
   endpoint:
     health:
       show-details: never
+
+playout:
+  # 播出端版本租约有效期，单位毫秒；到期后新拉取可绑定最新发布版本
+  lease-ttl-ms: ${PLAYOUT_LEASE_TTL_MS:600000}

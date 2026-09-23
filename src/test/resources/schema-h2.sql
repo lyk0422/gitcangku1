@@ -91,3 +91,65 @@ CREATE TABLE IF NOT EXISTS playout_emergency_override (
 );
 CREATE INDEX IF NOT EXISTS idx_override_playout
     ON playout_emergency_override (channel_id, status, start_ms, end_ms, priority);
+
+CREATE TABLE IF NOT EXISTS playout_edge_client (
+    client_key    VARCHAR(64) NOT NULL PRIMARY KEY,
+    created_at_ms BIGINT      NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS playout_lease (
+    id                BIGINT      NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    client_key        VARCHAR(64) NOT NULL,
+    channel_id        VARCHAR(64) NOT NULL,
+    business_day      DATE        NOT NULL,
+    publication_id    BIGINT      NOT NULL,
+    published_version BIGINT      NOT NULL,
+    lease_epoch       BIGINT      NOT NULL,
+    status            VARCHAR(16) NOT NULL,
+    expires_at_ms     BIGINT      NOT NULL,
+    created_at_ms     BIGINT      NOT NULL,
+    renewed_at_ms     BIGINT      NULL,
+    completed_at_ms   BIGINT      NULL
+);
+CREATE INDEX IF NOT EXISTS idx_lease_client
+    ON playout_lease (client_key, business_day, status);
+CREATE INDEX IF NOT EXISTS idx_lease_publication
+    ON playout_lease (publication_id, status, expires_at_ms);
+
+CREATE TABLE IF NOT EXISTS playout_lease_segment (
+    id            BIGINT      NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    lease_id      BIGINT      NOT NULL,
+    seq           INT         NOT NULL,
+    segment_id    VARCHAR(64) NOT NULL,
+    asset_id      VARCHAR(64) NOT NULL,
+    grant_id      BIGINT      NOT NULL,
+    grant_revoked TINYINT(1)  NOT NULL,
+    start_ms      BIGINT      NOT NULL,
+    end_ms        BIGINT      NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uk_lease_segment_seq ON playout_lease_segment (lease_id, seq);
+
+CREATE TABLE IF NOT EXISTS playout_lease_override (
+    id           BIGINT      NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    lease_id     BIGINT      NOT NULL,
+    override_key VARCHAR(64) NOT NULL,
+    asset_id     VARCHAR(64) NOT NULL,
+    grant_id     BIGINT      NOT NULL,
+    priority     TINYINT     NOT NULL,
+    start_ms     BIGINT      NOT NULL,
+    end_ms       BIGINT      NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_lease_override ON playout_lease_override (lease_id);
+
+CREATE TABLE IF NOT EXISTS playout_lease_ack (
+    id            BIGINT      NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    ack_key       VARCHAR(64) NOT NULL,
+    lease_id      BIGINT      NOT NULL,
+    lease_epoch   BIGINT      NOT NULL,
+    seq           INT         NOT NULL,
+    segment_id    VARCHAR(64) NOT NULL,
+    played_at_ms  BIGINT      NOT NULL,
+    created_at_ms BIGINT      NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uk_lease_ack_key ON playout_lease_ack (ack_key);
+CREATE UNIQUE INDEX IF NOT EXISTS uk_lease_ack_seq ON playout_lease_ack (lease_id, seq);
