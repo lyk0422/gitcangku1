@@ -36,11 +36,14 @@ CREATE TABLE IF NOT EXISTS rollout_task (
   device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
   status VARCHAR(16) NOT NULL COMMENT 'PENDING待回执；SUCCESS成功；FAILED失败；CANCELLED已取消',
   first_result VARCHAR(16) NULL COMMENT '首次回执结果（SUCCESS/FAILED），未回执为NULL',
+  attempt_no INT NOT NULL DEFAULT 1 COMMENT '尝试序号，首次投放为1，每次显式重试加一；同发布单同设备最多3次',
+  predecessor_id BIGINT NULL COMMENT '前驱任务ID，首次投放为NULL；同一前驱至多追加一个后继任务',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
   PRIMARY KEY (id),
-  CONSTRAINT uk_task_release_device UNIQUE (release_id, device_id)
-) COMMENT='设备投放任务，同设备同发布单最多一条';
+  CONSTRAINT uk_task_release_device_attempt UNIQUE (release_id, device_id, attempt_no),
+  CONSTRAINT uk_task_predecessor UNIQUE (predecessor_id)
+) COMMENT='设备投放任务，同设备同发布单按尝试序号最多3条';
 
 CREATE TABLE IF NOT EXISTS release_pause_record (
   id BIGINT NOT NULL AUTO_INCREMENT COMMENT '暂停记录ID',

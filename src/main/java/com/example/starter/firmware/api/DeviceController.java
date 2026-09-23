@@ -8,10 +8,11 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * 设备登记、查询与固件拉取。
+ * 设备登记、查询、固件拉取与设备任务历史。
  */
 @RestController
 @RequestMapping("/api/devices")
@@ -38,5 +39,11 @@ public class DeviceController {
     @PostMapping("/{deviceId}/pull")
     public PullResponse pull(@PathVariable String deviceId, @Valid @RequestBody RequestIdBody request) {
         return taskService.pull(deviceId, request.requestId());
+    }
+
+    @GetMapping("/{deviceId}/tasks")
+    public TaskHistoryResponse tasks(@PathVariable String deviceId,
+                                     @RequestParam(required = false) Long releaseId) {
+        return taskService.listDeviceHistory(deviceId, releaseId);
     }
 }

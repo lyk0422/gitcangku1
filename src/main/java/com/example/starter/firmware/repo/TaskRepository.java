@@ -14,7 +14,8 @@ import java.util.List;
 import java.util.Optional;
 
 /**
- * 投放任务数据访问。同设备同发布单由唯一约束 uk_task_release_device 保证最多一条。
+ * 投放任务数据访问。同设备同发布单按尝试序号由 uk_task_release_device_attempt 保证唯一，
+ * uk_task_predecessor 保证同一前驱至多一个后继，并发重试只能追加一条。
  */
 @Repository
 public class TaskRepository {
@@ -23,10 +24,13 @@ public class TaskRepository {
         String firstResult = rs.getString("first_result");
         return new RolloutTask(rs.getLong("id"), rs.getLong("release_id"), rs.getString("device_id"),
                 TaskStatus.valueOf(rs.getString("status")),
-                firstResult == null ? null : ReceiptResult.valueOf(firstResult));
+                firstResult == null ? null : ReceiptResult.valueOf(firstResult),
+                rs.getInt("attempt_no"),
+                rs.getObject("predecessor_id", Long.class));
     };
 
-    private static final String COLUMNS = "id, release_id, device_id, status, first_result";
+    private static final String COLUMNS = "id, release_id, device_id, status, first_result,"
+            + " attempt_no, predecessor_id";
 
     private final JdbcTemplate jdbc;
 
@@ -47,6 +51,25 @@ public class TaskRepository {
         return keyHolder.getKey().longValue();
     }
 
+    /**
+     * 显式重试：在前驱之后追加一条新的 PENDING 任务，尝试序号为前驱加一。
+     */
+    public long insertRetry(long releaseId, String deviceId, int attemptNo, long predecessorId) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO rollout_task (release_id, device_id, status, attempt_no, predecessor_id)"
+                            + " VALUES (?, ?, 'PENDING', ?, ?)",
+                    new String[]{"id"});
+            ps.setLong(1, releaseId);
+            ps.setString(2, deviceId);
+            ps.setInt(3, attemptNo);
+            ps.setLong(4, predecessorId);
+            return ps;
+        }, keyHolder);
+        return keyHolder.getKey().longValue();
+    }
+
     public Optional<RolloutTask> findById(long id) {
         return jdbc.query("SELECT " + COLUMNS + " FROM rollout_task WHERE id = ?", MAPPER, id)
                 .stream().findFirst();
@@ -57,8 +80,12 @@ public class TaskRepository {
                 .stream().findFirst();
     }
 
-    public Optional<RolloutTask> findByReleaseAndDevice(long releaseId, String deviceId) {
-        return jdbc.query("SELECT " + COLUMNS + " FROM rollout_task WHERE release_id = ? AND device_id = ?",
+    /**
+     * 同发布单同设备的最新一次尝试（尝试序号最大）。
+     */
+    public Optional<RolloutTask> findLatestByReleaseAndDevice(long releaseId, String deviceId) {
+        return jdbc.query("SELECT " + COLUMNS + " FROM rollout_task"
+                        + " WHERE release_id = ? AND device_id = ? ORDER BY attempt_no DESC LIMIT 1",
                 MAPPER, releaseId, deviceId).stream().findFirst();
     }
 
@@ -74,11 +101,23 @@ public class TaskRepository {
 
     public List<RolloutTask> findByRelease(long releaseId, TaskStatus statusFilter) {
         if (statusFilter == null) {
-            return jdbc.query("SELECT " + COLUMNS + " FROM rollout_task WHERE release_id = ? ORDER BY id",
-                    MAPPER, releaseId);
+            return jdbc.query("SELECT " + COLUMNS + " FROM rollout_task WHERE release_id = ?"
+                    + " ORDER BY device_id, attempt_no", MAPPER, releaseId);
         }
-        return jdbc.query("SELECT " + COLUMNS + " FROM rollout_task WHERE release_id = ? AND status = ? ORDER BY id",
-                MAPPER, releaseId, statusFilter.name());
+        return jdbc.query("SELECT " + COLUMNS + " FROM rollout_task WHERE release_id = ? AND status = ?"
+                + " ORDER BY device_id, attempt_no", MAPPER, releaseId, statusFilter.name());
+    }
+
+    /**
+     * 设备任务历史：按发布单与尝试序号升序，releaseId 为 null 时不限发布单。
+     */
+    public List<RolloutTask> findByDevice(String deviceId, Long releaseId) {
+        if (releaseId == null) {
+            return jdbc.query("SELECT " + COLUMNS + " FROM rollout_task WHERE device_id = ?"
+                    + " ORDER BY release_id, attempt_no", MAPPER, deviceId);
+        }
+        return jdbc.query("SELECT " + COLUMNS + " FROM rollout_task WHERE device_id = ? AND release_id = ?"
+                + " ORDER BY release_id, attempt_no", MAPPER, deviceId, releaseId);
     }
 
     public long countByReleaseAndDevice(long releaseId, String deviceId) {

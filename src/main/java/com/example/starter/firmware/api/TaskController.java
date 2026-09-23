@@ -9,7 +9,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * 投放任务回执。
+ * 投放任务回执与失败任务显式重试。
  */
 @RestController
 @RequestMapping("/api/tasks")
@@ -24,5 +24,10 @@ public class TaskController {
     @PostMapping("/{taskId}/receipt")
     public TaskView receipt(@PathVariable long taskId, @Valid @RequestBody ReceiptRequest request) {
         return taskService.receipt(taskId, request);
+    }
+
+    @PostMapping("/{taskId}/retry")
+    public TaskView retry(@PathVariable long taskId, @Valid @RequestBody RetryTaskRequest request) {
+        return taskService.retry(taskId, request);
     }
 }
