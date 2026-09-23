@@ -23,12 +23,25 @@ COMMENT ON COLUMN artifact.created_at IS '登记时间，UTC 时间戳';
 CREATE UNIQUE INDEX IF NOT EXISTS uk_artifact_name_version ON artifact (name, version);
 CREATE INDEX IF NOT EXISTS idx_artifact_name ON artifact (name);
 
+CREATE TABLE IF NOT EXISTS artifact_platform (
+    id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+    artifact_id BIGINT      NOT NULL,
+    platform    VARCHAR(64) NOT NULL,
+    CONSTRAINT fk_platform_artifact FOREIGN KEY (artifact_id) REFERENCES artifact (id)
+);
+COMMENT ON TABLE artifact_platform IS '制品版本支持的目标平台；元素为 os/arch，仅含 ANY 表示全平台';
+COMMENT ON COLUMN artifact_platform.artifact_id IS '所属制品版本 ID';
+COMMENT ON COLUMN artifact_platform.platform IS '平台标识 os/arch，或 ANY（全平台通配）';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_platform_artifact ON artifact_platform (artifact_id, platform);
+
 CREATE TABLE IF NOT EXISTS artifact_dependency (
     id              BIGINT AUTO_INCREMENT PRIMARY KEY,
     artifact_id     BIGINT       NOT NULL,
     name            VARCHAR(128) NOT NULL,
     minimum_version INT          NOT NULL,
     maximum_version INT          NOT NULL,
+    optional        TINYINT      NOT NULL DEFAULT 0,
     CONSTRAINT fk_dep_artifact FOREIGN KEY (artifact_id) REFERENCES artifact (id)
 );
 COMMENT ON TABLE artifact_dependency IS '制品声明的依赖区间（闭区间），登记后不可改';
@@ -36,6 +49,7 @@ COMMENT ON COLUMN artifact_dependency.artifact_id IS '所属制品版本 ID';
 COMMENT ON COLUMN artifact_dependency.name IS '依赖制品名称，同一制品内唯一';
 COMMENT ON COLUMN artifact_dependency.minimum_version IS '依赖最低版本（含），正整数';
 COMMENT ON COLUMN artifact_dependency.maximum_version IS '依赖最高版本（含），正整数';
+COMMENT ON COLUMN artifact_dependency.optional IS '是否可选依赖：0=必选（默认），1=可选';
 
 CREATE UNIQUE INDEX IF NOT EXISTS uk_dep_artifact_name ON artifact_dependency (artifact_id, name);
 
@@ -43,13 +57,15 @@ CREATE TABLE IF NOT EXISTS lock_file (
     id                 BIGINT AUTO_INCREMENT PRIMARY KEY,
     root_name          VARCHAR(128) NOT NULL,
     root_version       INT          NOT NULL,
+    target_platform    VARCHAR(64),
     repository_version BIGINT       NOT NULL,
     request_id         VARCHAR(64)  NOT NULL,
     created_at         TIMESTAMP(6) NOT NULL
 );
-COMMENT ON TABLE lock_file IS '锁定文件：一次成功锁定的根、精确依赖集合及读取时的仓库版本';
+COMMENT ON TABLE lock_file IS '锁定文件：一次成功锁定的根、目标平台、精确依赖集合及读取时的仓库版本';
 COMMENT ON COLUMN lock_file.root_name IS '根制品名称（精确版本，锁定时固定）';
 COMMENT ON COLUMN lock_file.root_version IS '根制品版本号，正整数';
+COMMENT ON COLUMN lock_file.target_platform IS '锁定目标平台 os/arch；平台特性上线前的历史锁文件为 NULL（旧查询保持不变）';
 COMMENT ON COLUMN lock_file.repository_version IS '锁定时读取的仓库版本号';
 COMMENT ON COLUMN lock_file.request_id IS '触发锁定的全局唯一请求 ID';
 COMMENT ON COLUMN lock_file.created_at IS '锁定生成时间，UTC 时间戳';
@@ -71,6 +87,27 @@ COMMENT ON COLUMN lock_file_entry.version IS '被锁定的精确版本号，正�
 
 CREATE UNIQUE INDEX IF NOT EXISTS uk_entry_lock_name ON lock_file_entry (lock_file_id, name);
 
+CREATE TABLE IF NOT EXISTS lock_file_optional (
+    id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+    lock_file_id    BIGINT        NOT NULL,
+    source_name     VARCHAR(128)  NOT NULL,
+    dependency_name VARCHAR(128)  NOT NULL,
+    included        TINYINT       NOT NULL,
+    target_version  INT,
+    reason          VARCHAR(1024),
+    CONSTRAINT fk_optional_lock FOREIGN KEY (lock_file_id) REFERENCES lock_file (id)
+);
+COMMENT ON TABLE lock_file_optional IS '锁文件中每条可选依赖的 included/skipped 评估结果，按来源、依赖名称稳定排序';
+COMMENT ON COLUMN lock_file_optional.lock_file_id IS '所属锁文件 ID';
+COMMENT ON COLUMN lock_file_optional.source_name IS '声明该可选依赖的已选制品名称';
+COMMENT ON COLUMN lock_file_optional.dependency_name IS '可选依赖目标制品名称';
+COMMENT ON COLUMN lock_file_optional.included IS '评估结果：1=已纳入（included），0=跳过（skipped）';
+COMMENT ON COLUMN lock_file_optional.target_version IS 'included 时纳入的精确版本；skipped 时为 NULL';
+COMMENT ON COLUMN lock_file_optional.reason IS 'skipped 的稳定原因；included 时为 NULL';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_optional_lock_source_dep
+    ON lock_file_optional (lock_file_id, source_name, dependency_name);
+
 CREATE TABLE IF NOT EXISTS idempotent_request (
     request_id     VARCHAR(64)  NOT NULL PRIMARY KEY,
     operation      VARCHAR(32)  NOT NULL,
@@ -86,3 +123,8 @@ COMMENT ON COLUMN idempotent_request.request_hash IS '规范化请求参数的 S
 COMMENT ON COLUMN idempotent_request.http_status IS '原成功响应 HTTP 状态码';
 COMMENT ON COLUMN idempotent_request.response_json IS '原成功响应 JSON，重放时原样返回';
 COMMENT ON COLUMN idempotent_request.created_at IS '首次成功提交时间，UTC 时间戳';
+
+-- 兼容迁移：历史无平台数据（缺少平台行的制品）一律视为支持 ANY。
+INSERT INTO artifact_platform (artifact_id, platform)
+SELECT a.id, 'ANY' FROM artifact a
+WHERE NOT EXISTS (SELECT 1 FROM artifact_platform p WHERE p.artifact_id = a.id);

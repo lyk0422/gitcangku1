@@ -39,10 +39,14 @@ class ArtifactServiceH2Test {
     @Autowired
     private JdbcTemplate jdbcTemplate;
 
+    private static final String PLATFORM = "linux/amd64";
+
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM lock_file_optional");
         jdbcTemplate.update("DELETE FROM lock_file_entry");
         jdbcTemplate.update("DELETE FROM lock_file");
+        jdbcTemplate.update("DELETE FROM artifact_platform");
         jdbcTemplate.update("DELETE FROM artifact_dependency");
         jdbcTemplate.update("DELETE FROM artifact");
         jdbcTemplate.update("DELETE FROM idempotent_request");
@@ -59,6 +63,10 @@ class ArtifactServiceH2Test {
 
     private static DependencySpec dep(String name, int min, int max) {
         return new DependencySpec(name, min, max);
+    }
+
+    private static LockRequest lockReq(String name, int version, long expectedRepositoryVersion) {
+        return new LockRequest(name, version, expectedRepositoryVersion, PLATFORM);
     }
 
     // ------------------------------------------------------------------
@@ -88,7 +96,7 @@ class ArtifactServiceH2Test {
         service.registerArtifact(requestId(), artifact("lib", 1));
         service.registerArtifact(requestId(), artifact("util", 1));
 
-        LockFileResponse lock = service.createLock(requestId(), new LockRequest("app", 1, 4L));
+        LockFileResponse lock = service.createLock(requestId(), lockReq("app", 1, 4L));
 
         assertThat(lock.repositoryVersion()).isEqualTo(4L);
         assertThat(lock.rootName()).isEqualTo("app");
@@ -118,7 +126,7 @@ class ArtifactServiceH2Test {
             barrier.await(5, TimeUnit.SECONDS);
             try {
                 return service.createLock(lockRequestId,
-                        new LockRequest("app", 1, versionBefore));
+                        lockReq("app", 1, versionBefore));
             } catch (ApiException e) {
                 return e;
             }
@@ -190,7 +198,7 @@ class ArtifactServiceH2Test {
     @Test
     void lockWithStaleExpectedRepositoryVersionReturns409WithoutSaving() {
         service.registerArtifact(requestId(), artifact("app", 1));
-        assertThatThrownBy(() -> service.createLock(requestId(), new LockRequest("app", 1, 0L)))
+        assertThatThrownBy(() -> service.createLock(requestId(), lockReq("app", 1, 0L)))
                 .isInstanceOfSatisfying(ApiException.class,
                         e -> assertThat(e.getStatus()).isEqualTo(409));
         assertThat(service.listLocks()).isEmpty();
@@ -202,14 +210,14 @@ class ArtifactServiceH2Test {
     void lockOnWithdrawnRootReturns409() {
         service.registerArtifact(requestId(), artifact("app", 1));
         service.withdrawArtifact(requestId(), "app", 1);
-        assertThatThrownBy(() -> service.createLock(requestId(), new LockRequest("app", 1, 2L)))
+        assertThatThrownBy(() -> service.createLock(requestId(), lockReq("app", 1, 2L)))
                 .isInstanceOfSatisfying(ApiException.class,
                         e -> assertThat(e.getStatus()).isEqualTo(409));
     }
 
     @Test
     void lockOnMissingRootReturns404() {
-        assertThatThrownBy(() -> service.createLock(requestId(), new LockRequest("ghost", 1, 0L)))
+        assertThatThrownBy(() -> service.createLock(requestId(), lockReq("ghost", 1, 0L)))
                 .isInstanceOfSatisfying(ApiException.class,
                         e -> assertThat(e.getStatus()).isEqualTo(404));
     }
@@ -220,7 +228,7 @@ class ArtifactServiceH2Test {
         service.registerArtifact(requestId(), artifact("app", 1, dep("lib", 2, 2)));
         service.registerArtifact(requestId(), artifact("lib", 1));
 
-        assertThatThrownBy(() -> service.createLock(requestId(), new LockRequest("app", 1, 2L)))
+        assertThatThrownBy(() -> service.createLock(requestId(), lockReq("app", 1, 2L)))
                 .isInstanceOfSatisfying(ApiException.class,
                         e -> assertThat(e.getStatus()).isEqualTo(422));
         assertThat(service.listLocks()).isEmpty();
@@ -441,13 +449,13 @@ class ArtifactServiceH2Test {
         service.registerArtifact(requestId(), artifact("app", 1, dep("lib", 1, 2)));
         service.registerArtifact(requestId(), artifact("lib", 1));
         String rid = requestId();
-        LockFileResponse first = service.createLock(rid, new LockRequest("app", 1, 2L));
+        LockFileResponse first = service.createLock(rid, lockReq("app", 1, 2L));
 
         // 登记 lib2 并撤回 lib1，仓库前进。
         service.registerArtifact(requestId(), artifact("lib", 2));
         service.withdrawArtifact(requestId(), "lib", 1);
 
-        LockFileResponse replay = service.createLock(rid, new LockRequest("app", 1, 2L));
+        LockFileResponse replay = service.createLock(rid, lockReq("app", 1, 2L));
         assertThat(replay.id()).isEqualTo(first.id());
         assertThat(replay.repositoryVersion()).isEqualTo(2L);
         assertThat(replay.entries()).isEqualTo(first.entries());
