@@ -3,6 +3,7 @@ package com.example.starter.race.service;
 import com.example.starter.race.api.AddPenaltyRequest;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
 import com.example.starter.race.api.CreateRaceRequest;
+import com.example.starter.race.api.CreateTeamRequest;
 import com.example.starter.race.api.RegisterRunnerRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
@@ -11,6 +12,7 @@ import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.api.SubmitTimingRequest;
+import com.example.starter.race.api.TeamsResponse;
 
 /**
  * 赛事成绩封榜应用服务；每个写方法在单个数据库事务内完成
@@ -47,6 +49,16 @@ public interface RaceService {
 
     /** 封榜：校验版本并原子保存只读成绩快照（含每名选手分段明细与缺失检查点）。 */
     ServiceResult sealRace(String raceId, SealRaceRequest request);
+
+    /**
+     * 创建团队并整体配置3~5个不同的已登记参赛号；同一选手最多属于一队。
+     * 仅 OPEN 且赛事尚无任何完赛计时或分段记录时允许（成员配置一旦出现计时即冻结）；
+     * 成功后版本加一。同键同参（成员集合换序视为同参）重放首次结果，异参409。
+     */
+    ServiceResult createTeam(String raceId, CreateTeamRequest request);
+
+    /** 查询团队榜（OPEN 实时派生；SEALED 返回封榜同版本只读快照，无团队时为空列表）。 */
+    TeamsResponse getTeams(String raceId);
 
     /** 查询即时成绩（OPEN 实时计算；SEALED 返回封榜快照）。 */
     StandingResponse getResults(String raceId);

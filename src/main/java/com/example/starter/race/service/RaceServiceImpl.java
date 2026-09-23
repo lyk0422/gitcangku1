@@ -5,6 +5,7 @@ import com.example.starter.race.api.CheckpointResponse;
 import com.example.starter.race.api.CheckpointsConfigResponse;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
 import com.example.starter.race.api.CreateRaceRequest;
+import com.example.starter.race.api.CreateTeamRequest;
 import com.example.starter.race.api.MissingCheckpointsResponse;
 import com.example.starter.race.api.RaceResponse;
 import com.example.starter.race.api.RegisterRunnerRequest;
@@ -15,11 +16,16 @@ import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.api.SubmitTimingRequest;
+import com.example.starter.race.api.TeamsResponse;
 import com.example.starter.race.domain.CheckpointRules;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
+import com.example.starter.race.domain.TeamCalculator;
+import com.example.starter.race.domain.TeamMemberScore;
+import com.example.starter.race.domain.TeamResult;
+import com.example.starter.race.domain.TeamView;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
 import com.example.starter.race.persistence.IdempotencyRow;
@@ -30,6 +36,11 @@ import com.example.starter.race.persistence.SnapshotCheckpointRow;
 import com.example.starter.race.persistence.SnapshotEntryRow;
 import com.example.starter.race.persistence.SnapshotRow;
 import com.example.starter.race.persistence.RaceRepository;
+import com.example.starter.race.persistence.TeamMemberRow;
+import com.example.starter.race.persistence.TeamRow;
+import com.example.starter.race.persistence.TeamSnapshotEntryRow;
+import com.example.starter.race.persistence.TeamSnapshotMemberRow;
+import com.example.starter.race.persistence.TeamSnapshotRow;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
@@ -390,10 +401,147 @@ public class RaceServiceImpl implements RaceService {
                             buildSnapshotCheckpoints(raceId, runners, checkpoints, timings);
                     repository.insertSnapshot(new SnapshotRow(raceId, newVersion, now,
                             snapshotEntries, snapshotCheckpoints));
+                    // 团队封榜与个人结果在同一事务、同一赛事版本冻结：成员、计分依据、
+                    // 成绩与名次一并固化；没有团队的已封榜赛事不补造队伍。
+                    insertTeamSnapshotIfAny(
+                            raceId, newVersion, now, entries,
+                            repository.findTeams(raceId));
                     return ServiceResult.ok(new StandingResponse(
                             raceId, newVersion, RaceStatus.SEALED, now,
                             snapshotEntries.stream().map(ResponseMapper::toEntryResponse).toList()));
                 });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult createTeam(String raceId, CreateTeamRequest request) {
+        // 成员集合换序视为同参：摘要前按参赛号字典序规范化。
+        List<String> normalizedBibs = new ArrayList<>(request.memberBibs());
+        normalizedBibs.sort(String::compareTo);
+        return withIdempotency(request.requestId(), "CREATE_TEAM",
+                orderedParams(
+                        "raceId", raceId,
+                        "teamCode", request.teamCode(),
+                        "expectedVersion", request.expectedVersion(),
+                        "memberBibs", normalizedBibs),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    List<String> bibs = request.memberBibs();
+                    if (bibs.size() < 3 || bibs.size() > 5) {
+                        throw new BadRequestException("团队成员数量必须在 3~5 之间");
+                    }
+                    if (new java.util.HashSet<>(bibs).size() != bibs.size()) {
+                        throw new BadRequestException("团队成员参赛号必须互不重复");
+                    }
+                    // 冻结条件：赛事一旦出现任何完赛计时或分段记录，团队配置全部冻结；
+                    // 撤销处罚不会清除这些记录，因此不能借此重新开放。
+                    if (repository.countFinishedRunners(raceId) > 0
+                            || repository.countTimings(raceId) > 0) {
+                        throw new ConflictException(
+                                "赛事已出现完赛计时或分段记录，团队配置已冻结: " + raceId);
+                    }
+                    if (repository.findTeam(raceId, request.teamCode()).isPresent()) {
+                        throw new ConflictException("团队代码已存在: " + request.teamCode());
+                    }
+                    // 成员必须全部已登记（不存在 -> 404），且同一选手最多属于一队（冲突 -> 409）。
+                    for (String bib : bibs) {
+                        requireRunner(raceId, bib);
+                    }
+                    List<TeamView> existingTeams = repository.findTeams(raceId);
+                    java.util.Set<String> assigned = new java.util.HashSet<>();
+                    for (TeamView team : existingTeams) {
+                        assigned.addAll(team.bibs());
+                    }
+                    for (String bib : bibs) {
+                        if (assigned.contains(bib)) {
+                            throw new ConflictException(
+                                    "选手已属于其他团队，不能重复入队: " + bib);
+                        }
+                    }
+
+                    bumpVersion(race, request.expectedVersion());
+                    long now = clock.millis();
+                    try {
+                        repository.insertTeam(new TeamRow(request.teamCode(), raceId, now));
+                        repository.insertTeamMembers(bibs.stream()
+                                .map(bib -> new TeamMemberRow(raceId, request.teamCode(), bib))
+                                .toList());
+                    } catch (DuplicateKeyException ex) {
+                        if (constraintMatches(ex, "uk_team_member_race_bib")
+                                || constraintMatches(ex, "pk_team_member")) {
+                            throw new ConflictException("选手已属于其他团队，不能重复入队");
+                        }
+                        throw new ConflictException("团队代码已存在: " + request.teamCode());
+                    }
+                    // 创建时赛事无任何完赛计时，全部成员必为未排名，团队为 INCOMPLETE。
+                    List<ResultEntry> entries = ResultCalculator.compute(
+                            repository.findRunners(raceId),
+                            repository.findPenalties(raceId),
+                            repository.findCheckpoints(raceId),
+                            repository.findAllTimings(raceId));
+                    List<TeamResult> results = TeamCalculator.compute(
+                            List.of(new TeamView(request.teamCode(), normalizedBibs)), entries);
+                    return ServiceResult.created(
+                            ResponseMapper.toTeamResponse(results.getFirst()));
+                });
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public TeamsResponse getTeams(String raceId) {
+        RaceRow race = repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        if (race.status() == RaceStatus.SEALED) {
+            // 封榜后只返回同版本快照；封榜前没有团队的赛事返回空团队列表，不补造队伍。
+            Long sealedAt = repository.findSnapshot(raceId)
+                    .map(SnapshotRow::sealedAt)
+                    .orElse(null);
+            return repository.findTeamSnapshot(raceId)
+                    .map(ResponseMapper::snapshotTeams)
+                    .orElseGet(() -> new TeamsResponse(
+                            raceId, race.version(), RaceStatus.SEALED, sealedAt, List.of()));
+        }
+        List<ResultEntry> entries = ResultCalculator.compute(
+                repository.findRunners(raceId),
+                repository.findPenalties(raceId),
+                repository.findCheckpoints(raceId),
+                repository.findAllTimings(raceId));
+        return ResponseMapper.liveTeams(
+                race, repository.findTeams(raceId), entries);
+    }
+
+    /**
+     * 在封榜事务内按与个人结果一致的 {@code entries} 构造并写入团队快照，
+     * 团队版本与封榜版本完全相同；无团队时不写任何快照行。
+     */
+    private void insertTeamSnapshotIfAny(
+            String raceId,
+            int newVersion,
+            long now,
+            List<ResultEntry> entries,
+            List<TeamView> teams) {
+        if (teams.isEmpty()) {
+            return;
+        }
+        List<TeamResult> results = TeamCalculator.compute(teams, entries);
+        List<TeamSnapshotEntryRow> snapshotEntries = new ArrayList<>(results.size());
+        for (int order = 0; order < results.size(); order++) {
+            TeamResult result = results.get(order);
+            List<TeamSnapshotMemberRow> memberRows = new ArrayList<>(result.members().size());
+            List<TeamMemberScore> members = result.members();
+            for (int memberOrder = 0; memberOrder < members.size(); memberOrder++) {
+                TeamMemberScore member = members.get(memberOrder);
+                memberRows.add(new TeamSnapshotMemberRow(
+                        raceId, result.teamCode(), member.bib(),
+                        member.personalRank(), member.status(), member.totalTimeMs(),
+                        member.scored(), memberOrder));
+            }
+            snapshotEntries.add(new TeamSnapshotEntryRow(
+                    raceId, result.teamCode(), result.rank(), result.status(),
+                    result.totalTimeMs(), order, memberRows));
+        }
+        repository.insertTeamSnapshot(
+                new TeamSnapshotRow(raceId, newVersion, now, snapshotEntries));
     }
 
     @Override

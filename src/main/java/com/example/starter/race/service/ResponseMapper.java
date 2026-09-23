@@ -7,9 +7,15 @@ import com.example.starter.race.api.ResultEntryResponse;
 import com.example.starter.race.api.RunnerResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.StandingResponse;
+import com.example.starter.race.api.TeamMemberResponse;
+import com.example.starter.race.api.TeamResponse;
+import com.example.starter.race.api.TeamsResponse;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
+import com.example.starter.race.domain.TeamCalculator;
+import com.example.starter.race.domain.TeamResult;
+import com.example.starter.race.domain.TeamView;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
 import com.example.starter.race.persistence.PenaltyRow;
@@ -18,6 +24,8 @@ import com.example.starter.race.persistence.RunnerRow;
 import com.example.starter.race.persistence.SnapshotCheckpointRow;
 import com.example.starter.race.persistence.SnapshotEntryRow;
 import com.example.starter.race.persistence.SnapshotRow;
+import com.example.starter.race.persistence.TeamSnapshotEntryRow;
+import com.example.starter.race.persistence.TeamSnapshotRow;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -150,5 +158,60 @@ final class ResponseMapper {
                 .toList();
         return new RunnerTimingResponse(
                 snapshot.raceId(), bib, snapshot.version(), finishTimeMs, passes);
+    }
+
+    /** 由实时个人成绩与团队配置派生团队榜。 */
+    static TeamsResponse liveTeams(
+            RaceRow race,
+            List<TeamView> teams,
+            List<ResultEntry> entries) {
+        List<TeamResult> results = TeamCalculator.compute(teams, entries);
+        return new TeamsResponse(
+                race.raceId(), race.version(), race.status(), null,
+                results.stream().map(ResponseMapper::toTeamResponse).toList());
+    }
+
+    /** 由封榜固化的团队快照组装团队榜。 */
+    static TeamsResponse snapshotTeams(TeamSnapshotRow snapshot) {
+        return new TeamsResponse(
+                snapshot.raceId(),
+                snapshot.version(),
+                RaceStatus.SEALED,
+                snapshot.sealedAt(),
+                snapshot.entries().stream()
+                        .map(ResponseMapper::toTeamResponse)
+                        .toList());
+    }
+
+    static TeamResponse toTeamResponse(TeamResult result) {
+        return new TeamResponse(
+                result.teamCode(),
+                result.rank(),
+                result.status(),
+                result.totalTimeMs(),
+                result.members().stream()
+                        .map(member -> new TeamMemberResponse(
+                                member.bib(),
+                                member.personalRank(),
+                                member.status(),
+                                member.totalTimeMs(),
+                                member.scored()))
+                        .toList());
+    }
+
+    static TeamResponse toTeamResponse(TeamSnapshotEntryRow entry) {
+        return new TeamResponse(
+                entry.teamId(),
+                entry.rank(),
+                entry.status(),
+                entry.totalTimeMs(),
+                entry.members().stream()
+                        .map(member -> new TeamMemberResponse(
+                                member.bib(),
+                                member.personalRank(),
+                                member.personalStatus(),
+                                member.totalTimeMs(),
+                                member.scored()))
+                        .toList());
     }
 }

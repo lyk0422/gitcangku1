@@ -87,6 +87,20 @@ public class RaceController {
         return toResponse(raceService.sealRace(raceId, request));
     }
 
+    /** 创建团队并整体配置3~5个已登记成员。 */
+    @PostMapping("/{raceId}/teams")
+    public ResponseEntity<Object> createTeam(
+            @PathVariable String raceId,
+            @Valid @RequestBody CreateTeamRequest request) {
+        return toResponse(raceService.createTeam(raceId, request));
+    }
+
+    /** 查询团队榜（OPEN 实时派生；封榜后返回同版本只读快照）。 */
+    @GetMapping("/{raceId}/teams")
+    public TeamsResponse getTeams(@PathVariable String raceId) {
+        return raceService.getTeams(raceId);
+    }
+
     /** 查询即时成绩（封榜后返回只读快照内容）。 */
     @GetMapping("/{raceId}/results")
     public StandingResponse getResults(@PathVariable String raceId) {

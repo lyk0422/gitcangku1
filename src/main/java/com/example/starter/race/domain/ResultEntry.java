@@ -25,7 +25,7 @@ public record ResultEntry(
         int checkpointCount,
         int coveredCheckpointCount,
         List<String> missingCheckpoints
-) {
+) implements TeamCalculator.ResultEntryLike {
 
     /** 未配置检查点赛事使用的兼容构造器：检查点计数均为 0、缺失列表为空。 */
     public ResultEntry(
