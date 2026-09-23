@@ -48,6 +48,7 @@ class ObservationApiTest {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("requestId", requestId);
         body.put("observationId", observationId);
+        body.put("surveyId", "survey-1");
         body.put("location", location);
         body.put("reading", reading);
         body.put("note", note);

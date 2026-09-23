@@ -65,7 +65,7 @@ class ObservationConcurrencyTest {
     }
 
     private void createObservation(String id, String requestId) {
-        observationService.create(new CreateObservationRequest(requestId, id, "站点A", "1.0", "初始备注"));
+        observationService.create(new CreateObservationRequest(requestId, id, "survey-1", "站点A", "1.0", "初始备注"));
     }
 
     @Test
@@ -169,7 +169,7 @@ class ObservationConcurrencyTest {
             tasks.add(() -> {
                 try {
                     observationService.create(new CreateObservationRequest(
-                            "req-ck" + index, "obs-c4", "站点" + index, "1.0", "备注"));
+                            "req-ck" + index, "obs-c4", "survey-1", "站点" + index, "1.0", "备注"));
                     return "ok";
                 } catch (ApiException e) {
                     return String.valueOf(e.status().value());

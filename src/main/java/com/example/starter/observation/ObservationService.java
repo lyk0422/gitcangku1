@@ -70,8 +70,8 @@ public class ObservationService {
      */
     @Transactional
     public WriteOutcome create(CreateObservationRequest request) {
-        String fingerprint = fingerprint("CREATE", request.observationId(), request.location(),
-                request.reading(), request.note());
+        String fingerprint = fingerprint("CREATE", request.observationId(), request.surveyId(),
+                request.location(), request.reading(), request.note());
         WriteOutcome replayed = checkReplay(request.requestId(), fingerprint);
         if (replayed != null) {
             return replayed;
@@ -84,8 +84,8 @@ public class ObservationService {
         if (observationRepository.findCurrentForUpdate(request.observationId()).isPresent()) {
             throw ApiException.conflict("observation already exists: " + request.observationId(), null);
         }
-        ObservationSnapshot snapshot = new ObservationSnapshot(request.observationId(), 1,
-                request.location(), request.reading(), request.note(), false);
+        ObservationSnapshot snapshot = new ObservationSnapshot(request.observationId(), request.surveyId(),
+                1, request.location(), request.reading(), request.note(), false);
         try {
             observationRepository.insertCurrent(snapshot);
         } catch (DuplicateKeyException e) {
@@ -131,14 +131,14 @@ public class ObservationService {
             throw ApiException.mergeConflict(conflictFields, current.version());
         }
 
-        ObservationSnapshot merged = new ObservationSnapshot(observationId, current.version(),
-                mergedLocation, mergedReading, mergedNote, false);
+        ObservationSnapshot merged = new ObservationSnapshot(observationId, current.surveyId(),
+                current.version(), mergedLocation, mergedReading, mergedNote, false);
         if (sameContent(merged, current)) {
             // 合并结果与当前完全相同：返回当前版本，不加版本
             return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(current));
         }
-        ObservationSnapshot next = new ObservationSnapshot(observationId, current.version() + 1,
-                mergedLocation, mergedReading, mergedNote, false);
+        ObservationSnapshot next = new ObservationSnapshot(observationId, current.surveyId(),
+                current.version() + 1, mergedLocation, mergedReading, mergedNote, false);
         observationRepository.updateCurrent(next);
         observationRepository.insertVersion(next);
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(next));
@@ -167,8 +167,8 @@ public class ObservationService {
         if (request.expectedVersion() != current.version()) {
             throw ApiException.conflict("expectedVersion mismatch", current.version());
         }
-        ObservationSnapshot tombstone = new ObservationSnapshot(observationId, current.version() + 1,
-                null, null, null, true);
+        ObservationSnapshot tombstone = new ObservationSnapshot(observationId, current.surveyId(),
+                current.version() + 1, null, null, null, true);
         observationRepository.markDeleted(observationId, tombstone.version());
         observationRepository.insertVersion(tombstone);
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(tombstone));
@@ -252,13 +252,13 @@ public class ObservationService {
         String resolvedNote = resolveFieldValue(noteConflict, selections.get("note"),
                 base.note(), current.note(), request.note(), false);
 
-        ObservationSnapshot merged = new ObservationSnapshot(observationId, current.version(),
-                resolvedLocation, resolvedReading, resolvedNote, false);
+        ObservationSnapshot merged = new ObservationSnapshot(observationId, current.surveyId(),
+                current.version(), resolvedLocation, resolvedReading, resolvedNote, false);
         boolean contentChanged = !sameContent(merged, current);
         int newVersion = contentChanged ? current.version() + 1 : current.version();
         if (contentChanged) {
-            ObservationSnapshot next = new ObservationSnapshot(observationId, newVersion,
-                    resolvedLocation, resolvedReading, resolvedNote, false);
+            ObservationSnapshot next = new ObservationSnapshot(observationId, current.surveyId(),
+                    newVersion, resolvedLocation, resolvedReading, resolvedNote, false);
             observationRepository.updateCurrent(next);
             observationRepository.insertVersion(next);
         }
@@ -285,7 +285,8 @@ public class ObservationService {
         }
 
         ObservationSnapshot pointed = contentChanged
-                ? new ObservationSnapshot(observationId, newVersion, resolvedLocation, resolvedReading, resolvedNote, false)
+                ? new ObservationSnapshot(observationId, current.surveyId(), newVersion,
+                        resolvedLocation, resolvedReading, resolvedNote, false)
                 : current;
         return completeResolve(request.requestId(), HttpStatus.OK,
                 ResolutionResponse.of(record, pointed, objectMapper));
