@@ -30,6 +30,17 @@ public class DeviceRepository {
                 deviceId).stream().findFirst();
     }
 
+    /**
+     * 行锁读取设备：回退计划创建/派发与投放拉取共用，形成一致提交顺序。
+     */
+    public Optional<Device> findByIdForUpdate(String deviceId) {
+        return jdbc.query("SELECT device_id, model, current_version, bucket_no FROM device"
+                        + " WHERE device_id = ? FOR UPDATE",
+                (rs, rowNum) -> new Device(rs.getString("device_id"), rs.getString("model"),
+                        rs.getString("current_version"), rs.getInt("bucket_no")),
+                deviceId).stream().findFirst();
+    }
+
     public void updateCurrentVersion(String deviceId, String newVersion) {
         jdbc.update("UPDATE device SET current_version = ? WHERE device_id = ?", newVersion, deviceId);
     }

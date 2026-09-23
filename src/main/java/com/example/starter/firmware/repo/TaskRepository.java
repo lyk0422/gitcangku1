@@ -87,4 +87,37 @@ public class TaskRepository {
                 Long.class, releaseId, deviceId);
         return count == null ? 0 : count;
     }
+
+    /**
+     * 设备一次成功投放形成的版本边：from_version -> to_version，含来源发布单ID。
+     *
+     * @param releaseId   来源发布单ID
+     * @param fromVersion 投放前版本
+     * @param toVersion   投放后版本
+     */
+    public record VersionEdge(long releaseId, String fromVersion, String toVersion) {
+    }
+
+    /**
+     * 设备全部成功投放的版本边，按完成时间（任务ID）升序，用于构造连续反向回退路径。
+     */
+    public List<VersionEdge> findSuccessEdgesByDevice(String deviceId) {
+        return jdbc.query("SELECT t.release_id, r.from_version, r.to_version"
+                        + " FROM rollout_task t JOIN release_order r ON r.id = t.release_id"
+                        + " WHERE t.device_id = ? AND t.status = 'SUCCESS'"
+                        + " ORDER BY t.id",
+                (rs, rowNum) -> new VersionEdge(rs.getLong("release_id"),
+                        rs.getString("from_version"), rs.getString("to_version")),
+                deviceId);
+    }
+
+    /**
+     * 设备是否存在未终结（PENDING）的投放任务，用于回退计划创建/派发的冲突检查。
+     */
+    public boolean hasPendingByDevice(String deviceId) {
+        Long count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM rollout_task WHERE device_id = ? AND status = 'PENDING'",
+                Long.class, deviceId);
+        return count != null && count > 0;
+    }
 }

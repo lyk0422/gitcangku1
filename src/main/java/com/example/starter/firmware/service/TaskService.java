@@ -14,6 +14,7 @@ import com.example.starter.firmware.error.ApiException;
 import com.example.starter.firmware.repo.DeviceRepository;
 import com.example.starter.firmware.repo.PauseRecordRepository;
 import com.example.starter.firmware.repo.ReleaseRepository;
+import com.example.starter.firmware.repo.RollbackPlanDeviceRepository;
 import com.example.starter.firmware.repo.TaskRepository;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
@@ -33,6 +34,7 @@ public class TaskService {
     private final ReleaseRepository releaseRepository;
     private final DeviceRepository deviceRepository;
     private final PauseRecordRepository pauseRecordRepository;
+    private final RollbackPlanDeviceRepository rollbackPlanDeviceRepository;
     private final DeviceService deviceService;
     private final ReleaseService releaseService;
     private final IdempotencyService idempotency;
@@ -40,12 +42,14 @@ public class TaskService {
 
     public TaskService(TaskRepository taskRepository, ReleaseRepository releaseRepository,
                        DeviceRepository deviceRepository, PauseRecordRepository pauseRecordRepository,
+                       RollbackPlanDeviceRepository rollbackPlanDeviceRepository,
                        DeviceService deviceService, ReleaseService releaseService,
                        IdempotencyService idempotency, Clock clock) {
         this.taskRepository = taskRepository;
         this.releaseRepository = releaseRepository;
         this.deviceRepository = deviceRepository;
         this.pauseRecordRepository = pauseRecordRepository;
+        this.rollbackPlanDeviceRepository = rollbackPlanDeviceRepository;
         this.deviceService = deviceService;
         this.releaseService = releaseService;
         this.idempotency = idempotency;
@@ -55,6 +59,7 @@ public class TaskService {
     /**
      * 设备拉取：已存在任务直接返回；否则仅当型号与当前版本匹配、分桶号小于比例且发布单 ACTIVE 时创建。
      * PAUSED 时不创建新任务，已有任务仍可查看与回执。
+     * 设备被未终结回退计划占用时不创建投放任务（设备不可同时进入冲突任务）。
      */
     public PullResponse pull(String deviceId, String requestId) {
         String fingerprint = String.join("|", "task.pull", deviceId);
@@ -73,6 +78,11 @@ public class TaskService {
             if (order.status() != ReleaseStatus.ACTIVE
                     || !device.currentVersion().equals(order.fromVersion())
                     || device.bucketNo() >= order.ratio()) {
+                return new PullResponse(null);
+            }
+            deviceRepository.findByIdForUpdate(deviceId)
+                    .orElseThrow(() -> ApiException.notFound("DEVICE_NOT_FOUND", "设备不存在: " + deviceId));
+            if (rollbackPlanDeviceRepository.isDeviceOccupied(deviceId)) {
                 return new PullResponse(null);
             }
             long taskId;
