@@ -79,11 +79,13 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     group_code VARCHAR(64) NOT NULL,
     title VARCHAR(512) NOT NULL,
     status VARCHAR(16) NOT NULL,
+    version BIGINT NOT NULL DEFAULT 0,
     created_by VARCHAR(128) NOT NULL,
     done_by VARCHAR(128) NULL,
     done_at TIMESTAMP(6) NULL,
     cancelled_by VARCHAR(128) NULL,
     cancelled_at TIMESTAMP(6) NULL,
+    started_at TIMESTAMP(6) NULL,
     created_at TIMESTAMP(6) NOT NULL,
     updated_at TIMESTAMP(6) NOT NULL,
     CONSTRAINT uk_task_key UNIQUE (incident_id, task_key)
@@ -98,5 +100,42 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 );
 
 CREATE TABLE IF NOT EXISTS task_graph_lock (
+    id TINYINT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS shared_resources (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    resource_key VARCHAR(128) NOT NULL,
+    name VARCHAR(256) NOT NULL,
+    capacity INT NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_resource_key UNIQUE (resource_key),
+    CONSTRAINT ck_resource_capacity CHECK (capacity > 0)
+);
+
+CREATE TABLE IF NOT EXISTS resource_leases (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    lease_key VARCHAR(128) NOT NULL,
+    resource_id BIGINT NOT NULL,
+    task_id BIGINT NOT NULL,
+    incident_id BIGINT NOT NULL,
+    quantity INT NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    version BIGINT NOT NULL DEFAULT 0,
+    active_slot VARCHAR(256) GENERATED ALWAYS AS (CASE WHEN status = 'ACTIVE' THEN CONCAT(CAST(resource_id AS VARCHAR(32)), ':', CAST(task_id AS VARCHAR(32))) ELSE NULL END),
+    granted_at TIMESTAMP(6) NULL,
+    released_at TIMESTAMP(6) NULL,
+    revoked_at TIMESTAMP(6) NULL,
+    revoke_reason VARCHAR(512) NULL,
+    request_id VARCHAR(128) NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_lease_key UNIQUE (lease_key),
+    CONSTRAINT uk_active_slot UNIQUE (active_slot),
+    CONSTRAINT ck_lease_quantity CHECK (quantity > 0)
+);
+
+CREATE TABLE IF NOT EXISTS resource_lock (
     id TINYINT PRIMARY KEY
 );

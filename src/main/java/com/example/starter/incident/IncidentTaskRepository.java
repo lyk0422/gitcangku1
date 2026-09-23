@@ -44,14 +44,17 @@ public class IncidentTaskRepository {
     private static IncidentTask mapTask(ResultSet rs) throws SQLException {
         Timestamp doneAt = rs.getTimestamp("done_at");
         Timestamp cancelledAt = rs.getTimestamp("cancelled_at");
+        Timestamp startedAt = rs.getTimestamp("started_at");
         return new IncidentTask(
                 rs.getLong("id"), rs.getLong("incident_id"), rs.getString("task_key"),
                 rs.getString("group_code"), rs.getString("title"),
                 TaskStatus.valueOf(rs.getString("status")),
+                rs.getLong("version"),
                 rs.getString("created_by"), rs.getString("done_by"),
                 doneAt == null ? null : doneAt.toInstant(),
                 rs.getString("cancelled_by"),
                 cancelledAt == null ? null : cancelledAt.toInstant(),
+                startedAt == null ? null : startedAt.toInstant(),
                 rs.getTimestamp("created_at").toInstant(),
                 rs.getTimestamp("updated_at").toInstant());
     }
@@ -70,21 +73,23 @@ public class IncidentTaskRepository {
         jdbc.update(con -> {
             var ps = con.prepareStatement(
                     "INSERT INTO incident_tasks (incident_id, task_key, group_code, title, status,"
-                            + " created_by, done_by, done_at, cancelled_by, cancelled_at,"
-                            + " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                            + " version, created_by, done_by, done_at, cancelled_by, cancelled_at,"
+                            + " started_at, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setLong(1, task.incidentId());
             ps.setString(2, task.taskKey());
             ps.setString(3, task.groupCode());
             ps.setString(4, task.title());
             ps.setString(5, task.status().name());
-            ps.setString(6, task.createdBy());
-            ps.setString(7, task.doneBy());
-            ps.setTimestamp(8, task.doneAt() == null ? null : Timestamp.from(task.doneAt()));
-            ps.setString(9, task.cancelledBy());
-            ps.setTimestamp(10, task.cancelledAt() == null ? null : Timestamp.from(task.cancelledAt()));
-            ps.setTimestamp(11, Timestamp.from(task.createdAt()));
-            ps.setTimestamp(12, Timestamp.from(task.updatedAt()));
+            ps.setLong(6, task.version());
+            ps.setString(7, task.createdBy());
+            ps.setString(8, task.doneBy());
+            ps.setTimestamp(9, task.doneAt() == null ? null : Timestamp.from(task.doneAt()));
+            ps.setString(10, task.cancelledBy());
+            ps.setTimestamp(11, task.cancelledAt() == null ? null : Timestamp.from(task.cancelledAt()));
+            ps.setTimestamp(12, task.startedAt() == null ? null : Timestamp.from(task.startedAt()));
+            ps.setTimestamp(13, Timestamp.from(task.createdAt()));
+            ps.setTimestamp(14, Timestamp.from(task.updatedAt()));
             return ps;
         }, keys);
         return keys.getKey().longValue();
@@ -101,6 +106,52 @@ public class IncidentTaskRepository {
     }
 
     /**
+     * 按主键查询任务（不加锁）。
+     */
+    public Optional<IncidentTask> findById(long id) {
+        List<IncidentTask> rows = jdbc.query("SELECT * FROM incident_tasks WHERE id = ?",
+                TASK_MAPPER, id);
+        return rows.stream().findFirst();
+    }
+
+    /**
+     * 按主键锁定任务行（SELECT ... FOR UPDATE），用于租约/开始路径的状态复核。
+     */
+    public Optional<IncidentTask> lockById(long id) {
+        List<IncidentTask> rows = jdbc.query("SELECT * FROM incident_tasks WHERE id = ? FOR UPDATE",
+                TASK_MAPPER, id);
+        return rows.stream().findFirst();
+    }
+
+    /**
+     * 列出全部任务（抢占反向依赖闭包计算用），按 id 返回。
+     */
+    public List<IncidentTask> listAll() {
+        return jdbc.query("SELECT * FROM incident_tasks ORDER BY id", TASK_MAPPER);
+    }
+
+    /**
+     * 查询直接依赖（阻塞边指向）指定事件的全部任务，即 blocker_incident_id = incidentId。
+     */
+    public List<IncidentTask> listDirectDependents(long incidentId) {
+        return jdbc.query("SELECT t.* FROM incident_task_blockers b"
+                        + " JOIN incident_tasks t ON t.id = b.task_id"
+                        + " WHERE b.blocker_incident_id = ? ORDER BY t.id",
+                TASK_MAPPER, incidentId);
+    }
+
+    /**
+     * 条件开始：仅当任务仍为 OPEN 且版本匹配时置为 STARTED、记录开始时刻并递增版本。
+     * 返回更新行数；0 表示任务已离开 OPEN 或版本过期，调用方据此 409。
+     */
+    public int markStartedIfOpen(long id, long expectedVersion, String actor, Instant at) {
+        return jdbc.update("UPDATE incident_tasks SET status = 'STARTED', version = version + 1,"
+                        + " started_at = ?, updated_at = ? WHERE id = ? AND status = 'OPEN'"
+                        + " AND version = ?",
+                Timestamp.from(at), Timestamp.from(at), id, expectedVersion);
+    }
+
+    /**
      * 查询事件全部任务，按创建顺序返回。
      */
     public List<IncidentTask> listByIncident(long incidentId) {
@@ -109,11 +160,20 @@ public class IncidentTaskRepository {
     }
 
     /**
-     * 查询事件仍 OPEN 的任务（解决门禁用），按创建顺序返回。
+     * 查询事件仍 OPEN 的任务（兼容旧调用），按创建顺序返回。
      */
     public List<IncidentTask> listOpenByIncident(long incidentId) {
         return jdbc.query("SELECT * FROM incident_tasks WHERE incident_id = ? AND status = 'OPEN'"
                 + " ORDER BY id", TASK_MAPPER, incidentId);
+    }
+
+    /**
+     * 查询事件未终态的任务（OPEN/STARTED，解决门禁用），按创建顺序返回。
+     */
+    public List<IncidentTask> listUnfinishedByIncident(long incidentId) {
+        return jdbc.query("SELECT * FROM incident_tasks WHERE incident_id = ?"
+                        + " AND status IN ('OPEN','STARTED') ORDER BY id",
+                TASK_MAPPER, incidentId);
     }
 
     /**
@@ -126,20 +186,22 @@ public class IncidentTaskRepository {
     }
 
     /**
-     * 将 OPEN 任务置为 DONE，记录完成人与 UTC 时刻。
+     * 将任务置为 DONE，记录完成人与 UTC 时刻并递增版本。
+     * 调用方负责状态门禁（OPEN/STARTED 可完成）与租约原子释放。
      */
     public void markDone(long id, String actor, Instant at) {
-        jdbc.update("UPDATE incident_tasks SET status = 'DONE', done_by = ?, done_at = ?,"
-                        + " updated_at = ? WHERE id = ?",
+        jdbc.update("UPDATE incident_tasks SET status = 'DONE', version = version + 1, done_by = ?,"
+                        + " done_at = ?, updated_at = ? WHERE id = ?",
                 actor, Timestamp.from(at), Timestamp.from(at), id);
     }
 
     /**
-     * 将 OPEN 任务置为 CANCELLED，记录取消人与 UTC 时刻。
+     * 将任务置为 CANCELLED，记录取消人与 UTC 时刻并递增版本。
+     * 调用方负责状态门禁（OPEN/STARTED 可取消）与租约原子释放。
      */
     public void markCancelled(long id, String actor, Instant at) {
-        jdbc.update("UPDATE incident_tasks SET status = 'CANCELLED', cancelled_by = ?,"
-                        + " cancelled_at = ?, updated_at = ? WHERE id = ?",
+        jdbc.update("UPDATE incident_tasks SET status = 'CANCELLED', version = version + 1,"
+                        + " cancelled_by = ?, cancelled_at = ?, updated_at = ? WHERE id = ?",
                 actor, Timestamp.from(at), Timestamp.from(at), id);
     }
 

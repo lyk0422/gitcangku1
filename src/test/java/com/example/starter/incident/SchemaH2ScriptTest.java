@@ -108,6 +108,69 @@ class SchemaH2ScriptTest {
                     duplicateBlockerRejected = true;
                 }
                 assertThat(duplicateBlockerRejected).isTrue();
+
+                // 共享资源：容量必须为正整数
+                st.execute("INSERT INTO shared_resources (resource_key, name, capacity,"
+                        + " created_at, updated_at) VALUES ('RES-1','r',2,'" + Timestamp.from(now)
+                        + "','" + Timestamp.from(now) + "')");
+                boolean badCapacityRejected = false;
+                try {
+                    st.execute("INSERT INTO shared_resources (resource_key, name, capacity,"
+                            + " created_at, updated_at) VALUES ('RES-2','r',0,'" + Timestamp.from(now)
+                            + "','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    badCapacityRejected = true;
+                }
+                assertThat(badCapacityRejected).isTrue();
+                boolean duplicateResourceKeyRejected = false;
+                try {
+                    st.execute("INSERT INTO shared_resources (resource_key, name, capacity,"
+                            + " created_at, updated_at) VALUES ('RES-1','r',1,'" + Timestamp.from(now)
+                            + "','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateResourceKeyRejected = true;
+                }
+                assertThat(duplicateResourceKeyRejected).isTrue();
+
+                // 租约：lease_key 唯一、quantity 必须为正、同任务同资源仅一条 ACTIVE
+                st.execute("INSERT INTO resource_leases (lease_key, resource_id, task_id,"
+                        + " incident_id, quantity, status, granted_at, created_at, updated_at)"
+                        + " VALUES ('LE-1',1,1,1,1,'ACTIVE','" + Timestamp.from(now) + "','"
+                        + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                boolean badQuantityRejected = false;
+                try {
+                    st.execute("INSERT INTO resource_leases (lease_key, resource_id, task_id,"
+                            + " incident_id, quantity, status, granted_at, created_at, updated_at)"
+                            + " VALUES ('LE-2',1,2,1,0,'ACTIVE','" + Timestamp.from(now) + "','"
+                            + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    badQuantityRejected = true;
+                }
+                assertThat(badQuantityRejected).isTrue();
+                boolean duplicateActiveRejected = false;
+                try {
+                    st.execute("INSERT INTO resource_leases (lease_key, resource_id, task_id,"
+                            + " incident_id, quantity, status, granted_at, created_at, updated_at)"
+                            + " VALUES ('LE-3',1,1,1,1,'ACTIVE','" + Timestamp.from(now) + "','"
+                            + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateActiveRejected = true;
+                }
+                assertThat(duplicateActiveRejected).isTrue();
+
+                // 撤销首条后，同任务同资源可再持 ACTIVE；且允许多条终态并存
+                st.executeUpdate("UPDATE resource_leases SET status='REVOKED', revoked_at='"
+                        + Timestamp.from(now) + "' WHERE lease_key='LE-1'");
+                st.execute("INSERT INTO resource_leases (lease_key, resource_id, task_id,"
+                        + " incident_id, quantity, status, granted_at, created_at, updated_at)"
+                        + " VALUES ('LE-4',1,1,1,1,'ACTIVE','" + Timestamp.from(now) + "','"
+                        + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                try (ResultSet rs = st.executeQuery(
+                        "SELECT status, active_slot FROM resource_leases WHERE lease_key='LE-4'")) {
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getString("status")).isEqualTo("ACTIVE");
+                    assertThat(rs.getString("active_slot")).isEqualTo("1:1");
+                }
             }
         }
     }

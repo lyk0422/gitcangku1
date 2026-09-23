@@ -63,6 +63,14 @@ public class IncidentRepository {
     }
 
     /**
+     * 按主键查询事件（不加锁），用于关联键解析。
+     */
+    public Optional<Incident> findById(long id) {
+        List<Incident> rows = jdbc.query("SELECT * FROM incidents WHERE id = ?", INCIDENT_MAPPER, id);
+        return rows.stream().findFirst();
+    }
+
+    /**
      * 按业务键查询并锁定事件行（SELECT ... FOR UPDATE），用于写路径串行化。
      */
     public Optional<Incident> lockByKey(String incidentKey) {

@@ -63,19 +63,56 @@ public final class Responses {
     }
 
     /**
-     * 处置任务视图：blockers 按阻塞事件键排序；doneBy/doneAt 仅 DONE 有值，
+     * 处置任务视图：blockers 按阻塞事件键排序；version 为任务乐观版本；
+     * startedAt 仅 STARTED/DONE 有值，doneBy/doneAt 仅 DONE 有值，
      * cancelledBy/cancelledAt 仅 CANCELLED 有值。
      */
     public record TaskView(String taskKey, String groupCode, String title, String status,
-                           List<TaskBlockerView> blockers, String createdBy, Instant createdAt,
-                           String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt) {
+                           long version, List<TaskBlockerView> blockers, String createdBy,
+                           Instant createdAt, Instant startedAt, String doneBy, Instant doneAt,
+                           String cancelledBy, Instant cancelledAt) {
     }
 
     /** 按事件分组的任务列表视图：tasks 按创建顺序返回。 */
     public record IncidentTasksView(String incidentKey, List<TaskView> tasks) {
     }
 
-    /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
+    /** 解决门禁未完成项：仍有 OPEN/STARTED 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
+    }
+
+    /** 共享资源视图：usedCapacity 为查询时全部 ACTIVE 租约占用之和，availableCapacity 为剩余容量。 */
+    public record ResourceView(String resourceKey, String name, int capacity,
+                               int usedCapacity, int availableCapacity, Instant createdAt) {
+    }
+
+    /**
+     * 租约视图：status 为 ACTIVE/RELEASED/REVOKED；incidentKey/taskKey 标识持有任务；
+     * grantedAt 仅 ACTIVE 起有值，releasedAt 仅 RELEASED 有值，
+     * revokedAt/revokeReason 仅 REVOKED 有值；requestId 为关联抢占请求标识，可空。
+     */
+    public record LeaseView(String leaseKey, String resourceKey, String incidentKey, String taskKey,
+                            int quantity, String status, long version, Instant grantedAt,
+                            Instant releasedAt, Instant revokedAt, String revokeReason,
+                            String requestId, Instant createdAt) {
+    }
+
+    /** 抢占计划中的受害租约条目：leaseKey + 提交时租约版本。 */
+    public record PreemptionVictim(String leaseKey, long version) {
+    }
+
+    /**
+     * 抢占结果视图：revoked 为本次实际撤销的受害租约（按计划顺序），
+     * granted 为新授予的租约；任一校验失败整单 409 且无任何变更。
+     */
+    public record PreemptionView(String requestId, List<LeaseView> revoked, LeaseView granted) {
+    }
+
+    /** 抢占闭包查询结果：victims 为必须同时抢占的全部 ACTIVE 受害租约（含传递闭包）。 */
+    public record PreemptionClosureView(String resourceKey, List<LeaseView> victims) {
+    }
+
+    /** 资源占用明细视图：资源本体 + 当前全部 ACTIVE 租约。 */
+    public record ResourceUsageView(ResourceView resource, List<LeaseView> activeLeases) {
     }
 }
