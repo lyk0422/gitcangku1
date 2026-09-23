@@ -1,6 +1,7 @@
 package com.example.starter.repo;
 
 import com.example.starter.domain.Point;
+import com.example.starter.domain.TimeWindow;
 
 import java.util.List;
 
@@ -10,6 +11,7 @@ import java.util.List;
  * @param routeId 航线唯一标识
  * @param version 当前航线版本（从 1 开始）
  * @param points  当前版本有序航点
+ * @param window  整体飞行窗口（UTC 毫秒，左闭右开）；全时为 {@link TimeWindow#ALWAYS}
  */
-public record RoutePo(String routeId, int version, List<Point> points) {
+public record RoutePo(String routeId, int version, List<Point> points, TimeWindow window) {
 }

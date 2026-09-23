@@ -1,6 +1,7 @@
 package com.example.starter.service;
 
 import com.example.starter.api.ApiException;
+import com.example.starter.api.dto.HitZoneWindowDto;
 import com.example.starter.api.dto.MutationResponse;
 import com.example.starter.api.dto.ReviewRequest;
 import com.example.starter.api.dto.ReviewResultDto;
@@ -8,12 +9,14 @@ import com.example.starter.api.dto.RouteCreateRequest;
 import com.example.starter.api.dto.RoutePointDto;
 import com.example.starter.api.dto.RouteReplaceRequest;
 import com.example.starter.api.dto.RouteResult;
+import com.example.starter.api.dto.TimeWindowDto;
 import com.example.starter.api.dto.ZoneCreateRequest;
 import com.example.starter.api.dto.ZoneResult;
 import com.example.starter.api.dto.ZoneRevokeRequest;
 import com.example.starter.domain.Geometry;
 import com.example.starter.domain.Point;
 import com.example.starter.domain.ReviewConclusion;
+import com.example.starter.domain.TimeWindow;
 import com.example.starter.domain.ZoneStatus;
 import com.example.starter.repo.AirspaceRepository;
 import com.example.starter.repo.DedupPo;
@@ -22,6 +25,7 @@ import com.example.starter.repo.ReviewRepository;
 import com.example.starter.repo.RoutePo;
 import com.example.starter.repo.RouteRepository;
 import com.example.starter.repo.ZonePo;
+import com.example.starter.repo.ReviewPo.ZoneWindowSnapshot;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -53,8 +57,13 @@ import java.util.function.Supplier;
  * 失败（含业务冲突）回滚事务，不占用 requestId。</p>
  *
  * <p>审核事务先锁全局空域版本行、再锁航线行：区域变更事务必须更新版本行，
- * 因而与审核互斥，保证审核使用的空域版本号与全部禁飞区来自同一已提交状态，
- * 不会产生“携带新版本、使用旧区域”或反之的结论。</p>
+ * 航线替换事务必须更新航线行，因而与审核互斥，保证审核使用的空域版本、
+ * 全部禁飞区几何/时间窗口，以及航线版本、点列与整体飞行窗口来自同一已提交状态，
+ * 不会产生混搭版本的结论。</p>
+ *
+ * <p>时间窗口为可选 UTC 毫秒区间（左闭右开），缺省为全时；审核仅在航线整体
+ * 飞行窗口与区域有效窗口存在正长度时间交集、且线段与闭矩形空间相交时才计入
+ * BLOCKED。时间仅端点相接不相交，空间仅接触边界仍相交。</p>
  */
 @Service
 public class AirspaceReviewService {
@@ -88,22 +97,25 @@ public class AirspaceReviewService {
 
     // ============================ 禁飞区 ============================
 
-    /** 创建禁飞区；同键同参重放原结果，异参 409。 */
+    /** 创建禁飞区（可带 UTC 毫秒有效窗口，缺省全时）；同键同参重放原结果，异参 409。 */
     public MutationResponse createZone(ZoneCreateRequest request) {
         return withIdempotency(request.requestId(), KIND_ZONE_CREATE, canonicalHash(request), () -> {
             if (request.xMin() >= request.xMax() || request.yMin() >= request.yMax()) {
                 throw new ApiException(HttpStatus.BAD_REQUEST, "INVALID_ZONE_RECTANGLE",
                         "禁飞区必须是非退化轴对齐矩形：xMin < xMax 且 yMin < yMax");
             }
+            TimeWindow window = resolveWindow(request.window());
             if (airspaceRepo.findZone(request.zoneId()) != null) {
                 throw new ApiException(HttpStatus.CONFLICT, "ZONE_ALREADY_EXISTS",
                         "禁飞区已存在: " + request.zoneId());
             }
             long newVersion = airspaceRepo.incrementGlobalVersion();
             airspaceRepo.insertZone(new ZonePo(request.zoneId(), request.xMin(), request.yMin(),
-                    request.xMax(), request.yMax(), ZoneStatus.ACTIVE.name(), newVersion, null));
+                    request.xMax(), request.yMax(), ZoneStatus.ACTIVE.name(), newVersion, null,
+                    window));
             return new MutationResponse(request.requestId(), false,
-                    new ZoneResult(request.zoneId(), ZoneStatus.ACTIVE.name(), newVersion));
+                    new ZoneResult(request.zoneId(), ZoneStatus.ACTIVE.name(), newVersion,
+                            toDto(window)));
         });
     }
 
@@ -122,32 +134,39 @@ public class AirspaceReviewService {
             long newVersion = airspaceRepo.incrementGlobalVersion();
             airspaceRepo.markRevoked(request.zoneId(), newVersion);
             return new MutationResponse(request.requestId(), false,
-                    new ZoneResult(request.zoneId(), ZoneStatus.REVOKED.name(), newVersion));
+                    new ZoneResult(request.zoneId(), ZoneStatus.REVOKED.name(), newVersion,
+                            toDto(zone.window())));
         });
     }
 
     // ============================ 航线 ============================
 
-    /** 创建航线（初始版本 1）。 */
+    /** 创建航线（初始版本 1，可带整体飞行窗口，缺省全时）。 */
     public MutationResponse createRoute(RouteCreateRequest request) {
         return withIdempotency(request.requestId(), KIND_ROUTE_CREATE, canonicalHash(request), () -> {
             List<Point> points = toPoints(request.points());
             validatePointsDistinct(points);
+            TimeWindow window = resolveWindow(request.window());
             if (routeRepo.findRoute(request.routeId()) != null) {
                 throw new ApiException(HttpStatus.CONFLICT, "ROUTE_ALREADY_EXISTS",
                         "航线已存在: " + request.routeId());
             }
-            routeRepo.insertRoute(request.routeId(), points);
+            routeRepo.insertRoute(request.routeId(), points, window);
             return new MutationResponse(request.requestId(), false,
-                    new RouteResult(request.routeId(), 1));
+                    new RouteResult(request.routeId(), 1, toDto(window)));
         });
     }
 
-    /** 替换航线点列，expectedVersion 不匹配返回 409；成功版本加一。 */
+    /**
+     * 整体替换航线点列与窗口，expectedVersion 不匹配返回 409；成功版本加一。
+     * 即使仅窗口改变也推进版本并使当前审核结论失效；省略窗口时明确重置为全时。
+     */
     public MutationResponse replaceRoute(RouteReplaceRequest request) {
         return withIdempotency(request.requestId(), KIND_ROUTE_REPLACE, canonicalHash(request), () -> {
             List<Point> points = toPoints(request.points());
             validatePointsDistinct(points);
+            // 旧替换请求省略窗口：明确沿用全时语义
+            TimeWindow window = resolveWindow(request.window());
             RoutePo route = routeRepo.findRoute(request.routeId());
             if (route == null) {
                 throw new ApiException(HttpStatus.NOT_FOUND, "ROUTE_NOT_FOUND",
@@ -158,9 +177,10 @@ public class AirspaceReviewService {
                         "航线版本不匹配：expected=" + request.expectedVersion()
                                 + ", current=" + route.version());
             }
-            // 条件更新兜底并发替换：更新 0 行说明版本已被其他事务推进
-            int updated = routeRepo.compareAndIncrementVersion(
-                    request.routeId(), request.expectedVersion());
+            // 条件更新兜底并发替换：更新 0 行说明版本已被其他事务推进。
+            // 任何替换（即使仅窗口改变、几何不变）都在此处推进版本并写入新窗口。
+            int updated = routeRepo.compareAndReplace(
+                    request.routeId(), request.expectedVersion(), window);
             if (updated == 0) {
                 throw new ApiException(HttpStatus.CONFLICT, "VERSION_CONFLICT",
                         "航线版本已变化，请使用最新 expectedVersion 重试");
@@ -168,18 +188,23 @@ public class AirspaceReviewService {
             routeRepo.deletePoints(request.routeId());
             routeRepo.insertPoints(request.routeId(), points);
             return new MutationResponse(request.requestId(), false,
-                    new RouteResult(request.routeId(), request.expectedVersion() + 1));
+                    new RouteResult(request.routeId(), request.expectedVersion() + 1, toDto(window)));
         });
     }
 
     // ============================ 审核 ============================
 
-    /** 提交审核：任一指定版本不是当前版本返回 409；结果不可变。 */
+    /**
+     * 提交审核：任一指定版本不是当前版本返回 409；结果不可变。
+     *
+     * <p>仅当航线整体飞行窗口与区域有效窗口相交（任一方全时必相交，
+     * 端点相接不相交）且线段与闭矩形空间相交（接触边界仍相交）时计入 BLOCKED。</p>
+     */
     public MutationResponse review(ReviewRequest request) {
         return withIdempotency(request.requestId(), KIND_REVIEW, canonicalHash(request), () -> {
             // 先锁空域版本行：与任何区域创建/撤销事务互斥
             long globalVersion = airspaceRepo.getGlobalVersionForUpdate();
-            // 再锁航线行：与航线替换事务互斥，保证版本号与点列一致
+            // 再锁航线行：与航线替换事务互斥，保证版本号、点列与窗口一致
             RoutePo route = routeRepo.findRouteForUpdate(request.routeId());
             if (route == null) {
                 throw new ApiException(HttpStatus.NOT_FOUND, "ROUTE_NOT_FOUND",
@@ -195,35 +220,41 @@ public class AirspaceReviewService {
                         "空域版本不是当前版本：submitted=" + request.airspaceVersion()
                                 + ", current=" + globalVersion);
             }
-            // 持锁状态下读取全部有效禁飞区，与上面的版本号同属一个一致状态
+            // 持锁状态下读取全部有效禁飞区（几何与窗口），与上面的版本号同属一个一致状态
             List<ZonePo> activeZones = airspaceRepo.findActiveZones();
-            Set<String> hits = new TreeSet<>();
+            Set<String> hitIds = new TreeSet<>();
+            List<ZoneWindowSnapshot> hitWindows = new ArrayList<>();
             for (ZonePo zone : activeZones) {
-                if (Geometry.polylineHitsRectangle(route.points(),
-                        zone.xMin(), zone.yMin(), zone.xMax(), zone.yMax())) {
-                    hits.add(zone.zoneId());
+                boolean spatialHit = Geometry.polylineHitsRectangle(route.points(),
+                        zone.xMin(), zone.yMin(), zone.xMax(), zone.yMax());
+                boolean temporalHit = TimeWindow.overlaps(route.window(), zone.window());
+                if (spatialHit && temporalHit) {
+                    hitIds.add(zone.zoneId());
+                    // 区域已按 zoneId 排序返回，追加顺序即字典序，与 hitIds 对齐
+                    hitWindows.add(new ZoneWindowSnapshot(zone.zoneId(), zone.window()));
                 }
             }
-            String conclusion = hits.isEmpty()
+            String conclusion = hitIds.isEmpty()
                     ? ReviewConclusion.CLEAR.name()
                     : ReviewConclusion.BLOCKED.name();
             String reviewId = "rv_" + UUID.randomUUID();
             ReviewPo po = new ReviewPo(reviewId, request.routeId(), route.version(), globalVersion,
-                    conclusion, new ArrayList<>(hits), List.copyOf(route.points()),
+                    conclusion, new ArrayList<>(hitIds), List.copyOf(route.points()),
+                    route.window(), List.copyOf(hitWindows),
                     request.requestId(), nowMillis());
             reviewRepo.insertReview(po);
             return new MutationResponse(request.requestId(), false, toDto(po, conclusion, true));
         });
     }
 
-    /** 按 reviewId 查询历史审核，保留原结论。 */
+    /** 按 reviewId 查询历史审核，保留原结论与双方窗口快照。 */
     public ReviewResultDto getReview(String reviewId) {
         ReviewPo po = reviewRepo.findReview(reviewId);
         if (po == null) {
             throw new ApiException(HttpStatus.NOT_FOUND, "REVIEW_NOT_FOUND",
                     "审核记录不存在: " + reviewId);
         }
-        // 历史查询永远返回保存时的原结论，不重新计算
+        // 历史查询永远返回保存时的原结论与窗口快照，不重新计算
         return toDto(po, po.conclusion(), null);
     }
 
@@ -321,6 +352,39 @@ public class AirspaceReviewService {
 
     // ============================ 工具方法 ============================
 
+    /**
+     * 解析并校验时间窗口：缺省或起止均缺省为全时；起止必须成对出现，
+     * 单独提供其一时 400；开始必须严格早于结束，否则 400。
+     */
+    private static TimeWindow resolveWindow(TimeWindowDto dto) {
+        if (dto == null) {
+            return TimeWindow.ALWAYS;
+        }
+        Long start = dto.startUtcMillis();
+        Long end = dto.endUtcMillis();
+        boolean startMissing = start == null;
+        boolean endMissing = end == null;
+        if (startMissing && endMissing) {
+            return TimeWindow.ALWAYS;
+        }
+        if (startMissing || endMissing) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "INVALID_TIME_WINDOW",
+                    "时间窗口起止时刻必须成对提供，或同时缺省表示全时有效");
+        }
+        if (start >= end) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "INVALID_TIME_WINDOW",
+                    "时间窗口开始时刻必须严格早于结束时刻（左闭右开）");
+        }
+        return new TimeWindow(start, end);
+    }
+
+    private static TimeWindowDto toDto(TimeWindow window) {
+        if (window == null) {
+            return new TimeWindowDto(null, null);
+        }
+        return new TimeWindowDto(window.startUtcMillis(), window.endUtcMillis());
+    }
+
     private static List<Point> toPoints(List<RoutePointDto> dtos) {
         List<Point> points = new ArrayList<>(dtos.size());
         for (RoutePointDto dto : dtos) {
@@ -345,8 +409,16 @@ public class AirspaceReviewService {
         for (Point p : po.pointsSnapshot()) {
             snapshot.add(new RoutePointDto(p.x(), p.y()));
         }
+        List<HitZoneWindowDto> windows = new ArrayList<>(po.hitZoneWindows().size());
+        for (ZoneWindowSnapshot hit : po.hitZoneWindows()) {
+            windows.add(new HitZoneWindowDto(hit.zoneId(), new TimeWindowDto(
+                    hit.window() == null ? null : hit.window().startUtcMillis(),
+                    hit.window() == null ? null : hit.window().endUtcMillis())));
+        }
         return new ReviewResultDto(po.reviewId(), po.routeId(), po.routeVersion(),
-                po.airspaceVersion(), conclusion, List.copyOf(po.hitZoneIds()), snapshot, current);
+                po.airspaceVersion(), conclusion, List.copyOf(po.hitZoneIds()), snapshot,
+                new TimeWindowDto(po.routeWindow().startUtcMillis(), po.routeWindow().endUtcMillis()),
+                List.copyOf(windows), current);
     }
 
     private long nowMillis() {
@@ -364,7 +436,8 @@ public class AirspaceReviewService {
     /**
      * 计算请求参数的规范化哈希（SHA-256）。
      * 对象字段按键名字典序递归排序，列表保持顺序，使相同语义参数产生相同哈希、
-     * 字段书写顺序不同不影响比对结果。
+     * 字段书写顺序不同不影响比对结果；窗口为数值 UTC 毫秒，等价时刻序列化结果相同，
+     * 因而视为同参。
      */
     private String canonicalHash(Object request) {
         try {
@@ -379,10 +452,18 @@ public class AirspaceReviewService {
 
     private static JsonNode canonicalize(JsonNode node) {
         if (node.isObject()) {
-            ObjectNode sorted = JsonNodeFactory.instance.objectNode();
             List<String> names = new ArrayList<>();
             node.fieldNames().forEachRemaining(names::add);
             names.sort(String::compareTo);
+            // 起止均缺省的窗口对象与缺省窗口（null）语义同为全时，归一化为 null，
+            // 保证二者请求指纹一致、按同参重放。
+            if (names.size() == 2
+                    && names.equals(List.of("endUtcMillis", "startUtcMillis"))
+                    && node.get("startUtcMillis").isNull()
+                    && node.get("endUtcMillis").isNull()) {
+                return JsonNodeFactory.instance.nullNode();
+            }
+            ObjectNode sorted = JsonNodeFactory.instance.objectNode();
             for (String name : names) {
                 sorted.set(name, canonicalize(node.get(name)));
             }

@@ -1,8 +1,9 @@
 package com.example.starter.repo;
 
 import com.example.starter.domain.Point;
+import com.example.starter.domain.TimeWindow;
+import com.example.starter.repo.ReviewPo.ZoneWindowSnapshot;
 import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
 
 import java.util.ArrayList;
@@ -11,7 +12,9 @@ import java.util.List;
 
 /**
  * 审核结果与幂等去重数据访问。
- * 点快照以 "x,y;x,y" 文本保存，命中 zoneId 以逗号拼接，均为不可变内容。
+ * 点快照以 "x,y;x,y" 文本保存，命中 zoneId 以逗号拼接；
+ * 命中区域窗口快照以 "zoneId,start,end;..." 保存（全时窗口的 start/end 留空段），
+ * 均为不可变内容。历史记录缺少窗口列值时按全时解释。
  */
 @Repository
 public class ReviewRepository {
@@ -22,32 +25,40 @@ public class ReviewRepository {
         this.jdbc = jdbc;
     }
 
-    private static final RowMapper<ReviewPo> REVIEW_MAPPER = (rs, n) -> new ReviewPo(
-            rs.getString("review_id"),
-            rs.getString("route_id"),
-            rs.getInt("route_version"),
-            rs.getLong("airspace_version"),
-            rs.getString("conclusion"),
-            decodeZoneIds(rs.getString("hit_zone_ids")),
-            decodePoints(rs.getString("points_snapshot")),
-            rs.getString("request_id"),
-            rs.getLong("created_at"));
+    private static final String REVIEW_COLUMNS =
+            "review_id, route_id, route_version, airspace_version, conclusion, "
+                    + "hit_zone_ids, points_snapshot, route_window_start, route_window_end, "
+                    + "hit_zone_windows, request_id, created_at";
+
+    private static final org.springframework.jdbc.core.RowMapper<ReviewPo> REVIEW_MAPPER = (rs, n) -> {
+        TimeWindow routeWindow = new TimeWindow(
+                (Long) rs.getObject("route_window_start"),
+                (Long) rs.getObject("route_window_end"));
+        return new ReviewPo(
+                rs.getString("review_id"),
+                rs.getString("route_id"),
+                rs.getInt("route_version"),
+                rs.getLong("airspace_version"),
+                rs.getString("conclusion"),
+                decodeZoneIds(rs.getString("hit_zone_ids")),
+                decodePoints(rs.getString("points_snapshot")),
+                routeWindow,
+                decodeZoneWindows(rs.getString("hit_zone_windows")),
+                rs.getString("request_id"),
+                rs.getLong("created_at"));
+    };
 
     /** 按 reviewId 查询不可变审核记录，不存在返回 null。 */
     public ReviewPo findReview(String reviewId) {
         return jdbc.query(
-                "SELECT review_id, route_id, route_version, airspace_version, conclusion, "
-                        + "hit_zone_ids, points_snapshot, request_id, created_at "
-                        + "FROM review WHERE review_id = ?",
+                "SELECT " + REVIEW_COLUMNS + " FROM review WHERE review_id = ?",
                 REVIEW_MAPPER, reviewId).stream().findFirst().orElse(null);
     }
 
     /** 查询某航线最新的一条审核记录（按创建时间、reviewId 倒序），没有返回 null。 */
     public ReviewPo findLatestReview(String routeId) {
         return jdbc.query(
-                "SELECT review_id, route_id, route_version, airspace_version, conclusion, "
-                        + "hit_zone_ids, points_snapshot, request_id, created_at "
-                        + "FROM review WHERE route_id = ? "
+                "SELECT " + REVIEW_COLUMNS + " FROM review WHERE route_id = ? "
                         + "ORDER BY created_at DESC, review_id DESC LIMIT 1",
                 REVIEW_MAPPER, routeId).stream().findFirst().orElse(null);
     }
@@ -56,11 +67,13 @@ public class ReviewRepository {
     public void insertReview(ReviewPo po) {
         jdbc.update("INSERT INTO review "
                         + "(review_id, route_id, route_version, airspace_version, conclusion, "
-                        + "hit_zone_ids, points_snapshot, request_id, created_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        + "hit_zone_ids, points_snapshot, route_window_start, route_window_end, "
+                        + "hit_zone_windows, request_id, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 po.reviewId(), po.routeId(), po.routeVersion(), po.airspaceVersion(),
                 po.conclusion(), encodeZoneIds(po.hitZoneIds()), encodePoints(po.pointsSnapshot()),
-                po.requestId(), po.createdAt());
+                po.routeWindow().startUtcMillis(), po.routeWindow().endUtcMillis(),
+                encodeZoneWindows(po.hitZoneWindows()), po.requestId(), po.createdAt());
     }
 
     /** 查询幂等去重记录，不存在返回 null。 */
@@ -117,5 +130,44 @@ public class ReviewRepository {
             return new ArrayList<>();
         }
         return new ArrayList<>(Arrays.asList(text.split(",")));
+    }
+
+    /**
+     * 命中区域窗口快照编码："zoneId,start,end;zoneId,start,end"。
+     * 全时窗口的 start/end 为空段（如 "z1,,"）。
+     */
+    public static String encodeZoneWindows(List<ZoneWindowSnapshot> snapshots) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < snapshots.size(); i++) {
+            if (i > 0) {
+                sb.append(';');
+            }
+            ZoneWindowSnapshot snapshot = snapshots.get(i);
+            sb.append(snapshot.zoneId()).append(',');
+            if (snapshot.window() != null && !snapshot.window().isAlways()) {
+                sb.append(snapshot.window().startUtcMillis())
+                        .append(',').append(snapshot.window().endUtcMillis());
+            } else {
+                sb.append(',');
+            }
+        }
+        return sb.toString();
+    }
+
+    /** 命中区域窗口快照解码，空串返回空列表；缺少时刻按全时解释。 */
+    public static List<ZoneWindowSnapshot> decodeZoneWindows(String text) {
+        List<ZoneWindowSnapshot> snapshots = new ArrayList<>();
+        if (text != null && !text.isEmpty()) {
+            for (String segment : text.split(";", -1)) {
+                String[] parts = segment.split(",", -1);
+                String zoneId = parts[0];
+                Long start = parts.length > 1 && !parts[1].isEmpty()
+                        ? Long.parseLong(parts[1]) : null;
+                Long end = parts.length > 2 && !parts[2].isEmpty()
+                        ? Long.parseLong(parts[2]) : null;
+                snapshots.add(new ZoneWindowSnapshot(zoneId, new TimeWindow(start, end)));
+            }
+        }
+        return snapshots;
     }
 }

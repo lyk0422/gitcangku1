@@ -24,16 +24,20 @@ CREATE TABLE IF NOT EXISTS no_fly_zone (
     y_max            INT NOT NULL COMMENT '矩形上边界（含），单位米，y_min < y_max',
     status           VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE 有效参与审核；REVOKED 已撤销不参与审核',
     created_version  BIGINT NOT NULL COMMENT '创建生效时的全局空域版本',
-    revoked_version  BIGINT NULL COMMENT '撤销生效时的全局空域版本；NULL 表示仍有效'
-) COMMENT = '禁飞区（非退化轴对齐闭矩形，只能创建或撤销）';
+    revoked_version  BIGINT NULL COMMENT '撤销生效时的全局空域版本；NULL 表示仍有效',
+    window_start     BIGINT NULL COMMENT '有效窗口起点（含），UTC 毫秒；与 window_end 同时为 NULL 表示全时有效',
+    window_end       BIGINT NULL COMMENT '有效窗口终点（不含），UTC 毫秒，严格晚于 window_start；NULL 表示全时有效'
+) COMMENT = '禁飞区（非退化轴对齐闭矩形，只能创建或撤销，可带 UTC 毫秒有效窗口）';
 
--- 航线当前状态：routeId 唯一，版本从 1 开始，替换成功加一
+-- 航线当前状态：routeId 唯一，版本从 1 开始，替换成功加一（即使仅窗口改变）
 -- touch 仅用于审核事务对该行产生真实更新以加行级写锁，与替换操作互斥
 CREATE TABLE IF NOT EXISTS route (
-    route_id  VARCHAR(64) PRIMARY KEY COMMENT '航线唯一标识',
-    version   INT NOT NULL COMMENT '当前航线版本，初始 1，每次成功替换加一',
-    touch     BIGINT NOT NULL COMMENT '仅用于审核事务加行级写锁的计数器，无业务含义'
-) COMMENT = '航线当前版本状态';
+    route_id      VARCHAR(64) PRIMARY KEY COMMENT '航线唯一标识',
+    version       INT NOT NULL COMMENT '当前航线版本，初始 1，每次成功替换加一（含仅窗口改期）',
+    touch         BIGINT NOT NULL COMMENT '仅用于审核事务加行级写锁的计数器，无业务含义',
+    window_start  BIGINT NULL COMMENT '整体飞行窗口起点（含），UTC 毫秒；与 window_end 同时为 NULL 表示全时有效',
+    window_end    BIGINT NULL COMMENT '整体飞行窗口终点（不含），UTC 毫秒，严格晚于 window_start；NULL 表示全时有效'
+) COMMENT = '航线当前版本状态（点列与整体 UTC 毫秒飞行窗口）';
 
 -- 航线点（当前版本，2~50 个，按 seq 顺序连接）
 CREATE TABLE IF NOT EXISTS route_point (
@@ -46,16 +50,19 @@ CREATE TABLE IF NOT EXISTS route_point (
 
 -- 审核不可变结果
 CREATE TABLE IF NOT EXISTS review (
-    review_id         VARCHAR(64) PRIMARY KEY COMMENT '审核记录唯一标识（不可变）',
-    route_id          VARCHAR(64) NOT NULL COMMENT '被审核航线标识',
-    route_version     INT NOT NULL COMMENT '审核明确指定的航线版本',
-    airspace_version  BIGINT NOT NULL COMMENT '审核明确指定的空域版本',
-    conclusion        VARCHAR(16) NOT NULL COMMENT '保存时的原结论：CLEAR 通过或 BLOCKED 命中，永不改变',
-    hit_zone_ids      CLOB NOT NULL COMMENT '命中的全部 zoneId，字典序去重后逗号拼接；未命中为空串',
-    points_snapshot   VARCHAR(4000) NOT NULL COMMENT '审核时航点不可变快照，格式 x,y;x,y',
-    request_id        VARCHAR(64) NOT NULL COMMENT '提交审核的写操作请求标识',
-    created_at        BIGINT NOT NULL COMMENT '创建时间，epoch 毫秒（UTC）'
-) COMMENT = '审核不可变结果';
+    review_id          VARCHAR(64) PRIMARY KEY COMMENT '审核记录唯一标识（不可变）',
+    route_id           VARCHAR(64) NOT NULL COMMENT '被审核航线标识',
+    route_version      INT NOT NULL COMMENT '审核明确指定的航线版本',
+    airspace_version   BIGINT NOT NULL COMMENT '审核明确指定的空域版本',
+    conclusion         VARCHAR(16) NOT NULL COMMENT '保存时的原结论：CLEAR 通过或 BLOCKED 命中，永不改变',
+    hit_zone_ids       CLOB NOT NULL COMMENT '命中的全部 zoneId，字典序去重后逗号拼接；未命中为空串',
+    points_snapshot    VARCHAR(4000) NOT NULL COMMENT '审核时航点不可变快照，格式 x,y;x,y',
+    route_window_start BIGINT NULL COMMENT '审核时航线整体飞行窗口起点（含）快照，UTC 毫秒；NULL 表示全时（含旧记录）',
+    route_window_end   BIGINT NULL COMMENT '审核时航线整体飞行窗口终点（不含）快照，UTC 毫秒；NULL 表示全时（含旧记录）',
+    hit_zone_windows   CLOB NOT NULL COMMENT '命中区域审核时有效窗口快照，格式 zoneId,start,end;...，空时刻留空；未命中为空串',
+    request_id         VARCHAR(64) NOT NULL COMMENT '提交审核的写操作请求标识',
+    created_at         BIGINT NOT NULL COMMENT '创建时间，epoch 毫秒（UTC）'
+) COMMENT = '审核不可变结果（含双方时间窗口快照，历史不随后续改期改变）';
 
 CREATE UNIQUE INDEX IF NOT EXISTS ux_review_request ON review (request_id);
 
@@ -63,7 +70,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_review_request ON review (request_id);
 CREATE TABLE IF NOT EXISTS request_dedup (
     request_id     VARCHAR(64) PRIMARY KEY COMMENT '写操作全局唯一请求标识',
     request_kind   VARCHAR(32) NOT NULL COMMENT '请求类型：ZONE_CREATE/ZONE_REVOKE/ROUTE_CREATE/ROUTE_REPLACE/REVIEW',
-    request_hash   VARCHAR(64) NOT NULL COMMENT '规范化参数的 SHA-256 十六进制摘要，用于同键异参冲突判定',
+    request_hash   VARCHAR(64) NOT NULL COMMENT '规范化参数的 SHA-256 十六进制摘要，用于同键异参冲突判定（含窗口）',
     response_json  CLOB NOT NULL COMMENT '首次成功响应 JSON，重放时原样返回',
     created_at     BIGINT NOT NULL COMMENT '首次成功时间，epoch 毫秒（UTC）'
 ) COMMENT = '写操作幂等去重记录（与业务变更同事务原子提交）';
