@@ -54,6 +54,13 @@ public class BatchRepository {
     public record LineageRow(long id, String parentKey, String childKey, int seq, String createdAt) {
     }
 
+    /**
+     * batch_merge_parent 表行记录：合批父子关系（多父），创建后不可改写。
+     */
+    public record MergeParentRow(long id, String parentKey, String childKey, int seq,
+                                 String createdAt) {
+    }
+
     private static final RowMapper<BatchRow> BATCH_MAPPER = (rs, n) -> new BatchRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("product_code"),
             rs.getString("batch_no"), rs.getString("produced_at"),
@@ -78,6 +85,10 @@ public class BatchRepository {
             rs.getInt("response_status"), rs.getString("response_body"));
 
     private static final RowMapper<LineageRow> LINEAGE_MAPPER = (rs, n) -> new LineageRow(
+            rs.getLong("id"), rs.getString("parent_key"), rs.getString("child_key"),
+            rs.getInt("seq"), rs.getString("created_at"));
+
+    private static final RowMapper<MergeParentRow> MERGE_PARENT_MAPPER = (rs, n) -> new MergeParentRow(
             rs.getLong("id"), rs.getString("parent_key"), rs.getString("child_key"),
             rs.getInt("seq"), rs.getString("created_at"));
 
@@ -194,12 +205,25 @@ public class BatchRepository {
     }
 
     /**
-     * 某批次的直接父批业务键；每个子批仅一个父批。
+     * 某批次的直接拆分父批业务键；每个子批仅一个拆分父批。
      */
     public Optional<String> findParentKey(String childKey) {
         return jdbc.queryForList("SELECT parent_key FROM batch_lineage WHERE child_key = ?",
                         String.class, childKey)
                 .stream().findFirst();
+    }
+
+    public void insertMergeParent(MergeParentRow row) {
+        jdbc.update("INSERT INTO batch_merge_parent (parent_key, child_key, seq, created_at)"
+                        + " VALUES (?, ?, ?, ?)",
+                row.parentKey(), row.childKey(), row.seq(), row.createdAt());
+    }
+
+    /**
+     * 全部合批血缘边（父→子），与拆分边合并后构成多父有向无环图；关系不可改写，只增不改。
+     */
+    public List<MergeParentRow> findAllMergeParents() {
+        return jdbc.query("SELECT * FROM batch_merge_parent ORDER BY id", MERGE_PARENT_MAPPER);
     }
 
     /**

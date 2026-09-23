@@ -5,6 +5,7 @@ import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
 import com.example.starter.batch.dto.LineageEntryResponse;
+import com.example.starter.batch.dto.MergeRequest;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
@@ -96,6 +97,15 @@ public class BatchController {
     public ResponseEntity<String> split(@PathVariable String batchKey,
                                         @Valid @RequestBody SplitRequest request) {
         return stored(service.split(batchKey, request));
+    }
+
+    /**
+     * 合批：2～5 个不同且当前可用的 RELEASED 父批合成一个全新批次，
+     * 父批全部置为 MERGED 并退出可用集合，新批初始 QUARANTINED。
+     */
+    @PostMapping("/merge")
+    public ResponseEntity<String> merge(@Valid @RequestBody MergeRequest request) {
+        return stored(service.merge(request));
     }
 
     /**
