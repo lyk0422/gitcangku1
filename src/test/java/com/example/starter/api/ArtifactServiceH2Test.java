@@ -43,8 +43,12 @@ class ArtifactServiceH2Test {
     void cleanDatabase() {
         jdbcTemplate.update("DELETE FROM lock_file_entry");
         jdbcTemplate.update("DELETE FROM lock_file");
+        jdbcTemplate.update("DELETE FROM artifact_signature");
         jdbcTemplate.update("DELETE FROM artifact_dependency");
         jdbcTemplate.update("DELETE FROM artifact");
+        jdbcTemplate.update("DELETE FROM signing_policy_key");
+        jdbcTemplate.update("DELETE FROM signing_policy");
+        jdbcTemplate.update("DELETE FROM signing_key");
         jdbcTemplate.update("DELETE FROM idempotent_request");
         jdbcTemplate.update("UPDATE repository_state SET version = 0 WHERE id = 1");
     }
@@ -54,7 +58,7 @@ class ArtifactServiceH2Test {
     }
 
     private RegisterArtifactRequest artifact(String name, int version, DependencySpec... deps) {
-        return new RegisterArtifactRequest(name, version, List.of(deps));
+        return new RegisterArtifactRequest(name, version, null, List.of(deps));
     }
 
     private static DependencySpec dep(String name, int min, int max) {
@@ -412,11 +416,11 @@ class ArtifactServiceH2Test {
 
     @Test
     void uniqueConstraintOnNameAndVersionIsEnforcedByDatabase() {
-        jdbcTemplate.update("INSERT INTO artifact (name, version, withdrawn, created_at) "
-                + "VALUES ('x', 1, 0, CURRENT_TIMESTAMP(6))");
+        jdbcTemplate.update("INSERT INTO artifact (name, version, withdrawn, content_digest, created_at) "
+                + "VALUES ('x', 1, 0, REPEAT('a', 64), CURRENT_TIMESTAMP(6))");
         assertThatThrownBy(() -> jdbcTemplate.update(
-                "INSERT INTO artifact (name, version, withdrawn, created_at) "
-                        + "VALUES ('x', 1, 0, CURRENT_TIMESTAMP(6))"))
+                "INSERT INTO artifact (name, version, withdrawn, content_digest, created_at) "
+                        + "VALUES ('x', 1, 0, REPEAT('a', 64), CURRENT_TIMESTAMP(6))"))
                 .isInstanceOf(org.springframework.dao.DuplicateKeyException.class);
     }
 

@@ -24,7 +24,7 @@ class LockResolverTest {
             List<TestVersion> versions = (List<TestVersion>) groups[i + 1];
             List<ArtifactVersion> list = versions.stream()
                     .map(v -> new ArtifactVersion(id.getAndIncrement(), name, v.version(),
-                            v.withdrawn(), v.deps()))
+                            v.withdrawn(), "digest-" + name + "-" + v.version(), v.deps()))
                     .toList();
             map.put(name, list);
         }
