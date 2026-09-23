@@ -113,6 +113,13 @@ public class PlanService {
             return tx.execute(status -> {
                 DayPlan plan = planRepo.findByKeyForUpdate(scheduleKey)
                         .orElseThrow(() -> notFound(scheduleKey));
+                // 权威幂等复核在计划行锁内、状态/版本校验前：并发同键请求在该行上排队，
+                // 首次替换提交后等待者返回首次快照，不会重复加版本或把版本变化误判为冲突。
+                Optional<PlanResponse> lockedReplay =
+                        replayIfPresent(OP_UPDATE, req.requestKey(), hash);
+                if (lockedReplay.isPresent()) {
+                    return lockedReplay.get();
+                }
                 if (plan.status() != PlanStatus.DRAFT) {
                     throw conflict("PLAN_STATE_CONFLICT",
                             "仅草稿可修改占用，当前状态: " + plan.status());
@@ -147,6 +154,13 @@ public class PlanService {
         try {
             return tx.execute(status -> {
                 planRepo.acquirePublishLock();
+                // 与改签相同：在发布锁内、计划行锁定前做权威幂等复核，
+                // 保证并发同键重放返回首次成功快照，而不是把“已发布”误判为状态冲突。
+                Optional<PlanResponse> lockedReplay =
+                        replayIfPresent(OP_PUBLISH, requestKey, hash);
+                if (lockedReplay.isPresent()) {
+                    return lockedReplay.get();
+                }
                 DayPlan plan = planRepo.findByKeyForUpdate(scheduleKey)
                         .orElseThrow(() -> notFound(scheduleKey));
                 if (plan.status() != PlanStatus.DRAFT) {
@@ -185,6 +199,13 @@ public class PlanService {
             return tx.execute(status -> {
                 DayPlan plan = planRepo.findByKeyForUpdate(scheduleKey)
                         .orElseThrow(() -> notFound(scheduleKey));
+                // 权威幂等复核在计划行锁内、状态校验前：并发同键请求在该行上排队，
+                // 首个取消提交后等待者读到首次快照并返回，不会把“已取消”误判为状态冲突。
+                Optional<PlanResponse> lockedReplay =
+                        replayIfPresent(OP_CANCEL, requestKey, hash);
+                if (lockedReplay.isPresent()) {
+                    return lockedReplay.get();
+                }
                 if (plan.status() != PlanStatus.PUBLISHED) {
                     throw conflict("PLAN_STATE_CONFLICT",
                             "仅已发布计划可取消，当前状态: " + plan.status());
@@ -218,6 +239,14 @@ public class PlanService {
         try {
             return tx.execute(status -> {
                 planRepo.acquirePublishLock();
+                // 权威幂等复核必须在发布锁内、锁定计划行之前：并发同键请求在锁上排队，
+                // 首个事务提交后，等待者在此读到首次成功快照并原样返回，
+                // 不会因旧计划已取消/版本已变而误判为状态或版本冲突，也不执行任何写入。
+                Optional<RescheduleResponse> lockedReplay =
+                        replayIfPresent(OP_RESCHEDULE, req.requestKey(), hash, RescheduleResponse.class);
+                if (lockedReplay.isPresent()) {
+                    return lockedReplay.get();
+                }
                 DayPlan oldPlan = planRepo.findByKeyForUpdate(oldScheduleKey)
                         .orElseThrow(() -> notFound(oldScheduleKey));
                 DayPlan newPlan = planRepo.findByKeyForUpdate(req.newScheduleKey())
