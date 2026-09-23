@@ -1,0 +1,11 @@
+# 外部 MySQL 配置（历史部署入口）：通过 DB_URL / DB_USER / DB_PASSWORD 环境变量注入
+spring:
+  datasource:
+    url: ${DB_URL}
+    username: ${DB_USER}
+    password: ${DB_PASSWORD:}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema.sql

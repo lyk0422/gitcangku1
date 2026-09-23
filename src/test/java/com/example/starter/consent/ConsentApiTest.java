@@ -45,9 +45,24 @@ class ConsentApiTest {
 
     @BeforeEach
     void cleanTables() {
+        jdbc.update("DELETE FROM migration_evidence_item");
+        jdbc.update("DELETE FROM migration_evidence");
+        jdbc.update("DELETE FROM query_generation");
+        jdbc.update("DELETE FROM purpose_replacement");
         jdbc.update("DELETE FROM consent_record");
         jdbc.update("DELETE FROM consent_grant");
+        jdbc.update("DELETE FROM catalog_purpose");
+        jdbc.update("DELETE FROM catalog_generation");
         jdbc.update("DELETE FROM idempotency_request");
+        // 共享内存库（DB_CLOSE_DELAY=-1）：重置初始目录，避免跨测试类污染
+        jdbc.update("INSERT INTO catalog_generation (generation, migration_key, source_purpose)"
+                + " VALUES (1, NULL, NULL)");
+        // DELETE 不重置 H2 自增序列，显式从 2 继续
+        jdbc.execute("ALTER TABLE catalog_generation ALTER COLUMN generation RESTART WITH 2");
+        jdbc.update("INSERT INTO catalog_purpose (code, status, scope_canonical, introduced_generation)"
+                + " VALUES ('RESEARCH', 'ACTIVE', NULL, 1)");
+        jdbc.update("INSERT INTO catalog_purpose (code, status, scope_canonical, introduced_generation)"
+                + " VALUES ('PERSONALIZATION', 'ACTIVE', NULL, 1)");
     }
 
     private ResultActions grant(String requestId, String subjectKey, String purpose) throws Exception {
@@ -288,12 +303,13 @@ class ConsentApiTest {
     }
 
     @Test
-    void invalidPurposeReturns400() throws Exception {
+    void unknownPurposeRejected() throws Exception {
+        // 用途改为目录驱动字符串后，未知用途由业务层拒绝（404）
         mockMvc.perform(post("/api/v1/consents/grants")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"requestId\":\"g-1\",\"subjectKey\":\"subj-a\",\"purpose\":\"MARKETING\"}"))
-                .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.code").value("INVALID_ARGUMENT"));
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.code").value("PURPOSE_NOT_FOUND"));
     }
 
     @Test
@@ -382,7 +398,7 @@ class ConsentApiTest {
                 ready.countDown();
                 start.await();
                 return consentService.write(new RecordWriteRequest(
-                        requestId, "subj-a", Purpose.RESEARCH, "rec-1", "same-payload")).payload();
+                        requestId, "subj-a", "RESEARCH", "rec-1", "same-payload")).payload();
             });
         }
         List<Future<String>> futures = new ArrayList<>();
@@ -412,7 +428,7 @@ class ConsentApiTest {
                 ready.countDown();
                 start.await();
                 return consentService.grant(
-                        new com.example.starter.consent.dto.GrantRequest(requestId, "subj-c", Purpose.RESEARCH)).epoch();
+                        new com.example.starter.consent.dto.GrantRequest(requestId, "subj-c", "RESEARCH")).epoch();
             });
         }
         List<Future<Integer>> futures = new ArrayList<>();

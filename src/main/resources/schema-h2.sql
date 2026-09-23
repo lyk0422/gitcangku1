@@ -1,4 +1,4 @@
--- 测试库（H2 MySQL 兼容模式）建表语句，与主 schema.sql 结构一致，去掉行内 COMMENT
+-- 本地嵌入式 H2（MODE=MySQL）建表语句，结构与 schema.sql 一致，去掉 MySQL 行内 COMMENT
 
 -- 授权代次表：按“主体＋用途”维护从 1 开始递增的代次
 CREATE TABLE IF NOT EXISTS consent_grant (

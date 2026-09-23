@@ -36,7 +36,7 @@ public class IdempotencyRepository {
     public record IdempotencyRow(String requestId, String operation, String paramsFingerprint, String responseBody) {
     }
 
-    Optional<IdempotencyRow> find(String requestId) {
+    public Optional<IdempotencyRow> find(String requestId) {
         List<IdempotencyRow> rows = jdbc.query(
                 "SELECT request_id, operation, params_fingerprint, response_body"
                         + " FROM idempotency_request WHERE request_id = ?",
@@ -44,7 +44,7 @@ public class IdempotencyRepository {
         return rows.stream().findFirst();
     }
 
-    void insert(String requestId, String operation, String paramsFingerprint, String responseBody) {
+    public void insert(String requestId, String operation, String paramsFingerprint, String responseBody) {
         jdbc.update(
                 "INSERT INTO idempotency_request (request_id, operation, params_fingerprint, response_body)"
                         + " VALUES (?, ?, ?, ?)",
