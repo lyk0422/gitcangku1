@@ -94,6 +94,15 @@ public class PlanRepository {
     }
 
     /**
+     * 按主键查询计划并加行级写锁，须在事务内调用，用于容量交换激活时锁定全部参与计划。
+     */
+    public Optional<DayPlan> findByIdForUpdate(long planId) {
+        return jdbc.query("SELECT id, schedule_key, op_date, version, status FROM rail_day_plan"
+                        + " WHERE id = ? FOR UPDATE",
+                PLAN_MAPPER, planId).stream().findFirst();
+    }
+
+    /**
      * 按业务键查询计划并加行级写锁，须在事务内调用，用于串行化同一计划的更新/发布/取消。
      */
     public Optional<DayPlan> findByKeyForUpdate(String scheduleKey) {
