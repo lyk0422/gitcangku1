@@ -76,6 +76,16 @@ public class ReservationRepository {
     }
 
     /**
+     * 只读统计某公告下已到期但仍为 RESERVED 的预占单数（预览等只读场景使用，不加锁）。
+     */
+    public int countExpiredReserved(String campaignId, long nowUtc) {
+        Integer count = jdbc.queryForObject("SELECT COUNT(*) FROM exposure_reservation "
+                        + "WHERE campaign_id = ? AND status = 'RESERVED' AND expires_at_utc <= ?",
+                Integer.class, campaignId, nowUtc);
+        return count == null ? 0 : count;
+    }
+
+    /**
      * 条件 CAS：仅当当前状态为 expect 时改为 target 并记录终态时刻。
      *
      * @return 是否更新成功（并发终态竞争时只有一个返回 true）

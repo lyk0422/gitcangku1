@@ -54,3 +54,69 @@ CREATE TABLE IF NOT EXISTS idempotency_record (
     created_at_utc      BIGINT       NOT NULL,
     PRIMARY KEY (request_id)
 );
+
+-- 活动预算账本：每个 campaign 在左闭右开 UTC 投放窗口内持有非负整数预算；
+-- 恒等式 budget = 可转余额 + in_flight + confirmed 由 CHECK 约束保证
+CREATE TABLE IF NOT EXISTS campaign_budget_account (
+    campaign_id      VARCHAR(64)  NOT NULL,
+    tenant_id        VARCHAR(64)  NOT NULL,
+    window_start_utc BIGINT       NOT NULL,
+    window_end_utc   BIGINT       NOT NULL,
+    audience_rule    VARCHAR(256) NOT NULL,
+    budget           INT          NOT NULL DEFAULT 0,
+    in_flight        INT          NOT NULL DEFAULT 0,
+    confirmed        INT          NOT NULL DEFAULT 0,
+    version          INT          NOT NULL DEFAULT 0,
+    created_at_utc   BIGINT       NOT NULL,
+    PRIMARY KEY (campaign_id),
+    CHECK (budget >= 0),
+    CHECK (in_flight >= 0),
+    CHECK (confirmed >= 0),
+    CHECK (budget >= in_flight + confirmed)
+);
+COMMENT ON TABLE campaign_budget_account IS '活动预算账本：每 campaign 一行，预算在投放窗口内有效';
+COMMENT ON COLUMN campaign_budget_account.campaign_id IS '活动编号，全局唯一';
+COMMENT ON COLUMN campaign_budget_account.tenant_id IS '租户编号；预算转移要求双方同租户';
+COMMENT ON COLUMN campaign_budget_account.window_start_utc IS '投放窗口起始时刻（含），epoch 毫秒，UTC';
+COMMENT ON COLUMN campaign_budget_account.window_end_utc IS '投放窗口结束时刻（不含），epoch 毫秒，UTC';
+COMMENT ON COLUMN campaign_budget_account.audience_rule IS '受众规则标识；预算转移要求双方一致';
+COMMENT ON COLUMN campaign_budget_account.budget IS '当前总预算，单位次，非负整数';
+COMMENT ON COLUMN campaign_budget_account.in_flight IS '在途预占数（已预占未回执未过期释放），单位次';
+COMMENT ON COLUMN campaign_budget_account.confirmed IS '已确认曝光数，单位次，不可回收';
+COMMENT ON COLUMN campaign_budget_account.version IS '乐观锁版本号，每次成功预算转移后 +1';
+COMMENT ON COLUMN campaign_budget_account.created_at_utc IS '账本创建时刻，epoch 毫秒，UTC';
+
+-- 预算转移单：transfer_key 全局唯一，冻结规范化明细与前后账本快照
+CREATE TABLE IF NOT EXISTS budget_transfer (
+    transfer_key          VARCHAR(64) NOT NULL,
+    request_id            VARCHAR(64) NOT NULL,
+    normalized_lines_json CLOB        NOT NULL,
+    before_snapshot_json  CLOB        NOT NULL,
+    after_snapshot_json   CLOB        NOT NULL,
+    created_at_utc        BIGINT      NOT NULL,
+    PRIMARY KEY (transfer_key)
+);
+COMMENT ON TABLE budget_transfer IS '预算转移单：激活成功后一次性冻结，只读可查';
+COMMENT ON COLUMN budget_transfer.transfer_key IS '转移单业务编号，全局唯一';
+COMMENT ON COLUMN budget_transfer.request_id IS '激活请求的幂等键';
+COMMENT ON COLUMN budget_transfer.normalized_lines_json IS '规范化（按源目标求和并排序）后的转移明细 JSON';
+COMMENT ON COLUMN budget_transfer.before_snapshot_json IS '激活前各活动账本快照 JSON（按 campaignId 排序）';
+COMMENT ON COLUMN budget_transfer.after_snapshot_json IS '激活后各活动账本快照 JSON（按 campaignId 排序）';
+COMMENT ON COLUMN budget_transfer.created_at_utc IS '激活时刻，epoch 毫秒，UTC';
+
+-- 预算转移规范化明细行：line_no 按（源,目标）字典序从 0 编号，保证稳定排序
+CREATE TABLE IF NOT EXISTS budget_transfer_line (
+    transfer_key        VARCHAR(64) NOT NULL,
+    line_no             INT         NOT NULL,
+    source_campaign_id  VARCHAR(64) NOT NULL,
+    target_campaign_id  VARCHAR(64) NOT NULL,
+    amount              INT         NOT NULL,
+    PRIMARY KEY (transfer_key, line_no),
+    CHECK (amount > 0)
+);
+COMMENT ON TABLE budget_transfer_line IS '预算转移规范化明细：按源目标求和后的结果，稳定排序';
+COMMENT ON COLUMN budget_transfer_line.transfer_key IS '所属转移单编号';
+COMMENT ON COLUMN budget_transfer_line.line_no IS '明细序号，按（源,目标）字典序从 0 递增';
+COMMENT ON COLUMN budget_transfer_line.source_campaign_id IS '源活动编号（预算转出方）';
+COMMENT ON COLUMN budget_transfer_line.target_campaign_id IS '目标活动编号（预算转入方）';
+COMMENT ON COLUMN budget_transfer_line.amount IS '转移数量，单位次，正整数';
