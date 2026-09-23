@@ -81,12 +81,19 @@ public class BatchService {
         String fingerprint = fingerprint("create", req.batchKey(), req.productCode(), req.batchNo(),
                 req.producedAt().toString(), String.join(SEP, items));
         return executeIdempotent(CMD_CREATE, req.commandKey(), fingerprint, () -> {
-            repo.findBatch(req.batchKey()).ifPresent(b -> {
+            var existingBatch = repo.findBatch(req.batchKey());
+            if (existingBatch.isPresent()) {
+                // 并发同键请求可能已在命令日志检查之后、本行检查之前提交：
+                // 此时优先重放首次命令快照，而不是把幂等重放误判为 batchKey 冲突。
+                var replay = loggedResponse(CMD_CREATE, req.commandKey(), fingerprint);
+                if (replay.isPresent()) {
+                    return replay.get();
+                }
                 throw ApiException.conflict("batchKey 已存在: " + req.batchKey());
-            });
+            }
             String now = now();
             repo.insertBatch(new BatchRepository.BatchRow(0L, req.batchKey(), req.productCode(),
-                    req.batchNo(), req.producedAt().toString(), BatchStatus.QUARANTINED.name(), now));
+                    req.batchNo(), req.producedAt().toString(), BatchStatus.QUARANTINED.name(), 1L, now));
             for (int i = 0; i < items.size(); i++) {
                 repo.insertRequiredTest(req.batchKey(), items.get(i), i + 1);
             }
@@ -459,7 +466,7 @@ public class BatchService {
             for (int i = 0; i < children.size(); i++) {
                 SplitRequest.ChildSpec spec = children.get(i);
                 repo.insertBatch(new BatchRepository.BatchRow(0L, spec.batchKey(), parent.productCode(),
-                        spec.batchNo(), parent.producedAt(), BatchStatus.QUARANTINED.name(), now));
+                        spec.batchNo(), parent.producedAt(), BatchStatus.QUARANTINED.name(), 1L, now));
                 for (int j = 0; j < required.size(); j++) {
                     repo.insertRequiredTest(spec.batchKey(), required.get(j), j + 1);
                 }
