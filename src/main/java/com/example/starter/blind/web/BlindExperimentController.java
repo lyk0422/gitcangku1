@@ -8,6 +8,7 @@ import com.example.starter.blind.dto.AllocationView;
 import com.example.starter.blind.dto.CreateExperimentRequest;
 import com.example.starter.blind.dto.ExperimentView;
 import com.example.starter.blind.dto.UnblindApplyRequest;
+import com.example.starter.blind.dto.RejectUnblindRequest;
 import com.example.starter.blind.dto.UnblindRequestView;
 import com.example.starter.blind.dto.UnblindResultView;
 import com.example.starter.blind.service.ExperimentService;
@@ -40,6 +41,8 @@ public class BlindExperimentController {
     static final String OP_ALLOCATION_WITHDRAW = "allocation.withdraw";
     static final String OP_UNBLIND_APPLY = "unblind.apply";
     static final String OP_UNBLIND_APPROVE = "unblind.approve";
+    static final String OP_UNBLIND_REJECT = "unblind.reject";
+    static final String OP_UNBLIND_CANCEL = "unblind.cancel";
 
     private final ExperimentService experimentService;
     private final UnblindService unblindService;
@@ -158,13 +161,15 @@ public class BlindExperimentController {
         String fingerprint = idempotencyService.fingerprint(OP_UNBLIND_APPLY,
                 Map.of("experimentId", expId,
                         "participantId", pid,
-                        "reason", request.reason()));
+                        "reason", request.reason(),
+                        "validMinutes", request.validMinutes() == null ? 30 : request.validMinutes()));
         return idempotencyService.runWrite(reqId, OP_UNBLIND_APPLY, fingerprint, actor,
                 () -> IdempotencyService.WriteOutcome.of(HttpStatus.CREATED.value(),
-                        unblindService.apply(expId, pid, request.reason(), actor.actorId())));
+                        unblindService.apply(expId, pid, request.reason(),
+                                request.validMinutes(), actor.actorId())));
     }
 
-    /** 另一名 REVIEWER 批准揭盲申请。 */
+    /** 另一名 REVIEWER 批准揭盲申请；到期提交返回 409。 */
     @PostMapping("/unblind-requests/{unblindRequestId}/approval")
     public ResponseEntity<String> approveUnblind(
             @PathVariable String unblindRequestId,
@@ -177,6 +182,37 @@ public class BlindExperimentController {
         return idempotencyService.runWrite(reqId, OP_UNBLIND_APPROVE, fingerprint, actor,
                 () -> IdempotencyService.WriteOutcome.of(HttpStatus.OK.value(),
                         unblindService.approve(ubId, actor.actorId())));
+    }
+
+    /** 另一名 REVIEWER 填写非空原因拒绝揭盲申请；申请人不能自拒。 */
+    @PostMapping("/unblind-requests/{unblindRequestId}/rejection")
+    public ResponseEntity<String> rejectUnblind(
+            @PathVariable String unblindRequestId,
+            @Valid @RequestBody RejectUnblindRequest request,
+            @RequestHeader(IdempotencyService.HEADER_REQUEST_ID) String requestId) {
+        Actor actor = requireReviewer();
+        String ubId = RequestTokens.requireId("unblindRequestId", unblindRequestId);
+        String reqId = RequestTokens.requireRequestId(requestId);
+        String fingerprint = idempotencyService.fingerprint(OP_UNBLIND_REJECT,
+                Map.of("unblindRequestId", ubId, "rejectReason", request.rejectReason()));
+        return idempotencyService.runWrite(reqId, OP_UNBLIND_REJECT, fingerprint, actor,
+                () -> IdempotencyService.WriteOutcome.of(HttpStatus.OK.value(),
+                        unblindService.reject(ubId, actor.actorId(), request.rejectReason())));
+    }
+
+    /** 申请人（COORDINATOR）撤销自己的待审申请；非本人 403。 */
+    @PostMapping("/unblind-requests/{unblindRequestId}/cancellation")
+    public ResponseEntity<String> cancelUnblind(
+            @PathVariable String unblindRequestId,
+            @RequestHeader(IdempotencyService.HEADER_REQUEST_ID) String requestId) {
+        Actor actor = requireCoordinator();
+        String ubId = RequestTokens.requireId("unblindRequestId", unblindRequestId);
+        String reqId = RequestTokens.requireRequestId(requestId);
+        String fingerprint = idempotencyService.fingerprint(OP_UNBLIND_CANCEL,
+                Map.of("unblindRequestId", ubId));
+        return idempotencyService.runWrite(reqId, OP_UNBLIND_CANCEL, fingerprint, actor,
+                () -> IdempotencyService.WriteOutcome.of(HttpStatus.OK.value(),
+                        unblindService.cancel(ubId, actor.actorId())));
     }
 
     /** 查询揭盲申请状态（不含处理代码）；申请人或批准人可查。 */
