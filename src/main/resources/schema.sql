@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS batch (
     product_code VARCHAR(64) NOT NULL COMMENT '产品编码，创建后不可修改',
     batch_no VARCHAR(64) NOT NULL COMMENT '批号，创建后不可修改',
     produced_at VARCHAR(40) NOT NULL COMMENT '生产时间，ISO-8601 UTC  instant 字符串',
-    status VARCHAR(32) NOT NULL COMMENT '批次状态：QUARANTINED/PENDING_RELEASE/RELEASE_REVIEW/RELEASED/REJECTED/RECALLED/SPLIT',
+    status VARCHAR(32) NOT NULL COMMENT '批次状态：QUARANTINED/PENDING_RELEASE/RELEASE_REVIEW/RELEASED/REJECTED/RECALLED/SPLIT/MERGED',
     created_at VARCHAR(40) NOT NULL COMMENT '创建时间，ISO-8601 UTC instant 字符串',
     CONSTRAINT uk_batch_key UNIQUE (batch_key)
 );
@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS recall (
 );
 
 CREATE TABLE IF NOT EXISTS command_log (
-    command_type VARCHAR(32) NOT NULL COMMENT '命令类型：CREATE_BATCH/SUBMIT_TEST/APPROVE/RECALL/SPLIT',
+    command_type VARCHAR(32) NOT NULL COMMENT '命令类型：CREATE_BATCH/SUBMIT_TEST/APPROVE/RECALL/SPLIT/MERGE',
     command_key VARCHAR(64) NOT NULL COMMENT '命令幂等键；同类型同键同参重放返回首次结果，同键改参返回 409',
     fingerprint VARCHAR(64) NOT NULL COMMENT '业务参数（不含 commandKey）的 SHA-256 摘要，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行成功的 HTTP 状态码',
@@ -57,12 +57,14 @@ CREATE TABLE IF NOT EXISTS command_log (
     CONSTRAINT pk_command_log PRIMARY KEY (command_type, command_key)
 );
 
--- 拆分血缘：仅记录父子追溯关系，不涉及数量分摊；关系创建后不可改写。
+-- 血缘关系：拆分为单父边，合批引入多父边，血缘由树扩展为多父有向无环图；
+-- 仅记录追溯关系，不涉及数量分摊；关系创建后不可改写。
 CREATE TABLE IF NOT EXISTS batch_lineage (
-    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键，同时作为拆分关系创建顺序依据',
-    parent_key VARCHAR(64) NOT NULL COMMENT '父批业务键，拆分时必须为 RELEASED，拆分后置为 SPLIT',
-    child_key VARCHAR(64) NOT NULL COMMENT '子批业务键；每个子批仅一个父批，全局唯一，不可改写',
-    seq INT NOT NULL COMMENT '子批在拆分请求中的顺序，从 1 开始',
-    created_at VARCHAR(40) NOT NULL COMMENT '拆分时间，ISO-8601 UTC instant 字符串',
-    CONSTRAINT uk_lineage_child UNIQUE (child_key)
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键，同时作为血缘关系创建顺序依据',
+    parent_key VARCHAR(64) NOT NULL COMMENT '父批业务键：拆分时必须为 RELEASED 后置为 SPLIT，合批时必须为 RELEASED 后置为 MERGED',
+    child_key VARCHAR(64) NOT NULL COMMENT '子批业务键；拆分子批仅一个父批，合批新批有 2～5 个父批，关系不可改写',
+    relation_kind VARCHAR(8) NOT NULL COMMENT '关系类型：SPLIT 拆单边 / MERGE 合批边',
+    seq INT NOT NULL COMMENT '关系在创建请求中的顺序，从 1 开始；合批时为父批在请求（排序去重后）中的序号',
+    created_at VARCHAR(40) NOT NULL COMMENT '关系创建时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_lineage_pair UNIQUE (parent_key, child_key)
 );

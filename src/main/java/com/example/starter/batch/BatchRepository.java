@@ -49,9 +49,10 @@ public class BatchRepository {
     }
 
     /**
-     * batch_lineage 表行记录：拆分父子关系，创建后不可改写。
+     * batch_lineage 表行记录：SPLIT 单父边与 MERGE 多父边，创建后不可改写。
      */
-    public record LineageRow(long id, String parentKey, String childKey, int seq, String createdAt) {
+    public record LineageRow(long id, String parentKey, String childKey, String relationKind,
+                             int seq, String createdAt) {
     }
 
     private static final RowMapper<BatchRow> BATCH_MAPPER = (rs, n) -> new BatchRow(
@@ -79,7 +80,7 @@ public class BatchRepository {
 
     private static final RowMapper<LineageRow> LINEAGE_MAPPER = (rs, n) -> new LineageRow(
             rs.getLong("id"), rs.getString("parent_key"), rs.getString("child_key"),
-            rs.getInt("seq"), rs.getString("created_at"));
+            rs.getString("relation_kind"), rs.getInt("seq"), rs.getString("created_at"));
 
     private final JdbcTemplate jdbc;
 
@@ -181,9 +182,9 @@ public class BatchRepository {
     }
 
     public void insertLineage(LineageRow row) {
-        jdbc.update("INSERT INTO batch_lineage (parent_key, child_key, seq, created_at)"
-                        + " VALUES (?, ?, ?, ?)",
-                row.parentKey(), row.childKey(), row.seq(), row.createdAt());
+        jdbc.update("INSERT INTO batch_lineage (parent_key, child_key, relation_kind, seq, created_at)"
+                        + " VALUES (?, ?, ?, ?, ?)",
+                row.parentKey(), row.childKey(), row.relationKind(), row.seq(), row.createdAt());
     }
 
     /**
@@ -191,15 +192,6 @@ public class BatchRepository {
      */
     public List<LineageRow> findAllLineage() {
         return jdbc.query("SELECT * FROM batch_lineage ORDER BY id", LINEAGE_MAPPER);
-    }
-
-    /**
-     * 某批次的直接父批业务键；每个子批仅一个父批。
-     */
-    public Optional<String> findParentKey(String childKey) {
-        return jdbc.queryForList("SELECT parent_key FROM batch_lineage WHERE child_key = ?",
-                        String.class, childKey)
-                .stream().findFirst();
     }
 
     /**

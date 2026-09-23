@@ -5,6 +5,7 @@ import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
 import com.example.starter.batch.dto.LineageEntryResponse;
+import com.example.starter.batch.dto.MergeRequest;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
@@ -99,7 +100,7 @@ public class BatchController {
     }
 
     /**
-     * 祖先查询：从直接父批到根，含各批自身状态及导致不可用的召回祖先。
+     * 祖先查询：从直接父批沿全部路径向上到根，含各批自身状态及导致不可用的召回祖先。
      */
     @GetMapping("/{batchKey}/ancestors")
     public List<LineageEntryResponse> ancestors(@PathVariable String batchKey) {
@@ -107,11 +108,19 @@ public class BatchController {
     }
 
     /**
-     * 后代查询：按拆分创建顺序展开，含各批自身状态及导致不可用的召回祖先。
+     * 后代查询：按血缘关系创建顺序展开，含各批自身状态及导致不可用的召回祖先。
      */
     @GetMapping("/{batchKey}/descendants")
     public List<LineageEntryResponse> descendants(@PathVariable String batchKey) {
         return service.listDescendants(batchKey);
+    }
+
+    /**
+     * 合批：将 2～5 个当前可用的 RELEASED 批次合为一个全新批次，全部父批置为 MERGED。
+     */
+    @PostMapping("/merge")
+    public ResponseEntity<String> merge(@Valid @RequestBody MergeRequest request) {
+        return stored(service.merge(request));
     }
 
     private ResponseEntity<String> stored(StoredResponse response) {

@@ -6,6 +6,8 @@ import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
 import com.example.starter.batch.dto.LineageEntryResponse;
+import com.example.starter.batch.dto.MergeRequest;
+import com.example.starter.batch.dto.MergeResponse;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.RecallResponse;
 import com.example.starter.batch.dto.SplitRequest;
@@ -29,6 +31,7 @@ import java.util.Collections;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -50,6 +53,7 @@ public class BatchService {
     private static final String CMD_APPROVE = "APPROVE";
     private static final String CMD_RECALL = "RECALL";
     private static final String CMD_SPLIT = "SPLIT";
+    private static final String CMD_MERGE = "MERGE";
 
     /**
      * 指纹拼接分隔符（NUL）：业务参数不可能包含该字符，避免拼接碰撞。
@@ -123,7 +127,8 @@ public class BatchService {
             BatchStatus status = BatchStatus.valueOf(batch.status());
             assertNoRecalledAncestor(batchKey);
             if (status == BatchStatus.REJECTED || status == BatchStatus.RELEASED
-                    || status == BatchStatus.RECALLED || status == BatchStatus.SPLIT) {
+                    || status == BatchStatus.RECALLED || status == BatchStatus.SPLIT
+                    || status == BatchStatus.MERGED) {
                 throw ApiException.conflict("批次状态 " + status + " 不允许提交检验");
             }
             List<String> required = repo.findRequiredTests(batchKey);
@@ -210,8 +215,8 @@ public class BatchService {
     }
 
     /**
-     * 召回：RELEASED 或 SPLIT 批次可召回，召回后进入 RECALLED 并不再出现在可用批次查询中。
-     * 召回提交后其全部后代立即不可用（排除出可用查询、禁止新增检验/批准/拆分），
+     * 召回：RELEASED、SPLIT 或 MERGED 批次可召回，召回后进入 RECALLED 并不再出现在可用批次查询中。
+     * 召回提交后其全部后代立即不可用（排除出可用查询、禁止新增检验/批准/拆分/合批），
      * 但后代自身状态与既有检验、批准记录不改写，也不为后代补写召回记录。
      */
     public StoredResponse recall(String batchKey, String actorId, RecallRequest req) {
@@ -221,18 +226,38 @@ public class BatchService {
         String actor = actorId.trim();
         String fingerprint = fingerprint("recall", batchKey, actor, req.reason());
         return executeIdempotent(CMD_RECALL, req.commandKey(), fingerprint, () -> {
+            // 先做不加锁的存在性与状态预判
+            BatchRepository.BatchRow preview = repo.findBatch(batchKey)
+                    .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+            BatchStatus previewStatus = BatchStatus.valueOf(preview.status());
+            if (previewStatus != BatchStatus.RELEASED && previewStatus != BatchStatus.SPLIT
+                    && previewStatus != BatchStatus.MERGED) {
+                throw ApiException.conflict("批次状态 " + previewStatus
+                        + " 不允许召回，仅 RELEASED、SPLIT 或 MERGED 可召回");
+            }
+            // 逐行锁定自身与全部后代（合并为一个集合后按业务键排序，保证锁顺序全局确定）：
+            // 与后代上的检验/批准/拆分/合批互斥，避免与合批的排序父批锁形成环；
+            // 按事务提交顺序裁决——召回先提交则后代新操作看到召回并返回 422。
+            Set<String> lockedKeys = new HashSet<>(loadGraph().descendantKeys(batchKey));
+            lockedKeys.add(batchKey);
+            List<String> orderedKeys = new ArrayList<>(lockedKeys);
+            Collections.sort(orderedKeys);
+            for (String lockedKey : orderedKeys) {
+                repo.findBatchForUpdate(lockedKey);
+            }
+            // 锁齐后在锁内重查命令快照：并发同键召回在锁等待期间可能已由对方提交
+            var loggedAfterLock = loggedResponse(CMD_RECALL, req.commandKey(), fingerprint);
+            if (loggedAfterLock.isPresent()) {
+                return loggedAfterLock.get();
+            }
+            // 锁等待期间状态可能已被并发事务改写，锁内复核
             BatchRepository.BatchRow batch = repo.findBatchForUpdate(batchKey)
                     .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
             BatchStatus status = BatchStatus.valueOf(batch.status());
-            if (status != BatchStatus.RELEASED && status != BatchStatus.SPLIT) {
-                throw ApiException.conflict("批次状态 " + status + " 不允许召回，仅 RELEASED 或 SPLIT 可召回");
-            }
-            // 逐行锁定全部后代（按业务键排序保证锁顺序确定）：与后代上的检验/批准/拆分
-            // 互斥，按事务提交顺序裁决——召回先提交则后代新操作看到召回并返回 422。
-            List<String> descendants = descendantKeys(batchKey);
-            Collections.sort(descendants);
-            for (String descendantKey : descendants) {
-                repo.findBatchForUpdate(descendantKey);
+            if (status != BatchStatus.RELEASED && status != BatchStatus.SPLIT
+                    && status != BatchStatus.MERGED) {
+                throw ApiException.conflict("批次状态 " + status
+                        + " 不允许召回，仅 RELEASED、SPLIT 或 MERGED 可召回");
             }
             String now = now();
             repo.insertRecall(new BatchRepository.RecallRow(0L, batchKey, req.commandKey(),
@@ -245,15 +270,16 @@ public class BatchService {
     }
 
     /**
-     * 当前可用批次：排除已召回（RECALLED）、已拆分（SPLIT）批次，
-     * 以及任一祖先被召回的后代批次；后代自身状态不改写。
+     * 当前可用批次：排除已召回（RECALLED）、已拆分（SPLIT）、已合批（MERGED）批次，
+     * 以及任一路径祖先被召回的后代批次；后代自身状态不改写。
      */
     public List<BatchResponse> listAvailable() {
-        Map<String, String> parentOf = childToParent();
+        LineageGraph graph = loadGraph();
         Set<String> recalled = new HashSet<>(repo.findRecalledKeys());
         return repo.findAvailableBatches().stream()
                 .filter(b -> !BatchStatus.SPLIT.name().equals(b.status()))
-                .filter(b -> recalledAncestor(b.batchKey(), parentOf, recalled).isEmpty())
+                .filter(b -> !BatchStatus.MERGED.name().equals(b.status()))
+                .filter(b -> graph.recalledAncestors(b.batchKey(), recalled).isEmpty())
                 .map(this::toBatchResponse)
                 .toList();
     }
@@ -464,7 +490,7 @@ public class BatchService {
                     repo.insertRequiredTest(spec.batchKey(), required.get(j), j + 1);
                 }
                 repo.insertLineage(new BatchRepository.LineageRow(0L, parentKey, spec.batchKey(),
-                        i + 1, now));
+                        "SPLIT", i + 1, now));
                 childBodies.add(new SplitResponse.SplitChild(spec.batchKey(), spec.batchNo(),
                         parent.productCode(), Instant.parse(parent.producedAt()),
                         BatchStatus.QUARANTINED, required, Instant.parse(now)));
@@ -477,102 +503,238 @@ public class BatchService {
     }
 
     /**
-     * 祖先查询：从直接父批逐级向上到根，每项含批次自身状态及导致其不可用的召回祖先。
+     * 合批：2～5 个不同且当前可用的 RELEASED 父批合为一个全新批次。
+     * 父批产品编码与必做检验项集合必须相同；新批初始 QUARANTINED，生产 UTC 时间取父批最晚值；
+     * 父批全部置为 MERGED 并退出可用集合。父批状态、全部多父边与新批同一事务提交。
+     */
+    public StoredResponse merge(MergeRequest req) {
+        // 父批集合去重后按业务键排序：集合顺序不影响同参判定，也保证并发锁顺序确定
+        List<String> parents = new ArrayList<>(new LinkedHashSet<>(req.parentBatchKeys()));
+        if (parents.size() != req.parentBatchKeys().size()) {
+            throw ApiException.badRequest("parentBatchKeys 存在重复父批");
+        }
+        if (parents.size() < 2 || parents.size() > 5) {
+            throw ApiException.badRequest("parentBatchKeys 必须包含 2～5 个不同父批");
+        }
+        Collections.sort(parents);
+        List<String> parts = new ArrayList<>();
+        parts.add("merge");
+        parts.add(req.newBatchKey());
+        parts.add(req.newBatchNo());
+        parts.addAll(parents);
+        String fingerprint = fingerprint(parts.toArray(new String[0]));
+        return executeIdempotent(CMD_MERGE, req.commandKey(), fingerprint, () -> {
+            // 按排序后的父批键逐行加锁：父批只能被消费一次，合批/拆分/召回并发按提交顺序裁决
+            List<BatchRepository.BatchRow> parentRows = new ArrayList<>(parents.size());
+            for (String parentKey : parents) {
+                BatchRepository.BatchRow row = repo.findBatchForUpdate(parentKey)
+                        .orElseThrow(() -> ApiException.notFound("批次不存在: " + parentKey));
+                parentRows.add(row);
+            }
+            // 锁齐父批后重查命令快照：并发同键请求在锁等待期间可能已由对方提交，
+            // 此时须重放首次结果而不是因父批已 MERGED 误判冲突
+            var logged = loggedResponse(CMD_MERGE, req.commandKey(), fingerprint);
+            if (logged.isPresent()) {
+                return logged.get();
+            }
+            LineageGraph graph = loadGraph();
+            Set<String> recalledKeys = new HashSet<>(repo.findRecalledKeys());
+            String productCode = parentRows.get(0).productCode();
+            List<String> required = repo.findRequiredTests(parents.get(0));
+            Set<String> requiredSet = new HashSet<>(required);
+            Instant latestProducedAt = Instant.parse(parentRows.get(0).producedAt());
+            for (int i = 0; i < parents.size(); i++) {
+                BatchRepository.BatchRow row = parentRows.get(i);
+                // 祖先召回拦截优先于自身状态：任一路径存在召回祖先一律 422，不伪造后代自身状态
+                List<String> recalledAncestors = new ArrayList<>(
+                        graph.recalledAncestors(row.batchKey(), recalledKeys));
+                if (!recalledAncestors.isEmpty()) {
+                    Collections.sort(recalledAncestors);
+                    throw ApiException.unprocessable("批次 " + row.batchKey() + " 的祖先 "
+                            + recalledAncestors + " 已召回，该批次不可用，禁止合批");
+                }
+                if (!BatchStatus.RELEASED.name().equals(row.status())) {
+                    throw ApiException.conflict(
+                            "批次 " + row.batchKey() + " 状态 " + row.status()
+                                    + " 不允许合批，仅当前可用的 RELEASED 批次可合批");
+                }
+                if (!productCode.equals(row.productCode())) {
+                    throw ApiException.unprocessable("父批产品编码不一致: "
+                            + productCode + " / " + row.productCode());
+                }
+                List<String> otherRequired = repo.findRequiredTests(row.batchKey());
+                if (otherRequired.size() != requiredSet.size()
+                        || !requiredSet.containsAll(otherRequired)) {
+                    throw ApiException.unprocessable(
+                            "父批必做检验项集合不一致: " + parents.get(0) + " / " + row.batchKey());
+                }
+                Instant producedAt = Instant.parse(row.producedAt());
+                if (producedAt.isAfter(latestProducedAt)) {
+                    latestProducedAt = producedAt;
+                }
+            }
+            if (repo.findBatch(req.newBatchKey()).isPresent()) {
+                throw ApiException.conflict("新批 batchKey 已存在: " + req.newBatchKey());
+            }
+            String now = now();
+            repo.insertBatch(new BatchRepository.BatchRow(0L, req.newBatchKey(), productCode,
+                    req.newBatchNo(), latestProducedAt.toString(),
+                    BatchStatus.QUARANTINED.name(), now));
+            for (int j = 0; j < required.size(); j++) {
+                repo.insertRequiredTest(req.newBatchKey(), required.get(j), j + 1);
+            }
+            for (int i = 0; i < parents.size(); i++) {
+                repo.insertLineage(new BatchRepository.LineageRow(0L, parents.get(i),
+                        req.newBatchKey(), "MERGE", i + 1, now));
+            }
+            for (String parentKey : parents) {
+                repo.updateStatus(parentKey, BatchStatus.MERGED.name());
+            }
+            MergeResponse.MergedChild child = new MergeResponse.MergedChild(
+                    req.newBatchKey(), req.newBatchNo(), productCode, latestProducedAt,
+                    BatchStatus.QUARANTINED, required, Instant.parse(now));
+            MergeResponse body = new MergeResponse(parents, BatchStatus.MERGED, child,
+                    Instant.parse(now));
+            return new StoredResponse(201, toJson(body));
+        });
+    }
+
+    /**
+     * 祖先查询：沿全部路径从直接父批逐级向上到根，按 batchKey 升序去重展开，
+     * 每项含批次自身状态及导致其不可用的全部召回祖先（共享祖先只显示一次）。
      */
     public List<LineageEntryResponse> listAncestors(String batchKey) {
         repo.findBatch(batchKey)
                 .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
-        Map<String, String> parentOf = childToParent();
-        Set<String> recalled = new HashSet<>(repo.findRecalledKeys());
-        List<LineageEntryResponse> result = new ArrayList<>();
-        String current = batchKey;
-        while (parentOf.containsKey(current)) {
-            current = parentOf.get(current);
-            result.add(toLineageEntry(current, parentOf, recalled));
+        LineageGraph graph = loadGraph();
+        List<String> ancestorKeys = new ArrayList<>(graph.ancestorKeys(batchKey));
+        Collections.sort(ancestorKeys);
+        List<LineageEntryResponse> result = new ArrayList<>(ancestorKeys.size());
+        for (String key : ancestorKeys) {
+            result.add(toLineageEntry(key, graph));
         }
         return result;
     }
 
     /**
-     * 后代查询：按血缘关系创建顺序广度优先展开，每项含批次自身状态及导致其不可用的召回祖先。
+     * 后代查询：按血缘关系创建顺序广度优先展开，按 batchKey 升序去重，
+     * 每项含批次自身状态及导致其不可用的全部召回祖先。
      */
     public List<LineageEntryResponse> listDescendants(String batchKey) {
         repo.findBatch(batchKey)
                 .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
-        Map<String, String> parentOf = childToParent();
-        Set<String> recalled = new HashSet<>(repo.findRecalledKeys());
-        List<LineageEntryResponse> result = new ArrayList<>();
-        for (String key : descendantKeys(batchKey)) {
-            result.add(toLineageEntry(key, parentOf, recalled));
+        LineageGraph graph = loadGraph();
+        List<String> descendantKeys = new ArrayList<>(graph.descendantKeys(batchKey));
+        Collections.sort(descendantKeys);
+        List<LineageEntryResponse> result = new ArrayList<>(descendantKeys.size());
+        for (String key : descendantKeys) {
+            result.add(toLineageEntry(key, graph));
         }
         return result;
     }
 
     /**
-     * 若任一级祖先已被召回则抛 422：后代批次禁止新增检验、批准和拆分。
+     * 若任一路径上存在已召回祖先则抛 422：后代批次禁止新增检验、批准、拆分和合批；
+     * 召回一条路径不能被另一条未召回路径抵消。
      */
     private void assertNoRecalledAncestor(String batchKey) {
-        Optional<String> recalled = recalledAncestor(batchKey, childToParent(),
-                new HashSet<>(repo.findRecalledKeys()));
-        if (recalled.isPresent()) {
+        LineageGraph graph = loadGraph();
+        List<String> recalled = new ArrayList<>(graph.recalledAncestors(batchKey,
+                new HashSet<>(repo.findRecalledKeys())));
+        if (!recalled.isEmpty()) {
+            Collections.sort(recalled);
             throw ApiException.unprocessable(
-                    "祖先批次 " + recalled.get() + " 已召回，禁止新增检验、批准和拆分");
+                    "祖先批次 " + recalled + " 已召回，禁止新增检验、批准、拆分和合批");
         }
     }
 
-    /**
-     * 沿父链向上查找最近的被直接召回（RECALLED）祖先；批次自身召回不算祖先召回。
-     */
-    private Optional<String> recalledAncestor(String batchKey, Map<String, String> parentOf,
-                                              Set<String> recalled) {
-        String current = batchKey;
-        while (parentOf.containsKey(current)) {
-            current = parentOf.get(current);
-            if (recalled.contains(current)) {
-                return Optional.of(current);
-            }
-        }
-        return Optional.empty();
+    private LineageGraph loadGraph() {
+        return new LineageGraph(repo.findAllLineage());
     }
 
-    /**
-     * 全部血缘边的 子批→父批 映射；关系不可改写，只增不改。
-     */
-    private Map<String, String> childToParent() {
-        Map<String, String> parentOf = new HashMap<>();
-        for (BatchRepository.LineageRow row : repo.findAllLineage()) {
-            parentOf.put(row.childKey(), row.parentKey());
-        }
-        return parentOf;
-    }
-
-    /**
-     * 某批次的全部后代业务键，按血缘关系创建顺序广度优先展开（不含自身）。
-     */
-    private List<String> descendantKeys(String rootKey) {
-        Map<String, List<String>> childrenOf = new HashMap<>();
-        for (BatchRepository.LineageRow row : repo.findAllLineage()) {
-            childrenOf.computeIfAbsent(row.parentKey(), k -> new ArrayList<>()).add(row.childKey());
-        }
-        List<String> result = new ArrayList<>();
-        Deque<String> queue = new ArrayDeque<>();
-        queue.add(rootKey);
-        while (!queue.isEmpty()) {
-            String current = queue.poll();
-            for (String child : childrenOf.getOrDefault(current, List.of())) {
-                result.add(child);
-                queue.add(child);
-            }
-        }
-        return result;
-    }
-
-    private LineageEntryResponse toLineageEntry(String batchKey, Map<String, String> parentOf,
-                                                Set<String> recalled) {
+    private LineageEntryResponse toLineageEntry(String batchKey, LineageGraph graph) {
         BatchRepository.BatchRow row = repo.findBatch(batchKey)
                 .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+        List<String> recalled = new ArrayList<>(
+                graph.recalledAncestors(batchKey, new HashSet<>(repo.findRecalledKeys())));
+        Collections.sort(recalled);
         return new LineageEntryResponse(row.batchKey(), row.batchNo(),
                 BatchStatus.valueOf(row.status()),
-                recalledAncestor(batchKey, parentOf, recalled).orElse(null));
+                recalled.isEmpty() ? null : recalled.get(0),
+                recalled);
+    }
+
+    /**
+     * 多父血缘有向无环图：边方向 父批→子批。拆分产生单父边，合批为同一子批引入 2～5 条父边，
+     * 允许拆分后的兄弟批次重新合批，故同一节点可能经多条路径到达同一祖先（菱形汇合）。
+     * 关系不可改写，图只增不改；本对象为单次请求内的只读快照。
+     */
+    private static final class LineageGraph {
+
+        /**
+         * 父批键 → 子批键列表，按边的创建顺序（id 升序）排列。
+         */
+        private final Map<String, List<String>> childrenOf = new HashMap<>();
+
+        /**
+         * 子批键 → 全部直接父批键列表，按边的创建顺序（id 升序）排列。
+         */
+        private final Map<String, List<String>> parentsOf = new HashMap<>();
+
+        private LineageGraph(List<BatchRepository.LineageRow> edges) {
+            for (BatchRepository.LineageRow edge : edges) {
+                childrenOf.computeIfAbsent(edge.parentKey(), k -> new ArrayList<>())
+                        .add(edge.childKey());
+                parentsOf.computeIfAbsent(edge.childKey(), k -> new ArrayList<>())
+                        .add(edge.parentKey());
+            }
+        }
+
+        /**
+         * 某节点的全部祖先业务键（不含自身）：沿全部父边向上遍历，汇合节点只计一次。
+         */
+        private Set<String> ancestorKeys(String childKey) {
+            Set<String> visited = new HashSet<>();
+            Deque<String> stack = new ArrayDeque<>(parentsOf.getOrDefault(childKey, List.of()));
+            while (!stack.isEmpty()) {
+                String current = stack.pop();
+                if (visited.add(current)) {
+                    stack.addAll(parentsOf.getOrDefault(current, List.of()));
+                }
+            }
+            return visited;
+        }
+
+        /**
+         * 某节点的全部后代业务键（不含自身）：按边创建顺序广度优先展开，汇合节点只计一次。
+         */
+        private Set<String> descendantKeys(String rootKey) {
+            Set<String> visited = new HashSet<>();
+            Deque<String> queue = new ArrayDeque<>();
+            queue.add(rootKey);
+            while (!queue.isEmpty()) {
+                String current = queue.poll();
+                for (String child : childrenOf.getOrDefault(current, List.of())) {
+                    if (visited.add(child)) {
+                        queue.add(child);
+                    }
+                }
+            }
+            return visited;
+        }
+
+        /**
+         * 沿全部路径向上收集被直接召回（RECALLED）的祖先键；批次自身召回不算祖先召回。
+         * 任一路径存在召回祖先即计入，召回一条路径不能被另一条未召回路径抵消。
+         */
+        private Set<String> recalledAncestors(String batchKey, Set<String> recalledKeys) {
+            Set<String> result = new HashSet<>();
+            for (String ancestor : ancestorKeys(batchKey)) {
+                if (recalledKeys.contains(ancestor)) {
+                    result.add(ancestor);
+                }
+            }
+            return result;
+        }
     }
 }
