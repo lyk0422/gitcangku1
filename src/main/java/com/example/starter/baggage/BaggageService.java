@@ -72,7 +72,7 @@ public class BaggageService {
             rs.getString("bag_tag"), rs.getString("current_location"),
             rs.getInt("next_leg_index"), rs.getString("status"), rs.getString("loaded_leg_id"),
             rs.getString("short_leg_id"), rs.getString("short_destination"),
-            getInstant(rs, "short_registered_at"));
+            getInstant(rs, "short_registered_at"), rs.getString("container_no"));
 
     private static final RowMapper<ItineraryItem> ITINERARY_MAPPER = (rs, rowNum) -> new ItineraryItem(
             rs.getInt("seq"), rs.getString("leg_id"), rs.getString("origin"), rs.getString("destination"));
@@ -300,6 +300,7 @@ public class BaggageService {
         if (!LEG_SEALED.equals(leg.status())) {
             throw ApiException.unprocessable("航段状态为 " + leg.status() + "，禁止到达确认");
         }
+        lockSealedContainers(legId);
         List<String> manifest = readJsonList(leg.sealedManifest());
         List<String> actual = request.bagTags();
         Set<String> actualSet = new HashSet<>(actual);
@@ -315,6 +316,7 @@ public class BaggageService {
         jdbcTemplate.update(
                 "UPDATE leg SET status = ?, version = ?, arrival_type = ?, arrival_actual = NULL WHERE leg_id = ?",
                 LEG_ARRIVED, newVersion, ARRIVAL_EXACT, legId);
+        closeEmptiedContainers(legId);
         return new ArriveResponse(legId, LEG_ARRIVED, newVersion, sortedCopy(manifest));
     }
 
@@ -324,6 +326,7 @@ public class BaggageService {
         if (!LEG_SEALED.equals(leg.status())) {
             throw ApiException.unprocessable("航段状态为 " + leg.status() + "，禁止差异到达");
         }
+        lockSealedContainers(legId);
         List<String> manifest = readJsonList(leg.sealedManifest());
         List<String> actual = request.bagTags();
         Set<String> actualSet = new HashSet<>(actual);
@@ -356,10 +359,13 @@ public class BaggageService {
         jdbcTemplate.update(
                 "UPDATE leg SET status = ?, version = ?, arrival_type = ?, arrival_actual = ? WHERE leg_id = ?",
                 LEG_ARRIVED, newVersion, ARRIVAL_DIFF, writeJson(arrivedSorted), legId);
+        closeEmptiedContainers(legId);
         return new DifferenceArriveResponse(legId, LEG_ARRIVED, newVersion, arrivedSorted, shortList);
     }
 
     private RecoverResponse doRecover(RecoverRequest request) {
+        // 单次加锁读取缺失航段：与装载/到达/重封路径在航段行层次串行化，避免跨操作死锁
+        LegRow missingLeg = lockLeg(request.missingLegId());
         BagRow bag = lockBag(request.bagTag());
         if (bag == null) {
             throw ApiException.notFound("行李不存在: " + request.bagTag());
@@ -375,10 +381,6 @@ public class BaggageService {
             throw ApiException.conflict(
                     "缺失航段不匹配: 登记为 " + bag.shortLegId() + "，提交为 " + request.missingLegId());
         }
-        LegRow missingLeg = findLeg(request.missingLegId());
-        if (missingLeg == null) {
-            throw ApiException.unprocessable("缺失航段不存在: " + request.missingLegId());
-        }
         if (!missingLeg.destination().equals(request.actualStation())) {
             throw ApiException.unprocessable(
                     "实际到站 " + request.actualStation() + " 与缺失航段应到站 "
@@ -387,11 +389,13 @@ public class BaggageService {
         int nextIndex = bag.nextLegIndex() + 1;
         int total = itineraryCount(bag.bagTag());
         String newStatus = nextIndex >= total ? BAG_DELIVERED : BAG_RECOVERED;
+        String oldContainerNo = bag.containerNo();
         jdbcTemplate.update(
                 "UPDATE bag SET current_location = ?, next_leg_index = ?, status = ?, loaded_leg_id = NULL,"
-                        + " short_leg_id = NULL, short_destination = NULL, short_registered_at = NULL"
-                        + " WHERE bag_tag = ?",
+                        + " short_leg_id = NULL, short_destination = NULL, short_registered_at = NULL,"
+                        + " container_no = NULL WHERE bag_tag = ?",
                 request.actualStation(), nextIndex, newStatus, bag.bagTag());
+        closeContainerIfEmpty(oldContainerNo);
         insertEvent(bag.bagTag(), EVT_RECOVERED, request.missingLegId(), request.actualStation());
         if (BAG_DELIVERED.equals(newStatus)) {
             insertEvent(bag.bagTag(), EVT_DELIVERED, request.missingLegId(), request.actualStation());
@@ -400,18 +404,64 @@ public class BaggageService {
                 nextIndex, request.missingLegId());
     }
 
-    /** 实际到达行李的统一推进：移动到到达站、推进待乘索引，完成行程者交付。 */
+    /** 实际到达行李的统一推进：移动到到达站、推进待乘索引，完成行程者交付；到达即卸下并离开容器。 */
     private void advanceArrivedBag(BagRow bag, String destination, String legId) {
         int nextIndex = bag.nextLegIndex() + 1;
         int total = itineraryCount(bag.bagTag());
         String status = nextIndex >= total ? BAG_DELIVERED : BAG_IN_TRANSIT;
         jdbcTemplate.update(
-                "UPDATE bag SET current_location = ?, next_leg_index = ?, status = ?, loaded_leg_id = NULL"
-                        + " WHERE bag_tag = ?",
+                "UPDATE bag SET current_location = ?, next_leg_index = ?, status = ?, loaded_leg_id = NULL,"
+                        + " container_no = NULL WHERE bag_tag = ?",
                 destination, nextIndex, status, bag.bagTag());
         insertEvent(bag.bagTag(), EVT_UNLOADED, legId, destination);
         if (BAG_DELIVERED.equals(status)) {
             insertEvent(bag.bagTag(), EVT_DELIVERED, legId, destination);
+        }
+    }
+
+    /**
+     * 到达确认后收口该航段容器：已无绑定行李的容器视为卸载扫描完成关闭（UNLOADED）；
+     * 仍留有短卸行李的容器保持 SEALED，等待补到或重封核对时按行李状态拦截。
+     */
+    private void closeEmptiedContainers(String legId) {
+        List<String> sealedContainers = jdbcTemplate.queryForList(
+                "SELECT container_no FROM baggage_container WHERE leg_id = ? AND status = 'SEALED'",
+                String.class, legId);
+        for (String containerNo : sealedContainers) {
+            Integer bound = jdbcTemplate.queryForObject(
+                    "SELECT COUNT(*) FROM bag WHERE container_no = ?", Integer.class, containerNo);
+            if (bound != null && bound == 0) {
+                jdbcTemplate.update(
+                        "UPDATE baggage_container SET status = 'UNLOADED', version = version + 1"
+                                + " WHERE container_no = ?",
+                        containerNo);
+            }
+        }
+    }
+
+    /**
+     * 锁定航段下全部 SEALED 容器（按编号排序）。
+     * 统一“先容器后行李”的加锁顺序，避免与重封事务（锁源容器->锁行李）交叉死锁。
+     */
+    private void lockSealedContainers(String legId) {
+        jdbcTemplate.queryForList(
+                "SELECT container_no FROM baggage_container WHERE leg_id = ? AND status = 'SEALED'"
+                        + " ORDER BY container_no FOR UPDATE",
+                String.class, legId);
+    }
+
+    /** 行李离开容器后关闭已空容器（补到/卸载场景），调用方须已持有相关行锁。 */
+    private void closeContainerIfEmpty(String containerNo) {
+        if (containerNo == null) {
+            return;
+        }
+        Integer bound = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM bag WHERE container_no = ?", Integer.class, containerNo);
+        if (bound != null && bound == 0) {
+            jdbcTemplate.update(
+                    "UPDATE baggage_container SET status = 'UNLOADED', version = version + 1"
+                            + " WHERE container_no = ? AND status = 'SEALED'",
+                    containerNo);
         }
     }
 
@@ -474,8 +524,8 @@ public class BaggageService {
 
     private static String bagSelect(boolean forUpdate) {
         return "SELECT bag_tag, current_location, next_leg_index, status, loaded_leg_id,"
-                + " short_leg_id, short_destination, short_registered_at FROM bag WHERE bag_tag = ?"
-                + (forUpdate ? " FOR UPDATE" : "");
+                + " short_leg_id, short_destination, short_registered_at, container_no FROM bag"
+                + " WHERE bag_tag = ?" + (forUpdate ? " FOR UPDATE" : "");
     }
 
     private ItineraryItem nextItinerary(String bagTag, int nextLegIndex) {
@@ -557,7 +607,8 @@ public class BaggageService {
 
     private record BagRow(String bagTag, String currentLocation, int nextLegIndex,
                           String status, String loadedLegId, String shortLegId,
-                          String shortDestination, Instant shortRegisteredAt) {
+                          String shortDestination, Instant shortRegisteredAt,
+                          String containerNo) {
     }
 
     /** 装载幂等摘要参数：bagTags 已排序，顺序差异不视为异参。 */

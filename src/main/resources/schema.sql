@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS bag (
     short_leg_id        VARCHAR(64)  NULL COMMENT '短卸缺失航段标识，仅 SHORT_UNLOADED 状态非 NULL',
     short_destination   VARCHAR(64)  NULL COMMENT '短卸应到站点代码，仅 SHORT_UNLOADED 状态非 NULL',
     short_registered_at TIMESTAMP WITH TIME ZONE NULL COMMENT '短卸登记时刻（UTC），仅 SHORT_UNLOADED 状态非 NULL',
+    container_no        VARCHAR(64)  NULL COMMENT '当前所属有效容器编号（SEALED 容器），未装入容器或离容器后为 NULL；任何时刻一件行李最多属于一个有效容器',
     created_at          TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     PRIMARY KEY (bag_tag)
 );
@@ -64,10 +65,78 @@ CREATE TABLE IF NOT EXISTS bag_event (
 -- 幂等去重：仅记录成功请求；同 requestId 同参数重放原结果，异参数返回 409
 CREATE TABLE IF NOT EXISTS request_log (
     request_id      VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
-    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER',
+    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER/CREATE_REPACK/ACTIVATE_REPACK',
     request_hash    VARCHAR(64)  NOT NULL COMMENT '请求参数（不含 requestId）的 SHA-256 摘要',
     response_status INT          NOT NULL COMMENT '原成功响应的 HTTP 状态码',
     response_body   CLOB         NOT NULL COMMENT '原成功响应体（JSON）',
     created_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     PRIMARY KEY (request_id)
+);
+
+-- 行李容器：编号全局唯一，封签号全局唯一；同一航段同一交接点内成组
+-- 状态 SEALED 已封舱（有效容器，行李当前绑定）-> CLOSED_REPACKED 经重封关闭；
+-- UNLOADED 卸载扫描后关闭。version 乐观锁，每次封签/清单变更后递增。
+CREATE TABLE IF NOT EXISTS baggage_container (
+    container_no    VARCHAR(64)  NOT NULL COMMENT '容器编号，全局唯一',
+    leg_id          VARCHAR(64)  NOT NULL COMMENT '所属航段标识',
+    handover_point  VARCHAR(64)  NOT NULL COMMENT '交接点（站点）代码，源容器与目标容器必须一致',
+    seal_no         VARCHAR(64)  NOT NULL COMMENT '当前封签号，全局唯一',
+    status          VARCHAR(32)  NOT NULL DEFAULT 'SEALED' COMMENT '容器状态：SEALED 已封舱有效/CLOSED_REPACKED 重封关闭/UNLOADED 卸载关闭',
+    version         INT          NOT NULL DEFAULT 1 COMMENT '乐观锁版本，重封提交时递增',
+    created_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    PRIMARY KEY (container_no),
+    UNIQUE (seal_no)
+);
+
+-- 行李容器归属链：每件行李每进入一个容器追加一行，重封改绑时保留原容器链，不做物理删除
+-- (bag_tag, container_no) 唯一防止重复入链；链按 seq 递增，最新一行即当前归属
+CREATE TABLE IF NOT EXISTS bag_container_chain (
+    id           BIGINT AUTO_INCREMENT NOT NULL COMMENT '自增主键',
+    bag_tag      VARCHAR(64) NOT NULL COMMENT '行李牌号',
+    seq          INT         NOT NULL COMMENT '该行李容器链顺序，0 起递增',
+    container_no VARCHAR(64) NOT NULL COMMENT '进入的容器编号',
+    leg_id       VARCHAR(64) NOT NULL COMMENT '进入容器时所属航段',
+    entered_at   TIMESTAMP WITH TIME ZONE NOT NULL COMMENT '入容器时刻（UTC）',
+    PRIMARY KEY (id),
+    UNIQUE (bag_tag, seq),
+    UNIQUE (bag_tag, container_no)
+);
+
+-- 容器重封单：PREVIEW 预览（创建时只读差异快照）-> ACTIVE 双人确认激活；失败不产生 ACTIVE 单
+-- repack_key 全局唯一；源容器须同航段、同交接点、状态 SEALED
+CREATE TABLE IF NOT EXISTS repack_order (
+    repack_key           VARCHAR(64)  NOT NULL COMMENT '重封单业务键，全局唯一',
+    leg_id               VARCHAR(64)  NOT NULL COMMENT '源容器共同所属航段',
+    handover_point       VARCHAR(64)  NOT NULL COMMENT '源容器共同交接点代码',
+    status               VARCHAR(16)  NOT NULL DEFAULT 'PREVIEW' COMMENT '重封单状态：PREVIEW 仅预览/ACTIVE 已激活完成',
+    operator_id          VARCHAR(64)  NULL COMMENT '激活操作人员工号，PREVIEW 为 NULL',
+    reviewer_id          VARCHAR(64)  NULL COMMENT '激活复核人员工号（必须与操作人不同），PREVIEW 为 NULL',
+    source_containers    CLOB         NOT NULL COMMENT '源容器编号只读有序快照（JSON 数组，1~10 个）',
+    source_versions      CLOB         NOT NULL COMMENT '各源容器提交时 expectedVersion 只读快照（JSON 整数数组，与源容器顺序一致）',
+    old_seals            CLOB         NOT NULL COMMENT '各源容器旧封签号只读快照（JSON 数组，与源容器顺序一致）',
+    partition_targets    CLOB         NOT NULL COMMENT '目标容器编号有序快照（JSON 数组，1~10 个）',
+    partition_seals      CLOB         NOT NULL COMMENT '各目标容器新封签号快照（JSON 数组，与目标容器顺序一致）',
+    partition_bag_tags   CLOB         NOT NULL COMMENT '精确分区快照（JSON 数组的数组，外层与目标容器顺序一致，内层为完整 bagTag 集合，排序存储）',
+    before_snapshot      CLOB         NOT NULL COMMENT '激活前清单快照（JSON：容器编号 -> 排序 bagTag 数组），含全部源容器',
+    after_snapshot       CLOB         NULL COMMENT '激活后清单快照（JSON：目标容器编号 -> 排序 bagTag 数组），仅 ACTIVE 非 NULL',
+    preview_differences  CLOB         NOT NULL COMMENT '创建时清单差异预览（JSON：目标容器编号 -> {added,removed}，相对源并集）',
+    scan_statuses        CLOB         NOT NULL COMMENT '创建时各行李当前扫描状态快照（JSON：bagTag -> 状态）',
+    created_request_id   VARCHAR(128) NOT NULL COMMENT '创建重封单的 requestId',
+    activated_request_id VARCHAR(128) NULL COMMENT '激活重封单的 requestId，PREVIEW 为 NULL',
+    created_at           TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    activated_at         TIMESTAMP WITH TIME ZONE NULL COMMENT '激活完成时刻（UTC），PREVIEW 为 NULL',
+    PRIMARY KEY (repack_key)
+);
+
+-- 重封证据明细（只读、稳定排序）：每行记录一件行李在某张重封单中的源->目标去向
+CREATE TABLE IF NOT EXISTS repack_evidence (
+    id           BIGINT AUTO_INCREMENT NOT NULL COMMENT '自增主键',
+    repack_key   VARCHAR(64) NOT NULL COMMENT '重封单业务键',
+    bag_tag      VARCHAR(64) NOT NULL COMMENT '行李牌号',
+    source_container VARCHAR(64) NOT NULL COMMENT '重封前源容器编号',
+    target_container VARCHAR(64) NOT NULL COMMENT '重封后目标容器编号',
+    old_seal     VARCHAR(64) NOT NULL COMMENT '源容器旧封签号',
+    new_seal     VARCHAR(64) NOT NULL COMMENT '目标容器新封签号',
+    PRIMARY KEY (id),
+    UNIQUE (repack_key, bag_tag)
 );
