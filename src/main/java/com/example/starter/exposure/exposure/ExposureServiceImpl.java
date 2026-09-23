@@ -1,19 +1,25 @@
 package com.example.starter.exposure.exposure;
 
 import com.example.starter.exposure.domain.Campaign;
+import com.example.starter.exposure.domain.Placement;
 import com.example.starter.exposure.domain.Reservation;
 import com.example.starter.exposure.domain.ReservationStatus;
 import com.example.starter.exposure.repo.CampaignRepository;
 import com.example.starter.exposure.repo.IdempotencyRepository;
 import com.example.starter.exposure.repo.IdempotencyRepository.IdempotencyRecord;
 import com.example.starter.exposure.repo.LedgerRepository;
+import com.example.starter.exposure.repo.PlacementRepository;
 import com.example.starter.exposure.repo.ReservationRepository;
 import com.example.starter.exposure.web.ApiException;
 import com.example.starter.exposure.web.ApplyExposureRequest;
+import com.example.starter.exposure.web.ApplyPlacementExposureRequest;
 import com.example.starter.exposure.web.CampaignResponse;
 import com.example.starter.exposure.web.CreateCampaignRequest;
+import com.example.starter.exposure.web.CreatePlacementRequest;
+import com.example.starter.exposure.web.PlacementResponse;
 import com.example.starter.exposure.web.QuotaResponse;
 import com.example.starter.exposure.web.ReservationActionRequest;
+import com.example.starter.exposure.web.ReservationPlacementDetail;
 import com.example.starter.exposure.web.ReservationResponse;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
@@ -33,6 +39,11 @@ import java.util.function.Supplier;
  * <p>所有写操作以 requestId 为全局幂等键：同键同参重放原成功结果，异参 409；
  * 业务失败随事务回滚，不占幂等键。所有操作与额度查询先结算相关过期预占，
  * 不依赖后台定时器。终态竞争由行锁 + 状态 CAS 保证只允许一个终态。</p>
+ *
+ * <p>三层额度（公告当日总额、访客跨展示位共享当日上限、展示位当日额度）在同一事务内
+ * 按固定加锁顺序（公告行 → 总账 → 访客账 → 展示位账 → 展示位行）取得，任一已满整体
+ * 回滚返回 429；取消/到期释放三层，确认持续占用。新增展示位持公告行锁并递增
+ * configVersion，与申请事务按提交顺序串行化。</p>
  */
 @Service
 public class ExposureServiceImpl implements ExposureService {
@@ -44,6 +55,7 @@ public class ExposureServiceImpl implements ExposureService {
 
     private final Clock clock;
     private final CampaignRepository campaignRepository;
+    private final PlacementRepository placementRepository;
     private final ReservationRepository reservationRepository;
     private final LedgerRepository ledgerRepository;
     private final IdempotencyRepository idempotencyRepository;
@@ -52,6 +64,7 @@ public class ExposureServiceImpl implements ExposureService {
 
     public ExposureServiceImpl(Clock clock,
                                CampaignRepository campaignRepository,
+                               PlacementRepository placementRepository,
                                ReservationRepository reservationRepository,
                                LedgerRepository ledgerRepository,
                                IdempotencyRepository idempotencyRepository,
@@ -59,6 +72,7 @@ public class ExposureServiceImpl implements ExposureService {
                                TransactionTemplate txTemplate) {
         this.clock = clock;
         this.campaignRepository = campaignRepository;
+        this.placementRepository = placementRepository;
         this.reservationRepository = reservationRepository;
         this.ledgerRepository = ledgerRepository;
         this.idempotencyRepository = idempotencyRepository;
@@ -76,11 +90,13 @@ public class ExposureServiceImpl implements ExposureService {
                         throw new ApiException(HttpStatus.CONFLICT,
                                 "campaign already exists: " + request.campaignId());
                     }
+                    long now = clock.millis();
                     Campaign campaign = new Campaign(
                             request.campaignId(),
                             request.dailyTotalCap(),
                             request.perVisitorDailyCap(),
-                            clock.millis());
+                            1,
+                            now);
                     try {
                         campaignRepository.insert(campaign);
                     } catch (DuplicateKeyException duplicateCampaign) {
@@ -88,51 +104,86 @@ public class ExposureServiceImpl implements ExposureService {
                         throw new ApiException(HttpStatus.CONFLICT,
                                 "campaign already exists: " + request.campaignId());
                     }
+                    // 公告创建即生成 DEFAULT 展示位，日额度等于公告日总额度，配置版本 1
+                    placementRepository.insert(new Placement(
+                            campaign.campaignId(),
+                            Placement.DEFAULT_CODE,
+                            campaign.dailyTotalCap(),
+                            1,
+                            now));
                     return CampaignResponse.from(campaign);
                 });
     }
 
     @Override
+    public PlacementResponse createPlacement(String campaignId, CreatePlacementRequest request) {
+        String fingerprint = campaignId + "|" + request.placementCode() + "|" + request.dailyCap()
+                + "|" + request.expectedConfigVersion();
+        return runIdempotent(request.requestId(), Operation.CREATE_PLACEMENT, fingerprint,
+                PlacementResponse.class, () -> {
+                    long now = clock.millis();
+                    // 持公告行锁串行化所有配置变更与额度申请
+                    Campaign campaign = campaignRepository.lockById(campaignId)
+                            .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
+                                    "campaign not found: " + campaignId));
+
+                    if (campaign.configVersion() != request.expectedConfigVersion()) {
+                        throw new ApiException(HttpStatus.CONFLICT,
+                                "config version mismatch: expected " + request.expectedConfigVersion()
+                                        + " but current is " + campaign.configVersion());
+                    }
+                    if (Placement.DEFAULT_CODE.equals(request.placementCode())) {
+                        throw new ApiException(HttpStatus.CONFLICT,
+                                "placement code reserved: " + Placement.DEFAULT_CODE);
+                    }
+                    int existing = placementRepository.countByCampaign(campaignId);
+                    if (existing >= PlacementRepository.MAX_PLACEMENTS_PER_CAMPAIGN) {
+                        throw new ApiException(HttpStatus.CONFLICT,
+                                "placement limit reached: at most "
+                                        + PlacementRepository.MAX_PLACEMENTS_PER_CAMPAIGN
+                                        + " placements per campaign");
+                    }
+                    if (request.dailyCap() > campaign.dailyTotalCap()) {
+                        throw new ApiException(HttpStatus.CONFLICT,
+                                "placement daily cap must not exceed campaign daily total cap: "
+                                        + campaign.dailyTotalCap());
+                    }
+
+                    int newVersion = campaign.configVersion() + 1;
+                    Placement placement = new Placement(
+                            campaignId,
+                            request.placementCode(),
+                            request.dailyCap(),
+                            newVersion,
+                            now);
+                    try {
+                        placementRepository.insert(placement);
+                    } catch (DuplicateKeyException duplicatePlacement) {
+                        throw new ApiException(HttpStatus.CONFLICT,
+                                "placement already exists: " + request.placementCode());
+                    }
+                    // 展示位、版本号在同一事务原子提交
+                    campaignRepository.updateConfigVersion(campaignId, newVersion);
+                    return PlacementResponse.from(placement);
+                });
+    }
+
+    @Override
     public ReservationResponse apply(ApplyExposureRequest request) {
+        // 旧入口等价于申请 DEFAULT；指纹保持旧格式以兼容旧幂等语义
         String fingerprint = request.campaignId() + "|" + request.visitorId();
         return runIdempotent(request.requestId(), Operation.APPLY, fingerprint,
-                ReservationResponse.class, () -> {
-                    long now = clock.millis();
-                    LocalDate utcDate = LocalDate.now(clock);
-                    Campaign campaign = requireCampaign(request.campaignId());
+                ReservationResponse.class,
+                () -> reserve(request.campaignId(), Placement.DEFAULT_CODE, request.visitorId()));
+    }
 
-                    // 先结算该公告相关过期预占并释放额度
-                    settleExpired(campaign.campaignId(), now);
-
-                    // 固定加锁顺序：公告当日总账 -> 访客当日账，避免死锁
-                    ledgerRepository.ensureTotalRow(campaign.campaignId(), utcDate);
-                    ledgerRepository.ensureVisitorRow(campaign.campaignId(), request.visitorId(), utcDate);
-                    int usedTotal = ledgerRepository.lockUsedTotal(campaign.campaignId(), utcDate);
-                    int usedVisitor = ledgerRepository.lockUsedVisitor(
-                            campaign.campaignId(), request.visitorId(), utcDate);
-
-                    // 任一额度已满则 429，两个额度均不增加（尚未写入）
-                    if (usedTotal + 1 > campaign.dailyTotalCap()
-                            || usedVisitor + 1 > campaign.perVisitorDailyCap()) {
-                        throw new ApiException(HttpStatus.TOO_MANY_REQUESTS,
-                                "exposure quota exhausted for campaign " + campaign.campaignId());
-                    }
-                    ledgerRepository.addTotal(campaign.campaignId(), utcDate, 1);
-                    ledgerRepository.addVisitor(campaign.campaignId(), request.visitorId(), utcDate, 1);
-
-                    String reservationId = UUID.randomUUID().toString().replace("-", "");
-                    Reservation reservation = new Reservation(
-                            reservationId,
-                            campaign.campaignId(),
-                            request.visitorId(),
-                            java.sql.Date.valueOf(utcDate),
-                            ReservationStatus.RESERVED,
-                            now,
-                            now + RESERVATION_TTL_MILLIS,
-                            null);
-                    reservationRepository.insert(reservation);
-                    return ReservationResponse.from(reservation);
-                });
+    @Override
+    public ReservationResponse applyPlacement(ApplyPlacementExposureRequest request) {
+        String fingerprint = request.campaignId() + "|" + request.placementCode() + "|"
+                + request.visitorId();
+        return runIdempotent(request.requestId(), Operation.APPLY, fingerprint,
+                ReservationResponse.class,
+                () -> reserve(request.campaignId(), request.placementCode(), request.visitorId()));
     }
 
     @Override
@@ -162,7 +213,8 @@ public class ExposureServiceImpl implements ExposureService {
     }
 
     @Override
-    public QuotaResponse queryQuota(String campaignId, String visitorId, LocalDate requestedDate) {
+    public QuotaResponse queryQuota(String campaignId, String visitorId, String placementCode,
+                                    LocalDate requestedDate) {
         return txTemplate.execute(status -> {
             Campaign campaign = requireCampaign(campaignId);
             long now = clock.millis();
@@ -171,21 +223,46 @@ public class ExposureServiceImpl implements ExposureService {
             settleExpired(campaignId, now);
 
             int usedTotal = ledgerRepository.getUsedTotal(campaignId, utcDate);
-            if (visitorId == null || visitorId.isBlank()) {
-                return new QuotaResponse(
-                        campaignId, null, utcDate,
-                        campaign.dailyTotalCap(), usedTotal,
-                        campaign.dailyTotalCap() - usedTotal,
-                        null, null, null, now);
+            Integer perVisitorCap = null;
+            Integer usedVisitor = null;
+            Integer remainingVisitor = null;
+            if (visitorId != null && !visitorId.isBlank()) {
+                perVisitorCap = campaign.perVisitorDailyCap();
+                usedVisitor = ledgerRepository.getUsedVisitor(campaignId, visitorId, utcDate);
+                remainingVisitor = perVisitorCap - usedVisitor;
             }
-            int usedVisitor = ledgerRepository.getUsedVisitor(campaignId, visitorId, utcDate);
+
+            Integer placementDailyCap = null;
+            Integer usedPlacement = null;
+            Integer remainingPlacement = null;
+            if (placementCode != null && !placementCode.isBlank()) {
+                Placement placement = placementRepository.findById(campaignId, placementCode)
+                        .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
+                                "placement not found: " + placementCode));
+                placementDailyCap = placement.dailyCap();
+                usedPlacement = ledgerRepository.getUsedPlacement(campaignId, placementCode, utcDate);
+                remainingPlacement = placementDailyCap - usedPlacement;
+            }
+
+            // 预占展示位明细：当日仍活跃（RESERVED/CONFIRMED）的预占，按维度过滤
+            List<ReservationPlacementDetail> reservations = reservationRepository
+                    .findActive(campaignId, visitorId, placementCode, utcDate)
+                    .stream()
+                    .map(ReservationPlacementDetail::from)
+                    .toList();
+
             return new QuotaResponse(
-                    campaignId, visitorId, utcDate,
+                    campaignId,
+                    visitorId == null || visitorId.isBlank() ? null : visitorId,
+                    utcDate,
                     campaign.dailyTotalCap(), usedTotal,
                     campaign.dailyTotalCap() - usedTotal,
-                    campaign.perVisitorDailyCap(), usedVisitor,
-                    campaign.perVisitorDailyCap() - usedVisitor,
-                    now);
+                    perVisitorCap, usedVisitor, remainingVisitor,
+                    now,
+                    campaign.configVersion(),
+                    placementCode == null || placementCode.isBlank() ? null : placementCode,
+                    placementDailyCap, usedPlacement, remainingPlacement,
+                    reservations);
         });
     }
 
@@ -194,9 +271,62 @@ public class ExposureServiceImpl implements ExposureService {
     /** 幂等操作类型，同时标识存储响应的反序列化类型。 */
     private enum Operation {
         CREATE_CAMPAIGN,
+        CREATE_PLACEMENT,
         APPLY,
         CONFIRM,
         CANCEL
+    }
+
+    /**
+     * 按展示位预占一次曝光：同一事务内同时取得三层额度，任一已满返回 429 且三层均不增加。
+     */
+    private ReservationResponse reserve(String campaignId, String placementCode, String visitorId) {
+        long now = clock.millis();
+        LocalDate utcDate = LocalDate.now(clock);
+
+        // 先结算该公告相关过期预占并释放三层额度（预占行最先加锁）
+        settleExpired(campaignId, now);
+
+        // 公告行锁：与新增展示位事务按提交顺序串行化；随后固定加锁顺序 总账→访客账→展示位账
+        Campaign campaign = campaignRepository.lockById(campaignId)
+                .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
+                        "campaign not found: " + campaignId));
+        Placement placement = placementRepository.lockById(campaignId, placementCode)
+                .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
+                        "placement not found: " + placementCode));
+
+        ledgerRepository.ensureTotalRow(campaignId, utcDate);
+        ledgerRepository.ensureVisitorRow(campaignId, visitorId, utcDate);
+        ledgerRepository.ensurePlacementRow(campaignId, placementCode, utcDate);
+        int usedTotal = ledgerRepository.lockUsedTotal(campaignId, utcDate);
+        int usedVisitor = ledgerRepository.lockUsedVisitor(campaignId, visitorId, utcDate);
+        int usedPlacement = ledgerRepository.lockUsedPlacement(campaignId, placementCode, utcDate);
+
+        // 任一额度已满则 429，三层额度均不增加（尚未写入，事务回滚）
+        if (usedTotal + 1 > campaign.dailyTotalCap()
+                || usedVisitor + 1 > campaign.perVisitorDailyCap()
+                || usedPlacement + 1 > placement.dailyCap()) {
+            throw new ApiException(HttpStatus.TOO_MANY_REQUESTS,
+                    "exposure quota exhausted for campaign " + campaignId
+                            + " placement " + placementCode);
+        }
+        ledgerRepository.addTotal(campaignId, utcDate, 1);
+        ledgerRepository.addVisitor(campaignId, visitorId, utcDate, 1);
+        ledgerRepository.addPlacement(campaignId, placementCode, utcDate, 1);
+
+        String reservationId = UUID.randomUUID().toString().replace("-", "");
+        Reservation reservation = new Reservation(
+                reservationId,
+                campaignId,
+                visitorId,
+                placementCode,
+                java.sql.Date.valueOf(utcDate),
+                ReservationStatus.RESERVED,
+                now,
+                now + RESERVATION_TTL_MILLIS,
+                null);
+        reservationRepository.insert(reservation);
+        return ReservationResponse.from(reservation);
     }
 
     /**
@@ -255,7 +385,7 @@ public class ExposureServiceImpl implements ExposureService {
                 .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
                         "reservation not found: " + reservationId));
 
-        // 仅结算本单（本事务已持其行锁，加锁顺序保持为 预占单 -> 总账 -> 访客账，避免死锁）
+        // 仅结算本单（本事务已持其行锁，加锁顺序保持为 预占单 -> 总账 -> 访客账 -> 展示位账）
         expireIfDue(current, now);
         current = reservationRepository.lockById(reservationId).orElseThrow();
 
@@ -271,10 +401,8 @@ public class ExposureServiceImpl implements ExposureService {
                         reservationId, ReservationStatus.RESERVED, ReservationStatus.CANCELLED, now)) {
                     throw new ApiException(HttpStatus.CONFLICT, "reservation state changed concurrently");
                 }
-                // 取消释放两级额度；固定顺序先总账后访客账
-                ledgerRepository.releaseTotal(current.campaignId(), current.utcDate().toLocalDate());
-                ledgerRepository.releaseVisitor(
-                        current.campaignId(), current.visitorId(), current.utcDate().toLocalDate());
+                // 取消释放三层额度；固定顺序先总账后访客账再展示位账
+                releaseAllTiers(current);
             }
         } else if (current.status() == ReservationStatus.CONFIRMED
                 || current.status() == ReservationStatus.CANCELLED
@@ -299,7 +427,7 @@ public class ExposureServiceImpl implements ExposureService {
 
     /**
      * 结算某公告当前已到期（now &gt;= expiresAt）但仍为 RESERVED 的预占：
-     * 行锁查出后逐个 CAS 为 EXPIRED，仅 CAS 成功者释放两级额度，杜绝重复释放。
+     * 行锁查出后逐个 CAS 为 EXPIRED，仅 CAS 成功者释放三层额度，杜绝重复释放。
      */
     private void settleExpired(String campaignId, long now) {
         List<Reservation> expired = reservationRepository.lockExpiredReserved(campaignId, now);
@@ -309,7 +437,7 @@ public class ExposureServiceImpl implements ExposureService {
     }
 
     /**
-     * 若传入预占单（调用方已持其行锁）已到期，则 CAS 转 EXPIRED 并释放两级额度；
+     * 若传入预占单（调用方已持其行锁）已到期，则 CAS 转 EXPIRED 并释放三层额度；
      * 未到期或已非 RESERVED 则不做任何变更。
      */
     private void expireIfDue(Reservation reservation, long now) {
@@ -321,24 +449,25 @@ public class ExposureServiceImpl implements ExposureService {
                     ReservationStatus.EXPIRED,
                     now);
             if (won) {
-                LocalDate utcDate = reservation.utcDate().toLocalDate();
-                ledgerRepository.releaseTotal(reservation.campaignId(), utcDate);
-                ledgerRepository.releaseVisitor(
-                        reservation.campaignId(), reservation.visitorId(), utcDate);
+                releaseAllTiers(reservation);
             }
         }
+    }
+
+    /** 释放预占占用的三层额度：总账 → 访客账 → 展示位账，固定顺序避免死锁。 */
+    private void releaseAllTiers(Reservation reservation) {
+        LocalDate utcDate = reservation.utcDate().toLocalDate();
+        ledgerRepository.releaseTotal(reservation.campaignId(), utcDate);
+        ledgerRepository.releaseVisitor(
+                reservation.campaignId(), reservation.visitorId(), utcDate);
+        ledgerRepository.releasePlacement(
+                reservation.campaignId(), reservation.placementCode(), utcDate);
     }
 
     private Campaign requireCampaign(String campaignId) {
         return campaignRepository.findById(campaignId)
                 .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
                         "campaign not found: " + campaignId));
-    }
-
-    private Reservation requireReservation(String reservationId) {
-        return reservationRepository.findById(reservationId)
-                .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
-                        "reservation not found: " + reservationId));
     }
 
     private String writeJson(Object value) {

@@ -27,6 +27,7 @@ public class ReservationRepository {
             rs.getString("reservation_id"),
             rs.getString("campaign_id"),
             rs.getString("visitor_id"),
+            rs.getString("placement_code"),
             rs.getDate("utc_date"),
             ReservationStatus.valueOf(rs.getString("status")),
             rs.getLong("created_at_utc"),
@@ -34,14 +35,16 @@ public class ReservationRepository {
             (Long) rs.getObject("terminal_at_utc"));
 
     private static final String COLUMNS =
-            "reservation_id, campaign_id, visitor_id, utc_date, status, "
+            "reservation_id, campaign_id, visitor_id, placement_code, utc_date, status, "
                     + "created_at_utc, expires_at_utc, terminal_at_utc";
 
     public void insert(Reservation reservation) {
-        jdbc.update("INSERT INTO exposure_reservation (" + COLUMNS + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        jdbc.update("INSERT INTO exposure_reservation (" + COLUMNS + ") "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 reservation.reservationId(),
                 reservation.campaignId(),
                 reservation.visitorId(),
+                reservation.placementCode(),
                 reservation.utcDate(),
                 reservation.status().name(),
                 reservation.createdAtUtc(),
@@ -86,5 +89,29 @@ public class ReservationRepository {
                         + "WHERE reservation_id = ? AND status = ?",
                 target.name(), terminalAtUtc, reservationId, expect.name());
         return rows == 1;
+    }
+
+    /**
+     * 查询某公告某 UTC 日处于活跃状态（RESERVED/CONFIRMED，即仍占用三层额度）的预占明细。
+     * visitorId 与 placementCode 非空时按对应维度过滤；按展示位、创建时刻升序。
+     */
+    public List<Reservation> findActive(String campaignId, String visitorId,
+                                        String placementCode, java.time.LocalDate utcDate) {
+        StringBuilder sql = new StringBuilder("SELECT " + COLUMNS + " FROM exposure_reservation "
+                + "WHERE campaign_id = ? AND utc_date = ? "
+                + "AND status IN ('RESERVED', 'CONFIRMED')");
+        List<Object> args = new java.util.ArrayList<>();
+        args.add(campaignId);
+        args.add(java.sql.Date.valueOf(utcDate));
+        if (visitorId != null && !visitorId.isBlank()) {
+            sql.append(" AND visitor_id = ?");
+            args.add(visitorId);
+        }
+        if (placementCode != null && !placementCode.isBlank()) {
+            sql.append(" AND placement_code = ?");
+            args.add(placementCode);
+        }
+        sql.append(" ORDER BY placement_code, created_at_utc, reservation_id");
+        return jdbc.query(sql.toString(), MAPPER, args.toArray());
     }
 }
