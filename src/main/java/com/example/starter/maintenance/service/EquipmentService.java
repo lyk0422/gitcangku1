@@ -9,8 +9,15 @@ import org.springframework.stereotype.Service;
 import com.example.starter.maintenance.api.ApiException;
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
+import com.example.starter.maintenance.api.dto.DriftCorrectionActivateRequest;
+import com.example.starter.maintenance.api.dto.DriftCorrectionDetailView;
+import com.example.starter.maintenance.api.dto.DriftCorrectionPreviewRequest;
+import com.example.starter.maintenance.api.dto.DriftCorrectionPreviewResponse;
+import com.example.starter.maintenance.api.dto.DriftCorrectionResponse;
+import com.example.starter.maintenance.api.dto.DriftCorrectionSummaryView;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
+import com.example.starter.maintenance.api.dto.MaintenanceSnapshotView;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
 import com.example.starter.maintenance.api.dto.RegisterEquipmentRequest;
 import com.example.starter.maintenance.api.dto.ReviseReadingRequest;
@@ -25,10 +32,13 @@ import com.example.starter.maintenance.api.dto.StatusResponse;
 public class EquipmentService {
 
     private final EquipmentTxService txService;
+    private final DriftCorrectionService driftCorrectionService;
     private final IdempotencyService idempotency;
 
-    public EquipmentService(EquipmentTxService txService, IdempotencyService idempotency) {
+    public EquipmentService(EquipmentTxService txService, DriftCorrectionService driftCorrectionService,
+                            IdempotencyService idempotency) {
         this.txService = txService;
+        this.driftCorrectionService = driftCorrectionService;
         this.idempotency = idempotency;
     }
 
@@ -64,6 +74,45 @@ public class EquipmentService {
 
     public List<MaintenanceResponse> listMaintenances(String equipmentId) {
         return txService.listMaintenances(equipmentId);
+    }
+
+    // ---------- 漂移修正 ----------
+
+    public DriftCorrectionPreviewResponse previewDriftCorrection(String equipmentId,
+                                                                 DriftCorrectionPreviewRequest req) {
+        return driftCorrectionService.preview(equipmentId, req);
+    }
+
+    /**
+     * 激活漂移修正。correctionKey 全局唯一：并发唯一键冲突（事务已回滚）时，
+     * 优先按 requestId 重放已提交的成功快照，否则说明 correctionKey 被其他请求占用，返回 409。
+     */
+    public DriftCorrectionResponse activateDriftCorrection(String equipmentId,
+                                                           DriftCorrectionActivateRequest req) {
+        String fingerprint = DriftCorrectionService.fingerprint(equipmentId, req);
+        try {
+            return driftCorrectionService.activate(equipmentId, req);
+        } catch (DuplicateKeyException e) {
+            DriftCorrectionResponse replayed = idempotency.replayExisting(req.requestId(),
+                    DriftCorrectionService.OPERATION, fingerprint, DriftCorrectionResponse.class);
+            if (replayed != null) {
+                return replayed;
+            }
+            throw ApiException.conflict("CORRECTION_KEY_EXISTS",
+                    "correctionKey 已被占用：" + req.correctionKey());
+        }
+    }
+
+    public List<DriftCorrectionSummaryView> listDriftCorrections(String equipmentId) {
+        return driftCorrectionService.listCorrections(equipmentId);
+    }
+
+    public DriftCorrectionDetailView getDriftCorrection(String equipmentId, String correctionKey) {
+        return driftCorrectionService.getCorrection(equipmentId, correctionKey);
+    }
+
+    public List<MaintenanceSnapshotView> listMaintenanceSnapshots(String equipmentId) {
+        return driftCorrectionService.listSnapshots(equipmentId);
     }
 
     /**

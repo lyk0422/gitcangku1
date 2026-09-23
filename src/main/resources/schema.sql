@@ -20,18 +20,20 @@ CREATE TABLE IF NOT EXISTS reading (
     reading_id VARCHAR(64) NOT NULL,
     sampled_at TIMESTAMP WITH TIME ZONE NOT NULL,
     cumulative_minutes BIGINT NOT NULL,
+    cumulative_millis BIGINT NOT NULL,
     revision_no INT NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL,
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL,
     PRIMARY KEY (equipment_id, reading_id),
     CONSTRAINT uq_reading_sampled_at UNIQUE (equipment_id, sampled_at)
 );
-COMMENT ON TABLE reading IS '工时读数当前值：按采样时刻排序后累计分钟须单调不减';
+COMMENT ON TABLE reading IS '工时读数当前值：按采样时刻排序后累计工时须单调不减';
 COMMENT ON COLUMN reading.equipment_id IS '所属设备标识';
 COMMENT ON COLUMN reading.reading_id IS '读数标识，设备内唯一';
 COMMENT ON COLUMN reading.sampled_at IS 'UTC 采样时刻；同设备同一时刻仅允许一条读数';
-COMMENT ON COLUMN reading.cumulative_minutes IS '当前累计工时（分钟），非负整数，随修订更新';
-COMMENT ON COLUMN reading.revision_no IS '当前修订号，初始 1，每次修订加一';
+COMMENT ON COLUMN reading.cumulative_minutes IS '当前累计工时（分钟），非负整数；漂移修正后为毫秒值四舍五入到分钟的视图';
+COMMENT ON COLUMN reading.cumulative_millis IS '当前累计工时（毫秒），规范精确值；分钟读数按 ×60000 精确换算，漂移修正读数精确到 0.001 小时（3600 毫秒）';
+COMMENT ON COLUMN reading.revision_no IS '当前修订号，初始 1，每次修订或漂移修正加一';
 COMMENT ON COLUMN reading.created_at IS '读数登记时刻（UTC）';
 COMMENT ON COLUMN reading.updated_at IS '最近一次修订时刻（UTC）';
 
@@ -41,15 +43,17 @@ CREATE TABLE IF NOT EXISTS reading_revision (
     reading_id VARCHAR(64) NOT NULL,
     revision_no INT NOT NULL,
     cumulative_minutes BIGINT NOT NULL,
+    cumulative_millis BIGINT NOT NULL,
     request_id VARCHAR(128) NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL,
     PRIMARY KEY (equipment_id, reading_id, revision_no)
 );
-COMMENT ON TABLE reading_revision IS '读数修订历史：revision_no=1 为初始登记值，其后每行对应一次修订';
+COMMENT ON TABLE reading_revision IS '读数修订历史：revision_no=1 为初始登记值，其后每行对应一次修订或漂移修正；历史行不可变';
 COMMENT ON COLUMN reading_revision.equipment_id IS '所属设备标识';
 COMMENT ON COLUMN reading_revision.reading_id IS '读数标识';
 COMMENT ON COLUMN reading_revision.revision_no IS '修订号，从 1 开始递增';
-COMMENT ON COLUMN reading_revision.cumulative_minutes IS '该修订版本的累计工时（分钟）';
+COMMENT ON COLUMN reading_revision.cumulative_minutes IS '该修订版本的累计工时（分钟），毫秒值四舍五入视图';
+COMMENT ON COLUMN reading_revision.cumulative_millis IS '该修订版本的累计工时（毫秒），规范精确值';
 COMMENT ON COLUMN reading_revision.request_id IS '产生该修订的请求 requestId';
 COMMENT ON COLUMN reading_revision.created_at IS '该修订生效时刻（UTC）';
 
@@ -61,17 +65,19 @@ CREATE TABLE IF NOT EXISTS maintenance (
     anchor_revision_no INT NOT NULL,
     anchor_sampled_at TIMESTAMP WITH TIME ZONE NOT NULL,
     anchor_cumulative_minutes BIGINT NOT NULL,
+    anchor_cumulative_millis BIGINT NOT NULL,
     request_id VARCHAR(128) NOT NULL,
     completed_at TIMESTAMP WITH TIME ZONE NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_maintenance_equipment ON maintenance (equipment_id, anchor_sampled_at);
-COMMENT ON TABLE maintenance IS '保养记录：锚点时间须严格晚于上次保养锚点；作为锚点的读数不可再修订';
+COMMENT ON TABLE maintenance IS '保养记录：锚点时间须严格晚于上次保养锚点；作为锚点的读数被冻结，不可再修订或被漂移修正';
 COMMENT ON COLUMN maintenance.maintenance_id IS '保养记录自增主键';
 COMMENT ON COLUMN maintenance.equipment_id IS '所属设备标识';
 COMMENT ON COLUMN maintenance.reading_id IS '锚点读数标识';
 COMMENT ON COLUMN maintenance.anchor_revision_no IS '锚点读数在保养完成时的修订号';
 COMMENT ON COLUMN maintenance.anchor_sampled_at IS '锚点读数的 UTC 采样时刻（快照）';
-COMMENT ON COLUMN maintenance.anchor_cumulative_minutes IS '锚点读数在保养完成时的累计工时快照（分钟）';
+COMMENT ON COLUMN maintenance.anchor_cumulative_minutes IS '锚点读数在保养完成时的累计工时快照（分钟），毫秒值四舍五入视图';
+COMMENT ON COLUMN maintenance.anchor_cumulative_millis IS '锚点读数在保养完成时的累计工时快照（毫秒），规范精确值';
 COMMENT ON COLUMN maintenance.request_id IS '完成保养请求的 requestId';
 COMMENT ON COLUMN maintenance.completed_at IS '保养完成登记时刻（UTC）';
 
@@ -85,7 +91,107 @@ CREATE TABLE IF NOT EXISTS idempotency_request (
 );
 COMMENT ON TABLE idempotency_request IS '写操作幂等去重：同键同参重放原成功结果，同键异参返回 409';
 COMMENT ON COLUMN idempotency_request.request_id IS '全局唯一请求标识';
-COMMENT ON COLUMN idempotency_request.operation IS '操作类型（登记设备/新增读数/修订/完成保养）';
+COMMENT ON COLUMN idempotency_request.operation IS '操作类型（登记设备/新增读数/修订/完成保养/漂移修正）';
 COMMENT ON COLUMN idempotency_request.request_fingerprint IS '业务参数指纹（不含 requestId），用于同键异参判定';
 COMMENT ON COLUMN idempotency_request.response_body IS '原成功响应报文（JSON），重放时原样返回';
 COMMENT ON COLUMN idempotency_request.created_at IS '首次成功处理时刻（UTC）';
+
+-- 漂移修正单单头：correction_key 全局唯一；激活成功后才落库，失败整体回滚不占键。
+CREATE TABLE IF NOT EXISTS drift_correction (
+    correction_key VARCHAR(64) NOT NULL PRIMARY KEY,
+    equipment_id VARCHAR(64) NOT NULL,
+    request_id VARCHAR(128) NOT NULL,
+    anchor_count INT NOT NULL,
+    first_sampled_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    last_sampled_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    affected_count INT NOT NULL,
+    maintenance_snapshot_version BIGINT NOT NULL,
+    equipment_version BIGINT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_drift_correction_equipment ON drift_correction (equipment_id, created_at);
+COMMENT ON TABLE drift_correction IS '时钟漂移修正单单头：2~20 个锚点按采集 UTC 时刻排序，首尾锚点间按时间线性插值修正';
+COMMENT ON COLUMN drift_correction.correction_key IS '修正单业务标识，全局唯一';
+COMMENT ON COLUMN drift_correction.equipment_id IS '所属设备标识';
+COMMENT ON COLUMN drift_correction.request_id IS '激活请求的 requestId（幂等键）';
+COMMENT ON COLUMN drift_correction.anchor_count IS '锚点数量（2~20）';
+COMMENT ON COLUMN drift_correction.first_sampled_at IS '首锚点读数的 UTC 采样时刻（修正区间下界，含）';
+COMMENT ON COLUMN drift_correction.last_sampled_at IS '尾锚点读数的 UTC 采样时刻（修正区间上界，含）';
+COMMENT ON COLUMN drift_correction.affected_count IS '区间内受影响读数条数（每条生成一个新修订号）';
+COMMENT ON COLUMN drift_correction.maintenance_snapshot_version IS '本次激活生成的保养快照版本号（每设备从 1 递增，每单恰好一个）';
+COMMENT ON COLUMN drift_correction.equipment_version IS '激活后的设备版本号';
+COMMENT ON COLUMN drift_correction.created_at IS '激活时刻（UTC）';
+
+-- 漂移修正锚点：按读数采样时刻规范化排序（seq 从 1 开始），校准值精确到 0.001 小时。
+CREATE TABLE IF NOT EXISTS drift_correction_anchor (
+    correction_key VARCHAR(64) NOT NULL,
+    seq INT NOT NULL,
+    reading_id VARCHAR(64) NOT NULL,
+    sampled_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    expected_revision_no INT NOT NULL,
+    calibrated_millis BIGINT NOT NULL,
+    PRIMARY KEY (correction_key, seq),
+    CONSTRAINT uq_drift_anchor_reading UNIQUE (correction_key, reading_id)
+);
+COMMENT ON TABLE drift_correction_anchor IS '漂移修正锚点：激活时校验读数当前修订号与 expected_revision_no 一致，校准值须严格递增';
+COMMENT ON COLUMN drift_correction_anchor.correction_key IS '所属修正单标识';
+COMMENT ON COLUMN drift_correction_anchor.seq IS '锚点序号，按读数采样时刻升序从 1 开始（提交乱序按时间规范化）';
+COMMENT ON COLUMN drift_correction_anchor.reading_id IS '锚点读数标识';
+COMMENT ON COLUMN drift_correction_anchor.sampled_at IS '锚点读数的 UTC 采样时刻';
+COMMENT ON COLUMN drift_correction_anchor.expected_revision_no IS '提交时锚点读数的期望修订号，激活时不一致则整单 409';
+COMMENT ON COLUMN drift_correction_anchor.calibrated_millis IS '经校准的真实累计工时（毫秒），精确到 0.001 小时（3600 毫秒），非负';
+
+-- 漂移修正影响明细：区间内每条读数的旧值/新值/插值段，证据只读、按 seq 稳定排序。
+CREATE TABLE IF NOT EXISTS drift_correction_item (
+    correction_key VARCHAR(64) NOT NULL,
+    seq INT NOT NULL,
+    reading_id VARCHAR(64) NOT NULL,
+    sampled_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    segment_index INT NOT NULL,
+    old_millis BIGINT NOT NULL,
+    new_millis BIGINT NOT NULL,
+    old_revision_no INT NOT NULL,
+    new_revision_no INT NOT NULL,
+    PRIMARY KEY (correction_key, seq),
+    CONSTRAINT uq_drift_item_reading UNIQUE (correction_key, reading_id)
+);
+COMMENT ON TABLE drift_correction_item IS '漂移修正影响明细：区间内每条读数生成一个新修订号，旧版本不可变';
+COMMENT ON COLUMN drift_correction_item.correction_key IS '所属修正单标识';
+COMMENT ON COLUMN drift_correction_item.seq IS '明细序号，按读数采样时刻升序从 1 开始';
+COMMENT ON COLUMN drift_correction_item.reading_id IS '受影响读数标识';
+COMMENT ON COLUMN drift_correction_item.sampled_at IS '读数的 UTC 采样时刻';
+COMMENT ON COLUMN drift_correction_item.segment_index IS '插值段序号：该读数所在锚点段的左锚点 seq（末锚点归属第 anchor_count-1 段）';
+COMMENT ON COLUMN drift_correction_item.old_millis IS '修正前累计工时（毫秒）';
+COMMENT ON COLUMN drift_correction_item.new_millis IS '修正后累计工时（毫秒），按时间线性插值并舍入到 0.001 小时';
+COMMENT ON COLUMN drift_correction_item.old_revision_no IS '修正前读数修订号';
+COMMENT ON COLUMN drift_correction_item.new_revision_no IS '修正后读数修订号（old_revision_no + 1）';
+
+-- 保养快照：漂移修正激活时按修正后当前累计工时一次性原子重算，每单恰好一行。
+CREATE TABLE IF NOT EXISTS maintenance_snapshot (
+    equipment_id VARCHAR(64) NOT NULL,
+    snapshot_version BIGINT NOT NULL,
+    correction_key VARCHAR(64) NOT NULL,
+    latest_reading_id VARCHAR(64),
+    latest_sampled_at TIMESTAMP WITH TIME ZONE,
+    latest_cumulative_millis BIGINT NOT NULL,
+    anchor_cumulative_millis BIGINT NOT NULL,
+    run_millis BIGINT NOT NULL,
+    period_minutes BIGINT NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    next_threshold_millis BIGINT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    PRIMARY KEY (equipment_id, snapshot_version)
+);
+COMMENT ON TABLE maintenance_snapshot IS '保养窗口快照：漂移修正激活事务内按修正后读数一次性重算全部保养项目状态与下一阈值';
+COMMENT ON COLUMN maintenance_snapshot.equipment_id IS '所属设备标识';
+COMMENT ON COLUMN maintenance_snapshot.snapshot_version IS '快照版本号，每设备从 1 递增；每次漂移修正激活恰好生成一个';
+COMMENT ON COLUMN maintenance_snapshot.correction_key IS '产生该快照的漂移修正单标识';
+COMMENT ON COLUMN maintenance_snapshot.latest_reading_id IS '最新读数标识（无读数时为 NULL）';
+COMMENT ON COLUMN maintenance_snapshot.latest_sampled_at IS '最新读数 UTC 采样时刻（无读数时为 NULL）';
+COMMENT ON COLUMN maintenance_snapshot.latest_cumulative_millis IS '修正后最新累计工时（毫秒，无读数时为 0）';
+COMMENT ON COLUMN maintenance_snapshot.anchor_cumulative_millis IS '最近保养锚点累计工时快照（毫秒，无保养时为 0）';
+COMMENT ON COLUMN maintenance_snapshot.run_millis IS '本轮运行时长（毫秒）= 最新累计工时 - 最近保养锚点工时';
+COMMENT ON COLUMN maintenance_snapshot.period_minutes IS '保养周期（分钟），登记时的设备周期快照';
+COMMENT ON COLUMN maintenance_snapshot.status IS '保养状态：run_millis 达到周期即 DUE，否则 NOT_DUE';
+COMMENT ON COLUMN maintenance_snapshot.next_threshold_millis IS '下一阈值（毫秒）= 最近保养锚点工时 + 保养周期，达到即进入 DUE';
+COMMENT ON COLUMN maintenance_snapshot.created_at IS '快照生成时刻（UTC）';

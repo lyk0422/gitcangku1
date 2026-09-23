@@ -20,6 +20,7 @@ import com.example.starter.maintenance.api.dto.RevisionView;
 import com.example.starter.maintenance.api.dto.StatusResponse;
 import com.example.starter.maintenance.domain.Equipment;
 import com.example.starter.maintenance.domain.MaintenanceRecord;
+import com.example.starter.maintenance.domain.MeterUnits;
 import com.example.starter.maintenance.domain.Reading;
 import com.example.starter.maintenance.store.EquipmentRepository;
 
@@ -74,12 +75,13 @@ public class EquipmentTxService {
                     }
                     checkMonotonic(equipmentId, req.sampledAt(), req.cumulativeMinutes());
                     Instant now = clock.instant();
+                    long cumulativeMillis = MeterUnits.minutesToMillis(req.cumulativeMinutes());
                     repository.insertReading(
                             new Reading(equipmentId, req.readingId(), req.sampledAt(),
-                                    req.cumulativeMinutes(), 1),
+                                    req.cumulativeMinutes(), cumulativeMillis, 1),
                             now);
                     repository.insertRevision(equipmentId, req.readingId(), 1,
-                            req.cumulativeMinutes(), req.requestId(), now);
+                            req.cumulativeMinutes(), cumulativeMillis, req.requestId(), now);
                     repository.incrementVersion(equipmentId);
                     return new ReadingResponse(equipmentId, req.readingId(), req.sampledAt(),
                             req.cumulativeMinutes(), 1, false, equipment.version() + 1);
@@ -106,10 +108,11 @@ public class EquipmentTxService {
                     checkMonotonic(equipmentId, reading.sampledAt(), req.cumulativeMinutes());
                     int newRevisionNo = reading.revisionNo() + 1;
                     Instant now = clock.instant();
+                    long cumulativeMillis = MeterUnits.minutesToMillis(req.cumulativeMinutes());
                     repository.updateReadingValue(equipmentId, readingId, req.cumulativeMinutes(),
-                            newRevisionNo, now);
+                            cumulativeMillis, newRevisionNo, now);
                     repository.insertRevision(equipmentId, readingId, newRevisionNo,
-                            req.cumulativeMinutes(), req.requestId(), now);
+                            req.cumulativeMinutes(), cumulativeMillis, req.requestId(), now);
                     repository.incrementVersion(equipmentId);
                     return new ReadingResponse(equipmentId, readingId, reading.sampledAt(),
                             req.cumulativeMinutes(), newRevisionNo, false, equipment.version() + 1);
@@ -142,7 +145,7 @@ public class EquipmentTxService {
                     Instant now = clock.instant();
                     long maintenanceId = repository.insertMaintenance(equipmentId, req.readingId(),
                             req.anchorRevisionNo(), anchor.sampledAt(), anchor.cumulativeMinutes(),
-                            req.requestId(), now);
+                            anchor.cumulativeMillis(), req.requestId(), now);
                     repository.incrementVersion(equipmentId);
                     return new MaintenanceResponse(maintenanceId, equipmentId, req.readingId(),
                             req.anchorRevisionNo(), anchor.sampledAt(), anchor.cumulativeMinutes(),

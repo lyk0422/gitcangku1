@@ -15,8 +15,15 @@ import org.springframework.web.bind.annotation.RestController;
 
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
+import com.example.starter.maintenance.api.dto.DriftCorrectionActivateRequest;
+import com.example.starter.maintenance.api.dto.DriftCorrectionDetailView;
+import com.example.starter.maintenance.api.dto.DriftCorrectionPreviewRequest;
+import com.example.starter.maintenance.api.dto.DriftCorrectionPreviewResponse;
+import com.example.starter.maintenance.api.dto.DriftCorrectionResponse;
+import com.example.starter.maintenance.api.dto.DriftCorrectionSummaryView;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
+import com.example.starter.maintenance.api.dto.MaintenanceSnapshotView;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
 import com.example.starter.maintenance.api.dto.RegisterEquipmentRequest;
 import com.example.starter.maintenance.api.dto.ReviseReadingRequest;
@@ -92,5 +99,49 @@ public class EquipmentController {
     @GetMapping("/{equipmentId}/maintenances")
     public List<MaintenanceResponse> listMaintenances(@PathVariable String equipmentId) {
         return service.listMaintenances(equipmentId);
+    }
+
+    /**
+     * 漂移修正预览：返回区间内全部读数的旧值、新值、插值段和受影响保养项目，不写数据。
+     * 锚点 2~20 个，按读数采样时刻规范化排序，校准值（精确到 0.001 小时）须严格递增。
+     */
+    @PostMapping("/{equipmentId}/drift-corrections/preview")
+    public DriftCorrectionPreviewResponse previewDriftCorrection(
+            @PathVariable String equipmentId,
+            @Valid @RequestBody DriftCorrectionPreviewRequest req) {
+        return service.previewDriftCorrection(equipmentId, req);
+    }
+
+    /**
+     * 漂移修正激活：一个事务内重读锚点与区间读数并校验，为每条受影响读数生成新修订，
+     * 按修正后当前累计工时一次性重算全部保养项目，恰好生成一个 maintenanceSnapshotVersion。
+     * requestId 同参（锚点换序按时间规范化后等价）重放首次快照，异参 409，失败不占键；
+     * correctionKey 全局唯一；冻结点落入修正集合整单 422。
+     */
+    @PostMapping("/{equipmentId}/drift-corrections")
+    @ResponseStatus(HttpStatus.CREATED)
+    public DriftCorrectionResponse activateDriftCorrection(
+            @PathVariable String equipmentId,
+            @Valid @RequestBody DriftCorrectionActivateRequest req) {
+        return service.activateDriftCorrection(equipmentId, req);
+    }
+
+    /** 漂移修正单列表（证据查询，只读，按激活时刻与 correctionKey 稳定排序）。 */
+    @GetMapping("/{equipmentId}/drift-corrections")
+    public List<DriftCorrectionSummaryView> listDriftCorrections(@PathVariable String equipmentId) {
+        return service.listDriftCorrections(equipmentId);
+    }
+
+    /** 漂移修正单详情（证据查询，只读）：单头 + 锚点 + 影响明细，均稳定排序。 */
+    @GetMapping("/{equipmentId}/drift-corrections/{correctionKey}")
+    public DriftCorrectionDetailView getDriftCorrection(@PathVariable String equipmentId,
+                                                        @PathVariable String correctionKey) {
+        return service.getDriftCorrection(equipmentId, correctionKey);
+    }
+
+    /** 保养快照历史（证据查询，只读，按版本号稳定排序）。 */
+    @GetMapping("/{equipmentId}/maintenance-snapshots")
+    public List<MaintenanceSnapshotView> listMaintenanceSnapshots(@PathVariable String equipmentId) {
+        return service.listMaintenanceSnapshots(equipmentId);
     }
 }
