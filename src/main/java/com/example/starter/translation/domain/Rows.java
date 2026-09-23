@@ -1,5 +1,6 @@
 package com.example.starter.translation.domain;
 
+import java.time.LocalDateTime;
 import java.util.List;
 
 /**
@@ -18,9 +19,11 @@ public final class Rows {
      * @param draftVersion     文档草稿版本，从 1 开始；增段落或修改源文/译文/术语时加一
      * @param publishedVersion 已发布版本号，从 0 开始，每次成功发布加一
      * @param termVersion      当前术语版本，从 0 开始（0 表示尚未建立术语版本）
+     * @param releaseRevision  发布目录修订号，从 0 开始，每次成功发布或首次撤回加一
      */
     public record DocumentRow(long documentId, List<String> targetLanguages,
-                              int draftVersion, int publishedVersion, int termVersion) {
+                              int draftVersion, int publishedVersion, int termVersion,
+                              int releaseRevision) {
     }
 
     /**
@@ -69,6 +72,20 @@ public final class Rows {
      */
     public record ApprovalRow(String segmentId, String language, String reviewer,
                               int sourceVersion, int translationVersion) {
+    }
+
+    /**
+     * 发布快照：发布时生成的完整只读快照及撤回标记；撤回不删除或修改快照正文。
+     *
+     * @param documentId       所属文档 ID
+     * @param publishedVersion 发布版本号，从 1 开始单调递增，不因撤回复用
+     * @param snapshotJson     快照内容 JSON，撤回后仍原样保留
+     * @param withdrawn        是否已撤回；撤回永久有效，存量快照默认为 false
+     * @param withdrawReason   撤回原因，撤回时必填非空；未撤回为 null
+     * @param withdrawnAt      撤回时刻，UTC 墙钟时间；未撤回为 null
+     */
+    public record SnapshotRow(long documentId, int publishedVersion, String snapshotJson,
+                              boolean withdrawn, String withdrawReason, LocalDateTime withdrawnAt) {
     }
 
     /**

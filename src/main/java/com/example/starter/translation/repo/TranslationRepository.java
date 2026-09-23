@@ -4,6 +4,7 @@ import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
 import com.example.starter.translation.domain.Rows.RequestLogRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
+import com.example.starter.translation.domain.Rows.SnapshotRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
 import com.example.starter.translation.domain.Rows.TranslationRow;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -13,6 +14,7 @@ import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.stereotype.Repository;
 
 import java.sql.PreparedStatement;
+import java.time.LocalDateTime;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
@@ -29,7 +31,16 @@ public class TranslationRepository {
             Arrays.stream(rs.getString("target_languages").split(",")).toList(),
             rs.getInt("draft_version"),
             rs.getInt("published_version"),
-            rs.getInt("term_version"));
+            rs.getInt("term_version"),
+            rs.getInt("release_revision"));
+
+    private static final RowMapper<SnapshotRow> SNAPSHOT_MAPPER = (rs, n) -> new SnapshotRow(
+            rs.getLong("document_id"),
+            rs.getInt("published_version"),
+            rs.getString("snapshot_json"),
+            rs.getBoolean("withdrawn"),
+            rs.getString("withdraw_reason"),
+            rs.getObject("withdrawn_at", LocalDateTime.class));
 
     private static final RowMapper<SegmentRow> SEGMENT_MAPPER = (rs, n) -> new SegmentRow(
             rs.getString("segment_id"), rs.getString("source_text"), rs.getInt("source_version"));
@@ -52,13 +63,13 @@ public class TranslationRepository {
         this.jdbc = jdbc;
     }
 
-    /** 插入文档并返回自增 ID，初始草稿版本 1、发布版本 0、术语版本 0。 */
+    /** 插入文档并返回自增 ID，初始草稿版本 1、发布版本 0、术语版本 0、发布目录修订号 0。 */
     public long insertDocument(List<String> targetLanguages) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO document (target_languages, draft_version, published_version, term_version) "
-                            + "VALUES (?, 1, 0, 0)",
+                    "INSERT INTO document (target_languages, draft_version, published_version, term_version, "
+                            + "release_revision) VALUES (?, 1, 0, 0, 0)",
                     new String[]{"document_id"});
             ps.setString(1, String.join(",", targetLanguages));
             return ps;
@@ -73,8 +84,8 @@ public class TranslationRepository {
     /** 按 ID 查询文档并加行级写锁（FOR UPDATE），用于串行化同一文档的写操作。 */
     public Optional<DocumentRow> findDocumentForUpdate(long documentId) {
         List<DocumentRow> rows = jdbc.query(
-                "SELECT document_id, target_languages, draft_version, published_version, term_version "
-                        + "FROM document WHERE document_id = ? FOR UPDATE",
+                "SELECT document_id, target_languages, draft_version, published_version, term_version, "
+                        + "release_revision FROM document WHERE document_id = ? FOR UPDATE",
                 DOCUMENT_MAPPER, documentId);
         return rows.stream().findFirst();
     }
@@ -82,8 +93,8 @@ public class TranslationRepository {
     /** 只读查询文档（不加锁），用于快照查询。 */
     public Optional<DocumentRow> findDocument(long documentId) {
         List<DocumentRow> rows = jdbc.query(
-                "SELECT document_id, target_languages, draft_version, published_version, term_version "
-                        + "FROM document WHERE document_id = ?",
+                "SELECT document_id, target_languages, draft_version, published_version, term_version, "
+                        + "release_revision FROM document WHERE document_id = ?",
                 DOCUMENT_MAPPER, documentId);
         return rows.stream().findFirst();
     }
@@ -240,5 +251,48 @@ public class TranslationRepository {
     public void insertRequestLog(String requestId, String requestHash, int responseStatus, String responseBody) {
         jdbc.update("INSERT INTO request_log (request_id, request_hash, response_status, response_body) "
                 + "VALUES (?, ?, ?, ?)", requestId, requestHash, responseStatus, responseBody);
+    }
+
+    public void updateReleaseRevision(long documentId, int releaseRevision) {
+        jdbc.update("UPDATE document SET release_revision = ? WHERE document_id = ?",
+                releaseRevision, documentId);
+    }
+
+    /** 查询指定发布版本的快照行（含撤回标记）；不存在返回空。 */
+    public Optional<SnapshotRow> findSnapshotRow(long documentId, int publishedVersion) {
+        List<SnapshotRow> rows = jdbc.query(
+                "SELECT document_id, published_version, snapshot_json, withdrawn, withdraw_reason, withdrawn_at "
+                        + "FROM release_snapshot WHERE document_id = ? AND published_version = ?",
+                SNAPSHOT_MAPPER, documentId, publishedVersion);
+        return rows.stream().findFirst();
+    }
+
+    /** 查询全部发布快照，按发布版本号升序，用于发布目录与撤回历史。 */
+    public List<SnapshotRow> listSnapshots(long documentId) {
+        return jdbc.query(
+                "SELECT document_id, published_version, snapshot_json, withdrawn, withdraw_reason, withdrawn_at "
+                        + "FROM release_snapshot WHERE document_id = ? ORDER BY published_version",
+                SNAPSHOT_MAPPER, documentId);
+    }
+
+    /**
+     * 查询当前可用发布：未撤回快照中发布版本号最大的一条。
+     * 单条 SQL 完成过滤与取最大，保证读到一个完整已提交状态，不会短暂指向已撤回版本。
+     */
+    public Optional<SnapshotRow> findLatestActiveSnapshot(long documentId) {
+        List<SnapshotRow> rows = jdbc.query(
+                "SELECT document_id, published_version, snapshot_json, withdrawn, withdraw_reason, withdrawn_at "
+                        + "FROM release_snapshot WHERE document_id = ? AND withdrawn = FALSE "
+                        + "ORDER BY published_version DESC LIMIT 1",
+                SNAPSHOT_MAPPER, documentId);
+        return rows.stream().findFirst();
+    }
+
+    /** 标记撤回：仅更新撤回标记、原因与 UTC 时刻，不修改快照正文。 */
+    public void markWithdrawn(long documentId, int publishedVersion, String reason,
+                              LocalDateTime withdrawnAtUtc) {
+        jdbc.update("UPDATE release_snapshot SET withdrawn = TRUE, withdraw_reason = ?, withdrawn_at = ? "
+                        + "WHERE document_id = ? AND published_version = ?",
+                reason, withdrawnAtUtc, documentId, publishedVersion);
     }
 }

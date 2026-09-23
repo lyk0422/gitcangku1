@@ -238,4 +238,107 @@ class ConcurrencyTest extends AbstractIntegrationTest {
                 "SELECT term_version FROM document WHERE document_id = ?", Integer.class, docId);
         assertThat(termVersion).isEqualTo(1);
     }
+
+    @Test
+    @DisplayName("并发撤回同一版本：仅一个成功，其余 409，目录修订号只推进一次")
+    void concurrentWithdraws() throws Exception {
+        long docId = createDocument(newRequestId(), "[\"en\"]",
+                "[{\"segmentId\":\"s1\",\"sourceText\":\"原文\"}]");
+        submitTranslation(docId, "s1", "en", "alice", "hello", 1, newRequestId());
+        approve(docId, "s1", "en", "bob", 1, newRequestId());
+        assertThat(publish(docId, 2, 0, newRequestId()).status()).isEqualTo(201);
+        // 当前目录修订号 1
+
+        int threads = 4;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch gate = new CountDownLatch(1);
+        List<Future<ApiResult>> futures = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            final int n = i;
+            futures.add(pool.submit(() -> {
+                gate.await();
+                return withdraw(docId, 1, "并发撤回-" + n, 1, newRequestId());
+            }));
+        }
+        gate.countDown();
+        int success = 0;
+        int conflict = 0;
+        for (Future<ApiResult> future : futures) {
+            int status = future.get(30, TimeUnit.SECONDS).status();
+            if (status == 200) {
+                success++;
+            } else if (status == 409) {
+                conflict++;
+            }
+        }
+        pool.shutdown();
+
+        assertThat(success).isEqualTo(1);
+        assertThat(conflict).isEqualTo(threads - 1);
+        // 串行一致：修订号只推进一次，仅一条撤回记录，当前可用为 null
+        Integer releaseRevision = jdbc.queryForObject(
+                "SELECT release_revision FROM document WHERE document_id = ?", Integer.class, docId);
+        assertThat(releaseRevision).isEqualTo(2);
+        Integer withdrawnCount = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM release_snapshot WHERE document_id = ? AND withdrawn = TRUE",
+                Integer.class, docId);
+        assertThat(withdrawnCount).isEqualTo(1);
+        ApiResult current = getJson("/api/documents/" + docId + "/releases/current");
+        assertThat(current.status()).isEqualTo(200);
+        assertThat(current.body().get("snapshot").isNull()).isTrue();
+    }
+
+    @Test
+    @DisplayName("撤回与再次发布并发：串行执行对应一个一致状态，当前可用始终指向完整提交的 v2")
+    void concurrentWithdrawAndRepublish() throws Exception {
+        long docId = createDocument(newRequestId(), "[\"en\"]",
+                "[{\"segmentId\":\"s1\",\"sourceText\":\"原文\"}]");
+        submitTranslation(docId, "s1", "en", "alice", "hello", 1, newRequestId());
+        approve(docId, "s1", "en", "bob", 1, newRequestId());
+        assertThat(publish(docId, 2, 0, newRequestId()).status()).isEqualTo(201);
+        // 当前草稿版本 2、发布版本 1、目录修订号 1
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        CountDownLatch gate = new CountDownLatch(1);
+        Future<ApiResult> withdrawFuture = pool.submit(() -> {
+            gate.await();
+            return withdraw(docId, 1, "撤回 v1", 1, newRequestId());
+        });
+        Future<ApiResult> publishFuture = pool.submit(() -> {
+            gate.await();
+            return publish(docId, 2, 1, newRequestId());
+        });
+        gate.countDown();
+        ApiResult withdrawResult = withdrawFuture.get(30, TimeUnit.SECONDS);
+        ApiResult publishResult = publishFuture.get(30, TimeUnit.SECONDS);
+        pool.shutdown();
+
+        // 发布不校验目录修订号，必然成功；撤回先于发布则成功，否则因修订号过期 409
+        assertThat(publishResult.status()).isEqualTo(201);
+        assertThat(publishResult.body().get("publishedVersion").asInt()).isEqualTo(2);
+        assertThat(withdrawResult.status()).isIn(200, 409);
+
+        boolean withdrawn = withdrawResult.status() == 200;
+        Integer releaseRevision = jdbc.queryForObject(
+                "SELECT release_revision FROM document WHERE document_id = ?", Integer.class, docId);
+        // 初始 0 + 两次发布各加一 + 撤回成功再加一
+        assertThat(releaseRevision).isEqualTo(withdrawn ? 3 : 2);
+        Integer withdrawnCount = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM release_snapshot WHERE document_id = ? AND withdrawn = TRUE",
+                Integer.class, docId);
+        assertThat(withdrawnCount).isEqualTo(withdrawn ? 1 : 0);
+
+        // 当前可用始终是一个完整提交状态：v2 已发布且未撤回，不会指向已撤回的 v1 或为 null
+        ApiResult current = getJson("/api/documents/" + docId + "/releases/current");
+        assertThat(current.status()).isEqualTo(200);
+        assertThat(current.body().get("publishedVersion").asInt()).isEqualTo(2);
+        assertThat(current.body().get("snapshot").get("publishedVersion").asInt()).isEqualTo(2);
+        assertThat(current.body().get("releaseRevision").asInt()).isEqualTo(releaseRevision);
+
+        // 目录与历史一致：两个发布条目，撤回标记与并发结果一致
+        ApiResult catalog = getJson("/api/documents/" + docId + "/releases");
+        assertThat(catalog.body().get("releases")).hasSize(2);
+        assertThat(catalog.body().get("releases").get(0).get("withdrawn").asBoolean()).isEqualTo(withdrawn);
+        assertThat(catalog.body().get("releases").get(1).get("withdrawn").asBoolean()).isFalse();
+    }
 }

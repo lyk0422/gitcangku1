@@ -129,11 +129,33 @@ public class TranslationController {
         return ResponseEntity.ok(translationService.getTermStatus(documentId));
     }
 
-    /** 查询指定发布版本的只读快照。 */
+    /** 查询指定发布版本的只读快照；即使已撤回也返回原始快照，区别于“当前可用”入口。 */
     @GetMapping("/{documentId}/releases/{publishedVersion}")
     public ResponseEntity<String> getRelease(@PathVariable long documentId, @PathVariable int publishedVersion) {
         return ResponseEntity.ok().contentType(MediaType.APPLICATION_JSON)
                 .body(translationService.getRelease(documentId, publishedVersion));
+    }
+
+    /** 撤回指定发布版本：永久有效，不删除快照；修订号过期或已撤回 409，版本不存在 404。 */
+    @PostMapping("/{documentId}/releases/{publishedVersion}/withdraw")
+    public ResponseEntity<String> withdraw(@PathVariable long documentId, @PathVariable int publishedVersion,
+                                           @Valid @RequestBody ApiDtos.WithdrawRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/releases/" + publishedVersion + "/withdraw";
+        return writeExecutor.execute(request.requestId(), hash(operation, request),
+                () -> WriteResult.of(200, translationService.withdraw(documentId, publishedVersion, request)))
+                .toResponseEntity();
+    }
+
+    /** 查询当前可用发布：未撤回版本中编号最大的完整快照；全部撤回或从未发布时快照为 null。 */
+    @GetMapping("/{documentId}/releases/current")
+    public ResponseEntity<ApiDtos.CurrentReleaseResponse> getCurrentRelease(@PathVariable long documentId) {
+        return ResponseEntity.ok(translationService.getCurrentRelease(documentId));
+    }
+
+    /** 查询发布目录与撤回历史：按发布编号排序，含撤回原因与 UTC 时刻。 */
+    @GetMapping("/{documentId}/releases")
+    public ResponseEntity<ApiDtos.ReleaseCatalogResponse> getReleaseCatalog(@PathVariable long documentId) {
+        return ResponseEntity.ok(translationService.getReleaseCatalog(documentId));
     }
 
     /** 计算请求摘要：操作（含路径变量）+ 操作者 + 规范化请求体的 SHA-256。 */

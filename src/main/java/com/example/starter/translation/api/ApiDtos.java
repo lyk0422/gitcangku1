@@ -1,6 +1,7 @@
 package com.example.starter.translation.api;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.databind.JsonNode;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
@@ -65,6 +66,13 @@ public final class ApiDtos {
             @PositiveOrZero(message = "expectedPublishedVersion 不能为负数") int expectedPublishedVersion) {
     }
 
+    /** 撤回请求：原因必填非空，携带期望的发布目录修订号做乐观校验。 */
+    public record WithdrawRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @NotBlank(message = "reason 不能为空") @Size(max = 1024) String reason,
+            @PositiveOrZero(message = "expectedReleaseRevision 不能为负数") int expectedReleaseRevision) {
+    }
+
     /** 术语规则输入：sourceTerm 区分大小写，requiredTranslation 非空。 */
     public record TermRuleInput(
             @NotBlank(message = "sourceTerm 不能为空") @Size(max = 512) String sourceTerm,
@@ -101,7 +109,30 @@ public final class ApiDtos {
     }
 
     /** 发布响应。 */
-    public record PublishResponse(long documentId, int publishedVersion) {
+    public record PublishResponse(long documentId, int publishedVersion, int releaseRevision) {
+    }
+
+    /** 撤回响应：含推进后的发布目录修订号与 UTC 撤回时刻。 */
+    public record WithdrawResponse(long documentId, int publishedVersion, int releaseRevision,
+                                   boolean withdrawn, String withdrawnAt) {
+    }
+
+    /**
+     * 当前可用发布视图：未撤回版本中编号最大的完整快照及发布目录修订号；
+     * 全部撤回或从未发布时 publishedVersion 与 snapshot 均为 null。
+     */
+    public record CurrentReleaseResponse(long documentId, int releaseRevision,
+                                         Integer publishedVersion, JsonNode snapshot) {
+    }
+
+    /** 发布目录条目：按发布编号排序，含撤回标记、撤回原因与 UTC 撤回时刻（未撤回为 null）。 */
+    public record ReleaseEntryView(int publishedVersion, boolean withdrawn,
+                                   String withdrawReason, String withdrawnAt) {
+    }
+
+    /** 发布目录与撤回历史查询响应。 */
+    public record ReleaseCatalogResponse(long documentId, int releaseRevision,
+                                         List<ReleaseEntryView> releases) {
     }
 
     /** 术语规则视图。 */

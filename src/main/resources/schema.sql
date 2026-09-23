@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS document (
     draft_version INT NOT NULL,
     published_version INT NOT NULL,
     term_version INT NOT NULL,
+    release_revision INT NOT NULL DEFAULT 0,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 COMMENT ON TABLE document IS '文档：全局唯一 documentId，含 1~5 种目标语言及草稿/发布/术语版本';
@@ -15,6 +16,7 @@ COMMENT ON COLUMN document.target_languages IS '目标语言列表，逗号分�
 COMMENT ON COLUMN document.draft_version IS '文档草稿版本，从 1 开始；增段落或修改源文/译文/术语时加一';
 COMMENT ON COLUMN document.published_version IS '已发布版本号，从 0 开始，每次成功发布加一';
 COMMENT ON COLUMN document.term_version IS '当前术语版本，从 0 开始（0 表示尚未建立术语版本），每次新增术语版本加一';
+COMMENT ON COLUMN document.release_revision IS '发布目录修订号，从 0 开始，每次成功发布或首次撤回加一；存量文档默认为 0';
 COMMENT ON COLUMN document.created_at IS '创建时间，数据库默认时区';
 
 CREATE TABLE IF NOT EXISTS segment (
@@ -76,13 +78,19 @@ CREATE TABLE IF NOT EXISTS release_snapshot (
     document_id BIGINT NOT NULL,
     published_version INT NOT NULL,
     snapshot_json LONGTEXT NOT NULL,
+    withdrawn BOOLEAN NOT NULL DEFAULT FALSE,
+    withdraw_reason VARCHAR(1024) DEFAULT NULL,
+    withdrawn_at TIMESTAMP DEFAULT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (document_id, published_version)
 );
-COMMENT ON TABLE release_snapshot IS '发布快照：发布时原子生成的完整只读快照，JSON 序列化，不可修改';
+COMMENT ON TABLE release_snapshot IS '发布快照：发布时原子生成的完整只读快照，JSON 序列化，不可修改；撤回仅打标记，不删除或修改快照正文';
 COMMENT ON COLUMN release_snapshot.document_id IS '所属文档 ID';
-COMMENT ON COLUMN release_snapshot.published_version IS '发布版本号，从 1 开始';
+COMMENT ON COLUMN release_snapshot.published_version IS '发布版本号，从 1 开始单调递增，不因撤回复用';
 COMMENT ON COLUMN release_snapshot.snapshot_json IS '快照内容 JSON：全部段落源文及各语言译文、作者、审核人与版本号';
+COMMENT ON COLUMN release_snapshot.withdrawn IS '是否已撤回；撤回永久有效，存量快照默认为 FALSE';
+COMMENT ON COLUMN release_snapshot.withdraw_reason IS '撤回原因，撤回时必填非空；未撤回为 NULL';
+COMMENT ON COLUMN release_snapshot.withdrawn_at IS '撤回时刻，UTC；未撤回为 NULL';
 COMMENT ON COLUMN release_snapshot.created_at IS '发布时间，数据库默认时区';
 
 CREATE TABLE IF NOT EXISTS term_version (

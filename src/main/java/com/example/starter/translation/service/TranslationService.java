@@ -5,13 +5,18 @@ import com.example.starter.translation.api.ApiException;
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
+import com.example.starter.translation.domain.Rows.SnapshotRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
 import com.example.starter.translation.domain.Rows.TranslationRow;
 import com.example.starter.translation.repo.TranslationRepository;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -230,10 +235,67 @@ public class TranslationService {
             throw ApiException.termViolation("译文违反 " + termViolations.size() + " 条术语规则", termViolations);
         }
         int publishedVersion = document.publishedVersion() + 1;
+        int releaseRevision = document.releaseRevision() + 1;
         repository.insertSnapshot(documentId, publishedVersion,
                 buildSnapshotJson(document, publishedVersion, segments, translations, approvals, termRules));
         repository.updatePublishedVersion(documentId, publishedVersion);
-        return new ApiDtos.PublishResponse(documentId, publishedVersion);
+        repository.updateReleaseRevision(documentId, releaseRevision);
+        return new ApiDtos.PublishResponse(documentId, publishedVersion, releaseRevision);
+    }
+
+    /**
+     * 撤回指定发布版本：永久有效，仅打撤回标记并记录原因与 UTC 时刻，不删除或修改快照正文、术语及批准信息；
+     * expectedReleaseRevision 必须等于当前发布目录修订号（不符 409），已撤回重复撤回 409，版本不存在 404；
+     * 成功后发布目录修订号加一，发布编号不复用；撤回非当前版本不改变当前可用指向，但同样推进修订号。
+     */
+    @Transactional
+    public ApiDtos.WithdrawResponse withdraw(long documentId, int publishedVersion,
+                                             ApiDtos.WithdrawRequest request) {
+        DocumentRow document = lockDocument(documentId);
+        SnapshotRow snapshot = repository.findSnapshotRow(documentId, publishedVersion)
+                .orElseThrow(() -> ApiException.notFound(
+                        "发布版本不存在: " + documentId + "/" + publishedVersion));
+        if (document.releaseRevision() != request.expectedReleaseRevision()) {
+            throw ApiException.conflict("发布目录修订号冲突：当前修订号 " + document.releaseRevision()
+                    + "，与期望的 " + request.expectedReleaseRevision() + " 不一致");
+        }
+        if (snapshot.withdrawn()) {
+            throw ApiException.conflict("发布版本已撤回: " + documentId + "/" + publishedVersion);
+        }
+        int releaseRevision = document.releaseRevision() + 1;
+        LocalDateTime withdrawnAt = LocalDateTime.now(ZoneOffset.UTC);
+        repository.markWithdrawn(documentId, publishedVersion, request.reason(), withdrawnAt);
+        repository.updateReleaseRevision(documentId, releaseRevision);
+        return new ApiDtos.WithdrawResponse(documentId, publishedVersion, releaseRevision, true,
+                formatUtc(withdrawnAt));
+    }
+
+    /**
+     * 查询当前可用发布：未撤回版本中编号最大的完整快照及发布目录修订号；
+     * 全部撤回或从未发布时返回 200、快照为 null。直接返回历史快照原文，不按当前源文/术语/批准重新拼装。
+     */
+    @Transactional(readOnly = true)
+    public ApiDtos.CurrentReleaseResponse getCurrentRelease(long documentId) {
+        DocumentRow document = repository.findDocument(documentId)
+                .orElseThrow(() -> ApiException.notFound("文档不存在: " + documentId));
+        return repository.findLatestActiveSnapshot(documentId)
+                .map(snapshot -> new ApiDtos.CurrentReleaseResponse(documentId, document.releaseRevision(),
+                        snapshot.publishedVersion(), readSnapshotJson(snapshot.snapshotJson())))
+                .orElseGet(() -> new ApiDtos.CurrentReleaseResponse(documentId, document.releaseRevision(),
+                        null, null));
+    }
+
+    /** 查询发布目录与撤回历史：按发布编号升序，含撤回原因与 UTC 撤回时刻；从未发布时为空目录。 */
+    @Transactional(readOnly = true)
+    public ApiDtos.ReleaseCatalogResponse getReleaseCatalog(long documentId) {
+        DocumentRow document = repository.findDocument(documentId)
+                .orElseThrow(() -> ApiException.notFound("文档不存在: " + documentId));
+        List<ApiDtos.ReleaseEntryView> releases = repository.listSnapshots(documentId).stream()
+                .map(snapshot -> new ApiDtos.ReleaseEntryView(snapshot.publishedVersion(), snapshot.withdrawn(),
+                        snapshot.withdrawReason(),
+                        snapshot.withdrawnAt() == null ? null : formatUtc(snapshot.withdrawnAt())))
+                .toList();
+        return new ApiDtos.ReleaseCatalogResponse(documentId, document.releaseRevision(), releases);
     }
 
     /** 查询指定发布版本的只读快照 JSON；不存在返回 404。 */
@@ -345,6 +407,20 @@ public class TranslationService {
 
     private static ApiDtos.TermRuleView toRuleView(TermRuleRow rule) {
         return new ApiDtos.TermRuleView(rule.sourceTerm(), rule.language(), rule.requiredTranslation());
+    }
+
+    /** 将存储的快照 JSON 原文解析为响应节点；不重新拼装，保证回退使用的是历史快照本身。 */
+    private JsonNode readSnapshotJson(String snapshotJson) {
+        try {
+            return objectMapper.readTree(snapshotJson);
+        } catch (Exception e) {
+            throw new IllegalStateException("快照反序列化失败", e);
+        }
+    }
+
+    /** 将 UTC 墙钟时间格式化为带 Z 的 ISO-8601 时刻。 */
+    private static String formatUtc(LocalDateTime utcDateTime) {
+        return DateTimeFormatter.ISO_OFFSET_DATE_TIME.format(utcDateTime.atOffset(ZoneOffset.UTC));
     }
 
     /** 生成完整只读快照 JSON：全部段落源文及各语言译文、作者、审核人、版本号与固化的术语版本及规则集。 */

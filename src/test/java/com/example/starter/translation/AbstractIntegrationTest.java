@@ -130,6 +130,14 @@ public abstract class AbstractIntegrationTest {
         return putJson("/api/documents/" + documentId + "/terms", body);
     }
 
+    /** 撤回指定发布版本：携带非空原因与期望的发布目录修订号。 */
+    protected ApiResult withdraw(long documentId, int publishedVersion, String reason,
+                                 int expectedReleaseRevision, String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"reason\":\"" + reason
+                + "\",\"expectedReleaseRevision\":" + expectedReleaseRevision + "}";
+        return postJson("/api/documents/" + documentId + "/releases/" + publishedVersion + "/withdraw", body);
+    }
+
     /** HTTP 响应结果：状态码与 JSON 响应体。 */
     protected record ApiResult(int status, JsonNode body) {
     }
