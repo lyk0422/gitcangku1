@@ -55,4 +55,12 @@ public final class Requests {
     /** 任务完成/取消请求，操作人由 X-Actor-Id 指定且须为当前指挥人。 */
     public record TaskActionRequest(String commandKey) {
     }
+
+    /**
+     * 任务依赖整体替换请求：expectedTaskVersion 为提交时基于的任务版本（必填，乐观并发控制）；
+     * blockerIncidentKeys 为 0~5 个不重复、已存在且非自身的阻塞事件键（重复或依赖自身为 400）。
+     */
+    public record TaskBlockersReplaceRequest(String commandKey, Integer expectedTaskVersion,
+                                             List<String> blockerIncidentKeys) {
+    }
 }

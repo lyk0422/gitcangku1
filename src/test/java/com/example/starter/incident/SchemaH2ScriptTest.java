@@ -108,6 +108,25 @@ class SchemaH2ScriptTest {
                     duplicateBlockerRejected = true;
                 }
                 assertThat(duplicateBlockerRejected).isTrue();
+
+                // 任务版本默认从 1 开始
+                try (ResultSet rs = st.executeQuery(
+                        "SELECT version FROM incident_tasks WHERE id = 1")) {
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getInt("version")).isEqualTo(1);
+                }
+
+                // 修订历史表可追加并查询（不可变历史，仅追加）
+                st.execute("INSERT INTO incident_task_revisions (task_id, operation, actor,"
+                        + " from_version, to_version, blocker_keys, occurred_at) VALUES"
+                        + " (1,'REPLACE','alice',1,2,'[\"IK-1\"]','" + Timestamp.from(now) + "')");
+                try (ResultSet rs = st.executeQuery(
+                        "SELECT operation, to_version FROM incident_task_revisions"
+                                + " WHERE task_id = 1")) {
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getString("operation")).isEqualTo("REPLACE");
+                    assertThat(rs.getInt("to_version")).isEqualTo(2);
+                }
             }
         }
     }

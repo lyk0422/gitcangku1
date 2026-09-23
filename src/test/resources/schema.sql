@@ -83,9 +83,21 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     done_at TIMESTAMP(6) NULL,
     cancelled_by VARCHAR(128) NULL,
     cancelled_at TIMESTAMP(6) NULL,
+    version INT NOT NULL DEFAULT 1,
     created_at TIMESTAMP(6) NOT NULL,
     updated_at TIMESTAMP(6) NOT NULL,
     CONSTRAINT uk_task_key UNIQUE (incident_id, task_key)
+);
+
+CREATE TABLE IF NOT EXISTS incident_task_revisions (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    task_id BIGINT NOT NULL,
+    operation VARCHAR(16) NOT NULL,
+    actor VARCHAR(128) NOT NULL,
+    from_version INT NOT NULL,
+    to_version INT NOT NULL,
+    blocker_keys CLOB NOT NULL,
+    occurred_at TIMESTAMP(6) NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS incident_task_blockers (

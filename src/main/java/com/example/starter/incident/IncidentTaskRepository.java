@@ -52,9 +52,15 @@ public class IncidentTaskRepository {
                 doneAt == null ? null : doneAt.toInstant(),
                 rs.getString("cancelled_by"),
                 cancelledAt == null ? null : cancelledAt.toInstant(),
+                rs.getInt("version"),
                 rs.getTimestamp("created_at").toInstant(),
                 rs.getTimestamp("updated_at").toInstant());
     }
+
+    private static final RowMapper<TaskRevision> REVISION_MAPPER = (rs, n) -> new TaskRevision(
+            rs.getLong("id"), rs.getLong("task_id"), rs.getString("operation"),
+            rs.getString("actor"), rs.getInt("from_version"), rs.getInt("to_version"),
+            rs.getString("blocker_keys"), rs.getTimestamp("occurred_at").toInstant());
 
     /**
      * 依赖图有向边：fromIncidentId（任务所属事件）→ toIncidentId（阻塞事件）。
@@ -63,15 +69,15 @@ public class IncidentTaskRepository {
     }
 
     /**
-     * 插入 OPEN 任务，返回生成主键。(incident_id, task_key) 唯一约束兜底并发重复插入。
+     * 插入 OPEN 任务（版本从 1 开始），返回生成主键。(incident_id, task_key) 唯一约束兜底并发重复插入。
      */
     public long insert(IncidentTask task) {
         KeyHolder keys = new GeneratedKeyHolder();
         jdbc.update(con -> {
             var ps = con.prepareStatement(
                     "INSERT INTO incident_tasks (incident_id, task_key, group_code, title, status,"
-                            + " created_by, done_by, done_at, cancelled_by, cancelled_at,"
-                            + " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                            + " created_by, done_by, done_at, cancelled_by, cancelled_at, version,"
+                            + " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setLong(1, task.incidentId());
             ps.setString(2, task.taskKey());
@@ -83,8 +89,9 @@ public class IncidentTaskRepository {
             ps.setTimestamp(8, task.doneAt() == null ? null : Timestamp.from(task.doneAt()));
             ps.setString(9, task.cancelledBy());
             ps.setTimestamp(10, task.cancelledAt() == null ? null : Timestamp.from(task.cancelledAt()));
-            ps.setTimestamp(11, Timestamp.from(task.createdAt()));
-            ps.setTimestamp(12, Timestamp.from(task.updatedAt()));
+            ps.setInt(11, task.version());
+            ps.setTimestamp(12, Timestamp.from(task.createdAt()));
+            ps.setTimestamp(13, Timestamp.from(task.updatedAt()));
             return ps;
         }, keys);
         return keys.getKey().longValue();
@@ -126,20 +133,20 @@ public class IncidentTaskRepository {
     }
 
     /**
-     * 将 OPEN 任务置为 DONE，记录完成人与 UTC 时刻。
+     * 将 OPEN 任务置为 DONE，记录完成人与 UTC 时刻，并将版本加一。
      */
     public void markDone(long id, String actor, Instant at) {
         jdbc.update("UPDATE incident_tasks SET status = 'DONE', done_by = ?, done_at = ?,"
-                        + " updated_at = ? WHERE id = ?",
+                        + " version = version + 1, updated_at = ? WHERE id = ?",
                 actor, Timestamp.from(at), Timestamp.from(at), id);
     }
 
     /**
-     * 将 OPEN 任务置为 CANCELLED，记录取消人与 UTC 时刻。
+     * 将 OPEN 任务置为 CANCELLED，记录取消人与 UTC 时刻，并将版本加一。
      */
     public void markCancelled(long id, String actor, Instant at) {
         jdbc.update("UPDATE incident_tasks SET status = 'CANCELLED', cancelled_by = ?,"
-                        + " cancelled_at = ?, updated_at = ? WHERE id = ?",
+                        + " cancelled_at = ?, version = version + 1, updated_at = ? WHERE id = ?",
                 actor, Timestamp.from(at), Timestamp.from(at), id);
     }
 
@@ -199,5 +206,39 @@ public class IncidentTaskRepository {
             }
         }
         return false;
+    }
+
+    /**
+     * 删除任务的全部阻塞边（依赖整体替换时先移除旧边；同事务回滚可恢复）。
+     */
+    public void deleteBlockers(long taskId) {
+        jdbc.update("DELETE FROM incident_task_blockers WHERE task_id = ?", taskId);
+    }
+
+    /**
+     * 依赖替换成功后写入新版本号（调用方保证 newVersion = 旧版本 + 1）。
+     */
+    public void updateVersion(long taskId, int newVersion, Instant at) {
+        jdbc.update("UPDATE incident_tasks SET version = ?, updated_at = ? WHERE id = ?",
+                newVersion, Timestamp.from(at), taskId);
+    }
+
+    /**
+     * 追加一条不可变的任务版本修订历史。
+     */
+    public void insertRevision(TaskRevision revision) {
+        jdbc.update("INSERT INTO incident_task_revisions (task_id, operation, actor, from_version,"
+                        + " to_version, blocker_keys, occurred_at) VALUES (?,?,?,?,?,?,?)",
+                revision.taskId(), revision.operation(), revision.actor(), revision.fromVersion(),
+                revision.toVersion(), revision.blockerKeys(),
+                Timestamp.from(revision.occurredAt()));
+    }
+
+    /**
+     * 查询任务的全部版本修订历史，按发生顺序返回。
+     */
+    public List<TaskRevision> listRevisions(long taskId) {
+        return jdbc.query("SELECT * FROM incident_task_revisions WHERE task_id = ? ORDER BY id",
+                REVISION_MAPPER, taskId);
     }
 }

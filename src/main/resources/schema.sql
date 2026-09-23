@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS incident_status_history (
 CREATE TABLE IF NOT EXISTS command_keys (
     id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
     command_key VARCHAR(128) NOT NULL COMMENT '调用方幂等键，全局唯一',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：takeover/transfer_initiate/transfer_accept/action/status/escalation_check/escalation_ack/task_create/task_complete/task_cancel',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：takeover/transfer_initiate/transfer_accept/action/status/escalation_check/escalation_ack/task_create/task_complete/task_cancel/task_blockers_replace',
     request_hash VARCHAR(64) NOT NULL COMMENT '规范化请求参数的 SHA-256 摘要，用于同键改参检测',
     response_status INT NULL COMMENT '首次成功的 HTTP 状态码；事务提交前必写入',
     response_body MEDIUMTEXT NULL COMMENT '首次成功响应 JSON，用于同键同参重放',
@@ -84,10 +84,22 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     done_at TIMESTAMP(6) NULL COMMENT '完成 UTC 时间；仅 DONE 有值，否则为空',
     cancelled_by VARCHAR(128) NULL COMMENT '取消人（操作时的当前指挥人）；仅 CANCELLED 有值，否则为空',
     cancelled_at TIMESTAMP(6) NULL COMMENT '取消 UTC 时间；仅 CANCELLED 有值，否则为空',
+    version INT NOT NULL DEFAULT 1 COMMENT '任务版本，从 1 开始；依赖替换、完成、取消各自首次成功时加一（即使依赖列表未变也加一）',
     created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
     updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间',
     CONSTRAINT uk_task_key UNIQUE (incident_id, task_key)
 ) COMMENT='事件处置任务表';
+
+CREATE TABLE IF NOT EXISTS incident_task_revisions (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    task_id BIGINT NOT NULL COMMENT '所属任务 id，关联 incident_tasks.id',
+    operation VARCHAR(16) NOT NULL COMMENT '版本变更类型：REPLACE 依赖替换 / COMPLETE 完成 / CANCEL 取消',
+    actor VARCHAR(128) NOT NULL COMMENT '操作者（操作时的当前指挥人）',
+    from_version INT NOT NULL COMMENT '变更前任务版本',
+    to_version INT NOT NULL COMMENT '变更后任务版本（= from_version + 1）',
+    blocker_keys MEDIUMTEXT NOT NULL COMMENT '变更生效后排序后的依赖事件键 JSON 数组；空数组表示无依赖',
+    occurred_at TIMESTAMP(6) NOT NULL COMMENT '变更发生 UTC 时间'
+) COMMENT='处置任务版本修订历史表（不可变，仅追加）';
 
 CREATE TABLE IF NOT EXISTS incident_task_blockers (
     id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
