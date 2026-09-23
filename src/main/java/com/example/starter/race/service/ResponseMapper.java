@@ -7,9 +7,12 @@ import com.example.starter.race.api.ResultEntryResponse;
 import com.example.starter.race.api.RunnerResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.StandingResponse;
+import com.example.starter.race.api.TeamMemberResultResponse;
+import com.example.starter.race.api.TeamStandingEntryResponse;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
+import com.example.starter.race.domain.TeamStanding;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
 import com.example.starter.race.persistence.PenaltyRow;
@@ -18,6 +21,7 @@ import com.example.starter.race.persistence.RunnerRow;
 import com.example.starter.race.persistence.SnapshotCheckpointRow;
 import com.example.starter.race.persistence.SnapshotEntryRow;
 import com.example.starter.race.persistence.SnapshotRow;
+import com.example.starter.race.persistence.SnapshotTeamRow;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -95,6 +99,32 @@ final class ResponseMapper {
                 entry.checkpointCount(),
                 entry.coveredCheckpointCount(),
                 entry.missingCheckpoints());
+    }
+
+    /** 实时计算出的团队成绩条目转响应。 */
+    static TeamStandingEntryResponse toTeamEntryResponse(TeamStanding standing) {
+        return new TeamStandingEntryResponse(
+                standing.teamCode(),
+                standing.rank(),
+                standing.status(),
+                standing.totalTimeMs(),
+                standing.members().stream()
+                        .map(member -> new TeamMemberResultResponse(
+                                member.bib(), member.scoring(), member.scoringTimeMs()))
+                        .toList());
+    }
+
+    /** 封榜快照中的团队成绩条目转响应。 */
+    static TeamStandingEntryResponse toTeamEntryResponse(SnapshotTeamRow team) {
+        return new TeamStandingEntryResponse(
+                team.teamCode(),
+                team.rank(),
+                team.status(),
+                team.totalTimeMs(),
+                team.members().stream()
+                        .map(member -> new TeamMemberResultResponse(
+                                member.bib(), member.scoring(), member.scoringTimeMs()))
+                        .toList());
     }
 
     /**

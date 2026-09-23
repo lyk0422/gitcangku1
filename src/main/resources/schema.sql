@@ -95,9 +95,50 @@ CREATE TABLE IF NOT EXISTS result_snapshot_checkpoint (
     CONSTRAINT fk_snapshot_checkpoint_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
 );
 
+CREATE TABLE IF NOT EXISTS team (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    team_code VARCHAR(64) NOT NULL COMMENT '团队代码，同一赛事内唯一',
+    created_at BIGINT NOT NULL COMMENT '创建时间，Unix毫秒时间戳',
+    CONSTRAINT pk_team PRIMARY KEY (race_id, team_code),
+    CONSTRAINT fk_team_race FOREIGN KEY (race_id) REFERENCES race (race_id)
+);
+
+CREATE TABLE IF NOT EXISTS team_member (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    team_code VARCHAR(64) NOT NULL COMMENT '所属团队代码',
+    bib VARCHAR(64) NOT NULL COMMENT '成员参赛号；同一赛事内一名选手最多属于一队',
+    created_at BIGINT NOT NULL COMMENT '配置时间，Unix毫秒时间戳',
+    CONSTRAINT pk_team_member PRIMARY KEY (race_id, bib),
+    CONSTRAINT uk_team_member_team_bib UNIQUE (race_id, team_code, bib),
+    CONSTRAINT fk_team_member_team FOREIGN KEY (race_id, team_code) REFERENCES team (race_id, team_code),
+    CONSTRAINT fk_team_member_runner FOREIGN KEY (race_id, bib) REFERENCES runner (race_id, bib)
+);
+
+CREATE TABLE IF NOT EXISTS result_snapshot_team (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属快照的赛事ID',
+    team_code VARCHAR(64) NOT NULL COMMENT '团队代码',
+    rank_no INT COMMENT '团队名次（从1开始，完全同分并列同名次并跳号，如1、1、3）；INCOMPLETE为NULL',
+    status VARCHAR(16) NOT NULL COMMENT '团队成绩状态：COMPLETE-已产生成绩，INCOMPLETE-RANKED成员不足3人',
+    total_time_ms BIGINT COMMENT '团队总耗时=入选3人计分值合计（毫秒）；INCOMPLETE为NULL',
+    display_order INT NOT NULL COMMENT '展示顺序，从0开始：COMPLETE按名次与teamCode，INCOMPLETE末尾按teamCode',
+    CONSTRAINT pk_snapshot_team PRIMARY KEY (race_id, team_code),
+    CONSTRAINT fk_snapshot_team_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
+);
+
+CREATE TABLE IF NOT EXISTS result_snapshot_team_member (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属快照的赛事ID',
+    team_code VARCHAR(64) NOT NULL COMMENT '所属团队代码',
+    bib VARCHAR(64) NOT NULL COMMENT '成员参赛号',
+    scoring BOOLEAN NOT NULL COMMENT '封榜时是否入选团队计分（队内前3名RANKED成员）',
+    scoring_time_ms BIGINT COMMENT '入选者的计分值（毫秒，即该选手封榜时含有效处罚的总耗时）；未入选为NULL',
+    display_order INT NOT NULL COMMENT '展示顺序，从0开始，按参赛号字典序',
+    CONSTRAINT pk_snapshot_team_member PRIMARY KEY (race_id, team_code, bib),
+    CONSTRAINT fk_snapshot_team_member_team FOREIGN KEY (race_id, team_code) REFERENCES result_snapshot_team (race_id, team_code)
+);
+
 CREATE TABLE IF NOT EXISTS idempotency_record (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求ID（写操作幂等键）',
-    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE',
+    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE/CREATE_TEAM',
     request_digest CHAR(64) NOT NULL COMMENT '请求参数（requestId除外，含expectedVersion）规范化JSON的SHA-256摘要',
     response_status INT NOT NULL COMMENT '原成功请求的HTTP状态码，重放时原样返回',
     response_body TEXT COMMENT '原成功响应体JSON，重放时原样返回',

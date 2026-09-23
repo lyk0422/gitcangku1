@@ -113,6 +113,20 @@ public class RaceController {
         return raceService.getMissingCheckpoints(raceId);
     }
 
+    /** 创建团队并整体配置3~5个成员。 */
+    @PostMapping("/{raceId}/teams")
+    public ResponseEntity<Object> createTeam(
+            @PathVariable String raceId,
+            @Valid @RequestBody CreateTeamRequest request) {
+        return toResponse(raceService.createTeam(raceId, request));
+    }
+
+    /** 查询团队成绩榜（OPEN 实时计算；SEALED 返回封榜快照中的团队成绩）。 */
+    @GetMapping("/{raceId}/teams")
+    public TeamStandingsResponse getTeamStandings(@PathVariable String raceId) {
+        return raceService.getTeamStandings(raceId);
+    }
+
     private ResponseEntity<Object> toResponse(ServiceResult result) {
         return ResponseEntity.status(result.status()).body(result.body());
     }

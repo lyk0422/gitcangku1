@@ -1,0 +1,15 @@
+package com.example.starter.race.persistence;
+
+/**
+ * team 表行记录。
+ *
+ * @param raceId    所属赛事ID
+ * @param teamCode  团队代码，赛事内唯一
+ * @param createdAt 创建时间，Unix毫秒时间戳
+ */
+public record TeamRow(
+        String raceId,
+        String teamCode,
+        long createdAt
+) {
+}

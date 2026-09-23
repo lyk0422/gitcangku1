@@ -5,6 +5,7 @@ import com.example.starter.race.api.CheckpointResponse;
 import com.example.starter.race.api.CheckpointsConfigResponse;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
 import com.example.starter.race.api.CreateRaceRequest;
+import com.example.starter.race.api.CreateTeamRequest;
 import com.example.starter.race.api.MissingCheckpointsResponse;
 import com.example.starter.race.api.RaceResponse;
 import com.example.starter.race.api.RegisterRunnerRequest;
@@ -15,11 +16,16 @@ import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.api.SubmitTimingRequest;
+import com.example.starter.race.api.TeamResponse;
+import com.example.starter.race.api.TeamStandingsResponse;
 import com.example.starter.race.domain.CheckpointRules;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
+import com.example.starter.race.domain.TeamCalculator;
+import com.example.starter.race.domain.TeamMemberResult;
+import com.example.starter.race.domain.TeamStanding;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
 import com.example.starter.race.persistence.IdempotencyRow;
@@ -29,6 +35,10 @@ import com.example.starter.race.persistence.RunnerRow;
 import com.example.starter.race.persistence.SnapshotCheckpointRow;
 import com.example.starter.race.persistence.SnapshotEntryRow;
 import com.example.starter.race.persistence.SnapshotRow;
+import com.example.starter.race.persistence.SnapshotTeamMemberRow;
+import com.example.starter.race.persistence.SnapshotTeamRow;
+import com.example.starter.race.persistence.TeamMemberRow;
+import com.example.starter.race.persistence.TeamRow;
 import com.example.starter.race.persistence.RaceRepository;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -390,6 +400,24 @@ public class RaceServiceImpl implements RaceService {
                             buildSnapshotCheckpoints(raceId, runners, checkpoints, timings);
                     repository.insertSnapshot(new SnapshotRow(raceId, newVersion, now,
                             snapshotEntries, snapshotCheckpoints));
+                    // 团队成绩与个人结果在同一事务固化：成员、计分依据、成绩与名次共享同一赛事版本。
+                    List<TeamStanding> teamStandings =
+                            TeamCalculator.compute(entries, teamViews(raceId));
+                    List<SnapshotTeamRow> snapshotTeams = new ArrayList<>(teamStandings.size());
+                    List<SnapshotTeamMemberRow> snapshotTeamMembers = new ArrayList<>();
+                    for (int order = 0; order < teamStandings.size(); order++) {
+                        TeamStanding standing = teamStandings.get(order);
+                        snapshotTeams.add(new SnapshotTeamRow(raceId, standing.teamCode(),
+                                standing.rank(), standing.status(), standing.totalTimeMs(), order));
+                        for (int memberOrder = 0; memberOrder < standing.members().size();
+                                memberOrder++) {
+                            TeamMemberResult member = standing.members().get(memberOrder);
+                            snapshotTeamMembers.add(new SnapshotTeamMemberRow(raceId,
+                                    standing.teamCode(), member.bib(), member.scoring(),
+                                    member.scoringTimeMs(), memberOrder));
+                        }
+                    }
+                    repository.insertSnapshotTeams(snapshotTeams, snapshotTeamMembers);
                     return ServiceResult.ok(new StandingResponse(
                             raceId, newVersion, RaceStatus.SEALED, now,
                             snapshotEntries.stream().map(ResponseMapper::toEntryResponse).toList()));
@@ -486,6 +514,83 @@ public class RaceServiceImpl implements RaceService {
                 .toList();
         return new MissingCheckpointsResponse(
                 raceId, race.version(), checkpoints.size(), rows);
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult createTeam(String raceId, CreateTeamRequest request) {
+        // 成员集合换序视为同一参数：幂等摘要使用排序后的成员列表。
+        List<String> sortedMembers = request.members().stream().sorted().toList();
+        return withIdempotency(request.requestId(), "CREATE_TEAM",
+                orderedParams(
+                        "raceId", raceId,
+                        "teamCode", request.teamCode(),
+                        "expectedVersion", request.expectedVersion(),
+                        "members", sortedMembers),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    validateTeamMembers(request.members());
+                    // 只要赛事出现任何完赛计时或分段记录，团队成员配置即冻结且不可恢复。
+                    if (repository.countTimedRunners(raceId) > 0
+                            || repository.countTimings(raceId) > 0) {
+                        throw new ConflictException(
+                                "赛事已存在完赛计时或分段记录，团队成员配置已冻结: " + raceId);
+                    }
+                    for (String bib : request.members()) {
+                        requireRunner(raceId, bib);
+                    }
+                    if (repository.findTeam(raceId, request.teamCode()).isPresent()) {
+                        throw new ConflictException("团队代码已存在: " + request.teamCode());
+                    }
+                    for (String bib : request.members()) {
+                        Optional<TeamMemberRow> membership =
+                                repository.findTeamMembership(raceId, bib);
+                        if (membership.isPresent()) {
+                            throw new ConflictException("选手已属于团队 "
+                                    + membership.get().teamCode() + ": " + bib);
+                        }
+                    }
+                    long now = clock.millis();
+                    bumpVersion(race, request.expectedVersion());
+                    try {
+                        repository.insertTeam(raceId, request.teamCode(), now);
+                        repository.insertTeamMembers(request.members().stream()
+                                .map(bib -> new TeamMemberRow(
+                                        raceId, request.teamCode(), bib, now))
+                                .toList());
+                    } catch (DuplicateKeyException ex) {
+                        throw new ConflictException(
+                                "团队代码或成员参赛号冲突: " + request.teamCode());
+                    }
+                    return ServiceResult.created(new TeamResponse(
+                            raceId, request.teamCode(), request.expectedVersion() + 1,
+                            sortedMembers, now));
+                });
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public TeamStandingsResponse getTeamStandings(String raceId) {
+        RaceRow race = repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        if (race.status() == RaceStatus.SEALED) {
+            SnapshotRow snapshot = repository.findSnapshot(raceId)
+                    .orElseThrow(() -> new IllegalStateException(
+                            "赛事已封榜但缺少快照: " + raceId));
+            // 封榜后只返回快照；封榜前无团队的赛事快照中无团队行，返回空团队列表。
+            List<SnapshotTeamRow> teams = repository.findSnapshotTeams(raceId);
+            return new TeamStandingsResponse(raceId, snapshot.version(), RaceStatus.SEALED,
+                    snapshot.sealedAt(),
+                    teams.stream().map(ResponseMapper::toTeamEntryResponse).toList());
+        }
+        List<ResultEntry> entries = ResultCalculator.compute(
+                repository.findRunners(raceId),
+                repository.findPenalties(raceId),
+                repository.findCheckpoints(raceId),
+                repository.findAllTimings(raceId));
+        List<TeamStanding> standings = TeamCalculator.compute(entries, teamViews(raceId));
+        return new TeamStandingsResponse(raceId, race.version(), race.status(), null,
+                standings.stream().map(ResponseMapper::toTeamEntryResponse).toList());
     }
 
     @Override
@@ -723,5 +828,37 @@ public class RaceServiceImpl implements RaceService {
         String message = cause.getMessage();
         return message != null
                 && message.toUpperCase(java.util.Locale.ROOT).contains(constraintName.toUpperCase(java.util.Locale.ROOT));
+    }
+
+    /**
+     * 校验团队成员配置：3~5 个参赛号且互不重复；成员是否已登记、是否已入队在业务校验中判定。
+     */
+    private static void validateTeamMembers(List<String> members) {
+        if (members.size() < 3 || members.size() > 5) {
+            throw new BadRequestException("团队成员数量必须在 3~5 之间");
+        }
+        if (new java.util.HashSet<>(members).size() != members.size()) {
+            throw new BadRequestException("团队成员参赛号不得重复");
+        }
+    }
+
+    /** 汇总赛事当前团队定义（团队代码 + 成员参赛号），供团队成绩实时派生与封榜固化使用。 */
+    private List<TeamCalculator.TeamView> teamViews(String raceId) {
+        Map<String, List<String>> bibsByTeam = new TreeMap<>();
+        for (TeamMemberRow member : repository.findTeamMembers(raceId)) {
+            bibsByTeam.computeIfAbsent(member.teamCode(), key -> new ArrayList<>())
+                    .add(member.bib());
+        }
+        List<TeamCalculator.TeamView> views = new ArrayList<>();
+        for (TeamRow team : repository.findTeams(raceId)) {
+            views.add(new TeamViewRecord(
+                    team.teamCode(), bibsByTeam.getOrDefault(team.teamCode(), List.of())));
+        }
+        return views;
+    }
+
+    /** 团队定义视图实现：团队代码与成员参赛号。 */
+    private record TeamViewRecord(String teamCode, List<String> memberBibs)
+            implements TeamCalculator.TeamView {
     }
 }
