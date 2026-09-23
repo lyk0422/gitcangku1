@@ -159,7 +159,7 @@ class BaggageConcurrencyTest {
 
     private void registerLeg(String legId, String origin, String destination) {
         baggageService.registerLeg(
-                new RegisterLegRequest(UUID.randomUUID().toString(), legId, origin, destination));
+                new RegisterLegRequest(UUID.randomUUID().toString(), legId, origin, destination, null));
     }
 
     private void registerBag(String bagTag, List<String> legIds) {

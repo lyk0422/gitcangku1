@@ -55,6 +55,7 @@ public class BaggageService {
     private static final String BAG_SHORT_UNLOADED = "SHORT_UNLOADED";
     private static final String BAG_RECOVERED = "RECOVERED";
     private static final String BAG_DELIVERED = "DELIVERED";
+    private static final String BAG_MISLOADED = "MISLOADED";
 
     private static final String EVT_REGISTERED = "REGISTERED";
     private static final String EVT_LOADED = "LOADED";
@@ -66,13 +67,15 @@ public class BaggageService {
     private static final RowMapper<LegRow> LEG_MAPPER = (rs, rowNum) -> new LegRow(
             rs.getString("leg_id"), rs.getString("origin"), rs.getString("destination"),
             rs.getString("status"), rs.getInt("version"), rs.getString("sealed_manifest"),
-            rs.getString("arrival_type"), rs.getString("arrival_actual"));
+            rs.getString("arrival_type"), rs.getString("arrival_actual"),
+            getInstant(rs, "departure_time"));
 
     private static final RowMapper<BagRow> BAG_MAPPER = (rs, rowNum) -> new BagRow(
             rs.getString("bag_tag"), rs.getString("current_location"),
             rs.getInt("next_leg_index"), rs.getString("status"), rs.getString("loaded_leg_id"),
             rs.getString("short_leg_id"), rs.getString("short_destination"),
-            getInstant(rs, "short_registered_at"));
+            getInstant(rs, "short_registered_at"),
+            rs.getInt("version"), rs.getInt("path_generation"));
 
     private static final RowMapper<ItineraryItem> ITINERARY_MAPPER = (rs, rowNum) -> new ItineraryItem(
             rs.getInt("seq"), rs.getString("leg_id"), rs.getString("origin"), rs.getString("destination"));
@@ -209,10 +212,13 @@ public class BaggageService {
         if (findLeg(request.legId()) != null) {
             throw ApiException.conflict("航段已存在: " + request.legId());
         }
+        OffsetDateTime departureTime = parseDepartureTime(request.departureTime(), request.legId());
         jdbcTemplate.update(
-                "INSERT INTO leg (leg_id, origin, destination, status, version) VALUES (?, ?, ?, ?, 1)",
-                request.legId(), request.origin(), request.destination(), LEG_OPEN);
-        return new LegResponse(request.legId(), request.origin(), request.destination(), LEG_OPEN, 1);
+                "INSERT INTO leg (leg_id, origin, destination, status, version, departure_time)"
+                        + " VALUES (?, ?, ?, ?, 1, ?)",
+                request.legId(), request.origin(), request.destination(), LEG_OPEN, departureTime);
+        return new LegResponse(request.legId(), request.origin(), request.destination(),
+                LEG_OPEN, 1, request.departureTime());
     }
 
     private BagResponse doRegisterBag(RegisterBagRequest request) {
@@ -273,7 +279,9 @@ public class BaggageService {
         }
         for (BagRow bag : bags) {
             jdbcTemplate.update("INSERT INTO load_record (bag_tag, leg_id) VALUES (?, ?)", bag.bagTag(), legId);
-            jdbcTemplate.update("UPDATE bag SET loaded_leg_id = ? WHERE bag_tag = ?", legId, bag.bagTag());
+            jdbcTemplate.update(
+                    "UPDATE bag SET loaded_leg_id = ?, version = version + 1 WHERE bag_tag = ?",
+                    legId, bag.bagTag());
             insertEvent(bag.bagTag(), EVT_LOADED, legId, leg.origin());
         }
         int newVersion = leg.version() + 1;
@@ -346,7 +354,8 @@ public class BaggageService {
             } else {
                 jdbcTemplate.update(
                         "UPDATE bag SET status = ?, loaded_leg_id = NULL, short_leg_id = ?,"
-                                + " short_destination = ?, short_registered_at = ? WHERE bag_tag = ?",
+                                + " short_destination = ?, short_registered_at = ?, version = version + 1"
+                                + " WHERE bag_tag = ?",
                         BAG_SHORT_UNLOADED, legId, leg.destination(), registeredAt, bagTag);
                 insertEvent(bagTag, EVT_SHORT, legId, bag.currentLocation());
             }
@@ -365,6 +374,10 @@ public class BaggageService {
             throw ApiException.notFound("行李不存在: " + request.bagTag());
         }
         if (!BAG_SHORT_UNLOADED.equals(bag.status())) {
+            if (BAG_MISLOADED.equals(bag.status())) {
+                throw ApiException.unprocessable(
+                        "行李 " + bag.bagTag() + " 存在未结错装事件，须完成改派后再补到");
+            }
             if (BAG_RECOVERED.equals(bag.status()) || BAG_DELIVERED.equals(bag.status())) {
                 throw ApiException.conflict("行李 " + bag.bagTag() + " 已补到，不得再次推进");
             }
@@ -389,8 +402,8 @@ public class BaggageService {
         String newStatus = nextIndex >= total ? BAG_DELIVERED : BAG_RECOVERED;
         jdbcTemplate.update(
                 "UPDATE bag SET current_location = ?, next_leg_index = ?, status = ?, loaded_leg_id = NULL,"
-                        + " short_leg_id = NULL, short_destination = NULL, short_registered_at = NULL"
-                        + " WHERE bag_tag = ?",
+                        + " short_leg_id = NULL, short_destination = NULL, short_registered_at = NULL,"
+                        + " version = version + 1 WHERE bag_tag = ?",
                 request.actualStation(), nextIndex, newStatus, bag.bagTag());
         insertEvent(bag.bagTag(), EVT_RECOVERED, request.missingLegId(), request.actualStation());
         if (BAG_DELIVERED.equals(newStatus)) {
@@ -406,8 +419,8 @@ public class BaggageService {
         int total = itineraryCount(bag.bagTag());
         String status = nextIndex >= total ? BAG_DELIVERED : BAG_IN_TRANSIT;
         jdbcTemplate.update(
-                "UPDATE bag SET current_location = ?, next_leg_index = ?, status = ?, loaded_leg_id = NULL"
-                        + " WHERE bag_tag = ?",
+                "UPDATE bag SET current_location = ?, next_leg_index = ?, status = ?, loaded_leg_id = NULL,"
+                        + " version = version + 1 WHERE bag_tag = ?",
                 destination, nextIndex, status, bag.bagTag());
         insertEvent(bag.bagTag(), EVT_UNLOADED, legId, destination);
         if (BAG_DELIVERED.equals(status)) {
@@ -416,6 +429,10 @@ public class BaggageService {
     }
 
     private void validateLoadable(BagRow bag, LegRow leg) {
+        if (BAG_MISLOADED.equals(bag.status())) {
+            throw ApiException.unprocessable(
+                    "行李 " + bag.bagTag() + " 存在未结错装事件，改派确认前不得装载");
+        }
         if (BAG_SHORT_UNLOADED.equals(bag.status())) {
             throw ApiException.unprocessable(
                     "行李 " + bag.bagTag() + " 处于短卸状态，须先补到才能装载后续航段");
@@ -443,6 +460,19 @@ public class BaggageService {
         }
     }
 
+    /** 解析可选的航段出发时间（ISO-8601，如 2026-09-23T08:00:00Z），为空表示未登记。 */
+    private static OffsetDateTime parseDepartureTime(String departureTime, String legId) {
+        if (departureTime == null || departureTime.isBlank()) {
+            return null;
+        }
+        try {
+            return OffsetDateTime.parse(departureTime);
+        } catch (Exception ex) {
+            throw ApiException.unprocessable(
+                    "航段 " + legId + " 出发时间格式非法: " + departureTime);
+        }
+    }
+
     private LegRow findLeg(String legId) {
         List<LegRow> rows = jdbcTemplate.query(legSelect(false), LEG_MAPPER, legId);
         return rows.isEmpty() ? null : rows.get(0);
@@ -458,7 +488,7 @@ public class BaggageService {
 
     private static String legSelect(boolean forUpdate) {
         return "SELECT leg_id, origin, destination, status, version, sealed_manifest,"
-                + " arrival_type, arrival_actual FROM leg WHERE leg_id = ?"
+                + " arrival_type, arrival_actual, departure_time FROM leg WHERE leg_id = ?"
                 + (forUpdate ? " FOR UPDATE" : "");
     }
 
@@ -474,7 +504,8 @@ public class BaggageService {
 
     private static String bagSelect(boolean forUpdate) {
         return "SELECT bag_tag, current_location, next_leg_index, status, loaded_leg_id,"
-                + " short_leg_id, short_destination, short_registered_at FROM bag WHERE bag_tag = ?"
+                + " short_leg_id, short_destination, short_registered_at, version, path_generation"
+                + " FROM bag WHERE bag_tag = ?"
                 + (forUpdate ? " FOR UPDATE" : "");
     }
 
@@ -521,7 +552,7 @@ public class BaggageService {
                 bag.status(), bag.loadedLegId(), toItinerary(bag.bagTag()),
                 bag.shortLegId(), bag.shortDestination(),
                 bag.shortRegisteredAt() == null ? null : bag.shortRegisteredAt().toString(),
-                toEvents(bag.bagTag()));
+                toEvents(bag.bagTag()), bag.version(), bag.pathGeneration());
     }
 
     private static Instant getInstant(java.sql.ResultSet rs, String column) throws java.sql.SQLException {
@@ -552,12 +583,13 @@ public class BaggageService {
 
     private record LegRow(String legId, String origin, String destination,
                           String status, int version, String sealedManifest,
-                          String arrivalType, String arrivalActual) {
+                          String arrivalType, String arrivalActual, Instant departureTime) {
     }
 
     private record BagRow(String bagTag, String currentLocation, int nextLegIndex,
                           String status, String loadedLegId, String shortLegId,
-                          String shortDestination, Instant shortRegisteredAt) {
+                          String shortDestination, Instant shortRegisteredAt,
+                          int version, int pathGeneration) {
     }
 
     /** 装载幂等摘要参数：bagTags 已排序，顺序差异不视为异参。 */

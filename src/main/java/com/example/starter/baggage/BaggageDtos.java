@@ -19,7 +19,8 @@ public final class BaggageDtos {
             @NotBlank(message = "requestId 不能为空") String requestId,
             @NotBlank(message = "legId 不能为空") String legId,
             @NotBlank(message = "origin 不能为空") String origin,
-            @NotBlank(message = "destination 不能为空") String destination) {
+            @NotBlank(message = "destination 不能为空") String destination,
+            String departureTime) {
     }
 
     /** 登记行李请求：legIds 为 1~5 个有序航段。 */
@@ -67,7 +68,7 @@ public final class BaggageDtos {
 
     /** 航段响应。 */
     public record LegResponse(String legId, String origin, String destination,
-                              String status, int version) {
+                              String status, int version, String departureTime) {
     }
 
     /** 行程明细项。 */
@@ -83,7 +84,7 @@ public final class BaggageDtos {
     public record BagResponse(String bagTag, String currentLocation, int nextLegIndex,
                               String status, String loadedLegId, List<ItineraryItem> itinerary,
                               String shortLegId, String shortDestination, String shortRegisteredAt,
-                              List<TraceEvent> events) {
+                              List<TraceEvent> events, int version, int pathGeneration) {
     }
 
     /** 批量装载响应。 */
