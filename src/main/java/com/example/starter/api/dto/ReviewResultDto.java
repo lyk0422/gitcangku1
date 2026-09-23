@@ -4,6 +4,7 @@ import java.util.List;
 
 /**
  * 审核结果。历史查询保留原结论；当前查询在版本不再匹配时 conclusion 为 STALE。
+ * 快照同时保存审核时航线整体窗口与各命中区域窗口（全时为 null），历史不随后续改窗改变。
  *
  * @param reviewId        审核记录唯一标识（不可变）
  * @param routeId         航线标识
@@ -12,6 +13,8 @@ import java.util.List;
  * @param conclusion      CLEAR / BLOCKED / STALE
  * @param hitZoneIds      BLOCKED 时命中的全部 zoneId（字典序去重），否则为空列表
  * @param pointsSnapshot  审核时不可变的航点快照
+ * @param routeWindow     审核时航线整体飞行窗口；null 表示全时
+ * @param zoneWindows     审核时各命中区域有效窗口快照（zoneId -> 窗口，全时值为 null）
  * @param current         仅当前查询返回：当前航线/空域是否仍与审核版本匹配
  */
 public record ReviewResultDto(
@@ -22,5 +25,7 @@ public record ReviewResultDto(
         String conclusion,
         List<String> hitZoneIds,
         List<RoutePointDto> pointsSnapshot,
+        TimeWindowDto routeWindow,
+        java.util.Map<String, TimeWindowDto> zoneWindows,
         Boolean current) {
 }

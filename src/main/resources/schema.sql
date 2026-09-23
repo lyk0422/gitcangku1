@@ -24,16 +24,20 @@ CREATE TABLE IF NOT EXISTS no_fly_zone (
     y_max            INT NOT NULL COMMENT '矩形上边界（含），单位米，y_min < y_max',
     status           VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE 有效参与审核；REVOKED 已撤销不参与审核',
     created_version  BIGINT NOT NULL COMMENT '创建生效时的全局空域版本',
-    revoked_version  BIGINT NULL COMMENT '撤销生效时的全局空域版本；NULL 表示仍有效'
-) COMMENT = '禁飞区（非退化轴对齐闭矩形，只能创建或撤销）';
+    revoked_version  BIGINT NULL COMMENT '撤销生效时的全局空域版本；NULL 表示仍有效',
+    window_start     BIGINT NULL COMMENT '有效窗口起点 UTC 毫秒，左闭；与 window_end 同时为 NULL 表示全时有效',
+    window_end       BIGINT NULL COMMENT '有效窗口终点 UTC 毫秒，右开；必须与 window_start 成对且严格大于起点'
+) COMMENT = '禁飞区（非退化轴对齐闭矩形，可选 UTC 毫秒半开有效窗口，只能创建或撤销）';
 
 -- 航线当前状态：routeId 唯一，版本从 1 开始，替换成功加一
 -- touch 仅用于审核事务对该行产生真实更新以加行级写锁，与替换操作互斥
 CREATE TABLE IF NOT EXISTS route (
-    route_id  VARCHAR(64) PRIMARY KEY COMMENT '航线唯一标识',
-    version   INT NOT NULL COMMENT '当前航线版本，初始 1，每次成功替换加一',
-    touch     BIGINT NOT NULL COMMENT '仅用于审核事务加行级写锁的计数器，无业务含义'
-) COMMENT = '航线当前版本状态';
+    route_id      VARCHAR(64) PRIMARY KEY COMMENT '航线唯一标识',
+    version       INT NOT NULL COMMENT '当前航线版本，初始 1，每次成功替换加一（仅窗口改变也加一）',
+    touch         BIGINT NOT NULL COMMENT '仅用于审核事务加行级写锁的计数器，无业务含义',
+    window_start  BIGINT NULL COMMENT '整条航线统一飞行窗口起点 UTC 毫秒，左闭；与 window_end 同时为 NULL 表示全时',
+    window_end    BIGINT NULL COMMENT '整条航线统一飞行窗口终点 UTC 毫秒，右开；必须与 window_start 成对且严格大于起点'
+) COMMENT = '航线当前版本状态（可选整条航线统一 UTC 毫秒半开飞行窗口）';
 
 -- 航线点（当前版本，2~50 个，按 seq 顺序连接）
 CREATE TABLE IF NOT EXISTS route_point (
@@ -53,6 +57,8 @@ CREATE TABLE IF NOT EXISTS review (
     conclusion        VARCHAR(16) NOT NULL COMMENT '保存时的原结论：CLEAR 通过或 BLOCKED 命中，永不改变',
     hit_zone_ids      CLOB NOT NULL COMMENT '命中的全部 zoneId，字典序去重后逗号拼接；未命中为空串',
     points_snapshot   VARCHAR(4000) NOT NULL COMMENT '审核时航点不可变快照，格式 x,y;x,y',
+    route_window      VARCHAR(64) NOT NULL COMMENT '审核时航线整体飞行窗口快照 start,end；空串表示全时',
+    zone_windows      CLOB NOT NULL COMMENT '与 hit_zone_ids 按序对齐的命中区域窗口快照 start:end，分号分隔；空项表示该区域全时',
     request_id        VARCHAR(64) NOT NULL COMMENT '提交审核的写操作请求标识',
     created_at        BIGINT NOT NULL COMMENT '创建时间，epoch 毫秒（UTC）'
 ) COMMENT = '审核不可变结果';

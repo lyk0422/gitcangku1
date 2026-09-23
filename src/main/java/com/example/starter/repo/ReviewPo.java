@@ -1,6 +1,7 @@
 package com.example.starter.repo;
 
 import com.example.starter.domain.Point;
+import com.example.starter.domain.TimeWindow;
 
 import java.util.List;
 
@@ -14,10 +15,13 @@ import java.util.List;
  * @param conclusion      CLEAR / BLOCKED
  * @param hitZoneIds      命中 zoneId（字典序去重）
  * @param pointsSnapshot  审核时航点不可变快照
+ * @param routeWindow     审核时航线整体飞行窗口快照；null 表示全时
+ * @param zoneWindows     与 hitZoneIds 按序对齐的各命中区域有效窗口快照；元素 null 表示该区域全时
  * @param requestId       提交审核的请求标识
  * @param createdAt       创建时间（epoch 毫秒）
  */
 public record ReviewPo(String reviewId, String routeId, int routeVersion, long airspaceVersion,
                        String conclusion, List<String> hitZoneIds, List<Point> pointsSnapshot,
+                       TimeWindow routeWindow, List<TimeWindow> zoneWindows,
                        String requestId, long createdAt) {
 }

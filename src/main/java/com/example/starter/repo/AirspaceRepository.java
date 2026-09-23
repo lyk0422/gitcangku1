@@ -1,5 +1,6 @@
 package com.example.starter.repo;
 
+import com.example.starter.domain.TimeWindow;
 import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
@@ -19,6 +20,10 @@ public class AirspaceRepository {
         this.jdbc = jdbc;
     }
 
+    private static final String ZONE_COLUMNS =
+            "zone_id, x_min, y_min, x_max, y_max, status, created_version, revoked_version, "
+                    + "window_start, window_end";
+
     private static final RowMapper<ZonePo> ZONE_MAPPER = (rs, n) -> new ZonePo(
             rs.getString("zone_id"),
             rs.getInt("x_min"),
@@ -27,7 +32,18 @@ public class AirspaceRepository {
             rs.getInt("y_max"),
             rs.getString("status"),
             rs.getLong("created_version"),
-            (Long) rs.getObject("revoked_version"));
+            (Long) rs.getObject("revoked_version"),
+            readWindow(rs));
+
+    /** 读取成对窗口列；两端都为 NULL 表示全时有效。 */
+    private static TimeWindow readWindow(java.sql.ResultSet rs) throws java.sql.SQLException {
+        Long start = (Long) rs.getObject("window_start");
+        Long end = (Long) rs.getObject("window_end");
+        if (start == null && end == null) {
+            return null;
+        }
+        return new TimeWindow(start == null ? 0L : start, end == null ? 0L : end);
+    }
 
     /** 读取当前全局空域版本（单行）。 */
     public long getGlobalVersion() {
@@ -40,8 +56,8 @@ public class AirspaceRepository {
     public ZonePo findZone(String zoneId) {
         try {
             return jdbc.queryForObject(
-                    "SELECT zone_id, x_min, y_min, x_max, y_max, status, created_version, revoked_version "
-                            + "FROM no_fly_zone WHERE zone_id = ?", ZONE_MAPPER, zoneId);
+                    "SELECT " + ZONE_COLUMNS + " FROM no_fly_zone WHERE zone_id = ?",
+                    ZONE_MAPPER, zoneId);
         } catch (EmptyResultDataAccessException ex) {
             return null;
         }
@@ -50,18 +66,28 @@ public class AirspaceRepository {
     /** 查询全部有效（ACTIVE）禁飞区。 */
     public List<ZonePo> findActiveZones() {
         return jdbc.query(
-                "SELECT zone_id, x_min, y_min, x_max, y_max, status, created_version, revoked_version "
-                        + "FROM no_fly_zone WHERE status = 'ACTIVE' ORDER BY zone_id",
+                "SELECT " + ZONE_COLUMNS + " FROM no_fly_zone WHERE status = 'ACTIVE' "
+                        + "ORDER BY zone_id",
                 ZONE_MAPPER);
     }
 
     /** 创建禁飞区（调用方负责事务与版本递增）。 */
     public void insertZone(ZonePo zone) {
         jdbc.update("INSERT INTO no_fly_zone "
-                        + "(zone_id, x_min, y_min, x_max, y_max, status, created_version, revoked_version) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        + "(zone_id, x_min, y_min, x_max, y_max, status, created_version, "
+                        + "revoked_version, window_start, window_end) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 zone.zoneId(), zone.xMin(), zone.yMin(), zone.xMax(), zone.yMax(),
-                zone.status(), zone.createdVersion(), zone.revokedVersion());
+                zone.status(), zone.createdVersion(), zone.revokedVersion(),
+                windowStart(zone.window()), windowEnd(zone.window()));
+    }
+
+    private static Long windowStart(TimeWindow window) {
+        return window == null ? null : window.startUtcMillis();
+    }
+
+    private static Long windowEnd(TimeWindow window) {
+        return window == null ? null : window.endUtcMillis();
     }
 
     /** 撤销禁飞区并记录撤销生效版本（调用方负责事务与版本递增）。 */

@@ -204,6 +204,86 @@ class AirspaceReviewControllerIT {
     }
 
     @Test
+    @DisplayName("限时窗口：重叠 BLOCKED、仅端点相接 CLEAR、非法窗口 400、结果回显窗口")
+    void timeWindowFlowOverHttp() throws Exception {
+        // 建航线，整体窗口 [1500,2500)
+        mockMvc.perform(post("/api/airspace/routes")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"w1","requestId":"req-w-route",
+                                 "points":[{"x":0,"y":10},{"x":100,"y":10}],
+                                 "window":{"startUtcMillis":1500,"endUtcMillis":2500}}"""))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.version").value(1))
+                .andExpect(jsonPath("$.data.window.startUtcMillis").value(1500))
+                .andExpect(jsonPath("$.data.window.endUtcMillis").value(2500));
+
+        // 建区域，空间命中，有效窗口 [1000,2000) 与航线窗口正长度重叠
+        mockMvc.perform(post("/api/airspace/zones")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"zoneId":"wz","xMin":40,"yMin":5,"xMax":60,"yMax":15,
+                                 "window":{"startUtcMillis":1000,"endUtcMillis":2000},
+                                 "requestId":"req-w-zone"}"""))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.airspaceVersion").value(1))
+                .andExpect(jsonPath("$.data.window.startUtcMillis").value(1000));
+
+        // 空域版本 1、航线版本 1：时空均相交 → BLOCKED，快照含双方窗口
+        mockMvc.perform(post("/api/airspace/reviews")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"w1","routeVersion":1,"airspaceVersion":1,
+                                 "requestId":"req-w-review-blocked"}"""))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.conclusion").value("BLOCKED"))
+                .andExpect(jsonPath("$.data.hitZoneIds[0]").value("wz"))
+                .andExpect(jsonPath("$.data.routeWindow.startUtcMillis").value(1500))
+                .andExpect(jsonPath("$.data.zoneWindows.wz.startUtcMillis").value(1000));
+
+        // 仅窗口替换：起点等于终点非法 → 400
+        mockMvc.perform(post("/api/airspace/routes/replace")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"w1","expectedVersion":1,
+                                 "points":[{"x":0,"y":10},{"x":100,"y":10}],
+                                 "window":{"startUtcMillis":3000,"endUtcMillis":3000},
+                                 "requestId":"req-w-bad-window"}"""))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("ROUTE_WINDOW_INVALID"));
+
+        // 单侧窗口（缺 endUtcMillis）→ 400 校验失败
+        mockMvc.perform(post("/api/airspace/zones")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"zoneId":"wz2","xMin":40,"yMin":5,"xMax":60,"yMax":15,
+                                 "window":{"startUtcMillis":1000},
+                                 "requestId":"req-w-half-window"}"""))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("VALIDATION_FAILED"));
+
+        // 合法改期到 [2000,3000)：与区域窗口仅端点相接 → 版本 2，审核 CLEAR
+        mockMvc.perform(post("/api/airspace/routes/replace")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"w1","expectedVersion":1,
+                                 "points":[{"x":0,"y":10},{"x":100,"y":10}],
+                                 "window":{"startUtcMillis":2000,"endUtcMillis":3000},
+                                 "requestId":"req-w-reschedule"}"""))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.version").value(2));
+        mockMvc.perform(post("/api/airspace/reviews")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"w1","routeVersion":2,"airspaceVersion":1,
+                                 "requestId":"req-w-review-clear"}"""))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.conclusion").value("CLEAR"))
+                .andExpect(jsonPath("$.data.hitZoneIds").isArray())
+                .andExpect(jsonPath("$.data.hitZoneIds").isEmpty());
+    }
+
+    @Test
     @DisplayName("参数与资源错误：400 校验失败、404 资源不存在、撤销两次 409")
     void validationAndNotFoundOverHttp() throws Exception {
         // 坐标越界 → 400（Bean Validation）
