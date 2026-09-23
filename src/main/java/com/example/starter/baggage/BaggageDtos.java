@@ -65,6 +65,16 @@ public final class BaggageDtos {
             @NotBlank(message = "actualStation 不能为空") String actualStation) {
     }
 
+    /** 剩余行程改派请求：1~5 个有序新航段替换全部待乘后缀，expectedRouteVersion 为行李当前行程版本。 */
+    public record RerouteRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotBlank(message = "bagTag 不能为空") String bagTag,
+            @NotNull(message = "expectedRouteVersion 不能为空") Integer expectedRouteVersion,
+            @NotNull(message = "newLegIds 不能为空")
+            @Size(min = 1, max = 5, message = "新后缀航段数必须为 1~5")
+            List<@NotBlank(message = "航段不能为空") String> newLegIds) {
+    }
+
     /** 航段响应。 */
     public record LegResponse(String legId, String origin, String destination,
                               String status, int version) {
@@ -79,11 +89,11 @@ public final class BaggageDtos {
                              String location, String eventTime) {
     }
 
-    /** 行李响应：含完整事件轨迹。 */
+    /** 行李响应：含完整事件轨迹与当前行程版本。 */
     public record BagResponse(String bagTag, String currentLocation, int nextLegIndex,
                               String status, String loadedLegId, List<ItineraryItem> itinerary,
                               String shortLegId, String shortDestination, String shortRegisteredAt,
-                              List<TraceEvent> events) {
+                              int routeVersion, List<TraceEvent> events) {
     }
 
     /** 批量装载响应。 */
@@ -106,6 +116,23 @@ public final class BaggageDtos {
     /** 补到响应。 */
     public record RecoverResponse(String bagTag, String status, String currentLocation,
                                   int nextLegIndex, String recoveredLegId) {
+    }
+
+    /** 改派响应：返回改派后的行程版本与完整行程。 */
+    public record RerouteResponse(String bagTag, int routeVersion, int nextLegIndex,
+                                  String currentLocation, String status,
+                                  List<ItineraryItem> itinerary) {
+    }
+
+    /** 改派历史项：记录单次改派前后完整行程、版本与 UTC 时刻。 */
+    public record RerouteHistoryItem(int versionFrom, int versionTo, int nextLegIndex,
+                                     List<ItineraryItem> beforeItinerary,
+                                     List<ItineraryItem> afterItinerary, String reroutedAt) {
+    }
+
+    /** 改派历史响应：按版本升序。 */
+    public record RerouteHistoryResponse(String bagTag, int routeVersion,
+                                         List<RerouteHistoryItem> history) {
     }
 
     /** 封舱清单查询响应。 */

@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS bag (
     short_leg_id        VARCHAR(64)  NULL COMMENT '短卸缺失航段标识，仅 SHORT_UNLOADED 状态非 NULL',
     short_destination   VARCHAR(64)  NULL COMMENT '短卸应到站点代码，仅 SHORT_UNLOADED 状态非 NULL',
     short_registered_at TIMESTAMP WITH TIME ZONE NULL COMMENT '短卸登记时刻（UTC），仅 SHORT_UNLOADED 状态非 NULL',
+    route_version       INT          NOT NULL DEFAULT 1 COMMENT '行程版本：初始 1，每次剩余行程改派成功后加一，用于乐观并发校验',
     created_at          TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     PRIMARY KEY (bag_tag)
 );
@@ -53,7 +54,7 @@ CREATE TABLE IF NOT EXISTS bag_event (
     id         BIGINT AUTO_INCREMENT NOT NULL COMMENT '事件自增主键',
     bag_tag    VARCHAR(64)  NOT NULL COMMENT '行李牌号',
     seq        INT          NOT NULL COMMENT '该行李内事件顺序，0 起递增',
-    event_type VARCHAR(32)  NOT NULL COMMENT '事件类型：REGISTERED 登记/LOADED 装载/UNLOADED 到达卸下/SHORT_UNLOADED 短卸/RECOVERED 补到/DELIVERED 交付',
+    event_type VARCHAR(32)  NOT NULL COMMENT '事件类型：REGISTERED 登记/LOADED 装载/UNLOADED 到达卸下/SHORT_UNLOADED 短卸/RECOVERED 补到/DELIVERED 交付/REROUTED 剩余行程改派',
     leg_id     VARCHAR(64)  NULL COMMENT '关联航段标识，与航段无关的事件为 NULL',
     location   VARCHAR(64)  NULL COMMENT '事件发生后行李所在站点代码',
     event_time TIMESTAMP WITH TIME ZONE NOT NULL COMMENT '事件发生时刻（UTC）',
@@ -61,10 +62,24 @@ CREATE TABLE IF NOT EXISTS bag_event (
     UNIQUE (bag_tag, seq)
 );
 
+-- 改派历史：每次成功的剩余行程改派追加一行，记录改派前后完整行程与版本快照（不可重写）
+CREATE TABLE IF NOT EXISTS reroute_history (
+    id               BIGINT AUTO_INCREMENT NOT NULL COMMENT '改派历史自增主键',
+    bag_tag          VARCHAR(64)  NOT NULL COMMENT '行李牌号',
+    version_from     INT          NOT NULL COMMENT '改派前行程版本（初始为 1）',
+    version_to       INT          NOT NULL COMMENT '改派后行程版本（version_from + 1）',
+    before_itinerary CLOB         NOT NULL COMMENT '改派前完整行程只读快照（JSON 数组，含 seq/legId/origin/destination）',
+    after_itinerary  CLOB         NOT NULL COMMENT '改派后完整行程只读快照（JSON 数组，含 seq/legId/origin/destination）',
+    next_leg_index   INT          NOT NULL COMMENT '改派时的待乘下标：前缀长度，改派不推进该下标',
+    rerouted_at      TIMESTAMP WITH TIME ZONE NOT NULL COMMENT '改派提交时刻（UTC）',
+    PRIMARY KEY (id),
+    UNIQUE (bag_tag, version_to)
+);
+
 -- 幂等去重：仅记录成功请求；同 requestId 同参数重放原结果，异参数返回 409
 CREATE TABLE IF NOT EXISTS request_log (
     request_id      VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
-    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER',
+    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER/REROUTE',
     request_hash    VARCHAR(64)  NOT NULL COMMENT '请求参数（不含 requestId）的 SHA-256 摘要',
     response_status INT          NOT NULL COMMENT '原成功响应的 HTTP 状态码',
     response_body   CLOB         NOT NULL COMMENT '原成功响应体（JSON）',
