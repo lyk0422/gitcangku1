@@ -2,6 +2,8 @@ package com.example.starter.repo;
 
 import com.example.starter.domain.ArtifactVersion;
 import com.example.starter.domain.DependencyRange;
+import com.example.starter.domain.OptionalDecision;
+import com.example.starter.domain.Platforms;
 import com.example.starter.domain.RepositorySnapshot;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.support.GeneratedKeyHolder;
@@ -13,13 +15,14 @@ import java.sql.Statement;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
 /**
- * 仓库数据访问：制品、依赖、锁文件、仓库版本与幂等记录。
+ * 仓库数据访问：制品、依赖、锁文件（含目标平台与可选依赖判定）、仓库版本与幂等记录。
  *
  * <p>所有多语句业务操作均在 Service 层事务内执行；写事务通过
  * {@code SELECT ... FOR UPDATE} 锁定单行仓库版本表实现串行化，
@@ -56,24 +59,29 @@ public class RepositoryDao {
      */
     public RepositorySnapshot loadSnapshot() {
         List<ArtifactRow> rows = jdbcTemplate.query(
-                "SELECT id, name, version, withdrawn FROM artifact ORDER BY name ASC, version DESC",
+                "SELECT id, name, version, withdrawn, platforms FROM artifact "
+                        + "ORDER BY name ASC, version DESC",
                 (rs, n) -> new ArtifactRow(rs.getLong("id"), rs.getString("name"),
-                        rs.getInt("version"), rs.getInt("withdrawn") == 1));
+                        rs.getInt("version"), rs.getInt("withdrawn") == 1,
+                        parsePlatforms(rs.getString("platforms"))));
 
         List<DepRow> depRows = jdbcTemplate.query(
-                "SELECT artifact_id, name, minimum_version, maximum_version FROM artifact_dependency",
+                "SELECT artifact_id, name, minimum_version, maximum_version, optional "
+                        + "FROM artifact_dependency",
                 (rs, n) -> new DepRow(rs.getLong("artifact_id"), rs.getString("name"),
-                        rs.getInt("minimum_version"), rs.getInt("maximum_version")));
+                        rs.getInt("minimum_version"), rs.getInt("maximum_version"),
+                        rs.getInt("optional") == 1));
         Map<Long, List<DependencyRange>> depsByArtifact = depRows.stream()
                 .collect(Collectors.groupingBy(DepRow::artifactId,
-                        Collectors.mapping(d -> new DependencyRange(d.name(), d.minimumVersion(), d.maximumVersion()),
+                        Collectors.mapping(d -> new DependencyRange(d.name(), d.minimumVersion(),
+                                d.maximumVersion(), d.optional()),
                                 Collectors.toList())));
 
         Map<String, List<ArtifactVersion>> artifacts = new LinkedHashMap<>();
         for (ArtifactRow row : rows) {
             List<DependencyRange> deps = depsByArtifact.getOrDefault(row.id(), List.of());
             ArtifactVersion version = new ArtifactVersion(row.id(), row.name(), row.version(),
-                    row.withdrawn(), List.copyOf(deps));
+                    row.withdrawn(), row.platforms(), List.copyOf(deps));
             artifacts.computeIfAbsent(row.name(), k -> new ArrayList<>()).add(version);
         }
         return new RepositorySnapshot(getRepositoryVersion(), Map.copyOf(artifacts));
@@ -101,16 +109,19 @@ public class RepositoryDao {
         return count == null ? 0 : count;
     }
 
-    /** 新增制品版本，返回自增主键。 */
-    public long insertArtifact(String name, int version, Instant createdAt) {
+    /** 新增制品版本（含平台集合），返回自增主键。 */
+    public long insertArtifact(String name, int version, List<String> platforms, Instant createdAt) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
+        String platformValue = String.join(",", platforms);
         jdbcTemplate.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO artifact (name, version, withdrawn, created_at) VALUES (?, ?, 0, ?)",
+                    "INSERT INTO artifact (name, version, withdrawn, platforms, created_at) "
+                            + "VALUES (?, ?, 0, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, name);
             ps.setInt(2, version);
-            ps.setTimestamp(3, Timestamp.from(createdAt));
+            ps.setString(3, platformValue);
+            ps.setTimestamp(4, Timestamp.from(createdAt));
             return ps;
         }, keyHolder);
         Number key = keyHolder.getKey();
@@ -120,32 +131,38 @@ public class RepositoryDao {
         return key.longValue();
     }
 
-    /** 为制品版本写入一条依赖声明。 */
-    public void insertDependency(long artifactId, String name, int minimumVersion, int maximumVersion) {
+    /** 为制品版本写入一条依赖声明（含 optional 标记）。 */
+    public void insertDependency(long artifactId, String name, int minimumVersion,
+                                 int maximumVersion, boolean optional) {
         jdbcTemplate.update(
-                "INSERT INTO artifact_dependency (artifact_id, name, minimum_version, maximum_version) "
-                        + "VALUES (?, ?, ?, ?)",
-                artifactId, name, minimumVersion, maximumVersion);
+                "INSERT INTO artifact_dependency "
+                        + "(artifact_id, name, minimum_version, maximum_version, optional) "
+                        + "VALUES (?, ?, ?, ?, ?)",
+                artifactId, name, minimumVersion, maximumVersion, optional ? 1 : 0);
     }
 
-    /** 读取单个制品版本（含依赖），不存在返回 null。 */
+    /** 读取单个制品版本（含平台与依赖），不存在返回 null。 */
     public ArtifactVersion loadArtifact(String name, int version) {
         List<ArtifactRow> rows = jdbcTemplate.query(
-                "SELECT id, name, version, withdrawn FROM artifact WHERE name = ? AND version = ?",
+                "SELECT id, name, version, withdrawn, platforms FROM artifact "
+                        + "WHERE name = ? AND version = ?",
                 (rs, n) -> new ArtifactRow(rs.getLong("id"), rs.getString("name"),
-                        rs.getInt("version"), rs.getInt("withdrawn") == 1),
+                        rs.getInt("version"), rs.getInt("withdrawn") == 1,
+                        parsePlatforms(rs.getString("platforms"))),
                 name, version);
         if (rows.isEmpty()) {
             return null;
         }
         ArtifactRow row = rows.get(0);
         List<DependencyRange> deps = jdbcTemplate.query(
-                "SELECT name, minimum_version, maximum_version FROM artifact_dependency WHERE artifact_id = ?",
+                "SELECT name, minimum_version, maximum_version, optional "
+                        + "FROM artifact_dependency WHERE artifact_id = ?",
                 (rs, n) -> new DependencyRange(rs.getString("name"),
-                        rs.getInt("minimum_version"), rs.getInt("maximum_version")),
+                        rs.getInt("minimum_version"), rs.getInt("maximum_version"),
+                        rs.getInt("optional") == 1),
                 row.id());
         return new ArtifactVersion(row.id(), row.name(), row.version(), row.withdrawn(),
-                List.copyOf(deps));
+                row.platforms(), List.copyOf(deps));
     }
 
     /** 仓库版本号加一，返回加一后的版本号（须在持有行锁时调用）。 */
@@ -163,20 +180,21 @@ public class RepositoryDao {
                 "UPDATE artifact SET withdrawn = 1 WHERE id = ? AND withdrawn = 0", artifactId);
     }
 
-    /** 新增锁文件主记录，返回自增主键。 */
+    /** 新增锁文件主记录（固化目标平台），返回自增主键。 */
     public long insertLockFile(String rootName, int rootVersion, long repositoryVersion,
-                               String requestId, Instant createdAt) {
+                               String targetPlatform, String requestId, Instant createdAt) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbcTemplate.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO lock_file (root_name, root_version, repository_version, request_id, created_at) "
-                            + "VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO lock_file (root_name, root_version, repository_version, "
+                            + "target_platform, request_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, rootName);
             ps.setInt(2, rootVersion);
             ps.setLong(3, repositoryVersion);
-            ps.setString(4, requestId);
-            ps.setTimestamp(5, Timestamp.from(createdAt));
+            ps.setString(4, targetPlatform);
+            ps.setString(5, requestId);
+            ps.setTimestamp(6, Timestamp.from(createdAt));
             return ps;
         }, keyHolder);
         Number key = keyHolder.getKey();
@@ -191,6 +209,19 @@ public class RepositoryDao {
         jdbcTemplate.update(
                 "INSERT INTO lock_file_entry (lock_file_id, name, version) VALUES (?, ?, ?)",
                 lockFileId, name, version);
+    }
+
+    /** 新增一条锁文件可选依赖判定，按调用顺序（来源名称、依赖名称字典序）写入。 */
+    public void insertLockOptional(long lockFileId, OptionalDecision decision) {
+        jdbcTemplate.update(
+                "INSERT INTO lock_file_optional (lock_file_id, source_name, dependency_name, "
+                        + "minimum_version, maximum_version, included, selected_version, reason) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                lockFileId, decision.sourceName(), decision.dependencyName(),
+                decision.minimumVersion(), decision.maximumVersion(),
+                decision.included() ? 1 : 0,
+                decision.selectedVersion(),
+                decision.reason());
     }
 
     /** 幂等记录视图。 */
@@ -235,30 +266,38 @@ public class RepositoryDao {
 
     /** 锁文件列表行：不含条目明细。 */
     public record LockFileRow(long id, String rootName, int rootVersion,
-                              long repositoryVersion, Instant createdAt) {
+                              long repositoryVersion, String targetPlatform, Instant createdAt) {
     }
 
     /** 锁文件条目行。 */
     public record LockEntryRow(long lockFileId, String name, int version) {
     }
 
+    /** 锁文件可选依赖判定行。 */
+    public record LockOptionalRow(long id, long lockFileId, String sourceName, String dependencyName,
+                                  int minimumVersion, int maximumVersion, boolean included,
+                                  Integer selectedVersion, String reason) {
+    }
+
     /** 查询全部历史锁文件，按 ID 升序。 */
     public List<LockFileRow> listLockFiles() {
         return jdbcTemplate.query(
-                "SELECT id, root_name, root_version, repository_version, created_at "
+                "SELECT id, root_name, root_version, repository_version, target_platform, created_at "
                         + "FROM lock_file ORDER BY id ASC",
                 (rs, n) -> new LockFileRow(rs.getLong("id"), rs.getString("root_name"),
                         rs.getInt("root_version"), rs.getLong("repository_version"),
+                        rs.getString("target_platform"),
                         rs.getTimestamp("created_at").toInstant()));
     }
 
     /** 按主键查询锁文件，不存在返回 null。 */
     public LockFileRow getLockFile(long id) {
         List<LockFileRow> rows = jdbcTemplate.query(
-                "SELECT id, root_name, root_version, repository_version, created_at "
+                "SELECT id, root_name, root_version, repository_version, target_platform, created_at "
                         + "FROM lock_file WHERE id = ?",
                 (rs, n) -> new LockFileRow(rs.getLong("id"), rs.getString("root_name"),
                         rs.getInt("root_version"), rs.getLong("repository_version"),
+                        rs.getString("target_platform"),
                         rs.getTimestamp("created_at").toInstant()),
                 id);
         return rows.isEmpty() ? null : rows.get(0);
@@ -274,9 +313,37 @@ public class RepositoryDao {
                 lockFileId);
     }
 
-    private record ArtifactRow(long id, String name, int version, boolean withdrawn) {
+    /** 查询某锁文件的全部可选依赖判定，按写入顺序（来源名称、依赖名称字典序）升序。 */
+    public List<LockOptionalRow> listLockOptional(long lockFileId) {
+        return jdbcTemplate.query(
+                "SELECT id, lock_file_id, source_name, dependency_name, minimum_version, "
+                        + "maximum_version, included, selected_version, reason "
+                        + "FROM lock_file_optional WHERE lock_file_id = ? ORDER BY id ASC",
+                (rs, n) -> new LockOptionalRow(rs.getLong("id"), rs.getLong("lock_file_id"),
+                        rs.getString("source_name"), rs.getString("dependency_name"),
+                        rs.getInt("minimum_version"), rs.getInt("maximum_version"),
+                        rs.getInt("included") == 1,
+                        (Integer) rs.getObject("selected_version"),
+                        rs.getString("reason")),
+                lockFileId);
     }
 
-    private record DepRow(long artifactId, String name, int minimumVersion, int maximumVersion) {
+    /** 解析逗号分隔的平台列；NULL/空（理论上不应出现）回退为 ANY。 */
+    private static List<String> parsePlatforms(String stored) {
+        if (stored == null || stored.isBlank()) {
+            return List.of(Platforms.ANY);
+        }
+        return Arrays.stream(stored.split(","))
+                .map(String::trim)
+                .filter(s -> !s.isEmpty())
+                .toList();
+    }
+
+    private record ArtifactRow(long id, String name, int version, boolean withdrawn,
+                               List<String> platforms) {
+    }
+
+    private record DepRow(long artifactId, String name, int minimumVersion, int maximumVersion,
+                          boolean optional) {
     }
 }

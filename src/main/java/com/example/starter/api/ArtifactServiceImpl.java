@@ -6,15 +6,20 @@ import com.example.starter.api.dto.DependencyView;
 import com.example.starter.api.dto.LockEntryResponse;
 import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
+import com.example.starter.api.dto.OptionalDependencyResponse;
 import com.example.starter.api.dto.RegisterArtifactRequest;
 import com.example.starter.domain.ArtifactVersion;
 import com.example.starter.domain.DependencyRange;
 import com.example.starter.domain.LockResolver;
+import com.example.starter.domain.OptionalDecision;
+import com.example.starter.domain.Platforms;
+import com.example.starter.domain.ResolutionResult;
 import com.example.starter.domain.RepositorySnapshot;
 import com.example.starter.repo.RepositoryDao;
 import com.example.starter.repo.RepositoryDao.IdempotentRecord;
 import com.example.starter.repo.RepositoryDao.LockEntryRow;
 import com.example.starter.repo.RepositoryDao.LockFileRow;
+import com.example.starter.repo.RepositoryDao.LockOptionalRow;
 import com.example.starter.support.ApiException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
@@ -68,11 +73,12 @@ public class ArtifactServiceImpl implements ArtifactService {
     @Override
     public ArtifactResponse registerArtifact(String requestId, RegisterArtifactRequest request) {
         requireRequestId(requestId);
+        List<String> platforms = validateAndNormalizePlatforms(request);
         validateRegisterRequest(request);
         String hash = sha256(OP_REGISTER + "|" + request.name().trim() + "|" + request.version() + "|"
-                + canonicalDependencies(request));
+                + canonicalPlatforms(platforms) + "|" + canonicalDependencies(request));
         return executeIdempotent(requestId, OP_REGISTER, hash, 201,
-                () -> doRegister(request), ArtifactResponse.class);
+                () -> doRegister(request, platforms), ArtifactResponse.class);
     }
 
     @Override
@@ -92,17 +98,20 @@ public class ArtifactServiceImpl implements ArtifactService {
         if (request.rootName() == null || request.rootName().isBlank()) {
             throw ApiException.badRequest("rootName 不能为空");
         }
+        String targetPlatform = validateTargetPlatform(request.targetPlatform());
         String hash = sha256(OP_LOCK + "|" + request.rootName().trim() + "|" + request.rootVersion()
-                + "|" + request.expectedRepositoryVersion());
+                + "|" + request.expectedRepositoryVersion() + "|" + targetPlatform);
         return executeIdempotent(requestId, OP_LOCK, hash, 201,
-                () -> doLock(request), LockFileResponse.class);
+                () -> doLock(request, targetPlatform), LockFileResponse.class);
     }
 
     @Override
     public List<LockFileResponse> listLocks() {
         List<LockFileResponse> result = new ArrayList<>();
         for (LockFileRow row : repositoryDao.listLockFiles()) {
-            result.add(toLockResponse(row, repositoryDao.listLockEntries(row.id())));
+            result.add(toLockResponse(row,
+                    repositoryDao.listLockEntries(row.id()),
+                    repositoryDao.listLockOptional(row.id())));
         }
         return result;
     }
@@ -113,14 +122,16 @@ public class ArtifactServiceImpl implements ArtifactService {
         if (row == null) {
             throw ApiException.notFound("锁文件不存在: " + id);
         }
-        return toLockResponse(row, repositoryDao.listLockEntries(id));
+        return toLockResponse(row,
+                repositoryDao.listLockEntries(id),
+                repositoryDao.listLockOptional(id));
     }
 
     // ------------------------------------------------------------------
     // 业务操作（运行在已加行锁的写事务内）
     // ------------------------------------------------------------------
 
-    private ArtifactResponse doRegister(RegisterArtifactRequest request) {
+    private ArtifactResponse doRegister(RegisterArtifactRequest request, List<String> platforms) {
         String name = request.name().trim();
         int version = request.version();
 
@@ -138,14 +149,14 @@ public class ArtifactServiceImpl implements ArtifactService {
         }
 
         Instant now = Instant.now(clock);
-        long artifactId = repositoryDao.insertArtifact(name, version, now);
+        long artifactId = repositoryDao.insertArtifact(name, version, platforms, now);
         for (var dep : request.dependencies()) {
             repositoryDao.insertDependency(artifactId, dep.name().trim(),
-                    dep.minimumVersion(), dep.maximumVersion());
+                    dep.minimumVersion(), dep.maximumVersion(), dep.optional());
         }
         long repositoryVersion = repositoryDao.incrementRepositoryVersion();
 
-        return new ArtifactResponse(name, version, false, repositoryVersion, now,
+        return new ArtifactResponse(name, version, platforms, false, repositoryVersion, now,
                 toDependencyViews(request.dependencies()));
     }
 
@@ -163,11 +174,11 @@ public class ArtifactServiceImpl implements ArtifactService {
             throw ApiException.conflict("制品版本已撤回: " + name + ":" + version);
         }
         long repositoryVersion = repositoryDao.incrementRepositoryVersion();
-        return new ArtifactResponse(name, version, true, repositoryVersion,
+        return new ArtifactResponse(name, version, artifact.platforms(), true, repositoryVersion,
                 Instant.now(clock), toDependencyViews(artifact.dependencies()));
     }
 
-    private LockFileResponse doLock(LockRequest request) {
+    private LockFileResponse doLock(LockRequest request, String targetPlatform) {
         String rootName = request.rootName().trim();
         int rootVersion = request.rootVersion();
 
@@ -185,22 +196,40 @@ public class ArtifactServiceImpl implements ArtifactService {
         if (root.withdrawn()) {
             throw ApiException.conflict("根制品版本已撤回: " + rootName + ":" + rootVersion);
         }
+        if (!root.supports(targetPlatform)) {
+            // 平台不兼容的精确根：422，且不保存锁文件。
+            throw ApiException.unprocessable("根制品 " + rootName + ":" + rootVersion
+                    + " 不支持目标平台 " + targetPlatform);
+        }
 
         RepositorySnapshot snapshot = repositoryDao.loadSnapshot();
-        Map<String, Integer> solution = LockResolver.resolve(snapshot, rootName, rootVersion);
-        if (solution == null) {
+        ResolutionResult resolution =
+                LockResolver.resolve(snapshot, rootName, rootVersion, targetPlatform);
+        if (resolution == null) {
+            // 必选依赖无可行解：整体 422，不保存锁文件。仅可选依赖无解不会导致失败。
             throw ApiException.unprocessable(
-                    "不存在满足全部依赖区间的未撤回版本组合，无法锁定");
+                    "不存在满足全部必选依赖区间且兼容平台 " + targetPlatform
+                            + " 的未撤回版本组合，无法锁定");
         }
+        Map<String, Integer> solution = resolution.entries();
 
         Instant now = Instant.now(clock);
         long lockFileId = repositoryDao.insertLockFile(rootName, rootVersion, currentVersion,
-                currentRequestId.get(), now);
+                targetPlatform, currentRequestId.get(), now);
         solution.forEach((n, v) -> repositoryDao.insertLockEntry(lockFileId, n, v));
+        for (OptionalDecision decision : resolution.optionalDecisions()) {
+            repositoryDao.insertLockOptional(lockFileId, decision);
+        }
 
         List<LockEntryResponse> entries = new ArrayList<>();
         solution.forEach((n, v) -> entries.add(new LockEntryResponse(n, v)));
-        return new LockFileResponse(lockFileId, rootName, rootVersion, currentVersion, now, entries);
+        List<OptionalDependencyResponse> optionalViews = resolution.optionalDecisions().stream()
+                .map(d -> new OptionalDependencyResponse(d.sourceName(), d.dependencyName(),
+                        d.minimumVersion(), d.maximumVersion(), d.included(),
+                        d.selectedVersion(), d.reason()))
+                .toList();
+        return new LockFileResponse(lockFileId, rootName, rootVersion, currentVersion,
+                targetPlatform, now, entries, optionalViews);
     }
 
     // ------------------------------------------------------------------
@@ -295,9 +324,36 @@ public class ArtifactServiceImpl implements ArtifactService {
         }
     }
 
+    /** 校验登记平台集合，失败转 400，返回规范化结果。 */
+    private List<String> validateAndNormalizePlatforms(RegisterArtifactRequest request) {
+        try {
+            return Platforms.normalize(request.platforms());
+        } catch (IllegalArgumentException e) {
+            throw ApiException.badRequest(e.getMessage());
+        }
+    }
+
+    /** 校验锁定目标平台：必须为具体 os/arch（不接受 ANY）。 */
+    private String validateTargetPlatform(String raw) {
+        if (raw == null || raw.isBlank()) {
+            throw ApiException.badRequest("targetPlatform 不能为空");
+        }
+        String target = raw.trim();
+        if (Platforms.ANY.equals(target) || !Platforms.isOsArch(target)) {
+            throw ApiException.badRequest("targetPlatform 格式必须为 os/arch: " + raw);
+        }
+        return target;
+    }
+
+    private String canonicalPlatforms(List<String> platforms) {
+        // 登记时平台顺序不影响语义，规范化为字典序参与幂等摘要。
+        return platforms.stream().sorted().reduce((a, b) -> a + "," + b).orElse("");
+    }
+
     private String canonicalDependencies(RegisterArtifactRequest request) {
         return request.dependencies().stream()
-                .map(d -> d.name().trim() + ":" + d.minimumVersion() + ":" + d.maximumVersion())
+                .map(d -> d.name().trim() + ":" + d.minimumVersion() + ":" + d.maximumVersion()
+                        + ":" + d.optional())
                 .sorted()
                 .reduce((a, b) -> a + "," + b)
                 .orElse("");
@@ -306,23 +362,37 @@ public class ArtifactServiceImpl implements ArtifactService {
     private List<DependencyView> toDependencyViews(List<?> raw) {
         TreeMap<String, DependencyView> sorted = new TreeMap<>();
         for (Object o : raw) {
-            if (o instanceof com.example.starter.api.dto.DependencySpec spec) {
+            if (o instanceof DependencySpec spec) {
                 sorted.put(spec.name().trim(), new DependencyView(
-                        spec.name().trim(), spec.minimumVersion(), spec.maximumVersion()));
+                        spec.name().trim(), spec.minimumVersion(), spec.maximumVersion(),
+                        spec.optional()));
             } else if (o instanceof DependencyRange range) {
                 sorted.put(range.name(), new DependencyView(
-                        range.name(), range.minimumVersion(), range.maximumVersion()));
+                        range.name(), range.minimumVersion(), range.maximumVersion(),
+                        range.optional()));
             }
         }
         return List.copyOf(sorted.values());
     }
 
-    private LockFileResponse toLockResponse(LockFileRow row, List<LockEntryRow> entries) {
+    private LockFileResponse toLockResponse(LockFileRow row, List<LockEntryRow> entries,
+                                            List<LockOptionalRow> optionalRows) {
         List<LockEntryResponse> entryViews = entries.stream()
                 .map(e -> new LockEntryResponse(e.name(), e.version()))
                 .toList();
+        // 迁移前的旧锁文件无 target_platform：新字段在响应中整体省略，保持旧查询结构不变。
+        if (row.targetPlatform() == null) {
+            return new LockFileResponse(row.id(), row.rootName(), row.rootVersion(),
+                    row.repositoryVersion(), null, row.createdAt(), entryViews, null);
+        }
+        List<OptionalDependencyResponse> optionalViews = optionalRows.stream()
+                .map(o -> new OptionalDependencyResponse(o.sourceName(), o.dependencyName(),
+                        o.minimumVersion(), o.maximumVersion(), o.included(),
+                        o.selectedVersion(), o.reason()))
+                .toList();
         return new LockFileResponse(row.id(), row.rootName(), row.rootVersion(),
-                row.repositoryVersion(), row.createdAt(), entryViews);
+                row.repositoryVersion(), row.targetPlatform(), row.createdAt(),
+                entryViews, optionalViews);
     }
 
     private void requireRequestId(String requestId) {
