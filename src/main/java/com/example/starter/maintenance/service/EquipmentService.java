@@ -7,9 +7,13 @@ import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 
 import com.example.starter.maintenance.api.ApiException;
+import com.example.starter.maintenance.api.dto.AddItemRequest;
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
+import com.example.starter.maintenance.api.dto.ItemStatusSummaryResponse;
+import com.example.starter.maintenance.api.dto.ItemStatusView;
+import com.example.starter.maintenance.api.dto.MaintenanceItemResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
 import com.example.starter.maintenance.api.dto.RegisterEquipmentRequest;
@@ -38,6 +42,13 @@ public class EquipmentService {
                 EquipmentResponse.class, () -> txService.register(req));
     }
 
+    public MaintenanceItemResponse addItem(String equipmentId, AddItemRequest req) {
+        String fingerprint = equipmentId + "|" + req.itemCode() + "|" + req.maintenancePeriodMinutes()
+                + "|" + req.expectedVersion();
+        return recoverDuplicateKey(req.requestId(), "ADD_ITEM", fingerprint,
+                MaintenanceItemResponse.class, () -> txService.addItem(equipmentId, req));
+    }
+
     public ReadingResponse addReading(String equipmentId, AddReadingRequest req) {
         return txService.addReading(equipmentId, req);
     }
@@ -54,6 +65,18 @@ public class EquipmentService {
         return txService.getStatus(equipmentId);
     }
 
+    public ItemStatusView getItemStatus(String equipmentId, String itemCode) {
+        return txService.getItemStatus(equipmentId, itemCode);
+    }
+
+    public ItemStatusSummaryResponse getItemsStatus(String equipmentId) {
+        return txService.getItemsStatus(equipmentId);
+    }
+
+    public List<MaintenanceItemResponse> listItems(String equipmentId) {
+        return txService.listItems(equipmentId);
+    }
+
     public List<ReadingResponse> listReadings(String equipmentId) {
         return txService.listReadings(equipmentId);
     }
@@ -64,6 +87,10 @@ public class EquipmentService {
 
     public List<MaintenanceResponse> listMaintenances(String equipmentId) {
         return txService.listMaintenances(equipmentId);
+    }
+
+    public List<MaintenanceResponse> listItemMaintenances(String equipmentId, String itemCode) {
+        return txService.listItemMaintenances(equipmentId, itemCode);
     }
 
     /**

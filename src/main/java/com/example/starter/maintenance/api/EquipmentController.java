@@ -13,9 +13,13 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
+import com.example.starter.maintenance.api.dto.AddItemRequest;
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
+import com.example.starter.maintenance.api.dto.ItemStatusSummaryResponse;
+import com.example.starter.maintenance.api.dto.ItemStatusView;
+import com.example.starter.maintenance.api.dto.MaintenanceItemResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
 import com.example.starter.maintenance.api.dto.RegisterEquipmentRequest;
@@ -26,6 +30,7 @@ import com.example.starter.maintenance.service.EquipmentService;
 
 /**
  * 设备工时保养判定 API。不连接真实设备，读数由调用方登记/补录。
+ * 每台设备含一个登记时迁移的 DEFAULT 项目和最多 20 个自定义项目；项目共享读数、独立判定。
  */
 @RestController
 @RequestMapping("/api/equipment")
@@ -37,11 +42,45 @@ public class EquipmentController {
         this.service = service;
     }
 
-    /** 登记设备：保养周期（分钟）为正整数，登记后不可修改；初始版本 1、累计工时 0。 */
+    /** 登记设备：保养周期（分钟）为正整数，登记后不可修改；初始版本 1、累计工时 0，并生成 DEFAULT 项目。 */
     @PostMapping
     @ResponseStatus(HttpStatus.CREATED)
     public EquipmentResponse register(@Valid @RequestBody RegisterEquipmentRequest req) {
         return service.register(req);
+    }
+
+    /** 新增保养项目：itemCode 设备内唯一（DEFAULT 保留），周期为正整数分钟，创建后不可修改或删除。 */
+    @PostMapping("/{equipmentId}/items")
+    @ResponseStatus(HttpStatus.CREATED)
+    public MaintenanceItemResponse addItem(@PathVariable String equipmentId,
+                                           @Valid @RequestBody AddItemRequest req) {
+        return service.addItem(equipmentId, req);
+    }
+
+    /** 项目列表（含 DEFAULT，按 itemCode 升序）。 */
+    @GetMapping("/{equipmentId}/items")
+    public List<MaintenanceItemResponse> listItems(@PathVariable String equipmentId) {
+        return service.listItems(equipmentId);
+    }
+
+    /** 全项目保养状态汇总：按 itemCode 升序；所有项目共享同一最新读数，状态独立判定。 */
+    @GetMapping("/{equipmentId}/items/status")
+    public ItemStatusSummaryResponse getItemsStatus(@PathVariable String equipmentId) {
+        return service.getItemsStatus(equipmentId);
+    }
+
+    /** 单项目保养状态。 */
+    @GetMapping("/{equipmentId}/items/{itemCode}/status")
+    public ItemStatusView getItemStatus(@PathVariable String equipmentId,
+                                        @PathVariable String itemCode) {
+        return service.getItemStatus(equipmentId, itemCode);
+    }
+
+    /** 单项目保养历史（锚点快照，按锚点时间稳定升序）。 */
+    @GetMapping("/{equipmentId}/items/{itemCode}/maintenances")
+    public List<MaintenanceResponse> listItemMaintenances(@PathVariable String equipmentId,
+                                                          @PathVariable String itemCode) {
+        return service.listItemMaintenances(equipmentId, itemCode);
     }
 
     /** 新增工时读数（允许补录历史）；按采样时刻排序后累计分钟须单调不减，否则 422。 */
@@ -52,7 +91,7 @@ public class EquipmentController {
         return service.addReading(equipmentId, req);
     }
 
-    /** 修订读数：只改累计分钟、不改采样时刻；作为历史保养锚点的读数返回 409。 */
+    /** 修订读数：只改累计分钟、不改采样时刻；被任一项目保养记录锚定的读数返回 409 并列出全部引用项目。 */
     @PostMapping("/{equipmentId}/readings/{readingId}/revisions")
     @ResponseStatus(HttpStatus.CREATED)
     public ReadingResponse reviseReading(@PathVariable String equipmentId,
@@ -61,7 +100,10 @@ public class EquipmentController {
         return service.reviseReading(equipmentId, readingId, req);
     }
 
-    /** 完成保养：以现存读数及其当前修订号为锚点，锚点时间须晚于上次保养锚点。 */
+    /**
+     * 完成保养：以现存读数及其当前修订号为锚点，锚点时间须晚于该项目上次保养锚点。
+     * 不传 itemCode 时沿用旧接口语义操作 DEFAULT 项目。
+     */
     @PostMapping("/{equipmentId}/maintenances")
     @ResponseStatus(HttpStatus.CREATED)
     public MaintenanceResponse completeMaintenance(@PathVariable String equipmentId,
@@ -69,13 +111,13 @@ public class EquipmentController {
         return service.completeMaintenance(equipmentId, req);
     }
 
-    /** 保养状态：本轮运行分钟 = 最新读数 - 最近保养锚点工时（无保养从 0 计），达到周期即 DUE。 */
+    /** DEFAULT 项目保养状态（旧接口，响应保持兼容）。 */
     @GetMapping("/{equipmentId}/status")
     public StatusResponse getStatus(@PathVariable String equipmentId) {
         return service.getStatus(equipmentId);
     }
 
-    /** 读数历史（当前值，按采样时刻升序）。 */
+    /** 读数历史（当前值，按采样时刻升序；anchored 表示是否被任一项目锚定）。 */
     @GetMapping("/{equipmentId}/readings")
     public List<ReadingResponse> listReadings(@PathVariable String equipmentId) {
         return service.listReadings(equipmentId);
@@ -88,7 +130,7 @@ public class EquipmentController {
         return service.listRevisions(equipmentId, readingId);
     }
 
-    /** 保养历史（锚点快照，按锚点时间升序）。 */
+    /** DEFAULT 项目保养历史（旧接口，按锚点时间升序）。 */
     @GetMapping("/{equipmentId}/maintenances")
     public List<MaintenanceResponse> listMaintenances(@PathVariable String equipmentId) {
         return service.listMaintenances(equipmentId);
