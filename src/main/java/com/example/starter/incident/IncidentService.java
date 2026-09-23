@@ -72,16 +72,21 @@ public class IncidentService {
     private final EscalationRepository escalations;
     private final IncidentTaskRepository tasks;
     private final CommandKeyRepository commandKeys;
+    private final SharedResourceRepository resources;
+    private final ResourceLeaseRepository leases;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public IncidentService(IncidentRepository incidents, EscalationRepository escalations,
                            IncidentTaskRepository tasks, CommandKeyRepository commandKeys,
+                           SharedResourceRepository resources, ResourceLeaseRepository leases,
                            ObjectMapper objectMapper, Clock clock) {
         this.incidents = incidents;
         this.escalations = escalations;
         this.tasks = tasks;
         this.commandKeys = commandKeys;
+        this.resources = resources;
+        this.leases = leases;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -453,7 +458,7 @@ public class IncidentService {
                     Instant now = now();
                     long taskId = tasks.insert(new IncidentTask(0L, incident.id(), taskKey,
                             groupCode, title, TaskStatus.OPEN, actor, null, null, null, null,
-                            now, now));
+                            null, null, 1L, now, now));
                     for (Incident blocker : blockers) {
                         tasks.insertBlocker(taskId, blocker.id(), now);
                     }
@@ -462,7 +467,7 @@ public class IncidentService {
     }
 
     /**
-     * 完成任务：仅当前指挥人；仅 OPEN 可完成；全部阻塞事件进入
+     * 完成任务：仅当前指挥人；仅 OPEN/STARTED 可完成；全部阻塞事件进入
      * CONTAINED/RESOLVED/CLOSED 后才可完成，否则 409 并返回未解除事件列表。
      * DONE/CANCELLED 为终态，重复操作按 commandKey 幂等规则返回首次结果。
      */
@@ -470,13 +475,15 @@ public class IncidentService {
     public TaskView completeTask(String incidentKey, String taskKey, String actor,
                                  TaskActionRequest req) {
         String commandKey = requireText(req.commandKey(), "commandKey");
+        // 资源池全局锁先于事件行锁：与租约申请/抢占/启动保持一致的加锁顺序
+        resources.lockPool();
         Incident incident = lockIncident(incidentKey);
         return runIdempotent(commandKey, "task_complete", hash(incidentKey, taskKey, actor),
                 TaskView.class, () -> {
                     requireCommander(incident, actor);
                     IncidentTask task = tasks.findByKey(incident.id(), taskKey)
                             .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
-                    if (task.status() != TaskStatus.OPEN) {
+                    if (task.status() != TaskStatus.OPEN && task.status() != TaskStatus.STARTED) {
                         throw ApiException.conflict(
                                 "任务已处于终态 " + task.status() + "，不能完成");
                     }
@@ -485,30 +492,37 @@ public class IncidentService {
                         throw ApiException.conflict("存在未解除阻塞的事件: "
                                 + String.join(",", unresolved), List.copyOf(unresolved));
                     }
-                    tasks.markDone(task.id(), actor, now());
+                    Instant now = now();
+                    tasks.markDone(task.id(), actor, now);
+                    // 完成原子释放该任务全部 ACTIVE 租约
+                    leases.releaseActiveForTask(task.id(), now);
                     return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
                 });
     }
 
     /**
-     * 取消任务：仅当前指挥人；仅 OPEN 可取消；DONE/CANCELLED 为终态，
+     * 取消任务：仅当前指挥人；仅 OPEN/STARTED 可取消；DONE/CANCELLED 为终态，
      * 重复操作按 commandKey 幂等规则返回首次结果。
      */
     @Transactional
     public TaskView cancelTask(String incidentKey, String taskKey, String actor,
                                TaskActionRequest req) {
         String commandKey = requireText(req.commandKey(), "commandKey");
+        resources.lockPool();
         Incident incident = lockIncident(incidentKey);
         return runIdempotent(commandKey, "task_cancel", hash(incidentKey, taskKey, actor),
                 TaskView.class, () -> {
                     requireCommander(incident, actor);
                     IncidentTask task = tasks.findByKey(incident.id(), taskKey)
                             .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
-                    if (task.status() != TaskStatus.OPEN) {
+                    if (task.status() != TaskStatus.OPEN && task.status() != TaskStatus.STARTED) {
                         throw ApiException.conflict(
                                 "任务已处于终态 " + task.status() + "，不能取消");
                     }
-                    tasks.markCancelled(task.id(), actor, now());
+                    Instant now = now();
+                    tasks.markCancelled(task.id(), actor, now);
+                    // 取消原子释放该任务全部 ACTIVE 租约
+                    leases.releaseActiveForTask(task.id(), now);
                     return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
                 });
     }
@@ -640,8 +654,9 @@ public class IncidentService {
                         UNBLOCKING_STATUSES.contains(b.status())))
                 .toList();
         return new TaskView(task.taskKey(), task.groupCode(), task.title(), task.status().name(),
-                blockers, task.createdBy(), task.createdAt(), task.doneBy(), task.doneAt(),
-                task.cancelledBy(), task.cancelledAt());
+                blockers, task.createdBy(), task.createdAt(), task.startedBy(), task.startedAt(),
+                task.doneBy(), task.doneAt(), task.cancelledBy(), task.cancelledAt(),
+                task.version());
     }
 
     private static TransferView toTransferView(IncidentTransfer transfer) {

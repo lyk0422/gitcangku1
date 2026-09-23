@@ -80,10 +80,13 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     title VARCHAR(512) NOT NULL,
     status VARCHAR(16) NOT NULL,
     created_by VARCHAR(128) NOT NULL,
+    started_by VARCHAR(128) NULL,
+    started_at TIMESTAMP(6) NULL,
     done_by VARCHAR(128) NULL,
     done_at TIMESTAMP(6) NULL,
     cancelled_by VARCHAR(128) NULL,
     cancelled_at TIMESTAMP(6) NULL,
+    version INT NOT NULL DEFAULT 1,
     created_at TIMESTAMP(6) NOT NULL,
     updated_at TIMESTAMP(6) NOT NULL,
     CONSTRAINT uk_task_key UNIQUE (incident_id, task_key)
@@ -98,5 +101,37 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 );
 
 CREATE TABLE IF NOT EXISTS task_graph_lock (
+    id TINYINT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS shared_resources (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    resource_key VARCHAR(128) NOT NULL,
+    capacity INT NOT NULL,
+    created_by VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_resource_key UNIQUE (resource_key)
+);
+
+CREATE TABLE IF NOT EXISTS resource_leases (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    lease_key VARCHAR(128) NOT NULL,
+    resource_id BIGINT NOT NULL,
+    incident_id BIGINT NOT NULL,
+    task_id BIGINT NOT NULL,
+    units INT NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    version INT NOT NULL,
+    request_id VARCHAR(128) NOT NULL,
+    created_by VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    released_at TIMESTAMP(6) NULL,
+    revoked_at TIMESTAMP(6) NULL,
+    CONSTRAINT uk_lease_key UNIQUE (lease_key)
+);
+
+CREATE TABLE IF NOT EXISTS resource_pool_lock (
     id TINYINT PRIMARY KEY
 );

@@ -52,7 +52,31 @@ public final class Requests {
                                     String title, List<String> blockerIncidentKeys) {
     }
 
-    /** 任务完成/取消请求，操作人由 X-Actor-Id 指定且须为当前指挥人。 */
+    /** 任务完成/取消/启动请求，操作人由 X-Actor-Id 指定且须为当前指挥人。 */
     public record TaskActionRequest(String commandKey) {
+    }
+
+    /** 共享资源创建请求：capacity 必须为正整数。操作人由 X-Actor-Id 指定。 */
+    public record ResourceCreateRequest(String resourceKey, Integer capacity) {
+    }
+
+    /**
+     * 租约申请请求：requestId 为调用方幂等键；leaseKey 全局唯一；
+     * units 取值 1~资源容量；taskVersion 为提交时的任务版本，不一致返回 409。
+     */
+    public record LeaseRequest(String requestId, String resourceKey, String leaseKey,
+                               Integer units, Long taskVersion) {
+    }
+
+    /** 受害租约引用：leaseKey + 提交时的租约版本，版本不一致整单 409。 */
+    public record VictimRef(String leaseKey, Long version) {
+    }
+
+    /**
+     * 抢占计划请求：requestId 为调用方幂等键；victims 为完整受害租约列表
+     * （集合语义，换序重放等价）；leaseKey/units/taskVersion 为拟授予新租约的参数。
+     */
+    public record PreemptRequest(String requestId, String resourceKey, String leaseKey,
+                                 Integer units, Long taskVersion, List<VictimRef> victims) {
     }
 }

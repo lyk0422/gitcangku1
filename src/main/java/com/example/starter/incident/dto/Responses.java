@@ -63,12 +63,15 @@ public final class Responses {
     }
 
     /**
-     * 处置任务视图：blockers 按阻塞事件键排序；doneBy/doneAt 仅 DONE 有值，
-     * cancelledBy/cancelledAt 仅 CANCELLED 有值。
+     * 处置任务视图：blockers 按阻塞事件键排序；startedBy/startedAt 仅 STARTED 及经
+     * STARTED 的终态有值，doneBy/doneAt 仅 DONE 有值，cancelledBy/cancelledAt 仅
+     * CANCELLED 有值；version 为任务乐观版本（创建为 1，启动/完成/取消各加 1）。
      */
     public record TaskView(String taskKey, String groupCode, String title, String status,
                            List<TaskBlockerView> blockers, String createdBy, Instant createdAt,
-                           String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt) {
+                           String startedBy, Instant startedAt,
+                           String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt,
+                           long version) {
     }
 
     /** 按事件分组的任务列表视图：tasks 按创建顺序返回。 */
@@ -77,5 +80,45 @@ public final class Responses {
 
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
+    }
+
+    /**
+     * 租约视图：status 为 ACTIVE/RELEASED/REVOKED；version 为租约乐观版本；
+     * releasedAt 仅 RELEASED 有值，revokedAt 仅 REVOKED 有值。
+     */
+    public record LeaseView(String leaseKey, String resourceKey, String incidentKey,
+                            String taskKey, int units, String status, long version,
+                            String createdBy, Instant createdAt, Instant releasedAt,
+                            Instant revokedAt) {
+    }
+
+    /**
+     * 资源占用视图：activeUnits 为 ACTIVE 租约单位合计，
+     * availableUnits = capacity - activeUnits；activeLeases 按创建顺序返回。
+     */
+    public record ResourceView(String resourceKey, int capacity, int activeUnits,
+                               int availableUnits, List<LeaseView> activeLeases) {
+    }
+
+    /** 资源租约历史视图：leases 含全部状态，按创建顺序返回。 */
+    public record LeaseHistoryView(String resourceKey, List<LeaseView> leases) {
+    }
+
+    /** 抢占结果视图：grantedLease 为新授予租约，revokedVictims 为被撤销的受害租约。 */
+    public record PreemptionView(LeaseView grantedLease, List<LeaseView> revokedVictims) {
+    }
+
+    /** 任务引用视图（抢占闭包中的 STARTED 任务等）。 */
+    public record TaskRefView(String incidentKey, String taskKey) {
+    }
+
+    /**
+     * 抢占闭包视图（只读）：listedVictims 为查询指定的受害租约；
+     * requiredAdditionalLeases 为反向依赖闭包要求但未列出的 ACTIVE 租约；
+     * startedTasks 为闭包中已 STARTED 的任务（存在时不得抢占）。
+     */
+    public record PreemptionClosureView(String resourceKey, List<LeaseView> listedVictims,
+                                        List<LeaseView> requiredAdditionalLeases,
+                                        List<TaskRefView> startedTasks) {
     }
 }

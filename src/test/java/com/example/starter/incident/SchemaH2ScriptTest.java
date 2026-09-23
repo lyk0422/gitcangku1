@@ -111,4 +111,70 @@ class SchemaH2ScriptTest {
             }
         }
     }
+
+    @Test
+    void h2Schema_resourceTablesEnforceConstraints() throws Exception {
+        String url = "jdbc:h2:mem:schema_h2_resource;MODE=MySQL;DATABASE_TO_LOWER=TRUE;"
+                + "DB_CLOSE_DELAY=0";
+        try (Connection con = DriverManager.getConnection(url, "sa", "")) {
+            ScriptUtils.executeSqlScript(con, new ClassPathResource("schema-h2.sql"));
+
+            Instant now = Instant.parse("2026-09-22T00:00:00Z");
+            try (Statement st = con.createStatement()) {
+                st.execute("INSERT INTO incidents (incident_key, severity, summary, reporter,"
+                        + " status, commander, created_at, updated_at) VALUES"
+                        + " ('IK-R','S2','s','r','COMMANDING','alice','" + Timestamp.from(now)
+                        + "','" + Timestamp.from(now) + "')");
+                st.execute("INSERT INTO incident_tasks (incident_id, task_key, group_code, title,"
+                        + " status, created_by, version, created_at, updated_at) VALUES"
+                        + " (1,'T-1','G','t','OPEN','alice',1,'" + Timestamp.from(now) + "','"
+                        + Timestamp.from(now) + "')");
+                st.execute("INSERT INTO shared_resources (resource_key, capacity, created_by,"
+                        + " created_at, updated_at) VALUES ('RES-1',2,'ops','"
+                        + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+
+                // resource_key 唯一约束
+                boolean duplicateResourceRejected = false;
+                try {
+                    st.execute("INSERT INTO shared_resources (resource_key, capacity, created_by,"
+                            + " created_at, updated_at) VALUES ('RES-1',5,'ops','"
+                            + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateResourceRejected = true;
+                }
+                assertThat(duplicateResourceRejected).isTrue();
+
+                // lease_key 唯一约束
+                st.execute("INSERT INTO resource_leases (lease_key, resource_id, incident_id,"
+                        + " task_id, units, status, version, request_id, created_by, created_at,"
+                        + " updated_at) VALUES ('LK-1',1,1,1,2,'ACTIVE',1,'REQ-1','alice','"
+                        + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                boolean duplicateLeaseRejected = false;
+                try {
+                    st.execute("INSERT INTO resource_leases (lease_key, resource_id, incident_id,"
+                            + " task_id, units, status, version, request_id, created_by,"
+                            + " created_at, updated_at) VALUES ('LK-1',1,1,1,1,'ACTIVE',1,"
+                            + "'REQ-2','alice','" + Timestamp.from(now) + "','"
+                            + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateLeaseRejected = true;
+                }
+                assertThat(duplicateLeaseRejected).isTrue();
+
+                // 条件更新只作用于 ACTIVE：RELEASED 后撤销更新 0 行，版本随流转加 1
+                int released = st.executeUpdate("UPDATE resource_leases SET status='RELEASED',"
+                        + " version=version+1 WHERE id = 1 AND status = 'ACTIVE'");
+                assertThat(released).isEqualTo(1);
+                int lateRevoke = st.executeUpdate("UPDATE resource_leases SET status='REVOKED',"
+                        + " version=version+1 WHERE id = 1 AND status = 'ACTIVE'");
+                assertThat(lateRevoke).isZero();
+                try (ResultSet rs = st.executeQuery(
+                        "SELECT status, version FROM resource_leases WHERE id = 1")) {
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getString("status")).isEqualTo("RELEASED");
+                    assertThat(rs.getLong("version")).isEqualTo(2);
+                }
+            }
+        }
+    }
 }

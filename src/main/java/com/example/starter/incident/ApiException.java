@@ -56,4 +56,10 @@ public class ApiException extends RuntimeException {
     public static ApiException illegalTransition(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "ILLEGAL_TRANSITION", message, null);
     }
+
+    /** 422：携带结构化明细的非法计划（如抢占计划未包含依赖闭包要求的租约列表）。 */
+    public static ApiException unprocessable(String message, Object details) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "UNPROCESSABLE_PLAN",
+                message, details);
+    }
 }

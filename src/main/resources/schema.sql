@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS incident_status_history (
 CREATE TABLE IF NOT EXISTS command_keys (
     id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
     command_key VARCHAR(128) NOT NULL COMMENT '调用方幂等键，全局唯一',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：takeover/transfer_initiate/transfer_accept/action/status/escalation_check/escalation_ack/task_create/task_complete/task_cancel',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：takeover/transfer_initiate/transfer_accept/action/status/escalation_check/escalation_ack/task_create/task_complete/task_cancel/task_start/lease_request/lease_preempt',
     request_hash VARCHAR(64) NOT NULL COMMENT '规范化请求参数的 SHA-256 摘要，用于同键改参检测',
     response_status INT NULL COMMENT '首次成功的 HTTP 状态码；事务提交前必写入',
     response_body MEDIUMTEXT NULL COMMENT '首次成功响应 JSON，用于同键同参重放',
@@ -78,12 +78,15 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     task_key VARCHAR(128) NOT NULL COMMENT '任务业务键，事件内唯一；同键同内容幂等，同键不同内容冲突',
     group_code VARCHAR(64) NOT NULL COMMENT '分组编码，非空',
     title VARCHAR(512) NOT NULL COMMENT '任务标题，非空',
-    status VARCHAR(16) NOT NULL COMMENT '状态：OPEN 待处理 / DONE 已完成 / CANCELLED 已取消；仅允许 OPEN→DONE 或 OPEN→CANCELLED，DONE 与 CANCELLED 为终态',
+    status VARCHAR(16) NOT NULL COMMENT '状态：OPEN 待处理 / STARTED 已启动（须持有 ACTIVE 租约）/ DONE 已完成 / CANCELLED 已取消；允许 OPEN→STARTED→DONE/CANCELLED 或 OPEN→DONE/CANCELLED，DONE 与 CANCELLED 为终态',
     created_by VARCHAR(128) NOT NULL COMMENT '创建人（创建时的当前指挥人）',
+    started_by VARCHAR(128) NULL COMMENT '启动人（操作时的当前指挥人）；仅 STARTED 及经 STARTED 的终态有值，否则为空',
+    started_at TIMESTAMP(6) NULL COMMENT '启动 UTC 时间；仅 STARTED 及经 STARTED 的终态有值，否则为空',
     done_by VARCHAR(128) NULL COMMENT '完成人（操作时的当前指挥人）；仅 DONE 有值，否则为空',
     done_at TIMESTAMP(6) NULL COMMENT '完成 UTC 时间；仅 DONE 有值，否则为空',
     cancelled_by VARCHAR(128) NULL COMMENT '取消人（操作时的当前指挥人）；仅 CANCELLED 有值，否则为空',
     cancelled_at TIMESTAMP(6) NULL COMMENT '取消 UTC 时间；仅 CANCELLED 有值，否则为空',
+    version INT NOT NULL DEFAULT 1 COMMENT '任务乐观版本，创建为 1，启动/完成/取消各加 1；租约申请与抢占计划按此校验',
     created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
     updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间',
     CONSTRAINT uk_task_key UNIQUE (incident_id, task_key)
@@ -100,3 +103,35 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY COMMENT '固定为 1 的单行锁；创建任务时 SELECT ... FOR UPDATE 持有，串行化环检测与写入，保证并发反向依赖最终图无环'
 ) COMMENT='任务依赖图全局锁表';
+
+CREATE TABLE IF NOT EXISTS shared_resources (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    resource_key VARCHAR(128) NOT NULL COMMENT '资源业务键，全局唯一',
+    capacity INT NOT NULL COMMENT '资源容量（单位数），必须为正整数；ACTIVE 租约单位合计永不超过该值',
+    created_by VARCHAR(128) NOT NULL COMMENT '创建人标识',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
+    updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间',
+    CONSTRAINT uk_resource_key UNIQUE (resource_key)
+) COMMENT='跨事件共享资源池定义表';
+
+CREATE TABLE IF NOT EXISTS resource_leases (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    lease_key VARCHAR(128) NOT NULL COMMENT '租约业务键，全局唯一；同键同内容幂等，同键不同内容冲突',
+    resource_id BIGINT NOT NULL COMMENT '资源 id，关联 shared_resources.id',
+    incident_id BIGINT NOT NULL COMMENT '租约所属事件 id，关联 incidents.id',
+    task_id BIGINT NOT NULL COMMENT '租约所属任务 id，关联 incident_tasks.id；同任务同资源至多一条 ACTIVE 租约',
+    units INT NOT NULL COMMENT '租用单位数，取值 1~资源容量',
+    status VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE 生效中 / RELEASED 任务完成或取消时原子释放 / REVOKED 被更高严重级别事件抢占撤销',
+    version INT NOT NULL COMMENT '租约乐观版本，创建为 1，释放或撤销时加 1；抢占计划按 leaseKey+version 指定受害租约',
+    request_id VARCHAR(128) NOT NULL COMMENT '授予该租约的请求 requestId（租约申请或抢占计划的幂等键）',
+    created_by VARCHAR(128) NOT NULL COMMENT '申请人（申请时的当前指挥人）',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
+    updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间',
+    released_at TIMESTAMP(6) NULL COMMENT '释放 UTC 时间；仅 RELEASED 有值，否则为空',
+    revoked_at TIMESTAMP(6) NULL COMMENT '撤销 UTC 时间；仅 REVOKED 有值，否则为空',
+    CONSTRAINT uk_lease_key UNIQUE (lease_key)
+) COMMENT='共享资源租约表';
+
+CREATE TABLE IF NOT EXISTS resource_pool_lock (
+    id TINYINT PRIMARY KEY COMMENT '固定为 1 的单行锁；租约申请/抢占/任务启动/完成/取消先 SELECT ... FOR UPDATE 持有（先于事件行锁），串行化容量核算与租约状态变更，保证容量永不超限且任务不带失效租约启动'
+) COMMENT='共享资源池全局锁表';
