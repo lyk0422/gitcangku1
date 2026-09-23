@@ -32,8 +32,8 @@ public class EvidenceRepository {
                        String custodianId, LocalDateTime now) {
         jdbc.update("""
                         INSERT INTO evidence
-                            (evidence_key, case_key, category, seal_no, custodian_id, status, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            (evidence_key, case_key, category, seal_no, custodian_id, status, version, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
                         """,
                 evidenceKey, caseKey, category, sealNo, custodianId,
                 EvidenceStatus.SEALED.name(), now, now);
@@ -58,21 +58,27 @@ public class EvidenceRepository {
     }
 
     /**
-     * 更新证物状态与保管人（交接接受时原子切换保管人）。
+     * 更新证物状态与保管人（交接接受时原子切换保管人）；版本号同步递增。
      */
     public void updateCustody(String evidenceKey, String custodianId, EvidenceStatus status,
                               LocalDateTime now) {
-        jdbc.update(
-                "UPDATE evidence SET custodian_id = ?, status = ?, updated_at = ? WHERE evidence_key = ?",
+        jdbc.update("""
+                        UPDATE evidence
+                        SET custodian_id = ?, status = ?, version = version + 1, updated_at = ?
+                        WHERE evidence_key = ?
+                        """,
                 custodianId, status.name(), now, evidenceKey);
     }
 
     /**
-     * 仅更新证物状态（交接发起/取消、核验失败）。
+     * 仅更新证物状态（交接发起/取消、核验失败）；版本号同步递增。
      */
     public void updateStatus(String evidenceKey, EvidenceStatus status, LocalDateTime now) {
-        jdbc.update(
-                "UPDATE evidence SET status = ?, updated_at = ? WHERE evidence_key = ?",
+        jdbc.update("""
+                        UPDATE evidence
+                        SET status = ?, version = version + 1, updated_at = ?
+                        WHERE evidence_key = ?
+                        """,
                 status.name(), now, evidenceKey);
     }
 
@@ -83,6 +89,20 @@ public class EvidenceRepository {
         return jdbc.query(
                 "SELECT * FROM evidence WHERE custodian_id = ? AND status = ? ORDER BY id",
                 ROW_MAPPER, custodianId, EvidenceStatus.SEALED.name());
+    }
+
+    /**
+     * 按业务键集合批量查询并锁定证物行（SELECT ... FOR UPDATE），按主键顺序返回。
+     * 组合借出/归还使用：调用方先按固定顺序（主键）锁定，避免并发死锁。
+     */
+    public List<Evidence> findByKeysForUpdate(List<String> evidenceKeys) {
+        if (evidenceKeys.isEmpty()) {
+            return List.of();
+        }
+        String placeholders = String.join(", ", evidenceKeys.stream().map(k -> "?").toList());
+        return jdbc.query(
+                "SELECT * FROM evidence WHERE evidence_key IN (" + placeholders + ") ORDER BY id FOR UPDATE",
+                ROW_MAPPER, evidenceKeys.toArray());
     }
 
     private static final class EvidenceRowMapper implements RowMapper<Evidence> {
@@ -96,6 +116,7 @@ public class EvidenceRepository {
                     rs.getString("seal_no"),
                     rs.getString("custodian_id"),
                     EvidenceStatus.valueOf(rs.getString("status")),
+                    rs.getLong("version"),
                     rs.getObject("created_at", LocalDateTime.class),
                     rs.getObject("updated_at", LocalDateTime.class));
         }
