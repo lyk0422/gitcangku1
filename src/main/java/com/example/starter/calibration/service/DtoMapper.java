@@ -8,7 +8,6 @@ import com.example.starter.calibration.api.dto.MeasurementResponse;
 import com.example.starter.calibration.api.dto.ReleaseRecordResponse;
 import com.example.starter.calibration.model.Certificate;
 import com.example.starter.calibration.model.Measurement;
-import com.example.starter.calibration.model.MeasurementStatus;
 import com.example.starter.calibration.model.ReleaseRecord;
 
 /**
@@ -41,9 +40,12 @@ final class DtoMapper {
                 cert.createdAt());
     }
 
-    static MeasurementResponse toResponse(Measurement m, boolean certificateRevoked,
-                                          List<ReleaseRecord> releases) {
-        boolean usable = m.status() == MeasurementStatus.RELEASED && !certificateRevoked;
+    /**
+     * 测量明细映射。revisionOfKey/rootKey 由调用方预先解析；usable 表示存在
+     * RELEASED 状态批次引用该测量且证书未撤销。
+     */
+    static MeasurementResponse toResponse(Measurement m, boolean usable, String revisionOfKey,
+                                          String rootKey, List<ReleaseRecord> releases) {
         return new MeasurementResponse(
                 m.id(),
                 m.measurementKey(),
@@ -59,6 +61,10 @@ final class DtoMapper {
                 m.passed(),
                 m.status().name(),
                 usable,
+                m.version(),
+                revisionOfKey,
+                rootKey,
+                m.note(),
                 m.createdAt(),
                 releases.stream().map(DtoMapper::toResponse).toList());
     }

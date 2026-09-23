@@ -29,7 +29,12 @@ class MeasurementSubmitTest {
 
     @BeforeEach
     void clean() {
+        jdbc.update("DELETE FROM request_idempotency");
+        jdbc.update("DELETE FROM batch_lineage");
+        jdbc.update("DELETE FROM review_item");
+        jdbc.update("DELETE FROM batch_review");
         jdbc.update("DELETE FROM release_record");
+        jdbc.update("DELETE FROM release_batch");
         jdbc.update("DELETE FROM measurement");
         jdbc.update("DELETE FROM calibration_certificate");
         jdbc.update("DELETE FROM instrument_lock");

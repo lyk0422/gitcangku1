@@ -44,4 +44,9 @@ public class ApiException extends RuntimeException {
     public static ApiException unprocessable(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "NO_MATCHING_CERTIFICATE", message);
     }
+
+    /** 403：操作者不被允许（如复核人即原放行人）。 */
+    public static ApiException forbidden(String code, String message) {
+        return new ApiException(HttpStatus.FORBIDDEN, code, message);
+    }
 }

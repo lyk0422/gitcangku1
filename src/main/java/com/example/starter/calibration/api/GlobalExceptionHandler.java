@@ -22,6 +22,12 @@ public class GlobalExceptionHandler {
                 .body(new ErrorResponse(ex.getCode(), ex.getMessage(), ex.getFailures()));
     }
 
+    @ExceptionHandler(ItemsConflictException.class)
+    public ResponseEntity<ErrorResponse> handleItemsConflict(ItemsConflictException ex) {
+        return ResponseEntity.status(ex.getStatus())
+                .body(new ErrorResponse(ex.getCode(), ex.getMessage(), ex.getFailures()));
+    }
+
     @ExceptionHandler(ApiException.class)
     public ResponseEntity<ErrorResponse> handleApi(ApiException ex) {
         return ResponseEntity.status(ex.getStatus())

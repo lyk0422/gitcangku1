@@ -14,15 +14,19 @@ import com.example.starter.calibration.api.ApiException;
 import com.example.starter.calibration.api.BatchRejectedException;
 import com.example.starter.calibration.api.ItemFailure;
 import com.example.starter.calibration.api.dto.ReleaseResponse;
+import com.example.starter.calibration.model.BatchStatus;
 import com.example.starter.calibration.model.Certificate;
 import com.example.starter.calibration.model.Measurement;
 import com.example.starter.calibration.model.MeasurementStatus;
+import com.example.starter.calibration.model.ReleaseBatch;
+import com.example.starter.calibration.repo.BatchRepository;
 import com.example.starter.calibration.repo.CertificateRepository;
 import com.example.starter.calibration.repo.MeasurementRepository;
 import com.example.starter.calibration.repo.ReleaseRepository;
 
 /**
  * 批量放行服务：每批 1～50 条，整批原子生效；任一项不满足条件则整批拒绝（409）并返回各项原因。
+ * 成功生成 RELEASED 状态批次，并按提交顺序固化逐位置明细，作为后续复核与重新放行的基准。
  */
 @Service
 public class ReleaseService {
@@ -33,13 +37,16 @@ public class ReleaseService {
     private final MeasurementRepository measurements;
     private final CertificateRepository certificates;
     private final ReleaseRepository releases;
+    private final BatchRepository batches;
 
     public ReleaseService(MeasurementRepository measurements,
                           CertificateRepository certificates,
-                          ReleaseRepository releases) {
+                          ReleaseRepository releases,
+                          BatchRepository batches) {
         this.measurements = measurements;
         this.certificates = certificates;
         this.releases = releases;
+        this.batches = batches;
     }
 
     /**
@@ -59,7 +66,8 @@ public class ReleaseService {
         }
 
         List<ItemFailure> failures = new ArrayList<>();
-        List<Measurement> approved = new ArrayList<>();
+        // 按字典序加锁，但 approved 保留提交顺序以便固化位置
+        List<Measurement> lockedOrdered = new ArrayList<>();
         for (String key : orderedKeys.stream().sorted().toList()) {
             var locked = measurements.findByKeyForUpdate(key);
             if (locked.isEmpty()) {
@@ -86,7 +94,7 @@ public class ReleaseService {
                 reasons.add("SAME_ACTOR");
             }
             if (reasons.isEmpty()) {
-                approved.add(measurement);
+                lockedOrdered.add(measurement);
             } else {
                 failures.add(new ItemFailure(key, reasons));
             }
@@ -98,9 +106,13 @@ public class ReleaseService {
 
         String batchId = UUID.randomUUID().toString();
         Instant releasedAt = Instant.now();
-        for (Measurement measurement : approved) {
+        batches.insert(new ReleaseBatch(batchId, releaser, BatchStatus.RELEASED, releasedAt, null));
+        for (int i = 0; i < orderedKeys.size(); i++) {
+            String key = orderedKeys.get(i);
+            Measurement measurement = lockedOrdered.stream()
+                    .filter(m -> m.measurementKey().equals(key)).findFirst().orElseThrow();
             measurements.markReleased(measurement.id());
-            releases.insert(batchId, measurement.id(), releaser, releasedAt);
+            releases.insert(batchId, i + 1, measurement.id(), releaser, releasedAt);
         }
         return new ReleaseResponse(batchId, releaser, releasedAt, orderedKeys);
     }

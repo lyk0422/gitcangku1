@@ -64,16 +64,19 @@ public class MeasurementService {
         Measurement measurement = new Measurement(
                 0L, key, instrumentId, measuredAt, reading, lower, upper, submittedBy,
                 cert.id(), computed, passed, MeasurementStatus.PENDING, Instant.now());
+        long id;
         try {
-            measurements.insert(measurement);
+            id = measurements.insert(measurement);
         } catch (DuplicateKeyException ex) {
             throw ApiException.conflict("DUPLICATE_MEASUREMENT_KEY", "测量键已存在: " + key);
         }
+        // 原始测量的修订链根指向自身
+        measurements.updateRootId(id, id);
         return toDetail(measurements.findByKey(key).orElseThrow());
     }
 
     /**
-     * 历史明细：包含原始测量、未舍入计算值、显示值与放行历史；不存在返回 404。
+     * 历史明细：包含原始测量、未舍入计算值、显示值、版本链键与放行历史；不存在返回 404。
      */
     @Transactional(readOnly = true)
     public MeasurementResponse detail(String key) {
@@ -83,7 +86,7 @@ public class MeasurementService {
     }
 
     /**
-     * 当前可用结果：已放行且证书未撤销。instrumentId 为 null 时返回全部仪器。
+     * 当前可用结果：已放行且存在 RELEASED 状态批次引用、证书未撤销。instrumentId 为 null 时返回全部仪器。
      */
     @Transactional(readOnly = true)
     public List<MeasurementResponse> usable(String instrumentId) {
@@ -93,11 +96,17 @@ public class MeasurementService {
                 .toList();
     }
 
-    private MeasurementResponse toDetail(Measurement measurement) {
-        boolean certRevoked = certificates.findById(measurement.certificateId())
-                .map(Certificate::revoked)
-                .orElse(true);
-        return DtoMapper.toResponse(measurement, certRevoked,
+    /**
+     * 将测量实体映射为响应；解析修订链前驱/根业务键与当前可用性。
+     */
+    public MeasurementResponse toDetail(Measurement measurement) {
+        String revisionOfKey = measurement.revisionOf() == null ? null
+                : measurements.findById(measurement.revisionOf()).map(Measurement::measurementKey).orElse(null);
+        long rootId = measurement.rootId() == null ? measurement.id() : measurement.rootId();
+        String rootKey = measurements.findById(rootId).map(Measurement::measurementKey)
+                .orElse(measurement.measurementKey());
+        boolean usable = measurements.isUsable(measurement.id());
+        return DtoMapper.toResponse(measurement, usable, revisionOfKey, rootKey,
                 releases.findByMeasurementId(measurement.id()));
     }
 }

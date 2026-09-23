@@ -9,5 +9,8 @@ public enum MeasurementStatus {
     PENDING,
 
     /** 已放行：经批量放行接口原子放行。证书撤销后状态保留，仅失去“当前可用”资格。 */
-    RELEASED
+    RELEASED,
+
+    /** 复核驳回：批次复核驳回后被驳回测量的状态，等待原提交人创建后继修订。 */
+    REJECTED
 }
