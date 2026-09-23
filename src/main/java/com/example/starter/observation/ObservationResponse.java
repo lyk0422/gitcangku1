@@ -7,6 +7,7 @@ import com.fasterxml.jackson.annotation.JsonInclude;
  *
  * @param observationId 观测记录唯一标识
  * @param version       版本号
+ * @param generation    合并代次：初始 1，墓碑显式恢复后加一，删除不变
  * @param deleted       是否为删除墓碑
  * @param location      观测地点（墓碑版本不返回）
  * @param reading       观测读数（墓碑版本不返回）
@@ -16,6 +17,7 @@ import com.fasterxml.jackson.annotation.JsonInclude;
 public record ObservationResponse(
         String observationId,
         int version,
+        int generation,
         boolean deleted,
         String location,
         String reading,
@@ -26,9 +28,11 @@ public record ObservationResponse(
      */
     public static ObservationResponse of(ObservationSnapshot snapshot) {
         if (snapshot.deleted()) {
-            return new ObservationResponse(snapshot.observationId(), snapshot.version(), true, null, null, null);
+            return new ObservationResponse(snapshot.observationId(), snapshot.version(),
+                    snapshot.generation(), true, null, null, null);
         }
-        return new ObservationResponse(snapshot.observationId(), snapshot.version(), false,
+        return new ObservationResponse(snapshot.observationId(), snapshot.version(),
+                snapshot.generation(), false,
                 snapshot.location(), snapshot.reading(), snapshot.note());
     }
 }

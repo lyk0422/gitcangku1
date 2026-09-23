@@ -15,7 +15,8 @@ import org.springframework.web.bind.annotation.RestController;
 import java.util.List;
 
 /**
- * 现场观测离线合并 API：创建、离线提交（三方合并）、冲突显式解决、删除、当前/历史版本与解决记录查询。
+ * 现场观测离线合并 API：创建、离线提交（三方合并）、冲突显式解决、删除、墓碑显式恢复，
+ * 以及当前/历史版本（含合并代次）、解决记录与恢复历史查询。
  */
 @RestController
 @RequestMapping("/api/observations")
@@ -56,6 +57,16 @@ public class ObservationController {
     public ResponseEntity<ObservationResponse> delete(@PathVariable String observationId,
                                                       @Valid @RequestBody DeleteObservationRequest request) {
         ObservationService.WriteOutcome outcome = observationService.delete(observationId, request);
+        return ResponseEntity.status(outcome.status()).body(outcome.body());
+    }
+
+    /**
+     * 墓碑显式恢复：当前为墓碑且 expectedVersion 匹配时，从非墓碑历史版本复制内容生成新版本，代次加一。
+     */
+    @PostMapping("/{observationId}/restore")
+    public ResponseEntity<ObservationResponse> restore(@PathVariable String observationId,
+                                                       @Valid @RequestBody RestoreObservationRequest request) {
+        ObservationService.WriteOutcome outcome = observationService.restore(observationId, request);
         return ResponseEntity.status(outcome.status()).body(outcome.body());
     }
 
@@ -102,6 +113,16 @@ public class ObservationController {
     public List<ResolutionResponse> listResolutions(@PathVariable String observationId) {
         return observationService.listResolutions(observationId).stream()
                 .map(this::resolutionResponse)
+                .toList();
+    }
+
+    /**
+     * 按 observationId 查询墓碑恢复历史，按恢复时刻先后排序；只读不写。
+     */
+    @GetMapping("/{observationId}/recoveries")
+    public List<RecoveryResponse> listRecoveries(@PathVariable String observationId) {
+        return observationService.listRecoveries(observationId).stream()
+                .map(RecoveryResponse::of)
                 .toList();
     }
 

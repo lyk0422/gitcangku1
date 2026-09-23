@@ -68,4 +68,11 @@ public class ApiException extends RuntimeException {
     public static ApiException gone(String message) {
         return new ApiException(HttpStatus.GONE, message, null, null);
     }
+
+    /**
+     * 422：请求语义不合法，如墓碑恢复的来源版本本身是墓碑。
+     */
+    public static ApiException unprocessable(String message, Integer currentVersion) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, message, null, currentVersion);
+    }
 }

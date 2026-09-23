@@ -36,6 +36,11 @@ import java.util.Set;
  * <p>显式冲突解决（RESOLVE）在同一套占位与行锁机制内执行：事务内重读基线与最新当前版本重算冲突，
  * 人工选择必须恰好覆盖重算后的冲突字段；成功后原子写入新观测版本（内容无变化则不加版本）、
  * 不可变 conflict_resolution 记录与 request_log 响应。resolutionId 全局唯一，同参重放、改参 409。
+ *
+ * <p>墓碑显式恢复（RESTORE）仅在当前为墓碑且 expectedVersion 匹配时允许：来源必须是本记录已存在的
+ * 非墓碑历史版本（可跨合并代次），恢复复制其地点、读数与备注，生成“墓碑版本 + 1”的新快照，
+ * 不回退版本、不改写任何历史快照/冲突解决记录/墓碑，合并代次加一。恢复后 merge/resolve 只接受
+ * 本代次 baseVersion，旧代次基线返回 409 并给出当前版本；恢复与原业务写入共用同一套全局 requestId 规则。
  */
 @Service
 public class ObservationService {
@@ -50,17 +55,20 @@ public class ObservationService {
     private final ObservationRepository observationRepository;
     private final RequestLogRepository requestLogRepository;
     private final ResolutionRepository resolutionRepository;
+    private final RecoveryRepository recoveryRepository;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public ObservationService(ObservationRepository observationRepository,
                               RequestLogRepository requestLogRepository,
                               ResolutionRepository resolutionRepository,
+                              RecoveryRepository recoveryRepository,
                               ObjectMapper objectMapper,
                               Clock clock) {
         this.observationRepository = observationRepository;
         this.requestLogRepository = requestLogRepository;
         this.resolutionRepository = resolutionRepository;
+        this.recoveryRepository = recoveryRepository;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -84,7 +92,7 @@ public class ObservationService {
         if (observationRepository.findCurrentForUpdate(request.observationId()).isPresent()) {
             throw ApiException.conflict("observation already exists: " + request.observationId(), null);
         }
-        ObservationSnapshot snapshot = new ObservationSnapshot(request.observationId(), 1,
+        ObservationSnapshot snapshot = new ObservationSnapshot(request.observationId(), 1, 1,
                 request.location(), request.reading(), request.note(), false);
         try {
             observationRepository.insertCurrent(snapshot);
@@ -120,6 +128,13 @@ public class ObservationService {
         ObservationSnapshot base = observationRepository.findVersion(observationId, request.baseVersion())
                 .orElseThrow(() -> ApiException.notFound(
                         "base version not found: " + observationId + "@" + request.baseVersion()));
+        // 代次隔离：仅接受本代次的基线；墓碑恢复后旧代次的离线修改不得直接灌入恢复后的记录。
+        if (base.generation() != current.generation()) {
+            throw ApiException.conflict(
+                    "baseVersion belongs to a stale merge generation; re-read the current baseline: "
+                            + observationId + "@" + request.baseVersion(),
+                    current.version());
+        }
 
         List<String> conflictFields = new ArrayList<>();
         String mergedLocation = mergeField("location", base.location(), current.location(),
@@ -132,13 +147,13 @@ public class ObservationService {
         }
 
         ObservationSnapshot merged = new ObservationSnapshot(observationId, current.version(),
-                mergedLocation, mergedReading, mergedNote, false);
+                current.generation(), mergedLocation, mergedReading, mergedNote, false);
         if (sameContent(merged, current)) {
             // 合并结果与当前完全相同：返回当前版本，不加版本
             return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(current));
         }
         ObservationSnapshot next = new ObservationSnapshot(observationId, current.version() + 1,
-                mergedLocation, mergedReading, mergedNote, false);
+                current.generation(), mergedLocation, mergedReading, mergedNote, false);
         observationRepository.updateCurrent(next);
         observationRepository.insertVersion(next);
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(next));
@@ -168,10 +183,74 @@ public class ObservationService {
             throw ApiException.conflict("expectedVersion mismatch", current.version());
         }
         ObservationSnapshot tombstone = new ObservationSnapshot(observationId, current.version() + 1,
-                null, null, null, true);
+                current.generation(), null, null, null, true);
         observationRepository.markDeleted(observationId, tombstone.version());
         observationRepository.insertVersion(tombstone);
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(tombstone));
+    }
+
+    /**
+     * 墓碑显式恢复：仅当当前为墓碑且 expectedVersion 匹配当前墓碑版本时允许恢复。
+     * 来源必须是本记录已存在的非墓碑历史版本（可跨代次）；恢复复制其地点、读数与备注，
+     * 生成“墓碑版本 + 1”的新快照，不回退版本、不改写任何历史快照/冲突解决记录/墓碑，
+     * 合并代次加一。与其他写操作共用同一套 requestId 幂等规则。
+     */
+    @Transactional
+    public WriteOutcome restore(String observationId, RestoreObservationRequest request) {
+        String fingerprint = fingerprint("RESTORE", observationId,
+                String.valueOf(request.expectedVersion()), String.valueOf(request.sourceVersion()),
+                request.reason());
+        WriteOutcome replayed = checkReplay(request.requestId(), fingerprint);
+        if (replayed != null) {
+            return replayed;
+        }
+        WriteOutcome concurrent = insertPlaceholder(request.requestId(), fingerprint, "RESTORE");
+        if (concurrent != null) {
+            return concurrent;
+        }
+
+        ObservationSnapshot current = observationRepository.findCurrentForUpdate(observationId)
+                .orElseThrow(() -> ApiException.notFound("observation not found: " + observationId));
+        // 当前非墓碑：不允许恢复，返回 409 并给出当前版本。
+        if (!current.deleted()) {
+            throw ApiException.conflict("observation is not a tombstone: " + observationId,
+                    current.version());
+        }
+        if (request.expectedVersion() != current.version()) {
+            throw ApiException.conflict("expectedVersion mismatch", current.version());
+        }
+        ObservationSnapshot source = observationRepository.findVersion(observationId, request.sourceVersion())
+                .orElseThrow(() -> ApiException.notFound(
+                        "source version not found: " + observationId + "@" + request.sourceVersion()));
+        // 来源为墓碑：语义不合法，返回 422。
+        if (source.deleted()) {
+            throw ApiException.unprocessable(
+                    "source version is a tombstone: " + observationId + "@" + request.sourceVersion(),
+                    current.version());
+        }
+
+        int newGeneration = current.generation() + 1;
+        ObservationSnapshot restored = new ObservationSnapshot(observationId, current.version() + 1,
+                newGeneration, source.location(), source.reading(), source.note(), false);
+        observationRepository.restoreCurrent(restored);
+        observationRepository.insertVersion(restored);
+
+        RecoveryRecord record = new RecoveryRecord(
+                observationId, restored.version(), current.version(), source.version(),
+                current.generation(), newGeneration, request.reason(), request.requestId(),
+                Instant.now(clock));
+        recoveryRepository.insert(record);
+        return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(restored));
+    }
+
+    /**
+     * 按 observationId 查询墓碑恢复历史，按恢复时刻先后排序；观测记录不存在返回 404。只读不写。
+     */
+    @Transactional(readOnly = true)
+    public List<RecoveryRecord> listRecoveries(String observationId) {
+        observationRepository.findCurrent(observationId)
+                .orElseThrow(() -> ApiException.notFound("observation not found: " + observationId));
+        return recoveryRepository.findByObservationId(observationId);
     }
 
     /**
@@ -229,6 +308,13 @@ public class ObservationService {
         ObservationSnapshot base = observationRepository.findVersion(observationId, request.baseVersion())
                 .orElseThrow(() -> ApiException.notFound(
                         "base version not found: " + observationId + "@" + request.baseVersion()));
+        // 代次隔离：显式解决同样只接受本代次基线；旧代次基线返回 409 并给出当前版本。
+        if (base.generation() != current.generation()) {
+            throw ApiException.conflict(
+                    "baseVersion belongs to a stale merge generation; re-read the current baseline: "
+                            + observationId + "@" + request.baseVersion(),
+                    current.version());
+        }
 
         List<String> conflictFields = new ArrayList<>();
         boolean locationConflict = fieldConflicts(base.location(), current.location(), request.location(), false);
@@ -253,12 +339,12 @@ public class ObservationService {
                 base.note(), current.note(), request.note(), false);
 
         ObservationSnapshot merged = new ObservationSnapshot(observationId, current.version(),
-                resolvedLocation, resolvedReading, resolvedNote, false);
+                current.generation(), resolvedLocation, resolvedReading, resolvedNote, false);
         boolean contentChanged = !sameContent(merged, current);
         int newVersion = contentChanged ? current.version() + 1 : current.version();
         if (contentChanged) {
             ObservationSnapshot next = new ObservationSnapshot(observationId, newVersion,
-                    resolvedLocation, resolvedReading, resolvedNote, false);
+                    current.generation(), resolvedLocation, resolvedReading, resolvedNote, false);
             observationRepository.updateCurrent(next);
             observationRepository.insertVersion(next);
         }
@@ -285,7 +371,8 @@ public class ObservationService {
         }
 
         ObservationSnapshot pointed = contentChanged
-                ? new ObservationSnapshot(observationId, newVersion, resolvedLocation, resolvedReading, resolvedNote, false)
+                ? new ObservationSnapshot(observationId, newVersion, current.generation(),
+                        resolvedLocation, resolvedReading, resolvedNote, false)
                 : current;
         return completeResolve(request.requestId(), HttpStatus.OK,
                 ResolutionResponse.of(record, pointed, objectMapper));
