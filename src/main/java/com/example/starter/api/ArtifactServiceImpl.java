@@ -1,20 +1,33 @@
 package com.example.starter.api;
 
 import com.example.starter.api.dto.ArtifactResponse;
+import com.example.starter.api.dto.CandidateRejectionResponse;
 import com.example.starter.api.dto.DependencySpec;
 import com.example.starter.api.dto.DependencyView;
 import com.example.starter.api.dto.LockEntryResponse;
 import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
+import com.example.starter.api.dto.PolicyResponse;
+import com.example.starter.api.dto.PublishPolicyRequest;
 import com.example.starter.api.dto.RegisterArtifactRequest;
+import com.example.starter.api.dto.SubstitutionStepResponse;
 import com.example.starter.domain.ArtifactVersion;
-import com.example.starter.domain.DependencyRange;
-import com.example.starter.domain.LockResolver;
+import com.example.starter.domain.CoordinatePattern;
+import com.example.starter.domain.PlatformAvailability;
+import com.example.starter.domain.PolicyValidator;
 import com.example.starter.domain.RepositorySnapshot;
+import com.example.starter.domain.SubstitutionCandidate;
+import com.example.starter.domain.SubstitutionFailureException;
+import com.example.starter.domain.SubstitutionLockResolver;
+import com.example.starter.domain.SubstitutionPolicy;
+import com.example.starter.domain.SubstitutionResult;
+import com.example.starter.domain.SubstitutionRule;
+import com.example.starter.domain.SubstitutionStep;
 import com.example.starter.repo.RepositoryDao;
 import com.example.starter.repo.RepositoryDao.IdempotentRecord;
 import com.example.starter.repo.RepositoryDao.LockEntryRow;
 import com.example.starter.repo.RepositoryDao.LockFileRow;
+import com.example.starter.repo.RepositoryDao.PolicySummaryRow;
 import com.example.starter.support.ApiException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
@@ -27,6 +40,7 @@ import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -37,17 +51,21 @@ import java.util.function.Supplier;
 /**
  * 制品仓库业务服务实现。
  *
- * <p>所有写操作在单个事务内完成：先锁单行仓库版本表互斥并发写，
- * 再做业务变更并写入幂等成功记录，原子提交；业务失败整体回滚，不占用 requestId。
+ * <p>所有写操作在单个事务内完成：先锁单行仓库版本表（策略发布同时锁策略版本表）
+ * 互斥并发写，再做业务变更并写入幂等成功记录，原子提交；业务失败整体回滚，不占用 requestId。
+ * 锁定事务在同一快照内读取制品、撤回状态、平台可用性与唯一 policyVersion。
  */
 @Service
 public class ArtifactServiceImpl implements ArtifactService {
 
     private static final int MAX_NAMES = 20;
     private static final int MAX_VERSIONS_PER_NAME = 5;
+    private static final int MAX_PLATFORMS = 10;
 
     private static final String OP_REGISTER = "REGISTER_ARTIFACT";
     private static final String OP_WITHDRAW = "WITHDRAW_ARTIFACT";
+    private static final String OP_RESTORE = "RESTORE_ARTIFACT";
+    private static final String OP_POLICY = "PUBLISH_POLICY";
     private static final String OP_LOCK = "CREATE_LOCK";
 
     private final RepositoryDao repositoryDao;
@@ -70,7 +88,7 @@ public class ArtifactServiceImpl implements ArtifactService {
         requireRequestId(requestId);
         validateRegisterRequest(request);
         String hash = sha256(OP_REGISTER + "|" + request.name().trim() + "|" + request.version() + "|"
-                + canonicalDependencies(request));
+                + canonicalDependencies(request) + "|" + canonicalPlatforms(request.platforms()));
         return executeIdempotent(requestId, OP_REGISTER, hash, 201,
                 () -> doRegister(request), ArtifactResponse.class);
     }
@@ -87,13 +105,70 @@ public class ArtifactServiceImpl implements ArtifactService {
     }
 
     @Override
+    public ArtifactResponse restoreArtifact(String requestId, String name, int version) {
+        requireRequestId(requestId);
+        if (name == null || name.isBlank()) {
+            throw ApiException.badRequest("name 不能为空");
+        }
+        String hash = sha256(OP_RESTORE + "|" + name.trim() + "|" + version);
+        return executeIdempotent(requestId, OP_RESTORE, hash, 200,
+                () -> doRestore(name.trim(), version), ArtifactResponse.class);
+    }
+
+    @Override
+    public PolicyResponse publishPolicy(String requestId, PublishPolicyRequest request) {
+        requireRequestId(requestId);
+        if (request.rules() == null || request.rules().isEmpty()) {
+            throw ApiException.badRequest("策略至少包含一条规则");
+        }
+        List<SubstitutionRule> rules = parseRules(request);
+        try {
+            PolicyValidator.validate(rules);
+        } catch (SubstitutionFailureException e) {
+            throw ApiException.unprocessable(e.getMessage());
+        }
+        String hash = sha256(OP_POLICY + "|" + canonicalRules(rules));
+        return executeIdempotent(requestId, OP_POLICY, hash, 201,
+                () -> doPublishPolicy(rules), PolicyResponse.class);
+    }
+
+    @Override
+    public PolicyResponse getCurrentPolicy() {
+        return toPolicyResponse(repositoryDao.getCurrentPolicyVersion());
+    }
+
+    @Override
+    public PolicyResponse getPolicy(long version) {
+        if (version <= 0) {
+            throw ApiException.badRequest("policyVersion 必须为正整数");
+        }
+        PolicyResponse response = toPolicyResponse(version);
+        if (response == null) {
+            throw ApiException.notFound("策略版本不存在: " + version);
+        }
+        return response;
+    }
+
+    @Override
+    public List<PolicyResponse> listPolicies() {
+        List<PolicyResponse> result = new ArrayList<>();
+        for (PolicySummaryRow row : repositoryDao.listPolicies()) {
+            result.add(toPolicyResponse(row.version()));
+        }
+        return result;
+    }
+
+    @Override
     public LockFileResponse createLock(String requestId, LockRequest request) {
         requireRequestId(requestId);
         if (request.rootName() == null || request.rootName().isBlank()) {
             throw ApiException.badRequest("rootName 不能为空");
         }
+        if (request.platform() == null || request.platform().isBlank()) {
+            throw ApiException.badRequest("platform 不能为空");
+        }
         String hash = sha256(OP_LOCK + "|" + request.rootName().trim() + "|" + request.rootVersion()
-                + "|" + request.expectedRepositoryVersion());
+                + "|" + request.platform().trim() + "|" + request.expectedRepositoryVersion());
         return executeIdempotent(requestId, OP_LOCK, hash, 201,
                 () -> doLock(request), LockFileResponse.class);
     }
@@ -102,7 +177,9 @@ public class ArtifactServiceImpl implements ArtifactService {
     public List<LockFileResponse> listLocks() {
         List<LockFileResponse> result = new ArrayList<>();
         for (LockFileRow row : repositoryDao.listLockFiles()) {
-            result.add(toLockResponse(row, repositoryDao.listLockEntries(row.id())));
+            result.add(toLockResponse(row,
+                    repositoryDao.listLockEntries(row.id()),
+                    repositoryDao.listSubstitutionSteps(row.id())));
         }
         return result;
     }
@@ -113,7 +190,9 @@ public class ArtifactServiceImpl implements ArtifactService {
         if (row == null) {
             throw ApiException.notFound("锁文件不存在: " + id);
         }
-        return toLockResponse(row, repositoryDao.listLockEntries(id));
+        return toLockResponse(row,
+                repositoryDao.listLockEntries(id),
+                repositoryDao.listSubstitutionSteps(id));
     }
 
     // ------------------------------------------------------------------
@@ -123,6 +202,7 @@ public class ArtifactServiceImpl implements ArtifactService {
     private ArtifactResponse doRegister(RegisterArtifactRequest request) {
         String name = request.name().trim();
         int version = request.version();
+        List<String> platforms = normalizedPlatforms(request.platforms());
 
         if (repositoryDao.artifactExists(name, version)) {
             throw ApiException.conflict("制品版本已存在: " + name + ":" + version);
@@ -142,6 +222,9 @@ public class ArtifactServiceImpl implements ArtifactService {
         for (var dep : request.dependencies()) {
             repositoryDao.insertDependency(artifactId, dep.name().trim(),
                     dep.minimumVersion(), dep.maximumVersion());
+        }
+        for (String platform : platforms) {
+            repositoryDao.insertArtifactPlatform(artifactId, platform);
         }
         long repositoryVersion = repositoryDao.incrementRepositoryVersion();
 
@@ -167,9 +250,47 @@ public class ArtifactServiceImpl implements ArtifactService {
                 Instant.now(clock), toDependencyViews(artifact.dependencies()));
     }
 
+    private ArtifactResponse doRestore(String name, int version) {
+        ArtifactVersion artifact = repositoryDao.loadArtifact(name, version);
+        if (artifact == null) {
+            throw ApiException.notFound("制品版本不存在: " + name + ":" + version);
+        }
+        if (!artifact.withdrawn()) {
+            throw ApiException.conflict("制品版本未撤回，无需恢复: " + name + ":" + version);
+        }
+        int affected = repositoryDao.restoreWithdrawn(artifact.id());
+        if (affected == 0) {
+            throw ApiException.conflict("制品版本未撤回，无需恢复: " + name + ":" + version);
+        }
+        long repositoryVersion = repositoryDao.incrementRepositoryVersion();
+        return new ArtifactResponse(name, version, false, repositoryVersion,
+                Instant.now(clock), toDependencyViews(artifact.dependencies()));
+    }
+
+    private PolicyResponse doPublishPolicy(List<SubstitutionRule> rules) {
+        // 同时持有仓库与策略单行锁，使策略激活与制品变更、锁定按提交顺序串行。
+        repositoryDao.lockRepositoryState();
+        long policyVersion = repositoryDao.lockPolicyState();
+        long nextVersion = policyVersion + 1;
+        Instant now = Instant.now(clock);
+        repositoryDao.insertPolicy(nextVersion, rules.size(), now);
+        for (int i = 0; i < rules.size(); i++) {
+            SubstitutionRule rule = rules.get(i);
+            long ruleId = repositoryDao.insertRule(nextVersion, i, rule.source().raw(),
+                    rule.platform(), rule.effectiveAt());
+            for (SubstitutionCandidate candidate : rule.candidates()) {
+                repositoryDao.insertCandidate(ruleId, candidate.priority(), candidate.coordinate());
+            }
+        }
+        repositoryDao.advancePolicyVersion();
+        repositoryDao.incrementRepositoryVersion();
+        return buildPolicyResponse(nextVersion, now, rules);
+    }
+
     private LockFileResponse doLock(LockRequest request) {
         String rootName = request.rootName().trim();
         int rootVersion = request.rootVersion();
+        String platform = request.platform().trim();
 
         // 当前事务已在入口持有 repository_state 行锁；此处读取版本号并做乐观校验。
         long currentVersion = repositoryDao.lockRepositoryState();
@@ -177,6 +298,9 @@ public class ArtifactServiceImpl implements ArtifactService {
             throw ApiException.conflict("仓库版本不匹配：expected="
                     + request.expectedRepositoryVersion() + ", actual=" + currentVersion);
         }
+        // 锁定策略单行：本事务的全部读取只能看到一个 policyVersion。
+        Long policyVersion = repositoryDao.lockPolicyState();
+        Long effectivePolicyVersion = policyVersion == 0L ? null : policyVersion;
 
         ArtifactVersion root = repositoryDao.loadArtifact(rootName, rootVersion);
         if (root == null) {
@@ -187,20 +311,40 @@ public class ArtifactServiceImpl implements ArtifactService {
         }
 
         RepositorySnapshot snapshot = repositoryDao.loadSnapshot();
-        Map<String, Integer> solution = LockResolver.resolve(snapshot, rootName, rootVersion);
-        if (solution == null) {
+        PlatformAvailability availability = repositoryDao.loadAvailability();
+        SubstitutionPolicy policy = repositoryDao.loadPolicy(effectivePolicyVersion);
+        if (policy != null) {
+            // 规则集合整体激活：只保留当前时刻已生效的规则供本次解析使用。
+            Instant now = Instant.now(clock);
+            List<SubstitutionRule> effective = policy.rules().stream()
+                    .filter(rule -> !rule.effectiveAt().isAfter(now))
+                    .toList();
+            policy = new SubstitutionPolicy(policy.version(), policy.createdAt(), effective);
+        }
+
+        final SubstitutionResult result;
+        try {
+            result = SubstitutionLockResolver.resolve(snapshot, availability, policy,
+                    rootName, rootVersion, platform, Instant.now(clock));
+        } catch (SubstitutionFailureException e) {
+            throw ApiException.unprocessable(e.getMessage());
+        }
+        if (result == null) {
             throw ApiException.unprocessable(
                     "不存在满足全部依赖区间的未撤回版本组合，无法锁定");
         }
 
         Instant now = Instant.now(clock);
         long lockFileId = repositoryDao.insertLockFile(rootName, rootVersion, currentVersion,
-                currentRequestId.get(), now);
-        solution.forEach((n, v) -> repositoryDao.insertLockEntry(lockFileId, n, v));
+                platform, result.policyVersion(), currentRequestId.get(), now);
+        result.versions().forEach((n, v) -> repositoryDao.insertLockEntry(lockFileId, n, v));
+        for (SubstitutionStep step : result.steps()) {
+            repositoryDao.insertSubstitutionStep(lockFileId, step);
+        }
 
-        List<LockEntryResponse> entries = new ArrayList<>();
-        solution.forEach((n, v) -> entries.add(new LockEntryResponse(n, v)));
-        return new LockFileResponse(lockFileId, rootName, rootVersion, currentVersion, now, entries);
+        return toLockResponse(repositoryDao.getLockFile(lockFileId),
+                repositoryDao.listLockEntries(lockFileId),
+                repositoryDao.listSubstitutionSteps(lockFileId));
     }
 
     // ------------------------------------------------------------------
@@ -233,10 +377,10 @@ public class ArtifactServiceImpl implements ArtifactService {
                         requestId, operation, requestHash, Instant.now(clock));
                 currentRequestId.set(requestId);
                 try {
-                    T result = action.get();
+                    T response = action.get();
                     repositoryDao.completeIdempotentRequest(
-                            requestId, httpStatus, writeJson(result));
-                    return result;
+                            requestId, httpStatus, writeJson(response));
+                    return response;
                 } finally {
                     currentRequestId.remove();
                 }
@@ -268,7 +412,7 @@ public class ArtifactServiceImpl implements ArtifactService {
     }
 
     // ------------------------------------------------------------------
-    // 校验与转换
+    // 校验、解析与转换
     // ------------------------------------------------------------------
 
     private void validateRegisterRequest(RegisterArtifactRequest request) {
@@ -293,6 +437,60 @@ public class ArtifactServiceImpl implements ArtifactService {
                 throw ApiException.badRequest("依赖名称重复: " + depName);
             }
         }
+        List<String> platforms = normalizedPlatforms(request.platforms());
+        if (platforms.size() > MAX_PLATFORMS) {
+            throw ApiException.badRequest("每个制品版本最多声明 " + MAX_PLATFORMS + " 个平台");
+        }
+    }
+
+    private List<String> normalizedPlatforms(List<String> raw) {
+        TreeMap<String, String> sorted = new TreeMap<>();
+        if (raw != null) {
+            for (String platform : raw) {
+                if (platform == null || platform.isBlank()) {
+                    throw ApiException.badRequest("平台标识不能为空");
+                }
+                String trimmed = platform.trim();
+                if (sorted.putIfAbsent(trimmed, trimmed) != null) {
+                    throw ApiException.badRequest("平台标识重复: " + trimmed);
+                }
+            }
+        }
+        return List.copyOf(sorted.values());
+    }
+
+    private List<SubstitutionRule> parseRules(PublishPolicyRequest request) {
+        List<SubstitutionRule> rules = new ArrayList<>();
+        Set<String> candidatePriorities = new HashSet<>();
+        for (int i = 0; i < request.rules().size(); i++) {
+            PublishPolicyRequest.RuleSpec spec = request.rules().get(i);
+            if (spec.source() == null || spec.source().isBlank()) {
+                throw ApiException.badRequest("第 " + (i + 1) + " 条规则的原坐标模式不能为空");
+            }
+            if (spec.platform() == null || spec.platform().isBlank()) {
+                throw ApiException.badRequest("第 " + (i + 1) + " 条规则的平台不能为空");
+            }
+            final CoordinatePattern source;
+            try {
+                source = CoordinatePattern.of(spec.source().trim());
+            } catch (IllegalArgumentException e) {
+                throw ApiException.badRequest(e.getMessage());
+            }
+            List<SubstitutionCandidate> candidates = spec.candidates().stream()
+                    .sorted(Comparator.comparingInt(PublishPolicyRequest.CandidateSpec::priority))
+                    .map(c -> {
+                        try {
+                            return new SubstitutionCandidate(c.coordinate(), c.priority());
+                        } catch (IllegalArgumentException e) {
+                            throw ApiException.badRequest(e.getMessage());
+                        }
+                    })
+                    .toList();
+            candidatePriorities.clear();
+            rules.add(new SubstitutionRule(0L, source, spec.platform().trim(),
+                    candidates, spec.effectiveAt()));
+        }
+        return rules;
     }
 
     private String canonicalDependencies(RegisterArtifactRequest request) {
@@ -303,13 +501,32 @@ public class ArtifactServiceImpl implements ArtifactService {
                 .orElse("");
     }
 
+    private String canonicalPlatforms(List<String> platforms) {
+        if (platforms == null) {
+            return "";
+        }
+        return platforms.stream().map(String::trim).sorted().reduce((a, b) -> a + "," + b).orElse("");
+    }
+
+    private String canonicalRules(List<SubstitutionRule> rules) {
+        return rules.stream()
+                .map(rule -> rule.source().raw() + "@" + rule.platform() + ">"
+                        + rule.candidates().stream()
+                        .sorted(Comparator.comparingInt(SubstitutionCandidate::priority))
+                        .map(c -> c.priority() + ":" + c.coordinate())
+                        .reduce((a, b) -> a + ";" + b).orElse("")
+                        + "@" + rule.effectiveAt())
+                .reduce((a, b) -> a + "|" + b)
+                .orElse("");
+    }
+
     private List<DependencyView> toDependencyViews(List<?> raw) {
         TreeMap<String, DependencyView> sorted = new TreeMap<>();
         for (Object o : raw) {
-            if (o instanceof com.example.starter.api.dto.DependencySpec spec) {
+            if (o instanceof DependencySpec spec) {
                 sorted.put(spec.name().trim(), new DependencyView(
                         spec.name().trim(), spec.minimumVersion(), spec.maximumVersion()));
-            } else if (o instanceof DependencyRange range) {
+            } else if (o instanceof com.example.starter.domain.DependencyRange range) {
                 sorted.put(range.name(), new DependencyView(
                         range.name(), range.minimumVersion(), range.maximumVersion()));
             }
@@ -317,12 +534,49 @@ public class ArtifactServiceImpl implements ArtifactService {
         return List.copyOf(sorted.values());
     }
 
-    private LockFileResponse toLockResponse(LockFileRow row, List<LockEntryRow> entries) {
+    private LockFileResponse toLockResponse(LockFileRow row, List<LockEntryRow> entries,
+                                            List<SubstitutionStep> steps) {
         List<LockEntryResponse> entryViews = entries.stream()
                 .map(e -> new LockEntryResponse(e.name(), e.version()))
                 .toList();
+        List<SubstitutionStepResponse> stepViews = steps.stream()
+                .map(ArtifactServiceImpl::toStepResponse)
+                .toList();
         return new LockFileResponse(row.id(), row.rootName(), row.rootVersion(),
-                row.repositoryVersion(), row.createdAt(), entryViews);
+                row.repositoryVersion(), row.platform(), row.policyVersion(), row.createdAt(),
+                entryViews, stepViews);
+    }
+
+    private static SubstitutionStepResponse toStepResponse(SubstitutionStep step) {
+        List<CandidateRejectionResponse> rejections = step.rejections().stream()
+                .map(r -> new CandidateRejectionResponse(r.coordinate(), r.priority(), r.reason()))
+                .toList();
+        return new SubstitutionStepResponse(step.stepOrder(), step.originalCoordinate(),
+                step.sourcePattern(), step.platform(), step.finalCoordinate(),
+                step.policyVersion(), rejections);
+    }
+
+    private PolicyResponse toPolicyResponse(Long version) {
+        SubstitutionPolicy policy = repositoryDao.loadPolicy(version);
+        if (policy == null) {
+            return null;
+        }
+        return buildPolicyResponse(policy.version(), policy.createdAt(), policy.rules());
+    }
+
+    private PolicyResponse buildPolicyResponse(long version, Instant createdAt,
+                                               List<SubstitutionRule> rules) {
+        List<PolicyResponse.RuleView> ruleViews = new ArrayList<>();
+        for (int i = 0; i < rules.size(); i++) {
+            SubstitutionRule rule = rules.get(i);
+            List<PolicyResponse.CandidateView> candidates = rule.candidates().stream()
+                    .sorted(Comparator.comparingInt(SubstitutionCandidate::priority))
+                    .map(c -> new PolicyResponse.CandidateView(c.coordinate(), c.priority()))
+                    .toList();
+            ruleViews.add(new PolicyResponse.RuleView(i, rule.source().raw(),
+                    rule.platform(), rule.effectiveAt(), candidates));
+        }
+        return new PolicyResponse(version, createdAt, List.copyOf(ruleViews));
     }
 
     private void requireRequestId(String requestId) {

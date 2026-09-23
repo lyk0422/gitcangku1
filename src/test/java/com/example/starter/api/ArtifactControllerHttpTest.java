@@ -35,12 +35,19 @@ class ArtifactControllerHttpTest {
 
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM lock_step_rejection");
+        jdbcTemplate.update("DELETE FROM lock_substitution_step");
         jdbcTemplate.update("DELETE FROM lock_file_entry");
         jdbcTemplate.update("DELETE FROM lock_file");
+        jdbcTemplate.update("DELETE FROM artifact_platform");
         jdbcTemplate.update("DELETE FROM artifact_dependency");
         jdbcTemplate.update("DELETE FROM artifact");
+        jdbcTemplate.update("DELETE FROM substitution_candidate");
+        jdbcTemplate.update("DELETE FROM substitution_rule");
+        jdbcTemplate.update("DELETE FROM substitution_policy");
         jdbcTemplate.update("DELETE FROM idempotent_request");
         jdbcTemplate.update("UPDATE repository_state SET version = 0 WHERE id = 1");
+        jdbcTemplate.update("UPDATE policy_state SET current_version = 0 WHERE id = 1");
     }
 
     private static HttpHeaders jsonHeaders(String requestId) {
@@ -139,7 +146,7 @@ class ArtifactControllerHttpTest {
                 new HttpEntity<>(registerBody("lib", 2),
                         jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
 
-        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"expectedRepositoryVersion\":3}";
+        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"platform\":\"jvm\",\"expectedRepositoryVersion\":3}";
         ResponseEntity<JsonNode> lock = restTemplate.postForEntity("/api/artifacts/locks",
                 new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
                 JsonNode.class);
@@ -172,7 +179,7 @@ class ArtifactControllerHttpTest {
         restTemplate.postForEntity("/api/artifacts",
                 new HttpEntity<>(registerBody("app", 1),
                         jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
-        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"expectedRepositoryVersion\":0}";
+        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"platform\":\"jvm\",\"expectedRepositoryVersion\":0}";
         ResponseEntity<JsonNode> response = restTemplate.postForEntity("/api/artifacts/locks",
                 new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
                 JsonNode.class);
@@ -187,7 +194,7 @@ class ArtifactControllerHttpTest {
         restTemplate.postForEntity("/api/artifacts",
                 new HttpEntity<>(registerBody("lib", 1),
                         jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
-        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"expectedRepositoryVersion\":2}";
+        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"platform\":\"jvm\",\"expectedRepositoryVersion\":2}";
         ResponseEntity<JsonNode> response = restTemplate.postForEntity("/api/artifacts/locks",
                 new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
                 JsonNode.class);
@@ -211,7 +218,7 @@ class ArtifactControllerHttpTest {
         assertThat(withdrawn.getBody().path("repositoryVersion").asLong()).isEqualTo(2L);
 
         // 撤回后锁定撤回的根 → 409。
-        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"expectedRepositoryVersion\":2}";
+        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"platform\":\"jvm\",\"expectedRepositoryVersion\":2}";
         ResponseEntity<JsonNode> lockOnWithdrawn = restTemplate.postForEntity(
                 "/api/artifacts/locks",
                 new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
