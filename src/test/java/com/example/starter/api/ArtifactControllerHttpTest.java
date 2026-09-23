@@ -35,8 +35,10 @@ class ArtifactControllerHttpTest {
 
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM lock_file_optional");
         jdbcTemplate.update("DELETE FROM lock_file_entry");
         jdbcTemplate.update("DELETE FROM lock_file");
+        jdbcTemplate.update("DELETE FROM artifact_platform");
         jdbcTemplate.update("DELETE FROM artifact_dependency");
         jdbcTemplate.update("DELETE FROM artifact");
         jdbcTemplate.update("DELETE FROM idempotent_request");
@@ -60,11 +62,26 @@ class ArtifactControllerHttpTest {
         return toJson(body);
     }
 
+    private String registerBodyWithPlatforms(String name, int version, List<String> platforms,
+                                             Object... dependencies) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("name", name);
+        body.put("version", version);
+        body.put("dependencies", List.of(dependencies));
+        body.put("platforms", platforms);
+        return toJson(body);
+    }
+
     private Map<String, Object> dependency(String name, int min, int max) {
+        return dependency(name, min, max, false);
+    }
+
+    private Map<String, Object> dependency(String name, int min, int max, boolean optional) {
         Map<String, Object> dep = new LinkedHashMap<>();
         dep.put("name", name);
         dep.put("minimumVersion", min);
         dep.put("maximumVersion", max);
+        dep.put("optional", optional);
         return dep;
     }
 
@@ -139,7 +156,8 @@ class ArtifactControllerHttpTest {
                 new HttpEntity<>(registerBody("lib", 2),
                         jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
 
-        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"expectedRepositoryVersion\":3}";
+        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"targetPlatform\":\"linux/x64\","
+                + "\"expectedRepositoryVersion\":3}";
         ResponseEntity<JsonNode> lock = restTemplate.postForEntity("/api/artifacts/locks",
                 new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
                 JsonNode.class);
@@ -172,7 +190,8 @@ class ArtifactControllerHttpTest {
         restTemplate.postForEntity("/api/artifacts",
                 new HttpEntity<>(registerBody("app", 1),
                         jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
-        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"expectedRepositoryVersion\":0}";
+        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"targetPlatform\":\"linux/x64\","
+                + "\"expectedRepositoryVersion\":0}";
         ResponseEntity<JsonNode> response = restTemplate.postForEntity("/api/artifacts/locks",
                 new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
                 JsonNode.class);
@@ -187,7 +206,8 @@ class ArtifactControllerHttpTest {
         restTemplate.postForEntity("/api/artifacts",
                 new HttpEntity<>(registerBody("lib", 1),
                         jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
-        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"expectedRepositoryVersion\":2}";
+        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"targetPlatform\":\"linux/x64\","
+                + "\"expectedRepositoryVersion\":2}";
         ResponseEntity<JsonNode> response = restTemplate.postForEntity("/api/artifacts/locks",
                 new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
                 JsonNode.class);
@@ -211,11 +231,92 @@ class ArtifactControllerHttpTest {
         assertThat(withdrawn.getBody().path("repositoryVersion").asLong()).isEqualTo(2L);
 
         // 撤回后锁定撤回的根 → 409。
-        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"expectedRepositoryVersion\":2}";
+        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"targetPlatform\":\"linux/x64\","
+                + "\"expectedRepositoryVersion\":2}";
         ResponseEntity<JsonNode> lockOnWithdrawn = restTemplate.postForEntity(
                 "/api/artifacts/locks",
                 new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
                 JsonNode.class);
         assertThat(lockOnWithdrawn.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+    }
+
+    @Test
+    void platformFilteringOptionalIncludeAndSkipOverHttp() {
+        // app: 平台 linux/x64；必选 core[1,1]；可选 plugin[1,1]。
+        // core 支持 linux/x64；plugin1 必选 helper[1,1]（存在）→ included 并纳入 helper；
+        // app 还可选 miss[1,1]（不存在）→ skipped。
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBodyWithPlatforms("app", 1, List.of("linux/x64"),
+                        dependency("core", 1, 1),
+                        dependency("plugin", 1, 1, true),
+                        dependency("miss", 1, 1, true)),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBodyWithPlatforms("core", 1, List.of("linux/x64")),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("plugin", 1, dependency("helper", 1, 1)),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("helper", 1),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+
+        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"targetPlatform\":\"linux/x64\","
+                + "\"expectedRepositoryVersion\":4}";
+        ResponseEntity<JsonNode> lock = restTemplate.postForEntity("/api/artifacts/locks",
+                new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(lock.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        JsonNode body = lock.getBody();
+        assertThat(body.path("targetPlatform").asText()).isEqualTo("linux/x64");
+        assertThat(body.path("entries")).hasSize(4);
+        JsonNode optional = body.path("optionalDependencies");
+        assertThat(optional).hasSize(2);
+        assertThat(optional.get(0).path("sourceName").asText()).isEqualTo("app");
+        assertThat(optional.get(0).path("dependencyName").asText()).isEqualTo("miss");
+        assertThat(optional.get(0).path("status").asText()).isEqualTo("SKIPPED");
+        assertThat(optional.get(0).path("reason").asText()).isEqualTo("NO_COMPATIBLE_CANDIDATE");
+        assertThat(optional.get(1).path("dependencyName").asText()).isEqualTo("plugin");
+        assertThat(optional.get(1).path("status").asText()).isEqualTo("INCLUDED");
+        assertThat(optional.get(1).path("selectedVersion").asInt()).isEqualTo(1);
+    }
+
+    @Test
+    void platformIncompatibleRootReturns422OverHttp() {
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBodyWithPlatforms("app", 1, List.of("darwin/arm64")),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"targetPlatform\":\"linux/x64\","
+                + "\"expectedRepositoryVersion\":1}";
+        ResponseEntity<JsonNode> response = restTemplate.postForEntity("/api/artifacts/locks",
+                new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+    }
+
+    @Test
+    void missingTargetPlatformReturns400OverHttp() {
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("app", 1),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"expectedRepositoryVersion\":1}";
+        ResponseEntity<JsonNode> response = restTemplate.postForEntity("/api/artifacts/locks",
+                new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
+    void optionalDependencyFlagDefaultsToFalseForLegacyPayload() {
+        // 请求体不带 optional：按必选处理，依赖不可解时整体 422。
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("app", 1, dependency("ghost", 1, 1)),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"targetPlatform\":\"linux/x64\","
+                + "\"expectedRepositoryVersion\":1}";
+        ResponseEntity<JsonNode> response = restTemplate.postForEntity("/api/artifacts/locks",
+                new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
     }
 }

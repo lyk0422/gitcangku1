@@ -41,8 +41,10 @@ class ArtifactServiceH2Test {
 
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM lock_file_optional");
         jdbcTemplate.update("DELETE FROM lock_file_entry");
         jdbcTemplate.update("DELETE FROM lock_file");
+        jdbcTemplate.update("DELETE FROM artifact_platform");
         jdbcTemplate.update("DELETE FROM artifact_dependency");
         jdbcTemplate.update("DELETE FROM artifact");
         jdbcTemplate.update("DELETE FROM idempotent_request");
@@ -54,12 +56,24 @@ class ArtifactServiceH2Test {
     }
 
     private RegisterArtifactRequest artifact(String name, int version, DependencySpec... deps) {
-        return new RegisterArtifactRequest(name, version, List.of(deps));
+        return new RegisterArtifactRequest(name, version, List.of(deps), List.of());
+    }
+
+    private RegisterArtifactRequest artifactWithPlatforms(String name, int version,
+                                                          List<String> platforms,
+                                                          DependencySpec... deps) {
+        return new RegisterArtifactRequest(name, version, List.of(deps), platforms);
     }
 
     private static DependencySpec dep(String name, int min, int max) {
-        return new DependencySpec(name, min, max);
+        return new DependencySpec(name, min, max, false);
     }
+
+    private static DependencySpec opt(String name, int min, int max) {
+        return new DependencySpec(name, min, max, true);
+    }
+
+    private static final String PLATFORM = "linux/x64";
 
     // ------------------------------------------------------------------
     // 主流程
@@ -88,7 +102,7 @@ class ArtifactServiceH2Test {
         service.registerArtifact(requestId(), artifact("lib", 1));
         service.registerArtifact(requestId(), artifact("util", 1));
 
-        LockFileResponse lock = service.createLock(requestId(), new LockRequest("app", 1, 4L));
+        LockFileResponse lock = service.createLock(requestId(), new LockRequest("app", 1, PLATFORM, 4L));
 
         assertThat(lock.repositoryVersion()).isEqualTo(4L);
         assertThat(lock.rootName()).isEqualTo("app");
@@ -118,7 +132,7 @@ class ArtifactServiceH2Test {
             barrier.await(5, TimeUnit.SECONDS);
             try {
                 return service.createLock(lockRequestId,
-                        new LockRequest("app", 1, versionBefore));
+                        new LockRequest("app", 1, PLATFORM, versionBefore));
             } catch (ApiException e) {
                 return e;
             }
@@ -190,7 +204,7 @@ class ArtifactServiceH2Test {
     @Test
     void lockWithStaleExpectedRepositoryVersionReturns409WithoutSaving() {
         service.registerArtifact(requestId(), artifact("app", 1));
-        assertThatThrownBy(() -> service.createLock(requestId(), new LockRequest("app", 1, 0L)))
+        assertThatThrownBy(() -> service.createLock(requestId(), new LockRequest("app", 1, PLATFORM, 0L)))
                 .isInstanceOfSatisfying(ApiException.class,
                         e -> assertThat(e.getStatus()).isEqualTo(409));
         assertThat(service.listLocks()).isEmpty();
@@ -202,14 +216,14 @@ class ArtifactServiceH2Test {
     void lockOnWithdrawnRootReturns409() {
         service.registerArtifact(requestId(), artifact("app", 1));
         service.withdrawArtifact(requestId(), "app", 1);
-        assertThatThrownBy(() -> service.createLock(requestId(), new LockRequest("app", 1, 2L)))
+        assertThatThrownBy(() -> service.createLock(requestId(), new LockRequest("app", 1, PLATFORM, 2L)))
                 .isInstanceOfSatisfying(ApiException.class,
                         e -> assertThat(e.getStatus()).isEqualTo(409));
     }
 
     @Test
     void lockOnMissingRootReturns404() {
-        assertThatThrownBy(() -> service.createLock(requestId(), new LockRequest("ghost", 1, 0L)))
+        assertThatThrownBy(() -> service.createLock(requestId(), new LockRequest("ghost", 1, PLATFORM, 0L)))
                 .isInstanceOfSatisfying(ApiException.class,
                         e -> assertThat(e.getStatus()).isEqualTo(404));
     }
@@ -220,7 +234,7 @@ class ArtifactServiceH2Test {
         service.registerArtifact(requestId(), artifact("app", 1, dep("lib", 2, 2)));
         service.registerArtifact(requestId(), artifact("lib", 1));
 
-        assertThatThrownBy(() -> service.createLock(requestId(), new LockRequest("app", 1, 2L)))
+        assertThatThrownBy(() -> service.createLock(requestId(), new LockRequest("app", 1, PLATFORM, 2L)))
                 .isInstanceOfSatisfying(ApiException.class,
                         e -> assertThat(e.getStatus()).isEqualTo(422));
         assertThat(service.listLocks()).isEmpty();
@@ -441,15 +455,327 @@ class ArtifactServiceH2Test {
         service.registerArtifact(requestId(), artifact("app", 1, dep("lib", 1, 2)));
         service.registerArtifact(requestId(), artifact("lib", 1));
         String rid = requestId();
-        LockFileResponse first = service.createLock(rid, new LockRequest("app", 1, 2L));
+        LockFileResponse first = service.createLock(rid, new LockRequest("app", 1, PLATFORM, 2L));
 
         // 登记 lib2 并撤回 lib1，仓库前进。
         service.registerArtifact(requestId(), artifact("lib", 2));
         service.withdrawArtifact(requestId(), "lib", 1);
 
-        LockFileResponse replay = service.createLock(rid, new LockRequest("app", 1, 2L));
+        LockFileResponse replay = service.createLock(rid, new LockRequest("app", 1, PLATFORM, 2L));
         assertThat(replay.id()).isEqualTo(first.id());
         assertThat(replay.repositoryVersion()).isEqualTo(2L);
         assertThat(replay.entries()).isEqualTo(first.entries());
+    }
+
+    // ------------------------------------------------------------------
+    // 目标平台
+    // ------------------------------------------------------------------
+
+    @Test
+    void registerPersistsPlatformsAndResponseEchoesThem() {
+        ArtifactResponse response = service.registerArtifact(requestId(),
+                artifactWithPlatforms("app", 1, List.of("linux/x64", "darwin/arm64")));
+        assertThat(response.platforms()).containsExactly("darwin/arm64", "linux/x64");
+    }
+
+    @Test
+    void registerWithoutPlatformsMigratesToAnyAndParticipatesInPlatformLock() {
+        // 无平台登记（历史行为）：在任意具体平台锁定时都应可参与。
+        service.registerArtifact(requestId(), artifact("app", 1, dep("lib", 1, 1)));
+        service.registerArtifact(requestId(), artifact("lib", 1));
+        LockFileResponse lock = service.createLock(requestId(),
+                new LockRequest("app", 1, PLATFORM, 2L));
+        assertThat(lock.targetPlatform()).isEqualTo(PLATFORM);
+        assertThat(lock.entries()).hasSize(2);
+    }
+
+    @Test
+    void anyPlatformArtifactParticipatesInAnyLock() {
+        service.registerArtifact(requestId(),
+                artifactWithPlatforms("app", 1, List.of("ANY"), dep("lib", 1, 1)));
+        service.registerArtifact(requestId(), artifactWithPlatforms("lib", 1, List.of("ANY")));
+        LockFileResponse lock = service.createLock(requestId(),
+                new LockRequest("app", 1, PLATFORM, 2L));
+        assertThat(lock.entries()).extracting("name", "version")
+                .containsExactly(tuple("app", 1), tuple("lib", 1));
+    }
+
+    @Test
+    void platformIncompatibleExactRootReturns422() {
+        service.registerArtifact(requestId(),
+                artifactWithPlatforms("app", 1, List.of("darwin/arm64")));
+        assertThatThrownBy(() -> service.createLock(requestId(),
+                new LockRequest("app", 1, PLATFORM, 1L)))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(422));
+        assertThat(service.listLocks()).isEmpty();
+    }
+
+    @Test
+    void mandatoryCandidateSupportingOnlyOtherPlatformIsFilteredAndLockReturns422() {
+        // app 支持 linux/x64 且必选 lib[1,1]；lib1 只支持 darwin/arm64，必选无解 → 422，不保存。
+        service.registerArtifact(requestId(),
+                artifactWithPlatforms("app", 1, List.of(PLATFORM), dep("lib", 1, 1)));
+        service.registerArtifact(requestId(),
+                artifactWithPlatforms("lib", 1, List.of("darwin/arm64")));
+        assertThatThrownBy(() -> service.createLock(requestId(),
+                new LockRequest("app", 1, PLATFORM, 2L)))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(422));
+        assertThat(service.listLocks()).isEmpty();
+    }
+
+    @Test
+    void platformSpecificHighestVersionIsSkippedAndLowerCompatibleVersionChosen() {
+        // lib2 仅支持 darwin/arm64，lib1 支持 linux/x64：平台过滤后必选解析必须回退到 lib1。
+        service.registerArtifact(requestId(),
+                artifactWithPlatforms("app", 1, List.of(PLATFORM), dep("lib", 1, 2)));
+        service.registerArtifact(requestId(),
+                artifactWithPlatforms("lib", 2, List.of("darwin/arm64")));
+        service.registerArtifact(requestId(),
+                artifactWithPlatforms("lib", 1, List.of(PLATFORM)));
+        LockFileResponse lock = service.createLock(requestId(),
+                new LockRequest("app", 1, PLATFORM, 3L));
+        assertThat(lock.entries()).extracting("name", "version")
+                .containsExactly(tuple("app", 1), tuple("lib", 1));
+    }
+
+    @Test
+    void invalidPlatformFormatReturns400() {
+        assertThatThrownBy(() -> service.registerArtifact(requestId(),
+                artifactWithPlatforms("app", 1, List.of("linux-x64"))))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(400));
+    }
+
+    @Test
+    void anyPlatformMixedWithConcretePlatformReturns400() {
+        assertThatThrownBy(() -> service.registerArtifact(requestId(),
+                artifactWithPlatforms("app", 1, List.of("ANY", PLATFORM))))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(400));
+    }
+
+    @Test
+    void moreThanTenPlatformsReturn400() {
+        List<String> platforms = new ArrayList<>();
+        for (int i = 0; i < 11; i++) {
+            platforms.add("os" + i + "/arch" + i);
+        }
+        assertThatThrownBy(() -> service.registerArtifact(requestId(),
+                artifactWithPlatforms("app", 1, platforms)))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(400));
+    }
+
+    // ------------------------------------------------------------------
+    // 可选依赖：加入、跳过、闭包、不影响必选
+    // ------------------------------------------------------------------
+
+    @Test
+    void optionalDependencyIsIncludedWithHighestCompatibleVersionAndClosure() {
+        // app 必选 core[1,1]，可选 plugin[1,2]；plugin2 必选 helper[1,1]，plugin1 无依赖。
+        // 取最高 plugin2，并把必选闭包 helper 一并加入。
+        service.registerArtifact(requestId(), artifact("app", 1,
+                dep("core", 1, 1), opt("plugin", 1, 2)));
+        service.registerArtifact(requestId(), artifact("core", 1));
+        service.registerArtifact(requestId(),
+                artifact("plugin", 2, dep("helper", 1, 1)));
+        service.registerArtifact(requestId(), artifact("plugin", 1));
+        service.registerArtifact(requestId(), artifact("helper", 1));
+
+        LockFileResponse lock = service.createLock(requestId(),
+                new LockRequest("app", 1, PLATFORM, 5L));
+
+        assertThat(lock.entries()).extracting("name", "version")
+                .containsExactly(tuple("app", 1), tuple("core", 1),
+                        tuple("helper", 1), tuple("plugin", 2));
+        assertThat(lock.optionalDependencies()).hasSize(1);
+        assertThat(lock.optionalDependencies().get(0).status()).isEqualTo("INCLUDED");
+        assertThat(lock.optionalDependencies().get(0).sourceName()).isEqualTo("app");
+        assertThat(lock.optionalDependencies().get(0).dependencyName()).isEqualTo("plugin");
+        assertThat(lock.optionalDependencies().get(0).selectedVersion()).isEqualTo(2);
+        assertThat(lock.optionalDependencies().get(0).reason()).isNull();
+    }
+
+    @Test
+    void optionalDependencyAlreadySelectedAndSatisfyingIsIncludedWithoutChangingVersion() {
+        // app 必选 core[1,1] 且可选 lib[1,2]；core1 必选 lib[1,1]：必选阶段 lib1 已选，
+        // 可选阶段直接记 included@1，不更换版本。
+        service.registerArtifact(requestId(),
+                artifact("app", 1, dep("core", 1, 1), opt("lib", 1, 2)));
+        service.registerArtifact(requestId(), artifact("core", 1, dep("lib", 1, 1)));
+        service.registerArtifact(requestId(), artifact("lib", 2));
+        service.registerArtifact(requestId(), artifact("lib", 1));
+
+        LockFileResponse lock = service.createLock(requestId(),
+                new LockRequest("app", 1, PLATFORM, 4L));
+        assertThat(lock.entries()).extracting("name", "version")
+                .containsExactly(tuple("app", 1), tuple("core", 1), tuple("lib", 1));
+        assertThat(lock.optionalDependencies()).singleElement()
+                .satisfies(o -> {
+                    assertThat(o.status()).isEqualTo("INCLUDED");
+                    assertThat(o.selectedVersion()).isEqualTo(1);
+                });
+    }
+
+    @Test
+    void optionalDependencySelectedOutOfRangeIsSkippedAndCannotReplaceSelection() {
+        // app 必选 core[1,1] 且可选 lib[2,2]；core1 必选 lib[1,1]：必选固定 lib1，
+        // 可选区间不满足且不能更换已选版本，记 skipped，lib 保持 1。
+        service.registerArtifact(requestId(),
+                artifact("app", 1, dep("core", 1, 1), opt("lib", 2, 2)));
+        service.registerArtifact(requestId(), artifact("core", 1, dep("lib", 1, 1)));
+        service.registerArtifact(requestId(), artifact("lib", 2));
+        service.registerArtifact(requestId(), artifact("lib", 1));
+
+        LockFileResponse lock = service.createLock(requestId(),
+                new LockRequest("app", 1, PLATFORM, 4L));
+        assertThat(lock.entries()).extracting("name", "version")
+                .containsExactly(tuple("app", 1), tuple("core", 1), tuple("lib", 1));
+        assertThat(lock.optionalDependencies()).singleElement()
+                .satisfies(o -> {
+                    assertThat(o.status()).isEqualTo("SKIPPED");
+                    assertThat(o.reason()).isEqualTo("SELECTED_VERSION_OUT_OF_RANGE");
+                    assertThat(o.selectedVersion()).isNull();
+                });
+    }
+
+    @Test
+    void optionalDependencyWithoutAnyCompatibleVersionIsSkippedButLockSucceeds() {
+        // 仅有 ghost 但区间不匹配（或不存在）：SKIPPED/NO_COMPATIBLE_CANDIDATE，锁定不失败。
+        service.registerArtifact(requestId(),
+                artifact("app", 1, opt("ghost", 1, 1)));
+        service.registerArtifact(requestId(), artifact("ghost", 2));
+
+        LockFileResponse lock = service.createLock(requestId(),
+                new LockRequest("app", 1, PLATFORM, 2L));
+        assertThat(lock.entries()).extracting("name", "version")
+                .containsExactly(tuple("app", 1));
+        assertThat(lock.optionalDependencies()).singleElement()
+                .satisfies(o -> {
+                    assertThat(o.status()).isEqualTo("SKIPPED");
+                    assertThat(o.reason()).isEqualTo("NO_COMPATIBLE_CANDIDATE");
+                });
+        // 仅可选无解不影响锁文件保存。
+        LockFileResponse queried = service.getLock(lock.id());
+        assertThat(queried.entries()).isEqualTo(lock.entries());
+        assertThat(queried.optionalDependencies()).isEqualTo(lock.optionalDependencies());
+        assertThat(queried.targetPlatform()).isEqualTo(lock.targetPlatform());
+    }
+
+    @Test
+    void optionalClosureInfeasibleIsSkippedAndMandatorySelectionIsNotDowngraded() {
+        // app 必选 lib[1,2] → 必选取 lib2；app 可选 plugin[1,1]；
+        // plugin1 必选 lib[1,1]，与已选 lib2 冲突且不允许更换 → CLOSURE_INFEASIBLE，
+        // lib 必须保持 2。
+        service.registerArtifact(requestId(),
+                artifact("app", 1, dep("lib", 1, 2), opt("plugin", 1, 1)));
+        service.registerArtifact(requestId(), artifact("lib", 2, dep("app", 1, 1)));
+        service.registerArtifact(requestId(), artifact("lib", 1));
+        service.registerArtifact(requestId(),
+                artifact("plugin", 1, dep("lib", 1, 1)));
+
+        LockFileResponse lock = service.createLock(requestId(),
+                new LockRequest("app", 1, PLATFORM, 4L));
+        assertThat(lock.entries()).extracting("name", "version")
+                .containsExactly(tuple("app", 1), tuple("lib", 2));
+        assertThat(lock.optionalDependencies()).singleElement()
+                .satisfies(o -> {
+                    assertThat(o.status()).isEqualTo("SKIPPED");
+                    assertThat(o.reason()).isEqualTo("CLOSURE_INFEASIBLE");
+                });
+    }
+
+    @Test
+    void optionalResultsArePersistedInStableSourceThenDependencyOrder() {
+        // zeta 可选 zopt[1,1]（不存在→skipped），app 可选 aopt[1,1]（存在→included）。
+        // 存储与查询必须按 (sourceName, dependencyName) 排序：app/aopt 先于 zeta/zopt。
+        service.registerArtifact(requestId(), artifact("app", 1,
+                dep("zeta", 1, 1), opt("aopt", 1, 1)));
+        service.registerArtifact(requestId(),
+                artifact("zeta", 1, opt("zopt", 1, 1)));
+        service.registerArtifact(requestId(), artifact("aopt", 1));
+
+        LockFileResponse lock = service.createLock(requestId(),
+                new LockRequest("app", 1, PLATFORM, 3L));
+        assertThat(lock.optionalDependencies()).hasSize(2);
+        assertThat(lock.optionalDependencies().get(0).sourceName()).isEqualTo("app");
+        assertThat(lock.optionalDependencies().get(0).dependencyName()).isEqualTo("aopt");
+        assertThat(lock.optionalDependencies().get(0).status()).isEqualTo("INCLUDED");
+        assertThat(lock.optionalDependencies().get(1).sourceName()).isEqualTo("zeta");
+        assertThat(lock.optionalDependencies().get(1).dependencyName()).isEqualTo("zopt");
+        assertThat(lock.optionalDependencies().get(1).status()).isEqualTo("SKIPPED");
+
+        LockFileResponse queried = service.getLock(lock.id());
+        assertThat(queried.targetPlatform()).isEqualTo(PLATFORM);
+        assertThat(queried.optionalDependencies()).isEqualTo(lock.optionalDependencies());
+    }
+
+    @Test
+    void optionalIncompatibleByPlatformIsSkippedAsNoCompatibleCandidate() {
+        service.registerArtifact(requestId(),
+                artifact("app", 1, opt("plugin", 1, 1)));
+        service.registerArtifact(requestId(),
+                artifactWithPlatforms("plugin", 1, List.of("darwin/arm64")));
+
+        LockFileResponse lock = service.createLock(requestId(),
+                new LockRequest("app", 1, PLATFORM, 2L));
+        assertThat(lock.optionalDependencies()).singleElement()
+                .satisfies(o -> {
+                    assertThat(o.status()).isEqualTo("SKIPPED");
+                    assertThat(o.reason()).isEqualTo("NO_COMPATIBLE_CANDIDATE");
+                });
+        assertThat(lock.entries()).extracting("name").containsExactly("app");
+    }
+
+    // ------------------------------------------------------------------
+    // 新字段的幂等语义
+    // ------------------------------------------------------------------
+
+    @Test
+    void sameRequestIdDifferentPlatformsReturns409() {
+        String rid = requestId();
+        service.registerArtifact(rid, artifactWithPlatforms("app", 1, List.of(PLATFORM)));
+        assertThatThrownBy(() -> service.registerArtifact(rid,
+                artifactWithPlatforms("app", 1, List.of("darwin/arm64"))))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(409));
+    }
+
+    @Test
+    void sameRequestIdDifferentOptionalFlagReturns409() {
+        String rid = requestId();
+        service.registerArtifact(rid, artifact("app", 1, dep("lib", 1, 1)));
+        assertThatThrownBy(() -> service.registerArtifact(rid,
+                artifact("app", 1, opt("lib", 1, 1))))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(409));
+    }
+
+    @Test
+    void sameRequestIdDifferentTargetPlatformReturns409() {
+        service.registerArtifact(requestId(), artifact("app", 1));
+        String rid = requestId();
+        service.createLock(rid, new LockRequest("app", 1, PLATFORM, 1L));
+        assertThatThrownBy(() -> service.createLock(rid,
+                new LockRequest("app", 1, "darwin/arm64", 1L)))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(409));
+    }
+
+    @Test
+    void lockReplayReturnsSameTargetPlatformAndOptionalResults() {
+        service.registerArtifact(requestId(),
+                artifact("app", 1, opt("plugin", 1, 1)));
+        service.registerArtifact(requestId(), artifact("plugin", 1));
+        String rid = requestId();
+        LockFileResponse first = service.createLock(rid,
+                new LockRequest("app", 1, PLATFORM, 2L));
+        LockFileResponse replay = service.createLock(rid,
+                new LockRequest("app", 1, PLATFORM, 2L));
+        assertThat(replay.id()).isEqualTo(first.id());
+        assertThat(replay.targetPlatform()).isEqualTo(PLATFORM);
+        assertThat(replay.optionalDependencies()).isEqualTo(first.optionalDependencies());
     }
 }
