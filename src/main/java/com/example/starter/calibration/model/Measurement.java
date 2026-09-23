@@ -5,9 +5,11 @@ import java.time.Instant;
 
 /**
  * 测量记录。提交时按测量时刻匹配唯一有效证书，并固化未舍入计算值与合格判定。
+ * 同一 measurementKey 构成修订链：原始提交 version=0，被驳回后的后继修订 version+1。
  *
  * @param id             测量记录 ID（自增）
- * @param measurementKey 业务测量键，全局唯一（幂等键）
+ * @param measurementKey 业务测量键，同一修订链共享
+ * @param version        版本号：原始提交为 0，每次后继修订 +1
  * @param instrumentId   仪器 ID
  * @param measuredAt     测量时刻（UTC）
  * @param rawReading     原始读数，最多 6 位小数
@@ -17,12 +19,15 @@ import java.time.Instant;
  * @param certificateId  提交时匹配到的校准证书 ID
  * @param computedValue  未舍入计算值 a×读数+b
  * @param passed         是否合格（基于未舍入值，含端点）
- * @param status         状态：PENDING 待放行 / RELEASED 已放行
+ * @param status         状态：PENDING 待放行 / RELEASED 已放行 / REJECTED 复核驳回
+ * @param note           测量说明；原始提交为 null，仅修订时可填写或修改
+ * @param predecessorId  前驱测量记录 ID（修订链）；原始提交为 null
  * @param createdAt      提交时间（UTC）
  */
 public record Measurement(
         long id,
         String measurementKey,
+        int version,
         String instrumentId,
         Instant measuredAt,
         BigDecimal rawReading,
@@ -33,6 +38,8 @@ public record Measurement(
         BigDecimal computedValue,
         boolean passed,
         MeasurementStatus status,
+        String note,
+        Long predecessorId,
         Instant createdAt) {
 
     /**

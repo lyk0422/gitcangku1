@@ -31,6 +31,10 @@ class ReleaseApiTest {
 
     @BeforeEach
     void clean() {
+        jdbc.update("DELETE FROM release_lineage");
+        jdbc.update("DELETE FROM batch_snapshot");
+        jdbc.update("DELETE FROM review_record");
+        jdbc.update("DELETE FROM release_batch");
         jdbc.update("DELETE FROM release_record");
         jdbc.update("DELETE FROM measurement");
         jdbc.update("DELETE FROM calibration_certificate");

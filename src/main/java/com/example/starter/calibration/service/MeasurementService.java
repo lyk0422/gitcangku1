@@ -39,7 +39,7 @@ public class MeasurementService {
     /**
      * 提交测量。按测量时刻匹配唯一有效证书，无匹配返回 422；
      * 使用 BigDecimal 精确计算 a×读数+b，合格判断基于未舍入值且包含端点。
-     * measurementKey 重复返回 409（幂等键冲突）。
+     * (measurementKey, version=0) 重复返回 409（幂等键冲突）。
      */
     @Transactional
     public MeasurementResponse submit(SubmitMeasurementRequest request) {
@@ -62,28 +62,32 @@ public class MeasurementService {
         boolean passed = computed.compareTo(lower) >= 0 && computed.compareTo(upper) <= 0;
 
         Measurement measurement = new Measurement(
-                0L, key, instrumentId, measuredAt, reading, lower, upper, submittedBy,
-                cert.id(), computed, passed, MeasurementStatus.PENDING, Instant.now());
+                0L, key, 0, instrumentId, measuredAt, reading, lower, upper, submittedBy,
+                cert.id(), computed, passed, MeasurementStatus.PENDING, null, null, Instant.now());
         try {
             measurements.insert(measurement);
         } catch (DuplicateKeyException ex) {
             throw ApiException.conflict("DUPLICATE_MEASUREMENT_KEY", "测量键已存在: " + key);
         }
-        return toDetail(measurements.findByKey(key).orElseThrow());
+        return toDetail(measurements.findByKeyAndVersion(key, 0).orElseThrow());
     }
 
     /**
      * 历史明细：包含原始测量、未舍入计算值、显示值与放行历史；不存在返回 404。
+     * version 为 null 时返回该测量键的最新版本。
      */
     @Transactional(readOnly = true)
-    public MeasurementResponse detail(String key) {
-        Measurement measurement = measurements.findByKey(key)
-                .orElseThrow(() -> ApiException.notFound("测量不存在: " + key));
+    public MeasurementResponse detail(String key, Integer version) {
+        Measurement measurement = (version == null
+                ? measurements.findByKey(key)
+                : measurements.findByKeyAndVersion(key, version))
+                .orElseThrow(() -> ApiException.notFound("测量不存在: " + key
+                        + (version == null ? "" : " 版本 " + version)));
         return toDetail(measurement);
     }
 
     /**
-     * 当前可用结果：已放行且证书未撤销。instrumentId 为 null 时返回全部仪器。
+     * 当前可用结果：已放行、证书未撤销且所在批次生效中。instrumentId 为 null 时返回全部仪器。
      */
     @Transactional(readOnly = true)
     public List<MeasurementResponse> usable(String instrumentId) {
@@ -98,6 +102,7 @@ public class MeasurementService {
                 .map(Certificate::revoked)
                 .orElse(true);
         return DtoMapper.toResponse(measurement, certRevoked,
+                releases.hasActiveRelease(measurement.id()),
                 releases.findByMeasurementId(measurement.id()));
     }
 }

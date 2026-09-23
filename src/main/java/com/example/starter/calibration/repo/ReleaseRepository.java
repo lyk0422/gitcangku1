@@ -45,4 +45,24 @@ public class ReleaseRepository {
         return jdbc.query("SELECT * FROM release_record WHERE measurement_id = ? ORDER BY id",
                 MAPPER, measurementId);
     }
+
+    /**
+     * 查询某批次的全部放行记录（按写入顺序）。
+     */
+    public List<ReleaseRecord> findByBatchId(String batchId) {
+        return jdbc.query("SELECT * FROM release_record WHERE batch_id = ? ORDER BY id",
+                MAPPER, batchId);
+    }
+
+    /**
+     * 判断测量记录是否处于生效中的放行批次（批次状态为 RELEASED）。
+     */
+    public boolean hasActiveRelease(long measurementId) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM release_record r "
+                        + "JOIN release_batch b ON b.batch_id = r.batch_id "
+                        + "WHERE r.measurement_id = ? AND b.status = 'RELEASED'",
+                Integer.class, measurementId);
+        return count != null && count > 0;
+    }
 }

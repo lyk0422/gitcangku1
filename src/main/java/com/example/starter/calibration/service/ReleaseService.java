@@ -14,9 +14,12 @@ import com.example.starter.calibration.api.ApiException;
 import com.example.starter.calibration.api.BatchRejectedException;
 import com.example.starter.calibration.api.ItemFailure;
 import com.example.starter.calibration.api.dto.ReleaseResponse;
+import com.example.starter.calibration.model.BatchStatus;
 import com.example.starter.calibration.model.Certificate;
 import com.example.starter.calibration.model.Measurement;
 import com.example.starter.calibration.model.MeasurementStatus;
+import com.example.starter.calibration.model.ReleaseBatch;
+import com.example.starter.calibration.repo.BatchRepository;
 import com.example.starter.calibration.repo.CertificateRepository;
 import com.example.starter.calibration.repo.MeasurementRepository;
 import com.example.starter.calibration.repo.ReleaseRepository;
@@ -33,13 +36,16 @@ public class ReleaseService {
     private final MeasurementRepository measurements;
     private final CertificateRepository certificates;
     private final ReleaseRepository releases;
+    private final BatchRepository batches;
 
     public ReleaseService(MeasurementRepository measurements,
                           CertificateRepository certificates,
-                          ReleaseRepository releases) {
+                          ReleaseRepository releases,
+                          BatchRepository batches) {
         this.measurements = measurements;
         this.certificates = certificates;
         this.releases = releases;
+        this.batches = batches;
     }
 
     /**
@@ -98,6 +104,8 @@ public class ReleaseService {
 
         String batchId = UUID.randomUUID().toString();
         Instant releasedAt = Instant.now();
+        batches.insert(new ReleaseBatch(batchId, releaser, releasedAt, BatchStatus.RELEASED,
+                null, null, null));
         for (Measurement measurement : approved) {
             measurements.markReleased(measurement.id());
             releases.insert(batchId, measurement.id(), releaser, releasedAt);
