@@ -5,10 +5,12 @@ import java.util.List;
 
 /**
  * 测量明细响应。computedValue 为未舍入精确值；displayValue 为 HALF_UP 保留 4 位的显示值；
- * usable 表示“当前可用”（已放行且证书未撤销）。
+ * usable 表示“当前可用”（最新版、已放行且证书未撤销）。
  *
  * @param id             测量记录 ID
  * @param measurementKey 业务测量键
+ * @param revision       修订号，从 1 开始递增
+ * @param revisionReason 修订原因；首版为 null
  * @param instrumentId   仪器 ID
  * @param measuredAt     测量时刻（UTC）
  * @param reading        原始读数（十进制字符串）
@@ -20,13 +22,15 @@ import java.util.List;
  * @param displayValue   显示值，HALF_UP 4 位小数（十进制字符串）
  * @param passed         是否合格（基于未舍入值，含端点）
  * @param status         状态：PENDING / RELEASED
- * @param usable         当前是否可用（已放行且证书未撤销）
- * @param createdAt      提交时间（UTC）
+ * @param usable         当前是否可用（最新版、已放行且证书未撤销）
+ * @param createdAt      提交/修订时间（UTC）
  * @param releases       放行历史
  */
 public record MeasurementResponse(
         long id,
         String measurementKey,
+        int revision,
+        String revisionReason,
         String instrumentId,
         Instant measuredAt,
         String reading,

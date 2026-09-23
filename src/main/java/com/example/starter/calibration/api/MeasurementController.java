@@ -16,12 +16,15 @@ import org.springframework.web.bind.annotation.RestController;
 import com.example.starter.calibration.api.dto.MeasurementResponse;
 import com.example.starter.calibration.api.dto.ReleaseRequest;
 import com.example.starter.calibration.api.dto.ReleaseResponse;
+import com.example.starter.calibration.api.dto.ReleaseVersionsRequest;
+import com.example.starter.calibration.api.dto.ReleaseVersionsResponse;
+import com.example.starter.calibration.api.dto.ReviseMeasurementRequest;
 import com.example.starter.calibration.api.dto.SubmitMeasurementRequest;
 import com.example.starter.calibration.service.MeasurementService;
 import com.example.starter.calibration.service.ReleaseService;
 
 /**
- * 测量接口：提交、批量放行、历史明细、当前可用结果查询。
+ * 测量接口：提交、修订、版本化批量放行、旧版批量放行、版本历史、历史明细、当前可用结果查询。
  */
 @RestController
 @RequestMapping("/api/measurements")
@@ -44,8 +47,29 @@ public class MeasurementController {
     }
 
     /**
-     * 批量放行（1～50 条，原子）：200；批次非法 400；任一项不满足条件整批拒绝 409 并返回各项原因。
+     * 修订测量：200；非法参数 400；不存在 404；权限/版本/幂等冲突 409；无匹配证书 422。
+     * 原提交人通过 X-Actor-Id 携带 expectedRevision、requestId 与非空原因。
+     */
+    @PostMapping("/{key}/revisions")
+    public MeasurementResponse revise(@PathVariable String key,
+                                      @RequestBody ReviseMeasurementRequest request,
+                                      @RequestHeader("X-Actor-Id") String actor) {
+        return measurements.revise(key, request, actor);
+    }
+
+    /**
+     * 版本化批量放行（1～50 项，原子）：200；批次非法 400；任一项不满足条件整批拒绝 409。
      * 放行人通过 X-Actor-Id 请求头提供。
+     */
+    @PostMapping("/release-versions")
+    public ReleaseVersionsResponse releaseVersions(@RequestBody ReleaseVersionsRequest request,
+                                                   @RequestHeader("X-Actor-Id") String actor) {
+        return releases.releaseVersions(request.items(), actor);
+    }
+
+    /**
+     * 批量放行旧入口（1～50 条，原子）：从未修订的测量键保持可用；
+     * 已有修订的键整批 409 并要求显式版本（REVISION_REQUIRED）。
      */
     @PostMapping("/release")
     public ReleaseResponse release(@RequestBody ReleaseRequest request,
@@ -54,7 +78,7 @@ public class MeasurementController {
     }
 
     /**
-     * 当前可用结果：已放行且证书未撤销；可按仪器过滤。
+     * 当前可用结果：最新版、已放行且证书未撤销，每键至多一条；可按仪器过滤。
      */
     @GetMapping("/usable")
     public List<MeasurementResponse> usable(@RequestParam(required = false) String instrumentId) {
@@ -62,7 +86,15 @@ public class MeasurementController {
     }
 
     /**
-     * 历史明细：原始测量、计算值、显示值与放行历史；不存在 404。
+     * 版本历史：该测量键全部修订版本（按修订号升序）；不存在 404。
+     */
+    @GetMapping("/{key}/revisions")
+    public List<MeasurementResponse> history(@PathVariable String key) {
+        return measurements.history(key);
+    }
+
+    /**
+     * 历史明细：默认返回最新版本，含原始测量、计算值、显示值与放行历史；不存在 404。
      */
     @GetMapping("/{key}")
     public MeasurementResponse detail(@PathVariable String key) {

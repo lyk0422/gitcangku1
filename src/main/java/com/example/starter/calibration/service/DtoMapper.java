@@ -43,10 +43,12 @@ final class DtoMapper {
 
     static MeasurementResponse toResponse(Measurement m, boolean certificateRevoked,
                                           List<ReleaseRecord> releases) {
-        boolean usable = m.status() == MeasurementStatus.RELEASED && !certificateRevoked;
+        boolean usable = m.isLatest() && m.status() == MeasurementStatus.RELEASED && !certificateRevoked;
         return new MeasurementResponse(
                 m.id(),
                 m.measurementKey(),
+                m.revision(),
+                m.revisionReason(),
                 m.instrumentId(),
                 m.measuredAt(),
                 format(m.rawReading()),
