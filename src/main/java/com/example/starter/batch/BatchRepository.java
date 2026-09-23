@@ -14,10 +14,10 @@ import java.util.Optional;
 public class BatchRepository {
 
     /**
-     * batch 表行记录；id 同时作为同批次事件的提交顺序依据。
+     * batch 表行记录；id 同时作为同批次事件的提交顺序依据；version 为批次版本号。
      */
     public record BatchRow(long id, String batchKey, String productCode, String batchNo,
-                           String producedAt, String status, String createdAt) {
+                           String producedAt, String status, long version, String createdAt) {
     }
 
     /**
@@ -57,7 +57,7 @@ public class BatchRepository {
     private static final RowMapper<BatchRow> BATCH_MAPPER = (rs, n) -> new BatchRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("product_code"),
             rs.getString("batch_no"), rs.getString("produced_at"),
-            rs.getString("status"), rs.getString("created_at"));
+            rs.getString("status"), rs.getLong("version"), rs.getString("created_at"));
 
     private static final RowMapper<TestRow> TEST_MAPPER = (rs, n) -> new TestRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("test_key"),
@@ -118,8 +118,20 @@ public class BatchRepository {
                 String.class, batchKey);
     }
 
+    /**
+     * 状态流转：更新状态并自增版本号。检验落定、批准、召回、拆分、处置落账均经由此方法，
+     * 使 batch.version 反映批次被改写的次数，供处置单冻结与二审重校。
+     */
     public void updateStatus(String batchKey, String status) {
-        jdbc.update("UPDATE batch SET status = ? WHERE batch_key = ?", status, batchKey);
+        jdbc.update("UPDATE batch SET status = ?, version = version + 1 WHERE batch_key = ?",
+                status, batchKey);
+    }
+
+    /**
+     * 处置 HOLD：批次状态保持不变，但版本仍自增，表示处置单已对其落账（记录暂挂原因）。
+     */
+    public void incrementVersion(String batchKey) {
+        jdbc.update("UPDATE batch SET version = version + 1 WHERE batch_key = ?", batchKey);
     }
 
     public List<BatchRow> findAvailableBatches() {

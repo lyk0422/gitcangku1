@@ -59,15 +59,29 @@ public class BatchService {
     private static final int IDEMPOTENCY_MAX_ATTEMPTS = 3;
 
     private final BatchRepository repo;
+    private final DispositionRepository dispositionRepo;
     private final TransactionTemplate tx;
     private final ObjectMapper objectMapper;
 
     public BatchService(BatchRepository repo,
+                        DispositionRepository dispositionRepo,
                         PlatformTransactionManager transactionManager,
                         ObjectMapper objectMapper) {
         this.repo = repo;
+        this.dispositionRepo = dispositionRepo;
         this.tx = new TransactionTemplate(transactionManager);
         this.objectMapper = objectMapper;
+    }
+
+    /**
+     * 已完成召回处置落账（batch_disposition 有结论）的批次对旧生命周期封闭：
+     * 不可再检验、批准、召回或拆分；闭包成员均已各自落账，因此祖先转为 DESTROYED 后
+     * 后代也不会因失去"召回祖先"标记而被重新放行或拆分。
+     */
+    private void assertNotDispositionLanded(String batchKey) {
+        if (dispositionRepo.existsBatchDisposition(batchKey)) {
+            throw ApiException.conflict("批次 " + batchKey + " 已完成召回处置落账，不可再变更");
+        }
     }
 
     /**
@@ -86,7 +100,7 @@ public class BatchService {
             });
             String now = now();
             repo.insertBatch(new BatchRepository.BatchRow(0L, req.batchKey(), req.productCode(),
-                    req.batchNo(), req.producedAt().toString(), BatchStatus.QUARANTINED.name(), now));
+                    req.batchNo(), req.producedAt().toString(), BatchStatus.QUARANTINED.name(), 1L, now));
             for (int i = 0; i < items.size(); i++) {
                 repo.insertRequiredTest(req.batchKey(), items.get(i), i + 1);
             }
@@ -121,6 +135,7 @@ public class BatchService {
             }
 
             BatchStatus status = BatchStatus.valueOf(batch.status());
+            assertNotDispositionLanded(batchKey);
             assertNoRecalledAncestor(batchKey);
             if (status == BatchStatus.REJECTED || status == BatchStatus.RELEASED
                     || status == BatchStatus.RECALLED || status == BatchStatus.SPLIT) {
@@ -169,6 +184,7 @@ public class BatchService {
             BatchRepository.BatchRow batch = repo.findBatchForUpdate(batchKey)
                     .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
             BatchStatus status = BatchStatus.valueOf(batch.status());
+            assertNotDispositionLanded(batchKey);
             assertNoRecalledAncestor(batchKey);
             if (status == BatchStatus.QUARANTINED) {
                 throw ApiException.unprocessable("必做检验项未全部通过，不能批准");
@@ -224,6 +240,7 @@ public class BatchService {
             BatchRepository.BatchRow batch = repo.findBatchForUpdate(batchKey)
                     .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
             BatchStatus status = BatchStatus.valueOf(batch.status());
+            assertNotDispositionLanded(batchKey);
             if (status != BatchStatus.RELEASED && status != BatchStatus.SPLIT) {
                 throw ApiException.conflict("批次状态 " + status + " 不允许召回，仅 RELEASED 或 SPLIT 可召回");
             }
@@ -251,8 +268,10 @@ public class BatchService {
     public List<BatchResponse> listAvailable() {
         Map<String, String> parentOf = childToParent();
         Set<String> recalled = new HashSet<>(repo.findRecalledKeys());
+        Set<String> landed = new HashSet<>(dispositionRepo.findLandedKeys());
         return repo.findAvailableBatches().stream()
                 .filter(b -> !BatchStatus.SPLIT.name().equals(b.status()))
+                .filter(b -> !landed.contains(b.batchKey()))
                 .filter(b -> recalledAncestor(b.batchKey(), parentOf, recalled).isEmpty())
                 .map(this::toBatchResponse)
                 .toList();
@@ -444,6 +463,7 @@ public class BatchService {
                 return logged.get();
             }
             assertNoRecalledAncestor(parentKey);
+            assertNotDispositionLanded(parentKey);
             if (!BatchStatus.RELEASED.name().equals(parent.status())) {
                 throw ApiException.conflict(
                         "批次状态 " + parent.status() + " 不允许拆分，仅当前可用的 RELEASED 批次可拆分");
@@ -459,7 +479,7 @@ public class BatchService {
             for (int i = 0; i < children.size(); i++) {
                 SplitRequest.ChildSpec spec = children.get(i);
                 repo.insertBatch(new BatchRepository.BatchRow(0L, spec.batchKey(), parent.productCode(),
-                        spec.batchNo(), parent.producedAt(), BatchStatus.QUARANTINED.name(), now));
+                        spec.batchNo(), parent.producedAt(), BatchStatus.QUARANTINED.name(), 1L, now));
                 for (int j = 0; j < required.size(); j++) {
                     repo.insertRequiredTest(spec.batchKey(), required.get(j), j + 1);
                 }

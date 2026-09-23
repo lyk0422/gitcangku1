@@ -2,6 +2,8 @@ package com.example.starter.batch;
 
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.dao.ConcurrencyFailureException;
+import org.springframework.dao.DeadlockLoserDataAccessException;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
@@ -20,6 +22,15 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorResponse> handleApi(ApiException ex) {
         return ResponseEntity.status(ex.status())
                 .body(new ErrorResponse(ex.code(), ex.getMessage()));
+    }
+
+    /**
+     * 并发锁冲突（死锁败方/串行化失败）：事务已回滚、未部分落账，按 409 冲突返回，调用方可安全重试。
+     */
+    @ExceptionHandler({ConcurrencyFailureException.class, DeadlockLoserDataAccessException.class})
+    public ResponseEntity<ErrorResponse> handleConcurrency(RuntimeException ex) {
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(new ErrorResponse("CONFLICT", "并发冲突，操作已回滚，请重试"));
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
