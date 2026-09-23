@@ -91,3 +91,30 @@ CREATE TABLE IF NOT EXISTS playout_emergency_override (
 );
 CREATE INDEX IF NOT EXISTS idx_override_playout
     ON playout_emergency_override (channel_id, status, start_ms, end_ms, priority);
+
+CREATE TABLE IF NOT EXISTS playout_play_decision (
+    play_key          VARCHAR(64) NOT NULL PRIMARY KEY,
+    channel_id        VARCHAR(64) NOT NULL,
+    play_at_ms        BIGINT      NOT NULL,
+    business_day      DATE        NOT NULL,
+    asset_id          VARCHAR(64) NOT NULL,
+    source            VARCHAR(16) NOT NULL,
+    reason            VARCHAR(32) NULL,
+    override_key      VARCHAR(64) NULL,
+    publication_id    BIGINT      NULL,
+    published_version BIGINT      NULL,
+    segment_id        VARCHAR(64) NULL,
+    grant_id          BIGINT      NULL,
+    request_id        VARCHAR(64) NOT NULL,
+    created_at_ms     BIGINT      NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_play_decision_query
+    ON playout_play_decision (channel_id, business_day, play_at_ms, play_key);
+
+CREATE TABLE IF NOT EXISTS playout_play_receipt (
+    play_key      VARCHAR(64)  NOT NULL PRIMARY KEY,
+    result        VARCHAR(16)  NOT NULL,
+    note          VARCHAR(512) NOT NULL,
+    request_id    VARCHAR(64)  NOT NULL,
+    receipt_at_ms BIGINT       NOT NULL
+);

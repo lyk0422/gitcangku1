@@ -73,6 +73,23 @@ public class PlayoutRepository {
         }
     }
 
+    /**
+     * 播出决定固化行；登记后不可变。source 为 EMERGENCY / PROGRAM / FALLBACK；
+     * overrideKey、publicationId/publishedVersion/segmentId 按来源择一非空；grantId 为实际采用
+     * 授权，保底无授权时为 NULL。
+     */
+    public record PlayDecisionRow(String playKey, String channelId, long playAtMs,
+                                  LocalDate businessDay, String assetId, String source,
+                                  String reason, String overrideKey, Long publicationId,
+                                  Long publishedVersion, String segmentId, Long grantId,
+                                  String requestId, long createdAtMs) {
+    }
+
+    /** 播出回执行；每个播出决定至多一条，首次提交后固化。 */
+    public record ReceiptRow(String playKey, String result, String note,
+                             String requestId, long receiptAtMs) {
+    }
+
     private static final RowMapper<AssetRow> ASSET_MAPPER = (rs, n) ->
             new AssetRow(rs.getString("id"), rs.getLong("duration_ms"));
 
@@ -112,6 +129,20 @@ public class PlayoutRepository {
                     rs.getDate("business_day").toLocalDate(), rs.getString("status"),
                     rs.getString("cancel_request_id"),
                     (Long) rs.getObject("cancelled_at_ms"), rs.getLong("created_at_ms"));
+
+    private static final RowMapper<PlayDecisionRow> PLAY_DECISION_MAPPER = (rs, n) ->
+            new PlayDecisionRow(rs.getString("play_key"), rs.getString("channel_id"),
+                    rs.getLong("play_at_ms"), rs.getDate("business_day").toLocalDate(),
+                    rs.getString("asset_id"), rs.getString("source"), rs.getString("reason"),
+                    rs.getString("override_key"), (Long) rs.getObject("publication_id"),
+                    (Long) rs.getObject("published_version"), rs.getString("segment_id"),
+                    (Long) rs.getObject("grant_id"), rs.getString("request_id"),
+                    rs.getLong("created_at_ms"));
+
+    private static final RowMapper<ReceiptRow> RECEIPT_MAPPER = (rs, n) ->
+            new ReceiptRow(rs.getString("play_key"), rs.getString("result"),
+                    rs.getString("note"), rs.getString("request_id"),
+                    rs.getLong("receipt_at_ms"));
 
     // ---------- 素材 ----------
 
@@ -380,5 +411,64 @@ public class PlayoutRepository {
                         + " SET status = 'CANCELLED', cancel_request_id = ?, cancelled_at_ms = ?"
                         + " WHERE override_key = ? AND status = 'ACTIVE'",
                 cancelRequestId, cancelledAtMs, overrideKey);
+    }
+
+    // ---------- 播出决定固化 ----------
+
+    private static final String PLAY_DECISION_COLUMNS = "play_key, channel_id, play_at_ms,"
+            + " business_day, asset_id, source, reason, override_key, publication_id,"
+            + " published_version, segment_id, grant_id, request_id, created_at_ms";
+
+    public void insertPlayDecision(PlayDecisionRow row) {
+        jdbc.update("INSERT INTO playout_play_decision (" + PLAY_DECISION_COLUMNS + ")"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                row.playKey(), row.channelId(), row.playAtMs(), Date.valueOf(row.businessDay()),
+                row.assetId(), row.source(), row.reason(), row.overrideKey(), row.publicationId(),
+                row.publishedVersion(), row.segmentId(), row.grantId(), row.requestId(),
+                row.createdAtMs());
+    }
+
+    public Optional<PlayDecisionRow> findPlayDecision(String playKey) {
+        return jdbc.query("SELECT " + PLAY_DECISION_COLUMNS
+                        + " FROM playout_play_decision WHERE play_key = ?",
+                PLAY_DECISION_MAPPER, playKey).stream().findFirst();
+    }
+
+    /** 按全局键查询并加行锁，用于登记去重与并发裁决。 */
+    public Optional<PlayDecisionRow> findPlayDecisionForUpdate(String playKey) {
+        return jdbc.query("SELECT " + PLAY_DECISION_COLUMNS
+                        + " FROM playout_play_decision WHERE play_key = ? FOR UPDATE",
+                PLAY_DECISION_MAPPER, playKey).stream().findFirst();
+    }
+
+    /** 按频道与业务日查询固化记录，按播出时刻、playKey 升序。 */
+    public List<PlayDecisionRow> findPlayDecisions(String channelId, LocalDate businessDay) {
+        return jdbc.query("SELECT " + PLAY_DECISION_COLUMNS
+                        + " FROM playout_play_decision"
+                        + " WHERE channel_id = ? AND business_day = ?"
+                        + " ORDER BY play_at_ms, play_key",
+                PLAY_DECISION_MAPPER, channelId, Date.valueOf(businessDay));
+    }
+
+    // ---------- 播出回执 ----------
+
+    public void insertReceipt(String playKey, String result, String note,
+                              String requestId, long receiptAtMs) {
+        jdbc.update("INSERT INTO playout_play_receipt (play_key, result, note, request_id,"
+                        + " receipt_at_ms) VALUES (?, ?, ?, ?, ?)",
+                playKey, result, note, requestId, receiptAtMs);
+    }
+
+    public Optional<ReceiptRow> findReceipt(String playKey) {
+        return jdbc.query("SELECT play_key, result, note, request_id, receipt_at_ms"
+                        + " FROM playout_play_receipt WHERE play_key = ?",
+                RECEIPT_MAPPER, playKey).stream().findFirst();
+    }
+
+    /** 按决定键查询回执并加行锁，用于并发回执去重裁决。 */
+    public Optional<ReceiptRow> findReceiptForUpdate(String playKey) {
+        return jdbc.query("SELECT play_key, result, note, request_id, receipt_at_ms"
+                        + " FROM playout_play_receipt WHERE play_key = ? FOR UPDATE",
+                RECEIPT_MAPPER, playKey).stream().findFirst();
     }
 }

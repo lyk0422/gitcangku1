@@ -97,3 +97,31 @@ CREATE TABLE IF NOT EXISTS playout_emergency_override (
     PRIMARY KEY (override_key),
     KEY idx_override_playout (channel_id, status, start_ms, end_ms, priority)
 ) COMMENT = '限时紧急插播表；不改写日草稿与发布快照，同频道同优先级 ACTIVE 区间不得重叠';
+
+CREATE TABLE IF NOT EXISTS playout_play_decision (
+    play_key          VARCHAR(64) NOT NULL COMMENT '播出决定全局唯一键，客户端指定，登记后不变',
+    channel_id        VARCHAR(64) NOT NULL COMMENT '频道 ID',
+    play_at_ms        BIGINT      NOT NULL COMMENT '业务播出时刻，UTC 纪元毫秒',
+    business_day      DATE        NOT NULL COMMENT '播出时刻所在业务日，Asia/Shanghai 日历日',
+    asset_id          VARCHAR(64) NOT NULL COMMENT '登记时刻决策采用的素材 ID',
+    source            VARCHAR(16) NOT NULL COMMENT '决策来源：EMERGENCY 紧急插播 / PROGRAM 节目片段 / FALLBACK 保底',
+    reason            VARCHAR(32) NULL COMMENT '保底原因：NO_PUBLISHED_SCHEDULE / GAP / GRANT_REVOKED；非保底为 NULL',
+    override_key      VARCHAR(64) NULL COMMENT '命中的紧急插播键；source 为 EMERGENCY 时非空，否则为 NULL',
+    publication_id    BIGINT      NULL COMMENT '命中的发布快照 ID；source 为 PROGRAM 或 GRANT_REVOKED 保底时非空',
+    published_version BIGINT      NULL COMMENT '命中的节目发布版本；与 publication_id 同生同灭',
+    segment_id        VARCHAR(64) NULL COMMENT '命中的发布快照片段 ID；与 publication_id 同生同灭',
+    grant_id          BIGINT      NULL COMMENT '实际采用的授权 ID；保底无授权时为 NULL',
+    request_id        VARCHAR(64) NOT NULL COMMENT '登记操作的幂等请求 ID',
+    created_at_ms     BIGINT      NOT NULL COMMENT '登记时间，UTC 纪元毫秒',
+    PRIMARY KEY (play_key),
+    KEY idx_play_decision_query (channel_id, business_day, play_at_ms, play_key)
+) COMMENT = '播出决定固化表，登记后不可变；与撤销/取消/发布竞争按提交顺序裁决';
+
+CREATE TABLE IF NOT EXISTS playout_play_receipt (
+    play_key      VARCHAR(64)  NOT NULL COMMENT '所属播出决定键，每个决定至多一条回执',
+    result        VARCHAR(16)  NOT NULL COMMENT '回执结果：PLAYED 已播 / FAILED 失败；首次提交后固化',
+    note          VARCHAR(512) NOT NULL COMMENT '回执说明，非空；首次提交后固化',
+    request_id    VARCHAR(64)  NOT NULL COMMENT '首次回执的幂等请求 ID',
+    receipt_at_ms BIGINT       NOT NULL COMMENT '首次回执固化时间，UTC 纪元毫秒',
+    PRIMARY KEY (play_key)
+) COMMENT = '播出回执表，仅记录回执，不触发重播或改写节目与授权';

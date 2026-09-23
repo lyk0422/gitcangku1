@@ -1,10 +1,13 @@
 package com.example.starter.playout;
 
+import com.example.starter.playout.PlayoutRepository.ChannelRow;
 import com.example.starter.playout.PlayoutRepository.DraftRow;
 import com.example.starter.playout.PlayoutRepository.GrantRow;
 import com.example.starter.playout.PlayoutRepository.OverrideRow;
+import com.example.starter.playout.PlayoutRepository.PlayDecisionRow;
 import com.example.starter.playout.PlayoutRepository.PublicationRow;
 import com.example.starter.playout.PlayoutRepository.PublicationSegmentRow;
+import com.example.starter.playout.PlayoutRepository.ReceiptRow;
 import com.example.starter.playout.PlayoutRepository.RequestRow;
 import com.example.starter.playout.PlayoutRepository.SegmentRow;
 import com.example.starter.playout.api.ApiException;
@@ -20,12 +23,18 @@ import com.example.starter.playout.api.Dtos.EmergencyOverrideResponse;
 import com.example.starter.playout.api.Dtos.FallbackReason;
 import com.example.starter.playout.api.Dtos.GrantResponse;
 import com.example.starter.playout.api.Dtos.OverrideStatus;
+import com.example.starter.playout.api.Dtos.PlayDecisionResponse;
+import com.example.starter.playout.api.Dtos.PlayReceiptResponse;
+import com.example.starter.playout.api.Dtos.PlayResult;
 import com.example.starter.playout.api.Dtos.PlayoutDecisionResponse;
 import com.example.starter.playout.api.Dtos.PublishRequest;
 import com.example.starter.playout.api.Dtos.PublishResponse;
+import com.example.starter.playout.api.Dtos.ReceiptStatus;
+import com.example.starter.playout.api.Dtos.RegisterPlayDecisionRequest;
 import com.example.starter.playout.api.Dtos.ReplaceDraftRequest;
 import com.example.starter.playout.api.Dtos.SegmentInput;
 import com.example.starter.playout.api.Dtos.SegmentResponse;
+import com.example.starter.playout.api.Dtos.SubmitPlayReceiptRequest;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
@@ -63,6 +72,8 @@ public class PlayoutService {
     private static final String OP_REVOKE_GRANT = "REVOKE_GRANT";
     private static final String OP_CREATE_OVERRIDE = "CREATE_OVERRIDE";
     private static final String OP_CANCEL_OVERRIDE = "CANCEL_OVERRIDE";
+    private static final String OP_REGISTER_PLAY = "REGISTER_PLAY";
+    private static final String OP_SUBMIT_RECEIPT = "SUBMIT_RECEIPT";
 
     /** 紧急插播时长上限（含）：30 分钟，单位毫秒。 */
     private static final long OVERRIDE_MAX_DURATION_MS = 30L * 60L * 1000L;
@@ -251,55 +262,56 @@ public class PlayoutService {
     public PlayoutDecisionResponse playoutDecision(String channelId, OffsetDateTime at) {
         var channel = repo.findChannel(channelId)
                 .orElseThrow(() -> ApiException.notFound("频道不存在: " + channelId));
-        long atMs = toMs(at);
+        DecisionSnapshot snapshot = computeDecision(channel, channelId, toMs(at), false);
+        return new PlayoutDecisionResponse(channelId, at, snapshot.assetId(), snapshot.source(),
+                snapshot.reason(), snapshot.publicationId(), snapshot.segmentId(),
+                snapshot.overrideKey());
+    }
 
-        Optional<OverrideRow> override = selectActiveOverrideAt(channelId, atMs);
-        if (override.isPresent()) {
-            OverrideRow hit = override.get();
-            return new PlayoutDecisionResponse(channelId, at, hit.assetId(),
-                    DecisionSource.EMERGENCY, null, null, null, hit.overrideKey());
+    /**
+     * 计算某时刻的播出决定快照：先取有效最高优先级紧急插播，否则沿用节目及保底逻辑。
+     * locked 为 true 时对判定涉及的授权行加行锁（FOR UPDATE），用于登记固化时与授权撤销
+     * 按提交顺序串行化；实时查询传 false，保持只读。
+     */
+    private DecisionSnapshot computeDecision(ChannelRow channel, String channelId, long atMs,
+                                             boolean locked) {
+        for (OverrideRow candidate : repo.findActiveOverridesAt(channelId, atMs)) {
+            GrantRow grant = findGrant(candidate.grantId(), locked);
+            if (grant != null && !grant.revoked()) {
+                return new DecisionSnapshot(candidate.assetId(), DecisionSource.EMERGENCY, null,
+                        candidate.overrideKey(), null, null, null, candidate.grantId());
+            }
         }
 
-        LocalDate businessDay = at.atZoneSameInstant(ZONE).toLocalDate();
+        LocalDate businessDay = Instant.ofEpochMilli(atMs).atZone(ZONE).toLocalDate();
 
         Optional<PublicationRow> publication = repo.findLatestPublication(channelId, businessDay);
         if (publication.isEmpty()) {
-            return fallback(channelId, at, channel.fallbackAssetId(),
-                    FallbackReason.NO_PUBLISHED_SCHEDULE);
+            return new DecisionSnapshot(channel.fallbackAssetId(), DecisionSource.FALLBACK,
+                    FallbackReason.NO_PUBLISHED_SCHEDULE, null, null, null, null, null);
         }
         Optional<PublicationSegmentRow> segment =
                 repo.findPublicationSegmentAt(publication.get().id(), atMs);
         if (segment.isEmpty()) {
-            return fallback(channelId, at, channel.fallbackAssetId(),
-                    FallbackReason.GAP);
+            return new DecisionSnapshot(channel.fallbackAssetId(), DecisionSource.FALLBACK,
+                    FallbackReason.GAP, null, null, null, null, null);
         }
         PublicationSegmentRow hit = segment.get();
-        GrantRow grant = repo.findGrant(hit.grantId())
+        GrantRow grant = Optional.ofNullable(findGrant(hit.grantId(), locked))
                 .orElseThrow(() -> ApiException.unprocessable("SNAPSHOT_INCOMPLETE",
                         "发布快照引用的授权不存在: " + hit.grantId()));
         if (grant.revoked()) {
-            return new PlayoutDecisionResponse(channelId, at, channel.fallbackAssetId(),
-                    DecisionSource.FALLBACK,
-                    FallbackReason.GRANT_REVOKED,
-                    publication.get().id(), hit.segmentId(), null);
+            return new DecisionSnapshot(channel.fallbackAssetId(), DecisionSource.FALLBACK,
+                    FallbackReason.GRANT_REVOKED, null, publication.get().id(),
+                    publication.get().publishedVersion(), hit.segmentId(), null);
         }
-        return new PlayoutDecisionResponse(channelId, at, hit.assetId(),
-                DecisionSource.PROGRAM, null,
-                publication.get().id(), hit.segmentId(), null);
+        return new DecisionSnapshot(hit.assetId(), DecisionSource.PROGRAM, null, null,
+                publication.get().id(), publication.get().publishedVersion(), hit.segmentId(),
+                hit.grantId());
     }
 
-    /**
-     * 选取某时刻生效的最高优先级紧急插播：候选为区间命中且 ACTIVE 的插播，按优先级降序，
-     * 跳过其指定授权已撤销的插播。授权状态为查询时的实时状态。
-     */
-    private Optional<OverrideRow> selectActiveOverrideAt(String channelId, long atMs) {
-        for (OverrideRow candidate : repo.findActiveOverridesAt(channelId, atMs)) {
-            GrantRow grant = repo.findGrant(candidate.grantId()).orElse(null);
-            if (grant != null && !grant.revoked()) {
-                return Optional.of(candidate);
-            }
-        }
-        return Optional.empty();
+    private GrantRow findGrant(long grantId, boolean locked) {
+        return (locked ? repo.findGrantForUpdate(grantId) : repo.findGrant(grantId)).orElse(null);
     }
 
     // ---------- 紧急插播 ----------
@@ -428,6 +440,147 @@ public class PlayoutService {
                 atMs(row.createdAtMs()));
     }
 
+    // ---------- 播出决定固化 ----------
+
+    /**
+     * 登记播出决定：将频道在指定业务播出时刻的一次决策固化为不可变记录。决策计算与快照落库
+     * 在同一事务内读取同一份完整状态：持频道行锁与插播创建/取消串行，判定涉及的授权行加行锁
+     * 与撤销串行，按提交顺序裁决——失效先提交则不能固化为仍有效来源，固化先提交则保留当时
+     * 结果，之后实时查询可以不同。playKey 全局唯一：同键同频道同时刻（任意 requestId）返回
+     * 原决定，不重新计算、不覆盖；同键改参返回 409。
+     */
+    @Transactional
+    public PlayDecisionResponse registerPlayDecision(RegisterPlayDecisionRequest request) {
+        String hash = sha256(OP_REGISTER_PLAY + "|" + request.playKey() + "|"
+                + request.channelId() + "|" + toMs(request.at()));
+        return idempotent(request.requestId(), OP_REGISTER_PLAY, hash, PlayDecisionResponse.class,
+                () -> doRegisterPlayDecision(request));
+    }
+
+    private PlayDecisionResponse doRegisterPlayDecision(RegisterPlayDecisionRequest request) {
+        long playAtMs = toMs(request.at());
+        repo.lockChannelForUpdate(request.channelId());
+        var channel = repo.findChannel(request.channelId())
+                .orElseThrow(() -> ApiException.notFound("频道不存在: " + request.channelId()));
+
+        Optional<PlayDecisionRow> existing = repo.findPlayDecisionForUpdate(request.playKey());
+        if (existing.isPresent()) {
+            return reconcileExistingDecision(existing.get(), request.channelId(), playAtMs);
+        }
+
+        DecisionSnapshot snapshot = computeDecision(channel, request.channelId(), playAtMs, true);
+        LocalDate businessDay = request.at().atZoneSameInstant(ZONE).toLocalDate();
+        PlayDecisionRow row = new PlayDecisionRow(request.playKey(), request.channelId(), playAtMs,
+                businessDay, snapshot.assetId(), snapshot.source().name(),
+                snapshot.reason() == null ? null : snapshot.reason().name(), snapshot.overrideKey(),
+                snapshot.publicationId(), snapshot.publishedVersion(), snapshot.segmentId(),
+                snapshot.grantId(), request.requestId(), nowMs());
+        try {
+            repo.insertPlayDecision(row);
+        } catch (DuplicateKeyException e) {
+            // 并发同 playKey：等待对方事务提交后读取已固化记录，按同参/改参裁决
+            PlayDecisionRow committed = repo.findPlayDecisionForUpdate(request.playKey())
+                    .orElseThrow(() -> ApiException.conflict("PLAY_KEY_CONFLICT",
+                            "playKey 并发冲突: " + request.playKey()));
+            return reconcileExistingDecision(committed, request.channelId(), playAtMs);
+        }
+        return toPlayDecisionResponse(row, null);
+    }
+
+    /** 同 playKey 已固化：同频道同时刻返回原决定（不重新计算、不覆盖），否则 409。 */
+    private PlayDecisionResponse reconcileExistingDecision(PlayDecisionRow row, String channelId,
+                                                           long playAtMs) {
+        if (!row.channelId().equals(channelId) || row.playAtMs() != playAtMs) {
+            throw ApiException.conflict("PLAY_KEY_CONFLICT",
+                    "playKey 已登记且频道或播出时刻不一致: " + row.playKey());
+        }
+        return toPlayDecisionResponse(row, repo.findReceipt(row.playKey()).orElse(null));
+    }
+
+    /** 查询播出决定明细（含当前回执状态，无回执为 PENDING）。 */
+    @Transactional(readOnly = true)
+    public PlayDecisionResponse getPlayDecision(String playKey) {
+        PlayDecisionRow row = repo.findPlayDecision(playKey)
+                .orElseThrow(() -> ApiException.notFound("播出决定不存在: " + playKey));
+        return toPlayDecisionResponse(row, repo.findReceipt(playKey).orElse(null));
+    }
+
+    /** 按频道与业务日查询固化记录，按播出时刻、playKey 升序。 */
+    @Transactional(readOnly = true)
+    public List<PlayDecisionResponse> listPlayDecisions(String channelId, LocalDate businessDay) {
+        repo.findChannel(channelId)
+                .orElseThrow(() -> ApiException.notFound("频道不存在: " + channelId));
+        return repo.findPlayDecisions(channelId, businessDay).stream()
+                .map(row -> toPlayDecisionResponse(row,
+                        repo.findReceipt(row.playKey()).orElse(null)))
+                .toList();
+    }
+
+    // ---------- 播出回执 ----------
+
+    /**
+     * 提交播出回执：仅接受 PLAYED/FAILED 及非空说明，首次回执固化结果与 UTC 时刻；只记录
+     * 回执，不自动重播、不更新节目或授权。授权事后撤销不阻止对已固化记录提交回执。同
+     * requestId 同参重放返回首次响应；不同 requestId 提交相同结果与说明返回已有回执，改结果
+     * 或说明返回 409；并发回执只产生一份。
+     */
+    @Transactional
+    public PlayReceiptResponse submitPlayReceipt(String playKey, SubmitPlayReceiptRequest request) {
+        String hash = sha256(OP_SUBMIT_RECEIPT + "|" + playKey + "|" + request.result()
+                + "|" + request.note());
+        return idempotent(request.requestId(), OP_SUBMIT_RECEIPT, hash, PlayReceiptResponse.class,
+                () -> doSubmitPlayReceipt(playKey, request));
+    }
+
+    private PlayReceiptResponse doSubmitPlayReceipt(String playKey,
+                                                    SubmitPlayReceiptRequest request) {
+        repo.findPlayDecision(playKey)
+                .orElseThrow(() -> ApiException.notFound("播出决定不存在: " + playKey));
+
+        Optional<ReceiptRow> existing = repo.findReceiptForUpdate(playKey);
+        if (existing.isPresent()) {
+            return reconcileReceipt(existing.get(), request);
+        }
+        long receiptAtMs = nowMs();
+        try {
+            repo.insertReceipt(playKey, request.result().name(), request.note(),
+                    request.requestId(), receiptAtMs);
+        } catch (DuplicateKeyException e) {
+            // 并发回执：等待对方事务提交后读取已固化回执，按同参/改参裁决
+            ReceiptRow committed = repo.findReceiptForUpdate(playKey)
+                    .orElseThrow(() -> ApiException.conflict("RECEIPT_CONFLICT",
+                            "回执并发冲突: " + playKey));
+            return reconcileReceipt(committed, request);
+        }
+        return new PlayReceiptResponse(playKey, request.result(), request.note(),
+                request.requestId(), atMs(receiptAtMs));
+    }
+
+    /** 已有固化回执：结果与说明一致返回已有回执，否则 409。 */
+    private PlayReceiptResponse reconcileReceipt(ReceiptRow row, SubmitPlayReceiptRequest request) {
+        if (!row.result().equals(request.result().name()) || !row.note().equals(request.note())) {
+            throw ApiException.conflict("RECEIPT_CONFLICT",
+                    "该播出决定已存在不同回执: " + row.playKey());
+        }
+        return toReceiptResponse(row);
+    }
+
+    private static PlayReceiptResponse toReceiptResponse(ReceiptRow row) {
+        return new PlayReceiptResponse(row.playKey(), PlayResult.valueOf(row.result()), row.note(),
+                row.requestId(), atMs(row.receiptAtMs()));
+    }
+
+    private static PlayDecisionResponse toPlayDecisionResponse(PlayDecisionRow row,
+                                                               ReceiptRow receipt) {
+        return new PlayDecisionResponse(row.playKey(), row.channelId(), atMs(row.playAtMs()),
+                row.businessDay().toString(), row.assetId(), DecisionSource.valueOf(row.source()),
+                row.reason() == null ? null : FallbackReason.valueOf(row.reason()),
+                row.overrideKey(), row.publicationId(), row.publishedVersion(), row.segmentId(),
+                row.grantId(), row.requestId(), atMs(row.createdAtMs()),
+                receipt == null ? ReceiptStatus.PENDING : ReceiptStatus.valueOf(receipt.result()),
+                receipt == null ? null : toReceiptResponse(receipt));
+    }
+
     // ---------- 内部方法 ----------
 
     /** 校验并规范化草稿片段：非空、区间内、不跨日、不重叠、素材存在且被单条未撤销授权完整覆盖。 */
@@ -552,12 +705,6 @@ public class PlayoutService {
         return sb.toString();
     }
 
-    private PlayoutDecisionResponse fallback(String channelId, OffsetDateTime at, String assetId,
-                                             FallbackReason reason) {
-        return new PlayoutDecisionResponse(channelId, at, assetId,
-                DecisionSource.FALLBACK, reason, null, null, null);
-    }
-
     private static long toMs(OffsetDateTime time) {
         return time.toInstant().toEpochMilli();
     }
@@ -590,5 +737,11 @@ public class PlayoutService {
         SegmentResponse toResponse() {
             return new SegmentResponse(id, assetId, atMs(startMs), atMs(endMs));
         }
+    }
+
+    /** 播出决定计算快照（内部）：实时查询与登记固化共用同一计算逻辑。 */
+    private record DecisionSnapshot(String assetId, DecisionSource source, FallbackReason reason,
+                                    String overrideKey, Long publicationId, Long publishedVersion,
+                                    String segmentId, Long grantId) {
     }
 }

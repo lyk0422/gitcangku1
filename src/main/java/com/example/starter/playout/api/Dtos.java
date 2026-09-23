@@ -6,6 +6,7 @@ import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.PositiveOrZero;
+import jakarta.validation.constraints.Size;
 
 import java.time.OffsetDateTime;
 import java.util.List;
@@ -166,6 +167,64 @@ public final class Dtos {
             String cancelRequestId,
             OffsetDateTime cancelledAt,
             OffsetDateTime createdAt) {
+    }
+
+    /** 登记播出决定请求：将 channelId 在 at 时刻的一次决策固化为不可变记录。 */
+    public record RegisterPlayDecisionRequest(
+            @NotBlank String requestId,
+            @NotBlank String playKey,
+            @NotBlank String channelId,
+            @NotNull OffsetDateTime at) {
+    }
+
+    /** 回执结果：PLAYED 已播出 / FAILED 播出失败；首次回执后固化。 */
+    public enum PlayResult {
+        PLAYED, FAILED
+    }
+
+    /** 回执状态：无回执时 PENDING，有回执时与回执结果一致。 */
+    public enum ReceiptStatus {
+        PENDING, PLAYED, FAILED
+    }
+
+    /** 提交播出回执请求；result 仅接受 PLAYED/FAILED，note 非空。 */
+    public record SubmitPlayReceiptRequest(
+            @NotBlank String requestId,
+            @NotNull PlayResult result,
+            @NotBlank @Size(max = 512) String note) {
+    }
+
+    /** 播出回执响应；receiptAt 为首次回执固化的 UTC 时刻（API 层以 Asia/Shanghai 呈现）。 */
+    public record PlayReceiptResponse(
+            String playKey,
+            PlayResult result,
+            String note,
+            String requestId,
+            OffsetDateTime receiptAt) {
+    }
+
+    /**
+     * 播出决定固化记录响应。source 为 EMERGENCY 时 overrideKey 非空；为 PROGRAM 时
+     * publicationId/publishedVersion/segmentId/grantId 非空；为 FALLBACK 时 reason 非空且
+     * grantId 为 null（保底无授权）。receipt 为 null 表示尚无回执（receiptStatus 为 PENDING）。
+     */
+    public record PlayDecisionResponse(
+            String playKey,
+            String channelId,
+            OffsetDateTime playAt,
+            String businessDay,
+            String assetId,
+            DecisionSource source,
+            FallbackReason reason,
+            String overrideKey,
+            Long publicationId,
+            Long publishedVersion,
+            String segmentId,
+            Long grantId,
+            String requestId,
+            OffsetDateTime createdAt,
+            ReceiptStatus receiptStatus,
+            PlayReceiptResponse receipt) {
     }
 
     /** 统一错误响应体。 */
