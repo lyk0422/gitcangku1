@@ -11,6 +11,7 @@ import com.example.starter.firmware.api.ResumeReleaseRequest;
 import com.example.starter.firmware.domain.ReleaseOrder;
 import com.example.starter.firmware.domain.ReleaseStatus;
 import com.example.starter.firmware.error.ApiException;
+import com.example.starter.firmware.repo.DeviceOccupationRepository;
 import com.example.starter.firmware.repo.PauseRecordRepository;
 import com.example.starter.firmware.repo.ReleaseRepository;
 import com.example.starter.firmware.repo.ResumeRecordRepository;
@@ -32,17 +33,20 @@ public class ReleaseService {
     private final TaskRepository taskRepository;
     private final PauseRecordRepository pauseRecordRepository;
     private final ResumeRecordRepository resumeRecordRepository;
+    private final DeviceOccupationRepository occupationRepository;
     private final IdempotencyService idempotency;
     private final Clock clock;
 
     public ReleaseService(ReleaseRepository releaseRepository, TaskRepository taskRepository,
                           PauseRecordRepository pauseRecordRepository,
                           ResumeRecordRepository resumeRecordRepository,
+                          DeviceOccupationRepository occupationRepository,
                           IdempotencyService idempotency, Clock clock) {
         this.releaseRepository = releaseRepository;
         this.taskRepository = taskRepository;
         this.pauseRecordRepository = pauseRecordRepository;
         this.resumeRecordRepository = resumeRecordRepository;
+        this.occupationRepository = occupationRepository;
         this.idempotency = idempotency;
         this.clock = clock;
     }
@@ -127,6 +131,7 @@ public class ReleaseService {
             if (order.status() == ReleaseStatus.ACTIVE || order.status() == ReleaseStatus.PAUSED) {
                 releaseRepository.cancel(releaseId);
                 taskRepository.cancelPendingByRelease(releaseId);
+                occupationRepository.releaseAll(DeviceOccupationRepository.SCOPE_FORWARD, releaseId);
             }
             return ReleaseView.of(findOrder(releaseId));
         }, ReleaseView.class);

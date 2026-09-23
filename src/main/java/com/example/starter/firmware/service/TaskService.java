@@ -11,6 +11,7 @@ import com.example.starter.firmware.domain.ReleaseStatus;
 import com.example.starter.firmware.domain.RolloutTask;
 import com.example.starter.firmware.domain.TaskStatus;
 import com.example.starter.firmware.error.ApiException;
+import com.example.starter.firmware.repo.DeviceOccupationRepository;
 import com.example.starter.firmware.repo.DeviceRepository;
 import com.example.starter.firmware.repo.PauseRecordRepository;
 import com.example.starter.firmware.repo.ReleaseRepository;
@@ -33,6 +34,7 @@ public class TaskService {
     private final ReleaseRepository releaseRepository;
     private final DeviceRepository deviceRepository;
     private final PauseRecordRepository pauseRecordRepository;
+    private final DeviceOccupationRepository occupationRepository;
     private final DeviceService deviceService;
     private final ReleaseService releaseService;
     private final IdempotencyService idempotency;
@@ -40,12 +42,14 @@ public class TaskService {
 
     public TaskService(TaskRepository taskRepository, ReleaseRepository releaseRepository,
                        DeviceRepository deviceRepository, PauseRecordRepository pauseRecordRepository,
+                       DeviceOccupationRepository occupationRepository,
                        DeviceService deviceService, ReleaseService releaseService,
                        IdempotencyService idempotency, Clock clock) {
         this.taskRepository = taskRepository;
         this.releaseRepository = releaseRepository;
         this.deviceRepository = deviceRepository;
         this.pauseRecordRepository = pauseRecordRepository;
+        this.occupationRepository = occupationRepository;
         this.deviceService = deviceService;
         this.releaseService = releaseService;
         this.idempotency = idempotency;
@@ -75,10 +79,17 @@ public class TaskService {
                     || device.bucketNo() >= order.ratio()) {
                 return new PullResponse(null);
             }
+            // 与回退计划互斥：设备已被未终结冲突任务占用时本次不派发（返回空任务）。
+            try {
+                occupationRepository.tryOccupy(deviceId, DeviceOccupationRepository.SCOPE_FORWARD, order.id());
+            } catch (DuplicateKeyException e) {
+                return new PullResponse(null);
+            }
             long taskId;
             try {
                 taskId = taskRepository.insert(order.id(), deviceId);
             } catch (DuplicateKeyException e) {
+                // 并发下首个事务已占用并建任务；行锁串行后通常在上方 existing 分支返回，这里兜底读取。
                 RolloutTask task = taskRepository.findByReleaseAndDevice(order.id(), deviceId)
                         .orElseThrow(() -> new IllegalStateException("任务唯一约束冲突后未找到任务"));
                 return new PullResponse(TaskView.of(task, order));
@@ -110,6 +121,9 @@ public class TaskService {
                     if (request.result() == ReceiptResult.SUCCESS) {
                         deviceRepository.updateCurrentVersion(task.deviceId(), lockedOrder.toVersion());
                     }
+                    // 任务终结（成功或失败）即释放设备占用，设备此后可进入新的冲突任务。
+                    occupationRepository.release(task.deviceId(), DeviceOccupationRepository.SCOPE_FORWARD,
+                            lockedOrder.id());
                     ReleaseOrder updated = releaseRepository.findById(snapshot.releaseId()).orElseThrow();
                     pauseIfThresholdReached(updated, taskId);
                     yield TaskView.of(taskRepository.findById(taskId).orElseThrow(), updated);
@@ -121,7 +135,11 @@ public class TaskService {
                     throw ApiException.conflict("RECEIPT_RESULT_CONFLICT",
                             "任务已终结为 " + task.firstResult() + "，不能改为 " + request.result());
                 }
-                case CANCELLED -> throw ApiException.conflict("TASK_CANCELLED", "任务已取消，回执不再受理");
+                case CANCELLED -> {
+                    occupationRepository.release(task.deviceId(), DeviceOccupationRepository.SCOPE_FORWARD,
+                            lockedOrder.id());
+                    throw ApiException.conflict("TASK_CANCELLED", "任务已取消，回执不再受理");
+                }
             };
         }, TaskView.class);
     }
