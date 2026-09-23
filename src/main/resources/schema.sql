@@ -111,6 +111,121 @@ COMMENT ON COLUMN term_rule.source_term IS '源文术语，Unicode 原文、区�
 COMMENT ON COLUMN term_rule.language IS '目标语言码，小写';
 COMMENT ON COLUMN term_rule.required_translation IS '该术语在目标语言中的必译文本，非空';
 
+CREATE TABLE IF NOT EXISTS review_policy (
+    document_id BIGINT NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    policy_version INT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (document_id, language, policy_version)
+);
+COMMENT ON TABLE review_policy IS '评审策略版本：每种目标语言从 1 开始的不可变双阶段策略版本，已有版本不可覆盖';
+COMMENT ON COLUMN review_policy.document_id IS '所属文档 ID';
+COMMENT ON COLUMN review_policy.language IS '目标语言码，小写';
+COMMENT ON COLUMN review_policy.policy_version IS '策略版本号，按语言从 1 开始单调递增';
+COMMENT ON COLUMN review_policy.created_at IS '版本创建时间，数据库默认时区';
+
+CREATE TABLE IF NOT EXISTS review_policy_current (
+    document_id BIGINT NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    policy_version INT NOT NULL,
+    PRIMARY KEY (document_id, language)
+);
+COMMENT ON TABLE review_policy_current IS '当前生效评审策略指针：每种语言指向最新激活的策略版本，仅作用于新投票';
+COMMENT ON COLUMN review_policy_current.document_id IS '所属文档 ID';
+COMMENT ON COLUMN review_policy_current.language IS '目标语言码，小写';
+COMMENT ON COLUMN review_policy_current.policy_version IS '当前生效的策略版本号；不存在记录表示该语言未配置评审策略';
+
+CREATE TABLE IF NOT EXISTS review_policy_stage (
+    document_id BIGINT NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    policy_version INT NOT NULL,
+    stage VARCHAR(16) NOT NULL,
+    quorum INT NOT NULL,
+    PRIMARY KEY (document_id, language, policy_version, stage)
+);
+COMMENT ON TABLE review_policy_stage IS '评审策略阶段：某策略版本下 LANGUAGE/COMPLIANCE 阶段的法定人数';
+COMMENT ON COLUMN review_policy_stage.document_id IS '所属文档 ID';
+COMMENT ON COLUMN review_policy_stage.language IS '目标语言码，小写';
+COMMENT ON COLUMN review_policy_stage.policy_version IS '所属策略版本号';
+COMMENT ON COLUMN review_policy_stage.stage IS '评审阶段：LANGUAGE 或 COMPLIANCE';
+COMMENT ON COLUMN review_policy_stage.quorum IS '该阶段通过所需的最少当前有效 APPROVE 票数，>= 1';
+
+CREATE TABLE IF NOT EXISTS review_policy_reviewer (
+    document_id BIGINT NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    policy_version INT NOT NULL,
+    stage VARCHAR(16) NOT NULL,
+    reviewer VARCHAR(128) NOT NULL,
+    PRIMARY KEY (document_id, language, policy_version, stage, reviewer)
+);
+COMMENT ON TABLE review_policy_reviewer IS '评审策略候选审核人：某策略版本某阶段允许投票的审核人集合，两阶段集合可重叠';
+COMMENT ON COLUMN review_policy_reviewer.document_id IS '所属文档 ID';
+COMMENT ON COLUMN review_policy_reviewer.language IS '目标语言码，小写';
+COMMENT ON COLUMN review_policy_reviewer.policy_version IS '所属策略版本号';
+COMMENT ON COLUMN review_policy_reviewer.stage IS '评审阶段：LANGUAGE 或 COMPLIANCE';
+COMMENT ON COLUMN review_policy_reviewer.reviewer IS '候选审核人，取投票时 X-Actor-Id';
+
+CREATE TABLE IF NOT EXISTS review_vote (
+    document_id BIGINT NOT NULL,
+    segment_id VARCHAR(64) NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    stage VARCHAR(16) NOT NULL,
+    reviewer VARCHAR(128) NOT NULL,
+    vote_version INT NOT NULL,
+    vote_key VARCHAR(128) NOT NULL,
+    decision VARCHAR(8) NOT NULL,
+    source_version INT NOT NULL,
+    translation_version INT NOT NULL,
+    term_version INT NOT NULL,
+    policy_version INT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (document_id, segment_id, language, stage, reviewer, vote_version),
+    CONSTRAINT uk_review_vote_key UNIQUE (vote_key)
+);
+COMMENT ON TABLE review_vote IS '评审投票：审核人对精确版本组合投 APPROVE/REJECT；改票生成新 vote_version，旧票保留审计；任一版本变化后旧票不计入当前法定人数';
+COMMENT ON COLUMN review_vote.document_id IS '所属文档 ID';
+COMMENT ON COLUMN review_vote.segment_id IS '所属段落 ID';
+COMMENT ON COLUMN review_vote.language IS '目标语言码，小写';
+COMMENT ON COLUMN review_vote.stage IS '评审阶段：LANGUAGE 或 COMPLIANCE；同一审核人对同一译文只能在一个阶段投票';
+COMMENT ON COLUMN review_vote.reviewer IS '审核人，取投票时 X-Actor-Id';
+COMMENT ON COLUMN review_vote.vote_version IS '该审核人在该阶段该译文的票版本，从 1 开始，改票加一；每组最大版本为当前票';
+COMMENT ON COLUMN review_vote.vote_key IS '全局唯一投票键；不同请求复用同一 voteKey 返回 409';
+COMMENT ON COLUMN review_vote.decision IS '投票决定：APPROVE 或 REJECT';
+COMMENT ON COLUMN review_vote.source_version IS '投票针对的源文版本，须等于投票时当前源文版本';
+COMMENT ON COLUMN review_vote.translation_version IS '投票针对的译文版本，须等于投票时当前译文版本';
+COMMENT ON COLUMN review_vote.term_version IS '投票针对的术语版本，须等于投票时当前术语版本';
+COMMENT ON COLUMN review_vote.policy_version IS '投票针对的策略版本，须等于投票时当前生效策略版本';
+COMMENT ON COLUMN review_vote.created_at IS '投票时间，数据库默认时区';
+
+CREATE TABLE IF NOT EXISTS release_vote_freeze (
+    document_id BIGINT NOT NULL,
+    published_version INT NOT NULL,
+    segment_id VARCHAR(64) NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    stage VARCHAR(16) NOT NULL,
+    reviewer VARCHAR(128) NOT NULL,
+    vote_version INT NOT NULL,
+    decision VARCHAR(8) NOT NULL,
+    source_version INT NOT NULL,
+    translation_version INT NOT NULL,
+    term_version INT NOT NULL,
+    policy_version INT NOT NULL,
+    PRIMARY KEY (document_id, published_version, segment_id, language, stage, reviewer)
+);
+COMMENT ON TABLE release_vote_freeze IS '发布票版本冻结：发布通过门禁时采用的当前有效票版本集合，随快照原子写入，不可修改';
+COMMENT ON COLUMN release_vote_freeze.document_id IS '所属文档 ID';
+COMMENT ON COLUMN release_vote_freeze.published_version IS '所属发布版本号';
+COMMENT ON COLUMN release_vote_freeze.segment_id IS '所属段落 ID';
+COMMENT ON COLUMN release_vote_freeze.language IS '目标语言码，小写';
+COMMENT ON COLUMN release_vote_freeze.stage IS '评审阶段：LANGUAGE 或 COMPLIANCE';
+COMMENT ON COLUMN release_vote_freeze.reviewer IS '审核人';
+COMMENT ON COLUMN release_vote_freeze.vote_version IS '发布时采用的票版本';
+COMMENT ON COLUMN release_vote_freeze.decision IS '投票决定：APPROVE 或 REJECT';
+COMMENT ON COLUMN release_vote_freeze.source_version IS '冻结时的源文版本';
+COMMENT ON COLUMN release_vote_freeze.translation_version IS '冻结时的译文版本';
+COMMENT ON COLUMN release_vote_freeze.term_version IS '冻结时的术语版本';
+COMMENT ON COLUMN release_vote_freeze.policy_version IS '冻结时的策略版本';
+
 CREATE TABLE IF NOT EXISTS request_log (
     request_id VARCHAR(128) PRIMARY KEY,
     request_hash VARCHAR(64) NOT NULL,

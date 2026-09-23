@@ -72,6 +72,36 @@ public final class Rows {
     }
 
     /**
+     * 评审策略阶段：某策略版本下 LANGUAGE/COMPLIANCE 阶段的法定人数与候选审核人集合。
+     *
+     * @param stage     评审阶段：LANGUAGE 或 COMPLIANCE
+     * @param quorum    该阶段通过所需的最少当前有效 APPROVE 票数，>= 1
+     * @param reviewers 候选审核人集合，非空且去重；两阶段集合可重叠
+     */
+    public record ReviewStageRow(String stage, int quorum, List<String> reviewers) {
+    }
+
+    /**
+     * 评审投票：审核人对精确版本组合的一票；改票生成新 voteVersion，旧票保留审计。
+     *
+     * @param segmentId          所属段落 ID
+     * @param language           目标语言码，小写
+     * @param stage              评审阶段：LANGUAGE 或 COMPLIANCE
+     * @param reviewer           审核人，取投票时 X-Actor-Id
+     * @param voteVersion        该审核人在该阶段该译文的票版本，从 1 开始，改票加一
+     * @param voteKey            全局唯一投票键；不同请求复用返回 409
+     * @param decision           投票决定：APPROVE 或 REJECT
+     * @param sourceVersion      投票针对的源文版本
+     * @param translationVersion 投票针对的译文版本
+     * @param termVersion        投票针对的术语版本
+     * @param policyVersion      投票针对的策略版本
+     */
+    public record VoteRow(String segmentId, String language, String stage, String reviewer,
+                          int voteVersion, String voteKey, String decision,
+                          int sourceVersion, int translationVersion, int termVersion, int policyVersion) {
+    }
+
+    /**
      * 写操作幂等去重记录：全局唯一 requestId，仅记录成功结果，与业务变更原子提交。
      *
      * @param requestId      全局唯一请求 ID

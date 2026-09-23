@@ -7,6 +7,7 @@ import com.example.starter.translation.domain.Rows.DocumentRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
 import com.example.starter.translation.domain.Rows.TranslationRow;
+import com.example.starter.translation.domain.Rows.VoteRow;
 import com.example.starter.translation.repo.TranslationRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.stereotype.Service;
@@ -31,10 +32,13 @@ import java.util.stream.Collectors;
 public class TranslationService {
 
     private final TranslationRepository repository;
+    private final ReviewService reviewService;
     private final ObjectMapper objectMapper;
 
-    public TranslationService(TranslationRepository repository, ObjectMapper objectMapper) {
+    public TranslationService(TranslationRepository repository, ReviewService reviewService,
+                              ObjectMapper objectMapper) {
         this.repository = repository;
+        this.reviewService = reviewService;
         this.objectMapper = objectMapper;
     }
 
@@ -175,9 +179,11 @@ public class TranslationService {
 
     /**
      * 发布：校验期望版本（不符 409），再校验全部段落在全部目标语言均有有效批准（缺译或审核失效 422）、
-     * 译文绑定当前术语版本（过期 422）且满足当前术语规则（违规 422 并返回全部违规术语），
-     * 全部通过后原子生成完整只读快照（固化术语版本与实际规则集）并递增发布版本；
-     * 任何失败回滚，不产生部分快照。
+     * 译文绑定当前术语版本（过期 422）且满足当前术语规则（违规 422 并返回全部违规术语）；
+     * 对配置了生效评审策略的语言，还须在同一文档行锁保护的一致快照中确认全部段落两个阶段均 PASSED
+     * 且票版本组合与当前版本相同（未通过 422）。
+     * 全部通过后原子生成完整只读快照（固化术语版本、实际规则集与采用的票版本集合）并递增发布版本；
+     * 任何失败回滚，不产生部分快照或部分票冻结。
      */
     @Transactional
     public ApiDtos.PublishResponse publish(long documentId, ApiDtos.PublishRequest request) {
@@ -229,9 +235,16 @@ public class TranslationService {
         if (!termViolations.isEmpty()) {
             throw ApiException.termViolation("译文违反 " + termViolations.size() + " 条术语规则", termViolations);
         }
+        Map<String, List<VoteRow>> adoptedVotes = reviewService.verifyReviewGate(document, segments, translations);
         int publishedVersion = document.publishedVersion() + 1;
         repository.insertSnapshot(documentId, publishedVersion,
-                buildSnapshotJson(document, publishedVersion, segments, translations, approvals, termRules));
+                buildSnapshotJson(document, publishedVersion, segments, translations, approvals, termRules,
+                        adoptedVotes));
+        for (List<VoteRow> votes : adoptedVotes.values()) {
+            for (VoteRow vote : votes) {
+                repository.insertVoteFreeze(documentId, publishedVersion, vote);
+            }
+        }
         repository.updatePublishedVersion(documentId, publishedVersion);
         return new ApiDtos.PublishResponse(documentId, publishedVersion);
     }
@@ -307,7 +320,8 @@ public class TranslationService {
         return draftVersion;
     }
 
-    private static String key(String segmentId, String language) {
+    /** 段落+语言复合键，包内共享（ReviewService 门禁与历史票统计使用同一规则）。 */
+    static String key(String segmentId, String language) {
         return segmentId + " " + language;
     }
 
@@ -347,10 +361,14 @@ public class TranslationService {
         return new ApiDtos.TermRuleView(rule.sourceTerm(), rule.language(), rule.requiredTranslation());
     }
 
-    /** 生成完整只读快照 JSON：全部段落源文及各语言译文、作者、审核人、版本号与固化的术语版本及规则集。 */
+    /**
+     * 生成完整只读快照 JSON：全部段落源文及各语言译文、作者、审核人、版本号与固化的术语版本及规则集；
+     * 配置了评审策略的语言额外固化策略版本与发布采用的票版本集合。
+     */
     private String buildSnapshotJson(DocumentRow document, int publishedVersion, List<SegmentRow> segments,
                                      Map<String, TranslationRow> translations,
-                                     Map<String, ApprovalRow> approvals, List<TermRuleRow> termRules) {
+                                     Map<String, ApprovalRow> approvals, List<TermRuleRow> termRules,
+                                     Map<String, List<VoteRow>> adoptedVotes) {
         Map<String, Object> snapshot = new LinkedHashMap<>();
         snapshot.put("documentId", document.documentId());
         snapshot.put("publishedVersion", publishedVersion);
@@ -384,6 +402,20 @@ public class TranslationService {
                 translationJson.put("sourceVersion", translation.sourceVersion());
                 translationJson.put("termVersion", translation.termVersion());
                 translationJson.put("reviewer", approval.reviewer());
+                List<VoteRow> votes = adoptedVotes.get(key(segment.segmentId(), language));
+                if (votes != null && !votes.isEmpty()) {
+                    translationJson.put("policyVersion", votes.get(0).policyVersion());
+                    List<Map<String, Object>> voteList = new ArrayList<>();
+                    for (VoteRow vote : votes) {
+                        Map<String, Object> voteJson = new LinkedHashMap<>();
+                        voteJson.put("stage", vote.stage());
+                        voteJson.put("reviewer", vote.reviewer());
+                        voteJson.put("voteVersion", vote.voteVersion());
+                        voteJson.put("decision", vote.decision());
+                        voteList.add(voteJson);
+                    }
+                    translationJson.put("reviewVotes", voteList);
+                }
                 translationList.add(translationJson);
             }
             segmentJson.put("translations", translationList);
