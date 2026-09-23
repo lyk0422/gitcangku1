@@ -64,6 +64,11 @@ public class ReleaseController {
         return taskService.listByRelease(releaseId, filter);
     }
 
+    @GetMapping("/{releaseId}/devices/{deviceId}/attempts")
+    public AttemptHistoryResponse attempts(@PathVariable long releaseId, @PathVariable String deviceId) {
+        return taskService.history(releaseId, deviceId);
+    }
+
     private TaskStatus parseStatus(String status) {
         if (status == null || status.isBlank()) {
             return null;
