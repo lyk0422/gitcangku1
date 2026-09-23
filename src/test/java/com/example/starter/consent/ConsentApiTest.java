@@ -25,6 +25,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
 
+import com.example.starter.consent.dto.GrantRequest;
 import com.example.starter.consent.dto.RecordWriteRequest;
 
 /**
@@ -33,6 +34,10 @@ import com.example.starter.consent.dto.RecordWriteRequest;
 @SpringBootTest
 @AutoConfigureMockMvc
 class ConsentApiTest {
+
+    /** 远期到期时刻（UTC），保证本类用例在真实时钟下授权始终有效。 */
+    private static final String FAR_FUTURE = "2099-01-01T00:00:00Z";
+    private static final java.time.Instant FAR_FUTURE_INSTANT = java.time.Instant.parse(FAR_FUTURE);
 
     @Autowired
     private MockMvc mockMvc;
@@ -46,6 +51,7 @@ class ConsentApiTest {
     @BeforeEach
     void cleanTables() {
         jdbc.update("DELETE FROM consent_record");
+        jdbc.update("DELETE FROM consent_delegation");
         jdbc.update("DELETE FROM consent_grant");
         jdbc.update("DELETE FROM idempotency_request");
     }
@@ -54,8 +60,8 @@ class ConsentApiTest {
         return mockMvc.perform(post("/api/v1/consents/grants")
                 .contentType(MediaType.APPLICATION_JSON)
                 .content("""
-                        {"requestId":"%s","subjectKey":"%s","purpose":"%s"}
-                        """.formatted(requestId, subjectKey, purpose)));
+                        {"requestId":"%s","subjectKey":"%s","purpose":"%s","expiresAt":"%s"}
+                        """.formatted(requestId, subjectKey, purpose, FAR_FUTURE)));
     }
 
     private ResultActions write(String requestId, String subjectKey, String purpose,
@@ -63,8 +69,9 @@ class ConsentApiTest {
         return mockMvc.perform(post("/api/v1/records")
                 .contentType(MediaType.APPLICATION_JSON)
                 .content("""
-                        {"requestId":"%s","subjectKey":"%s","purpose":"%s","recordKey":"%s","payload":"%s"}
-                        """.formatted(requestId, subjectKey, purpose, recordKey, payload)));
+                        {"requestId":"%s","subjectKey":"%s","purpose":"%s","callerKey":"%s","recordKey":"%s",
+                         "payload":"%s","delegationPath":[]}
+                        """.formatted(requestId, subjectKey, purpose, subjectKey, recordKey, payload)));
     }
 
     private ResultActions revoke(String requestId, String subjectKey, String purpose, int epoch) throws Exception {
@@ -382,7 +389,8 @@ class ConsentApiTest {
                 ready.countDown();
                 start.await();
                 return consentService.write(new RecordWriteRequest(
-                        requestId, "subj-a", Purpose.RESEARCH, "rec-1", "same-payload")).payload();
+                        requestId, "subj-a", Purpose.RESEARCH, "subj-a", "rec-1", "same-payload",
+                        List.of())).payload();
             });
         }
         List<Future<String>> futures = new ArrayList<>();
@@ -412,7 +420,7 @@ class ConsentApiTest {
                 ready.countDown();
                 start.await();
                 return consentService.grant(
-                        new com.example.starter.consent.dto.GrantRequest(requestId, "subj-c", Purpose.RESEARCH)).epoch();
+                        new GrantRequest(requestId, "subj-c", Purpose.RESEARCH, FAR_FUTURE_INSTANT)).epoch();
             });
         }
         List<Future<Integer>> futures = new ArrayList<>();
