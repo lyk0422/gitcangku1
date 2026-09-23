@@ -79,7 +79,74 @@ CREATE TABLE IF NOT EXISTS publish_lock (
     id INT NOT NULL,
     PRIMARY KEY (id)
 );
-COMMENT ON TABLE publish_lock IS '发布/改签全局互斥锁，保证并发发布与改签按事务提交顺序裁决';
-COMMENT ON COLUMN publish_lock.id IS '锁行 id，固定为 1，发布与改签时 SELECT ... FOR UPDATE 串行化';
+COMMENT ON TABLE publish_lock IS '发布/改签/容量交换全局互斥锁，保证并发写操作按事务提交顺序裁决';
+COMMENT ON COLUMN publish_lock.id IS '锁行 id，固定为 1，发布、改签与交换激活时 SELECT ... FOR UPDATE 串行化';
 
 MERGE INTO publish_lock KEY(id) VALUES (1);
+
+-- 容量交换单：调度员选择同一运营日 2～20 个已发布计划做闭环原子交换。
+CREATE TABLE IF NOT EXISTS rail_capacity_swap (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    swap_key VARCHAR(64) NOT NULL,
+    op_date DATE NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    item_count INT NOT NULL,
+    request_hash CHAR(64) NOT NULL,
+    created_at BIGINT NOT NULL,
+    activated_at BIGINT,
+    PRIMARY KEY (id),
+    CONSTRAINT uk_rail_capacity_swap_key UNIQUE (swap_key)
+);
+COMMENT ON TABLE rail_capacity_swap IS '容量交换单主表；PREVIEW 预览单可激活一次为 ACTIVE，swap_key 跨请求全局唯一';
+COMMENT ON COLUMN rail_capacity_swap.id IS '主键';
+COMMENT ON COLUMN rail_capacity_swap.swap_key IS '交换单业务键，跨请求全局唯一';
+COMMENT ON COLUMN rail_capacity_swap.op_date IS '交换单统一运营日（Asia/Shanghai 日历日），全部参与计划必须同日';
+COMMENT ON COLUMN rail_capacity_swap.status IS '交换单状态：PREVIEW 预览 / ACTIVE 已激活';
+COMMENT ON COLUMN rail_capacity_swap.item_count IS '参与计划数量，2～20';
+COMMENT ON COLUMN rail_capacity_swap.request_hash IS '创建请求规范化（计划与占用段均排序、与提交顺序无关）后的 SHA-256';
+COMMENT ON COLUMN rail_capacity_swap.created_at IS '创建时刻，UTC 毫秒';
+COMMENT ON COLUMN rail_capacity_swap.activated_at IS '激活时刻，UTC 毫秒；未激活为空';
+
+CREATE TABLE IF NOT EXISTS rail_capacity_swap_item (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    swap_id BIGINT NOT NULL,
+    item_seq INT NOT NULL,
+    plan_id BIGINT NOT NULL,
+    schedule_key VARCHAR(64) NOT NULL,
+    expected_version INT NOT NULL,
+    current_json CLOB NOT NULL,
+    target_json CLOB NOT NULL,
+    PRIMARY KEY (id)
+);
+COMMENT ON TABLE rail_capacity_swap_item IS '交换单参与项（预览提交内容的不可变留痕），按 item_seq 稳定排序';
+COMMENT ON COLUMN rail_capacity_swap_item.id IS '主键';
+COMMENT ON COLUMN rail_capacity_swap_item.swap_id IS '所属交换单 id，关联 rail_capacity_swap.id';
+COMMENT ON COLUMN rail_capacity_swap_item.item_seq IS '规范化排序后的参与项序号，从 0 开始';
+COMMENT ON COLUMN rail_capacity_swap_item.plan_id IS '参与计划 id，关联 rail_day_plan.id';
+COMMENT ON COLUMN rail_capacity_swap_item.schedule_key IS '参与计划业务键（留痕，计划后续变更不改写）';
+COMMENT ON COLUMN rail_capacity_swap_item.expected_version IS '调度员提交的期望计划版本';
+COMMENT ON COLUMN rail_capacity_swap_item.current_json IS '提交的当前占用段 JSON（sectionId+左闭右开 UTC 起止，已规范化排序）';
+COMMENT ON COLUMN rail_capacity_swap_item.target_json IS '提交的目标占用段 JSON（sectionId+左闭右开 UTC 起止，已规范化排序）';
+
+CREATE TABLE IF NOT EXISTS rail_capacity_swap_snapshot (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    swap_id BIGINT NOT NULL,
+    phase VARCHAR(8) NOT NULL,
+    item_seq INT NOT NULL,
+    plan_id BIGINT NOT NULL,
+    schedule_key VARCHAR(64) NOT NULL,
+    version INT NOT NULL,
+    occupancies_json CLOB NOT NULL,
+    created_at BIGINT NOT NULL,
+    PRIMARY KEY (id)
+);
+COMMENT ON TABLE rail_capacity_swap_snapshot IS '交换前后不可变快照，激活时一次性写入，之后任何操作不改写不删除';
+COMMENT ON COLUMN rail_capacity_swap_snapshot.id IS '主键';
+COMMENT ON COLUMN rail_capacity_swap_snapshot.swap_id IS '所属交换单 id，关联 rail_capacity_swap.id';
+COMMENT ON COLUMN rail_capacity_swap_snapshot.phase IS '快照阶段：BEFORE 交换前 / AFTER 交换后';
+COMMENT ON COLUMN rail_capacity_swap_snapshot.item_seq IS '参与项序号，与 rail_capacity_swap_item.item_seq 一致';
+COMMENT ON COLUMN rail_capacity_swap_snapshot.plan_id IS '参与计划 id，关联 rail_day_plan.id';
+COMMENT ON COLUMN rail_capacity_swap_snapshot.schedule_key IS '参与计划业务键';
+COMMENT ON COLUMN rail_capacity_swap_snapshot.version IS '快照时的计划版本：BEFORE 为激活前版本，AFTER 为递增后版本';
+COMMENT ON COLUMN rail_capacity_swap_snapshot.occupancies_json IS '占用段快照 JSON（sectionId+左闭右开 UTC 起止，稳定排序）';
+COMMENT ON COLUMN rail_capacity_swap_snapshot.created_at IS '快照写入时刻，UTC 毫秒';
