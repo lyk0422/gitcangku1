@@ -8,6 +8,7 @@ import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.PositiveOrZero;
 import jakarta.validation.constraints.Size;
 
+import java.time.OffsetDateTime;
 import java.util.List;
 
 /**
@@ -131,5 +132,75 @@ public final class ApiDtos {
         public ErrorResponse(String error, String message) {
             this(error, message, null);
         }
+    }
+
+    /** 列车语言候选输入：候选译文版本与期望的当前发布指针。 */
+    public record TrainLocaleInput(
+            @NotBlank(message = "locale 不能为空") String locale,
+            @Positive(message = "translationVersion 必须为正数") int translationVersion,
+            @PositiveOrZero(message = "expectedVersion 不能为负数") int expectedVersion) {
+    }
+
+    /** 创建发布列车请求：2~20 个唯一语言，集合须与文档目标语言完全一致。 */
+    public record CreateReleaseTrainRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @NotBlank(message = "trainKey 不能为空") @Size(max = 128) String trainKey,
+            @Positive(message = "sourceDocumentVersion 必须为正数") int sourceDocumentVersion,
+            @NotNull(message = "plannedAt 不能为空") OffsetDateTime plannedAt,
+            @NotNull(message = "locales 不能为空") @Size(min = 2, max = 20, message = "列车语言须为 2~20 个")
+            List<@Valid TrainLocaleInput> locales) {
+    }
+
+    /** 列车状态变更请求（READY / 取消 / 激活共用，仅携带 requestId）。 */
+    public record TrainTransitionRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId) {
+    }
+
+    /** 列车语言候选视图。 */
+    public record TrainLocaleView(String locale, int candidateTranslationVersion, int expectedVersion) {
+    }
+
+    /** 发布列车视图：状态、冻结的术语版本与源文摘要、激活后推进到的版本。 */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public record TrainResponse(long trainId, String trainKey, long documentId, String status,
+                                int sourceDocumentVersion, OffsetDateTime plannedAt,
+                                Integer termVersion, String sourceDigest, Integer releaseTrainVersion,
+                                List<TrainLocaleView> locales) {
+    }
+
+    /** 列车列表响应，按 trainKey 稳定排序。 */
+    public record TrainListResponse(long documentId, List<TrainResponse> trains) {
+    }
+
+    /** 源段版本差异：译文所依据源文版本与当前源文版本不一致。 */
+    public record SourceVersionDiff(String segmentId, int translationSourceVersion, int currentSourceVersion) {
+    }
+
+    /** 逐语言预检结果：缺段、候选版本不符、源段版本差异、未批准、术语过期/违规与当前发布指针。 */
+    public record LocalePrecheck(String locale, int candidateTranslationVersion, int expectedVersion,
+                                 int currentPointer, boolean pointerMismatch,
+                                 List<String> missingSegments, List<String> candidateMismatches,
+                                 List<SourceVersionDiff> sourceVersionDiffs, List<String> unapprovedSegments,
+                                 boolean termStale, List<TermRuleView> termViolations) {
+        /** 内容侧是否全部通过（不含发布指针，指针仅在激活时强校验）。 */
+        public boolean contentReady() {
+            return missingSegments.isEmpty() && candidateMismatches.isEmpty()
+                    && sourceVersionDiffs.isEmpty() && unapprovedSegments.isEmpty()
+                    && !termStale && termViolations.isEmpty();
+        }
+    }
+
+    /** 列车预检响应：逐语言明细与是否可进入 READY；预检不写数据。 */
+    public record PrecheckResponse(long trainId, String trainKey, long documentId, String status,
+                                   int termVersion, boolean ready, List<LocalePrecheck> locales) {
+    }
+
+    /** 发布指针视图。 */
+    public record ReleasePointerView(String locale, int releasedVersion) {
+    }
+
+    /** 发布指针查询响应，按语言码稳定排序。 */
+    public record ReleasePointerListResponse(long documentId, int trainReleaseVersion,
+                                             List<ReleasePointerView> pointers) {
     }
 }

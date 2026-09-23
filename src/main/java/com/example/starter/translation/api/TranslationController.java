@@ -1,5 +1,6 @@
 package com.example.starter.translation.api;
 
+import com.example.starter.translation.service.ReleaseTrainService;
 import com.example.starter.translation.service.TranslationService;
 import com.example.starter.translation.service.WriteExecutor;
 import com.example.starter.translation.service.WriteResult;
@@ -19,7 +20,10 @@ import org.springframework.web.bind.annotation.RestController;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.Comparator;
 import java.util.HexFormat;
+import java.util.List;
+import java.util.Locale;
 
 /**
  * 多语种段落修订与发布快照 REST API。
@@ -30,12 +34,14 @@ import java.util.HexFormat;
 public class TranslationController {
 
     private final TranslationService translationService;
+    private final ReleaseTrainService releaseTrainService;
     private final WriteExecutor writeExecutor;
     private final ObjectMapper objectMapper;
 
-    public TranslationController(TranslationService translationService, WriteExecutor writeExecutor,
-                                 ObjectMapper objectMapper) {
+    public TranslationController(TranslationService translationService, ReleaseTrainService releaseTrainService,
+                                 WriteExecutor writeExecutor, ObjectMapper objectMapper) {
         this.translationService = translationService;
+        this.releaseTrainService = releaseTrainService;
         this.writeExecutor = writeExecutor;
         this.objectMapper = objectMapper;
     }
@@ -134,6 +140,89 @@ public class TranslationController {
     public ResponseEntity<String> getRelease(@PathVariable long documentId, @PathVariable int publishedVersion) {
         return ResponseEntity.ok().contentType(MediaType.APPLICATION_JSON)
                 .body(translationService.getRelease(documentId, publishedVersion));
+    }
+
+    /** 创建发布列车：2~20 个唯一语言且与文档目标语言完全一致；locale 换序视为同参。 */
+    @PostMapping("/{documentId}/release-trains")
+    public ResponseEntity<String> createTrain(@PathVariable long documentId,
+                                              @Valid @RequestBody ApiDtos.CreateReleaseTrainRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/release-trains";
+        return writeExecutor.execute(request.requestId(), trainHash(operation, request),
+                () -> WriteResult.of(201, releaseTrainService.createTrain(documentId, request)))
+                .toResponseEntity();
+    }
+
+    /** 查询文档全部列车，按 trainKey 稳定排序。 */
+    @GetMapping("/{documentId}/release-trains")
+    public ResponseEntity<ApiDtos.TrainListResponse> listTrains(@PathVariable long documentId) {
+        return ResponseEntity.ok(releaseTrainService.listTrains(documentId));
+    }
+
+    /** 查询单个列车详情。 */
+    @GetMapping("/{documentId}/release-trains/{trainKey}")
+    public ResponseEntity<ApiDtos.TrainResponse> getTrain(@PathVariable long documentId,
+                                                          @PathVariable String trainKey) {
+        return ResponseEntity.ok(releaseTrainService.getTrain(documentId, trainKey));
+    }
+
+    /** 列车预检：逐语言缺段、源段版本差异、术语违规与当前发布指针；只读不写数据。 */
+    @GetMapping("/{documentId}/release-trains/{trainKey}/precheck")
+    public ResponseEntity<ApiDtos.PrecheckResponse> precheck(@PathVariable long documentId,
+                                                             @PathVariable String trainKey) {
+        return ResponseEntity.ok(releaseTrainService.precheck(documentId, trainKey));
+    }
+
+    /** 进入 READY：预检通过后冻结候选集合、源文摘要、术语版本与预检结果。 */
+    @PostMapping("/{documentId}/release-trains/{trainKey}/ready")
+    public ResponseEntity<String> ready(@PathVariable long documentId, @PathVariable String trainKey,
+                                        @Valid @RequestBody ApiDtos.TrainTransitionRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/release-trains/" + trainKey + "/ready";
+        return writeExecutor.execute(request.requestId(), hash(operation, request),
+                () -> WriteResult.of(200, releaseTrainService.ready(documentId, trainKey))).toResponseEntity();
+    }
+
+    /** 整列取消：仅 DRAFT/READY 可取消。 */
+    @PostMapping("/{documentId}/release-trains/{trainKey}/cancel")
+    public ResponseEntity<String> cancel(@PathVariable long documentId, @PathVariable String trainKey,
+                                         @Valid @RequestBody ApiDtos.TrainTransitionRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/release-trains/" + trainKey + "/cancel";
+        return writeExecutor.execute(request.requestId(), hash(operation, request),
+                () -> WriteResult.of(200, releaseTrainService.cancel(documentId, trainKey))).toResponseEntity();
+    }
+
+    /** 激活：到达计划时刻后单事务重查并原子切换全部语言发布指针，生成全部语言不可变快照。 */
+    @PostMapping("/{documentId}/release-trains/{trainKey}/activate")
+    public ResponseEntity<String> activate(@PathVariable long documentId, @PathVariable String trainKey,
+                                           @Valid @RequestBody ApiDtos.TrainTransitionRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/release-trains/" + trainKey + "/activate";
+        return writeExecutor.execute(request.requestId(), hash(operation, request),
+                () -> WriteResult.of(201, releaseTrainService.activate(documentId, trainKey)))
+                .toResponseEntity();
+    }
+
+    /** 查询指定发布列车版本的全部语言快照，按语言码稳定排序。 */
+    @GetMapping("/{documentId}/train-releases/{releaseTrainVersion}")
+    public ResponseEntity<String> getTrainRelease(@PathVariable long documentId,
+                                                  @PathVariable int releaseTrainVersion) {
+        return ResponseEntity.ok().contentType(MediaType.APPLICATION_JSON)
+                .body(releaseTrainService.getTrainRelease(documentId, releaseTrainVersion));
+    }
+
+    /** 查询文档全部语言的当前发布指针，按语言码稳定排序。 */
+    @GetMapping("/{documentId}/release-pointers")
+    public ResponseEntity<ApiDtos.ReleasePointerListResponse> getPointers(@PathVariable long documentId) {
+        return ResponseEntity.ok(releaseTrainService.getPointers(documentId));
+    }
+
+    /** 列车创建请求摘要：语言候选规范化（小写、去空白、按语言码排序）后计算，locale 换序视为同参。 */
+    private String trainHash(String operation, ApiDtos.CreateReleaseTrainRequest request) {
+        List<ApiDtos.TrainLocaleInput> normalized = request.locales().stream()
+                .map(l -> new ApiDtos.TrainLocaleInput(l.locale().trim().toLowerCase(Locale.ROOT),
+                        l.translationVersion(), l.expectedVersion()))
+                .sorted(Comparator.comparing(ApiDtos.TrainLocaleInput::locale))
+                .toList();
+        return hash(operation, new ApiDtos.CreateReleaseTrainRequest(request.requestId(), request.trainKey(),
+                request.sourceDocumentVersion(), request.plannedAt(), normalized));
     }
 
     /** 计算请求摘要：操作（含路径变量）+ 操作者 + 规范化请求体的 SHA-256。 */

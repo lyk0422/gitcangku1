@@ -327,9 +327,8 @@ public class TranslationService {
      * 术语违规判定：源文按 Unicode 原文、区分大小写做连续子串匹配；仅源文命中 sourceTerm 的规则参与校验，
      * 译文正文（同样区分大小写）不含 requiredTranslation 即为违规。返回全部违规规则。
      */
-    private static List<ApiDtos.TermRuleView> findViolations(String sourceText, String language, String content,
-                                                             List<TermRuleRow> rules) {
-        List<ApiDtos.TermRuleView> violations = new ArrayList<>();
+    static List<ApiDtos.TermRuleView> findViolations(String sourceText, String language, String content,
+                                                             List<TermRuleRow> rules) {        List<ApiDtos.TermRuleView> violations = new ArrayList<>();
         for (TermRuleRow rule : rules) {
             if (rule.language().equals(language) && sourceText.contains(rule.sourceTerm())
                     && !content.contains(rule.requiredTranslation())) {

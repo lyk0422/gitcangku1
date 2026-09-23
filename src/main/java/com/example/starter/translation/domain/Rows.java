@@ -1,5 +1,6 @@
 package com.example.starter.translation.domain;
 
+import java.time.Instant;
 import java.util.List;
 
 /**
@@ -18,9 +19,11 @@ public final class Rows {
      * @param draftVersion     文档草稿版本，从 1 开始；增段落或修改源文/译文/术语时加一
      * @param publishedVersion 已发布版本号，从 0 开始，每次成功发布加一
      * @param termVersion      当前术语版本，从 0 开始（0 表示尚未建立术语版本）
+     * @param trainReleaseVersion 发布列车版本计数，从 0 开始，每次列车激活加一
      */
     public record DocumentRow(long documentId, List<String> targetLanguages,
-                              int draftVersion, int publishedVersion, int termVersion) {
+                              int draftVersion, int publishedVersion, int termVersion,
+                              int trainReleaseVersion) {
     }
 
     /**
@@ -81,5 +84,52 @@ public final class Rows {
      */
     public record RequestLogRow(String requestId, String requestHash,
                                 int responseStatus, String responseBody) {
+    }
+
+    /** 发布列车状态：DRAFT 已创建、READY 已冻结、CANCELLED 已整列取消、ACTIVATED 已激活。 */
+    public enum TrainStatus {
+        DRAFT, READY, CANCELLED, ACTIVATED
+    }
+
+    /**
+     * 发布列车：针对一个源文档版本的多语言原子发布计划，trainKey 全局唯一。
+     *
+     * @param trainId               全局唯一列车 ID，自增
+     * @param trainKey              发布经理声明的列车键，全局唯一
+     * @param documentId            所属文档 ID
+     * @param sourceDocumentVersion 创建时声明的源文档草稿版本
+     * @param plannedAt             计划发布时间（UTC Instant）；到达后才允许激活
+     * @param status                列车状态
+     * @param termVersion           READY 时冻结的术语版本；null 表示尚未 READY
+     * @param sourceDigest          READY 时冻结的源文摘要；null 表示尚未 READY
+     * @param precheckJson          READY 时冻结的预检结果 JSON；null 表示尚未 READY
+     * @param releaseTrainVersion   激活后推进到的发布列车版本；null 表示尚未激活
+     */
+    public record ReleaseTrainRow(long trainId, String trainKey, long documentId,
+                                  int sourceDocumentVersion, Instant plannedAt, TrainStatus status,
+                                  Integer termVersion, String sourceDigest, String precheckJson,
+                                  Integer releaseTrainVersion) {
+    }
+
+    /**
+     * 发布列车语言候选：进入 READY 后不可替换。
+     *
+     * @param trainId                     所属列车 ID
+     * @param locale                      目标语言码，小写
+     * @param candidateTranslationVersion 候选译文版本：全部段落译文须处于该版本且已批准
+     * @param expectedVersion             期望的当前发布指针；激活时指针不符则整列 409
+     */
+    public record TrainLocaleRow(long trainId, String locale, int candidateTranslationVersion,
+                                 int expectedVersion) {
+    }
+
+    /**
+     * 发布指针：每个文档每种语言当前已推进到的发布列车版本。
+     *
+     * @param documentId      所属文档 ID
+     * @param locale          目标语言码，小写
+     * @param releasedVersion 当前发布指针；0 表示尚未发布
+     */
+    public record ReleasePointerRow(long documentId, String locale, int releasedVersion) {
     }
 }

@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS document (
     draft_version INT NOT NULL,
     published_version INT NOT NULL,
     term_version INT NOT NULL,
+    train_release_version INT NOT NULL DEFAULT 0,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 COMMENT ON TABLE document IS '文档：全局唯一 documentId，含 1~5 种目标语言及草稿/发布/术语版本';
@@ -15,6 +16,7 @@ COMMENT ON COLUMN document.target_languages IS '目标语言列表，逗号分�
 COMMENT ON COLUMN document.draft_version IS '文档草稿版本，从 1 开始；增段落或修改源文/译文/术语时加一';
 COMMENT ON COLUMN document.published_version IS '已发布版本号，从 0 开始，每次成功发布加一';
 COMMENT ON COLUMN document.term_version IS '当前术语版本，从 0 开始（0 表示尚未建立术语版本），每次新增术语版本加一';
+COMMENT ON COLUMN document.train_release_version IS '发布列车版本计数，从 0 开始，每次列车激活加一；全部语言发布指针切到该版本';
 COMMENT ON COLUMN document.created_at IS '创建时间，数据库默认时区';
 
 CREATE TABLE IF NOT EXISTS segment (
@@ -124,3 +126,73 @@ COMMENT ON COLUMN request_log.request_hash IS '请求参数规范化后的 SHA-2
 COMMENT ON COLUMN request_log.response_status IS '原成功响应的 HTTP 状态码，用于重放';
 COMMENT ON COLUMN request_log.response_body IS '原成功响应体 JSON，用于重放';
 COMMENT ON COLUMN request_log.created_at IS '记录时间，数据库默认时区';
+
+CREATE TABLE IF NOT EXISTS release_train (
+    train_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    train_key VARCHAR(128) NOT NULL,
+    document_id BIGINT NOT NULL,
+    source_document_version INT NOT NULL,
+    planned_at TIMESTAMP NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    term_version INT,
+    source_digest VARCHAR(64),
+    precheck_json LONGTEXT,
+    release_train_version INT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    activated_at TIMESTAMP,
+    CONSTRAINT uk_release_train_key UNIQUE (train_key)
+);
+COMMENT ON TABLE release_train IS '发布列车：针对一个源文档版本的多语言原子发布计划，trainKey 全局唯一；状态 DRAFT/READY/CANCELLED/ACTIVATED';
+COMMENT ON COLUMN release_train.train_id IS '全局唯一列车 ID，自增';
+COMMENT ON COLUMN release_train.train_key IS '发布经理声明的列车键，全局唯一，重复创建返回 409';
+COMMENT ON COLUMN release_train.document_id IS '所属文档 ID';
+COMMENT ON COLUMN release_train.source_document_version IS '创建列车时声明的源文档草稿版本，必须等于创建时当前草稿版本';
+COMMENT ON COLUMN release_train.planned_at IS '计划发布时间，数据库默认时区；到达该时刻后才允许激活';
+COMMENT ON COLUMN release_train.status IS '列车状态：DRAFT 已创建、READY 已冻结、CANCELLED 已整列取消、ACTIVATED 已激活';
+COMMENT ON COLUMN release_train.term_version IS '进入 READY 时冻结的术语版本；为空表示尚未进入 READY';
+COMMENT ON COLUMN release_train.source_digest IS '进入 READY 时冻结的源文摘要（全部段落 ID+版本+正文的 SHA-256）；为空表示尚未进入 READY';
+COMMENT ON COLUMN release_train.precheck_json IS '进入 READY 时冻结的预检结果 JSON；为空表示尚未进入 READY';
+COMMENT ON COLUMN release_train.release_train_version IS '激活后本列车推进到的发布列车版本；为空表示尚未激活';
+COMMENT ON COLUMN release_train.created_at IS '创建时间，数据库默认时区';
+COMMENT ON COLUMN release_train.activated_at IS '激活时间，数据库默认时区；为空表示尚未激活';
+
+CREATE TABLE IF NOT EXISTS release_train_locale (
+    train_id BIGINT NOT NULL,
+    locale VARCHAR(16) NOT NULL,
+    candidate_translation_version INT NOT NULL,
+    expected_version INT NOT NULL,
+    PRIMARY KEY (train_id, locale)
+);
+COMMENT ON TABLE release_train_locale IS '发布列车语言候选：每列车 2~20 个唯一语言，进入 READY 后不可替换';
+COMMENT ON COLUMN release_train_locale.train_id IS '所属列车 ID';
+COMMENT ON COLUMN release_train_locale.locale IS '目标语言码，小写；列车内唯一且集合须与文档目标语言完全一致';
+COMMENT ON COLUMN release_train_locale.candidate_translation_version IS '该语言候选译文版本：全部段落译文须处于该版本且已批准';
+COMMENT ON COLUMN release_train_locale.expected_version IS '该语言期望的当前发布指针；激活时若指针已被其他发布推进则整列 409';
+
+CREATE TABLE IF NOT EXISTS release_pointer (
+    document_id BIGINT NOT NULL,
+    locale VARCHAR(16) NOT NULL,
+    released_version INT NOT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (document_id, locale)
+);
+COMMENT ON TABLE release_pointer IS '发布指针：每个文档每种语言当前已推进到的发布列车版本，无行表示 0（尚未发布）';
+COMMENT ON COLUMN release_pointer.document_id IS '所属文档 ID';
+COMMENT ON COLUMN release_pointer.locale IS '目标语言码，小写';
+COMMENT ON COLUMN release_pointer.released_version IS '当前发布指针，等于最近一次覆盖该语言的成功列车版本；0 表示尚未发布';
+COMMENT ON COLUMN release_pointer.updated_at IS '最近推进时间，数据库默认时区';
+
+CREATE TABLE IF NOT EXISTS train_snapshot (
+    document_id BIGINT NOT NULL,
+    release_train_version INT NOT NULL,
+    locale VARCHAR(16) NOT NULL,
+    snapshot_json LONGTEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (document_id, release_train_version, locale)
+);
+COMMENT ON TABLE train_snapshot IS '列车发布快照：激活时按语言原子生成的不可变只读快照，记录源文、候选、术语与切换前后指针';
+COMMENT ON COLUMN train_snapshot.document_id IS '所属文档 ID';
+COMMENT ON COLUMN train_snapshot.release_train_version IS '发布列车版本，同一列车全部语言共用同一版本';
+COMMENT ON COLUMN train_snapshot.locale IS '该快照对应的语言码，小写';
+COMMENT ON COLUMN train_snapshot.snapshot_json IS '快照内容 JSON：源文摘要、候选译文、术语版本及规则、切换前后发布指针';
+COMMENT ON COLUMN train_snapshot.created_at IS '快照生成时间，数据库默认时区';

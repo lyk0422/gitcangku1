@@ -35,6 +35,10 @@ public abstract class AbstractIntegrationTest {
 
     @BeforeEach
     void cleanTables() {
+        jdbc.update("DELETE FROM release_train_locale");
+        jdbc.update("DELETE FROM release_train");
+        jdbc.update("DELETE FROM release_pointer");
+        jdbc.update("DELETE FROM train_snapshot");
         jdbc.update("DELETE FROM approval");
         jdbc.update("DELETE FROM translation");
         jdbc.update("DELETE FROM segment");
