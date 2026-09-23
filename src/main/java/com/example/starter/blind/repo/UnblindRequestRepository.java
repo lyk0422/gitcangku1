@@ -87,6 +87,19 @@ public class UnblindRequestRepository {
     }
 
     /**
+     * 查询某参与者全部已批准揭盲申请；其申请人是污染闭包的根节点
+     * （批准即视为申请人已获知处理代码）。
+     */
+    public List<UnblindRequestRow> findApprovedByParticipant(String experimentId,
+                                                             String participantId) {
+        return jdbc.query(
+                "SELECT " + COLUMNS + " FROM unblind_request "
+                        + "WHERE experiment_id = ? AND participant_id = ? AND status = 'APPROVED' "
+                        + "ORDER BY reviewed_at, id",
+                MAPPER, experimentId, participantId);
+    }
+
+    /**
      * 批准：仅 PENDING 可批准，写入处理代码、批准人与时间，并释放待审唯一占位。
      *
      * @return 受影响行数；0 表示不存在或已批准

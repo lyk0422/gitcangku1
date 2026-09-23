@@ -15,4 +15,8 @@ public record Actor(String actorId, Role role) {
     public boolean isReviewer() {
         return role == Role.REVIEWER;
     }
+
+    public boolean isCompliance() {
+        return role == Role.COMPLIANCE;
+    }
 }

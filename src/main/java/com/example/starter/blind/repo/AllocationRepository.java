@@ -64,6 +64,19 @@ public class AllocationRepository {
     }
 
     /**
+     * 行级锁定某参与者的分配行，串行化同一参与者维度的披露提交、
+     * 闭包版本生成与隔离发起/审核门禁判定。
+     */
+    public AllocationRow lockByExperimentAndParticipant(String experimentId, String participantId) {
+        List<AllocationRow> rows = jdbc.query(
+                "SELECT id, experiment_id, participant_id, block_no, seat_no, blind_code, status, "
+                        + "assigned_actor, assigned_at, withdrawn_at "
+                        + "FROM allocation WHERE experiment_id = ? AND participant_id = ? FOR UPDATE",
+                ALLOCATION_MAPPER, experimentId, participantId);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /**
      * 原子领取按区组、席位顺序排列的第一个空位：把尚未被占用的最小 block_no/seat_no
      * 关联给新参与者。依赖 allocation(experiment_id, block_no, seat_no) 唯一索引兜底并发。
      *

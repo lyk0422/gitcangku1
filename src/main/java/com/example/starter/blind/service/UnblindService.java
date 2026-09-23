@@ -27,15 +27,18 @@ public class UnblindService {
     private final UnblindRequestRepository unblindRequestRepository;
     private final ExperimentService experimentService;
     private final ExperimentRepository experimentRepository;
+    private final ContaminationService contaminationService;
     private final Clock clock;
 
     public UnblindService(UnblindRequestRepository unblindRequestRepository,
                           ExperimentService experimentService,
                           ExperimentRepository experimentRepository,
+                          ContaminationService contaminationService,
                           Clock clock) {
         this.unblindRequestRepository = unblindRequestRepository;
         this.experimentService = experimentService;
         this.experimentRepository = experimentRepository;
+        this.contaminationService = contaminationService;
         this.clock = clock;
     }
 
@@ -86,6 +89,10 @@ public class UnblindService {
         if (row.applicantActor().equals(reviewerActor)) {
             throw ApiException.forbidden("批准人必须是不同于申请人的另一名 REVIEWER");
         }
+        // 污染闭包门禁：拟批准人（无论其是否曾为其他申请的申请人/审核人）
+        // 一旦在目标参与者闭包内，不得成为本申请的新审核人。
+        contaminationService.assertReviewerNotContaminated(
+                row.experimentId(), row.participantId(), reviewerActor);
         // 从数据库读取处理映射（盲底），批准时写入申请记录；处理代码不打日志。
         AllocationRow allocation =
                 experimentService.mustFindAllocationRow(row.experimentId(), row.participantId());
@@ -97,6 +104,8 @@ public class UnblindService {
         long now = clock.nowMillis();
         unblindRequestRepository.approve(unblindRequestId, reviewerActor,
                 seat.treatment(), now);
+        // 新申请人成为闭包根节点；若闭包集合因此扩大，追加 OPEN 新版本，旧冻结快照不变。
+        contaminationService.refreshVersionAfterApproval(row.experimentId(), row.participantId());
         return new UnblindRequestView(row.id(), row.experimentId(), row.participantId(),
                 row.reason(), row.applicantActor(), reviewerActor, "APPROVED",
                 row.createdAt(), now);
