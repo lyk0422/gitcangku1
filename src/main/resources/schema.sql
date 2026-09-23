@@ -79,6 +79,7 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     group_code VARCHAR(64) NOT NULL COMMENT '分组编码，非空',
     title VARCHAR(512) NOT NULL COMMENT '任务标题，非空',
     status VARCHAR(16) NOT NULL COMMENT '状态：OPEN 待处理 / DONE 已完成 / CANCELLED 已取消；仅允许 OPEN→DONE 或 OPEN→CANCELLED，DONE 与 CANCELLED 为终态',
+    version INT NOT NULL DEFAULT 1 COMMENT '任务版本，从 1 开始；依赖列表每次替换成功加一（即使列表未变），完成或取消首次成功也加一；expectedTaskVersion 用于乐观并发控制',
     created_by VARCHAR(128) NOT NULL COMMENT '创建人（创建时的当前指挥人）',
     done_by VARCHAR(128) NULL COMMENT '完成人（操作时的当前指挥人）；仅 DONE 有值，否则为空',
     done_at TIMESTAMP(6) NULL COMMENT '完成 UTC 时间；仅 DONE 有值，否则为空',
@@ -97,6 +98,19 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
     CONSTRAINT uk_task_blocker UNIQUE (task_id, blocker_incident_id)
 ) COMMENT='处置任务跨事件阻塞关系表（有向图边：所属任务事件 → 阻塞事件）';
 
+CREATE TABLE IF NOT EXISTS incident_task_dependency_revisions (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    task_id BIGINT NOT NULL COMMENT '所属任务 id，关联 incident_tasks.id',
+    revision_no INT NOT NULL COMMENT '修订序号，任务内从 1 开始单调递增，与替换后版本一致；仅依赖替换产生记录',
+    before_version INT NOT NULL COMMENT '修订前任务版本',
+    after_version INT NOT NULL COMMENT '修订后任务版本（= before_version + 1）',
+    dependencies MEDIUMTEXT NOT NULL COMMENT '排序后的依赖（阻塞）事件业务键 JSON 数组，提交时快照，不可变',
+    actor VARCHAR(128) NOT NULL COMMENT '操作者（提交修订时的当前指挥人）',
+    occurred_at TIMESTAMP(6) NOT NULL COMMENT '修订提交 UTC 时刻',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '落库 UTC 时间',
+    CONSTRAINT uk_task_revision_no UNIQUE (task_id, revision_no)
+) COMMENT='处置任务依赖列表不可变修订历史表';
+
 CREATE TABLE IF NOT EXISTS task_graph_lock (
-    id TINYINT PRIMARY KEY COMMENT '固定为 1 的单行锁；创建任务时 SELECT ... FOR UPDATE 持有，串行化环检测与写入，保证并发反向依赖最终图无环'
+    id TINYINT PRIMARY KEY COMMENT '固定为 1 的单行锁；创建任务或替换依赖时 SELECT ... FOR UPDATE 持有，串行化环检测与写入，保证并发反向依赖最终图无环'
 ) COMMENT='任务依赖图全局锁表';

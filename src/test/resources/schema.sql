@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     group_code VARCHAR(64) NOT NULL,
     title VARCHAR(512) NOT NULL,
     status VARCHAR(16) NOT NULL,
+    version INT NOT NULL DEFAULT 1,
     created_by VARCHAR(128) NOT NULL,
     done_by VARCHAR(128) NULL,
     done_at TIMESTAMP(6) NULL,
@@ -94,6 +95,19 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
     blocker_incident_id BIGINT NOT NULL,
     created_at TIMESTAMP(6) NOT NULL,
     CONSTRAINT uk_task_blocker UNIQUE (task_id, blocker_incident_id)
+);
+
+CREATE TABLE IF NOT EXISTS incident_task_dependency_revisions (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    task_id BIGINT NOT NULL,
+    revision_no INT NOT NULL,
+    before_version INT NOT NULL,
+    after_version INT NOT NULL,
+    dependencies CLOB NOT NULL,
+    actor VARCHAR(128) NOT NULL,
+    occurred_at TIMESTAMP(6) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_task_revision_no UNIQUE (task_id, revision_no)
 );
 
 CREATE TABLE IF NOT EXISTS task_graph_lock (

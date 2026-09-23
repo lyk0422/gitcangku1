@@ -9,6 +9,7 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.HexFormat;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -22,6 +23,7 @@ import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
 import com.example.starter.incident.dto.Requests.TaskActionRequest;
 import com.example.starter.incident.dto.Requests.TaskCreateRequest;
+import com.example.starter.incident.dto.Requests.TaskDependencyReplaceRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
@@ -32,10 +34,13 @@ import com.example.starter.incident.dto.Responses.IncidentTasksView;
 import com.example.starter.incident.dto.Responses.IncidentView;
 import com.example.starter.incident.dto.Responses.StatusChangeView;
 import com.example.starter.incident.dto.Responses.TaskBlockerView;
+import com.example.starter.incident.dto.Responses.TaskRevisionView;
+import com.example.starter.incident.dto.Responses.TaskRevisionsView;
 import com.example.starter.incident.dto.Responses.TaskView;
 import com.example.starter.incident.dto.Responses.TransferView;
 import com.example.starter.incident.dto.Responses.UnfinishedTaskView;
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
@@ -452,7 +457,7 @@ public class IncidentService {
                     }
                     Instant now = now();
                     long taskId = tasks.insert(new IncidentTask(0L, incident.id(), taskKey,
-                            groupCode, title, TaskStatus.OPEN, actor, null, null, null, null,
+                            groupCode, title, TaskStatus.OPEN, 1, actor, null, null, null, null,
                             now, now));
                     for (Incident blocker : blockers) {
                         tasks.insertBlocker(taskId, blocker.id(), now);
@@ -511,6 +516,116 @@ public class IncidentService {
                     tasks.markCancelled(task.id(), actor, now());
                     return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
                 });
+    }
+
+    /**
+     * 整体替换 OPEN 任务的阻塞列表：仅当前指挥人；0~5 个不重复、已存在且非自身的事件键。
+     * 替换在依赖图全局锁内先移除该任务旧边、再写入新边并做环检测，拒绝直接或间接环
+     * （409，事务回滚保证旧边、版本、修订历史及去重记录不变）；同事件其他任务的边以及
+     * DONE/CANCELLED 任务的历史边仍参与判定。即使新列表与旧列表完全相同，成功后版本也加一。
+     * expectedTaskVersion 为乐观版本：与提交时最新版本不一致返回 409；终态任务不得修订（409）。
+     * 同 commandKey 同操作者同参重放首次结果且不再次替换，异参 409，失败不占键。
+     */
+    @Transactional
+    public TaskView replaceTaskDependencies(String incidentKey, String taskKey, String actor,
+                                            TaskDependencyReplaceRequest req) {
+        String commandKey = requireText(req.commandKey(), "commandKey");
+        if (req.expectedTaskVersion() == null) {
+            throw ApiException.badRequest("expectedTaskVersion 不能为空");
+        }
+        int expectedVersion = req.expectedTaskVersion();
+        if (expectedVersion < 1) {
+            throw ApiException.badRequest("expectedTaskVersion 必须从 1 开始");
+        }
+        List<String> blockerKeys = new ArrayList<>();
+        if (req.blockerIncidentKeys() != null) {
+            Set<String> distinct = new HashSet<>();
+            for (String raw : req.blockerIncidentKeys()) {
+                String blockerKey = requireText(raw, "blockerIncidentKey");
+                if (!distinct.add(blockerKey)) {
+                    throw ApiException.badRequest("阻塞事件不能重复: " + blockerKey);
+                }
+                blockerKeys.add(blockerKey);
+            }
+        }
+        if (blockerKeys.size() > MAX_BLOCKERS_PER_TASK) {
+            throw ApiException.badRequest("阻塞事件最多 " + MAX_BLOCKERS_PER_TASK + " 个");
+        }
+        if (blockerKeys.contains(incidentKey)) {
+            throw ApiException.badRequest("阻塞事件不能是事件自身: " + incidentKey);
+        }
+        List<String> requested = blockerKeys.stream().sorted().toList();
+        Incident incident = lockIncident(incidentKey);
+        return runIdempotent(commandKey, "task_dependencies_replace",
+                hash(incidentKey, taskKey, actor, Integer.toString(expectedVersion),
+                        String.join(",", requested)),
+                TaskView.class, () -> {
+                    requireCommander(incident, actor);
+                    IncidentTask task = tasks.findByKey(incident.id(), taskKey)
+                            .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
+                    if (task.status() != TaskStatus.OPEN) {
+                        throw ApiException.conflict(
+                                "任务已处于终态 " + task.status() + "，不能修订依赖");
+                    }
+                    if (task.version() != expectedVersion) {
+                        throw ApiException.conflict("任务版本已变化: expected=" + expectedVersion
+                                + ", actual=" + task.version());
+                    }
+                    List<Incident> blockers = new ArrayList<>();
+                    for (String blockerKey : blockerKeys) {
+                        blockers.add(incidents.findByKey(blockerKey)
+                                .orElseThrow(() -> ApiException.notFound(
+                                        "阻塞事件不存在: " + blockerKey)));
+                    }
+                    Instant now = now();
+                    // 全局图锁：先删该任务旧边，再写新边并环检测，并发反向建边下最终图无环
+                    tasks.lockGraph();
+                    tasks.deleteBlockers(task.id());
+                    for (Incident blocker : blockers) {
+                        tasks.insertBlocker(task.id(), blocker.id(), now);
+                    }
+                    for (Incident blocker : blockers) {
+                        if (tasks.isReachable(blocker.id(), incident.id())) {
+                            throw ApiException.conflict("阻塞关系会形成环: "
+                                    + blocker.incidentKey() + " 已直接或间接依赖 " + incidentKey);
+                        }
+                    }
+                    int updated = tasks.bumpVersionIfOpen(task.id(), expectedVersion, now);
+                    if (updated == 0) {
+                        throw ApiException.conflict("任务已被并发修订或状态已变更: " + taskKey);
+                    }
+                    int afterVersion = expectedVersion + 1;
+                    int revisionNo = tasks.listRevisions(task.id()).size() + 1;
+                    tasks.insertRevision(new TaskDependencyRevision(0L, task.id(), revisionNo,
+                            expectedVersion, afterVersion, toJson(requested), actor, now, now));
+                    return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
+                });
+    }
+
+    /**
+     * 查询任务不可变依赖修订历史（含前后版本与排序后的依赖事件键快照），按修订序号升序。
+     * 只读，不隐式写入。
+     */
+    @Transactional(readOnly = true)
+    public TaskRevisionsView taskRevisions(String incidentKey, String taskKey) {
+        Incident incident = incidents.findByKey(incidentKey)
+                .orElseThrow(() -> ApiException.notFound("事件不存在: " + incidentKey));
+        IncidentTask task = tasks.findByKey(incident.id(), taskKey)
+                .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
+        List<TaskRevisionView> views = tasks.listRevisions(task.id()).stream()
+                .map(r -> new TaskRevisionView(r.revisionNo(), r.beforeVersion(), r.afterVersion(),
+                        readStringList(r.dependenciesJson()), r.actor(), r.occurredAt()))
+                .toList();
+        return new TaskRevisionsView(incidentKey, taskKey, task.version(), views);
+    }
+
+    private List<String> readStringList(String json) {
+        try {
+            return objectMapper.readValue(json, new TypeReference<List<String>>() {
+            });
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("修订依赖列表反序列化失败", e);
+        }
     }
 
     /**
@@ -640,8 +755,8 @@ public class IncidentService {
                         UNBLOCKING_STATUSES.contains(b.status())))
                 .toList();
         return new TaskView(task.taskKey(), task.groupCode(), task.title(), task.status().name(),
-                blockers, task.createdBy(), task.createdAt(), task.doneBy(), task.doneAt(),
-                task.cancelledBy(), task.cancelledAt());
+                task.version(), blockers, task.createdBy(), task.createdAt(), task.doneBy(),
+                task.doneAt(), task.cancelledBy(), task.cancelledAt());
     }
 
     private static TransferView toTransferView(IncidentTransfer transfer) {

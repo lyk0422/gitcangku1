@@ -8,6 +8,7 @@ import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
 import com.example.starter.incident.dto.Requests.TaskActionRequest;
 import com.example.starter.incident.dto.Requests.TaskCreateRequest;
+import com.example.starter.incident.dto.Requests.TaskDependencyReplaceRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
@@ -16,6 +17,7 @@ import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
 import com.example.starter.incident.dto.Responses.IncidentTasksView;
 import com.example.starter.incident.dto.Responses.IncidentView;
+import com.example.starter.incident.dto.Responses.TaskRevisionsView;
 import com.example.starter.incident.dto.Responses.TaskView;
 import com.example.starter.incident.dto.Responses.TransferView;
 import org.springframework.http.HttpStatus;
@@ -187,5 +189,26 @@ public class IncidentController {
                                @RequestHeader("X-Actor-Id") String actor,
                                @RequestBody TaskActionRequest req) {
         return service.cancelTask(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 整体替换 OPEN 任务的阻塞依赖列表（仅当前指挥人；expectedTaskVersion 乐观并发控制，
+     * 拒绝环依赖；成功后版本加一并保存不可变修订）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/dependencies")
+    public TaskView replaceDependencies(@PathVariable String incidentKey,
+                                        @PathVariable String taskKey,
+                                        @RequestHeader("X-Actor-Id") String actor,
+                                        @RequestBody TaskDependencyReplaceRequest req) {
+        return service.replaceTaskDependencies(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 查询任务依赖修订历史（前后版本与排序后的依赖列表快照，只读）。
+     */
+    @GetMapping("/{incidentKey}/tasks/{taskKey}/revisions")
+    public TaskRevisionsView revisions(@PathVariable String incidentKey,
+                                       @PathVariable String taskKey) {
+        return service.taskRevisions(incidentKey, taskKey);
     }
 }

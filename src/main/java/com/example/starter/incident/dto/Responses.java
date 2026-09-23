@@ -63,12 +63,26 @@ public final class Responses {
     }
 
     /**
-     * 处置任务视图：blockers 按阻塞事件键排序；doneBy/doneAt 仅 DONE 有值，
+     * 处置任务视图：version 为任务版本（从 1 开始，依赖替换与首次完成/取消成功加一）；
+     * blockers 按阻塞事件键排序；doneBy/doneAt 仅 DONE 有值，
      * cancelledBy/cancelledAt 仅 CANCELLED 有值。
      */
-    public record TaskView(String taskKey, String groupCode, String title, String status,
+    public record TaskView(String taskKey, String groupCode, String title, String status, int version,
                            List<TaskBlockerView> blockers, String createdBy, Instant createdAt,
                            String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt) {
+    }
+
+    /**
+     * 依赖修订视图：revisionNo 为任务内单调递增的修订序号（与替换后版本一致）；
+     * beforeVersion/afterVersion 为修订前后版本；dependencies 为排序后的依赖事件键快照，不可变。
+     */
+    public record TaskRevisionView(int revisionNo, int beforeVersion, int afterVersion,
+                                   List<String> dependencies, String actor, Instant occurredAt) {
+    }
+
+    /** 任务依赖修订历史视图：revisions 按修订序号升序返回，只读。 */
+    public record TaskRevisionsView(String incidentKey, String taskKey, int currentVersion,
+                                    List<TaskRevisionView> revisions) {
     }
 
     /** 按事件分组的任务列表视图：tasks 按创建顺序返回。 */

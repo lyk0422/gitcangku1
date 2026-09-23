@@ -108,6 +108,30 @@ class SchemaH2ScriptTest {
                     duplicateBlockerRejected = true;
                 }
                 assertThat(duplicateBlockerRejected).isTrue();
+
+                // 依赖修订：(task_id, revision_no) 唯一，历史不可变
+                st.execute("INSERT INTO incident_task_dependency_revisions (task_id, revision_no,"
+                        + " before_version, after_version, dependencies, actor, occurred_at,"
+                        + " created_at) VALUES (1,1,1,2,'[\"IK-1\"]','alice','"
+                        + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                boolean duplicateRevisionRejected = false;
+                try {
+                    st.execute("INSERT INTO incident_task_dependency_revisions (task_id,"
+                            + " revision_no, before_version, after_version, dependencies, actor,"
+                            + " occurred_at, created_at) VALUES (1,1,2,3,'[]','alice','"
+                            + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateRevisionRejected = true;
+                }
+                assertThat(duplicateRevisionRejected).isTrue();
+
+                // 任务版本乐观条件更新：仅 OPEN 且版本匹配时生效
+                int bumped = st.executeUpdate("UPDATE incident_tasks SET version = version + 1"
+                        + " WHERE id = 1 AND status = 'OPEN' AND version = 1");
+                assertThat(bumped).isEqualTo(1);
+                int staleBump = st.executeUpdate("UPDATE incident_tasks SET version = version + 1"
+                        + " WHERE id = 1 AND status = 'OPEN' AND version = 1");
+                assertThat(staleBump).isZero();
             }
         }
     }
