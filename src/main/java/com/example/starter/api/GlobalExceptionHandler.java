@@ -21,6 +21,14 @@ public class GlobalExceptionHandler {
         return ResponseEntity.status(ex.status()).body(body(ex.code(), ex.getMessage()));
     }
 
+    /** 全部改航候选 BLOCKED：422，响应体给出逐候选命中集合。 */
+    @ExceptionHandler(AllCandidatesBlockedException.class)
+    public ResponseEntity<Map<String, Object>> handleAllBlocked(AllCandidatesBlockedException ex) {
+        Map<String, Object> map = body("ALL_CANDIDATES_BLOCKED", ex.getMessage());
+        map.put("candidates", ex.candidates());
+        return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY).body(map);
+    }
+
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ResponseEntity<Map<String, Object>> handleValidation(MethodArgumentNotValidException ex) {
         String message = ex.getBindingResult().getFieldErrors().stream()

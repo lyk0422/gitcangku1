@@ -59,6 +59,28 @@ CREATE TABLE IF NOT EXISTS review (
 
 CREATE UNIQUE INDEX IF NOT EXISTS ux_review_request ON review (request_id);
 
+-- 改航候选集评估不可变记录：固化读取的空域版本、航线版本（替换前/后）与选中候选序号
+CREATE TABLE IF NOT EXISTS reroute_evaluation (
+    evaluation_key    VARCHAR(64) PRIMARY KEY COMMENT '评估唯一标识，全局唯一（同键同参重放）',
+    route_id          VARCHAR(64) NOT NULL COMMENT '被评估并替换点列的目标航线标识',
+    route_version     INT NOT NULL COMMENT '评估读取的航线版本（替换前）',
+    new_route_version INT NOT NULL COMMENT '选中替换后的航线版本，等于替换前版本加一',
+    airspace_version  BIGINT NOT NULL COMMENT '评估事务读取并固化的空域版本',
+    selected_index    INT NOT NULL COMMENT '选中候选序号，从 1 开始，按声明顺序首个 CLEAR',
+    request_id        VARCHAR(64) NOT NULL COMMENT '评估写操作请求标识（即 evaluationKey）',
+    created_at        BIGINT NOT NULL COMMENT '创建时间，epoch 毫秒（UTC）'
+) COMMENT = '改航候选集评估不可变记录（与航线点列替换同事务原子提交）';
+
+-- 评估的逐候选结论：点列与命中 zoneId 均为不可变快照
+CREATE TABLE IF NOT EXISTS reroute_evaluation_candidate (
+    evaluation_key  VARCHAR(64) NOT NULL COMMENT '所属评估标识',
+    candidate_index INT NOT NULL COMMENT '候选序号，从 1 开始，按请求声明顺序',
+    conclusion      VARCHAR(16) NOT NULL COMMENT '候选结论：CLEAR 通过或 BLOCKED 命中，永不改变',
+    hit_zone_ids    CLOB NOT NULL COMMENT '命中的全部 zoneId，字典序去重后逗号拼接；CLEAR 为空串',
+    points_snapshot VARCHAR(4000) NOT NULL COMMENT '候选有序航点不可变快照，格式 x,y;x,y',
+    PRIMARY KEY (evaluation_key, candidate_index)
+) COMMENT = '改航评估逐候选不可变结论';
+
 -- 写操作幂等去重：同键同参重放原结果，异参冲突；失败不占键
 CREATE TABLE IF NOT EXISTS request_dedup (
     request_id     VARCHAR(64) PRIMARY KEY COMMENT '写操作全局唯一请求标识',

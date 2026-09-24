@@ -1,7 +1,11 @@
 package com.example.starter.service;
 
+import com.example.starter.api.AllCandidatesBlockedException;
 import com.example.starter.api.ApiException;
+import com.example.starter.api.dto.CandidateResultDto;
 import com.example.starter.api.dto.MutationResponse;
+import com.example.starter.api.dto.RerouteEvaluationRequest;
+import com.example.starter.api.dto.RerouteEvaluationResultDto;
 import com.example.starter.api.dto.ReviewRequest;
 import com.example.starter.api.dto.ReviewResultDto;
 import com.example.starter.api.dto.RouteCreateRequest;
@@ -16,7 +20,10 @@ import com.example.starter.domain.Point;
 import com.example.starter.domain.ReviewConclusion;
 import com.example.starter.domain.ZoneStatus;
 import com.example.starter.repo.AirspaceRepository;
+import com.example.starter.repo.CandidateResultPo;
 import com.example.starter.repo.DedupPo;
+import com.example.starter.repo.RerouteEvaluationPo;
+import com.example.starter.repo.RerouteEvaluationRepository;
 import com.example.starter.repo.ReviewPo;
 import com.example.starter.repo.ReviewRepository;
 import com.example.starter.repo.RoutePo;
@@ -64,10 +71,12 @@ public class AirspaceReviewService {
     static final String KIND_ROUTE_CREATE = "ROUTE_CREATE";
     static final String KIND_ROUTE_REPLACE = "ROUTE_REPLACE";
     static final String KIND_REVIEW = "REVIEW";
+    static final String KIND_REROUTE_EVALUATION = "REROUTE_EVALUATION";
 
     private final AirspaceRepository airspaceRepo;
     private final RouteRepository routeRepo;
     private final ReviewRepository reviewRepo;
+    private final RerouteEvaluationRepository evaluationRepo;
     private final ObjectMapper objectMapper;
     private final Clock clock;
     private final TransactionTemplate txTemplate;
@@ -75,12 +84,14 @@ public class AirspaceReviewService {
     public AirspaceReviewService(AirspaceRepository airspaceRepo,
                                  RouteRepository routeRepo,
                                  ReviewRepository reviewRepo,
+                                 RerouteEvaluationRepository evaluationRepo,
                                  ObjectMapper objectMapper,
                                  Clock clock,
                                  PlatformTransactionManager transactionManager) {
         this.airspaceRepo = airspaceRepo;
         this.routeRepo = routeRepo;
         this.reviewRepo = reviewRepo;
+        this.evaluationRepo = evaluationRepo;
         this.objectMapper = objectMapper;
         this.clock = clock;
         this.txTemplate = new TransactionTemplate(transactionManager);
@@ -246,8 +257,153 @@ public class AirspaceReviewService {
         });
     }
 
-    // ============================ 幂等与事务 ============================
+    // ============================ 改航候选集评估 ============================
 
+    /**
+     * 改航候选集批量评估。
+     *
+     * <p>在一个事务内先锁全局空域版本行、再锁目标航线行（与审核相同的加锁顺序，避免死锁），
+     * 读取一致的航线版本与全部有效禁飞区后，对每个候选独立判定（线段穿越、完全位于
+     * 区域内、仅接触边界均算命中）。按声明顺序取首个 CLEAR：在同一事务内用其点列替换
+     * 目标航线（版本加一、旧审核结论随版本推进而失效）并写入不可变评估记录。</p>
+     *
+     * <p>全部候选 BLOCKED 抛 422 并回滚，航线点列与评估记录都不写入；任一版本不符 409。
+     * 幂等以 evaluationKey 为键：同键同参重放首次响应快照；候选顺序属于参数，换序异参 409；
+     * 任何失败都回滚、不占用 evaluationKey。</p>
+     */
+    public MutationResponse evaluateReroute(RerouteEvaluationRequest request) {
+        return withIdempotency(request.evaluationKey(), KIND_REROUTE_EVALUATION,
+                canonicalHash(request), () -> {
+                    // 请求级校验：每个候选至少两点不同；候选之间不得完全相同
+                    List<List<Point>> candidatePoints = validateCandidates(request.candidates());
+
+                    // 先锁空域版本行：与任何区域创建/撤销事务互斥
+                    long globalVersion = airspaceRepo.getGlobalVersionForUpdate();
+                    // 再锁航线行：与航线替换/审核事务互斥，保证版本号与点列一致
+                    RoutePo route = routeRepo.findRouteForUpdate(request.routeId());
+                    if (route == null) {
+                        throw new ApiException(HttpStatus.NOT_FOUND, "ROUTE_NOT_FOUND",
+                                "航线不存在: " + request.routeId());
+                    }
+                    if (route.version() != request.expectedVersion()) {
+                        throw new ApiException(HttpStatus.CONFLICT, "VERSION_CONFLICT",
+                                "航线版本不是当前版本：submitted=" + request.expectedVersion()
+                                        + ", current=" + route.version());
+                    }
+                    if (globalVersion != request.airspaceVersion()) {
+                        throw new ApiException(HttpStatus.CONFLICT, "VERSION_CONFLICT",
+                                "空域版本不是当前版本：submitted=" + request.airspaceVersion()
+                                        + ", current=" + globalVersion);
+                    }
+                    // 持锁状态下读取全部有效禁飞区，与上面的版本号同属一个一致状态
+                    List<ZonePo> activeZones = airspaceRepo.findActiveZones();
+
+                    List<CandidateResultPo> verdicts = new ArrayList<>(candidatePoints.size());
+                    int selectedIndex = -1;
+                    for (int i = 0; i < candidatePoints.size(); i++) {
+                        List<Point> candidate = candidatePoints.get(i);
+                        Set<String> hits = new TreeSet<>();
+                        for (ZonePo zone : activeZones) {
+                            if (Geometry.polylineHitsRectangle(candidate,
+                                    zone.xMin(), zone.yMin(), zone.xMax(), zone.yMax())) {
+                                hits.add(zone.zoneId());
+                            }
+                        }
+                        List<String> hitList = new ArrayList<>(hits);
+                        verdicts.add(new CandidateResultPo(i + 1, List.copyOf(candidate), hitList));
+                        if (selectedIndex < 0 && hits.isEmpty()) {
+                            selectedIndex = i;
+                        }
+                    }
+
+                    if (selectedIndex < 0) {
+                        // 全部 BLOCKED：回滚，不写航线、不写评估记录、不占键
+                        throw new AllCandidatesBlockedException(
+                                "全部改航候选均命中有效禁飞区", toCandidateDtos(verdicts));
+                    }
+
+                    List<Point> selectedPoints = candidatePoints.get(selectedIndex);
+                    // 条件更新兜底并发替换：更新 0 行说明版本已被其他事务推进
+                    int updated = routeRepo.compareAndIncrementVersion(
+                            request.routeId(), request.expectedVersion());
+                    if (updated == 0) {
+                        throw new ApiException(HttpStatus.CONFLICT, "VERSION_CONFLICT",
+                                "航线版本已变化，请使用最新 expectedVersion 重试");
+                    }
+                    routeRepo.deletePoints(request.routeId());
+                    routeRepo.insertPoints(request.routeId(), selectedPoints);
+
+                    int oldVersion = request.expectedVersion();
+                    RerouteEvaluationPo po = new RerouteEvaluationPo(
+                            request.evaluationKey(), request.routeId(), oldVersion,
+                            oldVersion + 1, globalVersion, selectedIndex + 1,
+                            List.copyOf(verdicts), request.evaluationKey(), nowMillis());
+                    evaluationRepo.insertEvaluation(po);
+                    return new MutationResponse(request.evaluationKey(), false,
+                            toEvaluationDto(po));
+                });
+    }
+
+    /** 按 evaluationKey 查询历史改航评估；记录不可变，不重新计算、不随后续变更改写。 */
+    public RerouteEvaluationResultDto getRerouteEvaluation(String evaluationKey) {
+        RerouteEvaluationPo po = evaluationRepo.findEvaluation(evaluationKey);
+        if (po == null) {
+            throw new ApiException(HttpStatus.NOT_FOUND, "EVALUATION_NOT_FOUND",
+                    "改航评估记录不存在: " + evaluationKey);
+        }
+        return toEvaluationDto(po);
+    }
+
+    /**
+     * 校验候选集合：候选数量由 Bean Validation 约束为 2～10，这里校验
+     * 每个候选至少有两个不同的点，且候选之间（按顺序点列）不得完全相同。
+     * 任一不满足返回 400，整次请求失败。
+     */
+    private List<List<Point>> validateCandidates(List<List<RoutePointDto>> rawCandidates) {
+        List<List<Point>> candidates = new ArrayList<>(rawCandidates.size());
+        for (int i = 0; i < rawCandidates.size(); i++) {
+            List<Point> points = toPoints(rawCandidates.get(i));
+            try {
+                validatePointsDistinct(points);
+            } catch (ApiException ex) {
+                throw new ApiException(HttpStatus.BAD_REQUEST, "CANDIDATE_POINTS_IDENTICAL",
+                        "第 " + (i + 1) + " 个候选至少需要两个不同的点");
+            }
+            for (int j = 0; j < candidates.size(); j++) {
+                if (candidates.get(j).equals(points)) {
+                    throw new ApiException(HttpStatus.BAD_REQUEST, "DUPLICATE_CANDIDATE",
+                            "候选之间不得完全相同，第 " + (i + 1) + " 个候选与第 "
+                                    + (j + 1) + " 个候选完全相同");
+                }
+            }
+            candidates.add(List.copyOf(points));
+        }
+        return candidates;
+    }
+
+    private static List<CandidateResultDto> toCandidateDtos(List<CandidateResultPo> verdicts) {
+        List<CandidateResultDto> dtos = new ArrayList<>(verdicts.size());
+        for (CandidateResultPo c : verdicts) {
+            List<RoutePointDto> points = new ArrayList<>(c.points().size());
+            for (Point p : c.points()) {
+                points.add(new RoutePointDto(p.x(), p.y()));
+            }
+            String conclusion = c.hitZoneIds().isEmpty()
+                    ? ReviewConclusion.CLEAR.name()
+                    : ReviewConclusion.BLOCKED.name();
+            dtos.add(new CandidateResultDto(c.index(), conclusion,
+                    List.copyOf(c.hitZoneIds()), List.copyOf(points)));
+        }
+        return List.copyOf(dtos);
+    }
+
+    private static RerouteEvaluationResultDto toEvaluationDto(RerouteEvaluationPo po) {
+        return new RerouteEvaluationResultDto(po.evaluationKey(), po.routeId(),
+                po.routeVersion(), po.newRouteVersion(), po.airspaceVersion(),
+                po.selectedIndex(), toCandidateDtos(po.candidates()));
+    }
+
+    // ============================ 幂等与事务 ============================
     /**
      * 在事务内执行幂等写操作：
      * 同键同参返回首次成功结果（标记 replayed=true）；同键异参/异种操作抛 409；

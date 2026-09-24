@@ -1,6 +1,8 @@
 package com.example.starter.api;
 
 import com.example.starter.api.dto.MutationResponse;
+import com.example.starter.api.dto.RerouteEvaluationRequest;
+import com.example.starter.api.dto.RerouteEvaluationResultDto;
 import com.example.starter.api.dto.ReviewRequest;
 import com.example.starter.api.dto.ReviewResultDto;
 import com.example.starter.api.dto.RouteCreateRequest;
@@ -59,6 +61,19 @@ public class AirspaceReviewController {
     @PostMapping("/reviews")
     public ResponseEntity<MutationResponse> review(@Valid @RequestBody ReviewRequest request) {
         return ResponseEntity.status(HttpStatus.CREATED).body(service.review(request));
+    }
+
+    /** 改航候选集批量评估：选中首个 CLEAR 并替换目标航线；全部 BLOCKED 返回 422。 */
+    @PostMapping("/reroute-evaluations")
+    public ResponseEntity<MutationResponse> evaluateReroute(
+            @Valid @RequestBody RerouteEvaluationRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(service.evaluateReroute(request));
+    }
+
+    /** 按 evaluationKey 查询历史改航评估（保留固化结论，不随后续变更改写）。 */
+    @GetMapping("/reroute-evaluations/{evaluationKey}")
+    public RerouteEvaluationResultDto getRerouteEvaluation(@PathVariable String evaluationKey) {
+        return service.getRerouteEvaluation(evaluationKey);
     }
 
     /** 按 reviewId 查询历史审核结果（保留原结论）。 */

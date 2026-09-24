@@ -35,6 +35,8 @@ class AirspaceReviewControllerIT {
 
     @BeforeEach
     void cleanup() {
+        jdbc.update("DELETE FROM reroute_evaluation_candidate");
+        jdbc.update("DELETE FROM reroute_evaluation");
         jdbc.update("DELETE FROM review");
         jdbc.update("DELETE FROM request_dedup");
         jdbc.update("DELETE FROM route_point");
@@ -253,5 +255,136 @@ class AirspaceReviewControllerIT {
                                 {"zoneId":"z2","requestId":"req-v6"}"""))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("ZONE_ALREADY_REVOKED"));
+    }
+
+    @Test
+    @DisplayName("改航评估：首个 CLEAR 选中并替换航线，历史查询稳定，全部 BLOCKED 返回 422")
+    void rerouteEvaluationOverHttp() throws Exception {
+        // 建航线（版本 1）与一个封住 y=10 水平候选的禁飞区（空域版本 1）
+        mockMvc.perform(post("/api/airspace/routes")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"e1","requestId":"req-e-route",
+                                 "points":[{"x":0,"y":10},{"x":100,"y":10}]}"""))
+                .andExpect(status().isCreated());
+        mockMvc.perform(post("/api/airspace/zones")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"zoneId":"ez1","xMin":40,"yMin":5,"xMax":60,"yMax":15,
+                                 "requestId":"req-e-zone"}"""))
+                .andExpect(status().isCreated());
+
+        // 候选 1 穿过区域 BLOCKED，候选 2 CLEAR 被选中
+        String evalBody = """
+                {"evaluationKey":"eval-1","routeId":"e1","expectedVersion":1,
+                 "airspaceVersion":1,
+                 "candidates":[
+                   [{"x":0,"y":10},{"x":100,"y":10}],
+                   [{"x":0,"y":80},{"x":100,"y":80}]
+                 ]}""";
+        mockMvc.perform(post("/api/airspace/reroute-evaluations")
+                        .contentType(MediaType.APPLICATION_JSON).content(evalBody))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.replayed").value(false))
+                .andExpect(jsonPath("$.data.selectedIndex").value(2))
+                .andExpect(jsonPath("$.data.routeVersion").value(1))
+                .andExpect(jsonPath("$.data.newRouteVersion").value(2))
+                .andExpect(jsonPath("$.data.airspaceVersion").value(1))
+                .andExpect(jsonPath("$.data.candidates[0].conclusion").value("BLOCKED"))
+                .andExpect(jsonPath("$.data.candidates[0].hitZoneIds[0]").value("ez1"))
+                .andExpect(jsonPath("$.data.candidates[1].conclusion").value("CLEAR"))
+                .andExpect(jsonPath("$.data.candidates[1].points[0].y").value(80));
+
+        // 历史查询：固化结论（与响应体一致）
+        mockMvc.perform(get("/api/airspace/reroute-evaluations/eval-1"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.selectedIndex").value(2))
+                .andExpect(jsonPath("$.candidates[0].hitZoneIds[0]").value("ez1"))
+                .andExpect(jsonPath("$.candidates[1].points[0].y").value(80));
+
+        // 同键同参重放：replayed=true，且不再推进版本（newRouteVersion 仍为 2）
+        mockMvc.perform(post("/api/airspace/reroute-evaluations")
+                        .contentType(MediaType.APPLICATION_JSON).content(evalBody))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.replayed").value(true))
+                .andExpect(jsonPath("$.data.newRouteVersion").value(2));
+
+        // 查询不存在的评估 → 404
+        mockMvc.perform(get("/api/airspace/reroute-evaluations/missing"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.code").value("EVALUATION_NOT_FOUND"));
+    }
+
+    @Test
+    @DisplayName("改航评估：全部候选 BLOCKED 返回 422 且给出逐候选命中集合，航线不被替换")
+    void rerouteAllBlockedReturns422OverHttp() throws Exception {
+        mockMvc.perform(post("/api/airspace/routes")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"e2","requestId":"req-e2-route",
+                                 "points":[{"x":0,"y":0},{"x":100,"y":100}]}"""))
+                .andExpect(status().isCreated());
+        mockMvc.perform(post("/api/airspace/zones")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"zoneId":"ez2","xMin":10,"yMin":10,"xMax":80,"yMax":80,
+                                 "requestId":"req-e2-zone"}"""))
+                .andExpect(status().isCreated());
+
+        mockMvc.perform(post("/api/airspace/reroute-evaluations")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"evaluationKey":"eval-2","routeId":"e2","expectedVersion":1,
+                                 "airspaceVersion":1,
+                                 "candidates":[
+                                   [{"x":0,"y":50},{"x":100,"y":50}],
+                                   [{"x":40,"y":40},{"x":60,"y":60}]
+                                 ]}"""))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.code").value("ALL_CANDIDATES_BLOCKED"))
+                .andExpect(jsonPath("$.candidates[0].hitZoneIds[0]").value("ez2"))
+                .andExpect(jsonPath("$.candidates[1].hitZoneIds[0]").value("ez2"));
+    }
+
+    @Test
+    @DisplayName("改航评估：候选不足、候选点不足、候选完全相同均返回 400")
+    void rerouteCandidateValidationOverHttp() throws Exception {
+        mockMvc.perform(post("/api/airspace/routes")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"e3","requestId":"req-e3-route",
+                                 "points":[{"x":0,"y":0},{"x":10,"y":10}]}"""))
+                .andExpect(status().isCreated());
+
+        // 仅 1 个候选（要求 2~10）→ 400
+        mockMvc.perform(post("/api/airspace/reroute-evaluations")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"evaluationKey":"eval-3a","routeId":"e3","expectedVersion":1,
+                                 "airspaceVersion":0,
+                                 "candidates":[[{"x":0,"y":1},{"x":10,"y":1}]]}"""))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("VALIDATION_FAILED"));
+
+        // 候选只有 1 个点（要求 2~50）→ 400
+        mockMvc.perform(post("/api/airspace/reroute-evaluations")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"evaluationKey":"eval-3b","routeId":"e3","expectedVersion":1,
+                                 "airspaceVersion":0,
+                                 "candidates":[[{"x":0,"y":1}],[{"x":2,"y":2},{"x":3,"y":3}]]}"""))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("VALIDATION_FAILED"));
+
+        // 候选完全相同 → 业务 400
+        mockMvc.perform(post("/api/airspace/reroute-evaluations")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"evaluationKey":"eval-3c","routeId":"e3","expectedVersion":1,
+                                 "airspaceVersion":0,
+                                 "candidates":[[{"x":0,"y":1},{"x":10,"y":1}],
+                                               [{"x":0,"y":1},{"x":10,"y":1}]]}"""))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("DUPLICATE_CANDIDATE"));
     }
 }
