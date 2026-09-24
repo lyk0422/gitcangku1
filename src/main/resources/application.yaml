@@ -4,8 +4,12 @@ spring:
   config:
     import: "optional:configtree:/run/secrets/"
   datasource:
-    url: ${DB_URL}
-    username: ${DB_USER}
+    # 本地默认嵌入式 H2（MODE=MySQL），自动建表，仅保证同一 JVM 内状态；
+    # 提供 DB_URL/DB_USER/DB_PASSWORD/DB_DRIVER 环境变量时可切换到外部 MySQL。
+    url: ${DB_URL:jdbc:h2:mem:local_demo;MODE=MySQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1}
+    username: ${DB_USER:sa}
+    password: ${DB_PASSWORD:}
+    driver-class-name: ${DB_DRIVER:org.h2.Driver}
     hikari:
       maximum-pool-size: 5
       minimum-idle: 1

@@ -54,6 +54,9 @@ public class MeasurementService {
             throw ApiException.badRequest("lowerLimit 不能大于 upperLimit");
         }
 
+        // 仪器级行锁：与期间核查、批量放行按事务提交顺序串行裁决。
+        certificates.lockInstrument(instrumentId);
+
         Certificate cert = certificates.findMatching(instrumentId, measuredAt)
                 .orElseThrow(() -> ApiException.unprocessable(
                         "测量时刻无匹配的有效证书: instrument=" + instrumentId));
@@ -63,7 +66,7 @@ public class MeasurementService {
 
         Measurement measurement = new Measurement(
                 0L, key, instrumentId, measuredAt, reading, lower, upper, submittedBy,
-                cert.id(), computed, passed, MeasurementStatus.PENDING, Instant.now());
+                cert.id(), computed, passed, MeasurementStatus.PENDING, false, Instant.now());
         try {
             measurements.insert(measurement);
         } catch (DuplicateKeyException ex) {
