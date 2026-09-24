@@ -42,6 +42,8 @@ class BaggageApiTest {
     @BeforeEach
     void cleanDatabase() {
         jdbcTemplate.update("DELETE FROM bag_event");
+        jdbcTemplate.update("DELETE FROM offload_item");
+        jdbcTemplate.update("DELETE FROM offload_record");
         jdbcTemplate.update("DELETE FROM load_record");
         jdbcTemplate.update("DELETE FROM bag_itinerary");
         jdbcTemplate.update("DELETE FROM bag");
@@ -223,7 +225,8 @@ class BaggageApiTest {
     void idempotency_replaysSameKeySameParams() throws Exception {
         String requestId = UUID.randomUUID().toString();
         Map<String, Object> body = Map.of(
-                "requestId", requestId, "legId", "LEG1", "origin", "PEK", "destination", "SHA");
+                "requestId", requestId, "legId", "LEG1", "origin", "PEK", "destination", "SHA",
+                "maxBags", 500, "maxWeight", 50000);
         postJson("/api/legs", body).andExpect(status().isCreated())
                 .andExpect(jsonPath("$.version").value(1));
         // 同键同参重放：返回原成功结果，不产生第二条航段
@@ -250,9 +253,11 @@ class BaggageApiTest {
     void idempotency_sameKeyDifferentParamsReturns409() throws Exception {
         String requestId = UUID.randomUUID().toString();
         postJson("/api/legs", Map.of("requestId", requestId, "legId", "LEG1",
-                "origin", "PEK", "destination", "SHA")).andExpect(status().isCreated());
+                "origin", "PEK", "destination", "SHA", "maxBags", 500, "maxWeight", 50000))
+                .andExpect(status().isCreated());
         postJson("/api/legs", Map.of("requestId", requestId, "legId", "LEG2",
-                "origin", "PEK", "destination", "SHA")).andExpect(status().isConflict());
+                "origin", "PEK", "destination", "SHA", "maxBags", 500, "maxWeight", 50000))
+                .andExpect(status().isConflict());
     }
 
     @Test
@@ -282,12 +287,13 @@ class BaggageApiTest {
 
     private ResultActions registerLeg(String legId, String origin, String destination) throws Exception {
         return postJson("/api/legs", Map.of("requestId", UUID.randomUUID().toString(),
-                "legId", legId, "origin", origin, "destination", destination));
+                "legId", legId, "origin", origin, "destination", destination,
+                "maxBags", 500, "maxWeight", 50000));
     }
 
     private ResultActions registerBag(String bagTag, List<String> legIds) throws Exception {
         return postJson("/api/bags", Map.of("requestId", UUID.randomUUID().toString(),
-                "bagTag", bagTag, "legIds", legIds));
+                "bagTag", bagTag, "legIds", legIds, "weight", 20, "cabin", "STANDARD"));
     }
 
     private ResultActions load(String legId, int expectedVersion, List<String> bagTags) throws Exception {

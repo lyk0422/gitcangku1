@@ -14,6 +14,7 @@ import org.springframework.web.bind.annotation.RestController;
 import com.example.starter.baggage.BaggageDtos.ArriveRequest;
 import com.example.starter.baggage.BaggageDtos.ArriveResponse;
 import com.example.starter.baggage.BaggageDtos.BagResponse;
+import com.example.starter.baggage.BaggageDtos.CapacityResponse;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveRequest;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveResponse;
 import com.example.starter.baggage.BaggageDtos.LegDifferenceResponse;
@@ -21,6 +22,9 @@ import com.example.starter.baggage.BaggageDtos.LegResponse;
 import com.example.starter.baggage.BaggageDtos.LoadRequest;
 import com.example.starter.baggage.BaggageDtos.LoadResponse;
 import com.example.starter.baggage.BaggageDtos.ManifestResponse;
+import com.example.starter.baggage.BaggageDtos.OffloadListResponse;
+import com.example.starter.baggage.BaggageDtos.OffloadRequest;
+import com.example.starter.baggage.BaggageDtos.OffloadResponse;
 import com.example.starter.baggage.BaggageDtos.RecoverRequest;
 import com.example.starter.baggage.BaggageDtos.RecoverResponse;
 import com.example.starter.baggage.BaggageDtos.RegisterBagRequest;
@@ -85,10 +89,28 @@ public class BaggageController {
         return baggageService.recover(request);
     }
 
+    /** 容量卸载：OPEN 航段按确定顺序选择被卸行李至不超目标件数与总重上限。 */
+    @PostMapping("/legs/{legId}/offload")
+    public OffloadResponse offload(@PathVariable String legId, @Valid @RequestBody OffloadRequest request) {
+        return baggageService.offload(legId, request);
+    }
+
     /** 行李完整轨迹查询。 */
     @GetMapping("/bags/{bagTag}/trace")
     public BagResponse getBagTrace(@PathVariable String bagTag) {
         return baggageService.getBagTrace(bagTag);
+    }
+
+    /** 航段载量占用查询：当前件数/总重占用与剩余额度。 */
+    @GetMapping("/legs/{legId}/capacity")
+    public CapacityResponse getCapacity(@PathVariable String legId) {
+        return baggageService.getCapacity(legId);
+    }
+
+    /** 航段卸载明细查询：按卸载时刻倒序返回每次卸载决策与逐件明细。 */
+    @GetMapping("/legs/{legId}/offloads")
+    public OffloadListResponse listOffloads(@PathVariable String legId) {
+        return baggageService.listOffloads(legId);
     }
 
     /** 封舱清单查询。 */

@@ -65,6 +65,8 @@ class BaggageShortUnloadTest {
     @BeforeEach
     void cleanDatabase() {
         jdbcTemplate.update("DELETE FROM bag_event");
+        jdbcTemplate.update("DELETE FROM offload_item");
+        jdbcTemplate.update("DELETE FROM offload_record");
         jdbcTemplate.update("DELETE FROM load_record");
         jdbcTemplate.update("DELETE FROM bag_itinerary");
         jdbcTemplate.update("DELETE FROM bag");
@@ -440,11 +442,12 @@ class BaggageShortUnloadTest {
 
     private void registerLeg(String legId, String origin, String destination) {
         baggageService.registerLeg(
-                new RegisterLegRequest(UUID.randomUUID().toString(), legId, origin, destination));
+                new RegisterLegRequest(UUID.randomUUID().toString(), legId, origin, destination, 500, 50000));
     }
 
     private void registerBag(String bagTag, List<String> legIds) {
-        baggageService.registerBag(new RegisterBagRequest(UUID.randomUUID().toString(), bagTag, legIds));
+        baggageService.registerBag(new RegisterBagRequest(UUID.randomUUID().toString(), bagTag, legIds,
+                20, "STANDARD"));
     }
 
     private ResultActions load(String legId, int expectedVersion, List<String> bagTags) throws Exception {
