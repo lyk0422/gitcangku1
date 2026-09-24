@@ -14,6 +14,7 @@ import org.springframework.jdbc.support.GeneratedKeyHolder;
 import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.stereotype.Repository;
 
+import com.example.starter.maintenance.domain.DowntimeRecord;
 import com.example.starter.maintenance.domain.Equipment;
 import com.example.starter.maintenance.domain.MaintenanceRecord;
 import com.example.starter.maintenance.domain.Reading;
@@ -57,7 +58,23 @@ public class EquipmentRepository {
             rs.getInt("anchor_revision_no"),
             readInstant(rs, "anchor_sampled_at"),
             rs.getLong("anchor_cumulative_minutes"),
+            rs.getLong("settled_deduction_minutes"),
+            rs.getLong("settled_run_minutes"),
             readInstant(rs, "completed_at"));
+
+    private static final RowMapper<DowntimeRecord> DOWNTIME_MAPPER = (rs, rowNum) -> new DowntimeRecord(
+            rs.getString("downtime_key"),
+            rs.getString("equipment_id"),
+            readInstant(rs, "start_at"),
+            readInstant(rs, "end_at"),
+            rs.getString("reason"),
+            rs.getString("status"),
+            rs.getString("request_id"),
+            readInstant(rs, "created_at"),
+            rs.getObject("revoked_at", OffsetDateTime.class) == null
+                    ? null
+                    : readInstant(rs, "revoked_at"),
+            rs.getString("revoke_request_id"));
 
     // ---------- 设备 ----------
 
@@ -140,6 +157,25 @@ public class EquipmentRepository {
         return rows.stream().findFirst();
     }
 
+    /** 该设备最早一条读数（采样时刻最小者）。 */
+    public Optional<Reading> findEarliestReading(String equipmentId) {
+        List<Reading> rows = jdbc.query(
+                "SELECT equipment_id, reading_id, sampled_at, cumulative_minutes, revision_no"
+                        + " FROM reading WHERE equipment_id = ? ORDER BY sampled_at ASC LIMIT 1",
+                READING_MAPPER, equipmentId);
+        return rows.stream().findFirst();
+    }
+
+    /** 采样时刻不晚于给定时刻的最近一条读数；不存在时为空（停机扣减量按 0 处理）。 */
+    public Optional<Reading> findLatestReadingAtOrBefore(String equipmentId, Instant sampledAt) {
+        List<Reading> rows = jdbc.query(
+                "SELECT equipment_id, reading_id, sampled_at, cumulative_minutes, revision_no"
+                        + " FROM reading WHERE equipment_id = ? AND sampled_at <= ?"
+                        + " ORDER BY sampled_at DESC LIMIT 1",
+                READING_MAPPER, equipmentId, utc(sampledAt));
+        return rows.stream().findFirst();
+    }
+
     public void updateReadingValue(String equipmentId, String readingId, long cumulativeMinutes,
                                    int newRevisionNo, Instant updatedAt) {
         jdbc.update("UPDATE reading SET cumulative_minutes = ?, revision_no = ?, updated_at = ?"
@@ -182,21 +218,25 @@ public class EquipmentRepository {
 
     public long insertMaintenance(String equipmentId, String readingId, int anchorRevisionNo,
                                   Instant anchorSampledAt, long anchorCumulativeMinutes,
+                                  long settledDeductionMinutes, long settledRunMinutes,
                                   String requestId, Instant completedAt) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(connection -> {
             PreparedStatement ps = connection.prepareStatement(
                     "INSERT INTO maintenance (equipment_id, reading_id, anchor_revision_no,"
-                            + " anchor_sampled_at, anchor_cumulative_minutes, request_id, completed_at)"
-                            + " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            + " anchor_sampled_at, anchor_cumulative_minutes,"
+                            + " settled_deduction_minutes, settled_run_minutes, request_id, completed_at)"
+                            + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, equipmentId);
             ps.setString(2, readingId);
             ps.setInt(3, anchorRevisionNo);
             ps.setObject(4, utc(anchorSampledAt));
             ps.setLong(5, anchorCumulativeMinutes);
-            ps.setString(6, requestId);
-            ps.setObject(7, utc(completedAt));
+            ps.setLong(6, settledDeductionMinutes);
+            ps.setLong(7, settledRunMinutes);
+            ps.setString(8, requestId);
+            ps.setObject(9, utc(completedAt));
             return ps;
         }, keyHolder);
         Number key = keyHolder.getKey();
@@ -210,7 +250,8 @@ public class EquipmentRepository {
     public Optional<MaintenanceRecord> findLastMaintenance(String equipmentId) {
         List<MaintenanceRecord> rows = jdbc.query(
                 "SELECT maintenance_id, equipment_id, reading_id, anchor_revision_no,"
-                        + " anchor_sampled_at, anchor_cumulative_minutes, completed_at"
+                        + " anchor_sampled_at, anchor_cumulative_minutes,"
+                        + " settled_deduction_minutes, settled_run_minutes, completed_at"
                         + " FROM maintenance WHERE equipment_id = ?"
                         + " ORDER BY anchor_sampled_at DESC, maintenance_id DESC LIMIT 1",
                 MAINTENANCE_MAPPER, equipmentId);
@@ -220,7 +261,8 @@ public class EquipmentRepository {
     public List<MaintenanceRecord> listMaintenances(String equipmentId) {
         return jdbc.query(
                 "SELECT maintenance_id, equipment_id, reading_id, anchor_revision_no,"
-                        + " anchor_sampled_at, anchor_cumulative_minutes, completed_at"
+                        + " anchor_sampled_at, anchor_cumulative_minutes,"
+                        + " settled_deduction_minutes, settled_run_minutes, completed_at"
                         + " FROM maintenance WHERE equipment_id = ?"
                         + " ORDER BY anchor_sampled_at ASC, maintenance_id ASC",
                 MAINTENANCE_MAPPER, equipmentId);
@@ -232,6 +274,75 @@ public class EquipmentRepository {
                 "SELECT COUNT(*) FROM maintenance WHERE equipment_id = ? AND reading_id = ?",
                 Integer.class, equipmentId, readingId);
         return count != null && count > 0;
+    }
+
+    /**
+     * 开区间 (startAt, endAt) 内是否存在保养锚点时刻。
+     * 停机区间不得跨越任何已有保养锚点；锚点恰等于区间任一端点（端点相接）允许：
+     * 锚点为起点时区间完全位于该次保养之后，为终点时完全位于其之前。
+     */
+    public boolean existsMaintenanceAnchorBetween(String equipmentId, Instant startAt, Instant endAt) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM maintenance WHERE equipment_id = ?"
+                        + " AND anchor_sampled_at > ? AND anchor_sampled_at < ?",
+                Integer.class, equipmentId, utc(startAt), utc(endAt));
+        return count != null && count > 0;
+    }
+
+    // ---------- 停机区间 ----------
+
+    public void insertDowntime(DowntimeRecord downtime, Instant createdAt) {
+        jdbc.update("INSERT INTO downtime (downtime_key, equipment_id, start_at, end_at, reason,"
+                        + " status, request_id, created_at, revoked_at, revoke_request_id)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)",
+                downtime.downtimeKey(), downtime.equipmentId(), utc(downtime.startAt()),
+                utc(downtime.endAt()), downtime.reason(), DowntimeRecord.ACTIVE,
+                downtime.requestId(), utc(createdAt));
+    }
+
+    /** 按全局键查询停机区间（跨设备，用于全局唯一键判定）。 */
+    public Optional<DowntimeRecord> findDowntime(String downtimeKey) {
+        List<DowntimeRecord> rows = jdbc.query(
+                "SELECT downtime_key, equipment_id, start_at, end_at, reason, status, request_id,"
+                        + " created_at, revoked_at, revoke_request_id FROM downtime WHERE downtime_key = ?",
+                DOWNTIME_MAPPER, downtimeKey);
+        return rows.stream().findFirst();
+    }
+
+    public List<DowntimeRecord> listDowntimes(String equipmentId) {
+        return jdbc.query(
+                "SELECT downtime_key, equipment_id, start_at, end_at, reason, status, request_id,"
+                        + " created_at, revoked_at, revoke_request_id FROM downtime"
+                        + " WHERE equipment_id = ? ORDER BY start_at ASC, downtime_key ASC",
+                DOWNTIME_MAPPER, equipmentId);
+    }
+
+    public List<DowntimeRecord> listActiveDowntimes(String equipmentId) {
+        return jdbc.query(
+                "SELECT downtime_key, equipment_id, start_at, end_at, reason, status, request_id,"
+                        + " created_at, revoked_at, revoke_request_id FROM downtime"
+                        + " WHERE equipment_id = ? AND status = 'ACTIVE'"
+                        + " ORDER BY start_at ASC, downtime_key ASC",
+                DOWNTIME_MAPPER, equipmentId);
+    }
+
+    /**
+     * 生效区间重叠判定（半开区间）：existing.start &lt; new.end AND existing.end &gt; new.start。
+     * 仅端点相接（existing.end = new.start 或 existing.start = new.end）不算重叠。
+     */
+    public boolean existsActiveOverlap(String equipmentId, Instant startAt, Instant endAt) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM downtime WHERE equipment_id = ? AND status = 'ACTIVE'"
+                        + " AND start_at < ? AND end_at > ?",
+                Integer.class, equipmentId, utc(endAt), utc(startAt));
+        return count != null && count > 0;
+    }
+
+    /** 撤销生效区间；仅 ACTIVE 行可更新，返回受影响行数（重复撤销为 0）。记录保留不可改写。 */
+    public int cancelDowntime(String downtimeKey, String revokeRequestId, Instant revokedAt) {
+        return jdbc.update("UPDATE downtime SET status = 'CANCELLED', revoked_at = ?,"
+                        + " revoke_request_id = ? WHERE downtime_key = ? AND status = 'ACTIVE'",
+                utc(revokedAt), revokeRequestId, downtimeKey);
     }
 
     // ---------- 幂等去重 ----------

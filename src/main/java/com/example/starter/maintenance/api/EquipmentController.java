@@ -14,10 +14,13 @@ import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
+import com.example.starter.maintenance.api.dto.CancelDowntimeRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
+import com.example.starter.maintenance.api.dto.DowntimeResponse;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
+import com.example.starter.maintenance.api.dto.RegisterDowntimeRequest;
 import com.example.starter.maintenance.api.dto.RegisterEquipmentRequest;
 import com.example.starter.maintenance.api.dto.ReviseReadingRequest;
 import com.example.starter.maintenance.api.dto.RevisionView;
@@ -61,7 +64,7 @@ public class EquipmentController {
         return service.reviseReading(equipmentId, readingId, req);
     }
 
-    /** 完成保养：以现存读数及其当前修订号为锚点，锚点时间须晚于上次保养锚点。 */
+    /** 完成保养：以现存读数及其当前修订号为锚点，结算当前锚点之后的扣减量并固化运行分钟与扣减合计。 */
     @PostMapping("/{equipmentId}/maintenances")
     @ResponseStatus(HttpStatus.CREATED)
     public MaintenanceResponse completeMaintenance(@PathVariable String equipmentId,
@@ -69,7 +72,24 @@ public class EquipmentController {
         return service.completeMaintenance(equipmentId, req);
     }
 
-    /** 保养状态：本轮运行分钟 = 最新读数 - 最近保养锚点工时（无保养从 0 计），达到周期即 DUE。 */
+    /** 登记停机区间：左闭右开、不重叠、不跨锚点、起止须在读数范围内，违反返回 422。 */
+    @PostMapping("/{equipmentId}/downtimes")
+    @ResponseStatus(HttpStatus.CREATED)
+    public DowntimeResponse registerDowntime(@PathVariable String equipmentId,
+                                             @Valid @RequestBody RegisterDowntimeRequest req) {
+        return service.registerDowntime(equipmentId, req);
+    }
+
+    /** 撤销停机：记录保留不可改写；重复撤销 409；撤销后扣减量不再参与计算。 */
+    @PostMapping("/{equipmentId}/downtimes/{downtimeKey}/cancel")
+    @ResponseStatus(HttpStatus.CREATED)
+    public DowntimeResponse cancelDowntime(@PathVariable String equipmentId,
+                                           @PathVariable String downtimeKey,
+                                           @Valid @RequestBody CancelDowntimeRequest req) {
+        return service.cancelDowntime(equipmentId, downtimeKey, req);
+    }
+
+    /** 保养状态：本轮运行分钟在原公式上再减当前锚点之后全部生效停机区间扣减合计，为负按 0。 */
     @GetMapping("/{equipmentId}/status")
     public StatusResponse getStatus(@PathVariable String equipmentId) {
         return service.getStatus(equipmentId);
@@ -92,5 +112,18 @@ public class EquipmentController {
     @GetMapping("/{equipmentId}/maintenances")
     public List<MaintenanceResponse> listMaintenances(@PathVariable String equipmentId) {
         return service.listMaintenances(equipmentId);
+    }
+
+    /** 停机清单（含按当前读数实时计算的扣减明细，按开始时刻升序）。 */
+    @GetMapping("/{equipmentId}/downtimes")
+    public List<DowntimeResponse> listDowntimes(@PathVariable String equipmentId) {
+        return service.listDowntimes(equipmentId);
+    }
+
+    /** 单个停机区间及其扣减明细。 */
+    @GetMapping("/{equipmentId}/downtimes/{downtimeKey}")
+    public DowntimeResponse getDowntime(@PathVariable String equipmentId,
+                                        @PathVariable String downtimeKey) {
+        return service.getDowntime(equipmentId, downtimeKey);
     }
 }

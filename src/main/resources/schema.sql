@@ -61,6 +61,8 @@ CREATE TABLE IF NOT EXISTS maintenance (
     anchor_revision_no INT NOT NULL,
     anchor_sampled_at TIMESTAMP WITH TIME ZONE NOT NULL,
     anchor_cumulative_minutes BIGINT NOT NULL,
+    settled_deduction_minutes BIGINT NOT NULL,
+    settled_run_minutes BIGINT NOT NULL,
     request_id VARCHAR(128) NOT NULL,
     completed_at TIMESTAMP WITH TIME ZONE NOT NULL
 );
@@ -72,6 +74,8 @@ COMMENT ON COLUMN maintenance.reading_id IS '锚点读数标识';
 COMMENT ON COLUMN maintenance.anchor_revision_no IS '锚点读数在保养完成时的修订号';
 COMMENT ON COLUMN maintenance.anchor_sampled_at IS '锚点读数的 UTC 采样时刻（快照）';
 COMMENT ON COLUMN maintenance.anchor_cumulative_minutes IS '锚点读数在保养完成时的累计工时快照（分钟）';
+COMMENT ON COLUMN maintenance.settled_deduction_minutes IS '结算时该锚点之后全部生效停机区间扣减合计快照（分钟，非负）';
+COMMENT ON COLUMN maintenance.settled_run_minutes IS '结算时固化的本轮运行分钟快照（分钟，扣减停机后，不为负）';
 COMMENT ON COLUMN maintenance.request_id IS '完成保养请求的 requestId';
 COMMENT ON COLUMN maintenance.completed_at IS '保养完成登记时刻（UTC）';
 
@@ -85,7 +89,34 @@ CREATE TABLE IF NOT EXISTS idempotency_request (
 );
 COMMENT ON TABLE idempotency_request IS '写操作幂等去重：同键同参重放原成功结果，同键异参返回 409';
 COMMENT ON COLUMN idempotency_request.request_id IS '全局唯一请求标识';
-COMMENT ON COLUMN idempotency_request.operation IS '操作类型（登记设备/新增读数/修订/完成保养）';
+COMMENT ON COLUMN idempotency_request.operation IS '操作类型（登记设备/新增读数/修订/完成保养/登记停机/撤销停机）';
 COMMENT ON COLUMN idempotency_request.request_fingerprint IS '业务参数指纹（不含 requestId），用于同键异参判定';
 COMMENT ON COLUMN idempotency_request.response_body IS '原成功响应报文（JSON），重放时原样返回';
 COMMENT ON COLUMN idempotency_request.created_at IS '首次成功处理时刻（UTC）';
+
+-- 停机区间：登记后记录不可改写；撤销仅把状态置为 CANCELLED 并补记撤销信息。
+-- 同设备生效（ACTIVE）区间不得重叠，仅端点相接合法；该约束由业务在设备行锁内校验。
+CREATE TABLE IF NOT EXISTS downtime (
+    downtime_key VARCHAR(128) NOT NULL PRIMARY KEY,
+    equipment_id VARCHAR(64) NOT NULL,
+    start_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    end_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    reason VARCHAR(512) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    request_id VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    revoked_at TIMESTAMP WITH TIME ZONE,
+    revoke_request_id VARCHAR(128)
+);
+CREATE INDEX IF NOT EXISTS idx_downtime_equipment ON downtime (equipment_id, status, start_at);
+COMMENT ON TABLE downtime IS '设备停机区间（UTC，左闭右开）：生效区间不得重叠；撤销后记录保留不可改写';
+COMMENT ON COLUMN downtime.downtime_key IS '停机区间全局唯一标识（客户端提供）';
+COMMENT ON COLUMN downtime.equipment_id IS '所属设备标识';
+COMMENT ON COLUMN downtime.start_at IS 'UTC 开始时刻（含）；须不早于该设备最早读数采样时刻';
+COMMENT ON COLUMN downtime.end_at IS 'UTC 结束时刻（不含），严格晚于开始；须不晚于该设备最晚读数采样时刻';
+COMMENT ON COLUMN downtime.reason IS '停机原因，非空';
+COMMENT ON COLUMN downtime.status IS '状态：ACTIVE 生效（参与扣减）/ CANCELLED 已撤销（不参与扣减）';
+COMMENT ON COLUMN downtime.request_id IS '登记停机请求的 requestId';
+COMMENT ON COLUMN downtime.created_at IS '停机登记时刻（UTC）';
+COMMENT ON COLUMN downtime.revoked_at IS '撤销时刻（UTC），未撤销为空';
+COMMENT ON COLUMN downtime.revoke_request_id IS '撤销停机请求的 requestId，未撤销为空';

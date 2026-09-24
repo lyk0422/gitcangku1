@@ -8,10 +8,13 @@ import org.springframework.stereotype.Service;
 
 import com.example.starter.maintenance.api.ApiException;
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
+import com.example.starter.maintenance.api.dto.CancelDowntimeRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
+import com.example.starter.maintenance.api.dto.DowntimeResponse;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
+import com.example.starter.maintenance.api.dto.RegisterDowntimeRequest;
 import com.example.starter.maintenance.api.dto.RegisterEquipmentRequest;
 import com.example.starter.maintenance.api.dto.ReviseReadingRequest;
 import com.example.starter.maintenance.api.dto.RevisionView;
@@ -50,6 +53,18 @@ public class EquipmentService {
         return txService.completeMaintenance(equipmentId, req);
     }
 
+    /** downtimeKey 全局唯一：并发跨设备撞键时优先重放同 requestId 的成功结果，否则转 409。 */
+    public DowntimeResponse registerDowntime(String equipmentId, RegisterDowntimeRequest req) {
+        String fingerprint = equipmentId + "|" + req.downtimeKey() + "|" + req.startAt() + "|"
+                + req.endAt() + "|" + req.reason() + "|" + req.expectedVersion();
+        return recoverDuplicateKey(req.requestId(), "REGISTER_DOWNTIME", fingerprint,
+                DowntimeResponse.class, () -> txService.registerDowntime(equipmentId, req));
+    }
+
+    public DowntimeResponse cancelDowntime(String equipmentId, String downtimeKey, CancelDowntimeRequest req) {
+        return txService.cancelDowntime(equipmentId, downtimeKey, req);
+    }
+
     public StatusResponse getStatus(String equipmentId) {
         return txService.getStatus(equipmentId);
     }
@@ -64,6 +79,14 @@ public class EquipmentService {
 
     public List<MaintenanceResponse> listMaintenances(String equipmentId) {
         return txService.listMaintenances(equipmentId);
+    }
+
+    public List<DowntimeResponse> listDowntimes(String equipmentId) {
+        return txService.listDowntimes(equipmentId);
+    }
+
+    public DowntimeResponse getDowntime(String equipmentId, String downtimeKey) {
+        return txService.getDowntime(equipmentId, downtimeKey);
     }
 
     /**
