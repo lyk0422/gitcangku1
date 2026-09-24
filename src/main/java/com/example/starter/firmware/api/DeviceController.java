@@ -6,12 +6,13 @@ import jakarta.validation.Valid;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * 设备登记、查询与固件拉取。
+ * 设备登记、查询、维护窗口修订与固件拉取。
  */
 @RestController
 @RequestMapping("/api/devices")
@@ -33,6 +34,15 @@ public class DeviceController {
     @GetMapping("/{deviceId}")
     public DeviceView get(@PathVariable String deviceId) {
         return deviceService.get(deviceId);
+    }
+
+    /**
+     * 修订设备 UTC 偏移与每日维护窗口，携带设备 expectedVersion，冲突 409。
+     */
+    @PutMapping("/{deviceId}/window")
+    public DeviceView updateWindow(@PathVariable String deviceId,
+                                   @Valid @RequestBody UpdateDeviceWindowRequest request) {
+        return deviceService.updateWindow(deviceId, request);
     }
 
     @PostMapping("/{deviceId}/pull")

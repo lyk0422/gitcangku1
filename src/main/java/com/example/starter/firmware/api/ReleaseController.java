@@ -64,6 +64,22 @@ public class ReleaseController {
         return taskService.listByRelease(releaseId, filter);
     }
 
+    /**
+     * 发布单顺延汇总（只读稳定排序）。
+     */
+    @GetMapping("/{releaseId}/defers")
+    public DeferSummaryView defers(@PathVariable long releaseId) {
+        return taskService.deferSummary(releaseId);
+    }
+
+    /**
+     * 单个任务（同发布单同设备）的顺延累计统计（只读）。
+     */
+    @GetMapping("/{releaseId}/defers/{deviceId}")
+    public DeferStateView defer(@PathVariable long releaseId, @PathVariable String deviceId) {
+        return taskService.getDefer(releaseId, deviceId);
+    }
+
     private TaskStatus parseStatus(String status) {
         if (status == null || status.isBlank()) {
             return null;

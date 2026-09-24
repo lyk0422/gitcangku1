@@ -12,6 +12,9 @@ import java.util.Optional;
 @Repository
 public class DeviceRepository {
 
+    private static final String COLUMNS = "device_id, model, current_version, bucket_no, utc_offset_minutes,"
+            + " window_start_minute, window_end_minute, device_version";
+
     private final JdbcTemplate jdbc;
 
     public DeviceRepository(JdbcTemplate jdbc) {
@@ -19,18 +22,46 @@ public class DeviceRepository {
     }
 
     public void insert(Device device) {
-        jdbc.update("INSERT INTO device (device_id, model, current_version, bucket_no) VALUES (?, ?, ?, ?)",
-                device.deviceId(), device.model(), device.currentVersion(), device.bucketNo());
+        jdbc.update("INSERT INTO device (device_id, model, current_version, bucket_no, utc_offset_minutes,"
+                + " window_start_minute, window_end_minute, device_version)"
+                + " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                device.deviceId(), device.model(), device.currentVersion(), device.bucketNo(),
+                device.utcOffsetMinutes(), device.windowStartMinute(), device.windowEndMinute(),
+                device.deviceVersion());
+    }
+
+    private static Device mapDevice(java.sql.ResultSet rs, int rowNum) throws java.sql.SQLException {
+        return new Device(rs.getString("device_id"), rs.getString("model"),
+                rs.getString("current_version"), rs.getInt("bucket_no"),
+                rs.getInt("utc_offset_minutes"), rs.getInt("window_start_minute"),
+                rs.getInt("window_end_minute"), rs.getInt("device_version"));
     }
 
     public Optional<Device> findById(String deviceId) {
-        return jdbc.query("SELECT device_id, model, current_version, bucket_no FROM device WHERE device_id = ?",
-                (rs, rowNum) -> new Device(rs.getString("device_id"), rs.getString("model"),
-                        rs.getString("current_version"), rs.getInt("bucket_no")),
-                deviceId).stream().findFirst();
+        return jdbc.query("SELECT " + COLUMNS + " FROM device WHERE device_id = ?",
+                DeviceRepository::mapDevice, deviceId).stream().findFirst();
+    }
+
+    /**
+     * 行锁读取设备，窗口修订与拉取按提交顺序串行裁决。
+     */
+    public Optional<Device> findByIdForUpdate(String deviceId) {
+        return jdbc.query("SELECT " + COLUMNS + " FROM device WHERE device_id = ? FOR UPDATE",
+                DeviceRepository::mapDevice, deviceId).stream().findFirst();
     }
 
     public void updateCurrentVersion(String deviceId, String newVersion) {
         jdbc.update("UPDATE device SET current_version = ? WHERE device_id = ?", newVersion, deviceId);
+    }
+
+    /**
+     * 乐观修订偏移与窗口：仅当 device_version 匹配时生效，成功后版本加一。返回影响行数。
+     */
+    public int updateWindow(String deviceId, int expectedVersion, int utcOffsetMinutes,
+                            int windowStartMinute, int windowEndMinute) {
+        return jdbc.update("UPDATE device SET utc_offset_minutes = ?, window_start_minute = ?,"
+                + " window_end_minute = ?, device_version = device_version + 1, updated_at = CURRENT_TIMESTAMP"
+                + " WHERE device_id = ? AND device_version = ?",
+                utcOffsetMinutes, windowStartMinute, windowEndMinute, deviceId, expectedVersion);
     }
 }

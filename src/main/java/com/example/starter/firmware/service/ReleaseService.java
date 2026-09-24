@@ -53,14 +53,15 @@ public class ReleaseService {
         }
         int sampleFloor = request.effectiveSampleFloor();
         int threshold = request.effectiveFailureThresholdPercent();
+        boolean respectWindow = request.effectiveRespectMaintenanceWindow();
         String fingerprint = String.join("|", "release.create", request.model(), request.fromVersion(),
                 request.toVersion(), String.valueOf(request.ratio()), String.valueOf(sampleFloor),
-                String.valueOf(threshold));
+                String.valueOf(threshold), String.valueOf(respectWindow));
         return idempotency.execute(request.requestId(), "release.create", fingerprint, () -> {
             long id;
             try {
                 id = releaseRepository.insert(request.model(), request.fromVersion(), request.toVersion(),
-                        request.ratio(), sampleFloor, threshold);
+                        request.ratio(), sampleFloor, threshold, respectWindow);
             } catch (DuplicateKeyException e) {
                 throw ApiException.conflict("ACTIVE_RELEASE_EXISTS", "型号已存在未终结发布单: " + request.model());
             }
