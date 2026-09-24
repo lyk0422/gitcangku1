@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS recall (
 );
 
 CREATE TABLE IF NOT EXISTS command_log (
-    command_type VARCHAR(32) NOT NULL COMMENT '命令类型：CREATE_BATCH/SUBMIT_TEST/APPROVE/RECALL/SPLIT',
+    command_type VARCHAR(32) NOT NULL COMMENT '命令类型：CREATE_BATCH/SUBMIT_TEST/APPROVE/RECALL/SPLIT/CREATE_SAMPLING_PLAN/REGISTER_SAMPLE',
     command_key VARCHAR(64) NOT NULL COMMENT '命令幂等键；同类型同键同参重放返回首次结果，同键改参返回 409',
     fingerprint VARCHAR(64) NOT NULL COMMENT '业务参数（不含 commandKey）的 SHA-256 摘要，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行成功的 HTTP 状态码',
@@ -65,4 +65,34 @@ CREATE TABLE IF NOT EXISTS batch_lineage (
     seq INT NOT NULL COMMENT '子批在拆分请求中的顺序，从 1 开始',
     created_at VARCHAR(40) NOT NULL COMMENT '拆分时间，ISO-8601 UTC instant 字符串',
     CONSTRAINT uk_lineage_child UNIQUE (child_key)
+);
+
+-- 抽样检验计划：同批次允许多个历史计划，但同时只能有一个 OPEN；终结（ACCEPTED/REJECTED）后不可改写。
+CREATE TABLE IF NOT EXISTS sampling_plan (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键，同时作为计划创建顺序依据',
+    plan_key VARCHAR(64) NOT NULL COMMENT '抽样计划业务键，全局唯一，创建后不可修改',
+    batch_key VARCHAR(64) NOT NULL COMMENT '所属批次业务键；子批不继承父批计划与判定',
+    seq INT NOT NULL COMMENT '同批次计划序号，从 1 开始，历史计划不可改写',
+    sample_size INT NOT NULL COMMENT '样本量，取值 1～200',
+    accept_number INT NOT NULL COMMENT '接收数 Ac，满足 0≤Ac<Re；登记完成且累计加权缺陷不大于 Ac 判定 ACCEPTED',
+    reject_number INT NOT NULL COMMENT '拒收数 Re，满足 Ac<Re≤样本量；累计加权缺陷达到 Re 当件同事务判定 REJECTED',
+    basis VARCHAR(512) NOT NULL COMMENT '抽样依据，非空，创建后不可修改',
+    status VARCHAR(16) NOT NULL COMMENT '计划状态：OPEN 未终结/ACCEPTED 判定接收/REJECTED 判定拒收；终结后不可改写',
+    weighted_defects INT NOT NULL COMMENT '累计加权缺陷数，单位为加权分：CRITICAL=3、MAJOR=1、MINOR=0、QUALIFIED=0',
+    registered_count INT NOT NULL COMMENT '已登记样本件数，取值 0～样本量',
+    created_at VARCHAR(40) NOT NULL COMMENT '计划创建时间，ISO-8601 UTC instant 字符串',
+    decided_at VARCHAR(40) COMMENT '判定时刻，ISO-8601 UTC instant 字符串；OPEN 未终结时为 NULL，判定后不可改写',
+    CONSTRAINT uk_sampling_plan_key UNIQUE (plan_key)
+);
+
+-- 逐件样本登记结果：同一计划内样本序号唯一，登记后不可修改或删除。
+CREATE TABLE IF NOT EXISTS sample_record (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    plan_key VARCHAR(64) NOT NULL COMMENT '所属抽样计划业务键',
+    sample_index INT NOT NULL COMMENT '样本序号，取值 1～样本量，同一计划内不可重复',
+    result VARCHAR(16) NOT NULL COMMENT '逐件结果：QUALIFIED 合格/CRITICAL 致命缺陷/MAJOR 主要缺陷/MINOR 轻微缺陷',
+    description VARCHAR(512) NOT NULL COMMENT '逐件情况描述，非空，登记后不可修改',
+    weight INT NOT NULL COMMENT '该件加权缺陷分，单位为加权分：QUALIFIED 与 MINOR=0、MAJOR=1、CRITICAL=3',
+    created_at VARCHAR(40) NOT NULL COMMENT '登记时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_sample_plan_index UNIQUE (plan_key, sample_index)
 );

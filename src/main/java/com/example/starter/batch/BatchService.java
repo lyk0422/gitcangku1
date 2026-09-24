@@ -59,13 +59,16 @@ public class BatchService {
     private static final int IDEMPOTENCY_MAX_ATTEMPTS = 3;
 
     private final BatchRepository repo;
+    private final SamplingPlanService samplingPlanService;
     private final TransactionTemplate tx;
     private final ObjectMapper objectMapper;
 
     public BatchService(BatchRepository repo,
+                        SamplingPlanService samplingPlanService,
                         PlatformTransactionManager transactionManager,
                         ObjectMapper objectMapper) {
         this.repo = repo;
+        this.samplingPlanService = samplingPlanService;
         this.tx = new TransactionTemplate(transactionManager);
         this.objectMapper = objectMapper;
     }
@@ -170,11 +173,15 @@ public class BatchService {
                     .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
             BatchStatus status = BatchStatus.valueOf(batch.status());
             assertNoRecalledAncestor(batchKey);
+            // 抽样判定门禁优先：只有存在 ACCEPTED 计划的批次才可批准，否则 422 并指明当前计划状态；
+            // 终态批次按下一条规则返回 409
+            if (status != BatchStatus.QUARANTINED && status != BatchStatus.PENDING_RELEASE
+                    && status != BatchStatus.RELEASE_REVIEW) {
+                throw ApiException.conflict("批次状态 " + status + " 不允许批准");
+            }
+            samplingPlanService.assertBatchHasAcceptedPlan(batchKey);
             if (status == BatchStatus.QUARANTINED) {
                 throw ApiException.unprocessable("必做检验项未全部通过，不能批准");
-            }
-            if (status != BatchStatus.PENDING_RELEASE && status != BatchStatus.RELEASE_REVIEW) {
-                throw ApiException.conflict("批次状态 " + status + " 不允许批准");
             }
             boolean actorInspected = repo.findTests(batchKey).stream()
                     .anyMatch(t -> t.inspector().equals(actor));

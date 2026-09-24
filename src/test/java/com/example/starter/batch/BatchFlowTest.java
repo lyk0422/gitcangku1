@@ -45,6 +45,8 @@ class BatchFlowTest {
     @BeforeEach
     void cleanTables() {
         jdbc.update("DELETE FROM command_log");
+        jdbc.update("DELETE FROM sample_record");
+        jdbc.update("DELETE FROM sampling_plan");
         jdbc.update("DELETE FROM approval");
         jdbc.update("DELETE FROM recall");
         jdbc.update("DELETE FROM test_result");
@@ -59,6 +61,9 @@ class BatchFlowTest {
     void happyFlow_quarantineToReleasedThenRecalled() throws Exception {
         String batchKey = "BK-HAPPY-" + unique();
         createBatch(batchKey, List.of("外观", "含量", "无菌"), 201);
+
+        // 抽样计划须在隔离中创建并判定 ACCEPTED，作为后续双角色批准的前置条件
+        createAcceptedPlan(batchKey);
 
         // 初始隔离，出现在可用列表
         assertEquals("QUARANTINED", currentStatus(batchKey));
@@ -129,6 +134,8 @@ class BatchFlowTest {
     void approvalConstraints_duplicateRole_sameActor_inspectorRejected() throws Exception {
         String batchKey = "BK-CONSTRAINT-" + unique();
         createBatch(batchKey, List.of("t1"), 201);
+        // 先让抽样计划 ACCEPTED，使后续 422 精确命中“检验人不得批准”规则而非抽样门禁
+        createAcceptedPlan(batchKey);
         submitTest(batchKey, testReq("TK-1", "t1", "PASS", "inspector-1"), null, null, 201);
 
         // 检验人不能批准
@@ -283,6 +290,7 @@ class BatchFlowTest {
     void approvalAndRecall_commandKeyReplayAndConflict() throws Exception {
         String batchKey = "BK-CMD-" + unique();
         createBatch(batchKey, List.of("t1"), 201);
+        createAcceptedPlan(batchKey);
         submitTest(batchKey, testReq("TK-1", "t1", "PASS", "insp"), null, null, 201);
 
         String body = "{\"commandKey\":\"CK-A1\"}";
@@ -354,6 +362,7 @@ class BatchFlowTest {
     void concurrentSameActorTwoRoles_cannotRelease() throws Exception {
         String batchKey = "BK-RACE-ACTOR-" + unique();
         createBatch(batchKey, List.of("t1"), 201);
+        createAcceptedPlan(batchKey);
         submitTest(batchKey, testReq("TK-1", "t1", "PASS", "insp"), null, null, 201);
 
         List<Future<Integer>> results = runConcurrent(
@@ -402,6 +411,7 @@ class BatchFlowTest {
     void concurrentRecallAndFinalApproval_cannotReleaseAfterRecall() throws Exception {
         String batchKey = "BK-RACE-RC-" + unique();
         createBatch(batchKey, List.of("t1"), 201);
+        createAcceptedPlan(batchKey);
         submitTest(batchKey, testReq("TK-1", "t1", "PASS", "insp"), null, null, 201);
         approve(batchKey, "qa", "QUALITY", "CK-Q", 201);
 
@@ -443,6 +453,7 @@ class BatchFlowTest {
     void dataIsPersistedInTables() throws Exception {
         String batchKey = "BK-PERSIST-" + unique();
         createBatch(batchKey, List.of("t1"), 201);
+        createAcceptedPlan(batchKey);
         submitTest(batchKey, testReq("TK-1", "t1", "PASS", "insp"), null, null, 201);
         approve(batchKey, "qa", "QUALITY", "CK-A1", 201);
         approve(batchKey, "ops", "OPERATIONS", "CK-A2", 201);
@@ -545,6 +556,25 @@ class BatchFlowTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"commandKey\":\"" + commandKey + "\",\"reason\":\"" + reason + "\"}"))
                 .andExpect(status().is(expected));
+    }
+
+    /**
+     * 在隔离中的批次上创建一件式抽样计划并登记合格，使计划落定为 ACCEPTED，
+     * 满足新规则下“判定是双角色批准前置条件”的门禁。
+     */
+    private void createAcceptedPlan(String batchKey) throws Exception {
+        String planKey = "PLAN-" + unique();
+        mockMvc.perform(post("/api/batches/" + batchKey + "/sampling-plans")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"commandKey\":\"CK-PLAN-" + unique() + "\",\"planKey\":\""
+                                + planKey + "\",\"sampleSize\":1,\"acceptNumber\":0,"
+                                + "\"rejectNumber\":1,\"basis\":\"unit-test-std\"}"))
+                .andExpect(status().isCreated());
+        mockMvc.perform(post("/api/sampling-plans/" + planKey + "/samples")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"commandKey\":\"CK-SMP-" + unique() + "\",\"sampleIndex\":1,"
+                                + "\"result\":\"QUALIFIED\",\"description\":\"抽样合格\"}"))
+                .andExpect(status().isCreated());
     }
 
     private String currentStatus(String batchKey) throws Exception {

@@ -46,6 +46,8 @@ class BatchSplitLineageTest {
     @BeforeEach
     void cleanTables() {
         jdbc.update("DELETE FROM command_log");
+        jdbc.update("DELETE FROM sample_record");
+        jdbc.update("DELETE FROM sampling_plan");
         jdbc.update("DELETE FROM approval");
         jdbc.update("DELETE FROM recall");
         jdbc.update("DELETE FROM test_result");
@@ -376,6 +378,8 @@ class BatchSplitLineageTest {
         List<String> available = availableKeys();
         assertFalse(available.contains(childA));
         assertTrue(available.contains(childB));
+        // 子批隔离中先建 ACCEPTED 抽样计划作为批准前置条件
+        createAcceptedPlan(childB);
         submitTest(childB, "t1", "PASS", "insp-b2", 201);
         approve(childB, "qa-b", "QUALITY", "CK-UT-AB1", 201);
         approve(childB, "ops-b", "OPERATIONS", "CK-UT-AB2", 201);
@@ -414,6 +418,8 @@ class BatchSplitLineageTest {
         String child = "BK-CRA-C-" + unique();
         split(root, "CK-CRA-S", List.of(new String[]{child, "L1"},
                 new String[]{"BK-CRA-C2-" + unique(), "L2"}), 201);
+        // 子批先有 ACCEPTED 抽样计划，第一笔批准才能成功并停在 RELEASE_REVIEW
+        createAcceptedPlan(child);
         submitTest(child, "t1", "PASS", "insp-2", 201);
         approve(child, "qa-1", "QUALITY", "CK-CRA-A1", 201);
 
@@ -563,12 +569,26 @@ class BatchSplitLineageTest {
     }
 
     /**
-     * 让批次走完 检验 PASS + 双角色批准 进入 RELEASED。
+     * 让批次走完 ACCEPTED 抽样计划 + 检验 PASS + 双角色批准 进入 RELEASED。
+     * 抽样计划必须在隔离中（提交必做检验项前）创建并登记判定。
      */
     private void releaseBatch(String batchKey, String inspector) throws Exception {
         MvcResult history = mockMvc.perform(get("/api/batches/" + batchKey + "/history"))
                 .andExpect(status().isOk()).andReturn();
         JsonNode node = objectMapper.readTree(history.getResponse().getContentAsString());
+        // 先在隔离中创建一件式计划并登记合格，判定 ACCEPTED 作为批准前置条件
+        String planKey = "PLAN-SP-" + unique();
+        mockMvc.perform(post("/api/batches/" + batchKey + "/sampling-plans")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"commandKey\":\"CK-PLAN-" + unique() + "\",\"planKey\":\""
+                                + planKey + "\",\"sampleSize\":1,\"acceptNumber\":0,"
+                                + "\"rejectNumber\":1,\"basis\":\"unit-test-std\"}"))
+                .andExpect(status().isCreated());
+        mockMvc.perform(post("/api/sampling-plans/" + planKey + "/samples")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"commandKey\":\"CK-SMP-" + unique() + "\",\"sampleIndex\":1,"
+                                + "\"result\":\"QUALIFIED\",\"description\":\"抽样合格\"}"))
+                .andExpect(status().isCreated());
         for (JsonNode item : node.path("batch").path("requiredTests")) {
             submitTest(batchKey, item.asText(), "PASS", inspector, 201);
         }
@@ -597,6 +617,25 @@ class BatchSplitLineageTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"commandKey\":\"" + commandKey + "\"}"))
                 .andExpect(status().is(expected));
+    }
+
+    /**
+     * 在隔离中的批次上创建一件式抽样计划并登记合格，使计划落定为 ACCEPTED，
+     * 满足“判定是双角色批准前置条件”的门禁。
+     */
+    private void createAcceptedPlan(String batchKey) throws Exception {
+        String planKey = "PLAN-GATE-" + unique();
+        mockMvc.perform(post("/api/batches/" + batchKey + "/sampling-plans")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"commandKey\":\"CK-PLAN-" + unique() + "\",\"planKey\":\""
+                                + planKey + "\",\"sampleSize\":1,\"acceptNumber\":0,"
+                                + "\"rejectNumber\":1,\"basis\":\"unit-test-std\"}"))
+                .andExpect(status().isCreated());
+        mockMvc.perform(post("/api/sampling-plans/" + planKey + "/samples")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"commandKey\":\"CK-SMP-" + unique() + "\",\"sampleIndex\":1,"
+                                + "\"result\":\"QUALIFIED\",\"description\":\"抽样合格\"}"))
+                .andExpect(status().isCreated());
     }
 
     private void recall(String batchKey, String actor, String reason, String commandKey, int expected)
