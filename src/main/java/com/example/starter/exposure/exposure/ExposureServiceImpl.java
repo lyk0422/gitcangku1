@@ -1,20 +1,28 @@
 package com.example.starter.exposure.exposure;
 
 import com.example.starter.exposure.domain.Campaign;
+import com.example.starter.exposure.domain.CampaignCategory;
 import com.example.starter.exposure.domain.Reservation;
 import com.example.starter.exposure.domain.ReservationStatus;
+import com.example.starter.exposure.domain.VisitorQuietHours;
 import com.example.starter.exposure.repo.CampaignRepository;
 import com.example.starter.exposure.repo.IdempotencyRepository;
 import com.example.starter.exposure.repo.IdempotencyRepository.IdempotencyRecord;
 import com.example.starter.exposure.repo.LedgerRepository;
 import com.example.starter.exposure.repo.ReservationRepository;
+import com.example.starter.exposure.repo.SuppressionCounterRepository;
+import com.example.starter.exposure.repo.VisitorQuietHoursRepository;
 import com.example.starter.exposure.web.ApiException;
 import com.example.starter.exposure.web.ApplyExposureRequest;
+import com.example.starter.exposure.web.ApplyResponse;
 import com.example.starter.exposure.web.CampaignResponse;
 import com.example.starter.exposure.web.CreateCampaignRequest;
+import com.example.starter.exposure.web.QuietHoursSettingsRequest;
+import com.example.starter.exposure.web.QuietHoursSettingsResponse;
 import com.example.starter.exposure.web.QuotaResponse;
 import com.example.starter.exposure.web.ReservationActionRequest;
 import com.example.starter.exposure.web.ReservationResponse;
+import com.example.starter.exposure.web.SuppressionStatsResponse;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.http.HttpStatus;
@@ -24,6 +32,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 import java.time.Clock;
 import java.time.LocalDate;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.function.Supplier;
 
@@ -31,8 +40,9 @@ import java.util.function.Supplier;
  * 公告曝光频控业务服务实现。
  *
  * <p>所有写操作以 requestId 为全局幂等键：同键同参重放原成功结果，异参 409；
- * 业务失败随事务回滚，不占幂等键。所有操作与额度查询先结算相关过期预占，
- * 不依赖后台定时器。终态竞争由行锁 + 状态 CAS 保证只允许一个终态。</p>
+ * 业务失败随事务回滚，不占幂等键。申请先判定访客静默（抑制不创建预占、不写额度账目），
+ * 再结算过期预占并校验两级额度；终态竞争由行锁 + 状态 CAS 保证只允许一个终态。
+ * 静默设置修改走乐观锁版本，且申请事务持设置行锁，按提交顺序串行裁决。</p>
  */
 @Service
 public class ExposureServiceImpl implements ExposureService {
@@ -47,6 +57,8 @@ public class ExposureServiceImpl implements ExposureService {
     private final ReservationRepository reservationRepository;
     private final LedgerRepository ledgerRepository;
     private final IdempotencyRepository idempotencyRepository;
+    private final VisitorQuietHoursRepository quietHoursRepository;
+    private final SuppressionCounterRepository suppressionCounterRepository;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate txTemplate;
 
@@ -55,6 +67,8 @@ public class ExposureServiceImpl implements ExposureService {
                                ReservationRepository reservationRepository,
                                LedgerRepository ledgerRepository,
                                IdempotencyRepository idempotencyRepository,
+                               VisitorQuietHoursRepository quietHoursRepository,
+                               SuppressionCounterRepository suppressionCounterRepository,
                                ObjectMapper objectMapper,
                                TransactionTemplate txTemplate) {
         this.clock = clock;
@@ -62,6 +76,8 @@ public class ExposureServiceImpl implements ExposureService {
         this.reservationRepository = reservationRepository;
         this.ledgerRepository = ledgerRepository;
         this.idempotencyRepository = idempotencyRepository;
+        this.quietHoursRepository = quietHoursRepository;
+        this.suppressionCounterRepository = suppressionCounterRepository;
         this.objectMapper = objectMapper;
         this.txTemplate = txTemplate;
     }
@@ -69,7 +85,7 @@ public class ExposureServiceImpl implements ExposureService {
     @Override
     public CampaignResponse createCampaign(CreateCampaignRequest request) {
         String fingerprint = request.campaignId() + "|" + request.dailyTotalCap() + "|"
-                + request.perVisitorDailyCap();
+                + request.perVisitorDailyCap() + "|" + request.category();
         return runIdempotent(request.requestId(), Operation.CREATE_CAMPAIGN, fingerprint,
                 CampaignResponse.class, () -> {
                     if (campaignRepository.findById(request.campaignId()).isPresent()) {
@@ -80,6 +96,7 @@ public class ExposureServiceImpl implements ExposureService {
                             request.campaignId(),
                             request.dailyTotalCap(),
                             request.perVisitorDailyCap(),
+                            request.category(),
                             clock.millis());
                     try {
                         campaignRepository.insert(campaign);
@@ -93,46 +110,10 @@ public class ExposureServiceImpl implements ExposureService {
     }
 
     @Override
-    public ReservationResponse apply(ApplyExposureRequest request) {
+    public ApplyResponse apply(ApplyExposureRequest request) {
         String fingerprint = request.campaignId() + "|" + request.visitorId();
         return runIdempotent(request.requestId(), Operation.APPLY, fingerprint,
-                ReservationResponse.class, () -> {
-                    long now = clock.millis();
-                    LocalDate utcDate = LocalDate.now(clock);
-                    Campaign campaign = requireCampaign(request.campaignId());
-
-                    // 先结算该公告相关过期预占并释放额度
-                    settleExpired(campaign.campaignId(), now);
-
-                    // 固定加锁顺序：公告当日总账 -> 访客当日账，避免死锁
-                    ledgerRepository.ensureTotalRow(campaign.campaignId(), utcDate);
-                    ledgerRepository.ensureVisitorRow(campaign.campaignId(), request.visitorId(), utcDate);
-                    int usedTotal = ledgerRepository.lockUsedTotal(campaign.campaignId(), utcDate);
-                    int usedVisitor = ledgerRepository.lockUsedVisitor(
-                            campaign.campaignId(), request.visitorId(), utcDate);
-
-                    // 任一额度已满则 429，两个额度均不增加（尚未写入）
-                    if (usedTotal + 1 > campaign.dailyTotalCap()
-                            || usedVisitor + 1 > campaign.perVisitorDailyCap()) {
-                        throw new ApiException(HttpStatus.TOO_MANY_REQUESTS,
-                                "exposure quota exhausted for campaign " + campaign.campaignId());
-                    }
-                    ledgerRepository.addTotal(campaign.campaignId(), utcDate, 1);
-                    ledgerRepository.addVisitor(campaign.campaignId(), request.visitorId(), utcDate, 1);
-
-                    String reservationId = UUID.randomUUID().toString().replace("-", "");
-                    Reservation reservation = new Reservation(
-                            reservationId,
-                            campaign.campaignId(),
-                            request.visitorId(),
-                            java.sql.Date.valueOf(utcDate),
-                            ReservationStatus.RESERVED,
-                            now,
-                            now + RESERVATION_TTL_MILLIS,
-                            null);
-                    reservationRepository.insert(reservation);
-                    return ReservationResponse.from(reservation);
-                });
+                ApplyResponse.class, () -> doApply(request));
     }
 
     @Override
@@ -189,6 +170,40 @@ public class ExposureServiceImpl implements ExposureService {
         });
     }
 
+    @Override
+    public QuietHoursSettingsResponse saveQuietHours(QuietHoursSettingsRequest request) {
+        if (request.quietStartMinute().equals(request.quietEndMinute())) {
+            throw new ApiException(HttpStatus.BAD_REQUEST,
+                    "quiet start minute and end minute must differ");
+        }
+        String fingerprint = request.visitorId() + "|" + request.utcOffsetMinutes() + "|"
+                + request.quietStartMinute() + "|" + request.quietEndMinute() + "|"
+                + request.allowCritical() + "|" + request.expectedVersion();
+        return runIdempotent(request.requestId(), Operation.SAVE_QUIET_HOURS, fingerprint,
+                QuietHoursSettingsResponse.class, () -> doSaveQuietHours(request));
+    }
+
+    @Override
+    public QuietHoursSettingsResponse getQuietHours(String visitorId) {
+        return txTemplate.execute(status -> {
+            VisitorQuietHours settings = quietHoursRepository.lockById(visitorId)
+                    .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
+                            "visitor quiet hours not registered: " + visitorId));
+            return QuietHoursSettingsResponse.from(settings);
+        });
+    }
+
+    @Override
+    public SuppressionStatsResponse querySuppressionStats(String campaignId, String visitorId,
+                                                          LocalDate requestedDate) {
+        return txTemplate.execute(status -> {
+            requireCampaign(campaignId);
+            LocalDate utcDate = requestedDate != null ? requestedDate : LocalDate.now(clock);
+            int count = suppressionCounterRepository.getCount(campaignId, visitorId, utcDate);
+            return new SuppressionStatsResponse(campaignId, visitorId, utcDate, count);
+        });
+    }
+
     // ---- 内部辅助（作用域末尾） ----
 
     /** 幂等操作类型，同时标识存储响应的反序列化类型。 */
@@ -196,7 +211,133 @@ public class ExposureServiceImpl implements ExposureService {
         CREATE_CAMPAIGN,
         APPLY,
         CONFIRM,
-        CANCEL
+        CANCEL,
+        SAVE_QUIET_HOURS
+    }
+
+    /**
+     * 申请曝光事务主体：静默判定严格先于额度校验与账目写入。
+     * 加锁顺序固定为 访客设置 -> 公告当日总账 -> 访客当日账，避免死锁。
+     */
+    private ApplyResponse doApply(ApplyExposureRequest request) {
+        long now = clock.millis();
+        LocalDate utcDate = LocalDate.now(clock);
+        Campaign campaign = requireCampaign(request.campaignId());
+
+        // 1) 静默判定（持访客设置行锁，与设置修改按提交顺序串行）
+        Optional<VisitorQuietHours> settings = quietHoursRepository.lockById(request.visitorId());
+        if (settings.isPresent() && isSuppressedNow(settings.get(), campaign.category(), now)) {
+            VisitorQuietHours q = settings.get();
+            long quietUntilUtc = QuietHoursCalculator.nextQuietEndUtcMillis(
+                    now, q.utcOffsetMinutes(), q.quietStartMinute(), q.quietEndMinute());
+            // 抑制计数按公告、访客与 UTC 日累计；不创建预占、不触碰额度账目
+            suppressionCounterRepository.increment(
+                    campaign.campaignId(), request.visitorId(), utcDate, campaign.category());
+            return ApplyResponse.suppressed(
+                    campaign.campaignId(), request.visitorId(),
+                    campaign.category(), utcDate, quietUntilUtc);
+        }
+
+        // 2) 结算该公告相关过期预占并释放额度（静默期间不结算，避免无谓写竞争）
+        settleExpired(campaign.campaignId(), now);
+
+        // 3) 固定加锁顺序：公告当日总账 -> 访客当日账
+        ledgerRepository.ensureTotalRow(campaign.campaignId(), utcDate);
+        ledgerRepository.ensureVisitorRow(campaign.campaignId(), request.visitorId(), utcDate);
+        int usedTotal = ledgerRepository.lockUsedTotal(campaign.campaignId(), utcDate);
+        int usedVisitor = ledgerRepository.lockUsedVisitor(
+                campaign.campaignId(), request.visitorId(), utcDate);
+
+        // 4) 任一额度已满则 429，两个额度均不增加（尚未写入），抑制不参与此分支
+        if (usedTotal + 1 > campaign.dailyTotalCap()
+                || usedVisitor + 1 > campaign.perVisitorDailyCap()) {
+            throw new ApiException(HttpStatus.TOO_MANY_REQUESTS,
+                    "exposure quota exhausted for campaign " + campaign.campaignId());
+        }
+        ledgerRepository.addTotal(campaign.campaignId(), utcDate, 1);
+        ledgerRepository.addVisitor(campaign.campaignId(), request.visitorId(), utcDate, 1);
+
+        String reservationId = UUID.randomUUID().toString().replace("-", "");
+        Reservation reservation = new Reservation(
+                reservationId,
+                campaign.campaignId(),
+                request.visitorId(),
+                java.sql.Date.valueOf(utcDate),
+                ReservationStatus.RESERVED,
+                now,
+                now + RESERVATION_TTL_MILLIS,
+                null);
+        reservationRepository.insert(reservation);
+        return ApplyResponse.reserved(reservation, campaign.category());
+    }
+
+    /**
+     * 判定当前时刻公告类别是否应被静默抑制：
+     * SERVICE/MARKETING 落入静默区间即抑制；CRITICAL 仅在 allowCritical=false 时抑制。
+     */
+    private boolean isSuppressedNow(VisitorQuietHours settings, CampaignCategory category, long now) {
+        int localMinute = QuietHoursCalculator.localMinute(now, settings.utcOffsetMinutes());
+        boolean within = QuietHoursCalculator.isWithinQuietHours(
+                localMinute, settings.quietStartMinute(), settings.quietEndMinute());
+        if (!within) {
+            return false;
+        }
+        if (category == CampaignCategory.CRITICAL) {
+            return !settings.allowCritical();
+        }
+        return true;
+    }
+
+    /**
+     * 登记/修改静默设置事务主体：expectedVersion=0 为首次登记；
+     * 已存在时按乐观锁版本整体覆盖，冲突返回 409。只影响后续申请。
+     */
+    private QuietHoursSettingsResponse doSaveQuietHours(QuietHoursSettingsRequest request) {
+        long now = clock.millis();
+        Optional<VisitorQuietHours> existing = quietHoursRepository.lockById(request.visitorId());
+        if (existing.isEmpty()) {
+            if (request.expectedVersion() != 0) {
+                throw new ApiException(HttpStatus.CONFLICT,
+                        "visitor quiet hours not registered, expectedVersion must be 0 for registration: "
+                                + request.visitorId());
+            }
+            VisitorQuietHours settings = new VisitorQuietHours(
+                    request.visitorId(),
+                    request.utcOffsetMinutes(),
+                    request.quietStartMinute(),
+                    request.quietEndMinute(),
+                    request.allowCritical(),
+                    1,
+                    now,
+                    now);
+            try {
+                quietHoursRepository.insert(settings);
+            } catch (DuplicateKeyException duplicate) {
+                throw new ApiException(HttpStatus.CONFLICT,
+                        "visitor quiet hours registered concurrently: " + request.visitorId());
+            }
+            return QuietHoursSettingsResponse.from(settings);
+        }
+        VisitorQuietHours current = existing.get();
+        if (current.version() != request.expectedVersion()) {
+            throw new ApiException(HttpStatus.CONFLICT,
+                    "quiet hours version conflict: expected " + current.version()
+                            + " but got " + request.expectedVersion());
+        }
+        VisitorQuietHours updated = new VisitorQuietHours(
+                request.visitorId(),
+                request.utcOffsetMinutes(),
+                request.quietStartMinute(),
+                request.quietEndMinute(),
+                request.allowCritical(),
+                current.version() + 1,
+                current.createdAtUtc(),
+                now);
+        if (!quietHoursRepository.compareAndSetUpdate(updated, request.expectedVersion())) {
+            throw new ApiException(HttpStatus.CONFLICT,
+                    "quiet hours version conflict: " + request.visitorId());
+        }
+        return QuietHoursSettingsResponse.from(updated);
     }
 
     /**
@@ -333,12 +474,6 @@ public class ExposureServiceImpl implements ExposureService {
         return campaignRepository.findById(campaignId)
                 .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
                         "campaign not found: " + campaignId));
-    }
-
-    private Reservation requireReservation(String reservationId) {
-        return reservationRepository.findById(reservationId)
-                .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
-                        "reservation not found: " + reservationId));
     }
 
     private String writeJson(Object value) {
