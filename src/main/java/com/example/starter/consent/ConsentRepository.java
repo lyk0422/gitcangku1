@@ -97,6 +97,37 @@ public class ConsentRepository {
         return rows.stream().findFirst();
     }
 
+    /**
+     * 判断主体在任何用途下是否存在授权代次，用于导出快照的 404 判定。
+     */
+    boolean existsAnyGrantForSubject(String subjectKey) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM consent_grant WHERE subject_key = ?",
+                Integer.class, subjectKey);
+        return count != null && count > 0;
+    }
+
+    /**
+     * 读取主体某用途的最新代次并加行锁（FOR UPDATE），使导出快照与并发撤回按提交顺序裁决。
+     */
+    Optional<GrantRow> findLatestGrantForUpdate(String subjectKey, Purpose purpose) {
+        List<GrantRow> rows = jdbc.query(
+                "SELECT subject_key, purpose, epoch, status FROM consent_grant"
+                        + " WHERE subject_key = ? AND purpose = ? ORDER BY epoch DESC LIMIT 1 FOR UPDATE",
+                GRANT_MAPPER, subjectKey, purpose.name());
+        return rows.stream().findFirst();
+    }
+
+    /**
+     * 读取指定代次的全部记录，按 recordKey 升序，用于生成导出快照。
+     */
+    List<RecordRow> findRecords(String subjectKey, Purpose purpose, int epoch) {
+        return jdbc.query(
+                "SELECT subject_key, purpose, epoch, record_key, payload FROM consent_record"
+                        + " WHERE subject_key = ? AND purpose = ? AND epoch = ? ORDER BY record_key ASC",
+                RECORD_MAPPER, subjectKey, purpose.name(), epoch);
+    }
+
     void insertRecord(String subjectKey, Purpose purpose, int epoch, String recordKey, String payload, String requestId) {
         jdbc.update(
                 "INSERT INTO consent_record (subject_key, purpose, epoch, record_key, payload, request_id)"
