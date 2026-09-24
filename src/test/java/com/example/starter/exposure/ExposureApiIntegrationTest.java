@@ -1,10 +1,12 @@
 package com.example.starter.exposure;
 
 import com.example.starter.exposure.web.ApplyExposureRequest;
+import com.example.starter.exposure.web.ApplyResultResponse;
 import com.example.starter.exposure.web.CreateCampaignRequest;
 import com.example.starter.exposure.web.QuotaResponse;
 import com.example.starter.exposure.web.ReservationActionRequest;
 import com.example.starter.exposure.web.ReservationResponse;
+import com.example.starter.exposure.domain.CampaignCategory;
 import com.example.starter.exposure.exposure.ExposureService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.AfterAll;
@@ -110,6 +112,8 @@ class ExposureApiIntegrationTest {
         jdbc.update("DELETE FROM exposure_reservation");
         jdbc.update("DELETE FROM quota_visitor_ledger");
         jdbc.update("DELETE FROM quota_total_ledger");
+        jdbc.update("DELETE FROM suppression_stats");
+        jdbc.update("DELETE FROM visitor_quiet_settings");
         jdbc.update("DELETE FROM campaign");
         mutableClock().setInstant(BASE);
     }
@@ -120,7 +124,21 @@ class ExposureApiIntegrationTest {
     }
 
     private CreateCampaignRequest createReq(String requestId, String campaignId, int total, int perVisitor) {
-        return new CreateCampaignRequest(requestId, campaignId, total, perVisitor);
+        return new CreateCampaignRequest(requestId, campaignId, CampaignCategory.SERVICE, total, perVisitor);
+    }
+
+    private CreateCampaignRequest createReq(String requestId, String campaignId,
+                                            CampaignCategory category, int total, int perVisitor) {
+        return new CreateCampaignRequest(requestId, campaignId, category, total, perVisitor);
+    }
+
+    /** 申请并断言结果为 RESERVED，返回预占单。 */
+    private ReservationResponse applyReserved(ApplyExposureRequest request) {
+        ApplyResultResponse result = service.apply(request);
+        assertEquals("RESERVED", result.outcome().name());
+        assertNotNull(result.reservation());
+        assertNull(result.quietEndsAtUtc());
+        return result.reservation();
     }
 
     @Test
@@ -128,7 +146,7 @@ class ExposureApiIntegrationTest {
     void apply_createsReservationAndOccupiesBothQuotas() {
         service.createCampaign(createReq("req-c1", "c1", 10, 2));
 
-        ReservationResponse r = service.apply(new ApplyExposureRequest("req-a1", "c1", "v1"));
+        ReservationResponse r = applyReserved(new ApplyExposureRequest("req-a1", "c1", "v1"));
 
         assertEquals("c1", r.campaignId());
         assertEquals("v1", r.visitorId());
@@ -155,7 +173,7 @@ class ExposureApiIntegrationTest {
     @DisplayName("确认后转 CONFIRMED 并持续占用当天额度；重复确认返回原状态")
     void confirm_keepsQuotaAndRepeatedConfirmReturnsSameState() {
         service.createCampaign(createReq("req-c1", "c1", 10, 2));
-        ReservationResponse r = service.apply(new ApplyExposureRequest("req-a1", "c1", "v1"));
+        ReservationResponse r = applyReserved(new ApplyExposureRequest("req-a1", "c1", "v1"));
 
         ReservationResponse confirmed = service.confirm(r.reservationId(),
                 new ReservationActionRequest("req-ok1"));
@@ -180,7 +198,7 @@ class ExposureApiIntegrationTest {
     @DisplayName("取消仅适用于 RESERVED：释放两级额度，重复取消返回原状态")
     void cancel_releasesBothQuotasAndRepeatedCancelReturnsSameState() {
         service.createCampaign(createReq("req-c1", "c1", 1, 1));
-        ReservationResponse r = service.apply(new ApplyExposureRequest("req-a1", "c1", "v1"));
+        ReservationResponse r = applyReserved(new ApplyExposureRequest("req-a1", "c1", "v1"));
 
         ReservationResponse cancelled = service.cancel(r.reservationId(),
                 new ReservationActionRequest("req-x1"));
@@ -200,7 +218,7 @@ class ExposureApiIntegrationTest {
         assertEquals(1, quota.remainingVisitor());
 
         // 释放后额度可再次申请
-        ReservationResponse second = service.apply(new ApplyExposureRequest("req-a2", "c1", "v1"));
+        ReservationResponse second = applyReserved(new ApplyExposureRequest("req-a2", "c1", "v1"));
         assertEquals("RESERVED", second.status().name());
     }
 
@@ -208,11 +226,11 @@ class ExposureApiIntegrationTest {
     @DisplayName("非法状态转换返回 409：确认已取消、取消已确认")
     void illegalTransitionsReturn409() {
         service.createCampaign(createReq("req-c1", "c1", 10, 2));
-        ReservationResponse r1 = service.apply(new ApplyExposureRequest("req-a1", "c1", "v1"));
+        ReservationResponse r1 = applyReserved(new ApplyExposureRequest("req-a1", "c1", "v1"));
         service.cancel(r1.reservationId(), new ReservationActionRequest("req-x1"));
         assert409(() -> service.confirm(r1.reservationId(), new ReservationActionRequest("req-e1")));
 
-        ReservationResponse r2 = service.apply(new ApplyExposureRequest("req-a2", "c1", "v2"));
+        ReservationResponse r2 = applyReserved(new ApplyExposureRequest("req-a2", "c1", "v2"));
         service.confirm(r2.reservationId(), new ReservationActionRequest("req-k1"));
         assert409(() -> service.cancel(r2.reservationId(), new ReservationActionRequest("req-e2")));
     }
@@ -221,7 +239,7 @@ class ExposureApiIntegrationTest {
     @DisplayName("达到到期时刻即 EXPIRED 并释放；确认/取消过期单返回 409；不依赖定时器")
     void expiry_atExactMomentReleasesQuotaAndActionsReturn409() {
         service.createCampaign(createReq("req-c1", "c1", 10, 2));
-        ReservationResponse r = service.apply(new ApplyExposureRequest("req-a1", "c1", "v1"));
+        ReservationResponse r = applyReserved(new ApplyExposureRequest("req-a1", "c1", "v1"));
 
         // 到期前 1 毫秒仍可确认的边界由另一用例覆盖；此处推进到恰好到期时刻
         mutableClock().advanceMillis(60_000L);
@@ -244,7 +262,7 @@ class ExposureApiIntegrationTest {
     void confirmAcrossUtcDay_keepsOriginalDayLedger() {
         mutableClock().setInstant(Instant.parse("2026-09-22T23:59:30Z"));
         service.createCampaign(createReq("req-c1", "c1", 10, 2));
-        ReservationResponse r = service.apply(new ApplyExposureRequest("req-a1", "c1", "v1"));
+        ReservationResponse r = applyReserved(new ApplyExposureRequest("req-a1", "c1", "v1"));
         assertEquals(LocalDate.of(2026, 9, 22), r.utcDate());
 
         // 推进到次日但未到到期时刻（到期 = 23:59:30 + 60s = 次日 00:00:30）
@@ -265,8 +283,8 @@ class ExposureApiIntegrationTest {
     @DisplayName("任一额度已满返回 429，两个额度均不增加；访客上限同样生效")
     void quotaExhausted_returns429AndNoLedgerIncrease() {
         service.createCampaign(createReq("req-c1", "c1", 2, 2));
-        service.apply(new ApplyExposureRequest("req-a1", "c1", "v1"));
-        service.apply(new ApplyExposureRequest("req-a2", "c1", "v2"));
+        applyReserved(new ApplyExposureRequest("req-a1", "c1", "v1"));
+        applyReserved(new ApplyExposureRequest("req-a2", "c1", "v2"));
 
         assert429(() -> service.apply(new ApplyExposureRequest("req-a3", "c1", "v3")));
         assert429(() -> service.apply(new ApplyExposureRequest("req-a4", "c1", "v1")));
@@ -281,9 +299,9 @@ class ExposureApiIntegrationTest {
     @DisplayName("幂等：同键同参重放原结果；异参 409；失败不占键")
     void idempotency_replaySameResult_conflictOnDifferentParams_failureDoesNotOccupy() {
         service.createCampaign(createReq("req-c1", "c1", 1, 5));
-        ReservationResponse first = service.apply(new ApplyExposureRequest("key-1", "c1", "v1"));
+        ReservationResponse first = applyReserved(new ApplyExposureRequest("key-1", "c1", "v1"));
 
-        ReservationResponse replay = service.apply(new ApplyExposureRequest("key-1", "c1", "v1"));
+        ReservationResponse replay = applyReserved(new ApplyExposureRequest("key-1", "c1", "v1"));
         assertEquals(first.reservationId(), replay.reservationId());
         assertEquals(1, service.queryQuota("c1", null, LocalDate.of(2026, 9, 22)).usedTotal());
 
@@ -296,7 +314,7 @@ class ExposureApiIntegrationTest {
         // 失败的申请（总额已满）不占键：释放额度后同键同参可成功
         assert429(() -> service.apply(new ApplyExposureRequest("key-fail", "c1", "v2")));
         service.cancel(first.reservationId(), new ReservationActionRequest("req-x1"));
-        ReservationResponse retried = service.apply(new ApplyExposureRequest("key-fail", "c1", "v2"));
+        ReservationResponse retried = applyReserved(new ApplyExposureRequest("key-fail", "c1", "v2"));
         assertEquals("RESERVED", retried.status().name());
         assertEquals(1, service.queryQuota("c1", null, LocalDate.of(2026, 9, 22)).usedTotal());
     }
@@ -315,7 +333,8 @@ class ExposureApiIntegrationTest {
     void httpSemantics_201_429_400() throws Exception {
         mockMvc.perform(post("/api/exposure/campaigns")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"requestId\":\"h1\",\"campaignId\":\"ch\",\"dailyTotalCap\":1,"
+                        .content("{\"requestId\":\"h1\",\"campaignId\":\"ch\",\"category\":\"SERVICE\","
+                                + "\"dailyTotalCap\":1,"
                                 + "\"perVisitorDailyCap\":1}"))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.campaignId").value("ch"));
@@ -324,7 +343,8 @@ class ExposureApiIntegrationTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"requestId\":\"h2\",\"campaignId\":\"ch\",\"visitorId\":\"u1\"}"))
                 .andExpect(status().isCreated())
-                .andExpect(jsonPath("$.status").value("RESERVED"));
+                .andExpect(jsonPath("$.outcome").value("RESERVED"))
+                .andExpect(jsonPath("$.reservation.status").value("RESERVED"));
 
         mockMvc.perform(post("/api/exposure/reservations")
                         .contentType(MediaType.APPLICATION_JSON)
@@ -334,7 +354,8 @@ class ExposureApiIntegrationTest {
 
         mockMvc.perform(post("/api/exposure/campaigns")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"requestId\":\"h4\",\"campaignId\":\"bad\",\"dailyTotalCap\":0,"
+                        .content("{\"requestId\":\"h4\",\"campaignId\":\"bad\",\"category\":\"MARKETING\","
+                                + "\"dailyTotalCap\":0,"
                                 + "\"perVisitorDailyCap\":1}"))
                 .andExpect(status().isBadRequest());
 

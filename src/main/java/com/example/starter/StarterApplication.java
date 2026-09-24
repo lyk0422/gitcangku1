@@ -4,7 +4,7 @@ import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 
 /**
- * 业务题目工程入口；当前仅提供 Web 服务及数据库健康检查，不包含题目业务实现。
+ * 业务题目工程入口；提供公告曝光频控（含访客静默时段与类别抑制）Web 服务及 H2 内存库。
  */
 @SpringBootApplication
 public class StarterApplication {

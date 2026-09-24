@@ -7,6 +7,7 @@ import com.example.starter.exposure.web.CreateCampaignRequest;
 import com.example.starter.exposure.web.QuotaResponse;
 import com.example.starter.exposure.web.ReservationActionRequest;
 import com.example.starter.exposure.web.ReservationResponse;
+import com.example.starter.exposure.domain.CampaignCategory;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -87,6 +88,8 @@ class ExposureConcurrencyTest {
         jdbc.update("DELETE FROM exposure_reservation");
         jdbc.update("DELETE FROM quota_visitor_ledger");
         jdbc.update("DELETE FROM quota_total_ledger");
+        jdbc.update("DELETE FROM suppression_stats");
+        jdbc.update("DELETE FROM visitor_quiet_settings");
         jdbc.update("DELETE FROM campaign");
     }
 
@@ -100,7 +103,8 @@ class ExposureConcurrencyTest {
     void concurrentApply_doesNotOversell() throws Exception {
         int totalCap = 20;
         int threads = 100;
-        service.createCampaign(new CreateCampaignRequest("req-c", "cap", totalCap, 100_000));
+        service.createCampaign(new CreateCampaignRequest(
+                "req-c", "cap", CampaignCategory.SERVICE, totalCap, 100_000));
 
         ExecutorService pool = Executors.newFixedThreadPool(16);
         CountDownLatch start = new CountDownLatch(1);
@@ -114,7 +118,8 @@ class ExposureConcurrencyTest {
                 try {
                     start.await();
                     ReservationResponse r = service.apply(
-                            new ApplyExposureRequest("req-a-" + idx, "cap", "visitor-" + idx));
+                            new ApplyExposureRequest("req-a-" + idx, "cap", "visitor-" + idx))
+                            .reservation();
                     success.incrementAndGet();
                     reservationIds.add(r.reservationId());
                 } catch (ApiException ex) {
@@ -144,8 +149,10 @@ class ExposureConcurrencyTest {
     @Test
     @DisplayName("同一预占并发确认/取消：只允许一个终态，额度不重复释放、不变负")
     void concurrentConfirmAndCancel_singleTerminal_noDoubleRelease() throws Exception {
-        service.createCampaign(new CreateCampaignRequest("req-c", "cap", 1, 1));
-        ReservationResponse r = service.apply(new ApplyExposureRequest("req-a", "cap", "v1"));
+        service.createCampaign(new CreateCampaignRequest(
+                "req-c", "cap", CampaignCategory.SERVICE, 1, 1));
+        ReservationResponse r = service.apply(new ApplyExposureRequest("req-a", "cap", "v1"))
+                .reservation();
 
         int threads = 24;
         ExecutorService pool = Executors.newFixedThreadPool(threads);
@@ -212,7 +219,8 @@ class ExposureConcurrencyTest {
     @Test
     @DisplayName("同一 requestId 并发重放：业务只执行一次，响应一致")
     void concurrentSameRequestId_executesOnce() throws Exception {
-        service.createCampaign(new CreateCampaignRequest("req-c", "cap", 100, 100));
+        service.createCampaign(new CreateCampaignRequest(
+                "req-c", "cap", CampaignCategory.SERVICE, 100, 100));
 
         int threads = 16;
         ExecutorService pool = Executors.newFixedThreadPool(threads);
@@ -225,7 +233,8 @@ class ExposureConcurrencyTest {
                 try {
                     start.await();
                     ReservationResponse r = service.apply(
-                            new ApplyExposureRequest("same-key", "cap", "visitor-x"));
+                            new ApplyExposureRequest("same-key", "cap", "visitor-x"))
+                            .reservation();
                     reservationIds.add(r.reservationId());
                 } catch (Exception e) {
                     errors.incrementAndGet();

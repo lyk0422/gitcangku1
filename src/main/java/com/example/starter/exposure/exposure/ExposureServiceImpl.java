@@ -1,20 +1,28 @@
 package com.example.starter.exposure.exposure;
 
 import com.example.starter.exposure.domain.Campaign;
+import com.example.starter.exposure.domain.CampaignCategory;
 import com.example.starter.exposure.domain.Reservation;
 import com.example.starter.exposure.domain.ReservationStatus;
+import com.example.starter.exposure.domain.VisitorQuietSettings;
 import com.example.starter.exposure.repo.CampaignRepository;
 import com.example.starter.exposure.repo.IdempotencyRepository;
 import com.example.starter.exposure.repo.IdempotencyRepository.IdempotencyRecord;
 import com.example.starter.exposure.repo.LedgerRepository;
 import com.example.starter.exposure.repo.ReservationRepository;
+import com.example.starter.exposure.repo.SuppressionStatsRepository;
+import com.example.starter.exposure.repo.VisitorQuietSettingsRepository;
 import com.example.starter.exposure.web.ApiException;
 import com.example.starter.exposure.web.ApplyExposureRequest;
+import com.example.starter.exposure.web.ApplyResultResponse;
 import com.example.starter.exposure.web.CampaignResponse;
 import com.example.starter.exposure.web.CreateCampaignRequest;
 import com.example.starter.exposure.web.QuotaResponse;
+import com.example.starter.exposure.web.QuietSettingsRequest;
+import com.example.starter.exposure.web.QuietSettingsResponse;
 import com.example.starter.exposure.web.ReservationActionRequest;
 import com.example.starter.exposure.web.ReservationResponse;
+import com.example.starter.exposure.web.SuppressionStatsResponse;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.http.HttpStatus;
@@ -31,7 +39,8 @@ import java.util.function.Supplier;
  * 公告曝光频控业务服务实现。
  *
  * <p>所有写操作以 requestId 为全局幂等键：同键同参重放原成功结果，异参 409；
- * 业务失败随事务回滚，不占幂等键。所有操作与额度查询先结算相关过期预占，
+ * 业务失败随事务回滚，不占幂等键。申请曝光先判定访客静默（先于额度校验），
+ * 被抑制返回 SUPPRESSED 并累计抑制次数；其余操作与额度查询先结算相关过期预占，
  * 不依赖后台定时器。终态竞争由行锁 + 状态 CAS 保证只允许一个终态。</p>
  */
 @Service
@@ -47,6 +56,8 @@ public class ExposureServiceImpl implements ExposureService {
     private final ReservationRepository reservationRepository;
     private final LedgerRepository ledgerRepository;
     private final IdempotencyRepository idempotencyRepository;
+    private final VisitorQuietSettingsRepository quietSettingsRepository;
+    private final SuppressionStatsRepository suppressionStatsRepository;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate txTemplate;
 
@@ -55,6 +66,8 @@ public class ExposureServiceImpl implements ExposureService {
                                ReservationRepository reservationRepository,
                                LedgerRepository ledgerRepository,
                                IdempotencyRepository idempotencyRepository,
+                               VisitorQuietSettingsRepository quietSettingsRepository,
+                               SuppressionStatsRepository suppressionStatsRepository,
                                ObjectMapper objectMapper,
                                TransactionTemplate txTemplate) {
         this.clock = clock;
@@ -62,14 +75,16 @@ public class ExposureServiceImpl implements ExposureService {
         this.reservationRepository = reservationRepository;
         this.ledgerRepository = ledgerRepository;
         this.idempotencyRepository = idempotencyRepository;
+        this.quietSettingsRepository = quietSettingsRepository;
+        this.suppressionStatsRepository = suppressionStatsRepository;
         this.objectMapper = objectMapper;
         this.txTemplate = txTemplate;
     }
 
     @Override
     public CampaignResponse createCampaign(CreateCampaignRequest request) {
-        String fingerprint = request.campaignId() + "|" + request.dailyTotalCap() + "|"
-                + request.perVisitorDailyCap();
+        String fingerprint = request.campaignId() + "|" + request.category() + "|"
+                + request.dailyTotalCap() + "|" + request.perVisitorDailyCap();
         return runIdempotent(request.requestId(), Operation.CREATE_CAMPAIGN, fingerprint,
                 CampaignResponse.class, () -> {
                     if (campaignRepository.findById(request.campaignId()).isPresent()) {
@@ -78,6 +93,7 @@ public class ExposureServiceImpl implements ExposureService {
                     }
                     Campaign campaign = new Campaign(
                             request.campaignId(),
+                            request.category(),
                             request.dailyTotalCap(),
                             request.perVisitorDailyCap(),
                             clock.millis());
@@ -93,13 +109,23 @@ public class ExposureServiceImpl implements ExposureService {
     }
 
     @Override
-    public ReservationResponse apply(ApplyExposureRequest request) {
+    public ApplyResultResponse apply(ApplyExposureRequest request) {
         String fingerprint = request.campaignId() + "|" + request.visitorId();
         return runIdempotent(request.requestId(), Operation.APPLY, fingerprint,
-                ReservationResponse.class, () -> {
+                ApplyResultResponse.class, () -> {
                     long now = clock.millis();
                     LocalDate utcDate = LocalDate.now(clock);
                     Campaign campaign = requireCampaign(request.campaignId());
+
+                    // 静默判定先于额度校验与过期结算；被抑制不创建预占、不占额度、不留账目痕迹
+                    SuppressionDecision suppression = evaluateSuppression(campaign, request.visitorId(), now);
+                    if (suppression.suppressed()) {
+                        suppressionStatsRepository.ensureRow(campaign.campaignId(),
+                                request.visitorId(), utcDate);
+                        suppressionStatsRepository.increment(campaign.campaignId(),
+                                request.visitorId(), utcDate);
+                        return ApplyResultResponse.suppressed(suppression.quietEndsAtUtc());
+                    }
 
                     // 先结算该公告相关过期预占并释放额度
                     settleExpired(campaign.campaignId(), now);
@@ -131,7 +157,7 @@ public class ExposureServiceImpl implements ExposureService {
                             now + RESERVATION_TTL_MILLIS,
                             null);
                     reservationRepository.insert(reservation);
-                    return ReservationResponse.from(reservation);
+                    return ApplyResultResponse.reserved(ReservationResponse.from(reservation));
                 });
     }
 
@@ -189,6 +215,83 @@ public class ExposureServiceImpl implements ExposureService {
         });
     }
 
+    @Override
+    public QuietSettingsResponse putQuietSettings(QuietSettingsRequest request) {
+        if (request.quietStartMinute().equals(request.quietEndMinute())) {
+            throw new ApiException(HttpStatus.BAD_REQUEST,
+                    "quietStartMinute must differ from quietEndMinute");
+        }
+        String fingerprint = request.visitorId() + "|" + request.utcOffsetMinutes() + "|"
+                + request.quietStartMinute() + "|" + request.quietEndMinute() + "|"
+                + request.allowCritical() + "|" + request.expectedVersion();
+        return runIdempotent(request.requestId(), Operation.PUT_QUIET_SETTINGS, fingerprint,
+                QuietSettingsResponse.class, () -> {
+                    long now = clock.millis();
+                    VisitorQuietSettings existing =
+                            quietSettingsRepository.lockById(request.visitorId()).orElse(null);
+                    if (existing == null) {
+                        if (request.expectedVersion() != 0) {
+                            // 访客尚未登记，唯一合法的期望版本为 0
+                            throw new ApiException(HttpStatus.CONFLICT,
+                                    "quiet settings version conflict for visitor " + request.visitorId());
+                        }
+                        VisitorQuietSettings created = new VisitorQuietSettings(
+                                request.visitorId(),
+                                request.utcOffsetMinutes(),
+                                request.quietStartMinute(),
+                                request.quietEndMinute(),
+                                request.allowCritical(),
+                                1,
+                                now);
+                        try {
+                            quietSettingsRepository.insert(created);
+                        } catch (DuplicateKeyException duplicate) {
+                            // 并发首次登记：另一事务已建行，按版本冲突处理
+                            throw new ApiException(HttpStatus.CONFLICT,
+                                    "quiet settings version conflict for visitor " + request.visitorId());
+                        }
+                        return QuietSettingsResponse.from(created);
+                    }
+                    if (existing.version() != request.expectedVersion()) {
+                        throw new ApiException(HttpStatus.CONFLICT,
+                                "quiet settings version conflict for visitor " + request.visitorId());
+                    }
+                    VisitorQuietSettings updated = new VisitorQuietSettings(
+                            request.visitorId(),
+                            request.utcOffsetMinutes(),
+                            request.quietStartMinute(),
+                            request.quietEndMinute(),
+                            request.allowCritical(),
+                            existing.version() + 1,
+                            now);
+                    if (!quietSettingsRepository.compareAndSetUpdate(updated, request.expectedVersion())) {
+                        throw new ApiException(HttpStatus.CONFLICT,
+                                "quiet settings version conflict for visitor " + request.visitorId());
+                    }
+                    return QuietSettingsResponse.from(updated);
+                });
+    }
+
+    @Override
+    public QuietSettingsResponse getQuietSettings(String visitorId) {
+        return quietSettingsRepository.findById(visitorId)
+                .map(QuietSettingsResponse::from)
+                .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
+                        "quiet settings not registered for visitor " + visitorId));
+    }
+
+    @Override
+    public SuppressionStatsResponse querySuppressionStats(String campaignId, String visitorId,
+                                                          LocalDate requestedDate) {
+        return txTemplate.execute(status -> {
+            Campaign campaign = requireCampaign(campaignId);
+            LocalDate utcDate = requestedDate != null ? requestedDate : LocalDate.now(clock);
+            long count = suppressionStatsRepository.getCount(campaignId, visitorId, utcDate);
+            return new SuppressionStatsResponse(
+                    campaignId, visitorId, campaign.category(), utcDate, count);
+        });
+    }
+
     // ---- 内部辅助（作用域末尾） ----
 
     /** 幂等操作类型，同时标识存储响应的反序列化类型。 */
@@ -196,7 +299,8 @@ public class ExposureServiceImpl implements ExposureService {
         CREATE_CAMPAIGN,
         APPLY,
         CONFIRM,
-        CANCEL
+        CANCEL,
+        PUT_QUIET_SETTINGS
     }
 
     /**
@@ -335,10 +439,57 @@ public class ExposureServiceImpl implements ExposureService {
                         "campaign not found: " + campaignId));
     }
 
-    private Reservation requireReservation(String reservationId) {
-        return reservationRepository.findById(reservationId)
-                .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
-                        "reservation not found: " + reservationId));
+    /** 静默判定结论：suppressed=true 时携带静默结束 UTC 时刻（epoch 毫秒）。 */
+    private record SuppressionDecision(boolean suppressed, long quietEndsAtUtc) {
+        static SuppressionDecision notSuppressed() {
+            return new SuppressionDecision(false, 0L);
+        }
+    }
+
+    /**
+     * 静默判定：访客未登记视为无静默；申请时刻按访客 UTC 偏移换算为本地分钟，
+     * 落在左闭右开的每日静默区间内时，SERVICE/MARKETING 一律抑制，
+     * CRITICAL 仅在 allowCritical=true 时放行，否则同样抑制。
+     */
+    private SuppressionDecision evaluateSuppression(Campaign campaign, String visitorId, long nowUtcMillis) {
+        VisitorQuietSettings settings = quietSettingsRepository.findById(visitorId).orElse(null);
+        if (settings == null) {
+            return SuppressionDecision.notSuppressed();
+        }
+        long localMinute = Math.floorDiv(nowUtcMillis + settings.utcOffsetMinutes() * 60_000L, 60_000L)
+                % 1440L;
+        if (!isWithinQuietWindow((int) localMinute,
+                settings.quietStartMinute(), settings.quietEndMinute())) {
+            return SuppressionDecision.notSuppressed();
+        }
+        if (campaign.category() == CampaignCategory.CRITICAL && settings.allowCritical()) {
+            return SuppressionDecision.notSuppressed();
+        }
+        return new SuppressionDecision(true, nextQuietEndUtc(nowUtcMillis, settings));
+    }
+
+    /** 判断本地分钟是否落在左闭右开静默区间；start&gt;end 表示跨零点。 */
+    private boolean isWithinQuietWindow(int localMinute, int startMinute, int endMinute) {
+        if (startMinute < endMinute) {
+            return localMinute >= startMinute && localMinute < endMinute;
+        }
+        // 跨零点：[start, 1440) ∪ [0, end)
+        return localMinute >= startMinute || localMinute < endMinute;
+    }
+
+    /**
+     * 计算申请时刻之后最近一个静默结束边界的 UTC 时刻。
+     * 以本地零点对齐的 UTC 时刻为基准，按当天/次日的结束分钟推导，保证结果严格晚于申请时刻。
+     */
+    private long nextQuietEndUtc(long nowUtcMillis, VisitorQuietSettings settings) {
+        long offsetMillis = settings.utcOffsetMinutes() * 60_000L;
+        long localMillis = nowUtcMillis + offsetMillis;
+        long localDayStart = Math.floorDiv(localMillis, 86_400_000L) * 86_400_000L;
+        long endTodayUtc = localDayStart + settings.quietEndMinute() * 60_000L - offsetMillis;
+        if (endTodayUtc > nowUtcMillis) {
+            return endTodayUtc;
+        }
+        return endTodayUtc + 86_400_000L;
     }
 
     private String writeJson(Object value) {
