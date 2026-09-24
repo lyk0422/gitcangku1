@@ -97,3 +97,26 @@ CREATE TABLE IF NOT EXISTS playout_emergency_override (
     PRIMARY KEY (override_key),
     KEY idx_override_playout (channel_id, status, start_ms, end_ms, priority)
 ) COMMENT = '限时紧急插播表；不改写日草稿与发布快照，同频道同优先级 ACTIVE 区间不得重叠';
+
+CREATE TABLE IF NOT EXISTS playout_blackout_window (
+    blackout_key        VARCHAR(64) NOT NULL COMMENT '屏蔽窗口全局唯一键，客户端指定，创建后不变',
+    channel_id          VARCHAR(64) NOT NULL COMMENT '窗口所属频道 ID',
+    start_ms            BIGINT      NOT NULL COMMENT '窗口开始（含），UTC 纪元毫秒',
+    end_ms              BIGINT      NOT NULL COMMENT '窗口结束（不含），UTC 纪元毫秒；区间左闭右开，时长大于 0 且不超过 6 小时',
+    business_day        DATE        NOT NULL COMMENT '窗口所在业务日，Asia/Shanghai 日历日；区间不跨日',
+    substitute_asset_id VARCHAR(64) NOT NULL COMMENT '替补素材 ID，命中窗口时代替被屏蔽素材播出；不得出现在被屏蔽集合中',
+    status              VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE 生效中 / CANCELLED 已取消；创建即 ACTIVE，只能取消不可改写',
+    cancel_request_id   VARCHAR(64) NULL COMMENT '取消操作的幂等请求 ID；未取消时为 NULL',
+    cancelled_at_ms     BIGINT      NULL COMMENT '取消时间，UTC 纪元毫秒；未取消时为 NULL',
+    created_at_ms       BIGINT      NOT NULL COMMENT '创建时间，UTC 纪元毫秒',
+    PRIMARY KEY (blackout_key),
+    KEY idx_blackout_playout (channel_id, status, start_ms, end_ms)
+) COMMENT = '频道屏蔽窗口表；不改写日草稿、发布快照与插播记录，同频道 ACTIVE 窗口不得重叠（端点相接合法）';
+
+CREATE TABLE IF NOT EXISTS playout_blackout_asset (
+    blackout_key VARCHAR(64) NOT NULL COMMENT '所属屏蔽窗口键',
+    asset_id     VARCHAR(64) NOT NULL COMMENT '被屏蔽素材 ID，窗口内 1～20 个去重',
+    ordinal      INT         NOT NULL COMMENT '被屏蔽素材在创建请求中的顺序（从 0 起），仅用于明细展示',
+    PRIMARY KEY (blackout_key, asset_id),
+    KEY idx_blackout_asset_asset (asset_id)
+) COMMENT = '屏蔽窗口被屏蔽素材集合表；窗口取消后保留原集合，不可改写';

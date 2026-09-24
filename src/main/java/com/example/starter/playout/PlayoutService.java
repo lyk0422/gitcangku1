@@ -1,6 +1,7 @@
 package com.example.starter.playout;
 
 import com.example.starter.playout.PlayoutRepository.DraftRow;
+import com.example.starter.playout.PlayoutRepository.BlackoutWindowRow;
 import com.example.starter.playout.PlayoutRepository.GrantRow;
 import com.example.starter.playout.PlayoutRepository.OverrideRow;
 import com.example.starter.playout.PlayoutRepository.PublicationRow;
@@ -9,8 +10,11 @@ import com.example.starter.playout.PlayoutRepository.RequestRow;
 import com.example.starter.playout.PlayoutRepository.SegmentRow;
 import com.example.starter.playout.api.ApiException;
 import com.example.starter.playout.api.Dtos.AssetResponse;
+import com.example.starter.playout.api.Dtos.BlackoutStatus;
+import com.example.starter.playout.api.Dtos.BlackoutWindowResponse;
 import com.example.starter.playout.api.Dtos.ChannelResponse;
 import com.example.starter.playout.api.Dtos.CreateAssetRequest;
+import com.example.starter.playout.api.Dtos.CreateBlackoutWindowRequest;
 import com.example.starter.playout.api.Dtos.CreateChannelRequest;
 import com.example.starter.playout.api.Dtos.CreateEmergencyOverrideRequest;
 import com.example.starter.playout.api.Dtos.CreateGrantRequest;
@@ -40,8 +44,10 @@ import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Supplier;
 
@@ -63,9 +69,17 @@ public class PlayoutService {
     private static final String OP_REVOKE_GRANT = "REVOKE_GRANT";
     private static final String OP_CREATE_OVERRIDE = "CREATE_OVERRIDE";
     private static final String OP_CANCEL_OVERRIDE = "CANCEL_OVERRIDE";
+    private static final String OP_CREATE_BLACKOUT = "CREATE_BLACKOUT";
+    private static final String OP_CANCEL_BLACKOUT = "CANCEL_BLACKOUT";
 
     /** 紧急插播时长上限（含）：30 分钟，单位毫秒。 */
     private static final long OVERRIDE_MAX_DURATION_MS = 30L * 60L * 1000L;
+
+    /** 屏蔽窗口时长上限（含）：6 小时，单位毫秒。 */
+    private static final long BLACKOUT_MAX_DURATION_MS = 6L * 60L * 60L * 1000L;
+
+    /** 屏蔽窗口被屏蔽素材数量上限（含）。 */
+    private static final int BLACKOUT_MAX_ASSETS = 20;
 
     private final PlayoutRepository repo;
     private final ObjectMapper objectMapper;
@@ -246,6 +260,11 @@ public class PlayoutService {
      * 最高优先级插播（EMERGENCY 来源，随附 overrideKey）；高优先级插播授权失效时自动落到
      * 仍有效的低优先级插播。无有效插播候选时沿用原节目与保底逻辑。查询不改变插播状态，
      * 插播不随授权撤销自动换绑授权。到插播结束时刻（左闭右开）不再命中。
+     *
+     * <p>原判定之后增加频道屏蔽过滤：命中该时刻 ACTIVE 屏蔽窗口且原选中素材属于窗口被屏蔽
+     * 集合时，返回窗口替补素材，来源标记 SUBSTITUTE，并随附 blackoutKey、被替换的原素材与
+     * 原来源；原素材不在集合中时按原逻辑返回。窗口结束或取消后查询回到原逻辑。
+     * 查询为只读事务，基于单一一致快照，不会出现已取消窗口仍生效或 ACTIVE 窗口未生效。</p>
      */
     @Transactional(readOnly = true)
     public PlayoutDecisionResponse playoutDecision(String channelId, OffsetDateTime at) {
@@ -253,24 +272,32 @@ public class PlayoutService {
                 .orElseThrow(() -> ApiException.notFound("频道不存在: " + channelId));
         long atMs = toMs(at);
 
+        PlayoutDecisionResponse base = baseDecision(channelId, channel.fallbackAssetId(), at, atMs);
+        return applyBlackout(channelId, at, atMs, base);
+    }
+
+    /** 屏蔽过滤之前的原播出决定（紧急插播 → 已发布节目 → 保底）。 */
+    private PlayoutDecisionResponse baseDecision(String channelId, String fallbackAssetId,
+                                                 OffsetDateTime at, long atMs) {
         Optional<OverrideRow> override = selectActiveOverrideAt(channelId, atMs);
         if (override.isPresent()) {
             OverrideRow hit = override.get();
             return new PlayoutDecisionResponse(channelId, at, hit.assetId(),
-                    DecisionSource.EMERGENCY, null, null, null, hit.overrideKey());
+                    DecisionSource.EMERGENCY, null, null, null, hit.overrideKey(),
+                    null, null, null);
         }
 
         LocalDate businessDay = at.atZoneSameInstant(ZONE).toLocalDate();
 
         Optional<PublicationRow> publication = repo.findLatestPublication(channelId, businessDay);
         if (publication.isEmpty()) {
-            return fallback(channelId, at, channel.fallbackAssetId(),
+            return fallback(channelId, at, fallbackAssetId,
                     FallbackReason.NO_PUBLISHED_SCHEDULE);
         }
         Optional<PublicationSegmentRow> segment =
                 repo.findPublicationSegmentAt(publication.get().id(), atMs);
         if (segment.isEmpty()) {
-            return fallback(channelId, at, channel.fallbackAssetId(),
+            return fallback(channelId, at, fallbackAssetId,
                     FallbackReason.GAP);
         }
         PublicationSegmentRow hit = segment.get();
@@ -278,14 +305,35 @@ public class PlayoutService {
                 .orElseThrow(() -> ApiException.unprocessable("SNAPSHOT_INCOMPLETE",
                         "发布快照引用的授权不存在: " + hit.grantId()));
         if (grant.revoked()) {
-            return new PlayoutDecisionResponse(channelId, at, channel.fallbackAssetId(),
+            return new PlayoutDecisionResponse(channelId, at, fallbackAssetId,
                     DecisionSource.FALLBACK,
                     FallbackReason.GRANT_REVOKED,
-                    publication.get().id(), hit.segmentId(), null);
+                    publication.get().id(), hit.segmentId(), null,
+                    null, null, null);
         }
         return new PlayoutDecisionResponse(channelId, at, hit.assetId(),
                 DecisionSource.PROGRAM, null,
-                publication.get().id(), hit.segmentId(), null);
+                publication.get().id(), hit.segmentId(), null,
+                null, null, null);
+    }
+
+    /**
+     * 在原决定之上应用屏蔽窗口：同频道 ACTIVE 窗口互不重叠，命中至多一条；仅当原选中素材
+     * 属于该窗口被屏蔽集合时回退为替补素材（SUBSTITUTE），否则原决定不变。
+     */
+    private PlayoutDecisionResponse applyBlackout(String channelId, OffsetDateTime at, long atMs,
+                                                  PlayoutDecisionResponse base) {
+        List<BlackoutWindowRow> windows = repo.findActiveBlackoutsAt(channelId, atMs);
+        if (windows.isEmpty()) {
+            return base;
+        }
+        BlackoutWindowRow window = windows.get(0);
+        if (!repo.blackoutAssetExists(window.blackoutKey(), base.assetId())) {
+            return base;
+        }
+        return new PlayoutDecisionResponse(channelId, at, window.substituteAssetId(),
+                DecisionSource.SUBSTITUTE, null, base.publicationId(), base.segmentId(),
+                base.overrideKey(), window.blackoutKey(), base.assetId(), base.source());
     }
 
     /**
@@ -428,6 +476,141 @@ public class PlayoutService {
                 atMs(row.createdAtMs()));
     }
 
+    // ---------- 频道屏蔽窗口 ----------
+
+    /**
+     * 创建频道屏蔽窗口：创建即 ACTIVE，只可取消不可改写。校验区间同日、时长在 (0, 6 小时]，
+     * 被屏蔽素材 1～20 个去重且全部存在、替补素材存在且不在集合中；同频道 ACTIVE 窗口不得
+     * 重叠（端点相接合法）。携带 requestId 幂等：同键同参（被屏蔽集合换序视为同参）返回首次
+     * 结果，异参 409，失败不占键；已取消窗口不能用相同 blackoutKey 重放复活。
+     */
+    @Transactional
+    public BlackoutWindowResponse createBlackoutWindow(CreateBlackoutWindowRequest request) {
+        List<String> normalized = normalizeBlockedAssets(request.blockedAssetIds());
+        String hash = sha256(OP_CREATE_BLACKOUT + "|" + request.blackoutKey() + "|"
+                + request.channelId() + "|" + toMs(request.start()) + "|" + toMs(request.end())
+                + "|" + String.join(",", normalized) + "|" + request.substituteAssetId());
+        List<String> ordered = request.blockedAssetIds().stream().distinct().toList();
+        return idempotent(request.requestId(), OP_CREATE_BLACKOUT, hash,
+                BlackoutWindowResponse.class, () -> doCreateBlackout(request, ordered));
+    }
+
+    private BlackoutWindowResponse doCreateBlackout(CreateBlackoutWindowRequest request,
+                                                    List<String> blockedAssets) {
+        long startMs = toMs(request.start());
+        long endMs = toMs(request.end());
+        long durationMs = endMs - startMs;
+        if (durationMs <= 0) {
+            throw ApiException.badRequest("屏蔽窗口结束时间必须大于开始时间");
+        }
+        if (durationMs > BLACKOUT_MAX_DURATION_MS) {
+            throw ApiException.badRequest("屏蔽窗口时长不得超过 6 小时");
+        }
+        LocalDate startDay = request.start().atZoneSameInstant(ZONE).toLocalDate();
+        LocalDate endDay = request.end().atZoneSameInstant(ZONE).toLocalDate();
+        if (!startDay.equals(endDay)) {
+            throw ApiException.badRequest("屏蔽窗口起止时间必须处于同一 Asia/Shanghai 业务日");
+        }
+        if (blockedAssets.isEmpty() || blockedAssets.size() > BLACKOUT_MAX_ASSETS) {
+            throw ApiException.badRequest("被屏蔽素材数量必须在 1～20 个之间");
+        }
+
+        repo.lockChannelForUpdate(request.channelId());
+        repo.findChannel(request.channelId())
+                .orElseThrow(() -> ApiException.notFound("频道不存在: " + request.channelId()));
+
+        // 同键语义：已存在（含已取消）即冲突，重放创建不能复活已取消窗口。
+        if (repo.findBlackoutWindowForUpdate(request.blackoutKey()).isPresent()) {
+            throw ApiException.conflict("DUPLICATE_BLACKOUT_KEY",
+                    "屏蔽窗口 blackoutKey 已存在: " + request.blackoutKey());
+        }
+
+        if (repo.findAsset(request.substituteAssetId()).isEmpty()) {
+            throw ApiException.notFound("替补素材不存在: " + request.substituteAssetId());
+        }
+        for (String assetId : blockedAssets) {
+            if (repo.findAsset(assetId).isEmpty()) {
+                throw ApiException.notFound("被屏蔽素材不存在: " + assetId);
+            }
+        }
+        if (blockedAssets.contains(request.substituteAssetId())) {
+            throw ApiException.unprocessable("SUBSTITUTE_BLOCKED",
+                    "替补素材不得出现在被屏蔽集合中: " + request.substituteAssetId());
+        }
+
+        List<BlackoutWindowRow> overlapping =
+                repo.findActiveBlackoutOverlappingForUpdate(request.channelId(), startMs, endMs);
+        if (!overlapping.isEmpty()) {
+            throw ApiException.conflict("BLACKOUT_INTERVAL_CONFLICT",
+                    "同频道 ACTIVE 屏蔽窗口区间重叠: " + overlapping.get(0).blackoutKey());
+        }
+
+        long createdAtMs = nowMs();
+        try {
+            repo.insertBlackoutWindow(request.blackoutKey(), request.channelId(), startMs, endMs,
+                    startDay, request.substituteAssetId(), createdAtMs);
+        } catch (DuplicateKeyException e) {
+            throw ApiException.conflict("DUPLICATE_BLACKOUT_KEY",
+                    "屏蔽窗口 blackoutKey 已存在: " + request.blackoutKey());
+        }
+        for (int i = 0; i < blockedAssets.size(); i++) {
+            repo.insertBlackoutAsset(request.blackoutKey(), blockedAssets.get(i), i);
+        }
+        return new BlackoutWindowResponse(request.blackoutKey(), request.channelId(),
+                request.start(), request.end(), List.copyOf(blockedAssets),
+                request.substituteAssetId(), BlackoutStatus.ACTIVE, null, null,
+                atMs(createdAtMs));
+    }
+
+    /**
+     * 取消屏蔽窗口：仅 ACTIVE 可取消，已取消再取消为 409 状态冲突；取消提交后窗口立即失效，
+     * 被屏蔽素材原集合保留且不可改写。携带 requestId 幂等：同键同参返回首次结果（含 CANCELLED
+     * 明细），改参 409，失败不占键。
+     */
+    @Transactional
+    public BlackoutWindowResponse cancelBlackoutWindow(String blackoutKey, String requestId) {
+        String hash = sha256(OP_CANCEL_BLACKOUT + "|" + blackoutKey);
+        return idempotent(requestId, OP_CANCEL_BLACKOUT, hash, BlackoutWindowResponse.class, () -> {
+            // 先在频道锁上与同频道创建/取消串行，取消提交后并发创建即可复用该区间。
+            BlackoutWindowRow existing = repo.findBlackoutWindow(blackoutKey)
+                    .orElseThrow(() -> ApiException.notFound("屏蔽窗口不存在: " + blackoutKey));
+            repo.lockChannelForUpdate(existing.channelId());
+            int updated = repo.cancelBlackoutWindow(blackoutKey, requestId, nowMs());
+            if (updated == 0) {
+                throw ApiException.conflict("BLACKOUT_NOT_ACTIVE",
+                        "屏蔽窗口已取消，不能重复取消: " + blackoutKey);
+            }
+            return toBlackoutResponse(repo.findBlackoutWindowForUpdate(blackoutKey).orElseThrow());
+        });
+    }
+
+    /** 查询屏蔽窗口明细（ACTIVE/CANCELLED 均返回，含取消时刻与被屏蔽原集合，不可改写）。 */
+    @Transactional(readOnly = true)
+    public BlackoutWindowResponse getBlackoutWindow(String blackoutKey) {
+        BlackoutWindowRow row = repo.findBlackoutWindow(blackoutKey)
+                .orElseThrow(() -> ApiException.notFound("屏蔽窗口不存在: " + blackoutKey));
+        return toBlackoutResponse(row);
+    }
+
+    private BlackoutWindowResponse toBlackoutResponse(BlackoutWindowRow row) {
+        return new BlackoutWindowResponse(row.blackoutKey(), row.channelId(),
+                atMs(row.startMs()), atMs(row.endMs()), repo.findBlackoutAssets(row.blackoutKey()),
+                row.substituteAssetId(),
+                row.active() ? BlackoutStatus.ACTIVE : BlackoutStatus.CANCELLED,
+                row.cancelRequestId(),
+                row.cancelledAtMs() == null ? null : atMs(row.cancelledAtMs()),
+                atMs(row.createdAtMs()));
+    }
+
+    /** 去重并排序被屏蔽素材，作为幂等参数指纹：被屏蔽集合换序视为同参。 */
+    private static List<String> normalizeBlockedAssets(List<String> assetIds) {
+        if (assetIds == null) {
+            return List.of();
+        }
+        Set<String> distinct = new LinkedHashSet<>(assetIds);
+        return distinct.stream().sorted().toList();
+    }
+
     // ---------- 内部方法 ----------
 
     /** 校验并规范化草稿片段：非空、区间内、不跨日、不重叠、素材存在且被单条未撤销授权完整覆盖。 */
@@ -555,7 +738,8 @@ public class PlayoutService {
     private PlayoutDecisionResponse fallback(String channelId, OffsetDateTime at, String assetId,
                                              FallbackReason reason) {
         return new PlayoutDecisionResponse(channelId, at, assetId,
-                DecisionSource.FALLBACK, reason, null, null, null);
+                DecisionSource.FALLBACK, reason, null, null, null,
+                null, null, null);
     }
 
     private static long toMs(OffsetDateTime time) {

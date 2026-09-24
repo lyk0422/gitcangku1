@@ -73,6 +73,15 @@ public class PlayoutRepository {
         }
     }
 
+    /** 屏蔽窗口行；status 为 ACTIVE / CANCELLED，被屏蔽素材集合另存于 playout_blackout_asset。 */
+    public record BlackoutWindowRow(String blackoutKey, String channelId, long startMs, long endMs,
+                                    LocalDate businessDay, String substituteAssetId, String status,
+                                    String cancelRequestId, Long cancelledAtMs, long createdAtMs) {
+        public boolean active() {
+            return "ACTIVE".equals(status);
+        }
+    }
+
     private static final RowMapper<AssetRow> ASSET_MAPPER = (rs, n) ->
             new AssetRow(rs.getString("id"), rs.getLong("duration_ms"));
 
@@ -111,6 +120,13 @@ public class PlayoutRepository {
                     rs.getLong("start_ms"), rs.getLong("end_ms"),
                     rs.getDate("business_day").toLocalDate(), rs.getString("status"),
                     rs.getString("cancel_request_id"),
+                    (Long) rs.getObject("cancelled_at_ms"), rs.getLong("created_at_ms"));
+
+    private static final RowMapper<BlackoutWindowRow> BLACKOUT_WINDOW_MAPPER = (rs, n) ->
+            new BlackoutWindowRow(rs.getString("blackout_key"), rs.getString("channel_id"),
+                    rs.getLong("start_ms"), rs.getLong("end_ms"),
+                    rs.getDate("business_day").toLocalDate(), rs.getString("substitute_asset_id"),
+                    rs.getString("status"), rs.getString("cancel_request_id"),
                     (Long) rs.getObject("cancelled_at_ms"), rs.getLong("created_at_ms"));
 
     // ---------- 素材 ----------
@@ -380,5 +396,85 @@ public class PlayoutRepository {
                         + " SET status = 'CANCELLED', cancel_request_id = ?, cancelled_at_ms = ?"
                         + " WHERE override_key = ? AND status = 'ACTIVE'",
                 cancelRequestId, cancelledAtMs, overrideKey);
+    }
+
+    // ---------- 频道屏蔽窗口 ----------
+
+    public void insertBlackoutWindow(String blackoutKey, String channelId, long startMs, long endMs,
+                                     LocalDate businessDay, String substituteAssetId,
+                                     long createdAtMs) {
+        jdbc.update("INSERT INTO playout_blackout_window"
+                        + " (blackout_key, channel_id, start_ms, end_ms, business_day,"
+                        + "  substitute_asset_id, status, created_at_ms)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', ?)",
+                blackoutKey, channelId, startMs, endMs, Date.valueOf(businessDay),
+                substituteAssetId, createdAtMs);
+    }
+
+    public void insertBlackoutAsset(String blackoutKey, String assetId, int ordinal) {
+        jdbc.update("INSERT INTO playout_blackout_asset (blackout_key, asset_id, ordinal)"
+                + " VALUES (?, ?, ?)", blackoutKey, assetId, ordinal);
+    }
+
+    public Optional<BlackoutWindowRow> findBlackoutWindow(String blackoutKey) {
+        return jdbc.query("SELECT blackout_key, channel_id, start_ms, end_ms, business_day,"
+                        + " substitute_asset_id, status, cancel_request_id, cancelled_at_ms, created_at_ms"
+                        + " FROM playout_blackout_window WHERE blackout_key = ?",
+                BLACKOUT_WINDOW_MAPPER, blackoutKey).stream().findFirst();
+    }
+
+    /** 按全局键查询并加行锁。 */
+    public Optional<BlackoutWindowRow> findBlackoutWindowForUpdate(String blackoutKey) {
+        return jdbc.query("SELECT blackout_key, channel_id, start_ms, end_ms, business_day,"
+                        + " substitute_asset_id, status, cancel_request_id, cancelled_at_ms, created_at_ms"
+                        + " FROM playout_blackout_window WHERE blackout_key = ? FOR UPDATE",
+                BLACKOUT_WINDOW_MAPPER, blackoutKey).stream().findFirst();
+    }
+
+    /** 窗口被屏蔽素材集合，按创建请求顺序返回（取消后仍保留原集合）。 */
+    public List<String> findBlackoutAssets(String blackoutKey) {
+        return jdbc.queryForList("SELECT asset_id FROM playout_blackout_asset"
+                + " WHERE blackout_key = ? ORDER BY ordinal", String.class, blackoutKey);
+    }
+
+    /**
+     * 同频道、状态 ACTIVE 且与 [startMs, endMs) 相交的窗口（区间左闭右开：
+     * 相邻 start == end 不算相交）。须在持频道锁后调用，行锁避免并发取消/创建漏判。
+     */
+    public List<BlackoutWindowRow> findActiveBlackoutOverlappingForUpdate(String channelId,
+                                                                          long startMs, long endMs) {
+        return jdbc.query("SELECT blackout_key, channel_id, start_ms, end_ms, business_day,"
+                        + " substitute_asset_id, status, cancel_request_id, cancelled_at_ms, created_at_ms"
+                        + " FROM playout_blackout_window"
+                        + " WHERE channel_id = ? AND status = 'ACTIVE'"
+                        + " AND start_ms < ? AND end_ms > ?"
+                        + " ORDER BY start_ms, blackout_key FOR UPDATE",
+                BLACKOUT_WINDOW_MAPPER, channelId, endMs, startMs);
+    }
+
+    /** 命中某时刻的 ACTIVE 窗口（start <= at < end），同频道 ACTIVE 窗口互不重叠，至多一条。 */
+    public List<BlackoutWindowRow> findActiveBlackoutsAt(String channelId, long atMs) {
+        return jdbc.query("SELECT blackout_key, channel_id, start_ms, end_ms, business_day,"
+                        + " substitute_asset_id, status, cancel_request_id, cancelled_at_ms, created_at_ms"
+                        + " FROM playout_blackout_window"
+                        + " WHERE channel_id = ? AND status = 'ACTIVE'"
+                        + " AND start_ms <= ? AND end_ms > ?"
+                        + " ORDER BY start_ms, blackout_key",
+                BLACKOUT_WINDOW_MAPPER, channelId, atMs, atMs);
+    }
+
+    /** 判断素材是否属于窗口被屏蔽集合。 */
+    public boolean blackoutAssetExists(String blackoutKey, String assetId) {
+        Integer count = jdbc.queryForObject("SELECT COUNT(1) FROM playout_blackout_asset"
+                + " WHERE blackout_key = ? AND asset_id = ?", Integer.class, blackoutKey, assetId);
+        return count != null && count > 0;
+    }
+
+    /** 取消屏蔽窗口；返回受影响行数，0 表示不存在或已取消。 */
+    public int cancelBlackoutWindow(String blackoutKey, String cancelRequestId, long cancelledAtMs) {
+        return jdbc.update("UPDATE playout_blackout_window"
+                        + " SET status = 'CANCELLED', cancel_request_id = ?, cancelled_at_ms = ?"
+                        + " WHERE blackout_key = ? AND status = 'ACTIVE'",
+                cancelRequestId, cancelledAtMs, blackoutKey);
     }
 }
