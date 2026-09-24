@@ -16,24 +16,24 @@ public final class Dtos {
                                       String startUtc, String endUtc, String plannedVolume) {
     }
 
-    /** 供水窗口视图；activeCurtailmentVolume 为 null 表示无生效限供。 */
+    /** 供水窗口视图；activeCurtailmentVolume 为 null 表示无生效限供；version 为旱情乐观校验版本号。 */
     public record WindowResponse(long id, String windowKey, String channelId, String startUtc, String endUtc,
                                  String plannedVolume, String activeCurtailmentVolume, String availableTotal,
-                                 String createdUtc) {
+                                 String droughtLevel, long version, String createdUtc) {
     }
 
-    /** 提交配水申请命令；申请人由 X-Actor-Id 请求头提供。 */
+    /** 提交配水申请命令；申请人由 X-Actor-Id 请求头提供；priority 缺省 NORMAL。 */
     public record SubmitAllocationRequest(String commandKey, String allocationKey, Long windowId,
-                                          String userId, String amount) {
+                                          String userId, String amount, String priority) {
     }
 
     /**
-     * 配水申请视图。状态：REQUESTED / APPROVED / CANCELLED。
+     * 配水申请视图。状态：REQUESTED / APPROVED / CANCELLED。优先级：ESSENTIAL / NORMAL / DEFERRABLE。
      * amount 为不可改写的原申请水量；heldAmount 为当前持有额度（REQUESTED 为 0，普通批准时等于原水量，
-     * 转出时等额扣减，取消时归零；持有额度恰为零的已转出申请仍为 APPROVED）。
+     * 转出时等额扣减，取消时归零，旱情削减时按等级比例调减；持有额度恰为零的已转出申请仍为 APPROVED）。
      */
-    public record AllocationResponse(String allocationKey, long windowId, String userId, String amount,
-                                     String heldAmount, String requester, String status,
+    public record AllocationResponse(String allocationKey, long windowId, String userId, String priority,
+                                     String amount, String heldAmount, String requester, String status,
                                      String createdUtc, String updatedUtc) {
     }
 
@@ -52,7 +52,8 @@ public final class Dtos {
 
     /** 窗口当前可用容量视图；approvedTotal 汇总 APPROVED 申请的当前持有额度。 */
     public record CapacityResponse(long windowId, String plannedVolume, String activeCurtailmentVolume,
-                                   String availableTotal, String approvedTotal, String remaining) {
+                                   String availableTotal, String approvedTotal, String remaining,
+                                   String droughtLevel) {
     }
 
     /** 同窗口额度转让命令；操作人（源申请人）由 X-Actor-Id 请求头提供。 */
@@ -69,9 +70,39 @@ public final class Dtos {
     public record TransferListResponse(long windowId, List<TransferResponse> transfers) {
     }
 
-    /** 窗口历史明细：窗口本身 + 全部申请 + 全部限供记录。 */
+    /** 窗口历史明细：窗口本身 + 全部申请 + 全部限供记录 + 全部旱情削减声明。 */
     public record HistoryResponse(WindowResponse window, List<AllocationResponse> allocations,
-                                  List<CurtailmentResponse> curtailments) {
+                                  List<CurtailmentResponse> curtailments,
+                                  List<DroughtResponse> droughtCurtailments) {
+    }
+
+    /**
+     * 旱情分级削减声明命令。level：NONE / LEVEL1 / LEVEL2 / LEVEL3；
+     * 三级削减百分比为 0~100 整数且须 ESSENTIAL≤NORMAL≤DEFERRABLE；
+     * expectedVersion 须等于窗口当前版本号。
+     */
+    public record DeclareDroughtRequest(String commandKey, String curtailmentKey, String level,
+                                        Integer essentialPct, Integer normalPct, Integer deferrablePct,
+                                        Long expectedVersion) {
+    }
+
+    /** 旱情削减逐申请明细视图；previousHeld/newHeld 为调整前后持有额度。 */
+    public record DroughtDetailResponse(String allocationKey, String priority, String previousHeld,
+                                        String newHeld) {
+    }
+
+    /** 旱情削减声明视图；windowVersion 为本次生效后的窗口版本号。 */
+    public record DroughtResponse(long id, String curtailmentKey, long windowId, String level,
+                                  int essentialPct, int normalPct, int deferrablePct, long windowVersion,
+                                  String createdUtc, List<DroughtDetailResponse> details) {
+    }
+
+    /** 窗口当前旱情状态视图；latest 为最近一次声明（含 NONE），从未声明时为 null。 */
+    public record WindowDroughtResponse(long windowId, String level, long version, DroughtResponse latest) {
+    }
+
+    /** 窗口旱情削减历史视图，按声明顺序返回。 */
+    public record DroughtHistoryResponse(long windowId, List<DroughtResponse> curtailments) {
     }
 
     /** 统一错误响应体。 */

@@ -3,14 +3,20 @@ package com.example.starter.water;
 import com.example.starter.water.WaterRepository.AllocationRow;
 import com.example.starter.water.WaterRepository.CommandRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
+import com.example.starter.water.WaterRepository.DroughtDetailRow;
+import com.example.starter.water.WaterRepository.DroughtRow;
 import com.example.starter.water.WaterRepository.TransferRow;
 import com.example.starter.water.WaterRepository.WindowRow;
 import com.example.starter.water.dto.Dtos.AllocationResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
+import com.example.starter.water.dto.Dtos.DroughtDetailResponse;
+import com.example.starter.water.dto.Dtos.DroughtHistoryResponse;
+import com.example.starter.water.dto.Dtos.DroughtResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferResponse;
+import com.example.starter.water.dto.Dtos.WindowDroughtResponse;
 import com.example.starter.water.dto.Dtos.WindowResponse;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
@@ -19,8 +25,10 @@ import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
@@ -41,7 +49,19 @@ public class WaterService {
     static final String STATUS_APPROVED = "APPROVED";
     static final String STATUS_CANCELLED = "CANCELLED";
 
+    static final String LEVEL_NONE = "NONE";
+    static final String LEVEL_1 = "LEVEL1";
+    static final String LEVEL_2 = "LEVEL2";
+    static final String LEVEL_3 = "LEVEL3";
+    static final List<String> LEVELS = List.of(LEVEL_NONE, LEVEL_1, LEVEL_2, LEVEL_3);
+
+    static final String PRIORITY_ESSENTIAL = "ESSENTIAL";
+    static final String PRIORITY_NORMAL = "NORMAL";
+    static final String PRIORITY_DEFERRABLE = "DEFERRABLE";
+    static final List<String> PRIORITIES = List.of(PRIORITY_ESSENTIAL, PRIORITY_NORMAL, PRIORITY_DEFERRABLE);
+
     private static final long NANOS_PER_SECOND = 1_000_000_000L;
+    private static final BigDecimal HUNDRED = new BigDecimal("100");
     private static final Pattern AMOUNT_PATTERN = Pattern.compile("\\d{1,16}(\\.\\d{1,3})?");
     private static final Pattern KEY_PATTERN = Pattern.compile("[\\w.\\-:]{1,128}");
 
@@ -84,9 +104,9 @@ public class WaterService {
         });
     }
 
-    /** 提交配水申请，申请人为 actor。 */
+    /** 提交配水申请，申请人为 actor；priority 缺省 NORMAL。 */
     public AllocationResponse submitAllocation(String commandKey, String allocationKey, Long windowId,
-                                               String userId, String amount, String actor) {
+                                               String userId, String amount, String priority, String actor) {
         requireKey("commandKey", commandKey);
         requireKey("allocationKey", allocationKey);
         requireKey("userId", userId);
@@ -95,14 +115,16 @@ public class WaterService {
             throw ApiException.badRequest("INVALID_ARGUMENT", "windowId 不能为空");
         }
         BigDecimal qty = parseAmount("amount", amount);
+        String normalizedPriority = normalizePriority(priority);
         String params = "ALLOCATION_SUBMIT|" + allocationKey + "|" + windowId + "|" + userId + "|"
-                + qty.toPlainString() + "|" + actor;
+                + qty.toPlainString() + "|" + normalizedPriority + "|" + actor;
         return runCommand("ALLOCATION_SUBMIT", commandKey, params, AllocationResponse.class, () -> {
             WindowRow window = repository.lockWindowById(windowId);
             if (window == null) {
                 throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + windowId);
             }
-            long id = repository.insertAllocation(allocationKey, windowId, userId, qty, actor, nowNanos());
+            repository.insertAllocation(allocationKey, windowId, userId, normalizedPriority, qty, actor,
+                    nowNanos());
             return toAllocationResponse(repository.findAllocationByKey(allocationKey));
         });
     }
@@ -287,6 +309,115 @@ public class WaterService {
         });
     }
 
+    /**
+     * 声明旱情等级：在窗口行锁事务内按优先级比例削减（或回补）全部 APPROVED 申请的当前持有额度。
+     * 目标额度 = 旱情基线持有额度 × (100 - 百分比) / 100，3 位小数 HALF_UP；同级取整差额由
+     * 申请标识升序首笔承担，使该级削减后总量恰好等于该级基线总量的同式取整值。
+     * 升级按最新百分比在基线上重算，降级/恢复 NONE 按基线回补；回补后任一申请超过原申请水量
+     * 或窗口已批准总量超过可用总量则整次 422 且额度不变。
+     */
+    public DroughtResponse declareDrought(String commandKey, String curtailmentKey, long windowId,
+                                          String level, Integer essentialPct, Integer normalPct,
+                                          Integer deferrablePct, Long expectedVersion) {
+        requireKey("commandKey", commandKey);
+        requireKey("curtailmentKey", curtailmentKey);
+        String normalizedLevel = normalizeLevel(level);
+        int essential = requirePct("essentialPct", essentialPct);
+        int normal = requirePct("normalPct", normalPct);
+        int deferrable = requirePct("deferrablePct", deferrablePct);
+        if (!(essential <= normal && normal <= deferrable)) {
+            throw ApiException.unprocessable("RATIO_ORDER_INVALID",
+                    "削减百分比须满足 ESSENTIAL<=NORMAL<=DEFERRABLE");
+        }
+        if (expectedVersion == null) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "expectedVersion 不能为空");
+        }
+        String params = "DROUGHT_DECLARE|" + curtailmentKey + "|" + windowId + "|" + normalizedLevel + "|"
+                + essential + "|" + normal + "|" + deferrable + "|" + expectedVersion;
+        return runCommand("DROUGHT_DECLARE", commandKey, params, DroughtResponse.class, () -> {
+            WindowRow window = repository.lockWindowById(windowId);
+            if (window == null) {
+                throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + windowId);
+            }
+            if (repository.findDroughtByKey(curtailmentKey) != null) {
+                throw ApiException.conflict("DROUGHT_KEY_REUSED",
+                        "curtailmentKey 已被使用: " + curtailmentKey);
+            }
+            if (window.version() != expectedVersion) {
+                throw ApiException.conflict("VERSION_CONFLICT", "expectedVersion " + expectedVersion
+                        + " 与窗口当前版本 " + window.version() + " 不一致");
+            }
+            List<AllocationRow> approved = repository.listApprovedAllocations(windowId);
+            List<BigDecimal> targets = LEVEL_NONE.equals(normalizedLevel)
+                    ? approved.stream().map(AllocationRow::baseHeldAmount).toList()
+                    : curtailTargets(approved, essential, normal, deferrable);
+            // 越界校验：任一申请超过原申请水量，或窗口已批准总量超过可用总量，整次 422 且额度不变
+            BigDecimal newTotal = BigDecimal.ZERO;
+            for (int i = 0; i < approved.size(); i++) {
+                BigDecimal target = targets.get(i);
+                if (target.signum() < 0 || target.compareTo(approved.get(i).amount()) > 0) {
+                    throw ApiException.unprocessable("ALLOCATION_EXCEEDS_AMOUNT",
+                            "调整后申请 " + approved.get(i).allocationKey() + " 持有额度越界: " + fmt(target));
+                }
+                newTotal = newTotal.add(target);
+            }
+            BigDecimal available = availableTotal(window);
+            if (newTotal.compareTo(available) > 0) {
+                throw ApiException.unprocessable("APPROVED_EXCEEDS_AVAILABLE",
+                        "调整后已批准总量 " + fmt(newTotal) + " 将超过可用总量 " + fmt(available));
+            }
+            long now = nowNanos();
+            for (int i = 0; i < approved.size(); i++) {
+                if (approved.get(i).heldAmount().compareTo(targets.get(i)) != 0) {
+                    repository.setHeldAmount(approved.get(i).id(), targets.get(i), now);
+                }
+            }
+            long newVersion = window.version() + 1;
+            repository.updateWindowDrought(windowId, normalizedLevel, newVersion);
+            long droughtId;
+            try {
+                droughtId = repository.insertDrought(curtailmentKey, windowId, normalizedLevel, essential,
+                        normal, deferrable, newVersion, now);
+            } catch (DuplicateKeyException e) {
+                // 并发复用同一 curtailmentKey（换 commandKey）：事务回滚，额度无变化
+                throw ApiException.conflict("DROUGHT_KEY_REUSED",
+                        "curtailmentKey 已被使用: " + curtailmentKey);
+            }
+            List<DroughtDetailResponse> details = new ArrayList<>();
+            for (int i = 0; i < approved.size(); i++) {
+                AllocationRow allocation = approved.get(i);
+                repository.insertDroughtDetail(droughtId, allocation.allocationKey(), allocation.priority(),
+                        allocation.heldAmount(), targets.get(i));
+                details.add(new DroughtDetailResponse(allocation.allocationKey(), allocation.priority(),
+                        fmt(allocation.heldAmount()), fmt(targets.get(i))));
+            }
+            return new DroughtResponse(droughtId, curtailmentKey, windowId, normalizedLevel, essential,
+                    normal, deferrable, newVersion, toIso(now), details);
+        });
+    }
+
+    /** 查询窗口当前旱情等级、版本号与最近一次声明（含明细）。 */
+    public WindowDroughtResponse getWindowDrought(long windowId) {
+        WindowRow window = repository.findWindowById(windowId);
+        if (window == null) {
+            throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + windowId);
+        }
+        DroughtRow latest = repository.findLatestDrought(windowId);
+        return new WindowDroughtResponse(windowId, window.droughtLevel(), window.version(),
+                latest == null ? null : toDroughtResponse(latest));
+    }
+
+    /** 查询窗口全部旱情削减声明历史（含明细），按声明顺序返回。 */
+    public DroughtHistoryResponse getDroughtHistory(long windowId) {
+        WindowRow window = repository.findWindowById(windowId);
+        if (window == null) {
+            throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + windowId);
+        }
+        List<DroughtResponse> curtailments = repository.listDroughts(windowId).stream()
+                .map(this::toDroughtResponse).toList();
+        return new DroughtHistoryResponse(windowId, curtailments);
+    }
+
     /** 查询窗口当前可用容量。 */
     public CapacityResponse getCapacity(long windowId) {
         WindowRow window = repository.findWindowById(windowId);
@@ -298,10 +429,10 @@ public class WaterService {
         BigDecimal approved = repository.sumApprovedAmount(windowId);
         return new CapacityResponse(window.id(), fmt(window.plannedVolume()),
                 active != null ? fmt(active.volume()) : null, fmt(available), fmt(approved),
-                fmt(available.subtract(approved)));
+                fmt(available.subtract(approved)), window.droughtLevel());
     }
 
-    /** 查询窗口历史明细：窗口 + 全部申请 + 全部限供。 */
+    /** 查询窗口历史明细：窗口 + 全部申请 + 全部限供 + 全部旱情削减声明。 */
     public HistoryResponse getHistory(long windowId) {
         WindowRow window = repository.findWindowById(windowId);
         if (window == null) {
@@ -312,7 +443,9 @@ public class WaterService {
                 .map(this::toAllocationResponse).toList();
         List<CurtailmentResponse> curtailments = repository.listCurtailments(windowId).stream()
                 .map(this::toCurtailmentResponse).toList();
-        return new HistoryResponse(toWindowResponse(window, active), allocations, curtailments);
+        List<DroughtResponse> droughts = repository.listDroughts(windowId).stream()
+                .map(this::toDroughtResponse).toList();
+        return new HistoryResponse(toWindowResponse(window, active), allocations, curtailments, droughts);
     }
 
     // ------------------------------------------------------------------
@@ -373,12 +506,13 @@ public class WaterService {
         BigDecimal available = active != null ? active.volume() : row.plannedVolume();
         return new WindowResponse(row.id(), row.windowKey(), row.channelId(), toIso(row.startNanos()),
                 toIso(row.endNanos()), fmt(row.plannedVolume()),
-                active != null ? fmt(active.volume()) : null, fmt(available), toIso(row.createdNanos()));
+                active != null ? fmt(active.volume()) : null, fmt(available), row.droughtLevel(),
+                row.version(), toIso(row.createdNanos()));
     }
 
     private AllocationResponse toAllocationResponse(AllocationRow row) {
-        return new AllocationResponse(row.allocationKey(), row.windowId(), row.userId(), fmt(row.amount()),
-                fmt(row.heldAmount()), row.requester(), row.status(),
+        return new AllocationResponse(row.allocationKey(), row.windowId(), row.userId(), row.priority(),
+                fmt(row.amount()), fmt(row.heldAmount()), row.requester(), row.status(),
                 toIso(row.createdNanos()), toIso(row.updatedNanos()));
     }
 
@@ -390,6 +524,93 @@ public class WaterService {
     private CurtailmentResponse toCurtailmentResponse(CurtailmentRow row) {
         return new CurtailmentResponse(row.id(), row.windowId(), fmt(row.volume()), row.status(),
                 toIso(row.createdNanos()), row.cancelledNanos() == null ? null : toIso(row.cancelledNanos()));
+    }
+
+    private DroughtResponse toDroughtResponse(DroughtRow row) {
+        List<DroughtDetailResponse> details = repository.listDroughtDetails(row.id()).stream()
+                .map(d -> new DroughtDetailResponse(d.allocationKey(), d.priority(),
+                        fmt(d.previousHeld()), fmt(d.newHeld())))
+                .toList();
+        return new DroughtResponse(row.id(), row.curtailmentKey(), row.windowId(), row.level(),
+                row.essentialPct(), row.normalPct(), row.deferrablePct(), row.windowVersion(),
+                toIso(row.createdNanos()), details);
+    }
+
+    /** 旱情目标额度：基线 × (100 - 百分比) / 100，3 位小数 HALF_UP。 */
+    static BigDecimal curtailTarget(BigDecimal base, int pct) {
+        return base.multiply(BigDecimal.valueOf(100L - pct)).divide(HUNDRED, 3, RoundingMode.HALF_UP);
+    }
+
+    /**
+     * 计算各 APPROVED 申请削减后持有额度：逐笔按优先级比例取整后，同级总量与
+     * 该级基线总量同式取整值的差额由该级申请标识升序首笔承担（输入已按申请标识升序）。
+     */
+    static List<BigDecimal> curtailTargets(List<AllocationRow> approved, int essentialPct, int normalPct,
+                                           int deferrablePct) {
+        List<BigDecimal> targets = new ArrayList<>(approved.size());
+        for (AllocationRow allocation : approved) {
+            targets.add(curtailTarget(allocation.baseHeldAmount(),
+                    pctOf(allocation.priority(), essentialPct, normalPct, deferrablePct)));
+        }
+        for (String priority : PRIORITIES) {
+            int pct = pctOf(priority, essentialPct, normalPct, deferrablePct);
+            BigDecimal levelBase = BigDecimal.ZERO;
+            BigDecimal levelSum = BigDecimal.ZERO;
+            int first = -1;
+            for (int i = 0; i < approved.size(); i++) {
+                if (!priority.equals(approved.get(i).priority())) {
+                    continue;
+                }
+                if (first < 0) {
+                    first = i;
+                }
+                levelBase = levelBase.add(approved.get(i).baseHeldAmount());
+                levelSum = levelSum.add(targets.get(i));
+            }
+            if (first < 0) {
+                continue;
+            }
+            BigDecimal delta = curtailTarget(levelBase, pct).subtract(levelSum);
+            if (delta.signum() != 0) {
+                targets.set(first, targets.get(first).add(delta));
+            }
+        }
+        return targets;
+    }
+
+    private static int pctOf(String priority, int essentialPct, int normalPct, int deferrablePct) {
+        return switch (priority) {
+            case PRIORITY_ESSENTIAL -> essentialPct;
+            case PRIORITY_DEFERRABLE -> deferrablePct;
+            default -> normalPct;
+        };
+    }
+
+    private static String normalizeLevel(String level) {
+        if (level == null || !LEVELS.contains(level.trim())) {
+            throw ApiException.badRequest("INVALID_ARGUMENT",
+                    "level 必须为 NONE/LEVEL1/LEVEL2/LEVEL3: " + level);
+        }
+        return level.trim();
+    }
+
+    private static String normalizePriority(String priority) {
+        if (priority == null || priority.isBlank()) {
+            return PRIORITY_NORMAL;
+        }
+        String trimmed = priority.trim();
+        if (!PRIORITIES.contains(trimmed)) {
+            throw ApiException.badRequest("INVALID_ARGUMENT",
+                    "priority 必须为 ESSENTIAL/NORMAL/DEFERRABLE: " + priority);
+        }
+        return trimmed;
+    }
+
+    private static int requirePct(String field, Integer pct) {
+        if (pct == null || pct < 0 || pct > 100) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", field + " 必须为 0~100 的整数");
+        }
+        return pct;
     }
 
     static long nowNanos() {

@@ -20,15 +20,18 @@ import java.util.Objects;
 @Repository
 public class WaterRepository {
 
-    /** 供水窗口行。 */
+    /** 供水窗口行；droughtLevel 为当前旱情等级，version 为旱情乐观校验版本号。 */
     public record WindowRow(long id, String windowKey, String channelId, long startNanos, long endNanos,
-                            BigDecimal plannedVolume, long createdNanos) {
+                            BigDecimal plannedVolume, String droughtLevel, long version, long createdNanos) {
     }
 
-    /** 配水申请行；amount 为不可改写的原申请水量，heldAmount 为当前持有额度。 */
-    public record AllocationRow(long id, String allocationKey, long windowId, String userId, BigDecimal amount,
-                                BigDecimal heldAmount, String requester, String status,
-                                long createdNanos, long updatedNanos) {
+    /**
+     * 配水申请行；amount 为不可改写的原申请水量，heldAmount 为当前持有额度，
+     * baseHeldAmount 为旱情削减前持有额度基线（旱情削减不改写）。
+     */
+    public record AllocationRow(long id, String allocationKey, long windowId, String userId, String priority,
+                                BigDecimal amount, BigDecimal heldAmount, BigDecimal baseHeldAmount,
+                                String requester, String status, long createdNanos, long updatedNanos) {
     }
 
     /** 转让流水行，创建后不可变。 */
@@ -41,25 +44,41 @@ public class WaterRepository {
                                  Long cancelledNanos) {
     }
 
+    /** 旱情削减声明行，创建后不可变。 */
+    public record DroughtRow(long id, String curtailmentKey, long windowId, String level, int essentialPct,
+                             int normalPct, int deferrablePct, long windowVersion, long createdNanos) {
+    }
+
+    /** 旱情削减逐申请明细行，创建后不可变。 */
+    public record DroughtDetailRow(long id, long curtailmentId, String allocationKey, String priority,
+                                   BigDecimal previousHeld, BigDecimal newHeld) {
+    }
+
     /** 幂等命令行；response 为 null 表示响应尚未写回（同事务内）。 */
     public record CommandRow(String commandKey, String operation, String params, String response,
                              long createdNanos) {
     }
 
+    private static final String WINDOW_SELECT =
+            "SELECT id, window_key, channel_id, start_nanos, end_nanos, planned_volume, drought_level, version,"
+                    + " created_nanos";
+
     private static final RowMapper<WindowRow> WINDOW_MAPPER = (rs, n) -> new WindowRow(
             rs.getLong("id"), rs.getString("window_key"), rs.getString("channel_id"),
             rs.getLong("start_nanos"), rs.getLong("end_nanos"),
-            rs.getBigDecimal("planned_volume"), rs.getLong("created_nanos"));
+            rs.getBigDecimal("planned_volume"), rs.getString("drought_level"), rs.getLong("version"),
+            rs.getLong("created_nanos"));
 
     private static final RowMapper<AllocationRow> ALLOCATION_MAPPER = (rs, n) -> new AllocationRow(
             rs.getLong("id"), rs.getString("allocation_key"), rs.getLong("window_id"),
-            rs.getString("user_id"), rs.getBigDecimal("amount"), rs.getBigDecimal("held_amount"),
+            rs.getString("user_id"), rs.getString("priority"),
+            rs.getBigDecimal("amount"), rs.getBigDecimal("held_amount"), rs.getBigDecimal("base_held_amount"),
             rs.getString("requester"), rs.getString("status"),
             rs.getLong("created_nanos"), rs.getLong("updated_nanos"));
 
     private static final String ALLOCATION_SELECT =
-            "SELECT id, allocation_key, window_id, user_id, amount, held_amount, requester, status,"
-                    + " created_nanos, updated_nanos";
+            "SELECT id, allocation_key, window_id, user_id, priority, amount, held_amount, base_held_amount,"
+                    + " requester, status, created_nanos, updated_nanos";
 
     private static final RowMapper<TransferRow> TRANSFER_MAPPER = (rs, n) -> new TransferRow(
             rs.getLong("id"), rs.getString("transfer_key"), rs.getLong("window_id"),
@@ -70,6 +89,19 @@ public class WaterRepository {
             rs.getLong("id"), rs.getLong("window_id"), rs.getBigDecimal("volume"), rs.getString("status"),
             rs.getLong("created_nanos"),
             rs.getObject("cancelled_nanos") == null ? null : rs.getLong("cancelled_nanos"));
+
+    private static final RowMapper<DroughtRow> DROUGHT_MAPPER = (rs, n) -> new DroughtRow(
+            rs.getLong("id"), rs.getString("curtailment_key"), rs.getLong("window_id"), rs.getString("level"),
+            rs.getInt("essential_pct"), rs.getInt("normal_pct"), rs.getInt("deferrable_pct"),
+            rs.getLong("window_version"), rs.getLong("created_nanos"));
+
+    private static final String DROUGHT_SELECT =
+            "SELECT id, curtailment_key, window_id, level, essential_pct, normal_pct, deferrable_pct,"
+                    + " window_version, created_nanos";
+
+    private static final RowMapper<DroughtDetailRow> DROUGHT_DETAIL_MAPPER = (rs, n) -> new DroughtDetailRow(
+            rs.getLong("id"), rs.getLong("curtailment_id"), rs.getString("allocation_key"),
+            rs.getString("priority"), rs.getBigDecimal("previous_held"), rs.getBigDecimal("new_held"));
 
     private static final RowMapper<CommandRow> COMMAND_MAPPER = (rs, n) -> new CommandRow(
             rs.getString("command_key"), rs.getString("operation"), rs.getString("params"),
@@ -103,23 +135,26 @@ public class WaterRepository {
     /** 按主键查询窗口，不存在返回 null。 */
     public WindowRow findWindowById(long id) {
         try {
-            return jdbc.queryForObject(
-                    "SELECT id, window_key, channel_id, start_nanos, end_nanos, planned_volume, created_nanos"
-                            + " FROM supply_window WHERE id = ?", WINDOW_MAPPER, id);
+            return jdbc.queryForObject(WINDOW_SELECT + " FROM supply_window WHERE id = ?", WINDOW_MAPPER, id);
         } catch (EmptyResultDataAccessException e) {
             return null;
         }
     }
 
-    /** 按主键锁定窗口行（FOR UPDATE），用于串行化批准与限供。 */
+    /** 按主键锁定窗口行（FOR UPDATE），用于串行化批准、限供与旱情等级变更。 */
     public WindowRow lockWindowById(long id) {
         try {
-            return jdbc.queryForObject(
-                    "SELECT id, window_key, channel_id, start_nanos, end_nanos, planned_volume, created_nanos"
-                            + " FROM supply_window WHERE id = ? FOR UPDATE", WINDOW_MAPPER, id);
+            return jdbc.queryForObject(WINDOW_SELECT + " FROM supply_window WHERE id = ? FOR UPDATE",
+                    WINDOW_MAPPER, id);
         } catch (EmptyResultDataAccessException e) {
             return null;
         }
+    }
+
+    /** 旱情等级变更：更新当前等级并递增版本号。 */
+    public void updateWindowDrought(long id, String droughtLevel, long newVersion) {
+        jdbc.update("UPDATE supply_window SET drought_level = ?, version = ? WHERE id = ?",
+                droughtLevel, newVersion, id);
     }
 
     /** 判断同渠道是否存在与 [startNanos, endNanos) 重叠的窗口（相邻合法）。 */
@@ -131,20 +166,23 @@ public class WaterRepository {
     }
 
     /** 插入申请（初始 REQUESTED）并返回主键。 */
-    public long insertAllocation(String allocationKey, long windowId, String userId, BigDecimal amount,
-                                 String requester, long nowNanos) {
+    public long insertAllocation(String allocationKey, long windowId, String userId, String priority,
+                                 BigDecimal amount, String requester, long nowNanos) {
         KeyHolder keys = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO allocation (allocation_key, window_id, user_id, amount, held_amount, requester, status, created_nanos, updated_nanos)"
-                            + " VALUES (?, ?, ?, ?, 0, ?, 'REQUESTED', ?, ?)", Statement.RETURN_GENERATED_KEYS);
+                    "INSERT INTO allocation (allocation_key, window_id, user_id, priority, amount, held_amount,"
+                            + " base_held_amount, requester, status, created_nanos, updated_nanos)"
+                            + " VALUES (?, ?, ?, ?, ?, 0, 0, ?, 'REQUESTED', ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, allocationKey);
             ps.setLong(2, windowId);
             ps.setString(3, userId);
-            ps.setBigDecimal(4, amount);
-            ps.setString(5, requester);
-            ps.setLong(6, nowNanos);
+            ps.setString(4, priority);
+            ps.setBigDecimal(5, amount);
+            ps.setString(6, requester);
             ps.setLong(7, nowNanos);
+            ps.setLong(8, nowNanos);
             return ps;
         }, keys);
         return Objects.requireNonNull(keys.getKey()).longValue();
@@ -172,20 +210,37 @@ public class WaterRepository {
     }
 
     /**
-     * 更新申请状态与变更时间，并同步持有额度：批准时持有额度等于原申请水量，取消时归零，
-     * REQUESTED 保持当前持有额度不变。
+     * 更新申请状态与变更时间，并同步持有额度及其旱情基线：批准时两者都等于原申请水量，
+     * 取消时两者归零，REQUESTED 保持不变。
      */
     public void updateAllocationStatus(long id, String status, long updatedNanos) {
         jdbc.update("UPDATE allocation SET status = ?, updated_nanos = ?,"
                 + " held_amount = CASE WHEN ? = 'APPROVED' THEN amount WHEN ? = 'CANCELLED' THEN 0"
-                + " ELSE held_amount END WHERE id = ?",
-                status, updatedNanos, status, status, id);
+                + " ELSE held_amount END,"
+                + " base_held_amount = CASE WHEN ? = 'APPROVED' THEN amount WHEN ? = 'CANCELLED' THEN 0"
+                + " ELSE base_held_amount END WHERE id = ?",
+                status, updatedNanos, status, status, status, status, id);
     }
 
-    /** 转让扣减源持有额度（不得为负由事务内校验保证）并记录变更时间。 */
+    /** 转让扣减源持有额度及其旱情基线（不得为负由事务内校验保证）并记录变更时间。 */
     public void decrementHeldAmount(long id, BigDecimal delta, long updatedNanos) {
-        jdbc.update("UPDATE allocation SET held_amount = held_amount - ?, updated_nanos = ? WHERE id = ?",
-                delta, updatedNanos, id);
+        jdbc.update("UPDATE allocation SET held_amount = held_amount - ?,"
+                + " base_held_amount = base_held_amount - ?, updated_nanos = ? WHERE id = ?",
+                delta, delta, updatedNanos, id);
+    }
+
+    /** 旱情削减/回补：仅调整当前持有额度（不改写基线与原申请水量）并记录变更时间。 */
+    public void setHeldAmount(long id, BigDecimal newHeld, long updatedNanos) {
+        jdbc.update("UPDATE allocation SET held_amount = ?, updated_nanos = ? WHERE id = ?",
+                newHeld, updatedNanos, id);
+    }
+
+    /** 窗口全部 APPROVED 申请，按申请业务键升序（旱情同级取整差额由首笔承担）。 */
+    public List<AllocationRow> listApprovedAllocations(long windowId) {
+        return jdbc.query(
+                ALLOCATION_SELECT + " FROM allocation WHERE window_id = ? AND status = 'APPROVED'"
+                        + " ORDER BY allocation_key",
+                ALLOCATION_MAPPER, windowId);
     }
 
     /** 窗口当前所有 APPROVED 申请的当前持有额度之和（BigDecimal 精确求和），无则 0。 */
@@ -303,5 +358,78 @@ public class WaterRepository {
     /** 写回命令首次成功响应。 */
     public void updateCommandResponse(String commandKey, String response) {
         jdbc.update("UPDATE command_log SET response = ? WHERE command_key = ?", response, commandKey);
+    }
+
+    /** 插入旱情削减声明并返回主键。 */
+    public long insertDrought(String curtailmentKey, long windowId, String level, int essentialPct,
+                              int normalPct, int deferrablePct, long windowVersion, long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO drought_curtailment (curtailment_key, window_id, level, essential_pct,"
+                            + " normal_pct, deferrable_pct, window_version, created_nanos)"
+                            + " VALUES (?, ?, ?, ?, ?, ?, ?, ?)", Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, curtailmentKey);
+            ps.setLong(2, windowId);
+            ps.setString(3, level);
+            ps.setInt(4, essentialPct);
+            ps.setInt(5, normalPct);
+            ps.setInt(6, deferrablePct);
+            ps.setLong(7, windowVersion);
+            ps.setLong(8, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 按业务键查询旱情削减声明，不存在返回 null。 */
+    public DroughtRow findDroughtByKey(String curtailmentKey) {
+        try {
+            return jdbc.queryForObject(DROUGHT_SELECT + " FROM drought_curtailment WHERE curtailment_key = ?",
+                    DROUGHT_MAPPER, curtailmentKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 窗口最近一次旱情削减声明，从未声明返回 null。 */
+    public DroughtRow findLatestDrought(long windowId) {
+        List<DroughtRow> rows = jdbc.query(
+                DROUGHT_SELECT + " FROM drought_curtailment WHERE window_id = ? ORDER BY id DESC LIMIT 1",
+                DROUGHT_MAPPER, windowId);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /** 窗口全部旱情削减声明（含 NONE 恢复），按主键升序。 */
+    public List<DroughtRow> listDroughts(long windowId) {
+        return jdbc.query(DROUGHT_SELECT + " FROM drought_curtailment WHERE window_id = ? ORDER BY id",
+                DROUGHT_MAPPER, windowId);
+    }
+
+    /** 插入旱情削减逐申请明细并返回主键。 */
+    public long insertDroughtDetail(long curtailmentId, String allocationKey, String priority,
+                                    BigDecimal previousHeld, BigDecimal newHeld) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO drought_curtailment_detail (curtailment_id, allocation_key, priority,"
+                            + " previous_held, new_held) VALUES (?, ?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setLong(1, curtailmentId);
+            ps.setString(2, allocationKey);
+            ps.setString(3, priority);
+            ps.setBigDecimal(4, previousHeld);
+            ps.setBigDecimal(5, newHeld);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 某次旱情削减声明的全部明细，按申请业务键升序。 */
+    public List<DroughtDetailRow> listDroughtDetails(long curtailmentId) {
+        return jdbc.query(
+                "SELECT id, curtailment_id, allocation_key, priority, previous_held, new_held"
+                        + " FROM drought_curtailment_detail WHERE curtailment_id = ? ORDER BY allocation_key",
+                DROUGHT_DETAIL_MAPPER, curtailmentId);
     }
 }

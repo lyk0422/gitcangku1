@@ -6,11 +6,15 @@ import com.example.starter.water.dto.Dtos.CommandRequest;
 import com.example.starter.water.dto.Dtos.CreateWindowRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
+import com.example.starter.water.dto.Dtos.DeclareDroughtRequest;
+import com.example.starter.water.dto.Dtos.DroughtHistoryResponse;
+import com.example.starter.water.dto.Dtos.DroughtResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
 import com.example.starter.water.dto.Dtos.SubmitAllocationRequest;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferRequest;
 import com.example.starter.water.dto.Dtos.TransferResponse;
+import com.example.starter.water.dto.Dtos.WindowDroughtResponse;
 import com.example.starter.water.dto.Dtos.WindowResponse;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -46,7 +50,7 @@ public class WaterController {
     public AllocationResponse submitAllocation(@RequestBody SubmitAllocationRequest request,
                                                @RequestHeader("X-Actor-Id") String actor) {
         return service.submitAllocation(request.commandKey(), request.allocationKey(), request.windowId(),
-                request.userId(), request.amount(), actor);
+                request.userId(), request.amount(), request.priority(), actor);
     }
 
     /** 批准配水申请。 */
@@ -102,5 +106,26 @@ public class WaterController {
     @GetMapping("/windows/{windowId}/history")
     public HistoryResponse getHistory(@PathVariable long windowId) {
         return service.getHistory(windowId);
+    }
+
+    /** 声明窗口旱情等级，按优先级比例削减/回补全部已批准申请的持有额度。 */
+    @PostMapping("/windows/{windowId}/drought")
+    public DroughtResponse declareDrought(@PathVariable long windowId,
+                                          @RequestBody DeclareDroughtRequest request) {
+        return service.declareDrought(request.commandKey(), request.curtailmentKey(), windowId,
+                request.level(), request.essentialPct(), request.normalPct(), request.deferrablePct(),
+                request.expectedVersion());
+    }
+
+    /** 查询窗口当前旱情等级、版本号与最近一次声明（含明细）。 */
+    @GetMapping("/windows/{windowId}/drought")
+    public WindowDroughtResponse getWindowDrought(@PathVariable long windowId) {
+        return service.getWindowDrought(windowId);
+    }
+
+    /** 查询窗口旱情削减历史（含逐申请明细）。 */
+    @GetMapping("/windows/{windowId}/drought/history")
+    public DroughtHistoryResponse getDroughtHistory(@PathVariable long windowId) {
+        return service.getDroughtHistory(windowId);
     }
 }
