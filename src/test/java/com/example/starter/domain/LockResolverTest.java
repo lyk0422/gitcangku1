@@ -183,4 +183,129 @@ class LockResolverTest {
         assertThat(result).isNotNull();
         assertThat(result.keySet()).containsExactly("alib", "root", "zlib");
     }
+
+    // ------------------------------------------------------------------
+    // resolveDetailed：与 resolve 算法一致，并给出不可行阻塞明细
+    // ------------------------------------------------------------------
+
+    @Test
+    void detailedFeasibleResultMatchesResolve() {
+        // 需要回溯的场景：两种入口必须给出完全一致的可行解。
+        RepositorySnapshot s = snapshot(0,
+                "app", List.of(v(1, dep("b", 1, 2), dep("c", 1, 1))),
+                "b", List.of(v(2, dep("c", 2, 2)), v(1)),
+                "c", List.of(v(1)));
+
+        LockResolver.Resolution detailed = LockResolver.resolveDetailed(s, "app", 1);
+        assertThat(detailed.feasible()).isTrue();
+        assertThat(detailed.solution()).isEqualTo(LockResolver.resolve(s, "app", 1));
+        assertThat(detailed.blockers()).isEmpty();
+    }
+
+    @Test
+    void detailedInfeasibleReportsMissingVersions() {
+        // app -> b[2,3]，仓库只有 b1：b2、b3 缺失。
+        RepositorySnapshot s = snapshot(0,
+                "app", List.of(v(1, dep("b", 2, 3))),
+                "b", List.of(v(1)));
+
+        LockResolver.Resolution detailed = LockResolver.resolveDetailed(s, "app", 1);
+        assertThat(detailed.feasible()).isFalse();
+        assertThat(LockResolver.resolve(s, "app", 1)).isNull();
+        assertThat(detailed.blockers()).containsExactly(
+                new LockResolver.Blocker("b", LockResolver.REASON_MISSING_VERSION,
+                        2, 3, List.of(2, 3)));
+    }
+
+    @Test
+    void detailedInfeasibleReportsWithdrawnVersions() {
+        // app -> b[1,2]，b2/b1 均已撤回。
+        RepositorySnapshot s = snapshot(0,
+                "app", List.of(v(1, dep("b", 1, 2))),
+                "b", List.of(w(2), w(1)));
+
+        LockResolver.Resolution detailed = LockResolver.resolveDetailed(s, "app", 1);
+        assertThat(detailed.feasible()).isFalse();
+        assertThat(detailed.blockers()).containsExactly(
+                new LockResolver.Blocker("b", LockResolver.REASON_VERSION_WITHDRAWN,
+                        1, 2, List.of(1, 2)));
+    }
+
+    @Test
+    void detailedInfeasibleReportsMissingDependencyName() {
+        // 依赖名称从未登记：区间内版本整体缺失。
+        RepositorySnapshot s = snapshot(0,
+                "app", List.of(v(1, dep("ghost", 1, 1))));
+
+        LockResolver.Resolution detailed = LockResolver.resolveDetailed(s, "app", 1);
+        assertThat(detailed.feasible()).isFalse();
+        assertThat(detailed.blockers()).containsExactly(
+                new LockResolver.Blocker("ghost", LockResolver.REASON_MISSING_VERSION,
+                        1, 1, List.of(1)));
+    }
+
+    @Test
+    void detailedInfeasibleReportsEmptyRangeIntersection() {
+        // app -> a[1,1] 且 b[1,1]；a1 -> c[1,1]，b1 -> c[3,3]：已选制品对 c 的区间交集为空。
+        RepositorySnapshot s = snapshot(0,
+                "app", List.of(v(1, dep("a", 1, 1), dep("b", 1, 1))),
+                "a", List.of(v(1, dep("c", 1, 1))),
+                "b", List.of(v(1, dep("c", 3, 3))),
+                "c", List.of(v(2)));
+
+        LockResolver.Resolution detailed = LockResolver.resolveDetailed(s, "app", 1);
+        assertThat(detailed.feasible()).isFalse();
+        assertThat(detailed.blockers())
+                .anySatisfy(blocker -> {
+                    assertThat(blocker.name()).isEqualTo("c");
+                    assertThat(blocker.reason()).isEqualTo(LockResolver.REASON_RANGE_UNSATISFIABLE);
+                });
+    }
+
+    @Test
+    void detailedBlockersAreDeduplicatedAcrossBranches() {
+        // app -> a[1,2]；a1/a2 均 -> c[2,2]；c 只有 c1：两个分支都在 c 上失败，阻塞项去重为一个。
+        RepositorySnapshot s = snapshot(0,
+                "app", List.of(v(1, dep("a", 1, 2))),
+                "a", List.of(v(2, dep("c", 2, 2)), v(1, dep("c", 2, 2))),
+                "c", List.of(v(1)));
+
+        LockResolver.Resolution detailed = LockResolver.resolveDetailed(s, "app", 1);
+        assertThat(detailed.feasible()).isFalse();
+        assertThat(detailed.blockers()).containsExactly(
+                new LockResolver.Blocker("c", LockResolver.REASON_MISSING_VERSION,
+                        2, 2, List.of(2)));
+    }
+
+    @Test
+    void detailedBlockersAreSortedByNameAcrossIndependentFailures() {
+        // app -> a[1,2]；a2 -> d[2,2]，a1 -> c[2,2]；c/d 只有 1：两个独立失败按名称升序输出。
+        RepositorySnapshot s = snapshot(0,
+                "app", List.of(v(1, dep("a", 1, 2))),
+                "a", List.of(v(2, dep("d", 2, 2)), v(1, dep("c", 2, 2))),
+                "c", List.of(v(1)),
+                "d", List.of(v(1)));
+
+        LockResolver.Resolution detailed = LockResolver.resolveDetailed(s, "app", 1);
+        assertThat(detailed.feasible()).isFalse();
+        assertThat(detailed.blockers()).containsExactly(
+                new LockResolver.Blocker("c", LockResolver.REASON_MISSING_VERSION,
+                        2, 2, List.of(2)),
+                new LockResolver.Blocker("d", LockResolver.REASON_MISSING_VERSION,
+                        2, 2, List.of(2)));
+    }
+
+    @Test
+    void detailedInfeasibleCycleReportsNoFeasibleCandidate() {
+        // 环冲突：a1 存在且未撤回，但其对 app 的区间与固定根版本冲突。
+        RepositorySnapshot s = snapshot(0,
+                "app", List.of(v(1, dep("a", 1, 1)), v(2)),
+                "a", List.of(v(1, dep("app", 2, 2))));
+
+        LockResolver.Resolution detailed = LockResolver.resolveDetailed(s, "app", 1);
+        assertThat(detailed.feasible()).isFalse();
+        assertThat(detailed.blockers()).containsExactly(
+                new LockResolver.Blocker("a", LockResolver.REASON_NO_FEASIBLE_CANDIDATE,
+                        1, 1, List.of(1)));
+    }
 }

@@ -4,6 +4,8 @@ import com.example.starter.api.dto.ArtifactResponse;
 import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
 import com.example.starter.api.dto.RegisterArtifactRequest;
+import com.example.starter.api.dto.ReresolveReportResponse;
+import com.example.starter.api.dto.ReresolveRequest;
 
 import java.util.List;
 
@@ -26,4 +28,13 @@ public interface ArtifactService {
 
     /** 按 ID 查询单个锁文件，不存在返回 null。 */
     LockFileResponse getLock(long id);
+
+    /** 重解析已有锁文件并固化不可变报告（reresolveKey 幂等）。 */
+    ReresolveReportResponse reresolveLock(String reresolveKey, ReresolveRequest request);
+
+    /** 按 ID 查询重解析报告，不存在抛 404。 */
+    ReresolveReportResponse getReresolveReport(long id);
+
+    /** 查询某锁文件的全部重解析报告，按报告 ID 升序。 */
+    List<ReresolveReportResponse> listReresolveReports(long lockId);
 }

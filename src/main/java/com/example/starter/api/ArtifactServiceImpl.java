@@ -7,6 +7,9 @@ import com.example.starter.api.dto.LockEntryResponse;
 import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
 import com.example.starter.api.dto.RegisterArtifactRequest;
+import com.example.starter.api.dto.ReresolveDiffResponse;
+import com.example.starter.api.dto.ReresolveReportResponse;
+import com.example.starter.api.dto.ReresolveRequest;
 import com.example.starter.domain.ArtifactVersion;
 import com.example.starter.domain.DependencyRange;
 import com.example.starter.domain.LockResolver;
@@ -15,6 +18,7 @@ import com.example.starter.repo.RepositoryDao;
 import com.example.starter.repo.RepositoryDao.IdempotentRecord;
 import com.example.starter.repo.RepositoryDao.LockEntryRow;
 import com.example.starter.repo.RepositoryDao.LockFileRow;
+import com.example.starter.repo.RepositoryDao.ReresolveReportRow;
 import com.example.starter.support.ApiException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
@@ -26,12 +30,14 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.function.Supplier;
 
 /**
@@ -49,6 +55,21 @@ public class ArtifactServiceImpl implements ArtifactService {
     private static final String OP_REGISTER = "REGISTER_ARTIFACT";
     private static final String OP_WITHDRAW = "WITHDRAW_ARTIFACT";
     private static final String OP_LOCK = "CREATE_LOCK";
+    private static final String OP_RERESOLVE = "RERESOLVE_LOCK";
+
+    /** 重解析结论：新解析集合与原锁文件逐名称逐版本一致。 */
+    static final String CONCLUSION_REPRODUCIBLE = "REPRODUCIBLE";
+    /** 重解析结论：可行但存在差异。 */
+    static final String CONCLUSION_DRIFTED = "DRIFTED";
+    /** 重解析结论：没有任何可行组合。 */
+    static final String CONCLUSION_INFEASIBLE = "INFEASIBLE";
+
+    /** 漂移原因：原候选被撤回。 */
+    static final String DRIFT_WITHDRAWN = "WITHDRAWN";
+    /** 漂移原因：被更高版本取代。 */
+    static final String DRIFT_SUPERSEDED = "SUPERSEDED";
+    /** 漂移原因：依赖区间不再满足（含新增/移除：原解析的依赖闭包已不匹配当前约束）。 */
+    static final String DRIFT_RANGE_NOT_SATISFIED = "RANGE_NOT_SATISFIED";
 
     private final RepositoryDao repositoryDao;
     private final TransactionTemplate transactionTemplate;
@@ -116,6 +137,38 @@ public class ArtifactServiceImpl implements ArtifactService {
         return toLockResponse(row, repositoryDao.listLockEntries(id));
     }
 
+    @Override
+    public ReresolveReportResponse reresolveLock(String reresolveKey, ReresolveRequest request) {
+        if (reresolveKey == null || reresolveKey.isBlank()) {
+            throw ApiException.badRequest("缺少请求头 X-Reresolve-Key");
+        }
+        if (request.lockId() == null || request.expectedRepositoryVersion() == null) {
+            throw ApiException.badRequest("lockId 与 expectedRepositoryVersion 不能为空");
+        }
+        String hash = sha256(OP_RERESOLVE + "|" + request.lockId()
+                + "|" + request.expectedRepositoryVersion());
+        return executeIdempotent(reresolveKey, OP_RERESOLVE, hash, 201,
+                () -> doReresolve(request), ReresolveReportResponse.class);
+    }
+
+    @Override
+    public ReresolveReportResponse getReresolveReport(long id) {
+        ReresolveReportRow row = repositoryDao.getReresolveReport(id);
+        if (row == null) {
+            throw ApiException.notFound("重解析报告不存在: " + id);
+        }
+        return toReportResponse(row);
+    }
+
+    @Override
+    public List<ReresolveReportResponse> listReresolveReports(long lockId) {
+        List<ReresolveReportResponse> result = new ArrayList<>();
+        for (ReresolveReportRow row : repositoryDao.listReresolveReportsByLock(lockId)) {
+            result.add(toReportResponse(row));
+        }
+        return result;
+    }
+
     // ------------------------------------------------------------------
     // 业务操作（运行在已加行锁的写事务内）
     // ------------------------------------------------------------------
@@ -137,7 +190,7 @@ public class ArtifactServiceImpl implements ArtifactService {
                     "制品 " + name + " 的版本数量已达上限 " + MAX_VERSIONS_PER_NAME);
         }
 
-        Instant now = Instant.now(clock);
+        Instant now = now();
         long artifactId = repositoryDao.insertArtifact(name, version, now);
         for (var dep : request.dependencies()) {
             repositoryDao.insertDependency(artifactId, dep.name().trim(),
@@ -164,7 +217,7 @@ public class ArtifactServiceImpl implements ArtifactService {
         }
         long repositoryVersion = repositoryDao.incrementRepositoryVersion();
         return new ArtifactResponse(name, version, true, repositoryVersion,
-                Instant.now(clock), toDependencyViews(artifact.dependencies()));
+                now(), toDependencyViews(artifact.dependencies()));
     }
 
     private LockFileResponse doLock(LockRequest request) {
@@ -193,7 +246,7 @@ public class ArtifactServiceImpl implements ArtifactService {
                     "不存在满足全部依赖区间的未撤回版本组合，无法锁定");
         }
 
-        Instant now = Instant.now(clock);
+        Instant now = now();
         long lockFileId = repositoryDao.insertLockFile(rootName, rootVersion, currentVersion,
                 currentRequestId.get(), now);
         solution.forEach((n, v) -> repositoryDao.insertLockEntry(lockFileId, n, v));
@@ -331,6 +384,14 @@ public class ArtifactServiceImpl implements ArtifactService {
         }
     }
 
+    /**
+     * 当前时间，截断到微秒：与 H2/MySQL TIMESTAMP(6) 的存储精度对齐，
+     * 保证内存返回值与数据库回读值一致。
+     */
+    private Instant now() {
+        return Instant.now(clock).truncatedTo(ChronoUnit.MICROS);
+    }
+
     private String writeJson(Object value) {
         try {
             return objectMapper.writeValueAsString(value);
@@ -360,5 +421,143 @@ public class ArtifactServiceImpl implements ArtifactService {
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException(e);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // 锁文件重解析（运行在已加行锁的写事务内）
+    // ------------------------------------------------------------------
+
+    /**
+     * 在同一事务内基于当前仓库状态重解析锁文件根版本，并固化不可变报告。
+     * 原锁文件不被改写；重解析不推进仓库版本号，也不创建新锁文件。
+     */
+    private ReresolveReportResponse doReresolve(ReresolveRequest request) {
+        // 当前事务已在入口持有 repository_state 行锁；此处读取版本号并做乐观校验。
+        long currentVersion = repositoryDao.lockRepositoryState();
+        if (currentVersion != request.expectedRepositoryVersion()) {
+            throw ApiException.conflict("仓库版本不匹配：expected="
+                    + request.expectedRepositoryVersion() + ", actual=" + currentVersion);
+        }
+
+        LockFileRow lock = repositoryDao.getLockFile(request.lockId());
+        if (lock == null) {
+            throw ApiException.notFound("锁文件不存在: " + request.lockId());
+        }
+        ArtifactVersion root = repositoryDao.loadArtifact(lock.rootName(), lock.rootVersion());
+        if (root == null) {
+            throw ApiException.notFound(
+                    "根制品版本不存在: " + lock.rootName() + ":" + lock.rootVersion());
+        }
+        if (root.withdrawn()) {
+            throw ApiException.unprocessable(
+                    "根制品版本已撤回: " + lock.rootName() + ":" + lock.rootVersion());
+        }
+
+        RepositorySnapshot snapshot = repositoryDao.loadSnapshot();
+        LockResolver.Resolution resolution =
+                LockResolver.resolveDetailed(snapshot, lock.rootName(), lock.rootVersion());
+
+        Map<String, Integer> original = new TreeMap<>();
+        for (LockEntryRow entry : repositoryDao.listLockEntries(lock.id())) {
+            original.put(entry.name(), entry.version());
+        }
+
+        String conclusion;
+        List<LockEntryResponse> entries;
+        List<ReresolveDiffResponse> diffs;
+        if (resolution.feasible()) {
+            Map<String, Integer> solution = resolution.solution();
+            diffs = computeDriftDiffs(original, solution, snapshot);
+            conclusion = diffs.isEmpty() ? CONCLUSION_REPRODUCIBLE : CONCLUSION_DRIFTED;
+            entries = new ArrayList<>();
+            solution.forEach((n, v) -> entries.add(new LockEntryResponse(n, v)));
+        } else {
+            conclusion = CONCLUSION_INFEASIBLE;
+            entries = List.of();
+            diffs = resolution.blockers().stream()
+                    .map(b -> new ReresolveDiffResponse(b.name(), "BLOCKER", b.reason(),
+                            null, null, b.minimumVersion(), b.maximumVersion(), b.versions()))
+                    .toList();
+        }
+
+        Instant now = now();
+        long reportId = repositoryDao.insertReresolveReport(
+                lock.id(), currentVersion, conclusion, currentRequestId.get(), now);
+        for (LockEntryResponse entry : entries) {
+            repositoryDao.insertReresolveReportEntry(reportId, entry.name(), entry.version());
+        }
+        for (ReresolveDiffResponse diff : diffs) {
+            repositoryDao.insertReresolveReportDiff(reportId, diff.name(), diff.changeType(),
+                    diff.reason(), diff.oldVersion(), diff.newVersion(),
+                    diff.minimumVersion(), diff.maximumVersion(), joinVersions(diff.versions()));
+        }
+        return new ReresolveReportResponse(reportId, lock.id(), currentVersion, conclusion,
+                now, entries, diffs);
+    }
+
+    /**
+     * 逐名称比较原锁文件与新解析集合，产出按名称升序的差异明细。
+     *
+     * <p>原因判定：原版本在当前快照中已撤回 → WITHDRAWN；新版本号更高 → SUPERSEDED；
+     * 其余（含新增、移除与降级）→ RANGE_NOT_SATISFIED。
+     */
+    private List<ReresolveDiffResponse> computeDriftDiffs(Map<String, Integer> original,
+                                                          Map<String, Integer> solution,
+                                                          RepositorySnapshot snapshot) {
+        Set<String> names = new HashSet<>();
+        names.addAll(original.keySet());
+        names.addAll(solution.keySet());
+        List<ReresolveDiffResponse> diffs = new ArrayList<>();
+        for (String name : new TreeSet<>(names)) {
+            Integer oldVersion = original.get(name);
+            Integer newVersion = solution.get(name);
+            if (oldVersion == null) {
+                diffs.add(new ReresolveDiffResponse(name, "ADDED", DRIFT_RANGE_NOT_SATISFIED,
+                        null, newVersion, null, null, null));
+            } else if (newVersion == null) {
+                diffs.add(new ReresolveDiffResponse(name, "REMOVED", DRIFT_RANGE_NOT_SATISFIED,
+                        oldVersion, null, null, null, null));
+            } else if (!oldVersion.equals(newVersion)) {
+                String reason;
+                if (isWithdrawn(snapshot, name, oldVersion)) {
+                    reason = DRIFT_WITHDRAWN;
+                } else if (newVersion > oldVersion) {
+                    reason = DRIFT_SUPERSEDED;
+                } else {
+                    reason = DRIFT_RANGE_NOT_SATISFIED;
+                }
+                diffs.add(new ReresolveDiffResponse(name, "CHANGED", reason,
+                        oldVersion, newVersion, null, null, null));
+            }
+        }
+        return List.copyOf(diffs);
+    }
+
+    /** 指定名称版本在当前快照中是否已撤回；版本不存在时视为未撤回。 */
+    private static boolean isWithdrawn(RepositorySnapshot snapshot, String name, int version) {
+        return snapshot.artifacts().getOrDefault(name, List.of()).stream()
+                .anyMatch(a -> a.version() == version && a.withdrawn());
+    }
+
+    private ReresolveReportResponse toReportResponse(ReresolveReportRow row) {
+        List<LockEntryResponse> entries = repositoryDao.listReresolveEntries(row.id()).stream()
+                .map(e -> new LockEntryResponse(e.name(), e.version()))
+                .toList();
+        List<ReresolveDiffResponse> diffs = repositoryDao.listReresolveDiffs(row.id()).stream()
+                .map(d -> new ReresolveDiffResponse(d.name(), d.changeType(), d.reason(),
+                        d.oldVersion(), d.newVersion(), d.minimumVersion(), d.maximumVersion(),
+                        d.versions()))
+                .toList();
+        return new ReresolveReportResponse(row.id(), row.lockFileId(), row.repositoryVersion(),
+                row.conclusion(), row.createdAt(), entries, diffs);
+    }
+
+    /** 版本清单序列化为逗号分隔字符串；null 清单保持 null。 */
+    private static String joinVersions(List<Integer> versions) {
+        if (versions == null) {
+            return null;
+        }
+        return versions.stream().map(String::valueOf)
+                .reduce((a, b) -> a + "," + b).orElse("");
     }
 }

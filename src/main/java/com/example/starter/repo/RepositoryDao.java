@@ -279,4 +279,130 @@ public class RepositoryDao {
 
     private record DepRow(long artifactId, String name, int minimumVersion, int maximumVersion) {
     }
+
+    // ------------------------------------------------------------------
+    // 重解析报告
+    // ------------------------------------------------------------------
+
+    /** 重解析报告行：不含条目与差异明细。 */
+    public record ReresolveReportRow(long id, long lockFileId, long repositoryVersion,
+                                     String conclusion, Instant createdAt) {
+    }
+
+    /** 重解析报告的新解析集合条目行。 */
+    public record ReresolveEntryRow(String name, int version) {
+    }
+
+    /** 重解析报告的差异/阻塞明细行。 */
+    public record ReresolveDiffRow(String name, String changeType, String reason,
+                                   Integer oldVersion, Integer newVersion,
+                                   Integer minimumVersion, Integer maximumVersion,
+                                   List<Integer> versions) {
+    }
+
+    /** 新增重解析报告主记录，返回自增主键。 */
+    public long insertReresolveReport(long lockFileId, long repositoryVersion, String conclusion,
+                                      String reresolveKey, Instant createdAt) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbcTemplate.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO reresolve_report (lock_file_id, repository_version, conclusion, "
+                            + "reresolve_key, created_at) VALUES (?, ?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setLong(1, lockFileId);
+            ps.setLong(2, repositoryVersion);
+            ps.setString(3, conclusion);
+            ps.setString(4, reresolveKey);
+            ps.setTimestamp(5, Timestamp.from(createdAt));
+            return ps;
+        }, keyHolder);
+        Number key = keyHolder.getKey();
+        if (key == null) {
+            throw new IllegalStateException("插入重解析报告未获取自增主键");
+        }
+        return key.longValue();
+    }
+
+    /** 新增重解析报告的新解析集合条目。 */
+    public void insertReresolveReportEntry(long reportId, String name, int version) {
+        jdbcTemplate.update(
+                "INSERT INTO reresolve_report_entry (report_id, name, version) VALUES (?, ?, ?)",
+                reportId, name, version);
+    }
+
+    /** 新增重解析报告的差异/阻塞明细；versions 以逗号分隔存储，null 表示无清单。 */
+    public void insertReresolveReportDiff(long reportId, String name, String changeType, String reason,
+                                          Integer oldVersion, Integer newVersion,
+                                          Integer minimumVersion, Integer maximumVersion,
+                                          String versions) {
+        jdbcTemplate.update(
+                "INSERT INTO reresolve_report_diff (report_id, name, change_type, reason, "
+                        + "old_version, new_version, minimum_version, maximum_version, versions) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                reportId, name, changeType, reason, oldVersion, newVersion,
+                minimumVersion, maximumVersion, versions);
+    }
+
+    /** 按主键查询重解析报告，不存在返回 null。 */
+    public ReresolveReportRow getReresolveReport(long id) {
+        List<ReresolveReportRow> rows = jdbcTemplate.query(
+                "SELECT id, lock_file_id, repository_version, conclusion, created_at "
+                        + "FROM reresolve_report WHERE id = ?",
+                (rs, n) -> new ReresolveReportRow(rs.getLong("id"), rs.getLong("lock_file_id"),
+                        rs.getLong("repository_version"), rs.getString("conclusion"),
+                        rs.getTimestamp("created_at").toInstant()),
+                id);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /** 查询某锁文件的全部重解析报告，按 ID 升序。 */
+    public List<ReresolveReportRow> listReresolveReportsByLock(long lockFileId) {
+        return jdbcTemplate.query(
+                "SELECT id, lock_file_id, repository_version, conclusion, created_at "
+                        + "FROM reresolve_report WHERE lock_file_id = ? ORDER BY id ASC",
+                (rs, n) -> new ReresolveReportRow(rs.getLong("id"), rs.getLong("lock_file_id"),
+                        rs.getLong("repository_version"), rs.getString("conclusion"),
+                        rs.getTimestamp("created_at").toInstant()),
+                lockFileId);
+    }
+
+    /** 查询某报告的新解析集合条目，按名称升序。 */
+    public List<ReresolveEntryRow> listReresolveEntries(long reportId) {
+        return jdbcTemplate.query(
+                "SELECT name, version FROM reresolve_report_entry "
+                        + "WHERE report_id = ? ORDER BY name ASC",
+                (rs, n) -> new ReresolveEntryRow(rs.getString("name"), rs.getInt("version")),
+                reportId);
+    }
+
+    /** 查询某报告的差异/阻塞明细，按名称升序。 */
+    public List<ReresolveDiffRow> listReresolveDiffs(long reportId) {
+        return jdbcTemplate.query(
+                "SELECT name, change_type, reason, old_version, new_version, "
+                        + "minimum_version, maximum_version, versions "
+                        + "FROM reresolve_report_diff WHERE report_id = ? ORDER BY name ASC",
+                (rs, n) -> new ReresolveDiffRow(rs.getString("name"),
+                        rs.getString("change_type"), rs.getString("reason"),
+                        rs.getObject("old_version", Integer.class),
+                        rs.getObject("new_version", Integer.class),
+                        rs.getObject("minimum_version", Integer.class),
+                        rs.getObject("maximum_version", Integer.class),
+                        parseVersions(rs.getString("versions"))),
+                reportId);
+    }
+
+    /** 逗号分隔的版本清单还原为列表；NULL 返回 null（无清单），空串还原为空列表。 */
+    private static List<Integer> parseVersions(String versions) {
+        if (versions == null) {
+            return null;
+        }
+        if (versions.isEmpty()) {
+            return List.of();
+        }
+        List<Integer> result = new ArrayList<>();
+        for (String part : versions.split(",")) {
+            result.add(Integer.valueOf(part));
+        }
+        return result;
+    }
 }

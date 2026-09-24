@@ -4,6 +4,8 @@ import com.example.starter.api.dto.ArtifactResponse;
 import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
 import com.example.starter.api.dto.RegisterArtifactRequest;
+import com.example.starter.api.dto.ReresolveReportResponse;
+import com.example.starter.api.dto.ReresolveRequest;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Positive;
 import org.springframework.http.HttpStatus;
@@ -68,5 +70,26 @@ public class ArtifactController {
     @GetMapping("/locks/{id}")
     public LockFileResponse getLock(@PathVariable long id) {
         return artifactService.getLock(id);
+    }
+
+    /** 重解析已有锁文件并生成不可变报告。 */
+    @PostMapping("/locks/reresolve")
+    public ResponseEntity<ReresolveReportResponse> reresolve(
+            @RequestHeader("X-Reresolve-Key") String reresolveKey,
+            @Valid @RequestBody ReresolveRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(artifactService.reresolveLock(reresolveKey, request));
+    }
+
+    /** 按 ID 查询重解析报告明细。 */
+    @GetMapping("/locks/reresolve-reports/{id}")
+    public ReresolveReportResponse getReresolveReport(@PathVariable long id) {
+        return artifactService.getReresolveReport(id);
+    }
+
+    /** 查询某锁文件的全部重解析报告。 */
+    @GetMapping("/locks/{lockId}/reresolve-reports")
+    public List<ReresolveReportResponse> listReresolveReports(@PathVariable long lockId) {
+        return artifactService.listReresolveReports(lockId);
     }
 }

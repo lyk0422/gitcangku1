@@ -35,6 +35,9 @@ class ArtifactControllerHttpTest {
 
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM reresolve_report_diff");
+        jdbcTemplate.update("DELETE FROM reresolve_report_entry");
+        jdbcTemplate.update("DELETE FROM reresolve_report");
         jdbcTemplate.update("DELETE FROM lock_file_entry");
         jdbcTemplate.update("DELETE FROM lock_file");
         jdbcTemplate.update("DELETE FROM artifact_dependency");
