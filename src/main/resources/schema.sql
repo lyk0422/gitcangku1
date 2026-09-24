@@ -51,3 +51,59 @@ CREATE TABLE IF NOT EXISTS release_record (
     released_at DATETIME(6) NOT NULL COMMENT '放行时间（UTC）',
     KEY idx_release_measurement (measurement_id)
 ) COMMENT='放行历史';
+
+-- 仪器期间核查记录：核查记录不可修改删除；同一仪器同一核查时刻只允许一条。
+CREATE TABLE IF NOT EXISTS interim_check (
+    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY COMMENT '核查记录 ID，自增',
+    check_key VARCHAR(64) NOT NULL COMMENT '核查键，全局唯一，业务幂等键',
+    instrument_id VARCHAR(64) NOT NULL COMMENT '仪器 ID',
+    checked_at DATETIME(6) NOT NULL COMMENT '核查时刻（UTC）',
+    standard_value DECIMAL(38,6) NOT NULL COMMENT '标准值，十进制，最多 6 位小数',
+    measured_value DECIMAL(38,6) NOT NULL COMMENT '实测值，十进制，最多 6 位小数',
+    tolerance DECIMAL(38,6) NOT NULL COMMENT '容差，非负十进制，最多 6 位小数；|标准值-实测值|<=容差判定 PASS',
+    verdict VARCHAR(8) NOT NULL COMMENT '核查判定：PASS=通过，FAIL=失败',
+    checked_by VARCHAR(64) NOT NULL COMMENT '核查人',
+    request_id VARCHAR(64) NOT NULL COMMENT '写操作请求幂等键（requestId），全局唯一',
+    created_at DATETIME(6) NOT NULL COMMENT '记录创建时间（UTC）',
+    CONSTRAINT uk_interim_check_key UNIQUE (check_key),
+    CONSTRAINT uk_interim_check_instrument_time UNIQUE (instrument_id, checked_at),
+    CONSTRAINT uk_interim_check_request UNIQUE (request_id),
+    KEY idx_interim_check_instrument_time (instrument_id, checked_at)
+) COMMENT='仪器期间核查记录';
+
+-- FAIL 核查引入的追溯隔离区间：[range_from, range_to)，左闭右开。
+-- range_from 取该仪器上一条 PASS 核查时刻；此前无 PASS 时取该仪器最早测量时刻。
+CREATE TABLE IF NOT EXISTS isolation_interval (
+    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY COMMENT '隔离区间 ID，自增',
+    check_id BIGINT NOT NULL COMMENT '触发隔离的 FAIL 核查记录 ID',
+    instrument_id VARCHAR(64) NOT NULL COMMENT '仪器 ID',
+    range_from DATETIME(6) NOT NULL COMMENT '区间起点（UTC，左闭，含该时刻）',
+    range_to DATETIME(6) NOT NULL COMMENT '区间终点（UTC，右开，不含该时刻），即 FAIL 核查时刻',
+    resolved_by_check_id BIGINT NULL COMMENT '解除该区间的更晚 PASS 核查记录 ID；NULL 表示仍未解除',
+    resolved_at DATETIME(6) NULL COMMENT '解除时间（UTC）；未解除时为 NULL',
+    created_at DATETIME(6) NOT NULL COMMENT '区间创建时间（UTC）',
+    CONSTRAINT uk_isolation_interval_check UNIQUE (check_id),
+    KEY idx_isolation_interval_instrument (instrument_id, resolved_by_check_id, range_from, range_to)
+) COMMENT='期间核查 FAIL 追溯隔离区间';
+
+-- SUSPECT 标记：FAIL 核查原子标记区间内已放行结果；按“FAIL 核查 × 测量”逐条记录，
+-- 解除时只清除已被更晚 PASS 覆盖且不再被其他未解除 FAIL 覆盖的标记。
+CREATE TABLE IF NOT EXISTS suspect_marking (
+    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY COMMENT 'SUSPECT 标记 ID，自增',
+    check_id BIGINT NOT NULL COMMENT '引入该 SUSPECT 标记的 FAIL 核查记录 ID',
+    measurement_id BIGINT NOT NULL COMMENT '被标记的测量记录 ID',
+    marked_at DATETIME(6) NOT NULL COMMENT '标记时间（UTC）',
+    cleared_by_check_id BIGINT NULL COMMENT '解除该标记的更晚 PASS 核查记录 ID；NULL 表示仍被隔离',
+    cleared_at DATETIME(6) NULL COMMENT '解除时间（UTC）；未解除时为 NULL',
+    CONSTRAINT uk_suspect_check_measurement UNIQUE (check_id, measurement_id),
+    KEY idx_suspect_measurement (measurement_id, cleared_by_check_id),
+    KEY idx_suspect_check (check_id)
+) COMMENT='FAIL 核查引入的 SUSPECT 结果标记';
+
+-- 写操作幂等请求登记：与业务写入同一事务提交；事务回滚（失败）时不占用 requestId。
+CREATE TABLE IF NOT EXISTS check_request (
+    request_id VARCHAR(64) NOT NULL PRIMARY KEY COMMENT '请求幂等键（requestId）',
+    request_hash VARCHAR(64) NOT NULL COMMENT '归一化请求参数的 SHA-256 摘要，用于同参/异参判定',
+    check_key VARCHAR(64) NOT NULL COMMENT '该请求首次生效产生的核查键',
+    created_at DATETIME(6) NOT NULL COMMENT '首次生效时间（UTC）'
+) COMMENT='期间核查写操作幂等请求登记';

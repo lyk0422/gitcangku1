@@ -17,6 +17,7 @@ import com.example.starter.calibration.model.MeasurementStatus;
 import com.example.starter.calibration.repo.CertificateRepository;
 import com.example.starter.calibration.repo.MeasurementRepository;
 import com.example.starter.calibration.repo.ReleaseRepository;
+import com.example.starter.calibration.repo.SuspectMarkingRepository;
 
 /**
  * 测量服务：提交（匹配唯一有效证书并固化计算结果）、历史明细、当前可用结果查询。
@@ -27,13 +28,16 @@ public class MeasurementService {
     private final MeasurementRepository measurements;
     private final CertificateRepository certificates;
     private final ReleaseRepository releases;
+    private final SuspectMarkingRepository suspectMarkings;
 
     public MeasurementService(MeasurementRepository measurements,
                               CertificateRepository certificates,
-                              ReleaseRepository releases) {
+                              ReleaseRepository releases,
+                              SuspectMarkingRepository suspectMarkings) {
         this.measurements = measurements;
         this.certificates = certificates;
         this.releases = releases;
+        this.suspectMarkings = suspectMarkings;
     }
 
     /**
@@ -97,7 +101,8 @@ public class MeasurementService {
         boolean certRevoked = certificates.findById(measurement.certificateId())
                 .map(Certificate::revoked)
                 .orElse(true);
-        return DtoMapper.toResponse(measurement, certRevoked,
+        boolean suspect = suspectMarkings.hasActiveMarking(measurement.id());
+        return DtoMapper.toResponse(measurement, certRevoked, suspect,
                 releases.findByMeasurementId(measurement.id()));
     }
 }

@@ -20,7 +20,8 @@ import java.util.List;
  * @param displayValue   显示值，HALF_UP 4 位小数（十进制字符串）
  * @param passed         是否合格（基于未舍入值，含端点）
  * @param status         状态：PENDING / RELEASED
- * @param usable         当前是否可用（已放行且证书未撤销）
+ * @param suspect        是否仍被未解除 FAIL 核查标记为 SUSPECT（隔离中）
+ * @param usable         当前是否可用（已放行、证书未撤销且未被 SUSPECT 隔离）
  * @param createdAt      提交时间（UTC）
  * @param releases       放行历史
  */
@@ -38,6 +39,7 @@ public record MeasurementResponse(
         String displayValue,
         boolean passed,
         String status,
+        boolean suspect,
         boolean usable,
         Instant createdAt,
         List<ReleaseRecordResponse> releases) {

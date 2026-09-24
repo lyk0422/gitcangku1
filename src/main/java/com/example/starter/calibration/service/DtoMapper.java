@@ -42,8 +42,8 @@ final class DtoMapper {
     }
 
     static MeasurementResponse toResponse(Measurement m, boolean certificateRevoked,
-                                          List<ReleaseRecord> releases) {
-        boolean usable = m.status() == MeasurementStatus.RELEASED && !certificateRevoked;
+                                          boolean suspect, List<ReleaseRecord> releases) {
+        boolean usable = m.status() == MeasurementStatus.RELEASED && !certificateRevoked && !suspect;
         return new MeasurementResponse(
                 m.id(),
                 m.measurementKey(),
@@ -58,6 +58,7 @@ final class DtoMapper {
                 m.displayValue().toPlainString(),
                 m.passed(),
                 m.status().name(),
+                suspect,
                 usable,
                 m.createdAt(),
                 releases.stream().map(DtoMapper::toResponse).toList());
