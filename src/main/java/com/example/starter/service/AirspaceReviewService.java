@@ -1,6 +1,9 @@
 package com.example.starter.service;
 
 import com.example.starter.api.ApiException;
+import com.example.starter.api.dto.EvaluationCandidateDto;
+import com.example.starter.api.dto.EvaluationRequest;
+import com.example.starter.api.dto.EvaluationResultDto;
 import com.example.starter.api.dto.MutationResponse;
 import com.example.starter.api.dto.ReviewRequest;
 import com.example.starter.api.dto.ReviewResultDto;
@@ -17,6 +20,9 @@ import com.example.starter.domain.ReviewConclusion;
 import com.example.starter.domain.ZoneStatus;
 import com.example.starter.repo.AirspaceRepository;
 import com.example.starter.repo.DedupPo;
+import com.example.starter.repo.EvaluationCandidatePo;
+import com.example.starter.repo.EvaluationPo;
+import com.example.starter.repo.EvaluationRepository;
 import com.example.starter.repo.ReviewPo;
 import com.example.starter.repo.ReviewRepository;
 import com.example.starter.repo.RoutePo;
@@ -64,10 +70,12 @@ public class AirspaceReviewService {
     static final String KIND_ROUTE_CREATE = "ROUTE_CREATE";
     static final String KIND_ROUTE_REPLACE = "ROUTE_REPLACE";
     static final String KIND_REVIEW = "REVIEW";
+    static final String KIND_EVALUATION = "EVALUATION";
 
     private final AirspaceRepository airspaceRepo;
     private final RouteRepository routeRepo;
     private final ReviewRepository reviewRepo;
+    private final EvaluationRepository evaluationRepo;
     private final ObjectMapper objectMapper;
     private final Clock clock;
     private final TransactionTemplate txTemplate;
@@ -75,12 +83,14 @@ public class AirspaceReviewService {
     public AirspaceReviewService(AirspaceRepository airspaceRepo,
                                  RouteRepository routeRepo,
                                  ReviewRepository reviewRepo,
+                                 EvaluationRepository evaluationRepo,
                                  ObjectMapper objectMapper,
                                  Clock clock,
                                  PlatformTransactionManager transactionManager) {
         this.airspaceRepo = airspaceRepo;
         this.routeRepo = routeRepo;
         this.reviewRepo = reviewRepo;
+        this.evaluationRepo = evaluationRepo;
         this.objectMapper = objectMapper;
         this.clock = clock;
         this.txTemplate = new TransactionTemplate(transactionManager);
@@ -246,6 +256,108 @@ public class AirspaceReviewService {
         });
     }
 
+    // ============================ 改航候选评估 ============================
+
+    /**
+     * 改航候选集批量评估：在同一事务内读取一致的航线与全部有效禁飞区状态，
+     * 对每个候选独立判定（规则与审核一致），按声明顺序取第一个 CLEAR 的候选，
+     * 用其点列替换目标航线（版本加一、当前审核结论随之失效），并写入不可变评估记录。
+     *
+     * <p>任一指定版本不是当前版本返回 409，且不写入航线点列与评估记录；
+     * 全部候选 BLOCKED 返回 422 并给出逐候选命中集合，不写入航线、不占用 evaluationKey。</p>
+     */
+    public MutationResponse evaluate(EvaluationRequest request) {
+        return withIdempotency(request.evaluationKey(), KIND_EVALUATION, canonicalHash(request), () -> {
+            List<List<Point>> candidates = new ArrayList<>(request.candidates().size());
+            for (List<RoutePointDto> dtoList : request.candidates()) {
+                List<Point> points = toPoints(dtoList);
+                validatePointsDistinct(points);
+                candidates.add(points);
+            }
+            validateCandidatesDistinct(candidates);
+            // 与审核相同的加锁顺序：先锁空域版本行，再锁航线行，读取同一已提交状态
+            long globalVersion = airspaceRepo.getGlobalVersionForUpdate();
+            RoutePo route = routeRepo.findRouteForUpdate(request.routeId());
+            if (route == null) {
+                throw new ApiException(HttpStatus.NOT_FOUND, "ROUTE_NOT_FOUND",
+                        "航线不存在: " + request.routeId());
+            }
+            if (route.version() != request.expectedVersion()) {
+                throw new ApiException(HttpStatus.CONFLICT, "VERSION_CONFLICT",
+                        "航线版本不是当前版本：expected=" + request.expectedVersion()
+                                + ", current=" + route.version());
+            }
+            if (globalVersion != request.airspaceVersion()) {
+                throw new ApiException(HttpStatus.CONFLICT, "VERSION_CONFLICT",
+                        "空域版本不是当前版本：submitted=" + request.airspaceVersion()
+                                + ", current=" + globalVersion);
+            }
+            // 持锁状态下读取全部有效禁飞区，逐候选独立判定
+            List<ZonePo> activeZones = airspaceRepo.findActiveZones();
+            List<EvaluationCandidateDto> outcomes = new ArrayList<>(candidates.size());
+            int selected = -1;
+            for (int i = 0; i < candidates.size(); i++) {
+                Set<String> hits = new TreeSet<>();
+                for (ZonePo zone : activeZones) {
+                    if (Geometry.polylineHitsRectangle(candidates.get(i),
+                            zone.xMin(), zone.yMin(), zone.xMax(), zone.yMax())) {
+                        hits.add(zone.zoneId());
+                    }
+                }
+                String conclusion = hits.isEmpty()
+                        ? ReviewConclusion.CLEAR.name()
+                        : ReviewConclusion.BLOCKED.name();
+                outcomes.add(new EvaluationCandidateDto(i, conclusion,
+                        List.copyOf(hits), toPointDtos(candidates.get(i))));
+                if (selected < 0 && hits.isEmpty()) {
+                    selected = i;
+                }
+            }
+            if (selected < 0) {
+                // 全部 BLOCKED：422 并携带逐候选命中集合；回滚不占键、不写航线
+                throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "ALL_CANDIDATES_BLOCKED",
+                        "全部候选均被有效禁飞区封锁，未写入航线", List.copyOf(outcomes));
+            }
+            // 持锁后条件更新兜底：更新 0 行说明版本已被其他事务推进
+            int updated = routeRepo.compareAndIncrementVersion(
+                    request.routeId(), request.expectedVersion());
+            if (updated == 0) {
+                throw new ApiException(HttpStatus.CONFLICT, "VERSION_CONFLICT",
+                        "航线版本已变化，请使用最新 expectedVersion 重试");
+            }
+            routeRepo.deletePoints(request.routeId());
+            routeRepo.insertPoints(request.routeId(), candidates.get(selected));
+            // 写入不可变评估记录：固化空域版本、逐候选结论与选中序号
+            String evaluationId = "ev_" + UUID.randomUUID();
+            EvaluationPo po = new EvaluationPo(evaluationId, request.evaluationKey(),
+                    request.routeId(), route.version(), route.version() + 1, globalVersion,
+                    selected, candidates.get(selected), nowMillis());
+            evaluationRepo.insertEvaluation(po);
+            for (int i = 0; i < candidates.size(); i++) {
+                evaluationRepo.insertCandidate(new EvaluationCandidatePo(evaluationId, i,
+                        outcomes.get(i).conclusion(), outcomes.get(i).hitZoneIds(),
+                        candidates.get(i)));
+            }
+            return new MutationResponse(request.evaluationKey(), false, toDto(po, outcomes));
+        });
+    }
+
+    /** 按 evaluationId 查询历史评估记录；记录不可变，历史查询稳定。 */
+    public EvaluationResultDto getEvaluation(String evaluationId) {
+        EvaluationPo po = evaluationRepo.findEvaluation(evaluationId);
+        if (po == null) {
+            throw new ApiException(HttpStatus.NOT_FOUND, "EVALUATION_NOT_FOUND",
+                    "评估记录不存在: " + evaluationId);
+        }
+        List<EvaluationCandidatePo> stored = evaluationRepo.findCandidates(evaluationId);
+        List<EvaluationCandidateDto> outcomes = new ArrayList<>(stored.size());
+        for (EvaluationCandidatePo c : stored) {
+            outcomes.add(new EvaluationCandidateDto(c.idx(), c.conclusion(),
+                    List.copyOf(c.hitZoneIds()), toPointDtos(c.points())));
+        }
+        return toDto(po, outcomes);
+    }
+
     // ============================ 幂等与事务 ============================
 
     /**
@@ -394,5 +506,32 @@ public class AirspaceReviewService {
             return array;
         }
         return node;
+    }
+
+    /** 候选之间不得完全相同（点列逐点相等即相同），重复则整次 400。 */
+    private static void validateCandidatesDistinct(List<List<Point>> candidates) {
+        for (int i = 0; i < candidates.size(); i++) {
+            for (int j = i + 1; j < candidates.size(); j++) {
+                if (candidates.get(i).equals(candidates.get(j))) {
+                    throw new ApiException(HttpStatus.BAD_REQUEST, "DUPLICATE_CANDIDATE",
+                            "候选点列不得完全相同：序号 " + i + " 与 " + j + " 重复");
+                }
+            }
+        }
+    }
+
+    private static List<RoutePointDto> toPointDtos(List<Point> points) {
+        List<RoutePointDto> dtos = new ArrayList<>(points.size());
+        for (Point p : points) {
+            dtos.add(new RoutePointDto(p.x(), p.y()));
+        }
+        return dtos;
+    }
+
+    private static EvaluationResultDto toDto(EvaluationPo po,
+                                             List<EvaluationCandidateDto> outcomes) {
+        return new EvaluationResultDto(po.evaluationId(), po.evaluationKey(), po.routeId(),
+                po.routeVersion(), po.newRouteVersion(), po.airspaceVersion(),
+                po.selectedIndex(), toPointDtos(po.selectedPoints()), List.copyOf(outcomes));
     }
 }

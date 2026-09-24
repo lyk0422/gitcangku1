@@ -62,8 +62,33 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_review_request ON review (request_id);
 -- 写操作幂等去重：同键同参重放原结果，异参冲突；失败不占键
 CREATE TABLE IF NOT EXISTS request_dedup (
     request_id     VARCHAR(64) PRIMARY KEY COMMENT '写操作全局唯一请求标识',
-    request_kind   VARCHAR(32) NOT NULL COMMENT '请求类型：ZONE_CREATE/ZONE_REVOKE/ROUTE_CREATE/ROUTE_REPLACE/REVIEW',
+    request_kind   VARCHAR(32) NOT NULL COMMENT '请求类型：ZONE_CREATE/ZONE_REVOKE/ROUTE_CREATE/ROUTE_REPLACE/REVIEW/EVALUATION',
     request_hash   VARCHAR(64) NOT NULL COMMENT '规范化参数的 SHA-256 十六进制摘要，用于同键异参冲突判定',
     response_json  CLOB NOT NULL COMMENT '首次成功响应 JSON，重放时原样返回',
     created_at     BIGINT NOT NULL COMMENT '首次成功时间，epoch 毫秒（UTC）'
 ) COMMENT = '写操作幂等去重记录（与业务变更同事务原子提交）';
+
+-- 改航候选评估不可变记录：仅在选中候选并替换航线成功时写入，之后永不改写
+CREATE TABLE IF NOT EXISTS evaluation (
+    evaluation_id      VARCHAR(64) PRIMARY KEY COMMENT '评估记录唯一标识（不可变）',
+    evaluation_key     VARCHAR(64) NOT NULL COMMENT '客户端提交的评估幂等键，全局唯一',
+    route_id           VARCHAR(64) NOT NULL COMMENT '目标航线标识',
+    route_version      INT NOT NULL COMMENT '评估时读取（替换前）的航线版本',
+    new_route_version  INT NOT NULL COMMENT '选中候选替换后的航线版本（route_version + 1）',
+    airspace_version   BIGINT NOT NULL COMMENT '评估时读取并固化的全局空域版本',
+    selected_index     INT NOT NULL COMMENT '选中候选在请求声明顺序中的序号，从 0 开始',
+    selected_points    VARCHAR(4000) NOT NULL COMMENT '选中候选点列不可变快照，格式 x,y;x,y',
+    created_at         BIGINT NOT NULL COMMENT '创建时间，epoch 毫秒（UTC）'
+) COMMENT = '改航候选评估不可变记录（与航线替换同事务原子提交）';
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_evaluation_key ON evaluation (evaluation_key);
+
+-- 评估的逐候选结论：每个候选一行，结论与命中集合保存后不变
+CREATE TABLE IF NOT EXISTS evaluation_candidate (
+    evaluation_id  VARCHAR(64) NOT NULL COMMENT '所属评估记录标识',
+    idx            INT NOT NULL COMMENT '候选在请求声明顺序中的序号，从 0 开始',
+    conclusion     VARCHAR(16) NOT NULL COMMENT '该候选结论：CLEAR 通过或 BLOCKED 命中，永不改变',
+    hit_zone_ids   CLOB NOT NULL COMMENT '该候选命中的全部 zoneId，字典序去重后逗号拼接；未命中为空串',
+    points         VARCHAR(4000) NOT NULL COMMENT '该候选点列不可变快照，格式 x,y;x,y',
+    PRIMARY KEY (evaluation_id, idx)
+) COMMENT = '改航评估逐候选不可变结论';

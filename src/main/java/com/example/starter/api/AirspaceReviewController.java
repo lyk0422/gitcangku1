@@ -1,5 +1,7 @@
 package com.example.starter.api;
 
+import com.example.starter.api.dto.EvaluationRequest;
+import com.example.starter.api.dto.EvaluationResultDto;
 import com.example.starter.api.dto.MutationResponse;
 import com.example.starter.api.dto.ReviewRequest;
 import com.example.starter.api.dto.ReviewResultDto;
@@ -71,5 +73,17 @@ public class AirspaceReviewController {
     @GetMapping("/routes/{routeId}/current-review")
     public ReviewResultDto getCurrentReview(@PathVariable String routeId) {
         return service.getCurrentReview(routeId);
+    }
+
+    /** 提交改航候选集批量评估：选中第一个 CLEAR 候选并替换航线。 */
+    @PostMapping("/evaluations")
+    public ResponseEntity<MutationResponse> evaluate(@Valid @RequestBody EvaluationRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(service.evaluate(request));
+    }
+
+    /** 按 evaluationId 查询历史评估记录（不可变，历史查询稳定）。 */
+    @GetMapping("/evaluations/{evaluationId}")
+    public EvaluationResultDto getEvaluation(@PathVariable String evaluationId) {
+        return service.getEvaluation(evaluationId);
     }
 }
