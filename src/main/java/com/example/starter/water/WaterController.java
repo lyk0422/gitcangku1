@@ -6,6 +6,10 @@ import com.example.starter.water.dto.Dtos.CommandRequest;
 import com.example.starter.water.dto.Dtos.CreateWindowRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
+import com.example.starter.water.dto.Dtos.DroughtDeclarationRequest;
+import com.example.starter.water.dto.Dtos.DroughtDeclarationResponse;
+import com.example.starter.water.dto.Dtos.DroughtHistoryResponse;
+import com.example.starter.water.dto.Dtos.DroughtStatusResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
 import com.example.starter.water.dto.Dtos.SubmitAllocationRequest;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
@@ -41,12 +45,12 @@ public class WaterController {
                 request.startUtc(), request.endUtc(), request.plannedVolume());
     }
 
-    /** 提交配水申请。 */
+    /** 提交配水申请（priority 缺省 NORMAL：ESSENTIAL/NORMAL/DEFERRABLE）。 */
     @PostMapping("/allocations")
     public AllocationResponse submitAllocation(@RequestBody SubmitAllocationRequest request,
                                                @RequestHeader("X-Actor-Id") String actor) {
         return service.submitAllocation(request.commandKey(), request.allocationKey(), request.windowId(),
-                request.userId(), request.amount(), actor);
+                request.userId(), request.amount(), request.priority(), actor);
     }
 
     /** 批准配水申请。 */
@@ -64,18 +68,39 @@ public class WaterController {
         return service.cancelAllocation(request.commandKey(), allocationKey, actor);
     }
 
-    /** 创建窗口限供。 */
+    /** 创建窗口总量限供。 */
     @PostMapping("/windows/{windowId}/curtailment")
     public CurtailmentResponse createCurtailment(@PathVariable long windowId,
                                                  @RequestBody CurtailmentRequest request) {
         return service.createCurtailment(request.commandKey(), windowId, request.volume());
     }
 
-    /** 取消窗口当前生效限供。 */
+    /** 取消窗口当前生效总量限供。 */
     @PostMapping("/windows/{windowId}/curtailment/cancel")
     public CurtailmentResponse cancelCurtailment(@PathVariable long windowId,
                                                  @RequestBody CommandRequest request) {
         return service.cancelCurtailment(request.commandKey(), windowId);
+    }
+
+    /** 声明/调整/恢复窗口旱情分级比例削减（NONE/LEVEL1/LEVEL2/LEVEL3）。 */
+    @PostMapping("/windows/{windowId}/drought")
+    public DroughtDeclarationResponse declareDrought(@PathVariable long windowId,
+                                                     @RequestBody DroughtDeclarationRequest request) {
+        return service.declareDrought(request.commandKey(), request.curtailmentKey(), windowId,
+                request.level(), request.essentialPct(), request.normalPct(), request.deferrablePct(),
+                request.expectedVersion());
+    }
+
+    /** 查询窗口当前旱情等级与生效削减明细。 */
+    @GetMapping("/windows/{windowId}/drought")
+    public DroughtStatusResponse getDroughtStatus(@PathVariable long windowId) {
+        return service.getDroughtStatus(windowId);
+    }
+
+    /** 查询窗口旱情声明历史与逐次削减明细。 */
+    @GetMapping("/windows/{windowId}/drought/history")
+    public DroughtHistoryResponse getDroughtHistory(@PathVariable long windowId) {
+        return service.getDroughtHistory(windowId);
     }
 
     /** 同窗口额度原子转让（仅源申请人本人）。 */

@@ -2,6 +2,8 @@ package com.example.starter.water;
 
 import com.example.starter.water.WaterRepository.AllocationRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
+import com.example.starter.water.WaterRepository.DroughtDetailRow;
+import com.example.starter.water.WaterRepository.DroughtRow;
 import com.example.starter.water.WaterRepository.TransferRow;
 import com.example.starter.water.WaterRepository.WindowRow;
 import org.junit.jupiter.api.Test;
@@ -12,6 +14,7 @@ import org.springframework.jdbc.datasource.init.ScriptUtils;
 
 import java.math.BigDecimal;
 import java.sql.Connection;
+import java.util.List;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -38,18 +41,23 @@ class PersistenceTests {
         WaterRepository repo1 = new WaterRepository(new JdbcTemplate(first));
         long windowId = repo1.insertWindow("wk-persist", "ch-persist", 1_000L, 2_000L,
                 new BigDecimal("10.000"), 1L);
-        repo1.insertAllocation("ak-source", windowId, "user-1", new BigDecimal("6.000"), "alice", 2L);
-        repo1.insertAllocation("ak-target", windowId, "user-2", new BigDecimal("2.500"), "bob", 3L);
+        repo1.insertAllocation("ak-source", windowId, "user-1", "NORMAL", new BigDecimal("6.000"), "alice", 2L);
+        repo1.insertAllocation("ak-target", windowId, "user-2", "ESSENTIAL", new BigDecimal("2.500"), "bob", 3L);
         AllocationRow source = repo1.findAllocationByKey("ak-source");
         AllocationRow target = repo1.findAllocationByKey("ak-target");
         // 普通批准：源持有额度等于原申请水量
         repo1.updateAllocationStatus(source.id(), "APPROVED", 4L);
-        // 转让 2.5：源持有 3.5、目标 APPROVED 持有 2.5、写不可变流水
-        repo1.decrementHeldAmount(source.id(), new BigDecimal("2.500"), 5L);
+        // 转让 2.5：源持有与旱情基准均为 3.5、目标 APPROVED 持有/基准 2.5、写不可变流水
+        repo1.decrementHeldAndBaseline(source.id(), new BigDecimal("2.500"), 5L);
         repo1.updateAllocationStatus(target.id(), "APPROVED", 5L);
         repo1.insertTransfer("tk-persist", windowId, "ak-source", "ak-target",
                 new BigDecimal("2.500"), "alice", 5L);
         repo1.insertCurtailment(windowId, new BigDecimal("8.000"), 6L);
+        // 旱情声明 LEVEL2：ESSENTIAL 10% / NORMAL 20% / DEFERRABLE 30%，写入声明与逐笔明细
+        long droughtId = repo1.insertDrought("dk-persist", windowId, "LEVEL2", 10, 20, 30, 0L, 8L);
+        repo1.insertDroughtDetail(droughtId, source.id(), "ak-source", "NORMAL",
+                new BigDecimal("6.000"), new BigDecimal("4.800"), new BigDecimal("1.200"), 8L);
+        repo1.bumpWindowVersion(windowId);
         repo1.insertCommand("cmd-persist", "TRANSFER",
                 "TRANSFER|tk-persist|ak-source|ak-target|alice", 7L);
         repo1.updateCommandResponse("cmd-persist", "{\"transferKey\":\"tk-persist\"}");
@@ -73,8 +81,12 @@ class PersistenceTests {
 
         AllocationRow target2 = repo2.findAllocationByKey("ak-target");
         assertEquals("APPROVED", target2.status());
+        assertEquals("ESSENTIAL", target2.priority());
         assertEquals(new BigDecimal("2.500"), target2.amount());
         assertEquals(new BigDecimal("2.500"), target2.heldAmount());
+        // 旱情基准随转让从源扣减（6-2.5=3.5），转入方为完整额度 2.5，基准总量守恒为 6
+        assertEquals(new BigDecimal("3.500"), source2.baselineHeldAmount());
+        assertEquals(new BigDecimal("2.500"), target2.baselineHeldAmount());
 
         // 容量统计汇总 APPROVED 申请的当前持有额度：3.5 + 2.5 = 6
         assertEquals(new BigDecimal("6.000"), repo2.sumApprovedAmount(windowId));
@@ -91,6 +103,26 @@ class PersistenceTests {
         assertNotNull(curtailment);
         assertEquals(new BigDecimal("8.000"), curtailment.volume());
 
+        // 旱情声明、窗口版本与逐笔明细可从全新连接读取
+        WindowRow window2 = repo2.findWindowById(windowId);
+        assertEquals(1L, window2.version());
+        DroughtRow drought = repo2.findDroughtByKey("dk-persist");
+        assertNotNull(drought);
+        assertEquals("LEVEL2", drought.level());
+        assertEquals(10, drought.essentialPct());
+        assertEquals(20, drought.normalPct());
+        assertEquals(30, drought.deferrablePct());
+        assertEquals(0L, drought.expectedVersion());
+        assertEquals("ACTIVE", drought.status());
+        List<DroughtDetailRow> details = repo2.listDroughtDetails(drought.id());
+        assertEquals(1, details.size());
+        assertEquals("ak-source", details.get(0).allocationKey());
+        assertEquals(new BigDecimal("6.000"), details.get(0).originalHeld());
+        assertEquals(new BigDecimal("4.800"), details.get(0).targetHeld());
+        assertEquals(new BigDecimal("1.200"), details.get(0).reducedAmount());
+        assertEquals(drought.id(), repo2.findActiveDrought(windowId).id());
+        assertEquals(1, repo2.listDroughts(windowId).size());
+
         assertEquals("{\"transferKey\":\"tk-persist\"}", repo2.findCommand("cmd-persist").response());
     }
 
@@ -103,7 +135,7 @@ class PersistenceTests {
         }
         WaterRepository repo = new WaterRepository(new JdbcTemplate(dataSource));
         long windowId = repo.insertWindow("wk-cancel", "ch-cancel", 1L, 2L, new BigDecimal("5"), 1L);
-        repo.insertAllocation("ak-cancel", windowId, "user-1", new BigDecimal("3.000"), "alice", 2L);
+        repo.insertAllocation("ak-cancel", windowId, "user-1", "NORMAL", new BigDecimal("3.000"), "alice", 2L);
         AllocationRow allocation = repo.findAllocationByKey("ak-cancel");
         repo.updateAllocationStatus(allocation.id(), "APPROVED", 3L);
         assertEquals(new BigDecimal("3.000"), repo.sumApprovedAmount(windowId));
