@@ -184,13 +184,15 @@ class CheckpointServiceH2Test extends AbstractRaceH2Test {
     }
 
     @Test
-    void 无完赛耗时选手提交分段返回422() {
+    void 无完赛耗时的在途选手允许提交分段() {
         createRace();
-        registerRunner("u", null, 1, "req-u"); // UNTIMED
+        registerRunner("u", null, 1, "req-u"); // UNTIMED 在途
         configure(2, "req-cfg", "c1", "1");
-        assertThatThrownBy(() -> submit("u", "t-x", "c1", 100L, 3, "req-tx"))
-                .isInstanceOf(UnprocessableEntityException.class)
-                .hasMessageContaining("完赛耗时");
+        // 退赛 DNF 场景要求：尚无完赛计时也可提交分段，提交后版本加一
+        submit("u", "t-x", "c1", 100L, 3, "req-tx");
+        assertThat(raceService.getRunnerTimings(RACE, "u").checkpoints())
+                .filteredOn(p -> p.elapsedMillis() != null).hasSize(1);
+        assertThat(repository.findRace(RACE).orElseThrow().version()).isEqualTo(4);
     }
 
     @Test

@@ -3,6 +3,7 @@ package com.example.starter.race.persistence;
 import com.example.starter.race.domain.EntryStatus;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
+import com.example.starter.race.domain.WithdrawalStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
@@ -30,6 +31,7 @@ public class RaceRepository {
             new CheckpointTimingRowMapper();
     private static final SnapshotCheckpointRowMapper SNAPSHOT_CHECKPOINT_ROW_MAPPER =
             new SnapshotCheckpointRowMapper();
+    private static final WithdrawalRowMapper WITHDRAWAL_ROW_MAPPER = new WithdrawalRowMapper();
 
     private final JdbcTemplate jdbcTemplate;
 
@@ -147,6 +149,66 @@ public class RaceRepository {
                 .findFirst();
     }
 
+    /** 按全局退赛键查询退赛登记（用于 withdrawalKey 幂等重放）。 */
+    public Optional<WithdrawalRow> findWithdrawal(String withdrawalKey) {
+        return jdbcTemplate
+                .query("SELECT withdrawal_key, race_id, bib, status, reason, last_checkpoint_code, "
+                                + "revoked, created_at, revoked_at "
+                                + "FROM withdrawal WHERE withdrawal_key = ?",
+                        WITHDRAWAL_ROW_MAPPER, withdrawalKey)
+                .stream()
+                .findFirst();
+    }
+
+    /** 查询赛事下全部退赛登记（含已撤销），按登记时间与退赛键排列。 */
+    public List<WithdrawalRow> findWithdrawals(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT withdrawal_key, race_id, bib, status, reason, last_checkpoint_code, "
+                        + "revoked, created_at, revoked_at "
+                        + "FROM withdrawal WHERE race_id = ? ORDER BY created_at, withdrawal_key",
+                WITHDRAWAL_ROW_MAPPER, raceId);
+    }
+
+    /** 查询赛事下全部生效中（未撤销）的退赛登记。 */
+    public List<WithdrawalRow> findActiveWithdrawals(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT withdrawal_key, race_id, bib, status, reason, last_checkpoint_code, "
+                        + "revoked, created_at, revoked_at "
+                        + "FROM withdrawal WHERE race_id = ? AND revoked = FALSE "
+                        + "ORDER BY created_at, withdrawal_key",
+                WITHDRAWAL_ROW_MAPPER, raceId);
+    }
+
+    /** 查询某选手当前生效中的退赛登记；无则 empty。 */
+    public Optional<WithdrawalRow> findActiveWithdrawal(String raceId, String bib) {
+        return jdbcTemplate
+                .query("SELECT withdrawal_key, race_id, bib, status, reason, last_checkpoint_code, "
+                                + "revoked, created_at, revoked_at "
+                                + "FROM withdrawal WHERE race_id = ? AND bib = ? AND revoked = FALSE",
+                        WITHDRAWAL_ROW_MAPPER, raceId, bib)
+                .stream()
+                .findFirst();
+    }
+
+    /** 新增退赛登记（全局唯一 withdrawalKey 由数据库主键保证）。 */
+    public void insertWithdrawal(WithdrawalRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO withdrawal "
+                        + "(withdrawal_key, race_id, bib, status, reason, last_checkpoint_code, "
+                        + "revoked, created_at, revoked_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, FALSE, ?, NULL)",
+                row.withdrawalKey(), row.raceId(), row.bib(), row.status().name(),
+                row.reason(), row.lastCheckpointCode(), row.createdAt());
+    }
+
+    /** 撤销退赛登记，仅对当前未撤销的登记生效；返回受影响行数。 */
+    public int markWithdrawalRevoked(String withdrawalKey, long now) {
+        return jdbcTemplate.update(
+                "UPDATE withdrawal SET revoked = TRUE, revoked_at = ? "
+                        + "WHERE withdrawal_key = ? AND revoked = FALSE",
+                now, withdrawalKey);
+    }
+
     /** 新增选手分段通过记录（全局唯一 timingId 与选手+检查点唯一键由数据库约束保证）。 */
     public void insertTiming(CheckpointTimingRow row) {
         jdbcTemplate.update(
@@ -188,7 +250,8 @@ public class RaceRepository {
         SnapshotRow header = headers.getFirst();
         List<SnapshotEntryRow> entryRows = jdbcTemplate.query(
                 "SELECT race_id, bib, rank_no, status, finish_time_ms, penalty_ms, total_time_ms, "
-                        + "display_order, checkpoint_count, covered_checkpoint_count "
+                        + "display_order, checkpoint_count, covered_checkpoint_count, "
+                        + "last_checkpoint_code "
                         + "FROM result_snapshot_entry WHERE race_id = ? ORDER BY display_order",
                 SNAPSHOT_ENTRY_ROW_MAPPER, raceId);
         List<SnapshotCheckpointRow> checkpoints = jdbcTemplate.query(
@@ -210,7 +273,8 @@ public class RaceRepository {
                         entry.finishTimeMs(), entry.penaltyMs(), entry.totalTimeMs(),
                         entry.displayOrder(), entry.checkpointCount(),
                         entry.coveredCheckpointCount(),
-                        missingByBib.getOrDefault(entry.bib(), List.of())))
+                        missingByBib.getOrDefault(entry.bib(), List.of()),
+                        entry.lastCheckpointCode()))
                 .toList();
         return Optional.of(new SnapshotRow(header.raceId(), header.version(), header.sealedAt(),
                 entries, checkpoints));
@@ -292,8 +356,9 @@ public class RaceRepository {
         jdbcTemplate.batchUpdate(
                 "INSERT INTO result_snapshot_entry "
                         + "(race_id, bib, rank_no, status, finish_time_ms, penalty_ms, total_time_ms, "
-                        + "display_order, checkpoint_count, covered_checkpoint_count) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        + "display_order, checkpoint_count, covered_checkpoint_count, "
+                        + "last_checkpoint_code) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 snapshot.entries(),
                 snapshot.entries().size(),
                 (ps, entry) -> {
@@ -307,6 +372,7 @@ public class RaceRepository {
                     ps.setInt(8, entry.displayOrder());
                     ps.setInt(9, entry.checkpointCount());
                     ps.setInt(10, entry.coveredCheckpointCount());
+                    ps.setString(11, entry.lastCheckpointCode());
                 });
         jdbcTemplate.batchUpdate(
                 "INSERT INTO result_snapshot_checkpoint "
@@ -376,6 +442,7 @@ public class RaceRepository {
         jdbcTemplate.update("DELETE FROM idempotency_record");
         jdbcTemplate.update("DELETE FROM checkpoint_timing");
         jdbcTemplate.update("DELETE FROM checkpoint");
+        jdbcTemplate.update("DELETE FROM withdrawal");
         jdbcTemplate.update("DELETE FROM penalty");
         jdbcTemplate.update("DELETE FROM runner");
         jdbcTemplate.update("DELETE FROM race");
@@ -435,7 +502,24 @@ public class RaceRepository {
                     rs.getInt("display_order"),
                     rs.getInt("checkpoint_count"),
                     rs.getInt("covered_checkpoint_count"),
-                    List.of());
+                    List.of(),
+                    rs.getString("last_checkpoint_code"));
+        }
+    }
+
+    private static final class WithdrawalRowMapper implements RowMapper<WithdrawalRow> {
+        @Override
+        public WithdrawalRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new WithdrawalRow(
+                    rs.getString("withdrawal_key"),
+                    rs.getString("race_id"),
+                    rs.getString("bib"),
+                    WithdrawalStatus.valueOf(rs.getString("status")),
+                    rs.getString("reason"),
+                    rs.getString("last_checkpoint_code"),
+                    rs.getBoolean("revoked"),
+                    rs.getLong("created_at"),
+                    (Long) rs.getObject("revoked_at"));
         }
     }
 

@@ -4,13 +4,17 @@ import com.example.starter.race.api.AddPenaltyRequest;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
 import com.example.starter.race.api.CreateRaceRequest;
 import com.example.starter.race.api.RegisterRunnerRequest;
+import com.example.starter.race.api.RegisterWithdrawalRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
+import com.example.starter.race.api.RevokeWithdrawalRequest;
 import com.example.starter.race.api.MissingCheckpointsResponse;
+import com.example.starter.race.api.RunnerStatusResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.api.SubmitTimingRequest;
+import com.example.starter.race.api.WithdrawalListResponse;
 
 /**
  * 赛事成绩封榜应用服务；每个写方法在单个数据库事务内完成
@@ -47,6 +51,22 @@ public interface RaceService {
 
     /** 封榜：校验版本并原子保存只读成绩快照（含每名选手分段明细与缺失检查点）。 */
     ServiceResult sealRace(String raceId, SealRaceRequest request);
+
+    /**
+     * 退赛登记（DNS 未出发 / DNF 中途退赛）；成功后赛事版本加一。
+     * 同状态重复登记幂等返回首次结果，DNS 与 DNF 相互改写返回409；
+     * 已取消资格或已有完赛计时的选手登记返回409。
+     */
+    ServiceResult registerWithdrawal(String raceId, RegisterWithdrawalRequest request);
+
+    /** 撤销退赛：携带同一 withdrawalKey 与当前赛事版本；已撤销的退赛再次撤销返回409。 */
+    ServiceResult revokeWithdrawal(String raceId, String withdrawalKey, RevokeWithdrawalRequest request);
+
+    /** 查询赛事退赛清单（含已撤销记录）；只读，不修改版本。 */
+    WithdrawalListResponse getWithdrawals(String raceId);
+
+    /** 查询单个选手的当前参赛状态；只读，不修改版本。 */
+    RunnerStatusResponse getRunnerStatus(String raceId, String bib);
 
     /** 查询即时成绩（OPEN 实时计算；SEALED 返回封榜快照）。 */
     StandingResponse getResults(String raceId);

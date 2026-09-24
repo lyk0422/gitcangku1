@@ -87,6 +87,37 @@ public class RaceController {
         return toResponse(raceService.sealRace(raceId, request));
     }
 
+    /** 退赛登记（DNS 未出发 / DNF 中途退赛）。 */
+    @PostMapping("/{raceId}/withdrawals")
+    public ResponseEntity<Object> registerWithdrawal(
+            @PathVariable String raceId,
+            @Valid @RequestBody RegisterWithdrawalRequest request) {
+        return toResponse(raceService.registerWithdrawal(raceId, request));
+    }
+
+    /** 撤销退赛。 */
+    @PostMapping("/{raceId}/withdrawals/{withdrawalKey}/revocation")
+    public ResponseEntity<Object> revokeWithdrawal(
+            @PathVariable String raceId,
+            @PathVariable String withdrawalKey,
+            @Valid @RequestBody RevokeWithdrawalRequest request) {
+        return toResponse(raceService.revokeWithdrawal(raceId, withdrawalKey, request));
+    }
+
+    /** 查询赛事退赛清单（含已撤销记录）。 */
+    @GetMapping("/{raceId}/withdrawals")
+    public WithdrawalListResponse getWithdrawals(@PathVariable String raceId) {
+        return raceService.getWithdrawals(raceId);
+    }
+
+    /** 查询单个选手的当前参赛状态。 */
+    @GetMapping("/{raceId}/runners/{bib}/status")
+    public RunnerStatusResponse getRunnerStatus(
+            @PathVariable String raceId,
+            @PathVariable String bib) {
+        return raceService.getRunnerStatus(raceId, bib);
+    }
+
     /** 查询即时成绩（封榜后返回只读快照内容）。 */
     @GetMapping("/{raceId}/results")
     public StandingResponse getResults(@PathVariable String raceId) {
