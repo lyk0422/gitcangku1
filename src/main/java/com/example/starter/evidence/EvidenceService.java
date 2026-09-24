@@ -45,6 +45,7 @@ public class EvidenceService {
     private final TransferRecordRepository transferRepository;
     private final SealInspectionRepository inspectionRepository;
     private final LoanRecordRepository loanRepository;
+    private final DestructionItemRepository destructionItemRepository;
     private final CommandLogRepository commandLogRepository;
     private final ObjectMapper objectMapper;
     private final EvidenceClock clock;
@@ -53,6 +54,7 @@ public class EvidenceService {
                            TransferRecordRepository transferRepository,
                            SealInspectionRepository inspectionRepository,
                            LoanRecordRepository loanRepository,
+                           DestructionItemRepository destructionItemRepository,
                            CommandLogRepository commandLogRepository,
                            ObjectMapper objectMapper,
                            EvidenceClock clock) {
@@ -60,6 +62,7 @@ public class EvidenceService {
         this.transferRepository = transferRepository;
         this.inspectionRepository = inspectionRepository;
         this.loanRepository = loanRepository;
+        this.destructionItemRepository = destructionItemRepository;
         this.commandLogRepository = commandLogRepository;
         this.objectMapper = objectMapper;
         this.clock = clock;
@@ -75,7 +78,10 @@ public class EvidenceService {
             return replay.get();
         }
         if (evidenceRepository.findByKey(request.evidenceKey()).isPresent()) {
-            throw ApiException.conflict("证物已存在: " + request.evidenceKey());
+            // 并发同键同参重放：另一事务已连同幂等日志一起提交，此时先重放首次结果而非直接 409。
+            StoredResponse concurrent = checkReplay(request.commandKey(), requestHash)
+                    .orElseThrow(() -> ApiException.conflict("证物已存在: " + request.evidenceKey()));
+            return concurrent;
         }
         LocalDateTime now = LocalDateTime.now();
         evidenceRepository.insert(request.evidenceKey(), request.caseKey(), request.category(),
@@ -103,6 +109,8 @@ public class EvidenceService {
         if (request.toCustodian().equals(actorId)) {
             throw ApiException.badRequest("接收人不能与发起保管人相同");
         }
+        requireNotDestroyed(evidence);
+        requireNotFrozen(evidenceKey);
         requireSealIntact(evidence);
         requireCustodian(evidence, actorId);
         if (evidence.status() == EvidenceStatus.TRANSFER_PENDING) {
@@ -135,6 +143,8 @@ public class EvidenceService {
         if (replay.isPresent()) {
             return replay.get();
         }
+        requireNotDestroyed(evidence);
+        requireNotFrozen(evidenceKey);
         requireSealIntact(evidence);
         TransferRecord pending = requirePending(evidence, evidenceKey);
         if (!pending.toCustodian().equals(actorId)) {
@@ -166,6 +176,8 @@ public class EvidenceService {
         if (replay.isPresent()) {
             return replay.get();
         }
+        requireNotDestroyed(evidence);
+        requireNotFrozen(evidenceKey);
         requireSealIntact(evidence);
         TransferRecord pending = requirePending(evidence, evidenceKey);
         if (!pending.fromCustodian().equals(actorId)) {
@@ -198,6 +210,8 @@ public class EvidenceService {
         if (replay.isPresent()) {
             return replay.get();
         }
+        requireNotDestroyed(evidence);
+        requireNotFrozen(evidenceKey);
         requireCustodian(evidence, actorId);
         if (evidence.status() == EvidenceStatus.TRANSFER_PENDING) {
             throw ApiException.conflict("待接收期间禁止封条核验: " + evidenceKey);
@@ -237,6 +251,8 @@ public class EvidenceService {
         if (request.borrowerId().equals(actorId)) {
             throw ApiException.badRequest("借用人不能与当前保管人相同");
         }
+        requireNotDestroyed(evidence);
+        requireNotFrozen(evidenceKey);
         requireCustodian(evidence, actorId);
         if (evidence.status() == EvidenceStatus.SEAL_BROKEN) {
             throw ApiException.unprocessable("封条已异常，禁止借出: " + evidenceKey);
@@ -283,6 +299,7 @@ public class EvidenceService {
         if (replay.isPresent()) {
             return replay.get();
         }
+        requireNotDestroyed(evidence);
         LoanRecord loan = loanRepository.findByLoanKey(request.loanKey())
                 .orElseThrow(() -> ApiException.notFound("借出记录不存在: " + request.loanKey()));
         if (!loan.evidenceKey().equals(evidenceKey)) {
@@ -360,6 +377,26 @@ public class EvidenceService {
         if (evidence.status() == EvidenceStatus.SEAL_BROKEN) {
             throw ApiException.unprocessable("封条已异常，禁止交接相关操作: " + evidence.evidenceKey());
         }
+    }
+
+    /**
+     * DESTROYED 为终态，禁止任何写操作（含再次入列销毁令）。
+     */
+    private void requireNotDestroyed(Evidence evidence) {
+        if (evidence.status() == EvidenceStatus.DESTROYED) {
+            throw ApiException.conflict("证物已销毁，禁止任何写操作: " + evidence.evidenceKey());
+        }
+    }
+
+    /**
+     * 证物被未终结（PENDING/APPROVED）销毁令冻结期间，交接、借出、独立封条核验及再次入列一律 409，
+     * 并返回冻结它的 destructionKey。调用前必须已通过证物行锁或销毁令行锁，保证读取一致。
+     */
+    private void requireNotFrozen(String evidenceKey) {
+        destructionItemRepository.findOpenOrderKeyForEvidence(evidenceKey).ifPresent(key -> {
+            throw ApiException.conflict(
+                    "证物已被销毁令冻结: " + evidenceKey + "，冻结销毁令: " + key);
+        });
     }
 
     private void requireCustodian(Evidence evidence, String actorId) {

@@ -1,5 +1,6 @@
 package com.example.starter.error;
 
+import com.example.starter.evidence.DestructionValidationException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
@@ -12,6 +13,7 @@ import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
 import java.time.LocalDateTime;
+import java.util.List;
 import java.util.stream.Collectors;
 
 /**
@@ -26,6 +28,18 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorBody> handleApi(ApiException ex) {
         return ResponseEntity.status(ex.status())
                 .body(new ErrorBody(ex.status().value(), ex.getMessage(), LocalDateTime.now()));
+    }
+
+    /**
+     * 销毁令入列校验失败：整单 422，逐件返回原因，不创建销毁令。
+     */
+    @ExceptionHandler(DestructionValidationException.class)
+    public ResponseEntity<DestructionErrorBody> handleDestructionValidation(DestructionValidationException ex) {
+        return ResponseEntity.unprocessableEntity()
+                .body(new DestructionErrorBody(422, ex.getMessage(), LocalDateTime.now(),
+                        ex.itemReasons().stream()
+                                .map(r -> new ItemError(r.evidenceKey(), r.reason(), r.detail()))
+                                .toList()));
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
@@ -59,5 +73,27 @@ public class GlobalExceptionHandler {
      * @param timestamp 发生时间（Asia/Shanghai）
      */
     public record ErrorBody(int status, String message, LocalDateTime timestamp) {
+    }
+
+    /**
+     * 销毁令入列校验失败响应体：附带逐件证物原因。
+     *
+     * @param status    HTTP 状态码（422）
+     * @param message   总错误描述
+     * @param timestamp 发生时间（Asia/Shanghai）
+     * @param items     逐件证物不合格原因
+     */
+    public record DestructionErrorBody(int status, String message, LocalDateTime timestamp,
+                                    List<ItemError> items) {
+    }
+
+    /**
+     * 单件证物不合格原因。
+     *
+     * @param evidenceKey 证物业务键
+     * @param reason      机器可读原因码
+     * @param detail      人类可读说明
+     */
+    public record ItemError(String evidenceKey, String reason, String detail) {
     }
 }
