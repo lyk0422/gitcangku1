@@ -59,13 +59,16 @@ public class BatchService {
     private static final int IDEMPOTENCY_MAX_ATTEMPTS = 3;
 
     private final BatchRepository repo;
+    private final SamplingRepository samplingRepo;
     private final TransactionTemplate tx;
     private final ObjectMapper objectMapper;
 
     public BatchService(BatchRepository repo,
+                        SamplingRepository samplingRepo,
                         PlatformTransactionManager transactionManager,
                         ObjectMapper objectMapper) {
         this.repo = repo;
+        this.samplingRepo = samplingRepo;
         this.tx = new TransactionTemplate(transactionManager);
         this.objectMapper = objectMapper;
     }
@@ -170,6 +173,7 @@ public class BatchService {
                     .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
             BatchStatus status = BatchStatus.valueOf(batch.status());
             assertNoRecalledAncestor(batchKey);
+            assertSamplingPlanAllowsApproval(batchKey);
             if (status == BatchStatus.QUARANTINED) {
                 throw ApiException.unprocessable("必做检验项未全部通过，不能批准");
             }
@@ -506,6 +510,24 @@ public class BatchService {
             result.add(toLineageEntry(key, parentOf, recalled));
         }
         return result;
+    }
+
+    /**
+     * 抽样判定是双角色批准的前置条件：批次一旦启用过抽样计划，只有存在 ACCEPTED 计划才可批准；
+     * 当前计划 OPEN（尚无判定）或最近计划 REJECTED 均返回 422 并指明当前计划状态。
+     * 从未创建抽样计划的批次沿用原有必做检验项门禁，不在此拦截。
+     */
+    private void assertSamplingPlanAllowsApproval(String batchKey) {
+        List<SamplingRepository.PlanRow> plans = samplingRepo.findPlansByBatch(batchKey);
+        if (plans.isEmpty()) {
+            return;
+        }
+        if (samplingRepo.findAcceptedPlan(batchKey).isPresent()) {
+            return;
+        }
+        SamplingRepository.PlanRow latest = plans.get(plans.size() - 1);
+        throw ApiException.unprocessable("批次不存在 ACCEPTED 抽样计划，当前抽样计划状态为 "
+                + latest.status() + "，不能批准放行");
     }
 
     /**

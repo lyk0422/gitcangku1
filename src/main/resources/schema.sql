@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS recall (
 );
 
 CREATE TABLE IF NOT EXISTS command_log (
-    command_type VARCHAR(32) NOT NULL COMMENT '命令类型：CREATE_BATCH/SUBMIT_TEST/APPROVE/RECALL/SPLIT',
+    command_type VARCHAR(32) NOT NULL COMMENT '命令类型：CREATE_BATCH/SUBMIT_TEST/APPROVE/RECALL/SPLIT/CREATE_SAMPLING_PLAN/RECORD_SAMPLE',
     command_key VARCHAR(64) NOT NULL COMMENT '命令幂等键；同类型同键同参重放返回首次结果，同键改参返回 409',
     fingerprint VARCHAR(64) NOT NULL COMMENT '业务参数（不含 commandKey）的 SHA-256 摘要，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行成功的 HTTP 状态码',
@@ -66,3 +66,37 @@ CREATE TABLE IF NOT EXISTS batch_lineage (
     created_at VARCHAR(40) NOT NULL COMMENT '拆分时间，ISO-8601 UTC instant 字符串',
     CONSTRAINT uk_lineage_child UNIQUE (child_key)
 );
+
+-- 抽样检验计划：同批次至多一个未终结(OPEN)计划由服务层在批次行锁内保证；计划终结后不可改写。
+CREATE TABLE IF NOT EXISTS sampling_plan (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键，同时作为同批次计划创建顺序依据',
+    plan_key VARCHAR(64) NOT NULL COMMENT '抽样计划业务键，全局唯一，创建后不可修改',
+    batch_key VARCHAR(64) NOT NULL COMMENT '所属批次业务键；子批不继承父批计划与判定',
+    sample_size INT NOT NULL COMMENT '样本量，取值 1～200，单位：件',
+    accept_number INT NOT NULL COMMENT '接收数 Ac，满足 0≤Ac<Re≤样本量，单位：加权缺陷数',
+    reject_number INT NOT NULL COMMENT '拒收数 Re，累计加权缺陷数达到该值即判定 REJECTED',
+    basis VARCHAR(512) NOT NULL COMMENT '抽样依据，非空，如抽样标准与方案编号',
+    status VARCHAR(16) NOT NULL COMMENT '计划状态：OPEN 未终结/ACCEPTED 接收/REJECTED 拒收',
+    recorded_count INT NOT NULL COMMENT '已登记样本件数，单位：件，取值 0～样本量，只增不改',
+    weighted_defects INT NOT NULL COMMENT '累计加权缺陷数：CRITICAL=3、MAJOR=1、MINOR=0，只增不改',
+    created_at VARCHAR(40) NOT NULL COMMENT '创建时间，ISO-8601 UTC instant 字符串',
+    decided_at VARCHAR(40) COMMENT '判定时刻，ISO-8601 UTC instant 字符串；OPEN 时为 NULL，终结时非空且不可改写',
+    CONSTRAINT uk_plan_key UNIQUE (plan_key)
+);
+CREATE INDEX IF NOT EXISTS idx_plan_batch ON sampling_plan (batch_key, status);
+
+-- 逐件样本登记：登记后不可改写、不可删除；累计计数与判定在同一事务内落定。
+CREATE TABLE IF NOT EXISTS sample_record (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键，同时作为登记提交顺序依据',
+    plan_key VARCHAR(64) NOT NULL COMMENT '所属抽样计划业务键',
+    sample_no INT NOT NULL COMMENT '样本序号，取值 1～样本量，同一计划内不可重复',
+    conforming BOOLEAN NOT NULL COMMENT '是否合格件：TRUE 合格；FALSE 为缺陷件',
+    grade VARCHAR(8) COMMENT '缺陷等级 CRITICAL/MAJOR/MINOR；合格件为 NULL',
+    description VARCHAR(512) NOT NULL COMMENT '登记描述，非空',
+    weight_added INT NOT NULL COMMENT '该件计入的加权缺陷数：合格/MINOR=0、MAJOR=1、CRITICAL=3',
+    weighted_defects_after INT NOT NULL COMMENT '该件登记落定后计划累计加权缺陷数，用于历史追溯',
+    plan_status_after VARCHAR(16) NOT NULL COMMENT '该件登记落定后计划状态：OPEN/ACCEPTED/REJECTED，登记当时快照，不可改写',
+    created_at VARCHAR(40) NOT NULL COMMENT '登记时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_sample_no UNIQUE (plan_key, sample_no)
+);
+
