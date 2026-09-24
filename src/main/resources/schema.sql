@@ -3,16 +3,19 @@
 CREATE TABLE IF NOT EXISTS experiment (
     id          VARCHAR(64)  NOT NULL,
     block_count INT          NOT NULL,
+    version     INT          NOT NULL,
     status      VARCHAR(16)  NOT NULL,
     created_at  BIGINT       NOT NULL,
     CONSTRAINT pk_experiment PRIMARY KEY (id),
-    CONSTRAINT ck_experiment_block_count CHECK (block_count BETWEEN 2 AND 8),
+    CONSTRAINT ck_experiment_block_count CHECK (block_count BETWEEN 2 AND 16),
+    CONSTRAINT ck_experiment_version CHECK (version >= 1),
     CONSTRAINT ck_experiment_status CHECK (status IN ('OPEN', 'CLOSED'))
 );
-COMMENT ON TABLE  experiment IS '实验表，experimentId 全局唯一，创建后区组数量与席位内容不可修改';
+COMMENT ON TABLE  experiment IS '实验表，experimentId 全局唯一；创建时2~8个区组，协调员可在 OPEN 状态追加区组至最多16个';
 COMMENT ON COLUMN experiment.id IS '实验编号，业务唯一，创建时由请求给定';
-COMMENT ON COLUMN experiment.block_count IS '区组数量，取值2~8，创建时固定，每组固定4个席位';
-COMMENT ON COLUMN experiment.status IS '实验状态：OPEN=开放登记；CLOSED=已关闭，关闭后拒绝新增分配';
+COMMENT ON COLUMN experiment.block_count IS '区组数量，创建时取2~8，每次扩容追加1~4个区组后总数不得超过16，每组固定4个席位';
+COMMENT ON COLUMN experiment.version IS '实验版本号，创建为1，每次成功扩容加一，登记/退组/关闭不改变版本';
+COMMENT ON COLUMN experiment.status IS '实验状态：OPEN=开放登记与扩容；CLOSED=已关闭，关闭后拒绝新增分配与扩容';
 COMMENT ON COLUMN experiment.created_at IS '创建时间，Unix 毫秒，UTC';
 
 CREATE TABLE IF NOT EXISTS seat (
@@ -27,7 +30,7 @@ CREATE TABLE IF NOT EXISTS seat (
 );
 COMMENT ON TABLE  seat IS '席位表（处理映射）：每区组4席，按提交顺序固定两个A两个B，之后不可改；仅保存于数据库';
 COMMENT ON COLUMN seat.experiment_id IS '所属实验编号';
-COMMENT ON COLUMN seat.block_no IS '区组号，从1开始，按区组顺序分配';
+COMMENT ON COLUMN seat.block_no IS '区组号，从1开始，按区组顺序分配；扩容新区组号从现有最大区组号加一起连续编号';
 COMMENT ON COLUMN seat.seat_no IS '区组内席位号1~4，属于可直接解码信息，禁止通过普通接口暴露';
 COMMENT ON COLUMN seat.treatment IS '处理代码 A 或 B，盲底，仅揭盲批准后可返回给申请人';
 
@@ -59,6 +62,35 @@ COMMENT ON COLUMN allocation.status IS '分配状态：ASSIGNED=在组；WITHDRA
 COMMENT ON COLUMN allocation.assigned_actor IS '执行登记的操作者编号（X-Actor-Id）';
 COMMENT ON COLUMN allocation.assigned_at IS '分配时间，Unix 毫秒，UTC';
 COMMENT ON COLUMN allocation.withdrawn_at IS '退组时间，Unix 毫秒，UTC；NULL 表示未退组';
+
+CREATE TABLE IF NOT EXISTS block_extension (
+    id                   BIGINT       NOT NULL AUTO_INCREMENT,
+    extension_key        VARCHAR(64)  NOT NULL,
+    experiment_id        VARCHAR(64)  NOT NULL,
+    expected_version     INT          NOT NULL,
+    from_block_count     INT          NOT NULL,
+    added_block_count    INT          NOT NULL,
+    from_block_no        INT          NOT NULL,
+    to_block_no          INT          NOT NULL,
+    resulting_version    INT          NOT NULL,
+    operator_actor       VARCHAR(64)  NOT NULL,
+    created_at           BIGINT       NOT NULL,
+    CONSTRAINT pk_block_extension PRIMARY KEY (id),
+    CONSTRAINT uq_block_extension_key UNIQUE (extension_key),
+    CONSTRAINT ck_block_extension_added CHECK (added_block_count BETWEEN 1 AND 4)
+);
+COMMENT ON TABLE  block_extension IS '区组扩容记录；extensionKey 全局唯一，与追加席位、实验版本递增同一事务提交；实验关闭后记录仍保留可查';
+COMMENT ON COLUMN block_extension.id IS '扩容记录自增主键';
+COMMENT ON COLUMN block_extension.extension_key IS '扩容幂等键（请求体 extensionKey），全局唯一；同键同参重放首次结果，异参409，失败不占键';
+COMMENT ON COLUMN block_extension.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN block_extension.expected_version IS '提交时期望的扩容前实验版本号，与库内不一致则409（乐观并发）';
+COMMENT ON COLUMN block_extension.from_block_count IS '扩容前区组总数';
+COMMENT ON COLUMN block_extension.added_block_count IS '本次追加区组数量，1~4';
+COMMENT ON COLUMN block_extension.from_block_no IS '本次首个新区组号（=扩容前最大区组号+1）';
+COMMENT ON COLUMN block_extension.to_block_no IS '本次最后一个新区组号（=扩容后最大区组号）';
+COMMENT ON COLUMN block_extension.resulting_version IS '扩容后实验版本号（=扩容前版本+1）';
+COMMENT ON COLUMN block_extension.operator_actor IS '执行扩容的协调员操作者编号（X-Actor-Id），属于幂等参数的一部分';
+COMMENT ON COLUMN block_extension.created_at IS '扩容提交时间，Unix 毫秒，UTC';
 
 CREATE TABLE IF NOT EXISTS unblind_request (
     id                      VARCHAR(64)  NOT NULL,

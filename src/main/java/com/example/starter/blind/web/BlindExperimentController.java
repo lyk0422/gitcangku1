@@ -5,8 +5,12 @@ import com.example.starter.blind.ActorContext;
 import com.example.starter.blind.ApiException;
 import com.example.starter.blind.RequestTokens;
 import com.example.starter.blind.dto.AllocationView;
+import com.example.starter.blind.dto.CapacityView;
 import com.example.starter.blind.dto.CreateExperimentRequest;
 import com.example.starter.blind.dto.ExperimentView;
+import com.example.starter.blind.dto.ExtendBlocksRequest;
+import com.example.starter.blind.dto.ExtensionHistoryView;
+import com.example.starter.blind.dto.ExtensionView;
 import com.example.starter.blind.dto.UnblindApplyRequest;
 import com.example.starter.blind.dto.UnblindRequestView;
 import com.example.starter.blind.dto.UnblindResultView;
@@ -24,6 +28,7 @@ import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -36,6 +41,7 @@ public class BlindExperimentController {
 
     static final String OP_EXPERIMENT_CREATE = "experiment.create";
     static final String OP_EXPERIMENT_CLOSE = "experiment.close";
+    static final String OP_EXPERIMENT_EXTEND = "experiment.extendBlocks";
     static final String OP_ALLOCATION_CREATE = "allocation.create";
     static final String OP_ALLOCATION_WITHDRAW = "allocation.withdraw";
     static final String OP_UNBLIND_APPLY = "unblind.apply";
@@ -94,6 +100,50 @@ public class BlindExperimentController {
         return idempotencyService.runWrite(reqId, OP_EXPERIMENT_CLOSE, fingerprint, actor,
                 () -> IdempotencyService.WriteOutcome.of(HttpStatus.OK.value(),
                         experimentService.close(expId)));
+    }
+
+    // ---------------- 区组扩容 ----------------
+
+    /**
+     * 区组扩容（仅 COORDINATOR）：对 OPEN 实验追加 1~4 个区组，每个区组 4 席且含两个 A 两个 B。
+     * 区组顺序属于请求参数；extensionKey 全局唯一。
+     */
+    @PostMapping("/experiments/{experimentId}/block-extensions")
+    public ResponseEntity<String> extendBlocks(
+            @PathVariable String experimentId,
+            @Valid @RequestBody ExtendBlocksRequest request,
+            @RequestHeader(IdempotencyService.HEADER_REQUEST_ID) String requestId) {
+        Actor actor = requireCoordinator();
+        String expId = RequestTokens.requireId("experimentId", experimentId);
+        String extensionKey = RequestTokens.requireId("extensionKey", request.extensionKey());
+        String reqId = RequestTokens.requireRequestId(requestId);
+        List<List<String>> blocks = request.blocks().stream()
+                .map(ExtendBlocksRequest.BlockSeats::treatments)
+                .toList();
+        String fingerprint = idempotencyService.fingerprint(OP_EXPERIMENT_EXTEND,
+                Map.of("experimentId", expId,
+                        "extensionKey", extensionKey,
+                        "expectedVersion", request.expectedVersion(),
+                        "blocks", blocks));
+        return idempotencyService.runWrite(reqId, OP_EXPERIMENT_EXTEND, fingerprint, actor,
+                () -> IdempotencyService.WriteOutcome.of(HttpStatus.OK.value(),
+                        experimentService.extendBlocks(expId, extensionKey,
+                                request.expectedVersion(), blocks, actor.actorId())));
+    }
+
+    /** 查询区组容量与已用席位统计（COORDINATOR / REVIEWER 均可），不含处理映射。 */
+    @GetMapping("/experiments/{experimentId}/capacity")
+    public CapacityView getCapacity(@PathVariable String experimentId) {
+        requireActor();
+        return experimentService.getCapacity(RequestTokens.requireId("experimentId", experimentId));
+    }
+
+    /** 查询扩容历史（COORDINATOR / REVIEWER 均可）；实验关闭后记录仍保留可查。 */
+    @GetMapping("/experiments/{experimentId}/block-extensions")
+    public ExtensionHistoryView getExtensionHistory(@PathVariable String experimentId) {
+        requireActor();
+        return experimentService.getExtensionHistory(
+                RequestTokens.requireId("experimentId", experimentId));
     }
 
     // ---------------- 分配 / 退组 / 查询 ----------------
