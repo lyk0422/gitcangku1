@@ -5,11 +5,16 @@ import com.example.starter.blind.ActorContext;
 import com.example.starter.blind.ApiException;
 import com.example.starter.blind.RequestTokens;
 import com.example.starter.blind.dto.AllocationView;
+import com.example.starter.blind.dto.BlockExtensionHistoryView;
+import com.example.starter.blind.dto.BlockExtensionView;
+import com.example.starter.blind.dto.CapacityStatsView;
 import com.example.starter.blind.dto.CreateExperimentRequest;
 import com.example.starter.blind.dto.ExperimentView;
+import com.example.starter.blind.dto.ExtendBlocksRequest;
 import com.example.starter.blind.dto.UnblindApplyRequest;
 import com.example.starter.blind.dto.UnblindRequestView;
 import com.example.starter.blind.dto.UnblindResultView;
+import com.example.starter.blind.service.BlockExtensionService;
 import com.example.starter.blind.service.ExperimentService;
 import com.example.starter.blind.service.IdempotencyService;
 import com.example.starter.blind.service.UnblindService;
@@ -36,21 +41,25 @@ public class BlindExperimentController {
 
     static final String OP_EXPERIMENT_CREATE = "experiment.create";
     static final String OP_EXPERIMENT_CLOSE = "experiment.close";
+    static final String OP_EXPERIMENT_EXTEND = "experiment.extendBlocks";
     static final String OP_ALLOCATION_CREATE = "allocation.create";
     static final String OP_ALLOCATION_WITHDRAW = "allocation.withdraw";
     static final String OP_UNBLIND_APPLY = "unblind.apply";
     static final String OP_UNBLIND_APPROVE = "unblind.approve";
 
     private final ExperimentService experimentService;
+    private final BlockExtensionService blockExtensionService;
     private final UnblindService unblindService;
     private final IdempotencyService idempotencyService;
     private final ActorContext actorContext;
 
     public BlindExperimentController(ExperimentService experimentService,
+                                     BlockExtensionService blockExtensionService,
                                      UnblindService unblindService,
                                      IdempotencyService idempotencyService,
                                      ActorContext actorContext) {
         this.experimentService = experimentService;
+        this.blockExtensionService = blockExtensionService;
         this.unblindService = unblindService;
         this.idempotencyService = idempotencyService;
         this.actorContext = actorContext;
@@ -94,6 +103,48 @@ public class BlindExperimentController {
         return idempotencyService.runWrite(reqId, OP_EXPERIMENT_CLOSE, fingerprint, actor,
                 () -> IdempotencyService.WriteOutcome.of(HttpStatus.OK.value(),
                         experimentService.close(expId)));
+    }
+
+    // ---------------- 区组扩容 ----------------
+
+    /**
+     * 盲法区组扩容（仅 COORDINATOR）：OPEN 实验追加 1~4 个区组，版本加一。
+     * 权限先于幂等；extensionKey 全局唯一，同键同参重放首次结果，换序视为异参 409。
+     */
+    @PostMapping("/experiments/{experimentId}/block-extensions")
+    public ResponseEntity<String> extendBlocks(
+            @PathVariable String experimentId,
+            @Valid @RequestBody ExtendBlocksRequest request,
+            @RequestHeader(IdempotencyService.HEADER_REQUEST_ID) String requestId) {
+        Actor actor = requireCoordinator();
+        String expId = RequestTokens.requireId("experimentId", experimentId);
+        String reqId = RequestTokens.requireRequestId(requestId);
+        String extensionKey = RequestTokens.requireId("extensionKey", request.extensionKey());
+        String fingerprint = idempotencyService.fingerprint(OP_EXPERIMENT_EXTEND,
+                Map.of("experimentId", expId,
+                        "extensionKey", extensionKey,
+                        "expectedVersion", request.expectedVersion(),
+                        "blocks", request.blocks().stream()
+                                .map(b -> Map.of("treatments", b.treatments())).toList()));
+        return idempotencyService.runWrite(reqId, OP_EXPERIMENT_EXTEND, fingerprint, actor,
+                () -> IdempotencyService.WriteOutcome.of(HttpStatus.CREATED.value(),
+                        blockExtensionService.extend(expId, request, actor.actorId())));
+    }
+
+    /** 查询区组容量与已用席位统计（COORDINATOR / REVIEWER 均可），不泄露处理映射。 */
+    @GetMapping("/experiments/{experimentId}/capacity")
+    public CapacityStatsView getCapacity(@PathVariable String experimentId) {
+        requireActor();
+        return blockExtensionService.stats(
+                RequestTokens.requireId("experimentId", experimentId));
+    }
+
+    /** 查询扩容历史（COORDINATOR / REVIEWER 均可）；实验关闭后记录仍保留可查。 */
+    @GetMapping("/experiments/{experimentId}/block-extensions")
+    public BlockExtensionHistoryView getExtensionHistory(@PathVariable String experimentId) {
+        requireActor();
+        return blockExtensionService.history(
+                RequestTokens.requireId("experimentId", experimentId));
     }
 
     // ---------------- 分配 / 退组 / 查询 ----------------

@@ -94,6 +94,16 @@ public class AllocationRepository {
     }
 
     /**
+     * 已退组席位数；退组席位仍占用容量，统计中单独列出。
+     */
+    public long countWithdrawn(String experimentId) {
+        Long count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM allocation WHERE experiment_id = ? AND status = 'WITHDRAWN'",
+                Long.class, experimentId);
+        return count == null ? 0 : count;
+    }
+
+    /**
      * 退组：仅 ASSIGNED -> WITHDRAWN，不释放席位。
      *
      * @return 受影响行数；0 表示不存在或已退组

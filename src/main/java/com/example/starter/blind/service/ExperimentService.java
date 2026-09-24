@@ -56,7 +56,7 @@ public class ExperimentService {
         }
         long now = clock.nowMillis();
         experimentRepository.insertExperiment(
-                new ExperimentRow(experimentId, blockCount, "OPEN", now));
+                new ExperimentRow(experimentId, blockCount, 1, "OPEN", now));
         List<SeatRow> seats = new ArrayList<>(blockCount * SEATS_PER_BLOCK);
         for (int blockNo = 1; blockNo <= blockCount; blockNo++) {
             for (int seatNo = 1; seatNo <= SEATS_PER_BLOCK; seatNo++) {
@@ -66,14 +66,13 @@ public class ExperimentService {
             }
         }
         seats.forEach(experimentRepository::insertSeat);
-        return new ExperimentView(experimentId, blockCount, SEATS_PER_BLOCK,
+        return new ExperimentView(experimentId, blockCount, 1, SEATS_PER_BLOCK,
                 blockCount * SEATS_PER_BLOCK, "OPEN", now);
     }
 
     public ExperimentView getExperiment(String experimentId) {
         ExperimentRow row = mustFindExperiment(experimentId);
-        return new ExperimentView(row.id(), row.blockCount(), SEATS_PER_BLOCK,
-                row.blockCount() * SEATS_PER_BLOCK, row.status(), row.createdAt());
+        return toView(row);
     }
 
     /**
@@ -161,8 +160,8 @@ public class ExperimentService {
             throw ApiException.conflict("实验已关闭");
         }
         experimentRepository.markClosed(experimentId);
-        return new ExperimentView(experiment.id(), experiment.blockCount(), SEATS_PER_BLOCK,
-                experiment.blockCount() * SEATS_PER_BLOCK, "CLOSED", experiment.createdAt());
+        return toView(new ExperimentRow(experiment.id(), experiment.blockCount(),
+                experiment.version(), "CLOSED", experiment.createdAt()));
     }
 
     /**
@@ -198,5 +197,10 @@ public class ExperimentService {
     private AllocationView toView(AllocationRow row) {
         return new AllocationView(row.experimentId(), row.participantId(), row.blindCode(),
                 row.blockNo(), row.status(), row.assignedAt(), row.withdrawnAt());
+    }
+
+    private ExperimentView toView(ExperimentRow row) {
+        return new ExperimentView(row.id(), row.blockCount(), row.version(), SEATS_PER_BLOCK,
+                row.blockCount() * SEATS_PER_BLOCK, row.status(), row.createdAt());
     }
 }
