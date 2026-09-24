@@ -3,7 +3,9 @@ package com.example.starter.plan.web;
 import com.example.starter.plan.service.PlanService;
 import com.example.starter.plan.web.dto.CreatePlanRequest;
 import com.example.starter.plan.web.dto.PlanActionRequest;
+import com.example.starter.plan.web.dto.PlanPairResponse;
 import com.example.starter.plan.web.dto.PlanResponse;
+import com.example.starter.plan.web.dto.PublishPairRequest;
 import com.example.starter.plan.web.dto.PublishedSlotView;
 import com.example.starter.plan.web.dto.RescheduleChainResponse;
 import com.example.starter.plan.web.dto.RescheduleRequest;
@@ -105,12 +107,38 @@ public class PlanController {
     }
 
     /**
-     * 按运营日期与区段查询当前已发布时隙。
+     * 按运营日期与区段查询当前已发布时隙（含跨零点占用落在该日的部分）。
      */
     @GetMapping("/published-slots")
     public List<PublishedSlotView> getPublishedSlots(
             @RequestParam @NotNull @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date,
             @RequestParam @NotBlank String sectionId) {
         return service.getPublishedSlots(date, sectionId);
+    }
+
+    /**
+     * 夜间计划对联合发布：一个事务内重查两张草稿版本与状态并原子校验冲突，
+     * 成功则两张同时发布并写入不可变计划对记录。
+     */
+    @PostMapping("/plan-pairs/publish")
+    public PlanPairResponse publishPair(@Valid @RequestBody PublishPairRequest request) {
+        return service.publishPair(request);
+    }
+
+    /**
+     * 取消计划对：取消其中仍处于已发布状态的成员，各自仅释放自身占用。
+     */
+    @PostMapping("/plan-pairs/{nightPairKey}/cancel")
+    public PlanPairResponse cancelPair(@PathVariable String nightPairKey,
+                                       @Valid @RequestBody PlanActionRequest request) {
+        return service.cancelPair(nightPairKey, request.requestKey());
+    }
+
+    /**
+     * 计划对明细（含两张计划当前状态与占用）。
+     */
+    @GetMapping("/plan-pairs/{nightPairKey}")
+    public PlanPairResponse getPair(@PathVariable String nightPairKey) {
+        return service.getPair(nightPairKey);
     }
 }

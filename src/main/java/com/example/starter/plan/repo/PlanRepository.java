@@ -1,6 +1,7 @@
 package com.example.starter.plan.repo;
 
 import com.example.starter.plan.model.DayPlan;
+import com.example.starter.plan.model.NightPair;
 import com.example.starter.plan.model.Occupancy;
 import com.example.starter.plan.model.PlanStatus;
 import com.example.starter.plan.model.PublishedSlot;
@@ -27,12 +28,17 @@ import org.springframework.stereotype.Repository;
 @Repository
 public class PlanRepository {
 
+    private static final String PLAN_COLUMNS =
+            "id, schedule_key, op_date, version, status, overnight, night_pair_key";
+
     private static final RowMapper<DayPlan> PLAN_MAPPER = (rs, n) -> new DayPlan(
             rs.getLong("id"),
             rs.getString("schedule_key"),
             rs.getObject("op_date", LocalDate.class),
             rs.getInt("version"),
-            PlanStatus.valueOf(rs.getString("status")));
+            PlanStatus.valueOf(rs.getString("status")),
+            rs.getBoolean("overnight"),
+            rs.getString("night_pair_key"));
 
     private static final RowMapper<Occupancy> OCCUPANCY_MAPPER = (rs, n) -> new Occupancy(
             rs.getLong("id"),
@@ -49,6 +55,15 @@ public class PlanRepository {
             rs.getLong("successor_plan_id"),
             rs.getLong("created_at"));
 
+    private static final RowMapper<NightPair> NIGHT_PAIR_MAPPER = (rs, n) -> new NightPair(
+            rs.getLong("id"),
+            rs.getString("night_pair_key"),
+            rs.getLong("first_plan_id"),
+            rs.getLong("second_plan_id"),
+            rs.getObject("first_op_date", LocalDate.class),
+            rs.getObject("second_op_date", LocalDate.class),
+            rs.getLong("created_at"));
+
     private final JdbcTemplate jdbc;
 
     public PlanRepository(JdbcTemplate jdbc) {
@@ -58,18 +73,22 @@ public class PlanRepository {
     /**
      * 插入新计划，返回自增主键。
      */
-    public long insertPlan(String scheduleKey, LocalDate opDate, PlanStatus status, long nowMillis) {
+    public long insertPlan(String scheduleKey, LocalDate opDate, PlanStatus status,
+                           boolean overnight, String nightPairKey, long nowMillis) {
         KeyHolder keys = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO rail_day_plan (schedule_key, op_date, version, status, created_at, updated_at)"
-                            + " VALUES (?, ?, 1, ?, ?, ?)",
+                    "INSERT INTO rail_day_plan"
+                            + " (schedule_key, op_date, version, status, overnight, night_pair_key,"
+                            + " created_at, updated_at) VALUES (?, ?, 1, ?, ?, ?, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, scheduleKey);
             ps.setDate(2, Date.valueOf(opDate));
             ps.setString(3, status.name());
-            ps.setLong(4, nowMillis);
-            ps.setLong(5, nowMillis);
+            ps.setBoolean(4, overnight);
+            ps.setString(5, nightPairKey);
+            ps.setLong(6, nowMillis);
+            ps.setLong(7, nowMillis);
             return ps;
         }, keys);
         return keys.getKey().longValue();
@@ -79,7 +98,7 @@ public class PlanRepository {
      * 按业务键查询计划（不加锁）。
      */
     public Optional<DayPlan> findByKey(String scheduleKey) {
-        return jdbc.query("SELECT id, schedule_key, op_date, version, status FROM rail_day_plan"
+        return jdbc.query("SELECT " + PLAN_COLUMNS + " FROM rail_day_plan"
                         + " WHERE schedule_key = ?",
                 PLAN_MAPPER, scheduleKey).stream().findFirst();
     }
@@ -88,7 +107,7 @@ public class PlanRepository {
      * 按主键查询计划（不加锁），用于改签链遍历。
      */
     public Optional<DayPlan> findById(long planId) {
-        return jdbc.query("SELECT id, schedule_key, op_date, version, status FROM rail_day_plan"
+        return jdbc.query("SELECT " + PLAN_COLUMNS + " FROM rail_day_plan"
                         + " WHERE id = ?",
                 PLAN_MAPPER, planId).stream().findFirst();
     }
@@ -97,9 +116,28 @@ public class PlanRepository {
      * 按业务键查询计划并加行级写锁，须在事务内调用，用于串行化同一计划的更新/发布/取消。
      */
     public Optional<DayPlan> findByKeyForUpdate(String scheduleKey) {
-        return jdbc.query("SELECT id, schedule_key, op_date, version, status FROM rail_day_plan"
+        return jdbc.query("SELECT " + PLAN_COLUMNS + " FROM rail_day_plan"
                         + " WHERE schedule_key = ? FOR UPDATE",
                 PLAN_MAPPER, scheduleKey).stream().findFirst();
+    }
+
+    /**
+     * 查询声明了指定夜间计划对业务键的草稿计划（不加锁，须在发布锁保护的事务内使用）。
+     */
+    public List<DayPlan> findDraftsByNightPairKey(String nightPairKey) {
+        return jdbc.query("SELECT " + PLAN_COLUMNS + " FROM rail_day_plan"
+                        + " WHERE night_pair_key = ? AND status = 'DRAFT' ORDER BY op_date, id",
+                PLAN_MAPPER, nightPairKey);
+    }
+
+    /**
+     * 统计声明了指定夜间计划对业务键的草稿数量，用于限制同一键最多组成一对草稿。
+     */
+    public int countDraftsByNightPairKey(String nightPairKey) {
+        Integer count = jdbc.queryForObject("SELECT COUNT(*) FROM rail_day_plan"
+                        + " WHERE night_pair_key = ? AND status = 'DRAFT'",
+                Integer.class, nightPairKey);
+        return count == null ? 0 : count;
     }
 
     /**
@@ -154,21 +192,25 @@ public class PlanRepository {
     }
 
     /**
-     * 查询指定运营日、指定区段集合上其他已发布计划的生效时隙（排除给定计划集合）。
+     * 查询指定区段集合上与给定时刻区间 [fromUtc, toUtc) 存在交叠的、其他已发布计划的生效时隙
+     * （排除给定计划集合）。按时刻交叠判定，跨零点占用自然同时参与两个运营日的判定。
      */
-    public List<PublishedSlot> findPublishedSlots(LocalDate opDate, Collection<String> sectionIds,
-                                                  Collection<Long> excludePlanIds) {
+    public List<PublishedSlot> findPublishedSlotsOverlapping(Collection<String> sectionIds,
+                                                             Instant fromUtc, Instant toUtc,
+                                                             Collection<Long> excludePlanIds) {
         if (sectionIds.isEmpty()) {
             return List.of();
         }
         StringJoiner sectionPlaceholders = new StringJoiner(", ");
         sectionIds.forEach(s -> sectionPlaceholders.add("?"));
         StringBuilder sql = new StringBuilder(
-                "SELECT p.schedule_key, o.train_no, o.section_id, o.start_utc, o.end_utc"
+                "SELECT p.schedule_key, p.op_date, o.train_no, o.section_id, o.start_utc, o.end_utc"
                         + " FROM rail_plan_occupancy o JOIN rail_day_plan p ON p.id = o.plan_id"
-                        + " WHERE p.status = 'PUBLISHED' AND p.op_date = ?");
+                        + " WHERE p.status = 'PUBLISHED'"
+                        + " AND o.start_utc < ? AND o.end_utc > ?");
         List<Object> args = new ArrayList<>();
-        args.add(Date.valueOf(opDate));
+        args.add(toUtc.toEpochMilli());
+        args.add(fromUtc.toEpochMilli());
         if (!excludePlanIds.isEmpty()) {
             StringJoiner excludePlaceholders = new StringJoiner(", ");
             excludePlanIds.forEach(id -> excludePlaceholders.add("?"));
@@ -180,6 +222,7 @@ public class PlanRepository {
         args.addAll(sectionIds);
         return jdbc.query(sql.toString(), (rs, n) -> new PublishedSlot(
                 rs.getString("schedule_key"),
+                rs.getObject("op_date", LocalDate.class),
                 rs.getString("train_no"),
                 rs.getString("section_id"),
                 Instant.ofEpochMilli(rs.getLong("start_utc")),
@@ -211,6 +254,28 @@ public class PlanRepository {
         return jdbc.query("SELECT id, predecessor_plan_id, successor_plan_id, created_at"
                         + " FROM rail_plan_reschedule_link WHERE successor_plan_id = ?",
                 LINK_MAPPER, successorPlanId).stream().findFirst();
+    }
+
+    /**
+     * 写入夜间计划对不可变记录；night_pair_key 唯一约束冲突时抛出 DuplicateKeyException 由上层裁决。
+     */
+    public void insertNightPair(String nightPairKey, long firstPlanId, long secondPlanId,
+                                LocalDate firstOpDate, LocalDate secondOpDate, long nowMillis) {
+        jdbc.update("INSERT INTO rail_night_pair"
+                        + " (night_pair_key, first_plan_id, second_plan_id,"
+                        + " first_op_date, second_op_date, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                nightPairKey, firstPlanId, secondPlanId,
+                Date.valueOf(firstOpDate), Date.valueOf(secondOpDate), nowMillis);
+    }
+
+    /**
+     * 按计划对业务键查询计划对记录（不加锁）。
+     */
+    public Optional<NightPair> findNightPairByKey(String nightPairKey) {
+        return jdbc.query("SELECT id, night_pair_key, first_plan_id, second_plan_id,"
+                        + " first_op_date, second_op_date, created_at"
+                        + " FROM rail_night_pair WHERE night_pair_key = ?",
+                NIGHT_PAIR_MAPPER, nightPairKey).stream().findFirst();
     }
 
     /**
