@@ -1,5 +1,7 @@
 package com.example.starter.error;
 
+import com.example.starter.evidence.destruction.DestructionValidationException;
+import com.example.starter.evidence.destruction.dto.DestructionValidationError;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
@@ -26,6 +28,16 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorBody> handleApi(ApiException ex) {
         return ResponseEntity.status(ex.status())
                 .body(new ErrorBody(ex.status().value(), ex.getMessage(), LocalDateTime.now()));
+    }
+
+    /**
+     * 创建销毁令整单 422：返回逐件不合格原因，不创建销毁令。
+     */
+    @ExceptionHandler(DestructionValidationException.class)
+    public ResponseEntity<DestructionValidationError> handleDestructionValidation(
+            DestructionValidationException ex) {
+        return ResponseEntity.unprocessableEntity()
+                .body(new DestructionValidationError(422, ex.getMessage(), ex.itemErrors()));
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)

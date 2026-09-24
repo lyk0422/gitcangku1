@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS evidence (
     category VARCHAR(64) NOT NULL COMMENT '证物类别，入库后不可修改',
     seal_no VARCHAR(64) NOT NULL COMMENT '封条编号，入库后不可修改',
     custodian_id VARCHAR(64) NOT NULL COMMENT '当前保管人（操作人标识），交接接受后原子切换；借出期间不变',
-    status VARCHAR(20) NOT NULL COMMENT '证物状态：SEALED 已封存 / TRANSFER_PENDING 待接收 / BORROWED 借出未归还 / SEAL_BROKEN 封条异常（终态）',
+    status VARCHAR(20) NOT NULL COMMENT '证物状态：SEALED 已封存 / TRANSFER_PENDING 待接收 / BORROWED 借出未归还 / SEAL_BROKEN 封条异常（终态）/ DESTROYED 已销毁（终态，保管链封存）',
     created_at DATETIME(6) NOT NULL COMMENT '入库时间，Asia/Shanghai',
     updated_at DATETIME(6) NOT NULL COMMENT '最近一次状态或保管人变更时间，Asia/Shanghai',
     CONSTRAINT uk_evidence_key UNIQUE (evidence_key)
@@ -65,10 +65,50 @@ CREATE TABLE IF NOT EXISTS command_log (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     command_key VARCHAR(64) NOT NULL COMMENT '幂等命令键，全局唯一',
     actor_id VARCHAR(64) NOT NULL COMMENT '发起操作人',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN/DESTRUCTION_CREATE/DESTRUCTION_APPROVE/DESTRUCTION_REJECT/DESTRUCTION_EXECUTE',
     request_hash VARCHAR(64) NOT NULL COMMENT '请求参数规范化后的 SHA-256，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行的 HTTP 状态码',
     response_body TEXT NOT NULL COMMENT '首次执行的响应体 JSON，重放时原样返回',
     created_at DATETIME(6) NOT NULL COMMENT '首次执行时间，Asia/Shanghai',
     CONSTRAINT uk_command_key UNIQUE (command_key)
+);
+
+-- 销毁令：保管人发起，双人互不相同且均不同于提交人审批；拒绝立即终态 REJECTED，第二次同意转 APPROVED，执行成功转 DESTROYED 终态。
+CREATE TABLE IF NOT EXISTS destruction_order (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    destruction_key VARCHAR(64) NOT NULL COMMENT '销毁令业务键，全局唯一',
+    submitter_id VARCHAR(64) NOT NULL COMMENT '提交销毁令的当前保管人；审批人不得与此人相同',
+    legal_basis VARCHAR(128) NOT NULL COMMENT '非空法律依据编号',
+    destruction_method VARCHAR(128) NOT NULL COMMENT '非空销毁方式',
+    force_include_broken TINYINT NOT NULL COMMENT '是否显式声明允许封条异常证物入列：1 是 / 0 否',
+    status VARCHAR(20) NOT NULL COMMENT '销毁令状态：PENDING 待审批 / APPROVED 已批准待执行 / REJECTED 已拒绝（终态）/ DESTROYED 已执行（终态）',
+    reject_reason VARCHAR(512) NULL COMMENT '拒绝原因；拒绝时写入一次，不可改写；NULL 表示未拒绝',
+    rejected_by VARCHAR(64) NULL COMMENT '拒绝操作的审批人；NULL 表示未拒绝',
+    rejected_at DATETIME(6) NULL COMMENT '拒绝时间，Asia/Shanghai；NULL 表示未拒绝',
+    approved_at DATETIME(6) NULL COMMENT '第二次同意使销毁令转 APPROVED 的时间；NULL 表示未批准',
+    destroyed_at DATETIME(6) NULL COMMENT '实际执行销毁时间，Asia/Shanghai；NULL 表示未执行',
+    created_at DATETIME(6) NOT NULL COMMENT '创建时间，Asia/Shanghai',
+    updated_at DATETIME(6) NOT NULL COMMENT '最近状态变更时间，Asia/Shanghai',
+    CONSTRAINT uk_destruction_key UNIQUE (destruction_key)
+);
+
+-- 销毁令入列证物：创建时写入，之后不可变；每件证物至多被一个未终结（PENDING/APPROVED）销毁令冻结。
+CREATE TABLE IF NOT EXISTS destruction_order_item (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    destruction_key VARCHAR(64) NOT NULL COMMENT '所属销毁令业务键',
+    evidence_key VARCHAR(64) NOT NULL COMMENT '入列证物业务键',
+    position INT NOT NULL COMMENT '提交列表中的原始位置（从 0 开始），用于逐件原因按原序返回；同集合换序视为同参',
+    KEY idx_destruction_item_order (destruction_key, position),
+    KEY idx_destruction_item_evidence (evidence_key)
+);
+
+-- 销毁令审批记录：只追加；每个销毁令至多两条 AGREED 且审批人互不相同并不同于提交人，至多一条 REJECTED。
+CREATE TABLE IF NOT EXISTS destruction_approval (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    destruction_key VARCHAR(64) NOT NULL COMMENT '所属销毁令业务键',
+    approver_id VARCHAR(64) NOT NULL COMMENT '审批操作人；两名审批人互不相同且都不同于提交人',
+    decision VARCHAR(20) NOT NULL COMMENT '审批决定：AGREED 同意 / REJECTED 拒绝（拒绝立即终态，原因不可改写）',
+    reason VARCHAR(512) NULL COMMENT '审批备注或拒绝原因；拒绝时非空且不可改写',
+    created_at DATETIME(6) NOT NULL COMMENT '审批提交时间，Asia/Shanghai',
+    KEY idx_destruction_approval_order (destruction_key, id)
 );

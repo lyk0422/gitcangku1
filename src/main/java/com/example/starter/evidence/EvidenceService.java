@@ -12,6 +12,7 @@ import com.example.starter.evidence.dto.LoanView;
 import com.example.starter.evidence.dto.SealInspectionRequest;
 import com.example.starter.evidence.dto.TransferInitiateRequest;
 import com.example.starter.evidence.dto.TransferView;
+import com.example.starter.evidence.destruction.DestructionOrderItemRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -46,6 +47,7 @@ public class EvidenceService {
     private final SealInspectionRepository inspectionRepository;
     private final LoanRecordRepository loanRepository;
     private final CommandLogRepository commandLogRepository;
+    private final DestructionOrderItemRepository destructionItemRepository;
     private final ObjectMapper objectMapper;
     private final EvidenceClock clock;
 
@@ -54,6 +56,7 @@ public class EvidenceService {
                            SealInspectionRepository inspectionRepository,
                            LoanRecordRepository loanRepository,
                            CommandLogRepository commandLogRepository,
+                           DestructionOrderItemRepository destructionItemRepository,
                            ObjectMapper objectMapper,
                            EvidenceClock clock) {
         this.evidenceRepository = evidenceRepository;
@@ -61,6 +64,7 @@ public class EvidenceService {
         this.inspectionRepository = inspectionRepository;
         this.loanRepository = loanRepository;
         this.commandLogRepository = commandLogRepository;
+        this.destructionItemRepository = destructionItemRepository;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -100,6 +104,8 @@ public class EvidenceService {
         if (replay.isPresent()) {
             return replay.get();
         }
+        requireNotFrozen(evidenceKey);
+        requireNotDestroyed(evidence);
         if (request.toCustodian().equals(actorId)) {
             throw ApiException.badRequest("接收人不能与发起保管人相同");
         }
@@ -135,6 +141,8 @@ public class EvidenceService {
         if (replay.isPresent()) {
             return replay.get();
         }
+        requireNotFrozen(evidenceKey);
+        requireNotDestroyed(evidence);
         requireSealIntact(evidence);
         TransferRecord pending = requirePending(evidence, evidenceKey);
         if (!pending.toCustodian().equals(actorId)) {
@@ -166,6 +174,8 @@ public class EvidenceService {
         if (replay.isPresent()) {
             return replay.get();
         }
+        requireNotFrozen(evidenceKey);
+        requireNotDestroyed(evidence);
         requireSealIntact(evidence);
         TransferRecord pending = requirePending(evidence, evidenceKey);
         if (!pending.fromCustodian().equals(actorId)) {
@@ -198,6 +208,8 @@ public class EvidenceService {
         if (replay.isPresent()) {
             return replay.get();
         }
+        requireNotFrozen(evidenceKey);
+        requireNotDestroyed(evidence);
         requireCustodian(evidence, actorId);
         if (evidence.status() == EvidenceStatus.TRANSFER_PENDING) {
             throw ApiException.conflict("待接收期间禁止封条核验: " + evidenceKey);
@@ -234,6 +246,8 @@ public class EvidenceService {
         if (replay.isPresent()) {
             return replay.get();
         }
+        requireNotFrozen(evidenceKey);
+        requireNotDestroyed(evidence);
         if (request.borrowerId().equals(actorId)) {
             throw ApiException.badRequest("借用人不能与当前保管人相同");
         }
@@ -283,6 +297,7 @@ public class EvidenceService {
         if (replay.isPresent()) {
             return replay.get();
         }
+        requireNotDestroyed(evidence);
         LoanRecord loan = loanRepository.findByLoanKey(request.loanKey())
                 .orElseThrow(() -> ApiException.notFound("借出记录不存在: " + request.loanKey()));
         if (!loan.evidenceKey().equals(evidenceKey)) {
@@ -354,6 +369,26 @@ public class EvidenceService {
     private Evidence lockEvidence(String evidenceKey) {
         return evidenceRepository.findByKeyForUpdate(evidenceKey)
                 .orElseThrow(() -> ApiException.notFound("证物不存在: " + evidenceKey));
+    }
+
+    /**
+     * 冻结拦截：证物被 PENDING/APPROVED 销毁令入列期间，交接/借出/封条核验/再次入列一律 409，
+     * 并返回冻结它的 destructionKey。调用前必须已持有证物行锁。
+     */
+    private void requireNotFrozen(String evidenceKey) {
+        destructionItemRepository.findActiveFreezeKey(evidenceKey).ifPresent(freezeKey -> {
+            throw ApiException.conflict(
+                    "证物已被销毁令冻结，操作被拒绝: " + evidenceKey + "，destructionKey=" + freezeKey);
+        });
+    }
+
+    /**
+     * DESTROYED 终态证物禁止任何写操作（原保管链/借出/封条记录原样保留可查）。
+     */
+    private void requireNotDestroyed(Evidence evidence) {
+        if (evidence.status() == EvidenceStatus.DESTROYED) {
+            throw ApiException.conflict("证物已销毁，禁止任何写操作: " + evidence.evidenceKey());
+        }
     }
 
     private void requireSealIntact(Evidence evidence) {

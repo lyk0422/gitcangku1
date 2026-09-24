@@ -58,6 +58,22 @@ public class EvidenceRepository {
     }
 
     /**
+     * 一次事务内批量锁定多件证物（销毁令创建/执行重查）。
+     * 固定按证物主键升序加锁，避免多个事务以不同顺序申请行锁时交叉等待导致死锁；
+     * 不存在的键不会出现在结果中，由调用方按提交列表判定缺失。
+     */
+    public List<Evidence> findByKeysForUpdateOrdered(List<String> evidenceKeys) {
+        if (evidenceKeys.isEmpty()) {
+            return List.of();
+        }
+        String placeholders = String.join(",", evidenceKeys.stream().map(k -> "?").toList());
+        return jdbc.query(
+                "SELECT * FROM evidence WHERE evidence_key IN (" + placeholders
+                        + ") ORDER BY id FOR UPDATE",
+                ROW_MAPPER, evidenceKeys.toArray());
+    }
+
+    /**
      * 更新证物状态与保管人（交接接受时原子切换保管人）。
      */
     public void updateCustody(String evidenceKey, String custodianId, EvidenceStatus status,
