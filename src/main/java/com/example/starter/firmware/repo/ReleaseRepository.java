@@ -24,10 +24,12 @@ public class ReleaseRepository {
             rs.getString("from_version"), rs.getString("to_version"),
             rs.getInt("ratio"), ReleaseStatus.valueOf(rs.getString("status")),
             rs.getInt("sample_floor"), rs.getInt("failure_threshold_percent"),
-            rs.getInt("monitor_round"), rs.getInt("round_success"), rs.getInt("round_failed"));
+            rs.getInt("monitor_round"), rs.getInt("round_success"), rs.getInt("round_failed"),
+            rs.getBoolean("respect_maintenance_window"));
 
     private static final String COLUMNS = "id, version, model, from_version, to_version, ratio, status,"
-            + " sample_floor, failure_threshold_percent, monitor_round, round_success, round_failed";
+            + " sample_floor, failure_threshold_percent, monitor_round, round_success, round_failed,"
+            + " respect_maintenance_window";
 
     private final JdbcTemplate jdbc;
 
@@ -36,13 +38,14 @@ public class ReleaseRepository {
     }
 
     public long insert(String model, String fromVersion, String toVersion, int ratio,
-                       int sampleFloor, int failureThresholdPercent) {
+                       int sampleFloor, int failureThresholdPercent, boolean respectMaintenanceWindow) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
                     "INSERT INTO release_order (version, model, from_version, to_version, ratio, status,"
-                            + " sample_floor, failure_threshold_percent, monitor_round, active_model)"
-                            + " VALUES (1, ?, ?, ?, ?, 'ACTIVE', ?, ?, 1, ?)",
+                            + " sample_floor, failure_threshold_percent, monitor_round, active_model,"
+                            + " respect_maintenance_window)"
+                            + " VALUES (1, ?, ?, ?, ?, 'ACTIVE', ?, ?, 1, ?, ?)",
                     new String[]{"id"});
             ps.setString(1, model);
             ps.setString(2, fromVersion);
@@ -51,6 +54,7 @@ public class ReleaseRepository {
             ps.setInt(5, sampleFloor);
             ps.setInt(6, failureThresholdPercent);
             ps.setString(7, model);
+            ps.setBoolean(8, respectMaintenanceWindow);
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();

@@ -35,6 +35,17 @@ public class DeviceController {
         return deviceService.get(deviceId);
     }
 
+    @PostMapping("/{deviceId}/window")
+    public DeviceWindowView updateWindow(@PathVariable String deviceId,
+                                         @Valid @RequestBody UpdateWindowRequest request) {
+        return deviceService.updateWindow(deviceId, request);
+    }
+
+    @GetMapping("/{deviceId}/window")
+    public DeviceWindowView getWindow(@PathVariable String deviceId) {
+        return deviceService.getWindow(deviceId);
+    }
+
     @PostMapping("/{deviceId}/pull")
     public PullResponse pull(@PathVariable String deviceId, @Valid @RequestBody RequestIdBody request) {
         return taskService.pull(deviceId, request.requestId());

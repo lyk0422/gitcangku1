@@ -1,9 +1,11 @@
 package com.example.starter.firmware.service;
 
 import com.example.starter.firmware.api.CreateReleaseRequest;
+import com.example.starter.firmware.api.DeferralRecordView;
 import com.example.starter.firmware.api.ExpandReleaseRequest;
 import com.example.starter.firmware.api.MonitorView;
 import com.example.starter.firmware.api.PauseRecordView;
+import com.example.starter.firmware.api.ReleaseDeferralSummaryView;
 import com.example.starter.firmware.api.ReleaseHistoryResponse;
 import com.example.starter.firmware.api.ReleaseView;
 import com.example.starter.firmware.api.ResumeRecordView;
@@ -11,6 +13,7 @@ import com.example.starter.firmware.api.ResumeReleaseRequest;
 import com.example.starter.firmware.domain.ReleaseOrder;
 import com.example.starter.firmware.domain.ReleaseStatus;
 import com.example.starter.firmware.error.ApiException;
+import com.example.starter.firmware.repo.DeferralRepository;
 import com.example.starter.firmware.repo.PauseRecordRepository;
 import com.example.starter.firmware.repo.ReleaseRepository;
 import com.example.starter.firmware.repo.ResumeRecordRepository;
@@ -32,17 +35,20 @@ public class ReleaseService {
     private final TaskRepository taskRepository;
     private final PauseRecordRepository pauseRecordRepository;
     private final ResumeRecordRepository resumeRecordRepository;
+    private final DeferralRepository deferralRepository;
     private final IdempotencyService idempotency;
     private final Clock clock;
 
     public ReleaseService(ReleaseRepository releaseRepository, TaskRepository taskRepository,
                           PauseRecordRepository pauseRecordRepository,
                           ResumeRecordRepository resumeRecordRepository,
+                          DeferralRepository deferralRepository,
                           IdempotencyService idempotency, Clock clock) {
         this.releaseRepository = releaseRepository;
         this.taskRepository = taskRepository;
         this.pauseRecordRepository = pauseRecordRepository;
         this.resumeRecordRepository = resumeRecordRepository;
+        this.deferralRepository = deferralRepository;
         this.idempotency = idempotency;
         this.clock = clock;
     }
@@ -53,14 +59,15 @@ public class ReleaseService {
         }
         int sampleFloor = request.effectiveSampleFloor();
         int threshold = request.effectiveFailureThresholdPercent();
+        boolean respectWindow = request.effectiveRespectMaintenanceWindow();
         String fingerprint = String.join("|", "release.create", request.model(), request.fromVersion(),
                 request.toVersion(), String.valueOf(request.ratio()), String.valueOf(sampleFloor),
-                String.valueOf(threshold));
+                String.valueOf(threshold), String.valueOf(respectWindow));
         return idempotency.execute(request.requestId(), "release.create", fingerprint, () -> {
             long id;
             try {
                 id = releaseRepository.insert(request.model(), request.fromVersion(), request.toVersion(),
-                        request.ratio(), sampleFloor, threshold);
+                        request.ratio(), sampleFloor, threshold, respectWindow);
             } catch (DuplicateKeyException e) {
                 throw ApiException.conflict("ACTIVE_RELEASE_EXISTS", "型号已存在未终结发布单: " + request.model());
             }
@@ -154,5 +161,26 @@ public class ReleaseService {
     public ReleaseOrder findOrder(long releaseId) {
         return releaseRepository.findById(releaseId)
                 .orElseThrow(() -> ApiException.notFound("RELEASE_NOT_FOUND", "发布单不存在: " + releaseId));
+    }
+
+    /**
+     * 发布单顺延汇总（只读）：按设备ID稳定排序的顺延明细及合计。
+     */
+    public ReleaseDeferralSummaryView deferralSummary(long releaseId) {
+        findOrder(releaseId);
+        var records = deferralRepository.findByRelease(releaseId).stream()
+                .map(DeferralRecordView::of).toList();
+        int total = records.stream().mapToInt(DeferralRecordView::deferCount).sum();
+        return new ReleaseDeferralSummaryView(releaseId, records.size(), total, records);
+    }
+
+    /**
+     * 单设备在发布单下的顺延统计（只读）；无顺延记录时返回零值统计。
+     */
+    public DeferralRecordView deferralOfDevice(long releaseId, String deviceId) {
+        findOrder(releaseId);
+        return deferralRepository.findByReleaseAndDevice(releaseId, deviceId)
+                .map(DeferralRecordView::of)
+                .orElseGet(() -> new DeferralRecordView(releaseId, deviceId, 0, null));
     }
 }

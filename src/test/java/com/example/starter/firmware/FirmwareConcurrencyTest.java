@@ -5,6 +5,7 @@ import com.example.starter.firmware.api.PullResponse;
 import com.example.starter.firmware.api.ReceiptRequest;
 import com.example.starter.firmware.api.RegisterDeviceRequest;
 import com.example.starter.firmware.api.ResumeReleaseRequest;
+import com.example.starter.firmware.api.UpdateWindowRequest;
 import com.example.starter.firmware.domain.ReceiptResult;
 import com.example.starter.firmware.domain.ReleaseOrder;
 import com.example.starter.firmware.domain.ReleaseStatus;
@@ -21,9 +22,13 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Primary;
 import org.springframework.http.HttpStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Callable;
@@ -40,6 +45,15 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @SpringBootTest
 class FirmwareConcurrencyTest {
+
+    @TestConfiguration
+    static class ClockConfig {
+        @Bean
+        @Primary
+        MutableClock mutableClock() {
+            return new MutableClock(Instant.parse("2026-09-24T10:00:00Z"));
+        }
+    }
 
     @Autowired
     private DeviceService deviceService;
@@ -62,16 +76,21 @@ class FirmwareConcurrencyTest {
     @Autowired
     private JdbcTemplate jdbc;
 
+    @Autowired
+    private MutableClock clock;
+
     private ExecutorService executor;
 
     @BeforeEach
     void setUp() {
         jdbc.update("DELETE FROM rollout_task");
+        jdbc.update("DELETE FROM task_deferral");
         jdbc.update("DELETE FROM release_pause_record");
         jdbc.update("DELETE FROM release_resume_record");
         jdbc.update("DELETE FROM release_order");
         jdbc.update("DELETE FROM device");
         jdbc.update("DELETE FROM idempotency_record");
+        clock.set(Instant.parse("2026-09-24T10:00:00Z"));
         executor = Executors.newFixedThreadPool(8);
     }
 
@@ -342,5 +361,67 @@ class FirmwareConcurrencyTest {
         Long resumeRecords = jdbc.queryForObject(
                 "SELECT COUNT(*) FROM release_resume_record WHERE release_id = ?", Long.class, releaseId);
         assertThat(resumeRecords).isEqualTo(1);
+    }
+
+    @Test
+    void 并发窗口外拉取_顺延计数精确累加且不下发任务() throws Exception {
+        // 窗口 09:00~17:00 UTC，时钟固定在 20:00 UTC（窗口外）
+        clock.set(Instant.parse("2026-09-24T20:00:00Z"));
+        deviceService.register(new RegisterDeviceRequest("req-d", "d1", "m1", "1.0.0", 5, 0, 540, 1020));
+        long releaseId = releaseService.create(new CreateReleaseRequest("req-r", "m1", "1.0.0", "2.0.0",
+                100, null, null, true)).releaseId();
+
+        int threads = 8;
+        List<Callable<PullResponse>> tasks = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            int seq = i;
+            tasks.add(() -> taskService.pull("d1", "req-pull-" + seq));
+        }
+        List<Object> results = runConcurrently(tasks);
+
+        for (Object result : results) {
+            assertThat(result).isInstanceOf(PullResponse.class);
+            PullResponse response = (PullResponse) result;
+            assertThat(response.task()).isNull();
+            assertThat(response.result()).isEqualTo("DEFERRED");
+            assertThat(response.nextWindowStartUtc()).isEqualTo("2026-09-25T09:00:00Z");
+        }
+        // 每个 requestId 恰好计一次：不丢失、不重复
+        Long deferCount = jdbc.queryForObject(
+                "SELECT defer_count FROM task_deferral WHERE release_id = ? AND device_id = 'd1'",
+                Long.class, releaseId);
+        assertThat(deferCount).isEqualTo(threads);
+        assertThat(taskRepository.countByReleaseAndDevice(releaseId, "d1")).isZero();
+    }
+
+    @Test
+    void 并发拉取与窗口修改_同一任务不得既被下发又被顺延() throws Exception {
+        // 时钟固定在 10:00 UTC：初始窗口 09:00~17:00 窗内，修改为 20:00~21:00 窗外
+        for (int round = 0; round < 10; round++) {
+            String deviceId = "d" + round;
+            String model = "m" + round;
+            deviceService.register(new RegisterDeviceRequest("req-d" + round, deviceId, model,
+                    "1.0.0", 5, 0, 540, 1020));
+            long releaseId = releaseService.create(new CreateReleaseRequest("req-r" + round, model,
+                    "1.0.0", "2.0.0", 100, null, null, true)).releaseId();
+            final int seq = round;
+
+            List<Object> results = runConcurrently(List.of(
+                    (Callable<Object>) () -> taskService.pull(deviceId, "req-p" + seq),
+                    (Callable<Object>) () -> deviceService.updateWindow(deviceId,
+                            new UpdateWindowRequest("req-w" + seq, 1, 0, 1200, 1260))));
+            assertThat(results).noneMatch(r -> r instanceof Exception);
+
+            long taskCount = taskRepository.countByReleaseAndDevice(releaseId, deviceId);
+            Long deferCount = jdbc.queryForObject(
+                    "SELECT COALESCE(SUM(defer_count), 0) FROM task_deferral"
+                            + " WHERE release_id = ? AND device_id = ?",
+                    Long.class, releaseId, deviceId);
+            // 按事务提交顺序裁决：拉取要么在修改前下发任务，要么在修改后顺延，二者必居其一
+            assertThat(taskCount + deferCount)
+                    .as("第%d轮：任务下发与顺延互斥且恰好一次", round)
+                    .isEqualTo(1);
+            assertThat(deviceService.get(deviceId).version()).isEqualTo(2);
+        }
     }
 }

@@ -7,11 +7,11 @@ import com.example.starter.firmware.domain.ReleaseOrder;
  */
 public record ReleaseView(long releaseId, int version, String model, String fromVersion, String toVersion,
                           int ratio, String status, int sampleFloor, int failureThresholdPercent,
-                          int monitorRound) {
+                          int monitorRound, boolean respectMaintenanceWindow) {
 
     public static ReleaseView of(ReleaseOrder order) {
         return new ReleaseView(order.id(), order.version(), order.model(), order.fromVersion(),
                 order.toVersion(), order.ratio(), order.status().name(), order.sampleFloor(),
-                order.failureThresholdPercent(), order.monitorRound());
+                order.failureThresholdPercent(), order.monitorRound(), order.respectMaintenanceWindow());
     }
 }

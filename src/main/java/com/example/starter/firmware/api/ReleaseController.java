@@ -58,6 +58,16 @@ public class ReleaseController {
         return releaseService.history(releaseId);
     }
 
+    @GetMapping("/{releaseId}/deferrals")
+    public ReleaseDeferralSummaryView deferrals(@PathVariable long releaseId) {
+        return releaseService.deferralSummary(releaseId);
+    }
+
+    @GetMapping("/{releaseId}/deferrals/{deviceId}")
+    public DeferralRecordView deferralOfDevice(@PathVariable long releaseId, @PathVariable String deviceId) {
+        return releaseService.deferralOfDevice(releaseId, deviceId);
+    }
+
     @GetMapping("/{releaseId}/tasks")
     public TaskListResponse tasks(@PathVariable long releaseId, @RequestParam(required = false) String status) {
         TaskStatus filter = parseStatus(status);
