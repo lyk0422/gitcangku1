@@ -13,14 +13,16 @@ public final class Rows {
     /**
      * 文档：全局唯一 documentId，含 1~5 种目标语言及草稿/发布/术语版本。
      *
-     * @param documentId       全局唯一文档 ID，自增
-     * @param targetLanguages  目标语言列表，小写语言码，1~5 种
-     * @param draftVersion     文档草稿版本，从 1 开始；增段落或修改源文/译文/术语时加一
-     * @param publishedVersion 已发布版本号，从 0 开始，每次成功发布加一
-     * @param termVersion      当前术语版本，从 0 开始（0 表示尚未建立术语版本）
+     * @param documentId        全局唯一文档 ID，自增
+     * @param targetLanguages   目标语言列表，小写语言码，1~5 种
+     * @param draftVersion      文档草稿版本，从 1 开始；增段落或修改源文/译文/术语/引用升级时加一
+     * @param publishedVersion  已发布版本号，从 0 开始，每次成功发布加一
+     * @param termVersion       当前术语版本，从 0 开始（0 表示尚未建立术语版本）
+     * @param globalTermVersion 文档引用的全局术语库版本，从 0 开始（0 表示尚未引用），仅通过引用升级推进
      */
     public record DocumentRow(long documentId, List<String> targetLanguages,
-                              int draftVersion, int publishedVersion, int termVersion) {
+                              int draftVersion, int publishedVersion, int termVersion,
+                              int globalTermVersion) {
     }
 
     /**
@@ -42,20 +44,25 @@ public final class Rows {
      * @param author             译文作者，取提交时 X-Actor-Id
      * @param sourceVersion      译文所依据的源文版本；提交时必须等于当前源文版本
      * @param translationVersion 译文版本，从 1 开始，每次重新提交加一
-     * @param termVersion        译文提交时绑定的术语版本；不等于当前术语版本时视为术语过期
+     * @param termVersion        译文提交时绑定的文档术语版本；不等于当前术语版本时视为术语过期
+     * @param globalTermVersion  译文提交时绑定的全局术语库版本；不等于文档当前引用版本时视为术语过期
      */
     public record TranslationRow(String segmentId, String language, String content, String author,
-                                 int sourceVersion, int translationVersion, int termVersion) {
+                                 int sourceVersion, int translationVersion, int termVersion,
+                                 int globalTermVersion) {
     }
 
     /**
      * 术语规则：属于某术语版本的不可变规则，按 sourceTerm 与目标语言唯一。
+     * 全局术语规则复用本类型，suppressed 恒为 false。
      *
      * @param sourceTerm          源文术语，Unicode 原文、区分大小写，按连续子串匹配
      * @param language            目标语言码，小写
-     * @param requiredTranslation 该术语在目标语言中的必译文本，非空
+     * @param requiredTranslation 该术语在目标语言中的必译文本；suppressed 为 true 时为 null
+     * @param suppressed          是否抑制同 sourceTerm 与语言的全局规则：true 时该术语不参与校验
      */
-    public record TermRuleRow(String sourceTerm, String language, String requiredTranslation) {
+    public record TermRuleRow(String sourceTerm, String language, String requiredTranslation,
+                              boolean suppressed) {
     }
 
     /**

@@ -4,6 +4,7 @@ import com.example.starter.translation.api.ApiException;
 import com.example.starter.translation.domain.Rows.RequestLogRow;
 import com.example.starter.translation.repo.TranslationRepository;
 import org.springframework.dao.DuplicateKeyException;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -14,7 +15,9 @@ import java.util.function.Supplier;
  * 写操作幂等执行器。
  * 同一事务内完成：requestId 查重 → 业务变更 → 成功结果落 request_log，原子提交；
  * 失败抛异常回滚，requestId 不占键。同键同参重放原成功结果，同键异参返回 409。
- * 并发下同键请求由主键约束兜底：后到的插入冲突回滚后重读记录并重放。
+ * 并发下同键请求由主键约束兜底：后到的插入冲突回滚后重读记录并重放；
+ * 后到请求也可能因对方先提交而触发业务版本冲突（409），此时若对方已落成功记录，
+ * 同样按同参重放、异参 409 处理。
  */
 @Component
 public class WriteExecutor {
@@ -33,7 +36,25 @@ public class WriteExecutor {
             return transactionalWrite.run(requestId, requestHash, action);
         } catch (WriteResult.ReplaySignal signal) {
             return replay(requestId, requestHash);
+        } catch (ApiException e) {
+            if (e.status() == HttpStatus.CONFLICT) {
+                return replayIfCommitted(requestId, requestHash, e);
+            }
+            throw e;
         }
+    }
+
+    /** 并发下对方已提交同键成功记录时重放；同键异参或未落记录时维持原冲突。 */
+    private WriteResult replayIfCommitted(String requestId, String requestHash, ApiException conflict) {
+        Optional<RequestLogRow> committed = repository.findRequestLog(requestId);
+        if (committed.isEmpty()) {
+            throw conflict;
+        }
+        RequestLogRow log = committed.get();
+        if (!log.requestHash().equals(requestHash)) {
+            throw ApiException.conflict("requestId 已使用且请求参数不同: " + requestId);
+        }
+        return new WriteResult(log.responseStatus(), log.responseBody());
     }
 
     private WriteResult replay(String requestId, String requestHash) {

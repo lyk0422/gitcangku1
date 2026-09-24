@@ -7,14 +7,16 @@ CREATE TABLE IF NOT EXISTS document (
     draft_version INT NOT NULL,
     published_version INT NOT NULL,
     term_version INT NOT NULL,
+    global_term_version INT NOT NULL DEFAULT 0,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 COMMENT ON TABLE document IS '文档：全局唯一 documentId，含 1~5 种目标语言及草稿/发布/术语版本';
 COMMENT ON COLUMN document.document_id IS '全局唯一文档 ID，自增';
 COMMENT ON COLUMN document.target_languages IS '目标语言列表，逗号分隔的小写语言码，1~5 种';
-COMMENT ON COLUMN document.draft_version IS '文档草稿版本，从 1 开始；增段落或修改源文/译文/术语时加一';
+COMMENT ON COLUMN document.draft_version IS '文档草稿版本，从 1 开始；增段落或修改源文/译文/术语/引用升级时加一';
 COMMENT ON COLUMN document.published_version IS '已发布版本号，从 0 开始，每次成功发布加一';
 COMMENT ON COLUMN document.term_version IS '当前术语版本，从 0 开始（0 表示尚未建立术语版本），每次新增术语版本加一';
+COMMENT ON COLUMN document.global_term_version IS '文档引用的全局术语库版本，从 0 开始（0 表示尚未引用），仅通过引用升级推进';
 COMMENT ON COLUMN document.created_at IS '创建时间，数据库默认时区';
 
 CREATE TABLE IF NOT EXISTS segment (
@@ -39,6 +41,7 @@ CREATE TABLE IF NOT EXISTS translation (
     source_version INT NOT NULL,
     translation_version INT NOT NULL,
     term_version INT NOT NULL,
+    global_term_version INT NOT NULL DEFAULT 0,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (document_id, segment_id, language)
 );
@@ -50,7 +53,8 @@ COMMENT ON COLUMN translation.content IS '译文正文，UTF-8';
 COMMENT ON COLUMN translation.author IS '译文作者，取提交时 X-Actor-Id';
 COMMENT ON COLUMN translation.source_version IS '译文所依据的源文版本；提交时必须等于当前源文版本';
 COMMENT ON COLUMN translation.translation_version IS '译文版本，从 1 开始，每次重新提交加一';
-COMMENT ON COLUMN translation.term_version IS '译文提交时绑定的术语版本；不等于当前术语版本时视为术语过期';
+COMMENT ON COLUMN translation.term_version IS '译文提交时绑定的文档术语版本；不等于当前术语版本时视为术语过期';
+COMMENT ON COLUMN translation.global_term_version IS '译文提交时绑定的全局术语库版本；不等于文档当前引用版本时视为术语过期';
 COMMENT ON COLUMN translation.updated_at IS '最近提交时间，数据库默认时区';
 
 CREATE TABLE IF NOT EXISTS approval (
@@ -101,7 +105,8 @@ CREATE TABLE IF NOT EXISTS term_rule (
     term_version INT NOT NULL,
     source_term VARCHAR(512) NOT NULL,
     language VARCHAR(16) NOT NULL,
-    required_translation VARCHAR(2048) NOT NULL,
+    required_translation VARCHAR(2048),
+    suppressed BOOLEAN NOT NULL DEFAULT FALSE,
     PRIMARY KEY (document_id, term_version, source_term, language)
 );
 COMMENT ON TABLE term_rule IS '术语规则：属于某术语版本的不可变规则，按 sourceTerm 与目标语言唯一，每版本 0~100 条';
@@ -109,7 +114,39 @@ COMMENT ON COLUMN term_rule.document_id IS '所属文档 ID';
 COMMENT ON COLUMN term_rule.term_version IS '所属术语版本号';
 COMMENT ON COLUMN term_rule.source_term IS '源文术语，Unicode 原文、区分大小写，按连续子串匹配';
 COMMENT ON COLUMN term_rule.language IS '目标语言码，小写';
-COMMENT ON COLUMN term_rule.required_translation IS '该术语在目标语言中的必译文本，非空';
+COMMENT ON COLUMN term_rule.required_translation IS '该术语在目标语言中的必译文本，非空；suppressed 为 true 时为空';
+COMMENT ON COLUMN term_rule.suppressed IS '是否抑制同 sourceTerm 与语言的全局规则：true 时该术语不参与校验';
+
+CREATE TABLE IF NOT EXISTS global_term_version (
+    global_term_version INT PRIMARY KEY,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+COMMENT ON TABLE global_term_version IS '全局术语库版本：从 1 开始的不可变快照，不属于任何文档，已有版本不可覆盖';
+COMMENT ON COLUMN global_term_version.global_term_version IS '全局术语库版本号，从 1 开始单调递增';
+COMMENT ON COLUMN global_term_version.created_at IS '版本创建时间，数据库默认时区';
+
+CREATE TABLE IF NOT EXISTS global_term_rule (
+    global_term_version INT NOT NULL,
+    source_term VARCHAR(512) NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    required_translation VARCHAR(2048) NOT NULL,
+    PRIMARY KEY (global_term_version, source_term, language)
+);
+COMMENT ON TABLE global_term_rule IS '全局术语规则：属于某全局术语库版本的不可变规则，按 sourceTerm 与目标语言唯一，每版本 0~200 条';
+COMMENT ON COLUMN global_term_rule.global_term_version IS '所属全局术语库版本号';
+COMMENT ON COLUMN global_term_rule.source_term IS '源文术语，Unicode 原文、区分大小写，按连续子串匹配';
+COMMENT ON COLUMN global_term_rule.language IS '目标语言码，小写';
+COMMENT ON COLUMN global_term_rule.required_translation IS '该术语在目标语言中的必译文本，非空';
+
+CREATE TABLE IF NOT EXISTS global_glossary_state (
+    state_id INT PRIMARY KEY,
+    current_version INT NOT NULL
+);
+COMMENT ON TABLE global_glossary_state IS '全局术语库当前版本状态：单行（state_id=1），写操作加行锁串行推进';
+COMMENT ON COLUMN global_glossary_state.state_id IS '固定为 1 的单行标识';
+COMMENT ON COLUMN global_glossary_state.current_version IS '当前最新全局术语库版本，从 0 开始（0 表示尚未建立）';
+
+INSERT IGNORE INTO global_glossary_state (state_id, current_version) VALUES (1, 0);
 
 CREATE TABLE IF NOT EXISTS request_log (
     request_id VARCHAR(128) PRIMARY KEY,

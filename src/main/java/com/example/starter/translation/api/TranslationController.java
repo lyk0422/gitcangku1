@@ -136,6 +136,22 @@ public class TranslationController {
                 .body(translationService.getRelease(documentId, publishedVersion));
     }
 
+    /** 全局术语库引用升级：携带两个期望版本，将文档引用推进到最新全局版本，草稿版本加一。 */
+    @PostMapping("/{documentId}/glossary/upgrade")
+    public ResponseEntity<String> upgradeGlossaryReference(@PathVariable long documentId,
+                                                           @Valid @RequestBody ApiDtos.UpgradeGlossaryRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/glossary/upgrade";
+        return writeExecutor.execute(request.requestId(), hash(operation, request),
+                () -> WriteResult.of(200, translationService.upgradeGlossaryReference(documentId, request)))
+                .toResponseEntity();
+    }
+
+    /** 查询生效规则集：全局与文档术语版本合成，逐条标明来源，按 sourceTerm 与语言升序。 */
+    @GetMapping("/{documentId}/terms/effective")
+    public ResponseEntity<ApiDtos.EffectiveTermsView> getEffectiveTerms(@PathVariable long documentId) {
+        return ResponseEntity.ok(translationService.getEffectiveTerms(documentId));
+    }
+
     /** 计算请求摘要：操作（含路径变量）+ 操作者 + 规范化请求体的 SHA-256。 */
     private String hash(String operation, Object... parts) {
         try {

@@ -29,7 +29,8 @@ public class TranslationRepository {
             Arrays.stream(rs.getString("target_languages").split(",")).toList(),
             rs.getInt("draft_version"),
             rs.getInt("published_version"),
-            rs.getInt("term_version"));
+            rs.getInt("term_version"),
+            rs.getInt("global_term_version"));
 
     private static final RowMapper<SegmentRow> SEGMENT_MAPPER = (rs, n) -> new SegmentRow(
             rs.getString("segment_id"), rs.getString("source_text"), rs.getInt("source_version"));
@@ -37,14 +38,20 @@ public class TranslationRepository {
     private static final RowMapper<TranslationRow> TRANSLATION_MAPPER = (rs, n) -> new TranslationRow(
             rs.getString("segment_id"), rs.getString("language"), rs.getString("content"),
             rs.getString("author"), rs.getInt("source_version"), rs.getInt("translation_version"),
-            rs.getInt("term_version"));
+            rs.getInt("term_version"), rs.getInt("global_term_version"));
 
     private static final RowMapper<ApprovalRow> APPROVAL_MAPPER = (rs, n) -> new ApprovalRow(
             rs.getString("segment_id"), rs.getString("language"), rs.getString("reviewer"),
             rs.getInt("source_version"), rs.getInt("translation_version"));
 
     private static final RowMapper<TermRuleRow> TERM_RULE_MAPPER = (rs, n) -> new TermRuleRow(
-            rs.getString("source_term"), rs.getString("language"), rs.getString("required_translation"));
+            rs.getString("source_term"), rs.getString("language"), rs.getString("required_translation"),
+            rs.getBoolean("suppressed"));
+
+    /** 全局术语规则行映射：全局规则不支持抑制，suppressed 恒为 false。 */
+    private static final RowMapper<TermRuleRow> GLOBAL_TERM_RULE_MAPPER = (rs, n) -> new TermRuleRow(
+            rs.getString("source_term"), rs.getString("language"), rs.getString("required_translation"),
+            false);
 
     private final JdbcTemplate jdbc;
 
@@ -73,7 +80,8 @@ public class TranslationRepository {
     /** 按 ID 查询文档并加行级写锁（FOR UPDATE），用于串行化同一文档的写操作。 */
     public Optional<DocumentRow> findDocumentForUpdate(long documentId) {
         List<DocumentRow> rows = jdbc.query(
-                "SELECT document_id, target_languages, draft_version, published_version, term_version "
+                "SELECT document_id, target_languages, draft_version, published_version, term_version, "
+                        + "global_term_version "
                         + "FROM document WHERE document_id = ? FOR UPDATE",
                 DOCUMENT_MAPPER, documentId);
         return rows.stream().findFirst();
@@ -82,7 +90,8 @@ public class TranslationRepository {
     /** 只读查询文档（不加锁），用于快照查询。 */
     public Optional<DocumentRow> findDocument(long documentId) {
         List<DocumentRow> rows = jdbc.query(
-                "SELECT document_id, target_languages, draft_version, published_version, term_version "
+                "SELECT document_id, target_languages, draft_version, published_version, term_version, "
+                        + "global_term_version "
                         + "FROM document WHERE document_id = ?",
                 DOCUMENT_MAPPER, documentId);
         return rows.stream().findFirst();
@@ -98,6 +107,12 @@ public class TranslationRepository {
 
     public void updateTermVersion(long documentId, int termVersion) {
         jdbc.update("UPDATE document SET term_version = ? WHERE document_id = ?", termVersion, documentId);
+    }
+
+    /** 推进文档引用的全局术语库版本（仅引用升级调用）。 */
+    public void updateGlobalTermVersion(long documentId, int globalTermVersion) {
+        jdbc.update("UPDATE document SET global_term_version = ? WHERE document_id = ?",
+                globalTermVersion, documentId);
     }
 
     public void insertSegment(long documentId, String segmentId, String sourceText) {
@@ -128,7 +143,8 @@ public class TranslationRepository {
 
     public Optional<TranslationRow> findTranslation(long documentId, String segmentId, String language) {
         List<TranslationRow> rows = jdbc.query(
-                "SELECT segment_id, language, content, author, source_version, translation_version, term_version "
+                "SELECT segment_id, language, content, author, source_version, translation_version, "
+                        + "term_version, global_term_version "
                         + "FROM translation WHERE document_id = ? AND segment_id = ? AND language = ?",
                 TRANSLATION_MAPPER, documentId, segmentId, language);
         return rows.stream().findFirst();
@@ -136,7 +152,8 @@ public class TranslationRepository {
 
     public List<TranslationRow> listTranslations(long documentId) {
         return jdbc.query(
-                "SELECT segment_id, language, content, author, source_version, translation_version, term_version "
+                "SELECT segment_id, language, content, author, source_version, translation_version, "
+                        + "term_version, global_term_version "
                         + "FROM translation WHERE document_id = ? ORDER BY segment_id, language",
                 TRANSLATION_MAPPER, documentId);
     }
@@ -145,15 +162,16 @@ public class TranslationRepository {
     public void upsertTranslation(long documentId, TranslationRow row) {
         int updated = jdbc.update(
                 "UPDATE translation SET content = ?, author = ?, source_version = ?, translation_version = ?, "
-                        + "term_version = ?, updated_at = CURRENT_TIMESTAMP "
+                        + "term_version = ?, global_term_version = ?, updated_at = CURRENT_TIMESTAMP "
                         + "WHERE document_id = ? AND segment_id = ? AND language = ?",
                 row.content(), row.author(), row.sourceVersion(), row.translationVersion(), row.termVersion(),
-                documentId, row.segmentId(), row.language());
+                row.globalTermVersion(), documentId, row.segmentId(), row.language());
         if (updated == 0) {
             jdbc.update("INSERT INTO translation (document_id, segment_id, language, content, author, "
-                            + "source_version, translation_version, term_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            + "source_version, translation_version, term_version, global_term_version) "
+                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     documentId, row.segmentId(), row.language(), row.content(), row.author(),
-                    row.sourceVersion(), row.translationVersion(), row.termVersion());
+                    row.sourceVersion(), row.translationVersion(), row.termVersion(), row.globalTermVersion());
         }
     }
 
@@ -202,8 +220,9 @@ public class TranslationRepository {
     /** 插入一条术语规则，归属指定术语版本。 */
     public void insertTermRule(long documentId, int termVersion, TermRuleRow rule) {
         jdbc.update("INSERT INTO term_rule (document_id, term_version, source_term, language, "
-                        + "required_translation) VALUES (?, ?, ?, ?, ?)",
-                documentId, termVersion, rule.sourceTerm(), rule.language(), rule.requiredTranslation());
+                        + "required_translation, suppressed) VALUES (?, ?, ?, ?, ?, ?)",
+                documentId, termVersion, rule.sourceTerm(), rule.language(), rule.requiredTranslation(),
+                rule.suppressed());
     }
 
     /** 判断指定术语版本是否存在。 */
@@ -217,7 +236,7 @@ public class TranslationRepository {
     /** 查询指定术语版本的全部规则，按 sourceTerm、语言排序保证稳定输出。 */
     public List<TermRuleRow> listTermRules(long documentId, int termVersion) {
         return jdbc.query(
-                "SELECT source_term, language, required_translation FROM term_rule "
+                "SELECT source_term, language, required_translation, suppressed FROM term_rule "
                         + "WHERE document_id = ? AND term_version = ? ORDER BY source_term, language",
                 TERM_RULE_MAPPER, documentId, termVersion);
     }
@@ -240,5 +259,53 @@ public class TranslationRepository {
     public void insertRequestLog(String requestId, String requestHash, int responseStatus, String responseBody) {
         jdbc.update("INSERT INTO request_log (request_id, request_hash, response_status, response_body) "
                 + "VALUES (?, ?, ?, ?)", requestId, requestHash, responseStatus, responseBody);
+    }
+
+    /** 查询全局术语库当前版本并加行级写锁（FOR UPDATE），用于串行化全局版本提交与引用升级。 */
+    public int lockGlobalGlossaryState() {
+        Integer version = jdbc.queryForObject(
+                "SELECT current_version FROM global_glossary_state WHERE state_id = 1 FOR UPDATE",
+                Integer.class);
+        return version == null ? 0 : version;
+    }
+
+    /** 只读查询全局术语库当前版本（不加锁）。 */
+    public int findLatestGlobalTermVersion() {
+        Integer version = jdbc.queryForObject(
+                "SELECT current_version FROM global_glossary_state WHERE state_id = 1",
+                Integer.class);
+        return version == null ? 0 : version;
+    }
+
+    public void updateGlobalGlossaryState(int currentVersion) {
+        jdbc.update("UPDATE global_glossary_state SET current_version = ? WHERE state_id = 1", currentVersion);
+    }
+
+    /** 插入全局术语库版本主记录（不可变，主键已存在时抛冲突）。 */
+    public void insertGlobalTermVersion(int globalTermVersion) {
+        jdbc.update("INSERT INTO global_term_version (global_term_version) VALUES (?)", globalTermVersion);
+    }
+
+    /** 插入一条全局术语规则，归属指定全局术语库版本。 */
+    public void insertGlobalTermRule(int globalTermVersion, TermRuleRow rule) {
+        jdbc.update("INSERT INTO global_term_rule (global_term_version, source_term, language, "
+                        + "required_translation) VALUES (?, ?, ?, ?)",
+                globalTermVersion, rule.sourceTerm(), rule.language(), rule.requiredTranslation());
+    }
+
+    /** 判断指定全局术语库版本是否存在。 */
+    public boolean globalTermVersionExists(int globalTermVersion) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM global_term_version WHERE global_term_version = ?",
+                Integer.class, globalTermVersion);
+        return count != null && count > 0;
+    }
+
+    /** 查询指定全局术语库版本的全部规则，按 sourceTerm、语言排序保证稳定输出。 */
+    public List<TermRuleRow> listGlobalTermRules(int globalTermVersion) {
+        return jdbc.query(
+                "SELECT source_term, language, required_translation FROM global_term_rule "
+                        + "WHERE global_term_version = ? ORDER BY source_term, language",
+                GLOBAL_TERM_RULE_MAPPER, globalTermVersion);
     }
 }
