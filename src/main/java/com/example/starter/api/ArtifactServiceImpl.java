@@ -7,14 +7,21 @@ import com.example.starter.api.dto.LockEntryResponse;
 import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
 import com.example.starter.api.dto.RegisterArtifactRequest;
+import com.example.starter.api.dto.ReresolveDiffResponse;
+import com.example.starter.api.dto.ReresolveReportResponse;
+import com.example.starter.api.dto.ReresolveRequest;
 import com.example.starter.domain.ArtifactVersion;
 import com.example.starter.domain.DependencyRange;
+import com.example.starter.domain.InfeasibleBlocker;
 import com.example.starter.domain.LockResolver;
+import com.example.starter.domain.ReresolveDiffer;
 import com.example.starter.domain.RepositorySnapshot;
+import com.example.starter.domain.ResolutionResult;
 import com.example.starter.repo.RepositoryDao;
 import com.example.starter.repo.RepositoryDao.IdempotentRecord;
 import com.example.starter.repo.RepositoryDao.LockEntryRow;
 import com.example.starter.repo.RepositoryDao.LockFileRow;
+import com.example.starter.repo.RepositoryDao.ReresolveReportRow;
 import com.example.starter.support.ApiException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
@@ -49,6 +56,12 @@ public class ArtifactServiceImpl implements ArtifactService {
     private static final String OP_REGISTER = "REGISTER_ARTIFACT";
     private static final String OP_WITHDRAW = "WITHDRAW_ARTIFACT";
     private static final String OP_LOCK = "CREATE_LOCK";
+    private static final String OP_RERESOLVE = "RERESOLVE_LOCK";
+
+    private static final String CONCLUSION_REPRODUCIBLE = "REPRODUCIBLE";
+    private static final String CONCLUSION_DRIFTED = "DRIFTED";
+    private static final String CONCLUSION_INFEASIBLE = "INFEASIBLE";
+    private static final String CHANGE_INFEASIBLE = "INFEASIBLE";
 
     private final RepositoryDao repositoryDao;
     private final TransactionTemplate transactionTemplate;
@@ -114,6 +127,154 @@ public class ArtifactServiceImpl implements ArtifactService {
             throw ApiException.notFound("锁文件不存在: " + id);
         }
         return toLockResponse(row, repositoryDao.listLockEntries(id));
+    }
+
+    @Override
+    public ReresolveReportResponse reresolve(String requestId, long lockFileId, ReresolveRequest request) {
+        requireRequestId(requestId);
+        if (request.reresolveKey() == null || request.reresolveKey().isBlank()) {
+            throw ApiException.badRequest("reresolveKey 不能为空");
+        }
+        String hash = sha256(OP_RERESOLVE + "|" + lockFileId + "|"
+                + request.reresolveKey().trim() + "|" + request.expectedRepositoryVersion());
+        return executeIdempotent(requestId, OP_RERESOLVE, hash, 201,
+                () -> doReresolve(lockFileId, request), ReresolveReportResponse.class);
+    }
+
+    @Override
+    public ReresolveReportResponse getReresolveReport(long id) {
+        ReresolveReportRow row = repositoryDao.getReresolveReport(id);
+        if (row == null) {
+            throw ApiException.notFound("重解析报告不存在: " + id);
+        }
+        return toReresolveReportResponse(row);
+    }
+
+    @Override
+    public List<ReresolveReportResponse> listReresolveReports(long lockFileId) {
+        if (repositoryDao.getLockFile(lockFileId) == null) {
+            throw ApiException.notFound("锁文件不存在: " + lockFileId);
+        }
+        List<ReresolveReportResponse> result = new ArrayList<>();
+        for (ReresolveReportRow row : repositoryDao.listReresolveReportsByLockFile(lockFileId)) {
+            result.add(toReresolveReportResponse(row));
+        }
+        return result;
+    }
+
+    // ------------------------------------------------------------------
+    // 锁文件重解析（运行在已加行锁的写事务内；不推进仓库版本、不改写原锁文件）
+    // ------------------------------------------------------------------
+
+    private ReresolveReportResponse doReresolve(long lockFileId, ReresolveRequest request) {
+        // 1. 已持有 repository_state 行锁：版本号与随后读取的快照必然自洽。
+        long currentVersion = repositoryDao.lockRepositoryState();
+        if (currentVersion != request.expectedRepositoryVersion()) {
+            throw ApiException.conflict("仓库版本不匹配：expected="
+                    + request.expectedRepositoryVersion() + ", actual=" + currentVersion);
+        }
+
+        // 2. 原锁文件必须存在；其内容永不被改写或删除。
+        LockFileRow lockFile = repositoryDao.getLockFile(lockFileId);
+        if (lockFile == null) {
+            throw ApiException.notFound("锁文件不存在: " + lockFileId);
+        }
+        String rootName = lockFile.rootName();
+        int rootVersion = lockFile.rootVersion();
+
+        // 3. 根版本固定为原锁根；已撤回则无法重解析。
+        ArtifactVersion root = repositoryDao.loadArtifact(rootName, rootVersion);
+        if (root == null || root.withdrawn()) {
+            throw ApiException.unprocessable(
+                    "根制品版本已撤回，无法重解析: " + rootName + ":" + rootVersion);
+        }
+
+        // 4. 在当前一致性快照上用与原锁定一致的回溯算法重新解析。
+        RepositorySnapshot snapshot = repositoryDao.loadSnapshot();
+        ResolutionResult resolution = LockResolver.resolveWithDiagnosis(snapshot, rootName, rootVersion);
+
+        TreeMap<String, Integer> original = new TreeMap<>();
+        for (LockEntryRow entry : repositoryDao.listLockEntries(lockFileId)) {
+            original.put(entry.name(), entry.version());
+        }
+
+        String conclusion;
+        List<ReresolveDiffResponse> diffs;
+        TreeMap<String, Integer> resolved = new TreeMap<>();
+        if (resolution.feasible()) {
+            resolved.putAll(resolution.solution());
+            if (resolved.equals(original)) {
+                conclusion = CONCLUSION_REPRODUCIBLE;
+                diffs = List.of();
+            } else {
+                conclusion = CONCLUSION_DRIFTED;
+                diffs = ReresolveDiffer.diff(original, resolved, snapshot).stream()
+                        .map(d -> new ReresolveDiffResponse(d.name(), d.changeType(),
+                                d.originalVersion(), d.newVersion(), d.reason(), d.detail()))
+                        .toList();
+            }
+        } else {
+            conclusion = CONCLUSION_INFEASIBLE;
+            InfeasibleBlocker blocker = resolution.blocker();
+            Integer originalBlockedVersion = original.get(blocker.name());
+            diffs = List.of(new ReresolveDiffResponse(
+                    blocker.name(), CHANGE_INFEASIBLE, originalBlockedVersion, null,
+                    blocker.reason(), infeasibleDetail(blocker)));
+        }
+
+        // 5. 同一事务内固化不可变报告（reresolve_key 全局唯一由数据库约束保证）。
+        //    当前事务持有 repository_state 行锁，全部重解析写事务串行，故预检具有权威性。
+        String reresolveKey = request.reresolveKey().trim();
+        if (repositoryDao.findReresolveReportByKey(reresolveKey) != null) {
+            throw ApiException.conflict("reresolveKey 已被使用: " + reresolveKey);
+        }
+        Instant now = Instant.now(clock);
+        long reportId = repositoryDao.insertReresolveReport(
+                reresolveKey, lockFileId, rootName, rootVersion,
+                currentVersion, conclusion, currentRequestId.get(), now);
+        for (Map.Entry<String, Integer> entry : resolved.entrySet()) {
+            repositoryDao.insertReresolveEntry(reportId, entry.getKey(), entry.getValue());
+        }
+        for (ReresolveDiffResponse diff : diffs) {
+            repositoryDao.insertReresolveDiff(reportId, diff.name(), diff.changeType(),
+                    diff.originalVersion(), diff.newVersion(), diff.reason(), diff.detail());
+        }
+
+        return new ReresolveReportResponse(reportId, request.reresolveKey().trim(), lockFileId,
+                rootName, rootVersion, currentVersion, conclusion, now,
+                toLockEntryViews(resolved), diffs);
+    }
+
+    private static String infeasibleDetail(InfeasibleBlocker blocker) {
+        String versions = blocker.versions().stream().map(String::valueOf)
+                .reduce((a, b) -> a + "," + b).orElse("");
+        return switch (blocker.reason()) {
+            case InfeasibleBlocker.VERSIONS_WITHDRAWN ->
+                    "名称 " + blocker.name() + " 在依赖区间内的候选版本均已撤回：" + versions;
+            case InfeasibleBlocker.VERSIONS_MISSING ->
+                    "名称 " + blocker.name() + " 在要求的版本处没有登记任何可用版本：" + versions;
+            default ->
+                    "名称 " + blocker.name() + " 的依赖区间交集冲突，无可同时满足的候选版本：" + versions;
+        };
+    }
+
+    private ReresolveReportResponse toReresolveReportResponse(ReresolveReportRow row) {
+        List<LockEntryResponse> entries = repositoryDao.listReresolveEntries(row.id()).stream()
+                .map(e -> new LockEntryResponse(e.name(), e.version()))
+                .toList();
+        List<ReresolveDiffResponse> diffs = repositoryDao.listReresolveDiffs(row.id()).stream()
+                .map(d -> new ReresolveDiffResponse(d.name(), d.changeType(),
+                        d.originalVersion(), d.newVersion(), d.reason(), d.detail()))
+                .toList();
+        return new ReresolveReportResponse(row.id(), row.reresolveKey(), row.lockFileId(),
+                row.rootName(), row.rootVersion(), row.repositoryVersion(),
+                row.conclusion(), row.createdAt(), entries, diffs);
+    }
+
+    private static List<LockEntryResponse> toLockEntryViews(Map<String, Integer> entries) {
+        return entries.entrySet().stream()
+                .map(e -> new LockEntryResponse(e.getKey(), e.getValue()))
+                .toList();
     }
 
     // ------------------------------------------------------------------

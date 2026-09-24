@@ -279,4 +279,146 @@ public class RepositoryDao {
 
     private record DepRow(long artifactId, String name, int minimumVersion, int maximumVersion) {
     }
+
+    // ------------------------------------------------------------------
+    // 锁文件重解析报告（只增不改不删，天然不可变）
+    // ------------------------------------------------------------------
+
+    /** 重解析报告主记录行。 */
+    public record ReresolveReportRow(long id, String reresolveKey, long lockFileId,
+                                     String rootName, int rootVersion, long repositoryVersion,
+                                     String conclusion, String requestId, Instant createdAt) {
+    }
+
+    /** 重解析报告新解析集合条目行。 */
+    public record ReresolveEntryRow(long reportId, String name, int version) {
+    }
+
+    /** 重解析报告差异/不可行原因明细行，original/new_version 可空。 */
+    public record ReresolveDiffRow(long reportId, String name, String changeType,
+                                   Integer originalVersion, Integer newVersion,
+                                   String reason, String detail) {
+    }
+
+    /** 新增重解析报告主记录，返回自增主键；reresolve_key 冲突抛 DuplicateKeyException。 */
+    public long insertReresolveReport(String reresolveKey, long lockFileId, String rootName,
+                                      int rootVersion, long repositoryVersion, String conclusion,
+                                      String requestId, Instant createdAt) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbcTemplate.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO reresolve_report (reresolve_key, lock_file_id, root_name, root_version, "
+                            + "repository_version, conclusion, request_id, created_at) "
+                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, reresolveKey);
+            ps.setLong(2, lockFileId);
+            ps.setString(3, rootName);
+            ps.setInt(4, rootVersion);
+            ps.setLong(5, repositoryVersion);
+            ps.setString(6, conclusion);
+            ps.setString(7, requestId);
+            ps.setTimestamp(8, Timestamp.from(createdAt));
+            return ps;
+        }, keyHolder);
+        Number key = keyHolder.getKey();
+        if (key == null) {
+            throw new IllegalStateException("插入重解析报告未获取自增主键");
+        }
+        return key.longValue();
+    }
+
+    /** 新增报告新解析集合中的一条精确版本。 */
+    public void insertReresolveEntry(long reportId, String name, int version) {
+        jdbcTemplate.update(
+                "INSERT INTO reresolve_report_entry (report_id, name, version) VALUES (?, ?, ?)",
+                reportId, name, version);
+    }
+
+    /** 新增一条报告差异/不可行原因明细，版本列允许为空。 */
+    public void insertReresolveDiff(long reportId, String name, String changeType,
+                                    Integer originalVersion, Integer newVersion,
+                                    String reason, String detail) {
+        jdbcTemplate.update(
+                "INSERT INTO reresolve_report_diff (report_id, name, change_type, original_version, "
+                        + "new_version, reason, detail) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ps -> {
+                    ps.setLong(1, reportId);
+                    ps.setString(2, name);
+                    ps.setString(3, changeType);
+                    if (originalVersion == null) {
+                        ps.setNull(4, java.sql.Types.INTEGER);
+                    } else {
+                        ps.setInt(4, originalVersion);
+                    }
+                    if (newVersion == null) {
+                        ps.setNull(5, java.sql.Types.INTEGER);
+                    } else {
+                        ps.setInt(5, newVersion);
+                    }
+                    ps.setString(6, reason);
+                    ps.setString(7, detail);
+                });
+    }
+
+    /** 按主键查询报告主记录，不存在返回 null。 */
+    public ReresolveReportRow getReresolveReport(long id) {
+        List<ReresolveReportRow> rows = jdbcTemplate.query(
+                "SELECT id, reresolve_key, lock_file_id, root_name, root_version, repository_version, "
+                        + "conclusion, request_id, created_at FROM reresolve_report WHERE id = ?",
+                (rs, n) -> mapReportRow(rs),
+                id);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /** 按全局唯一 reresolveKey 查询报告主记录，不存在返回 null。 */
+    public ReresolveReportRow findReresolveReportByKey(String reresolveKey) {
+        List<ReresolveReportRow> rows = jdbcTemplate.query(
+                "SELECT id, reresolve_key, lock_file_id, root_name, root_version, repository_version, "
+                        + "conclusion, request_id, created_at FROM reresolve_report WHERE reresolve_key = ?",
+                (rs, n) -> mapReportRow(rs),
+                reresolveKey);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /** 查询某锁文件的全部重解析报告，按报告 ID 升序（提交顺序）。 */
+    public List<ReresolveReportRow> listReresolveReportsByLockFile(long lockFileId) {
+        return jdbcTemplate.query(
+                "SELECT id, reresolve_key, lock_file_id, root_name, root_version, repository_version, "
+                        + "conclusion, request_id, created_at FROM reresolve_report "
+                        + "WHERE lock_file_id = ? ORDER BY id ASC",
+                (rs, n) -> mapReportRow(rs),
+                lockFileId);
+    }
+
+    /** 查询报告的新解析集合条目，按名称升序。 */
+    public List<ReresolveEntryRow> listReresolveEntries(long reportId) {
+        return jdbcTemplate.query(
+                "SELECT report_id, name, version FROM reresolve_report_entry "
+                        + "WHERE report_id = ? ORDER BY name ASC",
+                (rs, n) -> new ReresolveEntryRow(rs.getLong("report_id"),
+                        rs.getString("name"), rs.getInt("version")),
+                reportId);
+    }
+
+    /** 查询报告的差异/不可行明细，按名称升序（同名称按变化类型稳定排序）。 */
+    public List<ReresolveDiffRow> listReresolveDiffs(long reportId) {
+        return jdbcTemplate.query(
+                "SELECT report_id, name, change_type, original_version, new_version, reason, detail "
+                        + "FROM reresolve_report_diff WHERE report_id = ? "
+                        + "ORDER BY name ASC, change_type ASC",
+                (rs, n) -> new ReresolveDiffRow(rs.getLong("report_id"),
+                        rs.getString("name"), rs.getString("change_type"),
+                        rs.getObject("original_version", Integer.class),
+                        rs.getObject("new_version", Integer.class),
+                        rs.getString("reason"), rs.getString("detail")),
+                reportId);
+    }
+
+    private static ReresolveReportRow mapReportRow(java.sql.ResultSet rs) throws java.sql.SQLException {
+        return new ReresolveReportRow(rs.getLong("id"), rs.getString("reresolve_key"),
+                rs.getLong("lock_file_id"), rs.getString("root_name"), rs.getInt("root_version"),
+                rs.getLong("repository_version"), rs.getString("conclusion"),
+                rs.getString("request_id"), rs.getTimestamp("created_at").toInstant());
+    }
 }
