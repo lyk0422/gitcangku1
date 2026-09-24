@@ -1,10 +1,16 @@
 package com.example.starter.race.service;
 
 import com.example.starter.race.api.AddPenaltyRequest;
+import com.example.starter.race.api.AdvancementResponse;
+import com.example.starter.race.api.AssignGroupsRequest;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
 import com.example.starter.race.api.CreateRaceRequest;
+import com.example.starter.race.api.GenerateAdvancementRequest;
+import com.example.starter.race.api.GroupsResponse;
+import com.example.starter.race.api.NonAdvancedResponse;
 import com.example.starter.race.api.RegisterRunnerRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
+import com.example.starter.race.api.RevokeAdvancementRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
 import com.example.starter.race.api.MissingCheckpointsResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
@@ -59,4 +65,32 @@ public interface RaceService {
 
     /** 查询赛事全部选手缺失检查点汇总，按参赛号与检查点顺序稳定返回；只读。 */
     MissingCheckpointsResponse getMissingCheckpoints(String raceId);
+
+    /**
+     * 一次性划分分组（2~8 组、每组 2~16 人、同一选手只属一组）；
+     * 仅 OPEN 且尚未划分时可执行，成功后版本加一且不可改写。
+     */
+    ServiceResult assignGroups(String raceId, AssignGroupsRequest request);
+
+    /**
+     * 原子生成晋级名单：组内前 Q 名直接晋级，剩余有效选手全局前 W 名补位，
+     * 并列跨过边界全部纳入；任一分组有效选手不足 Q 名返回422且不生成。
+     * 成功后写入不可变快照并推进版本；同一赛事最多一份生效名单。
+     */
+    ServiceResult generateAdvancement(String raceId, GenerateAdvancementRequest request);
+
+    /** 整份撤销当前生效名单并推进版本；原快照保留，撤销后可重新生成。 */
+    ServiceResult revokeAdvancement(String raceId, RevokeAdvancementRequest request);
+
+    /** 查询赛事分组划分；未划分为空列表。 */
+    GroupsResponse getGroups(String raceId);
+
+    /** 查询当前生效的晋级名单；无生效名单为404。 */
+    AdvancementResponse getActiveAdvancement(String raceId);
+
+    /** 按键查询晋级名单快照（含已撤销）；不存在或不属于该赛事为404。 */
+    AdvancementResponse getAdvancement(String raceId, String advancementKey);
+
+    /** 查询未晋级清单：已划入分组但不在当前生效名单中的选手；无生效名单为404。 */
+    NonAdvancedResponse getNonAdvanced(String raceId);
 }

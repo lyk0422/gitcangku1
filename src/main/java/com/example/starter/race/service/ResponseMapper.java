@@ -1,5 +1,7 @@
 package com.example.starter.race.service;
 
+import com.example.starter.race.api.AdvancementEntryResponse;
+import com.example.starter.race.api.AdvancementResponse;
 import com.example.starter.race.api.CheckpointPassResponse;
 import com.example.starter.race.api.CheckpointTimingResponse;
 import com.example.starter.race.api.PenaltyResponse;
@@ -10,6 +12,8 @@ import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
+import com.example.starter.race.persistence.AdvancementEntryRow;
+import com.example.starter.race.persistence.AdvancementRow;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
 import com.example.starter.race.persistence.PenaltyRow;
@@ -150,5 +154,33 @@ final class ResponseMapper {
                 .toList();
         return new RunnerTimingResponse(
                 snapshot.raceId(), bib, snapshot.version(), finishTimeMs, passes);
+    }
+
+    /** 晋级名单快照行转响应。 */
+    static AdvancementResponse toAdvancementResponse(AdvancementRow row) {
+        return new AdvancementResponse(
+                row.advancementKey(),
+                row.raceId(),
+                row.version(),
+                row.quotaPerGroup(),
+                row.wildcardCount(),
+                row.expectedCount(),
+                row.actualCount(),
+                row.overflowReason(),
+                row.status(),
+                row.generatedAt(),
+                row.revokedAt(),
+                row.entries().stream().map(ResponseMapper::toAdvancementEntryResponse).toList());
+    }
+
+    static AdvancementEntryResponse toAdvancementEntryResponse(AdvancementEntryRow entry) {
+        return new AdvancementEntryResponse(
+                entry.bib(),
+                entry.groupCode(),
+                entry.type(),
+                entry.rankNo(),
+                entry.finishTimeMs(),
+                entry.penaltyMs(),
+                entry.totalTimeMs());
     }
 }

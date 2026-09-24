@@ -95,9 +95,66 @@ CREATE TABLE IF NOT EXISTS result_snapshot_checkpoint (
     CONSTRAINT fk_snapshot_checkpoint_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
 );
 
+CREATE TABLE IF NOT EXISTS race_group (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    group_code VARCHAR(64) NOT NULL COMMENT '分组代码，同一赛事内唯一；一次性划分后不可修改',
+    created_at BIGINT NOT NULL COMMENT '分组划分时间，Unix毫秒时间戳',
+    CONSTRAINT pk_race_group PRIMARY KEY (race_id, group_code),
+    CONSTRAINT fk_group_race FOREIGN KEY (race_id) REFERENCES race (race_id)
+);
+
+CREATE TABLE IF NOT EXISTS race_group_member (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    group_code VARCHAR(64) NOT NULL COMMENT '所属分组代码',
+    bib VARCHAR(64) NOT NULL COMMENT '选手参赛号；同一赛事内一名选手最多属于一个分组',
+    created_at BIGINT NOT NULL COMMENT '划入分组时间，Unix毫秒时间戳',
+    CONSTRAINT pk_group_member PRIMARY KEY (race_id, bib),
+    CONSTRAINT fk_member_group FOREIGN KEY (race_id, group_code) REFERENCES race_group (race_id, group_code),
+    CONSTRAINT fk_member_runner FOREIGN KEY (race_id, bib) REFERENCES runner (race_id, bib),
+    INDEX idx_member_group (race_id, group_code)
+);
+
+CREATE TABLE IF NOT EXISTS advancement_snapshot (
+    advancement_key VARCHAR(128) NOT NULL COMMENT '晋级名单键，全局唯一；撤销后原快照保留，键不复用',
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    version INT NOT NULL COMMENT '生成名单后的赛事版本号',
+    quota_per_group INT NOT NULL COMMENT '每组直接晋级名额Q，取值1~8',
+    wildcard_count INT NOT NULL COMMENT '全局补位名额W，取值0~8',
+    expected_count INT NOT NULL COMMENT '计划晋级人数=Q乘组数加W',
+    actual_count INT NOT NULL COMMENT '实际晋级人数；并列跨过边界时大于计划人数',
+    overflow_reason VARCHAR(255) COMMENT '超额原因（并列边界说明）；无超额为NULL',
+    status VARCHAR(16) NOT NULL COMMENT '名单状态：ACTIVE-生效中，REVOKED-已撤销（快照保留）',
+    generated_at BIGINT NOT NULL COMMENT '名单生成时间，Unix毫秒时间戳',
+    revoked_at BIGINT COMMENT '名单撤销时间，Unix毫秒时间戳；未撤销为NULL',
+    CONSTRAINT pk_advancement PRIMARY KEY (advancement_key),
+    CONSTRAINT fk_advancement_race FOREIGN KEY (race_id) REFERENCES race (race_id),
+    INDEX idx_advancement_race (race_id)
+);
+
+CREATE TABLE IF NOT EXISTS advancement_active (
+    race_id VARCHAR(64) NOT NULL COMMENT '赛事ID；每个赛事最多一份生效名单',
+    advancement_key VARCHAR(128) NOT NULL COMMENT '当前生效的晋级名单键',
+    CONSTRAINT pk_advancement_active PRIMARY KEY (race_id),
+    CONSTRAINT fk_active_advancement FOREIGN KEY (advancement_key) REFERENCES advancement_snapshot (advancement_key)
+);
+
+CREATE TABLE IF NOT EXISTS advancement_entry (
+    advancement_key VARCHAR(128) NOT NULL COMMENT '所属晋级名单键',
+    bib VARCHAR(64) NOT NULL COMMENT '晋级选手参赛号',
+    group_code VARCHAR(64) NOT NULL COMMENT '所属分组代码',
+    type VARCHAR(16) NOT NULL COMMENT '晋级类型：DIRECT-组内直接晋级，WILDCARD-全局补位',
+    rank_no INT NOT NULL COMMENT '名次：DIRECT为组内名次，WILDCARD为补位候选池名次；并列同名次并跳号',
+    finish_time_ms BIGINT NOT NULL COMMENT '生成时固化的原始完赛耗时（毫秒）',
+    penalty_ms BIGINT NOT NULL COMMENT '生成时固化的生效加时合计（毫秒），无加时为0',
+    total_time_ms BIGINT NOT NULL COMMENT '生成时固化的总耗时=原始完赛耗时+生效加时（毫秒）',
+    display_order INT NOT NULL COMMENT '展示顺序，从0开始：先 DIRECT 按组与名次，再 WILDCARD 按补位名次',
+    CONSTRAINT pk_advancement_entry PRIMARY KEY (advancement_key, bib),
+    CONSTRAINT fk_entry_advancement FOREIGN KEY (advancement_key) REFERENCES advancement_snapshot (advancement_key)
+);
+
 CREATE TABLE IF NOT EXISTS idempotency_record (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求ID（写操作幂等键）',
-    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE',
+    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE/ASSIGN_GROUPS/GENERATE_ADVANCEMENT/REVOKE_ADVANCEMENT',
     request_digest CHAR(64) NOT NULL COMMENT '请求参数（requestId除外，含expectedVersion）规范化JSON的SHA-256摘要',
     response_status INT NOT NULL COMMENT '原成功请求的HTTP状态码，重放时原样返回',
     response_body TEXT COMMENT '原成功响应体JSON，重放时原样返回',

@@ -1,27 +1,39 @@
 package com.example.starter.race.service;
 
 import com.example.starter.race.api.AddPenaltyRequest;
+import com.example.starter.race.api.AdvancementResponse;
+import com.example.starter.race.api.AssignGroupsRequest;
 import com.example.starter.race.api.CheckpointResponse;
 import com.example.starter.race.api.CheckpointsConfigResponse;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
 import com.example.starter.race.api.CreateRaceRequest;
+import com.example.starter.race.api.GenerateAdvancementRequest;
+import com.example.starter.race.api.GroupsResponse;
 import com.example.starter.race.api.MissingCheckpointsResponse;
+import com.example.starter.race.api.NonAdvancedResponse;
 import com.example.starter.race.api.RaceResponse;
 import com.example.starter.race.api.RegisterRunnerRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
+import com.example.starter.race.api.RevokeAdvancementRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
 import com.example.starter.race.api.RunnerMissingCheckpointsResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.api.SubmitTimingRequest;
+import com.example.starter.race.domain.AdvancementCalculator;
 import com.example.starter.race.domain.CheckpointRules;
+import com.example.starter.race.domain.EntryStatus;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
+import com.example.starter.race.persistence.AdvancementEntryRow;
+import com.example.starter.race.persistence.AdvancementRow;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
+import com.example.starter.race.persistence.GroupMemberRow;
+import com.example.starter.race.persistence.GroupRow;
 import com.example.starter.race.persistence.IdempotencyRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
@@ -41,10 +53,14 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.HexFormat;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.function.Supplier;
 
@@ -496,6 +512,282 @@ public class RaceServiceImpl implements RaceService {
         SnapshotRow snapshot = repository.findSnapshot(raceId)
                 .orElseThrow(() -> new NotFoundException("赛事尚未封榜: " + raceId));
         return ResponseMapper.snapshotStanding(snapshot);
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult assignGroups(String raceId, AssignGroupsRequest request) {
+        // 规范化分组参数顺序，保证同参重放摘要一致。
+        List<AssignGroupsRequest.GroupDefinition> canonical = request.groups().stream()
+                .sorted(java.util.Comparator.comparing(AssignGroupsRequest.GroupDefinition::groupCode))
+                .toList();
+        return withIdempotency(request.requestId(), "ASSIGN_GROUPS",
+                orderedParams(
+                        "raceId", raceId,
+                        "expectedVersion", request.expectedVersion(),
+                        "groups", canonical.stream()
+                                .map(def -> def.groupCode() + ":"
+                                        + def.bibs().stream().sorted().toList())
+                                .toList()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    validateGroupDefinitions(request.groups());
+                    if (!repository.findGroups(raceId).isEmpty()) {
+                        throw new ConflictException("赛事已划分分组，划分后不可修改: " + raceId);
+                    }
+                    for (AssignGroupsRequest.GroupDefinition def : request.groups()) {
+                        for (String bib : def.bibs()) {
+                            requireRunner(raceId, bib);
+                        }
+                    }
+                    bumpVersion(race, request.expectedVersion());
+                    long now = clock.millis();
+                    repository.insertGroups(request.groups().stream()
+                            .map(def -> new GroupRow(raceId, def.groupCode(), now))
+                            .toList());
+                    List<GroupMemberRow> memberRows = new ArrayList<>();
+                    for (AssignGroupsRequest.GroupDefinition def : request.groups()) {
+                        for (String bib : def.bibs()) {
+                            memberRows.add(new GroupMemberRow(raceId, def.groupCode(), bib, now));
+                        }
+                    }
+                    repository.insertGroupMembers(memberRows);
+                    return ServiceResult.created(buildGroupsResponse(
+                            raceId, request.expectedVersion() + 1));
+                });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult generateAdvancement(String raceId, GenerateAdvancementRequest request) {
+        return withIdempotency(request.requestId(), "GENERATE_ADVANCEMENT",
+                orderedParams(
+                        "raceId", raceId,
+                        "advancementKey", request.advancementKey(),
+                        "quotaPerGroup", request.quotaPerGroup(),
+                        "wildcardCount", request.wildcardCount(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    int quota = request.quotaPerGroup();
+                    int wildcard = request.wildcardCount();
+                    if (quota < 1 || quota > 8) {
+                        throw new BadRequestException("每组直接晋级名额Q必须在 1~8 之间");
+                    }
+                    if (wildcard < 0 || wildcard > 8) {
+                        throw new BadRequestException("补位名额W必须在 0~8 之间");
+                    }
+                    List<GroupRow> groups = repository.findGroups(raceId);
+                    if (groups.isEmpty()) {
+                        throw new ConflictException("赛事尚未划分分组，无法生成晋级名单: " + raceId);
+                    }
+                    if (repository.findActiveAdvancement(raceId).isPresent()) {
+                        throw new ConflictException("赛事已存在生效晋级名单，请先撤销: " + raceId);
+                    }
+                    if (repository.findAdvancement(request.advancementKey()).isPresent()) {
+                        throw new ConflictException(
+                                "advancementKey 已存在: " + request.advancementKey());
+                    }
+                    List<GroupMemberRow> members = repository.findGroupMembers(raceId);
+                    // 行锁保护下读取一致状态：有效选手=有完赛计时、覆盖全部检查点且未取消资格。
+                    List<ResultEntry> standings = ResultCalculator.compute(
+                            repository.findRunners(raceId),
+                            repository.findPenalties(raceId),
+                            repository.findCheckpoints(raceId),
+                            repository.findAllTimings(raceId));
+                    Map<String, ResultEntry> rankedByBib = new HashMap<>();
+                    for (ResultEntry entry : standings) {
+                        if (entry.status() == EntryStatus.RANKED) {
+                            rankedByBib.put(entry.bib(), entry);
+                        }
+                    }
+                    Map<String, Long> totalTimeByBib = new HashMap<>();
+                    rankedByBib.forEach((bib, entry) -> totalTimeByBib.put(bib, entry.totalTimeMs()));
+                    List<AdvancementCalculator.GroupInput> groupInputs = groups.stream()
+                            .map(group -> new AdvancementCalculator.GroupInput(
+                                    group.groupCode(),
+                                    members.stream()
+                                            .filter(member -> member.groupCode()
+                                                    .equals(group.groupCode()))
+                                            .map(GroupMemberRow::bib)
+                                            .toList()))
+                            .toList();
+                    AdvancementCalculator.AdvancementOutcome outcome =
+                            AdvancementCalculator.compute(groupInputs, totalTimeByBib, quota, wildcard);
+                    if (outcome instanceof AdvancementCalculator.AdvancementOutcome.Insufficient
+                            insufficient) {
+                        throw new UnprocessableEntityException(
+                                "分组 " + insufficient.groupCode() + " 有效选手不足: 需要 "
+                                        + insufficient.required() + " 名, 实际 "
+                                        + insufficient.actual() + " 名");
+                    }
+                    AdvancementCalculator.AdvancementOutcome.Plan plan =
+                            (AdvancementCalculator.AdvancementOutcome.Plan) outcome;
+                    int newVersion = request.expectedVersion() + 1;
+                    bumpVersion(race, request.expectedVersion());
+                    long now = clock.millis();
+                    List<AdvancementEntryRow> entryRows = new ArrayList<>(plan.entries().size());
+                    int order = 0;
+                    for (AdvancementCalculator.AdvanceEntry advance : plan.entries()) {
+                        ResultEntry standing = rankedByBib.get(advance.bib());
+                        entryRows.add(new AdvancementEntryRow(
+                                request.advancementKey(), advance.bib(), advance.groupCode(),
+                                advance.type().name(), advance.rank(),
+                                standing.finishTimeMs(), standing.penaltyMs(),
+                                standing.totalTimeMs(), order++));
+                    }
+                    AdvancementRow row = new AdvancementRow(
+                            request.advancementKey(), raceId, newVersion, quota, wildcard,
+                            plan.expectedCount(), plan.actualCount(), plan.overflowReason(),
+                            "ACTIVE", now, null, entryRows);
+                    try {
+                        repository.insertAdvancement(row);
+                    } catch (DuplicateKeyException ex) {
+                        // 并发下主键兜底：advancementKey 全局唯一。
+                        throw new ConflictException(
+                                "advancementKey 已存在: " + request.advancementKey());
+                    }
+                    repository.insertActiveAdvancement(raceId, request.advancementKey());
+                    return ServiceResult.created(ResponseMapper.toAdvancementResponse(row));
+                });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult revokeAdvancement(String raceId, RevokeAdvancementRequest request) {
+        return withIdempotency(request.requestId(), "REVOKE_ADVANCEMENT",
+                orderedParams(
+                        "raceId", raceId,
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    AdvancementRow active = repository.findActiveAdvancement(raceId)
+                            .orElseThrow(() -> new NotFoundException(
+                                    "赛事无生效晋级名单: " + raceId));
+                    bumpVersion(race, request.expectedVersion());
+                    long now = clock.millis();
+                    repository.deleteActiveAdvancement(raceId);
+                    int updated = repository.markAdvancementRevoked(active.advancementKey(), now);
+                    if (updated == 0) {
+                        throw new ConflictException("名单已撤销: " + active.advancementKey());
+                    }
+                    AdvancementRow revoked =
+                            repository.findAdvancement(active.advancementKey()).orElseThrow();
+                    return ServiceResult.ok(ResponseMapper.toAdvancementResponse(revoked));
+                });
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public GroupsResponse getGroups(String raceId) {
+        RaceRow race = repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        return buildGroupsResponse(race.raceId(), race.version());
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public AdvancementResponse getActiveAdvancement(String raceId) {
+        repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        AdvancementRow active = repository.findActiveAdvancement(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事无生效晋级名单: " + raceId));
+        return ResponseMapper.toAdvancementResponse(active);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public AdvancementResponse getAdvancement(String raceId, String advancementKey) {
+        repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        AdvancementRow row = repository.findAdvancement(advancementKey)
+                .filter(advancement -> advancement.raceId().equals(raceId))
+                .orElseThrow(() -> new NotFoundException("晋级名单不存在: " + advancementKey));
+        return ResponseMapper.toAdvancementResponse(row);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public NonAdvancedResponse getNonAdvanced(String raceId) {
+        repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        AdvancementRow active = repository.findActiveAdvancement(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事无生效晋级名单: " + raceId));
+        Set<String> advancedBibs = new HashSet<>();
+        for (AdvancementEntryRow entry : active.entries()) {
+            advancedBibs.add(entry.bib());
+        }
+        List<ResultEntry> standings = ResultCalculator.compute(
+                repository.findRunners(raceId),
+                repository.findPenalties(raceId),
+                repository.findCheckpoints(raceId),
+                repository.findAllTimings(raceId));
+        Map<String, ResultEntry> standingByBib = new HashMap<>();
+        for (ResultEntry entry : standings) {
+            standingByBib.put(entry.bib(), entry);
+        }
+        List<NonAdvancedResponse.NonAdvancedEntryResponse> rows =
+                repository.findGroupMembers(raceId).stream()
+                        .filter(member -> !advancedBibs.contains(member.bib()))
+                        .map(member -> {
+                            ResultEntry standing = standingByBib.get(member.bib());
+                            return new NonAdvancedResponse.NonAdvancedEntryResponse(
+                                    member.bib(), member.groupCode(), standing.status(),
+                                    standing.rank(), standing.totalTimeMs());
+                        })
+                        .toList();
+        return new NonAdvancedResponse(raceId, active.advancementKey(), rows);
+    }
+
+    /** 组装分组响应：分组按代码字典序，组内成员按参赛号字典序。 */
+    private GroupsResponse buildGroupsResponse(String raceId, int version) {
+        Map<String, List<String>> bibsByGroup = new LinkedHashMap<>();
+        for (GroupRow group : repository.findGroups(raceId)) {
+            bibsByGroup.put(group.groupCode(), new ArrayList<>());
+        }
+        for (GroupMemberRow member : repository.findGroupMembers(raceId)) {
+            List<String> bibs = bibsByGroup.get(member.groupCode());
+            if (bibs != null) {
+                bibs.add(member.bib());
+            }
+        }
+        List<GroupsResponse.GroupResponse> groups = bibsByGroup.entrySet().stream()
+                .map(entry -> new GroupsResponse.GroupResponse(entry.getKey(), entry.getValue()))
+                .toList();
+        return new GroupsResponse(raceId, version, groups);
+    }
+
+    /**
+     * 校验分组划分请求体：2~8 个分组、代码非空且赛事内唯一、
+     * 每组 2~16 名选手、同一选手只属一个分组。
+     */
+    private static void validateGroupDefinitions(
+            List<AssignGroupsRequest.GroupDefinition> definitions) {
+        if (definitions.size() < 2 || definitions.size() > 8) {
+            throw new BadRequestException("分组数量必须在 2~8 之间");
+        }
+        Set<String> groupCodes = new HashSet<>();
+        Set<String> assignedBibs = new HashSet<>();
+        for (AssignGroupsRequest.GroupDefinition def : definitions) {
+            if (def.groupCode() == null || def.groupCode().isBlank()) {
+                throw new BadRequestException("分组代码不能为空");
+            }
+            if (!groupCodes.add(def.groupCode())) {
+                throw new BadRequestException("分组代码在赛事内重复: " + def.groupCode());
+            }
+            if (def.bibs() == null || def.bibs().size() < 2 || def.bibs().size() > 16) {
+                throw new BadRequestException(
+                        "每组选手数量必须在 2~16 之间: " + def.groupCode());
+            }
+            for (String bib : def.bibs()) {
+                if (bib == null || bib.isBlank()) {
+                    throw new BadRequestException("参赛号不能为空: " + def.groupCode());
+                }
+                if (!assignedBibs.add(bib)) {
+                    throw new BadRequestException("同一选手只能属于一个分组: " + bib);
+                }
+            }
+        }
     }
 
     /**

@@ -30,6 +30,10 @@ public class RaceRepository {
             new CheckpointTimingRowMapper();
     private static final SnapshotCheckpointRowMapper SNAPSHOT_CHECKPOINT_ROW_MAPPER =
             new SnapshotCheckpointRowMapper();
+    private static final GroupRowMapper GROUP_ROW_MAPPER = new GroupRowMapper();
+    private static final GroupMemberRowMapper GROUP_MEMBER_ROW_MAPPER = new GroupMemberRowMapper();
+    private static final AdvancementEntryRowMapper ADVANCEMENT_ENTRY_ROW_MAPPER =
+            new AdvancementEntryRowMapper();
 
     private final JdbcTemplate jdbcTemplate;
 
@@ -370,6 +374,11 @@ public class RaceRepository {
 
     /** 测试辅助：清空全部业务数据，按外键依赖顺序删除。 */
     public void deleteAllForTesting() {
+        jdbcTemplate.update("DELETE FROM advancement_entry");
+        jdbcTemplate.update("DELETE FROM advancement_active");
+        jdbcTemplate.update("DELETE FROM advancement_snapshot");
+        jdbcTemplate.update("DELETE FROM race_group_member");
+        jdbcTemplate.update("DELETE FROM race_group");
         jdbcTemplate.update("DELETE FROM result_snapshot_checkpoint");
         jdbcTemplate.update("DELETE FROM result_snapshot_entry");
         jdbcTemplate.update("DELETE FROM result_snapshot");
@@ -379,6 +388,190 @@ public class RaceRepository {
         jdbcTemplate.update("DELETE FROM penalty");
         jdbcTemplate.update("DELETE FROM runner");
         jdbcTemplate.update("DELETE FROM race");
+    }
+
+    /** 查询赛事的全部分组，按分组代码字典序排列；未划分为空列表。 */
+    public List<GroupRow> findGroups(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT race_id, group_code, created_at FROM race_group "
+                        + "WHERE race_id = ? ORDER BY group_code",
+                GROUP_ROW_MAPPER, raceId);
+    }
+
+    /** 查询赛事的全部分组成员，按分组代码、参赛号字典序排列。 */
+    public List<GroupMemberRow> findGroupMembers(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT race_id, group_code, bib, created_at FROM race_group_member "
+                        + "WHERE race_id = ? ORDER BY group_code, bib",
+                GROUP_MEMBER_ROW_MAPPER, raceId);
+    }
+
+    /** 一次性写入赛事分组（划分后不可修改）。 */
+    public void insertGroups(List<GroupRow> rows) {
+        jdbcTemplate.batchUpdate(
+                "INSERT INTO race_group (race_id, group_code, created_at) VALUES (?, ?, ?)",
+                rows,
+                rows.size(),
+                (ps, row) -> {
+                    ps.setString(1, row.raceId());
+                    ps.setString(2, row.groupCode());
+                    ps.setLong(3, row.createdAt());
+                });
+    }
+
+    /** 一次性写入分组成员；同赛事选手唯一由主键 (race_id, bib) 保证。 */
+    public void insertGroupMembers(List<GroupMemberRow> rows) {
+        jdbcTemplate.batchUpdate(
+                "INSERT INTO race_group_member (race_id, group_code, bib, created_at) "
+                        + "VALUES (?, ?, ?, ?)",
+                rows,
+                rows.size(),
+                (ps, row) -> {
+                    ps.setString(1, row.raceId());
+                    ps.setString(2, row.groupCode());
+                    ps.setString(3, row.bib());
+                    ps.setLong(4, row.createdAt());
+                });
+    }
+
+    /** 按名单键查询晋级名单快照（含全部条目）；不存在返回 empty。 */
+    public Optional<AdvancementRow> findAdvancement(String advancementKey) {
+        List<AdvancementRow> headers = jdbcTemplate.query(
+                "SELECT advancement_key, race_id, version, quota_per_group, wildcard_count, "
+                        + "expected_count, actual_count, overflow_reason, status, generated_at, revoked_at "
+                        + "FROM advancement_snapshot WHERE advancement_key = ?",
+                (rs, rowNum) -> new AdvancementRow(
+                        rs.getString("advancement_key"),
+                        rs.getString("race_id"),
+                        rs.getInt("version"),
+                        rs.getInt("quota_per_group"),
+                        rs.getInt("wildcard_count"),
+                        rs.getInt("expected_count"),
+                        rs.getInt("actual_count"),
+                        rs.getString("overflow_reason"),
+                        rs.getString("status"),
+                        rs.getLong("generated_at"),
+                        (Long) rs.getObject("revoked_at"),
+                        List.of()),
+                advancementKey);
+        if (headers.isEmpty()) {
+            return Optional.empty();
+        }
+        AdvancementRow header = headers.getFirst();
+        return Optional.of(new AdvancementRow(
+                header.advancementKey(), header.raceId(), header.version(),
+                header.quotaPerGroup(), header.wildcardCount(),
+                header.expectedCount(), header.actualCount(), header.overflowReason(),
+                header.status(), header.generatedAt(), header.revokedAt(),
+                findAdvancementEntries(header.advancementKey())));
+    }
+
+    /** 查询赛事当前生效的晋级名单；无生效名单返回 empty。 */
+    public Optional<AdvancementRow> findActiveAdvancement(String raceId) {
+        List<String> keys = jdbcTemplate.query(
+                "SELECT advancement_key FROM advancement_active WHERE race_id = ?",
+                (rs, rowNum) -> rs.getString("advancement_key"),
+                raceId);
+        if (keys.isEmpty()) {
+            return Optional.empty();
+        }
+        return findAdvancement(keys.getFirst());
+    }
+
+    /** 原子写入晋级名单快照头表与全部条目。 */
+    public void insertAdvancement(AdvancementRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO advancement_snapshot "
+                        + "(advancement_key, race_id, version, quota_per_group, wildcard_count, "
+                        + "expected_count, actual_count, overflow_reason, status, generated_at, revoked_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                row.advancementKey(), row.raceId(), row.version(),
+                row.quotaPerGroup(), row.wildcardCount(),
+                row.expectedCount(), row.actualCount(), row.overflowReason(),
+                row.status(), row.generatedAt());
+        jdbcTemplate.batchUpdate(
+                "INSERT INTO advancement_entry "
+                        + "(advancement_key, bib, group_code, type, rank_no, "
+                        + "finish_time_ms, penalty_ms, total_time_ms, display_order) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                row.entries(),
+                row.entries().size(),
+                (ps, entry) -> {
+                    ps.setString(1, entry.advancementKey());
+                    ps.setString(2, entry.bib());
+                    ps.setString(3, entry.groupCode());
+                    ps.setString(4, entry.type());
+                    ps.setInt(5, entry.rankNo());
+                    ps.setLong(6, entry.finishTimeMs());
+                    ps.setLong(7, entry.penaltyMs());
+                    ps.setLong(8, entry.totalTimeMs());
+                    ps.setInt(9, entry.displayOrder());
+                });
+    }
+
+    /** 登记赛事当前生效名单（每赛事一行，主键保证最多一份生效名单）。 */
+    public void insertActiveAdvancement(String raceId, String advancementKey) {
+        jdbcTemplate.update(
+                "INSERT INTO advancement_active (race_id, advancement_key) VALUES (?, ?)",
+                raceId, advancementKey);
+    }
+
+    /** 移除赛事当前生效名单登记（撤销时调用，原快照保留）。 */
+    public void deleteActiveAdvancement(String raceId) {
+        jdbcTemplate.update("DELETE FROM advancement_active WHERE race_id = ?", raceId);
+    }
+
+    /** 标记名单已撤销，仅对当前生效中的名单生效；返回受影响行数。 */
+    public int markAdvancementRevoked(String advancementKey, long now) {
+        return jdbcTemplate.update(
+                "UPDATE advancement_snapshot SET status = 'REVOKED', revoked_at = ? "
+                        + "WHERE advancement_key = ? AND status = 'ACTIVE'",
+                now, advancementKey);
+    }
+
+    private List<AdvancementEntryRow> findAdvancementEntries(String advancementKey) {
+        return jdbcTemplate.query(
+                "SELECT advancement_key, bib, group_code, type, rank_no, "
+                        + "finish_time_ms, penalty_ms, total_time_ms, display_order "
+                        + "FROM advancement_entry WHERE advancement_key = ? ORDER BY display_order",
+                ADVANCEMENT_ENTRY_ROW_MAPPER, advancementKey);
+    }
+
+    private static final class GroupRowMapper implements RowMapper<GroupRow> {
+        @Override
+        public GroupRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new GroupRow(
+                    rs.getString("race_id"),
+                    rs.getString("group_code"),
+                    rs.getLong("created_at"));
+        }
+    }
+
+    private static final class GroupMemberRowMapper implements RowMapper<GroupMemberRow> {
+        @Override
+        public GroupMemberRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new GroupMemberRow(
+                    rs.getString("race_id"),
+                    rs.getString("group_code"),
+                    rs.getString("bib"),
+                    rs.getLong("created_at"));
+        }
+    }
+
+    private static final class AdvancementEntryRowMapper implements RowMapper<AdvancementEntryRow> {
+        @Override
+        public AdvancementEntryRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new AdvancementEntryRow(
+                    rs.getString("advancement_key"),
+                    rs.getString("bib"),
+                    rs.getString("group_code"),
+                    rs.getString("type"),
+                    rs.getInt("rank_no"),
+                    rs.getLong("finish_time_ms"),
+                    rs.getLong("penalty_ms"),
+                    rs.getLong("total_time_ms"),
+                    rs.getInt("display_order"));
+        }
     }
 
     private static final class RaceRowMapper implements RowMapper<RaceRow> {

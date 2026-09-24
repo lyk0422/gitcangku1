@@ -113,6 +113,56 @@ public class RaceController {
         return raceService.getMissingCheckpoints(raceId);
     }
 
+    /** 一次性划分分组（2~8 组、每组 2~16 人、同一选手只属一组）。 */
+    @PostMapping("/{raceId}/groups")
+    public ResponseEntity<Object> assignGroups(
+            @PathVariable String raceId,
+            @Valid @RequestBody AssignGroupsRequest request) {
+        return toResponse(raceService.assignGroups(raceId, request));
+    }
+
+    /** 查询赛事分组划分。 */
+    @GetMapping("/{raceId}/groups")
+    public GroupsResponse getGroups(@PathVariable String raceId) {
+        return raceService.getGroups(raceId);
+    }
+
+    /** 原子生成晋级名单并写入不可变快照。 */
+    @PostMapping("/{raceId}/advancement")
+    public ResponseEntity<Object> generateAdvancement(
+            @PathVariable String raceId,
+            @Valid @RequestBody GenerateAdvancementRequest request) {
+        return toResponse(raceService.generateAdvancement(raceId, request));
+    }
+
+    /** 整份撤销当前生效晋级名单（原快照保留）。 */
+    @PostMapping("/{raceId}/advancement/revocation")
+    public ResponseEntity<Object> revokeAdvancement(
+            @PathVariable String raceId,
+            @Valid @RequestBody RevokeAdvancementRequest request) {
+        return toResponse(raceService.revokeAdvancement(raceId, request));
+    }
+
+    /** 查询当前生效的晋级名单。 */
+    @GetMapping("/{raceId}/advancement")
+    public AdvancementResponse getActiveAdvancement(@PathVariable String raceId) {
+        return raceService.getActiveAdvancement(raceId);
+    }
+
+    /** 按键查询晋级名单快照（含已撤销）。 */
+    @GetMapping("/{raceId}/advancement/{advancementKey}")
+    public AdvancementResponse getAdvancement(
+            @PathVariable String raceId,
+            @PathVariable String advancementKey) {
+        return raceService.getAdvancement(raceId, advancementKey);
+    }
+
+    /** 查询未晋级清单（已划入分组但不在当前生效名单中的选手）。 */
+    @GetMapping("/{raceId}/advancement-non-advanced")
+    public NonAdvancedResponse getNonAdvanced(@PathVariable String raceId) {
+        return raceService.getNonAdvanced(raceId);
+    }
+
     private ResponseEntity<Object> toResponse(ServiceResult result) {
         return ResponseEntity.status(result.status()).body(result.body());
     }
