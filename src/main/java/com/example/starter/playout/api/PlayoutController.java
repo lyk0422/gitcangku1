@@ -2,8 +2,11 @@ package com.example.starter.playout.api;
 
 import com.example.starter.playout.PlayoutService;
 import com.example.starter.playout.api.Dtos.AssetResponse;
+import com.example.starter.playout.api.Dtos.BlackoutWindowResponse;
+import com.example.starter.playout.api.Dtos.CancelBlackoutWindowRequest;
 import com.example.starter.playout.api.Dtos.ChannelResponse;
 import com.example.starter.playout.api.Dtos.CreateAssetRequest;
+import com.example.starter.playout.api.Dtos.CreateBlackoutWindowRequest;
 import com.example.starter.playout.api.Dtos.CreateChannelRequest;
 import com.example.starter.playout.api.Dtos.CreateEmergencyOverrideRequest;
 import com.example.starter.playout.api.Dtos.CreateGrantRequest;
@@ -117,6 +120,27 @@ public class PlayoutController {
     @GetMapping("/emergency-overrides/{overrideKey}")
     public EmergencyOverrideResponse emergencyOverride(@PathVariable @NotBlank String overrideKey) {
         return service.getEmergencyOverride(overrideKey);
+    }
+
+    /** 创建频道屏蔽窗口（创建即 ACTIVE，携带 requestId 幂等）。 */
+    @PostMapping("/blackout-windows")
+    public BlackoutWindowResponse createBlackoutWindow(
+            @Valid @RequestBody CreateBlackoutWindowRequest request) {
+        return service.createBlackoutWindow(request);
+    }
+
+    /** 取消频道屏蔽窗口（仅 ACTIVE 可取消，携带 requestId 幂等）。 */
+    @PostMapping("/blackout-windows/{blackoutKey}/cancel")
+    public BlackoutWindowResponse cancelBlackoutWindow(
+            @PathVariable @NotBlank String blackoutKey,
+            @Valid @RequestBody CancelBlackoutWindowRequest request) {
+        return service.cancelBlackoutWindow(blackoutKey, request.requestId());
+    }
+
+    /** 查询屏蔽窗口明细，ACTIVE/CANCELLED 均返回，取消后保留取消时刻与原被屏蔽集合。 */
+    @GetMapping("/blackout-windows/{blackoutKey}")
+    public BlackoutWindowResponse blackoutWindow(@PathVariable @NotBlank String blackoutKey) {
+        return service.getBlackoutWindow(blackoutKey);
     }
 
     private static LocalDate parseBusinessDay(String businessDay) {

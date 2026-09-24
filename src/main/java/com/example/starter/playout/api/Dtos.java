@@ -6,6 +6,7 @@ import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.PositiveOrZero;
+import jakarta.validation.constraints.Size;
 
 import java.time.OffsetDateTime;
 import java.util.List;
@@ -107,9 +108,9 @@ public final class Dtos {
             long draftVersion) {
     }
 
-    /** 播出决定来源：EMERGENCY 命中紧急插播，PROGRAM 命中节目片段，FALLBACK 返回保底素材。 */
+    /** 播出决定来源：EMERGENCY 命中紧急插播，PROGRAM 命中节目片段，FALLBACK 返回保底素材，SUBSTITUTE 命中频道屏蔽窗口返回替补素材。 */
     public enum DecisionSource {
-        EMERGENCY, PROGRAM, FALLBACK
+        EMERGENCY, PROGRAM, FALLBACK, SUBSTITUTE
     }
 
     /** 保底原因：无已发布编排 / 处于空档 / 覆盖片段的授权已撤销。 */
@@ -117,7 +118,11 @@ public final class Dtos {
         NO_PUBLISHED_SCHEDULE, GAP, GRANT_REVOKED
     }
 
-    /** 播出决定响应；source 为 FALLBACK 时 reason 非空；source 为 EMERGENCY 时 overrideKey 非空。 */
+    /**
+     * 播出决定响应；source 为 FALLBACK 时 reason 非空；source 为 EMERGENCY 时 overrideKey 非空；
+     * source 为 SUBSTITUTE 时 blackoutKey/replacedAssetId/replacedSource 非空，记录命中的屏蔽窗口、
+     * 被替换的原素材与原来源（EMERGENCY / PROGRAM / FALLBACK）。
+     */
     public record PlayoutDecisionResponse(
             String channelId,
             OffsetDateTime at,
@@ -126,7 +131,18 @@ public final class Dtos {
             FallbackReason reason,
             Long publicationId,
             String segmentId,
-            String overrideKey) {
+            String overrideKey,
+            String blackoutKey,
+            String replacedAssetId,
+            DecisionSource replacedSource) {
+
+        /** 不含屏蔽信息的构造入口（未命中屏蔽替换时使用）。 */
+        public PlayoutDecisionResponse(String channelId, OffsetDateTime at, String assetId,
+                                       DecisionSource source, FallbackReason reason,
+                                       Long publicationId, String segmentId, String overrideKey) {
+            this(channelId, at, assetId, source, reason, publicationId, segmentId, overrideKey,
+                    null, null, null);
+        }
     }
 
     /** 紧急插播状态：创建即 ACTIVE，取消后为 CANCELLED，均为终态语义（ACTIVE 只能转为 CANCELLED）。 */
@@ -163,6 +179,47 @@ public final class Dtos {
             OffsetDateTime start,
             OffsetDateTime end,
             OverrideStatus status,
+            String cancelRequestId,
+            OffsetDateTime cancelledAt,
+            OffsetDateTime createdAt) {
+    }
+
+    /** 屏蔽窗口状态：创建即 ACTIVE，取消后为 CANCELLED（终态，只能取消不可改写）。 */
+    public enum BlackoutStatus {
+        ACTIVE, CANCELLED
+    }
+
+    /**
+     * 创建频道屏蔽窗口请求。区间 [start, end) 左闭右开、同处一个 Asia/Shanghai 业务日、
+     * 时长大于 0 且不超过 6 小时；blockedAssetIds 为 1～20 个去重素材，
+     * substituteAssetId 不得出现在该集合中。
+     */
+    public record CreateBlackoutWindowRequest(
+            @NotBlank String requestId,
+            @NotBlank String blackoutKey,
+            @NotBlank String channelId,
+            @NotNull OffsetDateTime start,
+            @NotNull OffsetDateTime end,
+            @NotNull @Size(min = 1, max = 20) List<@NotBlank String> blockedAssetIds,
+            @NotBlank String substituteAssetId) {
+    }
+
+    /** 取消屏蔽窗口请求（幂等）。 */
+    public record CancelBlackoutWindowRequest(@NotBlank String requestId) {
+    }
+
+    /**
+     * 屏蔽窗口明细响应：ACTIVE/CANCELLED 均返回；取消后 blockedAssetIds 仍为创建时原集合，
+     * 并保留取消请求 ID 与取消时刻，历史明细不可改写。
+     */
+    public record BlackoutWindowResponse(
+            String blackoutKey,
+            String channelId,
+            OffsetDateTime start,
+            OffsetDateTime end,
+            List<String> blockedAssetIds,
+            String substituteAssetId,
+            BlackoutStatus status,
             String cancelRequestId,
             OffsetDateTime cancelledAt,
             OffsetDateTime createdAt) {
