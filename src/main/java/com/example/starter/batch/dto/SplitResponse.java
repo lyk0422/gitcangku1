@@ -17,7 +17,7 @@ public record SplitResponse(
 ) {
 
     /**
-     * 拆分产生的子批概要。
+     * 拆分产生的子批概要。子批继承父批保质分钟，并按自身生产时间重新计算有效期。
      */
     public record SplitChild(
             String batchKey,
@@ -26,7 +26,11 @@ public record SplitResponse(
             Instant producedAt,
             BatchStatus status,
             List<String> requiredTests,
-            Instant createdAt
+            Instant createdAt,
+            int shelfLifeMinutes,
+            Instant baseExpiresAt,
+            Instant expiresAt,
+            boolean expired
     ) {
     }
 }

@@ -549,11 +549,11 @@ class BatchSplitLineageTest {
 
     private String createBody(String batchKey, List<String> items) throws Exception {
         return objectMapper.writeValueAsString(new CreateCmd("CK-C-" + unique(), batchKey, "PROD-1",
-                "LOT-1", Instant.parse("2026-01-02T03:04:05Z"), items));
+                "LOT-1", Instant.parse("2026-01-02T03:04:05Z"), 5256000, items));
     }
 
     private record CreateCmd(String commandKey, String batchKey, String productCode, String batchNo,
-                             Instant producedAt, List<String> requiredTests) {
+                             Instant producedAt, Integer shelfLifeMinutes, List<String> requiredTests) {
     }
 
     private void createBatch(String batchKey, List<String> items, int expected) throws Exception {

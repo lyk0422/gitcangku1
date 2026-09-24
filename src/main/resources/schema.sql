@@ -5,8 +5,11 @@ CREATE TABLE IF NOT EXISTS batch (
     product_code VARCHAR(64) NOT NULL COMMENT '产品编码，创建后不可修改',
     batch_no VARCHAR(64) NOT NULL COMMENT '批号，创建后不可修改',
     produced_at VARCHAR(40) NOT NULL COMMENT '生产时间，ISO-8601 UTC  instant 字符串',
-    status VARCHAR(32) NOT NULL COMMENT '批次状态：QUARANTINED/PENDING_RELEASE/RELEASE_REVIEW/RELEASED/REJECTED/RECALLED/SPLIT',
+    status VARCHAR(32) NOT NULL COMMENT '批次状态：QUARANTINED/PENDING_RELEASE/RELEASE_REVIEW/RELEASED/REJECTED/RECALLED/SPLIT；到期不改写此状态',
     created_at VARCHAR(40) NOT NULL COMMENT '创建时间，ISO-8601 UTC instant 字符串',
+    shelf_life_minutes INT NOT NULL COMMENT '保质分钟，正整数，登记后不可改写；拆分子批继承父批保质分钟',
+    base_expires_at VARCHAR(40) NOT NULL COMMENT '初始有效期=生产时间+保质分钟，不随延期改写，ISO-8601 UTC instant 字符串',
+    expires_at VARCHAR(40) NOT NULL COMMENT '当前有效期（含已生效延期的累计顺延），当前时刻达到即视为到期；ISO-8601 UTC instant 字符串',
     CONSTRAINT uk_batch_key UNIQUE (batch_key)
 );
 
@@ -48,7 +51,7 @@ CREATE TABLE IF NOT EXISTS recall (
 );
 
 CREATE TABLE IF NOT EXISTS command_log (
-    command_type VARCHAR(32) NOT NULL COMMENT '命令类型：CREATE_BATCH/SUBMIT_TEST/APPROVE/RECALL/SPLIT',
+    command_type VARCHAR(32) NOT NULL COMMENT '命令类型：CREATE_BATCH/SUBMIT_TEST/APPROVE/RECALL/SPLIT/EXTENSION_SUBMIT/EXTENSION_CONFIRM',
     command_key VARCHAR(64) NOT NULL COMMENT '命令幂等键；同类型同键同参重放返回首次结果，同键改参返回 409',
     fingerprint VARCHAR(64) NOT NULL COMMENT '业务参数（不含 commandKey）的 SHA-256 摘要，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行成功的 HTTP 状态码',
@@ -65,4 +68,22 @@ CREATE TABLE IF NOT EXISTS batch_lineage (
     seq INT NOT NULL COMMENT '子批在拆分请求中的顺序，从 1 开始',
     created_at VARCHAR(40) NOT NULL COMMENT '拆分时间，ISO-8601 UTC instant 字符串',
     CONSTRAINT uk_lineage_child UNIQUE (child_key)
+);
+
+-- 复检延期申请：extensionKey 全局唯一；确认生效后记录不可改写，未确认行可保留为申请痕迹。
+CREATE TABLE IF NOT EXISTS batch_extension (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键，同时作为延期生效顺序依据',
+    extension_key VARCHAR(64) NOT NULL COMMENT '延期业务键，全局唯一，同一 extensionKey 最多生效一次',
+    batch_key VARCHAR(64) NOT NULL COMMENT '目标批次业务键',
+    submit_command_key VARCHAR(64) NOT NULL COMMENT '延期提交命令幂等键',
+    confirm_command_key VARCHAR(64) COMMENT '延期确认命令幂等键；未确认时为 NULL，确认后不再改写',
+    recheck_conclusion VARCHAR(512) NOT NULL COMMENT '本次复检结论，非空；仅合格可放行',
+    extend_minutes INT NOT NULL COMMENT '本次顺延分钟，1～43200',
+    reviewer_id VARCHAR(64) NOT NULL COMMENT '复检人标识，必须与该批次两名原批准人都不同',
+    confirmer_id VARCHAR(64) COMMENT '批准角色确认人标识，必须不同于复检人；未确认时为 NULL',
+    seq INT NOT NULL COMMENT '该批次第几次延期，从 1 开始；同批次最多三次',
+    status VARCHAR(16) NOT NULL COMMENT '申请状态：SUBMITTED 已提交待确认/CONFIRMED 已确认生效；生效记录不可改写',
+    submitted_at VARCHAR(40) NOT NULL COMMENT '提交时间，ISO-8601 UTC instant 字符串',
+    confirmed_at VARCHAR(40) COMMENT '确认生效时间，ISO-8601 UTC instant 字符串；未确认时为 NULL',
+    CONSTRAINT uk_extension_key UNIQUE (extension_key)
 );

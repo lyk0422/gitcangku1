@@ -4,8 +4,12 @@ import com.example.starter.batch.dto.ApproveRequest;
 import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
+import com.example.starter.batch.dto.ExtensionConfirmRequest;
+import com.example.starter.batch.dto.ExtensionResponse;
+import com.example.starter.batch.dto.ExtensionSubmitRequest;
 import com.example.starter.batch.dto.LineageEntryResponse;
 import com.example.starter.batch.dto.RecallRequest;
+import com.example.starter.batch.dto.ShelfLifeResponse;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
 import jakarta.validation.Valid;
@@ -74,7 +78,7 @@ public class BatchController {
     }
 
     /**
-     * 当前可用批次：不含已召回批次。
+     * 当前可用批次：不含已召回、已拆分与已到期批次。
      */
     @GetMapping("/available")
     public List<BatchResponse> available() {
@@ -82,11 +86,61 @@ public class BatchController {
     }
 
     /**
-     * 批次完整历史明细：批次概要、全部检验、全部批准与召回记录。
+     * 到期批次清单：当前服务端时钟下达到有效期的全部批次，稳定排序。
+     */
+    @GetMapping("/expired")
+    public List<ShelfLifeResponse> expired() {
+        return service.listExpired();
+    }
+
+    /**
+     * 批次完整历史明细：批次概要、全部检验、全部批准、召回记录与延期历史。
      */
     @GetMapping("/{batchKey}/history")
     public BatchHistoryResponse history(@PathVariable String batchKey) {
         return service.history(batchKey);
+    }
+
+    /**
+     * 批次有效期视图：初始/当前有效期、到期标识与剩余分钟。
+     */
+    @GetMapping("/{batchKey}/shelf-life")
+    public ShelfLifeResponse shelfLife(@PathVariable String batchKey) {
+        return service.shelfLife(batchKey);
+    }
+
+    /**
+     * 提交复检延期；X-Actor-Id 为复检人，必须与该批两名原批准人都不同。
+     */
+    @PostMapping("/{batchKey}/extensions")
+    public ResponseEntity<String> submitExtension(@PathVariable String batchKey,
+                                                  @RequestHeader(name = "X-Actor-Id", required = false)
+                                                  String actorId,
+                                                  @Valid @RequestBody ExtensionSubmitRequest request) {
+        return stored(service.submitExtension(batchKey, actorId, request));
+    }
+
+    /**
+     * 延期历史：按延期序号稳定排序。
+     */
+    @GetMapping("/{batchKey}/extensions")
+    public List<ExtensionResponse> extensions(@PathVariable String batchKey) {
+        return service.extensionHistory(batchKey);
+    }
+
+    /**
+     * 批准角色确认延期生效；X-Actor-Id 为确认人，必须不同于复检人；
+     * X-Approval-Role 为 QUALITY 或 OPERATIONS。
+     */
+    @PostMapping("/{batchKey}/extensions/{extensionKey}/confirm")
+    public ResponseEntity<String> confirmExtension(@PathVariable String batchKey,
+                                                   @PathVariable String extensionKey,
+                                                   @RequestHeader(name = "X-Actor-Id", required = false)
+                                                   String actorId,
+                                                   @RequestHeader(name = "X-Approval-Role", required = false)
+                                                   String role,
+                                                   @Valid @RequestBody ExtensionConfirmRequest request) {
+        return stored(service.confirmExtension(extensionKey, actorId, role, request));
     }
 
     /**
