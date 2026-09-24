@@ -4,6 +4,8 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
 
+import java.sql.Timestamp;
+import java.time.Instant;
 import java.util.Optional;
 
 /**
@@ -20,6 +22,17 @@ public class ObservationRepository {
             rs.getString("reading"),
             rs.getString("note"),
             rs.getBoolean("deleted"));
+
+    private static final RowMapper<VersionRecord> VERSION_RECORD_MAPPER = (rs, rowNum) -> new VersionRecord(
+            new ObservationSnapshot(
+                    rs.getString("observation_id"),
+                    rs.getInt("version"),
+                    rs.getString("location"),
+                    rs.getString("reading"),
+                    rs.getString("note"),
+                    rs.getBoolean("deleted")),
+            rs.getLong("global_revision"),
+            rs.getTimestamp("committed_at_utc").toInstant());
 
     private final JdbcTemplate jdbcTemplate;
 
@@ -93,13 +106,41 @@ public class ObservationRepository {
     }
 
     /**
-     * 追加一条完整版本快照，历史永不删除。
+     * 追加一条完整版本快照，历史永不删除。全局版本号与提交时刻由写事务在持锁期间确定。
      */
-    public void insertVersion(ObservationSnapshot snapshot) {
+    public void insertVersion(ObservationSnapshot snapshot, long globalRevision, Instant committedAtUtc) {
         jdbcTemplate.update(
-                "INSERT INTO observation_version (observation_id, version, location, reading, note, deleted, created_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                "INSERT INTO observation_version (observation_id, version, location, reading, note, deleted, "
+                        + "global_revision, committed_at_utc, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                 snapshot.observationId(), snapshot.version(), snapshot.location(),
-                snapshot.reading(), snapshot.note(), snapshot.deleted());
+                snapshot.reading(), snapshot.note(), snapshot.deleted(),
+                globalRevision, Timestamp.from(committedAtUtc));
+    }
+
+    /**
+     * 判断记录是否在任何时刻存在过（历史表有任意版本）；快照创建要求集合内每个 ID 都存在过，墓碑也算存在。
+     */
+    public boolean existsEver(String observationId) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM observation_version WHERE observation_id = ?",
+                Integer.class, observationId);
+        return count != null && count > 0;
+    }
+
+    /**
+     * 读取指定时刻之前（含该时刻）已提交的最后一个版本；该时刻前尚未创建返回空。
+     * 按提交时刻与版本号排序，兼容同一事务内连续产生多个版本时的先后定位。
+     */
+    public Optional<VersionRecord> findVersionAsOf(String observationId, Instant asOfUtc) {
+        return jdbcTemplate.query(
+                        "SELECT observation_id, version, location, reading, note, deleted, "
+                                + "global_revision, committed_at_utc "
+                                + "FROM observation_version "
+                                + "WHERE observation_id = ? AND committed_at_utc <= ? "
+                                + "ORDER BY committed_at_utc DESC, version DESC "
+                                + "LIMIT 1",
+                        VERSION_RECORD_MAPPER, observationId, Timestamp.from(asOfUtc))
+                .stream().findFirst();
     }
 }

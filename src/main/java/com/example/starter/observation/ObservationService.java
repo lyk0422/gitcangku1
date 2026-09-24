@@ -50,17 +50,20 @@ public class ObservationService {
     private final ObservationRepository observationRepository;
     private final RequestLogRepository requestLogRepository;
     private final ResolutionRepository resolutionRepository;
+    private final GlobalRevisionRepository globalRevisionRepository;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public ObservationService(ObservationRepository observationRepository,
                               RequestLogRepository requestLogRepository,
                               ResolutionRepository resolutionRepository,
+                              GlobalRevisionRepository globalRevisionRepository,
                               ObjectMapper objectMapper,
                               Clock clock) {
         this.observationRepository = observationRepository;
         this.requestLogRepository = requestLogRepository;
         this.resolutionRepository = resolutionRepository;
+        this.globalRevisionRepository = globalRevisionRepository;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -81,9 +84,13 @@ public class ObservationService {
             return concurrent;
         }
 
+        // 先取全局版本行锁再取记录行锁，所有写事务与快照事务使用一致的加锁顺序（全局→记录）。
+        long globalRevision = globalRevisionRepository.lockAndGet() + 1;
         if (observationRepository.findCurrentForUpdate(request.observationId()).isPresent()) {
             throw ApiException.conflict("observation already exists: " + request.observationId(), null);
         }
+        globalRevisionRepository.advance();
+        Instant committedAtUtc = Instant.now(clock);
         ObservationSnapshot snapshot = new ObservationSnapshot(request.observationId(), 1,
                 request.location(), request.reading(), request.note(), false);
         try {
@@ -92,7 +99,7 @@ public class ObservationService {
             // 并发创建同一 observationId：由主键串行化，后到者按冲突处理
             throw ApiException.conflict("observation already exists: " + request.observationId(), null);
         }
-        observationRepository.insertVersion(snapshot);
+        observationRepository.insertVersion(snapshot, globalRevision, committedAtUtc);
         return complete(request.requestId(), HttpStatus.CREATED, ObservationResponse.of(snapshot));
     }
 
@@ -112,6 +119,8 @@ public class ObservationService {
             return concurrent;
         }
 
+        // 先取全局版本行锁再取记录行锁，统一加锁顺序并按事务提交顺序裁决快照可见性。
+        long currentGlobalRevision = globalRevisionRepository.lockAndGet();
         ObservationSnapshot current = observationRepository.findCurrentForUpdate(observationId)
                 .orElseThrow(() -> ApiException.notFound("observation not found: " + observationId));
         if (current.deleted()) {
@@ -134,13 +143,15 @@ public class ObservationService {
         ObservationSnapshot merged = new ObservationSnapshot(observationId, current.version(),
                 mergedLocation, mergedReading, mergedNote, false);
         if (sameContent(merged, current)) {
-            // 合并结果与当前完全相同：返回当前版本，不加版本
+            // 合并结果与当前完全相同：返回当前版本，不加版本，也不推进全局版本
             return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(current));
         }
+        long nextGlobalRevision = currentGlobalRevision + 1;
+        globalRevisionRepository.advance();
         ObservationSnapshot next = new ObservationSnapshot(observationId, current.version() + 1,
                 mergedLocation, mergedReading, mergedNote, false);
         observationRepository.updateCurrent(next);
-        observationRepository.insertVersion(next);
+        observationRepository.insertVersion(next, nextGlobalRevision, Instant.now(clock));
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(next));
     }
 
@@ -159,6 +170,8 @@ public class ObservationService {
             return concurrent;
         }
 
+        // 先取全局版本行锁再取记录行锁，墓碑的提交时刻即其生效时刻。
+        long nextGlobalRevision = globalRevisionRepository.lockAndGet() + 1;
         ObservationSnapshot current = observationRepository.findCurrentForUpdate(observationId)
                 .orElseThrow(() -> ApiException.notFound("observation not found: " + observationId));
         if (current.deleted()) {
@@ -167,10 +180,11 @@ public class ObservationService {
         if (request.expectedVersion() != current.version()) {
             throw ApiException.conflict("expectedVersion mismatch", current.version());
         }
+        globalRevisionRepository.advance();
         ObservationSnapshot tombstone = new ObservationSnapshot(observationId, current.version() + 1,
                 null, null, null, true);
         observationRepository.markDeleted(observationId, tombstone.version());
-        observationRepository.insertVersion(tombstone);
+        observationRepository.insertVersion(tombstone, nextGlobalRevision, Instant.now(clock));
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(tombstone));
     }
 
@@ -204,6 +218,8 @@ public class ObservationService {
             return concurrent;
         }
 
+        // 先取全局版本行锁再取记录行锁；无内容变化的解决不推进全局版本，但其提交顺序仍由该行锁串行化。
+        long currentGlobalRevision = globalRevisionRepository.lockAndGet();
         ObservationSnapshot current = observationRepository.findCurrentForUpdate(observationId)
                 .orElseThrow(() -> ApiException.notFound("observation not found: " + observationId));
 
@@ -256,11 +272,14 @@ public class ObservationService {
                 resolvedLocation, resolvedReading, resolvedNote, false);
         boolean contentChanged = !sameContent(merged, current);
         int newVersion = contentChanged ? current.version() + 1 : current.version();
+        Instant resolvedAtUtc = Instant.now(clock);
         if (contentChanged) {
+            long nextGlobalRevision = currentGlobalRevision + 1;
+            globalRevisionRepository.advance();
             ObservationSnapshot next = new ObservationSnapshot(observationId, newVersion,
                     resolvedLocation, resolvedReading, resolvedNote, false);
             observationRepository.updateCurrent(next);
-            observationRepository.insertVersion(next);
+            observationRepository.insertVersion(next, nextGlobalRevision, resolvedAtUtc);
         }
 
         ResolutionRecord record = new ResolutionRecord(
@@ -268,7 +287,7 @@ public class ObservationService {
                 request.baseVersion(), current.version(), newVersion,
                 request.location(), request.reading(), request.note(),
                 List.copyOf(conflictFields), normalizedSelections, request.operator(),
-                Instant.now(clock), contentChanged);
+                resolvedAtUtc, contentChanged);
         try {
             resolutionRepository.insert(record);
         } catch (DuplicateKeyException e) {
