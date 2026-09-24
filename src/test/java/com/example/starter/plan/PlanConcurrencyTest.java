@@ -85,7 +85,7 @@ class PlanConcurrencyTest {
         List<Callable<PlanResponse>> tasks = new ArrayList<>();
         for (int i = 0; i < threads; i++) {
             tasks.add(() -> service.createDraft(new CreatePlanRequest(
-                    requestKey, scheduleKey, DAY, occupancies)));
+                    requestKey, scheduleKey, DAY, false, null, occupancies)));
         }
         ExecutorService pool = Executors.newFixedThreadPool(threads);
         CountDownLatch ready = new CountDownLatch(threads);
@@ -185,7 +185,7 @@ class PlanConcurrencyTest {
     }
 
     private void createDraft(String scheduleKey, String section, int startHour, int endHour) {
-        service.createDraft(new CreatePlanRequest(key("REQ"), scheduleKey, DAY,
+        service.createDraft(new CreatePlanRequest(key("REQ"), scheduleKey, DAY, false, null,
                 List.of(occ(section, startHour, endHour))));
     }
 

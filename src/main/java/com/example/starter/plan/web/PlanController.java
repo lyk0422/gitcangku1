@@ -2,6 +2,9 @@ package com.example.starter.plan.web;
 
 import com.example.starter.plan.service.PlanService;
 import com.example.starter.plan.web.dto.CreatePlanRequest;
+import com.example.starter.plan.web.dto.PairCancelRequest;
+import com.example.starter.plan.web.dto.PairPublishRequest;
+import com.example.starter.plan.web.dto.PairPublishResponse;
 import com.example.starter.plan.web.dto.PlanActionRequest;
 import com.example.starter.plan.web.dto.PlanResponse;
 import com.example.starter.plan.web.dto.PublishedSlotView;
@@ -76,6 +79,23 @@ public class PlanController {
     public PlanResponse cancel(@PathVariable String scheduleKey,
                                @Valid @RequestBody PlanActionRequest request) {
         return service.cancel(scheduleKey, request.requestKey());
+    }
+
+    /**
+     * 夜间计划对联合发布：同一事务重查两张草稿版本与两个运营日的区段冲突，
+     * 两张同时变为已发布并写入不可变计划对记录。
+     */
+    @PostMapping("/night-pairs/publish")
+    public PairPublishResponse publishPair(@Valid @RequestBody PairPublishRequest request) {
+        return service.publishPair(request);
+    }
+
+    /**
+     * 取消夜间计划对中的单张成员：仅释放该成员自身占用，另一张保持已发布。
+     */
+    @PostMapping("/night-pairs/cancel")
+    public PlanResponse cancelPairMember(@Valid @RequestBody PairCancelRequest request) {
+        return service.cancelPairMember(request);
     }
 
     /**

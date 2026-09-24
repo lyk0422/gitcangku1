@@ -7,6 +7,8 @@ CREATE TABLE IF NOT EXISTS rail_day_plan (
     op_date DATE NOT NULL,
     version INT NOT NULL,
     status VARCHAR(16) NOT NULL,
+    overnight BOOLEAN NOT NULL DEFAULT FALSE,
+    night_pair_key VARCHAR(64) NULL,
     created_at BIGINT NOT NULL,
     updated_at BIGINT NOT NULL,
     PRIMARY KEY (id),
@@ -18,6 +20,8 @@ COMMENT ON COLUMN rail_day_plan.schedule_key IS '计划业务键，全局唯一�
 COMMENT ON COLUMN rail_day_plan.op_date IS '运营日期（Asia/Shanghai 日历日）';
 COMMENT ON COLUMN rail_day_plan.version IS '计划版本，草稿占用整体替换成功一次加一';
 COMMENT ON COLUMN rail_day_plan.status IS '计划状态：DRAFT 草稿 / PUBLISHED 已发布 / CANCELLED 已取消';
+COMMENT ON COLUMN rail_day_plan.overnight IS '是否夜间跨零点计划：TRUE 时占用允许从运营日 22:00 延伸至次日 06:00，单条不超过 8 小时';
+COMMENT ON COLUMN rail_day_plan.night_pair_key IS '夜间计划对业务键，NULL 表示普通单日计划；同一计划对的两张草稿取值相同，全局限一个已发布计划对';
 COMMENT ON COLUMN rail_day_plan.created_at IS '创建时刻，UTC 毫秒';
 COMMENT ON COLUMN rail_day_plan.updated_at IS '最近变更时刻，UTC 毫秒';
 
@@ -54,7 +58,7 @@ CREATE TABLE IF NOT EXISTS idempotency_record (
 );
 COMMENT ON TABLE idempotency_record IS '写操作幂等记录，仅缓存成功结果，失败不缓存可重试';
 COMMENT ON COLUMN idempotency_record.id IS '主键';
-COMMENT ON COLUMN idempotency_record.op_type IS '操作类型：CREATE / UPDATE / PUBLISH / CANCEL / RESCHEDULE';
+COMMENT ON COLUMN idempotency_record.op_type IS '操作类型：CREATE / UPDATE / PUBLISH / CANCEL / RESCHEDULE / PAIR_PUBLISH / PAIR_CANCEL';
 COMMENT ON COLUMN idempotency_record.request_key IS '客户端幂等键，同一操作类型内唯一';
 COMMENT ON COLUMN idempotency_record.request_hash IS '请求参数规范化后的 SHA-256，同键不同参判定 409';
 COMMENT ON COLUMN idempotency_record.response_json IS '首次成功响应快照（JSON），重放原样返回';
@@ -79,7 +83,25 @@ CREATE TABLE IF NOT EXISTS publish_lock (
     id INT NOT NULL,
     PRIMARY KEY (id)
 );
-COMMENT ON TABLE publish_lock IS '发布/改签全局互斥锁，保证并发发布与改签按事务提交顺序裁决';
+COMMENT ON TABLE publish_lock IS '发布/改签全局互斥锁，保证并发发布与日夜间联合发布按事务提交顺序裁决';
 COMMENT ON COLUMN publish_lock.id IS '锁行 id，固定为 1，发布与改签时 SELECT ... FOR UPDATE 串行化';
+
+CREATE TABLE IF NOT EXISTS rail_night_pair (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    night_pair_key VARCHAR(64) NOT NULL,
+    same_day_plan_id BIGINT NOT NULL,
+    next_day_plan_id BIGINT NOT NULL,
+    created_at BIGINT NOT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT uk_night_pair_key UNIQUE (night_pair_key),
+    CONSTRAINT uk_night_pair_same_day UNIQUE (same_day_plan_id),
+    CONSTRAINT uk_night_pair_next_day UNIQUE (next_day_plan_id)
+);
+COMMENT ON TABLE rail_night_pair IS '夜间跨零点计划对不可变记录，联合发布成功时追加；任一张取消记录保留不改写';
+COMMENT ON COLUMN rail_night_pair.id IS '主键';
+COMMENT ON COLUMN rail_night_pair.night_pair_key IS '计划对业务键，与两张计划 night_pair_key 相同，全局唯一';
+COMMENT ON COLUMN rail_night_pair.same_day_plan_id IS '当日（跨零点起始运营日）计划 id，关联 rail_day_plan.id，全表唯一';
+COMMENT ON COLUMN rail_night_pair.next_day_plan_id IS '次日计划 id，关联 rail_day_plan.id，全表唯一';
+COMMENT ON COLUMN rail_night_pair.created_at IS '计划对创建（联合发布成功）时刻，UTC 毫秒';
 
 MERGE INTO publish_lock KEY(id) VALUES (1);
