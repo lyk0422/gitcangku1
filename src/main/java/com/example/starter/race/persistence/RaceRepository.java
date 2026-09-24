@@ -373,6 +373,11 @@ public class RaceRepository {
         jdbcTemplate.update("DELETE FROM result_snapshot_checkpoint");
         jdbcTemplate.update("DELETE FROM result_snapshot_entry");
         jdbcTemplate.update("DELETE FROM result_snapshot");
+        jdbcTemplate.update("DELETE FROM advancement_list_non_advanced");
+        jdbcTemplate.update("DELETE FROM advancement_list_entry");
+        jdbcTemplate.update("DELETE FROM advancement_list");
+        jdbcTemplate.update("DELETE FROM advancement_group_member");
+        jdbcTemplate.update("DELETE FROM advancement_group");
         jdbcTemplate.update("DELETE FROM idempotency_record");
         jdbcTemplate.update("DELETE FROM checkpoint_timing");
         jdbcTemplate.update("DELETE FROM checkpoint");
