@@ -80,6 +80,7 @@ public class ObservationService {
         if (concurrent != null) {
             return concurrent;
         }
+        observationRepository.lockGlobalWriteMutex();
 
         if (observationRepository.findCurrentForUpdate(request.observationId()).isPresent()) {
             throw ApiException.conflict("observation already exists: " + request.observationId(), null);
@@ -93,6 +94,7 @@ public class ObservationService {
             throw ApiException.conflict("observation already exists: " + request.observationId(), null);
         }
         observationRepository.insertVersion(snapshot);
+        observationRepository.insertVersionCommit(request.observationId(), snapshot.version(), Instant.now(clock));
         return complete(request.requestId(), HttpStatus.CREATED, ObservationResponse.of(snapshot));
     }
 
@@ -111,6 +113,7 @@ public class ObservationService {
         if (concurrent != null) {
             return concurrent;
         }
+        observationRepository.lockGlobalWriteMutex();
 
         ObservationSnapshot current = observationRepository.findCurrentForUpdate(observationId)
                 .orElseThrow(() -> ApiException.notFound("observation not found: " + observationId));
@@ -141,6 +144,7 @@ public class ObservationService {
                 mergedLocation, mergedReading, mergedNote, false);
         observationRepository.updateCurrent(next);
         observationRepository.insertVersion(next);
+        observationRepository.insertVersionCommit(observationId, next.version(), Instant.now(clock));
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(next));
     }
 
@@ -158,6 +162,7 @@ public class ObservationService {
         if (concurrent != null) {
             return concurrent;
         }
+        observationRepository.lockGlobalWriteMutex();
 
         ObservationSnapshot current = observationRepository.findCurrentForUpdate(observationId)
                 .orElseThrow(() -> ApiException.notFound("observation not found: " + observationId));
@@ -171,6 +176,7 @@ public class ObservationService {
                 null, null, null, true);
         observationRepository.markDeleted(observationId, tombstone.version());
         observationRepository.insertVersion(tombstone);
+        observationRepository.insertVersionCommit(observationId, tombstone.version(), Instant.now(clock));
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(tombstone));
     }
 
@@ -203,6 +209,7 @@ public class ObservationService {
         if (concurrent != null) {
             return concurrent;
         }
+        observationRepository.lockGlobalWriteMutex();
 
         ObservationSnapshot current = observationRepository.findCurrentForUpdate(observationId)
                 .orElseThrow(() -> ApiException.notFound("observation not found: " + observationId));
@@ -261,14 +268,16 @@ public class ObservationService {
                     resolvedLocation, resolvedReading, resolvedNote, false);
             observationRepository.updateCurrent(next);
             observationRepository.insertVersion(next);
+            observationRepository.insertVersionCommit(observationId, newVersion, Instant.now(clock));
         }
 
+        Instant resolvedAt = Instant.now(clock);
         ResolutionRecord record = new ResolutionRecord(
                 request.resolutionId(), observationId, request.requestId(),
                 request.baseVersion(), current.version(), newVersion,
                 request.location(), request.reading(), request.note(),
                 List.copyOf(conflictFields), normalizedSelections, request.operator(),
-                Instant.now(clock), contentChanged);
+                resolvedAt, contentChanged);
         try {
             resolutionRepository.insert(record);
         } catch (DuplicateKeyException e) {

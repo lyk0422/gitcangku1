@@ -59,3 +59,55 @@ CREATE TABLE IF NOT EXISTS conflict_resolution (
     -- 且不可变解决历史必须在任何数据清理/归档场景下继续可查。
     UNIQUE (observation_id, request_id)
 );
+
+-- 观测版本事务提交时刻表：每个版本（含墓碑、冲突解决生成的版本）在其写事务内、
+-- 提交前写入一行 UTC 时刻，是按时刻（AS OF）查询与冻结快照时间过滤的唯一时间权威。
+-- 同一记录的写事务均持有 observation_current 行锁，故该时刻顺序与事务提交顺序一致。
+CREATE TABLE IF NOT EXISTS observation_version_commit (
+    observation_id VARCHAR(64) NOT NULL COMMENT '观测记录唯一标识',
+    version INT NOT NULL COMMENT '版本号，与 observation_version.version 对应（含墓碑版本）',
+    committed_at_utc TIMESTAMP(6) NOT NULL COMMENT '该版本事务提交的 UTC 时刻（微秒精度）；按时刻查询取 committed_at_utc <= 目标时刻的最后版本',
+    PRIMARY KEY (observation_id, version)
+);
+
+-- 全局版本提交互斥锁表：仅含一行（lock_slot = 0）。
+-- 每个会产生观测版本的写事务（创建/合并/删除/冲突解决）与每个冻结快照事务，
+-- 都必须在任何业务写入/一致读取前先 SELECT ... FOR UPDATE 锁定该行：
+-- 快照事务持锁期间不可能有写事务提交，反之亦然，从而保证快照切刻按事务提交顺序
+-- 全含或全不含，杜绝同一快照内一条取新版本、另一条取旧版本。
+CREATE TABLE IF NOT EXISTS observation_write_mutex (
+    lock_slot INT NOT NULL COMMENT '互斥锁槽位，固定为 0',
+    PRIMARY KEY (lock_slot)
+);
+
+-- 幂等地植入唯一锁行（H2 MODE=MySQL 与 MySQL 均支持 NOT EXISTS 语义）。
+INSERT INTO observation_write_mutex (lock_slot)
+SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM observation_write_mutex WHERE lock_slot = 0);
+
+-- 冻结快照主表：每次成功冻结追加一行，不可变、永不更新或删除。
+-- 同一目标时刻允许存在多个快照；snapshotKey 全局唯一，requestId 全局唯一以支持同参重放。
+CREATE TABLE IF NOT EXISTS observation_snapshot (
+    snapshot_key VARCHAR(128) NOT NULL COMMENT '全局唯一冻结快照标识',
+    request_id VARCHAR(128) NOT NULL COMMENT '生成该快照的请求标识（requestId），同键同参重放、异参 409',
+    target_time_utc TIMESTAMP(6) NOT NULL COMMENT '快照目标 UTC 时刻：固化该时刻的一致视图',
+    global_latest_version BIGINT NOT NULL COMMENT '读取切刻处全局最新版本序号：当时已提交的全部观测版本总数（跨所有记录）',
+    id_count INT NOT NULL COMMENT '快照覆盖的去重后 observationId 数量（1～50）',
+    id_fingerprint VARCHAR(128) NOT NULL COMMENT '归一化 observationId 集合指纹（升序、去重后哈希），与目标时刻共同判定同键异参 409',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '快照落库时间（服务器时区）',
+    PRIMARY KEY (snapshot_key),
+    UNIQUE (request_id)
+);
+
+-- 冻结快照逐条内容表：按 observationId 升序固化目标时刻各记录的最后版本与状态，写入后永不更新或删除。
+CREATE TABLE IF NOT EXISTS observation_snapshot_item (
+    snapshot_key VARCHAR(128) NOT NULL COMMENT '所属冻结快照标识',
+    ordinal INT NOT NULL COMMENT '条目序号，从 0 开始按 observationId 升序',
+    observation_id VARCHAR(64) NOT NULL COMMENT '观测记录唯一标识',
+    version INT NULL COMMENT '目标时刻该记录最后一个已提交版本号；状态为 ABSENT（尚未创建）时为 NULL',
+    state VARCHAR(16) NOT NULL COMMENT '目标时刻状态：PRESENT 正常版本可取内容 / DELETED 墓碑 / ABSENT 该时刻记录尚未创建',
+    location VARCHAR(512) NULL COMMENT '目标时刻版本观测地点快照；DELETED 与 ABSENT 为 NULL',
+    reading VARCHAR(64) NULL COMMENT '目标时刻版本观测读数快照（十进制原文）；DELETED 与 ABSENT 为 NULL',
+    note VARCHAR(1024) NULL COMMENT '目标时刻版本观测备注快照；DELETED 与 ABSENT 为 NULL',
+    last_resolution_id VARCHAR(128) NULL COMMENT '目标时刻之前（含该时刻）最近一次冲突解决记录标识；该时刻之前无解决记录时为 NULL',
+    PRIMARY KEY (snapshot_key, ordinal)
+);

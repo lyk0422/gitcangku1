@@ -4,6 +4,8 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
 
+import java.sql.Timestamp;
+import java.time.Instant;
 import java.util.Optional;
 
 /**
@@ -47,6 +49,17 @@ public class ObservationRepository {
                                 + "FROM observation_current WHERE observation_id = ? FOR UPDATE",
                         SNAPSHOT_MAPPER, observationId)
                 .stream().findFirst();
+    }
+
+    /**
+     * 锁定全局版本提交互斥行（SELECT ... FOR UPDATE）。
+     * 所有产生观测版本的写事务与冻结快照事务都先取此锁：持锁期间其他一方无法提交，
+     * 使快照的一致切刻严格按事务提交顺序全含或全不含。
+     */
+    public void lockGlobalWriteMutex() {
+        jdbcTemplate.queryForObject(
+                "SELECT lock_slot FROM observation_write_mutex WHERE lock_slot = 0 FOR UPDATE",
+                Integer.class);
     }
 
     /**
@@ -101,5 +114,43 @@ public class ObservationRepository {
                         + "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                 snapshot.observationId(), snapshot.version(), snapshot.location(),
                 snapshot.reading(), snapshot.note(), snapshot.deleted());
+    }
+
+    /**
+     * 在版本写事务内（提交前）登记该版本事务提交时刻（UTC）。
+     * 该时刻是按时刻查询与冻结快照时间过滤的唯一时间权威，与版本行同事务原子可见。
+     */
+    public void insertVersionCommit(String observationId, int version, Instant committedAtUtc) {
+        jdbcTemplate.update(
+                "INSERT INTO observation_version_commit (observation_id, version, committed_at_utc) "
+                        + "VALUES (?, ?, ?)",
+                observationId, version, Timestamp.from(committedAtUtc));
+    }
+
+    /**
+     * 查询某条观测记录在目标 UTC 时刻（含）之前最后一个已提交版本；该时刻尚未创建时返回空。
+     * 墓碑版本同样命中，由快照的 deleted 标记区分；删除后恢复的新版本因其提交时刻更晚不会被取到。
+     */
+    public Optional<ObservationSnapshot> findVersionAsOf(String observationId, Instant asOfUtc) {
+        return jdbcTemplate.query(
+                        "SELECT v.observation_id, v.version, v.location, v.reading, v.note, v.deleted "
+                                + "FROM observation_version v "
+                                + "JOIN observation_version_commit c "
+                                + "ON c.observation_id = v.observation_id AND c.version = v.version "
+                                + "WHERE v.observation_id = ? AND c.committed_at_utc <= ? "
+                                + "ORDER BY v.version DESC LIMIT 1",
+                        SNAPSHOT_MAPPER, observationId, Timestamp.from(asOfUtc))
+                .stream().findFirst();
+    }
+
+    /**
+     * 统计目标 UTC 时刻（含）之前全局已提交的观测版本总数（跨所有记录，含墓碑）。
+     * 用于冻结快照固化“读取时的全局最新版本”，并参与快照事务的全含/全不含裁决。
+     */
+    public long countCommittedVersions(Instant asOfUtc) {
+        Long count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM observation_version_commit WHERE committed_at_utc <= ?",
+                Long.class, Timestamp.from(asOfUtc));
+        return count == null ? 0L : count;
     }
 }

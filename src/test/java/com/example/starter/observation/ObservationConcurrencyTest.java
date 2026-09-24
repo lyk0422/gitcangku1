@@ -33,6 +33,7 @@ class ObservationConcurrencyTest {
     @BeforeEach
     void cleanDatabase() {
         jdbcTemplate.update("DELETE FROM request_log");
+        jdbcTemplate.update("DELETE FROM observation_version_commit");
         jdbcTemplate.update("DELETE FROM observation_version");
         jdbcTemplate.update("DELETE FROM observation_current");
     }

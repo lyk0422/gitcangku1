@@ -84,6 +84,22 @@ public class ResolutionRepository {
                 RESOLUTION_MAPPER, observationId);
     }
 
+    /**
+     * 查询某条观测记录在目标 UTC 时刻（含）之前最近一次冲突解决记录；该时刻之前无解决记录时返回空。
+     * 解决记录与其产生的版本在同一写事务提交，故按解决时刻过滤与版本提交时刻的可见性一致。
+     */
+    public Optional<ResolutionRecord> findLatestAsOf(String observationId, Instant asOfUtc) {
+        return jdbcTemplate.query(
+                        "SELECT resolution_id, observation_id, request_id, base_version, previous_version, "
+                                + "new_version, candidate_location, candidate_reading, candidate_note, "
+                                + "conflict_fields, field_selections, operator, content_changed, resolved_at_utc "
+                                + "FROM conflict_resolution "
+                                + "WHERE observation_id = ? AND resolved_at_utc <= ? "
+                                + "ORDER BY resolved_at_utc DESC, resolution_id DESC LIMIT 1",
+                        RESOLUTION_MAPPER, observationId, Timestamp.from(asOfUtc))
+                .stream().findFirst();
+    }
+
     private String writeJson(Object value) {
         try {
             return objectMapper.writeValueAsString(value);

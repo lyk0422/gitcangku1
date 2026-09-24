@@ -23,10 +23,14 @@ import java.util.List;
 public class ObservationController {
 
     private final ObservationService observationService;
+    private final AsOfSnapshotService asOfSnapshotService;
     private final ObjectMapper objectMapper;
 
-    public ObservationController(ObservationService observationService, ObjectMapper objectMapper) {
+    public ObservationController(ObservationService observationService,
+                                 AsOfSnapshotService asOfSnapshotService,
+                                 ObjectMapper objectMapper) {
         this.observationService = observationService;
+        this.asOfSnapshotService = asOfSnapshotService;
         this.objectMapper = objectMapper;
     }
 
@@ -103,6 +107,34 @@ public class ObservationController {
         return observationService.listResolutions(observationId).stream()
                 .map(this::resolutionResponse)
                 .toList();
+    }
+
+    /**
+     * 按时刻一致视图查询：给定 UTC 时刻与 observationId 集合，返回该时刻逐条最后版本、状态与最近解决记录标识。
+     * 只读，不推进观测版本、不写入解决记录。
+     */
+    @PostMapping("/asof")
+    public AsOfResponse queryAsOf(@Valid @RequestBody AsOfQueryRequest request) {
+        List<AsOfEntry> entries = asOfSnapshotService.queryAsOf(request.asOfUtc(), request.observationIds());
+        return new AsOfResponse(request.asOfUtc(),
+                entries.stream().map(AsOfResponse.Entry::of).toList());
+    }
+
+    /**
+     * 创建冻结快照：单事务内读取目标时刻一致状态并保存不可变快照；同键同参重放首次快照。
+     */
+    @PostMapping("/snapshots")
+    public ResponseEntity<SnapshotResponse> createSnapshot(@Valid @RequestBody SnapshotCreateRequest request) {
+        SnapshotRecord record = asOfSnapshotService.createSnapshot(request);
+        return ResponseEntity.status(201).body(SnapshotResponse.of(record));
+    }
+
+    /**
+     * 按 snapshotKey 读取不可变冻结快照；不存在返回 404。
+     */
+    @GetMapping("/snapshots/{snapshotKey}")
+    public SnapshotResponse getSnapshot(@PathVariable String snapshotKey) {
+        return SnapshotResponse.of(asOfSnapshotService.getSnapshot(snapshotKey));
     }
 
     private ResolutionResponse resolutionResponse(ResolutionRecord record) {
