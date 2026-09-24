@@ -21,6 +21,10 @@ import com.example.starter.baggage.BaggageDtos.LegResponse;
 import com.example.starter.baggage.BaggageDtos.LoadRequest;
 import com.example.starter.baggage.BaggageDtos.LoadResponse;
 import com.example.starter.baggage.BaggageDtos.ManifestResponse;
+import com.example.starter.baggage.BaggageDtos.OccupancyResponse;
+import com.example.starter.baggage.BaggageDtos.OffloadListResponse;
+import com.example.starter.baggage.BaggageDtos.OffloadRequest;
+import com.example.starter.baggage.BaggageDtos.OffloadResponse;
 import com.example.starter.baggage.BaggageDtos.RecoverRequest;
 import com.example.starter.baggage.BaggageDtos.RecoverResponse;
 import com.example.starter.baggage.BaggageDtos.RegisterBagRequest;
@@ -42,19 +46,19 @@ public class BaggageController {
         this.baggageService = baggageService;
     }
 
-    /** 登记航段。 */
+    /** 登记航段（含件数与总重上限）。 */
     @PostMapping("/legs")
     public ResponseEntity<LegResponse> registerLeg(@Valid @RequestBody RegisterLegRequest request) {
         return ResponseEntity.status(HttpStatus.CREATED).body(baggageService.registerLeg(request));
     }
 
-    /** 登记行李及其有序行程。 */
+    /** 登记行李及其有序行程（含重量与舱位等级）。 */
     @PostMapping("/bags")
     public ResponseEntity<BagResponse> registerBag(@Valid @RequestBody RegisterBagRequest request) {
         return ResponseEntity.status(HttpStatus.CREATED).body(baggageService.registerBag(request));
     }
 
-    /** 批量装载：整批原子，任一行李不满足则 422 且无一件移动。 */
+    /** 批量装载：整批原子，超限或任一行李不满足则 422 且无一件移动。 */
     @PostMapping("/legs/{legId}/load")
     public LoadResponse load(@PathVariable String legId, @Valid @RequestBody LoadRequest request) {
         return baggageService.load(legId, request);
@@ -64,6 +68,12 @@ public class BaggageController {
     @PostMapping("/legs/{legId}/seal")
     public SealResponse seal(@PathVariable String legId, @Valid @RequestBody SealRequest request) {
         return baggageService.seal(legId, request);
+    }
+
+    /** 超载优先级卸载：对 OPEN 航段按确定顺序选被卸行李至目标件数/总重均不超限。 */
+    @PostMapping("/legs/{legId}/offload")
+    public OffloadResponse offload(@PathVariable String legId, @Valid @RequestBody OffloadRequest request) {
+        return baggageService.offload(legId, request);
     }
 
     /** 到达确认：实际袋号集合须与封舱清单完全一致。 */
@@ -79,7 +89,7 @@ public class BaggageController {
         return baggageService.arriveDifference(legId, request);
     }
 
-    /** 补到：短卸行李在缺失航段的应到站实际到达后恢复行程。 */
+    /** 补到/改派：短卸行李补到，OFFLOADED 行李沿用本入口改派后重新装载剩余行程。 */
     @PostMapping("/bags/recover")
     public RecoverResponse recover(@Valid @RequestBody RecoverRequest request) {
         return baggageService.recover(request);
@@ -95,6 +105,18 @@ public class BaggageController {
     @GetMapping("/legs/{legId}/manifest")
     public ManifestResponse getManifest(@PathVariable String legId) {
         return baggageService.getManifest(legId);
+    }
+
+    /** 航段载量占用查询。 */
+    @GetMapping("/legs/{legId}/occupancy")
+    public OccupancyResponse getOccupancy(@PathVariable String legId) {
+        return baggageService.getOccupancy(legId);
+    }
+
+    /** 航段卸载明细查询。 */
+    @GetMapping("/legs/{legId}/offloads")
+    public OffloadListResponse listOffloads(@PathVariable String legId) {
+        return baggageService.listOffloads(legId);
     }
 
     /** 航段差异快照查询：返回只读封舱清单与差异到达实际集合。 */
