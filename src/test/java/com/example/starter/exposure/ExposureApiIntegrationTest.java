@@ -107,6 +107,8 @@ class ExposureApiIntegrationTest {
     @BeforeEach
     void cleanAndReset() {
         jdbc.update("DELETE FROM idempotency_record");
+        jdbc.update("DELETE FROM exposure_decay_record");
+        jdbc.update("DELETE FROM visitor_last_confirmation");
         jdbc.update("DELETE FROM exposure_reservation");
         jdbc.update("DELETE FROM quota_visitor_ledger");
         jdbc.update("DELETE FROM quota_total_ledger");
@@ -120,7 +122,7 @@ class ExposureApiIntegrationTest {
     }
 
     private CreateCampaignRequest createReq(String requestId, String campaignId, int total, int perVisitor) {
-        return new CreateCampaignRequest(requestId, campaignId, total, perVisitor);
+        return new CreateCampaignRequest(requestId, campaignId, total, perVisitor, null);
     }
 
     @Test
