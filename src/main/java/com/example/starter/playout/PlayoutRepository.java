@@ -26,8 +26,8 @@ public class PlayoutRepository {
         this.jdbc = jdbc;
     }
 
-    /** 素材行。 */
-    public record AssetRow(String id, long durationMs) {
+    /** 素材行；rating 为 NULL 表示历史素材未声明分级，校验时按 MATURE 处理。 */
+    public record AssetRow(String id, long durationMs, String rating) {
     }
 
     /** 频道行。 */
@@ -63,8 +63,27 @@ public class PlayoutRepository {
                              String responseBody) {
     }
 
+    /** 管控时段行；起止为自运营日 00:00 起的分钟数，左闭右开。 */
+    public record RatingWindowRow(long id, String channelId, int startMinute, int endMinute,
+                                  String maxRating, long version, boolean revoked) {
+    }
+
+    /** 历史发布分级校验记录行。 */
+    public record RatingCheckRow(long id, long publicationId, String channelId,
+                                 LocalDate businessDay, long publishedVersion,
+                                 String segmentId, String assetId, String assetRating,
+                                 long startMs, long endMs,
+                                 Long windowId, Integer windowStartMinute, Integer windowEndMinute,
+                                 String allowedRating) {
+    }
+
+    /** 紧急插播行。 */
+    public record InterruptionRow(long id, String channelId, String assetId, long atMs,
+                                  String assetRating, Long windowId) {
+    }
+
     private static final RowMapper<AssetRow> ASSET_MAPPER = (rs, n) ->
-            new AssetRow(rs.getString("id"), rs.getLong("duration_ms"));
+            new AssetRow(rs.getString("id"), rs.getLong("duration_ms"), rs.getString("rating"));
 
     private static final RowMapper<ChannelRow> CHANNEL_MAPPER = (rs, n) ->
             new ChannelRow(rs.getString("id"), rs.getString("fallback_asset_id"));
@@ -95,15 +114,36 @@ public class PlayoutRepository {
             new RequestRow(rs.getString("request_id"), rs.getString("operation"),
                     rs.getString("params_hash"), rs.getString("response_body"));
 
+    private static final RowMapper<RatingWindowRow> RATING_WINDOW_MAPPER = (rs, n) ->
+            new RatingWindowRow(rs.getLong("id"), rs.getString("channel_id"),
+                    rs.getInt("start_minute"), rs.getInt("end_minute"),
+                    rs.getString("max_rating"), rs.getLong("version"), rs.getBoolean("revoked"));
+
+    private static final RowMapper<RatingCheckRow> RATING_CHECK_MAPPER = (rs, n) ->
+            new RatingCheckRow(rs.getLong("id"), rs.getLong("publication_id"),
+                    rs.getString("channel_id"), rs.getDate("business_day").toLocalDate(),
+                    rs.getLong("published_version"), rs.getString("segment_id"),
+                    rs.getString("asset_id"), rs.getString("asset_rating"),
+                    rs.getLong("start_ms"), rs.getLong("end_ms"),
+                    (Long) rs.getObject("window_id"),
+                    (Integer) rs.getObject("window_start_minute"),
+                    (Integer) rs.getObject("window_end_minute"),
+                    rs.getString("allowed_rating"));
+
+    private static final RowMapper<InterruptionRow> INTERRUPTION_MAPPER = (rs, n) ->
+            new InterruptionRow(rs.getLong("id"), rs.getString("channel_id"),
+                    rs.getString("asset_id"), rs.getLong("at_ms"),
+                    rs.getString("asset_rating"), (Long) rs.getObject("window_id"));
+
     // ---------- 素材 ----------
 
-    public void insertAsset(String id, long durationMs, long createdAtMs) {
-        jdbc.update("INSERT INTO playout_asset (id, duration_ms, created_at_ms) VALUES (?, ?, ?)",
-                id, durationMs, createdAtMs);
+    public void insertAsset(String id, long durationMs, String rating, long createdAtMs) {
+        jdbc.update("INSERT INTO playout_asset (id, duration_ms, rating, created_at_ms) VALUES (?, ?, ?, ?)",
+                id, durationMs, rating, createdAtMs);
     }
 
     public Optional<AssetRow> findAsset(String id) {
-        return jdbc.query("SELECT id, duration_ms FROM playout_asset WHERE id = ?",
+        return jdbc.query("SELECT id, duration_ms, rating FROM playout_asset WHERE id = ?",
                 ASSET_MAPPER, id).stream().findFirst();
     }
 
@@ -283,6 +323,121 @@ public class PlayoutRepository {
     public void completeRequest(String requestId, String responseBody) {
         jdbc.update("UPDATE playout_request SET response_body = ? WHERE request_id = ?",
                 responseBody, requestId);
+    }
+
+    // ---------- 频道行锁 ----------
+
+    /** 锁定频道行，使同频道的时段变更、发布与插播事务按提交顺序串行裁决。 */
+    public void lockChannel(String channelId) {
+        jdbc.queryForObject("SELECT id FROM playout_channel WHERE id = ? FOR UPDATE",
+                String.class, channelId);
+    }
+
+    // ---------- 管控时段 ----------
+
+    public long insertRatingWindow(String channelId, int startMinute, int endMinute,
+                                   String maxRating, long createdAtMs) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO playout_rating_window"
+                            + " (channel_id, start_minute, end_minute, max_rating, version,"
+                            + " revoked, created_at_ms, updated_at_ms)"
+                            + " VALUES (?, ?, ?, ?, 1, 0, ?, ?)", Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, channelId);
+            ps.setInt(2, startMinute);
+            ps.setInt(3, endMinute);
+            ps.setString(4, maxRating);
+            ps.setLong(5, createdAtMs);
+            ps.setLong(6, createdAtMs);
+            return ps;
+        }, keyHolder);
+        return keyHolder.getKey().longValue();
+    }
+
+    public Optional<RatingWindowRow> findRatingWindow(long id) {
+        return jdbc.query("SELECT id, channel_id, start_minute, end_minute, max_rating, version, revoked"
+                + " FROM playout_rating_window WHERE id = ?", RATING_WINDOW_MAPPER, id)
+                .stream().findFirst();
+    }
+
+    /** 频道全部生效中（未删除）的管控时段，按起点排序。 */
+    public List<RatingWindowRow> findActiveRatingWindows(String channelId) {
+        return jdbc.query("SELECT id, channel_id, start_minute, end_minute, max_rating, version, revoked"
+                + " FROM playout_rating_window WHERE channel_id = ? AND revoked = 0"
+                + " ORDER BY start_minute, id", RATING_WINDOW_MAPPER, channelId);
+    }
+
+    /** 同 {@link #findActiveRatingWindows}，但对时段行加锁，配合频道行锁在变更时做重叠校验。 */
+    public List<RatingWindowRow> findActiveRatingWindowsForUpdate(String channelId) {
+        return jdbc.query("SELECT id, channel_id, start_minute, end_minute, max_rating, version, revoked"
+                + " FROM playout_rating_window WHERE channel_id = ? AND revoked = 0"
+                + " ORDER BY start_minute, id FOR UPDATE", RATING_WINDOW_MAPPER, channelId);
+    }
+
+    /** 乐观锁修改时段；返回受影响行数，0 表示时段不存在、已删除或版本不符。 */
+    public int updateRatingWindow(long id, int startMinute, int endMinute, String maxRating,
+                                  long expectedVersion, long updatedAtMs) {
+        return jdbc.update("UPDATE playout_rating_window"
+                        + " SET start_minute = ?, end_minute = ?, max_rating = ?,"
+                        + " version = version + 1, updated_at_ms = ?"
+                        + " WHERE id = ? AND version = ? AND revoked = 0",
+                startMinute, endMinute, maxRating, updatedAtMs, id, expectedVersion);
+    }
+
+    // ---------- 发布分级校验记录 ----------
+
+    public void insertPublicationRatingCheck(long publicationId, String channelId,
+                                             LocalDate businessDay, long publishedVersion,
+                                             String segmentId, String assetId, String assetRating,
+                                             long startMs, long endMs,
+                                             Long windowId, Integer windowStartMinute,
+                                             Integer windowEndMinute, String allowedRating,
+                                             long createdAtMs) {
+        jdbc.update("INSERT INTO playout_publication_rating_check"
+                        + " (publication_id, channel_id, business_day, published_version,"
+                        + " segment_id, asset_id, asset_rating, start_ms, end_ms,"
+                        + " window_id, window_start_minute, window_end_minute, allowed_rating, created_at_ms)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                publicationId, channelId, Date.valueOf(businessDay), publishedVersion,
+                segmentId, assetId, assetRating, startMs, endMs,
+                windowId, windowStartMinute, windowEndMinute, allowedRating, createdAtMs);
+    }
+
+    /** 历史发布分级校验记录，按发布版本与片段起点排序。 */
+    public List<RatingCheckRow> findRatingChecks(String channelId, LocalDate businessDay) {
+        return jdbc.query("SELECT id, publication_id, channel_id, business_day, published_version,"
+                        + " segment_id, asset_id, asset_rating, start_ms, end_ms,"
+                        + " window_id, window_start_minute, window_end_minute, allowed_rating"
+                        + " FROM playout_publication_rating_check"
+                        + " WHERE channel_id = ? AND business_day = ?"
+                        + " ORDER BY published_version, start_ms, id",
+                RATING_CHECK_MAPPER, channelId, Date.valueOf(businessDay));
+    }
+
+    // ---------- 紧急插播 ----------
+
+    public long insertInterruption(String channelId, String assetId, long atMs,
+                                   String assetRating, Long windowId, long createdAtMs) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO playout_interruption"
+                            + " (channel_id, asset_id, at_ms, asset_rating, window_id, created_at_ms)"
+                            + " VALUES (?, ?, ?, ?, ?, ?)", Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, channelId);
+            ps.setString(2, assetId);
+            ps.setLong(3, atMs);
+            ps.setString(4, assetRating);
+            if (windowId == null) {
+                ps.setObject(5, null);
+            } else {
+                ps.setLong(5, windowId);
+            }
+            ps.setLong(6, createdAtMs);
+            return ps;
+        }, keyHolder);
+        return keyHolder.getKey().longValue();
     }
 
     /** 判断是否为唯一键冲突（草稿首建、发布版本、请求 ID 等并发场景）。 */

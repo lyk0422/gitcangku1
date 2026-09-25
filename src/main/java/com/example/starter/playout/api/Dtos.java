@@ -16,14 +16,25 @@ public final class Dtos {
     private Dtos() {
     }
 
-    /** 创建素材请求；id 为空时由系统生成稳定 ID。 */
+    /** 创建素材请求；id 为空时由系统生成稳定 ID；rating 为空表示历史素材未声明分级，校验时按 MATURE 处理。 */
     public record CreateAssetRequest(
             String id,
-            @NotNull @Positive Long durationMs) {
+            @NotNull @Positive Long durationMs,
+            ContentRating rating) {
     }
 
-    /** 素材响应。 */
-    public record AssetResponse(String id, long durationMs) {
+    /** 素材响应；rating 为 NULL 表示未声明分级。 */
+    public record AssetResponse(String id, long durationMs, ContentRating rating) {
+    }
+
+    /** 内容分级，严格程度 G < PG < MATURE。 */
+    public enum ContentRating {
+        G, PG, MATURE;
+
+        /** 判断当前分级是否超出允许的最高分级。 */
+        public boolean exceeds(ContentRating maxAllowed) {
+            return this.ordinal() > maxAllowed.ordinal();
+        }
     }
 
     /** 创建频道请求；fallbackAssetId 为不会被撤销的保底素材。 */
@@ -115,7 +126,7 @@ public final class Dtos {
         NO_PUBLISHED_SCHEDULE, GAP, GRANT_REVOKED
     }
 
-    /** 播出决定响应；source 为 FALLBACK 时 reason 非空。 */
+    /** 播出决定响应；source 为 FALLBACK 时 reason 非空。返回素材时附带其有效分级与命中管控时段（如有）。 */
     public record PlayoutDecisionResponse(
             String channelId,
             OffsetDateTime at,
@@ -123,10 +134,80 @@ public final class Dtos {
             DecisionSource source,
             FallbackReason reason,
             Long publicationId,
-            String segmentId) {
+            String segmentId,
+            ContentRating assetRating,
+            Long ratingWindowId,
+            Integer windowStartMinute,
+            Integer windowEndMinute,
+            ContentRating windowMaxRating) {
     }
 
-    /** 统一错误响应体。 */
-    public record ErrorResponse(String error, String message) {
+    /** 创建/修改频道管控时段请求；起止为自运营日 00:00 起的分钟数，左闭右开。 */
+    public record UpsertRatingWindowRequest(
+            @NotBlank String requestId,
+            @NotNull @PositiveOrZero Integer startMinute,
+            @NotNull @Positive Integer endMinute,
+            @NotNull ContentRating maxRating) {
+    }
+
+    /** 管控时段响应。 */
+    public record RatingWindowResponse(
+            long id,
+            String channelId,
+            int startMinute,
+            int endMinute,
+            ContentRating maxRating,
+            long version,
+            boolean revoked) {
+    }
+
+    /** 紧急插播请求；at 为插播时刻，按其所属运营日管控时段判定分级。 */
+    public record CreateInterruptionRequest(
+            @NotBlank String requestId,
+            @NotBlank String assetId,
+            @NotNull OffsetDateTime at) {
+    }
+
+    /** 紧急插播响应；windowId 为 NULL 表示插播时刻未落入任何管控时段。 */
+    public record InterruptionResponse(
+            long id,
+            String channelId,
+            String assetId,
+            OffsetDateTime at,
+            ContentRating assetRating,
+            Long windowId) {
+    }
+
+    /** 历史发布分级校验记录。 */
+    public record RatingCheckRecordResponse(
+            long publicationId,
+            long publishedVersion,
+            String segmentId,
+            String assetId,
+            ContentRating assetRating,
+            OffsetDateTime start,
+            OffsetDateTime end,
+            Long windowId,
+            Integer windowStartMinute,
+            Integer windowEndMinute,
+            ContentRating allowedRating) {
+    }
+
+    /** 单条越级素材明细：命中的管控时段与允许最高分级。 */
+    public record RatingViolation(
+            String segmentId,
+            String assetId,
+            ContentRating assetRating,
+            long windowId,
+            int windowStartMinute,
+            int windowEndMinute,
+            ContentRating allowedRating) {
+    }
+
+    /** 统一错误响应体；violations 仅在分级越权 422 时携带全部越级明细。 */
+    public record ErrorResponse(String error, String message, List<RatingViolation> violations) {
+        public ErrorResponse(String error, String message) {
+            this(error, message, null);
+        }
     }
 }

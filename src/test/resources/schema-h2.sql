@@ -4,6 +4,7 @@
 CREATE TABLE IF NOT EXISTS playout_asset (
     id            VARCHAR(64) NOT NULL PRIMARY KEY,
     duration_ms   BIGINT      NOT NULL,
+    rating        VARCHAR(8)  NULL,
     created_at_ms BIGINT      NOT NULL
 );
 
@@ -74,3 +75,51 @@ CREATE TABLE IF NOT EXISTS playout_request (
     response_body TEXT        NULL,
     created_at_ms BIGINT      NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS playout_rating_window (
+    id            BIGINT      NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    channel_id    VARCHAR(64) NOT NULL,
+    start_minute  INT         NOT NULL,
+    end_minute    INT         NOT NULL,
+    max_rating    VARCHAR(8)  NOT NULL,
+    version       BIGINT      NOT NULL DEFAULT 1,
+    revoked       TINYINT(1)  NOT NULL DEFAULT 0,
+    created_at_ms BIGINT      NOT NULL,
+    updated_at_ms BIGINT      NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rating_window_channel
+    ON playout_rating_window (channel_id, revoked, start_minute, end_minute);
+
+CREATE TABLE IF NOT EXISTS playout_publication_rating_check (
+    id                  BIGINT      NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    publication_id      BIGINT      NOT NULL,
+    channel_id          VARCHAR(64) NOT NULL,
+    business_day        DATE        NOT NULL,
+    published_version   BIGINT      NOT NULL,
+    segment_id          VARCHAR(64) NOT NULL,
+    asset_id            VARCHAR(64) NOT NULL,
+    asset_rating        VARCHAR(8)  NOT NULL,
+    start_ms            BIGINT      NOT NULL,
+    end_ms              BIGINT      NOT NULL,
+    window_id           BIGINT      NULL,
+    window_start_minute INT         NULL,
+    window_end_minute   INT         NULL,
+    allowed_rating      VARCHAR(8)  NULL,
+    created_at_ms       BIGINT      NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pub_rating_check_pub
+    ON playout_publication_rating_check (publication_id);
+CREATE INDEX IF NOT EXISTS idx_pub_rating_check_channel
+    ON playout_publication_rating_check (channel_id, business_day, published_version);
+
+CREATE TABLE IF NOT EXISTS playout_interruption (
+    id            BIGINT      NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    channel_id    VARCHAR(64) NOT NULL,
+    asset_id      VARCHAR(64) NOT NULL,
+    at_ms         BIGINT      NOT NULL,
+    asset_rating  VARCHAR(8)  NOT NULL,
+    window_id     BIGINT      NULL,
+    created_at_ms BIGINT      NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_interruption_channel
+    ON playout_interruption (channel_id, at_ms);
