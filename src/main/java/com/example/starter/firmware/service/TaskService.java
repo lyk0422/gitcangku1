@@ -4,6 +4,7 @@ import com.example.starter.firmware.api.PullResponse;
 import com.example.starter.firmware.api.ReceiptRequest;
 import com.example.starter.firmware.api.TaskListResponse;
 import com.example.starter.firmware.api.TaskView;
+import com.example.starter.firmware.domain.CompatMatrix;
 import com.example.starter.firmware.domain.Device;
 import com.example.starter.firmware.domain.ReceiptResult;
 import com.example.starter.firmware.domain.ReleaseOrder;
@@ -12,6 +13,7 @@ import com.example.starter.firmware.domain.RolloutTask;
 import com.example.starter.firmware.domain.TaskStatus;
 import com.example.starter.firmware.error.ApiException;
 import com.example.starter.firmware.repo.DeviceRepository;
+import com.example.starter.firmware.repo.IncompatibleRecordRepository;
 import com.example.starter.firmware.repo.PauseRecordRepository;
 import com.example.starter.firmware.repo.ReleaseRepository;
 import com.example.starter.firmware.repo.TaskRepository;
@@ -23,7 +25,10 @@ import java.time.Instant;
 import java.util.List;
 
 /**
- * 投放任务：设备拉取与回执。与取消、恢复并发时统一先锁发布单行，再操作任务，形成一致提交顺序。
+ * 投放任务：设备拉取与回执。与取消、恢复、矩阵缩窄并发时统一先锁发布单行，
+ * 再锁目标固件矩阵行（存在时），形成一致提交顺序。
+ * 拉取先做硬件兼容门禁：不兼容返回 INCOMPATIBLE、落不兼容记录，不创建任务、
+ * 不计入失败率样本、不改变设备状态；兼容设备继续既有版本、分桶和暂停门禁。
  * 回执首次终结任务时在发布单行锁内累计当前监控轮次统计，达到阈值即在同一事务原子暂停。
  */
 @Service
@@ -33,65 +38,82 @@ public class TaskService {
     private final ReleaseRepository releaseRepository;
     private final DeviceRepository deviceRepository;
     private final PauseRecordRepository pauseRecordRepository;
+    private final IncompatibleRecordRepository incompatibleRecordRepository;
     private final DeviceService deviceService;
     private final ReleaseService releaseService;
+    private final CompatService compatService;
     private final IdempotencyService idempotency;
     private final Clock clock;
 
     public TaskService(TaskRepository taskRepository, ReleaseRepository releaseRepository,
                        DeviceRepository deviceRepository, PauseRecordRepository pauseRecordRepository,
+                       IncompatibleRecordRepository incompatibleRecordRepository,
                        DeviceService deviceService, ReleaseService releaseService,
-                       IdempotencyService idempotency, Clock clock) {
+                       CompatService compatService, IdempotencyService idempotency, Clock clock) {
         this.taskRepository = taskRepository;
         this.releaseRepository = releaseRepository;
         this.deviceRepository = deviceRepository;
         this.pauseRecordRepository = pauseRecordRepository;
+        this.incompatibleRecordRepository = incompatibleRecordRepository;
         this.deviceService = deviceService;
         this.releaseService = releaseService;
+        this.compatService = compatService;
         this.idempotency = idempotency;
         this.clock = clock;
     }
 
     /**
-     * 设备拉取：已存在任务直接返回；否则仅当型号与当前版本匹配、分桶号小于比例且发布单 ACTIVE 时创建。
-     * PAUSED 时不创建新任务，已有任务仍可查看与回执。
+     * 设备拉取：已存在任务直接返回；否则先过硬件兼容门禁，再校验版本、分桶与 ACTIVE 状态。
+     * INCOMPATIBLE 不创建任务、不计失败率样本、不改设备状态；PAUSED 时不创建新任务，已有任务仍可查看与回执。
      */
     public PullResponse pull(String deviceId, String requestId) {
-        String fingerprint = String.join("|", "task.pull", deviceId);
+        Device device = deviceService.findDevice(deviceId);
+        var activeOrder = releaseRepository.findActiveByModel(device.model());
+        String fingerprint = activeOrder.map(order -> String.join("|", "task.pull", deviceId,
+                String.valueOf(order.version()), order.toVersion()))
+                .orElseGet(() -> String.join("|", "task.pull", deviceId));
         return idempotency.execute(requestId, "task.pull", fingerprint, () -> {
-            Device device = deviceService.findDevice(deviceId);
-            var activeOrder = releaseRepository.findActiveByModel(device.model());
             if (activeOrder.isEmpty()) {
-                return new PullResponse(null);
+                return PullResponse.empty();
             }
             ReleaseOrder order = releaseRepository.findByIdForUpdate(activeOrder.get().id())
                     .orElseThrow(() -> ApiException.notFound("RELEASE_NOT_FOUND", "发布单不存在"));
             var existing = taskRepository.findByReleaseAndDevice(order.id(), deviceId);
             if (existing.isPresent()) {
-                return new PullResponse(TaskView.of(existing.get(), order));
+                return PullResponse.task(TaskView.of(existing.get(), order));
             }
-            if (order.status() != ReleaseStatus.ACTIVE
-                    || !device.currentVersion().equals(order.fromVersion())
-                    || device.bucketNo() >= order.ratio()) {
-                return new PullResponse(null);
+            if (order.status() != ReleaseStatus.ACTIVE) {
+                return PullResponse.empty();
+            }
+            // 锁目标固件矩阵行（存在时）：矩阵缩窄与本事务拉取按提交顺序裁决
+            CompatMatrix matrix = compatService.effectiveMatrixForUpdate(order.toVersion());
+            if (!compatService.isCompatible(matrix, device.hardwareModel())) {
+                incompatibleRecordRepository.insert(deviceId, device.hardwareModel(), order.id(),
+                        order.toVersion(), matrix.version());
+                return PullResponse.incompatible();
+            }
+            // 兼容设备继续既有来源版本与分桶门禁
+            if (!device.currentVersion().equals(order.fromVersion()) || device.bucketNo() >= order.ratio()) {
+                return PullResponse.empty();
             }
             long taskId;
             try {
-                taskId = taskRepository.insert(order.id(), deviceId);
+                taskId = taskRepository.insert(order.id(), deviceId, matrix.version());
             } catch (DuplicateKeyException e) {
                 RolloutTask task = taskRepository.findByReleaseAndDevice(order.id(), deviceId)
                         .orElseThrow(() -> new IllegalStateException("任务唯一约束冲突后未找到任务"));
-                return new PullResponse(TaskView.of(task, order));
+                return PullResponse.task(TaskView.of(task, order));
             }
             RolloutTask task = taskRepository.findById(taskId)
                     .orElseThrow(() -> new IllegalStateException("任务创建后读取失败"));
-            return new PullResponse(TaskView.of(task, order));
+            return PullResponse.task(TaskView.of(task, order));
         }, PullResponse.class);
     }
 
     /**
      * 回执：首次回执终结任务并计入完成时所在监控轮次，仅 SUCCESS 更新设备当前版本；
      * 同结果重复成功（不重复计数），改结果 409；已取消任务的后到回执 409 且不更新设备版本。
+     * 已下发任务保存的是拉取时矩阵版本，矩阵缩窄不阻断回执。
      * 样本达到下限且失败率越限时，同事务将仍为 ACTIVE 的发布单原子转为 PAUSED 并落暂停记录。
      */
     public TaskView receipt(long taskId, ReceiptRequest request) {

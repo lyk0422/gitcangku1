@@ -30,12 +30,15 @@ class FirmwarePauseResumeTest {
 
     @BeforeEach
     void cleanUp() {
+        jdbc.update("DELETE FROM device_incompatible_record");
         jdbc.update("DELETE FROM rollout_task");
         jdbc.update("DELETE FROM release_pause_record");
         jdbc.update("DELETE FROM release_resume_record");
         jdbc.update("DELETE FROM release_order");
         jdbc.update("DELETE FROM device");
         jdbc.update("DELETE FROM idempotency_record");
+        jdbc.update("DELETE FROM firmware_compat_matrix");
+        jdbc.update("DELETE FROM hardware_model");
     }
 
     private static long idOf(MvcResult result, String path) throws Exception {
@@ -45,8 +48,8 @@ class FirmwarePauseResumeTest {
 
     private void registerDevice(String requestId, String deviceId, String model, int bucket) throws Exception {
         mockMvc.perform(post("/api/devices").contentType("application/json").content("""
-                {"requestId":"%s","deviceId":"%s","model":"%s","currentVersion":"1.0.0","bucketNo":%d}
-                """.formatted(requestId, deviceId, model, bucket)))
+                {"requestId":"%s","deviceId":"%s","model":"%s","hardwareModel":"HW-%s","currentVersion":"1.0.0","bucketNo":%d}
+                """.formatted(requestId, deviceId, model, model, bucket)))
                 .andExpect(status().isOk());
     }
 
@@ -58,7 +61,12 @@ class FirmwarePauseResumeTest {
                 """.formatted(requestId, model, ratio, sampleFloor, threshold)))
                 .andExpect(status().isOk())
                 .andReturn();
-        return idOf(result, "$.releaseId");
+        long releaseId = idOf(result, "$.releaseId");
+        mockMvc.perform(post("/api/releases/" + releaseId + "/start").contentType("application/json")
+                        .content("{\"requestId\":\"%s-start\",\"expectedVersion\":1}".formatted(requestId)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("ACTIVE"));
+        return releaseId;
     }
 
     private long pullTask(String requestId, String deviceId) throws Exception {
@@ -411,15 +419,20 @@ class FirmwarePauseResumeTest {
                 """)).andExpect(status().isBadRequest());
 
         // 旧客户端不传监控参数：默认值 floor=2 / threshold=100
-        mockMvc.perform(post("/api/releases").contentType("application/json").content("""
+        MvcResult draft = mockMvc.perform(post("/api/releases").contentType("application/json").content("""
                 {"requestId":"r-ok","model":"m1","fromVersion":"1.0.0","toVersion":"2.0.0","ratio":10}
                 """))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.sampleFloor").value(2))
                 .andExpect(jsonPath("$.failureThresholdPercent").value(100))
                 .andExpect(jsonPath("$.monitorRound").value(1))
+                .andExpect(jsonPath("$.status").value("DRAFT"))
+                .andReturn();
+        long releaseId = idOf(draft, "$.releaseId");
+        mockMvc.perform(post("/api/releases/" + releaseId + "/start").contentType("application/json")
+                        .content("{\"requestId\":\"r-ok-start\",\"expectedVersion\":1}"))
+                .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("ACTIVE"));
-        long releaseId = jdbc.queryForObject("SELECT id FROM release_order", Long.class);
 
         // 只读查询不触发状态变化：连续查询后版本/状态/统计不变
         mockMvc.perform(get("/api/releases/" + releaseId + "/monitor")).andExpect(status().isOk());

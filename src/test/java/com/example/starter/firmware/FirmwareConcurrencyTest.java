@@ -66,12 +66,15 @@ class FirmwareConcurrencyTest {
 
     @BeforeEach
     void setUp() {
+        jdbc.update("DELETE FROM device_incompatible_record");
         jdbc.update("DELETE FROM rollout_task");
         jdbc.update("DELETE FROM release_pause_record");
         jdbc.update("DELETE FROM release_resume_record");
         jdbc.update("DELETE FROM release_order");
         jdbc.update("DELETE FROM device");
         jdbc.update("DELETE FROM idempotency_record");
+        jdbc.update("DELETE FROM firmware_compat_matrix");
+        jdbc.update("DELETE FROM hardware_model");
         executor = Executors.newFixedThreadPool(8);
     }
 
@@ -79,6 +82,14 @@ class FirmwareConcurrencyTest {
     void tearDown() throws InterruptedException {
         executor.shutdownNow();
         assertThat(executor.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
+    }
+
+    /**
+     * 通过兼容预检启动发布单（新契约：创建为 DRAFT，启动后才投放）。
+     */
+    private void startRelease(long releaseId, String requestId) {
+        releaseService.start(releaseId,
+                new com.example.starter.firmware.api.StartReleaseRequest(requestId, 1));
     }
 
     /**
@@ -110,9 +121,10 @@ class FirmwareConcurrencyTest {
 
     @Test
     void 并发拉取_同设备同发布单最多一条任务() throws Exception {
-        deviceService.register(new RegisterDeviceRequest("req-d", "d1", "m1", "1.0.0", 5));
+        deviceService.register(new RegisterDeviceRequest("req-d", "d1", "m1", "HW-m1", "1.0.0", 5));
         long releaseId = releaseService.create(new CreateReleaseRequest("req-r", "m1", "1.0.0", "2.0.0", 100))
                 .releaseId();
+        startRelease(releaseId, "req-r-start");
 
         int threads = 8;
         List<Callable<PullResponse>> tasks = new ArrayList<>();
@@ -150,7 +162,7 @@ class FirmwareConcurrencyTest {
         assertThat(successes).isEqualTo(1);
         assertThat(conflicts).isEqualTo(1);
         Long active = jdbc.queryForObject(
-                "SELECT COUNT(*) FROM release_order WHERE status = 'ACTIVE'", Long.class);
+                "SELECT COUNT(*) FROM release_order WHERE active_model IS NOT NULL", Long.class);
         assertThat(active).isEqualTo(1);
     }
 
@@ -159,9 +171,11 @@ class FirmwareConcurrencyTest {
         for (int round = 0; round < 10; round++) {
             String deviceId = "d" + round;
             String model = "m" + round;
-            deviceService.register(new RegisterDeviceRequest("req-d" + round, deviceId, model, "1.0.0", 5));
+            deviceService.register(new RegisterDeviceRequest("req-d" + round, deviceId, model,
+                    "HW-" + model, "1.0.0", 5));
             long releaseId = releaseService.create(
                     new CreateReleaseRequest("req-r" + round, model, "1.0.0", "2.0.0", 100)).releaseId();
+            startRelease(releaseId, "req-rs" + round);
             final int seq = round;
 
             List<Object> results = runConcurrently(List.of(
@@ -184,9 +198,11 @@ class FirmwareConcurrencyTest {
         for (int round = 0; round < 10; round++) {
             String deviceId = "d" + round;
             String model = "m" + round;
-            deviceService.register(new RegisterDeviceRequest("req-d" + round, deviceId, model, "1.0.0", 5));
+            deviceService.register(new RegisterDeviceRequest("req-d" + round, deviceId, model,
+                    "HW-" + model, "1.0.0", 5));
             long releaseId = releaseService.create(
                     new CreateReleaseRequest("req-r" + round, model, "1.0.0", "2.0.0", 100)).releaseId();
+            startRelease(releaseId, "req-rs" + round);
             long taskId = taskService.pull(deviceId, "req-p" + round).task().taskId();
             final int seq = round;
 
@@ -217,9 +233,10 @@ class FirmwareConcurrencyTest {
 
     @Test
     void 并发同requestId_重放一致且副作用只发生一次() throws Exception {
-        deviceService.register(new RegisterDeviceRequest("req-d", "d1", "m1", "1.0.0", 5));
+        deviceService.register(new RegisterDeviceRequest("req-d", "d1", "m1", "HW-m1", "1.0.0", 5));
         long releaseId = releaseService.create(new CreateReleaseRequest("req-r", "m1", "1.0.0", "2.0.0", 10))
                 .releaseId();
+        startRelease(releaseId, "req-r-start");
 
         int threads = 6;
         List<Callable<Object>> tasks = new ArrayList<>();
@@ -241,10 +258,11 @@ class FirmwareConcurrencyTest {
     void 并发失败回执_统计不丢失且每轮至多一条暂停记录() throws Exception {
         int devices = 8;
         for (int i = 0; i < devices; i++) {
-            deviceService.register(new RegisterDeviceRequest("req-d" + i, "d" + i, "m1", "1.0.0", i));
+            deviceService.register(new RegisterDeviceRequest("req-d" + i, "d" + i, "m1", "HW-m1", "1.0.0", i));
         }
         long releaseId = releaseService.create(
                 new CreateReleaseRequest("req-r", "m1", "1.0.0", "2.0.0", 100, 2, 50)).releaseId();
+        startRelease(releaseId, "req-r-start");
         List<Long> taskIds = new ArrayList<>();
         for (int i = 0; i < devices; i++) {
             taskIds.add(taskService.pull("d" + i, "req-p" + i).task().taskId());
@@ -273,10 +291,13 @@ class FirmwareConcurrencyTest {
         int resumeFirst = 0;
         for (int round = 0; round < 10; round++) {
             String model = "m" + round;
-            deviceService.register(new RegisterDeviceRequest("req-d" + round, "d" + round, model, "1.0.0", 1));
-            deviceService.register(new RegisterDeviceRequest("req-e" + round, "e" + round, model, "1.0.0", 2));
+            deviceService.register(new RegisterDeviceRequest("req-d" + round, "d" + round, model,
+                    "HW-" + model, "1.0.0", 1));
+            deviceService.register(new RegisterDeviceRequest("req-e" + round, "e" + round, model,
+                    "HW-" + model, "1.0.0", 2));
             long releaseId = releaseService.create(
                     new CreateReleaseRequest("req-r" + round, model, "1.0.0", "2.0.0", 100, 2, 50)).releaseId();
+            startRelease(releaseId, "req-rs" + round);
             long t1 = taskService.pull("d" + round, "req-p1-" + round).task().taskId();
             long t2 = taskService.pull("e" + round, "req-p2-" + round).task().taskId();
             taskService.receipt(t1, new ReceiptRequest("req-f1-" + round, ReceiptResult.FAILED));
@@ -315,10 +336,11 @@ class FirmwareConcurrencyTest {
 
     @Test
     void 并发同requestId恢复_重放一致且版本只加一次() throws Exception {
-        deviceService.register(new RegisterDeviceRequest("req-d1", "d1", "m1", "1.0.0", 1));
-        deviceService.register(new RegisterDeviceRequest("req-d2", "d2", "m1", "1.0.0", 2));
+        deviceService.register(new RegisterDeviceRequest("req-d1", "d1", "m1", "HW-m1", "1.0.0", 1));
+        deviceService.register(new RegisterDeviceRequest("req-d2", "d2", "m1", "HW-m1", "1.0.0", 2));
         long releaseId = releaseService.create(
                 new CreateReleaseRequest("req-r", "m1", "1.0.0", "2.0.0", 100, 2, 50)).releaseId();
+        startRelease(releaseId, "req-r-start");
         long t1 = taskService.pull("d1", "req-p1").task().taskId();
         long t2 = taskService.pull("d2", "req-p2").task().taskId();
         taskService.receipt(t1, new ReceiptRequest("req-f1", ReceiptResult.FAILED));

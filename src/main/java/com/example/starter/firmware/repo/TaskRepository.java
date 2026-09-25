@@ -14,19 +14,23 @@ import java.util.List;
 import java.util.Optional;
 
 /**
- * 投放任务数据访问。同设备同发布单由唯一约束 uk_task_release_device 保证最多一条。
+ * 投放任务数据访问。同设备同发布单由唯一约束 uk_task_release_device 保证最多一条，
+ * 因而同一设备在其产品型号唯一未终结发布单下并发拉取最多一个进行中任务。
+ * 任务创建时落库拉取时刻的兼容矩阵版本，矩阵缩窄不回溯修改。
  */
 @Repository
 public class TaskRepository {
 
     private static final RowMapper<RolloutTask> MAPPER = (rs, rowNum) -> {
         String firstResult = rs.getString("first_result");
+        Integer compatMatrixVersion = rs.getObject("compat_matrix_version", Integer.class);
         return new RolloutTask(rs.getLong("id"), rs.getLong("release_id"), rs.getString("device_id"),
                 TaskStatus.valueOf(rs.getString("status")),
-                firstResult == null ? null : ReceiptResult.valueOf(firstResult));
+                firstResult == null ? null : ReceiptResult.valueOf(firstResult),
+                compatMatrixVersion);
     };
 
-    private static final String COLUMNS = "id, release_id, device_id, status, first_result";
+    private static final String COLUMNS = "id, release_id, device_id, status, first_result, compat_matrix_version";
 
     private final JdbcTemplate jdbc;
 
@@ -34,14 +38,16 @@ public class TaskRepository {
         this.jdbc = jdbc;
     }
 
-    public long insert(long releaseId, String deviceId) {
+    public long insert(long releaseId, String deviceId, Integer compatMatrixVersion) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO rollout_task (release_id, device_id, status) VALUES (?, ?, 'PENDING')",
+                    "INSERT INTO rollout_task (release_id, device_id, status, compat_matrix_version)"
+                            + " VALUES (?, ?, 'PENDING', ?)",
                     new String[]{"id"});
             ps.setLong(1, releaseId);
             ps.setString(2, deviceId);
+            ps.setObject(3, compatMatrixVersion);
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();

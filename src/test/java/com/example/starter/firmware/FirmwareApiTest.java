@@ -35,12 +35,15 @@ class FirmwareApiTest {
 
     @BeforeEach
     void cleanUp() {
+        jdbc.update("DELETE FROM device_incompatible_record");
         jdbc.update("DELETE FROM rollout_task");
         jdbc.update("DELETE FROM release_pause_record");
         jdbc.update("DELETE FROM release_resume_record");
         jdbc.update("DELETE FROM release_order");
         jdbc.update("DELETE FROM device");
         jdbc.update("DELETE FROM idempotency_record");
+        jdbc.update("DELETE FROM firmware_compat_matrix");
+        jdbc.update("DELETE FROM hardware_model");
     }
 
     private String registerDevice(String requestId, String deviceId, String model, String version, int bucket)
@@ -48,8 +51,8 @@ class FirmwareApiTest {
         MvcResult result = mockMvc.perform(post("/api/devices")
                         .contentType("application/json")
                         .content("""
-                                {"requestId":"%s","deviceId":"%s","model":"%s","currentVersion":"%s","bucketNo":%d}
-                                """.formatted(requestId, deviceId, model, version, bucket)))
+                                {"requestId":"%s","deviceId":"%s","model":"%s","hardwareModel":"HW-%s","currentVersion":"%s","bucketNo":%d}
+                                """.formatted(requestId, deviceId, model, model, version, bucket)))
                 .andReturn();
         return result.getResponse().getContentAsString();
     }
@@ -65,6 +68,23 @@ class FirmwareApiTest {
         return result.getResponse().getContentAsString();
     }
 
+    /**
+     * 新契约：创建为 DRAFT，需通过兼容预检启动后才投放。
+     */
+    private void startRelease(long releaseId, String requestId) throws Exception {
+        mockMvc.perform(post("/api/releases/" + releaseId + "/start").contentType("application/json")
+                        .content("{\"requestId\":\"%s\",\"expectedVersion\":1}".formatted(requestId)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("ACTIVE"));
+    }
+
+    private long createAndStartRelease(String requestId, String model, String from, String to, int ratio)
+            throws Exception {
+        long releaseId = releaseIdOf(createRelease(requestId + "-create", model, from, to, ratio));
+        startRelease(releaseId, requestId + "-start");
+        return releaseId;
+    }
+
     private long releaseIdOf(String responseBody) {
         Number id = com.jayway.jsonpath.JsonPath.read(responseBody, "$.releaseId");
         return id.longValue();
@@ -73,10 +93,11 @@ class FirmwareApiTest {
     @Test
     void 主流程_登记发布拉取回执成功并更新设备版本() throws Exception {
         mockMvc.perform(post("/api/devices").contentType("application/json").content("""
-                        {"requestId":"r1","deviceId":"d1","model":"m1","currentVersion":"1.0.0","bucketNo":5}
+                        {"requestId":"r1","deviceId":"d1","model":"m1","hardwareModel":"HW-A","currentVersion":"1.0.0","bucketNo":5}
                         """))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.deviceId").value("d1"))
+                .andExpect(jsonPath("$.hardwareModel").value("HW-A"))
                 .andExpect(jsonPath("$.bucketNo").value(5));
 
         MvcResult release = mockMvc.perform(post("/api/releases").contentType("application/json").content("""
@@ -84,9 +105,10 @@ class FirmwareApiTest {
                         """))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.version").value(1))
-                .andExpect(jsonPath("$.status").value("ACTIVE"))
+                .andExpect(jsonPath("$.status").value("DRAFT"))
                 .andReturn();
         long releaseId = idOf(release, "$.releaseId");
+        startRelease(releaseId, "r2-start");
 
         MvcResult pull = mockMvc.perform(post("/api/devices/d1/pull").contentType("application/json")
                         .content("{\"requestId\":\"r3\"}"))
@@ -117,18 +139,18 @@ class FirmwareApiTest {
         registerDevice("r1", "d1", "m1", "1.0.0", 5);
 
         mockMvc.perform(post("/api/devices").contentType("application/json").content("""
-                        {"requestId":"r2","deviceId":"d1","model":"m1","currentVersion":"1.0.0","bucketNo":5}
+                        {"requestId":"r2","deviceId":"d1","model":"m1","hardwareModel":"HW-m1","currentVersion":"1.0.0","bucketNo":5}
                         """))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("DEVICE_EXISTS"));
 
         mockMvc.perform(post("/api/devices").contentType("application/json").content("""
-                        {"requestId":"r3","deviceId":"d2","model":"m1","currentVersion":"1.0.0","bucketNo":100}
+                        {"requestId":"r3","deviceId":"d2","model":"m1","hardwareModel":"HW-m1","currentVersion":"1.0.0","bucketNo":100}
                         """))
                 .andExpect(status().isBadRequest());
 
         mockMvc.perform(post("/api/devices").contentType("application/json").content("""
-                        {"deviceId":"d3","model":"m1","currentVersion":"1.0.0","bucketNo":1}
+                        {"deviceId":"d3","model":"m1","hardwareModel":"HW-m1","currentVersion":"1.0.0","bucketNo":1}
                         """))
                 .andExpect(status().isBadRequest());
     }
@@ -143,7 +165,7 @@ class FirmwareApiTest {
         assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM device", Long.class)).isEqualTo(1);
 
         mockMvc.perform(post("/api/devices").contentType("application/json").content("""
-                        {"requestId":"rid-1","deviceId":"d9","model":"m1","currentVersion":"1.0.0","bucketNo":5}
+                        {"requestId":"rid-1","deviceId":"d9","model":"m1","hardwareModel":"HW-m1","currentVersion":"1.0.0","bucketNo":5}
                         """))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("REQUEST_ID_CONFLICT"));
@@ -156,6 +178,7 @@ class FirmwareApiTest {
                 .andExpect(status().isOk())
                 .andReturn();
         long releaseId = releaseIdOf(created.getResponse().getContentAsString());
+        startRelease(releaseId, "rid-y-start");
         mockMvc.perform(post("/api/releases/" + releaseId + "/expand").contentType("application/json").content("""
                         {"requestId":"rid-z","expectedVersion":99,"ratio":50}
                         """))
@@ -188,6 +211,7 @@ class FirmwareApiTest {
     @Test
     void 扩量_版本校验_比例只增不减_重放不再加版本() throws Exception {
         long releaseId = releaseIdOf(createRelease("r1", "m1", "1.0.0", "2.0.0", 10));
+        startRelease(releaseId, "r1-start");
 
         mockMvc.perform(post("/api/releases/" + releaseId + "/expand").contentType("application/json").content("""
                         {"requestId":"r2","expectedVersion":2,"ratio":30}
@@ -235,7 +259,8 @@ class FirmwareApiTest {
     void 拉取_不匹配不创建任务_重复拉取返回已有任务() throws Exception {
         registerDevice("r1", "d1", "m1", "1.0.0", 50);
         registerDevice("r2", "d2", "m1", "9.9.9", 1);
-        createRelease("r3", "m1", "1.0.0", "2.0.0", 10);
+        long pullReleaseId = releaseIdOf(createRelease("r3", "m1", "1.0.0", "2.0.0", 10));
+        startRelease(pullReleaseId, "r3-start");
 
         // 分桶号不小于比例：不投放
         mockMvc.perform(post("/api/devices/d1/pull").contentType("application/json")
@@ -279,7 +304,7 @@ class FirmwareApiTest {
     @Test
     void 回执_失败终结且本轮不再投放_同结果重复成功_改结果409() throws Exception {
         registerDevice("r1", "d1", "m1", "1.0.0", 1);
-        createRelease("r2", "m1", "1.0.0", "2.0.0", 100);
+        createAndStartRelease("r2", "m1", "1.0.0", "2.0.0", 100);
         MvcResult pull = mockMvc.perform(post("/api/devices/d1/pull").contentType("application/json")
                         .content("{\"requestId\":\"r3\"}"))
                 .andReturn();
@@ -325,6 +350,7 @@ class FirmwareApiTest {
         registerDevice("r1", "d1", "m1", "1.0.0", 1);
         registerDevice("r2", "d2", "m1", "1.0.0", 2);
         long releaseId = releaseIdOf(createRelease("r3", "m1", "1.0.0", "2.0.0", 100));
+        startRelease(releaseId, "r3-start");
         MvcResult pull = mockMvc.perform(post("/api/devices/d1/pull").contentType("application/json")
                         .content("{\"requestId\":\"r4\"}"))
                 .andReturn();
@@ -376,6 +402,7 @@ class FirmwareApiTest {
         registerDevice("r1", "d1", "m1", "1.0.0", 1);
         registerDevice("r2", "d2", "m1", "1.0.0", 2);
         long releaseId = releaseIdOf(createRelease("r3", "m1", "1.0.0", "2.0.0", 100));
+        startRelease(releaseId, "r3-start");
         mockMvc.perform(post("/api/devices/d1/pull").contentType("application/json")
                 .content("{\"requestId\":\"r4\"}"));
         mockMvc.perform(post("/api/devices/d2/pull").contentType("application/json")

@@ -2,7 +2,8 @@
 
 CREATE TABLE IF NOT EXISTS device (
   device_id VARCHAR(64) NOT NULL COMMENT '设备唯一标识',
-  model VARCHAR(64) NOT NULL COMMENT '设备型号，登记后不可修改',
+  model VARCHAR(64) NOT NULL COMMENT '设备产品型号，登记后不可修改；同一产品型号至多一张未终结发布单',
+  hardware_model VARCHAR(64) NOT NULL COMMENT '设备硬件型号，登记后不可修改；用于固件硬件兼容矩阵校验',
   current_version VARCHAR(64) NOT NULL COMMENT '设备当前固件版本',
   bucket_no INT NOT NULL COMMENT '灰度分桶号，取值0~99，登记后不可修改',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '登记时间',
@@ -16,13 +17,13 @@ CREATE TABLE IF NOT EXISTS release_order (
   from_version VARCHAR(64) NOT NULL COMMENT '来源固件版本',
   to_version VARCHAR(64) NOT NULL COMMENT '目标固件版本，必须与来源版本不同',
   ratio INT NOT NULL COMMENT '投放比例，取值0~100，只增不减',
-  status VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE投放中，PAUSED失败率自动暂停，CANCELLED已取消（终态）',
+  status VARCHAR(16) NOT NULL COMMENT '状态：DRAFT已创建待启动（不参与拉取），ACTIVE投放中，PAUSED失败率自动暂停，CANCELLED已取消（终态）',
   sample_floor INT NOT NULL COMMENT '失败率统计样本下限，取值2~100；本轮样本数达到下限才评估暂停',
   failure_threshold_percent INT NOT NULL COMMENT '失败率阈值百分比，取值1~100；FAILED×100>=样本数×阈值时自动暂停',
   monitor_round INT NOT NULL DEFAULT 1 COMMENT '当前监控轮次，从1开始，人工恢复后加一并清零统计',
   round_success INT NOT NULL DEFAULT 0 COMMENT '当前监控轮次内首次进入SUCCESS的任务数，重复回执不重复计数',
   round_failed INT NOT NULL DEFAULT 0 COMMENT '当前监控轮次内首次进入FAILED的任务数，重复回执不重复计数',
-  active_model VARCHAR(64) NULL COMMENT 'ACTIVE或PAUSED时等于model，取消后置NULL；用于同型号至多一张未终结发布单的唯一约束',
+  active_model VARCHAR(64) NULL COMMENT 'DRAFT、ACTIVE或PAUSED时等于model，取消后置NULL；用于同产品型号至多一张未终结发布单的唯一约束',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
   PRIMARY KEY (id)
@@ -36,6 +37,7 @@ CREATE TABLE IF NOT EXISTS rollout_task (
   device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
   status VARCHAR(16) NOT NULL COMMENT 'PENDING待回执；SUCCESS成功；FAILED失败；CANCELLED已取消',
   first_result VARCHAR(16) NULL COMMENT '首次回执结果（SUCCESS/FAILED），未回执为NULL',
+  compat_matrix_version INT NULL COMMENT '拉取创建任务时目标固件兼容矩阵版本：>=1已配置矩阵版本，0表示未配置（兼容全部型号）；矩阵缩窄不改变已存任务；NULL为矩阵功能前的历史任务',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
   PRIMARY KEY (id),
@@ -71,3 +73,30 @@ CREATE TABLE IF NOT EXISTS idempotency_record (
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   PRIMARY KEY (request_id)
 ) COMMENT='写操作幂等去重记录，失败不占键';
+
+CREATE TABLE IF NOT EXISTS hardware_model (
+  model VARCHAR(64) NOT NULL COMMENT '已知硬件型号，登记后不可变；兼容矩阵只允许引用已知型号',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '登记时间',
+  PRIMARY KEY (model)
+) COMMENT='已知硬件型号目录，设备 hardwareModel 与矩阵型号集合都必须存在于此';
+
+CREATE TABLE IF NOT EXISTS firmware_compat_matrix (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '矩阵ID',
+  firmware_version VARCHAR(64) NOT NULL COMMENT '固件版本（即发布单 to_version）',
+  version INT NOT NULL COMMENT '该固件矩阵版本号，从1开始，每次配置修改成功加一',
+  models CLOB NOT NULL COMMENT '允许的硬件型号集合，JSON数组且按字典序存储；空数组[]表示兼容全部型号；换序为同参不产生新版本',
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近配置修改时间',
+  PRIMARY KEY (id),
+  CONSTRAINT uk_compat_firmware UNIQUE (firmware_version)
+) COMMENT='固件硬件兼容矩阵当前版本，按固件版本唯一';
+
+CREATE TABLE IF NOT EXISTS device_incompatible_record (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '记录ID',
+  device_id VARCHAR(64) NOT NULL COMMENT '拉取被拦截的设备ID',
+  hardware_model VARCHAR(64) NOT NULL COMMENT '拉取时设备硬件型号',
+  release_id BIGINT NOT NULL COMMENT '目标发布单ID',
+  to_version VARCHAR(64) NOT NULL COMMENT '目标固件版本',
+  matrix_version INT NOT NULL COMMENT '拦截时依据的兼容矩阵版本',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '拦截时间',
+  PRIMARY KEY (id)
+) COMMENT='设备拉取命中不兼容矩阵的记录；拦截不创建任务、不计失败率样本、不改设备状态';

@@ -33,6 +33,11 @@ public class ReleaseController {
         return releaseService.create(request);
     }
 
+    @PostMapping("/{releaseId}/start")
+    public ReleaseView start(@PathVariable long releaseId, @Valid @RequestBody StartReleaseRequest request) {
+        return releaseService.start(releaseId, request);
+    }
+
     @PostMapping("/{releaseId}/expand")
     public ReleaseView expand(@PathVariable long releaseId, @Valid @RequestBody ExpandReleaseRequest request) {
         return releaseService.expand(releaseId, request);
@@ -62,6 +67,11 @@ public class ReleaseController {
     public TaskListResponse tasks(@PathVariable long releaseId, @RequestParam(required = false) String status) {
         TaskStatus filter = parseStatus(status);
         return taskService.listByRelease(releaseId, filter);
+    }
+
+    @GetMapping("/{releaseId}/model-stats")
+    public ModelRolloutStatsResponse modelStats(@PathVariable long releaseId) {
+        return releaseService.modelStats(releaseId);
     }
 
     private TaskStatus parseStatus(String status) {
