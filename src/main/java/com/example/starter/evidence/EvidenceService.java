@@ -48,6 +48,7 @@ public class EvidenceService {
     private final CommandLogRepository commandLogRepository;
     private final ObjectMapper objectMapper;
     private final EvidenceClock clock;
+    private final ContainerService containerService;
 
     public EvidenceService(EvidenceRepository evidenceRepository,
                            TransferRecordRepository transferRepository,
@@ -55,7 +56,8 @@ public class EvidenceService {
                            LoanRecordRepository loanRepository,
                            CommandLogRepository commandLogRepository,
                            ObjectMapper objectMapper,
-                           EvidenceClock clock) {
+                           EvidenceClock clock,
+                           ContainerService containerService) {
         this.evidenceRepository = evidenceRepository;
         this.transferRepository = transferRepository;
         this.inspectionRepository = inspectionRepository;
@@ -63,6 +65,7 @@ public class EvidenceService {
         this.commandLogRepository = commandLogRepository;
         this.objectMapper = objectMapper;
         this.clock = clock;
+        this.containerService = containerService;
     }
 
     /**
@@ -105,6 +108,8 @@ public class EvidenceService {
         }
         requireSealIntact(evidence);
         requireCustodian(evidence, actorId);
+        // 容器 INSPECTION_FAILED 或证物 PENDING_VERIFICATION 时持续阻断迁移，与巡检并发按提交顺序裁决。
+        containerService.requireTransferAllowed(evidence);
         if (evidence.status() == EvidenceStatus.TRANSFER_PENDING) {
             throw ApiException.conflict("证物已存在待接收交接: " + evidenceKey);
         }
@@ -205,6 +210,9 @@ public class EvidenceService {
         if (evidence.status() == EvidenceStatus.BORROWED) {
             throw ApiException.conflict("借出期间禁止独立封条核验: " + evidenceKey);
         }
+        if (evidence.status() == EvidenceStatus.PENDING_VERIFICATION) {
+            throw ApiException.conflict("容器巡检失败待双人复核期间禁止独立封条核验: " + evidenceKey);
+        }
         LocalDateTime now = LocalDateTime.now();
         inspectionRepository.insert(evidenceKey, actorId, request.passed(), request.note(), now);
         if (!request.passed() && evidence.status() != EvidenceStatus.SEAL_BROKEN) {
@@ -238,6 +246,8 @@ public class EvidenceService {
             throw ApiException.badRequest("借用人不能与当前保管人相同");
         }
         requireCustodian(evidence, actorId);
+        // 容器 INSPECTION_FAILED 或证物 PENDING_VERIFICATION 时持续阻断新借出，与巡检并发按提交顺序裁决。
+        containerService.requireLoanAllowed(evidence);
         if (evidence.status() == EvidenceStatus.SEAL_BROKEN) {
             throw ApiException.unprocessable("封条已异常，禁止借出: " + evidenceKey);
         }
@@ -404,7 +414,7 @@ public class EvidenceService {
     private EvidenceView toView(Evidence evidence) {
         return new EvidenceView(evidence.evidenceKey(), evidence.caseKey(), evidence.category(),
                 evidence.sealNo(), evidence.custodianId(), evidence.status(),
-                evidence.createdAt(), evidence.updatedAt());
+                evidence.containerKey(), evidence.createdAt(), evidence.updatedAt());
     }
 
     private TransferView toView(TransferRecord record) {

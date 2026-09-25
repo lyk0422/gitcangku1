@@ -26,14 +26,15 @@ public class EvidenceRepository {
     }
 
     /**
-     * 插入新证物，初始状态 SEALED，保管人为入库操作人。
+     * 插入新证物，初始状态 SEALED，保管人为入库操作人，不属于任何容器。
      */
     public void insert(String evidenceKey, String caseKey, String category, String sealNo,
                        String custodianId, LocalDateTime now) {
         jdbc.update("""
                         INSERT INTO evidence
-                            (evidence_key, case_key, category, seal_no, custodian_id, status, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            (evidence_key, case_key, category, seal_no, custodian_id, status,
+                             container_key, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)
                         """,
                 evidenceKey, caseKey, category, sealNo, custodianId,
                 EvidenceStatus.SEALED.name(), now, now);
@@ -77,6 +78,49 @@ public class EvidenceRepository {
     }
 
     /**
+     * 仅更新证物所属容器（装载/移出）；null 表示移出容器。
+     */
+    public void updateContainer(String evidenceKey, String containerKey, LocalDateTime now) {
+        jdbc.update(
+                "UPDATE evidence SET container_key = ?, updated_at = ? WHERE evidence_key = ?",
+                containerKey, now, evidenceKey);
+    }
+
+    /**
+     * 条件更新状态（CAS）：仅当当前状态等于期望值时生效，用于并发裁决。
+     *
+     * @return 是否更新成功（false 表示已被并发事务改变状态）
+     */
+    public boolean compareAndUpdateStatus(String evidenceKey, EvidenceStatus expect,
+                                          EvidenceStatus target, LocalDateTime now) {
+        int updated = jdbc.update("""
+                        UPDATE evidence
+                        SET status = ?, updated_at = ?
+                        WHERE evidence_key = ? AND status = ?
+                        """,
+                target.name(), now, evidenceKey, expect.name());
+        return updated == 1;
+    }
+
+    /**
+     * 查询容器内全部证物并锁定行（FAIL 巡检批量标记与快照必须逐件锁定）。
+     */
+    public List<Evidence> findByContainerForUpdate(String containerKey) {
+        return jdbc.query(
+                "SELECT * FROM evidence WHERE container_key = ? ORDER BY evidence_key FOR UPDATE",
+                ROW_MAPPER, containerKey);
+    }
+
+    /**
+     * 查询容器内全部证物（只读，按证物键排序，集合顺序不影响业务语义）。
+     */
+    public List<Evidence> findByContainer(String containerKey) {
+        return jdbc.query(
+                "SELECT * FROM evidence WHERE container_key = ? ORDER BY evidence_key",
+                ROW_MAPPER, containerKey);
+    }
+
+    /**
      * 查询指定保管人当前可交接的证物（本人保管且状态 SEALED）。
      */
     public List<Evidence> findTransferable(String custodianId) {
@@ -96,6 +140,7 @@ public class EvidenceRepository {
                     rs.getString("seal_no"),
                     rs.getString("custodian_id"),
                     EvidenceStatus.valueOf(rs.getString("status")),
+                    rs.getString("container_key"),
                     rs.getObject("created_at", LocalDateTime.class),
                     rs.getObject("updated_at", LocalDateTime.class));
         }
