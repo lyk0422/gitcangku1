@@ -86,6 +86,15 @@ public class UnblindRequestRepository {
         return rows.isEmpty() ? null : rows.get(0);
     }
 
+    /** 该分配是否已存在批准的揭盲（即参与者已揭盲，禁止替补）。 */
+    public boolean existsApprovedByAllocation(long allocationId) {
+        Long count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM unblind_request "
+                        + "WHERE allocation_id = ? AND status = 'APPROVED'",
+                Long.class, allocationId);
+        return count != null && count > 0;
+    }
+
     /**
      * 批准：仅 PENDING 可批准，写入处理代码、批准人与时间，并释放待审唯一占位。
      *

@@ -112,3 +112,32 @@ COMMENT ON COLUMN idempotent_request.fingerprint IS '请求参数指纹（含路
 COMMENT ON COLUMN idempotent_request.response_status IS '首次成功响应的 HTTP 状态码，重放时原样返回';
 COMMENT ON COLUMN idempotent_request.response_body IS '首次成功响应体 JSON，重放时原样返回';
 COMMENT ON COLUMN idempotent_request.created_at IS '记录时间，Unix 毫秒，UTC';
+
+CREATE TABLE IF NOT EXISTS replacement (
+    id                    BIGINT       NOT NULL AUTO_INCREMENT,
+    replace_key           VARCHAR(64)  NOT NULL,
+    experiment_id         VARCHAR(64)  NOT NULL,
+    allocation_id         BIGINT       NOT NULL,
+    block_no              INT          NOT NULL,
+    original_participant_id VARCHAR(64) NOT NULL,
+    new_participant_id    VARCHAR(64)  NOT NULL,
+    operator_actor        VARCHAR(64)  NOT NULL,
+    original_assigned_at  BIGINT       NOT NULL,
+    original_withdrawn_at BIGINT       NOT NULL,
+    replaced_at           BIGINT       NOT NULL,
+    CONSTRAINT pk_replacement PRIMARY KEY (id),
+    CONSTRAINT uq_replacement_original UNIQUE (experiment_id, original_participant_id),
+    CONSTRAINT uq_replacement_new UNIQUE (new_participant_id)
+);
+COMMENT ON TABLE  replacement IS '受试者替补记录表（不可变，仅插入）：固化原参与者、新参与者、区组、分配序号与时刻；不保存处理代码与席位号';
+COMMENT ON COLUMN replacement.id IS '替补记录自增主键';
+COMMENT ON COLUMN replacement.replace_key IS '提交替补时携带的替补键，参与幂等指纹，仅作业务留痕';
+COMMENT ON COLUMN replacement.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN replacement.allocation_id IS '被继承的分配序号（allocation.id），替补不新建分配序号';
+COMMENT ON COLUMN replacement.block_no IS '原参与者所属区组号，替补前后不变';
+COMMENT ON COLUMN replacement.original_participant_id IS '被替补的原参与者编号，转入 REPLACED 终态；同实验内至多被替补一次';
+COMMENT ON COLUMN replacement.new_participant_id IS '替补新参与者编号，全局唯一，继承原分配的处理代码';
+COMMENT ON COLUMN replacement.operator_actor IS '执行替补的操作者编号（X-Actor-Id）';
+COMMENT ON COLUMN replacement.original_assigned_at IS '原参与者入组时间，Unix 毫秒，UTC（替补时快照）';
+COMMENT ON COLUMN replacement.original_withdrawn_at IS '原参与者退组时间，Unix 毫秒，UTC（替补时快照，替补前必已退组）';
+COMMENT ON COLUMN replacement.replaced_at IS '替补提交时间，Unix 毫秒，UTC';

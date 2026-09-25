@@ -4,9 +4,11 @@ import com.example.starter.blind.ApiException;
 import com.example.starter.blind.Clock;
 import com.example.starter.blind.dto.UnblindRequestView;
 import com.example.starter.blind.dto.UnblindResultView;
+import com.example.starter.blind.repo.AllocationRepository;
 import com.example.starter.blind.repo.AllocationRepository.AllocationRow;
 import com.example.starter.blind.repo.ExperimentRepository.SeatRow;
 import com.example.starter.blind.repo.ExperimentRepository;
+import com.example.starter.blind.repo.ReplacementRepository;
 import com.example.starter.blind.repo.UnblindRequestRepository;
 import com.example.starter.blind.repo.UnblindRequestRepository.UnblindRequestRow;
 import org.springframework.dao.DuplicateKeyException;
@@ -27,15 +29,21 @@ public class UnblindService {
     private final UnblindRequestRepository unblindRequestRepository;
     private final ExperimentService experimentService;
     private final ExperimentRepository experimentRepository;
+    private final AllocationRepository allocationRepository;
+    private final ReplacementRepository replacementRepository;
     private final Clock clock;
 
     public UnblindService(UnblindRequestRepository unblindRequestRepository,
                           ExperimentService experimentService,
                           ExperimentRepository experimentRepository,
+                          AllocationRepository allocationRepository,
+                          ReplacementRepository replacementRepository,
                           Clock clock) {
         this.unblindRequestRepository = unblindRequestRepository;
         this.experimentService = experimentService;
         this.experimentRepository = experimentRepository;
+        this.allocationRepository = allocationRepository;
+        this.replacementRepository = replacementRepository;
         this.clock = clock;
     }
 
@@ -52,7 +60,15 @@ public class UnblindService {
             throw ApiException.badRequest("reason 最长 500 字符");
         }
         AllocationRow allocation =
-                experimentService.mustFindAllocationRow(experimentId, participantId);
+                allocationRepository.lockByExperimentAndParticipant(experimentId, participantId);
+        if (allocation == null) {
+            experimentService.requireExperiment(experimentId);
+            if (replacementRepository.findByOriginal(experimentId, participantId) != null) {
+                // 替补先提交：对原参与者的后续揭盲申请一律 409。
+                throw ApiException.conflict("参与者已被替补，处于 REPLACED 终态，禁止揭盲申请");
+            }
+            throw ApiException.notFound("参与者尚未在该实验登记");
+        }
         UnblindRequestRow pending =
                 unblindRequestRepository.findPendingByAllocation(allocation.id());
         if (pending != null) {
@@ -87,8 +103,11 @@ public class UnblindService {
             throw ApiException.forbidden("批准人必须是不同于申请人的另一名 REVIEWER");
         }
         // 从数据库读取处理映射（盲底），批准时写入申请记录；处理代码不打日志。
-        AllocationRow allocation =
-                experimentService.mustFindAllocationRow(row.experimentId(), row.participantId());
+        // 按分配序号定位：即使原参与者此后被替补，既有申请仍可完成审批并继续指向原标识。
+        AllocationRow allocation = allocationRepository.findById(row.allocationId());
+        if (allocation == null) {
+            throw new IllegalStateException("分配记录缺失，数据不一致");
+        }
         SeatRow seat = experimentRepository.findSeat(row.experimentId(),
                 allocation.blockNo(), allocation.seatNo());
         if (seat == null) {

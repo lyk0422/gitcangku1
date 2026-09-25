@@ -10,6 +10,8 @@ import com.example.starter.blind.repo.AllocationRepository.VacantSeat;
 import com.example.starter.blind.repo.ExperimentRepository;
 import com.example.starter.blind.repo.ExperimentRepository.ExperimentRow;
 import com.example.starter.blind.repo.ExperimentRepository.SeatRow;
+import com.example.starter.blind.repo.ReplacementRepository;
+import com.example.starter.blind.repo.ReplacementRepository.ReplacementRow;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -29,15 +31,18 @@ public class ExperimentService {
 
     private final ExperimentRepository experimentRepository;
     private final AllocationRepository allocationRepository;
+    private final ReplacementRepository replacementRepository;
     private final BlindCodeGenerator blindCodeGenerator;
     private final Clock clock;
 
     public ExperimentService(ExperimentRepository experimentRepository,
                              AllocationRepository allocationRepository,
+                             ReplacementRepository replacementRepository,
                              BlindCodeGenerator blindCodeGenerator,
                              Clock clock) {
         this.experimentRepository = experimentRepository;
         this.allocationRepository = allocationRepository;
+        this.replacementRepository = replacementRepository;
         this.blindCodeGenerator = blindCodeGenerator;
         this.clock = clock;
     }
@@ -97,6 +102,10 @@ public class ExperimentService {
             // 同实验同参与者只占一席；已退组也不重新占席。
             throw ApiException.conflict("参与者已在该实验登记，仅可占一席");
         }
+        if (replacementRepository.existsInExperimentByParticipant(experimentId, participantId)) {
+            // 已进入过替补流程（被替补或作为替补）的参与者处于流程终态，不可重新登记。
+            throw ApiException.conflict("参与者已进入替补流程，不可重新登记");
+        }
         VacantSeat vacant = allocationRepository.takeFirstVacantSeat(experimentId);
         if (vacant == null) {
             throw ApiException.full("实验席位已满");
@@ -138,7 +147,15 @@ public class ExperimentService {
      */
     @Transactional
     public AllocationView withdraw(String experimentId, String participantId) {
-        AllocationRow allocation = mustFindAllocation(experimentId, participantId);
+        AllocationRow allocation =
+                allocationRepository.findByExperimentAndParticipant(experimentId, participantId);
+        if (allocation == null) {
+            mustFindExperiment(experimentId);
+            if (replacementRepository.findByOriginal(experimentId, participantId) != null) {
+                throw ApiException.conflict("参与者已被替补，处于 REPLACED 终态");
+            }
+            throw ApiException.notFound("参与者尚未在该实验登记");
+        }
         if ("WITHDRAWN".equals(allocation.status())) {
             throw ApiException.conflict("参与者已退组");
         }
@@ -169,12 +186,32 @@ public class ExperimentService {
      * 普通查询：只返回盲码、区组号、参与者编号与退组状态。
      */
     public AllocationView getAllocation(String experimentId, String participantId) {
-        return toView(mustFindAllocation(experimentId, participantId));
+        AllocationRow row =
+                allocationRepository.findByExperimentAndParticipant(experimentId, participantId);
+        if (row != null) {
+            return toView(row);
+        }
+        mustFindExperiment(experimentId);
+        ReplacementRow replaced = replacementRepository.findByOriginal(experimentId, participantId);
+        if (replaced == null) {
+            throw ApiException.notFound("参与者尚未在该实验登记");
+        }
+        // 分配序号被继承但记录保留：原参与者查询返回 REPLACED 终态视图。
+        AllocationRow slot = allocationRepository.findById(replaced.allocationId());
+        String blindCode = slot == null ? null : slot.blindCode();
+        return new AllocationView(experimentId, participantId, blindCode, replaced.blockNo(),
+                "REPLACED", replaced.originalAssignedAt(), replaced.originalWithdrawnAt(),
+                replaced.replacedAt());
     }
 
     /** 内部使用的完整分配行（含盲底字段），禁止直接透出到普通响应。 */
     public AllocationRow mustFindAllocationRow(String experimentId, String participantId) {
         return mustFindAllocation(experimentId, participantId);
+    }
+
+    /** 校验实验存在，不存在抛 404。 */
+    public void requireExperiment(String experimentId) {
+        mustFindExperiment(experimentId);
     }
 
     private AllocationRow mustFindAllocation(String experimentId, String participantId) {
@@ -197,6 +234,6 @@ public class ExperimentService {
 
     private AllocationView toView(AllocationRow row) {
         return new AllocationView(row.experimentId(), row.participantId(), row.blindCode(),
-                row.blockNo(), row.status(), row.assignedAt(), row.withdrawnAt());
+                row.blockNo(), row.status(), row.assignedAt(), row.withdrawnAt(), null);
     }
 }
