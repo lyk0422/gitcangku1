@@ -47,14 +47,15 @@ CREATE TABLE IF NOT EXISTS result_snapshot (
 CREATE TABLE IF NOT EXISTS result_snapshot_entry (
     race_id VARCHAR(64) NOT NULL COMMENT '所属快照的赛事ID',
     bib VARCHAR(64) NOT NULL COMMENT '参赛号',
-    rank_no INT COMMENT '名次（从1开始，并列同名次并跳号，如1、1、3）；未计时/漏点/取消资格为NULL',
-    status VARCHAR(24) NOT NULL COMMENT '成绩状态：RANKED-参与排名，UNTIMED-计时缺失，MISSING_CHECKPOINT-有完赛但未覆盖全部检查点，DISQUALIFIED-取消资格',
+    rank_no INT COMMENT '名次（从1开始，并列同名次并跳号，如1、1、3）；未计时/漏点/取消资格/退赛为NULL',
+    status VARCHAR(24) NOT NULL COMMENT '成绩状态：RANKED-参与排名，UNTIMED-计时缺失，MISSING_CHECKPOINT-有完赛但未覆盖全部检查点，DISQUALIFIED-取消资格，DNS-未出发，DNF-中途退赛',
     finish_time_ms BIGINT COMMENT '原始完赛耗时（毫秒）；计时缺失为NULL',
     penalty_ms BIGINT NOT NULL COMMENT '生效（未撤销）加时处罚合计毫秒数，无加时为0',
     total_time_ms BIGINT COMMENT '总耗时=原始完赛耗时+生效加时（毫秒）；未排名时为NULL',
     checkpoint_count INT NOT NULL DEFAULT 0 COMMENT '赛事检查点总数；未配置检查点为0',
     covered_checkpoint_count INT NOT NULL DEFAULT 0 COMMENT '封榜时该选手已覆盖检查点数量；缺失检查点由result_snapshot_checkpoint中elapsed_millis为NULL的行固化',
-    display_order INT NOT NULL COMMENT '展示顺序，从0开始：先名次顺序，并列者按参赛号字典序，其余按参赛号字典序',
+    last_checkpoint_code VARCHAR(64) COMMENT '退赛选手最后通过的检查点代码：DNF为登记时指定的顺序最大者，DNS为NULL；非退赛状态为NULL',
+    display_order INT NOT NULL COMMENT '展示顺序，从0开始：先名次顺序，并列者按参赛号字典序，再其余未排名选手，退赛选手单独成组排在末尾',
     CONSTRAINT pk_snapshot_entry PRIMARY KEY (race_id, bib),
     CONSTRAINT fk_snapshot_entry_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
 );
@@ -95,9 +96,27 @@ CREATE TABLE IF NOT EXISTS result_snapshot_checkpoint (
     CONSTRAINT fk_snapshot_checkpoint_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
 );
 
+CREATE TABLE IF NOT EXISTS runner_withdrawal (
+    withdrawal_id BIGINT NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    withdrawal_key VARCHAR(128) NOT NULL COMMENT '全局唯一退赛键；同一键重放首次登记/撤销结果，撤销时须携带登记时的同一键',
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    bib VARCHAR(64) NOT NULL COMMENT '退赛选手参赛号',
+    status VARCHAR(16) NOT NULL COMMENT '退赛状态：DNS-未出发，DNF-中途退赛',
+    reason VARCHAR(512) NOT NULL COMMENT '非空退赛原因',
+    last_checkpoint_code VARCHAR(64) COMMENT 'DNF登记时指定的最后通过检查点代码（必须是其已有分段记录中顺序最大者）；DNS为NULL',
+    last_checkpoint_position INT COMMENT '登记时固化的最后通过检查点顺序；DNS为NULL',
+    revoked BOOLEAN NOT NULL DEFAULT FALSE COMMENT '是否已撤销：FALSE-退赛生效中，TRUE-已撤销且记录不可变',
+    created_at BIGINT NOT NULL COMMENT '退赛登记时间，Unix毫秒时间戳',
+    revoked_at BIGINT COMMENT '撤销时间，Unix毫秒时间戳；未撤销为NULL',
+    CONSTRAINT pk_runner_withdrawal PRIMARY KEY (withdrawal_id),
+    CONSTRAINT uk_withdrawal_key UNIQUE (withdrawal_key),
+    CONSTRAINT fk_withdrawal_runner FOREIGN KEY (race_id, bib) REFERENCES runner (race_id, bib),
+    INDEX idx_withdrawal_race_bib (race_id, bib)
+);
+
 CREATE TABLE IF NOT EXISTS idempotency_record (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求ID（写操作幂等键）',
-    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE',
+    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/WITHDRAW_RUNNER/REVOKE_WITHDRAWAL/SEAL_RACE',
     request_digest CHAR(64) NOT NULL COMMENT '请求参数（requestId除外，含expectedVersion）规范化JSON的SHA-256摘要',
     response_status INT NOT NULL COMMENT '原成功请求的HTTP状态码，重放时原样返回',
     response_body TEXT COMMENT '原成功响应体JSON，重放时原样返回',

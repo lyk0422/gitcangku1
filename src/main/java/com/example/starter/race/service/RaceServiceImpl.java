@@ -15,7 +15,13 @@ import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.api.SubmitTimingRequest;
+import com.example.starter.race.api.WithdrawalListResponse;
+import com.example.starter.race.api.WithdrawalResponse;
+import com.example.starter.race.api.WithdrawRunnerRequest;
+import com.example.starter.race.api.RevokeWithdrawalRequest;
+import com.example.starter.race.api.RunnerStatusResponse;
 import com.example.starter.race.domain.CheckpointRules;
+import com.example.starter.race.domain.EntryStatus;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
@@ -30,6 +36,7 @@ import com.example.starter.race.persistence.SnapshotCheckpointRow;
 import com.example.starter.race.persistence.SnapshotEntryRow;
 import com.example.starter.race.persistence.SnapshotRow;
 import com.example.starter.race.persistence.RaceRepository;
+import com.example.starter.race.persistence.WithdrawalRow;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
@@ -136,6 +143,7 @@ public class RaceServiceImpl implements RaceService {
                 () -> {
                     RaceRow race = requireOpenRace(raceId, request.expectedVersion());
                     RunnerRow runner = requireRunner(raceId, request.bib());
+                    requireNotWithdrawn(runner);
                     validateFinishTime(request.finishTimeMs(), false);
                     // 修订后原始完赛耗时仍须严格大于该选手每一条已有分段耗时，否则分段不变量被破坏。
                     List<CheckpointTimingRow> runnerTimings =
@@ -173,7 +181,8 @@ public class RaceServiceImpl implements RaceService {
                         "expectedVersion", request.expectedVersion()),
                 () -> {
                     RaceRow race = requireOpenRace(raceId, request.expectedVersion());
-                    requireRunner(raceId, request.bib());
+                    RunnerRow penalizedRunner = requireRunner(raceId, request.bib());
+                    requireNotWithdrawn(penalizedRunner);
                     PenaltyType type = parsePenaltyType(request.type());
                     Long amountMs = request.amountMs();
                     if (type == PenaltyType.ADD_TIME) {
@@ -290,6 +299,7 @@ public class RaceServiceImpl implements RaceService {
 
                     RaceRow race = requireOpenRace(raceId, request.expectedVersion());
                     RunnerRow runner = requireRunner(raceId, bib);
+                    requireNotWithdrawn(runner);
                     CheckpointRow checkpoint = repository
                             .findCheckpoint(raceId, request.checkpointCode())
                             .orElseThrow(() -> new NotFoundException(
@@ -383,7 +393,8 @@ public class RaceServiceImpl implements RaceService {
                                 order,
                                 entry.checkpointCount(),
                                 entry.coveredCheckpointCount(),
-                                entry.missingCheckpoints()));
+                                entry.missingCheckpoints(),
+                                entry.lastCheckpointCode()));
                     }
                     // 在同一封榜事务内固化每名选手 × 每个检查点的明细，缺失行耗时为 null。
                     List<SnapshotCheckpointRow> snapshotCheckpoints =
@@ -394,6 +405,276 @@ public class RaceServiceImpl implements RaceService {
                             raceId, newVersion, RaceStatus.SEALED, now,
                             snapshotEntries.stream().map(ResponseMapper::toEntryResponse).toList()));
                 });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult withdrawRunner(String raceId, String bib, WithdrawRunnerRequest request) {
+        return withIdempotency(request.requestId(), "WITHDRAW_RUNNER",
+                orderedParams(
+                        "raceId", raceId,
+                        "bib", bib,
+                        "withdrawalKey", request.withdrawalKey(),
+                        "status", request.status(),
+                        "reason", request.reason(),
+                        "lastCheckpointCode", request.lastCheckpointCode(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    // withdrawalKey 是第二层全局幂等键：同键同参重放首次结果，异参409。
+                    // 同键重放不校验版本（幂等请求应原样返回首次结果）。
+                    WithdrawalRow existingByKey =
+                            repository.findWithdrawalByKey(request.withdrawalKey()).orElse(null);
+                    if (existingByKey != null) {
+                        return replayWithdrawalOrConflict(raceId, bib, request, existingByKey);
+                    }
+
+                    // 新键视为一次全新提交：先在赛事行锁上校验版本/封榜，
+                    // 因此并发同版本的重复登记只有一个能成功，其余随版本推进409。
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    RunnerRow runner = requireRunner(raceId, bib);
+                    EntryStatus withdrawalStatus = parseWithdrawalStatus(request.status());
+                    List<CheckpointTimingRow> timings =
+                            repository.findTimingsForRunner(raceId, bib);
+
+                    // 同键重放已在前面处理；到这里必是新键，选手已有生效退赛即冲突：
+                    // 无论同状态重复还是 DNS/DNF 相互改写，都不能产生第二条生效登记。
+                    WithdrawalRow active = findActiveWithdrawal(raceId, bib);
+                    if (active != null) {
+                        if (active.status() != withdrawalStatus) {
+                            throw new ConflictException(
+                                    "选手已登记 " + active.status() + " 退赛，不能改写为 "
+                                            + withdrawalStatus + ": " + bib);
+                        }
+                        throw new ConflictException(
+                                "选手已登记退赛，重复登记须携带同一 withdrawalKey: " + bib);
+                    }
+
+                    // 已取消资格或已有完赛计时的选手登记退赛返回409。
+                    if (hasActiveDisqualification(raceId, bib)) {
+                        throw new ConflictException("选手已被取消资格，不能登记退赛: " + bib);
+                    }
+                    if (runner.finishTimeMs() != null) {
+                        throw new ConflictException("选手已有完赛计时，不能登记退赛: " + bib);
+                    }
+
+                    String lastCheckpointCode = null;
+                    Integer lastCheckpointPosition = null;
+                    if (withdrawalStatus == EntryStatus.DNS) {
+                        if (request.lastCheckpointCode() != null
+                                && !request.lastCheckpointCode().isBlank()) {
+                            throw new BadRequestException("DNS 登记不得指定最后通过检查点");
+                        }
+                        if (!timings.isEmpty()) {
+                            throw new UnprocessableEntityException(
+                                    "DNS 要求选手尚无任何分段记录: " + bib);
+                        }
+                    } else {
+                        final String requestedCheckpoint = request.lastCheckpointCode();
+                        if (requestedCheckpoint == null || requestedCheckpoint.isBlank()) {
+                            throw new BadRequestException(
+                                    "DNF 登记必须指定最后通过的检查点");
+                        }
+                        if (timings.isEmpty()) {
+                            throw new UnprocessableEntityException(
+                                    "DNF 要求选手至少已有一条分段记录: " + bib);
+                        }
+                        CheckpointRow checkpoint = repository
+                                .findCheckpoint(raceId, requestedCheckpoint)
+                                .orElseThrow(() -> new NotFoundException(
+                                        "检查点不存在: " + requestedCheckpoint));
+                        CheckpointTimingRow maxTiming = timings.get(timings.size() - 1);
+                        // findTimingsForRunner 按 position 升序，末条即顺序最大的已有记录。
+                        if (!maxTiming.checkpointCode().equals(requestedCheckpoint)) {
+                            throw new UnprocessableEntityException(
+                                    "最后通过检查点必须是已有分段记录中顺序最大者: expected="
+                                            + maxTiming.checkpointCode() + ", actual="
+                                            + requestedCheckpoint);
+                        }
+                        lastCheckpointCode = requestedCheckpoint;
+                        lastCheckpointPosition = checkpoint.position();
+                    }
+
+                    bumpVersion(race, request.expectedVersion());
+                    long now = clock.millis();
+                    WithdrawalRow row = new WithdrawalRow(
+                            0L, request.withdrawalKey(), raceId, bib, withdrawalStatus,
+                            request.reason(), lastCheckpointCode, lastCheckpointPosition,
+                            false, now, null);
+                    try {
+                        repository.insertWithdrawal(row);
+                    } catch (DuplicateKeyException ex) {
+                        // 并发下唯一键兜底：同键走重放/异参冲突。
+                        WithdrawalRow concurrent =
+                                repository.findWithdrawalByKey(request.withdrawalKey())
+                                        .orElseThrow();
+                        return replayWithdrawalOrConflict(raceId, bib, request, concurrent);
+                    }
+                    WithdrawalRow saved =
+                            repository.findWithdrawalByKey(request.withdrawalKey()).orElseThrow();
+                    return ServiceResult.created(ResponseMapper.toWithdrawalResponse(saved));
+                });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult revokeWithdrawal(
+            String raceId, String bib, RevokeWithdrawalRequest request) {
+        return withIdempotency(request.requestId(), "REVOKE_WITHDRAWAL",
+                orderedParams(
+                        "raceId", raceId,
+                        "bib", bib,
+                        "withdrawalKey", request.withdrawalKey(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    WithdrawalRow existing = repository
+                            .findWithdrawalByKey(request.withdrawalKey())
+                            .orElseThrow(() -> new NotFoundException(
+                                    "退赛记录不存在: " + request.withdrawalKey()));
+                    if (!existing.raceId().equals(raceId) || !existing.bib().equals(bib)) {
+                        throw new NotFoundException(
+                                "退赛记录不属于该选手: " + request.withdrawalKey());
+                    }
+                    if (existing.revoked()) {
+                        // 撤销记录不可变，已撤销的退赛不能再次撤销。
+                        throw new ConflictException(
+                                "退赛已撤销，不能再次撤销: " + request.withdrawalKey());
+                    }
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    bumpVersion(race, request.expectedVersion());
+                    long now = clock.millis();
+                    int updated = repository.markWithdrawalRevoked(request.withdrawalKey(), now);
+                    if (updated == 0) {
+                        throw new ConflictException(
+                                "退赛已撤销或版本冲突: " + request.withdrawalKey());
+                    }
+                    WithdrawalRow refreshed =
+                            repository.findWithdrawalByKey(request.withdrawalKey()).orElseThrow();
+                    return ServiceResult.ok(ResponseMapper.toWithdrawalResponse(refreshed));
+                });
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public WithdrawalListResponse getWithdrawals(String raceId) {
+        RaceRow race = repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        List<WithdrawalResponse> withdrawals = repository.findWithdrawals(raceId).stream()
+                .map(ResponseMapper::toWithdrawalResponse)
+                .toList();
+        return new WithdrawalListResponse(raceId, race.version(), withdrawals);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public RunnerStatusResponse getRunnerStatus(String raceId, String bib) {
+        RaceRow race = repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        RunnerRow runner = repository.findRunner(raceId, bib)
+                .orElseThrow(() -> new NotFoundException("选手不存在: " + bib));
+        WithdrawalRow active = findActiveWithdrawal(raceId, bib);
+
+        if (race.status() == RaceStatus.SEALED) {
+            // 封榜后以一致快照为准：固化状态、最终名次、缺失检查点与最后通过检查点。
+            SnapshotRow snapshot = repository.findSnapshot(raceId)
+                    .orElseThrow(() -> new IllegalStateException(
+                            "赛事已封榜但缺少快照: " + raceId));
+            SnapshotEntryRow entry = snapshot.entries().stream()
+                    .filter(candidate -> candidate.bib().equals(bib))
+                    .findFirst()
+                    .orElseThrow(() -> new IllegalStateException(
+                            "封榜快照缺少选手条目: " + bib));
+            String lastPassed = snapshot.checkpoints().stream()
+                    .filter(detail -> detail.bib().equals(bib) && detail.elapsedMillis() != null)
+                    .max(java.util.Comparator.comparingInt(SnapshotCheckpointRow::position))
+                    .map(SnapshotCheckpointRow::checkpointCode)
+                    .orElse(null);
+            return new RunnerStatusResponse(
+                    bib, snapshot.version(), entry.status(), entry.rank(),
+                    entry.finishTimeMs(), lastPassed, entry.missingCheckpoints(),
+                    active == null ? null : ResponseMapper.toWithdrawalResponse(active));
+        }
+
+        // OPEN：实时计算该选手条目，并从分段记录派生最后通过检查点。
+        StandingResponse standing = ResponseMapper.liveStanding(
+                race,
+                repository.findRunners(raceId),
+                repository.findPenalties(raceId),
+                repository.findCheckpoints(raceId),
+                repository.findAllTimings(raceId));
+        var entry = standing.entries().stream()
+                .filter(candidate -> candidate.bib().equals(bib))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException("即时成绩缺少选手条目: " + bib));
+        List<CheckpointTimingRow> timings = repository.findTimingsForRunner(raceId, bib);
+        String lastPassed = timings.isEmpty()
+                ? null
+                : timings.get(timings.size() - 1).checkpointCode();
+        return new RunnerStatusResponse(
+                bib, race.version(), entry.status(), entry.rank(), runner.finishTimeMs(),
+                lastPassed, entry.missingCheckpoints(),
+                active == null ? null : ResponseMapper.toWithdrawalResponse(active));
+    }
+
+    private ServiceResult replayWithdrawalOrConflict(
+            String raceId,
+            String bib,
+            WithdrawRunnerRequest request,
+            WithdrawalRow existing) {
+        EntryStatus requestedStatus = parseWithdrawalStatus(request.status());
+        boolean sameParams = existing.raceId().equals(raceId)
+                && existing.bib().equals(bib)
+                && existing.status() == requestedStatus
+                && existing.reason().equals(request.reason())
+                && java.util.Objects.equals(
+                        existing.lastCheckpointCode(),
+                        blankToNull(request.lastCheckpointCode()));
+        if (!sameParams) {
+            throw new ConflictException(
+                    "withdrawalKey 已用于不同参数的退赛登记: " + request.withdrawalKey());
+        }
+        if (existing.revoked()) {
+            // 已撤销记录不可变，其键不能用于再次登记；如需重新退赛须使用新键。
+            throw new ConflictException(
+                    "withdrawalKey 对应的退赛已撤销，不能重复登记: "
+                            + request.withdrawalKey());
+        }
+        return ServiceResult.created(ResponseMapper.toWithdrawalResponse(existing));
+    }
+
+    private WithdrawalRow findActiveWithdrawal(String raceId, String bib) {
+        return repository.findWithdrawalsForRunner(raceId, bib).stream()
+                .filter(withdrawal -> !withdrawal.revoked())
+                .reduce((first, second) -> second)
+                .orElse(null);
+    }
+
+    private boolean hasActiveDisqualification(String raceId, String bib) {
+        return repository.findPenalties(raceId).stream()
+                .anyMatch(penalty -> penalty.bib().equals(bib)
+                        && !penalty.revoked()
+                        && penalty.type() == PenaltyType.DISQUALIFY);
+    }
+
+    private static String blankToNull(String value) {
+        return value == null || value.isBlank() ? null : value;
+    }
+
+    private static EntryStatus parseWithdrawalStatus(String status) {
+        if ("DNS".equals(status)) {
+            return EntryStatus.DNS;
+        }
+        if ("DNF".equals(status)) {
+            return EntryStatus.DNF;
+        }
+        throw new BadRequestException("未知退赛状态（仅支持 DNS/DNF）: " + status);
+    }
+
+    private static void requireNotWithdrawn(RunnerRow runner) {
+        if (runner.withdrawalStatus() != null) {
+            throw new ConflictException(
+                    "选手已登记 " + runner.withdrawalStatus() + " 退赛，记录只读: "
+                            + runner.bib());
+        }
     }
 
     @Override

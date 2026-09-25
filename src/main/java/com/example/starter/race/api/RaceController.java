@@ -10,6 +10,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+
 /**
  * 赛事计时处罚与成绩封榜 HTTP 接口。
  */
@@ -85,6 +86,38 @@ public class RaceController {
             @PathVariable String raceId,
             @Valid @RequestBody SealRaceRequest request) {
         return toResponse(raceService.sealRace(raceId, request));
+    }
+
+    /** 登记选手退赛（DNS 未出发 / DNF 中途退赛）。 */
+    @PostMapping("/{raceId}/runners/{bib}/withdrawal")
+    public ResponseEntity<Object> withdrawRunner(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody WithdrawRunnerRequest request) {
+        return toResponse(raceService.withdrawRunner(raceId, bib, request));
+    }
+
+    /** 撤销选手退赛（须携带登记时同一 withdrawalKey 与当前版本）。 */
+    @PostMapping("/{raceId}/runners/{bib}/withdrawal/revocation")
+    public ResponseEntity<Object> revokeWithdrawal(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody RevokeWithdrawalRequest request) {
+        return toResponse(raceService.revokeWithdrawal(raceId, bib, request));
+    }
+
+    /** 查询赛事退赛清单（含已撤销的不可变历史）。 */
+    @GetMapping("/{raceId}/withdrawals")
+    public WithdrawalListResponse getWithdrawals(@PathVariable String raceId) {
+        return raceService.getWithdrawals(raceId);
+    }
+
+    /** 查询单个选手当前参赛状态。 */
+    @GetMapping("/{raceId}/runners/{bib}/status")
+    public RunnerStatusResponse getRunnerStatus(
+            @PathVariable String raceId,
+            @PathVariable String bib) {
+        return raceService.getRunnerStatus(raceId, bib);
     }
 
     /** 查询即时成绩（封榜后返回只读快照内容）。 */

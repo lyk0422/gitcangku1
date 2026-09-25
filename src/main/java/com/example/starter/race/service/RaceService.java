@@ -3,14 +3,18 @@ package com.example.starter.race.service;
 import com.example.starter.race.api.AddPenaltyRequest;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
 import com.example.starter.race.api.CreateRaceRequest;
+import com.example.starter.race.api.MissingCheckpointsResponse;
 import com.example.starter.race.api.RegisterRunnerRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
-import com.example.starter.race.api.MissingCheckpointsResponse;
+import com.example.starter.race.api.RevokeWithdrawalRequest;
+import com.example.starter.race.api.RunnerStatusResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.api.SubmitTimingRequest;
+import com.example.starter.race.api.WithdrawalListResponse;
+import com.example.starter.race.api.WithdrawRunnerRequest;
 
 /**
  * 赛事成绩封榜应用服务；每个写方法在单个数据库事务内完成
@@ -47,6 +51,25 @@ public interface RaceService {
 
     /** 封榜：校验版本并原子保存只读成绩快照（含每名选手分段明细与缺失检查点）。 */
     ServiceResult sealRace(String raceId, SealRaceRequest request);
+
+    /**
+     * 退赛登记（DNS 未出发 / DNF 中途退赛）：校验选手前置状态与 DNF 最后检查点，
+     * 成功后赛事版本加一，既有分段保留只读。同状态同键幂等，异状态改写409。
+     */
+    ServiceResult withdrawRunner(String raceId, String bib, WithdrawRunnerRequest request);
+
+    /**
+     * 撤销退赛：须携带同一 withdrawalKey 与当前版本，撤销后选手回到
+     * UNTIMED 或 MISSING_CHECKPOINT；已撤销记录不可变、不能再次撤销。
+     */
+    ServiceResult revokeWithdrawal(
+            String raceId, String bib, RevokeWithdrawalRequest request);
+
+    /** 查询赛事退赛清单（含已撤销的不可变历史），按登记先后排列；只读。 */
+    WithdrawalListResponse getWithdrawals(String raceId);
+
+    /** 查询单个选手当前参赛状态、最后通过检查点、缺失检查点与生效退赛；只读。 */
+    RunnerStatusResponse getRunnerStatus(String raceId, String bib);
 
     /** 查询即时成绩（OPEN 实时计算；SEALED 返回封榜快照）。 */
     StandingResponse getResults(String raceId);

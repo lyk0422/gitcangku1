@@ -9,7 +9,7 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * 成绩排名纯逻辑：依据选手原始耗时、处罚列表与检查点覆盖情况计算榜单，
+ * 成绩排名纯逻辑：依据选手原始耗时、处罚列表、检查点覆盖情况与退赛状态计算榜单，
  * 不涉及数据库与时间。
  *
  * <p>规则：
@@ -20,7 +20,10 @@ import java.util.Set;
  *   <li>赛事配置了检查点时：已有完赛耗时但未覆盖全部检查点的选手状态
  *       MISSING_CHECKPOINT，不排名；全部覆盖后恢复加时与并列排名规则；
  *       未配置检查点的赛事沿用原排名规则；</li>
- *   <li>正常选手按总耗时升序，同耗时同名次，下一名次跳过并列人数（1、1、3）；</li>
+ *   <li>退赛状态（DNS 未出发、DNF 中途退赛）覆盖一切排名判定：
+ *       不参与排名、不占名次，并单独成组列在榜单末尾（组内按参赛号字典序）；</li>
+ *   <li>正常选手按总耗时升序，同耗时同名次，下一名次跳过并列人数（1、1、3），
+ *       名次只在剩余选手上从1连续编号；</li>
  *   <li>并列者及未排名者内部均按参赛号字典序展示。</li>
  * </ul>
  */
@@ -39,7 +42,7 @@ public final class ResultCalculator {
     /**
      * 计算即时成绩。
      *
-     * @param runnerView  全部选手视图（参赛号、原始完赛耗时）
+     * @param runnerView  全部选手视图（参赛号、原始完赛耗时、生效退赛状态）
      * @param penalties   全部处罚（含已撤销）
      * @param checkpoints 赛事检查点配置（按 position 排序后使用）；为空表示赛事未配置检查点
      * @param timings     全部选手的分段通过记录
@@ -58,7 +61,7 @@ public final class ResultCalculator {
         Map<String, Aggregate> aggregates = new LinkedHashMap<>();
         for (RunnerView runner : runnerView) {
             aggregates.put(runner.bib(),
-                    new Aggregate(runner.bib(), runner.finishTimeMs(), orderedCheckpoints));
+                    new Aggregate(runner, orderedCheckpoints));
         }
 
         // 仅统计属于已配置检查点的分段（数据库外键已保证，这里做防御性过滤）。
@@ -88,8 +91,15 @@ public final class ResultCalculator {
 
         List<Aggregate> ranked = new ArrayList<>();
         List<Aggregate> others = new ArrayList<>();
+        List<Aggregate> withdrawals = new ArrayList<>();
         for (Aggregate aggregate : aggregates.values()) {
-            if (aggregate.disqualified) {
+            EntryStatus withdrawalStatus = aggregate.runner.withdrawalStatus();
+            if (withdrawalStatus == EntryStatus.DNS
+                    || withdrawalStatus == EntryStatus.DNF) {
+                // 退赛判定优先：即使存在处罚或计时残留，也不参与排名，单独成组。
+                aggregate.status = withdrawalStatus;
+                withdrawals.add(aggregate);
+            } else if (aggregate.disqualified) {
                 aggregate.status = EntryStatus.DISQUALIFIED;
                 others.add(aggregate);
             } else if (aggregate.finishTimeMs == null) {
@@ -109,6 +119,8 @@ public final class ResultCalculator {
                 .comparingLong((Aggregate a) -> a.totalTimeMs)
                 .thenComparing(a -> a.bib));
         others.sort(Comparator.comparing(a -> a.bib));
+        // 退赛选手单独列出：组内按参赛号字典序稳定展示，不占名次。
+        withdrawals.sort(Comparator.comparing(a -> a.bib));
 
         int index = 0;
         while (index < ranked.size()) {
@@ -131,14 +143,27 @@ public final class ResultCalculator {
         for (Aggregate aggregate : others) {
             entries.add(aggregate.toEntry());
         }
+        for (Aggregate aggregate : withdrawals) {
+            entries.add(aggregate.toEntry());
+        }
         return entries;
     }
 
-    /** 选手视图：参赛号与原始完赛耗时（null 表示计时缺失）。 */
+    /** 选手视图：参赛号、原始完赛耗时与生效退赛状态（null 表示未退赛）。 */
     public interface RunnerView {
         String bib();
 
         Long finishTimeMs();
+
+        /** 生效中的退赛状态（DNS/DNF）；未退赛或退赛已撤销时返回 null。 */
+        default EntryStatus withdrawalStatus() {
+            return null;
+        }
+
+        /** 退赛登记时固化的最后通过检查点代码；非 DNF 退赛返回 null。 */
+        default String lastCheckpointCode() {
+            return null;
+        }
     }
 
     /** 处罚视图。 */
@@ -154,6 +179,7 @@ public final class ResultCalculator {
 
     /** 单选手聚合中间态。 */
     private static final class Aggregate {
+        private final RunnerView runner;
         private final String bib;
         private final Long finishTimeMs;
         private final List<CheckpointView> checkpoints;
@@ -164,9 +190,10 @@ public final class ResultCalculator {
         private int rank;
         private long totalTimeMs;
 
-        private Aggregate(String bib, Long finishTimeMs, List<CheckpointView> checkpoints) {
-            this.bib = bib;
-            this.finishTimeMs = finishTimeMs;
+        private Aggregate(RunnerView runner, List<CheckpointView> checkpoints) {
+            this.runner = runner;
+            this.bib = runner.bib();
+            this.finishTimeMs = runner.finishTimeMs();
             this.checkpoints = checkpoints;
         }
 
@@ -181,6 +208,7 @@ public final class ResultCalculator {
         }
 
         private ResultEntry toEntry() {
+            boolean withdrawn = status == EntryStatus.DNS || status == EntryStatus.DNF;
             return new ResultEntry(
                     bib,
                     status == EntryStatus.RANKED ? rank : null,
@@ -190,7 +218,8 @@ public final class ResultCalculator {
                     status == EntryStatus.RANKED ? totalTimeMs : null,
                     checkpoints.size(),
                     coveredCodes.size(),
-                    missingCheckpoints());
+                    missingCheckpoints(),
+                    withdrawn ? runner.lastCheckpointCode() : null);
         }
     }
 }

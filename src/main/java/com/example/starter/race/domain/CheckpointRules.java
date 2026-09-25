@@ -8,7 +8,8 @@ import java.util.List;
  * <p>规则（违反任一则提交被拒绝，不写入）：
  * <ul>
  *   <li>elapsedMillis 取值 1~86400000；</li>
- *   <li>elapsedMillis 必须严格小于该选手已有原始完赛耗时（无完赛耗时也拒绝）；</li>
+ *   <li>选手已有原始完赛耗时时，elapsedMillis 必须严格小于该耗时；
+ *       尚无完赛耗时（途中计时，可能随后 DNF 退赛）时不做该约束；</li>
  *   <li>同一选手同一检查点最多一条；</li>
  *   <li>允许乱序到达，但按检查点顺序查看时耗时必须严格递增：
  *       新记录必须严格大于已存在的最近前序检查点耗时，
@@ -29,7 +30,7 @@ public final class CheckpointRules {
      * @param existingForRunner 该选手已存在的全部分段记录（任意顺序）
      * @param targetPosition    本次提交检查点的顺序
      * @param elapsedMillis     本次提交的累计耗时
-     * @param finishTimeMs      该选手已有原始完赛耗时；null 表示尚无完赛计时
+     * @param finishTimeMs      该选手已有原始完赛耗时；null 表示尚无完赛计时（途中）
      * @return 违反不变量时的错误信息；合法时为 null
      */
     public static String validate(
@@ -40,10 +41,7 @@ public final class CheckpointRules {
         if (elapsedMillis < 1L || elapsedMillis > MAX_ELAPSED_MILLIS) {
             return "分段耗时毫秒数必须在 1~86400000 之间";
         }
-        if (finishTimeMs == null) {
-            return "选手尚无原始完赛耗时，不能提交分段记录";
-        }
-        if (elapsedMillis >= finishTimeMs) {
+        if (finishTimeMs != null && elapsedMillis >= finishTimeMs) {
             return "分段耗时必须严格小于该选手原始完赛耗时";
         }
 

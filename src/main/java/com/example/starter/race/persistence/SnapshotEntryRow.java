@@ -18,6 +18,7 @@ import java.util.List;
  * @param checkpointCount           赛事检查点总数；未配置检查点为 0
  * @param coveredCheckpointCount    该选手已覆盖检查点数量
  * @param missingCheckpoints        缺失检查点代码，按检查点顺序排列；无缺失时为空列表
+ * @param lastCheckpointCode        退赛选手最后通过检查点代码（DNF 指定者）；DNS 或非退赛状态为 null
  */
 public record SnapshotEntryRow(
         String raceId,
@@ -30,10 +31,28 @@ public record SnapshotEntryRow(
         int displayOrder,
         int checkpointCount,
         int coveredCheckpointCount,
-        List<String> missingCheckpoints
+        List<String> missingCheckpoints,
+        String lastCheckpointCode
 ) {
 
-    /** 兼容旧调用的构造器：检查点计数为 0、缺失列表为空。 */
+    /** 不含退赛信息的兼容构造器：最后通过检查点为 null。 */
+    public SnapshotEntryRow(
+            String raceId,
+            String bib,
+            Integer rank,
+            EntryStatus status,
+            Long finishTimeMs,
+            long penaltyMs,
+            Long totalTimeMs,
+            int displayOrder,
+            int checkpointCount,
+            int coveredCheckpointCount,
+            List<String> missingCheckpoints) {
+        this(raceId, bib, rank, status, finishTimeMs, penaltyMs, totalTimeMs, displayOrder,
+                checkpointCount, coveredCheckpointCount, missingCheckpoints, null);
+    }
+
+    /** 兼容旧调用的构造器：检查点计数为 0、缺失列表与最后检查点为空。 */
     public SnapshotEntryRow(
             String raceId,
             String bib,
@@ -44,6 +63,6 @@ public record SnapshotEntryRow(
             Long totalTimeMs,
             int displayOrder) {
         this(raceId, bib, rank, status, finishTimeMs, penaltyMs, totalTimeMs, displayOrder,
-                0, 0, List.of());
+                0, 0, List.of(), null);
     }
 }

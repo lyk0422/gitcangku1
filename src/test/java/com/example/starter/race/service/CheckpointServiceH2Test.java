@@ -184,13 +184,19 @@ class CheckpointServiceH2Test extends AbstractRaceH2Test {
     }
 
     @Test
-    void 无完赛耗时选手提交分段返回422() {
+    void 无完赛耗时选手可提交途中分段且状态为UNTIMED() {
         createRace();
         registerRunner("u", null, 1, "req-u"); // UNTIMED
         configure(2, "req-cfg", "c1", "1");
-        assertThatThrownBy(() -> submit("u", "t-x", "c1", 100L, 3, "req-tx"))
-                .isInstanceOf(UnprocessableEntityException.class)
-                .hasMessageContaining("完赛耗时");
+        // 途中计时（尚无完赛耗时，可能随后 DNF）允许提交
+        submit("u", "t-x", "c1", 100L, 3, "req-tx");
+        RunnerTimingResponse timing = raceService.getRunnerTimings(RACE, "u");
+        assertThat(timing.checkpoints()).hasSize(1);
+        assertThat(timing.checkpoints().getFirst().elapsedMillis()).isEqualTo(100L);
+        assertThat(timing.finishTimeMs()).isNull();
+        StandingResponse standing = raceService.getResults(RACE);
+        assertThat(standing.entries().getFirst().status()).isEqualTo(EntryStatus.UNTIMED);
+        assertThat(standing.entries().getFirst().rank()).isNull();
     }
 
     @Test

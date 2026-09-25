@@ -10,13 +10,14 @@ import java.util.List;
  *
  * @param bib                    参赛号
  * @param rank                   名次（并列同名次并跳号）；非 RANKED 为 null
- * @param status                RANKED / UNTIMED / MISSING_CHECKPOINT / DISQUALIFIED
+ * @param status                RANKED / UNTIMED / MISSING_CHECKPOINT / DISQUALIFIED / DNS / DNF
  * @param finishTimeMs          原始完赛耗时毫秒；计时缺失为 null
  * @param penaltyMs             生效加时合计毫秒数
  * @param totalTimeMs           总耗时毫秒；未排名为 null
  * @param checkpointCount       赛事检查点总数；未配置检查点为 0
  * @param coveredCheckpointCount 该选手已覆盖检查点数量
  * @param missingCheckpoints    缺失检查点代码，按检查点顺序排列；无缺失为空列表
+ * @param lastCheckpointCode    退赛选手最后通过检查点代码（DNF 登记时指定）；DNS 或非退赛状态为 null
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public record ResultEntryResponse(
@@ -28,6 +29,7 @@ public record ResultEntryResponse(
         Long totalTimeMs,
         int checkpointCount,
         int coveredCheckpointCount,
-        List<String> missingCheckpoints
+        List<String> missingCheckpoints,
+        String lastCheckpointCode
 ) {
 }

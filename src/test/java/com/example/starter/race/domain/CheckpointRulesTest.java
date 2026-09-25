@@ -76,8 +76,9 @@ class CheckpointRulesTest {
     }
 
     @Test
-    void 尚无完赛耗时或耗时越界被拒绝() {
-        assertThat(CheckpointRules.validate(List.of(), 1, 100L, null)).isNotNull();
+    void 尚无完赛耗时的途中计时允许提交但耗时越界仍被拒绝() {
+        // 途中分段（尚未完赛计时，可能随后 DNF）允许提交
+        assertThat(CheckpointRules.validate(List.of(), 1, 100L, null)).isNull();
         assertThat(CheckpointRules.validate(List.of(), 1, 0L, 1000L)).isNotNull();
         assertThat(CheckpointRules.validate(List.of(), 1, 86_400_001L, 86_400_000L)).isNotNull();
         assertThat(CheckpointRules.validate(List.of(), 1, 500L, 499L)).isNotNull();
