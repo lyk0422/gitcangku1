@@ -3,19 +3,34 @@ CREATE TABLE IF NOT EXISTS consent_grant (
     subject_key VARCHAR(128) NOT NULL COMMENT '主体标识（合成字符串）',
     purpose VARCHAR(32) NOT NULL COMMENT '用途：RESEARCH 研究 / PERSONALIZATION 个性化',
     epoch INT NOT NULL COMMENT '授权代次，从 1 开始递增',
-    status VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE 有效 / REVOKED 已撤回',
+    status VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE 有效 / REVOKED 已整体撤回',
     request_id VARCHAR(128) NOT NULL COMMENT '创建本代授权的幂等请求标识',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间（服务器时区 Asia/Shanghai）',
-    revoked_at TIMESTAMP NULL DEFAULT NULL COMMENT '撤回时间（服务器时区 Asia/Shanghai），未撤回为 NULL',
+    revoked_at TIMESTAMP NULL DEFAULT NULL COMMENT '整体撤回时间（服务器时区 Asia/Shanghai），未撤回为 NULL',
     PRIMARY KEY (subject_key, purpose, epoch)
 ) COMMENT = '授权代次表';
+
+-- 授权子范围表：子范围仅是同一 epoch 内的逻辑分区，不产生新 epoch；同一 epoch 内 scope_key 唯一
+CREATE TABLE IF NOT EXISTS consent_scope (
+    subject_key VARCHAR(128) NOT NULL COMMENT '主体标识（合成字符串）',
+    purpose VARCHAR(32) NOT NULL COMMENT '用途：RESEARCH 研究 / PERSONALIZATION 个性化',
+    epoch INT NOT NULL COMMENT '子范围所属授权代次，新 epoch 下同名 scope_key 为全新子范围',
+    scope_key VARCHAR(128) NOT NULL COMMENT '子范围标识，同一代次内唯一；默认子范围不落表，由 scope_key 为 NULL 表示',
+    label VARCHAR(256) NOT NULL COMMENT '子范围非空标签，创建时提交，同一 scope_key 不可变更',
+    status VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE 有效 / REVOKED 已独立撤回',
+    request_id VARCHAR(128) NOT NULL COMMENT '创建本子范围的幂等请求标识',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间（服务器时区 Asia/Shanghai）',
+    revoked_at TIMESTAMP NULL DEFAULT NULL COMMENT '独立撤回时间（服务器时区 Asia/Shanghai），未撤回为 NULL',
+    PRIMARY KEY (subject_key, purpose, epoch, scope_key)
+) COMMENT = '授权子范围表';
 
 -- 授权记录表：仅当前有效代次可写入和查询，撤回后保留数据但不可见
 CREATE TABLE IF NOT EXISTS consent_record (
     subject_key VARCHAR(128) NOT NULL COMMENT '主体标识（合成字符串）',
     purpose VARCHAR(32) NOT NULL COMMENT '用途：RESEARCH 研究 / PERSONALIZATION 个性化',
     epoch INT NOT NULL COMMENT '记录所属授权代次',
-    record_key VARCHAR(128) NOT NULL COMMENT '记录键，同一代内唯一',
+    scope_key VARCHAR(128) NULL DEFAULT NULL COMMENT '所属子范围标识；NULL 表示默认子范围，非空时须命中 consent_scope',
+    record_key VARCHAR(128) NOT NULL COMMENT '记录键，同一代内唯一（不区分子范围）',
     payload TEXT NOT NULL COMMENT '记录内容（合成字符串）',
     request_id VARCHAR(128) NOT NULL COMMENT '写入本记录的幂等请求标识',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间（服务器时区 Asia/Shanghai）',
@@ -25,7 +40,7 @@ CREATE TABLE IF NOT EXISTS consent_record (
 -- 幂等请求表：成功结果与业务变更同事务保存，失败请求不占用 requestId
 CREATE TABLE IF NOT EXISTS idempotency_request (
     request_id VARCHAR(128) NOT NULL COMMENT '幂等请求标识',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：GRANT 授权 / WRITE 写入 / REVOKE 撤回',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：GRANT 授权 / SCOPE_CREATE 子范围创建 / WRITE 写入 / SCOPE_REVOKE 子范围撤回 / REVOKE 整体撤回',
     params_fingerprint VARCHAR(512) NOT NULL COMMENT '规范化参数指纹，用于检测同 requestId 参数变更',
     response_body TEXT NOT NULL COMMENT '成功响应快照（JSON）',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间（服务器时区 Asia/Shanghai）',
