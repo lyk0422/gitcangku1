@@ -6,9 +6,11 @@ import java.util.List;
 import com.example.starter.calibration.api.dto.CertificateResponse;
 import com.example.starter.calibration.api.dto.MeasurementResponse;
 import com.example.starter.calibration.api.dto.ReleaseRecordResponse;
+import com.example.starter.calibration.api.dto.ReviewResponse;
 import com.example.starter.calibration.model.Certificate;
 import com.example.starter.calibration.model.Measurement;
 import com.example.starter.calibration.model.MeasurementStatus;
+import com.example.starter.calibration.model.PeerReview;
 import com.example.starter.calibration.model.ReleaseRecord;
 
 /**
@@ -47,6 +49,7 @@ final class DtoMapper {
         return new MeasurementResponse(
                 m.id(),
                 m.measurementKey(),
+                m.version(),
                 m.instrumentId(),
                 m.measuredAt(),
                 format(m.rawReading()),
@@ -65,5 +68,19 @@ final class DtoMapper {
 
     static ReleaseRecordResponse toResponse(ReleaseRecord record) {
         return new ReleaseRecordResponse(record.batchId(), record.releasedBy(), record.releasedAt());
+    }
+
+    static ReviewResponse toResponse(PeerReview review) {
+        return new ReviewResponse(
+                review.id(),
+                review.reviewKey(),
+                review.measurementKey(),
+                review.version(),
+                review.certificateId(),
+                review.conclusion().name(),
+                review.state().name(),
+                review.reviewer(),
+                review.comment(),
+                review.createdAt());
     }
 }

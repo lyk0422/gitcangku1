@@ -43,8 +43,11 @@ class ConcurrencyApiTest {
 
     @BeforeEach
     void clean() {
+        jdbc.update("DELETE FROM review_request");
+        jdbc.update("DELETE FROM peer_review");
         jdbc.update("DELETE FROM release_record");
         jdbc.update("DELETE FROM measurement");
+        jdbc.update("DELETE FROM measurement_head");
         jdbc.update("DELETE FROM calibration_certificate");
         jdbc.update("DELETE FROM instrument_lock");
     }
@@ -102,6 +105,16 @@ class ConcurrencyApiTest {
                             {"measurementKey":"M-%d","instrumentId":"INS-R%d",
                              "measuredAt":"2026-06-01T00:00:00Z","reading":"1",
                              "lowerLimit":"0","upperLimit":"9","submittedBy":"alice"}""".formatted(r, r)))
+                    .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isCreated());
+
+            // 放行前需具备有效 PASS 同行复核（复核人 dave 不同于提交人 alice）
+            mvc.perform(post("/api/reviews")
+                            .header("X-Actor-Id", "dave")
+                            .header("X-Request-Id", "REQ-REV-" + r)
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content("""
+                                    {"measurementKey":"M-%d","reviewKey":"RV-M-%d","version":1,
+                                     "conclusion":"PASS","comment":"ok"}""".formatted(r, r)))
                     .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isCreated());
 
             ExecutorService pool = Executors.newFixedThreadPool(2);
@@ -164,6 +177,14 @@ class ConcurrencyApiTest {
                         {"measurementKey":"M-D","instrumentId":"INS-D",
                          "measuredAt":"2026-06-01T00:00:00Z","reading":"1",
                          "lowerLimit":"0","upperLimit":"9","submittedBy":"alice"}"""))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isCreated());
+        mvc.perform(post("/api/reviews")
+                        .header("X-Actor-Id", "dave")
+                        .header("X-Request-Id", "REQ-REV-D")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"measurementKey":"M-D","reviewKey":"RV-M-D","version":1,
+                                 "conclusion":"PASS","comment":"ok"}"""))
                 .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isCreated());
 
         int threads = 6;

@@ -16,12 +16,13 @@ import org.springframework.web.bind.annotation.RestController;
 import com.example.starter.calibration.api.dto.MeasurementResponse;
 import com.example.starter.calibration.api.dto.ReleaseRequest;
 import com.example.starter.calibration.api.dto.ReleaseResponse;
+import com.example.starter.calibration.api.dto.ReviseMeasurementRequest;
 import com.example.starter.calibration.api.dto.SubmitMeasurementRequest;
 import com.example.starter.calibration.service.MeasurementService;
 import com.example.starter.calibration.service.ReleaseService;
 
 /**
- * 测量接口：提交、批量放行、历史明细、当前可用结果查询。
+ * 测量接口：提交、修订、单条/批量放行、历史明细、当前可用结果查询。
  */
 @RestController
 @RequestMapping("/api/measurements")
@@ -44,6 +45,25 @@ public class MeasurementController {
     }
 
     /**
+     * 修订测量：仅待修订（RETURNED）状态可修订，产生新版本；200；不可修订 409；不存在 404。
+     */
+    @PostMapping("/{key}/revise")
+    public MeasurementResponse revise(@PathVariable String key,
+                                      @RequestBody ReviseMeasurementRequest request) {
+        return measurements.revise(key, request);
+    }
+
+    /**
+     * 单条放行：须同时满足既有判定条件与当前版本有效 PASS 复核；
+     * 门禁不满足 422 并说明原因；已放行 409；不存在 404。
+     */
+    @PostMapping("/{key}/release")
+    public ReleaseResponse releaseOne(@PathVariable String key,
+                                      @RequestHeader("X-Actor-Id") String actor) {
+        return releases.releaseOne(key, actor);
+    }
+
+    /**
      * 批量放行（1～50 条，原子）：200；批次非法 400；任一项不满足条件整批拒绝 409 并返回各项原因。
      * 放行人通过 X-Actor-Id 请求头提供。
      */
@@ -54,7 +74,7 @@ public class MeasurementController {
     }
 
     /**
-     * 当前可用结果：已放行且证书未撤销；可按仪器过滤。
+     * 当前可用结果：当前版本已放行且证书未撤销；可按仪器过滤。
      */
     @GetMapping("/usable")
     public List<MeasurementResponse> usable(@RequestParam(required = false) String instrumentId) {
@@ -62,7 +82,7 @@ public class MeasurementController {
     }
 
     /**
-     * 历史明细：原始测量、计算值、显示值与放行历史；不存在 404。
+     * 历史明细：当前版本的原始测量、计算值、显示值与放行历史；不存在 404。
      */
     @GetMapping("/{key}")
     public MeasurementResponse detail(@PathVariable String key) {

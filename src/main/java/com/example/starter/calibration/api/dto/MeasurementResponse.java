@@ -9,6 +9,7 @@ import java.util.List;
  *
  * @param id             测量记录 ID
  * @param measurementKey 业务测量键
+ * @param version        当前版本号，从 1 开始
  * @param instrumentId   仪器 ID
  * @param measuredAt     测量时刻（UTC）
  * @param reading        原始读数（十进制字符串）
@@ -27,6 +28,7 @@ import java.util.List;
 public record MeasurementResponse(
         long id,
         String measurementKey,
+        int version,
         String instrumentId,
         Instant measuredAt,
         String reading,
