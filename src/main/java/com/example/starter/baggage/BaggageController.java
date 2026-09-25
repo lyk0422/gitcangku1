@@ -14,9 +14,16 @@ import org.springframework.web.bind.annotation.RestController;
 import com.example.starter.baggage.BaggageDtos.ArriveRequest;
 import com.example.starter.baggage.BaggageDtos.ArriveResponse;
 import com.example.starter.baggage.BaggageDtos.BagResponse;
+import com.example.starter.baggage.BaggageDtos.CustomsCheckRequest;
+import com.example.starter.baggage.BaggageDtos.CustomsCheckResponse;
+import com.example.starter.baggage.BaggageDtos.DepartRequest;
+import com.example.starter.baggage.BaggageDtos.DepartResponse;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveRequest;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveResponse;
+import com.example.starter.baggage.BaggageDtos.HoldImpactResponse;
+import com.example.starter.baggage.BaggageDtos.InspectionChainResponse;
 import com.example.starter.baggage.BaggageDtos.LegDifferenceResponse;
+import com.example.starter.baggage.BaggageDtos.LegGateResponse;
 import com.example.starter.baggage.BaggageDtos.LegResponse;
 import com.example.starter.baggage.BaggageDtos.LoadRequest;
 import com.example.starter.baggage.BaggageDtos.LoadResponse;
@@ -25,6 +32,8 @@ import com.example.starter.baggage.BaggageDtos.RecoverRequest;
 import com.example.starter.baggage.BaggageDtos.RecoverResponse;
 import com.example.starter.baggage.BaggageDtos.RegisterBagRequest;
 import com.example.starter.baggage.BaggageDtos.RegisterLegRequest;
+import com.example.starter.baggage.BaggageDtos.RerouteRequest;
+import com.example.starter.baggage.BaggageDtos.RerouteResponse;
 import com.example.starter.baggage.BaggageDtos.SealRequest;
 import com.example.starter.baggage.BaggageDtos.SealResponse;
 import com.example.starter.baggage.BaggageDtos.ShortListResponse;
@@ -37,9 +46,11 @@ import com.example.starter.baggage.BaggageDtos.ShortListResponse;
 public class BaggageController {
 
     private final BaggageService baggageService;
+    private final CustomsService customsService;
 
-    public BaggageController(BaggageService baggageService) {
+    public BaggageController(BaggageService baggageService, CustomsService customsService) {
         this.baggageService = baggageService;
+        this.customsService = customsService;
     }
 
     /** 登记航段。 */
@@ -107,5 +118,41 @@ public class BaggageController {
     @GetMapping("/bags/short-unloaded")
     public ShortListResponse listShortUnloaded() {
         return baggageService.listShortUnloaded();
+    }
+
+    /** 登记行李海关检查终态（放行/拦截），同检查版本唯一终态，拦截原因必填。 */
+    @PostMapping("/customs/checks")
+    public CustomsCheckResponse registerCustomsCheck(@Valid @RequestBody CustomsCheckRequest request) {
+        return customsService.registerCheck(request);
+    }
+
+    /** 行李检查链与当前各航段持续门禁查询。 */
+    @GetMapping("/bags/{bagTag}/customs-chain")
+    public InspectionChainResponse getCustomsChain(@PathVariable String bagTag) {
+        return customsService.getChain(bagTag);
+    }
+
+    /** 航段门禁查询：返回该航段上各行李的放行/拦截门禁。 */
+    @GetMapping("/legs/{legId}/gates")
+    public LegGateResponse getLegGates(@PathVariable String legId) {
+        return customsService.getLegGates(legId);
+    }
+
+    /** 拦截影响查询：返回行李当前仍生效的 CUSTOMS_HOLD 门禁及只读快照。 */
+    @GetMapping("/bags/{bagTag}/hold-impact")
+    public HoldImpactResponse getHoldImpact(@PathVariable String bagTag) {
+        return customsService.getHoldImpact(bagTag);
+    }
+
+    /** 起飞：航段封舱后起飞，机上所有行李目的国门禁放行才可起飞。 */
+    @PostMapping("/legs/{legId}/depart")
+    public DepartResponse depart(@PathVariable String legId, @Valid @RequestBody DepartRequest request) {
+        return baggageService.depart(legId, request);
+    }
+
+    /** 改派：以新的有序航段替换行李未乘坐的后续行程。 */
+    @PostMapping("/bags/reroute")
+    public RerouteResponse reroute(@Valid @RequestBody RerouteRequest request) {
+        return baggageService.reroute(request);
     }
 }
