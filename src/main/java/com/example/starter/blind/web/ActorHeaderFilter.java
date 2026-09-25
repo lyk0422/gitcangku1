@@ -57,7 +57,8 @@ public class ActorHeaderFilter extends OncePerRequestFilter {
             try {
                 role = Role.valueOf(roleHeader.trim());
             } catch (IllegalArgumentException e) {
-                writeError(response, HttpServletResponse.SC_UNAUTHORIZED, "X-Role 仅允许 COORDINATOR 或 REVIEWER");
+                writeError(response, HttpServletResponse.SC_UNAUTHORIZED,
+                        "X-Role 仅允许 COORDINATOR、REVIEWER 或 UNBLINDED_MANAGER");
                 return;
             }
             actorContext.set(new Actor(actorId.trim(), role));

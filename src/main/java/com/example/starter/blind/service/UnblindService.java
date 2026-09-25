@@ -2,11 +2,14 @@ package com.example.starter.blind.service;
 
 import com.example.starter.blind.ApiException;
 import com.example.starter.blind.Clock;
+import com.example.starter.blind.SiteStatus;
 import com.example.starter.blind.dto.UnblindRequestView;
 import com.example.starter.blind.dto.UnblindResultView;
 import com.example.starter.blind.repo.AllocationRepository.AllocationRow;
 import com.example.starter.blind.repo.ExperimentRepository.SeatRow;
 import com.example.starter.blind.repo.ExperimentRepository;
+import com.example.starter.blind.repo.SiteRepository;
+import com.example.starter.blind.repo.SiteRepository.SiteRow;
 import com.example.starter.blind.repo.UnblindRequestRepository;
 import com.example.starter.blind.repo.UnblindRequestRepository.UnblindRequestRow;
 import org.springframework.dao.DuplicateKeyException;
@@ -27,15 +30,18 @@ public class UnblindService {
     private final UnblindRequestRepository unblindRequestRepository;
     private final ExperimentService experimentService;
     private final ExperimentRepository experimentRepository;
+    private final SiteRepository siteRepository;
     private final Clock clock;
 
     public UnblindService(UnblindRequestRepository unblindRequestRepository,
                           ExperimentService experimentService,
                           ExperimentRepository experimentRepository,
+                          SiteRepository siteRepository,
                           Clock clock) {
         this.unblindRequestRepository = unblindRequestRepository;
         this.experimentService = experimentService;
         this.experimentRepository = experimentRepository;
+        this.siteRepository = siteRepository;
         this.clock = clock;
     }
 
@@ -53,6 +59,14 @@ public class UnblindService {
         }
         AllocationRow allocation =
                 experimentService.mustFindAllocationRow(experimentId, participantId);
+        if (allocation.siteCode() != null) {
+            // 中心名下分配：与中心关闭按中心行锁串行，按事务提交顺序裁决；
+            // 暂停不改变揭盲权限，关闭后不再接受新的揭盲申请。
+            SiteRow site = siteRepository.lock(experimentId, allocation.siteCode());
+            if (site != null && SiteStatus.CLOSED.name().equals(site.status())) {
+                throw ApiException.conflict("中心已关闭，不再接受新的揭盲申请");
+            }
+        }
         UnblindRequestRow pending =
                 unblindRequestRepository.findPendingByAllocation(allocation.id());
         if (pending != null) {

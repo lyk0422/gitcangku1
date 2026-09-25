@@ -17,6 +17,7 @@ public class AllocationRepository {
     public record AllocationRow(
             long id,
             String experimentId,
+            String siteCode,
             String participantId,
             int blockNo,
             int seatNo,
@@ -30,6 +31,7 @@ public class AllocationRepository {
     private static final RowMapper<AllocationRow> ALLOCATION_MAPPER = (rs, n) -> new AllocationRow(
             rs.getLong("id"),
             rs.getString("experiment_id"),
+            rs.getString("site_code"),
             rs.getString("participant_id"),
             rs.getInt("block_no"),
             rs.getInt("seat_no"),
@@ -47,17 +49,18 @@ public class AllocationRepository {
 
     public void insert(AllocationRow row) {
         jdbc.update("INSERT INTO allocation ("
-                        + "experiment_id, participant_id, block_no, seat_no, blind_code, "
+                        + "experiment_id, site_code, participant_id, block_no, seat_no, blind_code, "
                         + "status, assigned_actor, assigned_at, withdrawn_at"
-                        + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                row.experimentId(), row.participantId(), row.blockNo(), row.seatNo(), row.blindCode(),
+                        + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                row.experimentId(), row.siteCode(), row.participantId(),
+                row.blockNo(), row.seatNo(), row.blindCode(),
                 row.status(), row.assignedActor(), row.assignedAt(), row.withdrawnAt());
     }
 
     public AllocationRow findByExperimentAndParticipant(String experimentId, String participantId) {
         List<AllocationRow> rows = jdbc.query(
-                "SELECT id, experiment_id, participant_id, block_no, seat_no, blind_code, status, "
-                        + "assigned_actor, assigned_at, withdrawn_at "
+                "SELECT id, experiment_id, site_code, participant_id, block_no, seat_no, "
+                        + "blind_code, status, assigned_actor, assigned_at, withdrawn_at "
                         + "FROM allocation WHERE experiment_id = ? AND participant_id = ?",
                 ALLOCATION_MAPPER, experimentId, participantId);
         return rows.isEmpty() ? null : rows.get(0);

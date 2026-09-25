@@ -34,6 +34,7 @@ COMMENT ON COLUMN seat.treatment IS '处理代码 A 或 B，盲底，仅揭盲�
 CREATE TABLE IF NOT EXISTS allocation (
     id             BIGINT       NOT NULL AUTO_INCREMENT,
     experiment_id  VARCHAR(64)  NOT NULL,
+    site_code      VARCHAR(64),
     participant_id VARCHAR(64)  NOT NULL,
     block_no       INT          NOT NULL,
     seat_no        INT          NOT NULL,
@@ -48,9 +49,10 @@ CREATE TABLE IF NOT EXISTS allocation (
     CONSTRAINT uq_allocation_blind_code UNIQUE (blind_code),
     CONSTRAINT ck_allocation_status CHECK (status IN ('ASSIGNED', 'WITHDRAWN'))
 );
-COMMENT ON TABLE  allocation IS '参与者分配表；同实验同参与者只占一席，退组不释放席位、不重排已有分配';
+COMMENT ON TABLE  allocation IS '参与者分配表；同实验同参与者只占一席，退组不释放席位、不重排已有分配；site_code 为中心激活门禁上线前的历史分配，允许为空';
 COMMENT ON COLUMN allocation.id IS '分配自增主键';
 COMMENT ON COLUMN allocation.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN allocation.site_code IS '分配所属中心编号；门禁上线前的历史分配为 NULL，新分配在中心激活门禁下必填';
 COMMENT ON COLUMN allocation.participant_id IS '合成参与者编号，非真实医疗数据';
 COMMENT ON COLUMN allocation.block_no IS '分配到的区组号，普通查询可返回';
 COMMENT ON COLUMN allocation.seat_no IS '分配到的席位号，可直接解码处理代码，禁止通过普通接口暴露';
@@ -95,7 +97,7 @@ COMMENT ON COLUMN unblind_request.pending_allocation_id IS '待审去重列：�
 CREATE TABLE IF NOT EXISTS idempotent_request (
     request_id      VARCHAR(64)  NOT NULL,
     actor_id        VARCHAR(64)  NOT NULL,
-    role            VARCHAR(16)  NOT NULL,
+    role            VARCHAR(32)  NOT NULL,
     operation       VARCHAR(64)  NOT NULL,
     fingerprint     VARCHAR(128) NOT NULL,
     response_status INT          NOT NULL,
@@ -106,9 +108,76 @@ CREATE TABLE IF NOT EXISTS idempotent_request (
 COMMENT ON TABLE  idempotent_request IS '写操作幂等记录表；仅记录成功请求，失败不占键，与业务变更同一事务原子提交';
 COMMENT ON COLUMN idempotent_request.request_id IS '全局唯一 requestId（X-Request-Id）';
 COMMENT ON COLUMN idempotent_request.actor_id IS '首次成功调用的操作者编号，属于幂等参数的一部分';
-COMMENT ON COLUMN idempotent_request.role IS '首次成功调用的角色 COORDINATOR/REVIEWER，属于幂等参数的一部分';
+COMMENT ON COLUMN idempotent_request.role IS '首次成功调用的角色 COORDINATOR/REVIEWER/UNBLINDED_MANAGER，属于幂等参数的一部分';
 COMMENT ON COLUMN idempotent_request.operation IS '写操作标识，如 experiment.create/allocation.create';
 COMMENT ON COLUMN idempotent_request.fingerprint IS '请求参数指纹（含路径参数与请求体），与 actor/role 共同判定同参/异参';
 COMMENT ON COLUMN idempotent_request.response_status IS '首次成功响应的 HTTP 状态码，重放时原样返回';
 COMMENT ON COLUMN idempotent_request.response_body IS '首次成功响应体 JSON，重放时原样返回';
 COMMENT ON COLUMN idempotent_request.created_at IS '记录时间，Unix 毫秒，UTC';
+
+CREATE TABLE IF NOT EXISTS site (
+    id                      BIGINT       NOT NULL AUTO_INCREMENT,
+    experiment_id           VARCHAR(64)  NOT NULL,
+    site_code               VARCHAR(64)  NOT NULL,
+    status                  VARCHAR(16)  NOT NULL,
+    target_enrollment_limit INT          NOT NULL,
+    generation              INT          NOT NULL,
+    created_at              BIGINT       NOT NULL,
+    updated_at              BIGINT       NOT NULL,
+    CONSTRAINT pk_site PRIMARY KEY (id),
+    CONSTRAINT uq_site_experiment_code UNIQUE (experiment_id, site_code),
+    CONSTRAINT ck_site_status CHECK (status IN ('INACTIVE', 'ACTIVE', 'SUSPENDED', 'CLOSED')),
+    CONSTRAINT ck_site_limit CHECK (target_enrollment_limit >= 0),
+    CONSTRAINT ck_site_generation CHECK (generation >= 0)
+);
+COMMENT ON TABLE  site IS '盲法试验中心表；同实验中心编号唯一，状态机 INACTIVE->ACTIVE<->SUSPENDED->CLOSED，每次激活/恢复产生新代次';
+COMMENT ON COLUMN site.id IS '中心自增主键';
+COMMENT ON COLUMN site.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN site.site_code IS '中心编号，实验内唯一';
+COMMENT ON COLUMN site.status IS '中心状态：INACTIVE=未激活；ACTIVE=已激活接受分配；SUSPENDED=暂停（拒绝新分配）；CLOSED=已关闭不可恢复';
+COMMENT ON COLUMN site.target_enrollment_limit IS '目标入组上限（人），创建时固定，必须大于0方可激活；累计分配达上限后拒绝新分配，退组不回收容量';
+COMMENT ON COLUMN site.generation IS '激活代次，未激活为0，首次激活为1，每次暂停后双人确认恢复加1；关闭后不再增加';
+COMMENT ON COLUMN site.created_at IS '中心创建时间，Unix 毫秒，UTC';
+COMMENT ON COLUMN site.updated_at IS '中心最近状态变更时间，Unix 毫秒，UTC';
+
+CREATE TABLE IF NOT EXISTS site_activation_record (
+    id                    BIGINT       NOT NULL AUTO_INCREMENT,
+    experiment_id         VARCHAR(64)  NOT NULL,
+    site_code             VARCHAR(64)  NOT NULL,
+    generation            INT          NOT NULL,
+    activation_key        VARCHAR(128) NOT NULL,
+    first_confirmer_actor VARCHAR(64)  NOT NULL,
+    second_confirmer_actor VARCHAR(64) NOT NULL,
+    target_enrollment_limit INT        NOT NULL,
+    activated_at          BIGINT       NOT NULL,
+    CONSTRAINT pk_site_activation_record PRIMARY KEY (id),
+    CONSTRAINT uq_site_activation_generation UNIQUE (experiment_id, site_code, generation),
+    CONSTRAINT ck_site_activation_distinct CHECK (first_confirmer_actor <> second_confirmer_actor)
+);
+COMMENT ON TABLE  site_activation_record IS '不可变双人激活记录表；每一代次激活/恢复成功写入一行，两名不同未盲管理人员同一 activationKey 确认，写入后永不更新或删除';
+COMMENT ON COLUMN site_activation_record.id IS '激活记录自增主键';
+COMMENT ON COLUMN site_activation_record.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN site_activation_record.site_code IS '中心编号';
+COMMENT ON COLUMN site_activation_record.generation IS '本次激活对应的中心代次，首次激活为1，恢复逐代加1';
+COMMENT ON COLUMN site_activation_record.activation_key IS '双人确认必须一致的激活密钥；只存储，不通过普通接口回显';
+COMMENT ON COLUMN site_activation_record.first_confirmer_actor IS '第一名确认的未盲管理人员编号';
+COMMENT ON COLUMN site_activation_record.second_confirmer_actor IS '第二名确认的未盲管理人员编号，必须不同于第一人';
+COMMENT ON COLUMN site_activation_record.target_enrollment_limit IS '激活时中心的目标入组上限快照（人）';
+COMMENT ON COLUMN site_activation_record.activated_at IS '第二人确认、激活完成时间，Unix 毫秒，UTC';
+
+CREATE TABLE IF NOT EXISTS site_activation_pending (
+    experiment_id         VARCHAR(64)  NOT NULL,
+    site_code             VARCHAR(64)  NOT NULL,
+    generation            INT          NOT NULL,
+    activation_key        VARCHAR(128) NOT NULL,
+    first_confirmer_actor VARCHAR(64)  NOT NULL,
+    created_at            BIGINT       NOT NULL,
+    CONSTRAINT pk_site_activation_pending PRIMARY KEY (experiment_id, site_code)
+);
+COMMENT ON TABLE  site_activation_pending IS '双人激活首确认暂存表；同一中心至多一条待确认，记录首确认操作者、密钥与其时代次，第二人确认成功后同事务删除';
+COMMENT ON COLUMN site_activation_pending.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN site_activation_pending.site_code IS '中心编号';
+COMMENT ON COLUMN site_activation_pending.generation IS '首确认时中心代次（首次激活为0），第二人完成时代次加1';
+COMMENT ON COLUMN site_activation_pending.activation_key IS '首确认提交的激活密钥，第二人必须提交相同密钥';
+COMMENT ON COLUMN site_activation_pending.first_confirmer_actor IS '第一名确认的未盲管理人员编号，第二人必须与之不同';
+COMMENT ON COLUMN site_activation_pending.created_at IS '首确认时间，Unix 毫秒，UTC';

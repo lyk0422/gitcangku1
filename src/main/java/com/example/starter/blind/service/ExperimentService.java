@@ -10,6 +10,7 @@ import com.example.starter.blind.repo.AllocationRepository.VacantSeat;
 import com.example.starter.blind.repo.ExperimentRepository;
 import com.example.starter.blind.repo.ExperimentRepository.ExperimentRow;
 import com.example.starter.blind.repo.ExperimentRepository.SeatRow;
+import com.example.starter.blind.repo.SiteRepository.SiteRow;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -30,15 +31,18 @@ public class ExperimentService {
     private final ExperimentRepository experimentRepository;
     private final AllocationRepository allocationRepository;
     private final BlindCodeGenerator blindCodeGenerator;
+    private final SiteService siteService;
     private final Clock clock;
 
     public ExperimentService(ExperimentRepository experimentRepository,
                              AllocationRepository allocationRepository,
                              BlindCodeGenerator blindCodeGenerator,
+                             SiteService siteService,
                              Clock clock) {
         this.experimentRepository = experimentRepository;
         this.allocationRepository = allocationRepository;
         this.blindCodeGenerator = blindCodeGenerator;
+        this.siteService = siteService;
         this.clock = clock;
     }
 
@@ -78,9 +82,28 @@ public class ExperimentService {
 
     /**
      * 原子领取第一个空位；实验行级锁串行化同实验并发分配。
+     * 实验级入口（历史路径）：不经过中心门禁，分配行 site_code 为 NULL。
      */
     @Transactional
     public AllocationView register(String experimentId, String participantId, String actorId) {
+        return doRegister(experimentId, null, participantId, actorId);
+    }
+
+    /**
+     * 中心门禁登记：中心必须 ACTIVE 且累计分配未达上限，否则 409/422；
+     * 实验行锁 + 中心行锁串行化同中心并发，按事务提交顺序裁决。
+     */
+    @Transactional
+    public AllocationView registerAtSite(String experimentId, String siteCode,
+                                         String participantId, String actorId) {
+        if (siteCode == null || siteCode.isBlank()) {
+            throw ApiException.badRequest("siteCode 不能为空");
+        }
+        return doRegister(experimentId, siteCode, participantId, actorId);
+    }
+
+    private AllocationView doRegister(String experimentId, String siteCode,
+                                      String participantId, String actorId) {
         if (participantId == null || participantId.isBlank()) {
             throw ApiException.badRequest("participantId 不能为空");
         }
@@ -90,6 +113,14 @@ public class ExperimentService {
         }
         if ("CLOSED".equals(experiment.status())) {
             throw ApiException.conflict("实验已关闭，拒绝新增分配");
+        }
+        if (siteCode != null) {
+            // 中心门禁：未激活/暂停/关闭 409，累计达上限 422（含已退组，不回收容量）。
+            SiteRow site = siteService.lockSite(experimentId, siteCode);
+            if (site == null) {
+                throw ApiException.notFound("中心不存在: " + siteCode);
+            }
+            siteService.assertAssignable(site);
         }
         AllocationRow existing =
                 allocationRepository.findByExperimentAndParticipant(experimentId, participantId);
@@ -102,17 +133,18 @@ public class ExperimentService {
             throw ApiException.full("实验席位已满");
         }
         long now = clock.nowMillis();
-        AllocationRow inserted = insertWithUniqueBlindCode(experimentId, participantId, actorId,
-                vacant, now);
+        AllocationRow inserted = insertWithUniqueBlindCode(experimentId, siteCode,
+                participantId, actorId, vacant, now);
         return toView(inserted);
     }
 
-    private AllocationRow insertWithUniqueBlindCode(String experimentId, String participantId,
-                                                    String actorId, VacantSeat vacant, long now) {
+    private AllocationRow insertWithUniqueBlindCode(String experimentId, String siteCode,
+                                                    String participantId, String actorId,
+                                                    VacantSeat vacant, long now) {
         // 盲码随机冲突概率极低，仍由唯一索引兜底并重试。
         for (int attempt = 0; attempt < 5; attempt++) {
             String blindCode = blindCodeGenerator.nextCode();
-            AllocationRow row = new AllocationRow(0L, experimentId, participantId,
+            AllocationRow row = new AllocationRow(0L, experimentId, siteCode, participantId,
                     vacant.blockNo(), vacant.seatNo(), blindCode, "ASSIGNED",
                     actorId, now, null);
             try {
