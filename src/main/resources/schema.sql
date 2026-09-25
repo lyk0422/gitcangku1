@@ -5,6 +5,9 @@
 CREATE TABLE IF NOT EXISTS playout_asset (
     id           VARCHAR(64)  NOT NULL COMMENT '素材稳定 ID，客户端指定或系统生成，创建后不变',
     duration_ms  BIGINT       NOT NULL COMMENT '素材时长，单位毫秒，正整数',
+    withdrawn           TINYINT(1)  NOT NULL DEFAULT 0 COMMENT '是否已撤回：0 未撤回，1 已撤回；撤回为终态，撤回素材不得用于新插播发布',
+    withdraw_request_id VARCHAR(64)  NULL COMMENT '撤回操作的幂等请求 ID；未撤回时为 NULL',
+    withdrawn_at_ms     BIGINT       NULL COMMENT '撤回时间，UTC 纪元毫秒；未撤回时为 NULL',
     created_at_ms BIGINT      NOT NULL COMMENT '创建时间，UTC 纪元毫秒',
     PRIMARY KEY (id)
 ) COMMENT = '素材表';
@@ -20,6 +23,7 @@ CREATE TABLE IF NOT EXISTS playout_grant (
     id                BIGINT      NOT NULL AUTO_INCREMENT COMMENT '授权自增 ID',
     channel_id        VARCHAR(64) NOT NULL COMMENT '授权频道 ID',
     asset_id          VARCHAR(64) NOT NULL COMMENT '授权普通素材 ID（不得为频道保底素材）',
+    region_code       VARCHAR(32) NOT NULL DEFAULT '*' COMMENT '授权区域码；* 表示全部区域，区域插播要求授权区域为 * 或等于插播区域',
     valid_from_ms     BIGINT      NOT NULL COMMENT '授权生效起点（含），UTC 纪元毫秒',
     valid_to_ms       BIGINT      NOT NULL COMMENT '授权生效终点（不含），UTC 纪元毫秒，区间左闭右开',
     revoked           TINYINT(1)  NOT NULL DEFAULT 0 COMMENT '是否已撤销：0 未撤销，1 已撤销；撤销为终态',
@@ -49,12 +53,26 @@ CREATE TABLE IF NOT EXISTS playout_draft_segment (
     KEY idx_draft_segment (channel_id, business_day)
 ) COMMENT = '草稿片段表，随草稿整份替换而整体重建';
 
+CREATE TABLE IF NOT EXISTS playout_draft_splice (
+    id           VARCHAR(64) NOT NULL COMMENT '插播配置 ID，客户端指定或系统生成',
+    segment_id   VARCHAR(64) NOT NULL COMMENT '所属草稿片段（节目单条目）ID',
+    channel_id   VARCHAR(64) NOT NULL COMMENT '所属频道 ID',
+    business_day DATE        NOT NULL COMMENT '所属业务日，Asia/Shanghai 日历日',
+    region_code  VARCHAR(32) NOT NULL COMMENT '插播生效区域码',
+    asset_id     VARCHAR(64) NOT NULL COMMENT '插播素材 ID，须具有覆盖该区域与完整窗口的有效授权',
+    start_ms     BIGINT      NOT NULL COMMENT '插播窗口开始（含），UTC 纪元毫秒，须落在条目窗口内',
+    end_ms       BIGINT      NOT NULL COMMENT '插播窗口结束（不含），UTC 纪元毫秒；区间左闭右开',
+    PRIMARY KEY (id),
+    KEY idx_draft_splice (channel_id, business_day)
+) COMMENT = '草稿区域插播表，随草稿整份替换而整体重建；同条目同区域窗口不得重叠，端点相接合法';
+
 CREATE TABLE IF NOT EXISTS playout_publication (
     id                BIGINT      NOT NULL AUTO_INCREMENT COMMENT '发布快照自增 ID',
     channel_id        VARCHAR(64) NOT NULL COMMENT '频道 ID',
     business_day      DATE        NOT NULL COMMENT '业务日，Asia/Shanghai 日历日',
     published_version BIGINT      NOT NULL COMMENT '发布版本，每频道+业务日从 1 起递增',
     draft_version     BIGINT      NOT NULL COMMENT '发布时对应的草稿版本',
+    splice_key        VARCHAR(64)  NULL COMMENT '发布幂等键（客户端指定）；指纹含节目单版本、区域、窗口、素材及授权版本，同键重放首次完整快照',
     created_at_ms     BIGINT      NOT NULL COMMENT '发布时间，UTC 纪元毫秒',
     PRIMARY KEY (id),
     UNIQUE KEY uk_publication_version (channel_id, business_day, published_version)
@@ -72,9 +90,34 @@ CREATE TABLE IF NOT EXISTS playout_publication_segment (
     KEY idx_pub_segment (publication_id)
 ) COMMENT = '发布快照片段表，只读';
 
+CREATE TABLE IF NOT EXISTS playout_publication_region (
+    id              BIGINT      NOT NULL AUTO_INCREMENT COMMENT '快照区域行自增 ID',
+    publication_id  BIGINT      NOT NULL COMMENT '所属发布快照 ID',
+    segment_id      VARCHAR(64) NOT NULL COMMENT '来源草稿片段（节目单条目）ID',
+    region_code     VARCHAR(32) NOT NULL COMMENT '区域码',
+    asset_id        VARCHAR(64) NOT NULL COMMENT '该区域该条目实际播出素材 ID（插播素材或主素材）',
+    grant_id        BIGINT      NOT NULL COMMENT '发布时选定的授权版本（授权 ID），快照固化不随后续撤销改写',
+    splice_start_ms BIGINT       NULL COMMENT '插播窗口开始（含），UTC 纪元毫秒；非插播行（主素材行）为 NULL',
+    splice_end_ms   BIGINT       NULL COMMENT '插播窗口结束（不含），UTC 纪元毫秒；非插播行（主素材行）为 NULL',
+    fallback_reason VARCHAR(32)  NULL COMMENT '回退原因：NO_SPLICE_CONFIG 该区域未配置插播 / NO_SPLICE_WINDOW 当前时刻不在任何插播窗口内；插播行为 NULL',
+    PRIMARY KEY (id),
+    KEY idx_pub_region (publication_id, segment_id, region_code)
+) COMMENT = '发布快照区域解析表，只读；固化区域、条目、实际素材、授权版本、插播窗口与回退原因';
+
+CREATE TABLE IF NOT EXISTS playout_blackout_window (
+    id            BIGINT      NOT NULL AUTO_INCREMENT COMMENT '黑屏窗口自增 ID',
+    channel_id    VARCHAR(64) NOT NULL COMMENT '所属频道 ID',
+    region_code   VARCHAR(32) NOT NULL COMMENT '生效区域码；* 表示全部区域',
+    start_ms      BIGINT      NOT NULL COMMENT '黑屏开始（含），UTC 纪元毫秒',
+    end_ms        BIGINT      NOT NULL COMMENT '黑屏结束（不含），UTC 纪元毫秒；区间左闭右开',
+    created_at_ms BIGINT      NOT NULL COMMENT '创建时间，UTC 纪元毫秒',
+    PRIMARY KEY (id),
+    KEY idx_blackout (channel_id, region_code, start_ms, end_ms)
+) COMMENT = '黑屏窗口表；插播窗口与黑屏窗口相交时整次发布拒绝';
+
 CREATE TABLE IF NOT EXISTS playout_request (
     request_id    VARCHAR(64)  NOT NULL COMMENT '幂等请求 ID，客户端生成',
-    operation     VARCHAR(32)  NOT NULL COMMENT '操作类型：REPLACE_DRAFT / PUBLISH / REVOKE_GRANT / CREATE_OVERRIDE / CANCEL_OVERRIDE',
+    operation     VARCHAR(32)  NOT NULL COMMENT '操作类型：REPLACE_DRAFT / PUBLISH / REVOKE_GRANT / CREATE_OVERRIDE / CANCEL_OVERRIDE / WITHDRAW_ASSET / CREATE_BLACKOUT',
     params_hash   VARCHAR(64)  NOT NULL COMMENT '业务参数（不含 requestId）的 SHA-256，十六进制',
     response_body TEXT         NULL COMMENT '成功时的响应 JSON；失败请求回滚不占用 requestId',
     created_at_ms BIGINT       NOT NULL COMMENT '记录创建时间，UTC 纪元毫秒',

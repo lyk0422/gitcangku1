@@ -2,8 +2,10 @@ package com.example.starter.playout.api;
 
 import com.example.starter.playout.PlayoutService;
 import com.example.starter.playout.api.Dtos.AssetResponse;
+import com.example.starter.playout.api.Dtos.BlackoutWindowResponse;
 import com.example.starter.playout.api.Dtos.ChannelResponse;
 import com.example.starter.playout.api.Dtos.CreateAssetRequest;
+import com.example.starter.playout.api.Dtos.CreateBlackoutWindowRequest;
 import com.example.starter.playout.api.Dtos.CreateChannelRequest;
 import com.example.starter.playout.api.Dtos.CreateEmergencyOverrideRequest;
 import com.example.starter.playout.api.Dtos.CreateGrantRequest;
@@ -12,10 +14,14 @@ import com.example.starter.playout.api.Dtos.EmergencyOverrideResponse;
 import com.example.starter.playout.api.Dtos.GrantResponse;
 import com.example.starter.playout.api.Dtos.CancelEmergencyOverrideRequest;
 import com.example.starter.playout.api.Dtos.PlayoutDecisionResponse;
+import com.example.starter.playout.api.Dtos.PublicationSnapshotResponse;
 import com.example.starter.playout.api.Dtos.PublishRequest;
 import com.example.starter.playout.api.Dtos.PublishResponse;
+import com.example.starter.playout.api.Dtos.RegionPlayoutDecisionResponse;
 import com.example.starter.playout.api.Dtos.ReplaceDraftRequest;
 import com.example.starter.playout.api.Dtos.RevokeGrantRequest;
+import com.example.starter.playout.api.Dtos.SpliceDiagnosticsResponse;
+import com.example.starter.playout.api.Dtos.WithdrawAssetRequest;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import org.springframework.format.annotation.DateTimeFormat;
@@ -52,6 +58,13 @@ public class PlayoutController {
     @PostMapping("/assets")
     public AssetResponse createAsset(@Valid @RequestBody CreateAssetRequest request) {
         return service.createAsset(request);
+    }
+
+    /** 撤回素材（终态，幂等）；撤回素材不得用于新插播发布。 */
+    @PostMapping("/assets/{assetId}/withdraw")
+    public AssetResponse withdrawAsset(@PathVariable @NotBlank String assetId,
+                                       @Valid @RequestBody WithdrawAssetRequest request) {
+        return service.withdrawAsset(assetId, request.requestId());
     }
 
     /** 创建频道。 */
@@ -117,6 +130,38 @@ public class PlayoutController {
     @GetMapping("/emergency-overrides/{overrideKey}")
     public EmergencyOverrideResponse emergencyOverride(@PathVariable @NotBlank String overrideKey) {
         return service.getEmergencyOverride(overrideKey);
+    }
+
+    /** 创建黑屏窗口（幂等）；插播窗口与黑屏窗口相交时整次发布 422。 */
+    @PostMapping("/channels/{channelId}/blackout-windows")
+    public BlackoutWindowResponse createBlackoutWindow(
+            @PathVariable @NotBlank String channelId,
+            @Valid @RequestBody CreateBlackoutWindowRequest request) {
+        return service.createBlackoutWindow(channelId, request);
+    }
+
+    /** 按频道、区域与时刻查询播放决策；窗口内使用发布快照素材，不按当前配置重新解析。 */
+    @GetMapping("/channels/{channelId}/regions/{regionCode}/playout")
+    public RegionPlayoutDecisionResponse regionPlayout(
+            @PathVariable @NotBlank String channelId,
+            @PathVariable @NotBlank String regionCode,
+            @RequestParam
+            @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME)
+            OffsetDateTime at) {
+        return service.regionPlayoutDecision(channelId, regionCode, at);
+    }
+
+    /** 查询发布快照：固化区域、条目、实际素材、授权版本、插播窗口与回退原因，只读。 */
+    @GetMapping("/publications/{publicationId}")
+    public PublicationSnapshotResponse publicationSnapshot(@PathVariable long publicationId) {
+        return service.publicationSnapshot(publicationId);
+    }
+
+    /** 授权阻断诊断：列出当前草稿各区域插播被阻断的原因，blocks 为空表示可发布。 */
+    @GetMapping("/channels/{channelId}/drafts/{businessDay}/splice-diagnostics")
+    public SpliceDiagnosticsResponse spliceDiagnostics(@PathVariable @NotBlank String channelId,
+                                                       @PathVariable String businessDay) {
+        return service.spliceDiagnostics(channelId, parseBusinessDay(businessDay));
     }
 
     private static LocalDate parseBusinessDay(String businessDay) {
