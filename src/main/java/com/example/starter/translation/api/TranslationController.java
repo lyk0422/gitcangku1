@@ -110,10 +110,26 @@ public class TranslationController {
                 () -> WriteResult.of(201, translationService.updateTerms(documentId, request))).toResponseEntity();
     }
 
-    /** 查询当前术语版本及完整规则集。 */
+    /** 查询当前文档术语版本及完整原始规则集（含 suppressed 标记）。 */
     @GetMapping("/{documentId}/terms")
     public ResponseEntity<ApiDtos.TermVersionView> getCurrentTerms(@PathVariable long documentId) {
         return ResponseEntity.ok(translationService.getCurrentTerms(documentId));
+    }
+
+    /** 查询当前生效规则集：全局快照与文档术语快照合成，逐条标明来源 GLOBAL/DOCUMENT/SUPPRESSED。 */
+    @GetMapping("/{documentId}/terms/effective")
+    public ResponseEntity<ApiDtos.EffectiveTermSetResponse> getEffectiveTerms(@PathVariable long documentId) {
+        return ResponseEntity.ok(translationService.getEffectiveTerms(documentId));
+    }
+
+    /** 显式提交全局术语库引用升级：携带当前引用版本与目标版本两个期望版本，升级使草稿版本加一。 */
+    @PostMapping("/{documentId}/global-terms/upgrade")
+    public ResponseEntity<String> upgradeGlobalReference(@PathVariable long documentId,
+                                                         @Valid @RequestBody ApiDtos.UpgradeGlobalReferenceRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/global-terms/upgrade";
+        return writeExecutor.execute(request.requestId(), hash(operation, request),
+                () -> WriteResult.of(200, translationService.upgradeGlobalReference(documentId, request)))
+                .toResponseEntity();
     }
 
     /** 查询指定术语版本的不可变规则集。 */

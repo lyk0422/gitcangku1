@@ -11,14 +11,14 @@ public class ApiException extends RuntimeException {
 
     private final HttpStatus status;
     private final String code;
-    private final List<ApiDtos.TermRuleView> violations;
+    private final List<ApiDtos.TermViolationView> violations;
 
     public ApiException(HttpStatus status, String code, String message) {
         this(status, code, message, null);
     }
 
     public ApiException(HttpStatus status, String code, String message,
-                        List<ApiDtos.TermRuleView> violations) {
+                        List<ApiDtos.TermViolationView> violations) {
         super(message);
         this.status = status;
         this.code = code;
@@ -33,8 +33,8 @@ public class ApiException extends RuntimeException {
         return code;
     }
 
-    /** 术语违规明细，仅术语违规 422 时非空。 */
-    public List<ApiDtos.TermRuleView> violations() {
+    /** 术语违规明细，仅术语违规 422 时非空，含违规规则及来源。 */
+    public List<ApiDtos.TermViolationView> violations() {
         return violations;
     }
 
@@ -53,8 +53,8 @@ public class ApiException extends RuntimeException {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "UNPROCESSABLE", message);
     }
 
-    /** 422：译文违反术语规则，返回全部违规术语。 */
-    public static ApiException termViolation(String message, List<ApiDtos.TermRuleView> violations) {
+    /** 422：译文违反术语规则，返回全部违规术语及来源。 */
+    public static ApiException termViolation(String message, List<ApiDtos.TermViolationView> violations) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "TERM_VIOLATION", message, violations);
     }
 }

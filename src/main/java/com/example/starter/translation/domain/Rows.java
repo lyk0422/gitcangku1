@@ -11,16 +11,18 @@ public final class Rows {
     }
 
     /**
-     * 文档：全局唯一 documentId，含 1~5 种目标语言及草稿/发布/术语版本。
+     * 文档：全局唯一 documentId，含 1~5 种目标语言及草稿/发布/术语版本与引用的全局术语版本。
      *
-     * @param documentId       全局唯一文档 ID，自增
-     * @param targetLanguages  目标语言列表，小写语言码，1~5 种
-     * @param draftVersion     文档草稿版本，从 1 开始；增段落或修改源文/译文/术语时加一
-     * @param publishedVersion 已发布版本号，从 0 开始，每次成功发布加一
-     * @param termVersion      当前术语版本，从 0 开始（0 表示尚未建立术语版本）
+     * @param documentId          全局唯一文档 ID，自增
+     * @param targetLanguages     目标语言列表，小写语言码，1~5 种
+     * @param draftVersion        文档草稿版本，从 1 开始；增段落或修改源文/译文/文档术语/升级全局引用时加一
+     * @param publishedVersion    已发布版本号，从 0 开始，每次成功发布加一
+     * @param termVersion         当前文档术语版本，从 0 开始（0 表示尚未建立文档术语版本）
+     * @param globalTermVersion   引用的全局术语库版本，从 0 开始（0 表示未引用）；仅显式引用升级时推进
      */
     public record DocumentRow(long documentId, List<String> targetLanguages,
-                              int draftVersion, int publishedVersion, int termVersion) {
+                              int draftVersion, int publishedVersion, int termVersion,
+                              int globalTermVersion) {
     }
 
     /**
@@ -36,16 +38,18 @@ public final class Rows {
     /**
      * 译文：按段落与语言唯一，保存正文、作者、所依据源文版本、绑定术语版本及递增译文版本。
      *
-     * @param segmentId          所属段落 ID
-     * @param language           目标语言码，小写
-     * @param content            译文正文，UTF-8
-     * @param author             译文作者，取提交时 X-Actor-Id
-     * @param sourceVersion      译文所依据的源文版本；提交时必须等于当前源文版本
-     * @param translationVersion 译文版本，从 1 开始，每次重新提交加一
-     * @param termVersion        译文提交时绑定的术语版本；不等于当前术语版本时视为术语过期
+     * @param segmentId           所属段落 ID
+     * @param language            目标语言码，小写
+     * @param content             译文正文，UTF-8
+     * @param author              译文作者，取提交时 X-Actor-Id
+     * @param sourceVersion       译文所依据的源文版本；提交时必须等于当前源文版本
+     * @param translationVersion  译文版本，从 1 开始，每次重新提交加一
+     * @param termVersion         译文提交时绑定的文档术语版本；与 globalTermVersion 共同决定生效规则集
+     * @param globalTermVersion   译文提交时文档引用的全局术语库版本；与 termVersion 共同决定生效规则集
      */
     public record TranslationRow(String segmentId, String language, String content, String author,
-                                 int sourceVersion, int translationVersion, int termVersion) {
+                                 int sourceVersion, int translationVersion, int termVersion,
+                                 int globalTermVersion) {
     }
 
     /**
@@ -53,9 +57,28 @@ public final class Rows {
      *
      * @param sourceTerm          源文术语，Unicode 原文、区分大小写，按连续子串匹配
      * @param language            目标语言码，小写
+     * @param requiredTranslation 该术语在目标语言中的必译文本；suppressed=true 时可为 null
+     * @param suppressed          是否抑制：true 表示取消所引用全局版本中同键全局规则，不参与校验
+     */
+    public record TermRuleRow(String sourceTerm, String language, String requiredTranslation,
+                              boolean suppressed) {
+
+        /** 普通文档规则（非抑制）。 */
+        public TermRuleRow(String sourceTerm, String language, String requiredTranslation) {
+            this(sourceTerm, language, requiredTranslation, false);
+        }
+    }
+
+    /**
+     * 全局术语规则：属于某全局术语版本的不可变规则，按 sourceTerm 与目标语言唯一。
+     *
+     * @param globalTermVersion   所属全局术语库版本
+     * @param sourceTerm          源文术语，Unicode 原文、区分大小写，按连续子串匹配
+     * @param language            目标语言码，小写
      * @param requiredTranslation 该术语在目标语言中的必译文本，非空
      */
-    public record TermRuleRow(String sourceTerm, String language, String requiredTranslation) {
+    public record GlobalTermRuleRow(int globalTermVersion, String sourceTerm, String language,
+                                    String requiredTranslation) {
     }
 
     /**

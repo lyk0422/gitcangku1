@@ -41,6 +41,9 @@ public abstract class AbstractIntegrationTest {
         jdbc.update("DELETE FROM release_snapshot");
         jdbc.update("DELETE FROM term_rule");
         jdbc.update("DELETE FROM term_version");
+        jdbc.update("DELETE FROM global_term_rule");
+        jdbc.update("DELETE FROM global_term_version");
+        jdbc.update("ALTER TABLE global_term_version ALTER COLUMN global_term_version RESTART WITH 1");
         jdbc.update("DELETE FROM request_log");
         jdbc.update("DELETE FROM document");
     }
@@ -122,12 +125,36 @@ public abstract class AbstractIntegrationTest {
         return postJson("/api/documents/" + documentId + "/publish", body);
     }
 
-    /** 新增术语版本：rulesJson 为规则数组 JSON。 */
+    /** 新增文档术语版本：rulesJson 为规则数组 JSON。 */
     protected ApiResult updateTerms(long documentId, int expectedTermVersion, String rulesJson,
                                     String requestId) throws Exception {
         String body = "{\"requestId\":\"" + requestId + "\",\"expectedTermVersion\":" + expectedTermVersion
                 + ",\"rules\":" + rulesJson + "}";
         return putJson("/api/documents/" + documentId + "/terms", body);
+    }
+
+    /** 新增全局术语库版本：expectedGlobal 为期望当前全局版本，rulesJson 为规则数组 JSON。 */
+    protected ApiResult createGlobalTerms(int expectedGlobal, String rulesJson, String requestId)
+            throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"expectedGlobalTermVersion\":" + expectedGlobal
+                + ",\"rules\":" + rulesJson + "}";
+        return putJson("/api/global-terms", body);
+    }
+
+    protected ApiResult getGlobalTerms(int globalTermVersion) throws Exception {
+        return getJson("/api/global-terms/" + globalTermVersion);
+    }
+
+    /** 显式升级文档引用的全局术语库版本。 */
+    protected ApiResult upgradeGlobalReference(long documentId, int expectedGlobal, int targetGlobal,
+                                               String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"expectedGlobalTermVersion\":" + expectedGlobal
+                + ",\"targetGlobalTermVersion\":" + targetGlobal + "}";
+        return postJson("/api/documents/" + documentId + "/global-terms/upgrade", body);
+    }
+
+    protected ApiResult getEffectiveTerms(long documentId) throws Exception {
+        return getJson("/api/documents/" + documentId + "/terms/effective");
     }
 
     /** HTTP 响应结果：状态码与 JSON 响应体。 */
