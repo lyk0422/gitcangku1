@@ -68,4 +68,11 @@ public class ApiException extends RuntimeException {
     public static ApiException gone(String message) {
         return new ApiException(HttpStatus.GONE, message, null, null);
     }
+
+    /**
+     * 422：坐标语义不合法（未知坐标基准、经纬度越界或基准换算结果越界）。
+     */
+    public static ApiException unprocessableEntity(String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, message, null, null);
+    }
 }
