@@ -41,6 +41,9 @@ public abstract class AbstractIntegrationTest {
         jdbc.update("DELETE FROM release_snapshot");
         jdbc.update("DELETE FROM term_rule");
         jdbc.update("DELETE FROM term_version");
+        jdbc.update("DELETE FROM global_term_rule");
+        jdbc.update("DELETE FROM global_term_version");
+        jdbc.update("UPDATE global_term_state SET current_version = 0 WHERE id = 1");
         jdbc.update("DELETE FROM request_log");
         jdbc.update("DELETE FROM document");
     }
@@ -128,6 +131,23 @@ public abstract class AbstractIntegrationTest {
         String body = "{\"requestId\":\"" + requestId + "\",\"expectedTermVersion\":" + expectedTermVersion
                 + ",\"rules\":" + rulesJson + "}";
         return putJson("/api/documents/" + documentId + "/terms", body);
+    }
+
+    /** 提交全局术语库新版本：rulesJson 为规则数组 JSON。 */
+    protected ApiResult updateGlobalTerms(int expectedGlobalTermVersion, String rulesJson,
+                                          String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"expectedGlobalTermVersion\":"
+                + expectedGlobalTermVersion + ",\"rules\":" + rulesJson + "}";
+        return postJson("/api/global-terms", body);
+    }
+
+    /** 显式升级文档引用的全局术语库版本。 */
+    protected ApiResult upgradeGlobalTermReference(long documentId, int expectedTermVersion,
+                                                   int expectedGlobalTermVersion, String requestId)
+            throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"expectedTermVersion\":" + expectedTermVersion
+                + ",\"expectedGlobalTermVersion\":" + expectedGlobalTermVersion + "}";
+        return postJson("/api/documents/" + documentId + "/global-term-reference/upgrade", body);
     }
 
     /** HTTP 响应结果：状态码与 JSON 响应体。 */

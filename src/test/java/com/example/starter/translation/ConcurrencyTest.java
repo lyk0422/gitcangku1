@@ -238,4 +238,137 @@ class ConcurrencyTest extends AbstractIntegrationTest {
                 "SELECT term_version FROM document WHERE document_id = ?", Integer.class, docId);
         assertThat(termVersion).isEqualTo(1);
     }
+
+    @Test
+    @DisplayName("并发全局术语更新：同一期望版本仅一个成功，全局版本无丢失更新")
+    void concurrentGlobalTermUpdates() throws Exception {
+        int threads = 4;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch gate = new CountDownLatch(1);
+        List<Future<ApiResult>> futures = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            final int n = i;
+            futures.add(pool.submit(() -> {
+                gate.await();
+                return updateGlobalTerms(0,
+                        "[{\"sourceTerm\":\"术语" + n + "\",\"language\":\"en\","
+                                + "\"requiredTranslation\":\"term" + n + "\"}]", newRequestId());
+            }));
+        }
+        gate.countDown();
+        int success = 0;
+        int conflict = 0;
+        for (Future<ApiResult> future : futures) {
+            int status = future.get(30, TimeUnit.SECONDS).status();
+            if (status == 201) {
+                success++;
+            } else if (status == 409) {
+                conflict++;
+            }
+        }
+        pool.shutdown();
+
+        assertThat(success).isEqualTo(1);
+        assertThat(conflict).isEqualTo(threads - 1);
+        assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM global_term_version", Integer.class))
+                .isEqualTo(1);
+        assertThat(jdbc.queryForObject(
+                "SELECT current_version FROM global_term_state WHERE id = 1", Integer.class)).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("发布与全局术语更新并发：发布固化更新前完整状态或因引用落后失败，不产生混合快照")
+    void concurrentPublishAndGlobalTermUpdate() throws Exception {
+        long docId = createDocument(newRequestId(), "[\"en\"]",
+                "[{\"segmentId\":\"s1\",\"sourceText\":\"机器学习\"}]");
+        updateGlobalTerms(0,
+                "[{\"sourceTerm\":\"机器学习\",\"language\":\"en\",\"requiredTranslation\":\"machine learning\"}]",
+                newRequestId());
+        upgradeGlobalTermReference(docId, 0, 0, newRequestId());
+        submitTranslation(docId, "s1", "en", "alice", "machine learning", 1, newRequestId());
+        approve(docId, "s1", "en", "bob", 1, newRequestId());
+        // 当前草稿版本 3、发布版本 0、引用全局版本 1
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        CountDownLatch gate = new CountDownLatch(1);
+        Future<ApiResult> publishFuture = pool.submit(() -> {
+            gate.await();
+            return publish(docId, 3, 0, newRequestId());
+        });
+        Future<ApiResult> globalFuture = pool.submit(() -> {
+            gate.await();
+            return updateGlobalTerms(1,
+                    "[{\"sourceTerm\":\"机器学习\",\"language\":\"en\",\"requiredTranslation\":\"ML\"}]",
+                    newRequestId());
+        });
+        gate.countDown();
+        ApiResult publishResult = publishFuture.get(30, TimeUnit.SECONDS);
+        ApiResult globalResult = globalFuture.get(30, TimeUnit.SECONDS);
+        pool.shutdown();
+
+        // 全局更新必然成功；发布要么 201（先于全局更新，快照固化全局版本 1 与旧规则），要么 422（引用已落后）
+        assertThat(globalResult.status()).isEqualTo(201);
+        assertThat(publishResult.status()).isIn(201, 422);
+
+        Integer publishedVersion = jdbc.queryForObject(
+                "SELECT published_version FROM document WHERE document_id = ?", Integer.class, docId);
+        Integer snapshots = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM release_snapshot WHERE document_id = ?", Integer.class, docId);
+        assertThat(snapshots).isEqualTo(publishedVersion);
+        if (publishResult.status() == 201) {
+            // 发布先于全局更新：快照为更新前完整状态（全局版本 1、旧必译文本），无混合规则集
+            assertThat(publishedVersion).isEqualTo(1);
+            ApiResult release = getJson("/api/documents/" + docId + "/releases/1");
+            assertThat(release.body().get("globalTermVersion").asInt()).isEqualTo(1);
+            assertThat(release.body().get("terms")).hasSize(1);
+            assertThat(release.body().get("terms").get(0).get("requiredTranslation").asText())
+                    .isEqualTo("machine learning");
+            assertThat(release.body().get("terms").get(0).get("source").asText()).isEqualTo("GLOBAL");
+        } else {
+            // 全局更新先于发布：引用落后，发布 422 且无快照
+            assertThat(publishedVersion).isZero();
+        }
+    }
+
+    @Test
+    @DisplayName("引用升级与发布并发：只发布升级前完整状态或因草稿版本变化失败，不产生混合快照")
+    void concurrentPublishAndReferenceUpgrade() throws Exception {
+        long docId = createDocument(newRequestId(), "[\"en\"]",
+                "[{\"segmentId\":\"s1\",\"sourceText\":\"机器学习\"}]");
+        updateGlobalTerms(0,
+                "[{\"sourceTerm\":\"机器学习\",\"language\":\"en\",\"requiredTranslation\":\"machine learning\"}]",
+                newRequestId());
+        upgradeGlobalTermReference(docId, 0, 0, newRequestId());
+        submitTranslation(docId, "s1", "en", "alice", "machine learning", 1, newRequestId());
+        approve(docId, "s1", "en", "bob", 1, newRequestId());
+        updateGlobalTerms(1,
+                "[{\"sourceTerm\":\"机器学习\",\"language\":\"en\",\"requiredTranslation\":\"ML\"}]",
+                newRequestId());
+        // 当前草稿版本 3、发布版本 0、引用全局版本 1（最新全局版本 2）
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        CountDownLatch gate = new CountDownLatch(1);
+        Future<ApiResult> publishFuture = pool.submit(() -> {
+            gate.await();
+            return publish(docId, 3, 0, newRequestId());
+        });
+        Future<ApiResult> upgradeFuture = pool.submit(() -> {
+            gate.await();
+            return upgradeGlobalTermReference(docId, 0, 1, newRequestId());
+        });
+        gate.countDown();
+        ApiResult publishResult = publishFuture.get(30, TimeUnit.SECONDS);
+        ApiResult upgradeResult = upgradeFuture.get(30, TimeUnit.SECONDS);
+        pool.shutdown();
+
+        // 升级必然成功；发布要么 422（引用落后），要么 409（升级已推进草稿版本）
+        assertThat(upgradeResult.status()).isEqualTo(200);
+        assertThat(publishResult.status()).isIn(409, 422);
+        assertThat(jdbc.queryForObject(
+                "SELECT COUNT(*) FROM release_snapshot WHERE document_id = ?", Integer.class, docId))
+                .isZero();
+        Integer globalTermVersion = jdbc.queryForObject(
+                "SELECT global_term_version FROM document WHERE document_id = ?", Integer.class, docId);
+        assertThat(globalTermVersion).isEqualTo(2);
+    }
 }

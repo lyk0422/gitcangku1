@@ -101,13 +101,24 @@ public class TranslationController {
                 () -> WriteResult.of(201, translationService.publish(documentId, request))).toResponseEntity();
     }
 
-    /** 新增术语版本：不可变快照，术语版本与草稿版本各加一；已有版本不可覆盖。 */
+    /** 新增文档术语版本：不可变快照，术语版本与草稿版本各加一；已有版本不可覆盖。 */
     @PutMapping("/{documentId}/terms")
     public ResponseEntity<String> updateTerms(@PathVariable long documentId,
                                               @Valid @RequestBody ApiDtos.UpdateTermsRequest request) {
         String operation = "PUT /api/documents/" + documentId + "/terms";
         return writeExecutor.execute(request.requestId(), hash(operation, request),
                 () -> WriteResult.of(201, translationService.updateTerms(documentId, request))).toResponseEntity();
+    }
+
+    /** 显式升级文档引用的全局术语库版本：携带期望的文档术语版本与全局引用版本，升级使草稿版本加一。 */
+    @PostMapping("/{documentId}/global-term-reference/upgrade")
+    public ResponseEntity<String> upgradeGlobalTermReference(
+            @PathVariable long documentId,
+            @Valid @RequestBody ApiDtos.UpgradeGlobalTermReferenceRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/global-term-reference/upgrade";
+        return writeExecutor.execute(request.requestId(), hash(operation, request),
+                () -> WriteResult.of(200, translationService.upgradeGlobalTermReference(documentId, request)))
+                .toResponseEntity();
     }
 
     /** 查询当前术语版本及完整规则集。 */
@@ -121,6 +132,12 @@ public class TranslationController {
     public ResponseEntity<ApiDtos.TermVersionView> getTerms(@PathVariable long documentId,
                                                             @PathVariable int termVersion) {
         return ResponseEntity.ok(translationService.getTerms(documentId, termVersion));
+    }
+
+    /** 查询当前生效规则集：全局规则与文档规则合成，逐条标明来源 GLOBAL、DOCUMENT 或 SUPPRESSED。 */
+    @GetMapping("/{documentId}/terms/effective")
+    public ResponseEntity<ApiDtos.EffectiveTermsResponse> getEffectiveTerms(@PathVariable long documentId) {
+        return ResponseEntity.ok(translationService.getEffectiveTerms(documentId));
     }
 
     /** 查询全部译文的术语状态：绑定版本、是否过期及当前规则下的违规术语。 */
