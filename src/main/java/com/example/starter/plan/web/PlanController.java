@@ -4,6 +4,7 @@ import com.example.starter.plan.service.PlanService;
 import com.example.starter.plan.web.dto.CreatePlanRequest;
 import com.example.starter.plan.web.dto.PlanActionRequest;
 import com.example.starter.plan.web.dto.PlanResponse;
+import com.example.starter.plan.web.dto.PreemptionRecordView;
 import com.example.starter.plan.web.dto.PublishedSlotView;
 import com.example.starter.plan.web.dto.UpdateOccupanciesRequest;
 import jakarta.validation.Valid;
@@ -57,12 +58,12 @@ public class PlanController {
     }
 
     /**
-     * 发布计划，原子校验时隙冲突。
+     * 发布计划，原子校验时隙冲突；携带 preemptKey 时按走廊等级抢占模式发布。
      */
     @PostMapping("/plans/{scheduleKey}/publish")
     public PlanResponse publish(@PathVariable String scheduleKey,
                                 @Valid @RequestBody PlanActionRequest request) {
-        return service.publish(scheduleKey, request.requestKey());
+        return service.publish(scheduleKey, request.requestKey(), request.preemptKey());
     }
 
     /**
@@ -90,5 +91,16 @@ public class PlanController {
             @RequestParam @NotNull @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date,
             @RequestParam @NotBlank String sectionId) {
         return service.getPublishedSlots(date, sectionId);
+    }
+
+    /**
+     * 查询不可变抢占记录；date 与 sectionId 均可选，缺省不过滤。
+     */
+    @GetMapping("/preemption-records")
+    public List<PreemptionRecordView> getPreemptionRecords(
+            @RequestParam(required = false)
+            @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date,
+            @RequestParam(required = false) String sectionId) {
+        return service.getPreemptionRecords(date, sectionId);
     }
 }

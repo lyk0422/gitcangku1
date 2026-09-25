@@ -57,7 +57,7 @@ class PlanConcurrencyTest {
         List<Outcome> outcomes = runConcurrently(scheduleKeys.stream()
                 .<Callable<Outcome>>map(sk -> () -> {
                     try {
-                        service.publish(sk, key("REQ"));
+                        service.publish(sk, key("REQ"), null);
                         return Outcome.OK;
                     } catch (ApiException e) {
                         assertThat(e.status()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
@@ -131,7 +131,7 @@ class PlanConcurrencyTest {
                     }
                 },
                 () -> {
-                    service.publish(scheduleKey, key("REQ"));
+                    service.publish(scheduleKey, key("REQ"), null);
                     return Outcome.OK;
                 }));
 
@@ -154,21 +154,21 @@ class PlanConcurrencyTest {
         String planB = key("SCH");
         createDraft(planA, section, 8, 9);
         createDraft(planB, section, 9, 10);
-        service.publish(planA, key("REQ"));
-        service.publish(planB, key("REQ"));
+        service.publish(planA, key("REQ"), null);
+        service.publish(planB, key("REQ"), null);
 
         service.cancel(planA, key("REQ"));
 
         // A 的时隙释放：新计划可占用 08:00-09:00
         String intoA = key("SCH");
         createDraft(intoA, section, 8, 9);
-        service.publish(intoA, key("REQ"));
+        service.publish(intoA, key("REQ"), null);
 
         // B 的时隙不受影响：09:30-10:30 与 B 冲突，必须 422
         String intoB = key("SCH");
         createDraft(intoB, section, 9, 10);
         try {
-            service.publish(intoB, key("REQ"));
+            service.publish(intoB, key("REQ"), null);
             org.assertj.core.api.Assertions.fail("应抛出 422 时隙冲突");
         } catch (ApiException e) {
             assertThat(e.status()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);

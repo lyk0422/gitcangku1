@@ -1,12 +1,13 @@
 spring:
   datasource:
-    url: jdbc:h2:mem:railtest;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=10000
+    # 独立命名内存库，MySQL 兼容模式；DB_CLOSE_DELAY=-1 保证同一 JVM 内状态可跨连接复用。
+    url: jdbc:h2:mem:railtest;MODE=MySQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=10000
     driver-class-name: org.h2.Driver
     username: sa
     password: ""
   sql:
     init:
       mode: always
-      # 单资源解析，测试 classpath 优先，命中本目录的 H2 方言 schema.sql，
+      # 单资源解析，直接复用主资源中的 H2 方言 schema-h2.sql，
       # 避免默认 classpath*:schema.sql 同时执行主资源中的 MySQL 方言脚本。
-      schema-locations: classpath:schema.sql
+      schema-locations: classpath:schema-h2.sql

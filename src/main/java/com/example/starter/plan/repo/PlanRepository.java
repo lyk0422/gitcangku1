@@ -146,7 +146,7 @@ public class PlanRepository {
         }
         StringJoiner placeholders = new StringJoiner(", ");
         sectionIds.forEach(s -> placeholders.add("?"));
-        String sql = "SELECT p.schedule_key, o.train_no, o.section_id, o.start_utc, o.end_utc"
+        String sql = "SELECT p.schedule_key, o.train_no, o.section_id, p.op_date, o.start_utc, o.end_utc"
                 + " FROM rail_plan_occupancy o JOIN rail_day_plan p ON p.id = o.plan_id"
                 + " WHERE p.status = 'PUBLISHED' AND p.op_date = ? AND p.id <> ?"
                 + " AND o.section_id IN (" + placeholders + ") ORDER BY o.section_id, o.start_utc";
@@ -157,18 +157,56 @@ public class PlanRepository {
         for (String sectionId : sectionIds) {
             args[i++] = sectionId;
         }
-        return jdbc.query(sql, (rs, n) -> new PublishedSlot(
-                rs.getString("schedule_key"),
-                rs.getString("train_no"),
-                rs.getString("section_id"),
-                Instant.ofEpochMilli(rs.getLong("start_utc")),
-                Instant.ofEpochMilli(rs.getLong("end_utc"))), args);
+        return jdbc.query(sql, PUBLISHED_SLOT_MAPPER, args);
     }
+
+    /**
+     * 查询某区段上当前已发布计划的生效时隙；opDate 为 null 时不限运营日。
+     */
+    public List<PublishedSlot> findPublishedSlotsBySection(String sectionId, LocalDate opDate) {
+        String sql = "SELECT p.schedule_key, o.train_no, o.section_id, p.op_date, o.start_utc, o.end_utc"
+                + " FROM rail_plan_occupancy o JOIN rail_day_plan p ON p.id = o.plan_id"
+                + " WHERE p.status = 'PUBLISHED' AND o.section_id = ?"
+                + (opDate == null ? "" : " AND p.op_date = ?")
+                + " ORDER BY p.op_date, o.start_utc";
+        if (opDate == null) {
+            return jdbc.query(sql, PUBLISHED_SLOT_MAPPER, sectionId);
+        }
+        return jdbc.query(sql, PUBLISHED_SLOT_MAPPER, sectionId, Date.valueOf(opDate));
+    }
+
+    private static final RowMapper<PublishedSlot> PUBLISHED_SLOT_MAPPER = (rs, n) -> new PublishedSlot(
+            rs.getString("schedule_key"),
+            rs.getString("train_no"),
+            rs.getString("section_id"),
+            rs.getObject("op_date", LocalDate.class),
+            Instant.ofEpochMilli(rs.getLong("start_utc")),
+            Instant.ofEpochMilli(rs.getLong("end_utc")));
 
     /**
      * 获取发布全局互斥锁（单行 FOR UPDATE），串行化所有发布事务。
      */
     public void acquirePublishLock() {
         jdbc.queryForObject("SELECT id FROM publish_lock WHERE id = 1 FOR UPDATE", Integer.class);
+    }
+
+    /**
+     * 按主键查询计划并加行级写锁，须在事务内调用，用于抢占时锁定被抢占计划。
+     */
+    public Optional<DayPlan> findByIdForUpdate(long planId) {
+        return jdbc.query("SELECT id, schedule_key, op_date, version, status FROM rail_day_plan"
+                        + " WHERE id = ? FOR UPDATE",
+                PLAN_MAPPER, planId).stream().findFirst();
+    }
+
+    /**
+     * 条件更新状态：仅当当前状态为 fromStatus 时置为 toStatus，返回受影响行数。
+     * 用于抢占的原子降级判定：0 行表示目标计划已被并发取消或抢占。
+     */
+    public int updateStatusIfCurrent(long planId, PlanStatus fromStatus, PlanStatus toStatus,
+                                     long nowMillis) {
+        return jdbc.update("UPDATE rail_day_plan SET status = ?, updated_at = ?"
+                        + " WHERE id = ? AND status = ?",
+                toStatus.name(), nowMillis, planId, fromStatus.name());
     }
 }
