@@ -35,7 +35,8 @@ public class RaceRepository {
     /** 按ID查询赛事。 */
     public Optional<RaceRow> findRace(String raceId) {
         return jdbcTemplate
-                .query("SELECT race_id, version, status, created_at FROM race WHERE race_id = ?",
+                .query("SELECT race_id, version, status, relay_enabled, leg_count, handoff_limit_ms, created_at "
+                                + "FROM race WHERE race_id = ?",
                         RACE_ROW_MAPPER, raceId)
                 .stream()
                 .findFirst();
@@ -236,9 +237,15 @@ public class RaceRepository {
 
     /** 测试辅助：清空全部业务数据，按外键依赖顺序删除。 */
     public void deleteAllForTesting() {
+        jdbcTemplate.update("DELETE FROM relay_snapshot_team");
         jdbcTemplate.update("DELETE FROM result_snapshot_entry");
         jdbcTemplate.update("DELETE FROM result_snapshot");
         jdbcTemplate.update("DELETE FROM idempotency_record");
+        jdbcTemplate.update("DELETE FROM relay_finish");
+        jdbcTemplate.update("DELETE FROM relay_foul");
+        jdbcTemplate.update("DELETE FROM relay_handoff");
+        jdbcTemplate.update("DELETE FROM relay_team_member");
+        jdbcTemplate.update("DELETE FROM relay_team");
         jdbcTemplate.update("DELETE FROM penalty");
         jdbcTemplate.update("DELETE FROM runner");
         jdbcTemplate.update("DELETE FROM race");
@@ -251,6 +258,9 @@ public class RaceRepository {
                     rs.getString("race_id"),
                     rs.getInt("version"),
                     RaceStatus.valueOf(rs.getString("status")),
+                    rs.getBoolean("relay_enabled"),
+                    (Integer) rs.getObject("leg_count"),
+                    (Integer) rs.getObject("handoff_limit_ms"),
                     rs.getLong("created_at"));
         }
     }

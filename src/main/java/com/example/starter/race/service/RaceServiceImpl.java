@@ -15,6 +15,7 @@ import com.example.starter.race.domain.ResultEntry;
 import com.example.starter.race.persistence.IdempotencyRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
+import com.example.starter.race.persistence.RelayRepository;
 import com.example.starter.race.persistence.RunnerRow;
 import com.example.starter.race.persistence.SnapshotEntryRow;
 import com.example.starter.race.persistence.SnapshotRow;
@@ -61,11 +62,20 @@ public class RaceServiceImpl implements RaceService {
     private static final long INFLIGHT_WAIT_MAX_MS = 30_000L;
 
     private final RaceRepository repository;
+    private final RelaySnapshotBuilder relaySnapshotBuilder;
+    private final RelayRepository relayRepository;
     private final Clock clock;
     private final ObjectMapper objectMapper;
 
-    public RaceServiceImpl(RaceRepository repository, Clock clock, ObjectMapper objectMapper) {
+    public RaceServiceImpl(
+            RaceRepository repository,
+            RelaySnapshotBuilder relaySnapshotBuilder,
+            RelayRepository relayRepository,
+            Clock clock,
+            ObjectMapper objectMapper) {
         this.repository = repository;
+        this.relaySnapshotBuilder = relaySnapshotBuilder;
+        this.relayRepository = relayRepository;
         this.clock = clock;
         this.objectMapper = objectMapper;
     }
@@ -99,6 +109,7 @@ public class RaceServiceImpl implements RaceService {
                         "finishTimeMs", request.finishTimeMs()),
                 () -> {
                     RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    rejectRelayPersonalWrite(race);
                     Long finishTimeMs = request.finishTimeMs();
                     validateFinishTime(finishTimeMs, true);
                     long now = clock.millis();
@@ -124,6 +135,7 @@ public class RaceServiceImpl implements RaceService {
                         "finishTimeMs", request.finishTimeMs()),
                 () -> {
                     RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    rejectRelayPersonalWrite(race);
                     requireRunner(raceId, request.bib());
                     validateFinishTime(request.finishTimeMs(), false);
                     long now = clock.millis();
@@ -246,6 +258,13 @@ public class RaceServiceImpl implements RaceService {
                     }
                     repository.insertSnapshot(new SnapshotRow(raceId, newVersion, now,
                             snapshotEntries));
+                    if (race.relayEnabled()) {
+                        // 接力赛在同一事务、同一封榜快照下固化各队逐棒明细、犯规与最终名次。
+                        List<RelaySnapshotBuilder.TeamState> teamStates =
+                                relaySnapshotBuilder.buildStates(race);
+                        relayRepository.insertSnapshotTeams(
+                                relaySnapshotBuilder.toSnapshotRows(raceId, teamStates));
+                    }
                     return ServiceResult.ok(new StandingResponse(
                             raceId, newVersion, RaceStatus.SEALED, now,
                             snapshotEntries.stream().map(ResponseMapper::toEntryResponse).toList()));
@@ -324,8 +343,14 @@ public class RaceServiceImpl implements RaceService {
         return result;
     }
 
-    private RaceRow requireOpenRace(String raceId, Integer expectedVersion) {
-        RaceRow race = repository.findRace(raceId)
+    /** 接力模式下不接受既有个人完赛计时提交（登记/修订）。 */
+    private static void rejectRelayPersonalWrite(RaceRow race) {
+        if (race.relayEnabled()) {
+            throw new ConflictException("接力赛事不接受个人完赛计时提交: " + race.raceId());
+        }
+    }
+
+    private RaceRow requireOpenRace(String raceId, Integer expectedVersion) {        RaceRow race = repository.findRace(raceId)
                 .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
         if (race.status() == RaceStatus.SEALED) {
             throw new ConflictException("赛事已封榜，禁止写入: " + raceId);
