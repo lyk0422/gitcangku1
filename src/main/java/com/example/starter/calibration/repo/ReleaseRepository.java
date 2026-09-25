@@ -39,10 +39,21 @@ public class ReleaseRepository {
     }
 
     /**
-     * 查询某测量记录的全部放行历史（按时间升序）。
+     * 查询某测量记录版本行的全部放行历史（按时间升序）。
      */
     public List<ReleaseRecord> findByMeasurementId(long measurementId) {
         return jdbc.query("SELECT * FROM release_record WHERE measurement_id = ? ORDER BY id",
                 MAPPER, measurementId);
+    }
+
+    /**
+     * 查询某逻辑测量（root_id）全部版本行的放行历史（按时间升序），用于重算链明细。
+     */
+    public List<ReleaseRecord> findByRootId(long rootId) {
+        return jdbc.query(
+                "SELECT r.* FROM release_record r "
+                        + "JOIN measurement m ON m.id = r.measurement_id "
+                        + "WHERE m.root_id = ? ORDER BY r.id",
+                MAPPER, rootId);
     }
 }

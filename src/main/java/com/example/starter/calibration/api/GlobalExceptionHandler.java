@@ -22,6 +22,21 @@ public class GlobalExceptionHandler {
                 .body(new ErrorResponse(ex.getCode(), ex.getMessage(), ex.getFailures()));
     }
 
+    @ExceptionHandler(BatchGateException.class)
+    public ResponseEntity<ErrorResponse> handleBatchGate(BatchGateException ex) {
+        return ResponseEntity.status(ex.getStatus())
+                .body(new ErrorResponse(ex.getCode(), ex.getMessage(), ex.getFailures()));
+    }
+
+    @ExceptionHandler(EnvOutOfRangeException.class)
+    public ResponseEntity<EnvRangeResponse> handleEnvOutOfRange(EnvOutOfRangeException ex) {
+        return ResponseEntity.status(ex.getStatus())
+                .body(new EnvRangeResponse(
+                        ex.getCode(), ex.getMessage(), ex.getInstrumentModel(),
+                        ex.getTempMin(), ex.getTempMax(),
+                        ex.getHumidityMin(), ex.getHumidityMax()));
+    }
+
     @ExceptionHandler(ApiException.class)
     public ResponseEntity<ErrorResponse> handleApi(ApiException ex) {
         return ResponseEntity.status(ex.getStatus())
