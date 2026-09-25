@@ -64,6 +64,18 @@
 #
 ##############################################################################
 
+# 环境兼容：部分受限 shell 的 PATH 缺少 Git Bash 工具目录（uname/xargs 等），
+# 若 uname 不可用则补充常见工具目录，保证脚本在精简 PATH 下也能运行。
+if ! command -v uname >/dev/null 2>&1 ; then
+    for gradle_tool_dir in /usr/bin /bin "/c/Program Files/Git/usr/bin" "/mingw64/bin" ; do
+        if [ -x "$gradle_tool_dir/uname" ] || [ -x "$gradle_tool_dir/uname.exe" ] ; then
+            PATH="$gradle_tool_dir:$PATH"
+            export PATH
+            break
+        fi
+    done
+fi
+
 # Attempt to set APP_HOME
 
 # Resolve links: $0 may be a link
