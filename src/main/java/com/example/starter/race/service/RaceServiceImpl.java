@@ -1,34 +1,54 @@
 package com.example.starter.race.service;
 
 import com.example.starter.race.api.AddPenaltyRequest;
+import com.example.starter.race.api.AddTeamMemberRequest;
+import com.example.starter.race.api.BatchLockRosterRequest;
+import com.example.starter.race.api.BatchLockRosterResponse;
 import com.example.starter.race.api.CheckpointResponse;
 import com.example.starter.race.api.CheckpointsConfigResponse;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
 import com.example.starter.race.api.CreateRaceRequest;
+import com.example.starter.race.api.CreateTeamRequest;
+import com.example.starter.race.api.LockRosterRequest;
 import com.example.starter.race.api.MissingCheckpointsResponse;
 import com.example.starter.race.api.RaceResponse;
 import com.example.starter.race.api.RegisterRunnerRequest;
+import com.example.starter.race.api.RemoveTeamMemberRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
+import com.example.starter.race.api.RosterLockResponse;
 import com.example.starter.race.api.RunnerMissingCheckpointsResponse;
+import com.example.starter.race.api.RunnerTeamResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.api.SubmitTimingRequest;
+import com.example.starter.race.api.TeamResponse;
+import com.example.starter.race.api.TeamRosterResponse;
+import com.example.starter.race.api.TeamStandingResponse;
+import com.example.starter.race.api.TeamStandingsResponse;
+import com.example.starter.race.api.UnlockRosterRequest;
 import com.example.starter.race.domain.CheckpointRules;
+import com.example.starter.race.domain.EntryStatus;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
+import com.example.starter.race.domain.TeamStatus;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
 import com.example.starter.race.persistence.IdempotencyRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
+import com.example.starter.race.persistence.RosterLockRow;
 import com.example.starter.race.persistence.RunnerRow;
 import com.example.starter.race.persistence.SnapshotCheckpointRow;
 import com.example.starter.race.persistence.SnapshotEntryRow;
 import com.example.starter.race.persistence.SnapshotRow;
+import com.example.starter.race.persistence.SnapshotTeamRow;
+import com.example.starter.race.persistence.TeamMemberRow;
+import com.example.starter.race.persistence.TeamRow;
+import com.example.starter.race.persistence.TeamStandingRow;
 import com.example.starter.race.persistence.RaceRepository;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -41,10 +61,13 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.function.Supplier;
 
@@ -70,6 +93,10 @@ public class RaceServiceImpl implements RaceService {
     private static final long MAX_PENALTY_MS = 3_600_000L;
     /** 同键并发时等待先行者事务结束的上限（毫秒）。 */
     private static final long INFLIGHT_WAIT_MAX_MS = 30_000L;
+    /** 锁定名单人数下限（含）。 */
+    private static final int MIN_ROSTER_SIZE = 2;
+    /** 锁定名单人数上限（含）。 */
+    private static final int MAX_ROSTER_SIZE = 8;
 
     private final RaceRepository repository;
     private final Clock clock;
@@ -119,6 +146,7 @@ public class RaceServiceImpl implements RaceService {
                     } catch (DuplicateKeyException ex) {
                         throw new ConflictException("参赛号已存在: " + request.bib());
                     }
+                    recomputeLockedTeamStandings(raceId, request.expectedVersion() + 1);
                     RunnerRow runner = repository.findRunner(raceId, request.bib()).orElseThrow();
                     return ServiceResult.created(ResponseMapper.toRunnerResponse(runner));
                 });
@@ -154,6 +182,7 @@ public class RaceServiceImpl implements RaceService {
                     if (updated == 0) {
                         throw new NotFoundException("选手不存在: " + request.bib());
                     }
+                    recomputeLockedTeamStandings(raceId, request.expectedVersion() + 1);
                     RunnerRow refreshedRunner =
                             repository.findRunner(raceId, request.bib()).orElseThrow();
                     return ServiceResult.ok(ResponseMapper.toRunnerResponse(refreshedRunner));
@@ -194,6 +223,7 @@ public class RaceServiceImpl implements RaceService {
                     } catch (DuplicateKeyException ex) {
                         throw new ConflictException("处罚ID已存在: " + request.penaltyId());
                     }
+                    recomputeLockedTeamStandings(raceId, request.expectedVersion() + 1);
                     PenaltyRow penalty = repository.findPenalty(request.penaltyId()).orElseThrow();
                     return ServiceResult.created(ResponseMapper.toPenaltyResponse(penalty));
                 });
@@ -224,6 +254,7 @@ public class RaceServiceImpl implements RaceService {
                     if (updated == 0) {
                         throw new ConflictException("处罚已撤销: " + penaltyId);
                     }
+                    recomputeLockedTeamStandings(raceId, request.expectedVersion() + 1);
                     PenaltyRow refreshed = repository.findPenalty(penaltyId).orElseThrow();
                     return ServiceResult.ok(ResponseMapper.toPenaltyResponse(refreshed));
                 });
@@ -320,6 +351,7 @@ public class RaceServiceImpl implements RaceService {
                         throw new UnprocessableEntityException(
                                 "同一选手同一检查点最多一条分段记录");
                     }
+                    recomputeLockedTeamStandings(raceId, request.expectedVersion() + 1);
                     CheckpointTimingRow saved =
                             repository.findTiming(request.timingId()).orElseThrow();
                     return ServiceResult.created(ResponseMapper.toTimingResponse(saved));
@@ -390,6 +422,15 @@ public class RaceServiceImpl implements RaceService {
                             buildSnapshotCheckpoints(raceId, runners, checkpoints, timings);
                     repository.insertSnapshot(new SnapshotRow(raceId, newVersion, now,
                             snapshotEntries, snapshotCheckpoints));
+                    // 同一事务内固化锁定队伍的团队快照：名单版本、个人成绩版本与团队得分。
+                    List<SnapshotTeamRow> snapshotTeams = repository.findTeamStandings(raceId)
+                            .stream()
+                            .map(standing -> new SnapshotTeamRow(
+                                    raceId, standing.teamId(), standing.rosterVersion(),
+                                    newVersion, standing.memberCount(), standing.rankedCount(),
+                                    standing.totalTimeMs()))
+                            .toList();
+                    repository.insertSnapshotTeams(snapshotTeams);
                     return ServiceResult.ok(new StandingResponse(
                             raceId, newVersion, RaceStatus.SEALED, now,
                             snapshotEntries.stream().map(ResponseMapper::toEntryResponse).toList()));
@@ -723,5 +764,391 @@ public class RaceServiceImpl implements RaceService {
         String message = cause.getMessage();
         return message != null
                 && message.toUpperCase(java.util.Locale.ROOT).contains(constraintName.toUpperCase(java.util.Locale.ROOT));
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult createTeam(String raceId, CreateTeamRequest request) {
+        return withIdempotency(request.requestId(), "CREATE_TEAM",
+                orderedParams(
+                        "raceId", raceId,
+                        "teamId", request.teamId(),
+                        "captainBib", request.captainBib(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    requireRunner(raceId, request.captainBib());
+                    long now = clock.millis();
+                    bumpVersion(race, request.expectedVersion());
+                    try {
+                        repository.insertTeam(raceId, request.teamId(), request.captainBib(), now);
+                    } catch (DuplicateKeyException ex) {
+                        throw new ConflictException("队伍已存在: " + request.teamId());
+                    }
+                    return ServiceResult.created(
+                            toTeamResponse(raceId, request.teamId(), request.expectedVersion() + 1));
+                });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult addTeamMember(String raceId, String teamId, AddTeamMemberRequest request) {
+        return withIdempotency(request.requestId(), "ADD_TEAM_MEMBER",
+                orderedParams(
+                        "raceId", raceId,
+                        "teamId", teamId,
+                        "bib", request.bib(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    TeamRow team = requireTeam(raceId, teamId);
+                    requireRosterEditable(team);
+                    requireRunner(raceId, request.bib());
+                    long now = clock.millis();
+                    bumpVersion(race, request.expectedVersion());
+                    try {
+                        repository.insertTeamMember(raceId, teamId, request.bib(), now);
+                    } catch (DuplicateKeyException ex) {
+                        throw new ConflictException("参赛者已加入队伍: " + request.bib());
+                    }
+                    repository.touchTeam(raceId, teamId, now);
+                    return ServiceResult.created(
+                            toTeamResponse(raceId, teamId, request.expectedVersion() + 1));
+                });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult removeTeamMember(String raceId, String teamId, String bib,
+                                          RemoveTeamMemberRequest request) {
+        return withIdempotency(request.requestId(), "REMOVE_TEAM_MEMBER",
+                orderedParams(
+                        "raceId", raceId,
+                        "teamId", teamId,
+                        "bib", bib,
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    TeamRow team = requireTeam(raceId, teamId);
+                    requireRosterEditable(team);
+                    long now = clock.millis();
+                    bumpVersion(race, request.expectedVersion());
+                    if (repository.deleteTeamMember(raceId, teamId, bib) == 0) {
+                        throw new NotFoundException("成员不在队伍中: " + bib);
+                    }
+                    repository.touchTeam(raceId, teamId, now);
+                    return ServiceResult.ok(
+                            toTeamResponse(raceId, teamId, request.expectedVersion() + 1));
+                });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult lockRoster(String raceId, String teamId, LockRosterRequest request) {
+        List<String> members = normalizeMembers(request.members());
+        // rosterKey 指纹含队长、赛事版本、队伍和规范化成员集合，作为名单锁定的幂等键。
+        String rosterKey = rosterKey(
+                raceId, teamId, request.captainBib(), request.expectedVersion(), members);
+        return withIdempotency(rosterKey, "LOCK_ROSTER",
+                orderedParams(
+                        "raceId", raceId,
+                        "teamId", teamId,
+                        "captainBib", request.captainBib(),
+                        "expectedVersion", request.expectedVersion(),
+                        "members", members),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    TeamRow team = requireTeam(raceId, teamId);
+                    if (team.status() == TeamStatus.LOCKED) {
+                        throw new ConflictException("队伍名单已锁定: " + teamId);
+                    }
+                    if (!team.captainBib().equals(request.captainBib())) {
+                        throw new UnprocessableEntityException("仅队长可提交名单锁定: " + teamId);
+                    }
+                    validateLockMembers(raceId, teamId, members);
+                    long now = clock.millis();
+                    bumpVersion(race, request.expectedVersion());
+                    int rosterVersion = team.rosterVersion() + 1;
+                    int raceVersion = request.expectedVersion() + 1;
+                    writeRosterLock(raceId, teamId, rosterVersion, raceVersion,
+                            request.captainBib(), members, now);
+                    recomputeLockedTeamStandings(raceId, raceVersion);
+                    return ServiceResult.created(new RosterLockResponse(
+                            raceId, teamId, rosterVersion, raceVersion, members, now, rosterKey));
+                });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult batchLockRosters(String raceId, BatchLockRosterRequest request) {
+        List<TeamLockPlan> plans = request.teams().stream()
+                .map(entry -> new TeamLockPlan(entry.teamId(), entry.captainBib(),
+                        normalizeMembers(entry.members())))
+                .toList();
+        List<Map<String, Object>> teamParams = plans.stream()
+                .map(plan -> {
+                    Map<String, Object> map = new TreeMap<String, Object>();
+                    map.put("teamId", plan.teamId());
+                    map.put("captainBib", plan.captainBib());
+                    map.put("members", plan.members());
+                    return map;
+                })
+                .toList();
+        return withIdempotency(request.requestId(), "BATCH_LOCK_ROSTER",
+                orderedParams(
+                        "raceId", raceId,
+                        "expectedVersion", request.expectedVersion(),
+                        "teams", teamParams),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    // 先整批校验：成员不跨队、人数2~8、全部个人报名有效；任一失败整批422不写入。
+                    validateBatchLock(raceId, plans);
+                    long now = clock.millis();
+                    bumpVersion(race, request.expectedVersion());
+                    int raceVersion = request.expectedVersion() + 1;
+                    List<RosterLockResponse> locks = new ArrayList<>(plans.size());
+                    for (TeamLockPlan plan : plans) {
+                        TeamRow team = repository.findTeam(raceId, plan.teamId()).orElseThrow();
+                        int rosterVersion = team.rosterVersion() + 1;
+                        writeRosterLock(raceId, plan.teamId(), rosterVersion, raceVersion,
+                                plan.captainBib(), plan.members(), now);
+                        locks.add(new RosterLockResponse(
+                                raceId, plan.teamId(), rosterVersion, raceVersion, plan.members(),
+                                now, rosterKey(raceId, plan.teamId(), plan.captainBib(),
+                                        request.expectedVersion(), plan.members())));
+                    }
+                    recomputeLockedTeamStandings(raceId, raceVersion);
+                    return ServiceResult.created(
+                            new BatchLockRosterResponse(raceId, raceVersion, locks));
+                });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult unlockRoster(String raceId, String teamId, UnlockRosterRequest request) {
+        return withIdempotency(request.requestId(), "UNLOCK_ROSTER",
+                orderedParams(
+                        "raceId", raceId,
+                        "teamId", teamId,
+                        "reason", request.reason(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    // 赛事已封榜时 requireOpenRace 直接返回409，禁止解锁。
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    TeamRow team = requireTeam(raceId, teamId);
+                    if (team.status() != TeamStatus.LOCKED) {
+                        throw new ConflictException("队伍名单未锁定: " + teamId);
+                    }
+                    long now = clock.millis();
+                    bumpVersion(race, request.expectedVersion());
+                    // 旧锁定快照仅置解锁标记与原因，不删除；重锁时生成新名单版本。
+                    int updated = repository.markRosterLockUnlocked(
+                            raceId, teamId, team.rosterVersion(), request.reason(), now);
+                    if (updated == 0) {
+                        throw new ConflictException("队伍名单未锁定: " + teamId);
+                    }
+                    repository.updateTeamRosterState(
+                            raceId, teamId, TeamStatus.OPEN, team.rosterVersion(), now);
+                    repository.deleteTeamStanding(raceId, teamId);
+                    recomputeLockedTeamStandings(raceId, request.expectedVersion() + 1);
+                    return ServiceResult.ok(
+                            toTeamResponse(raceId, teamId, request.expectedVersion() + 1));
+                });
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public TeamRosterResponse getTeamRoster(String raceId, String teamId) {
+        repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        TeamRow team = requireTeam(raceId, teamId);
+        List<String> members = repository.findTeamMembers(raceId, teamId).stream()
+                .map(TeamMemberRow::bib)
+                .toList();
+        List<TeamRosterResponse.RosterLockInfo> locks = repository.findRosterLocks(raceId, teamId)
+                .stream()
+                .map(lock -> new TeamRosterResponse.RosterLockInfo(
+                        lock.rosterVersion(), lock.raceVersion(), lock.lockedBy(), lock.lockedAt(),
+                        repository.findRosterLockMembers(raceId, teamId, lock.rosterVersion()),
+                        lock.unlocked(), lock.unlockReason(), lock.unlockedAt()))
+                .toList();
+        return new TeamRosterResponse(raceId, teamId, team.captainBib(), team.status(),
+                team.rosterVersion(), members, locks);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public RunnerTeamResponse getRunnerTeam(String raceId, String bib) {
+        repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        requireRunner(raceId, bib);
+        Optional<TeamMemberRow> membership = repository.findMembership(raceId, bib);
+        if (membership.isEmpty()) {
+            return new RunnerTeamResponse(raceId, bib, null, null, null);
+        }
+        TeamRow team = repository.findTeam(raceId, membership.get().teamId()).orElseThrow();
+        return new RunnerTeamResponse(
+                raceId, bib, team.teamId(), team.status(), team.rosterVersion());
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public TeamStandingsResponse getTeamStandings(String raceId) {
+        RaceRow race = repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        List<TeamStandingResponse> teams;
+        if (race.status() == RaceStatus.SEALED) {
+            // 封榜后返回固化的团队快照（名单版本、个人成绩版本与团队得分）。
+            teams = repository.findSnapshotTeams(raceId).stream()
+                    .map(row -> new TeamStandingResponse(
+                            row.raceId(), row.teamId(), row.rosterVersion(), row.raceVersion(),
+                            row.memberCount(), row.rankedCount(), row.totalTimeMs()))
+                    .toList();
+        } else {
+            teams = repository.findTeamStandings(raceId).stream()
+                    .map(row -> new TeamStandingResponse(
+                            row.raceId(), row.teamId(), row.rosterVersion(), row.raceVersion(),
+                            row.memberCount(), row.rankedCount(), row.totalTimeMs()))
+                    .toList();
+        }
+        return new TeamStandingsResponse(raceId, race.version(), race.status(), teams);
+    }
+
+    /**
+     * 以锁定名单和当前赛事版本重算全部已锁定队伍的团队得分：
+     * 团队得分=锁定名单中全部 RANKED 成员总耗时之和；存在未排名成员时得分为 null（不完整）。
+     * 无锁定队伍时为空操作。
+     */
+    private void recomputeLockedTeamStandings(String raceId, int raceVersion) {
+        List<TeamRow> lockedTeams = repository.findLockedTeams(raceId);
+        if (lockedTeams.isEmpty()) {
+            return;
+        }
+        List<ResultEntry> entries = ResultCalculator.compute(
+                repository.findRunners(raceId),
+                repository.findPenalties(raceId),
+                repository.findCheckpoints(raceId),
+                repository.findAllTimings(raceId));
+        Map<String, ResultEntry> entryByBib = new HashMap<>();
+        for (ResultEntry entry : entries) {
+            entryByBib.put(entry.bib(), entry);
+        }
+        long now = clock.millis();
+        for (TeamRow team : lockedTeams) {
+            List<String> members = repository.findRosterLockMembers(
+                    raceId, team.teamId(), team.rosterVersion());
+            long totalTimeMs = 0L;
+            int rankedCount = 0;
+            boolean complete = true;
+            for (String bib : members) {
+                ResultEntry entry = entryByBib.get(bib);
+                if (entry == null || entry.status() != EntryStatus.RANKED
+                        || entry.totalTimeMs() == null) {
+                    complete = false;
+                } else {
+                    rankedCount++;
+                    totalTimeMs += entry.totalTimeMs();
+                }
+            }
+            repository.upsertTeamStanding(new TeamStandingRow(
+                    raceId, team.teamId(), team.rosterVersion(), raceVersion,
+                    members.size(), rankedCount, complete ? totalTimeMs : null, now));
+        }
+    }
+
+    /** 写入一次名单锁定：快照头、成员快照、当前名单重建与队伍状态推进。 */
+    private void writeRosterLock(String raceId, String teamId, int rosterVersion, int raceVersion,
+                                 String captainBib, List<String> members, long now) {
+        repository.insertRosterLock(new RosterLockRow(raceId, teamId, rosterVersion,
+                raceVersion, captainBib, now, false, null, null));
+        repository.insertRosterLockMembers(raceId, teamId, rosterVersion, members);
+        repository.deleteTeamMembers(raceId, teamId);
+        for (String bib : members) {
+            repository.insertTeamMember(raceId, teamId, bib, now);
+        }
+        repository.updateTeamRosterState(raceId, teamId, TeamStatus.LOCKED, rosterVersion, now);
+    }
+
+    /** 批量锁定整批校验：队伍存在且未锁定、队长一致、人数与报名有效、成员不跨队。 */
+    private void validateBatchLock(String raceId, List<TeamLockPlan> plans) {
+        Set<String> seenTeamIds = new HashSet<>();
+        Map<String, String> memberToTeam = new HashMap<>();
+        for (TeamLockPlan plan : plans) {
+            if (!seenTeamIds.add(plan.teamId())) {
+                throw new UnprocessableEntityException("批量锁定中队伍重复: " + plan.teamId());
+            }
+            TeamRow team = requireTeam(raceId, plan.teamId());
+            if (team.status() == TeamStatus.LOCKED) {
+                throw new ConflictException("队伍名单已锁定: " + plan.teamId());
+            }
+            if (!team.captainBib().equals(plan.captainBib())) {
+                throw new UnprocessableEntityException("仅队长可提交名单锁定: " + plan.teamId());
+            }
+            validateLockMembers(raceId, plan.teamId(), plan.members());
+            for (String bib : plan.members()) {
+                String owner = memberToTeam.putIfAbsent(bib, plan.teamId());
+                if (owner != null) {
+                    throw new UnprocessableEntityException(
+                            "批量锁定中成员跨队: " + bib + " 同时属于 " + owner + " 与 " + plan.teamId());
+                }
+            }
+        }
+    }
+
+    /** 校验锁定名单：人数2~8、全部成员具有有效个人报名、未加入其他队伍。 */
+    private void validateLockMembers(String raceId, String teamId, List<String> members) {
+        if (members.size() < MIN_ROSTER_SIZE || members.size() > MAX_ROSTER_SIZE) {
+            throw new UnprocessableEntityException(
+                    "锁定名单人数必须在 2~8 之间: " + members.size());
+        }
+        for (String bib : members) {
+            if (repository.findRunner(raceId, bib).isEmpty()) {
+                throw new UnprocessableEntityException("成员无有效个人报名: " + bib);
+            }
+            Optional<TeamMemberRow> membership = repository.findMembership(raceId, bib);
+            if (membership.isPresent() && !membership.get().teamId().equals(teamId)) {
+                throw new UnprocessableEntityException("成员已属于其他队伍: " + bib);
+            }
+        }
+    }
+
+    /** 规范化成员集合：去空白、去重、按字典序排序，使指纹与请求顺序无关。 */
+    private static List<String> normalizeMembers(List<String> members) {
+        return members.stream().map(String::trim).distinct().sorted().toList();
+    }
+
+    /** 计算名单锁定幂等指纹：队长+赛事版本+队伍+规范化成员集合的摘要。 */
+    private String rosterKey(String raceId, String teamId, String captainBib,
+                             int expectedVersion, List<String> members) {
+        return "roster-lock:" + digest("LOCK_ROSTER", orderedParams(
+                "raceId", raceId,
+                "teamId", teamId,
+                "captainBib", captainBib,
+                "raceVersion", expectedVersion,
+                "members", members));
+    }
+
+    private TeamRow requireTeam(String raceId, String teamId) {
+        return repository.findTeam(raceId, teamId)
+                .orElseThrow(() -> new NotFoundException("队伍不存在: " + teamId));
+    }
+
+    private static void requireRosterEditable(TeamRow team) {
+        if (team.status() == TeamStatus.LOCKED) {
+            throw new ConflictException("队伍名单已锁定，禁止增删成员: " + team.teamId());
+        }
+    }
+
+    private TeamResponse toTeamResponse(String raceId, String teamId, int raceVersion) {
+        TeamRow team = repository.findTeam(raceId, teamId).orElseThrow();
+        List<String> members = repository.findTeamMembers(raceId, teamId).stream()
+                .map(TeamMemberRow::bib)
+                .toList();
+        return new TeamResponse(raceId, teamId, team.captainBib(), team.status(),
+                team.rosterVersion(), raceVersion, members);
+    }
+
+    /** 批量锁定中一支队伍的锁定计划（成员已规范化）。 */
+    private record TeamLockPlan(String teamId, String captainBib, List<String> members) {
     }
 }

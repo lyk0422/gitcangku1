@@ -113,6 +113,81 @@ public class RaceController {
         return raceService.getMissingCheckpoints(raceId);
     }
 
+    /** 创建队伍。 */
+    @PostMapping("/{raceId}/teams")
+    public ResponseEntity<Object> createTeam(
+            @PathVariable String raceId,
+            @Valid @RequestBody CreateTeamRequest request) {
+        return toResponse(raceService.createTeam(raceId, request));
+    }
+
+    /** 新增队伍成员（名单未锁定时）。 */
+    @PostMapping("/{raceId}/teams/{teamId}/members")
+    public ResponseEntity<Object> addTeamMember(
+            @PathVariable String raceId,
+            @PathVariable String teamId,
+            @Valid @RequestBody AddTeamMemberRequest request) {
+        return toResponse(raceService.addTeamMember(raceId, teamId, request));
+    }
+
+    /** 移除队伍成员（名单未锁定时）。 */
+    @PostMapping("/{raceId}/teams/{teamId}/members/{bib}/removal")
+    public ResponseEntity<Object> removeTeamMember(
+            @PathVariable String raceId,
+            @PathVariable String teamId,
+            @PathVariable String bib,
+            @Valid @RequestBody RemoveTeamMemberRequest request) {
+        return toResponse(raceService.removeTeamMember(raceId, teamId, bib, request));
+    }
+
+    /** 队长提交名单锁定（rosterKey 幂等）。 */
+    @PostMapping("/{raceId}/teams/{teamId}/roster-lock")
+    public ResponseEntity<Object> lockRoster(
+            @PathVariable String raceId,
+            @PathVariable String teamId,
+            @Valid @RequestBody LockRosterRequest request) {
+        return toResponse(raceService.lockRoster(raceId, teamId, request));
+    }
+
+    /** 批量锁定多支队伍名单（整批校验，一事务写入）。 */
+    @PostMapping("/{raceId}/roster-locks")
+    public ResponseEntity<Object> batchLockRosters(
+            @PathVariable String raceId,
+            @Valid @RequestBody BatchLockRosterRequest request) {
+        return toResponse(raceService.batchLockRosters(raceId, request));
+    }
+
+    /** 裁判解锁队伍名单（须说明原因，封榜后409）。 */
+    @PostMapping("/{raceId}/teams/{teamId}/roster-unlock")
+    public ResponseEntity<Object> unlockRoster(
+            @PathVariable String raceId,
+            @PathVariable String teamId,
+            @Valid @RequestBody UnlockRosterRequest request) {
+        return toResponse(raceService.unlockRoster(raceId, teamId, request));
+    }
+
+    /** 查询队伍名单：当前状态、名单版本与锁定历史。 */
+    @GetMapping("/{raceId}/teams/{teamId}")
+    public TeamRosterResponse getTeamRoster(
+            @PathVariable String raceId,
+            @PathVariable String teamId) {
+        return raceService.getTeamRoster(raceId, teamId);
+    }
+
+    /** 查询参赛者队伍归属。 */
+    @GetMapping("/{raceId}/runners/{bib}/team")
+    public RunnerTeamResponse getRunnerTeam(
+            @PathVariable String raceId,
+            @PathVariable String bib) {
+        return raceService.getRunnerTeam(raceId, bib);
+    }
+
+    /** 查询赛事团队得分（封榜后返回固化快照）。 */
+    @GetMapping("/{raceId}/team-standings")
+    public TeamStandingsResponse getTeamStandings(@PathVariable String raceId) {
+        return raceService.getTeamStandings(raceId);
+    }
+
     private ResponseEntity<Object> toResponse(ServiceResult result) {
         return ResponseEntity.status(result.status()).body(result.body());
     }

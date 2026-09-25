@@ -95,9 +95,81 @@ CREATE TABLE IF NOT EXISTS result_snapshot_checkpoint (
     CONSTRAINT fk_snapshot_checkpoint_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
 );
 
+CREATE TABLE IF NOT EXISTS team (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    team_id VARCHAR(64) NOT NULL COMMENT '队伍ID，同一赛事内唯一',
+    captain_bib VARCHAR(64) NOT NULL COMMENT '队长参赛号，须为本赛事已报名选手',
+    status VARCHAR(16) NOT NULL COMMENT '名单状态：OPEN-可增删成员，LOCKED-已锁定禁止普通增删',
+    roster_version INT NOT NULL COMMENT '当前名单版本，每次锁定加一；从未锁定为0',
+    created_at BIGINT NOT NULL COMMENT '创建时间，Unix毫秒时间戳',
+    updated_at BIGINT NOT NULL COMMENT '最近一次名单变更时间，Unix毫秒时间戳',
+    CONSTRAINT pk_team PRIMARY KEY (race_id, team_id),
+    CONSTRAINT fk_team_race FOREIGN KEY (race_id) REFERENCES race (race_id)
+);
+
+CREATE TABLE IF NOT EXISTS team_member (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    team_id VARCHAR(64) NOT NULL COMMENT '所属队伍ID',
+    bib VARCHAR(64) NOT NULL COMMENT '成员参赛号；同一赛事内一名参赛者最多属于一支队伍',
+    added_at BIGINT NOT NULL COMMENT '加入时间，Unix毫秒时间戳',
+    CONSTRAINT pk_team_member PRIMARY KEY (race_id, team_id, bib),
+    CONSTRAINT uk_team_member_race_bib UNIQUE (race_id, bib),
+    CONSTRAINT fk_team_member_team FOREIGN KEY (race_id, team_id) REFERENCES team (race_id, team_id),
+    CONSTRAINT fk_team_member_runner FOREIGN KEY (race_id, bib) REFERENCES runner (race_id, bib)
+);
+
+CREATE TABLE IF NOT EXISTS roster_lock (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    team_id VARCHAR(64) NOT NULL COMMENT '队伍ID',
+    roster_version INT NOT NULL COMMENT '名单版本，从1开始，重锁生成新版本',
+    race_version INT NOT NULL COMMENT '锁定时的赛事版本（个人成绩版本）',
+    locked_by VARCHAR(64) NOT NULL COMMENT '提交锁定的队长参赛号',
+    locked_at BIGINT NOT NULL COMMENT '锁定时间，Unix毫秒时间戳',
+    unlocked BOOLEAN NOT NULL DEFAULT FALSE COMMENT '是否已被裁判解锁：FALSE-生效中，TRUE-已解锁（快照保留不删除）',
+    unlock_reason VARCHAR(512) COMMENT '裁判解锁原因；未解锁为NULL',
+    unlocked_at BIGINT COMMENT '解锁时间，Unix毫秒时间戳；未解锁为NULL',
+    CONSTRAINT pk_roster_lock PRIMARY KEY (race_id, team_id, roster_version),
+    CONSTRAINT fk_roster_lock_team FOREIGN KEY (race_id, team_id) REFERENCES team (race_id, team_id)
+);
+
+CREATE TABLE IF NOT EXISTS roster_lock_member (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    team_id VARCHAR(64) NOT NULL COMMENT '队伍ID',
+    roster_version INT NOT NULL COMMENT '名单版本',
+    bib VARCHAR(64) NOT NULL COMMENT '锁定名单成员参赛号',
+    CONSTRAINT pk_roster_lock_member PRIMARY KEY (race_id, team_id, roster_version, bib),
+    CONSTRAINT fk_roster_lock_member_lock FOREIGN KEY (race_id, team_id, roster_version)
+        REFERENCES roster_lock (race_id, team_id, roster_version)
+);
+
+CREATE TABLE IF NOT EXISTS team_standing (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    team_id VARCHAR(64) NOT NULL COMMENT '队伍ID；仅当前处于锁定状态的队伍有行',
+    roster_version INT NOT NULL COMMENT '得分对应的锁定名单版本',
+    race_version INT NOT NULL COMMENT '得分重算时的赛事版本（与个人成绩版本一致）',
+    member_count INT NOT NULL COMMENT '锁定名单人数（2~8）',
+    ranked_count INT NOT NULL COMMENT '锁定名单中状态为RANKED的成员人数',
+    total_time_ms BIGINT COMMENT '团队得分=全部RANKED成员总耗时（原始完赛耗时+生效加时）之和（毫秒）；存在未排名成员时为NULL表示得分不完整',
+    computed_at BIGINT NOT NULL COMMENT '重算时间，Unix毫秒时间戳',
+    CONSTRAINT pk_team_standing PRIMARY KEY (race_id, team_id),
+    CONSTRAINT fk_team_standing_team FOREIGN KEY (race_id, team_id) REFERENCES team (race_id, team_id)
+);
+
+CREATE TABLE IF NOT EXISTS result_snapshot_team (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属快照的赛事ID',
+    team_id VARCHAR(64) NOT NULL COMMENT '队伍ID',
+    roster_version INT NOT NULL COMMENT '封榜时固化的名单版本',
+    race_version INT NOT NULL COMMENT '封榜时固化的个人成绩版本（封榜后的赛事版本）',
+    member_count INT NOT NULL COMMENT '封榜时锁定名单人数',
+    ranked_count INT NOT NULL COMMENT '封榜时RANKED成员人数',
+    total_time_ms BIGINT COMMENT '封榜时固化的团队得分（毫秒）；存在未排名成员为NULL',
+    CONSTRAINT pk_snapshot_team PRIMARY KEY (race_id, team_id),
+    CONSTRAINT fk_snapshot_team_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
+);
+
 CREATE TABLE IF NOT EXISTS idempotency_record (
-    request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求ID（写操作幂等键）',
-    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE',
+    request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求ID（写操作幂等键）；名单锁定使用rosterKey指纹',
+    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE/CREATE_TEAM/ADD_TEAM_MEMBER/REMOVE_TEAM_MEMBER/LOCK_ROSTER/BATCH_LOCK_ROSTER/UNLOCK_ROSTER',
     request_digest CHAR(64) NOT NULL COMMENT '请求参数（requestId除外，含expectedVersion）规范化JSON的SHA-256摘要',
     response_status INT NOT NULL COMMENT '原成功请求的HTTP状态码，重放时原样返回',
     response_body TEXT COMMENT '原成功响应体JSON，重放时原样返回',

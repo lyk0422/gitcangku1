@@ -1,16 +1,25 @@
 package com.example.starter.race.service;
 
 import com.example.starter.race.api.AddPenaltyRequest;
+import com.example.starter.race.api.AddTeamMemberRequest;
+import com.example.starter.race.api.BatchLockRosterRequest;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
 import com.example.starter.race.api.CreateRaceRequest;
+import com.example.starter.race.api.CreateTeamRequest;
+import com.example.starter.race.api.LockRosterRequest;
 import com.example.starter.race.api.RegisterRunnerRequest;
+import com.example.starter.race.api.RemoveTeamMemberRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
 import com.example.starter.race.api.MissingCheckpointsResponse;
+import com.example.starter.race.api.RunnerTeamResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.api.SubmitTimingRequest;
+import com.example.starter.race.api.TeamRosterResponse;
+import com.example.starter.race.api.TeamStandingsResponse;
+import com.example.starter.race.api.UnlockRosterRequest;
 
 /**
  * 赛事成绩封榜应用服务；每个写方法在单个数据库事务内完成
@@ -59,4 +68,39 @@ public interface RaceService {
 
     /** 查询赛事全部选手缺失检查点汇总，按参赛号与检查点顺序稳定返回；只读。 */
     MissingCheckpointsResponse getMissingCheckpoints(String raceId);
+
+    /** 创建队伍（队长须为已报名选手）；版本不匹配或赛事已封榜返回409。 */
+    ServiceResult createTeam(String raceId, CreateTeamRequest request);
+
+    /** 新增队伍成员；仅名单未锁定时可用，每名参赛者同一赛事最多属于一支队伍。 */
+    ServiceResult addTeamMember(String raceId, String teamId, AddTeamMemberRequest request);
+
+    /** 移除队伍成员；仅名单未锁定时可用。 */
+    ServiceResult removeTeamMember(String raceId, String teamId, String bib,
+                                   RemoveTeamMemberRequest request);
+
+    /**
+     * 队长提交名单锁定：人数须为2~8且全部成员具有有效个人报名，否则422；
+     * 锁定后禁止普通增删成员。幂等键为 rosterKey 指纹（队长+赛事版本+队伍+规范化成员集合），
+     * 同键同参重放首次结果，失败不占键。
+     */
+    ServiceResult lockRoster(String raceId, String teamId, LockRosterRequest request);
+
+    /**
+     * 批量锁定多支队伍：先整批校验成员不跨队、人数与全部个人报名，任一失败整批422；
+     * 成功后在一事务写入所有锁定快照。
+     */
+    ServiceResult batchLockRosters(String raceId, BatchLockRosterRequest request);
+
+    /** 裁判解锁队伍名单（须说明原因）；不删除旧锁定快照，重锁生成新版本；封榜后409。 */
+    ServiceResult unlockRoster(String raceId, String teamId, UnlockRosterRequest request);
+
+    /** 查询队伍名单：当前状态、名单版本与全部锁定历史；只读。 */
+    TeamRosterResponse getTeamRoster(String raceId, String teamId);
+
+    /** 查询参赛者队伍归属；未加入任何队伍时 teamId 为 null；只读。 */
+    RunnerTeamResponse getRunnerTeam(String raceId, String bib);
+
+    /** 查询赛事团队得分（OPEN 为重算结果，SEALED 为封榜固化快照）；只读。 */
+    TeamStandingsResponse getTeamStandings(String raceId);
 }
