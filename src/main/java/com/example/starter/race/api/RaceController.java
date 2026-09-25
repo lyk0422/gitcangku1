@@ -7,6 +7,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
@@ -85,6 +86,37 @@ public class RaceController {
             @PathVariable String raceId,
             @Valid @RequestBody SealRaceRequest request) {
         return toResponse(raceService.sealRace(raceId, request));
+    }
+
+    /** 一次性登记分批起跑波次（1~20 个）。 */
+    @PostMapping("/{raceId}/waves")
+    public ResponseEntity<Object> registerWaves(
+            @PathVariable String raceId,
+            @Valid @RequestBody RegisterWavesRequest request) {
+        return toResponse(raceService.registerWaves(raceId, request));
+    }
+
+    /** 修改单个波次的起跑时刻与参赛者集合。 */
+    @PutMapping("/{raceId}/waves/{waveKey}")
+    public ResponseEntity<Object> updateWave(
+            @PathVariable String raceId,
+            @PathVariable String waveKey,
+            @Valid @RequestBody UpdateWaveRequest request) {
+        return toResponse(raceService.updateWave(raceId, waveKey, request));
+    }
+
+    /** 查询赛事波次清单。 */
+    @GetMapping("/{raceId}/waves")
+    public WavesResponse getWaves(@PathVariable String raceId) {
+        return raceService.getWaves(raceId);
+    }
+
+    /** 查询单个参赛者的波次归属与净计时。 */
+    @GetMapping("/{raceId}/runners/{bib}/net-time")
+    public RunnerNetTimeResponse getRunnerNetTime(
+            @PathVariable String raceId,
+            @PathVariable String bib) {
+        return raceService.getRunnerNetTime(raceId, bib);
     }
 
     /** 查询即时成绩（封榜后返回只读快照内容）。 */

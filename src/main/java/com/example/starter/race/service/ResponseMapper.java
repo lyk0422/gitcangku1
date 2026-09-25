@@ -4,9 +4,12 @@ import com.example.starter.race.api.CheckpointPassResponse;
 import com.example.starter.race.api.CheckpointTimingResponse;
 import com.example.starter.race.api.PenaltyResponse;
 import com.example.starter.race.api.ResultEntryResponse;
+import com.example.starter.race.api.RunnerNetTimeResponse;
 import com.example.starter.race.api.RunnerResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.StandingResponse;
+import com.example.starter.race.api.WaveResponse;
+import com.example.starter.race.api.WavesResponse;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
@@ -18,7 +21,11 @@ import com.example.starter.race.persistence.RunnerRow;
 import com.example.starter.race.persistence.SnapshotCheckpointRow;
 import com.example.starter.race.persistence.SnapshotEntryRow;
 import com.example.starter.race.persistence.SnapshotRow;
+import com.example.starter.race.persistence.WaveAssignment;
+import com.example.starter.race.persistence.WaveEntrantRow;
+import com.example.starter.race.persistence.WaveRow;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -51,9 +58,10 @@ final class ResponseMapper {
             List<RunnerRow> runners,
             List<PenaltyRow> penalties,
             List<CheckpointRow> checkpoints,
-            List<CheckpointTimingRow> timings) {
+            List<CheckpointTimingRow> timings,
+            List<WaveAssignment> waveAssignments) {
         List<ResultEntry> entries = ResultCalculator.compute(
-                runners, penalties, checkpoints, timings);
+                runners, penalties, checkpoints, timings, waveAssignments, race.baseStartMs());
         return new StandingResponse(
                 race.raceId(),
                 race.version(),
@@ -79,6 +87,11 @@ final class ResponseMapper {
                 entry.finishTimeMs(),
                 entry.penaltyMs(),
                 entry.totalTimeMs(),
+                entry.waveKey(),
+                entry.waveStartMs(),
+                entry.baseStartMs(),
+                entry.netTimeMs(),
+                entry.invalidReason(),
                 entry.checkpointCount(),
                 entry.coveredCheckpointCount(),
                 entry.missingCheckpoints());
@@ -92,6 +105,11 @@ final class ResponseMapper {
                 entry.finishTimeMs(),
                 entry.penaltyMs(),
                 entry.totalTimeMs(),
+                entry.waveKey(),
+                entry.waveStartMs(),
+                entry.baseStartMs(),
+                entry.netTimeMs(),
+                entry.invalidReason(),
                 entry.checkpointCount(),
                 entry.coveredCheckpointCount(),
                 entry.missingCheckpoints());
@@ -150,5 +168,64 @@ final class ResponseMapper {
                 .toList();
         return new RunnerTimingResponse(
                 snapshot.raceId(), bib, snapshot.version(), finishTimeMs, passes);
+    }
+
+    /** 组装赛事波次清单：波次按 waveKey 字典序，每波次参赛者按参赛号字典序。 */
+    static WavesResponse wavesResponse(
+            String raceId,
+            int version,
+            List<WaveRow> waves,
+            List<WaveEntrantRow> allEntrants) {
+        Map<String, List<String>> bibsByWave = new LinkedHashMap<>();
+        for (WaveRow wave : waves) {
+            bibsByWave.put(wave.waveKey(), new ArrayList<>());
+        }
+        for (WaveEntrantRow entrant : allEntrants) {
+            List<String> bibs = bibsByWave.get(entrant.waveKey());
+            if (bibs != null) {
+                bibs.add(entrant.bib());
+            }
+        }
+        List<WaveResponse> waveResponses = waves.stream()
+                .map(wave -> new WaveResponse(
+                        wave.waveKey(),
+                        wave.startMs(),
+                        List.copyOf(bibsByWave.get(wave.waveKey())),
+                        wave.createdAt(),
+                        wave.updatedAt()))
+                .toList();
+        return new WavesResponse(raceId, version, waveResponses);
+    }
+
+    /** 由即时计算的成绩条目组装单参赛者净计时视图（OPEN）。 */
+    static RunnerNetTimeResponse liveRunnerNetTime(int version, ResultEntry entry) {
+        return new RunnerNetTimeResponse(
+                entry.bib(),
+                version,
+                entry.status(),
+                entry.finishTimeMs(),
+                entry.penaltyMs(),
+                entry.totalTimeMs(),
+                entry.waveKey(),
+                entry.waveStartMs(),
+                entry.baseStartMs(),
+                entry.netTimeMs(),
+                entry.invalidReason());
+    }
+
+    /** 由封榜快照条目组装单参赛者净计时视图（SEALED，只读）。 */
+    static RunnerNetTimeResponse snapshotRunnerNetTime(SnapshotEntryRow entry, int version) {
+        return new RunnerNetTimeResponse(
+                entry.bib(),
+                version,
+                entry.status(),
+                entry.finishTimeMs(),
+                entry.penaltyMs(),
+                entry.totalTimeMs(),
+                entry.waveKey(),
+                entry.waveStartMs(),
+                entry.baseStartMs(),
+                entry.netTimeMs(),
+                entry.invalidReason());
     }
 }
