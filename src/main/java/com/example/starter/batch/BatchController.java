@@ -4,6 +4,7 @@ import com.example.starter.batch.dto.ApproveRequest;
 import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
+import com.example.starter.batch.dto.CreateConditionRequest;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
 import jakarta.validation.Valid;
@@ -62,13 +63,25 @@ public class BatchController {
     }
 
     /**
-     * 召回已放行批次。
+     * 召回已放行批次（RELEASED）或条件放行期内批次（CONDITIONAL）。
      */
     @PostMapping("/{batchKey}/recall")
     public ResponseEntity<String> recall(@PathVariable String batchKey,
                                          @RequestHeader(name = "X-Actor-Id", required = false) String actorId,
                                          @Valid @RequestBody RecallRequest request) {
         return stored(service.recall(batchKey, actorId, request));
+    }
+
+    /**
+     * 创建条件放行；X-Actor-Id 为批准人，X-Approval-Role 为 QUALITY 或 OPERATIONS。
+     * 仅已通过全部必做检验但尚未批准（或上一条条件放行已到期降级）的批次可创建。
+     */
+    @PostMapping("/{batchKey}/conditions")
+    public ResponseEntity<String> createCondition(@PathVariable String batchKey,
+                                                  @RequestHeader(name = "X-Actor-Id", required = false) String actorId,
+                                                  @RequestHeader(name = "X-Approval-Role", required = false) String role,
+                                                  @Valid @RequestBody CreateConditionRequest request) {
+        return stored(service.createCondition(batchKey, actorId, role, request));
     }
 
     /**

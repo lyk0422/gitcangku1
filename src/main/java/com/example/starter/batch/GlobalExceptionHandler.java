@@ -17,7 +17,12 @@ import org.springframework.web.servlet.resource.NoResourceFoundException;
 public class GlobalExceptionHandler {
 
     @ExceptionHandler(ApiException.class)
-    public ResponseEntity<ErrorResponse> handleApi(ApiException ex) {
+    public ResponseEntity<Object> handleApi(ApiException ex) {
+        if (ex instanceof ConditionBlockedException blocked) {
+            return ResponseEntity.status(ex.status())
+                    .body(new ConditionBlockedResponse(ex.code(), blocked.reason(),
+                            ex.getMessage(), blocked.openItems()));
+        }
         return ResponseEntity.status(ex.status())
                 .body(new ErrorResponse(ex.code(), ex.getMessage()));
     }

@@ -48,6 +48,22 @@ public class BatchRepository {
                              int responseStatus, String responseBody) {
     }
 
+    /**
+     * conditional_release 表行记录：一条条件放行（1～5 个条件子项）。
+     */
+    public record ConditionalReleaseRow(long id, String conditionKey, String batchKey,
+                                        String commandKey, String creatorId, String creatorRole,
+                                        String expiresAt, String createdAt) {
+    }
+
+    /**
+     * condition_item 表行记录：closedAt 为 null 表示尚未核销。
+     */
+    public record ConditionItemRow(long id, String conditionKey, String itemKey, String description,
+                                   int seq, String closedAt, String closerId, String closerRole,
+                                   String closeCommandKey, String evidence) {
+    }
+
     private static final RowMapper<BatchRow> BATCH_MAPPER = (rs, n) -> new BatchRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("product_code"),
             rs.getString("batch_no"), rs.getString("produced_at"),
@@ -70,6 +86,19 @@ public class BatchRepository {
     private static final RowMapper<CommandRow> COMMAND_MAPPER = (rs, n) -> new CommandRow(
             rs.getString("command_type"), rs.getString("command_key"), rs.getString("fingerprint"),
             rs.getInt("response_status"), rs.getString("response_body"));
+
+    private static final RowMapper<ConditionalReleaseRow> CONDITIONAL_RELEASE_MAPPER = (rs, n) ->
+            new ConditionalReleaseRow(rs.getLong("id"), rs.getString("condition_key"),
+                    rs.getString("batch_key"), rs.getString("command_key"),
+                    rs.getString("creator_id"), rs.getString("creator_role"),
+                    rs.getString("expires_at"), rs.getString("created_at"));
+
+    private static final RowMapper<ConditionItemRow> CONDITION_ITEM_MAPPER = (rs, n) ->
+            new ConditionItemRow(rs.getLong("id"), rs.getString("condition_key"),
+                    rs.getString("item_key"), rs.getString("description"), rs.getInt("seq"),
+                    rs.getString("closed_at"), rs.getString("closer_id"),
+                    rs.getString("closer_role"), rs.getString("close_command_key"),
+                    rs.getString("evidence"));
 
     private final JdbcTemplate jdbc;
 
@@ -112,8 +141,22 @@ public class BatchRepository {
         jdbc.update("UPDATE batch SET status = ? WHERE batch_key = ?", status, batchKey);
     }
 
-    public List<BatchRow> findAvailableBatches() {
-        return jdbc.query("SELECT * FROM batch WHERE status <> 'RECALLED' ORDER BY id", BATCH_MAPPER);
+    /**
+     * 当前可用批次：排除已召回批次；CONDITIONAL 批次在其最新一条条件放行到期时刻已到
+     * （到期降级后允许重建，旧条件放行记录保留，故只按 id 最大的当前条件放行裁决）
+     * 且仍有未核销子项时实时降级，不出现在结果中（按传入的当前 UTC 时刻判定，不依赖后台任务）。
+     * ISO-8601 UTC instant 字符串可直接按字典序比较先后。
+     */
+    public List<BatchRow> findAvailableBatches(String nowIso) {
+        return jdbc.query(
+                "SELECT * FROM batch b WHERE b.status <> 'RECALLED'"
+                        + " AND NOT (b.status = 'CONDITIONAL' AND EXISTS ("
+                        + " SELECT 1 FROM conditional_release c"
+                        + " WHERE c.batch_key = b.batch_key AND c.expires_at <= ?"
+                        + " AND c.id = (SELECT MAX(c2.id) FROM conditional_release c2"
+                        + " WHERE c2.batch_key = b.batch_key)))"
+                        + " ORDER BY b.id",
+                BATCH_MAPPER, nowIso);
     }
 
     public Optional<TestRow> findTest(String batchKey, String testKey) {
@@ -163,10 +206,86 @@ public class BatchRepository {
                 .stream().findFirst();
     }
 
-    public void insertCommand(CommandRow row, String createdAt) {
+    /**
+     * 插入幂等命令占位行：业务动作执行前先占用 (command_type, command_key)。
+     * 并发同键 INSERT 会阻塞至先到事务提交（本方随后得到唯一键冲突并改读其快照）
+     * 或回滚（占位行随事务消失，本方继续执行业务）；业务失败即回滚，失败不占键。
+     */
+    public void insertCommandPlaceholder(String commandType, String commandKey, String fingerprint,
+                                         String createdAt) {
         jdbc.update("INSERT INTO command_log (command_type, command_key, fingerprint,"
-                        + " response_status, response_body, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                row.commandType(), row.commandKey(), row.fingerprint(),
-                row.responseStatus(), row.responseBody(), createdAt);
+                        + " response_status, response_body, created_at) VALUES (?, ?, ?, 0, '', ?)",
+                commandType, commandKey, fingerprint, createdAt);
+    }
+
+    /**
+     * 业务动作成功后，把占位行更新为首次响应快照。
+     */
+    public void updateCommandResult(String commandType, String commandKey, int responseStatus,
+                                    String responseBody) {
+        jdbc.update("UPDATE command_log SET response_status = ?, response_body = ?"
+                        + " WHERE command_type = ? AND command_key = ?",
+                responseStatus, responseBody, commandType, commandKey);
+    }
+
+    public Optional<ConditionalReleaseRow> findConditionalRelease(String conditionKey) {
+        return jdbc.query("SELECT * FROM conditional_release WHERE condition_key = ?",
+                        CONDITIONAL_RELEASE_MAPPER, conditionKey)
+                .stream().findFirst();
+    }
+
+    /**
+     * 批次最新一条条件放行（到期降级后可重建，历史条件放行全部保留）。
+     */
+    public Optional<ConditionalReleaseRow> findLatestConditionalReleaseForBatch(String batchKey) {
+        return jdbc.query("SELECT * FROM conditional_release WHERE batch_key = ? ORDER BY id DESC LIMIT 1",
+                        CONDITIONAL_RELEASE_MAPPER, batchKey)
+                .stream().findFirst();
+    }
+
+    /**
+     * 批次全部条件放行（按创建顺序稳定排序；历史明细用，记录永不物理删除）。
+     */
+    public List<ConditionalReleaseRow> findConditionalReleasesForBatch(String batchKey) {
+        return jdbc.query("SELECT * FROM conditional_release WHERE batch_key = ? ORDER BY id",
+                CONDITIONAL_RELEASE_MAPPER, batchKey);
+    }
+
+    public void insertConditionalRelease(ConditionalReleaseRow row) {
+        jdbc.update("INSERT INTO conditional_release (condition_key, batch_key, command_key,"
+                        + " creator_id, creator_role, expires_at, created_at)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                row.conditionKey(), row.batchKey(), row.commandKey(), row.creatorId(),
+                row.creatorRole(), row.expiresAt(), row.createdAt());
+    }
+
+    public List<ConditionItemRow> findConditionItems(String conditionKey) {
+        return jdbc.query("SELECT * FROM condition_item WHERE condition_key = ? ORDER BY seq",
+                CONDITION_ITEM_MAPPER, conditionKey);
+    }
+
+    public Optional<ConditionItemRow> findConditionItem(String conditionKey, String itemKey) {
+        return jdbc.query("SELECT * FROM condition_item WHERE condition_key = ? AND item_key = ?",
+                        CONDITION_ITEM_MAPPER, conditionKey, itemKey)
+                .stream().findFirst();
+    }
+
+    public void insertConditionItem(String conditionKey, String itemKey, String description, int seq) {
+        jdbc.update("INSERT INTO condition_item (condition_key, item_key, description, seq)"
+                        + " VALUES (?, ?, ?, ?)",
+                conditionKey, itemKey, description, seq);
+    }
+
+    /**
+     * 核销子项：仅当 closed_at 仍为 NULL 时生效，返回受影响行数；
+     * 行已存在（含并发重复核销）时返回 0，核销不重复计数。
+     */
+    public int closeConditionItemIfOpen(String conditionKey, String itemKey, String closerId,
+                                        String closerRole, String commandKey, String evidence,
+                                        String closedAt) {
+        return jdbc.update("UPDATE condition_item SET closed_at = ?, closer_id = ?, closer_role = ?,"
+                        + " close_command_key = ?, evidence = ?"
+                        + " WHERE condition_key = ? AND item_key = ? AND closed_at IS NULL",
+                closedAt, closerId, closerRole, commandKey, evidence, conditionKey, itemKey);
     }
 }
