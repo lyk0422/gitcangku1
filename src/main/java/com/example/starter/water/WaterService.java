@@ -1,14 +1,22 @@
 package com.example.starter.water;
 
 import com.example.starter.water.WaterRepository.AllocationRow;
+import com.example.starter.water.WaterRepository.BlendLineRow;
+import com.example.starter.water.WaterRepository.BlendSnapshotRow;
 import com.example.starter.water.WaterRepository.CommandRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
+import com.example.starter.water.WaterRepository.SourceRow;
 import com.example.starter.water.WaterRepository.TransferRow;
 import com.example.starter.water.WaterRepository.WindowRow;
 import com.example.starter.water.dto.Dtos.AllocationResponse;
+import com.example.starter.water.dto.Dtos.AllocationSalinityResponse;
+import com.example.starter.water.dto.Dtos.BlendLineResponse;
+import com.example.starter.water.dto.Dtos.BlendResponse;
+import com.example.starter.water.dto.Dtos.BlendSourceItem;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.SourceResponse;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferResponse;
 import com.example.starter.water.dto.Dtos.WindowResponse;
@@ -19,9 +27,13 @@ import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
@@ -84,9 +96,10 @@ public class WaterService {
         });
     }
 
-    /** 提交配水申请，申请人为 actor。 */
+    /** 提交配水申请，申请人为 actor；maxSalinity 为可空的掺配盐度上限（毫克每升）。 */
     public AllocationResponse submitAllocation(String commandKey, String allocationKey, Long windowId,
-                                               String userId, String amount, String actor) {
+                                               String userId, String amount, String maxSalinity,
+                                               String actor) {
         requireKey("commandKey", commandKey);
         requireKey("allocationKey", allocationKey);
         requireKey("userId", userId);
@@ -95,14 +108,17 @@ public class WaterService {
             throw ApiException.badRequest("INVALID_ARGUMENT", "windowId 不能为空");
         }
         BigDecimal qty = parseAmount("amount", amount);
+        BigDecimal maxSalinityMgL = parseSalinity("maxSalinityMgPerL", maxSalinity);
         String params = "ALLOCATION_SUBMIT|" + allocationKey + "|" + windowId + "|" + userId + "|"
-                + qty.toPlainString() + "|" + actor;
+                + qty.toPlainString() + "|" + (maxSalinityMgL == null ? "-" : maxSalinityMgL.toPlainString())
+                + "|" + actor;
         return runCommand("ALLOCATION_SUBMIT", commandKey, params, AllocationResponse.class, () -> {
             WindowRow window = repository.lockWindowById(windowId);
             if (window == null) {
                 throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + windowId);
             }
-            long id = repository.insertAllocation(allocationKey, windowId, userId, qty, actor, nowNanos());
+            long id = repository.insertAllocation(allocationKey, windowId, userId, qty, maxSalinityMgL,
+                    actor, nowNanos());
             return toAllocationResponse(repository.findAllocationByKey(allocationKey));
         });
     }
@@ -316,6 +332,211 @@ public class WaterService {
     }
 
     // ------------------------------------------------------------------
+    // 水源与掺配核销
+    // ------------------------------------------------------------------
+
+    /** 创建水源：sourceId 全局唯一，可用量与盐度最多 3 位小数。 */
+    public SourceResponse createSource(String commandKey, String sourceId, String availableAmount,
+                                       String salinity) {
+        requireKey("commandKey", commandKey);
+        requireKey("sourceId", sourceId);
+        BigDecimal available = parseAmount("availableAmount", availableAmount);
+        BigDecimal salinityMgL = parseSalinity("salinityMgPerL", salinity);
+        if (salinityMgL == null) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "salinityMgPerL 不能为空");
+        }
+        String params = "SOURCE_CREATE|" + sourceId + "|" + available.toPlainString() + "|"
+                + salinityMgL.toPlainString();
+        return runCommand("SOURCE_CREATE", commandKey, params, SourceResponse.class, () -> {
+            if (repository.findSourceById(sourceId) != null) {
+                throw ApiException.conflict("SOURCE_EXISTS", "水源已存在: " + sourceId);
+            }
+            try {
+                repository.insertSource(sourceId, available, salinityMgL, nowNanos());
+            } catch (DuplicateKeyException e) {
+                // 并发同 sourceId 创建：事务回滚，按提交顺序后者失败
+                throw ApiException.conflict("SOURCE_EXISTS", "水源已存在: " + sourceId);
+            }
+            return toSourceResponse(repository.findSourceById(sourceId));
+        });
+    }
+
+    /** 修改水源盐度：expectedVersion 须等于当前版本，否则 409；修改只影响后续核销，不改写历史快照。 */
+    public SourceResponse updateSourceSalinity(String commandKey, String sourceId, Long expectedVersion,
+                                               String salinity) {
+        requireKey("commandKey", commandKey);
+        requireKey("sourceId", sourceId);
+        if (expectedVersion == null || expectedVersion < 0) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "expectedVersion 必须为不小于 0 的整数");
+        }
+        BigDecimal salinityMgL = parseSalinity("salinityMgPerL", salinity);
+        if (salinityMgL == null) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "salinityMgPerL 不能为空");
+        }
+        String params = "SOURCE_SALINITY_UPDATE|" + sourceId + "|" + expectedVersion + "|"
+                + salinityMgL.toPlainString();
+        return runCommand("SOURCE_SALINITY_UPDATE", commandKey, params, SourceResponse.class, () -> {
+            SourceRow source = repository.lockSourceById(sourceId);
+            if (source == null) {
+                throw ApiException.notFound("SOURCE_NOT_FOUND", "水源不存在: " + sourceId);
+            }
+            if (source.version() != expectedVersion) {
+                throw ApiException.conflict("SOURCE_VERSION_CONFLICT",
+                        "水源版本已变更：期望 " + expectedVersion + "，当前 " + source.version());
+            }
+            repository.updateSourceSalinity(source.id(), salinityMgL, nowNanos());
+            return toSourceResponse(repository.findSourceById(sourceId));
+        });
+    }
+
+    /** 查询水源余量、盐度与版本。 */
+    public SourceResponse getSource(String sourceId) {
+        SourceRow source = repository.findSourceById(sourceId);
+        if (source == null) {
+            throw ApiException.notFound("SOURCE_NOT_FOUND", "水源不存在: " + sourceId);
+        }
+        return toSourceResponse(source);
+    }
+
+    /**
+     * 掺配核销：一次核销选择 1 至 5 个水源及各自取水量（换序视为同参），各取水量之和必须等于
+     * 申请核销量 settleAmount；任一水源可用量不足、总量不等或加权平均盐度高于申请上限均返回 422
+     * 并给出水源余量或计算值。成功时在同一事务扣减全部水源可用量与申请剩余额度，写入不可变掺配
+     * 快照；任一扣减失败整单回滚。blendKey 指纹含操作者、申请版本、规范化水源集合与数量，
+     * 同键同参重放首次完整结果，失败不占键。
+     */
+    public BlendResponse blend(String blendKey, String allocationKey, Long allocationVersion,
+                               String settleAmount, List<BlendSourceItem> sources, String operator) {
+        requireKey("blendKey", blendKey);
+        requireKey("allocationKey", allocationKey);
+        requireKey("X-Actor-Id", operator);
+        if (allocationVersion == null || allocationVersion < 0) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "allocationVersion 必须为不小于 0 的整数");
+        }
+        BigDecimal settle = parseAmount("settleAmount", settleAmount);
+        if (sources == null || sources.isEmpty() || sources.size() > 5) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "sources 必须包含 1 至 5 个水源");
+        }
+        // 规范化：按 sourceId 排序的取水映射，重复水源拒绝
+        Map<String, BigDecimal> normalized = new TreeMap<>();
+        for (BlendSourceItem item : sources) {
+            if (item == null) {
+                throw ApiException.badRequest("INVALID_ARGUMENT", "sources 不能包含空项");
+            }
+            requireKey("sources[].sourceId", item.sourceId());
+            BigDecimal amount = parseAmount("sources[" + item.sourceId() + "].amount", item.amount());
+            if (normalized.putIfAbsent(item.sourceId(), amount) != null) {
+                throw ApiException.badRequest("INVALID_ARGUMENT", "水源重复: " + item.sourceId());
+            }
+        }
+        BigDecimal total = normalized.values().stream().reduce(BigDecimal.ZERO, BigDecimal::add);
+        if (total.compareTo(settle) != 0) {
+            throw ApiException.unprocessable("BLEND_TOTAL_MISMATCH",
+                    "各水源取水量之和 " + fmt(total) + " 不等于申请核销量 " + fmt(settle));
+        }
+        StringBuilder fingerprint = new StringBuilder("BLEND|").append(allocationKey).append('|')
+                .append(operator).append('|').append(allocationVersion).append('|')
+                .append(settle.toPlainString());
+        normalized.forEach((sourceId, amount) -> fingerprint.append('|').append(sourceId).append(':')
+                .append(amount.toPlainString()));
+        return runCommand("BLEND", blendKey, fingerprint.toString(), BlendResponse.class, () -> {
+            // 先锁申请行，与批准/取消/转让按提交顺序串行裁决
+            AllocationRow allocation = repository.lockAllocationByKey(allocationKey);
+            if (allocation == null) {
+                throw ApiException.notFound("ALLOCATION_NOT_FOUND", "配水申请不存在: " + allocationKey);
+            }
+            if (allocation.version() != allocationVersion) {
+                throw ApiException.conflict("ALLOCATION_VERSION_CONFLICT",
+                        "申请版本已变更：期望 " + allocationVersion + "，当前 " + allocation.version());
+            }
+            if (!STATUS_APPROVED.equals(allocation.status())) {
+                throw ApiException.conflict("ALLOCATION_NOT_APPROVED",
+                        "只有 APPROVED 状态的申请可以核销，当前状态: " + allocation.status());
+            }
+            if (allocation.heldAmount().compareTo(settle) < 0) {
+                throw ApiException.unprocessable("ALLOCATION_BALANCE_INSUFFICIENT",
+                        "申请剩余额度 " + fmt(allocation.heldAmount()) + " 不足，无法核销 " + fmt(settle));
+            }
+            // 再按 sourceId 字典序锁定全部水源行，避免并发核销死锁
+            List<SourceRow> locked = new ArrayList<>();
+            for (String sourceId : normalized.keySet()) {
+                SourceRow source = repository.lockSourceById(sourceId);
+                if (source == null) {
+                    throw ApiException.notFound("SOURCE_NOT_FOUND", "水源不存在: " + sourceId);
+                }
+                locked.add(source);
+            }
+            BigDecimal saltTotal = BigDecimal.ZERO;
+            for (SourceRow source : locked) {
+                BigDecimal amount = normalized.get(source.sourceId());
+                if (source.availableAmount().compareTo(amount) < 0) {
+                    throw ApiException.unprocessable("SOURCE_INSUFFICIENT",
+                            "水源 " + source.sourceId() + " 余量 " + fmt(source.availableAmount())
+                                    + " 不足，需取水 " + fmt(amount));
+                }
+                saltTotal = saltTotal.add(amount.multiply(source.salinityMgL()));
+            }
+            // 加权平均盐度 = saltTotal / settle；与上限比较用等价的精确乘法，避免除法舍入误差
+            if (allocation.maxSalinityMgL() != null
+                    && saltTotal.compareTo(allocation.maxSalinityMgL().multiply(settle)) > 0) {
+                BigDecimal average = saltTotal.divide(settle, 6, RoundingMode.HALF_UP);
+                throw ApiException.unprocessable("SALINITY_EXCEEDED",
+                        "加权平均盐度 " + fmt(average) + " 毫克每升，高于申请上限 "
+                                + fmt(allocation.maxSalinityMgL()));
+            }
+            long now = nowNanos();
+            for (SourceRow source : locked) {
+                BigDecimal amount = normalized.get(source.sourceId());
+                if (repository.deductSourceAvailable(source.id(), amount, now) == 0) {
+                    // 行锁内不会发生；兜底保证任一扣减失败整单回滚
+                    throw ApiException.unprocessable("SOURCE_INSUFFICIENT",
+                            "水源 " + source.sourceId() + " 余量不足，无法扣减 " + fmt(amount));
+                }
+            }
+            if (repository.deductAllocationHeld(allocation.id(), settle, now) == 0) {
+                throw ApiException.unprocessable("ALLOCATION_BALANCE_INSUFFICIENT",
+                        "申请剩余额度不足，无法核销 " + fmt(settle));
+            }
+            BigDecimal weighted = saltTotal.divide(settle, 6, RoundingMode.HALF_UP);
+            long snapshotId = repository.insertBlendSnapshot(blendKey, allocationKey, allocationVersion,
+                    operator, settle, saltTotal, weighted, now);
+            for (SourceRow source : locked) {
+                repository.insertBlendLine(snapshotId, source.sourceId(), source.version(),
+                        normalized.get(source.sourceId()), source.salinityMgL());
+            }
+            return toBlendResponse(repository.findSnapshotByBlendKey(blendKey));
+        });
+    }
+
+    /** 查询掺配快照（不可变），含冻结的水源明细。 */
+    public BlendResponse getBlendSnapshot(String blendKey) {
+        BlendSnapshotRow snapshot = repository.findSnapshotByBlendKey(blendKey);
+        if (snapshot == null) {
+            throw ApiException.notFound("BLEND_NOT_FOUND", "掺配快照不存在: " + blendKey);
+        }
+        return toBlendResponse(snapshot);
+    }
+
+    /** 查询申请累计盐度：全部核销按核销量加权的累计平均盐度；无核销记录时为 null。 */
+    public AllocationSalinityResponse getAllocationSalinity(String allocationKey) {
+        AllocationRow allocation = repository.findAllocationByKey(allocationKey);
+        if (allocation == null) {
+            throw ApiException.notFound("ALLOCATION_NOT_FOUND", "配水申请不存在: " + allocationKey);
+        }
+        List<BlendSnapshotRow> snapshots = repository.listSnapshotsByAllocation(allocationKey);
+        BigDecimal settledTotal = BigDecimal.ZERO;
+        BigDecimal saltTotal = BigDecimal.ZERO;
+        for (BlendSnapshotRow snapshot : snapshots) {
+            settledTotal = settledTotal.add(snapshot.settleAmount());
+            saltTotal = saltTotal.add(snapshot.saltTotal());
+        }
+        String cumulative = settledTotal.signum() > 0
+                ? fmt(saltTotal.divide(settledTotal, 6, RoundingMode.HALF_UP)) : null;
+        return new AllocationSalinityResponse(allocationKey, fmt(settledTotal), cumulative,
+                snapshots.size());
+    }
+
+    // ------------------------------------------------------------------
     // 幂等命令框架
     // ------------------------------------------------------------------
 
@@ -378,7 +599,8 @@ public class WaterService {
 
     private AllocationResponse toAllocationResponse(AllocationRow row) {
         return new AllocationResponse(row.allocationKey(), row.windowId(), row.userId(), fmt(row.amount()),
-                fmt(row.heldAmount()), row.requester(), row.status(),
+                fmt(row.heldAmount()), row.maxSalinityMgL() == null ? null : fmt(row.maxSalinityMgL()),
+                row.version(), row.requester(), row.status(),
                 toIso(row.createdNanos()), toIso(row.updatedNanos()));
     }
 
@@ -390,6 +612,21 @@ public class WaterService {
     private CurtailmentResponse toCurtailmentResponse(CurtailmentRow row) {
         return new CurtailmentResponse(row.id(), row.windowId(), fmt(row.volume()), row.status(),
                 toIso(row.createdNanos()), row.cancelledNanos() == null ? null : toIso(row.cancelledNanos()));
+    }
+
+    private SourceResponse toSourceResponse(SourceRow row) {
+        return new SourceResponse(row.sourceId(), fmt(row.availableAmount()), fmt(row.salinityMgL()),
+                row.version(), toIso(row.createdNanos()), toIso(row.updatedNanos()));
+    }
+
+    private BlendResponse toBlendResponse(BlendSnapshotRow row) {
+        List<BlendLineResponse> lines = repository.listBlendLines(row.id()).stream()
+                .map(line -> new BlendLineResponse(line.sourceId(), line.sourceVersion(), fmt(line.amount()),
+                        fmt(line.salinityMgL())))
+                .toList();
+        return new BlendResponse(row.blendKey(), row.allocationKey(), row.allocationVersion(),
+                row.operator(), fmt(row.settleAmount()), fmt(row.weightedSalinityMgL()), lines,
+                toIso(row.createdNanos()));
     }
 
     static long nowNanos() {
@@ -437,6 +674,19 @@ public class WaterService {
             throw ApiException.badRequest("INVALID_ARGUMENT", field + " 必须大于 0");
         }
         return amount;
+    }
+
+    /** 解析盐度：十进制字符串，不小于 0，最多 3 位小数；空值返回 null（表示未声明）。 */
+    static BigDecimal parseSalinity(String field, String value) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        String trimmed = value.trim();
+        if (!AMOUNT_PATTERN.matcher(trimmed).matches()) {
+            throw ApiException.badRequest("INVALID_ARGUMENT",
+                    field + " 必须为不小于 0 的十进制字符串，最多 3 位小数: " + value);
+        }
+        return new BigDecimal(trimmed);
     }
 
     static void requireKey(String field, String value) {

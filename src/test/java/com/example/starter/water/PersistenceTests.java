@@ -38,8 +38,8 @@ class PersistenceTests {
         WaterRepository repo1 = new WaterRepository(new JdbcTemplate(first));
         long windowId = repo1.insertWindow("wk-persist", "ch-persist", 1_000L, 2_000L,
                 new BigDecimal("10.000"), 1L);
-        repo1.insertAllocation("ak-source", windowId, "user-1", new BigDecimal("6.000"), "alice", 2L);
-        repo1.insertAllocation("ak-target", windowId, "user-2", new BigDecimal("2.500"), "bob", 3L);
+        repo1.insertAllocation("ak-source", windowId, "user-1", new BigDecimal("6.000"), null, "alice", 2L);
+        repo1.insertAllocation("ak-target", windowId, "user-2", new BigDecimal("2.500"), null, "bob", 3L);
         AllocationRow source = repo1.findAllocationByKey("ak-source");
         AllocationRow target = repo1.findAllocationByKey("ak-target");
         // 普通批准：源持有额度等于原申请水量
@@ -103,7 +103,7 @@ class PersistenceTests {
         }
         WaterRepository repo = new WaterRepository(new JdbcTemplate(dataSource));
         long windowId = repo.insertWindow("wk-cancel", "ch-cancel", 1L, 2L, new BigDecimal("5"), 1L);
-        repo.insertAllocation("ak-cancel", windowId, "user-1", new BigDecimal("3.000"), "alice", 2L);
+        repo.insertAllocation("ak-cancel", windowId, "user-1", new BigDecimal("3.000"), null, "alice", 2L);
         AllocationRow allocation = repo.findAllocationByKey("ak-cancel");
         repo.updateAllocationStatus(allocation.id(), "APPROVED", 3L);
         assertEquals(new BigDecimal("3.000"), repo.sumApprovedAmount(windowId));
@@ -115,5 +115,65 @@ class PersistenceTests {
         assertEquals(new BigDecimal("3.000"), cancelled.amount());
         assertEquals(0, cancelled.heldAmount().compareTo(BigDecimal.ZERO));
         assertEquals(0, repo.sumApprovedAmount(windowId).compareTo(BigDecimal.ZERO));
+    }
+
+    @Test
+    void blendSnapshotAndSourceAreReadableFromNewConnection() throws Exception {
+        String url = String.format(URL_TEMPLATE, UUID.randomUUID().toString().substring(0, 8));
+        SimpleDriverDataSource first = new SimpleDriverDataSource(new org.h2.Driver(), url, "sa", "");
+        try (Connection connection = first.getConnection()) {
+            ScriptUtils.executeSqlScript(connection, new ClassPathResource("schema.sql"));
+        }
+        WaterRepository repo1 = new WaterRepository(new JdbcTemplate(first));
+        long windowId = repo1.insertWindow("wk-blend", "ch-blend", 1L, 2L, new BigDecimal("20"), 1L);
+        repo1.insertAllocation("ak-blend", windowId, "user-1", new BigDecimal("10.000"),
+                new BigDecimal("400"), "alice", 2L);
+        AllocationRow allocation = repo1.findAllocationByKey("ak-blend");
+        repo1.updateAllocationStatus(allocation.id(), "APPROVED", 3L);
+        repo1.insertSource("src-a", new BigDecimal("100.000"), new BigDecimal("500"), 4L);
+        repo1.insertSource("src-b", new BigDecimal("50.000"), new BigDecimal("200"), 4L);
+        // 核销 4 = 1 + 3，盐量 1100，加权盐度 275
+        repo1.deductSourceAvailable(1L, new BigDecimal("1.000"), 5L);
+        repo1.deductSourceAvailable(2L, new BigDecimal("3.000"), 5L);
+        repo1.deductAllocationHeld(allocation.id(), new BigDecimal("4.000"), 5L);
+        long snapshotId = repo1.insertBlendSnapshot("bk-persist", "ak-blend", 1L, "alice",
+                new BigDecimal("4.000"), new BigDecimal("1100.000000000"),
+                new BigDecimal("275.000000"), 5L);
+        repo1.insertBlendLine(snapshotId, "src-a", 0L, new BigDecimal("1.000"), new BigDecimal("500"));
+        repo1.insertBlendLine(snapshotId, "src-b", 0L, new BigDecimal("3.000"), new BigDecimal("200"));
+
+        // 全新连接与仓储实例读取：快照、明细、水源余量与申请剩余额度保持一致
+        WaterRepository repo2 = new WaterRepository(
+                new JdbcTemplate(new SimpleDriverDataSource(new org.h2.Driver(), url, "sa", "")));
+        WaterRepository.SourceRow sourceA = repo2.findSourceById("src-a");
+        assertNotNull(sourceA);
+        assertEquals(new BigDecimal("99.000"), sourceA.availableAmount());
+        assertEquals(0, sourceA.salinityMgL().compareTo(new BigDecimal("500")));
+        assertEquals(0L, sourceA.version());
+        assertEquals(new BigDecimal("47.000"), repo2.findSourceById("src-b").availableAmount());
+
+        AllocationRow blended = repo2.findAllocationByKey("ak-blend");
+        assertEquals(new BigDecimal("6.000"), blended.heldAmount());
+        assertEquals(0, blended.maxSalinityMgL().compareTo(new BigDecimal("400")));
+        assertEquals(2L, blended.version());
+
+        WaterRepository.BlendSnapshotRow snapshot = repo2.findSnapshotByBlendKey("bk-persist");
+        assertNotNull(snapshot);
+        assertEquals("ak-blend", snapshot.allocationKey());
+        assertEquals(1L, snapshot.allocationVersion());
+        assertEquals("alice", snapshot.operator());
+        assertEquals(new BigDecimal("4.000"), snapshot.settleAmount());
+        assertEquals(0, snapshot.saltTotal().compareTo(new BigDecimal("1100")));
+        assertEquals(0, snapshot.weightedSalinityMgL().compareTo(new BigDecimal("275")));
+        assertEquals(1, repo2.listSnapshotsByAllocation("ak-blend").size());
+
+        var lines = repo2.listBlendLines(snapshotId);
+        assertEquals(2, lines.size());
+        assertEquals("src-a", lines.get(0).sourceId());
+        assertEquals(0L, lines.get(0).sourceVersion());
+        assertEquals(new BigDecimal("1.000"), lines.get(0).amount());
+        assertEquals(0, lines.get(0).salinityMgL().compareTo(new BigDecimal("500")));
+        assertEquals("src-b", lines.get(1).sourceId());
+        assertEquals(new BigDecimal("3.000"), lines.get(1).amount());
     }
 }

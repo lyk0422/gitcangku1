@@ -1,16 +1,22 @@
 package com.example.starter.water;
 
 import com.example.starter.water.dto.Dtos.AllocationResponse;
+import com.example.starter.water.dto.Dtos.AllocationSalinityResponse;
+import com.example.starter.water.dto.Dtos.BlendRequest;
+import com.example.starter.water.dto.Dtos.BlendResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
 import com.example.starter.water.dto.Dtos.CommandRequest;
+import com.example.starter.water.dto.Dtos.CreateSourceRequest;
 import com.example.starter.water.dto.Dtos.CreateWindowRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.SourceResponse;
 import com.example.starter.water.dto.Dtos.SubmitAllocationRequest;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferRequest;
 import com.example.starter.water.dto.Dtos.TransferResponse;
+import com.example.starter.water.dto.Dtos.UpdateSalinityRequest;
 import com.example.starter.water.dto.Dtos.WindowResponse;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -46,7 +52,7 @@ public class WaterController {
     public AllocationResponse submitAllocation(@RequestBody SubmitAllocationRequest request,
                                                @RequestHeader("X-Actor-Id") String actor) {
         return service.submitAllocation(request.commandKey(), request.allocationKey(), request.windowId(),
-                request.userId(), request.amount(), actor);
+                request.userId(), request.amount(), request.maxSalinityMgPerL(), actor);
     }
 
     /** 批准配水申请。 */
@@ -102,5 +108,46 @@ public class WaterController {
     @GetMapping("/windows/{windowId}/history")
     public HistoryResponse getHistory(@PathVariable long windowId) {
         return service.getHistory(windowId);
+    }
+
+    /** 创建掺配水源。 */
+    @PostMapping("/sources")
+    public SourceResponse createSource(@RequestBody CreateSourceRequest request) {
+        return service.createSource(request.commandKey(), request.sourceId(), request.availableAmount(),
+                request.salinityMgPerL());
+    }
+
+    /** 修改水源盐度（携带 expectedVersion，只影响后续核销）。 */
+    @PostMapping("/sources/{sourceId}/salinity")
+    public SourceResponse updateSourceSalinity(@PathVariable String sourceId,
+                                               @RequestBody UpdateSalinityRequest request) {
+        return service.updateSourceSalinity(request.commandKey(), sourceId, request.expectedVersion(),
+                request.salinityMgPerL());
+    }
+
+    /** 查询水源余量、盐度与版本。 */
+    @GetMapping("/sources/{sourceId}")
+    public SourceResponse getSource(@PathVariable String sourceId) {
+        return service.getSource(sourceId);
+    }
+
+    /** 掺配核销：1 至 5 个水源联合扣减并写不可变快照；操作人由 X-Actor-Id 提供。 */
+    @PostMapping("/blends")
+    public BlendResponse blend(@RequestBody BlendRequest request,
+                               @RequestHeader("X-Actor-Id") String actor) {
+        return service.blend(request.blendKey(), request.allocationKey(), request.allocationVersion(),
+                request.settleAmount(), request.sources(), actor);
+    }
+
+    /** 查询掺配快照（不可变）。 */
+    @GetMapping("/blends/{blendKey}")
+    public BlendResponse getBlendSnapshot(@PathVariable String blendKey) {
+        return service.getBlendSnapshot(blendKey);
+    }
+
+    /** 查询申请累计盐度。 */
+    @GetMapping("/allocations/{allocationKey}/salinity")
+    public AllocationSalinityResponse getAllocationSalinity(@PathVariable String allocationKey) {
+        return service.getAllocationSalinity(allocationKey);
     }
 }
