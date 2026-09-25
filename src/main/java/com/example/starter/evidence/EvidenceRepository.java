@@ -77,6 +77,20 @@ public class EvidenceRepository {
     }
 
     /**
+     * 条件更新证物状态：仅当当前状态等于期望值时生效（容器双人复核恢复在锁内调用）。
+     *
+     * @return 更新行数；0 表示证物当前状态与期望不符
+     */
+    public int updateStatusFrom(String evidenceKey, EvidenceStatus expected,
+                                EvidenceStatus status, LocalDateTime now) {
+        return jdbc.update("""
+                        UPDATE evidence SET status = ?, updated_at = ?
+                        WHERE evidence_key = ? AND status = ?
+                        """,
+                status.name(), now, evidenceKey, expected.name());
+    }
+
+    /**
      * 查询指定保管人当前可交接的证物（本人保管且状态 SEALED）。
      */
     public List<Evidence> findTransferable(String custodianId) {

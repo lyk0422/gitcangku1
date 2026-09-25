@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS evidence (
     category VARCHAR(64) NOT NULL COMMENT '证物类别，入库后不可修改',
     seal_no VARCHAR(64) NOT NULL COMMENT '封条编号，入库后不可修改',
     custodian_id VARCHAR(64) NOT NULL COMMENT '当前保管人（操作人标识），交接接受后原子切换；借出期间不变',
-    status VARCHAR(20) NOT NULL COMMENT '证物状态：SEALED 已封存 / TRANSFER_PENDING 待接收 / BORROWED 借出未归还 / SEAL_BROKEN 封条异常（终态）',
+    status VARCHAR(32) NOT NULL COMMENT '证物状态：SEALED 已封存 / TRANSFER_PENDING 待接收 / BORROWED 借出未归还 / PENDING_VERIFICATION 容器巡检失败待逐件核验 / SEAL_BROKEN 封条异常（终态）',
     created_at DATETIME(6) NOT NULL COMMENT '入库时间，Asia/Shanghai',
     updated_at DATETIME(6) NOT NULL COMMENT '最近一次状态或保管人变更时间，Asia/Shanghai',
     CONSTRAINT uk_evidence_key UNIQUE (evidence_key)
@@ -60,12 +60,77 @@ CREATE TABLE IF NOT EXISTS loan_record (
     KEY idx_loan_borrower_status (borrower_id, status)
 );
 
+-- 封存容器：装载多件证物；SEALED 可巡检/变更集合，FAIL 巡检后进入 INSPECTION_FAILED 并持续阻断借出与迁移。
+-- version 为容器行版本：任何容器状态或下次巡检时刻变更均自增，巡检指纹包含发起时所见版本。
+CREATE TABLE IF NOT EXISTS sealed_container (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    container_id VARCHAR(64) NOT NULL COMMENT '容器业务键，全局唯一',
+    status VARCHAR(24) NOT NULL COMMENT '容器状态：SEALED 封存可用 / INSPECTION_FAILED 巡检失败待双人复核',
+    next_inspection_at DATETIME(6) NOT NULL COMMENT '下次巡检截止时刻（UTC）；允许提前巡检，新值必须严格晚于实际巡检时刻',
+    version BIGINT NOT NULL COMMENT '容器行版本，每次容器变更自增；巡检指纹包含客户端发起时所见版本',
+    created_at DATETIME(6) NOT NULL COMMENT '创建时间，Asia/Shanghai',
+    updated_at DATETIME(6) NOT NULL COMMENT '最近一次容器变更时间，Asia/Shanghai',
+    CONSTRAINT uk_container_id UNIQUE (container_id)
+);
+
+-- 容器装载关系：一件证物同一时刻至多装入一个容器；FAIL 容器集合冻结。
+CREATE TABLE IF NOT EXISTS container_item (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    container_id VARCHAR(64) NOT NULL COMMENT '所属容器业务键',
+    evidence_key VARCHAR(64) NOT NULL COMMENT '装载证物业务键',
+    loaded_at DATETIME(6) NOT NULL COMMENT '装载时间，Asia/Shanghai',
+    CONSTRAINT uk_container_item_pair UNIQUE (container_id, evidence_key),
+    CONSTRAINT uk_container_item_evidence UNIQUE (evidence_key)
+);
+
+-- 容器巡检记录：只追加、不可变；FAIL 记录不允许被后续 PASS 改写。
+CREATE TABLE IF NOT EXISTS container_inspection (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    container_id VARCHAR(64) NOT NULL COMMENT '关联容器业务键',
+    inspect_key VARCHAR(64) NOT NULL COMMENT '巡检幂等命令键，全局唯一；同键同参重放首次完整结果，失败不占键',
+    inspector_id VARCHAR(64) NOT NULL COMMENT '检查人（操作人标识）',
+    container_version BIGINT NOT NULL COMMENT '发起巡检时客户端所见容器版本，参与巡检指纹',
+    inspected_at DATETIME(6) NOT NULL COMMENT '实际巡检时刻（UTC），请求指定，允许早于计划时刻',
+    next_inspection_at DATETIME(6) NOT NULL COMMENT '巡检后下次巡检时刻（UTC），必须严格晚于 inspected_at',
+    result VARCHAR(8) NOT NULL COMMENT '封签结果：PASS 通过 / FAIL 失败',
+    note VARCHAR(512) NULL COMMENT '巡检说明；FAIL 时不能为空',
+    created_at DATETIME(6) NOT NULL COMMENT '记录创建时间，Asia/Shanghai',
+    CONSTRAINT uk_container_inspect_key UNIQUE (inspect_key),
+    KEY idx_container_inspection_container (container_id)
+);
+
+-- 逐件巡检快照：仅 FAIL 巡检写入，每件装载证物一行，只追加、不可变。
+CREATE TABLE IF NOT EXISTS container_item_snapshot (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    inspection_id BIGINT NOT NULL COMMENT '所属容器巡检记录主键',
+    container_id VARCHAR(64) NOT NULL COMMENT '所属容器业务键',
+    evidence_key VARCHAR(64) NOT NULL COMMENT '被拍快照的证物业务键',
+    evidence_status VARCHAR(20) NOT NULL COMMENT '快照时证物状态（FAIL 时全部为 SEALED）',
+    custodian_id VARCHAR(64) NOT NULL COMMENT '快照时证物当前保管人',
+    seal_no VARCHAR(64) NOT NULL COMMENT '快照时证物封条编号',
+    snapshot_no INT NOT NULL COMMENT '件次序号，按装载顺序自 1 开始',
+    created_at DATETIME(6) NOT NULL COMMENT '快照写入时间，Asia/Shanghai',
+    CONSTRAINT uk_snapshot_inspection_item UNIQUE (inspection_id, evidence_key),
+    KEY idx_snapshot_container (container_id)
+);
+
+-- 容器复核封签记录：INSPECTION_FAILED 容器须两名不同保管人各完成一次复核后恢复 SEALED。
+CREATE TABLE IF NOT EXISTS container_review (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    container_id VARCHAR(64) NOT NULL COMMENT '关联容器业务键',
+    custodian_id VARCHAR(64) NOT NULL COMMENT '复核保管人；同一容器同一保管人至多一次',
+    note VARCHAR(512) NULL COMMENT '复核说明；NULL 表示未填写',
+    created_at DATETIME(6) NOT NULL COMMENT '复核时间，Asia/Shanghai',
+    CONSTRAINT uk_container_reviewer UNIQUE (container_id, custodian_id),
+    KEY idx_container_review_container (container_id)
+);
+
 -- 幂等命令日志：command_key 全局唯一；同键同参重放返回首次结果，同键改参返回 409。
 CREATE TABLE IF NOT EXISTS command_log (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     command_key VARCHAR(64) NOT NULL COMMENT '幂等命令键，全局唯一',
     actor_id VARCHAR(64) NOT NULL COMMENT '发起操作人',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN/CONTAINER_CREATE/CONTAINER_LOAD/CONTAINER_UNLOAD/CONTAINER_INSPECT/CONTAINER_REVIEW',
     request_hash VARCHAR(64) NOT NULL COMMENT '请求参数规范化后的 SHA-256，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行的 HTTP 状态码',
     response_body TEXT NOT NULL COMMENT '首次执行的响应体 JSON，重放时原样返回',

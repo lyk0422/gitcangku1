@@ -1,6 +1,7 @@
 package com.example.starter.evidence;
 
 import com.example.starter.error.ApiException;
+import com.example.starter.container.ContainerService;
 import com.example.starter.evidence.dto.CommandRequest;
 import com.example.starter.evidence.dto.CustodyChainView;
 import com.example.starter.evidence.dto.EvidenceView;
@@ -46,6 +47,7 @@ public class EvidenceService {
     private final SealInspectionRepository inspectionRepository;
     private final LoanRecordRepository loanRepository;
     private final CommandLogRepository commandLogRepository;
+    private final ContainerService containerService;
     private final ObjectMapper objectMapper;
     private final EvidenceClock clock;
 
@@ -54,6 +56,7 @@ public class EvidenceService {
                            SealInspectionRepository inspectionRepository,
                            LoanRecordRepository loanRepository,
                            CommandLogRepository commandLogRepository,
+                           ContainerService containerService,
                            ObjectMapper objectMapper,
                            EvidenceClock clock) {
         this.evidenceRepository = evidenceRepository;
@@ -61,6 +64,7 @@ public class EvidenceService {
         this.inspectionRepository = inspectionRepository;
         this.loanRepository = loanRepository;
         this.commandLogRepository = commandLogRepository;
+        this.containerService = containerService;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -105,6 +109,11 @@ public class EvidenceService {
         }
         requireSealIntact(evidence);
         requireCustodian(evidence, actorId);
+        // 处于 INSPECTION_FAILED 容器的证物在双人复核封签前禁止迁移，返回 409。
+        containerService.assertNotBlockedByFailedContainer(evidenceKey);
+        if (evidence.status() == EvidenceStatus.PENDING_VERIFICATION) {
+            throw ApiException.conflict("证物处于容器巡检失败待核验状态，禁止迁移: " + evidenceKey);
+        }
         if (evidence.status() == EvidenceStatus.TRANSFER_PENDING) {
             throw ApiException.conflict("证物已存在待接收交接: " + evidenceKey);
         }
@@ -238,8 +247,14 @@ public class EvidenceService {
             throw ApiException.badRequest("借用人不能与当前保管人相同");
         }
         requireCustodian(evidence, actorId);
+        // 处于 INSPECTION_FAILED 容器的证物在双人复核封签前禁止新借出，返回 409；
+        // 调用在证物行锁内，与 FAIL 巡检按事务提交顺序裁决。
+        containerService.assertNotBlockedByFailedContainer(evidenceKey);
         if (evidence.status() == EvidenceStatus.SEAL_BROKEN) {
             throw ApiException.unprocessable("封条已异常，禁止借出: " + evidenceKey);
+        }
+        if (evidence.status() == EvidenceStatus.PENDING_VERIFICATION) {
+            throw ApiException.conflict("证物处于容器巡检失败待核验状态，禁止借出: " + evidenceKey);
         }
         if (evidence.status() == EvidenceStatus.TRANSFER_PENDING) {
             throw ApiException.conflict("待接收交接期间禁止借出: " + evidenceKey);
