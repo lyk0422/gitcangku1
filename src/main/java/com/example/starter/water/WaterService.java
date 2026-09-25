@@ -3,25 +3,35 @@ package com.example.starter.water;
 import com.example.starter.water.WaterRepository.AllocationRow;
 import com.example.starter.water.WaterRepository.CommandRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
+import com.example.starter.water.WaterRepository.ScheduleRow;
 import com.example.starter.water.WaterRepository.TransferRow;
+import com.example.starter.water.WaterRepository.UsageRow;
 import com.example.starter.water.WaterRepository.WindowRow;
 import com.example.starter.water.dto.Dtos.AllocationResponse;
+import com.example.starter.water.dto.Dtos.AllocationSchedulesResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
+import com.example.starter.water.dto.Dtos.ChannelScheduleResponse;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.ScheduleResponse;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferResponse;
+import com.example.starter.water.dto.Dtos.UsageResponse;
 import com.example.starter.water.dto.Dtos.WindowResponse;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
+import java.time.Clock;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
@@ -48,12 +58,20 @@ public class WaterService {
     private final WaterRepository repository;
     private final TransactionTemplate tx;
     private final ObjectMapper objectMapper;
+    private final Clock clock;
 
+    @Autowired
     public WaterService(WaterRepository repository, PlatformTransactionManager transactionManager,
                         ObjectMapper objectMapper) {
+        this(repository, transactionManager, objectMapper, Clock.systemUTC());
+    }
+
+    WaterService(WaterRepository repository, PlatformTransactionManager transactionManager,
+                 ObjectMapper objectMapper, Clock clock) {
         this.repository = repository;
         this.tx = new TransactionTemplate(transactionManager);
         this.objectMapper = objectMapper;
+        this.clock = clock;
     }
 
     // ------------------------------------------------------------------
@@ -212,8 +230,9 @@ public class WaterService {
                 throw ApiException.conflict("SAME_USER", "转让双方必须属于不同用水户");
             }
             BigDecimal amount = lockedTarget.amount();
-            if (lockedSource.heldAmount().compareTo(amount) < 0) {
-                throw ApiException.quotaExceeded("源申请当前持有额度 " + fmt(lockedSource.heldAmount())
+            BigDecimal sourceRemaining = lockedSource.heldAmount().subtract(lockedSource.writtenOffAmount());
+            if (sourceRemaining.compareTo(amount) < 0) {
+                throw ApiException.quotaExceeded("源申请当前剩余未核销水量 " + fmt(sourceRemaining)
                         + " 不足，无法转让 " + fmt(amount));
             }
             long now = nowNanos();
@@ -316,6 +335,207 @@ public class WaterService {
     }
 
     // ------------------------------------------------------------------
+    // 轮灌排班与用水核销
+    // ------------------------------------------------------------------
+
+    private static final long NANOS_PER_MINUTE = 60L * NANOS_PER_SECOND;
+    private static final long MIN_SLOT_NANOS = 30L * NANOS_PER_MINUTE;
+    private static final long MAX_SLOT_NANOS = 720L * NANOS_PER_MINUTE;
+    private static final int MAX_ACTIVE_SCHEDULES_PER_ALLOCATION = 3;
+
+    /**
+     * 创建轮灌引水时段：渠道取自所属窗口；时段须为 30~720 分钟且完全落在窗口内；
+     * 申请须 APPROVED、未取消且剩余未核销水量大于 0；同窗口最多持有 3 个生效时段；
+     * 同渠道时间重叠（左闭右开，端点相接合法）返回 409 并给出全部冲突时段。
+     */
+    public ScheduleResponse createSchedule(String commandKey, String scheduleKey, String allocationKey,
+                                           String startUtc, String endUtc, String actor) {
+        requireKey("commandKey", commandKey);
+        requireKey("scheduleKey", scheduleKey);
+        requireKey("allocationKey", allocationKey);
+        requireKey("X-Actor-Id", actor);
+        long startNanos = parseInstant("startUtc", startUtc);
+        long endNanos = parseInstant("endUtc", endUtc);
+        long duration = endNanos - startNanos;
+        if (duration < MIN_SLOT_NANOS || duration > MAX_SLOT_NANOS) {
+            throw ApiException.badRequest("INVALID_ARGUMENT",
+                    "引水时段时长必须在 30 至 720 分钟之间（含端点）");
+        }
+        String params = "SCHEDULE_CREATE|" + scheduleKey + "|" + allocationKey + "|" + startNanos + "|"
+                + endNanos + "|" + actor;
+        return runCommand("SCHEDULE_CREATE", commandKey, params, ScheduleResponse.class, () -> {
+            if (repository.findScheduleByKey(scheduleKey) != null) {
+                throw ApiException.conflict("SCHEDULE_KEY_REUSED", "scheduleKey 已被使用: " + scheduleKey);
+            }
+            AllocationRow allocation = repository.findAllocationByKey(allocationKey);
+            if (allocation == null) {
+                throw ApiException.notFound("ALLOCATION_NOT_FOUND", "配水申请不存在: " + allocationKey);
+            }
+            if (!allocation.requester().equals(actor)) {
+                throw ApiException.conflict("NOT_OWNER", "只有申请人本人可以为该申请排班");
+            }
+            // 窗口行锁：与并发排班、转让、取消、核销按事务提交顺序串行裁决
+            WindowRow window = lockWindowOf(allocation);
+            // 锁内重读申请，得到最新状态、持有额度与累计核销
+            allocation = repository.lockAllocationByKey(allocationKey);
+            if (!STATUS_APPROVED.equals(allocation.status())) {
+                throw ApiException.unprocessable("ALLOCATION_NOT_SCHEDULABLE",
+                        "只有 APPROVED 且未取消的申请可以排班，当前状态: " + allocation.status(), null);
+            }
+            BigDecimal remaining = remainingOf(allocation);
+            if (remaining.signum() <= 0) {
+                throw ApiException.unprocessable("NO_REMAINING_WATER",
+                        "申请剩余未核销水量为 0，不能再排班", null);
+            }
+            if (startNanos < window.startNanos() || endNanos > window.endNanos()) {
+                throw ApiException.badRequest("SLOT_OUTSIDE_WINDOW",
+                        "引水时段必须完全落在所属配水窗口 [" + toIso(window.startNanos()) + ", "
+                                + toIso(window.endNanos()) + ") 内");
+            }
+            List<ScheduleRow> conflicts =
+                    repository.findOverlappingActiveSchedules(window.channelId(), startNanos, endNanos);
+            if (!conflicts.isEmpty()) {
+                throw ApiException.conflict("SCHEDULE_OVERLAP",
+                        "同一渠道在该时段已存在生效引水时段",
+                        Map.of("conflicts", conflicts.stream().map(this::toScheduleResponse).toList()));
+            }
+            if (repository.countActiveSchedules(allocationKey, window.id())
+                    >= MAX_ACTIVE_SCHEDULES_PER_ALLOCATION) {
+                throw ApiException.unprocessable("TOO_MANY_SCHEDULES",
+                        "单个申请在同一窗口内最多持有 " + MAX_ACTIVE_SCHEDULES_PER_ALLOCATION
+                                + " 个生效时段", null);
+            }
+            long now = nowNanos();
+            final long id;
+            try {
+                id = repository.insertSchedule(scheduleKey, window.channelId(), window.id(), allocationKey,
+                        startNanos, endNanos, remaining, now);
+            } catch (DuplicateKeyException e) {
+                // 并发复用同一 scheduleKey（换 commandKey）：事务回滚，不产生排班
+                throw ApiException.conflict("SCHEDULE_KEY_REUSED", "scheduleKey 已被使用: " + scheduleKey);
+            }
+            return toScheduleResponse(repository.findScheduleById(id));
+        });
+    }
+
+    /** 取消排班：立即释放同渠道重叠占用；起始时刻已到的时段不得取消（409），历史记录保留。 */
+    public ScheduleResponse cancelSchedule(String commandKey, String scheduleKey, String actor) {
+        requireKey("commandKey", commandKey);
+        requireKey("scheduleKey", scheduleKey);
+        requireKey("X-Actor-Id", actor);
+        String params = "SCHEDULE_CANCEL|" + scheduleKey + "|" + actor;
+        return runCommand("SCHEDULE_CANCEL", commandKey, params, ScheduleResponse.class, () -> {
+            ScheduleRow schedule = repository.findScheduleByKey(scheduleKey);
+            if (schedule == null) {
+                throw ApiException.notFound("SCHEDULE_NOT_FOUND", "排班记录不存在: " + scheduleKey);
+            }
+            AllocationRow allocation = repository.findAllocationByKey(schedule.allocationKey());
+            // 与排班/转让/核销争用同一窗口锁，按事务提交顺序裁决
+            WindowRow window = repository.lockWindowById(schedule.windowId());
+            if (window == null) {
+                throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + schedule.windowId());
+            }
+            schedule = repository.findScheduleById(schedule.id());
+            if (allocation != null && !allocation.requester().equals(actor)) {
+                throw ApiException.conflict("NOT_OWNER", "只有申请人本人可以取消该排班");
+            }
+            if ("CANCELLED".equals(schedule.status())) {
+                throw ApiException.conflict("SCHEDULE_ALREADY_CANCELLED", "排班已取消，不能重复取消");
+            }
+            if (nowNanos() >= schedule.startNanos()) {
+                throw ApiException.conflict("SCHEDULE_ALREADY_STARTED",
+                        "引水时段起始时刻已到，不能取消",
+                        Map.of("schedule", toScheduleResponse(schedule)));
+            }
+            repository.cancelSchedule(schedule.id(), nowNanos());
+            return toScheduleResponse(repository.findScheduleById(schedule.id()));
+        });
+    }
+
+    /**
+     * 用水核销：用水时刻必须落在该申请某个生效时段内，否则 422 并给出最近可用时段；
+     * 本次核销后累计核销不得超过申请持有额度（剩余未核销水量），否则 422；
+     * 排班时固化的剩余水量快照不受核销影响。
+     */
+    public UsageResponse writeOffUsage(String commandKey, String usageKey, String allocationKey,
+                                       String volume, String usedAtUtc, String actor) {
+        requireKey("commandKey", commandKey);
+        requireKey("usageKey", usageKey);
+        requireKey("allocationKey", allocationKey);
+        requireKey("X-Actor-Id", actor);
+        BigDecimal qty = parseAmount("volume", volume);
+        long usedAtNanos = parseInstant("usedAtUtc", usedAtUtc);
+        String params = "USAGE_WRITE_OFF|" + usageKey + "|" + allocationKey + "|" + qty.toPlainString()
+                + "|" + usedAtNanos + "|" + actor;
+        return runCommand("USAGE_WRITE_OFF", commandKey, params, UsageResponse.class, () -> {
+            if (repository.findUsageByKey(usageKey) != null) {
+                throw ApiException.conflict("USAGE_KEY_REUSED", "usageKey 已被使用: " + usageKey);
+            }
+            AllocationRow allocation = repository.findAllocationByKey(allocationKey);
+            if (allocation == null) {
+                throw ApiException.notFound("ALLOCATION_NOT_FOUND", "配水申请不存在: " + allocationKey);
+            }
+            if (!allocation.requester().equals(actor)) {
+                throw ApiException.conflict("NOT_OWNER", "只有申请人本人可以核销该申请的用水");
+            }
+            // 窗口行锁：与排班、转让、取消按事务提交顺序串行
+            WindowRow window = lockWindowOf(allocation);
+            allocation = repository.lockAllocationByKey(allocationKey);
+            if (!STATUS_APPROVED.equals(allocation.status())) {
+                throw ApiException.unprocessable("ALLOCATION_NOT_ACTIVE",
+                        "只有 APPROVED 申请可以核销用水，当前状态: " + allocation.status(), null);
+            }
+            List<ScheduleRow> active = repository.listSchedulesByAllocation(allocationKey).stream()
+                    .filter(s -> "ACTIVE".equals(s.status())
+                            && usedAtNanos >= s.startNanos() && usedAtNanos < s.endNanos())
+                    .toList();
+            if (active.isEmpty()) {
+                ScheduleRow nearest = nearestActiveSchedule(
+                        repository.listSchedulesByAllocation(allocationKey), usedAtNanos);
+                Object details = nearest == null ? null
+                        : Map.of("nearestSchedule", toScheduleResponse(nearest));
+                throw ApiException.unprocessable("OUTSIDE_ACTIVE_SLOT",
+                        "用水时刻 " + usedAtUtc + " 不在该申请任何生效引水时段内", details);
+            }
+            ScheduleRow slot = active.get(0);
+            BigDecimal remaining = remainingOf(allocation);
+            if (qty.compareTo(remaining) > 0) {
+                throw ApiException.quotaExceeded("本次核销 " + fmt(qty) + " 超过申请剩余未核销水量 "
+                        + fmt(remaining));
+            }
+            long now = nowNanos();
+            try {
+                repository.insertUsage(usageKey, allocationKey, slot.id(), qty, usedAtNanos, now);
+            } catch (DuplicateKeyException e) {
+                // 并发复用同一 usageKey（换 commandKey）：事务回滚，不产生核销
+                throw ApiException.conflict("USAGE_KEY_REUSED", "usageKey 已被使用: " + usageKey);
+            }
+            repository.addWrittenOffAmount(allocation.id(), qty, now);
+            return toUsageResponse(repository.findUsageByKey(usageKey));
+        });
+    }
+
+    /** 查询渠道排班表（含已取消历史记录）。 */
+    public ChannelScheduleResponse getChannelSchedule(String channelId) {
+        requireKey("channelId", channelId);
+        List<ScheduleResponse> schedules = repository.listSchedulesByChannel(channelId).stream()
+                .map(this::toScheduleResponse).toList();
+        return new ChannelScheduleResponse(channelId, schedules);
+    }
+
+    /** 查询申请时段明细（含已取消历史记录）；申请不存在返回 404。 */
+    public AllocationSchedulesResponse getAllocationSchedules(String allocationKey) {
+        requireKey("allocationKey", allocationKey);
+        AllocationRow allocation = repository.findAllocationByKey(allocationKey);
+        if (allocation == null) {
+            throw ApiException.notFound("ALLOCATION_NOT_FOUND", "配水申请不存在: " + allocationKey);
+        }
+        List<ScheduleResponse> schedules = repository.listSchedulesByAllocation(allocationKey).stream()
+                .map(this::toScheduleResponse).toList();
+        return new AllocationSchedulesResponse(allocationKey, schedules);
+    }
+
+    // ------------------------------------------------------------------
     // 幂等命令框架
     // ------------------------------------------------------------------
 
@@ -364,6 +584,43 @@ public class WaterService {
         return window;
     }
 
+    /** 申请剩余未核销水量 = 当前持有额度 - 累计已核销水量。 */
+    private BigDecimal remainingOf(AllocationRow allocation) {
+        return allocation.heldAmount().subtract(allocation.writtenOffAmount());
+    }
+
+    /**
+     * 距离给定时刻最近的生效时段：时刻早于时段按距开始时刻计，晚于/等于结束时刻按距结束时刻计，
+     * 距离相同取开始时刻更早者。无生效时段返回 null。
+     */
+    private ScheduleRow nearestActiveSchedule(List<ScheduleRow> schedules, long atNanos) {
+        return schedules.stream()
+                .filter(s -> "ACTIVE".equals(s.status()))
+                .min(Comparator.comparingLong((ScheduleRow s) -> distanceToSlot(s, atNanos))
+                        .thenComparingLong(ScheduleRow::startNanos)
+                        .thenComparingLong(ScheduleRow::id))
+                .orElse(null);
+    }
+
+    private long distanceToSlot(ScheduleRow slot, long atNanos) {
+        if (atNanos < slot.startNanos()) {
+            return slot.startNanos() - atNanos;
+        }
+        return atNanos - slot.endNanos();
+    }
+
+    private ScheduleResponse toScheduleResponse(ScheduleRow row) {
+        return new ScheduleResponse(row.id(), row.scheduleKey(), row.channelId(), row.windowId(),
+                row.allocationKey(), toIso(row.startNanos()), toIso(row.endNanos()),
+                fmt(row.remainingSnapshot()), row.status(), toIso(row.createdNanos()),
+                row.cancelledNanos() == null ? null : toIso(row.cancelledNanos()));
+    }
+
+    private UsageResponse toUsageResponse(UsageRow row) {
+        return new UsageResponse(row.usageKey(), row.allocationKey(), row.scheduleId(), fmt(row.volume()),
+                toIso(row.usedAtNanos()), toIso(row.createdNanos()));
+    }
+
     private BigDecimal availableTotal(WindowRow window) {
         CurtailmentRow active = repository.findActiveCurtailment(window.id());
         return active != null ? active.volume() : window.plannedVolume();
@@ -378,7 +635,7 @@ public class WaterService {
 
     private AllocationResponse toAllocationResponse(AllocationRow row) {
         return new AllocationResponse(row.allocationKey(), row.windowId(), row.userId(), fmt(row.amount()),
-                fmt(row.heldAmount()), row.requester(), row.status(),
+                fmt(row.heldAmount()), fmt(row.writtenOffAmount()), row.requester(), row.status(),
                 toIso(row.createdNanos()), toIso(row.updatedNanos()));
     }
 
@@ -392,8 +649,8 @@ public class WaterService {
                 toIso(row.createdNanos()), row.cancelledNanos() == null ? null : toIso(row.cancelledNanos()));
     }
 
-    static long nowNanos() {
-        return toNanos(Instant.now());
+    long nowNanos() {
+        return toNanos(Instant.now(clock));
     }
 
     /** Instant -> UTC 纳秒时间戳。 */

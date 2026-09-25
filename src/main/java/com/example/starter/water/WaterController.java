@@ -1,16 +1,23 @@
 package com.example.starter.water;
 
 import com.example.starter.water.dto.Dtos.AllocationResponse;
+import com.example.starter.water.dto.Dtos.AllocationSchedulesResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
+import com.example.starter.water.dto.Dtos.ChannelScheduleResponse;
 import com.example.starter.water.dto.Dtos.CommandRequest;
 import com.example.starter.water.dto.Dtos.CreateWindowRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.ScheduleCancelRequest;
+import com.example.starter.water.dto.Dtos.ScheduleCreateRequest;
+import com.example.starter.water.dto.Dtos.ScheduleResponse;
 import com.example.starter.water.dto.Dtos.SubmitAllocationRequest;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferRequest;
 import com.example.starter.water.dto.Dtos.TransferResponse;
+import com.example.starter.water.dto.Dtos.UsageResponse;
+import com.example.starter.water.dto.Dtos.UsageWriteOffRequest;
 import com.example.starter.water.dto.Dtos.WindowResponse;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -102,5 +109,41 @@ public class WaterController {
     @GetMapping("/windows/{windowId}/history")
     public HistoryResponse getHistory(@PathVariable long windowId) {
         return service.getHistory(windowId);
+    }
+
+    /** 为已批准申请申请轮灌引水时段；同渠道重叠返回 409 并给出冲突时段。 */
+    @PostMapping("/schedules")
+    public ScheduleResponse createSchedule(@RequestBody ScheduleCreateRequest request,
+                                           @RequestHeader("X-Actor-Id") String actor) {
+        return service.createSchedule(request.commandKey(), request.scheduleKey(), request.allocationKey(),
+                request.startUtc(), request.endUtc(), actor);
+    }
+
+    /** 取消轮灌时段；起始时刻已到返回 409。 */
+    @PostMapping("/schedules/{scheduleKey}/cancel")
+    public ScheduleResponse cancelSchedule(@PathVariable String scheduleKey,
+                                           @RequestBody ScheduleCancelRequest request,
+                                           @RequestHeader("X-Actor-Id") String actor) {
+        return service.cancelSchedule(request.commandKey(), scheduleKey, actor);
+    }
+
+    /** 用水核销；用水时刻须落在该申请某个生效时段内，否则 422 并给出最近可用时段。 */
+    @PostMapping("/usages")
+    public UsageResponse writeOffUsage(@RequestBody UsageWriteOffRequest request,
+                                       @RequestHeader("X-Actor-Id") String actor) {
+        return service.writeOffUsage(request.commandKey(), request.usageKey(), request.allocationKey(),
+                request.volume(), request.usedAtUtc(), actor);
+    }
+
+    /** 查询渠道排班表（含已取消历史记录）。 */
+    @GetMapping("/channels/{channelId}/schedules")
+    public ChannelScheduleResponse getChannelSchedule(@PathVariable String channelId) {
+        return service.getChannelSchedule(channelId);
+    }
+
+    /** 查询申请时段明细（含已取消历史记录）。 */
+    @GetMapping("/allocations/{allocationKey}/schedules")
+    public AllocationSchedulesResponse getAllocationSchedules(@PathVariable String allocationKey) {
+        return service.getAllocationSchedules(allocationKey);
     }
 }
