@@ -282,12 +282,29 @@ public class PlayoutRepository {
                 PUBLICATION_MAPPER, channelId, Date.valueOf(businessDay)).stream().findFirst();
     }
 
+    /** 按自增 ID 查询发布快照。 */
+    public Optional<PublicationRow> findPublicationById(long publicationId) {
+        return jdbc.query("SELECT id, channel_id, business_day, published_version, draft_version"
+                        + " FROM playout_publication WHERE id = ?",
+                PUBLICATION_MAPPER, publicationId).stream().findFirst();
+    }
+
     /** 快照中覆盖指定时刻的片段（start <= at < end）。 */
     public Optional<PublicationSegmentRow> findPublicationSegmentAt(long publicationId, long atMs) {
         return jdbc.query("SELECT id, publication_id, segment_id, asset_id, grant_id, start_ms, end_ms"
                         + " FROM playout_publication_segment"
                         + " WHERE publication_id = ? AND start_ms <= ? AND end_ms > ?"
                         + " ORDER BY start_ms LIMIT 1",
+                PUBLICATION_SEGMENT_MAPPER, publicationId, atMs, atMs).stream().findFirst();
+    }
+
+    /** 同上，但加行锁，用于播放回执确认时与（理论上的）快照写入串行。 */
+    public Optional<PublicationSegmentRow> findPublicationSegmentAtForUpdate(long publicationId,
+                                                                             long atMs) {
+        return jdbc.query("SELECT id, publication_id, segment_id, asset_id, grant_id, start_ms, end_ms"
+                        + " FROM playout_publication_segment"
+                        + " WHERE publication_id = ? AND start_ms <= ? AND end_ms > ?"
+                        + " ORDER BY start_ms LIMIT 1 FOR UPDATE",
                 PUBLICATION_SEGMENT_MAPPER, publicationId, atMs, atMs).stream().findFirst();
     }
 
@@ -380,5 +397,382 @@ public class PlayoutRepository {
                         + " SET status = 'CANCELLED', cancel_request_id = ?, cancelled_at_ms = ?"
                         + " WHERE override_key = ? AND status = 'ACTIVE'",
                 cancelRequestId, cancelledAtMs, overrideKey);
+    }
+
+    // ---------- 字幕文本版本 ----------
+
+    /** 字幕文本版本行；reviewStatus 为 PENDING / APPROVED / REJECTED。 */
+    public record CaptionTextRow(String versionId, String content, String reviewStatus,
+                                 Long reviewedAtMs, long createdAtMs) {
+    }
+
+    private static final RowMapper<CaptionTextRow> CAPTION_TEXT_MAPPER = (rs, n) ->
+            new CaptionTextRow(rs.getString("version_id"), rs.getString("content"),
+                    rs.getString("review_status"), (Long) rs.getObject("reviewed_at_ms"),
+                    rs.getLong("created_at_ms"));
+
+    public void insertCaptionText(String versionId, String content, long createdAtMs) {
+        jdbc.update("INSERT INTO playout_caption_text_version"
+                        + " (version_id, content, review_status, created_at_ms)"
+                        + " VALUES (?, ?, 'PENDING', ?)",
+                versionId, content, createdAtMs);
+    }
+
+    public Optional<CaptionTextRow> findCaptionText(String versionId) {
+        return jdbc.query("SELECT version_id, content, review_status, reviewed_at_ms, created_at_ms"
+                        + " FROM playout_caption_text_version WHERE version_id = ?",
+                CAPTION_TEXT_MAPPER, versionId).stream().findFirst();
+    }
+
+    public Optional<CaptionTextRow> findCaptionTextForUpdate(String versionId) {
+        return jdbc.query("SELECT version_id, content, review_status, reviewed_at_ms, created_at_ms"
+                        + " FROM playout_caption_text_version WHERE version_id = ? FOR UPDATE",
+                CAPTION_TEXT_MAPPER, versionId).stream().findFirst();
+    }
+
+    /** 审核文本版本（PENDING 唯一一次流转）；返回受影响行数，0 表示不存在或已审核。 */
+    public int reviewCaptionText(String versionId, String decision, long reviewedAtMs) {
+        return jdbc.update("UPDATE playout_caption_text_version"
+                        + " SET review_status = ?, reviewed_at_ms = ?"
+                        + " WHERE version_id = ? AND review_status = 'PENDING'",
+                decision, reviewedAtMs, versionId);
+    }
+
+    // ---------- 紧急字幕 ----------
+
+    /** 紧急字幕行；status 为 ACTIVE / REVOKED，regions 为规范化区域集合。 */
+    public record CaptionRow(long id, String captionKey, String channelId, int priority,
+                            String textVersionId, long startMs, long endMs, List<String> regions,
+                            String status, String revokeCrawlKey, Long revokedAtMs,
+                            long createdAtMs) {
+        public boolean active() {
+            return "ACTIVE".equals(status);
+        }
+    }
+
+    private static final RowMapper<CaptionRow> CAPTION_MAPPER = (rs, n) ->
+            new CaptionRow(rs.getLong("id"), rs.getString("caption_key"), rs.getString("channel_id"),
+                    rs.getInt("priority"), rs.getString("text_version_id"),
+                    rs.getLong("start_ms"), rs.getLong("end_ms"),
+                    splitRegions(rs.getString("regions_csv")),
+                    rs.getString("status"), rs.getString("revoke_request_id"),
+                    (Long) rs.getObject("revoked_at_ms"), rs.getLong("created_at_ms"));
+
+    static List<String> splitRegions(String csv) {
+        if (csv == null || csv.isEmpty()) {
+            return List.of();
+        }
+        return List.of(csv.split(","));
+    }
+
+    public long insertCaption(String captionKey, String channelId, int priority, String textVersionId,
+                              long startMs, long endMs, List<String> regions, long createdAtMs) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO playout_emergency_caption"
+                            + " (caption_key, channel_id, priority, text_version_id, start_ms, end_ms,"
+                            + "  regions_csv, status, created_at_ms)"
+                            + " VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, captionKey);
+            ps.setString(2, channelId);
+            ps.setInt(3, priority);
+            ps.setString(4, textVersionId);
+            ps.setLong(5, startMs);
+            ps.setLong(6, endMs);
+            ps.setString(7, String.join(",", regions));
+            ps.setLong(8, createdAtMs);
+            return ps;
+        }, keyHolder);
+        long captionId = keyHolder.getKey().longValue();
+        for (String region : regions) {
+            jdbc.update("INSERT INTO playout_emergency_caption_region (caption_id, region) VALUES (?, ?)",
+                    captionId, region);
+        }
+        return captionId;
+    }
+
+    public Optional<CaptionRow> findCaption(String captionKey) {
+        return jdbc.query(captionSelect() + " WHERE c.caption_key = ?",
+                CAPTION_MAPPER, captionKey).stream().findFirst();
+    }
+
+    public Optional<CaptionRow> findCaptionForUpdate(String captionKey) {
+        return jdbc.query(captionSelect() + " WHERE c.caption_key = ? FOR UPDATE",
+                CAPTION_MAPPER, captionKey).stream().findFirst();
+    }
+
+    private static String captionSelect() {
+        return "SELECT c.id, c.caption_key, c.channel_id, c.priority, c.text_version_id,"
+                + " c.start_ms, c.end_ms, c.regions_csv, c.status, c.revoke_request_id,"
+                + " c.revoked_at_ms, c.created_at_ms"
+                + " FROM playout_emergency_caption c";
+    }
+
+    /**
+     * 同频道、指定区域、同优先级、状态 ACTIVE 且与 [startMs, endMs) 相交的字幕
+     * （左闭右开：start == end 端点相接不算相交）。须在持频道锁后调用。
+     */
+    public List<CaptionRow> findActiveCaptionsOverlappingForUpdate(String channelId, String region,
+                                                                   int priority,
+                                                                   long startMs, long endMs) {
+        return jdbc.query(captionSelect()
+                        + " JOIN playout_emergency_caption_region r ON r.caption_id = c.id"
+                        + " WHERE c.channel_id = ? AND r.region = ? AND c.status = 'ACTIVE'"
+                        + " AND c.priority = ? AND c.start_ms < ? AND c.end_ms > ?"
+                        + " ORDER BY c.start_ms, c.caption_key FOR UPDATE",
+                CAPTION_MAPPER, channelId, region, priority, endMs, startMs);
+    }
+
+    /**
+     * 命中指定频道与区域、在某时刻仍有效（start <= at < end）的 ACTIVE 字幕候选，
+     * 按优先级降序排列；供区域字幕实时决策查询使用。
+     */
+    public List<CaptionRow> findActiveCaptionsAt(String channelId, String region, long atMs) {
+        return jdbc.query(captionSelect()
+                        + " JOIN playout_emergency_caption_region r ON r.caption_id = c.id"
+                        + " WHERE c.channel_id = ? AND r.region = ? AND c.status = 'ACTIVE'"
+                        + " AND c.start_ms <= ? AND c.end_ms > ?"
+                        + " ORDER BY c.priority DESC, c.start_ms ASC, c.caption_key ASC",
+                CAPTION_MAPPER, channelId, region, atMs, atMs);
+    }
+
+    /** 撤销字幕；返回受影响行数，0 表示不存在或已撤销。 */
+    public int revokeCaption(String captionKey, String crawlKey, long revokedAtMs) {
+        return jdbc.update("UPDATE playout_emergency_caption"
+                        + " SET status = 'REVOKED', revoke_request_id = ?, revoked_at_ms = ?"
+                        + " WHERE caption_key = ? AND status = 'ACTIVE'",
+                crawlKey, revokedAtMs, captionKey);
+    }
+
+    /**
+     * 锁定指定频道与 UTC 日窗口相交的全部字幕行（FOR UPDATE），发布规划时与
+     * 撤销/新建字幕事务按提交顺序串行。相交为左闭右开语义：start_ms < dayEnd 且 end_ms > dayStart。
+     */
+    public List<CaptionRow> findChannelCaptionsIntersectingForUpdate(String channelId,
+                                                                     long dayStartMs, long dayEndMs) {
+        return jdbc.query(captionSelect()
+                        + " WHERE c.channel_id = ? AND c.start_ms < ? AND c.end_ms > ?"
+                        + " ORDER BY c.id FOR UPDATE",
+                CAPTION_MAPPER, channelId, dayEndMs, dayStartMs);
+    }
+
+    // ---------- 黑屏窗口 ----------
+
+    /** 黑屏窗口行。 */
+    public record BlackoutRow(long id, String blackoutKey, String channelId, String region,
+                              long startMs, long endMs, long createdAtMs) {
+    }
+
+    private static final RowMapper<BlackoutRow> BLACKOUT_MAPPER = (rs, n) ->
+            new BlackoutRow(rs.getLong("id"), rs.getString("blackout_key"),
+                    rs.getString("channel_id"), rs.getString("region"),
+                    rs.getLong("start_ms"), rs.getLong("end_ms"), rs.getLong("created_at_ms"));
+
+    public long insertBlackout(String blackoutKey, String channelId, String region,
+                               long startMs, long endMs, long createdAtMs) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO playout_blackout_window"
+                            + " (blackout_key, channel_id, region, start_ms, end_ms, created_at_ms)"
+                            + " VALUES (?, ?, ?, ?, ?, ?)", Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, blackoutKey);
+            ps.setString(2, channelId);
+            ps.setString(3, region);
+            ps.setLong(4, startMs);
+            ps.setLong(5, endMs);
+            ps.setLong(6, createdAtMs);
+            return ps;
+        }, keyHolder);
+        return keyHolder.getKey().longValue();
+    }
+
+    public Optional<BlackoutRow> findBlackout(String blackoutKey) {
+        return jdbc.query("SELECT id, blackout_key, channel_id, region, start_ms, end_ms, created_at_ms"
+                        + " FROM playout_blackout_window WHERE blackout_key = ?",
+                BLACKOUT_MAPPER, blackoutKey).stream().findFirst();
+    }
+
+    /** 指定频道+区域与 [startMs, endMs) 相交的黑屏窗口（左闭右开，端点相接不冲突）。 */
+    public List<BlackoutRow> findBlackoutsOverlapping(String channelId, String region,
+                                                      long startMs, long endMs) {
+        return jdbc.query("SELECT id, blackout_key, channel_id, region, start_ms, end_ms, created_at_ms"
+                        + " FROM playout_blackout_window"
+                        + " WHERE channel_id = ? AND region = ? AND start_ms < ? AND end_ms > ?"
+                        + " ORDER BY start_ms, blackout_key",
+                BLACKOUT_MAPPER, channelId, region, endMs, startMs);
+    }
+
+    // ---------- crawlKey 幂等记录 ----------
+
+    /** crawlKey 去重记录行；responseBody 为 NULL 表示尚未成功完成。 */
+    public record CrawlRecordRow(String crawlKey, String operation, String paramsHash,
+                                 String responseBody) {
+    }
+
+    private static final RowMapper<CrawlRecordRow> CRAWL_MAPPER = (rs, n) ->
+            new CrawlRecordRow(rs.getString("crawl_key"), rs.getString("operation"),
+                    rs.getString("params_hash"), rs.getString("response_body"));
+
+    public Optional<CrawlRecordRow> findCrawlRecordForUpdate(String crawlKey) {
+        return jdbc.query("SELECT crawl_key, operation, params_hash, response_body"
+                        + " FROM playout_crawl_record WHERE crawl_key = ? FOR UPDATE",
+                CRAWL_MAPPER, crawlKey).stream().findFirst();
+    }
+
+    public void insertCrawlRecord(String crawlKey, String operation, String paramsHash,
+                                  long createdAtMs) {
+        jdbc.update("INSERT INTO playout_crawl_record"
+                        + " (crawl_key, operation, params_hash, created_at_ms)"
+                        + " VALUES (?, ?, ?, ?)",
+                crawlKey, operation, paramsHash, createdAtMs);
+    }
+
+    public void completeCrawlRecord(String crawlKey, String responseBody) {
+        jdbc.update("UPDATE playout_crawl_record SET response_body = ? WHERE crawl_key = ?",
+                responseBody, crawlKey);
+    }
+
+    // ---------- 发布快照字幕决策 ----------
+
+    /** 固化的快照字幕决策行。 */
+    public record PublicationCaptionRow(long id, long publicationId, String region,
+                                        String segmentId, long startMs, long endMs,
+                                        long captionId, String captionKey, int priority,
+                                        String textVersionId, String textContent, String reason) {
+    }
+
+    private static final RowMapper<PublicationCaptionRow> PUBLICATION_CAPTION_MAPPER = (rs, n) ->
+            new PublicationCaptionRow(rs.getLong("id"), rs.getLong("publication_id"),
+                    rs.getString("region"), rs.getString("segment_id"),
+                    rs.getLong("start_ms"), rs.getLong("end_ms"),
+                    rs.getLong("caption_id"), rs.getString("caption_key"), rs.getInt("priority"),
+                    rs.getString("text_version_id"), rs.getString("text_content"),
+                    rs.getString("reason"));
+
+    public void insertPublicationCaption(long publicationId, String region, String segmentId,
+                                         long startMs, long endMs, long captionId, String captionKey,
+                                         int priority, String textVersionId, String textContent,
+                                         String reason) {
+        jdbc.update("INSERT INTO playout_publication_caption"
+                        + " (publication_id, region, segment_id, start_ms, end_ms, caption_id,"
+                        + "  caption_key, priority, text_version_id, text_content, reason)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                publicationId, region, segmentId, startMs, endMs, captionId, captionKey, priority,
+                textVersionId, textContent, reason);
+    }
+
+    public List<PublicationCaptionRow> findPublicationCaptions(long publicationId) {
+        return jdbc.query("SELECT id, publication_id, region, segment_id, start_ms, end_ms,"
+                        + " caption_id, caption_key, priority, text_version_id, text_content, reason"
+                        + " FROM playout_publication_caption WHERE publication_id = ?"
+                        + " ORDER BY region, start_ms",
+                PUBLICATION_CAPTION_MAPPER, publicationId);
+    }
+
+    /** 快照中某区域某时刻命中的字幕决策（start <= at < end）；结束端点恰好不再命中。 */
+    public Optional<PublicationCaptionRow> findPublicationCaptionAt(long publicationId,
+                                                                    String region, long atMs) {
+        return jdbc.query("SELECT id, publication_id, region, segment_id, start_ms, end_ms,"
+                        + " caption_id, caption_key, priority, text_version_id, text_content, reason"
+                        + " FROM playout_publication_caption"
+                        + " WHERE publication_id = ? AND region = ? AND start_ms <= ? AND end_ms > ?"
+                        + " ORDER BY start_ms LIMIT 1",
+                PUBLICATION_CAPTION_MAPPER, publicationId, region, atMs, atMs).stream().findFirst();
+    }
+
+    /** 快照中某区域恰在 at 时刻结束的字幕决策（start <= at 且 end == at），用于回执端点判定。 */
+    public boolean existsPublicationCaptionEndingAt(long publicationId, String region, long atMs) {
+        Long count = jdbc.queryForObject("SELECT COUNT(1) FROM playout_publication_caption"
+                        + " WHERE publication_id = ? AND region = ? AND start_ms <= ? AND end_ms = ?",
+                Long.class, publicationId, region, atMs, atMs);
+        return count != null && count > 0;
+    }
+
+    // ---------- 播放回执 ----------
+
+    /** 播放回执行；captionKey 为 NULL 表示该时刻无字幕覆盖。 */
+    public record PlayoutReceiptRow(long id, String crawlKey, String channelId, long publicationId,
+                                    long publishedVersion, String region, long atMs, String assetId,
+                                    String segmentId, Long captionRecordId, String captionKey,
+                                    Integer priority, String textVersionId, String captionText,
+                                    Long captionStartMs, Long captionEndMs, String confirmReason,
+                                    long createdAtMs) {
+    }
+
+    private static final RowMapper<PlayoutReceiptRow> RECEIPT_MAPPER = (rs, n) ->
+            new PlayoutReceiptRow(rs.getLong("id"), rs.getString("crawl_key"),
+                    rs.getString("channel_id"), rs.getLong("publication_id"),
+                    rs.getLong("published_version"), rs.getString("region"), rs.getLong("at_ms"),
+                    rs.getString("asset_id"), rs.getString("segment_id"),
+                    (Long) rs.getObject("caption_record_id"), rs.getString("caption_key"),
+                    (Integer) rs.getObject("priority"), rs.getString("text_version_id"),
+                    rs.getString("caption_text"),
+                    (Long) rs.getObject("caption_start_ms"), (Long) rs.getObject("caption_end_ms"),
+                    rs.getString("confirm_reason"), rs.getLong("created_at_ms"));
+
+    public long insertReceipt(String crawlKey, String channelId, long publicationId,
+                              long publishedVersion, String region, long atMs, String assetId,
+                              String segmentId, Long captionRecordId, String captionKey,
+                              Integer priority, String textVersionId, String captionText,
+                              Long captionStartMs, Long captionEndMs, String confirmReason,
+                              long createdAtMs) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO playout_playout_receipt"
+                            + " (crawl_key, channel_id, publication_id, published_version, region,"
+                            + "  at_ms, asset_id, segment_id, caption_record_id, caption_key, priority,"
+                            + "  text_version_id, caption_text, caption_start_ms, caption_end_ms,"
+                            + "  confirm_reason, created_at_ms)"
+                            + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, crawlKey);
+            ps.setString(2, channelId);
+            ps.setLong(3, publicationId);
+            ps.setLong(4, publishedVersion);
+            ps.setString(5, region);
+            ps.setLong(6, atMs);
+            ps.setString(7, assetId);
+            ps.setString(8, segmentId);
+            if (captionRecordId == null) {
+                ps.setNull(9, java.sql.Types.BIGINT);
+            } else {
+                ps.setLong(9, captionRecordId);
+            }
+            ps.setString(10, captionKey);
+            if (priority == null) {
+                ps.setNull(11, java.sql.Types.INTEGER);
+            } else {
+                ps.setInt(11, priority);
+            }
+            ps.setString(12, textVersionId);
+            ps.setString(13, captionText);
+            if (captionStartMs == null) {
+                ps.setNull(14, java.sql.Types.BIGINT);
+            } else {
+                ps.setLong(14, captionStartMs);
+            }
+            if (captionEndMs == null) {
+                ps.setNull(15, java.sql.Types.BIGINT);
+            } else {
+                ps.setLong(15, captionEndMs);
+            }
+            ps.setString(16, confirmReason);
+            ps.setLong(17, createdAtMs);
+            return ps;
+        }, keyHolder);
+        return keyHolder.getKey().longValue();
+    }
+
+    public Optional<PlayoutReceiptRow> findReceiptByCrawlKey(String crawlKey) {
+        return jdbc.query("SELECT id, crawl_key, channel_id, publication_id, published_version,"
+                        + " region, at_ms, asset_id, segment_id, caption_record_id, caption_key,"
+                        + " priority, text_version_id, caption_text, caption_start_ms, caption_end_ms,"
+                        + " confirm_reason, created_at_ms"
+                        + " FROM playout_playout_receipt WHERE crawl_key = ?",
+                RECEIPT_MAPPER, crawlKey).stream().findFirst();
     }
 }
