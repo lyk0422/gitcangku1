@@ -7,6 +7,7 @@ import com.example.starter.race.api.ResultEntryResponse;
 import com.example.starter.race.api.RunnerResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.StandingResponse;
+import com.example.starter.race.api.WithdrawalResponse;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
@@ -18,6 +19,7 @@ import com.example.starter.race.persistence.RunnerRow;
 import com.example.starter.race.persistence.SnapshotCheckpointRow;
 import com.example.starter.race.persistence.SnapshotEntryRow;
 import com.example.starter.race.persistence.SnapshotRow;
+import com.example.starter.race.persistence.WithdrawalRow;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -46,14 +48,21 @@ final class ResponseMapper {
                 row.elapsedMillis(), row.createdAt());
     }
 
+    static WithdrawalResponse toWithdrawalResponse(WithdrawalRow row) {
+        return new WithdrawalResponse(
+                row.withdrawalKey(), row.bib(), row.status(), row.reason(),
+                row.lastCheckpointCode(), row.revoked(), row.createdAt(), row.revokedAt());
+    }
+
     static StandingResponse liveStanding(
             RaceRow race,
             List<RunnerRow> runners,
             List<PenaltyRow> penalties,
             List<CheckpointRow> checkpoints,
-            List<CheckpointTimingRow> timings) {
+            List<CheckpointTimingRow> timings,
+            List<WithdrawalRow> withdrawals) {
         List<ResultEntry> entries = ResultCalculator.compute(
-                runners, penalties, checkpoints, timings);
+                runners, penalties, checkpoints, timings, withdrawals);
         return new StandingResponse(
                 race.raceId(),
                 race.version(),
@@ -81,7 +90,8 @@ final class ResponseMapper {
                 entry.totalTimeMs(),
                 entry.checkpointCount(),
                 entry.coveredCheckpointCount(),
-                entry.missingCheckpoints());
+                entry.missingCheckpoints(),
+                entry.lastCheckpointCode());
     }
 
     static ResultEntryResponse toEntryResponse(SnapshotEntryRow entry) {
@@ -94,7 +104,8 @@ final class ResponseMapper {
                 entry.totalTimeMs(),
                 entry.checkpointCount(),
                 entry.coveredCheckpointCount(),
-                entry.missingCheckpoints());
+                entry.missingCheckpoints(),
+                entry.lastCheckpointCode());
     }
 
     /**
