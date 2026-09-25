@@ -8,12 +8,14 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.time.LocalDate;
+import java.util.List;
 
 /**
  * 公告曝光频控 API。
@@ -70,5 +72,44 @@ public class ExposureController {
                                     @RequestParam(required = false)
                                     @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate utcDate) {
         return exposureService.queryQuota(campaignId, visitorId, utcDate);
+    }
+
+    /** 迁移公告归属渠道；只影响迁移后的新申请，既有预占按固化渠道结算。 */
+    @PostMapping("/campaigns/{campaignId}/channel")
+    public CampaignResponse migrateChannel(@PathVariable String campaignId,
+                                           @Valid @RequestBody MigrateChannelRequest request) {
+        return exposureService.migrateCampaignChannel(campaignId, request);
+    }
+
+    /** 创建或修改渠道日总量频控配置；修改须携带 expectedVersion，冲突 409。 */
+    @PutMapping("/channels/{channelKey}")
+    public ChannelConfigResponse upsertChannelConfig(@PathVariable String channelKey,
+                                                     @Valid @RequestBody UpsertChannelConfigRequest request) {
+        return exposureService.upsertChannelConfig(channelKey, request);
+    }
+
+    /** 渠道某 UTC 日用量；utcDate 缺省为当前 UTC 日。 */
+    @GetMapping("/channels/{channelKey}/usage")
+    public ChannelUsageResponse queryChannelUsage(@PathVariable String channelKey,
+                                                  @RequestParam(required = false)
+                                                  @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate utcDate) {
+        return exposureService.queryChannelUsage(channelKey, utcDate);
+    }
+
+    /** 渠道某 UTC 日预占明细；utcDate 缺省为当前 UTC 日。 */
+    @GetMapping("/channels/{channelKey}/reservations")
+    public List<ChannelReservationResponse> listChannelReservations(
+            @PathVariable String channelKey,
+            @RequestParam(required = false)
+            @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate utcDate) {
+        return exposureService.listChannelReservations(channelKey, utcDate);
+    }
+
+    /** 渠道某 UTC 日按公告归属统计；utcDate 缺省为当前 UTC 日。 */
+    @GetMapping("/channels/{channelKey}/stats")
+    public ChannelStatsResponse queryChannelStats(@PathVariable String channelKey,
+                                                  @RequestParam(required = false)
+                                                  @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate utcDate) {
+        return exposureService.queryChannelStats(channelKey, utcDate);
     }
 }

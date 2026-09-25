@@ -107,9 +107,12 @@ class ExposureApiIntegrationTest {
     @BeforeEach
     void cleanAndReset() {
         jdbc.update("DELETE FROM idempotency_record");
+        jdbc.update("DELETE FROM channel_reservation");
         jdbc.update("DELETE FROM exposure_reservation");
         jdbc.update("DELETE FROM quota_visitor_ledger");
         jdbc.update("DELETE FROM quota_total_ledger");
+        jdbc.update("DELETE FROM channel_daily_ledger");
+        jdbc.update("DELETE FROM channel_cap_config");
         jdbc.update("DELETE FROM campaign");
         mutableClock().setInstant(BASE);
     }
