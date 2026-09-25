@@ -1,4 +1,5 @@
--- 测试用 H2（MySQL 兼容模式）schema，与生产 schema.sql 结构一致，去掉 H2 不兼容的 COMMENT 子句。
+-- 本地默认运行用 H2（MySQL 兼容模式）schema，与生产 schema.sql 结构一致，
+-- 去掉 H2 不兼容的 COMMENT 子句；仅用于同一 JVM 内的内存状态。
 
 CREATE TABLE IF NOT EXISTS incidents (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,

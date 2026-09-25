@@ -4,8 +4,10 @@ spring:
   config:
     import: "optional:configtree:/run/secrets/"
   datasource:
-    url: ${DB_URL}
-    username: ${DB_USER}
+    # 本地默认嵌入式 H2（MySQL 兼容模式），同一 JVM 内存状态，无需外部数据库或 Docker。
+    url: jdbc:h2:mem:incident_local;MODE=MySQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=30000
+    username: sa
+    driver-class-name: org.h2.Driver
     hikari:
       maximum-pool-size: 5
       minimum-idle: 1
@@ -14,6 +16,8 @@ spring:
   sql:
     init:
       mode: always
+      # 默认加载 H2 兼容建表脚本；mysql profile 下覆盖为 MySQL 版本。
+      schema-locations: classpath:schema-h2.sql
   jackson:
     time-zone: Asia/Shanghai
   lifecycle:
@@ -34,3 +38,18 @@ management:
   endpoint:
     health:
       show-details: never
+
+---
+# 生产/外接 MySQL：以 --spring.profiles.active=mysql 启用，需提供 DB_URL/DB_USER 环境变量。
+spring:
+  config:
+    activate:
+      on-profile: mysql
+  datasource:
+    url: ${DB_URL}
+    username: ${DB_USER}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema.sql

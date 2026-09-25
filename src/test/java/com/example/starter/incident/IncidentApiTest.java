@@ -32,9 +32,15 @@ class IncidentApiTest {
     @BeforeEach
     void clean() {
         jdbc.update("DELETE FROM command_keys");
+        jdbc.update("DELETE FROM notification_outbox");
+        jdbc.update("DELETE FROM incident_task_blockers");
+        jdbc.update("DELETE FROM incident_tasks");
+        jdbc.update("DELETE FROM incident_escalations");
         jdbc.update("DELETE FROM incident_status_history");
         jdbc.update("DELETE FROM incident_transfers");
         jdbc.update("DELETE FROM incident_actions");
+        jdbc.update("DELETE FROM drill_cleanups");
+        jdbc.update("DELETE FROM drill_batches");
         jdbc.update("DELETE FROM incidents");
     }
 

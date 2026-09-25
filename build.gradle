@@ -23,6 +23,8 @@ dependencies {
     implementation 'org.springframework.boot:spring-boot-starter-jdbc'
     implementation 'org.springframework.boot:spring-boot-starter-actuator'
     runtimeOnly 'com.mysql:mysql-connector-j'
+    // 本地默认以嵌入式 H2（MySQL 兼容模式）运行，无需外部数据库；生产通过 mysql profile 切换 MySQL。
+    runtimeOnly 'com.h2database:h2'
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
     testRuntimeOnly 'com.h2database:h2'
 }

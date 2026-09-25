@@ -44,4 +44,14 @@ public class ApiException extends RuntimeException {
     public static ApiException illegalTransition(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "ILLEGAL_TRANSITION", message);
     }
+
+    /** 422：跨域引用（演练/真实事件相互依赖或引用）。 */
+    public static ApiException unprocessableCrossDomain(String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "CROSS_DOMAIN_REFERENCE", message);
+    }
+
+    /** 422：演练批次存在未终结事件，整批不可清理。 */
+    public static ApiException batchNotTerminal(String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "BATCH_NOT_TERMINAL", message);
+    }
 }
