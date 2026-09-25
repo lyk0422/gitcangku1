@@ -15,9 +15,11 @@ public class BatchRepository {
 
     /**
      * batch 表行记录；id 同时作为同批次事件的提交顺序依据。
+     * minStorageTempC/maxStorageTempC 为储运温度规格（摄氏度，含边界），允许为 null（沿用默认规格）。
      */
     public record BatchRow(long id, String batchKey, String productCode, String batchNo,
-                           String producedAt, String status, String createdAt) {
+                           String producedAt, String status, String createdAt, long version,
+                           Double minStorageTempC, Double maxStorageTempC) {
     }
 
     /**
@@ -49,15 +51,45 @@ public class BatchRepository {
     }
 
     /**
-     * batch_lineage 表行记录：拆分父子关系，创建后不可改写。
+     * batch_lineage 表行记录：拆分或返工父子关系，创建后不可改写。
+     * relationType 为 SPLIT（拆分血缘）或 REWORK（MAJOR 偏差返工链）。
      */
-    public record LineageRow(long id, String parentKey, String childKey, int seq, String createdAt) {
+    public record LineageRow(long id, String parentKey, String childKey, int seq,
+                             String relationType, String createdAt) {
     }
 
-    private static final RowMapper<BatchRow> BATCH_MAPPER = (rs, n) -> new BatchRow(
-            rs.getLong("id"), rs.getString("batch_key"), rs.getString("product_code"),
-            rs.getString("batch_no"), rs.getString("produced_at"),
-            rs.getString("status"), rs.getString("created_at"));
+    /**
+     * storage_excursion 表行记录：温度偏差登记，登记后区间/温度/级别不可改写。
+     */
+    public record ExcursionRow(long id, String batchKey, String excursionKey, String startAt,
+                               String endAt, double measuredMinTempC, double measuredMaxTempC,
+                               String severity, String status, long batchVersion, String registeredAt) {
+    }
+
+    /**
+     * excursion_adjudication 表行记录：裁决不可变快照。
+     */
+    public record AdjudicationRow(long id, String batchKey, String excursionKey, String disposition,
+                                  String actorId, String reason, String reworkBatchKey,
+                                  String adjudicatedAt) {
+    }
+
+    /**
+     * batch_risk_event 表行记录：风险只增不改。
+     */
+    public record RiskEventRow(long id, String batchKey, String riskType, String detail,
+                               String actorId, String createdAt) {
+    }
+
+    private static final RowMapper<BatchRow> BATCH_MAPPER = (rs, n) -> {
+        Double min = rs.getObject("min_storage_temp_c", Double.class);
+        Double max = rs.getObject("max_storage_temp_c", Double.class);
+        return new BatchRow(
+                rs.getLong("id"), rs.getString("batch_key"), rs.getString("product_code"),
+                rs.getString("batch_no"), rs.getString("produced_at"),
+                rs.getString("status"), rs.getString("created_at"),
+                rs.getLong("version"), min, max);
+    };
 
     private static final RowMapper<TestRow> TEST_MAPPER = (rs, n) -> new TestRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("test_key"),
@@ -79,7 +111,23 @@ public class BatchRepository {
 
     private static final RowMapper<LineageRow> LINEAGE_MAPPER = (rs, n) -> new LineageRow(
             rs.getLong("id"), rs.getString("parent_key"), rs.getString("child_key"),
-            rs.getInt("seq"), rs.getString("created_at"));
+            rs.getInt("seq"), rs.getString("relation_type"), rs.getString("created_at"));
+
+    private static final RowMapper<ExcursionRow> EXCURSION_MAPPER = (rs, n) -> new ExcursionRow(
+            rs.getLong("id"), rs.getString("batch_key"), rs.getString("excursion_key"),
+            rs.getString("start_at"), rs.getString("end_at"),
+            rs.getDouble("measured_min_temp_c"), rs.getDouble("measured_max_temp_c"),
+            rs.getString("severity"), rs.getString("status"),
+            rs.getLong("batch_version"), rs.getString("registered_at"));
+
+    private static final RowMapper<AdjudicationRow> ADJUDICATION_MAPPER = (rs, n) -> new AdjudicationRow(
+            rs.getLong("id"), rs.getString("batch_key"), rs.getString("excursion_key"),
+            rs.getString("disposition"), rs.getString("actor_id"), rs.getString("reason"),
+            rs.getString("rework_batch_key"), rs.getString("adjudicated_at"));
+
+    private static final RowMapper<RiskEventRow> RISK_MAPPER = (rs, n) -> new RiskEventRow(
+            rs.getLong("id"), rs.getString("batch_key"), rs.getString("risk_type"),
+            rs.getString("detail"), rs.getString("actor_id"), rs.getString("created_at"));
 
     private final JdbcTemplate jdbc;
 
@@ -93,7 +141,7 @@ public class BatchRepository {
     }
 
     /**
-     * 行锁读取批次，串行化同一批次上的检验/批准/召回事务。
+     * 行锁读取批次，串行化同一批次上的检验/批准/召回/偏差事务。
      */
     public Optional<BatchRow> findBatchForUpdate(String batchKey) {
         return jdbc.query("SELECT * FROM batch WHERE batch_key = ? FOR UPDATE", BATCH_MAPPER, batchKey)
@@ -101,10 +149,12 @@ public class BatchRepository {
     }
 
     public void insertBatch(BatchRow row) {
-        jdbc.update("INSERT INTO batch (batch_key, product_code, batch_no, produced_at, status, created_at)"
-                        + " VALUES (?, ?, ?, ?, ?, ?)",
+        jdbc.update("INSERT INTO batch (batch_key, product_code, batch_no, produced_at, status, created_at,"
+                        + " version, min_storage_temp_c, max_storage_temp_c)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 row.batchKey(), row.productCode(), row.batchNo(), row.producedAt(),
-                row.status(), row.createdAt());
+                row.status(), row.createdAt(), row.version(),
+                row.minStorageTempC(), row.maxStorageTempC());
     }
 
     public void insertRequiredTest(String batchKey, String testItem, int seq) {
@@ -120,6 +170,13 @@ public class BatchRepository {
 
     public void updateStatus(String batchKey, String status) {
         jdbc.update("UPDATE batch SET status = ? WHERE batch_key = ?", status, batchKey);
+    }
+
+    /**
+     * 批次版本号 +1，每次储运偏差登记在同一事务内调用。
+     */
+    public void incrementVersion(String batchKey) {
+        jdbc.update("UPDATE batch SET version = version + 1 WHERE batch_key = ?", batchKey);
     }
 
     public List<BatchRow> findAvailableBatches() {
@@ -181,9 +238,9 @@ public class BatchRepository {
     }
 
     public void insertLineage(LineageRow row) {
-        jdbc.update("INSERT INTO batch_lineage (parent_key, child_key, seq, created_at)"
-                        + " VALUES (?, ?, ?, ?)",
-                row.parentKey(), row.childKey(), row.seq(), row.createdAt());
+        jdbc.update("INSERT INTO batch_lineage (parent_key, child_key, seq, relation_type, created_at)"
+                        + " VALUES (?, ?, ?, ?, ?)",
+                row.parentKey(), row.childKey(), row.seq(), row.relationType(), row.createdAt());
     }
 
     /**
@@ -194,7 +251,7 @@ public class BatchRepository {
     }
 
     /**
-     * 某批次的直接父批业务键；每个子批仅一个父批。
+     * 某批次的直接父批业务键；每个子批仅一个父批（拆分或返工）。
      */
     public Optional<String> findParentKey(String childKey) {
         return jdbc.queryForList("SELECT parent_key FROM batch_lineage WHERE child_key = ?",
@@ -208,5 +265,74 @@ public class BatchRepository {
     public List<String> findRecalledKeys() {
         return jdbc.queryForList("SELECT batch_key FROM batch WHERE status = 'RECALLED'",
                 String.class);
+    }
+
+    /**
+     * 全部存在 MAJOR 偏差 REJECT 裁决的批次业务键；这些批次及其后代按召回口径拦截。
+     */
+    public List<String> findExcursionRejectedKeys() {
+        return jdbc.queryForList(
+                "SELECT DISTINCT batch_key FROM excursion_adjudication WHERE disposition = 'REJECT'",
+                String.class);
+    }
+
+    // ---------- 储运偏差 ----------
+
+    public void insertExcursion(ExcursionRow row) {
+        jdbc.update("INSERT INTO storage_excursion (batch_key, excursion_key, start_at, end_at,"
+                        + " measured_min_temp_c, measured_max_temp_c, severity, status, batch_version,"
+                        + " registered_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                row.batchKey(), row.excursionKey(), row.startAt(), row.endAt(),
+                row.measuredMinTempC(), row.measuredMaxTempC(), row.severity(), row.status(),
+                row.batchVersion(), row.registeredAt());
+    }
+
+    public Optional<ExcursionRow> findExcursion(String batchKey, String excursionKey) {
+        return jdbc.query("SELECT * FROM storage_excursion WHERE batch_key = ? AND excursion_key = ?",
+                        EXCURSION_MAPPER, batchKey, excursionKey)
+                .stream().findFirst();
+    }
+
+    public List<ExcursionRow> findExcursions(String batchKey) {
+        return jdbc.query("SELECT * FROM storage_excursion WHERE batch_key = ? ORDER BY id",
+                EXCURSION_MAPPER, batchKey);
+    }
+
+    /**
+     * 推进偏差裁决状态（OPEN→ADJUDICATED）；区间、温度与严重级别列不参与更新，保持不可变。
+     */
+    public void updateExcursionStatus(String batchKey, String excursionKey, String status) {
+        jdbc.update("UPDATE storage_excursion SET status = ? WHERE batch_key = ? AND excursion_key = ?",
+                status, batchKey, excursionKey);
+    }
+
+    public void insertAdjudication(AdjudicationRow row) {
+        jdbc.update("INSERT INTO excursion_adjudication (batch_key, excursion_key, disposition,"
+                        + " actor_id, reason, rework_batch_key, adjudicated_at)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                row.batchKey(), row.excursionKey(), row.disposition(), row.actorId(),
+                row.reason(), row.reworkBatchKey(), row.adjudicatedAt());
+    }
+
+    public Optional<AdjudicationRow> findAdjudication(String batchKey, String excursionKey) {
+        return jdbc.query("SELECT * FROM excursion_adjudication WHERE batch_key = ? AND excursion_key = ?",
+                        ADJUDICATION_MAPPER, batchKey, excursionKey)
+                .stream().findFirst();
+    }
+
+    public List<AdjudicationRow> findAdjudications(String batchKey) {
+        return jdbc.query("SELECT * FROM excursion_adjudication WHERE batch_key = ? ORDER BY id",
+                ADJUDICATION_MAPPER, batchKey);
+    }
+
+    public void insertRiskEvent(RiskEventRow row) {
+        jdbc.update("INSERT INTO batch_risk_event (batch_key, risk_type, detail, actor_id, created_at)"
+                        + " VALUES (?, ?, ?, ?, ?)",
+                row.batchKey(), row.riskType(), row.detail(), row.actorId(), row.createdAt());
+    }
+
+    public List<RiskEventRow> findRiskEvents(String batchKey) {
+        return jdbc.query("SELECT * FROM batch_risk_event WHERE batch_key = ? ORDER BY id",
+                RISK_MAPPER, batchKey);
     }
 }

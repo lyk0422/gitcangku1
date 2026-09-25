@@ -49,6 +49,9 @@ class BatchSplitLineageTest {
         jdbc.update("DELETE FROM approval");
         jdbc.update("DELETE FROM recall");
         jdbc.update("DELETE FROM test_result");
+        jdbc.update("DELETE FROM excursion_adjudication");
+        jdbc.update("DELETE FROM storage_excursion");
+        jdbc.update("DELETE FROM batch_risk_event");
         jdbc.update("DELETE FROM batch_required_test");
         jdbc.update("DELETE FROM batch_lineage");
         jdbc.update("DELETE FROM batch");

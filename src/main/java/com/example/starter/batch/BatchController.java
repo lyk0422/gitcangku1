@@ -3,9 +3,14 @@ package com.example.starter.batch;
 import com.example.starter.batch.dto.ApproveRequest;
 import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
+import com.example.starter.batch.dto.AdjudicateExcursionRequest;
 import com.example.starter.batch.dto.CreateBatchRequest;
+import com.example.starter.batch.dto.ExcursionResponse;
 import com.example.starter.batch.dto.LineageEntryResponse;
 import com.example.starter.batch.dto.RecallRequest;
+import com.example.starter.batch.dto.RegisterExcursionsRequest;
+import com.example.starter.batch.dto.ReleaseBlockResponse;
+import com.example.starter.batch.dto.RiskEventResponse;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
 import jakarta.validation.Valid;
@@ -107,11 +112,59 @@ public class BatchController {
     }
 
     /**
-     * 后代查询：按拆分创建顺序展开，含各批自身状态及导致不可用的召回祖先。
+     * 后代查询：按拆分创建顺序展开，含各批自身状态及导致不可用的召回/偏差 REJECT 祖先。
      */
     @GetMapping("/{batchKey}/descendants")
     public List<LineageEntryResponse> descendants(@PathVariable String batchKey) {
         return service.listDescendants(batchKey);
+    }
+
+    /**
+     * 一次登记一条或多条储运温度偏差（UTC 左闭右开区间）；
+     * 先校验完整最终区间集合与规格判定，任一非法整批回滚。
+     */
+    @PostMapping("/{batchKey}/excursions")
+    public ResponseEntity<String> registerExcursions(@PathVariable String batchKey,
+                                                     @Valid @RequestBody RegisterExcursionsRequest request) {
+        return stored(service.registerExcursions(batchKey, request));
+    }
+
+    /**
+     * 查询批次全部储运偏差区间及裁决快照。
+     */
+    @GetMapping("/{batchKey}/excursions")
+    public List<ExcursionResponse> excursions(@PathVariable String batchKey) {
+        return service.listExcursions(batchKey);
+    }
+
+    /**
+     * 裁决偏差：X-Actor-Id 为操作人，X-Approval-Role 为 QUALITY/OPERATIONS；
+     * MAJOR 仅可 REWORK/REJECT，MINOR 须 QUALITY 角色 CONFIRM。
+     */
+    @PostMapping("/{batchKey}/excursions/{excursionKey}/adjudications")
+    public ResponseEntity<String> adjudicateExcursion(
+            @PathVariable String batchKey,
+            @PathVariable String excursionKey,
+            @RequestHeader(name = "X-Actor-Id", required = false) String actorId,
+            @RequestHeader(name = "X-Approval-Role", required = false) String role,
+            @Valid @RequestBody AdjudicateExcursionRequest request) {
+        return stored(service.adjudicateExcursion(batchKey, excursionKey, actorId, role, request));
+    }
+
+    /**
+     * 放行持续门禁查询：未裁决 MAJOR 偏差阻断放行，未确认 MINOR 偏差需质控确认。
+     */
+    @GetMapping("/{batchKey}/release-blocks")
+    public ReleaseBlockResponse releaseBlocks(@PathVariable String batchKey) {
+        return service.releaseBlock(batchKey);
+    }
+
+    /**
+     * 查询批次风险记录（已放行新增 MAJOR、偏差 REJECT 拦截）；风险只增不改。
+     */
+    @GetMapping("/{batchKey}/risk-events")
+    public List<RiskEventResponse> riskEvents(@PathVariable String batchKey) {
+        return service.listRiskEvents(batchKey);
     }
 
     private ResponseEntity<String> stored(StoredResponse response) {
