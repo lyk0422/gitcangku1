@@ -9,6 +9,7 @@ import org.springframework.stereotype.Service;
 import com.example.starter.maintenance.api.ApiException;
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
+import com.example.starter.maintenance.api.dto.ConversionRecordView;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
@@ -33,8 +34,8 @@ public class EquipmentService {
     }
 
     public EquipmentResponse register(RegisterEquipmentRequest req) {
-        String fingerprint = req.equipmentId() + "|" + req.maintenancePeriodMinutes();
-        return recoverDuplicateKey(req.requestId(), "REGISTER_EQUIPMENT", fingerprint,
+        return recoverDuplicateKey(req.requestId(), "REGISTER_EQUIPMENT",
+                EquipmentTxService.registerFingerprint(req),
                 EquipmentResponse.class, () -> txService.register(req));
     }
 
@@ -50,8 +51,12 @@ public class EquipmentService {
         return txService.completeMaintenance(equipmentId, req);
     }
 
-    public StatusResponse getStatus(String equipmentId) {
-        return txService.getStatus(equipmentId);
+    public EquipmentResponse getEquipment(String equipmentId) {
+        return txService.getEquipment(equipmentId);
+    }
+
+    public StatusResponse getStatus(String equipmentId, String displayUnit) {
+        return txService.getStatus(equipmentId, displayUnit);
     }
 
     public List<ReadingResponse> listReadings(String equipmentId) {
@@ -64,6 +69,10 @@ public class EquipmentService {
 
     public List<MaintenanceResponse> listMaintenances(String equipmentId) {
         return txService.listMaintenances(equipmentId);
+    }
+
+    public List<ConversionRecordView> listConversions(String equipmentId) {
+        return txService.listConversions(equipmentId);
     }
 
     /**
