@@ -62,8 +62,81 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_review_request ON review (request_id);
 -- 写操作幂等去重：同键同参重放原结果，异参冲突；失败不占键
 CREATE TABLE IF NOT EXISTS request_dedup (
     request_id     VARCHAR(64) PRIMARY KEY COMMENT '写操作全局唯一请求标识',
-    request_kind   VARCHAR(32) NOT NULL COMMENT '请求类型：ZONE_CREATE/ZONE_REVOKE/ROUTE_CREATE/ROUTE_REPLACE/REVIEW',
+    request_kind   VARCHAR(32) NOT NULL COMMENT '请求类型：ZONE_CREATE/ZONE_REVOKE/ROUTE_CREATE/ROUTE_REPLACE/REVIEW/RUNWAY_CREATE/CLOSURE_CREATE/FLIGHT_CREATE/FLIGHT_REVIEW/FLIGHT_DEPART/FLIGHT_REROUTE/FLIGHT_CANCEL/FLIGHT_EMERGENCY_CONVERT',
     request_hash   VARCHAR(64) NOT NULL COMMENT '规范化参数的 SHA-256 十六进制摘要，用于同键异参冲突判定',
     response_json  CLOB NOT NULL COMMENT '首次成功响应 JSON，重放时原样返回',
     created_at     BIGINT NOT NULL COMMENT '首次成功时间，epoch 毫秒（UTC）'
 ) COMMENT = '写操作幂等去重记录（与业务变更同事务原子提交）';
+
+-- 跑道：runwayId 唯一，版本从 0 开始，每次关闭窗口登记成功后加一
+CREATE TABLE IF NOT EXISTS runway (
+    runway_id       VARCHAR(64) PRIMARY KEY COMMENT '跑道唯一标识',
+    version         INT NOT NULL COMMENT '当前跑道版本，初始 0，每次关闭窗口登记成功后加一；登记关闭窗口须携带该版本',
+    hourly_capacity INT NOT NULL COMMENT '每 UTC 小时起降容量（起飞与落地各计一次），必须 >= 1',
+    touch           BIGINT NOT NULL COMMENT '仅用于事务加行级写锁的计数器，无业务含义'
+) COMMENT = '机场跑道（含版本与小时容量）';
+
+-- 跑道关闭窗口：UTC 左闭右开 [start_utc, end_utc)，同一跑道窗口不得重叠，端点相接合法
+CREATE TABLE IF NOT EXISTS runway_closure (
+    closure_id       VARCHAR(64) PRIMARY KEY COMMENT '关闭窗口唯一标识（服务端生成）',
+    runway_id        VARCHAR(64) NOT NULL COMMENT '所属跑道标识',
+    start_utc        BIGINT NOT NULL COMMENT '关闭开始时刻，epoch 毫秒（UTC），左闭',
+    end_utc          BIGINT NOT NULL COMMENT '关闭结束时刻，epoch 毫秒（UTC），右开，必须大于 start_utc',
+    allow_emergency  BOOLEAN NOT NULL COMMENT '是否允许紧急例外：TRUE 时 EMERGENCY 航班附事件号可通过该窗口',
+    operator         VARCHAR(64) NOT NULL COMMENT '登记操作者标识',
+    closure_key      VARCHAR(64) NOT NULL COMMENT '幂等键：指纹含跑道版本、规范化时段、例外标志与操作者；同键重放，失败不占键',
+    runway_version   INT NOT NULL COMMENT '本次窗口登记生效后的跑道版本',
+    created_at       BIGINT NOT NULL COMMENT '登记时间，epoch 毫秒（UTC）'
+) COMMENT = '跑道关闭窗口（UTC 左闭右开，同跑道不重叠，端点相接合法）';
+
+CREATE INDEX IF NOT EXISTS ix_closure_runway ON runway_closure (runway_id);
+
+-- closureKey 指纹唯一：同键重放原窗口，失败不占键
+CREATE UNIQUE INDEX IF NOT EXISTS ux_closure_key ON runway_closure (closure_key);
+
+-- 航班：航线起降段计划与状态
+CREATE TABLE IF NOT EXISTS flight (
+    flight_id      VARCHAR(64) PRIMARY KEY COMMENT '航班唯一标识',
+    route_id       VARCHAR(64) NOT NULL COMMENT '关联航线标识',
+    route_type     VARCHAR(16) NOT NULL COMMENT '航线类型：NORMAL 普通；EMERGENCY 紧急',
+    event_no       VARCHAR(64) NULL COMMENT '紧急事件号；EMERGENCY 经关闭窗口例外通过时必填，否则为 NULL',
+    dep_runway_id  VARCHAR(64) NOT NULL COMMENT '起飞跑道标识',
+    dep_time_utc   BIGINT NOT NULL COMMENT '计划起飞时刻，epoch 毫秒（UTC）',
+    arr_runway_id  VARCHAR(64) NOT NULL COMMENT '落地跑道标识',
+    arr_time_utc   BIGINT NOT NULL COMMENT '计划落地时刻，epoch 毫秒（UTC）',
+    status         VARCHAR(16) NOT NULL COMMENT '状态：PENDING 待审查；APPROVED 已批准；RUNWAY_RISK 跑道风险；DEPARTED 已起飞；CANCELLED 已取消',
+    approved_at    BIGINT NULL COMMENT '批准时间，epoch 毫秒（UTC）；未批准为 NULL',
+    touch          BIGINT NOT NULL COMMENT '仅用于事务加行级写锁的计数器，无业务含义'
+) COMMENT = '航班起降段计划与状态';
+
+-- 跑道风险固化快照：新关闭窗口生效时命中且未起飞的已批准 NORMAL 航班
+CREATE TABLE IF NOT EXISTS flight_risk (
+    flight_id       VARCHAR(64) NOT NULL COMMENT '风险航班标识',
+    closure_id      VARCHAR(64) NOT NULL COMMENT '触发风险的关闭窗口标识',
+    runway_id       VARCHAR(64) NOT NULL COMMENT '关闭窗口所属跑道标识（快照）',
+    start_utc       BIGINT NOT NULL COMMENT '关闭开始时刻快照，epoch 毫秒（UTC），左闭',
+    end_utc         BIGINT NOT NULL COMMENT '关闭结束时刻快照，epoch 毫秒（UTC），右开',
+    allow_emergency BOOLEAN NOT NULL COMMENT '关闭窗口紧急例外标志快照',
+    operator        VARCHAR(64) NOT NULL COMMENT '登记操作者快照',
+    runway_version  INT NOT NULL COMMENT '窗口生效跑道版本快照',
+    snapshot_at     BIGINT NOT NULL COMMENT '快照固化时间，epoch 毫秒（UTC）',
+    PRIMARY KEY (flight_id, closure_id)
+) COMMENT = '航班跑道风险快照（窗口内容固化，不随后续变更）';
+
+-- 航班批量审查结论（不可变）
+CREATE TABLE IF NOT EXISTS flight_review (
+    review_id   VARCHAR(64) PRIMARY KEY COMMENT '批量审查记录唯一标识（不可变）',
+    request_id  VARCHAR(64) NOT NULL COMMENT '提交审查的写操作请求标识',
+    approved    BOOLEAN NOT NULL COMMENT '整批是否批准：任一航线拒绝则为 FALSE 且无任何航班状态变更',
+    created_at  BIGINT NOT NULL COMMENT '审查时间，epoch 毫秒（UTC）'
+) COMMENT = '航班批量审查结论（不可变）';
+
+-- 航班批量审查逐航线明细（不可变，原因码可区分）
+CREATE TABLE IF NOT EXISTS flight_review_item (
+    review_id  VARCHAR(64) NOT NULL COMMENT '所属批量审查记录标识',
+    flight_id  VARCHAR(64) NOT NULL COMMENT '被审查航班标识',
+    result     VARCHAR(16) NOT NULL COMMENT '单航线结果：APPROVED 通过；REJECTED 拒绝',
+    reason     VARCHAR(64) NULL COMMENT '拒绝原因码：RUNWAY_CLOSED/EMERGENCY_EXCEPTION_NOT_ALLOWED/MISSING_EVENT_NO/CAPACITY_EXCEEDED/FLIGHT_NOT_REVIEWABLE；通过为 NULL',
+    detail     VARCHAR(512) NULL COMMENT '拒绝细节（涉及窗口或容量槽位）；通过为 NULL',
+    PRIMARY KEY (review_id, flight_id)
+) COMMENT = '航班批量审查逐航线明细（不可变）';

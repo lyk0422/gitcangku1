@@ -94,4 +94,13 @@ public class AirspaceRepository {
         jdbc.update("UPDATE airspace_meta SET global_version = global_version + 1 WHERE id = 1");
         return getGlobalVersion();
     }
+
+    /**
+     * 仅取得协调锁行的行级排他锁（真实更新 touched）。
+     * 跑道关闭变更、航班批量审查、起飞与改航事务都先取该锁，
+     * 使这些操作按事务提交顺序串行裁决。
+     */
+    public void lockCoordinationRow() {
+        jdbc.update("UPDATE coord_lock SET touched = touched + 1 WHERE id = 1");
+    }
 }
