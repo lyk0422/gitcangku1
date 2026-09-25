@@ -4,6 +4,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
 
+import java.math.BigDecimal;
 import java.util.List;
 import java.util.Optional;
 
@@ -54,6 +55,13 @@ public class BatchRepository {
     public record LineageRow(long id, String parentKey, String childKey, int seq, String createdAt) {
     }
 
+    /**
+     * batch_yield 表行记录：每批次仅一份；数量为最多三位小数的十进制原始值。
+     */
+    public record YieldRow(long id, String batchKey, BigDecimal inputQty, BigDecimal outputQty,
+                           long version, String operator, String createdAt, String updatedAt) {
+    }
+
     private static final RowMapper<BatchRow> BATCH_MAPPER = (rs, n) -> new BatchRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("product_code"),
             rs.getString("batch_no"), rs.getString("produced_at"),
@@ -80,6 +88,11 @@ public class BatchRepository {
     private static final RowMapper<LineageRow> LINEAGE_MAPPER = (rs, n) -> new LineageRow(
             rs.getLong("id"), rs.getString("parent_key"), rs.getString("child_key"),
             rs.getInt("seq"), rs.getString("created_at"));
+
+    private static final RowMapper<YieldRow> YIELD_MAPPER = (rs, n) -> new YieldRow(
+            rs.getLong("id"), rs.getString("batch_key"), rs.getBigDecimal("input_qty"),
+            rs.getBigDecimal("output_qty"), rs.getLong("version"), rs.getString("operator"),
+            rs.getString("created_at"), rs.getString("updated_at"));
 
     private final JdbcTemplate jdbc;
 
@@ -208,5 +221,58 @@ public class BatchRepository {
     public List<String> findRecalledKeys() {
         return jdbc.queryForList("SELECT batch_key FROM batch WHERE status = 'RECALLED'",
                 String.class);
+    }
+
+    /**
+     * 某批次的产率记录；每批次至多一份。
+     */
+    public Optional<YieldRow> findYield(String batchKey) {
+        return jdbc.query("SELECT * FROM batch_yield WHERE batch_key = ?", YIELD_MAPPER, batchKey)
+                .stream().findFirst();
+    }
+
+    public void insertYield(YieldRow row) {
+        jdbc.update("INSERT INTO batch_yield (batch_key, input_qty, output_qty, version, operator,"
+                        + " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                row.batchKey(), row.inputQty(), row.outputQty(), row.version(), row.operator(),
+                row.createdAt(), row.updatedAt());
+    }
+
+    /**
+     * 修订产率：更新数值、版本与操作人；created_at 保留首次登记时间。
+     */
+    public void updateYield(YieldRow row) {
+        jdbc.update("UPDATE batch_yield SET input_qty = ?, output_qty = ?, version = ?,"
+                        + " operator = ?, updated_at = ? WHERE batch_key = ?",
+                row.inputQty(), row.outputQty(), row.version(), row.operator(), row.updatedAt(),
+                row.batchKey());
+    }
+
+    /**
+     * 某批次的全部直接父批业务键（当前血缘模型下每个子批至多一个父批，
+     * 以列表返回以兼容后续合批产生的多父批）。
+     */
+    public List<String> findParentKeys(String childKey) {
+        return jdbc.queryForList("SELECT parent_key FROM batch_lineage WHERE child_key = ?",
+                String.class, childKey);
+    }
+
+    /**
+     * 某批次的全部直接子批业务键，按血缘创建顺序。
+     */
+    public List<String> findChildKeys(String parentKey) {
+        return jdbc.queryForList(
+                "SELECT child_key FROM batch_lineage WHERE parent_key = ? ORDER BY seq",
+                String.class, parentKey);
+    }
+
+    /**
+     * 某父批全部直接子批中已登记产率的记录，用于父子投入/产出守恒汇总。
+     */
+    public List<YieldRow> findChildYields(String parentKey) {
+        return jdbc.query("SELECT y.* FROM batch_yield y"
+                        + " JOIN batch_lineage l ON y.batch_key = l.child_key"
+                        + " WHERE l.parent_key = ? ORDER BY l.seq",
+                YIELD_MAPPER, parentKey);
     }
 }

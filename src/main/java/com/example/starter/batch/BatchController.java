@@ -8,6 +8,10 @@ import com.example.starter.batch.dto.LineageEntryResponse;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
+import com.example.starter.batch.dto.YieldAllocationResponse;
+import com.example.starter.batch.dto.YieldBlockResponse;
+import com.example.starter.batch.dto.YieldRecordResponse;
+import com.example.starter.batch.dto.YieldSubmitRequest;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
@@ -112,6 +116,39 @@ public class BatchController {
     @GetMapping("/{batchKey}/descendants")
     public List<LineageEntryResponse> descendants(@PathVariable String batchKey) {
         return service.listDescendants(batchKey);
+    }
+
+    /**
+     * 登记/修订批次产率：一个请求可含多批次，先校验最终分配再单事务写入，
+     * 任一失败整单回滚；yieldKey 幂等，同键成功重放首次快照，失败不占键。
+     */
+    @PostMapping("/yields")
+    public ResponseEntity<String> submitYields(@Valid @RequestBody YieldSubmitRequest request) {
+        return stored(service.submitYields(request));
+    }
+
+    /**
+     * 查询单批次产率：原始数值保留，yieldRate 按四位小数展示。
+     */
+    @GetMapping("/{batchKey}/yield")
+    public YieldRecordResponse yield(@PathVariable String batchKey) {
+        return service.getYield(batchKey);
+    }
+
+    /**
+     * 父子分配汇总：本批产出、子批已分配投入与剩余可分配量，及各直接父批分配汇总。
+     */
+    @GetMapping("/{batchKey}/yield-allocation")
+    public YieldAllocationResponse yieldAllocation(@PathVariable String batchKey) {
+        return service.getYieldAllocation(batchKey);
+    }
+
+    /**
+     * 产率召回阻断原因：是否处于召回血缘闭包内及阻断来源召回记录。
+     */
+    @GetMapping("/{batchKey}/yield-block")
+    public YieldBlockResponse yieldBlock(@PathVariable String batchKey) {
+        return service.getYieldBlock(batchKey);
     }
 
     private ResponseEntity<String> stored(StoredResponse response) {
