@@ -14,12 +14,17 @@ import org.springframework.web.bind.annotation.RestController;
 import com.example.starter.baggage.BaggageDtos.ArriveRequest;
 import com.example.starter.baggage.BaggageDtos.ArriveResponse;
 import com.example.starter.baggage.BaggageDtos.BagResponse;
+import com.example.starter.baggage.BaggageDtos.ClearOverweightRequest;
+import com.example.starter.baggage.BaggageDtos.ClearOverweightResponse;
 import com.example.starter.baggage.BaggageDtos.LegResponse;
 import com.example.starter.baggage.BaggageDtos.LoadRequest;
 import com.example.starter.baggage.BaggageDtos.LoadResponse;
 import com.example.starter.baggage.BaggageDtos.ManifestResponse;
 import com.example.starter.baggage.BaggageDtos.RegisterBagRequest;
 import com.example.starter.baggage.BaggageDtos.RegisterLegRequest;
+import com.example.starter.baggage.BaggageDtos.ReweighHistoryResponse;
+import com.example.starter.baggage.BaggageDtos.ReweighRequest;
+import com.example.starter.baggage.BaggageDtos.ReweighResponse;
 import com.example.starter.baggage.BaggageDtos.SealRequest;
 import com.example.starter.baggage.BaggageDtos.SealResponse;
 
@@ -76,5 +81,24 @@ public class BaggageController {
     @GetMapping("/legs/{legId}/manifest")
     public ManifestResponse getManifest(@PathVariable String legId) {
         return baggageService.getManifest(legId);
+    }
+
+    /** 复重纠偏：提交实测重量与称重站，原子纠偏并写不可变复重记录，随后触发超重校验。 */
+    @PostMapping("/bags/{bagTag}/reweigh")
+    public ReweighResponse reweigh(@PathVariable String bagTag, @Valid @RequestBody ReweighRequest request) {
+        return baggageService.reweigh(bagTag, request);
+    }
+
+    /** 清除超重提醒：需说明，清除不可逆。 */
+    @PostMapping("/bags/{bagTag}/overweight/clear")
+    public ClearOverweightResponse clearOverweight(@PathVariable String bagTag,
+                                                   @Valid @RequestBody ClearOverweightRequest request) {
+        return baggageService.clearOverweight(bagTag, request);
+    }
+
+    /** 复重历史与当前提醒状态查询。 */
+    @GetMapping("/bags/{bagTag}/reweighs")
+    public ReweighHistoryResponse getReweighHistory(@PathVariable String bagTag) {
+        return baggageService.getReweighHistory(bagTag);
     }
 }

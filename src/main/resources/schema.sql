@@ -15,12 +15,17 @@ CREATE TABLE IF NOT EXISTS leg (
 
 -- 行李：bag_tag 唯一，登记 1~5 个有序航段行程
 CREATE TABLE IF NOT EXISTS bag (
-    bag_tag          VARCHAR(64) NOT NULL COMMENT '行李牌号，全局唯一',
-    current_location VARCHAR(64) NOT NULL COMMENT '当前所在站点代码',
-    next_leg_index   INT         NOT NULL DEFAULT 0 COMMENT '待乘航段在行程中的下标（0 起），等于行程长度表示已完成',
-    status           VARCHAR(16) NOT NULL DEFAULT 'IN_TRANSIT' COMMENT '行李状态：IN_TRANSIT/DELIVERED',
-    loaded_leg_id    VARCHAR(64) NULL COMMENT '当前已装载到的航段，未装载为 NULL',
-    created_at       TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    bag_tag               VARCHAR(64)  NOT NULL COMMENT '行李牌号，全局唯一',
+    current_location      VARCHAR(64)  NOT NULL COMMENT '当前所在站点代码',
+    next_leg_index        INT          NOT NULL DEFAULT 0 COMMENT '待乘航段在行程中的下标（0 起），等于行程长度表示已完成',
+    status                VARCHAR(16)  NOT NULL DEFAULT 'IN_TRANSIT' COMMENT '行李状态：IN_TRANSIT/DELIVERED',
+    loaded_leg_id         VARCHAR(64)  NULL COMMENT '当前已装载到的航段，未装载为 NULL',
+    weight_kg             INT          NULL COMMENT '当前记录重量（千克，整数），复重后原子更新；从未称重为 NULL',
+    free_allowance_kg     INT          NOT NULL DEFAULT 20 COMMENT '登记的旅客免费行李限额（千克），超重校验基准',
+    overweight_reminder   VARCHAR(16)  NOT NULL DEFAULT 'NONE' COMMENT '超重提醒状态：NONE 无 / ACTIVE 待处理 / CLEARED 已人工清除（不可逆）',
+    overweight_clear_note VARCHAR(255) NULL COMMENT '清除超重提醒时提交的说明，未清除为 NULL',
+    overweight_cleared_at TIMESTAMP    NULL COMMENT '超重提醒清除时间（会话时区），未清除为 NULL',
+    created_at            TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     PRIMARY KEY (bag_tag)
 );
 
@@ -42,10 +47,25 @@ CREATE TABLE IF NOT EXISTS load_record (
     PRIMARY KEY (bag_tag)
 );
 
+-- 复重记录：不可变事件日志，同一行李可多次复重并保留完整历史；
+-- reweigh_key 为复重业务键，全局唯一，重复提交返回 409
+CREATE TABLE IF NOT EXISTS reweigh_record (
+    id            BIGINT      NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    bag_tag       VARCHAR(64) NOT NULL COMMENT '行李牌号',
+    reweigh_key   VARCHAR(128) NOT NULL COMMENT '复重业务键，全局唯一',
+    old_weight_kg INT         NULL COMMENT '复重前记录重量（千克），首次称重为 NULL',
+    new_weight_kg INT         NOT NULL COMMENT '复重实测重量（千克，1~50 整数）',
+    weight_changed BOOLEAN    NOT NULL COMMENT '本次复重是否改变了记录重量',
+    station_id    VARCHAR(64) NOT NULL COMMENT '称重站标识',
+    created_at    TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '复重时刻（会话时区）',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_reweigh_key (reweigh_key)
+);
+
 -- 幂等去重：仅记录成功请求；同 requestId 同参数重放原结果，异参数返回 409
 CREATE TABLE IF NOT EXISTS request_log (
     request_id      VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
-    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE',
+    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/REWEIGH/CLEAR_OVERWEIGHT',
     request_hash    VARCHAR(64)  NOT NULL COMMENT '请求参数（不含 requestId）的 SHA-256 摘要',
     response_status INT          NOT NULL COMMENT '原成功响应的 HTTP 状态码',
     response_body   CLOB         NOT NULL COMMENT '原成功响应体（JSON）',

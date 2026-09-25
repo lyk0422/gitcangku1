@@ -28,6 +28,10 @@ server:
     include-message: never
     include-stacktrace: never
 
+baggage:
+  # 批量装载总重上限（千克），按装载时行李最新记录重量判定
+  max-load-total-weight-kg: 500
+
 management:
   endpoints:
     web:

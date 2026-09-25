@@ -17,6 +17,10 @@ server:
     include-message: never
     include-stacktrace: never
 
+baggage:
+  # 测试用较小的批量装载总重上限，便于构造超限场景
+  max-load-total-weight-kg: 60
+
 management:
   endpoints:
     web:

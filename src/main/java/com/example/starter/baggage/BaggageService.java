@@ -1,11 +1,14 @@
 package com.example.starter.baggage;
 
+import java.sql.Timestamp;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Service;
@@ -13,6 +16,8 @@ import org.springframework.stereotype.Service;
 import com.example.starter.baggage.BaggageDtos.ArriveRequest;
 import com.example.starter.baggage.BaggageDtos.ArriveResponse;
 import com.example.starter.baggage.BaggageDtos.BagResponse;
+import com.example.starter.baggage.BaggageDtos.ClearOverweightRequest;
+import com.example.starter.baggage.BaggageDtos.ClearOverweightResponse;
 import com.example.starter.baggage.BaggageDtos.ItineraryItem;
 import com.example.starter.baggage.BaggageDtos.LegResponse;
 import com.example.starter.baggage.BaggageDtos.LoadRequest;
@@ -20,6 +25,10 @@ import com.example.starter.baggage.BaggageDtos.LoadResponse;
 import com.example.starter.baggage.BaggageDtos.ManifestResponse;
 import com.example.starter.baggage.BaggageDtos.RegisterBagRequest;
 import com.example.starter.baggage.BaggageDtos.RegisterLegRequest;
+import com.example.starter.baggage.BaggageDtos.ReweighHistoryResponse;
+import com.example.starter.baggage.BaggageDtos.ReweighRecordItem;
+import com.example.starter.baggage.BaggageDtos.ReweighRequest;
+import com.example.starter.baggage.BaggageDtos.ReweighResponse;
 import com.example.starter.baggage.BaggageDtos.SealRequest;
 import com.example.starter.baggage.BaggageDtos.SealResponse;
 
@@ -37,6 +46,17 @@ public class BaggageService {
     private static final String LEG_ARRIVED = "ARRIVED";
     private static final String BAG_IN_TRANSIT = "IN_TRANSIT";
     private static final String BAG_DELIVERED = "DELIVERED";
+    /** 超重提醒状态：无提醒。 */
+    private static final String REMINDER_NONE = "NONE";
+    /** 超重提醒状态：待人工处理。 */
+    private static final String REMINDER_ACTIVE = "ACTIVE";
+    /** 超重提醒状态：已人工清除（不可逆）。 */
+    private static final String REMINDER_CLEARED = "CLEARED";
+    /** 未登记免费限额时的默认值（千克）。 */
+    private static final int DEFAULT_FREE_ALLOWANCE_KG = 20;
+
+    private static final String BAG_COLUMNS = "bag_tag, current_location, next_leg_index, status, loaded_leg_id,"
+            + " weight_kg, free_allowance_kg, overweight_reminder, overweight_clear_note";
 
     private static final RowMapper<LegRow> LEG_MAPPER = (rs, rowNum) -> new LegRow(
             rs.getString("leg_id"), rs.getString("origin"), rs.getString("destination"),
@@ -44,21 +64,32 @@ public class BaggageService {
 
     private static final RowMapper<BagRow> BAG_MAPPER = (rs, rowNum) -> new BagRow(
             rs.getString("bag_tag"), rs.getString("current_location"),
-            rs.getInt("next_leg_index"), rs.getString("status"), rs.getString("loaded_leg_id"));
+            rs.getInt("next_leg_index"), rs.getString("status"), rs.getString("loaded_leg_id"),
+            rs.getObject("weight_kg", Integer.class), rs.getInt("free_allowance_kg"),
+            rs.getString("overweight_reminder"), rs.getString("overweight_clear_note"));
 
     private static final RowMapper<ItineraryItem> ITINERARY_MAPPER = (rs, rowNum) -> new ItineraryItem(
             rs.getInt("seq"), rs.getString("leg_id"), rs.getString("origin"), rs.getString("destination"));
 
+    private static final RowMapper<ReweighRecordItem> REWEIGH_MAPPER = (rs, rowNum) -> new ReweighRecordItem(
+            rs.getString("reweigh_key"), rs.getObject("old_weight_kg", Integer.class),
+            rs.getInt("new_weight_kg"), rs.getBoolean("weight_changed"),
+            rs.getString("station_id"), toIso(rs.getTimestamp("created_at")));
+
     private final JdbcTemplate jdbcTemplate;
     private final IdempotencyService idempotencyService;
     private final ObjectMapper objectMapper;
+    /** 批量装载总重上限（千克），按装载时行李最新重量判定。 */
+    private final int maxLoadTotalWeightKg;
 
     public BaggageService(JdbcTemplate jdbcTemplate,
                           IdempotencyService idempotencyService,
-                          ObjectMapper objectMapper) {
+                          ObjectMapper objectMapper,
+                          @Value("${baggage.max-load-total-weight-kg:500}") int maxLoadTotalWeightKg) {
         this.jdbcTemplate = jdbcTemplate;
         this.idempotencyService = idempotencyService;
         this.objectMapper = objectMapper;
+        this.maxLoadTotalWeightKg = maxLoadTotalWeightKg;
     }
 
     /** 登记航段：legId 唯一，初始状态 OPEN、版本 1。 */
@@ -92,6 +123,36 @@ public class BaggageService {
         ArrivePayload payload = new ArrivePayload(legId, sortedCopy(request.bagTags()));
         return idempotencyService.execute(request.requestId(), "ARRIVE", 200,
                 payload, ArriveResponse.class, () -> doArrive(legId, request));
+    }
+
+    /** 复重纠偏：未进入任何 SEALED 清单的行李可复重；重量不同则原子更新并写不可变复重记录，
+     *  相同则仅记录事件；复重后按最新重量触发超重校验。 */
+    public ReweighResponse reweigh(String bagTag, ReweighRequest request) {
+        ReweighPayload payload = new ReweighPayload(bagTag, request.reweighKey(),
+                request.measuredWeightKg(), request.stationId());
+        return idempotencyService.execute(request.requestId(), "REWEIGH", 200,
+                payload, ReweighResponse.class, () -> doReweigh(bagTag, request));
+    }
+
+    /** 清除超重提醒：需说明，清除不可逆；无待处理提醒时 422。 */
+    public ClearOverweightResponse clearOverweight(String bagTag, ClearOverweightRequest request) {
+        ClearOverweightPayload payload = new ClearOverweightPayload(bagTag, request.note());
+        return idempotencyService.execute(request.requestId(), "CLEAR_OVERWEIGHT", 200,
+                payload, ClearOverweightResponse.class, () -> doClearOverweight(bagTag, request));
+    }
+
+    /** 复重历史与当前提醒状态查询。 */
+    public ReweighHistoryResponse getReweighHistory(String bagTag) {
+        BagRow bag = findBag(bagTag);
+        if (bag == null) {
+            throw ApiException.notFound("行李不存在: " + bagTag);
+        }
+        List<ReweighRecordItem> history = jdbcTemplate.query(
+                "SELECT reweigh_key, old_weight_kg, new_weight_kg, weight_changed, station_id, created_at"
+                        + " FROM reweigh_record WHERE bag_tag = ? ORDER BY id",
+                REWEIGH_MAPPER, bagTag);
+        return new ReweighHistoryResponse(bag.bagTag(), bag.weightKg(), bag.freeAllowanceKg(),
+                bag.overweightReminder(), bag.overweightClearNote(), history);
     }
 
     /** 行李轨迹查询。 */
@@ -146,16 +207,17 @@ public class BaggageService {
             }
         }
         jdbcTemplate.update(
-                "INSERT INTO bag (bag_tag, current_location, next_leg_index, status) VALUES (?, ?, 0, ?)",
-                request.bagTag(), legs.get(0).origin(), BAG_IN_TRANSIT);
+                "INSERT INTO bag (bag_tag, current_location, next_leg_index, status, weight_kg, free_allowance_kg)"
+                        + " VALUES (?, ?, 0, ?, ?, ?)",
+                request.bagTag(), legs.get(0).origin(), BAG_IN_TRANSIT, request.weightKg(),
+                request.freeAllowanceKg() == null ? DEFAULT_FREE_ALLOWANCE_KG : request.freeAllowanceKg());
         for (int i = 0; i < legs.size(); i++) {
             LegRow leg = legs.get(i);
             jdbcTemplate.update(
                     "INSERT INTO bag_itinerary (bag_tag, seq, leg_id, origin, destination) VALUES (?, ?, ?, ?, ?)",
                     request.bagTag(), i, leg.legId(), leg.origin(), leg.destination());
         }
-        return new BagResponse(request.bagTag(), legs.get(0).origin(), 0, BAG_IN_TRANSIT, null,
-                toItinerary(request.bagTag()));
+        return toBagResponse(findBag(request.bagTag()));
     }
 
     private LoadResponse doLoad(String legId, LoadRequest request) {
@@ -178,13 +240,24 @@ public class BaggageService {
             validateLoadable(bag, leg);
             bags.add(bag);
         }
+        // 总重上限判定使用行锁下读到的最新重量（复重提交后装载必须读到新值）
+        int totalWeightKg = bags.stream().mapToInt(bag -> bag.weightKg() == null ? 0 : bag.weightKg()).sum();
+        if (totalWeightKg > maxLoadTotalWeightKg) {
+            throw ApiException.unprocessable(
+                    "批量装载总重 " + totalWeightKg + " 千克超过上限 " + maxLoadTotalWeightKg + " 千克");
+        }
+        // 未清除的超重提醒不阻止装载，但必须在响应中显式携带供人工确认
+        List<String> overweightReminders = bags.stream()
+                .filter(bag -> REMINDER_ACTIVE.equals(bag.overweightReminder()))
+                .map(BagRow::bagTag)
+                .toList();
         for (BagRow bag : bags) {
             jdbcTemplate.update("INSERT INTO load_record (bag_tag, leg_id) VALUES (?, ?)", bag.bagTag(), legId);
             jdbcTemplate.update("UPDATE bag SET loaded_leg_id = ? WHERE bag_tag = ?", legId, bag.bagTag());
         }
         int newVersion = leg.version() + 1;
         jdbcTemplate.update("UPDATE leg SET version = ? WHERE leg_id = ?", newVersion, legId);
-        return new LoadResponse(legId, LEG_OPEN, newVersion, sorted);
+        return new LoadResponse(legId, LEG_OPEN, newVersion, sorted, totalWeightKg, overweightReminders);
     }
 
     private SealResponse doSeal(String legId, SealRequest request) {
@@ -227,6 +300,80 @@ public class BaggageService {
         jdbcTemplate.update("UPDATE leg SET status = ?, version = ? WHERE leg_id = ?",
                 LEG_ARRIVED, newVersion, legId);
         return new ArriveResponse(legId, LEG_ARRIVED, newVersion, manifest);
+    }
+
+    private ReweighResponse doReweigh(String bagTag, ReweighRequest request) {
+        BagRow bag = lockBag(bagTag);
+        if (bag == null) {
+            throw ApiException.notFound("行李不存在: " + bagTag);
+        }
+        if (isInSealedManifest(bagTag)) {
+            throw ApiException.conflict("行李 " + bagTag + " 已进入 SEALED 航段清单，禁止复重");
+        }
+        if (reweighKeyExists(request.reweighKey())) {
+            throw ApiException.conflict("reweighKey 已使用: " + request.reweighKey());
+        }
+        int measured = request.measuredWeightKg();
+        Integer previous = bag.weightKg();
+        boolean changed = previous == null || previous != measured;
+        if (changed) {
+            jdbcTemplate.update("UPDATE bag SET weight_kg = ? WHERE bag_tag = ?", measured, bagTag);
+        }
+        try {
+            jdbcTemplate.update(
+                    "INSERT INTO reweigh_record (bag_tag, reweigh_key, old_weight_kg, new_weight_kg,"
+                            + " weight_changed, station_id) VALUES (?, ?, ?, ?, ?, ?)",
+                    bagTag, request.reweighKey(), previous, measured, changed, request.stationId());
+        } catch (DuplicateKeyException duplicate) {
+            // 并发下唯一索引兜底：reweighKey 已被其他请求占用
+            throw ApiException.conflict("reweighKey 已使用: " + request.reweighKey());
+        }
+        // 复重后触发超重校验：无既有分段重量规则，以本行李最新重量对照登记的免费限额
+        String reminder = measured > bag.freeAllowanceKg() ? REMINDER_ACTIVE : REMINDER_NONE;
+        jdbcTemplate.update(
+                "UPDATE bag SET overweight_reminder = ?, overweight_clear_note = NULL,"
+                        + " overweight_cleared_at = NULL WHERE bag_tag = ?",
+                reminder, bagTag);
+        Timestamp weighedAt = jdbcTemplate.queryForObject(
+                "SELECT created_at FROM reweigh_record WHERE reweigh_key = ?",
+                Timestamp.class, request.reweighKey());
+        return new ReweighResponse(bagTag, request.reweighKey(), previous, measured, changed,
+                request.stationId(), toIso(weighedAt), reminder);
+    }
+
+    private ClearOverweightResponse doClearOverweight(String bagTag, ClearOverweightRequest request) {
+        BagRow bag = lockBag(bagTag);
+        if (bag == null) {
+            throw ApiException.notFound("行李不存在: " + bagTag);
+        }
+        if (!REMINDER_ACTIVE.equals(bag.overweightReminder())) {
+            throw ApiException.unprocessable("行李 " + bagTag + " 当前无待清除的超重提醒");
+        }
+        jdbcTemplate.update(
+                "UPDATE bag SET overweight_reminder = ?, overweight_clear_note = ?,"
+                        + " overweight_cleared_at = CURRENT_TIMESTAMP WHERE bag_tag = ?",
+                REMINDER_CLEARED, request.note(), bagTag);
+        Timestamp clearedAt = jdbcTemplate.queryForObject(
+                "SELECT overweight_cleared_at FROM bag WHERE bag_tag = ?", Timestamp.class, bagTag);
+        return new ClearOverweightResponse(bagTag, REMINDER_CLEARED, request.note(), toIso(clearedAt));
+    }
+
+    /** 行李是否已进入任一 SEALED/ARRIVED 航段的封舱清单（一旦进入永久禁止复重）。 */
+    private boolean isInSealedManifest(String bagTag) {
+        List<String> manifests = jdbcTemplate.queryForList(
+                "SELECT sealed_manifest FROM leg WHERE sealed_manifest IS NOT NULL", String.class);
+        for (String manifest : manifests) {
+            if (readJsonList(manifest).contains(bagTag)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean reweighKeyExists(String reweighKey) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM reweigh_record WHERE reweigh_key = ?", Integer.class, reweighKey);
+        return count != null && count > 0;
     }
 
     private void validateLoadable(BagRow bag, LegRow leg) {
@@ -273,15 +420,14 @@ public class BaggageService {
 
     private BagRow findBag(String bagTag) {
         List<BagRow> rows = jdbcTemplate.query(
-                "SELECT bag_tag, current_location, next_leg_index, status, loaded_leg_id FROM bag WHERE bag_tag = ?",
+                "SELECT " + BAG_COLUMNS + " FROM bag WHERE bag_tag = ?",
                 BAG_MAPPER, bagTag);
         return rows.isEmpty() ? null : rows.get(0);
     }
 
     private BagRow lockBag(String bagTag) {
         List<BagRow> rows = jdbcTemplate.query(
-                "SELECT bag_tag, current_location, next_leg_index, status, loaded_leg_id FROM bag"
-                        + " WHERE bag_tag = ? FOR UPDATE",
+                "SELECT " + BAG_COLUMNS + " FROM bag WHERE bag_tag = ? FOR UPDATE",
                 BAG_MAPPER, bagTag);
         return rows.isEmpty() ? null : rows.get(0);
     }
@@ -307,7 +453,12 @@ public class BaggageService {
 
     private BagResponse toBagResponse(BagRow bag) {
         return new BagResponse(bag.bagTag(), bag.currentLocation(), bag.nextLegIndex(),
-                bag.status(), bag.loadedLegId(), toItinerary(bag.bagTag()));
+                bag.status(), bag.loadedLegId(), toItinerary(bag.bagTag()),
+                bag.weightKg(), bag.freeAllowanceKg(), bag.overweightReminder());
+    }
+
+    private static String toIso(Timestamp timestamp) {
+        return timestamp == null ? null : timestamp.toInstant().toString();
     }
 
     private static List<String> sortedCopy(List<String> values) {
@@ -336,7 +487,8 @@ public class BaggageService {
     }
 
     private record BagRow(String bagTag, String currentLocation, int nextLegIndex,
-                          String status, String loadedLegId) {
+                          String status, String loadedLegId, Integer weightKg, int freeAllowanceKg,
+                          String overweightReminder, String overweightClearNote) {
     }
 
     /** 装载幂等摘要参数：bagTags 已排序，顺序差异不视为异参。 */
@@ -349,5 +501,13 @@ public class BaggageService {
 
     /** 到达确认幂等摘要参数：bagTags 已排序，顺序差异不视为异参。 */
     private record ArrivePayload(String legId, List<String> bagTags) {
+    }
+
+    /** 复重幂等摘要参数。 */
+    private record ReweighPayload(String bagTag, String reweighKey, int measuredWeightKg, String stationId) {
+    }
+
+    /** 清除超重提醒幂等摘要参数。 */
+    private record ClearOverweightPayload(String bagTag, String note) {
     }
 }
