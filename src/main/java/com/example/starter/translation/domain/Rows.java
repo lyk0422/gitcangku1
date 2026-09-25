@@ -82,4 +82,39 @@ public final class Rows {
     public record RequestLogRow(String requestId, String requestHash,
                                 int responseStatus, String responseBody) {
     }
+
+    /**
+     * 区域译文变体：按段落+语言+区域唯一；区域代码为 DEFAULT 或具体区域，同一译文版本仅一条有效变体。
+     *
+     * @param segmentId          所属段落 ID
+     * @param language           目标语言码，小写；变体不得跨语言生效
+     * @param regionCode         适用区域代码，大写；DEFAULT 表示全局默认，其余为具体区域
+     * @param content            区域变体译文正文，UTF-8
+     * @param author             变体作者，取创建时 X-Actor-Id
+     * @param translationVersion 变体绑定的译文版本；不等于当前译文版本时变体失效
+     * @param termVersion        变体创建时绑定的术语版本；不等于当前术语版本时变体失效
+     * @param variantVersion     变体版本，按段落+语言+区域从 1 开始单调递增，重建加一
+     * @param status             变体状态：PENDING 待批准、ACTIVE 有效、REVOKED 已撤销；仅 ACTIVE 参与区域解析
+     */
+    public record RegionalVariantRow(String segmentId, String language, String regionCode, String content,
+                                     String author, int translationVersion, int termVersion,
+                                     int variantVersion, String status) {
+    }
+
+    /**
+     * 发布区域解析记录：每次发布逐段落固化请求区域、实际选用区域、译文版本与回退来源，不可修改。
+     *
+     * @param publishedVersion   发布版本号，从 1 开始
+     * @param segmentId          所属段落 ID
+     * @param language           目标语言码，小写
+     * @param requestedRegion    发布请求的区域代码，大写；未指定区域时为 DEFAULT
+     * @param resolvedRegion     实际选用的区域代码
+     * @param translationVersion 最终选用的译文版本
+     * @param fallbackSource     回退来源：EXACT 命中请求区域变体、FALLBACK_DEFAULT 回退 DEFAULT 变体、
+     *                           BASE 未使用变体取基础译文
+     */
+    public record ReleaseResolutionRow(int publishedVersion, String segmentId, String language,
+                                       String requestedRegion, String resolvedRegion,
+                                       int translationVersion, String fallbackSource) {
+    }
 }

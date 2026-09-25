@@ -58,11 +58,12 @@ public final class ApiDtos {
             @Positive(message = "translationVersion 必须为正数") int translationVersion) {
     }
 
-    /** 发布请求：携带期望的草稿与发布版本做乐观校验。 */
+    /** 发布请求：携带期望的草稿与发布版本做乐观校验；region 可选，给定区域时按区域变体解析。 */
     public record PublishRequest(
             @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
             @Positive(message = "expectedDraftVersion 必须为正数") int expectedDraftVersion,
-            @PositiveOrZero(message = "expectedPublishedVersion 不能为负数") int expectedPublishedVersion) {
+            @PositiveOrZero(message = "expectedPublishedVersion 不能为负数") int expectedPublishedVersion,
+            @Size(max = 32) String region) {
     }
 
     /** 术语规则输入：sourceTerm 区分大小写，requiredTranslation 非空。 */
@@ -127,9 +128,63 @@ public final class ApiDtos {
 
     /** 统一错误响应；violations 仅在术语违规 422 时返回，含全部违规术语。 */
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    public record ErrorResponse(String error, String message, List<TermRuleView> violations) {
+    public record ErrorResponse(String error, String message, List<TermRuleView> violations,
+                                List<MissingSegment> missing) {
         public ErrorResponse(String error, String message) {
-            this(error, message, null);
+            this(error, message, null, null);
         }
+
+        public ErrorResponse(String error, String message, List<TermRuleView> violations) {
+            this(error, message, violations, null);
+        }
+    }
+
+    /** 区域变体创建请求：expectedVersion 为文档草稿版本乐观校验；区域代码 DEFAULT 或具体区域。 */
+    public record CreateVariantRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @NotBlank(message = "regionCode 不能为空") @Size(max = 32) String regionCode,
+            @NotBlank(message = "content 不能为空") String content,
+            @Positive(message = "expectedVersion 必须为正数") int expectedVersion) {
+    }
+
+    /** 区域变体批准请求；审核人取 X-Actor-Id 请求头。 */
+    public record ApproveVariantRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId) {
+    }
+
+    /** 区域变体撤销请求：expectedVersion 为文档草稿版本乐观校验。 */
+    public record RevokeVariantRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @Positive(message = "expectedVersion 必须为正数") int expectedVersion) {
+    }
+
+    /** 区域变体写操作响应。 */
+    public record VariantResponse(long documentId, String segmentId, String language, String regionCode,
+                                  int variantVersion, int translationVersion, String status, int draftVersion) {
+    }
+
+    /** 区域解析缺失条目：给定区域与 DEFAULT 均无有效变体的段落+语言。 */
+    public record MissingSegment(String segmentId, String language) {
+    }
+
+    /** 单条区域解析结果：最终选用的内容、区域代码、译文版本与回退来源；missing 为 true 时其余字段为空。 */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public record ResolutionEntry(String segmentId, String language, boolean missing, String content,
+                                  String regionCode, Integer translationVersion, String fallbackSource) {
+    }
+
+    /** 区域覆盖解析查询响应：按段落、语言稳定排序的解析结果及缺失列表。 */
+    public record ResolutionResponse(long documentId, String region, List<ResolutionEntry> entries,
+                                     List<MissingSegment> missing) {
+    }
+
+    /** 回退历史条目：一次发布中一个段落+语言的区域解析固化记录。 */
+    public record FallbackHistoryEntry(int publishedVersion, String segmentId, String language,
+                                       String requestedRegion, String resolvedRegion,
+                                       int translationVersion, String fallbackSource) {
+    }
+
+    /** 回退历史查询响应：按发布版本、段落、语言稳定排序。 */
+    public record FallbackHistoryResponse(long documentId, List<FallbackHistoryEntry> entries) {
     }
 }

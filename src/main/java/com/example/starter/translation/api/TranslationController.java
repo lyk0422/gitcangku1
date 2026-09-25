@@ -14,6 +14,7 @@ import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.nio.charset.StandardCharsets;
@@ -134,6 +135,58 @@ public class TranslationController {
     public ResponseEntity<String> getRelease(@PathVariable long documentId, @PathVariable int publishedVersion) {
         return ResponseEntity.ok().contentType(MediaType.APPLICATION_JSON)
                 .body(translationService.getRelease(documentId, publishedVersion));
+    }
+
+    /** 区域变体创建：作者取 X-Actor-Id，expectedVersion 为文档草稿版本乐观校验，初始待批准。 */
+    @PostMapping("/{documentId}/segments/{segmentId}/translations/{language}/variants")
+    public ResponseEntity<String> createVariant(@PathVariable long documentId, @PathVariable String segmentId,
+                                                @PathVariable String language,
+                                                @RequestHeader("X-Actor-Id") String actorId,
+                                                @Valid @RequestBody ApiDtos.CreateVariantRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/segments/" + segmentId
+                + "/translations/" + language + "/variants";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(201, translationService.createVariant(
+                        documentId, segmentId, language, actorId, request))).toResponseEntity();
+    }
+
+    /** 区域变体批准：审核人取 X-Actor-Id，不得是变体作者；批准后参与区域解析。 */
+    @PostMapping("/{documentId}/segments/{segmentId}/translations/{language}/variants/{regionCode}/approve")
+    public ResponseEntity<String> approveVariant(@PathVariable long documentId, @PathVariable String segmentId,
+                                                 @PathVariable String language, @PathVariable String regionCode,
+                                                 @RequestHeader("X-Actor-Id") String actorId,
+                                                 @Valid @RequestBody ApiDtos.ApproveVariantRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/segments/" + segmentId
+                + "/translations/" + language + "/variants/" + regionCode + "/approve";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(200, translationService.approveVariant(
+                        documentId, segmentId, language, regionCode, actorId, request))).toResponseEntity();
+    }
+
+    /** 区域变体撤销：expectedVersion 为文档草稿版本乐观校验；撤销后解析与发布自动回退 DEFAULT。 */
+    @PostMapping("/{documentId}/segments/{segmentId}/translations/{language}/variants/{regionCode}/revoke")
+    public ResponseEntity<String> revokeVariant(@PathVariable long documentId, @PathVariable String segmentId,
+                                                @PathVariable String language, @PathVariable String regionCode,
+                                                @Valid @RequestBody ApiDtos.RevokeVariantRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/segments/" + segmentId
+                + "/translations/" + language + "/variants/" + regionCode + "/revoke";
+        return writeExecutor.execute(request.requestId(), hash(operation, request),
+                () -> WriteResult.of(200, translationService.revokeVariant(
+                        documentId, segmentId, language, regionCode, request))).toResponseEntity();
+    }
+
+    /** 区域覆盖解析查询：给定区域逐段落语言返回最终选用的内容、区域代码与回退来源。 */
+    @GetMapping("/{documentId}/resolution")
+    public ResponseEntity<ApiDtos.ResolutionResponse> getResolution(
+            @PathVariable long documentId,
+            @RequestParam(required = false) String region) {
+        return ResponseEntity.ok(translationService.getResolution(documentId, region));
+    }
+
+    /** 回退历史查询：全部发布固化的区域解析记录。 */
+    @GetMapping("/{documentId}/fallback-history")
+    public ResponseEntity<ApiDtos.FallbackHistoryResponse> getFallbackHistory(@PathVariable long documentId) {
+        return ResponseEntity.ok(translationService.getFallbackHistory(documentId));
     }
 
     /** 计算请求摘要：操作（含路径变量）+ 操作者 + 规范化请求体的 SHA-256。 */

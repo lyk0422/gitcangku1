@@ -39,6 +39,8 @@ public abstract class AbstractIntegrationTest {
         jdbc.update("DELETE FROM translation");
         jdbc.update("DELETE FROM segment");
         jdbc.update("DELETE FROM release_snapshot");
+        jdbc.update("DELETE FROM release_resolution");
+        jdbc.update("DELETE FROM regional_variant");
         jdbc.update("DELETE FROM term_rule");
         jdbc.update("DELETE FROM term_version");
         jdbc.update("DELETE FROM request_log");
@@ -128,6 +130,41 @@ public abstract class AbstractIntegrationTest {
         String body = "{\"requestId\":\"" + requestId + "\",\"expectedTermVersion\":" + expectedTermVersion
                 + ",\"rules\":" + rulesJson + "}";
         return putJson("/api/documents/" + documentId + "/terms", body);
+    }
+
+    /** 带区域的发布。 */
+    protected ApiResult publishWithRegion(long documentId, int expectedDraftVersion,
+                                          int expectedPublishedVersion, String region,
+                                          String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"expectedDraftVersion\":" + expectedDraftVersion
+                + ",\"expectedPublishedVersion\":" + expectedPublishedVersion + ",\"region\":\"" + region + "\"}";
+        return postJson("/api/documents/" + documentId + "/publish", body);
+    }
+
+    /** 创建区域变体。 */
+    protected ApiResult createVariant(long documentId, String segmentId, String language, String actorId,
+                                      String regionCode, String content, int expectedVersion,
+                                      String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"regionCode\":\"" + regionCode
+                + "\",\"content\":\"" + content + "\",\"expectedVersion\":" + expectedVersion + "}";
+        return postJson("/api/documents/" + documentId + "/segments/" + segmentId + "/translations/" + language
+                + "/variants", body, actorId);
+    }
+
+    /** 批准区域变体。 */
+    protected ApiResult approveVariant(long documentId, String segmentId, String language, String regionCode,
+                                       String actorId, String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\"}";
+        return postJson("/api/documents/" + documentId + "/segments/" + segmentId + "/translations/" + language
+                + "/variants/" + regionCode + "/approve", body, actorId);
+    }
+
+    /** 撤销区域变体。 */
+    protected ApiResult revokeVariant(long documentId, String segmentId, String language, String regionCode,
+                                      int expectedVersion, String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"expectedVersion\":" + expectedVersion + "}";
+        return postJson("/api/documents/" + documentId + "/segments/" + segmentId + "/translations/" + language
+                + "/variants/" + regionCode + "/revoke", body);
     }
 
     /** HTTP 响应结果：状态码与 JSON 响应体。 */

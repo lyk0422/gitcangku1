@@ -2,6 +2,8 @@ package com.example.starter.translation.repo;
 
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
+import com.example.starter.translation.domain.Rows.RegionalVariantRow;
+import com.example.starter.translation.domain.Rows.ReleaseResolutionRow;
 import com.example.starter.translation.domain.Rows.RequestLogRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
@@ -240,5 +242,79 @@ public class TranslationRepository {
     public void insertRequestLog(String requestId, String requestHash, int responseStatus, String responseBody) {
         jdbc.update("INSERT INTO request_log (request_id, request_hash, response_status, response_body) "
                 + "VALUES (?, ?, ?, ?)", requestId, requestHash, responseStatus, responseBody);
+    }
+
+    private static final RowMapper<RegionalVariantRow> VARIANT_MAPPER = (rs, n) -> new RegionalVariantRow(
+            rs.getString("segment_id"), rs.getString("language"), rs.getString("region_code"),
+            rs.getString("content"), rs.getString("author"), rs.getInt("translation_version"),
+            rs.getInt("term_version"), rs.getInt("variant_version"), rs.getString("status"));
+
+    private static final RowMapper<ReleaseResolutionRow> RESOLUTION_MAPPER = (rs, n) -> new ReleaseResolutionRow(
+            rs.getInt("published_version"), rs.getString("segment_id"), rs.getString("language"),
+            rs.getString("requested_region"), rs.getString("resolved_region"),
+            rs.getInt("translation_version"), rs.getString("fallback_source"));
+
+    /** 查询指定段落+语言+区域的变体（每键至多一行）。 */
+    public Optional<RegionalVariantRow> findVariant(long documentId, String segmentId, String language,
+                                                    String regionCode) {
+        List<RegionalVariantRow> rows = jdbc.query(
+                "SELECT segment_id, language, region_code, content, author, translation_version, term_version, "
+                        + "variant_version, status FROM regional_variant "
+                        + "WHERE document_id = ? AND segment_id = ? AND language = ? AND region_code = ?",
+                VARIANT_MAPPER, documentId, segmentId, language, regionCode);
+        return rows.stream().findFirst();
+    }
+
+    /** 查询文档全部变体，按段落、语言、区域排序保证稳定输出。 */
+    public List<RegionalVariantRow> listVariants(long documentId) {
+        return jdbc.query(
+                "SELECT segment_id, language, region_code, content, author, translation_version, term_version, "
+                        + "variant_version, status FROM regional_variant "
+                        + "WHERE document_id = ? ORDER BY segment_id, language, region_code",
+                VARIANT_MAPPER, documentId);
+    }
+
+    /** 插入或整行替换变体（按主键段落+语言+区域唯一）。 */
+    public void upsertVariant(long documentId, RegionalVariantRow row) {
+        int updated = jdbc.update(
+                "UPDATE regional_variant SET content = ?, author = ?, translation_version = ?, term_version = ?, "
+                        + "variant_version = ?, status = ?, updated_at = CURRENT_TIMESTAMP "
+                        + "WHERE document_id = ? AND segment_id = ? AND language = ? AND region_code = ?",
+                row.content(), row.author(), row.translationVersion(), row.termVersion(),
+                row.variantVersion(), row.status(),
+                documentId, row.segmentId(), row.language(), row.regionCode());
+        if (updated == 0) {
+            jdbc.update("INSERT INTO regional_variant (document_id, segment_id, language, region_code, content, "
+                            + "author, translation_version, term_version, variant_version, status) "
+                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    documentId, row.segmentId(), row.language(), row.regionCode(), row.content(), row.author(),
+                    row.translationVersion(), row.termVersion(), row.variantVersion(), row.status());
+        }
+    }
+
+    /** 仅更新变体状态与更新时间。 */
+    public void updateVariantStatus(long documentId, String segmentId, String language, String regionCode,
+                                    String status) {
+        jdbc.update("UPDATE regional_variant SET status = ?, updated_at = CURRENT_TIMESTAMP "
+                        + "WHERE document_id = ? AND segment_id = ? AND language = ? AND region_code = ?",
+                status, documentId, segmentId, language, regionCode);
+    }
+
+    /** 写入一条发布区域解析记录（不可变，随发布同事务提交）。 */
+    public void insertResolution(long documentId, ReleaseResolutionRow row) {
+        jdbc.update("INSERT INTO release_resolution (document_id, published_version, segment_id, language, "
+                        + "requested_region, resolved_region, translation_version, fallback_source) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                documentId, row.publishedVersion(), row.segmentId(), row.language(),
+                row.requestedRegion(), row.resolvedRegion(), row.translationVersion(), row.fallbackSource());
+    }
+
+    /** 查询文档全部发布区域解析记录，按发布版本、段落、语言排序保证稳定输出。 */
+    public List<ReleaseResolutionRow> listResolutions(long documentId) {
+        return jdbc.query(
+                "SELECT published_version, segment_id, language, requested_region, resolved_region, "
+                        + "translation_version, fallback_source FROM release_resolution "
+                        + "WHERE document_id = ? ORDER BY published_version, segment_id, language",
+                RESOLUTION_MAPPER, documentId);
     }
 }

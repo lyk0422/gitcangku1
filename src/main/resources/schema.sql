@@ -111,6 +111,56 @@ COMMENT ON COLUMN term_rule.source_term IS '源文术语，Unicode 原文、区�
 COMMENT ON COLUMN term_rule.language IS '目标语言码，小写';
 COMMENT ON COLUMN term_rule.required_translation IS '该术语在目标语言中的必译文本，非空';
 
+CREATE TABLE IF NOT EXISTS regional_variant (
+    document_id BIGINT NOT NULL,
+    segment_id VARCHAR(64) NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    region_code VARCHAR(32) NOT NULL,
+    content LONGTEXT NOT NULL,
+    author VARCHAR(128) NOT NULL,
+    translation_version INT NOT NULL,
+    term_version INT NOT NULL,
+    variant_version INT NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (document_id, segment_id, language, region_code)
+);
+COMMENT ON TABLE regional_variant IS '区域译文变体：按段落+语言+区域唯一；区域代码为 DEFAULT 或具体区域，同一译文版本仅一条有效变体';
+COMMENT ON COLUMN regional_variant.document_id IS '所属文档 ID';
+COMMENT ON COLUMN regional_variant.segment_id IS '所属段落 ID';
+COMMENT ON COLUMN regional_variant.language IS '目标语言码，小写；变体不得跨语言生效';
+COMMENT ON COLUMN regional_variant.region_code IS '适用区域代码，大写；DEFAULT 表示全局默认，其余为具体区域';
+COMMENT ON COLUMN regional_variant.content IS '区域变体译文正文，UTF-8';
+COMMENT ON COLUMN regional_variant.author IS '变体作者，取创建时 X-Actor-Id';
+COMMENT ON COLUMN regional_variant.translation_version IS '变体绑定的译文版本；不等于当前译文版本时变体失效';
+COMMENT ON COLUMN regional_variant.term_version IS '变体创建时绑定的术语版本；不等于当前术语版本时变体失效';
+COMMENT ON COLUMN regional_variant.variant_version IS '变体版本，按段落+语言+区域从 1 开始单调递增，重建加一';
+COMMENT ON COLUMN regional_variant.status IS '变体状态：PENDING 待批准、ACTIVE 有效、REVOKED 已撤销；仅 ACTIVE 参与区域解析';
+COMMENT ON COLUMN regional_variant.updated_at IS '最近变更时间，数据库默认时区';
+
+CREATE TABLE IF NOT EXISTS release_resolution (
+    document_id BIGINT NOT NULL,
+    published_version INT NOT NULL,
+    segment_id VARCHAR(64) NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    requested_region VARCHAR(32) NOT NULL,
+    resolved_region VARCHAR(32) NOT NULL,
+    translation_version INT NOT NULL,
+    fallback_source VARCHAR(24) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (document_id, published_version, segment_id, language)
+);
+COMMENT ON TABLE release_resolution IS '发布区域解析记录：每次发布逐段落固化请求区域、实际选用区域、译文版本与回退来源，不可修改';
+COMMENT ON COLUMN release_resolution.document_id IS '所属文档 ID';
+COMMENT ON COLUMN release_resolution.published_version IS '发布版本号，从 1 开始';
+COMMENT ON COLUMN release_resolution.segment_id IS '所属段落 ID';
+COMMENT ON COLUMN release_resolution.language IS '目标语言码，小写';
+COMMENT ON COLUMN release_resolution.requested_region IS '发布请求的区域代码，大写；未指定区域时为 DEFAULT';
+COMMENT ON COLUMN release_resolution.resolved_region IS '实际选用的区域代码；回退 DEFAULT 时为 DEFAULT，未用变体时为 DEFAULT';
+COMMENT ON COLUMN release_resolution.translation_version IS '最终选用的译文版本';
+COMMENT ON COLUMN release_resolution.fallback_source IS '回退来源：EXACT 命中请求区域变体、FALLBACK_DEFAULT 回退 DEFAULT 变体、BASE 未使用变体取基础译文';
+COMMENT ON COLUMN release_resolution.created_at IS '发布时间，数据库默认时区';
+
 CREATE TABLE IF NOT EXISTS request_log (
     request_id VARCHAR(128) PRIMARY KEY,
     request_hash VARCHAR(64) NOT NULL,

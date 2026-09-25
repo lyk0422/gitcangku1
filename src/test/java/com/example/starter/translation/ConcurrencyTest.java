@@ -238,4 +238,108 @@ class ConcurrencyTest extends AbstractIntegrationTest {
                 "SELECT term_version FROM document WHERE document_id = ?", Integer.class, docId);
         assertThat(termVersion).isEqualTo(1);
     }
+
+    @Test
+    @DisplayName("并发创建同键区域变体：同一期望版本仅一个成功，其余 409，变体仅一条")
+    void concurrentVariantCreates() throws Exception {
+        long docId = createDocument(newRequestId(), "[\"en\"]",
+                "[{\"segmentId\":\"s1\",\"sourceText\":\"原文\"}]");
+        submitTranslation(docId, "s1", "en", "alice", "hello", 1, newRequestId());
+        approve(docId, "s1", "en", "bob", 1, newRequestId());
+        // 当前草稿版本 2
+
+        int threads = 4;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch gate = new CountDownLatch(1);
+        List<Future<ApiResult>> futures = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            final int n = i;
+            futures.add(pool.submit(() -> {
+                gate.await();
+                return createVariant(docId, "s1", "en", "alice", "CN", "hello-cn-" + n, 2,
+                        newRequestId());
+            }));
+        }
+        gate.countDown();
+        int success = 0;
+        int conflict = 0;
+        for (Future<ApiResult> future : futures) {
+            int status = future.get(30, TimeUnit.SECONDS).status();
+            if (status == 201) {
+                success++;
+            } else if (status == 409) {
+                conflict++;
+            }
+        }
+        pool.shutdown();
+
+        assertThat(success).isEqualTo(1);
+        assertThat(conflict).isEqualTo(threads - 1);
+        assertThat(jdbc.queryForObject(
+                "SELECT COUNT(*) FROM regional_variant WHERE document_id = ?", Integer.class, docId))
+                .isEqualTo(1);
+        Integer draftVersion = jdbc.queryForObject(
+                "SELECT draft_version FROM document WHERE document_id = ?", Integer.class, docId);
+        assertThat(draftVersion).isEqualTo(3);
+    }
+
+    @Test
+    @DisplayName("撤销区域变体与区域发布并发：按事务提交顺序裁决，发布要么命中变体要么 409，不混合新旧区域选择")
+    void concurrentRevokeAndRegionalPublish() throws Exception {
+        long docId = createDocument(newRequestId(), "[\"en\"]",
+                "[{\"segmentId\":\"s1\",\"sourceText\":\"原文\"}]");
+        submitTranslation(docId, "s1", "en", "alice", "hello", 1, newRequestId());
+        approve(docId, "s1", "en", "bob", 1, newRequestId());
+        createVariant(docId, "s1", "en", "alice", "DEFAULT", "hello-global", 2, newRequestId());
+        approveVariant(docId, "s1", "en", "DEFAULT", "carol", newRequestId());
+        createVariant(docId, "s1", "en", "alice", "CN", "hello-cn", 3, newRequestId());
+        approveVariant(docId, "s1", "en", "CN", "carol", newRequestId());
+        // 当前草稿版本 4、发布版本 0
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        CountDownLatch gate = new CountDownLatch(1);
+        Future<ApiResult> publishFuture = pool.submit(() -> {
+            gate.await();
+            return publishWithRegion(docId, 4, 0, "CN", newRequestId());
+        });
+        Future<ApiResult> revokeFuture = pool.submit(() -> {
+            gate.await();
+            return revokeVariant(docId, "s1", "en", "CN", 4, newRequestId());
+        });
+        gate.countDown();
+        ApiResult publishResult = publishFuture.get(30, TimeUnit.SECONDS);
+        ApiResult revokeResult = revokeFuture.get(30, TimeUnit.SECONDS);
+        pool.shutdown();
+
+        // 撤销必然成功（发布不改草稿版本）；发布要么先于撤销成功，要么因草稿版本已变 409
+        assertThat(revokeResult.status()).isEqualTo(200);
+        assertThat(publishResult.status()).isIn(201, 409);
+
+        Integer publishedVersion = jdbc.queryForObject(
+                "SELECT published_version FROM document WHERE document_id = ?", Integer.class, docId);
+        Integer snapshots = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM release_snapshot WHERE document_id = ?", Integer.class, docId);
+        Integer resolutions = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM release_resolution WHERE document_id = ?", Integer.class, docId);
+        assertThat(snapshots).isEqualTo(publishedVersion);
+        assertThat(resolutions).isEqualTo(publishedVersion);
+        if (publishResult.status() == 201) {
+            // 发布先于撤销：快照固化 CN 变体，撤销不改写既有快照
+            assertThat(publishedVersion).isEqualTo(1);
+            ApiResult release = getJson("/api/documents/" + docId + "/releases/1");
+            var translation = release.body().get("segments").get(0).get("translations").get(0);
+            assertThat(translation.get("content").asText()).isEqualTo("hello-cn");
+            assertThat(translation.get("regionCode").asText()).isEqualTo("CN");
+            assertThat(translation.get("fallbackSource").asText()).isEqualTo("EXACT");
+        } else {
+            // 撤销先于发布：期望草稿版本不符，发布 409 且无快照
+            assertThat(publishedVersion).isZero();
+        }
+        // 撤销后解析回退 DEFAULT（无论并发顺序如何，最终状态一致）
+        ApiResult resolution = getJson("/api/documents/" + docId + "/resolution?region=CN");
+        assertThat(resolution.body().get("entries").get(0).get("content").asText())
+                .isEqualTo("hello-global");
+        assertThat(resolution.body().get("entries").get(0).get("fallbackSource").asText())
+                .isEqualTo("FALLBACK_DEFAULT");
+    }
 }
