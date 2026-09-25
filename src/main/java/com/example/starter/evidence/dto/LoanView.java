@@ -15,8 +15,8 @@ import java.time.LocalDateTime;
  * @param purpose     借出用途
  * @param loanAt      实际借出时刻（UTC）
  * @param dueAt       UTC 应还时刻
- * @param status      借出状态
- * @param overdue     是否已逾期：仅 ACTIVE 且当前 UTC 时刻晚于 dueAt 时为 true
+ * @param status      借出状态（对外生效值）：未归还且已过应还时刻时实时呈现为派生状态 OVERDUE
+ * @param overdue     是否已逾期：仅 ACTIVE 且当前 UTC 时刻不早于 dueAt 时为 true
  * @param sealIntact  归还封条核验结果：null 未归还 / true 完好 / false 异常
  * @param returnNote  归还说明；null 表示未归还
  * @param returnedAt  实际归还时刻（UTC）；null 表示未归还

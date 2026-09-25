@@ -14,7 +14,7 @@ import java.time.LocalDateTime;
  * @param purpose     借出用途
  * @param loanAt      实际借出时刻（UTC）
  * @param dueAt       UTC 应还时刻（晚于借出时刻且不超过 72 小时）
- * @param status      借出状态
+ * @param status      借出状态：ACTIVE 未归还 / RETURNED 已归还 / RECLAIMED 已追缴（终态）；OVERDUE 为派生状态不落库
  * @param sealPassed  归还封条核验结果：null 未归还 / true 完好 / false 异常
  * @param returnNote  归还说明；null 表示未归还
  * @param returnedAt  实际归还时刻（UTC）；null 表示未归还

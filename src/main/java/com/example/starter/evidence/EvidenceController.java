@@ -1,12 +1,16 @@
 package com.example.starter.evidence;
 
+import com.example.starter.evidence.dto.BorrowerFreezeView;
+import com.example.starter.evidence.dto.BorrowerUnfreezeRequest;
 import com.example.starter.evidence.dto.CommandRequest;
 import com.example.starter.evidence.dto.CustodyChainView;
 import com.example.starter.evidence.dto.EvidenceView;
 import com.example.starter.evidence.dto.IntakeRequest;
 import com.example.starter.evidence.dto.LoanCreateRequest;
+import com.example.starter.evidence.dto.LoanReclaimRequest;
 import com.example.starter.evidence.dto.LoanReturnRequest;
 import com.example.starter.evidence.dto.LoanView;
+import com.example.starter.evidence.dto.ReclaimView;
 import com.example.starter.evidence.dto.SealInspectionRequest;
 import com.example.starter.evidence.dto.TransferInitiateRequest;
 import jakarta.validation.Valid;
@@ -139,6 +143,59 @@ public class EvidenceController {
         StoredResponse response = idempotencyAdvisor.guard(request.commandKey(), hash,
                 () -> evidenceService.returnLoan(actorId, evidenceKey, request, hash));
         return toEntity(response);
+    }
+
+    /**
+     * 逾期追缴：仅借出时的保管人，借出须已逾期；借出转 RECLAIMED、证物转在库待核验，
+     * 同一借出只能被追缴一次，重复提交按 reclaimKey 幂等返回首次结果。
+     */
+    @PostMapping("/{evidenceKey}/loans/reclaim")
+    public ResponseEntity<String> reclaimLoan(@RequestHeader(ACTOR_HEADER) @NotBlank String actorId,
+                                              @PathVariable String evidenceKey,
+                                              @Valid @RequestBody LoanReclaimRequest request) {
+        String hash = idempotencyAdvisor.hash(EvidenceService.OP_LOAN_RECLAIM, actorId,
+                evidenceKey, request);
+        StoredResponse response = idempotencyAdvisor.guard(request.commandKey(), hash,
+                () -> evidenceService.reclaimLoan(actorId, evidenceKey, request, hash));
+        return toEntity(response);
+    }
+
+    /**
+     * 解冻借出人：须由另一名保管人提交说明；解冻后追缴计数从零重新累计。
+     */
+    @PostMapping("/borrowers/{borrowerId}/unfreeze")
+    public ResponseEntity<String> unfreezeBorrower(@RequestHeader(ACTOR_HEADER) @NotBlank String actorId,
+                                                   @PathVariable String borrowerId,
+                                                   @Valid @RequestBody BorrowerUnfreezeRequest request) {
+        String hash = idempotencyAdvisor.hash(EvidenceService.OP_BORROWER_UNFREEZE, actorId,
+                borrowerId, request);
+        StoredResponse response = idempotencyAdvisor.guard(request.commandKey(), hash,
+                () -> evidenceService.unfreezeBorrower(actorId, borrowerId, request, hash));
+        return toEntity(response);
+    }
+
+    /**
+     * 逾期清单：当前仍未归还且已过应还时刻的借出（按可注入时钟实时判定）。
+     */
+    @GetMapping("/loans/overdue")
+    public List<LoanView> listOverdueLoans() {
+        return evidenceService.listOverdueLoans();
+    }
+
+    /**
+     * 按借出人查询全部追缴记录（历史记录解冻后仍保留）。
+     */
+    @GetMapping("/reclaims/by-borrower/{borrowerId}")
+    public List<ReclaimView> listReclaimsByBorrower(@PathVariable String borrowerId) {
+        return evidenceService.listReclaimsByBorrower(borrowerId);
+    }
+
+    /**
+     * 查询借出人冻结状态（是否冻结、累计追缴次数、冻结原因）。
+     */
+    @GetMapping("/borrowers/{borrowerId}/freeze")
+    public BorrowerFreezeView borrowerFreezeStatus(@PathVariable String borrowerId) {
+        return evidenceService.borrowerFreezeStatus(borrowerId);
     }
 
     /**

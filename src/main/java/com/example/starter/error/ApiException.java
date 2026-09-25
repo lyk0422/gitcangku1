@@ -4,7 +4,8 @@ import org.springframework.http.HttpStatus;
 
 /**
  * 业务异常，携带可区分的 HTTP 状态码：
- * 400 参数非法；404 不存在；409 操作人不匹配或状态冲突（含幂等键改参）；422 封条异常前置条件失败。
+ * 400 参数非法；403 借出人被冻结；404 不存在；409 操作人不匹配或状态冲突（含幂等键改参）；
+ * 422 前置条件失败（封条异常、借出未逾期等）。
  */
 public class ApiException extends RuntimeException {
 
@@ -21,6 +22,10 @@ public class ApiException extends RuntimeException {
 
     public static ApiException badRequest(String message) {
         return new ApiException(HttpStatus.BAD_REQUEST, message);
+    }
+
+    public static ApiException forbidden(String message) {
+        return new ApiException(HttpStatus.FORBIDDEN, message);
     }
 
     public static ApiException notFound(String message) {

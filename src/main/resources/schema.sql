@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS evidence (
     category VARCHAR(64) NOT NULL COMMENT '证物类别，入库后不可修改',
     seal_no VARCHAR(64) NOT NULL COMMENT '封条编号，入库后不可修改',
     custodian_id VARCHAR(64) NOT NULL COMMENT '当前保管人（操作人标识），交接接受后原子切换；借出期间不变',
-    status VARCHAR(20) NOT NULL COMMENT '证物状态：SEALED 已封存 / TRANSFER_PENDING 待接收 / BORROWED 借出未归还 / SEAL_BROKEN 封条异常（终态）',
+    status VARCHAR(20) NOT NULL COMMENT '证物状态：SEALED 已封存 / TRANSFER_PENDING 待接收 / BORROWED 借出未归还 / PENDING_INSPECTION 追缴回库待核验 / SEAL_BROKEN 封条异常（终态）',
     created_at DATETIME(6) NOT NULL COMMENT '入库时间，Asia/Shanghai',
     updated_at DATETIME(6) NOT NULL COMMENT '最近一次状态或保管人变更时间，Asia/Shanghai',
     CONSTRAINT uk_evidence_key UNIQUE (evidence_key)
@@ -50,7 +50,7 @@ CREATE TABLE IF NOT EXISTS loan_record (
     purpose VARCHAR(512) NOT NULL COMMENT '借出用途，非空',
     loan_at DATETIME(6) NOT NULL COMMENT '实际借出时刻，UTC',
     due_at DATETIME(6) NOT NULL COMMENT 'UTC 应还时刻，须晚于服务端当前时刻且不超过 72 小时',
-    status VARCHAR(20) NOT NULL COMMENT '借出状态：ACTIVE 未归还 / RETURNED 已归还（不可再变）',
+    status VARCHAR(20) NOT NULL COMMENT '借出状态：ACTIVE 未归还 / RETURNED 已归还（不可再变）/ RECLAIMED 已追缴（终态）；OVERDUE 为查询时刻派生状态，不落库',
     seal_passed TINYINT NULL COMMENT '归还封条核验结果：NULL 未归还 / 1 封条完好回到 SEALED / 0 异常进入 SEAL_BROKEN',
     return_note VARCHAR(512) NULL COMMENT '归还说明；NULL 表示未归还',
     returned_at DATETIME(6) NULL COMMENT '实际归还时刻（UTC）；NULL 表示未归还',
@@ -60,12 +60,55 @@ CREATE TABLE IF NOT EXISTS loan_record (
     KEY idx_loan_borrower_status (borrower_id, status)
 );
 
+-- 追缴记录：只追加、不可变；reclaim_key 全局唯一，重复提交按该键幂等返回首次结果；
+-- loan_key 唯一约束保证同一借出记录只能被追缴一次。原到期时刻、逾期分钟数与说明在追缴时固化。
+CREATE TABLE IF NOT EXISTS reclaim_record (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    reclaim_key VARCHAR(64) NOT NULL COMMENT '追缴业务键，全局唯一；同一借出重复提交按该键幂等返回首次结果',
+    loan_key VARCHAR(64) NOT NULL COMMENT '被追缴的借出业务键，全局唯一（同一借出只能被追缴一次）',
+    evidence_key VARCHAR(64) NOT NULL COMMENT '关联证物业务键',
+    custodian_id VARCHAR(64) NOT NULL COMMENT '提交追缴的保管人（须为借出时的保管人）',
+    borrower_id VARCHAR(64) NOT NULL COMMENT '被追缴的借出人',
+    due_at DATETIME(6) NOT NULL COMMENT '原应还时刻（UTC），追缴时固化，此后不随借出记录变化',
+    overdue_minutes BIGINT NOT NULL COMMENT '追缴时刻相对原应还时刻的逾期分钟数，追缴时固化',
+    note VARCHAR(512) NOT NULL COMMENT '追缴说明，非空',
+    reclaimed_at DATETIME(6) NOT NULL COMMENT '追缴时刻（UTC）',
+    created_at DATETIME(6) NOT NULL COMMENT '记录创建时间，Asia/Shanghai',
+    CONSTRAINT uk_reclaim_key UNIQUE (reclaim_key),
+    CONSTRAINT uk_reclaim_loan UNIQUE (loan_key),
+    KEY idx_reclaim_borrower (borrower_id),
+    KEY idx_reclaim_evidence (evidence_key)
+);
+
+-- 借出人冻结状态：每个借出人至多一行。同一借出人累计被追缴达到 2 次即自动冻结，
+-- 冻结期间新借出申请返回 403；解冻后追缴计数从零重新累计，历史追缴记录保留。
+CREATE TABLE IF NOT EXISTS borrower_freeze (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    borrower_id VARCHAR(64) NOT NULL COMMENT '借出人标识',
+    frozen TINYINT NOT NULL COMMENT '是否冻结中：1 冻结（禁止新借出）/ 0 正常',
+    reclaim_count INT NOT NULL COMMENT '上次解冻以来累计被追缴次数，达到 2 次自动冻结；解冻后清零',
+    frozen_by VARCHAR(64) NULL COMMENT '触发冻结的追缴保管人，解冻须由另一名保管人提交；NULL 表示未冻结',
+    frozen_at DATETIME(6) NULL COMMENT '冻结触发时间，Asia/Shanghai；NULL 表示未冻结',
+    updated_at DATETIME(6) NOT NULL COMMENT '最近一次变更时间，Asia/Shanghai',
+    CONSTRAINT uk_freeze_borrower UNIQUE (borrower_id)
+);
+
+-- 解冻记录：只追加、不可变；解冻后追缴计数从零重新累计，历史追缴记录保留。
+CREATE TABLE IF NOT EXISTS unfreeze_record (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    borrower_id VARCHAR(64) NOT NULL COMMENT '被解冻的借出人',
+    actor_id VARCHAR(64) NOT NULL COMMENT '提交解冻的保管人，须不同于触发冻结的保管人且非借出人本人',
+    note VARCHAR(512) NOT NULL COMMENT '解冻说明，非空',
+    created_at DATETIME(6) NOT NULL COMMENT '解冻时间，Asia/Shanghai',
+    KEY idx_unfreeze_borrower (borrower_id)
+);
+
 -- 幂等命令日志：command_key 全局唯一；同键同参重放返回首次结果，同键改参返回 409。
 CREATE TABLE IF NOT EXISTS command_log (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     command_key VARCHAR(64) NOT NULL COMMENT '幂等命令键，全局唯一',
     actor_id VARCHAR(64) NOT NULL COMMENT '发起操作人',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN/LOAN_RECLAIM/BORROWER_UNFREEZE',
     request_hash VARCHAR(64) NOT NULL COMMENT '请求参数规范化后的 SHA-256，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行的 HTTP 状态码',
     response_body TEXT NOT NULL COMMENT '首次执行的响应体 JSON，重放时原样返回',

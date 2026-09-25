@@ -279,15 +279,16 @@ class LoanApiTest {
         assertThat(beforeDue).hasSize(1);
         assertThat(beforeDue.get(0).get("overdue").asBoolean()).isFalse();
 
-        // 超过应还时刻：仅查询标识变化，不自动归还、不换保管人、不解除限制
+        // 超过应还时刻：实时判定为派生状态 OVERDUE，不自动归还、不换保管人、不解除限制
         fixClock(BASE.plusSeconds(7200));
         JsonNode overdue = activeLoans(borrower);
         assertThat(overdue).hasSize(1);
         assertThat(overdue.get(0).get("overdue").asBoolean()).isTrue();
+        assertThat(overdue.get(0).get("status").asText()).isEqualTo("OVERDUE");
         JsonNode view = chain(evidenceKey);
         assertThat(view.get("evidence").get("status").asText()).isEqualTo("BORROWED");
         assertThat(view.get("evidence").get("custodianId").asText()).isEqualTo("alice");
-        assertThat(view.get("loans").get(0).get("status").asText()).isEqualTo("ACTIVE");
+        assertThat(view.get("loans").get(0).get("status").asText()).isEqualTo("OVERDUE");
         assertThat(initiate("alice", evidenceKey, "carol").getResponse().getStatus()).isEqualTo(409);
 
         // 逾期后仍可正常归还
