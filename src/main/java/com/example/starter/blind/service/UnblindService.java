@@ -4,6 +4,9 @@ import com.example.starter.blind.ApiException;
 import com.example.starter.blind.Clock;
 import com.example.starter.blind.dto.UnblindRequestView;
 import com.example.starter.blind.dto.UnblindResultView;
+import com.example.starter.blind.repo.AdverseEventRepository;
+import com.example.starter.blind.repo.AdverseEventRepository.AdverseEventRow;
+import com.example.starter.blind.repo.AllocationRepository;
 import com.example.starter.blind.repo.AllocationRepository.AllocationRow;
 import com.example.starter.blind.repo.ExperimentRepository.SeatRow;
 import com.example.starter.blind.repo.ExperimentRepository;
@@ -27,15 +30,21 @@ public class UnblindService {
     private final UnblindRequestRepository unblindRequestRepository;
     private final ExperimentService experimentService;
     private final ExperimentRepository experimentRepository;
+    private final AllocationRepository allocationRepository;
+    private final AdverseEventRepository adverseEventRepository;
     private final Clock clock;
 
     public UnblindService(UnblindRequestRepository unblindRequestRepository,
                           ExperimentService experimentService,
                           ExperimentRepository experimentRepository,
+                          AllocationRepository allocationRepository,
+                          AdverseEventRepository adverseEventRepository,
                           Clock clock) {
         this.unblindRequestRepository = unblindRequestRepository;
         this.experimentService = experimentService;
         this.experimentRepository = experimentRepository;
+        this.allocationRepository = allocationRepository;
+        this.adverseEventRepository = adverseEventRepository;
         this.clock = clock;
     }
 
@@ -52,7 +61,11 @@ public class UnblindService {
             throw ApiException.badRequest("reason 最长 500 字符");
         }
         AllocationRow allocation =
-                experimentService.mustFindAllocationRow(experimentId, participantId);
+                experimentService.mustLockAllocationRow(experimentId, participantId);
+        if (allocation.unblindedAt() != null) {
+            // 另一通道（紧急揭盲）已先完成：后续常规操作一律 409。
+            throw ApiException.conflict("该分配已揭盲");
+        }
         UnblindRequestRow pending =
                 unblindRequestRepository.findPendingByAllocation(allocation.id());
         if (pending != null) {
@@ -61,7 +74,8 @@ public class UnblindService {
         String requestId = "UB-" + UUID.randomUUID().toString().replace("-", "");
         long now = clock.nowMillis();
         UnblindRequestRow row = new UnblindRequestRow(requestId, experimentId, participantId,
-                allocation.id(), reason, applicantActor, null, "PENDING", null, now, null);
+                allocation.id(), reason, applicantActor, null, "PENDING", null, now, null,
+                "REGULAR", null);
         try {
             unblindRequestRepository.insertPending(row);
         } catch (DuplicateKeyException e) {
@@ -88,7 +102,11 @@ public class UnblindService {
         }
         // 从数据库读取处理映射（盲底），批准时写入申请记录；处理代码不打日志。
         AllocationRow allocation =
-                experimentService.mustFindAllocationRow(row.experimentId(), row.participantId());
+                experimentService.mustLockAllocationRow(row.experimentId(), row.participantId());
+        if (allocation.unblindedAt() != null) {
+            // 紧急揭盲已先完成：同一分配只成功揭盲一次。
+            throw ApiException.conflict("该分配已揭盲");
+        }
         SeatRow seat = experimentRepository.findSeat(row.experimentId(),
                 allocation.blockNo(), allocation.seatNo());
         if (seat == null) {
@@ -97,9 +115,11 @@ public class UnblindService {
         long now = clock.nowMillis();
         unblindRequestRepository.approve(unblindRequestId, reviewerActor,
                 seat.treatment(), now);
+        // 常规批准同样完成揭盲：写入分配揭盲时间，紧急通道后续操作将返回 409。
+        allocationRepository.completeUnblind(allocation.id(), now);
         return new UnblindRequestView(row.id(), row.experimentId(), row.participantId(),
                 row.reason(), row.applicantActor(), reviewerActor, "APPROVED",
-                row.createdAt(), now);
+                row.createdAt(), now, "REGULAR", null);
     }
 
     /**
@@ -140,6 +160,60 @@ public class UnblindService {
     private UnblindRequestView toView(UnblindRequestRow row) {
         return new UnblindRequestView(row.id(), row.experimentId(), row.participantId(),
                 row.reason(), row.applicantActor(), row.reviewerActor(), row.status(),
-                row.createdAt(), row.reviewedAt());
+                row.createdAt(), row.reviewedAt(), row.requestType(), row.eventKey());
+    }
+
+    /**
+     * 紧急揭盲：仅 REVIEWER 可调用（控制器校验），分配须处于 URGENT_REVIEW 且未退组、未揭盲；
+     * eventKey 须对应该参与者的 SEVERE 报告，否则 422。成功后原子完成揭盲、
+     * 复位 URGENT_REVIEW 标记，并写入 EMERGENCY 类型的不可变揭盲记录。
+     * 不受实验 CLOSED 限制；与常规批准互斥，同一分配只成功揭盲一次。
+     */
+    @Transactional
+    public UnblindRequestView emergency(String experimentId, String participantId,
+                                        String eventKey, String reason, String reviewerActor) {
+        if (reason == null || reason.isBlank()) {
+            throw ApiException.badRequest("reason 不能为空");
+        }
+        if (reason.length() > 500) {
+            throw ApiException.badRequest("reason 最长 500 字符");
+        }
+        if (eventKey == null || eventKey.isBlank()) {
+            throw ApiException.badRequest("eventKey 不能为空");
+        }
+        AllocationRow allocation =
+                experimentService.mustLockAllocationRow(experimentId, participantId);
+        if ("WITHDRAWN".equals(allocation.status())) {
+            throw ApiException.conflict("退组分配不可发起紧急揭盲");
+        }
+        if (allocation.unblindedAt() != null) {
+            // 常规通道已先完成揭盲：同一分配只成功揭盲一次。
+            throw ApiException.conflict("该分配已揭盲");
+        }
+        if (!"Y".equals(allocation.urgentReview())) {
+            throw ApiException.conflict("该分配未处于 URGENT_REVIEW 状态，不可紧急揭盲");
+        }
+        AdverseEventRow event = adverseEventRepository.findByEventKey(experimentId, eventKey);
+        if (event == null || event.allocationId() != allocation.id()
+                || !"SEVERE".equals(event.severity())) {
+            throw ApiException.unprocessable("eventKey 对应的报告不存在或严重度非 SEVERE");
+        }
+        SeatRow seat = experimentRepository.findSeat(experimentId,
+                allocation.blockNo(), allocation.seatNo());
+        if (seat == null) {
+            throw new IllegalStateException("席位映射缺失，数据不一致");
+        }
+        long now = clock.nowMillis();
+        // 原子完成揭盲并复位 URGENT_REVIEW；并发下仅一个事务生效。
+        int updated = allocationRepository.completeUnblind(allocation.id(), now);
+        if (updated == 0) {
+            throw ApiException.conflict("该分配已揭盲");
+        }
+        String requestId = "UB-" + UUID.randomUUID().toString().replace("-", "");
+        UnblindRequestRow row = new UnblindRequestRow(requestId, experimentId, participantId,
+                allocation.id(), reason, reviewerActor, reviewerActor, "APPROVED",
+                seat.treatment(), now, now, "EMERGENCY", eventKey);
+        unblindRequestRepository.insertEmergency(row);
+        return toView(row);
     }
 }

@@ -114,7 +114,7 @@ public class ExperimentService {
             String blindCode = blindCodeGenerator.nextCode();
             AllocationRow row = new AllocationRow(0L, experimentId, participantId,
                     vacant.blockNo(), vacant.seatNo(), blindCode, "ASSIGNED",
-                    actorId, now, null);
+                    actorId, now, null, "N", null);
             try {
                 allocationRepository.insert(row);
                 return allocationRepository.findByExperimentAndParticipant(experimentId, participantId);
@@ -135,10 +135,11 @@ public class ExperimentService {
 
     /**
      * 退组：状态置为 WITHDRAWN 并记录时间；席位不释放、已有分配不重排。
+     * 行锁与紧急揭盲串行化，按事务提交顺序裁决。
      */
     @Transactional
     public AllocationView withdraw(String experimentId, String participantId) {
-        AllocationRow allocation = mustFindAllocation(experimentId, participantId);
+        AllocationRow allocation = mustLockAllocationRow(experimentId, participantId);
         if ("WITHDRAWN".equals(allocation.status())) {
             throw ApiException.conflict("参与者已退组");
         }
@@ -198,5 +199,26 @@ public class ExperimentService {
     private AllocationView toView(AllocationRow row) {
         return new AllocationView(row.experimentId(), row.participantId(), row.blindCode(),
                 row.blockNo(), row.status(), row.assignedAt(), row.withdrawnAt());
+    }
+
+    /** 内部使用：行级锁定的完整分配行（含盲底字段），供紧急揭盲/退组串行化。 */
+    public AllocationRow mustLockAllocationRow(String experimentId, String participantId) {
+        mustFindExperiment(experimentId);
+        AllocationRow row =
+                allocationRepository.findByExperimentAndParticipant(experimentId, participantId);
+        if (row == null) {
+            throw ApiException.notFound("参与者尚未在该实验登记");
+        }
+        return allocationRepository.lockById(row.id());
+    }
+
+    /**
+     * URGENT_REVIEW 分配清单：只返回盲码、区组号、参与者编号与退组状态，不含处理代码。
+     */
+    public List<AllocationView> listUrgentReviews(String experimentId) {
+        mustFindExperiment(experimentId);
+        return allocationRepository.findUrgentReviewByExperiment(experimentId).stream()
+                .map(this::toView)
+                .toList();
     }
 }

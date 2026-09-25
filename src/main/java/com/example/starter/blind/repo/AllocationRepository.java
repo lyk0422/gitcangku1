@@ -24,7 +24,9 @@ public class AllocationRepository {
             String status,
             String assignedActor,
             long assignedAt,
-            Long withdrawnAt) {
+            Long withdrawnAt,
+            String urgentReview,
+            Long unblindedAt) {
     }
 
     private static final RowMapper<AllocationRow> ALLOCATION_MAPPER = (rs, n) -> new AllocationRow(
@@ -37,7 +39,13 @@ public class AllocationRepository {
             rs.getString("status"),
             rs.getString("assigned_actor"),
             rs.getLong("assigned_at"),
-            (Long) rs.getObject("withdrawn_at"));
+            (Long) rs.getObject("withdrawn_at"),
+            rs.getString("urgent_review"),
+            (Long) rs.getObject("unblinded_at"));
+
+    private static final String COLUMNS =
+            "id, experiment_id, participant_id, block_no, seat_no, blind_code, status, "
+                    + "assigned_actor, assigned_at, withdrawn_at, urgent_review, unblinded_at";
 
     private final JdbcTemplate jdbc;
 
@@ -48,18 +56,27 @@ public class AllocationRepository {
     public void insert(AllocationRow row) {
         jdbc.update("INSERT INTO allocation ("
                         + "experiment_id, participant_id, block_no, seat_no, blind_code, "
-                        + "status, assigned_actor, assigned_at, withdrawn_at"
-                        + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        + "status, assigned_actor, assigned_at, withdrawn_at, urgent_review, unblinded_at"
+                        + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 row.experimentId(), row.participantId(), row.blockNo(), row.seatNo(), row.blindCode(),
-                row.status(), row.assignedActor(), row.assignedAt(), row.withdrawnAt());
+                row.status(), row.assignedActor(), row.assignedAt(), row.withdrawnAt(),
+                row.urgentReview(), row.unblindedAt());
     }
 
     public AllocationRow findByExperimentAndParticipant(String experimentId, String participantId) {
         List<AllocationRow> rows = jdbc.query(
-                "SELECT id, experiment_id, participant_id, block_no, seat_no, blind_code, status, "
-                        + "assigned_actor, assigned_at, withdrawn_at "
-                        + "FROM allocation WHERE experiment_id = ? AND participant_id = ?",
+                "SELECT " + COLUMNS + " FROM allocation WHERE experiment_id = ? AND participant_id = ?",
                 ALLOCATION_MAPPER, experimentId, participantId);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /**
+     * 行级锁定分配，串行化紧急揭盲、常规批准与退组对同一分配的并发裁决。
+     */
+    public AllocationRow lockById(long allocationId) {
+        List<AllocationRow> rows = jdbc.query(
+                "SELECT " + COLUMNS + " FROM allocation WHERE id = ? FOR UPDATE",
+                ALLOCATION_MAPPER, allocationId);
         return rows.isEmpty() ? null : rows.get(0);
     }
 
@@ -118,5 +135,34 @@ public class AllocationRepository {
 
     public boolean isDuplicateBlindCode(DuplicateKeyException e) {
         return e.getMessage() != null && e.getMessage().contains("uq_allocation_blind_code");
+    }
+
+    /**
+     * SEVERE 不良事件上报后标记分配为 URGENT_REVIEW；已标记时幂等。
+     */
+    public void markUrgentReview(long allocationId) {
+        jdbc.update("UPDATE allocation SET urgent_review = 'Y' WHERE id = ?", allocationId);
+    }
+
+    /**
+     * 原子完成揭盲：写入揭盲时间并复位 URGENT_REVIEW 标记；仅未揭盲时生效。
+     *
+     * @return 受影响行数；0 表示该分配已揭盲
+     */
+    public int completeUnblind(long allocationId, long unblindedAt) {
+        return jdbc.update(
+                "UPDATE allocation SET unblinded_at = ?, urgent_review = 'N' "
+                        + "WHERE id = ? AND unblinded_at IS NULL",
+                unblindedAt, allocationId);
+    }
+
+    /**
+     * 查询实验内处于 URGENT_REVIEW 的分配清单（按分配时间升序）。
+     */
+    public List<AllocationRow> findUrgentReviewByExperiment(String experimentId) {
+        return jdbc.query(
+                "SELECT " + COLUMNS + " FROM allocation "
+                        + "WHERE experiment_id = ? AND urgent_review = 'Y' ORDER BY assigned_at, id",
+                ALLOCATION_MAPPER, experimentId);
     }
 }

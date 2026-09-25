@@ -4,12 +4,16 @@ import com.example.starter.blind.Actor;
 import com.example.starter.blind.ActorContext;
 import com.example.starter.blind.ApiException;
 import com.example.starter.blind.RequestTokens;
+import com.example.starter.blind.dto.AdverseEventReportRequest;
+import com.example.starter.blind.dto.AdverseEventView;
 import com.example.starter.blind.dto.AllocationView;
 import com.example.starter.blind.dto.CreateExperimentRequest;
+import com.example.starter.blind.dto.EmergencyUnblindRequest;
 import com.example.starter.blind.dto.ExperimentView;
 import com.example.starter.blind.dto.UnblindApplyRequest;
 import com.example.starter.blind.dto.UnblindRequestView;
 import com.example.starter.blind.dto.UnblindResultView;
+import com.example.starter.blind.service.AdverseEventService;
 import com.example.starter.blind.service.ExperimentService;
 import com.example.starter.blind.service.IdempotencyService;
 import com.example.starter.blind.service.UnblindService;
@@ -24,6 +28,7 @@ import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -40,18 +45,23 @@ public class BlindExperimentController {
     static final String OP_ALLOCATION_WITHDRAW = "allocation.withdraw";
     static final String OP_UNBLIND_APPLY = "unblind.apply";
     static final String OP_UNBLIND_APPROVE = "unblind.approve";
+    static final String OP_ADVERSE_EVENT_REPORT = "adverse-event.report";
+    static final String OP_UNBLIND_EMERGENCY = "unblind.emergency";
 
     private final ExperimentService experimentService;
     private final UnblindService unblindService;
+    private final AdverseEventService adverseEventService;
     private final IdempotencyService idempotencyService;
     private final ActorContext actorContext;
 
     public BlindExperimentController(ExperimentService experimentService,
                                      UnblindService unblindService,
+                                     AdverseEventService adverseEventService,
                                      IdempotencyService idempotencyService,
                                      ActorContext actorContext) {
         this.experimentService = experimentService;
         this.unblindService = unblindService;
+        this.adverseEventService = adverseEventService;
         this.idempotencyService = idempotencyService;
         this.actorContext = actorContext;
     }
@@ -193,6 +203,71 @@ public class BlindExperimentController {
         Actor actor = requireActor();
         return unblindService.getResult(
                 RequestTokens.requireId("unblindRequestId", unblindRequestId), actor.actorId());
+    }
+
+    // ---------------- 不良事件与紧急揭盲 ----------------
+
+    /** 上报不良事件（任意角色）；SEVERE 自动将分配标记为 URGENT_REVIEW。 */
+    @PostMapping("/experiments/{experimentId}/participants/{participantId}/adverse-events")
+    public ResponseEntity<String> reportAdverseEvent(
+            @PathVariable String experimentId,
+            @PathVariable String participantId,
+            @Valid @RequestBody AdverseEventReportRequest request,
+            @RequestHeader(IdempotencyService.HEADER_REQUEST_ID) String requestId) {
+        Actor actor = requireActor();
+        String expId = RequestTokens.requireId("experimentId", experimentId);
+        String pid = RequestTokens.requireId("participantId", participantId);
+        String reqId = RequestTokens.requireRequestId(requestId);
+        String fingerprint = idempotencyService.fingerprint(OP_ADVERSE_EVENT_REPORT,
+                Map.of("experimentId", expId,
+                        "participantId", pid,
+                        "eventKey", request.eventKey(),
+                        "severity", request.severity().name(),
+                        "description", request.description()));
+        return idempotencyService.runWrite(reqId, OP_ADVERSE_EVENT_REPORT, fingerprint, actor,
+                () -> IdempotencyService.WriteOutcome.of(HttpStatus.CREATED.value(),
+                        adverseEventService.report(expId, pid, request.eventKey(),
+                                request.severity(), request.description(), actor.actorId())));
+    }
+
+    /** 查询参与者的不良事件报告历史（任意角色）；不含处理代码。 */
+    @GetMapping("/experiments/{experimentId}/participants/{participantId}/adverse-events")
+    public List<AdverseEventView> listAdverseEvents(@PathVariable String experimentId,
+                                                    @PathVariable String participantId) {
+        requireActor();
+        return adverseEventService.listHistory(
+                RequestTokens.requireId("experimentId", experimentId),
+                RequestTokens.requireId("participantId", participantId));
+    }
+
+    /** 查询实验内 URGENT_REVIEW 分配清单（任意角色）；不含处理代码。 */
+    @GetMapping("/experiments/{experimentId}/urgent-reviews")
+    public List<AllocationView> listUrgentReviews(@PathVariable String experimentId) {
+        requireActor();
+        return experimentService.listUrgentReviews(
+                RequestTokens.requireId("experimentId", experimentId));
+    }
+
+    /** 紧急揭盲（仅 REVIEWER）：分配须处于 URGENT_REVIEW，eventKey 须对应 SEVERE 报告。 */
+    @PostMapping("/experiments/{experimentId}/participants/{participantId}/emergency-unblind")
+    public ResponseEntity<String> emergencyUnblind(
+            @PathVariable String experimentId,
+            @PathVariable String participantId,
+            @Valid @RequestBody EmergencyUnblindRequest request,
+            @RequestHeader(IdempotencyService.HEADER_REQUEST_ID) String requestId) {
+        Actor actor = requireReviewer();
+        String expId = RequestTokens.requireId("experimentId", experimentId);
+        String pid = RequestTokens.requireId("participantId", participantId);
+        String reqId = RequestTokens.requireRequestId(requestId);
+        String fingerprint = idempotencyService.fingerprint(OP_UNBLIND_EMERGENCY,
+                Map.of("experimentId", expId,
+                        "participantId", pid,
+                        "eventKey", request.eventKey(),
+                        "reason", request.reason()));
+        return idempotencyService.runWrite(reqId, OP_UNBLIND_EMERGENCY, fingerprint, actor,
+                () -> IdempotencyService.WriteOutcome.of(HttpStatus.CREATED.value(),
+                        unblindService.emergency(expId, pid, request.eventKey(),
+                                request.reason(), actor.actorId())));
     }
 
     // ---------------- 权限辅助（先于幂等回放执行） ----------------

@@ -24,7 +24,9 @@ public class UnblindRequestRepository {
             String status,
             String treatment,
             long createdAt,
-            Long reviewedAt) {
+            Long reviewedAt,
+            String requestType,
+            String eventKey) {
     }
 
     private static final RowMapper<UnblindRequestRow> MAPPER = (rs, n) -> new UnblindRequestRow(
@@ -38,11 +40,14 @@ public class UnblindRequestRepository {
             rs.getString("status"),
             rs.getString("treatment"),
             rs.getLong("created_at"),
-            (Long) rs.getObject("reviewed_at"));
+            (Long) rs.getObject("reviewed_at"),
+            rs.getString("request_type"),
+            rs.getString("event_key"));
 
     private static final String COLUMNS =
             "id, experiment_id, participant_id, allocation_id, reason, applicant_actor, "
-                    + "reviewer_actor, status, treatment, created_at, reviewed_at";
+                    + "reviewer_actor, status, treatment, created_at, reviewed_at, "
+                    + "request_type, event_key";
 
     private final JdbcTemplate jdbc;
 
@@ -96,5 +101,19 @@ public class UnblindRequestRepository {
                         + "treatment = ?, reviewed_at = ?, pending_allocation_id = NULL "
                         + "WHERE id = ? AND status = 'PENDING'",
                 reviewerActor, treatment, reviewedAt, requestId);
+    }
+
+    /**
+     * 插入紧急揭盲记录：直接落终态 APPROVED，类型 EMERGENCY，不占用待审唯一占位。
+     */
+    public void insertEmergency(UnblindRequestRow row) {
+        jdbc.update("INSERT INTO unblind_request ("
+                        + "id, experiment_id, participant_id, allocation_id, reason, applicant_actor, "
+                        + "reviewer_actor, status, treatment, created_at, reviewed_at, "
+                        + "pending_allocation_id, request_type, event_key"
+                        + ") VALUES (?, ?, ?, ?, ?, ?, ?, 'APPROVED', ?, ?, ?, NULL, 'EMERGENCY', ?)",
+                row.id(), row.experimentId(), row.participantId(), row.allocationId(),
+                row.reason(), row.applicantActor(), row.reviewerActor(), row.treatment(),
+                row.createdAt(), row.reviewedAt(), row.eventKey());
     }
 }

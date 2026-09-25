@@ -42,11 +42,14 @@ CREATE TABLE IF NOT EXISTS allocation (
     assigned_actor VARCHAR(64)  NOT NULL,
     assigned_at    BIGINT       NOT NULL,
     withdrawn_at   BIGINT,
+    urgent_review  VARCHAR(1)   NOT NULL DEFAULT 'N',
+    unblinded_at   BIGINT,
     CONSTRAINT pk_allocation PRIMARY KEY (id),
     CONSTRAINT uq_allocation_participant UNIQUE (experiment_id, participant_id),
     CONSTRAINT uq_allocation_seat UNIQUE (experiment_id, block_no, seat_no),
     CONSTRAINT uq_allocation_blind_code UNIQUE (blind_code),
-    CONSTRAINT ck_allocation_status CHECK (status IN ('ASSIGNED', 'WITHDRAWN'))
+    CONSTRAINT ck_allocation_status CHECK (status IN ('ASSIGNED', 'WITHDRAWN')),
+    CONSTRAINT ck_allocation_urgent_review CHECK (urgent_review IN ('Y', 'N'))
 );
 COMMENT ON TABLE  allocation IS '参与者分配表；同实验同参与者只占一席，退组不释放席位、不重排已有分配';
 COMMENT ON COLUMN allocation.id IS '分配自增主键';
@@ -59,6 +62,8 @@ COMMENT ON COLUMN allocation.status IS '分配状态：ASSIGNED=在组；WITHDRA
 COMMENT ON COLUMN allocation.assigned_actor IS '执行登记的操作者编号（X-Actor-Id）';
 COMMENT ON COLUMN allocation.assigned_at IS '分配时间，Unix 毫秒，UTC';
 COMMENT ON COLUMN allocation.withdrawn_at IS '退组时间，Unix 毫秒，UTC；NULL 表示未退组';
+COMMENT ON COLUMN allocation.urgent_review IS '紧急复核标记：Y=存在 SEVERE 不良事件待紧急揭盲；N=无；紧急揭盲成功后复位为 N';
+COMMENT ON COLUMN allocation.unblinded_at IS '揭盲完成时间，Unix 毫秒，UTC；NULL 表示尚未揭盲；常规批准与紧急揭盲共用，保证同一分配只成功揭盲一次';
 
 CREATE TABLE IF NOT EXISTS unblind_request (
     id                      VARCHAR(64)  NOT NULL,
@@ -73,10 +78,13 @@ CREATE TABLE IF NOT EXISTS unblind_request (
     created_at              BIGINT       NOT NULL,
     reviewed_at             BIGINT,
     pending_allocation_id   BIGINT,
+    request_type            VARCHAR(16)  NOT NULL DEFAULT 'REGULAR',
+    event_key               VARCHAR(64),
     CONSTRAINT pk_unblind_request PRIMARY KEY (id),
     CONSTRAINT uq_unblind_pending UNIQUE (pending_allocation_id),
     CONSTRAINT ck_unblind_status CHECK (status IN ('PENDING', 'APPROVED')),
-    CONSTRAINT ck_unblind_treatment CHECK (treatment IS NULL OR treatment IN ('A', 'B'))
+    CONSTRAINT ck_unblind_treatment CHECK (treatment IS NULL OR treatment IN ('A', 'B')),
+    CONSTRAINT ck_unblind_type CHECK (request_type IN ('REGULAR', 'EMERGENCY'))
 );
 COMMENT ON TABLE  unblind_request IS '揭盲申请表；同一分配至多一个待审申请，须由另一名 REVIEWER 批准后申请人方可查看结果';
 COMMENT ON COLUMN unblind_request.id IS '揭盲申请编号，全局唯一';
@@ -91,6 +99,33 @@ COMMENT ON COLUMN unblind_request.treatment IS '揭盲结果处理代码 A/B，�
 COMMENT ON COLUMN unblind_request.created_at IS '申请时间，Unix 毫秒，UTC';
 COMMENT ON COLUMN unblind_request.reviewed_at IS '批准时间，Unix 毫秒，UTC；NULL 表示未批准';
 COMMENT ON COLUMN unblind_request.pending_allocation_id IS '待审去重列：待审时等于 allocation_id，终态置 NULL；唯一索引保证同一分配至多一个待审申请';
+COMMENT ON COLUMN unblind_request.request_type IS '揭盲类型：REGULAR=协调员申请+审阅批准的常规通道；EMERGENCY=SEVERE 不良事件触发的紧急揭盲，由 REVIEWER 直接完成';
+COMMENT ON COLUMN unblind_request.event_key IS '紧急揭盲依据的不良事件报告 eventKey；常规申请为 NULL';
+
+CREATE TABLE IF NOT EXISTS adverse_event (
+    id             BIGINT        NOT NULL AUTO_INCREMENT,
+    experiment_id  VARCHAR(64)   NOT NULL,
+    participant_id VARCHAR(64)   NOT NULL,
+    allocation_id  BIGINT        NOT NULL,
+    event_key      VARCHAR(64)   NOT NULL,
+    severity       VARCHAR(16)   NOT NULL,
+    description    VARCHAR(1000) NOT NULL,
+    reporter_actor VARCHAR(64)   NOT NULL,
+    created_at     BIGINT        NOT NULL,
+    CONSTRAINT pk_adverse_event PRIMARY KEY (id),
+    CONSTRAINT uq_adverse_event_key UNIQUE (experiment_id, event_key),
+    CONSTRAINT ck_adverse_event_severity CHECK (severity IN ('MILD', 'MODERATE', 'SEVERE'))
+);
+COMMENT ON TABLE  adverse_event IS '不良事件报告表；同一参与者可有多条报告，报告不含处理代码等盲底信息';
+COMMENT ON COLUMN adverse_event.id IS '报告自增主键';
+COMMENT ON COLUMN adverse_event.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN adverse_event.participant_id IS '合成参与者编号，非真实医疗数据';
+COMMENT ON COLUMN adverse_event.allocation_id IS '对应分配主键';
+COMMENT ON COLUMN adverse_event.event_key IS '报告业务键，实验内唯一，由上报方给定；紧急揭盲据此校验 SEVERE 严重度';
+COMMENT ON COLUMN adverse_event.severity IS '严重度：MILD/MODERATE/SEVERE；SEVERE 自动将分配标记为 URGENT_REVIEW';
+COMMENT ON COLUMN adverse_event.description IS '事件描述，必填，最长 1000 字符';
+COMMENT ON COLUMN adverse_event.reporter_actor IS '上报人操作者编号（X-Actor-Id），任意角色可上报';
+COMMENT ON COLUMN adverse_event.created_at IS '上报时间，Unix 毫秒，UTC';
 
 CREATE TABLE IF NOT EXISTS idempotent_request (
     request_id      VARCHAR(64)  NOT NULL,
