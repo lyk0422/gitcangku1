@@ -1,6 +1,7 @@
 package com.example.starter.support;
 
 import com.example.starter.api.dto.ApiError;
+import com.example.starter.api.dto.ApiViolationError;
 import jakarta.validation.ConstraintViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -19,6 +20,14 @@ public class GlobalExceptionHandler {
     public org.springframework.http.ResponseEntity<ApiError> handleApi(ApiException ex) {
         return org.springframework.http.ResponseEntity.status(ex.getStatus())
                 .body(new ApiError(ex.getCode(), ex.getMessage()));
+    }
+
+    @ExceptionHandler(LicenseViolationException.class)
+    public org.springframework.http.ResponseEntity<ApiViolationError> handleLicenseViolation(
+            LicenseViolationException ex) {
+        return org.springframework.http.ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
+                .body(new ApiViolationError("LICENSE_POLICY_VIOLATION", ex.getMessage(),
+                        ex.getViolations()));
     }
 
     @ExceptionHandler({MissingRequestHeaderException.class, MethodArgumentNotValidException.class,

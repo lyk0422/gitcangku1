@@ -163,20 +163,25 @@ public class RepositoryDao {
                 "UPDATE artifact SET withdrawn = 1 WHERE id = ? AND withdrawn = 0", artifactId);
     }
 
-    /** 新增锁文件主记录，返回自增主键。 */
+    /** 新增锁文件主记录，返回自增主键；policyVersion 为 null 表示锁定时未配置策略。 */
     public long insertLockFile(String rootName, int rootVersion, long repositoryVersion,
-                               String requestId, Instant createdAt) {
+                               Long policyVersion, String requestId, Instant createdAt) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbcTemplate.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO lock_file (root_name, root_version, repository_version, request_id, created_at) "
-                            + "VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO lock_file (root_name, root_version, repository_version, policy_version, "
+                            + "request_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, rootName);
             ps.setInt(2, rootVersion);
             ps.setLong(3, repositoryVersion);
-            ps.setString(4, requestId);
-            ps.setTimestamp(5, Timestamp.from(createdAt));
+            if (policyVersion == null) {
+                ps.setNull(4, java.sql.Types.BIGINT);
+            } else {
+                ps.setLong(4, policyVersion);
+            }
+            ps.setString(5, requestId);
+            ps.setTimestamp(6, Timestamp.from(createdAt));
             return ps;
         }, keyHolder);
         Number key = keyHolder.getKey();
@@ -186,11 +191,102 @@ public class RepositoryDao {
         return key.longValue();
     }
 
-    /** 新增锁文件精确版本条目。 */
-    public void insertLockEntry(long lockFileId, String name, int version) {
+    /** 新增锁文件精确版本条目，固化锁定时的许可证标识。 */
+    public void insertLockEntry(long lockFileId, String name, int version, String license) {
         jdbcTemplate.update(
-                "INSERT INTO lock_file_entry (lock_file_id, name, version) VALUES (?, ?, ?)",
-                lockFileId, name, version);
+                "INSERT INTO lock_file_entry (lock_file_id, name, version, license) VALUES (?, ?, ?, ?)",
+                lockFileId, name, version, license);
+    }
+
+    // ------------------------------------------------------------------
+    // 许可证登记
+    // ------------------------------------------------------------------
+
+    /** 登记或修订制品版本的许可证（UPSERT），须在持有行锁的写事务内调用。 */
+    public void upsertLicense(long artifactId, String license, Instant updatedAt) {
+        int updated = jdbcTemplate.update(
+                "UPDATE artifact_license SET license = ?, updated_at = ? WHERE artifact_id = ?",
+                license, Timestamp.from(updatedAt), artifactId);
+        if (updated == 0) {
+            jdbcTemplate.update(
+                    "INSERT INTO artifact_license (artifact_id, license, updated_at) VALUES (?, ?, ?)",
+                    artifactId, license, Timestamp.from(updatedAt));
+        }
+    }
+
+    /** 查询单个制品版本已登记的许可证，未登记返回 null（语义上视为 UNKNOWN）。 */
+    public String findLicense(long artifactId) {
+        List<String> licenses = jdbcTemplate.query(
+                "SELECT license FROM artifact_license WHERE artifact_id = ?",
+                (rs, n) -> rs.getString("license"), artifactId);
+        return licenses.isEmpty() ? null : licenses.get(0);
+    }
+
+    /** 批量查询制品版本的已登记许可证：artifactId -> license，未登记的版本不出现在结果中。 */
+    public Map<Long, String> findLicenses(java.util.Collection<Long> artifactIds) {
+        if (artifactIds.isEmpty()) {
+            return Map.of();
+        }
+        String placeholders = String.join(", ", java.util.Collections.nCopies(artifactIds.size(), "?"));
+        Map<Long, String> result = new LinkedHashMap<>();
+        jdbcTemplate.query(
+                "SELECT artifact_id, license FROM artifact_license WHERE artifact_id IN (" + placeholders + ")",
+                rs -> {
+                    result.put(rs.getLong("artifact_id"), rs.getString("license"));
+                },
+                artifactIds.toArray());
+        return result;
+    }
+
+    // ------------------------------------------------------------------
+    // 命名空间许可证策略
+    // ------------------------------------------------------------------
+
+    /** 策略行视图。 */
+    public record PolicyRow(String namespace, long version, boolean rejectUnknown, Instant updatedAt) {
+    }
+
+    /** 按命名空间查询策略，未配置返回 null。 */
+    public PolicyRow findPolicy(String namespace) {
+        List<PolicyRow> rows = jdbcTemplate.query(
+                "SELECT namespace, version, reject_unknown, updated_at FROM license_policy WHERE namespace = ?",
+                (rs, n) -> new PolicyRow(rs.getString("namespace"), rs.getLong("version"),
+                        rs.getInt("reject_unknown") == 1, rs.getTimestamp("updated_at").toInstant()),
+                namespace);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /** 新建命名空间策略，初始版本为 1。 */
+    public void insertPolicy(String namespace, boolean rejectUnknown, Instant updatedAt) {
+        jdbcTemplate.update(
+                "INSERT INTO license_policy (namespace, version, reject_unknown, updated_at) "
+                        + "VALUES (?, 1, ?, ?)",
+                namespace, rejectUnknown ? 1 : 0, Timestamp.from(updatedAt));
+    }
+
+    /** 按期望版本乐观更新策略，返回受影响行数（0 表示版本冲突）。 */
+    public int updatePolicy(String namespace, long expectedVersion, boolean rejectUnknown, Instant updatedAt) {
+        return jdbcTemplate.update(
+                "UPDATE license_policy SET version = version + 1, reject_unknown = ?, updated_at = ? "
+                        + "WHERE namespace = ? AND version = ?",
+                rejectUnknown ? 1 : 0, Timestamp.from(updatedAt), namespace, expectedVersion);
+    }
+
+    /** 整体替换策略的允许许可证集合（先删后插，同事务）。 */
+    public void replaceAllowedLicenses(String namespace, List<String> allowedLicenses) {
+        jdbcTemplate.update("DELETE FROM license_policy_allowed WHERE namespace = ?", namespace);
+        for (String license : allowedLicenses) {
+            jdbcTemplate.update(
+                    "INSERT INTO license_policy_allowed (namespace, license) VALUES (?, ?)",
+                    namespace, license);
+        }
+    }
+
+    /** 查询策略允许的许可证集合，按字典序升序。 */
+    public List<String> listAllowedLicenses(String namespace) {
+        return jdbcTemplate.query(
+                "SELECT license FROM license_policy_allowed WHERE namespace = ? ORDER BY license ASC",
+                (rs, n) -> rs.getString("license"), namespace);
     }
 
     /** 幂等记录视图。 */
@@ -233,32 +329,34 @@ public class RepositoryDao {
         return records.isEmpty() ? null : records.get(0);
     }
 
-    /** 锁文件列表行：不含条目明细。 */
+    /** 锁文件列表行：不含条目明细；policyVersion 为 null 表示锁定时未配置策略。 */
     public record LockFileRow(long id, String rootName, int rootVersion,
-                              long repositoryVersion, Instant createdAt) {
+                              long repositoryVersion, Long policyVersion, Instant createdAt) {
     }
 
-    /** 锁文件条目行。 */
-    public record LockEntryRow(long lockFileId, String name, int version) {
+    /** 锁文件条目行：含锁定时固化的许可证标识。 */
+    public record LockEntryRow(long lockFileId, String name, int version, String license) {
     }
 
     /** 查询全部历史锁文件，按 ID 升序。 */
     public List<LockFileRow> listLockFiles() {
         return jdbcTemplate.query(
-                "SELECT id, root_name, root_version, repository_version, created_at "
+                "SELECT id, root_name, root_version, repository_version, policy_version, created_at "
                         + "FROM lock_file ORDER BY id ASC",
                 (rs, n) -> new LockFileRow(rs.getLong("id"), rs.getString("root_name"),
                         rs.getInt("root_version"), rs.getLong("repository_version"),
+                        (Long) rs.getObject("policy_version"),
                         rs.getTimestamp("created_at").toInstant()));
     }
 
     /** 按主键查询锁文件，不存在返回 null。 */
     public LockFileRow getLockFile(long id) {
         List<LockFileRow> rows = jdbcTemplate.query(
-                "SELECT id, root_name, root_version, repository_version, created_at "
+                "SELECT id, root_name, root_version, repository_version, policy_version, created_at "
                         + "FROM lock_file WHERE id = ?",
                 (rs, n) -> new LockFileRow(rs.getLong("id"), rs.getString("root_name"),
                         rs.getInt("root_version"), rs.getLong("repository_version"),
+                        (Long) rs.getObject("policy_version"),
                         rs.getTimestamp("created_at").toInstant()),
                 id);
         return rows.isEmpty() ? null : rows.get(0);
@@ -267,10 +365,10 @@ public class RepositoryDao {
     /** 查询某锁文件的全部条目，按名称升序。 */
     public List<LockEntryRow> listLockEntries(long lockFileId) {
         return jdbcTemplate.query(
-                "SELECT lock_file_id, name, version FROM lock_file_entry "
+                "SELECT lock_file_id, name, version, license FROM lock_file_entry "
                         + "WHERE lock_file_id = ? ORDER BY name ASC",
                 (rs, n) -> new LockEntryRow(rs.getLong("lock_file_id"),
-                        rs.getString("name"), rs.getInt("version")),
+                        rs.getString("name"), rs.getInt("version"), rs.getString("license")),
                 lockFileId);
     }
 

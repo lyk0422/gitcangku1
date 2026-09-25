@@ -39,11 +39,46 @@ COMMENT ON COLUMN artifact_dependency.maximum_version IS '依赖最高版本（�
 
 CREATE UNIQUE INDEX IF NOT EXISTS uk_dep_artifact_name ON artifact_dependency (artifact_id, name);
 
+CREATE TABLE IF NOT EXISTS artifact_license (
+    artifact_id BIGINT       NOT NULL PRIMARY KEY,
+    license     VARCHAR(64)  NOT NULL,
+    updated_at  TIMESTAMP(6) NOT NULL,
+    CONSTRAINT fk_license_artifact FOREIGN KEY (artifact_id) REFERENCES artifact (id)
+);
+COMMENT ON TABLE artifact_license IS '制品版本许可证登记：每版本一条，未登记视为 UNKNOWN；已撤回版本禁止修改';
+COMMENT ON COLUMN artifact_license.artifact_id IS '所属制品版本 ID';
+COMMENT ON COLUMN artifact_license.license IS '许可证标识（如 MIT、Apache-2.0），登记后可修订';
+COMMENT ON COLUMN artifact_license.updated_at IS '最近一次登记/修订时间，UTC 时间戳';
+
+CREATE TABLE IF NOT EXISTS license_policy (
+    namespace      VARCHAR(128) NOT NULL PRIMARY KEY,
+    version        BIGINT       NOT NULL,
+    reject_unknown TINYINT      NOT NULL DEFAULT 0,
+    updated_at     TIMESTAMP(6) NOT NULL
+);
+COMMENT ON TABLE license_policy IS '命名空间许可证策略：允许集合 + 是否拒绝 UNKNOWN，乐观版本控制';
+COMMENT ON COLUMN license_policy.namespace IS '命名空间（锁定根制品名称），策略只作用于以该名称为根的新锁定';
+COMMENT ON COLUMN license_policy.version IS '策略版本号，创建为 1，每次修改加一；修改须携带期望版本，冲突 409';
+COMMENT ON COLUMN license_policy.reject_unknown IS '是否拒绝未登记许可证的版本：0=允许 UNKNOWN，1=拒绝';
+COMMENT ON COLUMN license_policy.updated_at IS '最近一次策略修改时间，UTC 时间戳';
+
+CREATE TABLE IF NOT EXISTS license_policy_allowed (
+    namespace VARCHAR(128) NOT NULL,
+    license   VARCHAR(64)  NOT NULL,
+    CONSTRAINT fk_allowed_policy FOREIGN KEY (namespace) REFERENCES license_policy (namespace)
+);
+COMMENT ON TABLE license_policy_allowed IS '策略允许的许可证标识集合，空集合表示不允许任何已登记许可证';
+COMMENT ON COLUMN license_policy_allowed.namespace IS '所属策略命名空间';
+COMMENT ON COLUMN license_policy_allowed.license IS '允许的许可证标识';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_allowed_namespace_license ON license_policy_allowed (namespace, license);
+
 CREATE TABLE IF NOT EXISTS lock_file (
     id                 BIGINT AUTO_INCREMENT PRIMARY KEY,
     root_name          VARCHAR(128) NOT NULL,
     root_version       INT          NOT NULL,
     repository_version BIGINT       NOT NULL,
+    policy_version     BIGINT       NULL,
     request_id         VARCHAR(64)  NOT NULL,
     created_at         TIMESTAMP(6) NOT NULL
 );
@@ -51,6 +86,7 @@ COMMENT ON TABLE lock_file IS '锁定文件：一次成功锁定的根、精确�
 COMMENT ON COLUMN lock_file.root_name IS '根制品名称（精确版本，锁定时固定）';
 COMMENT ON COLUMN lock_file.root_version IS '根制品版本号，正整数';
 COMMENT ON COLUMN lock_file.repository_version IS '锁定时读取的仓库版本号';
+COMMENT ON COLUMN lock_file.policy_version IS '锁定时生效的策略版本号；NULL 表示该命名空间未配置策略，固化后不改写';
 COMMENT ON COLUMN lock_file.request_id IS '触发锁定的全局唯一请求 ID';
 COMMENT ON COLUMN lock_file.created_at IS '锁定生成时间，UTC 时间戳';
 
@@ -62,12 +98,14 @@ CREATE TABLE IF NOT EXISTS lock_file_entry (
     lock_file_id BIGINT       NOT NULL,
     name         VARCHAR(128) NOT NULL,
     version      INT          NOT NULL,
+    license      VARCHAR(64)  NOT NULL,
     CONSTRAINT fk_entry_lock FOREIGN KEY (lock_file_id) REFERENCES lock_file (id)
 );
 COMMENT ON TABLE lock_file_entry IS '锁文件中的精确制品版本，每个名称仅一个版本';
 COMMENT ON COLUMN lock_file_entry.lock_file_id IS '所属锁文件 ID';
 COMMENT ON COLUMN lock_file_entry.name IS '被锁定制品名称';
 COMMENT ON COLUMN lock_file_entry.version IS '被锁定的精确版本号，正整数';
+COMMENT ON COLUMN lock_file_entry.license IS '锁定时固化的许可证标识，UNKNOWN 表示未登记；后续许可证修订不改写该历史字段';
 
 CREATE UNIQUE INDEX IF NOT EXISTS uk_entry_lock_name ON lock_file_entry (lock_file_id, name);
 
@@ -81,7 +119,7 @@ CREATE TABLE IF NOT EXISTS idempotent_request (
 );
 COMMENT ON TABLE idempotent_request IS '写操作幂等记录，仅保存成功请求；失败不占键';
 COMMENT ON COLUMN idempotent_request.request_id IS '客户端提供的全局唯一请求 ID';
-COMMENT ON COLUMN idempotent_request.operation IS '操作类型：REGISTER_ARTIFACT/WITHDRAW_ARTIFACT/CREATE_LOCK';
+COMMENT ON COLUMN idempotent_request.operation IS '操作类型：REGISTER_ARTIFACT/WITHDRAW_ARTIFACT/CREATE_LOCK/SET_LICENSE/UPSERT_POLICY';
 COMMENT ON COLUMN idempotent_request.request_hash IS '规范化请求参数的 SHA-256 摘要，异参重放用于冲突判定';
 COMMENT ON COLUMN idempotent_request.http_status IS '原成功响应 HTTP 状态码';
 COMMENT ON COLUMN idempotent_request.response_json IS '原成功响应 JSON，重放时原样返回';
