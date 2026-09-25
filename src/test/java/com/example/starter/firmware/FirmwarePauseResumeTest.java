@@ -30,6 +30,9 @@ class FirmwarePauseResumeTest {
 
     @BeforeEach
     void cleanUp() {
+        jdbc.update("DELETE FROM rejected_receipt");
+        jdbc.update("DELETE FROM task_cancel_reason");
+        jdbc.update("DELETE FROM device_quarantine_record");
         jdbc.update("DELETE FROM rollout_task");
         jdbc.update("DELETE FROM release_pause_record");
         jdbc.update("DELETE FROM release_resume_record");

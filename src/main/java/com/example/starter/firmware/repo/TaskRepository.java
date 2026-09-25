@@ -15,6 +15,7 @@ import java.util.Optional;
 
 /**
  * 投放任务数据访问。同设备同发布单由唯一约束 uk_task_release_device 保证最多一条。
+ * 进行中任务 = PENDING（未开始）+ STARTED（已开始刷写）。
  */
 @Repository
 public class TaskRepository {
@@ -62,14 +63,55 @@ public class TaskRepository {
                 MAPPER, releaseId, deviceId).stream().findFirst();
     }
 
+    /**
+     * 设备全部进行中任务（PENDING + STARTED），按任务ID升序加行锁；隔离回查在设备行锁之后调用。
+     */
+    public List<RolloutTask> findInProgressByDeviceForUpdate(String deviceId) {
+        return jdbc.query("SELECT " + COLUMNS + " FROM rollout_task"
+                        + " WHERE device_id = ? AND status IN ('PENDING', 'STARTED') ORDER BY id FOR UPDATE",
+                MAPPER, deviceId);
+    }
+
+    public long countInProgressByDevice(String deviceId) {
+        Long count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM rollout_task WHERE device_id = ? AND status IN ('PENDING', 'STARTED')",
+                Long.class, deviceId);
+        return count == null ? 0 : count;
+    }
+
     public void complete(long id, ReceiptResult result) {
         jdbc.update("UPDATE rollout_task SET status = ?, first_result = ?, updated_at = CURRENT_TIMESTAMP"
                 + " WHERE id = ?", result.name(), result.name(), id);
     }
 
+    /**
+     * 设备上报开始：仅 PENDING 可转 STARTED，返回影响行数。
+     */
+    public int markStarted(long id) {
+        return jdbc.update("UPDATE rollout_task SET status = 'STARTED', updated_at = CURRENT_TIMESTAMP"
+                + " WHERE id = ? AND status = 'PENDING'", id);
+    }
+
+    /**
+     * 单任务取消：仅未终结（PENDING/STARTED）任务可转 CANCELLED，返回影响行数。
+     */
+    public int cancelTask(long id) {
+        return jdbc.update("UPDATE rollout_task SET status = 'CANCELLED', updated_at = CURRENT_TIMESTAMP"
+                + " WHERE id = ? AND status IN ('PENDING', 'STARTED')", id);
+    }
+
     public int cancelPendingByRelease(long releaseId) {
         return jdbc.update("UPDATE rollout_task SET status = 'CANCELLED', updated_at = CURRENT_TIMESTAMP"
                 + " WHERE release_id = ? AND status = 'PENDING'", releaseId);
+    }
+
+    /**
+     * 发布单全部未终结任务（PENDING + STARTED），按任务ID升序加行锁；发布单取消时回查并逐条落取消原因。
+     */
+    public List<RolloutTask> findUnfinishedByReleaseForUpdate(long releaseId) {
+        return jdbc.query("SELECT " + COLUMNS + " FROM rollout_task"
+                        + " WHERE release_id = ? AND status IN ('PENDING', 'STARTED') ORDER BY id FOR UPDATE",
+                MAPPER, releaseId);
     }
 
     public List<RolloutTask> findByRelease(long releaseId, TaskStatus statusFilter) {

@@ -33,6 +33,15 @@ public class ReleaseController {
         return releaseService.create(request);
     }
 
+    @GetMapping("/precheck")
+    public PrecheckView precheck(@RequestParam String model, @RequestParam String fromVersion,
+                                 @RequestParam int ratio) {
+        if (ratio < 0 || ratio > 100) {
+            throw ApiException.badRequest("INVALID_RATIO", "投放比例取值0~100: " + ratio);
+        }
+        return releaseService.precheck(model, fromVersion, ratio);
+    }
+
     @PostMapping("/{releaseId}/expand")
     public ReleaseView expand(@PathVariable long releaseId, @Valid @RequestBody ExpandReleaseRequest request) {
         return releaseService.expand(releaseId, request);
