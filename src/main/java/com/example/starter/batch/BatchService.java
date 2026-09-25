@@ -4,6 +4,7 @@ import com.example.starter.batch.dto.ApprovalResponse;
 import com.example.starter.batch.dto.ApproveRequest;
 import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
+import com.example.starter.batch.dto.BatchYieldResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
 import com.example.starter.batch.dto.LineageEntryResponse;
 import com.example.starter.batch.dto.RecallRequest;
@@ -11,7 +12,11 @@ import com.example.starter.batch.dto.RecallResponse;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SplitResponse;
 import com.example.starter.batch.dto.SubmitTestRequest;
+import com.example.starter.batch.dto.SubmitYieldRequest;
+import com.example.starter.batch.dto.SubmitYieldResponse;
 import com.example.starter.batch.dto.TestResultResponse;
+import com.example.starter.batch.dto.YieldAllocationResponse;
+import com.example.starter.batch.dto.YieldEntryResponse;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
@@ -19,6 +24,8 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -26,6 +33,7 @@ import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -33,6 +41,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.function.Supplier;
 
 /**
@@ -50,6 +59,7 @@ public class BatchService {
     private static final String CMD_APPROVE = "APPROVE";
     private static final String CMD_RECALL = "RECALL";
     private static final String CMD_SPLIT = "SPLIT";
+    private static final String CMD_YIELD = "SUBMIT_YIELD";
 
     /**
      * 指纹拼接分隔符（NUL）：业务参数不可能包含该字符，避免拼接碰撞。
@@ -574,5 +584,295 @@ public class BatchService {
         return new LineageEntryResponse(row.batchKey(), row.batchNo(),
                 BatchStatus.valueOf(row.status()),
                 recalledAncestor(batchKey, parentOf, recalled).orElse(null));
+    }
+
+    /**
+     * 登记或修订批次产率：一个请求可含多批次条目，先校验全部条目应用后的最终分配，
+     * 再在单事务写入，任一失败整单回滚。仅 RELEASED 或 SPLIT 的完成批次可登记；
+     * 拆分/合批子批须直接父批已登记产出量，且同一父批下子批投入量之和不超过父批产出量；
+     * 召回批次及其血缘闭包内批次返回 409。yieldKey 幂等：指纹含操作者、expectedVersion、
+     * 规范化批次集合和全部数值，同键成功重放首次快照，失败不占键。
+     */
+    public StoredResponse submitYield(String actorId, SubmitYieldRequest req) {
+        if (actorId == null || actorId.isBlank()) {
+            throw ApiException.badRequest("X-Actor-Id 不能为空");
+        }
+        String operator = actorId.trim();
+        List<SubmitYieldRequest.YieldEntry> entries = req.entries();
+        List<String> entryKeys = entries.stream().map(SubmitYieldRequest.YieldEntry::batchKey).toList();
+        if (new HashSet<>(entryKeys).size() != entryKeys.size()) {
+            throw ApiException.conflict("entries 内 batchKey 重复");
+        }
+        List<String> parts = new ArrayList<>();
+        parts.add("yield");
+        parts.add(operator);
+        entries.stream()
+                .sorted(Comparator.comparing(SubmitYieldRequest.YieldEntry::batchKey))
+                .forEach(e -> {
+                    parts.add(e.batchKey());
+                    parts.add(e.expectedVersion() == null ? "null" : e.expectedVersion().toString());
+                    parts.add(normalizeQuantity(e.inputQuantity()));
+                    parts.add(normalizeQuantity(e.outputQuantity()));
+                });
+        String fingerprint = fingerprint(parts.toArray(new String[0]));
+        return executeIdempotent(CMD_YIELD, req.yieldKey(), fingerprint, () -> {
+            // 直接父批关系（血缘只增不改，可在加锁前读取）
+            Map<String, String> parentOfEntry = new HashMap<>();
+            for (String key : entryKeys) {
+                repo.findParentKey(key).ifPresent(p -> parentOfEntry.put(key, p));
+            }
+            // 按业务键排序逐行锁定全部条目批次及其直接父批：与召回/拆分/并发产率命令互斥，
+            // 按事务提交顺序裁决
+            Set<String> lockKeys = new TreeSet<>(entryKeys);
+            lockKeys.addAll(parentOfEntry.values());
+            Map<String, BatchRepository.BatchRow> batches = new HashMap<>();
+            for (String key : lockKeys) {
+                repo.findBatchForUpdate(key)
+                        .ifPresent(row -> batches.put(key, row));
+            }
+            // 行锁后重查命令快照：并发同键请求在锁等待期间可能已由对方提交
+            var logged = loggedResponse(CMD_YIELD, req.yieldKey(), fingerprint);
+            if (logged.isPresent()) {
+                return logged.get();
+            }
+            for (String key : entryKeys) {
+                if (!batches.containsKey(key)) {
+                    throw ApiException.notFound("批次不存在: " + key);
+                }
+            }
+
+            // 逐条目校验：召回门禁 → 完成状态 → 版本语义
+            Map<String, BatchRepository.YieldRow> existingYields = new HashMap<>();
+            for (SubmitYieldRequest.YieldEntry entry : entries) {
+                String key = entry.batchKey();
+                BatchRepository.BatchRow batch = batches.get(key);
+                assertYieldNotRecallBlocked(key, batch);
+                if (!BatchStatus.RELEASED.name().equals(batch.status())
+                        && !BatchStatus.SPLIT.name().equals(batch.status())) {
+                    throw ApiException.conflict("批次状态 " + batch.status()
+                            + " 不允许登记产率，仅 RELEASED 或 SPLIT 的完成批次可登记");
+                }
+                Optional<BatchRepository.YieldRow> existing = repo.findYield(key);
+                existing.ifPresent(y -> existingYields.put(key, y));
+                if (entry.expectedVersion() == null) {
+                    if (existing.isPresent()) {
+                        throw ApiException.conflict(
+                                "批次已存在产率记录，修订须携带 expectedVersion: " + key);
+                    }
+                } else {
+                    if (existing.isEmpty()) {
+                        throw ApiException.conflict("批次尚无产率记录，无法修订: " + key);
+                    }
+                    int current = existing.get().version();
+                    if (current != entry.expectedVersion()) {
+                        throw ApiException.conflict("expectedVersion 与当前版本不一致: 期望 "
+                                + entry.expectedVersion() + "，当前 " + current);
+                    }
+                }
+            }
+
+            // 父子守恒：按全部条目应用后的最终状态校验
+            assertYieldConservation(entries, parentOfEntry, existingYields);
+
+            String now = now();
+            List<YieldEntryResponse> bodies = new ArrayList<>(entries.size());
+            for (SubmitYieldRequest.YieldEntry entry : entries) {
+                String key = entry.batchKey();
+                BatchRepository.YieldRow existing = existingYields.get(key);
+                int version = existing == null ? 1 : existing.version() + 1;
+                BatchRepository.YieldRow row = new BatchRepository.YieldRow(0L, key,
+                        entry.inputQuantity(), entry.outputQuantity(), version, operator, now, now);
+                if (existing == null) {
+                    repo.insertYield(row);
+                } else {
+                    repo.updateYield(row);
+                }
+                bodies.add(toYieldResponse(row));
+            }
+            SubmitYieldResponse body = new SubmitYieldResponse(req.yieldKey(), bodies,
+                    Instant.parse(now));
+            return new StoredResponse(201, toJson(body));
+        });
+    }
+
+    /**
+     * 查询批次产率：含批次状态、产率记录（未登记为 null）与召回阻断原因（无阻断为 null）。
+     */
+    public BatchYieldResponse yieldOf(String batchKey) {
+        BatchRepository.BatchRow batch = repo.findBatch(batchKey)
+                .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+        YieldEntryResponse yield = repo.findYield(batchKey)
+                .map(this::toYieldResponse)
+                .orElse(null);
+        return new BatchYieldResponse(batchKey, BatchStatus.valueOf(batch.status()), yield,
+                recallBlockOf(batch));
+    }
+
+    /**
+     * 查询父子分配汇总：本批作为父批的产出/已分配/剩余，以及作为子批的直接父批汇总。
+     */
+    public YieldAllocationResponse yieldAllocation(String batchKey) {
+        repo.findBatch(batchKey)
+                .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+        BigDecimal output = repo.findYield(batchKey)
+                .map(BatchRepository.YieldRow::outputQuantity)
+                .orElse(null);
+        Map<String, BigDecimal> childInputs = new HashMap<>();
+        for (BatchRepository.YieldRow row : repo.findChildYields(batchKey)) {
+            childInputs.put(row.batchKey(), row.inputQuantity());
+        }
+        BigDecimal allocated = BigDecimal.ZERO;
+        List<YieldAllocationResponse.ChildAllocation> children = new ArrayList<>();
+        for (String childKey : repo.findDirectChildKeys(batchKey)) {
+            BigDecimal input = childInputs.get(childKey);
+            if (input != null) {
+                allocated = allocated.add(input);
+            }
+            children.add(new YieldAllocationResponse.ChildAllocation(childKey, input));
+        }
+        BigDecimal remaining = output == null ? null : output.subtract(allocated);
+
+        YieldAllocationResponse.ParentAllocation parent = null;
+        Optional<String> parentKey = repo.findParentKey(batchKey);
+        if (parentKey.isPresent()) {
+            String pk = parentKey.get();
+            BigDecimal parentOutput = repo.findYield(pk)
+                    .map(BatchRepository.YieldRow::outputQuantity)
+                    .orElse(null);
+            BigDecimal parentAllocated = BigDecimal.ZERO;
+            for (BatchRepository.YieldRow row : repo.findChildYields(pk)) {
+                parentAllocated = parentAllocated.add(row.inputQuantity());
+            }
+            BigDecimal parentRemaining = parentOutput == null ? null
+                    : parentOutput.subtract(parentAllocated);
+            parent = new YieldAllocationResponse.ParentAllocation(pk, parentOutput,
+                    parentAllocated, parentRemaining);
+        }
+        return new YieldAllocationResponse(batchKey, output, allocated, remaining, parent, children);
+    }
+
+    /**
+     * 父子守恒校验（最终分配状态）：条目批次有直接父批时父批必须已登记产出量；
+     * 同一父批下全部子批最终投入量之和不得超过父批最终产出量；
+     * 修订父批产出量低于已有子批分配总量同样拒绝。任一违反抛 422，整单不生效。
+     */
+    private void assertYieldConservation(List<SubmitYieldRequest.YieldEntry> entries,
+                                         Map<String, String> parentOfEntry,
+                                         Map<String, BatchRepository.YieldRow> existingYields) {
+        Map<String, SubmitYieldRequest.YieldEntry> entryByKey = new HashMap<>();
+        for (SubmitYieldRequest.YieldEntry entry : entries) {
+            entryByKey.put(entry.batchKey(), entry);
+        }
+        // 受影响的父批：条目的直接父批（子批驱动）与条目批次自身（父批产出量驱动）
+        Set<String> conservationParents = new TreeSet<>(parentOfEntry.values());
+        conservationParents.addAll(entryByKey.keySet());
+
+        Map<String, BigDecimal> finalOutput = new HashMap<>();
+        for (String parentKey : conservationParents) {
+            SubmitYieldRequest.YieldEntry entry = entryByKey.get(parentKey);
+            if (entry != null) {
+                finalOutput.put(parentKey, entry.outputQuantity());
+            } else {
+                repo.findYield(parentKey).ifPresentOrElse(
+                        y -> finalOutput.put(parentKey, y.outputQuantity()),
+                        () -> finalOutput.put(parentKey, null));
+            }
+        }
+        // 子批驱动：直接父批必须已登记产出量（含同请求内登记的最终状态）
+        for (Map.Entry<String, String> e : parentOfEntry.entrySet()) {
+            if (finalOutput.get(e.getValue()) == null) {
+                throw ApiException.unprocessable(
+                        "直接父批次 " + e.getValue() + " 未登记产出量，禁止登记或修订子批产率: "
+                                + e.getKey());
+            }
+        }
+        // 每个受影响父批：子批最终投入量之和 ≤ 父批最终产出量
+        for (String parentKey : conservationParents) {
+            BigDecimal output = finalOutput.get(parentKey);
+            if (output == null) {
+                continue;
+            }
+            Map<String, BigDecimal> finalInputs = new HashMap<>();
+            for (BatchRepository.YieldRow row : repo.findChildYields(parentKey)) {
+                finalInputs.put(row.batchKey(), row.inputQuantity());
+            }
+            for (Map.Entry<String, String> e : parentOfEntry.entrySet()) {
+                if (e.getValue().equals(parentKey)) {
+                    finalInputs.put(e.getKey(), entryByKey.get(e.getKey()).inputQuantity());
+                }
+            }
+            BigDecimal allocated = BigDecimal.ZERO;
+            for (BigDecimal input : finalInputs.values()) {
+                allocated = allocated.add(input);
+            }
+            if (allocated.compareTo(output) > 0) {
+                SubmitYieldRequest.YieldEntry parentEntry = entryByKey.get(parentKey);
+                if (parentEntry != null) {
+                    throw ApiException.unprocessable("父批次 " + parentKey + " 拟登记产出量 "
+                            + output.toPlainString() + " 低于已有子批次分配总量 "
+                            + allocated.toPlainString());
+                }
+                String childKey = parentOfEntry.entrySet().stream()
+                        .filter(e -> e.getValue().equals(parentKey))
+                        .map(Map.Entry::getKey)
+                        .findFirst().orElseThrow();
+                BigDecimal proposed = entryByKey.get(childKey).inputQuantity();
+                BigDecimal others = allocated.subtract(proposed);
+                throw ApiException.unprocessable("父批次 " + parentKey + " 产出量 "
+                        + output.toPlainString() + " 不足：已分配 " + others.toPlainString()
+                        + "，拟分配 " + proposed.toPlainString());
+            }
+        }
+    }
+
+    /**
+     * 产率召回门禁：批次自身已召回或其血缘闭包内祖先已召回时抛 409；已登记记录不删除。
+     */
+    private void assertYieldNotRecallBlocked(String batchKey, BatchRepository.BatchRow batch) {
+        if (BatchStatus.RECALLED.name().equals(batch.status())) {
+            throw ApiException.conflict("批次已召回，禁止新增或修订产率: " + batchKey);
+        }
+        Optional<String> recalled = recalledAncestor(batchKey, childToParent(),
+                new HashSet<>(repo.findRecalledKeys()));
+        if (recalled.isPresent()) {
+            throw ApiException.conflict(
+                    "祖先批次 " + recalled.get() + " 已召回，禁止新增或修订产率");
+        }
+    }
+
+    /**
+     * 召回阻断原因：批次自身被直接召回（direct=true）或血缘闭包内祖先被召回（direct=false）；
+     * 无阻断返回 null。
+     */
+    private BatchYieldResponse.RecallBlock recallBlockOf(BatchRepository.BatchRow batch) {
+        if (BatchStatus.RECALLED.name().equals(batch.status())) {
+            String reason = repo.findRecall(batch.batchKey())
+                    .map(BatchRepository.RecallRow::reason).orElse(null);
+            return new BatchYieldResponse.RecallBlock(batch.batchKey(), reason, true);
+        }
+        Optional<String> recalled = recalledAncestor(batch.batchKey(), childToParent(),
+                new HashSet<>(repo.findRecalledKeys()));
+        if (recalled.isPresent()) {
+            String reason = repo.findRecall(recalled.get())
+                    .map(BatchRepository.RecallRow::reason).orElse(null);
+            return new BatchYieldResponse.RecallBlock(recalled.get(), reason, false);
+        }
+        return null;
+    }
+
+    /**
+     * 产率记录视图：原始投入/产出数值保留，产率按产出/投入四位小数（HALF_UP）展示。
+     */
+    private YieldEntryResponse toYieldResponse(BatchRepository.YieldRow row) {
+        BigDecimal rate = row.outputQuantity().divide(row.inputQuantity(), 4, RoundingMode.HALF_UP);
+        return new YieldEntryResponse(row.batchKey(), row.inputQuantity(), row.outputQuantity(),
+                rate, row.version(), row.operatorId(), Instant.parse(row.updatedAt()));
+    }
+
+    /**
+     * 数量规范化：去除尾部零的纯十进制表示，用于幂等指纹，避免 1.5 与 1.50 产生不同指纹。
+     */
+    private String normalizeQuantity(BigDecimal value) {
+        return value.stripTrailingZeros().toPlainString();
     }
 }

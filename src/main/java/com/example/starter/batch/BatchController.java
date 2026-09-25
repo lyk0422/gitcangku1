@@ -3,11 +3,14 @@ package com.example.starter.batch;
 import com.example.starter.batch.dto.ApproveRequest;
 import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
+import com.example.starter.batch.dto.BatchYieldResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
 import com.example.starter.batch.dto.LineageEntryResponse;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
+import com.example.starter.batch.dto.SubmitYieldRequest;
+import com.example.starter.batch.dto.YieldAllocationResponse;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
@@ -112,6 +115,33 @@ public class BatchController {
     @GetMapping("/{batchKey}/descendants")
     public List<LineageEntryResponse> descendants(@PathVariable String batchKey) {
         return service.listDescendants(batchKey);
+    }
+
+    /**
+     * 登记或修订批次产率：一个请求可含多批次条目，先校验最终分配再单事务写入，
+     * 任一失败整单回滚；X-Actor-Id 为操作人，yieldKey 为幂等键。
+     */
+    @PostMapping("/yields")
+    public ResponseEntity<String> submitYields(
+            @RequestHeader(name = "X-Actor-Id", required = false) String actorId,
+            @Valid @RequestBody SubmitYieldRequest request) {
+        return stored(service.submitYield(actorId, request));
+    }
+
+    /**
+     * 查询批次产率：产率记录（未登记为 null）与召回阻断原因（无阻断为 null）。
+     */
+    @GetMapping("/{batchKey}/yield")
+    public BatchYieldResponse yield(@PathVariable String batchKey) {
+        return service.yieldOf(batchKey);
+    }
+
+    /**
+     * 查询父子分配汇总：本批产出/子批已分配/剩余，以及直接父批的同一组汇总。
+     */
+    @GetMapping("/{batchKey}/yield/allocation")
+    public YieldAllocationResponse yieldAllocation(@PathVariable String batchKey) {
+        return service.yieldAllocation(batchKey);
     }
 
     private ResponseEntity<String> stored(StoredResponse response) {

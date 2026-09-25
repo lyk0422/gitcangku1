@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS recall (
 );
 
 CREATE TABLE IF NOT EXISTS command_log (
-    command_type VARCHAR(32) NOT NULL COMMENT '命令类型：CREATE_BATCH/SUBMIT_TEST/APPROVE/RECALL/SPLIT',
+    command_type VARCHAR(32) NOT NULL COMMENT '命令类型：CREATE_BATCH/SUBMIT_TEST/APPROVE/RECALL/SPLIT/SUBMIT_YIELD',
     command_key VARCHAR(64) NOT NULL COMMENT '命令幂等键；同类型同键同参重放返回首次结果，同键改参返回 409',
     fingerprint VARCHAR(64) NOT NULL COMMENT '业务参数（不含 commandKey）的 SHA-256 摘要，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行成功的 HTTP 状态码',
@@ -65,4 +65,18 @@ CREATE TABLE IF NOT EXISTS batch_lineage (
     seq INT NOT NULL COMMENT '子批在拆分请求中的顺序，从 1 开始',
     created_at VARCHAR(40) NOT NULL COMMENT '拆分时间，ISO-8601 UTC instant 字符串',
     CONSTRAINT uk_lineage_child UNIQUE (child_key)
+);
+
+-- 批次产率核算：同一批次仅一份产率记录，修订携带 expectedVersion 乐观递增；
+-- 原始投入/产出数值保留，展示用产率（产出/投入，四位小数）由查询时计算不落库。
+CREATE TABLE IF NOT EXISTS batch_yield (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    batch_key VARCHAR(64) NOT NULL COMMENT '批次业务键，同一批次仅一份产率记录',
+    input_quantity DECIMAL(16,3) NOT NULL COMMENT '实际投入量，>0，最多三位小数；原始数值保留',
+    output_quantity DECIMAL(16,3) NOT NULL COMMENT '合格产出量，>0，最多三位小数；原始数值保留',
+    version INT NOT NULL COMMENT '记录版本，登记时为 1，每次修订 +1；修订须携带 expectedVersion 与当前版本一致',
+    operator_id VARCHAR(64) NOT NULL COMMENT '最近一次登记或修订的操作人标识（X-Actor-Id）',
+    created_at VARCHAR(40) NOT NULL COMMENT '登记时间，ISO-8601 UTC instant 字符串',
+    updated_at VARCHAR(40) NOT NULL COMMENT '最近一次登记/修订时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_yield_batch UNIQUE (batch_key)
 );
