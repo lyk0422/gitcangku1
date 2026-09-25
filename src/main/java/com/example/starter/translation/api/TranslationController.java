@@ -136,6 +136,49 @@ public class TranslationController {
                 .body(translationService.getRelease(documentId, publishedVersion));
     }
 
+    /** 回退配置全量替换：携带期望草稿版本，整表校验无环后原子替换，草稿版本加一。 */
+    @PutMapping("/{documentId}/fallbacks")
+    public ResponseEntity<String> updateFallbacks(@PathVariable long documentId,
+                                                  @Valid @RequestBody ApiDtos.UpdateFallbacksRequest request) {
+        String operation = "PUT /api/documents/" + documentId + "/fallbacks";
+        return writeExecutor.execute(request.requestId(), hash(operation, request),
+                () -> WriteResult.of(200, translationService.updateFallbacks(documentId, request)))
+                .toResponseEntity();
+    }
+
+    /** 查询文档当前全部回退配置。 */
+    @GetMapping("/{documentId}/fallbacks")
+    public ResponseEntity<ApiDtos.FallbackConfigView> getFallbacks(@PathVariable long documentId) {
+        return ResponseEntity.ok(translationService.getFallbacks(documentId));
+    }
+
+    /** 查询指定目标语种的回退链（逐级解析的有序语种链）。 */
+    @GetMapping("/{documentId}/fallbacks/{language}")
+    public ResponseEntity<ApiDtos.FallbackChainView> getFallbackChain(@PathVariable long documentId,
+                                                                      @PathVariable String language) {
+        return ResponseEntity.ok(translationService.getFallbackChain(documentId, language));
+    }
+
+    /** 缺失段诊断查询：按当前状态预估发布将失败的全部段落语种组合及已尝试语种。 */
+    @GetMapping("/{documentId}/publish/missing")
+    public ResponseEntity<ApiDtos.MissingDiagnosticsResponse> getMissingDiagnostics(
+            @PathVariable long documentId) {
+        return ResponseEntity.ok(translationService.getMissingDiagnostics(documentId));
+    }
+
+    /** 译文撤回：删除译文及其批准，只影响后续发布解析，不改写已发布快照。 */
+    @PostMapping("/{documentId}/segments/{segmentId}/translations/{language}/withdraw")
+    public ResponseEntity<String> withdrawTranslation(@PathVariable long documentId,
+                                                      @PathVariable String segmentId,
+                                                      @PathVariable String language,
+                                                      @Valid @RequestBody ApiDtos.WithdrawTranslationRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/segments/" + segmentId
+                + "/translations/" + language + "/withdraw";
+        return writeExecutor.execute(request.requestId(), hash(operation, request),
+                () -> WriteResult.of(200, translationService.withdrawTranslation(
+                        documentId, segmentId, language, request))).toResponseEntity();
+    }
+
     /** 计算请求摘要：操作（含路径变量）+ 操作者 + 规范化请求体的 SHA-256。 */
     private String hash(String operation, Object... parts) {
         try {

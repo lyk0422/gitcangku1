@@ -41,6 +41,7 @@ public abstract class AbstractIntegrationTest {
         jdbc.update("DELETE FROM release_snapshot");
         jdbc.update("DELETE FROM term_rule");
         jdbc.update("DELETE FROM term_version");
+        jdbc.update("DELETE FROM fallback_config");
         jdbc.update("DELETE FROM request_log");
         jdbc.update("DELETE FROM document");
     }
@@ -128,6 +129,22 @@ public abstract class AbstractIntegrationTest {
         String body = "{\"requestId\":\"" + requestId + "\",\"expectedTermVersion\":" + expectedTermVersion
                 + ",\"rules\":" + rulesJson + "}";
         return putJson("/api/documents/" + documentId + "/terms", body);
+    }
+
+    /** 全量替换回退配置：fallbacksJson 为配置数组 JSON。 */
+    protected ApiResult updateFallbacks(long documentId, int expectedVersion, String fallbacksJson,
+                                        String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"expectedVersion\":" + expectedVersion
+                + ",\"fallbacks\":" + fallbacksJson + "}";
+        return putJson("/api/documents/" + documentId + "/fallbacks", body);
+    }
+
+    /** 撤回指定段落与语言的译文。 */
+    protected ApiResult withdraw(long documentId, String segmentId, String language, String requestId)
+            throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\"}";
+        return postJson("/api/documents/" + documentId + "/segments/" + segmentId + "/translations/" + language
+                + "/withdraw", body);
     }
 
     /** HTTP 响应结果：状态码与 JSON 响应体。 */

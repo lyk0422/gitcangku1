@@ -12,17 +12,24 @@ public class ApiException extends RuntimeException {
     private final HttpStatus status;
     private final String code;
     private final List<ApiDtos.TermRuleView> violations;
+    private final List<ApiDtos.MissingSegmentView> missing;
 
     public ApiException(HttpStatus status, String code, String message) {
-        this(status, code, message, null);
+        this(status, code, message, null, null);
     }
 
     public ApiException(HttpStatus status, String code, String message,
                         List<ApiDtos.TermRuleView> violations) {
+        this(status, code, message, violations, null);
+    }
+
+    public ApiException(HttpStatus status, String code, String message,
+                        List<ApiDtos.TermRuleView> violations, List<ApiDtos.MissingSegmentView> missing) {
         super(message);
         this.status = status;
         this.code = code;
         this.violations = violations;
+        this.missing = missing;
     }
 
     public HttpStatus status() {
@@ -36,6 +43,11 @@ public class ApiException extends RuntimeException {
     /** 术语违规明细，仅术语违规 422 时非空。 */
     public List<ApiDtos.TermRuleView> violations() {
         return violations;
+    }
+
+    /** 缺失段诊断明细，仅发布缺译 422 时非空。 */
+    public List<ApiDtos.MissingSegmentView> missing() {
+        return missing;
     }
 
     /** 404：资源不存在。 */
@@ -56,5 +68,10 @@ public class ApiException extends RuntimeException {
     /** 422：译文违反术语规则，返回全部违规术语。 */
     public static ApiException termViolation(String message, List<ApiDtos.TermRuleView> violations) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "TERM_VIOLATION", message, violations);
+    }
+
+    /** 422：发布时回退链全部缺失，返回稳定排序的缺失段与已尝试语种。 */
+    public static ApiException missingSegments(String message, List<ApiDtos.MissingSegmentView> missing) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "MISSING_TRANSLATION", message, null, missing);
     }
 }

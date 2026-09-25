@@ -72,6 +72,15 @@ public final class Rows {
     }
 
     /**
+     * 回退语种配置：每个目标语种至多一个回退语种，按文档全量替换，链上不得成环。
+     *
+     * @param language         目标语言码，小写，文档内唯一
+     * @param fallbackLanguage 回退目标语言码，小写，须已登记为文档目标语言
+     */
+    public record FallbackRow(String language, String fallbackLanguage) {
+    }
+
+    /**
      * 写操作幂等去重记录：全局唯一 requestId，仅记录成功结果，与业务变更原子提交。
      *
      * @param requestId      全局唯一请求 ID

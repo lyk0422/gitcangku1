@@ -125,11 +125,67 @@ public final class ApiDtos {
     public record TermStatusResponse(long documentId, int termVersion, List<TranslationTermStatus> translations) {
     }
 
+    /** 回退配置输入：一个目标语种及其唯一回退语种。 */
+    public record FallbackInput(
+            @NotBlank(message = "language 不能为空") String language,
+            @NotBlank(message = "fallbackLanguage 不能为空") String fallbackLanguage) {
+    }
+
+    /**
+     * 回退配置全量替换请求：携带期望的文档草稿版本做乐观校验；
+     * fallbacks 为完整新配置（空列表表示清空），任一不合法整次回滚。
+     */
+    public record UpdateFallbacksRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @Positive(message = "expectedVersion 必须为正数") int expectedVersion,
+            @NotNull(message = "fallbacks 不能为空") @Size(max = 5, message = "回退配置最多 5 条")
+            List<@Valid FallbackInput> fallbacks) {
+    }
+
+    /** 回退配置条目视图。 */
+    public record FallbackEntry(String language, String fallbackLanguage) {
+    }
+
+    /** 回退配置写操作响应。 */
+    public record FallbackConfigResponse(long documentId, int draftVersion, List<FallbackEntry> fallbacks) {
+    }
+
+    /** 回退配置查询视图：文档当前全部回退配置，按语言排序。 */
+    public record FallbackConfigView(long documentId, List<FallbackEntry> fallbacks) {
+    }
+
+    /** 目标语种回退链视图：从该语种出发逐级解析的有序语种链（含自身，不含未配置回退的结尾空位）。 */
+    public record FallbackChainView(long documentId, String language, List<String> chain) {
+    }
+
+    /** 缺失段诊断：发布时整条回退链均无已批准译文的段落与目标语种，及已尝试语种。 */
+    public record MissingSegmentView(String segmentId, String language, List<String> attemptedLanguages) {
+    }
+
+    /** 缺失段诊断查询响应：按当前状态预估发布将失败的全部段落，按 segmentId、语言稳定排序。 */
+    public record MissingDiagnosticsResponse(long documentId, int draftVersion,
+                                             List<MissingSegmentView> missing) {
+    }
+
+    /** 译文撤回请求。 */
+    public record WithdrawTranslationRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId) {
+    }
+
+    /** 译文撤回响应。 */
+    public record WithdrawResponse(long documentId, String segmentId, String language, int draftVersion) {
+    }
+
     /** 统一错误响应；violations 仅在术语违规 422 时返回，含全部违规术语。 */
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    public record ErrorResponse(String error, String message, List<TermRuleView> violations) {
+    public record ErrorResponse(String error, String message, List<TermRuleView> violations,
+                                List<MissingSegmentView> missing) {
         public ErrorResponse(String error, String message) {
-            this(error, message, null);
+            this(error, message, null, null);
+        }
+
+        public ErrorResponse(String error, String message, List<TermRuleView> violations) {
+            this(error, message, violations, null);
         }
     }
 }

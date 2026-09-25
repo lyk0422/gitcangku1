@@ -2,6 +2,7 @@ package com.example.starter.translation.repo;
 
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
+import com.example.starter.translation.domain.Rows.FallbackRow;
 import com.example.starter.translation.domain.Rows.RequestLogRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
@@ -45,6 +46,9 @@ public class TranslationRepository {
 
     private static final RowMapper<TermRuleRow> TERM_RULE_MAPPER = (rs, n) -> new TermRuleRow(
             rs.getString("source_term"), rs.getString("language"), rs.getString("required_translation"));
+
+    private static final RowMapper<FallbackRow> FALLBACK_MAPPER = (rs, n) -> new FallbackRow(
+            rs.getString("language"), rs.getString("fallback_language"));
 
     private final JdbcTemplate jdbc;
 
@@ -227,6 +231,37 @@ public class TranslationRepository {
                 "SELECT snapshot_json FROM release_snapshot WHERE document_id = ? AND published_version = ?",
                 (rs, n) -> rs.getString(1), documentId, publishedVersion);
         return rows.stream().findFirst();
+    }
+
+    /** 查询文档全部回退配置，按语言排序保证稳定输出。 */
+    public List<FallbackRow> listFallbacks(long documentId) {
+        return jdbc.query(
+                "SELECT language, fallback_language FROM fallback_config "
+                        + "WHERE document_id = ? ORDER BY language",
+                FALLBACK_MAPPER, documentId);
+    }
+
+    /** 删除文档全部回退配置（全量替换前先清空）。 */
+    public void deleteFallbacks(long documentId) {
+        jdbc.update("DELETE FROM fallback_config WHERE document_id = ?", documentId);
+    }
+
+    /** 插入一条回退配置：language 在文档内唯一。 */
+    public void insertFallback(long documentId, String language, String fallbackLanguage) {
+        jdbc.update("INSERT INTO fallback_config (document_id, language, fallback_language) VALUES (?, ?, ?)",
+                documentId, language, fallbackLanguage);
+    }
+
+    /** 删除指定段落与语言的译文（撤回）。 */
+    public void deleteTranslation(long documentId, String segmentId, String language) {
+        jdbc.update("DELETE FROM translation WHERE document_id = ? AND segment_id = ? AND language = ?",
+                documentId, segmentId, language);
+    }
+
+    /** 删除指定段落与语言的批准（撤回时一并清除）。 */
+    public void deleteApproval(long documentId, String segmentId, String language) {
+        jdbc.update("DELETE FROM approval WHERE document_id = ? AND segment_id = ? AND language = ?",
+                documentId, segmentId, language);
     }
 
     public Optional<RequestLogRow> findRequestLog(String requestId) {

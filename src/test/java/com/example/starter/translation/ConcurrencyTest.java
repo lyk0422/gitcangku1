@@ -200,6 +200,92 @@ class ConcurrencyTest extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("并发回退配置：同一期望版本仅一个成功，草稿版本无丢失更新，失败整次回滚")
+    void concurrentFallbackUpdates() throws Exception {
+        long docId = createDocument(newRequestId(), "[\"en\",\"ja\"]", "[]");
+        int threads = 4;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch gate = new CountDownLatch(1);
+        List<Future<ApiResult>> futures = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            futures.add(pool.submit(() -> {
+                gate.await();
+                return updateFallbacks(docId, 1,
+                        "[{\"language\":\"ja\",\"fallbackLanguage\":\"en\"}]", newRequestId());
+            }));
+        }
+        gate.countDown();
+        int success = 0;
+        int conflict = 0;
+        for (Future<ApiResult> future : futures) {
+            int status = future.get(30, TimeUnit.SECONDS).status();
+            if (status == 200) {
+                success++;
+            } else if (status == 409) {
+                conflict++;
+            }
+        }
+        pool.shutdown();
+
+        assertThat(success).isEqualTo(1);
+        assertThat(conflict).isEqualTo(threads - 1);
+        assertThat(jdbc.queryForObject(
+                "SELECT COUNT(*) FROM fallback_config WHERE document_id = ?", Integer.class, docId))
+                .isEqualTo(1);
+        Integer draftVersion = jdbc.queryForObject(
+                "SELECT draft_version FROM document WHERE document_id = ?", Integer.class, docId);
+        assertThat(draftVersion).isEqualTo(2);
+    }
+
+    @Test
+    @DisplayName("发布与撤回并发：按提交顺序裁决，发布要么固化撤回前快照要么失败，不产生部分快照")
+    void concurrentPublishAndWithdraw() throws Exception {
+        long docId = createDocument(newRequestId(), "[\"en\",\"ja\"]",
+                "[{\"segmentId\":\"s1\",\"sourceText\":\"原文\"}]");
+        updateFallbacks(docId, 1, "[{\"language\":\"ja\",\"fallbackLanguage\":\"en\"}]", newRequestId());
+        submitTranslation(docId, "s1", "en", "alice", "hello", 1, newRequestId());
+        approve(docId, "s1", "en", "bob", 1, newRequestId());
+        // 当前草稿版本 3、发布版本 0
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        CountDownLatch gate = new CountDownLatch(1);
+        Future<ApiResult> publishFuture = pool.submit(() -> {
+            gate.await();
+            return publish(docId, 3, 0, newRequestId());
+        });
+        Future<ApiResult> withdrawFuture = pool.submit(() -> {
+            gate.await();
+            return withdraw(docId, "s1", "en", newRequestId());
+        });
+        gate.countDown();
+        ApiResult publishResult = publishFuture.get(30, TimeUnit.SECONDS);
+        ApiResult withdrawResult = withdrawFuture.get(30, TimeUnit.SECONDS);
+        pool.shutdown();
+
+        // 撤回必然成功；发布要么先于撤回（201，快照固化 en 译文），
+        // 要么后于撤回（草稿版本已变为 4，期望版本不符 409）
+        assertThat(withdrawResult.status()).isEqualTo(200);
+        assertThat(publishResult.status()).isIn(201, 409);
+
+        Integer publishedVersion = jdbc.queryForObject(
+                "SELECT published_version FROM document WHERE document_id = ?", Integer.class, docId);
+        Integer snapshots = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM release_snapshot WHERE document_id = ?", Integer.class, docId);
+        assertThat(snapshots).isEqualTo(publishedVersion);
+        if (publishResult.status() == 201) {
+            // 发布先于撤回：快照使用提交时刻一致的链与译文版本，撤回不追溯改写
+            assertThat(publishedVersion).isEqualTo(1);
+            ApiResult release = getJson("/api/documents/" + docId + "/releases/1");
+            assertThat(release.status()).isEqualTo(200);
+            var jaEntry = release.body().get("segments").get(0).get("translations").get(1);
+            assertThat(jaEntry.get("usedLanguage").asText()).isEqualTo("en");
+            assertThat(jaEntry.get("content").asText()).isEqualTo("hello");
+        } else {
+            assertThat(publishedVersion).isZero();
+        }
+    }
+
+    @Test
     @DisplayName("并发术语更新：同一期望版本仅一个成功，术语版本无丢失更新")
     void concurrentTermUpdates() throws Exception {
         long docId = createDocument(newRequestId(), "[\"en\"]", "[]");
