@@ -103,6 +103,7 @@ public class EvidenceService {
         if (request.toCustodian().equals(actorId)) {
             throw ApiException.badRequest("接收人不能与发起保管人相同");
         }
+        requireNotDestroyed(evidence);
         requireSealIntact(evidence);
         requireCustodian(evidence, actorId);
         if (evidence.status() == EvidenceStatus.TRANSFER_PENDING) {
@@ -135,6 +136,7 @@ public class EvidenceService {
         if (replay.isPresent()) {
             return replay.get();
         }
+        requireNotDestroyed(evidence);
         requireSealIntact(evidence);
         TransferRecord pending = requirePending(evidence, evidenceKey);
         if (!pending.toCustodian().equals(actorId)) {
@@ -166,6 +168,7 @@ public class EvidenceService {
         if (replay.isPresent()) {
             return replay.get();
         }
+        requireNotDestroyed(evidence);
         requireSealIntact(evidence);
         TransferRecord pending = requirePending(evidence, evidenceKey);
         if (!pending.fromCustodian().equals(actorId)) {
@@ -198,6 +201,7 @@ public class EvidenceService {
         if (replay.isPresent()) {
             return replay.get();
         }
+        requireNotDestroyed(evidence);
         requireCustodian(evidence, actorId);
         if (evidence.status() == EvidenceStatus.TRANSFER_PENDING) {
             throw ApiException.conflict("待接收期间禁止封条核验: " + evidenceKey);
@@ -234,6 +238,7 @@ public class EvidenceService {
         if (replay.isPresent()) {
             return replay.get();
         }
+        requireNotDestroyed(evidence);
         if (request.borrowerId().equals(actorId)) {
             throw ApiException.badRequest("借用人不能与当前保管人相同");
         }
@@ -283,6 +288,7 @@ public class EvidenceService {
         if (replay.isPresent()) {
             return replay.get();
         }
+        requireNotDestroyed(evidence);
         LoanRecord loan = loanRepository.findByLoanKey(request.loanKey())
                 .orElseThrow(() -> ApiException.notFound("借出记录不存在: " + request.loanKey()));
         if (!loan.evidenceKey().equals(evidenceKey)) {
@@ -359,6 +365,12 @@ public class EvidenceService {
     private void requireSealIntact(Evidence evidence) {
         if (evidence.status() == EvidenceStatus.SEAL_BROKEN) {
             throw ApiException.unprocessable("封条已异常，禁止交接相关操作: " + evidence.evidenceKey());
+        }
+    }
+
+    private void requireNotDestroyed(Evidence evidence) {
+        if (evidence.status() == EvidenceStatus.DESTROYED) {
+            throw ApiException.unprocessable("证物已销毁（终态），禁止操作: " + evidence.evidenceKey());
         }
     }
 

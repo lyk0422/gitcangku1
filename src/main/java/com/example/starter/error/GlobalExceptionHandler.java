@@ -12,6 +12,7 @@ import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
 import java.time.LocalDateTime;
+import java.util.List;
 import java.util.stream.Collectors;
 
 /**
@@ -26,6 +27,13 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorBody> handleApi(ApiException ex) {
         return ResponseEntity.status(ex.status())
                 .body(new ErrorBody(ex.status().value(), ex.getMessage(), LocalDateTime.now()));
+    }
+
+    @ExceptionHandler(HoldBlockedException.class)
+    public ResponseEntity<HoldBlockedErrorBody> handleHoldBlocked(HoldBlockedException ex) {
+        return ResponseEntity.status(ex.status())
+                .body(new HoldBlockedErrorBody(ex.status().value(), ex.getMessage(),
+                        ex.holdKeys(), LocalDateTime.now()));
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
@@ -59,5 +67,17 @@ public class GlobalExceptionHandler {
      * @param timestamp 发生时间（Asia/Shanghai）
      */
     public record ErrorBody(int status, String message, LocalDateTime timestamp) {
+    }
+
+    /**
+     * 销毁申请命中有效冻结的错误响应体，稳定列出冻结键。
+     *
+     * @param status    HTTP 状态码（422）
+     * @param message   错误描述
+     * @param holdKeys  命中的有效冻结 holdKey 列表（去重、字典序排序）
+     * @param timestamp 发生时间（Asia/Shanghai）
+     */
+    public record HoldBlockedErrorBody(int status, String message, List<String> holdKeys,
+                                       LocalDateTime timestamp) {
     }
 }
