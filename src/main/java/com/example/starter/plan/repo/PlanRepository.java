@@ -27,12 +27,13 @@ import org.springframework.stereotype.Repository;
 @Repository
 public class PlanRepository {
 
-    private static final RowMapper<DayPlan> PLAN_MAPPER = (rs, n) -> new DayPlan(
+    static final RowMapper<DayPlan> PLAN_MAPPER = (rs, n) -> new DayPlan(
             rs.getLong("id"),
             rs.getString("schedule_key"),
             rs.getObject("op_date", LocalDate.class),
             rs.getInt("version"),
-            PlanStatus.valueOf(rs.getString("status")));
+            PlanStatus.valueOf(rs.getString("status")),
+            rs.getInt("platform_risk") != 0);
 
     private static final RowMapper<Occupancy> OCCUPANCY_MAPPER = (rs, n) -> new Occupancy(
             rs.getLong("id"),
@@ -79,7 +80,7 @@ public class PlanRepository {
      * 按业务键查询计划（不加锁）。
      */
     public Optional<DayPlan> findByKey(String scheduleKey) {
-        return jdbc.query("SELECT id, schedule_key, op_date, version, status FROM rail_day_plan"
+        return jdbc.query("SELECT id, schedule_key, op_date, version, status, platform_risk FROM rail_day_plan"
                         + " WHERE schedule_key = ?",
                 PLAN_MAPPER, scheduleKey).stream().findFirst();
     }
@@ -88,7 +89,7 @@ public class PlanRepository {
      * 按主键查询计划（不加锁），用于改签链遍历。
      */
     public Optional<DayPlan> findById(long planId) {
-        return jdbc.query("SELECT id, schedule_key, op_date, version, status FROM rail_day_plan"
+        return jdbc.query("SELECT id, schedule_key, op_date, version, status, platform_risk FROM rail_day_plan"
                         + " WHERE id = ?",
                 PLAN_MAPPER, planId).stream().findFirst();
     }
@@ -97,7 +98,7 @@ public class PlanRepository {
      * 按业务键查询计划并加行级写锁，须在事务内调用，用于串行化同一计划的更新/发布/取消。
      */
     public Optional<DayPlan> findByKeyForUpdate(String scheduleKey) {
-        return jdbc.query("SELECT id, schedule_key, op_date, version, status FROM rail_day_plan"
+        return jdbc.query("SELECT id, schedule_key, op_date, version, status, platform_risk FROM rail_day_plan"
                         + " WHERE schedule_key = ? FOR UPDATE",
                 PLAN_MAPPER, scheduleKey).stream().findFirst();
     }
@@ -151,6 +152,29 @@ public class PlanRepository {
     public void updateStatus(long planId, PlanStatus status, long nowMillis) {
         jdbc.update("UPDATE rail_day_plan SET status = ?, updated_at = ? WHERE id = ?",
                 status.name(), nowMillis, planId);
+    }
+
+    /**
+     * 更新站台风险标记（站台下调回查置位；编组/站台整改通过后清除）。
+     */
+    public void updatePlatformRisk(long planId, boolean platformRisk, long nowMillis) {
+        jdbc.update("UPDATE rail_day_plan SET platform_risk = ?, updated_at = ? WHERE id = ?",
+                platformRisk ? 1 : 0, nowMillis, planId);
+    }
+
+    /**
+     * 按业务键集合批量加行级写锁并查询，须在事务内调用，用于批量发布的最终态裁决。
+     */
+    public List<DayPlan> findByKeysForUpdate(Collection<String> scheduleKeys) {
+        if (scheduleKeys.isEmpty()) {
+            return List.of();
+        }
+        StringJoiner placeholders = new StringJoiner(", ");
+        scheduleKeys.forEach(k -> placeholders.add("?"));
+        return jdbc.query("SELECT id, schedule_key, op_date, version, status, platform_risk"
+                        + " FROM rail_day_plan WHERE schedule_key IN (" + placeholders + ")"
+                        + " FOR UPDATE",
+                PLAN_MAPPER, scheduleKeys.toArray());
     }
 
     /**
