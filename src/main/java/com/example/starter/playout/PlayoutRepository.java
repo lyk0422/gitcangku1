@@ -73,6 +73,49 @@ public class PlayoutRepository {
         }
     }
 
+    /** 黑屏窗口行；regionsText 为规范化区域集合（排序后逗号拼接）。 */
+    public record BlackoutRow(long id, String channelId, long startMs, long endMs,
+                              String regionsText, String requestId, long createdAtMs) {
+    }
+
+    /** 字幕文本版本行；status 为 PENDING / APPROVED。 */
+    public record SubtitleTextRow(String textKey, int version, String content, String status,
+                                  String approveRequestId, long createdAtMs, Long approvedAtMs) {
+        public boolean approved() {
+            return "APPROVED".equals(status);
+        }
+    }
+
+    /** 紧急字幕行；status 为 ACTIVE / REVOKED，regionsText 为规范化区域集合。 */
+    public record SubtitleRow(String subtitleKey, String channelId, int priority,
+                              String textKey, int textVersion, long startMs, long endMs,
+                              String regionsText, String status, String revokeRequestId,
+                              Long revokedAtMs, long createdAtMs) {
+        public boolean active() {
+            return "ACTIVE".equals(status);
+        }
+    }
+
+    /** 发布固化的字幕子片行。 */
+    public record PublicationSubtitleRow(long id, long publicationId, String region,
+                                         String segmentId, long startMs, long endMs,
+                                         String subtitleKey, String textKey, int textVersion,
+                                         String textContent, int priority, String reason) {
+    }
+
+    /** 播放回执行；字幕字段为 NULL 表示该时刻未覆盖字幕。 */
+    public record ReceiptRow(String crawlKey, String channelId, LocalDate businessDay,
+                             long publicationId, long publishedVersion, String region, long atMs,
+                             String assetId, String segmentId, String subtitleKey, String textKey,
+                             Integer textVersion, Integer priority, Long overlayStartMs,
+                             Long overlayEndMs, String fingerprint, long createdAtMs) {
+    }
+
+    /** 发布阻断审计行。 */
+    public record PublishBlockRow(long id, String channelId, LocalDate businessDay,
+                                  String requestId, String code, String detailJson, long createdAtMs) {
+    }
+
     private static final RowMapper<AssetRow> ASSET_MAPPER = (rs, n) ->
             new AssetRow(rs.getString("id"), rs.getLong("duration_ms"));
 
@@ -291,6 +334,21 @@ public class PlayoutRepository {
                 PUBLICATION_SEGMENT_MAPPER, publicationId, atMs, atMs).stream().findFirst();
     }
 
+    /** 按 ID 查询发布快照。 */
+    public Optional<PublicationRow> findPublicationById(long publicationId) {
+        return jdbc.query("SELECT id, channel_id, business_day, published_version, draft_version"
+                        + " FROM playout_publication WHERE id = ?",
+                PUBLICATION_MAPPER, publicationId).stream().findFirst();
+    }
+
+    /** 快照全部节目片段，按起点、片段 ID 稳定排序。 */
+    public List<PublicationSegmentRow> findPublicationSegments(long publicationId) {
+        return jdbc.query("SELECT id, publication_id, segment_id, asset_id, grant_id, start_ms, end_ms"
+                        + " FROM playout_publication_segment"
+                        + " WHERE publication_id = ? ORDER BY start_ms, segment_id, id",
+                PUBLICATION_SEGMENT_MAPPER, publicationId);
+    }
+
     // ---------- 幂等请求记录 ----------
 
     /** 按请求 ID 查询并加行锁，用于去重判定。 */
@@ -380,5 +438,302 @@ public class PlayoutRepository {
                         + " SET status = 'CANCELLED', cancel_request_id = ?, cancelled_at_ms = ?"
                         + " WHERE override_key = ? AND status = 'ACTIVE'",
                 cancelRequestId, cancelledAtMs, overrideKey);
+    }
+
+    // ---------- 黑屏窗口 ----------
+
+    private static final RowMapper<BlackoutRow> BLACKOUT_MAPPER = (rs, n) ->
+            new BlackoutRow(rs.getLong("id"), rs.getString("channel_id"),
+                    rs.getLong("start_ms"), rs.getLong("end_ms"), rs.getString("regions_text"),
+                    rs.getString("request_id"), rs.getLong("created_at_ms"));
+
+    public long insertBlackout(String channelId, long startMs, long endMs, String regionsText,
+                               String requestId, long createdAtMs) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO playout_blackout"
+                            + " (channel_id, start_ms, end_ms, regions_text, request_id, created_at_ms)"
+                            + " VALUES (?, ?, ?, ?, ?, ?)", Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, channelId);
+            ps.setLong(2, startMs);
+            ps.setLong(3, endMs);
+            ps.setString(4, regionsText);
+            ps.setString(5, requestId);
+            ps.setLong(6, createdAtMs);
+            return ps;
+        }, keyHolder);
+        return keyHolder.getKey().longValue();
+    }
+
+    public void insertBlackoutRegion(long blackoutId, String region) {
+        jdbc.update("INSERT INTO playout_blackout_region (blackout_id, region) VALUES (?, ?)",
+                blackoutId, region);
+    }
+
+    /** 查询频道内与 [startMs, endMs) 正重叠（端点相接不算）的黑屏窗口。 */
+    public List<BlackoutRow> findBlackoutsOverlapping(String channelId, long startMs, long endMs) {
+        return jdbc.query("SELECT id, channel_id, start_ms, end_ms, regions_text, request_id, created_at_ms"
+                        + " FROM playout_blackout"
+                        + " WHERE channel_id = ? AND start_ms < ? AND end_ms > ?"
+                        + " ORDER BY start_ms, id",
+                BLACKOUT_MAPPER, channelId, endMs, startMs);
+    }
+
+    public List<String> findBlackoutRegions(long blackoutId) {
+        return jdbc.queryForList("SELECT region FROM playout_blackout_region"
+                + " WHERE blackout_id = ? ORDER BY region", String.class, blackoutId);
+    }
+
+    // ---------- 字幕文本与审核 ----------
+
+    private static final RowMapper<SubtitleTextRow> SUBTITLE_TEXT_MAPPER = (rs, n) ->
+            new SubtitleTextRow(rs.getString("text_key"), rs.getInt("version"),
+                    rs.getString("content"), rs.getString("status"),
+                    rs.getString("approve_request_id"), rs.getLong("created_at_ms"),
+                    (Long) rs.getObject("approved_at_ms"));
+
+    public void insertSubtitleText(String textKey, int version, String content, long createdAtMs) {
+        jdbc.update("INSERT INTO playout_subtitle_text"
+                        + " (text_key, version, content, status, created_at_ms)"
+                        + " VALUES (?, ?, ?, 'PENDING', ?)",
+                textKey, version, content, createdAtMs);
+    }
+
+    public Optional<SubtitleTextRow> findSubtitleText(String textKey, int version) {
+        return jdbc.query("SELECT text_key, version, content, status, approve_request_id,"
+                        + " created_at_ms, approved_at_ms"
+                        + " FROM playout_subtitle_text WHERE text_key = ? AND version = ?",
+                SUBTITLE_TEXT_MAPPER, textKey, version).stream().findFirst();
+    }
+
+    /** 审核通过文本版本；返回受影响行数，0 表示不存在或已审核。 */
+    public int approveSubtitleText(String textKey, int version, String requestId, long approvedAtMs) {
+        return jdbc.update("UPDATE playout_subtitle_text"
+                        + " SET status = 'APPROVED', approve_request_id = ?, approved_at_ms = ?"
+                        + " WHERE text_key = ? AND version = ? AND status = 'PENDING'",
+                requestId, approvedAtMs, textKey, version);
+    }
+
+    /** 按主键查询文本版本并加行锁，供审核与并发创建字幕按提交顺序裁决。 */
+    public Optional<SubtitleTextRow> findSubtitleTextForUpdate(String textKey, int version) {
+        return jdbc.query("SELECT text_key, version, content, status, approve_request_id,"
+                        + " created_at_ms, approved_at_ms"
+                        + " FROM playout_subtitle_text WHERE text_key = ? AND version = ? FOR UPDATE",
+                SUBTITLE_TEXT_MAPPER, textKey, version).stream().findFirst();
+    }
+
+    // ---------- 紧急字幕 ----------
+
+    private static final RowMapper<SubtitleRow> SUBTITLE_MAPPER = (rs, n) ->
+            new SubtitleRow(rs.getString("subtitle_key"), rs.getString("channel_id"),
+                    rs.getInt("priority"), rs.getString("text_key"), rs.getInt("text_version"),
+                    rs.getLong("start_ms"), rs.getLong("end_ms"), rs.getString("regions_text"),
+                    rs.getString("status"), rs.getString("revoke_request_id"),
+                    (Long) rs.getObject("revoked_at_ms"), rs.getLong("created_at_ms"));
+
+    public void insertSubtitle(String subtitleKey, String channelId, int priority,
+                               String textKey, int textVersion, long startMs, long endMs,
+                               String regionsText, long createdAtMs) {
+        jdbc.update("INSERT INTO playout_emergency_subtitle"
+                        + " (subtitle_key, channel_id, priority, text_key, text_version,"
+                        + " start_ms, end_ms, regions_text, status, created_at_ms)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?)",
+                subtitleKey, channelId, priority, textKey, textVersion,
+                startMs, endMs, regionsText, createdAtMs);
+    }
+
+    public void insertSubtitleRegion(String subtitleKey, String region) {
+        jdbc.update("INSERT INTO playout_emergency_subtitle_region (subtitle_key, region)"
+                + " VALUES (?, ?)", subtitleKey, region);
+    }
+
+    public Optional<SubtitleRow> findSubtitle(String subtitleKey) {
+        return jdbc.query("SELECT subtitle_key, channel_id, priority, text_key, text_version,"
+                        + " start_ms, end_ms, regions_text, status, revoke_request_id,"
+                        + " revoked_at_ms, created_at_ms"
+                        + " FROM playout_emergency_subtitle WHERE subtitle_key = ?",
+                SUBTITLE_MAPPER, subtitleKey).stream().findFirst();
+    }
+
+    /** 按全局键查询并加行锁，用于撤销与创建的同键并发串行化。 */
+    public Optional<SubtitleRow> findSubtitleForUpdate(String subtitleKey) {
+        return jdbc.query("SELECT subtitle_key, channel_id, priority, text_key, text_version,"
+                        + " start_ms, end_ms, regions_text, status, revoke_request_id,"
+                        + " revoked_at_ms, created_at_ms"
+                        + " FROM playout_emergency_subtitle WHERE subtitle_key = ? FOR UPDATE",
+                SUBTITLE_MAPPER, subtitleKey).stream().findFirst();
+    }
+
+    public List<String> findSubtitleRegions(String subtitleKey) {
+        return jdbc.queryForList("SELECT region FROM playout_emergency_subtitle_region"
+                + " WHERE subtitle_key = ? ORDER BY region", String.class, subtitleKey);
+    }
+
+    /**
+     * 同频道、同优先级、状态 ACTIVE 且窗口与 [startMs, endMs) 时间重叠的字幕。
+     * 区间左闭右开：相邻 start == end 不重叠。区域交集由调用方在内存判定；
+     * 须在持频道锁后调用，结果行已加锁（H2/MySQL 均不允许 DISTINCT 与 FOR UPDATE 联用）。
+     */
+    public List<SubtitleRow> findActiveSubtitlesOverlappingForUpdate(String channelId, int priority,
+                                                                     long startMs, long endMs) {
+        return jdbc.query("SELECT subtitle_key, channel_id, priority, text_key, text_version,"
+                        + " start_ms, end_ms, regions_text, status, revoke_request_id,"
+                        + " revoked_at_ms, created_at_ms"
+                        + " FROM playout_emergency_subtitle"
+                        + " WHERE channel_id = ? AND status = 'ACTIVE' AND priority = ?"
+                        + " AND start_ms < ? AND end_ms > ?"
+                        + " ORDER BY subtitle_key FOR UPDATE",
+                SUBTITLE_MAPPER, channelId, priority, endMs, startMs);
+    }
+
+    /**
+     * 命中指定频道、区域与时刻的 ACTIVE 字幕（start <= at < end），按优先级降序、
+     * 窗口起点升序、字幕键升序排序；同级在同区域窗口不重叠，排序结果确定。
+     * 发布固化路径改用 {@link #findActiveSubtitlesForChannelForUpdate} 对全频道候选加锁。
+     */
+    public List<SubtitleRow> findActiveSubtitlesAt(String channelId, String region, long atMs) {
+        return jdbc.query("SELECT s.subtitle_key, s.channel_id, s.priority, s.text_key,"
+                        + " s.text_version, s.start_ms, s.end_ms, s.regions_text, s.status,"
+                        + " s.revoke_request_id, s.revoked_at_ms, s.created_at_ms"
+                        + " FROM playout_emergency_subtitle s"
+                        + " JOIN playout_emergency_subtitle_region r ON r.subtitle_key = s.subtitle_key"
+                        + " WHERE s.channel_id = ? AND s.status = 'ACTIVE' AND r.region = ?"
+                        + " AND s.start_ms <= ? AND s.end_ms > ?"
+                        + " ORDER BY s.priority DESC, s.start_ms ASC, s.subtitle_key ASC",
+                SUBTITLE_MAPPER, channelId, region, atMs, atMs);
+    }
+
+    /** 频道内全部 ACTIVE 字幕并加行锁，供发布固化时与字幕创建/撤销按提交顺序串行化。 */
+    public List<SubtitleRow> findActiveSubtitlesForChannelForUpdate(String channelId) {
+        return jdbc.query("SELECT subtitle_key, channel_id, priority, text_key, text_version,"
+                        + " start_ms, end_ms, regions_text, status, revoke_request_id,"
+                        + " revoked_at_ms, created_at_ms"
+                        + " FROM playout_emergency_subtitle"
+                        + " WHERE channel_id = ? AND status = 'ACTIVE'"
+                        + " ORDER BY subtitle_key FOR UPDATE",
+                SUBTITLE_MAPPER, channelId);
+    }
+
+    /** 撤销字幕；返回受影响行数，0 表示不存在或已撤销。 */
+    public int revokeSubtitle(String subtitleKey, String revokeRequestId, long revokedAtMs) {
+        return jdbc.update("UPDATE playout_emergency_subtitle"
+                        + " SET status = 'REVOKED', revoke_request_id = ?, revoked_at_ms = ?"
+                        + " WHERE subtitle_key = ? AND status = 'ACTIVE'",
+                revokeRequestId, revokedAtMs, subtitleKey);
+    }
+
+    // ---------- 发布固化字幕 ----------
+
+    private static final RowMapper<PublicationSubtitleRow> PUBLICATION_SUBTITLE_MAPPER = (rs, n) ->
+            new PublicationSubtitleRow(rs.getLong("id"), rs.getLong("publication_id"),
+                    rs.getString("region"), rs.getString("segment_id"),
+                    rs.getLong("start_ms"), rs.getLong("end_ms"),
+                    rs.getString("subtitle_key"), rs.getString("text_key"),
+                    rs.getInt("text_version"), rs.getString("text_content"),
+                    rs.getInt("priority"), rs.getString("reason"));
+
+    public void insertPublicationSubtitle(long publicationId, String region, String segmentId,
+                                          long startMs, long endMs, String subtitleKey,
+                                          String textKey, int textVersion, String textContent,
+                                          int priority, String reason) {
+        jdbc.update("INSERT INTO playout_publication_subtitle"
+                        + " (publication_id, region, segment_id, start_ms, end_ms, subtitle_key,"
+                        + " text_key, text_version, text_content, priority, reason)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                publicationId, region, segmentId, startMs, endMs, subtitleKey,
+                textKey, textVersion, textContent, priority, reason);
+    }
+
+    /** 快照内某区域覆盖指定时刻的字幕子片（start <= at < end）；结束端点恰好时不命中。 */
+    public Optional<PublicationSubtitleRow> findPublicationSubtitleAt(long publicationId,
+                                                                      String region, long atMs) {
+        return jdbc.query("SELECT id, publication_id, region, segment_id, start_ms, end_ms,"
+                        + " subtitle_key, text_key, text_version, text_content, priority, reason"
+                        + " FROM playout_publication_subtitle"
+                        + " WHERE publication_id = ? AND region = ? AND start_ms <= ? AND end_ms > ?"
+                        + " ORDER BY start_ms LIMIT 1",
+                PUBLICATION_SUBTITLE_MAPPER, publicationId, region, atMs, atMs)
+                .stream().findFirst();
+    }
+
+    /** 快照全部固化字幕子片，按区域、起点、终点稳定排序。 */
+    public List<PublicationSubtitleRow> findPublicationSubtitles(long publicationId) {
+        return jdbc.query("SELECT id, publication_id, region, segment_id, start_ms, end_ms,"
+                        + " subtitle_key, text_key, text_version, text_content, priority, reason"
+                        + " FROM playout_publication_subtitle"
+                        + " WHERE publication_id = ? ORDER BY region, start_ms, end_ms, id",
+                PUBLICATION_SUBTITLE_MAPPER, publicationId);
+    }
+
+    // ---------- 播放回执 ----------
+
+    private static final RowMapper<ReceiptRow> RECEIPT_MAPPER = (rs, n) ->
+            new ReceiptRow(rs.getString("crawl_key"), rs.getString("channel_id"),
+                    rs.getDate("business_day").toLocalDate(), rs.getLong("publication_id"),
+                    rs.getLong("published_version"), rs.getString("region"), rs.getLong("at_ms"),
+                    rs.getString("asset_id"), rs.getString("segment_id"),
+                    rs.getString("subtitle_key"), rs.getString("text_key"),
+                    (Integer) rs.getObject("text_version"), (Integer) rs.getObject("priority"),
+                    (Long) rs.getObject("overlay_start_ms"), (Long) rs.getObject("overlay_end_ms"),
+                    rs.getString("fingerprint"), rs.getLong("created_at_ms"));
+
+    public void insertReceipt(String crawlKey, String channelId, LocalDate businessDay,
+                              long publicationId, long publishedVersion, String region, long atMs,
+                              String assetId, String segmentId, String subtitleKey, String textKey,
+                              Integer textVersion, Integer priority, Long overlayStartMs,
+                              Long overlayEndMs, String fingerprint, long createdAtMs) {
+        jdbc.update("INSERT INTO playout_receipt"
+                        + " (crawl_key, channel_id, business_day, publication_id, published_version,"
+                        + " region, at_ms, asset_id, segment_id, subtitle_key, text_key, text_version,"
+                        + " priority, overlay_start_ms, overlay_end_ms, fingerprint, created_at_ms)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                crawlKey, channelId, Date.valueOf(businessDay), publicationId, publishedVersion,
+                region, atMs, assetId, segmentId, subtitleKey, textKey, textVersion,
+                priority, overlayStartMs, overlayEndMs, fingerprint, createdAtMs);
+    }
+
+    public Optional<ReceiptRow> findReceipt(String crawlKey) {
+        return jdbc.query("SELECT crawl_key, channel_id, business_day, publication_id,"
+                        + " published_version, region, at_ms, asset_id, segment_id, subtitle_key,"
+                        + " text_key, text_version, priority, overlay_start_ms, overlay_end_ms,"
+                        + " fingerprint, created_at_ms"
+                        + " FROM playout_receipt WHERE crawl_key = ?",
+                RECEIPT_MAPPER, crawlKey).stream().findFirst();
+    }
+
+    /** 按回执键查询并加行锁，用于同键重放串行化。 */
+    public Optional<ReceiptRow> findReceiptForUpdate(String crawlKey) {
+        return jdbc.query("SELECT crawl_key, channel_id, business_day, publication_id,"
+                        + " published_version, region, at_ms, asset_id, segment_id, subtitle_key,"
+                        + " text_key, text_version, priority, overlay_start_ms, overlay_end_ms,"
+                        + " fingerprint, created_at_ms"
+                        + " FROM playout_receipt WHERE crawl_key = ? FOR UPDATE",
+                RECEIPT_MAPPER, crawlKey).stream().findFirst();
+    }
+
+    // ---------- 发布阻断审计 ----------
+
+    private static final RowMapper<PublishBlockRow> PUBLISH_BLOCK_MAPPER = (rs, n) ->
+            new PublishBlockRow(rs.getLong("id"), rs.getString("channel_id"),
+                    rs.getDate("business_day").toLocalDate(), rs.getString("request_id"),
+                    rs.getString("code"), rs.getString("detail_json"), rs.getLong("created_at_ms"));
+
+    /** 阻断审计在独立事务中写入，发布主事务回滚不影响本表。 */
+    public void insertPublishBlock(String channelId, LocalDate businessDay, String requestId,
+                                   String code, String detailJson, long createdAtMs) {
+        jdbc.update("INSERT INTO playout_publish_block"
+                        + " (channel_id, business_day, request_id, code, detail_json, created_at_ms)"
+                        + " VALUES (?, ?, ?, ?, ?, ?)",
+                channelId, Date.valueOf(businessDay), requestId, code, detailJson, createdAtMs);
+    }
+
+    /** 查询某次发布业务键下最新的阻断原因；无记录时为空。 */
+    public Optional<PublishBlockRow> findLatestPublishBlock(String channelId, LocalDate businessDay) {
+        return jdbc.query("SELECT id, channel_id, business_day, request_id, code, detail_json,"
+                        + " created_at_ms FROM playout_publish_block"
+                        + " WHERE channel_id = ? AND business_day = ?"
+                        + " ORDER BY id DESC LIMIT 1",
+                PUBLISH_BLOCK_MAPPER, channelId, Date.valueOf(businessDay)).stream().findFirst();
     }
 }

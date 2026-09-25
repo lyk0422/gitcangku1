@@ -69,10 +69,13 @@ public class PlayoutService {
 
     private final PlayoutRepository repo;
     private final ObjectMapper objectMapper;
+    private final CrawlSubtitleService crawlSubtitleService;
 
-    public PlayoutService(PlayoutRepository repo, ObjectMapper objectMapper) {
+    public PlayoutService(PlayoutRepository repo, ObjectMapper objectMapper,
+                          CrawlSubtitleService crawlSubtitleService) {
         this.repo = repo;
         this.objectMapper = objectMapper;
+        this.crawlSubtitleService = crawlSubtitleService;
     }
 
     // ---------- 素材 ----------
@@ -234,6 +237,9 @@ public class PlayoutService {
                 repo.insertPublicationSegment(publicationId, segment.id(), segment.assetId(),
                         grantIds.get(i), segment.startMs(), segment.endMs());
             }
+            // 同事务固化紧急字幕：未审核文本或黑屏冲突在独立事务留痕后抛 422，整次发布回滚。
+            crawlSubtitleService.freezeForPublication(channelId, businessDay, publicationId,
+                    segments, request.requestId());
             return new PublishResponse(publicationId, channelId, businessDay.toString(),
                     newVersion, draft.version());
         });

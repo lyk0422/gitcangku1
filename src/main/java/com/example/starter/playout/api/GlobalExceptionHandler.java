@@ -27,6 +27,14 @@ public class GlobalExceptionHandler {
                 .body(new ErrorResponse(ex.code(), ex.getMessage()));
     }
 
+    /** 发布门禁 422：稳定列出全部阻断区域与窗口。 */
+    @ExceptionHandler(PublishBlockedException.class)
+    public ResponseEntity<Dtos.PublishBlockErrorResponse> handlePublishBlocked(
+            PublishBlockedException ex) {
+        return ResponseEntity.status(ex.status())
+                .body(new Dtos.PublishBlockErrorResponse(ex.code(), ex.getMessage(), ex.items()));
+    }
+
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ResponseEntity<ErrorResponse> handleValidation(MethodArgumentNotValidException ex) {
         String message = ex.getBindingResult().getFieldErrors().stream()
