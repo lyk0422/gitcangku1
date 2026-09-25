@@ -1,6 +1,8 @@
 package com.example.starter.incident;
 
 import com.example.starter.incident.dto.Requests.ActionRequest;
+import com.example.starter.incident.dto.Requests.AgencyAckRequest;
+import com.example.starter.incident.dto.Requests.AgencyConfigRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
 import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
@@ -11,6 +13,8 @@ import com.example.starter.incident.dto.Requests.TaskCreateRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
+import com.example.starter.incident.dto.Responses.AgencyConfigView;
+import com.example.starter.incident.dto.Responses.AgencyReceiptView;
 import com.example.starter.incident.dto.Responses.EscalationHistoryView;
 import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
@@ -23,6 +27,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -187,5 +192,34 @@ public class IncidentController {
                                @RequestHeader("X-Actor-Id") String actor,
                                @RequestBody TaskActionRequest req) {
         return service.cancelTask(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 配置必需外部机构（仅当前指挥人；携带 expectedVersion 乐观校验，
+     * 机构代码 0~5 个、去重排序，空集合合法；已关闭事件 409）。
+     */
+    @PutMapping("/{incidentKey}/agency-config")
+    public AgencyConfigView configureAgencies(@PathVariable String incidentKey,
+                                              @RequestHeader("X-Actor-Id") String actor,
+                                              @RequestBody AgencyConfigRequest req) {
+        return service.configureAgencies(incidentKey, actor, req);
+    }
+
+    /**
+     * 查询当前外部机构配置版本、必需机构与当前版本回执（只读）。
+     */
+    @GetMapping("/{incidentKey}/agency-config")
+    public AgencyConfigView agencyConfig(@PathVariable String incidentKey) {
+        return service.agencyConfig(incidentKey);
+    }
+
+    /**
+     * 提交外部机构确认/拒绝回执（ackKey 幂等；REJECT 需非空说明，
+     * 拒绝使事件进入 EXTERNAL_BLOCKED）。
+     */
+    @PostMapping("/{incidentKey}/agency-acks")
+    public AgencyReceiptView submitAgencyAck(@PathVariable String incidentKey,
+                                             @RequestBody AgencyAckRequest req) {
+        return service.submitAgencyAck(incidentKey, req);
     }
 }

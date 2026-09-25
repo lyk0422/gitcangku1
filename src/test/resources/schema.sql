@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS incidents (
     reporter VARCHAR(128) NOT NULL,
     status VARCHAR(16) NOT NULL,
     commander VARCHAR(128) NULL,
+    blocked_from VARCHAR(16) NULL,
     deadline_at TIMESTAMP(6) NULL,
     created_at TIMESTAMP(6) NOT NULL,
     updated_at TIMESTAMP(6) NOT NULL,
@@ -78,6 +79,7 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     group_code VARCHAR(64) NOT NULL,
     title VARCHAR(512) NOT NULL,
     status VARCHAR(16) NOT NULL,
+    priority VARCHAR(8) NOT NULL DEFAULT 'NORMAL',
     created_by VARCHAR(128) NOT NULL,
     done_by VARCHAR(128) NULL,
     done_at TIMESTAMP(6) NULL,
@@ -98,4 +100,27 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS incident_agency_configs (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    version INT NOT NULL,
+    agency_codes VARCHAR(512) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    created_by VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_agency_config_version UNIQUE (incident_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS incident_agency_receipts (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    config_version INT NOT NULL,
+    agency_code VARCHAR(64) NOT NULL,
+    receipt_type VARCHAR(16) NOT NULL,
+    reason VARCHAR(1024) NULL,
+    ack_key VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_agency_receipt UNIQUE (incident_id, config_version, agency_code)
 );

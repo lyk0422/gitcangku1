@@ -46,13 +46,38 @@ public final class Requests {
 
     /**
      * 处置任务创建请求：taskKey 事件内唯一；groupCode、title 非空；
-     * blockerIncidentKeys 为 0~5 个阻塞事件键，必须存在且不能是自身，重复键按去重处理。
+     * blockerIncidentKeys 为 0~5 个阻塞事件键，必须存在且不能是自身，重复键按去重处理；
+     * priority 为 NORMAL/HIGH，缺省 NORMAL；HIGH 任务受外部机构回执门禁约束。
      */
     public record TaskCreateRequest(String commandKey, String taskKey, String groupCode,
-                                    String title, List<String> blockerIncidentKeys) {
+                                    String title, List<String> blockerIncidentKeys,
+                                    String priority) {
+
+        /** 兼容缺省优先级（NORMAL）的创建请求。 */
+        public TaskCreateRequest(String commandKey, String taskKey, String groupCode,
+                                 String title, List<String> blockerIncidentKeys) {
+            this(commandKey, taskKey, groupCode, title, blockerIncidentKeys, null);
+        }
     }
 
     /** 任务完成/取消请求，操作人由 X-Actor-Id 指定且须为当前指挥人。 */
     public record TaskActionRequest(String commandKey) {
+    }
+
+    /**
+     * 外部机构配置请求：expectedVersion 为期望的当前配置版本（无配置时为 0），
+     * 不一致返回 409；agencyCodes 为 0~5 个必需机构代码，去重排序后保存，空集合合法。
+     * 操作人由 X-Actor-Id 指定且须为当前指挥人；已关闭事件不可修改（409）。
+     */
+    public record AgencyConfigRequest(Long expectedVersion, List<String> agencyCodes) {
+    }
+
+    /**
+     * 外部机构回执请求：ackKey 为机构侧幂等键（指纹含机构、配置版本、回执类型与说明，
+     * 成功重放首个响应，失败不占键）；configVersion 须等于当前生效配置版本；
+     * type 为 CONFIRM/REJECT；reason 在 REJECT 时必填非空。
+     */
+    public record AgencyAckRequest(String ackKey, String agencyCode, Long configVersion,
+                                   String type, String reason) {
     }
 }

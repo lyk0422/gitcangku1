@@ -111,4 +111,82 @@ class SchemaH2ScriptTest {
             }
         }
     }
+
+    @Test
+    void h2Schema_agencyTables_enforceConstraints() throws Exception {
+        String url = "jdbc:h2:mem:schema_h2_agency;MODE=MySQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=0";
+        try (Connection con = DriverManager.getConnection(url, "sa", "")) {
+            ScriptUtils.executeSqlScript(con, new ClassPathResource("schema-h2.sql"));
+
+            Instant now = Instant.parse("2026-09-22T00:00:00Z");
+            try (Statement st = con.createStatement()) {
+                st.execute("INSERT INTO incidents (incident_key, severity, summary, reporter, status,"
+                        + " commander, created_at, updated_at) VALUES"
+                        + " ('IK-A','S1','s','r','COMMANDING','alice','" + Timestamp.from(now) + "',"
+                        + "'" + Timestamp.from(now) + "')");
+
+                // 任务优先级默认值 NORMAL，可显式置 HIGH
+                st.execute("INSERT INTO incident_tasks (incident_id, task_key, group_code, title,"
+                        + " status, created_by, created_at, updated_at) VALUES (1,'T-1','G','t',"
+                        + "'OPEN','alice','" + Timestamp.from(now) + "','" + Timestamp.from(now)
+                        + "')");
+                try (ResultSet rs = st.executeQuery(
+                        "SELECT priority FROM incident_tasks WHERE id = 1")) {
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getString("priority")).isEqualTo("NORMAL");
+                }
+
+                // 机构配置：(incident_id, version) 唯一
+                st.execute("INSERT INTO incident_agency_configs (incident_id, version, agency_codes,"
+                        + " status, created_by, created_at) VALUES (1,1,'FIRE,POLICE','ACTIVE',"
+                        + "'alice','" + Timestamp.from(now) + "')");
+                boolean duplicateVersionRejected = false;
+                try {
+                    st.execute("INSERT INTO incident_agency_configs (incident_id, version,"
+                            + " agency_codes, status, created_by, created_at) VALUES (1,1,'MEDIC',"
+                            + "'REPLACED','alice','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateVersionRejected = true;
+                }
+                assertThat(duplicateVersionRejected).isTrue();
+
+                // 回执：(incident_id, config_version, agency_code) 唯一，同机构同版本仅一条终态
+                st.execute("INSERT INTO incident_agency_receipts (incident_id, config_version,"
+                        + " agency_code, receipt_type, reason, ack_key, created_at) VALUES"
+                        + " (1,1,'FIRE','CONFIRM',NULL,'ACK-1','" + Timestamp.from(now) + "')");
+                boolean duplicateReceiptRejected = false;
+                try {
+                    st.execute("INSERT INTO incident_agency_receipts (incident_id, config_version,"
+                            + " agency_code, receipt_type, reason, ack_key, created_at) VALUES"
+                            + " (1,1,'FIRE','REJECT','r','ACK-2','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateReceiptRejected = true;
+                }
+                assertThat(duplicateReceiptRejected).isTrue();
+                // 同机构不同版本可各有一条回执（旧回执仅归属旧版本）
+                st.execute("INSERT INTO incident_agency_receipts (incident_id, config_version,"
+                        + " agency_code, receipt_type, reason, ack_key, created_at) VALUES"
+                        + " (1,2,'FIRE','CONFIRM',NULL,'ACK-3','" + Timestamp.from(now) + "')");
+                try (ResultSet rs = st.executeQuery(
+                        "SELECT COUNT(*) AS c FROM incident_agency_receipts")) {
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getInt("c")).isEqualTo(2);
+                }
+
+                // 事件阻断标记：blocked_from 可写可清空
+                int blocked = st.executeUpdate("UPDATE incidents SET status='EXTERNAL_BLOCKED',"
+                        + " blocked_from='COMMANDING' WHERE id = 1");
+                assertThat(blocked).isEqualTo(1);
+                int restored = st.executeUpdate("UPDATE incidents SET status='COMMANDING',"
+                        + " blocked_from=NULL WHERE id = 1");
+                assertThat(restored).isEqualTo(1);
+                try (ResultSet rs = st.executeQuery(
+                        "SELECT status, blocked_from FROM incidents WHERE id = 1")) {
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getString("status")).isEqualTo("COMMANDING");
+                    assertThat(rs.getString("blocked_from")).isNull();
+                }
+            }
+        }
+    }
 }

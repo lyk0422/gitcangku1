@@ -11,10 +11,14 @@ public final class Responses {
     private Responses() {
     }
 
-    /** 事件当前视图：pendingTransferTo 为待接受的交接目标人，无则 null。 */
+    /**
+     * 事件当前视图：pendingTransferTo 为待接受的交接目标人，无则 null；
+     * blockedFrom 为进入 EXTERNAL_BLOCKED 前的状态，仅 EXTERNAL_BLOCKED 有值。
+     */
     public record IncidentView(String incidentKey, String severity, String summary, String reporter,
                                String status, String commander, String pendingTransferTo,
-                               Instant createdAt, Instant updatedAt, Instant deadlineAt) {
+                               Instant createdAt, Instant updatedAt, Instant deadlineAt,
+                               String blockedFrom) {
     }
 
     /** 交接单视图。 */
@@ -64,10 +68,12 @@ public final class Responses {
 
     /**
      * 处置任务视图：blockers 按阻塞事件键排序；doneBy/doneAt 仅 DONE 有值，
-     * cancelledBy/cancelledAt 仅 CANCELLED 有值。
+     * cancelledBy/cancelledAt 仅 CANCELLED 有值；priority 为 NORMAL/HIGH；
+     * agencyGate 为外部机构回执门禁原因（仅 HIGH 任务可能 gated）。
      */
     public record TaskView(String taskKey, String groupCode, String title, String status,
-                           List<TaskBlockerView> blockers, String createdBy, Instant createdAt,
+                           String priority, List<TaskBlockerView> blockers,
+                           TaskGateView agencyGate, String createdBy, Instant createdAt,
                            String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt) {
     }
 
@@ -77,5 +83,32 @@ public final class Responses {
 
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
+    }
+
+    /**
+     * 任务外部机构门禁视图：gated 表示该 HIGH 任务当前被门禁拦截；
+     * reason 为 EXTERNAL_BLOCKED（机构拒绝阻断）或 AGENCY_ACK_PENDING（机构未确认齐全），
+     * 未拦截时为 null；pendingAgencies 为尚无回执的必需机构，rejectedAgencies 为已拒绝机构。
+     */
+    public record TaskGateView(boolean gated, String reason, List<String> pendingAgencies,
+                               List<String> rejectedAgencies) {
+    }
+
+    /**
+     * 外部机构回执视图：configVersion 为回执归属的配置版本（旧版本回执不随配置替换迁移）；
+     * reason 仅 REJECT 有值。
+     */
+    public record AgencyReceiptView(String agencyCode, int configVersion, String type,
+                                    String reason, Instant createdAt) {
+    }
+
+    /**
+     * 外部机构配置查询视图：version 为当前生效配置版本（从未配置为 0）；
+     * agencyCodes 为去重排序后的必需机构代码；receipts 为当前版本已接收的回执；
+     * pendingAgencies 为当前版本尚无回执的必需机构，rejectedAgencies 为当前版本已拒绝机构。
+     */
+    public record AgencyConfigView(String incidentKey, int version, List<String> agencyCodes,
+                                   String incidentStatus, List<AgencyReceiptView> receipts,
+                                   List<String> pendingAgencies, List<String> rejectedAgencies) {
     }
 }

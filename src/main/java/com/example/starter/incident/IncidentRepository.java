@@ -46,11 +46,13 @@ public class IncidentRepository {
 
     private static Incident mapIncident(ResultSet rs) throws SQLException {
         Timestamp deadline = rs.getTimestamp("deadline_at");
+        String blockedFrom = rs.getString("blocked_from");
         return new Incident(rs.getLong("id"), rs.getString("incident_key"), rs.getString("severity"),
                 rs.getString("summary"), rs.getString("reporter"),
                 IncidentStatus.valueOf(rs.getString("status")), rs.getString("commander"),
                 rs.getTimestamp("created_at").toInstant(), rs.getTimestamp("updated_at").toInstant(),
-                deadline == null ? null : deadline.toInstant());
+                deadline == null ? null : deadline.toInstant(),
+                blockedFrom == null ? null : IncidentStatus.valueOf(blockedFrom));
     }
 
     /**
@@ -59,6 +61,15 @@ public class IncidentRepository {
     public Optional<Incident> findByKey(String incidentKey) {
         List<Incident> rows = jdbc.query("SELECT * FROM incidents WHERE incident_key = ?",
                 INCIDENT_MAPPER, incidentKey);
+        return rows.stream().findFirst();
+    }
+
+    /**
+     * 按主键查询事件（不加锁），用于任务视图等已知事件 id 的只读场景。
+     */
+    public Optional<Incident> findById(long id) {
+        List<Incident> rows = jdbc.query("SELECT * FROM incidents WHERE id = ?",
+                INCIDENT_MAPPER, id);
         return rows.stream().findFirst();
     }
 
@@ -109,6 +120,25 @@ public class IncidentRepository {
     public void updateState(long id, IncidentStatus status, String commander, Instant updatedAt) {
         jdbc.update("UPDATE incidents SET status = ?, commander = ?, updated_at = ? WHERE id = ?",
                 status.name(), commander, Timestamp.from(updatedAt), id);
+    }
+
+    /**
+     * 任一必需外部机构拒绝时将事件置为 EXTERNAL_BLOCKED，
+     * 并记录进入前的状态（blocked_from），供替换配置后恢复。
+     */
+    public void markExternalBlocked(long id, IncidentStatus blockedFrom, Instant updatedAt) {
+        jdbc.update("UPDATE incidents SET status = 'EXTERNAL_BLOCKED', blocked_from = ?,"
+                        + " updated_at = ? WHERE id = ?",
+                blockedFrom.name(), Timestamp.from(updatedAt), id);
+    }
+
+    /**
+     * 替换机构配置后解除 EXTERNAL_BLOCKED：恢复到进入前的状态并清空 blocked_from。
+     */
+    public void clearExternalBlock(long id, IncidentStatus restoredStatus, Instant updatedAt) {
+        jdbc.update("UPDATE incidents SET status = ?, blocked_from = NULL, updated_at = ?"
+                        + " WHERE id = ?",
+                restoredStatus.name(), Timestamp.from(updatedAt), id);
     }
 
     /**

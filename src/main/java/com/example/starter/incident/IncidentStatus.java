@@ -3,6 +3,8 @@ package com.example.starter.incident;
 /**
  * 事件状态机：REPORTED → COMMANDING → CONTAINED → RESOLVED → CLOSED。
  * 只允许沿箭头前进一步，不允许跳转或回退；REPORTED → COMMANDING 仅能通过接管完成。
+ * EXTERNAL_BLOCKED 为旁路阻断态：任一必需外部机构拒绝时从当前非终态进入，
+ * 不响应常规状态变更；指挥人替换机构配置后恢复到进入前的状态（blocked_from）。
  */
 public enum IncidentStatus {
 
@@ -19,7 +21,10 @@ public enum IncidentStatus {
     RESOLVED,
 
     /** 已关闭，终态，禁止任何写入。 */
-    CLOSED;
+    CLOSED,
+
+    /** 外部机构阻断：必需机构拒绝后进入，替换机构配置后恢复原状态。 */
+    EXTERNAL_BLOCKED;
 
     /**
      * 返回当前状态经状态变更接口可到达的下一状态；不可变更时返回 null。
