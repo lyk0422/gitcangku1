@@ -5,8 +5,6 @@ import com.example.starter.blind.Clock;
 import com.example.starter.blind.dto.UnblindRequestView;
 import com.example.starter.blind.dto.UnblindResultView;
 import com.example.starter.blind.repo.AllocationRepository.AllocationRow;
-import com.example.starter.blind.repo.ExperimentRepository.SeatRow;
-import com.example.starter.blind.repo.ExperimentRepository;
 import com.example.starter.blind.repo.UnblindRequestRepository;
 import com.example.starter.blind.repo.UnblindRequestRepository.UnblindRequestRow;
 import org.springframework.dao.DuplicateKeyException;
@@ -19,23 +17,20 @@ import java.util.UUID;
  * 揭盲申请/批准/结果业务：
  * 协调员为已分配参与者提出带原因申请，同一分配至多一个待审申请；
  * 须由另一名 REVIEWER 批准；仅申请人本人可查询结果，其他人 403，未批准 409。
- * 实验关闭、退组不撤销已批准的揭盲。
+ * 实验关闭、退组不撤销已批准的揭盲；揭盲处理代码按受试者登记时的协议版本解析。
  */
 @Service
 public class UnblindService {
 
     private final UnblindRequestRepository unblindRequestRepository;
     private final ExperimentService experimentService;
-    private final ExperimentRepository experimentRepository;
     private final Clock clock;
 
     public UnblindService(UnblindRequestRepository unblindRequestRepository,
                           ExperimentService experimentService,
-                          ExperimentRepository experimentRepository,
                           Clock clock) {
         this.unblindRequestRepository = unblindRequestRepository;
         this.experimentService = experimentService;
-        this.experimentRepository = experimentRepository;
         this.clock = clock;
     }
 
@@ -51,6 +46,9 @@ public class UnblindService {
         if (reason.length() > 500) {
             throw ApiException.badRequest("reason 最长 500 字符");
         }
+        // 提交顺序裁决：揭盲申请与协议修订生效互斥地按实验行锁排序，
+        // 保证“生效时存在待处理揭盲申请”的判定不漏判并发申请。
+        experimentService.lockExperimentForOrdering(experimentId);
         AllocationRow allocation =
                 experimentService.mustFindAllocationRow(experimentId, participantId);
         UnblindRequestRow pending =
@@ -86,17 +84,13 @@ public class UnblindService {
         if (row.applicantActor().equals(reviewerActor)) {
             throw ApiException.forbidden("批准人必须是不同于申请人的另一名 REVIEWER");
         }
-        // 从数据库读取处理映射（盲底），批准时写入申请记录；处理代码不打日志。
+        // 从数据库读取处理映射（盲底）：按分配登记时的协议版本解析，修订不改变既有揭盲归属。
         AllocationRow allocation =
                 experimentService.mustFindAllocationRow(row.experimentId(), row.participantId());
-        SeatRow seat = experimentRepository.findSeat(row.experimentId(),
-                allocation.blockNo(), allocation.seatNo());
-        if (seat == null) {
-            throw new IllegalStateException("席位映射缺失，数据不一致");
-        }
+        String treatment = experimentService.resolveTreatment(allocation);
         long now = clock.nowMillis();
         unblindRequestRepository.approve(unblindRequestId, reviewerActor,
-                seat.treatment(), now);
+                treatment, now);
         return new UnblindRequestView(row.id(), row.experimentId(), row.participantId(),
                 row.reason(), row.applicantActor(), reviewerActor, "APPROVED",
                 row.createdAt(), now);

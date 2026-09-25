@@ -11,6 +11,7 @@ import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.MissingRequestHeaderException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 
 /**
  * 全局异常处理；错误信息不包含处理代码或席位序号。
@@ -45,5 +46,12 @@ public class GlobalExceptionHandler {
                 : "缺少必需请求头: " + ex.getHeaderName();
         return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                 .body(new ErrorBody(HttpStatus.BAD_REQUEST.getReasonPhrase(), message));
+    }
+
+    @ExceptionHandler(MethodArgumentTypeMismatchException.class)
+    public ResponseEntity<ErrorBody> handleTypeMismatch(MethodArgumentTypeMismatchException ex) {
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                .body(new ErrorBody(HttpStatus.BAD_REQUEST.getReasonPhrase(),
+                        "路径参数类型不正确: " + ex.getName()));
     }
 }
