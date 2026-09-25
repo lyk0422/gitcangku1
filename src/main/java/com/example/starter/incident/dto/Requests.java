@@ -46,13 +46,51 @@ public final class Requests {
 
     /**
      * 处置任务创建请求：taskKey 事件内唯一；groupCode、title 非空；
-     * blockerIncidentKeys 为 0~5 个阻塞事件键，必须存在且不能是自身，重复键按去重处理。
+     * blockerIncidentKeys 为 0~5 个阻塞事件键，必须存在且不能是自身，重复键按去重处理；
+     * requiredCredentials 为高危任务必需资质代码集合，null/缺省为非高危任务，集合换序视为同参。
      */
     public record TaskCreateRequest(String commandKey, String taskKey, String groupCode,
-                                    String title, List<String> blockerIncidentKeys) {
+                                    String title, List<String> blockerIncidentKeys,
+                                    List<String> requiredCredentials) {
+
+        /** 兼容旧调用：不显式声明必需资质时视为非高危任务。 */
+        public TaskCreateRequest(String commandKey, String taskKey, String groupCode,
+                                 String title, List<String> blockerIncidentKeys) {
+            this(commandKey, taskKey, groupCode, title, blockerIncidentKeys, List.of());
+        }
     }
 
-    /** 任务完成/取消请求，操作人由 X-Actor-Id 指定且须为当前指挥人。 */
+    /** 任务开始/完成/取消请求，操作人由 X-Actor-Id 指定且须为当前指挥人。 */
     public record TaskActionRequest(String commandKey) {
+    }
+
+    /**
+     * 资源资质登记请求：resourceId、credentialCode 非空；validUntil 为 UTC 有效期截止时刻；
+     * validFrom 可空表示登记即生效。同键重登（续期）使资源版本 +1。
+     */
+    public record CredentialRegisterRequest(String commandKey, String resourceId,
+                                            String credentialCode, Instant validFrom,
+                                            Instant validUntil) {
+    }
+
+    /** 资质提前撤销请求：reason 为非空撤销原因。 */
+    public record CredentialRevokeRequest(String commandKey, String reason) {
+    }
+
+    /** 批量分配内的单个高危任务租约项；leaseStart/leaseEnd 为 UTC 租约时段。 */
+    public record LeaseItem(String incidentKey, String taskKey, String resourceId,
+                            Instant leaseStart, Instant leaseEnd) {
+    }
+
+    /**
+     * 批量租约分配请求：一次为多个高危任务分配资源；先统一校验租约冲突、依赖门禁与
+     * 全部资质后态，再单事务创建全部租约，任一任务失败整单回滚。
+     */
+    public record LeaseAllocateRequest(String commandKey, List<LeaseItem> items) {
+    }
+
+    /** 租约替换请求：以新资源替换任务当前（可能处于资质风险的）租约。 */
+    public record LeaseReplaceRequest(String commandKey, String resourceId,
+                                      Instant leaseStart, Instant leaseEnd) {
     }
 }

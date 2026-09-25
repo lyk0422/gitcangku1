@@ -40,6 +40,9 @@ class IncidentTaskServiceTest {
 
     @BeforeEach
     void clean() {
+        jdbc.update("DELETE FROM credential_risks");
+        jdbc.update("DELETE FROM resource_leases");
+        jdbc.update("DELETE FROM resource_credentials");
         jdbc.update("DELETE FROM command_keys");
         jdbc.update("DELETE FROM incident_status_history");
         jdbc.update("DELETE FROM incident_transfers");
@@ -246,24 +249,32 @@ class IncidentTaskServiceTest {
         commanding("INC-P3", "carol");
         service.createTask("INC-P1", "alice",
                 new TaskCreateRequest(key(), "T-1", "G", "t", List.of("INC-P2", "INC-P3")));
-        // 两个阻塞均未解除：409，details 返回全部未解除事件
-        assertThatThrownBy(() -> service.completeTask("INC-P1", "T-1", "alice",
+        // 两个阻塞均未解除：开始 409，details 返回全部未解除事件
+        assertThatThrownBy(() -> service.startTask("INC-P1", "T-1", "alice",
                 new TaskActionRequest(key())))
                 .isInstanceOfSatisfying(ApiException.class, e -> {
                     assertThat(e.status()).isEqualTo(HttpStatus.CONFLICT);
                     assertThat(details(e)).containsExactlyInAnyOrder("INC-P2", "INC-P3");
                 });
+        // 未开始任务不能完成：409
+        assertApiStatus(() -> service.completeTask("INC-P1", "T-1", "alice",
+                new TaskActionRequest(key())), HttpStatus.CONFLICT);
         // 解除一个后仍 409，只剩未解除的事件
         service.changeStatus("INC-P2", "bob", new StatusRequest(key(), "CONTAINED"));
-        assertThatThrownBy(() -> service.completeTask("INC-P1", "T-1", "alice",
+        assertThatThrownBy(() -> service.startTask("INC-P1", "T-1", "alice",
                 new TaskActionRequest(key())))
                 .isInstanceOfSatisfying(ApiException.class, e -> {
                     assertThat(e.status()).isEqualTo(HttpStatus.CONFLICT);
                     assertThat(details(e)).containsExactly("INC-P3");
                 });
-        // 全部解除（RESOLVED/CLOSED 同样视为解除）后完成
+        // 全部解除（RESOLVED/CLOSED 同样视为解除）后开始、完成
         service.changeStatus("INC-P3", "carol", new StatusRequest(key(), "CONTAINED"));
         service.changeStatus("INC-P3", "carol", new StatusRequest(key(), "RESOLVED"));
+        TaskView started = service.startTask("INC-P1", "T-1", "alice",
+                new TaskActionRequest(key()));
+        assertThat(started.status()).isEqualTo("IN_PROGRESS");
+        assertThat(started.startedBy()).isEqualTo("alice");
+        assertThat(started.startedAt()).isNotNull();
         TaskView done = service.completeTask("INC-P1", "T-1", "alice",
                 new TaskActionRequest(key()));
         assertThat(done.status()).isEqualTo("DONE");
@@ -290,6 +301,7 @@ class IncidentTaskServiceTest {
         assertApiStatus(() -> service.completeTask("INC-S1", "T-2", "alice",
                 new TaskActionRequest(key())), HttpStatus.CONFLICT);
         // DONE 终态：再完成/取消均 409
+        service.startTask("INC-S1", "T-1", "alice", new TaskActionRequest(key()));
         service.completeTask("INC-S1", "T-1", "alice", new TaskActionRequest(key()));
         assertApiStatus(() -> service.completeTask("INC-S1", "T-1", "alice",
                 new TaskActionRequest(key())), HttpStatus.CONFLICT);
@@ -314,6 +326,9 @@ class IncidentTaskServiceTest {
         service.acceptTransfer("INC-W1", "bob", new TransferAcceptRequest(key()));
         assertApiStatus(() -> service.completeTask("INC-W1", "T-1", "alice",
                 new TaskActionRequest(key())), HttpStatus.CONFLICT);
+        TaskView started = service.startTask("INC-W1", "T-1", "bob",
+                new TaskActionRequest(key()));
+        assertThat(started.status()).isEqualTo("IN_PROGRESS");
         TaskView done = service.completeTask("INC-W1", "T-1", "bob",
                 new TaskActionRequest(key()));
         assertThat(done.doneBy()).isEqualTo("bob");
@@ -337,6 +352,7 @@ class IncidentTaskServiceTest {
         assertApiStatus(() -> service.completeTask("INC-I1", "T-1", "alice",
                 new TaskActionRequest(createKey)), HttpStatus.CONFLICT);
         // 完成：同键重放首次结果（终态同类重复操作按幂等规则返回）
+        service.startTask("INC-I1", "T-1", "alice", new TaskActionRequest(key()));
         String completeKey = key();
         TaskView done = service.completeTask("INC-I1", "T-1", "alice",
                 new TaskActionRequest(completeKey));
@@ -364,7 +380,8 @@ class IncidentTaskServiceTest {
                                     new UnfinishedTaskView("DB", "T-1"),
                                     new UnfinishedTaskView("APP", "T-2"));
                 });
-        // 完成一个后仍有 OPEN：409 且只剩未完成项
+        // 完成一个后仍有未完成任务：409 且只剩未完成项
+        service.startTask("INC-R1", "T-1", "alice", new TaskActionRequest(key()));
         service.completeTask("INC-R1", "T-1", "alice", new TaskActionRequest(key()));
         assertThatThrownBy(() -> service.changeStatus("INC-R1", "alice",
                 new StatusRequest(key(), "RESOLVED")))

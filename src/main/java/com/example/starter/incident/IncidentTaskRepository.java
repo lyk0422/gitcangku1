@@ -7,6 +7,7 @@ import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -42,16 +43,22 @@ public class IncidentTaskRepository {
     private static final RowMapper<IncidentTask> TASK_MAPPER = (rs, n) -> mapTask(rs);
 
     private static IncidentTask mapTask(ResultSet rs) throws SQLException {
+        Timestamp startedAt = rs.getTimestamp("started_at");
         Timestamp doneAt = rs.getTimestamp("done_at");
         Timestamp cancelledAt = rs.getTimestamp("cancelled_at");
+        String preRisk = rs.getString("pre_risk_status");
         return new IncidentTask(
                 rs.getLong("id"), rs.getLong("incident_id"), rs.getString("task_key"),
                 rs.getString("group_code"), rs.getString("title"),
                 TaskStatus.valueOf(rs.getString("status")),
-                rs.getString("created_by"), rs.getString("done_by"),
+                CredentialCodec.decode(rs.getString("required_credentials")),
+                rs.getString("created_by"), rs.getString("started_by"),
+                startedAt == null ? null : startedAt.toInstant(),
+                rs.getString("done_by"),
                 doneAt == null ? null : doneAt.toInstant(),
                 rs.getString("cancelled_by"),
                 cancelledAt == null ? null : cancelledAt.toInstant(),
+                preRisk == null ? null : TaskStatus.valueOf(preRisk),
                 rs.getTimestamp("created_at").toInstant(),
                 rs.getTimestamp("updated_at").toInstant());
     }
@@ -63,28 +70,33 @@ public class IncidentTaskRepository {
     }
 
     /**
-     * 插入 OPEN 任务，返回生成主键。(incident_id, task_key) 唯一约束兜底并发重复插入。
+     * 插入任务，返回生成主键。(incident_id, task_key) 唯一约束兜底并发重复插入。
      */
     public long insert(IncidentTask task) {
         KeyHolder keys = new GeneratedKeyHolder();
         jdbc.update(con -> {
             var ps = con.prepareStatement(
                     "INSERT INTO incident_tasks (incident_id, task_key, group_code, title, status,"
-                            + " created_by, done_by, done_at, cancelled_by, cancelled_at,"
-                            + " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                            + " required_credentials, created_by, started_by, started_at, done_by,"
+                            + " done_at, cancelled_by, cancelled_at, pre_risk_status,"
+                            + " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setLong(1, task.incidentId());
             ps.setString(2, task.taskKey());
             ps.setString(3, task.groupCode());
             ps.setString(4, task.title());
             ps.setString(5, task.status().name());
-            ps.setString(6, task.createdBy());
-            ps.setString(7, task.doneBy());
-            ps.setTimestamp(8, task.doneAt() == null ? null : Timestamp.from(task.doneAt()));
-            ps.setString(9, task.cancelledBy());
-            ps.setTimestamp(10, task.cancelledAt() == null ? null : Timestamp.from(task.cancelledAt()));
-            ps.setTimestamp(11, Timestamp.from(task.createdAt()));
-            ps.setTimestamp(12, Timestamp.from(task.updatedAt()));
+            ps.setString(6, CredentialCodec.encode(task.requiredCredentials()));
+            ps.setString(7, task.createdBy());
+            ps.setString(8, task.startedBy());
+            ps.setTimestamp(9, task.startedAt() == null ? null : Timestamp.from(task.startedAt()));
+            ps.setString(10, task.doneBy());
+            ps.setTimestamp(11, task.doneAt() == null ? null : Timestamp.from(task.doneAt()));
+            ps.setString(12, task.cancelledBy());
+            ps.setTimestamp(13, task.cancelledAt() == null ? null : Timestamp.from(task.cancelledAt()));
+            ps.setString(14, task.preRiskStatus() == null ? null : task.preRiskStatus().name());
+            ps.setTimestamp(15, Timestamp.from(task.createdAt()));
+            ps.setTimestamp(16, Timestamp.from(task.updatedAt()));
             return ps;
         }, keys);
         return keys.getKey().longValue();
@@ -101,6 +113,15 @@ public class IncidentTaskRepository {
     }
 
     /**
+     * 按主键查询任务，用于租约分配等跨事件场景。
+     */
+    public Optional<IncidentTask> findById(long taskId) {
+        List<IncidentTask> rows = jdbc.query("SELECT * FROM incident_tasks WHERE id = ?",
+                TASK_MAPPER, taskId);
+        return rows.stream().findFirst();
+    }
+
+    /**
      * 查询事件全部任务，按创建顺序返回。
      */
     public List<IncidentTask> listByIncident(long incidentId) {
@@ -109,11 +130,12 @@ public class IncidentTaskRepository {
     }
 
     /**
-     * 查询事件仍 OPEN 的任务（解决门禁用），按创建顺序返回。
+     * 查询事件仍可解决门禁拦截的任务：OPEN 或 IN_PROGRESS 或 CREDENTIAL_RISK 均未完成。
      */
-    public List<IncidentTask> listOpenByIncident(long incidentId) {
-        return jdbc.query("SELECT * FROM incident_tasks WHERE incident_id = ? AND status = 'OPEN'"
-                + " ORDER BY id", TASK_MAPPER, incidentId);
+    public List<IncidentTask> listUnfinishedByIncident(long incidentId) {
+        return jdbc.query("SELECT * FROM incident_tasks WHERE incident_id = ?"
+                        + " AND status IN ('OPEN','IN_PROGRESS','CREDENTIAL_RISK') ORDER BY id",
+                TASK_MAPPER, incidentId);
     }
 
     /**
@@ -126,7 +148,16 @@ public class IncidentTaskRepository {
     }
 
     /**
-     * 将 OPEN 任务置为 DONE，记录完成人与 UTC 时刻。
+     * 将任务置为 IN_PROGRESS，记录开始人与 UTC 时刻。仅 OPEN 可开始。
+     */
+    public void markStarted(long id, String actor, Instant at) {
+        jdbc.update("UPDATE incident_tasks SET status = 'IN_PROGRESS', started_by = ?,"
+                        + " started_at = ?, updated_at = ? WHERE id = ?",
+                actor, Timestamp.from(at), Timestamp.from(at), id);
+    }
+
+    /**
+     * 将 IN_PROGRESS 任务置为 DONE，记录完成人与 UTC 时刻。
      */
     public void markDone(long id, String actor, Instant at) {
         jdbc.update("UPDATE incident_tasks SET status = 'DONE', done_by = ?, done_at = ?,"
@@ -141,6 +172,25 @@ public class IncidentTaskRepository {
         jdbc.update("UPDATE incident_tasks SET status = 'CANCELLED', cancelled_by = ?,"
                         + " cancelled_at = ?, updated_at = ? WHERE id = ?",
                 actor, Timestamp.from(at), Timestamp.from(at), id);
+    }
+
+    /**
+     * 资质撤销后将任务置为 CREDENTIAL_RISK，保存进入风险前的状态（OPEN/IN_PROGRESS）。
+     */
+    public void markCredentialRisk(long id, TaskStatus preRiskStatus, Instant at) {
+        jdbc.update("UPDATE incident_tasks SET status = 'CREDENTIAL_RISK', pre_risk_status = ?,"
+                        + " updated_at = ? WHERE id = ?",
+                preRiskStatus.name(), Timestamp.from(at), id);
+    }
+
+    /**
+     * 以合格租约替换后清除风险门禁：恢复进入风险前的状态（OPEN/IN_PROGRESS）并清空
+     * pre_risk_status。
+     */
+    public void clearCredentialRisk(long id, TaskStatus restoreStatus, Instant at) {
+        jdbc.update("UPDATE incident_tasks SET status = ?, pre_risk_status = NULL,"
+                        + " updated_at = ? WHERE id = ?",
+                restoreStatus.name(), Timestamp.from(at), id);
     }
 
     /**

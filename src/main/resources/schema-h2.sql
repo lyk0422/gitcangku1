@@ -79,14 +79,67 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     group_code VARCHAR(64) NOT NULL,
     title VARCHAR(512) NOT NULL,
     status VARCHAR(16) NOT NULL,
+    required_credentials VARCHAR(2048) NOT NULL,
     created_by VARCHAR(128) NOT NULL,
+    started_by VARCHAR(128) NULL,
+    started_at TIMESTAMP(6) NULL,
     done_by VARCHAR(128) NULL,
     done_at TIMESTAMP(6) NULL,
     cancelled_by VARCHAR(128) NULL,
     cancelled_at TIMESTAMP(6) NULL,
+    pre_risk_status VARCHAR(16) NULL,
     created_at TIMESTAMP(6) NOT NULL,
     updated_at TIMESTAMP(6) NOT NULL,
     CONSTRAINT uk_task_key UNIQUE (incident_id, task_key)
+);
+
+-- 资源资质：(resource_id, credential_code) 唯一；时间均为 UTC。
+CREATE TABLE IF NOT EXISTS resource_credentials (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    resource_id VARCHAR(128) NOT NULL,
+    credential_code VARCHAR(64) NOT NULL,
+    valid_from TIMESTAMP(6) NULL,
+    valid_until TIMESTAMP(6) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    version BIGINT NOT NULL,
+    revoked_by VARCHAR(128) NULL,
+    revoked_at TIMESTAMP(6) NULL,
+    revoke_reason VARCHAR(1024) NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_resource_credential UNIQUE (resource_id, credential_code)
+);
+
+-- 资源租约：current_flag=1 为任务当前租约，被替换后置 NULL；UNIQUE 允许多个 NULL。
+CREATE TABLE IF NOT EXISTS resource_leases (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    task_id BIGINT NOT NULL,
+    resource_id VARCHAR(128) NOT NULL,
+    resource_version BIGINT NOT NULL,
+    lease_start TIMESTAMP(6) NOT NULL,
+    lease_end TIMESTAMP(6) NOT NULL,
+    required_credentials VARCHAR(2048) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    current_flag TINYINT NULL,
+    created_by VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    replaced_by VARCHAR(128) NULL,
+    replaced_at TIMESTAMP(6) NULL,
+    CONSTRAINT uk_task_current_lease UNIQUE (task_id, current_flag)
+);
+
+-- 资质风险不可变记录：只追加，不更新不删除。
+CREATE TABLE IF NOT EXISTS credential_risks (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    lease_id BIGINT NOT NULL,
+    task_id BIGINT NOT NULL,
+    incident_id BIGINT NOT NULL,
+    resource_id VARCHAR(128) NOT NULL,
+    credential_code VARCHAR(64) NOT NULL,
+    reason VARCHAR(1024) NOT NULL,
+    triggered_by VARCHAR(128) NOT NULL,
+    triggered_at TIMESTAMP(6) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS incident_task_blockers (
@@ -98,5 +151,10 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 );
 
 CREATE TABLE IF NOT EXISTS task_graph_lock (
+    id TINYINT PRIMARY KEY
+);
+
+-- 租约分配/撤销/替换全局串行锁，保证按事务提交顺序裁决。
+CREATE TABLE IF NOT EXISTS lease_lock (
     id TINYINT PRIMARY KEY
 );

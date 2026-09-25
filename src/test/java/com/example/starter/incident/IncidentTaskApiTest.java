@@ -32,6 +32,9 @@ class IncidentTaskApiTest {
 
     @BeforeEach
     void clean() {
+        jdbc.update("DELETE FROM credential_risks");
+        jdbc.update("DELETE FROM resource_leases");
+        jdbc.update("DELETE FROM resource_credentials");
         jdbc.update("DELETE FROM command_keys");
         jdbc.update("DELETE FROM incident_status_history");
         jdbc.update("DELETE FROM incident_transfers");
@@ -107,17 +110,32 @@ class IncidentTaskApiTest {
                 .andExpect(jsonPath("$.groupCode").value("DB"))
                 .andExpect(jsonPath("$.createdBy").value("alice"));
 
-        // 阻塞未解除时完成 → 409 且 details 返回未解除事件列表
-        mvc.perform(post("/api/incidents/{k}/tasks/{t}/complete", "INC-500", "T-1")
+        // 阻塞未解除时开始 → 409 且 details 返回未解除事件列表
+        mvc.perform(post("/api/incidents/{k}/tasks/{t}/start", "INC-500", "T-1")
                         .header("X-Actor-Id", "alice")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"commandKey\":\"" + key() + "\"}"))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("CONFLICT"))
                 .andExpect(jsonPath("$.details[0]").value("INC-501"));
+        // 未开始任务不能完成 → 409（无阻塞明细）
+        mvc.perform(post("/api/incidents/{k}/tasks/{t}/complete", "INC-500", "T-1")
+                        .header("X-Actor-Id", "alice")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"commandKey\":\"" + key() + "\"}"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("CONFLICT"))
+                .andExpect(jsonPath("$.details").doesNotExist());
 
-        // 阻塞事件遏制后完成成功
+        // 阻塞事件遏制后开始、完成成功
         changeStatus("INC-501", "bob", "CONTAINED");
+        mvc.perform(post("/api/incidents/{k}/tasks/{t}/start", "INC-500", "T-1")
+                        .header("X-Actor-Id", "alice")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"commandKey\":\"" + key() + "\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("IN_PROGRESS"))
+                .andExpect(jsonPath("$.startedBy").value("alice"));
         mvc.perform(post("/api/incidents/{k}/tasks/{t}/complete", "INC-500", "T-1")
                         .header("X-Actor-Id", "alice")
                         .contentType(MediaType.APPLICATION_JSON)

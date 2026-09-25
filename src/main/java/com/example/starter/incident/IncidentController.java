@@ -170,7 +170,18 @@ public class IncidentController {
     }
 
     /**
-     * 完成任务（仅当前指挥人；全部阻塞解除后才可完成）。
+     * 开始任务（仅当前指挥人；全部阻塞解除且高危任务租约资质覆盖后才可开始；
+     * CREDENTIAL_RISK 不得开始）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/start")
+    public TaskView startTask(@PathVariable String incidentKey, @PathVariable String taskKey,
+                              @RequestHeader("X-Actor-Id") String actor,
+                              @RequestBody TaskActionRequest req) {
+        return service.startTask(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 完成任务（仅当前指挥人；进行中且全部阻塞解除、无资质风险后才可完成）。
      */
     @PostMapping("/{incidentKey}/tasks/{taskKey}/complete")
     public TaskView completeTask(@PathVariable String incidentKey, @PathVariable String taskKey,

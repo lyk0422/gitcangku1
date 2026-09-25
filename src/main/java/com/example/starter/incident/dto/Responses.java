@@ -63,19 +63,73 @@ public final class Responses {
     }
 
     /**
-     * 处置任务视图：blockers 按阻塞事件键排序；doneBy/doneAt 仅 DONE 有值，
-     * cancelledBy/cancelledAt 仅 CANCELLED 有值。
+     * 处置任务视图：blockers 按阻塞事件键排序；requiredCredentials 为字典序必需资质集合
+     * （空列表表示非高危任务）；startedBy/startedAt 仅已开始任务有值；
+     * doneBy/doneAt 仅 DONE 有值，cancelledBy/cancelledAt 仅 CANCELLED 有值；
+     * credentialRisk 为当前任务是否处于资质风险门禁。
      */
     public record TaskView(String taskKey, String groupCode, String title, String status,
-                           List<TaskBlockerView> blockers, String createdBy, Instant createdAt,
-                           String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt) {
+                           List<String> requiredCredentials, List<TaskBlockerView> blockers,
+                           String createdBy, Instant createdAt, String startedBy, Instant startedAt,
+                           String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt,
+                           boolean credentialRisk) {
     }
 
     /** 按事件分组的任务列表视图：tasks 按创建顺序返回。 */
     public record IncidentTasksView(String incidentKey, List<TaskView> tasks) {
     }
 
-    /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
+    /** 解决门禁未完成项：仍有 OPEN/IN_PROGRESS/CREDENTIAL_RISK 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
+    }
+
+    /** 资源资质视图：validFrom 为空表示登记即生效。 */
+    public record CredentialView(String resourceId, String credentialCode, Instant validFrom,
+                                 Instant validUntil, String status, long version,
+                                 String revokedBy, Instant revokedAt, String revokeReason) {
+    }
+
+    /** 资源的全部资质视图，按资质代码字典序返回。 */
+    public record ResourceCredentialsView(String resourceId, List<CredentialView> credentials) {
+    }
+
+    /** 租约视图：current 表示是否为任务当前租约。 */
+    public record LeaseView(long leaseId, String incidentKey, String taskKey, String resourceId,
+                            long resourceVersion, Instant leaseStart, Instant leaseEnd,
+                            List<String> requiredCredentials, String status, boolean current,
+                            String createdBy, Instant createdAt) {
+    }
+
+    /**
+     * 批量租约分配结果：created 为本次单事务创建的全部租约（与请求项顺序一致）。
+     */
+    public record LeaseAllocateView(List<LeaseView> created) {
+    }
+
+    /** 资质风险不可变记录视图。 */
+    public record CredentialRiskView(long riskId, long leaseId, String incidentKey, String taskKey,
+                                     String resourceId, String credentialCode, String reason,
+                                     String triggeredBy, Instant triggeredAt, Instant createdAt) {
+    }
+
+    /** 事件风险租约列表视图。 */
+    public record RiskLeasesView(String incidentKey, List<CredentialRiskView> risks) {
+    }
+
+    /**
+     * 资质撤销结果：credential 为撤销后资质视图；triggeredRisks 为本次撤销新产生的
+     * 不可变风险记录（已完成任务不产生记录、不改写）。
+     */
+    public record CredentialRevokeView(CredentialView credential,
+                                       List<CredentialRiskView> triggeredRisks) {
+    }
+
+    /**
+     * 任务门禁原因视图：可开始/可完成为 false 时 reasons 给出按门禁类别归类的人读原因；
+     * credentialRisk 为资质风险门禁，依赖满足也不能绕过。
+     */
+    public record TaskGateView(String incidentKey, String taskKey, String status,
+                               boolean credentialRisk, boolean canStart, boolean canComplete,
+                               List<String> reasons) {
     }
 }

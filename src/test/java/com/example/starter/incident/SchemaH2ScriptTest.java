@@ -83,19 +83,69 @@ class SchemaH2ScriptTest {
 
                 // 处置任务：(incident_id, task_key) 唯一
                 st.execute("INSERT INTO incident_tasks (incident_id, task_key, group_code, title,"
-                        + " status, created_by, created_at, updated_at) VALUES (1,'T-1','G','t',"
-                        + "'OPEN','alice','" + Timestamp.from(now) + "','" + Timestamp.from(now)
-                        + "')");
+                        + " status, required_credentials, created_by, created_at, updated_at)"
+                        + " VALUES (1,'T-1','G','t','OPEN','C1,C2','alice','"
+                        + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
                 boolean duplicateTaskRejected = false;
                 try {
                     st.execute("INSERT INTO incident_tasks (incident_id, task_key, group_code,"
-                            + " title, status, created_by, created_at, updated_at) VALUES"
-                            + " (1,'T-1','G','t2','OPEN','alice','" + Timestamp.from(now) + "','"
-                            + Timestamp.from(now) + "')");
+                            + " title, status, required_credentials, created_by, created_at,"
+                            + " updated_at) VALUES (1,'T-1','G','t2','OPEN','','alice','"
+                            + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
                 } catch (Exception e) {
                     duplicateTaskRejected = true;
                 }
                 assertThat(duplicateTaskRejected).isTrue();
+
+                // 资源资质：(resource_id, credential_code) 唯一
+                st.execute("INSERT INTO resource_credentials (resource_id, credential_code,"
+                        + " valid_from, valid_until, status, version, created_at, updated_at)"
+                        + " VALUES ('R-1','C1',NULL,'" + Timestamp.from(now.plusSeconds(3600))
+                        + "','ACTIVE',1,'" + Timestamp.from(now) + "','" + Timestamp.from(now)
+                        + "')");
+                boolean duplicateCredentialRejected = false;
+                try {
+                    st.execute("INSERT INTO resource_credentials (resource_id, credential_code,"
+                            + " valid_from, valid_until, status, version, created_at, updated_at)"
+                            + " VALUES ('R-1','C1',NULL,'" + Timestamp.from(now.plusSeconds(3600))
+                            + "','ACTIVE',1,'" + Timestamp.from(now) + "','"
+                            + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateCredentialRejected = true;
+                }
+                assertThat(duplicateCredentialRejected).isTrue();
+
+                // 资源租约：每任务至多一条当前租约（task_id,current_flag=1）唯一
+                st.execute("INSERT INTO resource_leases (task_id, resource_id, resource_version,"
+                        + " lease_start, lease_end, required_credentials, status, current_flag,"
+                        + " created_by, created_at) VALUES (1,'R-1',1,'" + Timestamp.from(now)
+                        + "','" + Timestamp.from(now.plusSeconds(3600)) + "','C1','ACTIVE',1,"
+                        + "'alice','" + Timestamp.from(now) + "')");
+                boolean secondCurrentLeaseRejected = false;
+                try {
+                    st.execute("INSERT INTO resource_leases (task_id, resource_id,"
+                            + " resource_version, lease_start, lease_end, required_credentials,"
+                            + " status, current_flag, created_by, created_at) VALUES"
+                            + " (1,'R-2',1,'" + Timestamp.from(now) + "','"
+                            + Timestamp.from(now.plusSeconds(3600)) + "','C1','ACTIVE',1,"
+                            + "'alice','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    secondCurrentLeaseRejected = true;
+                }
+                assertThat(secondCurrentLeaseRejected).isTrue();
+                // 历史租约 current_flag=NULL 不与唯一约束冲突
+                st.executeUpdate("UPDATE resource_leases SET current_flag = NULL WHERE task_id = 1");
+                st.execute("INSERT INTO resource_leases (task_id, resource_id, resource_version,"
+                        + " lease_start, lease_end, required_credentials, status, current_flag,"
+                        + " created_by, created_at) VALUES (1,'R-2',1,'" + Timestamp.from(now)
+                        + "','" + Timestamp.from(now.plusSeconds(3600)) + "','C1','ACTIVE',1,"
+                        + "'alice','" + Timestamp.from(now) + "')");
+
+                // 资质风险记录可正常追加
+                st.execute("INSERT INTO credential_risks (lease_id, task_id, incident_id,"
+                        + " resource_id, credential_code, reason, triggered_by, triggered_at,"
+                        + " created_at) VALUES (2,1,1,'R-1','C1','revoked','alice','"
+                        + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
 
                 // 阻塞边：(task_id, blocker_incident_id) 唯一
                 st.execute("INSERT INTO incident_task_blockers (task_id, blocker_incident_id,"

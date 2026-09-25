@@ -42,6 +42,9 @@ class IncidentTaskConcurrencyTest {
 
     @BeforeEach
     void clean() {
+        jdbc.update("DELETE FROM credential_risks");
+        jdbc.update("DELETE FROM resource_leases");
+        jdbc.update("DELETE FROM resource_credentials");
         jdbc.update("DELETE FROM command_keys");
         jdbc.update("DELETE FROM incident_status_history");
         jdbc.update("DELETE FROM incident_transfers");
@@ -122,30 +125,34 @@ class IncidentTaskConcurrencyTest {
     }
 
     @Test
-    void concurrentCompleteAndBlockerContain_commitOrderWins() throws Exception {
+    void concurrentStartAndBlockerContain_commitOrderWins() throws Exception {
         commanding("INC-A", "alice");
         commanding("INC-B", "bob");
         service.createTask("INC-A", "alice",
                 new TaskCreateRequest(key(), "T-1", "G", "t", List.of("INC-B")));
 
-        // 并发：完成 A 的任务（依赖 B）与遏制 B
+        // 并发：开始 A 的任务（依赖 B）与遏制 B
         List<Object> results = runConcurrently(List.of(
-                () -> service.completeTask("INC-A", "T-1", "alice", new TaskActionRequest(key())),
+                () -> service.startTask("INC-A", "T-1", "alice", new TaskActionRequest(key())),
                 () -> service.changeStatus("INC-B", "bob", new StatusRequest(key(), "CONTAINED"))));
 
-        // 遏制必然成功；完成是否成功取决于其读取时 B 是否已提交遏制
+        // 遏制必然成功；开始是否成功取决于其读取时 B 是否已提交遏制
         IncidentView blocker = service.get("INC-B");
         assertThat(blocker.status()).isEqualTo("CONTAINED");
         TaskView task = service.getTask("INC-A", "T-1");
-        Object completeResult = results.get(0);
-        if (task.status().equals("DONE")) {
-            // 完成先看到已遏制的 B：成功，且阻塞确已解除
-            assertThat(completeResult).isInstanceOf(TaskView.class);
+        Object startResult = results.get(0);
+        if ("IN_PROGRESS".equals(task.status())) {
+            // 开始先看到已遏制的 B：成功，且阻塞确已解除
+            assertThat(startResult).isInstanceOf(TaskView.class);
         } else {
-            // 完成先提交：B 尚未遏制，409 拒绝，任务仍 OPEN
+            // 开始先提交：B 尚未遏制，409 拒绝，任务仍 OPEN
             assertThat(task.status()).isEqualTo("OPEN");
-            assertThat(completeResult).isInstanceOfSatisfying(ApiException.class,
+            assertThat(startResult).isInstanceOfSatisfying(ApiException.class,
                     e -> assertThat(e.status()).isEqualTo(HttpStatus.CONFLICT));
+            // 之后阻塞已解除，可正常开始
+            TaskView started = service.startTask("INC-A", "T-1", "alice",
+                    new TaskActionRequest(key()));
+            assertThat(started.status()).isEqualTo("IN_PROGRESS");
         }
     }
 
@@ -154,9 +161,10 @@ class IncidentTaskConcurrencyTest {
         commanding("INC-A", "alice");
         service.createTask("INC-A", "alice",
                 new TaskCreateRequest(key(), "T-1", "G", "t", List.of()));
+        service.startTask("INC-A", "T-1", "alice", new TaskActionRequest(key()));
         service.changeStatus("INC-A", "alice", new StatusRequest(key(), "CONTAINED"));
 
-        // 并发：完成唯一 OPEN 任务与推进 RESOLVED（解决门禁要求无 OPEN 任务）
+        // 并发：完成唯一进行中任务与推进 RESOLVED（解决门禁要求无未完成任务）
         List<Object> results = runConcurrently(List.of(
                 () -> service.completeTask("INC-A", "T-1", "alice", new TaskActionRequest(key())),
                 () -> service.changeStatus("INC-A", "alice", new StatusRequest(key(), "RESOLVED"))));

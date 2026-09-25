@@ -56,4 +56,19 @@ public class ApiException extends RuntimeException {
     public static ApiException illegalTransition(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "ILLEGAL_TRANSITION", message, null);
     }
+
+    /** 422：请求语义在当前资源状态下不可处理（如对非高危任务分配租约、终态任务分配）。 */
+    public static ApiException unprocessable(String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "UNPROCESSABLE_ENTITY",
+                message, null);
+    }
+
+    /**
+     * 422：租约资质不满足门禁（缺失/已撤销或未严格覆盖任务计划完成时刻）。
+     * details 形如 {"missing":[...],"expired":[...]}。
+     */
+    public static ApiException credentialNotCovered(String message, Object details) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "CREDENTIAL_NOT_COVERED",
+                message, details);
+    }
 }
