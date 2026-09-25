@@ -58,6 +58,16 @@ public class ReleaseController {
         return releaseService.history(releaseId);
     }
 
+    @GetMapping("/{releaseId}/incompatible")
+    public IncompatibleListResponse incompatible(@PathVariable long releaseId) {
+        return releaseService.incompatibleRecords(releaseId);
+    }
+
+    @GetMapping("/{releaseId}/model-stats")
+    public ModelStatsResponse modelStats(@PathVariable long releaseId) {
+        return releaseService.modelStats(releaseId);
+    }
+
     @GetMapping("/{releaseId}/tasks")
     public TaskListResponse tasks(@PathVariable long releaseId, @RequestParam(required = false) String status) {
         TaskStatus filter = parseStatus(status);

@@ -5,6 +5,7 @@ import com.example.starter.firmware.api.ReceiptRequest;
 import com.example.starter.firmware.api.TaskListResponse;
 import com.example.starter.firmware.api.TaskView;
 import com.example.starter.firmware.domain.Device;
+import com.example.starter.firmware.domain.FirmwareCompat;
 import com.example.starter.firmware.domain.ReceiptResult;
 import com.example.starter.firmware.domain.ReleaseOrder;
 import com.example.starter.firmware.domain.ReleaseStatus;
@@ -12,6 +13,7 @@ import com.example.starter.firmware.domain.RolloutTask;
 import com.example.starter.firmware.domain.TaskStatus;
 import com.example.starter.firmware.error.ApiException;
 import com.example.starter.firmware.repo.DeviceRepository;
+import com.example.starter.firmware.repo.IncompatibleRecordRepository;
 import com.example.starter.firmware.repo.PauseRecordRepository;
 import com.example.starter.firmware.repo.ReleaseRepository;
 import com.example.starter.firmware.repo.TaskRepository;
@@ -33,59 +35,75 @@ public class TaskService {
     private final ReleaseRepository releaseRepository;
     private final DeviceRepository deviceRepository;
     private final PauseRecordRepository pauseRecordRepository;
+    private final IncompatibleRecordRepository incompatibleRecordRepository;
     private final DeviceService deviceService;
     private final ReleaseService releaseService;
+    private final FirmwareCompatService firmwareCompatService;
     private final IdempotencyService idempotency;
     private final Clock clock;
 
     public TaskService(TaskRepository taskRepository, ReleaseRepository releaseRepository,
                        DeviceRepository deviceRepository, PauseRecordRepository pauseRecordRepository,
+                       IncompatibleRecordRepository incompatibleRecordRepository,
                        DeviceService deviceService, ReleaseService releaseService,
+                       FirmwareCompatService firmwareCompatService,
                        IdempotencyService idempotency, Clock clock) {
         this.taskRepository = taskRepository;
         this.releaseRepository = releaseRepository;
         this.deviceRepository = deviceRepository;
         this.pauseRecordRepository = pauseRecordRepository;
+        this.incompatibleRecordRepository = incompatibleRecordRepository;
         this.deviceService = deviceService;
         this.releaseService = releaseService;
+        this.firmwareCompatService = firmwareCompatService;
         this.idempotency = idempotency;
         this.clock = clock;
     }
 
     /**
-     * 设备拉取：已存在任务直接返回；否则仅当型号与当前版本匹配、分桶号小于比例且发布单 ACTIVE 时创建。
+     * 设备拉取：已存在任务直接返回；目标固件不兼容设备硬件型号时返回 INCOMPATIBLE，
+     * 不创建任务、不计入失败率样本、不改变设备状态，仅记录首次拦截；
+     * 否则仅当型号与当前版本匹配、分桶号小于比例且发布单 ACTIVE 时创建，任务固化当前矩阵版本。
      * PAUSED 时不创建新任务，已有任务仍可查看与回执。
      */
     public PullResponse pull(String deviceId, String requestId) {
-        String fingerprint = String.join("|", "task.pull", deviceId);
+        Device device = deviceService.findDevice(deviceId);
+        var activeOrder = releaseRepository.findActiveByModel(device.model());
+        String fingerprint = "task.pull|" + deviceId + "|" + activeOrder
+                .map(order -> order.version() + "|" + order.toVersion())
+                .orElse("none|none");
         return idempotency.execute(requestId, "task.pull", fingerprint, () -> {
-            Device device = deviceService.findDevice(deviceId);
-            var activeOrder = releaseRepository.findActiveByModel(device.model());
             if (activeOrder.isEmpty()) {
-                return new PullResponse(null);
+                return PullResponse.none();
             }
             ReleaseOrder order = releaseRepository.findByIdForUpdate(activeOrder.get().id())
                     .orElseThrow(() -> ApiException.notFound("RELEASE_NOT_FOUND", "发布单不存在"));
             var existing = taskRepository.findByReleaseAndDevice(order.id(), deviceId);
             if (existing.isPresent()) {
-                return new PullResponse(TaskView.of(existing.get(), order));
+                return PullResponse.ofTask(TaskView.of(existing.get(), order));
+            }
+            FirmwareCompat compat = firmwareCompatService.findCompat(order.toVersion());
+            if (!compat.allows(device.hardwareModel())) {
+                incompatibleRecordRepository.insertIfAbsent(order.id(), deviceId, device.hardwareModel(),
+                        order.toVersion(), compat.matrixVersion(), Instant.now(clock).toString());
+                return PullResponse.incompatible();
             }
             if (order.status() != ReleaseStatus.ACTIVE
                     || !device.currentVersion().equals(order.fromVersion())
                     || device.bucketNo() >= order.ratio()) {
-                return new PullResponse(null);
+                return PullResponse.none();
             }
             long taskId;
             try {
-                taskId = taskRepository.insert(order.id(), deviceId);
+                taskId = taskRepository.insert(order.id(), deviceId, compat.matrixVersion());
             } catch (DuplicateKeyException e) {
                 RolloutTask task = taskRepository.findByReleaseAndDevice(order.id(), deviceId)
                         .orElseThrow(() -> new IllegalStateException("任务唯一约束冲突后未找到任务"));
-                return new PullResponse(TaskView.of(task, order));
+                return PullResponse.ofTask(TaskView.of(task, order));
             }
             RolloutTask task = taskRepository.findById(taskId)
                     .orElseThrow(() -> new IllegalStateException("任务创建后读取失败"));
-            return new PullResponse(TaskView.of(task, order));
+            return PullResponse.ofTask(TaskView.of(task, order));
         }, PullResponse.class);
     }
 

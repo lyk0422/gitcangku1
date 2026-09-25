@@ -67,6 +67,8 @@ class FirmwareConcurrencyTest {
     @BeforeEach
     void setUp() {
         jdbc.update("DELETE FROM rollout_task");
+        jdbc.update("DELETE FROM incompatible_record");
+        jdbc.update("DELETE FROM firmware_compat");
         jdbc.update("DELETE FROM release_pause_record");
         jdbc.update("DELETE FROM release_resume_record");
         jdbc.update("DELETE FROM release_order");

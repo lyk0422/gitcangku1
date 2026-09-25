@@ -3,6 +3,7 @@
 CREATE TABLE IF NOT EXISTS device (
   device_id VARCHAR(64) NOT NULL COMMENT '设备唯一标识',
   model VARCHAR(64) NOT NULL COMMENT '设备型号，登记后不可修改',
+  hardware_model VARCHAR(64) NOT NULL COMMENT '硬件型号，登记后不可修改；登记时未显式提供则等于设备型号',
   current_version VARCHAR(64) NOT NULL COMMENT '设备当前固件版本',
   bucket_no INT NOT NULL COMMENT '灰度分桶号，取值0~99，登记后不可修改',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '登记时间',
@@ -36,6 +37,7 @@ CREATE TABLE IF NOT EXISTS rollout_task (
   device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
   status VARCHAR(16) NOT NULL COMMENT 'PENDING待回执；SUCCESS成功；FAILED失败；CANCELLED已取消',
   first_result VARCHAR(16) NULL COMMENT '首次回执结果（SUCCESS/FAILED），未回执为NULL',
+  compat_version INT NOT NULL COMMENT '拉取创建任务时目标固件的兼容矩阵版本；未配置矩阵时为0',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
   PRIMARY KEY (id),
@@ -62,6 +64,26 @@ CREATE TABLE IF NOT EXISTS release_resume_record (
   resumed_at_utc VARCHAR(40) NOT NULL COMMENT '恢复时刻，UTC，ISO-8601格式（如2026-09-22T07:00:00Z）',
   PRIMARY KEY (id)
 ) COMMENT='发布单人工恢复记录，历史不可改';
+
+CREATE TABLE IF NOT EXISTS firmware_compat (
+  firmware_version VARCHAR(64) NOT NULL COMMENT '固件版本（发布单目标版本）',
+  matrix_version INT NOT NULL COMMENT '兼容矩阵版本，从1开始，每次修改成功加一',
+  allowed_models CLOB NOT NULL COMMENT '允许的硬件型号集合（JSON数组，升序去重存储）；空数组表示兼容全部型号',
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
+  PRIMARY KEY (firmware_version)
+) COMMENT='固件硬件兼容矩阵，按固件版本一行';
+
+CREATE TABLE IF NOT EXISTS incompatible_record (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '不兼容记录ID',
+  release_id BIGINT NOT NULL COMMENT '拦截时所在发布单ID',
+  device_id VARCHAR(64) NOT NULL COMMENT '被拦截设备ID',
+  hardware_model VARCHAR(64) NOT NULL COMMENT '被拦截设备的硬件型号',
+  firmware_version VARCHAR(64) NOT NULL COMMENT '目标固件版本',
+  matrix_version INT NOT NULL COMMENT '拦截时的兼容矩阵版本',
+  blocked_at_utc VARCHAR(40) NOT NULL COMMENT '首次拦截时刻，UTC，ISO-8601格式（如2026-09-25T07:00:00Z）',
+  PRIMARY KEY (id),
+  CONSTRAINT uk_incompat_release_device UNIQUE (release_id, device_id)
+) COMMENT='设备拉取被兼容矩阵拦截记录，同设备同发布单只记首次';
 
 CREATE TABLE IF NOT EXISTS idempotency_record (
   request_id VARCHAR(64) NOT NULL COMMENT '全局唯一请求ID',

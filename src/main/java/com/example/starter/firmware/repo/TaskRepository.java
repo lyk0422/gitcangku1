@@ -15,6 +15,7 @@ import java.util.Optional;
 
 /**
  * 投放任务数据访问。同设备同发布单由唯一约束 uk_task_release_device 保证最多一条。
+ * 任务创建时固化目标固件当时的兼容矩阵版本（compat_version）。
  */
 @Repository
 public class TaskRepository {
@@ -23,10 +24,11 @@ public class TaskRepository {
         String firstResult = rs.getString("first_result");
         return new RolloutTask(rs.getLong("id"), rs.getLong("release_id"), rs.getString("device_id"),
                 TaskStatus.valueOf(rs.getString("status")),
-                firstResult == null ? null : ReceiptResult.valueOf(firstResult));
+                firstResult == null ? null : ReceiptResult.valueOf(firstResult),
+                rs.getInt("compat_version"));
     };
 
-    private static final String COLUMNS = "id, release_id, device_id, status, first_result";
+    private static final String COLUMNS = "id, release_id, device_id, status, first_result, compat_version";
 
     private final JdbcTemplate jdbc;
 
@@ -34,14 +36,16 @@ public class TaskRepository {
         this.jdbc = jdbc;
     }
 
-    public long insert(long releaseId, String deviceId) {
+    public long insert(long releaseId, String deviceId, int compatVersion) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO rollout_task (release_id, device_id, status) VALUES (?, ?, 'PENDING')",
+                    "INSERT INTO rollout_task (release_id, device_id, status, compat_version)"
+                            + " VALUES (?, ?, 'PENDING', ?)",
                     new String[]{"id"});
             ps.setLong(1, releaseId);
             ps.setString(2, deviceId);
+            ps.setInt(3, compatVersion);
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();
@@ -86,5 +90,23 @@ public class TaskRepository {
                 "SELECT COUNT(*) FROM rollout_task WHERE release_id = ? AND device_id = ?",
                 Long.class, releaseId, deviceId);
         return count == null ? 0 : count;
+    }
+
+    /**
+     * 按硬件型号与任务状态分组的任务数（关联设备表取硬件型号）。
+     */
+    public List<ModelStatusCount> countByModelAndStatus(long releaseId) {
+        return jdbc.query("SELECT d.hardware_model, t.status, COUNT(*) AS cnt"
+                        + " FROM rollout_task t JOIN device d ON d.device_id = t.device_id"
+                        + " WHERE t.release_id = ? GROUP BY d.hardware_model, t.status",
+                (rs, rowNum) -> new ModelStatusCount(rs.getString("hardware_model"),
+                        rs.getString("status"), rs.getLong("cnt")),
+                releaseId);
+    }
+
+    /**
+     * 硬件型号 + 任务状态 + 数量的统计行。
+     */
+    public record ModelStatusCount(String hardwareModel, String status, long count) {
     }
 }
