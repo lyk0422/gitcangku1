@@ -26,17 +26,17 @@ public class PlayoutRepository {
         this.jdbc = jdbc;
     }
 
-    /** 素材行。 */
-    public record AssetRow(String id, long durationMs) {
+    /** 素材行；version 随版本拉取递增，withdrawn 为终态撤回标记。 */
+    public record AssetRow(String id, long durationMs, long version, boolean withdrawn) {
     }
 
     /** 频道行。 */
     public record ChannelRow(String id, String fallbackAssetId) {
     }
 
-    /** 授权行。 */
-    public record GrantRow(long id, String channelId, String assetId,
-                           long validFromMs, long validToMs, boolean revoked) {
+    /** 授权行；regionCode 为 NULL 表示全部区域，version 初始 1、撤销时递增。 */
+    public record GrantRow(long id, String channelId, String assetId, String regionCode,
+                           long validFromMs, long validToMs, long version, boolean revoked) {
     }
 
     /** 草稿行。 */
@@ -74,14 +74,17 @@ public class PlayoutRepository {
     }
 
     private static final RowMapper<AssetRow> ASSET_MAPPER = (rs, n) ->
-            new AssetRow(rs.getString("id"), rs.getLong("duration_ms"));
+            new AssetRow(rs.getString("id"), rs.getLong("duration_ms"),
+                    rs.getLong("version"), rs.getBoolean("withdrawn"));
 
     private static final RowMapper<ChannelRow> CHANNEL_MAPPER = (rs, n) ->
             new ChannelRow(rs.getString("id"), rs.getString("fallback_asset_id"));
 
     private static final RowMapper<GrantRow> GRANT_MAPPER = (rs, n) ->
             new GrantRow(rs.getLong("id"), rs.getString("channel_id"), rs.getString("asset_id"),
-                    rs.getLong("valid_from_ms"), rs.getLong("valid_to_ms"), rs.getBoolean("revoked"));
+                    rs.getString("region_code"),
+                    rs.getLong("valid_from_ms"), rs.getLong("valid_to_ms"),
+                    rs.getLong("version"), rs.getBoolean("revoked"));
 
     private static final RowMapper<DraftRow> DRAFT_MAPPER = (rs, n) ->
             new DraftRow(rs.getString("channel_id"), rs.getDate("business_day").toLocalDate(),
@@ -121,8 +124,19 @@ public class PlayoutRepository {
     }
 
     public Optional<AssetRow> findAsset(String id) {
-        return jdbc.query("SELECT id, duration_ms FROM playout_asset WHERE id = ?",
+        return jdbc.query("SELECT id, duration_ms, version, withdrawn FROM playout_asset WHERE id = ?",
                 ASSET_MAPPER, id).stream().findFirst();
+    }
+
+    /** 撤回素材；返回受影响行数，0 表示不存在或已撤回。撤回同时递增素材版本。 */
+    public int withdrawAsset(String id) {
+        return jdbc.update("UPDATE playout_asset SET withdrawn = 1, version = version + 1"
+                + " WHERE id = ? AND withdrawn = 0", id);
+    }
+
+    /** 拉取素材新版本：版本递增；返回受影响行数，0 表示素材不存在。 */
+    public int pullAssetVersion(String id) {
+        return jdbc.update("UPDATE playout_asset SET version = version + 1 WHERE id = ?", id);
     }
 
     // ---------- 频道 ----------
@@ -139,45 +153,48 @@ public class PlayoutRepository {
 
     // ---------- 授权 ----------
 
-    public long insertGrant(String channelId, String assetId, long validFromMs, long validToMs,
-                            long createdAtMs) {
+    public long insertGrant(String channelId, String assetId, String regionCode,
+                            long validFromMs, long validToMs, long createdAtMs) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO playout_grant (channel_id, asset_id, valid_from_ms, valid_to_ms, created_at_ms)"
-                            + " VALUES (?, ?, ?, ?, ?)", Statement.RETURN_GENERATED_KEYS);
+                    "INSERT INTO playout_grant (channel_id, asset_id, region_code,"
+                            + " valid_from_ms, valid_to_ms, created_at_ms)"
+                            + " VALUES (?, ?, ?, ?, ?, ?)", Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, channelId);
             ps.setString(2, assetId);
-            ps.setLong(3, validFromMs);
-            ps.setLong(4, validToMs);
-            ps.setLong(5, createdAtMs);
+            ps.setString(3, regionCode);
+            ps.setLong(4, validFromMs);
+            ps.setLong(5, validToMs);
+            ps.setLong(6, createdAtMs);
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();
     }
 
     public Optional<GrantRow> findGrant(long id) {
-        return jdbc.query("SELECT id, channel_id, asset_id, valid_from_ms, valid_to_ms, revoked"
+        return jdbc.query("SELECT id, channel_id, asset_id, region_code, valid_from_ms, valid_to_ms, version, revoked"
                 + " FROM playout_grant WHERE id = ?", GRANT_MAPPER, id).stream().findFirst();
     }
 
     /** 按 ID 查询授权并加行锁，用于紧急插播创建与授权撤销按提交顺序串行化。 */
     public Optional<GrantRow> findGrantForUpdate(long id) {
-        return jdbc.query("SELECT id, channel_id, asset_id, valid_from_ms, valid_to_ms, revoked"
+        return jdbc.query("SELECT id, channel_id, asset_id, region_code, valid_from_ms, valid_to_ms, version, revoked"
                 + " FROM playout_grant WHERE id = ? FOR UPDATE", GRANT_MAPPER, id)
                 .stream().findFirst();
     }
 
-    /** 撤销授权；返回受影响行数，0 表示不存在或已撤销。 */
+    /** 撤销授权并递增授权版本；返回受影响行数，0 表示不存在或已撤销。 */
     public int revokeGrant(long id, String revokeRequestId, long revokedAtMs) {
-        return jdbc.update("UPDATE playout_grant SET revoked = 1, revoke_request_id = ?, revoked_at_ms = ?"
+        return jdbc.update("UPDATE playout_grant SET revoked = 1, version = version + 1,"
+                + " revoke_request_id = ?, revoked_at_ms = ?"
                 + " WHERE id = ? AND revoked = 0", revokeRequestId, revokedAtMs, id);
     }
 
     /** 查找完整覆盖 [startMs, endMs) 的未撤销授权（区间左闭右开）。 */
     public List<GrantRow> findCoveringGrants(String channelId, String assetId,
                                              long startMs, long endMs) {
-        return jdbc.query("SELECT id, channel_id, asset_id, valid_from_ms, valid_to_ms, revoked"
+        return jdbc.query("SELECT id, channel_id, asset_id, region_code, valid_from_ms, valid_to_ms, version, revoked"
                         + " FROM playout_grant"
                         + " WHERE channel_id = ? AND asset_id = ? AND revoked = 0"
                         + " AND valid_from_ms <= ? AND valid_to_ms >= ?",
@@ -187,7 +204,7 @@ public class PlayoutRepository {
     /** 同上，但加行锁（FOR UPDATE），用于发布时与撤销串行化。 */
     public List<GrantRow> findCoveringGrantsForUpdate(String channelId, String assetId,
                                                       long startMs, long endMs) {
-        return jdbc.query("SELECT id, channel_id, asset_id, valid_from_ms, valid_to_ms, revoked"
+        return jdbc.query("SELECT id, channel_id, asset_id, region_code, valid_from_ms, valid_to_ms, version, revoked"
                         + " FROM playout_grant"
                         + " WHERE channel_id = ? AND asset_id = ?"
                         + " AND valid_from_ms <= ? AND valid_to_ms >= ?"
@@ -380,5 +397,245 @@ public class PlayoutRepository {
                         + " SET status = 'CANCELLED', cancel_request_id = ?, cancelled_at_ms = ?"
                         + " WHERE override_key = ? AND status = 'ACTIVE'",
                 cancelRequestId, cancelledAtMs, overrideKey);
+    }
+
+    // ---------- 区域插播配置 ----------
+
+    /** 区域插播配置行；grantVersion 为配置时固化的授权版本。 */
+    public record SpliceConfigRow(long id, String channelId, LocalDate businessDay, String segmentId,
+                                  String regionCode, String assetId, long grantId, long grantVersion,
+                                  long startMs, long endMs) {
+    }
+
+    private static final RowMapper<SpliceConfigRow> SPLICE_MAPPER = (rs, n) ->
+            new SpliceConfigRow(rs.getLong("id"), rs.getString("channel_id"),
+                    rs.getDate("business_day").toLocalDate(), rs.getString("segment_id"),
+                    rs.getString("region_code"), rs.getString("asset_id"),
+                    rs.getLong("grant_id"), rs.getLong("grant_version"),
+                    rs.getLong("start_ms"), rs.getLong("end_ms"));
+
+    private static final String SPLICE_COLUMNS =
+            "id, channel_id, business_day, segment_id, region_code, asset_id, grant_id,"
+                    + " grant_version, start_ms, end_ms";
+
+    public void insertSpliceConfig(String channelId, LocalDate businessDay, String segmentId,
+                                   String regionCode, String assetId, long grantId, long grantVersion,
+                                   long startMs, long endMs, long createdAtMs) {
+        jdbc.update("INSERT INTO playout_splice_config"
+                        + " (channel_id, business_day, segment_id, region_code, asset_id, grant_id,"
+                        + "  grant_version, start_ms, end_ms, created_at_ms)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                channelId, Date.valueOf(businessDay), segmentId, regionCode, assetId, grantId,
+                grantVersion, startMs, endMs, createdAtMs);
+    }
+
+    /** 删除条目全部插播配置（整份替换前调用）。 */
+    public void deleteSpliceConfigs(String channelId, LocalDate businessDay, String segmentId) {
+        jdbc.update("DELETE FROM playout_splice_config"
+                        + " WHERE channel_id = ? AND business_day = ? AND segment_id = ?",
+                channelId, Date.valueOf(businessDay), segmentId);
+    }
+
+    /** 删除频道某业务日全部插播配置（草稿整份替换时清除）。 */
+    public void deleteSpliceConfigsForDay(String channelId, LocalDate businessDay) {
+        jdbc.update("DELETE FROM playout_splice_config WHERE channel_id = ? AND business_day = ?",
+                channelId, Date.valueOf(businessDay));
+    }
+
+    /** 某条目的全部插播配置，按区域、窗口起点稳定排序。 */
+    public List<SpliceConfigRow> findSpliceConfigs(String channelId, LocalDate businessDay,
+                                                   String segmentId) {
+        return jdbc.query("SELECT " + SPLICE_COLUMNS + " FROM playout_splice_config"
+                        + " WHERE channel_id = ? AND business_day = ? AND segment_id = ?"
+                        + " ORDER BY region_code, start_ms, id",
+                SPLICE_MAPPER, channelId, Date.valueOf(businessDay), segmentId);
+    }
+
+    /** 频道某业务日全部插播配置，按条目、区域、窗口起点稳定排序。 */
+    public List<SpliceConfigRow> findSpliceConfigsForDay(String channelId, LocalDate businessDay) {
+        return jdbc.query("SELECT " + SPLICE_COLUMNS + " FROM playout_splice_config"
+                        + " WHERE channel_id = ? AND business_day = ?"
+                        + " ORDER BY segment_id, region_code, start_ms, id",
+                SPLICE_MAPPER, channelId, Date.valueOf(businessDay));
+    }
+
+    /** 锁定草稿行，串行化插播配置与草稿整份替换。 */
+    public Optional<DraftRow> findDraftForUpdate(String channelId, LocalDate businessDay) {
+        return jdbc.query("SELECT channel_id, business_day, version FROM playout_draft"
+                        + " WHERE channel_id = ? AND business_day = ? FOR UPDATE",
+                DRAFT_MAPPER, channelId, Date.valueOf(businessDay)).stream().findFirst();
+    }
+
+    // ---------- 黑屏窗口 ----------
+
+    /** 黑屏窗口行；status 为 ACTIVE / CANCELLED。 */
+    public record BlackoutRow(long id, String channelId, String regionCode,
+                              long startMs, long endMs, String status,
+                              String cancelRequestId, Long cancelledAtMs, long createdAtMs) {
+        public boolean active() {
+            return "ACTIVE".equals(status);
+        }
+    }
+
+    private static final RowMapper<BlackoutRow> BLACKOUT_MAPPER = (rs, n) ->
+            new BlackoutRow(rs.getLong("id"), rs.getString("channel_id"), rs.getString("region_code"),
+                    rs.getLong("start_ms"), rs.getLong("end_ms"), rs.getString("status"),
+                    rs.getString("cancel_request_id"),
+                    (Long) rs.getObject("cancelled_at_ms"), rs.getLong("created_at_ms"));
+
+    private static final String BLACKOUT_COLUMNS =
+            "id, channel_id, region_code, start_ms, end_ms, status, cancel_request_id,"
+                    + " cancelled_at_ms, created_at_ms";
+
+    public long insertBlackout(String channelId, String regionCode, long startMs, long endMs,
+                               long createdAtMs) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO playout_blackout (channel_id, region_code, start_ms, end_ms,"
+                            + " status, created_at_ms) VALUES (?, ?, ?, ?, 'ACTIVE', ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, channelId);
+            ps.setString(2, regionCode);
+            ps.setLong(3, startMs);
+            ps.setLong(4, endMs);
+            ps.setLong(5, createdAtMs);
+            return ps;
+        }, keyHolder);
+        return keyHolder.getKey().longValue();
+    }
+
+    public Optional<BlackoutRow> findBlackout(long id) {
+        return jdbc.query("SELECT " + BLACKOUT_COLUMNS + " FROM playout_blackout WHERE id = ?",
+                BLACKOUT_MAPPER, id).stream().findFirst();
+    }
+
+    /** 按 ID 查询并加行锁，串行化取消与发布校验。 */
+    public Optional<BlackoutRow> findBlackoutForUpdate(long id) {
+        return jdbc.query("SELECT " + BLACKOUT_COLUMNS + " FROM playout_blackout WHERE id = ?"
+                        + " FOR UPDATE",
+                BLACKOUT_MAPPER, id).stream().findFirst();
+    }
+
+    /** 取消黑屏窗口；返回受影响行数，0 表示不存在或已取消。 */
+    public int cancelBlackout(long id, String cancelRequestId, long cancelledAtMs) {
+        return jdbc.update("UPDATE playout_blackout"
+                        + " SET status = 'CANCELLED', cancel_request_id = ?, cancelled_at_ms = ?"
+                        + " WHERE id = ? AND status = 'ACTIVE'",
+                cancelRequestId, cancelledAtMs, id);
+    }
+
+    /** 与 [startMs, endMs) 相交的 ACTIVE 黑屏窗口（左闭右开：端点相接不算相交）。 */
+    public List<BlackoutRow> findActiveBlackoutsOverlapping(String channelId, String regionCode,
+                                                            long startMs, long endMs) {
+        return jdbc.query("SELECT " + BLACKOUT_COLUMNS + " FROM playout_blackout"
+                        + " WHERE channel_id = ? AND region_code = ? AND status = 'ACTIVE'"
+                        + " AND start_ms < ? AND end_ms > ?"
+                        + " ORDER BY start_ms, id",
+                BLACKOUT_MAPPER, channelId, regionCode, endMs, startMs);
+    }
+
+    // ---------- 发布区域快照 ----------
+
+    /** 发布区域解析快照行，只读；spliceStartMs/spliceEndMs 为 NULL 表示 MAIN 行。 */
+    public record PublicationRegionRow(long id, long publicationId, String segmentId,
+                                       String regionCode, String assetId, long grantId,
+                                       long grantVersion, Long spliceStartMs, Long spliceEndMs,
+                                       String source, String fallbackReason) {
+    }
+
+    private static final RowMapper<PublicationRegionRow> PUB_REGION_MAPPER = (rs, n) ->
+            new PublicationRegionRow(rs.getLong("id"), rs.getLong("publication_id"),
+                    rs.getString("segment_id"), rs.getString("region_code"),
+                    rs.getString("asset_id"), rs.getLong("grant_id"), rs.getLong("grant_version"),
+                    (Long) rs.getObject("splice_start_ms"), (Long) rs.getObject("splice_end_ms"),
+                    rs.getString("source"), rs.getString("fallback_reason"));
+
+    private static final String PUB_REGION_COLUMNS =
+            "id, publication_id, segment_id, region_code, asset_id, grant_id, grant_version,"
+                    + " splice_start_ms, splice_end_ms, source, fallback_reason";
+
+    public void insertPublicationRegion(long publicationId, String segmentId, String regionCode,
+                                        String assetId, long grantId, long grantVersion,
+                                        Long spliceStartMs, Long spliceEndMs,
+                                        String source, String fallbackReason, long createdAtMs) {
+        jdbc.update("INSERT INTO playout_publication_region"
+                        + " (publication_id, segment_id, region_code, asset_id, grant_id,"
+                        + "  grant_version, splice_start_ms, splice_end_ms, source, fallback_reason,"
+                        + "  created_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                publicationId, segmentId, regionCode, assetId, grantId, grantVersion,
+                spliceStartMs, spliceEndMs, source, fallbackReason, createdAtMs);
+    }
+
+    /** 快照全部区域行，按条目、区域、窗口起点稳定排序。 */
+    public List<PublicationRegionRow> findPublicationRegions(long publicationId) {
+        return jdbc.query("SELECT " + PUB_REGION_COLUMNS + " FROM playout_publication_region"
+                        + " WHERE publication_id = ?"
+                        + " ORDER BY segment_id, region_code, splice_start_ms, id",
+                PUB_REGION_MAPPER, publicationId);
+    }
+
+    /** 快照中某条目某区域的全部解析行（SPLICE 与 MAIN）。 */
+    public List<PublicationRegionRow> findPublicationRegions(long publicationId, String segmentId,
+                                                             String regionCode) {
+        return jdbc.query("SELECT " + PUB_REGION_COLUMNS + " FROM playout_publication_region"
+                        + " WHERE publication_id = ? AND segment_id = ? AND region_code = ?"
+                        + " ORDER BY splice_start_ms, id",
+                PUB_REGION_MAPPER, publicationId, segmentId, regionCode);
+    }
+
+    /** 按 ID 查询发布快照头。 */
+    public Optional<PublicationRow> findPublicationById(long publicationId) {
+        return jdbc.query("SELECT id, channel_id, business_day, published_version, draft_version"
+                        + " FROM playout_publication WHERE id = ?",
+                PUBLICATION_MAPPER, publicationId).stream().findFirst();
+    }
+
+    /** 快照全部条目行，按起点稳定排序。 */
+    public List<PublicationSegmentRow> findPublicationSegments(long publicationId) {
+        return jdbc.query("SELECT id, publication_id, segment_id, asset_id, grant_id, start_ms, end_ms"
+                        + " FROM playout_publication_segment"
+                        + " WHERE publication_id = ? ORDER BY start_ms, segment_id",
+                PUBLICATION_SEGMENT_MAPPER, publicationId);
+    }
+
+    // ---------- 区域播出回执 ----------
+
+    public long insertReceipt(String channelId, String regionCode, long atMs, String assetId,
+                              String source, Long publicationId, String segmentId,
+                              Long grantId, Long grantVersion, long createdAtMs) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO playout_receipt"
+                            + " (channel_id, region_code, at_ms, asset_id, source, publication_id,"
+                            + "  segment_id, grant_id, grant_version, created_at_ms)"
+                            + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, channelId);
+            ps.setString(2, regionCode);
+            ps.setLong(3, atMs);
+            ps.setString(4, assetId);
+            ps.setString(5, source);
+            if (publicationId == null) {
+                ps.setNull(6, java.sql.Types.BIGINT);
+            } else {
+                ps.setLong(6, publicationId);
+            }
+            ps.setString(7, segmentId);
+            if (grantId == null) {
+                ps.setNull(8, java.sql.Types.BIGINT);
+            } else {
+                ps.setLong(8, grantId);
+            }
+            if (grantVersion == null) {
+                ps.setNull(9, java.sql.Types.BIGINT);
+            } else {
+                ps.setLong(9, grantVersion);
+            }
+            ps.setLong(10, createdAtMs);
+            return ps;
+        }, keyHolder);
+        return keyHolder.getKey().longValue();
     }
 }

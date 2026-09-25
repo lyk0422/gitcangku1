@@ -2,20 +2,32 @@ package com.example.starter.playout.api;
 
 import com.example.starter.playout.PlayoutService;
 import com.example.starter.playout.api.Dtos.AssetResponse;
+import com.example.starter.playout.api.Dtos.BlackoutResponse;
+import com.example.starter.playout.api.Dtos.CancelBlackoutRequest;
 import com.example.starter.playout.api.Dtos.ChannelResponse;
 import com.example.starter.playout.api.Dtos.CreateAssetRequest;
+import com.example.starter.playout.api.Dtos.CreateBlackoutRequest;
 import com.example.starter.playout.api.Dtos.CreateChannelRequest;
 import com.example.starter.playout.api.Dtos.CreateEmergencyOverrideRequest;
 import com.example.starter.playout.api.Dtos.CreateGrantRequest;
+import com.example.starter.playout.api.Dtos.CreateReceiptRequest;
 import com.example.starter.playout.api.Dtos.DraftResponse;
 import com.example.starter.playout.api.Dtos.EmergencyOverrideResponse;
 import com.example.starter.playout.api.Dtos.GrantResponse;
 import com.example.starter.playout.api.Dtos.CancelEmergencyOverrideRequest;
 import com.example.starter.playout.api.Dtos.PlayoutDecisionResponse;
+import com.example.starter.playout.api.Dtos.PublicationSnapshotResponse;
 import com.example.starter.playout.api.Dtos.PublishRequest;
 import com.example.starter.playout.api.Dtos.PublishResponse;
+import com.example.starter.playout.api.Dtos.PullAssetRequest;
+import com.example.starter.playout.api.Dtos.ReceiptResponse;
+import com.example.starter.playout.api.Dtos.RegionalPlayoutResponse;
 import com.example.starter.playout.api.Dtos.ReplaceDraftRequest;
+import com.example.starter.playout.api.Dtos.ReplaceSplicesRequest;
 import com.example.starter.playout.api.Dtos.RevokeGrantRequest;
+import com.example.starter.playout.api.Dtos.SpliceConfigResponse;
+import com.example.starter.playout.api.Dtos.SpliceDiagnosticsResponse;
+import com.example.starter.playout.api.Dtos.WithdrawAssetRequest;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import org.springframework.format.annotation.DateTimeFormat;
@@ -117,6 +129,82 @@ public class PlayoutController {
     @GetMapping("/emergency-overrides/{overrideKey}")
     public EmergencyOverrideResponse emergencyOverride(@PathVariable @NotBlank String overrideKey) {
         return service.getEmergencyOverride(overrideKey);
+    }
+
+    /** 撤回素材（终态，幂等）。 */
+    @PostMapping("/assets/{assetId}/withdraw")
+    public AssetResponse withdrawAsset(@PathVariable @NotBlank String assetId,
+                                       @Valid @RequestBody WithdrawAssetRequest request) {
+        return service.withdrawAsset(assetId, request.requestId());
+    }
+
+    /** 拉取素材新版本（幂等），不改写历史发布快照。 */
+    @PostMapping("/assets/{assetId}/pull")
+    public AssetResponse pullAsset(@PathVariable @NotBlank String assetId,
+                                   @Valid @RequestBody PullAssetRequest request) {
+        return service.pullAssetVersion(assetId, request.requestId());
+    }
+
+    /** 整份替换节目单条目的区域插播配置（spliceKey 幂等 + 草稿版本乐观锁）。 */
+    @PutMapping("/channels/{channelId}/drafts/{businessDay}/segments/{segmentId}/splices")
+    public SpliceConfigResponse replaceSplices(@PathVariable @NotBlank String channelId,
+                                               @PathVariable String businessDay,
+                                               @PathVariable @NotBlank String segmentId,
+                                               @Valid @RequestBody ReplaceSplicesRequest request) {
+        return service.replaceSplices(channelId, parseBusinessDay(businessDay), segmentId, request);
+    }
+
+    /** 查询节目单条目当前的区域插播配置。 */
+    @GetMapping("/channels/{channelId}/drafts/{businessDay}/segments/{segmentId}/splices")
+    public SpliceConfigResponse spliceConfig(@PathVariable @NotBlank String channelId,
+                                             @PathVariable String businessDay,
+                                             @PathVariable @NotBlank String segmentId) {
+        return service.getSpliceConfig(channelId, parseBusinessDay(businessDay), segmentId);
+    }
+
+    /** 创建区域黑屏窗口（创建即 ACTIVE，幂等）。 */
+    @PostMapping("/channels/{channelId}/blackouts")
+    public BlackoutResponse createBlackout(@PathVariable @NotBlank String channelId,
+                                           @Valid @RequestBody CreateBlackoutRequest request) {
+        return service.createBlackout(channelId, request);
+    }
+
+    /** 取消黑屏窗口（仅 ACTIVE 可取消，幂等）。 */
+    @PostMapping("/blackouts/{blackoutId}/cancel")
+    public BlackoutResponse cancelBlackout(@PathVariable long blackoutId,
+                                           @Valid @RequestBody CancelBlackoutRequest request) {
+        return service.cancelBlackout(blackoutId, request.requestId());
+    }
+
+    /** 按频道、区域与时刻查询区域播放决策（基于发布快照解析）。 */
+    @GetMapping("/channels/{channelId}/regions/{regionCode}/playout")
+    public RegionalPlayoutResponse regionalPlayout(@PathVariable @NotBlank String channelId,
+                                                   @PathVariable @NotBlank String regionCode,
+                                                   @RequestParam
+                                                   @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME)
+                                                   OffsetDateTime at) {
+        return service.regionalPlayout(channelId, regionCode, at);
+    }
+
+    /** 创建区域播出回执（窗口内使用发布快照素材，幂等）。 */
+    @PostMapping("/channels/{channelId}/regions/{regionCode}/receipts")
+    public ReceiptResponse createReceipt(@PathVariable @NotBlank String channelId,
+                                         @PathVariable @NotBlank String regionCode,
+                                         @Valid @RequestBody CreateReceiptRequest request) {
+        return service.createReceipt(channelId, regionCode, request);
+    }
+
+    /** 查询发布快照（区域、条目、实际素材、授权版本、插播窗口与回退原因均为固化值）。 */
+    @GetMapping("/publications/{publicationId}/snapshot")
+    public PublicationSnapshotResponse publicationSnapshot(@PathVariable long publicationId) {
+        return service.getPublicationSnapshot(publicationId);
+    }
+
+    /** 授权阻断诊断：列出当前草稿中会被发布拒绝的插播明细（稳定排序）。 */
+    @GetMapping("/channels/{channelId}/drafts/{businessDay}/splice-diagnostics")
+    public SpliceDiagnosticsResponse spliceDiagnostics(@PathVariable @NotBlank String channelId,
+                                                       @PathVariable String businessDay) {
+        return service.spliceDiagnostics(channelId, parseBusinessDay(businessDay));
     }
 
     private static LocalDate parseBusinessDay(String businessDay) {
