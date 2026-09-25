@@ -74,4 +74,12 @@ public class ReleaseRepository {
         jdbc.update("UPDATE release_order SET status = 'CANCELLED', active_model = NULL,"
                 + " updated_at = CURRENT_TIMESTAMP WHERE id = ?", id);
     }
+
+    /**
+     * 乐观版本推进：仅当版本与状态匹配时版本加一，返回影响行数。用于区域上限配置修改。
+     */
+    public int bumpVersion(long id, int expectedVersion) {
+        return jdbc.update("UPDATE release_order SET version = version + 1, updated_at = CURRENT_TIMESTAMP"
+                + " WHERE id = ? AND version = ? AND status = 'ACTIVE'", id, expectedVersion);
+    }
 }

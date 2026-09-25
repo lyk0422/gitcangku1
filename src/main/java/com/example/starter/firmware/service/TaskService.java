@@ -12,15 +12,21 @@ import com.example.starter.firmware.domain.RolloutTask;
 import com.example.starter.firmware.domain.TaskStatus;
 import com.example.starter.firmware.error.ApiException;
 import com.example.starter.firmware.repo.DeviceRepository;
+import com.example.starter.firmware.repo.RegionLimitRepository;
+import com.example.starter.firmware.repo.RegionThrottleEventRepository;
+import com.example.starter.firmware.repo.RegionWaitRepository;
 import com.example.starter.firmware.repo.ReleaseRepository;
 import com.example.starter.firmware.repo.TaskRepository;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 
+import java.time.Clock;
+import java.time.LocalDateTime;
 import java.util.List;
 
 /**
  * 投放任务：设备拉取与回执。与取消并发时统一先锁发布单行，再操作任务，形成一致提交顺序。
+ * 区域限流判定、回执计数与上限配置修改同样由发布单行锁串行化，按事务提交顺序裁决。
  */
 @Service
 public class TaskService {
@@ -31,16 +37,27 @@ public class TaskService {
     private final DeviceService deviceService;
     private final ReleaseService releaseService;
     private final IdempotencyService idempotency;
+    private final RegionLimitRepository regionLimitRepository;
+    private final RegionWaitRepository regionWaitRepository;
+    private final RegionThrottleEventRepository throttleEventRepository;
+    private final Clock clock;
 
     public TaskService(TaskRepository taskRepository, ReleaseRepository releaseRepository,
                        DeviceRepository deviceRepository, DeviceService deviceService,
-                       ReleaseService releaseService, IdempotencyService idempotency) {
+                       ReleaseService releaseService, IdempotencyService idempotency,
+                       RegionLimitRepository regionLimitRepository,
+                       RegionWaitRepository regionWaitRepository,
+                       RegionThrottleEventRepository throttleEventRepository, Clock clock) {
         this.taskRepository = taskRepository;
         this.releaseRepository = releaseRepository;
         this.deviceRepository = deviceRepository;
         this.deviceService = deviceService;
         this.releaseService = releaseService;
         this.idempotency = idempotency;
+        this.regionLimitRepository = regionLimitRepository;
+        this.regionWaitRepository = regionWaitRepository;
+        this.throttleEventRepository = throttleEventRepository;
+        this.clock = clock;
     }
 
     /**
@@ -52,18 +69,22 @@ public class TaskService {
             Device device = deviceService.findDevice(deviceId);
             var activeOrder = releaseRepository.findActiveByModel(device.model());
             if (activeOrder.isEmpty()) {
-                return new PullResponse(null);
+                return PullResponse.none();
             }
             ReleaseOrder order = releaseRepository.findByIdForUpdate(activeOrder.get().id())
                     .orElseThrow(() -> ApiException.notFound("RELEASE_NOT_FOUND", "发布单不存在"));
             var existing = taskRepository.findByReleaseAndDevice(order.id(), deviceId);
             if (existing.isPresent()) {
-                return new PullResponse(TaskView.of(existing.get(), order));
+                return PullResponse.issued(TaskView.of(existing.get(), order));
             }
             if (order.status() != ReleaseStatus.ACTIVE
                     || !device.currentVersion().equals(order.fromVersion())
                     || device.bucketNo() >= order.ratio()) {
-                return new PullResponse(null);
+                return PullResponse.none();
+            }
+            PullResponse throttled = checkRegionThrottle(order, device);
+            if (throttled != null) {
+                return throttled;
             }
             long taskId;
             try {
@@ -71,11 +92,11 @@ public class TaskService {
             } catch (DuplicateKeyException e) {
                 RolloutTask task = taskRepository.findByReleaseAndDevice(order.id(), deviceId)
                         .orElseThrow(() -> new IllegalStateException("任务唯一约束冲突后未找到任务"));
-                return new PullResponse(TaskView.of(task, order));
+                return PullResponse.issued(TaskView.of(task, order));
             }
             RolloutTask task = taskRepository.findById(taskId)
                     .orElseThrow(() -> new IllegalStateException("任务创建后读取失败"));
-            return new PullResponse(TaskView.of(task, order));
+            return PullResponse.issued(TaskView.of(task, order));
         }, PullResponse.class);
     }
 
@@ -118,5 +139,44 @@ public class TaskService {
                 .map(task -> TaskView.of(task, order))
                 .toList();
         return new TaskListResponse(tasks);
+    }
+
+    /**
+     * 区域限流判定：返回非 null 表示被限流（不下发任务、不改变设备或任务状态）。
+     * 须在持有发布单行锁的事务内调用，进行中计数与任务下发、回执终结按提交顺序一致。
+     * 区域未配置上限时不限流；未曾被限流过的设备不排队，正常按比例规则参与。
+     */
+    private PullResponse checkRegionThrottle(ReleaseOrder order, Device device) {
+        var limit = regionLimitRepository.findLimit(order.id(), device.region());
+        if (limit.isEmpty()) {
+            return null;
+        }
+        long inFlight = taskRepository.countInFlightByRegion(order.id(), device.region());
+        long available = limit.get() - inFlight;
+        if (available <= 0) {
+            return throttle(order, device);
+        }
+        var wait = regionWaitRepository.find(order.id(), device.deviceId());
+        if (wait.isEmpty()) {
+            return null;
+        }
+        long ahead = regionWaitRepository.countAhead(order.id(), device.region(),
+                wait.get().waitedAt(), device.deviceId());
+        if (ahead >= available) {
+            // 空位按等待时刻从早到晚释放，同刻按设备ID字典序；该设备前面仍有更早的等待者
+            return throttle(order, device);
+        }
+        regionWaitRepository.delete(order.id(), device.deviceId());
+        return null;
+    }
+
+    /**
+     * 记录一次限流：刷新该设备的等待记录（保留最近一次限流时刻）并追加限流历史事件。
+     */
+    private PullResponse throttle(ReleaseOrder order, Device device) {
+        LocalDateTime now = LocalDateTime.now(clock);
+        regionWaitRepository.upsert(order.id(), device.deviceId(), device.region(), now);
+        throttleEventRepository.append(order.id(), device.region(), device.deviceId(), now);
+        return PullResponse.throttled();
     }
 }

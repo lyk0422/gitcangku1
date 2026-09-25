@@ -87,4 +87,16 @@ public class TaskRepository {
                 Long.class, releaseId, deviceId);
         return count == null ? 0 : count;
     }
+
+    /**
+     * 区域当前进行中（已下发未完成，即 PENDING）任务数。须在持有发布单行锁的事务内调用，
+     * 保证计数与任务下发、回执终结按事务提交顺序一致。
+     */
+    public long countInFlightByRegion(long releaseId, String region) {
+        Long count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM rollout_task t JOIN device d ON t.device_id = d.device_id"
+                        + " WHERE t.release_id = ? AND t.status = 'PENDING' AND d.region = ?",
+                Long.class, releaseId, region);
+        return count == null ? 0 : count;
+    }
 }

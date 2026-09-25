@@ -2,6 +2,7 @@ package com.example.starter.firmware.api;
 
 import com.example.starter.firmware.domain.TaskStatus;
 import com.example.starter.firmware.error.ApiException;
+import com.example.starter.firmware.service.RegionThrottleService;
 import com.example.starter.firmware.service.ReleaseService;
 import com.example.starter.firmware.service.TaskService;
 import jakarta.validation.Valid;
@@ -22,10 +23,13 @@ public class ReleaseController {
 
     private final ReleaseService releaseService;
     private final TaskService taskService;
+    private final RegionThrottleService regionThrottleService;
 
-    public ReleaseController(ReleaseService releaseService, TaskService taskService) {
+    public ReleaseController(ReleaseService releaseService, TaskService taskService,
+                             RegionThrottleService regionThrottleService) {
         this.releaseService = releaseService;
         this.taskService = taskService;
+        this.regionThrottleService = regionThrottleService;
     }
 
     @PostMapping
@@ -41,6 +45,12 @@ public class ReleaseController {
     @PostMapping("/{releaseId}/cancel")
     public ReleaseView cancel(@PathVariable long releaseId, @Valid @RequestBody RequestIdBody request) {
         return releaseService.cancel(releaseId, request.requestId());
+    }
+
+    @PostMapping("/{releaseId}/region-limits")
+    public RegionLimitConfigView updateRegionLimits(@PathVariable long releaseId,
+                                                    @Valid @RequestBody UpdateRegionLimitsRequest request) {
+        return regionThrottleService.updateLimits(releaseId, request);
     }
 
     @GetMapping("/{releaseId}/tasks")
