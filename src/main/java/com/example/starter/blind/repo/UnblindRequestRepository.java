@@ -87,6 +87,30 @@ public class UnblindRequestRepository {
     }
 
     /**
+     * 该分配是否已存在已批准的揭盲；已揭盲的参与者不可替补。
+     */
+    public boolean existsApprovedByAllocation(long allocationId) {
+        Long count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM unblind_request "
+                        + "WHERE allocation_id = ? AND status = 'APPROVED'",
+                Long.class, allocationId);
+        return count != null && count > 0;
+    }
+
+    /**
+     * 替补时释放该分配的待审去重占位：原参与者的待审申请记录保留且仍指向原标识，
+     * 但不再占用“同一分配至多一个待审申请”的唯一位置，替补参与者可独立申请。
+     *
+     * @return 受影响行数
+     */
+    public int releasePendingByAllocation(long allocationId) {
+        return jdbc.update(
+                "UPDATE unblind_request SET pending_allocation_id = NULL "
+                        + "WHERE pending_allocation_id = ?",
+                allocationId);
+    }
+
+    /**
      * 批准：仅 PENDING 可批准，写入处理代码、批准人与时间，并释放待审唯一占位。
      *
      * @return 受影响行数；0 表示不存在或已批准

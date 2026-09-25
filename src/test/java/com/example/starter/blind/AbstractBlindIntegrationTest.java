@@ -22,6 +22,7 @@ public abstract class AbstractBlindIntegrationTest {
         // 无外键约束，顺序无依赖；全部清空保证场景独立。
         jdbc.update("DELETE FROM idempotent_request");
         jdbc.update("DELETE FROM unblind_request");
+        jdbc.update("DELETE FROM replacement");
         jdbc.update("DELETE FROM allocation");
         jdbc.update("DELETE FROM seat");
         jdbc.update("DELETE FROM experiment");

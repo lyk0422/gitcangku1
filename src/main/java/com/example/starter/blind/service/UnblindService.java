@@ -4,9 +4,11 @@ import com.example.starter.blind.ApiException;
 import com.example.starter.blind.Clock;
 import com.example.starter.blind.dto.UnblindRequestView;
 import com.example.starter.blind.dto.UnblindResultView;
+import com.example.starter.blind.repo.AllocationRepository;
 import com.example.starter.blind.repo.AllocationRepository.AllocationRow;
 import com.example.starter.blind.repo.ExperimentRepository.SeatRow;
 import com.example.starter.blind.repo.ExperimentRepository;
+import com.example.starter.blind.repo.ReplacementRepository;
 import com.example.starter.blind.repo.UnblindRequestRepository;
 import com.example.starter.blind.repo.UnblindRequestRepository.UnblindRequestRow;
 import org.springframework.dao.DuplicateKeyException;
@@ -27,15 +29,21 @@ public class UnblindService {
     private final UnblindRequestRepository unblindRequestRepository;
     private final ExperimentService experimentService;
     private final ExperimentRepository experimentRepository;
+    private final AllocationRepository allocationRepository;
+    private final ReplacementRepository replacementRepository;
     private final Clock clock;
 
     public UnblindService(UnblindRequestRepository unblindRequestRepository,
                           ExperimentService experimentService,
                           ExperimentRepository experimentRepository,
+                          AllocationRepository allocationRepository,
+                          ReplacementRepository replacementRepository,
                           Clock clock) {
         this.unblindRequestRepository = unblindRequestRepository;
         this.experimentService = experimentService;
         this.experimentRepository = experimentRepository;
+        this.allocationRepository = allocationRepository;
+        this.replacementRepository = replacementRepository;
         this.clock = clock;
     }
 
@@ -73,6 +81,8 @@ public class UnblindService {
 
     /**
      * REVIEWER 批准申请；批准人不得是申请人本人。
+     * 凭申请固化的 allocation_id 行级锁定分配，与替补事务按提交顺序裁决：
+     * 替补先提交则对原参与者的批准 409。
      */
     @Transactional
     public UnblindRequestView approve(String unblindRequestId, String reviewerActor) {
@@ -83,12 +93,19 @@ public class UnblindService {
         if ("APPROVED".equals(row.status())) {
             throw ApiException.conflict("揭盲申请已批准");
         }
+        // 行级锁定对应分配：与替补互斥，提交顺序决定谁先生效。
+        AllocationRow allocation = allocationRepository.lockById(row.allocationId());
+        if (allocation == null) {
+            throw new IllegalStateException("分配记录缺失，数据不一致");
+        }
+        if (replacementRepository.findByOriginal(row.experimentId(), row.participantId()) != null) {
+            // 原参与者已被替补：其既有申请保留，但不得再揭盲（处理代码已由替补者继承）。
+            throw ApiException.conflict("参与者已被替补，其揭盲申请不可再批准");
+        }
         if (row.applicantActor().equals(reviewerActor)) {
             throw ApiException.forbidden("批准人必须是不同于申请人的另一名 REVIEWER");
         }
         // 从数据库读取处理映射（盲底），批准时写入申请记录；处理代码不打日志。
-        AllocationRow allocation =
-                experimentService.mustFindAllocationRow(row.experimentId(), row.participantId());
         SeatRow seat = experimentRepository.findSeat(row.experimentId(),
                 allocation.blockNo(), allocation.seatNo());
         if (seat == null) {

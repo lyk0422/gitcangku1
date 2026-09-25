@@ -10,6 +10,8 @@ import com.example.starter.blind.repo.AllocationRepository.VacantSeat;
 import com.example.starter.blind.repo.ExperimentRepository;
 import com.example.starter.blind.repo.ExperimentRepository.ExperimentRow;
 import com.example.starter.blind.repo.ExperimentRepository.SeatRow;
+import com.example.starter.blind.repo.ReplacementRepository;
+import com.example.starter.blind.repo.ReplacementRepository.ReplacementRow;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -29,15 +31,18 @@ public class ExperimentService {
 
     private final ExperimentRepository experimentRepository;
     private final AllocationRepository allocationRepository;
+    private final ReplacementRepository replacementRepository;
     private final BlindCodeGenerator blindCodeGenerator;
     private final Clock clock;
 
     public ExperimentService(ExperimentRepository experimentRepository,
                              AllocationRepository allocationRepository,
+                             ReplacementRepository replacementRepository,
                              BlindCodeGenerator blindCodeGenerator,
                              Clock clock) {
         this.experimentRepository = experimentRepository;
         this.allocationRepository = allocationRepository;
+        this.replacementRepository = replacementRepository;
         this.blindCodeGenerator = blindCodeGenerator;
         this.clock = clock;
     }
@@ -97,6 +102,10 @@ public class ExperimentService {
             // 同实验同参与者只占一席；已退组也不重新占席。
             throw ApiException.conflict("参与者已在该实验登记，仅可占一席");
         }
+        if (replacementRepository.findByOriginal(experimentId, participantId) != null) {
+            // REPLACED 为终态，被替补者不得以新登记回到实验。
+            throw ApiException.conflict("参与者已被替补，处于 REPLACED 终态，不可重新登记");
+        }
         VacantSeat vacant = allocationRepository.takeFirstVacantSeat(experimentId);
         if (vacant == null) {
             throw ApiException.full("实验席位已满");
@@ -142,7 +151,11 @@ public class ExperimentService {
         if ("WITHDRAWN".equals(allocation.status())) {
             throw ApiException.conflict("参与者已退组");
         }
-        allocationRepository.markWithdrawn(allocation.id(), clock.nowMillis());
+        int updated = allocationRepository.markWithdrawn(allocation.id(), clock.nowMillis());
+        if (updated == 0) {
+            // 与替补等并发事务按提交顺序裁决：状态已变化时按冲突处理。
+            throw ApiException.conflict("参与者状态已变化，退组冲突，请重试");
+        }
         AllocationRow refreshed =
                 allocationRepository.findByExperimentAndParticipant(experimentId, participantId);
         return toView(refreshed);
@@ -166,10 +179,23 @@ public class ExperimentService {
     }
 
     /**
-     * 普通查询：只返回盲码、区组号、参与者编号与退组状态。
+     * 普通查询：只返回盲码、区组号、参与者编号与在组状态。
+     * 已被替补的参与者返回 REPLACED 终态视图（无盲码与时刻）。
      */
     public AllocationView getAllocation(String experimentId, String participantId) {
-        return toView(mustFindAllocation(experimentId, participantId));
+        mustFindExperiment(experimentId);
+        AllocationRow row =
+                allocationRepository.findByExperimentAndParticipant(experimentId, participantId);
+        if (row != null) {
+            return toView(row);
+        }
+        ReplacementRow replacement =
+                replacementRepository.findByOriginal(experimentId, participantId);
+        if (replacement != null) {
+            return new AllocationView(experimentId, participantId, null,
+                    replacement.blockNo(), "REPLACED", null, null);
+        }
+        throw ApiException.notFound("参与者尚未在该实验登记");
     }
 
     /** 内部使用的完整分配行（含盲底字段），禁止直接透出到普通响应。 */
@@ -182,6 +208,10 @@ public class ExperimentService {
         AllocationRow row =
                 allocationRepository.findByExperimentAndParticipant(experimentId, participantId);
         if (row == null) {
+            if (replacementRepository.findByOriginal(experimentId, participantId) != null) {
+                // 已被替补：分配行已转移给替补参与者，原参与者处于 REPLACED 终态。
+                throw ApiException.conflict("参与者已被替补，处于 REPLACED 终态");
+            }
             throw ApiException.notFound("参与者尚未在该实验登记");
         }
         return row;

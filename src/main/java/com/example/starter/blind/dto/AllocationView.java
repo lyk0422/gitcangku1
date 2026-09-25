@@ -6,10 +6,10 @@ package com.example.starter.blind.dto;
  *
  * @param experimentId  实验编号
  * @param participantId 合成参与者编号
- * @param blindCode     随机无含义盲码
+ * @param blindCode     随机无含义盲码；REPLACED 终态视图无盲码，为 null
  * @param blockNo       区组号（不含区组内席位序号）
- * @param status        ASSIGNED / WITHDRAWN
- * @param assignedAt    分配时间，Unix 毫秒，UTC
+ * @param status        ASSIGNED / WITHDRAWN / REPLACED
+ * @param assignedAt    分配时间，Unix 毫秒，UTC；REPLACED 终态视图为 null
  * @param withdrawnAt   退组时间，Unix 毫秒，UTC；null 表示未退组
  */
 public record AllocationView(
@@ -18,7 +18,7 @@ public record AllocationView(
         String blindCode,
         int blockNo,
         String status,
-        long assignedAt,
+        Long assignedAt,
         Long withdrawnAt
 ) {
 }

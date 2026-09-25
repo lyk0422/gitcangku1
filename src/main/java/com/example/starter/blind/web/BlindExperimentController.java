@@ -5,13 +5,17 @@ import com.example.starter.blind.ActorContext;
 import com.example.starter.blind.ApiException;
 import com.example.starter.blind.RequestTokens;
 import com.example.starter.blind.dto.AllocationView;
+import com.example.starter.blind.dto.BlockQuotaView;
 import com.example.starter.blind.dto.CreateExperimentRequest;
 import com.example.starter.blind.dto.ExperimentView;
+import com.example.starter.blind.dto.ReplaceRequest;
+import com.example.starter.blind.dto.ReplacementView;
 import com.example.starter.blind.dto.UnblindApplyRequest;
 import com.example.starter.blind.dto.UnblindRequestView;
 import com.example.starter.blind.dto.UnblindResultView;
 import com.example.starter.blind.service.ExperimentService;
 import com.example.starter.blind.service.IdempotencyService;
+import com.example.starter.blind.service.ReplacementService;
 import com.example.starter.blind.service.UnblindService;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
@@ -24,6 +28,7 @@ import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -40,18 +45,22 @@ public class BlindExperimentController {
     static final String OP_ALLOCATION_WITHDRAW = "allocation.withdraw";
     static final String OP_UNBLIND_APPLY = "unblind.apply";
     static final String OP_UNBLIND_APPROVE = "unblind.approve";
+    static final String OP_ALLOCATION_REPLACE = "allocation.replace";
 
     private final ExperimentService experimentService;
     private final UnblindService unblindService;
+    private final ReplacementService replacementService;
     private final IdempotencyService idempotencyService;
     private final ActorContext actorContext;
 
     public BlindExperimentController(ExperimentService experimentService,
                                      UnblindService unblindService,
+                                     ReplacementService replacementService,
                                      IdempotencyService idempotencyService,
                                      ActorContext actorContext) {
         this.experimentService = experimentService;
         this.unblindService = unblindService;
+        this.replacementService = replacementService;
         this.idempotencyService = idempotencyService;
         this.actorContext = actorContext;
     }
@@ -140,6 +149,51 @@ public class BlindExperimentController {
         return experimentService.getAllocation(
                 RequestTokens.requireId("experimentId", experimentId),
                 RequestTokens.requireId("participantId", participantId));
+    }
+
+    // ---------------- 受试者替补 ----------------
+
+    /**
+     * 替补登记（仅 COORDINATOR）：仅对已退组且从未揭盲的参与者；
+     * 替补参与者继承原参与者的区组与处理代码，但响应不含处理代码。
+     */
+    @PostMapping("/experiments/{experimentId}/participants/{participantId}/replacement")
+    public ResponseEntity<String> replace(
+            @PathVariable String experimentId,
+            @PathVariable String participantId,
+            @Valid @RequestBody ReplaceRequest request,
+            @RequestHeader(IdempotencyService.HEADER_REQUEST_ID) String requestId) {
+        Actor actor = requireCoordinator();
+        String expId = RequestTokens.requireId("experimentId", experimentId);
+        String pid = RequestTokens.requireId("participantId", participantId);
+        String reqId = RequestTokens.requireRequestId(requestId);
+        String fingerprint = idempotencyService.fingerprint(OP_ALLOCATION_REPLACE,
+                Map.of("experimentId", expId,
+                        "participantId", pid,
+                        "replaceKey", request.replaceKey(),
+                        "newParticipantId", request.newParticipantId()));
+        return idempotencyService.runWrite(reqId, OP_ALLOCATION_REPLACE, fingerprint, actor,
+                () -> IdempotencyService.WriteOutcome.of(HttpStatus.CREATED.value(),
+                        replacementService.replace(expId, pid, request.replaceKey(),
+                                request.newParticipantId(), actor.actorId())));
+    }
+
+    /** 区组替补历史（两种角色均可）：不含处理代码与席位号。 */
+    @GetMapping("/experiments/{experimentId}/blocks/{blockNo}/replacements")
+    public List<ReplacementView> listBlockReplacements(@PathVariable String experimentId,
+                                                       @PathVariable int blockNo) {
+        requireActor();
+        return replacementService.listBlockReplacements(
+                RequestTokens.requireId("experimentId", experimentId), blockNo);
+    }
+
+    /** 区组名额统计（两种角色均可）：不含处理代码。 */
+    @GetMapping("/experiments/{experimentId}/blocks/{blockNo}/quota")
+    public BlockQuotaView getBlockQuota(@PathVariable String experimentId,
+                                        @PathVariable int blockNo) {
+        requireActor();
+        return replacementService.getBlockQuota(
+                RequestTokens.requireId("experimentId", experimentId), blockNo);
     }
 
     // ---------------- 揭盲 ----------------

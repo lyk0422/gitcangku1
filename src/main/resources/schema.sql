@@ -55,10 +55,36 @@ COMMENT ON COLUMN allocation.participant_id IS '合成参与者编号，非真�
 COMMENT ON COLUMN allocation.block_no IS '分配到的区组号，普通查询可返回';
 COMMENT ON COLUMN allocation.seat_no IS '分配到的席位号，可直接解码处理代码，禁止通过普通接口暴露';
 COMMENT ON COLUMN allocation.blind_code IS '随机生成的无含义盲码，全局唯一，与区组/席位无对应规律';
-COMMENT ON COLUMN allocation.status IS '分配状态：ASSIGNED=在组；WITHDRAWN=已退组（席位仍保留）';
-COMMENT ON COLUMN allocation.assigned_actor IS '执行登记的操作者编号（X-Actor-Id）';
-COMMENT ON COLUMN allocation.assigned_at IS '分配时间，Unix 毫秒，UTC';
+COMMENT ON COLUMN allocation.status IS '分配状态：ASSIGNED=在组；WITHDRAWN=已退组（席位仍保留）；参与者被替补后其分配行原地转移给替补者，原参与者的 REPLACED 终态由 replacement 表派生，不落本表';
+COMMENT ON COLUMN allocation.assigned_actor IS '执行登记（或替补登记）的操作者编号（X-Actor-Id）';
+COMMENT ON COLUMN allocation.assigned_at IS '分配时间，Unix 毫秒，UTC；替补后重置为替补时刻';
 COMMENT ON COLUMN allocation.withdrawn_at IS '退组时间，Unix 毫秒，UTC；NULL 表示未退组';
+
+CREATE TABLE IF NOT EXISTS replacement (
+    id                      BIGINT       NOT NULL AUTO_INCREMENT,
+    replace_key             VARCHAR(64)  NOT NULL,
+    experiment_id           VARCHAR(64)  NOT NULL,
+    block_no                INT          NOT NULL,
+    allocation_id           BIGINT       NOT NULL,
+    original_participant_id VARCHAR(64)  NOT NULL,
+    new_participant_id      VARCHAR(64)  NOT NULL,
+    actor_id                VARCHAR(64)  NOT NULL,
+    replaced_at             BIGINT       NOT NULL,
+    CONSTRAINT pk_replacement PRIMARY KEY (id),
+    CONSTRAINT uq_replacement_key UNIQUE (replace_key),
+    CONSTRAINT uq_replacement_original UNIQUE (experiment_id, original_participant_id),
+    CONSTRAINT uq_replacement_new UNIQUE (experiment_id, new_participant_id)
+);
+COMMENT ON TABLE  replacement IS '受试者替补记录表；记录不可变，不保存处理代码与席位号等盲底；替补不新建分配序号，原分配行原地转移给替补参与者';
+COMMENT ON COLUMN replacement.id IS '替补记录自增主键';
+COMMENT ON COLUMN replacement.replace_key IS '操作人提交的替补业务键，全局唯一，重复使用返回409';
+COMMENT ON COLUMN replacement.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN replacement.block_no IS '原参与者所属区组号，替补参与者继承';
+COMMENT ON COLUMN replacement.allocation_id IS '被继承的分配序号（allocation.id），替补前后不变';
+COMMENT ON COLUMN replacement.original_participant_id IS '原合成参与者编号，替补后处于 REPLACED 终态；同实验内至多被替补一次';
+COMMENT ON COLUMN replacement.new_participant_id IS '替补合成参与者编号，继承原参与者的区组与处理代码；同实验内至多参与一次替补';
+COMMENT ON COLUMN replacement.actor_id IS '执行替补的操作者编号（X-Actor-Id）';
+COMMENT ON COLUMN replacement.replaced_at IS '替补时间，Unix 毫秒，UTC';
 
 CREATE TABLE IF NOT EXISTS unblind_request (
     id                      VARCHAR(64)  NOT NULL,
@@ -90,7 +116,7 @@ COMMENT ON COLUMN unblind_request.status IS '申请状态：PENDING=待审；APP
 COMMENT ON COLUMN unblind_request.treatment IS '揭盲结果处理代码 A/B，批准时写入；NULL=尚未批准';
 COMMENT ON COLUMN unblind_request.created_at IS '申请时间，Unix 毫秒，UTC';
 COMMENT ON COLUMN unblind_request.reviewed_at IS '批准时间，Unix 毫秒，UTC；NULL 表示未批准';
-COMMENT ON COLUMN unblind_request.pending_allocation_id IS '待审去重列：待审时等于 allocation_id，终态置 NULL；唯一索引保证同一分配至多一个待审申请';
+COMMENT ON COLUMN unblind_request.pending_allocation_id IS '待审去重列：待审时等于 allocation_id，终态或所属参与者被替补时置 NULL；唯一索引保证同一分配至多一个待审申请';
 
 CREATE TABLE IF NOT EXISTS idempotent_request (
     request_id      VARCHAR(64)  NOT NULL,
