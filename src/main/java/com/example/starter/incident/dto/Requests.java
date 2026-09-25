@@ -42,4 +42,12 @@ public final class Requests {
     /** 升级确认请求：note 为非空处置说明，操作人由 X-Actor-Id 指定且须为当前指挥人。 */
     public record EscalationAckRequest(String commandKey, String note) {
     }
+
+    /** 时限挂起请求：suspendKey 标识本次挂起，恢复时须提交同一键；reason 为挂起原因。 */
+    public record SuspendRequest(String commandKey, String suspendKey, String reason) {
+    }
+
+    /** 时限恢复请求：suspendKey 须与生效挂起一致；note 为恢复说明。 */
+    public record ResumeRequest(String commandKey, String suspendKey, String note) {
+    }
 }

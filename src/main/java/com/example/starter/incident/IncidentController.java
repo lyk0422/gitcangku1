@@ -4,7 +4,9 @@ import com.example.starter.incident.dto.Requests.ActionRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
 import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
+import com.example.starter.incident.dto.Requests.ResumeRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
+import com.example.starter.incident.dto.Requests.SuspendRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
@@ -13,6 +15,8 @@ import com.example.starter.incident.dto.Responses.EscalationHistoryView;
 import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
 import com.example.starter.incident.dto.Responses.IncidentView;
+import com.example.starter.incident.dto.Responses.SuspensionStatusView;
+import com.example.starter.incident.dto.Responses.SuspensionView;
 import com.example.starter.incident.dto.Responses.TransferView;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -137,5 +141,33 @@ public class IncidentController {
                                      @RequestHeader("X-Actor-Id") String actor,
                                      @RequestBody StatusRequest req) {
         return service.changeStatus(incidentKey, actor, req);
+    }
+
+    /**
+     * 挂起遏制时限（仅当前指挥人，提交 suspendKey 与挂起原因）。
+     */
+    @PostMapping("/{incidentKey}/suspensions")
+    public SuspensionView suspend(@PathVariable String incidentKey,
+                                  @RequestHeader("X-Actor-Id") String actor,
+                                  @RequestBody SuspendRequest req) {
+        return service.suspend(incidentKey, actor, req);
+    }
+
+    /**
+     * 恢复遏制时限（仅当前指挥人，提交同一 suspendKey 与说明）。
+     */
+    @PostMapping("/{incidentKey}/suspensions/resume")
+    public SuspensionView resume(@PathVariable String incidentKey,
+                                 @RequestHeader("X-Actor-Id") String actor,
+                                 @RequestBody ResumeRequest req) {
+        return service.resume(incidentKey, actor, req);
+    }
+
+    /**
+     * 查询挂起区间明细与按当前时钟实时计算的剩余时限（只读，不隐式写入）。
+     */
+    @GetMapping("/{incidentKey}/suspensions")
+    public SuspensionStatusView suspensions(@PathVariable String incidentKey) {
+        return service.suspensionStatus(incidentKey);
     }
 }

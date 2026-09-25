@@ -51,6 +51,7 @@ class EscalationServiceTest {
     @BeforeEach
     void clean() {
         jdbc.update("DELETE FROM command_keys");
+        jdbc.update("DELETE FROM incident_suspensions");
         jdbc.update("DELETE FROM incident_escalations");
         jdbc.update("DELETE FROM incident_status_history");
         jdbc.update("DELETE FROM incident_transfers");

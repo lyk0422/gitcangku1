@@ -54,4 +54,26 @@ public final class Responses {
     public record EscalationHistoryView(Instant deadlineAt, EscalationView current,
                                         List<EscalationView> history) {
     }
+
+    /**
+     * 挂起区间视图：resumedBy/resumeNote/resumedAt 仅已恢复（封口）有值，
+     * 为空表示挂起仍生效；起始半区字段落库后不可改写。
+     */
+    public record SuspensionView(long id, String suspendKey, String reason, String suspendedBy,
+                                 Instant suspendedAt, String resumedBy, String resumeNote,
+                                 Instant resumedAt) {
+    }
+
+    /**
+     * 挂起状态与剩余时限视图：deadlineAt 为接管时确定的原始遏制期限（REPORTED 为空）；
+     * effectiveDeadlineAt 为排除挂起区间后的实际期限；remainingSeconds 为按当前时钟实时
+     * 计算的剩余秒数（无期限时为 null，已逾期为 0，不持久化）；suspendedTotalSeconds 为
+     * 累计挂起秒数（含生效中区间截至当前时刻）；suspended 表示当前是否有生效挂起；
+     * overdue 表示按当前时钟与挂起区间判定是否已逾期；suspensions 为全部区间明细。
+     */
+    public record SuspensionStatusView(Instant deadlineAt, Instant effectiveDeadlineAt,
+                                       Long remainingSeconds, long suspendedTotalSeconds,
+                                       boolean suspended, boolean overdue,
+                                       List<SuspensionView> suspensions) {
+    }
 }

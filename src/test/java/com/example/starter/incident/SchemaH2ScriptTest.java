@@ -80,6 +80,25 @@ class SchemaH2ScriptTest {
                     assertThat(rs.getTimestamp("deadline_at").toInstant())
                             .isEqualTo(now.plusSeconds(300));
                 }
+
+                // 挂起区间表：插入生效区间，条件恢复更新只作用于未封口记录
+                st.execute("INSERT INTO incident_suspensions (incident_id, suspend_key, reason,"
+                        + " suspended_by, suspended_at, resumed_by, resume_note, resumed_at,"
+                        + " created_at) VALUES (1,'SK-1','等待厂商','alice','"
+                        + Timestamp.from(now) + "',NULL,NULL,NULL,'" + Timestamp.from(now) + "')");
+                int sealed = st.executeUpdate("UPDATE incident_suspensions SET resumed_by='alice',"
+                        + " resume_note='厂商已响应', resumed_at='" + Timestamp.from(now) + "'"
+                        + " WHERE id = 1 AND resumed_at IS NULL");
+                assertThat(sealed).isEqualTo(1);
+                int reSealed = st.executeUpdate("UPDATE incident_suspensions SET resumed_at='"
+                        + Timestamp.from(now) + "' WHERE id = 1 AND resumed_at IS NULL");
+                assertThat(reSealed).isZero();
+                try (ResultSet rs = st.executeQuery(
+                        "SELECT reason, resumed_at FROM incident_suspensions WHERE id = 1")) {
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getString("reason")).isEqualTo("等待厂商");
+                    assertThat(rs.getTimestamp("resumed_at").toInstant()).isEqualTo(now);
+                }
             }
         }
     }

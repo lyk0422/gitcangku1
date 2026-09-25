@@ -44,4 +44,10 @@ public class ApiException extends RuntimeException {
     public static ApiException illegalTransition(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "ILLEGAL_TRANSITION", message);
     }
+
+    /** 422：单事件累计挂起时长达到上限。 */
+    public static ApiException suspensionLimit(String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SUSPENSION_LIMIT_EXCEEDED",
+                message);
+    }
 }
