@@ -1,5 +1,7 @@
 package com.example.starter.firmware.service;
 
+import com.example.starter.firmware.api.EmergencyException;
+import com.example.starter.firmware.api.PullRequest;
 import com.example.starter.firmware.api.PullResponse;
 import com.example.starter.firmware.api.ReceiptRequest;
 import com.example.starter.firmware.api.TaskListResponse;
@@ -35,19 +37,21 @@ public class TaskService {
     private final PauseRecordRepository pauseRecordRepository;
     private final DeviceService deviceService;
     private final ReleaseService releaseService;
+    private final FreezeService freezeService;
     private final IdempotencyService idempotency;
     private final Clock clock;
 
     public TaskService(TaskRepository taskRepository, ReleaseRepository releaseRepository,
                        DeviceRepository deviceRepository, PauseRecordRepository pauseRecordRepository,
                        DeviceService deviceService, ReleaseService releaseService,
-                       IdempotencyService idempotency, Clock clock) {
+                       FreezeService freezeService, IdempotencyService idempotency, Clock clock) {
         this.taskRepository = taskRepository;
         this.releaseRepository = releaseRepository;
         this.deviceRepository = deviceRepository;
         this.pauseRecordRepository = pauseRecordRepository;
         this.deviceService = deviceService;
         this.releaseService = releaseService;
+        this.freezeService = freezeService;
         this.idempotency = idempotency;
         this.clock = clock;
     }
@@ -55,11 +59,20 @@ public class TaskService {
     /**
      * 设备拉取：已存在任务直接返回；否则仅当型号与当前版本匹配、分桶号小于比例且发布单 ACTIVE 时创建。
      * PAUSED 时不创建新任务，已有任务仍可查看与回执。
+     * 命中生效冻结令范围时，新任务拉取返回 422，除非携带完整紧急例外。
      */
     public PullResponse pull(String deviceId, String requestId) {
-        String fingerprint = String.join("|", "task.pull", deviceId);
-        return idempotency.execute(requestId, "task.pull", fingerprint, () -> {
+        return pull(deviceId, new PullRequest(requestId, null));
+    }
+
+    /**
+     * 设备拉取（可携带紧急例外）。与冻结、撤销共用冻结裁决行锁，按提交顺序裁决。
+     */
+    public PullResponse pull(String deviceId, PullRequest request) {
+        String fingerprint = String.join("|", "task.pull", deviceId, exceptionFingerprint(request.exception()));
+        return idempotency.execute(request.requestId(), "task.pull", fingerprint, () -> {
             Device device = deviceService.findDevice(deviceId);
+            freezeService.lockGuard();
             var activeOrder = releaseRepository.findActiveByModel(device.model());
             if (activeOrder.isEmpty()) {
                 return new PullResponse(null);
@@ -68,25 +81,38 @@ public class TaskService {
                     .orElseThrow(() -> ApiException.notFound("RELEASE_NOT_FOUND", "发布单不存在"));
             var existing = taskRepository.findByReleaseAndDevice(order.id(), deviceId);
             if (existing.isPresent()) {
-                return new PullResponse(TaskView.of(existing.get(), order));
+                return new PullResponse(TaskView.of(existing.get()));
             }
             if (order.status() != ReleaseStatus.ACTIVE
                     || !device.currentVersion().equals(order.fromVersion())
                     || device.bucketNo() >= order.ratio()) {
                 return new PullResponse(null);
             }
+            EmergencyException exception = freezeService.assertPullAllowed(device.model(), order.id(),
+                    request.exception());
             long taskId;
             try {
-                taskId = taskRepository.insert(order.id(), deviceId);
+                taskId = taskRepository.insert(order.id(), deviceId, order.fromVersion(), order.toVersion());
             } catch (DuplicateKeyException e) {
                 RolloutTask task = taskRepository.findByReleaseAndDevice(order.id(), deviceId)
                         .orElseThrow(() -> new IllegalStateException("任务唯一约束冲突后未找到任务"));
-                return new PullResponse(TaskView.of(task, order));
+                return new PullResponse(TaskView.of(task));
+            }
+            if (exception != null) {
+                freezeService.recordExceptionUse("task.pull", deviceId, exception);
             }
             RolloutTask task = taskRepository.findById(taskId)
                     .orElseThrow(() -> new IllegalStateException("任务创建后读取失败"));
-            return new PullResponse(TaskView.of(task, order));
+            return new PullResponse(TaskView.of(task));
         }, PullResponse.class);
+    }
+
+    private static String exceptionFingerprint(EmergencyException exception) {
+        if (exception == null) {
+            return "-";
+        }
+        return exception.incidentId() + "#" + String.join(",", exception.approvers() == null
+                ? List.of() : exception.approvers().stream().sorted().toList());
     }
 
     /**
@@ -105,23 +131,26 @@ public class TaskService {
                     .orElseThrow(() -> ApiException.notFound("TASK_NOT_FOUND", "任务不存在: " + taskId));
             return switch (task.status()) {
                 case PENDING -> {
-                    taskRepository.complete(taskId, request.result());
+                    taskRepository.complete(taskId, request.result(),
+                            lockedOrder.fromVersion(), lockedOrder.toVersion());
                     releaseRepository.incrementRoundStats(snapshot.releaseId(), request.result());
                     if (request.result() == ReceiptResult.SUCCESS) {
                         deviceRepository.updateCurrentVersion(task.deviceId(), lockedOrder.toVersion());
                     }
                     ReleaseOrder updated = releaseRepository.findById(snapshot.releaseId()).orElseThrow();
                     pauseIfThresholdReached(updated, taskId);
-                    yield TaskView.of(taskRepository.findById(taskId).orElseThrow(), updated);
+                    yield TaskView.of(taskRepository.findById(taskId).orElseThrow());
                 }
                 case SUCCESS, FAILED -> {
                     if (task.firstResult() == request.result()) {
-                        yield TaskView.of(task, lockedOrder);
+                        yield TaskView.of(task);
                     }
                     throw ApiException.conflict("RECEIPT_RESULT_CONFLICT",
                             "任务已终结为 " + task.firstResult() + "，不能改为 " + request.result());
                 }
                 case CANCELLED -> throw ApiException.conflict("TASK_CANCELLED", "任务已取消，回执不再受理");
+                case RELEASE_FROZEN -> throw ApiException.conflict("TASK_FROZEN",
+                        "任务被冻结令 " + task.freezeOrderId() + " 冻结，回执暂不受理");
             };
         }, TaskView.class);
     }
@@ -148,10 +177,19 @@ public class TaskService {
     }
 
     public TaskListResponse listByRelease(long releaseId, TaskStatus statusFilter) {
-        ReleaseOrder order = releaseService.findOrder(releaseId);
+        releaseService.findOrder(releaseId);
         List<TaskView> tasks = taskRepository.findByRelease(releaseId, statusFilter).stream()
-                .map(task -> TaskView.of(task, order))
+                .map(TaskView::of)
                 .toList();
         return new TaskListResponse(tasks);
+    }
+
+    /**
+     * 单任务查询：包含创建/完成时的发布快照与冻结令快照。
+     */
+    public TaskView getTask(long taskId) {
+        RolloutTask task = taskRepository.findById(taskId)
+                .orElseThrow(() -> ApiException.notFound("TASK_NOT_FOUND", "任务不存在: " + taskId));
+        return TaskView.of(task);
     }
 }

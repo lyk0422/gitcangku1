@@ -36,7 +36,7 @@ public class DeviceController {
     }
 
     @PostMapping("/{deviceId}/pull")
-    public PullResponse pull(@PathVariable String deviceId, @Valid @RequestBody RequestIdBody request) {
-        return taskService.pull(deviceId, request.requestId());
+    public PullResponse pull(@PathVariable String deviceId, @Valid @RequestBody PullRequest request) {
+        return taskService.pull(deviceId, request);
     }
 }

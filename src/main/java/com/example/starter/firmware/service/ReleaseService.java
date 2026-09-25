@@ -1,6 +1,7 @@
 package com.example.starter.firmware.service;
 
 import com.example.starter.firmware.api.CreateReleaseRequest;
+import com.example.starter.firmware.api.EmergencyException;
 import com.example.starter.firmware.api.ExpandReleaseRequest;
 import com.example.starter.firmware.api.MonitorView;
 import com.example.starter.firmware.api.PauseRecordView;
@@ -20,6 +21,7 @@ import org.springframework.stereotype.Service;
 
 import java.time.Clock;
 import java.time.Instant;
+import java.util.List;
 
 /**
  * 发布单生命周期：创建（版本从1开始）、扩量（版本校验+只增不减）、失败率自动暂停、
@@ -33,17 +35,19 @@ public class ReleaseService {
     private final PauseRecordRepository pauseRecordRepository;
     private final ResumeRecordRepository resumeRecordRepository;
     private final IdempotencyService idempotency;
+    private final FreezeService freezeService;
     private final Clock clock;
 
     public ReleaseService(ReleaseRepository releaseRepository, TaskRepository taskRepository,
                           PauseRecordRepository pauseRecordRepository,
                           ResumeRecordRepository resumeRecordRepository,
-                          IdempotencyService idempotency, Clock clock) {
+                          IdempotencyService idempotency, FreezeService freezeService, Clock clock) {
         this.releaseRepository = releaseRepository;
         this.taskRepository = taskRepository;
         this.pauseRecordRepository = pauseRecordRepository;
         this.resumeRecordRepository = resumeRecordRepository;
         this.idempotency = idempotency;
+        this.freezeService = freezeService;
         this.clock = clock;
     }
 
@@ -55,8 +59,11 @@ public class ReleaseService {
         int threshold = request.effectiveFailureThresholdPercent();
         String fingerprint = String.join("|", "release.create", request.model(), request.fromVersion(),
                 request.toVersion(), String.valueOf(request.ratio()), String.valueOf(sampleFloor),
-                String.valueOf(threshold));
+                String.valueOf(threshold), exceptionFingerprint(request.exception()));
         return idempotency.execute(request.requestId(), "release.create", fingerprint, () -> {
+            // 冻结预校验：命中生效冻结令范围时须携带完整紧急例外，与冻结/撤销按提交顺序裁决
+            EmergencyException exception = freezeService.assertReleaseStartAllowed(request.model(),
+                    request.exception());
             long id;
             try {
                 id = releaseRepository.insert(request.model(), request.fromVersion(), request.toVersion(),
@@ -64,8 +71,19 @@ public class ReleaseService {
             } catch (DuplicateKeyException e) {
                 throw ApiException.conflict("ACTIVE_RELEASE_EXISTS", "型号已存在未终结发布单: " + request.model());
             }
+            if (exception != null) {
+                freezeService.recordExceptionUse("release.create", String.valueOf(id), exception);
+            }
             return ReleaseView.of(findOrder(id));
         }, ReleaseView.class);
+    }
+
+    private static String exceptionFingerprint(EmergencyException exception) {
+        if (exception == null) {
+            return "-";
+        }
+        return exception.incidentId() + "#" + String.join(",", exception.approvers() == null
+                ? List.of() : exception.approvers().stream().sorted().toList());
     }
 
     public ReleaseView expand(long releaseId, ExpandReleaseRequest request) {

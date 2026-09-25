@@ -41,6 +41,9 @@ class FirmwareApiTest {
         jdbc.update("DELETE FROM release_order");
         jdbc.update("DELETE FROM device");
         jdbc.update("DELETE FROM idempotency_record");
+        jdbc.update("DELETE FROM freeze_exception_record");
+        jdbc.update("DELETE FROM freeze_order");
+        jdbc.update("DELETE FROM freeze_approver");
     }
 
     private String registerDevice(String requestId, String deviceId, String model, String version, int bucket)

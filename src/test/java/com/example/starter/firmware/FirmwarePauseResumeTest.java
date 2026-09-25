@@ -36,6 +36,9 @@ class FirmwarePauseResumeTest {
         jdbc.update("DELETE FROM release_order");
         jdbc.update("DELETE FROM device");
         jdbc.update("DELETE FROM idempotency_record");
+        jdbc.update("DELETE FROM freeze_exception_record");
+        jdbc.update("DELETE FROM freeze_order");
+        jdbc.update("DELETE FROM freeze_approver");
     }
 
     private static long idOf(MvcResult result, String path) throws Exception {

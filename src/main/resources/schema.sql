@@ -34,8 +34,14 @@ CREATE TABLE IF NOT EXISTS rollout_task (
   id BIGINT NOT NULL AUTO_INCREMENT COMMENT '任务ID',
   release_id BIGINT NOT NULL COMMENT '所属发布单ID',
   device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
-  status VARCHAR(16) NOT NULL COMMENT 'PENDING待回执；SUCCESS成功；FAILED失败；CANCELLED已取消',
+  status VARCHAR(16) NOT NULL COMMENT 'PENDING待回执；SUCCESS成功；FAILED失败；CANCELLED已取消；RELEASE_FROZEN冻结令冻结中',
   first_result VARCHAR(16) NULL COMMENT '首次回执结果（SUCCESS/FAILED），未回执为NULL',
+  from_version VARCHAR(64) NULL COMMENT '创建时发布快照：来源固件版本',
+  to_version VARCHAR(64) NULL COMMENT '创建时发布快照：目标固件版本',
+  receipt_from_version VARCHAR(64) NULL COMMENT '完成时发布快照：来源固件版本，未回执为NULL',
+  receipt_to_version VARCHAR(64) NULL COMMENT '完成时发布快照：目标固件版本，未回执为NULL',
+  freeze_order_id BIGINT NULL COMMENT '冻结该任务的冻结令ID，未冻结为NULL',
+  freeze_snapshot CLOB NULL COMMENT '冻结时刻冻结令快照（JSON），解冻后清空',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
   PRIMARY KEY (id),
@@ -71,3 +77,45 @@ CREATE TABLE IF NOT EXISTS idempotency_record (
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   PRIMARY KEY (request_id)
 ) COMMENT='写操作幂等去重记录，失败不占键';
+
+CREATE TABLE IF NOT EXISTS freeze_approver (
+  approver_id VARCHAR(64) NOT NULL COMMENT '确认人唯一标识',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '登记时间',
+  PRIMARY KEY (approver_id)
+) COMMENT='冻结紧急例外已登记确认人';
+
+CREATE TABLE IF NOT EXISTS freeze_order (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '冻结令ID',
+  version INT NOT NULL COMMENT '冻结令版本，从1开始，每次修订加一',
+  freeze_key VARCHAR(64) NOT NULL COMMENT '冻结令幂等键，同键同参重放、异参409',
+  models_csv VARCHAR(2048) NOT NULL COMMENT '规范化排序后的硬件型号集合，逗号分隔，空串表示未指定',
+  release_ids_csv VARCHAR(2048) NOT NULL COMMENT '规范化排序后的发布单ID集合，逗号分隔，空串表示未指定',
+  start_utc VARCHAR(40) NOT NULL COMMENT '生效窗口开始，UTC，ISO-8601格式，左闭',
+  end_utc VARCHAR(40) NOT NULL COMMENT '生效窗口结束，UTC，ISO-8601格式，右开，必须晚于开始',
+  status VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE生效中，REVOKED已撤销（终态）',
+  exception_incident_id VARCHAR(64) NULL COMMENT '紧急例外事件号，无例外为NULL',
+  exception_approvers_csv VARCHAR(256) NULL COMMENT '紧急例外确认人，规范化排序逗号分隔，无例外为NULL',
+  revoked_at_utc VARCHAR(40) NULL COMMENT '撤销时刻，UTC，ISO-8601格式，未撤销为NULL',
+  revoke_affected_task_ids_csv VARCHAR(4096) NULL COMMENT '撤销时解冻的任务ID，逗号分隔，未撤销为NULL',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
+  PRIMARY KEY (id),
+  CONSTRAINT uk_freeze_order_key UNIQUE (freeze_key)
+) COMMENT='固件发布冻结令，UTC左闭右开窗口内冻结命中范围的发布启动与任务拉取';
+
+CREATE TABLE IF NOT EXISTS freeze_exception_record (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '例外放行记录ID',
+  api VARCHAR(32) NOT NULL COMMENT '放行接口：release.create发布启动，task.pull任务拉取',
+  incident_id VARCHAR(64) NOT NULL COMMENT '紧急例外事件号',
+  approvers_csv VARCHAR(256) NOT NULL COMMENT '两名已登记确认人，规范化排序逗号分隔',
+  ref VARCHAR(64) NOT NULL COMMENT '放行对象标识：发布单ID或设备ID',
+  created_at_utc VARCHAR(40) NOT NULL COMMENT '放行时刻，UTC，ISO-8601格式',
+  PRIMARY KEY (id)
+) COMMENT='紧急例外放行记录，历史只增不改';
+
+CREATE TABLE IF NOT EXISTS freeze_guard (
+  id INT NOT NULL COMMENT '单行锁占位，恒为1',
+  PRIMARY KEY (id)
+) COMMENT='冻结裁决单行锁：冻结、撤销、发布启动、拉取在同一事务内先锁本行，按提交顺序裁决';
+
+INSERT INTO freeze_guard (id) SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM freeze_guard);
