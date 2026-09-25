@@ -37,4 +37,9 @@ public class ApiException extends RuntimeException {
     public static ApiException unprocessable(String message) {
         return new ApiException(422, "UNPROCESSABLE_ENTITY", message);
     }
+
+    /** 携带可区分业务错误码的 422，供发布门禁等场景稳定识别失败原因。 */
+    public static ApiException unprocessable(String code, String message) {
+        return new ApiException(422, code, message);
+    }
 }
