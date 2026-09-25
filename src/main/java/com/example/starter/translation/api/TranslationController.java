@@ -92,7 +92,39 @@ public class TranslationController {
                         documentId, segmentId, language, actorId, request))).toResponseEntity();
     }
 
-    /** 发布：全部段落全部目标语言均有有效批准且术语校验通过时原子生成只读快照并递增发布版本。 */
+    /**
+     * 法律审签：法务人取 X-Actor-Id，requestId 即 signKey（指纹含法务人、译文版本、状态与说明）；
+     * 仅已批准译文可审签，expectedVersion 须等于当前译文版本，REJECTED 须附说明；
+     * 同一译文版本仅保留最后一条终态审签。
+     */
+    @PutMapping("/{documentId}/segments/{segmentId}/translations/{language}/legal-signoff")
+    public ResponseEntity<String> submitLegalSignoff(@PathVariable long documentId,
+                                                     @PathVariable String segmentId,
+                                                     @PathVariable String language,
+                                                     @RequestHeader("X-Actor-Id") String actorId,
+                                                     @Valid @RequestBody ApiDtos.LegalSignoffRequest request) {
+        String operation = "PUT /api/documents/" + documentId + "/segments/" + segmentId
+                + "/translations/" + language + "/legal-signoff";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(200, translationService.submitLegalSignoff(
+                        documentId, segmentId, language, actorId, request))).toResponseEntity();
+    }
+
+    /** 查询逐段审签历史：按译文版本升序，同一译文版本仅含最后一条终态审签。 */
+    @GetMapping("/{documentId}/segments/{segmentId}/translations/{language}/legal-signoffs")
+    public ResponseEntity<ApiDtos.LegalSignoffHistoryResponse> getLegalSignoffHistory(
+            @PathVariable long documentId, @PathVariable String segmentId, @PathVariable String language) {
+        return ResponseEntity.ok(
+                translationService.getLegalSignoffHistory(documentId, segmentId, language));
+    }
+
+    /** 发布阻断诊断：当前状态下法律审签门禁的全部阻断项（稳定排序，无阻断为空列表）。 */
+    @GetMapping("/{documentId}/publish-blockers")
+    public ResponseEntity<ApiDtos.PublishBlockersResponse> getPublishBlockers(@PathVariable long documentId) {
+        return ResponseEntity.ok(translationService.getPublishBlockers(documentId));
+    }
+
+    /** 发布：全部段落全部目标语言均有有效批准、术语校验与法律审签门禁通过时原子生成只读快照并递增发布版本。 */
     @PostMapping("/{documentId}/publish")
     public ResponseEntity<String> publish(@PathVariable long documentId,
                                           @Valid @RequestBody ApiDtos.PublishRequest request) {

@@ -4,6 +4,7 @@ import com.fasterxml.jackson.annotation.JsonInclude;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.PositiveOrZero;
 import jakarta.validation.constraints.Size;
@@ -63,6 +64,15 @@ public final class ApiDtos {
             @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
             @Positive(message = "expectedDraftVersion 必须为正数") int expectedDraftVersion,
             @PositiveOrZero(message = "expectedPublishedVersion 不能为负数") int expectedPublishedVersion) {
+    }
+
+    /** 法律审签请求：requestId 即 signKey，expectedVersion 为期望的译文版本；法务人取 X-Actor-Id。 */
+    public record LegalSignoffRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @Positive(message = "expectedVersion 必须为正数") int expectedVersion,
+            @NotBlank(message = "status 不能为空") @Pattern(regexp = "APPROVED|REJECTED",
+                    message = "status 须为 APPROVED 或 REJECTED") String status,
+            @Size(max = 2048) String reason) {
     }
 
     /** 术语规则输入：sourceTerm 区分大小写，requiredTranslation 非空。 */
@@ -125,11 +135,39 @@ public final class ApiDtos {
     public record TermStatusResponse(long documentId, int termVersion, List<TranslationTermStatus> translations) {
     }
 
-    /** 统一错误响应；violations 仅在术语违规 422 时返回，含全部违规术语。 */
+    /** 法律审签响应。 */
+    public record LegalSignoffResponse(long documentId, String segmentId, String language, String legalUser,
+                                       int translationVersion, String status, String reason) {
+    }
+
+    /** 单条审签历史视图：同一译文版本仅保留最后一条终态审签。 */
+    public record LegalSignoffView(String legalUser, int translationVersion, String status, String reason,
+                                   String signedAt) {
+    }
+
+    /** 逐段审签历史查询响应：按译文版本升序。 */
+    public record LegalSignoffHistoryResponse(long documentId, String segmentId, String language,
+                                              List<LegalSignoffView> signoffs) {
+    }
+
+    /** 发布阻断明细：段落、语言、译文版本与阻断原因。 */
+    public record PublishBlocker(String segmentId, String language, int translationVersion, String reason) {
+    }
+
+    /** 发布阻断诊断查询响应：当前状态下法律审签门禁的全部阻断项（无阻断为空列表）。 */
+    public record PublishBlockersResponse(long documentId, List<PublishBlocker> blockers) {
+    }
+
+    /** 统一错误响应；violations 仅在术语违规 422 时返回，blockers 仅在审签门禁 422 时返回。 */
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    public record ErrorResponse(String error, String message, List<TermRuleView> violations) {
+    public record ErrorResponse(String error, String message, List<TermRuleView> violations,
+                                List<PublishBlocker> blockers) {
         public ErrorResponse(String error, String message) {
-            this(error, message, null);
+            this(error, message, null, null);
+        }
+
+        public ErrorResponse(String error, String message, List<TermRuleView> violations) {
+            this(error, message, violations, null);
         }
     }
 }

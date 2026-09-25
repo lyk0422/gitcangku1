@@ -72,6 +72,27 @@ COMMENT ON COLUMN approval.source_version IS '批准时的源文版本，发布�
 COMMENT ON COLUMN approval.translation_version IS '批准时的译文版本，发布校验须等于当前译文版本';
 COMMENT ON COLUMN approval.approved_at IS '批准时间，数据库默认时区';
 
+CREATE TABLE IF NOT EXISTS legal_signoff (
+    document_id BIGINT NOT NULL,
+    segment_id VARCHAR(64) NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    translation_version INT NOT NULL,
+    legal_user VARCHAR(128) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    reason VARCHAR(2048),
+    signed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (document_id, segment_id, language, translation_version)
+);
+COMMENT ON TABLE legal_signoff IS '法律审签：按段落、语言与译文版本唯一，同一译文版本仅保留最后一条终态审签（APPROVED/REJECTED）';
+COMMENT ON COLUMN legal_signoff.document_id IS '所属文档 ID';
+COMMENT ON COLUMN legal_signoff.segment_id IS '所属段落 ID';
+COMMENT ON COLUMN legal_signoff.language IS '目标语言码，小写';
+COMMENT ON COLUMN legal_signoff.translation_version IS '审签针对的译文版本；译文修订后新版本需重新审签，旧审签仅归属旧版本';
+COMMENT ON COLUMN legal_signoff.legal_user IS '法务人员，取审签时 X-Actor-Id';
+COMMENT ON COLUMN legal_signoff.status IS '终态审签状态：APPROVED 或 REJECTED';
+COMMENT ON COLUMN legal_signoff.reason IS '审签说明；status 为 REJECTED 时非空，APPROVED 时可为空（NULL 表示未填写）';
+COMMENT ON COLUMN legal_signoff.signed_at IS '审签时间，数据库默认时区';
+
 CREATE TABLE IF NOT EXISTS release_snapshot (
     document_id BIGINT NOT NULL,
     published_version INT NOT NULL,

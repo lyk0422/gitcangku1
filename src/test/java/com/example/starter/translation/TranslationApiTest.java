@@ -147,6 +147,7 @@ class TranslationApiTest extends AbstractIntegrationTest {
         assertThat(staleApprove.status()).isEqualTo(422);
         ApiResult reApprove = approve(docId, "s1", "en", "bob", 2, newRequestId());
         assertThat(reApprove.status()).isEqualTo(200);
+        assertThat(legalApprove(docId, "s1", "en", "legal1", 2).status()).isEqualTo(200);
         ApiResult published = publish(docId, 4, 0, newRequestId());
         assertThat(published.status()).isEqualTo(201);
         assertThat(published.body().get("publishedVersion").asInt()).isEqualTo(1);
@@ -189,6 +190,8 @@ class TranslationApiTest extends AbstractIntegrationTest {
             submitTranslation(docId, seg, "ja", "carol", seg + "-ja", 1, newRequestId());
             approve(docId, seg, "en", "bob", 1, newRequestId());
             approve(docId, seg, "ja", "dave", 1, newRequestId());
+            legalApprove(docId, seg, "en", "legal1", 1);
+            legalApprove(docId, seg, "ja", "legal2", 1);
         }
         ApiResult published = publish(docId, 5, 0, newRequestId());
         assertThat(published.status()).isEqualTo(201);
@@ -223,12 +226,14 @@ class TranslationApiTest extends AbstractIntegrationTest {
                 "[{\"segmentId\":\"s1\",\"sourceText\":\"原文\"}]");
         submitTranslation(docId, "s1", "en", "alice", "v1", 1, newRequestId());
         approve(docId, "s1", "en", "bob", 1, newRequestId());
+        legalApprove(docId, "s1", "en", "legal1", 1);
         assertThat(publish(docId, 2, 0, newRequestId()).status()).isEqualTo(201);
 
         putJson("/api/documents/" + docId + "/segments/s1/source",
                 "{\"requestId\":\"" + newRequestId() + "\",\"sourceText\":\"原文v2\"}");
         submitTranslation(docId, "s1", "en", "alice", "v2", 2, newRequestId());
         approve(docId, "s1", "en", "bob", 2, newRequestId());
+        legalApprove(docId, "s1", "en", "legal1", 2);
         ApiResult second = publish(docId, 4, 1, newRequestId());
         assertThat(second.status()).isEqualTo(201);
         assertThat(second.body().get("publishedVersion").asInt()).isEqualTo(2);

@@ -97,6 +97,7 @@ class ConcurrencyTest extends AbstractIntegrationTest {
                 "[{\"segmentId\":\"s1\",\"sourceText\":\"原文\"}]");
         submitTranslation(docId, "s1", "en", "alice", "hello", 1, newRequestId());
         approve(docId, "s1", "en", "bob", 1, newRequestId());
+        legalApprove(docId, "s1", "en", "legal1", 1);
         // 当前草稿版本 2、发布版本 0
 
         ExecutorService pool = Executors.newFixedThreadPool(2);
@@ -150,6 +151,7 @@ class ConcurrencyTest extends AbstractIntegrationTest {
                 newRequestId());
         submitTranslation(docId, "s1", "en", "alice", "machine learning", 1, newRequestId());
         approve(docId, "s1", "en", "bob", 1, newRequestId());
+        legalApprove(docId, "s1", "en", "legal1", 1);
         // 当前草稿版本 3、发布版本 0、术语版本 1
 
         ExecutorService pool = Executors.newFixedThreadPool(2);

@@ -2,6 +2,7 @@ package com.example.starter.translation.repo;
 
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
+import com.example.starter.translation.domain.Rows.LegalSignoffRow;
 import com.example.starter.translation.domain.Rows.RequestLogRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
@@ -45,6 +46,11 @@ public class TranslationRepository {
 
     private static final RowMapper<TermRuleRow> TERM_RULE_MAPPER = (rs, n) -> new TermRuleRow(
             rs.getString("source_term"), rs.getString("language"), rs.getString("required_translation"));
+
+    private static final RowMapper<LegalSignoffRow> LEGAL_SIGNOFF_MAPPER = (rs, n) -> new LegalSignoffRow(
+            rs.getString("segment_id"), rs.getString("language"), rs.getString("legal_user"),
+            rs.getInt("translation_version"), rs.getString("status"), rs.getString("reason"),
+            rs.getString("signed_at"));
 
     private final JdbcTemplate jdbc;
 
@@ -191,6 +197,50 @@ public class TranslationRepository {
     public void insertSnapshot(long documentId, int publishedVersion, String snapshotJson) {
         jdbc.update("INSERT INTO release_snapshot (document_id, published_version, snapshot_json) VALUES (?, ?, ?)",
                 documentId, publishedVersion, snapshotJson);
+    }
+
+    /** 按译文版本查询审签（同一译文版本至多一条终态审签）。 */
+    public Optional<LegalSignoffRow> findLegalSignoff(long documentId, String segmentId, String language,
+                                                      int translationVersion) {
+        List<LegalSignoffRow> rows = jdbc.query(
+                "SELECT segment_id, language, legal_user, translation_version, status, reason, signed_at "
+                        + "FROM legal_signoff WHERE document_id = ? AND segment_id = ? AND language = ? "
+                        + "AND translation_version = ?",
+                LEGAL_SIGNOFF_MAPPER, documentId, segmentId, language, translationVersion);
+        return rows.stream().findFirst();
+    }
+
+    /** 查询某段落某语言的全部审签历史，按译文版本升序。 */
+    public List<LegalSignoffRow> listLegalSignoffs(long documentId, String segmentId, String language) {
+        return jdbc.query(
+                "SELECT segment_id, language, legal_user, translation_version, status, reason, signed_at "
+                        + "FROM legal_signoff WHERE document_id = ? AND segment_id = ? AND language = ? "
+                        + "ORDER BY translation_version",
+                LEGAL_SIGNOFF_MAPPER, documentId, segmentId, language);
+    }
+
+    /** 查询文档全部审签，按段落、语言、译文版本稳定排序。 */
+    public List<LegalSignoffRow> listLegalSignoffs(long documentId) {
+        return jdbc.query(
+                "SELECT segment_id, language, legal_user, translation_version, status, reason, signed_at "
+                        + "FROM legal_signoff WHERE document_id = ? "
+                        + "ORDER BY segment_id, language, translation_version",
+                LEGAL_SIGNOFF_MAPPER, documentId);
+    }
+
+    /** 插入或覆盖某译文版本的终态审签（按主键段落+语言+译文版本唯一，同版本仅保留最后一条）。 */
+    public void upsertLegalSignoff(long documentId, LegalSignoffRow row) {
+        int updated = jdbc.update(
+                "UPDATE legal_signoff SET legal_user = ?, status = ?, reason = ?, signed_at = CURRENT_TIMESTAMP "
+                        + "WHERE document_id = ? AND segment_id = ? AND language = ? AND translation_version = ?",
+                row.legalUser(), row.status(), row.reason(),
+                documentId, row.segmentId(), row.language(), row.translationVersion());
+        if (updated == 0) {
+            jdbc.update("INSERT INTO legal_signoff (document_id, segment_id, language, translation_version, "
+                            + "legal_user, status, reason) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    documentId, row.segmentId(), row.language(), row.translationVersion(),
+                    row.legalUser(), row.status(), row.reason());
+        }
     }
 
     /** 插入术语版本主记录（不可变，主键已存在时抛冲突）。 */

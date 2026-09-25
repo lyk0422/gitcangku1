@@ -72,6 +72,21 @@ public final class Rows {
     }
 
     /**
+     * 法律审签：按段落、语言与译文版本唯一，同一译文版本仅保留最后一条终态审签。
+     *
+     * @param segmentId          所属段落 ID
+     * @param language           目标语言码，小写
+     * @param legalUser          法务人员，取审签时 X-Actor-Id
+     * @param translationVersion 审签针对的译文版本；译文修订后新版本需重新审签，旧审签仅归属旧版本
+     * @param status             终态审签状态：APPROVED 或 REJECTED
+     * @param reason             审签说明；REJECTED 时非空，APPROVED 时可为 null（未填写）
+     * @param signedAt           审签时间，数据库默认时区
+     */
+    public record LegalSignoffRow(String segmentId, String language, String legalUser,
+                                  int translationVersion, String status, String reason, String signedAt) {
+    }
+
+    /**
      * 写操作幂等去重记录：全局唯一 requestId，仅记录成功结果，与业务变更原子提交。
      *
      * @param requestId      全局唯一请求 ID

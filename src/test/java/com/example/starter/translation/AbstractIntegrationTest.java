@@ -35,6 +35,7 @@ public abstract class AbstractIntegrationTest {
 
     @BeforeEach
     void cleanTables() {
+        jdbc.update("DELETE FROM legal_signoff");
         jdbc.update("DELETE FROM approval");
         jdbc.update("DELETE FROM translation");
         jdbc.update("DELETE FROM segment");
@@ -128,6 +129,28 @@ public abstract class AbstractIntegrationTest {
         String body = "{\"requestId\":\"" + requestId + "\",\"expectedTermVersion\":" + expectedTermVersion
                 + ",\"rules\":" + rulesJson + "}";
         return putJson("/api/documents/" + documentId + "/terms", body);
+    }
+
+    /** 提交法律审签：status 为 APPROVED 或 REJECTED，reason 可为 null（不序列化该字段）。 */
+    protected ApiResult legalSignoff(long documentId, String segmentId, String language, String actorId,
+                                     int expectedVersion, String status, String reason,
+                                     String requestId) throws Exception {
+        StringBuilder body = new StringBuilder("{\"requestId\":\"").append(requestId)
+                .append("\",\"expectedVersion\":").append(expectedVersion)
+                .append(",\"status\":\"").append(status).append("\"");
+        if (reason != null) {
+            body.append(",\"reason\":\"").append(reason).append("\"");
+        }
+        body.append('}');
+        return putJson("/api/documents/" + documentId + "/segments/" + segmentId + "/translations/" + language
+                + "/legal-signoff", body.toString(), actorId);
+    }
+
+    /** 以 APPROVED 提交法律审签（无说明），使用新的 signKey。 */
+    protected ApiResult legalApprove(long documentId, String segmentId, String language, String actorId,
+                                     int expectedVersion) throws Exception {
+        return legalSignoff(documentId, segmentId, language, actorId, expectedVersion, "APPROVED", null,
+                newRequestId());
     }
 
     /** HTTP 响应结果：状态码与 JSON 响应体。 */

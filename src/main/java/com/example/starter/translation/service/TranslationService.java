@@ -4,6 +4,7 @@ import com.example.starter.translation.api.ApiDtos;
 import com.example.starter.translation.api.ApiException;
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
+import com.example.starter.translation.domain.Rows.LegalSignoffRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
 import com.example.starter.translation.domain.Rows.TranslationRow;
@@ -176,7 +177,9 @@ public class TranslationService {
     /**
      * 发布：校验期望版本（不符 409），再校验全部段落在全部目标语言均有有效批准（缺译或审核失效 422）、
      * 译文绑定当前术语版本（过期 422）且满足当前术语规则（违规 422 并返回全部违规术语），
-     * 全部通过后原子生成完整只读快照（固化术语版本与实际规则集）并递增发布版本；
+     * 最后校验法律审签门禁：所有纳入快照的译文版本必须有 APPROVED 审签，
+     * 缺失或 REJECTED 均使整次发布 422，按段落、语言稳定排序返回全部阻断的译文版本与原因；
+     * 全部通过后原子生成完整只读快照（固化术语版本、实际规则集与所用审签）并递增发布版本；
      * 任何失败回滚，不产生部分快照。
      */
     @Transactional
@@ -193,8 +196,10 @@ public class TranslationService {
                 .collect(Collectors.toMap(t -> key(t.segmentId(), t.language()), Function.identity()));
         Map<String, ApprovalRow> approvals = repository.listApprovals(documentId).stream()
                 .collect(Collectors.toMap(a -> key(a.segmentId(), a.language()), Function.identity()));
+        Map<String, LegalSignoffRow> signoffs = signoffsByVersion(documentId);
         List<TermRuleRow> termRules = repository.listTermRules(documentId, document.termVersion());
         List<ApiDtos.TermRuleView> termViolations = new ArrayList<>();
+        List<ApiDtos.PublishBlocker> legalBlockers = new ArrayList<>();
         for (SegmentRow segment : segments) {
             for (String language : document.targetLanguages()) {
                 TranslationRow translation = translations.get(key(segment.segmentId(), language));
@@ -224,16 +229,114 @@ public class TranslationService {
                 }
                 termViolations.addAll(findViolations(
                         segment.sourceText(), language, translation.content(), termRules));
+                LegalSignoffRow signoff = signoffs.get(
+                        legalKey(segment.segmentId(), language, translation.translationVersion()));
+                if (signoff == null) {
+                    legalBlockers.add(new ApiDtos.PublishBlocker(segment.segmentId(), language,
+                            translation.translationVersion(), "缺少法律审签"));
+                } else if (!"APPROVED".equals(signoff.status())) {
+                    legalBlockers.add(new ApiDtos.PublishBlocker(segment.segmentId(), language,
+                            translation.translationVersion(), "法律审签已拒绝: " + signoff.reason()));
+                }
             }
         }
         if (!termViolations.isEmpty()) {
             throw ApiException.termViolation("译文违反 " + termViolations.size() + " 条术语规则", termViolations);
         }
+        if (!legalBlockers.isEmpty()) {
+            throw ApiException.legalGate(legalBlockers.size() + " 个译文版本未通过法律审签，整次发布被阻断",
+                    legalBlockers);
+        }
         int publishedVersion = document.publishedVersion() + 1;
         repository.insertSnapshot(documentId, publishedVersion,
-                buildSnapshotJson(document, publishedVersion, segments, translations, approvals, termRules));
+                buildSnapshotJson(document, publishedVersion, segments, translations, approvals, signoffs,
+                        termRules));
         repository.updatePublishedVersion(documentId, publishedVersion);
         return new ApiDtos.PublishResponse(documentId, publishedVersion);
+    }
+
+    /**
+     * 法律审签：仅已批准译文可审签（批准须匹配当前源文与译文版本，否则 422）；
+     * expectedVersion 必须等于当前译文版本（不符 409）；REJECTED 时说明不能为空（422）。
+     * 同一译文版本仅保留最后一条终态审签；译文修订后新版本需重新审签，旧审签仅归属旧版本。
+     */
+    @Transactional
+    public ApiDtos.LegalSignoffResponse submitLegalSignoff(long documentId, String segmentId, String language,
+                                                           String actorId,
+                                                           ApiDtos.LegalSignoffRequest request) {
+        lockDocument(documentId);
+        String normalizedLanguage = normalizeLanguage(language);
+        SegmentRow segment = findSegmentOrThrow(documentId, segmentId);
+        TranslationRow translation = repository.findTranslation(documentId, segmentId, normalizedLanguage)
+                .orElseThrow(() -> ApiException.notFound(
+                        "译文不存在: " + segmentId + "/" + normalizedLanguage));
+        if (translation.translationVersion() != request.expectedVersion()) {
+            throw ApiException.conflict("译文版本冲突：当前译文版本 " + translation.translationVersion()
+                    + "，与期望的 " + request.expectedVersion() + " 不一致");
+        }
+        ApprovalRow approval = repository.findApproval(documentId, segmentId, normalizedLanguage)
+                .orElseThrow(() -> ApiException.unprocessable("译文尚未批准，不能审签: "
+                        + segmentId + "/" + normalizedLanguage));
+        if (approval.translationVersion() != translation.translationVersion()
+                || approval.sourceVersion() != segment.sourceVersion()) {
+            throw ApiException.unprocessable("批准已失效，需重新批准后再审签: " + segmentId + "/" + normalizedLanguage);
+        }
+        String reason = request.reason();
+        if ("REJECTED".equals(request.status()) && (reason == null || reason.isBlank())) {
+            throw ApiException.unprocessable("拒绝说明不能为空");
+        }
+        repository.upsertLegalSignoff(documentId, new LegalSignoffRow(segmentId, normalizedLanguage, actorId,
+                translation.translationVersion(), request.status(), reason, null));
+        return new ApiDtos.LegalSignoffResponse(documentId, segmentId, normalizedLanguage, actorId,
+                translation.translationVersion(), request.status(), reason);
+    }
+
+    /** 查询逐段审签历史：按译文版本升序，同一译文版本仅含最后一条终态审签。 */
+    @Transactional(readOnly = true)
+    public ApiDtos.LegalSignoffHistoryResponse getLegalSignoffHistory(long documentId, String segmentId,
+                                                                      String language) {
+        repository.findDocument(documentId)
+                .orElseThrow(() -> ApiException.notFound("文档不存在: " + documentId));
+        findSegmentOrThrow(documentId, segmentId);
+        String normalizedLanguage = normalizeLanguage(language);
+        List<ApiDtos.LegalSignoffView> signoffs = repository
+                .listLegalSignoffs(documentId, segmentId, normalizedLanguage).stream()
+                .map(s -> new ApiDtos.LegalSignoffView(s.legalUser(), s.translationVersion(), s.status(),
+                        s.reason(), s.signedAt()))
+                .toList();
+        return new ApiDtos.LegalSignoffHistoryResponse(documentId, segmentId, normalizedLanguage, signoffs);
+    }
+
+    /**
+     * 发布阻断诊断：按当前状态计算法律审签门禁的阻断项（缺失或 REJECTED），
+     * 按段落、语言稳定排序；无阻断返回空列表。只反映审签门禁，不代替发布的其他校验。
+     */
+    @Transactional(readOnly = true)
+    public ApiDtos.PublishBlockersResponse getPublishBlockers(long documentId) {
+        DocumentRow document = repository.findDocument(documentId)
+                .orElseThrow(() -> ApiException.notFound("文档不存在: " + documentId));
+        Map<String, TranslationRow> translations = repository.listTranslations(documentId).stream()
+                .collect(Collectors.toMap(t -> key(t.segmentId(), t.language()), Function.identity()));
+        Map<String, LegalSignoffRow> signoffs = signoffsByVersion(documentId);
+        List<ApiDtos.PublishBlocker> blockers = new ArrayList<>();
+        for (SegmentRow segment : repository.listSegments(documentId)) {
+            for (String language : document.targetLanguages()) {
+                TranslationRow translation = translations.get(key(segment.segmentId(), language));
+                if (translation == null) {
+                    continue;
+                }
+                LegalSignoffRow signoff = signoffs.get(
+                        legalKey(segment.segmentId(), language, translation.translationVersion()));
+                if (signoff == null) {
+                    blockers.add(new ApiDtos.PublishBlocker(segment.segmentId(), language,
+                            translation.translationVersion(), "缺少法律审签"));
+                } else if (!"APPROVED".equals(signoff.status())) {
+                    blockers.add(new ApiDtos.PublishBlocker(segment.segmentId(), language,
+                            translation.translationVersion(), "法律审签已拒绝: " + signoff.reason()));
+                }
+            }
+        }
+        return new ApiDtos.PublishBlockersResponse(documentId, blockers);
     }
 
     /** 查询指定发布版本的只读快照 JSON；不存在返回 404。 */
@@ -311,6 +414,18 @@ public class TranslationService {
         return segmentId + " " + language;
     }
 
+    private static String legalKey(String segmentId, String language, int translationVersion) {
+        return key(segmentId, language) + " " + translationVersion;
+    }
+
+    /** 查询文档全部审签并按 段落+语言+译文版本 建索引。 */
+    private Map<String, LegalSignoffRow> signoffsByVersion(long documentId) {
+        return repository.listLegalSignoffs(documentId).stream()
+                .collect(Collectors.toMap(
+                        s -> legalKey(s.segmentId(), s.language(), s.translationVersion()),
+                        Function.identity()));
+    }
+
     private static String normalizeLanguage(String language) {
         return language.trim().toLowerCase(Locale.ROOT);
     }
@@ -347,10 +462,12 @@ public class TranslationService {
         return new ApiDtos.TermRuleView(rule.sourceTerm(), rule.language(), rule.requiredTranslation());
     }
 
-    /** 生成完整只读快照 JSON：全部段落源文及各语言译文、作者、审核人、版本号与固化的术语版本及规则集。 */
+    /** 生成完整只读快照 JSON：全部段落源文及各语言译文、作者、审核人、版本号、固化的术语版本及规则集与所用法律审签。 */
     private String buildSnapshotJson(DocumentRow document, int publishedVersion, List<SegmentRow> segments,
                                      Map<String, TranslationRow> translations,
-                                     Map<String, ApprovalRow> approvals, List<TermRuleRow> termRules) {
+                                     Map<String, ApprovalRow> approvals,
+                                     Map<String, LegalSignoffRow> signoffs,
+                                     List<TermRuleRow> termRules) {
         Map<String, Object> snapshot = new LinkedHashMap<>();
         snapshot.put("documentId", document.documentId());
         snapshot.put("publishedVersion", publishedVersion);
@@ -376,6 +493,8 @@ public class TranslationService {
             for (String language : document.targetLanguages()) {
                 TranslationRow translation = translations.get(key(segment.segmentId(), language));
                 ApprovalRow approval = approvals.get(key(segment.segmentId(), language));
+                LegalSignoffRow signoff = signoffs.get(
+                        legalKey(segment.segmentId(), language, translation.translationVersion()));
                 Map<String, Object> translationJson = new LinkedHashMap<>();
                 translationJson.put("language", language);
                 translationJson.put("content", translation.content());
@@ -384,6 +503,12 @@ public class TranslationService {
                 translationJson.put("sourceVersion", translation.sourceVersion());
                 translationJson.put("termVersion", translation.termVersion());
                 translationJson.put("reviewer", approval.reviewer());
+                Map<String, Object> signoffJson = new LinkedHashMap<>();
+                signoffJson.put("legalUser", signoff.legalUser());
+                signoffJson.put("status", signoff.status());
+                signoffJson.put("reason", signoff.reason());
+                signoffJson.put("translationVersion", signoff.translationVersion());
+                translationJson.put("legalSignoff", signoffJson);
                 translationList.add(translationJson);
             }
             segmentJson.put("translations", translationList);
