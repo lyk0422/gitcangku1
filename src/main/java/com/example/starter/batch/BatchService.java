@@ -14,11 +14,13 @@ import com.example.starter.batch.dto.SubmitTestRequest;
 import com.example.starter.batch.dto.TestResultResponse;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.dao.ConcurrencyFailureException;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -33,6 +35,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.function.Supplier;
 
 /**
@@ -52,11 +55,17 @@ public class BatchService {
     private static final String CMD_SPLIT = "SPLIT";
 
     /**
+     * 默认初始成分：空过敏原集合 + NONE 隔离级别；创建时未携带 composition 时使用。
+     */
+    static final List<String> DEFAULT_ALLERGEN_CODES = List.of();
+    static final SegregationLevel DEFAULT_LEVEL = SegregationLevel.NONE;
+
+    /**
      * 指纹拼接分隔符（NUL）：业务参数不可能包含该字符，避免拼接碰撞。
      */
     private static final String SEP = "\u0000";
 
-    private static final int IDEMPOTENCY_MAX_ATTEMPTS = 3;
+    private static final int IDEMPOTENCY_MAX_ATTEMPTS = 5;
 
     private final BatchRepository repo;
     private final TransactionTemplate tx;
@@ -78,8 +87,15 @@ public class BatchService {
         if (new HashSet<>(items).size() != items.size()) {
             throw ApiException.badRequest("requiredTests 存在重复检验项");
         }
+        // 初始成分：未携带 composition 时为空集合 + NONE；未知代码/空级别 422
+        List<String> initialCodes = Allergens.validate(req.composition(), catalogCodes());
+        SegregationLevel initialLevel = req.composition() == null
+                ? DEFAULT_LEVEL : req.composition().segregationLevel();
+        BigDecimal initialStock = req.initialStock() == null ? BigDecimal.ZERO : req.initialStock();
         String fingerprint = fingerprint("create", req.batchKey(), req.productCode(), req.batchNo(),
-                req.producedAt().toString(), String.join(SEP, items));
+                req.producedAt().toString(), String.join(SEP, items),
+                String.join(SEP, initialCodes), initialLevel.name(),
+                initialStock.stripTrailingZeros().toPlainString());
         return executeIdempotent(CMD_CREATE, req.commandKey(), fingerprint, () -> {
             repo.findBatch(req.batchKey()).ifPresent(b -> {
                 throw ApiException.conflict("batchKey 已存在: " + req.batchKey());
@@ -90,10 +106,24 @@ public class BatchService {
             for (int i = 0; i < items.size(); i++) {
                 repo.insertRequiredTest(req.batchKey(), items.get(i), i + 1);
             }
+            // 初始不可变成分版本 v1 与初始库存
+            repo.insertComponent(new BatchRepository.ComponentRow(0L, req.batchKey(), 1,
+                    Allergens.toStored(initialCodes), initialLevel.name(), req.commandKey(), now));
+            repo.insertStock(new BatchRepository.StockRow(req.batchKey(), initialStock, now));
+            repo.insertStockLedger(req.batchKey(), "INIT", req.commandKey(),
+                    initialStock, initialStock, now);
             BatchResponse body = new BatchResponse(req.batchKey(), req.productCode(), req.batchNo(),
-                    req.producedAt(), BatchStatus.QUARANTINED, items, Instant.parse(now));
+                    req.producedAt(), BatchStatus.QUARANTINED, items, Instant.parse(now),
+                    1, initialCodes, initialLevel, initialStock);
             return new StoredResponse(201, toJson(body));
         });
+    }
+
+    /**
+     * 过敏原代码字典，缓存于调用处无需特别处理（字典静态初始化，体量极小）。
+     */
+    Set<String> catalogCodes() {
+        return new HashSet<>(repo.findAllergenCatalogCodes());
     }
 
     /**
@@ -123,27 +153,34 @@ public class BatchService {
             BatchStatus status = BatchStatus.valueOf(batch.status());
             assertNoRecalledAncestor(batchKey);
             if (status == BatchStatus.REJECTED || status == BatchStatus.RELEASED
-                    || status == BatchStatus.RECALLED || status == BatchStatus.SPLIT) {
+                    || status == BatchStatus.RECALLED || status == BatchStatus.SPLIT
+                    || status == BatchStatus.MERGED) {
                 throw ApiException.conflict("批次状态 " + status + " 不允许提交检验");
             }
             List<String> required = repo.findRequiredTests(batchKey);
             if (!required.contains(req.testItem())) {
                 throw ApiException.unprocessable("检验项不属于该批次必做项: " + req.testItem());
             }
-            boolean itemAlreadyTested = repo.findTests(batchKey).stream()
-                    .anyMatch(t -> t.testItem().equals(req.testItem()));
-            if (itemAlreadyTested) {
-                throw ApiException.conflict("该检验项已存在检验结果: " + req.testItem());
+            int currentVersion = repo.findCurrentComponent(batchKey)
+                    .map(BatchRepository.ComponentRow::version).orElse(0);
+            // 同一成分版本内每个检验项仅可提交一次；ALLERGEN_RISK 重新检验发生在新版本，允许再次提交
+            boolean itemAlreadyTestedAtVersion = repo.findTests(batchKey).stream()
+                    .anyMatch(t -> t.testItem().equals(req.testItem())
+                            && t.componentVersion() == currentVersion);
+            if (itemAlreadyTestedAtVersion) {
+                throw ApiException.conflict("当前成分版本下该检验项已存在检验结果: " + req.testItem());
             }
 
             String now = now();
             repo.insertTest(new BatchRepository.TestRow(0L, batchKey, req.testKey(), req.testItem(),
-                    req.result().name(), req.inspector(), now));
+                    req.result().name(), req.inspector(), currentVersion, now));
 
             BatchStatus newStatus = status;
             if (req.result() == TestOutcome.FAIL) {
                 newStatus = BatchStatus.REJECTED;
-            } else if (status == BatchStatus.QUARANTINED && allRequiredPassed(batchKey, required)) {
+            } else if ((status == BatchStatus.QUARANTINED || status == BatchStatus.ALLERGEN_RISK)
+                    && allRequiredPassedAtCurrentVersion(batchKey, required)) {
+                // 风险批次在新版本上重新检验全部通过后回到待放行，等待双角色放行解除风险
                 newStatus = BatchStatus.PENDING_RELEASE;
             }
             if (newStatus != status) {
@@ -170,11 +207,16 @@ public class BatchService {
                     .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
             BatchStatus status = BatchStatus.valueOf(batch.status());
             assertNoRecalledAncestor(batchKey);
-            if (status == BatchStatus.QUARANTINED) {
+            if (status == BatchStatus.QUARANTINED || status == BatchStatus.ALLERGEN_RISK) {
                 throw ApiException.unprocessable("必做检验项未全部通过，不能批准");
             }
             if (status != BatchStatus.PENDING_RELEASE && status != BatchStatus.RELEASE_REVIEW) {
                 throw ApiException.conflict("批次状态 " + status + " 不允许批准");
+            }
+            // 放行门禁：当前成分版本的全部必做项必须均有 PASS；任一未检验成分版本阻断放行
+            List<String> required = repo.findRequiredTests(batchKey);
+            if (!allRequiredPassedAtCurrentVersion(batchKey, required)) {
+                throw ApiException.unprocessable("当前成分版本存在未通过的必做检验项，不能批准放行");
             }
             boolean actorInspected = repo.findTests(batchKey).stream()
                     .anyMatch(t -> t.inspector().equals(actor));
@@ -183,26 +225,38 @@ public class BatchService {
             }
 
             List<BatchRepository.ApprovalRow> approvals = repo.findApprovals(batchKey);
+            int maxRound = approvals.stream().mapToInt(BatchRepository.ApprovalRow::round).max().orElse(0);
             String now = now();
             int seq;
+            int round;
             BatchStatus newStatus;
-            if (approvals.isEmpty()) {
+            if (status == BatchStatus.PENDING_RELEASE) {
+                // 新一轮双角色放行（首次放行或 ALLERGEN_RISK 重新检验后的再次放行）
+                round = maxRound + 1;
                 seq = 1;
                 newStatus = BatchStatus.RELEASE_REVIEW;
             } else {
-                BatchRepository.ApprovalRow first = approvals.get(0);
+                List<BatchRepository.ApprovalRow> currentRound = approvals.stream()
+                        .filter(a -> a.round() == maxRound).toList();
+                BatchRepository.ApprovalRow first = currentRound.get(0);
                 if (first.role().equals(role.name())) {
                     throw ApiException.conflict("角色 " + role + " 已批准过，需要另一种角色");
                 }
                 if (first.actorId().equals(actor)) {
                     throw ApiException.conflict("两个批准人必须不同: " + actor);
                 }
+                round = maxRound;
                 seq = 2;
                 newStatus = BatchStatus.RELEASED;
             }
             repo.insertApproval(new BatchRepository.ApprovalRow(0L, batchKey, req.commandKey(),
-                    actor, role.name(), seq, now));
+                    actor, role.name(), seq, round, now));
             repo.updateStatus(batchKey, newStatus.name());
+            // 双角色放行完成：若存在未解除的过敏原风险则一并解除
+            if (newStatus == BatchStatus.RELEASED) {
+                repo.findOpenRisk(batchKey).ifPresent(risk ->
+                        repo.resolveRisk(risk.id(), now, req.commandKey()));
+            }
             ApprovalResponse body = new ApprovalResponse(batchKey, actor, role, seq, newStatus,
                     Instant.parse(now));
             return new StoredResponse(201, toJson(body));
@@ -224,15 +278,19 @@ public class BatchService {
             BatchRepository.BatchRow batch = repo.findBatchForUpdate(batchKey)
                     .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
             BatchStatus status = BatchStatus.valueOf(batch.status());
-            if (status != BatchStatus.RELEASED && status != BatchStatus.SPLIT) {
-                throw ApiException.conflict("批次状态 " + status + " 不允许召回，仅 RELEASED 或 SPLIT 可召回");
+            if (status != BatchStatus.RELEASED && status != BatchStatus.SPLIT
+                    && status != BatchStatus.MERGED) {
+                throw ApiException.conflict("批次状态 " + status
+                        + " 不允许召回，仅 RELEASED、SPLIT 或 MERGED 可召回");
             }
-            // 逐行锁定全部后代（按业务键排序保证锁顺序确定）：与后代上的检验/批准/拆分
-            // 互斥，按事务提交顺序裁决——召回先提交则后代新操作看到召回并返回 422。
-            List<String> descendants = descendantKeys(batchKey);
-            Collections.sort(descendants);
-            for (String descendantKey : descendants) {
-                repo.findBatchForUpdate(descendantKey);
+            // 统一按全局批次键排序锁定自身与全部后代（拆分+合批两类血缘）：
+            // 与合批/检验/批准事务采用同一全局加锁顺序，避免多资源死锁；
+            // 与后代上的操作互斥，按事务提交顺序裁决——召回先提交则后代新操作返回 422。
+            List<String> lockKeys = combinedDescendantKeys(batchKey);
+            lockKeys.add(batchKey);
+            Collections.sort(lockKeys);
+            for (String lockKey : lockKeys) {
+                repo.findBatchForUpdate(lockKey);
             }
             String now = now();
             repo.insertRecall(new BatchRepository.RecallRow(0L, batchKey, req.commandKey(),
@@ -249,11 +307,12 @@ public class BatchService {
      * 以及任一祖先被召回的后代批次；后代自身状态不改写。
      */
     public List<BatchResponse> listAvailable() {
-        Map<String, String> parentOf = childToParent();
+        Map<String, List<String>> combinedParents = combinedParentOf();
         Set<String> recalled = new HashSet<>(repo.findRecalledKeys());
         return repo.findAvailableBatches().stream()
                 .filter(b -> !BatchStatus.SPLIT.name().equals(b.status()))
-                .filter(b -> recalledAncestor(b.batchKey(), parentOf, recalled).isEmpty())
+                .filter(b -> !BatchStatus.MERGED.name().equals(b.status()))
+                .filter(b -> recalledAncestorCombined(b.batchKey(), combinedParents, recalled).isEmpty())
                 .map(this::toBatchResponse)
                 .toList();
     }
@@ -309,6 +368,8 @@ public class BatchService {
                 });
             } catch (DuplicateKeyException e) {
                 // 并发同事务键冲突：回滚后重试，读取对方已提交的命令快照或业务结果
+            } catch (ConcurrencyFailureException e) {
+                // 行锁冲突/死锁牺牲品：回滚后重试；操作在锁内重新校验状态，重试安全
             }
         }
         throw ApiException.conflict("命令并发冲突，请重试: " + commandKey);
@@ -340,10 +401,35 @@ public class BatchService {
         return passed.containsAll(required);
     }
 
+    /**
+     * 放行门禁的成分版本判定：当前成分版本的全部必做项必须都有 PASS。
+     * 任一成分版本（含合并进来的来源版本经由目标新版本重新检验）未检验即阻断放行。
+     */
+    private boolean allRequiredPassedAtCurrentVersion(String batchKey, List<String> required) {
+        int currentVersion = repo.findCurrentComponent(batchKey)
+                .map(BatchRepository.ComponentRow::version).orElse(0);
+        Set<String> passedAtCurrent = new HashSet<>();
+        for (BatchRepository.TestRow t : repo.findTests(batchKey)) {
+            if (t.componentVersion() == currentVersion && TestOutcome.PASS.name().equals(t.outcome())) {
+                passedAtCurrent.add(t.testItem());
+            }
+        }
+        return passedAtCurrent.containsAll(required);
+    }
+
     private BatchResponse toBatchResponse(BatchRepository.BatchRow row) {
+        BatchRepository.ComponentRow component = repo.findCurrentComponent(row.batchKey()).orElse(null);
+        int version = component == null ? 0 : component.version();
+        List<String> codes = component == null
+                ? List.of() : Allergens.fromStored(component.allergenCodes());
+        SegregationLevel level = component == null
+                ? SegregationLevel.NONE : SegregationLevel.valueOf(component.segregationLevel());
+        BigDecimal stock = repo.findStock(row.batchKey())
+                .map(BatchRepository.StockRow::quantity).orElse(BigDecimal.ZERO);
         return new BatchResponse(row.batchKey(), row.productCode(), row.batchNo(),
                 Instant.parse(row.producedAt()), BatchStatus.valueOf(row.status()),
-                repo.findRequiredTests(row.batchKey()), Instant.parse(row.createdAt()));
+                repo.findRequiredTests(row.batchKey()), Instant.parse(row.createdAt()),
+                version, codes, level, stock);
     }
 
     private TestResultResponse toTestResponse(BatchRepository.TestRow row, String batchStatus) {
@@ -455,6 +541,12 @@ public class BatchService {
             }
             String now = now();
             List<String> required = repo.findRequiredTests(parentKey);
+            // 子批继承父批当前不可变成分（过敏原集合与隔离级别）作为自身 v1，库存初始为 0
+            BatchRepository.ComponentRow parentComponent = repo.findCurrentComponent(parentKey).orElse(null);
+            List<String> inheritedCodes = parentComponent == null
+                    ? List.of() : Allergens.fromStored(parentComponent.allergenCodes());
+            SegregationLevel inheritedLevel = parentComponent == null
+                    ? SegregationLevel.NONE : SegregationLevel.valueOf(parentComponent.segregationLevel());
             List<SplitResponse.SplitChild> childBodies = new ArrayList<>(children.size());
             for (int i = 0; i < children.size(); i++) {
                 SplitRequest.ChildSpec spec = children.get(i);
@@ -463,6 +555,10 @@ public class BatchService {
                 for (int j = 0; j < required.size(); j++) {
                     repo.insertRequiredTest(spec.batchKey(), required.get(j), j + 1);
                 }
+                repo.insertComponent(new BatchRepository.ComponentRow(0L, spec.batchKey(), 1,
+                        Allergens.toStored(inheritedCodes), inheritedLevel.name(),
+                        req.commandKey(), now));
+                repo.insertStock(new BatchRepository.StockRow(spec.batchKey(), BigDecimal.ZERO, now));
                 repo.insertLineage(new BatchRepository.LineageRow(0L, parentKey, spec.batchKey(),
                         i + 1, now));
                 childBodies.add(new SplitResponse.SplitChild(spec.batchKey(), spec.batchNo(),
@@ -510,9 +606,10 @@ public class BatchService {
 
     /**
      * 若任一级祖先已被召回则抛 422：后代批次禁止新增检验、批准和拆分。
+     * 祖先同时沿拆分血缘（子→父）与合批血缘（来源→目标容器）追溯。
      */
     private void assertNoRecalledAncestor(String batchKey) {
-        Optional<String> recalled = recalledAncestor(batchKey, childToParent(),
+        Optional<String> recalled = recalledAncestorCombined(batchKey, combinedParentOf(),
                 new HashSet<>(repo.findRecalledKeys()));
         if (recalled.isPresent()) {
             throw ApiException.unprocessable(
@@ -521,18 +618,78 @@ public class BatchService {
     }
 
     /**
-     * 沿父链向上查找最近的被直接召回（RECALLED）祖先；批次自身召回不算祖先召回。
+     * 组合血缘的“祖先”多父映射（物料来源方向）：
+     * 拆分边 child→parent（子批的物料来自父批）；
+     * 合批边 target→source（目标容器的物料来自各来源，来源是目标的祖先）。
+     * 一个批次可同时是某批的拆分子批与某容器的合入来源。
      */
-    private Optional<String> recalledAncestor(String batchKey, Map<String, String> parentOf,
-                                              Set<String> recalled) {
-        String current = batchKey;
-        while (parentOf.containsKey(current)) {
-            current = parentOf.get(current);
+    private Map<String, List<String>> combinedParentOf() {
+        Map<String, List<String>> parentOf = new HashMap<>();
+        for (BatchRepository.LineageRow row : repo.findAllLineage()) {
+            parentOf.computeIfAbsent(row.childKey(), k -> new ArrayList<>()).add(row.parentKey());
+        }
+        for (BatchRepository.MergeLineageRow row : repo.findAllMergeLineage()) {
+            parentOf.computeIfAbsent(row.targetKey(), k -> new ArrayList<>()).add(row.sourceKey());
+        }
+        return parentOf;
+    }
+
+    /**
+     * 组合血缘上沿全部父链（拆分父批 + 合批目标容器）向上查找最近的被直接召回祖先；
+     * 批次自身召回不算祖先召回。
+     */
+    private Optional<String> recalledAncestorCombined(String batchKey,
+                                                      Map<String, List<String>> parentOf,
+                                                      Set<String> recalled) {
+        Set<String> visited = new HashSet<>();
+        Deque<String> stack = new ArrayDeque<>();
+        List<String> start = parentOf.get(batchKey);
+        if (start != null) {
+            stack.addAll(start);
+        }
+        while (!stack.isEmpty()) {
+            String current = stack.pop();
+            if (!visited.add(current)) {
+                continue;
+            }
             if (recalled.contains(current)) {
                 return Optional.of(current);
             }
+            List<String> ups = parentOf.get(current);
+            if (ups != null) {
+                stack.addAll(ups);
+            }
         }
         return Optional.empty();
+    }
+
+    /**
+     * 组合血缘上某批次的全部后代业务键（不含自身）：拆分边 parent→child，
+     * 合批边 source→target（来源被召回时目标容器及其后续血缘同为后代）。
+     */
+    private List<String> combinedDescendantKeys(String rootKey) {
+        Map<String, List<String>> childrenOf = new HashMap<>();
+        for (BatchRepository.LineageRow row : repo.findAllLineage()) {
+            childrenOf.computeIfAbsent(row.parentKey(), k -> new ArrayList<>()).add(row.childKey());
+        }
+        for (BatchRepository.MergeLineageRow row : repo.findAllMergeLineage()) {
+            childrenOf.computeIfAbsent(row.sourceKey(), k -> new ArrayList<>()).add(row.targetKey());
+        }
+        List<String> result = new ArrayList<>();
+        Deque<String> queue = new ArrayDeque<>();
+        Set<String> visited = new HashSet<>();
+        queue.add(rootKey);
+        visited.add(rootKey);
+        while (!queue.isEmpty()) {
+            String current = queue.poll();
+            for (String child : childrenOf.getOrDefault(current, List.of())) {
+                if (visited.add(child)) {
+                    result.add(child);
+                    queue.add(child);
+                }
+            }
+        }
+        return result;
     }
 
     /**
@@ -544,6 +701,22 @@ public class BatchService {
             parentOf.put(row.childKey(), row.parentKey());
         }
         return parentOf;
+    }
+
+    /**
+     * 仅沿拆分父链向上查找最近的被直接召回祖先；供 /ancestors、/descendants 查询端点使用，
+     * 这些端点保持拆分血缘语义（合批血缘请查成分血缘快照）。
+     */
+    private Optional<String> recalledAncestor(String batchKey, Map<String, String> parentOf,
+                                              Set<String> recalled) {
+        String current = batchKey;
+        while (parentOf.containsKey(current)) {
+            current = parentOf.get(current);
+            if (recalled.contains(current)) {
+                return Optional.of(current);
+            }
+        }
+        return Optional.empty();
     }
 
     /**

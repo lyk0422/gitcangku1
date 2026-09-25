@@ -3,9 +3,15 @@ package com.example.starter.batch;
 import com.example.starter.batch.dto.ApproveRequest;
 import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
+import com.example.starter.batch.dto.CompatibilityDiagnostic;
+import com.example.starter.batch.dto.ComponentVersionResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
 import com.example.starter.batch.dto.LineageEntryResponse;
+import com.example.starter.batch.dto.LineageSnapshotResponse;
+import com.example.starter.batch.dto.MergeRequest;
 import com.example.starter.batch.dto.RecallRequest;
+import com.example.starter.batch.dto.ReviseCompositionRequest;
+import com.example.starter.batch.dto.RiskResponse;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
 import jakarta.validation.Valid;
@@ -30,9 +36,11 @@ import java.util.List;
 public class BatchController {
 
     private final BatchService service;
+    private final AllergenService allergenService;
 
-    public BatchController(BatchService service) {
+    public BatchController(BatchService service, AllergenService allergenService) {
         this.service = service;
+        this.allergenService = allergenService;
     }
 
     /**
@@ -112,6 +120,56 @@ public class BatchController {
     @GetMapping("/{batchKey}/descendants")
     public List<LineageEntryResponse> descendants(@PathVariable String batchKey) {
         return service.listDescendants(batchKey);
+    }
+
+    /**
+     * 成分修订：expectedVersion 乐观并发，未知代码或空级别 422；追加不可变成分版本。
+     */
+    @PostMapping("/{batchKey}/composition")
+    public ResponseEntity<String> reviseComposition(@PathVariable String batchKey,
+                                                    @Valid @RequestBody ReviseCompositionRequest request) {
+        return stored(allergenService.reviseComposition(batchKey, request));
+    }
+
+    /**
+     * 批量合批：目标容器吸收全部来源（整批库存），先校验全部目标状态与兼容矩阵，
+     * 任一不兼容 422 并回滚全部血缘和库存。
+     */
+    @PostMapping("/merge")
+    public ResponseEntity<String> merge(@Valid @RequestBody MergeRequest request) {
+        return stored(allergenService.merge(request));
+    }
+
+    /**
+     * 合批兼容诊断：不落状态，返回兼容结论、可区分阻断原因与缺失级别对。
+     */
+    @PostMapping("/merge/diagnose")
+    public CompatibilityDiagnostic diagnose(@Valid @RequestBody MergeRequest request) {
+        return allergenService.diagnose(request.targetBatchKey(), request);
+    }
+
+    /**
+     * 成分版本查询：返回批次全部不可变成分版本，current 标记当前版本。
+     */
+    @GetMapping("/{batchKey}/composition")
+    public List<ComponentVersionResponse> components(@PathVariable String batchKey) {
+        return allergenService.listComponents(batchKey);
+    }
+
+    /**
+     * 风险查询：返回当前未解除的过敏原风险；无风险时 body 为 null。
+     */
+    @GetMapping("/{batchKey}/risk")
+    public RiskResponse risk(@PathVariable String batchKey) {
+        return allergenService.currentRisk(batchKey);
+    }
+
+    /**
+     * 成分血缘快照：当前成分 + 拆分/合批两类血缘边及各边成分版本。
+     */
+    @GetMapping("/{batchKey}/lineage-snapshot")
+    public LineageSnapshotResponse lineageSnapshot(@PathVariable String batchKey) {
+        return allergenService.lineageSnapshot(batchKey);
     }
 
     private ResponseEntity<String> stored(StoredResponse response) {
