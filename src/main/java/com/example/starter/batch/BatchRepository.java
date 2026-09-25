@@ -17,7 +17,7 @@ public class BatchRepository {
      * batch 表行记录；id 同时作为同批次事件的提交顺序依据。
      */
     public record BatchRow(long id, String batchKey, String productCode, String batchNo,
-                           String producedAt, String status, String createdAt) {
+                           String supplierId, String producedAt, String status, String createdAt) {
     }
 
     /**
@@ -48,9 +48,15 @@ public class BatchRepository {
                              int responseStatus, String responseBody) {
     }
 
+    /**
+     * supplier_threshold 表行记录：供应商准入门槛当前配置。
+     */
+    public record ThresholdRow(String supplierId, int threshold, String updatedAt) {
+    }
+
     private static final RowMapper<BatchRow> BATCH_MAPPER = (rs, n) -> new BatchRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("product_code"),
-            rs.getString("batch_no"), rs.getString("produced_at"),
+            rs.getString("batch_no"), rs.getString("supplier_id"), rs.getString("produced_at"),
             rs.getString("status"), rs.getString("created_at"));
 
     private static final RowMapper<TestRow> TEST_MAPPER = (rs, n) -> new TestRow(
@@ -70,6 +76,9 @@ public class BatchRepository {
     private static final RowMapper<CommandRow> COMMAND_MAPPER = (rs, n) -> new CommandRow(
             rs.getString("command_type"), rs.getString("command_key"), rs.getString("fingerprint"),
             rs.getInt("response_status"), rs.getString("response_body"));
+
+    private static final RowMapper<ThresholdRow> THRESHOLD_MAPPER = (rs, n) -> new ThresholdRow(
+            rs.getString("supplier_id"), rs.getInt("threshold"), rs.getString("updated_at"));
 
     private final JdbcTemplate jdbc;
 
@@ -91,10 +100,10 @@ public class BatchRepository {
     }
 
     public void insertBatch(BatchRow row) {
-        jdbc.update("INSERT INTO batch (batch_key, product_code, batch_no, produced_at, status, created_at)"
-                        + " VALUES (?, ?, ?, ?, ?, ?)",
-                row.batchKey(), row.productCode(), row.batchNo(), row.producedAt(),
-                row.status(), row.createdAt());
+        jdbc.update("INSERT INTO batch (batch_key, product_code, batch_no, supplier_id,"
+                        + " produced_at, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                row.batchKey(), row.productCode(), row.batchNo(), row.supplierId(),
+                row.producedAt(), row.status(), row.createdAt());
     }
 
     public void insertRequiredTest(String batchKey, String testItem, int seq) {
@@ -168,5 +177,36 @@ public class BatchRepository {
                         + " response_status, response_body, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                 row.commandType(), row.commandKey(), row.fingerprint(),
                 row.responseStatus(), row.responseBody(), createdAt);
+    }
+
+    /**
+     * 供应商全部终态批次（RELEASED/RECALLED），按 id（提交顺序）升序；
+     * 滑动窗口的“批次创建时刻”排序在服务层按 createdAt 解析后完成。
+     */
+    public List<BatchRow> findTerminalBatchesBySupplier(String supplierId) {
+        return jdbc.query("SELECT * FROM batch WHERE supplier_id = ?"
+                        + " AND status IN ('RELEASED', 'RECALLED') ORDER BY id",
+                BATCH_MAPPER, supplierId);
+    }
+
+    public Optional<ThresholdRow> findThreshold(String supplierId) {
+        return jdbc.query("SELECT * FROM supplier_threshold WHERE supplier_id = ?",
+                        THRESHOLD_MAPPER, supplierId)
+                .stream().findFirst();
+    }
+
+    /**
+     * 设置或覆盖供应商门槛；并发同供应商首次写入产生主键冲突时，
+     * 由上层幂等重试按事务提交顺序裁决。
+     */
+    public void upsertThreshold(ThresholdRow row) {
+        int updated = jdbc.update(
+                "UPDATE supplier_threshold SET threshold = ?, updated_at = ? WHERE supplier_id = ?",
+                row.threshold(), row.updatedAt(), row.supplierId());
+        if (updated == 0) {
+            jdbc.update("INSERT INTO supplier_threshold (supplier_id, threshold, updated_at)"
+                            + " VALUES (?, ?, ?)",
+                    row.supplierId(), row.threshold(), row.updatedAt());
+        }
     }
 }

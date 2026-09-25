@@ -1,5 +1,6 @@
 package com.example.starter.batch;
 
+import com.example.starter.batch.dto.GateRejectedResponse;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -20,6 +21,13 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorResponse> handleApi(ApiException ex) {
         return ResponseEntity.status(ex.status())
                 .body(new ErrorResponse(ex.code(), ex.getMessage()));
+    }
+
+    @ExceptionHandler(GateRejectedException.class)
+    public ResponseEntity<GateRejectedResponse> handleGateRejected(GateRejectedException ex) {
+        return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
+                .body(new GateRejectedResponse("PRECONDITION_FAILED", ex.getMessage(),
+                        ex.currentScore(), ex.threshold()));
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)

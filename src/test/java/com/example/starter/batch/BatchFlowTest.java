@@ -163,15 +163,24 @@ class BatchFlowTest {
     void invalidBodiesAndHeaders_return400() throws Exception {
         // 必做项为空
         String emptyTests = "{\"commandKey\":\"c\",\"batchKey\":\"b\",\"productCode\":\"p\","
-                + "\"batchNo\":\"n\",\"producedAt\":\"2026-01-01T00:00:00Z\",\"requiredTests\":[]}";
+                + "\"batchNo\":\"n\",\"supplierId\":\"SUP-1\","
+                + "\"producedAt\":\"2026-01-01T00:00:00Z\",\"requiredTests\":[]}";
         mockMvc.perform(post("/api/batches").contentType(MediaType.APPLICATION_JSON).content(emptyTests))
                 .andExpect(status().isBadRequest());
 
         // 必做项 6 个
         String sixTests = "{\"commandKey\":\"c\",\"batchKey\":\"b2\",\"productCode\":\"p\","
-                + "\"batchNo\":\"n\",\"producedAt\":\"2026-01-01T00:00:00Z\","
+                + "\"batchNo\":\"n\",\"supplierId\":\"SUP-1\","
+                + "\"producedAt\":\"2026-01-01T00:00:00Z\","
                 + "\"requiredTests\":[\"a\",\"b\",\"c\",\"d\",\"e\",\"f\"]}";
         mockMvc.perform(post("/api/batches").contentType(MediaType.APPLICATION_JSON).content(sixTests))
+                .andExpect(status().isBadRequest());
+
+        // 缺 supplierId
+        String noSupplier = "{\"commandKey\":\"c\",\"batchKey\":\"b3\",\"productCode\":\"p\","
+                + "\"batchNo\":\"n\",\"producedAt\":\"2026-01-01T00:00:00Z\","
+                + "\"requiredTests\":[\"a\"]}";
+        mockMvc.perform(post("/api/batches").contentType(MediaType.APPLICATION_JSON).content(noSupplier))
                 .andExpect(status().isBadRequest());
 
         // 检验项重复
@@ -230,7 +239,7 @@ class BatchFlowTest {
 
         // 同 commandKey 改参（批号不同）→ 409
         String changed = objectMapper.writeValueAsString(new CreateCmd("CK-1", batchKey + "-X",
-                "p", "n-changed", Instant.parse("2026-03-01T00:00:00Z"), List.of("t1")));
+                "p", "n-changed", "SUP-1", Instant.parse("2026-03-01T00:00:00Z"), List.of("t1")));
         mockMvc.perform(post("/api/batches")
                         .contentType(MediaType.APPLICATION_JSON).content(changed))
                 .andExpect(status().isConflict());
@@ -495,7 +504,7 @@ class BatchFlowTest {
     // ---------- helpers ----------
 
     private record CreateCmd(String commandKey, String batchKey, String productCode, String batchNo,
-                             Instant producedAt, List<String> requiredTests) {
+                             String supplierId, Instant producedAt, List<String> requiredTests) {
     }
 
     private String unique() {
@@ -504,7 +513,7 @@ class BatchFlowTest {
 
     private String createBody(String batchKey, List<String> items) throws Exception {
         return objectMapper.writeValueAsString(new CreateCmd("CK-1", batchKey, "PROD-1", "LOT-1",
-                Instant.parse("2026-01-02T03:04:05Z"), items));
+                "SUP-" + unique(), Instant.parse("2026-01-02T03:04:05Z"), items));
     }
 
     private void createBatch(String batchKey, List<String> items, int expectedStatus) throws Exception {

@@ -48,19 +48,24 @@ public class BatchService {
     private static final int IDEMPOTENCY_MAX_ATTEMPTS = 3;
 
     private final BatchRepository repo;
+    private final SupplierService supplierService;
     private final TransactionTemplate tx;
     private final ObjectMapper objectMapper;
 
     public BatchService(BatchRepository repo,
+                        SupplierService supplierService,
                         PlatformTransactionManager transactionManager,
                         ObjectMapper objectMapper) {
         this.repo = repo;
+        this.supplierService = supplierService;
         this.tx = new TransactionTemplate(transactionManager);
         this.objectMapper = objectMapper;
     }
 
     /**
      * 创建批次：初始状态 QUARANTINED；batchKey 全局唯一，重复返回 409。
+     * 供应商已设置准入门槛且当前滑动评分低于门槛时返回 422（携带当前评分与门槛），
+     * 判定基于本事务内可读取到的最新已提交终态批次集合；已存在批次不受门槛影响。
      */
     public StoredResponse createBatch(CreateBatchRequest req) {
         List<String> items = req.requiredTests().stream().map(String::trim).toList();
@@ -68,19 +73,27 @@ public class BatchService {
             throw ApiException.badRequest("requiredTests 存在重复检验项");
         }
         String fingerprint = fingerprint("create", req.batchKey(), req.productCode(), req.batchNo(),
-                req.producedAt().toString(), String.join(SEP, items));
+                req.supplierId(), req.producedAt().toString(), String.join(SEP, items));
         return executeIdempotent(CMD_CREATE, req.commandKey(), fingerprint, () -> {
             repo.findBatch(req.batchKey()).ifPresent(b -> {
                 throw ApiException.conflict("batchKey 已存在: " + req.batchKey());
             });
+            repo.findThreshold(req.supplierId()).ifPresent(t -> {
+                int currentScore = supplierService.currentScore(req.supplierId());
+                if (currentScore < t.threshold()) {
+                    throw new GateRejectedException(req.supplierId(), currentScore, t.threshold());
+                }
+            });
             String now = now();
             repo.insertBatch(new BatchRepository.BatchRow(0L, req.batchKey(), req.productCode(),
-                    req.batchNo(), req.producedAt().toString(), BatchStatus.QUARANTINED.name(), now));
+                    req.batchNo(), req.supplierId(), req.producedAt().toString(),
+                    BatchStatus.QUARANTINED.name(), now));
             for (int i = 0; i < items.size(); i++) {
                 repo.insertRequiredTest(req.batchKey(), items.get(i), i + 1);
             }
             BatchResponse body = new BatchResponse(req.batchKey(), req.productCode(), req.batchNo(),
-                    req.producedAt(), BatchStatus.QUARANTINED, items, Instant.parse(now));
+                    req.supplierId(), req.producedAt(), BatchStatus.QUARANTINED, items,
+                    Instant.parse(now));
             return new StoredResponse(201, toJson(body));
         });
     }
@@ -301,7 +314,7 @@ public class BatchService {
     }
 
     private BatchResponse toBatchResponse(BatchRepository.BatchRow row) {
-        return new BatchResponse(row.batchKey(), row.productCode(), row.batchNo(),
+        return new BatchResponse(row.batchKey(), row.productCode(), row.batchNo(), row.supplierId(),
                 Instant.parse(row.producedAt()), BatchStatus.valueOf(row.status()),
                 repo.findRequiredTests(row.batchKey()), Instant.parse(row.createdAt()));
     }

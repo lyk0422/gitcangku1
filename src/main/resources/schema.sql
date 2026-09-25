@@ -4,6 +4,7 @@ CREATE TABLE IF NOT EXISTS batch (
     batch_key VARCHAR(64) NOT NULL COMMENT '批次业务键，全局唯一，创建后不可修改',
     product_code VARCHAR(64) NOT NULL COMMENT '产品编码，创建后不可修改',
     batch_no VARCHAR(64) NOT NULL COMMENT '批号，创建后不可修改',
+    supplier_id VARCHAR(64) NOT NULL COMMENT '供应商标识，创建后不可修改；供应商评分与准入门槛按该标识归集',
     produced_at VARCHAR(40) NOT NULL COMMENT '生产时间，ISO-8601 UTC  instant 字符串',
     status VARCHAR(32) NOT NULL COMMENT '批次状态：QUARANTINED/PENDING_RELEASE/RELEASE_REVIEW/RELEASED/REJECTED/RECALLED',
     created_at VARCHAR(40) NOT NULL COMMENT '创建时间，ISO-8601 UTC instant 字符串',
@@ -47,8 +48,14 @@ CREATE TABLE IF NOT EXISTS recall (
     created_at VARCHAR(40) NOT NULL COMMENT '召回时间，ISO-8601 UTC instant 字符串'
 );
 
+CREATE TABLE IF NOT EXISTS supplier_threshold (
+    supplier_id VARCHAR(64) PRIMARY KEY COMMENT '供应商标识',
+    threshold INT NOT NULL COMMENT '准入门槛分数，取值 -100~100；当前滑动评分低于该值时拦截该供应商新批次创建（422）',
+    updated_at VARCHAR(40) NOT NULL COMMENT '最近一次门槛设置时间，ISO-8601 UTC instant 字符串'
+);
+
 CREATE TABLE IF NOT EXISTS command_log (
-    command_type VARCHAR(32) NOT NULL COMMENT '命令类型：CREATE_BATCH/SUBMIT_TEST/APPROVE/RECALL',
+    command_type VARCHAR(32) NOT NULL COMMENT '命令类型：CREATE_BATCH/SUBMIT_TEST/APPROVE/RECALL/SET_THRESHOLD',
     command_key VARCHAR(64) NOT NULL COMMENT '命令幂等键；同类型同键同参重放返回首次结果，同键改参返回 409',
     fingerprint VARCHAR(64) NOT NULL COMMENT '业务参数（不含 commandKey）的 SHA-256 摘要，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行成功的 HTTP 状态码',

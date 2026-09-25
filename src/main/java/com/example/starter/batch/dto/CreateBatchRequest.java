@@ -9,12 +9,14 @@ import java.util.List;
 
 /**
  * 创建批次请求。producedAt 为 ISO-8601 UTC 时间；requiredTests 为 1～5 个必做检验项。
+ * supplierId 为供应商标识，用于供应商评分卡与准入门槛判定。
  */
 public record CreateBatchRequest(
         @NotBlank(message = "commandKey 不能为空") String commandKey,
         @NotBlank(message = "batchKey 不能为空") String batchKey,
         @NotBlank(message = "productCode 不能为空") String productCode,
         @NotBlank(message = "batchNo 不能为空") String batchNo,
+        @NotBlank(message = "supplierId 不能为空") String supplierId,
         @NotNull(message = "producedAt 不能为空") Instant producedAt,
         @NotNull(message = "requiredTests 不能为空")
         @Size(min = 1, max = 5, message = "requiredTests 必须包含 1～5 个检验项")
