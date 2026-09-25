@@ -59,3 +59,57 @@ CREATE TABLE IF NOT EXISTS conflict_resolution (
     -- 且不可变解决历史必须在任何数据清理/归档场景下继续可查。
     UNIQUE (observation_id, request_id)
 );
+
+-- 设备时钟偏移记录表：同一设备按生效起始时刻（UTC）划分偏移区间，
+-- 区间为 [effective_from_utc, 该设备下一条记录的起始时刻)，起始时刻相同即区间重叠（409）。
+CREATE TABLE IF NOT EXISTS device_offset (
+    device_id VARCHAR(64) NOT NULL COMMENT '采集设备唯一标识',
+    effective_from_utc TIMESTAMP NOT NULL COMMENT '偏移生效起始时刻（UTC，含边界）；存 UTC 字段值',
+    offset_seconds INT NOT NULL COMMENT '偏移秒数（-86400 至 86400 整数）；矫正后时刻 = 设备本地时刻 + 偏移秒数',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间（服务器时区）',
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近一次偏移秒数修改时间（服务器时区）',
+    PRIMARY KEY (device_id, effective_from_utc)
+);
+
+-- 设备观测提交表：每次提交追加一行版本；原始本地时刻不可改写，
+-- 矫正后时刻与合并顺序仅由系统在提交或偏移重建时写入。
+CREATE TABLE IF NOT EXISTS device_observation (
+    observation_id VARCHAR(64) NOT NULL COMMENT '观测标识；同一观测的多次提交构成其版本序列',
+    version INT NOT NULL COMMENT '版本号，按提交到达顺序从 1 开始单调递增，分配后不可改写',
+    device_id VARCHAR(64) NOT NULL COMMENT '提交设备标识',
+    device_local_time TIMESTAMP NOT NULL COMMENT '设备本地时刻原始值（无区字面量，不可改写）',
+    corrected_at_utc TIMESTAMP NOT NULL COMMENT '矫正后时刻（UTC）= 设备本地时刻 + 命中偏移秒数；存 UTC 字段值',
+    location VARCHAR(512) NOT NULL COMMENT '观测地点',
+    reading VARCHAR(64) NOT NULL COMMENT '观测读数，十进制字符串，最多三位小数',
+    note VARCHAR(1024) NOT NULL COMMENT '观测备注',
+    merge_seq BIGINT NOT NULL COMMENT '全局合并顺序：按（矫正后时刻, 设备标识, 观测标识, 版本）升序排位，重建时整体重排',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '提交落库时间（服务器时区）',
+    PRIMARY KEY (observation_id, version)
+);
+
+-- 不可变重排记录：偏移登记/修改触发的重建使某观测当前胜出版本变化时写入，永不更新或删除。
+CREATE TABLE IF NOT EXISTS observation_reorder (
+    reorder_id VARCHAR(256) NOT NULL COMMENT '重排记录标识：触发请求标识#观测标识',
+    request_id VARCHAR(128) NOT NULL COMMENT '触发本次重建的偏移变更请求标识（requestId）',
+    device_id VARCHAR(64) NOT NULL COMMENT '偏移变更所属设备标识',
+    effective_from_utc TIMESTAMP NOT NULL COMMENT '变更的偏移记录生效起始时刻（UTC）；存 UTC 字段值',
+    old_offset_seconds INT NULL COMMENT '变更前偏移秒数；新增偏移记录时为 NULL',
+    new_offset_seconds INT NOT NULL COMMENT '变更后偏移秒数',
+    observation_id VARCHAR(64) NOT NULL COMMENT '受影响的观测标识',
+    old_winner_version INT NOT NULL COMMENT '重建前当前胜出版本号',
+    new_winner_version INT NOT NULL COMMENT '重建后当前胜出版本号',
+    old_order VARCHAR(512) NOT NULL COMMENT '重建前该观测各版本按合并排位的版本号列表（JSON 数组）',
+    new_order VARCHAR(512) NOT NULL COMMENT '重建后该观测各版本按合并排位的版本号列表（JSON 数组）',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录落库时间（服务器时区）',
+    PRIMARY KEY (reorder_id)
+);
+
+-- 合并顺序全局互斥行：观测提交、偏移登记与修改在同一事务内先锁定该行，
+-- 使并发按事务提交顺序裁决（先提交先生效）。
+CREATE TABLE IF NOT EXISTS merge_order_lock (
+    id INT NOT NULL COMMENT '锁行标识，固定为 1',
+    PRIMARY KEY (id)
+);
+
+-- H2 语法：保证锁行恰好存在一行（本地与测试均运行于 H2）。
+MERGE INTO merge_order_lock (id) KEY(id) VALUES (1);
