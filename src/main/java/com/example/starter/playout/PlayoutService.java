@@ -5,8 +5,8 @@ import com.example.starter.playout.PlayoutRepository.GrantRow;
 import com.example.starter.playout.PlayoutRepository.OverrideRow;
 import com.example.starter.playout.PlayoutRepository.PublicationRow;
 import com.example.starter.playout.PlayoutRepository.PublicationSegmentRow;
-import com.example.starter.playout.PlayoutRepository.RequestRow;
 import com.example.starter.playout.PlayoutRepository.SegmentRow;
+import com.example.starter.playout.PlayoutRepository.SimulcastPlaceholderRow;
 import com.example.starter.playout.api.ApiException;
 import com.example.starter.playout.api.Dtos.AssetResponse;
 import com.example.starter.playout.api.Dtos.ChannelResponse;
@@ -26,7 +26,6 @@ import com.example.starter.playout.api.Dtos.PublishResponse;
 import com.example.starter.playout.api.Dtos.ReplaceDraftRequest;
 import com.example.starter.playout.api.Dtos.SegmentInput;
 import com.example.starter.playout.api.Dtos.SegmentResponse;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -43,7 +42,6 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
-import java.util.function.Supplier;
 
 /**
  * 播出编排核心服务：素材、频道、授权、草稿、发布与播出决定。
@@ -68,11 +66,11 @@ public class PlayoutService {
     private static final long OVERRIDE_MAX_DURATION_MS = 30L * 60L * 1000L;
 
     private final PlayoutRepository repo;
-    private final ObjectMapper objectMapper;
+    private final IdempotentExecutor idempotency;
 
-    public PlayoutService(PlayoutRepository repo, ObjectMapper objectMapper) {
+    public PlayoutService(PlayoutRepository repo, IdempotentExecutor idempotency) {
         this.repo = repo;
-        this.objectMapper = objectMapper;
+        this.idempotency = idempotency;
     }
 
     // ---------- 素材 ----------
@@ -136,7 +134,7 @@ public class PlayoutService {
     @Transactional
     public GrantResponse revokeGrant(long grantId, String requestId) {
         String hash = sha256(OP_REVOKE_GRANT + "|" + grantId);
-        return idempotent(requestId, OP_REVOKE_GRANT, hash, GrantResponse.class, () -> {
+        return idempotency.execute(requestId, OP_REVOKE_GRANT, hash, GrantResponse.class, () -> {
             GrantRow grant = repo.findGrant(grantId)
                     .orElseThrow(() -> ApiException.notFound("授权不存在: " + grantId));
             int updated = repo.revokeGrant(grantId, requestId, nowMs());
@@ -150,7 +148,8 @@ public class PlayoutService {
 
     // ---------- 草稿 ----------
 
-    /** 整份替换草稿；携带 expectedDraftVersion（0 表示首次创建），版本不符返回 409 且不改写原草稿。 */
+    /** 整份替换草稿；携带 expectedDraftVersion（0 表示首次创建），版本不符返回 409 且不改写原草稿。
+     *  草稿中仍生效的联播占位片段必须原样保留（同 ID、素材与起止时刻），删除或改时返回 409。 */
     @Transactional
     public DraftResponse replaceDraft(String channelId, LocalDate businessDay,
                                       ReplaceDraftRequest request) {
@@ -159,7 +158,9 @@ public class PlayoutService {
 
         String hash = sha256(OP_REPLACE_DRAFT + "|" + channelId + "|" + businessDay
                 + "|" + request.expectedDraftVersion() + "|" + canonicalSegments(request.segments()));
-        return idempotent(request.requestId(), OP_REPLACE_DRAFT, hash, DraftResponse.class, () -> {
+        return idempotency.execute(request.requestId(), OP_REPLACE_DRAFT, hash, DraftResponse.class, () -> {
+            // 频道行锁：与联播占位写入/释放按提交顺序串行，避免占位被并发替换丢失。
+            repo.lockChannelForUpdate(channelId);
             List<ValidatedSegment> segments = validateSegments(channelId, businessDay, request.segments());
             long newVersion;
             if (request.expectedDraftVersion() == 0) {
@@ -179,6 +180,7 @@ public class PlayoutService {
                 }
                 newVersion = request.expectedDraftVersion() + 1;
             }
+            requireSimulcastPlaceholdersPreserved(channelId, businessDay, segments);
             repo.deleteDraftSegments(channelId, businessDay);
             for (ValidatedSegment segment : segments) {
                 repo.insertDraftSegment(segment.id(), channelId, businessDay,
@@ -194,6 +196,7 @@ public class PlayoutService {
     /**
      * 发布草稿：校验草稿版本与发布版本，逐片段加锁校验授权仍有效后原子生成只读快照。
      * 与授权撤销并发时按数据库提交顺序生效：撤销先提交则本方法因授权失效而 422 拒绝。
+     * 草稿中仍生效的联播占位必须包含在本次发布内，缺失返回 409。
      */
     @Transactional
     public PublishResponse publish(String channelId, LocalDate businessDay, PublishRequest request) {
@@ -202,10 +205,13 @@ public class PlayoutService {
 
         String hash = sha256(OP_PUBLISH + "|" + channelId + "|" + businessDay
                 + "|" + request.draftVersion() + "|" + request.expectedPublishedVersion());
-        return idempotent(request.requestId(), OP_PUBLISH, hash, PublishResponse.class, () -> {
+        return idempotency.execute(request.requestId(), OP_PUBLISH, hash, PublishResponse.class, () -> {
+            // 频道行锁：与联播占位写入/释放按提交顺序串行。
+            repo.lockChannelForUpdate(channelId);
             DraftRow draft = repo.findDraft(channelId, businessDay)
                     .orElseThrow(() -> ApiException.notFound("草稿不存在: " + channelId + " " + businessDay));
             List<SegmentRow> segments = repo.findDraftSegments(channelId, businessDay);
+            requireSimulcastPlaceholdersPublished(channelId, businessDay, segments);
             if (draft.version() != request.draftVersion()) {
                 throw ApiException.conflict("DRAFT_VERSION_CONFLICT",
                         "草稿版本不符，当前 " + draft.version());
@@ -315,7 +321,7 @@ public class PlayoutService {
         String hash = sha256(OP_CREATE_OVERRIDE + "|" + request.overrideKey() + "|"
                 + request.channelId() + "|" + request.assetId() + "|" + request.grantId() + "|"
                 + request.priority() + "|" + toMs(request.start()) + "|" + toMs(request.end()));
-        return idempotent(request.requestId(), OP_CREATE_OVERRIDE, hash,
+        return idempotency.execute(request.requestId(), OP_CREATE_OVERRIDE, hash,
                 EmergencyOverrideResponse.class, () -> doCreateOverride(request));
     }
 
@@ -397,7 +403,7 @@ public class PlayoutService {
     @Transactional
     public EmergencyOverrideResponse cancelEmergencyOverride(String overrideKey, String requestId) {
         String hash = sha256(OP_CANCEL_OVERRIDE + "|" + overrideKey);
-        return idempotent(requestId, OP_CANCEL_OVERRIDE, hash, EmergencyOverrideResponse.class, () -> {
+        return idempotency.execute(requestId, OP_CANCEL_OVERRIDE, hash, EmergencyOverrideResponse.class, () -> {
             // 先在频道锁上与同频道创建/取消串行，取消提交后并发创建即可复用该区间。
             OverrideRow existing = repo.findOverride(overrideKey)
                     .orElseThrow(() -> ApiException.notFound("紧急插播不存在: " + overrideKey));
@@ -495,51 +501,46 @@ public class PlayoutService {
     }
 
     /**
-     * 幂等执行：去重记录与业务结果同事务提交；同 requestId 同参数返回原结果，
-     * 同 requestId 不同参数返回 409；业务失败抛异常回滚，不占用 requestId。
+     * 校验草稿替换后仍生效的联播占位被原样保留：占位片段不可独立删除或改时，
+     * 只有整组撤销才能释放；违反时返回 409，须在持频道锁后调用。
      */
-    private <T> T idempotent(String requestId, String operation, String paramsHash,
-                             Class<T> type, Supplier<T> action) {
-        if (requestId == null || requestId.isBlank()) {
-            throw ApiException.badRequest("requestId 不能为空");
+    private void requireSimulcastPlaceholdersPreserved(String channelId, LocalDate businessDay,
+                                                       List<ValidatedSegment> segments) {
+        for (SimulcastPlaceholderRow placeholder
+                : repo.findActiveSimulcastPlaceholders(channelId, businessDay)) {
+            boolean preserved = segments.stream().anyMatch(s ->
+                    s.id().equals(placeholder.segmentId())
+                            && s.assetId().equals(placeholder.assetId())
+                            && s.startMs() == placeholder.startMs()
+                            && s.endMs() == placeholder.endMs());
+            if (!preserved) {
+                throw ApiException.conflict("SIMULCAST_PLACEHOLDER_LOCKED",
+                        "联播占位不可独立修改或删除，须整组撤销: " + placeholder.simulcastKey());
+            }
         }
-        Optional<RequestRow> existing = repo.findRequestForUpdate(requestId);
-        if (existing.isPresent()) {
-            return replay(existing.get(), operation, paramsHash, type);
-        }
-        try {
-            repo.insertRequest(requestId, operation, paramsHash, nowMs());
-        } catch (DuplicateKeyException e) {
-            // 并发同 requestId：等待对方事务结束后读取已提交记录
-            RequestRow committed = repo.findRequestForUpdate(requestId)
-                    .orElseThrow(() -> ApiException.conflict("REQUEST_ID_CONFLICT",
-                            "requestId 并发冲突: " + requestId));
-            return replay(committed, operation, paramsHash, type);
-        }
-        T result = action.get();
-        try {
-            repo.completeRequest(requestId, objectMapper.writeValueAsString(result));
-        } catch (Exception e) {
-            throw new IllegalStateException("幂等结果序列化失败", e);
-        }
-        return result;
     }
 
-    private <T> T replay(RequestRow row, String operation, String paramsHash, Class<T> type) {
-        if (!row.operation().equals(operation) || !row.paramsHash().equals(paramsHash)) {
-            throw ApiException.conflict("REQUEST_ID_CONFLICT",
-                    "requestId 已使用且参数不一致: " + row.requestId());
-        }
-        if (row.responseBody() == null) {
-            throw ApiException.conflict("REQUEST_ID_CONFLICT",
-                    "requestId 请求尚未完成: " + row.requestId());
-        }
-        try {
-            return objectMapper.readValue(row.responseBody(), type);
-        } catch (Exception e) {
-            throw new IllegalStateException("幂等结果反序列化失败", e);
+    /** 校验发布快照包含全部仍生效的联播占位片段，缺失返回 409，须在持频道锁后调用。 */
+    private void requireSimulcastPlaceholdersPublished(String channelId, LocalDate businessDay,
+                                                       List<SegmentRow> segments) {
+        for (SimulcastPlaceholderRow placeholder
+                : repo.findActiveSimulcastPlaceholders(channelId, businessDay)) {
+            boolean included = segments.stream().anyMatch(s ->
+                    s.id().equals(placeholder.segmentId())
+                            && s.assetId().equals(placeholder.assetId())
+                            && s.startMs() == placeholder.startMs()
+                            && s.endMs() == placeholder.endMs());
+            if (!included) {
+                throw ApiException.conflict("SIMULCAST_PLACEHOLDER_MISSING",
+                        "发布必须包含联播占位片段: " + placeholder.segmentId());
+            }
         }
     }
+
+    /**
+     * 幂等执行由 {@link IdempotentExecutor} 统一承担：去重记录与业务结果同事务提交；
+     * 同 requestId 同参数返回原结果，不同参数 409，失败回滚不占键。
+     */
 
     private static String canonicalSegments(List<SegmentInput> segments) {
         StringBuilder sb = new StringBuilder();

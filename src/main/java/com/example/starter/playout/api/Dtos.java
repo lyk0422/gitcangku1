@@ -6,6 +6,7 @@ import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.PositiveOrZero;
+import jakarta.validation.constraints.Size;
 
 import java.time.OffsetDateTime;
 import java.util.List;
@@ -170,5 +171,96 @@ public final class Dtos {
 
     /** 统一错误响应体。 */
     public record ErrorResponse(String error, String message) {
+    }
+
+    // ---------- 多频道联播 ----------
+
+    /**
+     * 创建多频道联播锁定请求。channelIds 为同一运营日的 2～8 个不同频道；plannedAt 为全组统一的
+     * 计划播出时刻（含），联播占位区间为 [plannedAt, plannedAt + 素材时长)，业务日由 plannedAt
+     * 按 Asia/Shanghai 换算。
+     */
+    public record CreateSimulcastLockRequest(
+            @NotBlank String requestId,
+            @NotBlank String simulcastKey,
+            @NotNull @Size(min = 2, max = 8) List<@NotBlank String> channelIds,
+            @NotBlank String assetId,
+            @NotNull OffsetDateTime plannedAt) {
+    }
+
+    /** 撤销联播组请求（幂等）。 */
+    public record RevokeSimulcastLockRequest(@NotBlank String requestId) {
+    }
+
+    /** 联播组状态：ACTIVE 生效中 / REVOKED 已整组撤销（终态，键不释放）。 */
+    public enum SimulcastStatus {
+        ACTIVE, REVOKED
+    }
+
+    /** 频道占位状态：ACTIVE 生效中 / RELEASED 已随整组撤销释放（终态）。 */
+    public enum SimulcastPlaceholderStatus {
+        ACTIVE, RELEASED
+    }
+
+    /** 联播组内单频道占位明细；grantId 为创建时固化的该频道授权版本。 */
+    public record SimulcastChannelEntry(
+            String channelId,
+            String segmentId,
+            long grantId,
+            OffsetDateTime start,
+            OffsetDateTime end,
+            SimulcastPlaceholderStatus placeholderStatus) {
+    }
+
+    /** 联播组响应；撤销后 revokeRequestId/revokedAt 非空，占位状态变为 RELEASED。 */
+    public record SimulcastLockResponse(
+            String simulcastKey,
+            String assetId,
+            String businessDay,
+            OffsetDateTime plannedAt,
+            OffsetDateTime endAt,
+            SimulcastStatus status,
+            List<SimulcastChannelEntry> channels,
+            String revokeRequestId,
+            OffsetDateTime revokedAt,
+            OffsetDateTime createdAt) {
+    }
+
+    /** 单频道校验未通过的原因。 */
+    public record SimulcastRejection(String channelId, String code, String message) {
+    }
+
+    /** 联播创建 422 响应体：任一频道不满足即整次拒绝并给出逐频道原因，不写入任何锁定。 */
+    public record SimulcastErrorResponse(String error, String message,
+                                         List<SimulcastRejection> rejections) {
+    }
+
+    /** 频道占位查询项。 */
+    public record SimulcastPlaceholderItem(
+            String simulcastKey,
+            String segmentId,
+            String assetId,
+            long grantId,
+            OffsetDateTime start,
+            OffsetDateTime end,
+            SimulcastPlaceholderStatus status) {
+    }
+
+    /** 频道+业务日的联播占位查询响应。 */
+    public record ChannelSimulcastPlaceholdersResponse(
+            String channelId,
+            String businessDay,
+            List<SimulcastPlaceholderItem> placeholders) {
+    }
+
+    /** 撤销历史项，记录不可变。 */
+    public record SimulcastRevocationItem(
+            String simulcastKey,
+            String revokeRequestId,
+            OffsetDateTime revokedAt) {
+    }
+
+    /** 撤销历史查询响应。 */
+    public record SimulcastRevocationHistoryResponse(List<SimulcastRevocationItem> revocations) {
     }
 }

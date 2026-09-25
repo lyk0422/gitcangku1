@@ -73,6 +73,29 @@ public class PlayoutRepository {
         }
     }
 
+    /** 联播组行；status 为 ACTIVE / REVOKED，撤销为终态，键不释放。 */
+    public record SimulcastGroupRow(String simulcastKey, String assetId, LocalDate businessDay,
+                                    long plannedAtMs, long endMs, String status, long createdAtMs) {
+        public boolean active() {
+            return "ACTIVE".equals(status);
+        }
+    }
+
+    /** 联播频道占位行；status 为 ACTIVE / RELEASED，grantId 为创建时固化的每频道授权。 */
+    public record SimulcastPlaceholderRow(long id, String simulcastKey, String channelId,
+                                          LocalDate businessDay, String segmentId, String assetId,
+                                          long grantId, long startMs, long endMs, String status,
+                                          long createdAtMs) {
+        public boolean active() {
+            return "ACTIVE".equals(status);
+        }
+    }
+
+    /** 联播撤销历史行，写入后不可变。 */
+    public record SimulcastRevocationRow(long id, String simulcastKey, String revokeRequestId,
+                                         long revokedAtMs) {
+    }
+
     private static final RowMapper<AssetRow> ASSET_MAPPER = (rs, n) ->
             new AssetRow(rs.getString("id"), rs.getLong("duration_ms"));
 
@@ -112,6 +135,22 @@ public class PlayoutRepository {
                     rs.getDate("business_day").toLocalDate(), rs.getString("status"),
                     rs.getString("cancel_request_id"),
                     (Long) rs.getObject("cancelled_at_ms"), rs.getLong("created_at_ms"));
+
+    private static final RowMapper<SimulcastGroupRow> SIMULCAST_GROUP_MAPPER = (rs, n) ->
+            new SimulcastGroupRow(rs.getString("simulcast_key"), rs.getString("asset_id"),
+                    rs.getDate("business_day").toLocalDate(), rs.getLong("planned_at_ms"),
+                    rs.getLong("end_ms"), rs.getString("status"), rs.getLong("created_at_ms"));
+
+    private static final RowMapper<SimulcastPlaceholderRow> SIMULCAST_PLACEHOLDER_MAPPER = (rs, n) ->
+            new SimulcastPlaceholderRow(rs.getLong("id"), rs.getString("simulcast_key"),
+                    rs.getString("channel_id"), rs.getDate("business_day").toLocalDate(),
+                    rs.getString("segment_id"), rs.getString("asset_id"), rs.getLong("grant_id"),
+                    rs.getLong("start_ms"), rs.getLong("end_ms"), rs.getString("status"),
+                    rs.getLong("created_at_ms"));
+
+    private static final RowMapper<SimulcastRevocationRow> SIMULCAST_REVOCATION_MAPPER = (rs, n) ->
+            new SimulcastRevocationRow(rs.getLong("id"), rs.getString("simulcast_key"),
+                    rs.getString("revoke_request_id"), rs.getLong("revoked_at_ms"));
 
     // ---------- 素材 ----------
 
@@ -380,5 +419,121 @@ public class PlayoutRepository {
                         + " SET status = 'CANCELLED', cancel_request_id = ?, cancelled_at_ms = ?"
                         + " WHERE override_key = ? AND status = 'ACTIVE'",
                 cancelRequestId, cancelledAtMs, overrideKey);
+    }
+
+    // ---------- 多频道联播 ----------
+
+    public void insertSimulcastGroup(String simulcastKey, String assetId, LocalDate businessDay,
+                                     long plannedAtMs, long endMs, long createdAtMs) {
+        jdbc.update("INSERT INTO playout_simulcast_group"
+                        + " (simulcast_key, asset_id, business_day, planned_at_ms, end_ms, status, created_at_ms)"
+                        + " VALUES (?, ?, ?, ?, ?, 'ACTIVE', ?)",
+                simulcastKey, assetId, Date.valueOf(businessDay), plannedAtMs, endMs, createdAtMs);
+    }
+
+    public Optional<SimulcastGroupRow> findSimulcastGroup(String simulcastKey) {
+        return jdbc.query("SELECT simulcast_key, asset_id, business_day, planned_at_ms, end_ms,"
+                        + " status, created_at_ms FROM playout_simulcast_group WHERE simulcast_key = ?",
+                SIMULCAST_GROUP_MAPPER, simulcastKey).stream().findFirst();
+    }
+
+    /** 按全局键查询联播组并加行锁，用于撤销与创建按提交顺序串行化。 */
+    public Optional<SimulcastGroupRow> findSimulcastGroupForUpdate(String simulcastKey) {
+        return jdbc.query("SELECT simulcast_key, asset_id, business_day, planned_at_ms, end_ms,"
+                        + " status, created_at_ms FROM playout_simulcast_group"
+                        + " WHERE simulcast_key = ? FOR UPDATE",
+                SIMULCAST_GROUP_MAPPER, simulcastKey).stream().findFirst();
+    }
+
+    /** 将联播组置为 REVOKED；返回受影响行数，0 表示不存在或已撤销。 */
+    public int revokeSimulcastGroup(String simulcastKey) {
+        return jdbc.update("UPDATE playout_simulcast_group SET status = 'REVOKED'"
+                + " WHERE simulcast_key = ? AND status = 'ACTIVE'", simulcastKey);
+    }
+
+    public void insertSimulcastPlaceholder(String simulcastKey, String channelId,
+                                           LocalDate businessDay, String segmentId, String assetId,
+                                           long grantId, long startMs, long endMs, long createdAtMs) {
+        jdbc.update("INSERT INTO playout_simulcast_placeholder"
+                        + " (simulcast_key, channel_id, business_day, segment_id, asset_id, grant_id,"
+                        + "  start_ms, end_ms, status, created_at_ms)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?)",
+                simulcastKey, channelId, Date.valueOf(businessDay), segmentId, assetId, grantId,
+                startMs, endMs, createdAtMs);
+    }
+
+    /** 频道+业务日下仍处于 ACTIVE 的联播占位，按开始时刻排序。 */
+    public List<SimulcastPlaceholderRow> findActiveSimulcastPlaceholders(String channelId,
+                                                                         LocalDate businessDay) {
+        return jdbc.query("SELECT id, simulcast_key, channel_id, business_day, segment_id, asset_id,"
+                        + " grant_id, start_ms, end_ms, status, created_at_ms"
+                        + " FROM playout_simulcast_placeholder"
+                        + " WHERE channel_id = ? AND business_day = ? AND status = 'ACTIVE'"
+                        + " ORDER BY start_ms, id",
+                SIMULCAST_PLACEHOLDER_MAPPER, channelId, Date.valueOf(businessDay));
+    }
+
+    /** 联播组下全部占位（含已释放），按频道排序，用于组明细查询。 */
+    public List<SimulcastPlaceholderRow> findSimulcastPlaceholdersByGroup(String simulcastKey) {
+        return jdbc.query("SELECT id, simulcast_key, channel_id, business_day, segment_id, asset_id,"
+                        + " grant_id, start_ms, end_ms, status, created_at_ms"
+                        + " FROM playout_simulcast_placeholder"
+                        + " WHERE simulcast_key = ? ORDER BY channel_id",
+                SIMULCAST_PLACEHOLDER_MAPPER, simulcastKey);
+    }
+
+    /** 整组释放全部 ACTIVE 占位；返回受影响行数。 */
+    public int releaseSimulcastPlaceholders(String simulcastKey) {
+        return jdbc.update("UPDATE playout_simulcast_placeholder SET status = 'RELEASED'"
+                + " WHERE simulcast_key = ? AND status = 'ACTIVE'", simulcastKey);
+    }
+
+    public void insertSimulcastRevocation(String simulcastKey, String revokeRequestId,
+                                          long revokedAtMs) {
+        jdbc.update("INSERT INTO playout_simulcast_revocation"
+                        + " (simulcast_key, revoke_request_id, revoked_at_ms) VALUES (?, ?, ?)",
+                simulcastKey, revokeRequestId, revokedAtMs);
+    }
+
+    public Optional<SimulcastRevocationRow> findSimulcastRevocation(String simulcastKey) {
+        return jdbc.query("SELECT id, simulcast_key, revoke_request_id, revoked_at_ms"
+                        + " FROM playout_simulcast_revocation WHERE simulcast_key = ?",
+                SIMULCAST_REVOCATION_MAPPER, simulcastKey).stream().findFirst();
+    }
+
+    /** 全部撤销历史，按撤销时间倒序（同刻按 ID 倒序），记录不可变。 */
+    public List<SimulcastRevocationRow> findAllSimulcastRevocations() {
+        return jdbc.query("SELECT id, simulcast_key, revoke_request_id, revoked_at_ms"
+                        + " FROM playout_simulcast_revocation ORDER BY revoked_at_ms DESC, id DESC",
+                SIMULCAST_REVOCATION_MAPPER);
+    }
+
+    /** 删除草稿中的单个片段（联播撤销时移除占位片段）。 */
+    public void deleteDraftSegment(String channelId, LocalDate businessDay, String segmentId) {
+        jdbc.update("DELETE FROM playout_draft_segment"
+                        + " WHERE channel_id = ? AND business_day = ? AND id = ?",
+                channelId, Date.valueOf(businessDay), segmentId);
+    }
+
+    /** 无条件递增草稿版本（联播占位写入/移除时调用，须在持频道锁后执行）。 */
+    public int touchDraftVersion(String channelId, LocalDate businessDay, long updatedAtMs) {
+        return jdbc.update("UPDATE playout_draft SET version = version + 1, updated_at_ms = ?"
+                        + " WHERE channel_id = ? AND business_day = ?",
+                updatedAtMs, channelId, Date.valueOf(businessDay));
+    }
+
+    /**
+     * 同频道、状态 ACTIVE 且与 [startMs, endMs) 相交的紧急插播（不限优先级），加行锁，
+     * 用于联播创建与插播创建/取消按提交顺序串行化。须在持频道锁后调用。
+     */
+    public List<OverrideRow> findActiveOverridesOverlappingForUpdate(String channelId,
+                                                                     long startMs, long endMs) {
+        return jdbc.query("SELECT override_key, channel_id, asset_id, grant_id, priority, start_ms,"
+                        + " end_ms, business_day, status, cancel_request_id, cancelled_at_ms, created_at_ms"
+                        + " FROM playout_emergency_override"
+                        + " WHERE channel_id = ? AND status = 'ACTIVE'"
+                        + " AND start_ms < ? AND end_ms > ?"
+                        + " ORDER BY start_ms, override_key FOR UPDATE",
+                OVERRIDE_MAPPER, channelId, endMs, startMs);
     }
 }

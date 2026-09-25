@@ -1,6 +1,7 @@
 package com.example.starter.playout.api;
 
 import com.example.starter.playout.api.Dtos.ErrorResponse;
+import com.example.starter.playout.api.Dtos.SimulcastErrorResponse;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -25,6 +26,15 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorResponse> handleApi(ApiException ex) {
         return ResponseEntity.status(ex.status())
                 .body(new ErrorResponse(ex.code(), ex.getMessage()));
+    }
+
+    /** 联播创建逐频道校验失败：422 并返回逐频道原因。 */
+    @ExceptionHandler(SimulcastValidationException.class)
+    public ResponseEntity<SimulcastErrorResponse> handleSimulcastValidation(
+            SimulcastValidationException ex) {
+        return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
+                .body(new SimulcastErrorResponse("SIMULCAST_VALIDATION_FAILED",
+                        ex.getMessage(), ex.rejections()));
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)

@@ -75,6 +75,45 @@ CREATE TABLE IF NOT EXISTS playout_request (
     created_at_ms BIGINT      NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS playout_simulcast_group (
+    simulcast_key VARCHAR(64) NOT NULL PRIMARY KEY,
+    asset_id      VARCHAR(64) NOT NULL,
+    business_day  DATE        NOT NULL,
+    planned_at_ms BIGINT      NOT NULL,
+    end_ms        BIGINT      NOT NULL,
+    status        VARCHAR(16) NOT NULL,
+    created_at_ms BIGINT      NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS playout_simulcast_placeholder (
+    id            BIGINT      NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    simulcast_key VARCHAR(64) NOT NULL,
+    channel_id    VARCHAR(64) NOT NULL,
+    business_day  DATE        NOT NULL,
+    segment_id    VARCHAR(64) NOT NULL,
+    asset_id      VARCHAR(64) NOT NULL,
+    grant_id      BIGINT      NOT NULL,
+    start_ms      BIGINT      NOT NULL,
+    end_ms        BIGINT      NOT NULL,
+    status        VARCHAR(16) NOT NULL,
+    created_at_ms BIGINT      NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uk_placeholder_segment
+    ON playout_simulcast_placeholder (channel_id, business_day, segment_id);
+CREATE INDEX IF NOT EXISTS idx_placeholder_group
+    ON playout_simulcast_placeholder (simulcast_key);
+CREATE INDEX IF NOT EXISTS idx_placeholder_channel
+    ON playout_simulcast_placeholder (channel_id, business_day, status);
+
+CREATE TABLE IF NOT EXISTS playout_simulcast_revocation (
+    id                BIGINT      NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    simulcast_key     VARCHAR(64) NOT NULL,
+    revoke_request_id VARCHAR(64) NOT NULL,
+    revoked_at_ms     BIGINT      NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uk_revocation_group
+    ON playout_simulcast_revocation (simulcast_key);
+
 CREATE TABLE IF NOT EXISTS playout_emergency_override (
     override_key      VARCHAR(64) NOT NULL PRIMARY KEY,
     channel_id        VARCHAR(64) NOT NULL,
