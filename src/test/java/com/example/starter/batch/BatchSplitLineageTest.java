@@ -7,6 +7,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.web.servlet.MockMvc;
@@ -34,6 +35,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  */
 @SpringBootTest
 @AutoConfigureMockMvc
+@Import(TestClockConfig.class)
 class BatchSplitLineageTest {
 
     @Autowired
@@ -42,10 +44,15 @@ class BatchSplitLineageTest {
     private ObjectMapper objectMapper;
     @Autowired
     private JdbcTemplate jdbc;
+    @Autowired
+    private TestClockConfig.MutableClock clock;
 
     @BeforeEach
     void cleanTables() {
+        clock.setInstant(TestClockConfig.BASE_INSTANT);
         jdbc.update("DELETE FROM command_log");
+        jdbc.update("DELETE FROM shelf_life_extension");
+        jdbc.update("DELETE FROM extension_request");
         jdbc.update("DELETE FROM approval");
         jdbc.update("DELETE FROM recall");
         jdbc.update("DELETE FROM test_result");
@@ -549,11 +556,11 @@ class BatchSplitLineageTest {
 
     private String createBody(String batchKey, List<String> items) throws Exception {
         return objectMapper.writeValueAsString(new CreateCmd("CK-C-" + unique(), batchKey, "PROD-1",
-                "LOT-1", Instant.parse("2026-01-02T03:04:05Z"), items));
+                "LOT-1", Instant.parse("2026-01-02T03:04:05Z"), 43200L, items));
     }
 
     private record CreateCmd(String commandKey, String batchKey, String productCode, String batchNo,
-                             Instant producedAt, List<String> requiredTests) {
+                             Instant producedAt, Long shelfLifeMinutes, List<String> requiredTests) {
     }
 
     private void createBatch(String batchKey, List<String> items, int expected) throws Exception {

@@ -7,7 +7,8 @@ import java.util.List;
 
 /**
  * 拆分响应。父批状态落定 SPLIT；子批初始 QUARANTINED，继承父批产品编码、
- * 生产 UTC 时间与必做检验项，不继承检验或批准记录。splitAt 为 UTC instant。
+ * 生产 UTC 时间、保质分钟与必做检验项，不继承检验、批准记录或父批延期；
+ * 子批初始有效期按自身生产时间 + 继承的保质分钟重新计算。splitAt 为 UTC instant。
  */
 public record SplitResponse(
         String parentBatchKey,
@@ -17,7 +18,7 @@ public record SplitResponse(
 ) {
 
     /**
-     * 拆分产生的子批概要。
+     * 拆分产生的子批概要。shelfLifeMinutes 继承自父批；validUntil 按自身生产时间重算。
      */
     public record SplitChild(
             String batchKey,
@@ -25,6 +26,8 @@ public record SplitResponse(
             String productCode,
             Instant producedAt,
             BatchStatus status,
+            long shelfLifeMinutes,
+            Instant validUntil,
             List<String> requiredTests,
             Instant createdAt
     ) {
