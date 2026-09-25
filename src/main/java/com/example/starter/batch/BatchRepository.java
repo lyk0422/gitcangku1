@@ -13,11 +13,15 @@ import java.util.Optional;
 @Repository
 public class BatchRepository {
 
+    public static final String EDGE_SPLIT = "SPLIT";
+    public static final String EDGE_REWORK = "REWORK";
+
     /**
      * batch 表行记录；id 同时作为同批次事件的提交顺序依据。
+     * generation 为返工重投代次：新建/拆分继承为 0 或父批代次，返工重投加一。
      */
     public record BatchRow(long id, String batchKey, String productCode, String batchNo,
-                           String producedAt, String status, String createdAt) {
+                           String producedAt, String status, int generation, String createdAt) {
     }
 
     /**
@@ -49,15 +53,23 @@ public class BatchRepository {
     }
 
     /**
-     * batch_lineage 表行记录：拆分父子关系，创建后不可改写。
+     * batch_lineage 表行记录：edgeType 为 SPLIT（拆分）或 REWORK（返工重投），创建后不可改写。
      */
-    public record LineageRow(long id, String parentKey, String childKey, int seq, String createdAt) {
+    public record LineageRow(long id, String parentKey, String childKey, String edgeType,
+                             int seq, String createdAt) {
+    }
+
+    /**
+     * rework_order 表行记录：一次返工重投一行，原批次唯一，创建后不可改写。
+     */
+    public record ReworkRow(long id, String reworkKey, String sourceBatchKey,
+                            String reworkBatchKey, String reason, int generation, String createdAt) {
     }
 
     private static final RowMapper<BatchRow> BATCH_MAPPER = (rs, n) -> new BatchRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("product_code"),
             rs.getString("batch_no"), rs.getString("produced_at"),
-            rs.getString("status"), rs.getString("created_at"));
+            rs.getString("status"), rs.getInt("generation"), rs.getString("created_at"));
 
     private static final RowMapper<TestRow> TEST_MAPPER = (rs, n) -> new TestRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("test_key"),
@@ -79,7 +91,12 @@ public class BatchRepository {
 
     private static final RowMapper<LineageRow> LINEAGE_MAPPER = (rs, n) -> new LineageRow(
             rs.getLong("id"), rs.getString("parent_key"), rs.getString("child_key"),
-            rs.getInt("seq"), rs.getString("created_at"));
+            rs.getString("edge_type"), rs.getInt("seq"), rs.getString("created_at"));
+
+    private static final RowMapper<ReworkRow> REWORK_MAPPER = (rs, n) -> new ReworkRow(
+            rs.getLong("id"), rs.getString("rework_key"), rs.getString("source_batch_key"),
+            rs.getString("rework_batch_key"), rs.getString("reason"),
+            rs.getInt("generation"), rs.getString("created_at"));
 
     private final JdbcTemplate jdbc;
 
@@ -93,7 +110,7 @@ public class BatchRepository {
     }
 
     /**
-     * 行锁读取批次，串行化同一批次上的检验/批准/召回事务。
+     * 行锁读取批次，串行化同一批次上的检验/批准/召回/返工事务。
      */
     public Optional<BatchRow> findBatchForUpdate(String batchKey) {
         return jdbc.query("SELECT * FROM batch WHERE batch_key = ? FOR UPDATE", BATCH_MAPPER, batchKey)
@@ -101,10 +118,10 @@ public class BatchRepository {
     }
 
     public void insertBatch(BatchRow row) {
-        jdbc.update("INSERT INTO batch (batch_key, product_code, batch_no, produced_at, status, created_at)"
-                        + " VALUES (?, ?, ?, ?, ?, ?)",
+        jdbc.update("INSERT INTO batch (batch_key, product_code, batch_no, produced_at, status,"
+                        + " generation, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 row.batchKey(), row.productCode(), row.batchNo(), row.producedAt(),
-                row.status(), row.createdAt());
+                row.status(), row.generation(), row.createdAt());
     }
 
     public void insertRequiredTest(String batchKey, String testItem, int seq) {
@@ -181,13 +198,14 @@ public class BatchRepository {
     }
 
     public void insertLineage(LineageRow row) {
-        jdbc.update("INSERT INTO batch_lineage (parent_key, child_key, seq, created_at)"
-                        + " VALUES (?, ?, ?, ?)",
-                row.parentKey(), row.childKey(), row.seq(), row.createdAt());
+        jdbc.update("INSERT INTO batch_lineage (parent_key, child_key, edge_type, seq, created_at)"
+                        + " VALUES (?, ?, ?, ?, ?)",
+                row.parentKey(), row.childKey(), row.edgeType(), row.seq(), row.createdAt());
     }
 
     /**
-     * 全部血缘边（父→子），用于在内存中推导祖先链与后代集合；关系不可改写，只增不改。
+     * 全部血缘边（父→子，含拆分与返工边），用于在内存中推导祖先链、返工链与后代闭包；
+     * 关系不可改写，只增不改。
      */
     public List<LineageRow> findAllLineage() {
         return jdbc.query("SELECT * FROM batch_lineage ORDER BY id", LINEAGE_MAPPER);
@@ -208,5 +226,31 @@ public class BatchRepository {
     public List<String> findRecalledKeys() {
         return jdbc.queryForList("SELECT batch_key FROM batch WHERE status = 'RECALLED'",
                 String.class);
+    }
+
+    public void insertRework(ReworkRow row) {
+        jdbc.update("INSERT INTO rework_order (rework_key, source_batch_key, rework_batch_key,"
+                        + " reason, generation, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                row.reworkKey(), row.sourceBatchKey(), row.reworkBatchKey(), row.reason(),
+                row.generation(), row.createdAt());
+    }
+
+    public Optional<ReworkRow> findReworkBySource(String sourceBatchKey) {
+        return jdbc.query("SELECT * FROM rework_order WHERE source_batch_key = ?",
+                        REWORK_MAPPER, sourceBatchKey)
+                .stream().findFirst();
+    }
+
+    public Optional<ReworkRow> findReworkByKey(String reworkKey) {
+        return jdbc.query("SELECT * FROM rework_order WHERE rework_key = ?",
+                        REWORK_MAPPER, reworkKey)
+                .stream().findFirst();
+    }
+
+    /**
+     * 全部返工登记，按落库顺序排列，用于返工链明细查询。
+     */
+    public List<ReworkRow> findAllReworks() {
+        return jdbc.query("SELECT * FROM rework_order ORDER BY id", REWORK_MAPPER);
     }
 }

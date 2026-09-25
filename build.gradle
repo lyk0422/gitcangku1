@@ -25,6 +25,8 @@ dependencies {
     runtimeOnly 'com.mysql:mysql-connector-j'
     runtimeOnly 'com.h2database:h2'
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    // 测试需要引用 org.h2.api.Trigger 制造真实数据库失败（版本随 Spring Boot BOM）
+    testImplementation 'com.h2database:h2'
 }
 
 tasks.named('test') {

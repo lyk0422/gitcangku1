@@ -6,8 +6,12 @@ import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
 import com.example.starter.batch.dto.LineageEntryResponse;
+import com.example.starter.batch.dto.RecallClosureResponse;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.RecallResponse;
+import com.example.starter.batch.dto.ReworkChainEntryResponse;
+import com.example.starter.batch.dto.ReworkRequest;
+import com.example.starter.batch.dto.ReworkResponse;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SplitResponse;
 import com.example.starter.batch.dto.SubmitTestRequest;
@@ -25,7 +29,6 @@ import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -50,6 +53,13 @@ public class BatchService {
     private static final String CMD_APPROVE = "APPROVE";
     private static final String CMD_RECALL = "RECALL";
     private static final String CMD_SPLIT = "SPLIT";
+    private static final String CMD_REWORK = "REWORK";
+
+    /**
+     * 单条返工血缘链允许的最大累计返工代次：代次 1～3 的返工批次可存在，
+     * 对代次 3 的批次再次返工（将产生代次 4）返回 422。
+     */
+    private static final int MAX_REWORK_GENERATION = 3;
 
     /**
      * 指纹拼接分隔符（NUL）：业务参数不可能包含该字符，避免拼接碰撞。
@@ -86,12 +96,12 @@ public class BatchService {
             });
             String now = now();
             repo.insertBatch(new BatchRepository.BatchRow(0L, req.batchKey(), req.productCode(),
-                    req.batchNo(), req.producedAt().toString(), BatchStatus.QUARANTINED.name(), now));
+                    req.batchNo(), req.producedAt().toString(), BatchStatus.QUARANTINED.name(), 0, now));
             for (int i = 0; i < items.size(); i++) {
                 repo.insertRequiredTest(req.batchKey(), items.get(i), i + 1);
             }
             BatchResponse body = new BatchResponse(req.batchKey(), req.productCode(), req.batchNo(),
-                    req.producedAt(), BatchStatus.QUARANTINED, items, Instant.parse(now));
+                    req.producedAt(), BatchStatus.QUARANTINED, 0, items, Instant.parse(now));
             return new StoredResponse(201, toJson(body));
         });
     }
@@ -123,7 +133,9 @@ public class BatchService {
             BatchStatus status = BatchStatus.valueOf(batch.status());
             assertNoRecalledAncestor(batchKey);
             if (status == BatchStatus.REJECTED || status == BatchStatus.RELEASED
-                    || status == BatchStatus.RECALLED || status == BatchStatus.SPLIT) {
+                    || status == BatchStatus.RECALLED || status == BatchStatus.SPLIT
+                    || status == BatchStatus.REWORKED
+                    || status == BatchStatus.PENDING_DISPOSAL) {
                 throw ApiException.conflict("批次状态 " + status + " 不允许提交检验");
             }
             List<String> required = repo.findRequiredTests(batchKey);
@@ -211,8 +223,12 @@ public class BatchService {
 
     /**
      * 召回：RELEASED 或 SPLIT 批次可召回，召回后进入 RECALLED 并不再出现在可用批次查询中。
-     * 召回提交后其全部后代立即不可用（排除出可用查询、禁止新增检验/批准/拆分），
-     * 但后代自身状态与既有检验、批准记录不改写，也不为后代补写召回记录。
+     *
+     * <p>召回闭包沿拆分边与返工边向下扩展：逐行锁定闭包内全部批次（含提交前刚由并发事务
+     * 创建的返工/拆分子批），与后代上的检验/批准/拆分/返工互斥，按事务提交顺序裁决——
+     * 召回先提交则后代新操作看到召回并返回 422；返工/拆分先提交则新子批被纳入本次闭包。
+     * 闭包内已放行（RELEASED）的后代在同一事务内标记为 PENDING_DISPOSAL（待处置），
+     * 任一处置更新失败整次回滚；其余后代自身状态、既有检验/批准/血缘记录不删除不改写。
      */
     public StoredResponse recall(String batchKey, String actorId, RecallRequest req) {
         if (actorId == null || actorId.isBlank()) {
@@ -227,14 +243,17 @@ public class BatchService {
             if (status != BatchStatus.RELEASED && status != BatchStatus.SPLIT) {
                 throw ApiException.conflict("批次状态 " + status + " 不允许召回，仅 RELEASED 或 SPLIT 可召回");
             }
-            // 逐行锁定全部后代（按业务键排序保证锁顺序确定）：与后代上的检验/批准/拆分
-            // 互斥，按事务提交顺序裁决——召回先提交则后代新操作看到召回并返回 422。
-            List<String> descendants = descendantKeys(batchKey);
-            Collections.sort(descendants);
-            for (String descendantKey : descendants) {
-                repo.findBatchForUpdate(descendantKey);
-            }
+            // 迭代锁定闭包：持锁后重新展开后代，以纳入锁等待期间由先提交的并发返工/拆分事务
+            // 新增的子批；每轮按业务键排序锁定，保证多召回事务间锁顺序确定。
+            List<BatchRepository.BatchRow> lockedDescendants = lockDescendantClosure(batchKey);
+
             String now = now();
+            // 同一事务内处置闭包中所有已放行后代：任一更新失败抛出异常则整次回滚。
+            for (BatchRepository.BatchRow descendant : lockedDescendants) {
+                if (BatchStatus.RELEASED.name().equals(descendant.status())) {
+                    repo.updateStatus(descendant.batchKey(), BatchStatus.PENDING_DISPOSAL.name());
+                }
+            }
             repo.insertRecall(new BatchRepository.RecallRow(0L, batchKey, req.commandKey(),
                     actor, req.reason(), now));
             repo.updateStatus(batchKey, BatchStatus.RECALLED.name());
@@ -245,14 +264,42 @@ public class BatchService {
     }
 
     /**
-     * 当前可用批次：排除已召回（RECALLED）、已拆分（SPLIT）批次，
-     * 以及任一祖先被召回的后代批次；后代自身状态不改写。
+     * 迭代锁定起点批次的全部后代闭包（沿拆分边与返工边 BFS）。
+     * 每轮持锁后重新读取血缘展开，纳入先提交的并发事务新增子批，直至闭包不再扩大；
+     * 返回最终锁定后代的最新行（含状态，用于同事务处置判定）。
+     */
+    private List<BatchRepository.BatchRow> lockDescendantClosure(String rootKey) {
+        Set<String> locked = new HashSet<>();
+        List<BatchRepository.BatchRow> rows = new ArrayList<>();
+        while (true) {
+            List<String> descendants = descendantKeys(rootKey);
+            List<String> pending = descendants.stream()
+                    .filter(k -> !locked.contains(k))
+                    .sorted()
+                    .toList();
+            if (pending.isEmpty()) {
+                return rows;
+            }
+            for (String key : pending) {
+                BatchRepository.BatchRow row = repo.findBatchForUpdate(key)
+                        .orElseThrow(() -> ApiException.notFound("批次不存在: " + key));
+                locked.add(key);
+                rows.add(row);
+            }
+        }
+    }
+
+    /**
+     * 当前可用批次：排除已拆分（SPLIT）、已返工（REWORKED）、待处置（PENDING_DISPOSAL）批次，
+     * 以及任一祖先被召回的后代批次；闭包内其余后代自身状态不改写，但同样被祖先召回排除。
      */
     public List<BatchResponse> listAvailable() {
         Map<String, String> parentOf = childToParent();
         Set<String> recalled = new HashSet<>(repo.findRecalledKeys());
         return repo.findAvailableBatches().stream()
                 .filter(b -> !BatchStatus.SPLIT.name().equals(b.status()))
+                .filter(b -> !BatchStatus.REWORKED.name().equals(b.status()))
+                .filter(b -> !BatchStatus.PENDING_DISPOSAL.name().equals(b.status()))
                 .filter(b -> recalledAncestor(b.batchKey(), parentOf, recalled).isEmpty())
                 .map(this::toBatchResponse)
                 .toList();
@@ -342,7 +389,7 @@ public class BatchService {
 
     private BatchResponse toBatchResponse(BatchRepository.BatchRow row) {
         return new BatchResponse(row.batchKey(), row.productCode(), row.batchNo(),
-                Instant.parse(row.producedAt()), BatchStatus.valueOf(row.status()),
+                Instant.parse(row.producedAt()), BatchStatus.valueOf(row.status()), row.generation(),
                 repo.findRequiredTests(row.batchKey()), Instant.parse(row.createdAt()));
     }
 
@@ -459,21 +506,164 @@ public class BatchService {
             for (int i = 0; i < children.size(); i++) {
                 SplitRequest.ChildSpec spec = children.get(i);
                 repo.insertBatch(new BatchRepository.BatchRow(0L, spec.batchKey(), parent.productCode(),
-                        spec.batchNo(), parent.producedAt(), BatchStatus.QUARANTINED.name(), now));
+                        spec.batchNo(), parent.producedAt(), BatchStatus.QUARANTINED.name(),
+                        parent.generation(), now));
                 for (int j = 0; j < required.size(); j++) {
                     repo.insertRequiredTest(spec.batchKey(), required.get(j), j + 1);
                 }
                 repo.insertLineage(new BatchRepository.LineageRow(0L, parentKey, spec.batchKey(),
-                        i + 1, now));
+                        BatchRepository.EDGE_SPLIT, i + 1, now));
                 childBodies.add(new SplitResponse.SplitChild(spec.batchKey(), spec.batchNo(),
                         parent.productCode(), Instant.parse(parent.producedAt()),
-                        BatchStatus.QUARANTINED, required, Instant.parse(now)));
+                        BatchStatus.QUARANTINED, parent.generation(), required, Instant.parse(now)));
             }
             repo.updateStatus(parentKey, BatchStatus.SPLIT.name());
             SplitResponse body = new SplitResponse(parentKey, BatchStatus.SPLIT, childBodies,
                     Instant.parse(now));
             return new StoredResponse(201, toJson(body));
         });
+    }
+
+    /**
+     * 返工重投：对已完成必做检验但判定不合格（REJECTED）、且尚未放行的批次，
+     * 提交 reworkKey 与返工说明生成代次加一的新返工批次，并把原批次登记为其唯一父批次，
+     * 原批次转为 REWORKED 终态（不可再放行、拆分或合批）。
+     *
+     * <p>新批次继承产品编码、生产 UTC 时间与必做检验项，初始 QUARANTINED，不继承任何
+     * 检验结论与批准，须重新执行全部必做检验与双角色放行。
+     *
+     * <p>同一批次只能返工一次：重复提交按 reworkKey 幂等返回首次结果；换新 reworkKey 再提交
+     * 返回 409。已放行、已召回、已拆分或状态不允许的批次返回 409；单条血缘链累计返工代次
+     * 上限为 3，再返工将产生代次 4 时返回 422 并给出当前代次。
+     */
+    public StoredResponse rework(String sourceBatchKey, ReworkRequest req) {
+        String fingerprint = fingerprint("rework", sourceBatchKey, req.reworkKey(),
+                req.reworkBatchKey(), req.reworkBatchNo(), req.reason());
+        return executeIdempotent(CMD_REWORK, req.commandKey(), fingerprint, () -> {
+            BatchRepository.BatchRow source = repo.findBatchForUpdate(sourceBatchKey)
+                    .orElseThrow(() -> ApiException.notFound("批次不存在: " + sourceBatchKey));
+            // 源批行锁后重查命令快照与 reworkKey：并发同键请求在锁等待期间可能已由对方提交。
+            var logged = loggedResponse(CMD_REWORK, req.commandKey(), fingerprint);
+            if (logged.isPresent()) {
+                return logged.get();
+            }
+            var existingByKey = repo.findReworkByKey(req.reworkKey());
+            if (existingByKey.isPresent()) {
+                BatchRepository.ReworkRow prior = existingByKey.get();
+                BatchRepository.BatchRow priorBatch = repo.findBatch(prior.reworkBatchKey())
+                        .orElseThrow(() -> new IllegalStateException(
+                                "返工批次缺失: " + prior.reworkBatchKey()));
+                boolean sameContent = prior.sourceBatchKey().equals(sourceBatchKey)
+                        && prior.reworkBatchKey().equals(req.reworkBatchKey())
+                        && priorBatch.batchNo().equals(req.reworkBatchNo())
+                        && prior.reason().equals(req.reason());
+                if (!sameContent) {
+                    throw ApiException.conflict("reworkKey 已以不同参数使用: " + req.reworkKey());
+                }
+                // 按 reworkKey 幂等：重复提交（即便使用不同 commandKey）重放首次返工结果。
+                return new StoredResponse(201, toJson(toReworkResponse(prior)));
+            }
+
+            BatchStatus status = BatchStatus.valueOf(source.status());
+            if (status != BatchStatus.REJECTED) {
+                throw ApiException.conflict("批次状态 " + status
+                        + " 不允许返工，仅已完成必做检验但判定不合格（REJECTED）且未放行的批次可返工；"
+                        + "已放行、已召回、已拆分的批次不得返工");
+            }
+            assertNoRecalledAncestor(sourceBatchKey);
+            if (source.generation() + 1 > MAX_REWORK_GENERATION) {
+                throw ApiException.unprocessable("返工代次已达上限 " + MAX_REWORK_GENERATION
+                        + "，批次 " + sourceBatchKey + " 当前代次为 " + source.generation());
+            }
+            // 唯一约束 uk_rework_source/uk_rework_batch 兜底并发；先给出可读的 409。
+            if (repo.findReworkBySource(sourceBatchKey).isPresent()) {
+                throw ApiException.conflict("批次已返工一次，不能再次返工: " + sourceBatchKey);
+            }
+            if (repo.findBatch(req.reworkBatchKey()).isPresent()) {
+                throw ApiException.conflict("返工批次 batchKey 已存在: " + req.reworkBatchKey());
+            }
+
+            int newGeneration = source.generation() + 1;
+            String now = now();
+            List<String> required = repo.findRequiredTests(sourceBatchKey);
+            repo.insertBatch(new BatchRepository.BatchRow(0L, req.reworkBatchKey(), source.productCode(),
+                    req.reworkBatchNo(), source.producedAt(), BatchStatus.QUARANTINED.name(),
+                    newGeneration, now));
+            for (int j = 0; j < required.size(); j++) {
+                repo.insertRequiredTest(req.reworkBatchKey(), required.get(j), j + 1);
+            }
+            repo.insertLineage(new BatchRepository.LineageRow(0L, sourceBatchKey,
+                    req.reworkBatchKey(), BatchRepository.EDGE_REWORK, 1, now));
+            repo.updateStatus(sourceBatchKey, BatchStatus.REWORKED.name());
+            repo.insertRework(new BatchRepository.ReworkRow(0L, req.reworkKey(), sourceBatchKey,
+                    req.reworkBatchKey(), req.reason(), newGeneration, now));
+
+            ReworkResponse body = new ReworkResponse(req.reworkKey(), sourceBatchKey,
+                    BatchStatus.REWORKED, req.reworkBatchKey(), req.reworkBatchNo(), newGeneration,
+                    required, req.reason(), Instant.parse(now));
+            return new StoredResponse(201, toJson(body));
+        });
+    }
+
+    /**
+     * 返工链明细：返回指定批次所在单条血缘链上、从根批次向下的全部返工重投登记，
+     * 按代次从低到高排列；该链没有任何返工时返回空列表。
+     */
+    public List<ReworkChainEntryResponse> listReworkChain(String batchKey) {
+        repo.findBatch(batchKey)
+                .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+        Map<String, String> parentOf = childToParent();
+        Set<String> chainNodes = new HashSet<>();
+        String current = batchKey;
+        chainNodes.add(current);
+        while (parentOf.containsKey(current)) {
+            current = parentOf.get(current);
+            chainNodes.add(current);
+        }
+        return repo.findAllReworks().stream()
+                .filter(r -> chainNodes.contains(r.sourceBatchKey()))
+                .sorted(java.util.Comparator.comparingInt(BatchRepository.ReworkRow::generation))
+                .map(r -> new ReworkChainEntryResponse(r.reworkKey(), r.sourceBatchKey(),
+                        r.reworkBatchKey(), r.generation(), r.reason(), Instant.parse(r.createdAt())))
+                .toList();
+    }
+
+    /**
+     * 召回闭包查询：起点自身 + 沿拆分边、返工边向下广度优先展开的全部后代。
+     * 标注每个批次是否被直接召回、是否在召回事务中被标记为待处置，以及使其不可用的召回祖先。
+     */
+    public RecallClosureResponse recallClosure(String batchKey) {
+        repo.findBatch(batchKey)
+                .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+        Map<String, String> parentOf = childToParent();
+        Set<String> recalled = new HashSet<>(repo.findRecalledKeys());
+        List<RecallClosureResponse.ClosureEntry> entries = new ArrayList<>();
+        entries.add(toClosureEntry(batchKey, parentOf, recalled));
+        for (String descendant : descendantKeys(batchKey)) {
+            entries.add(toClosureEntry(descendant, parentOf, recalled));
+        }
+        return new RecallClosureResponse(batchKey, entries);
+    }
+
+    private ReworkResponse toReworkResponse(BatchRepository.ReworkRow row) {
+        BatchRepository.BatchRow reworkBatch = repo.findBatch(row.reworkBatchKey())
+                .orElseThrow(() -> ApiException.notFound("返工批次不存在: " + row.reworkBatchKey()));
+        return new ReworkResponse(row.reworkKey(), row.sourceBatchKey(), BatchStatus.REWORKED,
+                row.reworkBatchKey(), reworkBatch.batchNo(), row.generation(),
+                repo.findRequiredTests(row.reworkBatchKey()), row.reason(),
+                Instant.parse(row.createdAt()));
+    }
+
+    private RecallClosureResponse.ClosureEntry toClosureEntry(String batchKey,
+                                                               Map<String, String> parentOf,
+                                                               Set<String> recalled) {
+        BatchRepository.BatchRow row = repo.findBatch(batchKey)
+                .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+        BatchStatus status = BatchStatus.valueOf(row.status());
+        return new RecallClosureResponse.ClosureEntry(row.batchKey(), row.batchNo(), status,
+                status == BatchStatus.RECALLED,
+                status == BatchStatus.PENDING_DISPOSAL,
+                recalledAncestor(batchKey, parentOf, recalled).orElse(null));
     }
 
     /**

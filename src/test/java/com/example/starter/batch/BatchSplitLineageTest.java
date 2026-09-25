@@ -51,6 +51,7 @@ class BatchSplitLineageTest {
         jdbc.update("DELETE FROM test_result");
         jdbc.update("DELETE FROM batch_required_test");
         jdbc.update("DELETE FROM batch_lineage");
+        jdbc.update("DELETE FROM rework_order");
         jdbc.update("DELETE FROM batch");
     }
 
@@ -317,9 +318,10 @@ class BatchSplitLineageTest {
         assertFalse(available.contains(grandChild));
         assertFalse(available.contains(grandSibling));
 
-        // 后代自身状态不改写，不伪造成曾直接召回
+        // 后代自身状态：非放行后代不改写；闭包内已放行后代（sibling）在同一召回事务内
+        // 标记为待处置 PENDING_DISPOSAL，不伪造成曾直接召回。
         assertEquals("SPLIT", currentStatus(child));
-        assertEquals("RELEASED", currentStatus(sibling));
+        assertEquals("PENDING_DISPOSAL", currentStatus(sibling));
         assertEquals("PENDING_RELEASE", currentStatus(grandChild));
         assertEquals(1, jdbc.queryForObject("SELECT COUNT(*) FROM recall", Integer.class));
         MvcResult childHistory = mockMvc.perform(get("/api/batches/" + child + "/history"))
@@ -432,8 +434,9 @@ class BatchSplitLineageTest {
         int recall = results.get(1).get(30, TimeUnit.SECONDS);
         assertEquals(201, recall, "SPLIT 根批始终可召回");
         if (finalApproval == 201) {
-            // 批准先提交：子批 RELEASED，随后召回使其不可用但状态不改写
-            assertEquals("RELEASED", currentStatus(child));
+            // 批准先提交：子批一度 RELEASED；召回随后提交，闭包将该已放行后代同事务标记为待处置，
+            // 立即不可用。
+            assertEquals("PENDING_DISPOSAL", currentStatus(child));
             assertFalse(availableKeys().contains(child));
         } else {
             // 召回先提交：后代新增批准被拦截 422，子批停留 RELEASE_REVIEW
@@ -479,9 +482,9 @@ class BatchSplitLineageTest {
             assertFalse(available.contains(g2));
             submitTest(g1, "t1", "PASS", "insp-3", 422);
         } else {
-            // 召回先提交：拆分被拦截 422，子批停留 RELEASED 但不可用，无新子批
+            // 召回先提交：拆分被拦截 422，无新子批；子批作为闭包内已放行后代被同事务标记为待处置
             assertEquals(422, split);
-            assertEquals("RELEASED", currentStatus(child));
+            assertEquals("PENDING_DISPOSAL", currentStatus(child));
             assertEquals(0, jdbc.queryForObject(
                     "SELECT COUNT(*) FROM batch WHERE batch_key IN (?, ?)", Integer.class, g1, g2));
         }
