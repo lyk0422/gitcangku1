@@ -21,6 +21,13 @@ public class GlobalExceptionHandler {
         return ResponseEntity.status(ex.status()).body(body(ex.code(), ex.getMessage()));
     }
 
+    @ExceptionHandler(CapacityConflictException.class)
+    public ResponseEntity<Map<String, Object>> handleCapacity(CapacityConflictException ex) {
+        Map<String, Object> map = body(ex.code(), ex.getMessage());
+        map.put("blockingRoutes", ex.blockingRoutes());
+        return ResponseEntity.status(ex.status()).body(map);
+    }
+
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ResponseEntity<Map<String, Object>> handleValidation(MethodArgumentNotValidException ex) {
         String message = ex.getBindingResult().getFieldErrors().stream()

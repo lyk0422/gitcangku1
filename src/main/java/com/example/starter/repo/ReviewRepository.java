@@ -42,23 +42,28 @@ public class ReviewRepository {
                 REVIEW_MAPPER, reviewId).stream().findFirst().orElse(null);
     }
 
-    /** 查询某航线最新的一条审核记录（按创建时间、reviewId 倒序），没有返回 null。 */
+    /** 查询某航线最新的一条审核记录（按单调序号倒序），没有返回 null。 */
     public ReviewPo findLatestReview(String routeId) {
         return jdbc.query(
                 "SELECT review_id, route_id, route_version, airspace_version, conclusion, "
                         + "hit_zone_ids, points_snapshot, request_id, created_at "
                         + "FROM review WHERE route_id = ? "
-                        + "ORDER BY created_at DESC, review_id DESC LIMIT 1",
+                        + "ORDER BY seq DESC LIMIT 1",
                 REVIEW_MAPPER, routeId).stream().findFirst().orElse(null);
     }
 
-    /** 插入不可变审核结果（调用方负责事务）。 */
+    /**
+     * 插入不可变审核结果（调用方负责事务并已持有全局协调锁）。
+     * seq 取 MAX(seq)+1，使“最新审核”排序不受同毫秒创建与随机 reviewId 影响。
+     */
     public void insertReview(ReviewPo po) {
+        Long nextSeq = jdbc.queryForObject("SELECT COALESCE(MAX(seq), 0) + 1 FROM review",
+                Long.class);
         jdbc.update("INSERT INTO review "
-                        + "(review_id, route_id, route_version, airspace_version, conclusion, "
+                        + "(seq, review_id, route_id, route_version, airspace_version, conclusion, "
                         + "hit_zone_ids, points_snapshot, request_id, created_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                po.reviewId(), po.routeId(), po.routeVersion(), po.airspaceVersion(),
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                nextSeq, po.reviewId(), po.routeId(), po.routeVersion(), po.airspaceVersion(),
                 po.conclusion(), encodeZoneIds(po.hitZoneIds()), encodePoints(po.pointsSnapshot()),
                 po.requestId(), po.createdAt());
     }
