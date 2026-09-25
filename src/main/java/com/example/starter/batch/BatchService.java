@@ -86,12 +86,13 @@ public class BatchService {
             });
             String now = now();
             repo.insertBatch(new BatchRepository.BatchRow(0L, req.batchKey(), req.productCode(),
-                    req.batchNo(), req.producedAt().toString(), BatchStatus.QUARANTINED.name(), now));
+                    req.batchNo(), req.producedAt().toString(), BatchStatus.QUARANTINED.name(),
+                    false, now));
             for (int i = 0; i < items.size(); i++) {
                 repo.insertRequiredTest(req.batchKey(), items.get(i), i + 1);
             }
             BatchResponse body = new BatchResponse(req.batchKey(), req.productCode(), req.batchNo(),
-                    req.producedAt(), BatchStatus.QUARANTINED, items, Instant.parse(now));
+                    req.producedAt(), BatchStatus.QUARANTINED, false, items, Instant.parse(now));
             return new StoredResponse(201, toJson(body));
         });
     }
@@ -170,6 +171,9 @@ public class BatchService {
                     .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
             BatchStatus status = BatchStatus.valueOf(batch.status());
             assertNoRecalledAncestor(batchKey);
+            if (batch.temperatureHold()) {
+                throw ApiException.conflict("批次处于 TEMPERATURE_HOLD 温控冻结，未解除前不得到货放行");
+            }
             if (status == BatchStatus.QUARANTINED) {
                 throw ApiException.unprocessable("必做检验项未全部通过，不能批准");
             }
@@ -343,6 +347,7 @@ public class BatchService {
     private BatchResponse toBatchResponse(BatchRepository.BatchRow row) {
         return new BatchResponse(row.batchKey(), row.productCode(), row.batchNo(),
                 Instant.parse(row.producedAt()), BatchStatus.valueOf(row.status()),
+                row.temperatureHold(),
                 repo.findRequiredTests(row.batchKey()), Instant.parse(row.createdAt()));
     }
 
@@ -444,6 +449,9 @@ public class BatchService {
                 return logged.get();
             }
             assertNoRecalledAncestor(parentKey);
+            if (parent.temperatureHold()) {
+                throw ApiException.conflict("批次处于 TEMPERATURE_HOLD 温控冻结，未解除前不得拆分");
+            }
             if (!BatchStatus.RELEASED.name().equals(parent.status())) {
                 throw ApiException.conflict(
                         "批次状态 " + parent.status() + " 不允许拆分，仅当前可用的 RELEASED 批次可拆分");
@@ -459,7 +467,8 @@ public class BatchService {
             for (int i = 0; i < children.size(); i++) {
                 SplitRequest.ChildSpec spec = children.get(i);
                 repo.insertBatch(new BatchRepository.BatchRow(0L, spec.batchKey(), parent.productCode(),
-                        spec.batchNo(), parent.producedAt(), BatchStatus.QUARANTINED.name(), now));
+                        spec.batchNo(), parent.producedAt(), BatchStatus.QUARANTINED.name(),
+                        false, now));
                 for (int j = 0; j < required.size(); j++) {
                     repo.insertRequiredTest(spec.batchKey(), required.get(j), j + 1);
                 }
