@@ -1,4 +1,4 @@
--- 测试库（H2 MySQL 兼容模式）建表语句，与主 schema.sql 结构一致，去掉行内 COMMENT
+-- 本地 H2 运行库（MySQL 兼容模式）建表语句，与主 schema.sql 结构一致，去掉行内 COMMENT
 CREATE TABLE IF NOT EXISTS consent_grant (
     subject_key VARCHAR(128) NOT NULL,
     purpose VARCHAR(32) NOT NULL,

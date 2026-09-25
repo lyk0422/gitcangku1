@@ -11,6 +11,8 @@ import org.springframework.web.method.annotation.HandlerMethodValidationExceptio
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
+import com.example.starter.consent.dto.BatchQueryDeniedResponse;
+
 /**
  * 全局异常处理：把业务异常与参数错误统一转换为带稳定业务码的错误响应。
  */
@@ -21,6 +23,16 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorResponse> handleApi(ApiException ex) {
         return ResponseEntity.status(ex.getStatus())
                 .body(new ErrorResponse(ex.getCode(), ex.getMessage()));
+    }
+
+    /**
+     * 批次查询阻断：403 且稳定列出各主体原因，不返回任何业务数据。
+     */
+    @ExceptionHandler(BatchQueryDeniedException.class)
+    public ResponseEntity<BatchQueryDeniedResponse> handleBatchDenied(BatchQueryDeniedException ex) {
+        return ResponseEntity.status(HttpStatus.FORBIDDEN)
+                .body(new BatchQueryDeniedResponse(
+                        BatchQueryDeniedException.CODE_BATCH_QUERY_DENIED, ex.getMessage(), ex.getReasons()));
     }
 
     @ExceptionHandler({
