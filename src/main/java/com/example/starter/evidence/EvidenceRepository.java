@@ -4,6 +4,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
 
+import java.math.BigDecimal;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.LocalDateTime;
@@ -37,6 +38,44 @@ public class EvidenceRepository {
                         """,
                 evidenceKey, caseKey, category, sealNo, custodianId,
                 EvidenceStatus.SEALED.name(), now, now);
+    }
+
+    /**
+     * 批量入库插入新证物，初始状态 SEALED，携带重量核对与复核状态。
+     */
+    public void insertBatch(String evidenceKey, String custodianId, String description,
+                            BigDecimal declaredWeight, BigDecimal measuredWeight,
+                            WeightStatus weightStatus, ReviewStatus reviewStatus,
+                            String intakeKey, LocalDateTime now) {
+        jdbc.update("""
+                        INSERT INTO evidence
+                            (evidence_key, case_key, category, seal_no, custodian_id, status,
+                             description, declared_weight, measured_weight,
+                             weight_status, review_status, intake_key, created_at, updated_at)
+                        VALUES (?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                evidenceKey, custodianId, EvidenceStatus.SEALED.name(),
+                description, declaredWeight, measuredWeight,
+                weightStatus.name(), reviewStatus.name(), intakeKey, now, now);
+    }
+
+    /**
+     * 按批次键查询该批全部证物（按主键顺序，即清单创建顺序）。
+     */
+    public List<Evidence> findByIntakeKey(String intakeKey) {
+        return jdbc.query(
+                "SELECT * FROM evidence WHERE intake_key = ? ORDER BY id",
+                ROW_MAPPER, intakeKey);
+    }
+
+    /**
+     * 关闭待复核状态（PENDING -> RESOLVED）；仅当前仍为 PENDING 时生效，返回是否更新成功。
+     */
+    public boolean closeReview(String evidenceKey, LocalDateTime now) {
+        return jdbc.update(
+                "UPDATE evidence SET review_status = ?, updated_at = ? "
+                        + "WHERE evidence_key = ? AND review_status = ?",
+                ReviewStatus.RESOLVED.name(), now, evidenceKey, ReviewStatus.PENDING.name()) == 1;
     }
 
     /**
@@ -96,6 +135,13 @@ public class EvidenceRepository {
                     rs.getString("seal_no"),
                     rs.getString("custodian_id"),
                     EvidenceStatus.valueOf(rs.getString("status")),
+                    rs.getString("description"),
+                    rs.getBigDecimal("declared_weight"),
+                    rs.getBigDecimal("measured_weight"),
+                    rs.getString("weight_status") == null
+                            ? null : WeightStatus.valueOf(rs.getString("weight_status")),
+                    ReviewStatus.valueOf(rs.getString("review_status")),
+                    rs.getString("intake_key"),
                     rs.getObject("created_at", LocalDateTime.class),
                     rs.getObject("updated_at", LocalDateTime.class));
         }

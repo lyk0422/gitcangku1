@@ -1,11 +1,14 @@
 package com.example.starter.evidence;
 
+import com.example.starter.evidence.dto.BatchIntakeRequest;
+import com.example.starter.evidence.dto.BatchView;
 import com.example.starter.evidence.dto.CommandRequest;
 import com.example.starter.evidence.dto.CustodyChainView;
 import com.example.starter.evidence.dto.EvidenceView;
 import com.example.starter.evidence.dto.IntakeRequest;
 import com.example.starter.evidence.dto.SealInspectionRequest;
 import com.example.starter.evidence.dto.TransferInitiateRequest;
+import com.example.starter.evidence.dto.WeightReviewRequest;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import org.springframework.http.HttpStatus;
@@ -20,7 +23,12 @@ import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * 证物封存交接 API。所有操作人通过 X-Actor-Id 请求头提供；
@@ -124,6 +132,66 @@ public class EvidenceController {
     @GetMapping("/{evidenceKey}/custody-chain")
     public CustodyChainView custodyChain(@PathVariable String evidenceKey) {
         return evidenceService.custodyChain(evidenceKey);
+    }
+
+    /**
+     * 批量入库：提交批次键、保管人与 1～50 件清单及一一对应的实测重量。
+     * 同一事务内原子创建全部证物；差异超 5% 的项标记待复核。清单换序视为同参。
+     */
+    @PostMapping("/batch-intake")
+    public ResponseEntity<String> batchIntake(@Valid @RequestBody BatchIntakeRequest request) {
+        String hash = idempotencyAdvisor.hash(EvidenceService.OP_BATCH_INTAKE,
+                request.custodianId(), null, canonicalItems(request));
+        StoredResponse response = idempotencyAdvisor.guard(request.intakeKey(), hash,
+                () -> evidenceService.batchIntake(request, hash));
+        return toEntity(response);
+    }
+
+    /**
+     * 重量差异复核：仅当前保管人，携带说明写入不可变记录并关闭待复核状态；复核不可逆。
+     */
+    @PostMapping("/{evidenceKey}/weight-review")
+    public ResponseEntity<String> reviewWeight(@RequestHeader(ACTOR_HEADER) @NotBlank String actorId,
+                                               @PathVariable String evidenceKey,
+                                               @Valid @RequestBody WeightReviewRequest request) {
+        String hash = idempotencyAdvisor.hash(EvidenceService.OP_WEIGHT_REVIEW, actorId,
+                evidenceKey, request);
+        StoredResponse response = idempotencyAdvisor.guard(request.commandKey(), hash,
+                () -> evidenceService.reviewWeight(actorId, evidenceKey, request, hash));
+        return toEntity(response);
+    }
+
+    /**
+     * 按批次键查询入库清单与差异复核状态。
+     */
+    @GetMapping("/batches/{intakeKey}")
+    public BatchView batchView(@PathVariable String intakeKey) {
+        return evidenceService.batchView(intakeKey);
+    }
+
+    /**
+     * 构造批次请求的规范化清单：证物与实测重量按下标配对后按 evidenceKey 排序，
+     * 保证清单换序得到相同请求指纹（同参）。
+     */
+    private List<Map<String, Object>> canonicalItems(BatchIntakeRequest request) {
+        List<BatchIntakeRequest.BatchIntakeItem> items =
+                request.items() == null ? List.of() : request.items();
+        List<BigDecimal> weights =
+                request.measuredWeights() == null ? List.of() : request.measuredWeights();
+        List<Map<String, Object>> pairs = new ArrayList<>();
+        for (int i = 0; i < items.size(); i++) {
+            BatchIntakeRequest.BatchIntakeItem item = items.get(i);
+            Map<String, Object> pair = new LinkedHashMap<>();
+            pair.put("evidenceKey", item == null ? null : item.evidenceKey());
+            pair.put("description", item == null ? null : item.description());
+            pair.put("declaredWeight", item == null || item.declaredWeight() == null
+                    ? null : item.declaredWeight().stripTrailingZeros());
+            pair.put("measuredWeight", i < weights.size() && weights.get(i) != null
+                    ? weights.get(i).stripTrailingZeros() : null);
+            pairs.add(pair);
+        }
+        pairs.sort(Comparator.comparing(pair -> String.valueOf(pair.get("evidenceKey"))));
+        return pairs;
     }
 
     private ResponseEntity<String> toEntity(StoredResponse response) {

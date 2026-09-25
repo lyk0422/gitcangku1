@@ -1,6 +1,10 @@
 package com.example.starter.evidence;
 
 import com.example.starter.error.ApiException;
+import com.example.starter.error.BatchValidationException;
+import com.example.starter.evidence.dto.BatchIntakeRequest;
+import com.example.starter.evidence.dto.BatchIntakeResponse;
+import com.example.starter.evidence.dto.BatchView;
 import com.example.starter.evidence.dto.CommandRequest;
 import com.example.starter.evidence.dto.CustodyChainView;
 import com.example.starter.evidence.dto.EvidenceView;
@@ -9,12 +13,19 @@ import com.example.starter.evidence.dto.IntakeRequest;
 import com.example.starter.evidence.dto.SealInspectionRequest;
 import com.example.starter.evidence.dto.TransferInitiateRequest;
 import com.example.starter.evidence.dto.TransferView;
+import com.example.starter.evidence.dto.WeightReviewRequest;
+import com.example.starter.evidence.dto.WeightReviewView;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -26,25 +37,40 @@ import java.util.Optional;
 public class EvidenceService {
 
     static final String OP_INTAKE = "INTAKE";
+    static final String OP_BATCH_INTAKE = "BATCH_INTAKE";
+    static final String OP_WEIGHT_REVIEW = "WEIGHT_REVIEW";
     static final String OP_TRANSFER_INITIATE = "TRANSFER_INITIATE";
     static final String OP_TRANSFER_ACCEPT = "TRANSFER_ACCEPT";
     static final String OP_TRANSFER_CANCEL = "TRANSFER_CANCEL";
     static final String OP_SEAL_INSPECTION = "SEAL_INSPECTION";
 
+    /** 差异判定阈值：超过申报重量的 5% 记为 DISCREPANT。 */
+    private static final BigDecimal DISCREPANCY_THRESHOLD = new BigDecimal("0.05");
+    /** 申报重量上限（DECIMAL(10,2)）。 */
+    private static final BigDecimal MAX_DECLARED = new BigDecimal("99999999.99");
+    /** 实测重量上限（DECIMAL(12,4)）。 */
+    private static final BigDecimal MAX_MEASURED = new BigDecimal("99999999.9999");
+
     private final EvidenceRepository evidenceRepository;
     private final TransferRecordRepository transferRepository;
     private final SealInspectionRepository inspectionRepository;
+    private final WeightDiscrepancyRepository discrepancyRepository;
+    private final WeightReviewRepository reviewRepository;
     private final CommandLogRepository commandLogRepository;
     private final ObjectMapper objectMapper;
 
     public EvidenceService(EvidenceRepository evidenceRepository,
                            TransferRecordRepository transferRepository,
                            SealInspectionRepository inspectionRepository,
+                           WeightDiscrepancyRepository discrepancyRepository,
+                           WeightReviewRepository reviewRepository,
                            CommandLogRepository commandLogRepository,
                            ObjectMapper objectMapper) {
         this.evidenceRepository = evidenceRepository;
         this.transferRepository = transferRepository;
         this.inspectionRepository = inspectionRepository;
+        this.discrepancyRepository = discrepancyRepository;
+        this.reviewRepository = reviewRepository;
         this.commandLogRepository = commandLogRepository;
         this.objectMapper = objectMapper;
     }
@@ -69,6 +95,190 @@ public class EvidenceService {
     }
 
     /**
+     * 批量入库：清单内键重复或已存在整批 400；单项格式非法整批 422；否则同一事务内原子创建
+     * 全部证物为 SEALED，差异超 5% 的项标记 DISCREPANT 并进入待复核，记录差异明细。
+     */
+    @Transactional
+    public StoredResponse batchIntake(BatchIntakeRequest request, String requestHash) {
+        Optional<StoredResponse> replay = checkReplay(request.intakeKey(), requestHash);
+        if (replay.isPresent()) {
+            return replay.get();
+        }
+        List<BatchIntakeRequest.BatchIntakeItem> items = request.items();
+        List<BigDecimal> measured = request.measuredWeights();
+        if (items.size() != measured.size()) {
+            throw ApiException.badRequest("实测重量列表与证物清单数量不一致");
+        }
+        requireNoDuplicateKeys(items);
+        requireNoneExists(items);
+        validateItems(items, measured);
+
+        LocalDateTime now = LocalDateTime.now();
+        List<BatchIntakeResponse.Item> results = new ArrayList<>();
+        int matchedCount = 0;
+        int discrepantCount = 0;
+        for (int i = 0; i < items.size(); i++) {
+            BatchIntakeRequest.BatchIntakeItem item = items.get(i);
+            BigDecimal declared = item.declaredWeight();
+            BigDecimal actual = measured.get(i);
+            BigDecimal diff = actual.subtract(declared).abs();
+            WeightStatus weightStatus = diff.compareTo(declared.multiply(DISCREPANCY_THRESHOLD)) > 0
+                    ? WeightStatus.DISCREPANT : WeightStatus.MATCHED;
+            ReviewStatus reviewStatus = weightStatus == WeightStatus.DISCREPANT
+                    ? ReviewStatus.PENDING : ReviewStatus.NONE;
+            evidenceRepository.insertBatch(item.evidenceKey(), request.custodianId(),
+                    item.description(), declared, actual, weightStatus, reviewStatus,
+                    request.intakeKey(), now);
+            if (weightStatus == WeightStatus.DISCREPANT) {
+                discrepantCount++;
+                BigDecimal diffPercent = diff.multiply(new BigDecimal("100"))
+                        .divide(declared, 4, RoundingMode.HALF_UP);
+                discrepancyRepository.insert(request.intakeKey(), item.evidenceKey(),
+                        declared, actual, diffPercent, now);
+            } else {
+                matchedCount++;
+            }
+            results.add(new BatchIntakeResponse.Item(item.evidenceKey(), EvidenceStatus.SEALED,
+                    declared, actual, weightStatus, reviewStatus));
+        }
+        BatchIntakeResponse body = new BatchIntakeResponse(request.intakeKey(), request.custodianId(),
+                items.size(), matchedCount, discrepantCount, results);
+        return record(request.intakeKey(), OP_BATCH_INTAKE, request.custodianId(), requestHash, 201, body);
+    }
+
+    /**
+     * 重量差异复核：仅当前保管人，证物须处于待复核；写入不可变复核记录并关闭待复核状态。
+     * 复核不可逆，关闭后与 MATCHED 证物权限一致。
+     */
+    @Transactional
+    public StoredResponse reviewWeight(String actorId, String evidenceKey,
+                                       WeightReviewRequest request, String requestHash) {
+        Optional<StoredResponse> replay = checkReplay(request.commandKey(), requestHash);
+        if (replay.isPresent()) {
+            return replay.get();
+        }
+        Evidence evidence = lockEvidence(evidenceKey);
+        requireCustodian(evidence, actorId);
+        if (evidence.reviewStatus() == ReviewStatus.RESOLVED) {
+            throw ApiException.conflict("复核已关闭，不可重复复核: " + evidenceKey);
+        }
+        if (evidence.reviewStatus() != ReviewStatus.PENDING) {
+            throw ApiException.conflict("证物不存在待复核差异: " + evidenceKey);
+        }
+        LocalDateTime now = LocalDateTime.now();
+        if (!evidenceRepository.closeReview(evidenceKey, now)) {
+            throw ApiException.conflict("复核已被处理: " + evidenceKey);
+        }
+        reviewRepository.insert(evidenceKey, actorId, request.note(), now);
+        WeightReview review = reviewRepository.findByEvidenceKey(evidenceKey).orElseThrow();
+        return record(request.commandKey(), OP_WEIGHT_REVIEW, actorId, requestHash,
+                200, toView(review));
+    }
+
+    /**
+     * 按批次键查询入库清单与差异复核状态。
+     */
+    @Transactional(readOnly = true)
+    public BatchView batchView(String intakeKey) {
+        List<Evidence> items = evidenceRepository.findByIntakeKey(intakeKey);
+        if (items.isEmpty()) {
+            throw ApiException.notFound("批次不存在: " + intakeKey);
+        }
+        List<BatchView.Item> views = new ArrayList<>();
+        int matchedCount = 0;
+        int discrepantCount = 0;
+        int pendingReviewCount = 0;
+        for (Evidence evidence : items) {
+            String reviewNote = reviewRepository.findByEvidenceKey(evidence.evidenceKey())
+                    .map(WeightReview::note).orElse(null);
+            if (evidence.weightStatus() == WeightStatus.DISCREPANT) {
+                discrepantCount++;
+            } else {
+                matchedCount++;
+            }
+            if (evidence.reviewStatus() == ReviewStatus.PENDING) {
+                pendingReviewCount++;
+            }
+            views.add(new BatchView.Item(evidence.evidenceKey(), evidence.description(),
+                    evidence.declaredWeight(), evidence.measuredWeight(),
+                    evidence.weightStatus(), evidence.reviewStatus(), reviewNote,
+                    evidence.createdAt()));
+        }
+        return new BatchView(intakeKey, items.get(0).custodianId(), items.size(),
+                matchedCount, discrepantCount, pendingReviewCount, views);
+    }
+
+    /**
+     * 清单内 evidenceKey 不得重复（空键不参与判重，按格式错误处理）。
+     */
+    private void requireNoDuplicateKeys(List<BatchIntakeRequest.BatchIntakeItem> items) {
+        Map<String, Integer> seen = new LinkedHashMap<>();
+        for (BatchIntakeRequest.BatchIntakeItem item : items) {
+            if (item == null || item.evidenceKey() == null || item.evidenceKey().isBlank()) {
+                continue;
+            }
+            if (seen.merge(item.evidenceKey(), 1, Integer::sum) > 1) {
+                throw ApiException.badRequest("清单内证物键重复: " + item.evidenceKey());
+            }
+        }
+    }
+
+    /**
+     * 清单内全部 evidenceKey 不得已存在于系统。
+     */
+    private void requireNoneExists(List<BatchIntakeRequest.BatchIntakeItem> items) {
+        for (BatchIntakeRequest.BatchIntakeItem item : items) {
+            if (item == null || item.evidenceKey() == null || item.evidenceKey().isBlank()) {
+                continue;
+            }
+            if (evidenceRepository.findByKey(item.evidenceKey()).isPresent()) {
+                throw ApiException.badRequest("证物已存在: " + item.evidenceKey());
+            }
+        }
+    }
+
+    /**
+     * 逐项格式校验：任一非法即整批 422 并返回逐项原因，不创建任何证物。
+     */
+    private void validateItems(List<BatchIntakeRequest.BatchIntakeItem> items,
+                               List<BigDecimal> measured) {
+        List<BatchValidationException.ItemError> errors = new ArrayList<>();
+        for (int i = 0; i < items.size(); i++) {
+            BatchIntakeRequest.BatchIntakeItem item = items.get(i);
+            if (item == null) {
+                errors.add(new BatchValidationException.ItemError(i, null, "清单项缺失"));
+                continue;
+            }
+            String key = item.evidenceKey();
+            String errorKey = key == null || key.isBlank() ? null : key;
+            if (errorKey == null) {
+                errors.add(new BatchValidationException.ItemError(i, null, "证物键为空"));
+            }
+            if (item.description() == null || item.description().isBlank()) {
+                errors.add(new BatchValidationException.ItemError(i, errorKey, "描述为空"));
+            }
+            BigDecimal declared = item.declaredWeight();
+            if (declared == null || declared.signum() <= 0) {
+                errors.add(new BatchValidationException.ItemError(i, errorKey, "申报重量须大于0"));
+            } else if (declared.scale() > 2 || declared.compareTo(MAX_DECLARED) > 0) {
+                errors.add(new BatchValidationException.ItemError(i, errorKey,
+                        "申报重量须为不超过两位小数的合法数值"));
+            }
+            BigDecimal actual = measured.get(i);
+            if (actual == null || actual.signum() <= 0) {
+                errors.add(new BatchValidationException.ItemError(i, errorKey, "实测重量须大于0"));
+            } else if (actual.scale() > 4 || actual.compareTo(MAX_MEASURED) > 0) {
+                errors.add(new BatchValidationException.ItemError(i, errorKey,
+                        "实测重量须为不超过四位小数的合法数值"));
+            }
+        }
+        if (!errors.isEmpty()) {
+            throw new BatchValidationException(errors);
+        }
+    }
+
+
+    /**
      * 发起交接：仅当前保管人，证物须为 SEALED，接收人须与发起人不同；成功后进入 TRANSFER_PENDING。
      */
     @Transactional
@@ -83,6 +293,7 @@ public class EvidenceService {
             throw ApiException.badRequest("接收人不能与发起保管人相同");
         }
         requireSealIntact(evidence);
+        requireNotPendingReview(evidence);
         requireCustodian(evidence, actorId);
         if (evidence.status() == EvidenceStatus.TRANSFER_PENDING) {
             throw ApiException.conflict("证物已存在待接收交接: " + evidenceKey);
@@ -160,6 +371,7 @@ public class EvidenceService {
         }
         Evidence evidence = lockEvidence(evidenceKey);
         requireCustodian(evidence, actorId);
+        requireNotPendingReview(evidence);
         if (evidence.status() == EvidenceStatus.TRANSFER_PENDING) {
             throw ApiException.conflict("待接收期间禁止封条核验: " + evidenceKey);
         }
@@ -207,6 +419,13 @@ public class EvidenceService {
         }
     }
 
+    private void requireNotPendingReview(Evidence evidence) {
+        if (evidence.reviewStatus() == ReviewStatus.PENDING) {
+            throw ApiException.conflict("证物重量差异待复核，禁止交接与封条核验: "
+                    + evidence.evidenceKey());
+        }
+    }
+
     private void requireCustodian(Evidence evidence, String actorId) {
         if (!evidence.custodianId().equals(actorId)) {
             throw ApiException.conflict("操作人不是当前保管人: " + actorId);
@@ -249,7 +468,14 @@ public class EvidenceService {
     private EvidenceView toView(Evidence evidence) {
         return new EvidenceView(evidence.evidenceKey(), evidence.caseKey(), evidence.category(),
                 evidence.sealNo(), evidence.custodianId(), evidence.status(),
+                evidence.description(), evidence.declaredWeight(), evidence.measuredWeight(),
+                evidence.weightStatus(), evidence.reviewStatus(), evidence.intakeKey(),
                 evidence.createdAt(), evidence.updatedAt());
+    }
+
+    private WeightReviewView toView(WeightReview review) {
+        return new WeightReviewView(review.evidenceKey(), review.reviewerId(),
+                review.note(), review.createdAt());
     }
 
     private TransferView toView(TransferRecord record) {

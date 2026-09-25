@@ -12,6 +12,7 @@ import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
 import java.time.LocalDateTime;
+import java.util.List;
 import java.util.stream.Collectors;
 
 /**
@@ -26,6 +27,13 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorBody> handleApi(ApiException ex) {
         return ResponseEntity.status(ex.status())
                 .body(new ErrorBody(ex.status().value(), ex.getMessage(), LocalDateTime.now()));
+    }
+
+    @ExceptionHandler(BatchValidationException.class)
+    public ResponseEntity<BatchErrorBody> handleBatchValidation(BatchValidationException ex) {
+        return ResponseEntity.status(ex.status())
+                .body(new BatchErrorBody(ex.status().value(), ex.getMessage(),
+                        ex.errors(), LocalDateTime.now()));
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
@@ -59,5 +67,18 @@ public class GlobalExceptionHandler {
      * @param timestamp 发生时间（Asia/Shanghai）
      */
     public record ErrorBody(int status, String message, LocalDateTime timestamp) {
+    }
+
+    /**
+     * 批量入库清单格式错误响应体（422），携带逐项失败原因。
+     *
+     * @param status    HTTP 状态码
+     * @param message   错误描述
+     * @param errors    逐项失败原因（清单下标、证物键、原因）
+     * @param timestamp 发生时间（Asia/Shanghai）
+     */
+    public record BatchErrorBody(int status, String message,
+                                 List<BatchValidationException.ItemError> errors,
+                                 LocalDateTime timestamp) {
     }
 }
