@@ -1,9 +1,13 @@
 package com.example.starter.evidence;
 
+import com.example.starter.evidence.dto.BatchIntakeRequest;
+import com.example.starter.evidence.dto.BatchIntakeView;
 import com.example.starter.evidence.dto.CommandRequest;
 import com.example.starter.evidence.dto.CustodyChainView;
 import com.example.starter.evidence.dto.EvidenceView;
 import com.example.starter.evidence.dto.IntakeRequest;
+import com.example.starter.evidence.dto.ReviewRecordView;
+import com.example.starter.evidence.dto.ReviewSubmitRequest;
 import com.example.starter.evidence.dto.SealInspectionRequest;
 import com.example.starter.evidence.dto.TransferInitiateRequest;
 import jakarta.validation.Valid;
@@ -51,6 +55,49 @@ public class EvidenceController {
                 request.evidenceKey(), request);
         StoredResponse response = idempotencyAdvisor.guard(request.commandKey(), hash,
                 () -> evidenceService.intake(actorId, request, hash));
+        return toEntity(response);
+    }
+
+    /**
+     * 批量入库：1~50 件证物原子创建为 SEALED；DISCREPANT 项进入待复核。
+     * requestId 即批次键兼幂等键：同键同参（清单换序视为同参）重放首次快照，异参 409，失败不占键。
+     */
+    @PostMapping("/batches")
+    public ResponseEntity<String> batchIntake(@RequestHeader(ACTOR_HEADER) @NotBlank String actorId,
+                                              @Valid @RequestBody BatchIntakeRequest request) {
+        String hash = idempotencyAdvisor.hashBatch(EvidenceService.OP_BATCH_INTAKE, actorId, request);
+        StoredResponse response = idempotencyAdvisor.guard(request.requestId(), hash,
+                () -> evidenceService.batchIntake(actorId, request, hash), true);
+        return toEntity(response);
+    }
+
+    /**
+     * 按批次查询入库清单与差异复核状态。
+     */
+    @GetMapping("/batches/{intakeKey}")
+    public BatchIntakeView batchView(@PathVariable String intakeKey) {
+        return evidenceService.batchView(intakeKey);
+    }
+
+    /**
+     * 查询批次全部复核记录（只追加，按提交顺序）。
+     */
+    @GetMapping("/batches/{intakeKey}/reviews")
+    public List<ReviewRecordView> batchReviews(@PathVariable String intakeKey) {
+        return evidenceService.batchReviews(intakeKey);
+    }
+
+    /**
+     * 提交差异复核：仅批次保管人，说明必填，提交后不可逆关闭待复核状态。
+     */
+    @PostMapping("/{evidenceKey}/review")
+    public ResponseEntity<String> submitReview(@RequestHeader(ACTOR_HEADER) @NotBlank String actorId,
+                                               @PathVariable String evidenceKey,
+                                               @Valid @RequestBody ReviewSubmitRequest request) {
+        String hash = idempotencyAdvisor.hash(EvidenceService.OP_REVIEW_SUBMIT, actorId,
+                evidenceKey, request);
+        StoredResponse response = idempotencyAdvisor.guard(request.commandKey(), hash,
+                () -> evidenceService.submitReview(actorId, evidenceKey, request, hash));
         return toEntity(response);
     }
 

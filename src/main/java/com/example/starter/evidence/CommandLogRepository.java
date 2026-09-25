@@ -38,6 +38,33 @@ public class CommandLogRepository {
     }
 
     /**
+     * 事务开始时预占幂等键（响应状态 0、空响应体为占位值）。
+     * 并发同键事务在唯一约束上等待先提交者；事务回滚时占位行一并回滚，失败不占键。
+     */
+    public void reserve(String commandKey, String actorId, String operation, String requestHash,
+                        LocalDateTime now) {
+        jdbc.update("""
+                        INSERT INTO command_log
+                            (command_key, actor_id, operation, request_hash, response_status, response_body, created_at)
+                        VALUES (?, ?, ?, ?, 0, '', ?)
+                        """,
+                commandKey, actorId, operation, requestHash, now);
+    }
+
+    /**
+     * 事务提交前把预占行补全为首次执行的真实响应快照。
+     */
+    public void complete(String commandKey, int responseStatus, String responseBody,
+                         LocalDateTime now) {
+        jdbc.update("""
+                        UPDATE command_log
+                        SET response_status = ?, response_body = ?, created_at = ?
+                        WHERE command_key = ?
+                        """,
+                responseStatus, responseBody, now, commandKey);
+    }
+
+    /**
      * 按命令键查询首次执行记录。
      */
     public Optional<CommandLog> findByKey(String commandKey) {

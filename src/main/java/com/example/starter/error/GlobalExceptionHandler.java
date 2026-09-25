@@ -12,6 +12,7 @@ import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
 import java.time.LocalDateTime;
+import java.util.List;
 import java.util.stream.Collectors;
 
 /**
@@ -25,7 +26,13 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(ApiException.class)
     public ResponseEntity<ErrorBody> handleApi(ApiException ex) {
         return ResponseEntity.status(ex.status())
-                .body(new ErrorBody(ex.status().value(), ex.getMessage(), LocalDateTime.now()));
+                .body(new ErrorBody(ex.status().value(), ex.getMessage(), LocalDateTime.now(), null));
+    }
+
+    @ExceptionHandler(ItemValidationException.class)
+    public ResponseEntity<ErrorBody> handleItemValidation(ItemValidationException ex) {
+        return ResponseEntity.unprocessableEntity()
+                .body(new ErrorBody(422, ex.getMessage(), LocalDateTime.now(), ex.errors()));
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
@@ -35,20 +42,20 @@ public class GlobalExceptionHandler {
                 .distinct()
                 .collect(Collectors.joining(", ", "参数非法: ", ""));
         return ResponseEntity.badRequest()
-                .body(new ErrorBody(400, message, LocalDateTime.now()));
+                .body(new ErrorBody(400, message, LocalDateTime.now(), null));
     }
 
     @ExceptionHandler({MissingRequestHeaderException.class, HttpMessageNotReadableException.class})
     public ResponseEntity<ErrorBody> handleBadRequest(Exception ex) {
         return ResponseEntity.badRequest()
-                .body(new ErrorBody(400, "参数非法: " + ex.getMessage(), LocalDateTime.now()));
+                .body(new ErrorBody(400, "参数非法: " + ex.getMessage(), LocalDateTime.now(), null));
     }
 
     @ExceptionHandler(Exception.class)
     public ResponseEntity<ErrorBody> handleOther(Exception ex) {
         log.error("未处理异常", ex);
         return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                .body(new ErrorBody(500, "服务内部错误", LocalDateTime.now()));
+                .body(new ErrorBody(500, "服务内部错误", LocalDateTime.now(), null));
     }
 
     /**
@@ -57,7 +64,9 @@ public class GlobalExceptionHandler {
      * @param status    HTTP 状态码
      * @param message   错误描述
      * @param timestamp 发生时间（Asia/Shanghai）
+     * @param errors    逐项非法原因；仅 422 批量入库校验失败时非空
      */
-    public record ErrorBody(int status, String message, LocalDateTime timestamp) {
+    public record ErrorBody(int status, String message, LocalDateTime timestamp,
+                            List<ItemValidationException.ItemError> errors) {
     }
 }
