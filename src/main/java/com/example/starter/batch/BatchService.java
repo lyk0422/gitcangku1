@@ -59,13 +59,16 @@ public class BatchService {
     private static final int IDEMPOTENCY_MAX_ATTEMPTS = 3;
 
     private final BatchRepository repo;
+    private final TransportRepository transportRepo;
     private final TransactionTemplate tx;
     private final ObjectMapper objectMapper;
 
     public BatchService(BatchRepository repo,
+                        TransportRepository transportRepo,
                         PlatformTransactionManager transactionManager,
                         ObjectMapper objectMapper) {
         this.repo = repo;
+        this.transportRepo = transportRepo;
         this.tx = new TransactionTemplate(transactionManager);
         this.objectMapper = objectMapper;
     }
@@ -170,6 +173,7 @@ public class BatchService {
                     .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
             BatchStatus status = BatchStatus.valueOf(batch.status());
             assertNoRecalledAncestor(batchKey);
+            assertNoActiveTemperatureHold(batchKey, "到货放行");
             if (status == BatchStatus.QUARANTINED) {
                 throw ApiException.unprocessable("必做检验项未全部通过，不能批准");
             }
@@ -342,8 +346,27 @@ public class BatchService {
 
     private BatchResponse toBatchResponse(BatchRepository.BatchRow row) {
         return new BatchResponse(row.batchKey(), row.productCode(), row.batchNo(),
-                Instant.parse(row.producedAt()), BatchStatus.valueOf(row.status()),
+                Instant.parse(row.producedAt()), effectiveStatus(row),
                 repo.findRequiredTests(row.batchKey()), Instant.parse(row.createdAt()));
+    }
+
+    /**
+     * 批次对外呈现状态：存在未解除的温控冻结时为 TEMPERATURE_HOLD，否则为底层状态。
+     */
+    private BatchStatus effectiveStatus(BatchRepository.BatchRow row) {
+        return transportRepo.findActiveHold(row.batchKey()).isPresent()
+                ? BatchStatus.TEMPERATURE_HOLD
+                : BatchStatus.valueOf(row.status());
+    }
+
+    /**
+     * 温控冻结（TEMPERATURE_HOLD）期间禁止到货放行、拆分等操作，违反返回 409。
+     */
+    private void assertNoActiveTemperatureHold(String batchKey, String operation) {
+        if (transportRepo.findActiveHold(batchKey).isPresent()) {
+            throw ApiException.conflict(
+                    "批次处于温控冻结（TEMPERATURE_HOLD），禁止" + operation);
+        }
     }
 
     private TestResultResponse toTestResponse(BatchRepository.TestRow row, String batchStatus) {
@@ -444,6 +467,7 @@ public class BatchService {
                 return logged.get();
             }
             assertNoRecalledAncestor(parentKey);
+            assertNoActiveTemperatureHold(parentKey, "拆分");
             if (!BatchStatus.RELEASED.name().equals(parent.status())) {
                 throw ApiException.conflict(
                         "批次状态 " + parent.status() + " 不允许拆分，仅当前可用的 RELEASED 批次可拆分");
