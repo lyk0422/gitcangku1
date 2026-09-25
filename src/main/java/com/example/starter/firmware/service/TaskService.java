@@ -12,6 +12,7 @@ import com.example.starter.firmware.domain.RolloutTask;
 import com.example.starter.firmware.domain.TaskStatus;
 import com.example.starter.firmware.error.ApiException;
 import com.example.starter.firmware.repo.DeviceRepository;
+import com.example.starter.firmware.repo.PathBlockedRepository;
 import com.example.starter.firmware.repo.PauseRecordRepository;
 import com.example.starter.firmware.repo.ReleaseRepository;
 import com.example.starter.firmware.repo.TaskRepository;
@@ -33,47 +34,66 @@ public class TaskService {
     private final ReleaseRepository releaseRepository;
     private final DeviceRepository deviceRepository;
     private final PauseRecordRepository pauseRecordRepository;
+    private final PathBlockedRepository pathBlockedRepository;
     private final DeviceService deviceService;
     private final ReleaseService releaseService;
+    private final VersionService versionService;
     private final IdempotencyService idempotency;
     private final Clock clock;
 
     public TaskService(TaskRepository taskRepository, ReleaseRepository releaseRepository,
                        DeviceRepository deviceRepository, PauseRecordRepository pauseRecordRepository,
+                       PathBlockedRepository pathBlockedRepository,
                        DeviceService deviceService, ReleaseService releaseService,
-                       IdempotencyService idempotency, Clock clock) {
+                       VersionService versionService, IdempotencyService idempotency, Clock clock) {
         this.taskRepository = taskRepository;
         this.releaseRepository = releaseRepository;
         this.deviceRepository = deviceRepository;
         this.pauseRecordRepository = pauseRecordRepository;
+        this.pathBlockedRepository = pathBlockedRepository;
         this.deviceService = deviceService;
         this.releaseService = releaseService;
+        this.versionService = versionService;
         this.idempotency = idempotency;
         this.clock = clock;
     }
 
     /**
-     * 设备拉取：已存在任务直接返回；否则仅当型号与当前版本匹配、分桶号小于比例且发布单 ACTIVE 时创建。
-     * PAUSED 时不创建新任务，已有任务仍可查看与回执。
+     * 设备拉取：在 发布单行锁→设备行锁 的固定顺序下做一致判定。已存在任务直接返回；
+     * 否则仅当型号与当前版本匹配、分桶号小于比例且发布单 ACTIVE 时创建。
+     * 发布单未声明跳级时，按提交时刻一致的版本链与设备版本做前置链校验：
+     * 目标前置链上存在设备尚未安装的中间版本则返回 PATH_BLOCKED 与下一个必装版本，
+     * 不建任务、不计失败率样本、不改设备与任务状态，仅追加一条拦截历史。
+     * 发布单 allowSkip=true 时忽略链校验直接下发；目标版本未登记链信息时沿用既有规则。
      */
     public PullResponse pull(String deviceId, String requestId) {
         String fingerprint = String.join("|", "task.pull", deviceId);
         return idempotency.execute(requestId, "task.pull", fingerprint, () -> {
-            Device device = deviceService.findDevice(deviceId);
-            var activeOrder = releaseRepository.findActiveByModel(device.model());
+            Device initial = deviceService.findDevice(deviceId);
+            var activeOrder = releaseRepository.findActiveByModel(initial.model());
             if (activeOrder.isEmpty()) {
-                return new PullResponse(null);
+                return PullResponse.none();
             }
             ReleaseOrder order = releaseRepository.findByIdForUpdate(activeOrder.get().id())
                     .orElseThrow(() -> ApiException.notFound("RELEASE_NOT_FOUND", "发布单不存在"));
+            Device device = deviceRepository.findByIdForUpdate(deviceId)
+                    .orElseThrow(() -> ApiException.notFound("DEVICE_NOT_FOUND", "设备不存在: " + deviceId));
             var existing = taskRepository.findByReleaseAndDevice(order.id(), deviceId);
             if (existing.isPresent()) {
-                return new PullResponse(TaskView.of(existing.get(), order));
+                return PullResponse.issued(TaskView.of(existing.get(), order));
             }
             if (order.status() != ReleaseStatus.ACTIVE
                     || !device.currentVersion().equals(order.fromVersion())
                     || device.bucketNo() >= order.ratio()) {
-                return new PullResponse(null);
+                return PullResponse.none();
+            }
+            if (!order.allowSkip()) {
+                String required = pathBlockedRequired(device.currentVersion(), order.toVersion());
+                if (required != null) {
+                    pathBlockedRepository.insert(order.id(), deviceId, device.currentVersion(),
+                            required, order.toVersion(), Instant.now(clock).toString());
+                    return PullResponse.pathBlocked(required);
+                }
             }
             long taskId;
             try {
@@ -81,12 +101,33 @@ public class TaskService {
             } catch (DuplicateKeyException e) {
                 RolloutTask task = taskRepository.findByReleaseAndDevice(order.id(), deviceId)
                         .orElseThrow(() -> new IllegalStateException("任务唯一约束冲突后未找到任务"));
-                return new PullResponse(TaskView.of(task, order));
+                return PullResponse.issued(TaskView.of(task, order));
             }
             RolloutTask task = taskRepository.findById(taskId)
                     .orElseThrow(() -> new IllegalStateException("任务创建后读取失败"));
-            return new PullResponse(TaskView.of(task, order));
+            return PullResponse.issued(TaskView.of(task, order));
         }, PullResponse.class);
+    }
+
+    /**
+     * 前置链拦截判定：chain 为目标版本沿前置链接回溯（含自身）。
+     * 目标版本未登记（空链）时不启用链校验；设备版本是目标本身或其直接前置时放行；
+     * 设备在链上更旧的位置时，下一个必须安装版本为链中紧邻其后的版本；
+     * 设备不在目标链上时，从链起点开始安装。无拦截返回 null。
+     */
+    private String pathBlockedRequired(String currentVersion, String targetVersion) {
+        List<String> chain = versionService.chainFrom(targetVersion);
+        if (chain.isEmpty()) {
+            return null;
+        }
+        int index = chain.indexOf(currentVersion);
+        if (index < 0) {
+            return chain.get(chain.size() - 1);
+        }
+        if (index <= 1) {
+            return null;
+        }
+        return chain.get(index - 1);
     }
 
     /**

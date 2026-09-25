@@ -38,8 +38,10 @@ class FirmwareApiTest {
         jdbc.update("DELETE FROM rollout_task");
         jdbc.update("DELETE FROM release_pause_record");
         jdbc.update("DELETE FROM release_resume_record");
+        jdbc.update("DELETE FROM path_blocked_record");
         jdbc.update("DELETE FROM release_order");
         jdbc.update("DELETE FROM device");
+        jdbc.update("DELETE FROM firmware_version");
         jdbc.update("DELETE FROM idempotency_record");
     }
 

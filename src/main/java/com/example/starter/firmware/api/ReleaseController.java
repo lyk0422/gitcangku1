@@ -48,6 +48,17 @@ public class ReleaseController {
         return releaseService.resume(releaseId, request);
     }
 
+    @PostMapping("/{releaseId}/skip-level")
+    public ReleaseView setSkipLevel(@PathVariable long releaseId,
+                                    @Valid @RequestBody SkipLevelRequest request) {
+        return releaseService.setSkipLevel(releaseId, request);
+    }
+
+    @GetMapping("/{releaseId}/path-blocked")
+    public PathBlockedHistoryResponse pathBlocked(@PathVariable long releaseId) {
+        return releaseService.pathBlockedHistory(releaseId);
+    }
+
     @GetMapping("/{releaseId}/monitor")
     public MonitorView monitor(@PathVariable long releaseId) {
         return releaseService.monitor(releaseId);

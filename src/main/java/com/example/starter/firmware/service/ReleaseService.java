@@ -3,14 +3,18 @@ package com.example.starter.firmware.service;
 import com.example.starter.firmware.api.CreateReleaseRequest;
 import com.example.starter.firmware.api.ExpandReleaseRequest;
 import com.example.starter.firmware.api.MonitorView;
+import com.example.starter.firmware.api.PathBlockedHistoryResponse;
+import com.example.starter.firmware.api.PathBlockedView;
 import com.example.starter.firmware.api.PauseRecordView;
 import com.example.starter.firmware.api.ReleaseHistoryResponse;
 import com.example.starter.firmware.api.ReleaseView;
 import com.example.starter.firmware.api.ResumeRecordView;
 import com.example.starter.firmware.api.ResumeReleaseRequest;
+import com.example.starter.firmware.api.SkipLevelRequest;
 import com.example.starter.firmware.domain.ReleaseOrder;
 import com.example.starter.firmware.domain.ReleaseStatus;
 import com.example.starter.firmware.error.ApiException;
+import com.example.starter.firmware.repo.PathBlockedRepository;
 import com.example.starter.firmware.repo.PauseRecordRepository;
 import com.example.starter.firmware.repo.ReleaseRepository;
 import com.example.starter.firmware.repo.ResumeRecordRepository;
@@ -32,17 +36,20 @@ public class ReleaseService {
     private final TaskRepository taskRepository;
     private final PauseRecordRepository pauseRecordRepository;
     private final ResumeRecordRepository resumeRecordRepository;
+    private final PathBlockedRepository pathBlockedRepository;
     private final IdempotencyService idempotency;
     private final Clock clock;
 
     public ReleaseService(ReleaseRepository releaseRepository, TaskRepository taskRepository,
                           PauseRecordRepository pauseRecordRepository,
                           ResumeRecordRepository resumeRecordRepository,
+                          PathBlockedRepository pathBlockedRepository,
                           IdempotencyService idempotency, Clock clock) {
         this.releaseRepository = releaseRepository;
         this.taskRepository = taskRepository;
         this.pauseRecordRepository = pauseRecordRepository;
         this.resumeRecordRepository = resumeRecordRepository;
+        this.pathBlockedRepository = pathBlockedRepository;
         this.idempotency = idempotency;
         this.clock = clock;
     }
@@ -137,6 +144,38 @@ public class ReleaseService {
      */
     public MonitorView monitor(long releaseId) {
         return MonitorView.of(findOrder(releaseId));
+    }
+
+    /**
+     * 跳级开关修改：须携带发布单 expectedVersion，冲突 409；成功版本加一。
+     * 只影响后续拉取，不改写已下发任务；与拉取、回执按发布单行锁提交顺序裁决。
+     */
+    public ReleaseView setSkipLevel(long releaseId, SkipLevelRequest request) {
+        String fingerprint = String.join("|", "release.skipLevel", String.valueOf(releaseId),
+                String.valueOf(request.expectedVersion()), String.valueOf(request.allowSkip()));
+        return idempotency.execute(request.requestId(), "release.skipLevel", fingerprint, () -> {
+            ReleaseOrder order = releaseRepository.findByIdForUpdate(releaseId)
+                    .orElseThrow(() -> ApiException.notFound("RELEASE_NOT_FOUND", "发布单不存在: " + releaseId));
+            if (order.status() == ReleaseStatus.CANCELLED) {
+                throw ApiException.conflict("RELEASE_CANCELLED", "发布单已取消，不能修改跳级开关");
+            }
+            if (order.version() != request.expectedVersion()) {
+                throw ApiException.conflict("VERSION_CONFLICT",
+                        "expectedVersion 与当前版本不一致: " + order.version());
+            }
+            releaseRepository.updateSkipLevel(releaseId, request.expectedVersion(), request.allowSkip());
+            return ReleaseView.of(findOrder(releaseId));
+        }, ReleaseView.class);
+    }
+
+    /**
+     * PATH_BLOCKED 拦截历史（只读，不触发状态变化）。
+     */
+    public PathBlockedHistoryResponse pathBlockedHistory(long releaseId) {
+        findOrder(releaseId);
+        var records = pathBlockedRepository.findByRelease(releaseId).stream()
+                .map(PathBlockedView::of).toList();
+        return new PathBlockedHistoryResponse(releaseId, records);
     }
 
     /**

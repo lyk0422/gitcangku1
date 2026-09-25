@@ -11,12 +11,13 @@ CREATE TABLE IF NOT EXISTS device (
 
 CREATE TABLE IF NOT EXISTS release_order (
   id BIGINT NOT NULL AUTO_INCREMENT COMMENT '发布单ID',
-  version INT NOT NULL COMMENT '发布单版本号，从1开始，每次扩量或人工恢复成功加一',
+  version INT NOT NULL COMMENT '发布单版本号，从1开始，每次扩量、人工恢复或跳级开关修改成功加一',
   model VARCHAR(64) NOT NULL COMMENT '目标设备型号',
   from_version VARCHAR(64) NOT NULL COMMENT '来源固件版本',
   to_version VARCHAR(64) NOT NULL COMMENT '目标固件版本，必须与来源版本不同',
   ratio INT NOT NULL COMMENT '投放比例，取值0~100，只增不减',
   status VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE投放中，PAUSED失败率自动暂停，CANCELLED已取消（终态）',
+  allow_skip BOOLEAN NOT NULL DEFAULT FALSE COMMENT '跳级开关：TRUE允许跳级（拉取时忽略前置链校验直接下发），FALSE按前置链校验；只影响后续拉取',
   sample_floor INT NOT NULL COMMENT '失败率统计样本下限，取值2~100；本轮样本数达到下限才评估暂停',
   failure_threshold_percent INT NOT NULL COMMENT '失败率阈值百分比，取值1~100；FAILED×100>=样本数×阈值时自动暂停',
   monitor_round INT NOT NULL DEFAULT 1 COMMENT '当前监控轮次，从1开始，人工恢复后加一并清零统计',
@@ -71,3 +72,21 @@ CREATE TABLE IF NOT EXISTS idempotency_record (
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   PRIMARY KEY (request_id)
 ) COMMENT='写操作幂等去重记录，失败不占键';
+
+CREATE TABLE IF NOT EXISTS firmware_version (
+  version VARCHAR(64) NOT NULL COMMENT '固件版本标识，登记后不可修改',
+  predecessor_version VARCHAR(64) NULL COMMENT '直接前置版本（至多一个），NULL表示版本链起点；登记后不可修改',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '登记时间',
+  PRIMARY KEY (version)
+) COMMENT='固件版本链登记，前置链接构成从基础版本出发的有向无环链';
+
+CREATE TABLE IF NOT EXISTS path_blocked_record (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '拦截记录ID',
+  release_id BIGINT NOT NULL COMMENT '所属发布单ID',
+  device_id VARCHAR(64) NOT NULL COMMENT '被拦截设备ID',
+  current_version VARCHAR(64) NOT NULL COMMENT '拉取判定时刻的设备当前版本',
+  required_version VARCHAR(64) NOT NULL COMMENT '下一个必须安装的中间版本',
+  target_version VARCHAR(64) NOT NULL COMMENT '本次不下发的目标任务版本',
+  blocked_at_utc VARCHAR(40) NOT NULL COMMENT '拦截时刻，UTC，ISO-8601格式（如2026-09-25T02:00:00Z）',
+  PRIMARY KEY (id)
+) COMMENT='PATH_BLOCKED 拦截历史，只增不改；不建任务、不计失败率样本、不改设备状态';

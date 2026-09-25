@@ -23,10 +23,11 @@ public class ReleaseRepository {
             rs.getLong("id"), rs.getInt("version"), rs.getString("model"),
             rs.getString("from_version"), rs.getString("to_version"),
             rs.getInt("ratio"), ReleaseStatus.valueOf(rs.getString("status")),
+            rs.getBoolean("allow_skip"),
             rs.getInt("sample_floor"), rs.getInt("failure_threshold_percent"),
             rs.getInt("monitor_round"), rs.getInt("round_success"), rs.getInt("round_failed"));
 
-    private static final String COLUMNS = "id, version, model, from_version, to_version, ratio, status,"
+    private static final String COLUMNS = "id, version, model, from_version, to_version, ratio, status, allow_skip,"
             + " sample_floor, failure_threshold_percent, monitor_round, round_success, round_failed";
 
     private final JdbcTemplate jdbc;
@@ -116,5 +117,14 @@ public class ReleaseRepository {
                 + " monitor_round = monitor_round + 1, round_success = 0, round_failed = 0,"
                 + " updated_at = CURRENT_TIMESTAMP"
                 + " WHERE id = ? AND version = ? AND status = 'PAUSED'", id, expectedVersion);
+    }
+
+    /**
+     * 跳级开关修改：仅当版本匹配且未终结时生效，成功版本加一；只影响后续拉取，不改写已下发任务。
+     */
+    public int updateSkipLevel(long id, int expectedVersion, boolean allowSkip) {
+        return jdbc.update("UPDATE release_order SET allow_skip = ?, version = version + 1,"
+                + " updated_at = CURRENT_TIMESTAMP"
+                + " WHERE id = ? AND version = ? AND status <> 'CANCELLED'", allowSkip, id, expectedVersion);
     }
 }
