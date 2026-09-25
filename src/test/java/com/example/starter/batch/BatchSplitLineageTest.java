@@ -317,15 +317,23 @@ class BatchSplitLineageTest {
         assertFalse(available.contains(grandChild));
         assertFalse(available.contains(grandSibling));
 
-        // 后代自身状态不改写，不伪造成曾直接召回
+        // 后代自身状态：已放行后代在召回同事务内标记为 PENDING_DISPOSAL，
+        // 其余后代状态不改写，也不伪造成曾直接召回
         assertEquals("SPLIT", currentStatus(child));
-        assertEquals("RELEASED", currentStatus(sibling));
+        assertEquals("PENDING_DISPOSAL", currentStatus(sibling));
         assertEquals("PENDING_RELEASE", currentStatus(grandChild));
         assertEquals(1, jdbc.queryForObject("SELECT COUNT(*) FROM recall", Integer.class));
         MvcResult childHistory = mockMvc.perform(get("/api/batches/" + child + "/history"))
                 .andExpect(status().isOk()).andReturn();
         assertTrue(objectMapper.readTree(childHistory.getResponse().getContentAsString())
                 .path("recall").isNull());
+        MvcResult siblingHistory = mockMvc.perform(get("/api/batches/" + sibling + "/history"))
+                .andExpect(status().isOk()).andReturn();
+        // 待处置后代自身没有召回记录，血缘与历史不被删除或改写
+        assertTrue(objectMapper.readTree(siblingHistory.getResponse().getContentAsString())
+                .path("recall").isNull());
+        assertEquals(2, objectMapper.readTree(siblingHistory.getResponse().getContentAsString())
+                .path("approvals").size());
 
         // 禁止后代新增检验、批准和拆分 → 422
         submitTest(grandChild, "t1", "PASS", "insp-5", 422);
@@ -432,8 +440,8 @@ class BatchSplitLineageTest {
         int recall = results.get(1).get(30, TimeUnit.SECONDS);
         assertEquals(201, recall, "SPLIT 根批始终可召回");
         if (finalApproval == 201) {
-            // 批准先提交：子批 RELEASED，随后召回使其不可用但状态不改写
-            assertEquals("RELEASED", currentStatus(child));
+            // 批准先提交：子批曾 RELEASED，随后召回在同一事务内将其标记为待处置，不再可用
+            assertEquals("PENDING_DISPOSAL", currentStatus(child));
             assertFalse(availableKeys().contains(child));
         } else {
             // 召回先提交：后代新增批准被拦截 422，子批停留 RELEASE_REVIEW

@@ -5,7 +5,10 @@ import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
 import com.example.starter.batch.dto.LineageEntryResponse;
+import com.example.starter.batch.dto.RecallClosureResponse;
 import com.example.starter.batch.dto.RecallRequest;
+import com.example.starter.batch.dto.ReworkChainResponse;
+import com.example.starter.batch.dto.ReworkRequest;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
 import jakarta.validation.Valid;
@@ -107,11 +110,37 @@ public class BatchController {
     }
 
     /**
-     * 后代查询：按拆分创建顺序展开，含各批自身状态及导致不可用的召回祖先。
+     * 后代查询：按血缘创建顺序展开（含 SPLIT 与 REWORK 边），含各批自身状态及导致不可用的召回祖先。
      */
     @GetMapping("/{batchKey}/descendants")
     public List<LineageEntryResponse> descendants(@PathVariable String batchKey) {
         return service.listDescendants(batchKey);
+    }
+
+    /**
+     * 返工重投：REJECTED 批次提交 reworkKey 与返工说明，生成代次加一的新返工批次，
+     * 原批次转为 REWORKED 终态。
+     */
+    @PostMapping("/{batchKey}/rework")
+    public ResponseEntity<String> rework(@PathVariable String batchKey,
+                                         @Valid @RequestBody ReworkRequest request) {
+        return stored(service.rework(batchKey, request));
+    }
+
+    /**
+     * 返工链明细：沿 REWORK 边从链头（代次 0）到最新返工产物。
+     */
+    @GetMapping("/{batchKey}/rework-chain")
+    public ReworkChainResponse reworkChain(@PathVariable String batchKey) {
+        return service.reworkChain(batchKey);
+    }
+
+    /**
+     * 召回闭包查询：目标批次（或其最近召回祖先）被召回时沿 SPLIT/REWORK 边向下的全部受影响批次。
+     */
+    @GetMapping("/{batchKey}/recall-closure")
+    public RecallClosureResponse recallClosure(@PathVariable String batchKey) {
+        return service.recallClosure(batchKey);
     }
 
     private ResponseEntity<String> stored(StoredResponse response) {

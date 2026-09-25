@@ -4,8 +4,12 @@ package com.example.starter.batch;
  * 批次状态机。
  * QUARANTINED 初始隔离；全部必做检验项 PASS 后进入 PENDING_RELEASE；
  * 首个有效批准进入 RELEASE_REVIEW；第二个不同角色批准进入 RELEASED；
- * 任一 FAIL 立即进入 REJECTED（终态）；已放行批次召回后进入 RECALLED（终态）；
- * RELEASED 批次拆分后进入 SPLIT（终态，父批不再可用，可整体召回）。
+ * 任一 FAIL 立即进入 REJECTED（不合格待处置，可返工重投一次）；
+ * 已放行批次召回后进入 RECALLED（终态）；
+ * RELEASED 批次拆分后进入 SPLIT（终态，父批不再可用，可整体召回）；
+ * REJECTED 批次返工重投后原批次进入 REWORKED（终态，不可再放行、拆分或合批），
+ * 同时生成代次加一的新返工批次；
+ * 已放行后代在祖先被召回的同一事务内进入 PENDING_DISPOSAL（待处置终态，不可再放行、拆分或返工）。
  */
 public enum BatchStatus {
     QUARANTINED,
@@ -14,5 +18,7 @@ public enum BatchStatus {
     RELEASED,
     REJECTED,
     RECALLED,
-    SPLIT
+    SPLIT,
+    REWORKED,
+    PENDING_DISPOSAL
 }
