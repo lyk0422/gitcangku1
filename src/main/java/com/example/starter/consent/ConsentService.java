@@ -1,5 +1,7 @@
 package com.example.starter.consent;
 
+import java.time.Clock;
+import java.time.Instant;
 import java.util.Optional;
 
 import org.springframework.dao.DuplicateKeyException;
@@ -12,6 +14,7 @@ import com.example.starter.consent.dto.GrantResponse;
 import com.example.starter.consent.dto.RecordResponse;
 import com.example.starter.consent.dto.RecordWriteRequest;
 import com.example.starter.consent.dto.RevokeRequest;
+import com.example.starter.consent.dto.RevokeResponse;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
@@ -21,6 +24,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  * <p>幂等规则：成功结果与业务变更同事务保存；同一 requestId 相同参数重试返回原结果，
  * 参数变更返回 409；失败请求不占用 requestId。写入重放不得绕过授权状态：
  * 即使 requestId 命中幂等记录，只要所属代次已撤回，仍返回 410。
+ *
+ * <p>撤回与保留冻结：撤回本身从不物理删除数据；撤回时若该代次存在生效保留冻结，
+ * 响应报告被保留记录数，后续清除操作必须保留该代次数据直至冻结到期或解除。
  */
 @Service
 public class ConsentService {
@@ -38,14 +44,20 @@ public class ConsentService {
 
     private final ConsentRepository consentRepository;
     private final IdempotencyRepository idempotencyRepository;
+    private final RetentionHoldRepository retentionHoldRepository;
     private final ObjectMapper objectMapper;
+    private final Clock clock;
 
     public ConsentService(ConsentRepository consentRepository,
                           IdempotencyRepository idempotencyRepository,
-                          ObjectMapper objectMapper) {
+                          RetentionHoldRepository retentionHoldRepository,
+                          ObjectMapper objectMapper,
+                          Clock clock) {
         this.consentRepository = consentRepository;
         this.idempotencyRepository = idempotencyRepository;
+        this.retentionHoldRepository = retentionHoldRepository;
         this.objectMapper = objectMapper;
+        this.clock = clock;
     }
 
     /**
@@ -139,13 +151,14 @@ public class ConsentService {
 
     /**
      * 撤回：指定代次只允许从有效变为已撤回；撤回提交后旧代查询立即返回 410，写入被拒绝。
+     * 撤回不物理删除数据；存在生效保留冻结时响应报告被保留记录数。
      */
     @Transactional
-    public GrantResponse revoke(RevokeRequest request) {
+    public RevokeResponse revoke(RevokeRequest request) {
         String fingerprint = OP_REVOKE + "|" + request.subjectKey() + "|" + request.purpose() + "|" + request.epoch();
         Optional<IdempotencyRow> replayed = checkReplay(request.requestId(), fingerprint);
         if (replayed.isPresent()) {
-            return readSnapshot(replayed.get().responseBody(), GrantResponse.class);
+            return readSnapshot(replayed.get().responseBody(), RevokeResponse.class);
         }
 
         consentRepository.findGrant(request.subjectKey(), request.purpose(), request.epoch())
@@ -154,8 +167,15 @@ public class ConsentService {
         if (!revoked) {
             throw ApiException.conflict(CODE_GRANT_ALREADY_REVOKED, "授权代次已撤回");
         }
-        GrantResponse response = new GrantResponse(request.subjectKey(), request.purpose(),
-                request.epoch(), GrantStatus.REVOKED);
+        // 存在生效冻结时该代次数据不得物理清除，报告被保留记录数
+        long retainedRecordCount = 0;
+        if (retentionHoldRepository.hasActiveHold(request.subjectKey(), request.purpose(),
+                request.epoch(), Instant.now(clock))) {
+            retainedRecordCount = consentRepository.countRecords(
+                    request.subjectKey(), request.purpose(), request.epoch());
+        }
+        RevokeResponse response = new RevokeResponse(request.subjectKey(), request.purpose(),
+                request.epoch(), GrantStatus.REVOKED, retainedRecordCount);
         storeSuccess(request.requestId(), OP_REVOKE, fingerprint, response);
         return response;
     }
