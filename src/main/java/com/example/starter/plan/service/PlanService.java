@@ -18,6 +18,8 @@ import com.example.starter.plan.web.dto.RescheduleChainResponse;
 import com.example.starter.plan.web.dto.RescheduleRequest;
 import com.example.starter.plan.web.dto.RescheduleResponse;
 import com.example.starter.plan.web.dto.UpdateOccupanciesRequest;
+import com.example.starter.workblock.service.WorkBlockService;
+import com.example.starter.workblock.web.dto.AffectedPlanView;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -60,13 +62,16 @@ public class PlanService {
 
     private final PlanRepository planRepo;
     private final IdempotencyRepository idemRepo;
+    private final WorkBlockService workBlockService;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate tx;
 
     public PlanService(PlanRepository planRepo, IdempotencyRepository idemRepo,
+                       WorkBlockService workBlockService,
                        ObjectMapper objectMapper, PlatformTransactionManager txManager) {
         this.planRepo = planRepo;
         this.idemRepo = idemRepo;
+        this.workBlockService = workBlockService;
         this.objectMapper = objectMapper;
         this.tx = new TransactionTemplate(txManager);
     }
@@ -161,6 +166,8 @@ public class PlanService {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "存在时隙冲突，计划保持草稿", conflicts);
                 }
+                // 与生效施工占用窗口的联合校验（计划完整后态）
+                rejectWorkBlockConflicts(scheduleKey, occupancies);
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(plan.id(), PlanStatus.PUBLISHED, now);
                 PlanResponse response = loadPlan(scheduleKey);
@@ -183,6 +190,7 @@ public class PlanService {
         }
         try {
             return tx.execute(status -> {
+                planRepo.acquirePublishLock();
                 DayPlan plan = planRepo.findByKeyForUpdate(scheduleKey)
                         .orElseThrow(() -> notFound(scheduleKey));
                 if (plan.status() != PlanStatus.PUBLISHED) {
@@ -258,8 +266,10 @@ public class PlanService {
                         List.of(newPlan.id(), oldPlan.id())));
                 if (!conflicts.isEmpty()) {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
-                            "新草稿存在时隙冲突，改签未生效", conflicts);
+                            "新草稿与已发布时隙冲突，改签未生效", conflicts);
                 }
+                // 与生效施工占用窗口的联合校验（新计划完整后态）
+                rejectWorkBlockConflicts(req.newScheduleKey(), occupancies);
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(oldPlan.id(), PlanStatus.CANCELLED, now);
                 planRepo.updateStatus(newPlan.id(), PlanStatus.PUBLISHED, now);
@@ -450,6 +460,37 @@ public class PlanService {
             }
         }
         return conflicts;
+    }
+
+    /**
+     * 计划发布/改签与生效施工窗口的联合校验：计划完整后态任一区段占用与生效窗口相交即 422，
+     * details 首项为首个冲突区段和窗口；调用方处于全局发布锁事务内，抛出即整单回滚。
+     */
+    private void rejectWorkBlockConflicts(String scheduleKey, List<Occupancy> occupancies) {
+        List<AffectedPlanView> windowConflicts =
+                workBlockService.findConflictsWithActiveWindows(scheduleKey, occupancies);
+        if (windowConflicts.isEmpty()) {
+            return;
+        }
+        List<Map<String, Object>> details = new ArrayList<>();
+        for (AffectedPlanView c : windowConflicts) {
+            Map<String, Object> detail = new LinkedHashMap<>();
+            detail.put("type", "WORK_BLOCK_CONFLICT");
+            detail.put("scheduleKey", scheduleKey);
+            detail.put("sectionId", c.sectionId());
+            detail.put("workKey", c.workKey());
+            detail.put("windowStart", c.windowStart().toString());
+            detail.put("windowEnd", c.windowEnd().toString());
+            detail.put("trainNo", c.trainNo());
+            detail.put("startUtc", c.startUtc().toString());
+            detail.put("endUtc", c.endUtc().toString());
+            details.add(detail);
+        }
+        AffectedPlanView first = windowConflicts.get(0);
+        throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "WORK_BLOCK_CONFLICT",
+                "计划占用与生效施工窗口相交，首个冲突区段: " + first.sectionId()
+                        + "，冲突窗口: " + first.workKey(),
+                details);
     }
 
     /**
