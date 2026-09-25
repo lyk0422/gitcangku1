@@ -34,13 +34,16 @@ public class ObservationService {
     private static final String SEPARATOR = "\u0001";
 
     private final ObservationRepository observationRepository;
+    private final QualityFlagRepository qualityFlagRepository;
     private final RequestLogRepository requestLogRepository;
     private final ObjectMapper objectMapper;
 
     public ObservationService(ObservationRepository observationRepository,
+                              QualityFlagRepository qualityFlagRepository,
                               RequestLogRepository requestLogRepository,
                               ObjectMapper objectMapper) {
         this.observationRepository = observationRepository;
+        this.qualityFlagRepository = qualityFlagRepository;
         this.requestLogRepository = requestLogRepository;
         this.objectMapper = objectMapper;
     }
@@ -65,7 +68,7 @@ public class ObservationService {
             throw ApiException.conflict("observation already exists: " + request.observationId(), null);
         }
         ObservationSnapshot snapshot = new ObservationSnapshot(request.observationId(), 1,
-                request.location(), request.reading(), request.note(), false);
+                request.location(), request.reading(), request.note(), 100, false);
         try {
             observationRepository.insertCurrent(snapshot);
         } catch (DuplicateKeyException e) {
@@ -112,14 +115,16 @@ public class ObservationService {
         }
 
         ObservationSnapshot merged = new ObservationSnapshot(observationId, current.version(),
-                mergedLocation, mergedReading, mergedNote, false);
+                mergedLocation, mergedReading, mergedNote, current.confidence(), false);
         if (sameContent(merged, current)) {
             // 合并结果与当前完全相同：返回当前版本，不加版本
             return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(current));
         }
         ObservationSnapshot next = new ObservationSnapshot(observationId, current.version() + 1,
-                mergedLocation, mergedReading, mergedNote, false);
+                mergedLocation, mergedReading, mergedNote, current.confidence(), false);
         observationRepository.updateCurrent(next);
+        // 产生新版本：绑定旧版本的待复核标记同事务转 STALE，不再可复核也不影响新版本
+        qualityFlagRepository.stalePendingFlagsForVersion(observationId, current.version());
         observationRepository.insertVersion(next);
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(next));
     }
@@ -148,8 +153,10 @@ public class ObservationService {
             throw ApiException.conflict("expectedVersion mismatch", current.version());
         }
         ObservationSnapshot tombstone = new ObservationSnapshot(observationId, current.version() + 1,
-                null, null, null, true);
-        observationRepository.markDeleted(observationId, tombstone.version());
+                null, null, null, current.confidence(), true);
+        observationRepository.markDeleted(observationId, tombstone.version(), tombstone.confidence());
+        // 删除产生墓碑新版本：绑定旧版本的待复核标记同事务转 STALE
+        qualityFlagRepository.stalePendingFlagsForVersion(observationId, current.version());
         observationRepository.insertVersion(tombstone);
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(tombstone));
     }

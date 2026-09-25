@@ -38,6 +38,8 @@ class ObservationApiTest {
 
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM quality_flag_review");
+        jdbcTemplate.update("DELETE FROM quality_flag");
         jdbcTemplate.update("DELETE FROM request_log");
         jdbcTemplate.update("DELETE FROM observation_version");
         jdbcTemplate.update("DELETE FROM observation_current");

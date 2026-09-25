@@ -8,6 +8,7 @@ package com.example.starter.observation;
  * @param location      观测地点（可编辑字段）；删除墓碑版本为 null
  * @param reading       观测读数，十进制字符串，最多三位小数，比较按数值；删除墓碑版本为 null
  * @param note          观测备注（可编辑字段）；删除墓碑版本为 null
+ * @param confidence    该版本置信度，初始 100；历史快照一旦写入不再因后续版本或复核被改写
  * @param deleted       是否为删除墓碑：true 时业务字段无意义
  */
 public record ObservationSnapshot(
@@ -16,5 +17,6 @@ public record ObservationSnapshot(
         String location,
         String reading,
         String note,
+        int confidence,
         boolean deleted) {
 }

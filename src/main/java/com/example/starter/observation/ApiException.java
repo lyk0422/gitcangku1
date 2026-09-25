@@ -47,6 +47,13 @@ public class ApiException extends RuntimeException {
     }
 
     /**
+     * 403：复核角色与标记提交角色相同，禁止复核。
+     */
+    public static ApiException forbidden(String message) {
+        return new ApiException(HttpStatus.FORBIDDEN, message, null, null);
+    }
+
+    /**
      * 409：通用冲突（记录已存在、删除版本不匹配、requestId 异参复用）。
      */
     public static ApiException conflict(String message, Integer currentVersion) {
@@ -63,9 +70,16 @@ public class ApiException extends RuntimeException {
     }
 
     /**
-     * 410：记录已删除，拒绝新的修改和删除。
+     * 410：记录已删除，或标记绑定版本已失效，拒绝新的修改、删除与复核。
      */
     public static ApiException gone(String message) {
         return new ApiException(HttpStatus.GONE, message, null, null);
+    }
+
+    /**
+     * 410：携带服务端当前版本号（如标记复核时观测已产生新版本）。
+     */
+    public static ApiException gone(String message, Integer currentVersion) {
+        return new ApiException(HttpStatus.GONE, message, null, currentVersion);
     }
 }
