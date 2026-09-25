@@ -5,8 +5,13 @@ import com.example.starter.api.dto.DependencySpec;
 import com.example.starter.api.dto.DependencyView;
 import com.example.starter.api.dto.LockEntryResponse;
 import com.example.starter.api.dto.LockFileResponse;
+import com.example.starter.api.dto.LockMirrorView;
 import com.example.starter.api.dto.LockRequest;
+import com.example.starter.api.dto.MirrorFailoverResponse;
+import com.example.starter.api.dto.MirrorSpec;
+import com.example.starter.api.dto.MirrorView;
 import com.example.starter.api.dto.RegisterArtifactRequest;
+import com.example.starter.api.dto.RegisterMirrorsRequest;
 import com.example.starter.domain.ArtifactVersion;
 import com.example.starter.domain.DependencyRange;
 import com.example.starter.domain.LockResolver;
@@ -15,7 +20,10 @@ import com.example.starter.repo.RepositoryDao;
 import com.example.starter.repo.RepositoryDao.IdempotentRecord;
 import com.example.starter.repo.RepositoryDao.LockEntryRow;
 import com.example.starter.repo.RepositoryDao.LockFileRow;
+import com.example.starter.repo.RepositoryDao.LockMirrorRow;
+import com.example.starter.repo.RepositoryDao.MirrorRow;
 import com.example.starter.support.ApiException;
+import com.fasterxml.jackson.databind.JavaType;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
@@ -45,10 +53,16 @@ public class ArtifactServiceImpl implements ArtifactService {
 
     private static final int MAX_NAMES = 20;
     private static final int MAX_VERSIONS_PER_NAME = 5;
+    private static final int MAX_MIRRORS_PER_VERSION = 3;
 
     private static final String OP_REGISTER = "REGISTER_ARTIFACT";
     private static final String OP_WITHDRAW = "WITHDRAW_ARTIFACT";
     private static final String OP_LOCK = "CREATE_LOCK";
+    private static final String OP_REGISTER_MIRROR = "REGISTER_MIRROR";
+    private static final String OP_MIRROR_AVAILABILITY = "SET_MIRROR_AVAILABILITY";
+
+    private static final JavaType MIRROR_VIEW_LIST = com.fasterxml.jackson.databind.type.TypeFactory
+            .defaultInstance().constructCollectionType(List.class, MirrorView.class);
 
     private final RepositoryDao repositoryDao;
     private final TransactionTemplate transactionTemplate;
@@ -84,6 +98,74 @@ public class ArtifactServiceImpl implements ArtifactService {
         String hash = sha256(OP_WITHDRAW + "|" + name.trim() + "|" + version);
         return executeIdempotent(requestId, OP_WITHDRAW, hash, 200,
                 () -> doWithdraw(name.trim(), version), ArtifactResponse.class);
+    }
+
+    @Override
+    public List<MirrorView> registerMirrors(String requestId, String name, int version,
+                                            RegisterMirrorsRequest request) {
+        requireRequestId(requestId);
+        validateMirrorRequest(request);
+        String hash = sha256(OP_REGISTER_MIRROR + "|" + name.trim() + "|" + version + "|"
+                + canonicalMirrors(request));
+        return executeIdempotent(requestId, OP_REGISTER_MIRROR, hash, 201,
+                () -> doRegisterMirrors(name.trim(), version, request), MIRROR_VIEW_LIST);
+    }
+
+    @Override
+    public MirrorView setMirrorAvailability(String requestId, String name, int version,
+                                            String mirrorId, boolean available) {
+        requireRequestId(requestId);
+        if (name == null || name.isBlank()) {
+            throw ApiException.badRequest("name 不能为空");
+        }
+        if (mirrorId == null || mirrorId.isBlank()) {
+            throw ApiException.badRequest("mirrorId 不能为空");
+        }
+        String hash = sha256(OP_MIRROR_AVAILABILITY + "|" + name.trim() + "|" + version + "|"
+                + mirrorId.trim() + "|" + available);
+        return executeIdempotent(requestId, OP_MIRROR_AVAILABILITY, hash, 200,
+                () -> doSetMirrorAvailability(name.trim(), version, mirrorId.trim(), available),
+                MirrorView.class);
+    }
+
+    @Override
+    public List<MirrorView> listMirrors(String name, int version) {
+        ArtifactVersion artifact = repositoryDao.loadArtifact(name, version);
+        if (artifact == null) {
+            throw ApiException.notFound("制品版本不存在: " + name + ":" + version);
+        }
+        return toMirrorViews(repositoryDao.listMirrorsByArtifact(artifact.id()));
+    }
+
+    @Override
+    public MirrorFailoverResponse failoverMirror(long lockFileId, String name) {
+        if (name == null || name.isBlank()) {
+            throw ApiException.badRequest("name 不能为空");
+        }
+        String trimmed = name.trim();
+        if (repositoryDao.getLockFile(lockFileId) == null) {
+            throw ApiException.notFound("锁文件不存在: " + lockFileId);
+        }
+        LockEntryRow entry = repositoryDao.findLockEntry(lockFileId, trimmed);
+        if (entry == null) {
+            throw ApiException.notFound(
+                    "制品名称不在锁文件解析集合中: " + trimmed);
+        }
+        // 单条 SQL 读取锁定版本当前登记的镜像（含可用性），语句级一致快照。
+        List<MirrorRow> mirrors = repositoryDao.listMirrorsOfLockedVersion(lockFileId, trimmed);
+        MirrorRow selected = null;
+        for (MirrorRow row : mirrors) {
+            if (row.available()) {
+                selected = row;
+                break;
+            }
+        }
+        if (selected == null) {
+            throw ApiException.unprocessable(
+                    "制品 " + trimmed + " 锁定版本登记的全部镜像当前均不可用");
+        }
+        return new MirrorFailoverResponse(lockFileId, trimmed, entry.version(),
+                selected.mirrorId(), selected.priority(), toMirrorViews(mirrors));
     }
 
     @Override
@@ -149,8 +231,46 @@ public class ArtifactServiceImpl implements ArtifactService {
                 toDependencyViews(request.dependencies()));
     }
 
-    private ArtifactResponse doWithdraw(String name, int version) {
+    private List<MirrorView> doRegisterMirrors(String name, int version,
+                                               RegisterMirrorsRequest request) {
         ArtifactVersion artifact = repositoryDao.loadArtifact(name, version);
+        if (artifact == null) {
+            throw ApiException.notFound("制品版本不存在: " + name + ":" + version);
+        }
+        int existing = repositoryDao.countMirrors(artifact.id());
+        if (existing + request.mirrors().size() > MAX_MIRRORS_PER_VERSION) {
+            throw ApiException.unprocessable(
+                    "制品版本 " + name + ":" + version + " 的镜像源数量将超过上限 "
+                            + MAX_MIRRORS_PER_VERSION);
+        }
+        Instant now = Instant.now(clock);
+        for (MirrorSpec spec : request.mirrors()) {
+            String mirrorId = spec.mirrorId().trim();
+            if (repositoryDao.findMirror(artifact.id(), mirrorId) != null) {
+                throw ApiException.conflict(
+                        "镜像源已登记: " + name + ":" + version + " -> " + mirrorId);
+            }
+            repositoryDao.insertMirror(artifact.id(), mirrorId, spec.priority(), now);
+        }
+        return toMirrorViews(repositoryDao.listMirrorsByArtifact(artifact.id()));
+    }
+
+    private MirrorView doSetMirrorAvailability(String name, int version,
+                                               String mirrorId, boolean available) {
+        ArtifactVersion artifact = repositoryDao.loadArtifact(name, version);
+        if (artifact == null) {
+            throw ApiException.notFound("制品版本不存在: " + name + ":" + version);
+        }
+        MirrorRow mirror = repositoryDao.findMirror(artifact.id(), mirrorId);
+        if (mirror == null) {
+            throw ApiException.notFound(
+                    "镜像源未登记: " + name + ":" + version + " -> " + mirrorId);
+        }
+        repositoryDao.updateMirrorAvailability(artifact.id(), mirrorId, available);
+        return new MirrorView(mirrorId, mirror.priority(), available);
+    }
+
+    private ArtifactResponse doWithdraw(String name, int version) {        ArtifactVersion artifact = repositoryDao.loadArtifact(name, version);
         if (artifact == null) {
             throw ApiException.notFound("制品版本不存在: " + name + ":" + version);
         }
@@ -198,9 +318,34 @@ public class ArtifactServiceImpl implements ArtifactService {
                 currentRequestId.get(), now);
         solution.forEach((n, v) -> repositoryDao.insertLockEntry(lockFileId, n, v));
 
+        // 固化镜像快照：每个锁定版本按优先级升序、仅保留当前可用镜像；
+        // 过滤后为空不影响锁定成功，后续可用性变更不回写本快照。
         List<LockEntryResponse> entries = new ArrayList<>();
-        solution.forEach((n, v) -> entries.add(new LockEntryResponse(n, v)));
+        solution.forEach((n, v) -> {
+            List<LockMirrorView> mirrors = lockTimeMirrors(lockFileId, n, v);
+            entries.add(new LockEntryResponse(n, v, mirrors));
+        });
         return new LockFileResponse(lockFileId, rootName, rootVersion, currentVersion, now, entries);
+    }
+
+    /**
+     * 计算并持久化某锁定版本的镜像快照，返回按优先级升序的可用镜像清单。
+     * 须在持有仓库行锁的事务内调用，与锁定读取的仓库状态一致。
+     */
+    private List<LockMirrorView> lockTimeMirrors(long lockFileId, String name, int version) {
+        ArtifactVersion artifact = repositoryDao.loadArtifact(name, version);
+        if (artifact == null) {
+            return List.of();
+        }
+        List<LockMirrorView> mirrors = new ArrayList<>();
+        for (MirrorRow row : repositoryDao.listMirrorsByArtifact(artifact.id())) {
+            if (!row.available()) {
+                continue;
+            }
+            repositoryDao.insertLockMirror(lockFileId, name, row.mirrorId(), row.priority());
+            mirrors.add(new LockMirrorView(row.mirrorId(), row.priority()));
+        }
+        return List.copyOf(mirrors);
     }
 
     // ------------------------------------------------------------------
@@ -214,6 +359,12 @@ public class ArtifactServiceImpl implements ArtifactService {
 
     private <T> T executeIdempotent(String requestId, String operation, String requestHash,
                                     int httpStatus, Supplier<T> action, Class<T> responseType) {
+        return executeIdempotent(requestId, operation, requestHash, httpStatus, action,
+                objectMapper.getTypeFactory().constructType(responseType));
+    }
+
+    private <T> T executeIdempotent(String requestId, String operation, String requestHash,
+                                    int httpStatus, Supplier<T> action, JavaType responseType) {
         // 快速路径：已提交的成功记录直接重放。
         T replay = replayIfPresent(requestId, operation, requestHash, responseType);
         if (replay != null) {
@@ -255,7 +406,7 @@ public class ArtifactServiceImpl implements ArtifactService {
      * 存在成功记录时：同操作同参返回原结果；异参（含异操作）返回 409。不存在返回 null。
      */
     private <T> T replayIfPresent(String requestId, String operation, String requestHash,
-                                  Class<T> responseType) {
+                                  JavaType responseType) {
         IdempotentRecord record = repositoryDao.findIdempotentRequest(requestId);
         if (record == null) {
             return null;
@@ -318,15 +469,55 @@ public class ArtifactServiceImpl implements ArtifactService {
     }
 
     private LockFileResponse toLockResponse(LockFileRow row, List<LockEntryRow> entries) {
+        Map<String, List<LockMirrorView>> mirrorsByName = new java.util.HashMap<>();
+        for (LockMirrorRow mirror : repositoryDao.listLockMirrors(row.id())) {
+            mirrorsByName.computeIfAbsent(mirror.name(), k -> new ArrayList<>())
+                    .add(new LockMirrorView(mirror.mirrorId(), mirror.priority()));
+        }
         List<LockEntryResponse> entryViews = entries.stream()
-                .map(e -> new LockEntryResponse(e.name(), e.version()))
+                .map(e -> new LockEntryResponse(e.name(), e.version(),
+                        mirrorsByName.getOrDefault(e.name(), List.of())))
                 .toList();
         return new LockFileResponse(row.id(), row.rootName(), row.rootVersion(),
                 row.repositoryVersion(), row.createdAt(), entryViews);
     }
 
-    private void requireRequestId(String requestId) {
-        if (requestId == null || requestId.isBlank()) {
+    private void validateMirrorRequest(RegisterMirrorsRequest request) {
+        if (request.mirrors() == null || request.mirrors().isEmpty()
+                || request.mirrors().size() > MAX_MIRRORS_PER_VERSION) {
+            throw ApiException.badRequest(
+                    "一次登记 1～" + MAX_MIRRORS_PER_VERSION + " 个镜像源");
+        }
+        Set<String> ids = new HashSet<>();
+        for (MirrorSpec spec : request.mirrors()) {
+            if (spec.mirrorId() == null || spec.mirrorId().isBlank()) {
+                throw ApiException.badRequest("镜像源标识不能为空");
+            }
+            if (spec.priority() < 1) {
+                throw ApiException.badRequest("镜像优先级必须为正整数，1 为最高");
+            }
+            // 同优先级允许共存，按镜像标识字典序确定稳定次序。
+            if (!ids.add(spec.mirrorId().trim())) {
+                throw ApiException.badRequest("镜像源标识重复: " + spec.mirrorId().trim());
+            }
+        }
+    }
+
+    private String canonicalMirrors(RegisterMirrorsRequest request) {
+        return request.mirrors().stream()
+                .map(m -> m.mirrorId().trim() + ":" + m.priority())
+                .sorted()
+                .reduce((a, b) -> a + "," + b)
+                .orElse("");
+    }
+
+    private List<MirrorView> toMirrorViews(List<MirrorRow> rows) {
+        return rows.stream()
+                .map(r -> new MirrorView(r.mirrorId(), r.priority(), r.available()))
+                .toList();
+    }
+
+    private void requireRequestId(String requestId) {        if (requestId == null || requestId.isBlank()) {
             throw ApiException.badRequest("缺少请求头 X-Request-Id");
         }
     }
@@ -339,7 +530,7 @@ public class ArtifactServiceImpl implements ArtifactService {
         }
     }
 
-    private <T> T readJson(String json, Class<T> type) {
+    private <T> T readJson(String json, JavaType type) {
         try {
             return objectMapper.readValue(json, type);
         } catch (Exception e) {

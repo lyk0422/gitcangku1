@@ -35,8 +35,10 @@ class ArtifactControllerHttpTest {
 
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM lock_file_mirror");
         jdbcTemplate.update("DELETE FROM lock_file_entry");
         jdbcTemplate.update("DELETE FROM lock_file");
+        jdbcTemplate.update("DELETE FROM artifact_mirror");
         jdbcTemplate.update("DELETE FROM artifact_dependency");
         jdbcTemplate.update("DELETE FROM artifact");
         jdbcTemplate.update("DELETE FROM idempotent_request");
@@ -217,5 +219,143 @@ class ArtifactControllerHttpTest {
                 new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
                 JsonNode.class);
         assertThat(lockOnWithdrawn.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+    }
+
+    // ------------------------------------------------------------------
+    // 镜像源端点
+    // ------------------------------------------------------------------
+
+    private String mirrorBody(Object... mirrors) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("mirrors", List.of(mirrors));
+        return toJson(body);
+    }
+
+    private Map<String, Object> mirror(String id, int priority) {
+        Map<String, Object> mirror = new LinkedHashMap<>();
+        mirror.put("mirrorId", id);
+        mirror.put("priority", priority);
+        return mirror;
+    }
+
+    private void registerArtifactViaHttp(String name, int version) {
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody(name, version),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+    }
+
+    @Test
+    void mirrorRegistrationLockAndFailoverWorkflow() {
+        registerArtifactViaHttp("app", 1);
+
+        // 登记镜像：201，按优先级升序返回。
+        ResponseEntity<JsonNode> registered = restTemplate.postForEntity(
+                "/api/artifacts/app/versions/1/mirrors",
+                new HttpEntity<>(mirrorBody(mirror("m-slow", 3), mirror("m-fast", 1)),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        assertThat(registered.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(registered.getBody().get(0).path("mirrorId").asText()).isEqualTo("m-fast");
+        assertThat(registered.getBody().get(1).path("mirrorId").asText()).isEqualTo("m-slow");
+
+        // 登记明细查询。
+        ResponseEntity<JsonNode> detail = restTemplate.getForEntity(
+                "/api/artifacts/app/versions/1/mirrors", JsonNode.class);
+        assertThat(detail.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(detail.getBody()).hasSize(2);
+
+        // 锁定：条目固化可用镜像快照。
+        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"expectedRepositoryVersion\":1}";
+        ResponseEntity<JsonNode> lock = restTemplate.postForEntity("/api/artifacts/locks",
+                new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(lock.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        long lockId = lock.getBody().path("id").asLong();
+        JsonNode mirrors = lock.getBody().path("entries").get(0).path("mirrors");
+        assertThat(mirrors).hasSize(2);
+        assertThat(mirrors.get(0).path("mirrorId").asText()).isEqualTo("m-fast");
+
+        // 按锁文件查询镜像清单。
+        ResponseEntity<JsonNode> lockMirrors = restTemplate.getForEntity(
+                "/api/artifacts/locks/{id}/mirrors", JsonNode.class, lockId);
+        assertThat(lockMirrors.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(lockMirrors.getBody().get(0).path("mirrors")).hasSize(2);
+
+        // 故障切换：返回最高优先级可用镜像。
+        ResponseEntity<JsonNode> failover = restTemplate.getForEntity(
+                "/api/artifacts/locks/{id}/mirrors/failover?name=app", JsonNode.class, lockId);
+        assertThat(failover.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(failover.getBody().path("mirrorId").asText()).isEqualTo("m-fast");
+
+        // 标记 m-fast 不可用：故障切换回退到 m-slow，锁文件快照不变。
+        ResponseEntity<JsonNode> toggled = restTemplate.exchange(
+                "/api/artifacts/app/versions/1/mirrors/m-fast/availability",
+                HttpMethod.PUT,
+                new HttpEntity<>("{\"available\":false}",
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        assertThat(toggled.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(toggled.getBody().path("available").asBoolean()).isFalse();
+
+        ResponseEntity<JsonNode> fallback = restTemplate.getForEntity(
+                "/api/artifacts/locks/{id}/mirrors/failover?name=app", JsonNode.class, lockId);
+        assertThat(fallback.getBody().path("mirrorId").asText()).isEqualTo("m-slow");
+        assertThat(restTemplate.getForEntity("/api/artifacts/locks/{id}/mirrors",
+                JsonNode.class, lockId).getBody().get(0).path("mirrors")).hasSize(2);
+
+        // 全部不可用：422。
+        restTemplate.exchange("/api/artifacts/app/versions/1/mirrors/m-slow/availability",
+                HttpMethod.PUT,
+                new HttpEntity<>("{\"available\":false}",
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        ResponseEntity<JsonNode> none = restTemplate.getForEntity(
+                "/api/artifacts/locks/{id}/mirrors/failover?name=app", JsonNode.class, lockId);
+        assertThat(none.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+        assertThat(none.getBody().path("error").asText()).isEqualTo("UNPROCESSABLE_ENTITY");
+
+        // 名称不在锁文件解析集合：404。
+        ResponseEntity<JsonNode> unknown = restTemplate.getForEntity(
+                "/api/artifacts/locks/{id}/mirrors/failover?name=ghost", JsonNode.class, lockId);
+        assertThat(unknown.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+    }
+
+    @Test
+    void mirrorRegistrationIdempotentReplayViaHttp() {
+        registerArtifactViaHttp("app", 1);
+        String rid = UUID.randomUUID().toString();
+        HttpEntity<String> request = new HttpEntity<>(
+                mirrorBody(mirror("m1", 1)), jsonHeaders(rid));
+
+        ResponseEntity<JsonNode> first = restTemplate.postForEntity(
+                "/api/artifacts/app/versions/1/mirrors", request, JsonNode.class);
+        assertThat(first.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        ResponseEntity<JsonNode> replay = restTemplate.postForEntity(
+                "/api/artifacts/app/versions/1/mirrors", request, JsonNode.class);
+        assertThat(replay.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(replay.getBody()).isEqualTo(first.getBody());
+
+        // 同 requestId 异参：409。
+        ResponseEntity<JsonNode> conflict = restTemplate.postForEntity(
+                "/api/artifacts/app/versions/1/mirrors",
+                new HttpEntity<>(mirrorBody(mirror("m2", 1)), jsonHeaders(rid)), JsonNode.class);
+        assertThat(conflict.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+    }
+
+    @Test
+    void mirrorRegistrationOnMissingVersionReturns404() {
+        ResponseEntity<JsonNode> response = restTemplate.postForEntity(
+                "/api/artifacts/ghost/versions/1/mirrors",
+                new HttpEntity<>(mirrorBody(mirror("m1", 1)),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+    }
+
+    @Test
+    void moreThanThreeMirrorsInOneRequestReturns400() {
+        registerArtifactViaHttp("app", 1);
+        ResponseEntity<JsonNode> response = restTemplate.postForEntity(
+                "/api/artifacts/app/versions/1/mirrors",
+                new HttpEntity<>(mirrorBody(mirror("m1", 1), mirror("m2", 2),
+                                mirror("m3", 3), mirror("m4", 4)),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
     }
 }

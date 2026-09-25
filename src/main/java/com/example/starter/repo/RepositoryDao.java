@@ -274,6 +274,131 @@ public class RepositoryDao {
                 lockFileId);
     }
 
+    /** 查询锁文件中指定名称的锁定条目，不存在返回 null。 */
+    public LockEntryRow findLockEntry(long lockFileId, String name) {
+        List<LockEntryRow> rows = jdbcTemplate.query(
+                "SELECT lock_file_id, name, version FROM lock_file_entry "
+                        + "WHERE lock_file_id = ? AND name = ?",
+                (rs, n) -> new LockEntryRow(rs.getLong("lock_file_id"),
+                        rs.getString("name"), rs.getInt("version")),
+                lockFileId, name);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    // ------------------------------------------------------------------
+    // 镜像源
+    // ------------------------------------------------------------------
+
+    /** 镜像源行：登记明细或锁定版本的当前镜像状态。 */
+    public record MirrorRow(String mirrorId, int priority, boolean available) {
+    }
+
+    /** 新增制品版本的镜像登记，默认可用，返回自增主键。 */
+    public long insertMirror(long artifactId, String mirrorId, int priority, Instant createdAt) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbcTemplate.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO artifact_mirror (artifact_id, mirror_id, priority, available, created_at) "
+                            + "VALUES (?, ?, ?, 1, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setLong(1, artifactId);
+            ps.setString(2, mirrorId);
+            ps.setInt(3, priority);
+            ps.setTimestamp(4, Timestamp.from(createdAt));
+            return ps;
+        }, keyHolder);
+        Number key = keyHolder.getKey();
+        if (key == null) {
+            throw new IllegalStateException("插入镜像源未获取自增主键");
+        }
+        return key.longValue();
+    }
+
+    /** 统计制品版本已登记的镜像数量。 */
+    public int countMirrors(long artifactId) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM artifact_mirror WHERE artifact_id = ?",
+                Integer.class, artifactId);
+        return count == null ? 0 : count;
+    }
+
+    /**
+     * 查询制品版本登记的全部镜像（含不可用），按优先级升序、
+     * 同优先级按镜像标识字典序升序。
+     */
+    public List<MirrorRow> listMirrorsByArtifact(long artifactId) {
+        return jdbcTemplate.query(
+                "SELECT mirror_id, priority, available FROM artifact_mirror "
+                        + "WHERE artifact_id = ? ORDER BY priority ASC, mirror_id ASC",
+                (rs, n) -> new MirrorRow(rs.getString("mirror_id"),
+                        rs.getInt("priority"), rs.getInt("available") == 1),
+                artifactId);
+    }
+
+    /** 查询单个镜像登记，不存在返回 null。 */
+    public MirrorRow findMirror(long artifactId, String mirrorId) {
+        List<MirrorRow> rows = jdbcTemplate.query(
+                "SELECT mirror_id, priority, available FROM artifact_mirror "
+                        + "WHERE artifact_id = ? AND mirror_id = ?",
+                (rs, n) -> new MirrorRow(rs.getString("mirror_id"),
+                        rs.getInt("priority"), rs.getInt("available") == 1),
+                artifactId, mirrorId);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /** 条件更新镜像可用性，仅当状态确实变化时返回 1。 */
+    public int updateMirrorAvailability(long artifactId, String mirrorId, boolean available) {
+        return jdbcTemplate.update(
+                "UPDATE artifact_mirror SET available = ? WHERE artifact_id = ? AND mirror_id = ?",
+                ps -> {
+                    ps.setInt(1, available ? 1 : 0);
+                    ps.setLong(2, artifactId);
+                    ps.setString(3, mirrorId);
+                });
+    }
+
+    /** 新增锁文件镜像快照条目。 */
+    public void insertLockMirror(long lockFileId, String name, String mirrorId, int priority) {
+        jdbcTemplate.update(
+                "INSERT INTO lock_file_mirror (lock_file_id, name, mirror_id, priority) "
+                        + "VALUES (?, ?, ?, ?)",
+                lockFileId, name, mirrorId, priority);
+    }
+
+    /** 锁文件镜像快照行。 */
+    public record LockMirrorRow(String name, String mirrorId, int priority) {
+    }
+
+    /**
+     * 查询锁文件固化的全部镜像快照，按名称升序、同名称按优先级与镜像标识升序。
+     */
+    public List<LockMirrorRow> listLockMirrors(long lockFileId) {
+        return jdbcTemplate.query(
+                "SELECT name, mirror_id, priority FROM lock_file_mirror "
+                        + "WHERE lock_file_id = ? ORDER BY name ASC, priority ASC, mirror_id ASC",
+                (rs, n) -> new LockMirrorRow(rs.getString("name"),
+                        rs.getString("mirror_id"), rs.getInt("priority")),
+                lockFileId);
+    }
+
+    /**
+     * 故障切换：在单条 SQL 内连接锁文件条目、制品版本与镜像登记，
+     * 返回该名称锁定版本当前登记的全部镜像（含不可用），按优先级、镜像标识排序。
+     * 语句级读一致性保证不会读到可用性变更的中间状态。
+     */
+    public List<MirrorRow> listMirrorsOfLockedVersion(long lockFileId, String name) {
+        return jdbcTemplate.query(
+                "SELECT m.mirror_id, m.priority, m.available "
+                        + "FROM lock_file_entry e "
+                        + "JOIN artifact a ON a.name = e.name AND a.version = e.version "
+                        + "JOIN artifact_mirror m ON m.artifact_id = a.id "
+                        + "WHERE e.lock_file_id = ? AND e.name = ? "
+                        + "ORDER BY m.priority ASC, m.mirror_id ASC",
+                (rs, n) -> new MirrorRow(rs.getString("mirror_id"),
+                        rs.getInt("priority"), rs.getInt("available") == 1),
+                lockFileId, name);
+    }
+
     private record ArtifactRow(long id, String name, int version, boolean withdrawn) {
     }
 
