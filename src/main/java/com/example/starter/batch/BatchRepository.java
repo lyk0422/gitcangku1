@@ -15,9 +15,11 @@ public class BatchRepository {
 
     /**
      * batch 表行记录；id 同时作为同批次事件的提交顺序依据。
+     * shelfLifeMinutes 创建后不可修改；expiresAt 为当前有效期截止（延期生效时整体顺延）。
      */
     public record BatchRow(long id, String batchKey, String productCode, String batchNo,
-                           String producedAt, String status, String createdAt) {
+                           String producedAt, int shelfLifeMinutes, String expiresAt,
+                           String status, String createdAt) {
     }
 
     /**
@@ -54,10 +56,19 @@ public class BatchRepository {
     public record LineageRow(long id, String parentKey, String childKey, int seq, String createdAt) {
     }
 
+    /**
+     * batch_extension 表行记录：复检延期。PENDING_CONFIRM 待确认；EFFECTIVE 已生效（终态，不可改写）。
+     */
+    public record ExtensionRow(long id, String batchKey, String extensionKey, String retestConclusion,
+                               int extensionMinutes, String retester, String status,
+                               String submittedAt, String confirmedBy, String confirmedRole,
+                               String confirmedAt) {
+    }
+
     private static final RowMapper<BatchRow> BATCH_MAPPER = (rs, n) -> new BatchRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("product_code"),
-            rs.getString("batch_no"), rs.getString("produced_at"),
-            rs.getString("status"), rs.getString("created_at"));
+            rs.getString("batch_no"), rs.getString("produced_at"), rs.getInt("shelf_life_minutes"),
+            rs.getString("expires_at"), rs.getString("status"), rs.getString("created_at"));
 
     private static final RowMapper<TestRow> TEST_MAPPER = (rs, n) -> new TestRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("test_key"),
@@ -81,6 +92,13 @@ public class BatchRepository {
             rs.getLong("id"), rs.getString("parent_key"), rs.getString("child_key"),
             rs.getInt("seq"), rs.getString("created_at"));
 
+    private static final RowMapper<ExtensionRow> EXTENSION_MAPPER = (rs, n) -> new ExtensionRow(
+            rs.getLong("id"), rs.getString("batch_key"), rs.getString("extension_key"),
+            rs.getString("retest_conclusion"), rs.getInt("extension_minutes"),
+            rs.getString("retester"), rs.getString("status"), rs.getString("submitted_at"),
+            rs.getString("confirmed_by"), rs.getString("confirmed_role"),
+            rs.getString("confirmed_at"));
+
     private final JdbcTemplate jdbc;
 
     public BatchRepository(JdbcTemplate jdbc) {
@@ -101,10 +119,11 @@ public class BatchRepository {
     }
 
     public void insertBatch(BatchRow row) {
-        jdbc.update("INSERT INTO batch (batch_key, product_code, batch_no, produced_at, status, created_at)"
-                        + " VALUES (?, ?, ?, ?, ?, ?)",
+        jdbc.update("INSERT INTO batch (batch_key, product_code, batch_no, produced_at,"
+                        + " shelf_life_minutes, expires_at, status, created_at)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 row.batchKey(), row.productCode(), row.batchNo(), row.producedAt(),
-                row.status(), row.createdAt());
+                row.shelfLifeMinutes(), row.expiresAt(), row.status(), row.createdAt());
     }
 
     public void insertRequiredTest(String batchKey, String testItem, int seq) {
@@ -208,5 +227,52 @@ public class BatchRepository {
     public List<String> findRecalledKeys() {
         return jdbc.queryForList("SELECT batch_key FROM batch WHERE status = 'RECALLED'",
                 String.class);
+    }
+
+    /**
+     * 整体顺延批次有效期截止（延期生效时同事务调用）；保质分钟本身不可改写。
+     */
+    public void updateExpiresAt(String batchKey, String expiresAt) {
+        jdbc.update("UPDATE batch SET expires_at = ? WHERE batch_key = ?", expiresAt, batchKey);
+    }
+
+    /**
+     * 当前已到期的批次（expires_at <= canonicalNow），按 id 稳定排序；仅用于查询标识，不改写状态。
+     */
+    public List<BatchRow> findExpiredBatches(String canonicalNow) {
+        return jdbc.query("SELECT * FROM batch WHERE expires_at <= ? ORDER BY id",
+                BATCH_MAPPER, canonicalNow);
+    }
+
+    public Optional<ExtensionRow> findExtension(String batchKey, String extensionKey) {
+        return jdbc.query("SELECT * FROM batch_extension WHERE batch_key = ? AND extension_key = ?",
+                        EXTENSION_MAPPER, batchKey, extensionKey)
+                .stream().findFirst();
+    }
+
+    /**
+     * 某批次全部延期记录（含待确认与已生效），按 id 稳定排序。
+     */
+    public List<ExtensionRow> findExtensions(String batchKey) {
+        return jdbc.query("SELECT * FROM batch_extension WHERE batch_key = ? ORDER BY id",
+                EXTENSION_MAPPER, batchKey);
+    }
+
+    public void insertExtension(ExtensionRow row) {
+        jdbc.update("INSERT INTO batch_extension (batch_key, extension_key, retest_conclusion,"
+                        + " extension_minutes, retester, status, submitted_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                row.batchKey(), row.extensionKey(), row.retestConclusion(), row.extensionMinutes(),
+                row.retester(), row.status(), row.submittedAt());
+    }
+
+    /**
+     * 延期生效：同一事务内把待确认记录置为 EFFECTIVE 并写入确认人信息；生效后不再修改。
+     */
+    public void markExtensionEffective(String batchKey, String extensionKey, String confirmedBy,
+                                       String confirmedRole, String confirmedAt) {
+        jdbc.update("UPDATE batch_extension SET status = 'EFFECTIVE', confirmed_by = ?,"
+                        + " confirmed_role = ?, confirmed_at = ?"
+                        + " WHERE batch_key = ? AND extension_key = ?",
+                confirmedBy, confirmedRole, confirmedAt, batchKey, extensionKey);
     }
 }

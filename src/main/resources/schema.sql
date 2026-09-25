@@ -5,6 +5,8 @@ CREATE TABLE IF NOT EXISTS batch (
     product_code VARCHAR(64) NOT NULL COMMENT '产品编码，创建后不可修改',
     batch_no VARCHAR(64) NOT NULL COMMENT '批号，创建后不可修改',
     produced_at VARCHAR(40) NOT NULL COMMENT '生产时间，ISO-8601 UTC  instant 字符串',
+    shelf_life_minutes INT NOT NULL COMMENT '保质分钟，正整数，创建后不可修改；子批继承父批保质分钟',
+    expires_at VARCHAR(40) NOT NULL COMMENT '当前有效期截止，ISO-8601 UTC 毫秒精度字符串；初始为生产时间+保质分钟，延期生效时整体顺延',
     status VARCHAR(32) NOT NULL COMMENT '批次状态：QUARANTINED/PENDING_RELEASE/RELEASE_REVIEW/RELEASED/REJECTED/RECALLED/SPLIT',
     created_at VARCHAR(40) NOT NULL COMMENT '创建时间，ISO-8601 UTC instant 字符串',
     CONSTRAINT uk_batch_key UNIQUE (batch_key)
@@ -48,7 +50,7 @@ CREATE TABLE IF NOT EXISTS recall (
 );
 
 CREATE TABLE IF NOT EXISTS command_log (
-    command_type VARCHAR(32) NOT NULL COMMENT '命令类型：CREATE_BATCH/SUBMIT_TEST/APPROVE/RECALL/SPLIT',
+    command_type VARCHAR(32) NOT NULL COMMENT '命令类型：CREATE_BATCH/SUBMIT_TEST/APPROVE/RECALL/SPLIT/EXTENSION_SUBMIT/EXTENSION_CONFIRM',
     command_key VARCHAR(64) NOT NULL COMMENT '命令幂等键；同类型同键同参重放返回首次结果，同键改参返回 409',
     fingerprint VARCHAR(64) NOT NULL COMMENT '业务参数（不含 commandKey）的 SHA-256 摘要，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行成功的 HTTP 状态码',
@@ -65,4 +67,21 @@ CREATE TABLE IF NOT EXISTS batch_lineage (
     seq INT NOT NULL COMMENT '子批在拆分请求中的顺序，从 1 开始',
     created_at VARCHAR(40) NOT NULL COMMENT '拆分时间，ISO-8601 UTC instant 字符串',
     CONSTRAINT uk_lineage_child UNIQUE (child_key)
+);
+
+-- 复检延期：提交时落 PENDING_CONFIRM 行，确认人生效后置 EFFECTIVE 并整体顺延有效期；
+-- 生效后的记录不可改写，祖先召回不删除记录，仅使后代延期一律 422 且不再恢复可用。
+CREATE TABLE IF NOT EXISTS batch_extension (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键，同时作为延期历史排序依据',
+    batch_key VARCHAR(64) NOT NULL COMMENT '目标批次业务键',
+    extension_key VARCHAR(64) NOT NULL COMMENT '延期业务键，同一批次内唯一，最多生效一次',
+    retest_conclusion VARCHAR(16) NOT NULL COMMENT '本次复检结论：PASS=合格/FAIL=不合格；仅合格允许提交',
+    extension_minutes INT NOT NULL COMMENT '本次顺延分钟，1～43200；生效后累加进批次有效期',
+    retester VARCHAR(64) NOT NULL COMMENT '复检人标识，须不同于该批次全部批准人',
+    status VARCHAR(16) NOT NULL COMMENT '延期状态：PENDING_CONFIRM=待确认/EFFECTIVE=已生效（终态，不可改写）',
+    submitted_at VARCHAR(40) NOT NULL COMMENT '延期提交时间，ISO-8601 UTC instant 字符串',
+    confirmed_by VARCHAR(64) NULL COMMENT '确认人标识（批准角色），须不同于复检人；未生效时为 NULL',
+    confirmed_role VARCHAR(32) NULL COMMENT '确认人批准角色：QUALITY/OPERATIONS；未生效时为 NULL',
+    confirmed_at VARCHAR(40) NULL COMMENT '生效时间，ISO-8601 UTC instant 字符串；未生效时为 NULL',
+    CONSTRAINT uk_extension_key UNIQUE (batch_key, extension_key)
 );

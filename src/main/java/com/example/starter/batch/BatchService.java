@@ -4,12 +4,17 @@ import com.example.starter.batch.dto.ApprovalResponse;
 import com.example.starter.batch.dto.ApproveRequest;
 import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
+import com.example.starter.batch.dto.ConfirmExtensionRequest;
 import com.example.starter.batch.dto.CreateBatchRequest;
+import com.example.starter.batch.dto.ExpiredBatchResponse;
+import com.example.starter.batch.dto.ExtensionResponse;
 import com.example.starter.batch.dto.LineageEntryResponse;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.RecallResponse;
+import com.example.starter.batch.dto.ShelfLifeResponse;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SplitResponse;
+import com.example.starter.batch.dto.SubmitExtensionRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
 import com.example.starter.batch.dto.TestResultResponse;
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -22,7 +27,11 @@ import org.springframework.transaction.support.TransactionTemplate;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -50,6 +59,8 @@ public class BatchService {
     private static final String CMD_APPROVE = "APPROVE";
     private static final String CMD_RECALL = "RECALL";
     private static final String CMD_SPLIT = "SPLIT";
+    private static final String CMD_EXT_SUBMIT = "EXTENSION_SUBMIT";
+    private static final String CMD_EXT_CONFIRM = "EXTENSION_CONFIRM";
 
     /**
      * 指纹拼接分隔符（NUL）：业务参数不可能包含该字符，避免拼接碰撞。
@@ -58,20 +69,31 @@ public class BatchService {
 
     private static final int IDEMPOTENCY_MAX_ATTEMPTS = 3;
 
+    /**
+     * 有效期截止的规范存储格式：固定毫秒精度 UTC，保证字符串字典序与时间序一致，
+     * 到期查询可直接按字符串比较。
+     */
+    private static final DateTimeFormatter EXPIRY_FORMAT =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").withZone(ZoneOffset.UTC);
+
     private final BatchRepository repo;
     private final TransactionTemplate tx;
     private final ObjectMapper objectMapper;
+    private final Clock clock;
 
     public BatchService(BatchRepository repo,
                         PlatformTransactionManager transactionManager,
-                        ObjectMapper objectMapper) {
+                        ObjectMapper objectMapper,
+                        Clock clock) {
         this.repo = repo;
         this.tx = new TransactionTemplate(transactionManager);
         this.objectMapper = objectMapper;
+        this.clock = clock;
     }
 
     /**
      * 创建批次：初始状态 QUARANTINED；batchKey 全局唯一，重复返回 409。
+     * 初始有效期为生产时间加保质分钟；保质分钟创建后不可改写。
      */
     public StoredResponse createBatch(CreateBatchRequest req) {
         List<String> items = req.requiredTests().stream().map(String::trim).toList();
@@ -79,19 +101,29 @@ public class BatchService {
             throw ApiException.badRequest("requiredTests 存在重复检验项");
         }
         String fingerprint = fingerprint("create", req.batchKey(), req.productCode(), req.batchNo(),
-                req.producedAt().toString(), String.join(SEP, items));
+                req.producedAt().toString(), req.shelfLifeMinutes().toString(),
+                String.join(SEP, items));
         return executeIdempotent(CMD_CREATE, req.commandKey(), fingerprint, () -> {
-            repo.findBatch(req.batchKey()).ifPresent(b -> {
+            if (repo.findBatch(req.batchKey()).isPresent()) {
+                // 批次行已可见说明创建事务已整体提交，同事务写入的命令快照必然可见：
+                // 并发下同键请求在两次读之间被对方提交时，重放首次结果而不是误判 409
+                var logged = loggedResponse(CMD_CREATE, req.commandKey(), fingerprint);
+                if (logged.isPresent()) {
+                    return logged.get();
+                }
                 throw ApiException.conflict("batchKey 已存在: " + req.batchKey());
-            });
+            }
             String now = now();
+            String expiresAt = canonical(req.producedAt().plusSeconds(req.shelfLifeMinutes() * 60L));
             repo.insertBatch(new BatchRepository.BatchRow(0L, req.batchKey(), req.productCode(),
-                    req.batchNo(), req.producedAt().toString(), BatchStatus.QUARANTINED.name(), now));
+                    req.batchNo(), req.producedAt().toString(), req.shelfLifeMinutes(), expiresAt,
+                    BatchStatus.QUARANTINED.name(), now));
             for (int i = 0; i < items.size(); i++) {
                 repo.insertRequiredTest(req.batchKey(), items.get(i), i + 1);
             }
             BatchResponse body = new BatchResponse(req.batchKey(), req.productCode(), req.batchNo(),
-                    req.producedAt(), BatchStatus.QUARANTINED, items, Instant.parse(now));
+                    req.producedAt(), BatchStatus.QUARANTINED, items, Instant.parse(now),
+                    Instant.parse(expiresAt), false);
             return new StoredResponse(201, toJson(body));
         });
     }
@@ -176,6 +208,9 @@ public class BatchService {
             if (status != BatchStatus.PENDING_RELEASE && status != BatchStatus.RELEASE_REVIEW) {
                 throw ApiException.conflict("批次状态 " + status + " 不允许批准");
             }
+            if (isExpired(batch)) {
+                throw ApiException.unprocessable("批次已到期，禁止批准: " + batchKey);
+            }
             boolean actorInspected = repo.findTests(batchKey).stream()
                     .anyMatch(t -> t.inspector().equals(actor));
             if (actorInspected) {
@@ -245,7 +280,7 @@ public class BatchService {
     }
 
     /**
-     * 当前可用批次：排除已召回（RECALLED）、已拆分（SPLIT）批次，
+     * 当前可用批次：排除已召回（RECALLED）、已拆分（SPLIT）、已到期批次，
      * 以及任一祖先被召回的后代批次；后代自身状态不改写。
      */
     public List<BatchResponse> listAvailable() {
@@ -253,6 +288,7 @@ public class BatchService {
         Set<String> recalled = new HashSet<>(repo.findRecalledKeys());
         return repo.findAvailableBatches().stream()
                 .filter(b -> !BatchStatus.SPLIT.name().equals(b.status()))
+                .filter(b -> !isExpired(b))
                 .filter(b -> recalledAncestor(b.batchKey(), parentOf, recalled).isEmpty())
                 .map(this::toBatchResponse)
                 .toList();
@@ -343,7 +379,8 @@ public class BatchService {
     private BatchResponse toBatchResponse(BatchRepository.BatchRow row) {
         return new BatchResponse(row.batchKey(), row.productCode(), row.batchNo(),
                 Instant.parse(row.producedAt()), BatchStatus.valueOf(row.status()),
-                repo.findRequiredTests(row.batchKey()), Instant.parse(row.createdAt()));
+                repo.findRequiredTests(row.batchKey()), Instant.parse(row.createdAt()),
+                Instant.parse(row.expiresAt()), isExpired(row));
     }
 
     private TestResultResponse toTestResponse(BatchRepository.TestRow row, String batchStatus) {
@@ -396,7 +433,21 @@ public class BatchService {
     }
 
     private String now() {
-        return Instant.now().toString();
+        return Instant.now(clock).toString();
+    }
+
+    /**
+     * 规范化为固定毫秒精度 UTC 字符串，保证字典序与时间序一致。
+     */
+    private String canonical(Instant instant) {
+        return EXPIRY_FORMAT.format(instant);
+    }
+
+    /**
+     * 当前时刻达到或超过有效期即视为到期；只影响可用性判定与查询标识，不改写批次状态。
+     */
+    private boolean isExpired(BatchRepository.BatchRow row) {
+        return !Instant.now(clock).isBefore(Instant.parse(row.expiresAt()));
     }
 
     private String fingerprint(String... parts) {        String canonical = String.join(SEP, parts);
@@ -448,6 +499,9 @@ public class BatchService {
                 throw ApiException.conflict(
                         "批次状态 " + parent.status() + " 不允许拆分，仅当前可用的 RELEASED 批次可拆分");
             }
+            if (isExpired(parent)) {
+                throw ApiException.unprocessable("批次已到期，禁止拆分: " + parentKey);
+            }
             for (String childKey : childKeys) {
                 if (repo.findBatch(childKey).isPresent()) {
                     throw ApiException.conflict("子批 batchKey 已存在: " + childKey);
@@ -458,8 +512,12 @@ public class BatchService {
             List<SplitResponse.SplitChild> childBodies = new ArrayList<>(children.size());
             for (int i = 0; i < children.size(); i++) {
                 SplitRequest.ChildSpec spec = children.get(i);
+                // 子批继承父批保质分钟，并按自身生产时间重新计算有效期
+                String childExpiresAt = canonical(Instant.parse(parent.producedAt())
+                        .plusSeconds(parent.shelfLifeMinutes() * 60L));
                 repo.insertBatch(new BatchRepository.BatchRow(0L, spec.batchKey(), parent.productCode(),
-                        spec.batchNo(), parent.producedAt(), BatchStatus.QUARANTINED.name(), now));
+                        spec.batchNo(), parent.producedAt(), parent.shelfLifeMinutes(),
+                        childExpiresAt, BatchStatus.QUARANTINED.name(), now));
                 for (int j = 0; j < required.size(); j++) {
                     repo.insertRequiredTest(spec.batchKey(), required.get(j), j + 1);
                 }
@@ -574,5 +632,182 @@ public class BatchService {
         return new LineageEntryResponse(row.batchKey(), row.batchNo(),
                 BatchStatus.valueOf(row.status()),
                 recalledAncestor(batchKey, parentOf, recalled).orElse(null));
+    }
+
+    /**
+     * 提交复检延期：复检人（X-Actor-Id）须与该批次原两名批准人都不同；
+     * 要求该批次已通过全部必做检验、没有召回祖先、本次复检结论为合格（PASS），
+     * 且累计顺延分钟不超过原保质分钟两倍、生效次数不超过三次，超限 422。
+     * 成功落 PENDING_CONFIRM 记录，待另一名不同于复检人的批准角色确认后生效。
+     */
+    public StoredResponse submitExtension(String batchKey, String actorId,
+                                          SubmitExtensionRequest req) {
+        if (actorId == null || actorId.isBlank()) {
+            throw ApiException.badRequest("X-Actor-Id 不能为空");
+        }
+        String retester = actorId.trim();
+        String conclusion = req.retestConclusion().trim();
+        String fingerprint = fingerprint("ext-submit", batchKey, req.extensionKey(), conclusion,
+                req.extensionMinutes().toString(), retester);
+        return executeIdempotent(CMD_EXT_SUBMIT, req.commandKey(), fingerprint, () -> {
+            BatchRepository.BatchRow batch = repo.findBatchForUpdate(batchKey)
+                    .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+            // 行锁后重查命令快照：并发同键请求在锁等待期间可能已由对方提交
+            var logged = loggedResponse(CMD_EXT_SUBMIT, req.commandKey(), fingerprint);
+            if (logged.isPresent()) {
+                return logged.get();
+            }
+            assertNoRecalledAncestor(batchKey);
+            if (repo.findExtension(batchKey, req.extensionKey()).isPresent()) {
+                throw ApiException.conflict("extensionKey 已存在: " + req.extensionKey());
+            }
+            List<String> required = repo.findRequiredTests(batchKey);
+            if (!allRequiredPassed(batchKey, required)) {
+                throw ApiException.unprocessable("必做检验项未全部通过，不能提交延期");
+            }
+            if (!"PASS".equals(conclusion)) {
+                throw ApiException.unprocessable("本次复检结论为不合格，不能提交延期");
+            }
+            boolean retesterApproved = repo.findApprovals(batchKey).stream()
+                    .anyMatch(a -> a.actorId().equals(retester));
+            if (retesterApproved) {
+                throw ApiException.unprocessable("复检人须与该批次原批准人都不同: " + retester);
+            }
+            assertExtensionLimits(batch, req.extensionMinutes());
+            String now = now();
+            repo.insertExtension(new BatchRepository.ExtensionRow(0L, batchKey, req.extensionKey(),
+                    conclusion, req.extensionMinutes(), retester, "PENDING_CONFIRM", now,
+                    null, null, null));
+            ExtensionResponse body = new ExtensionResponse(batchKey, req.extensionKey(), conclusion,
+                    req.extensionMinutes(), retester, "PENDING_CONFIRM", Instant.parse(now),
+                    null, null, null, null);
+            return new StoredResponse(201, toJson(body));
+        });
+    }
+
+    /**
+     * 确认延期：确认人（X-Actor-Id）须为不同于复检人的批准角色（X-Approval-Role）。
+     * 生效时在同一事务内把延期记录置为 EFFECTIVE（不可改写）并把有效期整体顺延；
+     * 批次状态与既有检验、批准记录不变。确认时重检召回祖先、检验通过与顺延上限，任一失败 422/409 且不改变任何数据。
+     */
+    public StoredResponse confirmExtension(String batchKey, String extensionKey, String actorId,
+                                           String roleHeader, ConfirmExtensionRequest req) {
+        if (actorId == null || actorId.isBlank()) {
+            throw ApiException.badRequest("X-Actor-Id 不能为空");
+        }
+        ApprovalRole role = parseRole(roleHeader);
+        String confirmer = actorId.trim();
+        String fingerprint = fingerprint("ext-confirm", batchKey, extensionKey, confirmer,
+                role.name());
+        return executeIdempotent(CMD_EXT_CONFIRM, req.commandKey(), fingerprint, () -> {
+            BatchRepository.BatchRow batch = repo.findBatchForUpdate(batchKey)
+                    .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+            var logged = loggedResponse(CMD_EXT_CONFIRM, req.commandKey(), fingerprint);
+            if (logged.isPresent()) {
+                return logged.get();
+            }
+            BatchRepository.ExtensionRow ext = repo.findExtension(batchKey, extensionKey)
+                    .orElseThrow(() -> ApiException.notFound("延期不存在: " + extensionKey));
+            if ("EFFECTIVE".equals(ext.status())) {
+                throw ApiException.conflict("延期已生效，不可重复确认: " + extensionKey);
+            }
+            if (ext.retester().equals(confirmer)) {
+                throw ApiException.unprocessable("确认人须不同于复检人: " + confirmer);
+            }
+            assertNoRecalledAncestor(batchKey);
+            List<String> required = repo.findRequiredTests(batchKey);
+            if (!allRequiredPassed(batchKey, required)) {
+                throw ApiException.unprocessable("必做检验项未全部通过，延期不能生效");
+            }
+            assertExtensionLimits(batch, ext.extensionMinutes());
+            String now = now();
+            repo.markExtensionEffective(batchKey, extensionKey, confirmer, role.name(), now);
+            String newExpiresAt = canonical(Instant.parse(batch.expiresAt())
+                    .plusSeconds(ext.extensionMinutes() * 60L));
+            repo.updateExpiresAt(batchKey, newExpiresAt);
+            ExtensionResponse body = new ExtensionResponse(batchKey, extensionKey,
+                    ext.retestConclusion(), ext.extensionMinutes(), ext.retester(), "EFFECTIVE",
+                    Instant.parse(ext.submittedAt()), confirmer, role.name(), Instant.parse(now),
+                    Instant.parse(newExpiresAt));
+            return new StoredResponse(200, toJson(body));
+        });
+    }
+
+    /**
+     * 有效期查询：保质分钟、当前有效期截止、剩余分钟（到期后为负）、到期标识与已生效延期统计。
+     */
+    public ShelfLifeResponse shelfLife(String batchKey) {
+        BatchRepository.BatchRow batch = repo.findBatch(batchKey)
+                .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+        Instant expiresAt = Instant.parse(batch.expiresAt());
+        Instant now = Instant.now(clock);
+        List<BatchRepository.ExtensionRow> effective = effectiveExtensions(batchKey);
+        int cumulative = effective.stream().mapToInt(BatchRepository.ExtensionRow::extensionMinutes)
+                .sum();
+        return new ShelfLifeResponse(batchKey, batch.shelfLifeMinutes(),
+                Instant.parse(batch.producedAt()), expiresAt,
+                Duration.between(now, expiresAt).toMinutes(), !now.isBefore(expiresAt),
+                cumulative, effective.size());
+    }
+
+    /**
+     * 延期历史：全部延期记录按提交顺序（id）稳定排序；newExpiresAt 按生效顺序重放推导。
+     */
+    public List<ExtensionResponse> listExtensions(String batchKey) {
+        BatchRepository.BatchRow batch = repo.findBatch(batchKey)
+                .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+        List<ExtensionResponse> result = new ArrayList<>();
+        Instant running = Instant.parse(batch.producedAt())
+                .plusSeconds(batch.shelfLifeMinutes() * 60L);
+        for (BatchRepository.ExtensionRow ext : repo.findExtensions(batchKey)) {
+            Instant resultingExpiry = null;
+            if ("EFFECTIVE".equals(ext.status())) {
+                running = running.plusSeconds(ext.extensionMinutes() * 60L);
+                resultingExpiry = running;
+            }
+            result.add(toExtensionResponse(ext, resultingExpiry));
+        }
+        return result;
+    }
+
+    /**
+     * 到期批次清单：当前时刻达到有效期的全部批次，按创建顺序（id）稳定排序；只读，不改写状态。
+     */
+    public List<ExpiredBatchResponse> listExpired() {
+        return repo.findExpiredBatches(canonical(Instant.now(clock))).stream()
+                .map(b -> new ExpiredBatchResponse(b.batchKey(), b.productCode(), b.batchNo(),
+                        BatchStatus.valueOf(b.status()), Instant.parse(b.expiresAt())))
+                .toList();
+    }
+
+    /**
+     * 延期上限校验：已生效不超过 3 次，且本次生效后累计顺延分钟不超过原保质分钟两倍，超限 422。
+     */
+    private void assertExtensionLimits(BatchRepository.BatchRow batch, int additionalMinutes) {
+        List<BatchRepository.ExtensionRow> effective = effectiveExtensions(batch.batchKey());
+        if (effective.size() >= 3) {
+            throw ApiException.unprocessable("延期次数已达上限 3 次: " + batch.batchKey());
+        }
+        long cumulative = effective.stream()
+                .mapToLong(BatchRepository.ExtensionRow::extensionMinutes).sum();
+        if (cumulative + additionalMinutes > 2L * batch.shelfLifeMinutes()) {
+            throw ApiException.unprocessable("累计顺延分钟不得超过原保质分钟两倍: "
+                    + batch.batchKey());
+        }
+    }
+
+    private List<BatchRepository.ExtensionRow> effectiveExtensions(String batchKey) {
+        return repo.findExtensions(batchKey).stream()
+                .filter(e -> "EFFECTIVE".equals(e.status()))
+                .toList();
+    }
+
+    private ExtensionResponse toExtensionResponse(BatchRepository.ExtensionRow ext,
+                                                  Instant resultingExpiry) {
+        return new ExtensionResponse(ext.batchKey(), ext.extensionKey(), ext.retestConclusion(),
+                ext.extensionMinutes(), ext.retester(), ext.status(),
+                Instant.parse(ext.submittedAt()), ext.confirmedBy(), ext.confirmedRole(),
+                ext.confirmedAt() == null ? null : Instant.parse(ext.confirmedAt()),
+                resultingExpiry);
     }
 }

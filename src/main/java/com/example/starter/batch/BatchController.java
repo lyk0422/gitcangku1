@@ -3,10 +3,15 @@ package com.example.starter.batch;
 import com.example.starter.batch.dto.ApproveRequest;
 import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
+import com.example.starter.batch.dto.ConfirmExtensionRequest;
 import com.example.starter.batch.dto.CreateBatchRequest;
+import com.example.starter.batch.dto.ExpiredBatchResponse;
+import com.example.starter.batch.dto.ExtensionResponse;
 import com.example.starter.batch.dto.LineageEntryResponse;
 import com.example.starter.batch.dto.RecallRequest;
+import com.example.starter.batch.dto.ShelfLifeResponse;
 import com.example.starter.batch.dto.SplitRequest;
+import com.example.starter.batch.dto.SubmitExtensionRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpHeaders;
@@ -112,6 +117,52 @@ public class BatchController {
     @GetMapping("/{batchKey}/descendants")
     public List<LineageEntryResponse> descendants(@PathVariable String batchKey) {
         return service.listDescendants(batchKey);
+    }
+
+    /**
+     * 提交复检延期；X-Actor-Id 为复检人，须与该批次原两名批准人都不同。
+     */
+    @PostMapping("/{batchKey}/extensions")
+    public ResponseEntity<String> submitExtension(@PathVariable String batchKey,
+                                                  @RequestHeader(name = "X-Actor-Id", required = false) String actorId,
+                                                  @Valid @RequestBody SubmitExtensionRequest request) {
+        return stored(service.submitExtension(batchKey, actorId, request));
+    }
+
+    /**
+     * 确认延期并生效；X-Actor-Id 为确认人（不同于复检人），X-Approval-Role 为 QUALITY 或 OPERATIONS。
+     */
+    @PostMapping("/{batchKey}/extensions/{extensionKey}/confirm")
+    public ResponseEntity<String> confirmExtension(@PathVariable String batchKey,
+                                                   @PathVariable String extensionKey,
+                                                   @RequestHeader(name = "X-Actor-Id", required = false) String actorId,
+                                                   @RequestHeader(name = "X-Approval-Role", required = false) String role,
+                                                   @Valid @RequestBody ConfirmExtensionRequest request) {
+        return stored(service.confirmExtension(batchKey, extensionKey, actorId, role, request));
+    }
+
+    /**
+     * 批次有效期查询：保质分钟、有效期截止、剩余分钟、到期标识与已生效延期统计。
+     */
+    @GetMapping("/{batchKey}/shelf-life")
+    public ShelfLifeResponse shelfLife(@PathVariable String batchKey) {
+        return service.shelfLife(batchKey);
+    }
+
+    /**
+     * 延期历史：全部延期记录按提交顺序稳定排序。
+     */
+    @GetMapping("/{batchKey}/extensions")
+    public List<ExtensionResponse> extensions(@PathVariable String batchKey) {
+        return service.listExtensions(batchKey);
+    }
+
+    /**
+     * 到期批次清单：当前时刻达到有效期的全部批次，按创建顺序稳定排序。
+     */
+    @GetMapping("/expired")
+    public List<ExpiredBatchResponse> expired() {
+        return service.listExpired();
     }
 
     private ResponseEntity<String> stored(StoredResponse response) {

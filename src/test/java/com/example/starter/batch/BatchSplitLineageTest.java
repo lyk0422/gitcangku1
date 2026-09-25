@@ -51,6 +51,7 @@ class BatchSplitLineageTest {
         jdbc.update("DELETE FROM test_result");
         jdbc.update("DELETE FROM batch_required_test");
         jdbc.update("DELETE FROM batch_lineage");
+        jdbc.update("DELETE FROM batch_extension");
         jdbc.update("DELETE FROM batch");
     }
 
@@ -548,12 +549,13 @@ class BatchSplitLineageTest {
     }
 
     private String createBody(String batchKey, List<String> items) throws Exception {
+        // 保质分钟取 100 年：本类用例不涉及到期，避免系统时钟推进导致批次到期
         return objectMapper.writeValueAsString(new CreateCmd("CK-C-" + unique(), batchKey, "PROD-1",
-                "LOT-1", Instant.parse("2026-01-02T03:04:05Z"), items));
+                "LOT-1", Instant.parse("2026-01-02T03:04:05Z"), 52_560_000, items));
     }
 
     private record CreateCmd(String commandKey, String batchKey, String productCode, String batchNo,
-                             Instant producedAt, List<String> requiredTests) {
+                             Instant producedAt, int shelfLifeMinutes, List<String> requiredTests) {
     }
 
     private void createBatch(String batchKey, List<String> items, int expected) throws Exception {
