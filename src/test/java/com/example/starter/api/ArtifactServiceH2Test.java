@@ -45,6 +45,8 @@ class ArtifactServiceH2Test {
         jdbcTemplate.update("DELETE FROM lock_file");
         jdbcTemplate.update("DELETE FROM artifact_dependency");
         jdbcTemplate.update("DELETE FROM artifact");
+        jdbcTemplate.update("DELETE FROM namespace_policy_license");
+        jdbcTemplate.update("DELETE FROM namespace_policy");
         jdbcTemplate.update("DELETE FROM idempotent_request");
         jdbcTemplate.update("UPDATE repository_state SET version = 0 WHERE id = 1");
     }

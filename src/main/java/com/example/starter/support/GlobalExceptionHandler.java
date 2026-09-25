@@ -1,6 +1,9 @@
 package com.example.starter.support;
 
 import com.example.starter.api.dto.ApiError;
+import com.example.starter.api.dto.LicenseViolationResponse;
+import com.example.starter.api.dto.PolicyViolationError;
+import com.example.starter.domain.LicenseViolation;
 import jakarta.validation.ConstraintViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -9,6 +12,8 @@ import org.springframework.web.bind.MissingRequestHeaderException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
+import java.util.List;
+
 /**
  * 业务异常与请求校验异常到 HTTP 响应的映射。
  */
@@ -16,9 +21,21 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 public class GlobalExceptionHandler {
 
     @ExceptionHandler(ApiException.class)
-    public org.springframework.http.ResponseEntity<ApiError> handleApi(ApiException ex) {
+    public org.springframework.http.ResponseEntity<Object> handleApi(ApiException ex) {
+        if (ex.getViolations() != null) {
+            List<LicenseViolationResponse> violations = ex.getViolations().stream()
+                    .map(this::toViolationView)
+                    .toList();
+            return org.springframework.http.ResponseEntity.status(ex.getStatus())
+                    .body(new PolicyViolationError(ex.getCode(), ex.getMessage(), violations));
+        }
         return org.springframework.http.ResponseEntity.status(ex.getStatus())
                 .body(new ApiError(ex.getCode(), ex.getMessage()));
+    }
+
+    private LicenseViolationResponse toViolationView(LicenseViolation violation) {
+        return new LicenseViolationResponse(violation.name(), violation.version(),
+                violation.license(), violation.reason());
     }
 
     @ExceptionHandler({MissingRequestHeaderException.class, MethodArgumentNotValidException.class,

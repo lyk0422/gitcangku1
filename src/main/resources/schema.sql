@@ -12,12 +12,14 @@ CREATE TABLE IF NOT EXISTS artifact (
     name       VARCHAR(128) NOT NULL,
     version    INT          NOT NULL,
     withdrawn  TINYINT      NOT NULL DEFAULT 0,
+    license    VARCHAR(64)  NULL,
     created_at TIMESTAMP(6) NOT NULL
 );
 COMMENT ON TABLE artifact IS '软件制品版本，name 与 version 联合唯一，撤回不删除';
 COMMENT ON COLUMN artifact.name IS '制品名称';
 COMMENT ON COLUMN artifact.version IS '制品版本号，正整数';
 COMMENT ON COLUMN artifact.withdrawn IS '撤回状态：0=有效，1=已撤回（记录保留）';
+COMMENT ON COLUMN artifact.license IS '许可证标识；NULL 表示未登记，按 UNKNOWN 处理；已撤回版本不可再修改';
 COMMENT ON COLUMN artifact.created_at IS '登记时间，UTC 时间戳';
 
 CREATE UNIQUE INDEX IF NOT EXISTS uk_artifact_name_version ON artifact (name, version);
@@ -39,6 +41,29 @@ COMMENT ON COLUMN artifact_dependency.maximum_version IS '依赖最高版本（�
 
 CREATE UNIQUE INDEX IF NOT EXISTS uk_dep_artifact_name ON artifact_dependency (artifact_id, name);
 
+CREATE TABLE IF NOT EXISTS namespace_policy (
+    namespace     VARCHAR(128) NOT NULL PRIMARY KEY,
+    version       BIGINT       NOT NULL,
+    reject_unknown TINYINT     NOT NULL DEFAULT 0,
+    updated_at    TIMESTAMP(6) NOT NULL
+);
+COMMENT ON TABLE namespace_policy IS '命名空间许可证策略；以制品名称为命名空间，每次成功修改 version 加一';
+COMMENT ON COLUMN namespace_policy.namespace IS '命名空间名称，等于制品名称';
+COMMENT ON COLUMN namespace_policy.version IS '策略版本号：首次创建后为 1，每次修改加一；冲突时返回 409';
+COMMENT ON COLUMN namespace_policy.reject_unknown IS '是否拒绝 UNKNOWN 许可证：0=允许，1=拒绝';
+COMMENT ON COLUMN namespace_policy.updated_at IS '策略最后修改时间，UTC 时间戳';
+
+CREATE TABLE IF NOT EXISTS namespace_policy_license (
+    id            BIGINT AUTO_INCREMENT PRIMARY KEY,
+    namespace     VARCHAR(128) NOT NULL,
+    license       VARCHAR(64)  NOT NULL
+);
+COMMENT ON TABLE namespace_policy_license IS '命名空间策略允许的许可证集合';
+COMMENT ON COLUMN namespace_policy_license.namespace IS '所属命名空间';
+COMMENT ON COLUMN namespace_policy_license.license IS '允许的许可证标识';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_policy_license ON namespace_policy_license (namespace, license);
+
 CREATE TABLE IF NOT EXISTS lock_file (
     id                 BIGINT AUTO_INCREMENT PRIMARY KEY,
     root_name          VARCHAR(128) NOT NULL,
@@ -58,16 +83,20 @@ CREATE UNIQUE INDEX IF NOT EXISTS uk_lock_request ON lock_file (request_id);
 CREATE INDEX IF NOT EXISTS idx_lock_root ON lock_file (root_name, root_version);
 
 CREATE TABLE IF NOT EXISTS lock_file_entry (
-    id           BIGINT AUTO_INCREMENT PRIMARY KEY,
-    lock_file_id BIGINT       NOT NULL,
-    name         VARCHAR(128) NOT NULL,
-    version      INT          NOT NULL,
+    id             BIGINT AUTO_INCREMENT PRIMARY KEY,
+    lock_file_id   BIGINT       NOT NULL,
+    name           VARCHAR(128) NOT NULL,
+    version        INT          NOT NULL,
+    license        VARCHAR(64)  NULL,
+    policy_version BIGINT       NOT NULL,
     CONSTRAINT fk_entry_lock FOREIGN KEY (lock_file_id) REFERENCES lock_file (id)
 );
-COMMENT ON TABLE lock_file_entry IS '锁文件中的精确制品版本，每个名称仅一个版本';
+COMMENT ON TABLE lock_file_entry IS '锁文件中的精确制品版本，每个名称仅一个版本；许可证与策略版本在锁定时固化，后续修改不改写';
 COMMENT ON COLUMN lock_file_entry.lock_file_id IS '所属锁文件 ID';
-COMMENT ON COLUMN lock_file_entry.name IS '被锁定制品名称';
+COMMENT ON COLUMN lock_file_entry.name IS '被锁定制品名称（即命名空间）';
 COMMENT ON COLUMN lock_file_entry.version IS '被锁定的精确版本号，正整数';
+COMMENT ON COLUMN lock_file_entry.license IS '锁定时该制品版本登记的许可证标识；NULL 表示当时为 UNKNOWN';
+COMMENT ON COLUMN lock_file_entry.policy_version IS '锁定时该命名空间策略的版本号；当时无策略为 0';
 
 CREATE UNIQUE INDEX IF NOT EXISTS uk_entry_lock_name ON lock_file_entry (lock_file_id, name);
 
@@ -81,7 +110,7 @@ CREATE TABLE IF NOT EXISTS idempotent_request (
 );
 COMMENT ON TABLE idempotent_request IS '写操作幂等记录，仅保存成功请求；失败不占键';
 COMMENT ON COLUMN idempotent_request.request_id IS '客户端提供的全局唯一请求 ID';
-COMMENT ON COLUMN idempotent_request.operation IS '操作类型：REGISTER_ARTIFACT/WITHDRAW_ARTIFACT/CREATE_LOCK';
+COMMENT ON COLUMN idempotent_request.operation IS '操作类型：REGISTER_ARTIFACT/WITHDRAW_ARTIFACT/CREATE_LOCK/SET_LICENSE/SET_POLICY';
 COMMENT ON COLUMN idempotent_request.request_hash IS '规范化请求参数的 SHA-256 摘要，异参重放用于冲突判定';
 COMMENT ON COLUMN idempotent_request.http_status IS '原成功响应 HTTP 状态码';
 COMMENT ON COLUMN idempotent_request.response_json IS '原成功响应 JSON，重放时原样返回';

@@ -3,18 +3,26 @@ package com.example.starter.api;
 import com.example.starter.api.dto.ArtifactResponse;
 import com.example.starter.api.dto.DependencySpec;
 import com.example.starter.api.dto.DependencyView;
+import com.example.starter.api.dto.LicenseResponse;
+import com.example.starter.api.dto.LicenseViolationResponse;
 import com.example.starter.api.dto.LockEntryResponse;
 import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
+import com.example.starter.api.dto.PolicyResponse;
 import com.example.starter.api.dto.RegisterArtifactRequest;
+import com.example.starter.api.dto.SetPolicyRequest;
 import com.example.starter.domain.ArtifactVersion;
 import com.example.starter.domain.DependencyRange;
+import com.example.starter.domain.LicensePolicyChecker;
+import com.example.starter.domain.LicenseViolation;
 import com.example.starter.domain.LockResolver;
+import com.example.starter.domain.NamespacePolicy;
 import com.example.starter.domain.RepositorySnapshot;
 import com.example.starter.repo.RepositoryDao;
 import com.example.starter.repo.RepositoryDao.IdempotentRecord;
 import com.example.starter.repo.RepositoryDao.LockEntryRow;
 import com.example.starter.repo.RepositoryDao.LockFileRow;
+import com.example.starter.repo.RepositoryDao.PolicyDetailRow;
 import com.example.starter.support.ApiException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
@@ -27,11 +35,13 @@ import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.function.Supplier;
 
 /**
@@ -39,6 +49,7 @@ import java.util.function.Supplier;
  *
  * <p>所有写操作在单个事务内完成：先锁单行仓库版本表互斥并发写，
  * 再做业务变更并写入幂等成功记录，原子提交；业务失败整体回滚，不占用 requestId。
+ * 锁定、撤回、许可证登记与策略修改均串行于同一行锁，按事务提交顺序裁决。
  */
 @Service
 public class ArtifactServiceImpl implements ArtifactService {
@@ -49,6 +60,8 @@ public class ArtifactServiceImpl implements ArtifactService {
     private static final String OP_REGISTER = "REGISTER_ARTIFACT";
     private static final String OP_WITHDRAW = "WITHDRAW_ARTIFACT";
     private static final String OP_LOCK = "CREATE_LOCK";
+    private static final String OP_SET_LICENSE = "SET_LICENSE";
+    private static final String OP_SET_POLICY = "SET_POLICY";
 
     private final RepositoryDao repositoryDao;
     private final TransactionTemplate transactionTemplate;
@@ -87,6 +100,50 @@ public class ArtifactServiceImpl implements ArtifactService {
     }
 
     @Override
+    public LicenseResponse setLicense(String requestId, String name, int version, String license) {
+        requireRequestId(requestId);
+        if (name == null || name.isBlank()) {
+            throw ApiException.badRequest("name 不能为空");
+        }
+        String normalized = normalizeLicense(license);
+        if (normalized != null && normalized.length() > 64) {
+            throw ApiException.badRequest("许可证标识最长 64 字符");
+        }
+        String hash = sha256(OP_SET_LICENSE + "|" + name.trim() + "|" + version + "|"
+                + (normalized == null ? "" : normalized));
+        return executeIdempotent(requestId, OP_SET_LICENSE, hash, 200,
+                () -> doSetLicense(name.trim(), version, normalized), LicenseResponse.class);
+    }
+
+    @Override
+    public PolicyResponse setPolicy(String requestId, SetPolicyRequest request) {
+        requireRequestId(requestId);
+        validatePolicyRequest(request);
+        String namespace = request.namespace().trim();
+        Set<String> allowed = new TreeSet<>();
+        for (String license : request.allowedLicenses()) {
+            allowed.add(license.trim());
+        }
+        String hash = sha256(OP_SET_POLICY + "|" + namespace + "|" + request.expectedVersion()
+                + "|" + request.rejectUnknown() + "|" + String.join(",", allowed));
+        return executeIdempotent(requestId, OP_SET_POLICY, hash, 200,
+                () -> doSetPolicy(namespace, request.expectedVersion(),
+                        request.rejectUnknown(), allowed),
+                PolicyResponse.class);
+    }
+
+    @Override
+    public PolicyResponse getPolicy(String namespace) {
+        PolicyDetailRow detail = repositoryDao.loadPolicyDetail(namespace);
+        if (detail == null) {
+            return null;
+        }
+        NamespacePolicy policy = repositoryDao.loadPolicy(namespace);
+        return new PolicyResponse(detail.namespace(), detail.version(), detail.rejectUnknown(),
+                policy.sortedAllowedLicenses(), detail.updatedAt());
+    }
+
+    @Override
     public LockFileResponse createLock(String requestId, LockRequest request) {
         requireRequestId(requestId);
         if (request.rootName() == null || request.rootName().isBlank()) {
@@ -99,8 +156,41 @@ public class ArtifactServiceImpl implements ArtifactService {
     }
 
     @Override
-    public List<LockFileResponse> listLocks() {
-        List<LockFileResponse> result = new ArrayList<>();
+    public List<LicenseViolationResponse> diagnoseLock(LockRequest request) {
+        if (request.rootName() == null || request.rootName().isBlank()) {
+            throw ApiException.badRequest("rootName 不能为空");
+        }
+        return transactionTemplate.execute(status -> {
+            // 与正式锁定同样持有行锁，保证诊断基于一致快照；只读，提交时不产生任何写入。
+            repositoryDao.lockRepositoryState();
+            String rootName = request.rootName().trim();
+            ArtifactVersion root = repositoryDao.loadArtifact(rootName, request.rootVersion());
+            if (root == null) {
+                throw ApiException.notFound("根制品版本不存在: " + rootName + ":" + request.rootVersion());
+            }
+            if (root.withdrawn()) {
+                throw ApiException.conflict("根制品版本已撤回: " + rootName + ":" + request.rootVersion());
+            }
+            RepositorySnapshot snapshot = repositoryDao.loadSnapshot();
+            Map<String, Integer> solution = LockResolver.resolve(snapshot, rootName, request.rootVersion());
+            if (solution == null) {
+                throw ApiException.unprocessable(
+                        "不存在满足全部依赖区间的未撤回版本组合，无法锁定");
+            }
+            Map<String, String> licenses = new HashMap<>();
+            snapshot.artifacts().forEach((name, versions) -> versions.forEach(v -> {
+                if (v.license() != null) {
+                    licenses.put(name + ":" + v.version(), v.license());
+                }
+            }));
+            return LicensePolicyChecker.check(solution, licenses, snapshot.policies()).stream()
+                    .map(v -> new LicenseViolationResponse(v.name(), v.version(), v.license(), v.reason()))
+                    .toList();
+        });
+    }
+
+    @Override
+    public List<LockFileResponse> listLocks() {        List<LockFileResponse> result = new ArrayList<>();
         for (LockFileRow row : repositoryDao.listLockFiles()) {
             result.add(toLockResponse(row, repositoryDao.listLockEntries(row.id())));
         }
@@ -167,6 +257,55 @@ public class ArtifactServiceImpl implements ArtifactService {
                 Instant.now(clock), toDependencyViews(artifact.dependencies()));
     }
 
+    private LicenseResponse doSetLicense(String name, int version, String license) {
+        ArtifactVersion artifact = repositoryDao.loadArtifact(name, version);
+        if (artifact == null) {
+            throw ApiException.notFound("制品版本不存在: " + name + ":" + version);
+        }
+        if (artifact.withdrawn()) {
+            throw ApiException.conflict("制品版本已撤回，不可修改许可证: " + name + ":" + version);
+        }
+        int affected = repositoryDao.updateLicense(name, version, license);
+        if (affected == 0) {
+            // 并发撤回抢先提交（持有行锁时理论上不会发生，防御性处理）。
+            throw ApiException.conflict("制品版本已撤回，不可修改许可证: " + name + ":" + version);
+        }
+        long repositoryVersion = repositoryDao.incrementRepositoryVersion();
+        return new LicenseResponse(name, version, license, false, repositoryVersion,
+                Instant.now(clock));
+    }
+
+    private PolicyResponse doSetPolicy(String namespace, long expectedVersion,
+                                       boolean rejectUnknown, Set<String> allowed) {
+        Instant now = Instant.now(clock);
+        NamespacePolicy current = repositoryDao.loadPolicy(namespace);
+        long newVersion;
+        if (current == null) {
+            if (expectedVersion != 0) {
+                throw ApiException.conflict("命名空间策略不存在，expectedVersion 必须为 0: " + namespace);
+            }
+            repositoryDao.insertPolicy(namespace, rejectUnknown, now);
+            newVersion = 1;
+        } else {
+            if (current.version() != expectedVersion) {
+                throw ApiException.conflict("策略版本不匹配：expected=" + expectedVersion
+                        + ", actual=" + current.version());
+            }
+            int updated = repositoryDao.updatePolicy(namespace, expectedVersion, rejectUnknown, now);
+            if (updated == 0) {
+                throw ApiException.conflict("策略版本不匹配：expected=" + expectedVersion);
+            }
+            newVersion = expectedVersion + 1;
+        }
+        repositoryDao.deletePolicyLicenses(namespace);
+        for (String license : allowed) {
+            repositoryDao.insertPolicyLicense(namespace, license);
+        }
+        repositoryDao.incrementRepositoryVersion();
+        return new PolicyResponse(namespace, newVersion, rejectUnknown,
+                List.copyOf(allowed), now);
+    }
+
     private LockFileResponse doLock(LockRequest request) {
         String rootName = request.rootName().trim();
         int rootVersion = request.rootVersion();
@@ -193,13 +332,37 @@ public class ArtifactServiceImpl implements ArtifactService {
                     "不存在满足全部依赖区间的未撤回版本组合，无法锁定");
         }
 
+        // 依赖解析成功后，对完整闭包校验命名空间许可证策略；任一违规整次锁定 422。
+        Map<String, String> licenses = new HashMap<>();
+        snapshot.artifacts().forEach((name, versions) -> versions.forEach(v -> {
+            if (v.license() != null) {
+                licenses.put(name + ":" + v.version(), v.license());
+            }
+        }));
+        List<LicenseViolation> violations = LicensePolicyChecker.check(
+                solution, licenses, snapshot.policies());
+        if (!violations.isEmpty()) {
+            throw ApiException.policyViolation(violations);
+        }
+
         Instant now = Instant.now(clock);
         long lockFileId = repositoryDao.insertLockFile(rootName, rootVersion, currentVersion,
                 currentRequestId.get(), now);
-        solution.forEach((n, v) -> repositoryDao.insertLockEntry(lockFileId, n, v));
+        // 固化每个解析版本在锁定时的许可证与策略版本；后续修改不改写历史。
+        solution.forEach((name, version) -> {
+            String license = licenses.get(name + ":" + version);
+            NamespacePolicy policy = snapshot.policies().get(name);
+            repositoryDao.insertLockEntry(lockFileId, name, version, license,
+                    policy == null ? 0L : policy.version());
+        });
 
         List<LockEntryResponse> entries = new ArrayList<>();
-        solution.forEach((n, v) -> entries.add(new LockEntryResponse(n, v)));
+        solution.forEach((name, version) -> {
+            String license = licenses.get(name + ":" + version);
+            NamespacePolicy policy = snapshot.policies().get(name);
+            entries.add(new LockEntryResponse(name, version, license,
+                    policy == null ? 0L : policy.version()));
+        });
         return new LockFileResponse(lockFileId, rootName, rootVersion, currentVersion, now, entries);
     }
 
@@ -295,6 +458,37 @@ public class ArtifactServiceImpl implements ArtifactService {
         }
     }
 
+    private void validatePolicyRequest(SetPolicyRequest request) {
+        if (request.namespace() == null || request.namespace().isBlank()) {
+            throw ApiException.badRequest("namespace 不能为空");
+        }
+        if (request.expectedVersion() == null || request.expectedVersion() < 0) {
+            throw ApiException.badRequest("expectedVersion 必须为非负整数");
+        }
+        if (request.rejectUnknown() == null) {
+            throw ApiException.badRequest("rejectUnknown 不能为空");
+        }
+        if (request.allowedLicenses().size() > 50) {
+            throw ApiException.badRequest("允许许可证集合最多 50 个标识");
+        }
+        for (String license : request.allowedLicenses()) {
+            if (license == null || license.isBlank()) {
+                throw ApiException.badRequest("允许许可证标识不能为空");
+            }
+            if (license.trim().length() > 64) {
+                throw ApiException.badRequest("许可证标识最长 64 字符: " + license.trim());
+            }
+        }
+    }
+
+    /** 空白许可证归一化为 null（UNKNOWN），其余去首尾空白。 */
+    private static String normalizeLicense(String license) {
+        if (license == null || license.isBlank()) {
+            return null;
+        }
+        return license.trim();
+    }
+
     private String canonicalDependencies(RegisterArtifactRequest request) {
         return request.dependencies().stream()
                 .map(d -> d.name().trim() + ":" + d.minimumVersion() + ":" + d.maximumVersion())
@@ -319,7 +513,7 @@ public class ArtifactServiceImpl implements ArtifactService {
 
     private LockFileResponse toLockResponse(LockFileRow row, List<LockEntryRow> entries) {
         List<LockEntryResponse> entryViews = entries.stream()
-                .map(e -> new LockEntryResponse(e.name(), e.version()))
+                .map(e -> new LockEntryResponse(e.name(), e.version(), e.license(), e.policyVersion()))
                 .toList();
         return new LockFileResponse(row.id(), row.rootName(), row.rootVersion(),
                 row.repositoryVersion(), row.createdAt(), entryViews);
