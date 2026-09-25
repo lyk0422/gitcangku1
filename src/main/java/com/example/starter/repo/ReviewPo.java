@@ -12,12 +12,15 @@ import java.util.List;
  * @param routeVersion    审核时的航线版本
  * @param airspaceVersion 审核时的空域版本
  * @param conclusion      CLEAR / BLOCKED
+ * @param reasonCode      审查原因：CLEAR / ZONE_HIT / EMERGENCY_EXCEPTION
  * @param hitZoneIds      命中 zoneId（字典序去重）
+ * @param hitClosureIds   紧急例外通过的关闭窗口 id（字典序），无则为空列表
  * @param pointsSnapshot  审核时航点不可变快照
  * @param requestId       提交审核的请求标识
  * @param createdAt       创建时间（epoch 毫秒）
  */
 public record ReviewPo(String reviewId, String routeId, int routeVersion, long airspaceVersion,
-                       String conclusion, List<String> hitZoneIds, List<Point> pointsSnapshot,
+                       String conclusion, String reasonCode, List<String> hitZoneIds,
+                       List<String> hitClosureIds, List<Point> pointsSnapshot,
                        String requestId, long createdAt) {
 }

@@ -30,10 +30,55 @@ CREATE TABLE IF NOT EXISTS no_fly_zone (
 -- 航线当前状态：routeId 唯一，版本从 1 开始，替换成功加一
 -- touch 仅用于审核事务对该行产生真实更新以加行级写锁，与替换操作互斥
 CREATE TABLE IF NOT EXISTS route (
-    route_id  VARCHAR(64) PRIMARY KEY COMMENT '航线唯一标识',
-    version   INT NOT NULL COMMENT '当前航线版本，初始 1，每次成功替换加一',
-    touch     BIGINT NOT NULL COMMENT '仅用于审核事务加行级写锁的计数器，无业务含义'
+    route_id      VARCHAR(64) PRIMARY KEY COMMENT '航线唯一标识',
+    version       INT NOT NULL COMMENT '当前航线版本，初始 1，每次成功替换加一',
+    touch         BIGINT NOT NULL COMMENT '仅用于审核事务加行级写锁的计数器，无业务含义',
+    status        VARCHAR(16) NOT NULL COMMENT '状态：DRAFT 待批准；APPROVED 已批准；RUNWAY_RISK 跑道关闭风险；DEPARTED 已起飞；CANCELLED 已取消',
+    category      VARCHAR(16) NULL COMMENT '航线类别：NORMAL 普通；EMERGENCY 紧急；NULL 表示无飞行计划（不参与跑道关闭与容量检查）',
+    event_no      VARCHAR(64) NULL COMMENT '紧急事件号；EMERGENCY 航线经关闭窗口例外通过时必填，否则为 NULL',
+    dep_runway_id VARCHAR(64) NULL COMMENT '计划起飞跑道标识；NULL 表示无起降计划',
+    dep_time_utc  BIGINT NULL COMMENT '计划起飞时刻，epoch 毫秒（UTC）',
+    arr_runway_id VARCHAR(64) NULL COMMENT '计划降落跑道标识；NULL 表示无起降计划',
+    arr_time_utc  BIGINT NULL COMMENT '计划降落时刻，epoch 毫秒（UTC）'
 ) COMMENT = '航线当前版本状态';
+
+-- 机场跑道：runwayId 唯一，版本从 1 开始，每次关闭窗口变更加一
+CREATE TABLE IF NOT EXISTS runway (
+    runway_id         VARCHAR(64) PRIMARY KEY COMMENT '跑道唯一标识',
+    version           INT NOT NULL COMMENT '当前跑道版本，初始 1，每次关闭窗口变更加一',
+    capacity_per_hour INT NOT NULL COMMENT '每小时起降容量（架次），审查容量约束',
+    touch             BIGINT NOT NULL COMMENT '仅用于变更事务加行级写锁的计数器，无业务含义'
+) COMMENT = '机场跑道（版本与容量约束）';
+
+-- 跑道关闭窗口：UTC 左闭右开 [start_utc, end_utc)；同一跑道窗口不得重叠，端点相接合法
+CREATE TABLE IF NOT EXISTS runway_closure (
+    closure_id      VARCHAR(64) PRIMARY KEY COMMENT '关闭窗口唯一标识（不可变）',
+    runway_id       VARCHAR(64) NOT NULL COMMENT '所属跑道标识',
+    start_utc       BIGINT NOT NULL COMMENT '关闭开始（含），epoch 毫秒（UTC）',
+    end_utc         BIGINT NOT NULL COMMENT '关闭结束（不含），epoch 毫秒（UTC），start_utc < end_utc',
+    allow_emergency BOOLEAN NOT NULL COMMENT '是否允许紧急例外：TRUE 时 EMERGENCY 航线附事件号可通过',
+    operator        VARCHAR(64) NOT NULL COMMENT '登记该关闭窗口的操作者',
+    runway_version  INT NOT NULL COMMENT '本次关闭变更生效后的跑道版本',
+    closure_key     VARCHAR(64) NOT NULL COMMENT '关闭变更幂等键，指纹含跑道版本、规范化时段、例外标志与操作者',
+    created_at      BIGINT NOT NULL COMMENT '创建时间，epoch 毫秒（UTC）'
+) COMMENT = '跑道关闭窗口（UTC 左闭右开，不可变）';
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_runway_closure_key ON runway_closure (closure_key);
+
+-- 航线跑道风险：新关闭窗口命中未来已批准 NORMAL 航线时固化的窗口快照；
+-- 改航、取消或转为合格紧急例外后删除
+CREATE TABLE IF NOT EXISTS route_risk (
+    route_id        VARCHAR(64) PRIMARY KEY COMMENT '风险航线标识（每条航线至多一条生效风险）',
+    closure_id      VARCHAR(64) NOT NULL COMMENT '命中的关闭窗口标识（快照）',
+    runway_id       VARCHAR(64) NOT NULL COMMENT '跑道标识（快照）',
+    segment         VARCHAR(16) NOT NULL COMMENT '命中航段：DEPARTURE 起飞；ARRIVAL 降落',
+    start_utc       BIGINT NOT NULL COMMENT '关闭开始（含）快照，epoch 毫秒（UTC）',
+    end_utc         BIGINT NOT NULL COMMENT '关闭结束（不含）快照，epoch 毫秒（UTC）',
+    allow_emergency BOOLEAN NOT NULL COMMENT '窗口是否允许紧急例外（快照）',
+    operator        VARCHAR(64) NOT NULL COMMENT '登记操作者（快照）',
+    runway_version  INT NOT NULL COMMENT '关闭生效后的跑道版本（快照）',
+    created_at      BIGINT NOT NULL COMMENT '风险固化时间，epoch 毫秒（UTC）'
+) COMMENT = '航线跑道关闭风险（关闭窗口不可变快照）';
 
 -- 航线点（当前版本，2~50 个，按 seq 顺序连接）
 CREATE TABLE IF NOT EXISTS route_point (
@@ -51,7 +96,9 @@ CREATE TABLE IF NOT EXISTS review (
     route_version     INT NOT NULL COMMENT '审核明确指定的航线版本',
     airspace_version  BIGINT NOT NULL COMMENT '审核明确指定的空域版本',
     conclusion        VARCHAR(16) NOT NULL COMMENT '保存时的原结论：CLEAR 通过或 BLOCKED 命中，永不改变',
+    reason_code       VARCHAR(32) NOT NULL COMMENT '审查原因：CLEAR 正常通过；ZONE_HIT 命中禁飞区；EMERGENCY_EXCEPTION 紧急例外通过',
     hit_zone_ids      CLOB NOT NULL COMMENT '命中的全部 zoneId，字典序去重后逗号拼接；未命中为空串',
+    hit_closure_ids   CLOB NOT NULL COMMENT '紧急例外通过的关闭窗口 id，字典序逗号拼接；无则为空串',
     points_snapshot   VARCHAR(4000) NOT NULL COMMENT '审核时航点不可变快照，格式 x,y;x,y',
     request_id        VARCHAR(64) NOT NULL COMMENT '提交审核的写操作请求标识',
     created_at        BIGINT NOT NULL COMMENT '创建时间，epoch 毫秒（UTC）'
@@ -62,7 +109,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_review_request ON review (request_id);
 -- 写操作幂等去重：同键同参重放原结果，异参冲突；失败不占键
 CREATE TABLE IF NOT EXISTS request_dedup (
     request_id     VARCHAR(64) PRIMARY KEY COMMENT '写操作全局唯一请求标识',
-    request_kind   VARCHAR(32) NOT NULL COMMENT '请求类型：ZONE_CREATE/ZONE_REVOKE/ROUTE_CREATE/ROUTE_REPLACE/REVIEW',
+    request_kind   VARCHAR(32) NOT NULL COMMENT '请求类型：ZONE_CREATE/ZONE_REVOKE/ROUTE_CREATE/ROUTE_REPLACE/REVIEW/REVIEW_BATCH/RUNWAY_CREATE/CLOSURE_CREATE/ROUTE_DEPART/ROUTE_CANCEL/ROUTE_EMERGENCY_EXCEPTION',
     request_hash   VARCHAR(64) NOT NULL COMMENT '规范化参数的 SHA-256 十六进制摘要，用于同键异参冲突判定',
     response_json  CLOB NOT NULL COMMENT '首次成功响应 JSON，重放时原样返回',
     created_at     BIGINT NOT NULL COMMENT '首次成功时间，epoch 毫秒（UTC）'

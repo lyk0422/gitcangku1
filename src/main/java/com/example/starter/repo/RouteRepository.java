@@ -1,6 +1,9 @@
 package com.example.starter.repo;
 
+import com.example.starter.domain.FlightPlan;
 import com.example.starter.domain.Point;
+import com.example.starter.domain.RouteCategory;
+import com.example.starter.domain.RouteStatus;
 import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
@@ -19,20 +22,13 @@ public class RouteRepository {
         this.jdbc = jdbc;
     }
 
-    /** 按 routeId 查询航线（含当前版本点列），不存在返回 null。 */
+    /** 按 routeId 查询航线（含当前版本点列与起降计划），不存在返回 null。 */
     public RoutePo findRoute(String routeId) {
-        Integer version;
-        try {
-            version = jdbc.queryForObject(
-                    "SELECT version FROM route WHERE route_id = ?", Integer.class, routeId);
-        } catch (EmptyResultDataAccessException ex) {
+        RouteRow row = findRouteRow(routeId);
+        if (row == null) {
             return null;
         }
-        if (version == null) {
-            return null;
-        }
-        List<Point> points = findPoints(routeId);
-        return new RoutePo(routeId, version, points);
+        return new RoutePo(routeId, row.version(), findPoints(routeId), row.status(), row.flightPlan());
     }
 
     /**
@@ -49,13 +45,33 @@ public class RouteRepository {
         if (locked == 0) {
             return null;
         }
-        Integer version = jdbc.queryForObject(
-                "SELECT version FROM route WHERE route_id = ?", Integer.class, routeId);
-        if (version == null) {
+        return findRoute(routeId);
+    }
+
+    private RouteRow findRouteRow(String routeId) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT version, status, category, event_no, dep_runway_id, dep_time_utc, "
+                            + "arr_runway_id, arr_time_utc FROM route WHERE route_id = ?",
+                    (rs, n) -> new RouteRow(
+                            rs.getInt("version"),
+                            rs.getString("status"),
+                            toFlightPlan(rs.getString("category"), rs.getString("event_no"),
+                                    rs.getString("dep_runway_id"), (Long) rs.getObject("dep_time_utc"),
+                                    rs.getString("arr_runway_id"), (Long) rs.getObject("arr_time_utc"))),
+                    routeId);
+        } catch (EmptyResultDataAccessException ex) {
             return null;
         }
-        List<Point> points = findPoints(routeId);
-        return new RoutePo(routeId, version, points);
+    }
+
+    private static FlightPlan toFlightPlan(String category, String eventNo,
+                                           String depRunwayId, Long depTimeUtc,
+                                           String arrRunwayId, Long arrTimeUtc) {
+        if (category == null && depRunwayId == null && arrRunwayId == null) {
+            return null;
+        }
+        return new FlightPlan(category, eventNo, depRunwayId, depTimeUtc, arrRunwayId, arrTimeUtc);
     }
 
     private List<Point> findPoints(String routeId) {
@@ -64,23 +80,53 @@ public class RouteRepository {
                 (rs, n) -> new Point(rs.getInt("x"), rs.getInt("y")), routeId);
     }
 
-    /** 创建航线（初始版本 1）并写入点列（调用方负责事务）。 */
-    public void insertRoute(String routeId, List<Point> points) {
-        jdbc.update("INSERT INTO route (route_id, version, touch) VALUES (?, 1, 0)", routeId);
+    /** 创建航线（初始版本 1，状态 DRAFT）并写入点列与起降计划（调用方负责事务）。 */
+    public void insertRoute(String routeId, List<Point> points, FlightPlan plan) {
+        jdbc.update("INSERT INTO route (route_id, version, touch, status, category, event_no, "
+                        + "dep_runway_id, dep_time_utc, arr_runway_id, arr_time_utc) "
+                        + "VALUES (?, 1, 0, ?, ?, ?, ?, ?, ?, ?)",
+                routeId, RouteStatus.DRAFT.name(),
+                plan == null ? null : plan.category(),
+                plan == null ? null : plan.eventNo(),
+                plan == null ? null : plan.depRunwayId(),
+                plan == null ? null : plan.depTimeUtc(),
+                plan == null ? null : plan.arrRunwayId(),
+                plan == null ? null : plan.arrTimeUtc());
         insertPoints(routeId, points);
     }
 
     /**
      * 条件更新航线版本：仅当当前版本等于 expectedVersion 时加一（同时推进 touch
-     * 以持有行写锁，与审核事务互斥）。
+     * 以持有行写锁，与审核事务互斥）；替换后状态回到 DRAFT 并写入新起降计划。
      *
      * @return 更新行数；0 表示版本不匹配
      */
-    public int compareAndIncrementVersion(String routeId, int expectedVersion) {
+    public int compareAndIncrementVersion(String routeId, int expectedVersion, FlightPlan plan) {
         return jdbc.update(
-                "UPDATE route SET version = version + 1, touch = touch + 1 "
+                "UPDATE route SET version = version + 1, touch = touch + 1, status = ?, "
+                        + "category = ?, event_no = ?, dep_runway_id = ?, dep_time_utc = ?, "
+                        + "arr_runway_id = ?, arr_time_utc = ? "
                         + "WHERE route_id = ? AND version = ?",
+                RouteStatus.DRAFT.name(),
+                plan == null ? null : plan.category(),
+                plan == null ? null : plan.eventNo(),
+                plan == null ? null : plan.depRunwayId(),
+                plan == null ? null : plan.depTimeUtc(),
+                plan == null ? null : plan.arrRunwayId(),
+                plan == null ? null : plan.arrTimeUtc(),
                 routeId, expectedVersion);
+    }
+
+    /** 更新航线状态（调用方负责事务与行锁）。 */
+    public void updateStatus(String routeId, String status) {
+        jdbc.update("UPDATE route SET status = ? WHERE route_id = ?", status, routeId);
+    }
+
+    /** 转为紧急例外：写入类别与事件号并恢复已批准状态（调用方负责事务与行锁）。 */
+    public void convertToEmergency(String routeId, String eventNo) {
+        jdbc.update("UPDATE route SET category = ?, event_no = ?, status = ? WHERE route_id = ?",
+                RouteCategory.EMERGENCY.name(), eventNo,
+                RouteStatus.APPROVED.name(), routeId);
     }
 
     /** 删除航线旧点列（调用方负责事务）。 */
@@ -95,5 +141,9 @@ public class RouteRepository {
             jdbc.update("INSERT INTO route_point (route_id, seq, x, y) VALUES (?, ?, ?, ?)",
                     routeId, seq++, p.x(), p.y());
         }
+    }
+
+    /** 航线行内部表示（版本、状态与起降计划）。 */
+    private record RouteRow(int version, String status, FlightPlan flightPlan) {
     }
 }
