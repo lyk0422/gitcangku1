@@ -1,5 +1,6 @@
 package com.example.starter.plan.repo;
 
+import com.example.starter.plan.model.ChainState;
 import com.example.starter.plan.model.DayPlan;
 import com.example.starter.plan.model.Occupancy;
 import com.example.starter.plan.model.PlanStatus;
@@ -27,12 +28,19 @@ import org.springframework.stereotype.Repository;
 @Repository
 public class PlanRepository {
 
+    private static final String PLAN_COLUMNS = "id, schedule_key, op_date, version, status,"
+            + " stock_key, origin_station, dest_station, chain_state";
+
     private static final RowMapper<DayPlan> PLAN_MAPPER = (rs, n) -> new DayPlan(
             rs.getLong("id"),
             rs.getString("schedule_key"),
             rs.getObject("op_date", LocalDate.class),
             rs.getInt("version"),
-            PlanStatus.valueOf(rs.getString("status")));
+            PlanStatus.valueOf(rs.getString("status")),
+            rs.getString("stock_key"),
+            rs.getString("origin_station"),
+            rs.getString("dest_station"),
+            ChainState.valueOf(rs.getString("chain_state")));
 
     private static final RowMapper<Occupancy> OCCUPANCY_MAPPER = (rs, n) -> new Occupancy(
             rs.getLong("id"),
@@ -56,20 +64,27 @@ public class PlanRepository {
     }
 
     /**
-     * 插入新计划，返回自增主键。
+     * 插入新计划，返回自增主键。车底标识与首末站同时存在或同时为 null。
      */
-    public long insertPlan(String scheduleKey, LocalDate opDate, PlanStatus status, long nowMillis) {
+    public long insertPlan(String scheduleKey, LocalDate opDate, PlanStatus status,
+                           String stockKey, String originStation, String destStation,
+                           long nowMillis) {
         KeyHolder keys = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO rail_day_plan (schedule_key, op_date, version, status, created_at, updated_at)"
-                            + " VALUES (?, ?, 1, ?, ?, ?)",
+                    "INSERT INTO rail_day_plan (schedule_key, op_date, version, status,"
+                            + " stock_key, origin_station, dest_station, chain_state,"
+                            + " created_at, updated_at)"
+                            + " VALUES (?, ?, 1, ?, ?, ?, ?, 'NORMAL', ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, scheduleKey);
             ps.setDate(2, Date.valueOf(opDate));
             ps.setString(3, status.name());
-            ps.setLong(4, nowMillis);
-            ps.setLong(5, nowMillis);
+            ps.setString(4, stockKey);
+            ps.setString(5, originStation);
+            ps.setString(6, destStation);
+            ps.setLong(7, nowMillis);
+            ps.setLong(8, nowMillis);
             return ps;
         }, keys);
         return keys.getKey().longValue();
@@ -79,7 +94,7 @@ public class PlanRepository {
      * 按业务键查询计划（不加锁）。
      */
     public Optional<DayPlan> findByKey(String scheduleKey) {
-        return jdbc.query("SELECT id, schedule_key, op_date, version, status FROM rail_day_plan"
+        return jdbc.query("SELECT " + PLAN_COLUMNS + " FROM rail_day_plan"
                         + " WHERE schedule_key = ?",
                 PLAN_MAPPER, scheduleKey).stream().findFirst();
     }
@@ -88,7 +103,7 @@ public class PlanRepository {
      * 按主键查询计划（不加锁），用于改签链遍历。
      */
     public Optional<DayPlan> findById(long planId) {
-        return jdbc.query("SELECT id, schedule_key, op_date, version, status FROM rail_day_plan"
+        return jdbc.query("SELECT " + PLAN_COLUMNS + " FROM rail_day_plan"
                         + " WHERE id = ?",
                 PLAN_MAPPER, planId).stream().findFirst();
     }
@@ -97,9 +112,58 @@ public class PlanRepository {
      * 按业务键查询计划并加行级写锁，须在事务内调用，用于串行化同一计划的更新/发布/取消。
      */
     public Optional<DayPlan> findByKeyForUpdate(String scheduleKey) {
-        return jdbc.query("SELECT id, schedule_key, op_date, version, status FROM rail_day_plan"
+        return jdbc.query("SELECT " + PLAN_COLUMNS + " FROM rail_day_plan"
                         + " WHERE schedule_key = ? FOR UPDATE",
                 PLAN_MAPPER, scheduleKey).stream().findFirst();
+    }
+
+    /**
+     * 查询指定车底在指定运营日的全部已发布计划（交路链组成段）。
+     */
+    public List<DayPlan> findPublishedByStock(String stockKey, LocalDate opDate) {
+        return jdbc.query("SELECT " + PLAN_COLUMNS + " FROM rail_day_plan"
+                        + " WHERE stock_key = ? AND op_date = ? AND status = 'PUBLISHED'",
+                PLAN_MAPPER, stockKey, Date.valueOf(opDate));
+    }
+
+    /**
+     * 查询指定车底全部运营日的已发布计划（周转参数修改后的全量重校验用）。
+     */
+    public List<DayPlan> findPublishedByStockAllDates(String stockKey) {
+        return jdbc.query("SELECT " + PLAN_COLUMNS + " FROM rail_day_plan"
+                        + " WHERE stock_key = ? AND status = 'PUBLISHED'",
+                PLAN_MAPPER, stockKey);
+    }
+
+    /**
+     * 批量更新计划的交路链状态。
+     */
+    public void updateChainState(Collection<Long> planIds, ChainState chainState, long nowMillis) {
+        if (planIds.isEmpty()) {
+            return;
+        }
+        jdbc.batchUpdate("UPDATE rail_day_plan SET chain_state = ?, updated_at = ? WHERE id = ?",
+                planIds, planIds.size(),
+                (ps, planId) -> {
+                    ps.setString(1, chainState.name());
+                    ps.setLong(2, nowMillis);
+                    ps.setLong(3, planId);
+                });
+    }
+
+    /**
+     * 清除指定车底（可选限定运营日）全部待重排标记；opDate 为 null 时清除该车底所有运营日。
+     */
+    public void clearPendingReplan(String stockKey, LocalDate opDate, long nowMillis) {
+        if (opDate == null) {
+            jdbc.update("UPDATE rail_day_plan SET chain_state = 'NORMAL', updated_at = ?"
+                            + " WHERE stock_key = ? AND chain_state = 'PENDING_REPLAN'",
+                    nowMillis, stockKey);
+        } else {
+            jdbc.update("UPDATE rail_day_plan SET chain_state = 'NORMAL', updated_at = ?"
+                            + " WHERE stock_key = ? AND op_date = ? AND chain_state = 'PENDING_REPLAN'",
+                    nowMillis, stockKey, Date.valueOf(opDate));
+        }
     }
 
     /**

@@ -1,12 +1,16 @@
 package com.example.starter.plan.service;
 
+import com.example.starter.plan.model.ChainState;
 import com.example.starter.plan.model.DayPlan;
 import com.example.starter.plan.model.Occupancy;
 import com.example.starter.plan.model.PlanStatus;
 import com.example.starter.plan.model.PublishedSlot;
 import com.example.starter.plan.model.RescheduleLink;
+import com.example.starter.plan.model.RollingStock;
 import com.example.starter.plan.repo.IdempotencyRepository;
 import com.example.starter.plan.repo.PlanRepository;
+import com.example.starter.plan.repo.RollingStockRepository;
+import com.example.starter.plan.service.ChainValidator.ChainSegment;
 import com.example.starter.plan.web.ApiException;
 import com.example.starter.plan.web.dto.CreatePlanRequest;
 import com.example.starter.plan.web.dto.OccupancyRequest;
@@ -43,8 +47,11 @@ import org.springframework.transaction.support.TransactionTemplate;
  * 铁路走廊日计划核心业务：草稿创建/整体替换、发布、取消、原子改签与查询。
  *
  * <p>并发与幂等约定：写操作按 (操作类型, requestKey) 幂等，同键同参重放返回首次成功结果，
- * 同键不同参返回 409；发布与改签经全局发布锁串行化，同一计划的更新/发布/取消/改签经行锁按事务提交顺序生效；
- * 仅成功结果写入幂等记录，失败（含 422 时隙冲突）不缓存、可修正后重试。
+ * 同键不同参返回 409；发布、改签、取消经全局发布锁串行化，同一计划的更新/发布/取消/改签经行锁按事务提交顺序生效；
+ * 仅成功结果写入幂等记录，失败（含 422 时隙冲突、422 交路链不连续）不缓存、可修正后重试。
+ *
+ * <p>车底交路：登记车底的计划在发布/改签时校验并入交路链后仍连续（站点衔接 + 最小周转），
+ * 取消中间段允许断链但追加不可变断链记录并把后续段标记为待重排。
  */
 @Service
 public class PlanService {
@@ -60,13 +67,18 @@ public class PlanService {
 
     private final PlanRepository planRepo;
     private final IdempotencyRepository idemRepo;
+    private final RollingStockRepository stockRepo;
+    private final ChainValidator chainValidator;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate tx;
 
     public PlanService(PlanRepository planRepo, IdempotencyRepository idemRepo,
+                       RollingStockRepository stockRepo, ChainValidator chainValidator,
                        ObjectMapper objectMapper, PlatformTransactionManager txManager) {
         this.planRepo = planRepo;
         this.idemRepo = idemRepo;
+        this.stockRepo = stockRepo;
+        this.chainValidator = chainValidator;
         this.objectMapper = objectMapper;
         this.tx = new TransactionTemplate(txManager);
     }
@@ -77,6 +89,7 @@ public class PlanService {
     public PlanResponse createDraft(CreatePlanRequest req) {
         validateOccupancyParams(req.occupancies());
         validateWithinOperationDay(req.occupancies(), req.opDate());
+        validateStockRegistration(req);
         String hash = hashCreate(req);
         Optional<PlanResponse> replay = replayIfPresent(OP_CREATE, req.requestKey(), hash);
         if (replay.isPresent()) {
@@ -88,7 +101,8 @@ public class PlanService {
                     throw conflict("SCHEDULE_KEY_EXISTS", "scheduleKey 已存在: " + req.scheduleKey());
                 }
                 long now = System.currentTimeMillis();
-                long planId = planRepo.insertPlan(req.scheduleKey(), req.opDate(), PlanStatus.DRAFT, now);
+                long planId = planRepo.insertPlan(req.scheduleKey(), req.opDate(), PlanStatus.DRAFT,
+                        req.stockKey(), req.originStation(), req.destStation(), now);
                 planRepo.insertOccupancies(planId, toOccupancies(planId, req.occupancies()));
                 PlanResponse response = loadPlan(req.scheduleKey());
                 idemRepo.insert(OP_CREATE, req.requestKey(), hash, toJson(response), now);
@@ -161,8 +175,14 @@ public class PlanService {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "存在时隙冲突，计划保持草稿", conflicts);
                 }
+                // 车底交路：并入本草稿后同车底同运营日交路链仍须连续
+                validateChainAfterMerge(plan, List.of());
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(plan.id(), PlanStatus.PUBLISHED, now);
+                if (plan.stockKey() != null) {
+                    // 链已恢复连续，清除本运营日待重排标记
+                    planRepo.clearPendingReplan(plan.stockKey(), plan.opDate(), now);
+                }
                 PlanResponse response = loadPlan(scheduleKey);
                 idemRepo.insert(OP_PUBLISH, requestKey, hash, toJson(response), now);
                 return response;
@@ -174,6 +194,8 @@ public class PlanService {
 
     /**
      * 取消已发布计划：时隙立即释放，历史计划与占用保留不改写。
+     * 若计划登记了车底且链上仍有后续已发布段，允许链断裂：追加不可变断链记录，
+     * 并把全部后续段标记为待重排。
      */
     public PlanResponse cancel(String scheduleKey, String requestKey) {
         String hash = hashAction(OP_CANCEL, scheduleKey);
@@ -183,6 +205,7 @@ public class PlanService {
         }
         try {
             return tx.execute(status -> {
+                planRepo.acquirePublishLock();
                 DayPlan plan = planRepo.findByKeyForUpdate(scheduleKey)
                         .orElseThrow(() -> notFound(scheduleKey));
                 if (plan.status() != PlanStatus.PUBLISHED) {
@@ -191,6 +214,9 @@ public class PlanService {
                 }
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(plan.id(), PlanStatus.CANCELLED, now);
+                if (plan.stockKey() != null) {
+                    recordChainBreak(plan, now);
+                }
                 PlanResponse response = loadPlan(scheduleKey);
                 idemRepo.insert(OP_CANCEL, requestKey, hash, toJson(response), now);
                 return response;
@@ -260,10 +286,22 @@ public class PlanService {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "新草稿存在时隙冲突，改签未生效", conflicts);
                 }
+                // 车底交路：新草稿并入其车底链（旧计划移出）后仍须连续，否则整单 422 回滚
+                if (newPlan.stockKey() != null) {
+                    validateChainAfterMerge(newPlan, List.of(oldPlan.id()));
+                }
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(oldPlan.id(), PlanStatus.CANCELLED, now);
                 planRepo.updateStatus(newPlan.id(), PlanStatus.PUBLISHED, now);
                 planRepo.insertRescheduleLink(oldPlan.id(), newPlan.id(), now);
+                if (oldPlan.stockKey() != null
+                        && !oldPlan.stockKey().equals(newPlan.stockKey())) {
+                    // 旧计划所属车底链被移出一段：按取消处理，允许断链并记录
+                    recordChainBreak(oldPlan, now);
+                }
+                if (newPlan.stockKey() != null) {
+                    planRepo.clearPendingReplan(newPlan.stockKey(), newPlan.opDate(), now);
+                }
                 RescheduleResponse response = new RescheduleResponse(
                         loadPlan(oldScheduleKey), loadPlan(req.newScheduleKey()));
                 idemRepo.insert(OP_RESCHEDULE, req.requestKey(), hash, toJson(response), now);
@@ -342,7 +380,8 @@ public class PlanService {
                 .map(o -> new OccupancyView(o.trainNo(), o.sectionId(), o.startUtc(), o.endUtc()))
                 .toList();
         return new PlanResponse(plan.scheduleKey(), plan.opDate(), plan.version(),
-                plan.status().name(), views);
+                plan.status().name(), plan.stockKey(), plan.originStation(), plan.destStation(),
+                plan.chainState().name(), views);
     }
 
     private List<Occupancy> toOccupancies(long planId, List<OccupancyRequest> requests) {
@@ -383,6 +422,82 @@ public class PlanService {
                 throw badRequest("第 " + i + " 条占用不在运营日 " + opDate + "（Asia/Shanghai）内");
             }
         }
+    }
+
+    /**
+     * 车底交路登记参数校验：车底标识与首末站必须同时提供或同时缺省；
+     * 提供时车底须已登记，否则 400。
+     */
+    private void validateStockRegistration(CreatePlanRequest req) {
+        boolean anyPresent = req.stockKey() != null || req.originStation() != null
+                || req.destStation() != null;
+        boolean allPresent = req.stockKey() != null && req.originStation() != null
+                && req.destStation() != null;
+        if (!anyPresent) {
+            return;
+        }
+        if (!allPresent || req.stockKey().isBlank() || req.originStation().isBlank()
+                || req.destStation().isBlank()) {
+            throw badRequest("stockKey、originStation、destStation 必须同时提供且非空白");
+        }
+        if (stockRepo.findByKey(req.stockKey()).isEmpty()) {
+            throw badRequest("车底未登记: " + req.stockKey());
+        }
+    }
+
+    /**
+     * 校验指定草稿并入其车底交路链后链仍连续：加载同车底同运营日已发布段
+     * （排除 excludePlanIds），加上本草稿段，排序后逐相邻段校验站点衔接与最小周转。
+     * 任一违规抛出 422 并携带全部断点明细；计划无车底登记时直接跳过。
+     *
+     * @param excludePlanIds 合并时排除的计划 id（如改签中被取消的旧计划）
+     */
+    private void validateChainAfterMerge(DayPlan draft, List<Long> excludePlanIds) {
+        if (draft.stockKey() == null) {
+            return;
+        }
+        RollingStock stock = stockRepo.findByKey(draft.stockKey())
+                .orElseThrow(() -> new IllegalStateException("车底登记缺失: " + draft.stockKey()));
+        List<ChainSegment> segments = new ArrayList<>(
+                chainValidator.loadPublishedSegments(draft.stockKey(), draft.opDate()).stream()
+                        .filter(s -> !excludePlanIds.contains(s.planId())).toList());
+        segments.add(chainValidator.segmentOf(draft));
+        segments.sort(Comparator.comparing(ChainSegment::departureUtc)
+                .thenComparing(ChainSegment::planId));
+        List<Map<String, Object>> violations =
+                chainValidator.validate(segments, stock.minTurnaroundMinutes());
+        if (!violations.isEmpty()) {
+            throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "CHAIN_LINK_CONFLICT",
+                    "并入后交路链不连续：站点不衔接或周转不足", violations);
+        }
+    }
+
+    /**
+     * 计划从其车底交路链移除后的断链处理（取消或改签移出时调用，须在移除生效后调用）：
+     * 若同车底同运营日仍有后续已发布段，追加不可变断链记录并把全部后续段标记为待重排。
+     */
+    private void recordChainBreak(DayPlan removedPlan, long now) {
+        ChainSegment removed = chainValidator.segmentOf(removedPlan);
+        List<ChainSegment> remaining = chainValidator.loadPublishedSegments(
+                removedPlan.stockKey(), removedPlan.opDate());
+        List<ChainSegment> successors = remaining.stream()
+                .filter(s -> s.departureUtc().isAfter(removed.departureUtc())
+                        || (s.departureUtc().equals(removed.departureUtc())
+                                && s.planId() > removed.planId()))
+                .toList();
+        if (successors.isEmpty()) {
+            return;
+        }
+        String prevKey = remaining.stream()
+                .filter(s -> !successors.contains(s))
+                .max(Comparator.comparing(ChainSegment::departureUtc)
+                        .thenComparing(ChainSegment::planId))
+                .map(ChainSegment::scheduleKey)
+                .orElse(null);
+        stockRepo.insertBreak(removedPlan.stockKey(), removedPlan.opDate(), removedPlan.id(),
+                removedPlan.scheduleKey(), prevKey, successors.get(0).scheduleKey(), now);
+        planRepo.updateChainState(successors.stream().map(ChainSegment::planId).toList(),
+                ChainState.PENDING_REPLAN, now);
     }
 
     /**
@@ -483,7 +598,10 @@ public class PlanService {
 
     private String hashCreate(CreatePlanRequest req) {
         StringBuilder sb = new StringBuilder(OP_CREATE).append('\n')
-                .append(req.scheduleKey()).append('\n').append(req.opDate());
+                .append(req.scheduleKey()).append('\n').append(req.opDate()).append('\n')
+                .append(req.stockKey()).append('\n')
+                .append(req.originStation()).append('\n')
+                .append(req.destStation());
         appendOccupancies(sb, req.occupancies());
         return sha256(sb.toString());
     }

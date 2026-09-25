@@ -7,6 +7,10 @@ CREATE TABLE IF NOT EXISTS rail_day_plan (
     op_date DATE NOT NULL,
     version INT NOT NULL,
     status VARCHAR(16) NOT NULL,
+    stock_key VARCHAR(64),
+    origin_station VARCHAR(64),
+    dest_station VARCHAR(64),
+    chain_state VARCHAR(16) NOT NULL DEFAULT 'NORMAL',
     created_at BIGINT NOT NULL,
     updated_at BIGINT NOT NULL,
     PRIMARY KEY (id),
@@ -18,6 +22,10 @@ COMMENT ON COLUMN rail_day_plan.schedule_key IS '计划业务键，全局唯一�
 COMMENT ON COLUMN rail_day_plan.op_date IS '运营日期（Asia/Shanghai 日历日）';
 COMMENT ON COLUMN rail_day_plan.version IS '计划版本，草稿占用整体替换成功一次加一';
 COMMENT ON COLUMN rail_day_plan.status IS '计划状态：DRAFT 草稿 / PUBLISHED 已发布 / CANCELLED 已取消';
+COMMENT ON COLUMN rail_day_plan.stock_key IS '车底标识，NULL 表示不参与车底交路链；与首末站同时存在或同时为空';
+COMMENT ON COLUMN rail_day_plan.origin_station IS '始发站，NULL 表示未登记车底交路';
+COMMENT ON COLUMN rail_day_plan.dest_station IS '终到站，NULL 表示未登记车底交路';
+COMMENT ON COLUMN rail_day_plan.chain_state IS '交路链状态：NORMAL 正常 / PENDING_REPLAN 待重排（前序段取消导致断链后标记）';
 COMMENT ON COLUMN rail_day_plan.created_at IS '创建时刻，UTC 毫秒';
 COMMENT ON COLUMN rail_day_plan.updated_at IS '最近变更时刻，UTC 毫秒';
 
@@ -54,7 +62,7 @@ CREATE TABLE IF NOT EXISTS idempotency_record (
 );
 COMMENT ON TABLE idempotency_record IS '写操作幂等记录，仅缓存成功结果，失败不缓存可重试';
 COMMENT ON COLUMN idempotency_record.id IS '主键';
-COMMENT ON COLUMN idempotency_record.op_type IS '操作类型：CREATE / UPDATE / PUBLISH / CANCEL / RESCHEDULE';
+COMMENT ON COLUMN idempotency_record.op_type IS '操作类型：CREATE / UPDATE / PUBLISH / CANCEL / RESCHEDULE / STOCK_CREATE / TURNAROUND';
 COMMENT ON COLUMN idempotency_record.request_key IS '客户端幂等键，同一操作类型内唯一';
 COMMENT ON COLUMN idempotency_record.request_hash IS '请求参数规范化后的 SHA-256，同键不同参判定 409';
 COMMENT ON COLUMN idempotency_record.response_json IS '首次成功响应快照（JSON），重放原样返回';
@@ -75,11 +83,51 @@ COMMENT ON COLUMN rail_plan_reschedule_link.predecessor_plan_id IS '直接前驱
 COMMENT ON COLUMN rail_plan_reschedule_link.successor_plan_id IS '直接后继（改签发布的新计划）id，关联 rail_day_plan.id，全表唯一';
 COMMENT ON COLUMN rail_plan_reschedule_link.created_at IS '关联创建时刻，UTC 毫秒';
 
+CREATE TABLE IF NOT EXISTS rail_rolling_stock (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    stock_key VARCHAR(64) NOT NULL,
+    min_turnaround_minutes INT NOT NULL,
+    version INT NOT NULL,
+    created_at BIGINT NOT NULL,
+    updated_at BIGINT NOT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT uk_rail_rolling_stock_key UNIQUE (stock_key)
+);
+COMMENT ON TABLE rail_rolling_stock IS '车底登记与最小周转参数';
+COMMENT ON COLUMN rail_rolling_stock.id IS '主键';
+COMMENT ON COLUMN rail_rolling_stock.stock_key IS '车底标识，全局唯一';
+COMMENT ON COLUMN rail_rolling_stock.min_turnaround_minutes IS '最小周转分钟数（1～240），相邻段终到至始发的最小间隔';
+COMMENT ON COLUMN rail_rolling_stock.version IS '周转参数版本，修改须携带 expectedVersion 乐观校验，成功一次加一';
+COMMENT ON COLUMN rail_rolling_stock.created_at IS '登记时刻，UTC 毫秒';
+COMMENT ON COLUMN rail_rolling_stock.updated_at IS '最近变更时刻，UTC 毫秒';
+
+CREATE TABLE IF NOT EXISTS rail_chain_break (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    stock_key VARCHAR(64) NOT NULL,
+    op_date DATE NOT NULL,
+    cancelled_plan_id BIGINT NOT NULL,
+    cancelled_schedule_key VARCHAR(64) NOT NULL,
+    prev_schedule_key VARCHAR(64),
+    next_schedule_key VARCHAR(64),
+    created_at BIGINT NOT NULL,
+    PRIMARY KEY (id)
+);
+COMMENT ON TABLE rail_chain_break IS '车底交路断链记录，取消中间段或改签移出时追加，追加后不可变';
+COMMENT ON COLUMN rail_chain_break.id IS '主键';
+COMMENT ON COLUMN rail_chain_break.stock_key IS '断链车底标识，关联 rail_rolling_stock.stock_key';
+COMMENT ON COLUMN rail_chain_break.op_date IS '断链发生运营日（Asia/Shanghai 日历日）';
+COMMENT ON COLUMN rail_chain_break.cancelled_plan_id IS '被移除计划 id，关联 rail_day_plan.id';
+COMMENT ON COLUMN rail_chain_break.cancelled_schedule_key IS '被移除计划业务键';
+COMMENT ON COLUMN rail_chain_break.prev_schedule_key IS '断点前一已发布段业务键，NULL 表示被移除段为链首';
+COMMENT ON COLUMN rail_chain_break.next_schedule_key IS '断点后一已发布段业务键（最近后续段）';
+COMMENT ON COLUMN rail_chain_break.created_at IS '记录创建时刻，UTC 毫秒';
+CREATE INDEX IF NOT EXISTS idx_rail_chain_break_stock ON rail_chain_break (stock_key, op_date);
+
 CREATE TABLE IF NOT EXISTS publish_lock (
     id INT NOT NULL,
     PRIMARY KEY (id)
 );
-COMMENT ON TABLE publish_lock IS '发布/改签全局互斥锁，保证并发发布与改签按事务提交顺序裁决';
-COMMENT ON COLUMN publish_lock.id IS '锁行 id，固定为 1，发布与改签时 SELECT ... FOR UPDATE 串行化';
+COMMENT ON TABLE publish_lock IS '发布/改签/取消/周转参数修改全局互斥锁，保证并发写按事务提交顺序裁决';
+COMMENT ON COLUMN publish_lock.id IS '锁行 id，固定为 1，写操作时 SELECT ... FOR UPDATE 串行化';
 
 MERGE INTO publish_lock KEY(id) VALUES (1);
