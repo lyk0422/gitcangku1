@@ -57,6 +57,20 @@ CREATE TABLE IF NOT EXISTS command_keys (
     CONSTRAINT uk_command_key UNIQUE (command_key)
 ) COMMENT='命令幂等键表';
 
+CREATE TABLE IF NOT EXISTS incident_suspensions (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    incident_id BIGINT NOT NULL COMMENT '所属事件 id，关联 incidents.id',
+    suspend_key VARCHAR(128) NOT NULL COMMENT '挂起幂等键，由指挥员提交；恢复须提交同一 suspendKey',
+    reason VARCHAR(1024) NOT NULL COMMENT '挂起原因，挂起提交时固化，历史不可改写',
+    suspended_by VARCHAR(128) NOT NULL COMMENT '挂起操作人（提交时的当前指挥人）',
+    suspended_at TIMESTAMP(6) NOT NULL COMMENT '挂起起始 UTC 时刻（注入时钟）；挂起区间整体从遏制已消耗时长中排除',
+    resume_note VARCHAR(1024) NULL COMMENT '恢复说明；仅已封口区间有值，写入后不可改写',
+    resumed_by VARCHAR(128) NULL COMMENT '恢复操作人；仅已封口区间有值',
+    resumed_at TIMESTAMP(6) NULL COMMENT '恢复封口 UTC 时刻；为空表示当前生效中挂起，同一事件至多一条为空区间',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '服务端落库 UTC 时间',
+    updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间（仅恢复封口时更新一次）'
+) COMMENT='遏制时限挂起区间表';
+
 CREATE TABLE IF NOT EXISTS incident_escalations (
     id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
     incident_id BIGINT NOT NULL COMMENT '所属事件 id，关联 incidents.id；每事件至多一条升级记录',

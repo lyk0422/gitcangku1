@@ -73,12 +73,47 @@ class SchemaH2ScriptTest {
                         + " WHERE id = 1 AND status = 'OPEN'");
                 assertThat(lateAck).isZero();
 
+                // 挂起区间：插入生效区间，条件封口恰好一次，重复封口更新 0 行（历史不可改写）
+                st.execute("INSERT INTO incident_suspensions (incident_id, suspend_key, reason,"
+                        + " suspended_by, suspended_at, created_at, updated_at) VALUES"
+                        + " (1,'SK-1','等待厂商','alice','" + Timestamp.from(now) + "','"
+                        + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                int firstClose = st.executeUpdate("UPDATE incident_suspensions SET resume_note='到场',"
+                        + " resumed_by='alice', resumed_at='" + Timestamp.from(now.plusSeconds(60))
+                        + "', updated_at='" + Timestamp.from(now.plusSeconds(60))
+                        + "' WHERE incident_id = 1 AND resumed_at IS NULL");
+                assertThat(firstClose).isEqualTo(1);
+                int secondClose = st.executeUpdate("UPDATE incident_suspensions SET resume_note='改写',"
+                        + " resumed_at='" + Timestamp.from(now.plusSeconds(120))
+                        + "' WHERE incident_id = 1 AND resumed_at IS NULL");
+                assertThat(secondClose).isZero();
+                // 同一事件可再插入下一条区间（区间只追加），生效中区间由服务层行锁保证至多一条
+                st.execute("INSERT INTO incident_suspensions (incident_id, suspend_key, reason,"
+                        + " suspended_by, suspended_at, created_at, updated_at) VALUES"
+                        + " (1,'SK-2','二次挂起','alice','" + Timestamp.from(now.plusSeconds(120))
+                        + "','" + Timestamp.from(now.plusSeconds(120)) + "','"
+                        + Timestamp.from(now.plusSeconds(120)) + "')");
+
                 try (ResultSet rs = st.executeQuery(
                         "SELECT status, deadline_at FROM incident_escalations WHERE incident_id = 1")) {
                     assertThat(rs.next()).isTrue();
                     assertThat(rs.getString("status")).isEqualTo("CANCELLED");
                     assertThat(rs.getTimestamp("deadline_at").toInstant())
                             .isEqualTo(now.plusSeconds(300));
+                }
+
+                try (ResultSet rs = st.executeQuery(
+                        "SELECT suspend_key, resume_note, resumed_at FROM incident_suspensions"
+                                + " WHERE incident_id = 1 ORDER BY id")) {
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getString("suspend_key")).isEqualTo("SK-1");
+                    assertThat(rs.getString("resume_note")).isEqualTo("到场");
+                    assertThat(rs.getTimestamp("resumed_at").toInstant())
+                            .isEqualTo(now.plusSeconds(60));
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getString("suspend_key")).isEqualTo("SK-2");
+                    assertThat(rs.getString("resumed_at")).isNull();
+                    assertThat(rs.next()).isFalse();
                 }
             }
         }

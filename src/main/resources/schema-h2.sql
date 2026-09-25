@@ -57,6 +57,20 @@ CREATE TABLE IF NOT EXISTS command_keys (
     CONSTRAINT uk_command_key UNIQUE (command_key)
 );
 
+CREATE TABLE IF NOT EXISTS incident_suspensions (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    suspend_key VARCHAR(128) NOT NULL,
+    reason VARCHAR(1024) NOT NULL,
+    suspended_by VARCHAR(128) NOT NULL,
+    suspended_at TIMESTAMP(6) NOT NULL,
+    resume_note VARCHAR(1024) NULL,
+    resumed_by VARCHAR(128) NULL,
+    resumed_at TIMESTAMP(6) NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS incident_escalations (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     incident_id BIGINT NOT NULL,

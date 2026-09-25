@@ -4,6 +4,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.HexFormat;
@@ -15,7 +16,9 @@ import com.example.starter.incident.dto.Requests.ActionRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
 import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
+import com.example.starter.incident.dto.Requests.ResumeRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
+import com.example.starter.incident.dto.Requests.SuspendRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
@@ -25,6 +28,8 @@ import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
 import com.example.starter.incident.dto.Responses.IncidentView;
 import com.example.starter.incident.dto.Responses.StatusChangeView;
+import com.example.starter.incident.dto.Responses.SuspensionHistoryView;
+import com.example.starter.incident.dto.Responses.SuspensionView;
 import com.example.starter.incident.dto.Responses.TransferView;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -39,6 +44,8 @@ import org.springframework.transaction.annotation.Transactional;
  * 幂等约定：commandKey 全局唯一，同键同参重放首次响应，同键改参返回 409。
  * 遏制期限：首次进入 COMMANDING 时以该次接管 UTC 时刻按等级确定
  * （S1=5分钟、S2=15分钟、S3=60分钟、S4=240分钟），交接不重置。
+ * 时限挂起：挂起区间整体从已消耗时长中排除，有效期限随挂起顺延；
+ * 累计挂起上限为原时限一倍，剩余时限按当前时钟与区间实时计算，不持久化可变剩余值。
  */
 @Service
 public class IncidentService {
@@ -51,14 +58,17 @@ public class IncidentService {
 
     private final IncidentRepository incidents;
     private final EscalationRepository escalations;
+    private final SuspensionRepository suspensions;
     private final CommandKeyRepository commandKeys;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public IncidentService(IncidentRepository incidents, EscalationRepository escalations,
-                           CommandKeyRepository commandKeys, ObjectMapper objectMapper, Clock clock) {
+                           SuspensionRepository suspensions, CommandKeyRepository commandKeys,
+                           ObjectMapper objectMapper, Clock clock) {
         this.incidents = incidents;
         this.escalations = escalations;
+        this.suspensions = suspensions;
         this.commandKeys = commandKeys;
         this.objectMapper = objectMapper;
         this.clock = clock;
@@ -246,6 +256,10 @@ public class IncidentService {
                             incident.status(), targetStatus, actor, now));
                     if (targetStatus == IncidentStatus.CONTAINED) {
                         escalations.cancelOpenForIncident(incident.id(), now);
+                        // 挂起与遏制并发：挂起先提交时以遏制时刻封口生效区间，
+                        // 恢复先提交时区间已封口（更新 0 行）；保证区间状态与事件状态自洽。
+                        suspensions.closeOpenForIncident(incident.id(),
+                                "遏制登记时自动封口（并发裁决）", actor, now);
                     }
                     return toView(incidents.findByKey(incidentKey).orElseThrow(), null);
                 });
@@ -269,9 +283,14 @@ public class IncidentService {
                         return toEscalationHistory(incident, List.of(existing.get()));
                     }
                     Instant currentTime = now();
-                    if (incident.status() == IncidentStatus.COMMANDING
+                    List<Suspension> intervals = suspensions.listByIncident(incident.id());
+                    // 挂起期间计时冻结，不触发超时升级要求（即便墙钟已越过原始期限）
+                    boolean suspendedNow = SuspensionClock.findOpen(intervals).isPresent();
+                    if (!suspendedNow
+                            && incident.status() == IncidentStatus.COMMANDING
                             && incident.deadlineAt() != null
-                            && !currentTime.isBefore(incident.deadlineAt())) {
+                            && SuspensionClock.isOverdue(startAt(incident), limitOf(incident),
+                                    intervals, currentTime)) {
                         escalations.insert(new Escalation(0L, incident.id(), incident.deadlineAt(),
                                 currentTime, incident.commander(), EscalationStatus.OPEN,
                                 null, null, null, currentTime, currentTime));
@@ -309,6 +328,105 @@ public class IncidentService {
                     return toEscalationView(
                             escalations.findByIncident(incident.id()).orElseThrow());
                 });
+    }
+
+    /**
+     * 遏制时限挂起：仅当前指挥人可对未遏制（COMMANDING）事件提交 suspendKey 与原因。
+     * 已遏制/已关闭/已升级确认不得挂起（409）；已有生效挂起重复挂起 409；
+     * 累计挂起达到原时限一倍时返回 422 并给出已累计挂起时长。挂起期间计时暂停。
+     */
+    @Transactional
+    public SuspensionView suspend(String incidentKey, String actor, SuspendRequest req) {
+        String commandKey = requireText(req.commandKey(), "commandKey");
+        String suspendKey = requireText(req.suspendKey(), "suspendKey");
+        String reason = requireText(req.reason(), "reason");
+        Incident incident = lockIncident(incidentKey);
+        return runIdempotent(commandKey, "suspend",
+                hash(incidentKey, actor, suspendKey, reason), SuspensionView.class, () -> {
+                    requireCommander(incident, actor);
+                    if (incident.status() != IncidentStatus.COMMANDING) {
+                        throw ApiException.conflict(
+                                "仅 COMMANDING 状态可挂起时限，当前状态: " + incident.status());
+                    }
+                    escalations.findByIncident(incident.id()).ifPresent(e -> {
+                        if (e.status() == EscalationStatus.ACKNOWLEDGED) {
+                            throw ApiException.conflict("事件已升级确认，不得挂起");
+                        }
+                    });
+                    List<Suspension> intervals = suspensions.listByIncident(incident.id());
+                    if (SuspensionClock.findOpen(intervals).isPresent()) {
+                        throw ApiException.conflict("事件已存在生效中的挂起，不能重复挂起");
+                    }
+                    Duration limit = limitOf(incident);
+                    Duration already = SuspensionClock.totalClosedSuspended(intervals);
+                    if (already.compareTo(limit) >= 0) {
+                        throw ApiException.unprocessable(
+                                "累计挂起时长已达上限（原时限一倍），不能再次挂起；"
+                                        + "已累计挂起毫秒数=" + already.toMillis()
+                                        + "，上限毫秒数=" + limit.toMillis());
+                    }
+                    Instant now = now();
+                    long id = suspensions.insert(new Suspension(0L, incident.id(), suspendKey, reason,
+                            actor, now, null, null, null, now, now));
+                    return toSuspensionView(
+                            suspensions.findById(id).orElseThrow(), now);
+                });
+    }
+
+    /**
+     * 恢复计时：须提交与当前生效挂起相同的 suspendKey 与非空说明。
+     * 未挂起时恢复返回 409；suspendKey 不匹配返回 409。恢复时刻封口区间，
+     * 恢复后剩余时限 = 原时限 - 挂起前已消耗活跃时长，挂起区间整体从消耗中排除。
+     */
+    @Transactional
+    public SuspensionView resume(String incidentKey, String actor, ResumeRequest req) {
+        String commandKey = requireText(req.commandKey(), "commandKey");
+        String suspendKey = requireText(req.suspendKey(), "suspendKey");
+        String note = requireText(req.note(), "note");
+        Incident incident = lockIncident(incidentKey);
+        return runIdempotent(commandKey, "resume",
+                hash(incidentKey, actor, suspendKey, note), SuspensionView.class, () -> {
+                    requireCommander(incident, actor);
+                    Suspension open = suspensions.findOpen(incident.id())
+                            .orElseThrow(() -> ApiException.conflict("事件当前没有生效中的挂起，不能恢复"));
+                    if (!open.suspendKey().equals(suspendKey)) {
+                        throw ApiException.conflict(
+                                "suspendKey 与当前生效挂起不匹配: " + open.suspendKey());
+                    }
+                    Instant now = now();
+                    int updated = suspensions.close(open.id(), note, actor, now);
+                    if (updated == 0) {
+                        throw ApiException.conflict("挂起区间已被并发恢复，不能重复恢复");
+                    }
+                    return toSuspensionView(
+                            suspensions.findById(open.id()).orElseThrow(), now);
+                });
+    }
+
+    /**
+     * 查询挂起区间明细与实时剩余时限。只读，按当前时钟与挂起区间实时计算，
+     * 不持久化可变剩余值，不隐式写入。
+     */
+    @Transactional(readOnly = true)
+    public SuspensionHistoryView suspensionHistory(String incidentKey) {
+        Incident incident = incidents.findByKey(incidentKey)
+                .orElseThrow(() -> ApiException.notFound("事件不存在: " + incidentKey));
+        if (incident.deadlineAt() == null) {
+            return new SuspensionHistoryView(null, false, null, 0L, 0L, 0L, List.of());
+        }
+        Instant now = now();
+        List<Suspension> intervals = suspensions.listByIncident(incident.id());
+        Duration limit = limitOf(incident);
+        Duration suspended = SuspensionClock.totalSuspended(intervals, now);
+        Instant effective = SuspensionClock.effectiveDeadline(
+                startAt(incident), limit, intervals, now);
+        Duration remaining = SuspensionClock.remaining(
+                startAt(incident), limit, intervals, now);
+        boolean open = SuspensionClock.findOpen(intervals).isPresent();
+        List<SuspensionView> views = intervals.stream()
+                .map(s -> toSuspensionView(s, now)).toList();
+        return new SuspensionHistoryView(incident.deadlineAt(), open, effective,
+                remaining.toMillis(), suspended.toMillis(), limit.toMillis(), views);
     }
 
     /**
@@ -459,5 +577,29 @@ public class IncidentService {
         List<EscalationView> views = list.stream().map(this::toEscalationView).toList();
         EscalationView current = views.isEmpty() ? null : views.get(views.size() - 1);
         return new EscalationHistoryView(incident.deadlineAt(), current, views);
+    }
+
+    /**
+     * 事件等级对应的原遏制时限；deadlineAt 已在接管时按此时限写入。
+     */
+    private Duration limitOf(Incident incident) {
+        return Duration.ofMinutes(CONTAINMENT_MINUTES.get(incident.severity()));
+    }
+
+    /**
+     * 反推接管起算时刻：原始期限 = 接管时刻 + 等级时限。
+     */
+    private Instant startAt(Incident incident) {
+        return incident.deadlineAt().minus(limitOf(incident));
+    }
+
+    /**
+     * 组装挂起区间视图；生效中区间的挂起时长按查询当前时刻计算。
+     */
+    private SuspensionView toSuspensionView(Suspension suspension, Instant now) {
+        return new SuspensionView(suspension.id(), suspension.suspendKey(), suspension.reason(),
+                suspension.suspendedBy(), suspension.suspendedAt(), suspension.resumeNote(),
+                suspension.resumedBy(), suspension.resumedAt(),
+                suspension.suspendedMillisUntil(now));
     }
 }
