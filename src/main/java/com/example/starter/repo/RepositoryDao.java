@@ -164,19 +164,22 @@ public class RepositoryDao {
     }
 
     /** 新增锁文件主记录，返回自增主键。 */
-    public long insertLockFile(String rootName, int rootVersion, long repositoryVersion,
+    public long insertLockFile(String lockName, String rootName, int rootVersion,
+                               long repositoryVersion, int policyVersion,
                                String requestId, Instant createdAt) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbcTemplate.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO lock_file (root_name, root_version, repository_version, request_id, created_at) "
-                            + "VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO lock_file (lock_name, root_name, root_version, repository_version, "
+                            + "policy_version, request_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
-            ps.setString(1, rootName);
-            ps.setInt(2, rootVersion);
-            ps.setLong(3, repositoryVersion);
-            ps.setString(4, requestId);
-            ps.setTimestamp(5, Timestamp.from(createdAt));
+            ps.setString(1, lockName);
+            ps.setString(2, rootName);
+            ps.setInt(3, rootVersion);
+            ps.setLong(4, repositoryVersion);
+            ps.setInt(5, policyVersion);
+            ps.setString(6, requestId);
+            ps.setTimestamp(7, Timestamp.from(createdAt));
             return ps;
         }, keyHolder);
         Number key = keyHolder.getKey();
@@ -234,8 +237,8 @@ public class RepositoryDao {
     }
 
     /** 锁文件列表行：不含条目明细。 */
-    public record LockFileRow(long id, String rootName, int rootVersion,
-                              long repositoryVersion, Instant createdAt) {
+    public record LockFileRow(long id, String lockName, String rootName, int rootVersion,
+                              long repositoryVersion, int policyVersion, Instant createdAt) {
     }
 
     /** 锁文件条目行。 */
@@ -245,20 +248,22 @@ public class RepositoryDao {
     /** 查询全部历史锁文件，按 ID 升序。 */
     public List<LockFileRow> listLockFiles() {
         return jdbcTemplate.query(
-                "SELECT id, root_name, root_version, repository_version, created_at "
+                "SELECT id, lock_name, root_name, root_version, repository_version, policy_version, created_at "
                         + "FROM lock_file ORDER BY id ASC",
-                (rs, n) -> new LockFileRow(rs.getLong("id"), rs.getString("root_name"),
-                        rs.getInt("root_version"), rs.getLong("repository_version"),
+                (rs, n) -> new LockFileRow(rs.getLong("id"), rs.getString("lock_name"),
+                        rs.getString("root_name"), rs.getInt("root_version"),
+                        rs.getLong("repository_version"), rs.getInt("policy_version"),
                         rs.getTimestamp("created_at").toInstant()));
     }
 
     /** 按主键查询锁文件，不存在返回 null。 */
     public LockFileRow getLockFile(long id) {
         List<LockFileRow> rows = jdbcTemplate.query(
-                "SELECT id, root_name, root_version, repository_version, created_at "
+                "SELECT id, lock_name, root_name, root_version, repository_version, policy_version, created_at "
                         + "FROM lock_file WHERE id = ?",
-                (rs, n) -> new LockFileRow(rs.getLong("id"), rs.getString("root_name"),
-                        rs.getInt("root_version"), rs.getLong("repository_version"),
+                (rs, n) -> new LockFileRow(rs.getLong("id"), rs.getString("lock_name"),
+                        rs.getString("root_name"), rs.getInt("root_version"),
+                        rs.getLong("repository_version"), rs.getInt("policy_version"),
                         rs.getTimestamp("created_at").toInstant()),
                 id);
         return rows.isEmpty() ? null : rows.get(0);
@@ -272,6 +277,18 @@ public class RepositoryDao {
                 (rs, n) -> new LockEntryRow(rs.getLong("lock_file_id"),
                         rs.getString("name"), rs.getInt("version")),
                 lockFileId);
+    }
+
+    /** 按锁定图名称查询全部锁文件，按 ID 升序。 */
+    public List<LockFileRow> listLockFilesByName(String lockName) {
+        return jdbcTemplate.query(
+                "SELECT id, lock_name, root_name, root_version, repository_version, policy_version, created_at "
+                        + "FROM lock_file WHERE lock_name = ? ORDER BY id ASC",
+                (rs, n) -> new LockFileRow(rs.getLong("id"), rs.getString("lock_name"),
+                        rs.getString("root_name"), rs.getInt("root_version"),
+                        rs.getLong("repository_version"), rs.getInt("policy_version"),
+                        rs.getTimestamp("created_at").toInstant()),
+                lockName);
     }
 
     private record ArtifactRow(long id, String name, int version, boolean withdrawn) {

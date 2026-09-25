@@ -10,7 +10,12 @@ import com.example.starter.api.dto.RegisterArtifactRequest;
 import com.example.starter.domain.ArtifactVersion;
 import com.example.starter.domain.DependencyRange;
 import com.example.starter.domain.LockResolver;
+import com.example.starter.domain.ProvenanceAttestation;
+import com.example.starter.domain.ProvenancePolicy;
+import com.example.starter.domain.ProvenancePolicyEvaluator;
+import com.example.starter.domain.ProvenanceViolation;
 import com.example.starter.domain.RepositorySnapshot;
+import com.example.starter.repo.ProvenanceDao;
 import com.example.starter.repo.RepositoryDao;
 import com.example.starter.repo.RepositoryDao.IdempotentRecord;
 import com.example.starter.repo.RepositoryDao.LockEntryRow;
@@ -51,15 +56,18 @@ public class ArtifactServiceImpl implements ArtifactService {
     private static final String OP_LOCK = "CREATE_LOCK";
 
     private final RepositoryDao repositoryDao;
+    private final ProvenanceDao provenanceDao;
     private final TransactionTemplate transactionTemplate;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public ArtifactServiceImpl(RepositoryDao repositoryDao,
+                               ProvenanceDao provenanceDao,
                                TransactionTemplate transactionTemplate,
                                ObjectMapper objectMapper,
                                Clock clock) {
         this.repositoryDao = repositoryDao;
+        this.provenanceDao = provenanceDao;
         this.transactionTemplate = transactionTemplate;
         this.objectMapper = objectMapper;
         this.clock = clock;
@@ -92,10 +100,11 @@ public class ArtifactServiceImpl implements ArtifactService {
         if (request.rootName() == null || request.rootName().isBlank()) {
             throw ApiException.badRequest("rootName 不能为空");
         }
-        String hash = sha256(OP_LOCK + "|" + request.rootName().trim() + "|" + request.rootVersion()
-                + "|" + request.expectedRepositoryVersion());
+        String lockName = normalizeLockName(request.lockName());
+        String hash = sha256(OP_LOCK + "|" + lockName + "|" + request.rootName().trim() + "|"
+                + request.rootVersion() + "|" + request.expectedRepositoryVersion());
         return executeIdempotent(requestId, OP_LOCK, hash, 201,
-                () -> doLock(request), LockFileResponse.class);
+                () -> doLock(lockName, request), LockFileResponse.class);
     }
 
     @Override
@@ -167,7 +176,7 @@ public class ArtifactServiceImpl implements ArtifactService {
                 Instant.now(clock), toDependencyViews(artifact.dependencies()));
     }
 
-    private LockFileResponse doLock(LockRequest request) {
+    private LockFileResponse doLock(String lockName, LockRequest request) {
         String rootName = request.rootName().trim();
         int rootVersion = request.rootVersion();
 
@@ -193,14 +202,83 @@ public class ArtifactServiceImpl implements ArtifactService {
                     "不存在满足全部依赖区间的未撤回版本组合，无法锁定");
         }
 
+        // 来源策略门禁：仅纳入来源策略管理的锁定图需要校验，全部直接及传递制品必须满足当前策略版本。
+        int policyVersion = 0;
+        if (lockName != null) {
+            policyVersion = provenanceDao.currentPolicyVersion(lockName);
+            if (policyVersion == 0) {
+                throw ApiException.unprocessable(
+                        "锁定图 " + lockName + " 尚未定义来源策略，无法按来源策略解析");
+            }
+            ProvenancePolicy policy = provenanceDao.loadPolicy(lockName, policyVersion);
+            Map<String, ArtifactVersion> chosen = chosenArtifacts(snapshot, solution);
+            List<ProvenanceViolation> violations = ProvenancePolicyEvaluator.evaluate(
+                    chosen, rootName, policy, this::lookupAttestation);
+            if (!violations.isEmpty()) {
+                throw provenanceViolation(violations);
+            }
+        }
+
         Instant now = Instant.now(clock);
-        long lockFileId = repositoryDao.insertLockFile(rootName, rootVersion, currentVersion,
-                currentRequestId.get(), now);
+        long lockFileId = repositoryDao.insertLockFile(lockName, rootName, rootVersion,
+                currentVersion, policyVersion, currentRequestId.get(), now);
         solution.forEach((n, v) -> repositoryDao.insertLockEntry(lockFileId, n, v));
 
         List<LockEntryResponse> entries = new ArrayList<>();
         solution.forEach((n, v) -> entries.add(new LockEntryResponse(n, v)));
-        return new LockFileResponse(lockFileId, rootName, rootVersion, currentVersion, now, entries);
+        return new LockFileResponse(lockFileId, rootName, rootVersion, currentVersion,
+                policyVersion, now, entries);
+    }
+
+    /** 将解析结果（名称 -> 版本号）还原为含依赖声明的制品版本视图，按名称升序。 */
+    private Map<String, ArtifactVersion> chosenArtifacts(RepositorySnapshot snapshot,
+                                                         Map<String, Integer> solution) {
+        TreeMap<String, ArtifactVersion> chosen = new TreeMap<>();
+        solution.forEach((name, version) -> {
+            List<ArtifactVersion> candidates = snapshot.artifacts().get(name);
+            if (candidates == null) {
+                throw new IllegalStateException("解析结果中的制品不存在: " + name);
+            }
+            candidates.stream().filter(a -> a.version() == version).findFirst()
+                    .ifPresent(a -> chosen.put(name, a));
+        });
+        return chosen;
+    }
+
+    /** 证明查询：按提交顺序裁决，最新一条决定坐标证明状态。 */
+    private ProvenancePolicyEvaluator.LookupResult lookupAttestation(String name, int version) {
+        ProvenanceAttestation latest = provenanceDao.loadLatestAttestation(name, version);
+        if (latest == null) {
+            return new ProvenancePolicyEvaluator.LookupResult(
+                    ProvenancePolicyEvaluator.LookupResult.State.ABSENT, null);
+        }
+        if (latest.revoked()) {
+            return new ProvenancePolicyEvaluator.LookupResult(
+                    ProvenancePolicyEvaluator.LookupResult.State.REVOKED, latest);
+        }
+        return new ProvenancePolicyEvaluator.LookupResult(
+                ProvenancePolicyEvaluator.LookupResult.State.VALID, latest);
+    }
+
+    /** 构造带来源违规明细的 422 异常：可区分原因并列出完整路径。 */
+    private ApiException provenanceViolation(List<ProvenanceViolation> violations) {
+        String message = violations.stream()
+                .map(v -> "[" + v.reason() + "] " + String.join(" -> ", v.path()) + "：" + v.detail())
+                .reduce((a, b) -> a + "; " + b)
+                .orElse("来源策略校验失败");
+        return ApiException.provenanceViolation("来源策略校验失败：" + message,
+                violations.stream()
+                        .map(v -> new com.example.starter.api.dto.ViolationView(
+                                v.reason(), v.path(), v.detail()))
+                        .toList());
+    }
+
+    /** 规范化锁定图名称：空白视为未命名（旧锁定图，不做来源门禁）。 */
+    private static String normalizeLockName(String lockName) {
+        if (lockName == null || lockName.isBlank()) {
+            return null;
+        }
+        return lockName.trim();
     }
 
     // ------------------------------------------------------------------
@@ -322,7 +400,7 @@ public class ArtifactServiceImpl implements ArtifactService {
                 .map(e -> new LockEntryResponse(e.name(), e.version()))
                 .toList();
         return new LockFileResponse(row.id(), row.rootName(), row.rootVersion(),
-                row.repositoryVersion(), row.createdAt(), entryViews);
+                row.repositoryVersion(), row.policyVersion(), row.createdAt(), entryViews);
     }
 
     private void requireRequestId(String requestId) {
