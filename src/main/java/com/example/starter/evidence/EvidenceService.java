@@ -37,6 +37,11 @@ public class EvidenceService {
     static final String OP_LOAN_RETURN = "LOAN_RETURN";
 
     /**
+     * 未指定库位时的默认库位编码。
+     */
+    static final String DEFAULT_LOCATION = "DEFAULT";
+
+    /**
      * 借出最长期限：72 小时。
      */
     static final long MAX_LOAN_HOURS = 72;
@@ -46,6 +51,7 @@ public class EvidenceService {
     private final SealInspectionRepository inspectionRepository;
     private final LoanRecordRepository loanRepository;
     private final CommandLogRepository commandLogRepository;
+    private final LocationRepository locationRepository;
     private final ObjectMapper objectMapper;
     private final EvidenceClock clock;
 
@@ -54,6 +60,7 @@ public class EvidenceService {
                            SealInspectionRepository inspectionRepository,
                            LoanRecordRepository loanRepository,
                            CommandLogRepository commandLogRepository,
+                           LocationRepository locationRepository,
                            ObjectMapper objectMapper,
                            EvidenceClock clock) {
         this.evidenceRepository = evidenceRepository;
@@ -61,12 +68,14 @@ public class EvidenceService {
         this.inspectionRepository = inspectionRepository;
         this.loanRepository = loanRepository;
         this.commandLogRepository = commandLogRepository;
+        this.locationRepository = locationRepository;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
 
     /**
      * 证物入库：初始状态 SEALED，保管人为操作人。evidenceKey 全局唯一。
+     * 未指定库位时进入默认库位 DEFAULT；指定库位必须存在且启用，入库后该库位库存版本递增。
      */
     @Transactional
     public StoredResponse intake(String actorId, IntakeRequest request, String requestHash) {
@@ -77,9 +86,17 @@ public class EvidenceService {
         if (evidenceRepository.findByKey(request.evidenceKey()).isPresent()) {
             throw ApiException.conflict("证物已存在: " + request.evidenceKey());
         }
+        String locationCode = request.locationCode() == null || request.locationCode().isBlank()
+                ? DEFAULT_LOCATION : request.locationCode();
+        StorageLocation location = locationRepository.findByCodeForUpdate(locationCode)
+                .orElseThrow(() -> ApiException.conflict("库位不存在: " + locationCode));
+        if (location.status() != LocationStatus.ACTIVE) {
+            throw ApiException.conflict("库位已停用，禁止入库: " + locationCode);
+        }
         LocalDateTime now = LocalDateTime.now();
         evidenceRepository.insert(request.evidenceKey(), request.caseKey(), request.category(),
-                request.sealNo(), actorId, now);
+                request.sealNo(), actorId, locationCode, now);
+        locationRepository.incrementVersion(locationCode, now);
         Evidence evidence = evidenceRepository.findByKey(request.evidenceKey()).orElseThrow();
         return record(request.commandKey(), OP_INTAKE, actorId, requestHash, 201, toView(evidence));
     }
@@ -403,7 +420,7 @@ public class EvidenceService {
 
     private EvidenceView toView(Evidence evidence) {
         return new EvidenceView(evidence.evidenceKey(), evidence.caseKey(), evidence.category(),
-                evidence.sealNo(), evidence.custodianId(), evidence.status(),
+                evidence.sealNo(), evidence.custodianId(), evidence.locationCode(), evidence.status(),
                 evidence.createdAt(), evidence.updatedAt());
     }
 

@@ -1,5 +1,6 @@
 package com.example.starter.error;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
@@ -12,6 +13,7 @@ import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
 import java.time.LocalDateTime;
+import java.util.List;
 import java.util.stream.Collectors;
 
 /**
@@ -25,7 +27,8 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(ApiException.class)
     public ResponseEntity<ErrorBody> handleApi(ApiException ex) {
         return ResponseEntity.status(ex.status())
-                .body(new ErrorBody(ex.status().value(), ex.getMessage(), LocalDateTime.now()));
+                .body(new ErrorBody(ex.status().value(), ex.getMessage(), LocalDateTime.now(),
+                        ex.items()));
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
@@ -52,12 +55,20 @@ public class GlobalExceptionHandler {
     }
 
     /**
-     * 统一错误响应体。
+     * 统一错误响应体。items 为逐项说明（如迁移前置校验逐件结果）；无明细时不序列化该字段。
      *
      * @param status    HTTP 状态码
      * @param message   错误描述
      * @param timestamp 发生时间（Asia/Shanghai）
+     * @param items     逐项说明；null 表示无逐项明细
      */
-    public record ErrorBody(int status, String message, LocalDateTime timestamp) {
+    public record ErrorBody(int status, String message, LocalDateTime timestamp,
+                            @JsonInclude(JsonInclude.Include.NON_NULL) List<String> items) {
+        /**
+         * 无逐项明细的错误响应。
+         */
+        public ErrorBody(int status, String message, LocalDateTime timestamp) {
+            this(status, message, timestamp, null);
+        }
     }
 }

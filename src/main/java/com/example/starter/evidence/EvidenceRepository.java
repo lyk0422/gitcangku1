@@ -26,16 +26,16 @@ public class EvidenceRepository {
     }
 
     /**
-     * 插入新证物，初始状态 SEALED，保管人为入库操作人。
+     * 插入新证物，初始状态 SEALED，保管人为入库操作人，库位为指定库位或默认库位。
      */
     public void insert(String evidenceKey, String caseKey, String category, String sealNo,
-                       String custodianId, LocalDateTime now) {
+                       String custodianId, String locationCode, LocalDateTime now) {
         jdbc.update("""
                         INSERT INTO evidence
-                            (evidence_key, case_key, category, seal_no, custodian_id, status, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            (evidence_key, case_key, category, seal_no, custodian_id, location_code, status, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
-                evidenceKey, caseKey, category, sealNo, custodianId,
+                evidenceKey, caseKey, category, sealNo, custodianId, locationCode,
                 EvidenceStatus.SEALED.name(), now, now);
     }
 
@@ -85,6 +85,24 @@ public class EvidenceRepository {
                 ROW_MAPPER, custodianId, EvidenceStatus.SEALED.name());
     }
 
+    /**
+     * 查询指定库位当前库存的证物（库位库存查询）。
+     */
+    public List<Evidence> findByLocationCode(String locationCode) {
+        return jdbc.query(
+                "SELECT * FROM evidence WHERE location_code = ? ORDER BY id",
+                ROW_MAPPER, locationCode);
+    }
+
+    /**
+     * 迁移执行时原子切换证物所在库位（调用前必须已通过 findByKeyForUpdate 锁定证物行）。
+     */
+    public void updateLocation(String evidenceKey, String locationCode, LocalDateTime now) {
+        jdbc.update(
+                "UPDATE evidence SET location_code = ?, updated_at = ? WHERE evidence_key = ?",
+                locationCode, now, evidenceKey);
+    }
+
     private static final class EvidenceRowMapper implements RowMapper<Evidence> {
         @Override
         public Evidence mapRow(ResultSet rs, int rowNum) throws SQLException {
@@ -95,6 +113,7 @@ public class EvidenceRepository {
                     rs.getString("category"),
                     rs.getString("seal_no"),
                     rs.getString("custodian_id"),
+                    rs.getString("location_code"),
                     EvidenceStatus.valueOf(rs.getString("status")),
                     rs.getObject("created_at", LocalDateTime.class),
                     rs.getObject("updated_at", LocalDateTime.class));
