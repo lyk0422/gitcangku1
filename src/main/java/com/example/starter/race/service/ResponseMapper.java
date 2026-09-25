@@ -7,9 +7,12 @@ import com.example.starter.race.api.ResultEntryResponse;
 import com.example.starter.race.api.RunnerResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.StandingResponse;
+import com.example.starter.race.api.TeamSnapshotResponse;
+import com.example.starter.race.api.TeamStandingsResponse;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
+import com.example.starter.race.domain.TeamStanding;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
 import com.example.starter.race.persistence.PenaltyRow;
@@ -18,6 +21,7 @@ import com.example.starter.race.persistence.RunnerRow;
 import com.example.starter.race.persistence.SnapshotCheckpointRow;
 import com.example.starter.race.persistence.SnapshotEntryRow;
 import com.example.starter.race.persistence.SnapshotRow;
+import com.example.starter.race.persistence.TeamSealSnapshotRow;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -150,5 +154,38 @@ final class ResponseMapper {
                 .toList();
         return new RunnerTimingResponse(
                 snapshot.raceId(), bib, snapshot.version(), finishTimeMs, passes);
+    }
+
+    /** 实时团队成绩条目转响应。 */
+    static TeamStandingsResponse.TeamStandingEntry toTeamStandingEntry(TeamStanding standing) {
+        return new TeamStandingsResponse.TeamStandingEntry(
+                standing.teamId(),
+                standing.rosterVersion(),
+                standing.members(),
+                standing.complete(),
+                standing.teamScoreMs(),
+                standing.teamRank());
+    }
+
+    /** 封榜队伍快照行转实时团队成绩响应条目（SEALED 后查询团队得分使用）。 */
+    static TeamStandingsResponse.TeamStandingEntry toTeamStandingEntry(TeamSealSnapshotRow row) {
+        return new TeamStandingsResponse.TeamStandingEntry(
+                row.teamId(),
+                row.rosterVersion(),
+                row.members(),
+                row.complete(),
+                row.teamScoreMs(),
+                row.teamRank());
+    }
+
+    /** 封榜队伍快照行转快照响应条目。 */
+    static TeamSnapshotResponse.TeamSnapshotEntry toTeamSnapshotEntry(TeamSealSnapshotRow row) {
+        return new TeamSnapshotResponse.TeamSnapshotEntry(
+                row.teamId(),
+                row.rosterVersion(),
+                row.members(),
+                row.complete(),
+                row.teamScoreMs(),
+                row.teamRank());
     }
 }
