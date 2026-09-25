@@ -51,3 +51,34 @@ CREATE TABLE IF NOT EXISTS release_record (
     released_at DATETIME(6) NOT NULL COMMENT '放行时间（UTC）',
     KEY idx_release_measurement (measurement_id)
 ) COMMENT='放行历史';
+
+-- 联合放行批次：跨仪器 2～20 条测量的一致放行；记录创建后不可变。
+CREATE TABLE IF NOT EXISTS joint_release_batch (
+    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY COMMENT '联合放行批次自增主键',
+    joint_batch_key VARCHAR(64) NOT NULL COMMENT '业务联合批次键，全局唯一，作为幂等键',
+    request_id VARCHAR(96) NOT NULL COMMENT '请求幂等键 requestId；同键同参重放返回首次响应快照',
+    released_by VARCHAR(64) NOT NULL COMMENT '放行人（X-Actor-Id）',
+    released_at DATETIME(6) NOT NULL COMMENT '放行提交时刻（UTC）',
+    -- 成功响应快照：固化首次请求返回顺序；重放时以集合比对，换序视为同参
+    snapshot_keys TEXT NOT NULL COMMENT '成功时固化的测量键列表（首次请求顺序的 JSON 数组文本）',
+    created_at DATETIME(6) NOT NULL COMMENT '记录创建时间（UTC），与放行时刻一致',
+    CONSTRAINT uk_joint_batch_key UNIQUE (joint_batch_key),
+    CONSTRAINT uk_joint_batch_request UNIQUE (request_id)
+) COMMENT='跨仪器联合放行批次（不可变）';
+
+-- 联合放行明细：每条测量一行，固化证书与计算值快照；记录创建后不可变。
+CREATE TABLE IF NOT EXISTS joint_release_item (
+    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY COMMENT '联合放行明细自增主键',
+    joint_batch_id BIGINT NOT NULL COMMENT '关联 joint_release_batch.id',
+    joint_batch_key VARCHAR(64) NOT NULL COMMENT '冗余联合批次键，便于按批次查询',
+    measurement_id BIGINT NOT NULL COMMENT '测量记录 ID',
+    measurement_key VARCHAR(64) NOT NULL COMMENT '测量业务键快照',
+    instrument_id VARCHAR(64) NOT NULL COMMENT '仪器 ID 快照（允许跨仪器混合）',
+    certificate_id BIGINT NOT NULL COMMENT '本次放行使用的校准证书 ID 快照',
+    computed_value DECIMAL(38,12) NOT NULL COMMENT '放行时固化的未舍入计算值 a×读数+b 快照',
+    released_by VARCHAR(64) NOT NULL COMMENT '放行人（X-Actor-Id）',
+    released_at DATETIME(6) NOT NULL COMMENT '放行时刻（UTC），整批一致',
+    KEY idx_joint_item_batch (joint_batch_id),
+    KEY idx_joint_item_key (joint_batch_key),
+    KEY idx_joint_item_measurement (measurement_id)
+) COMMENT='联合放行批次测量明细（不可变快照）';
