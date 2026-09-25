@@ -2,13 +2,22 @@ package com.example.starter.water;
 
 import com.example.starter.water.WaterRepository.AllocationRow;
 import com.example.starter.water.WaterRepository.CommandRow;
+import com.example.starter.water.WaterRepository.CorrectionRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
+import com.example.starter.water.WaterRepository.SnapshotRow;
 import com.example.starter.water.WaterRepository.TransferRow;
 import com.example.starter.water.WaterRepository.WindowRow;
+import com.example.starter.water.dto.Dtos.AllocationLedgerResponse;
 import com.example.starter.water.dto.Dtos.AllocationResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
+import com.example.starter.water.dto.Dtos.CorrectionBatchResponse;
+import com.example.starter.water.dto.Dtos.CorrectionPreviewItem;
+import com.example.starter.water.dto.Dtos.CorrectionPreviewResponse;
+import com.example.starter.water.dto.Dtos.CorrectionResponse;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.LedgerEntryResponse;
+import com.example.starter.water.dto.Dtos.SnapshotResponse;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferResponse;
 import com.example.starter.water.dto.Dtos.WindowResponse;
@@ -21,7 +30,12 @@ import org.springframework.transaction.support.TransactionTemplate;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
@@ -40,6 +54,7 @@ public class WaterService {
     static final String STATUS_REQUESTED = "REQUESTED";
     static final String STATUS_APPROVED = "APPROVED";
     static final String STATUS_CANCELLED = "CANCELLED";
+    static final String STATUS_REVOKED = "REVOKED";
 
     private static final long NANOS_PER_SECOND = 1_000_000_000L;
     private static final Pattern AMOUNT_PATTERN = Pattern.compile("\\d{1,16}(\\.\\d{1,3})?");
@@ -134,6 +149,9 @@ public class WaterService {
                 throw ApiException.quotaExceeded("批准后将超过当前可用总量 " + fmt(available));
             }
             repository.updateAllocationStatus(allocation.id(), STATUS_APPROVED, nowNanos());
+            // 原核销流水：批准即版本 1 的核销记录入账
+            repository.insertLedger(allocation.allocationKey(), window.id(), "WRITE_OFF", null,
+                    allocation.amount(), allocation.amount(), nowNanos());
             return toAllocationResponse(repository.findAllocationByKey(allocationKey));
         });
     }
@@ -159,6 +177,9 @@ public class WaterService {
                 throw ApiException.conflict("ALLOCATION_ALREADY_CANCELLED", "申请已取消，不能重复取消");
             }
             repository.updateAllocationStatus(allocation.id(), STATUS_CANCELLED, nowNanos());
+            // 取消流水：持有额度归零
+            repository.insertLedger(allocation.allocationKey(), allocation.windowId(), "CANCEL", null,
+                    allocation.heldAmount().negate(), BigDecimal.ZERO, nowNanos());
             return toAllocationResponse(repository.findAllocationByKey(allocationKey));
         });
     }
@@ -219,6 +240,11 @@ public class WaterService {
             long now = nowNanos();
             repository.decrementHeldAmount(lockedSource.id(), amount, now);
             repository.updateAllocationStatus(lockedTarget.id(), STATUS_APPROVED, now);
+            // 转出流水：源持有额度等额扣减；目标以 WRITE_OFF 入账（额度来自转让而非普通批准）
+            repository.insertLedger(lockedSource.allocationKey(), lockedSource.windowId(), "TRANSFER_OUT", null,
+                    amount.negate(), lockedSource.heldAmount().subtract(amount), now);
+            repository.insertLedger(lockedTarget.allocationKey(), lockedTarget.windowId(), "WRITE_OFF", null,
+                    amount, amount, now);
             try {
                 repository.insertTransfer(transferKey, lockedSource.windowId(), sourceAllocationKey,
                         targetAllocationKey, amount, actor, now);
@@ -316,6 +342,325 @@ public class WaterService {
     }
 
     // ------------------------------------------------------------------
+    // 计量更正
+    // ------------------------------------------------------------------
+
+    /**
+     * 登记计量更正申请。meterKey 为幂等指纹键：指纹含原核销版本、校正数、读表时刻、原因和操作者，
+     * 同键同参重放首次结果，同键改参 409，校验失败事务回滚不占键。窗口关闭后仍可登记。
+     */
+    public CorrectionResponse submitCorrection(String meterKey, String allocationKey, Long baseVersion,
+                                               String correctedAmount, String readingUtc, String reason,
+                                               String actor) {
+        requireKey("meterKey", meterKey);
+        requireKey("allocationKey", allocationKey);
+        requireKey("X-Actor-Id", actor);
+        if (baseVersion == null || baseVersion < 1) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "baseVersion 必须为大于等于 1 的整数");
+        }
+        BigDecimal corrected = parseNonNegativeAmount("correctedAmount", correctedAmount);
+        long readingNanos = parseInstant("readingUtc", readingUtc);
+        String reasonText = requireReason(reason);
+        String params = "CORRECTION_SUBMIT|" + meterKey + "|" + allocationKey + "|" + baseVersion + "|"
+                + corrected.toPlainString() + "|" + readingNanos + "|" + reasonText + "|" + actor;
+        return runCommand("CORRECTION_SUBMIT", meterKey, params, CorrectionResponse.class, () -> {
+            AllocationRow allocation = repository.findAllocationByKey(allocationKey);
+            if (allocation == null) {
+                throw ApiException.notFound("ALLOCATION_NOT_FOUND", "核销记录不存在: " + allocationKey);
+            }
+            lockWindowOf(allocation);
+            // 窗口锁内重读，避免与取消/转让并发时使用过期状态
+            allocation = repository.lockAllocationByKey(allocationKey);
+            if (!STATUS_APPROVED.equals(allocation.status())) {
+                throw ApiException.conflict("ALLOCATION_NOT_APPROVED",
+                        "只有已批准（APPROVED）的核销记录才能登记计量更正");
+            }
+            repository.insertCorrection(meterKey, allocationKey, allocation.windowId(), baseVersion,
+                    corrected, readingNanos, reasonText, actor, nowNanos());
+            return toCorrectionResponse(repository.findCorrectionByKey(meterKey));
+        });
+    }
+
+    /**
+     * 批量批准计量更正：批内按更正提交顺序裁决，逐条重算最终余额、已结算转让后的持有额度与窗口储备；
+     * 任一更正使历史时点之后可用量为负或侵占储备即 422，全部更正、额度和流水同事务回滚。
+     */
+    public CorrectionBatchResponse approveCorrections(String commandKey, List<String> meterKeys) {
+        requireKey("commandKey", commandKey);
+        requireMeterKeys(meterKeys);
+        String params = "CORRECTION_APPROVE|" + String.join(",", meterKeys);
+        return runCommand("CORRECTION_APPROVE", commandKey, params, CorrectionBatchResponse.class, () -> {
+            List<CorrectionRow> batch = loadBatch(meterKeys);
+            Map<Long, WindowRow> windows = lockWindowsOf(batch);
+            long now = nowNanos();
+            for (CorrectionRow correction : batch) {
+                if (isClosed(windows.get(correction.windowId()), now)) {
+                    throw ApiException.conflict("WINDOW_CLOSED",
+                            "窗口已关闭，不能批准影响已结算余额的更正: " + correction.meterKey());
+                }
+            }
+            List<CorrectionResponse> responses = new ArrayList<>();
+            // 试算并逐条入账：任一失败抛异常，整批事务回滚
+            Map<Long, BigDecimal> projectedByWindow = new HashMap<>();
+            for (CorrectionRow correction : batch) {
+                CorrectionRow locked = repository.lockCorrectionByKey(correction.meterKey());
+                requireRequestable(locked);
+                AllocationRow allocation = repository.lockAllocationByKey(locked.allocationKey());
+                if (!STATUS_APPROVED.equals(allocation.status())) {
+                    throw ApiException.conflict("ALLOCATION_NOT_APPROVED",
+                            "核销记录当前不是 APPROVED，不能批准更正: " + locked.meterKey());
+                }
+                if (locked.baseVersion() != allocation.version()) {
+                    throw ApiException.conflict("STALE_VERSION",
+                            "原核销版本 " + locked.baseVersion() + " 与当前版本 " + allocation.version()
+                                    + " 不一致: " + locked.meterKey());
+                }
+                WindowRow window = windows.get(locked.windowId());
+                BigDecimal projected = projectedByWindow
+                        .computeIfAbsent(window.id(), repository::sumApprovedAmount)
+                        .subtract(allocation.heldAmount()).add(locked.correctedAmount());
+                BigDecimal available = availableTotal(window);
+                if (projected.compareTo(available) > 0) {
+                    throw ApiException.unprocessable("RESERVE_VIOLATION",
+                            "更正 " + locked.meterKey() + " 使历史时点之后可用量为负并侵占储备："
+                                    + "更正后已结算总量 " + fmt(projected) + " 超过可用总量 " + fmt(available));
+                }
+                projectedByWindow.put(window.id(), projected);
+                repository.setHeldAmountAndVersion(allocation.id(), locked.correctedAmount(),
+                        allocation.version() + 1, now);
+                repository.markCorrectionApproved(locked.id(), allocation.heldAmount(), now);
+                repository.insertSnapshot(locked.meterKey(), locked.allocationKey(), locked.windowId(),
+                        locked.correctedAmount(), locked.readingNanos(), locked.reason(), locked.actor(), now);
+                // 更正反向流水：不覆盖原核销，以差额反向入账
+                repository.insertLedger(locked.allocationKey(), locked.windowId(), "CORRECTION",
+                        locked.meterKey(), locked.correctedAmount().subtract(allocation.heldAmount()),
+                        locked.correctedAmount(), now);
+                responses.add(toCorrectionResponse(repository.findCorrectionByKey(locked.meterKey())));
+            }
+            return new CorrectionBatchResponse(responses);
+        });
+    }
+
+    /**
+     * 撤销已批准更正：恢复批准前持有额度并产生撤销反向流水，须同样通过最终态储备校验；
+     * 窗口关闭后不能撤销影响已结算余额的更正。
+     */
+    public CorrectionResponse revokeCorrection(String commandKey, String meterKey) {
+        requireKey("commandKey", commandKey);
+        requireKey("meterKey", meterKey);
+        String params = "CORRECTION_REVOKE|" + meterKey;
+        return runCommand("CORRECTION_REVOKE", commandKey, params, CorrectionResponse.class, () -> {
+            CorrectionRow correction = repository.findCorrectionByKey(meterKey);
+            if (correction == null) {
+                throw ApiException.notFound("CORRECTION_NOT_FOUND", "计量更正不存在: " + meterKey);
+            }
+            WindowRow window = repository.lockWindowById(correction.windowId());
+            long now = nowNanos();
+            if (isClosed(window, now)) {
+                throw ApiException.conflict("WINDOW_CLOSED", "窗口已关闭，不能撤销影响已结算余额的更正");
+            }
+            CorrectionRow locked = repository.lockCorrectionByKey(meterKey);
+            if (STATUS_REVOKED.equals(locked.status())) {
+                throw ApiException.conflict("CORRECTION_ALREADY_REVOKED", "更正已撤销，不能重复撤销");
+            }
+            if (!STATUS_APPROVED.equals(locked.status())) {
+                throw ApiException.conflict("CORRECTION_NOT_APPROVED", "只有已批准的更正才能撤销");
+            }
+            AllocationRow allocation = repository.lockAllocationByKey(locked.allocationKey());
+            if (!STATUS_APPROVED.equals(allocation.status())) {
+                throw ApiException.conflict("ALLOCATION_NOT_APPROVED",
+                        "核销记录当前不是 APPROVED，不能撤销更正");
+            }
+            BigDecimal restored = locked.previousAmount();
+            BigDecimal projected = repository.sumApprovedAmount(window.id())
+                    .subtract(allocation.heldAmount()).add(restored);
+            BigDecimal available = availableTotal(window);
+            if (projected.compareTo(available) > 0) {
+                throw ApiException.unprocessable("RESERVE_VIOLATION",
+                        "撤销后已结算总量 " + fmt(projected) + " 超过可用总量 " + fmt(available)
+                                + "，侵占储备，撤销被拒绝");
+            }
+            repository.setHeldAmountAndVersion(allocation.id(), restored, allocation.version() + 1, now);
+            repository.markCorrectionRevoked(locked.id(), now);
+            // 撤销反向流水：把更正差额再反向入账
+            repository.insertLedger(allocation.allocationKey(), window.id(), "REVERSAL", meterKey,
+                    restored.subtract(allocation.heldAmount()), restored, now);
+            return toCorrectionResponse(repository.findCorrectionByKey(meterKey));
+        });
+    }
+
+    /**
+     * 批量批准预检（只读不落库）：按提交顺序试算每个更正，返回可区分的拒绝原因；
+     * 已判定可批准的更正计入后续试算状态。
+     */
+    public CorrectionPreviewResponse previewCorrections(List<String> meterKeys) {
+        requireMeterKeys(meterKeys);
+        List<CorrectionRow> found = new ArrayList<>();
+        Map<String, CorrectionRow> byKey = new LinkedHashMap<>();
+        for (String meterKey : meterKeys) {
+            CorrectionRow correction = repository.findCorrectionByKey(meterKey);
+            if (correction != null) {
+                found.add(correction);
+                byKey.put(meterKey, correction);
+            }
+        }
+        found.sort(Comparator.comparingLong(CorrectionRow::id));
+        long now = nowNanos();
+        Map<Long, WindowRow> windows = new HashMap<>();
+        Map<Long, BigDecimal> projectedByWindow = new HashMap<>();
+        Map<Long, Long> versions = new HashMap<>();
+        Map<Long, BigDecimal> helds = new HashMap<>();
+        Map<String, CorrectionPreviewItem> results = new LinkedHashMap<>();
+        for (CorrectionRow correction : found) {
+            results.put(correction.meterKey(), previewOne(correction, now, windows, projectedByWindow,
+                    versions, helds));
+        }
+        List<CorrectionPreviewItem> items = new ArrayList<>();
+        for (String meterKey : meterKeys) {
+            CorrectionRow correction = byKey.get(meterKey);
+            items.add(correction == null
+                    ? new CorrectionPreviewItem(meterKey, false, "CORRECTION_NOT_FOUND", "计量更正不存在: " + meterKey)
+                    : results.get(meterKey));
+        }
+        return new CorrectionPreviewResponse(items);
+    }
+
+    /** 查询单个计量更正视图。 */
+    public CorrectionResponse getCorrection(String meterKey) {
+        CorrectionRow correction = repository.findCorrectionByKey(meterKey);
+        if (correction == null) {
+            throw ApiException.notFound("CORRECTION_NOT_FOUND", "计量更正不存在: " + meterKey);
+        }
+        return toCorrectionResponse(correction);
+    }
+
+    /** 查询更正对应的不可变读表快照。 */
+    public SnapshotResponse getSnapshot(String meterKey) {
+        SnapshotRow snapshot = repository.findSnapshotByMeterKey(meterKey);
+        if (snapshot == null) {
+            throw ApiException.notFound("SNAPSHOT_NOT_FOUND", "读表快照不存在（更正尚未批准）: " + meterKey);
+        }
+        return new SnapshotResponse(snapshot.meterKey(), snapshot.allocationKey(), snapshot.windowId(),
+                fmt(snapshot.correctedAmount()), toIso(snapshot.readingNanos()), snapshot.reason(),
+                snapshot.actor(), toIso(snapshot.createdNanos()));
+    }
+
+    /** 查询核销记录全部流水（原核销、转出、取消、更正与撤销反向流水），按入账顺序即余额演算。 */
+    public AllocationLedgerResponse getAllocationLedger(String allocationKey) {
+        if (repository.findAllocationByKey(allocationKey) == null) {
+            throw ApiException.notFound("ALLOCATION_NOT_FOUND", "核销记录不存在: " + allocationKey);
+        }
+        List<LedgerEntryResponse> entries = repository.listLedger(allocationKey).stream()
+                .map(row -> new LedgerEntryResponse(row.id(), row.entryType(), row.meterKey(),
+                        fmt(row.delta()), fmt(row.balanceAfter()), toIso(row.createdNanos())))
+                .toList();
+        return new AllocationLedgerResponse(allocationKey, entries);
+    }
+
+    /** 预检单个更正；通过则把试算结果计入后续更正的试算状态。 */
+    private CorrectionPreviewItem previewOne(CorrectionRow correction, long now,
+                                             Map<Long, WindowRow> windows,
+                                             Map<Long, BigDecimal> projectedByWindow,
+                                             Map<Long, Long> versions,
+                                             Map<Long, BigDecimal> helds) {
+        String meterKey = correction.meterKey();
+        if (!STATUS_REQUESTED.equals(correction.status())) {
+            String code = STATUS_APPROVED.equals(correction.status())
+                    ? "CORRECTION_ALREADY_APPROVED" : "CORRECTION_ALREADY_REVOKED";
+            return new CorrectionPreviewItem(meterKey, false, code, "更正当前状态为 " + correction.status());
+        }
+        WindowRow window = windows.computeIfAbsent(correction.windowId(), repository::findWindowById);
+        if (window == null) {
+            return new CorrectionPreviewItem(meterKey, false, "WINDOW_NOT_FOUND", "供水窗口不存在");
+        }
+        if (isClosed(window, now)) {
+            return new CorrectionPreviewItem(meterKey, false, "WINDOW_CLOSED",
+                    "窗口已关闭，不能批准影响已结算余额的更正");
+        }
+        AllocationRow allocation = repository.findAllocationByKey(correction.allocationKey());
+        if (allocation == null || !STATUS_APPROVED.equals(allocation.status())) {
+            return new CorrectionPreviewItem(meterKey, false, "ALLOCATION_NOT_APPROVED",
+                    "核销记录当前不是 APPROVED");
+        }
+        long version = versions.getOrDefault(allocation.id(), allocation.version());
+        if (correction.baseVersion() != version) {
+            return new CorrectionPreviewItem(meterKey, false, "STALE_VERSION",
+                    "原核销版本 " + correction.baseVersion() + " 与当前版本 " + version + " 不一致");
+        }
+        BigDecimal held = helds.getOrDefault(allocation.id(), allocation.heldAmount());
+        BigDecimal projected = projectedByWindow
+                .computeIfAbsent(window.id(), repository::sumApprovedAmount)
+                .subtract(held).add(correction.correctedAmount());
+        BigDecimal available = availableTotal(window);
+        if (projected.compareTo(available) > 0) {
+            return new CorrectionPreviewItem(meterKey, false, "RESERVE_VIOLATION",
+                    "更正后已结算总量 " + fmt(projected) + " 超过可用总量 " + fmt(available) + "，侵占储备");
+        }
+        projectedByWindow.put(window.id(), projected);
+        versions.put(allocation.id(), version + 1);
+        helds.put(allocation.id(), correction.correctedAmount());
+        return new CorrectionPreviewItem(meterKey, true, null, null);
+    }
+
+    /** 加载批内更正并按提交顺序（主键升序）排序；任一不存在即 404。 */
+    private List<CorrectionRow> loadBatch(List<String> meterKeys) {
+        List<CorrectionRow> batch = new ArrayList<>();
+        for (String meterKey : meterKeys) {
+            CorrectionRow correction = repository.findCorrectionByKey(meterKey);
+            if (correction == null) {
+                throw ApiException.notFound("CORRECTION_NOT_FOUND", "计量更正不存在: " + meterKey);
+            }
+            batch.add(correction);
+        }
+        batch.sort(Comparator.comparingLong(CorrectionRow::id));
+        return batch;
+    }
+
+    /** 按窗口 ID 升序锁定批内全部涉及窗口，与批准/转让/限供按事务提交顺序串行裁决。 */
+    private Map<Long, WindowRow> lockWindowsOf(List<CorrectionRow> batch) {
+        Map<Long, WindowRow> windows = new HashMap<>();
+        batch.stream().map(CorrectionRow::windowId).distinct().sorted().forEach(windowId -> {
+            WindowRow window = repository.lockWindowById(windowId);
+            if (window == null) {
+                throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + windowId);
+            }
+            windows.put(windowId, window);
+        });
+        return windows;
+    }
+
+    /** 更正须为 REQUESTED，否则按当前状态给出可区分冲突。 */
+    private void requireRequestable(CorrectionRow correction) {
+        if (STATUS_APPROVED.equals(correction.status())) {
+            throw ApiException.conflict("CORRECTION_ALREADY_APPROVED",
+                    "更正已批准，不能重复批准: " + correction.meterKey());
+        }
+        if (STATUS_REVOKED.equals(correction.status())) {
+            throw ApiException.conflict("CORRECTION_ALREADY_REVOKED",
+                    "更正已撤销，不能再次批准: " + correction.meterKey());
+        }
+    }
+
+    private void requireMeterKeys(List<String> meterKeys) {
+        if (meterKeys == null || meterKeys.isEmpty()) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "meterKeys 不能为空");
+        }
+        meterKeys.forEach(meterKey -> requireKey("meterKey", meterKey));
+    }
+
+    /** 窗口关闭判定：当前时刻不早于窗口结束时刻。 */
+    private boolean isClosed(WindowRow window, long nowNanos) {
+        return nowNanos >= window.endNanos();
+    }
+
+    private CorrectionResponse toCorrectionResponse(CorrectionRow row) {
+        return new CorrectionResponse(row.meterKey(), row.allocationKey(), row.windowId(), row.baseVersion(),
+                row.previousAmount() == null ? null : fmt(row.previousAmount()), fmt(row.correctedAmount()),
+                toIso(row.readingNanos()), row.reason(), row.actor(), row.status(),
+                toIso(row.createdNanos()), toIso(row.updatedNanos()));
+    }
+
+    // ------------------------------------------------------------------
     // 幂等命令框架
     // ------------------------------------------------------------------
 
@@ -378,7 +723,7 @@ public class WaterService {
 
     private AllocationResponse toAllocationResponse(AllocationRow row) {
         return new AllocationResponse(row.allocationKey(), row.windowId(), row.userId(), fmt(row.amount()),
-                fmt(row.heldAmount()), row.requester(), row.status(),
+                fmt(row.heldAmount()), row.requester(), row.status(), row.version(),
                 toIso(row.createdNanos()), toIso(row.updatedNanos()));
     }
 
@@ -392,8 +737,11 @@ public class WaterService {
                 toIso(row.createdNanos()), row.cancelledNanos() == null ? null : toIso(row.cancelledNanos()));
     }
 
+    /** 可替换时钟（UTC 纳秒），测试用于窗口关闭边界；默认系统时钟。 */
+    static volatile java.util.function.LongSupplier clockNanos = () -> toNanos(Instant.now());
+
     static long nowNanos() {
-        return toNanos(Instant.now());
+        return clockNanos.getAsLong();
     }
 
     /** Instant -> UTC 纳秒时间戳。 */
@@ -444,6 +792,28 @@ public class WaterService {
             throw ApiException.badRequest("INVALID_ARGUMENT",
                     field + " 不能为空，且仅允许字母数字及 . - _ :，最长 128 字符");
         }
+    }
+
+    /** 解析校正数量：十进制字符串，大于等于 0，最多 3 位小数。 */
+    static BigDecimal parseNonNegativeAmount(String field, String value) {
+        if (value == null || value.isBlank()) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", field + " 不能为空");
+        }
+        String trimmed = value.trim();
+        if (!AMOUNT_PATTERN.matcher(trimmed).matches()) {
+            throw ApiException.badRequest("INVALID_ARGUMENT",
+                    field + " 必须为大于等于 0 的十进制字符串，最多 3 位小数: " + value);
+        }
+        return new BigDecimal(trimmed);
+    }
+
+    /** 校验更正原因：去空白后 1..512 字符。 */
+    static String requireReason(String reason) {
+        String trimmed = reason == null ? "" : reason.trim();
+        if (trimmed.isEmpty() || trimmed.length() > 512) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "reason 不能为空且最长 512 字符");
+        }
+        return trimmed;
     }
 
     /** 水量格式化为十进制字符串（去掉多余尾零）。 */

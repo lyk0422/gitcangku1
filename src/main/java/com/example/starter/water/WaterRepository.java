@@ -25,9 +25,9 @@ public class WaterRepository {
                             BigDecimal plannedVolume, long createdNanos) {
     }
 
-    /** 配水申请行；amount 为不可改写的原申请水量，heldAmount 为当前持有额度。 */
+    /** 配水申请行；amount 为不可改写的原申请水量，heldAmount 为当前持有额度，version 为核销版本。 */
     public record AllocationRow(long id, String allocationKey, long windowId, String userId, BigDecimal amount,
-                                BigDecimal heldAmount, String requester, String status,
+                                BigDecimal heldAmount, String requester, String status, long version,
                                 long createdNanos, long updatedNanos) {
     }
 
@@ -46,6 +46,24 @@ public class WaterRepository {
                              long createdNanos) {
     }
 
+    /** 计量更正申请行；previousAmount 未批准时为 null。 */
+    public record CorrectionRow(long id, String meterKey, String allocationKey, long windowId, long baseVersion,
+                                BigDecimal previousAmount, BigDecimal correctedAmount, long readingNanos,
+                                String reason, String actor, String status,
+                                long createdNanos, long updatedNanos) {
+    }
+
+    /** 不可变读表快照行。 */
+    public record SnapshotRow(long id, String meterKey, String allocationKey, long windowId,
+                              BigDecimal correctedAmount, long readingNanos, String reason, String actor,
+                              long createdNanos) {
+    }
+
+    /** 额度流水行，创建后不可变；balanceAfter 支持余额演算。 */
+    public record LedgerRow(long id, String allocationKey, long windowId, String entryType, String meterKey,
+                            BigDecimal delta, BigDecimal balanceAfter, long createdNanos) {
+    }
+
     private static final RowMapper<WindowRow> WINDOW_MAPPER = (rs, n) -> new WindowRow(
             rs.getLong("id"), rs.getString("window_key"), rs.getString("channel_id"),
             rs.getLong("start_nanos"), rs.getLong("end_nanos"),
@@ -54,11 +72,11 @@ public class WaterRepository {
     private static final RowMapper<AllocationRow> ALLOCATION_MAPPER = (rs, n) -> new AllocationRow(
             rs.getLong("id"), rs.getString("allocation_key"), rs.getLong("window_id"),
             rs.getString("user_id"), rs.getBigDecimal("amount"), rs.getBigDecimal("held_amount"),
-            rs.getString("requester"), rs.getString("status"),
+            rs.getString("requester"), rs.getString("status"), rs.getLong("version"),
             rs.getLong("created_nanos"), rs.getLong("updated_nanos"));
 
     private static final String ALLOCATION_SELECT =
-            "SELECT id, allocation_key, window_id, user_id, amount, held_amount, requester, status,"
+            "SELECT id, allocation_key, window_id, user_id, amount, held_amount, requester, status, version,"
                     + " created_nanos, updated_nanos";
 
     private static final RowMapper<TransferRow> TRANSFER_MAPPER = (rs, n) -> new TransferRow(
@@ -74,6 +92,28 @@ public class WaterRepository {
     private static final RowMapper<CommandRow> COMMAND_MAPPER = (rs, n) -> new CommandRow(
             rs.getString("command_key"), rs.getString("operation"), rs.getString("params"),
             rs.getString("response"), rs.getLong("created_nanos"));
+
+    private static final RowMapper<CorrectionRow> CORRECTION_MAPPER = (rs, n) -> new CorrectionRow(
+            rs.getLong("id"), rs.getString("meter_key"), rs.getString("allocation_key"),
+            rs.getLong("window_id"), rs.getLong("base_version"),
+            rs.getObject("previous_amount") == null ? null : rs.getBigDecimal("previous_amount"),
+            rs.getBigDecimal("corrected_amount"), rs.getLong("reading_nanos"),
+            rs.getString("reason"), rs.getString("actor"), rs.getString("status"),
+            rs.getLong("created_nanos"), rs.getLong("updated_nanos"));
+
+    private static final String CORRECTION_SELECT =
+            "SELECT id, meter_key, allocation_key, window_id, base_version, previous_amount, corrected_amount,"
+                    + " reading_nanos, reason, actor, status, created_nanos, updated_nanos";
+
+    private static final RowMapper<SnapshotRow> SNAPSHOT_MAPPER = (rs, n) -> new SnapshotRow(
+            rs.getLong("id"), rs.getString("meter_key"), rs.getString("allocation_key"),
+            rs.getLong("window_id"), rs.getBigDecimal("corrected_amount"), rs.getLong("reading_nanos"),
+            rs.getString("reason"), rs.getString("actor"), rs.getLong("created_nanos"));
+
+    private static final RowMapper<LedgerRow> LEDGER_MAPPER = (rs, n) -> new LedgerRow(
+            rs.getLong("id"), rs.getString("allocation_key"), rs.getLong("window_id"),
+            rs.getString("entry_type"), rs.getString("meter_key"),
+            rs.getBigDecimal("delta"), rs.getBigDecimal("balance_after"), rs.getLong("created_nanos"));
 
     private final JdbcTemplate jdbc;
 
@@ -303,5 +343,124 @@ public class WaterRepository {
     /** 写回命令首次成功响应。 */
     public void updateCommandResponse(String commandKey, String response) {
         jdbc.update("UPDATE command_log SET response = ? WHERE command_key = ?", response, commandKey);
+    }
+
+    // ------------------------------------------------------------------
+    // 计量更正
+    // ------------------------------------------------------------------
+
+    /** 计量更正/撤销时直接设定持有额度并递增核销版本。 */
+    public void setHeldAmountAndVersion(long id, BigDecimal heldAmount, long version, long updatedNanos) {
+        jdbc.update("UPDATE allocation SET held_amount = ?, version = ?, updated_nanos = ? WHERE id = ?",
+                heldAmount, version, updatedNanos, id);
+    }
+
+    /** 插入计量更正申请（初始 REQUESTED）并返回主键。 */
+    public long insertCorrection(String meterKey, String allocationKey, long windowId, long baseVersion,
+                                 BigDecimal correctedAmount, long readingNanos, String reason, String actor,
+                                 long nowNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO meter_correction (meter_key, allocation_key, window_id, base_version,"
+                            + " previous_amount, corrected_amount, reading_nanos, reason, actor, status,"
+                            + " created_nanos, updated_nanos)"
+                            + " VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, 'REQUESTED', ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, meterKey);
+            ps.setString(2, allocationKey);
+            ps.setLong(3, windowId);
+            ps.setLong(4, baseVersion);
+            ps.setBigDecimal(5, correctedAmount);
+            ps.setLong(6, readingNanos);
+            ps.setString(7, reason);
+            ps.setString(8, actor);
+            ps.setLong(9, nowNanos);
+            ps.setLong(10, nowNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 按业务键查询计量更正，不存在返回 null。 */
+    public CorrectionRow findCorrectionByKey(String meterKey) {
+        try {
+            return jdbc.queryForObject(CORRECTION_SELECT + " FROM meter_correction WHERE meter_key = ?",
+                    CORRECTION_MAPPER, meterKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 按业务键锁定计量更正行（FOR UPDATE），不存在返回 null。 */
+    public CorrectionRow lockCorrectionByKey(String meterKey) {
+        try {
+            return jdbc.queryForObject(CORRECTION_SELECT + " FROM meter_correction WHERE meter_key = ? FOR UPDATE",
+                    CORRECTION_MAPPER, meterKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 批准更正：置 APPROVED 并记录原持有额度（供撤销恢复）。 */
+    public void markCorrectionApproved(long id, BigDecimal previousAmount, long updatedNanos) {
+        jdbc.update("UPDATE meter_correction SET status = 'APPROVED', previous_amount = ?, updated_nanos = ?"
+                + " WHERE id = ?", previousAmount, updatedNanos, id);
+    }
+
+    /** 撤销更正：置 REVOKED，保留原持有额度快照。 */
+    public void markCorrectionRevoked(long id, long updatedNanos) {
+        jdbc.update("UPDATE meter_correction SET status = 'REVOKED', updated_nanos = ? WHERE id = ?",
+                updatedNanos, id);
+    }
+
+    /** 插入不可变读表快照并返回主键。 */
+    public long insertSnapshot(String meterKey, String allocationKey, long windowId, BigDecimal correctedAmount,
+                               long readingNanos, String reason, String actor, long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO meter_snapshot (meter_key, allocation_key, window_id, corrected_amount,"
+                            + " reading_nanos, reason, actor, created_nanos) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, meterKey);
+            ps.setString(2, allocationKey);
+            ps.setLong(3, windowId);
+            ps.setBigDecimal(4, correctedAmount);
+            ps.setLong(5, readingNanos);
+            ps.setString(6, reason);
+            ps.setString(7, actor);
+            ps.setLong(8, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 按更正业务键查询读表快照，不存在返回 null。 */
+    public SnapshotRow findSnapshotByMeterKey(String meterKey) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT id, meter_key, allocation_key, window_id, corrected_amount, reading_nanos, reason,"
+                            + " actor, created_nanos FROM meter_snapshot WHERE meter_key = ?",
+                    SNAPSHOT_MAPPER, meterKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 追加不可变额度流水（原核销/转出/取消/更正反向/撤销反向）。 */
+    public void insertLedger(String allocationKey, long windowId, String entryType, String meterKey,
+                             BigDecimal delta, BigDecimal balanceAfter, long createdNanos) {
+        jdbc.update("INSERT INTO allocation_ledger (allocation_key, window_id, entry_type, meter_key, delta,"
+                        + " balance_after, created_nanos) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                allocationKey, windowId, entryType, meterKey, delta, balanceAfter, createdNanos);
+    }
+
+    /** 核销记录全部流水，按主键升序即余额演算顺序。 */
+    public List<LedgerRow> listLedger(String allocationKey) {
+        return jdbc.query(
+                "SELECT id, allocation_key, window_id, entry_type, meter_key, delta, balance_after, created_nanos"
+                        + " FROM allocation_ledger WHERE allocation_key = ? ORDER BY id",
+                LEDGER_MAPPER, allocationKey);
     }
 }

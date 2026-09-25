@@ -1,7 +1,10 @@
 package com.example.starter.water;
 
 import com.example.starter.water.WaterRepository.AllocationRow;
+import com.example.starter.water.WaterRepository.CorrectionRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
+import com.example.starter.water.WaterRepository.LedgerRow;
+import com.example.starter.water.WaterRepository.SnapshotRow;
 import com.example.starter.water.WaterRepository.TransferRow;
 import com.example.starter.water.WaterRepository.WindowRow;
 import org.junit.jupiter.api.Test;
@@ -92,6 +95,68 @@ class PersistenceTests {
         assertEquals(new BigDecimal("8.000"), curtailment.volume());
 
         assertEquals("{\"transferKey\":\"tk-persist\"}", repo2.findCommand("cmd-persist").response());
+    }
+
+    @Test
+    void correctionSnapshotAndLedgerAreReadableFromNewConnection() throws Exception {
+        String url = String.format(URL_TEMPLATE, UUID.randomUUID().toString().substring(0, 8));
+
+        // 第一次“运行”：核销记录入账后登记并批准计量更正，写反向流水与读表快照
+        SimpleDriverDataSource first = new SimpleDriverDataSource(new org.h2.Driver(), url, "sa", "");
+        try (Connection connection = first.getConnection()) {
+            ScriptUtils.executeSqlScript(connection, new ClassPathResource("schema.sql"));
+        }
+        WaterRepository repo1 = new WaterRepository(new JdbcTemplate(first));
+        long windowId = repo1.insertWindow("wk-corr", "ch-corr", 1_000L, 2_000L,
+                new BigDecimal("10.000"), 1L);
+        repo1.insertAllocation("ak-corr", windowId, "user-1", new BigDecimal("4.000"), "alice", 2L);
+        AllocationRow allocation = repo1.findAllocationByKey("ak-corr");
+        repo1.updateAllocationStatus(allocation.id(), "APPROVED", 3L);
+        repo1.insertLedger("ak-corr", windowId, "WRITE_OFF", null,
+                new BigDecimal("4.000"), new BigDecimal("4.000"), 3L);
+        repo1.insertCorrection("mk-corr", "ak-corr", windowId, 1L, new BigDecimal("3.500"),
+                1_500L, "读表偏差修正", "carol", 4L);
+        CorrectionRow correction = repo1.findCorrectionByKey("mk-corr");
+        repo1.setHeldAmountAndVersion(allocation.id(), new BigDecimal("3.500"), 2L, 5L);
+        repo1.markCorrectionApproved(correction.id(), new BigDecimal("4.000"), 5L);
+        repo1.insertSnapshot("mk-corr", "ak-corr", windowId, new BigDecimal("3.500"),
+                1_500L, "读表偏差修正", "carol", 5L);
+        repo1.insertLedger("ak-corr", windowId, "CORRECTION", "mk-corr",
+                new BigDecimal("-0.500"), new BigDecimal("3.500"), 5L);
+
+        // 第二次读取：全新连接与仓储实例，同一 JVM 内数据仍在
+        WaterRepository repo2 = new WaterRepository(
+                new JdbcTemplate(new SimpleDriverDataSource(new org.h2.Driver(), url, "sa", "")));
+        AllocationRow corrected = repo2.findAllocationByKey("ak-corr");
+        assertEquals(new BigDecimal("3.500"), corrected.heldAmount());
+        assertEquals(new BigDecimal("4.000"), corrected.amount());
+        assertEquals(2L, corrected.version());
+
+        CorrectionRow approved = repo2.findCorrectionByKey("mk-corr");
+        assertNotNull(approved);
+        assertEquals("APPROVED", approved.status());
+        assertEquals(1L, approved.baseVersion());
+        assertEquals(new BigDecimal("4.000"), approved.previousAmount());
+        assertEquals(new BigDecimal("3.500"), approved.correctedAmount());
+        assertEquals(1_500L, approved.readingNanos());
+        assertEquals("读表偏差修正", approved.reason());
+        assertEquals("carol", approved.actor());
+
+        SnapshotRow snapshot = repo2.findSnapshotByMeterKey("mk-corr");
+        assertNotNull(snapshot);
+        assertEquals("ak-corr", snapshot.allocationKey());
+        assertEquals(new BigDecimal("3.500"), snapshot.correctedAmount());
+        assertEquals(1_500L, snapshot.readingNanos());
+
+        // 余额演算：原核销 -> 更正反向流水
+        java.util.List<LedgerRow> ledger = repo2.listLedger("ak-corr");
+        assertEquals(2, ledger.size());
+        assertEquals("WRITE_OFF", ledger.get(0).entryType());
+        assertEquals(new BigDecimal("4.000"), ledger.get(0).balanceAfter());
+        assertEquals("CORRECTION", ledger.get(1).entryType());
+        assertEquals("mk-corr", ledger.get(1).meterKey());
+        assertEquals(new BigDecimal("-0.500"), ledger.get(1).delta());
+        assertEquals(new BigDecimal("3.500"), ledger.get(1).balanceAfter());
     }
 
     @Test
