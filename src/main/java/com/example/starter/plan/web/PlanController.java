@@ -1,14 +1,25 @@
 package com.example.starter.plan.web;
 
+import com.example.starter.plan.service.CrewService;
 import com.example.starter.plan.service.PlanService;
 import com.example.starter.plan.web.dto.CreatePlanRequest;
+import com.example.starter.plan.web.dto.CrewGapDiagnosisResponse;
+import com.example.starter.plan.web.dto.CrewReplacementRequest;
 import com.example.starter.plan.web.dto.PlanActionRequest;
+import com.example.starter.plan.web.dto.PlanCrewQualificationResponse;
 import com.example.starter.plan.web.dto.PlanResponse;
+import com.example.starter.plan.web.dto.PublishPlanRequest;
 import com.example.starter.plan.web.dto.PublishedSlotView;
+import com.example.starter.plan.web.dto.QualificationResponse;
+import com.example.starter.plan.web.dto.RegisterQualificationRequest;
 import com.example.starter.plan.web.dto.RescheduleChainResponse;
 import com.example.starter.plan.web.dto.RescheduleRequest;
 import com.example.starter.plan.web.dto.RescheduleResponse;
+import com.example.starter.plan.web.dto.RiskRecordListResponse;
+import com.example.starter.plan.web.dto.TerminateQualificationRequest;
+import com.example.starter.plan.web.dto.TerminateQualificationResponse;
 import com.example.starter.plan.web.dto.UpdateOccupanciesRequest;
+import com.example.starter.plan.web.dto.UpdateQualificationRequest;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
@@ -37,9 +48,11 @@ import org.springframework.web.bind.annotation.RestController;
 public class PlanController {
 
     private final PlanService service;
+    private final CrewService crewService;
 
-    public PlanController(PlanService service) {
+    public PlanController(PlanService service, CrewService crewService) {
         this.service = service;
+        this.crewService = crewService;
     }
 
     /**
@@ -61,12 +74,12 @@ public class PlanController {
     }
 
     /**
-     * 发布计划，原子校验时隙冲突。
+     * 发布计划，原子校验时隙冲突、同车底风险门禁与乘务完整资质（如指定）。
      */
     @PostMapping("/plans/{scheduleKey}/publish")
     public PlanResponse publish(@PathVariable String scheduleKey,
-                                @Valid @RequestBody PlanActionRequest request) {
-        return service.publish(scheduleKey, request.requestKey());
+                                @Valid @RequestBody PublishPlanRequest request) {
+        return service.publish(scheduleKey, request);
     }
 
     /**
@@ -112,5 +125,69 @@ public class PlanController {
             @RequestParam @NotNull @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date,
             @RequestParam @NotBlank String sectionId) {
         return service.getPublishedSlots(date, sectionId);
+    }
+
+    /**
+     * 登记乘务员资质。
+     */
+    @PostMapping("/crew-qualifications")
+    @ResponseStatus(HttpStatus.CREATED)
+    public QualificationResponse registerQualification(
+            @Valid @RequestBody RegisterQualificationRequest request) {
+        return crewService.register(request);
+    }
+
+    /**
+     * 修改乘务员资质（expectedVersion 乐观校验，成功版本加一）。
+     */
+    @PutMapping("/crew-qualifications/{crewId}/{qualificationCode}")
+    public QualificationResponse updateQualification(
+            @PathVariable String crewId, @PathVariable String qualificationCode,
+            @Valid @RequestBody UpdateQualificationRequest request) {
+        return crewService.update(crewId, qualificationCode, request);
+    }
+
+    /**
+     * 提前终止资质：同一事务回查所有未来已发布计划并写入不可变风险记录。
+     */
+    @PostMapping("/crew-qualifications/{crewId}/{qualificationCode}/terminate")
+    public TerminateQualificationResponse terminateQualification(
+            @PathVariable String crewId, @PathVariable String qualificationCode,
+            @Valid @RequestBody TerminateQualificationRequest request) {
+        return crewService.terminate(crewId, qualificationCode, request);
+    }
+
+    /**
+     * 风险计划换人：两角色一次性替换为合格人员并解除风险门禁。
+     */
+    @PostMapping("/plans/{scheduleKey}/crew-replacement")
+    public PlanResponse replaceCrew(@PathVariable String scheduleKey,
+                                    @Valid @RequestBody CrewReplacementRequest request) {
+        return crewService.replaceCrew(scheduleKey, request);
+    }
+
+    /**
+     * 查询计划乘务资质（两角色指派、资质清单与合格性）。
+     */
+    @GetMapping("/plans/{scheduleKey}/crew-qualification")
+    public PlanCrewQualificationResponse getPlanCrewQualification(
+            @PathVariable String scheduleKey) {
+        return crewService.getPlanCrewQualification(scheduleKey);
+    }
+
+    /**
+     * 查询计划乘务资质缺口诊断。
+     */
+    @GetMapping("/plans/{scheduleKey}/crew-qualification-gaps")
+    public CrewGapDiagnosisResponse getCrewGaps(@PathVariable String scheduleKey) {
+        return crewService.getCrewGaps(scheduleKey);
+    }
+
+    /**
+     * 查询计划乘务风险记录。
+     */
+    @GetMapping("/plans/{scheduleKey}/risk-records")
+    public RiskRecordListResponse getRiskRecords(@PathVariable String scheduleKey) {
+        return crewService.getRiskRecords(scheduleKey);
     }
 }

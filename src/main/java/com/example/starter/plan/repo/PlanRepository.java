@@ -27,12 +27,18 @@ import org.springframework.stereotype.Repository;
 @Repository
 public class PlanRepository {
 
+    private static final String PLAN_COLUMNS = "id, schedule_key, op_date, version, status,"
+            + " driver_id, conductor_id, risk_blocked";
+
     private static final RowMapper<DayPlan> PLAN_MAPPER = (rs, n) -> new DayPlan(
             rs.getLong("id"),
             rs.getString("schedule_key"),
             rs.getObject("op_date", LocalDate.class),
             rs.getInt("version"),
-            PlanStatus.valueOf(rs.getString("status")));
+            PlanStatus.valueOf(rs.getString("status")),
+            rs.getString("driver_id"),
+            rs.getString("conductor_id"),
+            rs.getBoolean("risk_blocked"));
 
     private static final RowMapper<Occupancy> OCCUPANCY_MAPPER = (rs, n) -> new Occupancy(
             rs.getLong("id"),
@@ -79,7 +85,7 @@ public class PlanRepository {
      * 按业务键查询计划（不加锁）。
      */
     public Optional<DayPlan> findByKey(String scheduleKey) {
-        return jdbc.query("SELECT id, schedule_key, op_date, version, status FROM rail_day_plan"
+        return jdbc.query("SELECT " + PLAN_COLUMNS + " FROM rail_day_plan"
                         + " WHERE schedule_key = ?",
                 PLAN_MAPPER, scheduleKey).stream().findFirst();
     }
@@ -88,7 +94,7 @@ public class PlanRepository {
      * 按主键查询计划（不加锁），用于改签链遍历。
      */
     public Optional<DayPlan> findById(long planId) {
-        return jdbc.query("SELECT id, schedule_key, op_date, version, status FROM rail_day_plan"
+        return jdbc.query("SELECT " + PLAN_COLUMNS + " FROM rail_day_plan"
                         + " WHERE id = ?",
                 PLAN_MAPPER, planId).stream().findFirst();
     }
@@ -97,7 +103,7 @@ public class PlanRepository {
      * 按业务键查询计划并加行级写锁，须在事务内调用，用于串行化同一计划的更新/发布/取消。
      */
     public Optional<DayPlan> findByKeyForUpdate(String scheduleKey) {
-        return jdbc.query("SELECT id, schedule_key, op_date, version, status FROM rail_day_plan"
+        return jdbc.query("SELECT " + PLAN_COLUMNS + " FROM rail_day_plan"
                         + " WHERE schedule_key = ? FOR UPDATE",
                 PLAN_MAPPER, scheduleKey).stream().findFirst();
     }
@@ -218,5 +224,69 @@ public class PlanRepository {
      */
     public void acquirePublishLock() {
         jdbc.queryForObject("SELECT id FROM publish_lock WHERE id = 1 FOR UPDATE", Integer.class);
+    }
+
+    /**
+     * 发布/改签成功后绑定司机与车长，并同步解除风险门禁标记（资质校验已通过）。
+     */
+    public void updateCrewAndClearRisk(long planId, String driverId, String conductorId,
+                                       long nowMillis) {
+        jdbc.update("UPDATE rail_day_plan SET driver_id = ?, conductor_id = ?, risk_blocked = FALSE,"
+                        + " updated_at = ? WHERE id = ?",
+                driverId, conductorId, nowMillis, planId);
+    }
+
+    /**
+     * 将计划置为乘务风险门禁状态（资质提前终止回查命中时调用）。
+     */
+    public void markRiskBlocked(long planId, long nowMillis) {
+        jdbc.update("UPDATE rail_day_plan SET risk_blocked = TRUE, updated_at = ? WHERE id = ?",
+                nowMillis, planId);
+    }
+
+    /**
+     * 回查所有终到时刻严格晚于参考时刻、且仍在使用指定乘务员的已发布计划并加行锁，
+     * 用于资质提前终止时的风险扫描。命中计划可能以司机或车长身份使用该乘务员。
+     */
+    public List<DayPlan> findFuturePublishedPlansByCrewForUpdate(String crewId, long nowMillis) {
+        return jdbc.query("SELECT p.id, p.schedule_key, p.op_date, p.version, p.status,"
+                        + " p.driver_id, p.conductor_id, p.risk_blocked FROM rail_day_plan p"
+                        + " WHERE p.status = 'PUBLISHED'"
+                        + " AND (p.driver_id = ? OR p.conductor_id = ?)"
+                        + " AND EXISTS (SELECT 1 FROM rail_plan_occupancy o WHERE o.plan_id = p.id"
+                        + " AND o.end_utc > ?)"
+                        + " ORDER BY p.id FOR UPDATE",
+                PLAN_MAPPER, crewId, crewId, nowMillis);
+    }
+
+    /**
+     * 查询与本计划同运营日、使用相同车底（列车编号）且处于乘务风险门禁状态的其他已发布
+     * 计划业务键，用于阻断“风险状态下发布同车底新增段”。
+     */
+    public List<String> findRiskBlockedConsistKeys(LocalDate opDate,
+                                                   Collection<Long> excludePlanIds,
+                                                   Collection<String> trainNos) {
+        if (trainNos.isEmpty()) {
+            return List.of();
+        }
+        StringJoiner trainPlaceholders = new StringJoiner(", ");
+        trainNos.forEach(t -> trainPlaceholders.add("?"));
+        StringBuilder sql = new StringBuilder(
+                "SELECT DISTINCT p.schedule_key FROM rail_day_plan p"
+                        + " JOIN rail_plan_occupancy o ON o.plan_id = p.id"
+                        + " WHERE p.status = 'PUBLISHED' AND p.risk_blocked = TRUE"
+                        + " AND p.op_date = ?");
+        List<Object> args = new ArrayList<>();
+        args.add(Date.valueOf(opDate));
+        if (!excludePlanIds.isEmpty()) {
+            StringJoiner excludePlaceholders = new StringJoiner(", ");
+            excludePlanIds.forEach(id -> excludePlaceholders.add("?"));
+            sql.append(" AND p.id NOT IN (").append(excludePlaceholders).append(')');
+            args.addAll(excludePlanIds);
+        }
+        sql.append(" AND o.train_no IN (").append(trainPlaceholders)
+                .append(") ORDER BY p.schedule_key");
+        args.addAll(trainNos);
+        return jdbc.queryForList(sql.toString(), String.class, args.toArray());
     }
 }
