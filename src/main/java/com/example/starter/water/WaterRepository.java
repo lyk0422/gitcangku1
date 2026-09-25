@@ -46,6 +46,24 @@ public class WaterRepository {
                              long createdNanos) {
     }
 
+    /** 渠道行；version 随每次停运窗口变更递增。 */
+    public record ChannelRow(String channelId, long version, long createdNanos, long updatedNanos) {
+    }
+
+    /** 停运窗口行；recoveredNanos 为 null 表示未记录提前恢复。 */
+    public record OutageRow(long id, String outageKey, String channelId, long startNanos, long endNanos,
+                            String status, Long recoveredNanos, long channelVersion, long createdNanos) {
+    }
+
+    /** 供应风险行，创建后不可变。 */
+    public record RiskRow(long id, long outageId, String allocationKey, long createdNanos) {
+    }
+
+    /** 核销流水行，创建后不可变；batchKey 为 null 表示单笔核销。 */
+    public record SettlementRow(long id, String settlementKey, String batchKey, String allocationKey,
+                                long windowId, BigDecimal amount, long createdNanos) {
+    }
+
     private static final RowMapper<WindowRow> WINDOW_MAPPER = (rs, n) -> new WindowRow(
             rs.getLong("id"), rs.getString("window_key"), rs.getString("channel_id"),
             rs.getLong("start_nanos"), rs.getLong("end_nanos"),
@@ -74,6 +92,29 @@ public class WaterRepository {
     private static final RowMapper<CommandRow> COMMAND_MAPPER = (rs, n) -> new CommandRow(
             rs.getString("command_key"), rs.getString("operation"), rs.getString("params"),
             rs.getString("response"), rs.getLong("created_nanos"));
+
+    private static final RowMapper<ChannelRow> CHANNEL_MAPPER = (rs, n) -> new ChannelRow(
+            rs.getString("channel_id"), rs.getLong("version"),
+            rs.getLong("created_nanos"), rs.getLong("updated_nanos"));
+
+    private static final String OUTAGE_SELECT =
+            "SELECT id, outage_key, channel_id, start_nanos, end_nanos, status, recovered_nanos,"
+                    + " channel_version, created_nanos";
+
+    private static final RowMapper<OutageRow> OUTAGE_MAPPER = (rs, n) -> new OutageRow(
+            rs.getLong("id"), rs.getString("outage_key"), rs.getString("channel_id"),
+            rs.getLong("start_nanos"), rs.getLong("end_nanos"), rs.getString("status"),
+            rs.getObject("recovered_nanos") == null ? null : rs.getLong("recovered_nanos"),
+            rs.getLong("channel_version"), rs.getLong("created_nanos"));
+
+    private static final RowMapper<RiskRow> RISK_MAPPER = (rs, n) -> new RiskRow(
+            rs.getLong("id"), rs.getLong("outage_id"), rs.getString("allocation_key"),
+            rs.getLong("created_nanos"));
+
+    private static final RowMapper<SettlementRow> SETTLEMENT_MAPPER = (rs, n) -> new SettlementRow(
+            rs.getLong("id"), rs.getString("settlement_key"), rs.getString("batch_key"),
+            rs.getString("allocation_key"), rs.getLong("window_id"),
+            rs.getBigDecimal("amount"), rs.getLong("created_nanos"));
 
     private final JdbcTemplate jdbc;
 
@@ -303,5 +344,208 @@ public class WaterRepository {
     /** 写回命令首次成功响应。 */
     public void updateCommandResponse(String commandKey, String response) {
         jdbc.update("UPDATE command_log SET response = ? WHERE command_key = ?", response, commandKey);
+    }
+
+    // ------------------------------------------------------------------
+    // 渠道与停运窗口
+    // ------------------------------------------------------------------
+
+    /** 按 ID 查询渠道，不存在返回 null。 */
+    public ChannelRow findChannel(String channelId) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT channel_id, version, created_nanos, updated_nanos FROM channel WHERE channel_id = ?",
+                    CHANNEL_MAPPER, channelId);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 按 ID 锁定渠道行（FOR UPDATE），串行化停运变更、核销与转让结算，不存在返回 null。 */
+    public ChannelRow lockChannel(String channelId) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT channel_id, version, created_nanos, updated_nanos"
+                            + " FROM channel WHERE channel_id = ? FOR UPDATE",
+                    CHANNEL_MAPPER, channelId);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 创建渠道（版本 0）；并发重复创建由调用方捕获 DuplicateKeyException 忽略。 */
+    public void insertChannel(String channelId, long nowNanos) {
+        jdbc.update("INSERT INTO channel (channel_id, version, created_nanos, updated_nanos)"
+                + " VALUES (?, 0, ?, ?)", channelId, nowNanos, nowNanos);
+    }
+
+    /** 渠道版本 +1 并记录变更时间。 */
+    public void bumpChannelVersion(String channelId, long updatedNanos) {
+        jdbc.update("UPDATE channel SET version = version + 1, updated_nanos = ? WHERE channel_id = ?",
+                updatedNanos, channelId);
+    }
+
+    /** 插入停运窗口（SCHEDULED）并返回主键。 */
+    public long insertOutage(String outageKey, String channelId, long startNanos, long endNanos,
+                             long channelVersion, long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO outage_window (outage_key, channel_id, start_nanos, end_nanos, status,"
+                            + " recovered_nanos, channel_version, created_nanos)"
+                            + " VALUES (?, ?, ?, ?, 'SCHEDULED', NULL, ?, ?)", Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, outageKey);
+            ps.setString(2, channelId);
+            ps.setLong(3, startNanos);
+            ps.setLong(4, endNanos);
+            ps.setLong(5, channelVersion);
+            ps.setLong(6, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 按业务键查询停运窗口（含已删除），不存在返回 null。 */
+    public OutageRow findOutageByKey(String outageKey) {
+        try {
+            return jdbc.queryForObject(OUTAGE_SELECT + " FROM outage_window WHERE outage_key = ?",
+                    OUTAGE_MAPPER, outageKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 按主键查询停运窗口（含已删除），不存在返回 null。 */
+    public OutageRow findOutageById(long id) {
+        try {
+            return jdbc.queryForObject(OUTAGE_SELECT + " FROM outage_window WHERE id = ?",
+                    OUTAGE_MAPPER, id);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 判断同渠道是否存在与 [startNanos, endNanos) 重叠的生效停运窗口（相邻合法，已删除不计）。 */
+    public boolean existsOverlappingOutage(String channelId, long startNanos, long endNanos) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM outage_window WHERE channel_id = ? AND status = 'SCHEDULED'"
+                        + " AND start_nanos < ? AND ? < end_nanos",
+                Integer.class, channelId, endNanos, startNanos);
+        return count != null && count > 0;
+    }
+
+    /** 软删除停运窗口（仅未开始可删除，由业务层校验），并记录变更后的渠道版本。 */
+    public void markOutageDeleted(long id, long channelVersion) {
+        jdbc.update("UPDATE outage_window SET status = 'DELETED', channel_version = ? WHERE id = ?",
+                channelVersion, id);
+    }
+
+    /** 记录提前恢复时刻，并记录变更后的渠道版本。 */
+    public void markOutageRecovered(long id, long recoveredNanos, long channelVersion) {
+        jdbc.update("UPDATE outage_window SET recovered_nanos = ?, channel_version = ? WHERE id = ?",
+                recoveredNanos, channelVersion, id);
+    }
+
+    /**
+     * 查询在 now 时刻生效且与供水窗口 [windowStart, windowEnd) 相交的停运窗口：
+     * 未删除，且未恢复或恢复时刻晚于 now（恢复仅影响之后的核销）。
+     */
+    public List<OutageRow> listEffectiveOutages(String channelId, long windowStart, long windowEnd, long now) {
+        return jdbc.query(OUTAGE_SELECT + " FROM outage_window WHERE channel_id = ? AND status = 'SCHEDULED'"
+                        + " AND start_nanos < ? AND ? < end_nanos"
+                        + " AND (recovered_nanos IS NULL OR recovered_nanos > ?) ORDER BY id",
+                OUTAGE_MAPPER, channelId, windowEnd, windowStart, now);
+    }
+
+    /** 写入停运窗口受影响申请（不可变）。 */
+    public void insertOutageAllocation(long outageId, String allocationKey) {
+        jdbc.update("INSERT INTO outage_allocation (outage_id, allocation_key) VALUES (?, ?)",
+                outageId, allocationKey);
+    }
+
+    /** 停运窗口受影响申请业务键，按业务键升序（规范化顺序）。 */
+    public List<String> listOutageAllocationKeys(long outageId) {
+        return jdbc.queryForList(
+                "SELECT allocation_key FROM outage_allocation WHERE outage_id = ? ORDER BY allocation_key",
+                String.class, outageId);
+    }
+
+    /** 写入不可变供应风险。 */
+    public void insertRisk(long outageId, String allocationKey, long createdNanos) {
+        jdbc.update("INSERT INTO supply_risk (outage_id, allocation_key, created_nanos) VALUES (?, ?, ?)",
+                outageId, allocationKey, createdNanos);
+    }
+
+    /** 申请是否已存在供应风险（风险申请不能再次转让）。 */
+    public boolean existsRiskForAllocation(String allocationKey) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM supply_risk WHERE allocation_key = ?", Integer.class, allocationKey);
+        return count != null && count > 0;
+    }
+
+    /** 申请全部供应风险，按主键升序。 */
+    public List<RiskRow> listRisksByAllocation(String allocationKey) {
+        return jdbc.query(
+                "SELECT id, outage_id, allocation_key, created_nanos FROM supply_risk"
+                        + " WHERE allocation_key = ? ORDER BY id",
+                RISK_MAPPER, allocationKey);
+    }
+
+    /** 停运窗口写入的全部供应风险，按主键升序。 */
+    public List<RiskRow> listRisksByOutage(long outageId) {
+        return jdbc.query(
+                "SELECT id, outage_id, allocation_key, created_nanos FROM supply_risk"
+                        + " WHERE outage_id = ? ORDER BY id",
+                RISK_MAPPER, outageId);
+    }
+
+    // ------------------------------------------------------------------
+    // 核销
+    // ------------------------------------------------------------------
+
+    /** 插入不可变核销流水并返回主键；batchKey 为 null 表示单笔核销。 */
+    public long insertSettlement(String settlementKey, String batchKey, String allocationKey, long windowId,
+                                 BigDecimal amount, long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO settlement (settlement_key, batch_key, allocation_key, window_id, amount,"
+                            + " created_nanos) VALUES (?, ?, ?, ?, ?, ?)", Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, settlementKey);
+            ps.setString(2, batchKey);
+            ps.setString(3, allocationKey);
+            ps.setLong(4, windowId);
+            ps.setBigDecimal(5, amount);
+            ps.setLong(6, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 按业务键查询核销流水，不存在返回 null。 */
+    public SettlementRow findSettlementByKey(String settlementKey) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT id, settlement_key, batch_key, allocation_key, window_id, amount, created_nanos"
+                            + " FROM settlement WHERE settlement_key = ?",
+                    SETTLEMENT_MAPPER, settlementKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 批量核销业务键是否已使用。 */
+    public boolean existsSettlementBatch(String batchKey) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM settlement WHERE batch_key = ?", Integer.class, batchKey);
+        return count != null && count > 0;
+    }
+
+    /** 窗口累计已核销水量（BigDecimal 精确求和），无则 0。 */
+    public BigDecimal sumSettledAmount(long windowId) {
+        BigDecimal sum = jdbc.queryForObject(
+                "SELECT COALESCE(SUM(amount), 0) FROM settlement WHERE window_id = ?",
+                BigDecimal.class, windowId);
+        return sum == null ? BigDecimal.ZERO : sum;
     }
 }

@@ -74,6 +74,67 @@ public final class Dtos {
                                   List<CurtailmentResponse> curtailments) {
     }
 
+    /** 下达停运窗口命令；expectedVersion 为渠道版本乐观锁，allocationKeys 为受影响申请集合。 */
+    public record CreateOutageRequest(String commandKey, String outageKey, Long expectedVersion,
+                                      String startUtc, String endUtc, List<String> allocationKeys) {
+    }
+
+    /** 停运窗口变更命令（删除）；expectedVersion 为渠道版本乐观锁。 */
+    public record OutageCommandRequest(String commandKey, Long expectedVersion) {
+    }
+
+    /** 记录提前恢复命令；recoveredUtc 不得早于当前时刻。 */
+    public record RecoverOutageRequest(String commandKey, Long expectedVersion, String recoveredUtc) {
+    }
+
+    /**
+     * 停运窗口视图。状态：SCHEDULED 生效中 / DELETED 已删除；recoveredUtc 未恢复时为 null；
+     * channelVersion 为变更后的渠道版本。
+     */
+    public record OutageResponse(long id, String outageKey, String channelId, String startUtc, String endUtc,
+                                 String status, String recoveredUtc, long channelVersion,
+                                 List<String> allocationKeys, String createdUtc) {
+    }
+
+    /** 供应风险视图，创建后不可变。 */
+    public record RiskResponse(String allocationKey, String outageKey, String createdUtc) {
+    }
+
+    /** 停运影响视图：停运窗口 + 受影响申请当前状态 + 已写入的供应风险。 */
+    public record OutageImpactResponse(OutageResponse outage, List<AllocationResponse> affectedAllocations,
+                                       List<RiskResponse> risks) {
+    }
+
+    /** 申请供应风险列表视图。 */
+    public record RiskListResponse(String allocationKey, List<RiskResponse> risks) {
+    }
+
+    /** 单笔核销命令。 */
+    public record SettleRequest(String commandKey, String settlementKey, String amount) {
+    }
+
+    /** 核销流水视图，创建后不可变；batchKey 为 null 表示单笔核销。 */
+    public record SettlementResponse(String settlementKey, String batchKey, String allocationKey,
+                                     long windowId, String amount, String createdUtc) {
+    }
+
+    /** 批量核销项。 */
+    public record BatchSettleItem(String allocationKey, String amount) {
+    }
+
+    /** 批量核销命令：先按最终渠道容量、申请余额和停运后态预校验，任一失败全部回滚。 */
+    public record BatchSettleRequest(String commandKey, String batchKey, List<BatchSettleItem> items) {
+    }
+
+    /** 批量核销视图。 */
+    public record BatchSettleResponse(String batchKey, List<SettlementResponse> settlements) {
+    }
+
+    /** 核销可行性检查视图：settleable 为 false 时 rejectCode/rejectReason 给出可区分拒绝原因。 */
+    public record SettlementCheckResponse(String allocationKey, boolean settleable, String rejectCode,
+                                          String rejectReason) {
+    }
+
     /** 统一错误响应体。 */
     public record ErrorResponse(String code, String message) {
     }
