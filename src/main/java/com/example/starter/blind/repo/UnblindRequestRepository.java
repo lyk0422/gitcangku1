@@ -24,7 +24,8 @@ public class UnblindRequestRepository {
             String status,
             String treatment,
             long createdAt,
-            Long reviewedAt) {
+            Long reviewedAt,
+            String unblindType) {
     }
 
     private static final RowMapper<UnblindRequestRow> MAPPER = (rs, n) -> new UnblindRequestRow(
@@ -38,11 +39,12 @@ public class UnblindRequestRepository {
             rs.getString("status"),
             rs.getString("treatment"),
             rs.getLong("created_at"),
-            (Long) rs.getObject("reviewed_at"));
+            (Long) rs.getObject("reviewed_at"),
+            rs.getString("unblind_type"));
 
     private static final String COLUMNS =
             "id, experiment_id, participant_id, allocation_id, reason, applicant_actor, "
-                    + "reviewer_actor, status, treatment, created_at, reviewed_at";
+                    + "reviewer_actor, status, treatment, created_at, reviewed_at, unblind_type";
 
     private final JdbcTemplate jdbc;
 
@@ -96,5 +98,20 @@ public class UnblindRequestRepository {
                         + "treatment = ?, reviewed_at = ?, pending_allocation_id = NULL "
                         + "WHERE id = ? AND status = 'PENDING'",
                 reviewerActor, treatment, reviewedAt, requestId);
+    }
+
+    /**
+     * 插入紧急揭盲记录：写入即 APPROVED、EMERGENCY，不占用 pending_allocation_id。
+     * treatment 与 reviewer/时间一并落库；applicant 记录发起紧急揭盲的 REVIEWER。
+     */
+    public void insertEmergency(UnblindRequestRow row, String treatment) {
+        jdbc.update("INSERT INTO unblind_request ("
+                        + "id, experiment_id, participant_id, allocation_id, reason, applicant_actor, "
+                        + "reviewer_actor, status, treatment, created_at, reviewed_at, "
+                        + "pending_allocation_id, unblind_type"
+                        + ") VALUES (?, ?, ?, ?, ?, ?, ?, 'APPROVED', ?, ?, ?, NULL, 'EMERGENCY')",
+                row.id(), row.experimentId(), row.participantId(), row.allocationId(),
+                row.reason(), row.applicantActor(), row.reviewerActor(), treatment,
+                row.createdAt(), row.reviewedAt());
     }
 }

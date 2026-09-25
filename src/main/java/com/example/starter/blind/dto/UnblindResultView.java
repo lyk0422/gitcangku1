@@ -9,6 +9,7 @@ package com.example.starter.blind.dto;
  * @param treatment     处理代码 A / B
  * @param status        申请状态（返回时必为 APPROVED）
  * @param reviewedAt    批准时间，Unix 毫秒，UTC
+ * @param unblindType   REGULAR / EMERGENCY
  */
 public record UnblindResultView(
         String requestId,
@@ -16,6 +17,7 @@ public record UnblindResultView(
         String participantId,
         String treatment,
         String status,
-        long reviewedAt
+        long reviewedAt,
+        String unblindType
 ) {
 }

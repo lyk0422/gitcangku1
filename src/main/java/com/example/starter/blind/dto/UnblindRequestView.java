@@ -12,6 +12,7 @@ package com.example.starter.blind.dto;
  * @param status         PENDING / APPROVED
  * @param createdAt      申请时间，Unix 毫秒，UTC
  * @param reviewedAt     批准时间，Unix 毫秒，UTC；未批准为 null
+ * @param unblindType    REGULAR=常规申请-批准；EMERGENCY=紧急通道直接揭盲
  */
 public record UnblindRequestView(
         String requestId,
@@ -22,6 +23,7 @@ public record UnblindRequestView(
         String reviewerActor,
         String status,
         long createdAt,
-        Long reviewedAt
+        Long reviewedAt,
+        String unblindType
 ) {
 }

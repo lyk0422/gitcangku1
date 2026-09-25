@@ -48,4 +48,9 @@ public class ApiException extends RuntimeException {
     public static ApiException full(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, message);
     }
+
+    /** 422 业务不可处理：紧急揭盲前置条件不满足（非 URGENT_REVIEW、报告非 SEVERE 等）。 */
+    public static ApiException unprocessable(String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, message);
+    }
 }

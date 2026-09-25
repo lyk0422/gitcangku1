@@ -114,7 +114,7 @@ public class ExperimentService {
             String blindCode = blindCodeGenerator.nextCode();
             AllocationRow row = new AllocationRow(0L, experimentId, participantId,
                     vacant.blockNo(), vacant.seatNo(), blindCode, "ASSIGNED",
-                    actorId, now, null);
+                    actorId, now, null, false, false);
             try {
                 allocationRepository.insert(row);
                 return allocationRepository.findByExperimentAndParticipant(experimentId, participantId);
@@ -135,14 +135,19 @@ public class ExperimentService {
 
     /**
      * 退组：状态置为 WITHDRAWN 并记录时间；席位不释放、已有分配不重排。
+     * 行锁与紧急揭盲串行化：并发时按事务提交顺序裁决。
      */
     @Transactional
     public AllocationView withdraw(String experimentId, String participantId) {
         AllocationRow allocation = mustFindAllocation(experimentId, participantId);
-        if ("WITHDRAWN".equals(allocation.status())) {
+        AllocationRow locked = allocationRepository.lockById(allocation.id());
+        if (locked == null) {
+            throw ApiException.notFound("参与者尚未在该实验登记");
+        }
+        if ("WITHDRAWN".equals(locked.status())) {
             throw ApiException.conflict("参与者已退组");
         }
-        allocationRepository.markWithdrawn(allocation.id(), clock.nowMillis());
+        allocationRepository.markWithdrawn(locked.id(), clock.nowMillis());
         AllocationRow refreshed =
                 allocationRepository.findByExperimentAndParticipant(experimentId, participantId);
         return toView(refreshed);
@@ -198,5 +203,38 @@ public class ExperimentService {
     private AllocationView toView(AllocationRow row) {
         return new AllocationView(row.experimentId(), row.participantId(), row.blindCode(),
                 row.blockNo(), row.status(), row.assignedAt(), row.withdrawnAt());
+    }
+
+    /**
+     * URGENT_REVIEW 分配清单：只含盲码视图字段，不含处理代码与席位号。
+     */
+    public List<AllocationView> listUrgentReview(String experimentId) {
+        mustFindExperiment(experimentId);
+        return allocationRepository.findUrgentReviewByExperiment(experimentId).stream()
+                .map(this::toView)
+                .toList();
+    }
+
+    /**
+     * 行级锁定分配并返回最新行；供揭盲通道做终局裁决。
+     */
+    public AllocationRow lockAllocationRow(long allocationId) {
+        return allocationRepository.lockById(allocationId);
+    }
+
+    /**
+     * 终局揭盲置位：常规与紧急通道共用，保证同一分配只成功揭盲一次。
+     *
+     * @return true 表示本次成功揭盲；false 表示已被另一通道揭盲
+     */
+    public boolean markAllocationUnblindedOnce(long allocationId) {
+        return allocationRepository.markUnblindedOnce(allocationId) == 1;
+    }
+
+    /**
+     * SEVERE 不良事件触发的 URGENT_REVIEW 标记；幂等置位。
+     */
+    public void markUrgentReview(long allocationId) {
+        allocationRepository.markUrgentReview(allocationId);
     }
 }

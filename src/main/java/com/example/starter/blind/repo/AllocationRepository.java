@@ -24,7 +24,9 @@ public class AllocationRepository {
             String status,
             String assignedActor,
             long assignedAt,
-            Long withdrawnAt) {
+            Long withdrawnAt,
+            boolean urgentReview,
+            boolean unblinded) {
     }
 
     private static final RowMapper<AllocationRow> ALLOCATION_MAPPER = (rs, n) -> new AllocationRow(
@@ -37,7 +39,13 @@ public class AllocationRepository {
             rs.getString("status"),
             rs.getString("assigned_actor"),
             rs.getLong("assigned_at"),
-            (Long) rs.getObject("withdrawn_at"));
+            (Long) rs.getObject("withdrawn_at"),
+            rs.getInt("urgent_review") == 1,
+            rs.getInt("unblinded") == 1);
+
+    private static final String ALLOCATION_COLUMNS =
+            "id, experiment_id, participant_id, block_no, seat_no, blind_code, status, "
+                    + "assigned_actor, assigned_at, withdrawn_at, urgent_review, unblinded";
 
     private final JdbcTemplate jdbc;
 
@@ -56,10 +64,19 @@ public class AllocationRepository {
 
     public AllocationRow findByExperimentAndParticipant(String experimentId, String participantId) {
         List<AllocationRow> rows = jdbc.query(
-                "SELECT id, experiment_id, participant_id, block_no, seat_no, blind_code, status, "
-                        + "assigned_actor, assigned_at, withdrawn_at "
+                "SELECT " + ALLOCATION_COLUMNS + " "
                         + "FROM allocation WHERE experiment_id = ? AND participant_id = ?",
                 ALLOCATION_MAPPER, experimentId, participantId);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /**
+     * 行级锁定分配，串行化紧急揭盲、退组与常规揭盲批准对同一分配的并发终局裁决。
+     */
+    public AllocationRow lockById(long allocationId) {
+        List<AllocationRow> rows = jdbc.query(
+                "SELECT " + ALLOCATION_COLUMNS + " FROM allocation WHERE id = ? FOR UPDATE",
+                ALLOCATION_MAPPER, allocationId);
         return rows.isEmpty() ? null : rows.get(0);
     }
 
@@ -103,6 +120,37 @@ public class AllocationRepository {
                 "UPDATE allocation SET status = 'WITHDRAWN', withdrawn_at = ? "
                         + "WHERE id = ? AND status = 'ASSIGNED'",
                 withdrawnAt, allocationId);
+    }
+
+    /**
+     * 标记 URGENT_REVIEW：SEVERE 不良事件触发；幂等置位。
+     */
+    public void markUrgentReview(long allocationId) {
+        jdbc.update("UPDATE allocation SET urgent_review = 1 WHERE id = ?", allocationId);
+    }
+
+    /**
+     * 终局揭盲：仅未揭盲的分配可置位，并同时清除 URGENT_REVIEW。
+     * 常规与紧急两条通道共用此原子更新，保证同一分配只成功揭盲一次。
+     *
+     * @return 受影响行数；0 表示已揭盲（另一通道先行成功）
+     */
+    public int markUnblindedOnce(long allocationId) {
+        return jdbc.update(
+                "UPDATE allocation SET unblinded = 1, urgent_review = 0 "
+                        + "WHERE id = ? AND unblinded = 0",
+                allocationId);
+    }
+
+    /**
+     * URGENT_REVIEW 分配清单（不含席位号与处理代码字段由视图层保证）。
+     */
+    public List<AllocationRow> findUrgentReviewByExperiment(String experimentId) {
+        return jdbc.query(
+                "SELECT " + ALLOCATION_COLUMNS + " FROM allocation "
+                        + "WHERE experiment_id = ? AND urgent_review = 1 "
+                        + "ORDER BY assigned_at, id",
+                ALLOCATION_MAPPER, experimentId);
     }
 
     /**
