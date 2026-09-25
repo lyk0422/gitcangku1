@@ -10,6 +10,8 @@ import com.example.starter.blind.repo.AllocationRepository.VacantSeat;
 import com.example.starter.blind.repo.ExperimentRepository;
 import com.example.starter.blind.repo.ExperimentRepository.ExperimentRow;
 import com.example.starter.blind.repo.ExperimentRepository.SeatRow;
+import com.example.starter.blind.repo.SiteRepository;
+import com.example.starter.blind.repo.SiteRepository.SiteRow;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -21,6 +23,7 @@ import java.util.List;
  * 实验与分配核心业务：
  * 创建实验时固定区组与每区组两 A 两 B 的席位内容；分配按区组、席位顺序领取第一个空位；
  * 退组保留席位不重排；关闭后拒绝新增分配。普通视图不含席位号与处理代码。
+ * 中心作用域分配额外执行中心状态门禁与目标入组上限判定。
  */
 @Service
 public class ExperimentService {
@@ -29,15 +32,18 @@ public class ExperimentService {
 
     private final ExperimentRepository experimentRepository;
     private final AllocationRepository allocationRepository;
+    private final SiteRepository siteRepository;
     private final BlindCodeGenerator blindCodeGenerator;
     private final Clock clock;
 
     public ExperimentService(ExperimentRepository experimentRepository,
                              AllocationRepository allocationRepository,
+                             SiteRepository siteRepository,
                              BlindCodeGenerator blindCodeGenerator,
                              Clock clock) {
         this.experimentRepository = experimentRepository;
         this.allocationRepository = allocationRepository;
+        this.siteRepository = siteRepository;
         this.blindCodeGenerator = blindCodeGenerator;
         this.clock = clock;
     }
@@ -103,24 +109,94 @@ public class ExperimentService {
         }
         long now = clock.nowMillis();
         AllocationRow inserted = insertWithUniqueBlindCode(experimentId, participantId, actorId,
-                vacant, now);
+                vacant, now, null, null, null);
+        return toView(inserted);
+    }
+
+    /**
+     * 中心作用域分配：中心必须 ACTIVE，否则 409；中心累计分配（含已退组，容量不回收）
+     * 达到目标入组上限后新分配 422。assignmentKey 绑定操作者、受试者、中心代次与全部状态字段：
+     * 同键同人同受试者重放首次结果，异参 409，失败不占键。
+     */
+    @Transactional
+    public AllocationView registerAtSite(String experimentId, String siteCode,
+                                         String participantId, String assignmentKey,
+                                         String actorId) {
+        if (participantId == null || participantId.isBlank()) {
+            throw ApiException.badRequest("participantId 不能为空");
+        }
+        if (assignmentKey == null || assignmentKey.isBlank()) {
+            throw ApiException.badRequest("assignmentKey 不能为空");
+        }
+        ExperimentRow experiment = experimentRepository.lockById(experimentId);
+        if (experiment == null) {
+            throw ApiException.notFound("实验不存在: " + experimentId);
+        }
+        if ("CLOSED".equals(experiment.status())) {
+            throw ApiException.conflict("实验已关闭，拒绝新增分配");
+        }
+        SiteRow site = siteRepository.lockById(experimentId, siteCode);
+        if (site == null) {
+            throw ApiException.notFound("中心不存在: " + siteCode);
+        }
+        // 业务键重放判定先于状态门禁：成功结果可重放，失败未占键。
+        AllocationRow byKey = allocationRepository.findByAssignmentKey(assignmentKey);
+        if (byKey != null) {
+            if (byKey.experimentId().equals(experimentId)
+                    && siteCode.equals(byKey.siteCode())
+                    && byKey.participantId().equals(participantId)
+                    && byKey.assignedActor().equals(actorId)) {
+                return toView(byKey);
+            }
+            throw ApiException.conflict("assignmentKey 已绑定其他受试者、中心或操作者");
+        }
+        if (!"ACTIVE".equals(site.status())) {
+            throw ApiException.conflict(switch (site.status()) {
+                case "SUSPENDED" -> "中心已暂停，不接受新分配";
+                case "CLOSED" -> "中心已关闭，不接受新分配";
+                default -> "中心未激活，不得生成盲码或分配区组";
+            });
+        }
+        AllocationRow existing =
+                allocationRepository.findByExperimentAndParticipant(experimentId, participantId);
+        if (existing != null) {
+            throw ApiException.conflict("参与者已在该实验登记，仅可占一席");
+        }
+        // 累计分配含已退组：上限判定不回收容量。
+        long allocated = allocationRepository.countBySite(experimentId, siteCode);
+        if (allocated >= site.targetCap()) {
+            throw ApiException.unprocessable("中心累计分配已达目标入组上限");
+        }
+        VacantSeat vacant = allocationRepository.takeFirstVacantSeat(experimentId);
+        if (vacant == null) {
+            throw ApiException.full("实验席位已满");
+        }
+        long now = clock.nowMillis();
+        AllocationRow inserted = insertWithUniqueBlindCode(experimentId, participantId, actorId,
+                vacant, now, siteCode, site.generation(), assignmentKey);
         return toView(inserted);
     }
 
     private AllocationRow insertWithUniqueBlindCode(String experimentId, String participantId,
-                                                    String actorId, VacantSeat vacant, long now) {
+                                                    String actorId, VacantSeat vacant, long now,
+                                                    String siteCode, Integer siteGeneration,
+                                                    String assignmentKey) {
         // 盲码随机冲突概率极低，仍由唯一索引兜底并重试。
         for (int attempt = 0; attempt < 5; attempt++) {
             String blindCode = blindCodeGenerator.nextCode();
             AllocationRow row = new AllocationRow(0L, experimentId, participantId,
                     vacant.blockNo(), vacant.seatNo(), blindCode, "ASSIGNED",
-                    actorId, now, null);
+                    actorId, now, null, siteCode, siteGeneration, assignmentKey);
             try {
                 allocationRepository.insert(row);
                 return allocationRepository.findByExperimentAndParticipant(experimentId, participantId);
             } catch (DuplicateKeyException e) {
                 if (allocationRepository.isDuplicateBlindCode(e)) {
                     continue;
+                }
+                if (allocationRepository.isDuplicateAssignmentKey(e)) {
+                    // 并发同 assignmentKey：唯一约束兜底，按异参冲突处理。
+                    throw ApiException.conflict("assignmentKey 已被使用，请重试");
                 }
                 if (allocationRepository.isDuplicateSeat(e)
                         || allocationRepository.isDuplicateParticipant(e)) {
@@ -197,6 +273,6 @@ public class ExperimentService {
 
     private AllocationView toView(AllocationRow row) {
         return new AllocationView(row.experimentId(), row.participantId(), row.blindCode(),
-                row.blockNo(), row.status(), row.assignedAt(), row.withdrawnAt());
+                row.blockNo(), row.status(), row.assignedAt(), row.withdrawnAt(), row.siteCode());
     }
 }

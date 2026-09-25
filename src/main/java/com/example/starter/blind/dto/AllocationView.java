@@ -11,6 +11,7 @@ package com.example.starter.blind.dto;
  * @param status        ASSIGNED / WITHDRAWN
  * @param assignedAt    分配时间，Unix 毫秒，UTC
  * @param withdrawnAt   退组时间，Unix 毫秒，UTC；null 表示未退组
+ * @param siteCode      所属试验中心编号；null 表示未按中心登记（历史入口）
  */
 public record AllocationView(
         String experimentId,
@@ -19,6 +20,7 @@ public record AllocationView(
         int blockNo,
         String status,
         long assignedAt,
-        Long withdrawnAt
+        Long withdrawnAt,
+        String siteCode
 ) {
 }

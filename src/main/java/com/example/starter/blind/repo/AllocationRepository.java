@@ -13,7 +13,7 @@ import java.util.List;
 @Repository
 public class AllocationRepository {
 
-    /** 分配行（含盲底，仅供服务层内部使用）。 */
+    /** 分配行（含盲底，仅供服务层内部使用）。site_* 与 assignmentKey 为中心作用域分配字段。 */
     public record AllocationRow(
             long id,
             String experimentId,
@@ -24,7 +24,10 @@ public class AllocationRepository {
             String status,
             String assignedActor,
             long assignedAt,
-            Long withdrawnAt) {
+            Long withdrawnAt,
+            String siteCode,
+            Integer siteGeneration,
+            String assignmentKey) {
     }
 
     private static final RowMapper<AllocationRow> ALLOCATION_MAPPER = (rs, n) -> new AllocationRow(
@@ -37,7 +40,15 @@ public class AllocationRepository {
             rs.getString("status"),
             rs.getString("assigned_actor"),
             rs.getLong("assigned_at"),
-            (Long) rs.getObject("withdrawn_at"));
+            (Long) rs.getObject("withdrawn_at"),
+            rs.getString("site_code"),
+            (Integer) rs.getObject("site_generation"),
+            rs.getString("assignment_key"));
+
+    private static final String COLUMNS =
+            "id, experiment_id, participant_id, block_no, seat_no, blind_code, status, "
+                    + "assigned_actor, assigned_at, withdrawn_at, site_code, site_generation, "
+                    + "assignment_key";
 
     private final JdbcTemplate jdbc;
 
@@ -48,18 +59,28 @@ public class AllocationRepository {
     public void insert(AllocationRow row) {
         jdbc.update("INSERT INTO allocation ("
                         + "experiment_id, participant_id, block_no, seat_no, blind_code, "
-                        + "status, assigned_actor, assigned_at, withdrawn_at"
-                        + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        + "status, assigned_actor, assigned_at, withdrawn_at, "
+                        + "site_code, site_generation, assignment_key"
+                        + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 row.experimentId(), row.participantId(), row.blockNo(), row.seatNo(), row.blindCode(),
-                row.status(), row.assignedActor(), row.assignedAt(), row.withdrawnAt());
+                row.status(), row.assignedActor(), row.assignedAt(), row.withdrawnAt(),
+                row.siteCode(), row.siteGeneration(), row.assignmentKey());
     }
 
     public AllocationRow findByExperimentAndParticipant(String experimentId, String participantId) {
         List<AllocationRow> rows = jdbc.query(
-                "SELECT id, experiment_id, participant_id, block_no, seat_no, blind_code, status, "
-                        + "assigned_actor, assigned_at, withdrawn_at "
-                        + "FROM allocation WHERE experiment_id = ? AND participant_id = ?",
+                "SELECT " + COLUMNS + " FROM allocation WHERE experiment_id = ? AND participant_id = ?",
                 ALLOCATION_MAPPER, experimentId, participantId);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /**
+     * 按分配业务键查询；assignmentKey 全局唯一，用于同键重放与异参冲突判定。
+     */
+    public AllocationRow findByAssignmentKey(String assignmentKey) {
+        List<AllocationRow> rows = jdbc.query(
+                "SELECT " + COLUMNS + " FROM allocation WHERE assignment_key = ?",
+                ALLOCATION_MAPPER, assignmentKey);
         return rows.isEmpty() ? null : rows.get(0);
     }
 
@@ -94,6 +115,16 @@ public class AllocationRepository {
     }
 
     /**
+     * 中心累计分配数：含已退组（容量不回收），用于目标入组上限判定。
+     */
+    public long countBySite(String experimentId, String siteCode) {
+        Long count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM allocation WHERE experiment_id = ? AND site_code = ?",
+                Long.class, experimentId, siteCode);
+        return count == null ? 0 : count;
+    }
+
+    /**
      * 退组：仅 ASSIGNED -> WITHDRAWN，不释放席位。
      *
      * @return 受影响行数；0 表示不存在或已退组
@@ -118,5 +149,9 @@ public class AllocationRepository {
 
     public boolean isDuplicateBlindCode(DuplicateKeyException e) {
         return e.getMessage() != null && e.getMessage().contains("uq_allocation_blind_code");
+    }
+
+    public boolean isDuplicateAssignmentKey(DuplicateKeyException e) {
+        return e.getMessage() != null && e.getMessage().contains("uq_allocation_assignment_key");
     }
 }

@@ -23,6 +23,8 @@ public abstract class AbstractBlindIntegrationTest {
         jdbc.update("DELETE FROM idempotent_request");
         jdbc.update("DELETE FROM unblind_request");
         jdbc.update("DELETE FROM allocation");
+        jdbc.update("DELETE FROM site_activation");
+        jdbc.update("DELETE FROM site");
         jdbc.update("DELETE FROM seat");
         jdbc.update("DELETE FROM experiment");
         clock.setTime(1_700_000_000_000L);

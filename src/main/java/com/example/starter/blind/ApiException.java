@@ -48,4 +48,9 @@ public class ApiException extends RuntimeException {
     public static ApiException full(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, message);
     }
+
+    /** 422 业务不可处理：中心容量达上限、存在待处理揭盲申请禁止关闭等。 */
+    public static ApiException unprocessable(String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, message);
+    }
 }

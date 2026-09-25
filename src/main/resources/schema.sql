@@ -32,20 +32,24 @@ COMMENT ON COLUMN seat.seat_no IS '区组内席位号1~4，属于可直接解码
 COMMENT ON COLUMN seat.treatment IS '处理代码 A 或 B，盲底，仅揭盲批准后可返回给申请人';
 
 CREATE TABLE IF NOT EXISTS allocation (
-    id             BIGINT       NOT NULL AUTO_INCREMENT,
-    experiment_id  VARCHAR(64)  NOT NULL,
-    participant_id VARCHAR(64)  NOT NULL,
-    block_no       INT          NOT NULL,
-    seat_no        INT          NOT NULL,
-    blind_code     VARCHAR(32)  NOT NULL,
-    status         VARCHAR(16)  NOT NULL,
-    assigned_actor VARCHAR(64)  NOT NULL,
-    assigned_at    BIGINT       NOT NULL,
-    withdrawn_at   BIGINT,
+    id              BIGINT       NOT NULL AUTO_INCREMENT,
+    experiment_id   VARCHAR(64)  NOT NULL,
+    participant_id  VARCHAR(64)  NOT NULL,
+    block_no        INT          NOT NULL,
+    seat_no         INT          NOT NULL,
+    blind_code      VARCHAR(32)  NOT NULL,
+    status          VARCHAR(16)  NOT NULL,
+    assigned_actor  VARCHAR(64)  NOT NULL,
+    assigned_at     BIGINT       NOT NULL,
+    withdrawn_at    BIGINT,
+    site_code       VARCHAR(64),
+    site_generation INT,
+    assignment_key  VARCHAR(64),
     CONSTRAINT pk_allocation PRIMARY KEY (id),
     CONSTRAINT uq_allocation_participant UNIQUE (experiment_id, participant_id),
     CONSTRAINT uq_allocation_seat UNIQUE (experiment_id, block_no, seat_no),
     CONSTRAINT uq_allocation_blind_code UNIQUE (blind_code),
+    CONSTRAINT uq_allocation_assignment_key UNIQUE (assignment_key),
     CONSTRAINT ck_allocation_status CHECK (status IN ('ASSIGNED', 'WITHDRAWN'))
 );
 COMMENT ON TABLE  allocation IS '参与者分配表；同实验同参与者只占一席，退组不释放席位、不重排已有分配';
@@ -59,6 +63,63 @@ COMMENT ON COLUMN allocation.status IS '分配状态：ASSIGNED=在组；WITHDRA
 COMMENT ON COLUMN allocation.assigned_actor IS '执行登记的操作者编号（X-Actor-Id）';
 COMMENT ON COLUMN allocation.assigned_at IS '分配时间，Unix 毫秒，UTC';
 COMMENT ON COLUMN allocation.withdrawn_at IS '退组时间，Unix 毫秒，UTC；NULL 表示未退组';
+COMMENT ON COLUMN allocation.site_code IS '所属试验中心编号；NULL 表示未按中心登记（历史入口）';
+COMMENT ON COLUMN allocation.site_generation IS '分配时中心激活代次；NULL 表示未按中心登记';
+COMMENT ON COLUMN allocation.assignment_key IS '分配业务键，全局唯一，绑定操作者、受试者、中心代次与全部状态字段；NULL 表示历史入口分配';
+
+CREATE TABLE IF NOT EXISTS site (
+    experiment_id          VARCHAR(64) NOT NULL,
+    site_code              VARCHAR(64) NOT NULL,
+    status                 VARCHAR(16) NOT NULL,
+    target_cap             INT         NOT NULL,
+    generation             INT         NOT NULL,
+    pending_activation_key VARCHAR(64),
+    pending_actor          VARCHAR(64),
+    pending_confirmed_at   BIGINT,
+    created_at             BIGINT      NOT NULL,
+    closed_at              BIGINT,
+    CONSTRAINT pk_site PRIMARY KEY (experiment_id, site_code),
+    CONSTRAINT ck_site_status CHECK (status IN ('PENDING', 'ACTIVE', 'SUSPENDED', 'CLOSED')),
+    CONSTRAINT ck_site_target_cap CHECK (target_cap >= 0),
+    CONSTRAINT ck_site_generation CHECK (generation >= 0)
+);
+COMMENT ON TABLE  site IS '试验中心表；未激活中心不得生成盲码或分配区组，暂停/关闭后拒绝新分配，关闭不可逆';
+COMMENT ON COLUMN site.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN site.site_code IS '中心编号，实验内唯一';
+COMMENT ON COLUMN site.status IS '中心状态：PENDING=已创建未激活；ACTIVE=已激活；SUSPENDED=已暂停；CLOSED=已关闭（终态）';
+COMMENT ON COLUMN site.target_cap IS '目标入组上限（人），累计分配达到上限后新分配返回422，退组不回收容量；激活时校验必须大于零';
+COMMENT ON COLUMN site.generation IS '激活代次，0=从未激活；每次双人确认激活（含暂停后恢复）递增';
+COMMENT ON COLUMN site.pending_activation_key IS '首次双人确认提交的 activationKey，等待第二人确认；激活或关闭时清空';
+COMMENT ON COLUMN site.pending_actor IS '首次确认的操作者编号，第二人必须不同';
+COMMENT ON COLUMN site.pending_confirmed_at IS '首次确认时间，Unix 毫秒，UTC；NULL 表示无待确认';
+COMMENT ON COLUMN site.created_at IS '创建时间，Unix 毫秒，UTC';
+COMMENT ON COLUMN site.closed_at IS '关闭时间，Unix 毫秒，UTC；NULL 表示未关闭';
+
+CREATE TABLE IF NOT EXISTS site_activation (
+    id                  BIGINT      NOT NULL AUTO_INCREMENT,
+    experiment_id       VARCHAR(64) NOT NULL,
+    site_code           VARCHAR(64) NOT NULL,
+    generation          INT         NOT NULL,
+    activation_key      VARCHAR(64) NOT NULL,
+    first_actor         VARCHAR(64) NOT NULL,
+    first_confirmed_at  BIGINT      NOT NULL,
+    second_actor        VARCHAR(64) NOT NULL,
+    second_confirmed_at BIGINT      NOT NULL,
+    target_cap          INT         NOT NULL,
+    CONSTRAINT pk_site_activation PRIMARY KEY (id),
+    CONSTRAINT uq_site_activation UNIQUE (experiment_id, site_code, generation)
+);
+COMMENT ON TABLE  site_activation IS '中心双人激活记录表；激活成功在同一事务内写入，记录不可变（只插入，不更新不删除）';
+COMMENT ON COLUMN site_activation.id IS '激活记录自增主键';
+COMMENT ON COLUMN site_activation.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN site_activation.site_code IS '中心编号';
+COMMENT ON COLUMN site_activation.generation IS '本次激活产生的激活代次，从1开始';
+COMMENT ON COLUMN site_activation.activation_key IS '两名确认人共同使用的 activationKey，绑定操作者、中心、代次与全部状态字段';
+COMMENT ON COLUMN site_activation.first_actor IS '首次确认的操作者编号（未盲法管理人员）';
+COMMENT ON COLUMN site_activation.first_confirmed_at IS '首次确认时间，Unix 毫秒，UTC';
+COMMENT ON COLUMN site_activation.second_actor IS '第二次确认的操作者编号，必须不同于首次确认人';
+COMMENT ON COLUMN site_activation.second_confirmed_at IS '第二次确认（即激活生效）时间，Unix 毫秒，UTC';
+COMMENT ON COLUMN site_activation.target_cap IS '激活时目标入组上限快照（人），激活后上限修改不影响本记录';
 
 CREATE TABLE IF NOT EXISTS unblind_request (
     id                      VARCHAR(64)  NOT NULL,

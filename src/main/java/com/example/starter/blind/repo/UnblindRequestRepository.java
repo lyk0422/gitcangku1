@@ -97,4 +97,16 @@ public class UnblindRequestRepository {
                         + "WHERE id = ? AND status = 'PENDING'",
                 reviewerActor, treatment, reviewedAt, requestId);
     }
+
+    /**
+     * 中心维度待审揭盲申请数：关闭中心前必须为 0，否则 422。
+     */
+    public long countPendingBySite(String experimentId, String siteCode) {
+        Long count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM unblind_request u "
+                        + "JOIN allocation a ON u.allocation_id = a.id "
+                        + "WHERE a.experiment_id = ? AND a.site_code = ? AND u.status = 'PENDING'",
+                Long.class, experimentId, siteCode);
+        return count == null ? 0 : count;
+    }
 }
