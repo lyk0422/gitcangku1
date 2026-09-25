@@ -11,15 +11,15 @@ public final class Dtos {
     private Dtos() {
     }
 
-    /** 创建供水窗口命令。 */
+    /** 创建供水窗口命令；quarter 为所属季度（1~4）。 */
     public record CreateWindowRequest(String commandKey, String windowKey, String channelId,
-                                      String startUtc, String endUtc, String plannedVolume) {
+                                      String startUtc, String endUtc, String plannedVolume, Integer quarter) {
     }
 
     /** 供水窗口视图；activeCurtailmentVolume 为 null 表示无生效限供。 */
     public record WindowResponse(long id, String windowKey, String channelId, String startUtc, String endUtc,
-                                 String plannedVolume, String activeCurtailmentVolume, String availableTotal,
-                                 String createdUtc) {
+                                 String plannedVolume, int quarter, String activeCurtailmentVolume,
+                                 String availableTotal, String createdUtc) {
     }
 
     /** 提交配水申请命令；申请人由 X-Actor-Id 请求头提供。 */
@@ -27,9 +27,10 @@ public final class Dtos {
                                           String userId, String amount) {
     }
 
-    /** 配水申请视图。状态：REQUESTED / APPROVED / CANCELLED。 */
+    /** 配水申请视图。状态：REQUESTED / APPROVED / CANCELLED；carriedOut 为已结转出的水量。 */
     public record AllocationResponse(String allocationKey, long windowId, String userId, String amount,
-                                     String requester, String status, String createdUtc, String updatedUtc) {
+                                     String carriedOut, String requester, String status,
+                                     String createdUtc, String updatedUtc) {
     }
 
     /** 仅含幂等键的命令（批准/取消申请、取消限供）。 */
@@ -57,5 +58,25 @@ public final class Dtos {
 
     /** 统一错误响应体。 */
     public record ErrorResponse(String code, String message) {
+    }
+
+    /** 季度结转命令：把源申请的可结转余量迁移到同季度另一窗口的新建 APPROVED 申请。 */
+    public record CarryoverRequest(String commandKey, String carryoverKey, String sourceAllocationKey,
+                                   Long sourceWindowId, Long targetWindowId, String userId, String amount) {
+    }
+
+    /** 结转流水视图，写入后不可变。 */
+    public record CarryoverResponse(String carryoverKey, String userId, String sourceAllocationKey,
+                                    long sourceWindowId, long targetWindowId, String targetAllocationKey,
+                                    String amount, String createdUtc) {
+    }
+
+    /** 用水户某季度单条申请的跨窗口余量视图；carryableRemainder = amount - carriedOut。 */
+    public record RemainderItem(long windowId, String windowKey, int quarter, String allocationKey,
+                                String status, String amount, String carriedOut, String carryableRemainder) {
+    }
+
+    /** 按用水户的跨窗口余量查询响应。 */
+    public record RemainderResponse(String userId, int quarter, List<RemainderItem> items) {
     }
 }

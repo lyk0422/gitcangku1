@@ -77,7 +77,7 @@ class WaterApiTests {
     }
 
     private Map<String, Object> windowBody(String commandKey, String windowKey, String channelId,
-                                           String start, String end, String planned) {
+                                           String start, String end, String planned, Object quarter) {
         Map<String, Object> body = new HashMap<>();
         body.put("commandKey", commandKey);
         body.put("windowKey", windowKey);
@@ -85,12 +85,18 @@ class WaterApiTests {
         body.put("startUtc", start);
         body.put("endUtc", end);
         body.put("plannedVolume", planned);
+        body.put("quarter", quarter);
         return body;
     }
 
     private long createWindow(String channelId, String start, String end, String planned) throws Exception {
+        return createWindow(channelId, 1, start, end, planned);
+    }
+
+    private long createWindow(String channelId, int quarter, String start, String end, String planned)
+            throws Exception {
         JsonNode node = postOk("/api/windows",
-                windowBody(key("wc"), key("wk"), channelId, start, end, planned), null);
+                windowBody(key("wc"), key("wk"), channelId, start, end, planned, quarter), null);
         return node.get("id").asLong();
     }
 
@@ -143,11 +149,11 @@ class WaterApiTests {
         createWindow(channel, "2026-10-02T10:00:00Z", "2026-10-02T11:00:00Z", "10");
         // 重叠 -> 409
         postJson("/api/windows", windowBody(key("wc"), key("wk"), channel,
-                "2026-10-02T10:30:00Z", "2026-10-02T11:30:00Z", "10"), null, 409);
+                "2026-10-02T10:30:00Z", "2026-10-02T11:30:00Z", "10", 1), null, 409);
         postJson("/api/windows", windowBody(key("wc"), key("wk"), channel,
-                "2026-10-02T09:00:00Z", "2026-10-02T10:00:01Z", "10"), null, 409);
+                "2026-10-02T09:00:00Z", "2026-10-02T10:00:01Z", "10", 1), null, 409);
         postJson("/api/windows", windowBody(key("wc"), key("wk"), channel,
-                "2026-10-02T09:00:00Z", "2026-10-02T12:00:00Z", "10"), null, 409);
+                "2026-10-02T09:00:00Z", "2026-10-02T12:00:00Z", "10", 1), null, 409);
         // 相邻 -> 合法
         createWindow(channel, "2026-10-02T11:00:00Z", "2026-10-02T12:00:00Z", "10");
         createWindow(channel, "2026-10-02T09:00:00Z", "2026-10-02T10:00:00Z", "10");
@@ -160,24 +166,31 @@ class WaterApiTests {
         String channel = "ch-bad-" + run;
         // 超过 3 位小数
         postJson("/api/windows", windowBody(key("wc"), key("wk"), channel,
-                "2026-10-03T00:00:00Z", "2026-10-03T01:00:00Z", "1.0001"), null, 400);
+                "2026-10-03T00:00:00Z", "2026-10-03T01:00:00Z", "1.0001", 1), null, 400);
         // 零与负数
         postJson("/api/windows", windowBody(key("wc"), key("wk"), channel,
-                "2026-10-03T00:00:00Z", "2026-10-03T01:00:00Z", "0"), null, 400);
+                "2026-10-03T00:00:00Z", "2026-10-03T01:00:00Z", "0", 1), null, 400);
         postJson("/api/windows", windowBody(key("wc"), key("wk"), channel,
-                "2026-10-03T00:00:00Z", "2026-10-03T01:00:00Z", "-5"), null, 400);
+                "2026-10-03T00:00:00Z", "2026-10-03T01:00:00Z", "-5", 1), null, 400);
         // 非数字
         postJson("/api/windows", windowBody(key("wc"), key("wk"), channel,
-                "2026-10-03T00:00:00Z", "2026-10-03T01:00:00Z", "abc"), null, 400);
+                "2026-10-03T00:00:00Z", "2026-10-03T01:00:00Z", "abc", 1), null, 400);
         // 起止倒置
         postJson("/api/windows", windowBody(key("wc"), key("wk"), channel,
-                "2026-10-03T01:00:00Z", "2026-10-03T00:00:00Z", "1"), null, 400);
+                "2026-10-03T01:00:00Z", "2026-10-03T00:00:00Z", "1", 1), null, 400);
         // 非法时间
         postJson("/api/windows", windowBody(key("wc"), key("wk"), channel,
-                "not-a-time", "2026-10-03T01:00:00Z", "1"), null, 400);
+                "not-a-time", "2026-10-03T01:00:00Z", "1", 1), null, 400);
+        // 季度缺失或越界
+        postJson("/api/windows", windowBody(key("wc"), key("wk"), channel,
+                "2026-10-03T00:00:00Z", "2026-10-03T01:00:00Z", "1", null), null, 400);
+        postJson("/api/windows", windowBody(key("wc"), key("wk"), channel,
+                "2026-10-03T00:00:00Z", "2026-10-03T01:00:00Z", "1", 0), null, 400);
+        postJson("/api/windows", windowBody(key("wc"), key("wk"), channel,
+                "2026-10-03T00:00:00Z", "2026-10-03T01:00:00Z", "1", 5), null, 400);
         // 缺字段
         Map<String, Object> body = windowBody(key("wc"), key("wk"), channel,
-                "2026-10-03T00:00:00Z", "2026-10-03T01:00:00Z", "1");
+                "2026-10-03T00:00:00Z", "2026-10-03T01:00:00Z", "1", 1);
         body.remove("commandKey");
         postJson("/api/windows", body, null, 400);
     }
@@ -370,9 +383,9 @@ class WaterApiTests {
         String windowCommand = key("wc");
         String windowKey = key("wk");
         postOk("/api/windows", windowBody(windowCommand, windowKey, "ch-x-" + run,
-                "2026-11-01T00:00:00Z", "2026-11-01T01:00:00Z", "1"), null);
+                "2026-11-01T00:00:00Z", "2026-11-01T01:00:00Z", "1", 1), null);
         postJson("/api/windows", windowBody(windowCommand, windowKey, "ch-y-" + run,
-                "2026-11-01T00:00:00Z", "2026-11-01T01:00:00Z", "1"), null, 409);
+                "2026-11-01T00:00:00Z", "2026-11-01T01:00:00Z", "1", 1), null, 409);
     }
 
     // ------------------------------------------------------------------
