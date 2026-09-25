@@ -4,8 +4,11 @@ spring:
   config:
     import: "optional:configtree:/run/secrets/"
   datasource:
-    url: ${DB_URL}
-    username: ${DB_USER}
+    # 本地默认使用嵌入式 H2（MODE=MySQL，命名内存库，仅同一 JVM 内有效）；
+    # 提供 DB_URL/DB_USER/DB_PASSWORD 环境变量即可切换到外部 MySQL。
+    url: ${DB_URL:jdbc:h2:mem:calibration_local;MODE=MySQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1}
+    username: ${DB_USER:sa}
+    password: ${DB_PASSWORD:}
     hikari:
       maximum-pool-size: 5
       minimum-idle: 1

@@ -22,6 +22,18 @@ public class GlobalExceptionHandler {
                 .body(new ErrorResponse(ex.getCode(), ex.getMessage(), ex.getFailures()));
     }
 
+    @ExceptionHandler(GateRejectedException.class)
+    public ResponseEntity<ErrorResponse> handleGateRejected(GateRejectedException ex) {
+        return ResponseEntity.status(ex.getStatus())
+                .body(new ErrorResponse(ex.getCode(), ex.getMessage(), ex.getFailures()));
+    }
+
+    @ExceptionHandler(EnvironmentOutOfRangeException.class)
+    public ResponseEntity<EnvironmentErrorResponse> handleEnvironmentOutOfRange(EnvironmentOutOfRangeException ex) {
+        return ResponseEntity.status(ex.getStatus())
+                .body(new EnvironmentErrorResponse(ex.getCode(), ex.getMessage(), ex.getRange()));
+    }
+
     @ExceptionHandler(ApiException.class)
     public ResponseEntity<ErrorResponse> handleApi(ApiException ex) {
         return ResponseEntity.status(ex.getStatus())
