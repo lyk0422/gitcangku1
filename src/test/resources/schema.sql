@@ -77,12 +77,15 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     task_key VARCHAR(128) NOT NULL,
     group_code VARCHAR(64) NOT NULL,
     title VARCHAR(512) NOT NULL,
-    status VARCHAR(16) NOT NULL,
+    status VARCHAR(24) NOT NULL,
+    work_grid VARCHAR(64) NOT NULL,
     created_by VARCHAR(128) NOT NULL,
     done_by VARCHAR(128) NULL,
     done_at TIMESTAMP(6) NULL,
     cancelled_by VARCHAR(128) NULL,
     cancelled_at TIMESTAMP(6) NULL,
+    blocked_zone_id BIGINT NULL,
+    blocked_snapshot CLOB NULL,
     created_at TIMESTAMP(6) NOT NULL,
     updated_at TIMESTAMP(6) NOT NULL,
     CONSTRAINT uk_task_key UNIQUE (incident_id, task_key)
@@ -98,4 +101,57 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS task_dispatch_leases (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    task_id BIGINT NOT NULL,
+    dispatched_by VARCHAR(128) NOT NULL,
+    command_key VARCHAR(128) NOT NULL,
+    dispatched_at TIMESTAMP(6) NOT NULL,
+    consumed_at TIMESTAMP(6) NULL,
+    CONSTRAINT uk_dispatch_lease_task UNIQUE (task_id)
+);
+
+CREATE TABLE IF NOT EXISTS evacuation_zones (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    zone_key VARCHAR(128) NOT NULL,
+    version INT NOT NULL,
+    risk_level VARCHAR(16) NOT NULL,
+    grids CLOB NOT NULL,
+    grid_count INT NOT NULL,
+    effective_from TIMESTAMP(6) NOT NULL,
+    effective_to TIMESTAMP(6) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    registered_by VARCHAR(128) NOT NULL,
+    fingerprint VARCHAR(64) NOT NULL,
+    ended_at TIMESTAMP(6) NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_zone_key UNIQUE (incident_id, zone_key),
+    CONSTRAINT uk_zone_fingerprint UNIQUE (incident_id, fingerprint)
+);
+
+CREATE TABLE IF NOT EXISTS evacuation_exemptions (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    zone_id BIGINT NOT NULL,
+    version INT NOT NULL,
+    exempt_task_key VARCHAR(128) NOT NULL,
+    granted_by VARCHAR(128) NOT NULL,
+    command_key VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_exemption_scope UNIQUE (zone_id, exempt_task_key)
+);
+
+CREATE TABLE IF NOT EXISTS zone_command_keys (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    command_key VARCHAR(128) NOT NULL,
+    operation VARCHAR(32) NOT NULL,
+    request_hash VARCHAR(64) NOT NULL,
+    response_status INT NULL,
+    response_body CLOB NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_zone_command_key UNIQUE (command_key)
 );

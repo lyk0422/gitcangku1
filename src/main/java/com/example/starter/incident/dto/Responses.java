@@ -63,11 +63,22 @@ public final class Responses {
     }
 
     /**
-     * 处置任务视图：blockers 按阻塞事件键排序；doneBy/doneAt 仅 DONE 有值，
-     * cancelledBy/cancelledAt 仅 CANCELLED 有值。
+     * 疏散阻断信息视图：任务处于 EVACUATION_BLOCKED 时随任务返回，固化登记时刻的区域快照。
+     * effectiveFrom/effectiveTo 为 UTC 左闭右开窗口；grids 为规范化网格集合。
      */
-    public record TaskView(String taskKey, String groupCode, String title, String status,
-                           List<TaskBlockerView> blockers, String createdBy, Instant createdAt,
+    public record EvacuationBlockerView(String zoneKey, int version, String riskLevel,
+                                        List<String> grids, Instant effectiveFrom,
+                                        Instant effectiveTo) {
+    }
+
+    /**
+     * 处置任务视图：workGrid 为作业网格；blockers 按阻塞事件键排序；
+     * blocked 仅 EVACUATION_BLOCKED 状态非空（区域快照）；
+     * doneBy/doneAt 仅 DONE 有值，cancelledBy/cancelledAt 仅 CANCELLED 有值。
+     */
+    public record TaskView(String taskKey, String groupCode, String title, String workGrid,
+                           String status, List<TaskBlockerView> blockers,
+                           EvacuationBlockerView blocked, String createdBy, Instant createdAt,
                            String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt) {
     }
 
@@ -75,7 +86,51 @@ public final class Responses {
     public record IncidentTasksView(String incidentKey, List<TaskView> tasks) {
     }
 
-    /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
+    /** 解决门禁未完成项：仍有未终结任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
+    }
+
+    /**
+     * 疏散区域视图：effective 为查询时刻按窗口与状态计算的是否有效（只读计算，不隐式写入）；
+     * endedAt 仅 ENDED 有值。
+     */
+    public record ZoneView(String zoneKey, int version, String riskLevel, List<String> grids,
+                           Instant effectiveFrom, Instant effectiveTo, String status,
+                           boolean effective, String registeredBy, Instant endedAt,
+                           Instant createdAt) {
+    }
+
+    /** 事件的疏散区域列表视图：zones 按版本返回。 */
+    public record ZoneListView(String incidentKey, List<ZoneView> zones) {
+    }
+
+    /**
+     * 撤离豁免视图：version 为绑定的区域版本；zoneKey 为所属区域；taskKey 为被豁免任务。
+     */
+    public record ExemptionView(long id, String zoneKey, int version, String taskKey,
+                                String grantedBy, Instant createdAt) {
+    }
+
+    /** 事件的豁免列表视图：exemptions 按授予顺序返回。 */
+    public record ExemptionListView(String incidentKey, List<ExemptionView> exemptions) {
+    }
+
+    /**
+     * 批量派工结果视图：dispatched 为本次成功派工的任务键；tasks 返回派工后各任务明细。
+     */
+    public record BatchDispatchView(String incidentKey, List<String> dispatched, List<TaskView> tasks) {
+    }
+
+    /**
+     * 任务阻断查询视图：逐条任务返回其当前疏散命中与豁免情况。
+     * blockedBy 为当前有效且命中作业网格、但任务缺少对应版本豁免的区域键（无则空列表）；
+     * exemptions 为该任务已持有的豁免（区域键 + 版本）。
+     */
+    public record TaskBlockStatusView(String taskKey, String workGrid, String status,
+                                      List<String> blockedBy, List<ExemptionView> exemptions) {
+    }
+
+    /** 事件的任务阻断查询视图：tasks 按创建顺序返回。 */
+    public record TaskBlockStatusListView(String incidentKey, List<TaskBlockStatusView> tasks) {
     }
 }

@@ -83,15 +83,15 @@ class SchemaH2ScriptTest {
 
                 // 处置任务：(incident_id, task_key) 唯一
                 st.execute("INSERT INTO incident_tasks (incident_id, task_key, group_code, title,"
-                        + " status, created_by, created_at, updated_at) VALUES (1,'T-1','G','t',"
-                        + "'OPEN','alice','" + Timestamp.from(now) + "','" + Timestamp.from(now)
-                        + "')");
+                        + " status, work_grid, created_by, created_at, updated_at) VALUES"
+                        + " (1,'T-1','G','t','OPEN','X1Y1','alice','" + Timestamp.from(now) + "','"
+                        + Timestamp.from(now) + "')");
                 boolean duplicateTaskRejected = false;
                 try {
                     st.execute("INSERT INTO incident_tasks (incident_id, task_key, group_code,"
-                            + " title, status, created_by, created_at, updated_at) VALUES"
-                            + " (1,'T-1','G','t2','OPEN','alice','" + Timestamp.from(now) + "','"
-                            + Timestamp.from(now) + "')");
+                            + " title, status, work_grid, created_by, created_at, updated_at) VALUES"
+                            + " (1,'T-1','G','t2','OPEN','X1Y1','alice','" + Timestamp.from(now)
+                            + "','" + Timestamp.from(now) + "')");
                 } catch (Exception e) {
                     duplicateTaskRejected = true;
                 }
@@ -108,6 +108,75 @@ class SchemaH2ScriptTest {
                     duplicateBlockerRejected = true;
                 }
                 assertThat(duplicateBlockerRejected).isTrue();
+
+                // 疏散区域：(incident_id, zone_key) 唯一
+                st.execute("INSERT INTO evacuation_zones (incident_id, zone_key, version, risk_level,"
+                        + " grids, grid_count, effective_from, effective_to, status, registered_by,"
+                        + " fingerprint, ended_at, created_at, updated_at) VALUES"
+                        + " (1,'Z-1',1,'HIGH','[\"X1\"]',1,'" + Timestamp.from(now) + "','"
+                        + Timestamp.from(now.plusSeconds(60)) + "','REGISTERED','alice','FP-1',"
+                        + "NULL,'" + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                boolean duplicateZoneKeyRejected = false;
+                try {
+                    st.execute("INSERT INTO evacuation_zones (incident_id, zone_key, version,"
+                            + " risk_level, grids, grid_count, effective_from, effective_to, status,"
+                            + " registered_by, fingerprint, ended_at, created_at, updated_at) VALUES"
+                            + " (1,'Z-1',2,'LOW','[\"X2\"]',1,'" + Timestamp.from(now) + "','"
+                            + Timestamp.from(now.plusSeconds(60)) + "','REGISTERED','alice','FP-2',"
+                            + "NULL,'" + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateZoneKeyRejected = true;
+                }
+                assertThat(duplicateZoneKeyRejected).isTrue();
+
+                // 疏散区域：(incident_id, fingerprint) 唯一
+                boolean duplicateFpRejected = false;
+                try {
+                    st.execute("INSERT INTO evacuation_zones (incident_id, zone_key, version,"
+                            + " risk_level, grids, grid_count, effective_from, effective_to, status,"
+                            + " registered_by, fingerprint, ended_at, created_at, updated_at) VALUES"
+                            + " (1,'Z-2',2,'LOW','[\"X2\"]',1,'" + Timestamp.from(now) + "','"
+                            + Timestamp.from(now.plusSeconds(60)) + "','REGISTERED','alice','FP-1',"
+                            + "NULL,'" + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateFpRejected = true;
+                }
+                assertThat(duplicateFpRejected).isTrue();
+
+                // 豁免：(zone_id, exempt_task_key) 唯一；租约：task_id 唯一
+                st.execute("INSERT INTO evacuation_exemptions (incident_id, zone_id, version,"
+                        + " exempt_task_key, granted_by, command_key, created_at) VALUES"
+                        + " (1,1,1,'T-1','alice','CK-1','" + Timestamp.from(now) + "')");
+                boolean duplicateExemptionRejected = false;
+                try {
+                    st.execute("INSERT INTO evacuation_exemptions (incident_id, zone_id, version,"
+                            + " exempt_task_key, granted_by, command_key, created_at) VALUES"
+                            + " (1,1,1,'T-1','alice','CK-2','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateExemptionRejected = true;
+                }
+                assertThat(duplicateExemptionRejected).isTrue();
+
+                st.execute("INSERT INTO task_dispatch_leases (task_id, dispatched_by, command_key,"
+                        + " dispatched_at, consumed_at) VALUES (1,'alice','CK-1','"
+                        + Timestamp.from(now) + "',NULL)");
+                boolean duplicateLeaseRejected = false;
+                try {
+                    st.execute("INSERT INTO task_dispatch_leases (task_id, dispatched_by,"
+                            + " command_key, dispatched_at, consumed_at) VALUES (1,'alice','CK-2','"
+                            + Timestamp.from(now) + "',NULL)");
+                } catch (Exception e) {
+                    duplicateLeaseRejected = true;
+                }
+                assertThat(duplicateLeaseRejected).isTrue();
+
+                // 区域条件结束：仅 REGISTERED 可置 ENDED，重复结束 0 行
+                int ended = st.executeUpdate("UPDATE evacuation_zones SET status='ENDED'"
+                        + " WHERE id = 1 AND status = 'REGISTERED'");
+                assertThat(ended).isEqualTo(1);
+                int endedAgain = st.executeUpdate("UPDATE evacuation_zones SET status='ENDED'"
+                        + " WHERE id = 1 AND status = 'REGISTERED'");
+                assertThat(endedAgain).isZero();
             }
         }
     }

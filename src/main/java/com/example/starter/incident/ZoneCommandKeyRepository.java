@@ -7,21 +7,21 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 
-import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
 
 /**
- * 命令幂等键仓储。command_key 全局唯一；
- * 先占位插入、同事务内补写响应，并发同键插入由唯一约束串行化。
+ * 疏散域命令幂等键仓储，使用独立的 zone_command_keys 表与既有 command_keys 物理隔离。
+ * 语义与 {@link CommandKeyRepository} 一致：先占位插入、同事务内补写响应，
+ * 并发同键插入由唯一约束串行化，业务失败随事务回滚，不占用幂等键。
  */
 @Repository
-public class CommandKeyRepository implements CommandKeyStore {
+public class ZoneCommandKeyRepository implements CommandKeyStore {
 
     private final JdbcTemplate jdbc;
 
-    public CommandKeyRepository(JdbcTemplate jdbc) {
+    public ZoneCommandKeyRepository(JdbcTemplate jdbc) {
         this.jdbc = jdbc;
     }
 
@@ -39,28 +39,26 @@ public class CommandKeyRepository implements CommandKeyStore {
      * 按命令键查询（普通读）。
      */
     public Optional<CommandKeyRecord> find(String commandKey) {
-        List<CommandKeyRecord> rows = jdbc.query("SELECT * FROM command_keys WHERE command_key = ?",
-                MAPPER, commandKey);
+        List<CommandKeyRecord> rows = jdbc.query(
+                "SELECT * FROM zone_command_keys WHERE command_key = ?", MAPPER, commandKey);
         return rows.stream().findFirst();
     }
 
     /**
-     * 按命令键锁定读（SELECT ... FOR UPDATE），读取最新已提交数据，用于唯一冲突后的重查。
+     * 按命令键锁定读（SELECT ... FOR UPDATE），用于唯一冲突后的重查。
      */
     public Optional<CommandKeyRecord> findForUpdate(String commandKey) {
         List<CommandKeyRecord> rows = jdbc.query(
-                "SELECT * FROM command_keys WHERE command_key = ? FOR UPDATE", MAPPER, commandKey);
+                "SELECT * FROM zone_command_keys WHERE command_key = ? FOR UPDATE", MAPPER, commandKey);
         return rows.stream().findFirst();
     }
 
     /**
      * 占位插入幂等键（响应列为空，同事务内随后补写）。
-     *
-     * @throws DuplicateKeyException 同键已存在（含并发事务已提交）时抛出
      */
     public void insertPlaceholder(String commandKey, String operation, String requestHash, Instant now) {
-        jdbc.update("INSERT INTO command_keys (command_key, operation, request_hash, response_status,"
-                + " response_body, created_at) VALUES (?,?,?,NULL,NULL,?)",
+        jdbc.update("INSERT INTO zone_command_keys (command_key, operation, request_hash,"
+                + " response_status, response_body, created_at) VALUES (?,?,?,NULL,NULL,?)",
                 commandKey, operation, requestHash, Timestamp.from(now));
     }
 
@@ -68,7 +66,7 @@ public class CommandKeyRepository implements CommandKeyStore {
      * 补写首次成功的响应，与业务写入同事务提交。
      */
     public void fillResponse(String commandKey, int responseStatus, String responseBody) {
-        jdbc.update("UPDATE command_keys SET response_status = ?, response_body = ? WHERE command_key = ?",
-                responseStatus, responseBody, commandKey);
+        jdbc.update("UPDATE zone_command_keys SET response_status = ?, response_body = ?"
+                + " WHERE command_key = ?", responseStatus, responseBody, commandKey);
     }
 }

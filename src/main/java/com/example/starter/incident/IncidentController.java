@@ -7,10 +7,12 @@ import com.example.starter.incident.dto.Requests.ReportRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
 import com.example.starter.incident.dto.Requests.TaskActionRequest;
+import com.example.starter.incident.dto.Requests.TaskBatchDispatchRequest;
 import com.example.starter.incident.dto.Requests.TaskCreateRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
+import com.example.starter.incident.dto.Responses.BatchDispatchView;
 import com.example.starter.incident.dto.Responses.EscalationHistoryView;
 import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
@@ -144,13 +146,25 @@ public class IncidentController {
     }
 
     /**
-     * 创建处置任务（仅当前指挥人；阻塞事件 0~5 个，拒绝环依赖）。
+     * 创建处置任务（仅当前指挥人；workGrid 为作业网格；阻塞事件 0~5 个，拒绝环依赖；
+     * 作业网格命中有效疏散区域须持该区域版本豁免，否则 422）。
      */
     @PostMapping("/{incidentKey}/tasks")
     public TaskView createTask(@PathVariable String incidentKey,
                                @RequestHeader("X-Actor-Id") String actor,
                                @RequestBody TaskCreateRequest req) {
         return service.createTask(incidentKey, actor, req);
+    }
+
+    /**
+     * 批量派工（仅当前指挥人）：先校验全部任务最终位置、资源依赖与撤离豁免，
+     * 任一缺失整体 422，任务状态与派工租约全部回滚。
+     */
+    @PostMapping("/{incidentKey}/tasks/dispatch")
+    public BatchDispatchView batchDispatch(@PathVariable String incidentKey,
+                                           @RequestHeader("X-Actor-Id") String actor,
+                                           @RequestBody TaskBatchDispatchRequest req) {
+        return service.batchDispatch(incidentKey, actor, req);
     }
 
     /**
@@ -170,13 +184,33 @@ public class IncidentController {
     }
 
     /**
-     * 完成任务（仅当前指挥人；全部阻塞解除后才可完成）。
+     * 开始任务（仅当前指挥人；OPEN/DISPATCHED 可开始；命中有效疏散区域须持版本豁免）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/start")
+    public TaskView startTask(@PathVariable String incidentKey, @PathVariable String taskKey,
+                              @RequestHeader("X-Actor-Id") String actor,
+                              @RequestBody TaskActionRequest req) {
+        return service.startTask(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 完成任务（仅当前指挥人；全部阻塞解除后才可完成；进行中命中区域且无豁免不可完成）。
      */
     @PostMapping("/{incidentKey}/tasks/{taskKey}/complete")
     public TaskView completeTask(@PathVariable String incidentKey, @PathVariable String taskKey,
                                  @RequestHeader("X-Actor-Id") String actor,
                                  @RequestBody TaskActionRequest req) {
         return service.completeTask(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 撤离登记（仅当前指挥人；仅进行中且命中缺豁免有效区域的任务，登记后 EVACUATED 不可完成）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/evacuate")
+    public TaskView evacuateTask(@PathVariable String incidentKey, @PathVariable String taskKey,
+                                 @RequestHeader("X-Actor-Id") String actor,
+                                 @RequestBody TaskActionRequest req) {
+        return service.evacuateTask(incidentKey, taskKey, actor, req);
     }
 
     /**

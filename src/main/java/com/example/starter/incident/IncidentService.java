@@ -1,18 +1,14 @@
 package com.example.starter.incident;
 
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.EnumSet;
-import java.util.HexFormat;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.function.Supplier;
 
 import com.example.starter.incident.dto.Requests.ActionRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
@@ -21,12 +17,15 @@ import com.example.starter.incident.dto.Requests.ReportRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
 import com.example.starter.incident.dto.Requests.TaskActionRequest;
+import com.example.starter.incident.dto.Requests.TaskBatchDispatchRequest;
 import com.example.starter.incident.dto.Requests.TaskCreateRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
+import com.example.starter.incident.dto.Responses.BatchDispatchView;
 import com.example.starter.incident.dto.Responses.EscalationHistoryView;
 import com.example.starter.incident.dto.Responses.EscalationView;
+import com.example.starter.incident.dto.Responses.EvacuationBlockerView;
 import com.example.starter.incident.dto.Responses.HistoryView;
 import com.example.starter.incident.dto.Responses.IncidentTasksView;
 import com.example.starter.incident.dto.Responses.IncidentView;
@@ -35,8 +34,6 @@ import com.example.starter.incident.dto.Responses.TaskBlockerView;
 import com.example.starter.incident.dto.Responses.TaskView;
 import com.example.starter.incident.dto.Responses.TransferView;
 import com.example.starter.incident.dto.Responses.UnfinishedTaskView;
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -48,11 +45,13 @@ import org.springframework.transaction.annotation.Transactional;
  * 幂等约定：commandKey 全局唯一，同键同参重放首次响应，同键改参返回 409。
  * 遏制期限：首次进入 COMMANDING 时以该次接管 UTC 时刻按等级确定
  * （S1=5分钟、S2=15分钟、S3=60分钟、S4=240分钟），交接不重置。
+ *
+ * <p>疏散门禁：任务写事务在业务校验前先由 {@link EvacuationGate#evaluate} 按当前
+ * UTC 时刻完成区域生效/结束裁决（区域生效阻断未开始命中任务，区域结束恢复），
+ * 再校验创建/开始/派工/完成/撤离的豁免与资源依赖，任一失败随事务回滚不留半成品。
  */
 @Service
 public class IncidentService {
-
-    private static final String SEP = "\\u001F";
 
     /** 各严重等级的遏制时限（分钟），等级沿用上报值且不可修改。 */
     private static final Map<String, Long> CONTAINMENT_MINUTES = Map.of(
@@ -64,6 +63,9 @@ public class IncidentService {
     /** 每任务阻塞事件上限。 */
     private static final int MAX_BLOCKERS_PER_TASK = 5;
 
+    /** 批量派工单次任务数上限。 */
+    private static final int MAX_DISPATCH_BATCH = 20;
+
     /** 视为阻塞已解除的目标事件状态。 */
     private static final Set<IncidentStatus> UNBLOCKING_STATUSES = EnumSet.of(
             IncidentStatus.CONTAINED, IncidentStatus.RESOLVED, IncidentStatus.CLOSED);
@@ -72,17 +74,19 @@ public class IncidentService {
     private final EscalationRepository escalations;
     private final IncidentTaskRepository tasks;
     private final CommandKeyRepository commandKeys;
-    private final ObjectMapper objectMapper;
+    private final EvacuationGate gate;
+    private final Idempotency idempotency;
     private final Clock clock;
 
     public IncidentService(IncidentRepository incidents, EscalationRepository escalations,
                            IncidentTaskRepository tasks, CommandKeyRepository commandKeys,
-                           ObjectMapper objectMapper, Clock clock) {
+                           EvacuationGate gate, Idempotency idempotency, Clock clock) {
         this.incidents = incidents;
         this.escalations = escalations;
         this.tasks = tasks;
         this.commandKeys = commandKeys;
-        this.objectMapper = objectMapper;
+        this.gate = gate;
+        this.idempotency = idempotency;
         this.clock = clock;
     }
 
@@ -126,7 +130,8 @@ public class IncidentService {
     public IncidentView takeover(String incidentKey, String actor, TakeoverRequest req) {
         String commandKey = requireText(req.commandKey(), "commandKey");
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "takeover", hash(incidentKey, actor), IncidentView.class,
+        return idempotency.run(commandKeys, commandKey, "takeover",
+                Idempotency.hash(incidentKey, actor), IncidentView.class, now(),
                 () -> {
                     if (incident.status() != IncidentStatus.REPORTED) {
                         throw ApiException.illegalTransition(
@@ -151,9 +156,10 @@ public class IncidentService {
         String commandKey = requireText(req.commandKey(), "commandKey");
         String toCommander = requireText(req.toCommander(), "toCommander");
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "transfer_initiate", hash(incidentKey, actor, toCommander),
-                TransferView.class, () -> {
-                    requireCommander(incident, actor);
+        return idempotency.run(commandKeys, commandKey, "transfer_initiate",
+                Idempotency.hash(incidentKey, actor, toCommander), TransferView.class, now(),
+                () -> {
+                    requireCommanderStatic(incident, actor);
                     if (incident.status() == IncidentStatus.RESOLVED
                             || incident.status() == IncidentStatus.CLOSED) {
                         throw ApiException.illegalTransition(
@@ -183,7 +189,8 @@ public class IncidentService {
     public IncidentView acceptTransfer(String incidentKey, String actor, TransferAcceptRequest req) {
         String commandKey = requireText(req.commandKey(), "commandKey");
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "transfer_accept", hash(incidentKey, actor), IncidentView.class,
+        return idempotency.run(commandKeys, commandKey, "transfer_accept",
+                Idempotency.hash(incidentKey, actor), IncidentView.class, now(),
                 () -> {
                     if (incident.status() == IncidentStatus.RESOLVED
                             || incident.status() == IncidentStatus.CLOSED) {
@@ -217,10 +224,10 @@ public class IncidentService {
         }
         Instant occurredAt = req.occurredAt().truncatedTo(ChronoUnit.MICROS);
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "action",
-                hash(incidentKey, actor, actionKey, actionType, note, occurredAt.toString()),
-                ActionView.class, () -> {
-                    requireCommander(incident, actor);
+        return idempotency.run(commandKeys, commandKey, "action",
+                Idempotency.hash(incidentKey, actor, actionKey, actionType, note, occurredAt.toString()),
+                ActionView.class, now(), () -> {
+                    requireCommanderStatic(incident, actor);
                     if (incident.status() == IncidentStatus.CLOSED) {
                         throw ApiException.illegalTransition("事件已关闭，不能再追加处置记录");
                     }
@@ -254,23 +261,24 @@ public class IncidentService {
             throw ApiException.badRequest("未知目标状态: " + target);
         }
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "status", hash(incidentKey, actor, target),
-                IncidentView.class, () -> {
-                    requireCommander(incident, actor);
+        return idempotency.run(commandKeys, commandKey, "status",
+                Idempotency.hash(incidentKey, actor, target), IncidentView.class, now(),
+                () -> {
+                    requireCommanderStatic(incident, actor);
                     IncidentStatus next = incident.status().next();
                     if (next == null || next != targetStatus) {
                         throw ApiException.illegalTransition(
                                 "不允许从 " + incident.status() + " 流转到 " + targetStatus);
                     }
                     if (targetStatus == IncidentStatus.RESOLVED) {
-                        // 解决门禁：全部处置任务进入 DONE/CANCELLED 后才可解决
+                        // 解决门禁：全部处置任务进入终态（DONE/CANCELLED/EVACUATED）后才可解决
                         List<UnfinishedTaskView> unfinished = tasks
-                                .listOpenByIncident(incident.id()).stream()
+                                .listUnfinishedByIncident(incident.id()).stream()
                                 .map(t -> new UnfinishedTaskView(t.groupCode(), t.taskKey()))
                                 .toList();
                         if (!unfinished.isEmpty()) {
                             throw ApiException.conflict(
-                                    "仍有未完成的处置任务，不能进入 RESOLVED", unfinished);
+                                    "仍有未终结的处置任务，不能进入 RESOLVED", unfinished);
                         }
                     }
                     Instant now = now();
@@ -295,8 +303,8 @@ public class IncidentService {
     public EscalationHistoryView checkEscalation(String incidentKey, EscalationCheckRequest req) {
         String commandKey = requireText(req.commandKey(), "commandKey");
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "escalation_check", hash(incidentKey),
-                EscalationHistoryView.class, () -> {
+        return idempotency.run(commandKeys, commandKey, "escalation_check",
+                Idempotency.hash(incidentKey), EscalationHistoryView.class, now(), () -> {
                     var existing = escalations.findByIncident(incident.id());
                     if (existing.isPresent()) {
                         return toEscalationHistory(incident, List.of(existing.get()));
@@ -325,9 +333,9 @@ public class IncidentService {
         String commandKey = requireText(req.commandKey(), "commandKey");
         String note = requireText(req.note(), "note");
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "escalation_ack", hash(incidentKey, actor, note),
-                EscalationView.class, () -> {
-                    requireCommander(incident, actor);
+        return idempotency.run(commandKeys, commandKey, "escalation_ack",
+                Idempotency.hash(incidentKey, actor, note), EscalationView.class, now(), () -> {
+                    requireCommanderStatic(incident, actor);
                     Escalation escalation = escalations.findByIncident(incident.id())
                             .orElseThrow(() -> ApiException.conflict("当前没有可确认的升级记录"));
                     if (escalation.status() != EscalationStatus.OPEN) {
@@ -391,9 +399,11 @@ public class IncidentService {
     }
 
     /**
-     * 创建处置任务：仅当前指挥人；taskKey 事件内唯一；阻塞事件 0~5 个、必须存在且非自身；
-     * 创建时在依赖图全局锁内做环检测，拒绝直接或间接环（409 且不留部分任务或边）。
-     * taskKey 幂等：同键同内容（含阻塞集合）返回首次任务，同键不同内容返回 409。
+     * 创建处置任务：仅当前指挥人；taskKey 事件内唯一；workGrid 为作业网格（创建后固定）；
+     * 阻塞事件 0~5 个、必须存在且非自身；创建时在依赖图全局锁内做环检测，拒绝环。
+     * 高危门禁：作业网格与当前有效疏散区域相交时，必须持有该区域版本的撤离豁免，否则 422
+     * （EXEMPTION_REQUIRED，返回缺失豁免的区域键），任务与依赖边一并回滚。
+     * taskKey 幂等：同键同内容（含网格与阻塞集合）返回首次任务，同键不同内容返回 409。
      */
     @Transactional
     public TaskView createTask(String incidentKey, String actor, TaskCreateRequest req) {
@@ -401,6 +411,9 @@ public class IncidentService {
         String taskKey = requireText(req.taskKey(), "taskKey");
         String groupCode = requireText(req.groupCode(), "groupCode");
         String title = requireText(req.title(), "title");
+        // 未显式给出作业网格的历史调用方落到默认网格（不与任何疏散区域相交）。
+        String workGrid = (req.workGrid() == null || req.workGrid().isBlank())
+                ? "GRID-DEFAULT" : req.workGrid().strip();
         List<String> blockerKeys = req.blockerIncidentKeys() == null ? List.of()
                 : req.blockerIncidentKeys().stream()
                         .map(k -> requireText(k, "blockerIncidentKey"))
@@ -413,20 +426,23 @@ public class IncidentService {
             throw ApiException.badRequest("阻塞事件不能是事件自身: " + incidentKey);
         }
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "task_create",
-                hash(incidentKey, actor, taskKey, groupCode, title, String.join(",", blockerKeys)),
-                TaskView.class, () -> {
-                    requireCommander(incident, actor);
+        return idempotency.run(commandKeys, commandKey, "task_create",
+                Idempotency.hash(incidentKey, actor, taskKey, groupCode, title, workGrid,
+                        String.join(",", blockerKeys)),
+                TaskView.class, now(), () -> {
+                    requireCommanderStatic(incident, actor);
                     if (incident.status() == IncidentStatus.CLOSED) {
                         throw ApiException.illegalTransition("事件已关闭，不能再创建处置任务");
                     }
+                    // 先让区域按当前时刻生效/结束：既有未开始命中任务据此阻断或恢复。
+                    gate.evaluate(incident);
                     var existing = tasks.findByKey(incident.id(), taskKey);
                     if (existing.isPresent()) {
                         IncidentTask found = existing.get();
                         List<String> existingBlockers = incidents.listBlockingIncidents(found.id())
                                 .stream().map(Incident::incidentKey).sorted().toList();
                         List<String> requested = blockerKeys.stream().sorted().toList();
-                        if (!found.sameContent(groupCode, title)
+                        if (!found.sameContent(groupCode, title, workGrid)
                                 || !existingBlockers.equals(requested)) {
                             throw ApiException.conflict("taskKey 已被不同内容使用: " + taskKey);
                         }
@@ -452,69 +468,284 @@ public class IncidentService {
                     }
                     Instant now = now();
                     long taskId = tasks.insert(new IncidentTask(0L, incident.id(), taskKey,
-                            groupCode, title, TaskStatus.OPEN, actor, null, null, null, null,
-                            now, now));
+                            groupCode, title, TaskStatus.OPEN, workGrid, actor, null, null, null,
+                            null, null, null, now, now));
                     for (Incident blocker : blockers) {
                         tasks.insertBlocker(taskId, blocker.id(), now);
                     }
+                    // 高危门禁：新任务直接创建进有效疏散区域网格必须持豁免，否则 422 回滚。
+                    List<String> missingZones = gate.violatingZonesNow(incident.id(), taskKey, workGrid)
+                            .stream().map(EvacuationZone::zoneKey).toList();
+                    if (!missingZones.isEmpty()) {
+                        throw ApiException.unprocessable("EXEMPTION_REQUIRED",
+                                "任务作业网格命中有效疏散区域，必须持有该区域版本的撤离豁免: "
+                                        + String.join(",", missingZones),
+                                List.copyOf(missingZones));
+                    }
+                    return toTaskView(tasks.findById(taskId).orElseThrow());
+                });
+    }
+
+    /**
+     * 批量派工：先统一校验所有任务的最终位置（作业网格）、资源依赖（阻塞事件全部解除）
+     * 与撤离豁免（命中有效区域须持对应版本豁免），任一不满足整体 422
+     * （DISPATCH_VALIDATION_FAILED，逐条返回原因），任务状态与派工租约全部回滚。
+     * 仅 OPEN 任务可派工；全部通过后原子置 DISPATCHED 并为每任务写入未消费租约。
+     */
+    @Transactional
+    public BatchDispatchView batchDispatch(String incidentKey, String actor,
+                                           TaskBatchDispatchRequest req) {
+        String commandKey = requireText(req.commandKey(), "commandKey");
+        List<String> requestedKeys = req.taskKeys() == null ? List.of() : req.taskKeys().stream()
+                .map(k -> requireText(k, "taskKey")).distinct().toList();
+        if (requestedKeys.isEmpty()) {
+            throw ApiException.badRequest("taskKeys 至少包含一个任务");
+        }
+        if (requestedKeys.size() > MAX_DISPATCH_BATCH) {
+            throw ApiException.badRequest("单次派工最多 " + MAX_DISPATCH_BATCH + " 个任务");
+        }
+        Incident incident = lockIncident(incidentKey);
+        return idempotency.run(commandKeys, commandKey, "task_batch_dispatch",
+                Idempotency.hash(incidentKey, actor, String.join(",", requestedKeys)),
+                BatchDispatchView.class, now(), () -> {
+                    requireCommanderStatic(incident, actor);
+                    gate.evaluate(incident);
+                    List<IncidentTask> toDispatch = new ArrayList<>();
+                    List<Map<String, Object>> failures = new ArrayList<>();
+                    for (String taskKey : requestedKeys) {
+                        IncidentTask task = tasks.findByKey(incident.id(), taskKey).orElse(null);
+                        if (task == null) {
+                            failures.add(dispatchFailure(taskKey, "TASK_NOT_FOUND", List.of(), List.of()));
+                            continue;
+                        }
+                        if (task.status() != TaskStatus.OPEN) {
+                            // 非 OPEN（已派工/阻断/进行中/终态）不可派工，仅报告状态原因。
+                            String stateReason = switch (task.status()) {
+                                case DISPATCHED -> "ALREADY_DISPATCHED";
+                                case EVACUATION_BLOCKED -> "EVACUATION_BLOCKED";
+                                case IN_PROGRESS -> "ALREADY_STARTED";
+                                case DONE, CANCELLED, EVACUATED -> "TASK_TERMINAL";
+                                default -> "NOT_DISPATCHABLE";
+                            };
+                            failures.add(dispatchFailure(taskKey, stateReason, List.of(), List.of()));
+                            continue;
+                        }
+                        List<String> unresolved = unresolvedBlockers(task.id());
+                        List<String> missingZones = gate.violatingZonesNow(
+                                incident.id(), task.taskKey(), task.workGrid()).stream()
+                                .map(EvacuationZone::zoneKey).toList();
+                        List<String> failureReasons = new ArrayList<>();
+                        if (!unresolved.isEmpty()) {
+                            failureReasons.add("RESOURCE_DEPENDENCY");
+                        }
+                        if (!missingZones.isEmpty()) {
+                            failureReasons.add("EXEMPTION_REQUIRED");
+                        }
+                        if (!failureReasons.isEmpty()) {
+                            failures.add(dispatchFailure(taskKey, String.join(",", failureReasons),
+                                    missingZones, unresolved));
+                        } else {
+                            toDispatch.add(task);
+                        }
+                    }
+                    if (!failures.isEmpty()) {
+                        throw ApiException.unprocessable("DISPATCH_VALIDATION_FAILED",
+                                "批量派工存在未通过门禁的任务，全部回滚", List.copyOf(failures));
+                    }
+                    Instant now = now();
+                    List<Long> ids = toDispatch.stream().map(IncidentTask::id).toList();
+                    int updated = tasks.markDispatchedIfIn(ids, now, List.of(TaskStatus.OPEN));
+                    if (updated != ids.size()) {
+                        // 并发状态漂移：条件更新数量不符则整体失败回滚，不留部分派工
+                        throw ApiException.conflict("派工并发冲突，任务状态已变化");
+                    }
+                    for (IncidentTask task : toDispatch) {
+                        tasks.insertLease(task.id(), actor, commandKey, now);
+                    }
+                    List<TaskView> views = toDispatch.stream()
+                            .map(t -> tasks.findById(t.id()).orElseThrow())
+                            .map(this::toTaskView).toList();
+                    return new BatchDispatchView(incidentKey,
+                            toDispatch.stream().map(IncidentTask::taskKey).toList(), views);
+                });
+    }
+
+    /**
+     * 开始任务：仅 OPEN/DISPATCHED 可开始；EVACUATION_BLOCKED 必须等区域结束恢复后才可开始。
+     * 作业网格与有效疏散区域相交时必须持有该区域版本豁免，否则 422（EXEMPTION_REQUIRED）。
+     * 派工任务开始时消费其派工租约。
+     */
+    @Transactional
+    public TaskView startTask(String incidentKey, String taskKey, String actor,
+                              TaskActionRequest req) {
+        String commandKey = requireText(req.commandKey(), "commandKey");
+        Incident incident = lockIncident(incidentKey);
+        return idempotency.run(commandKeys, commandKey, "task_start",
+                Idempotency.hash(incidentKey, taskKey, actor), TaskView.class, now(), () -> {
+                    requireCommanderStatic(incident, actor);
+                    gate.evaluate(incident);
+                    IncidentTask task = tasks.findByKey(incident.id(), taskKey)
+                            .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
+                    if (task.status() == TaskStatus.EVACUATION_BLOCKED) {
+                        throw ApiException.unprocessable("TASK_EVACUATION_BLOCKED",
+                                "任务处于疏散阻断，区域结束恢复前不能开始: " + taskKey,
+                                blockedDetails(task));
+                    }
+                    if (task.status() != TaskStatus.OPEN && task.status() != TaskStatus.DISPATCHED) {
+                        throw ApiException.conflict(
+                                "任务当前状态 " + task.status() + " 不能开始");
+                    }
+                    List<String> missingZones = gate.violatingZonesNow(
+                                    incident.id(), task.taskKey(), task.workGrid()).stream()
+                            .map(EvacuationZone::zoneKey).toList();
+                    if (!missingZones.isEmpty()) {
+                        throw ApiException.unprocessable("EXEMPTION_REQUIRED",
+                                "任务作业网格命中有效疏散区域，必须持有该区域版本的撤离豁免: "
+                                        + String.join(",", missingZones),
+                                List.copyOf(missingZones));
+                    }
+                    Instant now = now();
+                    int updated = tasks.markInProgressIfIn(task.id(), now,
+                            List.of(TaskStatus.OPEN, TaskStatus.DISPATCHED));
+                    if (updated == 0) {
+                        throw ApiException.conflict("任务已被并发处理，不能开始: " + taskKey);
+                    }
+                    tasks.consumeLease(task.id(), now);
                     return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
                 });
     }
 
     /**
-     * 完成任务：仅当前指挥人；仅 OPEN 可完成；全部阻塞事件进入
-     * CONTAINED/RESOLVED/CLOSED 后才可完成，否则 409 并返回未解除事件列表。
-     * DONE/CANCELLED 为终态，重复操作按 commandKey 幂等规则返回首次结果。
+     * 完成任务：仅当前指挥人。
+     * OPEN/DISPATCHED 须先过资源依赖门禁（全部阻塞事件 CONTAINED/RESOLVED/CLOSED）；
+     * 命中有效区域的未开始任务在写事务开始时已被阻断（EVACUATION_BLOCKED）不可完成；
+     * IN_PROGRESS 任务若命中有效区域且无对应版本豁免，不能完成（须撤离），422；
+     * 持有效豁免的进行中任务可继续并完成。EVACUATED 为终态不可完成。
      */
     @Transactional
     public TaskView completeTask(String incidentKey, String taskKey, String actor,
                                  TaskActionRequest req) {
         String commandKey = requireText(req.commandKey(), "commandKey");
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "task_complete", hash(incidentKey, taskKey, actor),
-                TaskView.class, () -> {
-                    requireCommander(incident, actor);
+        return idempotency.run(commandKeys, commandKey, "task_complete",
+                Idempotency.hash(incidentKey, taskKey, actor), TaskView.class, now(), () -> {
+                    requireCommanderStatic(incident, actor);
+                    gate.evaluate(incident);
                     IncidentTask task = tasks.findByKey(incident.id(), taskKey)
                             .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
-                    if (task.status() != TaskStatus.OPEN) {
+                    if (task.status() == TaskStatus.EVACUATED) {
+                        throw ApiException.conflict("任务已撤离（EVACUATED 终态），不能完成");
+                    }
+                    if (task.status() == TaskStatus.CANCELLED || task.status() == TaskStatus.DONE) {
                         throw ApiException.conflict(
                                 "任务已处于终态 " + task.status() + "，不能完成");
+                    }
+                    if (task.status() == TaskStatus.EVACUATION_BLOCKED) {
+                        throw ApiException.unprocessable("TASK_EVACUATION_BLOCKED",
+                                "任务处于疏散阻断，区域结束恢复前不能完成: " + taskKey,
+                                blockedDetails(task));
                     }
                     List<String> unresolved = unresolvedBlockers(task.id());
                     if (!unresolved.isEmpty()) {
                         throw ApiException.conflict("存在未解除阻塞的事件: "
                                 + String.join(",", unresolved), List.copyOf(unresolved));
                     }
-                    tasks.markDone(task.id(), actor, now());
+                    if (task.status() == TaskStatus.IN_PROGRESS) {
+                        List<String> missingZones = gate.violatingZonesNow(
+                                        incident.id(), task.taskKey(), task.workGrid()).stream()
+                                .map(EvacuationZone::zoneKey).toList();
+                        if (!missingZones.isEmpty()) {
+                            throw ApiException.unprocessable("EVACUATE_OR_EXEMPT",
+                                    "进行中任务命中有效疏散区域且无豁免，不能完成，请登记撤离或取得豁免: "
+                                            + String.join(",", missingZones),
+                                    List.copyOf(missingZones));
+                        }
+                    }
+                    Instant now = now();
+                    int updated = tasks.markDoneIfIn(task.id(), actor, now, List.of(
+                            TaskStatus.OPEN, TaskStatus.DISPATCHED, TaskStatus.IN_PROGRESS));
+                    if (updated == 0) {
+                        throw ApiException.conflict("任务已被并发处理，不能完成: " + taskKey);
+                    }
                     return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
                 });
     }
 
     /**
-     * 取消任务：仅当前指挥人；仅 OPEN 可取消；DONE/CANCELLED 为终态，
-     * 重复操作按 commandKey 幂等规则返回首次结果。
+     * 撤离登记：仅当前指挥人；仅进行中（IN_PROGRESS）且当前命中有效疏散区域、
+     * 又未持有该区域版本豁免的任务可登记。登记后任务转 EVACUATED 终态，不可完成。
+     * 持有效豁免（未命中违规区域）的进行中任务应继续作业，不允许登记撤离。
+     */
+    @Transactional
+    public TaskView evacuateTask(String incidentKey, String taskKey, String actor,
+                                 TaskActionRequest req) {
+        String commandKey = requireText(req.commandKey(), "commandKey");
+        Incident incident = lockIncident(incidentKey);
+        return idempotency.run(commandKeys, commandKey, "task_evacuate",
+                Idempotency.hash(incidentKey, taskKey, actor), TaskView.class, now(), () -> {
+                    requireCommanderStatic(incident, actor);
+                    gate.evaluate(incident);
+                    IncidentTask task = tasks.findByKey(incident.id(), taskKey)
+                            .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
+                    if (task.status() == TaskStatus.EVACUATED) {
+                        throw ApiException.conflict("任务已撤离（EVACUATED 终态）");
+                    }
+                    if (task.status() != TaskStatus.IN_PROGRESS) {
+                        throw ApiException.unprocessable("EVACUATION_ONLY_IN_PROGRESS",
+                                "仅进行中的任务可登记撤离，当前状态: " + task.status(), null);
+                    }
+                    List<EvacuationZone> hit = gate.violatingZonesNow(
+                            incident.id(), task.taskKey(), task.workGrid());
+                    if (hit.isEmpty()) {
+                        throw ApiException.unprocessable("NOT_IN_EVACUATION_ZONE",
+                                "进行中任务未命中缺少豁免的有效疏散区域，不能登记撤离（持豁免任务应继续完成）",
+                                null);
+                    }
+                    Instant now = now();
+                    int updated = tasks.markEvacuatedIfInProgress(task.id(), now);
+                    if (updated == 0) {
+                        throw ApiException.conflict("任务已被并发处理，不能登记撤离: " + taskKey);
+                    }
+                    return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
+                });
+    }
+
+    /**
+     * 取消任务：仅当前指挥人；仅 OPEN/DISPATCHED 可取消；
+     * EVACUATION_BLOCKED 在区域结束恢复前冻结，不可取消；DONE/CANCELLED/EVACUATED 为终态。
      */
     @Transactional
     public TaskView cancelTask(String incidentKey, String taskKey, String actor,
                                TaskActionRequest req) {
         String commandKey = requireText(req.commandKey(), "commandKey");
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "task_cancel", hash(incidentKey, taskKey, actor),
-                TaskView.class, () -> {
-                    requireCommander(incident, actor);
+        return idempotency.run(commandKeys, commandKey, "task_cancel",
+                Idempotency.hash(incidentKey, taskKey, actor), TaskView.class, now(), () -> {
+                    requireCommanderStatic(incident, actor);
+                    gate.evaluate(incident);
                     IncidentTask task = tasks.findByKey(incident.id(), taskKey)
                             .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
-                    if (task.status() != TaskStatus.OPEN) {
-                        throw ApiException.conflict(
-                                "任务已处于终态 " + task.status() + "，不能取消");
+                    if (task.status() == TaskStatus.EVACUATION_BLOCKED) {
+                        throw ApiException.unprocessable("TASK_EVACUATION_BLOCKED",
+                                "任务处于疏散阻断，区域结束恢复前不能取消: " + taskKey,
+                                blockedDetails(task));
                     }
-                    tasks.markCancelled(task.id(), actor, now());
+                    if (task.status() != TaskStatus.OPEN && task.status() != TaskStatus.DISPATCHED) {
+                        throw ApiException.conflict(
+                                "任务当前状态 " + task.status() + " 不能取消");
+                    }
+                    Instant now = now();
+                    int updated = tasks.markCancelledIfIn(task.id(), actor, now,
+                            List.of(TaskStatus.OPEN, TaskStatus.DISPATCHED));
+                    if (updated == 0) {
+                        throw ApiException.conflict("任务已被并发处理，不能取消: " + taskKey);
+                    }
                     return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
                 });
     }
 
     /**
-     * 按事件分组查询任务（含阻塞状态，按目标事件当前状态计算）。只读，不隐式写入。
+     * 按事件分组查询任务（含阻塞状态与疏散阻断快照，按查询时状态计算）。只读，不隐式写入。
      */
     @Transactional(readOnly = true)
     public IncidentTasksView listTasks(String incidentKey) {
@@ -526,7 +757,7 @@ public class IncidentService {
     }
 
     /**
-     * 查询单任务明细（含阻塞状态）。只读，不隐式写入。
+     * 查询单任务明细（含阻塞状态与疏散阻断快照）。只读，不隐式写入。
      */
     @Transactional(readOnly = true)
     public TaskView getTask(String incidentKey, String taskKey) {
@@ -553,7 +784,10 @@ public class IncidentService {
                 .orElseThrow(() -> ApiException.notFound("事件不存在: " + incidentKey));
     }
 
-    private static void requireCommander(Incident incident, String actor) {
+    /**
+     * 指挥人校验（供本服务与疏散域共用）：actor 必须为事件当前指挥人。
+     */
+    static void requireCommanderStatic(Incident incident, String actor) {
         if (incident.commander() == null || !incident.commander().equals(actor)) {
             throw ApiException.conflict("只有当前指挥人 "
                     + (incident.commander() == null ? "(无)" : incident.commander()) + " 能执行该操作");
@@ -567,57 +801,25 @@ public class IncidentService {
         return value.strip();
     }
 
-    /**
-     * 幂等执行：同键同参重放首次响应，同键改参 409；并发同键由唯一约束串行化。
-     */
-    private <T> T runIdempotent(String commandKey, String operation, String requestHash,
-                                Class<T> type, Supplier<T> business) {
-        var existing = commandKeys.find(commandKey);
-        if (existing.isPresent()) {
-            return replay(existing.get(), operation, requestHash, type);
-        }
-        try {
-            commandKeys.insertPlaceholder(commandKey, operation, requestHash, now());
-        } catch (DuplicateKeyException e) {
-            var committed = commandKeys.findForUpdate(commandKey)
-                    .orElseThrow(() -> ApiException.conflict("commandKey 处理冲突: " + commandKey));
-            return replay(committed, operation, requestHash, type);
-        }
-        T result = business.get();
-        commandKeys.fillResponse(commandKey, 200, toJson(result));
-        return result;
+    private static Map<String, Object> dispatchFailure(String taskKey, String reason,
+                                                       List<String> missingZones,
+                                                       List<String> unresolvedBlockers) {
+        Map<String, Object> detail = new LinkedHashMap<>();
+        detail.put("taskKey", taskKey);
+        detail.put("reason", reason);
+        detail.put("missingExemptionZones", List.copyOf(missingZones));
+        detail.put("unresolvedBlockers", List.copyOf(unresolvedBlockers));
+        return detail;
     }
 
-    private <T> T replay(CommandKeyRecord record, String operation, String requestHash, Class<T> type) {
-        if (!record.operation().equals(operation) || !record.requestHash().equals(requestHash)) {
-            throw ApiException.conflict("commandKey 已被不同参数的请求使用: " + record.commandKey());
+    private EvacuationBlockerView blockedDetails(IncidentTask task) {
+        if (task.blockedSnapshot() == null) {
+            return null;
         }
-        if (record.responseBody() == null) {
-            throw ApiException.conflict("commandKey 正在处理中: " + record.commandKey());
-        }
-        try {
-            return objectMapper.readValue(record.responseBody(), type);
-        } catch (JsonProcessingException e) {
-            throw new IllegalStateException("幂等响应反序列化失败", e);
-        }
-    }
-
-    private String toJson(Object value) {
-        try {
-            return objectMapper.writeValueAsString(value);
-        } catch (JsonProcessingException e) {
-            throw new IllegalStateException("响应序列化失败", e);
-        }
-    }
-
-    private static String hash(String... parts) {
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] out = digest.digest(String.join(SEP, parts).getBytes(StandardCharsets.UTF_8));
-            return HexFormat.of().formatHex(out);
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException(e);
-        }
+        EvacuationGate.ZoneSnapshot snapshot = gate.readSnapshot(task.blockedSnapshot());
+        return new EvacuationBlockerView(snapshot.zoneKey(), snapshot.version(),
+                snapshot.riskLevel(), snapshot.grids(), snapshot.effectiveFrom(),
+                snapshot.effectiveTo());
     }
 
     private IncidentView toView(Incident incident, String pendingTransferTo) {
@@ -632,16 +834,19 @@ public class IncidentService {
     }
 
     /**
-     * 组装任务视图：阻塞状态按目标事件查询时的当前状态计算，不写回依赖任务。
+     * 组装任务视图：阻塞状态按目标事件查询时当前状态计算，不写回依赖任务；
+     * blocked 仅 EVACUATION_BLOCKED 状态返回固化的区域快照。
      */
     private TaskView toTaskView(IncidentTask task) {
         List<TaskBlockerView> blockers = incidents.listBlockingIncidents(task.id()).stream()
                 .map(b -> new TaskBlockerView(b.incidentKey(), b.status().name(),
                         UNBLOCKING_STATUSES.contains(b.status())))
                 .toList();
-        return new TaskView(task.taskKey(), task.groupCode(), task.title(), task.status().name(),
-                blockers, task.createdBy(), task.createdAt(), task.doneBy(), task.doneAt(),
-                task.cancelledBy(), task.cancelledAt());
+        EvacuationBlockerView blocked = task.status() == TaskStatus.EVACUATION_BLOCKED
+                ? blockedDetails(task) : null;
+        return new TaskView(task.taskKey(), task.groupCode(), task.title(), task.workGrid(),
+                task.status().name(), blockers, blocked, task.createdBy(), task.createdAt(),
+                task.doneBy(), task.doneAt(), task.cancelledBy(), task.cancelledAt());
     }
 
     private static TransferView toTransferView(IncidentTransfer transfer) {
