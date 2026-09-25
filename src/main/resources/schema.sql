@@ -59,3 +59,60 @@ CREATE TABLE IF NOT EXISTS conflict_resolution (
     -- 且不可变解决历史必须在任何数据清理/归档场景下继续可查。
     UNIQUE (observation_id, request_id)
 );
+
+-- 设备坐标基准登记表：记录设备当前生效的坐标基准版本；首次提交观测时按提交基准自动登记。
+CREATE TABLE IF NOT EXISTS device_frame (
+    device_id VARCHAR(64) NOT NULL COMMENT '设备唯一标识',
+    frame_version VARCHAR(32) NOT NULL COMMENT '设备当前登记的坐标基准版本（如 WGS84/GCJ02/BD09/CGCS2000）',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '登记时间（服务器时区）',
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近一次基准变更时间（服务器时区）',
+    PRIMARY KEY (device_id)
+);
+
+-- 观测坐标表：原始坐标与原基准版本不可改写；统一基准坐标与当前基准版本在基准重算时更新。
+CREATE TABLE IF NOT EXISTS observation_geo (
+    observation_id VARCHAR(64) NOT NULL COMMENT '观测记录唯一标识',
+    submission_seq BIGINT NOT NULL COMMENT '提交顺序号，全局递增，用于胜出判定的稳定次序',
+    device_id VARCHAR(64) NOT NULL COMMENT '提交设备标识',
+    original_frame_version VARCHAR(32) NOT NULL COMMENT '提交时的原始基准版本（不可改写）',
+    current_frame_version VARCHAR(32) NOT NULL COMMENT '当前生效基准版本（基准重算时更新）',
+    raw_latitude DOUBLE NOT NULL COMMENT '原始纬度（度，不可改写），合法范围 [-90, 90]',
+    raw_longitude DOUBLE NOT NULL COMMENT '原始经度（度，不可改写），合法范围 [-180, 180]',
+    unified_latitude DOUBLE NOT NULL COMMENT '统一基准纬度（度，基准重算时更新）',
+    unified_longitude DOUBLE NOT NULL COMMENT '统一基准经度（度，基准重算时更新）',
+    captured_at TIMESTAMP NOT NULL COMMENT '采集时刻（客户端按 UTC 提交，存储为服务器时区）',
+    cluster_id VARCHAR(64) NULL COMMENT '所属冲突簇标识；NULL 表示不在任何冲突簇中',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '提交落库时间（服务器时区）',
+    PRIMARY KEY (observation_id),
+    UNIQUE (submission_seq)
+);
+
+-- 冲突簇表：统一坐标球面距离不超过 50 米且采集时刻差不超过 60 秒的观测进入同簇（边界包含）。
+CREATE TABLE IF NOT EXISTS conflict_cluster (
+    cluster_id VARCHAR(64) NOT NULL COMMENT '冲突簇唯一标识',
+    winner_observation_id VARCHAR(64) NULL COMMENT '当前胜出观测记录标识；未人工裁决时取采集时刻最新者',
+    manually_resolved BOOLEAN NOT NULL DEFAULT FALSE COMMENT '是否已人工裁决：TRUE 时选择结论不被自动覆盖',
+    resolved_observation_id VARCHAR(64) NULL COMMENT '人工裁决选定的观测记录标识（裁决后不可变）',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '簇创建时间（服务器时区）',
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近一次簇变更时间（服务器时区）',
+    PRIMARY KEY (cluster_id)
+);
+
+-- 基准重算记录表：重算改变簇成员或当前胜出记录时与重算同事务原子写入，不可变、永不更新或删除。
+CREATE TABLE IF NOT EXISTS frame_recalc (
+    recalc_id VARCHAR(128) NOT NULL COMMENT '重算记录唯一标识（取触发请求的 requestId）',
+    device_id VARCHAR(64) NOT NULL COMMENT '被重算的设备标识',
+    request_id VARCHAR(128) NOT NULL COMMENT '触发重算的请求标识',
+    old_frame_version VARCHAR(32) NULL COMMENT '重算前设备基准版本（参数版本）；首次登记时为 NULL',
+    new_frame_version VARCHAR(32) NOT NULL COMMENT '重算后设备基准版本（参数版本）',
+    old_clusters VARCHAR(16000) NOT NULL COMMENT '重算前设备相关簇快照（JSON 数组，含成员与胜出记录）',
+    new_clusters VARCHAR(16000) NOT NULL COMMENT '重算后设备相关簇快照（JSON 数组，含成员与胜出记录）',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录落库时间（服务器时区）',
+    PRIMARY KEY (recalc_id)
+);
+
+-- 簇操作全局锁表：固定单行，提交、基准变更与人工裁决均先取该行锁，按提交顺序串行化。
+CREATE TABLE IF NOT EXISTS cluster_lock (
+    lock_id INT NOT NULL COMMENT '锁标识，固定为 1',
+    PRIMARY KEY (lock_id)
+);
