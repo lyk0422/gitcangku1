@@ -3,6 +3,8 @@ package com.example.starter.race.api;
 import com.example.starter.race.service.BadRequestException;
 import com.example.starter.race.service.ConflictException;
 import com.example.starter.race.service.NotFoundException;
+import com.example.starter.race.service.RecordClaimRejectedException;
+import com.example.starter.race.service.UnprocessableEntityException;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -30,6 +32,19 @@ public class ApiExceptionHandler {
     @ExceptionHandler(BadRequestException.class)
     public ResponseEntity<ErrorResponse> handleBadRequest(BadRequestException ex) {
         return build(HttpStatus.BAD_REQUEST, "BAD_REQUEST", ex.getMessage());
+    }
+
+    @ExceptionHandler(RecordClaimRejectedException.class)
+    public ResponseEntity<RecordClaimErrorResponse> handleRecordClaimRejected(
+            RecordClaimRejectedException ex) {
+        return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
+                .body(new RecordClaimErrorResponse(
+                        "UNPROCESSABLE_ENTITY", ex.getMessage(), ex.currentRecord()));
+    }
+
+    @ExceptionHandler(UnprocessableEntityException.class)
+    public ResponseEntity<ErrorResponse> handleUnprocessable(UnprocessableEntityException ex) {
+        return build(HttpStatus.UNPROCESSABLE_ENTITY, "UNPROCESSABLE_ENTITY", ex.getMessage());
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)

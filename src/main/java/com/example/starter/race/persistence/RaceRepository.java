@@ -35,7 +35,8 @@ public class RaceRepository {
     /** 按ID查询赛事。 */
     public Optional<RaceRow> findRace(String raceId) {
         return jdbcTemplate
-                .query("SELECT race_id, version, status, created_at FROM race WHERE race_id = ?",
+                .query("SELECT race_id, course_key, version, status, created_at "
+                                + "FROM race WHERE race_id = ?",
                         RACE_ROW_MAPPER, raceId)
                 .stream()
                 .findFirst();
@@ -99,11 +100,12 @@ public class RaceRepository {
                 entries));
     }
 
-    /** 新建赛事，初始版本1、状态OPEN。 */
-    public void insertRace(String raceId, long now) {
+    /** 新建赛事，初始版本1、状态OPEN，关联已登记赛道。 */
+    public void insertRace(String raceId, String courseKey, long now) {
         jdbcTemplate.update(
-                "INSERT INTO race (race_id, version, status, created_at) VALUES (?, 1, 'OPEN', ?)",
-                raceId, now);
+                "INSERT INTO race (race_id, course_key, version, status, created_at) "
+                        + "VALUES (?, ?, 1, 'OPEN', ?)",
+                raceId, courseKey, now);
     }
 
     /** 登记选手；finishTimeMs 为 null 表示计时缺失。 */
@@ -236,12 +238,14 @@ public class RaceRepository {
 
     /** 测试辅助：清空全部业务数据，按外键依赖顺序删除。 */
     public void deleteAllForTesting() {
+        jdbcTemplate.update("DELETE FROM course_record");
         jdbcTemplate.update("DELETE FROM result_snapshot_entry");
         jdbcTemplate.update("DELETE FROM result_snapshot");
         jdbcTemplate.update("DELETE FROM idempotency_record");
         jdbcTemplate.update("DELETE FROM penalty");
         jdbcTemplate.update("DELETE FROM runner");
         jdbcTemplate.update("DELETE FROM race");
+        jdbcTemplate.update("DELETE FROM course");
     }
 
     private static final class RaceRowMapper implements RowMapper<RaceRow> {
@@ -249,6 +253,7 @@ public class RaceRepository {
         public RaceRow mapRow(ResultSet rs, int rowNum) throws SQLException {
             return new RaceRow(
                     rs.getString("race_id"),
+                    rs.getString("course_key"),
                     rs.getInt("version"),
                     RaceStatus.valueOf(rs.getString("status")),
                     rs.getLong("created_at"));

@@ -29,13 +29,21 @@ class RaceApiH2Test extends AbstractRaceH2Test {
 
     @Test
     void 建赛登记查询成绩到封榜快照全链路() throws Exception {
+        mockMvc.perform(post("/api/courses")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"courseKey":"course-api","requestId":"req-course"}
+                                """))
+                .andExpect(status().isCreated());
+
         mockMvc.perform(post("/api/races")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"raceId":"race-api","requestId":"req-create"}
+                                {"raceId":"race-api","courseKey":"course-api","requestId":"req-create"}
                                 """))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.version").value(1))
+                .andExpect(jsonPath("$.courseKey").value("course-api"))
                 .andExpect(jsonPath("$.status").value("OPEN"));
 
         mockMvc.perform(post("/api/races/race-api/runners")
@@ -113,7 +121,21 @@ class RaceApiH2Test extends AbstractRaceH2Test {
         mockMvc.perform(post("/api/races")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"raceId":"r","requestId":"c1"}
+                                {"raceId":"r","courseKey":"missing-course","requestId":"c0"}
+                                """))
+                .andExpect(status().isNotFound());
+
+        mockMvc.perform(post("/api/courses")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"courseKey":"c","requestId":"c0course"}
+                                """))
+                .andExpect(status().isCreated());
+
+        mockMvc.perform(post("/api/races")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"raceId":"r","courseKey":"c","requestId":"c1"}
                                 """))
                 .andExpect(status().isCreated());
 
@@ -164,10 +186,16 @@ class RaceApiH2Test extends AbstractRaceH2Test {
                                 """))
                 .andExpect(status().isConflict());
         // 未封榜赛事查快照 404
+        mockMvc.perform(post("/api/courses")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"courseKey":"c2","requestId":"c7course"}
+                                """))
+                .andExpect(status().isCreated());
         mockMvc.perform(post("/api/races")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"raceId":"r2","requestId":"c7"}
+                                {"raceId":"r2","courseKey":"c2","requestId":"c7"}
                                 """))
                 .andExpect(status().isCreated());
         mockMvc.perform(get("/api/races/r2/snapshot"))
@@ -176,16 +204,22 @@ class RaceApiH2Test extends AbstractRaceH2Test {
 
     @Test
     void 同键同参HTTP重放返回首次状态码与响应() throws Exception {
-        mockMvc.perform(post("/api/races")
+        mockMvc.perform(post("/api/courses")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"raceId":"r3","requestId":"dup-create"}
+                                {"courseKey":"c3","requestId":"c3course"}
                                 """))
                 .andExpect(status().isCreated());
         mockMvc.perform(post("/api/races")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"raceId":"r3","requestId":"dup-create"}
+                                {"raceId":"r3","courseKey":"c3","requestId":"dup-create"}
+                                """))
+                .andExpect(status().isCreated());
+        mockMvc.perform(post("/api/races")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"raceId":"r3","courseKey":"c3","requestId":"dup-create"}
                                 """))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.version").value(1));
@@ -194,7 +228,7 @@ class RaceApiH2Test extends AbstractRaceH2Test {
         mockMvc.perform(post("/api/races")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"raceId":"r3-other","requestId":"dup-create"}
+                                {"raceId":"r3-other","courseKey":"c3","requestId":"dup-create"}
                                 """))
                 .andExpect(status().isConflict());
     }

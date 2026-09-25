@@ -12,30 +12,20 @@ import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
-import com.example.starter.race.persistence.IdempotencyRow;
+import com.example.starter.race.persistence.CourseRepository;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
 import com.example.starter.race.persistence.RunnerRow;
 import com.example.starter.race.persistence.SnapshotEntryRow;
 import com.example.starter.race.persistence.SnapshotRow;
 import com.example.starter.race.persistence.RaceRepository;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.util.ArrayList;
-import java.util.HexFormat;
 import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.TreeMap;
-import java.util.function.Supplier;
 
 /**
  * {@link RaceService} 的事务实现。
@@ -57,42 +47,48 @@ public class RaceServiceImpl implements RaceService {
     private static final long MAX_FINISH_TIME_MS = 86_400_000L;
     /** 加时处罚上界（毫秒），含端点：1小时。 */
     private static final long MAX_PENALTY_MS = 3_600_000L;
-    /** 同键并发时等待先行者事务结束的上限（毫秒）。 */
-    private static final long INFLIGHT_WAIT_MAX_MS = 30_000L;
 
     private final RaceRepository repository;
+    private final CourseRepository courseRepository;
+    private final IdempotencyExecutor idempotencyExecutor;
     private final Clock clock;
-    private final ObjectMapper objectMapper;
 
-    public RaceServiceImpl(RaceRepository repository, Clock clock, ObjectMapper objectMapper) {
+    public RaceServiceImpl(RaceRepository repository, CourseRepository courseRepository,
+                           IdempotencyExecutor idempotencyExecutor, Clock clock) {
         this.repository = repository;
+        this.courseRepository = courseRepository;
+        this.idempotencyExecutor = idempotencyExecutor;
         this.clock = clock;
-        this.objectMapper = objectMapper;
     }
 
     @Override
     @Transactional
     public ServiceResult createRace(CreateRaceRequest request) {
-        return withIdempotency(request.requestId(), "CREATE_RACE",
-                orderedParams("raceId", request.raceId()),
+        return idempotencyExecutor.execute(request.requestId(), "CREATE_RACE",
+                IdempotencyExecutor.orderedParams("raceId", request.raceId(),
+                        "courseKey", request.courseKey()),
                 () -> {
                     long now = clock.millis();
+                    courseRepository.findCourse(request.courseKey())
+                            .orElseThrow(() -> new NotFoundException(
+                                    "赛道不存在: " + request.courseKey()));
                     try {
-                        repository.insertRace(request.raceId(), now);
+                        repository.insertRace(request.raceId(), request.courseKey(), now);
                     } catch (DuplicateKeyException ex) {
                         throw new ConflictException("赛事已存在: " + request.raceId());
                     }
                     RaceRow race = repository.findRace(request.raceId()).orElseThrow();
                     return ServiceResult.created(new RaceResponse(
-                            race.raceId(), race.version(), race.status(), race.createdAt()));
+                            race.raceId(), race.courseKey(), race.version(), race.status(),
+                            race.createdAt()));
                 });
     }
 
     @Override
     @Transactional
     public ServiceResult registerRunner(String raceId, RegisterRunnerRequest request) {
-        return withIdempotency(request.requestId(), "REGISTER_RUNNER",
-                orderedParams(
+        return idempotencyExecutor.execute(request.requestId(), "REGISTER_RUNNER",
+                IdempotencyExecutor.orderedParams(
                         "raceId", raceId,
                         "bib", request.bib(),
                         "expectedVersion", request.expectedVersion(),
@@ -116,8 +112,8 @@ public class RaceServiceImpl implements RaceService {
     @Override
     @Transactional
     public ServiceResult reviseTime(String raceId, ReviseTimeRequest request) {
-        return withIdempotency(request.requestId(), "REVISE_TIME",
-                orderedParams(
+        return idempotencyExecutor.execute(request.requestId(), "REVISE_TIME",
+                IdempotencyExecutor.orderedParams(
                         "raceId", raceId,
                         "bib", request.bib(),
                         "expectedVersion", request.expectedVersion(),
@@ -141,8 +137,8 @@ public class RaceServiceImpl implements RaceService {
     @Override
     @Transactional
     public ServiceResult addPenalty(String raceId, AddPenaltyRequest request) {
-        return withIdempotency(request.requestId(), "ADD_PENALTY",
-                orderedParams(
+        return idempotencyExecutor.execute(request.requestId(), "ADD_PENALTY",
+                IdempotencyExecutor.orderedParams(
                         "raceId", raceId,
                         "penaltyId", request.penaltyId(),
                         "bib", request.bib(),
@@ -181,8 +177,8 @@ public class RaceServiceImpl implements RaceService {
     @Transactional
     public ServiceResult revokePenalty(
             String raceId, String penaltyId, RevokePenaltyRequest request) {
-        return withIdempotency(request.requestId(), "REVOKE_PENALTY",
-                orderedParams(
+        return idempotencyExecutor.execute(request.requestId(), "REVOKE_PENALTY",
+                IdempotencyExecutor.orderedParams(
                         "raceId", raceId,
                         "penaltyId", penaltyId,
                         "expectedVersion", request.expectedVersion()),
@@ -210,8 +206,8 @@ public class RaceServiceImpl implements RaceService {
     @Override
     @Transactional
     public ServiceResult sealRace(String raceId, SealRaceRequest request) {
-        return withIdempotency(request.requestId(), "SEAL_RACE",
-                orderedParams(
+        return idempotencyExecutor.execute(request.requestId(), "SEAL_RACE",
+                IdempotencyExecutor.orderedParams(
                         "raceId", raceId,
                         "expectedVersion", request.expectedVersion()),
                 () -> {
@@ -277,53 +273,6 @@ public class RaceServiceImpl implements RaceService {
         return ResponseMapper.snapshotStanding(snapshot);
     }
 
-    /**
-     * 幂等包装：同键同参重放原成功结果，同键异参409；
-     * 业务异常随事务回滚，占位行消失，不占用 requestId。
-     */
-    private ServiceResult withIdempotency(
-            String requestId,
-            String operation,
-            TreeMap<String, Object> params,
-            Supplier<ServiceResult> action) {
-        String digest = digest(operation, params);
-        long deadline = clock.millis() + INFLIGHT_WAIT_MAX_MS;
-        boolean acquired = false;
-        while (!acquired) {
-            try {
-                repository.insertIdempotencyPlaceholder(
-                        requestId, operation, digest, clock.millis());
-                acquired = true;
-            } catch (DuplicateKeyException ex) {
-                Optional<IdempotencyRow> existing =
-                        repository.findIdempotencyForUpdate(requestId);
-                if (existing.isEmpty()) {
-                    // 先行者事务回滚，占位行已随其消失，立即重新占位。
-                    continue;
-                }
-                IdempotencyRow row = existing.get();
-                if (row.responseStatus() == 0) {
-                    // 理论上不会出现（提交必带最终响应）；防御性等待先行者完成。
-                    if (clock.millis() >= deadline) {
-                        throw new ConflictException("相同 requestId 的请求仍在处理中");
-                    }
-                    sleepBriefly();
-                    continue;
-                }
-                if (!row.requestDigest().equals(digest)) {
-                    throw new ConflictException(
-                            "requestId 已用于不同参数的请求: " + requestId);
-                }
-                JsonNode replayedBody = parseReplayedBody(row.responseBody());
-                return new ServiceResult(replayedBody, row.responseStatus());
-            }
-        }
-        ServiceResult result = action.get();
-        repository.completeIdempotency(
-                requestId, result.status(), writeJson(result.body()));
-        return result;
-    }
-
     private RaceRow requireOpenRace(String raceId, Integer expectedVersion) {
         RaceRow race = repository.findRace(raceId)
                 .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
@@ -372,56 +321,6 @@ public class RaceServiceImpl implements RaceService {
             return PenaltyType.valueOf(type);
         } catch (IllegalArgumentException ex) {
             throw new BadRequestException("未知处罚类型: " + type);
-        }
-    }
-
-    private static TreeMap<String, Object> orderedParams(Object... keyValues) {
-        if (keyValues.length % 2 != 0) {
-            throw new IllegalArgumentException("参数必须为键值对");
-        }
-        TreeMap<String, Object> params = new TreeMap<>();
-        for (int i = 0; i < keyValues.length; i += 2) {
-            params.put((String) keyValues[i], keyValues[i + 1]);
-        }
-        return params;
-    }
-
-    private String digest(String operation, Map<String, Object> params) {
-        try {
-            Map<String, Object> canonical = new TreeMap<>(params);
-            canonical.put("__operation", operation);
-            MessageDigest messageDigest = MessageDigest.getInstance("SHA-256");
-            byte[] bytes = objectMapper.writerWithDefaultPrettyPrinter()
-                    .writeValueAsString(canonical)
-                    .getBytes(StandardCharsets.UTF_8);
-            return HexFormat.of().formatHex(messageDigest.digest(bytes));
-        } catch (NoSuchAlgorithmException | com.fasterxml.jackson.core.JsonProcessingException ex) {
-            throw new IllegalStateException("计算请求摘要失败", ex);
-        }
-    }
-
-    private String writeJson(Object body) {
-        try {
-            return objectMapper.writeValueAsString(body);
-        } catch (com.fasterxml.jackson.core.JsonProcessingException ex) {
-            throw new IllegalStateException("序列化响应失败", ex);
-        }
-    }
-
-    private JsonNode parseReplayedBody(String body) {
-        try {
-            return objectMapper.readTree(body);
-        } catch (com.fasterxml.jackson.core.JsonProcessingException ex) {
-            throw new IllegalStateException("解析原响应失败", ex);
-        }
-    }
-
-    private static void sleepBriefly() {
-        try {
-            Thread.sleep(10L);
-        } catch (InterruptedException ex) {
-            Thread.currentThread().interrupt();
-            throw new ConflictException("等待同键请求完成时被中断");
         }
     }
 }

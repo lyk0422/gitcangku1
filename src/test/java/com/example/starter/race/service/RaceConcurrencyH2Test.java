@@ -39,7 +39,8 @@ class RaceConcurrencyH2Test extends AbstractRaceH2Test {
 
     @Test
     void 并发同版本登记仅一个成功且版本只加一() throws Exception {
-        raceService.createRace(new CreateRaceRequest(RACE, "req-create"));
+        givenCourse(COURSE);
+        raceService.createRace(new CreateRaceRequest(RACE, COURSE, "req-create"));
 
         int threads = 10;
         ExecutorService pool = Executors.newFixedThreadPool(threads);
@@ -78,7 +79,8 @@ class RaceConcurrencyH2Test extends AbstractRaceH2Test {
 
     @Test
     void 封榜与处罚并发时互斥且最终状态自洽() throws Exception {
-        raceService.createRace(new CreateRaceRequest(RACE, "req-create"));
+        givenCourse(COURSE);
+        raceService.createRace(new CreateRaceRequest(RACE, COURSE, "req-create"));
         raceService.registerRunner(RACE,
                 new RegisterRunnerRequest("a", 1000L, 1, "req-a"));
         // 当前版本为2：封榜与加时都以 expectedVersion=2 并发提交
@@ -138,7 +140,8 @@ class RaceConcurrencyH2Test extends AbstractRaceH2Test {
 
     @Test
     void 同requestId并发重放只产生一次变更且结果一致() throws Exception {
-        raceService.createRace(new CreateRaceRequest(RACE, "req-create"));
+        givenCourse(COURSE);
+        raceService.createRace(new CreateRaceRequest(RACE, COURSE, "req-create"));
 
         int threads = 6;
         ExecutorService pool = Executors.newFixedThreadPool(threads);

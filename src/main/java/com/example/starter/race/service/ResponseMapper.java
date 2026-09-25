@@ -1,12 +1,14 @@
 package com.example.starter.race.service;
 
 import com.example.starter.race.api.PenaltyResponse;
+import com.example.starter.race.api.CourseRecordResponse;
 import com.example.starter.race.api.ResultEntryResponse;
 import com.example.starter.race.api.RunnerResponse;
 import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
+import com.example.starter.race.persistence.CourseRecordRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
 import com.example.starter.race.persistence.RunnerRow;
@@ -70,5 +72,16 @@ final class ResponseMapper {
                 entry.finishTimeMs(),
                 entry.penaltyMs(),
                 entry.totalTimeMs());
+    }
+
+    static CourseRecordResponse toRecordResponse(CourseRecordRow row) {
+        return new CourseRecordResponse(
+                row.recordId(),
+                row.courseKey(),
+                row.seq(),
+                row.raceId(),
+                row.bib(),
+                row.timeMs(),
+                row.claimedAt());
     }
 }
