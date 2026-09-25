@@ -8,11 +8,15 @@ import org.springframework.stereotype.Service;
 
 import com.example.starter.maintenance.api.ApiException;
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
+import com.example.starter.maintenance.api.dto.ApplyDeferralRequest;
+import com.example.starter.maintenance.api.dto.ApproveDeferralRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
+import com.example.starter.maintenance.api.dto.DeferralResponse;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
 import com.example.starter.maintenance.api.dto.RegisterEquipmentRequest;
+import com.example.starter.maintenance.api.dto.RejectDeferralRequest;
 import com.example.starter.maintenance.api.dto.ReviseReadingRequest;
 import com.example.starter.maintenance.api.dto.RevisionView;
 import com.example.starter.maintenance.api.dto.StatusResponse;
@@ -64,6 +68,27 @@ public class EquipmentService {
 
     public List<MaintenanceResponse> listMaintenances(String equipmentId) {
         return txService.listMaintenances(equipmentId);
+    }
+
+    public DeferralResponse applyDeferral(String equipmentId, ApplyDeferralRequest req) {
+        String fingerprint = equipmentId + "|" + req.deferKey() + "|" + req.minutes()
+                + "|" + req.reason() + "|" + req.applicant();
+        return recoverDuplicateKey(req.requestId(), "APPLY_DEFERRAL", fingerprint,
+                DeferralResponse.class, () -> txService.applyDeferral(equipmentId, req));
+    }
+
+    public DeferralResponse approveDeferral(String equipmentId, String deferKey,
+                                            ApproveDeferralRequest req) {
+        return txService.approveDeferral(equipmentId, deferKey, req);
+    }
+
+    public DeferralResponse rejectDeferral(String equipmentId, String deferKey,
+                                           RejectDeferralRequest req) {
+        return txService.rejectDeferral(equipmentId, deferKey, req);
+    }
+
+    public List<DeferralResponse> listDeferrals(String equipmentId) {
+        return txService.listDeferrals(equipmentId);
     }
 
     /**

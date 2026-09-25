@@ -14,11 +14,15 @@ import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
+import com.example.starter.maintenance.api.dto.ApplyDeferralRequest;
+import com.example.starter.maintenance.api.dto.ApproveDeferralRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
+import com.example.starter.maintenance.api.dto.DeferralResponse;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
 import com.example.starter.maintenance.api.dto.RegisterEquipmentRequest;
+import com.example.starter.maintenance.api.dto.RejectDeferralRequest;
 import com.example.starter.maintenance.api.dto.ReviseReadingRequest;
 import com.example.starter.maintenance.api.dto.RevisionView;
 import com.example.starter.maintenance.api.dto.StatusResponse;
@@ -92,5 +96,35 @@ public class EquipmentController {
     @GetMapping("/{equipmentId}/maintenances")
     public List<MaintenanceResponse> listMaintenances(@PathVariable String equipmentId) {
         return service.listMaintenances(equipmentId);
+    }
+
+    /** 申请保养延期：设备须 DUE 且保养未完成；同一设备同时只允许一条待审批延期。 */
+    @PostMapping("/{equipmentId}/deferrals")
+    @ResponseStatus(HttpStatus.CREATED)
+    public DeferralResponse applyDeferral(@PathVariable String equipmentId,
+                                          @Valid @RequestBody ApplyDeferralRequest req) {
+        return service.applyDeferral(equipmentId, req);
+    }
+
+    /** 批准延期：审批人须与申请人不同；批准后本次保养阈值临时后移申请分钟数。 */
+    @PostMapping("/{equipmentId}/deferrals/{deferKey}/approval")
+    public DeferralResponse approveDeferral(@PathVariable String equipmentId,
+                                            @PathVariable String deferKey,
+                                            @Valid @RequestBody ApproveDeferralRequest req) {
+        return service.approveDeferral(equipmentId, deferKey, req);
+    }
+
+    /** 拒绝延期：必须记录理由；拒绝后申请人可重新申请。 */
+    @PostMapping("/{equipmentId}/deferrals/{deferKey}/rejection")
+    public DeferralResponse rejectDeferral(@PathVariable String equipmentId,
+                                           @PathVariable String deferKey,
+                                           @Valid @RequestBody RejectDeferralRequest req) {
+        return service.rejectDeferral(equipmentId, deferKey, req);
+    }
+
+    /** 延期历史（含待审批/已批准/已拒绝/已失效，按申请先后升序）。 */
+    @GetMapping("/{equipmentId}/deferrals")
+    public List<DeferralResponse> listDeferrals(@PathVariable String equipmentId) {
+        return service.listDeferrals(equipmentId);
     }
 }

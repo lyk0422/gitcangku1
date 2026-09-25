@@ -14,6 +14,7 @@ import org.springframework.jdbc.support.GeneratedKeyHolder;
 import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.stereotype.Repository;
 
+import com.example.starter.maintenance.domain.Deferral;
 import com.example.starter.maintenance.domain.Equipment;
 import com.example.starter.maintenance.domain.MaintenanceRecord;
 import com.example.starter.maintenance.domain.Reading;
@@ -232,6 +233,119 @@ public class EquipmentRepository {
                 "SELECT COUNT(*) FROM maintenance WHERE equipment_id = ? AND reading_id = ?",
                 Integer.class, equipmentId, readingId);
         return count != null && count > 0;
+    }
+
+    // ---------- 保养延期 ----------
+
+    private static final RowMapper<Deferral> DEFERRAL_MAPPER = (rs, rowNum) -> new Deferral(
+            rs.getLong("deferral_id"),
+            rs.getString("equipment_id"),
+            rs.getString("defer_key"),
+            rs.getLong("cycle_maintenance_id"),
+            rs.getLong("requested_minutes"),
+            rs.getString("reason"),
+            rs.getString("status"),
+            rs.getString("applicant"),
+            rs.getString("approver"),
+            rs.getString("reject_reason"),
+            rs.getLong("applied_run_minutes"),
+            (Long) rs.getObject("original_threshold_minutes"),
+            (Long) rs.getObject("new_threshold_minutes"),
+            readInstant(rs, "created_at"),
+            rs.getObject("decided_at") == null ? null : readInstant(rs, "decided_at"));
+
+    private static final String DEFERRAL_COLUMNS =
+            "deferral_id, equipment_id, defer_key, cycle_maintenance_id, requested_minutes, reason,"
+                    + " status, applicant, approver, reject_reason, applied_run_minutes,"
+                    + " original_threshold_minutes, new_threshold_minutes, created_at, decided_at";
+
+    public long insertDeferral(String equipmentId, String deferKey, long cycleMaintenanceId,
+                               long requestedMinutes, String reason, String applicant,
+                               long appliedRunMinutes, String requestId, Instant createdAt) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbc.update(connection -> {
+            PreparedStatement ps = connection.prepareStatement(
+                    "INSERT INTO deferral (equipment_id, defer_key, cycle_maintenance_id,"
+                            + " requested_minutes, reason, status, applicant, applied_run_minutes,"
+                            + " request_id, created_at) VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, equipmentId);
+            ps.setString(2, deferKey);
+            ps.setLong(3, cycleMaintenanceId);
+            ps.setLong(4, requestedMinutes);
+            ps.setString(5, reason);
+            ps.setString(6, applicant);
+            ps.setLong(7, appliedRunMinutes);
+            ps.setString(8, requestId);
+            ps.setObject(9, utc(createdAt));
+            return ps;
+        }, keyHolder);
+        Number key = keyHolder.getKey();
+        if (key == null) {
+            throw new IllegalStateException("延期记录主键生成失败");
+        }
+        return key.longValue();
+    }
+
+    public Optional<Deferral> findDeferral(String equipmentId, String deferKey) {
+        List<Deferral> rows = jdbc.query(
+                "SELECT " + DEFERRAL_COLUMNS + " FROM deferral WHERE equipment_id = ? AND defer_key = ?",
+                DEFERRAL_MAPPER, equipmentId, deferKey);
+        return rows.stream().findFirst();
+    }
+
+    /** 设备当前是否存在待审批延期（待审批延期必然属于当前周期，保养完成时会被置为 EXPIRED）。 */
+    public boolean existsPendingDeferral(String equipmentId) {
+        return findPendingDeferral(equipmentId).isPresent();
+    }
+
+    /** 设备当前的待审批延期（至多一条，由业务规则保证）。 */
+    public Optional<Deferral> findPendingDeferral(String equipmentId) {
+        List<Deferral> rows = jdbc.query(
+                "SELECT " + DEFERRAL_COLUMNS + " FROM deferral"
+                        + " WHERE equipment_id = ? AND status = 'PENDING'"
+                        + " ORDER BY deferral_id ASC LIMIT 1",
+                DEFERRAL_MAPPER, equipmentId);
+        return rows.stream().findFirst();
+    }
+
+    /** 指定保养周期内已批准延期的累计分钟数（无批准记录时为 0）。 */
+    public long sumApprovedDeferralMinutes(String equipmentId, long cycleMaintenanceId) {
+        Long sum = jdbc.queryForObject(
+                "SELECT COALESCE(SUM(requested_minutes), 0) FROM deferral"
+                        + " WHERE equipment_id = ? AND cycle_maintenance_id = ? AND status = 'APPROVED'",
+                Long.class, equipmentId, cycleMaintenanceId);
+        return sum == null ? 0L : sum;
+    }
+
+    /** 批准延期：固化审批人与原/新阈值快照。 */
+    public void approveDeferral(long deferralId, String approver, long originalThresholdMinutes,
+                                long newThresholdMinutes, Instant decidedAt) {
+        jdbc.update("UPDATE deferral SET status = 'APPROVED', approver = ?,"
+                        + " original_threshold_minutes = ?, new_threshold_minutes = ?, decided_at = ?"
+                        + " WHERE deferral_id = ?",
+                approver, originalThresholdMinutes, newThresholdMinutes, utc(decidedAt), deferralId);
+    }
+
+    /** 拒绝延期：记录审批人与拒绝理由。 */
+    public void rejectDeferral(long deferralId, String approver, String rejectReason, Instant decidedAt) {
+        jdbc.update("UPDATE deferral SET status = 'REJECTED', approver = ?, reject_reason = ?,"
+                        + " decided_at = ? WHERE deferral_id = ?",
+                approver, rejectReason, utc(decidedAt), deferralId);
+    }
+
+    /** 保养完成时将本设备全部待审批延期置为 EXPIRED（周期结束，延期不再可审批）。 */
+    public void expirePendingDeferrals(String equipmentId, Instant decidedAt) {
+        jdbc.update("UPDATE deferral SET status = 'EXPIRED', decided_at = ?"
+                        + " WHERE equipment_id = ? AND status = 'PENDING'",
+                utc(decidedAt), equipmentId);
+    }
+
+    public List<Deferral> listDeferrals(String equipmentId) {
+        return jdbc.query(
+                "SELECT " + DEFERRAL_COLUMNS + " FROM deferral WHERE equipment_id = ?"
+                        + " ORDER BY deferral_id ASC",
+                DEFERRAL_MAPPER, equipmentId);
     }
 
     // ---------- 幂等去重 ----------
