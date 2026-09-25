@@ -35,6 +35,7 @@ public abstract class AbstractIntegrationTest {
 
     @BeforeEach
     void cleanTables() {
+        jdbc.update("DELETE FROM legal_sign");
         jdbc.update("DELETE FROM approval");
         jdbc.update("DELETE FROM translation");
         jdbc.update("DELETE FROM segment");
@@ -113,6 +114,16 @@ public abstract class AbstractIntegrationTest {
         String body = "{\"requestId\":\"" + requestId + "\",\"translationVersion\":" + translationVersion + "}";
         return postJson("/api/documents/" + documentId + "/segments/" + segmentId + "/translations/" + language
                 + "/approve", body, actorId);
+    }
+
+    protected ApiResult legalSign(long documentId, String segmentId, String language, String actorId,
+                                  int expectedVersion, String status, String reason, String requestId)
+            throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"expectedVersion\":" + expectedVersion
+                + ",\"status\":\"" + status + "\""
+                + (reason == null ? "" : ",\"reason\":\"" + reason + "\"") + "}";
+        return postJson("/api/documents/" + documentId + "/segments/" + segmentId + "/translations/" + language
+                + "/legal-sign", body, actorId);
     }
 
     protected ApiResult publish(long documentId, int expectedDraftVersion, int expectedPublishedVersion,

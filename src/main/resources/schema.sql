@@ -111,6 +111,27 @@ COMMENT ON COLUMN term_rule.source_term IS '源文术语，Unicode 原文、区�
 COMMENT ON COLUMN term_rule.language IS '目标语言码，小写';
 COMMENT ON COLUMN term_rule.required_translation IS '该术语在目标语言中的必译文本，非空';
 
+CREATE TABLE IF NOT EXISTS legal_sign (
+    document_id BIGINT NOT NULL,
+    segment_id VARCHAR(64) NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    translation_version INT NOT NULL,
+    legal_reviewer VARCHAR(128) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    reason VARCHAR(2048) NOT NULL,
+    signed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (document_id, segment_id, language, translation_version)
+);
+COMMENT ON TABLE legal_sign IS '法律审签：按段落、语言与译文版本唯一，同一译文版本仅保留最后一条终态审签（APPROVED/REJECTED）';
+COMMENT ON COLUMN legal_sign.document_id IS '所属文档 ID';
+COMMENT ON COLUMN legal_sign.segment_id IS '所属段落 ID';
+COMMENT ON COLUMN legal_sign.language IS '目标语言码，小写';
+COMMENT ON COLUMN legal_sign.translation_version IS '审签针对的译文版本；译文修订产生新版本后需重新审签，旧审签仅归属旧版本';
+COMMENT ON COLUMN legal_sign.legal_reviewer IS '法务人员，取审签时 X-Actor-Id';
+COMMENT ON COLUMN legal_sign.status IS '审签终态：APPROVED 或 REJECTED';
+COMMENT ON COLUMN legal_sign.reason IS '审签说明；REJECTED 时非空，APPROVED 时可为空串';
+COMMENT ON COLUMN legal_sign.signed_at IS '审签时间，数据库默认时区';
+
 CREATE TABLE IF NOT EXISTS request_log (
     request_id VARCHAR(128) PRIMARY KEY,
     request_hash VARCHAR(64) NOT NULL,

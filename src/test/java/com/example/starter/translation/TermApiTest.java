@@ -176,12 +176,13 @@ class TermApiTest extends AbstractIntegrationTest {
         ApiResult stalePublish = publish(docId, 4, 0, newRequestId());
         assertThat(stalePublish.status()).isEqualTo(422);
 
-        // 旧批准不再满足发布条件：基于当前术语版本重新提交并批准
+        // 旧批准不再满足发布条件：基于当前术语版本重新提交、批准并法律审签通过
         ApiResult resubmit = submitTranslation(docId, "s1", "en", "alice", "ML", 1, newRequestId());
         assertThat(resubmit.status()).isEqualTo(200);
         assertThat(resubmit.body().get("termVersion").asInt()).isEqualTo(2);
         assertThat(resubmit.body().get("translationVersion").asInt()).isEqualTo(2);
         approve(docId, "s1", "en", "bob", 2, newRequestId());
+        legalSign(docId, "s1", "en", "erin", 2, "APPROVED", "合规", newRequestId());
 
         ApiResult published = publish(docId, 5, 0, newRequestId());
         assertThat(published.status()).isEqualTo(201);
@@ -204,6 +205,7 @@ class TermApiTest extends AbstractIntegrationTest {
         updateTerms(docId, 0, RULES_V1, newRequestId());
         submitTranslation(docId, "s1", "en", "alice", "machine learning", 1, newRequestId());
         approve(docId, "s1", "en", "bob", 1, newRequestId());
+        legalSign(docId, "s1", "en", "erin", 1, "APPROVED", "合规", newRequestId());
         assertThat(publish(docId, 3, 0, newRequestId()).status()).isEqualTo(201);
 
         // 术语更新到新版本
@@ -280,9 +282,10 @@ class TermApiTest extends AbstractIntegrationTest {
         assertThat(violated.status()).isEqualTo(422);
         assertThat(publish(docId, 3, 0, newRequestId()).status()).isEqualTo(422);
 
-        // 合规提交并批准后发布成功
+        // 合规提交、批准并法律审签通过后发布成功
         submitTranslation(docId, "s1", "en", "alice", "machine learning", 1, newRequestId());
         approve(docId, "s1", "en", "bob", 2, newRequestId());
+        legalSign(docId, "s1", "en", "erin", 2, "APPROVED", "合规", newRequestId());
         assertThat(publish(docId, 4, 0, newRequestId()).status()).isEqualTo(201);
     }
 }

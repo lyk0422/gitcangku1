@@ -72,6 +72,21 @@ public final class Rows {
     }
 
     /**
+     * 法律审签：按段落、语言与译文版本唯一；同一译文版本仅保留最后一条终态审签。
+     * 译文修订产生新版本后旧审签仅归属旧版本，新版本需重新审签。
+     *
+     * @param segmentId          所属段落 ID
+     * @param language           目标语言码，小写
+     * @param translationVersion 审签针对的译文版本
+     * @param legalReviewer      法务人员，取审签时 X-Actor-Id
+     * @param status             审签终态：APPROVED 或 REJECTED
+     * @param reason             审签说明；REJECTED 时非空
+     */
+    public record LegalSignRow(String segmentId, String language, int translationVersion,
+                               String legalReviewer, String status, String reason) {
+    }
+
+    /**
      * 写操作幂等去重记录：全局唯一 requestId，仅记录成功结果，与业务变更原子提交。
      *
      * @param requestId      全局唯一请求 ID

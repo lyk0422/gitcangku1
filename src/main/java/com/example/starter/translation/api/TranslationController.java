@@ -20,6 +20,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
+import java.util.List;
 
 /**
  * 多语种段落修订与发布快照 REST API。
@@ -92,13 +93,50 @@ public class TranslationController {
                         documentId, segmentId, language, actorId, request))).toResponseEntity();
     }
 
-    /** 发布：全部段落全部目标语言均有有效批准且术语校验通过时原子生成只读快照并递增发布版本。 */
+    /** 发布：全部段落全部目标语言均有有效批准、法律审签通过且术语校验通过时原子生成只读快照并递增发布版本。 */
     @PostMapping("/{documentId}/publish")
     public ResponseEntity<String> publish(@PathVariable long documentId,
                                           @Valid @RequestBody ApiDtos.PublishRequest request) {
         String operation = "POST /api/documents/" + documentId + "/publish";
         return writeExecutor.execute(request.requestId(), hash(operation, request),
                 () -> WriteResult.of(201, translationService.publish(documentId, request))).toResponseEntity();
+    }
+
+    /**
+     * 法律审签：法务人取 X-Actor-Id；requestId 即 signKey，指纹含法务人、译文版本、状态与说明，
+     * 同键同参重放首次成功响应，失败不占键。
+     */
+    @PostMapping("/{documentId}/segments/{segmentId}/translations/{language}/legal-sign")
+    public ResponseEntity<String> legalSign(@PathVariable long documentId, @PathVariable String segmentId,
+                                            @PathVariable String language,
+                                            @RequestHeader("X-Actor-Id") String actorId,
+                                            @Valid @RequestBody ApiDtos.LegalSignRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/segments/" + segmentId
+                + "/translations/" + language + "/legal-sign";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(200, translationService.legalSign(
+                        documentId, segmentId, language, actorId, request))).toResponseEntity();
+    }
+
+    /** 查询指定段落、语言的逐版审签历史：每译文版本仅含最后一条终态审签。 */
+    @GetMapping("/{documentId}/segments/{segmentId}/translations/{language}/legal-signs")
+    public ResponseEntity<ApiDtos.LegalSignHistoryResponse> getLegalSignHistory(
+            @PathVariable long documentId, @PathVariable String segmentId, @PathVariable String language) {
+        return ResponseEntity.ok(translationService.getLegalSignHistory(documentId, segmentId, language));
+    }
+
+    /** 发布阻断诊断：返回当前全部阻断条目（含缺少法律审签/被拒绝），空列表表示可发布。 */
+    @GetMapping("/{documentId}/publish-diagnostics")
+    public ResponseEntity<ApiDtos.PublishDiagnosticsResponse> getPublishDiagnostics(
+            @PathVariable long documentId) {
+        return ResponseEntity.ok(translationService.getPublishDiagnostics(documentId));
+    }
+
+    /** 查询已发布快照所用审签版本：随快照冻结，后续拒绝不追溯改变。 */
+    @GetMapping("/{documentId}/releases/{publishedVersion}/legal-signs")
+    public ResponseEntity<List<ApiDtos.ReleaseLegalSignView>> getReleaseLegalSigns(
+            @PathVariable long documentId, @PathVariable int publishedVersion) {
+        return ResponseEntity.ok(translationService.getReleaseLegalSigns(documentId, publishedVersion));
     }
 
     /** 新增术语版本：不可变快照，术语版本与草稿版本各加一；已有版本不可覆盖。 */

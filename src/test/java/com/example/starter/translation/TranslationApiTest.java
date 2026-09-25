@@ -142,11 +142,13 @@ class TranslationApiTest extends AbstractIntegrationTest {
         ApiResult stillStale = publish(docId, 4, 0, newRequestId());
         assertThat(stillStale.status()).isEqualTo(422);
 
-        // 用旧译文版本批准 422；用当前版本批准后发布成功
+        // 用旧译文版本批准 422；用当前版本批准并法律审签通过后发布成功
         ApiResult staleApprove = approve(docId, "s1", "en", "bob", 1, newRequestId());
         assertThat(staleApprove.status()).isEqualTo(422);
         ApiResult reApprove = approve(docId, "s1", "en", "bob", 2, newRequestId());
         assertThat(reApprove.status()).isEqualTo(200);
+        assertThat(legalSign(docId, "s1", "en", "erin", 2, "APPROVED", "合规", newRequestId()).status())
+                .isEqualTo(200);
         ApiResult published = publish(docId, 4, 0, newRequestId());
         assertThat(published.status()).isEqualTo(201);
         assertThat(published.body().get("publishedVersion").asInt()).isEqualTo(1);
@@ -189,6 +191,8 @@ class TranslationApiTest extends AbstractIntegrationTest {
             submitTranslation(docId, seg, "ja", "carol", seg + "-ja", 1, newRequestId());
             approve(docId, seg, "en", "bob", 1, newRequestId());
             approve(docId, seg, "ja", "dave", 1, newRequestId());
+            legalSign(docId, seg, "en", "erin", 1, "APPROVED", "合规", newRequestId());
+            legalSign(docId, seg, "ja", "frank", 1, "APPROVED", "合规", newRequestId());
         }
         ApiResult published = publish(docId, 5, 0, newRequestId());
         assertThat(published.status()).isEqualTo(201);
@@ -223,12 +227,14 @@ class TranslationApiTest extends AbstractIntegrationTest {
                 "[{\"segmentId\":\"s1\",\"sourceText\":\"原文\"}]");
         submitTranslation(docId, "s1", "en", "alice", "v1", 1, newRequestId());
         approve(docId, "s1", "en", "bob", 1, newRequestId());
+        legalSign(docId, "s1", "en", "erin", 1, "APPROVED", "合规", newRequestId());
         assertThat(publish(docId, 2, 0, newRequestId()).status()).isEqualTo(201);
 
         putJson("/api/documents/" + docId + "/segments/s1/source",
                 "{\"requestId\":\"" + newRequestId() + "\",\"sourceText\":\"原文v2\"}");
         submitTranslation(docId, "s1", "en", "alice", "v2", 2, newRequestId());
         approve(docId, "s1", "en", "bob", 2, newRequestId());
+        legalSign(docId, "s1", "en", "erin", 2, "APPROVED", "合规", newRequestId());
         ApiResult second = publish(docId, 4, 1, newRequestId());
         assertThat(second.status()).isEqualTo(201);
         assertThat(second.body().get("publishedVersion").asInt()).isEqualTo(2);

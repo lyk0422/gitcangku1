@@ -65,6 +65,17 @@ public final class ApiDtos {
             @PositiveOrZero(message = "expectedPublishedVersion 不能为负数") int expectedPublishedVersion) {
     }
 
+    /**
+     * 法律审签请求：法务人取 X-Actor-Id；修改须携带译文 expectedVersion 做乐观校验；
+     * status 为 APPROVED/REJECTED；REJECTED 时 reason 不能为空。
+     */
+    public record LegalSignRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @Positive(message = "expectedVersion 必须为正数") int expectedVersion,
+            @NotBlank(message = "status 不能为空") String status,
+            @Size(max = 2048) String reason) {
+    }
+
     /** 术语规则输入：sourceTerm 区分大小写，requiredTranslation 非空。 */
     public record TermRuleInput(
             @NotBlank(message = "sourceTerm 不能为空") @Size(max = 512) String sourceTerm,
@@ -104,6 +115,35 @@ public final class ApiDtos {
     public record PublishResponse(long documentId, int publishedVersion) {
     }
 
+    /** 法律审签响应。 */
+    public record LegalSignResponse(long documentId, String segmentId, String language,
+                                    int translationVersion, String legalReviewer, String status, String reason) {
+    }
+
+    /** 单条审签历史条目。 */
+    public record LegalSignView(String segmentId, String language, int translationVersion,
+                                String legalReviewer, String status, String reason) {
+    }
+
+    /** 逐段审签历史响应。 */
+    public record LegalSignHistoryResponse(long documentId, String segmentId, String language,
+                                           List<LegalSignView> signs) {
+    }
+
+    /** 发布阻断条目：段落、语言、译文版本与原因，按段落、语言稳定排序。 */
+    public record PublishBlocker(String segmentId, String language, int translationVersion, String reason) {
+    }
+
+    /** 发布阻断诊断响应：当前草稿/发布版本及全部阻断条目（空列表表示当前可发布）。 */
+    public record PublishDiagnosticsResponse(long documentId, int draftVersion, int publishedVersion,
+                                             List<PublishBlocker> blockers) {
+    }
+
+    /** 已发布快照所用审签版本条目。 */
+    public record ReleaseLegalSignView(String segmentId, String language, int translationVersion,
+                                       String legalReviewer, String status) {
+    }
+
     /** 术语规则视图。 */
     public record TermRuleView(String sourceTerm, String language, String requiredTranslation) {
     }
@@ -125,11 +165,16 @@ public final class ApiDtos {
     public record TermStatusResponse(long documentId, int termVersion, List<TranslationTermStatus> translations) {
     }
 
-    /** 统一错误响应；violations 仅在术语违规 422 时返回，含全部违规术语。 */
+    /** 统一错误响应；violations 仅在术语违规 422 时返回，blockers 仅在发布门禁 422 时返回。 */
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    public record ErrorResponse(String error, String message, List<TermRuleView> violations) {
+    public record ErrorResponse(String error, String message, List<TermRuleView> violations,
+                                List<PublishBlocker> blockers) {
         public ErrorResponse(String error, String message) {
-            this(error, message, null);
+            this(error, message, null, null);
+        }
+
+        public ErrorResponse(String error, String message, List<TermRuleView> violations) {
+            this(error, message, violations, null);
         }
     }
 }

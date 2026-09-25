@@ -2,6 +2,7 @@ package com.example.starter.translation.repo;
 
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
+import com.example.starter.translation.domain.Rows.LegalSignRow;
 import com.example.starter.translation.domain.Rows.RequestLogRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
@@ -45,6 +46,10 @@ public class TranslationRepository {
 
     private static final RowMapper<TermRuleRow> TERM_RULE_MAPPER = (rs, n) -> new TermRuleRow(
             rs.getString("source_term"), rs.getString("language"), rs.getString("required_translation"));
+
+    private static final RowMapper<LegalSignRow> LEGAL_SIGN_MAPPER = (rs, n) -> new LegalSignRow(
+            rs.getString("segment_id"), rs.getString("language"), rs.getInt("translation_version"),
+            rs.getString("legal_reviewer"), rs.getString("status"), rs.getString("reason"));
 
     private final JdbcTemplate jdbc;
 
@@ -185,6 +190,42 @@ public class TranslationRepository {
                             + "source_version, translation_version) VALUES (?, ?, ?, ?, ?, ?)",
                     documentId, row.segmentId(), row.language(), row.reviewer(),
                     row.sourceVersion(), row.translationVersion());
+        }
+    }
+
+    /** 查询指定段落、语言的全部审签（含历史译文版本），按译文版本、审签时间排序。 */
+    public List<LegalSignRow> listLegalSigns(long documentId, String segmentId, String language) {
+        return jdbc.query(
+                "SELECT segment_id, language, translation_version, legal_reviewer, status, reason "
+                        + "FROM legal_sign WHERE document_id = ? AND segment_id = ? AND language = ? "
+                        + "ORDER BY translation_version, signed_at",
+                LEGAL_SIGN_MAPPER, documentId, segmentId, language);
+    }
+
+    /** 查询文档下全部审签记录（含历史译文版本），按段落、语言、译文版本排序。 */
+    public List<LegalSignRow> listLegalSigns(long documentId) {
+        return jdbc.query(
+                "SELECT segment_id, language, translation_version, legal_reviewer, status, reason "
+                        + "FROM legal_sign WHERE document_id = ? "
+                        + "ORDER BY segment_id, language, translation_version",
+                LEGAL_SIGN_MAPPER, documentId);
+    }
+
+    /**
+     * 插入或覆盖审签：同一文档、段落、语言、译文版本仅保留最后一条终态审签，
+     * 重复审签（可由不同法务人员发起）以最新终态覆盖。
+     */
+    public void upsertLegalSign(long documentId, LegalSignRow row) {
+        int updated = jdbc.update(
+                "UPDATE legal_sign SET legal_reviewer = ?, status = ?, reason = ?, signed_at = CURRENT_TIMESTAMP "
+                        + "WHERE document_id = ? AND segment_id = ? AND language = ? AND translation_version = ?",
+                row.legalReviewer(), row.status(), row.reason(),
+                documentId, row.segmentId(), row.language(), row.translationVersion());
+        if (updated == 0) {
+            jdbc.update("INSERT INTO legal_sign (document_id, segment_id, language, translation_version, "
+                            + "legal_reviewer, status, reason) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    documentId, row.segmentId(), row.language(), row.translationVersion(),
+                    row.legalReviewer(), row.status(), row.reason());
         }
     }
 

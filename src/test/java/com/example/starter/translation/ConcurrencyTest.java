@@ -97,6 +97,7 @@ class ConcurrencyTest extends AbstractIntegrationTest {
                 "[{\"segmentId\":\"s1\",\"sourceText\":\"原文\"}]");
         submitTranslation(docId, "s1", "en", "alice", "hello", 1, newRequestId());
         approve(docId, "s1", "en", "bob", 1, newRequestId());
+        legalSign(docId, "s1", "en", "erin", 1, "APPROVED", "合规", newRequestId());
         // 当前草稿版本 2、发布版本 0
 
         ExecutorService pool = Executors.newFixedThreadPool(2);
@@ -150,6 +151,7 @@ class ConcurrencyTest extends AbstractIntegrationTest {
                 newRequestId());
         submitTranslation(docId, "s1", "en", "alice", "machine learning", 1, newRequestId());
         approve(docId, "s1", "en", "bob", 1, newRequestId());
+        legalSign(docId, "s1", "en", "erin", 1, "APPROVED", "合规", newRequestId());
         // 当前草稿版本 3、发布版本 0、术语版本 1
 
         ExecutorService pool = Executors.newFixedThreadPool(2);
@@ -237,5 +239,92 @@ class ConcurrencyTest extends AbstractIntegrationTest {
         Integer termVersion = jdbc.queryForObject(
                 "SELECT term_version FROM document WHERE document_id = ?", Integer.class, docId);
         assertThat(termVersion).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("并发审签与发布：审签按事务提交顺序裁决，发布只在审签先提交时成功，不产生混合快照")
+    void concurrentLegalSignAndPublish() throws Exception {
+        long docId = createDocument(newRequestId(), "[\"en\"]",
+                "[{\"segmentId\":\"s1\",\"sourceText\":\"原文\"}]");
+        submitTranslation(docId, "s1", "en", "alice", "hello", 1, newRequestId());
+        approve(docId, "s1", "en", "bob", 1, newRequestId());
+        // 当前草稿版本 2、发布版本 0，尚无法律审签
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        CountDownLatch gate = new CountDownLatch(1);
+        Future<ApiResult> signFuture = pool.submit(() -> {
+            gate.await();
+            return legalSign(docId, "s1", "en", "erin", 1, "APPROVED", "合规", newRequestId());
+        });
+        Future<ApiResult> publishFuture = pool.submit(() -> {
+            gate.await();
+            return publish(docId, 2, 0, newRequestId());
+        });
+        gate.countDown();
+        ApiResult signResult = signFuture.get(30, TimeUnit.SECONDS);
+        ApiResult publishResult = publishFuture.get(30, TimeUnit.SECONDS);
+        pool.shutdown();
+
+        assertThat(signResult.status()).isEqualTo(200);
+        assertThat(publishResult.status()).isIn(201, 422);
+
+        Integer publishedVersion = jdbc.queryForObject(
+                "SELECT published_version FROM document WHERE document_id = ?", Integer.class, docId);
+        Integer snapshots = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM release_snapshot WHERE document_id = ?", Integer.class, docId);
+        Integer signCount = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM legal_sign WHERE document_id = ?", Integer.class, docId);
+        assertThat(signCount).isEqualTo(1);
+        // 快照数量与发布版本严格一致：发布失败时绝不产生部分快照
+        assertThat(snapshots).isEqualTo(publishedVersion);
+        if (publishResult.status() == 201) {
+            // 审签先于发布提交：发布版本 1，快照固化 APPROVED 审签
+            assertThat(publishedVersion).isEqualTo(1);
+            ApiResult release = getJson("/api/documents/" + docId + "/releases/1");
+            assertThat(release.body().get("segments").get(0).get("translations").get(0)
+                    .get("legalStatus").asText()).isEqualTo("APPROVED");
+        } else {
+            // 发布先于审签提交：门禁 422，无快照
+            assertThat(publishResult.body().get("blockers").get(0).get("reason").asText())
+                    .contains("缺少法律审签");
+            assertThat(publishedVersion).isZero();
+        }
+    }
+
+    @Test
+    @DisplayName("并发同 signKey 同参：仅执行一次，全部重放首次审签响应")
+    void concurrentSameSignKey() throws Exception {
+        long docId = createDocument(newRequestId(), "[\"en\"]",
+                "[{\"segmentId\":\"s1\",\"sourceText\":\"原文\"}]");
+        submitTranslation(docId, "s1", "en", "alice", "hello", 1, newRequestId());
+        approve(docId, "s1", "en", "bob", 1, newRequestId());
+
+        String signKey = newRequestId();
+        int threads = 8;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch gate = new CountDownLatch(1);
+        List<Future<ApiResult>> futures = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            futures.add(pool.submit(() -> {
+                gate.await();
+                return legalSign(docId, "s1", "en", "erin", 1, "APPROVED", "合规", signKey);
+            }));
+        }
+        gate.countDown();
+        for (Future<ApiResult> future : futures) {
+            ApiResult result = future.get(30, TimeUnit.SECONDS);
+            assertThat(result.status()).isEqualTo(200);
+            assertThat(result.body().get("legalReviewer").asText()).isEqualTo("erin");
+            assertThat(result.body().get("status").asText()).isEqualTo("APPROVED");
+        }
+        pool.shutdown();
+
+        // 仅一条终态审签、一条去重记录
+        assertThat(jdbc.queryForObject(
+                "SELECT COUNT(*) FROM legal_sign WHERE document_id = ?", Integer.class, docId))
+                .isEqualTo(1);
+        assertThat(jdbc.queryForObject(
+                "SELECT COUNT(*) FROM request_log WHERE request_id = ?", Integer.class, signKey))
+                .isEqualTo(1);
     }
 }
