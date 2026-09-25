@@ -5,9 +5,11 @@ import com.example.starter.firmware.domain.Device;
 /**
  * 设备视图。
  */
-public record DeviceView(String deviceId, String model, String currentVersion, int bucketNo) {
+public record DeviceView(String deviceId, String model, String currentVersion, int bucketNo,
+                         String status) {
 
     public static DeviceView of(Device device) {
-        return new DeviceView(device.deviceId(), device.model(), device.currentVersion(), device.bucketNo());
+        return new DeviceView(device.deviceId(), device.model(), device.currentVersion(),
+                device.bucketNo(), device.status().name());
     }
 }

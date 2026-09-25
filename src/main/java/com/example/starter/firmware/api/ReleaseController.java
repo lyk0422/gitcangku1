@@ -48,6 +48,11 @@ public class ReleaseController {
         return releaseService.resume(releaseId, request);
     }
 
+    @GetMapping("/precheck")
+    public ReleasePrecheckView precheck(@RequestParam String model, @RequestParam String fromVersion) {
+        return releaseService.precheck(model, fromVersion);
+    }
+
     @GetMapping("/{releaseId}/monitor")
     public MonitorView monitor(@PathVariable long releaseId) {
         return releaseService.monitor(releaseId);

@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS device (
   model VARCHAR(64) NOT NULL COMMENT '设备型号，登记后不可修改',
   current_version VARCHAR(64) NOT NULL COMMENT '设备当前固件版本',
   bucket_no INT NOT NULL COMMENT '灰度分桶号，取值0~99，登记后不可修改',
+  status VARCHAR(16) NOT NULL DEFAULT 'NORMAL' COMMENT '设备状态：NORMAL正常，QUARANTINED已隔离（隔离设备不得拉取新任务）',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '登记时间',
   PRIMARY KEY (device_id)
 ) COMMENT='设备登记表';
@@ -34,8 +35,9 @@ CREATE TABLE IF NOT EXISTS rollout_task (
   id BIGINT NOT NULL AUTO_INCREMENT COMMENT '任务ID',
   release_id BIGINT NOT NULL COMMENT '所属发布单ID',
   device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
-  status VARCHAR(16) NOT NULL COMMENT 'PENDING待回执；SUCCESS成功；FAILED失败；CANCELLED已取消',
+  status VARCHAR(16) NOT NULL COMMENT 'PENDING待开始；IN_PROGRESS已开始进行中；SUCCESS成功；FAILED失败；CANCELLED已取消',
   first_result VARCHAR(16) NULL COMMENT '首次回执结果（SUCCESS/FAILED），未回执为NULL',
+  cancel_reason VARCHAR(256) NULL COMMENT '取消原因代码（如隔离原因、RELEASE_CANCELLED），未取消为NULL；写入后不可改',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
   PRIMARY KEY (id),
@@ -62,6 +64,30 @@ CREATE TABLE IF NOT EXISTS release_resume_record (
   resumed_at_utc VARCHAR(40) NOT NULL COMMENT '恢复时刻，UTC，ISO-8601格式（如2026-09-22T07:00:00Z）',
   PRIMARY KEY (id)
 ) COMMENT='发布单人工恢复记录，历史不可改';
+
+CREATE TABLE IF NOT EXISTS device_quarantine_record (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '隔离记录ID',
+  device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
+  operation VARCHAR(16) NOT NULL COMMENT '操作：QUARANTINE隔离，UNQUARANTINE解除隔离',
+  operator_name VARCHAR(64) NOT NULL COMMENT '操作运维人标识；解除隔离的操作人必须与隔离人不同',
+  reason_code VARCHAR(64) NOT NULL COMMENT '原因代码：隔离时为隔离原因，解除时为原因已消除的确认说明',
+  device_version VARCHAR(64) NOT NULL COMMENT '操作时刻设备当前固件版本',
+  created_at_utc VARCHAR(40) NOT NULL COMMENT '操作时刻，UTC，ISO-8601格式（如2026-09-22T07:00:00Z）',
+  PRIMARY KEY (id)
+) COMMENT='设备隔离/解除隔离历史，只增不改';
+
+CREATE TABLE IF NOT EXISTS rejected_receipt (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '被拒回执记录ID',
+  request_id VARCHAR(64) NOT NULL COMMENT '被拒回执请求的requestId，唯一；同键重试不重复落记录',
+  task_id BIGINT NOT NULL COMMENT '任务ID',
+  release_id BIGINT NOT NULL COMMENT '所属发布单ID',
+  device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
+  result VARCHAR(16) NOT NULL COMMENT '被拒的回执结果（SUCCESS/FAILED）',
+  reason_code VARCHAR(64) NOT NULL COMMENT '拒绝原因代码，如DEVICE_QUARANTINED',
+  rejected_at_utc VARCHAR(40) NOT NULL COMMENT '拒绝时刻，UTC，ISO-8601格式（如2026-09-22T07:00:00Z）',
+  PRIMARY KEY (id),
+  CONSTRAINT uk_rejected_receipt_request UNIQUE (request_id)
+) COMMENT='被拒回执记录（如隔离设备已开始任务的成功回执），只增不改';
 
 CREATE TABLE IF NOT EXISTS idempotency_record (
   request_id VARCHAR(64) NOT NULL COMMENT '全局唯一请求ID',

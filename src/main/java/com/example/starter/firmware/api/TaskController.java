@@ -9,7 +9,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * 投放任务回执。
+ * 投放任务开始与回执。
  */
 @RestController
 @RequestMapping("/api/tasks")
@@ -19,6 +19,11 @@ public class TaskController {
 
     public TaskController(TaskService taskService) {
         this.taskService = taskService;
+    }
+
+    @PostMapping("/{taskId}/start")
+    public TaskView start(@PathVariable long taskId, @Valid @RequestBody RequestIdBody request) {
+        return taskService.start(taskId, request.requestId());
     }
 
     @PostMapping("/{taskId}/receipt")

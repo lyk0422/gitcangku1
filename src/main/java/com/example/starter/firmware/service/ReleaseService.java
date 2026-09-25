@@ -5,12 +5,14 @@ import com.example.starter.firmware.api.ExpandReleaseRequest;
 import com.example.starter.firmware.api.MonitorView;
 import com.example.starter.firmware.api.PauseRecordView;
 import com.example.starter.firmware.api.ReleaseHistoryResponse;
+import com.example.starter.firmware.api.ReleasePrecheckView;
 import com.example.starter.firmware.api.ReleaseView;
 import com.example.starter.firmware.api.ResumeRecordView;
 import com.example.starter.firmware.api.ResumeReleaseRequest;
 import com.example.starter.firmware.domain.ReleaseOrder;
 import com.example.starter.firmware.domain.ReleaseStatus;
 import com.example.starter.firmware.error.ApiException;
+import com.example.starter.firmware.repo.DeviceRepository;
 import com.example.starter.firmware.repo.PauseRecordRepository;
 import com.example.starter.firmware.repo.ReleaseRepository;
 import com.example.starter.firmware.repo.ResumeRecordRepository;
@@ -32,17 +34,20 @@ public class ReleaseService {
     private final TaskRepository taskRepository;
     private final PauseRecordRepository pauseRecordRepository;
     private final ResumeRecordRepository resumeRecordRepository;
+    private final DeviceRepository deviceRepository;
     private final IdempotencyService idempotency;
     private final Clock clock;
 
     public ReleaseService(ReleaseRepository releaseRepository, TaskRepository taskRepository,
                           PauseRecordRepository pauseRecordRepository,
                           ResumeRecordRepository resumeRecordRepository,
+                          DeviceRepository deviceRepository,
                           IdempotencyService idempotency, Clock clock) {
         this.releaseRepository = releaseRepository;
         this.taskRepository = taskRepository;
         this.pauseRecordRepository = pauseRecordRepository;
         this.resumeRecordRepository = resumeRecordRepository;
+        this.deviceRepository = deviceRepository;
         this.idempotency = idempotency;
         this.clock = clock;
     }
@@ -57,6 +62,11 @@ public class ReleaseService {
                 request.toVersion(), String.valueOf(request.ratio()), String.valueOf(sampleFloor),
                 String.valueOf(threshold));
         return idempotency.execute(request.requestId(), "release.create", fingerprint, () -> {
+            ReleasePrecheckView precheck = precheck(request.model(), request.fromVersion());
+            if (!precheck.startable()) {
+                throw ApiException.unprocessableEntity("ALL_CANDIDATES_QUARANTINED",
+                        "候选设备全部隔离，发布单不能启动: " + request.model());
+            }
             long id;
             try {
                 id = releaseRepository.insert(request.model(), request.fromVersion(), request.toVersion(),
@@ -66,6 +76,18 @@ public class ReleaseService {
             }
             return ReleaseView.of(findOrder(id));
         }, ReleaseView.class);
+    }
+
+    /**
+     * 发布预检（只读）：按型号与来源版本计算候选设备集合与可投放集合；
+     * 候选设备全部隔离时 startable 为 false，启动发布单将返回 422。
+     */
+    public ReleasePrecheckView precheck(String model, String fromVersion) {
+        long candidates = deviceRepository.countCandidates(model, fromVersion);
+        long quarantined = deviceRepository.countQuarantinedCandidates(model, fromVersion);
+        long deliverable = candidates - quarantined;
+        return new ReleasePrecheckView(model, fromVersion, candidates, quarantined, deliverable,
+                candidates == 0 || deliverable > 0);
     }
 
     public ReleaseView expand(long releaseId, ExpandReleaseRequest request) {
