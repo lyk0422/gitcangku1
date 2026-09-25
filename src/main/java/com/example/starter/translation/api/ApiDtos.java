@@ -125,11 +125,95 @@ public final class ApiDtos {
     public record TermStatusResponse(long documentId, int termVersion, List<TranslationTermStatus> translations) {
     }
 
-    /** 统一错误响应；violations 仅在术语违规 422 时返回，含全部违规术语。 */
+    /** 冻结条目输入：sourceTerm 去首尾空白后规范化，allowedTranslations 1~5 条。 */
+    public record FreezeEntryInput(
+            @NotBlank(message = "sourceTerm 不能为空") @Size(max = 512) String sourceTerm,
+            @NotBlank(message = "language 不能为空") String language,
+            @NotNull(message = "allowedTranslations 不能为空")
+            @Size(min = 1, max = 5, message = "允许译法须为 1~5 条")
+            List<@NotBlank(message = "允许译法不能为空") @Size(max = 2048) String> allowedTranslations) {
+    }
+
+    /** 创建术语冻结请求：freezeKey 为客户端幂等键，条目 1~100 条。 */
+    public record CreateFreezeRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @NotBlank(message = "freezeKey 不能为空") @Size(max = 128) String freezeKey,
+            @NotNull(message = "entries 不能为空") @Size(min = 1, max = 100, message = "冻结条目须为 1~100 条")
+            List<@Valid FreezeEntryInput> entries) {
+    }
+
+    /** 冻结写操作响应。 */
+    public record FreezeResponse(long documentId, int freezeVersion, int termVersion, String status,
+                                 String fingerprint, int entryCount) {
+    }
+
+    /** 冻结条目视图：规范化术语与去重排序后的允许译法。 */
+    public record FreezeEntryView(String sourceTerm, String language, List<String> allowedTranslations) {
+    }
+
+    /** 冻结查询视图：冻结版本、绑定术语版本、状态、指纹、操作者与完整条目。 */
+    public record FreezeView(long documentId, int freezeVersion, int termVersion, String status,
+                             String fingerprint, String createdBy, List<FreezeEntryView> entries) {
+    }
+
+    /** 撤销冻结请求。 */
+    public record RevokeFreezeRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId) {
+    }
+
+    /** 冻结违规明细：命中的段落、语言、术语及允许译法。 */
+    public record FreezeViolationView(String segmentId, String language, String sourceTerm,
+                                      List<String> allowedTranslations) {
+    }
+
+    /** 批量译文修订中的单条修订输入。 */
+    public record RevisionInput(
+            @NotBlank(message = "segmentId 不能为空") @Size(max = 64) String segmentId,
+            @NotBlank(message = "language 不能为空") String language,
+            @NotBlank(message = "content 不能为空") String content,
+            @Positive(message = "sourceVersion 必须为正数") int sourceVersion) {
+    }
+
+    /** 批量译文修订请求：1~50 条修订，整批原子提交或回滚。 */
+    public record BatchRevisionsRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @NotNull(message = "revisions 不能为空") @Size(min = 1, max = 50, message = "批量修订须为 1~50 条")
+            List<@Valid RevisionInput> revisions) {
+    }
+
+    /** 批量修订中单条修订的结果。 */
+    public record RevisionResult(String segmentId, String language, int translationVersion, int sourceVersion) {
+    }
+
+    /** 批量译文修订响应：整批成功后的草稿版本与各修订结果。 */
+    public record BatchRevisionsResponse(long documentId, int draftVersion, int termVersion,
+                                         List<RevisionResult> results) {
+    }
+
+    /** 段落诊断中单个命中术语的合规情况。 */
+    public record FreezeHitView(String sourceTerm, List<String> allowedTranslations, boolean satisfied) {
+    }
+
+    /** 单段落单语言的冻结诊断：译文版本（无译文为 null）与各命中术语的合规情况。 */
+    public record SegmentFreezeDiagnostics(String segmentId, String language, Integer translationVersion,
+                                           List<FreezeHitView> hits) {
+    }
+
+    /** 冻结段落诊断响应：仅含命中冻结术语的段落与语言，按段落、语言稳定排序。 */
+    public record FreezeDiagnosticsResponse(long documentId, int freezeVersion,
+                                            List<SegmentFreezeDiagnostics> diagnostics) {
+    }
+
+    /** 统一错误响应；violations 仅在术语违规 422 时返回，freezeViolations 仅在冻结违规 422 时返回。 */
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    public record ErrorResponse(String error, String message, List<TermRuleView> violations) {
+    public record ErrorResponse(String error, String message, List<TermRuleView> violations,
+                                List<FreezeViolationView> freezeViolations) {
         public ErrorResponse(String error, String message) {
-            this(error, message, null);
+            this(error, message, null, null);
+        }
+
+        public ErrorResponse(String error, String message, List<TermRuleView> violations) {
+            this(error, message, violations, null);
         }
     }
 }

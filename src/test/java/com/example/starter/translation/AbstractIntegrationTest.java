@@ -39,6 +39,8 @@ public abstract class AbstractIntegrationTest {
         jdbc.update("DELETE FROM translation");
         jdbc.update("DELETE FROM segment");
         jdbc.update("DELETE FROM release_snapshot");
+        jdbc.update("DELETE FROM term_freeze_entry");
+        jdbc.update("DELETE FROM term_freeze");
         jdbc.update("DELETE FROM term_rule");
         jdbc.update("DELETE FROM term_version");
         jdbc.update("DELETE FROM request_log");
@@ -128,6 +130,28 @@ public abstract class AbstractIntegrationTest {
         String body = "{\"requestId\":\"" + requestId + "\",\"expectedTermVersion\":" + expectedTermVersion
                 + ",\"rules\":" + rulesJson + "}";
         return putJson("/api/documents/" + documentId + "/terms", body);
+    }
+
+    /** 创建术语冻结：entriesJson 为冻结条目数组 JSON，操作者取 X-Actor-Id。 */
+    protected ApiResult createFreeze(long documentId, String freezeKey, String entriesJson, String actorId,
+                                     String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"freezeKey\":\"" + freezeKey
+                + "\",\"entries\":" + entriesJson + "}";
+        return postJson("/api/documents/" + documentId + "/freeze", body, actorId);
+    }
+
+    /** 撤销指定冻结版本。 */
+    protected ApiResult revokeFreeze(long documentId, int freezeVersion, String actorId,
+                                     String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\"}";
+        return postJson("/api/documents/" + documentId + "/freeze/" + freezeVersion + "/revoke", body, actorId);
+    }
+
+    /** 批量译文修订：revisionsJson 为修订数组 JSON，作者取 X-Actor-Id。 */
+    protected ApiResult submitRevisionBatch(long documentId, String revisionsJson, String actorId,
+                                            String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"revisions\":" + revisionsJson + "}";
+        return postJson("/api/documents/" + documentId + "/revisions", body, actorId);
     }
 
     /** HTTP 响应结果：状态码与 JSON 响应体。 */

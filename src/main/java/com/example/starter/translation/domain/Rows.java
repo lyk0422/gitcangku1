@@ -72,6 +72,31 @@ public final class Rows {
     }
 
     /**
+     * 术语冻结：绑定创建时术语版本的不可变冻结；同一术语版本至多一份有效（ACTIVE）冻结。
+     *
+     * @param documentId    所属文档 ID
+     * @param freezeVersion 文档内冻结版本号，从 1 开始单调递增
+     * @param termVersion   冻结绑定的术语版本（即冻结针对的文档版本）；文档新增术语版本后旧冻结不再有效
+     * @param status        冻结状态：ACTIVE 有效 / REVOKED 已撤销；撤销仅影响后续修订与发布，不重写既有快照
+     * @param freezeKey     客户端幂等键，全局唯一；同键同指纹重放原结果，同键异指纹 409，失败不占键
+     * @param fingerprint   freezeKey 指纹：文档 ID、术语版本、规范化术语条目、操作者与状态的 SHA-256
+     * @param createdBy     创建操作者，取创建时 X-Actor-Id
+     */
+    public record TermFreezeRow(long documentId, int freezeVersion, int termVersion, String status,
+                                String freezeKey, String fingerprint, String createdBy) {
+    }
+
+    /**
+     * 术语冻结条目：属于某冻结版本的不可变条目，创建后不可原地修改，每条允许译法一行。
+     *
+     * @param sourceTerm         规范化源文术语（去首尾空白），Unicode 原文、区分大小写，按连续子串匹配
+     * @param language           目标语言码，小写
+     * @param allowedTranslation 一条允许译法，非空；译文包含该术语任一允许译法即合规
+     */
+    public record TermFreezeEntryRow(String sourceTerm, String language, String allowedTranslation) {
+    }
+
+    /**
      * 写操作幂等去重记录：全局唯一 requestId，仅记录成功结果，与业务变更原子提交。
      *
      * @param requestId      全局唯一请求 ID

@@ -111,6 +111,50 @@ COMMENT ON COLUMN term_rule.source_term IS '源文术语，Unicode 原文、区�
 COMMENT ON COLUMN term_rule.language IS '目标语言码，小写';
 COMMENT ON COLUMN term_rule.required_translation IS '该术语在目标语言中的必译文本，非空';
 
+CREATE TABLE IF NOT EXISTS term_freeze (
+    document_id BIGINT NOT NULL,
+    freeze_version INT NOT NULL,
+    term_version INT NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    active_term_version INT GENERATED ALWAYS AS (CASE WHEN status = 'ACTIVE' THEN term_version ELSE NULL END),
+    freeze_key VARCHAR(128) NOT NULL,
+    fingerprint VARCHAR(64) NOT NULL,
+    created_by VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    revoked_by VARCHAR(128),
+    revoked_at TIMESTAMP,
+    PRIMARY KEY (document_id, freeze_version),
+    CONSTRAINT uk_term_freeze_key UNIQUE (freeze_key),
+    CONSTRAINT uk_term_freeze_active UNIQUE (document_id, active_term_version)
+);
+COMMENT ON TABLE term_freeze IS '术语冻结：绑定创建时术语版本的不可变冻结，同一术语版本至多一份有效冻结，撤销仅影响后续修订与发布';
+COMMENT ON COLUMN term_freeze.document_id IS '所属文档 ID';
+COMMENT ON COLUMN term_freeze.freeze_version IS '文档内冻结版本号，从 1 开始单调递增';
+COMMENT ON COLUMN term_freeze.term_version IS '冻结绑定的术语版本（即冻结针对的文档版本）；文档新增术语版本后旧冻结不再有效，需重新冻结';
+COMMENT ON COLUMN term_freeze.status IS '冻结状态：ACTIVE 有效 / REVOKED 已撤销；撤销不重写既有发布快照';
+COMMENT ON COLUMN term_freeze.active_term_version IS '生成列：ACTIVE 时等于术语版本，撤销后为 NULL；配合唯一约束保证同一文档同一术语版本至多一份有效冻结';
+COMMENT ON COLUMN term_freeze.freeze_key IS '客户端幂等键，全局唯一；同键同指纹重放原结果，同键异指纹 409，失败不占键';
+COMMENT ON COLUMN term_freeze.fingerprint IS 'freezeKey 指纹：文档 ID、术语版本、规范化术语条目、操作者与状态规范化后的 SHA-256';
+COMMENT ON COLUMN term_freeze.created_by IS '创建操作者，取创建时 X-Actor-Id';
+COMMENT ON COLUMN term_freeze.created_at IS '创建时间，数据库默认时区';
+COMMENT ON COLUMN term_freeze.revoked_by IS '撤销操作者，取撤销时 X-Actor-Id；未撤销为 NULL';
+COMMENT ON COLUMN term_freeze.revoked_at IS '撤销时间，数据库默认时区；未撤销为 NULL';
+
+CREATE TABLE IF NOT EXISTS term_freeze_entry (
+    document_id BIGINT NOT NULL,
+    freeze_version INT NOT NULL,
+    source_term VARCHAR(512) NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    allowed_translation VARCHAR(2048) NOT NULL,
+    PRIMARY KEY (document_id, freeze_version, source_term, language, allowed_translation)
+);
+COMMENT ON TABLE term_freeze_entry IS '术语冻结条目：属于某冻结版本的不可变条目，创建后不可原地修改，每条允许译法一行';
+COMMENT ON COLUMN term_freeze_entry.document_id IS '所属文档 ID';
+COMMENT ON COLUMN term_freeze_entry.freeze_version IS '所属冻结版本号';
+COMMENT ON COLUMN term_freeze_entry.source_term IS '规范化源文术语（去首尾空白），Unicode 原文、区分大小写，按连续子串匹配';
+COMMENT ON COLUMN term_freeze_entry.language IS '目标语言码，小写';
+COMMENT ON COLUMN term_freeze_entry.allowed_translation IS '一条允许译法，非空；译文包含该术语任一允许译法即合规';
+
 CREATE TABLE IF NOT EXISTS request_log (
     request_id VARCHAR(128) PRIMARY KEY,
     request_hash VARCHAR(64) NOT NULL,

@@ -4,6 +4,8 @@ import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
 import com.example.starter.translation.domain.Rows.RequestLogRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
+import com.example.starter.translation.domain.Rows.TermFreezeEntryRow;
+import com.example.starter.translation.domain.Rows.TermFreezeRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
 import com.example.starter.translation.domain.Rows.TranslationRow;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -45,6 +47,18 @@ public class TranslationRepository {
 
     private static final RowMapper<TermRuleRow> TERM_RULE_MAPPER = (rs, n) -> new TermRuleRow(
             rs.getString("source_term"), rs.getString("language"), rs.getString("required_translation"));
+
+    private static final RowMapper<TermFreezeRow> TERM_FREEZE_MAPPER = (rs, n) -> new TermFreezeRow(
+            rs.getLong("document_id"), rs.getInt("freeze_version"), rs.getInt("term_version"),
+            rs.getString("status"), rs.getString("freeze_key"), rs.getString("fingerprint"),
+            rs.getString("created_by"));
+
+    private static final RowMapper<TermFreezeEntryRow> TERM_FREEZE_ENTRY_MAPPER = (rs, n) ->
+            new TermFreezeEntryRow(rs.getString("source_term"), rs.getString("language"),
+                    rs.getString("allowed_translation"));
+
+    private static final String TERM_FREEZE_COLUMNS =
+            "document_id, freeze_version, term_version, status, freeze_key, fingerprint, created_by";
 
     private final JdbcTemplate jdbc;
 
@@ -240,5 +254,70 @@ public class TranslationRepository {
     public void insertRequestLog(String requestId, String requestHash, int responseStatus, String responseBody) {
         jdbc.update("INSERT INTO request_log (request_id, request_hash, response_status, response_body) "
                 + "VALUES (?, ?, ?, ?)", requestId, requestHash, responseStatus, responseBody);
+    }
+
+    /** 插入术语冻结主记录（初始状态 ACTIVE）；freezeKey 全局唯一，冲突时抛 DuplicateKeyException。 */
+    public void insertTermFreeze(long documentId, int freezeVersion, int termVersion,
+                                 String freezeKey, String fingerprint, String createdBy) {
+        jdbc.update("INSERT INTO term_freeze (document_id, freeze_version, term_version, status, freeze_key, "
+                        + "fingerprint, created_by) VALUES (?, ?, ?, 'ACTIVE', ?, ?, ?)",
+                documentId, freezeVersion, termVersion, freezeKey, fingerprint, createdBy);
+    }
+
+    /** 插入一条冻结条目（一条允许译法一行），归属指定冻结版本；条目创建后不可原地修改。 */
+    public void insertTermFreezeEntry(long documentId, int freezeVersion, TermFreezeEntryRow entry) {
+        jdbc.update("INSERT INTO term_freeze_entry (document_id, freeze_version, source_term, language, "
+                        + "allowed_translation) VALUES (?, ?, ?, ?, ?)",
+                documentId, freezeVersion, entry.sourceTerm(), entry.language(), entry.allowedTranslation());
+    }
+
+    /** 按全局唯一 freezeKey 查询冻结（幂等重放判定用）。 */
+    public Optional<TermFreezeRow> findTermFreezeByKey(String freezeKey) {
+        List<TermFreezeRow> rows = jdbc.query(
+                "SELECT " + TERM_FREEZE_COLUMNS + " FROM term_freeze WHERE freeze_key = ?",
+                TERM_FREEZE_MAPPER, freezeKey);
+        return rows.stream().findFirst();
+    }
+
+    /** 查询指定术语版本下状态为 ACTIVE 的有效冻结；不存在表示该术语版本未冻结。 */
+    public Optional<TermFreezeRow> findActiveTermFreeze(long documentId, int termVersion) {
+        List<TermFreezeRow> rows = jdbc.query(
+                "SELECT " + TERM_FREEZE_COLUMNS + " FROM term_freeze "
+                        + "WHERE document_id = ? AND term_version = ? AND status = 'ACTIVE'",
+                TERM_FREEZE_MAPPER, documentId, termVersion);
+        return rows.stream().findFirst();
+    }
+
+    /** 按冻结版本查询冻结（含已撤销），用于审计查询与撤销。 */
+    public Optional<TermFreezeRow> findTermFreeze(long documentId, int freezeVersion) {
+        List<TermFreezeRow> rows = jdbc.query(
+                "SELECT " + TERM_FREEZE_COLUMNS + " FROM term_freeze "
+                        + "WHERE document_id = ? AND freeze_version = ?",
+                TERM_FREEZE_MAPPER, documentId, freezeVersion);
+        return rows.stream().findFirst();
+    }
+
+    /** 查询文档当前最大冻结版本号，无冻结时返回 0。 */
+    public int findMaxFreezeVersion(long documentId) {
+        Integer max = jdbc.queryForObject(
+                "SELECT COALESCE(MAX(freeze_version), 0) FROM term_freeze WHERE document_id = ?",
+                Integer.class, documentId);
+        return max == null ? 0 : max;
+    }
+
+    /** 查询指定冻结版本的全部条目，按术语、语言、允许译法排序保证稳定输出。 */
+    public List<TermFreezeEntryRow> listTermFreezeEntries(long documentId, int freezeVersion) {
+        return jdbc.query(
+                "SELECT source_term, language, allowed_translation FROM term_freeze_entry "
+                        + "WHERE document_id = ? AND freeze_version = ? "
+                        + "ORDER BY source_term, language, allowed_translation",
+                TERM_FREEZE_ENTRY_MAPPER, documentId, freezeVersion);
+    }
+
+    /** 撤销冻结：状态置为 REVOKED 并记录撤销操作者；条目与既有发布快照保持不变。 */
+    public void revokeTermFreeze(long documentId, int freezeVersion, String revokedBy) {
+        jdbc.update("UPDATE term_freeze SET status = 'REVOKED', revoked_by = ?, "
+                        + "revoked_at = CURRENT_TIMESTAMP WHERE document_id = ? AND freeze_version = ?",
+                revokedBy, documentId, freezeVersion);
     }
 }

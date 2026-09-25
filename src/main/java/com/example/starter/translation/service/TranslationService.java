@@ -5,19 +5,29 @@ import com.example.starter.translation.api.ApiException;
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
+import com.example.starter.translation.domain.Rows.TermFreezeEntryRow;
+import com.example.starter.translation.domain.Rows.TermFreezeRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
 import com.example.starter.translation.domain.Rows.TranslationRow;
 import com.example.starter.translation.repo.TranslationRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.dao.DuplicateKeyException;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashSet;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -95,6 +105,16 @@ public class TranslationService {
         if (request.sourceVersion() != segment.sourceVersion()) {
             throw ApiException.unprocessable("译文所依据的源文版本 " + request.sourceVersion()
                     + " 与当前源文版本 " + segment.sourceVersion() + " 不匹配");
+        }
+        Optional<TermFreezeRow> freeze = repository.findActiveTermFreeze(documentId, document.termVersion());
+        if (freeze.isPresent()) {
+            List<FreezeEntry> freezeEntries = loadFreezeEntries(documentId, freeze.get().freezeVersion());
+            List<ApiDtos.FreezeViolationView> freezeViolations = findFreezeViolations(
+                    segment, normalizedLanguage, request.content(), freezeEntries);
+            if (!freezeViolations.isEmpty()) {
+                throw ApiException.freezeViolation(
+                        "译文违反 " + freezeViolations.size() + " 条冻结译法", freezeViolations);
+            }
         }
         List<TermRuleRow> termRules = repository.listTermRules(documentId, document.termVersion());
         List<ApiDtos.TermRuleView> violations = findViolations(
@@ -175,8 +195,9 @@ public class TranslationService {
 
     /**
      * 发布：校验期望版本（不符 409），再校验全部段落在全部目标语言均有有效批准（缺译或审核失效 422）、
-     * 译文绑定当前术语版本（过期 422）且满足当前术语规则（违规 422 并返回全部违规术语），
-     * 全部通过后原子生成完整只读快照（固化术语版本与实际规则集）并递增发布版本；
+     * 译文绑定当前术语版本（过期 422）、满足有效冻结的译法约束（违规 422 并稳定列出段落与术语）
+     * 且满足当前术语规则（违规 422 并返回全部违规术语），
+     * 全部通过后原子生成完整只读快照（固化术语版本与实际规则集、所用冻结版本与冻结条目）并递增发布版本；
      * 任何失败回滚，不产生部分快照。
      */
     @Transactional
@@ -194,6 +215,11 @@ public class TranslationService {
         Map<String, ApprovalRow> approvals = repository.listApprovals(documentId).stream()
                 .collect(Collectors.toMap(a -> key(a.segmentId(), a.language()), Function.identity()));
         List<TermRuleRow> termRules = repository.listTermRules(documentId, document.termVersion());
+        Optional<TermFreezeRow> freeze = repository.findActiveTermFreeze(documentId, document.termVersion());
+        List<FreezeEntry> freezeEntries = freeze
+                .map(f -> loadFreezeEntries(documentId, f.freezeVersion()))
+                .orElse(List.of());
+        List<ApiDtos.FreezeViolationView> freezeViolations = new ArrayList<>();
         List<ApiDtos.TermRuleView> termViolations = new ArrayList<>();
         for (SegmentRow segment : segments) {
             for (String language : document.targetLanguages()) {
@@ -224,14 +250,21 @@ public class TranslationService {
                 }
                 termViolations.addAll(findViolations(
                         segment.sourceText(), language, translation.content(), termRules));
+                freezeViolations.addAll(findFreezeViolations(
+                        segment, language, translation.content(), freezeEntries));
             }
+        }
+        if (!freezeViolations.isEmpty()) {
+            throw ApiException.freezeViolation(
+                    "译文违反 " + freezeViolations.size() + " 条冻结译法", freezeViolations);
         }
         if (!termViolations.isEmpty()) {
             throw ApiException.termViolation("译文违反 " + termViolations.size() + " 条术语规则", termViolations);
         }
         int publishedVersion = document.publishedVersion() + 1;
         repository.insertSnapshot(documentId, publishedVersion,
-                buildSnapshotJson(document, publishedVersion, segments, translations, approvals, termRules));
+                buildSnapshotJson(document, publishedVersion, segments, translations, approvals, termRules,
+                        freeze.orElse(null), freezeEntries));
         repository.updatePublishedVersion(documentId, publishedVersion);
         return new ApiDtos.PublishResponse(documentId, publishedVersion);
     }
@@ -347,15 +380,20 @@ public class TranslationService {
         return new ApiDtos.TermRuleView(rule.sourceTerm(), rule.language(), rule.requiredTranslation());
     }
 
-    /** 生成完整只读快照 JSON：全部段落源文及各语言译文、作者、审核人、版本号与固化的术语版本及规则集。 */
+    /**
+     * 生成完整只读快照 JSON：全部段落源文及各语言译文、作者、审核人、版本号、
+     * 固化的术语版本及规则集，以及发布时所用冻结版本与冻结条目（无有效冻结时 freezeVersion 为 null）。
+     */
     private String buildSnapshotJson(DocumentRow document, int publishedVersion, List<SegmentRow> segments,
                                      Map<String, TranslationRow> translations,
-                                     Map<String, ApprovalRow> approvals, List<TermRuleRow> termRules) {
+                                     Map<String, ApprovalRow> approvals, List<TermRuleRow> termRules,
+                                     TermFreezeRow freeze, List<FreezeEntry> freezeEntries) {
         Map<String, Object> snapshot = new LinkedHashMap<>();
         snapshot.put("documentId", document.documentId());
         snapshot.put("publishedVersion", publishedVersion);
         snapshot.put("draftVersion", document.draftVersion());
         snapshot.put("termVersion", document.termVersion());
+        snapshot.put("freezeVersion", freeze == null ? null : freeze.freezeVersion());
         snapshot.put("targetLanguages", document.targetLanguages());
         List<Map<String, Object>> termList = new ArrayList<>();
         for (TermRuleRow rule : termRules) {
@@ -366,6 +404,15 @@ public class TranslationService {
             termList.add(termJson);
         }
         snapshot.put("terms", termList);
+        List<Map<String, Object>> freezeEntryList = new ArrayList<>();
+        for (FreezeEntry entry : freezeEntries) {
+            Map<String, Object> entryJson = new LinkedHashMap<>();
+            entryJson.put("sourceTerm", entry.sourceTerm());
+            entryJson.put("language", entry.language());
+            entryJson.put("allowedTranslations", entry.allowedTranslations());
+            freezeEntryList.add(entryJson);
+        }
+        snapshot.put("freezeEntries", freezeEntryList);
         List<Map<String, Object>> segmentList = new ArrayList<>();
         for (SegmentRow segment : segments) {
             Map<String, Object> segmentJson = new LinkedHashMap<>();
@@ -395,5 +442,307 @@ public class TranslationService {
         } catch (Exception e) {
             throw new IllegalStateException("快照序列化失败", e);
         }
+    }
+
+    /**
+     * 创建术语冻结：冻结绑定当前术语版本（即冻结针对的文档版本），条目规范化后不可原地修改；
+     * 同一术语版本只允许一份有效冻结（已存在 409 FREEZE_EXISTS）；
+     * freezeKey 全局唯一，指纹含文档 ID、术语版本、规范化条目、操作者与状态，
+     * 同键同指纹重放原结果，同键异指纹 409，失败不占键。冻结创建不变更草稿版本。
+     */
+    @Transactional
+    public ApiDtos.FreezeResponse createFreeze(long documentId, String actorId,
+                                               ApiDtos.CreateFreezeRequest request) {
+        DocumentRow document = lockDocument(documentId);
+        List<FreezeEntry> entries = normalizeFreezeEntries(request.entries(), document);
+        String fingerprint = freezeFingerprint(document, entries, actorId);
+        Optional<TermFreezeRow> existing = repository.findTermFreezeByKey(request.freezeKey());
+        if (existing.isPresent()) {
+            return replayFreeze(existing.get(), fingerprint, request.freezeKey(), entries.size());
+        }
+        if (repository.findActiveTermFreeze(documentId, document.termVersion()).isPresent()) {
+            throw new ApiException(HttpStatus.CONFLICT, "FREEZE_EXISTS",
+                    "当前术语版本 " + document.termVersion() + " 已存在有效冻结: " + documentId);
+        }
+        int freezeVersion = repository.findMaxFreezeVersion(documentId) + 1;
+        try {
+            repository.insertTermFreeze(documentId, freezeVersion, document.termVersion(),
+                    request.freezeKey(), fingerprint, actorId);
+        } catch (DuplicateKeyException e) {
+            // 并发唯一约束冲突：同 freezeKey 重读按指纹裁决；同版本有效冻结冲突报 FREEZE_EXISTS
+            Optional<TermFreezeRow> byKey = repository.findTermFreezeByKey(request.freezeKey());
+            if (byKey.isPresent()) {
+                return replayFreeze(byKey.get(), fingerprint, request.freezeKey(), entries.size());
+            }
+            throw new ApiException(HttpStatus.CONFLICT, "FREEZE_EXISTS",
+                    "当前术语版本 " + document.termVersion() + " 已存在有效冻结: " + documentId);
+        }
+        for (FreezeEntry entry : entries) {
+            for (String allowed : entry.allowedTranslations()) {
+                repository.insertTermFreezeEntry(documentId, freezeVersion,
+                        new TermFreezeEntryRow(entry.sourceTerm(), entry.language(), allowed));
+            }
+        }
+        return new ApiDtos.FreezeResponse(documentId, freezeVersion, document.termVersion(),
+                "ACTIVE", fingerprint, entries.size());
+    }
+
+    /**
+     * 撤销冻结：仅可撤销 ACTIVE 冻结（重复撤销 409 FREEZE_ALREADY_REVOKED）；
+     * 撤销只影响后续修订与发布，不重写既有发布快照，冻结条目保持不可变。撤销不变更草稿版本。
+     */
+    @Transactional
+    public ApiDtos.FreezeResponse revokeFreeze(long documentId, int freezeVersion, String actorId,
+                                               ApiDtos.RevokeFreezeRequest request) {
+        lockDocument(documentId);
+        TermFreezeRow freeze = repository.findTermFreeze(documentId, freezeVersion)
+                .orElseThrow(() -> ApiException.notFound("冻结不存在: " + documentId + "/" + freezeVersion));
+        if (!"ACTIVE".equals(freeze.status())) {
+            throw new ApiException(HttpStatus.CONFLICT, "FREEZE_ALREADY_REVOKED",
+                    "冻结已撤销: " + documentId + "/" + freezeVersion);
+        }
+        repository.revokeTermFreeze(documentId, freezeVersion, actorId);
+        int entryCount = loadFreezeEntries(documentId, freezeVersion).size();
+        return new ApiDtos.FreezeResponse(documentId, freezeVersion, freeze.termVersion(),
+                "REVOKED", freeze.fingerprint(), entryCount);
+    }
+
+    /** 查询当前术语版本的有效冻结及完整条目；无有效冻结返回 404 NO_ACTIVE_FREEZE。 */
+    @Transactional(readOnly = true)
+    public ApiDtos.FreezeView getCurrentFreeze(long documentId) {
+        DocumentRow document = repository.findDocument(documentId)
+                .orElseThrow(() -> ApiException.notFound("文档不存在: " + documentId));
+        TermFreezeRow freeze = repository.findActiveTermFreeze(documentId, document.termVersion())
+                .orElseThrow(() -> ApiException.noActiveFreeze(
+                        "当前术语版本 " + document.termVersion() + " 无有效冻结: " + documentId));
+        return toFreezeView(freeze, loadFreezeEntries(documentId, freeze.freezeVersion()));
+    }
+
+    /** 查询指定冻结版本的冻结内容（含已撤销与已失效的历史冻结）；不存在返回 404。 */
+    @Transactional(readOnly = true)
+    public ApiDtos.FreezeView getFreeze(long documentId, int freezeVersion) {
+        repository.findDocument(documentId)
+                .orElseThrow(() -> ApiException.notFound("文档不存在: " + documentId));
+        TermFreezeRow freeze = repository.findTermFreeze(documentId, freezeVersion)
+                .orElseThrow(() -> ApiException.notFound("冻结不存在: " + documentId + "/" + freezeVersion));
+        return toFreezeView(freeze, loadFreezeEntries(documentId, freezeVersion));
+    }
+
+    /**
+     * 冻结段落诊断：对当前有效冻结，逐段落逐语言列出命中的冻结术语及合规情况（含缺译文段落）；
+     * 无有效冻结返回 404。仅输出命中术语的段落与语言，按段落、语言、术语稳定排序。
+     */
+    @Transactional(readOnly = true)
+    public ApiDtos.FreezeDiagnosticsResponse getFreezeDiagnostics(long documentId) {
+        DocumentRow document = repository.findDocument(documentId)
+                .orElseThrow(() -> ApiException.notFound("文档不存在: " + documentId));
+        TermFreezeRow freeze = repository.findActiveTermFreeze(documentId, document.termVersion())
+                .orElseThrow(() -> ApiException.noActiveFreeze(
+                        "当前术语版本 " + document.termVersion() + " 无有效冻结: " + documentId));
+        List<FreezeEntry> entries = loadFreezeEntries(documentId, freeze.freezeVersion());
+        Map<String, TranslationRow> translations = repository.listTranslations(documentId).stream()
+                .collect(Collectors.toMap(t -> key(t.segmentId(), t.language()), Function.identity()));
+        List<ApiDtos.SegmentFreezeDiagnostics> diagnostics = new ArrayList<>();
+        for (SegmentRow segment : repository.listSegments(documentId)) {
+            for (String language : document.targetLanguages()) {
+                TranslationRow translation = translations.get(key(segment.segmentId(), language));
+                List<ApiDtos.FreezeHitView> hits = new ArrayList<>();
+                for (FreezeEntry entry : entries) {
+                    if (entry.language().equals(language)
+                            && segment.sourceText().contains(entry.sourceTerm())) {
+                        boolean satisfied = translation != null && entry.allowedTranslations().stream()
+                                .anyMatch(translation.content()::contains);
+                        hits.add(new ApiDtos.FreezeHitView(entry.sourceTerm(),
+                                entry.allowedTranslations(), satisfied));
+                    }
+                }
+                if (!hits.isEmpty()) {
+                    diagnostics.add(new ApiDtos.SegmentFreezeDiagnostics(segment.segmentId(), language,
+                            translation == null ? null : translation.translationVersion(), hits));
+                }
+            }
+        }
+        return new ApiDtos.FreezeDiagnosticsResponse(documentId, freeze.freezeVersion(), diagnostics);
+    }
+
+    /**
+     * 批量译文修订：整批原子提交或回滚。先校验语言、段落与源文版本，再按最终段落版本
+     * 校验每个命中冻结术语均采用冻结译法（任一违反 422 FREEZE_VIOLATION，稳定列出段落与术语，
+     * 整批修订回滚、不产生任何发布候选快照），然后复核既有术语规则；
+     * 全部通过后统一写入译文并将草稿版本加一。
+     */
+    @Transactional
+    public ApiDtos.BatchRevisionsResponse submitRevisionBatch(long documentId, String actorId,
+                                                              ApiDtos.BatchRevisionsRequest request) {
+        DocumentRow document = lockDocument(documentId);
+        List<ValidatedRevision> revisions = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        for (ApiDtos.RevisionInput input : request.revisions()) {
+            String language = normalizeLanguage(input.language());
+            if (!document.targetLanguages().contains(language)) {
+                throw ApiException.unprocessable("语言不在文档目标语言中: " + language);
+            }
+            if (!seen.add(input.segmentId() + " " + language)) {
+                throw ApiException.unprocessable("批次内重复修订: " + input.segmentId() + "/" + language);
+            }
+            SegmentRow segment = findSegmentOrThrow(documentId, input.segmentId());
+            if (input.sourceVersion() != segment.sourceVersion()) {
+                throw ApiException.unprocessable("段落 " + input.segmentId() + " 的源文版本 "
+                        + input.sourceVersion() + " 与当前源文版本 " + segment.sourceVersion() + " 不匹配");
+            }
+            revisions.add(new ValidatedRevision(segment, language, input.content()));
+        }
+        Optional<TermFreezeRow> freeze = repository.findActiveTermFreeze(documentId, document.termVersion());
+        if (freeze.isPresent()) {
+            List<FreezeEntry> entries = loadFreezeEntries(documentId, freeze.get().freezeVersion());
+            List<ApiDtos.FreezeViolationView> violations = new ArrayList<>();
+            for (ValidatedRevision revision : revisions) {
+                violations.addAll(findFreezeViolations(
+                        revision.segment(), revision.language(), revision.content(), entries));
+            }
+            if (!violations.isEmpty()) {
+                // 按段落、语言、术语稳定排序，保证同一批次重放时违规列表一致
+                violations.sort(Comparator.comparing(ApiDtos.FreezeViolationView::segmentId)
+                        .thenComparing(ApiDtos.FreezeViolationView::language)
+                        .thenComparing(ApiDtos.FreezeViolationView::sourceTerm));
+                throw ApiException.freezeViolation(
+                        "批量修订违反 " + violations.size() + " 条冻结译法", violations);
+            }
+        }
+        List<TermRuleRow> termRules = repository.listTermRules(documentId, document.termVersion());
+        for (ValidatedRevision revision : revisions) {
+            List<ApiDtos.TermRuleView> termViolations = findViolations(revision.segment().sourceText(),
+                    revision.language(), revision.content(), termRules);
+            if (!termViolations.isEmpty()) {
+                throw ApiException.termViolation("段落 " + revision.segment().segmentId()
+                        + " 的译文违反 " + termViolations.size() + " 条术语规则", termViolations);
+            }
+        }
+        List<ApiDtos.RevisionResult> results = new ArrayList<>();
+        for (ValidatedRevision revision : revisions) {
+            int translationVersion = repository.findTranslation(documentId,
+                    revision.segment().segmentId(), revision.language())
+                    .map(TranslationRow::translationVersion).orElse(0) + 1;
+            repository.upsertTranslation(documentId, new TranslationRow(revision.segment().segmentId(),
+                    revision.language(), revision.content(), actorId, revision.segment().sourceVersion(),
+                    translationVersion, document.termVersion()));
+            results.add(new ApiDtos.RevisionResult(revision.segment().segmentId(), revision.language(),
+                    translationVersion, revision.segment().sourceVersion()));
+        }
+        int draftVersion = bumpDraftVersion(document);
+        return new ApiDtos.BatchRevisionsResponse(documentId, draftVersion, document.termVersion(), results);
+    }
+
+    /** freezeKey 重放裁决：同指纹返回原冻结结果，异指纹 409。 */
+    private static ApiDtos.FreezeResponse replayFreeze(TermFreezeRow freeze, String fingerprint,
+                                                       String freezeKey, int entryCount) {
+        if (!freeze.fingerprint().equals(fingerprint)) {
+            throw new ApiException(HttpStatus.CONFLICT, "FREEZE_KEY_CONFLICT",
+                    "freezeKey 已使用且冻结内容不同: " + freezeKey);
+        }
+        return new ApiDtos.FreezeResponse(freeze.documentId(), freeze.freezeVersion(),
+                freeze.termVersion(), freeze.status(), freeze.fingerprint(), entryCount);
+    }
+
+    /**
+     * 冻结条目规范化：sourceTerm 去首尾空白、语言小写且须在文档目标语言中、允许译法去空白去重排序；
+     * 规范化后按术语与语言去重（重复 422），并按术语、语言排序保证指纹与存储稳定。
+     */
+    private static List<FreezeEntry> normalizeFreezeEntries(List<ApiDtos.FreezeEntryInput> inputs,
+                                                            DocumentRow document) {
+        List<FreezeEntry> entries = new ArrayList<>();
+        Set<List<String>> seen = new HashSet<>();
+        for (ApiDtos.FreezeEntryInput input : inputs) {
+            String sourceTerm = input.sourceTerm().trim();
+            if (sourceTerm.isEmpty()) {
+                throw ApiException.unprocessable("sourceTerm 规范化后为空");
+            }
+            String language = normalizeLanguage(input.language());
+            if (!document.targetLanguages().contains(language)) {
+                throw ApiException.unprocessable("冻结条目语言不在文档目标语言中: " + language);
+            }
+            List<String> allowed = input.allowedTranslations().stream()
+                    .map(String::trim)
+                    .filter(a -> !a.isEmpty())
+                    .distinct()
+                    .sorted()
+                    .toList();
+            if (allowed.isEmpty()) {
+                throw ApiException.unprocessable("允许译法规范化后为空: " + sourceTerm + "/" + language);
+            }
+            if (!seen.add(List.of(sourceTerm, language))) {
+                throw ApiException.unprocessable("冻结条目重复: " + sourceTerm + "/" + language);
+            }
+            entries.add(new FreezeEntry(sourceTerm, language, allowed));
+        }
+        entries.sort(Comparator.comparing(FreezeEntry::sourceTerm).thenComparing(FreezeEntry::language));
+        return entries;
+    }
+
+    /** freezeKey 指纹：文档 ID、术语版本、规范化术语条目、操作者与状态（ACTIVE）的 SHA-256。 */
+    private static String freezeFingerprint(DocumentRow document, List<FreezeEntry> entries, String actorId) {
+        StringBuilder canonical = new StringBuilder()
+                .append("documentId=").append(document.documentId())
+                .append("\ntermVersion=").append(document.termVersion())
+                .append("\nactor=").append(actorId)
+                .append("\nstatus=ACTIVE");
+        for (FreezeEntry entry : entries) {
+            canonical.append('\n').append(entry.sourceTerm()).append('|').append(entry.language())
+                    .append('|').append(String.join(",", entry.allowedTranslations()));
+        }
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            return HexFormat.of().formatHex(digest.digest(canonical.toString().getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 不可用", e);
+        }
+    }
+
+    /** 加载冻结条目并按术语与语言分组；行已按术语、语言、允许译法排序，分组后保持稳定顺序。 */
+    private List<FreezeEntry> loadFreezeEntries(long documentId, int freezeVersion) {
+        Map<List<String>, List<String>> grouped = new LinkedHashMap<>();
+        for (TermFreezeEntryRow row : repository.listTermFreezeEntries(documentId, freezeVersion)) {
+            grouped.computeIfAbsent(List.of(row.sourceTerm(), row.language()), k -> new ArrayList<>())
+                    .add(row.allowedTranslation());
+        }
+        List<FreezeEntry> entries = new ArrayList<>();
+        grouped.forEach((groupKey, allowed) ->
+                entries.add(new FreezeEntry(groupKey.get(0), groupKey.get(1), allowed)));
+        return entries;
+    }
+
+    /**
+     * 冻结违规判定：段落最终源文按 Unicode 原文、区分大小写做连续子串匹配命中冻结术语；
+     * 译文不含该术语任一允许译法即违规。条目有序，返回该段落该语言下的全部违规。
+     */
+    private static List<ApiDtos.FreezeViolationView> findFreezeViolations(SegmentRow segment, String language,
+                                                                          String content,
+                                                                          List<FreezeEntry> entries) {
+        List<ApiDtos.FreezeViolationView> violations = new ArrayList<>();
+        for (FreezeEntry entry : entries) {
+            if (entry.language().equals(language) && segment.sourceText().contains(entry.sourceTerm())
+                    && entry.allowedTranslations().stream().noneMatch(content::contains)) {
+                violations.add(new ApiDtos.FreezeViolationView(segment.segmentId(), language,
+                        entry.sourceTerm(), entry.allowedTranslations()));
+            }
+        }
+        return violations;
+    }
+
+    private static ApiDtos.FreezeView toFreezeView(TermFreezeRow freeze, List<FreezeEntry> entries) {
+        return new ApiDtos.FreezeView(freeze.documentId(), freeze.freezeVersion(), freeze.termVersion(),
+                freeze.status(), freeze.fingerprint(), freeze.createdBy(),
+                entries.stream()
+                        .map(e -> new ApiDtos.FreezeEntryView(e.sourceTerm(), e.language(),
+                                e.allowedTranslations()))
+                        .toList());
+    }
+
+    /** 冻结条目分组：一个规范化术语在一种语言下的全部允许译法（去重排序）。 */
+    private record FreezeEntry(String sourceTerm, String language, List<String> allowedTranslations) {
+    }
+
+    /** 批量修订中通过基础校验的单条修订。 */
+    private record ValidatedRevision(SegmentRow segment, String language, String content) {
     }
 }
