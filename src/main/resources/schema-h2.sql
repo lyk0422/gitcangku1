@@ -100,3 +100,74 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
 );
+
+CREATE TABLE IF NOT EXISTS plan_versions (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_key VARCHAR(128) NOT NULL,
+    version_no INT NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    base_version_id BIGINT NULL,
+    branch_side VARCHAR(8) NULL,
+    revision INT NOT NULL,
+    left_version_id BIGINT NULL,
+    right_version_id BIGINT NULL,
+    created_by VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    published_at TIMESTAMP(6) NULL,
+    CONSTRAINT uk_plan_version UNIQUE (incident_key, version_no)
+);
+
+CREATE TABLE IF NOT EXISTS plan_tasks (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    version_id BIGINT NOT NULL,
+    task_id VARCHAR(128) NOT NULL,
+    title VARCHAR(512) NOT NULL,
+    assignee VARCHAR(128) NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_plan_task UNIQUE (version_id, task_id)
+);
+
+CREATE TABLE IF NOT EXISTS plan_edges (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    version_id BIGINT NOT NULL,
+    from_task_id VARCHAR(128) NOT NULL,
+    to_incident_key VARCHAR(128) NOT NULL,
+    to_task_id VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_plan_edge UNIQUE (version_id, from_task_id, to_incident_key, to_task_id)
+);
+
+CREATE TABLE IF NOT EXISTS plan_task_executions (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_key VARCHAR(128) NOT NULL,
+    task_id VARCHAR(128) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    assignee VARCHAR(128) NULL,
+    started_by VARCHAR(128) NULL,
+    started_at TIMESTAMP(6) NULL,
+    completed_by VARCHAR(128) NULL,
+    completed_at TIMESTAMP(6) NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_plan_execution UNIQUE (incident_key, task_id)
+);
+
+CREATE TABLE IF NOT EXISTS plan_merges (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    merge_key VARCHAR(128) NOT NULL,
+    request_id VARCHAR(128) NOT NULL,
+    incident_key VARCHAR(128) NOT NULL,
+    base_version_id BIGINT NOT NULL,
+    left_version_id BIGINT NOT NULL,
+    right_version_id BIGINT NOT NULL,
+    result_version_id BIGINT NOT NULL,
+    request_hash VARCHAR(64) NOT NULL,
+    diff_json CLOB NOT NULL,
+    resolutions_json CLOB NOT NULL,
+    final_tasks_json CLOB NOT NULL,
+    final_edges_json CLOB NOT NULL,
+    created_by VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_plan_merge_key UNIQUE (merge_key),
+    CONSTRAINT uk_plan_merge_request UNIQUE (request_id)
+);
