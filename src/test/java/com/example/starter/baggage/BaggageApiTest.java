@@ -43,6 +43,8 @@ class BaggageApiTest {
     void cleanDatabase() {
         jdbcTemplate.update("DELETE FROM bag_event");
         jdbcTemplate.update("DELETE FROM load_record");
+        jdbcTemplate.update("DELETE FROM container_occupancy");
+        jdbcTemplate.update("DELETE FROM cutoff_exception");
         jdbcTemplate.update("DELETE FROM bag_itinerary");
         jdbcTemplate.update("DELETE FROM bag");
         jdbcTemplate.update("DELETE FROM leg");
@@ -223,7 +225,8 @@ class BaggageApiTest {
     void idempotency_replaysSameKeySameParams() throws Exception {
         String requestId = UUID.randomUUID().toString();
         Map<String, Object> body = Map.of(
-                "requestId", requestId, "legId", "LEG1", "origin", "PEK", "destination", "SHA");
+                "requestId", requestId, "legId", "LEG1", "origin", "PEK", "destination", "SHA",
+                "departureAt", "2099-01-01T00:00:00Z");
         postJson("/api/legs", body).andExpect(status().isCreated())
                 .andExpect(jsonPath("$.version").value(1));
         // 同键同参重放：返回原成功结果，不产生第二条航段
@@ -237,7 +240,8 @@ class BaggageApiTest {
         registerBag("BAG1", List.of("LEG1")).andExpect(status().isCreated());
         String loadRequestId = UUID.randomUUID().toString();
         Map<String, Object> loadBody = Map.of(
-                "requestId", loadRequestId, "expectedVersion", 1, "bagTags", List.of("BAG1"));
+                "requestId", loadRequestId, "expectedVersion", 1,
+                "operator", "tester", "containerId", "ULD-LEG1", "bagTags", List.of("BAG1"));
         postJson("/api/legs/LEG1/load", loadBody).andExpect(status().isOk())
                 .andExpect(jsonPath("$.version").value(2));
         postJson("/api/legs/LEG1/load", loadBody).andExpect(status().isOk())
@@ -250,9 +254,11 @@ class BaggageApiTest {
     void idempotency_sameKeyDifferentParamsReturns409() throws Exception {
         String requestId = UUID.randomUUID().toString();
         postJson("/api/legs", Map.of("requestId", requestId, "legId", "LEG1",
-                "origin", "PEK", "destination", "SHA")).andExpect(status().isCreated());
+                "origin", "PEK", "destination", "SHA", "departureAt", "2099-01-01T00:00:00Z"))
+                .andExpect(status().isCreated());
         postJson("/api/legs", Map.of("requestId", requestId, "legId", "LEG2",
-                "origin", "PEK", "destination", "SHA")).andExpect(status().isConflict());
+                "origin", "PEK", "destination", "SHA", "departureAt", "2099-01-01T00:00:00Z"))
+                .andExpect(status().isConflict());
     }
 
     @Test
@@ -263,14 +269,17 @@ class BaggageApiTest {
         String requestId = UUID.randomUUID().toString();
         // 先以错误版本失败（409），不占键
         postJson("/api/legs/LEG1/load", Map.of("requestId", requestId,
-                "expectedVersion", 99, "bagTags", List.of("BAG1"))).andExpect(status().isConflict());
+                "expectedVersion", 99, "operator", "tester", "containerId", "ULD-LEG1",
+                "bagTags", List.of("BAG1"))).andExpect(status().isConflict());
         // 再以业务失败（422），同样不占键
         postJson("/api/legs/LEG1/load", Map.of("requestId", requestId,
-                "expectedVersion", 1, "bagTags", List.of("BAG_MISSING")))
+                "expectedVersion", 1, "operator", "tester", "containerId", "ULD-LEG1",
+                "bagTags", List.of("BAG_MISSING")))
                 .andExpect(status().isUnprocessableEntity());
         // 修正参数后同键成功
         postJson("/api/legs/LEG1/load", Map.of("requestId", requestId,
-                "expectedVersion", 1, "bagTags", List.of("BAG1"))).andExpect(status().isOk())
+                "expectedVersion", 1, "operator", "tester", "containerId", "ULD-LEG1",
+                "bagTags", List.of("BAG1"))).andExpect(status().isOk())
                 .andExpect(jsonPath("$.version").value(2));
     }
 
@@ -282,7 +291,8 @@ class BaggageApiTest {
 
     private ResultActions registerLeg(String legId, String origin, String destination) throws Exception {
         return postJson("/api/legs", Map.of("requestId", UUID.randomUUID().toString(),
-                "legId", legId, "origin", origin, "destination", destination));
+                "legId", legId, "origin", origin, "destination", destination,
+                "departureAt", "2099-01-01T00:00:00Z"));
     }
 
     private ResultActions registerBag(String bagTag, List<String> legIds) throws Exception {
@@ -293,7 +303,9 @@ class BaggageApiTest {
     private ResultActions load(String legId, int expectedVersion, List<String> bagTags) throws Exception {
         return postJson("/api/legs/" + legId + "/load", Map.of(
                 "requestId", UUID.randomUUID().toString(),
-                "expectedVersion", expectedVersion, "bagTags", bagTags));
+                "expectedVersion", expectedVersion,
+                "operator", "tester", "containerId", "ULD-" + legId,
+                "bagTags", bagTags));
     }
 
     private ResultActions seal(String legId, int expectedVersion) throws Exception {

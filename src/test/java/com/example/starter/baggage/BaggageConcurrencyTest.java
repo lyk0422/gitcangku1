@@ -45,6 +45,8 @@ class BaggageConcurrencyTest {
     void setUp() {
         jdbcTemplate.update("DELETE FROM bag_event");
         jdbcTemplate.update("DELETE FROM load_record");
+        jdbcTemplate.update("DELETE FROM container_occupancy");
+        jdbcTemplate.update("DELETE FROM cutoff_exception");
         jdbcTemplate.update("DELETE FROM bag_itinerary");
         jdbcTemplate.update("DELETE FROM bag");
         jdbcTemplate.update("DELETE FROM leg");
@@ -65,8 +67,7 @@ class BaggageConcurrencyTest {
 
         List<Callable<Object>> tasks = new ArrayList<>();
         for (int i = 0; i < 4; i++) {
-            tasks.add(() -> baggageService.load("LEG1",
-                    new LoadRequest(UUID.randomUUID().toString(), 1, List.of("BAG1"))));
+            tasks.add(() -> baggageService.load("LEG1", loadRequest(1, List.of("BAG1"))));
         }
         List<Object> results = runConcurrently(tasks);
 
@@ -92,11 +93,10 @@ class BaggageConcurrencyTest {
         registerLeg("LEG1", "PEK", "SHA");
         registerBag("BAG1", List.of("LEG1"));
         registerBag("BAG2", List.of("LEG1"));
-        baggageService.load("LEG1", new LoadRequest(UUID.randomUUID().toString(), 1, List.of("BAG1")));
+        baggageService.load("LEG1", loadRequest(1, List.of("BAG1")));
 
         List<Callable<Object>> tasks = List.of(
-                () -> baggageService.load("LEG1",
-                        new LoadRequest(UUID.randomUUID().toString(), 2, List.of("BAG2"))),
+                () -> baggageService.load("LEG1", loadRequest(2, List.of("BAG2"))),
                 () -> baggageService.seal("LEG1",
                         new SealRequest(UUID.randomUUID().toString(), 2)));
         List<Object> results = runConcurrently(tasks);
@@ -138,7 +138,7 @@ class BaggageConcurrencyTest {
         List<Callable<Object>> tasks = new ArrayList<>();
         for (int i = 0; i < 6; i++) {
             tasks.add(() -> baggageService.load("LEG1",
-                    new LoadRequest(requestId, 1, List.of("BAG1"))));
+                    new LoadRequest(requestId, 1, "tester", "ULD-CONCURRENT", List.of("BAG1"))));
         }
         List<Object> results = runConcurrently(tasks);
 
@@ -159,11 +159,17 @@ class BaggageConcurrencyTest {
 
     private void registerLeg(String legId, String origin, String destination) {
         baggageService.registerLeg(
-                new RegisterLegRequest(UUID.randomUUID().toString(), legId, origin, destination));
+                new RegisterLegRequest(UUID.randomUUID().toString(), legId, origin, destination,
+                        java.time.Instant.parse("2099-01-01T00:00:00Z")));
     }
 
     private void registerBag(String bagTag, List<String> legIds) {
         baggageService.registerBag(new RegisterBagRequest(UUID.randomUUID().toString(), bagTag, legIds));
+    }
+
+    private LoadRequest loadRequest(int expectedVersion, List<String> bagTags) {
+        return new LoadRequest(UUID.randomUUID().toString(), expectedVersion,
+                "tester", "ULD-CONCURRENT", bagTags);
     }
 
     /** 同步起跑并发执行任务，结果按提交顺序返回（异常包装为返回值）。 */

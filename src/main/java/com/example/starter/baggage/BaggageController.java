@@ -14,17 +14,22 @@ import org.springframework.web.bind.annotation.RestController;
 import com.example.starter.baggage.BaggageDtos.ArriveRequest;
 import com.example.starter.baggage.BaggageDtos.ArriveResponse;
 import com.example.starter.baggage.BaggageDtos.BagResponse;
+import com.example.starter.baggage.BaggageDtos.CutoffExceptionListResponse;
+import com.example.starter.baggage.BaggageDtos.CutoffResponse;
+import com.example.starter.baggage.BaggageDtos.CutoffUpdateRequest;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveRequest;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveResponse;
 import com.example.starter.baggage.BaggageDtos.LegDifferenceResponse;
 import com.example.starter.baggage.BaggageDtos.LegResponse;
 import com.example.starter.baggage.BaggageDtos.LoadRequest;
 import com.example.starter.baggage.BaggageDtos.LoadResponse;
+import com.example.starter.baggage.BaggageDtos.LoadStatusResponse;
 import com.example.starter.baggage.BaggageDtos.ManifestResponse;
 import com.example.starter.baggage.BaggageDtos.RecoverRequest;
 import com.example.starter.baggage.BaggageDtos.RecoverResponse;
 import com.example.starter.baggage.BaggageDtos.RegisterBagRequest;
 import com.example.starter.baggage.BaggageDtos.RegisterLegRequest;
+import com.example.starter.baggage.BaggageDtos.RerouteRequest;
 import com.example.starter.baggage.BaggageDtos.SealRequest;
 import com.example.starter.baggage.BaggageDtos.SealResponse;
 import com.example.starter.baggage.BaggageDtos.ShortListResponse;
@@ -107,5 +112,36 @@ public class BaggageController {
     @GetMapping("/bags/short-unloaded")
     public ShortListResponse listShortUnloaded() {
         return baggageService.listShortUnloaded();
+    }
+
+    /** 配置航段 UTC 截载时刻：必须早于起飞时刻；超截载装载写入不可变例外清单。 */
+    @PostMapping("/legs/{legId}/cutoff")
+    public CutoffResponse updateCutoff(@PathVariable String legId,
+                                       @Valid @RequestBody CutoffUpdateRequest request) {
+        return baggageService.updateCutoff(legId, request);
+    }
+
+    /** 航段截载配置查询。 */
+    @GetMapping("/legs/{legId}/cutoff")
+    public CutoffResponse getCutoff(@PathVariable String legId) {
+        return baggageService.getCutoff(legId);
+    }
+
+    /** 超截载例外清单查询。 */
+    @GetMapping("/legs/{legId}/cutoff-exceptions")
+    public CutoffExceptionListResponse listCutoffExceptions(@PathVariable String legId) {
+        return baggageService.listCutoffExceptions(legId);
+    }
+
+    /** 剩余行程改派：改派后后续装载使用新航段截载时刻。 */
+    @PostMapping("/bags/{bagTag}/reroute")
+    public BagResponse reroute(@PathVariable String bagTag, @Valid @RequestBody RerouteRequest request) {
+        return baggageService.reroute(bagTag, request);
+    }
+
+    /** 行李装载状态查询。 */
+    @GetMapping("/bags/{bagTag}/load-status")
+    public LoadStatusResponse getLoadStatus(@PathVariable String bagTag) {
+        return baggageService.getLoadStatus(bagTag);
     }
 }

@@ -1,5 +1,6 @@
 package com.example.starter.baggage;
 
+import java.time.Instant;
 import java.util.List;
 
 import jakarta.validation.constraints.NotBlank;
@@ -14,12 +15,13 @@ public final class BaggageDtos {
     private BaggageDtos() {
     }
 
-    /** 登记航段请求。 */
+    /** 登记航段请求：departureAt 为起飞时刻（UTC，ISO-8601）。 */
     public record RegisterLegRequest(
             @NotBlank(message = "requestId 不能为空") String requestId,
             @NotBlank(message = "legId 不能为空") String legId,
             @NotBlank(message = "origin 不能为空") String origin,
-            @NotBlank(message = "destination 不能为空") String destination) {
+            @NotBlank(message = "destination 不能为空") String destination,
+            @NotNull(message = "departureAt 不能为空") Instant departureAt) {
     }
 
     /** 登记行李请求：legIds 为 1~5 个有序航段。 */
@@ -30,10 +32,12 @@ public final class BaggageDtos {
             @Size(min = 1, max = 5, message = "行程航段数必须为 1~5") List<@NotBlank(message = "航段不能为空") String> legIds) {
     }
 
-    /** 批量装载请求：1~20 个不重复 bagTag。 */
+    /** 批量装载请求：1~20 个不重复 bagTag；operator 为操作者，containerId 为装载容器（ULD）。 */
     public record LoadRequest(
             @NotBlank(message = "requestId 不能为空") String requestId,
             @NotNull(message = "expectedVersion 不能为空") Integer expectedVersion,
+            @NotBlank(message = "operator 不能为空") String operator,
+            @NotBlank(message = "containerId 不能为空") String containerId,
             @NotNull(message = "bagTags 不能为空")
             @Size(min = 1, max = 20, message = "批量装载数量必须为 1~20") List<@NotBlank(message = "bagTag 不能为空") String> bagTags) {
     }
@@ -65,9 +69,23 @@ public final class BaggageDtos {
             @NotBlank(message = "actualStation 不能为空") String actualStation) {
     }
 
-    /** 航段响应。 */
+    /** 截载配置请求：cutoffAt 为 UTC 截载时刻（ISO-8601），必须早于航段起飞时刻。 */
+    public record CutoffUpdateRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotNull(message = "expectedVersion 不能为空") Integer expectedVersion,
+            @NotNull(message = "cutoffAt 不能为空") Instant cutoffAt) {
+    }
+
+    /** 剩余行程改派请求：legIds 为 1~5 个有序新航段，首段始发站须等于行李当前所在站。 */
+    public record RerouteRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotNull(message = "legIds 不能为空")
+            @Size(min = 1, max = 5, message = "改派航段数必须为 1~5") List<@NotBlank(message = "航段不能为空") String> legIds) {
+    }
+
+    /** 航段响应：departureAt/cutoffAt 为 UTC 时刻字符串，cutoffAt 未配置为 null。 */
     public record LegResponse(String legId, String origin, String destination,
-                              String status, int version) {
+                              String status, int version, String departureAt, String cutoffAt) {
     }
 
     /** 行程明细项。 */
@@ -124,5 +142,26 @@ public final class BaggageDtos {
 
     /** 未补到清单响应。 */
     public record ShortListResponse(List<ShortItem> shortUnloaded) {
+    }
+
+    /** 航段截载配置响应：cutoffAt 未配置为 null。 */
+    public record CutoffResponse(String legId, String status, int version,
+                                 String departureAt, String cutoffAt) {
+    }
+
+    /** 超截载例外清单项：loadedAt 为原装载时刻（UTC，不可变），cutoffAt 为触发例外的截载时刻。 */
+    public record CutoffExceptionItem(String bagTag, String loadedAt, String cutoffAt, String recordedAt) {
+    }
+
+    /** 超截载例外清单响应。 */
+    public record CutoffExceptionListResponse(String legId, List<CutoffExceptionItem> exceptions) {
+    }
+
+    /**
+     * 行李装载状态响应：未装载时 loadedLegId/containerId/operator/loadedAt/loadedLegCutoffAt 均为 null。
+     */
+    public record LoadStatusResponse(String bagTag, String status, String currentLocation,
+                                     int nextLegIndex, String loadedLegId, String containerId,
+                                     String operator, String loadedAt, String loadedLegCutoffAt) {
     }
 }

@@ -66,6 +66,8 @@ class BaggageShortUnloadTest {
     void cleanDatabase() {
         jdbcTemplate.update("DELETE FROM bag_event");
         jdbcTemplate.update("DELETE FROM load_record");
+        jdbcTemplate.update("DELETE FROM container_occupancy");
+        jdbcTemplate.update("DELETE FROM cutoff_exception");
         jdbcTemplate.update("DELETE FROM bag_itinerary");
         jdbcTemplate.update("DELETE FROM bag");
         jdbcTemplate.update("DELETE FROM leg");
@@ -408,7 +410,7 @@ class BaggageShortUnloadTest {
                         UUID.randomUUID().toString(), "BAG_SHORT", "LEG1", "SHA")),
                 () -> baggageService.load("LEG2",
                         new LoadRequest(UUID.randomUUID().toString(), 1,
-                                List.of("BAG_OK", "BAG_SHORT"))));
+                                "tester", "ULD-LEG2", List.of("BAG_OK", "BAG_SHORT"))));
         List<Object> results = runConcurrently(tasks);
 
         boolean loadSucceeded = results.stream()
@@ -440,7 +442,8 @@ class BaggageShortUnloadTest {
 
     private void registerLeg(String legId, String origin, String destination) {
         baggageService.registerLeg(
-                new RegisterLegRequest(UUID.randomUUID().toString(), legId, origin, destination));
+                new RegisterLegRequest(UUID.randomUUID().toString(), legId, origin, destination,
+                        Instant.parse("2099-01-01T00:00:00Z")));
     }
 
     private void registerBag(String bagTag, List<String> legIds) {
@@ -450,7 +453,9 @@ class BaggageShortUnloadTest {
     private ResultActions load(String legId, int expectedVersion, List<String> bagTags) throws Exception {
         return postJson("/api/legs/" + legId + "/load", Map.of(
                 "requestId", UUID.randomUUID().toString(),
-                "expectedVersion", expectedVersion, "bagTags", bagTags));
+                "expectedVersion", expectedVersion,
+                "operator", "tester", "containerId", "ULD-" + legId,
+                "bagTags", bagTags));
     }
 
     private ResultActions seal(String legId, int expectedVersion) throws Exception {
