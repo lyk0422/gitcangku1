@@ -11,7 +11,9 @@ package com.example.starter.repo;
  * @param status         ACTIVE / REVOKED
  * @param createdVersion 创建后生效的全局空域版本
  * @param revokedVersion 撤销后生效的全局空域版本；null 表示仍有效
+ * @param configVersion  高度带配置版本，初始 1，每次高度带配置修改加一
  */
 public record ZonePo(String zoneId, int xMin, int yMin, int xMax, int yMax,
-                     String status, long createdVersion, Long revokedVersion) {
+                     String status, long createdVersion, Long revokedVersion,
+                     int configVersion) {
 }

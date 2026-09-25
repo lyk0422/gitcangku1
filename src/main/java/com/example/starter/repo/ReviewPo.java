@@ -14,10 +14,14 @@ import java.util.List;
  * @param conclusion      CLEAR / BLOCKED
  * @param hitZoneIds      命中 zoneId（字典序去重）
  * @param pointsSnapshot  审核时航点不可变快照
+ * @param cruiseAltitudeM 审核时巡航高度快照，米
+ * @param startAt         审核时巡航起始时刻快照，epoch 毫秒（UTC，含）
+ * @param endAt           审核时巡航结束时刻快照，epoch 毫秒（UTC，不含）
  * @param requestId       提交审核的请求标识
  * @param createdAt       创建时间（epoch 毫秒）
  */
 public record ReviewPo(String reviewId, String routeId, int routeVersion, long airspaceVersion,
                        String conclusion, List<String> hitZoneIds, List<Point> pointsSnapshot,
+                       int cruiseAltitudeM, long startAt, long endAt,
                        String requestId, long createdAt) {
 }

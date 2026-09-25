@@ -24,15 +24,32 @@ CREATE TABLE IF NOT EXISTS no_fly_zone (
     y_max            INT NOT NULL COMMENT '矩形上边界（含），单位米，y_min < y_max',
     status           VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE 有效参与审核；REVOKED 已撤销不参与审核',
     created_version  BIGINT NOT NULL COMMENT '创建生效时的全局空域版本',
-    revoked_version  BIGINT NULL COMMENT '撤销生效时的全局空域版本；NULL 表示仍有效'
+    revoked_version  BIGINT NULL COMMENT '撤销生效时的全局空域版本；NULL 表示仍有效',
+    config_version   INT NOT NULL COMMENT '高度带配置版本，初始 1，每次高度带配置修改加一；不推进全局空域版本'
 ) COMMENT = '禁飞区（非退化轴对齐闭矩形，只能创建或撤销）';
+
+-- 区域高度带：左闭右开 [lower_m, upper_m)，同一区域内不得重叠（端点相接合法）；
+-- 高度带边界与标识创建后不可变，只允许上调容量或新增不重叠带
+CREATE TABLE IF NOT EXISTS zone_altitude_band (
+    zone_id     VARCHAR(64) NOT NULL COMMENT '所属禁飞区标识',
+    band_id     VARCHAR(64) NOT NULL COMMENT '高度带标识，区域内唯一',
+    lower_m     INT NOT NULL COMMENT '高度下限（含），单位米',
+    upper_m     INT NOT NULL COMMENT '高度上限（不含），单位米，lower_m < upper_m',
+    capacity    INT NOT NULL COMMENT '同时容量，1~50；只允许上调',
+    touch       BIGINT NOT NULL COMMENT '仅用于占用事务加行级写锁的计数器，无业务含义',
+    created_at  BIGINT NOT NULL COMMENT '创建时间，epoch 毫秒（UTC）',
+    PRIMARY KEY (zone_id, band_id)
+) COMMENT = '区域高度带配置（左闭右开，区域内不重叠）';
 
 -- 航线当前状态：routeId 唯一，版本从 1 开始，替换成功加一
 -- touch 仅用于审核事务对该行产生真实更新以加行级写锁，与替换操作互斥
 CREATE TABLE IF NOT EXISTS route (
-    route_id  VARCHAR(64) PRIMARY KEY COMMENT '航线唯一标识',
-    version   INT NOT NULL COMMENT '当前航线版本，初始 1，每次成功替换加一',
-    touch     BIGINT NOT NULL COMMENT '仅用于审核事务加行级写锁的计数器，无业务含义'
+    route_id          VARCHAR(64) PRIMARY KEY COMMENT '航线唯一标识',
+    version           INT NOT NULL COMMENT '当前航线版本，初始 1，每次成功替换加一',
+    touch             BIGINT NOT NULL COMMENT '仅用于审核事务加行级写锁的计数器，无业务含义',
+    cruise_altitude_m INT NOT NULL COMMENT '巡航高度，单位米',
+    start_at          BIGINT NOT NULL COMMENT '巡航起始时刻，epoch 毫秒（UTC，含）',
+    end_at            BIGINT NOT NULL COMMENT '巡航结束时刻，epoch 毫秒（UTC，不含），start_at < end_at'
 ) COMMENT = '航线当前版本状态';
 
 -- 航线点（当前版本，2~50 个，按 seq 顺序连接）
@@ -53,16 +70,40 @@ CREATE TABLE IF NOT EXISTS review (
     conclusion        VARCHAR(16) NOT NULL COMMENT '保存时的原结论：CLEAR 通过或 BLOCKED 命中，永不改变',
     hit_zone_ids      CLOB NOT NULL COMMENT '命中的全部 zoneId，字典序去重后逗号拼接；未命中为空串',
     points_snapshot   VARCHAR(4000) NOT NULL COMMENT '审核时航点不可变快照，格式 x,y;x,y',
+    cruise_altitude_m INT NOT NULL COMMENT '审核时巡航高度不可变快照，单位米',
+    start_at          BIGINT NOT NULL COMMENT '审核时巡航起始时刻快照，epoch 毫秒（UTC，含）',
+    end_at            BIGINT NOT NULL COMMENT '审核时巡航结束时刻快照，epoch 毫秒（UTC，不含）',
     request_id        VARCHAR(64) NOT NULL COMMENT '提交审核的写操作请求标识',
     created_at        BIGINT NOT NULL COMMENT '创建时间，epoch 毫秒（UTC）'
 ) COMMENT = '审核不可变结果';
 
 CREATE UNIQUE INDEX IF NOT EXISTS ux_review_request ON review (request_id);
 
+-- 高度层占用：关联 CLEAR 审核版本；取消后历史保留（status 置 CANCELLED），容量立即释放
+CREATE TABLE IF NOT EXISTS altitude_occupancy (
+    occupancy_id      VARCHAR(64) PRIMARY KEY COMMENT '占用记录唯一标识',
+    review_id         VARCHAR(64) NOT NULL COMMENT '关联的审核记录标识（创建占用时的审查版本）',
+    route_id          VARCHAR(64) NOT NULL COMMENT '占用航线标识',
+    route_version     INT NOT NULL COMMENT '占用关联的航线版本',
+    airspace_version  BIGINT NOT NULL COMMENT '占用关联的空域版本',
+    zone_id           VARCHAR(64) NOT NULL COMMENT '占用区域标识',
+    band_id           VARCHAR(64) NOT NULL COMMENT '占用高度带标识',
+    cruise_altitude_m INT NOT NULL COMMENT '占用航线巡航高度快照，单位米；落入高度带才消耗容量',
+    start_at          BIGINT NOT NULL COMMENT '占用起始时刻，epoch 毫秒（UTC，含）',
+    end_at            BIGINT NOT NULL COMMENT '占用结束时刻，epoch 毫秒（UTC，不含）',
+    status            VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE 占用中消耗容量；CANCELLED 已取消不消耗容量（历史保留）',
+    request_id        VARCHAR(64) NOT NULL COMMENT '创建占用的写操作请求标识',
+    created_at        BIGINT NOT NULL COMMENT '创建时间，epoch 毫秒（UTC）',
+    cancelled_at      BIGINT NULL COMMENT '取消时间，epoch 毫秒（UTC）；NULL 表示未取消'
+) COMMENT = '高度层占用记录（取消后历史保留）';
+
+CREATE INDEX IF NOT EXISTS ix_occupancy_band_time
+    ON altitude_occupancy (zone_id, band_id, status, start_at, end_at);
+
 -- 写操作幂等去重：同键同参重放原结果，异参冲突；失败不占键
 CREATE TABLE IF NOT EXISTS request_dedup (
     request_id     VARCHAR(64) PRIMARY KEY COMMENT '写操作全局唯一请求标识',
-    request_kind   VARCHAR(32) NOT NULL COMMENT '请求类型：ZONE_CREATE/ZONE_REVOKE/ROUTE_CREATE/ROUTE_REPLACE/REVIEW',
+    request_kind   VARCHAR(32) NOT NULL COMMENT '请求类型：ZONE_CREATE/ZONE_REVOKE/ROUTE_CREATE/ROUTE_REPLACE/REVIEW/ZONE_BANDS_MODIFY/OCCUPANCY_CREATE/OCCUPANCY_CANCEL',
     request_hash   VARCHAR(64) NOT NULL COMMENT '规范化参数的 SHA-256 十六进制摘要，用于同键异参冲突判定',
     response_json  CLOB NOT NULL COMMENT '首次成功响应 JSON，重放时原样返回',
     created_at     BIGINT NOT NULL COMMENT '首次成功时间，epoch 毫秒（UTC）'

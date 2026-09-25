@@ -52,6 +52,7 @@ class AirspaceReviewControllerIT {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {"routeId":"r1","requestId":"req-route-1",
+                                 "cruiseAltitudeM":0,"startAt":0,"endAt":1,
                                  "points":[{"x":0,"y":10},{"x":100,"y":10}]}"""))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.replayed").value(false))
@@ -126,6 +127,7 @@ class AirspaceReviewControllerIT {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {"routeId":"s1","requestId":"req-s-route",
+                                 "cruiseAltitudeM":0,"startAt":0,"endAt":1,
                                  "points":[{"x":0,"y":0},{"x":10,"y":10}]}"""))
                 .andExpect(status().isCreated());
         mockMvc.perform(post("/api/airspace/reviews")
@@ -141,6 +143,7 @@ class AirspaceReviewControllerIT {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {"routeId":"s1","expectedVersion":9,
+                                 "cruiseAltitudeM":0,"startAt":0,"endAt":1,
                                  "points":[{"x":0,"y":0},{"x":1,"y":1}],"requestId":"req-s-bad"}"""))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("VERSION_CONFLICT"));
@@ -150,6 +153,7 @@ class AirspaceReviewControllerIT {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {"routeId":"s1","expectedVersion":1,
+                                 "cruiseAltitudeM":0,"startAt":0,"endAt":1,
                                  "points":[{"x":0,"y":0},{"x":1,"y":1}],"requestId":"req-s-ok"}"""))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.version").value(2));
@@ -220,6 +224,7 @@ class AirspaceReviewControllerIT {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {"routeId":"v2","requestId":"req-v2",
+                                 "cruiseAltitudeM":0,"startAt":0,"endAt":1,
                                  "points":[{"x":0,"y":0}]}"""))
                 .andExpect(status().isBadRequest());
 
