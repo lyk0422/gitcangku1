@@ -15,12 +15,16 @@ import org.springframework.web.bind.annotation.RestController;
 
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
+import com.example.starter.maintenance.api.dto.DeductionsResponse;
+import com.example.starter.maintenance.api.dto.DowntimeResponse;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
+import com.example.starter.maintenance.api.dto.RegisterDowntimeRequest;
 import com.example.starter.maintenance.api.dto.RegisterEquipmentRequest;
 import com.example.starter.maintenance.api.dto.ReviseReadingRequest;
 import com.example.starter.maintenance.api.dto.RevisionView;
+import com.example.starter.maintenance.api.dto.RevokeDowntimeRequest;
 import com.example.starter.maintenance.api.dto.StatusResponse;
 import com.example.starter.maintenance.service.EquipmentService;
 
@@ -69,7 +73,7 @@ public class EquipmentController {
         return service.completeMaintenance(equipmentId, req);
     }
 
-    /** 保养状态：本轮运行分钟 = 最新读数 - 最近保养锚点工时（无保养从 0 计），达到周期即 DUE。 */
+    /** 保养状态：本轮运行分钟 = 最新读数 - 最近保养锚点工时 - 该锚点之后生效停机扣减合计（为负按 0 计），达到周期即 DUE。 */
     @GetMapping("/{equipmentId}/status")
     public StatusResponse getStatus(@PathVariable String equipmentId) {
         return service.getStatus(equipmentId);
@@ -92,5 +96,37 @@ public class EquipmentController {
     @GetMapping("/{equipmentId}/maintenances")
     public List<MaintenanceResponse> listMaintenances(@PathVariable String equipmentId) {
         return service.listMaintenances(equipmentId);
+    }
+
+    /**
+     * 登记停机区间：左闭右开 [startAt, endAt)，结束须晚于开始；起止须落在设备最早与最晚读数
+     * 采样时刻之间，不得跨越已有保养锚点时刻，且不得与同设备生效区间重叠（端点相接合法），违反返回 422。
+     */
+    @PostMapping("/{equipmentId}/downtimes")
+    @ResponseStatus(HttpStatus.CREATED)
+    public DowntimeResponse registerDowntime(@PathVariable String equipmentId,
+                                             @Valid @RequestBody RegisterDowntimeRequest req) {
+        return service.registerDowntime(equipmentId, req);
+    }
+
+    /** 撤销停机区间：撤销后扣减量不再参与计算，原区间记录保留且不可改写；重复撤销返回 409。 */
+    @PostMapping("/{equipmentId}/downtimes/{downtimeKey}/revocation")
+    @ResponseStatus(HttpStatus.CREATED)
+    public DowntimeResponse revokeDowntime(@PathVariable String equipmentId,
+                                           @PathVariable String downtimeKey,
+                                           @Valid @RequestBody RevokeDowntimeRequest req) {
+        return service.revokeDowntime(equipmentId, downtimeKey, req);
+    }
+
+    /** 停机清单（含已撤销记录，按开始时刻升序）。 */
+    @GetMapping("/{equipmentId}/downtimes")
+    public List<DowntimeResponse> listDowntimes(@PathVariable String equipmentId) {
+        return service.listDowntimes(equipmentId);
+    }
+
+    /** 本轮扣减明细：最近保养锚点之后全部生效停机区间的扣减量及合计。 */
+    @GetMapping("/{equipmentId}/deductions")
+    public DeductionsResponse getDeductions(@PathVariable String equipmentId) {
+        return service.getDeductions(equipmentId);
     }
 }
