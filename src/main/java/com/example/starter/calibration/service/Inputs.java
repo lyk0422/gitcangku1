@@ -27,6 +27,11 @@ final class Inputs {
         return value.trim();
     }
 
+    /** 可选文本：null 或空白归一为 null，否则返回去空白后的值。 */
+    static String optionalText(String value) {
+        return value == null || value.isBlank() ? null : value.trim();
+    }
+
     static BigDecimal requireDecimal(String value, String field) {
         if (value == null || !DECIMAL.matcher(value.trim()).matches()) {
             throw ApiException.badRequest(field + " 必须为最多 6 位小数的十进制字符串");

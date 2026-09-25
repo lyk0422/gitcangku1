@@ -1,13 +1,10 @@
 package com.example.starter.calibration.api.dto;
 
 /**
- * 提交测量请求。读数与上下限为最多 6 位小数的十进制字符串。
- * referenceKey 为可选幂等引用键：同键重放返回已有结果，失败不占键；
- * batchId 为可选提交批次，用于后续整批替换标准器。
+ * 批量测量提交中的单条测量。
  *
  * @param measurementKey 业务测量键，全局唯一（幂等键）
- * @param referenceKey   幂等引用键，可缺省
- * @param batchId        提交批次 ID，可缺省
+ * @param referenceKey   幂等引用键，可缺省；同键重放返回已有结果，失败不占键
  * @param instrumentId   仪器 ID
  * @param measuredAt     测量时刻，ISO-8601（按 UTC 归一）
  * @param reading        原始读数，十进制字符串
@@ -15,10 +12,9 @@ package com.example.starter.calibration.api.dto;
  * @param upperLimit     合格上限（含端点），十进制字符串
  * @param submittedBy    提交人
  */
-public record SubmitMeasurementRequest(
+public record BatchMeasurementItem(
         String measurementKey,
         String referenceKey,
-        String batchId,
         String instrumentId,
         String measuredAt,
         String reading,

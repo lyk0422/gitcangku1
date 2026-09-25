@@ -5,10 +5,12 @@ import java.util.List;
 
 import com.example.starter.calibration.api.dto.CertificateResponse;
 import com.example.starter.calibration.api.dto.MeasurementResponse;
+import com.example.starter.calibration.api.dto.MeasurementVersionResponse;
 import com.example.starter.calibration.api.dto.ReleaseRecordResponse;
 import com.example.starter.calibration.model.Certificate;
 import com.example.starter.calibration.model.Measurement;
 import com.example.starter.calibration.model.MeasurementStatus;
+import com.example.starter.calibration.model.MeasurementVersion;
 import com.example.starter.calibration.model.ReleaseRecord;
 
 /**
@@ -36,6 +38,11 @@ final class DtoMapper {
                 cert.validTo(),
                 format(cert.a()),
                 format(cert.b()),
+                cert.certVersion(),
+                format(cert.compensationCoeff()),
+                cert.uncertaintyVersion(),
+                cert.singleBatchOnly(),
+                cert.boundBatchId(),
                 cert.revoked(),
                 cert.revokedAt(),
                 cert.createdAt());
@@ -47,6 +54,8 @@ final class DtoMapper {
         return new MeasurementResponse(
                 m.id(),
                 m.measurementKey(),
+                m.batchId(),
+                m.referenceKey(),
                 m.instrumentId(),
                 m.measuredAt(),
                 format(m.rawReading()),
@@ -54,13 +63,32 @@ final class DtoMapper {
                 format(m.upperLimit()),
                 m.submittedBy(),
                 m.certificateId(),
+                m.certVersion(),
+                format(m.compensationCoeff()),
+                m.uncertaintyVersion(),
                 format(m.computedValue()),
+                format(m.uncertainty()),
                 m.displayValue().toPlainString(),
                 m.passed(),
+                m.version(),
                 m.status().name(),
                 usable,
                 m.createdAt(),
                 releases.stream().map(DtoMapper::toResponse).toList());
+    }
+
+    static MeasurementVersionResponse toResponse(MeasurementVersion v, int currentVersion) {
+        return new MeasurementVersionResponse(
+                v.version(),
+                v.certificateId(),
+                v.certVersion(),
+                format(v.compensationCoeff()),
+                v.uncertaintyVersion(),
+                format(v.computedValue()),
+                format(v.uncertainty()),
+                v.passed(),
+                v.version() == currentVersion,
+                v.createdAt());
     }
 
     static ReleaseRecordResponse toResponse(ReleaseRecord record) {

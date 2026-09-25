@@ -45,4 +45,12 @@ public class ReleaseRepository {
         return jdbc.query("SELECT * FROM release_record WHERE measurement_id = ? ORDER BY id",
                 MAPPER, measurementId);
     }
+
+    /**
+     * 查询某放行批次的全部放行记录（按 ID 升序），用于放行诊断。
+     */
+    public List<ReleaseRecord> findByBatchId(String batchId) {
+        return jdbc.query("SELECT * FROM release_record WHERE batch_id = ? ORDER BY id",
+                MAPPER, batchId);
+    }
 }
