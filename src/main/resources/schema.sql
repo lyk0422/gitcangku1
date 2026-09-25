@@ -59,3 +59,47 @@ CREATE TABLE IF NOT EXISTS conflict_resolution (
     -- 且不可变解决历史必须在任何数据清理/归档场景下继续可查。
     UNIQUE (observation_id, request_id)
 );
+
+-- 观测更正附页表：每个观测记录内 corr_version 从 1 开始递增；原始观测永不覆盖，
+-- 附页保存各字段提交前有效原值（from）与更正值（to），撤销仅置状态、不删行。
+CREATE TABLE IF NOT EXISTS corrigendum (
+    observation_id VARCHAR(64) NOT NULL COMMENT '观测记录唯一标识',
+    corr_version INT NOT NULL COMMENT '附页版本号，每个观测记录内从 1 开始单调递增',
+    base_version INT NOT NULL COMMENT '提交时指定并校验的原观测版本号（须等于提交时当前版本）',
+    diffs VARCHAR(2000) NOT NULL COMMENT '字段差异 JSON 原文：{field:{from,to}}，固定字段顺序 location/reading/note；from 为提交前有效原值，to 为更正值',
+    reason VARCHAR(1024) NOT NULL COMMENT '更正原因',
+    collector VARCHAR(128) NOT NULL COMMENT '采集者标识',
+    corr_key VARCHAR(128) NOT NULL COMMENT '幂等键（与 request_log.request_id 一致），同键重放、失败不占键',
+    status VARCHAR(8) NOT NULL DEFAULT 'VALID' COMMENT '附页状态：VALID 有效 / REVOKED 已撤销；撤销不删行',
+    created_at_utc TIMESTAMP NOT NULL COMMENT '附页提交时刻（UTC）',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录落库时间（服务器时区）',
+    PRIMARY KEY (observation_id, corr_version)
+);
+
+-- 附页撤销记录表：只允许撤销最新版本附页，撤销记录不可变、永不更新或删除。
+CREATE TABLE IF NOT EXISTS corrigendum_revocation (
+    revocation_id VARCHAR(128) NOT NULL COMMENT '全局唯一撤销记录标识',
+    observation_id VARCHAR(64) NOT NULL COMMENT '观测记录唯一标识',
+    corr_version INT NOT NULL COMMENT '被撤销的附页版本号',
+    restored_corr_version INT NULL COMMENT '撤销后恢复到的有效附页版本；NULL 表示无有效附页、恢复原始观测值',
+    corr_key VARCHAR(128) NOT NULL COMMENT '撤销请求幂等键（与 request_log.request_id 一致）',
+    operator VARCHAR(128) NOT NULL COMMENT '执行撤销的操作者标识',
+    reason VARCHAR(1024) NULL COMMENT '撤销原因；NULL 表示未填写',
+    revoked_at_utc TIMESTAMP NOT NULL COMMENT '撤销完成时刻（UTC）',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录落库时间（服务器时区）',
+    PRIMARY KEY (revocation_id)
+);
+
+-- 待复审标记表：观测记录已人工裁决后再发生附页提交/撤销时生成，
+-- 裁决结果本身冻结不改写，仅以标记提示需要复审。
+CREATE TABLE IF NOT EXISTS review_flag (
+    flag_id BIGINT NOT NULL AUTO_INCREMENT COMMENT '待复审标记自增标识',
+    observation_id VARCHAR(64) NOT NULL COMMENT '观测记录唯一标识',
+    resolution_id VARCHAR(128) NOT NULL COMMENT '被标记的裁决记录标识（生成标记时最近一次裁决）',
+    corr_version INT NOT NULL COMMENT '触发标记的附页版本号（撤销事件时为被撤销的附页版本）',
+    event VARCHAR(8) NOT NULL COMMENT '触发事件：SUBMIT 提交附页 / REVOKE 撤销附页',
+    status VARCHAR(8) NOT NULL DEFAULT 'PENDING' COMMENT '标记状态：PENDING 待复审',
+    created_at_utc TIMESTAMP NOT NULL COMMENT '标记生成时刻（UTC）',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录落库时间（服务器时区）',
+    PRIMARY KEY (flag_id)
+);
