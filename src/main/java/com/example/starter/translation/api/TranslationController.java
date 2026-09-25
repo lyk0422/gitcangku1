@@ -92,13 +92,51 @@ public class TranslationController {
                         documentId, segmentId, language, actorId, request))).toResponseEntity();
     }
 
-    /** 发布：全部段落全部目标语言均有有效批准且术语校验通过时原子生成只读快照并递增发布版本。 */
+    /** 发布：逐段落逐语种沿回退链解析已批准译文，任一缺失整次 422；成功原子生成只读快照并递增发布版本。 */
     @PostMapping("/{documentId}/publish")
     public ResponseEntity<String> publish(@PathVariable long documentId,
                                           @Valid @RequestBody ApiDtos.PublishRequest request) {
         String operation = "POST /api/documents/" + documentId + "/publish";
         return writeExecutor.execute(request.requestId(), hash(operation, request),
                 () -> WriteResult.of(201, translationService.publish(documentId, request))).toResponseEntity();
+    }
+
+    /** 配置某目标语种的回退语种：expectedVersion 做乐观校验，全文档回退链须无环，任一不合法整次回滚。 */
+    @PutMapping("/{documentId}/fallbacks/{language}")
+    public ResponseEntity<String> configureFallback(@PathVariable long documentId,
+                                                    @PathVariable String language,
+                                                    @Valid @RequestBody ApiDtos.ConfigureFallbackRequest request) {
+        String operation = "PUT /api/documents/" + documentId + "/fallbacks/" + language;
+        return writeExecutor.execute(request.requestId(), hash(operation, request),
+                () -> WriteResult.of(200, translationService.configureFallback(documentId, language, request)))
+                .toResponseEntity();
+    }
+
+    /** 查询全部目标语种的回退链（含未配置回退的单节点链）。 */
+    @GetMapping("/{documentId}/fallbacks")
+    public ResponseEntity<ApiDtos.FallbackChainsResponse> getFallbackChains(@PathVariable long documentId) {
+        return ResponseEntity.ok(translationService.getFallbackChains(documentId));
+    }
+
+    /** 缺失段诊断：返回沿回退链全部语种均无已批准译文的段落与已尝试语种，稳定排序。 */
+    @GetMapping("/{documentId}/missing-segments")
+    public ResponseEntity<ApiDtos.MissingSegmentsResponse> getMissingSegments(@PathVariable long documentId) {
+        return ResponseEntity.ok(translationService.getMissingSegments(documentId));
+    }
+
+    /** 撤回批准：译文保留但不再处于已批准状态，不影响已发布快照。 */
+    @PostMapping("/{documentId}/segments/{segmentId}/translations/{language}/withdraw")
+    public ResponseEntity<String> withdrawTranslation(@PathVariable long documentId,
+                                                      @PathVariable String segmentId,
+                                                      @PathVariable String language,
+                                                      @RequestHeader("X-Actor-Id") String actorId,
+                                                      @Valid @RequestBody ApiDtos.WithdrawTranslationRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/segments/" + segmentId
+                + "/translations/" + language + "/withdraw";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(200,
+                        translationService.withdrawApproval(documentId, segmentId, language, actorId)))
+                .toResponseEntity();
     }
 
     /** 新增术语版本：不可变快照，术语版本与草稿版本各加一；已有版本不可覆盖。 */

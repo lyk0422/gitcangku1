@@ -41,6 +41,7 @@ public abstract class AbstractIntegrationTest {
         jdbc.update("DELETE FROM release_snapshot");
         jdbc.update("DELETE FROM term_rule");
         jdbc.update("DELETE FROM term_version");
+        jdbc.update("DELETE FROM locale_fallback");
         jdbc.update("DELETE FROM request_log");
         jdbc.update("DELETE FROM document");
     }
@@ -120,6 +121,32 @@ public abstract class AbstractIntegrationTest {
         String body = "{\"requestId\":\"" + requestId + "\",\"expectedDraftVersion\":" + expectedDraftVersion
                 + ",\"expectedPublishedVersion\":" + expectedPublishedVersion + "}";
         return postJson("/api/documents/" + documentId + "/publish", body);
+    }
+
+    /** 发布指定目标语种。 */
+    protected ApiResult publishLanguage(long documentId, int expectedDraftVersion, int expectedPublishedVersion,
+                                        String language, String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"expectedDraftVersion\":" + expectedDraftVersion
+                + ",\"expectedPublishedVersion\":" + expectedPublishedVersion
+                + ",\"language\":\"" + language + "\"}";
+        return postJson("/api/documents/" + documentId + "/publish", body);
+    }
+
+    /** 配置回退语种；fallbackLanguage 为 null 时清除回退。 */
+    protected ApiResult configureFallback(long documentId, String language, int expectedVersion,
+                                          String fallbackLanguage, String requestId) throws Exception {
+        String fallback = fallbackLanguage == null ? "null" : "\"" + fallbackLanguage + "\"";
+        String body = "{\"requestId\":\"" + requestId + "\",\"expectedVersion\":" + expectedVersion
+                + ",\"fallbackLanguage\":" + fallback + "}";
+        return putJson("/api/documents/" + documentId + "/fallbacks/" + language, body);
+    }
+
+    /** 撤回批准。 */
+    protected ApiResult withdraw(long documentId, String segmentId, String language, String actorId,
+                                 String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\"}";
+        return postJson("/api/documents/" + documentId + "/segments/" + segmentId + "/translations/" + language
+                + "/withdraw", body, actorId);
     }
 
     /** 新增术语版本：rulesJson 为规则数组 JSON。 */

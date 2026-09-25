@@ -111,6 +111,19 @@ COMMENT ON COLUMN term_rule.source_term IS '源文术语，Unicode 原文、区�
 COMMENT ON COLUMN term_rule.language IS '目标语言码，小写';
 COMMENT ON COLUMN term_rule.required_translation IS '该术语在目标语言中的必译文本，非空';
 
+CREATE TABLE IF NOT EXISTS locale_fallback (
+    document_id BIGINT NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    fallback_language VARCHAR(16) NOT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (document_id, language)
+);
+COMMENT ON TABLE locale_fallback IS '语种回退链：每个目标语种至多一个回退语种，构成无环有向链；无记录表示该语种无回退';
+COMMENT ON COLUMN locale_fallback.document_id IS '所属文档 ID';
+COMMENT ON COLUMN locale_fallback.language IS '目标语种码，小写；发布该语种译文缺失时沿回退链查找';
+COMMENT ON COLUMN locale_fallback.fallback_language IS '回退语种码，小写；必须是文档已登记目标语种且不得与自身相同';
+COMMENT ON COLUMN locale_fallback.updated_at IS '最近配置时间，数据库默认时区';
+
 CREATE TABLE IF NOT EXISTS request_log (
     request_id VARCHAR(128) PRIMARY KEY,
     request_hash VARCHAR(64) NOT NULL,

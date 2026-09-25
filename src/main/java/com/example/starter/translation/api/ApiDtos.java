@@ -58,11 +58,24 @@ public final class ApiDtos {
             @Positive(message = "translationVersion 必须为正数") int translationVersion) {
     }
 
-    /** 发布请求：携带期望的草稿与发布版本做乐观校验。 */
+    /** 发布请求：携带期望的草稿与发布版本做乐观校验；language 为空时发布全部目标语种。 */
     public record PublishRequest(
             @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
             @Positive(message = "expectedDraftVersion 必须为正数") int expectedDraftVersion,
-            @PositiveOrZero(message = "expectedPublishedVersion 不能为负数") int expectedPublishedVersion) {
+            @PositiveOrZero(message = "expectedPublishedVersion 不能为负数") int expectedPublishedVersion,
+            @Size(max = 16, message = "language 长度不能超过 16") String language) {
+    }
+
+    /** 配置某语种回退语种请求：expectedVersion 为文档当前草稿版本；fallbackLanguage 留空表示清除回退。 */
+    public record ConfigureFallbackRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @Positive(message = "expectedVersion 必须为正数") int expectedVersion,
+            @Size(max = 16, message = "fallbackLanguage 长度不能超过 16") String fallbackLanguage) {
+    }
+
+    /** 撤回批准请求；撤回后该译文不再处于已批准状态，发布需重新批准。 */
+    public record WithdrawTranslationRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId) {
     }
 
     /** 术语规则输入：sourceTerm 区分大小写，requiredTranslation 非空。 */
@@ -104,6 +117,27 @@ public final class ApiDtos {
     public record PublishResponse(long documentId, int publishedVersion) {
     }
 
+    /** 回退配置写操作响应：language 的当前回退语种（null 表示已清除）及新的草稿版本。 */
+    public record FallbackConfigResponse(long documentId, String language, String fallbackLanguage,
+                                         int draftVersion) {
+    }
+
+    /** 单语种回退链视图：从该语种出发逐级展开的有序链（含自身，首个为直接语种）。 */
+    public record FallbackChainView(String language, List<String> chain) {
+    }
+
+    /** 文档全部目标语种的回退链查询响应。 */
+    public record FallbackChainsResponse(long documentId, List<FallbackChainView> chains) {
+    }
+
+    /** 缺失段诊断：某段落沿链全部语种均无已批准译文，记录已尝试语种（含直接语种，有序）。 */
+    public record MissingSegmentView(String segmentId, String language, List<String> attemptedLanguages) {
+    }
+
+    /** 缺失段诊断查询响应：按 segmentId、language 稳定排序。 */
+    public record MissingSegmentsResponse(long documentId, List<MissingSegmentView> missing) {
+    }
+
     /** 术语规则视图。 */
     public record TermRuleView(String sourceTerm, String language, String requiredTranslation) {
     }
@@ -125,11 +159,16 @@ public final class ApiDtos {
     public record TermStatusResponse(long documentId, int termVersion, List<TranslationTermStatus> translations) {
     }
 
-    /** 统一错误响应；violations 仅在术语违规 422 时返回，含全部违规术语。 */
+    /** 统一错误响应；violations 仅在术语违规 422 时返回，missing 仅在缺失段 422 时返回。 */
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    public record ErrorResponse(String error, String message, List<TermRuleView> violations) {
+    public record ErrorResponse(String error, String message, List<TermRuleView> violations,
+                                List<MissingSegmentView> missing) {
         public ErrorResponse(String error, String message) {
-            this(error, message, null);
+            this(error, message, null, null);
+        }
+
+        public ErrorResponse(String error, String message, List<TermRuleView> violations) {
+            this(error, message, violations, null);
         }
     }
 }

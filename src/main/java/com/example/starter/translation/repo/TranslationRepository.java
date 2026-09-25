@@ -2,6 +2,7 @@ package com.example.starter.translation.repo;
 
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
+import com.example.starter.translation.domain.Rows.FallbackRow;
 import com.example.starter.translation.domain.Rows.RequestLogRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
@@ -188,6 +189,13 @@ public class TranslationRepository {
         }
     }
 
+    /** 删除指定段落与语言的批准（撤回）；无记录时返回删除行数 0。 */
+    public int deleteApproval(long documentId, String segmentId, String language) {
+        return jdbc.update(
+                "DELETE FROM approval WHERE document_id = ? AND segment_id = ? AND language = ?",
+                documentId, segmentId, language);
+    }
+
     public void insertSnapshot(long documentId, int publishedVersion, String snapshotJson) {
         jdbc.update("INSERT INTO release_snapshot (document_id, published_version, snapshot_json) VALUES (?, ?, ?)",
                 documentId, publishedVersion, snapshotJson);
@@ -240,5 +248,30 @@ public class TranslationRepository {
     public void insertRequestLog(String requestId, String requestHash, int responseStatus, String responseBody) {
         jdbc.update("INSERT INTO request_log (request_id, request_hash, response_status, response_body) "
                 + "VALUES (?, ?, ?, ?)", requestId, requestHash, responseStatus, responseBody);
+    }
+
+    /** 查询文档全部回退配置，按语种排序保证稳定输出。 */
+    public List<FallbackRow> listFallbacks(long documentId) {
+        return jdbc.query(
+                "SELECT language, fallback_language FROM locale_fallback "
+                        + "WHERE document_id = ? ORDER BY language",
+                (rs, n) -> new FallbackRow(rs.getString(1), rs.getString(2)), documentId);
+    }
+
+    /** 插入或覆盖某语种的回退配置（按主键文档+语种唯一）。 */
+    public void upsertFallback(long documentId, String language, String fallbackLanguage) {
+        int updated = jdbc.update(
+                "UPDATE locale_fallback SET fallback_language = ?, updated_at = CURRENT_TIMESTAMP "
+                        + "WHERE document_id = ? AND language = ?",
+                fallbackLanguage, documentId, language);
+        if (updated == 0) {
+            jdbc.update("INSERT INTO locale_fallback (document_id, language, fallback_language) VALUES (?, ?, ?)",
+                    documentId, language, fallbackLanguage);
+        }
+    }
+
+    /** 清除某语种的回退配置（无记录时不报错）。 */
+    public void deleteFallback(long documentId, String language) {
+        jdbc.update("DELETE FROM locale_fallback WHERE document_id = ? AND language = ?", documentId, language);
     }
 }
