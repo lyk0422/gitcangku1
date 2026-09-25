@@ -16,7 +16,6 @@ import com.example.starter.calibration.api.ItemFailure;
 import com.example.starter.calibration.api.dto.ReleaseResponse;
 import com.example.starter.calibration.model.Certificate;
 import com.example.starter.calibration.model.Measurement;
-import com.example.starter.calibration.model.MeasurementStatus;
 import com.example.starter.calibration.repo.CertificateRepository;
 import com.example.starter.calibration.repo.MeasurementRepository;
 import com.example.starter.calibration.repo.ReleaseRepository;
@@ -67,24 +66,10 @@ public class ReleaseService {
                 continue;
             }
             Measurement measurement = locked.get();
-            List<String> reasons = new ArrayList<>();
-            if (measurement.status() == MeasurementStatus.RELEASED) {
-                reasons.add("ALREADY_RELEASED");
-            } else if (measurement.status() != MeasurementStatus.PENDING) {
-                reasons.add("NOT_PENDING");
-            }
-            if (!measurement.passed()) {
-                reasons.add("NOT_PASSED");
-            }
             Certificate cert = certificates.findByIdForUpdate(measurement.certificateId())
                     .orElseThrow(() -> ApiException.conflict("CERTIFICATE_MISSING",
                             "测量关联的证书不存在: " + measurement.certificateId()));
-            if (cert.revoked()) {
-                reasons.add("CERTIFICATE_REVOKED");
-            }
-            if (measurement.submittedBy().equals(releaser)) {
-                reasons.add("SAME_ACTOR");
-            }
+            List<String> reasons = ReleaseChecks.reasons(measurement, cert, releaser);
             if (reasons.isEmpty()) {
                 approved.add(measurement);
             } else {

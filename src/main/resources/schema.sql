@@ -45,9 +45,33 @@ CREATE TABLE IF NOT EXISTS measurement (
 -- 放行历史：证书撤销后保留，不回写为从未放行。
 CREATE TABLE IF NOT EXISTS release_record (
     id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY COMMENT '放行记录 ID，自增',
-    batch_id VARCHAR(64) NOT NULL COMMENT '放行批次 ID（UUID），同一批原子放行共享',
+    batch_id VARCHAR(64) NOT NULL COMMENT '放行批次 ID（UUID 或联合批次键），同一批原子放行共享',
     measurement_id BIGINT NOT NULL COMMENT '测量记录 ID',
     released_by VARCHAR(64) NOT NULL COMMENT '放行人（X-Actor-Id）',
     released_at DATETIME(6) NOT NULL COMMENT '放行时间（UTC）',
     KEY idx_release_measurement (measurement_id)
 ) COMMENT='放行历史';
+
+-- 联合放行批次：跨仪器联合批次放行成功后写入的不可变记录；
+-- joint_batch_key 全局唯一并作为幂等键，仅成功放行占键，失败不占键。
+CREATE TABLE IF NOT EXISTS joint_release_batch (
+    joint_batch_key VARCHAR(64) NOT NULL PRIMARY KEY COMMENT '联合批次键，全局唯一，作为幂等键',
+    request_fingerprint VARCHAR(512) NOT NULL COMMENT '请求参数指纹（放行人 + 按字典序排序的测量键集合）；同键异参判 409',
+    released_by VARCHAR(64) NOT NULL COMMENT '放行人（X-Actor-Id）',
+    released_at DATETIME(6) NOT NULL COMMENT '放行时间（UTC）',
+    item_count INT NOT NULL COMMENT '本批测量条数（2～20）'
+) COMMENT='联合放行批次记录（不可变）';
+
+-- 联合放行批次明细：固化各测量标识、放行时使用的证书与未舍入计算值快照；
+-- measurement_id 唯一，保证同一条测量至多被一个联合批次放行。
+CREATE TABLE IF NOT EXISTS joint_release_item (
+    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY COMMENT '明细 ID，自增',
+    joint_batch_key VARCHAR(64) NOT NULL COMMENT '联合批次键',
+    measurement_sort INT NOT NULL COMMENT '批内稳定排序序号（按测量键字典序，从 0 开始）',
+    measurement_id BIGINT NOT NULL COMMENT '测量记录 ID',
+    measurement_key VARCHAR(64) NOT NULL COMMENT '测量键快照',
+    certificate_id BIGINT NOT NULL COMMENT '放行时使用的校准证书 ID 快照',
+    computed_value DECIMAL(38,12) NOT NULL COMMENT '放行时未舍入计算值快照，最多 12 位小数',
+    CONSTRAINT uk_joint_item_measurement UNIQUE (measurement_id),
+    KEY idx_joint_item_batch (joint_batch_key)
+) COMMENT='联合放行批次测量明细（不可变快照）';
