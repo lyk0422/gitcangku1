@@ -49,9 +49,35 @@ CREATE TABLE IF NOT EXISTS transfer (
     CONSTRAINT fk_transfer_window FOREIGN KEY (window_id) REFERENCES supply_window (id)
 ) COMMENT='配水额度转让流水，与源扣减、目标批准同事务提交，创建后不可变，不提供撤销';
 
+CREATE TABLE IF NOT EXISTS rotation_schedule (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '轮灌排班记录主键',
+    schedule_key VARCHAR(128) NOT NULL COMMENT '排班业务键，全局唯一；换 commandKey 复用返回 409',
+    channel_id VARCHAR(128) NOT NULL COMMENT '渠道 ID，排班时从所属窗口固化；同一渠道任意时刻至多一条 ACTIVE',
+    allocation_key VARCHAR(128) NOT NULL COMMENT '所属配水申请业务键',
+    window_id BIGINT NOT NULL COMMENT '所属供水窗口 ID',
+    start_nanos BIGINT NOT NULL COMMENT '时段开始时刻（含），UTC 纳秒时间戳',
+    end_nanos BIGINT NOT NULL COMMENT '时段结束时刻（不含），UTC 纳秒时间戳；时长 30 至 720 分钟且落在窗口内',
+    remaining_snapshot DECIMAL(19,3) NOT NULL COMMENT '排班时申请的剩余未核销水量快照，单位立方米；固化后不因后续核销改写',
+    status VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE 生效中 / CANCELLED 已取消（立即释放渠道占用，记录保留）',
+    created_nanos BIGINT NOT NULL COMMENT '创建时间，UTC 纳秒时间戳',
+    cancelled_nanos BIGINT NULL COMMENT '取消时间，UTC 纳秒时间戳；未取消为 NULL',
+    CONSTRAINT uk_rotation_schedule_key UNIQUE (schedule_key),
+    CONSTRAINT fk_rotation_schedule_window FOREIGN KEY (window_id) REFERENCES supply_window (id)
+) COMMENT='轮灌引水时段排班，创建后起止与快照不可变，仅可取消';
+
+CREATE TABLE IF NOT EXISTS consumption (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '核销记录主键',
+    allocation_key VARCHAR(128) NOT NULL COMMENT '所属配水申请业务键',
+    window_id BIGINT NOT NULL COMMENT '所属供水窗口 ID',
+    amount DECIMAL(19,3) NOT NULL COMMENT '核销水量，单位立方米，大于 0 且不超过申请剩余未核销水量',
+    occurred_nanos BIGINT NOT NULL COMMENT '用水发生时刻，UTC 纳秒时间戳；必须落在该申请某个 ACTIVE 时段内',
+    created_nanos BIGINT NOT NULL COMMENT '创建时间，UTC 纳秒时间戳',
+    CONSTRAINT fk_consumption_window FOREIGN KEY (window_id) REFERENCES supply_window (id)
+) COMMENT='用水核销记录，创建后不可变；申请剩余未核销水量 = 持有额度 - 核销累计';
+
 CREATE TABLE IF NOT EXISTS command_log (
     command_key VARCHAR(128) PRIMARY KEY COMMENT '命令幂等键',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：WINDOW_CREATE/ALLOCATION_SUBMIT/ALLOCATION_APPROVE/ALLOCATION_CANCEL/CURTAILMENT_CREATE/CURTAILMENT_CANCEL/TRANSFER',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：WINDOW_CREATE/ALLOCATION_SUBMIT/ALLOCATION_APPROVE/ALLOCATION_CANCEL/CURTAILMENT_CREATE/CURTAILMENT_CANCEL/TRANSFER/SCHEDULE_CREATE/SCHEDULE_CANCEL/CONSUMPTION',
     params VARCHAR(2048) NOT NULL COMMENT '规范化请求参数串，用于同键改参检测',
     response MEDIUMTEXT NULL COMMENT '首次成功响应 JSON；命令事务提交前写入',
     created_nanos BIGINT NOT NULL COMMENT '创建时间，UTC 纳秒时间戳'

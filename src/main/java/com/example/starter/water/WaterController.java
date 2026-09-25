@@ -1,12 +1,18 @@
 package com.example.starter.water;
 
 import com.example.starter.water.dto.Dtos.AllocationResponse;
+import com.example.starter.water.dto.Dtos.AllocationScheduleListResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
+import com.example.starter.water.dto.Dtos.ChannelScheduleListResponse;
 import com.example.starter.water.dto.Dtos.CommandRequest;
+import com.example.starter.water.dto.Dtos.ConsumptionRequest;
+import com.example.starter.water.dto.Dtos.ConsumptionResponse;
+import com.example.starter.water.dto.Dtos.CreateScheduleRequest;
 import com.example.starter.water.dto.Dtos.CreateWindowRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.ScheduleResponse;
 import com.example.starter.water.dto.Dtos.SubmitAllocationRequest;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferRequest;
@@ -102,5 +108,38 @@ public class WaterController {
     @GetMapping("/windows/{windowId}/history")
     public HistoryResponse getHistory(@PathVariable long windowId) {
         return service.getHistory(windowId);
+    }
+
+    /** 申请轮灌引水时段。 */
+    @PostMapping("/schedules")
+    public ScheduleResponse createSchedule(@RequestBody CreateScheduleRequest request) {
+        return service.createSchedule(request.commandKey(), request.scheduleKey(), request.allocationKey(),
+                request.startUtc(), request.endUtc());
+    }
+
+    /** 取消轮灌时段（起始时刻已到的时段不得取消）。 */
+    @PostMapping("/schedules/{scheduleKey}/cancel")
+    public ScheduleResponse cancelSchedule(@PathVariable String scheduleKey,
+                                           @RequestBody CommandRequest request) {
+        return service.cancelSchedule(request.commandKey(), scheduleKey);
+    }
+
+    /** 查询渠道排班表。 */
+    @GetMapping("/channels/{channelId}/schedules")
+    public ChannelScheduleListResponse getChannelSchedules(@PathVariable String channelId) {
+        return service.getChannelSchedules(channelId);
+    }
+
+    /** 查询申请时段明细。 */
+    @GetMapping("/allocations/{allocationKey}/schedules")
+    public AllocationScheduleListResponse getAllocationSchedules(@PathVariable String allocationKey) {
+        return service.getAllocationSchedules(allocationKey);
+    }
+
+    /** 用水核销（必须落在该申请某个生效时段内）。 */
+    @PostMapping("/allocations/{allocationKey}/consumptions")
+    public ConsumptionResponse consume(@PathVariable String allocationKey,
+                                       @RequestBody ConsumptionRequest request) {
+        return service.consume(request.commandKey(), allocationKey, request.amount(), request.occurredUtc());
     }
 }

@@ -74,6 +74,37 @@ public final class Dtos {
                                   List<CurtailmentResponse> curtailments) {
     }
 
+    /** 轮灌排班命令：为 APPROVED 申请在所属窗口内申请一个引水时段（左闭右开，30 至 720 分钟）。 */
+    public record CreateScheduleRequest(String commandKey, String scheduleKey, String allocationKey,
+                                        String startUtc, String endUtc) {
+    }
+
+    /**
+     * 排班记录视图。状态：ACTIVE / CANCELLED；cancelledUtc 未取消时为 null。
+     * remainingSnapshot 为排班时申请剩余未核销水量快照，后续核销不改写。
+     */
+    public record ScheduleResponse(long id, String scheduleKey, String channelId, String allocationKey,
+                                   long windowId, String startUtc, String endUtc, String remainingSnapshot,
+                                   String status, String createdUtc, String cancelledUtc) {
+    }
+
+    /** 渠道排班表视图（含已取消的历史记录，按开始时刻升序）。 */
+    public record ChannelScheduleListResponse(String channelId, List<ScheduleResponse> schedules) {
+    }
+
+    /** 申请时段明细视图（含已取消的历史记录，按开始时刻升序）。 */
+    public record AllocationScheduleListResponse(String allocationKey, List<ScheduleResponse> schedules) {
+    }
+
+    /** 用水核销命令：occurredUtc 必须落在该申请某个 ACTIVE 时段内。 */
+    public record ConsumptionRequest(String commandKey, String amount, String occurredUtc) {
+    }
+
+    /** 核销记录视图；remainingAfter 为本次核销后的剩余未核销水量。 */
+    public record ConsumptionResponse(long id, String allocationKey, long windowId, String amount,
+                                      String occurredUtc, String remainingAfter, String createdUtc) {
+    }
+
     /** 统一错误响应体。 */
     public record ErrorResponse(String code, String message) {
     }

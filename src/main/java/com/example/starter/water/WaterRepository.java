@@ -46,6 +46,17 @@ public class WaterRepository {
                              long createdNanos) {
     }
 
+    /** 轮灌排班行；渠道、起止与剩余水量快照创建后固化，仅状态可变为 CANCELLED。 */
+    public record ScheduleRow(long id, String scheduleKey, String channelId, String allocationKey,
+                              long windowId, long startNanos, long endNanos, BigDecimal remainingSnapshot,
+                              String status, long createdNanos, Long cancelledNanos) {
+    }
+
+    /** 用水核销行，创建后不可变。 */
+    public record ConsumptionRow(long id, String allocationKey, long windowId, BigDecimal amount,
+                                 long occurredNanos, long createdNanos) {
+    }
+
     private static final RowMapper<WindowRow> WINDOW_MAPPER = (rs, n) -> new WindowRow(
             rs.getLong("id"), rs.getString("window_key"), rs.getString("channel_id"),
             rs.getLong("start_nanos"), rs.getLong("end_nanos"),
@@ -74,6 +85,21 @@ public class WaterRepository {
     private static final RowMapper<CommandRow> COMMAND_MAPPER = (rs, n) -> new CommandRow(
             rs.getString("command_key"), rs.getString("operation"), rs.getString("params"),
             rs.getString("response"), rs.getLong("created_nanos"));
+
+    private static final String SCHEDULE_SELECT =
+            "SELECT id, schedule_key, channel_id, allocation_key, window_id, start_nanos, end_nanos,"
+                    + " remaining_snapshot, status, created_nanos, cancelled_nanos";
+
+    private static final RowMapper<ScheduleRow> SCHEDULE_MAPPER = (rs, n) -> new ScheduleRow(
+            rs.getLong("id"), rs.getString("schedule_key"), rs.getString("channel_id"),
+            rs.getString("allocation_key"), rs.getLong("window_id"),
+            rs.getLong("start_nanos"), rs.getLong("end_nanos"), rs.getBigDecimal("remaining_snapshot"),
+            rs.getString("status"), rs.getLong("created_nanos"),
+            rs.getObject("cancelled_nanos") == null ? null : rs.getLong("cancelled_nanos"));
+
+    private static final RowMapper<ConsumptionRow> CONSUMPTION_MAPPER = (rs, n) -> new ConsumptionRow(
+            rs.getLong("id"), rs.getString("allocation_key"), rs.getLong("window_id"),
+            rs.getBigDecimal("amount"), rs.getLong("occurred_nanos"), rs.getLong("created_nanos"));
 
     private final JdbcTemplate jdbc;
 
@@ -303,5 +329,121 @@ public class WaterRepository {
     /** 写回命令首次成功响应。 */
     public void updateCommandResponse(String commandKey, String response) {
         jdbc.update("UPDATE command_log SET response = ? WHERE command_key = ?", response, commandKey);
+    }
+
+    // ------------------------------------------------------------------
+    // 轮灌排班与用水核销
+    // ------------------------------------------------------------------
+
+    /** 插入排班记录（ACTIVE）并返回主键；快照在插入时固化。 */
+    public long insertSchedule(String scheduleKey, String channelId, String allocationKey, long windowId,
+                               long startNanos, long endNanos, BigDecimal remainingSnapshot,
+                               long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO rotation_schedule (schedule_key, channel_id, allocation_key, window_id,"
+                            + " start_nanos, end_nanos, remaining_snapshot, status, created_nanos, cancelled_nanos)"
+                            + " VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, NULL)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, scheduleKey);
+            ps.setString(2, channelId);
+            ps.setString(3, allocationKey);
+            ps.setLong(4, windowId);
+            ps.setLong(5, startNanos);
+            ps.setLong(6, endNanos);
+            ps.setBigDecimal(7, remainingSnapshot);
+            ps.setLong(8, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 按业务键查询排班记录，不存在返回 null。 */
+    public ScheduleRow findScheduleByKey(String scheduleKey) {
+        try {
+            return jdbc.queryForObject(SCHEDULE_SELECT + " FROM rotation_schedule WHERE schedule_key = ?",
+                    SCHEDULE_MAPPER, scheduleKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 查询同渠道与 [startNanos, endNanos) 重叠的 ACTIVE 时段（相邻合法），无则 null。 */
+    public ScheduleRow findOverlappingActiveSchedule(String channelId, long startNanos, long endNanos) {
+        List<ScheduleRow> rows = jdbc.query(
+                SCHEDULE_SELECT + " FROM rotation_schedule WHERE channel_id = ? AND status = 'ACTIVE'"
+                        + " AND start_nanos < ? AND ? < end_nanos ORDER BY start_nanos LIMIT 1",
+                SCHEDULE_MAPPER, channelId, endNanos, startNanos);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /** 申请当前 ACTIVE 时段数量。 */
+    public int countActiveSchedulesByAllocation(String allocationKey) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM rotation_schedule WHERE allocation_key = ? AND status = 'ACTIVE'",
+                Integer.class, allocationKey);
+        return count == null ? 0 : count;
+    }
+
+    /** 渠道全部排班记录（含已取消），按开始时刻、主键升序。 */
+    public List<ScheduleRow> listSchedulesByChannel(String channelId) {
+        return jdbc.query(SCHEDULE_SELECT + " FROM rotation_schedule WHERE channel_id = ?"
+                + " ORDER BY start_nanos, id", SCHEDULE_MAPPER, channelId);
+    }
+
+    /** 申请全部排班记录（含已取消），按开始时刻、主键升序。 */
+    public List<ScheduleRow> listSchedulesByAllocation(String allocationKey) {
+        return jdbc.query(SCHEDULE_SELECT + " FROM rotation_schedule WHERE allocation_key = ?"
+                + " ORDER BY start_nanos, id", SCHEDULE_MAPPER, allocationKey);
+    }
+
+    /** 申请全部 ACTIVE 时段，按开始时刻升序。 */
+    public List<ScheduleRow> listActiveSchedulesByAllocation(String allocationKey) {
+        return jdbc.query(SCHEDULE_SELECT + " FROM rotation_schedule WHERE allocation_key = ?"
+                + " AND status = 'ACTIVE' ORDER BY start_nanos", SCHEDULE_MAPPER, allocationKey);
+    }
+
+    /** 取消排班：置为 CANCELLED 并记录取消时间，渠道占用随事务提交立即释放。 */
+    public void cancelSchedule(long id, long cancelledNanos) {
+        jdbc.update("UPDATE rotation_schedule SET status = 'CANCELLED', cancelled_nanos = ? WHERE id = ?",
+                cancelledNanos, id);
+    }
+
+    /** 插入核销记录并返回主键。 */
+    public long insertConsumption(String allocationKey, long windowId, BigDecimal amount,
+                                  long occurredNanos, long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO consumption (allocation_key, window_id, amount, occurred_nanos, created_nanos)"
+                            + " VALUES (?, ?, ?, ?, ?)", Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, allocationKey);
+            ps.setLong(2, windowId);
+            ps.setBigDecimal(3, amount);
+            ps.setLong(4, occurredNanos);
+            ps.setLong(5, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 按主键查询核销记录，不存在返回 null。 */
+    public ConsumptionRow findConsumptionById(long id) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT id, allocation_key, window_id, amount, occurred_nanos, created_nanos"
+                            + " FROM consumption WHERE id = ?", CONSUMPTION_MAPPER, id);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 申请累计已核销水量（BigDecimal 精确求和），无则 0。 */
+    public BigDecimal sumConsumedAmount(String allocationKey) {
+        BigDecimal sum = jdbc.queryForObject(
+                "SELECT COALESCE(SUM(amount), 0) FROM consumption WHERE allocation_key = ?",
+                BigDecimal.class, allocationKey);
+        return sum == null ? BigDecimal.ZERO : sum;
     }
 }
