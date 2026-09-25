@@ -36,6 +36,9 @@ import java.util.Set;
  * <p>显式冲突解决（RESOLVE）在同一套占位与行锁机制内执行：事务内重读基线与最新当前版本重算冲突，
  * 人工选择必须恰好覆盖重算后的冲突字段；成功后原子写入新观测版本（内容无变化则不加版本）、
  * 不可变 conflict_resolution 记录与 request_log 响应。resolutionId 全局唯一，同参重放、改参 409。
+ *
+ * <p>更正附页集成：生成冲突簇（合并/解决重算）时，未裁决观测的当前侧使用最新有效附页后的有效值；
+ * 已人工裁决的观测冻结裁决结果，附页不改写合并与裁决语义（见 CorrigendumService）。
  */
 @Service
 public class ObservationService {
@@ -50,17 +53,20 @@ public class ObservationService {
     private final ObservationRepository observationRepository;
     private final RequestLogRepository requestLogRepository;
     private final ResolutionRepository resolutionRepository;
+    private final CorrigendumService corrigendumService;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public ObservationService(ObservationRepository observationRepository,
                               RequestLogRepository requestLogRepository,
                               ResolutionRepository resolutionRepository,
+                              CorrigendumService corrigendumService,
                               ObjectMapper objectMapper,
                               Clock clock) {
         this.observationRepository = observationRepository;
         this.requestLogRepository = requestLogRepository;
         this.resolutionRepository = resolutionRepository;
+        this.corrigendumService = corrigendumService;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -121,12 +127,14 @@ public class ObservationService {
                 .orElseThrow(() -> ApiException.notFound(
                         "base version not found: " + observationId + "@" + request.baseVersion()));
 
+        // 冲突簇生成：未裁决观测的当前侧使用最新有效附页后的有效值；已人工裁决的观测冻结裁决结果
+        ObservationSnapshot effective = corrigendumService.effectiveSnapshot(current);
         List<String> conflictFields = new ArrayList<>();
-        String mergedLocation = mergeField("location", base.location(), current.location(),
+        String mergedLocation = mergeField("location", base.location(), effective.location(),
                 request.location(), conflictFields);
-        String mergedReading = mergeReadingField(base.reading(), current.reading(),
+        String mergedReading = mergeReadingField(base.reading(), effective.reading(),
                 request.reading(), conflictFields);
-        String mergedNote = mergeField("note", base.note(), current.note(), request.note(), conflictFields);
+        String mergedNote = mergeField("note", base.note(), effective.note(), request.note(), conflictFields);
         if (!conflictFields.isEmpty()) {
             throw ApiException.mergeConflict(conflictFields, current.version());
         }
@@ -230,27 +238,29 @@ public class ObservationService {
                 .orElseThrow(() -> ApiException.notFound(
                         "base version not found: " + observationId + "@" + request.baseVersion()));
 
+        // 冲突重算：未裁决观测的当前侧使用最新有效附页后的有效值；已人工裁决的观测冻结裁决结果
+        ObservationSnapshot effective = corrigendumService.effectiveSnapshot(current);
         List<String> conflictFields = new ArrayList<>();
-        boolean locationConflict = fieldConflicts(base.location(), current.location(), request.location(), false);
+        boolean locationConflict = fieldConflicts(base.location(), effective.location(), request.location(), false);
         if (locationConflict) {
             conflictFields.add("location");
         }
-        boolean readingConflict = fieldConflicts(base.reading(), current.reading(), request.reading(), true);
+        boolean readingConflict = fieldConflicts(base.reading(), effective.reading(), request.reading(), true);
         if (readingConflict) {
             conflictFields.add("reading");
         }
-        boolean noteConflict = fieldConflicts(base.note(), current.note(), request.note(), false);
+        boolean noteConflict = fieldConflicts(base.note(), effective.note(), request.note(), false);
         if (noteConflict) {
             conflictFields.add("note");
         }
         validateSelectionCoverage(selections.keySet(), conflictFields);
 
         String resolvedLocation = resolveFieldValue(locationConflict, selections.get("location"),
-                base.location(), current.location(), request.location(), false);
+                base.location(), effective.location(), request.location(), false);
         String resolvedReading = resolveFieldValue(readingConflict, selections.get("reading"),
-                base.reading(), current.reading(), request.reading(), true);
+                base.reading(), effective.reading(), request.reading(), true);
         String resolvedNote = resolveFieldValue(noteConflict, selections.get("note"),
-                base.note(), current.note(), request.note(), false);
+                base.note(), effective.note(), request.note(), false);
 
         ObservationSnapshot merged = new ObservationSnapshot(observationId, current.version(),
                 resolvedLocation, resolvedReading, resolvedNote, false);

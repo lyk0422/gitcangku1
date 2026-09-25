@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS observation_version (
 CREATE TABLE IF NOT EXISTS request_log (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
     fingerprint VARCHAR(128) NOT NULL COMMENT '请求操作与参数的指纹，同键异参时判定 409',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：CREATE / MERGE / DELETE / RESOLVE',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：CREATE / MERGE / DELETE / RESOLVE / CORRIGENDUM / CORRIGENDUM_BATCH / CORRIGENDUM_REVOKE',
     response_status INT NULL COMMENT '成功响应的 HTTP 状态码；提交过程中暂为 NULL',
     response_body VARCHAR(4000) NULL COMMENT '成功响应体（JSON 原文），用于同键同参重放；提交过程中暂为 NULL',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '请求记录创建时间（服务器时区）',
@@ -58,4 +58,43 @@ CREATE TABLE IF NOT EXISTS conflict_resolution (
     -- 不设置指向 observation_current 的外键：观测记录删除仅置墓碑（当前行保留），
     -- 且不可变解决历史必须在任何数据清理/归档场景下继续可查。
     UNIQUE (observation_id, request_id)
+);
+
+-- 观测更正附页表：原始观测不可覆盖，更正以附页形式按 (observation_id, corr_version) 递增追加。
+-- 每行保存指定原观测版本号、字段差异（更正值）与差异字段在原版本中的原值。
+CREATE TABLE IF NOT EXISTS observation_corrigendum (
+    observation_id VARCHAR(64) NOT NULL COMMENT '观测记录唯一标识',
+    corr_version INT NOT NULL COMMENT '附页版本号，同一观测记录内从 1 开始单调递增',
+    corr_key VARCHAR(128) NOT NULL COMMENT '客户端提交的附页幂等键（corrKey），指纹含原版本、规范化差异、原因与采集者',
+    base_version INT NOT NULL COMMENT '附页指定的原观测版本号，必须已存在',
+    diffs VARCHAR(2000) NOT NULL COMMENT '字段差异（更正值）JSON 对象原文，按固定字段顺序 location/reading/note，读数已数值规范化',
+    original_values VARCHAR(2000) NOT NULL COMMENT '差异字段在原观测版本中的原值（JSON 对象原文，字段顺序与 diffs 一致）',
+    reason VARCHAR(1024) NOT NULL COMMENT '更正原因',
+    collector VARCHAR(128) NOT NULL COMMENT '采集者标识',
+    revoked BOOLEAN NOT NULL DEFAULT FALSE COMMENT '是否已撤销：TRUE 表示该附页不再是有效附页（撤销记录见 corrigendum_revocation）',
+    created_at_utc TIMESTAMP NOT NULL COMMENT '附页提交时刻（UTC）',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录落库时间（服务器时区）',
+    PRIMARY KEY (observation_id, corr_version)
+);
+
+-- 附页撤销记录表：只允许撤销当前最新有效附页，记录不可变、永不更新或删除。
+CREATE TABLE IF NOT EXISTS corrigendum_revocation (
+    observation_id VARCHAR(64) NOT NULL COMMENT '观测记录唯一标识',
+    corr_version INT NOT NULL COMMENT '被撤销的附页版本号',
+    request_id VARCHAR(128) NOT NULL COMMENT '执行撤销的请求标识（requestId）',
+    operator VARCHAR(128) NOT NULL COMMENT '执行撤销的操作者标识',
+    revoked_at_utc TIMESTAMP NOT NULL COMMENT '撤销完成时刻（UTC）',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录落库时间（服务器时区）',
+    PRIMARY KEY (observation_id, corr_version)
+);
+
+-- 待复审标记表：已人工裁决的观测再收到新附页时生成；裁决结果本身冻结不改写。
+CREATE TABLE IF NOT EXISTS re_review_marker (
+    resolution_id VARCHAR(128) NOT NULL COMMENT '被冻结的冲突解决记录标识',
+    observation_id VARCHAR(64) NOT NULL COMMENT '观测记录唯一标识',
+    corr_version INT NOT NULL COMMENT '触发该标记的附页版本号',
+    status VARCHAR(16) NOT NULL DEFAULT 'PENDING' COMMENT '标记状态：PENDING 表示待复审',
+    created_at_utc TIMESTAMP NOT NULL COMMENT '标记生成时刻（UTC）',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录落库时间（服务器时区）',
+    PRIMARY KEY (resolution_id, observation_id, corr_version)
 );
