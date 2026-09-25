@@ -16,6 +16,7 @@ import com.example.starter.domain.Point;
 import com.example.starter.domain.ReviewConclusion;
 import com.example.starter.domain.ZoneStatus;
 import com.example.starter.repo.AirspaceRepository;
+import com.example.starter.repo.CapacityRepository;
 import com.example.starter.repo.DedupPo;
 import com.example.starter.repo.ReviewPo;
 import com.example.starter.repo.ReviewRepository;
@@ -68,6 +69,7 @@ public class AirspaceReviewService {
     private final AirspaceRepository airspaceRepo;
     private final RouteRepository routeRepo;
     private final ReviewRepository reviewRepo;
+    private final CapacityRepository capacityRepo;
     private final ObjectMapper objectMapper;
     private final Clock clock;
     private final TransactionTemplate txTemplate;
@@ -75,12 +77,14 @@ public class AirspaceReviewService {
     public AirspaceReviewService(AirspaceRepository airspaceRepo,
                                  RouteRepository routeRepo,
                                  ReviewRepository reviewRepo,
+                                 CapacityRepository capacityRepo,
                                  ObjectMapper objectMapper,
                                  Clock clock,
                                  PlatformTransactionManager transactionManager) {
         this.airspaceRepo = airspaceRepo;
         this.routeRepo = routeRepo;
         this.reviewRepo = reviewRepo;
+        this.capacityRepo = capacityRepo;
         this.objectMapper = objectMapper;
         this.clock = clock;
         this.txTemplate = new TransactionTemplate(transactionManager);
@@ -167,6 +171,8 @@ public class AirspaceReviewService {
             }
             routeRepo.deletePoints(request.routeId());
             routeRepo.insertPoints(request.routeId(), points);
+            // 旧版本的时空桶占用随航线修订失效，同一事务移除（版本增版后不再属于当前版本）
+            capacityRepo.deleteOccupancyByRoute(request.routeId());
             return new MutationResponse(request.requestId(), false,
                     new RouteResult(request.routeId(), request.expectedVersion() + 1));
         });
