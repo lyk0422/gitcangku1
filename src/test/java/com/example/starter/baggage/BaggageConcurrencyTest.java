@@ -43,6 +43,8 @@ class BaggageConcurrencyTest {
 
     @BeforeEach
     void setUp() {
+        jdbcTemplate.update("DELETE FROM overweight_alert");
+        jdbcTemplate.update("DELETE FROM reweigh_record");
         jdbcTemplate.update("DELETE FROM load_record");
         jdbcTemplate.update("DELETE FROM bag_itinerary");
         jdbcTemplate.update("DELETE FROM bag");
@@ -158,11 +160,11 @@ class BaggageConcurrencyTest {
 
     private void registerLeg(String legId, String origin, String destination) {
         baggageService.registerLeg(
-                new RegisterLegRequest(UUID.randomUUID().toString(), legId, origin, destination));
+                new RegisterLegRequest(UUID.randomUUID().toString(), legId, origin, destination, null));
     }
 
     private void registerBag(String bagTag, List<String> legIds) {
-        baggageService.registerBag(new RegisterBagRequest(UUID.randomUUID().toString(), bagTag, legIds));
+        baggageService.registerBag(new RegisterBagRequest(UUID.randomUUID().toString(), bagTag, legIds, null, null));
     }
 
     /** 同步起跑并发执行任务，结果按提交顺序返回（异常包装为返回值）。 */

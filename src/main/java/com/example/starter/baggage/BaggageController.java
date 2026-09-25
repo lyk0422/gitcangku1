@@ -14,12 +14,18 @@ import org.springframework.web.bind.annotation.RestController;
 import com.example.starter.baggage.BaggageDtos.ArriveRequest;
 import com.example.starter.baggage.BaggageDtos.ArriveResponse;
 import com.example.starter.baggage.BaggageDtos.BagResponse;
+import com.example.starter.baggage.BaggageDtos.ClearOverweightRequest;
+import com.example.starter.baggage.BaggageDtos.ClearOverweightResponse;
 import com.example.starter.baggage.BaggageDtos.LegResponse;
 import com.example.starter.baggage.BaggageDtos.LoadRequest;
 import com.example.starter.baggage.BaggageDtos.LoadResponse;
 import com.example.starter.baggage.BaggageDtos.ManifestResponse;
+import com.example.starter.baggage.BaggageDtos.OverweightStatusResponse;
 import com.example.starter.baggage.BaggageDtos.RegisterBagRequest;
 import com.example.starter.baggage.BaggageDtos.RegisterLegRequest;
+import com.example.starter.baggage.BaggageDtos.ReweighHistoryResponse;
+import com.example.starter.baggage.BaggageDtos.ReweighRequest;
+import com.example.starter.baggage.BaggageDtos.ReweighResponse;
 import com.example.starter.baggage.BaggageDtos.SealRequest;
 import com.example.starter.baggage.BaggageDtos.SealResponse;
 
@@ -48,7 +54,7 @@ public class BaggageController {
         return ResponseEntity.status(HttpStatus.CREATED).body(baggageService.registerBag(request));
     }
 
-    /** 批量装载：整批原子，任一行李不满足则 422 且无一件移动。 */
+    /** 批量装载：整批原子，任一行李不满足则 422 且无一件移动；超重提醒随响应返回不拦截。 */
     @PostMapping("/legs/{legId}/load")
     public LoadResponse load(@PathVariable String legId, @Valid @RequestBody LoadRequest request) {
         return baggageService.load(legId, request);
@@ -66,10 +72,35 @@ public class BaggageController {
         return baggageService.arrive(legId, request);
     }
 
+    /** 复重纠偏：仅允许尚未进入任何 SEALED 航段清单的行李。 */
+    @PostMapping("/bags/{bagTag}/reweigh")
+    public ReweighResponse reweigh(@PathVariable String bagTag, @Valid @RequestBody ReweighRequest request) {
+        return baggageService.reweigh(bagTag, request);
+    }
+
+    /** 清除超重提醒：清除不可逆，必须提交超额说明。 */
+    @PostMapping("/bags/{bagTag}/overweight/clear")
+    public ClearOverweightResponse clearOverweight(@PathVariable String bagTag,
+                                                   @Valid @RequestBody ClearOverweightRequest request) {
+        return baggageService.clearOverweight(bagTag, request);
+    }
+
     /** 行李轨迹查询。 */
     @GetMapping("/bags/{bagTag}/trace")
     public BagResponse getBagTrace(@PathVariable String bagTag) {
         return baggageService.getBagTrace(bagTag);
+    }
+
+    /** 行李复重历史与当前提醒状态查询。 */
+    @GetMapping("/bags/{bagTag}/reweigh-history")
+    public ReweighHistoryResponse getReweighHistory(@PathVariable String bagTag) {
+        return baggageService.getReweighHistory(bagTag);
+    }
+
+    /** 当前超重提醒状态查询（含已清除的历史提醒）。 */
+    @GetMapping("/bags/{bagTag}/overweight")
+    public OverweightStatusResponse getOverweightStatus(@PathVariable String bagTag) {
+        return baggageService.getOverweightStatus(bagTag);
     }
 
     /** 封舱清单查询。 */
