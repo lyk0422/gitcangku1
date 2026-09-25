@@ -7,6 +7,8 @@ import com.example.starter.playout.PlayoutRepository.PublicationRow;
 import com.example.starter.playout.PlayoutRepository.PublicationSegmentRow;
 import com.example.starter.playout.PlayoutRepository.RequestRow;
 import com.example.starter.playout.PlayoutRepository.SegmentRow;
+import com.example.starter.playout.PlayoutRepository.SimulcastGroupRow;
+import com.example.starter.playout.PlayoutRepository.SimulcastMemberRow;
 import com.example.starter.playout.api.ApiException;
 import com.example.starter.playout.api.Dtos.AssetResponse;
 import com.example.starter.playout.api.Dtos.ChannelResponse;
@@ -14,6 +16,7 @@ import com.example.starter.playout.api.Dtos.CreateAssetRequest;
 import com.example.starter.playout.api.Dtos.CreateChannelRequest;
 import com.example.starter.playout.api.Dtos.CreateEmergencyOverrideRequest;
 import com.example.starter.playout.api.Dtos.CreateGrantRequest;
+import com.example.starter.playout.api.Dtos.CreateSimulcastLockRequest;
 import com.example.starter.playout.api.Dtos.DecisionSource;
 import com.example.starter.playout.api.Dtos.DraftResponse;
 import com.example.starter.playout.api.Dtos.EmergencyOverrideResponse;
@@ -26,6 +29,12 @@ import com.example.starter.playout.api.Dtos.PublishResponse;
 import com.example.starter.playout.api.Dtos.ReplaceDraftRequest;
 import com.example.starter.playout.api.Dtos.SegmentInput;
 import com.example.starter.playout.api.Dtos.SegmentResponse;
+import com.example.starter.playout.api.Dtos.SimulcastChannelFailure;
+import com.example.starter.playout.api.Dtos.SimulcastLockResponse;
+import com.example.starter.playout.api.Dtos.SimulcastPlaceholderResponse;
+import com.example.starter.playout.api.Dtos.SimulcastRevocationResponse;
+import com.example.starter.playout.api.Dtos.SimulcastStatus;
+import com.example.starter.playout.api.SimulcastLockException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
@@ -38,9 +47,12 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.function.Supplier;
@@ -63,6 +75,8 @@ public class PlayoutService {
     private static final String OP_REVOKE_GRANT = "REVOKE_GRANT";
     private static final String OP_CREATE_OVERRIDE = "CREATE_OVERRIDE";
     private static final String OP_CANCEL_OVERRIDE = "CANCEL_OVERRIDE";
+    private static final String OP_CREATE_SIMULCAST = "CREATE_SIMULCAST";
+    private static final String OP_REVOKE_SIMULCAST = "REVOKE_SIMULCAST";
 
     /** 紧急插播时长上限（含）：30 分钟，单位毫秒。 */
     private static final long OVERRIDE_MAX_DURATION_MS = 30L * 60L * 1000L;
@@ -160,7 +174,47 @@ public class PlayoutService {
         String hash = sha256(OP_REPLACE_DRAFT + "|" + channelId + "|" + businessDay
                 + "|" + request.expectedDraftVersion() + "|" + canonicalSegments(request.segments()));
         return idempotent(request.requestId(), OP_REPLACE_DRAFT, hash, DraftResponse.class, () -> {
-            List<ValidatedSegment> segments = validateSegments(channelId, businessDay, request.segments());
+            // 锁定频道行：与联播创建/撤销、插播创建按提交顺序串行。
+            repo.lockChannelForUpdate(channelId);
+            List<SimulcastMemberRow> members =
+                    repo.findActiveMembersForChannelDay(channelId, businessDay);
+            Map<String, SimulcastMemberRow> memberBySegmentId = new LinkedHashMap<>();
+            for (SimulcastMemberRow member : members) {
+                memberBySegmentId.put(member.placeholderSegmentId(), member);
+            }
+            List<SegmentInput> normalInputs = new ArrayList<>();
+            Map<String, SegmentInput> placeholderInputs = new LinkedHashMap<>();
+            for (SegmentInput input : request.segments()) {
+                if (input.id() != null && memberBySegmentId.containsKey(input.id())) {
+                    placeholderInputs.put(input.id(), input);
+                } else {
+                    normalInputs.add(input);
+                }
+            }
+            // 联播占位不可独立修改：必须原样携带，删除或改时（含改素材）返回 409。
+            for (SimulcastMemberRow member : members) {
+                SegmentInput echo = placeholderInputs.get(member.placeholderSegmentId());
+                if (echo == null) {
+                    throw ApiException.conflict("SIMULCAST_PLACEHOLDER_REQUIRED",
+                            "草稿必须包含联播占位片段: " + member.placeholderSegmentId());
+                }
+                if (!member.assetId().equals(echo.assetId())
+                        || echo.start() == null || echo.end() == null
+                        || toMs(echo.start()) != member.atMs() || toMs(echo.end()) != member.atMs()) {
+                    throw ApiException.conflict("SIMULCAST_PLACEHOLDER_MODIFIED",
+                            "联播占位片段不可修改素材或时刻: " + member.placeholderSegmentId());
+                }
+            }
+            List<ValidatedSegment> segments = validateSegments(channelId, businessDay, normalInputs);
+            // 普通片段不得覆盖联播占位时刻。
+            for (ValidatedSegment segment : segments) {
+                for (SimulcastMemberRow member : members) {
+                    if (segment.startMs() <= member.atMs() && member.atMs() < segment.endMs()) {
+                        throw ApiException.unprocessable("SIMULCAST_MOMENT_OCCUPIED",
+                                "片段覆盖了联播占位时刻: " + segment.id());
+                    }
+                }
+            }
             long newVersion;
             if (request.expectedDraftVersion() == 0) {
                 try {
@@ -185,7 +239,8 @@ public class PlayoutService {
                         segment.assetId(), segment.startMs(), segment.endMs());
             }
             return new DraftResponse(channelId, businessDay.toString(), newVersion,
-                    segments.stream().map(ValidatedSegment::toResponse).toList());
+                    segments.stream().map(ValidatedSegment::toResponse).toList(),
+                    members.stream().map(PlayoutService::toPlaceholderResponse).toList());
         });
     }
 
@@ -233,6 +288,12 @@ public class PlayoutService {
                 SegmentRow segment = segments.get(i);
                 repo.insertPublicationSegment(publicationId, segment.id(), segment.assetId(),
                         grantIds.get(i), segment.startMs(), segment.endMs());
+            }
+            // 发布必须包含当前生效的联播占位：以固化的每频道授权版本写入只读快照，
+            // 撤销联播组不改写已发布快照。
+            for (SimulcastMemberRow member : repo.findActiveMembersForChannelDay(channelId, businessDay)) {
+                repo.insertPublicationSegment(publicationId, member.placeholderSegmentId(),
+                        member.assetId(), member.grantId(), member.atMs(), member.atMs());
             }
             return new PublishResponse(publicationId, channelId, businessDay.toString(),
                     newVersion, draft.version());
@@ -375,6 +436,12 @@ public class PlayoutService {
                     "同频道同优先级 ACTIVE 插播区间重叠: " + overlapping.get(0).overrideKey());
         }
 
+        // 插播区间不得覆盖生效中的联播占位时刻（持频道锁，与联播创建/撤销按提交顺序串行）。
+        if (!repo.findActiveMembersInRange(request.channelId(), startMs, endMs).isEmpty()) {
+            throw ApiException.unprocessable("SIMULCAST_MOMENT_OCCUPIED",
+                    "插播区间覆盖联播占位时刻: " + request.channelId());
+        }
+
         long createdAtMs = nowMs();
         try {
             repo.insertOverride(request.overrideKey(), request.channelId(), request.assetId(),
@@ -426,6 +493,215 @@ public class PlayoutService {
                 row.cancelRequestId(),
                 row.cancelledAtMs() == null ? null : atMs(row.cancelledAtMs()),
                 atMs(row.createdAtMs()));
+    }
+
+    // ---------- 联播锁定 ----------
+
+    /**
+     * 创建联播锁定：同一业务日 2～8 个频道共用同一素材与计划播出时刻。一个事务内逐频道校验
+     * 草稿存在、时刻未被片段/插播/其他联播占位占用、素材授权覆盖该频道该时刻；任一频道不满足
+     * 则整次 422 并返回逐频道原因，不写入任何锁定。全部通过后写入同一联播组并为每个频道写入
+     * 不可独立修改的联播占位，固化频道集合、素材、时刻与每频道授权版本。
+     * 携带 requestId 幂等：同键同参返回首次结果，改参 409，失败不占键。
+     */
+    @Transactional
+    public SimulcastLockResponse createSimulcastLock(CreateSimulcastLockRequest request) {
+        LocalDate businessDay = parseDay(request.businessDay());
+        long atMs = toMs(request.at());
+        if (!request.at().atZoneSameInstant(ZONE).toLocalDate().equals(businessDay)) {
+            throw ApiException.badRequest("计划播出时刻必须落在业务日内: " + businessDay);
+        }
+        List<String> channelIds = request.channelIds().stream().distinct().sorted().toList();
+        if (channelIds.size() != request.channelIds().size()) {
+            throw ApiException.badRequest("联播频道列表存在重复频道");
+        }
+        if (channelIds.size() < 2 || channelIds.size() > 8) {
+            throw ApiException.badRequest("联播频道数须在 2～8 之间");
+        }
+        String hash = sha256(OP_CREATE_SIMULCAST + "|" + request.simulcastKey() + "|" + businessDay
+                + "|" + String.join(",", channelIds) + "|" + request.assetId() + "|" + atMs);
+        return idempotent(request.requestId(), OP_CREATE_SIMULCAST, hash, SimulcastLockResponse.class,
+                () -> doCreateSimulcastLock(request, businessDay, atMs, channelIds));
+    }
+
+    private SimulcastLockResponse doCreateSimulcastLock(CreateSimulcastLockRequest request,
+                                                        LocalDate businessDay, long atMs,
+                                                        List<String> channelIds) {
+        if (repo.findAsset(request.assetId()).isEmpty()) {
+            throw ApiException.notFound("素材不存在: " + request.assetId());
+        }
+        // 同键语义：已存在（含已撤销）即冲突，撤销后 simulcastKey 不可复用；行锁串行并发同键创建。
+        if (repo.findSimulcastGroupForUpdate(request.simulcastKey()).isPresent()) {
+            throw ApiException.conflict("DUPLICATE_SIMULCAST_KEY",
+                    "联播组 simulcastKey 已存在: " + request.simulcastKey());
+        }
+        // 按字典序锁定全部频道行：与单频道草稿替换、插播创建串行，多组并发创建同序加锁避免死锁。
+        for (String channelId : channelIds) {
+            repo.lockChannelForUpdate(channelId);
+        }
+
+        List<SimulcastChannelFailure> failures = new ArrayList<>();
+        Map<String, GrantRow> selectedGrants = new LinkedHashMap<>();
+        for (String channelId : channelIds) {
+            if (repo.findChannel(channelId).isEmpty()) {
+                failures.add(new SimulcastChannelFailure(channelId, "CHANNEL_NOT_FOUND",
+                        "频道不存在: " + channelId));
+                continue;
+            }
+            if (repo.findDraft(channelId, businessDay).isEmpty()) {
+                failures.add(new SimulcastChannelFailure(channelId, "DRAFT_NOT_FOUND",
+                        "频道在该业务日无可用草稿: " + channelId));
+                continue;
+            }
+            boolean occupiedBySegment = repo.findDraftSegments(channelId, businessDay).stream()
+                    .anyMatch(s -> s.startMs() <= atMs && atMs < s.endMs());
+            if (occupiedBySegment) {
+                failures.add(new SimulcastChannelFailure(channelId, "SEGMENT_OCCUPIED",
+                        "该时刻已被草稿片段占用: " + channelId));
+                continue;
+            }
+            if (!repo.findActiveOverridesAt(channelId, atMs).isEmpty()) {
+                failures.add(new SimulcastChannelFailure(channelId, "OVERRIDE_OCCUPIED",
+                        "该时刻已被生效中的紧急插播占用: " + channelId));
+                continue;
+            }
+            if (repo.existsActiveMemberAt(channelId, businessDay, atMs)) {
+                failures.add(new SimulcastChannelFailure(channelId, "SIMULCAST_OCCUPIED",
+                        "该时刻已被其他联播组占位: " + channelId));
+                continue;
+            }
+            // 锁定覆盖该时刻的授权行：与授权撤销按提交顺序串行，撤销先提交则此处判为无有效授权。
+            Optional<GrantRow> grant = repo.findCoveringGrantsForUpdate(channelId, request.assetId(),
+                            atMs, atMs + 1).stream()
+                    .filter(g -> !g.revoked())
+                    .findFirst();
+            if (grant.isEmpty()) {
+                failures.add(new SimulcastChannelFailure(channelId, "NO_COVERING_GRANT",
+                        "素材授权未覆盖该频道该时刻: " + channelId));
+                continue;
+            }
+            selectedGrants.put(channelId, grant.get());
+        }
+        if (!failures.isEmpty()) {
+            throw new SimulcastLockException("SIMULCAST_VALIDATION_FAILED",
+                    "联播锁定校验失败，" + failures.size() + " 个频道不满足条件", failures);
+        }
+
+        long createdAtMs = nowMs();
+        try {
+            repo.insertSimulcastGroup(request.simulcastKey(), businessDay, request.assetId(),
+                    atMs, channelIds.size(), createdAtMs);
+        } catch (DuplicateKeyException e) {
+            throw ApiException.conflict("DUPLICATE_SIMULCAST_KEY",
+                    "联播组 simulcastKey 已存在: " + request.simulcastKey());
+        }
+        List<SimulcastPlaceholderResponse> placeholders = new ArrayList<>();
+        for (String channelId : channelIds) {
+            String placeholderSegmentId = UUID.randomUUID().toString();
+            GrantRow grant = selectedGrants.get(channelId);
+            try {
+                repo.insertSimulcastMember(request.simulcastKey(), channelId, businessDay,
+                        placeholderSegmentId, grant.id(), request.assetId(), atMs, createdAtMs);
+            } catch (DuplicateKeyException e) {
+                // 唯一索引兜底：同频道同时刻已被其他联播组占用（正常路径已被频道锁串行拦截）
+                throw new SimulcastLockException("SIMULCAST_VALIDATION_FAILED",
+                        "联播锁定校验失败，1 个频道不满足条件",
+                        List.of(new SimulcastChannelFailure(channelId, "SIMULCAST_OCCUPIED",
+                                "该时刻已被其他联播组占位: " + channelId)));
+            }
+            placeholders.add(new SimulcastPlaceholderResponse(request.simulcastKey(), channelId,
+                    placeholderSegmentId, request.assetId(), request.at(), grant.id()));
+        }
+        return new SimulcastLockResponse(request.simulcastKey(), businessDay.toString(),
+                request.assetId(), request.at(), SimulcastStatus.ACTIVE, placeholders,
+                null, null, atMs(createdAtMs));
+    }
+
+    /**
+     * 撤销整个联播组：须在计划播出时刻尚未到来前进行（now < at），开始后返回 409；
+     * 同事务写入不可变撤销历史并释放全部频道占位，不改写已发布快照。
+     * 携带 requestId 幂等：同键同参返回首次结果，改参 409，失败不占键。
+     */
+    @Transactional
+    public SimulcastLockResponse revokeSimulcastLock(String simulcastKey, String requestId) {
+        String hash = sha256(OP_REVOKE_SIMULCAST + "|" + simulcastKey);
+        return idempotent(requestId, OP_REVOKE_SIMULCAST, hash, SimulcastLockResponse.class, () -> {
+            SimulcastGroupRow group = repo.findSimulcastGroupForUpdate(simulcastKey)
+                    .orElseThrow(() -> ApiException.notFound("联播组不存在: " + simulcastKey));
+            if (!group.active()) {
+                throw ApiException.conflict("SIMULCAST_ALREADY_REVOKED",
+                        "联播组已撤销: " + simulcastKey);
+            }
+            long now = nowMs();
+            if (now >= group.atMs()) {
+                throw ApiException.conflict("SIMULCAST_ALREADY_STARTED",
+                        "联播已开始播出，不能撤销: " + simulcastKey);
+            }
+            int updated = repo.revokeSimulcastGroup(simulcastKey, requestId, now);
+            if (updated == 0) {
+                throw ApiException.conflict("SIMULCAST_ALREADY_REVOKED",
+                        "联播组已撤销: " + simulcastKey);
+            }
+            // 按字典序锁定全部频道行，与草稿替换/插播创建按提交顺序串行后，同事务释放全部占位。
+            repo.findSimulcastMembers(simulcastKey).stream()
+                    .map(SimulcastMemberRow::channelId)
+                    .sorted()
+                    .forEach(repo::lockChannelForUpdate);
+            repo.insertSimulcastRevocation(simulcastKey, requestId, group.channelCount(), now);
+            // 同事务释放全部频道占位：任何时刻不得只留下部分频道占位。
+            repo.deleteSimulcastMembers(simulcastKey);
+            return new SimulcastLockResponse(simulcastKey, group.businessDay().toString(),
+                    group.assetId(), atMs(group.atMs()), SimulcastStatus.REVOKED, List.of(),
+                    requestId, atMs(now), atMs(group.createdAtMs()));
+        });
+    }
+
+    /** 查询联播组：ACTIVE 时随附全部频道占位，REVOKED 时占位已释放并随附撤销情况。 */
+    @Transactional(readOnly = true)
+    public SimulcastLockResponse getSimulcastLock(String simulcastKey) {
+        SimulcastGroupRow group = repo.findSimulcastGroup(simulcastKey)
+                .orElseThrow(() -> ApiException.notFound("联播组不存在: " + simulcastKey));
+        List<SimulcastPlaceholderResponse> placeholders = repo.findSimulcastMembers(simulcastKey)
+                .stream().map(PlayoutService::toPlaceholderResponse).toList();
+        return new SimulcastLockResponse(simulcastKey, group.businessDay().toString(),
+                group.assetId(), atMs(group.atMs()),
+                group.active() ? SimulcastStatus.ACTIVE : SimulcastStatus.REVOKED, placeholders,
+                group.revokeRequestId(),
+                group.revokedAtMs() == null ? null : atMs(group.revokedAtMs()),
+                atMs(group.createdAtMs()));
+    }
+
+    /** 查询频道当前生效的联播占位；businessDay 为 null 时返回全部业务日。 */
+    @Transactional(readOnly = true)
+    public List<SimulcastPlaceholderResponse> listChannelPlaceholders(String channelId,
+                                                                      LocalDate businessDay) {
+        repo.findChannel(channelId)
+                .orElseThrow(() -> ApiException.notFound("频道不存在: " + channelId));
+        return repo.findChannelPlaceholders(channelId, businessDay).stream()
+                .map(PlayoutService::toPlaceholderResponse).toList();
+    }
+
+    /** 查询联播撤销历史；simulcastKey 为 null 时返回全部，只追加不改写。 */
+    @Transactional(readOnly = true)
+    public List<SimulcastRevocationResponse> listSimulcastRevocations(String simulcastKey) {
+        return repo.findSimulcastRevocations(simulcastKey).stream()
+                .map(r -> new SimulcastRevocationResponse(r.simulcastKey(), r.revokeRequestId(),
+                        r.channelCount(), atMs(r.revokedAtMs())))
+                .toList();
+    }
+
+    private static SimulcastPlaceholderResponse toPlaceholderResponse(SimulcastMemberRow member) {
+        return new SimulcastPlaceholderResponse(member.simulcastKey(), member.channelId(),
+                member.placeholderSegmentId(), member.assetId(), atMs(member.atMs()),
+                member.grantId());
+    }
+
+    private static LocalDate parseDay(String businessDay) {
+        try {
+            return LocalDate.parse(businessDay);
+        } catch (DateTimeParseException | NullPointerException e) {
+            throw ApiException.badRequest("业务日格式应为 yyyy-MM-dd: " + businessDay);
+        }
     }
 
     // ---------- 内部方法 ----------

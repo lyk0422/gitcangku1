@@ -74,7 +74,7 @@ CREATE TABLE IF NOT EXISTS playout_publication_segment (
 
 CREATE TABLE IF NOT EXISTS playout_request (
     request_id    VARCHAR(64)  NOT NULL COMMENT '幂等请求 ID，客户端生成',
-    operation     VARCHAR(32)  NOT NULL COMMENT '操作类型：REPLACE_DRAFT / PUBLISH / REVOKE_GRANT / CREATE_OVERRIDE / CANCEL_OVERRIDE',
+    operation     VARCHAR(32)  NOT NULL COMMENT '操作类型：REPLACE_DRAFT / PUBLISH / REVOKE_GRANT / CREATE_OVERRIDE / CANCEL_OVERRIDE / CREATE_SIMULCAST / REVOKE_SIMULCAST',
     params_hash   VARCHAR(64)  NOT NULL COMMENT '业务参数（不含 requestId）的 SHA-256，十六进制',
     response_body TEXT         NULL COMMENT '成功时的响应 JSON；失败请求回滚不占用 requestId',
     created_at_ms BIGINT       NOT NULL COMMENT '记录创建时间，UTC 纪元毫秒',
@@ -97,3 +97,40 @@ CREATE TABLE IF NOT EXISTS playout_emergency_override (
     PRIMARY KEY (override_key),
     KEY idx_override_playout (channel_id, status, start_ms, end_ms, priority)
 ) COMMENT = '限时紧急插播表；不改写日草稿与发布快照，同频道同优先级 ACTIVE 区间不得重叠';
+
+CREATE TABLE IF NOT EXISTS playout_simulcast_group (
+    simulcast_key     VARCHAR(64) NOT NULL COMMENT '联播组全局唯一键，客户端指定，创建后不变；撤销后键不可复用',
+    business_day      DATE        NOT NULL COMMENT '联播业务日，Asia/Shanghai 日历日；计划时刻须落在该日内',
+    asset_id          VARCHAR(64) NOT NULL COMMENT '联播素材 ID，全部频道共用，创建后固化',
+    at_ms             BIGINT      NOT NULL COMMENT '计划播出时刻，UTC 纪元毫秒，全部频道共用，创建后固化',
+    channel_count     INT         NOT NULL COMMENT '联播频道数，创建时固化，取值 2～8',
+    status            VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE 生效中 / REVOKED 已撤销；创建即 ACTIVE，只能整组撤销',
+    revoke_request_id VARCHAR(64) NULL COMMENT '撤销操作的幂等请求 ID；未撤销时为 NULL',
+    revoked_at_ms     BIGINT      NULL COMMENT '撤销时间，UTC 纪元毫秒；未撤销时为 NULL',
+    created_at_ms     BIGINT      NOT NULL COMMENT '创建时间，UTC 纪元毫秒',
+    PRIMARY KEY (simulcast_key)
+) COMMENT = '联播锁定组表；与全部频道占位同事务写入，任一频道校验失败则整组不写入';
+
+CREATE TABLE IF NOT EXISTS playout_simulcast_member (
+    simulcast_key          VARCHAR(64) NOT NULL COMMENT '所属联播组键',
+    channel_id             VARCHAR(64) NOT NULL COMMENT '占位频道 ID',
+    business_day           DATE        NOT NULL COMMENT '占位业务日，Asia/Shanghai 日历日，与联播组一致',
+    placeholder_segment_id VARCHAR(64) NOT NULL COMMENT '联播占位片段 ID，系统生成；草稿整份替换时须原样携带，删除或改时返回 409',
+    grant_id               BIGINT      NOT NULL COMMENT '创建锁定时为该频道选定的覆盖授权 ID，固化授权版本，撤销授权不改写',
+    asset_id               VARCHAR(64) NOT NULL COMMENT '联播素材 ID，与联播组一致',
+    at_ms                  BIGINT      NOT NULL COMMENT '计划播出时刻，UTC 纪元毫秒，与联播组一致',
+    created_at_ms          BIGINT      NOT NULL COMMENT '创建时间，UTC 纪元毫秒',
+    PRIMARY KEY (simulcast_key, channel_id),
+    UNIQUE KEY uk_member_moment (channel_id, business_day, at_ms),
+    KEY idx_member_channel_day (channel_id, business_day)
+) COMMENT = '联播频道占位表；撤销整组时同事务删除全部占位，任何时刻不得只留下部分频道占位';
+
+CREATE TABLE IF NOT EXISTS playout_simulcast_revocation (
+    id                BIGINT      NOT NULL AUTO_INCREMENT COMMENT '撤销历史自增 ID',
+    simulcast_key     VARCHAR(64) NOT NULL COMMENT '被撤销的联播组键',
+    revoke_request_id VARCHAR(64) NOT NULL COMMENT '撤销操作的幂等请求 ID',
+    channel_count     INT         NOT NULL COMMENT '撤销时释放的频道占位数',
+    revoked_at_ms     BIGINT      NOT NULL COMMENT '撤销时间，UTC 纪元毫秒',
+    PRIMARY KEY (id),
+    KEY idx_revocation_key (simulcast_key)
+) COMMENT = '联播撤销历史表，只追加不改写；撤销不改写已发布快照';

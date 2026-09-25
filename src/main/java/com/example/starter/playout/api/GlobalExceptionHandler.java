@@ -1,6 +1,7 @@
 package com.example.starter.playout.api;
 
 import com.example.starter.playout.api.Dtos.ErrorResponse;
+import com.example.starter.playout.api.Dtos.SimulcastLockErrorResponse;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -25,6 +26,13 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorResponse> handleApi(ApiException ex) {
         return ResponseEntity.status(ex.status())
                 .body(new ErrorResponse(ex.code(), ex.getMessage()));
+    }
+
+    /** 联播锁定 422：在统一错误体上扩展逐频道失败原因。 */
+    @ExceptionHandler(SimulcastLockException.class)
+    public ResponseEntity<SimulcastLockErrorResponse> handleSimulcastLock(SimulcastLockException ex) {
+        return ResponseEntity.status(ex.status())
+                .body(new SimulcastLockErrorResponse(ex.code(), ex.getMessage(), ex.failures()));
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)

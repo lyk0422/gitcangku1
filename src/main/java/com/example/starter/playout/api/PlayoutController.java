@@ -11,11 +11,16 @@ import com.example.starter.playout.api.Dtos.DraftResponse;
 import com.example.starter.playout.api.Dtos.EmergencyOverrideResponse;
 import com.example.starter.playout.api.Dtos.GrantResponse;
 import com.example.starter.playout.api.Dtos.CancelEmergencyOverrideRequest;
+import com.example.starter.playout.api.Dtos.CreateSimulcastLockRequest;
 import com.example.starter.playout.api.Dtos.PlayoutDecisionResponse;
 import com.example.starter.playout.api.Dtos.PublishRequest;
 import com.example.starter.playout.api.Dtos.PublishResponse;
 import com.example.starter.playout.api.Dtos.ReplaceDraftRequest;
 import com.example.starter.playout.api.Dtos.RevokeGrantRequest;
+import com.example.starter.playout.api.Dtos.RevokeSimulcastLockRequest;
+import com.example.starter.playout.api.Dtos.SimulcastLockResponse;
+import com.example.starter.playout.api.Dtos.SimulcastPlaceholderResponse;
+import com.example.starter.playout.api.Dtos.SimulcastRevocationResponse;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import org.springframework.format.annotation.DateTimeFormat;
@@ -32,6 +37,7 @@ import org.springframework.web.bind.annotation.RestController;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeParseException;
+import java.util.List;
 
 /**
  * 播出编排 REST API。成功响应统一 200；错误区分 400 参数错误、404 资源不存在、
@@ -117,6 +123,43 @@ public class PlayoutController {
     @GetMapping("/emergency-overrides/{overrideKey}")
     public EmergencyOverrideResponse emergencyOverride(@PathVariable @NotBlank String overrideKey) {
         return service.getEmergencyOverride(overrideKey);
+    }
+
+    /** 创建联播锁定（单事务逐频道校验，任一频道不满足整次 422，携带 requestId 幂等）。 */
+    @PostMapping("/simulcast-locks")
+    public SimulcastLockResponse createSimulcastLock(
+            @Valid @RequestBody CreateSimulcastLockRequest request) {
+        return service.createSimulcastLock(request);
+    }
+
+    /** 撤销整个联播组（须在开始播出前，携带 requestId 幂等）。 */
+    @PostMapping("/simulcast-locks/{simulcastKey}/revoke")
+    public SimulcastLockResponse revokeSimulcastLock(
+            @PathVariable @NotBlank String simulcastKey,
+            @Valid @RequestBody RevokeSimulcastLockRequest request) {
+        return service.revokeSimulcastLock(simulcastKey, request.requestId());
+    }
+
+    /** 查询联播组：ACTIVE 随附全部频道占位，REVOKED 随附撤销情况。 */
+    @GetMapping("/simulcast-locks/{simulcastKey}")
+    public SimulcastLockResponse simulcastLock(@PathVariable @NotBlank String simulcastKey) {
+        return service.getSimulcastLock(simulcastKey);
+    }
+
+    /** 查询频道当前生效的联播占位，可按业务日过滤。 */
+    @GetMapping("/channels/{channelId}/simulcast-placeholders")
+    public List<SimulcastPlaceholderResponse> channelPlaceholders(
+            @PathVariable @NotBlank String channelId,
+            @RequestParam(required = false) String businessDay) {
+        return service.listChannelPlaceholders(channelId,
+                businessDay == null ? null : parseBusinessDay(businessDay));
+    }
+
+    /** 查询联播撤销历史（只追加不改写），可按联播组键过滤。 */
+    @GetMapping("/simulcast-revocations")
+    public List<SimulcastRevocationResponse> simulcastRevocations(
+            @RequestParam(required = false) String simulcastKey) {
+        return service.listSimulcastRevocations(simulcastKey);
     }
 
     private static LocalDate parseBusinessDay(String businessDay) {
