@@ -13,6 +13,7 @@ import com.example.starter.consent.dto.GrantResponse;
 import com.example.starter.consent.dto.RecordResponse;
 import com.example.starter.consent.dto.RecordWriteRequest;
 import com.example.starter.consent.dto.RevokeRequest;
+import com.example.starter.consent.dto.RevokeResponse;
 
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
@@ -37,7 +38,7 @@ public class ConsentController {
     }
 
     @PostMapping("/consents/revocations")
-    public GrantResponse revoke(@Valid @RequestBody RevokeRequest request) {
+    public RevokeResponse revoke(@Valid @RequestBody RevokeRequest request) {
         return consentService.revoke(request);
     }
 

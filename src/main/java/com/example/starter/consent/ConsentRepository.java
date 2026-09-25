@@ -1,5 +1,7 @@
 package com.example.starter.consent;
 
+import java.sql.Timestamp;
+import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 
@@ -17,7 +19,8 @@ public class ConsentRepository {
             rs.getString("subject_key"),
             Purpose.valueOf(rs.getString("purpose")),
             rs.getInt("epoch"),
-            GrantStatus.valueOf(rs.getString("status")));
+            GrantStatus.valueOf(rs.getString("status")),
+            Optional.ofNullable(rs.getTimestamp("purged_at")).map(Timestamp::toInstant).orElse(null));
 
     private static final RowMapper<RecordRow> RECORD_MAPPER = (rs, rowNum) -> new RecordRow(
             rs.getString("subject_key"),
@@ -39,8 +42,9 @@ public class ConsentRepository {
      * @param purpose    用途
      * @param epoch      代次，从 1 开始
      * @param status     状态：ACTIVE 有效 / REVOKED 已撤回
+     * @param purgedAt   物理清除时间（UTC），null 表示尚未清除
      */
-    public record GrantRow(String subjectKey, Purpose purpose, int epoch, GrantStatus status) {
+    public record GrantRow(String subjectKey, Purpose purpose, int epoch, GrantStatus status, Instant purgedAt) {
     }
 
     /**
@@ -57,18 +61,39 @@ public class ConsentRepository {
 
     Optional<GrantRow> findGrant(String subjectKey, Purpose purpose, int epoch) {
         List<GrantRow> rows = jdbc.query(
-                "SELECT subject_key, purpose, epoch, status FROM consent_grant"
+                "SELECT subject_key, purpose, epoch, status, purged_at FROM consent_grant"
                         + " WHERE subject_key = ? AND purpose = ? AND epoch = ?",
+                GRANT_MAPPER, subjectKey, purpose.name(), epoch);
+        return rows.stream().findFirst();
+    }
+
+    /**
+     * 锁定授权代次行（SELECT ... FOR UPDATE），供撤回/清除/冻结在同一事务内串行裁决。
+     * H2 MySQL 兼容模式与 MySQL 均支持该语法。
+     */
+    Optional<GrantRow> lockGrant(String subjectKey, Purpose purpose, int epoch) {
+        List<GrantRow> rows = jdbc.query(
+                "SELECT subject_key, purpose, epoch, status, purged_at FROM consent_grant"
+                        + " WHERE subject_key = ? AND purpose = ? AND epoch = ? FOR UPDATE",
                 GRANT_MAPPER, subjectKey, purpose.name(), epoch);
         return rows.stream().findFirst();
     }
 
     Optional<GrantRow> findLatestGrant(String subjectKey, Purpose purpose) {
         List<GrantRow> rows = jdbc.query(
-                "SELECT subject_key, purpose, epoch, status FROM consent_grant"
+                "SELECT subject_key, purpose, epoch, status, purged_at FROM consent_grant"
                         + " WHERE subject_key = ? AND purpose = ? ORDER BY epoch DESC LIMIT 1",
                 GRANT_MAPPER, subjectKey, purpose.name());
         return rows.stream().findFirst();
+    }
+
+    /**
+     * 锁定最新授权代次行（SELECT ... FOR UPDATE），供写入与冻结/撤回并发裁决。
+     * 先查最新代次再按主键加行锁，规避 H2/MySQL 对 LIMIT 与 FOR UPDATE 组合的语法差异。
+     */
+    Optional<GrantRow> lockLatestGrant(String subjectKey, Purpose purpose) {
+        return findLatestGrant(subjectKey, purpose)
+                .flatMap(latest -> lockGrant(subjectKey, purpose, latest.epoch()));
     }
 
     void insertGrant(String subjectKey, Purpose purpose, int epoch, String requestId) {
@@ -89,12 +114,38 @@ public class ConsentRepository {
         return updated > 0;
     }
 
+    /** 标记代次已物理清除（仅允许清除一次）。 */
+    boolean markPurged(String subjectKey, Purpose purpose, int epoch, Instant purgedAt) {
+        int updated = jdbc.update(
+                "UPDATE consent_grant SET purged_at = ?"
+                        + " WHERE subject_key = ? AND purpose = ? AND epoch = ?"
+                        + " AND status = 'REVOKED' AND purged_at IS NULL",
+                Timestamp.from(purgedAt), subjectKey, purpose.name(), epoch);
+        return updated > 0;
+    }
+
     Optional<RecordRow> findRecord(String subjectKey, Purpose purpose, int epoch, String recordKey) {
         List<RecordRow> rows = jdbc.query(
                 "SELECT subject_key, purpose, epoch, record_key, payload FROM consent_record"
                         + " WHERE subject_key = ? AND purpose = ? AND epoch = ? AND record_key = ?",
                 RECORD_MAPPER, subjectKey, purpose.name(), epoch, recordKey);
         return rows.stream().findFirst();
+    }
+
+    int countRecords(String subjectKey, Purpose purpose, int epoch) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM consent_record"
+                        + " WHERE subject_key = ? AND purpose = ? AND epoch = ?",
+                Integer.class, subjectKey, purpose.name(), epoch);
+        return count == null ? 0 : count;
+    }
+
+    /** 物理删除指定代次的全部记录，返回删除条数。 */
+    int deleteRecordsForEpoch(String subjectKey, Purpose purpose, int epoch) {
+        return jdbc.update(
+                "DELETE FROM consent_record"
+                        + " WHERE subject_key = ? AND purpose = ? AND epoch = ?",
+                subjectKey, purpose.name(), epoch);
     }
 
     void insertRecord(String subjectKey, Purpose purpose, int epoch, String recordKey, String payload, String requestId) {

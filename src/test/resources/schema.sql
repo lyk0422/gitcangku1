@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS consent_grant (
     request_id VARCHAR(128) NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     revoked_at TIMESTAMP NULL DEFAULT NULL,
+    purged_at TIMESTAMP NULL DEFAULT NULL,
     PRIMARY KEY (subject_key, purpose, epoch)
 );
 
@@ -28,4 +29,36 @@ CREATE TABLE IF NOT EXISTS idempotency_request (
     response_body TEXT NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (request_id)
+);
+
+CREATE TABLE IF NOT EXISTS retention_hold (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    hold_key VARCHAR(128) NOT NULL,
+    subject_key VARCHAR(128) NOT NULL,
+    purpose VARCHAR(32) NOT NULL,
+    epoch INT NOT NULL,
+    reason VARCHAR(512) NOT NULL,
+    created_by VARCHAR(128) NOT NULL,
+    expires_at TIMESTAMP NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    released_at TIMESTAMP NULL DEFAULT NULL,
+    PRIMARY KEY (id),
+    UNIQUE (hold_key),
+    UNIQUE (subject_key, purpose, epoch, hold_key)
+);
+
+CREATE TABLE IF NOT EXISTS retention_hold_release (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    hold_id BIGINT NOT NULL,
+    hold_key VARCHAR(128) NOT NULL,
+    subject_key VARCHAR(128) NOT NULL,
+    purpose VARCHAR(32) NOT NULL,
+    epoch INT NOT NULL,
+    released_by VARCHAR(128) NOT NULL,
+    note VARCHAR(1024) NOT NULL,
+    released_at TIMESTAMP NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    UNIQUE (hold_id)
 );
