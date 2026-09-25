@@ -1,5 +1,7 @@
 package com.example.starter.translation.repo;
 
+import com.example.starter.translation.domain.Rows.ApprovalBatchItemRow;
+import com.example.starter.translation.domain.Rows.ApprovalBatchRow;
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
 import com.example.starter.translation.domain.Rows.RequestLogRow;
@@ -39,6 +41,16 @@ public class TranslationRepository {
     private static final RowMapper<ApprovalRow> APPROVAL_MAPPER = (rs, n) -> new ApprovalRow(
             rs.getString("segment_id"), rs.getString("language"), rs.getString("reviewer"),
             rs.getInt("source_version"), rs.getInt("translation_version"));
+
+    private static final RowMapper<ApprovalBatchRow> APPROVAL_BATCH_MAPPER = (rs, n) -> new ApprovalBatchRow(
+            rs.getString("batch_key"), rs.getLong("document_id"), rs.getInt("draft_version"),
+            rs.getString("reviewer"), rs.getInt("item_count"),
+            rs.getTimestamp("approved_at").toLocalDateTime());
+
+    private static final RowMapper<ApprovalBatchItemRow> APPROVAL_BATCH_ITEM_MAPPER =
+            (rs, n) -> new ApprovalBatchItemRow(
+                    rs.getString("batch_key"), rs.getString("segment_id"), rs.getString("language"),
+                    rs.getInt("translation_version"));
 
     private final JdbcTemplate jdbc;
 
@@ -175,6 +187,46 @@ public class TranslationRepository {
                     documentId, row.segmentId(), row.language(), row.reviewer(),
                     row.sourceVersion(), row.translationVersion());
         }
+    }
+
+    /** 插入不可变批量审核记录；approvedAt 由应用生成并固化，与响应一致。 */
+    public void insertApprovalBatch(ApprovalBatchRow row) {
+        jdbc.update("INSERT INTO approval_batch (batch_key, document_id, draft_version, reviewer, item_count, "
+                        + "approved_at) VALUES (?, ?, ?, ?, ?, ?)",
+                row.batchKey(), row.documentId(), row.draftVersion(), row.reviewer(), row.itemCount(),
+                row.approvedAt());
+    }
+
+    /** 插入不可变批量审核译文明细。 */
+    public void insertApprovalBatchItem(long documentId, ApprovalBatchItemRow row) {
+        jdbc.update("INSERT INTO approval_batch_item (batch_key, document_id, segment_id, language, "
+                        + "translation_version) VALUES (?, ?, ?, ?, ?)",
+                row.batchKey(), documentId, row.segmentId(), row.language(), row.translationVersion());
+    }
+
+    /** 按批次键查询批量审核记录。 */
+    public Optional<ApprovalBatchRow> findApprovalBatch(String batchKey) {
+        List<ApprovalBatchRow> rows = jdbc.query(
+                "SELECT batch_key, document_id, draft_version, reviewer, item_count, approved_at "
+                        + "FROM approval_batch WHERE batch_key = ?",
+                APPROVAL_BATCH_MAPPER, batchKey);
+        return rows.stream().findFirst();
+    }
+
+    /** 查询文档的全部批量审核记录，按批准时刻与批次键稳定排序。 */
+    public List<ApprovalBatchRow> listApprovalBatches(long documentId) {
+        return jdbc.query(
+                "SELECT batch_key, document_id, draft_version, reviewer, item_count, approved_at "
+                        + "FROM approval_batch WHERE document_id = ? ORDER BY approved_at, batch_key",
+                APPROVAL_BATCH_MAPPER, documentId);
+    }
+
+    /** 查询批次的译文批准明细，按段落与语言稳定排序。 */
+    public List<ApprovalBatchItemRow> listApprovalBatchItems(String batchKey) {
+        return jdbc.query(
+                "SELECT batch_key, segment_id, language, translation_version "
+                        + "FROM approval_batch_item WHERE batch_key = ? ORDER BY segment_id, language",
+                APPROVAL_BATCH_ITEM_MAPPER, batchKey);
     }
 
     public void insertSnapshot(long documentId, int publishedVersion, String snapshotJson) {

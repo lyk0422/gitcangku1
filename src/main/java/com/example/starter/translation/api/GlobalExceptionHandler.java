@@ -21,6 +21,13 @@ public class GlobalExceptionHandler {
                 .body(new ApiDtos.ErrorResponse(ex.code(), ex.getMessage()));
     }
 
+    /** 批量审核校验失败：422，逐条失败原因，整批不批准。 */
+    @ExceptionHandler(BatchApprovalException.class)
+    public ResponseEntity<ApiDtos.BatchErrorResponse> handleBatchApproval(BatchApprovalException ex) {
+        return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
+                .body(new ApiDtos.BatchErrorResponse("UNPROCESSABLE", ex.getMessage(), ex.failures()));
+    }
+
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ResponseEntity<ApiDtos.ErrorResponse> handleValidation(MethodArgumentNotValidException ex) {
         String message = ex.getBindingResult().getFieldErrors().stream()

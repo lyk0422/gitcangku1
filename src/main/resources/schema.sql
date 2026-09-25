@@ -81,6 +81,39 @@ COMMENT ON COLUMN release_snapshot.published_version IS '发布版本号，从 1
 COMMENT ON COLUMN release_snapshot.snapshot_json IS '快照内容 JSON：全部段落源文及各语言译文、作者、审核人与版本号';
 COMMENT ON COLUMN release_snapshot.created_at IS '发布时间，数据库默认时区';
 
+CREATE TABLE IF NOT EXISTS approval_batch (
+    batch_key VARCHAR(128) PRIMARY KEY,
+    document_id BIGINT NOT NULL,
+    draft_version INT NOT NULL,
+    reviewer VARCHAR(128) NOT NULL,
+    item_count INT NOT NULL,
+    approved_at TIMESTAMP NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+COMMENT ON TABLE approval_batch IS '批量审核记录：不可变，批量批准成功时原子写入；batchKey 全局唯一';
+COMMENT ON COLUMN approval_batch.batch_key IS '全局唯一批次键，由审核人提交，同键同参重放首次响应';
+COMMENT ON COLUMN approval_batch.document_id IS '所属文档 ID';
+COMMENT ON COLUMN approval_batch.draft_version IS '审核人提交的文档草稿版本（expectedDraftVersion），仅固化记录，不作为整批前置条件';
+COMMENT ON COLUMN approval_batch.reviewer IS '审核人，取批量审核时 X-Actor-Id，不得是任一批内译文作者';
+COMMENT ON COLUMN approval_batch.item_count IS '批内译文条数，1~50';
+COMMENT ON COLUMN approval_batch.approved_at IS '批量批准时刻，数据库默认时区，由应用生成并固化';
+COMMENT ON COLUMN approval_batch.created_at IS '记录时间，数据库默认时区';
+
+CREATE TABLE IF NOT EXISTS approval_batch_item (
+    batch_key VARCHAR(128) NOT NULL,
+    document_id BIGINT NOT NULL,
+    segment_id VARCHAR(64) NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    translation_version INT NOT NULL,
+    PRIMARY KEY (batch_key, segment_id, language)
+);
+COMMENT ON TABLE approval_batch_item IS '批量审核译文明细：不可变，按批次记录批准的译文标识及各自译文版本';
+COMMENT ON COLUMN approval_batch_item.batch_key IS '所属批次键，关联 approval_batch';
+COMMENT ON COLUMN approval_batch_item.document_id IS '所属文档 ID';
+COMMENT ON COLUMN approval_batch_item.segment_id IS '所属段落 ID';
+COMMENT ON COLUMN approval_batch_item.language IS '目标语言码，小写';
+COMMENT ON COLUMN approval_batch_item.translation_version IS '批准时的译文版本';
+
 CREATE TABLE IF NOT EXISTS request_log (
     request_id VARCHAR(128) PRIMARY KEY,
     request_hash VARCHAR(64) NOT NULL,

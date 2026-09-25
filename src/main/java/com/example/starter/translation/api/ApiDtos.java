@@ -64,6 +64,24 @@ public final class ApiDtos {
             @PositiveOrZero(message = "expectedPublishedVersion 不能为负数") int expectedPublishedVersion) {
     }
 
+    /** 批量审核单条译文输入：译文标识及各自期望译文版本。 */
+    public record BatchApprovalItemInput(
+            @NotBlank(message = "segmentId 不能为空") @Size(max = 64) String segmentId,
+            @NotBlank(message = "language 不能为空") @Size(max = 16) String language,
+            @Positive(message = "expectedTranslationVersion 必须为正数") int expectedTranslationVersion) {
+    }
+
+    /**
+     * 批量审核请求：batchKey 全局唯一做幂等去重；expectedDraftVersion 仅固化进批量记录；
+     * items 为 1~50 条译文标识，同一译文标识不得重复（重复返回 400）。
+     */
+    public record BatchApproveRequest(
+            @NotBlank(message = "batchKey 不能为空") @Size(max = 128) String batchKey,
+            @Positive(message = "expectedDraftVersion 必须为正数") int expectedDraftVersion,
+            @NotNull(message = "items 不能为空") @Size(min = 1, max = 50, message = "批量审核须为 1~50 条译文")
+            List<@Valid BatchApprovalItemInput> items) {
+    }
+
     /** 建文档响应。 */
     public record DocumentResponse(long documentId, int draftVersion, int publishedVersion,
                                    List<String> targetLanguages) {
@@ -85,6 +103,31 @@ public final class ApiDtos {
 
     /** 发布响应。 */
     public record PublishResponse(long documentId, int publishedVersion) {
+    }
+
+    /** 批量审核单条译文批准明细。 */
+    public record BatchApprovalItemResponse(String segmentId, String language, int translationVersion) {
+    }
+
+    /**
+     * 批量审核响应/记录：固化审核人提交的文档草稿版本、译文清单及各自版本、审核人与时刻。
+     * approvedAt 为 ISO 本地时间字符串（数据库默认时区）。
+     */
+    public record BatchApprovalResponse(String batchKey, long documentId, int draftVersion, String reviewer,
+                                        String approvedAt, List<BatchApprovalItemResponse> items) {
+    }
+
+    /** 批量审核记录摘要（列表查询用，不含明细）。 */
+    public record BatchApprovalSummary(String batchKey, long documentId, int draftVersion, String reviewer,
+                                       String approvedAt, int itemCount) {
+    }
+
+    /** 批量审核单条校验失败原因。 */
+    public record BatchItemFailure(String segmentId, String language, String reason) {
+    }
+
+    /** 批量审核 422 错误响应：整批不批准，逐条给出失败原因。 */
+    public record BatchErrorResponse(String error, String message, List<BatchItemFailure> failures) {
     }
 
     /** 统一错误响应。 */

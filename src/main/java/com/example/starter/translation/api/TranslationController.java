@@ -19,7 +19,9 @@ import org.springframework.web.bind.annotation.RestController;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.Comparator;
 import java.util.HexFormat;
+import java.util.List;
 
 /**
  * 多语种段落修订与发布快照 REST API。
@@ -99,6 +101,44 @@ public class TranslationController {
         String operation = "POST /api/documents/" + documentId + "/publish";
         return writeExecutor.execute(request.requestId(), hash(operation, request),
                 () -> WriteResult.of(201, translationService.publish(documentId, request))).toResponseEntity();
+    }
+
+    /**
+     * 批量审核：batchKey 全局唯一做幂等去重；译文标识集合换序视为同参（按排序后的清单计算摘要），
+     * 同键异参 409，失败不占键；任一条校验失败整批 422 且不批准任何一条。
+     */
+    @PostMapping("/{documentId}/approvals/batch")
+    public ResponseEntity<String> approveBatch(@PathVariable long documentId,
+                                               @RequestHeader("X-Actor-Id") String actorId,
+                                               @Valid @RequestBody ApiDtos.BatchApproveRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/approvals/batch";
+        return writeExecutor.execute(request.batchKey(), hash(operation, actorId, canonicalBatch(request)),
+                () -> WriteResult.of(200, translationService.approveBatch(documentId, actorId, request)))
+                .toResponseEntity();
+    }
+
+    /** 查询文档的全部批量审核记录摘要，只读稳定排序。 */
+    @GetMapping("/{documentId}/approval-batches")
+    public ResponseEntity<List<ApiDtos.BatchApprovalSummary>> listApprovalBatches(
+            @PathVariable long documentId) {
+        return ResponseEntity.ok(translationService.listApprovalBatches(documentId));
+    }
+
+    /** 查询批量审核记录及该批次的译文批准明细，只读稳定排序。 */
+    @GetMapping("/{documentId}/approval-batches/{batchKey}")
+    public ResponseEntity<ApiDtos.BatchApprovalResponse> getApprovalBatch(@PathVariable long documentId,
+                                                                          @PathVariable String batchKey) {
+        return ResponseEntity.ok(translationService.getApprovalBatch(documentId, batchKey));
+    }
+
+    /** 规范化批量审核请求：译文清单按段落与语言排序，使换序请求得到相同摘要。 */
+    private static ApiDtos.BatchApproveRequest canonicalBatch(ApiDtos.BatchApproveRequest request) {
+        List<ApiDtos.BatchApprovalItemInput> sorted = request.items().stream()
+                .sorted(Comparator.comparing(ApiDtos.BatchApprovalItemInput::segmentId)
+                        .thenComparing(ApiDtos.BatchApprovalItemInput::language)
+                        .thenComparingInt(ApiDtos.BatchApprovalItemInput::expectedTranslationVersion))
+                .toList();
+        return new ApiDtos.BatchApproveRequest(request.batchKey(), request.expectedDraftVersion(), sorted);
     }
 
     /** 查询指定发布版本的只读快照。 */

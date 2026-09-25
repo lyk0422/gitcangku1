@@ -24,6 +24,11 @@ public class ApiException extends RuntimeException {
         return code;
     }
 
+    /** 400：请求参数不合法（如批内译文标识重复）。 */
+    public static ApiException badRequest(String message) {
+        return new ApiException(HttpStatus.BAD_REQUEST, "BAD_REQUEST", message);
+    }
+
     /** 404：资源不存在。 */
     public static ApiException notFound(String message) {
         return new ApiException(HttpStatus.NOT_FOUND, "NOT_FOUND", message);

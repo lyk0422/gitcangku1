@@ -1,5 +1,6 @@
 package com.example.starter.translation.domain;
 
+import java.time.LocalDateTime;
 import java.util.List;
 
 /**
@@ -57,6 +58,32 @@ public final class Rows {
      */
     public record ApprovalRow(String segmentId, String language, String reviewer,
                               int sourceVersion, int translationVersion) {
+    }
+
+    /**
+     * 批量审核记录：不可变，批量批准成功时原子写入；batchKey 全局唯一。
+     *
+     * @param batchKey     全局唯一批次键，由审核人提交，同键同参重放首次响应
+     * @param documentId   所属文档 ID
+     * @param draftVersion 审核人提交的文档草稿版本（expectedDraftVersion），仅固化记录，不作为整批前置条件
+     * @param reviewer     审核人，取批量审核时 X-Actor-Id，不得是任一批内译文作者
+     * @param itemCount    批内译文条数，1~50
+     * @param approvedAt   批量批准时刻，数据库默认时区，由应用生成并固化
+     */
+    public record ApprovalBatchRow(String batchKey, long documentId, int draftVersion, String reviewer,
+                                   int itemCount, LocalDateTime approvedAt) {
+    }
+
+    /**
+     * 批量审核译文明细：不可变，按批次记录批准的译文标识及各自译文版本。
+     *
+     * @param batchKey           所属批次键，关联 approval_batch
+     * @param segmentId          所属段落 ID
+     * @param language           目标语言码，小写
+     * @param translationVersion 批准时的译文版本
+     */
+    public record ApprovalBatchItemRow(String batchKey, String segmentId, String language,
+                                       int translationVersion) {
     }
 
     /**
