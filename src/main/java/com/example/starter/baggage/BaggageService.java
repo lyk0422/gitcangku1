@@ -17,6 +17,10 @@ import org.springframework.stereotype.Service;
 import com.example.starter.baggage.BaggageDtos.ArriveRequest;
 import com.example.starter.baggage.BaggageDtos.ArriveResponse;
 import com.example.starter.baggage.BaggageDtos.BagResponse;
+import com.example.starter.baggage.BaggageDtos.CutoffExceptionItem;
+import com.example.starter.baggage.BaggageDtos.CutoffExceptionListResponse;
+import com.example.starter.baggage.BaggageDtos.CutoffResponse;
+import com.example.starter.baggage.BaggageDtos.CutoffUpdateResponse;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveRequest;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveResponse;
 import com.example.starter.baggage.BaggageDtos.ItineraryItem;
@@ -24,7 +28,9 @@ import com.example.starter.baggage.BaggageDtos.LegDifferenceResponse;
 import com.example.starter.baggage.BaggageDtos.LegResponse;
 import com.example.starter.baggage.BaggageDtos.LoadRequest;
 import com.example.starter.baggage.BaggageDtos.LoadResponse;
+import com.example.starter.baggage.BaggageDtos.LoadStatusResponse;
 import com.example.starter.baggage.BaggageDtos.ManifestResponse;
+import com.example.starter.baggage.BaggageDtos.ReassignRequest;
 import com.example.starter.baggage.BaggageDtos.RecoverRequest;
 import com.example.starter.baggage.BaggageDtos.RecoverResponse;
 import com.example.starter.baggage.BaggageDtos.RegisterBagRequest;
@@ -34,6 +40,7 @@ import com.example.starter.baggage.BaggageDtos.SealResponse;
 import com.example.starter.baggage.BaggageDtos.ShortItem;
 import com.example.starter.baggage.BaggageDtos.ShortListResponse;
 import com.example.starter.baggage.BaggageDtos.TraceEvent;
+import com.example.starter.baggage.BaggageDtos.UpdateCutoffRequest;
 
 /**
  * 联程行李装载交接核心业务：航段/行李登记、批量装载、封舱、精确/差异到达、补到与查询。
@@ -42,6 +49,10 @@ import com.example.starter.baggage.BaggageDtos.TraceEvent;
  * load_record 以 bag_tag 为主键保证同件行李不会进入两个清单。
  * 差异到达仅允许 SEALED 航段提交封舱清单子集；缺失行李转 SHORT_UNLOADED 并冻结待乘索引，
  * 补到前无法装载任何后续航段，补到提交后才恢复参与装载。
+ * 航段截载控制：航段可配置 UTC 截载时刻（必须早于起飞时刻，expectedVersion 做并发版本校验），
+ * 装载与补到以可注入时钟判定，当前时刻大于等于截载时刻即 422 并给出截载时刻；
+ * 截载修改不追溯既有装载记录，若早于已有装载时刻则登记不可变超截载例外清单；
+ * 剩余行程改派替换自当前待乘航段起的行程，后续装载使用新航段截载时刻。
  */
 @Service
 public class BaggageService {
@@ -62,11 +73,13 @@ public class BaggageService {
     private static final String EVT_SHORT = "SHORT_UNLOADED";
     private static final String EVT_RECOVERED = "RECOVERED";
     private static final String EVT_DELIVERED = "DELIVERED";
+    private static final String EVT_REASSIGNED = "REASSIGNED";
 
     private static final RowMapper<LegRow> LEG_MAPPER = (rs, rowNum) -> new LegRow(
             rs.getString("leg_id"), rs.getString("origin"), rs.getString("destination"),
             rs.getString("status"), rs.getInt("version"), rs.getString("sealed_manifest"),
-            rs.getString("arrival_type"), rs.getString("arrival_actual"));
+            rs.getString("arrival_type"), rs.getString("arrival_actual"),
+            getInstant(rs, "departure_time"), getInstant(rs, "cutoff_time"));
 
     private static final RowMapper<BagRow> BAG_MAPPER = (rs, rowNum) -> new BagRow(
             rs.getString("bag_tag"), rs.getString("current_location"),
@@ -85,6 +98,13 @@ public class BaggageService {
             rs.getString("bag_tag"), rs.getString("short_leg_id"), rs.getString("short_destination"),
             getInstant(rs, "short_registered_at").toString(),
             rs.getInt("next_leg_index"), rs.getString("current_location"));
+
+    private static final RowMapper<LoadRecordRow> LOAD_RECORD_MAPPER = (rs, rowNum) -> new LoadRecordRow(
+            rs.getString("bag_tag"), getInstant(rs, "loaded_at"));
+
+    private static final RowMapper<CutoffExceptionItem> EXCEPTION_MAPPER = (rs, rowNum) -> new CutoffExceptionItem(
+            rs.getString("leg_id"), rs.getString("bag_tag"),
+            getInstant(rs, "loaded_at").toString(), getInstant(rs, "cutoff_time").toString());
 
     private final JdbcTemplate jdbcTemplate;
     private final IdempotencyService idempotencyService;
@@ -119,7 +139,8 @@ public class BaggageService {
 
     /** 批量装载：整批原子，任一行李不满足则 422 且无一件移动。 */
     public LoadResponse load(String legId, LoadRequest request) {
-        LoadPayload payload = new LoadPayload(legId, request.expectedVersion(), sortedCopy(request.bagTags()));
+        LoadPayload payload = new LoadPayload(legId, request.expectedVersion(),
+                request.operator(), request.containerId(), sortedCopy(request.bagTags()));
         return idempotencyService.execute(request.requestId(), "LOAD", 200,
                 payload, LoadResponse.class, () -> doLoad(legId, request));
     }
@@ -205,14 +226,91 @@ public class BaggageService {
         return new ShortListResponse(items);
     }
 
+    /**
+     * 配置航段 UTC 截载时刻：校验版本与“截载早于起飞”，保存后版本递增；
+     * 新截载时刻早于已有装载记录的装载时刻时，登记不可变超截载例外但不修改原装载记录。
+     */
+    public CutoffUpdateResponse updateCutoff(String legId, UpdateCutoffRequest request) {
+        UpdateCutoffPayload payload = new UpdateCutoffPayload(
+                legId, request.expectedVersion(), request.cutoffTime());
+        return idempotencyService.execute(request.requestId(), "UPDATE_CUTOFF", 200,
+                payload, CutoffUpdateResponse.class, () -> doUpdateCutoff(legId, request));
+    }
+
+    /** 查询航段截载配置。 */
+    public CutoffResponse getCutoff(String legId) {
+        LegRow leg = findLeg(legId);
+        if (leg == null) {
+            throw ApiException.notFound("航段不存在: " + legId);
+        }
+        return new CutoffResponse(leg.legId(), leg.status(), leg.version(),
+                leg.departureTime() == null ? null : leg.departureTime().toString(),
+                leg.cutoffTime() == null ? null : leg.cutoffTime().toString());
+    }
+
+    /** 查询航段超截载例外清单：只读，按登记顺序返回。 */
+    public CutoffExceptionListResponse listCutoffExceptions(String legId) {
+        if (findLeg(legId) == null) {
+            throw ApiException.notFound("航段不存在: " + legId);
+        }
+        List<CutoffExceptionItem> items = jdbcTemplate.query(
+                "SELECT leg_id, bag_tag, loaded_at, cutoff_time FROM cutoff_exception"
+                        + " WHERE leg_id = ? ORDER BY id",
+                EXCEPTION_MAPPER, legId);
+        return new CutoffExceptionListResponse(items);
+    }
+
+    /**
+     * 剩余行程改派：行李未装载、非短卸且行程未完成时，以新有序航段替换自当前待乘航段起的行程；
+     * 首段始发站须等于行李当前所在站，后续装载即使用新航段的截载时刻。
+     */
+    public BagResponse reassign(String bagTag, ReassignRequest request) {
+        ReassignPayload payload = new ReassignPayload(bagTag, List.copyOf(request.legIds()));
+        return idempotencyService.execute(request.requestId(), "REASSIGN", 200,
+                payload, BagResponse.class, () -> doReassign(bagTag, request));
+    }
+
+    /** 查询行李装载状态：当前装载航段与装载时刻（UTC）、下一待乘航段及其截载时刻。 */
+    public LoadStatusResponse getLoadStatus(String bagTag) {
+        BagRow bag = findBag(bagTag);
+        if (bag == null) {
+            throw ApiException.notFound("行李不存在: " + bagTag);
+        }
+        String loadedAt = null;
+        if (bag.loadedLegId() != null) {
+            List<LoadRecordRow> rows = jdbcTemplate.query(
+                    "SELECT bag_tag, loaded_at FROM load_record WHERE bag_tag = ?",
+                    LOAD_RECORD_MAPPER, bagTag);
+            if (!rows.isEmpty()) {
+                loadedAt = rows.get(0).loadedAt().toString();
+            }
+        }
+        String nextLegId = null;
+        String nextLegCutoff = null;
+        ItineraryItem next = nextItinerary(bagTag, bag.nextLegIndex());
+        if (next != null) {
+            nextLegId = next.legId();
+            LegRow nextLeg = findLeg(next.legId());
+            if (nextLeg != null && nextLeg.cutoffTime() != null) {
+                nextLegCutoff = nextLeg.cutoffTime().toString();
+            }
+        }
+        return new LoadStatusResponse(bag.bagTag(), bag.status(), bag.loadedLegId(),
+                loadedAt, nextLegId, nextLegCutoff);
+    }
+
     private LegResponse doRegisterLeg(RegisterLegRequest request) {
         if (findLeg(request.legId()) != null) {
             throw ApiException.conflict("航段已存在: " + request.legId());
         }
+        Instant departureTime = parseInstant(request.departureTime(), "起飞时刻");
         jdbcTemplate.update(
-                "INSERT INTO leg (leg_id, origin, destination, status, version) VALUES (?, ?, ?, ?, 1)",
-                request.legId(), request.origin(), request.destination(), LEG_OPEN);
-        return new LegResponse(request.legId(), request.origin(), request.destination(), LEG_OPEN, 1);
+                "INSERT INTO leg (leg_id, origin, destination, status, version, departure_time)"
+                        + " VALUES (?, ?, ?, ?, 1, ?)",
+                request.legId(), request.origin(), request.destination(), LEG_OPEN,
+                toOffsetDateTime(departureTime));
+        return new LegResponse(request.legId(), request.origin(), request.destination(), LEG_OPEN, 1,
+                request.departureTime(), null);
     }
 
     private BagResponse doRegisterBag(RegisterBagRequest request) {
@@ -257,6 +355,7 @@ public class BaggageService {
         if (!LEG_OPEN.equals(leg.status())) {
             throw ApiException.unprocessable("航段状态为 " + leg.status() + "，禁止装载");
         }
+        checkNotCutoff(leg);
         List<String> bagTags = request.bagTags();
         if (new HashSet<>(bagTags).size() != bagTags.size()) {
             throw ApiException.unprocessable("批量装载的 bagTag 不得重复");
@@ -272,7 +371,11 @@ public class BaggageService {
             bags.add(bag);
         }
         for (BagRow bag : bags) {
-            jdbcTemplate.update("INSERT INTO load_record (bag_tag, leg_id) VALUES (?, ?)", bag.bagTag(), legId);
+            jdbcTemplate.update(
+                    "INSERT INTO load_record (bag_tag, leg_id, operator, container_id, loaded_at)"
+                            + " VALUES (?, ?, ?, ?, ?)",
+                    bag.bagTag(), legId, request.operator(), request.containerId(),
+                    toOffsetDateTime(clock.get()));
             jdbcTemplate.update("UPDATE bag SET loaded_leg_id = ? WHERE bag_tag = ?", legId, bag.bagTag());
             insertEvent(bag.bagTag(), EVT_LOADED, legId, leg.origin());
         }
@@ -386,6 +489,19 @@ public class BaggageService {
         }
         int nextIndex = bag.nextLegIndex() + 1;
         int total = itineraryCount(bag.bagTag());
+        // 补到后仍有待乘航段时，以该航段截载时刻判定（只读不加锁，避免与装载的锁序冲突）
+        if (nextIndex < total) {
+            ItineraryItem next = nextItinerary(bag.bagTag(), nextIndex);
+            if (next != null) {
+                LegRow nextLeg = findLeg(next.legId());
+                if (nextLeg != null && nextLeg.cutoffTime() != null
+                        && !clock.get().isBefore(nextLeg.cutoffTime())) {
+                    throw ApiException.unprocessable(
+                            "补到后待乘航段 " + nextLeg.legId() + " 已于 " + nextLeg.cutoffTime()
+                                    + " 截载，禁止补到");
+                }
+            }
+        }
         String newStatus = nextIndex >= total ? BAG_DELIVERED : BAG_RECOVERED;
         jdbcTemplate.update(
                 "UPDATE bag SET current_location = ?, next_leg_index = ?, status = ?, loaded_leg_id = NULL,"
@@ -400,9 +516,101 @@ public class BaggageService {
                 nextIndex, request.missingLegId());
     }
 
+    private CutoffUpdateResponse doUpdateCutoff(String legId, UpdateCutoffRequest request) {
+        LegRow leg = lockLeg(legId);
+        checkVersion(leg, request.expectedVersion());
+        Instant cutoff = parseInstant(request.cutoffTime(), "截载时刻");
+        if (cutoff == null) {
+            throw ApiException.unprocessable("截载时刻不能为空");
+        }
+        if (leg.departureTime() == null) {
+            throw ApiException.unprocessable("航段 " + legId + " 未配置起飞时刻，无法设置截载时刻");
+        }
+        if (!cutoff.isBefore(leg.departureTime())) {
+            throw ApiException.unprocessable(
+                    "截载时刻 " + cutoff + " 必须早于起飞时刻 " + leg.departureTime());
+        }
+        OffsetDateTime cutoffUtc = toOffsetDateTime(cutoff);
+        // 新截载时刻早于已有装载记录的装载时刻：登记不可变超截载例外，不修改原装载记录
+        List<CutoffExceptionItem> newExceptions = new ArrayList<>();
+        List<LoadRecordRow> violations = jdbcTemplate.query(
+                "SELECT bag_tag, loaded_at FROM load_record WHERE leg_id = ? AND loaded_at > ?"
+                        + " ORDER BY bag_tag",
+                LOAD_RECORD_MAPPER, legId, cutoffUtc);
+        for (LoadRecordRow violation : violations) {
+            Integer existing = jdbcTemplate.queryForObject(
+                    "SELECT COUNT(*) FROM cutoff_exception WHERE leg_id = ? AND bag_tag = ?"
+                            + " AND cutoff_time = ?",
+                    Integer.class, legId, violation.bagTag(), cutoffUtc);
+            if (existing == null || existing == 0) {
+                jdbcTemplate.update(
+                        "INSERT INTO cutoff_exception (leg_id, bag_tag, loaded_at, cutoff_time)"
+                                + " VALUES (?, ?, ?, ?)",
+                        legId, violation.bagTag(), toOffsetDateTime(violation.loadedAt()), cutoffUtc);
+            }
+            newExceptions.add(new CutoffExceptionItem(legId, violation.bagTag(),
+                    violation.loadedAt().toString(), cutoff.toString()));
+        }
+        int newVersion = leg.version() + 1;
+        jdbcTemplate.update("UPDATE leg SET cutoff_time = ?, version = ? WHERE leg_id = ?",
+                cutoffUtc, newVersion, legId);
+        return new CutoffUpdateResponse(legId, newVersion, cutoff.toString(), newExceptions);
+    }
+
+    private BagResponse doReassign(String bagTag, ReassignRequest request) {
+        BagRow bag = lockBag(bagTag);
+        if (bag == null) {
+            throw ApiException.notFound("行李不存在: " + bagTag);
+        }
+        if (BAG_SHORT_UNLOADED.equals(bag.status())) {
+            throw ApiException.unprocessable("行李 " + bagTag + " 处于短卸状态，须先补到才能改派");
+        }
+        if (bag.loadedLegId() != null) {
+            throw ApiException.unprocessable(
+                    "行李 " + bagTag + " 已装载到航段 " + bag.loadedLegId() + "，禁止改派");
+        }
+        int total = itineraryCount(bagTag);
+        if (bag.nextLegIndex() >= total) {
+            throw ApiException.unprocessable("行李 " + bagTag + " 已完成全部行程，禁止改派");
+        }
+        List<String> legIds = request.legIds();
+        if (new HashSet<>(legIds).size() != legIds.size()) {
+            throw ApiException.unprocessable("改派航段不得重复");
+        }
+        List<LegRow> legs = new ArrayList<>();
+        for (String legId : legIds) {
+            LegRow leg = findLeg(legId);
+            if (leg == null) {
+                throw ApiException.unprocessable("改派引用的航段不存在: " + legId);
+            }
+            legs.add(leg);
+        }
+        if (!legs.get(0).origin().equals(bag.currentLocation())) {
+            throw ApiException.unprocessable(
+                    "改派首段始发站 " + legs.get(0).origin()
+                            + " 与行李当前所在站 " + bag.currentLocation() + " 不一致");
+        }
+        for (int i = 0; i + 1 < legs.size(); i++) {
+            if (!legs.get(i).destination().equals(legs.get(i + 1).origin())) {
+                throw ApiException.unprocessable(
+                        "相邻航段首尾站必须衔接: " + legs.get(i).legId() + " -> " + legs.get(i + 1).legId());
+            }
+        }
+        jdbcTemplate.update("DELETE FROM bag_itinerary WHERE bag_tag = ? AND seq >= ?",
+                bagTag, bag.nextLegIndex());
+        for (int i = 0; i < legs.size(); i++) {
+            LegRow leg = legs.get(i);
+            jdbcTemplate.update(
+                    "INSERT INTO bag_itinerary (bag_tag, seq, leg_id, origin, destination)"
+                            + " VALUES (?, ?, ?, ?, ?)",
+                    bagTag, bag.nextLegIndex() + i, leg.legId(), leg.origin(), leg.destination());
+        }
+        insertEvent(bagTag, EVT_REASSIGNED, null, bag.currentLocation());
+        return toBagResponse(findBag(bagTag));
+    }
+
     /** 实际到达行李的统一推进：移动到到达站、推进待乘索引，完成行程者交付。 */
-    private void advanceArrivedBag(BagRow bag, String destination, String legId) {
-        int nextIndex = bag.nextLegIndex() + 1;
+    private void advanceArrivedBag(BagRow bag, String destination, String legId) {        int nextIndex = bag.nextLegIndex() + 1;
         int total = itineraryCount(bag.bagTag());
         String status = nextIndex >= total ? BAG_DELIVERED : BAG_IN_TRANSIT;
         jdbcTemplate.update(
@@ -443,6 +651,14 @@ public class BaggageService {
         }
     }
 
+    /** 截载判定：航段已配置截载时刻且当前时刻大于等于截载时刻时拒绝（422 并给出截载时刻）。 */
+    private void checkNotCutoff(LegRow leg) {
+        if (leg.cutoffTime() != null && !clock.get().isBefore(leg.cutoffTime())) {
+            throw ApiException.unprocessable(
+                    "航段 " + leg.legId() + " 已于 " + leg.cutoffTime() + " 截载，禁止装载");
+        }
+    }
+
     private LegRow findLeg(String legId) {
         List<LegRow> rows = jdbcTemplate.query(legSelect(false), LEG_MAPPER, legId);
         return rows.isEmpty() ? null : rows.get(0);
@@ -458,7 +674,7 @@ public class BaggageService {
 
     private static String legSelect(boolean forUpdate) {
         return "SELECT leg_id, origin, destination, status, version, sealed_manifest,"
-                + " arrival_type, arrival_actual FROM leg WHERE leg_id = ?"
+                + " arrival_type, arrival_actual, departure_time, cutoff_time FROM leg WHERE leg_id = ?"
                 + (forUpdate ? " FOR UPDATE" : "");
     }
 
@@ -529,6 +745,22 @@ public class BaggageService {
         return value == null ? null : value.toInstant();
     }
 
+    /** 解析 ISO-8601 UTC 时刻字符串；null/空白返回 null，格式非法抛 422。 */
+    private static Instant parseInstant(String text, String fieldName) {
+        if (text == null || text.isBlank()) {
+            return null;
+        }
+        try {
+            return Instant.parse(text.trim());
+        } catch (Exception ex) {
+            throw ApiException.unprocessable(fieldName + "格式非法，须为 ISO-8601 UTC 时刻: " + text);
+        }
+    }
+
+    private static OffsetDateTime toOffsetDateTime(Instant instant) {
+        return instant == null ? null : OffsetDateTime.ofInstant(instant, ZoneOffset.UTC);
+    }
+
     private static List<String> sortedCopy(List<String> values) {
         return values.stream().sorted().toList();
     }
@@ -552,7 +784,8 @@ public class BaggageService {
 
     private record LegRow(String legId, String origin, String destination,
                           String status, int version, String sealedManifest,
-                          String arrivalType, String arrivalActual) {
+                          String arrivalType, String arrivalActual,
+                          Instant departureTime, Instant cutoffTime) {
     }
 
     private record BagRow(String bagTag, String currentLocation, int nextLegIndex,
@@ -560,8 +793,9 @@ public class BaggageService {
                           String shortDestination, Instant shortRegisteredAt) {
     }
 
-    /** 装载幂等摘要参数：bagTags 已排序，顺序差异不视为异参。 */
-    private record LoadPayload(String legId, int expectedVersion, List<String> bagTags) {
+    /** 装载幂等摘要参数：含操作者、航段版本、容器与规范化（排序）行李集合，顺序差异不视为异参。 */
+    private record LoadPayload(String legId, int expectedVersion, String operator,
+                               String containerId, List<String> bagTags) {
     }
 
     /** 封舱幂等摘要参数。 */
@@ -574,5 +808,17 @@ public class BaggageService {
 
     /** 差异到达幂等摘要参数：bagTags 已排序，顺序差异不视为异参。 */
     private record DifferenceArrivePayload(String legId, int expectedVersion, List<String> bagTags) {
+    }
+
+    /** 截载配置幂等摘要参数。 */
+    private record UpdateCutoffPayload(String legId, int expectedVersion, String cutoffTime) {
+    }
+
+    /** 改派幂等摘要参数：legIds 为有序行程，顺序差异视为异参。 */
+    private record ReassignPayload(String bagTag, List<String> legIds) {
+    }
+
+    /** 装载记录行：仅用于截载例外与装载状态查询。 */
+    private record LoadRecordRow(String bagTag, Instant loadedAt) {
     }
 }

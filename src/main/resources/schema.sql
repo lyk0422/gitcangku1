@@ -12,6 +12,8 @@ CREATE TABLE IF NOT EXISTS leg (
     sealed_manifest CLOB         NULL COMMENT '封舱时的只读装载清单（JSON 数组），未封舱为 NULL',
     arrival_type    VARCHAR(16)  NULL COMMENT '到达确认类型：NULL 未到达，EXACT 精确到达，DIFF 差异到达',
     arrival_actual  CLOB         NULL COMMENT '差异到达实际到达袋号只读快照（JSON 数组），未差异到达为 NULL',
+    departure_time  TIMESTAMP WITH TIME ZONE NULL COMMENT '起飞时刻（UTC），NULL 表示未配置；配置截载前必须已设置',
+    cutoff_time     TIMESTAMP WITH TIME ZONE NULL COMMENT '行李截载时刻（UTC），NULL 表示未配置不拦截；必须早于起飞时刻，修改不追溯既有装载记录',
     created_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     PRIMARY KEY (leg_id)
 );
@@ -40,12 +42,28 @@ CREATE TABLE IF NOT EXISTS bag_itinerary (
     PRIMARY KEY (bag_tag, seq)
 );
 
--- 装载明细：bag_tag 为主键，保证一件行李同一时间只在一个航段的装载清单中
+-- 装载明细：bag_tag 为主键，保证一件行李同一时间只在一个航段的装载清单中；
+-- operator/container_id 为装载操作者与容器（ULD）标识，参与装载幂等指纹；
+-- loaded_at 为装载时刻（UTC），由应用时钟写入，截载修改不得删除或伪造
 CREATE TABLE IF NOT EXISTS load_record (
-    bag_tag   VARCHAR(64) NOT NULL COMMENT '行李牌号',
-    leg_id    VARCHAR(64) NOT NULL COMMENT '装载到的航段',
-    loaded_at TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '装载时间',
+    bag_tag      VARCHAR(64) NOT NULL COMMENT '行李牌号',
+    leg_id       VARCHAR(64) NOT NULL COMMENT '装载到的航段',
+    operator     VARCHAR(64) NOT NULL COMMENT '装载操作者标识',
+    container_id VARCHAR(64) NOT NULL COMMENT '装载容器（ULD）标识',
+    loaded_at    TIMESTAMP WITH TIME ZONE NOT NULL COMMENT '装载时刻（UTC），不可变',
     PRIMARY KEY (bag_tag)
+);
+
+-- 超截载例外清单：截载时刻修改为早于已有装载记录的装载时刻时登记，只增不改不删
+CREATE TABLE IF NOT EXISTS cutoff_exception (
+    id          BIGINT AUTO_INCREMENT NOT NULL COMMENT '例外自增主键',
+    leg_id      VARCHAR(64) NOT NULL COMMENT '航段标识',
+    bag_tag     VARCHAR(64) NOT NULL COMMENT '行李牌号',
+    loaded_at   TIMESTAMP WITH TIME ZONE NOT NULL COMMENT '原装载时刻（UTC），复制自装载记录，不可变',
+    cutoff_time TIMESTAMP WITH TIME ZONE NOT NULL COMMENT '本次修改后的截载时刻（UTC），早于装载时刻',
+    created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '例外登记时间',
+    PRIMARY KEY (id),
+    UNIQUE (leg_id, bag_tag, cutoff_time)
 );
 
 -- 行李实际事件流：支撑完整轨迹查询，(bag_tag, seq) 唯一保证每件行李事件顺序不重复
@@ -64,7 +82,7 @@ CREATE TABLE IF NOT EXISTS bag_event (
 -- 幂等去重：仅记录成功请求；同 requestId 同参数重放原结果，异参数返回 409
 CREATE TABLE IF NOT EXISTS request_log (
     request_id      VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
-    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER',
+    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER/UPDATE_CUTOFF/REASSIGN',
     request_hash    VARCHAR(64)  NOT NULL COMMENT '请求参数（不含 requestId）的 SHA-256 摘要',
     response_status INT          NOT NULL COMMENT '原成功响应的 HTTP 状态码',
     response_body   CLOB         NOT NULL COMMENT '原成功响应体（JSON）',

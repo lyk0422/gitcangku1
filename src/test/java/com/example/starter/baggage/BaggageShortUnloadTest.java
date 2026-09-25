@@ -66,6 +66,7 @@ class BaggageShortUnloadTest {
     void cleanDatabase() {
         jdbcTemplate.update("DELETE FROM bag_event");
         jdbcTemplate.update("DELETE FROM load_record");
+        jdbcTemplate.update("DELETE FROM cutoff_exception");
         jdbcTemplate.update("DELETE FROM bag_itinerary");
         jdbcTemplate.update("DELETE FROM bag");
         jdbcTemplate.update("DELETE FROM leg");
@@ -407,7 +408,7 @@ class BaggageShortUnloadTest {
                 () -> baggageService.recover(new RecoverRequest(
                         UUID.randomUUID().toString(), "BAG_SHORT", "LEG1", "SHA")),
                 () -> baggageService.load("LEG2",
-                        new LoadRequest(UUID.randomUUID().toString(), 1,
+                        new LoadRequest(UUID.randomUUID().toString(), 1, "OP1", "ULD1",
                                 List.of("BAG_OK", "BAG_SHORT"))));
         List<Object> results = runConcurrently(tasks);
 
@@ -440,7 +441,7 @@ class BaggageShortUnloadTest {
 
     private void registerLeg(String legId, String origin, String destination) {
         baggageService.registerLeg(
-                new RegisterLegRequest(UUID.randomUUID().toString(), legId, origin, destination));
+                new RegisterLegRequest(UUID.randomUUID().toString(), legId, origin, destination, null));
     }
 
     private void registerBag(String bagTag, List<String> legIds) {
@@ -450,7 +451,9 @@ class BaggageShortUnloadTest {
     private ResultActions load(String legId, int expectedVersion, List<String> bagTags) throws Exception {
         return postJson("/api/legs/" + legId + "/load", Map.of(
                 "requestId", UUID.randomUUID().toString(),
-                "expectedVersion", expectedVersion, "bagTags", bagTags));
+                "expectedVersion", expectedVersion,
+                "operator", "OP1", "containerId", "ULD1",
+                "bagTags", bagTags));
     }
 
     private ResultActions seal(String legId, int expectedVersion) throws Exception {
