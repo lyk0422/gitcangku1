@@ -1,5 +1,6 @@
 package com.example.starter.exposure.repo;
 
+import com.example.starter.exposure.domain.ConsentDecision;
 import com.example.starter.exposure.domain.Reservation;
 import com.example.starter.exposure.domain.ReservationStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -23,22 +24,32 @@ public class ReservationRepository {
         this.jdbc = jdbc;
     }
 
-    private static final RowMapper<Reservation> MAPPER = (rs, rowNum) -> new Reservation(
-            rs.getString("reservation_id"),
-            rs.getString("campaign_id"),
-            rs.getString("visitor_id"),
-            rs.getDate("utc_date"),
-            ReservationStatus.valueOf(rs.getString("status")),
-            rs.getLong("created_at_utc"),
-            rs.getLong("expires_at_utc"),
-            (Long) rs.getObject("terminal_at_utc"));
+    private static final RowMapper<Reservation> MAPPER = new RowMapper<>() {
+        @Override
+        public Reservation mapRow(ResultSet rs, int rowNum) throws SQLException {
+            String decision = rs.getString("consent_decision");
+            return new Reservation(
+                    rs.getString("reservation_id"),
+                    rs.getString("campaign_id"),
+                    rs.getString("visitor_id"),
+                    rs.getDate("utc_date"),
+                    ReservationStatus.valueOf(rs.getString("status")),
+                    rs.getLong("created_at_utc"),
+                    rs.getLong("expires_at_utc"),
+                    (Long) rs.getObject("terminal_at_utc"),
+                    decision == null ? null : ConsentDecision.valueOf(decision),
+                    (Integer) rs.getObject("consent_version"));
+        }
+    };
 
     private static final String COLUMNS =
             "reservation_id, campaign_id, visitor_id, utc_date, status, "
-                    + "created_at_utc, expires_at_utc, terminal_at_utc";
+                    + "created_at_utc, expires_at_utc, terminal_at_utc, "
+                    + "consent_decision, consent_version";
 
     public void insert(Reservation reservation) {
-        jdbc.update("INSERT INTO exposure_reservation (" + COLUMNS + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        jdbc.update("INSERT INTO exposure_reservation (" + COLUMNS + ") "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 reservation.reservationId(),
                 reservation.campaignId(),
                 reservation.visitorId(),
@@ -46,7 +57,9 @@ public class ReservationRepository {
                 reservation.status().name(),
                 reservation.createdAtUtc(),
                 reservation.expiresAtUtc(),
-                reservation.terminalAtUtc());
+                reservation.terminalAtUtc(),
+                reservation.consentDecision() == null ? null : reservation.consentDecision().name(),
+                reservation.consentVersion());
     }
 
     public Optional<Reservation> findById(String reservationId) {

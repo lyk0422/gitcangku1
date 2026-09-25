@@ -4,14 +4,17 @@ package com.example.starter.exposure.domain;
  * 曝光预占单 PO。额度所属日（{@link #utcDate}）固定为申请时刻的 UTC 日期，
  * 确认跨日也不迁移计数。
  *
- * @param reservationId 预占单编号
- * @param campaignId    所属公告编号
- * @param visitorId     合成访客编号
- * @param utcDate       额度所属 UTC 日（java.time.LocalDate 对应的 java.sql.Date）
- * @param status        预占状态
- * @param createdAtUtc  创建（申请）时刻，epoch 毫秒，UTC
- * @param expiresAtUtc  到期时刻，创建时刻 + 60 秒，epoch 毫秒，UTC；当前时刻达到该值即过期
- * @param terminalAtUtc 进入终态（CONFIRMED/CANCELLED/EXPIRED）的时刻，未到终态为 null
+ * @param reservationId   预占单编号
+ * @param campaignId      所属公告编号
+ * @param visitorId       合成访客编号
+ * @param utcDate         额度所属 UTC 日（java.time.LocalDate 对应的 java.sql.Date）
+ * @param status          预占状态
+ * @param createdAtUtc    创建（申请）时刻，epoch 毫秒，UTC
+ * @param expiresAtUtc    到期时刻，创建时刻 + 60 秒，epoch 毫秒，UTC；当前时刻达到该值即过期
+ * @param terminalAtUtc   进入终态（CONFIRMED/CANCELLED/EXPIRED）的时刻，未到终态为 null
+ * @param consentDecision 创建预占时固化的同意决定（ALLOW/DENY）；null 表示该公告未启用同意裁决
+ * @param consentVersion  创建预占时命中的同意版本号；同意撤回与活动类别变更均不改变该快照；
+ *                        null 表示该公告未启用同意裁决
  */
 public record Reservation(
         String reservationId,
@@ -21,6 +24,8 @@ public record Reservation(
         ReservationStatus status,
         long createdAtUtc,
         long expiresAtUtc,
-        Long terminalAtUtc
+        Long terminalAtUtc,
+        ConsentDecision consentDecision,
+        Integer consentVersion
 ) {
 }

@@ -28,16 +28,32 @@ public class CampaignRepository {
                     rs.getString("campaign_id"),
                     rs.getInt("daily_total_cap"),
                     rs.getInt("per_visitor_daily_cap"),
-                    rs.getLong("created_at_utc"));
+                    rs.getLong("created_at_utc"),
+                    rs.getString("category"),
+                    rs.getInt("version"),
+                    (Integer) rs.getObject("silent_start_minute"),
+                    (Integer) rs.getObject("silent_end_minute"));
         }
     };
+
+    private static final String COLUMNS =
+            "campaign_id, daily_total_cap, per_visitor_daily_cap, created_at_utc, "
+                    + "category, version, silent_start_minute, silent_end_minute";
 
     /**
      * 按编号查询公告。
      */
     public Optional<Campaign> findById(String campaignId) {
-        return jdbc.query("SELECT campaign_id, daily_total_cap, per_visitor_daily_cap, created_at_utc "
-                        + "FROM campaign WHERE campaign_id = ?", MAPPER, campaignId)
+        return jdbc.query("SELECT " + COLUMNS + " FROM campaign WHERE campaign_id = ?",
+                        MAPPER, campaignId)
+                .stream()
+                .findFirst();
+    }
+
+    /** 行锁读取公告（类别修改与预占裁决时使用）。 */
+    public Optional<Campaign> lockById(String campaignId) {
+        return jdbc.query("SELECT " + COLUMNS + " FROM campaign WHERE campaign_id = ? FOR UPDATE",
+                        MAPPER, campaignId)
                 .stream()
                 .findFirst();
     }
@@ -46,11 +62,27 @@ public class CampaignRepository {
      * 插入公告；编号冲突由调用方依据唯一约束处理。
      */
     public void insert(Campaign campaign) {
-        jdbc.update("INSERT INTO campaign (campaign_id, daily_total_cap, per_visitor_daily_cap, created_at_utc) "
-                        + "VALUES (?, ?, ?, ?)",
+        jdbc.update("INSERT INTO campaign (campaign_id, daily_total_cap, per_visitor_daily_cap, "
+                        + "created_at_utc, category, version, silent_start_minute, silent_end_minute) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 campaign.campaignId(),
                 campaign.dailyTotalCap(),
                 campaign.perVisitorDailyCap(),
-                campaign.createdAtUtc());
+                campaign.createdAtUtc(),
+                campaign.category(),
+                campaign.version(),
+                campaign.silentStartMinute(),
+                campaign.silentEndMinute());
+    }
+
+    /**
+     * 修改活动类别并使版本号 +1；旧类别同意不迁移到新类别。
+     *
+     * @return 是否更新成功（公告不存在时为 false）
+     */
+    public boolean updateCategory(String campaignId, String newCategory, int newVersion) {
+        int rows = jdbc.update("UPDATE campaign SET category = ?, version = ? WHERE campaign_id = ?",
+                newCategory, newVersion, campaignId);
+        return rows == 1;
     }
 }
