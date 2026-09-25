@@ -8,15 +8,18 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.EnumSet;
+import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Supplier;
 
+import com.example.starter.incident.IncidentTaskRepository.BlockerRow;
 import com.example.starter.incident.dto.Requests.ActionRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
 import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
+import com.example.starter.incident.dto.Requests.MergeRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
@@ -30,6 +33,9 @@ import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
 import com.example.starter.incident.dto.Responses.IncidentTasksView;
 import com.example.starter.incident.dto.Responses.IncidentView;
+import com.example.starter.incident.dto.Responses.MergeListView;
+import com.example.starter.incident.dto.Responses.MergeRecordView;
+import com.example.starter.incident.dto.Responses.MergeView;
 import com.example.starter.incident.dto.Responses.StatusChangeView;
 import com.example.starter.incident.dto.Responses.TaskBlockerView;
 import com.example.starter.incident.dto.Responses.TaskView;
@@ -71,16 +77,19 @@ public class IncidentService {
     private final IncidentRepository incidents;
     private final EscalationRepository escalations;
     private final IncidentTaskRepository tasks;
+    private final IncidentMergeRepository merges;
     private final CommandKeyRepository commandKeys;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public IncidentService(IncidentRepository incidents, EscalationRepository escalations,
-                           IncidentTaskRepository tasks, CommandKeyRepository commandKeys,
+                           IncidentTaskRepository tasks, IncidentMergeRepository merges,
+                           CommandKeyRepository commandKeys,
                            ObjectMapper objectMapper, Clock clock) {
         this.incidents = incidents;
         this.escalations = escalations;
         this.tasks = tasks;
+        this.merges = merges;
         this.commandKeys = commandKeys;
         this.objectMapper = objectMapper;
         this.clock = clock;
@@ -107,7 +116,7 @@ public class IncidentService {
         }
         Instant now = now();
         Incident incident = new Incident(0L, incidentKey, severity, summary, reporter,
-                IncidentStatus.REPORTED, null, now, now, null);
+                IncidentStatus.REPORTED, null, now, now, null, 0L, null);
         long id;
         try {
             id = incidents.insert(incident);
@@ -155,7 +164,8 @@ public class IncidentService {
                 TransferView.class, () -> {
                     requireCommander(incident, actor);
                     if (incident.status() == IncidentStatus.RESOLVED
-                            || incident.status() == IncidentStatus.CLOSED) {
+                            || incident.status() == IncidentStatus.CLOSED
+                            || incident.status() == IncidentStatus.MERGED) {
                         throw ApiException.illegalTransition(
                                 incident.status() + " 状态不允许发起交接");
                     }
@@ -186,7 +196,8 @@ public class IncidentService {
         return runIdempotent(commandKey, "transfer_accept", hash(incidentKey, actor), IncidentView.class,
                 () -> {
                     if (incident.status() == IncidentStatus.RESOLVED
-                            || incident.status() == IncidentStatus.CLOSED) {
+                            || incident.status() == IncidentStatus.CLOSED
+                            || incident.status() == IncidentStatus.MERGED) {
                         throw ApiException.illegalTransition(
                                 incident.status() + " 状态不允许接受交接");
                     }
@@ -420,6 +431,9 @@ public class IncidentService {
                     if (incident.status() == IncidentStatus.CLOSED) {
                         throw ApiException.illegalTransition("事件已关闭，不能再创建处置任务");
                     }
+                    if (incident.status() == IncidentStatus.MERGED) {
+                        throw ApiException.illegalTransition("事件已合并，不能再创建处置任务");
+                    }
                     var existing = tasks.findByKey(incident.id(), taskKey);
                     if (existing.isPresent()) {
                         IncidentTask found = existing.get();
@@ -438,13 +452,28 @@ public class IncidentService {
                     }
                     List<Incident> blockers = new ArrayList<>();
                     for (String blockerKey : blockerKeys) {
-                        blockers.add(incidents.findByKey(blockerKey)
+                        Incident blocker = incidents.findByKey(blockerKey)
                                 .orElseThrow(() -> ApiException.notFound(
-                                        "阻塞事件不存在: " + blockerKey)));
+                                        "阻塞事件不存在: " + blockerKey));
+                        if (blocker.status() == IncidentStatus.MERGED) {
+                            throw ApiException.conflict(
+                                    "阻塞事件已合并，不能作为新的阻塞目标: " + blockerKey);
+                        }
+                        blockers.add(blocker);
                     }
                     // 全局图锁：串行化环检测与边写入，并发反向依赖下最终图无环
                     tasks.lockGraph();
                     for (Incident blocker : blockers) {
+                        // 锁内重检：与并发合并的改挂串行一致，
+                        // 合并已提交的目标事件不能成为新的阻塞目标
+                        Incident current = incidents.findByKey(blocker.incidentKey())
+                                .orElseThrow(() -> ApiException.notFound(
+                                        "阻塞事件不存在: " + blocker.incidentKey()));
+                        if (current.status() == IncidentStatus.MERGED) {
+                            throw ApiException.conflict(
+                                    "阻塞事件已合并，不能作为新的阻塞目标: "
+                                            + blocker.incidentKey());
+                        }
                         if (tasks.isReachable(blocker.id(), incident.id())) {
                             throw ApiException.conflict("阻塞关系会形成环: "
                                     + blocker.incidentKey() + " 已直接或间接依赖 " + incidentKey);
@@ -453,7 +482,7 @@ public class IncidentService {
                     Instant now = now();
                     long taskId = tasks.insert(new IncidentTask(0L, incident.id(), taskKey,
                             groupCode, title, TaskStatus.OPEN, actor, null, null, null, null,
-                            now, now));
+                            now, now, null));
                     for (Incident blocker : blockers) {
                         tasks.insertBlocker(taskId, blocker.id(), now);
                     }
@@ -535,6 +564,161 @@ public class IncidentService {
         IncidentTask task = tasks.findByKey(incident.id(), taskKey)
                 .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
         return toTaskView(task);
+    }
+
+    /**
+     * 重复事件合并：操作者须为双方共同的当前指挥人；双方事件必须不同、均未进入
+     * RESOLVED/CLOSED/MERGED，且 expectedVersion 与当前版本一致，否则 409。
+     * 一个事务内完成：被并入事件全部任务迁移到存续事件（taskKey 冲突整次 409 并返回冲突键）；
+     * 指向被并入事件的阻塞边改指存续事件（重复边去重、指向自身的边丢弃）；
+     * 改挂后持有依赖图全局锁对整图做环检测，成环整次 409 回滚；
+     * 被并入事件遏制期限与待处理升级作废，进入 MERGED 终态并记录存续事件，
+     * 双方版本各加一，写入不可变合并记录。mergeKey 全局唯一；
+     * commandKey 同键同参重放首次结果、异参 409、失败不占键。
+     */
+    @Transactional
+    public MergeView merge(String actor, MergeRequest req) {
+        String commandKey = requireText(req.commandKey(), "commandKey");
+        String mergeKey = requireText(req.mergeKey(), "mergeKey");
+        String survivingKey = requireText(req.survivingIncidentKey(), "survivingIncidentKey");
+        String mergedKey = requireText(req.mergedIncidentKey(), "mergedIncidentKey");
+        if (req.survivingExpectedVersion() == null) {
+            throw ApiException.badRequest("survivingExpectedVersion 不能为空");
+        }
+        if (req.mergedExpectedVersion() == null) {
+            throw ApiException.badRequest("mergedExpectedVersion 不能为空");
+        }
+        if (survivingKey.equals(mergedKey)) {
+            throw ApiException.conflict("存续事件与被并入事件必须不同: " + survivingKey);
+        }
+        // 按事件键字典序加锁双方事件行，并发合并按同一顺序取锁避免死锁
+        Incident first = lockIncident(survivingKey.compareTo(mergedKey) <= 0
+                ? survivingKey : mergedKey);
+        Incident second = lockIncident(survivingKey.compareTo(mergedKey) <= 0
+                ? mergedKey : survivingKey);
+        Incident surviving = survivingKey.equals(first.incidentKey()) ? first : second;
+        Incident merged = mergedKey.equals(first.incidentKey()) ? first : second;
+        return runIdempotent(commandKey, "merge",
+                hash(mergeKey, survivingKey, mergedKey, actor,
+                        req.survivingExpectedVersion().toString(),
+                        req.mergedExpectedVersion().toString()),
+                MergeView.class, () -> {
+                    if (merges.findByMergeKey(mergeKey).isPresent()) {
+                        throw ApiException.conflict("mergeKey 已存在: " + mergeKey);
+                    }
+                    requireMergeable(surviving, "存续事件");
+                    requireMergeable(merged, "被并入事件");
+                    if (surviving.commander() == null
+                            || !surviving.commander().equals(merged.commander())) {
+                        throw ApiException.conflict("双方事件的当前指挥人必须相同");
+                    }
+                    requireCommander(surviving, actor);
+                    if (surviving.version() != req.survivingExpectedVersion()) {
+                        throw ApiException.conflict("存续事件版本不匹配: 期望 "
+                                + req.survivingExpectedVersion() + "，当前 " + surviving.version());
+                    }
+                    if (merged.version() != req.mergedExpectedVersion()) {
+                        throw ApiException.conflict("被并入事件版本不匹配: 期望 "
+                                + req.mergedExpectedVersion() + "，当前 " + merged.version());
+                    }
+                    // 任务键冲突：整次 409 并返回冲突键
+                    Set<String> survivingTaskKeys = new HashSet<>();
+                    for (IncidentTask t : tasks.listByIncident(surviving.id())) {
+                        survivingTaskKeys.add(t.taskKey());
+                    }
+                    List<IncidentTask> mergedTasks = tasks.listByIncident(merged.id());
+                    List<String> conflictKeys = mergedTasks.stream()
+                            .map(IncidentTask::taskKey)
+                            .filter(survivingTaskKeys::contains)
+                            .sorted()
+                            .toList();
+                    if (!conflictKeys.isEmpty()) {
+                        throw ApiException.conflict("被并入事件的任务键与存续事件冲突",
+                                List.copyOf(conflictKeys));
+                    }
+                    Instant now = now();
+                    // 全局图锁：与任务创建的环检测串行一致，合并改挂后整图必须无环
+                    tasks.lockGraph();
+                    // 任务迁移：被并入事件全部任务改挂存续事件，记录首次来源事件
+                    tasks.reassignTasks(merged.id(), surviving.id(), now);
+                    // 阻塞边改挂：指向被并入事件的边改指存续事件，重复边去重
+                    for (BlockerRow row : tasks.listBlockersPointingTo(merged.id())) {
+                        IncidentTask owner = tasks.findById(row.taskId()).orElseThrow();
+                        if (owner.incidentId() == surviving.id()
+                                || tasks.existsBlocker(row.taskId(), surviving.id())) {
+                            tasks.deleteBlocker(row.id());
+                        } else {
+                            tasks.updateBlockerTarget(row.id(), surviving.id());
+                        }
+                    }
+                    // 指向自身的边直接丢弃（含迁移后原指向存续事件的边）
+                    for (long selfRowId : tasks.listSelfBlockerRowIds()) {
+                        tasks.deleteBlocker(selfRowId);
+                    }
+                    // 改挂后整图环检测：成环则整次 409，事务回滚不留任何变更
+                    if (tasks.hasCycle()) {
+                        throw ApiException.conflict("合并后依赖图成环，本次合并已整体回滚");
+                    }
+                    // 被并入事件待处理升级作废（遏制期限随 markMerged 置空）
+                    escalations.cancelOpenForIncident(merged.id(), now);
+                    // 被并入事件进入 MERGED 终态并记录存续事件，双方版本各加一
+                    incidents.markMerged(merged.id(), surviving.id(), now);
+                    incidents.bumpVersion(surviving.id(), now);
+                    incidents.insertStatusChange(new StatusChange(0L, merged.id(),
+                            merged.status(), IncidentStatus.MERGED, actor, now));
+                    // 不可变合并记录；mergeKey 唯一约束兜底并发重复合并
+                    try {
+                        merges.insert(new IncidentMerge(0L, mergeKey, surviving.id(),
+                                merged.id(), actor, now));
+                    } catch (DuplicateKeyException e) {
+                        throw ApiException.conflict("mergeKey 已存在: " + mergeKey);
+                    }
+                    List<String> movedTaskKeys = mergedTasks.stream()
+                            .map(IncidentTask::taskKey).sorted().toList();
+                    return new MergeView(mergeKey, survivingKey, mergedKey,
+                            surviving.version() + 1, merged.version() + 1,
+                            movedTaskKeys, actor, now);
+                });
+    }
+
+    /**
+     * 合并前置校验：事件未进入 RESOLVED/CLOSED/MERGED，否则 409。
+     */
+    private static void requireMergeable(Incident incident, String role) {
+        if (incident.status() == IncidentStatus.RESOLVED
+                || incident.status() == IncidentStatus.CLOSED
+                || incident.status() == IncidentStatus.MERGED) {
+            throw ApiException.conflict(role + "已处于 " + incident.status()
+                    + " 状态，不能参与合并: " + incident.incidentKey());
+        }
+    }
+
+    /**
+     * 查询全部合并记录，按落库顺序稳定返回。只读，不隐式写入。
+     */
+    @Transactional(readOnly = true)
+    public MergeListView listMerges() {
+        return new MergeListView(merges.listAll().stream()
+                .map(this::toMergeRecordView).toList());
+    }
+
+    /**
+     * 按 mergeKey 查询单条合并记录。只读，不隐式写入。
+     */
+    @Transactional(readOnly = true)
+    public MergeRecordView getMerge(String mergeKey) {
+        requireText(mergeKey, "mergeKey");
+        return merges.findByMergeKey(mergeKey).map(this::toMergeRecordView)
+                .orElseThrow(() -> ApiException.notFound("合并记录不存在: " + mergeKey));
+    }
+
+    private MergeRecordView toMergeRecordView(IncidentMerge merge) {
+        String survivingKey = incidents.findById(merge.survivingIncidentId())
+                .map(Incident::incidentKey).orElse(null);
+        String mergedKey = incidents.findById(merge.mergedIncidentId())
+                .map(Incident::incidentKey).orElse(null);
+        return new MergeRecordView(merge.mergeKey(), survivingKey, mergedKey,
+                merge.actor(), merge.createdAt());
     }
 
     /**
@@ -621,9 +805,13 @@ public class IncidentService {
     }
 
     private IncidentView toView(Incident incident, String pendingTransferTo) {
+        String mergedIntoKey = incident.mergedIntoId() == null ? null
+                : incidents.findById(incident.mergedIntoId())
+                        .map(Incident::incidentKey).orElse(null);
         return new IncidentView(incident.incidentKey(), incident.severity(), incident.summary(),
                 incident.reporter(), incident.status().name(), incident.commander(), pendingTransferTo,
-                incident.createdAt(), incident.updatedAt(), incident.deadlineAt());
+                incident.createdAt(), incident.updatedAt(), incident.deadlineAt(),
+                incident.version(), mergedIntoKey);
     }
 
     private ActionView toActionView(IncidentAction action) {
@@ -632,16 +820,20 @@ public class IncidentService {
     }
 
     /**
-     * 组装任务视图：阻塞状态按目标事件查询时的当前状态计算，不写回依赖任务。
+     * 组装任务视图：阻塞状态按目标事件查询时的当前状态计算，不写回依赖任务；
+     * originIncidentKey 仅合并迁移过的任务有值（任务最初所属事件键）。
      */
     private TaskView toTaskView(IncidentTask task) {
         List<TaskBlockerView> blockers = incidents.listBlockingIncidents(task.id()).stream()
                 .map(b -> new TaskBlockerView(b.incidentKey(), b.status().name(),
                         UNBLOCKING_STATUSES.contains(b.status())))
                 .toList();
+        String originKey = task.originIncidentId() == null ? null
+                : incidents.findById(task.originIncidentId())
+                        .map(Incident::incidentKey).orElse(null);
         return new TaskView(task.taskKey(), task.groupCode(), task.title(), task.status().name(),
                 blockers, task.createdBy(), task.createdAt(), task.doneBy(), task.doneAt(),
-                task.cancelledBy(), task.cancelledAt());
+                task.cancelledBy(), task.cancelledAt(), originKey);
     }
 
     private static TransferView toTransferView(IncidentTransfer transfer) {

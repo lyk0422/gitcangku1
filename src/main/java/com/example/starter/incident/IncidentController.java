@@ -3,6 +3,7 @@ package com.example.starter.incident;
 import com.example.starter.incident.dto.Requests.ActionRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
 import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
+import com.example.starter.incident.dto.Requests.MergeRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
@@ -16,6 +17,9 @@ import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
 import com.example.starter.incident.dto.Responses.IncidentTasksView;
 import com.example.starter.incident.dto.Responses.IncidentView;
+import com.example.starter.incident.dto.Responses.MergeListView;
+import com.example.starter.incident.dto.Responses.MergeRecordView;
+import com.example.starter.incident.dto.Responses.MergeView;
 import com.example.starter.incident.dto.Responses.TaskView;
 import com.example.starter.incident.dto.Responses.TransferView;
 import org.springframework.http.HttpStatus;
@@ -184,8 +188,33 @@ public class IncidentController {
      */
     @PostMapping("/{incidentKey}/tasks/{taskKey}/cancel")
     public TaskView cancelTask(@PathVariable String incidentKey, @PathVariable String taskKey,
-                               @RequestHeader("X-Actor-Id") String actor,
-                               @RequestBody TaskActionRequest req) {
+                             @RequestHeader("X-Actor-Id") String actor,
+                             @RequestBody TaskActionRequest req) {
         return service.cancelTask(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 重复事件合并（操作人须为双方共同的当前指挥人；携带 mergeKey 与双方 expectedVersion）。
+     */
+    @PostMapping("/merges")
+    public MergeView merge(@RequestHeader("X-Actor-Id") String actor,
+                           @RequestBody MergeRequest req) {
+        return service.merge(actor, req);
+    }
+
+    /**
+     * 查询全部合并记录（按落库顺序稳定返回，只读）。
+     */
+    @GetMapping("/merges")
+    public MergeListView listMerges() {
+        return service.listMerges();
+    }
+
+    /**
+     * 按 mergeKey 查询单条合并记录（只读）。
+     */
+    @GetMapping("/merges/{mergeKey}")
+    public MergeRecordView getMerge(@PathVariable String mergeKey) {
+        return service.getMerge(mergeKey);
     }
 }

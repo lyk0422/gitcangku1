@@ -11,10 +11,15 @@ public final class Responses {
     private Responses() {
     }
 
-    /** 事件当前视图：pendingTransferTo 为待接受的交接目标人，无则 null。 */
+    /**
+     * 事件当前视图：pendingTransferTo 为待接受的交接目标人，无则 null；
+     * version 为乐观锁版本号（合并时双方各加一）；
+     * mergedIntoIncidentKey 仅 MERGED 状态有值，指向存续事件键，其余为 null。
+     */
     public record IncidentView(String incidentKey, String severity, String summary, String reporter,
                                String status, String commander, String pendingTransferTo,
-                               Instant createdAt, Instant updatedAt, Instant deadlineAt) {
+                               Instant createdAt, Instant updatedAt, Instant deadlineAt,
+                               long version, String mergedIntoIncidentKey) {
     }
 
     /** 交接单视图。 */
@@ -64,11 +69,13 @@ public final class Responses {
 
     /**
      * 处置任务视图：blockers 按阻塞事件键排序；doneBy/doneAt 仅 DONE 有值，
-     * cancelledBy/cancelledAt 仅 CANCELLED 有值。
+     * cancelledBy/cancelledAt 仅 CANCELLED 有值；
+     * originIncidentKey 为任务最初所属事件键，仅合并迁移过的任务有值，其余为 null。
      */
     public record TaskView(String taskKey, String groupCode, String title, String status,
                            List<TaskBlockerView> blockers, String createdBy, Instant createdAt,
-                           String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt) {
+                           String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt,
+                           String originIncidentKey) {
     }
 
     /** 按事件分组的任务列表视图：tasks 按创建顺序返回。 */
@@ -77,5 +84,25 @@ public final class Responses {
 
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
+    }
+
+    /**
+     * 合并操作结果视图：movedTaskKeys 为本次迁移到存续事件的任务键（按键排序）；
+     * survivingVersion/mergedVersion 为合并成功后双方各自加一后的版本号。
+     */
+    public record MergeView(String mergeKey, String survivingIncidentKey, String mergedIncidentKey,
+                            long survivingVersion, long mergedVersion, List<String> movedTaskKeys,
+                            String actor, Instant mergedAt) {
+    }
+
+    /**
+     * 合并记录查询视图：mergeKey 全局唯一；actor 为提交合并时的双方共同当前指挥人。
+     */
+    public record MergeRecordView(String mergeKey, String survivingIncidentKey,
+                                  String mergedIncidentKey, String actor, Instant mergedAt) {
+    }
+
+    /** 合并记录列表视图：merges 按落库顺序（id 升序）稳定返回。 */
+    public record MergeListView(List<MergeRecordView> merges) {
     }
 }

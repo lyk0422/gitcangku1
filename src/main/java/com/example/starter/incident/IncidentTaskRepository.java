@@ -44,6 +44,8 @@ public class IncidentTaskRepository {
     private static IncidentTask mapTask(ResultSet rs) throws SQLException {
         Timestamp doneAt = rs.getTimestamp("done_at");
         Timestamp cancelledAt = rs.getTimestamp("cancelled_at");
+        long originIncident = rs.getLong("origin_incident_id");
+        Long originIncidentId = rs.wasNull() ? null : originIncident;
         return new IncidentTask(
                 rs.getLong("id"), rs.getLong("incident_id"), rs.getString("task_key"),
                 rs.getString("group_code"), rs.getString("title"),
@@ -53,13 +55,20 @@ public class IncidentTaskRepository {
                 rs.getString("cancelled_by"),
                 cancelledAt == null ? null : cancelledAt.toInstant(),
                 rs.getTimestamp("created_at").toInstant(),
-                rs.getTimestamp("updated_at").toInstant());
+                rs.getTimestamp("updated_at").toInstant(),
+                originIncidentId);
     }
 
     /**
      * 依赖图有向边：fromIncidentId（任务所属事件）→ toIncidentId（阻塞事件）。
      */
     public record Edge(long fromIncidentId, long toIncidentId) {
+    }
+
+    /**
+     * 阻塞边行：id 为边主键，taskId 为所属任务，blockerIncidentId 为阻塞事件。
+     */
+    public record BlockerRow(long id, long taskId, long blockerIncidentId) {
     }
 
     /**
@@ -174,15 +183,7 @@ public class IncidentTaskRepository {
         if (fromIncidentId == toIncidentId) {
             return true;
         }
-        List<Edge> edges = jdbc.query(
-                "SELECT t.incident_id, b.blocker_incident_id FROM incident_task_blockers b"
-                        + " JOIN incident_tasks t ON t.id = b.task_id",
-                (rs, n) -> new Edge(rs.getLong(1), rs.getLong(2)));
-        Map<Long, List<Long>> adjacency = new HashMap<>();
-        for (Edge edge : edges) {
-            adjacency.computeIfAbsent(edge.fromIncidentId(), k -> new ArrayList<>())
-                    .add(edge.toIncidentId());
-        }
+        Map<Long, List<Long>> adjacency = loadAdjacency();
         Set<Long> visited = new HashSet<>();
         Deque<Long> queue = new ArrayDeque<>();
         queue.add(fromIncidentId);
@@ -199,5 +200,119 @@ public class IncidentTaskRepository {
             }
         }
         return false;
+    }
+
+    /**
+     * 全图环检测：对整幅依赖图做拓扑排序，存在未处理节点即成环。
+     * 调用前必须已持有 lockGraph() 全局锁；用于合并改挂后的整图校验。
+     */
+    public boolean hasCycle() {
+        Map<Long, List<Long>> adjacency = loadAdjacency();
+        Map<Long, Integer> indegree = new HashMap<>();
+        for (Map.Entry<Long, List<Long>> entry : adjacency.entrySet()) {
+            indegree.putIfAbsent(entry.getKey(), 0);
+            for (Long next : entry.getValue()) {
+                indegree.merge(next, 1, Integer::sum);
+            }
+        }
+        Deque<Long> queue = new ArrayDeque<>();
+        for (Map.Entry<Long, Integer> entry : indegree.entrySet()) {
+            if (entry.getValue() == 0) {
+                queue.add(entry.getKey());
+            }
+        }
+        int processed = 0;
+        while (!queue.isEmpty()) {
+            long current = queue.poll();
+            processed++;
+            for (Long next : adjacency.getOrDefault(current, List.of())) {
+                if (indegree.merge(next, -1, Integer::sum) == 0) {
+                    queue.add(next);
+                }
+            }
+        }
+        return processed < indegree.size();
+    }
+
+    /**
+     * 加载当前依赖图邻接表（任务所属事件 → 阻塞事件，含重复边）。
+     */
+    private Map<Long, List<Long>> loadAdjacency() {
+        List<Edge> edges = jdbc.query(
+                "SELECT t.incident_id, b.blocker_incident_id FROM incident_task_blockers b"
+                        + " JOIN incident_tasks t ON t.id = b.task_id",
+                (rs, n) -> new Edge(rs.getLong(1), rs.getLong(2)));
+        Map<Long, List<Long>> adjacency = new HashMap<>();
+        for (Edge edge : edges) {
+            adjacency.computeIfAbsent(edge.fromIncidentId(), k -> new ArrayList<>())
+                    .add(edge.toIncidentId());
+        }
+        return adjacency;
+    }
+
+    /**
+     * 合并迁移：将 fromIncidentId 事件的全部任务改挂到 toIncidentId 事件；
+     * 首次迁移时把 origin_incident_id 记为来源事件，已迁移过的任务保留最初来源。
+     */
+    public void reassignTasks(long fromIncidentId, long toIncidentId, Instant now) {
+        jdbc.update("UPDATE incident_tasks SET incident_id = ?,"
+                        + " origin_incident_id = COALESCE(origin_incident_id, ?), updated_at = ?"
+                        + " WHERE incident_id = ?",
+                toIncidentId, fromIncidentId, Timestamp.from(now), fromIncidentId);
+    }
+
+    /**
+     * 查询指向指定事件的全部阻塞边（任意任务的入边），用于合并改挂。
+     */
+    public List<BlockerRow> listBlockersPointingTo(long blockerIncidentId) {
+        return jdbc.query("SELECT id, task_id, blocker_incident_id FROM incident_task_blockers"
+                        + " WHERE blocker_incident_id = ? ORDER BY id",
+                (rs, n) -> new BlockerRow(rs.getLong(1), rs.getLong(2), rs.getLong(3)),
+                blockerIncidentId);
+    }
+
+    /**
+     * 将一条阻塞边的目标事件改指为新事件。
+     */
+    public void updateBlockerTarget(long blockerRowId, long newBlockerIncidentId) {
+        jdbc.update("UPDATE incident_task_blockers SET blocker_incident_id = ? WHERE id = ?",
+                newBlockerIncidentId, blockerRowId);
+    }
+
+    /**
+     * 删除一条阻塞边（合并去重或指向自身时丢弃）。
+     */
+    public void deleteBlocker(long blockerRowId) {
+        jdbc.update("DELETE FROM incident_task_blockers WHERE id = ?", blockerRowId);
+    }
+
+    /**
+     * 判断指定任务是否已存在指向某事件的阻塞边（合并改挂去重用）。
+     */
+    public boolean existsBlocker(long taskId, long blockerIncidentId) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM incident_task_blockers WHERE task_id = ?"
+                        + " AND blocker_incident_id = ?",
+                Integer.class, taskId, blockerIncidentId);
+        return count != null && count > 0;
+    }
+
+    /**
+     * 查询当前指向自身的阻塞边（任务所属事件与阻塞事件相同），合并改挂后丢弃。
+     */
+    public List<Long> listSelfBlockerRowIds() {
+        return jdbc.query("SELECT b.id FROM incident_task_blockers b"
+                        + " JOIN incident_tasks t ON t.id = b.task_id"
+                        + " WHERE t.incident_id = b.blocker_incident_id ORDER BY b.id",
+                (rs, n) -> rs.getLong(1));
+    }
+
+    /**
+     * 按主键查询任务（合并改挂时定位任务所属事件）。
+     */
+    public Optional<IncidentTask> findById(long taskId) {
+        List<IncidentTask> rows = jdbc.query("SELECT * FROM incident_tasks WHERE id = ?",
+                TASK_MAPPER, taskId);
+        return rows.stream().findFirst();
     }
 }

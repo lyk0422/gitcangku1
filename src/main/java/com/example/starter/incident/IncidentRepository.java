@@ -46,11 +46,14 @@ public class IncidentRepository {
 
     private static Incident mapIncident(ResultSet rs) throws SQLException {
         Timestamp deadline = rs.getTimestamp("deadline_at");
+        long mergedInto = rs.getLong("merged_into_id");
+        Long mergedIntoId = rs.wasNull() ? null : mergedInto;
         return new Incident(rs.getLong("id"), rs.getString("incident_key"), rs.getString("severity"),
                 rs.getString("summary"), rs.getString("reporter"),
                 IncidentStatus.valueOf(rs.getString("status")), rs.getString("commander"),
                 rs.getTimestamp("created_at").toInstant(), rs.getTimestamp("updated_at").toInstant(),
-                deadline == null ? null : deadline.toInstant());
+                deadline == null ? null : deadline.toInstant(),
+                rs.getLong("version"), mergedIntoId);
     }
 
     /**
@@ -68,6 +71,15 @@ public class IncidentRepository {
     public Optional<Incident> lockByKey(String incidentKey) {
         List<Incident> rows = jdbc.query("SELECT * FROM incidents WHERE incident_key = ? FOR UPDATE",
                 INCIDENT_MAPPER, incidentKey);
+        return rows.stream().findFirst();
+    }
+
+    /**
+     * 按主键查询事件（不加锁），用于合并记录、任务来源等关联键解析。
+     */
+    public Optional<Incident> findById(long id) {
+        List<Incident> rows = jdbc.query("SELECT * FROM incidents WHERE id = ?",
+                INCIDENT_MAPPER, id);
         return rows.stream().findFirst();
     }
 
@@ -226,5 +238,22 @@ public class IncidentRepository {
                         + " JOIN incidents i ON i.id = b.blocker_incident_id"
                         + " WHERE b.task_id = ? ORDER BY i.incident_key",
                 INCIDENT_MAPPER, taskId);
+    }
+
+    /**
+     * 合并成功时将被并入事件置为 MERGED 终态：记录存续事件 id、作废遏制期限、版本号加一。
+     */
+    public void markMerged(long id, long survivingIncidentId, Instant updatedAt) {
+        jdbc.update("UPDATE incidents SET status = 'MERGED', merged_into_id = ?,"
+                        + " deadline_at = NULL, version = version + 1, updated_at = ? WHERE id = ?",
+                survivingIncidentId, Timestamp.from(updatedAt), id);
+    }
+
+    /**
+     * 合并成功时将存续事件版本号加一（状态与指挥人不变）。
+     */
+    public void bumpVersion(long id, Instant updatedAt) {
+        jdbc.update("UPDATE incidents SET version = version + 1, updated_at = ? WHERE id = ?",
+                Timestamp.from(updatedAt), id);
     }
 }

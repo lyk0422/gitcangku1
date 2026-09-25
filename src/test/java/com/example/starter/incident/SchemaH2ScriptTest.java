@@ -111,4 +111,77 @@ class SchemaH2ScriptTest {
             }
         }
     }
+
+    @Test
+    void h2Schema_mergeTableAndVersionColumns() throws Exception {
+        String url = "jdbc:h2:mem:schema_h2_merge;MODE=MySQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=0";
+        try (Connection con = DriverManager.getConnection(url, "sa", "")) {
+            ScriptUtils.executeSqlScript(con, new ClassPathResource("schema-h2.sql"));
+
+            Instant now = Instant.parse("2026-09-22T00:00:00Z");
+            try (Statement st = con.createStatement()) {
+                // version 默认 0、merged_into_id 默认空
+                st.execute("INSERT INTO incidents (incident_key, severity, summary, reporter, status,"
+                        + " commander, created_at, updated_at) VALUES"
+                        + " ('IK-S','S1','s','r','COMMANDING','alice','" + Timestamp.from(now)
+                        + "','" + Timestamp.from(now) + "')");
+                st.execute("INSERT INTO incidents (incident_key, severity, summary, reporter, status,"
+                        + " commander, created_at, updated_at) VALUES"
+                        + " ('IK-M','S1','s','r','COMMANDING','alice','" + Timestamp.from(now)
+                        + "','" + Timestamp.from(now) + "')");
+                try (ResultSet rs = st.executeQuery(
+                        "SELECT version, merged_into_id FROM incidents WHERE incident_key = 'IK-S'")) {
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getLong("version")).isZero();
+                    assertThat(rs.getObject("merged_into_id")).isNull();
+                }
+
+                // 合并记录落库与 merge_key 唯一约束
+                st.execute("INSERT INTO incident_merges (merge_key, surviving_incident_id,"
+                        + " merged_incident_id, actor, created_at) VALUES ('MRG-1',1,2,'alice','"
+                        + Timestamp.from(now) + "')");
+                boolean duplicateMergeRejected = false;
+                try {
+                    st.execute("INSERT INTO incident_merges (merge_key, surviving_incident_id,"
+                            + " merged_incident_id, actor, created_at) VALUES ('MRG-1',1,2,"
+                            + "'alice','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateMergeRejected = true;
+                }
+                assertThat(duplicateMergeRejected).isTrue();
+
+                // 版本加一与 MERGED 终态标记
+                int bumped = st.executeUpdate("UPDATE incidents SET status = 'MERGED',"
+                        + " merged_into_id = 1, deadline_at = NULL, version = version + 1"
+                        + " WHERE id = 2");
+                assertThat(bumped).isEqualTo(1);
+                try (ResultSet rs = st.executeQuery(
+                        "SELECT status, version, merged_into_id FROM incidents WHERE id = 2")) {
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getString("status")).isEqualTo("MERGED");
+                    assertThat(rs.getLong("version")).isEqualTo(1L);
+                    assertThat(rs.getLong("merged_into_id")).isEqualTo(1L);
+                }
+
+                // 任务迁移：origin_incident_id 记录首次来源，COALESCE 不覆盖已有来源
+                st.execute("INSERT INTO incident_tasks (incident_id, task_key, group_code, title,"
+                        + " status, created_by, created_at, updated_at) VALUES (2,'T-1','G','t',"
+                        + "'OPEN','alice','" + Timestamp.from(now) + "','" + Timestamp.from(now)
+                        + "')");
+                st.executeUpdate("UPDATE incident_tasks SET incident_id = 1,"
+                        + " origin_incident_id = COALESCE(origin_incident_id, 2)"
+                        + " WHERE incident_id = 2");
+                st.executeUpdate("UPDATE incident_tasks SET incident_id = 2,"
+                        + " origin_incident_id = COALESCE(origin_incident_id, 1)"
+                        + " WHERE incident_id = 1");
+                try (ResultSet rs = st.executeQuery(
+                        "SELECT incident_id, origin_incident_id FROM incident_tasks"
+                                + " WHERE task_key = 'T-1'")) {
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getLong("incident_id")).isEqualTo(2L);
+                    assertThat(rs.getLong("origin_incident_id")).isEqualTo(2L);
+                }
+            }
+        }
+    }
 }
