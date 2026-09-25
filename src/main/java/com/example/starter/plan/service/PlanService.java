@@ -18,6 +18,8 @@ import com.example.starter.plan.web.dto.RescheduleChainResponse;
 import com.example.starter.plan.web.dto.RescheduleRequest;
 import com.example.starter.plan.web.dto.RescheduleResponse;
 import com.example.starter.plan.web.dto.UpdateOccupanciesRequest;
+import com.example.starter.work.model.WorkWindow;
+import com.example.starter.work.repo.WorkOrderRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -60,13 +62,16 @@ public class PlanService {
 
     private final PlanRepository planRepo;
     private final IdempotencyRepository idemRepo;
+    private final WorkOrderRepository workRepo;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate tx;
 
     public PlanService(PlanRepository planRepo, IdempotencyRepository idemRepo,
+                       WorkOrderRepository workRepo,
                        ObjectMapper objectMapper, PlatformTransactionManager txManager) {
         this.planRepo = planRepo;
         this.idemRepo = idemRepo;
+        this.workRepo = workRepo;
         this.objectMapper = objectMapper;
         this.tx = new TransactionTemplate(txManager);
     }
@@ -160,6 +165,11 @@ public class PlanService {
                 if (!conflicts.isEmpty()) {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "存在时隙冲突，计划保持草稿", conflicts);
+                }
+                List<Map<String, Object>> workConflicts = findWorkWindowConflicts(occupancies);
+                if (!workConflicts.isEmpty()) {
+                    throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "WORK_WINDOW_CONFLICT",
+                            "占用区段与生效施工窗口相交，计划保持草稿", workConflicts);
                 }
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(plan.id(), PlanStatus.PUBLISHED, now);
@@ -259,6 +269,11 @@ public class PlanService {
                 if (!conflicts.isEmpty()) {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "新草稿存在时隙冲突，改签未生效", conflicts);
+                }
+                List<Map<String, Object>> workConflicts = findWorkWindowConflicts(occupancies);
+                if (!workConflicts.isEmpty()) {
+                    throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "WORK_WINDOW_CONFLICT",
+                            "新草稿占用区段与生效施工窗口相交，改签未生效", workConflicts);
                 }
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(oldPlan.id(), PlanStatus.CANCELLED, now);
@@ -450,6 +465,37 @@ public class PlanService {
             }
         }
         return conflicts;
+    }
+
+    /**
+     * 占用与生效施工窗口的相交检测（同区段、左闭右开区间相交）。
+     * 命中即返回仅含首个冲突的明细列表：冲突区段与施工窗口（workKey 与起止）。
+     */
+    private List<Map<String, Object>> findWorkWindowConflicts(List<Occupancy> occupancies) {
+        List<String> sectionIds = occupancies.stream()
+                .map(Occupancy::sectionId)
+                .collect(java.util.stream.Collectors.toCollection(TreeSet::new))
+                .stream().toList();
+        List<WorkWindow> windows = workRepo.findActiveWindows(sectionIds, List.of());
+        for (Occupancy o : occupancies) {
+            for (WorkWindow w : windows) {
+                if (!o.sectionId().equals(w.sectionId())) {
+                    continue;
+                }
+                boolean overlap = o.startUtc().isBefore(w.endUtc())
+                        && w.startUtc().isBefore(o.endUtc());
+                if (overlap) {
+                    Map<String, Object> detail = new LinkedHashMap<>();
+                    detail.put("type", "WORK_WINDOW_CONFLICT");
+                    detail.put("sectionId", o.sectionId());
+                    detail.put("workKey", w.workKey());
+                    detail.put("windowStartUtc", w.startUtc().toString());
+                    detail.put("windowEndUtc", w.endUtc().toString());
+                    return List.of(detail);
+                }
+            }
+        }
+        return List.of();
     }
 
     /**

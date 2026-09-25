@@ -219,4 +219,36 @@ public class PlanRepository {
     public void acquirePublishLock() {
         jdbc.queryForObject("SELECT id FROM publish_lock WHERE id = 1 FOR UPDATE", Integer.class);
     }
+
+    /**
+     * 查询全部已发布计划中、在给定区段集合上与给定 UTC 窗口相交的占用时隙
+     * （左闭右开相交：o.start &lt; windowEnd 且 windowStart &lt; o.end），不限运营日。
+     * 结果按 schedule_key、section_id、start_utc 升序，保证冲突列举稳定。
+     */
+    public List<PublishedSlot> findPublishedOccupanciesIntersecting(Collection<String> sectionIds,
+                                                                    Instant windowStartUtc,
+                                                                    Instant windowEndUtc) {
+        if (sectionIds.isEmpty()) {
+            return List.of();
+        }
+        StringJoiner sectionPlaceholders = new StringJoiner(", ");
+        sectionIds.forEach(s -> sectionPlaceholders.add("?"));
+        StringBuilder sql = new StringBuilder(
+                "SELECT p.schedule_key, o.train_no, o.section_id, o.start_utc, o.end_utc"
+                        + " FROM rail_plan_occupancy o JOIN rail_day_plan p ON p.id = o.plan_id"
+                        + " WHERE p.status = 'PUBLISHED'"
+                        + " AND o.start_utc < ? AND o.end_utc > ?"
+                        + " AND o.section_id IN (").append(sectionPlaceholders)
+                .append(") ORDER BY p.schedule_key, o.section_id, o.start_utc");
+        List<Object> args = new ArrayList<>();
+        args.add(windowEndUtc.toEpochMilli());
+        args.add(windowStartUtc.toEpochMilli());
+        args.addAll(sectionIds);
+        return jdbc.query(sql.toString(), (rs, n) -> new PublishedSlot(
+                rs.getString("schedule_key"),
+                rs.getString("train_no"),
+                rs.getString("section_id"),
+                Instant.ofEpochMilli(rs.getLong("start_utc")),
+                Instant.ofEpochMilli(rs.getLong("end_utc"))), args.toArray());
+    }
 }
