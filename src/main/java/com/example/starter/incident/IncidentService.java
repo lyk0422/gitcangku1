@@ -11,25 +11,41 @@ import java.util.EnumSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.Supplier;
 
 import com.example.starter.incident.dto.Requests.ActionRequest;
+import com.example.starter.incident.dto.Requests.DelegateRegisterRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
 import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
+import com.example.starter.incident.dto.Requests.HandoffCreateRequest;
+import com.example.starter.incident.dto.Requests.HandoffItemRequest;
+import com.example.starter.incident.dto.Requests.HandoffSettleRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
+import com.example.starter.incident.dto.Requests.ResourceRegisterRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
 import com.example.starter.incident.dto.Requests.TaskActionRequest;
+import com.example.starter.incident.dto.Requests.TaskAssignResourceRequest;
 import com.example.starter.incident.dto.Requests.TaskCreateRequest;
+import com.example.starter.incident.dto.Requests.TaskStartRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
+import com.example.starter.incident.dto.Responses.CloseBlockerView;
+import com.example.starter.incident.dto.Responses.DelegateView;
 import com.example.starter.incident.dto.Responses.EscalationHistoryView;
 import com.example.starter.incident.dto.Responses.EscalationView;
+import com.example.starter.incident.dto.Responses.HandoffBatchView;
+import com.example.starter.incident.dto.Responses.HandoffSettlementListHolder;
+import com.example.starter.incident.dto.Responses.HandoffSettlementView;
+import com.example.starter.incident.dto.Responses.HandoffView;
 import com.example.starter.incident.dto.Responses.HistoryView;
 import com.example.starter.incident.dto.Responses.IncidentTasksView;
 import com.example.starter.incident.dto.Responses.IncidentView;
+import com.example.starter.incident.dto.Responses.ResourceResponsibilityView;
+import com.example.starter.incident.dto.Responses.ResourceView;
 import com.example.starter.incident.dto.Responses.StatusChangeView;
 import com.example.starter.incident.dto.Responses.TaskBlockerView;
 import com.example.starter.incident.dto.Responses.TaskView;
@@ -72,16 +88,24 @@ public class IncidentService {
     private final EscalationRepository escalations;
     private final IncidentTaskRepository tasks;
     private final CommandKeyRepository commandKeys;
+    private final ResourceRepository resources;
+    private final HandoffRepository handoffs;
+    private final DelegateRepository delegates;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public IncidentService(IncidentRepository incidents, EscalationRepository escalations,
                            IncidentTaskRepository tasks, CommandKeyRepository commandKeys,
+                           ResourceRepository resources, HandoffRepository handoffs,
+                           DelegateRepository delegates,
                            ObjectMapper objectMapper, Clock clock) {
         this.incidents = incidents;
         this.escalations = escalations;
         this.tasks = tasks;
         this.commandKeys = commandKeys;
+        this.resources = resources;
+        this.handoffs = handoffs;
+        this.delegates = delegates;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -107,7 +131,7 @@ public class IncidentService {
         }
         Instant now = now();
         Incident incident = new Incident(0L, incidentKey, severity, summary, reporter,
-                IncidentStatus.REPORTED, null, now, now, null);
+                IncidentStatus.REPORTED, null, 0L, now, now, null);
         long id;
         try {
             id = incidents.insert(incident);
@@ -263,14 +287,30 @@ public class IncidentService {
                                 "不允许从 " + incident.status() + " 流转到 " + targetStatus);
                     }
                     if (targetStatus == IncidentStatus.RESOLVED) {
-                        // 解决门禁：全部处置任务进入 DONE/CANCELLED 后才可解决
+                        // 解决门禁：普通处置任务须全部进入 DONE/CANCELLED；
+                        // 占用互助借用资源的未终态任务按互助规则在关闭时处理
+                        // （未开始解绑归还、已开始继续至终态自动归还），故不在此阻断。
                         List<UnfinishedTaskView> unfinished = tasks
-                                .listOpenByIncident(incident.id()).stream()
+                                .listUnfinishedByIncident(incident.id()).stream()
+                                .filter(t -> t.assignedHandoffId() == null)
                                 .map(t -> new UnfinishedTaskView(t.groupCode(), t.taskKey()))
                                 .toList();
                         if (!unfinished.isEmpty()) {
                             throw ApiException.conflict(
                                     "仍有未完成的处置任务，不能进入 RESOLVED", unfinished);
+                        }
+                    }
+                    if (targetStatus == IncidentStatus.CLOSED) {
+                        // 来源关闭阻断：尚有借出未归还（ACTIVE）资源时禁止关闭
+                        List<Handoff> lent = handoffs.listActiveBySource(incident.id());
+                        if (!lent.isEmpty()) {
+                            List<String> resourceKeys = lent.stream()
+                                    .map(h -> resources.findById(h.resourceId())
+                                            .map(Resource::resourceKey).orElse("?"))
+                                    .distinct().toList();
+                            throw ApiException.unprocessable("SOURCE_CLOSE_BLOCKED",
+                                    "仍有借出未归还的资源，来源事件不能关闭: "
+                                            + String.join(",", resourceKeys));
                         }
                     }
                     Instant now = now();
@@ -279,6 +319,10 @@ public class IncidentService {
                             incident.status(), targetStatus, actor, now));
                     if (targetStatus == IncidentStatus.CONTAINED) {
                         escalations.cancelOpenForIncident(incident.id(), now);
+                    }
+                    if (targetStatus == IncidentStatus.CLOSED) {
+                        // 目标关闭：同事务解除未开始任务占用并归还来源；已开始任务继续占用至终态
+                        settleOnTargetClosed(incident.id(), now);
                     }
                     return toView(incidents.findByKey(incidentKey).orElseThrow(), null);
                 });
@@ -452,8 +496,8 @@ public class IncidentService {
                     }
                     Instant now = now();
                     long taskId = tasks.insert(new IncidentTask(0L, incident.id(), taskKey,
-                            groupCode, title, TaskStatus.OPEN, actor, null, null, null, null,
-                            now, now));
+                            groupCode, title, TaskStatus.OPEN, null, null, null, null, actor,
+                            null, null, null, null, now, now));
                     for (Incident blocker : blockers) {
                         tasks.insertBlocker(taskId, blocker.id(), now);
                     }
@@ -476,7 +520,7 @@ public class IncidentService {
                     requireCommander(incident, actor);
                     IncidentTask task = tasks.findByKey(incident.id(), taskKey)
                             .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
-                    if (task.status() != TaskStatus.OPEN) {
+                    if (task.status() != TaskStatus.OPEN && task.status() != TaskStatus.STARTED) {
                         throw ApiException.conflict(
                                 "任务已处于终态 " + task.status() + "，不能完成");
                     }
@@ -485,14 +529,17 @@ public class IncidentService {
                         throw ApiException.conflict("存在未解除阻塞的事件: "
                                 + String.join(",", unresolved), List.copyOf(unresolved));
                     }
-                    tasks.markDone(task.id(), actor, now());
+                    Instant finishAt = now();
+                    tasks.markDone(task.id(), actor, finishAt);
+                    // 任务终态：若占用互助借用资源，同事务解绑并在无其他占用任务时归还来源
+                    settleBorrowedResourceOnTaskFinish(task, SettlementReason.TASK_DONE, finishAt);
                     return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
                 });
     }
 
     /**
-     * 取消任务：仅当前指挥人；仅 OPEN 可取消；DONE/CANCELLED 为终态，
-     * 重复操作按 commandKey 幂等规则返回首次结果。
+     * 取消任务：仅当前指挥人；OPEN/STARTED 可取消；DONE/CANCELLED 为终态，
+     * 重复操作按 commandKey 幂等规则返回首次结果。取消借用资源的已开始任务同样触发自动归还。
      */
     @Transactional
     public TaskView cancelTask(String incidentKey, String taskKey, String actor,
@@ -504,13 +551,445 @@ public class IncidentService {
                     requireCommander(incident, actor);
                     IncidentTask task = tasks.findByKey(incident.id(), taskKey)
                             .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
-                    if (task.status() != TaskStatus.OPEN) {
+                    if (task.status() != TaskStatus.OPEN && task.status() != TaskStatus.STARTED) {
                         throw ApiException.conflict(
                                 "任务已处于终态 " + task.status() + "，不能取消");
                     }
-                    tasks.markCancelled(task.id(), actor, now());
+                    Instant finishAt = now();
+                    tasks.markCancelled(task.id(), actor, finishAt);
+                    // 任务终态：若占用互助借用资源，同事务解绑并在无其他占用任务时归还来源
+                    settleBorrowedResourceOnTaskFinish(task, SettlementReason.TASK_CANCELLED,
+                            finishAt);
                     return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
                 });
+    }
+
+    /**
+     * 登记可互助资源：仅来源事件当前指挥人；事件未关闭；resourceKey 全局唯一，重复 409。
+     */
+    @Transactional
+    public ResourceView registerResource(String incidentKey, String actor, ResourceRegisterRequest req) {
+        String commandKey = requireText(req.commandKey(), "commandKey");
+        String resourceKey = requireText(req.resourceKey(), "resourceKey");
+        String label = requireText(req.label(), "label");
+        Incident incident = lockIncident(incidentKey);
+        return runIdempotent(commandKey, "resource_register",
+                hash(incidentKey, actor, resourceKey, label), ResourceView.class, () -> {
+                    requireCommander(incident, actor);
+                    if (incident.status() == IncidentStatus.CLOSED) {
+                        throw ApiException.illegalTransition("事件已关闭，不能登记资源");
+                    }
+                    if (resources.findByKey(resourceKey).isPresent()) {
+                        throw ApiException.conflict("resourceKey 已存在: " + resourceKey);
+                    }
+                    Instant now = now();
+                    long id;
+                    try {
+                        id = resources.insert(new Resource(0L, resourceKey, incident.id(), label,
+                                actor, ResourceStatus.AVAILABLE, now, now));
+                    } catch (DuplicateKeyException e) {
+                        throw ApiException.conflict("resourceKey 已存在: " + resourceKey);
+                    }
+                    return toResourceView(resources.findById(id).orElseThrow());
+                });
+    }
+
+    /**
+     * 登记目标事件接收代理人：仅当前指挥人；代理人不能是指挥人本人；重复登记幂等。
+     */
+    @Transactional
+    public DelegateView registerDelegate(String incidentKey, String actor, DelegateRegisterRequest req) {
+        String commandKey = requireText(req.commandKey(), "commandKey");
+        String delegate = requireText(req.delegate(), "delegate");
+        Incident incident = lockIncident(incidentKey);
+        return runIdempotent(commandKey, "delegate_register",
+                hash(incidentKey, actor, delegate), DelegateView.class, () -> {
+                    requireCommander(incident, actor);
+                    if (incident.status() == IncidentStatus.CLOSED) {
+                        throw ApiException.illegalTransition("事件已关闭，不能登记接收代理人");
+                    }
+                    if (delegate.equals(incident.commander())) {
+                        throw ApiException.badRequest("代理人不能是当前指挥人本人");
+                    }
+                    Instant now = now();
+                    delegates.insertIfAbsent(incident.id(), delegate, actor, now);
+                    return new DelegateView(incident.incidentKey(), delegate, actor, now);
+                });
+    }
+
+    /**
+     * 开始任务：仅当前指挥人；仅 OPEN 可开始，进入 STARTED 并记录开始人/时刻。
+     * 已开始任务占用的借用资源此后不因租约到期或目标关闭而解除，直至任务终态。
+     */
+    @Transactional
+    public TaskView startTask(String incidentKey, String taskKey, String actor, TaskStartRequest req) {
+        String commandKey = requireText(req.commandKey(), "commandKey");
+        Incident incident = lockIncident(incidentKey);
+        return runIdempotent(commandKey, "task_start", hash(incidentKey, taskKey, actor),
+                TaskView.class, () -> {
+                    requireCommander(incident, actor);
+                    IncidentTask task = tasks.findByKey(incident.id(), taskKey)
+                            .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
+                    if (task.status() == TaskStatus.DONE || task.status() == TaskStatus.CANCELLED) {
+                        throw ApiException.conflict(
+                                "任务已处于终态 " + task.status() + "，不能开始");
+                    }
+                    if (task.status() == TaskStatus.STARTED) {
+                        throw ApiException.conflict("任务已开始，不能重复开始");
+                    }
+                    int updated = tasks.markStarted(task.id(), actor, now());
+                    if (updated == 0) {
+                        throw ApiException.conflict("任务已被并发开始或已终态");
+                    }
+                    return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
+                });
+    }
+
+    /**
+     * 批量互助交接：来源事件当前指挥人把空闲资源以 handoffKey 借给另一 OPEN 事件。
+     * 目标不得等于来源；租约 UTC 左闭右开且结束晚于开始；接收方须为目标当前指挥人或其登记代理人；
+     * 两事件均未关闭。批量先统一校验资源最终归属、空闲与重叠租约，任一冲突 422，整批回滚。
+     * handoffKey 指纹含两事件版本、资源、时段与操作者，同键同参重放，同键改参 409，失败不占键。
+     */
+    @Transactional
+    public HandoffBatchView createHandoffs(String sourceKey, String actor, HandoffCreateRequest req) {
+        String targetKey = requireText(req.targetIncidentKey(), "targetIncidentKey");
+        String receiver = requireText(req.receiver(), "receiver");
+        List<HandoffItemRequest> rawItems = req.items();
+        if (rawItems == null || rawItems.isEmpty()) {
+            throw ApiException.badRequest("items 不能为空");
+        }
+        if (targetKey.equals(requireText(sourceKey, "incidentKey"))) {
+            throw ApiException.unprocessable("HANDOFF_SAME_INCIDENT",
+                    "目标事件不能等于来源事件: " + targetKey);
+        }
+        // 规范化并校验请求项（时段、批内键/资源去重）
+        List<HandoffItemRequest> items = new ArrayList<>();
+        Set<String> seenKeys = new java.util.HashSet<>();
+        Set<String> seenResources = new java.util.HashSet<>();
+        for (HandoffItemRequest raw : rawItems) {
+            String handoffKey = requireText(raw.handoffKey(), "handoffKey");
+            String resourceKey = requireText(raw.resourceKey(), "resourceKey");
+            if (raw.leaseStart() == null || raw.leaseEnd() == null) {
+                throw ApiException.badRequest("leaseStart/leaseEnd 不能为空");
+            }
+            Instant leaseStart = raw.leaseStart();
+            Instant leaseEnd = raw.leaseEnd();
+            if (!leaseEnd.isAfter(leaseStart)) {
+                throw ApiException.unprocessable("HANDOFF_INVALID_LEASE",
+                        "租约结束必须晚于开始: " + handoffKey);
+            }
+            if (!seenKeys.add(handoffKey)) {
+                throw ApiException.badRequest("批内 handoffKey 重复: " + handoffKey);
+            }
+            if (!seenResources.add(resourceKey)) {
+                throw ApiException.badRequest("批内同一资源只能交接一次: " + resourceKey);
+            }
+            items.add(new HandoffItemRequest(handoffKey, resourceKey, leaseStart, leaseEnd));
+        }
+
+        // 先非加锁确认两事件存在，再按事件主键升序加锁，
+        // 保证 A→B 与 B→A 的并发交接以相同顺序持锁，避免死锁。
+        Incident sourceProbe = incidents.findByKey(sourceKey)
+                .orElseThrow(() -> ApiException.notFound("事件不存在: " + sourceKey));
+        Incident targetProbe = incidents.findByKey(targetKey)
+                .orElseThrow(() -> ApiException.notFound("目标事件不存在: " + targetKey));
+        List<Long> incidentLockOrder = List.of(sourceProbe.id(), targetProbe.id()).stream()
+                .sorted().toList();
+        Map<Long, Incident> lockedIncidents = new java.util.LinkedHashMap<>();
+        for (Long id : incidentLockOrder) {
+            lockedIncidents.put(id, incidents.lockById(id).orElseThrow());
+        }
+        Incident source = lockedIncidents.get(sourceProbe.id());
+        Incident target = lockedIncidents.get(targetProbe.id());
+        requireCommander(source, actor);
+        if (source.status() == IncidentStatus.CLOSED) {
+            throw ApiException.unprocessable("HANDOFF_SOURCE_CLOSED",
+                    "来源事件已关闭，不能交接资源: " + sourceKey);
+        }
+        if (target.status() == IncidentStatus.CLOSED) {
+            throw ApiException.unprocessable("HANDOFF_TARGET_CLOSED",
+                    "目标事件已关闭，不能接收资源: " + targetKey);
+        }
+        if (!receiver.equals(target.commander()) && !delegates.isDelegate(target.id(), receiver)) {
+            throw ApiException.unprocessable("HANDOFF_RECEIVER_UNAUTHORIZED",
+                    "接收人 " + receiver + " 不是目标事件当前指挥人或其登记接收代理人");
+        }
+
+        Instant now = now();
+        List<Handoff> result = new ArrayList<>();
+        // 第一阶段：区分已存在（重放）与新建项，已存在项校验指纹一致；新建项解析资源并确认归属
+        List<HandoffItemRequest> newItems = new ArrayList<>();
+        for (HandoffItemRequest item : items) {
+            var existing = handoffs.findByKey(item.handoffKey());
+            if (existing.isPresent()) {
+                result.add(verifyReplay(existing.get(), item, source, target, actor, receiver));
+            } else {
+                Resource resource = resources.findByKey(item.resourceKey())
+                        .orElseThrow(() -> ApiException.notFound(
+                                "资源不存在: " + item.resourceKey()));
+                if (resource.ownerIncidentId() != source.id()) {
+                    throw ApiException.unprocessable("HANDOFF_RESOURCE_NOT_OWNED",
+                            "来源事件不持有资源 " + resource.resourceKey());
+                }
+                newItems.add(item);
+            }
+        }
+        // 第二阶段：按资源主键顺序一次性加锁，统一校验最终归属、空闲与重叠租约后才允许写入
+        Map<String, Resource> lockedByKey = new java.util.LinkedHashMap<>();
+        List<Long> newResourceIds = newItems.stream()
+                .map(i -> resources.findByKey(i.resourceKey()).orElseThrow().id())
+                .sorted().toList();
+        for (Long rid : newResourceIds) {
+            Resource locked = resources.lockById(rid).orElseThrow();
+            if (locked.ownerIncidentId() != source.id()) {
+                throw ApiException.unprocessable("HANDOFF_RESOURCE_NOT_OWNED",
+                        "来源事件不持有资源 " + locked.resourceKey());
+            }
+            lockedByKey.put(locked.resourceKey(), locked);
+        }
+        // 先判定更具体的重叠租约，再判定资源仍被占用（LEASED_OUT 但租约不相邻/未归还）
+        for (HandoffItemRequest item : newItems) {
+            Resource locked = lockedByKey.get(item.resourceKey());
+            if (handoffs.existsActiveOverlap(locked.id(), item.leaseStart(), item.leaseEnd())) {
+                throw ApiException.unprocessable("HANDOFF_LEASE_OVERLAP",
+                        "资源存在重叠的生效租约: " + item.resourceKey());
+            }
+            if (locked.status() != ResourceStatus.AVAILABLE) {
+                throw ApiException.unprocessable("HANDOFF_RESOURCE_BUSY",
+                        "资源已借出且未归还，不能重复转借: " + locked.resourceKey());
+            }
+        }
+        // 第三阶段：全部校验通过，逐资源创建 ACTIVE 交接并置为 LEASED_OUT
+        for (HandoffItemRequest item : newItems) {
+            Resource locked = lockedByKey.get(item.resourceKey());
+            long handoffId;
+            try {
+                handoffId = handoffs.insert(new Handoff(0L, item.handoffKey(), locked.id(),
+                        source.id(), target.id(), source.version(), target.version(),
+                        item.leaseStart(), item.leaseEnd(), actor, receiver,
+                        HandoffStatus.ACTIVE, null, now));
+            } catch (DuplicateKeyException e) {
+                // 并发同键已由事件行锁与唯一约束串行化；此处兜底重放校验，读不到时给出明确冲突
+                Handoff concurrent = handoffs.findByKey(item.handoffKey())
+                        .orElseThrow(() -> ApiException.conflict(
+                                "handoffKey 正被并发请求处理: " + item.handoffKey()));
+                result.add(verifyReplay(concurrent, item, source, target, actor, receiver));
+                continue;
+            }
+            resources.updateStatus(locked.id(), ResourceStatus.LEASED_OUT, now);
+            result.add(handoffs.lockById(handoffId).orElseThrow());
+        }
+        List<HandoffView> views = result.stream().map(this::toHandoffView).toList();
+        return new HandoffBatchView(sourceKey, targetKey, views);
+    }
+
+    /**
+     * 校验同 handoffKey 重放与首次请求指纹（两事件版本、资源、时段、操作者）完全一致。
+     */
+    private Handoff verifyReplay(Handoff existing, HandoffItemRequest item,
+                                 Incident source, Incident target, String actor,
+                                 String receiver) {
+        Resource resource = resources.findById(existing.resourceId())
+                .orElseThrow(() -> ApiException.conflict("交接资源已不存在: " + item.resourceKey()));
+        boolean same = existing.sourceIncidentId() == source.id()
+                && existing.targetIncidentId() == target.id()
+                && existing.sourceVersion() == source.version()
+                && existing.targetVersion() == target.version()
+                && resource.resourceKey().equals(item.resourceKey())
+                && existing.leaseStart().equals(item.leaseStart())
+                && existing.leaseEnd().equals(item.leaseEnd())
+                && existing.operator().equals(actor)
+                && existing.receiver().equals(receiver);
+        if (!same) {
+            throw ApiException.conflict(
+                    "handoffKey 已被不同参数（含事件版本/资源/时段/操作者）的请求使用: "
+                            + item.handoffKey());
+        }
+        return existing;
+    }
+
+    /**
+     * 将通过交接借入的资源分配给目标事件的任务：仅目标当前指挥人；任务属目标事件且未终态；
+     * 交接须 ACTIVE；当前时刻落在租约 [leaseStart, leaseEnd) 内（左闭右开）；
+     * 任务同一时刻至多占用一个资源，重复分配同一交接幂等。
+     */
+    @Transactional
+    public TaskView assignResourceToTask(String targetKey, String taskKey, String actor,
+                                         TaskAssignResourceRequest req) {
+        String commandKey = requireText(req.commandKey(), "commandKey");
+        String handoffKey = requireText(req.handoffKey(), "handoffKey");
+        Incident target = lockIncident(targetKey);
+        return runIdempotent(commandKey, "task_assign_resource",
+                hash(targetKey, taskKey, handoffKey, actor), TaskView.class, () -> {
+                    requireCommander(target, actor);
+                    IncidentTask task = tasks.findByKey(target.id(), taskKey)
+                            .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
+                    if (task.status() == TaskStatus.DONE || task.status() == TaskStatus.CANCELLED) {
+                        throw ApiException.conflict("任务已终态，不能分配资源: " + taskKey);
+                    }
+                    Handoff handoff = handoffs.lockByKey(handoffKey)
+                            .orElseThrow(() -> ApiException.notFound("交接不存在: " + handoffKey));
+                    if (handoff.targetIncidentId() != target.id()) {
+                        throw ApiException.unprocessable("HANDOFF_TARGET_MISMATCH",
+                                "交接目标事件与路径事件不一致: " + handoffKey);
+                    }
+                    if (handoff.status() != HandoffStatus.ACTIVE) {
+                        throw ApiException.unprocessable("HANDOFF_NOT_ACTIVE",
+                                "交接已结算，不能再分配资源: " + handoffKey);
+                    }
+                    Instant now = now();
+                    if (now.isBefore(handoff.leaseStart()) || !now.isBefore(handoff.leaseEnd())) {
+                        throw ApiException.unprocessable("HANDOFF_OUT_OF_LEASE",
+                                "当前时刻不在租约 [leaseStart, leaseEnd) 内: " + handoffKey);
+                    }
+                    if (task.assignedHandoffId() != null
+                            && task.assignedHandoffId() != handoff.id()) {
+                        throw ApiException.unprocessable("TASK_RESOURCE_CONFLICT",
+                                "任务已占用其他互助资源，不能重复分配: " + taskKey);
+                    }
+                    if (task.assignedHandoffId() == null) {
+                        // 资源同一时刻至多被目标事件的一个非终态任务占用（目标事件行已锁，串行化分配）
+                        if (tasks.countActiveByResource(handoff.resourceId()) > 0) {
+                            Resource occupied = resources.findById(handoff.resourceId()).orElseThrow();
+                            throw ApiException.unprocessable("RESOURCE_IN_USE",
+                                    "资源正被其他未终态任务占用，不能重复分配: "
+                                            + occupied.resourceKey());
+                        }
+                        tasks.assignBorrowedResource(task.id(), handoff.resourceId(),
+                                handoff.id(), now);
+                    }
+                    return toTaskView(tasks.findByKey(target.id(), taskKey).orElseThrow());
+                });
+    }
+
+    /**
+     * 租约到期结算检查：以注入 Clock 的当前时刻评估，不做定时扫描。
+     * 结算目标事件所有当前时刻 ≥ leaseEnd 的 ACTIVE 交接：未开始任务同事务解绑归还，
+     * 写入不可变结算（LEASE_EXPIRED）；若仍有已开始任务占用，则交接保持 ACTIVE 不归还。
+     * 返回本次新结算的交接视图。同 commandKey 重放首次结果，失败不占键。
+     */
+    @Transactional
+    public List<HandoffSettlementView> settleExpiredLeases(String targetKey,
+                                                           HandoffSettleRequest req) {
+        String commandKey = requireText(req.commandKey(), "commandKey");
+        Incident target = lockIncident(targetKey);
+        return runIdempotent(commandKey, "lease_settle", hash(targetKey),
+                HandoffSettlementListHolder.class, () -> {
+                    Instant now = now();
+                    List<HandoffSettlementView> settled = new ArrayList<>();
+                    for (Handoff active : handoffs.listActiveByTarget(target.id())) {
+                        if (!now.isBefore(active.leaseEnd())) {
+                            settleIfNoStartedTask(active, SettlementReason.LEASE_EXPIRED, now)
+                                    .ifPresent(settled::add);
+                        }
+                    }
+                    return new HandoffSettlementListHolder(settled);
+                }).views();
+    }
+
+    /**
+     * 解绑一条 ACTIVE 交接下全部未开始（OPEN）任务，并返回是否仍有已开始（STARTED）任务占用。
+     * 无论资源最终是否归还，未开始任务都须在同事务解除该资源。
+     */
+    private boolean detachOpenAndHasStarted(Handoff locked, Instant now) {
+        tasks.unassignOpenTasksByHandoff(locked.id(), now);
+        return !tasks.listStartedByHandoff(locked.id()).isEmpty();
+    }
+
+    /**
+     * 租约到期结算一条交接：先解绑未开始任务；若仍有已开始任务占用则不归还（返回空），
+     * 否则交接置 SETTLED、资源归还来源 AVAILABLE，并写一条不可变 LEASE_EXPIRED 结算。
+     * 调用方须持有目标事件行锁，交接行在此加锁防并发重复结算。
+     */
+    private Optional<HandoffSettlementView> settleIfNoStartedTask(Handoff handoff,
+                                                                  SettlementReason reason,
+                                                                  Instant now) {
+        Handoff locked = handoffs.lockById(handoff.id()).orElseThrow();
+        if (locked.status() != HandoffStatus.ACTIVE) {
+            return Optional.empty();
+        }
+        List<String> openTaskKeys = tasks.listOpenTaskKeysByHandoff(locked.id());
+        boolean hasStarted = detachOpenAndHasStarted(locked, now);
+        if (hasStarted) {
+            return Optional.empty();
+        }
+        int updated = handoffs.markSettled(locked.id(), now);
+        if (updated == 0) {
+            // 并发已结算：保守放弃本次结算，交由唯一约束/状态裁决
+            return Optional.empty();
+        }
+        Resource resource = resources.lockById(locked.resourceId()).orElseThrow();
+        resources.updateStatus(resource.id(), ResourceStatus.AVAILABLE, now);
+        String detail = openTaskKeys.isEmpty() ? "无未开始任务" : "解绑未开始任务: "
+                + String.join(",", openTaskKeys);
+        try {
+            handoffs.insertSettlement(new HandoffSettlement(0L, locked.id(), reason.name(),
+                    resource.resourceKey(), detail, now, now));
+        } catch (DuplicateKeyException e) {
+            // 结算已存在（并发/重放），不重复写入
+        }
+        return Optional.of(toSettlementView(handoffs.findSettlement(locked.id()).orElseThrow(),
+                locked));
+    }
+
+    /**
+     * 目标关闭结算：无论是否有已开始任务，未开始任务一律解绑归还来源；
+     * 无已开始任务占用的交接立即 SETTLED（TARGET_CLOSED），仍被已开始任务占用的交接
+     * 保持 ACTIVE，待任务终态自动归还。
+     */
+    private void settleOnTargetClosed(long targetIncidentId, Instant now) {
+        for (Handoff active : handoffs.listActiveByTarget(targetIncidentId)) {
+            Handoff locked = handoffs.lockById(active.id()).orElseThrow();
+            if (locked.status() != HandoffStatus.ACTIVE) {
+                continue;
+            }
+            List<String> openTaskKeys = tasks.listOpenTaskKeysByHandoff(locked.id());
+            boolean hasStarted = detachOpenAndHasStarted(locked, now);
+            if (!hasStarted) {
+                completeSettlement(locked, SettlementReason.TARGET_CLOSED, openTaskKeys, now);
+            }
+            // 有已开始任务：交接保持 ACTIVE，资源仍 LEASED_OUT，待任务终态结算
+        }
+    }
+
+    /**
+     * 落库一条交接的最终结算：交接 SETTLED、资源归还来源 AVAILABLE、写不可变结算记录。
+     */
+    private void completeSettlement(Handoff locked, SettlementReason reason,
+                                    List<String> detachedTaskKeys, Instant now) {
+        handoffs.markSettled(locked.id(), now);
+        Resource resource = resources.lockById(locked.resourceId()).orElseThrow();
+        resources.updateStatus(resource.id(), ResourceStatus.AVAILABLE, now);
+        String detail = detachedTaskKeys.isEmpty() ? "无未开始任务"
+                : "解绑未开始任务: " + String.join(",", detachedTaskKeys);
+        try {
+            handoffs.insertSettlement(new HandoffSettlement(0L, locked.id(), reason.name(),
+                    resource.resourceKey(), detail, now, now));
+        } catch (DuplicateKeyException e) {
+            // 结算记录已存在时不重复写入
+        }
+    }
+
+    /**
+     * 任务终态（DONE/CANCELLED）自动归还：清除任务占用；若该交接再无其他未终态任务占用，
+     * 立即结算归还来源（原因按任务终态）。否则交接保持 ACTIVE。
+     */
+    private void settleBorrowedResourceOnTaskFinish(IncidentTask finishedTask,
+                                                    SettlementReason reason, Instant now) {
+        if (finishedTask.assignedHandoffId() == null) {
+            return;
+        }
+        long handoffId = finishedTask.assignedHandoffId();
+        tasks.unassignTask(finishedTask.id(), now);
+        Handoff locked = handoffs.lockById(handoffId).orElseThrow();
+        if (locked.status() != HandoffStatus.ACTIVE) {
+            return;
+        }
+        if (!tasks.listActiveByHandoff(handoffId).isEmpty()) {
+            return;
+        }
+        completeSettlement(locked, reason, List.of(), now);
     }
 
     /**
@@ -538,13 +1017,118 @@ public class IncidentService {
     }
 
     /**
-     * 仍未解除阻塞的事件键列表：目标事件未进入 CONTAINED/RESOLVED/CLOSED 即未解除。
+     * 仍未解除阻塞的事件键列表：目标事件已进入的状态说明阻塞已解除。
      */
     private List<String> unresolvedBlockers(long taskId) {
         return incidents.listBlockingIncidents(taskId).stream()
                 .filter(b -> !UNBLOCKING_STATUSES.contains(b.status()))
                 .map(Incident::incidentKey)
                 .toList();
+    }
+
+    /**
+     * 查询事件登记的互助资源列表。只读，不隐式写入。
+     */
+    @Transactional(readOnly = true)
+    public List<ResourceView> listResources(String incidentKey) {
+        Incident incident = incidents.findByKey(incidentKey)
+                .orElseThrow(() -> ApiException.notFound("事件不存在: " + incidentKey));
+        return resources.listByOwner(incident.id()).stream().map(this::toResourceView).toList();
+    }
+
+    /**
+     * 查询资源当前责任：来源自持（SOURCE）或目标事件借用中（TARGET，含超期但被已开始任务占用）。
+     * 只读，不隐式写入。
+     */
+    @Transactional(readOnly = true)
+    public ResourceResponsibilityView getResourceResponsibility(String resourceKey) {
+        Resource resource = resources.findByKey(resourceKey)
+                .orElseThrow(() -> ApiException.notFound("资源不存在: " + resourceKey));
+        Incident owner = incidents.findById(resource.ownerIncidentId()).orElseThrow();
+        var activeOpt = handoffs.findActiveByResource(resource.id());
+        if (activeOpt.isEmpty()) {
+            return new ResourceResponsibilityView(toResourceView(resource), "SOURCE",
+                    owner.incidentKey(), null, null, null, null);
+        }
+        Handoff active = activeOpt.get();
+        Incident responsibleIncident = incidents.findById(active.targetIncidentId()).orElseThrow();
+        return new ResourceResponsibilityView(toResourceView(resource), "TARGET",
+                responsibleIncident.incidentKey(), active.handoffKey(), active.leaseStart(),
+                active.leaseEnd(), active.operator());
+    }
+
+    /**
+     * 查询资源的交接与不可变结算历史。只读，不隐式写入。
+     */
+    @Transactional(readOnly = true)
+    public List<HandoffView> getResourceHandoffs(String resourceKey) {
+        Resource resource = resources.findByKey(resourceKey)
+                .orElseThrow(() -> ApiException.notFound("资源不存在: " + resourceKey));
+        return handoffs.listByResource(resource.id()).stream().map(this::toHandoffView).toList();
+    }
+
+    /**
+     * 查询资源的不可变结算记录。只读，不隐式写入。
+     */
+    @Transactional(readOnly = true)
+    public List<HandoffSettlementView> getResourceSettlements(String resourceKey) {
+        Resource resource = resources.findByKey(resourceKey)
+                .orElseThrow(() -> ApiException.notFound("资源不存在: " + resourceKey));
+        return handoffs.listSettlementsByResource(resource.id()).stream()
+                .map(s -> {
+                    Handoff h = handoffs.findById(s.handoffId()).orElseThrow();
+                    return toSettlementView(s, h);
+                }).toList();
+    }
+
+    /**
+     * 查询关闭阻断原因：返回是否阻断及可区分原因（借出未归还资源、事件状态/门禁）。
+     * 只做检查，不改变状态，也不执行结算。
+     */
+    @Transactional(readOnly = true)
+    public CloseBlockerView getCloseBlockers(String incidentKey) {
+        Incident incident = incidents.findByKey(incidentKey)
+                .orElseThrow(() -> ApiException.notFound("事件不存在: " + incidentKey));
+        List<String> reasons = new ArrayList<>();
+        List<String> resourceKeys = new ArrayList<>();
+        if (incident.status() != IncidentStatus.RESOLVED) {
+            reasons.add("事件当前状态为 " + incident.status() + "，仅 RESOLVED 可关闭");
+        }
+        List<Handoff> lent = handoffs.listActiveBySource(incident.id());
+        if (!lent.isEmpty()) {
+            reasons.add("仍有借出未归还（ACTIVE）的互助资源，来源事件不可关闭");
+            for (Handoff h : lent) {
+                resources.findById(h.resourceId()).map(Resource::resourceKey)
+                        .ifPresent(resourceKeys::add);
+            }
+        }
+        return new CloseBlockerView(incident.incidentKey(), incident.status().name(),
+                !reasons.isEmpty(), List.copyOf(reasons),
+                resourceKeys.stream().distinct().toList());
+    }
+
+    private ResourceView toResourceView(Resource resource) {
+        Incident owner = incidents.findById(resource.ownerIncidentId()).orElseThrow();
+        return new ResourceView(resource.resourceKey(), owner.incidentKey(), resource.label(),
+                resource.registeredBy(), resource.status().name(), resource.createdAt(),
+                resource.updatedAt());
+    }
+
+    private HandoffView toHandoffView(Handoff handoff) {
+        Resource resource = resources.findById(handoff.resourceId()).orElseThrow();
+        Incident source = incidents.findById(handoff.sourceIncidentId()).orElseThrow();
+        Incident target = incidents.findById(handoff.targetIncidentId()).orElseThrow();
+        return new HandoffView(handoff.handoffKey(), resource.resourceKey(),
+                source.incidentKey(), target.incidentKey(), handoff.sourceVersion(),
+                handoff.targetVersion(), handoff.leaseStart(), handoff.leaseEnd(),
+                handoff.operator(), handoff.receiver(), handoff.status().name(),
+                handoff.settledAt(), handoff.createdAt());
+    }
+
+    private HandoffSettlementView toSettlementView(HandoffSettlement settlement, Handoff handoff) {
+        return new HandoffSettlementView(handoff.handoffKey(), settlement.reason(),
+                settlement.returnedResourceKey(), settlement.detail(),
+                settlement.settledAt(), settlement.createdAt());
     }
 
     private Incident lockIncident(String incidentKey) {
@@ -632,16 +1216,28 @@ public class IncidentService {
     }
 
     /**
-     * 组装任务视图：阻塞状态按目标事件查询时的当前状态计算，不写回依赖任务。
+     * 组装任务视图：阻塞状态按目标事件查询时的当前状态计算，不写回依赖任务；
+     * 借用资源/交接在仍占用时返回业务键，解绑归还后为空。
      */
     private TaskView toTaskView(IncidentTask task) {
         List<TaskBlockerView> blockers = incidents.listBlockingIncidents(task.id()).stream()
                 .map(b -> new TaskBlockerView(b.incidentKey(), b.status().name(),
                         UNBLOCKING_STATUSES.contains(b.status())))
                 .toList();
+        String assignedResourceKey = null;
+        String assignedHandoffKey = null;
+        if (task.assignedHandoffId() != null) {
+            assignedHandoffKey = handoffs.findById(task.assignedHandoffId())
+                    .map(Handoff::handoffKey).orElse(null);
+        }
+        if (task.assignedResourceId() != null) {
+            assignedResourceKey = resources.findById(task.assignedResourceId())
+                    .map(Resource::resourceKey).orElse(null);
+        }
         return new TaskView(task.taskKey(), task.groupCode(), task.title(), task.status().name(),
-                blockers, task.createdBy(), task.createdAt(), task.doneBy(), task.doneAt(),
-                task.cancelledBy(), task.cancelledAt());
+                blockers, task.createdBy(), task.createdAt(),
+                task.startedBy(), task.startedAt(), assignedResourceKey, assignedHandoffKey,
+                task.doneBy(), task.doneAt(), task.cancelledBy(), task.cancelledAt());
     }
 
     private static TransferView toTransferView(IncidentTransfer transfer) {

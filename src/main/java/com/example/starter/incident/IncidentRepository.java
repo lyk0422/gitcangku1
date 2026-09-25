@@ -49,6 +49,7 @@ public class IncidentRepository {
         return new Incident(rs.getLong("id"), rs.getString("incident_key"), rs.getString("severity"),
                 rs.getString("summary"), rs.getString("reporter"),
                 IncidentStatus.valueOf(rs.getString("status")), rs.getString("commander"),
+                rs.getLong("version"),
                 rs.getTimestamp("created_at").toInstant(), rs.getTimestamp("updated_at").toInstant(),
                 deadline == null ? null : deadline.toInstant());
     }
@@ -68,6 +69,23 @@ public class IncidentRepository {
     public Optional<Incident> lockByKey(String incidentKey) {
         List<Incident> rows = jdbc.query("SELECT * FROM incidents WHERE incident_key = ? FOR UPDATE",
                 INCIDENT_MAPPER, incidentKey);
+        return rows.stream().findFirst();
+    }
+
+    /**
+     * 按主键查询事件（不加锁），用于只读组装。
+     */
+    public Optional<Incident> findById(long id) {
+        List<Incident> rows = jdbc.query("SELECT * FROM incidents WHERE id = ?", INCIDENT_MAPPER, id);
+        return rows.stream().findFirst();
+    }
+
+    /**
+     * 按主键查询并锁定事件行（SELECT ... FOR UPDATE）。
+     */
+    public Optional<Incident> lockById(long id) {
+        List<Incident> rows = jdbc.query("SELECT * FROM incidents WHERE id = ? FOR UPDATE",
+                INCIDENT_MAPPER, id);
         return rows.stream().findFirst();
     }
 
@@ -104,10 +122,11 @@ public class IncidentRepository {
     }
 
     /**
-     * 更新事件状态与指挥人（commander 可为 null 表示不变更时传入原值）。
+     * 更新事件状态与指挥人（commander 可为 null 表示不变更时传入原值），版本号自增 1。
      */
     public void updateState(long id, IncidentStatus status, String commander, Instant updatedAt) {
-        jdbc.update("UPDATE incidents SET status = ?, commander = ?, updated_at = ? WHERE id = ?",
+        jdbc.update("UPDATE incidents SET status = ?, commander = ?, version = version + 1,"
+                + " updated_at = ? WHERE id = ?",
                 status.name(), commander, Timestamp.from(updatedAt), id);
     }
 

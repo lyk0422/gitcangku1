@@ -44,10 +44,16 @@ public class IncidentTaskRepository {
     private static IncidentTask mapTask(ResultSet rs) throws SQLException {
         Timestamp doneAt = rs.getTimestamp("done_at");
         Timestamp cancelledAt = rs.getTimestamp("cancelled_at");
+        Timestamp startedAt = rs.getTimestamp("started_at");
+        Long assignedResourceId = rs.getObject("assigned_resource_id", Long.class);
+        Long assignedHandoffId = rs.getObject("assigned_handoff_id", Long.class);
         return new IncidentTask(
                 rs.getLong("id"), rs.getLong("incident_id"), rs.getString("task_key"),
                 rs.getString("group_code"), rs.getString("title"),
                 TaskStatus.valueOf(rs.getString("status")),
+                assignedResourceId, assignedHandoffId,
+                rs.getString("started_by"),
+                startedAt == null ? null : startedAt.toInstant(),
                 rs.getString("created_by"), rs.getString("done_by"),
                 doneAt == null ? null : doneAt.toInstant(),
                 rs.getString("cancelled_by"),
@@ -70,21 +76,26 @@ public class IncidentTaskRepository {
         jdbc.update(con -> {
             var ps = con.prepareStatement(
                     "INSERT INTO incident_tasks (incident_id, task_key, group_code, title, status,"
+                            + " assigned_resource_id, assigned_handoff_id, started_by, started_at,"
                             + " created_by, done_by, done_at, cancelled_by, cancelled_at,"
-                            + " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                            + " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setLong(1, task.incidentId());
             ps.setString(2, task.taskKey());
             ps.setString(3, task.groupCode());
             ps.setString(4, task.title());
             ps.setString(5, task.status().name());
-            ps.setString(6, task.createdBy());
-            ps.setString(7, task.doneBy());
-            ps.setTimestamp(8, task.doneAt() == null ? null : Timestamp.from(task.doneAt()));
-            ps.setString(9, task.cancelledBy());
-            ps.setTimestamp(10, task.cancelledAt() == null ? null : Timestamp.from(task.cancelledAt()));
-            ps.setTimestamp(11, Timestamp.from(task.createdAt()));
-            ps.setTimestamp(12, Timestamp.from(task.updatedAt()));
+            ps.setObject(6, task.assignedResourceId());
+            ps.setObject(7, task.assignedHandoffId());
+            ps.setString(8, task.startedBy());
+            ps.setTimestamp(9, task.startedAt() == null ? null : Timestamp.from(task.startedAt()));
+            ps.setString(10, task.createdBy());
+            ps.setString(11, task.doneBy());
+            ps.setTimestamp(12, task.doneAt() == null ? null : Timestamp.from(task.doneAt()));
+            ps.setString(13, task.cancelledBy());
+            ps.setTimestamp(14, task.cancelledAt() == null ? null : Timestamp.from(task.cancelledAt()));
+            ps.setTimestamp(15, Timestamp.from(task.createdAt()));
+            ps.setTimestamp(16, Timestamp.from(task.updatedAt()));
             return ps;
         }, keys);
         return keys.getKey().longValue();
@@ -109,11 +120,11 @@ public class IncidentTaskRepository {
     }
 
     /**
-     * 查询事件仍 OPEN 的任务（解决门禁用），按创建顺序返回。
+     * 查询事件未终态（OPEN/STARTED）的任务（解决门禁用），按创建顺序返回。
      */
-    public List<IncidentTask> listOpenByIncident(long incidentId) {
-        return jdbc.query("SELECT * FROM incident_tasks WHERE incident_id = ? AND status = 'OPEN'"
-                + " ORDER BY id", TASK_MAPPER, incidentId);
+    public List<IncidentTask> listUnfinishedByIncident(long incidentId) {
+        return jdbc.query("SELECT * FROM incident_tasks WHERE incident_id = ?"
+                + " AND status IN ('OPEN','STARTED') ORDER BY id", TASK_MAPPER, incidentId);
     }
 
     /**
@@ -126,7 +137,7 @@ public class IncidentTaskRepository {
     }
 
     /**
-     * 将 OPEN 任务置为 DONE，记录完成人与 UTC 时刻。
+     * 将任务置为 DONE，记录完成人与 UTC 时刻（OPEN 与 STARTED 均可完成）。
      */
     public void markDone(long id, String actor, Instant at) {
         jdbc.update("UPDATE incident_tasks SET status = 'DONE', done_by = ?, done_at = ?,"
@@ -135,12 +146,86 @@ public class IncidentTaskRepository {
     }
 
     /**
-     * 将 OPEN 任务置为 CANCELLED，记录取消人与 UTC 时刻。
+     * 将任务置为 CANCELLED，记录取消人与 UTC 时刻（OPEN 与 STARTED 均可取消）。
      */
     public void markCancelled(long id, String actor, Instant at) {
         jdbc.update("UPDATE incident_tasks SET status = 'CANCELLED', cancelled_by = ?,"
                         + " cancelled_at = ?, updated_at = ? WHERE id = ?",
                 actor, Timestamp.from(at), Timestamp.from(at), id);
+    }
+
+    /**
+     * 将 OPEN 任务置为 STARTED，记录开始人与 UTC 时刻；仅 OPEN 可开始，返回受影响行数。
+     */
+    public int markStarted(long id, String actor, Instant at) {
+        return jdbc.update("UPDATE incident_tasks SET status = 'STARTED', started_by = ?,"
+                        + " started_at = ?, updated_at = ? WHERE id = ? AND status = 'OPEN'",
+                actor, Timestamp.from(at), Timestamp.from(at), id);
+    }
+
+    /**
+     * 给任务绑定通过交接借入的资源（目标事件 OPEN/STARTED 任务）。
+     */
+    public void assignBorrowedResource(long taskId, long resourceId, long handoffId, Instant at) {
+        jdbc.update("UPDATE incident_tasks SET assigned_resource_id = ?, assigned_handoff_id = ?,"
+                        + " updated_at = ? WHERE id = ?",
+                resourceId, handoffId, Timestamp.from(at), taskId);
+    }
+
+    /**
+     * 解除任务占用的借用资源（租约到期/目标关闭时对未开始任务执行），返回解绑行数。
+     * 仅解绑仍 OPEN（未开始）的任务；已开始任务继续占用。
+     */
+    public int unassignOpenTasksByHandoff(long handoffId, Instant at) {
+        return jdbc.update("UPDATE incident_tasks SET assigned_resource_id = NULL,"
+                        + " assigned_handoff_id = NULL, updated_at = ?"
+                        + " WHERE assigned_handoff_id = ? AND status = 'OPEN'",
+                Timestamp.from(at), handoffId);
+    }
+
+    /**
+     * 清除单个任务占用的借用资源（任务终态自动归还时使用）。
+     */
+    public int unassignTask(long taskId, Instant at) {
+        return jdbc.update("UPDATE incident_tasks SET assigned_resource_id = NULL,"
+                + " assigned_handoff_id = NULL, updated_at = ? WHERE id = ?",
+                Timestamp.from(at), taskId);
+    }
+
+    /**
+     * 列出占用指定交接资源且尚未终态（OPEN/STARTED）的任务。
+     */
+    public List<IncidentTask> listActiveByHandoff(long handoffId) {
+        return jdbc.query("SELECT * FROM incident_tasks WHERE assigned_handoff_id = ?"
+                        + " AND status IN ('OPEN','STARTED') ORDER BY id",
+                TASK_MAPPER, handoffId);
+    }
+
+    /**
+     * 列出占用指定交接资源且已开始（STARTED）的任务。
+     */
+    public List<IncidentTask> listStartedByHandoff(long handoffId) {
+        return jdbc.query("SELECT * FROM incident_tasks WHERE assigned_handoff_id = ?"
+                        + " AND status = 'STARTED' ORDER BY id",
+                TASK_MAPPER, handoffId);
+    }
+
+    /**
+     * 统计当前占用指定资源且尚未终态（OPEN/STARTED）的任务数（资源同一时刻至多被一个任务占用）。
+     */
+    public int countActiveByResource(long resourceId) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM incident_tasks WHERE assigned_resource_id = ?"
+                        + " AND status IN ('OPEN','STARTED')", Integer.class, resourceId);
+        return count == null ? 0 : count;
+    }
+
+    /**
+     * 列出占用指定交接资源且未开始（OPEN）的任务键，用于结算明细。
+     */
+    public List<String> listOpenTaskKeysByHandoff(long handoffId) {
+        return jdbc.queryForList("SELECT task_key FROM incident_tasks WHERE assigned_handoff_id = ?"
+                + " AND status = 'OPEN' ORDER BY id", String.class, handoffId);
     }
 
     /**
