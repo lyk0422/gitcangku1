@@ -1,17 +1,22 @@
 package com.example.starter.plan.service;
 
+import com.example.starter.plan.model.CrewRiskRecord;
+import com.example.starter.plan.model.CrewRole;
 import com.example.starter.plan.model.DayPlan;
 import com.example.starter.plan.model.Occupancy;
 import com.example.starter.plan.model.PlanStatus;
 import com.example.starter.plan.model.PublishedSlot;
 import com.example.starter.plan.model.RescheduleLink;
+import com.example.starter.plan.repo.CrewRepository;
 import com.example.starter.plan.repo.IdempotencyRepository;
 import com.example.starter.plan.repo.PlanRepository;
 import com.example.starter.plan.web.ApiException;
 import com.example.starter.plan.web.dto.CreatePlanRequest;
+import com.example.starter.plan.web.dto.CrewAssignmentRequest;
 import com.example.starter.plan.web.dto.OccupancyRequest;
 import com.example.starter.plan.web.dto.OccupancyView;
 import com.example.starter.plan.web.dto.PlanResponse;
+import com.example.starter.plan.web.dto.PublishPlanRequest;
 import com.example.starter.plan.web.dto.PublishedSlotView;
 import com.example.starter.plan.web.dto.RescheduleChainItem;
 import com.example.starter.plan.web.dto.RescheduleChainResponse;
@@ -59,13 +64,18 @@ public class PlanService {
     private static final String OP_RESCHEDULE = "RESCHEDULE";
 
     private final PlanRepository planRepo;
+    private final CrewRepository crewRepo;
+    private final CrewService crewService;
     private final IdempotencyRepository idemRepo;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate tx;
 
-    public PlanService(PlanRepository planRepo, IdempotencyRepository idemRepo,
+    public PlanService(PlanRepository planRepo, CrewRepository crewRepo, CrewService crewService,
+                       IdempotencyRepository idemRepo,
                        ObjectMapper objectMapper, PlatformTransactionManager txManager) {
         this.planRepo = planRepo;
+        this.crewRepo = crewRepo;
+        this.crewService = crewService;
         this.idemRepo = idemRepo;
         this.objectMapper = objectMapper;
         this.tx = new TransactionTemplate(txManager);
@@ -135,12 +145,20 @@ public class PlanService {
     }
 
     /**
-     * 发布计划：全局发布锁内原子校验本计划列车重叠与跨计划区段重叠，
-     * 任一冲突则整张计划保持草稿并抛出 422（携带冲突区段与计划）。
+     * 发布计划（无乘务指派），兼容旧调用。
      */
     public PlanResponse publish(String scheduleKey, String requestKey) {
-        String hash = hashAction(OP_PUBLISH, scheduleKey);
-        Optional<PlanResponse> replay = replayIfPresent(OP_PUBLISH, requestKey, hash);
+        return publish(scheduleKey, new PublishPlanRequest(requestKey));
+    }
+
+    /**
+     * 发布计划：全局发布锁内原子校验乘务资质门禁、本计划列车重叠、跨计划区段重叠
+     * 与同车底风险门禁。乘务缺口或时隙冲突抛出 422（携带稳定排序的缺口/冲突明细），
+     * 计划保持草稿；风险门禁与状态/版本问题抛出 409。任一失败整单回滚。
+     */
+    public PlanResponse publish(String scheduleKey, PublishPlanRequest req) {
+        String hash = hashPublish(scheduleKey, req);
+        Optional<PlanResponse> replay = replayIfPresent(OP_PUBLISH, req.requestKey(), hash);
         if (replay.isPresent()) {
             return replay.get();
         }
@@ -154,6 +172,12 @@ public class PlanService {
                             "仅草稿可发布，当前状态: " + plan.status());
                 }
                 List<Occupancy> occupancies = planRepo.findOccupancies(plan.id());
+                List<Map<String, Object>> crewGaps = crewService.findCrewGaps(occupancies,
+                        req.driver(), req.conductor());
+                if (!crewGaps.isEmpty()) {
+                    throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "CREW_QUALIFICATION_GAP",
+                            "乘务资质不满足，计划保持草稿", crewGaps);
+                }
                 List<Map<String, Object>> conflicts = new ArrayList<>();
                 conflicts.addAll(findTrainOverlaps(scheduleKey, occupancies));
                 conflicts.addAll(findSectionConflicts(plan, occupancies, List.of(plan.id())));
@@ -161,14 +185,22 @@ public class PlanService {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "存在时隙冲突，计划保持草稿", conflicts);
                 }
+                // 同车底新增段门禁：其他已发布计划仍处风险状态时，同列车不得发布新段
+                List<String> trainNos = occupancies.stream().map(Occupancy::trainNo)
+                        .distinct().toList();
+                if (crewService.hasRiskyPublishedTrain(trainNos, plan.id())) {
+                    throw conflict("RISK_STATE_CONFLICT",
+                            "同车底存在风险状态的已发布计划，须先替换合格乘务: " + scheduleKey);
+                }
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(plan.id(), PlanStatus.PUBLISHED, now);
+                assignCrew(plan.id(), req.driver(), req.conductor(), now);
                 PlanResponse response = loadPlan(scheduleKey);
-                idemRepo.insert(OP_PUBLISH, requestKey, hash, toJson(response), now);
+                idemRepo.insert(OP_PUBLISH, req.requestKey(), hash, toJson(response), now);
                 return response;
             });
         } catch (DuplicateKeyException e) {
-            return resolveDuplicate(OP_PUBLISH, requestKey, hash);
+            return resolveDuplicate(OP_PUBLISH, req.requestKey(), hash);
         }
     }
 
@@ -201,19 +233,34 @@ public class PlanService {
     }
 
     /**
-     * 原子改签：全局发布锁内校验新草稿（列车内部重叠与跨计划区段冲突，仅排除旧计划占用），
-     * 通过后同一事务取消旧计划、发布新计划并追加不可变前后继关联。
+     * 原子改签：全局发布锁内校验新草稿乘务资质门禁、列车内部重叠与跨计划区段冲突
+     * （仅排除旧计划占用），通过后同一事务取消旧计划、发布新计划、写入乘务指派快照
+     * 并追加不可变前后继关联。旧计划处于风险状态时禁止普通改签，
+     * 仅当请求为两角色均指定了合格替换人员（与风险记录不同的乘务员）才放行。
      * 任一步失败整体回滚：旧计划仍发布、新计划仍草稿，版本、占用与关联均不改变。
      */
     public RescheduleResponse reschedule(String oldScheduleKey, RescheduleRequest req) {
         if (oldScheduleKey.equals(req.newScheduleKey())) {
             throw badRequest("新旧计划必须不同: " + oldScheduleKey);
         }
-        String hash = hashReschedule(oldScheduleKey, req);
+        // 指纹含操作者、两计划版本、两角色与新草稿规范化区段时刻；
+        // 计划缺失时使用占位指纹先完成幂等裁决（同键不同参 409），无记录再抛 404
+        DayPlan oldPlanSnap = planRepo.findByKey(oldScheduleKey).orElse(null);
+        DayPlan newPlanSnap = planRepo.findByKey(req.newScheduleKey()).orElse(null);
+        List<Occupancy> newOccupanciesSnap = newPlanSnap == null
+                ? List.of() : planRepo.findOccupancies(newPlanSnap.id());
+        String hash = hashReschedule(oldScheduleKey, req, oldPlanSnap, newPlanSnap,
+                newOccupanciesSnap);
         Optional<RescheduleResponse> replay =
                 replayIfPresent(OP_RESCHEDULE, req.requestKey(), hash, RescheduleResponse.class);
         if (replay.isPresent()) {
             return replay.get();
+        }
+        if (oldPlanSnap == null) {
+            throw notFound(oldScheduleKey);
+        }
+        if (newPlanSnap == null) {
+            throw notFound(req.newScheduleKey());
         }
         try {
             return tx.execute(status -> {
@@ -250,7 +297,18 @@ public class PlanService {
                 if (planRepo.findLinkBySuccessor(newPlan.id()).isPresent()) {
                     throw conflict("LINK_CONFLICT", "新计划已存在直接前驱: " + req.newScheduleKey());
                 }
+                // 风险持续门禁：旧计划存在生效风险记录时，仅放行两角色均替换为合格人员的改签
+                List<CrewRiskRecord> activeRisks = crewService.findActiveRiskRecords(oldPlan.id());
+                if (!activeRisks.isEmpty()) {
+                    assertRiskRemediation(activeRisks, req);
+                }
                 List<Occupancy> occupancies = planRepo.findOccupancies(newPlan.id());
+                List<Map<String, Object>> crewGaps = crewService.findCrewGaps(occupancies,
+                        req.driver(), req.conductor());
+                if (!crewGaps.isEmpty()) {
+                    throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "CREW_QUALIFICATION_GAP",
+                            "乘务资质不满足，改签未生效", crewGaps);
+                }
                 List<Map<String, Object>> conflicts = new ArrayList<>();
                 conflicts.addAll(findTrainOverlaps(req.newScheduleKey(), occupancies));
                 // 仅排除旧计划与自身占用，第三方已发布计划照常参与冲突裁决
@@ -260,10 +318,18 @@ public class PlanService {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "新草稿存在时隙冲突，改签未生效", conflicts);
                 }
+                // 同车底新增段门禁：排除正在取消的旧计划后，其他风险计划同列车不得发布新段
+                List<String> trainNos = occupancies.stream().map(Occupancy::trainNo)
+                        .distinct().toList();
+                if (crewService.hasRiskyPublishedTrain(trainNos, oldPlan.id())) {
+                    throw conflict("RISK_STATE_CONFLICT",
+                            "同车底存在风险状态的已发布计划，须先替换合格乘务: " + req.newScheduleKey());
+                }
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(oldPlan.id(), PlanStatus.CANCELLED, now);
                 planRepo.updateStatus(newPlan.id(), PlanStatus.PUBLISHED, now);
                 planRepo.insertRescheduleLink(oldPlan.id(), newPlan.id(), now);
+                assignCrew(newPlan.id(), req.driver(), req.conductor(), now);
                 RescheduleResponse response = new RescheduleResponse(
                         loadPlan(oldScheduleKey), loadPlan(req.newScheduleKey()));
                 idemRepo.insert(OP_RESCHEDULE, req.requestKey(), hash, toJson(response), now);
@@ -499,9 +565,60 @@ public class PlanService {
         return sha256(opType + '\n' + scheduleKey);
     }
 
-    private String hashReschedule(String oldScheduleKey, RescheduleRequest req) {
-        return sha256(OP_RESCHEDULE + '\n' + oldScheduleKey + '\n' + req.newScheduleKey()
-                + '\n' + req.expectedOldVersion() + '\n' + req.expectedNewVersion());
+    /**
+     * 发布指纹：操作者、计划版本、两角色（乘务员+资质）与规范化区段时刻。
+     */
+    private String hashPublish(String scheduleKey, PublishPlanRequest req) {
+        StringBuilder sb = new StringBuilder(OP_PUBLISH).append('\n').append(scheduleKey)
+                .append('\n').append(req.operator() == null ? "" : req.operator());
+        DayPlan plan = planRepo.findByKey(scheduleKey).orElse(null);
+        sb.append('\n').append(plan == null ? "" : String.valueOf(plan.version()));
+        appendCrew(sb, req.driver());
+        appendCrew(sb, req.conductor());
+        if (plan != null) {
+            appendNormalizedOccupancies(sb, planRepo.findOccupancies(plan.id()));
+        }
+        return sha256(sb.toString());
+    }
+
+    /**
+     * 改签指纹：操作者、两计划版本、两角色与新草稿规范化区段时刻。
+     */
+    private String hashReschedule(String oldScheduleKey, RescheduleRequest req,
+                                  DayPlan oldPlan, DayPlan newPlan, List<Occupancy> newOccupancies) {
+        StringBuilder sb = new StringBuilder(OP_RESCHEDULE).append('\n').append(oldScheduleKey)
+                .append('\n').append(req.newScheduleKey())
+                .append('\n').append(req.operator() == null ? "" : req.operator())
+                .append('\n').append(req.expectedOldVersion())
+                .append('\n').append(req.expectedNewVersion())
+                .append('\n').append(oldPlan == null ? "MISSING" : String.valueOf(oldPlan.version()))
+                .append('\n').append(newPlan == null ? "MISSING" : String.valueOf(newPlan.version()));
+        appendCrew(sb, req.driver());
+        appendCrew(sb, req.conductor());
+        appendNormalizedOccupancies(sb, newOccupancies);
+        return sha256(sb.toString());
+    }
+
+    private void appendCrew(StringBuilder sb, CrewAssignmentRequest assignment) {
+        if (assignment == null) {
+            sb.append('\n').append('-');
+            return;
+        }
+        sb.append('\n').append(assignment.crewId()).append('|').append(assignment.qualCode());
+    }
+
+    /**
+     * 规范化占用指纹：区段与时刻按 (区段, 开始, 结束, 列车) 排序后拼接，换序视为同参。
+     */
+    private void appendNormalizedOccupancies(StringBuilder sb, List<Occupancy> occupancies) {
+        occupancies.stream()
+                .sorted(Comparator.comparing(Occupancy::sectionId)
+                        .thenComparing(Occupancy::startUtc)
+                        .thenComparing(Occupancy::endUtc)
+                        .thenComparing(Occupancy::trainNo))
+                .forEach(o -> sb.append('\n').append(o.sectionId()).append('|')
+                        .append(o.startUtc().toEpochMilli()).append('|')
+                        .append(o.endUtc().toEpochMilli()).append('|').append(o.trainNo()));
     }
 
     private void appendOccupancies(StringBuilder sb, List<OccupancyRequest> occupancies) {
@@ -553,5 +670,36 @@ public class PlanService {
 
     private ApiException conflict(String code, String message) {
         return new ApiException(HttpStatus.CONFLICT, code, message);
+    }
+
+    /**
+     * 写入计划乘务指派快照（发布/改签成功后）；两角色均缺省时不写。
+     */
+    private void assignCrew(long planId, CrewAssignmentRequest driver,
+                            CrewAssignmentRequest conductor, long nowMillis) {
+        if (driver != null) {
+            crewRepo.upsertPlanCrew(planId, CrewRole.DRIVER, driver.crewId(), driver.qualCode(),
+                    nowMillis);
+        }
+        if (conductor != null) {
+            crewRepo.upsertPlanCrew(planId, CrewRole.CONDUCTOR, conductor.crewId(),
+                    conductor.qualCode(), nowMillis);
+        }
+    }
+
+    /**
+     * 风险持续门禁：旧计划存在生效风险记录时，仅放行两角色均替换为
+     * 合格人员（与风险记录不同的乘务员）的改签，否则 409。
+     */
+    private void assertRiskRemediation(List<CrewRiskRecord> activeRisks, RescheduleRequest req) {
+        for (CrewRiskRecord risk : activeRisks) {
+            CrewAssignmentRequest replacement = risk.role() == CrewRole.DRIVER
+                    ? req.driver() : req.conductor();
+            if (replacement == null || replacement.crewId().equals(risk.crewId())) {
+                throw conflict("RISK_STATE_CONFLICT",
+                        "计划处于乘务风险状态，" + risk.role() + " 角色须替换为合格人员: "
+                                + risk.scheduleKey());
+            }
+        }
     }
 }

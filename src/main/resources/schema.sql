@@ -44,7 +44,7 @@ CREATE INDEX IF NOT EXISTS idx_rail_plan_occupancy_section ON rail_plan_occupanc
 
 CREATE TABLE IF NOT EXISTS idempotency_record (
     id BIGINT NOT NULL AUTO_INCREMENT,
-    op_type VARCHAR(16) NOT NULL,
+    op_type VARCHAR(32) NOT NULL,
     request_key VARCHAR(128) NOT NULL,
     request_hash CHAR(64) NOT NULL,
     response_json CLOB NOT NULL,
@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS idempotency_record (
 );
 COMMENT ON TABLE idempotency_record IS '写操作幂等记录，仅缓存成功结果，失败不缓存可重试';
 COMMENT ON COLUMN idempotency_record.id IS '主键';
-COMMENT ON COLUMN idempotency_record.op_type IS '操作类型：CREATE / UPDATE / PUBLISH / CANCEL / RESCHEDULE';
+COMMENT ON COLUMN idempotency_record.op_type IS '操作类型：CREATE / UPDATE / PUBLISH / CANCEL / RESCHEDULE / QUAL_UPSERT / QUAL_TERMINATE';
 COMMENT ON COLUMN idempotency_record.request_key IS '客户端幂等键，同一操作类型内唯一';
 COMMENT ON COLUMN idempotency_record.request_hash IS '请求参数规范化后的 SHA-256，同键不同参判定 409';
 COMMENT ON COLUMN idempotency_record.response_json IS '首次成功响应快照（JSON），重放原样返回';
@@ -83,3 +83,69 @@ COMMENT ON TABLE publish_lock IS '发布/改签全局互斥锁，保证并发发
 COMMENT ON COLUMN publish_lock.id IS '锁行 id，固定为 1，发布与改签时 SELECT ... FOR UPDATE 串行化';
 
 MERGE INTO publish_lock KEY(id) VALUES (1);
+
+CREATE TABLE IF NOT EXISTS rail_crew_qualification (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    qual_code VARCHAR(64) NOT NULL,
+    crew_id VARCHAR(64) NOT NULL,
+    sections VARCHAR(2048) NOT NULL,
+    expires_utc BIGINT NOT NULL,
+    version INT NOT NULL,
+    terminated TINYINT NOT NULL DEFAULT 0,
+    created_at BIGINT NOT NULL,
+    updated_at BIGINT NOT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT uk_crew_qual_code UNIQUE (qual_code)
+);
+COMMENT ON TABLE rail_crew_qualification IS '乘务资质：资质代码、乘务员、覆盖区段集合与 UTC 到期时刻；提前终止后不可再用于发布/改签';
+COMMENT ON COLUMN rail_crew_qualification.id IS '主键';
+COMMENT ON COLUMN rail_crew_qualification.qual_code IS '资质代码，全局唯一';
+COMMENT ON COLUMN rail_crew_qualification.crew_id IS '乘务员标识（司机或车长）';
+COMMENT ON COLUMN rail_crew_qualification.sections IS '覆盖区段集合，逗号分隔的规范化（排序去重）区段 ID 列表，换序视为同参';
+COMMENT ON COLUMN rail_crew_qualification.expires_utc IS '资质到期时刻，UTC 毫秒；必须严格晚于计划终到时刻方为有效';
+COMMENT ON COLUMN rail_crew_qualification.version IS '资质版本，创建为 1，每次修改加一，修改须携带 expectedVersion';
+COMMENT ON COLUMN rail_crew_qualification.terminated IS '是否已提前终止：0 有效 / 1 已提前终止，终止不可逆';
+COMMENT ON COLUMN rail_crew_qualification.created_at IS '创建时刻，UTC 毫秒';
+COMMENT ON COLUMN rail_crew_qualification.updated_at IS '最近变更时刻，UTC 毫秒';
+
+CREATE TABLE IF NOT EXISTS rail_plan_crew (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    plan_id BIGINT NOT NULL,
+    role VARCHAR(16) NOT NULL,
+    crew_id VARCHAR(64) NOT NULL,
+    qual_code VARCHAR(64) NOT NULL,
+    assigned_at BIGINT NOT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT uk_plan_crew_plan_role UNIQUE (plan_id, role)
+);
+COMMENT ON TABLE rail_plan_crew IS '计划乘务指派快照：发布/改签时按角色记录乘务员与所依据资质，替换人员时更新';
+COMMENT ON COLUMN rail_plan_crew.id IS '主键';
+COMMENT ON COLUMN rail_plan_crew.plan_id IS '所属计划 id，关联 rail_day_plan.id';
+COMMENT ON COLUMN rail_plan_crew.role IS '乘务角色：DRIVER 司机 / CONDUCTOR 车长，同一计划两角色必须为不同人员';
+COMMENT ON COLUMN rail_plan_crew.crew_id IS '乘务员标识';
+COMMENT ON COLUMN rail_plan_crew.qual_code IS '指派所依据的资质代码，关联 rail_crew_qualification.qual_code';
+COMMENT ON COLUMN rail_plan_crew.assigned_at IS '指派时刻，UTC 毫秒';
+CREATE INDEX IF NOT EXISTS idx_plan_crew_crew ON rail_plan_crew (crew_id);
+
+CREATE TABLE IF NOT EXISTS rail_crew_risk_record (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    plan_id BIGINT NOT NULL,
+    schedule_key VARCHAR(64) NOT NULL,
+    role VARCHAR(16) NOT NULL,
+    crew_id VARCHAR(64) NOT NULL,
+    qual_code VARCHAR(64) NOT NULL,
+    reason VARCHAR(32) NOT NULL,
+    recorded_at BIGINT NOT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT uk_risk_plan_role_qual UNIQUE (plan_id, role, qual_code)
+);
+COMMENT ON TABLE rail_crew_risk_record IS '乘务资质风险记录：资质提前终止回查命中已发布计划时写入，追加后不可变，不自动取消计划';
+COMMENT ON COLUMN rail_crew_risk_record.id IS '主键';
+COMMENT ON COLUMN rail_crew_risk_record.plan_id IS '受影响计划 id，关联 rail_day_plan.id';
+COMMENT ON COLUMN rail_crew_risk_record.schedule_key IS '受影响计划业务键，冗余便于查询';
+COMMENT ON COLUMN rail_crew_risk_record.role IS '受影响乘务角色：DRIVER 司机 / CONDUCTOR 车长';
+COMMENT ON COLUMN rail_crew_risk_record.crew_id IS '受影响乘务员标识';
+COMMENT ON COLUMN rail_crew_risk_record.qual_code IS '被提前终止的资质代码';
+COMMENT ON COLUMN rail_crew_risk_record.reason IS '风险原因：QUAL_TERMINATED 资质提前终止';
+COMMENT ON COLUMN rail_crew_risk_record.recorded_at IS '记录时刻，UTC 毫秒';
+CREATE INDEX IF NOT EXISTS idx_risk_plan ON rail_crew_risk_record (plan_id);
