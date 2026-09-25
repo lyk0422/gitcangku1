@@ -1,9 +1,13 @@
 package com.example.starter.exposure.exposure;
 
 import com.example.starter.exposure.domain.Campaign;
+import com.example.starter.exposure.domain.DecayRecord;
 import com.example.starter.exposure.domain.Reservation;
 import com.example.starter.exposure.domain.ReservationStatus;
+import com.example.starter.exposure.domain.VisitorCooldown;
 import com.example.starter.exposure.repo.CampaignRepository;
+import com.example.starter.exposure.repo.CooldownRepository;
+import com.example.starter.exposure.repo.DecayRecordRepository;
 import com.example.starter.exposure.repo.IdempotencyRepository;
 import com.example.starter.exposure.repo.IdempotencyRepository.IdempotencyRecord;
 import com.example.starter.exposure.repo.LedgerRepository;
@@ -11,19 +15,26 @@ import com.example.starter.exposure.repo.ReservationRepository;
 import com.example.starter.exposure.web.ApiException;
 import com.example.starter.exposure.web.ApplyExposureRequest;
 import com.example.starter.exposure.web.CampaignResponse;
+import com.example.starter.exposure.web.CooldownException;
+import com.example.starter.exposure.web.CooldownStatusResponse;
 import com.example.starter.exposure.web.CreateCampaignRequest;
+import com.example.starter.exposure.web.DecayRecordResponse;
 import com.example.starter.exposure.web.QuotaResponse;
 import com.example.starter.exposure.web.ReservationActionRequest;
 import com.example.starter.exposure.web.ReservationResponse;
+import com.example.starter.exposure.web.UpdateCooldownRequest;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.Clock;
 import java.time.LocalDate;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.function.Supplier;
 
@@ -33,6 +44,11 @@ import java.util.function.Supplier;
  * <p>所有写操作以 requestId 为全局幂等键：同键同参重放原成功结果，异参 409；
  * 业务失败随事务回滚，不占幂等键。所有操作与额度查询先结算相关过期预占，
  * 不依赖后台定时器。终态竞争由行锁 + 状态 CAS 保证只允许一个终态。</p>
+ *
+ * <p>冷却期：申请阶段校验该访客对该公告最近一次 CONFIRMED 时刻 + 冷却分钟数是否已过，
+ * 未过返回 429 并携带冷却结束时刻，不创建预占、不占用额度；确认成功同事务写入
+ * 最近确认时刻与当日第 N 次确认的衰减权重（1/N，4 位小数 HALF_UP）。
+ * 行锁顺序统一为 预占单 -&gt; 冷却行 -&gt; 总账 -&gt; 访客账，避免死锁。</p>
  */
 @Service
 public class ExposureServiceImpl implements ExposureService {
@@ -46,6 +62,8 @@ public class ExposureServiceImpl implements ExposureService {
     private final CampaignRepository campaignRepository;
     private final ReservationRepository reservationRepository;
     private final LedgerRepository ledgerRepository;
+    private final CooldownRepository cooldownRepository;
+    private final DecayRecordRepository decayRecordRepository;
     private final IdempotencyRepository idempotencyRepository;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate txTemplate;
@@ -54,6 +72,8 @@ public class ExposureServiceImpl implements ExposureService {
                                CampaignRepository campaignRepository,
                                ReservationRepository reservationRepository,
                                LedgerRepository ledgerRepository,
+                               CooldownRepository cooldownRepository,
+                               DecayRecordRepository decayRecordRepository,
                                IdempotencyRepository idempotencyRepository,
                                ObjectMapper objectMapper,
                                TransactionTemplate txTemplate) {
@@ -61,6 +81,8 @@ public class ExposureServiceImpl implements ExposureService {
         this.campaignRepository = campaignRepository;
         this.reservationRepository = reservationRepository;
         this.ledgerRepository = ledgerRepository;
+        this.cooldownRepository = cooldownRepository;
+        this.decayRecordRepository = decayRecordRepository;
         this.idempotencyRepository = idempotencyRepository;
         this.objectMapper = objectMapper;
         this.txTemplate = txTemplate;
@@ -69,7 +91,7 @@ public class ExposureServiceImpl implements ExposureService {
     @Override
     public CampaignResponse createCampaign(CreateCampaignRequest request) {
         String fingerprint = request.campaignId() + "|" + request.dailyTotalCap() + "|"
-                + request.perVisitorDailyCap();
+                + request.perVisitorDailyCap() + "|" + request.cooldownMinutesOrZero();
         return runIdempotent(request.requestId(), Operation.CREATE_CAMPAIGN, fingerprint,
                 CampaignResponse.class, () -> {
                     if (campaignRepository.findById(request.campaignId()).isPresent()) {
@@ -80,6 +102,8 @@ public class ExposureServiceImpl implements ExposureService {
                             request.campaignId(),
                             request.dailyTotalCap(),
                             request.perVisitorDailyCap(),
+                            request.cooldownMinutesOrZero(),
+                            0L,
                             clock.millis());
                     try {
                         campaignRepository.insert(campaign);
@@ -103,6 +127,9 @@ public class ExposureServiceImpl implements ExposureService {
 
                     // 先结算该公告相关过期预占并释放额度
                     settleExpired(campaign.campaignId(), now);
+
+                    // 冷却期判定：未过冷却期返回 429，不创建预占、不占用当日额度
+                    checkCooldown(campaign, request.visitorId(), now);
 
                     // 固定加锁顺序：公告当日总账 -> 访客当日账，避免死锁
                     ledgerRepository.ensureTotalRow(campaign.campaignId(), utcDate);
@@ -189,6 +216,51 @@ public class ExposureServiceImpl implements ExposureService {
         });
     }
 
+    @Override
+    public CampaignResponse updateCooldown(String campaignId, UpdateCooldownRequest request) {
+        String fingerprint = campaignId + "|" + request.cooldownMinutes() + "|" + request.expectedVersion();
+        return runIdempotent(request.requestId(), Operation.UPDATE_COOLDOWN, fingerprint,
+                CampaignResponse.class, () -> {
+                    Campaign campaign = requireCampaign(campaignId);
+                    if (!campaignRepository.updateCooldown(
+                            campaignId, request.cooldownMinutes(), request.expectedVersion())) {
+                        throw new ApiException(HttpStatus.CONFLICT,
+                                "campaign version conflict: expected " + request.expectedVersion()
+                                        + ", current " + campaign.version());
+                    }
+                    return CampaignResponse.from(campaignRepository.findById(campaignId).orElseThrow());
+                });
+    }
+
+    @Override
+    public CooldownStatusResponse queryCooldownStatus(String campaignId, String visitorId) {
+        return txTemplate.execute(status -> {
+            Campaign campaign = requireCampaign(campaignId);
+            long now = clock.millis();
+            Optional<VisitorCooldown> cooldown =
+                    cooldownRepository.find(campaignId, visitorId);
+            Long lastConfirmedAtUtc = cooldown.map(VisitorCooldown::lastConfirmedAtUtc).orElse(null);
+            Long cooldownUntilUtc = cooldownUntil(campaign.cooldownMinutes(), lastConfirmedAtUtc);
+            boolean inCooldown = cooldownUntilUtc != null && now < cooldownUntilUtc;
+            return new CooldownStatusResponse(
+                    campaignId, visitorId, campaign.cooldownMinutes(),
+                    lastConfirmedAtUtc, cooldownUntilUtc, inCooldown, now);
+        });
+    }
+
+    @Override
+    public List<DecayRecordResponse> queryDecayRecords(String campaignId, String visitorId,
+                                                       LocalDate requestedDate) {
+        return txTemplate.execute(status -> {
+            requireCampaign(campaignId);
+            LocalDate utcDate = requestedDate != null ? requestedDate : LocalDate.now(clock);
+            return decayRecordRepository.listForDay(campaignId, visitorId, utcDate)
+                    .stream()
+                    .map(DecayRecordResponse::from)
+                    .toList();
+        });
+    }
+
     // ---- 内部辅助（作用域末尾） ----
 
     /** 幂等操作类型，同时标识存储响应的反序列化类型。 */
@@ -196,7 +268,8 @@ public class ExposureServiceImpl implements ExposureService {
         CREATE_CAMPAIGN,
         APPLY,
         CONFIRM,
-        CANCEL
+        CANCEL,
+        UPDATE_COOLDOWN
     }
 
     /**
@@ -245,7 +318,42 @@ public class ExposureServiceImpl implements ExposureService {
     }
 
     /**
+     * 冷却期判定：仅在公告配置了冷却分钟数（&gt; 0）且该访客存在最近确认时刻时生效；
+     * 当前时刻早于冷却结束时刻则抛 429 并携带冷却结束时刻。行锁读取使并发确认
+     * 与本申请按提交顺序裁决。
+     */
+    private void checkCooldown(Campaign campaign, String visitorId, long now) {
+        if (campaign.cooldownMinutes() <= 0) {
+            return;
+        }
+        Optional<VisitorCooldown> cooldown =
+                cooldownRepository.lockForUpdate(campaign.campaignId(), visitorId);
+        if (cooldown.isEmpty()) {
+            return;
+        }
+        long cooldownUntil = cooldown.get().lastConfirmedAtUtc()
+                + campaign.cooldownMinutes() * 60_000L;
+        if (now < cooldownUntil) {
+            throw new CooldownException(
+                    "exposure cooldown active until " + cooldownUntil
+                            + " for campaign " + campaign.campaignId(),
+                    cooldownUntil);
+        }
+    }
+
+    /**
+     * 计算冷却结束时刻；无冷却限制或从未确认时返回 null。
+     */
+    private Long cooldownUntil(int cooldownMinutes, Long lastConfirmedAtUtc) {
+        if (cooldownMinutes <= 0 || lastConfirmedAtUtc == null) {
+            return null;
+        }
+        return lastConfirmedAtUtc + cooldownMinutes * 60_000L;
+    }
+
+    /**
      * 确认/取消状态机。调用前已持幂等键；行锁 + CAS 保证并发只有一个终态。
+     * 确认成功同事务更新最近确认时刻并写入当日衰减权重记录。
      *
      * @param isConfirm true=确认，false=取消
      */
@@ -266,6 +374,7 @@ public class ExposureServiceImpl implements ExposureService {
                         reservationId, ReservationStatus.RESERVED, ReservationStatus.CONFIRMED, now)) {
                     throw new ApiException(HttpStatus.CONFLICT, "reservation state changed concurrently");
                 }
+                recordConfirmation(current, now);
             } else {
                 if (!reservationRepository.compareAndSetStatus(
                         reservationId, ReservationStatus.RESERVED, ReservationStatus.CANCELLED, now)) {
@@ -287,7 +396,7 @@ public class ExposureServiceImpl implements ExposureService {
                         "reservation is " + current.status() + ", cannot "
                                 + (isConfirm ? "confirm" : "cancel"));
             }
-            // 重复同类终态操作：返回原状态，不重复释放额度
+            // 重复同类终态操作：返回原状态，不重复释放额度、不重复记录冷却与衰减
         } else {
             throw new ApiException(HttpStatus.INTERNAL_SERVER_ERROR,
                     "unexpected reservation status: " + current.status());
@@ -295,6 +404,29 @@ public class ExposureServiceImpl implements ExposureService {
 
         Reservation result = reservationRepository.lockById(reservationId).orElseThrow();
         return ReservationResponse.from(result);
+    }
+
+    /**
+     * 确认成功后的同事务副作用：更新该访客对该公告的最近确认时刻（供后续申请冷却判定），
+     * 并按确认发生的 UTC 自然日写入第 N 次确认的衰减权重（1/N，4 位小数 HALF_UP）。
+     * 先 upsert 冷却行取得行锁，再统计当日记录数，保证并发确认序号唯一。
+     */
+    private void recordConfirmation(Reservation reservation, long now) {
+        cooldownRepository.upsertLastConfirmed(
+                reservation.campaignId(), reservation.visitorId(), now);
+        LocalDate confirmDate = LocalDate.now(clock);
+        int seqNo = decayRecordRepository.countForDay(
+                reservation.campaignId(), reservation.visitorId(), confirmDate) + 1;
+        BigDecimal weight = BigDecimal.ONE.divide(BigDecimal.valueOf(seqNo), 4, RoundingMode.HALF_UP);
+        decayRecordRepository.insert(new DecayRecord(
+                null,
+                reservation.campaignId(),
+                reservation.visitorId(),
+                java.sql.Date.valueOf(confirmDate),
+                seqNo,
+                weight,
+                reservation.reservationId(),
+                now));
     }
 
     /**
@@ -333,12 +465,6 @@ public class ExposureServiceImpl implements ExposureService {
         return campaignRepository.findById(campaignId)
                 .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
                         "campaign not found: " + campaignId));
-    }
-
-    private Reservation requireReservation(String reservationId) {
-        return reservationRepository.findById(reservationId)
-                .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
-                        "reservation not found: " + reservationId));
     }
 
     private String writeJson(Object value) {

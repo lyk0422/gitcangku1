@@ -16,6 +16,14 @@ import org.springframework.web.method.annotation.MethodArgumentTypeMismatchExcep
 @RestControllerAdvice
 public class GlobalExceptionHandler {
 
+    @ExceptionHandler(CooldownException.class)
+    public ResponseEntity<CooldownErrorResponse> handleCooldown(CooldownException ex) {
+        HttpStatus status = ex.getStatus();
+        return ResponseEntity.status(status)
+                .body(new CooldownErrorResponse(status.value(), status.getReasonPhrase(),
+                        ex.getMessage(), ex.getCooldownUntilUtc()));
+    }
+
     @ExceptionHandler(ApiException.class)
     public ResponseEntity<ErrorResponse> handleApi(ApiException ex) {
         return build(ex.getStatus(), ex.getMessage(), null);

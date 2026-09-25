@@ -23,6 +23,7 @@ import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -84,6 +85,8 @@ class ExposureConcurrencyTest {
     @BeforeEach
     void clean() {
         jdbc.update("DELETE FROM idempotency_record");
+        jdbc.update("DELETE FROM exposure_decay_record");
+        jdbc.update("DELETE FROM visitor_campaign_cooldown");
         jdbc.update("DELETE FROM exposure_reservation");
         jdbc.update("DELETE FROM quota_visitor_ledger");
         jdbc.update("DELETE FROM quota_total_ledger");
@@ -239,5 +242,102 @@ class ExposureConcurrencyTest {
         assertEquals(0, errors.get(), "并发同键重放不应报错");
         assertEquals(1, reservationIds.size(), "业务只执行一次");
         assertEquals(1, service.queryQuota("cap", "visitor-x", DAY).usedVisitor());
+    }
+
+    @Test
+    @DisplayName("并发确认同一访客的多个预占：衰减序号恰好为 1..N 且唯一，最近确认时刻已写入")
+    void concurrentConfirms_decaySeqUniqueAndComplete() throws Exception {
+        int threads = 16;
+        service.createCampaign(new CreateCampaignRequest("req-c", "cap", 100, 100, 0));
+
+        // 固定时钟下顺序申请 N 个预占（均同一访客同一日）
+        String[] reservationIds = new String[threads];
+        for (int i = 0; i < threads; i++) {
+            reservationIds[i] = service.apply(
+                    new ApplyExposureRequest("req-a-" + i, "cap", "v1")).reservationId();
+        }
+
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicInteger confirmed = new AtomicInteger();
+        AtomicInteger errors = new AtomicInteger();
+        for (int i = 0; i < threads; i++) {
+            final int idx = i;
+            pool.submit(() -> {
+                try {
+                    start.await();
+                    ReservationResponse r = service.confirm(reservationIds[idx],
+                            new ReservationActionRequest("req-cf-" + idx));
+                    if (r.status().name().equals("CONFIRMED")) {
+                        confirmed.incrementAndGet();
+                    }
+                } catch (Exception e) {
+                    errors.incrementAndGet();
+                }
+            });
+        }
+        start.countDown();
+        pool.shutdown();
+        assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS), "并发任务应在超时前完成");
+
+        assertEquals(0, errors.get(), "并发确认不应报错");
+        assertEquals(threads, confirmed.get(), "全部预占应确认成功");
+
+        List<Integer> seqNos = jdbc.queryForList(
+                "SELECT seq_no FROM exposure_decay_record "
+                        + "WHERE campaign_id = 'cap' AND visitor_id = 'v1' AND utc_date = ? ORDER BY seq_no",
+                Integer.class, java.sql.Date.valueOf(DAY));
+        assertEquals(threads, seqNos.size(), "每次确认应恰好写入一条衰减记录");
+        for (int i = 0; i < threads; i++) {
+            assertEquals(i + 1, seqNos.get(i), "衰减序号必须恰好为 1..N 无重复无缺口");
+        }
+
+        Long lastConfirmed = jdbc.queryForObject(
+                "SELECT last_confirmed_at_utc FROM visitor_campaign_cooldown "
+                        + "WHERE campaign_id = 'cap' AND visitor_id = 'v1'",
+                Long.class);
+        assertEquals(BASE.toEpochMilli(), lastConfirmed, "最近确认时刻应已写入");
+    }
+
+    @Test
+    @DisplayName("冷却期内并发申请：全部被 429 拦截，不产生预占与额度占用")
+    void concurrentApplyDuringCooldown_allRejected() throws Exception {
+        service.createCampaign(new CreateCampaignRequest("req-c", "cap", 100, 100, 60));
+        ReservationResponse first = service.apply(new ApplyExposureRequest("req-a0", "cap", "v1"));
+        service.confirm(first.reservationId(), new ReservationActionRequest("req-c0"));
+
+        int threads = 16;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicInteger rejected = new AtomicInteger();
+        AtomicInteger succeeded = new AtomicInteger();
+        AtomicInteger errors = new AtomicInteger();
+        for (int i = 0; i < threads; i++) {
+            final int idx = i;
+            pool.submit(() -> {
+                try {
+                    start.await();
+                    service.apply(new ApplyExposureRequest("req-a-" + idx, "cap", "v1"));
+                    succeeded.incrementAndGet();
+                } catch (ApiException ex) {
+                    if (ex.getStatus().value() == 429) {
+                        rejected.incrementAndGet();
+                    } else {
+                        errors.incrementAndGet();
+                    }
+                } catch (Exception e) {
+                    errors.incrementAndGet();
+                }
+            });
+        }
+        start.countDown();
+        pool.shutdown();
+        assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS), "并发任务应在超时前完成");
+
+        assertEquals(0, errors.get(), "不应出现非 429 异常");
+        assertEquals(0, succeeded.get(), "冷却期内不应有任何申请成功");
+        assertEquals(threads, rejected.get(), "冷却期内并发申请应全部 429");
+        assertEquals(1, service.queryQuota("cap", "v1", DAY).usedVisitor(),
+                "冷却拦截不得占用额度");
     }
 }

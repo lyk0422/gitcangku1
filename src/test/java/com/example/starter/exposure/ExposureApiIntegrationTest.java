@@ -107,6 +107,8 @@ class ExposureApiIntegrationTest {
     @BeforeEach
     void cleanAndReset() {
         jdbc.update("DELETE FROM idempotency_record");
+        jdbc.update("DELETE FROM exposure_decay_record");
+        jdbc.update("DELETE FROM visitor_campaign_cooldown");
         jdbc.update("DELETE FROM exposure_reservation");
         jdbc.update("DELETE FROM quota_visitor_ledger");
         jdbc.update("DELETE FROM quota_total_ledger");
