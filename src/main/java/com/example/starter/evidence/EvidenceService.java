@@ -46,6 +46,7 @@ public class EvidenceService {
     private final SealInspectionRepository inspectionRepository;
     private final LoanRecordRepository loanRepository;
     private final CommandLogRepository commandLogRepository;
+    private final RetentionHoldRepository holdRepository;
     private final ObjectMapper objectMapper;
     private final EvidenceClock clock;
 
@@ -54,6 +55,7 @@ public class EvidenceService {
                            SealInspectionRepository inspectionRepository,
                            LoanRecordRepository loanRepository,
                            CommandLogRepository commandLogRepository,
+                           RetentionHoldRepository holdRepository,
                            ObjectMapper objectMapper,
                            EvidenceClock clock) {
         this.evidenceRepository = evidenceRepository;
@@ -61,6 +63,7 @@ public class EvidenceService {
         this.inspectionRepository = inspectionRepository;
         this.loanRepository = loanRepository;
         this.commandLogRepository = commandLogRepository;
+        this.holdRepository = holdRepository;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -253,6 +256,9 @@ public class EvidenceService {
         }
         if (request.dueAt().isAfter(nowUtc.plusHours(MAX_LOAN_HOURS))) {
             throw ApiException.badRequest("借出期限不得超过 " + MAX_LOAN_HOURS + " 小时");
+        }
+        if (!holdRepository.findEffectiveAt(evidenceKey, nowUtc).isEmpty()) {
+            throw ApiException.unprocessable("证物处于有效保全冻结，禁止借出: " + evidenceKey);
         }
         if (loanRepository.findByLoanKey(request.loanKey()).isPresent()) {
             throw ApiException.conflict("借出键已存在: " + request.loanKey());

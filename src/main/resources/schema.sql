@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS evidence (
     category VARCHAR(64) NOT NULL COMMENT '证物类别，入库后不可修改',
     seal_no VARCHAR(64) NOT NULL COMMENT '封条编号，入库后不可修改',
     custodian_id VARCHAR(64) NOT NULL COMMENT '当前保管人（操作人标识），交接接受后原子切换；借出期间不变',
-    status VARCHAR(20) NOT NULL COMMENT '证物状态：SEALED 已封存 / TRANSFER_PENDING 待接收 / BORROWED 借出未归还 / SEAL_BROKEN 封条异常（终态）',
+    status VARCHAR(20) NOT NULL COMMENT '证物状态：SEALED 已封存 / TRANSFER_PENDING 待接收 / BORROWED 借出未归还 / SEAL_BROKEN 封条异常（终态）/ DESTROYED 已销毁（终态）',
     created_at DATETIME(6) NOT NULL COMMENT '入库时间，Asia/Shanghai',
     updated_at DATETIME(6) NOT NULL COMMENT '最近一次状态或保管人变更时间，Asia/Shanghai',
     CONSTRAINT uk_evidence_key UNIQUE (evidence_key)
@@ -60,12 +60,80 @@ CREATE TABLE IF NOT EXISTS loan_record (
     KEY idx_loan_borrower_status (borrower_id, status)
 );
 
+-- 保全冻结：hold_id 为业务键，全局唯一；hold_key 为案件号/规范化证物/区间/原因/版本的指纹。
+-- 区间为 UTC 左闭右开 [effective_at, expire_at)；status=ACTIVE 且未过期方为有效冻结。
+-- 解除仅允许条件更新（版本匹配），版本递增；历史行保留，解除/过期不删除。
+CREATE TABLE IF NOT EXISTS retention_hold (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    hold_id VARCHAR(64) NOT NULL COMMENT '冻结业务键，全局唯一',
+    hold_key VARCHAR(64) NOT NULL COMMENT '冻结指纹：案件号+规范化证物集合+UTC区间+原因+版本的 SHA-256',
+    case_key VARCHAR(64) NOT NULL COMMENT '冻结关联案件号',
+    effective_at DATETIME(6) NOT NULL COMMENT 'UTC 生效时刻（含），不得早于创建时刻，禁止补建覆盖过去的冻结',
+    expire_at DATETIME(6) NOT NULL COMMENT 'UTC 失效时刻（不含），必须晚于生效时刻',
+    reason VARCHAR(512) NOT NULL COMMENT '冻结原因，非空，随快照不可变',
+    version INT NOT NULL COMMENT '冻结版本：创建为 1，每次解除递增；批量解除须携带期望版本',
+    status VARCHAR(20) NOT NULL COMMENT '冻结状态：ACTIVE 未解除（含未开始/已过期，到期按时刻计算）/ RELEASED 已解除（不可再变）',
+    created_by VARCHAR(64) NOT NULL COMMENT '创建请求方，仅其本人可解除',
+    created_at DATETIME(6) NOT NULL COMMENT '创建时间，UTC',
+    released_by VARCHAR(64) NULL COMMENT '解除操作人；NULL 表示未解除',
+    released_at DATETIME(6) NULL COMMENT '解除时刻（UTC）；NULL 表示未解除',
+    CONSTRAINT uk_hold_id UNIQUE (hold_id),
+    KEY idx_hold_status_time (status, effective_at, expire_at)
+);
+
+-- 冻结证物清单：集合在库内规范化排序；同一冻结内证物唯一。
+CREATE TABLE IF NOT EXISTS retention_hold_item (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    hold_pk BIGINT NOT NULL COMMENT '关联 retention_hold.id',
+    evidence_key VARCHAR(64) NOT NULL COMMENT '集合内证物业务键，按字典序规范化',
+    item_order INT NOT NULL COMMENT '规范化排序序号，从 0 开始',
+    CONSTRAINT uk_hold_item UNIQUE (hold_pk, evidence_key),
+    KEY idx_hold_item_evidence (evidence_key)
+);
+
+-- 销毁申请：只追加；PENDING 待审 / HOLD_BLOCKED 被有效冻结阻断（终态，须重新提交）/ DESTROYED 已完成销毁。
+CREATE TABLE IF NOT EXISTS destruction_request (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    request_key VARCHAR(64) NOT NULL COMMENT '销毁申请业务键，全局唯一',
+    status VARCHAR(20) NOT NULL COMMENT '申请状态：PENDING 待审 / HOLD_BLOCKED 冻结阻断（不可恢复，须重新提交）/ DESTROYED 已销毁',
+    requested_by VARCHAR(64) NOT NULL COMMENT '提交请求方，仅其本人可完成销毁',
+    blocked_reason TEXT NULL COMMENT '阻断不可变原因快照（JSON）；NULL 表示未被阻断，写入后不可修改',
+    created_at DATETIME(6) NOT NULL COMMENT '提交时间，UTC',
+    blocked_at DATETIME(6) NULL COMMENT '阻断时刻（UTC）；NULL 表示未阻断',
+    completed_at DATETIME(6) NULL COMMENT '完成销毁时刻（UTC）；NULL 表示未完成',
+    CONSTRAINT uk_destruction_request_key UNIQUE (request_key)
+);
+
+-- 销毁申请证物清单：提交时的集合快照，规范化排序，之后不随证物状态改写。
+CREATE TABLE IF NOT EXISTS destruction_request_item (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    request_pk BIGINT NOT NULL COMMENT '关联 destruction_request.id',
+    evidence_key VARCHAR(64) NOT NULL COMMENT '提交时的证物业务键快照',
+    item_order INT NOT NULL COMMENT '规范化排序序号，从 0 开始',
+    KEY idx_dreq_item_request (request_pk),
+    KEY idx_dreq_item_evidence (evidence_key, request_pk)
+);
+
+-- 销毁阻断冻结快照：申请转 HOLD_BLOCKED 瞬间命中的冻结不可变快照，之后冻结解除/过期不改写。
+CREATE TABLE IF NOT EXISTS destruction_block_snapshot (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    request_pk BIGINT NOT NULL COMMENT '关联 destruction_request.id',
+    hold_id VARCHAR(64) NOT NULL COMMENT '命中冻结业务键',
+    hold_version INT NOT NULL COMMENT '阻断瞬间的冻结版本快照',
+    case_key VARCHAR(64) NOT NULL COMMENT '阻断瞬间冻结案件号快照',
+    effective_at DATETIME(6) NOT NULL COMMENT '阻断瞬间冻结 UTC 生效时刻快照',
+    expire_at DATETIME(6) NOT NULL COMMENT '阻断瞬间冻结 UTC 失效时刻快照',
+    reason VARCHAR(512) NOT NULL COMMENT '阻断瞬间冻结原因快照',
+    snapshot_order INT NOT NULL COMMENT 'holdId 稳定排序序号，从 0 开始',
+    KEY idx_block_snapshot_request (request_pk)
+);
+
 -- 幂等命令日志：command_key 全局唯一；同键同参重放返回首次结果，同键改参返回 409。
 CREATE TABLE IF NOT EXISTS command_log (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     command_key VARCHAR(64) NOT NULL COMMENT '幂等命令键，全局唯一',
     actor_id VARCHAR(64) NOT NULL COMMENT '发起操作人',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN',
+    operation VARCHAR(40) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_*/SEAL_INSPECTION/LOAN_*/HOLD_CREATE/HOLD_RELEASE/HOLD_BATCH_RELEASE/DESTRUCTION_SUBMIT/DESTRUCTION_COMPLETE',
     request_hash VARCHAR(64) NOT NULL COMMENT '请求参数规范化后的 SHA-256，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行的 HTTP 状态码',
     response_body TEXT NOT NULL COMMENT '首次执行的响应体 JSON，重放时原样返回',
