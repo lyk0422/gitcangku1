@@ -19,7 +19,12 @@ import org.springframework.web.bind.annotation.RestController;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.Comparator;
 import java.util.HexFormat;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 
 /**
  * 多语种段落修订与发布快照 REST API。
@@ -101,11 +106,61 @@ public class TranslationController {
                 () -> WriteResult.of(201, translationService.publish(documentId, request))).toResponseEntity();
     }
 
+    /**
+     * 批量审核：batchKey 全局唯一并承担幂等键；条目集合换序视为同参，同键异参 409，失败不占键。
+     * 整批在一个事务内校验并原子批准，任一条不通过则 422 且不批准任何一条。
+     */
+    @PostMapping("/{documentId}/batch-approvals")
+    public ResponseEntity<String> approveTranslationsBatch(@PathVariable long documentId,
+                                                           @RequestHeader("X-Actor-Id") String actorId,
+                                                           @Valid @RequestBody ApiDtos.BatchApprovalRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/batch-approvals";
+        return writeExecutor.execute(request.batchKey(), hash(operation, actorId, canonicalBatch(request)),
+                () -> WriteResult.of(200,
+                        translationService.approveTranslationsBatch(documentId, actorId, request)))
+                .toResponseEntity();
+    }
+
+    /** 查询不可变批量审核记录及按批次的译文批准明细，只读稳定排序。 */
+    @GetMapping("/{documentId}/batch-approvals/{batchKey}")
+    public ResponseEntity<String> getBatchApproval(@PathVariable long documentId,
+                                                   @PathVariable String batchKey) {
+        return ResponseEntity.ok().contentType(MediaType.APPLICATION_JSON)
+                .body(writeResultBody(translationService.getBatchApproval(documentId, batchKey)));
+    }
+
     /** 查询指定发布版本的只读快照。 */
     @GetMapping("/{documentId}/releases/{publishedVersion}")
     public ResponseEntity<String> getRelease(@PathVariable long documentId, @PathVariable int publishedVersion) {
         return ResponseEntity.ok().contentType(MediaType.APPLICATION_JSON)
                 .body(translationService.getRelease(documentId, publishedVersion));
+    }
+
+    /**
+     * 规范化批量审核请求参数：条目按译文标识与版本排序，使条目集合换序与同参重放得到相同摘要。
+     * 语言码归一为小写，与服务端归一化规则一致。
+     */
+    private Map<String, Object> canonicalBatch(ApiDtos.BatchApprovalRequest request) {
+        List<Map<String, Object>> items = request.items().stream()
+                .map(item -> {
+                    Map<String, Object> canonicalItem = new LinkedHashMap<>();
+                    canonicalItem.put("segmentId", item.segmentId());
+                    canonicalItem.put("language", item.language().trim().toLowerCase(Locale.ROOT));
+                    canonicalItem.put("expectedTranslationVersion", item.expectedTranslationVersion());
+                    return canonicalItem;
+                })
+                .sorted(Comparator.comparing((Map<String, Object> m) -> (String) m.get("segmentId"))
+                        .thenComparing(m -> (String) m.get("language"))
+                        .thenComparingInt(m -> (Integer) m.get("expectedTranslationVersion")))
+                .toList();
+        Map<String, Object> canonical = new LinkedHashMap<>();
+        canonical.put("expectedDraftVersion", request.expectedDraftVersion());
+        canonical.put("items", items);
+        return canonical;
+    }
+
+    private String writeResultBody(Object body) {
+        return WriteResult.of(200, body).body();
     }
 
     /** 计算请求摘要：操作（含路径变量）+ 操作者 + 规范化请求体的 SHA-256。 */

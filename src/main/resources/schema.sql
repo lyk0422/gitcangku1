@@ -94,3 +94,39 @@ COMMENT ON COLUMN request_log.request_hash IS '请求参数规范化后的 SHA-2
 COMMENT ON COLUMN request_log.response_status IS '原成功响应的 HTTP 状态码，用于重放';
 COMMENT ON COLUMN request_log.response_body IS '原成功响应体 JSON，用于重放';
 COMMENT ON COLUMN request_log.created_at IS '记录时间，数据库默认时区';
+
+CREATE TABLE IF NOT EXISTS batch_approval (
+    batch_key VARCHAR(128) PRIMARY KEY,
+    document_id BIGINT NOT NULL,
+    expected_draft_version INT NOT NULL,
+    reviewer VARCHAR(128) NOT NULL,
+    approved_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+COMMENT ON TABLE batch_approval IS '批量审核记录：batchKey 全局唯一且不可变，固化草稿版本、审核人与时刻，不改变文档 draftVersion';
+COMMENT ON COLUMN batch_approval.batch_key IS '全局唯一批次键，同时承担批量审核请求的幂等键';
+COMMENT ON COLUMN batch_approval.document_id IS '所属文档 ID';
+COMMENT ON COLUMN batch_approval.expected_draft_version IS '提交批次时客户端所见文档草稿版本，仅固化记录，不作为整批前置条件';
+COMMENT ON COLUMN batch_approval.reviewer IS '审核人，取批量审核时 X-Actor-Id，不得是批内任一条译文作者';
+COMMENT ON COLUMN batch_approval.approved_at IS '批量审核时刻，数据库默认时区；全部译文在同一事务原子批准';
+COMMENT ON COLUMN batch_approval.created_at IS '记录创建时间，数据库默认时区';
+
+CREATE TABLE IF NOT EXISTS batch_approval_item (
+    batch_key VARCHAR(128) NOT NULL,
+    line_no INT NOT NULL,
+    document_id BIGINT NOT NULL,
+    segment_id VARCHAR(64) NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    translation_version INT NOT NULL,
+    source_version INT NOT NULL,
+    PRIMARY KEY (batch_key, line_no),
+    UNIQUE (batch_key, segment_id, language)
+);
+COMMENT ON TABLE batch_approval_item IS '批量审核明细：不可变，固化批内每条译文审核时刻的段落、语言与译文版本，按 line_no 稳定排序';
+COMMENT ON COLUMN batch_approval_item.batch_key IS '所属批量审核批次键';
+COMMENT ON COLUMN batch_approval_item.line_no IS '批内行号，从 1 开始，按请求顺序固化用于稳定排序与逐条原因定位';
+COMMENT ON COLUMN batch_approval_item.document_id IS '所属文档 ID';
+COMMENT ON COLUMN batch_approval_item.segment_id IS '所属段落 ID';
+COMMENT ON COLUMN batch_approval_item.language IS '目标语言码，小写';
+COMMENT ON COLUMN batch_approval_item.translation_version IS '批准时的译文版本；批内任一条版本并发改变则整批 422 回滚';
+COMMENT ON COLUMN batch_approval_item.source_version IS '批准时译文所依据的源文版本';

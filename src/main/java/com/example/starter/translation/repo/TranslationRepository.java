@@ -1,6 +1,8 @@
 package com.example.starter.translation.repo;
 
 import com.example.starter.translation.domain.Rows.ApprovalRow;
+import com.example.starter.translation.domain.Rows.BatchApprovalItemRow;
+import com.example.starter.translation.domain.Rows.BatchApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
 import com.example.starter.translation.domain.Rows.RequestLogRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
@@ -39,6 +41,15 @@ public class TranslationRepository {
     private static final RowMapper<ApprovalRow> APPROVAL_MAPPER = (rs, n) -> new ApprovalRow(
             rs.getString("segment_id"), rs.getString("language"), rs.getString("reviewer"),
             rs.getInt("source_version"), rs.getInt("translation_version"));
+
+    private static final RowMapper<BatchApprovalRow> BATCH_APPROVAL_MAPPER = (rs, n) -> new BatchApprovalRow(
+            rs.getString("batch_key"), rs.getLong("document_id"), rs.getInt("expected_draft_version"),
+            rs.getString("reviewer"), rs.getString("approved_at"));
+
+    private static final RowMapper<BatchApprovalItemRow> BATCH_APPROVAL_ITEM_MAPPER = (rs, n) ->
+            new BatchApprovalItemRow(rs.getString("batch_key"), rs.getInt("line_no"),
+                    rs.getLong("document_id"), rs.getString("segment_id"), rs.getString("language"),
+                    rs.getInt("translation_version"), rs.getInt("source_version"));
 
     private final JdbcTemplate jdbc;
 
@@ -200,5 +211,36 @@ public class TranslationRepository {
     public void insertRequestLog(String requestId, String requestHash, int responseStatus, String responseBody) {
         jdbc.update("INSERT INTO request_log (request_id, request_hash, response_status, response_body) "
                 + "VALUES (?, ?, ?, ?)", requestId, requestHash, responseStatus, responseBody);
+    }
+
+    /** 插入不可变批量审核记录；审核时刻取数据库默认值，插入后回查得到。 */
+    public void insertBatchApproval(BatchApprovalRow row) {
+        jdbc.update("INSERT INTO batch_approval (batch_key, document_id, expected_draft_version, reviewer) "
+                + "VALUES (?, ?, ?, ?)",
+                row.batchKey(), row.documentId(), row.expectedDraftVersion(), row.reviewer());
+    }
+
+    public Optional<BatchApprovalRow> findBatchApproval(String batchKey) {
+        List<BatchApprovalRow> rows = jdbc.query(
+                "SELECT batch_key, document_id, expected_draft_version, reviewer, approved_at "
+                        + "FROM batch_approval WHERE batch_key = ?",
+                BATCH_APPROVAL_MAPPER, batchKey);
+        return rows.stream().findFirst();
+    }
+
+    /** 插入批量审核明细行；批内位置固定，记录不可变。 */
+    public void insertBatchApprovalItem(BatchApprovalItemRow row) {
+        jdbc.update("INSERT INTO batch_approval_item (batch_key, line_no, document_id, segment_id, language, "
+                        + "translation_version, source_version) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                row.batchKey(), row.lineNo(), row.documentId(), row.segmentId(), row.language(),
+                row.translationVersion(), row.sourceVersion());
+    }
+
+    /** 按批次查询明细，按 line_no 稳定排序，只读。 */
+    public List<BatchApprovalItemRow> listBatchApprovalItems(String batchKey) {
+        return jdbc.query(
+                "SELECT batch_key, line_no, document_id, segment_id, language, translation_version, "
+                        + "source_version FROM batch_approval_item WHERE batch_key = ? ORDER BY line_no",
+                BATCH_APPROVAL_ITEM_MAPPER, batchKey);
     }
 }

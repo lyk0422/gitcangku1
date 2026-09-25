@@ -57,6 +57,25 @@ public final class ApiDtos {
             @Positive(message = "translationVersion 必须为正数") int translationVersion) {
     }
 
+    /** 批量审核单条译文标识：段落 + 语言 + 客户端所见期望译文版本。 */
+    public record BatchApprovalItemInput(
+            @NotBlank(message = "segmentId 不能为空") @Size(max = 64) String segmentId,
+            @NotBlank(message = "language 不能为空") @Size(max = 16) String language,
+            @Positive(message = "expectedTranslationVersion 必须为正数") int expectedTranslationVersion) {
+    }
+
+    /**
+     * 批量审核请求：batchKey 全局唯一并承担幂等键；expectedDraftVersion 仅固化进批量记录，不做整批前置校验；
+     * 条目须为 1~50 条，同一批次内译文标识（段落+语言）不得重复。
+     */
+    public record BatchApprovalRequest(
+            @NotBlank(message = "batchKey 不能为空") @Size(max = 128) String batchKey,
+            @Positive(message = "expectedDraftVersion 必须为正数") int expectedDraftVersion,
+            @NotNull(message = "items 不能为空")
+            @Size(min = 1, max = 50, message = "批量审核条目须为 1~50 条")
+            List<@Valid BatchApprovalItemInput> items) {
+    }
+
     /** 发布请求：携带期望的草稿与发布版本做乐观校验。 */
     public record PublishRequest(
             @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
@@ -87,7 +106,33 @@ public final class ApiDtos {
     public record PublishResponse(long documentId, int publishedVersion) {
     }
 
+    /** 批量审核单条结果明细。 */
+    public record BatchApprovalItemResponse(String segmentId, String language, String reviewer,
+                                           int translationVersion, int sourceVersion) {
+    }
+
+    /** 批量审核成功响应：原子批准全部条目并生成不可变批量记录。 */
+    public record BatchApprovalResponse(String batchKey, long documentId, int expectedDraftVersion,
+                                        String reviewer, String approvedAt,
+                                        List<BatchApprovalItemResponse> items) {
+    }
+
+    /** 批量审核记录查询响应：记录本身不可变，明细稳定排序。 */
+    public record BatchApprovalRecordResponse(String batchKey, long documentId, int expectedDraftVersion,
+                                              String reviewer, String approvedAt,
+                                              List<BatchApprovalItemResponse> items) {
+    }
+
     /** 统一错误响应。 */
     public record ErrorResponse(String error, String message) {
+    }
+
+    /** 批量审核 422 逐条原因：index 为条目在请求中的 1-based 位置。 */
+    public record BatchApprovalItemError(int index, String segmentId, String language, String reason) {
+    }
+
+    /** 批量审核失败响应：整批被拒，不批准任何一条，原因逐条返回。 */
+    public record BatchApprovalFailureResponse(String error, String message,
+                                               List<BatchApprovalItemError> items) {
     }
 }

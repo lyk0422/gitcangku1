@@ -139,4 +139,114 @@ class ConcurrencyTest extends AbstractIntegrationTest {
             assertThat(publishedVersion).isZero();
         }
     }
+
+    @Test
+    @DisplayName("并发同 batchKey 同参批量审核：仅批准一次，全部重放同一成功快照")
+    void concurrentSameBatchKey() throws Exception {
+        long docId = createDocument(newRequestId(), "[\"en\"]",
+                "[{\"segmentId\":\"s1\",\"sourceText\":\"原文一\"},{\"segmentId\":\"s2\",\"sourceText\":\"原文二\"}]");
+        submitTranslation(docId, "s1", "en", "alice", "one", 1, newRequestId());
+        submitTranslation(docId, "s2", "en", "alice", "two", 1, newRequestId());
+
+        String batchKey = newRequestId();
+        String bodyA = "{\"batchKey\":\"" + batchKey + "\",\"expectedDraftVersion\":3,\"items\":["
+                + "{\"segmentId\":\"s1\",\"language\":\"en\",\"expectedTranslationVersion\":1},"
+                + "{\"segmentId\":\"s2\",\"language\":\"en\",\"expectedTranslationVersion\":1}]}";
+        // 换序同参
+        String bodyB = "{\"batchKey\":\"" + batchKey + "\",\"expectedDraftVersion\":3,\"items\":["
+                + "{\"segmentId\":\"s2\",\"language\":\"EN\",\"expectedTranslationVersion\":1},"
+                + "{\"segmentId\":\"s1\",\"language\":\"en\",\"expectedTranslationVersion\":1}]}";
+
+        int threads = 6;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch gate = new CountDownLatch(1);
+        List<Future<ApiResult>> futures = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            final String body = i % 2 == 0 ? bodyA : bodyB;
+            futures.add(pool.submit(() -> {
+                gate.await();
+                return postJson("/api/documents/" + docId + "/batch-approvals", body, "bob");
+            }));
+        }
+        gate.countDown();
+        List<ApiResult> results = new ArrayList<>();
+        for (Future<ApiResult> future : futures) {
+            results.add(future.get(30, TimeUnit.SECONDS));
+        }
+        pool.shutdown();
+
+        for (ApiResult result : results) {
+            assertThat(result.status()).isEqualTo(200);
+            assertThat(result.body().get("batchKey").asText()).isEqualTo(batchKey);
+            assertThat(result.body().get("items")).hasSize(2);
+        }
+        // 只批准一次：approval 两条、批次记录一条、明细两条、幂等记录一条
+        assertThat(jdbc.queryForObject(
+                "SELECT COUNT(*) FROM approval WHERE document_id = ?", Integer.class, docId)).isEqualTo(2);
+        assertThat(jdbc.queryForObject(
+                "SELECT COUNT(*) FROM batch_approval WHERE batch_key = ?", Integer.class, batchKey))
+                .isEqualTo(1);
+        assertThat(jdbc.queryForObject(
+                "SELECT COUNT(*) FROM batch_approval_item WHERE batch_key = ?", Integer.class, batchKey))
+                .isEqualTo(2);
+        assertThat(jdbc.queryForObject(
+                "SELECT COUNT(*) FROM request_log WHERE request_id = ?", Integer.class, batchKey))
+                .isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("批量审核与译文重新提交并发：按事务提交顺序裁决，无部分批准，最终状态一致")
+    void concurrentBatchAndResubmit() throws Exception {
+        long docId = createDocument(newRequestId(), "[\"en\"]",
+                "[{\"segmentId\":\"s1\",\"sourceText\":\"原文\"}]");
+        submitTranslation(docId, "s1", "en", "alice", "v1", 1, newRequestId());
+
+        String batchKey = newRequestId();
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        CountDownLatch gate = new CountDownLatch(1);
+        Future<ApiResult> batchFuture = pool.submit(() -> {
+            gate.await();
+            return postJson("/api/documents/" + docId + "/batch-approvals",
+                    "{\"batchKey\":\"" + batchKey + "\",\"expectedDraftVersion\":2,\"items\":["
+                            + "{\"segmentId\":\"s1\",\"language\":\"en\","
+                            + "\"expectedTranslationVersion\":1}]}", "bob");
+        });
+        Future<ApiResult> resubmitFuture = pool.submit(() -> {
+            gate.await();
+            return submitTranslation(docId, "s1", "en", "alice", "v2", 1, newRequestId());
+        });
+        gate.countDown();
+        ApiResult batchResult = batchFuture.get(30, TimeUnit.SECONDS);
+        ApiResult resubmitResult = resubmitFuture.get(30, TimeUnit.SECONDS);
+        pool.shutdown();
+
+        assertThat(resubmitResult.status()).isEqualTo(200);
+        int currentVersion = jdbc.queryForObject(
+                "SELECT translation_version FROM translation WHERE document_id = ? AND segment_id = 's1'",
+                Integer.class, docId);
+        assertThat(currentVersion).isEqualTo(2);
+
+        Integer batchCount = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM batch_approval WHERE batch_key = ?", Integer.class, batchKey);
+        if (batchResult.status() == 200) {
+            // 批量先提交：版本 1 被批准；随后重新提交使译文版本变为 2，旧批准失效
+            assertThat(batchCount).isEqualTo(1);
+            Integer approvedVersion = jdbc.queryForObject(
+                    "SELECT translation_version FROM approval WHERE document_id = ? AND segment_id = 's1'",
+                    Integer.class, docId);
+            assertThat(approvedVersion).isEqualTo(1);
+        } else {
+            // 重新提交先提交：译文版本已变为 2，期望版本 1 的整批 422，无任何批次记录
+            assertThat(batchResult.status()).isEqualTo(422);
+            assertThat(batchCount).isZero();
+            assertThat(jdbc.queryForObject(
+                    "SELECT COUNT(*) FROM request_log WHERE request_id = ?", Integer.class, batchKey))
+                    .isZero();
+        }
+        // 无论顺序如何，批准数只能是 0 或 1，不存在部分批准之外的脏状态
+        Integer approvalCount = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM approval WHERE document_id = ? AND segment_id = 's1'",
+                Integer.class, docId);
+        assertThat(approvalCount).isIn(0, 1);
+    }
 }

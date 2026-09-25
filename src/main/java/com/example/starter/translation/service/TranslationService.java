@@ -2,7 +2,10 @@ package com.example.starter.translation.service;
 
 import com.example.starter.translation.api.ApiDtos;
 import com.example.starter.translation.api.ApiException;
+import com.example.starter.translation.api.BatchApprovalValidationException;
 import com.example.starter.translation.domain.Rows.ApprovalRow;
+import com.example.starter.translation.domain.Rows.BatchApprovalItemRow;
+import com.example.starter.translation.domain.Rows.BatchApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
 import com.example.starter.translation.domain.Rows.TranslationRow;
@@ -12,10 +15,12 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -172,6 +177,132 @@ public class TranslationService {
                 buildSnapshotJson(document, publishedVersion, segments, translations, approvals));
         repository.updatePublishedVersion(documentId, publishedVersion);
         return new ApiDtos.PublishResponse(documentId, publishedVersion);
+    }
+
+    /**
+     * 批量审核：在一个事务内锁定文档并重新读取全部译文最新状态，逐条校验
+     * （待审核即当前无有效批准、译文版本匹配、审核人不是作者、译文基于当前源文版本）。
+     * 任一条不满足则整批 422 回滚、不批准任何一条；全部通过时与单条批准共享同一 approval 状态机，
+     * 原子写入批准与不可变批量记录。不改变文档 draftVersion。
+     */
+    @Transactional
+    public ApiDtos.BatchApprovalResponse approveTranslationsBatch(long documentId, String actorId,
+                                                                  ApiDtos.BatchApprovalRequest request) {
+        DocumentRow document = lockDocument(documentId);
+
+        // 并发同 batchKey：本事务在开事务查重后才拿到文档锁，期间可能已有他事务原子提交同键批次。
+        // 持锁后复查，命中则整体转为重放首次快照（由 WriteExecutor 回滚本事务后重放），
+        // 避免把他事务已批准的条目误判为“已批准”而返回 422。
+        if (repository.findBatchApproval(request.batchKey()).isPresent()) {
+            throw new WriteResult.ReplaySignal(request.batchKey(), null);
+        }
+
+        // 同一批次内译文标识（段落+语言）不得重复，重复返回 400
+        Set<String> seen = new HashSet<>();
+        for (ApiDtos.BatchApprovalItemInput item : request.items()) {
+            String identity = item.segmentId() + " " + normalizeLanguage(item.language());
+            if (!seen.add(identity)) {
+                throw ApiException.badRequest(
+                        "同一批次内译文标识重复: " + item.segmentId() + "/" + item.language());
+            }
+        }
+
+        Map<String, SegmentRow> segments = repository.listSegments(documentId).stream()
+                .collect(Collectors.toMap(SegmentRow::segmentId, Function.identity()));
+        Map<String, TranslationRow> translations = repository.listTranslations(documentId).stream()
+                .collect(Collectors.toMap(t -> key(t.segmentId(), t.language()), Function.identity()));
+        Map<String, ApprovalRow> approvals = repository.listApprovals(documentId).stream()
+                .collect(Collectors.toMap(a -> key(a.segmentId(), a.language()), Function.identity()));
+
+        List<ApiDtos.BatchApprovalItemError> errors = new ArrayList<>();
+        List<ApiDtos.BatchApprovalItemResponse> responses = new ArrayList<>();
+        int index = 0;
+        for (ApiDtos.BatchApprovalItemInput item : request.items()) {
+            index++;
+            String language = normalizeLanguage(item.language());
+            String identityKey = key(item.segmentId(), language);
+
+            SegmentRow segment = segments.get(item.segmentId());
+            if (segment == null) {
+                errors.add(new ApiDtos.BatchApprovalItemError(index, item.segmentId(), language,
+                        "段落不存在"));
+                continue;
+            }
+            TranslationRow translation = translations.get(identityKey);
+            if (translation == null) {
+                errors.add(new ApiDtos.BatchApprovalItemError(index, item.segmentId(), language,
+                        "译文不存在"));
+                continue;
+            }
+            ApprovalRow approval = approvals.get(identityKey);
+            if (approval != null && approval.translationVersion() == translation.translationVersion()
+                    && approval.sourceVersion() == segment.sourceVersion()) {
+                errors.add(new ApiDtos.BatchApprovalItemError(index, item.segmentId(), language,
+                        "译文已批准，不是待审核状态"));
+                continue;
+            }
+            if (translation.author().equals(actorId)) {
+                errors.add(new ApiDtos.BatchApprovalItemError(index, item.segmentId(), language,
+                        "审核人不得是该译文作者"));
+                continue;
+            }
+            if (translation.translationVersion() != item.expectedTranslationVersion()) {
+                errors.add(new ApiDtos.BatchApprovalItemError(index, item.segmentId(), language,
+                        "译文版本 " + item.expectedTranslationVersion() + " 与当前版本 "
+                                + translation.translationVersion() + " 不匹配"));
+                continue;
+            }
+            if (translation.sourceVersion() != segment.sourceVersion()) {
+                errors.add(new ApiDtos.BatchApprovalItemError(index, item.segmentId(), language,
+                        "译文基于源文版本 " + translation.sourceVersion() + "，当前源文版本 "
+                                + segment.sourceVersion() + "，译文待更新，不能批准"));
+                continue;
+            }
+            responses.add(new ApiDtos.BatchApprovalItemResponse(item.segmentId(), language, actorId,
+                    translation.translationVersion(), segment.sourceVersion()));
+        }
+
+        if (!errors.isEmpty()) {
+            // 整批拒绝：不写入任何批准与批次记录，事务回滚
+            throw new BatchApprovalValidationException(errors);
+        }
+
+        // 全部通过：走与单条批准完全相同的 approval upsert 状态机
+        int lineNo = 0;
+        for (ApiDtos.BatchApprovalItemResponse approved : responses) {
+            lineNo++;
+            repository.upsertApproval(documentId, new ApprovalRow(approved.segmentId(), approved.language(),
+                    actorId, approved.sourceVersion(), approved.translationVersion()));
+            repository.insertBatchApprovalItem(new BatchApprovalItemRow(request.batchKey(), lineNo,
+                    documentId, approved.segmentId(), approved.language(),
+                    approved.translationVersion(), approved.sourceVersion()));
+        }
+        repository.insertBatchApproval(new BatchApprovalRow(request.batchKey(), documentId,
+                request.expectedDraftVersion(), actorId, null));
+        // 审核时刻以数据库默认时间戳为准，回查保证响应与不可变记录一致
+        BatchApprovalRow persisted = repository.findBatchApproval(request.batchKey())
+                .orElseThrow(() -> new IllegalStateException("批量审核记录插入后未回查到: " + request.batchKey()));
+
+        return new ApiDtos.BatchApprovalResponse(persisted.batchKey(), documentId,
+                request.expectedDraftVersion(), actorId, persisted.approvedAt(), responses);
+    }
+
+    /** 查询不可变批量审核记录及其按批次的译文批准明细，稳定排序；批次不存在返回 404。 */
+    @Transactional(readOnly = true)
+    public ApiDtos.BatchApprovalRecordResponse getBatchApproval(long documentId, String batchKey) {
+        repository.findDocument(documentId)
+                .orElseThrow(() -> ApiException.notFound("文档不存在: " + documentId));
+        BatchApprovalRow row = repository.findBatchApproval(batchKey)
+                .orElseThrow(() -> ApiException.notFound("批量审核记录不存在: " + batchKey));
+        if (row.documentId() != documentId) {
+            throw ApiException.notFound("批量审核记录不属于该文档: " + batchKey);
+        }
+        List<ApiDtos.BatchApprovalItemResponse> items = repository.listBatchApprovalItems(batchKey).stream()
+                .map(item -> new ApiDtos.BatchApprovalItemResponse(item.segmentId(), item.language(),
+                        row.reviewer(), item.translationVersion(), item.sourceVersion()))
+                .toList();
+        return new ApiDtos.BatchApprovalRecordResponse(row.batchKey(), row.documentId(),
+                row.expectedDraftVersion(), row.reviewer(), row.approvedAt(), items);
     }
 
     /** 查询指定发布版本的只读快照 JSON；不存在返回 404。 */

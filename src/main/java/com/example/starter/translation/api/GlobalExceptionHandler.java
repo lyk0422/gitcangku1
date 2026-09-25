@@ -21,6 +21,14 @@ public class GlobalExceptionHandler {
                 .body(new ApiDtos.ErrorResponse(ex.code(), ex.getMessage()));
     }
 
+    /** 批量审核整批 422：错误体外加逐条原因。 */
+    @ExceptionHandler(BatchApprovalValidationException.class)
+    public ResponseEntity<ApiDtos.BatchApprovalFailureResponse> handleBatchRejected(
+            BatchApprovalValidationException ex) {
+        return ResponseEntity.status(ex.status())
+                .body(new ApiDtos.BatchApprovalFailureResponse(ex.code(), ex.getMessage(), ex.itemErrors()));
+    }
+
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ResponseEntity<ApiDtos.ErrorResponse> handleValidation(MethodArgumentNotValidException ex) {
         String message = ex.getBindingResult().getFieldErrors().stream()

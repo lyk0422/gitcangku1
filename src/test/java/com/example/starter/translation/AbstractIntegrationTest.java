@@ -35,6 +35,8 @@ public abstract class AbstractIntegrationTest {
 
     @BeforeEach
     void cleanTables() {
+        jdbc.update("DELETE FROM batch_approval_item");
+        jdbc.update("DELETE FROM batch_approval");
         jdbc.update("DELETE FROM approval");
         jdbc.update("DELETE FROM translation");
         jdbc.update("DELETE FROM segment");
@@ -118,6 +120,18 @@ public abstract class AbstractIntegrationTest {
         String body = "{\"requestId\":\"" + requestId + "\",\"expectedDraftVersion\":" + expectedDraftVersion
                 + ",\"expectedPublishedVersion\":" + expectedPublishedVersion + "}";
         return postJson("/api/documents/" + documentId + "/publish", body);
+    }
+
+    /** 提交批量审核，body 为 items JSON 数组原文。 */
+    protected ApiResult batchApprove(long documentId, String batchKey, int expectedDraftVersion,
+                                     String itemsJson, String actorId) throws Exception {
+        String body = "{\"batchKey\":\"" + batchKey + "\",\"expectedDraftVersion\":" + expectedDraftVersion
+                + ",\"items\":" + itemsJson + "}";
+        return postJson("/api/documents/" + documentId + "/batch-approvals", body, actorId);
+    }
+
+    protected ApiResult getBatchApproval(long documentId, String batchKey) throws Exception {
+        return getJson("/api/documents/" + documentId + "/batch-approvals/" + batchKey);
     }
 
     /** HTTP 响应结果：状态码与 JSON 响应体。 */

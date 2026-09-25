@@ -60,6 +60,34 @@ public final class Rows {
     }
 
     /**
+     * 批量审核记录：batchKey 全局唯一、不可变；固化提交时的文档草稿版本（仅记录用，不做前置校验）、
+     * 审核人与审核时刻。批量审核不改变文档 draftVersion。
+     *
+     * @param batchKey             全局唯一批次键，承担批量审核的幂等键
+     * @param documentId           所属文档 ID
+     * @param expectedDraftVersion 提交批次时客户端所见文档草稿版本，仅固化进记录
+     * @param reviewer             审核人，取批量审核时 X-Actor-Id，不得是任一条译文作者
+     * @param approvedAt           审核时刻，数据库默认时区时间戳字符串
+     */
+    public record BatchApprovalRow(String batchKey, long documentId, int expectedDraftVersion,
+                                   String reviewer, String approvedAt) {
+    }
+
+    /**
+     * 批量审核明细：不可变，固化批内每条译文在审核时刻的段落、语言与译文版本，按位置稳定排序。
+     *
+     * @param batchKey            所属批次键
+     * @param lineNo              批内行号，从 1 开始，用于稳定排序与逐条原因定位
+     * @param segmentId           所属段落 ID
+     * @param language            目标语言码，小写
+     * @param translationVersion  批准时的译文版本
+     * @param sourceVersion       批准时译文所依据的源文版本
+     */
+    public record BatchApprovalItemRow(String batchKey, int lineNo, long documentId, String segmentId,
+                                       String language, int translationVersion, int sourceVersion) {
+    }
+
+    /**
      * 写操作幂等去重记录：全局唯一 requestId，仅记录成功结果，与业务变更原子提交。
      *
      * @param requestId      全局唯一请求 ID
