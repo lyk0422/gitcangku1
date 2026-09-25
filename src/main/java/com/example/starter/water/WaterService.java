@@ -1,7 +1,6 @@
 package com.example.starter.water;
 
 import com.example.starter.water.WaterRepository.AllocationRow;
-import com.example.starter.water.WaterRepository.CommandRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
 import com.example.starter.water.WaterRepository.TransferRow;
 import com.example.starter.water.WaterRepository.WindowRow;
@@ -12,27 +11,26 @@ import com.example.starter.water.dto.Dtos.HistoryResponse;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferResponse;
 import com.example.starter.water.dto.Dtos.WindowResponse;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.PlatformTransactionManager;
-import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
 import java.util.List;
-import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
 /**
  * 灌区配水业务服务。
  *
- * <p>幂等：每个写命令携带 commandKey，事务内先占位插入命令行再执行业务并写回响应；
+ * <p>幂等：每个写命令携带 commandKey，由 {@link CommandExecutor} 在事务内先占位插入命令行再执行业务；
  * 同键同参重放返回首次结果，同键改参返回 409。</p>
  *
  * <p>并发：批准申请与创建/取消限供在同一事务内先对窗口行 SELECT ... FOR UPDATE，
  * 按事务提交顺序生效，保证已批准总量永不超过最终可用总量。</p>
+ *
+ * <p>停运联动：转让结算是否受停运窗口拦截、风险门禁由 {@link CanalService} 判定，
+ * 本服务暴露锁定窗口等共享入口，保证两类命令按同一提交顺序串行裁决。</p>
  */
 @Service
 public class WaterService {
@@ -46,14 +44,16 @@ public class WaterService {
     private static final Pattern KEY_PATTERN = Pattern.compile("[\\w.\\-:]{1,128}");
 
     private final WaterRepository repository;
-    private final TransactionTemplate tx;
-    private final ObjectMapper objectMapper;
+    private final CommandExecutor commands;
+    private final SystemTime time;
+    private final CanalService canalService;
 
-    public WaterService(WaterRepository repository, PlatformTransactionManager transactionManager,
-                        ObjectMapper objectMapper) {
+    public WaterService(WaterRepository repository, CommandExecutor commands, SystemTime time,
+                        CanalService canalService) {
         this.repository = repository;
-        this.tx = new TransactionTemplate(transactionManager);
-        this.objectMapper = objectMapper;
+        this.commands = commands;
+        this.time = time;
+        this.canalService = canalService;
     }
 
     // ------------------------------------------------------------------
@@ -78,6 +78,8 @@ public class WaterService {
             if (repository.existsOverlappingWindow(channelId, startNanos, endNanos)) {
                 throw ApiException.conflict("WINDOW_OVERLAP", "同一渠道存在时间重叠的供水窗口");
             }
+            // 首次见到渠道时自动登记（版本 1、容量不限），供停运与核销联动使用
+            repository.upsertChannel(channelId, nowNanos());
             long id = repository.insertWindow(windowKey, channelId, startNanos, endNanos, planned, nowNanos());
             WindowRow row = repository.findWindowById(id);
             return toWindowResponse(row, null);
@@ -192,7 +194,7 @@ public class WaterService {
                         "转入申请不存在: " + targetAllocationKey);
             }
             // 先锁窗口行，与普通批准、取消、限供调整按事务提交顺序串行裁决
-            lockWindowOf(source);
+            WindowRow window = lockWindowOf(source);
             // 窗口锁内再锁定源/目标申请行，得到最新状态与持有额度
             AllocationRow lockedSource = repository.lockAllocationByKey(sourceAllocationKey);
             AllocationRow lockedTarget = repository.lockAllocationByKey(targetAllocationKey);
@@ -216,6 +218,8 @@ public class WaterService {
                 throw ApiException.quotaExceeded("源申请当前持有额度 " + fmt(lockedSource.heldAmount())
                         + " 不足，无法转让 " + fmt(amount));
             }
+            // 停运联动门禁：风险申请不能再次转让；任一方窗口与生效停运窗口相交即 422
+            canalService.requireTransferAllowed(lockedSource, lockedTarget, window);
             long now = nowNanos();
             repository.decrementHeldAmount(lockedSource.id(), amount, now);
             repository.updateAllocationStatus(lockedTarget.id(), STATUS_APPROVED, now);
@@ -316,40 +320,12 @@ public class WaterService {
     }
 
     // ------------------------------------------------------------------
-    // 幂等命令框架
+    // 幂等命令框架（委托 CommandExecutor）
     // ------------------------------------------------------------------
 
-    /**
-     * 在单事务内执行幂等命令：先占位插入命令行，再执行业务并写回响应。
-     * 并发同键时占位插入会因唯一约束失败，随后读取已提交的首次结果重放或报 409。
-     */
     private <T> T runCommand(String operation, String commandKey, String params, Class<T> type,
-                             Supplier<T> business) {
-        try {
-            return tx.execute(status -> {
-                CommandRow existing = repository.findCommand(commandKey);
-                if (existing != null) {
-                    return replay(existing, operation, params, type);
-                }
-                repository.insertCommand(commandKey, operation, params, nowNanos());
-                T result = business.get();
-                repository.updateCommandResponse(commandKey, toJson(result));
-                return result;
-            });
-        } catch (DuplicateKeyException e) {
-            CommandRow committed = repository.findCommand(commandKey);
-            if (committed == null || committed.response() == null) {
-                throw ApiException.conflict("COMMAND_CONFLICT", "相同 commandKey 的命令正在处理，请重试");
-            }
-            return replay(committed, operation, params, type);
-        }
-    }
-
-    private <T> T replay(CommandRow existing, String operation, String params, Class<T> type) {
-        if (!existing.operation().equals(operation) || !existing.params().equals(params)) {
-            throw ApiException.conflict("COMMAND_KEY_REUSED", "相同 commandKey 但参数不同，拒绝重放");
-        }
-        return fromJson(existing.response(), type);
+                             java.util.function.Supplier<T> business) {
+        return commands.run(operation, commandKey, params, type, business);
     }
 
     // ------------------------------------------------------------------
@@ -392,8 +368,9 @@ public class WaterService {
                 toIso(row.createdNanos()), row.cancelledNanos() == null ? null : toIso(row.cancelledNanos()));
     }
 
-    static long nowNanos() {
-        return toNanos(Instant.now());
+    /** 当前时刻，UTC 纳秒时间戳（时钟可替换，便于测试控制）。 */
+    long nowNanos() {
+        return time.nowNanos();
     }
 
     /** Instant -> UTC 纳秒时间戳。 */
@@ -453,21 +430,5 @@ public class WaterService {
             return "0";
         }
         return stripped.toPlainString();
-    }
-
-    private String toJson(Object value) {
-        try {
-            return objectMapper.writeValueAsString(value);
-        } catch (Exception e) {
-            throw new IllegalStateException("响应序列化失败", e);
-        }
-    }
-
-    private <T> T fromJson(String json, Class<T> type) {
-        try {
-            return objectMapper.readValue(json, type);
-        } catch (Exception e) {
-            throw new IllegalStateException("响应反序列化失败", e);
-        }
     }
 }

@@ -40,4 +40,9 @@ public class ApiException extends RuntimeException {
     public static ApiException quotaExceeded(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "QUOTA_EXCEEDED", message);
     }
+
+    /** 422 业务校验失败，携带可区分原因码（如 OUTAGE_WINDOW_CONFLICT / INSUFFICIENT_BALANCE）。 */
+    public static ApiException quotaExceeded(String code, String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, code, message);
+    }
 }

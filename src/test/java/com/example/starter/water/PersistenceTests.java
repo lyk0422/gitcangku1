@@ -1,21 +1,29 @@
 package com.example.starter.water;
 
 import com.example.starter.water.WaterRepository.AllocationRow;
+import com.example.starter.water.WaterRepository.ChannelRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
+import com.example.starter.water.WaterRepository.OutageRow;
 import com.example.starter.water.WaterRepository.TransferRow;
 import com.example.starter.water.WaterRepository.WindowRow;
 import org.junit.jupiter.api.Test;
 import org.springframework.core.io.ClassPathResource;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.SimpleDriverDataSource;
 import org.springframework.jdbc.datasource.init.ScriptUtils;
 
 import java.math.BigDecimal;
 import java.sql.Connection;
+import java.util.List;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * 持久化验证：同一 JVM 内使用命名 H2 内存库（MODE=MySQL），建表写入后以全新连接与仓储实例
@@ -115,5 +123,84 @@ class PersistenceTests {
         assertEquals(new BigDecimal("3.000"), cancelled.amount());
         assertEquals(0, cancelled.heldAmount().compareTo(BigDecimal.ZERO));
         assertEquals(0, repo.sumApprovedAmount(windowId).compareTo(BigDecimal.ZERO));
+    }
+
+    /**
+     * 停运与核销持久化边界：渠道版本、UTC 左闭右开重叠判定、恢复截断后的冲突查询、
+     * 风险唯一约束与核销流水，均通过真实 H2（MODE=MySQL）验证。
+     */
+    @Test
+    void outageAndSettlementBoundariesHoldOnRealH2() throws Exception {
+        String url = String.format(URL_TEMPLATE, UUID.randomUUID().toString().substring(0, 8));
+        SimpleDriverDataSource dataSource = new SimpleDriverDataSource(new org.h2.Driver(), url, "sa", "");
+        try (Connection connection = dataSource.getConnection()) {
+            ScriptUtils.executeSqlScript(connection, new ClassPathResource("schema.sql"));
+        }
+        WaterRepository repo = new WaterRepository(new JdbcTemplate(dataSource));
+
+        // 渠道登记幂等：重复 upsert 不报错、版本保持 1
+        repo.upsertChannel("ch-o", 1L);
+        repo.upsertChannel("ch-o", 2L);
+        ChannelRow channel = repo.findChannel("ch-o");
+        assertNotNull(channel);
+        assertEquals(1, channel.version());
+        assertNull(channel.capacity());
+        // 渠道变更：容量 + 版本递增
+        repo.updateChannel("ch-o", new BigDecimal("10.000"));
+        assertEquals(2, repo.findChannel("ch-o").version());
+        assertEquals(new BigDecimal("10.000"), repo.findChannel("ch-o").capacity());
+        repo.bumpChannelVersion("ch-o");
+        assertEquals(3, repo.findChannel("ch-o").version());
+
+        // 供水窗口与申请
+        long windowId = repo.insertWindow("wk-o", "ch-o", 1_000L, 2_000L, new BigDecimal("20.000"), 3L);
+        repo.insertAllocation("ak-o", windowId, "user-1", new BigDecimal("5.000"), "alice", 4L);
+        AllocationRow allocation = repo.findAllocationByKey("ak-o");
+        repo.updateAllocationStatus(allocation.id(), "APPROVED", 5L);
+
+        // 停运窗口：左闭右开重叠判定（[100,200) 与 [200,300) 相邻合法，与 [150,250) 重叠）
+        long outageId = repo.insertOutage("ok-1", "ch-o", 100L, 200L, 6L);
+        assertFalse(repo.existsOverlappingOutage("ch-o", 200L, 300L));
+        assertFalse(repo.existsOverlappingOutage("ch-o", 0L, 100L));
+        assertTrue(repo.existsOverlappingOutage("ch-o", 150L, 250L));
+        assertTrue(repo.existsOverlappingOutage("ch-o", 199L, 200L));
+        // 已删除停运不参与重叠判定
+        repo.deleteOutage(outageId);
+        assertFalse(repo.existsOverlappingOutage("ch-o", 150L, 250L));
+
+        // 冲突查询：受影响集合 + 生效区间（恢复截断）
+        long outage2 = repo.insertOutage("ok-2", "ch-o", 1_100L, 1_900L, 7L);
+        repo.insertOutageAllocations(outage2, List.of("ak-o"));
+        // 窗口 [1000,2000) 与停运 [1100,1900) 相交
+        assertEquals(1, repo.findConflictingOutages("ch-o", "ak-o", 1_000L, 2_000L).size());
+        // 不在受影响集合的申请不冲突
+        assertTrue(repo.findConflictingOutages("ch-o", "ak-other", 1_000L, 2_000L).isEmpty());
+        // 提前恢复到 1200：生效区间 [1100,1200)，与 [1200,2000) 不再相交
+        repo.recoverOutage(outage2, 1_200L);
+        assertTrue(repo.findConflictingOutages("ch-o", "ak-o", 1_200L, 2_000L).isEmpty());
+        assertEquals(1, repo.findConflictingOutages("ch-o", "ak-o", 1_000L, 1_200L).size());
+        OutageRow recovered = repo.findOutageByKey("ok-2");
+        assertEquals("RECOVERED", recovered.status());
+        assertEquals(1_200L, recovered.recoveredNanos());
+
+        // 风险唯一约束：同停运同申请重复写入 -> DuplicateKeyException
+        repo.insertRisk(outage2, "ak-o", 8L);
+        assertTrue(repo.existsRiskForAllocation("ak-o"));
+        assertThrows(DuplicateKeyException.class, () -> repo.insertRisk(outage2, "ak-o", 9L));
+        assertEquals(1, repo.listRisksByAllocation("ak-o").size());
+        // 已批准未结算申请清单
+        assertEquals(1, repo.listApprovedUnsettledAllocations("ch-o").size());
+
+        // 核销流水：settlement_key 唯一；渠道累计核销求和
+        repo.decrementHeldAmount(allocation.id(), new BigDecimal("2.000"), 10L);
+        repo.insertSettlement("sk-1", "ak-o", new BigDecimal("2.000"), "alice", null, 10L);
+        repo.decrementHeldAmount(allocation.id(), new BigDecimal("1.000"), 11L);
+        repo.insertSettlement("batch#1", "ak-o", new BigDecimal("1.000"), "alice", "batch", 11L);
+        assertThrows(DuplicateKeyException.class,
+                () -> repo.insertSettlement("sk-1", "ak-o", new BigDecimal("1.000"), "alice", null, 12L));
+        assertEquals(2, repo.listSettlementsByAllocation("ak-o").size());
+        assertEquals(1, repo.listSettlementsByBatch("batch").size());
+        assertEquals(new BigDecimal("3.000"), repo.sumSettledByChannel("ch-o"));
+        assertEquals(new BigDecimal("2.000"), repo.findAllocationByKey("ak-o").heldAmount());
     }
 }
