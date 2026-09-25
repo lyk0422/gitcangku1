@@ -3,7 +3,10 @@ package com.example.starter.batch;
 import com.example.starter.batch.dto.ApproveRequest;
 import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
+import com.example.starter.batch.dto.ClearConditionItemRequest;
+import com.example.starter.batch.dto.ConditionalReleaseResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
+import com.example.starter.batch.dto.CreateConditionalReleaseRequest;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
 import jakarta.validation.Valid;
@@ -62,13 +65,55 @@ public class BatchController {
     }
 
     /**
-     * 召回已放行批次。
+     * 召回已放行或条件放行期内的批次。
      */
     @PostMapping("/{batchKey}/recall")
     public ResponseEntity<String> recall(@PathVariable String batchKey,
                                          @RequestHeader(name = "X-Actor-Id", required = false) String actorId,
                                          @Valid @RequestBody RecallRequest request) {
         return stored(service.recall(batchKey, actorId, request));
+    }
+
+    /**
+     * 创建条件放行；X-Actor-Id 为创建批准人，X-Approval-Role 为 QUALITY 或 OPERATIONS。
+     */
+    @PostMapping("/{batchKey}/conditional-releases")
+    public ResponseEntity<String> createConditionalRelease(
+            @PathVariable String batchKey,
+            @RequestHeader(name = "X-Actor-Id", required = false) String actorId,
+            @RequestHeader(name = "X-Approval-Role", required = false) String role,
+            @Valid @RequestBody CreateConditionalReleaseRequest request) {
+        return stored(service.createConditionalRelease(batchKey, actorId, role, request));
+    }
+
+    /**
+     * 核销条件子项；核销角色须与创建角色不同。
+     */
+    @PostMapping("/{batchKey}/conditional-releases/{conditionKey}/clearances")
+    public ResponseEntity<String> clearConditionItem(
+            @PathVariable String batchKey,
+            @PathVariable String conditionKey,
+            @RequestHeader(name = "X-Actor-Id", required = false) String actorId,
+            @RequestHeader(name = "X-Approval-Role", required = false) String role,
+            @Valid @RequestBody ClearConditionItemRequest request) {
+        return stored(service.clearConditionItem(batchKey, conditionKey, actorId, role, request));
+    }
+
+    /**
+     * 批次全部条件放行明细（含未核销子项与到期状态），只读稳定排序。
+     */
+    @GetMapping("/{batchKey}/conditional-releases")
+    public List<ConditionalReleaseResponse> listConditions(@PathVariable String batchKey) {
+        return service.listConditions(batchKey);
+    }
+
+    /**
+     * 单条条件放行明细：全部子项、未核销子项与到期状态。
+     */
+    @GetMapping("/{batchKey}/conditional-releases/{conditionKey}")
+    public ConditionalReleaseResponse conditionDetail(@PathVariable String batchKey,
+                                                      @PathVariable String conditionKey) {
+        return service.conditionDetail(batchKey, conditionKey);
     }
 
     /**
