@@ -87,7 +87,22 @@ class ExposureConcurrencyTest {
         jdbc.update("DELETE FROM exposure_reservation");
         jdbc.update("DELETE FROM quota_visitor_ledger");
         jdbc.update("DELETE FROM quota_total_ledger");
+        jdbc.update("DELETE FROM visitor_consent");
+        jdbc.update("DELETE FROM consent_scope");
         jdbc.update("DELETE FROM campaign");
+    }
+
+    /** 为访客就 default 类别授予覆盖 BASE 前后宽窗口的 ALLOW。 */
+    private void grantAllow(String reqId, String visitor) {
+        service.grantConsent(new com.example.starter.exposure.web.GrantConsentRequest(
+                reqId, visitor, "default", "ALLOW", 1L,
+                BASE.toEpochMilli() - 3_600_000L, BASE.toEpochMilli() + 86_400_000L));
+    }
+
+    /** 创建默认类别、无静默/冷却配置的公告。 */
+    private void createCampaign(String reqId, String campaignId, int total, int perVisitor) {
+        service.createCampaign(new CreateCampaignRequest(
+                reqId, campaignId, total, perVisitor, null, null, null, null));
     }
 
     @AfterAll
@@ -100,7 +115,11 @@ class ExposureConcurrencyTest {
     void concurrentApply_doesNotOversell() throws Exception {
         int totalCap = 20;
         int threads = 100;
-        service.createCampaign(new CreateCampaignRequest("req-c", "cap", totalCap, 100_000));
+        service.createCampaign(new CreateCampaignRequest("req-c", "cap", totalCap, 100_000,
+                null, null, null, null));
+        for (int i = 0; i < threads; i++) {
+            grantAllow("req-g-" + i, "visitor-" + i);
+        }
 
         ExecutorService pool = Executors.newFixedThreadPool(16);
         CountDownLatch start = new CountDownLatch(1);
@@ -144,7 +163,8 @@ class ExposureConcurrencyTest {
     @Test
     @DisplayName("同一预占并发确认/取消：只允许一个终态，额度不重复释放、不变负")
     void concurrentConfirmAndCancel_singleTerminal_noDoubleRelease() throws Exception {
-        service.createCampaign(new CreateCampaignRequest("req-c", "cap", 1, 1));
+        createCampaign("req-c", "cap", 1, 1);
+        grantAllow("req-g", "v1");
         ReservationResponse r = service.apply(new ApplyExposureRequest("req-a", "cap", "v1"));
 
         int threads = 24;
@@ -212,7 +232,8 @@ class ExposureConcurrencyTest {
     @Test
     @DisplayName("同一 requestId 并发重放：业务只执行一次，响应一致")
     void concurrentSameRequestId_executesOnce() throws Exception {
-        service.createCampaign(new CreateCampaignRequest("req-c", "cap", 100, 100));
+        createCampaign("req-c", "cap", 100, 100);
+        grantAllow("req-g", "visitor-x");
 
         int threads = 16;
         ExecutorService pool = Executors.newFixedThreadPool(threads);

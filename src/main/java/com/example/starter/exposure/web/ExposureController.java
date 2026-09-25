@@ -14,9 +14,10 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.time.LocalDate;
+import java.util.List;
 
 /**
- * 公告曝光频控 API。
+ * 公告曝光频控与同意版本联合裁决 API。
  */
 @RestController
 @RequestMapping("/api/exposure")
@@ -28,19 +29,59 @@ public class ExposureController {
         this.exposureService = exposureService;
     }
 
-    /** 创建公告（额度创建时固定）。 */
+    /** 创建公告（额度创建时固定，可携带类别/静默窗口/冷却频控配置）。 */
     @PostMapping("/campaigns")
     public ResponseEntity<CampaignResponse> createCampaign(@Valid @RequestBody CreateCampaignRequest request) {
         return ResponseEntity.status(HttpStatus.CREATED).body(exposureService.createCampaign(request));
     }
 
-    /** 申请曝光：创建 60 秒有效预占并占用两级额度。 */
+    /** 修改公告活动类别：活动版本 +1，旧同意不迁移。 */
+    @PostMapping("/campaigns/{campaignId}/category")
+    public CampaignResponse updateCategory(@PathVariable String campaignId,
+                                           @Valid @RequestBody UpdateCategoryRequest request) {
+        return exposureService.updateCategory(campaignId, request);
+    }
+
+    /** 提交访客同意（ALLOW/DENY 版本区间，左闭右开）。 */
+    @PostMapping("/consents")
+    public ResponseEntity<ConsentResponse> grantConsent(@Valid @RequestBody GrantConsentRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(exposureService.grantConsent(request));
+    }
+
+    /** 查询某 (访客, 类别) 的全部同意区间（含撤回/被覆盖记录）。 */
+    @GetMapping("/consents")
+    public List<ConsentResponse> queryConsents(@RequestParam String visitorId,
+                                               @RequestParam String category) {
+        return exposureService.queryConsents(visitorId, category);
+    }
+
+    /** 撤回同意：只影响撤回之后的预占。 */
+    @PostMapping("/consents/{consentId}/withdraw")
+    public ConsentResponse withdrawConsent(@PathVariable String consentId,
+                                           @Valid @RequestBody WithdrawConsentRequest request) {
+        return exposureService.withdrawConsent(consentId, request);
+    }
+
+    /** 申请曝光：先过同意/静默/频控/预算，再创建 60 秒有效预占并占用两级额度。 */
     @PostMapping("/reservations")
     public ResponseEntity<ReservationResponse> apply(@Valid @RequestBody ApplyExposureRequest request) {
         return ResponseEntity.status(HttpStatus.CREATED).body(exposureService.apply(request));
     }
 
-    /** 预占明细。 */
+    /** 批量预占：任一访客最终账目预校验失败则整批回滚。 */
+    @PostMapping("/reservations/batch")
+    public ResponseEntity<BatchApplyResponse> batchApply(@Valid @RequestBody BatchApplyRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(exposureService.batchApply(request));
+    }
+
+    /** 只读预校验请求时刻的裁决结果与拒绝原因，不创建预占、不扣额度。 */
+    @GetMapping("/campaigns/{campaignId}/evaluation")
+    public EvaluationResponse evaluate(@PathVariable String campaignId,
+                                       @RequestParam String visitorId) {
+        return exposureService.evaluate(campaignId, visitorId);
+    }
+
+    /** 预占明细（含创建时固化的同意快照）。 */
     @GetMapping("/reservations/{reservationId}")
     public ReservationResponse getReservation(@PathVariable String reservationId) {
         return exposureService.getReservation(reservationId);

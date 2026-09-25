@@ -110,6 +110,8 @@ class ExposureApiIntegrationTest {
         jdbc.update("DELETE FROM exposure_reservation");
         jdbc.update("DELETE FROM quota_visitor_ledger");
         jdbc.update("DELETE FROM quota_total_ledger");
+        jdbc.update("DELETE FROM visitor_consent");
+        jdbc.update("DELETE FROM consent_scope");
         jdbc.update("DELETE FROM campaign");
         mutableClock().setInstant(BASE);
     }
@@ -120,13 +122,22 @@ class ExposureApiIntegrationTest {
     }
 
     private CreateCampaignRequest createReq(String requestId, String campaignId, int total, int perVisitor) {
-        return new CreateCampaignRequest(requestId, campaignId, total, perVisitor);
+        return new CreateCampaignRequest(requestId, campaignId, total, perVisitor,
+                null, null, null, null);
+    }
+
+    /** 为访客就公告当前类别提交一条覆盖 BASE 前后宽窗口的 ALLOW，便于既有频控用例直接申请。 */
+    private void grantAllow(String reqId, String visitor, String category) {
+        service.grantConsent(new com.example.starter.exposure.web.GrantConsentRequest(
+                reqId, visitor, category, "ALLOW", 1L,
+                BASE.toEpochMilli() - 3_600_000L, BASE.toEpochMilli() + 86_400_000L));
     }
 
     @Test
     @DisplayName("创建公告并申请曝光：预占 60 秒有效并占用两级额度")
     void apply_createsReservationAndOccupiesBothQuotas() {
         service.createCampaign(createReq("req-c1", "c1", 10, 2));
+        grantAllow("req-g1", "v1", "default");
 
         ReservationResponse r = service.apply(new ApplyExposureRequest("req-a1", "c1", "v1"));
 
@@ -155,6 +166,7 @@ class ExposureApiIntegrationTest {
     @DisplayName("确认后转 CONFIRMED 并持续占用当天额度；重复确认返回原状态")
     void confirm_keepsQuotaAndRepeatedConfirmReturnsSameState() {
         service.createCampaign(createReq("req-c1", "c1", 10, 2));
+        grantAllow("req-g1", "v1", "default");
         ReservationResponse r = service.apply(new ApplyExposureRequest("req-a1", "c1", "v1"));
 
         ReservationResponse confirmed = service.confirm(r.reservationId(),
@@ -180,6 +192,7 @@ class ExposureApiIntegrationTest {
     @DisplayName("取消仅适用于 RESERVED：释放两级额度，重复取消返回原状态")
     void cancel_releasesBothQuotasAndRepeatedCancelReturnsSameState() {
         service.createCampaign(createReq("req-c1", "c1", 1, 1));
+        grantAllow("req-g1", "v1", "default");
         ReservationResponse r = service.apply(new ApplyExposureRequest("req-a1", "c1", "v1"));
 
         ReservationResponse cancelled = service.cancel(r.reservationId(),
@@ -208,6 +221,8 @@ class ExposureApiIntegrationTest {
     @DisplayName("非法状态转换返回 409：确认已取消、取消已确认")
     void illegalTransitionsReturn409() {
         service.createCampaign(createReq("req-c1", "c1", 10, 2));
+        grantAllow("req-g1", "v1", "default");
+        grantAllow("req-g2", "v2", "default");
         ReservationResponse r1 = service.apply(new ApplyExposureRequest("req-a1", "c1", "v1"));
         service.cancel(r1.reservationId(), new ReservationActionRequest("req-x1"));
         assert409(() -> service.confirm(r1.reservationId(), new ReservationActionRequest("req-e1")));
@@ -221,6 +236,7 @@ class ExposureApiIntegrationTest {
     @DisplayName("达到到期时刻即 EXPIRED 并释放；确认/取消过期单返回 409；不依赖定时器")
     void expiry_atExactMomentReleasesQuotaAndActionsReturn409() {
         service.createCampaign(createReq("req-c1", "c1", 10, 2));
+        grantAllow("req-g1", "v1", "default");
         ReservationResponse r = service.apply(new ApplyExposureRequest("req-a1", "c1", "v1"));
 
         // 到期前 1 毫秒仍可确认的边界由另一用例覆盖；此处推进到恰好到期时刻
@@ -244,6 +260,7 @@ class ExposureApiIntegrationTest {
     void confirmAcrossUtcDay_keepsOriginalDayLedger() {
         mutableClock().setInstant(Instant.parse("2026-09-22T23:59:30Z"));
         service.createCampaign(createReq("req-c1", "c1", 10, 2));
+        grantAllow("req-g1", "v1", "default");
         ReservationResponse r = service.apply(new ApplyExposureRequest("req-a1", "c1", "v1"));
         assertEquals(LocalDate.of(2026, 9, 22), r.utcDate());
 
@@ -265,6 +282,9 @@ class ExposureApiIntegrationTest {
     @DisplayName("任一额度已满返回 429，两个额度均不增加；访客上限同样生效")
     void quotaExhausted_returns429AndNoLedgerIncrease() {
         service.createCampaign(createReq("req-c1", "c1", 2, 2));
+        grantAllow("req-g1", "v1", "default");
+        grantAllow("req-g2", "v2", "default");
+        grantAllow("req-g3", "v3", "default");
         service.apply(new ApplyExposureRequest("req-a1", "c1", "v1"));
         service.apply(new ApplyExposureRequest("req-a2", "c1", "v2"));
 
@@ -281,6 +301,8 @@ class ExposureApiIntegrationTest {
     @DisplayName("幂等：同键同参重放原结果；异参 409；失败不占键")
     void idempotency_replaySameResult_conflictOnDifferentParams_failureDoesNotOccupy() {
         service.createCampaign(createReq("req-c1", "c1", 1, 5));
+        grantAllow("req-g1", "v1", "default");
+        grantAllow("req-g2", "v2", "default");
         ReservationResponse first = service.apply(new ApplyExposureRequest("key-1", "c1", "v1"));
 
         ReservationResponse replay = service.apply(new ApplyExposureRequest("key-1", "c1", "v1"));
@@ -311,26 +333,50 @@ class ExposureApiIntegrationTest {
     }
 
     @Test
-    @DisplayName("HTTP 语义：创建 201、额度不足 429、参数越界 400")
-    void httpSemantics_201_429_400() throws Exception {
+    @DisplayName("HTTP 语义：创建 201、同意拒绝 403、额度不足 429、参数越界 400")
+    void httpSemantics_201_403_429_400() throws Exception {
         mockMvc.perform(post("/api/exposure/campaigns")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"requestId\":\"h1\",\"campaignId\":\"ch\",\"dailyTotalCap\":1,"
                                 + "\"perVisitorDailyCap\":1}"))
                 .andExpect(status().isCreated())
-                .andExpect(jsonPath("$.campaignId").value("ch"));
+                .andExpect(jsonPath("$.campaignId").value("ch"))
+                .andExpect(jsonPath("$.version").value(1))
+                .andExpect(jsonPath("$.category").value("default"));
+
+        long start = BASE.toEpochMilli() - 3_600_000L;
+        long end = BASE.toEpochMilli() + 86_400_000L;
+        mockMvc.perform(post("/api/exposure/consents")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"requestId\":\"hg1\",\"visitorId\":\"u1\",\"category\":\"default\","
+                                + "\"decision\":\"ALLOW\",\"consentVersion\":1,"
+                                + "\"effectiveStartUtc\":" + start + ",\"effectiveEndUtc\":" + end + "}"))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.decision").value("ALLOW"));
 
         mockMvc.perform(post("/api/exposure/reservations")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"requestId\":\"h2\",\"campaignId\":\"ch\",\"visitorId\":\"u1\"}"))
                 .andExpect(status().isCreated())
-                .andExpect(jsonPath("$.status").value("RESERVED"));
+                .andExpect(jsonPath("$.status").value("RESERVED"))
+                .andExpect(jsonPath("$.consentVersion").value(1))
+                .andExpect(jsonPath("$.consentDecision").value("ALLOW"));
 
+        // u2 从未提交 ALLOW：CONSENT_DENIED（403），且总额度不被扣减（仍可由有同意访客占用的结论见服务层用例）
         mockMvc.perform(post("/api/exposure/reservations")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"requestId\":\"h3\",\"campaignId\":\"ch\",\"visitorId\":\"u2\"}"))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.status").value(403))
+                .andExpect(jsonPath("$.reason").value("CONSENT_DENIED"));
+
+        // u1 已有一笔有效预占，总额度仅 1：再次申请被预算拒绝 429
+        mockMvc.perform(post("/api/exposure/reservations")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"requestId\":\"h3b\",\"campaignId\":\"ch\",\"visitorId\":\"u1\"}"))
                 .andExpect(status().isTooManyRequests())
-                .andExpect(jsonPath("$.status").value(429));
+                .andExpect(jsonPath("$.status").value(429))
+                .andExpect(jsonPath("$.reason").value("BUDGET_EXHAUSTED"));
 
         mockMvc.perform(post("/api/exposure/campaigns")
                         .contentType(MediaType.APPLICATION_JSON)

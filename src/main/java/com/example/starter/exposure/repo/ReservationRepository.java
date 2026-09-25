@@ -1,5 +1,6 @@
 package com.example.starter.exposure.repo;
 
+import com.example.starter.exposure.domain.ConsentDecision;
 import com.example.starter.exposure.domain.Reservation;
 import com.example.starter.exposure.domain.ReservationStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -23,27 +24,40 @@ public class ReservationRepository {
         this.jdbc = jdbc;
     }
 
-    private static final RowMapper<Reservation> MAPPER = (rs, rowNum) -> new Reservation(
-            rs.getString("reservation_id"),
-            rs.getString("campaign_id"),
-            rs.getString("visitor_id"),
-            rs.getDate("utc_date"),
-            ReservationStatus.valueOf(rs.getString("status")),
-            rs.getLong("created_at_utc"),
-            rs.getLong("expires_at_utc"),
-            (Long) rs.getObject("terminal_at_utc"));
+    private static final RowMapper<Reservation> MAPPER = (rs, rowNum) -> {
+        String decision = rs.getString("consent_decision");
+        return new Reservation(
+                rs.getString("reservation_id"),
+                rs.getString("campaign_id"),
+                rs.getString("visitor_id"),
+                rs.getDate("utc_date"),
+                ReservationStatus.valueOf(rs.getString("status")),
+                rs.getString("category"),
+                rs.getString("consent_id"),
+                (Long) rs.getObject("consent_version"),
+                decision == null ? null : ConsentDecision.valueOf(decision),
+                rs.getLong("created_at_utc"),
+                rs.getLong("expires_at_utc"),
+                (Long) rs.getObject("terminal_at_utc"));
+    };
 
     private static final String COLUMNS =
-            "reservation_id, campaign_id, visitor_id, utc_date, status, "
+            "reservation_id, campaign_id, visitor_id, utc_date, status, category, "
+                    + "consent_id, consent_version, consent_decision, "
                     + "created_at_utc, expires_at_utc, terminal_at_utc";
 
     public void insert(Reservation reservation) {
-        jdbc.update("INSERT INTO exposure_reservation (" + COLUMNS + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        jdbc.update("INSERT INTO exposure_reservation (" + COLUMNS + ") "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 reservation.reservationId(),
                 reservation.campaignId(),
                 reservation.visitorId(),
                 reservation.utcDate(),
                 reservation.status().name(),
+                reservation.category(),
+                reservation.consentId(),
+                reservation.consentVersion(),
+                reservation.consentDecision() == null ? null : reservation.consentDecision().name(),
                 reservation.createdAtUtc(),
                 reservation.expiresAtUtc(),
                 reservation.terminalAtUtc());
@@ -73,6 +87,18 @@ public class ReservationRepository {
         return jdbc.query("SELECT " + COLUMNS + " FROM exposure_reservation "
                         + "WHERE campaign_id = ? AND status = 'RESERVED' AND expires_at_utc <= ? FOR UPDATE",
                 MAPPER, campaignId, nowUtc);
+    }
+
+    /**
+     * 无锁读取某公告下某访客在指定时刻之后创建的预占单（按创建时刻升序），
+     * 用于冷却频控（同访客新建预占由裁决域父行锁串行化，无需预占行锁）与只读预校验。
+     */
+    public List<Reservation> findVisitorReservationsAfter(String campaignId, String visitorId,
+                                                          long afterCreatedAtUtc) {
+        return jdbc.query("SELECT " + COLUMNS + " FROM exposure_reservation "
+                        + "WHERE campaign_id = ? AND visitor_id = ? AND created_at_utc > ? "
+                        + "ORDER BY created_at_utc",
+                MAPPER, campaignId, visitorId, afterCreatedAtUtc);
     }
 
     /**
