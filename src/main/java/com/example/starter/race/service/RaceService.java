@@ -1,16 +1,24 @@
 package com.example.starter.race.service;
 
 import com.example.starter.race.api.AddPenaltyRequest;
+import com.example.starter.race.api.AdjudicateEvidenceRequest;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
 import com.example.starter.race.api.CreateRaceRequest;
+import com.example.starter.race.api.EvidenceRulingResponse;
+import com.example.starter.race.api.FinishEvidenceResponse;
+import com.example.starter.race.api.RegisterEvidenceRequest;
 import com.example.starter.race.api.RegisterRunnerRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
+import com.example.starter.race.api.RevokeEvidenceRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
 import com.example.starter.race.api.MissingCheckpointsResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.api.SubmitTimingRequest;
+import com.example.starter.race.api.WithdrawRunnerRequest;
+
+import java.util.List;
 
 /**
  * 赛事成绩封榜应用服务；每个写方法在单个数据库事务内完成
@@ -47,6 +55,41 @@ public interface RaceService {
 
     /** 封榜：校验版本并原子保存只读成绩快照（含每名选手分段明细与缺失检查点）。 */
     ServiceResult sealRace(String raceId, SealRaceRequest request);
+
+    /**
+     * 选手退赛：退赛后不参与排名，且成为“失效候选人”；
+     * 引用该选手的 PENDING 证据再裁决时返回422。已退赛重复提交返回409。
+     */
+    ServiceResult withdrawRunner(String raceId, String bib, WithdrawRunnerRequest request);
+
+    /**
+     * 登记冲线证据：仅 OPEN 赛事可登记；相同计时的候选人建议顺序不得遗漏或重复，
+     * 候选人须为该计时（原始完赛耗时相等）的有效选手；evidenceId 全局唯一。
+     */
+    ServiceResult registerEvidence(String raceId, RegisterEvidenceRequest request);
+
+    /**
+     * 批量裁决一组同计时证据：先校验赛事未封榜、证据均可裁决、全部候选人仍有效、
+     * 裁决顺序恰好覆盖全部候选人且无重复；任一失效返回422且无部分变更。
+     * 成功后重排该计时组并写入不可变裁决快照。
+     */
+    ServiceResult adjudicateEvidence(String raceId, AdjudicateEvidenceRequest request);
+
+    /** 撤回未裁决证据：保留撤回记录；已裁决证据不可撤回（409）。 */
+    ServiceResult revokeEvidence(
+            String raceId, String evidenceId, RevokeEvidenceRequest request);
+
+    /** 查询赛事冲线证据列表（含各状态），按计时组、登记时间稳定返回；只读。 */
+    List<FinishEvidenceResponse> getEvidences(String raceId);
+
+    /** 查询单条冲线证据（含裁决批次与撤回状态）；不存在为404。 */
+    FinishEvidenceResponse getEvidence(String raceId, String evidenceId);
+
+    /** 查询赛事全部证据裁决快照（不可变），按裁决时间稳定返回；只读。 */
+    List<EvidenceRulingResponse> getRulings(String raceId);
+
+    /** 按裁决批次ID查询不可变裁决快照；不存在为404。 */
+    EvidenceRulingResponse getRuling(String raceId, String rulingId);
 
     /** 查询即时成绩（OPEN 实时计算；SEALED 返回封榜快照）。 */
     StandingResponse getResults(String raceId);

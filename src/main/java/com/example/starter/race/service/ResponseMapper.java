@@ -2,6 +2,9 @@ package com.example.starter.race.service;
 
 import com.example.starter.race.api.CheckpointPassResponse;
 import com.example.starter.race.api.CheckpointTimingResponse;
+import com.example.starter.race.api.EvidenceRulingResponse;
+import com.example.starter.race.api.FinishEvidenceResponse;
+import com.example.starter.race.api.EvidenceWithdrawalResponse;
 import com.example.starter.race.api.PenaltyResponse;
 import com.example.starter.race.api.ResultEntryResponse;
 import com.example.starter.race.api.RunnerResponse;
@@ -12,6 +15,9 @@ import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
+import com.example.starter.race.persistence.EvidenceRulingRow;
+import com.example.starter.race.persistence.EvidenceWithdrawalRow;
+import com.example.starter.race.persistence.FinishEvidenceRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
 import com.example.starter.race.persistence.RunnerRow;
@@ -32,7 +38,26 @@ final class ResponseMapper {
     }
 
     static RunnerResponse toRunnerResponse(RunnerRow row) {
-        return new RunnerResponse(row.bib(), row.finishTimeMs(), row.createdAt(), row.updatedAt());
+        return new RunnerResponse(row.bib(), row.finishTimeMs(), row.entryStatus(),
+                row.createdAt(), row.updatedAt());
+    }
+
+    static FinishEvidenceResponse toEvidenceResponse(FinishEvidenceRow row) {
+        return new FinishEvidenceResponse(
+                row.evidenceId(), row.raceId(), row.finishTimeMs(), row.capturedAt(),
+                row.operator(), row.status(), row.suggestedOrder(), row.rulingId(),
+                row.createdAt(), row.revokedAt());
+    }
+
+    static EvidenceRulingResponse toRulingResponse(EvidenceRulingRow row) {
+        return new EvidenceRulingResponse(
+                row.rulingId(), row.raceId(), row.version(), row.finishTimeMs(),
+                row.orderedBibs(), row.evidenceIds(), row.operator(), row.createdAt());
+    }
+
+    static EvidenceWithdrawalResponse toWithdrawalResponse(EvidenceWithdrawalRow row) {
+        return new EvidenceWithdrawalResponse(
+                row.evidenceId(), row.raceId(), row.operator(), row.createdAt());
     }
 
     static PenaltyResponse toPenaltyResponse(PenaltyRow row) {
@@ -51,9 +76,10 @@ final class ResponseMapper {
             List<RunnerRow> runners,
             List<PenaltyRow> penalties,
             List<CheckpointRow> checkpoints,
-            List<CheckpointTimingRow> timings) {
+            List<CheckpointTimingRow> timings,
+            Map<String, Integer> evidenceOrderByBib) {
         List<ResultEntry> entries = ResultCalculator.compute(
-                runners, penalties, checkpoints, timings);
+                runners, penalties, checkpoints, timings, evidenceOrderByBib);
         return new StandingResponse(
                 race.raceId(),
                 race.version(),

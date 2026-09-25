@@ -87,6 +87,68 @@ public class RaceController {
         return toResponse(raceService.sealRace(raceId, request));
     }
 
+    /** 选手退赛。 */
+    @PostMapping("/{raceId}/runners/{bib}/withdrawal")
+    public ResponseEntity<Object> withdrawRunner(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody WithdrawRunnerRequest request) {
+        return toResponse(raceService.withdrawRunner(raceId, bib, request));
+    }
+
+    /** 登记冲线证据。 */
+    @PostMapping("/{raceId}/evidences")
+    public ResponseEntity<Object> registerEvidence(
+            @PathVariable String raceId,
+            @Valid @RequestBody RegisterEvidenceRequest request) {
+        return toResponse(raceService.registerEvidence(raceId, request));
+    }
+
+    /** 批量裁决一组冲线证据。 */
+    @PostMapping("/{raceId}/evidence-rulings")
+    public ResponseEntity<Object> adjudicateEvidence(
+            @PathVariable String raceId,
+            @Valid @RequestBody AdjudicateEvidenceRequest request) {
+        return toResponse(raceService.adjudicateEvidence(raceId, request));
+    }
+
+    /** 撤回未裁决冲线证据。 */
+    @PostMapping("/{raceId}/evidences/{evidenceId}/revocation")
+    public ResponseEntity<Object> revokeEvidence(
+            @PathVariable String raceId,
+            @PathVariable String evidenceId,
+            @Valid @RequestBody RevokeEvidenceRequest request) {
+        return toResponse(raceService.revokeEvidence(raceId, evidenceId, request));
+    }
+
+    /** 查询赛事全部冲线证据。 */
+    @GetMapping("/{raceId}/evidences")
+    public java.util.List<FinishEvidenceResponse> getEvidences(@PathVariable String raceId) {
+        return raceService.getEvidences(raceId);
+    }
+
+    /** 查询单条冲线证据。 */
+    @GetMapping("/{raceId}/evidences/{evidenceId}")
+    public FinishEvidenceResponse getEvidence(
+            @PathVariable String raceId,
+            @PathVariable String evidenceId) {
+        return raceService.getEvidence(raceId, evidenceId);
+    }
+
+    /** 查询赛事全部证据裁决快照。 */
+    @GetMapping("/{raceId}/evidence-rulings")
+    public java.util.List<EvidenceRulingResponse> getRulings(@PathVariable String raceId) {
+        return raceService.getRulings(raceId);
+    }
+
+    /** 按批次ID查询证据裁决快照。 */
+    @GetMapping("/{raceId}/evidence-rulings/{rulingId}")
+    public EvidenceRulingResponse getRuling(
+            @PathVariable String raceId,
+            @PathVariable String rulingId) {
+        return raceService.getRuling(raceId, rulingId);
+    }
+
     /** 查询即时成绩（封榜后返回只读快照内容）。 */
     @GetMapping("/{raceId}/results")
     public StandingResponse getResults(@PathVariable String raceId) {

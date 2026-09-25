@@ -1,8 +1,12 @@
 package com.example.starter.race.persistence;
 
 import com.example.starter.race.domain.EntryStatus;
+import com.example.starter.race.domain.EvidenceStatus;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
+import com.example.starter.race.domain.RunnerStatus;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
@@ -30,11 +34,17 @@ public class RaceRepository {
             new CheckpointTimingRowMapper();
     private static final SnapshotCheckpointRowMapper SNAPSHOT_CHECKPOINT_ROW_MAPPER =
             new SnapshotCheckpointRowMapper();
+    private final FinishEvidenceRowMapper finishEvidenceRowMapper = new FinishEvidenceRowMapper();
+    private final EvidenceRulingRowMapper evidenceRulingRowMapper = new EvidenceRulingRowMapper();
+    private static final EvidenceWithdrawalRowMapper EVIDENCE_WITHDRAWAL_ROW_MAPPER =
+            new EvidenceWithdrawalRowMapper();
 
     private final JdbcTemplate jdbcTemplate;
+    private final ObjectMapper objectMapper;
 
-    public RaceRepository(JdbcTemplate jdbcTemplate) {
+    public RaceRepository(JdbcTemplate jdbcTemplate, ObjectMapper objectMapper) {
         this.jdbcTemplate = jdbcTemplate;
+        this.objectMapper = objectMapper;
     }
 
     /** 按ID查询赛事。 */
@@ -62,7 +72,7 @@ public class RaceRepository {
     /** 查询赛事下全部选手，按参赛号字典序排列。 */
     public List<RunnerRow> findRunners(String raceId) {
         return jdbcTemplate.query(
-                "SELECT id, race_id, bib, finish_time_ms, created_at, updated_at "
+                "SELECT id, race_id, bib, finish_time_ms, entry_status, created_at, updated_at "
                         + "FROM runner WHERE race_id = ? ORDER BY bib",
                 RUNNER_ROW_MAPPER, raceId);
     }
@@ -70,7 +80,7 @@ public class RaceRepository {
     /** 按赛事与参赛号查询选手。 */
     public Optional<RunnerRow> findRunner(String raceId, String bib) {
         return jdbcTemplate
-                .query("SELECT id, race_id, bib, finish_time_ms, created_at, updated_at "
+                .query("SELECT id, race_id, bib, finish_time_ms, entry_status, created_at, updated_at "
                                 + "FROM runner WHERE race_id = ? AND bib = ?",
                         RUNNER_ROW_MAPPER, raceId, bib)
                 .stream()
@@ -223,12 +233,20 @@ public class RaceRepository {
                 raceId, now);
     }
 
-    /** 登记选手；finishTimeMs 为 null 表示计时缺失。 */
+    /** 登记选手；finishTimeMs 为 null 表示计时缺失，初始参赛状态 ACTIVE。 */
     public void insertRunner(String raceId, String bib, Long finishTimeMs, long now) {
         jdbcTemplate.update(
-                "INSERT INTO runner (race_id, bib, finish_time_ms, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO runner (race_id, bib, finish_time_ms, entry_status, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, 'ACTIVE', ?, ?)",
                 raceId, bib, finishTimeMs, now, now);
+    }
+
+    /** 选手退赛：仅当前 ACTIVE 的选手可置为 WITHDRAWN；返回受影响行数。 */
+    public int markRunnerWithdrawn(String raceId, String bib, long now) {
+        return jdbcTemplate.update(
+                "UPDATE runner SET entry_status = 'WITHDRAWN', updated_at = ? "
+                        + "WHERE race_id = ? AND bib = ? AND entry_status = 'ACTIVE'",
+                now, raceId, bib);
     }
 
     /** 修订选手原始完赛耗时；返回受影响行数（0 表示选手不存在）。 */
@@ -258,6 +276,155 @@ public class RaceRepository {
         return jdbcTemplate.update(
                 "UPDATE penalty SET revoked = TRUE, revoked_at = ? WHERE penalty_id = ? AND revoked = FALSE",
                 now, penaltyId);
+    }
+
+    /** 新增冲线证据（状态 PENDING）；evidenceId 全局唯一由主键约束保证。 */
+    public void insertEvidence(FinishEvidenceRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO finish_evidence "
+                        + "(evidence_id, race_id, finish_time_ms, captured_at, operator, status, "
+                        + "suggested_order_json, ruling_id, created_at, revoked_at) "
+                        + "VALUES (?, ?, ?, ?, ?, 'PENDING', ?, NULL, ?, NULL)",
+                row.evidenceId(), row.raceId(), row.finishTimeMs(), row.capturedAt(),
+                row.operator(), writeJsonList(row.suggestedOrder()), row.createdAt());
+    }
+
+    /** 按全局证据ID查询证据。 */
+    public Optional<FinishEvidenceRow> findEvidence(String evidenceId) {
+        return jdbcTemplate
+                .query("SELECT evidence_id, race_id, finish_time_ms, captured_at, operator, status, "
+                                + "suggested_order_json, ruling_id, created_at, revoked_at "
+                                + "FROM finish_evidence WHERE evidence_id = ?",
+                        finishEvidenceRowMapper, evidenceId)
+                .stream()
+                .findFirst();
+    }
+
+    /** 行锁方式查询证据，持有到事务结束（撤回/裁决串行化）。 */
+    public Optional<FinishEvidenceRow> findEvidenceForUpdate(String evidenceId) {
+        return jdbcTemplate
+                .query("SELECT evidence_id, race_id, finish_time_ms, captured_at, operator, status, "
+                                + "suggested_order_json, ruling_id, created_at, revoked_at "
+                                + "FROM finish_evidence WHERE evidence_id = ? FOR UPDATE",
+                        finishEvidenceRowMapper, evidenceId)
+                .stream()
+                .findFirst();
+    }
+
+    /** 查询赛事的全部冲线证据（含各状态），按计时组、登记时间与证据ID排列。 */
+    public List<FinishEvidenceRow> findEvidences(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT evidence_id, race_id, finish_time_ms, captured_at, operator, status, "
+                        + "suggested_order_json, ruling_id, created_at, revoked_at "
+                        + "FROM finish_evidence WHERE race_id = ? "
+                        + "ORDER BY finish_time_ms, created_at, evidence_id",
+                finishEvidenceRowMapper, raceId);
+    }
+
+    /** 查询赛事某计时组的全部证据（含各状态），按登记时间与证据ID排列。 */
+    public List<FinishEvidenceRow> findEvidencesByRaceAndTime(String raceId, long finishTimeMs) {
+        return jdbcTemplate.query(
+                "SELECT evidence_id, race_id, finish_time_ms, captured_at, operator, status, "
+                        + "suggested_order_json, ruling_id, created_at, revoked_at "
+                        + "FROM finish_evidence WHERE race_id = ? AND finish_time_ms = ? "
+                        + "ORDER BY created_at, evidence_id",
+                finishEvidenceRowMapper, raceId, finishTimeMs);
+    }
+
+    /** 行锁方式按证据ID批量查询（IN 列表），裁决时一次性锁定本批次全部证据。 */
+    public List<FinishEvidenceRow> findEvidencesByIdsForUpdate(List<String> evidenceIds) {
+        if (evidenceIds.isEmpty()) {
+            return List.of();
+        }
+        String placeholders = String.join(",", java.util.Collections.nCopies(evidenceIds.size(), "?"));
+        return jdbcTemplate.query(
+                "SELECT evidence_id, race_id, finish_time_ms, captured_at, operator, status, "
+                        + "suggested_order_json, ruling_id, created_at, revoked_at "
+                        + "FROM finish_evidence WHERE evidence_id IN (" + placeholders + ") FOR UPDATE",
+                finishEvidenceRowMapper, evidenceIds.toArray());
+    }
+
+    /** 将证据标记为已裁决；仅 PENDING 行生效，返回受影响行数（并发/重复裁决兜底）。 */
+    public int markEvidenceAdjudicated(String evidenceId, String rulingId) {
+        return jdbcTemplate.update(
+                "UPDATE finish_evidence SET status = 'ADJUDICATED', ruling_id = ? "
+                        + "WHERE evidence_id = ? AND status = 'PENDING'",
+                rulingId, evidenceId);
+    }
+
+    /** 将未裁决证据标记为撤回；仅 PENDING 行生效，返回受影响行数。 */
+    public int markEvidenceRevoked(String evidenceId, long now) {
+        return jdbcTemplate.update(
+                "UPDATE finish_evidence SET status = 'REVOKED', revoked_at = ? "
+                        + "WHERE evidence_id = ? AND status = 'PENDING'",
+                now, evidenceId);
+    }
+
+    /** 写入不可变证据裁决快照。 */
+    public void insertRuling(EvidenceRulingRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO evidence_ruling "
+                        + "(ruling_id, race_id, version, finish_time_ms, ordered_bibs_json, "
+                        + "evidence_ids_json, operator, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                row.rulingId(), row.raceId(), row.version(), row.finishTimeMs(),
+                writeJsonList(row.orderedBibs()), writeJsonList(row.evidenceIds()),
+                row.operator(), row.createdAt());
+    }
+
+    /** 按全局裁决批次ID查询裁决快照。 */
+    public Optional<EvidenceRulingRow> findRuling(String rulingId) {
+        return jdbcTemplate
+                .query("SELECT ruling_id, race_id, version, finish_time_ms, ordered_bibs_json, "
+                                + "evidence_ids_json, operator, created_at "
+                                + "FROM evidence_ruling WHERE ruling_id = ?",
+                        evidenceRulingRowMapper, rulingId)
+                .stream()
+                .findFirst();
+    }
+
+    /** 查询赛事全部裁决快照，按裁决时间与批次ID排列（实时排名合并各计时组顺序）。 */
+    public List<EvidenceRulingRow> findRulings(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT ruling_id, race_id, version, finish_time_ms, ordered_bibs_json, "
+                        + "evidence_ids_json, operator, created_at "
+                        + "FROM evidence_ruling WHERE race_id = ? ORDER BY created_at, ruling_id",
+                evidenceRulingRowMapper, raceId);
+    }
+
+    /** 写入未裁决证据撤回留痕；evidenceId 主键保证一条证据至多一条撤回记录。 */
+    public void insertWithdrawal(EvidenceWithdrawalRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO evidence_withdrawal (evidence_id, race_id, operator, created_at) "
+                        + "VALUES (?, ?, ?, ?)",
+                row.evidenceId(), row.raceId(), row.operator(), row.createdAt());
+    }
+
+    /** 按证据ID查询撤回记录。 */
+    public Optional<EvidenceWithdrawalRow> findWithdrawal(String evidenceId) {
+        return jdbcTemplate
+                .query("SELECT evidence_id, race_id, operator, created_at "
+                                + "FROM evidence_withdrawal WHERE evidence_id = ?",
+                        EVIDENCE_WITHDRAWAL_ROW_MAPPER, evidenceId)
+                .stream()
+                .findFirst();
+    }
+
+    private String writeJsonList(List<String> values) {
+        try {
+            return objectMapper.writeValueAsString(values);
+        } catch (com.fasterxml.jackson.core.JsonProcessingException ex) {
+            throw new IllegalStateException("序列化字符串列表失败", ex);
+        }
+    }
+
+    private List<String> readJsonList(String json) {
+        try {
+            return objectMapper.readValue(json, new TypeReference<List<String>>() {
+            });
+        } catch (com.fasterxml.jackson.core.JsonProcessingException ex) {
+            throw new IllegalStateException("解析字符串列表失败: " + json, ex);
+        }
     }
 
     /**
@@ -370,6 +537,9 @@ public class RaceRepository {
 
     /** 测试辅助：清空全部业务数据，按外键依赖顺序删除。 */
     public void deleteAllForTesting() {
+        jdbcTemplate.update("DELETE FROM evidence_withdrawal");
+        jdbcTemplate.update("DELETE FROM evidence_ruling");
+        jdbcTemplate.update("DELETE FROM finish_evidence");
         jdbcTemplate.update("DELETE FROM result_snapshot_checkpoint");
         jdbcTemplate.update("DELETE FROM result_snapshot_entry");
         jdbcTemplate.update("DELETE FROM result_snapshot");
@@ -401,6 +571,7 @@ public class RaceRepository {
                     rs.getString("race_id"),
                     rs.getString("bib"),
                     finishTimeMs,
+                    RunnerStatus.valueOf(rs.getString("entry_status")),
                     rs.getLong("created_at"),
                     rs.getLong("updated_at"));
         }
@@ -487,6 +658,50 @@ public class RaceRepository {
                     rs.getString("request_digest"),
                     rs.getInt("response_status"),
                     rs.getString("response_body"),
+                    rs.getLong("created_at"));
+        }
+    }
+
+    private final class FinishEvidenceRowMapper implements RowMapper<FinishEvidenceRow> {
+        @Override
+        public FinishEvidenceRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new FinishEvidenceRow(
+                    rs.getString("evidence_id"),
+                    rs.getString("race_id"),
+                    rs.getLong("finish_time_ms"),
+                    rs.getLong("captured_at"),
+                    rs.getString("operator"),
+                    EvidenceStatus.valueOf(rs.getString("status")),
+                    readJsonList(rs.getString("suggested_order_json")),
+                    rs.getString("ruling_id"),
+                    rs.getLong("created_at"),
+                    (Long) rs.getObject("revoked_at"));
+        }
+    }
+
+    private final class EvidenceRulingRowMapper implements RowMapper<EvidenceRulingRow> {
+        @Override
+        public EvidenceRulingRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new EvidenceRulingRow(
+                    rs.getString("ruling_id"),
+                    rs.getString("race_id"),
+                    rs.getInt("version"),
+                    rs.getLong("finish_time_ms"),
+                    readJsonList(rs.getString("ordered_bibs_json")),
+                    readJsonList(rs.getString("evidence_ids_json")),
+                    rs.getString("operator"),
+                    rs.getLong("created_at"));
+        }
+    }
+
+    private static final class EvidenceWithdrawalRowMapper
+            implements RowMapper<EvidenceWithdrawalRow> {
+        @Override
+        public EvidenceWithdrawalRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new EvidenceWithdrawalRow(
+                    rs.getString("evidence_id"),
+                    rs.getString("race_id"),
+                    rs.getString("operator"),
                     rs.getLong("created_at"));
         }
     }

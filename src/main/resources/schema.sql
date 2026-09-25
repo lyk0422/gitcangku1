@@ -15,8 +15,9 @@ CREATE TABLE IF NOT EXISTS runner (
     race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
     bib VARCHAR(64) NOT NULL COMMENT '参赛号，同一赛事内唯一',
     finish_time_ms BIGINT COMMENT '原始完赛耗时（毫秒，取值1~86400000）；NULL表示计时缺失，状态UNTIMED',
+    entry_status VARCHAR(16) NOT NULL DEFAULT 'ACTIVE' COMMENT '参赛状态：ACTIVE-有效可被证据引用，WITHDRAWN-已退赛不参与排名',
     created_at BIGINT NOT NULL COMMENT '登记时间，Unix毫秒时间戳',
-    updated_at BIGINT NOT NULL COMMENT '最近一次计时修订时间，Unix毫秒时间戳',
+    updated_at BIGINT NOT NULL COMMENT '最近一次计时修订/退赛时间，Unix毫秒时间戳',
     CONSTRAINT pk_runner PRIMARY KEY (id),
     CONSTRAINT uk_runner_race_bib UNIQUE (race_id, bib),
     CONSTRAINT fk_runner_race FOREIGN KEY (race_id) REFERENCES race (race_id)
@@ -97,10 +98,49 @@ CREATE TABLE IF NOT EXISTS result_snapshot_checkpoint (
 
 CREATE TABLE IF NOT EXISTS idempotency_record (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求ID（写操作幂等键）',
-    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE',
+    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/WITHDRAW_RUNNER/REGISTER_EVIDENCE/ADJUDICATE_EVIDENCE/REVOKE_EVIDENCE/SEAL_RACE',
     request_digest CHAR(64) NOT NULL COMMENT '请求参数（requestId除外，含expectedVersion）规范化JSON的SHA-256摘要',
     response_status INT NOT NULL COMMENT '原成功请求的HTTP状态码，重放时原样返回',
     response_body TEXT COMMENT '原成功响应体JSON，重放时原样返回',
     created_at BIGINT NOT NULL COMMENT '首次成功提交时间，Unix毫秒时间戳',
     CONSTRAINT pk_idempotency_record PRIMARY KEY (request_id)
+);
+
+CREATE TABLE IF NOT EXISTS finish_evidence (
+    evidence_id VARCHAR(128) NOT NULL COMMENT '冲线证据ID，全局唯一且不可重复',
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    finish_time_ms BIGINT NOT NULL COMMENT '证据对应的相同计时（毫秒），即该冲线计时组的原始完赛耗时',
+    captured_at BIGINT NOT NULL COMMENT '证据捕获UTC时刻，Unix毫秒时间戳，登记时由服务端时钟写入',
+    operator VARCHAR(128) NOT NULL COMMENT '登记操作者标识',
+    status VARCHAR(16) NOT NULL COMMENT '证据状态：PENDING-已登记未裁决，ADJUDICATED-已裁决，REVOKED-未裁决证据已撤回',
+    suggested_order_json TEXT NOT NULL COMMENT '建议顺序（参赛号数组）规范化JSON；候选不得遗漏或重复，裁决校验以此为准',
+    ruling_id VARCHAR(128) COMMENT '裁决批次ID；未裁决为NULL，裁决后写入，不可再改写',
+    created_at BIGINT NOT NULL COMMENT '登记时间，Unix毫秒时间戳',
+    revoked_at BIGINT COMMENT '撤回时间，Unix毫秒时间戳；未撤回为NULL',
+    CONSTRAINT pk_finish_evidence PRIMARY KEY (evidence_id),
+    CONSTRAINT fk_evidence_race FOREIGN KEY (race_id) REFERENCES race (race_id),
+    INDEX idx_evidence_race (race_id, finish_time_ms, status)
+);
+
+CREATE TABLE IF NOT EXISTS evidence_ruling (
+    ruling_id VARCHAR(128) NOT NULL COMMENT '证据裁决批次ID，全局唯一',
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    version INT NOT NULL COMMENT '裁决后的赛事版本号（裁决使版本加一），快照随之不可变',
+    finish_time_ms BIGINT NOT NULL COMMENT '本批次裁决的计时组（毫秒）',
+    ordered_bibs_json TEXT NOT NULL COMMENT '裁决名次顺序（参赛号数组，索引0为该计时组第1名）规范化JSON，写入后不可变',
+    evidence_ids_json TEXT NOT NULL COMMENT '本批次裁决的全部证据ID数组规范化JSON，写入后不可变',
+    operator VARCHAR(128) NOT NULL COMMENT '裁决操作者标识',
+    created_at BIGINT NOT NULL COMMENT '裁决时间，Unix毫秒时间戳',
+    CONSTRAINT pk_evidence_ruling PRIMARY KEY (ruling_id),
+    CONSTRAINT fk_ruling_race FOREIGN KEY (race_id) REFERENCES race (race_id),
+    INDEX idx_ruling_race_time (race_id, finish_time_ms)
+);
+
+CREATE TABLE IF NOT EXISTS evidence_withdrawal (
+    evidence_id VARCHAR(128) NOT NULL COMMENT '被撤回的证据ID，全局唯一（一条证据至多一条撤回记录）',
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    operator VARCHAR(128) NOT NULL COMMENT '撤回操作者标识',
+    created_at BIGINT NOT NULL COMMENT '撤回时间，Unix毫秒时间戳',
+    CONSTRAINT pk_evidence_withdrawal PRIMARY KEY (evidence_id),
+    CONSTRAINT fk_withdrawal_race FOREIGN KEY (race_id) REFERENCES race (race_id)
 );

@@ -1,27 +1,38 @@
 package com.example.starter.race.service;
 
 import com.example.starter.race.api.AddPenaltyRequest;
+import com.example.starter.race.api.AdjudicateEvidenceRequest;
 import com.example.starter.race.api.CheckpointResponse;
 import com.example.starter.race.api.CheckpointsConfigResponse;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
 import com.example.starter.race.api.CreateRaceRequest;
+import com.example.starter.race.api.EvidenceRulingResponse;
+import com.example.starter.race.api.FinishEvidenceResponse;
 import com.example.starter.race.api.MissingCheckpointsResponse;
 import com.example.starter.race.api.RaceResponse;
+import com.example.starter.race.api.RegisterEvidenceRequest;
 import com.example.starter.race.api.RegisterRunnerRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
+import com.example.starter.race.api.RevokeEvidenceRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
 import com.example.starter.race.api.RunnerMissingCheckpointsResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.api.SubmitTimingRequest;
+import com.example.starter.race.api.WithdrawRunnerRequest;
 import com.example.starter.race.domain.CheckpointRules;
+import com.example.starter.race.domain.EvidenceStatus;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
+import com.example.starter.race.domain.RunnerStatus;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
+import com.example.starter.race.persistence.EvidenceRulingRow;
+import com.example.starter.race.persistence.EvidenceWithdrawalRow;
+import com.example.starter.race.persistence.FinishEvidenceRow;
 import com.example.starter.race.persistence.IdempotencyRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
@@ -359,8 +370,16 @@ public class RaceServiceImpl implements RaceService {
                     List<PenaltyRow> penalties = repository.findPenalties(raceId);
                     List<CheckpointRow> checkpoints = repository.findCheckpoints(raceId);
                     List<CheckpointTimingRow> timings = repository.findAllTimings(raceId);
-                    List<ResultEntry> entries =
-                            ResultCalculator.compute(runners, penalties, checkpoints, timings);
+                    // 封榜固化已裁决冲线顺序：证据快照本身不可变，封榜快照同步反映裁决名次。
+                    java.util.Map<String, Integer> evidenceOrder = new java.util.HashMap<>();
+                    for (var ruling : repository.findRulings(raceId)) {
+                        List<String> orderedBibs = ruling.orderedBibs();
+                        for (int index = 0; index < orderedBibs.size(); index++) {
+                            evidenceOrder.put(orderedBibs.get(index), index);
+                        }
+                    }
+                    List<ResultEntry> entries = ResultCalculator.compute(
+                            runners, penalties, checkpoints, timings, evidenceOrder);
 
                     int newVersion = request.expectedVersion() + 1;
                     int updated = repository.sealIfOpenAtVersion(
@@ -397,6 +416,330 @@ public class RaceServiceImpl implements RaceService {
     }
 
     @Override
+    @Transactional
+    public ServiceResult withdrawRunner(String raceId, String bib, WithdrawRunnerRequest request) {
+        return withIdempotency(request.requestId(), "WITHDRAW_RUNNER",
+                orderedParams(
+                        "raceId", raceId,
+                        "bib", bib,
+                        "operator", request.operator(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    RunnerRow runner = requireRunner(raceId, bib);
+                    if (runner.entryStatus() == RunnerStatus.WITHDRAWN) {
+                        throw new ConflictException("选手已退赛: " + bib);
+                    }
+                    long now = clock.millis();
+                    bumpVersion(race, request.expectedVersion());
+                    int updated = repository.markRunnerWithdrawn(raceId, bib, now);
+                    if (updated == 0) {
+                        // 行锁释放后并发退赛兜底：此时赛事行锁仍在，实际不会发生，防御性报错。
+                        throw new ConflictException("选手已退赛: " + bib);
+                    }
+                    RunnerRow refreshed = repository.findRunner(raceId, bib).orElseThrow();
+                    return ServiceResult.ok(ResponseMapper.toRunnerResponse(refreshed));
+                });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult registerEvidence(String raceId, RegisterEvidenceRequest request) {
+        List<String> suggestedOrder = List.copyOf(request.suggestedOrder());
+        return withIdempotency(request.requestId(), "REGISTER_EVIDENCE",
+                orderedParams(
+                        "raceId", raceId,
+                        "evidenceId", request.evidenceId(),
+                        "finishTimeMs", request.finishTimeMs(),
+                        "capturedAt", request.capturedAt(),
+                        "operator", request.operator(),
+                        "expectedVersion", request.expectedVersion(),
+                        "suggestedOrder", suggestedOrder),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    validateFinishTime(request.finishTimeMs(), false);
+                    List<RunnerRow> runners = repository.findRunners(raceId);
+                    validateCandidatesForTimingGroup(
+                            runners, request.finishTimeMs(), suggestedOrder);
+                    bumpVersion(race, request.expectedVersion());
+                    long now = clock.millis();
+                    FinishEvidenceRow row = new FinishEvidenceRow(
+                            request.evidenceId(), raceId, request.finishTimeMs(),
+                            request.capturedAt(), request.operator(),
+                            EvidenceStatus.PENDING, suggestedOrder, null, now, null);
+                    try {
+                        repository.insertEvidence(row);
+                    } catch (DuplicateKeyException ex) {
+                        throw new ConflictException("证据ID已存在: " + request.evidenceId());
+                    }
+                    FinishEvidenceRow saved =
+                            repository.findEvidence(request.evidenceId()).orElseThrow();
+                    return ServiceResult.created(ResponseMapper.toEvidenceResponse(saved));
+                });
+    }
+
+    /**
+     * 校验证据建议顺序：候选列表不得重复，且必须恰好覆盖该计时组
+     * （原始完赛耗时相等）的全部有效选手，不得遗漏或夹带其他选手。
+     * 任一不满足返回422，原因可区分。
+     */
+    private static void validateCandidatesForTimingGroup(
+            List<RunnerRow> runners, long finishTimeMs, List<String> suggestedOrder) {        java.util.LinkedHashSet<String> distinct = new java.util.LinkedHashSet<>(suggestedOrder);
+        if (distinct.size() != suggestedOrder.size()) {
+            throw new UnprocessableEntityException("建议顺序存在重复候选人");
+        }
+        java.util.TreeSet<String> expected = new java.util.TreeSet<>();
+        java.util.Map<String, RunnerRow> byBib = new java.util.HashMap<>();
+        for (RunnerRow runner : runners) {
+            byBib.put(runner.bib(), runner);
+            // 退赛者已不属于计时组候选人：登记时直接排除，不要求建议顺序覆盖。
+            if (runner.entryStatus() == RunnerStatus.ACTIVE
+                    && runner.finishTimeMs() != null
+                    && runner.finishTimeMs() == finishTimeMs) {
+                expected.add(runner.bib());
+            }
+        }
+        for (String bib : suggestedOrder) {
+            RunnerRow runner = byBib.get(bib);
+            if (runner == null) {
+                throw new UnprocessableEntityException("候选人不是赛事选手: " + bib);
+            }
+            if (runner.entryStatus() == RunnerStatus.WITHDRAWN) {
+                throw new UnprocessableEntityException("候选人已退赛: " + bib);
+            }
+            if (runner.finishTimeMs() == null || runner.finishTimeMs() != finishTimeMs) {
+                throw new UnprocessableEntityException(
+                        "候选人不属于该计时组（原始完赛耗时不一致）: " + bib);
+            }
+        }
+        if (expected.isEmpty()) {
+            throw new UnprocessableEntityException("该计时组不存在有效候选人");
+        }
+        if (!distinct.equals(expected)) {
+            java.util.TreeSet<String> missing = new java.util.TreeSet<>(expected);
+            missing.removeAll(distinct);
+            if (!missing.isEmpty()) {
+                throw new UnprocessableEntityException("建议顺序遗漏候选人: " + missing);
+            }
+            throw new UnprocessableEntityException("建议顺序夹带非该计时组候选人");
+        }
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult adjudicateEvidence(String raceId, AdjudicateEvidenceRequest request) {
+        List<String> evidenceIds = request.evidenceIds().stream().sorted().toList();
+        List<String> orderedBibs = List.copyOf(request.orderedBibs());
+        return withIdempotency(request.requestId(), "ADJUDICATE_EVIDENCE",
+                orderedParams(
+                        "raceId", raceId,
+                        "rulingId", request.rulingId(),
+                        "finishTimeMs", request.finishTimeMs(),
+                        "operator", request.operator(),
+                        "expectedVersion", request.expectedVersion(),
+                        "evidenceIds", evidenceIds,
+                        "orderedBibs", orderedBibs),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    validateFinishTime(request.finishTimeMs(), false);
+                    if (request.evidenceIds().stream().distinct().count()
+                            != request.evidenceIds().size()) {
+                        throw new UnprocessableEntityException("裁决证据列表存在重复证据ID");
+                    }
+                    if (orderedBibs.stream().distinct().count() != orderedBibs.size()) {
+                        throw new UnprocessableEntityException("裁决名次顺序存在重复候选人");
+                    }
+                    // 一次性锁定本批次全部证据行（竞态下与撤回/并发裁决串行化）。
+                    List<FinishEvidenceRow> locked =
+                            repository.findEvidencesByIdsForUpdate(request.evidenceIds());
+                    if (locked.size() != request.evidenceIds().size()) {
+                        java.util.TreeSet<String> found = locked.stream()
+                                .map(FinishEvidenceRow::evidenceId)
+                                .collect(java.util.stream.Collectors.toCollection(
+                                        java.util.TreeSet::new));
+                        java.util.TreeSet<String> missing = new java.util.TreeSet<>(request.evidenceIds());
+                        missing.removeAll(found);
+                        throw new UnprocessableEntityException("证据不存在: " + missing);
+                    }
+                    for (FinishEvidenceRow evidence : locked) {
+                        if (!evidence.raceId().equals(raceId)) {
+                            throw new UnprocessableEntityException(
+                                    "证据不属于该赛事: " + evidence.evidenceId());
+                        }
+                        if (evidence.finishTimeMs() != request.finishTimeMs()) {
+                            throw new UnprocessableEntityException(
+                                    "证据计时与裁决计时不一致: " + evidence.evidenceId());
+                        }
+                        if (evidence.status() != EvidenceStatus.PENDING) {
+                            throw new UnprocessableEntityException(
+                                    "证据不是待裁决状态: " + evidence.evidenceId()
+                                            + " (" + evidence.status() + ")");
+                        }
+                    }
+
+                    List<RunnerRow> runners = repository.findRunners(raceId);
+                    long finishTimeMs = request.finishTimeMs();
+                    java.util.Map<String, RunnerRow> runnerByBib = new java.util.HashMap<>();
+                    java.util.TreeSet<String> activeAtTime = new java.util.TreeSet<>();
+                    for (RunnerRow runner : runners) {
+                        runnerByBib.put(runner.bib(), runner);
+                        if (runner.entryStatus() == RunnerStatus.ACTIVE
+                                && runner.finishTimeMs() != null
+                                && runner.finishTimeMs() == finishTimeMs) {
+                            activeAtTime.add(runner.bib());
+                        }
+                    }
+                    // 全部证据建议顺序的并集即本批次候选人。
+                    java.util.TreeSet<String> candidates = new java.util.TreeSet<>();
+                    for (FinishEvidenceRow evidence : locked) {
+                        for (String bib : evidence.suggestedOrder()) {
+                            RunnerRow runner = runnerByBib.get(bib);
+                            if (runner == null) {
+                                throw new UnprocessableEntityException(
+                                        "证据候选人不是赛事选手: " + bib);
+                            }
+                            if (runner.entryStatus() == RunnerStatus.WITHDRAWN) {
+                                throw new UnprocessableEntityException(
+                                        "证据候选人已退赛（候选人失效）: " + bib);
+                            }
+                            if (runner.finishTimeMs() == null
+                                    || runner.finishTimeMs() != finishTimeMs) {
+                                throw new UnprocessableEntityException(
+                                        "证据候选人已不属于该计时组: " + bib);
+                            }
+                            candidates.add(bib);
+                        }
+                    }
+                    if (candidates.isEmpty()) {
+                        throw new UnprocessableEntityException("裁决证据未包含任何候选人");
+                    }
+                    if (!new java.util.TreeSet<>(orderedBibs).equals(candidates)) {
+                        java.util.TreeSet<String> missing = new java.util.TreeSet<>(candidates);
+                        missing.removeAll(orderedBibs);
+                        if (!missing.isEmpty()) {
+                            throw new UnprocessableEntityException("裁决名次遗漏候选人: " + missing);
+                        }
+                        throw new UnprocessableEntityException("裁决名次夹带非候选人");
+                    }
+                    // 候选人必须恰好覆盖当前整个有效计时组，否则未裁决成员与裁决成员并列，
+                    // 裁决后名次必然重复。
+                    if (!candidates.equals(activeAtTime)) {
+                        java.util.TreeSet<String> uncovered = new java.util.TreeSet<>(activeAtTime);
+                        uncovered.removeAll(candidates);
+                        throw new UnprocessableEntityException(
+                                "裁决后名次存在重复：计时组尚有未经裁决的有效候选人 " + uncovered);
+                    }
+                    if (repository.findRuling(request.rulingId()).isPresent()) {
+                        throw new ConflictException("裁决批次ID已存在: " + request.rulingId());
+                    }
+
+                    int newVersion = request.expectedVersion() + 1;
+                    bumpVersion(race, request.expectedVersion());
+                    long now = clock.millis();
+                    repository.insertRuling(new EvidenceRulingRow(
+                            request.rulingId(), raceId, newVersion, request.finishTimeMs(),
+                            orderedBibs, request.evidenceIds().stream().sorted().toList(),
+                            request.operator(), now));
+                    for (String evidenceId : request.evidenceIds()) {
+                        int updated = repository.markEvidenceAdjudicated(
+                                evidenceId, request.rulingId());
+                        if (updated == 0) {
+                            // 行锁已持有，理论上不会发生；防御性失败以触发整体回滚。
+                            throw new ConflictException(
+                                    "证据并发状态变化，裁决失败: " + evidenceId);
+                        }
+                    }
+                    EvidenceRulingRow saved =
+                            repository.findRuling(request.rulingId()).orElseThrow();
+                    return ServiceResult.created(ResponseMapper.toRulingResponse(saved));
+                });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult revokeEvidence(
+            String raceId, String evidenceId, RevokeEvidenceRequest request) {
+        return withIdempotency(request.requestId(), "REVOKE_EVIDENCE",
+                orderedParams(
+                        "raceId", raceId,
+                        "evidenceId", evidenceId,
+                        "operator", request.operator(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    FinishEvidenceRow evidence = repository.findEvidenceForUpdate(evidenceId)
+                            .orElseThrow(() -> new NotFoundException("证据不存在: " + evidenceId));
+                    if (!evidence.raceId().equals(raceId)) {
+                        throw new NotFoundException("证据不属于该赛事: " + evidenceId);
+                    }
+                    if (evidence.status() == EvidenceStatus.ADJUDICATED) {
+                        throw new ConflictException("已裁决证据不可撤回: " + evidenceId);
+                    }
+                    if (evidence.status() == EvidenceStatus.REVOKED) {
+                        throw new ConflictException("证据已撤回: " + evidenceId);
+                    }
+                    bumpVersion(race, request.expectedVersion());
+                    long now = clock.millis();
+                    int updated = repository.markEvidenceRevoked(evidenceId, now);
+                    if (updated == 0) {
+                        // 行锁持有下理论不会发生；防御性冲突。
+                        throw new ConflictException("证据状态已变化，撤回失败: " + evidenceId);
+                    }
+                    repository.insertWithdrawal(new EvidenceWithdrawalRow(
+                            evidenceId, raceId, request.operator(), now));
+                    FinishEvidenceRow refreshed =
+                            repository.findEvidence(evidenceId).orElseThrow();
+                    return ServiceResult.ok(ResponseMapper.toEvidenceResponse(refreshed));
+                });
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<FinishEvidenceResponse> getEvidences(String raceId) {
+        repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        return repository.findEvidences(raceId).stream()
+                .map(ResponseMapper::toEvidenceResponse)
+                .toList();
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public FinishEvidenceResponse getEvidence(String raceId, String evidenceId) {
+        repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        FinishEvidenceRow evidence = repository.findEvidence(evidenceId)
+                .orElseThrow(() -> new NotFoundException("证据不存在: " + evidenceId));
+        if (!evidence.raceId().equals(raceId)) {
+            throw new NotFoundException("证据不属于该赛事: " + evidenceId);
+        }
+        return ResponseMapper.toEvidenceResponse(evidence);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<EvidenceRulingResponse> getRulings(String raceId) {
+        repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        return repository.findRulings(raceId).stream()
+                .map(ResponseMapper::toRulingResponse)
+                .toList();
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public EvidenceRulingResponse getRuling(String raceId, String rulingId) {
+        repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        EvidenceRulingRow ruling = repository.findRuling(rulingId)
+                .orElseThrow(() -> new NotFoundException("裁决快照不存在: " + rulingId));
+        if (!ruling.raceId().equals(raceId)) {
+            throw new NotFoundException("裁决快照不属于该赛事: " + rulingId);
+        }
+        return ResponseMapper.toRulingResponse(ruling);
+    }
+
+    @Override
     @Transactional(readOnly = true)
     public StandingResponse getResults(String raceId) {
         RaceRow race = repository.findRace(raceId)
@@ -407,12 +750,26 @@ public class RaceServiceImpl implements RaceService {
                             "赛事已封榜但缺少快照: " + raceId));
             return ResponseMapper.snapshotStanding(snapshot);
         }
+        return liveStanding(race);
+    }
+
+    private StandingResponse liveStanding(RaceRow race) {
+        // 实时排名合并全部已裁决计时组的组内顺序；处罚导致总耗时变化时顺序可能不再相邻，
+        // ResultCalculator 仅在同总耗时组全体持有裁决顺序时赋予不并列名次，否则回退并列规则。
+        java.util.Map<String, Integer> evidenceOrder = new java.util.HashMap<>();
+        for (var ruling : repository.findRulings(race.raceId())) {
+            List<String> orderedBibs = ruling.orderedBibs();
+            for (int index = 0; index < orderedBibs.size(); index++) {
+                evidenceOrder.put(orderedBibs.get(index), index);
+            }
+        }
         return ResponseMapper.liveStanding(
                 race,
-                repository.findRunners(raceId),
-                repository.findPenalties(raceId),
-                repository.findCheckpoints(raceId),
-                repository.findAllTimings(raceId));
+                repository.findRunners(race.raceId()),
+                repository.findPenalties(race.raceId()),
+                repository.findCheckpoints(race.raceId()),
+                repository.findAllTimings(race.raceId()),
+                evidenceOrder);
     }
 
     @Override

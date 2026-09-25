@@ -29,7 +29,7 @@ public final class ResultCalculator {
     private ResultCalculator() {
     }
 
-    /** 未配置检查点的赛事使用的兼容入口：无检查点、无分段记录。 */
+    /** 未配置检查点的赛事使用的兼容入口：无检查点、无分段记录、无证据裁决顺序。 */
     public static List<ResultEntry> compute(
             List<? extends RunnerView> runnerView,
             List<? extends PenaltyView> penalties) {
@@ -37,19 +37,33 @@ public final class ResultCalculator {
     }
 
     /**
-     * 计算即时成绩。
-     *
-     * @param runnerView  全部选手视图（参赛号、原始完赛耗时）
-     * @param penalties   全部处罚（含已撤销）
-     * @param checkpoints 赛事检查点配置（按 position 排序后使用）；为空表示赛事未配置检查点
-     * @param timings     全部选手的分段通过记录
-     * @return 按展示顺序排列的成绩条目
+     * 计算即时成绩（无冲线证据裁决顺序，并列回退为参赛号字典序）。
      */
     public static List<ResultEntry> compute(
             List<? extends RunnerView> runnerView,
             List<? extends PenaltyView> penalties,
             List<? extends CheckpointView> checkpoints,
             List<? extends TimingView> timings) {
+        return compute(runnerView, penalties, checkpoints, timings, Map.of());
+    }
+
+    /**
+     * 计算即时成绩。
+     *
+     * @param runnerView        全部选手视图（参赛号、原始完赛耗时、参赛状态）
+     * @param penalties         全部处罚（含已撤销）
+     * @param checkpoints       赛事检查点配置（按 position 排序后使用）；为空表示赛事未配置检查点
+     * @param timings           全部选手的分段通过记录
+     * @param evidenceOrderByBib 已裁决冲线证据给出的组内顺序：bib -&gt; 名次位置（从0开始）；
+     *                          仅作用于总耗时相同的并列选手，均无裁决顺序时回退参赛号字典序
+     * @return 按展示顺序排列的成绩条目
+     */
+    public static List<ResultEntry> compute(
+            List<? extends RunnerView> runnerView,
+            List<? extends PenaltyView> penalties,
+            List<? extends CheckpointView> checkpoints,
+            List<? extends TimingView> timings,
+            Map<String, Integer> evidenceOrderByBib) {
         List<CheckpointView> orderedCheckpoints = new ArrayList<>(checkpoints);
         orderedCheckpoints.sort(Comparator.comparingInt(CheckpointView::position)
                 .thenComparing(CheckpointView::checkpointCode));
@@ -58,7 +72,8 @@ public final class ResultCalculator {
         Map<String, Aggregate> aggregates = new LinkedHashMap<>();
         for (RunnerView runner : runnerView) {
             aggregates.put(runner.bib(),
-                    new Aggregate(runner.bib(), runner.finishTimeMs(), orderedCheckpoints));
+                    new Aggregate(runner.bib(), runner.finishTimeMs(),
+                            runner.entryStatus(), orderedCheckpoints));
         }
 
         // 仅统计属于已配置检查点的分段（数据库外键已保证，这里做防御性过滤）。
@@ -89,7 +104,11 @@ public final class ResultCalculator {
         List<Aggregate> ranked = new ArrayList<>();
         List<Aggregate> others = new ArrayList<>();
         for (Aggregate aggregate : aggregates.values()) {
-            if (aggregate.disqualified) {
+            if (aggregate.entryStatus == RunnerStatus.WITHDRAWN) {
+                // 退赛选手一律不排名；处罚与证据快照都不再影响其榜单状态。
+                aggregate.status = EntryStatus.WITHDRAWN;
+                others.add(aggregate);
+            } else if (aggregate.disqualified) {
                 aggregate.status = EntryStatus.DISQUALIFIED;
                 others.add(aggregate);
             } else if (aggregate.finishTimeMs == null) {
@@ -105,11 +124,13 @@ public final class ResultCalculator {
             }
         }
 
-        ranked.sort(Comparator
-                .comparingLong((Aggregate a) -> a.totalTimeMs)
-                .thenComparing(a -> a.bib));
+        ranked.sort(Comparator.comparingLong((Aggregate a) -> a.totalTimeMs));
         others.sort(Comparator.comparing(a -> a.bib));
 
+        // 在每个同总耗时组内决定顺序与名次：
+        // 组内全体都持有已裁决冲线顺序时，按证据位置排列并赋予互不相同名次（1、2、3…）；
+        // 否则回退参赛号字典序与并列同名次并跳号（1、1、3）。
+        List<Aggregate> reordered = new ArrayList<>(ranked.size());
         int index = 0;
         while (index < ranked.size()) {
             int groupEnd = index + 1;
@@ -117,12 +138,32 @@ public final class ResultCalculator {
                     && ranked.get(groupEnd).totalTimeMs == ranked.get(index).totalTimeMs) {
                 groupEnd++;
             }
-            int rank = index + 1;
-            for (int groupIndex = index; groupIndex < groupEnd; groupIndex++) {
-                ranked.get(groupIndex).rank = rank;
+            List<Aggregate> group = new ArrayList<>(ranked.subList(index, groupEnd));
+            boolean fullyAdjudicated = true;
+            for (Aggregate member : group) {
+                if (!evidenceOrderByBib.containsKey(member.bib)) {
+                    fullyAdjudicated = false;
+                    break;
+                }
             }
+            if (fullyAdjudicated) {
+                group.sort(Comparator.comparingInt(
+                        (Aggregate a) -> evidenceOrderByBib.get(a.bib))
+                        .thenComparing(a -> a.bib));
+                for (int offset = 0; offset < group.size(); offset++) {
+                    group.get(offset).rank = index + offset + 1;
+                }
+            } else {
+                group.sort(Comparator.comparing(a -> a.bib));
+                int rank = index + 1;
+                for (Aggregate member : group) {
+                    member.rank = rank;
+                }
+            }
+            reordered.addAll(group);
             index = groupEnd;
         }
+        ranked = reordered;
 
         List<ResultEntry> entries = new ArrayList<>(aggregates.size());
         for (Aggregate aggregate : ranked) {
@@ -134,11 +175,16 @@ public final class ResultCalculator {
         return entries;
     }
 
-    /** 选手视图：参赛号与原始完赛耗时（null 表示计时缺失）。 */
+    /** 选手视图：参赛号、原始完赛耗时（null 表示计时缺失）与参赛状态。 */
     public interface RunnerView {
         String bib();
 
         Long finishTimeMs();
+
+        /** 参赛状态；默认 ACTIVE，仅退赛选手需要覆盖为 WITHDRAWN。 */
+        default RunnerStatus entryStatus() {
+            return RunnerStatus.ACTIVE;
+        }
     }
 
     /** 处罚视图。 */
@@ -156,6 +202,7 @@ public final class ResultCalculator {
     private static final class Aggregate {
         private final String bib;
         private final Long finishTimeMs;
+        private final RunnerStatus entryStatus;
         private final List<CheckpointView> checkpoints;
         private final Set<String> coveredCodes = new HashSet<>();
         private long penaltyMs;
@@ -165,8 +212,17 @@ public final class ResultCalculator {
         private long totalTimeMs;
 
         private Aggregate(String bib, Long finishTimeMs, List<CheckpointView> checkpoints) {
+            this(bib, finishTimeMs, RunnerStatus.ACTIVE, checkpoints);
+        }
+
+        private Aggregate(
+                String bib,
+                Long finishTimeMs,
+                RunnerStatus entryStatus,
+                List<CheckpointView> checkpoints) {
             this.bib = bib;
             this.finishTimeMs = finishTimeMs;
+            this.entryStatus = entryStatus;
             this.checkpoints = checkpoints;
         }
 
