@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS incidents (
     status VARCHAR(16) NOT NULL,
     commander VARCHAR(128) NULL,
     deadline_at TIMESTAMP(6) NULL,
+    blocked_from_status VARCHAR(16) NULL,
     created_at TIMESTAMP(6) NOT NULL,
     updated_at TIMESTAMP(6) NOT NULL,
     CONSTRAINT uk_incidents_key UNIQUE (incident_key)
@@ -77,6 +78,7 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     task_key VARCHAR(128) NOT NULL,
     group_code VARCHAR(64) NOT NULL,
     title VARCHAR(512) NOT NULL,
+    priority VARCHAR(8) NOT NULL DEFAULT 'NORMAL',
     status VARCHAR(16) NOT NULL,
     created_by VARCHAR(128) NOT NULL,
     done_by VARCHAR(128) NULL,
@@ -98,4 +100,36 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS incident_agency_configs (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    version INT NOT NULL,
+    agency_codes CLOB NOT NULL,
+    created_by VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_agency_config_incident_version UNIQUE (incident_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS incident_agency_acks (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    config_version INT NOT NULL,
+    agency_code VARCHAR(128) NOT NULL,
+    ack_type VARCHAR(8) NOT NULL,
+    reason VARCHAR(1024) NULL,
+    submitted_by VARCHAR(128) NOT NULL,
+    submitted_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_agency_ack UNIQUE (incident_id, config_version, agency_code)
+);
+
+CREATE TABLE IF NOT EXISTS agency_ack_keys (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    ack_key VARCHAR(128) NOT NULL,
+    request_hash VARCHAR(64) NOT NULL,
+    response_status INT NULL,
+    response_body CLOB NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_agency_ack_key UNIQUE (ack_key)
 );

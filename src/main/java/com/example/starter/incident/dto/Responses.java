@@ -63,12 +63,15 @@ public final class Responses {
     }
 
     /**
-     * 处置任务视图：blockers 按阻塞事件键排序；doneBy/doneAt 仅 DONE 有值，
-     * cancelledBy/cancelledAt 仅 CANCELLED 有值。
+     * 处置任务视图：blockers 按阻塞事件键排序；priority 为 HIGH/NORMAL；
+     * gateReason 为当前 HIGH 任务完成门禁的未确认机构列表（无门禁或非 HIGH 时为 null）；
+     * doneBy/doneAt 仅 DONE 有值，cancelledBy/cancelledAt 仅 CANCELLED 有值。
      */
-    public record TaskView(String taskKey, String groupCode, String title, String status,
-                           List<TaskBlockerView> blockers, String createdBy, Instant createdAt,
-                           String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt) {
+    public record TaskView(String taskKey, String groupCode, String title, String priority,
+                           String status, List<TaskBlockerView> blockers, String createdBy,
+                           Instant createdAt, String doneBy, Instant doneAt,
+                           String cancelledBy, Instant cancelledAt,
+                           List<String> gateReason) {
     }
 
     /** 按事件分组的任务列表视图：tasks 按创建顺序返回。 */
@@ -77,5 +80,29 @@ public final class Responses {
 
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
+    }
+
+    /**
+     * 机构配置版本视图：version 从 1 起递增；agencyCodes 去重排序，空集合合法；
+     * current 表示是否为当前生效版本。
+     */
+    public record AgencyConfigVersionView(int version, List<String> agencyCodes, boolean current,
+                                          String createdBy, Instant createdAt) {
+    }
+
+    /**
+     * 机构回执视图：configVersion 为回执归属的配置版本；reason 仅 REJECT 有值。
+     */
+    public record AgencyAckView(int configVersion, String agencyCode, String ackType,
+                                String reason, String submittedBy, Instant submittedAt) {
+    }
+
+    /**
+     * 机构配置与回执总览：currentVersion 为当前配置版本（未配置为 0），
+     * configs 为全部版本（含历史），acks 为全部历史回执（跨版本，不可改写）。
+     */
+    public record AgencyGateView(String incidentKey, int currentVersion,
+                                 List<AgencyConfigVersionView> configs,
+                                 List<AgencyAckView> acks) {
     }
 }

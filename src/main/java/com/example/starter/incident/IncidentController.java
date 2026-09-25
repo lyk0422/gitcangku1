@@ -1,6 +1,8 @@
 package com.example.starter.incident;
 
 import com.example.starter.incident.dto.Requests.ActionRequest;
+import com.example.starter.incident.dto.Requests.AgencyAckRequest;
+import com.example.starter.incident.dto.Requests.AgencyConfigRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
 import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
@@ -11,6 +13,8 @@ import com.example.starter.incident.dto.Requests.TaskCreateRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
+import com.example.starter.incident.dto.Responses.AgencyAckView;
+import com.example.starter.incident.dto.Responses.AgencyGateView;
 import com.example.starter.incident.dto.Responses.EscalationHistoryView;
 import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
@@ -187,5 +191,35 @@ public class IncidentController {
                                @RequestHeader("X-Actor-Id") String actor,
                                @RequestBody TaskActionRequest req) {
         return service.cancelTask(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 修改必需外部机构配置（仅当前指挥人；携带 expectedVersion 乐观并发，
+     * 代码去重排序，空集合合法，至多 5 个；CLOSED 事件返回 409）。
+     */
+    @PostMapping("/{incidentKey}/agency-config")
+    public AgencyGateView configureAgencies(@PathVariable String incidentKey,
+                                            @RequestHeader("X-Actor-Id") String actor,
+                                            @RequestBody AgencyConfigRequest req) {
+        return service.configureAgencies(incidentKey, actor, req);
+    }
+
+    /**
+     * 提交机构终态回执（ackKey 幂等；同一机构每个配置版本仅一条；
+     * REJECT 必须携带非空 reason，任一必需机构拒绝使事件进入 EXTERNAL_BLOCKED）。
+     */
+    @PostMapping("/{incidentKey}/agency-acks")
+    public AgencyAckView submitAgencyAck(@PathVariable String incidentKey,
+                                         @RequestHeader("X-Actor-Id") String actor,
+                                         @RequestBody AgencyAckRequest req) {
+        return service.submitAgencyAck(incidentKey, actor, req);
+    }
+
+    /**
+     * 查询机构配置版本与全部历史回执（只读）。
+     */
+    @GetMapping("/{incidentKey}/agency-gate")
+    public AgencyGateView agencyGate(@PathVariable String incidentKey) {
+        return service.agencyGate(incidentKey);
     }
 }

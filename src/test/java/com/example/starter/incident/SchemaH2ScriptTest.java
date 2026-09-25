@@ -108,6 +108,65 @@ class SchemaH2ScriptTest {
                     duplicateBlockerRejected = true;
                 }
                 assertThat(duplicateBlockerRejected).isTrue();
+
+                // 机构配置：(incident_id, version) 唯一
+                st.execute("INSERT INTO incident_agency_configs (incident_id, version,"
+                        + " agency_codes, created_by, created_at) VALUES (1,1,'[\"A\",\"B\"]',"
+                        + "'alice','" + Timestamp.from(now) + "')");
+                boolean duplicateConfigRejected = false;
+                try {
+                    st.execute("INSERT INTO incident_agency_configs (incident_id, version,"
+                            + " agency_codes, created_by, created_at) VALUES (1,1,'[\"C\"]',"
+                            + "'alice','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateConfigRejected = true;
+                }
+                assertThat(duplicateConfigRejected).isTrue();
+
+                // 机构回执：(incident_id, config_version, agency_code) 唯一，同机构同版本仅一条终态
+                st.execute("INSERT INTO incident_agency_acks (incident_id, config_version,"
+                        + " agency_code, ack_type, reason, submitted_by, submitted_at) VALUES"
+                        + " (1,1,'A','CONFIRM',NULL,'agency-A','" + Timestamp.from(now) + "')");
+                boolean duplicateAckRejected = false;
+                try {
+                    st.execute("INSERT INTO incident_agency_acks (incident_id, config_version,"
+                            + " agency_code, ack_type, reason, submitted_by, submitted_at) VALUES"
+                            + " (1,1,'A','REJECT','r','agency-A','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateAckRejected = true;
+                }
+                assertThat(duplicateAckRejected).isTrue();
+                // 不同机构或不同版本不受该约束限制
+                st.execute("INSERT INTO incident_agency_acks (incident_id, config_version,"
+                        + " agency_code, ack_type, reason, submitted_by, submitted_at) VALUES"
+                        + " (1,1,'B','REJECT','r','agency-B','" + Timestamp.from(now) + "')");
+                st.execute("INSERT INTO incident_agency_acks (incident_id, config_version,"
+                        + " agency_code, ack_type, reason, submitted_by, submitted_at) VALUES"
+                        + " (1,2,'A','CONFIRM',NULL,'agency-A','" + Timestamp.from(now) + "')");
+
+                // 回执幂等键：ack_key 唯一
+                st.execute("INSERT INTO agency_ack_keys (ack_key, request_hash, created_at)"
+                        + " VALUES ('AK-1','h','" + Timestamp.from(now) + "')");
+                boolean duplicateAckKeyRejected = false;
+                try {
+                    st.execute("INSERT INTO agency_ack_keys (ack_key, request_hash, created_at)"
+                            + " VALUES ('AK-1','h2','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateAckKeyRejected = true;
+                }
+                assertThat(duplicateAckKeyRejected).isTrue();
+
+                // 任务优先级默认值 NORMAL，事件阻断前状态列可空
+                try (ResultSet rs = st.executeQuery(
+                        "SELECT priority FROM incident_tasks WHERE id = 1")) {
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getString("priority")).isEqualTo("NORMAL");
+                }
+                try (ResultSet rs = st.executeQuery(
+                        "SELECT blocked_from_status FROM incidents WHERE id = 1")) {
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getString("blocked_from_status")).isNull();
+                }
             }
         }
     }

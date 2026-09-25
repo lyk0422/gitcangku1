@@ -56,4 +56,9 @@ public class ApiException extends RuntimeException {
     public static ApiException illegalTransition(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "ILLEGAL_TRANSITION", message, null);
     }
+
+    /** 422：HIGH 任务外部机构确认门禁未通过，details 为未确认机构代码列表。 */
+    public static ApiException agencyGate(String message, Object details) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "AGENCY_GATE", message, details);
+    }
 }

@@ -46,11 +46,13 @@ public class IncidentRepository {
 
     private static Incident mapIncident(ResultSet rs) throws SQLException {
         Timestamp deadline = rs.getTimestamp("deadline_at");
+        String blockedFrom = rs.getString("blocked_from_status");
         return new Incident(rs.getLong("id"), rs.getString("incident_key"), rs.getString("severity"),
                 rs.getString("summary"), rs.getString("reporter"),
                 IncidentStatus.valueOf(rs.getString("status")), rs.getString("commander"),
                 rs.getTimestamp("created_at").toInstant(), rs.getTimestamp("updated_at").toInstant(),
-                deadline == null ? null : deadline.toInstant());
+                deadline == null ? null : deadline.toInstant(),
+                blockedFrom == null ? null : IncidentStatus.valueOf(blockedFrom));
     }
 
     /**
@@ -79,7 +81,8 @@ public class IncidentRepository {
         jdbc.update(con -> {
             var ps = con.prepareStatement(
                     "INSERT INTO incidents (incident_key, severity, summary, reporter, status, commander,"
-                            + " created_at, updated_at, deadline_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                            + " created_at, updated_at, deadline_at, blocked_from_status)"
+                            + " VALUES (?,?,?,?,?,?,?,?,?,?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, incident.incidentKey());
             ps.setString(2, incident.severity());
@@ -90,6 +93,8 @@ public class IncidentRepository {
             ps.setTimestamp(7, Timestamp.from(incident.createdAt()));
             ps.setTimestamp(8, Timestamp.from(incident.updatedAt()));
             ps.setTimestamp(9, incident.deadlineAt() == null ? null : Timestamp.from(incident.deadlineAt()));
+            ps.setString(10, incident.blockedFromStatus() == null
+                    ? null : incident.blockedFromStatus().name());
             return ps;
         }, keys);
         return keys.getKey().longValue();
@@ -226,5 +231,25 @@ public class IncidentRepository {
                         + " JOIN incidents i ON i.id = b.blocker_incident_id"
                         + " WHERE b.task_id = ? ORDER BY i.incident_key",
                 INCIDENT_MAPPER, taskId);
+    }
+
+    /**
+     * 因必需机构拒绝进入外部阻断态：保存阻断前状态到 blocked_from_status。
+     * 调用方已持事件行锁，仅作用于非 CLOSED 事件。
+     */
+    public void markExternalBlocked(long id, IncidentStatus fromStatus, Instant updatedAt) {
+        jdbc.update("UPDATE incidents SET status = 'EXTERNAL_BLOCKED', blocked_from_status = ?,"
+                        + " updated_at = ? WHERE id = ?",
+                fromStatus.name(), Timestamp.from(updatedAt), id);
+    }
+
+    /**
+     * 新版本门禁重新满足后恢复到阻断前状态，并清空 blocked_from_status。
+     * 条件包含 status='EXTERNAL_BLOCKED'，返回更新行数（0 表示已不在阻断态）。
+     */
+    public int restoreFromExternalBlocked(long id, IncidentStatus fromStatus, Instant updatedAt) {
+        return jdbc.update("UPDATE incidents SET status = ?, blocked_from_status = NULL,"
+                        + " updated_at = ? WHERE id = ? AND status = 'EXTERNAL_BLOCKED'",
+                fromStatus.name(), Timestamp.from(updatedAt), id);
     }
 }

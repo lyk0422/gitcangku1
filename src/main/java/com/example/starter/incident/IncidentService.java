@@ -8,6 +8,7 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.EnumSet;
+import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
@@ -15,6 +16,8 @@ import java.util.Set;
 import java.util.function.Supplier;
 
 import com.example.starter.incident.dto.Requests.ActionRequest;
+import com.example.starter.incident.dto.Requests.AgencyAckRequest;
+import com.example.starter.incident.dto.Requests.AgencyConfigRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
 import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
@@ -25,6 +28,9 @@ import com.example.starter.incident.dto.Requests.TaskCreateRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
+import com.example.starter.incident.dto.Responses.AgencyAckView;
+import com.example.starter.incident.dto.Responses.AgencyConfigVersionView;
+import com.example.starter.incident.dto.Responses.AgencyGateView;
 import com.example.starter.incident.dto.Responses.EscalationHistoryView;
 import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
@@ -72,16 +78,21 @@ public class IncidentService {
     private final EscalationRepository escalations;
     private final IncidentTaskRepository tasks;
     private final CommandKeyRepository commandKeys;
+    private final AgencyRepository agencies;
+    private final AgencyAckKeyRepository ackKeys;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public IncidentService(IncidentRepository incidents, EscalationRepository escalations,
                            IncidentTaskRepository tasks, CommandKeyRepository commandKeys,
+                           AgencyRepository agencies, AgencyAckKeyRepository ackKeys,
                            ObjectMapper objectMapper, Clock clock) {
         this.incidents = incidents;
         this.escalations = escalations;
         this.tasks = tasks;
         this.commandKeys = commandKeys;
+        this.agencies = agencies;
+        this.ackKeys = ackKeys;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -107,7 +118,7 @@ public class IncidentService {
         }
         Instant now = now();
         Incident incident = new Incident(0L, incidentKey, severity, summary, reporter,
-                IncidentStatus.REPORTED, null, now, now, null);
+                IncidentStatus.REPORTED, null, now, now, null, null);
         long id;
         try {
             id = incidents.insert(incident);
@@ -401,6 +412,12 @@ public class IncidentService {
         String taskKey = requireText(req.taskKey(), "taskKey");
         String groupCode = requireText(req.groupCode(), "groupCode");
         String title = requireText(req.title(), "title");
+        final TaskPriority priority;
+        try {
+            priority = TaskPriority.parse(req.priority());
+        } catch (IllegalArgumentException e) {
+            throw ApiException.badRequest("priority 必须为 HIGH 或 NORMAL");
+        }
         List<String> blockerKeys = req.blockerIncidentKeys() == null ? List.of()
                 : req.blockerIncidentKeys().stream()
                         .map(k -> requireText(k, "blockerIncidentKey"))
@@ -414,7 +431,8 @@ public class IncidentService {
         }
         Incident incident = lockIncident(incidentKey);
         return runIdempotent(commandKey, "task_create",
-                hash(incidentKey, actor, taskKey, groupCode, title, String.join(",", blockerKeys)),
+                hash(incidentKey, actor, taskKey, groupCode, title, priority.name(),
+                        String.join(",", blockerKeys)),
                 TaskView.class, () -> {
                     requireCommander(incident, actor);
                     if (incident.status() == IncidentStatus.CLOSED) {
@@ -427,6 +445,7 @@ public class IncidentService {
                                 .stream().map(Incident::incidentKey).sorted().toList();
                         List<String> requested = blockerKeys.stream().sorted().toList();
                         if (!found.sameContent(groupCode, title)
+                                || found.priority() != priority
                                 || !existingBlockers.equals(requested)) {
                             throw ApiException.conflict("taskKey 已被不同内容使用: " + taskKey);
                         }
@@ -452,8 +471,8 @@ public class IncidentService {
                     }
                     Instant now = now();
                     long taskId = tasks.insert(new IncidentTask(0L, incident.id(), taskKey,
-                            groupCode, title, TaskStatus.OPEN, actor, null, null, null, null,
-                            now, now));
+                            groupCode, title, priority, TaskStatus.OPEN, actor, null, null, null,
+                            null, now, now));
                     for (Incident blocker : blockers) {
                         tasks.insertBlocker(taskId, blocker.id(), now);
                     }
@@ -484,6 +503,18 @@ public class IncidentService {
                     if (!unresolved.isEmpty()) {
                         throw ApiException.conflict("存在未解除阻塞的事件: "
                                 + String.join(",", unresolved), List.copyOf(unresolved));
+                    }
+                    if (task.priority() == TaskPriority.HIGH) {
+                        AgencyGateState gate = evaluateGate(incident.id());
+                        if (gate.rejected()) {
+                            throw ApiException.agencyGate("存在必需外部机构拒绝回执，HIGH 任务不可完成",
+                                    List.copyOf(gate.unconfirmed()));
+                        }
+                        if (!gate.unconfirmed().isEmpty()) {
+                            throw ApiException.agencyGate("仍有必需外部机构未确认: "
+                                    + String.join(",", gate.unconfirmed()),
+                                    List.copyOf(gate.unconfirmed()));
+                        }
                     }
                     tasks.markDone(task.id(), actor, now());
                     return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
@@ -633,15 +664,22 @@ public class IncidentService {
 
     /**
      * 组装任务视图：阻塞状态按目标事件查询时的当前状态计算，不写回依赖任务。
+     * gateReason 仅 HIGH 任务返回：为当前配置版本下尚未确认（含已拒绝）的机构代码列表，
+     * 全部确认后为空列表；NORMAL 任务不受机构门禁，返回 null。
      */
     private TaskView toTaskView(IncidentTask task) {
         List<TaskBlockerView> blockers = incidents.listBlockingIncidents(task.id()).stream()
                 .map(b -> new TaskBlockerView(b.incidentKey(), b.status().name(),
                         UNBLOCKING_STATUSES.contains(b.status())))
                 .toList();
-        return new TaskView(task.taskKey(), task.groupCode(), task.title(), task.status().name(),
-                blockers, task.createdBy(), task.createdAt(), task.doneBy(), task.doneAt(),
-                task.cancelledBy(), task.cancelledAt());
+        List<String> gateReason = null;
+        if (task.priority() == TaskPriority.HIGH) {
+            gateReason = List.copyOf(evaluateGate(task.incidentId()).unconfirmed());
+        }
+        return new TaskView(task.taskKey(), task.groupCode(), task.title(),
+                task.priority().name(), task.status().name(), blockers, task.createdBy(),
+                task.createdAt(), task.doneBy(), task.doneAt(), task.cancelledBy(),
+                task.cancelledAt(), gateReason);
     }
 
     private static TransferView toTransferView(IncidentTransfer transfer) {
@@ -662,5 +700,236 @@ public class IncidentService {
         List<EscalationView> views = list.stream().map(this::toEscalationView).toList();
         EscalationView current = views.isEmpty() ? null : views.get(views.size() - 1);
         return new EscalationHistoryView(incident.deadlineAt(), current, views);
+    }
+
+    /**
+     * 当前配置版本的门禁评估结果：version 为评估的配置版本（未配置为 0）；
+     * rejected 表示该版本存在任一拒绝回执；unconfirmed 为尚未确认（含已拒绝）的机构代码，
+     * 已按字典序排序。未配置或空配置时 unconfirmed 为空。
+     */
+    private record AgencyGateState(int version, boolean rejected, List<String> unconfirmed) {
+    }
+
+    /**
+     * 按事件当前（最新）配置版本评估机构门禁：必需机构中无 CONFIRM 终态回执的即为未确认。
+     * 只读计算，不写库。
+     */
+    private AgencyGateState evaluateGate(long incidentId) {
+        var latest = agencies.findLatestConfig(incidentId);
+        if (latest.isEmpty()) {
+            return new AgencyGateState(0, false, List.of());
+        }
+        AgencyConfig config = latest.get();
+        List<AgencyAck> acks = agencies.listAcksByVersion(incidentId, config.version());
+        Set<String> confirmed = new HashSet<>();
+        boolean rejected = false;
+        for (AgencyAck ack : acks) {
+            if (ack.ackType() == AgencyAckType.CONFIRM) {
+                confirmed.add(ack.agencyCode());
+            } else {
+                rejected = true;
+            }
+        }
+        List<String> unconfirmed = config.agencyCodes().stream()
+                .filter(code -> !confirmed.contains(code))
+                .sorted()
+                .toList();
+        return new AgencyGateState(config.version(), rejected, unconfirmed);
+    }
+
+    /**
+     * 修改必需外部机构配置：仅当前指挥人；CLOSED 事件返回 409。
+     * expectedVersion 为指挥人上次见到的版本（首次配置传 0 或 null），
+     * 与当前版本不一致返回 409（乐观并发）；机构代码去重后按字典序落库，
+     * 空集合合法，至多 5 个。修改成功新增一个配置版本，旧版本与旧回执永久保留；
+     * 若事件处于 EXTERNAL_BLOCKED 且新版本门禁已满足（如无必需机构），
+     * 同事务恢复到阻断前状态。
+     */
+    @Transactional
+    public AgencyGateView configureAgencies(String incidentKey, String actor,
+                                            AgencyConfigRequest req) {
+        String commandKey = requireText(req.commandKey(), "commandKey");
+        int expectedVersion = req.expectedVersion() == null ? 0 : req.expectedVersion();
+        if (expectedVersion < 0) {
+            throw ApiException.badRequest("expectedVersion 不能为负数");
+        }
+        List<String> codes = req.agencyCodes() == null ? List.of()
+                : req.agencyCodes().stream()
+                        .map(c -> requireText(c, "agencyCode"))
+                        .distinct()
+                        .sorted()
+                        .toList();
+        if (codes.size() > 5) {
+            throw ApiException.badRequest("必需外部机构最多 5 个");
+        }
+        Incident incident = lockIncident(incidentKey);
+        return runIdempotent(commandKey, "agency_config",
+                hash(incidentKey, actor, String.valueOf(expectedVersion), String.join(",", codes)),
+                AgencyGateView.class, () -> {
+                    requireCommander(incident, actor);
+                    if (incident.status() == IncidentStatus.CLOSED) {
+                        throw ApiException.conflict("事件已关闭，不能修改机构配置");
+                    }
+                    int currentVersion = agencies.findLatestConfig(incident.id())
+                            .map(AgencyConfig::version).orElse(0);
+                    if (expectedVersion != currentVersion) {
+                        throw ApiException.conflict("配置版本已变化：期望 " + expectedVersion
+                                + "，当前 " + currentVersion + "，请刷新后重试");
+                    }
+                    int newVersion = currentVersion + 1;
+                    Instant now = now();
+                    agencies.insertConfig(new AgencyConfig(0L, incident.id(), newVersion,
+                            codes, actor, now));
+                    // 阻断态下替换配置：旧回执仅归属旧版本（不回写），按新版本重新计算门禁；
+                    // 新版本无必需机构即视为门禁满足，同事务恢复阻断前状态
+                    if (incident.status() == IncidentStatus.EXTERNAL_BLOCKED
+                            && incident.blockedFromStatus() != null) {
+                        AgencyGateState gate = evaluateGate(incident.id());
+                        if (!gate.rejected() && gate.unconfirmed().isEmpty()) {
+                            incidents.restoreFromExternalBlocked(incident.id(),
+                                    incident.blockedFromStatus(), now);
+                            incidents.insertStatusChange(new StatusChange(0L, incident.id(),
+                                    IncidentStatus.EXTERNAL_BLOCKED, incident.blockedFromStatus(),
+                                    actor, now));
+                        }
+                    }
+                    return toAgencyGateView(incident.incidentKey(), incident.id());
+                });
+    }
+
+    /**
+     * 提交机构终态回执：ackKey 为机构侧幂等键（独立命名空间），指纹含机构、事件版本、
+     * 回执类型与说明，成功重放首个响应，业务失败事务回滚不占键。
+     * 回执归属提交时的当前配置版本；同一机构每版本仅一条终态回执，重复提交返回 409。
+     * REJECT 必须携带非空说明；任一必需机构拒绝时事件转为 EXTERNAL_BLOCKED。
+     * CLOSED 事件不再受理回执，返回 409。
+     */
+    @Transactional
+    public AgencyAckView submitAgencyAck(String incidentKey, String actor, AgencyAckRequest req) {
+        String ackKey = requireText(req.ackKey(), "ackKey");
+        String agencyCode = requireText(req.agencyCode(), "agencyCode");
+        String ackTypeText = requireText(req.ackType(), "ackType");
+        AgencyAckType ackType;
+        try {
+            ackType = AgencyAckType.valueOf(ackTypeText.strip().toUpperCase());
+        } catch (IllegalArgumentException e) {
+            throw ApiException.badRequest("ackType 必须为 CONFIRM 或 REJECT");
+        }
+        String reason = req.reason() == null ? null : req.reason().strip();
+        if (ackType == AgencyAckType.REJECT && (reason == null || reason.isEmpty())) {
+            throw ApiException.badRequest("拒绝回执必须填写非空 reason");
+        }
+        if (ackType == AgencyAckType.CONFIRM) {
+            reason = null;
+        }
+        String submittedBy = requireText(actor, "X-Actor-Id");
+        Incident incident = lockIncident(incidentKey);
+        AgencyConfig current = agencies.findLatestConfig(incident.id())
+                .orElseThrow(() -> ApiException.conflict("事件尚未配置必需机构，不能提交回执"));
+        final String finalReason = reason;
+        String requestHash = hash(incidentKey, agencyCode, String.valueOf(current.version()),
+                ackType.name(), finalReason == null ? "" : finalReason);
+        return runAckIdempotent(ackKey, requestHash, () -> {
+            if (incident.status() == IncidentStatus.CLOSED) {
+                throw ApiException.conflict("事件已关闭，不再受理机构回执");
+            }
+            if (!current.agencyCodes().contains(agencyCode)) {
+                throw ApiException.conflict("机构 " + agencyCode + " 不在当前配置版本 "
+                        + current.version() + " 的必需机构列表中");
+            }
+            var existing = agencies.findAck(incident.id(), current.version(), agencyCode);
+            if (existing.isPresent()) {
+                throw ApiException.conflict("机构 " + agencyCode + " 在配置版本 "
+                        + current.version() + " 已存在终态回执，不能重复提交");
+            }
+            Instant now = now();
+            long ackId = agencies.insertAck(new AgencyAck(0L, incident.id(), current.version(),
+                    agencyCode, ackType, finalReason, submittedBy, now));
+            if (incident.status() != IncidentStatus.EXTERNAL_BLOCKED
+                    && ackType == AgencyAckType.REJECT) {
+                // 任一必需机构拒绝：事件进入外部阻断态，保存阻断前状态
+                incidents.markExternalBlocked(incident.id(), incident.status(), now);
+                incidents.insertStatusChange(new StatusChange(0L, incident.id(),
+                        incident.status(), IncidentStatus.EXTERNAL_BLOCKED, submittedBy, now));
+            } else if (incident.status() == IncidentStatus.EXTERNAL_BLOCKED
+                    && incident.blockedFromStatus() != null) {
+                // 阻断态下提交回执：按当前版本重新计算门禁，全部确认且无拒绝时解除阻断
+                AgencyGateState gate = evaluateGate(incident.id());
+                if (!gate.rejected() && gate.unconfirmed().isEmpty()) {
+                    incidents.restoreFromExternalBlocked(incident.id(),
+                            incident.blockedFromStatus(), now);
+                    incidents.insertStatusChange(new StatusChange(0L, incident.id(),
+                            IncidentStatus.EXTERNAL_BLOCKED, incident.blockedFromStatus(),
+                            submittedBy, now));
+                }
+            }
+            AgencyAck saved = agencies.listAcksByVersion(incident.id(), current.version())
+                    .stream().filter(a -> a.id() == ackId).findFirst().orElseThrow();
+            return toAgencyAckView(saved);
+        });
+    }
+
+    /**
+     * 查询机构配置版本与全部历史回执（只读，不隐式写入）。
+     */
+    @Transactional(readOnly = true)
+    public AgencyGateView agencyGate(String incidentKey) {
+        Incident incident = incidents.findByKey(incidentKey)
+                .orElseThrow(() -> ApiException.notFound("事件不存在: " + incidentKey));
+        return toAgencyGateView(incident.incidentKey(), incident.id());
+    }
+
+    /**
+     * 回执幂等执行：同键同参重放首次响应，同键改参 409；并发同键由唯一约束串行化。
+     * 业务失败抛异常时事务回滚，占位行随之回滚（失败不占键）。
+     */
+    private AgencyAckView runAckIdempotent(String ackKey, String requestHash,
+                                           Supplier<AgencyAckView> business) {
+        var existing = ackKeys.find(ackKey);
+        if (existing.isPresent()) {
+            return replayAck(existing.get(), requestHash);
+        }
+        try {
+            ackKeys.insertPlaceholder(ackKey, requestHash, now());
+        } catch (DuplicateKeyException e) {
+            var committed = ackKeys.findForUpdate(ackKey)
+                    .orElseThrow(() -> ApiException.conflict("ackKey 处理冲突: " + ackKey));
+            return replayAck(committed, requestHash);
+        }
+        AgencyAckView result = business.get();
+        ackKeys.fillResponse(ackKey, 200, toJson(result));
+        return result;
+    }
+
+    private AgencyAckView replayAck(AgencyAckKeyRepository.AckKeyRecord record, String requestHash) {
+        if (!record.requestHash().equals(requestHash)) {
+            throw ApiException.conflict("ackKey 已被不同参数的回执使用: " + record.ackKey());
+        }
+        if (record.responseBody() == null) {
+            throw ApiException.conflict("ackKey 正在处理中: " + record.ackKey());
+        }
+        try {
+            return objectMapper.readValue(record.responseBody(), AgencyAckView.class);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("回执幂等响应反序列化失败", e);
+        }
+    }
+
+    private AgencyGateView toAgencyGateView(String incidentKey, long incidentId) {
+        List<AgencyConfig> configs = agencies.listConfigs(incidentId);
+        int currentVersion = configs.isEmpty() ? 0 : configs.get(configs.size() - 1).version();
+        List<AgencyConfigVersionView> configViews = configs.stream()
+                .map(c -> new AgencyConfigVersionView(c.version(), c.agencyCodes(),
+                        c.version() == currentVersion, c.createdBy(), c.createdAt()))
+                .toList();
+        List<AgencyAckView> ackViews = agencies.listAllAcks(incidentId).stream()
+                .map(IncidentService::toAgencyAckView)
+                .toList();
+        return new AgencyGateView(incidentKey, currentVersion, configViews, ackViews);
+    }
+
+    private static AgencyAckView toAgencyAckView(AgencyAck ack) {
+        return new AgencyAckView(ack.configVersion(), ack.agencyCode(), ack.ackType().name(),
+                ack.reason(), ack.submittedBy(), ack.submittedAt());
     }
 }
