@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS bag (
     bag_tag             VARCHAR(64)  NOT NULL COMMENT '行李牌号，全局唯一',
     current_location    VARCHAR(64)  NOT NULL COMMENT '当前所在站点代码',
     next_leg_index      INT          NOT NULL DEFAULT 0 COMMENT '待乘航段在行程中的下标（0 起），等于行程长度表示已完成；短卸不推进',
-    status              VARCHAR(16)  NOT NULL DEFAULT 'IN_TRANSIT' COMMENT '行李状态：IN_TRANSIT 在途/SHORT_UNLOADED 短卸待补/RECOVERED 已补到在途/DELIVERED 已交付',
+    status              VARCHAR(16)  NOT NULL DEFAULT 'IN_TRANSIT' COMMENT '行李状态：IN_TRANSIT 在途/SHORT_UNLOADED 短卸待补/RECOVERED 已补到在途/DELIVERED 已交付/CUSTOMS_HOLD 海关暂扣',
     loaded_leg_id       VARCHAR(64)  NULL COMMENT '当前已装载到的航段，未装载为 NULL',
     short_leg_id        VARCHAR(64)  NULL COMMENT '短卸缺失航段标识，仅 SHORT_UNLOADED 状态非 NULL',
     short_destination   VARCHAR(64)  NULL COMMENT '短卸应到站点代码，仅 SHORT_UNLOADED 状态非 NULL',
@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS bag_event (
     id         BIGINT AUTO_INCREMENT NOT NULL COMMENT '事件自增主键',
     bag_tag    VARCHAR(64)  NOT NULL COMMENT '行李牌号',
     seq        INT          NOT NULL COMMENT '该行李内事件顺序，0 起递增',
-    event_type VARCHAR(32)  NOT NULL COMMENT '事件类型：REGISTERED 登记/LOADED 装载/UNLOADED 到达卸下/SHORT_UNLOADED 短卸/RECOVERED 补到/DELIVERED 交付',
+    event_type VARCHAR(32)  NOT NULL COMMENT '事件类型：REGISTERED 登记/LOADED 装载/UNLOADED 到达卸下/SHORT_UNLOADED 短卸/RECOVERED 补到/DELIVERED 交付/CUSTOMS_HOLD 海关暂扣/CUSTOMS_RELEASED 解除暂扣',
     leg_id     VARCHAR(64)  NULL COMMENT '关联航段标识，与航段无关的事件为 NULL',
     location   VARCHAR(64)  NULL COMMENT '事件发生后行李所在站点代码',
     event_time TIMESTAMP WITH TIME ZONE NOT NULL COMMENT '事件发生时刻（UTC）',
@@ -61,10 +61,32 @@ CREATE TABLE IF NOT EXISTS bag_event (
     UNIQUE (bag_tag, seq)
 );
 
+-- 海关暂扣：hold_key 唯一，记录不可变（仅解除确认字段可推进一次）；
+-- 解除需两名不同操作人按同一 hold_key 先后确认，第二人确认时刻即解除生效时刻
+CREATE TABLE IF NOT EXISTS customs_hold (
+    hold_key            VARCHAR(64)  NOT NULL COMMENT '暂扣业务键，全局唯一，解除确认按此键关联',
+    bag_tag             VARCHAR(64)  NOT NULL COMMENT '被暂扣行李牌号',
+    location            VARCHAR(64)  NOT NULL COMMENT '暂扣地点站点代码',
+    reason              VARCHAR(255) NOT NULL COMMENT '暂扣原因',
+    previous_status     VARCHAR(16)  NOT NULL COMMENT '暂扣前行李状态（IN_TRANSIT/RECOVERED），解除后恢复为该状态',
+    status              VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE' COMMENT '暂扣状态：ACTIVE 生效中/RELEASED 已解除',
+    removed_leg_id      VARCHAR(64)  NULL COMMENT '暂扣时从 OPEN 航段清单原子移除的航段标识，暂扣前未装载为 NULL',
+    first_operator      VARCHAR(64)  NULL COMMENT '第一名确认解除的海关操作人，未确认为 NULL，确认后不可替换或撤销',
+    first_confirmed_at  TIMESTAMP WITH TIME ZONE NULL COMMENT '第一人确认时刻（UTC），未确认为 NULL',
+    second_operator     VARCHAR(64)  NULL COMMENT '第二名确认解除的海关操作人，须与第一人不同，未确认为 NULL',
+    second_confirmed_at TIMESTAMP WITH TIME ZONE NULL COMMENT '第二人确认时刻（UTC），即解除生效时刻，未确认为 NULL',
+    created_at          TIMESTAMP WITH TIME ZONE NOT NULL COMMENT '暂扣登记时刻（UTC）',
+    PRIMARY KEY (hold_key)
+);
+
+-- 暂扣历史按行李查询；待第二人确认清单按状态过滤
+CREATE INDEX IF NOT EXISTS idx_customs_hold_bag ON customs_hold (bag_tag);
+CREATE INDEX IF NOT EXISTS idx_customs_hold_status ON customs_hold (status);
+
 -- 幂等去重：仅记录成功请求；同 requestId 同参数重放原结果，异参数返回 409
 CREATE TABLE IF NOT EXISTS request_log (
     request_id      VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
-    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER',
+    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER/CUSTOMS_HOLD/CUSTOMS_RELEASE',
     request_hash    VARCHAR(64)  NOT NULL COMMENT '请求参数（不含 requestId）的 SHA-256 摘要',
     response_status INT          NOT NULL COMMENT '原成功响应的 HTTP 状态码',
     response_body   CLOB         NOT NULL COMMENT '原成功响应体（JSON）',

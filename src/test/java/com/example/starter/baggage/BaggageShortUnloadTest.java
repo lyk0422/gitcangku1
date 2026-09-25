@@ -431,9 +431,14 @@ class BaggageShortUnloadTest {
                     "SELECT status FROM bag WHERE bag_tag = 'BAG_SHORT'", String.class);
             assertThat(shortStatus).isEqualTo("RECOVERED");
         } else {
-            // 装载先尝试且失败：整批不移动，补到完成后再装载必然成功
+            // 装载先尝试且失败：整批不移动；并发补到可能已提交也可能尚未提交，
+            // 最终补到完成后再装载必然成功
             assertThat(okLoaded).isZero();
-            recover("BAG_SHORT", "LEG1", "SHA").andExpect(status().isOk());
+            String shortStatus = jdbcTemplate.queryForObject(
+                    "SELECT status FROM bag WHERE bag_tag = 'BAG_SHORT'", String.class);
+            if ("SHORT_UNLOADED".equals(shortStatus)) {
+                recover("BAG_SHORT", "LEG1", "SHA").andExpect(status().isOk());
+            }
             load("LEG2", 1, List.of("BAG_OK", "BAG_SHORT")).andExpect(status().isOk());
         }
     }

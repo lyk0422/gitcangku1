@@ -125,4 +125,61 @@ public final class BaggageDtos {
     /** 未补到清单响应。 */
     public record ShortListResponse(List<ShortItem> shortUnloaded) {
     }
+
+    /** 海关暂扣请求：holdKey 全局唯一，location 为暂扣地点，reason 为暂扣原因。 */
+    public record CustomsHoldRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotBlank(message = "bagTag 不能为空") String bagTag,
+            @NotBlank(message = "holdKey 不能为空") String holdKey,
+            @NotBlank(message = "location 不能为空") String location,
+            @NotBlank(message = "reason 不能为空") String reason) {
+    }
+
+    /** 海关暂扣响应：removedFromLegId 为暂扣时从 OPEN 航段清单移除的航段，未装载为 null。 */
+    public record CustomsHoldResponse(String holdKey, String bagTag, String status,
+                                      String location, String reason, String heldAt,
+                                      String removedFromLegId) {
+    }
+
+    /** 解除暂扣确认请求：两名不同操作人按同一 holdKey 分别提交。 */
+    public record CustomsReleaseRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotBlank(message = "operatorId 不能为空") String operatorId) {
+    }
+
+    /**
+     * 解除暂扣确认响应：status 为 PENDING_SECOND_CONFIRM（已记录第一人，待第二人）
+     * 或 RELEASED（第二人确认完成，行李已转回可交接状态）。
+     */
+    public record CustomsReleaseResponse(String holdKey, String bagTag, String status,
+                                         String firstOperator, String firstConfirmedAt,
+                                         String secondOperator, String secondConfirmedAt,
+                                         String bagStatus) {
+    }
+
+    /** 暂扣历史记录项：含解除双人确认固化信息。 */
+    public record CustomsHoldItem(String holdKey, String bagTag, String status,
+                                  String location, String reason, String previousStatus,
+                                  String removedFromLegId, String heldAt,
+                                  String firstOperator, String firstConfirmedAt,
+                                  String secondOperator, String secondConfirmedAt) {
+    }
+
+    /** 暂扣历史响应。 */
+    public record CustomsHoldHistoryResponse(String bagTag, List<CustomsHoldItem> holds) {
+    }
+
+    /** 待第二人确认清单项。 */
+    public record PendingSecondItem(String holdKey, String bagTag, String location,
+                                    String firstOperator, String firstConfirmedAt) {
+    }
+
+    /** 待第二人确认清单响应。 */
+    public record PendingSecondResponse(List<PendingSecondItem> pendingSecondConfirm) {
+    }
+
+    /** 行李当前交接阻断原因响应：blocked 为 false 时其余暂扣字段为 null。 */
+    public record TransferBlockResponse(String bagTag, boolean blocked, String bagStatus,
+                                        String holdKey, String location, String reason, String heldAt) {
+    }
 }

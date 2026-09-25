@@ -14,6 +14,11 @@ import org.springframework.web.bind.annotation.RestController;
 import com.example.starter.baggage.BaggageDtos.ArriveRequest;
 import com.example.starter.baggage.BaggageDtos.ArriveResponse;
 import com.example.starter.baggage.BaggageDtos.BagResponse;
+import com.example.starter.baggage.BaggageDtos.CustomsHoldHistoryResponse;
+import com.example.starter.baggage.BaggageDtos.CustomsHoldRequest;
+import com.example.starter.baggage.BaggageDtos.CustomsHoldResponse;
+import com.example.starter.baggage.BaggageDtos.CustomsReleaseRequest;
+import com.example.starter.baggage.BaggageDtos.CustomsReleaseResponse;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveRequest;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveResponse;
 import com.example.starter.baggage.BaggageDtos.LegDifferenceResponse;
@@ -21,6 +26,7 @@ import com.example.starter.baggage.BaggageDtos.LegResponse;
 import com.example.starter.baggage.BaggageDtos.LoadRequest;
 import com.example.starter.baggage.BaggageDtos.LoadResponse;
 import com.example.starter.baggage.BaggageDtos.ManifestResponse;
+import com.example.starter.baggage.BaggageDtos.PendingSecondResponse;
 import com.example.starter.baggage.BaggageDtos.RecoverRequest;
 import com.example.starter.baggage.BaggageDtos.RecoverResponse;
 import com.example.starter.baggage.BaggageDtos.RegisterBagRequest;
@@ -28,6 +34,7 @@ import com.example.starter.baggage.BaggageDtos.RegisterLegRequest;
 import com.example.starter.baggage.BaggageDtos.SealRequest;
 import com.example.starter.baggage.BaggageDtos.SealResponse;
 import com.example.starter.baggage.BaggageDtos.ShortListResponse;
+import com.example.starter.baggage.BaggageDtos.TransferBlockResponse;
 
 /**
  * 联程行李装载交接 REST 入口。
@@ -107,5 +114,36 @@ public class BaggageController {
     @GetMapping("/bags/short-unloaded")
     public ShortListResponse listShortUnloaded() {
         return baggageService.listShortUnloaded();
+    }
+
+    /** 海关暂扣：转 CUSTOMS_HOLD 并写入不可变暂扣记录；已在 OPEN 清单中的行李先原子移除。 */
+    @PostMapping("/customs-holds")
+    public ResponseEntity<CustomsHoldResponse> hold(@Valid @RequestBody CustomsHoldRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(baggageService.hold(request));
+    }
+
+    /** 解除暂扣确认：两名不同操作人按同一 holdKey 分别确认，第二人确认时原子解除。 */
+    @PostMapping("/customs-holds/{holdKey}/confirm-release")
+    public CustomsReleaseResponse confirmRelease(@PathVariable String holdKey,
+                                                 @Valid @RequestBody CustomsReleaseRequest request) {
+        return baggageService.confirmRelease(holdKey, request);
+    }
+
+    /** 待第二人确认清单。 */
+    @GetMapping("/customs-holds/pending-second")
+    public PendingSecondResponse listPendingSecondConfirm() {
+        return baggageService.listPendingSecondConfirm();
+    }
+
+    /** 行李暂扣历史查询。 */
+    @GetMapping("/bags/{bagTag}/customs-holds")
+    public CustomsHoldHistoryResponse getHoldHistory(@PathVariable String bagTag) {
+        return baggageService.getHoldHistory(bagTag);
+    }
+
+    /** 行李当前交接阻断原因查询。 */
+    @GetMapping("/bags/{bagTag}/transfer-block")
+    public TransferBlockResponse getTransferBlock(@PathVariable String bagTag) {
+        return baggageService.getTransferBlock(bagTag);
     }
 }

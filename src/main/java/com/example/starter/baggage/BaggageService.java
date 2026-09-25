@@ -17,6 +17,12 @@ import org.springframework.stereotype.Service;
 import com.example.starter.baggage.BaggageDtos.ArriveRequest;
 import com.example.starter.baggage.BaggageDtos.ArriveResponse;
 import com.example.starter.baggage.BaggageDtos.BagResponse;
+import com.example.starter.baggage.BaggageDtos.CustomsHoldItem;
+import com.example.starter.baggage.BaggageDtos.CustomsHoldHistoryResponse;
+import com.example.starter.baggage.BaggageDtos.CustomsHoldRequest;
+import com.example.starter.baggage.BaggageDtos.CustomsHoldResponse;
+import com.example.starter.baggage.BaggageDtos.CustomsReleaseRequest;
+import com.example.starter.baggage.BaggageDtos.CustomsReleaseResponse;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveRequest;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveResponse;
 import com.example.starter.baggage.BaggageDtos.ItineraryItem;
@@ -25,6 +31,8 @@ import com.example.starter.baggage.BaggageDtos.LegResponse;
 import com.example.starter.baggage.BaggageDtos.LoadRequest;
 import com.example.starter.baggage.BaggageDtos.LoadResponse;
 import com.example.starter.baggage.BaggageDtos.ManifestResponse;
+import com.example.starter.baggage.BaggageDtos.PendingSecondItem;
+import com.example.starter.baggage.BaggageDtos.PendingSecondResponse;
 import com.example.starter.baggage.BaggageDtos.RecoverRequest;
 import com.example.starter.baggage.BaggageDtos.RecoverResponse;
 import com.example.starter.baggage.BaggageDtos.RegisterBagRequest;
@@ -34,6 +42,7 @@ import com.example.starter.baggage.BaggageDtos.SealResponse;
 import com.example.starter.baggage.BaggageDtos.ShortItem;
 import com.example.starter.baggage.BaggageDtos.ShortListResponse;
 import com.example.starter.baggage.BaggageDtos.TraceEvent;
+import com.example.starter.baggage.BaggageDtos.TransferBlockResponse;
 
 /**
  * 联程行李装载交接核心业务：航段/行李登记、批量装载、封舱、精确/差异到达、补到与查询。
@@ -55,6 +64,11 @@ public class BaggageService {
     private static final String BAG_SHORT_UNLOADED = "SHORT_UNLOADED";
     private static final String BAG_RECOVERED = "RECOVERED";
     private static final String BAG_DELIVERED = "DELIVERED";
+    private static final String BAG_CUSTOMS_HOLD = "CUSTOMS_HOLD";
+
+    private static final String HOLD_ACTIVE = "ACTIVE";
+    private static final String HOLD_RELEASED = "RELEASED";
+    private static final String RELEASE_PENDING_SECOND = "PENDING_SECOND_CONFIRM";
 
     private static final String EVT_REGISTERED = "REGISTERED";
     private static final String EVT_LOADED = "LOADED";
@@ -62,6 +76,8 @@ public class BaggageService {
     private static final String EVT_SHORT = "SHORT_UNLOADED";
     private static final String EVT_RECOVERED = "RECOVERED";
     private static final String EVT_DELIVERED = "DELIVERED";
+    private static final String EVT_CUSTOMS_HOLD = "CUSTOMS_HOLD";
+    private static final String EVT_CUSTOMS_RELEASED = "CUSTOMS_RELEASED";
 
     private static final RowMapper<LegRow> LEG_MAPPER = (rs, rowNum) -> new LegRow(
             rs.getString("leg_id"), rs.getString("origin"), rs.getString("destination"),
@@ -85,6 +101,13 @@ public class BaggageService {
             rs.getString("bag_tag"), rs.getString("short_leg_id"), rs.getString("short_destination"),
             getInstant(rs, "short_registered_at").toString(),
             rs.getInt("next_leg_index"), rs.getString("current_location"));
+
+    private static final RowMapper<HoldRow> HOLD_MAPPER = (rs, rowNum) -> new HoldRow(
+            rs.getString("hold_key"), rs.getString("bag_tag"), rs.getString("location"),
+            rs.getString("reason"), rs.getString("previous_status"), rs.getString("status"),
+            rs.getString("removed_leg_id"), rs.getString("first_operator"),
+            getInstant(rs, "first_confirmed_at"), rs.getString("second_operator"),
+            getInstant(rs, "second_confirmed_at"), getInstant(rs, "created_at"));
 
     private final JdbcTemplate jdbcTemplate;
     private final IdempotencyService idempotencyService;
@@ -203,6 +226,68 @@ public class BaggageService {
                         + " WHERE status = ? ORDER BY short_registered_at, bag_tag",
                 SHORT_MAPPER, BAG_SHORT_UNLOADED);
         return new ShortListResponse(items);
+    }
+
+    /**
+     * 海关暂扣：仅未到达最终目的地、未处于 SEALED 航段且未丢失的行李可暂扣。
+     * 已在 OPEN 航段清单中的行李先从该清单原子移除（移除失败整次回滚），
+     * 再转 CUSTOMS_HOLD 并写入不可变暂扣记录；暂扣后装载与补到均返回 409 并给出暂扣地点。
+     */
+    public CustomsHoldResponse hold(CustomsHoldRequest request) {
+        return idempotencyService.execute(request.requestId(), "CUSTOMS_HOLD", 201,
+                request, CustomsHoldResponse.class, () -> doHold(request));
+    }
+
+    /**
+     * 解除暂扣确认：两名不同操作人按同一 holdKey 分别确认。
+     * 第一人确认仅固化操作人与时刻（不可替换或撤销）；第二人确认原子解除暂扣，
+     * 行李转回暂扣前状态。同一操作人重复确认返回 422。
+     */
+    public CustomsReleaseResponse confirmRelease(String holdKey, CustomsReleaseRequest request) {
+        ReleasePayload payload = new ReleasePayload(holdKey, request.operatorId());
+        return idempotencyService.execute(request.requestId(), "CUSTOMS_RELEASE", 200,
+                payload, CustomsReleaseResponse.class, () -> doConfirmRelease(holdKey, request));
+    }
+
+    /** 暂扣历史查询：返回该行李全部暂扣记录（含已解除），按登记时刻升序。 */
+    public CustomsHoldHistoryResponse getHoldHistory(String bagTag) {
+        if (findBag(bagTag) == null) {
+            throw ApiException.notFound("行李不存在: " + bagTag);
+        }
+        List<CustomsHoldItem> holds = jdbcTemplate.query(
+                holdSelect(false) + " WHERE bag_tag = ? ORDER BY created_at, hold_key",
+                HOLD_ITEM_MAPPER, bagTag);
+        return new CustomsHoldHistoryResponse(bagTag, holds);
+    }
+
+    /** 待第二人确认清单：已有第一人确认但仍生效中的暂扣。 */
+    public PendingSecondResponse listPendingSecondConfirm() {
+        List<PendingSecondItem> items = jdbcTemplate.query(
+                "SELECT hold_key, bag_tag, location, first_operator, first_confirmed_at"
+                        + " FROM customs_hold WHERE status = ? AND first_operator IS NOT NULL"
+                        + " ORDER BY first_confirmed_at, hold_key",
+                (rs, rowNum) -> new PendingSecondItem(rs.getString("hold_key"), rs.getString("bag_tag"),
+                        rs.getString("location"), rs.getString("first_operator"),
+                        getInstant(rs, "first_confirmed_at").toString()),
+                HOLD_ACTIVE);
+        return new PendingSecondResponse(items);
+    }
+
+    /** 行李当前交接阻断原因查询：未阻断时 blocked=false 且暂扣字段为 null。 */
+    public TransferBlockResponse getTransferBlock(String bagTag) {
+        BagRow bag = findBag(bagTag);
+        if (bag == null) {
+            throw ApiException.notFound("行李不存在: " + bagTag);
+        }
+        if (!BAG_CUSTOMS_HOLD.equals(bag.status())) {
+            return new TransferBlockResponse(bagTag, false, bag.status(), null, null, null, null);
+        }
+        HoldRow hold = findActiveHold(bagTag);
+        if (hold == null) {
+            return new TransferBlockResponse(bagTag, false, bag.status(), null, null, null, null);
+        }
+        return new TransferBlockResponse(bagTag, true, bag.status(), hold.holdKey(),
+                hold.location(), hold.reason(), hold.createdAt().toString());
     }
 
     private LegResponse doRegisterLeg(RegisterLegRequest request) {
@@ -365,6 +450,9 @@ public class BaggageService {
             throw ApiException.notFound("行李不存在: " + request.bagTag());
         }
         if (!BAG_SHORT_UNLOADED.equals(bag.status())) {
+            if (BAG_CUSTOMS_HOLD.equals(bag.status())) {
+                throw customsHoldConflict(bag.bagTag(), "补到确认");
+            }
             if (BAG_RECOVERED.equals(bag.status()) || BAG_DELIVERED.equals(bag.status())) {
                 throw ApiException.conflict("行李 " + bag.bagTag() + " 已补到，不得再次推进");
             }
@@ -416,6 +504,9 @@ public class BaggageService {
     }
 
     private void validateLoadable(BagRow bag, LegRow leg) {
+        if (BAG_CUSTOMS_HOLD.equals(bag.status())) {
+            throw customsHoldConflict(bag.bagTag(), "装载");
+        }
         if (BAG_SHORT_UNLOADED.equals(bag.status())) {
             throw ApiException.unprocessable(
                     "行李 " + bag.bagTag() + " 处于短卸状态，须先补到才能装载后续航段");
@@ -574,5 +665,151 @@ public class BaggageService {
 
     /** 差异到达幂等摘要参数：bagTags 已排序，顺序差异不视为异参。 */
     private record DifferenceArrivePayload(String legId, int expectedVersion, List<String> bagTags) {
+    }
+
+    /** 解除暂扣确认幂等摘要参数。 */
+    private record ReleasePayload(String holdKey, String operatorId) {
+    }
+
+    /** 暂扣记录行。 */
+    private record HoldRow(String holdKey, String bagTag, String location, String reason,
+                           String previousStatus, String status, String removedLegId,
+                           String firstOperator, Instant firstConfirmedAt,
+                           String secondOperator, Instant secondConfirmedAt, Instant createdAt) {
+    }
+
+    private static final RowMapper<CustomsHoldItem> HOLD_ITEM_MAPPER = (rs, rowNum) -> new CustomsHoldItem(
+            rs.getString("hold_key"), rs.getString("bag_tag"), rs.getString("status"),
+            rs.getString("location"), rs.getString("reason"), rs.getString("previous_status"),
+            rs.getString("removed_leg_id"), getInstant(rs, "created_at").toString(),
+            rs.getString("first_operator"),
+            getInstant(rs, "first_confirmed_at") == null ? null : getInstant(rs, "first_confirmed_at").toString(),
+            rs.getString("second_operator"),
+            getInstant(rs, "second_confirmed_at") == null ? null : getInstant(rs, "second_confirmed_at").toString());
+
+    private static String holdSelect(boolean forUpdate) {
+        return "SELECT hold_key, bag_tag, location, reason, previous_status, status, removed_leg_id,"
+                + " first_operator, first_confirmed_at, second_operator, second_confirmed_at, created_at"
+                + " FROM customs_hold" + (forUpdate ? " WHERE hold_key = ? FOR UPDATE" : "");
+    }
+
+    private HoldRow findHold(String holdKey) {
+        List<HoldRow> rows = jdbcTemplate.query(holdSelect(false) + " WHERE hold_key = ?", HOLD_MAPPER, holdKey);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    private HoldRow lockHold(String holdKey) {
+        List<HoldRow> rows = jdbcTemplate.query(holdSelect(true), HOLD_MAPPER, holdKey);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /** 查询行李当前生效中的暂扣记录；非暂扣状态行李返回 null。 */
+    private HoldRow findActiveHold(String bagTag) {
+        List<HoldRow> rows = jdbcTemplate.query(
+                holdSelect(false) + " WHERE bag_tag = ? AND status = ?", HOLD_MAPPER, bagTag, HOLD_ACTIVE);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /** 暂扣期间写操作的统一 409：消息携带暂扣地点。 */
+    private ApiException customsHoldConflict(String bagTag, String operation) {
+        HoldRow hold = findActiveHold(bagTag);
+        String location = hold == null ? "未知" : hold.location();
+        return ApiException.conflict(
+                "行李 " + bagTag + " 处于海关暂扣，禁止" + operation + "，暂扣地点: " + location);
+    }
+
+    private CustomsHoldResponse doHold(CustomsHoldRequest request) {
+        BagRow snapshot = findBag(request.bagTag());
+        if (snapshot == null) {
+            throw ApiException.notFound("行李不存在: " + request.bagTag());
+        }
+        // 与装载保持一致的加锁顺序（先航段后行李），避免与 load/seal 死锁
+        LegRow loadedLeg = snapshot.loadedLegId() == null ? null : lockLeg(snapshot.loadedLegId());
+        BagRow bag = lockBag(request.bagTag());
+        // 持锁后重新判定：快照至加锁之间行李可能已被到达确认推进
+        String currentLoadedLegId = bag.loadedLegId();
+        if (currentLoadedLegId == null) {
+            loadedLeg = null;
+        } else if (loadedLeg == null || !currentLoadedLegId.equals(loadedLeg.legId())) {
+            loadedLeg = lockLeg(currentLoadedLegId);
+        }
+        if (BAG_CUSTOMS_HOLD.equals(bag.status())) {
+            throw customsHoldConflict(bag.bagTag(), "重复暂扣");
+        }
+        if (BAG_DELIVERED.equals(bag.status())) {
+            throw ApiException.conflict("行李 " + bag.bagTag() + " 已到达最终目的地，不得暂扣");
+        }
+        if (BAG_SHORT_UNLOADED.equals(bag.status())) {
+            throw ApiException.conflict("行李 " + bag.bagTag() + " 已丢失（短卸未补到），不得暂扣");
+        }
+        if (loadedLeg != null && !LEG_OPEN.equals(loadedLeg.status())) {
+            throw ApiException.conflict(
+                    "行李 " + bag.bagTag() + " 已处于 " + loadedLeg.status() + " 航段 "
+                            + loadedLeg.legId() + "，不得暂扣");
+        }
+        if (findHold(request.holdKey()) != null) {
+            throw ApiException.conflict("holdKey 已存在: " + request.holdKey());
+        }
+        String removedLegId = null;
+        if (loadedLeg != null) {
+            // 已在 OPEN 航段清单中：先原子移除，移除失败整次回滚
+            int removed = jdbcTemplate.update(
+                    "DELETE FROM load_record WHERE bag_tag = ? AND leg_id = ?",
+                    bag.bagTag(), loadedLeg.legId());
+            if (removed != 1) {
+                throw new IllegalStateException(
+                        "从航段 " + loadedLeg.legId() + " 清单移除行李 " + bag.bagTag() + " 失败，整次回滚");
+            }
+            jdbcTemplate.update("UPDATE leg SET version = ? WHERE leg_id = ?",
+                    loadedLeg.version() + 1, loadedLeg.legId());
+            removedLegId = loadedLeg.legId();
+        }
+        OffsetDateTime heldAt = OffsetDateTime.ofInstant(clock.get(), ZoneOffset.UTC);
+        jdbcTemplate.update(
+                "UPDATE bag SET status = ?, loaded_leg_id = NULL WHERE bag_tag = ?",
+                BAG_CUSTOMS_HOLD, bag.bagTag());
+        jdbcTemplate.update(
+                "INSERT INTO customs_hold (hold_key, bag_tag, location, reason, previous_status,"
+                        + " status, removed_leg_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                request.holdKey(), bag.bagTag(), request.location(), request.reason(),
+                bag.status(), HOLD_ACTIVE, removedLegId, heldAt);
+        insertEvent(bag.bagTag(), EVT_CUSTOMS_HOLD, removedLegId, request.location());
+        return new CustomsHoldResponse(request.holdKey(), bag.bagTag(), BAG_CUSTOMS_HOLD,
+                request.location(), request.reason(), heldAt.toInstant().toString(), removedLegId);
+    }
+
+    private CustomsReleaseResponse doConfirmRelease(String holdKey, CustomsReleaseRequest request) {
+        HoldRow hold = lockHold(holdKey);
+        if (hold == null) {
+            throw ApiException.notFound("暂扣记录不存在: " + holdKey);
+        }
+        if (HOLD_RELEASED.equals(hold.status())) {
+            throw ApiException.conflict("暂扣 " + holdKey + " 已解除，不得重复确认");
+        }
+        OffsetDateTime confirmedAt = OffsetDateTime.ofInstant(clock.get(), ZoneOffset.UTC);
+        if (hold.firstOperator() == null) {
+            jdbcTemplate.update(
+                    "UPDATE customs_hold SET first_operator = ?, first_confirmed_at = ? WHERE hold_key = ?",
+                    request.operatorId(), confirmedAt, holdKey);
+            return new CustomsReleaseResponse(holdKey, hold.bagTag(), RELEASE_PENDING_SECOND,
+                    request.operatorId(), confirmedAt.toInstant().toString(), null, null,
+                    BAG_CUSTOMS_HOLD);
+        }
+        if (hold.firstOperator().equals(request.operatorId())) {
+            throw ApiException.unprocessable(
+                    "操作人 " + request.operatorId() + " 已确认过，同一操作人不得重复确认");
+        }
+        // 第二人确认：原子解除暂扣，行李转回暂扣前可交接状态
+        BagRow bag = lockBag(hold.bagTag());
+        jdbcTemplate.update(
+                "UPDATE customs_hold SET second_operator = ?, second_confirmed_at = ?, status = ?"
+                        + " WHERE hold_key = ?",
+                request.operatorId(), confirmedAt, HOLD_RELEASED, holdKey);
+        jdbcTemplate.update(
+                "UPDATE bag SET status = ? WHERE bag_tag = ?", hold.previousStatus(), hold.bagTag());
+        insertEvent(hold.bagTag(), EVT_CUSTOMS_RELEASED, null, bag.currentLocation());
+        return new CustomsReleaseResponse(holdKey, hold.bagTag(), HOLD_RELEASED,
+                hold.firstOperator(), hold.firstConfirmedAt().toString(),
+                request.operatorId(), confirmedAt.toInstant().toString(), hold.previousStatus());
     }
 }
