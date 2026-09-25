@@ -97,6 +97,13 @@ public class ConsentRepository {
         return rows.stream().findFirst();
     }
 
+    List<RecordRow> findRecords(String subjectKey, Purpose purpose, int epoch) {
+        return jdbc.query(
+                "SELECT subject_key, purpose, epoch, record_key, payload FROM consent_record"
+                        + " WHERE subject_key = ? AND purpose = ? AND epoch = ? ORDER BY record_key",
+                RECORD_MAPPER, subjectKey, purpose.name(), epoch);
+    }
+
     void insertRecord(String subjectKey, Purpose purpose, int epoch, String recordKey, String payload, String requestId) {
         jdbc.update(
                 "INSERT INTO consent_record (subject_key, purpose, epoch, record_key, payload, request_id)"

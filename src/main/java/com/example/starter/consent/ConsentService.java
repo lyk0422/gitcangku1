@@ -5,6 +5,7 @@ import java.util.Optional;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import com.example.starter.consent.IdempotencyRepository.IdempotencyRow;
 import com.example.starter.consent.dto.GrantRequest;
@@ -21,6 +22,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  * <p>幂等规则：成功结果与业务变更同事务保存；同一 requestId 相同参数重试返回原结果，
  * 参数变更返回 409；失败请求不占用 requestId。写入重放不得绕过授权状态：
  * 即使 requestId 命中幂等记录，只要所属代次已撤回，仍返回 410。
+ *
+ * <p>顺序裁决：授权（用途迁移）、写入与撤回通过 {@link ConsentLock} 串行，
+ * 锁在事务提交后释放，与委托域操作按提交顺序裁决。
  */
 @Service
 public class ConsentService {
@@ -39,20 +43,34 @@ public class ConsentService {
     private final ConsentRepository consentRepository;
     private final IdempotencyRepository idempotencyRepository;
     private final ObjectMapper objectMapper;
+    private final TransactionTemplate transactionTemplate;
+    private final ConsentLock consentLock;
 
     public ConsentService(ConsentRepository consentRepository,
                           IdempotencyRepository idempotencyRepository,
-                          ObjectMapper objectMapper) {
+                          ObjectMapper objectMapper,
+                          org.springframework.transaction.PlatformTransactionManager transactionManager,
+                          ConsentLock consentLock) {
         this.consentRepository = consentRepository;
         this.idempotencyRepository = idempotencyRepository;
         this.objectMapper = objectMapper;
+        this.transactionTemplate = new TransactionTemplate(transactionManager);
+        this.consentLock = consentLock;
     }
 
     /**
      * 授权：当前授权仍有效时返回原代次；撤回后或首次授权生成下一代（从 1 开始递增）。
      */
-    @Transactional
     public GrantResponse grant(GrantRequest request) {
+        consentLock.lock();
+        try {
+            return transactionTemplate.execute(status -> doGrant(request));
+        } finally {
+            consentLock.unlock();
+        }
+    }
+
+    private GrantResponse doGrant(GrantRequest request) {
         String fingerprint = OP_GRANT + "|" + request.subjectKey() + "|" + request.purpose();
         Optional<IdempotencyRow> replayed = checkReplay(request.requestId(), fingerprint);
         if (replayed.isPresent()) {
@@ -88,8 +106,16 @@ public class ConsentService {
     /**
      * 写入：仅当前有效代次可写；同代同 recordKey 同 payload 去重返回原记录，不同 payload 返回 409。
      */
-    @Transactional
     public RecordResponse write(RecordWriteRequest request) {
+        consentLock.lock();
+        try {
+            return transactionTemplate.execute(status -> doWrite(request));
+        } finally {
+            consentLock.unlock();
+        }
+    }
+
+    private RecordResponse doWrite(RecordWriteRequest request) {
         String fingerprint = OP_WRITE + "|" + request.subjectKey() + "|" + request.purpose()
                 + "|" + request.recordKey() + "|" + request.payload();
         Optional<IdempotencyRow> replayed = checkReplay(request.requestId(), fingerprint);
@@ -140,8 +166,16 @@ public class ConsentService {
     /**
      * 撤回：指定代次只允许从有效变为已撤回；撤回提交后旧代查询立即返回 410，写入被拒绝。
      */
-    @Transactional
     public GrantResponse revoke(RevokeRequest request) {
+        consentLock.lock();
+        try {
+            return transactionTemplate.execute(status -> doRevoke(request));
+        } finally {
+            consentLock.unlock();
+        }
+    }
+
+    private GrantResponse doRevoke(RevokeRequest request) {
         String fingerprint = OP_REVOKE + "|" + request.subjectKey() + "|" + request.purpose() + "|" + request.epoch();
         Optional<IdempotencyRow> replayed = checkReplay(request.requestId(), fingerprint);
         if (replayed.isPresent()) {

@@ -23,6 +23,12 @@ public class GlobalExceptionHandler {
                 .body(new ErrorResponse(ex.getCode(), ex.getMessage()));
     }
 
+    @ExceptionHandler(BatchRejectionException.class)
+    public ResponseEntity<BatchErrorResponse> handleBatchRejection(BatchRejectionException ex) {
+        return ResponseEntity.status(ex.getStatus())
+                .body(new BatchErrorResponse(ex.getCode(), ex.getMessage(), ex.getReasons()));
+    }
+
     @ExceptionHandler({
             MethodArgumentNotValidException.class,
             HandlerMethodValidationException.class,
