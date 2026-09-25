@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS bag (
     bag_tag             VARCHAR(64)  NOT NULL COMMENT '行李牌号，全局唯一',
     current_location    VARCHAR(64)  NOT NULL COMMENT '当前所在站点代码',
     next_leg_index      INT          NOT NULL DEFAULT 0 COMMENT '待乘航段在行程中的下标（0 起），等于行程长度表示已完成；短卸不推进',
-    status              VARCHAR(16)  NOT NULL DEFAULT 'IN_TRANSIT' COMMENT '行李状态：IN_TRANSIT 在途/SHORT_UNLOADED 短卸待补/RECOVERED 已补到在途/DELIVERED 已交付',
+    status              VARCHAR(16)  NOT NULL DEFAULT 'IN_TRANSIT' COMMENT '行李状态：IN_TRANSIT 在途/SHORT_UNLOADED 短卸待补/RECOVERED 已补到在途/DELIVERED 已交付/CUSTOMS_HOLD 海关暂扣',
+    active_hold_key     VARCHAR(128) NULL COMMENT '当前生效的海关暂扣标识 holdKey，未暂扣为 NULL；解除后清空',
     loaded_leg_id       VARCHAR(64)  NULL COMMENT '当前已装载到的航段，未装载为 NULL',
     short_leg_id        VARCHAR(64)  NULL COMMENT '短卸缺失航段标识，仅 SHORT_UNLOADED 状态非 NULL',
     short_destination   VARCHAR(64)  NULL COMMENT '短卸应到站点代码，仅 SHORT_UNLOADED 状态非 NULL',
@@ -53,7 +54,7 @@ CREATE TABLE IF NOT EXISTS bag_event (
     id         BIGINT AUTO_INCREMENT NOT NULL COMMENT '事件自增主键',
     bag_tag    VARCHAR(64)  NOT NULL COMMENT '行李牌号',
     seq        INT          NOT NULL COMMENT '该行李内事件顺序，0 起递增',
-    event_type VARCHAR(32)  NOT NULL COMMENT '事件类型：REGISTERED 登记/LOADED 装载/UNLOADED 到达卸下/SHORT_UNLOADED 短卸/RECOVERED 补到/DELIVERED 交付',
+    event_type VARCHAR(32)  NOT NULL COMMENT '事件类型：REGISTERED 登记/LOADED 装载/UNLOADED 到达卸下/SHORT_UNLOADED 短卸/RECOVERED 补到/DELIVERED 交付/CUSTOMS_HELD 海关暂扣/CUSTOMS_HOLD_RELEASED 海关解除暂扣',
     leg_id     VARCHAR(64)  NULL COMMENT '关联航段标识，与航段无关的事件为 NULL',
     location   VARCHAR(64)  NULL COMMENT '事件发生后行李所在站点代码',
     event_time TIMESTAMP WITH TIME ZONE NOT NULL COMMENT '事件发生时刻（UTC）',
@@ -64,10 +65,46 @@ CREATE TABLE IF NOT EXISTS bag_event (
 -- 幂等去重：仅记录成功请求；同 requestId 同参数重放原结果，异参数返回 409
 CREATE TABLE IF NOT EXISTS request_log (
     request_id      VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
-    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER',
+    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER/CUSTOMS_HOLD/CUSTOMS_HOLD_CONFIRM',
     request_hash    VARCHAR(64)  NOT NULL COMMENT '请求参数（不含 requestId）的 SHA-256 摘要',
     response_status INT          NOT NULL COMMENT '原成功响应的 HTTP 状态码',
     response_body   CLOB         NOT NULL COMMENT '原成功响应体（JSON）',
     created_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     PRIMARY KEY (request_id)
+);
+
+-- 海关暂扣记录：完全不可变，任何行在插入后不再更新或删除；解除信息只写入 customs_hold_release
+CREATE TABLE IF NOT EXISTS customs_hold (
+    hold_key           VARCHAR(128) NOT NULL COMMENT '暂扣唯一标识，由请求方提供，全局唯一',
+    bag_tag            VARCHAR(64)  NOT NULL COMMENT '被暂扣行李牌号',
+    hold_location      VARCHAR(64)  NOT NULL COMMENT '暂扣地点（站点代码），阻断类 409 返回该值',
+    reason             VARCHAR(512) NOT NULL COMMENT '暂扣原因',
+    previous_status    VARCHAR(16)  NOT NULL COMMENT '暂扣前行李状态（IN_TRANSIT/RECOVERED 等），解除时恢复为该状态',
+    held_at            TIMESTAMP WITH TIME ZONE NOT NULL COMMENT '暂扣生效时刻（UTC）',
+    created_at         TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间（插入后不可变）',
+    PRIMARY KEY (hold_key)
+);
+
+-- 解除暂扣的海关操作人确认：同一 hold_key 须两名不同操作人各确认一次，先到先固化、不可替换或撤销
+CREATE TABLE IF NOT EXISTS customs_hold_confirmation (
+    id              BIGINT AUTO_INCREMENT NOT NULL COMMENT '确认自增主键',
+    hold_key        VARCHAR(128) NOT NULL COMMENT '暂扣标识',
+    operator_id     VARCHAR(64)  NOT NULL COMMENT '海关操作人标识',
+    confirmed_at    TIMESTAMP WITH TIME ZONE NOT NULL COMMENT '确认时刻（UTC）',
+    created_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间',
+    PRIMARY KEY (id),
+    UNIQUE (hold_key, operator_id)
+);
+
+-- 解除记录：第二次确认原子生成，固化两名操作人与其确认时刻；一暂扣仅一条
+CREATE TABLE IF NOT EXISTS customs_hold_release (
+    hold_key            VARCHAR(128) NOT NULL COMMENT '暂扣标识',
+    bag_tag             VARCHAR(64)  NOT NULL COMMENT '被解除暂扣的行李牌号',
+    first_operator_id   VARCHAR(64)  NOT NULL COMMENT '第一名确认操作人',
+    first_confirmed_at  TIMESTAMP WITH TIME ZONE NOT NULL COMMENT '第一名操作人确认时刻（UTC）',
+    second_operator_id  VARCHAR(64)  NOT NULL COMMENT '第二名确认操作人（与第一名不同）',
+    second_confirmed_at TIMESTAMP WITH TIME ZONE NOT NULL COMMENT '第二名操作人确认时刻（UTC），即解除生效时刻',
+    released_at         TIMESTAMP WITH TIME ZONE NOT NULL COMMENT '解除生效时刻（UTC），等于第二名确认时刻',
+    created_at          TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间',
+    PRIMARY KEY (hold_key)
 );

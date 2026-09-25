@@ -14,13 +14,20 @@ import org.springframework.web.bind.annotation.RestController;
 import com.example.starter.baggage.BaggageDtos.ArriveRequest;
 import com.example.starter.baggage.BaggageDtos.ArriveResponse;
 import com.example.starter.baggage.BaggageDtos.BagResponse;
+import com.example.starter.baggage.BaggageDtos.BagBlockingResponse;
+import com.example.starter.baggage.BaggageDtos.CustomsHoldConfirmRequest;
+import com.example.starter.baggage.BaggageDtos.CustomsHoldConfirmResponse;
+import com.example.starter.baggage.BaggageDtos.CustomsHoldRequest;
+import com.example.starter.baggage.BaggageDtos.CustomsHoldResponse;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveRequest;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveResponse;
+import com.example.starter.baggage.BaggageDtos.HoldHistoryResponse;
 import com.example.starter.baggage.BaggageDtos.LegDifferenceResponse;
 import com.example.starter.baggage.BaggageDtos.LegResponse;
 import com.example.starter.baggage.BaggageDtos.LoadRequest;
 import com.example.starter.baggage.BaggageDtos.LoadResponse;
 import com.example.starter.baggage.BaggageDtos.ManifestResponse;
+import com.example.starter.baggage.BaggageDtos.PendingHoldListResponse;
 import com.example.starter.baggage.BaggageDtos.RecoverRequest;
 import com.example.starter.baggage.BaggageDtos.RecoverResponse;
 import com.example.starter.baggage.BaggageDtos.RegisterBagRequest;
@@ -79,6 +86,18 @@ public class BaggageController {
         return baggageService.arriveDifference(legId, request);
     }
 
+    /** 海关暂扣：行李转 CUSTOMS_HOLD 并写入不可变暂扣记录，OPEN 清单中的行李先原子移除。 */
+    @PostMapping("/bags/customs-hold")
+    public CustomsHoldResponse customsHold(@Valid @RequestBody CustomsHoldRequest request) {
+        return baggageService.customsHold(request);
+    }
+
+    /** 解除暂扣确认：两名不同操作人按同一 holdKey 各确认一次，第二次确认原子解除。 */
+    @PostMapping("/bags/customs-hold/confirm")
+    public CustomsHoldConfirmResponse customsHoldConfirm(@Valid @RequestBody CustomsHoldConfirmRequest request) {
+        return baggageService.customsHoldConfirm(request);
+    }
+
     /** 补到：短卸行李在缺失航段的应到站实际到达后恢复行程。 */
     @PostMapping("/bags/recover")
     public RecoverResponse recover(@Valid @RequestBody RecoverRequest request) {
@@ -89,6 +108,24 @@ public class BaggageController {
     @GetMapping("/bags/{bagTag}/trace")
     public BagResponse getBagTrace(@PathVariable String bagTag) {
         return baggageService.getBagTrace(bagTag);
+    }
+
+    /** 行李当前交接阻断原因查询。 */
+    @GetMapping("/bags/{bagTag}/blocking-reasons")
+    public BagBlockingResponse getBlockingReasons(@PathVariable String bagTag) {
+        return baggageService.getBlockingReasons(bagTag);
+    }
+
+    /** 暂扣历史查询（按行李）。 */
+    @GetMapping("/bags/{bagTag}/customs-holds")
+    public HoldHistoryResponse getHoldHistory(@PathVariable String bagTag) {
+        return baggageService.getHoldHistory(bagTag);
+    }
+
+    /** 待第二人确认清单查询。 */
+    @GetMapping("/customs-holds/pending-second-confirmation")
+    public PendingHoldListResponse listPendingSecondConfirmation() {
+        return baggageService.listPendingSecondConfirmation();
     }
 
     /** 封舱清单查询。 */
