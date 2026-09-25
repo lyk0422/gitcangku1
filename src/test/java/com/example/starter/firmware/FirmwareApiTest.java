@@ -35,6 +35,8 @@ class FirmwareApiTest {
 
     @BeforeEach
     void cleanUp() {
+        jdbc.update("DELETE FROM canary_promotion");
+        jdbc.update("DELETE FROM canary_level");
         jdbc.update("DELETE FROM rollout_task");
         jdbc.update("DELETE FROM release_order");
         jdbc.update("DELETE FROM device");

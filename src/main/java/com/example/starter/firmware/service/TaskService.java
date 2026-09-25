@@ -11,6 +11,7 @@ import com.example.starter.firmware.domain.ReleaseStatus;
 import com.example.starter.firmware.domain.RolloutTask;
 import com.example.starter.firmware.domain.TaskStatus;
 import com.example.starter.firmware.error.ApiException;
+import com.example.starter.firmware.repo.CanaryLevelRepository;
 import com.example.starter.firmware.repo.DeviceRepository;
 import com.example.starter.firmware.repo.ReleaseRepository;
 import com.example.starter.firmware.repo.TaskRepository;
@@ -28,16 +29,19 @@ public class TaskService {
     private final TaskRepository taskRepository;
     private final ReleaseRepository releaseRepository;
     private final DeviceRepository deviceRepository;
+    private final CanaryLevelRepository canaryLevelRepository;
     private final DeviceService deviceService;
     private final ReleaseService releaseService;
     private final IdempotencyService idempotency;
 
     public TaskService(TaskRepository taskRepository, ReleaseRepository releaseRepository,
-                       DeviceRepository deviceRepository, DeviceService deviceService,
-                       ReleaseService releaseService, IdempotencyService idempotency) {
+                       DeviceRepository deviceRepository, CanaryLevelRepository canaryLevelRepository,
+                       DeviceService deviceService, ReleaseService releaseService,
+                       IdempotencyService idempotency) {
         this.taskRepository = taskRepository;
         this.releaseRepository = releaseRepository;
         this.deviceRepository = deviceRepository;
+        this.canaryLevelRepository = canaryLevelRepository;
         this.deviceService = deviceService;
         this.releaseService = releaseService;
         this.idempotency = idempotency;
@@ -98,6 +102,7 @@ public class TaskService {
                     if (request.result() == ReceiptResult.SUCCESS) {
                         deviceRepository.updateCurrentVersion(task.deviceId(), order.toVersion());
                     }
+                    recordCanarySample(order, request.result());
                     yield TaskView.of(taskRepository.findById(taskId).orElseThrow(), order);
                 }
                 case SUCCESS, FAILED -> {
@@ -110,6 +115,27 @@ public class TaskService {
                 case CANCELLED -> throw ApiException.conflict("TASK_CANCELLED", "任务已取消，回执不再受理");
             };
         }, TaskView.class);
+    }
+
+    /**
+     * 首次终结回执计入当前解锁级别样本；当前级别失败率超过上限时触发失败自动暂停。
+     * 仅在发布单 ACTIVE 时计数；调用方已持有发布单行锁，与推进串行。
+     */
+    private void recordCanarySample(ReleaseOrder order, ReceiptResult result) {
+        if (order.status() != ReleaseStatus.ACTIVE) {
+            return;
+        }
+        var levels = canaryLevelRepository.findByRelease(order.id());
+        if (levels.isEmpty()) {
+            return;
+        }
+        canaryLevelRepository.recordSample(order.id(), order.currentLevel(),
+                result == ReceiptResult.FAILED);
+        var current = canaryLevelRepository.findByReleaseAndLevel(order.id(), order.currentLevel())
+                .orElseThrow(() -> new IllegalStateException("当前解锁级别缺失: " + order.currentLevel()));
+        if (current.failureRateExceeded()) {
+            releaseRepository.pause(order.id());
+        }
     }
 
     public TaskListResponse listByRelease(long releaseId, TaskStatus statusFilter) {
