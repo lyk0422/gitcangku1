@@ -3,15 +3,20 @@ package com.example.starter.plan.service;
 import com.example.starter.plan.model.DayPlan;
 import com.example.starter.plan.model.Occupancy;
 import com.example.starter.plan.model.PlanStatus;
+import com.example.starter.plan.model.Platform;
+import com.example.starter.plan.model.PlatformSpan;
 import com.example.starter.plan.model.PublishedSlot;
 import com.example.starter.plan.model.RescheduleLink;
 import com.example.starter.plan.repo.IdempotencyRepository;
 import com.example.starter.plan.repo.PlanRepository;
+import com.example.starter.plan.repo.PlatformRepository;
 import com.example.starter.plan.web.ApiException;
+import com.example.starter.plan.web.dto.ConsistUpdateRequest;
 import com.example.starter.plan.web.dto.CreatePlanRequest;
 import com.example.starter.plan.web.dto.OccupancyRequest;
 import com.example.starter.plan.web.dto.OccupancyView;
 import com.example.starter.plan.web.dto.PlanResponse;
+import com.example.starter.plan.web.dto.PlatformRiskView;
 import com.example.starter.plan.web.dto.PublishedSlotView;
 import com.example.starter.plan.web.dto.RescheduleChainItem;
 import com.example.starter.plan.web.dto.RescheduleChainResponse;
@@ -57,15 +62,19 @@ public class PlanService {
     private static final String OP_PUBLISH = "PUBLISH";
     private static final String OP_CANCEL = "CANCEL";
     private static final String OP_RESCHEDULE = "RESCHEDULE";
+    private static final String OP_CONSIST = "CONSIST";
 
     private final PlanRepository planRepo;
+    private final PlatformRepository platformRepo;
     private final IdempotencyRepository idemRepo;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate tx;
 
-    public PlanService(PlanRepository planRepo, IdempotencyRepository idemRepo,
+    public PlanService(PlanRepository planRepo, PlatformRepository platformRepo,
+                       IdempotencyRepository idemRepo,
                        ObjectMapper objectMapper, PlatformTransactionManager txManager) {
         this.planRepo = planRepo;
+        this.platformRepo = platformRepo;
         this.idemRepo = idemRepo;
         this.objectMapper = objectMapper;
         this.tx = new TransactionTemplate(txManager);
@@ -84,6 +93,12 @@ public class PlanService {
         }
         try {
             return tx.execute(status -> {
+                // 并发下同键请求可能已提交：事务内先按幂等记录裁决（同参重放/异参 409）
+                Optional<PlanResponse> replayInTx =
+                        replayIfPresent(OP_CREATE, req.requestKey(), hash);
+                if (replayInTx.isPresent()) {
+                    return replayInTx.get();
+                }
                 if (planRepo.findByKey(req.scheduleKey()).isPresent()) {
                     throw conflict("SCHEDULE_KEY_EXISTS", "scheduleKey 已存在: " + req.scheduleKey());
                 }
@@ -139,7 +154,16 @@ public class PlanService {
      * 任一冲突则整张计划保持草稿并抛出 422（携带冲突区段与计划）。
      */
     public PlanResponse publish(String scheduleKey, String requestKey) {
-        String hash = hashAction(OP_PUBLISH, scheduleKey);
+        return publish(scheduleKey, requestKey, null);
+    }
+
+    /**
+     * 发布计划（携带操作者，计入幂等指纹）。除时隙冲突外，已登记编组的计划
+     * 还须通过站台联合复核：编组长度不得超过每个停靠站台有效长度，
+     * 且不得与其他已发布计划同站台窗口重叠，否则 422 并保持草稿。
+     */
+    public PlanResponse publish(String scheduleKey, String requestKey, String operator) {
+        String hash = hashAction(OP_PUBLISH, scheduleKey, operator);
         Optional<PlanResponse> replay = replayIfPresent(OP_PUBLISH, requestKey, hash);
         if (replay.isPresent()) {
             return replay.get();
@@ -161,6 +185,12 @@ public class PlanService {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "存在时隙冲突，计划保持草稿", conflicts);
                 }
+                List<Map<String, Object>> platformConflicts =
+                        findPlatformConflicts(plan, occupancies, List.of(plan.id()));
+                if (!platformConflicts.isEmpty()) {
+                    throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "PLATFORM_CONFLICT",
+                            "编组与站台联合复核未通过，计划保持草稿", platformConflicts);
+                }
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(plan.id(), PlanStatus.PUBLISHED, now);
                 PlanResponse response = loadPlan(scheduleKey);
@@ -176,7 +206,14 @@ public class PlanService {
      * 取消已发布计划：时隙立即释放，历史计划与占用保留不改写。
      */
     public PlanResponse cancel(String scheduleKey, String requestKey) {
-        String hash = hashAction(OP_CANCEL, scheduleKey);
+        return cancel(scheduleKey, requestKey, null);
+    }
+
+    /**
+     * 取消已发布计划（携带操作者，计入幂等指纹）；未解除的站台风险随取消一并解除。
+     */
+    public PlanResponse cancel(String scheduleKey, String requestKey, String operator) {
+        String hash = hashAction(OP_CANCEL, scheduleKey, operator);
         Optional<PlanResponse> replay = replayIfPresent(OP_CANCEL, requestKey, hash);
         if (replay.isPresent()) {
             return replay.get();
@@ -191,6 +228,7 @@ public class PlanService {
                 }
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(plan.id(), PlanStatus.CANCELLED, now);
+                platformRepo.resolveOpenRisks(plan.id(), now);
                 PlanResponse response = loadPlan(scheduleKey);
                 idemRepo.insert(OP_CANCEL, requestKey, hash, toJson(response), now);
                 return response;
@@ -198,6 +236,93 @@ public class PlanService {
         } catch (DuplicateKeyException e) {
             return resolveDuplicate(OP_CANCEL, requestKey, hash);
         }
+    }
+
+    /**
+     * 登记或变更计划编组：车厢按编号去重并规范排序，站台代码去重排序且必须已存在；
+     * 编组长度必须为正。携带 expectedVersion 乐观校验，成功版本加一。
+     *
+     * <p>已取消计划不可改（409）；无风险的已发布计划不可改（409）；被标记
+     * PLATFORM_RISK 的已发布计划仅允许消除风险的变更——结果编组不得超过每个
+     * 停靠站台的当前有效长度（即只能缩短编组或替换为合格站台），否则 422 且风险保留；
+     * 变更合规后解除其全部未解除风险。草稿计划在发布时才做长度复核，此处仅校验站台存在。
+     */
+    public PlanResponse updateConsist(String scheduleKey, ConsistUpdateRequest req) {
+        List<String> cars = normalizeCars(req.cars());
+        List<String> platformCodes = normalizePlatforms(req.platformCodes());
+        try {
+            return tx.execute(status -> {
+                // 与发布/改签/站台下调同一把全局锁，按事务提交顺序裁决，避免编组读取站台长度偏斜
+                planRepo.acquirePublishLock();
+                DayPlan plan = planRepo.findByKeyForUpdate(scheduleKey)
+                        .orElseThrow(() -> notFound(scheduleKey));
+                List<Occupancy> occupancies = planRepo.findOccupancies(plan.id());
+                String hash = hashConsist(scheduleKey, req, cars, platformCodes, occupancies);
+                Optional<PlanResponse> replay = replayIfPresent(OP_CONSIST, req.requestKey(), hash);
+                if (replay.isPresent()) {
+                    return replay.get();
+                }
+                if (plan.status() == PlanStatus.CANCELLED) {
+                    throw conflict("PLAN_STATE_CONFLICT", "已取消计划不可变更编组");
+                }
+                boolean openRisk = platformRepo.hasOpenRisk(plan.id());
+                if (plan.status() == PlanStatus.PUBLISHED && !openRisk) {
+                    throw conflict("PLAN_STATE_CONFLICT",
+                            "仅草稿或站台风险计划可变更编组，当前状态: " + plan.status());
+                }
+                if (req.expectedVersion() != plan.version()) {
+                    throw conflict("VERSION_CONFLICT",
+                            "expectedVersion=" + req.expectedVersion() + " 与当前版本 "
+                                    + plan.version() + " 不一致");
+                }
+                for (String code : platformCodes) {
+                    if (platformRepo.findByCode(code).isEmpty()) {
+                        throw new ApiException(HttpStatus.BAD_REQUEST, "PLATFORM_NOT_FOUND",
+                                "站台不存在: " + code);
+                    }
+                }
+                if (openRisk) {
+                    // 风险持续门禁：变更结果必须对每个停靠站台当前有效长度合规
+                    List<Map<String, Object>> violations =
+                            findLengthViolations(scheduleKey, req.consistLength(), platformCodes);
+                    if (!violations.isEmpty()) {
+                        throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY,
+                                "PLATFORM_CONFLICT",
+                                "风险计划仅允许缩短编组或替换为合格站台", violations);
+                    }
+                }
+                long now = System.currentTimeMillis();
+                planRepo.replaceConsist(plan.id(), req.consistLength(), cars, platformCodes,
+                        plan.version() + 1, now);
+                if (openRisk) {
+                    platformRepo.resolveOpenRisks(plan.id(), now);
+                }
+                PlanResponse response = loadPlan(scheduleKey);
+                idemRepo.insert(OP_CONSIST, req.requestKey(), hash, toJson(response), now);
+                return response;
+            });
+        } catch (DuplicateKeyException e) {
+            // 并发同键：重算指纹（含当前占用时段）后按幂等记录裁决
+            DayPlan plan = planRepo.findByKey(scheduleKey)
+                    .orElseThrow(() -> notFound(scheduleKey));
+            String hash = hashConsist(scheduleKey, req, cars, platformCodes,
+                    planRepo.findOccupancies(plan.id()));
+            return replayIfPresent(OP_CONSIST, req.requestKey(), hash)
+                    .orElseThrow(() -> conflict("IDEMPOTENT_KEY_REUSED",
+                            "requestKey 已用于其他参数: " + req.requestKey()));
+        }
+    }
+
+    /**
+     * 查询计划的站台风险快照（含已解除），计划不存在返回 404。
+     */
+    public List<PlatformRiskView> getPlanRisks(String scheduleKey) {
+        DayPlan plan = planRepo.findByKey(scheduleKey)
+                .orElseThrow(() -> notFound(scheduleKey));
+        return platformRepo.findRisksByPlan(plan.id()).stream()
+                .map(r -> new PlatformRiskView(r.platformCode(), r.previousLength(), r.newLength(),
+                        r.consistLength(), r.markedAt(), r.resolvedAt()))
+                .toList();
     }
 
     /**
@@ -259,6 +384,15 @@ public class PlanService {
                 if (!conflicts.isEmpty()) {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "新草稿存在时隙冲突，改签未生效", conflicts);
+                }
+                // 按最终状态复核新计划编组与站台（旧计划占用随取消释放，不再参与裁决）；
+                // 任一超长或同站台重叠即 422，整批不写入
+                List<Map<String, Object>> platformConflicts =
+                        findPlatformConflicts(newPlan, occupancies,
+                                List.of(newPlan.id(), oldPlan.id()));
+                if (!platformConflicts.isEmpty()) {
+                    throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "PLATFORM_CONFLICT",
+                            "编组与站台联合复核未通过，改签整批未写入", platformConflicts);
                 }
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(oldPlan.id(), PlanStatus.CANCELLED, now);
@@ -341,8 +475,12 @@ public class PlanService {
         List<OccupancyView> views = planRepo.findOccupancies(plan.id()).stream()
                 .map(o -> new OccupancyView(o.trainNo(), o.sectionId(), o.startUtc(), o.endUtc()))
                 .toList();
+        List<String> cars = planRepo.findCarNos(plan.id());
+        List<String> platformCodes = planRepo.findPlatformCodes(plan.id());
+        boolean platformRisk = platformRepo.hasOpenRisk(plan.id());
         return new PlanResponse(plan.scheduleKey(), plan.opDate(), plan.version(),
-                plan.status().name(), views);
+                plan.status().name(), views, plan.consistLength(), cars, platformCodes,
+                platformRisk);
     }
 
     private List<Occupancy> toOccupancies(long planId, List<OccupancyRequest> requests) {
@@ -453,6 +591,116 @@ public class PlanService {
     }
 
     /**
+     * 编组与站台联合复核：仅对已登记编组的计划生效。编组长度不得超过每个停靠站台的
+     * 当前有效长度；计划占用整体跨度不得与其他已发布计划（排除 excludePlanIds）
+     * 在同一站台的占用窗口重叠（左闭右开，相邻合法）。
+     *
+     * @param excludePlanIds 检测时排除的计划 id（发布为自身；改签为新旧两个计划）
+     */
+    private List<Map<String, Object>> findPlatformConflicts(DayPlan plan,
+                                                            List<Occupancy> occupancies,
+                                                            List<Long> excludePlanIds) {
+        if (plan.consistLength() == null) {
+            return List.of();
+        }
+        List<String> platformCodes = planRepo.findPlatformCodes(plan.id());
+        List<Map<String, Object>> conflicts = new ArrayList<>(
+                findLengthViolations(plan.scheduleKey(), plan.consistLength(), platformCodes));
+        if (platformCodes.isEmpty() || occupancies.isEmpty()) {
+            return conflicts;
+        }
+        List<PlatformSpan> others = platformRepo.findPublishedPlatformSpans(plan.opDate(),
+                platformCodes, excludePlanIds);
+        String span = spanOf(occupancies);
+        long start = Long.parseLong(span.substring(0, span.indexOf('/')));
+        long end = Long.parseLong(span.substring(span.indexOf('/') + 1));
+        Instant startUtc = Instant.ofEpochMilli(start);
+        Instant endUtc = Instant.ofEpochMilli(end);
+        for (PlatformSpan other : others) {
+            boolean overlap = startUtc.isBefore(other.endUtc())
+                    && other.startUtc().isBefore(endUtc);
+            if (overlap) {
+                Map<String, Object> detail = new LinkedHashMap<>();
+                detail.put("type", "PLATFORM_OVERLAP");
+                detail.put("platformCode", other.platformCode());
+                detail.put("scheduleKey", plan.scheduleKey());
+                detail.put("conflictingScheduleKey", other.scheduleKey());
+                detail.put("startUtc", startUtc.toString());
+                detail.put("endUtc", endUtc.toString());
+                conflicts.add(detail);
+            }
+        }
+        return conflicts;
+    }
+
+    /**
+     * 编组长度对每个停靠站台当前有效长度的超限明细。
+     */
+    private List<Map<String, Object>> findLengthViolations(String scheduleKey, int consistLength,
+                                                           List<String> platformCodes) {
+        List<Map<String, Object>> violations = new ArrayList<>();
+        for (String code : platformCodes) {
+            Optional<Platform> platform = platformRepo.findByCode(code);
+            if (platform.isPresent() && consistLength > platform.get().effectiveLength()) {
+                Map<String, Object> detail = new LinkedHashMap<>();
+                detail.put("type", "PLATFORM_LENGTH_EXCEEDED");
+                detail.put("platformCode", code);
+                detail.put("scheduleKey", scheduleKey);
+                detail.put("consistLength", consistLength);
+                detail.put("platformLength", platform.get().effectiveLength());
+                violations.add(detail);
+            }
+        }
+        return violations;
+    }
+
+    /**
+     * 计划占用整体跨度："startMillis/endMillis"（左闭右开）。
+     */
+    private String spanOf(List<Occupancy> occupancies) {
+        long start = Long.MAX_VALUE;
+        long end = Long.MIN_VALUE;
+        for (Occupancy o : occupancies) {
+            start = Math.min(start, o.startUtc().toEpochMilli());
+            end = Math.max(end, o.endUtc().toEpochMilli());
+        }
+        return start + "/" + end;
+    }
+
+    /**
+     * 车厢编号规范化：去空白、去重，纯数字按数值排序，其余按字典序（数字优先）。
+     */
+    private List<String> normalizeCars(List<String> cars) {
+        return cars.stream()
+                .map(String::trim)
+                .distinct()
+                .sorted((a, b) -> {
+                    boolean aNumeric = a.chars().allMatch(Character::isDigit);
+                    boolean bNumeric = b.chars().allMatch(Character::isDigit);
+                    if (aNumeric && bNumeric) {
+                        int byValue = Long.compare(Long.parseLong(a), Long.parseLong(b));
+                        return byValue != 0 ? byValue : a.compareTo(b);
+                    }
+                    if (aNumeric != bNumeric) {
+                        return aNumeric ? -1 : 1;
+                    }
+                    return a.compareTo(b);
+                })
+                .toList();
+    }
+
+    /**
+     * 站台代码规范化：去空白、去重、按字典序排序。
+     */
+    private List<String> normalizePlatforms(List<String> platformCodes) {
+        return platformCodes.stream()
+                .map(String::trim)
+                .distinct()
+                .sorted()
+                .toList();
+    }
+
+    /**
      * 幂等重放：存在记录且参数一致返回首次结果；参数不一致抛 409。
      */
     private Optional<PlanResponse> replayIfPresent(String opType, String requestKey, String hash) {
@@ -495,13 +743,31 @@ public class PlanService {
         return sha256(sb.toString());
     }
 
-    private String hashAction(String opType, String scheduleKey) {
-        return sha256(opType + '\n' + scheduleKey);
+    private String hashAction(String opType, String scheduleKey, String operator) {
+        return sha256(opType + '\n' + scheduleKey + '\n' + (operator == null ? "" : operator));
     }
 
     private String hashReschedule(String oldScheduleKey, RescheduleRequest req) {
         return sha256(OP_RESCHEDULE + '\n' + oldScheduleKey + '\n' + req.newScheduleKey()
-                + '\n' + req.expectedOldVersion() + '\n' + req.expectedNewVersion());
+                + '\n' + req.expectedOldVersion() + '\n' + req.expectedNewVersion()
+                + '\n' + (req.operator() == null ? "" : req.operator()));
+    }
+
+    /**
+     * 编组变更幂等指纹：操作者、计划业务键、计划版本、编组长度、规范化车厢、
+     * 规范化站台与计划当前占用时段（整体跨度）。
+     */
+    private String hashConsist(String scheduleKey, ConsistUpdateRequest req, List<String> cars,
+                               List<String> platformCodes, List<Occupancy> occupancies) {
+        StringBuilder sb = new StringBuilder(OP_CONSIST).append('\n')
+                .append(req.operator()).append('\n')
+                .append(scheduleKey).append('\n')
+                .append(req.expectedVersion()).append('\n')
+                .append(req.consistLength()).append('\n')
+                .append(String.join(",", cars)).append('\n')
+                .append(String.join(",", platformCodes)).append('\n')
+                .append(spanOf(occupancies));
+        return sha256(sb.toString());
     }
 
     private void appendOccupancies(StringBuilder sb, List<OccupancyRequest> occupancies) {

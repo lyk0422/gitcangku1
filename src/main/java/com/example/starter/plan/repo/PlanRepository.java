@@ -7,6 +7,7 @@ import com.example.starter.plan.model.PublishedSlot;
 import com.example.starter.plan.model.RescheduleLink;
 import java.sql.Date;
 import java.sql.PreparedStatement;
+import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Instant;
 import java.time.LocalDate;
@@ -15,6 +16,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.StringJoiner;
+import org.springframework.jdbc.core.BatchPreparedStatementSetter;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.jdbc.support.GeneratedKeyHolder;
@@ -32,7 +34,8 @@ public class PlanRepository {
             rs.getString("schedule_key"),
             rs.getObject("op_date", LocalDate.class),
             rs.getInt("version"),
-            PlanStatus.valueOf(rs.getString("status")));
+            PlanStatus.valueOf(rs.getString("status")),
+            rs.getObject("consist_length", Integer.class));
 
     private static final RowMapper<Occupancy> OCCUPANCY_MAPPER = (rs, n) -> new Occupancy(
             rs.getLong("id"),
@@ -79,7 +82,7 @@ public class PlanRepository {
      * 按业务键查询计划（不加锁）。
      */
     public Optional<DayPlan> findByKey(String scheduleKey) {
-        return jdbc.query("SELECT id, schedule_key, op_date, version, status FROM rail_day_plan"
+        return jdbc.query("SELECT id, schedule_key, op_date, version, status, consist_length FROM rail_day_plan"
                         + " WHERE schedule_key = ?",
                 PLAN_MAPPER, scheduleKey).stream().findFirst();
     }
@@ -88,7 +91,7 @@ public class PlanRepository {
      * 按主键查询计划（不加锁），用于改签链遍历。
      */
     public Optional<DayPlan> findById(long planId) {
-        return jdbc.query("SELECT id, schedule_key, op_date, version, status FROM rail_day_plan"
+        return jdbc.query("SELECT id, schedule_key, op_date, version, status, consist_length FROM rail_day_plan"
                         + " WHERE id = ?",
                 PLAN_MAPPER, planId).stream().findFirst();
     }
@@ -97,7 +100,7 @@ public class PlanRepository {
      * 按业务键查询计划并加行级写锁，须在事务内调用，用于串行化同一计划的更新/发布/取消。
      */
     public Optional<DayPlan> findByKeyForUpdate(String scheduleKey) {
-        return jdbc.query("SELECT id, schedule_key, op_date, version, status FROM rail_day_plan"
+        return jdbc.query("SELECT id, schedule_key, op_date, version, status, consist_length FROM rail_day_plan"
                         + " WHERE schedule_key = ? FOR UPDATE",
                 PLAN_MAPPER, scheduleKey).stream().findFirst();
     }
@@ -218,5 +221,64 @@ public class PlanRepository {
      */
     public void acquirePublishLock() {
         jdbc.queryForObject("SELECT id FROM publish_lock WHERE id = 1 FOR UPDATE", Integer.class);
+    }
+
+    /**
+     * 整体替换计划编组：车厢与停靠站台先删后插（入参须已规范化去重排序），
+     * 并更新编组长度与计划版本。
+     */
+    public void replaceConsist(long planId, int consistLength, List<String> cars,
+                               List<String> platformCodes, int newVersion, long nowMillis) {
+        jdbc.update("DELETE FROM rail_plan_car WHERE plan_id = ?", planId);
+        jdbc.batchUpdate(
+                "INSERT INTO rail_plan_car (plan_id, seq, car_no) VALUES (?, ?, ?)",
+                new BatchPreparedStatementSetter() {
+                    @Override
+                    public void setValues(PreparedStatement ps, int i) throws SQLException {
+                        ps.setLong(1, planId);
+                        ps.setInt(2, i);
+                        ps.setString(3, cars.get(i));
+                    }
+
+                    @Override
+                    public int getBatchSize() {
+                        return cars.size();
+                    }
+                });
+        jdbc.update("DELETE FROM rail_plan_platform WHERE plan_id = ?", planId);
+        jdbc.batchUpdate(
+                "INSERT INTO rail_plan_platform (plan_id, platform_code) VALUES (?, ?)",
+                new BatchPreparedStatementSetter() {
+                    @Override
+                    public void setValues(PreparedStatement ps, int i) throws SQLException {
+                        ps.setLong(1, planId);
+                        ps.setString(2, platformCodes.get(i));
+                    }
+
+                    @Override
+                    public int getBatchSize() {
+                        return platformCodes.size();
+                    }
+                });
+        jdbc.update("UPDATE rail_day_plan SET consist_length = ?, version = ?, updated_at = ?"
+                        + " WHERE id = ?",
+                consistLength, newVersion, nowMillis, planId);
+    }
+
+    /**
+     * 查询计划编组车厢编号，按规范化序号升序。
+     */
+    public List<String> findCarNos(long planId) {
+        return jdbc.query("SELECT car_no FROM rail_plan_car WHERE plan_id = ? ORDER BY seq",
+                (rs, n) -> rs.getString("car_no"), planId);
+    }
+
+    /**
+     * 查询计划停靠站台代码，按字典序升序。
+     */
+    public List<String> findPlatformCodes(long planId) {
+        return jdbc.query("SELECT platform_code FROM rail_plan_platform WHERE plan_id = ?"
+                        + " ORDER BY platform_code",
+                (rs, n) -> rs.getString("platform_code"), planId);
     }
 }

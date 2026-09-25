@@ -1,9 +1,17 @@
 package com.example.starter.plan.web;
 
 import com.example.starter.plan.service.PlanService;
+import com.example.starter.plan.service.PlatformService;
+import com.example.starter.plan.web.dto.ConsistUpdateRequest;
 import com.example.starter.plan.web.dto.CreatePlanRequest;
 import com.example.starter.plan.web.dto.PlanActionRequest;
 import com.example.starter.plan.web.dto.PlanResponse;
+import com.example.starter.plan.web.dto.PlatformCreateRequest;
+import com.example.starter.plan.web.dto.PlatformLengthRequest;
+import com.example.starter.plan.web.dto.PlatformLengthResponse;
+import com.example.starter.plan.web.dto.PlatformOccupancyView;
+import com.example.starter.plan.web.dto.PlatformResponse;
+import com.example.starter.plan.web.dto.PlatformRiskView;
 import com.example.starter.plan.web.dto.PublishedSlotView;
 import com.example.starter.plan.web.dto.RescheduleChainResponse;
 import com.example.starter.plan.web.dto.RescheduleRequest;
@@ -37,9 +45,11 @@ import org.springframework.web.bind.annotation.RestController;
 public class PlanController {
 
     private final PlanService service;
+    private final PlatformService platformService;
 
-    public PlanController(PlanService service) {
+    public PlanController(PlanService service, PlatformService platformService) {
         this.service = service;
+        this.platformService = platformService;
     }
 
     /**
@@ -66,7 +76,7 @@ public class PlanController {
     @PostMapping("/plans/{scheduleKey}/publish")
     public PlanResponse publish(@PathVariable String scheduleKey,
                                 @Valid @RequestBody PlanActionRequest request) {
-        return service.publish(scheduleKey, request.requestKey());
+        return service.publish(scheduleKey, request.requestKey(), request.operator());
     }
 
     /**
@@ -75,7 +85,7 @@ public class PlanController {
     @PostMapping("/plans/{scheduleKey}/cancel")
     public PlanResponse cancel(@PathVariable String scheduleKey,
                                @Valid @RequestBody PlanActionRequest request) {
-        return service.cancel(scheduleKey, request.requestKey());
+        return service.cancel(scheduleKey, request.requestKey(), request.operator());
     }
 
     /**
@@ -112,5 +122,51 @@ public class PlanController {
             @RequestParam @NotNull @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date,
             @RequestParam @NotBlank String sectionId) {
         return service.getPublishedSlots(date, sectionId);
+    }
+
+    /**
+     * 登记/变更计划编组：车厢去重规范排序，站台必须存在；expectedVersion 乐观校验，
+     * 已取消计划不可改，站台风险计划仅允许合规变更（缩短编组或替换合格站台）。
+     */
+    @PutMapping("/plans/{scheduleKey}/consist")
+    public PlanResponse updateConsist(@PathVariable String scheduleKey,
+                                      @Valid @RequestBody ConsistUpdateRequest request) {
+        return service.updateConsist(scheduleKey, request);
+    }
+
+    /**
+     * 查询计划的站台超长风险快照（含已解除）。
+     */
+    @GetMapping("/plans/{scheduleKey}/platform-risk")
+    public List<PlatformRiskView> getPlanRisks(@PathVariable String scheduleKey) {
+        return service.getPlanRisks(scheduleKey);
+    }
+
+    /**
+     * 创建站台。
+     */
+    @PostMapping("/platforms")
+    @ResponseStatus(HttpStatus.CREATED)
+    public PlatformResponse createPlatform(@Valid @RequestBody PlatformCreateRequest request) {
+        return platformService.createPlatform(request);
+    }
+
+    /**
+     * 调整站台有效长度；下调时同一事务回查未来已发布计划并标记 PLATFORM_RISK。
+     */
+    @PutMapping("/platforms/{code}/length")
+    public PlatformLengthResponse adjustPlatformLength(
+            @PathVariable String code, @Valid @RequestBody PlatformLengthRequest request) {
+        return platformService.adjustLength(code, request);
+    }
+
+    /**
+     * 查询指定运营日某站台上已发布计划的占用窗口。
+     */
+    @GetMapping("/platforms/{code}/occupancy")
+    public List<PlatformOccupancyView> getPlatformOccupancy(
+            @PathVariable String code,
+            @RequestParam @NotNull @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date) {
+        return platformService.getOccupancy(date, code);
     }
 }
