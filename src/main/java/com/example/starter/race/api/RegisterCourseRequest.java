@@ -3,14 +3,12 @@ package com.example.starter.race.api;
 import jakarta.validation.constraints.NotBlank;
 
 /**
- * 新建赛事请求；必须关联一个已登记赛道。
+ * 登记赛道请求；登记后初始无纪录。
  *
- * @param raceId    赛事ID，全局唯一
- * @param courseKey 所属赛道标识，须已登记
+ * @param courseKey 赛道标识，全局唯一
  * @param requestId 全局唯一请求ID（幂等键）
  */
-public record CreateRaceRequest(
-        @NotBlank String raceId,
+public record RegisterCourseRequest(
         @NotBlank String courseKey,
         @NotBlank String requestId
 ) {

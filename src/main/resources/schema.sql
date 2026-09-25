@@ -1,13 +1,22 @@
--- 赛事成绩封榜领域表结构。
+-- 赛事成绩封榜与赛道纪录领域表结构。
 -- 本地默认以 H2 内存库运行：jdbc:h2:mem:race_demo;MODE=MySQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1
 -- 标识符统一小写；时间字段均为 Unix 毫秒时间戳（BIGINT），不涉及时区换算。
 
+CREATE TABLE IF NOT EXISTS course (
+    course_key VARCHAR(64) NOT NULL COMMENT '赛道标识，全局唯一',
+    current_record_id BIGINT COMMENT '当前纪录ID（指向 course_record.id）；NULL表示该赛道尚无纪录',
+    created_at BIGINT NOT NULL COMMENT '赛道登记时间，Unix毫秒时间戳',
+    CONSTRAINT pk_course PRIMARY KEY (course_key)
+);
+
 CREATE TABLE IF NOT EXISTS race (
     race_id VARCHAR(64) NOT NULL COMMENT '赛事ID，全局唯一',
+    course_key VARCHAR(64) NOT NULL COMMENT '所属赛道标识，创建时必须已登记',
     version INT NOT NULL COMMENT '版本号，从1开始，每次写操作加一',
     status VARCHAR(16) NOT NULL COMMENT '赛事状态：OPEN-开放可写，SEALED-已封榜只读',
     created_at BIGINT NOT NULL COMMENT '创建时间，Unix毫秒时间戳',
-    CONSTRAINT pk_race PRIMARY KEY (race_id)
+    CONSTRAINT pk_race PRIMARY KEY (race_id),
+    CONSTRAINT fk_race_course FOREIGN KEY (course_key) REFERENCES course (course_key)
 );
 
 CREATE TABLE IF NOT EXISTS runner (
@@ -57,9 +66,25 @@ CREATE TABLE IF NOT EXISTS result_snapshot_entry (
     CONSTRAINT fk_snapshot_entry_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
 );
 
+-- 赛道纪录历史链：只增不改不删；id 自增顺序即纪录切换顺序（历史链顺序）。
+CREATE TABLE IF NOT EXISTS course_record (
+    id BIGINT NOT NULL AUTO_INCREMENT COMMENT '纪录ID，自增；同时作为历史链顺序（先认定在前）',
+    course_key VARCHAR(64) NOT NULL COMMENT '所属赛道标识',
+    race_id VARCHAR(64) NOT NULL COMMENT '产生该纪录的赛事ID',
+    bib VARCHAR(64) NOT NULL COMMENT '创纪录选手参赛号',
+    time_ms BIGINT NOT NULL COMMENT '纪录计时（毫秒），取封榜快照中该选手最终总耗时',
+    record_claim_key VARCHAR(128) NOT NULL COMMENT '纪录认定申请键，全局唯一；重复申请按此键幂等返回首次结果',
+    created_at BIGINT NOT NULL COMMENT '纪录切换（认定）时间，Unix毫秒时间戳',
+    CONSTRAINT pk_course_record PRIMARY KEY (id),
+    CONSTRAINT uk_course_record_claim UNIQUE (record_claim_key),
+    CONSTRAINT fk_record_course FOREIGN KEY (course_key) REFERENCES course (course_key),
+    CONSTRAINT fk_record_race FOREIGN KEY (race_id) REFERENCES race (race_id),
+    INDEX idx_course_record_course (course_key, id)
+);
+
 CREATE TABLE IF NOT EXISTS idempotency_record (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求ID（写操作幂等键）',
-    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/SEAL_RACE',
+    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/SEAL_RACE/REGISTER_COURSE/CLAIM_COURSE_RECORD',
     request_digest CHAR(64) NOT NULL COMMENT '请求参数（requestId除外，含expectedVersion）规范化JSON的SHA-256摘要',
     response_status INT NOT NULL COMMENT '原成功请求的HTTP状态码，重放时原样返回',
     response_body TEXT COMMENT '原成功响应体JSON，重放时原样返回',

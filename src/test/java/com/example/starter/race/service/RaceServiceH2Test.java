@@ -4,6 +4,7 @@ import com.example.starter.race.api.AddPenaltyRequest;
 import com.example.starter.race.api.CreateRaceRequest;
 import com.example.starter.race.api.PenaltyResponse;
 import com.example.starter.race.api.RaceResponse;
+import com.example.starter.race.api.RegisterCourseRequest;
 import com.example.starter.race.api.RegisterRunnerRequest;
 import com.example.starter.race.api.ResultEntryResponse;
 import com.example.starter.race.api.ReviseTimeRequest;
@@ -35,9 +36,15 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class RaceServiceH2Test extends AbstractRaceH2Test {
 
     private static final String RACE = "race-1";
+    private static final String COURSE = "course-1";
 
     @Autowired
     private RaceService raceService;
+
+    @org.junit.jupiter.api.BeforeEach
+    void registerDefaultCourse() {
+        raceService.registerCourse(new RegisterCourseRequest(COURSE, "req-course"));
+    }
 
     @Autowired
     private org.springframework.jdbc.core.JdbcTemplate jdbcTemplate;
@@ -56,7 +63,7 @@ class RaceServiceH2Test extends AbstractRaceH2Test {
     @Test
     void 完整主流程_登记加时取消撤销到封榜快照() {
         RaceResponse race = (RaceResponse) raceService.createRace(
-                new CreateRaceRequest(RACE, "req-create")).body();
+                new CreateRaceRequest(RACE, COURSE, "req-create")).body();
         assertThat(race.version()).isEqualTo(1);
         assertThat(race.status()).isEqualTo(RaceStatus.OPEN);
 
@@ -170,7 +177,7 @@ class RaceServiceH2Test extends AbstractRaceH2Test {
 
     @Test
     void 版本不匹配返回409且版本不变() {
-        raceService.createRace(new CreateRaceRequest(RACE, "req-create"));
+        raceService.createRace(new CreateRaceRequest(RACE, COURSE, "req-create"));
         raceService.registerRunner(RACE,
                 new RegisterRunnerRequest("a", 100L, 1, "req-a"));
 
@@ -189,7 +196,7 @@ class RaceServiceH2Test extends AbstractRaceH2Test {
         assertThatThrownBy(() -> raceService.getSnapshot(RACE))
                 .isInstanceOf(NotFoundException.class);
 
-        raceService.createRace(new CreateRaceRequest(RACE, "req-create"));
+        raceService.createRace(new CreateRaceRequest(RACE, COURSE, "req-create"));
         raceService.registerRunner(RACE,
                 new RegisterRunnerRequest("a", 100L, 1, "req-a"));
 
@@ -200,7 +207,7 @@ class RaceServiceH2Test extends AbstractRaceH2Test {
 
         // 赛事ID重复
         assertThatThrownBy(() -> raceService.createRace(
-                new CreateRaceRequest(RACE, "req-create-dup")))
+                new CreateRaceRequest(RACE, COURSE, "req-create-dup")))
                 .isInstanceOf(ConflictException.class);
 
         // 修订不存在的选手
@@ -237,7 +244,7 @@ class RaceServiceH2Test extends AbstractRaceH2Test {
 
     @Test
     void 重复撤销返回409且历史处罚不被覆盖() {
-        raceService.createRace(new CreateRaceRequest(RACE, "req-create"));
+        raceService.createRace(new CreateRaceRequest(RACE, COURSE, "req-create"));
         raceService.registerRunner(RACE,
                 new RegisterRunnerRequest("a", 100L, 1, "req-a"));
         raceService.addPenalty(RACE,
@@ -253,7 +260,7 @@ class RaceServiceH2Test extends AbstractRaceH2Test {
 
     @Test
     void 同键同参重放原成功结果且不重复变更() {
-        raceService.createRace(new CreateRaceRequest(RACE, "req-create"));
+        raceService.createRace(new CreateRaceRequest(RACE, COURSE, "req-create"));
         RegisterRunnerRequest register =
                 new RegisterRunnerRequest("a", 100L, 1, "req-reg-a");
 
@@ -278,7 +285,7 @@ class RaceServiceH2Test extends AbstractRaceH2Test {
 
     @Test
     void 同键异参返回409() {
-        raceService.createRace(new CreateRaceRequest(RACE, "req-create"));
+        raceService.createRace(new CreateRaceRequest(RACE, COURSE, "req-create"));
         raceService.registerRunner(RACE,
                 new RegisterRunnerRequest("a", 100L, 1, "req-reg-a"));
 
@@ -296,7 +303,7 @@ class RaceServiceH2Test extends AbstractRaceH2Test {
 
     @Test
     void 业务失败不占用requestId键() {
-        raceService.createRace(new CreateRaceRequest(RACE, "req-create"));
+        raceService.createRace(new CreateRaceRequest(RACE, COURSE, "req-create"));
 
         // 首次以错误版本请求，业务失败并随事务回滚，不占用 requestId
         assertThatThrownBy(() -> raceService.registerRunner(RACE,
@@ -317,7 +324,7 @@ class RaceServiceH2Test extends AbstractRaceH2Test {
     }
 
     private void seedSealedRace() {
-        raceService.createRace(new CreateRaceRequest(RACE, "req-create"));
+        raceService.createRace(new CreateRaceRequest(RACE, COURSE, "req-create"));
         raceService.registerRunner(RACE,
                 new RegisterRunnerRequest("a", 100L, 1, "req-a"));
         raceService.sealRace(RACE, new SealRaceRequest(2, "req-seal"));

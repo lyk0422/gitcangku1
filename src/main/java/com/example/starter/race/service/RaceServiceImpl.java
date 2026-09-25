@@ -1,17 +1,25 @@
 package com.example.starter.race.service;
 
 import com.example.starter.race.api.AddPenaltyRequest;
+import com.example.starter.race.api.ClaimRecordRequest;
+import com.example.starter.race.api.CourseRecordResponse;
+import com.example.starter.race.api.CourseResponse;
 import com.example.starter.race.api.CreateRaceRequest;
 import com.example.starter.race.api.RaceResponse;
+import com.example.starter.race.api.RecordHistoryResponse;
+import com.example.starter.race.api.RegisterCourseRequest;
 import com.example.starter.race.api.RegisterRunnerRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
+import com.example.starter.race.domain.EntryStatus;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
+import com.example.starter.race.persistence.CourseRecordRow;
+import com.example.starter.race.persistence.CourseRow;
 import com.example.starter.race.persistence.IdempotencyRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
@@ -74,17 +82,21 @@ public class RaceServiceImpl implements RaceService {
     @Transactional
     public ServiceResult createRace(CreateRaceRequest request) {
         return withIdempotency(request.requestId(), "CREATE_RACE",
-                orderedParams("raceId", request.raceId()),
+                orderedParams("raceId", request.raceId(), "courseKey", request.courseKey()),
                 () -> {
+                    repository.findCourse(request.courseKey())
+                            .orElseThrow(() -> new NotFoundException(
+                                    "赛道未登记: " + request.courseKey()));
                     long now = clock.millis();
                     try {
-                        repository.insertRace(request.raceId(), now);
+                        repository.insertRace(request.raceId(), request.courseKey(), now);
                     } catch (DuplicateKeyException ex) {
                         throw new ConflictException("赛事已存在: " + request.raceId());
                     }
                     RaceRow race = repository.findRace(request.raceId()).orElseThrow();
                     return ServiceResult.created(new RaceResponse(
-                            race.raceId(), race.version(), race.status(), race.createdAt()));
+                            race.raceId(), race.courseKey(), race.version(), race.status(),
+                            race.createdAt()));
                 });
     }
 
@@ -275,6 +287,134 @@ public class RaceServiceImpl implements RaceService {
         SnapshotRow snapshot = repository.findSnapshot(raceId)
                 .orElseThrow(() -> new NotFoundException("赛事尚未封榜: " + raceId));
         return ResponseMapper.snapshotStanding(snapshot);
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult registerCourse(RegisterCourseRequest request) {
+        return withIdempotency(request.requestId(), "REGISTER_COURSE",
+                orderedParams("courseKey", request.courseKey()),
+                () -> {
+                    long now = clock.millis();
+                    try {
+                        repository.insertCourse(request.courseKey(), now);
+                    } catch (DuplicateKeyException ex) {
+                        throw new ConflictException("赛道已登记: " + request.courseKey());
+                    }
+                    return ServiceResult.created(
+                            new CourseResponse(request.courseKey(), now));
+                });
+    }
+
+    /**
+     * 赛道纪录认定。并发与一致性要点：
+     * <ul>
+     *   <li>先对赛道行 SELECT ... FOR UPDATE，序列化同一赛道的并发认定；
+     *       后提交的事务读到的是最新已提交的当前纪录，基于过期当前纪录的申请在此被422拒绝；</li>
+     *   <li>计时在事务内从封榜只读快照读取（封榜后快照不可变，追溯修正只能发生在封榜前），
+     *       因此认定不会基于将被修正的计时生效；</li>
+     *   <li>认定成功在同一事务内完成“追加历史链纪录行 + 切换当前纪录指针”，
+     *       历史链只增长不可删改；recordClaimKey 唯一约束兜底重复认定。</li>
+     * </ul>
+     */
+    @Override
+    @Transactional
+    public ServiceResult claimRecord(String courseKey, ClaimRecordRequest request) {
+        return withIdempotency(request.requestId(), "CLAIM_COURSE_RECORD",
+                orderedParams(
+                        "courseKey", courseKey,
+                        "recordClaimKey", request.recordClaimKey(),
+                        "raceId", request.raceId(),
+                        "bib", request.bib()),
+                () -> doClaimRecord(courseKey, request));
+    }
+
+    private ServiceResult doClaimRecord(String courseKey, ClaimRecordRequest request) {
+        CourseRow course = repository.findCourseForUpdate(courseKey)
+                .orElseThrow(() -> new NotFoundException("赛道未登记: " + courseKey));
+
+        // recordClaimKey 幂等：已成功认定的申请键直接返回首次结果，不重复校验
+        Optional<CourseRecordRow> existing =
+                repository.findCourseRecordByClaimKey(request.recordClaimKey());
+        if (existing.isPresent()) {
+            return ServiceResult.created(
+                    ResponseMapper.toCourseRecordResponse(existing.get()));
+        }
+
+        RaceRow race = repository.findRace(request.raceId())
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + request.raceId()));
+        if (!race.courseKey().equals(courseKey)) {
+            throw new BadRequestException(
+                    "赛事 " + request.raceId() + " 不属于赛道: " + courseKey);
+        }
+        if (race.status() != RaceStatus.SEALED) {
+            throw new ConflictException("赛事尚未封榜，不能申请纪录认定: " + request.raceId());
+        }
+        SnapshotRow snapshot = repository.findSnapshot(request.raceId())
+                .orElseThrow(() -> new IllegalStateException(
+                        "赛事已封榜但缺少快照: " + request.raceId()));
+        SnapshotEntryRow entry = snapshot.entries().stream()
+                .filter(e -> e.bib().equals(request.bib()))
+                .findFirst()
+                .orElseThrow(() -> new NotFoundException(
+                        "选手不在封榜快照中: " + request.bib()));
+        if (entry.status() == EntryStatus.DISQUALIFIED) {
+            throw new UnprocessableException("选手已取消资格，不能认定纪录: " + request.bib());
+        }
+        if (entry.totalTimeMs() == null) {
+            throw new UnprocessableException("选手无有效完赛计时，不能认定纪录: " + request.bib());
+        }
+        long timeMs = entry.totalTimeMs();
+
+        CourseRecordRow current = null;
+        if (course.currentRecordId() != null) {
+            current = repository.findCourseRecordById(course.currentRecordId())
+                    .orElseThrow(() -> new IllegalStateException(
+                            "赛道当前纪录指针悬空: " + courseKey));
+            if (timeMs >= current.timeMs()) {
+                throw new RecordNotBetterException(
+                        "计时 " + timeMs + "ms 未严格优于当前纪录 " + current.timeMs() + "ms",
+                        ResponseMapper.toCourseRecordResponse(current));
+            }
+        }
+
+        long now = clock.millis();
+        long recordId;
+        try {
+            recordId = repository.insertCourseRecord(
+                    courseKey, request.raceId(), request.bib(), timeMs,
+                    request.recordClaimKey(), now);
+        } catch (DuplicateKeyException ex) {
+            throw new ConflictException("纪录认定申请键已使用: " + request.recordClaimKey());
+        }
+        repository.updateCourseCurrentRecord(courseKey, recordId);
+        CourseRecordRow record = repository.findCourseRecordById(recordId).orElseThrow();
+        return ServiceResult.created(ResponseMapper.toCourseRecordResponse(record));
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public CourseRecordResponse getCurrentRecord(String courseKey) {
+        CourseRow course = repository.findCourse(courseKey)
+                .orElseThrow(() -> new NotFoundException("赛道未登记: " + courseKey));
+        if (course.currentRecordId() == null) {
+            throw new NotFoundException("赛道尚无纪录: " + courseKey);
+        }
+        CourseRecordRow record = repository.findCourseRecordById(course.currentRecordId())
+                .orElseThrow(() -> new IllegalStateException(
+                        "赛道当前纪录指针悬空: " + courseKey));
+        return ResponseMapper.toCourseRecordResponse(record);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public RecordHistoryResponse getRecordHistory(String courseKey) {
+        repository.findCourse(courseKey)
+                .orElseThrow(() -> new NotFoundException("赛道未登记: " + courseKey));
+        return new RecordHistoryResponse(courseKey,
+                repository.findCourseRecords(courseKey).stream()
+                        .map(ResponseMapper::toCourseRecordResponse)
+                        .toList());
     }
 
     /**

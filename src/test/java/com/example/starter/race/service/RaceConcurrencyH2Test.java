@@ -2,6 +2,7 @@ package com.example.starter.race.service;
 
 import com.example.starter.race.api.AddPenaltyRequest;
 import com.example.starter.race.api.CreateRaceRequest;
+import com.example.starter.race.api.RegisterCourseRequest;
 import com.example.starter.race.api.RegisterRunnerRequest;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
@@ -33,13 +34,19 @@ import static org.assertj.core.api.Assertions.assertThat;
 class RaceConcurrencyH2Test extends AbstractRaceH2Test {
 
     private static final String RACE = "race-concurrent";
+    private static final String COURSE = "course-concurrent";
 
     @Autowired
     private RaceService raceService;
 
+    @org.junit.jupiter.api.BeforeEach
+    void registerDefaultCourse() {
+        raceService.registerCourse(new RegisterCourseRequest(COURSE, "req-course"));
+    }
+
     @Test
     void 并发同版本登记仅一个成功且版本只加一() throws Exception {
-        raceService.createRace(new CreateRaceRequest(RACE, "req-create"));
+        raceService.createRace(new CreateRaceRequest(RACE, COURSE, "req-create"));
 
         int threads = 10;
         ExecutorService pool = Executors.newFixedThreadPool(threads);
@@ -78,7 +85,7 @@ class RaceConcurrencyH2Test extends AbstractRaceH2Test {
 
     @Test
     void 封榜与处罚并发时互斥且最终状态自洽() throws Exception {
-        raceService.createRace(new CreateRaceRequest(RACE, "req-create"));
+        raceService.createRace(new CreateRaceRequest(RACE, COURSE, "req-create"));
         raceService.registerRunner(RACE,
                 new RegisterRunnerRequest("a", 1000L, 1, "req-a"));
         // 当前版本为2：封榜与加时都以 expectedVersion=2 并发提交
@@ -138,7 +145,7 @@ class RaceConcurrencyH2Test extends AbstractRaceH2Test {
 
     @Test
     void 同requestId并发重放只产生一次变更且结果一致() throws Exception {
-        raceService.createRace(new CreateRaceRequest(RACE, "req-create"));
+        raceService.createRace(new CreateRaceRequest(RACE, COURSE, "req-create"));
 
         int threads = 6;
         ExecutorService pool = Executors.newFixedThreadPool(threads);

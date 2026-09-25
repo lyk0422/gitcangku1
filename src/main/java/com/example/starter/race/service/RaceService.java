@@ -1,7 +1,11 @@
 package com.example.starter.race.service;
 
 import com.example.starter.race.api.AddPenaltyRequest;
+import com.example.starter.race.api.ClaimRecordRequest;
+import com.example.starter.race.api.CourseRecordResponse;
 import com.example.starter.race.api.CreateRaceRequest;
+import com.example.starter.race.api.RecordHistoryResponse;
+import com.example.starter.race.api.RegisterCourseRequest;
 import com.example.starter.race.api.RegisterRunnerRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
@@ -37,4 +41,21 @@ public interface RaceService {
 
     /** 查询封榜只读快照；未封榜为404。 */
     StandingResponse getSnapshot(String raceId);
+
+    /** 登记赛道（初始无纪录）；赛道标识重复返回409。 */
+    ServiceResult registerCourse(RegisterCourseRequest request);
+
+    /**
+     * 赛道纪录认定：单事务内重新校验赛事已封榜、选手在封榜快照中已完赛且未取消资格、
+     * 快照最终计时严格优于当前纪录；通过后原子切换纪录指针并把旧纪录保留在不可变历史链中。
+     * 计时不优于当前纪录时抛出 {@link RecordNotBetterException}（422，携带实际当前纪录）；
+     * 同一 recordClaimKey 重复申请幂等返回首次结果。
+     */
+    ServiceResult claimRecord(String courseKey, ClaimRecordRequest request);
+
+    /** 查询赛道当前纪录（只读，不触发认定）；赛道或纪录不存在为404。 */
+    CourseRecordResponse getCurrentRecord(String courseKey);
+
+    /** 查询赛道完整历史纪录链（只读，按认定先后升序）；赛道不存在为404。 */
+    RecordHistoryResponse getRecordHistory(String courseKey);
 }

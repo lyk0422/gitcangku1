@@ -5,10 +5,14 @@ import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
+import org.springframework.jdbc.support.GeneratedKeyHolder;
+import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.stereotype.Repository;
 
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Statement;
 import java.util.List;
 import java.util.Optional;
 
@@ -25,6 +29,9 @@ public class RaceRepository {
     private static final SnapshotEntryRowMapper SNAPSHOT_ENTRY_ROW_MAPPER =
             new SnapshotEntryRowMapper();
     private static final IdempotencyRowMapper IDEMPOTENCY_ROW_MAPPER = new IdempotencyRowMapper();
+    private static final CourseRowMapper COURSE_ROW_MAPPER = new CourseRowMapper();
+    private static final CourseRecordRowMapper COURSE_RECORD_ROW_MAPPER =
+            new CourseRecordRowMapper();
 
     private final JdbcTemplate jdbcTemplate;
 
@@ -35,7 +42,8 @@ public class RaceRepository {
     /** 按ID查询赛事。 */
     public Optional<RaceRow> findRace(String raceId) {
         return jdbcTemplate
-                .query("SELECT race_id, version, status, created_at FROM race WHERE race_id = ?",
+                .query("SELECT race_id, course_key, version, status, created_at "
+                                + "FROM race WHERE race_id = ?",
                         RACE_ROW_MAPPER, raceId)
                 .stream()
                 .findFirst();
@@ -99,11 +107,12 @@ public class RaceRepository {
                 entries));
     }
 
-    /** 新建赛事，初始版本1、状态OPEN。 */
-    public void insertRace(String raceId, long now) {
+    /** 新建赛事，初始版本1、状态OPEN；必须关联已登记赛道。 */
+    public void insertRace(String raceId, String courseKey, long now) {
         jdbcTemplate.update(
-                "INSERT INTO race (race_id, version, status, created_at) VALUES (?, 1, 'OPEN', ?)",
-                raceId, now);
+                "INSERT INTO race (race_id, course_key, version, status, created_at) "
+                        + "VALUES (?, ?, 1, 'OPEN', ?)",
+                raceId, courseKey, now);
     }
 
     /** 登记选手；finishTimeMs 为 null 表示计时缺失。 */
@@ -234,6 +243,98 @@ public class RaceRepository {
                 responseStatus, responseBody, requestId);
     }
 
+    /** 登记赛道，初始无纪录（current_record_id 为 NULL）。 */
+    public void insertCourse(String courseKey, long now) {
+        jdbcTemplate.update(
+                "INSERT INTO course (course_key, current_record_id, created_at) "
+                        + "VALUES (?, NULL, ?)",
+                courseKey, now);
+    }
+
+    /** 按标识查询赛道。 */
+    public Optional<CourseRow> findCourse(String courseKey) {
+        return jdbcTemplate
+                .query("SELECT course_key, current_record_id, created_at "
+                                + "FROM course WHERE course_key = ?",
+                        COURSE_ROW_MAPPER, courseKey)
+                .stream()
+                .findFirst();
+    }
+
+    /**
+     * 行锁方式查询赛道：序列化同一赛道的并发纪录认定，
+     * 保证认定事务读到的是最新已提交的当前纪录。
+     */
+    public Optional<CourseRow> findCourseForUpdate(String courseKey) {
+        return jdbcTemplate
+                .query("SELECT course_key, current_record_id, created_at "
+                                + "FROM course WHERE course_key = ? FOR UPDATE",
+                        COURSE_ROW_MAPPER, courseKey)
+                .stream()
+                .findFirst();
+    }
+
+    /** 追加一条赛道纪录（历史链只增长）；返回自增纪录ID。 */
+    public long insertCourseRecord(
+            String courseKey,
+            String raceId,
+            String bib,
+            long timeMs,
+            String recordClaimKey,
+            long now) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbcTemplate.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO course_record "
+                            + "(course_key, race_id, bib, time_ms, record_claim_key, created_at) "
+                            + "VALUES (?, ?, ?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, courseKey);
+            ps.setString(2, raceId);
+            ps.setString(3, bib);
+            ps.setLong(4, timeMs);
+            ps.setString(5, recordClaimKey);
+            ps.setLong(6, now);
+            return ps;
+        }, keyHolder);
+        return keyHolder.getKey().longValue();
+    }
+
+    /** 按纪录ID查询纪录。 */
+    public Optional<CourseRecordRow> findCourseRecordById(long recordId) {
+        return jdbcTemplate
+                .query("SELECT id, course_key, race_id, bib, time_ms, record_claim_key, created_at "
+                                + "FROM course_record WHERE id = ?",
+                        COURSE_RECORD_ROW_MAPPER, recordId)
+                .stream()
+                .findFirst();
+    }
+
+    /** 按认定申请键查询纪录（认定幂等判重）。 */
+    public Optional<CourseRecordRow> findCourseRecordByClaimKey(String recordClaimKey) {
+        return jdbcTemplate
+                .query("SELECT id, course_key, race_id, bib, time_ms, record_claim_key, created_at "
+                                + "FROM course_record WHERE record_claim_key = ?",
+                        COURSE_RECORD_ROW_MAPPER, recordClaimKey)
+                .stream()
+                .findFirst();
+    }
+
+    /** 查询赛道完整历史纪录链，按认定先后（id 自增）升序。 */
+    public List<CourseRecordRow> findCourseRecords(String courseKey) {
+        return jdbcTemplate.query(
+                "SELECT id, course_key, race_id, bib, time_ms, record_claim_key, created_at "
+                        + "FROM course_record WHERE course_key = ? ORDER BY id",
+                COURSE_RECORD_ROW_MAPPER, courseKey);
+    }
+
+    /** 原子切换赛道当前纪录指针；调用方须已持有赛道行锁。 */
+    public void updateCourseCurrentRecord(String courseKey, long recordId) {
+        jdbcTemplate.update(
+                "UPDATE course SET current_record_id = ? WHERE course_key = ?",
+                recordId, courseKey);
+    }
+
     /** 测试辅助：清空全部业务数据，按外键依赖顺序删除。 */
     public void deleteAllForTesting() {
         jdbcTemplate.update("DELETE FROM result_snapshot_entry");
@@ -241,7 +342,9 @@ public class RaceRepository {
         jdbcTemplate.update("DELETE FROM idempotency_record");
         jdbcTemplate.update("DELETE FROM penalty");
         jdbcTemplate.update("DELETE FROM runner");
+        jdbcTemplate.update("DELETE FROM course_record");
         jdbcTemplate.update("DELETE FROM race");
+        jdbcTemplate.update("DELETE FROM course");
     }
 
     private static final class RaceRowMapper implements RowMapper<RaceRow> {
@@ -249,8 +352,33 @@ public class RaceRepository {
         public RaceRow mapRow(ResultSet rs, int rowNum) throws SQLException {
             return new RaceRow(
                     rs.getString("race_id"),
+                    rs.getString("course_key"),
                     rs.getInt("version"),
                     RaceStatus.valueOf(rs.getString("status")),
+                    rs.getLong("created_at"));
+        }
+    }
+
+    private static final class CourseRowMapper implements RowMapper<CourseRow> {
+        @Override
+        public CourseRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new CourseRow(
+                    rs.getString("course_key"),
+                    (Long) rs.getObject("current_record_id"),
+                    rs.getLong("created_at"));
+        }
+    }
+
+    private static final class CourseRecordRowMapper implements RowMapper<CourseRecordRow> {
+        @Override
+        public CourseRecordRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new CourseRecordRow(
+                    rs.getLong("id"),
+                    rs.getString("course_key"),
+                    rs.getString("race_id"),
+                    rs.getString("bib"),
+                    rs.getLong("time_ms"),
+                    rs.getString("record_claim_key"),
                     rs.getLong("created_at"));
         }
     }
