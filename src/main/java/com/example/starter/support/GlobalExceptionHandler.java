@@ -18,7 +18,7 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(ApiException.class)
     public org.springframework.http.ResponseEntity<ApiError> handleApi(ApiException ex) {
         return org.springframework.http.ResponseEntity.status(ex.getStatus())
-                .body(new ApiError(ex.getCode(), ex.getMessage()));
+                .body(new ApiError(ex.getCode(), ex.getMessage(), ex.getDetails()));
     }
 
     @ExceptionHandler({MissingRequestHeaderException.class, MethodArgumentNotValidException.class,

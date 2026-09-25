@@ -35,6 +35,10 @@ class ArtifactControllerHttpTest {
 
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM lock_publish_exception");
+        jdbcTemplate.update("DELETE FROM lock_publish");
+        jdbcTemplate.update("DELETE FROM vulnerability_exception");
+        jdbcTemplate.update("DELETE FROM vulnerability_advisory");
         jdbcTemplate.update("DELETE FROM lock_file_entry");
         jdbcTemplate.update("DELETE FROM lock_file");
         jdbcTemplate.update("DELETE FROM artifact_dependency");
