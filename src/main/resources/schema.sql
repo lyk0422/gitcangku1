@@ -95,9 +95,44 @@ CREATE TABLE IF NOT EXISTS result_snapshot_checkpoint (
     CONSTRAINT fk_snapshot_checkpoint_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
 );
 
+CREATE TABLE IF NOT EXISTS finish_evidence (
+    evidence_id VARCHAR(64) NOT NULL COMMENT '冲线证据ID，全局唯一，不可重复',
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    finish_time_ms BIGINT NOT NULL COMMENT '候选组共享的原始完赛耗时（毫秒，1~86400000）',
+    suggested_order TEXT NOT NULL COMMENT '建议名次顺序（JSON数组），为候选参赛号集合的全排列，不遗漏不重复',
+    candidate_count INT NOT NULL COMMENT '候选人数量，至少2',
+    captured_at BIGINT NOT NULL COMMENT '证据捕获UTC时刻，Unix毫秒时间戳',
+    operator VARCHAR(64) NOT NULL COMMENT '登记操作者',
+    finish_key CHAR(64) NOT NULL COMMENT 'finishKey指纹：赛事ID+赛事版本+证据内容+规范化候选顺序+操作者的SHA-256；同键重放，失败不占键',
+    status VARCHAR(16) NOT NULL COMMENT '证据状态：PENDING-待裁决，ADJUDICATED-已裁决，WITHDRAWN-已撤回',
+    created_at BIGINT NOT NULL COMMENT '登记时间，Unix毫秒时间戳',
+    adjudicated_at BIGINT COMMENT '裁决时间，Unix毫秒时间戳；未裁决为NULL',
+    withdrawn_at BIGINT COMMENT '撤回时间，Unix毫秒时间戳；未撤回为NULL',
+    CONSTRAINT pk_finish_evidence PRIMARY KEY (evidence_id),
+    CONSTRAINT uk_finish_evidence_key UNIQUE (finish_key),
+    CONSTRAINT fk_evidence_race FOREIGN KEY (race_id) REFERENCES race (race_id),
+    INDEX idx_evidence_race (race_id, finish_time_ms)
+);
+
+CREATE TABLE IF NOT EXISTS finish_adjudication (
+    id BIGINT NOT NULL AUTO_INCREMENT COMMENT '自增主键，同时作为裁决生效顺序（大者生效）',
+    adjudication_id VARCHAR(64) NOT NULL COMMENT '裁决ID，全局唯一',
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    finish_time_ms BIGINT NOT NULL COMMENT '被裁决计时组共享的原始完赛耗时（毫秒）',
+    evidence_ids TEXT NOT NULL COMMENT '本次裁决覆盖的证据ID（JSON数组），裁决后证据置为ADJUDICATED',
+    final_order TEXT NOT NULL COMMENT '裁决后的名次顺序（JSON数组），候选集合的全排列，名次互不重复',
+    operator VARCHAR(64) NOT NULL COMMENT '裁决操作者（裁判）',
+    race_version INT NOT NULL COMMENT '裁决完成后的赛事版本号',
+    created_at BIGINT NOT NULL COMMENT '裁决时间，Unix毫秒时间戳；快照不可变，无更新字段',
+    CONSTRAINT pk_finish_adjudication PRIMARY KEY (id),
+    CONSTRAINT uk_finish_adjudication_id UNIQUE (adjudication_id),
+    CONSTRAINT fk_adjudication_race FOREIGN KEY (race_id) REFERENCES race (race_id),
+    INDEX idx_adjudication_race (race_id, finish_time_ms)
+);
+
 CREATE TABLE IF NOT EXISTS idempotency_record (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求ID（写操作幂等键）',
-    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE',
+    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE/REGISTER_FINISH_EVIDENCE/WITHDRAW_FINISH_EVIDENCE/ADJUDICATE_FINISH_EVIDENCE',
     request_digest CHAR(64) NOT NULL COMMENT '请求参数（requestId除外，含expectedVersion）规范化JSON的SHA-256摘要',
     response_status INT NOT NULL COMMENT '原成功请求的HTTP状态码，重放时原样返回',
     response_body TEXT COMMENT '原成功响应体JSON，重放时原样返回',

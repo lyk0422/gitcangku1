@@ -1,8 +1,12 @@
 package com.example.starter.race.service;
 
 import com.example.starter.race.api.AddPenaltyRequest;
+import com.example.starter.race.api.AdjudicateFinishEvidenceRequest;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
 import com.example.starter.race.api.CreateRaceRequest;
+import com.example.starter.race.api.FinishAdjudicationResponse;
+import com.example.starter.race.api.FinishEvidenceResponse;
+import com.example.starter.race.api.RegisterFinishEvidenceRequest;
 import com.example.starter.race.api.RegisterRunnerRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
@@ -11,6 +15,9 @@ import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.api.SubmitTimingRequest;
+import com.example.starter.race.api.WithdrawFinishEvidenceRequest;
+
+import java.util.List;
 
 /**
  * 赛事成绩封榜应用服务；每个写方法在单个数据库事务内完成
@@ -59,4 +66,26 @@ public interface RaceService {
 
     /** 查询赛事全部选手缺失检查点汇总，按参赛号与检查点顺序稳定返回；只读。 */
     MissingCheckpointsResponse getMissingCheckpoints(String raceId);
+
+    /**
+     * 登记冲线证据：仅 OPEN 赛事；建议顺序必须是该计时组全部候选人的全排列；
+     * finishKey 指纹相同重放原结果，失败不占键；赛事已封榜返回409。
+     */
+    ServiceResult registerFinishEvidence(String raceId, RegisterFinishEvidenceRequest request);
+
+    /** 撤回未裁决证据并保留撤回记录；已裁决证据不可撤回返回409。 */
+    ServiceResult withdrawFinishEvidence(
+            String raceId, String evidenceId, WithdrawFinishEvidenceRequest request);
+
+    /**
+     * 批量裁决一组证据：先校验赛事未封榜、全部候选人仍有效、裁决后名次无重复；
+     * 任一失效422且不留半成品；成功后重排该计时组并写入不可变裁决快照。
+     */
+    ServiceResult adjudicateFinishEvidence(String raceId, AdjudicateFinishEvidenceRequest request);
+
+    /** 查询赛事全部冲线证据（含已裁决、已撤回），按登记顺序稳定返回；只读。 */
+    List<FinishEvidenceResponse> listFinishEvidence(String raceId);
+
+    /** 查询赛事全部证据裁决快照（不可变），按裁决生效顺序稳定返回；只读。 */
+    List<FinishAdjudicationResponse> listFinishAdjudications(String raceId);
 }

@@ -2,6 +2,8 @@ package com.example.starter.race.service;
 
 import com.example.starter.race.api.CheckpointPassResponse;
 import com.example.starter.race.api.CheckpointTimingResponse;
+import com.example.starter.race.api.FinishAdjudicationResponse;
+import com.example.starter.race.api.FinishEvidenceResponse;
 import com.example.starter.race.api.PenaltyResponse;
 import com.example.starter.race.api.ResultEntryResponse;
 import com.example.starter.race.api.RunnerResponse;
@@ -12,6 +14,8 @@ import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
+import com.example.starter.race.persistence.FinishAdjudicationRow;
+import com.example.starter.race.persistence.FinishEvidenceRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
 import com.example.starter.race.persistence.RunnerRow;
@@ -51,15 +55,29 @@ final class ResponseMapper {
             List<RunnerRow> runners,
             List<PenaltyRow> penalties,
             List<CheckpointRow> checkpoints,
-            List<CheckpointTimingRow> timings) {
+            List<CheckpointTimingRow> timings,
+            List<FinishAdjudicationRow> adjudications) {
         List<ResultEntry> entries = ResultCalculator.compute(
-                runners, penalties, checkpoints, timings);
+                runners, penalties, checkpoints, timings, adjudications);
         return new StandingResponse(
                 race.raceId(),
                 race.version(),
                 race.status(),
                 null,
                 entries.stream().map(ResponseMapper::toEntryResponse).toList());
+    }
+
+    static FinishEvidenceResponse toEvidenceResponse(FinishEvidenceRow row) {
+        return new FinishEvidenceResponse(
+                row.evidenceId(), row.raceId(), row.finishTimeMs(), row.suggestedOrder(),
+                row.capturedAt(), row.operator(), row.finishKey(), row.status(),
+                row.createdAt(), row.adjudicatedAt(), row.withdrawnAt());
+    }
+
+    static FinishAdjudicationResponse toAdjudicationResponse(FinishAdjudicationRow row) {
+        return new FinishAdjudicationResponse(
+                row.adjudicationId(), row.raceId(), row.finishTimeMs(), row.evidenceIds(),
+                row.finalOrder(), row.operator(), row.raceVersion(), row.createdAt());
     }
 
     static StandingResponse snapshotStanding(SnapshotRow snapshot) {

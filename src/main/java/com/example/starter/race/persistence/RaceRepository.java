@@ -1,8 +1,12 @@
 package com.example.starter.race.persistence;
 
 import com.example.starter.race.domain.EntryStatus;
+import com.example.starter.race.domain.EvidenceStatus;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
@@ -32,9 +36,11 @@ public class RaceRepository {
             new SnapshotCheckpointRowMapper();
 
     private final JdbcTemplate jdbcTemplate;
+    private final ObjectMapper objectMapper;
 
-    public RaceRepository(JdbcTemplate jdbcTemplate) {
+    public RaceRepository(JdbcTemplate jdbcTemplate, ObjectMapper objectMapper) {
         this.jdbcTemplate = jdbcTemplate;
+        this.objectMapper = objectMapper;
     }
 
     /** 按ID查询赛事。 */
@@ -368,11 +374,152 @@ public class RaceRepository {
                 responseStatus, responseBody, requestId);
     }
 
+    /** 登记冲线证据（evidenceId 与 finishKey 唯一约束由数据库保证）。 */
+    public void insertFinishEvidence(FinishEvidenceRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO finish_evidence "
+                        + "(evidence_id, race_id, finish_time_ms, suggested_order, candidate_count, "
+                        + "captured_at, operator, finish_key, status, created_at, "
+                        + "adjudicated_at, withdrawn_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)",
+                row.evidenceId(), row.raceId(), row.finishTimeMs(),
+                writeStringList(row.suggestedOrder()), row.suggestedOrder().size(),
+                row.capturedAt(), row.operator(), row.finishKey(),
+                row.status().name(), row.createdAt());
+    }
+
+    /** 按证据ID查询冲线证据。 */
+    public Optional<FinishEvidenceRow> findFinishEvidence(String evidenceId) {
+        return jdbcTemplate
+                .query("SELECT evidence_id, race_id, finish_time_ms, suggested_order, captured_at, "
+                                + "operator, finish_key, status, created_at, adjudicated_at, withdrawn_at "
+                                + "FROM finish_evidence WHERE evidence_id = ?",
+                        this::mapFinishEvidence, evidenceId)
+                .stream()
+                .findFirst();
+    }
+
+    /** 按 finishKey 指纹查询冲线证据（同键重放）。 */
+    public Optional<FinishEvidenceRow> findFinishEvidenceByKey(String finishKey) {
+        return jdbcTemplate
+                .query("SELECT evidence_id, race_id, finish_time_ms, suggested_order, captured_at, "
+                                + "operator, finish_key, status, created_at, adjudicated_at, withdrawn_at "
+                                + "FROM finish_evidence WHERE finish_key = ?",
+                        this::mapFinishEvidence, finishKey)
+                .stream()
+                .findFirst();
+    }
+
+    /** 查询赛事全部冲线证据（含已裁决、已撤回），按登记时间与证据ID排列。 */
+    public List<FinishEvidenceRow> findFinishEvidenceForRace(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT evidence_id, race_id, finish_time_ms, suggested_order, captured_at, "
+                        + "operator, finish_key, status, created_at, adjudicated_at, withdrawn_at "
+                        + "FROM finish_evidence WHERE race_id = ? ORDER BY created_at, evidence_id",
+                this::mapFinishEvidence, raceId);
+    }
+
+    /** 条件置为已裁决：仅当前为 PENDING 的证据生效；返回受影响行数。 */
+    public int markEvidenceAdjudicated(String evidenceId, long now) {
+        return jdbcTemplate.update(
+                "UPDATE finish_evidence SET status = 'ADJUDICATED', adjudicated_at = ? "
+                        + "WHERE evidence_id = ? AND status = 'PENDING'",
+                now, evidenceId);
+    }
+
+    /** 条件置为已撤回：仅当前为 PENDING 的证据生效（已裁决不可撤回）；返回受影响行数。 */
+    public int markEvidenceWithdrawn(String evidenceId, long now) {
+        return jdbcTemplate.update(
+                "UPDATE finish_evidence SET status = 'WITHDRAWN', withdrawn_at = ? "
+                        + "WHERE evidence_id = ? AND status = 'PENDING'",
+                now, evidenceId);
+    }
+
+    /** 写入不可变证据裁决快照（只插不改）。 */
+    public void insertFinishAdjudication(FinishAdjudicationRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO finish_adjudication "
+                        + "(adjudication_id, race_id, finish_time_ms, evidence_ids, final_order, "
+                        + "operator, race_version, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                row.adjudicationId(), row.raceId(), row.finishTimeMs(),
+                writeStringList(row.evidenceIds()), writeStringList(row.finalOrder()),
+                row.operator(), row.raceVersion(), row.createdAt());
+    }
+
+    /** 查询赛事全部裁决快照，按自增ID（裁决生效顺序）升序排列。 */
+    public List<FinishAdjudicationRow> findFinishAdjudications(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT id, adjudication_id, race_id, finish_time_ms, evidence_ids, final_order, "
+                        + "operator, race_version, created_at "
+                        + "FROM finish_adjudication WHERE race_id = ? ORDER BY id",
+                this::mapFinishAdjudication, raceId);
+    }
+
+    /** 按裁决ID查询裁决快照。 */
+    public Optional<FinishAdjudicationRow> findFinishAdjudication(String adjudicationId) {
+        return jdbcTemplate
+                .query("SELECT id, adjudication_id, race_id, finish_time_ms, evidence_ids, final_order, "
+                                + "operator, race_version, created_at "
+                                + "FROM finish_adjudication WHERE adjudication_id = ?",
+                        this::mapFinishAdjudication, adjudicationId)
+                .stream()
+                .findFirst();
+    }
+
+    private FinishEvidenceRow mapFinishEvidence(ResultSet rs, int rowNum) throws SQLException {
+        return new FinishEvidenceRow(
+                rs.getString("evidence_id"),
+                rs.getString("race_id"),
+                rs.getLong("finish_time_ms"),
+                readStringList(rs.getString("suggested_order")),
+                rs.getLong("captured_at"),
+                rs.getString("operator"),
+                rs.getString("finish_key"),
+                EvidenceStatus.valueOf(rs.getString("status")),
+                rs.getLong("created_at"),
+                (Long) rs.getObject("adjudicated_at"),
+                (Long) rs.getObject("withdrawn_at"));
+    }
+
+    private FinishAdjudicationRow mapFinishAdjudication(ResultSet rs, int rowNum)
+            throws SQLException {
+        return new FinishAdjudicationRow(
+                rs.getLong("id"),
+                rs.getString("adjudication_id"),
+                rs.getString("race_id"),
+                rs.getLong("finish_time_ms"),
+                readStringList(rs.getString("evidence_ids")),
+                readStringList(rs.getString("final_order")),
+                rs.getString("operator"),
+                rs.getInt("race_version"),
+                rs.getLong("created_at"));
+    }
+
+    private String writeStringList(List<String> values) {
+        try {
+            return objectMapper.writeValueAsString(values);
+        } catch (JsonProcessingException ex) {
+            throw new IllegalStateException("序列化名单失败", ex);
+        }
+    }
+
+    private List<String> readStringList(String json) {
+        try {
+            return objectMapper.readValue(json, new TypeReference<>() {
+            });
+        } catch (JsonProcessingException ex) {
+            throw new IllegalStateException("解析名单失败", ex);
+        }
+    }
+
     /** 测试辅助：清空全部业务数据，按外键依赖顺序删除。 */
     public void deleteAllForTesting() {
         jdbcTemplate.update("DELETE FROM result_snapshot_checkpoint");
         jdbcTemplate.update("DELETE FROM result_snapshot_entry");
         jdbcTemplate.update("DELETE FROM result_snapshot");
+        jdbcTemplate.update("DELETE FROM finish_adjudication");
+        jdbcTemplate.update("DELETE FROM finish_evidence");
         jdbcTemplate.update("DELETE FROM idempotency_record");
         jdbcTemplate.update("DELETE FROM checkpoint_timing");
         jdbcTemplate.update("DELETE FROM checkpoint");

@@ -10,6 +10,8 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+
+import java.util.List;
 /**
  * 赛事计时处罚与成绩封榜 HTTP 接口。
  */
@@ -111,6 +113,43 @@ public class RaceController {
     @GetMapping("/{raceId}/missing-checkpoints")
     public MissingCheckpointsResponse getMissingCheckpoints(@PathVariable String raceId) {
         return raceService.getMissingCheckpoints(raceId);
+    }
+
+    /** 登记冲线证据。 */
+    @PostMapping("/{raceId}/finish-evidence")
+    public ResponseEntity<Object> registerFinishEvidence(
+            @PathVariable String raceId,
+            @Valid @RequestBody RegisterFinishEvidenceRequest request) {
+        return toResponse(raceService.registerFinishEvidence(raceId, request));
+    }
+
+    /** 撤回未裁决冲线证据。 */
+    @PostMapping("/{raceId}/finish-evidence/{evidenceId}/withdrawal")
+    public ResponseEntity<Object> withdrawFinishEvidence(
+            @PathVariable String raceId,
+            @PathVariable String evidenceId,
+            @Valid @RequestBody WithdrawFinishEvidenceRequest request) {
+        return toResponse(raceService.withdrawFinishEvidence(raceId, evidenceId, request));
+    }
+
+    /** 批量裁决一组冲线证据并写入不可变裁决快照。 */
+    @PostMapping("/{raceId}/finish-adjudications")
+    public ResponseEntity<Object> adjudicateFinishEvidence(
+            @PathVariable String raceId,
+            @Valid @RequestBody AdjudicateFinishEvidenceRequest request) {
+        return toResponse(raceService.adjudicateFinishEvidence(raceId, request));
+    }
+
+    /** 查询赛事全部冲线证据。 */
+    @GetMapping("/{raceId}/finish-evidence")
+    public List<FinishEvidenceResponse> listFinishEvidence(@PathVariable String raceId) {
+        return raceService.listFinishEvidence(raceId);
+    }
+
+    /** 查询赛事全部证据裁决快照。 */
+    @GetMapping("/{raceId}/finish-adjudications")
+    public List<FinishAdjudicationResponse> listFinishAdjudications(@PathVariable String raceId) {
+        return raceService.listFinishAdjudications(raceId);
     }
 
     private ResponseEntity<Object> toResponse(ServiceResult result) {
