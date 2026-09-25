@@ -18,6 +18,8 @@ import com.example.starter.race.persistence.RunnerRow;
 import com.example.starter.race.persistence.SnapshotCheckpointRow;
 import com.example.starter.race.persistence.SnapshotEntryRow;
 import com.example.starter.race.persistence.SnapshotRow;
+import com.example.starter.race.persistence.WaveRow;
+import com.example.starter.race.persistence.WaveRunnerRow;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -51,9 +53,13 @@ final class ResponseMapper {
             List<RunnerRow> runners,
             List<PenaltyRow> penalties,
             List<CheckpointRow> checkpoints,
-            List<CheckpointTimingRow> timings) {
+            List<CheckpointTimingRow> timings,
+            List<WaveRow> waves,
+            List<WaveRunnerRow> waveRunners) {
+        Map<String, ResultCalculator.WaveView> waveByBib =
+                waveViewByBib(waves, waveRunners);
         List<ResultEntry> entries = ResultCalculator.compute(
-                runners, penalties, checkpoints, timings);
+                runners, penalties, checkpoints, timings, waveByBib, race.baseStartAt());
         return new StandingResponse(
                 race.raceId(),
                 race.version(),
@@ -81,7 +87,13 @@ final class ResponseMapper {
                 entry.totalTimeMs(),
                 entry.checkpointCount(),
                 entry.coveredCheckpointCount(),
-                entry.missingCheckpoints());
+                entry.missingCheckpoints(),
+                entry.waveKey(),
+                entry.waveStartAt(),
+                entry.baseStartAt(),
+                entry.gunTimeMs(),
+                entry.netTimeMs(),
+                entry.invalidReason());
     }
 
     static ResultEntryResponse toEntryResponse(SnapshotEntryRow entry) {
@@ -94,7 +106,30 @@ final class ResponseMapper {
                 entry.totalTimeMs(),
                 entry.checkpointCount(),
                 entry.coveredCheckpointCount(),
-                entry.missingCheckpoints());
+                entry.missingCheckpoints(),
+                entry.waveKey(),
+                entry.waveStartAt(),
+                entry.baseStartAt(),
+                entry.gunTimeMs(),
+                entry.netTimeMs(),
+                entry.invalidReason());
+    }
+
+    /** 由波次与归属关系构造“参赛号 → 所属波次视图”的映射。 */
+    static Map<String, ResultCalculator.WaveView> waveViewByBib(
+            List<WaveRow> waves, List<WaveRunnerRow> waveRunners) {
+        Map<String, WaveRow> waveByKey = new LinkedHashMap<>();
+        for (WaveRow wave : waves) {
+            waveByKey.put(wave.waveKey(), wave);
+        }
+        Map<String, ResultCalculator.WaveView> waveByBib = new LinkedHashMap<>();
+        for (WaveRunnerRow waveRunner : waveRunners) {
+            WaveRow wave = waveByKey.get(waveRunner.waveKey());
+            if (wave != null) {
+                waveByBib.put(waveRunner.bib(), new WaveView(wave.waveKey(), wave.startAt()));
+            }
+        }
+        return waveByBib;
     }
 
     /**
@@ -150,5 +185,10 @@ final class ResponseMapper {
                 .toList();
         return new RunnerTimingResponse(
                 snapshot.raceId(), bib, snapshot.version(), finishTimeMs, passes);
+    }
+
+    /** ResultCalculator 使用的轻量波次视图。 */
+    private record WaveView(String waveKey, long startAt)
+            implements ResultCalculator.WaveView {
     }
 }

@@ -30,6 +30,8 @@ public class RaceRepository {
             new CheckpointTimingRowMapper();
     private static final SnapshotCheckpointRowMapper SNAPSHOT_CHECKPOINT_ROW_MAPPER =
             new SnapshotCheckpointRowMapper();
+    private static final WaveRowMapper WAVE_ROW_MAPPER = new WaveRowMapper();
+    private static final WaveRunnerRowMapper WAVE_RUNNER_ROW_MAPPER = new WaveRunnerRowMapper();
 
     private final JdbcTemplate jdbcTemplate;
 
@@ -40,7 +42,7 @@ public class RaceRepository {
     /** 按ID查询赛事。 */
     public Optional<RaceRow> findRace(String raceId) {
         return jdbcTemplate
-                .query("SELECT race_id, version, status, created_at FROM race WHERE race_id = ?",
+                .query("SELECT race_id, version, status, base_start_at, created_at FROM race WHERE race_id = ?",
                         RACE_ROW_MAPPER, raceId)
                 .stream()
                 .findFirst();
@@ -53,7 +55,7 @@ public class RaceRepository {
      */
     public Optional<RaceRow> findRaceForUpdate(String raceId) {
         return jdbcTemplate
-                .query("SELECT race_id, version, status, created_at FROM race WHERE race_id = ? FOR UPDATE",
+                .query("SELECT race_id, version, status, base_start_at, created_at FROM race WHERE race_id = ? FOR UPDATE",
                         RACE_ROW_MAPPER, raceId)
                 .stream()
                 .findFirst();
@@ -172,6 +174,68 @@ public class RaceRepository {
                 });
     }
 
+    /** 查询赛事的全部波次，按起跑时刻、波次键稳定排序。 */
+    public List<WaveRow> findWaves(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT race_id, wave_key, start_at, created_at, updated_at "
+                        + "FROM wave WHERE race_id = ? ORDER BY start_at, wave_key",
+                WAVE_ROW_MAPPER, raceId);
+    }
+
+    /** 按赛事与波次键查询单个波次。 */
+    public Optional<WaveRow> findWave(String raceId, String waveKey) {
+        return jdbcTemplate
+                .query("SELECT race_id, wave_key, start_at, created_at, updated_at "
+                                + "FROM wave WHERE race_id = ? AND wave_key = ?",
+                        WAVE_ROW_MAPPER, raceId, waveKey)
+                .stream()
+                .findFirst();
+    }
+
+    /** 查询赛事下全部参赛者-波次归属关系，按参赛号字典序排列。 */
+    public List<WaveRunnerRow> findWaveRunners(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT race_id, bib, wave_key, created_at, updated_at "
+                        + "FROM wave_runner WHERE race_id = ? ORDER BY bib",
+                WAVE_RUNNER_ROW_MAPPER, raceId);
+    }
+
+    /** 查询单个参赛者的波次归属；不属于任何波次返回 empty。 */
+    public Optional<WaveRunnerRow> findWaveRunner(String raceId, String bib) {
+        return jdbcTemplate
+                .query("SELECT race_id, bib, wave_key, created_at, updated_at "
+                                + "FROM wave_runner WHERE race_id = ? AND bib = ?",
+                        WAVE_RUNNER_ROW_MAPPER, raceId, bib)
+                .stream()
+                .findFirst();
+    }
+
+    /** 新增单个波次。 */
+    public void insertWave(WaveRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO wave (race_id, wave_key, start_at, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, ?)",
+                row.raceId(), row.waveKey(), row.startAt(), row.createdAt(), row.updatedAt());
+    }
+
+    /** 新增参赛者-波次归属关系（同一参赛者主键上至多一行）。 */
+    public void insertWaveRunner(WaveRunnerRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO wave_runner (race_id, bib, wave_key, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, ?)",
+                row.raceId(), row.bib(), row.waveKey(), row.createdAt(), row.updatedAt());
+    }
+
+    /** 删除赛事下全部参赛者-波次归属关系（整批替换波次时先清空）。 */
+    public int deleteWaveRunners(String raceId) {
+        return jdbcTemplate.update("DELETE FROM wave_runner WHERE race_id = ?", raceId);
+    }
+
+    /** 删除赛事下全部波次（整批替换波次时先清空；须先删除 wave_runner 以满足外键）。 */
+    public int deleteWaves(String raceId) {
+        return jdbcTemplate.update("DELETE FROM wave WHERE race_id = ?", raceId);
+    }
+
     /** 查询封榜快照（含全部条目与分段明细）；未封榜返回 empty。 */
     public Optional<SnapshotRow> findSnapshot(String raceId) {
         List<SnapshotRow> headers = jdbcTemplate.query(
@@ -188,7 +252,8 @@ public class RaceRepository {
         SnapshotRow header = headers.getFirst();
         List<SnapshotEntryRow> entryRows = jdbcTemplate.query(
                 "SELECT race_id, bib, rank_no, status, finish_time_ms, penalty_ms, total_time_ms, "
-                        + "display_order, checkpoint_count, covered_checkpoint_count "
+                        + "display_order, checkpoint_count, covered_checkpoint_count, "
+                        + "wave_key, wave_start_at, base_start_at, gun_time_ms, net_time_ms, invalid_reason "
                         + "FROM result_snapshot_entry WHERE race_id = ? ORDER BY display_order",
                 SNAPSHOT_ENTRY_ROW_MAPPER, raceId);
         List<SnapshotCheckpointRow> checkpoints = jdbcTemplate.query(
@@ -210,17 +275,20 @@ public class RaceRepository {
                         entry.finishTimeMs(), entry.penaltyMs(), entry.totalTimeMs(),
                         entry.displayOrder(), entry.checkpointCount(),
                         entry.coveredCheckpointCount(),
-                        missingByBib.getOrDefault(entry.bib(), List.of())))
+                        missingByBib.getOrDefault(entry.bib(), List.of()),
+                        entry.waveKey(), entry.waveStartAt(), entry.baseStartAt(),
+                        entry.gunTimeMs(), entry.netTimeMs(), entry.invalidReason()))
                 .toList();
         return Optional.of(new SnapshotRow(header.raceId(), header.version(), header.sealedAt(),
                 entries, checkpoints));
     }
 
-    /** 新建赛事，初始版本1、状态OPEN。 */
-    public void insertRace(String raceId, long now) {
+    /** 新建赛事，初始版本1、状态OPEN，并固化基准起跑时刻。 */
+    public void insertRace(String raceId, long baseStartAt, long now) {
         jdbcTemplate.update(
-                "INSERT INTO race (race_id, version, status, created_at) VALUES (?, 1, 'OPEN', ?)",
-                raceId, now);
+                "INSERT INTO race (race_id, version, status, base_start_at, created_at) "
+                        + "VALUES (?, 1, 'OPEN', ?, ?)",
+                raceId, baseStartAt, now);
     }
 
     /** 登记选手；finishTimeMs 为 null 表示计时缺失。 */
@@ -292,8 +360,9 @@ public class RaceRepository {
         jdbcTemplate.batchUpdate(
                 "INSERT INTO result_snapshot_entry "
                         + "(race_id, bib, rank_no, status, finish_time_ms, penalty_ms, total_time_ms, "
-                        + "display_order, checkpoint_count, covered_checkpoint_count) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        + "display_order, checkpoint_count, covered_checkpoint_count, "
+                        + "wave_key, wave_start_at, base_start_at, gun_time_ms, net_time_ms, invalid_reason) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 snapshot.entries(),
                 snapshot.entries().size(),
                 (ps, entry) -> {
@@ -307,6 +376,12 @@ public class RaceRepository {
                     ps.setInt(8, entry.displayOrder());
                     ps.setInt(9, entry.checkpointCount());
                     ps.setInt(10, entry.coveredCheckpointCount());
+                    ps.setString(11, entry.waveKey());
+                    ps.setObject(12, entry.waveStartAt());
+                    ps.setLong(13, entry.baseStartAt());
+                    ps.setObject(14, entry.gunTimeMs());
+                    ps.setObject(15, entry.netTimeMs());
+                    ps.setString(16, entry.invalidReason());
                 });
         jdbcTemplate.batchUpdate(
                 "INSERT INTO result_snapshot_checkpoint "
@@ -376,6 +451,8 @@ public class RaceRepository {
         jdbcTemplate.update("DELETE FROM idempotency_record");
         jdbcTemplate.update("DELETE FROM checkpoint_timing");
         jdbcTemplate.update("DELETE FROM checkpoint");
+        jdbcTemplate.update("DELETE FROM wave_runner");
+        jdbcTemplate.update("DELETE FROM wave");
         jdbcTemplate.update("DELETE FROM penalty");
         jdbcTemplate.update("DELETE FROM runner");
         jdbcTemplate.update("DELETE FROM race");
@@ -388,6 +465,7 @@ public class RaceRepository {
                     rs.getString("race_id"),
                     rs.getInt("version"),
                     RaceStatus.valueOf(rs.getString("status")),
+                    rs.getLong("base_start_at"),
                     rs.getLong("created_at"));
         }
     }
@@ -435,7 +513,13 @@ public class RaceRepository {
                     rs.getInt("display_order"),
                     rs.getInt("checkpoint_count"),
                     rs.getInt("covered_checkpoint_count"),
-                    List.of());
+                    List.of(),
+                    rs.getString("wave_key"),
+                    (Long) rs.getObject("wave_start_at"),
+                    rs.getLong("base_start_at"),
+                    (Long) rs.getObject("gun_time_ms"),
+                    (Long) rs.getObject("net_time_ms"),
+                    rs.getString("invalid_reason"));
         }
     }
 
@@ -461,6 +545,30 @@ public class RaceRepository {
                     rs.getInt("position"),
                     rs.getLong("elapsed_millis"),
                     rs.getLong("created_at"));
+        }
+    }
+
+    private static final class WaveRowMapper implements RowMapper<WaveRow> {
+        @Override
+        public WaveRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new WaveRow(
+                    rs.getString("race_id"),
+                    rs.getString("wave_key"),
+                    rs.getLong("start_at"),
+                    rs.getLong("created_at"),
+                    rs.getLong("updated_at"));
+        }
+    }
+
+    private static final class WaveRunnerRowMapper implements RowMapper<WaveRunnerRow> {
+        @Override
+        public WaveRunnerRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new WaveRunnerRow(
+                    rs.getString("race_id"),
+                    rs.getString("bib"),
+                    rs.getString("wave_key"),
+                    rs.getLong("created_at"),
+                    rs.getLong("updated_at"));
         }
     }
 

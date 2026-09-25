@@ -7,6 +7,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
@@ -85,6 +86,28 @@ public class RaceController {
             @PathVariable String raceId,
             @Valid @RequestBody SealRaceRequest request) {
         return toResponse(raceService.sealRace(raceId, request));
+    }
+
+    /** 整批登记/修改分批起跑波次。 */
+    @PutMapping("/{raceId}/waves")
+    public ResponseEntity<Object> registerWaves(
+            @PathVariable String raceId,
+            @Valid @RequestBody RegisterWavesRequest request) {
+        return toResponse(raceService.registerWaves(raceId, request));
+    }
+
+    /** 查询波次清单。 */
+    @GetMapping("/{raceId}/waves")
+    public WavesResponse getWaves(@PathVariable String raceId) {
+        return raceService.getWaves(raceId);
+    }
+
+    /** 查询单个参赛者的净计时。 */
+    @GetMapping("/{raceId}/runners/{bib}/net-time")
+    public RunnerNetTimeResponse getRunnerNetTime(
+            @PathVariable String raceId,
+            @PathVariable String bib) {
+        return raceService.getRunnerNetTime(raceId, bib);
     }
 
     /** 查询即时成绩（封榜后返回只读快照内容）。 */

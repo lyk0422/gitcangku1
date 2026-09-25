@@ -8,13 +8,18 @@ import com.example.starter.race.api.CreateRaceRequest;
 import com.example.starter.race.api.MissingCheckpointsResponse;
 import com.example.starter.race.api.RaceResponse;
 import com.example.starter.race.api.RegisterRunnerRequest;
+import com.example.starter.race.api.RegisterWavesRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
+import com.example.starter.race.api.ResultEntryResponse;
 import com.example.starter.race.api.RunnerMissingCheckpointsResponse;
+import com.example.starter.race.api.RunnerNetTimeResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.api.SubmitTimingRequest;
+import com.example.starter.race.api.WaveResponse;
+import com.example.starter.race.api.WavesResponse;
 import com.example.starter.race.domain.CheckpointRules;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
@@ -30,6 +35,8 @@ import com.example.starter.race.persistence.SnapshotCheckpointRow;
 import com.example.starter.race.persistence.SnapshotEntryRow;
 import com.example.starter.race.persistence.SnapshotRow;
 import com.example.starter.race.persistence.RaceRepository;
+import com.example.starter.race.persistence.WaveRow;
+import com.example.starter.race.persistence.WaveRunnerRow;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
@@ -88,14 +95,16 @@ public class RaceServiceImpl implements RaceService {
                 orderedParams("raceId", request.raceId()),
                 () -> {
                     long now = clock.millis();
+                    long baseStartAt = request.baseStartAt() != null ? request.baseStartAt() : now;
                     try {
-                        repository.insertRace(request.raceId(), now);
+                        repository.insertRace(request.raceId(), baseStartAt, now);
                     } catch (DuplicateKeyException ex) {
                         throw new ConflictException("赛事已存在: " + request.raceId());
                     }
                     RaceRow race = repository.findRace(request.raceId()).orElseThrow();
                     return ServiceResult.created(new RaceResponse(
-                            race.raceId(), race.version(), race.status(), race.createdAt()));
+                            race.raceId(), race.version(), race.status(),
+                            race.baseStartAt(), race.createdAt()));
                 });
     }
 
@@ -303,6 +312,17 @@ public class RaceServiceImpl implements RaceService {
                     if (violation != null) {
                         throw new UnprocessableEntityException(violation);
                     }
+                    // 分段耗时以赛事基准起跑为零点，波次选手任何分段都不得早于其波次起跑时刻。
+                    repository.findWaveRunner(raceId, bib).ifPresent(waveRunner -> {
+                        WaveRow wave = repository.findWave(raceId, waveRunner.waveKey())
+                                .orElseThrow(() -> new IllegalStateException(
+                                        "波次归属缺少波次定义: " + waveRunner.waveKey()));
+                        long waveOffsetMs = wave.startAt() - race.baseStartAt();
+                        if (elapsedMillis < waveOffsetMs) {
+                            throw new UnprocessableEntityException(
+                                    "分段耗时早于该选手波次起跑时刻: waveKey=" + wave.waveKey());
+                        }
+                    });
                     bumpVersion(race, request.expectedVersion());
                     long now = clock.millis();
                     CheckpointTimingRow row = new CheckpointTimingRow(
@@ -359,8 +379,12 @@ public class RaceServiceImpl implements RaceService {
                     List<PenaltyRow> penalties = repository.findPenalties(raceId);
                     List<CheckpointRow> checkpoints = repository.findCheckpoints(raceId);
                     List<CheckpointTimingRow> timings = repository.findAllTimings(raceId);
-                    List<ResultEntry> entries =
-                            ResultCalculator.compute(runners, penalties, checkpoints, timings);
+                    List<WaveRow> waves = repository.findWaves(raceId);
+                    List<WaveRunnerRow> waveRunners = repository.findWaveRunners(raceId);
+                    List<ResultEntry> entries = ResultCalculator.compute(
+                            runners, penalties, checkpoints, timings,
+                            ResponseMapper.waveViewByBib(waves, waveRunners),
+                            race.baseStartAt());
 
                     int newVersion = request.expectedVersion() + 1;
                     int updated = repository.sealIfOpenAtVersion(
@@ -383,7 +407,13 @@ public class RaceServiceImpl implements RaceService {
                                 order,
                                 entry.checkpointCount(),
                                 entry.coveredCheckpointCount(),
-                                entry.missingCheckpoints()));
+                                entry.missingCheckpoints(),
+                                entry.waveKey(),
+                                entry.waveStartAt(),
+                                entry.baseStartAt(),
+                                entry.gunTimeMs(),
+                                entry.netTimeMs(),
+                                entry.invalidReason()));
                     }
                     // 在同一封榜事务内固化每名选手 × 每个检查点的明细，缺失行耗时为 null。
                     List<SnapshotCheckpointRow> snapshotCheckpoints =
@@ -394,6 +424,156 @@ public class RaceServiceImpl implements RaceService {
                             raceId, newVersion, RaceStatus.SEALED, now,
                             snapshotEntries.stream().map(ResponseMapper::toEntryResponse).toList()));
                 });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult registerWaves(String raceId, RegisterWavesRequest request) {
+        // 幂等摘要按“波次键:起跑时刻”与参赛号排序列表规范化，保证集合语义下的重放稳定。
+        List<RegisterWavesRequest.WaveDefinition> canonicalWaves = request.waves().stream()
+                .sorted(java.util.Comparator
+                        .comparing(RegisterWavesRequest.WaveDefinition::waveKey))
+                .map(def -> new RegisterWavesRequest.WaveDefinition(
+                        def.waveKey(), def.startAt(),
+                        def.runners() == null ? List.of()
+                                : def.runners().stream().sorted().toList()))
+                .toList();
+        return withIdempotency(request.requestId(), "REGISTER_WAVES",
+                orderedParams(
+                        "raceId", raceId,
+                        "expectedVersion", request.expectedVersion(),
+                        "waves", canonicalWaves.stream()
+                                .map(def -> def.waveKey() + "@" + def.startAt()
+                                        + ":" + String.join(",", def.runners()))
+                                .toList()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    validateWaveDefinitions(request.waves());
+
+                    // 行锁已在 requireOpenRace 中获取：此处读到的全部选手与分段都是某个
+                    // 已串行化版本的一致快照；若先有分段计时提交，版本校验已要求客户端带着
+                    // 新版本重试，并在重试中对“全部已计时参赛者”重新执行下列校验。
+                    List<RunnerRow> runners = repository.findRunners(raceId);
+                    Map<String, RunnerRow> runnerByBib = new TreeMap<>();
+                    for (RunnerRow runner : runners) {
+                        runnerByBib.put(runner.bib(), runner);
+                    }
+                    Map<String, List<CheckpointTimingRow>> timingsByBib = new TreeMap<>();
+                    for (CheckpointTimingRow timing : repository.findAllTimings(raceId)) {
+                        timingsByBib.computeIfAbsent(timing.bib(), key -> new ArrayList<>())
+                                .add(timing);
+                    }
+
+                    for (RegisterWavesRequest.WaveDefinition wave : request.waves()) {
+                        long offsetMs = wave.startAt() - race.baseStartAt();
+                        for (String bib : wave.runners() == null ? List.<String>of() : wave.runners()) {
+                            RunnerRow runner = runnerByBib.get(bib);
+                            if (runner == null) {
+                                throw new UnprocessableEntityException(
+                                        "波次参赛者不存在: " + bib);
+                            }
+                            // 波次起跑时刻不得晚于该参赛者首个（累计耗时最小的）有效分段的绝对时刻。
+                            List<CheckpointTimingRow> runnerTimings =
+                                    timingsByBib.getOrDefault(bib, List.of());
+                            if (!runnerTimings.isEmpty()) {
+                                long firstElapsed = runnerTimings.stream()
+                                        .mapToLong(CheckpointTimingRow::elapsedMillis)
+                                        .min()
+                                        .orElseThrow();
+                                if (offsetMs > firstElapsed) {
+                                    throw new UnprocessableEntityException(
+                                            "波次起跑时刻晚于参赛者 " + bib
+                                                    + " 的首个有效分段计时: waveKey=" + wave.waveKey());
+                                }
+                            }
+                        }
+                    }
+
+                    bumpVersion(race, request.expectedVersion());
+                    long now = clock.millis();
+                    // 整批替换语义：先清空既有波次（含归属关系），再写入请求体中的完整集合。
+                    repository.deleteWaveRunners(raceId);
+                    repository.deleteWaves(raceId);
+                    for (RegisterWavesRequest.WaveDefinition wave : request.waves()) {
+                        repository.insertWave(new WaveRow(
+                                raceId, wave.waveKey(), wave.startAt(), now, now));
+                        List<String> waveBibs = wave.runners() == null
+                                ? List.of()
+                                : wave.runners().stream().distinct().sorted().toList();
+                        for (String bib : waveBibs) {
+                            repository.insertWaveRunner(new WaveRunnerRow(
+                                    raceId, bib, wave.waveKey(), now, now));
+                        }
+                    }
+                    return ServiceResult.ok(buildWavesResponse(raceId));
+                });
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public WavesResponse getWaves(String raceId) {
+        RaceRow race = repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        return buildWavesResponse(race);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public RunnerNetTimeResponse getRunnerNetTime(String raceId, String bib) {
+        RaceRow race = repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        repository.findRunner(raceId, bib)
+                .orElseThrow(() -> new NotFoundException("选手不存在: " + bib));
+        if (race.status() == RaceStatus.SEALED) {
+            SnapshotRow snapshot = repository.findSnapshot(raceId)
+                    .orElseThrow(() -> new IllegalStateException(
+                            "赛事已封榜但缺少快照: " + raceId));
+            SnapshotEntryRow entry = snapshot.entries().stream()
+                    .filter(candidate -> candidate.bib().equals(bib))
+                    .findFirst()
+                    .orElseThrow(() -> new IllegalStateException(
+                            "封榜快照缺少选手条目: " + bib));
+            return new RunnerNetTimeResponse(
+                    bib, snapshot.version(), entry.status(),
+                    entry.waveKey(), entry.waveStartAt(), entry.baseStartAt(),
+                    entry.finishTimeMs(), entry.gunTimeMs(), entry.netTimeMs(),
+                    entry.invalidReason());
+        }
+        StandingResponse standing = getResults(raceId);
+        ResultEntryResponse entry = standing.entries().stream()
+                .filter(candidate -> candidate.bib().equals(bib))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException("缺少选手成绩条目: " + bib));
+        return new RunnerNetTimeResponse(
+                bib, standing.version(), entry.status(),
+                entry.waveKey(), entry.waveStartAt(), entry.baseStartAt(),
+                entry.finishTimeMs(), entry.gunTimeMs(), entry.netTimeMs(),
+                entry.invalidReason());
+    }
+
+    private WavesResponse buildWavesResponse(String raceId) {
+        RaceRow race = repository.findRace(raceId).orElseThrow();
+        return buildWavesResponse(race);
+    }
+
+    private WavesResponse buildWavesResponse(RaceRow race) {
+        List<WaveRow> waves = repository.findWaves(race.raceId());
+        List<WaveRunnerRow> waveRunners = repository.findWaveRunners(race.raceId());
+        Map<String, List<String>> bibsByWaveKey = new TreeMap<>();
+        for (WaveRunnerRow waveRunner : waveRunners) {
+            bibsByWaveKey.computeIfAbsent(waveRunner.waveKey(), key -> new ArrayList<>())
+                    .add(waveRunner.bib());
+        }
+        List<WaveResponse> responses = waves.stream()
+                .map(wave -> new WaveResponse(
+                        wave.waveKey(),
+                        wave.startAt(),
+                        bibsByWaveKey.getOrDefault(wave.waveKey(), List.of()).stream()
+                                .sorted()
+                                .toList()))
+                .toList();
+        return new WavesResponse(
+                race.raceId(), race.version(), race.baseStartAt(), responses);
     }
 
     @Override
@@ -412,7 +592,9 @@ public class RaceServiceImpl implements RaceService {
                 repository.findRunners(raceId),
                 repository.findPenalties(raceId),
                 repository.findCheckpoints(raceId),
-                repository.findAllTimings(raceId));
+                repository.findAllTimings(raceId),
+                repository.findWaves(raceId),
+                repository.findWaveRunners(raceId));
     }
 
     @Override
@@ -645,6 +827,41 @@ public class RaceServiceImpl implements RaceService {
         } catch (InterruptedException ex) {
             Thread.currentThread().interrupt();
             throw new ConflictException("等待同键请求完成时被中断");
+        }
+    }
+
+    /**
+     * 校验波次定义请求体：1~20个、waveKey 非空且赛事内唯一、每名参赛者最多属于一个波次。
+     * 起跑时刻是否晚于已有分段计时在持有赛事行锁后结合持久化数据另行校验。
+     */
+    private static void validateWaveDefinitions(
+            List<RegisterWavesRequest.WaveDefinition> waves) {
+        if (waves.isEmpty() || waves.size() > 20) {
+            throw new BadRequestException("波次数量必须在 1~20 之间");
+        }
+        java.util.Set<String> waveKeys = new java.util.HashSet<>();
+        java.util.Set<String> assignedBibs = new java.util.HashSet<>();
+        for (RegisterWavesRequest.WaveDefinition wave : waves) {
+            if (wave.waveKey() == null || wave.waveKey().isBlank()) {
+                throw new BadRequestException("波次 waveKey 不能为空");
+            }
+            if (!waveKeys.add(wave.waveKey())) {
+                throw new BadRequestException("波次 waveKey 在赛事内重复: " + wave.waveKey());
+            }
+            if (wave.startAt() == null || wave.startAt() <= 0L) {
+                throw new BadRequestException("波次起跑时刻必须为正数毫秒时间戳");
+            }
+            if (wave.runners() != null) {
+                for (String bib : wave.runners()) {
+                    if (bib == null || bib.isBlank()) {
+                        throw new BadRequestException("波次参赛者参赛号不能为空");
+                    }
+                    if (!assignedBibs.add(bib)) {
+                        throw new BadRequestException(
+                                "同一参赛者只能属于一个波次: " + bib);
+                    }
+                }
+            }
         }
     }
 

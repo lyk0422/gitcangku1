@@ -10,13 +10,19 @@ import java.util.List;
  *
  * @param bib                    参赛号
  * @param rank                   名次（并列同名次并跳号）；非 RANKED 为 null
- * @param status                RANKED / UNTIMED / MISSING_CHECKPOINT / DISQUALIFIED
- * @param finishTimeMs          原始完赛耗时毫秒；计时缺失为 null
- * @param penaltyMs             生效加时合计毫秒数
- * @param totalTimeMs           总耗时毫秒；未排名为 null
- * @param checkpointCount       赛事检查点总数；未配置检查点为 0
+ * @param status                 RANKED / UNTIMED / MISSING_CHECKPOINT / DISQUALIFIED / INVALID_WAVE
+ * @param finishTimeMs           原始完赛耗时毫秒；计时缺失为 null
+ * @param penaltyMs              生效加时合计毫秒数
+ * @param totalTimeMs            最终枪声计时毫秒=原始完赛耗时+生效加时；未排名为 null
+ * @param checkpointCount        赛事检查点总数；未配置检查点为 0
  * @param coveredCheckpointCount 该选手已覆盖检查点数量
- * @param missingCheckpoints    缺失检查点代码，按检查点顺序排列；无缺失为空列表
+ * @param missingCheckpoints     缺失检查点代码，按检查点顺序排列；无缺失为空列表
+ * @param waveKey                所属波次唯一键；不属于任何波次为 null
+ * @param waveStartAt            所属波次UTC起跑时刻，Unix毫秒时间戳；无波次为 null
+ * @param baseStartAt            赛事基准起跑时刻，Unix毫秒UTC时间戳
+ * @param gunTimeMs              最终枪声计时毫秒；无枪声计时为 null
+ * @param netTimeMs              最终净计时毫秒；INVALID_WAVE 或无枪声计时为 null
+ * @param invalidReason          无效原因：INVALID_WAVE-净计时为负；其余为 null
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public record ResultEntryResponse(
@@ -28,6 +34,12 @@ public record ResultEntryResponse(
         Long totalTimeMs,
         int checkpointCount,
         int coveredCheckpointCount,
-        List<String> missingCheckpoints
+        List<String> missingCheckpoints,
+        String waveKey,
+        Long waveStartAt,
+        Long baseStartAt,
+        Long gunTimeMs,
+        Long netTimeMs,
+        String invalidReason
 ) {
 }
