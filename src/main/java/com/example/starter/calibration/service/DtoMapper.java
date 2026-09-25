@@ -1,6 +1,5 @@
 package com.example.starter.calibration.service;
 
-import java.math.BigDecimal;
 import java.util.List;
 
 import com.example.starter.calibration.api.dto.CertificateResponse;
@@ -20,9 +19,9 @@ final class DtoMapper {
     }
 
     /** 十进制输出：去掉多余尾零，零统一输出 "0"。 */
-    static String format(BigDecimal value) {
-        BigDecimal stripped = value.stripTrailingZeros();
-        if (stripped.compareTo(BigDecimal.ZERO) == 0) {
+    static String format(java.math.BigDecimal value) {
+        java.math.BigDecimal stripped = value.stripTrailingZeros();
+        if (stripped.compareTo(java.math.BigDecimal.ZERO) == 0) {
             return "0";
         }
         return stripped.toPlainString();
@@ -31,11 +30,16 @@ final class DtoMapper {
     static CertificateResponse toResponse(Certificate cert) {
         return new CertificateResponse(
                 cert.id(),
+                cert.standardId(),
                 cert.instrumentId(),
+                cert.version(),
                 cert.validFrom(),
                 cert.validTo(),
                 format(cert.a()),
                 format(cert.b()),
+                format(cert.uncertainty()),
+                cert.uncertaintyVersion(),
+                cert.singleBatchOnly(),
                 cert.revoked(),
                 cert.revokedAt(),
                 cert.createdAt());
@@ -48,14 +52,20 @@ final class DtoMapper {
                 m.id(),
                 m.measurementKey(),
                 m.instrumentId(),
+                m.standardId(),
                 m.measuredAt(),
                 format(m.rawReading()),
                 format(m.lowerLimit()),
                 format(m.upperLimit()),
                 m.submittedBy(),
                 m.certificateId(),
+                m.certificateVersion(),
+                m.versionNo(),
                 format(m.computedValue()),
                 m.displayValue().toPlainString(),
+                format(m.expandedUncertainty()),
+                m.uncertaintyVersion(),
+                m.referenceKey(),
                 m.passed(),
                 m.status().name(),
                 usable,
@@ -64,6 +74,8 @@ final class DtoMapper {
     }
 
     static ReleaseRecordResponse toResponse(ReleaseRecord record) {
-        return new ReleaseRecordResponse(record.batchId(), record.releasedBy(), record.releasedAt());
+        return new ReleaseRecordResponse(
+                record.batchId(), record.measurementVersionNo(),
+                record.releasedBy(), record.releasedAt());
     }
 }

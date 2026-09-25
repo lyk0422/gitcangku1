@@ -30,6 +30,9 @@ class CertificateApiTest {
     @BeforeEach
     void clean() {
         jdbc.update("DELETE FROM release_record");
+        jdbc.update("DELETE FROM certificate_batch_binding");
+        jdbc.update("DELETE FROM batch_submit");
+        jdbc.update("DELETE FROM measurement_version");
         jdbc.update("DELETE FROM measurement");
         jdbc.update("DELETE FROM calibration_certificate");
         jdbc.update("DELETE FROM instrument_lock");
