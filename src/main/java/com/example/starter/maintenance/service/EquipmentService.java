@@ -46,6 +46,11 @@ public class EquipmentService {
         return txService.reviseReading(equipmentId, readingId, req);
     }
 
+    public ReadingResponse certifyReading(String equipmentId, String readingId,
+                                          com.example.starter.maintenance.api.dto.CertifyReadingRequest req) {
+        return txService.certifyReading(equipmentId, readingId, req);
+    }
+
     public MaintenanceResponse completeMaintenance(String equipmentId, CompleteMaintenanceRequest req) {
         return txService.completeMaintenance(equipmentId, req);
     }

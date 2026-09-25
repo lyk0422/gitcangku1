@@ -11,6 +11,7 @@ import java.time.Instant;
  * @param cumulativeMinutes  当前累计工时（分钟）
  * @param revisionNo         当前修订号，初始 1
  * @param anchored           是否已被某条保养记录锚定（锚定后不可修订）
+ * @param certified          是否为设备当前已认证读数
  * @param equipmentVersion   操作后的设备版本号（仅写操作响应中有意义，查询时为当前版本）
  */
 public record ReadingResponse(
@@ -20,5 +21,6 @@ public record ReadingResponse(
         long cumulativeMinutes,
         int revisionNo,
         boolean anchored,
+        boolean certified,
         long equipmentVersion) {
 }

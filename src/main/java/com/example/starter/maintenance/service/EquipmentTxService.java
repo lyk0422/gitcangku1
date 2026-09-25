@@ -21,7 +21,9 @@ import com.example.starter.maintenance.api.dto.StatusResponse;
 import com.example.starter.maintenance.domain.Equipment;
 import com.example.starter.maintenance.domain.MaintenanceRecord;
 import com.example.starter.maintenance.domain.Reading;
+import com.example.starter.maintenance.domain.WorkOrder;
 import com.example.starter.maintenance.store.EquipmentRepository;
+import com.example.starter.maintenance.store.WorkOrderRepository;
 
 /**
  * 设备工时保养事务业务服务。写操作流程：设备行锁 → 幂等判定 → 版本校验 → 业务规则 → 变更并版本加一。
@@ -31,11 +33,14 @@ import com.example.starter.maintenance.store.EquipmentRepository;
 public class EquipmentTxService {
 
     private final EquipmentRepository repository;
+    private final WorkOrderRepository workOrderRepository;
     private final IdempotencyService idempotency;
     private final Clock clock;
 
-    public EquipmentTxService(EquipmentRepository repository, IdempotencyService idempotency, Clock clock) {
+    public EquipmentTxService(EquipmentRepository repository, WorkOrderRepository workOrderRepository,
+                              IdempotencyService idempotency, Clock clock) {
         this.repository = repository;
+        this.workOrderRepository = workOrderRepository;
         this.idempotency = idempotency;
         this.clock = clock;
     }
@@ -72,17 +77,18 @@ public class EquipmentTxService {
                         throw ApiException.unprocessable("READING_TIME_DUPLICATE",
                                 "同一设备同一采样时刻仅允许一条读数");
                     }
+                    checkActiveWorkOrderWindow(equipmentId, req.sampledAt(), req.cumulativeMinutes());
                     checkMonotonic(equipmentId, req.sampledAt(), req.cumulativeMinutes());
                     Instant now = clock.instant();
                     repository.insertReading(
                             new Reading(equipmentId, req.readingId(), req.sampledAt(),
-                                    req.cumulativeMinutes(), 1),
+                                    req.cumulativeMinutes(), 1, false),
                             now);
                     repository.insertRevision(equipmentId, req.readingId(), 1,
                             req.cumulativeMinutes(), req.requestId(), now);
                     repository.incrementVersion(equipmentId);
                     return new ReadingResponse(equipmentId, req.readingId(), req.sampledAt(),
-                            req.cumulativeMinutes(), 1, false, equipment.version() + 1);
+                            req.cumulativeMinutes(), 1, false, false, equipment.version() + 1);
                 });
     }
 
@@ -103,6 +109,9 @@ public class EquipmentTxService {
                         throw ApiException.conflict("READING_ANCHORED",
                                 "读数已作为历史保养锚点，不可修订：" + readingId);
                     }
+                    checkWorkOrderBaselineFrozen(equipmentId, readingId);
+                    checkWorkOrderRevisionWindow(equipmentId, reading.sampledAt(),
+                            req.cumulativeMinutes());
                     checkMonotonic(equipmentId, reading.sampledAt(), req.cumulativeMinutes());
                     int newRevisionNo = reading.revisionNo() + 1;
                     Instant now = clock.instant();
@@ -112,7 +121,34 @@ public class EquipmentTxService {
                             req.cumulativeMinutes(), req.requestId(), now);
                     repository.incrementVersion(equipmentId);
                     return new ReadingResponse(equipmentId, readingId, reading.sampledAt(),
-                            req.cumulativeMinutes(), newRevisionNo, false, equipment.version() + 1);
+                            req.cumulativeMinutes(), newRevisionNo, false,
+                            reading.certified(), equipment.version() + 1);
+                });
+    }
+
+    // ---------- 认证读数 ----------
+
+    @Transactional
+    public ReadingResponse certifyReading(String equipmentId, String readingId,
+                                          com.example.starter.maintenance.api.dto.CertifyReadingRequest req) {
+        Equipment equipment = lockEquipment(equipmentId);
+        String fingerprint = equipmentId + "|CERTIFY|" + readingId + "|" + req.expectedVersion();
+        return idempotency.execute(req.requestId(), "CERTIFY_READING", fingerprint,
+                ReadingResponse.class, () -> {
+                    checkVersion(equipment, req.expectedVersion());
+                    Reading reading = repository.findReading(equipmentId, readingId)
+                            .orElseThrow(() -> ApiException.notFound("READING_NOT_FOUND",
+                                    "读数不存在：" + readingId));
+                    long resultingVersion = equipment.version();
+                    if (!reading.certified()) {
+                        repository.certifyReading(equipmentId, readingId);
+                        repository.incrementVersion(equipmentId);
+                        resultingVersion = equipment.version() + 1;
+                    }
+                    return new ReadingResponse(equipmentId, readingId, reading.sampledAt(),
+                            reading.cumulativeMinutes(), reading.revisionNo(),
+                            repository.existsMaintenanceAnchoringReading(equipmentId, readingId),
+                            true, resultingVersion);
                 });
     }
 
@@ -176,7 +212,7 @@ public class EquipmentTxService {
                 .map(reading -> new ReadingResponse(equipmentId, reading.readingId(), reading.sampledAt(),
                         reading.cumulativeMinutes(), reading.revisionNo(),
                         repository.existsMaintenanceAnchoringReading(equipmentId, reading.readingId()),
-                        equipment.version()))
+                        reading.certified(), equipment.version()))
                 .toList();
     }
 
@@ -217,6 +253,60 @@ public class EquipmentTxService {
             throw ApiException.conflict("VERSION_CONFLICT",
                     "设备版本冲突：期望 " + expectedVersion + "，当前 " + equipment.version());
         }
+    }
+
+    /**
+     * 工单进行期间普通读数登记约束：读表时刻须落在进行中工单窗口 [windowStart, windowEnd)，
+     * 且读数不得低于工单基线。未开始/已终结工单不限制普通登记。
+     */
+    private void checkActiveWorkOrderWindow(String equipmentId, Instant sampledAt, long cumulativeMinutes) {
+        workOrderRepository.findOpenWorkOrder(equipmentId)
+                .filter(order -> WorkOrder.IN_PROGRESS.equals(order.status()))
+                .ifPresent(order -> {
+                    if (sampledAt.isBefore(order.windowStart())
+                            || !sampledAt.isBefore(order.windowEnd())) {
+                        throw ApiException.unprocessable("OUT_OF_WINDOW",
+                                "工单进行期间读表时刻须落在允许登记窗口 ["
+                                        + order.windowStart() + ", " + order.windowEnd() + ") 内");
+                    }
+                    if (cumulativeMinutes < order.baselineCumulativeMinutes()) {
+                        throw ApiException.unprocessable("BELOW_BASELINE",
+                                "工单进行期间读数不得低于基线工时 "
+                                        + order.baselineCumulativeMinutes());
+                    }
+                });
+    }
+
+    /**
+     * 工单开放（未开始/进行中）期间基线读数冻结：建单快照后基线读数不可修订，
+     * 直到工单关闭、取消或终止。
+     */
+    private void checkWorkOrderBaselineFrozen(String equipmentId, String readingId) {
+        workOrderRepository.findOpenWorkOrder(equipmentId)
+                .filter(order -> order.baselineReadingId().equals(readingId))
+                .ifPresent(order -> {
+                    throw ApiException.conflict("WORK_ORDER_BASELINE_FROZEN",
+                            "工单 " + order.workOrderId() + " 未终结，基线读数冻结不可修订：" + readingId);
+                });
+    }
+
+    /**
+     * 工单进行期间修订窗口内读数：读表时刻在窗口内时，修订值不得低于工单基线；
+     * 窗口外读数的修订不受此限（单调性仍由既有规则保证）。
+     */
+    private void checkWorkOrderRevisionWindow(String equipmentId, Instant sampledAt,
+                                              long cumulativeMinutes) {
+        workOrderRepository.findOpenWorkOrder(equipmentId)
+                .filter(order -> WorkOrder.IN_PROGRESS.equals(order.status()))
+                .filter(order -> !sampledAt.isBefore(order.windowStart())
+                        && sampledAt.isBefore(order.windowEnd()))
+                .ifPresent(order -> {
+                    if (cumulativeMinutes < order.baselineCumulativeMinutes()) {
+                        throw ApiException.unprocessable("BELOW_BASELINE",
+                                "工单进行期间读数修订不得低于基线工时 "
+                                        + order.baselineCumulativeMinutes());
+                    }
+                });
     }
 
     /** 单调性校验：新值须同时不早于前相邻读数、不晚于后相邻读数（按采样时刻排序）。 */

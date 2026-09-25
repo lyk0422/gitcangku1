@@ -48,7 +48,8 @@ public class EquipmentRepository {
             rs.getString("reading_id"),
             readInstant(rs, "sampled_at"),
             rs.getLong("cumulative_minutes"),
-            rs.getInt("revision_no"));
+            rs.getInt("revision_no"),
+            rs.getBoolean("certified"));
 
     private static final RowMapper<MaintenanceRecord> MAINTENANCE_MAPPER = (rs, rowNum) -> new MaintenanceRecord(
             rs.getLong("maintenance_id"),
@@ -89,16 +90,19 @@ public class EquipmentRepository {
 
     // ---------- 读数 ----------
 
+    private static final String READING_COLUMNS =
+            "equipment_id, reading_id, sampled_at, cumulative_minutes, revision_no, certified";
+
     public void insertReading(Reading reading, Instant createdAt) {
         jdbc.update("INSERT INTO reading (equipment_id, reading_id, sampled_at, cumulative_minutes,"
-                        + " revision_no, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?)",
+                        + " revision_no, certified, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
                 reading.equipmentId(), reading.readingId(), utc(reading.sampledAt()),
-                reading.cumulativeMinutes(), utc(createdAt), utc(createdAt));
+                reading.cumulativeMinutes(), reading.certified(), utc(createdAt), utc(createdAt));
     }
 
     public Optional<Reading> findReading(String equipmentId, String readingId) {
         List<Reading> rows = jdbc.query(
-                "SELECT equipment_id, reading_id, sampled_at, cumulative_minutes, revision_no"
+                "SELECT " + READING_COLUMNS
                         + " FROM reading WHERE equipment_id = ? AND reading_id = ?",
                 READING_MAPPER, equipmentId, readingId);
         return rows.stream().findFirst();
@@ -106,8 +110,7 @@ public class EquipmentRepository {
 
     public Optional<Reading> findReadingAt(String equipmentId, Instant sampledAt) {
         List<Reading> rows = jdbc.query(
-                "SELECT equipment_id, reading_id, sampled_at, cumulative_minutes, revision_no"
-                        + " FROM reading WHERE equipment_id = ? AND sampled_at = ?",
+                "SELECT " + READING_COLUMNS + " FROM reading WHERE equipment_id = ? AND sampled_at = ?",
                 READING_MAPPER, equipmentId, utc(sampledAt));
         return rows.stream().findFirst();
     }
@@ -115,7 +118,7 @@ public class EquipmentRepository {
     /** 采样时刻严格早于给定时刻的最近一条读数。 */
     public Optional<Reading> findPrevReading(String equipmentId, Instant sampledAt) {
         List<Reading> rows = jdbc.query(
-                "SELECT equipment_id, reading_id, sampled_at, cumulative_minutes, revision_no"
+                "SELECT " + READING_COLUMNS
                         + " FROM reading WHERE equipment_id = ? AND sampled_at < ?"
                         + " ORDER BY sampled_at DESC LIMIT 1",
                 READING_MAPPER, equipmentId, utc(sampledAt));
@@ -125,7 +128,7 @@ public class EquipmentRepository {
     /** 采样时刻严格晚于给定时刻的最近一条读数。 */
     public Optional<Reading> findNextReading(String equipmentId, Instant sampledAt) {
         List<Reading> rows = jdbc.query(
-                "SELECT equipment_id, reading_id, sampled_at, cumulative_minutes, revision_no"
+                "SELECT " + READING_COLUMNS
                         + " FROM reading WHERE equipment_id = ? AND sampled_at > ?"
                         + " ORDER BY sampled_at ASC LIMIT 1",
                 READING_MAPPER, equipmentId, utc(sampledAt));
@@ -134,10 +137,26 @@ public class EquipmentRepository {
 
     public Optional<Reading> findLatestReading(String equipmentId) {
         List<Reading> rows = jdbc.query(
-                "SELECT equipment_id, reading_id, sampled_at, cumulative_minutes, revision_no"
+                "SELECT " + READING_COLUMNS
                         + " FROM reading WHERE equipment_id = ? ORDER BY sampled_at DESC LIMIT 1",
                 READING_MAPPER, equipmentId);
         return rows.stream().findFirst();
+    }
+
+    /** 设备当前已认证读数（同设备同时仅一条 certified=TRUE）。 */
+    public Optional<Reading> findCertifiedReading(String equipmentId) {
+        List<Reading> rows = jdbc.query(
+                "SELECT " + READING_COLUMNS
+                        + " FROM reading WHERE equipment_id = ? AND certified = TRUE",
+                READING_MAPPER, equipmentId);
+        return rows.stream().findFirst();
+    }
+
+    /** 将指定读数置为设备当前唯一已认证读数，并撤销同设备其他读数的认证标记。 */
+    public void certifyReading(String equipmentId, String readingId) {
+        jdbc.update("UPDATE reading SET certified = CASE WHEN reading_id = ? THEN TRUE ELSE FALSE END"
+                        + " WHERE equipment_id = ?",
+                readingId, equipmentId);
     }
 
     public void updateReadingValue(String equipmentId, String readingId, long cumulativeMinutes,
@@ -149,7 +168,7 @@ public class EquipmentRepository {
 
     public List<Reading> listReadings(String equipmentId) {
         return jdbc.query(
-                "SELECT equipment_id, reading_id, sampled_at, cumulative_minutes, revision_no"
+                "SELECT " + READING_COLUMNS
                         + " FROM reading WHERE equipment_id = ? ORDER BY sampled_at ASC, reading_id ASC",
                 READING_MAPPER, equipmentId);
     }

@@ -10,11 +10,13 @@ import java.time.Instant;
  * @param sampledAt          UTC 采样时刻
  * @param cumulativeMinutes  当前累计工时（分钟）
  * @param revisionNo         当前修订号，初始 1
+ * @param certified          是否为设备当前已认证读数；同设备同时仅一条为 true
  */
 public record Reading(
         String equipmentId,
         String readingId,
         Instant sampledAt,
         long cumulativeMinutes,
-        int revisionNo) {
+        int revisionNo,
+        boolean certified) {
 }

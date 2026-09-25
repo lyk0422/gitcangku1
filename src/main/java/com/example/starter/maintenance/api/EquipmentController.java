@@ -61,6 +61,16 @@ public class EquipmentController {
         return service.reviseReading(equipmentId, readingId, req);
     }
 
+    /** 认证读数：将读数标记为设备当前已认证读数；建保养工单时基线须为已认证读数。 */
+    @PostMapping("/{equipmentId}/readings/{readingId}/certification")
+    @ResponseStatus(HttpStatus.CREATED)
+    public ReadingResponse certifyReading(@PathVariable String equipmentId,
+                                          @PathVariable String readingId,
+                                          @Valid @RequestBody
+                                          com.example.starter.maintenance.api.dto.CertifyReadingRequest req) {
+        return service.certifyReading(equipmentId, readingId, req);
+    }
+
     /** 完成保养：以现存读数及其当前修订号为锚点，锚点时间须晚于上次保养锚点。 */
     @PostMapping("/{equipmentId}/maintenances")
     @ResponseStatus(HttpStatus.CREATED)
