@@ -114,18 +114,22 @@ class TransferApiTests {
 
     private Map<String, Object> transferBody(String commandKey, String transferKey,
                                              String sourceKey, String targetKey) {
+        // 裁决依据窗口行锁内最新状态，expectedVersion 为调用方快照并参与 reserveKey 指纹
         Map<String, Object> body = new HashMap<>();
         body.put("commandKey", commandKey);
         body.put("transferKey", transferKey);
         body.put("sourceAllocationKey", sourceKey);
         body.put("targetAllocationKey", targetKey);
+        body.put("reserveKey", key("rk"));
+        body.put("expectedVersion", 0L);
         return body;
     }
 
     private int transferStatus(String commandKey, String transferKey, String sourceKey,
                                String targetKey, String actor) {
         try {
-            waterService.transferAllocation(commandKey, transferKey, sourceKey, targetKey, actor);
+            waterService.transferAllocation(commandKey, transferKey, sourceKey, targetKey, actor,
+                    key("rk"), 0L);
             return 200;
         } catch (ApiException e) {
             return e.status().value();

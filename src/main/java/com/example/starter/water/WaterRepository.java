@@ -22,13 +22,17 @@ public class WaterRepository {
 
     /** 供水窗口行。 */
     public record WindowRow(long id, String windowKey, String channelId, long startNanos, long endNanos,
-                            BigDecimal plannedVolume, long createdNanos) {
+                            BigDecimal plannedVolume, BigDecimal reserveVolume, long version, String status,
+                            Long closedNanos, long createdNanos) {
     }
 
-    /** 配水申请行；amount 为不可改写的原申请水量，heldAmount 为当前持有额度。 */
+    /**
+     * 配水申请行；amount 为不可改写的原申请水量，heldAmount 为当前持有额度，
+     * regularWrittenOff 为常规核销累计量。
+     */
     public record AllocationRow(long id, String allocationKey, long windowId, String userId, BigDecimal amount,
-                                BigDecimal heldAmount, String requester, String status,
-                                long createdNanos, long updatedNanos) {
+                                BigDecimal heldAmount, BigDecimal regularWrittenOff, String requester,
+                                String status, long createdNanos, long updatedNanos) {
     }
 
     /** 转让流水行，创建后不可变。 */
@@ -46,20 +50,43 @@ public class WaterRepository {
                              long createdNanos) {
     }
 
+    /** 常规核销流水行，创建后不可变。 */
+    public record RegularWriteoffRow(long id, String writeoffKey, long windowId, String allocationKey,
+                                     BigDecimal amount, String actor, long createdNanos) {
+    }
+
+    /** 应急核销流水行，创建后不可变；reserveSnapshot 为核销时储备量快照。 */
+    public record EmergencyWriteoffRow(long id, String writeoffKey, long windowId, String emergencyId,
+                                       String approver, String actor, BigDecimal amount,
+                                       BigDecimal reserveSnapshot, long createdNanos) {
+    }
+
+    /** reserveKey 指纹行；response 为 null 表示尚未成功提交（失败事务回滚不占键）。 */
+    public record ReserveCommandRow(String reserveKey, String operation, String fingerprint, String response,
+                                    long createdNanos) {
+    }
+
+    private static final String WINDOW_COLUMNS =
+            "id, window_key, channel_id, start_nanos, end_nanos, planned_volume, reserve_volume, version,"
+                    + " status, closed_nanos, created_nanos";
+
     private static final RowMapper<WindowRow> WINDOW_MAPPER = (rs, n) -> new WindowRow(
             rs.getLong("id"), rs.getString("window_key"), rs.getString("channel_id"),
             rs.getLong("start_nanos"), rs.getLong("end_nanos"),
-            rs.getBigDecimal("planned_volume"), rs.getLong("created_nanos"));
+            rs.getBigDecimal("planned_volume"), rs.getBigDecimal("reserve_volume"),
+            rs.getLong("version"), rs.getString("status"),
+            rs.getObject("closed_nanos") == null ? null : rs.getLong("closed_nanos"),
+            rs.getLong("created_nanos"));
 
     private static final RowMapper<AllocationRow> ALLOCATION_MAPPER = (rs, n) -> new AllocationRow(
             rs.getLong("id"), rs.getString("allocation_key"), rs.getLong("window_id"),
             rs.getString("user_id"), rs.getBigDecimal("amount"), rs.getBigDecimal("held_amount"),
-            rs.getString("requester"), rs.getString("status"),
+            rs.getBigDecimal("regular_written_off"), rs.getString("requester"), rs.getString("status"),
             rs.getLong("created_nanos"), rs.getLong("updated_nanos"));
 
     private static final String ALLOCATION_SELECT =
-            "SELECT id, allocation_key, window_id, user_id, amount, held_amount, requester, status,"
-                    + " created_nanos, updated_nanos";
+            "SELECT id, allocation_key, window_id, user_id, amount, held_amount, regular_written_off,"
+                    + " requester, status, created_nanos, updated_nanos";
 
     private static final RowMapper<TransferRow> TRANSFER_MAPPER = (rs, n) -> new TransferRow(
             rs.getLong("id"), rs.getString("transfer_key"), rs.getLong("window_id"),
@@ -74,6 +101,21 @@ public class WaterRepository {
     private static final RowMapper<CommandRow> COMMAND_MAPPER = (rs, n) -> new CommandRow(
             rs.getString("command_key"), rs.getString("operation"), rs.getString("params"),
             rs.getString("response"), rs.getLong("created_nanos"));
+
+    private static final RowMapper<RegularWriteoffRow> REGULAR_WRITEOFF_MAPPER = (rs, n) ->
+            new RegularWriteoffRow(rs.getLong("id"), rs.getString("writeoff_key"), rs.getLong("window_id"),
+                    rs.getString("allocation_key"), rs.getBigDecimal("amount"), rs.getString("actor"),
+                    rs.getLong("created_nanos"));
+
+    private static final RowMapper<EmergencyWriteoffRow> EMERGENCY_WRITEOFF_MAPPER = (rs, n) ->
+            new EmergencyWriteoffRow(rs.getLong("id"), rs.getString("writeoff_key"), rs.getLong("window_id"),
+                    rs.getString("emergency_id"), rs.getString("approver"), rs.getString("actor"),
+                    rs.getBigDecimal("amount"), rs.getBigDecimal("reserve_snapshot"),
+                    rs.getLong("created_nanos"));
+
+    private static final RowMapper<ReserveCommandRow> RESERVE_COMMAND_MAPPER = (rs, n) ->
+            new ReserveCommandRow(rs.getString("reserve_key"), rs.getString("operation"),
+                    rs.getString("fingerprint"), rs.getString("response"), rs.getLong("created_nanos"));
 
     private final JdbcTemplate jdbc;
 
@@ -104,19 +146,18 @@ public class WaterRepository {
     public WindowRow findWindowById(long id) {
         try {
             return jdbc.queryForObject(
-                    "SELECT id, window_key, channel_id, start_nanos, end_nanos, planned_volume, created_nanos"
-                            + " FROM supply_window WHERE id = ?", WINDOW_MAPPER, id);
+                    "SELECT " + WINDOW_COLUMNS + " FROM supply_window WHERE id = ?", WINDOW_MAPPER, id);
         } catch (EmptyResultDataAccessException e) {
             return null;
         }
     }
 
-    /** 按主键锁定窗口行（FOR UPDATE），用于串行化批准与限供。 */
+    /** 按主键锁定窗口行（FOR UPDATE），用于串行化批准、转让、限供、储备与核销裁决。 */
     public WindowRow lockWindowById(long id) {
         try {
             return jdbc.queryForObject(
-                    "SELECT id, window_key, channel_id, start_nanos, end_nanos, planned_volume, created_nanos"
-                            + " FROM supply_window WHERE id = ? FOR UPDATE", WINDOW_MAPPER, id);
+                    "SELECT " + WINDOW_COLUMNS + " FROM supply_window WHERE id = ? FOR UPDATE",
+                    WINDOW_MAPPER, id);
         } catch (EmptyResultDataAccessException e) {
             return null;
         }
@@ -303,5 +344,157 @@ public class WaterRepository {
     /** 写回命令首次成功响应。 */
     public void updateCommandResponse(String commandKey, String response) {
         jdbc.update("UPDATE command_log SET response = ? WHERE command_key = ?", response, commandKey);
+    }
+
+    // ------------------------------------------------------------------
+    // 应急储备、常规/应急核销、reserveKey 指纹
+    // ------------------------------------------------------------------
+
+    /** 调整窗口储备量（版本自增由 {@link #bumpWindowVersion} 单独完成）。 */
+    public void updateReserveVolume(long windowId, BigDecimal reserveVolume) {
+        jdbc.update("UPDATE supply_window SET reserve_volume = ? WHERE id = ?", reserveVolume, windowId);
+    }
+
+    /** 窗口聚合版本自增，每次储备相关写操作在窗口锁内调用。 */
+    public void bumpWindowVersion(long windowId) {
+        jdbc.update("UPDATE supply_window SET version = version + 1 WHERE id = ?", windowId);
+    }
+
+    /** 关闭窗口并记录关闭时刻。 */
+    public void closeWindow(long windowId, long closedNanos) {
+        jdbc.update("UPDATE supply_window SET status = 'CLOSED', closed_nanos = ? WHERE id = ?",
+                closedNanos, windowId);
+    }
+
+    /** 窗口全部 APPROVED 申请的常规核销累计量，无则 0。 */
+    public BigDecimal sumRegularWrittenOff(long windowId) {
+        BigDecimal sum = jdbc.queryForObject(
+                "SELECT COALESCE(SUM(regular_written_off), 0) FROM allocation WHERE window_id = ?",
+                BigDecimal.class, windowId);
+        return sum == null ? BigDecimal.ZERO : sum;
+    }
+
+    /** 窗口应急核销累计量，无则 0。 */
+    public BigDecimal sumEmergencyWrittenOff(long windowId) {
+        BigDecimal sum = jdbc.queryForObject(
+                "SELECT COALESCE(SUM(amount), 0) FROM emergency_writeoff WHERE window_id = ?",
+                BigDecimal.class, windowId);
+        return sum == null ? BigDecimal.ZERO : sum;
+    }
+
+    /** 常规核销：申请持有额度等额扣减，常规核销累计量等额累加，并记录变更时间。 */
+    public void applyRegularWriteoff(long allocationId, BigDecimal amount, long updatedNanos) {
+        jdbc.update("UPDATE allocation SET held_amount = held_amount - ?,"
+                + " regular_written_off = regular_written_off + ?, updated_nanos = ? WHERE id = ?",
+                amount, amount, updatedNanos, allocationId);
+    }
+
+    /** 插入常规核销流水并返回主键，业务键唯一冲突由上层捕获。 */
+    public long insertRegularWriteoff(String writeoffKey, long windowId, String allocationKey,
+                                      BigDecimal amount, String actor, long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO regular_writeoff (writeoff_key, window_id, allocation_key, amount, actor,"
+                            + " created_nanos) VALUES (?, ?, ?, ?, ?, ?)", Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, writeoffKey);
+            ps.setLong(2, windowId);
+            ps.setString(3, allocationKey);
+            ps.setBigDecimal(4, amount);
+            ps.setString(5, actor);
+            ps.setLong(6, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 按业务键查询常规核销流水，不存在返回 null。 */
+    public RegularWriteoffRow findRegularWriteoffByKey(String writeoffKey) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT id, writeoff_key, window_id, allocation_key, amount, actor, created_nanos"
+                            + " FROM regular_writeoff WHERE writeoff_key = ?",
+                    REGULAR_WRITEOFF_MAPPER, writeoffKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 插入应急核销流水并返回主键；(window_id, emergency_id) 与业务键唯一冲突由上层捕获。 */
+    public long insertEmergencyWriteoff(String writeoffKey, long windowId, String emergencyId, String approver,
+                                        String actor, BigDecimal amount, BigDecimal reserveSnapshot,
+                                        long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO emergency_writeoff (writeoff_key, window_id, emergency_id, approver, actor,"
+                            + " amount, reserve_snapshot, created_nanos) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, writeoffKey);
+            ps.setLong(2, windowId);
+            ps.setString(3, emergencyId);
+            ps.setString(4, approver);
+            ps.setString(5, actor);
+            ps.setBigDecimal(6, amount);
+            ps.setBigDecimal(7, reserveSnapshot);
+            ps.setLong(8, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 按窗口与应急编号锁定查询应急核销流水（FOR UPDATE），不存在返回 null。 */
+    public EmergencyWriteoffRow lockEmergencyWriteoff(long windowId, String emergencyId) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT id, writeoff_key, window_id, emergency_id, approver, actor, amount,"
+                            + " reserve_snapshot, created_nanos FROM emergency_writeoff"
+                            + " WHERE window_id = ? AND emergency_id = ? FOR UPDATE",
+                    EMERGENCY_WRITEOFF_MAPPER, windowId, emergencyId);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 按主键查询应急核销流水，不存在返回 null。 */
+    public EmergencyWriteoffRow findEmergencyWriteoffById(long id) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT id, writeoff_key, window_id, emergency_id, approver, actor, amount,"
+                            + " reserve_snapshot, created_nanos FROM emergency_writeoff WHERE id = ?",
+                    EMERGENCY_WRITEOFF_MAPPER, id);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 窗口全部应急核销流水，按主键升序。 */
+    public List<EmergencyWriteoffRow> listEmergencyWriteoffs(long windowId) {
+        return jdbc.query(
+                "SELECT id, writeoff_key, window_id, emergency_id, approver, actor, amount,"
+                        + " reserve_snapshot, created_nanos FROM emergency_writeoff WHERE window_id = ? ORDER BY id",
+                EMERGENCY_WRITEOFF_MAPPER, windowId);
+    }
+
+    /** 按 reserveKey 查询储备命令指纹，不存在返回 null。 */
+    public ReserveCommandRow findReserveCommand(String reserveKey) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT reserve_key, operation, fingerprint, response, created_nanos FROM reserve_command"
+                            + " WHERE reserve_key = ?", RESERVE_COMMAND_MAPPER, reserveKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 先占位插入 reserveKey 指纹（响应为空），同事务业务成功后写回快照。 */
+    public void insertReserveCommand(String reserveKey, String operation, String fingerprint, long createdNanos) {
+        jdbc.update("INSERT INTO reserve_command (reserve_key, operation, fingerprint, response, created_nanos)"
+                + " VALUES (?, ?, ?, NULL, ?)", reserveKey, operation, fingerprint, createdNanos);
+    }
+
+    /** 写回储备命令首次成功快照。 */
+    public void updateReserveCommandResponse(String reserveKey, String response) {
+        jdbc.update("UPDATE reserve_command SET response = ? WHERE reserve_key = ?", response, reserveKey);
     }
 }
