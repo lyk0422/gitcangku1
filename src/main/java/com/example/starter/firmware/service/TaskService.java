@@ -35,30 +35,45 @@ public class TaskService {
     private final PauseRecordRepository pauseRecordRepository;
     private final DeviceService deviceService;
     private final ReleaseService releaseService;
+    private final FreezeService freezeService;
     private final IdempotencyService idempotency;
     private final Clock clock;
 
     public TaskService(TaskRepository taskRepository, ReleaseRepository releaseRepository,
                        DeviceRepository deviceRepository, PauseRecordRepository pauseRecordRepository,
                        DeviceService deviceService, ReleaseService releaseService,
-                       IdempotencyService idempotency, Clock clock) {
+                       FreezeService freezeService, IdempotencyService idempotency, Clock clock) {
         this.taskRepository = taskRepository;
         this.releaseRepository = releaseRepository;
         this.deviceRepository = deviceRepository;
         this.pauseRecordRepository = pauseRecordRepository;
         this.deviceService = deviceService;
         this.releaseService = releaseService;
+        this.freezeService = freezeService;
         this.idempotency = idempotency;
         this.clock = clock;
     }
 
     /**
-     * 设备拉取：已存在任务直接返回；否则仅当型号与当前版本匹配、分桶号小于比例且发布单 ACTIVE 时创建。
-     * PAUSED 时不创建新任务，已有任务仍可查看与回执。
+     * 不带紧急例外的拉取，兼容既有调用方。
      */
     public PullResponse pull(String deviceId, String requestId) {
-        String fingerprint = String.join("|", "task.pull", deviceId);
+        return pull(deviceId, requestId, null);
+    }
+
+    /**
+     * 设备拉取：已存在任务直接返回；否则仅当型号与当前版本匹配、分桶号小于比例且发布单 ACTIVE 时创建。
+     * PAUSED 时不创建新任务，已有任务仍可查看与回执。
+     * 即将创建的新任务命中生效冻结窗口时，无完整双人例外返回 422；紧急例外创建的任务标记其放行的冻结令。
+     */
+    public PullResponse pull(String deviceId, String requestId,
+                             com.example.starter.firmware.api.EmergencyGrant grant) {
+        String grantPart = grant == null ? "" : String.join("~", grant.eventNo(),
+                grant.confirmer1(), grant.confirmer2());
+        String fingerprint = String.join("|", "task.pull", deviceId, grantPart);
         return idempotency.execute(requestId, "task.pull", fingerprint, () -> {
+            // 统一锁序：先锁 ACTIVE 冻结令并扫荡，再锁发布单/任务，避免与冻结创建事务死锁
+            freezeService.lockAndSweep();
             Device device = deviceService.findDevice(deviceId);
             var activeOrder = releaseRepository.findActiveByModel(device.model());
             if (activeOrder.isEmpty()) {
@@ -75,9 +90,12 @@ public class TaskService {
                     || device.bucketNo() >= order.ratio()) {
                 return new PullResponse(null);
             }
+            // 新任务拉取冻结守卫：命中生效窗口且例外不全即 422，本事务回滚不创建任务
+            Long emergencyFreezeId = freezeService.guardTaskPull(device.model(), order.id(), deviceId,
+                    grant, requestId);
             long taskId;
             try {
-                taskId = taskRepository.insert(order.id(), deviceId);
+                taskId = taskRepository.insert(order.id(), deviceId, order.version(), emergencyFreezeId);
             } catch (DuplicateKeyException e) {
                 RolloutTask task = taskRepository.findByReleaseAndDevice(order.id(), deviceId)
                         .orElseThrow(() -> new IllegalStateException("任务唯一约束冲突后未找到任务"));
@@ -97,6 +115,8 @@ public class TaskService {
     public TaskView receipt(long taskId, ReceiptRequest request) {
         String fingerprint = String.join("|", "task.receipt", String.valueOf(taskId), request.result().name());
         return idempotency.execute(request.requestId(), "task.receipt", fingerprint, () -> {
+            // 统一锁序：先锁 ACTIVE 冻结令并扫荡，冻结先提交则任务已 RELEASE_FROZEN、回执 409
+            freezeService.lockAndSweep();
             RolloutTask snapshot = taskRepository.findById(taskId)
                     .orElseThrow(() -> ApiException.notFound("TASK_NOT_FOUND", "任务不存在: " + taskId));
             ReleaseOrder lockedOrder = releaseRepository.findByIdForUpdate(snapshot.releaseId())
@@ -105,7 +125,7 @@ public class TaskService {
                     .orElseThrow(() -> ApiException.notFound("TASK_NOT_FOUND", "任务不存在: " + taskId));
             return switch (task.status()) {
                 case PENDING -> {
-                    taskRepository.complete(taskId, request.result());
+                    taskRepository.complete(taskId, request.result(), lockedOrder.version());
                     releaseRepository.incrementRoundStats(snapshot.releaseId(), request.result());
                     if (request.result() == ReceiptResult.SUCCESS) {
                         deviceRepository.updateCurrentVersion(task.deviceId(), lockedOrder.toVersion());
@@ -122,6 +142,7 @@ public class TaskService {
                             "任务已终结为 " + task.firstResult() + "，不能改为 " + request.result());
                 }
                 case CANCELLED -> throw ApiException.conflict("TASK_CANCELLED", "任务已取消，回执不再受理");
+                case RELEASE_FROZEN -> throw ApiException.conflict("TASK_FROZEN", "任务已被冻结令冻结，回执不再受理");
             };
         }, TaskView.class);
     }

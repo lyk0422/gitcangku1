@@ -33,6 +33,12 @@ public class ReleaseController {
         return releaseService.create(request);
     }
 
+    @PostMapping("/batch")
+    public BatchReleaseStartResponse createBatch(
+            @Valid @RequestBody BatchReleaseStartRequest request) {
+        return releaseService.createBatch(request);
+    }
+
     @PostMapping("/{releaseId}/expand")
     public ReleaseView expand(@PathVariable long releaseId, @Valid @RequestBody ExpandReleaseRequest request) {
         return releaseService.expand(releaseId, request);

@@ -33,17 +33,19 @@ public class ReleaseService {
     private final PauseRecordRepository pauseRecordRepository;
     private final ResumeRecordRepository resumeRecordRepository;
     private final IdempotencyService idempotency;
+    private final FreezeService freezeService;
     private final Clock clock;
 
     public ReleaseService(ReleaseRepository releaseRepository, TaskRepository taskRepository,
                           PauseRecordRepository pauseRecordRepository,
                           ResumeRecordRepository resumeRecordRepository,
-                          IdempotencyService idempotency, Clock clock) {
+                          IdempotencyService idempotency, FreezeService freezeService, Clock clock) {
         this.releaseRepository = releaseRepository;
         this.taskRepository = taskRepository;
         this.pauseRecordRepository = pauseRecordRepository;
         this.resumeRecordRepository = resumeRecordRepository;
         this.idempotency = idempotency;
+        this.freezeService = freezeService;
         this.clock = clock;
     }
 
@@ -55,8 +57,10 @@ public class ReleaseService {
         int threshold = request.effectiveFailureThresholdPercent();
         String fingerprint = String.join("|", "release.create", request.model(), request.fromVersion(),
                 request.toVersion(), String.valueOf(request.ratio()), String.valueOf(sampleFloor),
-                String.valueOf(threshold));
+                String.valueOf(threshold), grantFingerprint(request.emergencyGrant()));
         return idempotency.execute(request.requestId(), "release.create", fingerprint, () -> {
+            // 冻结守卫：命中生效窗口的型号无完整双人例外即 422，本事务整体回滚
+            freezeService.guardReleaseStart(request.model(), request.emergencyGrant(), request.requestId());
             long id;
             try {
                 id = releaseRepository.insert(request.model(), request.fromVersion(), request.toVersion(),
@@ -68,8 +72,50 @@ public class ReleaseService {
         }, ReleaseView.class);
     }
 
-    public ReleaseView expand(long releaseId, ExpandReleaseRequest request) {
-        String fingerprint = String.join("|", "release.expand", String.valueOf(releaseId),
+    /**
+     * 批量启动发布：先按最终冻结范围整体预校验（型号版本冲突、冻结冲突、紧急例外不全），
+     * 任一不合法则 422/409 且全部不写入；全部通过后在同一事务插入并返回。
+     */
+    public com.example.starter.firmware.api.BatchReleaseStartResponse createBatch(
+            com.example.starter.firmware.api.BatchReleaseStartRequest request) {
+        var items = request.items();
+        // 业务预校验（事务外只读）：来源/目标版本不同
+        for (int i = 0; i < items.size(); i++) {
+            var item = items.get(i);
+            if (item.fromVersion().equals(item.toVersion())) {
+                throw ApiException.badRequest("SAME_VERSION",
+                        "目标版本必须与来源版本不同（批量第" + i + "项）");
+            }
+        }
+        String fingerprint = "release.batch.start|" + items.size() + "|"
+                + items.stream().map(it -> String.join("~", it.model(), it.fromVersion(), it.toVersion(),
+                        String.valueOf(it.ratio()), String.valueOf(it.effectiveSampleFloor()),
+                        String.valueOf(it.effectiveFailureThresholdPercent())))
+                .reduce("", (a, b) -> a + ";" + b)
+                + "|" + grantFingerprint(request.emergencyGrant());
+        return idempotency.execute(request.requestId(), "release.batch.start", fingerprint, () -> {
+            // 冻结整体预校验：任一型号命中且例外不全即抛 422，事务回滚、全部不写入
+            java.util.List<Long> hitFreezeIds = freezeService.guardBatchReleaseStart(
+                    items.stream().map(com.example.starter.firmware.api.BatchReleaseStartRequest.Item::model)
+                            .toList(),
+                    request.emergencyGrant(), request.requestId());
+            java.util.List<ReleaseView> views = new java.util.ArrayList<>();
+            for (var item : items) {
+                long id;
+                try {
+                    id = releaseRepository.insert(item.model(), item.fromVersion(), item.toVersion(),
+                            item.ratio(), item.effectiveSampleFloor(), item.effectiveFailureThresholdPercent());
+                } catch (DuplicateKeyException e) {
+                    throw ApiException.conflict("ACTIVE_RELEASE_EXISTS",
+                            "型号已存在未终结发布单: " + item.model());
+                }
+                views.add(ReleaseView.of(findOrder(id)));
+            }
+            return new com.example.starter.firmware.api.BatchReleaseStartResponse(views, hitFreezeIds);
+        }, com.example.starter.firmware.api.BatchReleaseStartResponse.class);
+    }
+
+    public ReleaseView expand(long releaseId, ExpandReleaseRequest request) {        String fingerprint = String.join("|", "release.expand", String.valueOf(releaseId),
                 String.valueOf(request.expectedVersion()), String.valueOf(request.ratio()));
         return idempotency.execute(request.requestId(), "release.expand", fingerprint, () -> {
             ReleaseOrder order = releaseRepository.findByIdForUpdate(releaseId)
@@ -122,6 +168,8 @@ public class ReleaseService {
     public ReleaseView cancel(long releaseId, String requestId) {
         String fingerprint = String.join("|", "release.cancel", String.valueOf(releaseId));
         return idempotency.execute(requestId, "release.cancel", fingerprint, () -> {
+            // 统一锁序：先锁 ACTIVE 冻结令并扫荡，冻结先提交则命中任务已 RELEASE_FROZEN，取消只改 PENDING
+            freezeService.lockAndSweep();
             ReleaseOrder order = releaseRepository.findByIdForUpdate(releaseId)
                     .orElseThrow(() -> ApiException.notFound("RELEASE_NOT_FOUND", "发布单不存在: " + releaseId));
             if (order.status() == ReleaseStatus.ACTIVE || order.status() == ReleaseStatus.PAUSED) {
@@ -154,5 +202,15 @@ public class ReleaseService {
     public ReleaseOrder findOrder(long releaseId) {
         return releaseRepository.findById(releaseId)
                 .orElseThrow(() -> ApiException.notFound("RELEASE_NOT_FOUND", "发布单不存在: " + releaseId));
+    }
+
+    /**
+     * freezeKey 指纹须含紧急例外事件号与两名确认人：同键异参（含例外凭据不同）返回 409。
+     */
+    private static String grantFingerprint(com.example.starter.firmware.api.EmergencyGrant grant) {
+        if (grant == null) {
+            return "";
+        }
+        return String.join("~", grant.eventNo(), grant.confirmer1(), grant.confirmer2());
     }
 }
