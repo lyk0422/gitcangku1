@@ -14,12 +14,19 @@ public final class BaggageDtos {
     private BaggageDtos() {
     }
 
-    /** 登记航段请求。 */
+    /** 登记航段请求：originCountry/destinationCountry 可空，不同即为国际航段。 */
     public record RegisterLegRequest(
             @NotBlank(message = "requestId 不能为空") String requestId,
             @NotBlank(message = "legId 不能为空") String legId,
             @NotBlank(message = "origin 不能为空") String origin,
-            @NotBlank(message = "destination 不能为空") String destination) {
+            @NotBlank(message = "destination 不能为空") String destination,
+            String originCountry,
+            String destinationCountry) {
+
+        /** 兼容不登记国家代码的国内航段登记。 */
+        public RegisterLegRequest(String requestId, String legId, String origin, String destination) {
+            this(requestId, legId, origin, destination, null, null);
+        }
     }
 
     /** 登记行李请求：legIds 为 1~5 个有序航段。 */
@@ -65,9 +72,27 @@ public final class BaggageDtos {
             @NotBlank(message = "actualStation 不能为空") String actualStation) {
     }
 
+    /** 海关检查登记请求：status 为 RELEASED 放行或 HELD 拦截，HELD 时 reason 必填。 */
+    public record RegisterClearanceRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotBlank(message = "bagTag 不能为空") String bagTag,
+            @NotNull(message = "inspectionVersion 不能为空") Integer inspectionVersion,
+            @NotBlank(message = "status 不能为空") String status,
+            @NotBlank(message = "country 不能为空") String country,
+            String reason) {
+    }
+
+    /** 改派请求：将行李当前待乘航段改派为另一航段。 */
+    public record RerouteRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotBlank(message = "bagTag 不能为空") String bagTag,
+            @NotBlank(message = "newLegId 不能为空") String newLegId) {
+    }
+
     /** 航段响应。 */
     public record LegResponse(String legId, String origin, String destination,
-                              String status, int version) {
+                              String status, int version,
+                              String originCountry, String destinationCountry) {
     }
 
     /** 行程明细项。 */
@@ -124,5 +149,46 @@ public final class BaggageDtos {
 
     /** 未补到清单响应。 */
     public record ShortListResponse(List<ShortItem> shortUnloaded) {
+    }
+
+    /** 海关检查登记响应：clearanceKey 为内容指纹，同键重放返回原记录。 */
+    public record ClearanceResponse(String bagTag, int inspectionVersion, String status,
+                                    String country, String reason, String clearanceKey,
+                                    String registeredAt) {
+    }
+
+    /** 检查链明细项：按检查版本升序。 */
+    public record ClearanceItem(int inspectionVersion, String status, String country,
+                                String reason, String clearanceKey, String registeredAt) {
+    }
+
+    /** 行李检查链查询响应。 */
+    public record ClearanceChainResponse(String bagTag, List<ClearanceItem> chain) {
+    }
+
+    /** 航段门禁明细项：gateStatus 为 CLEARED/MISSING/HELD/NOT_REQUIRED。 */
+    public record GateItem(String bagTag, String gateStatus, Integer latestVersion,
+                           String clearanceStatus) {
+    }
+
+    /** 航段门禁查询响应：international 标识该航段是否需要海关放行门禁。 */
+    public record LegGateResponse(String legId, boolean international,
+                                  String originCountry, String destinationCountry,
+                                  List<GateItem> items) {
+    }
+
+    /** 拦截影响明细项：status 为 CUSTOMS_HOLD/CLEARED。 */
+    public record HoldItem(long id, String legId, int seq, String country, String status,
+                           int inspectionVersion, Integer resolvedVersion,
+                           String createdAt, String resolvedAt) {
+    }
+
+    /** 拦截影响查询响应：该行李全部海关拦截标记及解除情况。 */
+    public record HoldImpactResponse(String bagTag, List<HoldItem> holds) {
+    }
+
+    /** 改派响应。 */
+    public record RerouteResponse(String bagTag, String status, int nextLegIndex,
+                                  String newLegId, String currentLocation) {
     }
 }

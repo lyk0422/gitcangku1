@@ -14,9 +14,13 @@ import org.springframework.web.bind.annotation.RestController;
 import com.example.starter.baggage.BaggageDtos.ArriveRequest;
 import com.example.starter.baggage.BaggageDtos.ArriveResponse;
 import com.example.starter.baggage.BaggageDtos.BagResponse;
+import com.example.starter.baggage.BaggageDtos.ClearanceChainResponse;
+import com.example.starter.baggage.BaggageDtos.ClearanceResponse;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveRequest;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveResponse;
+import com.example.starter.baggage.BaggageDtos.HoldImpactResponse;
 import com.example.starter.baggage.BaggageDtos.LegDifferenceResponse;
+import com.example.starter.baggage.BaggageDtos.LegGateResponse;
 import com.example.starter.baggage.BaggageDtos.LegResponse;
 import com.example.starter.baggage.BaggageDtos.LoadRequest;
 import com.example.starter.baggage.BaggageDtos.LoadResponse;
@@ -24,7 +28,10 @@ import com.example.starter.baggage.BaggageDtos.ManifestResponse;
 import com.example.starter.baggage.BaggageDtos.RecoverRequest;
 import com.example.starter.baggage.BaggageDtos.RecoverResponse;
 import com.example.starter.baggage.BaggageDtos.RegisterBagRequest;
+import com.example.starter.baggage.BaggageDtos.RegisterClearanceRequest;
 import com.example.starter.baggage.BaggageDtos.RegisterLegRequest;
+import com.example.starter.baggage.BaggageDtos.RerouteRequest;
+import com.example.starter.baggage.BaggageDtos.RerouteResponse;
 import com.example.starter.baggage.BaggageDtos.SealRequest;
 import com.example.starter.baggage.BaggageDtos.SealResponse;
 import com.example.starter.baggage.BaggageDtos.ShortListResponse;
@@ -37,9 +44,11 @@ import com.example.starter.baggage.BaggageDtos.ShortListResponse;
 public class BaggageController {
 
     private final BaggageService baggageService;
+    private final CustomsService customsService;
 
-    public BaggageController(BaggageService baggageService) {
+    public BaggageController(BaggageService baggageService, CustomsService customsService) {
         this.baggageService = baggageService;
+        this.customsService = customsService;
     }
 
     /** 登记航段。 */
@@ -83,6 +92,37 @@ public class BaggageController {
     @PostMapping("/bags/recover")
     public RecoverResponse recover(@Valid @RequestBody RecoverRequest request) {
         return baggageService.recover(request);
+    }
+
+    /** 改派：将行李当前待乘航段改派为另一航段，国际航段须通过海关门禁。 */
+    @PostMapping("/bags/reroute")
+    public RerouteResponse reroute(@Valid @RequestBody RerouteRequest request) {
+        return baggageService.reroute(request);
+    }
+
+    /** 登记海关检查终态：放行或拦截，同 clearanceKey 重放原记录。 */
+    @PostMapping("/customs/clearances")
+    public ResponseEntity<ClearanceResponse> registerClearance(
+            @Valid @RequestBody RegisterClearanceRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(customsService.registerClearance(request));
+    }
+
+    /** 行李海关检查链查询：按检查版本升序。 */
+    @GetMapping("/bags/{bagTag}/customs/chain")
+    public ClearanceChainResponse getClearanceChain(@PathVariable String bagTag) {
+        return customsService.getChain(bagTag);
+    }
+
+    /** 行李拦截影响查询：全部海关拦截标记及解除情况。 */
+    @GetMapping("/bags/{bagTag}/customs/holds")
+    public HoldImpactResponse getCustomsHolds(@PathVariable String bagTag) {
+        return customsService.getHolds(bagTag);
+    }
+
+    /** 航段门禁查询：该航段当前已装载行李的海关门禁评估。 */
+    @GetMapping("/legs/{legId}/customs/gate")
+    public LegGateResponse getLegGate(@PathVariable String legId) {
+        return customsService.getLegGate(legId);
     }
 
     /** 行李完整轨迹查询。 */

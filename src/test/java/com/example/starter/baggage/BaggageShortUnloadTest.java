@@ -64,6 +64,8 @@ class BaggageShortUnloadTest {
 
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM customs_hold");
+        jdbcTemplate.update("DELETE FROM customs_clearance");
         jdbcTemplate.update("DELETE FROM bag_event");
         jdbcTemplate.update("DELETE FROM load_record");
         jdbcTemplate.update("DELETE FROM bag_itinerary");
