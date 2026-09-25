@@ -242,6 +242,16 @@ public class RepositoryDao {
     public record LockEntryRow(long lockFileId, String name, int version) {
     }
 
+    /** 制品版本镜像登记行。 */
+    public record MirrorRow(long artifactId, String mirrorId, int priority,
+                            boolean available, Instant createdAt) {
+    }
+
+    /** 锁文件固化镜像行。 */
+    public record LockMirrorRow(long lockFileId, String name, int version,
+                                String mirrorId, int priority) {
+    }
+
     /** 查询全部历史锁文件，按 ID 升序。 */
     public List<LockFileRow> listLockFiles() {
         return jdbcTemplate.query(
@@ -272,6 +282,115 @@ public class RepositoryDao {
                 (rs, n) -> new LockEntryRow(rs.getLong("lock_file_id"),
                         rs.getString("name"), rs.getInt("version")),
                 lockFileId);
+    }
+
+    // ------------------------------------------------------------------
+    // 镜像源（骨架方法，下一步实现）
+    // ------------------------------------------------------------------
+
+    /** 统计制品版本已登记的镜像数量（含不可用）。 */
+    public int countMirrors(long artifactId) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM artifact_mirror WHERE artifact_id = ?",
+                Integer.class, artifactId);
+        return count == null ? 0 : count;
+    }
+
+    /** 查询单个镜像登记，不存在返回 null。 */
+    public MirrorRow findMirror(long artifactId, String mirrorId) {
+        List<MirrorRow> rows = jdbcTemplate.query(
+                "SELECT artifact_id, mirror_id, priority, available, created_at "
+                        + "FROM artifact_mirror WHERE artifact_id = ? AND mirror_id = ?",
+                (rs, n) -> mapMirrorRow(rs),
+                artifactId, mirrorId);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /** 新增镜像登记（初始可用），返回自增主键。 */
+    public long insertMirror(long artifactId, String mirrorId, int priority, Instant createdAt) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbcTemplate.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO artifact_mirror (artifact_id, mirror_id, priority, available, created_at) "
+                            + "VALUES (?, ?, ?, 1, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setLong(1, artifactId);
+            ps.setString(2, mirrorId);
+            ps.setInt(3, priority);
+            ps.setTimestamp(4, Timestamp.from(createdAt));
+            return ps;
+        }, keyHolder);
+        Number key = keyHolder.getKey();
+        if (key == null) {
+            throw new IllegalStateException("插入镜像未获取自增主键");
+        }
+        return key.longValue();
+    }
+
+    /**
+     * 条件切换镜像可用性，仅当镜像存在且当前状态与目标不同时生效，
+     * 返回受影响行数：0 表示镜像不存在或已经是目标状态。
+     */
+    public int updateMirrorAvailability(long artifactId, String mirrorId, boolean available) {
+        return jdbcTemplate.update(
+                "UPDATE artifact_mirror SET available = ? "
+                        + "WHERE artifact_id = ? AND mirror_id = ? AND available <> ?",
+                available ? 1 : 0, artifactId, mirrorId, available ? 1 : 0);
+    }
+
+    /** 列出制品版本全部镜像（含不可用），按优先级升序、镜像标识兜底。 */
+    public List<MirrorRow> listMirrors(long artifactId) {
+        return jdbcTemplate.query(
+                "SELECT artifact_id, mirror_id, priority, available, created_at "
+                        + "FROM artifact_mirror WHERE artifact_id = ? "
+                        + "ORDER BY priority ASC, mirror_id ASC",
+                (rs, n) -> mapMirrorRow(rs), artifactId);
+    }
+
+    /** 列出制品版本当前可用镜像，按优先级升序、镜像标识兜底。 */
+    public List<MirrorRow> listAvailableMirrors(long artifactId) {
+        return jdbcTemplate.query(
+                "SELECT artifact_id, mirror_id, priority, available, created_at "
+                        + "FROM artifact_mirror WHERE artifact_id = ? AND available = 1 "
+                        + "ORDER BY priority ASC, mirror_id ASC",
+                (rs, n) -> mapMirrorRow(rs), artifactId);
+    }
+
+    /** 写入一条锁文件固化镜像。 */
+    public void insertLockMirror(long lockFileId, String name, int version,
+                                 String mirrorId, int priority) {
+        jdbcTemplate.update(
+                "INSERT INTO lock_file_mirror (lock_file_id, name, version, mirror_id, priority) "
+                        + "VALUES (?, ?, ?, ?, ?)",
+                lockFileId, name, version, mirrorId, priority);
+    }
+
+    /** 查询锁文件固化镜像，按名称升序、优先级升序、镜像标识兜底。 */
+    public List<LockMirrorRow> listLockMirrors(long lockFileId) {
+        return jdbcTemplate.query(
+                "SELECT lock_file_id, name, version, mirror_id, priority FROM lock_file_mirror "
+                        + "WHERE lock_file_id = ? ORDER BY name ASC, priority ASC, mirror_id ASC",
+                (rs, n) -> new LockMirrorRow(rs.getLong("lock_file_id"),
+                        rs.getString("name"), rs.getInt("version"),
+                        rs.getString("mirror_id"), rs.getInt("priority")),
+                lockFileId);
+    }
+
+    /** 按 (锁文件, 名称) 查询锁定条目，不存在返回 null。 */
+    public LockEntryRow findLockEntry(long lockFileId, String name) {
+        List<LockEntryRow> rows = jdbcTemplate.query(
+                "SELECT lock_file_id, name, version FROM lock_file_entry "
+                        + "WHERE lock_file_id = ? AND name = ?",
+                (rs, n) -> new LockEntryRow(rs.getLong("lock_file_id"),
+                        rs.getString("name"), rs.getInt("version")),
+                lockFileId, name);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    private static MirrorRow mapMirrorRow(java.sql.ResultSet rs) throws java.sql.SQLException {
+        return new MirrorRow(rs.getLong("artifact_id"), rs.getString("mirror_id"),
+                rs.getInt("priority"), rs.getInt("available") == 1,
+                rs.getTimestamp("created_at").toInstant());
     }
 
     private record ArtifactRow(long id, String name, int version, boolean withdrawn) {

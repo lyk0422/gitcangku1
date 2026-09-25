@@ -71,6 +71,45 @@ COMMENT ON COLUMN lock_file_entry.version IS '被锁定的精确版本号，正�
 
 CREATE UNIQUE INDEX IF NOT EXISTS uk_entry_lock_name ON lock_file_entry (lock_file_id, name);
 
+CREATE TABLE IF NOT EXISTS artifact_mirror (
+    id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+    artifact_id BIGINT       NOT NULL,
+    mirror_id   VARCHAR(128) NOT NULL,
+    priority    INT          NOT NULL,
+    available   TINYINT      NOT NULL DEFAULT 1,
+    created_at  TIMESTAMP(6) NOT NULL,
+    CONSTRAINT fk_mirror_artifact FOREIGN KEY (artifact_id) REFERENCES artifact (id)
+);
+COMMENT ON TABLE artifact_mirror IS '制品版本登记的镜像源元数据（最多 3 个），仅为标签不触发真实下载；不可用记录保留';
+COMMENT ON COLUMN artifact_mirror.artifact_id IS '所属制品版本 ID';
+COMMENT ON COLUMN artifact_mirror.mirror_id IS '镜像源标识，同一制品版本内唯一';
+COMMENT ON COLUMN artifact_mirror.priority IS '优先级：1 最高，数字越小越优先，同版本各镜像不得重复';
+COMMENT ON COLUMN artifact_mirror.available IS '可用性：1=可用（参与解析），0=不可用（不参与解析，记录保留）';
+COMMENT ON COLUMN artifact_mirror.created_at IS '登记时间，UTC 时间戳';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_mirror_artifact_mirror ON artifact_mirror (artifact_id, mirror_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uk_mirror_artifact_priority ON artifact_mirror (artifact_id, priority);
+CREATE INDEX IF NOT EXISTS idx_mirror_artifact ON artifact_mirror (artifact_id);
+
+CREATE TABLE IF NOT EXISTS lock_file_mirror (
+    id           BIGINT AUTO_INCREMENT PRIMARY KEY,
+    lock_file_id BIGINT       NOT NULL,
+    name         VARCHAR(128) NOT NULL,
+    version      INT          NOT NULL,
+    mirror_id    VARCHAR(128) NOT NULL,
+    priority     INT          NOT NULL,
+    CONSTRAINT fk_lock_mirror_file FOREIGN KEY (lock_file_id) REFERENCES lock_file (id)
+);
+COMMENT ON TABLE lock_file_mirror IS '锁文件固化的镜像清单快照：锁定当时可用、按优先级排序，事后可用性变更不追溯';
+COMMENT ON COLUMN lock_file_mirror.lock_file_id IS '所属锁文件 ID';
+COMMENT ON COLUMN lock_file_mirror.name IS '镜像所属锁定制品名称，与 lock_file_entry.name 对应';
+COMMENT ON COLUMN lock_file_mirror.version IS '镜像所属锁定制品精确版本号，正整数';
+COMMENT ON COLUMN lock_file_mirror.mirror_id IS '锁定当时的镜像源标识';
+COMMENT ON COLUMN lock_file_mirror.priority IS '锁定当时的优先级：1 最高，数字越小越优先';
+
+CREATE INDEX IF NOT EXISTS idx_lock_mirror_file ON lock_file_mirror (lock_file_id);
+CREATE INDEX IF NOT EXISTS idx_lock_mirror_entry ON lock_file_mirror (lock_file_id, name);
+
 CREATE TABLE IF NOT EXISTS idempotent_request (
     request_id     VARCHAR(64)  NOT NULL PRIMARY KEY,
     operation      VARCHAR(32)  NOT NULL,
