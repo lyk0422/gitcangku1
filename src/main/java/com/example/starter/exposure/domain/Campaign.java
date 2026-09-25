@@ -6,12 +6,14 @@ package com.example.starter.exposure.domain;
  * @param campaignId          公告编号，全局唯一
  * @param dailyTotalCap       每 UTC 日总额度，单位次，取值 1～100000
  * @param perVisitorDailyCap  每访客每 UTC 日上限，单位次，取值 1～100000
+ * @param version             公告版本号；访客抑制名单每成功批量变更一次加一，创建时为 0
  * @param createdAtUtc        创建时刻（epoch 毫秒，UTC）
  */
 public record Campaign(
         String campaignId,
         int dailyTotalCap,
         int perVisitorDailyCap,
+        int version,
         long createdAtUtc
 ) {
 }

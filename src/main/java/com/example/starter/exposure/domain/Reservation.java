@@ -7,16 +7,18 @@ package com.example.starter.exposure.domain;
  * @param reservationId 预占单编号
  * @param campaignId    所属公告编号
  * @param visitorId     合成访客编号
+ * @param placementId   展示位编号；频控两级账目不按展示位隔离，仅参与请求指纹
  * @param utcDate       额度所属 UTC 日（java.time.LocalDate 对应的 java.sql.Date）
  * @param status        预占状态
  * @param createdAtUtc  创建（申请）时刻，epoch 毫秒，UTC
  * @param expiresAtUtc  到期时刻，创建时刻 + 60 秒，epoch 毫秒，UTC；当前时刻达到该值即过期
- * @param terminalAtUtc 进入终态（CONFIRMED/CANCELLED/EXPIRED）的时刻，未到终态为 null
+ * @param terminalAtUtc 进入终态（CONFIRMED/CANCELLED/EXPIRED）的时刻，未进入终态为 null
  */
 public record Reservation(
         String reservationId,
         String campaignId,
         String visitorId,
+        String placementId,
         java.sql.Date utcDate,
         ReservationStatus status,
         long createdAtUtc,

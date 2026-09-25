@@ -6,8 +6,6 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
 
-import java.sql.ResultSet;
-import java.sql.SQLException;
 import java.util.List;
 import java.util.Optional;
 
@@ -27,6 +25,7 @@ public class ReservationRepository {
             rs.getString("reservation_id"),
             rs.getString("campaign_id"),
             rs.getString("visitor_id"),
+            rs.getString("placement_id"),
             rs.getDate("utc_date"),
             ReservationStatus.valueOf(rs.getString("status")),
             rs.getLong("created_at_utc"),
@@ -34,14 +33,16 @@ public class ReservationRepository {
             (Long) rs.getObject("terminal_at_utc"));
 
     private static final String COLUMNS =
-            "reservation_id, campaign_id, visitor_id, utc_date, status, "
+            "reservation_id, campaign_id, visitor_id, placement_id, utc_date, status, "
                     + "created_at_utc, expires_at_utc, terminal_at_utc";
 
     public void insert(Reservation reservation) {
-        jdbc.update("INSERT INTO exposure_reservation (" + COLUMNS + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        jdbc.update("INSERT INTO exposure_reservation (" + COLUMNS + ") "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 reservation.reservationId(),
                 reservation.campaignId(),
                 reservation.visitorId(),
+                reservation.placementId(),
                 reservation.utcDate(),
                 reservation.status().name(),
                 reservation.createdAtUtc(),
