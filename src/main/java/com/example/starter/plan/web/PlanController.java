@@ -4,7 +4,11 @@ import com.example.starter.plan.service.PlanService;
 import com.example.starter.plan.web.dto.CreatePlanRequest;
 import com.example.starter.plan.web.dto.PlanActionRequest;
 import com.example.starter.plan.web.dto.PlanResponse;
+import com.example.starter.plan.web.dto.PreemptionView;
 import com.example.starter.plan.web.dto.PublishedSlotView;
+import com.example.starter.plan.web.dto.SectionOccupancyView;
+import com.example.starter.plan.web.dto.SectionRegisterRequest;
+import com.example.starter.plan.web.dto.SectionView;
 import com.example.starter.plan.web.dto.UpdateOccupanciesRequest;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
@@ -57,12 +61,12 @@ public class PlanController {
     }
 
     /**
-     * 发布计划，原子校验时隙冲突。
+     * 发布计划，原子校验时隙冲突；携带 preemptKey 时对低等级已发布计划发起抢占。
      */
     @PostMapping("/plans/{scheduleKey}/publish")
     public PlanResponse publish(@PathVariable String scheduleKey,
                                 @Valid @RequestBody PlanActionRequest request) {
-        return service.publish(scheduleKey, request.requestKey());
+        return service.publish(scheduleKey, request.requestKey(), request.preemptKey());
     }
 
     /**
@@ -90,5 +94,43 @@ public class PlanController {
             @RequestParam @NotNull @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date,
             @RequestParam @NotBlank String sectionId) {
         return service.getPublishedSlots(date, sectionId);
+    }
+
+    /**
+     * 登记或更新区段走廊等级（1～5，数值越大优先级越高）。
+     */
+    @PutMapping("/sections/{sectionId}")
+    public SectionView registerSection(@PathVariable @NotBlank String sectionId,
+                                       @Valid @RequestBody SectionRegisterRequest request) {
+        return service.registerSection(sectionId, request);
+    }
+
+    /**
+     * 查询区段登记等级，未登记返回 404。
+     */
+    @GetMapping("/sections/{sectionId}")
+    public SectionView getSection(@PathVariable @NotBlank String sectionId) {
+        return service.getSection(sectionId);
+    }
+
+    /**
+     * 查询抢占记录，可按计划业务键（匹配抢占方或被抢占方）与运营日过滤。
+     */
+    @GetMapping("/preemptions")
+    public List<PreemptionView> getPreemptions(
+            @RequestParam(required = false) String scheduleKey,
+            @RequestParam(required = false)
+            @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date) {
+        return service.getPreemptions(scheduleKey, date);
+    }
+
+    /**
+     * 按区段查询当前等级占用：该区段上当前已发布生效的时隙及计划/区段等级。
+     */
+    @GetMapping("/section-occupancy")
+    public List<SectionOccupancyView> getSectionOccupancy(
+            @RequestParam @NotNull @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date,
+            @RequestParam @NotBlank String sectionId) {
+        return service.getSectionOccupancy(date, sectionId);
     }
 }

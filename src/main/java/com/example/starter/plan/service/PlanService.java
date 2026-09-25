@@ -3,15 +3,23 @@ package com.example.starter.plan.service;
 import com.example.starter.plan.model.DayPlan;
 import com.example.starter.plan.model.Occupancy;
 import com.example.starter.plan.model.PlanStatus;
+import com.example.starter.plan.model.Preemption;
+import com.example.starter.plan.model.PreemptionSection;
 import com.example.starter.plan.model.PublishedSlot;
 import com.example.starter.plan.repo.IdempotencyRepository;
 import com.example.starter.plan.repo.PlanRepository;
+import com.example.starter.plan.repo.PreemptionRepository;
 import com.example.starter.plan.web.ApiException;
 import com.example.starter.plan.web.dto.CreatePlanRequest;
 import com.example.starter.plan.web.dto.OccupancyRequest;
 import com.example.starter.plan.web.dto.OccupancyView;
 import com.example.starter.plan.web.dto.PlanResponse;
+import com.example.starter.plan.web.dto.PreemptionSectionView;
+import com.example.starter.plan.web.dto.PreemptionView;
 import com.example.starter.plan.web.dto.PublishedSlotView;
+import com.example.starter.plan.web.dto.SectionOccupancyView;
+import com.example.starter.plan.web.dto.SectionRegisterRequest;
+import com.example.starter.plan.web.dto.SectionView;
 import com.example.starter.plan.web.dto.UpdateOccupanciesRequest;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.nio.charset.StandardCharsets;
@@ -21,12 +29,16 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.TreeSet;
+import java.util.stream.Collectors;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
@@ -34,10 +46,16 @@ import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 /**
- * 铁路走廊日计划核心业务：草稿创建/整体替换、发布、取消与查询。
+ * 铁路走廊日计划核心业务：草稿创建/整体替换、发布、抢占、取消与查询。
+ *
+ * <p>走廊等级：区段登记 1～5 级（未登记按 1 级），发布计划继承其全部占用区段的最高等级。
+ * 发布携带 preemptKey 且冲突的已发布计划全部占用区段等级都低于本次草稿时，在同一事务内
+ * 把被抢占计划整体转为 PREEMPTED 终态并释放时隙、写入不可变抢占记录，随后发布抢占草稿；
+ * 任一冲突计划存在不低于草稿等级的区段时 422（返回该区段与等级）；冲突时隙已被当前持有者
+ * 抢占获得且等级不足时 409（同一时隙只能被抢占一次）。
  *
  * <p>并发与幂等约定：写操作按 (操作类型, requestKey) 幂等，同键同参重放返回首次成功结果，
- * 同键不同参返回 409；发布经全局发布锁串行化，同一计划的更新/发布/取消经行锁按事务提交顺序生效；
+ * 同键不同参返回 409；发布（含抢占）经全局发布锁串行化，按事务提交顺序裁决；
  * 仅成功结果写入幂等记录，失败（含 422 时隙冲突）不缓存、可修正后重试。
  */
 @Service
@@ -46,6 +64,9 @@ public class PlanService {
     /** 运营日解释时区。 */
     public static final ZoneId OPERATION_ZONE = ZoneId.of("Asia/Shanghai");
 
+    /** 未登记区段的默认走廊等级。 */
+    public static final int DEFAULT_SECTION_LEVEL = 1;
+
     private static final String OP_CREATE = "CREATE";
     private static final String OP_UPDATE = "UPDATE";
     private static final String OP_PUBLISH = "PUBLISH";
@@ -53,13 +74,16 @@ public class PlanService {
 
     private final PlanRepository planRepo;
     private final IdempotencyRepository idemRepo;
+    private final PreemptionRepository preemptionRepo;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate tx;
 
     public PlanService(PlanRepository planRepo, IdempotencyRepository idemRepo,
+                       PreemptionRepository preemptionRepo,
                        ObjectMapper objectMapper, PlatformTransactionManager txManager) {
         this.planRepo = planRepo;
         this.idemRepo = idemRepo;
+        this.preemptionRepo = preemptionRepo;
         this.objectMapper = objectMapper;
         this.tx = new TransactionTemplate(txManager);
     }
@@ -128,11 +152,14 @@ public class PlanService {
     }
 
     /**
-     * 发布计划：全局发布锁内原子校验本计划列车重叠与跨计划区段重叠，
-     * 任一冲突则整张计划保持草稿并抛出 422（携带冲突区段与计划）。
+     * 发布计划：全局发布锁内原子校验本计划列车重叠与跨计划区段重叠。
+     * 无冲突直接发布；有冲突且未提交 preemptKey 时 422；提交 preemptKey 时按走廊等级
+     * 校验抢占条件，满足则在同一事务内降级被抢占计划（PREEMPTED）、写入抢占记录并发布，
+     * 任一失败整单回滚且已发布计划不变。
      */
-    public PlanResponse publish(String scheduleKey, String requestKey) {
-        String hash = hashAction(OP_PUBLISH, scheduleKey);
+    public PlanResponse publish(String scheduleKey, String requestKey, String preemptKey) {
+        String normalizedPreemptKey = (preemptKey == null || preemptKey.isBlank()) ? null : preemptKey;
+        String hash = hashAction(OP_PUBLISH, scheduleKey, normalizedPreemptKey);
         Optional<PlanResponse> replay = replayIfPresent(OP_PUBLISH, requestKey, hash);
         if (replay.isPresent()) {
             return replay.get();
@@ -147,15 +174,26 @@ public class PlanService {
                             "仅草稿可发布，当前状态: " + plan.status());
                 }
                 List<Occupancy> occupancies = planRepo.findOccupancies(plan.id());
-                List<Map<String, Object>> conflicts = new ArrayList<>();
-                conflicts.addAll(findTrainOverlaps(scheduleKey, occupancies));
-                conflicts.addAll(findSectionConflicts(plan, occupancies));
-                if (!conflicts.isEmpty()) {
+                List<Map<String, Object>> trainOverlaps = findTrainOverlaps(scheduleKey, occupancies);
+                if (!trainOverlaps.isEmpty()) {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
-                            "存在时隙冲突，计划保持草稿", conflicts);
+                            "存在时隙冲突，计划保持草稿", trainOverlaps);
+                }
+                ConflictScan scan = scanSectionConflicts(plan, occupancies);
+                Map<String, Integer> draftLevels = sectionLevels(
+                        occupancies.stream().map(Occupancy::sectionId).toList());
+                int draftLevel = draftLevels.values().stream()
+                        .mapToInt(Integer::intValue).max().orElse(DEFAULT_SECTION_LEVEL);
+                if (!scan.details().isEmpty()) {
+                    if (normalizedPreemptKey == null) {
+                        throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
+                                "存在时隙冲突，计划保持草稿", scan.details());
+                    }
+                    preemptConflictingPlans(plan, normalizedPreemptKey, scan, draftLevel,
+                            System.currentTimeMillis());
                 }
                 long now = System.currentTimeMillis();
-                planRepo.updateStatus(plan.id(), PlanStatus.PUBLISHED, now);
+                planRepo.updateStatusAndLevel(plan.id(), PlanStatus.PUBLISHED, draftLevel, now);
                 PlanResponse response = loadPlan(scheduleKey);
                 idemRepo.insert(OP_PUBLISH, requestKey, hash, toJson(response), now);
                 return response;
@@ -169,7 +207,7 @@ public class PlanService {
      * 取消已发布计划：时隙立即释放，历史计划与占用保留不改写。
      */
     public PlanResponse cancel(String scheduleKey, String requestKey) {
-        String hash = hashAction(OP_CANCEL, scheduleKey);
+        String hash = hashAction(OP_CANCEL, scheduleKey, null);
         Optional<PlanResponse> replay = replayIfPresent(OP_CANCEL, requestKey, hash);
         if (replay.isPresent()) {
             return replay.get();
@@ -213,7 +251,59 @@ public class PlanService {
                 .toList();
     }
 
+    /**
+     * 登记或更新区段走廊等级（1～5）。
+     */
+    public SectionView registerSection(String sectionId, SectionRegisterRequest req) {
+        planRepo.upsertSection(sectionId, req.priority(), System.currentTimeMillis());
+        return new SectionView(sectionId, req.priority());
+    }
+
+    /**
+     * 查询区段登记等级，未登记返回 404。
+     */
+    public SectionView getSection(String sectionId) {
+        int priority = planRepo.findSectionPriority(sectionId)
+                .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND, "SECTION_NOT_FOUND",
+                        "区段未登记: " + sectionId));
+        return new SectionView(sectionId, priority);
+    }
+
+    /**
+     * 查询抢占记录，可按计划业务键（匹配抢占方或被抢占方）与运营日过滤，按提交顺序返回。
+     */
+    public List<PreemptionView> getPreemptions(String scheduleKey, LocalDate opDate) {
+        return preemptionRepo.findRecords(scheduleKey, opDate).stream()
+                .map(p -> new PreemptionView(p.preemptKey(), p.opDate(),
+                        p.winnerScheduleKey(), p.winnerLevel(),
+                        p.loserScheduleKey(), p.loserLevel(),
+                        preemptionRepo.findSections(p.id()).stream()
+                                .map(s -> new PreemptionSectionView(s.sectionId(), s.sectionLevel()))
+                                .toList(),
+                        p.createdAt()))
+                .toList();
+    }
+
+    /**
+     * 按区段查询当前等级占用：该区段上当前已发布生效的时隙及计划/区段等级。
+     */
+    public List<SectionOccupancyView> getSectionOccupancy(LocalDate opDate, String sectionId) {
+        int sectionLevel = planRepo.findSectionPriority(sectionId).orElse(DEFAULT_SECTION_LEVEL);
+        return planRepo.findPublishedSlots(opDate, List.of(sectionId), -1L).stream()
+                .map(s -> new SectionOccupancyView(s.scheduleKey(), s.trainNo(), s.sectionId(),
+                        s.startUtc(), s.endUtc(), s.planLevel(), sectionLevel))
+                .toList();
+    }
+
     // ---------- 内部实现 ----------
+
+    /**
+     * 跨计划区段冲突扫描结果：422 明细、按冲突计划分组的争夺区段与计划业务键。
+     */
+    private record ConflictScan(List<Map<String, Object>> details,
+                                Map<Long, Set<String>> contestedSectionsByPlan,
+                                Map<Long, String> scheduleKeysByPlan) {
+    }
 
     private PlanResponse loadPlan(String scheduleKey) {
         DayPlan plan = planRepo.findByKey(scheduleKey)
@@ -222,7 +312,7 @@ public class PlanService {
                 .map(o -> new OccupancyView(o.trainNo(), o.sectionId(), o.startUtc(), o.endUtc()))
                 .toList();
         return new PlanResponse(plan.scheduleKey(), plan.opDate(), plan.version(),
-                plan.status().name(), views);
+                plan.status().name(), plan.planLevel(), views);
     }
 
     private List<Occupancy> toOccupancies(long planId, List<OccupancyRequest> requests) {
@@ -296,15 +386,18 @@ public class PlanService {
     }
 
     /**
-     * 与其他已发布计划在同日期、同区段上的重叠检测（左闭右开，相邻合法）。
+     * 与其他已发布计划在同日期、同区段上的重叠扫描（左闭右开，相邻合法），
+     * 同时汇总按冲突计划分组的争夺区段，供抢占校验使用。
      */
-    private List<Map<String, Object>> findSectionConflicts(DayPlan plan, List<Occupancy> occupancies) {
+    private ConflictScan scanSectionConflicts(DayPlan plan, List<Occupancy> occupancies) {
         List<String> sectionIds = occupancies.stream()
                 .map(Occupancy::sectionId)
-                .collect(java.util.stream.Collectors.toCollection(TreeSet::new))
+                .collect(Collectors.toCollection(TreeSet::new))
                 .stream().toList();
         List<PublishedSlot> published = planRepo.findPublishedSlots(plan.opDate(), sectionIds, plan.id());
-        List<Map<String, Object>> conflicts = new ArrayList<>();
+        List<Map<String, Object>> details = new ArrayList<>();
+        Map<Long, Set<String>> contested = new LinkedHashMap<>();
+        Map<Long, String> scheduleKeys = new LinkedHashMap<>();
         for (Occupancy o : occupancies) {
             for (PublishedSlot slot : published) {
                 if (!o.sectionId().equals(slot.sectionId())) {
@@ -321,11 +414,100 @@ public class PlanService {
                     detail.put("trainNo", o.trainNo());
                     detail.put("startUtc", o.startUtc().toString());
                     detail.put("endUtc", o.endUtc().toString());
-                    conflicts.add(detail);
+                    details.add(detail);
+                    contested.computeIfAbsent(slot.planId(), k -> new TreeSet<>()).add(slot.sectionId());
+                    scheduleKeys.putIfAbsent(slot.planId(), slot.scheduleKey());
                 }
             }
         }
-        return conflicts;
+        return new ConflictScan(details, contested, scheduleKeys);
+    }
+
+    /**
+     * 抢占校验与执行（发布锁内、与发布同事务）：
+     * 全部冲突计划的全部占用区段等级都低于草稿等级时，原子降级被抢占计划为 PREEMPTED、
+     * 写入不可变抢占记录；存在不低于草稿等级的区段时 422（返回区段与等级）；
+     * 争夺时隙已被当前持有者抢占获得时 409（同一时隙只能被抢占一次）。
+     */
+    private void preemptConflictingPlans(DayPlan plan, String preemptKey, ConflictScan scan,
+                                         int draftLevel, long now) {
+        List<Map<String, Object>> blocking = new ArrayList<>();
+        Set<Long> blockedPlanIds = new TreeSet<>();
+        Map<Long, Integer> loserLevels = new HashMap<>();
+        Map<Long, Map<String, Integer>> loserSectionLevels = new HashMap<>();
+        for (Map.Entry<Long, Set<String>> entry : scan.contestedSectionsByPlan().entrySet()) {
+            long loserId = entry.getKey();
+            Set<String> loserSections = planRepo.findOccupancies(loserId).stream()
+                    .map(Occupancy::sectionId)
+                    .collect(Collectors.toCollection(TreeSet::new));
+            Map<String, Integer> levels = sectionLevels(loserSections);
+            loserSectionLevels.put(loserId, levels);
+            loserLevels.put(loserId,
+                    levels.values().stream().mapToInt(Integer::intValue).max()
+                            .orElse(DEFAULT_SECTION_LEVEL));
+            for (String sectionId : loserSections) {
+                int level = levels.get(sectionId);
+                if (level >= draftLevel) {
+                    blockedPlanIds.add(loserId);
+                    Map<String, Object> detail = new LinkedHashMap<>();
+                    detail.put("type", "PREEMPT_LEVEL_INSUFFICIENT");
+                    detail.put("sectionId", sectionId);
+                    detail.put("sectionLevel", level);
+                    detail.put("draftLevel", draftLevel);
+                    detail.put("conflictingScheduleKey", scan.scheduleKeysByPlan().get(loserId));
+                    blocking.add(detail);
+                }
+            }
+        }
+        if (!blocking.isEmpty()) {
+            for (long blockedId : blockedPlanIds) {
+                for (String sectionId : scan.contestedSectionsByPlan().get(blockedId)) {
+                    if (preemptionRepo.existsWinnerRecordOnSection(blockedId, sectionId)) {
+                        Map<String, Object> detail = new LinkedHashMap<>();
+                        detail.put("type", "SLOT_ALREADY_PREEMPTED");
+                        detail.put("sectionId", sectionId);
+                        detail.put("conflictingScheduleKey",
+                                scan.scheduleKeysByPlan().get(blockedId));
+                        throw new ApiException(HttpStatus.CONFLICT, "SLOT_ALREADY_PREEMPTED",
+                                "同一时隙只能被抢占一次，区段 " + sectionId
+                                        + " 的当前占用计划由抢占获得且等级不低于本次草稿",
+                                List.of(detail));
+                    }
+                }
+            }
+            throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "PREEMPT_LEVEL_INSUFFICIENT",
+                    "被抢占计划的全部占用区段等级必须低于本次草稿", blocking);
+        }
+        if (preemptionRepo.existsByPreemptKey(preemptKey)) {
+            throw conflict("PREEMPT_KEY_REUSED", "preemptKey 已用于其他抢占: " + preemptKey);
+        }
+        for (long loserId : new TreeSet<>(scan.contestedSectionsByPlan().keySet())) {
+            if (planRepo.markPreemptedIfPublished(loserId, now) == 0) {
+                throw conflict("PREEMPT_TARGET_CHANGED",
+                        "被抢占计划状态已变化，抢占失败: " + scan.scheduleKeysByPlan().get(loserId));
+            }
+            Map<String, Integer> levels = loserSectionLevels.get(loserId);
+            long preemptionId = preemptionRepo.insert(new Preemption(0L, preemptKey, plan.opDate(),
+                    plan.id(), plan.scheduleKey(), draftLevel,
+                    loserId, scan.scheduleKeysByPlan().get(loserId), loserLevels.get(loserId), now));
+            List<PreemptionSection> sections = scan.contestedSectionsByPlan().get(loserId).stream()
+                    .map(s -> new PreemptionSection(0L, preemptionId, s, levels.get(s)))
+                    .toList();
+            preemptionRepo.insertSections(preemptionId, sections);
+        }
+    }
+
+    /**
+     * 查询区段等级，未登记区段按 {@link #DEFAULT_SECTION_LEVEL} 级处理。
+     */
+    private Map<String, Integer> sectionLevels(Collection<String> sectionIds) {
+        Set<String> distinct = new TreeSet<>(sectionIds);
+        Map<String, Integer> registered = planRepo.findSectionPriorities(distinct);
+        Map<String, Integer> levels = new HashMap<>();
+        for (String sectionId : distinct) {
+            levels.put(sectionId, registered.getOrDefault(sectionId, DEFAULT_SECTION_LEVEL));
+        }
+        return levels;
     }
 
     /**
@@ -363,8 +545,9 @@ public class PlanService {
         return sha256(sb.toString());
     }
 
-    private String hashAction(String opType, String scheduleKey) {
-        return sha256(opType + '\n' + scheduleKey);
+    private String hashAction(String opType, String scheduleKey, String preemptKey) {
+        return sha256(opType + '\n' + scheduleKey + '\n'
+                + (preemptKey == null ? "" : preemptKey));
     }
 
     private void appendOccupancies(StringBuilder sb, List<OccupancyRequest> occupancies) {
