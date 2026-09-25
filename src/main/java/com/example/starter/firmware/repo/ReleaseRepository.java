@@ -24,10 +24,11 @@ public class ReleaseRepository {
             rs.getString("from_version"), rs.getString("to_version"),
             rs.getInt("ratio"), ReleaseStatus.valueOf(rs.getString("status")),
             rs.getInt("sample_floor"), rs.getInt("failure_threshold_percent"),
-            rs.getInt("monitor_round"), rs.getInt("round_success"), rs.getInt("round_failed"));
+            rs.getInt("monitor_round"), rs.getInt("round_success"), rs.getInt("round_failed"),
+            rs.getBoolean("allow_skip"));
 
     private static final String COLUMNS = "id, version, model, from_version, to_version, ratio, status,"
-            + " sample_floor, failure_threshold_percent, monitor_round, round_success, round_failed";
+            + " sample_floor, failure_threshold_percent, monitor_round, round_success, round_failed, allow_skip";
 
     private final JdbcTemplate jdbc;
 
@@ -36,13 +37,13 @@ public class ReleaseRepository {
     }
 
     public long insert(String model, String fromVersion, String toVersion, int ratio,
-                       int sampleFloor, int failureThresholdPercent) {
+                       int sampleFloor, int failureThresholdPercent, boolean allowSkip) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
                     "INSERT INTO release_order (version, model, from_version, to_version, ratio, status,"
-                            + " sample_floor, failure_threshold_percent, monitor_round, active_model)"
-                            + " VALUES (1, ?, ?, ?, ?, 'ACTIVE', ?, ?, 1, ?)",
+                            + " sample_floor, failure_threshold_percent, monitor_round, active_model, allow_skip)"
+                            + " VALUES (1, ?, ?, ?, ?, 'ACTIVE', ?, ?, 1, ?, ?)",
                     new String[]{"id"});
             ps.setString(1, model);
             ps.setString(2, fromVersion);
@@ -51,6 +52,7 @@ public class ReleaseRepository {
             ps.setInt(5, sampleFloor);
             ps.setInt(6, failureThresholdPercent);
             ps.setString(7, model);
+            ps.setBoolean(8, allowSkip);
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();
@@ -116,5 +118,14 @@ public class ReleaseRepository {
                 + " monitor_round = monitor_round + 1, round_success = 0, round_failed = 0,"
                 + " updated_at = CURRENT_TIMESTAMP"
                 + " WHERE id = ? AND version = ? AND status = 'PAUSED'", id, expectedVersion);
+    }
+
+    /**
+     * 跳级开关：仅当版本匹配且未终结时生效，版本加一；只影响后续拉取，不改写已下发任务。
+     */
+    public int updateAllowSkip(long id, int expectedVersion, boolean allowSkip) {
+        return jdbc.update("UPDATE release_order SET allow_skip = ?, version = version + 1,"
+                + " updated_at = CURRENT_TIMESTAMP"
+                + " WHERE id = ? AND version = ? AND status <> 'CANCELLED'", allowSkip, id, expectedVersion);
     }
 }

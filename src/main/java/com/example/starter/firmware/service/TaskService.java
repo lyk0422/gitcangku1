@@ -1,6 +1,8 @@
 package com.example.starter.firmware.service;
 
 import com.example.starter.firmware.api.PullResponse;
+import com.example.starter.firmware.api.PathBlockedHistoryResponse;
+import com.example.starter.firmware.api.PathBlockedRecordView;
 import com.example.starter.firmware.api.ReceiptRequest;
 import com.example.starter.firmware.api.TaskListResponse;
 import com.example.starter.firmware.api.TaskView;
@@ -12,6 +14,7 @@ import com.example.starter.firmware.domain.RolloutTask;
 import com.example.starter.firmware.domain.TaskStatus;
 import com.example.starter.firmware.error.ApiException;
 import com.example.starter.firmware.repo.DeviceRepository;
+import com.example.starter.firmware.repo.PathBlockedRecordRepository;
 import com.example.starter.firmware.repo.PauseRecordRepository;
 import com.example.starter.firmware.repo.ReleaseRepository;
 import com.example.starter.firmware.repo.TaskRepository;
@@ -33,28 +36,38 @@ public class TaskService {
     private final ReleaseRepository releaseRepository;
     private final DeviceRepository deviceRepository;
     private final PauseRecordRepository pauseRecordRepository;
+    private final PathBlockedRecordRepository pathBlockedRecordRepository;
     private final DeviceService deviceService;
     private final ReleaseService releaseService;
+    private final VersionService versionService;
     private final IdempotencyService idempotency;
     private final Clock clock;
 
     public TaskService(TaskRepository taskRepository, ReleaseRepository releaseRepository,
                        DeviceRepository deviceRepository, PauseRecordRepository pauseRecordRepository,
+                       PathBlockedRecordRepository pathBlockedRecordRepository,
                        DeviceService deviceService, ReleaseService releaseService,
-                       IdempotencyService idempotency, Clock clock) {
+                       VersionService versionService, IdempotencyService idempotency, Clock clock) {
         this.taskRepository = taskRepository;
         this.releaseRepository = releaseRepository;
         this.deviceRepository = deviceRepository;
         this.pauseRecordRepository = pauseRecordRepository;
+        this.pathBlockedRecordRepository = pathBlockedRecordRepository;
         this.deviceService = deviceService;
         this.releaseService = releaseService;
+        this.versionService = versionService;
         this.idempotency = idempotency;
         this.clock = clock;
     }
 
     /**
-     * 设备拉取：已存在任务直接返回；否则仅当型号与当前版本匹配、分桶号小于比例且发布单 ACTIVE 时创建。
+     * 设备拉取：已存在任务直接返回；否则仅当型号匹配、分桶号小于比例且发布单 ACTIVE 时创建。
      * PAUSED 时不创建新任务，已有任务仍可查看与回执。
+     * 未开启跳级时先做前置链判定：目标版本前置链上存在设备未安装的中间版本，
+     * 返回 PATH_BLOCKED 与下一个必须安装的版本，落判定历史，不计入失败率样本、不改变设备与任务状态；
+     * 链判定通过后再按既有规则要求当前版本等于来源版本。
+     * 开启跳级时忽略前置链与来源版本校验直接下发，已处目标版本的设备不再下发。
+     * 路径判定基于发布单行锁与设备行锁内提交时刻一致的版本链与设备版本。
      */
     public PullResponse pull(String deviceId, String requestId) {
         String fingerprint = String.join("|", "task.pull", deviceId);
@@ -62,18 +75,34 @@ public class TaskService {
             Device device = deviceService.findDevice(deviceId);
             var activeOrder = releaseRepository.findActiveByModel(device.model());
             if (activeOrder.isEmpty()) {
-                return new PullResponse(null);
+                return PullResponse.none();
             }
             ReleaseOrder order = releaseRepository.findByIdForUpdate(activeOrder.get().id())
                     .orElseThrow(() -> ApiException.notFound("RELEASE_NOT_FOUND", "发布单不存在"));
+            device = deviceRepository.findByIdForUpdate(deviceId)
+                    .orElseThrow(() -> ApiException.notFound("DEVICE_NOT_FOUND", "设备不存在: " + deviceId));
             var existing = taskRepository.findByReleaseAndDevice(order.id(), deviceId);
             if (existing.isPresent()) {
-                return new PullResponse(TaskView.of(existing.get(), order));
+                return PullResponse.task(TaskView.of(existing.get(), order));
             }
-            if (order.status() != ReleaseStatus.ACTIVE
-                    || !device.currentVersion().equals(order.fromVersion())
-                    || device.bucketNo() >= order.ratio()) {
-                return new PullResponse(null);
+            if (order.status() != ReleaseStatus.ACTIVE || device.bucketNo() >= order.ratio()) {
+                return PullResponse.none();
+            }
+            if (order.allowSkip()) {
+                // 跳级：忽略前置链与来源版本校验直接下发；已处目标版本的设备不再下发
+                if (device.currentVersion().equals(order.toVersion())) {
+                    return PullResponse.none();
+                }
+            } else {
+                var next = versionService.nextRequiredVersion(device.currentVersion(), order.toVersion());
+                if (next.isPresent()) {
+                    pathBlockedRecordRepository.insert(order.id(), deviceId, device.currentVersion(),
+                            order.toVersion(), next.get(), Instant.now(clock).toString());
+                    return PullResponse.blocked(next.get());
+                }
+                if (!device.currentVersion().equals(order.fromVersion())) {
+                    return PullResponse.none();
+                }
             }
             long taskId;
             try {
@@ -81,11 +110,11 @@ public class TaskService {
             } catch (DuplicateKeyException e) {
                 RolloutTask task = taskRepository.findByReleaseAndDevice(order.id(), deviceId)
                         .orElseThrow(() -> new IllegalStateException("任务唯一约束冲突后未找到任务"));
-                return new PullResponse(TaskView.of(task, order));
+                return PullResponse.task(TaskView.of(task, order));
             }
             RolloutTask task = taskRepository.findById(taskId)
                     .orElseThrow(() -> new IllegalStateException("任务创建后读取失败"));
-            return new PullResponse(TaskView.of(task, order));
+            return PullResponse.task(TaskView.of(task, order));
         }, PullResponse.class);
     }
 
@@ -153,5 +182,16 @@ public class TaskService {
                 .map(task -> TaskView.of(task, order))
                 .toList();
         return new TaskListResponse(tasks);
+    }
+
+    /**
+     * PATH_BLOCKED 判定历史（只读，不触发状态变化）。
+     */
+    public PathBlockedHistoryResponse listPathBlocked(long releaseId) {
+        releaseService.findOrder(releaseId);
+        List<PathBlockedRecordView> records = pathBlockedRecordRepository.findByRelease(releaseId).stream()
+                .map(PathBlockedRecordView::of)
+                .toList();
+        return new PathBlockedHistoryResponse(releaseId, records);
     }
 }

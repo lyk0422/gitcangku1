@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS release_order (
   sample_floor INT NOT NULL COMMENT '失败率统计样本下限，取值2~100；本轮样本数达到下限才评估暂停',
   failure_threshold_percent INT NOT NULL COMMENT '失败率阈值百分比，取值1~100；FAILED×100>=样本数×阈值时自动暂停',
   monitor_round INT NOT NULL DEFAULT 1 COMMENT '当前监控轮次，从1开始，人工恢复后加一并清零统计',
+  allow_skip BOOLEAN NOT NULL DEFAULT FALSE COMMENT '跳级开关：TRUE时忽略前置版本链校验直接下发；只影响后续拉取',
   round_success INT NOT NULL DEFAULT 0 COMMENT '当前监控轮次内首次进入SUCCESS的任务数，重复回执不重复计数',
   round_failed INT NOT NULL DEFAULT 0 COMMENT '当前监控轮次内首次进入FAILED的任务数，重复回执不重复计数',
   active_model VARCHAR(64) NULL COMMENT 'ACTIVE或PAUSED时等于model，取消后置NULL；用于同型号至多一张未终结发布单的唯一约束',
@@ -71,3 +72,22 @@ CREATE TABLE IF NOT EXISTS idempotency_record (
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   PRIMARY KEY (request_id)
 ) COMMENT='写操作幂等去重记录，失败不占键';
+
+CREATE TABLE IF NOT EXISTS firmware_version (
+  version VARCHAR(64) NOT NULL COMMENT '固件版本标识',
+  predecessor VARCHAR(64) NULL COMMENT '直接前置版本，NULL表示版本链起点；登记时前置必须已存在且不形成环',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '登记时间',
+  PRIMARY KEY (version)
+) COMMENT='固件版本链登记表，每个版本至多一个直接前置版本';
+
+CREATE TABLE IF NOT EXISTS path_blocked_record (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '记录ID',
+  release_id BIGINT NOT NULL COMMENT '判定所属发布单ID',
+  device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
+  device_version VARCHAR(64) NOT NULL COMMENT '判定时刻设备当前固件版本',
+  target_version VARCHAR(64) NOT NULL COMMENT '发布单目标固件版本',
+  next_version VARCHAR(64) NOT NULL COMMENT '下一个必须安装的中间版本',
+  blocked_at_utc VARCHAR(40) NOT NULL COMMENT '判定时刻，UTC，ISO-8601格式（如2026-09-25T02:00:00Z）',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间',
+  PRIMARY KEY (id)
+) COMMENT='PATH_BLOCKED 判定历史，只增不改；不计入失败率样本';

@@ -48,6 +48,11 @@ public class ReleaseController {
         return releaseService.resume(releaseId, request);
     }
 
+    @PostMapping("/{releaseId}/skip")
+    public ReleaseView setAllowSkip(@PathVariable long releaseId, @Valid @RequestBody SetSkipRequest request) {
+        return releaseService.setAllowSkip(releaseId, request);
+    }
+
     @GetMapping("/{releaseId}/monitor")
     public MonitorView monitor(@PathVariable long releaseId) {
         return releaseService.monitor(releaseId);
@@ -62,6 +67,11 @@ public class ReleaseController {
     public TaskListResponse tasks(@PathVariable long releaseId, @RequestParam(required = false) String status) {
         TaskStatus filter = parseStatus(status);
         return taskService.listByRelease(releaseId, filter);
+    }
+
+    @GetMapping("/{releaseId}/path-blocked")
+    public PathBlockedHistoryResponse pathBlocked(@PathVariable long releaseId) {
+        return taskService.listPathBlocked(releaseId);
     }
 
     private TaskStatus parseStatus(String status) {

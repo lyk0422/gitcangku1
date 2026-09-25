@@ -72,6 +72,8 @@ class FirmwareConcurrencyTest {
         jdbc.update("DELETE FROM release_order");
         jdbc.update("DELETE FROM device");
         jdbc.update("DELETE FROM idempotency_record");
+        jdbc.update("DELETE FROM path_blocked_record");
+        jdbc.update("DELETE FROM firmware_version");
         executor = Executors.newFixedThreadPool(8);
     }
 

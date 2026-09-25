@@ -8,6 +8,7 @@ import com.example.starter.firmware.api.ReleaseHistoryResponse;
 import com.example.starter.firmware.api.ReleaseView;
 import com.example.starter.firmware.api.ResumeRecordView;
 import com.example.starter.firmware.api.ResumeReleaseRequest;
+import com.example.starter.firmware.api.SetSkipRequest;
 import com.example.starter.firmware.domain.ReleaseOrder;
 import com.example.starter.firmware.domain.ReleaseStatus;
 import com.example.starter.firmware.error.ApiException;
@@ -53,14 +54,15 @@ public class ReleaseService {
         }
         int sampleFloor = request.effectiveSampleFloor();
         int threshold = request.effectiveFailureThresholdPercent();
+        boolean allowSkip = request.effectiveAllowSkip();
         String fingerprint = String.join("|", "release.create", request.model(), request.fromVersion(),
                 request.toVersion(), String.valueOf(request.ratio()), String.valueOf(sampleFloor),
-                String.valueOf(threshold));
+                String.valueOf(threshold), String.valueOf(allowSkip));
         return idempotency.execute(request.requestId(), "release.create", fingerprint, () -> {
             long id;
             try {
                 id = releaseRepository.insert(request.model(), request.fromVersion(), request.toVersion(),
-                        request.ratio(), sampleFloor, threshold);
+                        request.ratio(), sampleFloor, threshold, allowSkip);
             } catch (DuplicateKeyException e) {
                 throw ApiException.conflict("ACTIVE_RELEASE_EXISTS", "型号已存在未终结发布单: " + request.model());
             }
@@ -119,8 +121,29 @@ public class ReleaseService {
         }, ReleaseView.class);
     }
 
-    public ReleaseView cancel(long releaseId, String requestId) {
-        String fingerprint = String.join("|", "release.cancel", String.valueOf(releaseId));
+    /**
+     * 跳级开关：ACTIVE/PAUSED 可修改，CANCELLED 拒绝；expectedVersion 不一致返回 409。
+     * 成功版本加一，只影响后续拉取，不改写已下发任务。
+     */
+    public ReleaseView setAllowSkip(long releaseId, SetSkipRequest request) {
+        String fingerprint = String.join("|", "release.skip", String.valueOf(releaseId),
+                String.valueOf(request.expectedVersion()), String.valueOf(request.allowSkip()));
+        return idempotency.execute(request.requestId(), "release.skip", fingerprint, () -> {
+            ReleaseOrder order = releaseRepository.findByIdForUpdate(releaseId)
+                    .orElseThrow(() -> ApiException.notFound("RELEASE_NOT_FOUND", "发布单不存在: " + releaseId));
+            if (order.status() == ReleaseStatus.CANCELLED) {
+                throw ApiException.conflict("RELEASE_CANCELLED", "发布单已取消，不能修改跳级开关");
+            }
+            if (order.version() != request.expectedVersion()) {
+                throw ApiException.conflict("VERSION_CONFLICT",
+                        "expectedVersion 与当前版本不一致: " + order.version());
+            }
+            releaseRepository.updateAllowSkip(releaseId, request.expectedVersion(), request.allowSkip());
+            return ReleaseView.of(findOrder(releaseId));
+        }, ReleaseView.class);
+    }
+
+    public ReleaseView cancel(long releaseId, String requestId) {        String fingerprint = String.join("|", "release.cancel", String.valueOf(releaseId));
         return idempotency.execute(requestId, "release.cancel", fingerprint, () -> {
             ReleaseOrder order = releaseRepository.findByIdForUpdate(releaseId)
                     .orElseThrow(() -> ApiException.notFound("RELEASE_NOT_FOUND", "发布单不存在: " + releaseId));
