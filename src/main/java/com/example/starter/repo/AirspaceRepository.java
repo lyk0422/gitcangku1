@@ -27,7 +27,8 @@ public class AirspaceRepository {
             rs.getInt("y_max"),
             rs.getString("status"),
             rs.getLong("created_version"),
-            (Long) rs.getObject("revoked_version"));
+            (Long) rs.getObject("revoked_version"),
+            rs.getInt("zone_version"));
 
     /** 读取当前全局空域版本（单行）。 */
     public long getGlobalVersion() {
@@ -40,8 +41,24 @@ public class AirspaceRepository {
     public ZonePo findZone(String zoneId) {
         try {
             return jdbc.queryForObject(
-                    "SELECT zone_id, x_min, y_min, x_max, y_max, status, created_version, revoked_version "
+                    "SELECT zone_id, x_min, y_min, x_max, y_max, status, created_version, revoked_version, zone_version "
                             + "FROM no_fly_zone WHERE zone_id = ?", ZONE_MAPPER, zoneId);
+        } catch (EmptyResultDataAccessException ex) {
+            return null;
+        }
+    }
+
+    /**
+     * 在当前事务内以 SELECT ... FOR UPDATE 锁定禁飞区行并读取之。
+     * H2（MVStore）与 MySQL InnoDB 均对该读取持有行级排他锁至事务提交。
+     *
+     * @return 区域当前状态；不存在返回 null
+     */
+    public ZonePo findZoneForUpdate(String zoneId) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT zone_id, x_min, y_min, x_max, y_max, status, created_version, revoked_version, zone_version "
+                            + "FROM no_fly_zone WHERE zone_id = ? FOR UPDATE", ZONE_MAPPER, zoneId);
         } catch (EmptyResultDataAccessException ex) {
             return null;
         }
@@ -50,18 +67,30 @@ public class AirspaceRepository {
     /** 查询全部有效（ACTIVE）禁飞区。 */
     public List<ZonePo> findActiveZones() {
         return jdbc.query(
-                "SELECT zone_id, x_min, y_min, x_max, y_max, status, created_version, revoked_version "
+                "SELECT zone_id, x_min, y_min, x_max, y_max, status, created_version, revoked_version, zone_version "
                         + "FROM no_fly_zone WHERE status = 'ACTIVE' ORDER BY zone_id",
                 ZONE_MAPPER);
     }
 
-    /** 创建禁飞区（调用方负责事务与版本递增）。 */
+    /** 创建禁飞区（调用方负责事务与版本递增）；区域高度带配置版本初始为 1。 */
     public void insertZone(ZonePo zone) {
         jdbc.update("INSERT INTO no_fly_zone "
-                        + "(zone_id, x_min, y_min, x_max, y_max, status, created_version, revoked_version) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        + "(zone_id, x_min, y_min, x_max, y_max, status, created_version, revoked_version, zone_version) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",
                 zone.zoneId(), zone.xMin(), zone.yMin(), zone.xMax(), zone.yMax(),
                 zone.status(), zone.createdVersion(), zone.revokedVersion());
+    }
+
+    /**
+     * 高度带配置修改的乐观锁：仅当区域仍 ACTIVE 且 zone_version 等于 expectedVersion 时加一。
+     *
+     * @return 更新行数；0 表示区域不存在、已撤销或版本已被其他事务推进
+     */
+    public int compareAndIncrementZoneVersion(String zoneId, int expectedVersion) {
+        return jdbc.update(
+                "UPDATE no_fly_zone SET zone_version = zone_version + 1 "
+                        + "WHERE zone_id = ? AND zone_version = ? AND status = 'ACTIVE'",
+                zoneId, expectedVersion);
     }
 
     /** 撤销禁飞区并记录撤销生效版本（调用方负责事务与版本递增）。 */

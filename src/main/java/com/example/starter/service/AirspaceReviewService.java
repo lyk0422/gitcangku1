@@ -16,35 +16,25 @@ import com.example.starter.domain.Point;
 import com.example.starter.domain.ReviewConclusion;
 import com.example.starter.domain.ZoneStatus;
 import com.example.starter.repo.AirspaceRepository;
-import com.example.starter.repo.DedupPo;
+import com.example.starter.repo.BandPo;
+import com.example.starter.repo.BandRepository;
 import com.example.starter.repo.ReviewPo;
 import com.example.starter.repo.ReviewRepository;
 import com.example.starter.repo.RoutePo;
 import com.example.starter.repo.RouteRepository;
+import com.example.starter.repo.VerticalDetailPo;
 import com.example.starter.repo.ZonePo;
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ArrayNode;
-import com.fasterxml.jackson.databind.node.JsonNodeFactory;
-import com.fasterxml.jackson.databind.node.ObjectNode;
-import org.springframework.dao.DuplicateKeyException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.util.ArrayList;
-import java.util.HexFormat;
 import java.util.List;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.UUID;
-import java.util.function.Supplier;
 
 /**
  * 禁飞区与航线审查业务服务。
@@ -53,35 +43,37 @@ import java.util.function.Supplier;
  * 失败（含业务冲突）回滚事务，不占用 requestId。</p>
  *
  * <p>审核事务先锁全局空域版本行、再锁航线行：区域变更事务必须更新版本行，
- * 因而与审核互斥，保证审核使用的空域版本号与全部禁飞区来自同一已提交状态，
- * 不会产生“携带新版本、使用旧区域”或反之的结论。</p>
+ * 因而与审核互斥，保证审核使用的空域版本号与全部禁飞区来自同一已提交状态。</p>
+ *
+ * <p>高度层语义（本题新增）：区域可登记左闭右开高度带。审查时仅对二维路径相交的
+ * 区域进一步比较高度——巡航高度落入某高度带则记为垂直命中（verticalHit=true，
+ * 容量在占用环节裁决，审查仍可 CLEAR）；二维相交但高度不相交则垂直分离
+ * （verticalHit=false），该区域不拦截也不消耗容量。未登记任何高度带的区域保持
+ * “全高度禁飞”旧语义：二维相交即 BLOCKED。未登记巡航高度的历史航线只做二维审查。</p>
  */
 @Service
 public class AirspaceReviewService {
 
-    static final String KIND_ZONE_CREATE = "ZONE_CREATE";
-    static final String KIND_ZONE_REVOKE = "ZONE_REVOKE";
-    static final String KIND_ROUTE_CREATE = "ROUTE_CREATE";
-    static final String KIND_ROUTE_REPLACE = "ROUTE_REPLACE";
-    static final String KIND_REVIEW = "REVIEW";
-
     private final AirspaceRepository airspaceRepo;
     private final RouteRepository routeRepo;
     private final ReviewRepository reviewRepo;
-    private final ObjectMapper objectMapper;
+    private final BandRepository bandRepo;
+    private final IdempotencyService idempotency;
     private final Clock clock;
     private final TransactionTemplate txTemplate;
 
     public AirspaceReviewService(AirspaceRepository airspaceRepo,
                                  RouteRepository routeRepo,
                                  ReviewRepository reviewRepo,
-                                 ObjectMapper objectMapper,
+                                 BandRepository bandRepo,
+                                 IdempotencyService idempotency,
                                  Clock clock,
                                  PlatformTransactionManager transactionManager) {
         this.airspaceRepo = airspaceRepo;
         this.routeRepo = routeRepo;
         this.reviewRepo = reviewRepo;
-        this.objectMapper = objectMapper;
+        this.bandRepo = bandRepo;
+        this.idempotency = idempotency;
         this.clock = clock;
         this.txTemplate = new TransactionTemplate(transactionManager);
     }
@@ -90,7 +82,8 @@ public class AirspaceReviewService {
 
     /** 创建禁飞区；同键同参重放原结果，异参 409。 */
     public MutationResponse createZone(ZoneCreateRequest request) {
-        return withIdempotency(request.requestId(), KIND_ZONE_CREATE, canonicalHash(request), () -> {
+        return idempotency.execute(request.requestId(), IdempotencyService.KIND_ZONE_CREATE,
+                idempotency.canonicalHash(request), () -> {
             if (request.xMin() >= request.xMax() || request.yMin() >= request.yMax()) {
                 throw new ApiException(HttpStatus.BAD_REQUEST, "INVALID_ZONE_RECTANGLE",
                         "禁飞区必须是非退化轴对齐矩形：xMin < xMax 且 yMin < yMax");
@@ -101,7 +94,7 @@ public class AirspaceReviewService {
             }
             long newVersion = airspaceRepo.incrementGlobalVersion();
             airspaceRepo.insertZone(new ZonePo(request.zoneId(), request.xMin(), request.yMin(),
-                    request.xMax(), request.yMax(), ZoneStatus.ACTIVE.name(), newVersion, null));
+                    request.xMax(), request.yMax(), ZoneStatus.ACTIVE.name(), newVersion, null, 1));
             return new MutationResponse(request.requestId(), false,
                     new ZoneResult(request.zoneId(), ZoneStatus.ACTIVE.name(), newVersion));
         });
@@ -109,7 +102,8 @@ public class AirspaceReviewService {
 
     /** 撤销禁飞区（只能撤销一次，撤销使空域版本加一）。 */
     public MutationResponse revokeZone(ZoneRevokeRequest request) {
-        return withIdempotency(request.requestId(), KIND_ZONE_REVOKE, canonicalHash(request), () -> {
+        return idempotency.execute(request.requestId(), IdempotencyService.KIND_ZONE_REVOKE,
+                idempotency.canonicalHash(request), () -> {
             ZonePo zone = airspaceRepo.findZone(request.zoneId());
             if (zone == null) {
                 throw new ApiException(HttpStatus.NOT_FOUND, "ZONE_NOT_FOUND",
@@ -128,16 +122,19 @@ public class AirspaceReviewService {
 
     // ============================ 航线 ============================
 
-    /** 创建航线（初始版本 1）。 */
+    /** 创建航线（初始版本 1），可携带巡航高度与 UTC 时段。 */
     public MutationResponse createRoute(RouteCreateRequest request) {
-        return withIdempotency(request.requestId(), KIND_ROUTE_CREATE, canonicalHash(request), () -> {
+        return idempotency.execute(request.requestId(), IdempotencyService.KIND_ROUTE_CREATE,
+                idempotency.canonicalHash(request), () -> {
             List<Point> points = toPoints(request.points());
             validatePointsDistinct(points);
+            validateAltitudeWindow(request.cruiseAltitude(), request.startTime(), request.endTime());
             if (routeRepo.findRoute(request.routeId()) != null) {
                 throw new ApiException(HttpStatus.CONFLICT, "ROUTE_ALREADY_EXISTS",
                         "航线已存在: " + request.routeId());
             }
-            routeRepo.insertRoute(request.routeId(), points);
+            routeRepo.insertRoute(request.routeId(), points,
+                    request.cruiseAltitude(), request.startTime(), request.endTime());
             return new MutationResponse(request.requestId(), false,
                     new RouteResult(request.routeId(), 1));
         });
@@ -145,7 +142,8 @@ public class AirspaceReviewService {
 
     /** 替换航线点列，expectedVersion 不匹配返回 409；成功版本加一。 */
     public MutationResponse replaceRoute(RouteReplaceRequest request) {
-        return withIdempotency(request.requestId(), KIND_ROUTE_REPLACE, canonicalHash(request), () -> {
+        return idempotency.execute(request.requestId(), IdempotencyService.KIND_ROUTE_REPLACE,
+                idempotency.canonicalHash(request), () -> {
             List<Point> points = toPoints(request.points());
             validatePointsDistinct(points);
             RoutePo route = routeRepo.findRoute(request.routeId());
@@ -158,6 +156,13 @@ public class AirspaceReviewService {
                         "航线版本不匹配：expected=" + request.expectedVersion()
                                 + ", current=" + route.version());
             }
+            // 高度时段属性：请求全部缺省时保留原值；提供任一字段时必须三者齐全
+            boolean keepAltitude = request.cruiseAltitude() == null
+                    && request.startTime() == null && request.endTime() == null;
+            Integer cruiseAltitude = keepAltitude ? route.cruiseAltitude() : request.cruiseAltitude();
+            Long startTime = keepAltitude ? route.startTime() : request.startTime();
+            Long endTime = keepAltitude ? route.endTime() : request.endTime();
+            validateAltitudeWindow(cruiseAltitude, startTime, endTime);
             // 条件更新兜底并发替换：更新 0 行说明版本已被其他事务推进
             int updated = routeRepo.compareAndIncrementVersion(
                     request.routeId(), request.expectedVersion());
@@ -165,8 +170,8 @@ public class AirspaceReviewService {
                 throw new ApiException(HttpStatus.CONFLICT, "VERSION_CONFLICT",
                         "航线版本已变化，请使用最新 expectedVersion 重试");
             }
-            routeRepo.deletePoints(request.routeId());
-            routeRepo.insertPoints(request.routeId(), points);
+            routeRepo.replaceRouteAttributes(request.routeId(), points,
+                    cruiseAltitude, startTime, endTime);
             return new MutationResponse(request.requestId(), false,
                     new RouteResult(request.routeId(), request.expectedVersion() + 1));
         });
@@ -176,10 +181,11 @@ public class AirspaceReviewService {
 
     /** 提交审核：任一指定版本不是当前版本返回 409；结果不可变。 */
     public MutationResponse review(ReviewRequest request) {
-        return withIdempotency(request.requestId(), KIND_REVIEW, canonicalHash(request), () -> {
-            // 先锁空域版本行：与任何区域创建/撤销事务互斥
+        return idempotency.execute(request.requestId(), IdempotencyService.KIND_REVIEW,
+                idempotency.canonicalHash(request), () -> {
+            // 先锁空域版本行：与任何区域创建/撤销/高度带配置事务互斥
             long globalVersion = airspaceRepo.getGlobalVersionForUpdate();
-            // 再锁航线行：与航线替换事务互斥，保证版本号与点列一致
+            // 再锁航线行：与航线替换事务互斥，保证版本号、点列与高度时段一致
             RoutePo route = routeRepo.findRouteForUpdate(request.routeId());
             if (route == null) {
                 throw new ApiException(HttpStatus.NOT_FOUND, "ROUTE_NOT_FOUND",
@@ -198,11 +204,27 @@ public class AirspaceReviewService {
             // 持锁状态下读取全部有效禁飞区，与上面的版本号同属一个一致状态
             List<ZonePo> activeZones = airspaceRepo.findActiveZones();
             Set<String> hits = new TreeSet<>();
+            List<VerticalDetailPo> details = new ArrayList<>();
+            boolean altitudeRoute = route.cruiseAltitude() != null;
             for (ZonePo zone : activeZones) {
-                if (Geometry.polylineHitsRectangle(route.points(),
+                if (!Geometry.polylineHitsRectangle(route.points(),
                         zone.xMin(), zone.yMin(), zone.xMax(), zone.yMax())) {
-                    hits.add(zone.zoneId());
+                    continue;
                 }
+                List<BandPo> bands = bandRepo.findBands(zone.zoneId());
+                if (!altitudeRoute || bands.isEmpty()) {
+                    // 历史二维航线，或区域未登记高度带（全高度禁飞）：二维相交即拦截
+                    hits.add(zone.zoneId());
+                    continue;
+                }
+                // 高度层航线：仅比较二维相交且高度带相交的区域。
+                // 命中容量管控高度带不直接 BLOCKED，记 verticalHit=true 供占用环节裁决容量；
+                // 高度不相交记 verticalHit=false（垂直分离），不拦截不消耗容量。
+                BandPo matched = matchBand(bands, route.cruiseAltitude());
+                details.add(new VerticalDetailPo(null, zone.zoneId(),
+                        matched == null ? null : matched.bandLower(),
+                        matched == null ? null : matched.bandUpper(),
+                        matched != null, details.size()));
             }
             String conclusion = hits.isEmpty()
                     ? ReviewConclusion.CLEAR.name()
@@ -210,8 +232,14 @@ public class AirspaceReviewService {
             String reviewId = "rv_" + UUID.randomUUID();
             ReviewPo po = new ReviewPo(reviewId, request.routeId(), route.version(), globalVersion,
                     conclusion, new ArrayList<>(hits), List.copyOf(route.points()),
+                    route.cruiseAltitude(), route.startTime(), route.endTime(),
                     request.requestId(), nowMillis());
             reviewRepo.insertReview(po);
+            for (VerticalDetailPo detail : details) {
+                reviewRepo.insertVerticalDetail(
+                        new VerticalDetailPo(reviewId, detail.zoneId(), detail.bandLower(),
+                                detail.bandUpper(), detail.verticalHit(), detail.detailSeq()));
+            }
             return new MutationResponse(request.requestId(), false, toDto(po, conclusion, true));
         });
     }
@@ -246,80 +274,17 @@ public class AirspaceReviewService {
         });
     }
 
-    // ============================ 幂等与事务 ============================
-
-    /**
-     * 在事务内执行幂等写操作：
-     * 同键同参返回首次成功结果（标记 replayed=true）；同键异参/异种操作抛 409；
-     * 业务异常回滚、不占用 requestId；去重记录与业务变更同一事务原子提交。
-     *
-     * <p>同键并发时，落败事务可能先撞上唯一约束（DuplicateKeyException），
-     * 也可能在持锁后读到赢家已提交的状态而抛业务冲突（409）；两种情况都在
-     * 回滚后用新事务查询去重表：赢家同键同参已提交则重放原结果，否则按原错误抛出。</p>
-     */
-    private MutationResponse withIdempotency(String requestId, String kind, String paramHash,
-                                             Supplier<MutationResponse> action) {
-        try {
-            return txTemplate.execute(status -> doIdempotent(requestId, kind, paramHash, action));
-        } catch (DuplicateKeyException dup) {
-            return resolveAfterRace(requestId, kind, paramHash,
-                    new ApiException(HttpStatus.CONFLICT, "RESOURCE_CONFLICT",
-                            "并发资源冲突，请稍后使用相同 requestId 与参数重试"));
-        } catch (ApiException api) {
-            if (api.status() == HttpStatus.CONFLICT) {
-                return resolveAfterRace(requestId, kind, paramHash, api);
-            }
-            throw api;
-        }
-    }
-
-    /**
-     * 并发落败后的裁决：去重表中存在同键记录则按重放/异参冲突处理；
-     * 不存在（说明该 requestId 尚未成功、这是一次真实业务冲突）则抛出原错误，
-     * 不占用 requestId。
-     */
-    private MutationResponse resolveAfterRace(String requestId, String kind, String paramHash,
-                                              ApiException original) {
-        DedupPo winner = txTemplate.execute(status -> reviewRepo.findDedup(requestId));
-        if (winner == null) {
-            throw original;
-        }
-        ensureSameRequest(winner, kind, paramHash);
-        return deserializeReplay(winner);
-    }
-
-    private MutationResponse doIdempotent(String requestId, String kind, String paramHash,
-                                          Supplier<MutationResponse> action) {
-        DedupPo existing = reviewRepo.findDedup(requestId);
-        if (existing != null) {
-            ensureSameRequest(existing, kind, paramHash);
-            return deserializeReplay(existing);
-        }
-        // 业务异常会触发事务回滚，去重键不会被占用
-        MutationResponse result = action.get();
-        reviewRepo.insertDedup(new DedupPo(requestId, kind, paramHash,
-                writeJson(result), nowMillis()));
-        return result;
-    }
-
-    private void ensureSameRequest(DedupPo existing, String kind, String paramHash) {
-        if (!existing.requestKind().equals(kind) || !existing.requestHash().equals(paramHash)) {
-            throw new ApiException(HttpStatus.CONFLICT, "IDEMPOTENT_PARAM_MISMATCH",
-                    "requestId 已用于参数不同的请求: " + existing.requestId());
-        }
-    }
-
-    private MutationResponse deserializeReplay(DedupPo po) {
-        try {
-            MutationResponse original = objectMapper.readValue(po.responseJson(), MutationResponse.class);
-            // 业务结果原样重放，仅传输标记告知客户端本次为重放
-            return new MutationResponse(original.requestId(), true, original.data());
-        } catch (JsonProcessingException ex) {
-            throw new IllegalStateException("无法解析幂等重放结果: " + po.requestId(), ex);
-        }
-    }
-
     // ============================ 工具方法 ============================
+
+    /** 在高度带列表中找出包含指定巡航高度的带（左闭右开），无命中返回 null。 */
+    private static BandPo matchBand(List<BandPo> bands, int cruiseAltitude) {
+        for (BandPo band : bands) {
+            if (cruiseAltitude >= band.bandLower() && cruiseAltitude < band.bandUpper()) {
+                return band;
+            }
+        }
+        return null;
+    }
 
     private static List<Point> toPoints(List<RoutePointDto> dtos) {
         List<Point> points = new ArrayList<>(dtos.size());
@@ -340,59 +305,34 @@ public class AirspaceReviewService {
                 "航线至少需要两个不同的点");
     }
 
+    /**
+     * 校验巡航高度与 UTC 时段：三者要么全部缺省（null，仅二维审查），
+     * 要么全部提供，且时段为正长度（startTime &lt; endTime）。
+     */
+    static void validateAltitudeWindow(Integer cruiseAltitude, Long startTime, Long endTime) {
+        boolean allNull = cruiseAltitude == null && startTime == null && endTime == null;
+        boolean allPresent = cruiseAltitude != null && startTime != null && endTime != null;
+        if (!allNull && !allPresent) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "ALTITUDE_WINDOW_INCOMPLETE",
+                    "巡航高度与 UTC 起止时刻必须同时提供或同时缺省");
+        }
+        if (allPresent && startTime >= endTime) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "INVALID_TIME_WINDOW",
+                    "UTC 时段必须满足 startTime < endTime");
+        }
+    }
+
     private static ReviewResultDto toDto(ReviewPo po, String conclusion, Boolean current) {
         List<RoutePointDto> snapshot = new ArrayList<>(po.pointsSnapshot().size());
         for (Point p : po.pointsSnapshot()) {
             snapshot.add(new RoutePointDto(p.x(), p.y()));
         }
         return new ReviewResultDto(po.reviewId(), po.routeId(), po.routeVersion(),
-                po.airspaceVersion(), conclusion, List.copyOf(po.hitZoneIds()), snapshot, current);
+                po.airspaceVersion(), conclusion, List.copyOf(po.hitZoneIds()), snapshot, current,
+                po.cruiseAltitude(), po.startTime(), po.endTime());
     }
 
     private long nowMillis() {
         return clock.instant().toEpochMilli();
-    }
-
-    private String writeJson(Object value) {
-        try {
-            return objectMapper.writeValueAsString(value);
-        } catch (JsonProcessingException ex) {
-            throw new IllegalStateException("响应序列化失败", ex);
-        }
-    }
-
-    /**
-     * 计算请求参数的规范化哈希（SHA-256）。
-     * 对象字段按键名字典序递归排序，列表保持顺序，使相同语义参数产生相同哈希、
-     * 字段书写顺序不同不影响比对结果。
-     */
-    private String canonicalHash(Object request) {
-        try {
-            JsonNode sorted = canonicalize(objectMapper.valueToTree(request));
-            String canonical = objectMapper.writeValueAsString(sorted);
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            return HexFormat.of().formatHex(digest.digest(canonical.getBytes(StandardCharsets.UTF_8)));
-        } catch (JsonProcessingException | NoSuchAlgorithmException ex) {
-            throw new IllegalStateException("无法计算请求哈希", ex);
-        }
-    }
-
-    private static JsonNode canonicalize(JsonNode node) {
-        if (node.isObject()) {
-            ObjectNode sorted = JsonNodeFactory.instance.objectNode();
-            List<String> names = new ArrayList<>();
-            node.fieldNames().forEachRemaining(names::add);
-            names.sort(String::compareTo);
-            for (String name : names) {
-                sorted.set(name, canonicalize(node.get(name)));
-            }
-            return sorted;
-        }
-        if (node.isArray()) {
-            ArrayNode array = JsonNodeFactory.instance.arrayNode();
-            node.forEach(child -> array.add(canonicalize(child)));
-            return array;
-        }
-        return node;
     }
 }

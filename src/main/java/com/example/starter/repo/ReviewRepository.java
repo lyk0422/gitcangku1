@@ -30,24 +30,28 @@ public class ReviewRepository {
             rs.getString("conclusion"),
             decodeZoneIds(rs.getString("hit_zone_ids")),
             decodePoints(rs.getString("points_snapshot")),
+            (Integer) rs.getObject("cruise_altitude"),
+            (Long) rs.getObject("start_time"),
+            (Long) rs.getObject("end_time"),
             rs.getString("request_id"),
             rs.getLong("created_at"));
+
+    private static final String REVIEW_COLUMNS =
+            "review_id, route_id, route_version, airspace_version, conclusion, "
+                    + "hit_zone_ids, points_snapshot, cruise_altitude, start_time, end_time, "
+                    + "request_id, created_at";
 
     /** 按 reviewId 查询不可变审核记录，不存在返回 null。 */
     public ReviewPo findReview(String reviewId) {
         return jdbc.query(
-                "SELECT review_id, route_id, route_version, airspace_version, conclusion, "
-                        + "hit_zone_ids, points_snapshot, request_id, created_at "
-                        + "FROM review WHERE review_id = ?",
+                "SELECT " + REVIEW_COLUMNS + " FROM review WHERE review_id = ?",
                 REVIEW_MAPPER, reviewId).stream().findFirst().orElse(null);
     }
 
     /** 查询某航线最新的一条审核记录（按创建时间、reviewId 倒序），没有返回 null。 */
     public ReviewPo findLatestReview(String routeId) {
         return jdbc.query(
-                "SELECT review_id, route_id, route_version, airspace_version, conclusion, "
-                        + "hit_zone_ids, points_snapshot, request_id, created_at "
-                        + "FROM review WHERE route_id = ? "
+                "SELECT " + REVIEW_COLUMNS + " FROM review WHERE route_id = ? "
                         + "ORDER BY created_at DESC, review_id DESC LIMIT 1",
                 REVIEW_MAPPER, routeId).stream().findFirst().orElse(null);
     }
@@ -56,11 +60,33 @@ public class ReviewRepository {
     public void insertReview(ReviewPo po) {
         jdbc.update("INSERT INTO review "
                         + "(review_id, route_id, route_version, airspace_version, conclusion, "
-                        + "hit_zone_ids, points_snapshot, request_id, created_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        + "hit_zone_ids, points_snapshot, cruise_altitude, start_time, end_time, "
+                        + "request_id, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 po.reviewId(), po.routeId(), po.routeVersion(), po.airspaceVersion(),
                 po.conclusion(), encodeZoneIds(po.hitZoneIds()), encodePoints(po.pointsSnapshot()),
+                po.cruiseAltitude(), po.startTime(), po.endTime(),
                 po.requestId(), po.createdAt());
+    }
+
+    /** 插入某条审核的垂直分离明细（调用方负责事务）。 */
+    public void insertVerticalDetail(VerticalDetailPo po) {
+        jdbc.update("INSERT INTO review_vertical_detail "
+                        + "(review_id, zone_id, band_lower, band_upper, vertical_hit, detail_seq) "
+                        + "VALUES (?, ?, ?, ?, ?, ?)",
+                po.reviewId(), po.zoneId(), po.bandLower(), po.bandUpper(),
+                po.verticalHit(), po.detailSeq());
+    }
+
+    /** 查询某条审核的全部垂直分离明细（按明细序号升序）。 */
+    public List<VerticalDetailPo> findVerticalDetails(String reviewId) {
+        return jdbc.query(
+                "SELECT review_id, zone_id, band_lower, band_upper, vertical_hit, detail_seq "
+                        + "FROM review_vertical_detail WHERE review_id = ? ORDER BY detail_seq",
+                (rs, n) -> new VerticalDetailPo(rs.getString("review_id"), rs.getString("zone_id"),
+                        (Integer) rs.getObject("band_lower"), (Integer) rs.getObject("band_upper"),
+                        rs.getBoolean("vertical_hit"), rs.getInt("detail_seq")),
+                reviewId);
     }
 
     /** 查询幂等去重记录，不存在返回 null。 */

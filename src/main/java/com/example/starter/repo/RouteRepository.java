@@ -21,18 +21,13 @@ public class RouteRepository {
 
     /** 按 routeId 查询航线（含当前版本点列），不存在返回 null。 */
     public RoutePo findRoute(String routeId) {
-        Integer version;
         try {
-            version = jdbc.queryForObject(
-                    "SELECT version FROM route WHERE route_id = ?", Integer.class, routeId);
+            return jdbc.queryForObject(
+                    "SELECT route_id, version, cruise_altitude, start_time, end_time "
+                            + "FROM route WHERE route_id = ?", ROUTE_MAPPER, routeId);
         } catch (EmptyResultDataAccessException ex) {
             return null;
         }
-        if (version == null) {
-            return null;
-        }
-        List<Point> points = findPoints(routeId);
-        return new RoutePo(routeId, version, points);
     }
 
     /**
@@ -49,14 +44,22 @@ public class RouteRepository {
         if (locked == 0) {
             return null;
         }
-        Integer version = jdbc.queryForObject(
-                "SELECT version FROM route WHERE route_id = ?", Integer.class, routeId);
-        if (version == null) {
+        RoutePo route = findRoute(routeId);
+        if (route == null) {
             return null;
         }
-        List<Point> points = findPoints(routeId);
-        return new RoutePo(routeId, version, points);
+        return new RoutePo(routeId, route.version(), findPoints(routeId),
+                route.cruiseAltitude(), route.startTime(), route.endTime());
     }
+
+    private final org.springframework.jdbc.core.RowMapper<RoutePo> ROUTE_MAPPER = (rs, n) -> {
+        Integer cruise = (Integer) rs.getObject("cruise_altitude");
+        Long start = (Long) rs.getObject("start_time");
+        Long end = (Long) rs.getObject("end_time");
+        String routeId = rs.getString("route_id");
+        return new RoutePo(routeId, rs.getInt("version"), findPoints(routeId),
+                cruise, start, end);
+    };
 
     private List<Point> findPoints(String routeId) {
         return jdbc.query(
@@ -65,8 +68,11 @@ public class RouteRepository {
     }
 
     /** 创建航线（初始版本 1）并写入点列（调用方负责事务）。 */
-    public void insertRoute(String routeId, List<Point> points) {
-        jdbc.update("INSERT INTO route (route_id, version, touch) VALUES (?, 1, 0)", routeId);
+    public void insertRoute(String routeId, List<Point> points,
+                            Integer cruiseAltitude, Long startTime, Long endTime) {
+        jdbc.update("INSERT INTO route (route_id, version, touch, cruise_altitude, start_time, end_time) "
+                        + "VALUES (?, 1, 0, ?, ?, ?)",
+                routeId, cruiseAltitude, startTime, endTime);
         insertPoints(routeId, points);
     }
 
@@ -81,6 +87,15 @@ public class RouteRepository {
                 "UPDATE route SET version = version + 1, touch = touch + 1 "
                         + "WHERE route_id = ? AND version = ?",
                 routeId, expectedVersion);
+    }
+
+    /** 替换航线版本点列与高度时段属性（调用方负责事务）。 */
+    public void replaceRouteAttributes(String routeId, List<Point> points,
+                                       Integer cruiseAltitude, Long startTime, Long endTime) {
+        jdbc.update("UPDATE route SET cruise_altitude = ?, start_time = ?, end_time = ? "
+                + "WHERE route_id = ?", cruiseAltitude, startTime, endTime, routeId);
+        deletePoints(routeId);
+        insertPoints(routeId, points);
     }
 
     /** 删除航线旧点列（调用方负责事务）。 */

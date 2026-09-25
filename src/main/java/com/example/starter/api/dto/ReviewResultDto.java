@@ -13,6 +13,9 @@ import java.util.List;
  * @param hitZoneIds      BLOCKED 时命中的全部 zoneId（字典序去重），否则为空列表
  * @param pointsSnapshot  审核时不可变的航点快照
  * @param current         仅当前查询返回：当前航线/空域是否仍与审核版本匹配
+ * @param cruiseAltitude  审核时巡航高度快照（米）；null 表示该航线未登记高度
+ * @param startTime       审核时 UTC 时段起始快照，epoch 毫秒（含）；null 表示未登记
+ * @param endTime         审核时 UTC 时段结束快照，epoch 毫秒（不含）；null 表示未登记
  */
 public record ReviewResultDto(
         String reviewId,
@@ -22,5 +25,16 @@ public record ReviewResultDto(
         String conclusion,
         List<String> hitZoneIds,
         List<RoutePointDto> pointsSnapshot,
-        Boolean current) {
+        Boolean current,
+        Integer cruiseAltitude,
+        Long startTime,
+        Long endTime) {
+
+    /** 兼容历史构造：不携带巡航高度与时段快照。 */
+    public ReviewResultDto(String reviewId, String routeId, Integer routeVersion,
+                           Long airspaceVersion, String conclusion, List<String> hitZoneIds,
+                           List<RoutePointDto> pointsSnapshot, Boolean current) {
+        this(reviewId, routeId, routeVersion, airspaceVersion, conclusion, hitZoneIds,
+                pointsSnapshot, current, null, null, null);
+    }
 }
