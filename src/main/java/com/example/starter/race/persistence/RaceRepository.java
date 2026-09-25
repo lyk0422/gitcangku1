@@ -1,8 +1,10 @@
 package com.example.starter.race.persistence;
 
 import com.example.starter.race.domain.EntryStatus;
+import com.example.starter.race.domain.InspectionResult;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
+import com.example.starter.race.domain.RunnerRaceState;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
@@ -30,6 +32,11 @@ public class RaceRepository {
             new CheckpointTimingRowMapper();
     private static final SnapshotCheckpointRowMapper SNAPSHOT_CHECKPOINT_ROW_MAPPER =
             new SnapshotCheckpointRowMapper();
+    private static final InspectionConfigRowMapper INSPECTION_CONFIG_ROW_MAPPER =
+            new InspectionConfigRowMapper();
+    private static final InspectionRowMapper INSPECTION_ROW_MAPPER = new InspectionRowMapper();
+    private static final BindingRowMapper BINDING_ROW_MAPPER = new BindingRowMapper();
+    private static final RunnerStateRowMapper RUNNER_STATE_ROW_MAPPER = new RunnerStateRowMapper();
 
     private final JdbcTemplate jdbcTemplate;
 
@@ -368,12 +375,183 @@ public class RaceRepository {
                 responseStatus, responseBody, requestId);
     }
 
+    /** 查询赛事的器材检录配置；未配置返回 empty（视为不启用门禁、不接受检录提交）。 */
+    public Optional<RaceInspectionConfigRow> findInspectionConfig(String raceId) {
+        return jdbcTemplate
+                .query("SELECT race_id, mandatory, valid_minutes, created_at, updated_at "
+                                + "FROM race_inspection_config WHERE race_id = ?",
+                        INSPECTION_CONFIG_ROW_MAPPER, raceId)
+                .stream()
+                .findFirst();
+    }
+
+    /** 写入或更新赛事检录配置（仅 OPEN 赛事由服务层保证；有效分钟数须为 1~1440）。 */
+    public void upsertInspectionConfig(String raceId, boolean mandatory, int validMinutes, long now) {
+        int updated = jdbcTemplate.update(
+                "UPDATE race_inspection_config SET mandatory = ?, valid_minutes = ?, updated_at = ? "
+                        + "WHERE race_id = ?",
+                mandatory, validMinutes, now, raceId);
+        if (updated == 0) {
+            jdbcTemplate.update(
+                    "INSERT INTO race_inspection_config (race_id, mandatory, valid_minutes, created_at, updated_at) "
+                            + "VALUES (?, ?, ?, ?, ?)",
+                    raceId, mandatory, validMinutes, now, now);
+        }
+    }
+
+    /** 追加一条不可变检录历史记录；inspectionId 全局唯一由主键约束保证。 */
+    public void insertInspection(EquipmentInspectionRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO equipment_inspection "
+                        + "(inspection_id, race_id, bib, equipment_serial, result, valid_minutes, "
+                        + "inspected_at, valid_until, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                row.inspectionId(), row.raceId(), row.bib(), row.equipmentSerial(),
+                row.result().name(), row.validMinutes(), row.inspectedAt(),
+                row.validUntil(), row.createdAt());
+    }
+
+    /** 按全局检录ID查询记录（用于 inspectionKey 幂等重放/异参冲突）。 */
+    public Optional<EquipmentInspectionRow> findInspection(String inspectionId) {
+        return jdbcTemplate
+                .query("SELECT id, inspection_id, race_id, bib, equipment_serial, result, valid_minutes, "
+                                + "inspected_at, valid_until, created_at "
+                                + "FROM equipment_inspection WHERE inspection_id = ?",
+                        INSPECTION_ROW_MAPPER, inspectionId)
+                .stream()
+                .findFirst();
+    }
+
+    /** 查询选手最近一条检录记录（同毫秒按自增 id 大者优先）；无记录返回 empty。 */
+    public Optional<EquipmentInspectionRow> findLatestInspection(String raceId, String bib) {
+        return jdbcTemplate
+                .query("SELECT id, inspection_id, race_id, bib, equipment_serial, result, valid_minutes, "
+                                + "inspected_at, valid_until, created_at "
+                                + "FROM equipment_inspection WHERE race_id = ? AND bib = ? "
+                                + "ORDER BY inspected_at DESC, id DESC LIMIT 1",
+                        INSPECTION_ROW_MAPPER, raceId, bib)
+                .stream()
+                .findFirst();
+    }
+
+    /** 查询选手全部检录历史，按检录时刻与自增 id 升序（不可变，复检不删除旧记录）。 */
+    public List<EquipmentInspectionRow> findInspectionsForRunner(String raceId, String bib) {
+        return jdbcTemplate.query(
+                "SELECT id, inspection_id, race_id, bib, equipment_serial, result, valid_minutes, "
+                        + "inspected_at, valid_until, created_at "
+                        + "FROM equipment_inspection WHERE race_id = ? AND bib = ? "
+                        + "ORDER BY inspected_at, id",
+                INSPECTION_ROW_MAPPER, raceId, bib);
+    }
+
+    /** 查询某器材序列号在赛事内的当前活跃绑定；无活跃绑定返回 empty。 */
+    public Optional<EquipmentBindingRow> findActiveBinding(String raceId, String equipmentSerial) {
+        return jdbcTemplate
+                .query("SELECT id, race_id, equipment_serial, bib, inspection_id, bound_at, "
+                                + "released_at, release_reason "
+                                + "FROM equipment_binding "
+                                + "WHERE race_id = ? AND equipment_serial = ? AND released_at IS NULL",
+                        BINDING_ROW_MAPPER, raceId, equipmentSerial)
+                .stream()
+                .findFirst();
+    }
+
+    /** 查询选手当前活跃绑定；无返回 empty。 */
+    public Optional<EquipmentBindingRow> findActiveBindingForRunner(String raceId, String bib) {
+        return jdbcTemplate
+                .query("SELECT id, race_id, equipment_serial, bib, inspection_id, bound_at, "
+                                + "released_at, release_reason "
+                                + "FROM equipment_binding "
+                                + "WHERE race_id = ? AND bib = ? AND released_at IS NULL",
+                        BINDING_ROW_MAPPER, raceId, bib)
+                .stream()
+                .findFirst();
+    }
+
+    /** 查询赛事全部活跃器材绑定，按器材序列号与参赛号稳定排序。 */
+    public List<EquipmentBindingRow> findActiveBindings(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT id, race_id, equipment_serial, bib, inspection_id, bound_at, "
+                        + "released_at, release_reason "
+                        + "FROM equipment_binding WHERE race_id = ? AND released_at IS NULL "
+                        + "ORDER BY equipment_serial, bib",
+                BINDING_ROW_MAPPER, raceId);
+    }
+
+    /** 新增活跃器材绑定；active_slot 唯一约束兜底“同器材同赛事唯一活跃绑定”。 */
+    public void insertBinding(
+            String raceId, String equipmentSerial, String bib, String inspectionId, long now) {
+        jdbcTemplate.update(
+                "INSERT INTO equipment_binding "
+                        + "(race_id, equipment_serial, bib, inspection_id, bound_at, "
+                        + "released_at, release_reason, active_slot) "
+                        + "VALUES (?, ?, ?, ?, ?, NULL, NULL, ?)",
+                raceId, equipmentSerial, bib, inspectionId, now,
+                raceId + "|" + equipmentSerial);
+    }
+
+    /** 释放指定活跃绑定；返回受影响行数（0 表示已被并发释放）。 */
+    public int releaseBinding(long bindingId, String releaseReason, long now) {
+        return jdbcTemplate.update(
+                "UPDATE equipment_binding SET released_at = ?, release_reason = ?, active_slot = NULL "
+                        + "WHERE id = ? AND released_at IS NULL",
+                now, releaseReason, bindingId);
+    }
+
+    /** 查询选手起跑/退赛状态；无状态行（历史数据）返回 empty，调用方按 REGISTERED 处理。 */
+    public Optional<RunnerRaceStateRow> findRunnerState(String raceId, String bib) {
+        return jdbcTemplate
+                .query("SELECT race_id, bib, state, started_at, withdrawn_at, reason, created_at, updated_at "
+                                + "FROM runner_race_state WHERE race_id = ? AND bib = ?",
+                        RUNNER_STATE_ROW_MAPPER, raceId, bib)
+                .stream()
+                .findFirst();
+    }
+
+    /** 为选手创建初始状态行（REGISTERED）。 */
+    public void insertRunnerState(String raceId, String bib, long now) {
+        jdbcTemplate.update(
+                "INSERT INTO runner_race_state "
+                        + "(race_id, bib, state, started_at, withdrawn_at, reason, created_at, updated_at) "
+                        + "VALUES (?, ?, 'REGISTERED', NULL, NULL, NULL, ?, ?)",
+                raceId, bib, now, now);
+    }
+
+    /**
+     * 条件置为已起跑：仅当当前状态为 REGISTERED 时生效（首个分段计时或显式起跑共用）。
+     *
+     * @return 受影响行数；0 表示状态行不存在或已起跑/已退赛
+     */
+    public int markStartedIfRegistered(String raceId, String bib, long now) {
+        return jdbcTemplate.update(
+                "UPDATE runner_race_state SET state = 'STARTED', started_at = ?, updated_at = ? "
+                        + "WHERE race_id = ? AND bib = ? AND state = 'REGISTERED'",
+                now, now, raceId, bib);
+    }
+
+    /**
+     * 条件置为已退赛：仅当当前状态非 WITHDRAWN 时生效。
+     *
+     * @return 受影响行数；0 表示状态行不存在或已退赛
+     */
+    public int markWithdrawnIfNotWithdrawn(String raceId, String bib, String reason, long now) {
+        return jdbcTemplate.update(
+                "UPDATE runner_race_state SET state = 'WITHDRAWN', withdrawn_at = ?, reason = ?, "
+                        + "updated_at = ? "
+                        + "WHERE race_id = ? AND bib = ? AND state <> 'WITHDRAWN'",
+                now, reason, now, raceId, bib);
+    }
+
     /** 测试辅助：清空全部业务数据，按外键依赖顺序删除。 */
     public void deleteAllForTesting() {
         jdbcTemplate.update("DELETE FROM result_snapshot_checkpoint");
         jdbcTemplate.update("DELETE FROM result_snapshot_entry");
         jdbcTemplate.update("DELETE FROM result_snapshot");
         jdbcTemplate.update("DELETE FROM idempotency_record");
+        jdbcTemplate.update("DELETE FROM equipment_binding");
+        jdbcTemplate.update("DELETE FROM equipment_inspection");
+        jdbcTemplate.update("DELETE FROM race_inspection_config");
+        jdbcTemplate.update("DELETE FROM runner_race_state");
         jdbcTemplate.update("DELETE FROM checkpoint_timing");
         jdbcTemplate.update("DELETE FROM checkpoint");
         jdbcTemplate.update("DELETE FROM penalty");
@@ -488,6 +666,65 @@ public class RaceRepository {
                     rs.getInt("response_status"),
                     rs.getString("response_body"),
                     rs.getLong("created_at"));
+        }
+    }
+
+    private static final class InspectionConfigRowMapper implements RowMapper<RaceInspectionConfigRow> {
+        @Override
+        public RaceInspectionConfigRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new RaceInspectionConfigRow(
+                    rs.getString("race_id"),
+                    rs.getBoolean("mandatory"),
+                    rs.getInt("valid_minutes"),
+                    rs.getLong("created_at"),
+                    rs.getLong("updated_at"));
+        }
+    }
+
+    private static final class InspectionRowMapper implements RowMapper<EquipmentInspectionRow> {
+        @Override
+        public EquipmentInspectionRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new EquipmentInspectionRow(
+                    rs.getLong("id"),
+                    rs.getString("inspection_id"),
+                    rs.getString("race_id"),
+                    rs.getString("bib"),
+                    rs.getString("equipment_serial"),
+                    InspectionResult.valueOf(rs.getString("result")),
+                    rs.getInt("valid_minutes"),
+                    rs.getLong("inspected_at"),
+                    (Long) rs.getObject("valid_until"),
+                    rs.getLong("created_at"));
+        }
+    }
+
+    private static final class BindingRowMapper implements RowMapper<EquipmentBindingRow> {
+        @Override
+        public EquipmentBindingRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new EquipmentBindingRow(
+                    rs.getLong("id"),
+                    rs.getString("race_id"),
+                    rs.getString("equipment_serial"),
+                    rs.getString("bib"),
+                    rs.getString("inspection_id"),
+                    rs.getLong("bound_at"),
+                    (Long) rs.getObject("released_at"),
+                    rs.getString("release_reason"));
+        }
+    }
+
+    private static final class RunnerStateRowMapper implements RowMapper<RunnerRaceStateRow> {
+        @Override
+        public RunnerRaceStateRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new RunnerRaceStateRow(
+                    rs.getString("race_id"),
+                    rs.getString("bib"),
+                    RunnerRaceState.valueOf(rs.getString("state")),
+                    (Long) rs.getObject("started_at"),
+                    (Long) rs.getObject("withdrawn_at"),
+                    rs.getString("reason"),
+                    rs.getLong("created_at"),
+                    rs.getLong("updated_at"));
         }
     }
 }

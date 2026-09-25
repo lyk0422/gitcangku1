@@ -87,6 +87,71 @@ public class RaceController {
         return toResponse(raceService.sealRace(raceId, request));
     }
 
+    /** 配置赛事器材检录（是否强制及有效分钟数）。 */
+    @PostMapping("/{raceId}/inspection-config")
+    public ResponseEntity<Object> configureInspection(
+            @PathVariable String raceId,
+            @Valid @RequestBody ConfigureInspectionRequest request) {
+        return toResponse(raceService.configureInspection(raceId, request));
+    }
+
+    /** 选手提交器材检录/复检。 */
+    @PostMapping("/{raceId}/runners/{bib}/inspections")
+    public ResponseEntity<Object> submitInspection(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody SubmitInspectionRequest request) {
+        return toResponse(raceService.submitInspection(raceId, bib, request));
+    }
+
+    /** 选手起跑（强制检录赛事须持有未过期PASS）。 */
+    @PostMapping("/{raceId}/runners/{bib}/start")
+    public ResponseEntity<Object> startRunner(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody StartRunnerRequest request) {
+        return toResponse(raceService.startRunner(raceId, bib, request));
+    }
+
+    /** 选手退赛并释放器材绑定。 */
+    @PostMapping("/{raceId}/runners/{bib}/withdrawal")
+    public ResponseEntity<Object> withdrawRunner(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody WithdrawRunnerRequest request) {
+        return toResponse(raceService.withdrawRunner(raceId, bib, request));
+    }
+
+    /** 查询选手检录历史（不可变，复检只追加）。 */
+    @GetMapping("/{raceId}/runners/{bib}/inspections")
+    public InspectionHistoryResponse getInspectionHistory(
+            @PathVariable String raceId,
+            @PathVariable String bib) {
+        return raceService.getInspectionHistory(raceId, bib);
+    }
+
+    /** 查询选手当前检录有效状态。 */
+    @GetMapping("/{raceId}/runners/{bib}/inspection-status")
+    public InspectionStatusResponse getInspectionStatus(
+            @PathVariable String raceId,
+            @PathVariable String bib) {
+        return raceService.getInspectionStatus(raceId, bib);
+    }
+
+    /** 查询赛事当前活跃器材绑定清单。 */
+    @GetMapping("/{raceId}/equipment-bindings")
+    public EquipmentBindingsResponse getEquipmentBindings(@PathVariable String raceId) {
+        return raceService.getEquipmentBindings(raceId);
+    }
+
+    /** 查询选手起跑/退赛状态。 */
+    @GetMapping("/{raceId}/runners/{bib}/race-state")
+    public RunnerRaceStateResponse getRunnerState(
+            @PathVariable String raceId,
+            @PathVariable String bib) {
+        return raceService.getRunnerState(raceId, bib);
+    }
+
     /** 查询即时成绩（封榜后返回只读快照内容）。 */
     @GetMapping("/{raceId}/results")
     public StandingResponse getResults(@PathVariable String raceId) {

@@ -95,9 +95,64 @@ CREATE TABLE IF NOT EXISTS result_snapshot_checkpoint (
     CONSTRAINT fk_snapshot_checkpoint_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
 );
 
+CREATE TABLE IF NOT EXISTS race_inspection_config (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID；仅OPEN赛事可配置，配置后不可修改',
+    mandatory BOOLEAN NOT NULL COMMENT '是否强制器材检录：TRUE-起跑/首个分段计时前须有未过期PASS，FALSE-不启用起跑门禁',
+    valid_minutes INT NOT NULL COMMENT '检录PASS有效分钟数（取值1~1440），提交检录时快照到每条记录',
+    created_at BIGINT NOT NULL COMMENT '配置时间，Unix毫秒时间戳',
+    updated_at BIGINT NOT NULL COMMENT '最近配置变更时间，Unix毫秒时间戳',
+    CONSTRAINT pk_race_inspection_config PRIMARY KEY (race_id),
+    CONSTRAINT fk_inspection_config_race FOREIGN KEY (race_id) REFERENCES race (race_id)
+);
+
+CREATE TABLE IF NOT EXISTS equipment_inspection (
+    id BIGINT NOT NULL AUTO_INCREMENT COMMENT '自增主键，仅用于同毫秒内稳定判定“最近一条”',
+    inspection_id VARCHAR(128) NOT NULL COMMENT '检录记录ID（即选手提交的inspectionKey），全局唯一；复检也新插一行，历史不可变不可删',
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    bib VARCHAR(64) NOT NULL COMMENT '选手参赛号',
+    equipment_serial VARCHAR(128) NOT NULL COMMENT '器材序列号；FAIL记录同样留档但不产生绑定',
+    result VARCHAR(4) NOT NULL COMMENT '检录结果：PASS-通过（有效至valid_until），FAIL-不通过（立即阻断起跑）',
+    valid_minutes INT NOT NULL COMMENT '提交时赛事配置的有效分钟数快照（1~1440）',
+    inspected_at BIGINT NOT NULL COMMENT '检录提交时刻，Unix毫秒时间戳（服务端可注入时钟）',
+    valid_until BIGINT COMMENT 'PASS有效期截止时刻=inspected_at+valid_minutes*60000，含端点；FAIL为NULL',
+    created_at BIGINT NOT NULL COMMENT '记录入库时间，Unix毫秒时间戳',
+    CONSTRAINT pk_equipment_inspection PRIMARY KEY (inspection_id),
+    CONSTRAINT fk_inspection_runner FOREIGN KEY (race_id, bib) REFERENCES runner (race_id, bib),
+    INDEX idx_inspection_race_bib (race_id, bib, inspected_at)
+);
+
+CREATE TABLE IF NOT EXISTS equipment_binding (
+    id BIGINT NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    equipment_serial VARCHAR(128) NOT NULL COMMENT '被绑定的器材序列号',
+    bib VARCHAR(64) NOT NULL COMMENT '持绑选手参赛号；同一赛事同一器材同一时刻仅可绑定一名未完赛选手',
+    inspection_id VARCHAR(128) NOT NULL COMMENT '产生本次绑定的PASS检录记录ID',
+    bound_at BIGINT NOT NULL COMMENT '绑定生效时间，Unix毫秒时间戳',
+    released_at BIGINT COMMENT '绑定释放时间，Unix毫秒时间戳；NULL表示绑定仍活跃',
+    release_reason VARCHAR(24) COMMENT '释放原因：RE_INSPECTED-被本人新检录替换，WITHDRAWN-退赛，DISQUALIFIED-取消资格，FINISHED-完赛；活跃绑定为NULL',
+    active_slot VARCHAR(200) COMMENT '活跃绑定唯一槽=race_id|equipment_serial，活跃时非空，释放后置NULL；借助UNIQUE(多NULL相容)由数据库保证同器材不重复活跃绑定',
+    CONSTRAINT pk_equipment_binding PRIMARY KEY (id),
+    CONSTRAINT uk_equipment_binding_active UNIQUE (active_slot),
+    CONSTRAINT fk_binding_inspection FOREIGN KEY (inspection_id) REFERENCES equipment_inspection (inspection_id),
+    INDEX idx_binding_race_bib (race_id, bib)
+);
+
+CREATE TABLE IF NOT EXISTS runner_race_state (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    bib VARCHAR(64) NOT NULL COMMENT '选手参赛号',
+    state VARCHAR(16) NOT NULL COMMENT '起跑/退赛状态：REGISTERED-已登记未起跑，STARTED-已起跑，WITHDRAWN-已退赛；完赛与取消资格分别由runner.finish_time_ms与生效DISQUALIFY处罚表达',
+    started_at BIGINT COMMENT '起跑时间，Unix毫秒时间戳；未起跑为NULL',
+    withdrawn_at BIGINT COMMENT '退赛时间，Unix毫秒时间戳；未退赛为NULL',
+    reason VARCHAR(256) COMMENT '退赛原因；未退赛为NULL',
+    created_at BIGINT NOT NULL COMMENT '状态行创建时间，Unix毫秒时间戳',
+    updated_at BIGINT NOT NULL COMMENT '最近状态变更时间，Unix毫秒时间戳',
+    CONSTRAINT pk_runner_race_state PRIMARY KEY (race_id, bib),
+    CONSTRAINT fk_runner_state_runner FOREIGN KEY (race_id, bib) REFERENCES runner (race_id, bib)
+);
+
 CREATE TABLE IF NOT EXISTS idempotency_record (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求ID（写操作幂等键）',
-    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE',
+    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE/CONFIGURE_INSPECTION/SUBMIT_INSPECTION/START_RUNNER/WITHDRAW_RUNNER',
     request_digest CHAR(64) NOT NULL COMMENT '请求参数（requestId除外，含expectedVersion）规范化JSON的SHA-256摘要',
     response_status INT NOT NULL COMMENT '原成功请求的HTTP状态码，重放时原样返回',
     response_body TEXT COMMENT '原成功响应体JSON，重放时原样返回',

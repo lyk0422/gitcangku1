@@ -4,27 +4,45 @@ import com.example.starter.race.api.AddPenaltyRequest;
 import com.example.starter.race.api.CheckpointResponse;
 import com.example.starter.race.api.CheckpointsConfigResponse;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
+import com.example.starter.race.api.ConfigureInspectionRequest;
 import com.example.starter.race.api.CreateRaceRequest;
+import com.example.starter.race.api.EquipmentBindingResponse;
+import com.example.starter.race.api.EquipmentBindingsResponse;
+import com.example.starter.race.api.InspectionConfigResponse;
+import com.example.starter.race.api.InspectionHistoryResponse;
+import com.example.starter.race.api.InspectionRecordResponse;
+import com.example.starter.race.api.InspectionStatusResponse;
 import com.example.starter.race.api.MissingCheckpointsResponse;
 import com.example.starter.race.api.RaceResponse;
 import com.example.starter.race.api.RegisterRunnerRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
 import com.example.starter.race.api.RunnerMissingCheckpointsResponse;
+import com.example.starter.race.api.RunnerRaceStateResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
+import com.example.starter.race.api.StartRunnerRequest;
 import com.example.starter.race.api.StandingResponse;
+import com.example.starter.race.api.SubmitInspectionRequest;
 import com.example.starter.race.api.SubmitTimingRequest;
+import com.example.starter.race.api.WithdrawRunnerRequest;
 import com.example.starter.race.domain.CheckpointRules;
+import com.example.starter.race.domain.InspectionGate;
+import com.example.starter.race.domain.InspectionResult;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
+import com.example.starter.race.domain.RunnerRaceState;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
+import com.example.starter.race.persistence.EquipmentBindingRow;
+import com.example.starter.race.persistence.EquipmentInspectionRow;
 import com.example.starter.race.persistence.IdempotencyRow;
 import com.example.starter.race.persistence.PenaltyRow;
+import com.example.starter.race.persistence.RaceInspectionConfigRow;
 import com.example.starter.race.persistence.RaceRow;
+import com.example.starter.race.persistence.RunnerRaceStateRow;
 import com.example.starter.race.persistence.RunnerRow;
 import com.example.starter.race.persistence.SnapshotCheckpointRow;
 import com.example.starter.race.persistence.SnapshotEntryRow;
@@ -119,6 +137,8 @@ public class RaceServiceImpl implements RaceService {
                     } catch (DuplicateKeyException ex) {
                         throw new ConflictException("参赛号已存在: " + request.bib());
                     }
+                    // 为新选手建立起跑/退赛状态行：已登记未起跑。
+                    repository.insertRunnerState(raceId, request.bib(), now);
                     RunnerRow runner = repository.findRunner(raceId, request.bib()).orElseThrow();
                     return ServiceResult.created(ResponseMapper.toRunnerResponse(runner));
                 });
@@ -153,6 +173,10 @@ public class RaceServiceImpl implements RaceService {
                             raceId, request.bib(), request.finishTimeMs(), now);
                     if (updated == 0) {
                         throw new NotFoundException("选手不存在: " + request.bib());
+                    }
+                    // 修订后首次具备完赛耗时视为完赛，释放器材绑定（后续修订不再重复释放）。
+                    if (runner.finishTimeMs() == null) {
+                        releaseActiveBinding(raceId, request.bib(), "FINISHED", now);
                     }
                     RunnerRow refreshedRunner =
                             repository.findRunner(raceId, request.bib()).orElseThrow();
@@ -195,6 +219,10 @@ public class RaceServiceImpl implements RaceService {
                         throw new ConflictException("处罚ID已存在: " + request.penaltyId());
                     }
                     PenaltyRow penalty = repository.findPenalty(request.penaltyId()).orElseThrow();
+                    // 取消资格立即生效：释放该选手器材绑定供他人复检 PASS 使用（撤销处罚不回收绑定）。
+                    if (type == PenaltyType.DISQUALIFY) {
+                        releaseActiveBinding(raceId, request.bib(), "DISQUALIFIED", now);
+                    }
                     return ServiceResult.created(ResponseMapper.toPenaltyResponse(penalty));
                 });
     }
@@ -303,8 +331,21 @@ public class RaceServiceImpl implements RaceService {
                     if (violation != null) {
                         throw new UnprocessableEntityException(violation);
                     }
+                    // 首个分段计时即起跑：未起跑时强制检录赛事先过起跑门禁（按可注入时钟）。
+                    RunnerRaceStateRow state = currentRunnerState(raceId, bib);
+                    if (state.state() == RunnerRaceState.WITHDRAWN) {
+                        throw new ConflictException("选手已退赛，不能提交分段记录: " + bib);
+                    }
+                    boolean firstStart = state.state() == RunnerRaceState.REGISTERED;
+                    if (firstStart) {
+                        enforceInspectionGate(raceId, bib, clock.millis());
+                    }
                     bumpVersion(race, request.expectedVersion());
                     long now = clock.millis();
+                    if (firstStart) {
+                        // 门禁通过后将选手置为已起跑（显式起跑与首个分段计时共用同一状态转移）。
+                        repository.markStartedIfRegistered(raceId, bib, now);
+                    }
                     CheckpointTimingRow row = new CheckpointTimingRow(
                             request.timingId(), raceId, bib, request.checkpointCode(),
                             checkpoint.position(), elapsedMillis, now);
@@ -496,6 +537,311 @@ public class RaceServiceImpl implements RaceService {
         SnapshotRow snapshot = repository.findSnapshot(raceId)
                 .orElseThrow(() -> new NotFoundException("赛事尚未封榜: " + raceId));
         return ResponseMapper.snapshotStanding(snapshot);
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult configureInspection(String raceId, ConfigureInspectionRequest request) {
+        return withIdempotency(request.requestId(), "CONFIGURE_INSPECTION",
+                orderedParams(
+                        "raceId", raceId,
+                        "mandatory", request.mandatory(),
+                        "validMinutes", request.validMinutes(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    int validMinutes = request.validMinutes();
+                    if (validMinutes < 1 || validMinutes > 1440) {
+                        throw new BadRequestException("检录有效分钟数必须在 1~1440 之间");
+                    }
+                    long now = clock.millis();
+                    bumpVersion(race, request.expectedVersion());
+                    repository.upsertInspectionConfig(
+                            raceId, request.mandatory(), validMinutes, now);
+                    RaceInspectionConfigRow config =
+                            repository.findInspectionConfig(raceId).orElseThrow();
+                    RaceRow refreshed = repository.findRace(raceId).orElseThrow();
+                    return ServiceResult.ok(new InspectionConfigResponse(
+                            raceId, refreshed.version(), config.mandatory(),
+                            config.validMinutes(), config.createdAt(), config.updatedAt()));
+                });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult submitInspection(String raceId, String bib, SubmitInspectionRequest request) {
+        return withIdempotency(request.requestId(), "SUBMIT_INSPECTION",
+                orderedParams(
+                        "raceId", raceId,
+                        "bib", bib,
+                        "inspectionKey", request.inspectionKey(),
+                        "equipmentSerial", request.equipmentSerial(),
+                        "result", request.result(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    // inspectionKey 是第二层全局幂等键：同参重放原结果，异参409。
+                    EquipmentInspectionRow existingInspection =
+                            repository.findInspection(request.inspectionKey()).orElse(null);
+                    if (existingInspection != null) {
+                        return replayInspectionOrConflict(raceId, bib, request, existingInspection);
+                    }
+
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    RunnerRow runner = requireRunner(raceId, bib);
+                    if (currentRunnerState(raceId, bib).state() == RunnerRaceState.WITHDRAWN) {
+                        throw new ConflictException("选手已退赛，不能提交检录: " + bib);
+                    }
+                    RaceInspectionConfigRow config = repository.findInspectionConfig(raceId)
+                            .orElseThrow(() -> new UnprocessableEntityException(
+                                    "赛事尚未配置器材检录: " + raceId));
+                    InspectionResult result;
+                    try {
+                        result = InspectionResult.valueOf(request.result());
+                    } catch (IllegalArgumentException ex) {
+                        throw new BadRequestException("检录结果仅允许 PASS 或 FAIL: " + request.result());
+                    }
+                    long now = clock.millis();
+                    Long validUntil = result == InspectionResult.PASS
+                            ? now + config.validMinutes() * 60_000L
+                            : null;
+                    // 仅未完赛选手的 PASS 才占用器材绑定：未退赛、无生效取消资格、尚未申报完赛耗时。
+                    // （登记时已带 finishTimeMs 视为已完赛；无耗时者在 reviseTime 补录完赛时释放。）
+                    boolean occupiesBinding = result == InspectionResult.PASS
+                            && runner.finishTimeMs() == null
+                            && currentRunnerState(raceId, bib).state() != RunnerRaceState.WITHDRAWN
+                            && !hasActiveDisqualification(raceId, bib);
+                    // PASS 前先判定器材唯一性：同赛事同器材已绑定另一名未完赛选手即409。
+                    EquipmentBindingRow serialBinding = occupiesBinding
+                            ? repository.findActiveBinding(raceId, request.equipmentSerial())
+                                    .orElse(null)
+                            : null;
+                    if (serialBinding != null && !serialBinding.bib().equals(bib)) {
+                        throw new ConflictException(
+                                "器材序列号已绑定另一名未完赛选手: " + request.equipmentSerial());
+                    }
+                    bumpVersion(race, request.expectedVersion());
+                    EquipmentInspectionRow row = new EquipmentInspectionRow(
+                            0L, request.inspectionKey(), raceId, bib,
+                            request.equipmentSerial(), result, config.validMinutes(),
+                            now, validUntil, now);
+                    try {
+                        repository.insertInspection(row);
+                    } catch (DuplicateKeyException ex) {
+                        EquipmentInspectionRow concurrent =
+                                repository.findInspection(request.inspectionKey()).orElseThrow();
+                        return replayInspectionOrConflict(raceId, bib, request, concurrent);
+                    }
+                    if (occupiesBinding) {
+                        // 复检 PASS：先释放本人此前的活跃绑定（FAIL 阻断后复检或换新器材复检均覆盖）。
+                        EquipmentBindingRow ownBinding =
+                                repository.findActiveBindingForRunner(raceId, bib).orElse(null);
+                        if (ownBinding != null) {
+                            repository.releaseBinding(ownBinding.id(), "RE_INSPECTED", now);
+                        }
+                        try {
+                            repository.insertBinding(
+                                    raceId, request.equipmentSerial(), bib,
+                                    request.inspectionKey(), now);
+                        } catch (DuplicateKeyException ex) {
+                            // 唯一槽约束兜底并发下的同器材二次 PASS。
+                            throw new ConflictException(
+                                    "器材序列号已绑定另一名未完赛选手: "
+                                            + request.equipmentSerial());
+                        }
+                    }
+                    EquipmentInspectionRow saved =
+                            repository.findInspection(request.inspectionKey()).orElseThrow();
+                    return ServiceResult.created(toInspectionResponse(saved));
+                });
+    }
+
+    private ServiceResult replayInspectionOrConflict(
+            String raceId,
+            String bib,
+            SubmitInspectionRequest request,
+            EquipmentInspectionRow existing) {
+        boolean sameParams = existing.raceId().equals(raceId)
+                && existing.bib().equals(bib)
+                && existing.equipmentSerial().equals(request.equipmentSerial())
+                && existing.result().name().equals(request.result());
+        if (!sameParams) {
+            throw new ConflictException(
+                    "inspectionKey 已用于不同参数的检录记录: " + request.inspectionKey());
+        }
+        return ServiceResult.created(toInspectionResponse(existing));
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult startRunner(String raceId, String bib, StartRunnerRequest request) {
+        return withIdempotency(request.requestId(), "START_RUNNER",
+                orderedParams(
+                        "raceId", raceId,
+                        "bib", bib,
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    requireRunner(raceId, bib);
+                    RunnerRaceStateRow state = currentRunnerState(raceId, bib);
+                    if (state.state() == RunnerRaceState.WITHDRAWN) {
+                        throw new ConflictException("选手已退赛，不能起跑: " + bib);
+                    }
+                    if (state.state() == RunnerRaceState.STARTED) {
+                        throw new ConflictException("选手已起跑: " + bib);
+                    }
+                    long now = clock.millis();
+                    // 强制检录赛事：不存在、已过期或最新结果 FAIL 均422，不写入计时/起跑。
+                    enforceInspectionGate(raceId, bib, now);
+                    bumpVersion(race, request.expectedVersion());
+                    int updated = repository.markStartedIfRegistered(raceId, bib, now);
+                    if (updated == 0) {
+                        throw new ConflictException("选手状态已变化，起跑失败: " + bib);
+                    }
+                    return ServiceResult.ok(toRunnerStateResponse(
+                            repository.findRunnerState(raceId, bib).orElseThrow()));
+                });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult withdrawRunner(String raceId, String bib, WithdrawRunnerRequest request) {
+        return withIdempotency(request.requestId(), "WITHDRAW_RUNNER",
+                orderedParams(
+                        "raceId", raceId,
+                        "bib", bib,
+                        "reason", request.reason(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    requireRunner(raceId, bib);
+                    RunnerRaceStateRow state = currentRunnerState(raceId, bib);
+                    if (state.state() == RunnerRaceState.WITHDRAWN) {
+                        throw new ConflictException("选手已退赛: " + bib);
+                    }
+                    long now = clock.millis();
+                    bumpVersion(race, request.expectedVersion());
+                    int updated = repository.markWithdrawnIfNotWithdrawn(
+                            raceId, bib, request.reason(), now);
+                    if (updated == 0) {
+                        throw new ConflictException("选手已退赛: " + bib);
+                    }
+                    // 退赛释放器材绑定，其他选手此后可绑定该序列号。
+                    releaseActiveBinding(raceId, bib, "WITHDRAWN", now);
+                    return ServiceResult.ok(toRunnerStateResponse(
+                            repository.findRunnerState(raceId, bib).orElseThrow()));
+                });
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public InspectionHistoryResponse getInspectionHistory(String raceId, String bib) {
+        repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        requireRunner(raceId, bib);
+        List<InspectionRecordResponse> records =
+                repository.findInspectionsForRunner(raceId, bib).stream()
+                        .map(this::toInspectionResponse)
+                        .toList();
+        return new InspectionHistoryResponse(raceId, bib, records);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public InspectionStatusResponse getInspectionStatus(String raceId, String bib) {
+        repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        requireRunner(raceId, bib);
+        RaceInspectionConfigRow config = repository.findInspectionConfig(raceId).orElse(null);
+        long now = clock.millis();
+        EquipmentInspectionRow latest =
+                repository.findLatestInspection(raceId, bib).orElse(null);
+        boolean mandatory = config != null && config.mandatory();
+        String effective;
+        if (!mandatory) {
+            effective = "NOT_REQUIRED";
+        } else if (latest == null) {
+            effective = "NONE";
+        } else if (latest.result() == InspectionResult.FAIL) {
+            effective = "FAIL";
+        } else if (now > latest.validUntil()) {
+            effective = "EXPIRED";
+        } else {
+            effective = "PASS_VALID";
+        }
+        return new InspectionStatusResponse(
+                raceId, bib, mandatory, effective,
+                latest == null ? null : toInspectionResponse(latest), now);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public EquipmentBindingsResponse getEquipmentBindings(String raceId) {
+        repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        List<EquipmentBindingResponse> bindings = repository.findActiveBindings(raceId).stream()
+                .map(row -> new EquipmentBindingResponse(
+                        row.equipmentSerial(), row.bib(), row.inspectionId(), row.boundAt()))
+                .toList();
+        return new EquipmentBindingsResponse(raceId, bindings);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public RunnerRaceStateResponse getRunnerState(String raceId, String bib) {
+        repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        requireRunner(raceId, bib);
+        return toRunnerStateResponse(currentRunnerState(raceId, bib));
+    }
+
+    /**
+     * 强制检录起跑门禁：非强制/未配置赛事直接放行；
+     * 否则按可注入时钟校验最近一条检录，未通过抛 422（调用方不得继续写入）。
+     */
+    private void enforceInspectionGate(String raceId, String bib, long now) {
+        RaceInspectionConfigRow config = repository.findInspectionConfig(raceId).orElse(null);
+        boolean mandatory = config != null && config.mandatory();
+        EquipmentInspectionRow latest =
+                repository.findLatestInspection(raceId, bib).orElse(null);
+        InspectionGate.Verdict verdict = InspectionGate.evaluate(mandatory, latest, now);
+        if (verdict != InspectionGate.Verdict.ALLOWED) {
+            throw new UnprocessableEntityException(InspectionGate.reasonOf(verdict));
+        }
+    }
+
+    /** 释放选手当前活跃器材绑定；无活跃绑定时为空操作。 */
+    private void releaseActiveBinding(
+            String raceId, String bib, String releaseReason, long now) {
+        repository.findActiveBindingForRunner(raceId, bib)
+                .ifPresent(binding ->
+                        repository.releaseBinding(binding.id(), releaseReason, now));
+    }
+
+    /** 选手是否存在生效（未撤销）的取消资格处罚；生效 DQ 视为已退出竞争，不占用器材绑定。 */
+    private boolean hasActiveDisqualification(String raceId, String bib) {
+        return repository.findPenalties(raceId).stream()
+                .anyMatch(penalty -> penalty.bib().equals(bib)
+                        && penalty.type() == PenaltyType.DISQUALIFY
+                        && !penalty.revoked());
+    }
+
+    /** 读取选手起跑/退赛状态；缺少状态行（历史数据）按已登记未起跑处理。 */
+    private RunnerRaceStateRow currentRunnerState(String raceId, String bib) {
+        return repository.findRunnerState(raceId, bib).orElseGet(() ->
+                new RunnerRaceStateRow(
+                        raceId, bib, RunnerRaceState.REGISTERED, null, null, null, 0L, 0L));
+    }
+
+    private InspectionRecordResponse toInspectionResponse(EquipmentInspectionRow row) {
+        return new InspectionRecordResponse(
+                row.inspectionId(), row.bib(), row.equipmentSerial(), row.result().name(),
+                row.validMinutes(), row.inspectedAt(), row.validUntil());
+    }
+
+    private RunnerRaceStateResponse toRunnerStateResponse(RunnerRaceStateRow row) {
+        return new RunnerRaceStateResponse(
+                row.raceId(), row.bib(), row.state().name(),
+                row.startedAt(), row.withdrawnAt(), row.reason(), row.updatedAt());
     }
 
     /**
