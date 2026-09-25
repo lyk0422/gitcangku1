@@ -56,4 +56,14 @@ public class ApiException extends RuntimeException {
     public static ApiException illegalTransition(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "ILLEGAL_TRANSITION", message, null);
     }
+
+    /** 422：互助交接业务冲突（资源归属、重叠租约、批量校验），携带可区分错误码与结构化明细。 */
+    public static ApiException handoffConflict(String code, String message, Object details) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, code, message, details);
+    }
+
+    /** 409：乐观版本不匹配（事件版本在读取后已变更）。 */
+    public static ApiException versionMismatch(String message) {
+        return new ApiException(HttpStatus.CONFLICT, "VERSION_MISMATCH", message, null);
+    }
 }

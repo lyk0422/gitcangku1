@@ -11,9 +11,10 @@ public final class Responses {
     private Responses() {
     }
 
-    /** 事件当前视图：pendingTransferTo 为待接受的交接目标人，无则 null。 */
+    /** 事件当前视图：pendingTransferTo 为待接受的交接目标人，无则 null；version 为乐观版本号。 */
     public record IncidentView(String incidentKey, String severity, String summary, String reporter,
                                String status, String commander, String pendingTransferTo,
+                               long version,
                                Instant createdAt, Instant updatedAt, Instant deadlineAt) {
     }
 
@@ -63,11 +64,12 @@ public final class Responses {
     }
 
     /**
-     * 处置任务视图：blockers 按阻塞事件键排序；doneBy/doneAt 仅 DONE 有值，
-     * cancelledBy/cancelledAt 仅 CANCELLED 有值。
+     * 处置任务视图：blockers 按阻塞事件键排序；startedBy/startedAt 仅经过 IN_PROGRESS 有值，
+     * doneBy/doneAt 仅 DONE 有值，cancelledBy/cancelledAt 仅 CANCELLED 有值。
      */
     public record TaskView(String taskKey, String groupCode, String title, String status,
-                           List<TaskBlockerView> blockers, String createdBy, Instant createdAt,
+                           List<TaskBlockerView> blockers, String createdBy,
+                           String startedBy, Instant startedAt, Instant createdAt,
                            String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt) {
     }
 
@@ -77,5 +79,77 @@ public final class Responses {
 
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
+    }
+
+    /** 资源视图：holderIncidentKey 为登记持有事件。 */
+    public record ResourceView(String resourceKey, String holderIncidentKey,
+                               String acquiredBy, Instant acquiredAt) {
+    }
+
+    /** 事件资源列表视图。 */
+    public record IncidentResourcesView(String incidentKey, List<ResourceView> resources) {
+    }
+
+    /** 代理人视图。 */
+    public record DelegateView(String delegate, String registeredBy, Instant createdAt) {
+    }
+
+    /** 事件代理人列表视图。 */
+    public record IncidentDelegatesView(String incidentKey, List<DelegateView> delegates) {
+    }
+
+    /**
+     * 交接资源项视图：settled 表示该资源已归还来源；taskKeys 为当前仍引用该资源的目标任务键。
+     */
+    public record HandoffItemView(String resourceKey, boolean settled, List<String> taskKeys,
+                                  Instant settledAt) {
+    }
+
+    /**
+     * 互助交接视图：status 为 ACTIVE/SETTLED；endReason/endTriggeredAt 仅在
+     * 目标关闭或租约到期触发结束后有值；settlements 为已写入的不可变结算。
+     */
+    public record HandoffView(String handoffKey, String sourceIncidentKey, String targetIncidentKey,
+                              String receiver, long sourceVersion, long targetVersion,
+                              String operator, Instant leaseStart, Instant leaseEnd,
+                              String status, String endReason, Instant endTriggeredAt,
+                              List<HandoffItemView> items, List<SettlementView> settlements,
+                              Instant createdAt, Instant settledAt) {
+    }
+
+    /** 事件相关交接列表视图（含作为来源与作为目标的交接）。 */
+    public record IncidentHandoffsView(String incidentKey, List<HandoffView> handoffs) {
+    }
+
+    /** 不可变交接结算视图：reason 为 TARGET_CLOSED/LEASE_EXPIRED。 */
+    public record SettlementView(String handoffKey, String resourceKey, String reason,
+                                 String returnedToIncidentKey, Instant settledAt) {
+    }
+
+    /** 事件相关结算列表视图。 */
+    public record IncidentSettlementsView(String incidentKey, List<SettlementView> settlements) {
+    }
+
+    /**
+     * 资源当前责任视图：responsibleIncidentKey 为当前责任事件；
+     * lentOut 为 true 表示资源经进行中交接借出，责任方为该交接目标事件。
+     */
+    public record ResourceResponsibilityView(String resourceKey, String holderIncidentKey,
+                                             String responsibleIncidentKey, boolean lentOut,
+                                             String handoffKey, Instant leaseStart, Instant leaseEnd) {
+    }
+
+    /** 关闭阻断原因视图：type 为 LENT_RESOURCE（借出未归还）或 UNFINISHED_TASK（任务未终态）。 */
+    public record CloseBlockerView(String type, String resourceKey, String handoffKey,
+                                   String taskKey, String message) {
+    }
+
+    /** 关闭阻断查询视图：blockers 为空表示可关闭。 */
+    public record CloseBlockersView(String incidentKey, boolean closeable,
+                                    List<CloseBlockerView> blockers) {
+    }
+
+    /** 租约到期结算结果视图：settlements 为本次新写入的结算记录。 */
+    public record HandoffSettleView(String incidentKey, List<SettlementView> settlements) {
     }
 }

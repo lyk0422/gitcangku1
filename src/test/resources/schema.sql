@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS incidents (
     reporter VARCHAR(128) NOT NULL,
     status VARCHAR(16) NOT NULL,
     commander VARCHAR(128) NULL,
+    version INT NOT NULL DEFAULT 1,
     deadline_at TIMESTAMP(6) NULL,
     created_at TIMESTAMP(6) NOT NULL,
     updated_at TIMESTAMP(6) NOT NULL,
@@ -79,6 +80,8 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     title VARCHAR(512) NOT NULL,
     status VARCHAR(16) NOT NULL,
     created_by VARCHAR(128) NOT NULL,
+    started_by VARCHAR(128) NULL,
+    started_at TIMESTAMP(6) NULL,
     done_by VARCHAR(128) NULL,
     done_at TIMESTAMP(6) NULL,
     cancelled_by VARCHAR(128) NULL,
@@ -98,4 +101,69 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS incident_resources (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    resource_key VARCHAR(128) NOT NULL,
+    holder_incident_id BIGINT NOT NULL,
+    acquired_by VARCHAR(128) NOT NULL,
+    acquired_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_resource_key UNIQUE (resource_key)
+);
+
+CREATE TABLE IF NOT EXISTS incident_delegates (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    delegate VARCHAR(128) NOT NULL,
+    registered_by VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_delegate UNIQUE (incident_id, delegate)
+);
+
+CREATE TABLE IF NOT EXISTS resource_handoffs (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    handoff_key VARCHAR(128) NOT NULL,
+    source_incident_id BIGINT NOT NULL,
+    target_incident_id BIGINT NOT NULL,
+    receiver VARCHAR(128) NOT NULL,
+    source_version INT NOT NULL,
+    target_version INT NOT NULL,
+    operator VARCHAR(128) NOT NULL,
+    lease_start TIMESTAMP(6) NOT NULL,
+    lease_end TIMESTAMP(6) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    end_reason VARCHAR(32) NULL,
+    end_triggered_at TIMESTAMP(6) NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    settled_at TIMESTAMP(6) NULL,
+    CONSTRAINT uk_handoff_key UNIQUE (handoff_key)
+);
+
+CREATE TABLE IF NOT EXISTS resource_handoff_items (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    handoff_id BIGINT NOT NULL,
+    resource_key VARCHAR(128) NOT NULL,
+    settled_at TIMESTAMP(6) NULL,
+    CONSTRAINT uk_handoff_resource UNIQUE (handoff_id, resource_key)
+);
+
+CREATE TABLE IF NOT EXISTS handoff_task_refs (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    handoff_id BIGINT NOT NULL,
+    item_id BIGINT NOT NULL,
+    task_id BIGINT NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_item_task UNIQUE (item_id, task_id)
+);
+
+CREATE TABLE IF NOT EXISTS handoff_settlements (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    handoff_id BIGINT NOT NULL,
+    item_id BIGINT NOT NULL,
+    resource_key VARCHAR(128) NOT NULL,
+    reason VARCHAR(32) NOT NULL,
+    returned_to_incident_id BIGINT NOT NULL,
+    settled_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_settlement_item UNIQUE (item_id)
 );

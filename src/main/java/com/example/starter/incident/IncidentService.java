@@ -1,14 +1,10 @@
 package com.example.starter.incident;
 
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.EnumSet;
-import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -35,8 +31,6 @@ import com.example.starter.incident.dto.Responses.TaskBlockerView;
 import com.example.starter.incident.dto.Responses.TaskView;
 import com.example.starter.incident.dto.Responses.TransferView;
 import com.example.starter.incident.dto.Responses.UnfinishedTaskView;
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -51,8 +45,6 @@ import org.springframework.transaction.annotation.Transactional;
  */
 @Service
 public class IncidentService {
-
-    private static final String SEP = "\\u001F";
 
     /** 各严重等级的遏制时限（分钟），等级沿用上报值且不可修改。 */
     private static final Map<String, Long> CONTAINMENT_MINUTES = Map.of(
@@ -71,18 +63,18 @@ public class IncidentService {
     private final IncidentRepository incidents;
     private final EscalationRepository escalations;
     private final IncidentTaskRepository tasks;
-    private final CommandKeyRepository commandKeys;
-    private final ObjectMapper objectMapper;
+    private final ResourceHandoffService handoffService;
+    private final IdempotentExecutor idempotency;
     private final Clock clock;
 
     public IncidentService(IncidentRepository incidents, EscalationRepository escalations,
-                           IncidentTaskRepository tasks, CommandKeyRepository commandKeys,
-                           ObjectMapper objectMapper, Clock clock) {
+                           IncidentTaskRepository tasks, ResourceHandoffService handoffService,
+                           IdempotentExecutor idempotency, Clock clock) {
         this.incidents = incidents;
         this.escalations = escalations;
         this.tasks = tasks;
-        this.commandKeys = commandKeys;
-        this.objectMapper = objectMapper;
+        this.handoffService = handoffService;
+        this.idempotency = idempotency;
         this.clock = clock;
     }
 
@@ -107,7 +99,7 @@ public class IncidentService {
         }
         Instant now = now();
         Incident incident = new Incident(0L, incidentKey, severity, summary, reporter,
-                IncidentStatus.REPORTED, null, now, now, null);
+                IncidentStatus.REPORTED, null, 1L, now, now, null);
         long id;
         try {
             id = incidents.insert(incident);
@@ -265,7 +257,7 @@ public class IncidentService {
                     if (targetStatus == IncidentStatus.RESOLVED) {
                         // 解决门禁：全部处置任务进入 DONE/CANCELLED 后才可解决
                         List<UnfinishedTaskView> unfinished = tasks
-                                .listOpenByIncident(incident.id()).stream()
+                                .listUnfinishedByIncident(incident.id()).stream()
                                 .map(t -> new UnfinishedTaskView(t.groupCode(), t.taskKey()))
                                 .toList();
                         if (!unfinished.isEmpty()) {
@@ -273,12 +265,21 @@ public class IncidentService {
                                     "仍有未完成的处置任务，不能进入 RESOLVED", unfinished);
                         }
                     }
+                    if (targetStatus == IncidentStatus.CLOSED) {
+                        // 关闭门禁：借出资源未归还（含已开始任务仍占用）时禁止关闭；
+                        // 门禁内先按当前时刻结算已到期租约
+                        handoffService.requireCloseable(incident);
+                    }
                     Instant now = now();
                     incidents.updateState(incident.id(), targetStatus, incident.commander(), now);
                     incidents.insertStatusChange(new StatusChange(0L, incident.id(),
                             incident.status(), targetStatus, actor, now));
                     if (targetStatus == IncidentStatus.CONTAINED) {
                         escalations.cancelOpenForIncident(incident.id(), now);
+                    }
+                    if (targetStatus == IncidentStatus.CLOSED) {
+                        // 目标关闭触发其借入交接的结束与结算（同事务）
+                        handoffService.onIncidentClosed(incident.id());
                     }
                     return toView(incidents.findByKey(incidentKey).orElseThrow(), null);
                 });
@@ -453,7 +454,7 @@ public class IncidentService {
                     Instant now = now();
                     long taskId = tasks.insert(new IncidentTask(0L, incident.id(), taskKey,
                             groupCode, title, TaskStatus.OPEN, actor, null, null, null, null,
-                            now, now));
+                            null, null, now, now));
                     for (Incident blocker : blockers) {
                         tasks.insertBlocker(taskId, blocker.id(), now);
                     }
@@ -462,7 +463,30 @@ public class IncidentService {
     }
 
     /**
-     * 完成任务：仅当前指挥人；仅 OPEN 可完成；全部阻塞事件进入
+     * 开始任务：仅当前指挥人；仅 OPEN 可开始，进入 IN_PROGRESS 并记录开始人与 UTC 时刻。
+     * 已开始任务在互助交接结束触发后可继续持有借入资源直至终态。
+     */
+    @Transactional
+    public TaskView startTask(String incidentKey, String taskKey, String actor,
+                              TaskActionRequest req) {
+        String commandKey = requireText(req.commandKey(), "commandKey");
+        Incident incident = lockIncident(incidentKey);
+        return runIdempotent(commandKey, "task_start", hash(incidentKey, taskKey, actor),
+                TaskView.class, () -> {
+                    requireCommander(incident, actor);
+                    IncidentTask task = tasks.findByKey(incident.id(), taskKey)
+                            .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
+                    if (task.status() != TaskStatus.OPEN) {
+                        throw ApiException.conflict(
+                                "任务状态为 " + task.status() + "，仅 OPEN 可开始");
+                    }
+                    tasks.markStarted(task.id(), actor, now());
+                    return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
+                });
+    }
+
+    /**
+     * 完成任务：仅当前指挥人；OPEN/IN_PROGRESS 可完成；全部阻塞事件进入
      * CONTAINED/RESOLVED/CLOSED 后才可完成，否则 409 并返回未解除事件列表。
      * DONE/CANCELLED 为终态，重复操作按 commandKey 幂等规则返回首次结果。
      */
@@ -476,7 +500,7 @@ public class IncidentService {
                     requireCommander(incident, actor);
                     IncidentTask task = tasks.findByKey(incident.id(), taskKey)
                             .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
-                    if (task.status() != TaskStatus.OPEN) {
+                    if (task.status() == TaskStatus.DONE || task.status() == TaskStatus.CANCELLED) {
                         throw ApiException.conflict(
                                 "任务已处于终态 " + task.status() + "，不能完成");
                     }
@@ -486,12 +510,13 @@ public class IncidentService {
                                 + String.join(",", unresolved), List.copyOf(unresolved));
                     }
                     tasks.markDone(task.id(), actor, now());
+                    handoffService.onTaskTerminal(task.id());
                     return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
                 });
     }
 
     /**
-     * 取消任务：仅当前指挥人；仅 OPEN 可取消；DONE/CANCELLED 为终态，
+     * 取消任务：仅当前指挥人；OPEN/IN_PROGRESS 可取消；DONE/CANCELLED 为终态，
      * 重复操作按 commandKey 幂等规则返回首次结果。
      */
     @Transactional
@@ -504,11 +529,12 @@ public class IncidentService {
                     requireCommander(incident, actor);
                     IncidentTask task = tasks.findByKey(incident.id(), taskKey)
                             .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
-                    if (task.status() != TaskStatus.OPEN) {
+                    if (task.status() == TaskStatus.DONE || task.status() == TaskStatus.CANCELLED) {
                         throw ApiException.conflict(
                                 "任务已处于终态 " + task.status() + "，不能取消");
                     }
                     tasks.markCancelled(task.id(), actor, now());
+                    handoffService.onTaskTerminal(task.id());
                     return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
                 });
     }
@@ -572,58 +598,17 @@ public class IncidentService {
      */
     private <T> T runIdempotent(String commandKey, String operation, String requestHash,
                                 Class<T> type, Supplier<T> business) {
-        var existing = commandKeys.find(commandKey);
-        if (existing.isPresent()) {
-            return replay(existing.get(), operation, requestHash, type);
-        }
-        try {
-            commandKeys.insertPlaceholder(commandKey, operation, requestHash, now());
-        } catch (DuplicateKeyException e) {
-            var committed = commandKeys.findForUpdate(commandKey)
-                    .orElseThrow(() -> ApiException.conflict("commandKey 处理冲突: " + commandKey));
-            return replay(committed, operation, requestHash, type);
-        }
-        T result = business.get();
-        commandKeys.fillResponse(commandKey, 200, toJson(result));
-        return result;
-    }
-
-    private <T> T replay(CommandKeyRecord record, String operation, String requestHash, Class<T> type) {
-        if (!record.operation().equals(operation) || !record.requestHash().equals(requestHash)) {
-            throw ApiException.conflict("commandKey 已被不同参数的请求使用: " + record.commandKey());
-        }
-        if (record.responseBody() == null) {
-            throw ApiException.conflict("commandKey 正在处理中: " + record.commandKey());
-        }
-        try {
-            return objectMapper.readValue(record.responseBody(), type);
-        } catch (JsonProcessingException e) {
-            throw new IllegalStateException("幂等响应反序列化失败", e);
-        }
-    }
-
-    private String toJson(Object value) {
-        try {
-            return objectMapper.writeValueAsString(value);
-        } catch (JsonProcessingException e) {
-            throw new IllegalStateException("响应序列化失败", e);
-        }
+        return idempotency.run(commandKey, operation, requestHash, type, business);
     }
 
     private static String hash(String... parts) {
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] out = digest.digest(String.join(SEP, parts).getBytes(StandardCharsets.UTF_8));
-            return HexFormat.of().formatHex(out);
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException(e);
-        }
+        return IdempotentExecutor.hash(parts);
     }
 
     private IncidentView toView(Incident incident, String pendingTransferTo) {
         return new IncidentView(incident.incidentKey(), incident.severity(), incident.summary(),
                 incident.reporter(), incident.status().name(), incident.commander(), pendingTransferTo,
-                incident.createdAt(), incident.updatedAt(), incident.deadlineAt());
+                incident.version(), incident.createdAt(), incident.updatedAt(), incident.deadlineAt());
     }
 
     private ActionView toActionView(IncidentAction action) {
@@ -640,8 +625,8 @@ public class IncidentService {
                         UNBLOCKING_STATUSES.contains(b.status())))
                 .toList();
         return new TaskView(task.taskKey(), task.groupCode(), task.title(), task.status().name(),
-                blockers, task.createdBy(), task.createdAt(), task.doneBy(), task.doneAt(),
-                task.cancelledBy(), task.cancelledAt());
+                blockers, task.createdBy(), task.startedBy(), task.startedAt(), task.createdAt(),
+                task.doneBy(), task.doneAt(), task.cancelledBy(), task.cancelledAt());
     }
 
     private static TransferView toTransferView(IncidentTransfer transfer) {

@@ -55,4 +55,35 @@ public final class Requests {
     /** 任务完成/取消请求，操作人由 X-Actor-Id 指定且须为当前指挥人。 */
     public record TaskActionRequest(String commandKey) {
     }
+
+    /** 资源登记请求：resourceKey 全局唯一，操作人须为当前指挥人。 */
+    public record ResourceAcquireRequest(String commandKey, String resourceKey) {
+    }
+
+    /** 代理人登记请求：delegate 事件内唯一，操作人须为当前指挥人。 */
+    public record DelegateRegisterRequest(String commandKey, String delegate) {
+    }
+
+    /**
+     * 交接资源项请求：resourceKey 为借出资源；taskKeys 为引用该资源的目标事件任务键（0~N 个）。
+     */
+    public record HandoffItemRequest(String resourceKey, List<String> taskKeys) {
+    }
+
+    /**
+     * 互助交接创建请求：handoffKey 全局唯一（同键同参重放，失败不占键）；
+     * sourceVersion/targetVersion 为创建时双方事件乐观版本号；
+     * receiver 须为目标事件当前指挥人或其已登记代理人；
+     * 租约为 UTC 左闭右开 [leaseStart, leaseEnd)，leaseEnd 必须晚于 leaseStart；
+     * items 至少一项且 resourceKey 不重复，任一冲突整体回滚。
+     */
+    public record HandoffCreateRequest(String handoffKey, String targetIncidentKey, String receiver,
+                                       Long sourceVersion, Long targetVersion,
+                                       Instant leaseStart, Instant leaseEnd,
+                                       List<HandoffItemRequest> items) {
+    }
+
+    /** 租约到期结算请求：以注入 Clock 的当前时刻评估，结算本事件作为目标的已到期交接。 */
+    public record HandoffSettleRequest(String commandKey) {
+    }
 }
