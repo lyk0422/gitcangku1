@@ -95,9 +95,71 @@ CREATE TABLE IF NOT EXISTS result_snapshot_checkpoint (
     CONSTRAINT fk_snapshot_checkpoint_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
 );
 
+-- 赛事器材检录配置：仅强制检录赛事存在一行，建赛时写入后不可修改。
+CREATE TABLE IF NOT EXISTS race_inspection_config (
+    race_id VARCHAR(64) NOT NULL COMMENT '赛事ID，一个赛事最多一行检录配置',
+    inspection_required BOOLEAN NOT NULL COMMENT '是否强制检录：TRUE-起跑/首个分段计时前必须存在未过期PASS，FALSE-不受检录门禁影响',
+    valid_minutes INT NOT NULL COMMENT 'PASS检录有效分钟数（取值1~1440），有效至检录时刻加该分钟数',
+    created_at BIGINT NOT NULL COMMENT '配置写入时间，Unix毫秒时间戳',
+    CONSTRAINT pk_race_inspection_config PRIMARY KEY (race_id),
+    CONSTRAINT fk_inspection_config_race FOREIGN KEY (race_id) REFERENCES race (race_id)
+);
+
+-- 器材检录历史：只追加、不可变；同一选手同一赛事的“当前有效检录”取 seq 最大的一行。
+CREATE TABLE IF NOT EXISTS equipment_inspection (
+    seq BIGINT NOT NULL AUTO_INCREMENT COMMENT '自增提交序号，唯一确定同一时刻多条检录的先后顺序',
+    inspection_id VARCHAR(128) NOT NULL COMMENT '检录记录业务键（选手提交的inspectionKey），全局唯一；同键同参重放、异参409',
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    bib VARCHAR(64) NOT NULL COMMENT '被检录选手参赛号',
+    equipment_serial VARCHAR(128) NOT NULL COMMENT '器材序列号，赛事内同一时刻最多绑定一个未完赛选手',
+    result VARCHAR(8) NOT NULL COMMENT '检录结果：PASS-通过（有效至valid_until），FAIL-不通过（立即阻断起跑）',
+    valid_minutes INT NOT NULL COMMENT '本次检录快照的有效分钟数（1~1440）',
+    inspected_at BIGINT NOT NULL COMMENT '检录提交时刻，Unix毫秒时间戳',
+    valid_until BIGINT COMMENT 'PASS有效截止时刻=inspected_at+valid_minutes分钟，Unix毫秒时间戳；FAIL为NULL',
+    created_at BIGINT NOT NULL COMMENT '记录落库时间，Unix毫秒时间戳',
+    CONSTRAINT pk_equipment_inspection PRIMARY KEY (inspection_id),
+    CONSTRAINT uk_equipment_inspection_seq UNIQUE (seq),
+    CONSTRAINT fk_inspection_runner FOREIGN KEY (race_id, bib) REFERENCES runner (race_id, bib),
+    INDEX idx_inspection_race_bib (race_id, bib, inspected_at)
+);
+
+-- 器材当前绑定：同一(赛事,器材序列号)最多一行，持有者未完赛时其他选手PASS同一序列号返回409。
+CREATE TABLE IF NOT EXISTS equipment_binding (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    equipment_serial VARCHAR(128) NOT NULL COMMENT '器材序列号，赛事内唯一',
+    bib VARCHAR(64) NOT NULL COMMENT '当前绑定的选手参赛号；持有者退赛/取消资格/完赛后该行可被新PASS接管',
+    inspection_id VARCHAR(128) NOT NULL COMMENT '产生该绑定的PASS检录记录键',
+    bound_at BIGINT NOT NULL COMMENT '最近绑定时间，Unix毫秒时间戳',
+    CONSTRAINT pk_equipment_binding PRIMARY KEY (race_id, equipment_serial),
+    CONSTRAINT fk_binding_runner FOREIGN KEY (race_id, bib) REFERENCES runner (race_id, bib)
+);
+
+-- 选手赛程生命周期：行按需在起跑/退赛时创建；缺失行视为 REGISTERED。
+CREATE TABLE IF NOT EXISTS runner_lifecycle (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    bib VARCHAR(64) NOT NULL COMMENT '选手参赛号',
+    status VARCHAR(16) NOT NULL COMMENT '生命周期状态：REGISTERED-已登记未起跑，STARTED-已起跑，WITHDRAWN-已退赛（终态），DISQUALIFIED由取消资格处罚派生',
+    started_at BIGINT COMMENT '起跑时刻，Unix毫秒时间戳；未起跑为NULL',
+    created_at BIGINT NOT NULL COMMENT '生命周期行创建时间，Unix毫秒时间戳',
+    updated_at BIGINT NOT NULL COMMENT '最近状态变更时间，Unix毫秒时间戳',
+    CONSTRAINT pk_runner_lifecycle PRIMARY KEY (race_id, bib),
+    CONSTRAINT fk_lifecycle_runner FOREIGN KEY (race_id, bib) REFERENCES runner (race_id, bib)
+);
+
+-- 起跑记录：同一选手同一赛事最多一条成功起跑。
+CREATE TABLE IF NOT EXISTS race_start (
+    start_id VARCHAR(128) NOT NULL COMMENT '起跑记录业务键，全局唯一；同键同参重放、异参409',
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    bib VARCHAR(64) NOT NULL COMMENT '起跑选手参赛号',
+    started_at BIGINT NOT NULL COMMENT '起跑提交时刻，Unix毫秒时间戳',
+    CONSTRAINT pk_race_start PRIMARY KEY (start_id),
+    CONSTRAINT uk_start_runner UNIQUE (race_id, bib),
+    CONSTRAINT fk_start_runner FOREIGN KEY (race_id, bib) REFERENCES runner (race_id, bib)
+);
+
 CREATE TABLE IF NOT EXISTS idempotency_record (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求ID（写操作幂等键）',
-    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE',
+    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE/SUBMIT_INSPECTION/START_RUNNER/WITHDRAW_RUNNER',
     request_digest CHAR(64) NOT NULL COMMENT '请求参数（requestId除外，含expectedVersion）规范化JSON的SHA-256摘要',
     response_status INT NOT NULL COMMENT '原成功请求的HTTP状态码，重放时原样返回',
     response_body TEXT COMMENT '原成功响应体JSON，重放时原样返回',
