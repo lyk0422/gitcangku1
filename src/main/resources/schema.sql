@@ -75,9 +75,51 @@ COMMENT ON COLUMN maintenance.anchor_cumulative_minutes IS '锚点读数在保�
 COMMENT ON COLUMN maintenance.request_id IS '完成保养请求的 requestId';
 COMMENT ON COLUMN maintenance.completed_at IS '保养完成登记时刻（UTC）';
 
+-- 保养工单：创建时冻结基线读数与登记窗口；关闭时写入不可变保养状态快照。
+CREATE TABLE IF NOT EXISTS work_order (
+    work_order_key VARCHAR(128) NOT NULL PRIMARY KEY,
+    equipment_id VARCHAR(64) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    work_order_version BIGINT NOT NULL,
+    baseline_reading_id VARCHAR(64) NOT NULL,
+    baseline_sampled_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    baseline_cumulative_minutes BIGINT NOT NULL,
+    window_start TIMESTAMP WITH TIME ZONE NOT NULL,
+    window_end TIMESTAMP WITH TIME ZONE NOT NULL,
+    started_at TIMESTAMP WITH TIME ZONE NULL,
+    closed_at TIMESTAMP WITH TIME ZONE NULL,
+    cancelled_at TIMESTAMP WITH TIME ZONE NULL,
+    terminated_at TIMESTAMP WITH TIME ZONE NULL,
+    snapshot_last_reading_id VARCHAR(64) NULL,
+    snapshot_last_sampled_at TIMESTAMP WITH TIME ZONE NULL,
+    snapshot_last_cumulative_minutes BIGINT NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_work_order_equipment ON work_order (equipment_id, status);
+COMMENT ON TABLE work_order IS '保养工单：同一设备同一时刻仅允许一个未完结工单；关闭快照写入后不可变';
+COMMENT ON COLUMN work_order.work_order_key IS '工单标识（客户端提供，全局唯一），兼作工单写操作的幂等键';
+COMMENT ON COLUMN work_order.equipment_id IS '所属设备标识';
+COMMENT ON COLUMN work_order.status IS '工单状态：CREATED/STARTED/CLOSED/CANCELLED/TERMINATED';
+COMMENT ON COLUMN work_order.work_order_version IS '工单版本号，初始 1；开始/登记读数/关闭/取消/终止均校验并加一';
+COMMENT ON COLUMN work_order.baseline_reading_id IS '基线读数标识：建单时冻结的当前已认证读数（设备最新生效读数）';
+COMMENT ON COLUMN work_order.baseline_sampled_at IS '基线读数 UTC 采样时刻（建单时冻结）';
+COMMENT ON COLUMN work_order.baseline_cumulative_minutes IS '基线累计工时（分钟，建单时冻结）；工单期间读数不得低于该值';
+COMMENT ON COLUMN work_order.window_start IS '允许登记窗口起始时刻（UTC，含）';
+COMMENT ON COLUMN work_order.window_end IS '允许登记窗口结束时刻（UTC，不含），必须晚于 window_start';
+COMMENT ON COLUMN work_order.started_at IS '开始时刻（UTC），未开始为 NULL';
+COMMENT ON COLUMN work_order.closed_at IS '关闭时刻（UTC），未关闭为 NULL；关闭即快照时刻';
+COMMENT ON COLUMN work_order.cancelled_at IS '取消时刻（UTC），仅未开始工单可取消，未取消为 NULL';
+COMMENT ON COLUMN work_order.terminated_at IS '终止时刻（UTC），未终止为 NULL';
+COMMENT ON COLUMN work_order.snapshot_last_reading_id IS '关闭快照：最后有效读数标识；无窗口内有效读数时取基线读数；仅 CLOSED 有值';
+COMMENT ON COLUMN work_order.snapshot_last_sampled_at IS '关闭快照：最后有效读数 UTC 采样时刻；仅 CLOSED 有值';
+COMMENT ON COLUMN work_order.snapshot_last_cumulative_minutes IS '关闭快照：最后有效读数累计工时（分钟）；仅 CLOSED 有值';
+COMMENT ON COLUMN work_order.created_at IS '建单时刻（UTC）';
+COMMENT ON COLUMN work_order.updated_at IS '最近一次状态变更时刻（UTC）';
+
 -- 幂等去重表：requestId 全局唯一；仅成功结果占键，失败回滚不占键。
 CREATE TABLE IF NOT EXISTS idempotency_request (
-    request_id VARCHAR(128) NOT NULL PRIMARY KEY,
+    request_id VARCHAR(256) NOT NULL PRIMARY KEY,
     operation VARCHAR(48) NOT NULL,
     request_fingerprint VARCHAR(512) NOT NULL,
     response_body CLOB NOT NULL,

@@ -140,6 +140,25 @@ public class EquipmentRepository {
         return rows.stream().findFirst();
     }
 
+    /** 窗口 [windowStart, windowEnd) 内且累计工时不低于基线的最后一条有效读数。 */
+    public Optional<Reading> findLastValidReadingInWindow(String equipmentId, Instant windowStart,
+                                                          Instant windowEnd, long baselineCumulativeMinutes) {
+        List<Reading> rows = jdbc.query(
+                "SELECT equipment_id, reading_id, sampled_at, cumulative_minutes, revision_no"
+                        + " FROM reading WHERE equipment_id = ? AND sampled_at >= ? AND sampled_at < ?"
+                        + " AND cumulative_minutes >= ? ORDER BY sampled_at DESC LIMIT 1",
+                READING_MAPPER, equipmentId, utc(windowStart), utc(windowEnd), baselineCumulativeMinutes);
+        return rows.stream().findFirst();
+    }
+
+    /** 窗口 [windowStart, windowEnd) 内的读数条数（工单读数诊断）。 */
+    public int countReadingsInWindow(String equipmentId, Instant windowStart, Instant windowEnd) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM reading WHERE equipment_id = ? AND sampled_at >= ? AND sampled_at < ?",
+                Integer.class, equipmentId, utc(windowStart), utc(windowEnd));
+        return count == null ? 0 : count;
+    }
+
     public void updateReadingValue(String equipmentId, String readingId, long cumulativeMinutes,
                                    int newRevisionNo, Instant updatedAt) {
         jdbc.update("UPDATE reading SET cumulative_minutes = ?, revision_no = ?, updated_at = ?"

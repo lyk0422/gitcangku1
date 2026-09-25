@@ -21,7 +21,9 @@ import com.example.starter.maintenance.api.dto.StatusResponse;
 import com.example.starter.maintenance.domain.Equipment;
 import com.example.starter.maintenance.domain.MaintenanceRecord;
 import com.example.starter.maintenance.domain.Reading;
+import com.example.starter.maintenance.domain.WorkOrder;
 import com.example.starter.maintenance.store.EquipmentRepository;
+import com.example.starter.maintenance.store.WorkOrderRepository;
 
 /**
  * 设备工时保养事务业务服务。写操作流程：设备行锁 → 幂等判定 → 版本校验 → 业务规则 → 变更并版本加一。
@@ -31,11 +33,14 @@ import com.example.starter.maintenance.store.EquipmentRepository;
 public class EquipmentTxService {
 
     private final EquipmentRepository repository;
+    private final WorkOrderRepository workOrderRepository;
     private final IdempotencyService idempotency;
     private final Clock clock;
 
-    public EquipmentTxService(EquipmentRepository repository, IdempotencyService idempotency, Clock clock) {
+    public EquipmentTxService(EquipmentRepository repository, WorkOrderRepository workOrderRepository,
+                              IdempotencyService idempotency, Clock clock) {
         this.repository = repository;
+        this.workOrderRepository = workOrderRepository;
         this.idempotency = idempotency;
         this.clock = clock;
     }
@@ -73,6 +78,7 @@ public class EquipmentTxService {
                                 "同一设备同一采样时刻仅允许一条读数");
                     }
                     checkMonotonic(equipmentId, req.sampledAt(), req.cumulativeMinutes());
+                    checkActiveWorkOrderWindow(equipmentId, req.sampledAt(), req.cumulativeMinutes());
                     Instant now = clock.instant();
                     repository.insertReading(
                             new Reading(equipmentId, req.readingId(), req.sampledAt(),
@@ -230,6 +236,23 @@ public class EquipmentTxService {
         if (next.isPresent() && cumulativeMinutes > next.get().cumulativeMinutes()) {
             throw ApiException.unprocessable("READING_ORDER_VIOLATION",
                     "累计工时大于后一条读数（" + next.get().cumulativeMinutes() + "），违反单调不减约束");
+        }
+    }
+
+    /** 工单进行期间提交的新读数：读表时刻须落在工单窗口 [windowStart, windowEnd) 内且读数不得低于基线。 */
+    private void checkActiveWorkOrderWindow(String equipmentId, Instant sampledAt, long cumulativeMinutes) {
+        Optional<WorkOrder> active = workOrderRepository.findStartedByEquipment(equipmentId);
+        if (active.isEmpty()) {
+            return;
+        }
+        WorkOrder order = active.get();
+        if (sampledAt.isBefore(order.windowStart()) || !sampledAt.isBefore(order.windowEnd())) {
+            throw ApiException.unprocessable("READING_OUT_OF_WINDOW",
+                    "读表时刻不在工单允许窗口 [" + order.windowStart() + ", " + order.windowEnd() + ") 内");
+        }
+        if (cumulativeMinutes < order.baselineCumulativeMinutes()) {
+            throw ApiException.unprocessable("READING_BELOW_BASELINE",
+                    "读数低于工单基线（" + order.baselineCumulativeMinutes() + "）");
         }
     }
 }
