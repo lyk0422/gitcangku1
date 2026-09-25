@@ -103,4 +103,14 @@ public class ConsentRepository {
                         + " VALUES (?, ?, ?, ?, ?, ?)",
                 subjectKey, purpose.name(), epoch, recordKey, payload, requestId);
     }
+
+    /**
+     * 列出指定主体、用途、代次的全部记录，按记录键字典序稳定排列，用于批次查询快照。
+     */
+    List<RecordRow> findRecords(String subjectKey, Purpose purpose, int epoch) {
+        return jdbc.query(
+                "SELECT subject_key, purpose, epoch, record_key, payload FROM consent_record"
+                        + " WHERE subject_key = ? AND purpose = ? AND epoch = ? ORDER BY record_key",
+                RECORD_MAPPER, subjectKey, purpose.name(), epoch);
+    }
 }
