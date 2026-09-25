@@ -21,6 +21,15 @@ public class GlobalExceptionHandler {
         return ResponseEntity.status(ex.status()).body(body(ex.code(), ex.getMessage()));
     }
 
+    /** 429 容量已满：在统一错误体外返回当前占用数与容量上限。 */
+    @ExceptionHandler(CapacityExceededException.class)
+    public ResponseEntity<Map<String, Object>> handleCapacity(CapacityExceededException ex) {
+        Map<String, Object> map = body(ex.code(), ex.getMessage());
+        map.put("currentOccupancy", ex.currentOccupancy());
+        map.put("capacity", ex.capacity());
+        return ResponseEntity.status(ex.status()).body(map);
+    }
+
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ResponseEntity<Map<String, Object>> handleValidation(MethodArgumentNotValidException ex) {
         String message = ex.getBindingResult().getFieldErrors().stream()

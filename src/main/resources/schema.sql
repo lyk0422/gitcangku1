@@ -59,6 +59,38 @@ CREATE TABLE IF NOT EXISTS review (
 
 CREATE UNIQUE INDEX IF NOT EXISTS ux_review_request ON review (request_id);
 
+-- 航路走廊：corridorId 唯一；非退化轴对齐闭矩形；容量 1～50，只能上调
+-- touch 仅用于预约创建/取消事务对该行产生真实更新以加行级写锁，按提交顺序串行化容量裁决
+CREATE TABLE IF NOT EXISTS corridor (
+    corridor_id  VARCHAR(64) PRIMARY KEY COMMENT '走廊唯一标识',
+    x_min        INT NOT NULL COMMENT '矩形左边界（含），单位米',
+    y_min        INT NOT NULL COMMENT '矩形下边界（含），单位米',
+    x_max        INT NOT NULL COMMENT '矩形右边界（含），单位米，x_min < x_max',
+    y_max        INT NOT NULL COMMENT '矩形上边界（含），单位米，y_min < y_max',
+    capacity     INT NOT NULL COMMENT '同时容量上限，1～50；仅可上调不可下调',
+    touch        BIGINT NOT NULL COMMENT '仅用于容量裁决事务加行级写锁的计数器，无业务含义',
+    created_at   BIGINT NOT NULL COMMENT '创建时间，epoch 毫秒（UTC）',
+    updated_at   BIGINT NOT NULL COMMENT '最近容量调整时间，epoch 毫秒（UTC）'
+) COMMENT = '航路走廊（矩形区域与同时容量上限）';
+
+-- 走廊预约：reservationKey 全局唯一；时间窗 UTC 左闭右开，时长 1～120 分钟
+-- 取消仅置状态并记录取消时间，行保留作为历史
+CREATE TABLE IF NOT EXISTS corridor_reservation (
+    reservation_key  VARCHAR(64) PRIMARY KEY COMMENT '预约全局唯一业务键',
+    corridor_id      VARCHAR(64) NOT NULL COMMENT '所属走廊标识',
+    start_time       BIGINT NOT NULL COMMENT '预约开始时刻，epoch 毫秒（UTC），含（左闭）',
+    end_time         BIGINT NOT NULL COMMENT '预约结束时刻，epoch 毫秒（UTC），不含（右开）；start_time < end_time，时长 1～120 分钟',
+    review_id        VARCHAR(64) NOT NULL COMMENT '关联的已 CLEAR 审核结果标识，仅引用不消费不改写',
+    status           VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE 生效参与容量计数；CANCELLED 已取消立即移出容量计数但保留历史',
+    request_id       VARCHAR(64) NOT NULL COMMENT '创建预约的写操作请求标识',
+    created_at       BIGINT NOT NULL COMMENT '创建时间，epoch 毫秒（UTC）',
+    cancelled_at     BIGINT NULL COMMENT '取消时间，epoch 毫秒（UTC）；NULL 表示未取消'
+) COMMENT = '走廊时段预约（取消后保留历史）';
+
+CREATE INDEX IF NOT EXISTS ix_reservation_corridor_time
+    ON corridor_reservation (corridor_id, status, start_time, end_time);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_reservation_request ON corridor_reservation (request_id);
+
 -- 写操作幂等去重：同键同参重放原结果，异参冲突；失败不占键
 CREATE TABLE IF NOT EXISTS request_dedup (
     request_id     VARCHAR(64) PRIMARY KEY COMMENT '写操作全局唯一请求标识',
