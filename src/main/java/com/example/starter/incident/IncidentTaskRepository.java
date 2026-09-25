@@ -26,6 +26,8 @@ import org.springframework.stereotype.Repository;
  * 处置任务及跨事件阻塞关系的 JDBC 仓储。
  * 所有写路径均处于先锁定事件行的写事务内；创建任务额外持有 task_graph_lock 单行锁，
  * 使环检测与边写入相对其他创建串行化，保证并发反向依赖下最终图无环。
+ * 状态推进（开始/完成/取消/风险进出）均使用带状态条件的 UPDATE，
+ * 与资质撤销的条件更新按行锁提交顺序裁决，未完成态才会被改写。
  */
 @Repository
 public class IncidentTaskRepository {
@@ -42,12 +44,16 @@ public class IncidentTaskRepository {
     private static final RowMapper<IncidentTask> TASK_MAPPER = (rs, n) -> mapTask(rs);
 
     private static IncidentTask mapTask(ResultSet rs) throws SQLException {
+        Timestamp plannedCompleteAt = rs.getTimestamp("planned_complete_at");
         Timestamp doneAt = rs.getTimestamp("done_at");
         Timestamp cancelledAt = rs.getTimestamp("cancelled_at");
+        String preRiskStatus = rs.getString("pre_risk_status");
         return new IncidentTask(
                 rs.getLong("id"), rs.getLong("incident_id"), rs.getString("task_key"),
                 rs.getString("group_code"), rs.getString("title"),
                 TaskStatus.valueOf(rs.getString("status")),
+                plannedCompleteAt == null ? null : plannedCompleteAt.toInstant(),
+                preRiskStatus == null ? null : TaskStatus.valueOf(preRiskStatus),
                 rs.getString("created_by"), rs.getString("done_by"),
                 doneAt == null ? null : doneAt.toInstant(),
                 rs.getString("cancelled_by"),
@@ -70,21 +76,25 @@ public class IncidentTaskRepository {
         jdbc.update(con -> {
             var ps = con.prepareStatement(
                     "INSERT INTO incident_tasks (incident_id, task_key, group_code, title, status,"
+                            + " planned_complete_at, pre_risk_status,"
                             + " created_by, done_by, done_at, cancelled_by, cancelled_at,"
-                            + " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                            + " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setLong(1, task.incidentId());
             ps.setString(2, task.taskKey());
             ps.setString(3, task.groupCode());
             ps.setString(4, task.title());
             ps.setString(5, task.status().name());
-            ps.setString(6, task.createdBy());
-            ps.setString(7, task.doneBy());
-            ps.setTimestamp(8, task.doneAt() == null ? null : Timestamp.from(task.doneAt()));
-            ps.setString(9, task.cancelledBy());
-            ps.setTimestamp(10, task.cancelledAt() == null ? null : Timestamp.from(task.cancelledAt()));
-            ps.setTimestamp(11, Timestamp.from(task.createdAt()));
-            ps.setTimestamp(12, Timestamp.from(task.updatedAt()));
+            ps.setTimestamp(6, task.plannedCompleteAt() == null
+                    ? null : Timestamp.from(task.plannedCompleteAt()));
+            ps.setString(7, task.preRiskStatus() == null ? null : task.preRiskStatus().name());
+            ps.setString(8, task.createdBy());
+            ps.setString(9, task.doneBy());
+            ps.setTimestamp(10, task.doneAt() == null ? null : Timestamp.from(task.doneAt()));
+            ps.setString(11, task.cancelledBy());
+            ps.setTimestamp(12, task.cancelledAt() == null ? null : Timestamp.from(task.cancelledAt()));
+            ps.setTimestamp(13, Timestamp.from(task.createdAt()));
+            ps.setTimestamp(14, Timestamp.from(task.updatedAt()));
             return ps;
         }, keys);
         return keys.getKey().longValue();
@@ -101,6 +111,15 @@ public class IncidentTaskRepository {
     }
 
     /**
+     * 按主键查询任务。
+     */
+    public Optional<IncidentTask> findById(long id) {
+        List<IncidentTask> rows = jdbc.query("SELECT * FROM incident_tasks WHERE id = ?",
+                TASK_MAPPER, id);
+        return rows.stream().findFirst();
+    }
+
+    /**
      * 查询事件全部任务，按创建顺序返回。
      */
     public List<IncidentTask> listByIncident(long incidentId) {
@@ -109,11 +128,13 @@ public class IncidentTaskRepository {
     }
 
     /**
-     * 查询事件仍 OPEN 的任务（解决门禁用），按创建顺序返回。
+     * 查询事件仍未进入终态的任务（OPEN/IN_PROGRESS/CREDENTIAL_RISK，解决门禁用），
+     * 按创建顺序返回。
      */
-    public List<IncidentTask> listOpenByIncident(long incidentId) {
-        return jdbc.query("SELECT * FROM incident_tasks WHERE incident_id = ? AND status = 'OPEN'"
-                + " ORDER BY id", TASK_MAPPER, incidentId);
+    public List<IncidentTask> listUnfinishedByIncident(long incidentId) {
+        return jdbc.query("SELECT * FROM incident_tasks WHERE incident_id = ?"
+                + " AND status IN ('OPEN','IN_PROGRESS','CREDENTIAL_RISK') ORDER BY id",
+                TASK_MAPPER, incidentId);
     }
 
     /**
@@ -126,21 +147,55 @@ public class IncidentTaskRepository {
     }
 
     /**
-     * 将 OPEN 任务置为 DONE，记录完成人与 UTC 时刻。
+     * 将 OPEN 任务条件置为 IN_PROGRESS；返回更新行数，0 表示状态已变化（并发裁决失败）。
      */
-    public void markDone(long id, String actor, Instant at) {
-        jdbc.update("UPDATE incident_tasks SET status = 'DONE', done_by = ?, done_at = ?,"
-                        + " updated_at = ? WHERE id = ?",
+    public int markStarted(long id, Instant at) {
+        return jdbc.update("UPDATE incident_tasks SET status = 'IN_PROGRESS', updated_at = ?"
+                + " WHERE id = ? AND status = 'OPEN'",
+                Timestamp.from(at), id);
+    }
+
+    /**
+     * 将 OPEN/IN_PROGRESS 任务条件置为 DONE，记录完成人与 UTC 时刻；
+     * 返回更新行数，0 表示状态已变化（如并发资质撤销先进入 CREDENTIAL_RISK）。
+     */
+    public int markDone(long id, String actor, Instant at) {
+        return jdbc.update("UPDATE incident_tasks SET status = 'DONE', done_by = ?, done_at = ?,"
+                        + " updated_at = ? WHERE id = ? AND status IN ('OPEN','IN_PROGRESS')",
                 actor, Timestamp.from(at), Timestamp.from(at), id);
     }
 
     /**
-     * 将 OPEN 任务置为 CANCELLED，记录取消人与 UTC 时刻。
+     * 将 OPEN/IN_PROGRESS/CREDENTIAL_RISK 任务条件置为 CANCELLED，记录取消人与 UTC 时刻；
+     * 返回更新行数，0 表示已进入终态。
      */
-    public void markCancelled(long id, String actor, Instant at) {
-        jdbc.update("UPDATE incident_tasks SET status = 'CANCELLED', cancelled_by = ?,"
-                        + " cancelled_at = ?, updated_at = ? WHERE id = ?",
+    public int markCancelled(long id, String actor, Instant at) {
+        return jdbc.update("UPDATE incident_tasks SET status = 'CANCELLED', cancelled_by = ?,"
+                        + " cancelled_at = ?, updated_at = ? WHERE id = ?"
+                        + " AND status IN ('OPEN','IN_PROGRESS','CREDENTIAL_RISK')",
                 actor, Timestamp.from(at), Timestamp.from(at), id);
+    }
+
+    /**
+     * 将 OPEN/IN_PROGRESS 任务条件置为 CREDENTIAL_RISK 并记下风险前状态；
+     * 返回更新行数，0 表示任务已进入终态（已完成任务不改写）。
+     */
+    public int markCredentialRisk(long id, Instant at) {
+        return jdbc.update("UPDATE incident_tasks SET pre_risk_status = status,"
+                        + " status = 'CREDENTIAL_RISK', updated_at = ?"
+                        + " WHERE id = ? AND status IN ('OPEN','IN_PROGRESS')",
+                Timestamp.from(at), id);
+    }
+
+    /**
+     * 合格租约替换后将 CREDENTIAL_RISK 任务恢复到风险前状态并清空风险前状态列；
+     * 返回更新行数，0 表示任务已不在风险状态。
+     */
+    public int restoreFromCredentialRisk(long id, Instant at) {
+        return jdbc.update("UPDATE incident_tasks SET status = pre_risk_status,"
+                        + " pre_risk_status = NULL, updated_at = ?"
+                        + " WHERE id = ? AND status = 'CREDENTIAL_RISK'",
+                Timestamp.from(at), id);
     }
 
     /**
@@ -149,6 +204,22 @@ public class IncidentTaskRepository {
     public void insertBlocker(long taskId, long blockerIncidentId, Instant now) {
         jdbc.update("INSERT INTO incident_task_blockers (task_id, blocker_incident_id, created_at)"
                 + " VALUES (?,?,?)", taskId, blockerIncidentId, Timestamp.from(now));
+    }
+
+    /**
+     * 追加一条高危任务必需资质（按代码排序写入）。(task_id, credential_code) 唯一。
+     */
+    public void insertRequiredCredential(long taskId, String credentialCode, Instant now) {
+        jdbc.update("INSERT INTO task_required_credentials (task_id, credential_code, created_at)"
+                + " VALUES (?,?,?)", taskId, credentialCode, Timestamp.from(now));
+    }
+
+    /**
+     * 查询任务必需资质集合，按代码排序返回（规范化集合，换序视为同参）。
+     */
+    public List<String> listRequiredCredentials(long taskId) {
+        return jdbc.queryForList("SELECT credential_code FROM task_required_credentials"
+                + " WHERE task_id = ? ORDER BY credential_code", String.class, taskId);
     }
 
     /**

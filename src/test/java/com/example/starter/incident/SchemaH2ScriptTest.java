@@ -108,6 +108,105 @@ class SchemaH2ScriptTest {
                     duplicateBlockerRejected = true;
                 }
                 assertThat(duplicateBlockerRejected).isTrue();
+
+                // 共享资源：resource_key 唯一
+                st.execute("INSERT INTO resources (resource_key, version, created_by, created_at,"
+                        + " updated_at) VALUES ('RES-1',1,'alice','" + Timestamp.from(now) + "','"
+                        + Timestamp.from(now) + "')");
+                boolean duplicateResourceRejected = false;
+                try {
+                    st.execute("INSERT INTO resources (resource_key, version, created_by,"
+                            + " created_at, updated_at) VALUES ('RES-1',1,'alice','"
+                            + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateResourceRejected = true;
+                }
+                assertThat(duplicateResourceRejected).isTrue();
+
+                // 资源资质：(resource_id, credential_code) 唯一
+                st.execute("INSERT INTO resource_credentials (resource_id, credential_code,"
+                        + " valid_from, valid_until, revoked, revoked_at, created_at) VALUES"
+                        + " (1,'FIRE-A','" + Timestamp.from(now) + "','"
+                        + Timestamp.from(now.plusSeconds(3600)) + "',0,NULL,'"
+                        + Timestamp.from(now) + "')");
+                boolean duplicateCredentialRejected = false;
+                try {
+                    st.execute("INSERT INTO resource_credentials (resource_id, credential_code,"
+                            + " valid_from, valid_until, revoked, revoked_at, created_at) VALUES"
+                            + " (1,'FIRE-A','" + Timestamp.from(now) + "','"
+                            + Timestamp.from(now.plusSeconds(3600)) + "',0,NULL,'"
+                            + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateCredentialRejected = true;
+                }
+                assertThat(duplicateCredentialRejected).isTrue();
+
+                // 高危任务必需资质：(task_id, credential_code) 唯一
+                st.execute("INSERT INTO task_required_credentials (task_id, credential_code,"
+                        + " created_at) VALUES (1,'FIRE-A','" + Timestamp.from(now) + "')");
+                boolean duplicateRequiredRejected = false;
+                try {
+                    st.execute("INSERT INTO task_required_credentials (task_id, credential_code,"
+                            + " created_at) VALUES (1,'FIRE-A','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateRequiredRejected = true;
+                }
+                assertThat(duplicateRequiredRejected).isTrue();
+
+                // 资源租约：(lease_key, task_id) 唯一；批量下同 leaseKey 可覆盖多任务
+                st.execute("INSERT INTO resource_leases (lease_key, resource_id, resource_version,"
+                        + " task_id, credential_codes, lease_start, lease_end, status,"
+                        + " replaced_by, operator, created_at, updated_at) VALUES ('LK-1',1,1,1,"
+                        + "'FIRE-A','" + Timestamp.from(now) + "','"
+                        + Timestamp.from(now.plusSeconds(3600)) + "','ACTIVE',NULL,'alice','"
+                        + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                boolean duplicateLeaseRejected = false;
+                try {
+                    st.execute("INSERT INTO resource_leases (lease_key, resource_id,"
+                            + " resource_version, task_id, credential_codes, lease_start,"
+                            + " lease_end, status, replaced_by, operator, created_at, updated_at)"
+                            + " VALUES ('LK-1',1,1,1,'FIRE-A','" + Timestamp.from(now) + "','"
+                            + Timestamp.from(now.plusSeconds(3600)) + "','ACTIVE',NULL,'alice','"
+                            + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateLeaseRejected = true;
+                }
+                assertThat(duplicateLeaseRejected).isTrue();
+
+                // 资质风险记录：(lease_id, credential_code) 唯一，支撑只插入语义
+                st.execute("INSERT INTO credential_risk_records (lease_id, task_id, resource_id,"
+                        + " credential_code, revoked_at, detected_at) VALUES (1,1,1,'FIRE-A','"
+                        + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                boolean duplicateRiskRejected = false;
+                try {
+                    st.execute("INSERT INTO credential_risk_records (lease_id, task_id,"
+                            + " resource_id, credential_code, revoked_at, detected_at) VALUES"
+                            + " (1,1,1,'FIRE-A','" + Timestamp.from(now) + "','"
+                            + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateRiskRejected = true;
+                }
+                assertThat(duplicateRiskRejected).isTrue();
+
+                // 任务风险状态流转的条件更新：仅 OPEN/IN_PROGRESS 可被标记为 CREDENTIAL_RISK
+                int riskMarked = st.executeUpdate("UPDATE incident_tasks SET"
+                        + " pre_risk_status = status, status = 'CREDENTIAL_RISK'"
+                        + " WHERE id = 1 AND status IN ('OPEN','IN_PROGRESS')");
+                assertThat(riskMarked).isEqualTo(1);
+                int terminalSkipped = st.executeUpdate("UPDATE incident_tasks SET"
+                        + " pre_risk_status = status, status = 'CREDENTIAL_RISK'"
+                        + " WHERE id = 1 AND status IN ('OPEN','IN_PROGRESS')");
+                assertThat(terminalSkipped).isZero();
+                int restored = st.executeUpdate("UPDATE incident_tasks SET"
+                        + " status = pre_risk_status, pre_risk_status = NULL"
+                        + " WHERE id = 1 AND status = 'CREDENTIAL_RISK'");
+                assertThat(restored).isEqualTo(1);
+                try (ResultSet rs = st.executeQuery(
+                        "SELECT status, pre_risk_status FROM incident_tasks WHERE id = 1")) {
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getString("status")).isEqualTo("OPEN");
+                    assertThat(rs.getString("pre_risk_status")).isNull();
+                }
             }
         }
     }

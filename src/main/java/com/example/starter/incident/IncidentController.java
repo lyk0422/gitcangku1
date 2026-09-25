@@ -3,6 +3,7 @@ package com.example.starter.incident;
 import com.example.starter.incident.dto.Requests.ActionRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
 import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
+import com.example.starter.incident.dto.Requests.LeaseReplaceRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
@@ -16,6 +17,9 @@ import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
 import com.example.starter.incident.dto.Responses.IncidentTasksView;
 import com.example.starter.incident.dto.Responses.IncidentView;
+import com.example.starter.incident.dto.Responses.LeaseView;
+import com.example.starter.incident.dto.Responses.RiskLeaseListView;
+import com.example.starter.incident.dto.Responses.TaskGateView;
 import com.example.starter.incident.dto.Responses.TaskView;
 import com.example.starter.incident.dto.Responses.TransferView;
 import org.springframework.http.HttpStatus;
@@ -36,9 +40,11 @@ import org.springframework.web.bind.annotation.RestController;
 public class IncidentController {
 
     private final IncidentService service;
+    private final ResourceLeaseService leaseService;
 
-    public IncidentController(IncidentService service) {
+    public IncidentController(IncidentService service, ResourceLeaseService leaseService) {
         this.service = service;
+        this.leaseService = leaseService;
     }
 
     /**
@@ -170,6 +176,16 @@ public class IncidentController {
     }
 
     /**
+     * 开始任务（仅当前指挥人；仅 OPEN 可开始；CREDENTIAL_RISK 不得开始）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/start")
+    public TaskView startTask(@PathVariable String incidentKey, @PathVariable String taskKey,
+                              @RequestHeader("X-Actor-Id") String actor,
+                              @RequestBody TaskActionRequest req) {
+        return service.startTask(incidentKey, taskKey, actor, req);
+    }
+
+    /**
      * 完成任务（仅当前指挥人；全部阻塞解除后才可完成）。
      */
     @PostMapping("/{incidentKey}/tasks/{taskKey}/complete")
@@ -187,5 +203,31 @@ public class IncidentController {
                                @RequestHeader("X-Actor-Id") String actor,
                                @RequestBody TaskActionRequest req) {
         return service.cancelTask(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 查询任务门禁原因：开始/完成准入、阻止原因、未解除阻塞与被撤销资质（只读）。
+     */
+    @GetMapping("/{incidentKey}/tasks/{taskKey}/gate")
+    public TaskGateView taskGate(@PathVariable String incidentKey, @PathVariable String taskKey) {
+        return leaseService.taskGate(incidentKey, taskKey);
+    }
+
+    /**
+     * 以合格资源替换 CREDENTIAL_RISK 任务的当前租约（仅当前指挥人）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/lease/replace")
+    public LeaseView replaceLease(@PathVariable String incidentKey, @PathVariable String taskKey,
+                                  @RequestHeader("X-Actor-Id") String actor,
+                                  @RequestBody LeaseReplaceRequest req) {
+        return leaseService.replaceLease(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 查询事件下处于 CREDENTIAL_RISK 的租约及不可变风险记录（只读）。
+     */
+    @GetMapping("/{incidentKey}/risk-leases")
+    public RiskLeaseListView riskLeases(@PathVariable String incidentKey) {
+        return leaseService.riskLeasesByIncident(incidentKey);
     }
 }

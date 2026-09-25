@@ -64,6 +64,9 @@ public class IncidentService {
     /** 每任务阻塞事件上限。 */
     private static final int MAX_BLOCKERS_PER_TASK = 5;
 
+    /** 每高危任务必需资质上限。 */
+    private static final int MAX_CREDENTIALS_PER_TASK = 10;
+
     /** 视为阻塞已解除的目标事件状态。 */
     private static final Set<IncidentStatus> UNBLOCKING_STATUSES = EnumSet.of(
             IncidentStatus.CONTAINED, IncidentStatus.RESOLVED, IncidentStatus.CLOSED);
@@ -72,16 +75,18 @@ public class IncidentService {
     private final EscalationRepository escalations;
     private final IncidentTaskRepository tasks;
     private final CommandKeyRepository commandKeys;
+    private final LeaseRepository leases;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public IncidentService(IncidentRepository incidents, EscalationRepository escalations,
                            IncidentTaskRepository tasks, CommandKeyRepository commandKeys,
-                           ObjectMapper objectMapper, Clock clock) {
+                           LeaseRepository leases, ObjectMapper objectMapper, Clock clock) {
         this.incidents = incidents;
         this.escalations = escalations;
         this.tasks = tasks;
         this.commandKeys = commandKeys;
+        this.leases = leases;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -265,7 +270,7 @@ public class IncidentService {
                     if (targetStatus == IncidentStatus.RESOLVED) {
                         // 解决门禁：全部处置任务进入 DONE/CANCELLED 后才可解决
                         List<UnfinishedTaskView> unfinished = tasks
-                                .listOpenByIncident(incident.id()).stream()
+                                .listUnfinishedByIncident(incident.id()).stream()
                                 .map(t -> new UnfinishedTaskView(t.groupCode(), t.taskKey()))
                                 .toList();
                         if (!unfinished.isEmpty()) {
@@ -393,7 +398,10 @@ public class IncidentService {
     /**
      * 创建处置任务：仅当前指挥人；taskKey 事件内唯一；阻塞事件 0~5 个、必须存在且非自身；
      * 创建时在依赖图全局锁内做环检测，拒绝直接或间接环（409 且不留部分任务或边）。
-     * taskKey 幂等：同键同内容（含阻塞集合）返回首次任务，同键不同内容返回 409。
+     * requiredCredentials 非空时为高危任务：集合按代码去重排序规范化（换序视为同参），
+     * plannedCompleteAt（计划完成 UTC 时刻）必填；非高危任务两者均须为空。
+     * taskKey 幂等：同键同内容（含阻塞集合与规范化资质集合）返回首次任务，
+     * 同键不同内容返回 409。
      */
     @Transactional
     public TaskView createTask(String incidentKey, String actor, TaskCreateRequest req) {
@@ -412,9 +420,29 @@ public class IncidentService {
         if (blockerKeys.contains(incidentKey)) {
             throw ApiException.badRequest("阻塞事件不能是事件自身: " + incidentKey);
         }
+        List<String> requiredCredentials = req.requiredCredentials() == null ? List.of()
+                : req.requiredCredentials().stream()
+                        .map(c -> requireText(c, "requiredCredential"))
+                        .distinct()
+                        .sorted()
+                        .toList();
+        if (requiredCredentials.size() > MAX_CREDENTIALS_PER_TASK) {
+            throw ApiException.badRequest("必需资质最多 " + MAX_CREDENTIALS_PER_TASK + " 个");
+        }
+        boolean highRisk = !requiredCredentials.isEmpty();
+        if (highRisk && req.plannedCompleteAt() == null) {
+            throw ApiException.badRequest("高危任务 plannedCompleteAt 不能为空");
+        }
+        if (!highRisk && req.plannedCompleteAt() != null) {
+            throw ApiException.badRequest("非高危任务不能设置 plannedCompleteAt");
+        }
+        Instant plannedCompleteAt = req.plannedCompleteAt() == null ? null
+                : req.plannedCompleteAt().truncatedTo(ChronoUnit.MICROS);
         Incident incident = lockIncident(incidentKey);
         return runIdempotent(commandKey, "task_create",
-                hash(incidentKey, actor, taskKey, groupCode, title, String.join(",", blockerKeys)),
+                hash(incidentKey, actor, taskKey, groupCode, title,
+                        String.join(",", blockerKeys), String.join(",", requiredCredentials),
+                        plannedCompleteAt == null ? "" : plannedCompleteAt.toString()),
                 TaskView.class, () -> {
                     requireCommander(incident, actor);
                     if (incident.status() == IncidentStatus.CLOSED) {
@@ -426,8 +454,10 @@ public class IncidentService {
                         List<String> existingBlockers = incidents.listBlockingIncidents(found.id())
                                 .stream().map(Incident::incidentKey).sorted().toList();
                         List<String> requested = blockerKeys.stream().sorted().toList();
-                        if (!found.sameContent(groupCode, title)
-                                || !existingBlockers.equals(requested)) {
+                        if (!found.sameContent(groupCode, title, plannedCompleteAt)
+                                || !existingBlockers.equals(requested)
+                                || !tasks.listRequiredCredentials(found.id())
+                                        .equals(requiredCredentials)) {
                             throw ApiException.conflict("taskKey 已被不同内容使用: " + taskKey);
                         }
                         return toTaskView(found);
@@ -452,19 +482,55 @@ public class IncidentService {
                     }
                     Instant now = now();
                     long taskId = tasks.insert(new IncidentTask(0L, incident.id(), taskKey,
-                            groupCode, title, TaskStatus.OPEN, actor, null, null, null, null,
-                            now, now));
+                            groupCode, title, TaskStatus.OPEN, plannedCompleteAt, null, actor,
+                            null, null, null, null, now, now));
                     for (Incident blocker : blockers) {
                         tasks.insertBlocker(taskId, blocker.id(), now);
+                    }
+                    for (String credentialCode : requiredCredentials) {
+                        tasks.insertRequiredCredential(taskId, credentialCode, now);
                     }
                     return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
                 });
     }
 
     /**
-     * 完成任务：仅当前指挥人；仅 OPEN 可完成；全部阻塞事件进入
+     * 开始任务：仅当前指挥人；仅 OPEN 可开始；全部阻塞事件解除后才可开始；
+     * CREDENTIAL_RISK 任务不得开始（依赖满足也不能绕过），需先以合格资源替换租约。
+     */
+    @Transactional
+    public TaskView startTask(String incidentKey, String taskKey, String actor,
+                              TaskActionRequest req) {
+        String commandKey = requireText(req.commandKey(), "commandKey");
+        Incident incident = lockIncident(incidentKey);
+        return runIdempotent(commandKey, "task_start", hash(incidentKey, taskKey, actor),
+                TaskView.class, () -> {
+                    requireCommander(incident, actor);
+                    IncidentTask task = tasks.findByKey(incident.id(), taskKey)
+                            .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
+                    requireNotCredentialRisk(task);
+                    if (task.status() != TaskStatus.OPEN) {
+                        throw ApiException.conflict(
+                                "任务状态为 " + task.status() + "，不能开始");
+                    }
+                    List<String> unresolved = unresolvedBlockers(task.id());
+                    if (!unresolved.isEmpty()) {
+                        throw ApiException.conflict("存在未解除阻塞的事件: "
+                                + String.join(",", unresolved), List.copyOf(unresolved));
+                    }
+                    if (tasks.markStarted(task.id(), now()) == 0) {
+                        throw ApiException.conflict("任务状态已并发变化，不能开始");
+                    }
+                    return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
+                });
+    }
+
+    /**
+     * 完成任务：仅当前指挥人；仅 OPEN/IN_PROGRESS 可完成；全部阻塞事件进入
      * CONTAINED/RESOLVED/CLOSED 后才可完成，否则 409 并返回未解除事件列表。
-     * DONE/CANCELLED 为终态，重复操作按 commandKey 幂等规则返回首次结果。
+     * CREDENTIAL_RISK 任务不得完成（依赖满足也不能绕过），需先以合格资源替换租约。
+     * 完成时同事务释放任务持有中的租约。DONE/CANCELLED 为终态，
+     * 重复操作按 commandKey 幂等规则返回首次结果。
      */
     @Transactional
     public TaskView completeTask(String incidentKey, String taskKey, String actor,
@@ -476,7 +542,8 @@ public class IncidentService {
                     requireCommander(incident, actor);
                     IncidentTask task = tasks.findByKey(incident.id(), taskKey)
                             .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
-                    if (task.status() != TaskStatus.OPEN) {
+                    requireNotCredentialRisk(task);
+                    if (task.status() != TaskStatus.OPEN && task.status() != TaskStatus.IN_PROGRESS) {
                         throw ApiException.conflict(
                                 "任务已处于终态 " + task.status() + "，不能完成");
                     }
@@ -485,13 +552,18 @@ public class IncidentService {
                         throw ApiException.conflict("存在未解除阻塞的事件: "
                                 + String.join(",", unresolved), List.copyOf(unresolved));
                     }
-                    tasks.markDone(task.id(), actor, now());
+                    Instant now = now();
+                    if (tasks.markDone(task.id(), actor, now) == 0) {
+                        throw ApiException.conflict("任务状态已并发变化，不能完成");
+                    }
+                    leases.releaseHoldingByTask(task.id(), now);
                     return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
                 });
     }
 
     /**
-     * 取消任务：仅当前指挥人；仅 OPEN 可取消；DONE/CANCELLED 为终态，
+     * 取消任务：仅当前指挥人；仅 OPEN/IN_PROGRESS/CREDENTIAL_RISK 可取消；
+     * 取消时同事务释放任务持有中的租约。DONE/CANCELLED 为终态，
      * 重复操作按 commandKey 幂等规则返回首次结果。
      */
     @Transactional
@@ -504,11 +576,15 @@ public class IncidentService {
                     requireCommander(incident, actor);
                     IncidentTask task = tasks.findByKey(incident.id(), taskKey)
                             .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
-                    if (task.status() != TaskStatus.OPEN) {
+                    if (task.status() == TaskStatus.DONE || task.status() == TaskStatus.CANCELLED) {
                         throw ApiException.conflict(
                                 "任务已处于终态 " + task.status() + "，不能取消");
                     }
-                    tasks.markCancelled(task.id(), actor, now());
+                    Instant now = now();
+                    if (tasks.markCancelled(task.id(), actor, now) == 0) {
+                        throw ApiException.conflict("任务状态已并发变化，不能取消");
+                    }
+                    leases.releaseHoldingByTask(task.id(), now);
                     return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
                 });
     }
@@ -557,6 +633,17 @@ public class IncidentService {
         if (incident.commander() == null || !incident.commander().equals(actor)) {
             throw ApiException.conflict("只有当前指挥人 "
                     + (incident.commander() == null ? "(无)" : incident.commander()) + " 能执行该操作");
+        }
+    }
+
+    /**
+     * CREDENTIAL_RISK 门禁：任务不得开始或完成，直到以合格资源替换租约；
+     * 任务依赖满足也不能绕过此门禁。
+     */
+    private static void requireNotCredentialRisk(IncidentTask task) {
+        if (task.status() == TaskStatus.CREDENTIAL_RISK) {
+            throw ApiException.conflict("任务 " + task.taskKey()
+                    + " 处于 CREDENTIAL_RISK：必需资质被提前撤销，需以合格资源替换租约后才能开始或完成");
         }
     }
 
@@ -632,7 +719,8 @@ public class IncidentService {
     }
 
     /**
-     * 组装任务视图：阻塞状态按目标事件查询时的当前状态计算，不写回依赖任务。
+     * 组装任务视图：阻塞状态按目标事件查询时的当前状态计算，不写回依赖任务；
+     * 必需资质集合按代码排序返回（非高危任务为空列表）。
      */
     private TaskView toTaskView(IncidentTask task) {
         List<TaskBlockerView> blockers = incidents.listBlockingIncidents(task.id()).stream()
@@ -640,7 +728,8 @@ public class IncidentService {
                         UNBLOCKING_STATUSES.contains(b.status())))
                 .toList();
         return new TaskView(task.taskKey(), task.groupCode(), task.title(), task.status().name(),
-                blockers, task.createdBy(), task.createdAt(), task.doneBy(), task.doneAt(),
+                blockers, tasks.listRequiredCredentials(task.id()), task.plannedCompleteAt(),
+                task.createdBy(), task.createdAt(), task.doneBy(), task.doneAt(),
                 task.cancelledBy(), task.cancelledAt());
     }
 

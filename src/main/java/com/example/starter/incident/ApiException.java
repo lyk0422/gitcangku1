@@ -56,4 +56,10 @@ public class ApiException extends RuntimeException {
     public static ApiException illegalTransition(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "ILLEGAL_TRANSITION", message, null);
     }
+
+    /** 422：资质校验失败（缺失或有效期未严格覆盖），details 为 CredentialIssueView 列表。 */
+    public static ApiException credentialViolation(String message, Object details) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "CREDENTIAL_VIOLATION",
+                message, details);
+    }
 }
