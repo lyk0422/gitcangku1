@@ -9,6 +9,7 @@ import org.springframework.stereotype.Repository;
 
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 
@@ -236,12 +237,293 @@ public class RaceRepository {
 
     /** 测试辅助：清空全部业务数据，按外键依赖顺序删除。 */
     public void deleteAllForTesting() {
+        jdbcTemplate.update("DELETE FROM relay_snapshot_leg");
+        jdbcTemplate.update("DELETE FROM relay_snapshot_team");
+        jdbcTemplate.update("DELETE FROM relay_snapshot");
+        jdbcTemplate.update("DELETE FROM relay_finish");
+        jdbcTemplate.update("DELETE FROM relay_foul");
+        jdbcTemplate.update("DELETE FROM relay_handoff");
+        jdbcTemplate.update("DELETE FROM relay_team_leg");
+        jdbcTemplate.update("DELETE FROM relay_config");
         jdbcTemplate.update("DELETE FROM result_snapshot_entry");
         jdbcTemplate.update("DELETE FROM result_snapshot");
         jdbcTemplate.update("DELETE FROM idempotency_record");
         jdbcTemplate.update("DELETE FROM penalty");
         jdbcTemplate.update("DELETE FROM runner");
         jdbcTemplate.update("DELETE FROM race");
+    }
+
+    // ------------------------------------------------------------------
+    // 接力模式数据访问
+    // ------------------------------------------------------------------
+
+    /** 查询接力配置；非接力赛事返回 empty。 */
+    public Optional<RelayConfigRow> findRelayConfig(String raceId) {
+        return jdbcTemplate
+                .query("SELECT race_id, leg_count, exchange_limit_ms, created_at "
+                                + "FROM relay_config WHERE race_id = ?",
+                        (rs, rowNum) -> new RelayConfigRow(
+                                rs.getString("race_id"),
+                                rs.getInt("leg_count"),
+                                rs.getLong("exchange_limit_ms"),
+                                rs.getLong("created_at")),
+                        raceId)
+                .stream()
+                .findFirst();
+    }
+
+    /** 写入接力配置（每赛事仅一份，重复由主键拒绝）。 */
+    public void insertRelayConfig(String raceId, int legCount, long exchangeLimitMs, long now) {
+        jdbcTemplate.update(
+                "INSERT INTO relay_config (race_id, leg_count, exchange_limit_ms, created_at) "
+                        + "VALUES (?, ?, ?, ?)",
+                raceId, legCount, exchangeLimitMs, now);
+    }
+
+    /** 批量写入队伍棒次选手登记；runners 下标 i 对应棒次 i+1。 */
+    public void insertRelayTeamLegs(String raceId, String teamKey, List<String> runners) {
+        List<RelayTeamLegRow> rows = new ArrayList<>(runners.size());
+        for (int i = 0; i < runners.size(); i++) {
+            rows.add(new RelayTeamLegRow(raceId, teamKey, i + 1, runners.get(i)));
+        }
+        jdbcTemplate.batchUpdate(
+                "INSERT INTO relay_team_leg (race_id, team_key, leg_no, runner) VALUES (?, ?, ?, ?)",
+                rows,
+                rows.size(),
+                (ps, row) -> {
+                    ps.setString(1, row.raceId());
+                    ps.setString(2, row.teamKey());
+                    ps.setInt(3, row.legNo());
+                    ps.setString(4, row.runner());
+                });
+    }
+
+    /** 查询赛事全部队伍棒次登记，按队伍与棒次排列。 */
+    public List<RelayTeamLegRow> findRelayTeamLegs(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT race_id, team_key, leg_no, runner FROM relay_team_leg "
+                        + "WHERE race_id = ? ORDER BY team_key, leg_no",
+                (rs, rowNum) -> new RelayTeamLegRow(
+                        rs.getString("race_id"),
+                        rs.getString("team_key"),
+                        rs.getInt("leg_no"),
+                        rs.getString("runner")),
+                raceId);
+    }
+
+    /** 查询某队某棒次登记选手。 */
+    public Optional<RelayTeamLegRow> findRelayTeamLeg(String raceId, String teamKey, int legNo) {
+        return jdbcTemplate
+                .query("SELECT race_id, team_key, leg_no, runner FROM relay_team_leg "
+                                + "WHERE race_id = ? AND team_key = ? AND leg_no = ?",
+                        (rs, rowNum) -> new RelayTeamLegRow(
+                                rs.getString("race_id"),
+                                rs.getString("team_key"),
+                                rs.getInt("leg_no"),
+                                rs.getString("runner")),
+                        raceId, teamKey, legNo)
+                .stream()
+                .findFirst();
+    }
+
+    /** 查询某队全部交接记录，按棒次排列。 */
+    public List<RelayHandoffRow> findRelayHandoffs(String raceId, String teamKey) {
+        return jdbcTemplate.query(
+                "SELECT race_id, team_key, leg_no, receiver, elapsed_ms, zone_ms, foul, server_completed_at "
+                        + "FROM relay_handoff WHERE race_id = ? AND team_key = ? ORDER BY leg_no",
+                (rs, rowNum) -> new RelayHandoffRow(
+                        rs.getString("race_id"),
+                        rs.getString("team_key"),
+                        rs.getInt("leg_no"),
+                        rs.getString("receiver"),
+                        rs.getLong("elapsed_ms"),
+                        rs.getLong("zone_ms"),
+                        rs.getBoolean("foul"),
+                        rs.getLong("server_completed_at")),
+                raceId, teamKey);
+    }
+
+    /** 查询某队某棒次交接记录。 */
+    public Optional<RelayHandoffRow> findRelayHandoff(String raceId, String teamKey, int legNo) {
+        return jdbcTemplate
+                .query("SELECT race_id, team_key, leg_no, receiver, elapsed_ms, zone_ms, foul, server_completed_at "
+                                + "FROM relay_handoff WHERE race_id = ? AND team_key = ? AND leg_no = ?",
+                        (rs, rowNum) -> new RelayHandoffRow(
+                                rs.getString("race_id"),
+                                rs.getString("team_key"),
+                                rs.getInt("leg_no"),
+                                rs.getString("receiver"),
+                                rs.getLong("elapsed_ms"),
+                                rs.getLong("zone_ms"),
+                                rs.getBoolean("foul"),
+                                rs.getLong("server_completed_at")),
+                        raceId, teamKey, legNo)
+                .stream()
+                .findFirst();
+    }
+
+    /** 写入交接记录（每队每棒次仅一条，重复由主键拒绝）。 */
+    public void insertRelayHandoff(RelayHandoffRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO relay_handoff "
+                        + "(race_id, team_key, leg_no, receiver, elapsed_ms, zone_ms, foul, server_completed_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                row.raceId(), row.teamKey(), row.legNo(), row.receiver(),
+                row.elapsedMs(), row.zoneMs(), row.foul(), row.serverCompletedAt());
+    }
+
+    /** 写入犯规记录（不可逆，每队每交接至多一条）。 */
+    public void insertRelayFoul(RelayFoulRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO relay_foul (race_id, team_key, leg_no, zone_ms, limit_ms, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?)",
+                row.raceId(), row.teamKey(), row.legNo(), row.zoneMs(), row.limitMs(), row.createdAt());
+    }
+
+    /** 查询赛事全部犯规记录，按记录时间排列。 */
+    public List<RelayFoulRow> findRelayFouls(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT race_id, team_key, leg_no, zone_ms, limit_ms, created_at "
+                        + "FROM relay_foul WHERE race_id = ? ORDER BY created_at, team_key, leg_no",
+                (rs, rowNum) -> new RelayFoulRow(
+                        rs.getString("race_id"),
+                        rs.getString("team_key"),
+                        rs.getInt("leg_no"),
+                        rs.getLong("zone_ms"),
+                        rs.getLong("limit_ms"),
+                        rs.getLong("created_at")),
+                raceId);
+    }
+
+    /** 统计某队犯规次数。 */
+    public int countRelayFouls(String raceId, String teamKey) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM relay_foul WHERE race_id = ? AND team_key = ?",
+                Integer.class, raceId, teamKey);
+        return count == null ? 0 : count;
+    }
+
+    /** 写入队伍接力完赛记录（末棒交接后自动生成，每队仅一条）。 */
+    public void insertRelayFinish(RelayFinishRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO relay_finish (race_id, team_key, total_ms, foul_count, status, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?)",
+                row.raceId(), row.teamKey(), row.totalMs(), row.foulCount(),
+                row.status().name(), row.createdAt());
+    }
+
+    /** 查询赛事全部完赛记录。 */
+    public List<RelayFinishRow> findRelayFinishes(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT race_id, team_key, total_ms, foul_count, status, created_at "
+                        + "FROM relay_finish WHERE race_id = ? ORDER BY total_ms, team_key",
+                (rs, rowNum) -> new RelayFinishRow(
+                        rs.getString("race_id"),
+                        rs.getString("team_key"),
+                        rs.getLong("total_ms"),
+                        rs.getInt("foul_count"),
+                        com.example.starter.race.domain.EntryStatus.valueOf(rs.getString("status")),
+                        rs.getLong("created_at")),
+                raceId);
+    }
+
+    /** 查询某队完赛记录。 */
+    public Optional<RelayFinishRow> findRelayFinish(String raceId, String teamKey) {
+        return jdbcTemplate
+                .query("SELECT race_id, team_key, total_ms, foul_count, status, created_at "
+                                + "FROM relay_finish WHERE race_id = ? AND team_key = ?",
+                        (rs, rowNum) -> new RelayFinishRow(
+                                rs.getString("race_id"),
+                                rs.getString("team_key"),
+                                rs.getLong("total_ms"),
+                                rs.getInt("foul_count"),
+                                com.example.starter.race.domain.EntryStatus.valueOf(rs.getString("status")),
+                                rs.getLong("created_at")),
+                        raceId, teamKey)
+                .stream()
+                .findFirst();
+    }
+
+    /** 原子写入接力封榜快照头表、队伍名次行与逐棒明细行。 */
+    public void insertRelaySnapshot(RelaySnapshotRow snapshot) {
+        jdbcTemplate.update(
+                "INSERT INTO relay_snapshot (race_id, version, sealed_at) VALUES (?, ?, ?)",
+                snapshot.raceId(), snapshot.version(), snapshot.sealedAt());
+        jdbcTemplate.batchUpdate(
+                "INSERT INTO relay_snapshot_team "
+                        + "(race_id, team_key, rank_no, status, total_ms, foul_count, display_order) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                snapshot.teams(),
+                snapshot.teams().size(),
+                (ps, team) -> {
+                    ps.setString(1, team.raceId());
+                    ps.setString(2, team.teamKey());
+                    ps.setObject(3, team.rank());
+                    ps.setString(4, team.status().name());
+                    ps.setObject(5, team.totalMs());
+                    ps.setInt(6, team.foulCount());
+                    ps.setInt(7, team.displayOrder());
+                });
+        jdbcTemplate.batchUpdate(
+                "INSERT INTO relay_snapshot_leg "
+                        + "(race_id, team_key, leg_no, runner, elapsed_ms, split_ms, zone_ms, foul) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                snapshot.legs(),
+                snapshot.legs().size(),
+                (ps, leg) -> {
+                    ps.setString(1, leg.raceId());
+                    ps.setString(2, leg.teamKey());
+                    ps.setInt(3, leg.legNo());
+                    ps.setString(4, leg.runner());
+                    ps.setObject(5, leg.elapsedMs());
+                    ps.setObject(6, leg.splitMs());
+                    ps.setObject(7, leg.zoneMs());
+                    ps.setBoolean(8, leg.foul());
+                });
+    }
+
+    /** 查询接力封榜快照（含队伍名次与逐棒明细）；未封榜返回 empty。 */
+    public Optional<RelaySnapshotRow> findRelaySnapshot(String raceId) {
+        List<RelaySnapshotRow> headers = jdbcTemplate.query(
+                "SELECT race_id, version, sealed_at FROM relay_snapshot WHERE race_id = ?",
+                (rs, rowNum) -> new RelaySnapshotRow(
+                        rs.getString("race_id"),
+                        rs.getInt("version"),
+                        rs.getLong("sealed_at"),
+                        List.of(),
+                        List.of()),
+                raceId);
+        if (headers.isEmpty()) {
+            return Optional.empty();
+        }
+        RelaySnapshotRow header = headers.getFirst();
+        List<RelaySnapshotTeamRow> teams = jdbcTemplate.query(
+                "SELECT race_id, team_key, rank_no, status, total_ms, foul_count, display_order "
+                        + "FROM relay_snapshot_team WHERE race_id = ? ORDER BY display_order",
+                (rs, rowNum) -> new RelaySnapshotTeamRow(
+                        rs.getString("race_id"),
+                        rs.getString("team_key"),
+                        (Integer) rs.getObject("rank_no"),
+                        com.example.starter.race.domain.EntryStatus.valueOf(rs.getString("status")),
+                        (Long) rs.getObject("total_ms"),
+                        rs.getInt("foul_count"),
+                        rs.getInt("display_order")),
+                raceId);
+        List<RelaySnapshotLegRow> legs = jdbcTemplate.query(
+                "SELECT race_id, team_key, leg_no, runner, elapsed_ms, split_ms, zone_ms, foul "
+                        + "FROM relay_snapshot_leg WHERE race_id = ? ORDER BY team_key, leg_no",
+                (rs, rowNum) -> new RelaySnapshotLegRow(
+                        rs.getString("race_id"),
+                        rs.getString("team_key"),
+                        rs.getInt("leg_no"),
+                        rs.getString("runner"),
+                        (Long) rs.getObject("elapsed_ms"),
+                        (Long) rs.getObject("split_ms"),
+                        (Long) rs.getObject("zone_ms"),
+                        rs.getBoolean("foul")),
+                raceId);
+        return Optional.of(new RelaySnapshotRow(
+                header.raceId(), header.version(), header.sealedAt(), teams, legs));
     }
 
     private static final class RaceRowMapper implements RowMapper<RaceRow> {

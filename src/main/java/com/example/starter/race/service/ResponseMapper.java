@@ -1,14 +1,17 @@
 package com.example.starter.race.service;
 
 import com.example.starter.race.api.PenaltyResponse;
+import com.example.starter.race.api.RelayStandingResponse;
 import com.example.starter.race.api.ResultEntryResponse;
 import com.example.starter.race.api.RunnerResponse;
 import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.domain.RaceStatus;
+import com.example.starter.race.domain.RelayStanding;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
+import com.example.starter.race.persistence.RelaySnapshotRow;
 import com.example.starter.race.persistence.RunnerRow;
 import com.example.starter.race.persistence.SnapshotEntryRow;
 import com.example.starter.race.persistence.SnapshotRow;
@@ -70,5 +73,44 @@ final class ResponseMapper {
                 entry.finishTimeMs(),
                 entry.penaltyMs(),
                 entry.totalTimeMs());
+    }
+
+    /** 接力即时排名（OPEN）。 */
+    static RelayStandingResponse relayLiveStanding(RaceRow race, List<RelayStanding> standings) {
+        return new RelayStandingResponse(
+                race.raceId(),
+                race.version(),
+                race.status(),
+                null,
+                standings.stream().map(ResponseMapper::toRelayEntry).toList());
+    }
+
+    /** 接力封榜快照排名（SEALED）。 */
+    static RelayStandingResponse relaySnapshotStanding(RelaySnapshotRow snapshot) {
+        List<RelayStandingResponse.Entry> entries = snapshot.teams().stream()
+                .map(team -> new RelayStandingResponse.Entry(
+                        team.teamKey(),
+                        team.rank(),
+                        team.status(),
+                        team.totalMs(),
+                        team.foulCount(),
+                        team.foulCount() > 0))
+                .toList();
+        return new RelayStandingResponse(
+                snapshot.raceId(),
+                snapshot.version(),
+                RaceStatus.SEALED,
+                snapshot.sealedAt(),
+                entries);
+    }
+
+    private static RelayStandingResponse.Entry toRelayEntry(RelayStanding standing) {
+        return new RelayStandingResponse.Entry(
+                standing.teamKey(),
+                standing.rank(),
+                standing.status(),
+                standing.totalMs(),
+                standing.foulCount(),
+                standing.hasFouls());
     }
 }

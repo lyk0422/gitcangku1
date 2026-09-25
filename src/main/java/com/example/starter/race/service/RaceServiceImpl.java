@@ -63,11 +63,14 @@ public class RaceServiceImpl implements RaceService {
     private final RaceRepository repository;
     private final Clock clock;
     private final ObjectMapper objectMapper;
+    private final RelayServiceImpl relayService;
 
-    public RaceServiceImpl(RaceRepository repository, Clock clock, ObjectMapper objectMapper) {
+    public RaceServiceImpl(RaceRepository repository, Clock clock, ObjectMapper objectMapper,
+            RelayServiceImpl relayService) {
         this.repository = repository;
         this.clock = clock;
         this.objectMapper = objectMapper;
+        this.relayService = relayService;
     }
 
     @Override
@@ -101,6 +104,9 @@ public class RaceServiceImpl implements RaceService {
                     RaceRow race = requireOpenRace(raceId, request.expectedVersion());
                     Long finishTimeMs = request.finishTimeMs();
                     validateFinishTime(finishTimeMs, true);
+                    if (finishTimeMs != null) {
+                        requireNotRelayRace(raceId);
+                    }
                     long now = clock.millis();
                     bumpVersion(race, request.expectedVersion());
                     try {
@@ -124,6 +130,7 @@ public class RaceServiceImpl implements RaceService {
                         "finishTimeMs", request.finishTimeMs()),
                 () -> {
                     RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    requireNotRelayRace(raceId);
                     requireRunner(raceId, request.bib());
                     validateFinishTime(request.finishTimeMs(), false);
                     long now = clock.millis();
@@ -220,10 +227,6 @@ public class RaceServiceImpl implements RaceService {
                     if (race.status() == RaceStatus.SEALED) {
                         throw new ConflictException("赛事已封榜: " + raceId);
                     }
-                    List<RunnerRow> runners = repository.findRunners(raceId);
-                    List<PenaltyRow> penalties = repository.findPenalties(raceId);
-                    List<ResultEntry> entries = ResultCalculator.compute(runners, penalties);
-
                     int newVersion = request.expectedVersion() + 1;
                     int updated = repository.sealIfOpenAtVersion(
                             raceId, request.expectedVersion(), newVersion);
@@ -231,6 +234,18 @@ public class RaceServiceImpl implements RaceService {
                         throw new ConflictException("版本冲突或赛事已封榜");
                     }
                     long now = clock.millis();
+                    if (repository.findRelayConfig(raceId).isPresent()) {
+                        // 接力封榜：一致快照中固化各队逐棒明细、犯规记录与最终名次。
+                        repository.insertRelaySnapshot(
+                                relayService.buildRelaySnapshot(raceId, newVersion, now));
+                        return ServiceResult.ok(
+                                ResponseMapper.relaySnapshotStanding(
+                                        repository.findRelaySnapshot(raceId).orElseThrow()));
+                    }
+                    List<RunnerRow> runners = repository.findRunners(raceId);
+                    List<PenaltyRow> penalties = repository.findPenalties(raceId);
+                    List<ResultEntry> entries = ResultCalculator.compute(runners, penalties);
+
                     List<SnapshotEntryRow> snapshotEntries = new ArrayList<>(entries.size());
                     for (int order = 0; order < entries.size(); order++) {
                         ResultEntry entry = entries.get(order);
@@ -257,6 +272,7 @@ public class RaceServiceImpl implements RaceService {
     public StandingResponse getResults(String raceId) {
         RaceRow race = repository.findRace(raceId)
                 .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        requireNotRelayRace(raceId);
         if (race.status() == RaceStatus.SEALED) {
             SnapshotRow snapshot = repository.findSnapshot(raceId)
                     .orElseThrow(() -> new IllegalStateException(
@@ -324,8 +340,17 @@ public class RaceServiceImpl implements RaceService {
         return result;
     }
 
-    private RaceRow requireOpenRace(String raceId, Integer expectedVersion) {
-        RaceRow race = repository.findRace(raceId)
+    /**
+     * 个人计时边界：接力模式下不接受既有个人完赛计时提交，
+     * 也不提供个人成绩榜单（请使用接力相关接口）。
+     */
+    private void requireNotRelayRace(String raceId) {
+        if (repository.findRelayConfig(raceId).isPresent()) {
+            throw new ConflictException("接力赛事不支持个人计时操作: " + raceId);
+        }
+    }
+
+    private RaceRow requireOpenRace(String raceId, Integer expectedVersion) {        RaceRow race = repository.findRace(raceId)
                 .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
         if (race.status() == RaceStatus.SEALED) {
             throw new ConflictException("赛事已封榜，禁止写入: " + raceId);
