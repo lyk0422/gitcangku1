@@ -1,20 +1,40 @@
 package com.example.starter.api;
 
 import com.example.starter.api.dto.ArtifactResponse;
+import com.example.starter.api.dto.AttestationRequest;
+import com.example.starter.api.dto.AttestationResponse;
+import com.example.starter.api.dto.CreatePolicyRequest;
 import com.example.starter.api.dto.DependencySpec;
 import com.example.starter.api.dto.DependencyView;
 import com.example.starter.api.dto.LockEntryResponse;
 import com.example.starter.api.dto.LockFileResponse;
+import com.example.starter.api.dto.LockMigrationResult;
 import com.example.starter.api.dto.LockRequest;
+import com.example.starter.api.dto.MigrationCheckRequest;
+import com.example.starter.api.dto.MigrationCheckResponse;
+import com.example.starter.api.dto.PolicyResponse;
+import com.example.starter.api.dto.ProvenanceEntryView;
+import com.example.starter.api.dto.ProvenanceResponse;
+import com.example.starter.api.dto.PublishDiagnosticResponse;
+import com.example.starter.api.dto.PublishEntryView;
+import com.example.starter.api.dto.PublishRequest;
+import com.example.starter.api.dto.PublishResponse;
 import com.example.starter.api.dto.RegisterArtifactRequest;
 import com.example.starter.domain.ArtifactVersion;
+import com.example.starter.domain.Attestation;
 import com.example.starter.domain.DependencyRange;
 import com.example.starter.domain.LockResolver;
+import com.example.starter.domain.PolicyViolation;
+import com.example.starter.domain.ProvenanceChecker;
+import com.example.starter.domain.ProvenancePolicy;
 import com.example.starter.domain.RepositorySnapshot;
 import com.example.starter.repo.RepositoryDao;
 import com.example.starter.repo.RepositoryDao.IdempotentRecord;
 import com.example.starter.repo.RepositoryDao.LockEntryRow;
 import com.example.starter.repo.RepositoryDao.LockFileRow;
+import com.example.starter.repo.RepositoryDao.PolicyRow;
+import com.example.starter.repo.RepositoryDao.PublishEntryRow;
+import com.example.starter.repo.RepositoryDao.PublishRow;
 import com.example.starter.support.ApiException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
@@ -29,16 +49,22 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.function.Supplier;
+import java.util.regex.Pattern;
 
 /**
  * 制品仓库业务服务实现。
  *
  * <p>所有写操作在单个事务内完成：先锁单行仓库版本表互斥并发写，
  * 再做业务变更并写入幂等成功记录，原子提交；业务失败整体回滚，不占用 requestId。
+ *
+ * <p>来源证明：策略版本只增不改写；解析与发布在持有同一行锁的事务内
+ * 按当前策略版本校验全部命中坐标，任一违规整体回滚，不留半成品；
+ * 发布快照固化策略版本与证明版本，撤销证明不回改已发布结果。
  */
 @Service
 public class ArtifactServiceImpl implements ArtifactService {
@@ -49,6 +75,11 @@ public class ArtifactServiceImpl implements ArtifactService {
     private static final String OP_REGISTER = "REGISTER_ARTIFACT";
     private static final String OP_WITHDRAW = "WITHDRAW_ARTIFACT";
     private static final String OP_LOCK = "CREATE_LOCK";
+    private static final String OP_CREATE_POLICY = "CREATE_POLICY";
+    private static final String OP_ATTEST = "ATTEST";
+    private static final String OP_REVOKE_ATTEST = "REVOKE_ATTEST";
+
+    private static final Pattern DIGEST_PATTERN = Pattern.compile("[0-9a-f]{64}");
 
     private final RepositoryDao repositoryDao;
     private final TransactionTemplate transactionTemplate;
@@ -70,7 +101,7 @@ public class ArtifactServiceImpl implements ArtifactService {
         requireRequestId(requestId);
         validateRegisterRequest(request);
         String hash = sha256(OP_REGISTER + "|" + request.name().trim() + "|" + request.version() + "|"
-                + canonicalDependencies(request));
+                + canonicalDependencies(request) + "|" + (request.digest() == null ? "" : request.digest()));
         return executeIdempotent(requestId, OP_REGISTER, hash, 201,
                 () -> doRegister(request), ArtifactResponse.class);
     }
@@ -116,6 +147,189 @@ public class ArtifactServiceImpl implements ArtifactService {
         return toLockResponse(row, repositoryDao.listLockEntries(id));
     }
 
+    @Override
+    public PolicyResponse createPolicyVersion(String requestId, CreatePolicyRequest request) {
+        requireRequestId(requestId);
+        List<String> repos = normalizeRepos(request.allowedRepos());
+        String hash = sha256(OP_CREATE_POLICY + "|" + request.minLevel() + "|" + String.join(",", repos));
+        return executeIdempotent(requestId, OP_CREATE_POLICY, hash, 201,
+                () -> doCreatePolicy(request.minLevel(), repos), PolicyResponse.class);
+    }
+
+    @Override
+    public List<PolicyResponse> listPolicies() {
+        List<PolicyResponse> result = new ArrayList<>();
+        for (PolicyRow row : repositoryDao.listPolicies()) {
+            result.add(new PolicyResponse(row.version(), row.minLevel(),
+                    repositoryDao.listPolicyRepos(row.id()), row.createdAt()));
+        }
+        return result;
+    }
+
+    @Override
+    public AttestationResponse attest(String requestId, AttestationRequest request) {
+        requireRequestId(requestId);
+        if (request.name() == null || request.name().isBlank()) {
+            throw ApiException.badRequest("name 不能为空");
+        }
+        if (request.repoId() == null || request.repoId().isBlank()) {
+            throw ApiException.badRequest("repoId 不能为空");
+        }
+        String digest = normalizeDigest(request.digest());
+        String name = request.name().trim();
+        String repoId = request.repoId().trim();
+        String hash = sha256(OP_ATTEST + "|" + name + "|" + request.version() + "|"
+                + repoId + "|" + digest + "|" + request.level());
+        return executeIdempotent(requestId, OP_ATTEST, hash, 201,
+                () -> doAttest(name, request.version(), repoId, digest, request.level()),
+                AttestationResponse.class);
+    }
+
+    @Override
+    public AttestationResponse revokeAttestation(String requestId, String name, int version) {
+        requireRequestId(requestId);
+        if (name == null || name.isBlank()) {
+            throw ApiException.badRequest("name 不能为空");
+        }
+        String hash = sha256(OP_REVOKE_ATTEST + "|" + name.trim() + "|" + version);
+        return executeIdempotent(requestId, OP_REVOKE_ATTEST, hash, 200,
+                () -> doRevokeAttestation(name.trim(), version), AttestationResponse.class);
+    }
+
+    @Override
+    public PublishResponse publishLock(long lockFileId, PublishRequest request) {
+        if (request.operator() == null || request.operator().isBlank()) {
+            throw ApiException.badRequest("operator 不能为空");
+        }
+        String operator = request.operator().trim();
+        return transactionTemplate.execute(status -> {
+            // 与其他写操作共用同一行锁，按提交顺序裁决。
+            repositoryDao.lockRepositoryState();
+            LockFileRow lock = repositoryDao.getLockFile(lockFileId);
+            if (lock == null) {
+                throw ApiException.notFound("锁文件不存在: " + lockFileId);
+            }
+            ProvenancePolicy policy = currentPolicy();
+            if (policy == null) {
+                throw ApiException.unprocessable("尚未定义来源策略，无法发布锁定图");
+            }
+            Map<String, Integer> solution = lockSolution(lock.id());
+            Map<String, Attestation> attestations = repositoryDao.loadCurrentAttestations();
+            List<PolicyViolation> violations = evaluateSolution(
+                    policy, solution, attestations, lock.rootName(), lock.rootVersion());
+            if (!violations.isEmpty()) {
+                throw ApiException.policyViolation(formatViolations(violations));
+            }
+
+            String normalized = ProvenanceChecker.normalizedAttestationDigest(solution, attestations);
+            String provenanceKey = sha256("PUBLISH|" + lock.id() + "|" + lock.repositoryVersion()
+                    + "|" + policy.version() + "|" + normalized + "|" + operator);
+            PublishRow existing = repositoryDao.findPublishByKey(provenanceKey);
+            if (existing != null) {
+                // 同键重放：返回首次发布结果。
+                return toPublishResponse(existing);
+            }
+
+            Instant now = Instant.now(clock);
+            long publishId = repositoryDao.insertPublishRecord(
+                    lock.id(), policy.version(), provenanceKey, operator, now);
+            List<PublishEntryView> entries = new ArrayList<>();
+            for (Map.Entry<String, Integer> entry : new TreeMap<>(solution).entrySet()) {
+                Attestation attestation = attestations.get(entry.getKey() + ":" + entry.getValue());
+                repositoryDao.insertPublishEntry(publishId, entry.getKey(), entry.getValue(),
+                        attestation.id(), attestation.attestationVersion(),
+                        attestation.repoId(), attestation.digest(), attestation.level());
+                entries.add(new PublishEntryView(entry.getKey(), entry.getValue(),
+                        attestation.attestationVersion(), attestation.repoId(),
+                        attestation.digest(), attestation.level()));
+            }
+            return new PublishResponse(publishId, lock.id(), policy.version(), provenanceKey,
+                    operator, now, List.copyOf(entries));
+        });
+    }
+
+    @Override
+    public ProvenanceResponse getProvenance(long lockFileId) {
+        LockFileRow lock = repositoryDao.getLockFile(lockFileId);
+        if (lock == null) {
+            throw ApiException.notFound("锁文件不存在: " + lockFileId);
+        }
+        Map<String, Integer> solution = lockSolution(lock.id());
+        Map<String, String> paths = buildPaths(solution, lock.rootName(), lock.rootVersion());
+
+        PublishRow publish = repositoryDao.findLatestPublishByLock(lockFileId);
+        if (publish != null) {
+            // 已发布：来源数据来自冻结快照，撤销与策略收紧不倒改。
+            List<ProvenanceEntryView> entries = new ArrayList<>();
+            for (PublishEntryRow row : repositoryDao.listPublishEntries(publish.id())) {
+                entries.add(new ProvenanceEntryView(row.name(), row.version(),
+                        paths.getOrDefault(row.name(), row.name() + ":" + row.version()),
+                        row.attestationVersion(), row.repoId(), row.digest(), row.level(),
+                        null, "OK"));
+            }
+            return new ProvenanceResponse(lockFileId, true, publish.policyVersion(),
+                    List.copyOf(entries));
+        }
+
+        ProvenancePolicy policy = currentPolicy();
+        Map<String, Attestation> attestations = repositoryDao.loadCurrentAttestations();
+        Map<String, String> statusByCoordinate = new TreeMap<>();
+        if (policy != null) {
+            for (PolicyViolation violation : evaluateSolution(
+                    policy, solution, attestations, lock.rootName(), lock.rootVersion())) {
+                statusByCoordinate.putIfAbsent(violation.coordinate(), violation.code());
+            }
+        }
+        List<ProvenanceEntryView> entries = new ArrayList<>();
+        for (Map.Entry<String, Integer> entry : new TreeMap<>(solution).entrySet()) {
+            String coordinate = entry.getKey() + ":" + entry.getValue();
+            Attestation attestation = attestations.get(coordinate);
+            entries.add(new ProvenanceEntryView(entry.getKey(), entry.getValue(),
+                    paths.getOrDefault(entry.getKey(), coordinate),
+                    attestation == null ? null : attestation.attestationVersion(),
+                    attestation == null ? null : attestation.repoId(),
+                    attestation == null ? null : attestation.digest(),
+                    attestation == null ? null : attestation.level(),
+                    attestation == null ? null : attestation.revoked(),
+                    statusByCoordinate.getOrDefault(coordinate, "OK")));
+        }
+        return new ProvenanceResponse(lockFileId, false,
+                policy == null ? null : policy.version(), List.copyOf(entries));
+    }
+
+    @Override
+    public PublishDiagnosticResponse getPublishDiagnostic(long lockFileId) {
+        LockFileRow lock = repositoryDao.getLockFile(lockFileId);
+        if (lock == null) {
+            throw ApiException.notFound("锁文件不存在: " + lockFileId);
+        }
+        boolean published = repositoryDao.findLatestPublishByLock(lockFileId) != null;
+        ProvenancePolicy policy = currentPolicy();
+        List<PolicyViolation> violations = policy == null
+                ? List.of()
+                : evaluateSolution(policy, lockSolution(lock.id()),
+                        repositoryDao.loadCurrentAttestations(), lock.rootName(), lock.rootVersion());
+        return new PublishDiagnosticResponse(lockFileId, published,
+                policy == null ? null : policy.version(), violations);
+    }
+
+    @Override
+    public MigrationCheckResponse checkMigration(MigrationCheckRequest request) {
+        List<String> repos = normalizeRepos(request.allowedRepos());
+        // 候选策略版本号取“下一版本”，仅用于诊断信息展示，不写入。
+        ProvenancePolicy candidate = new ProvenancePolicy(
+                repositoryDao.maxPolicyVersion() + 1, request.minLevel(), repos);
+        Map<String, Attestation> attestations = repositoryDao.loadCurrentAttestations();
+        List<LockMigrationResult> results = new ArrayList<>();
+        for (LockFileRow lock : repositoryDao.listLockFiles()) {
+            List<PolicyViolation> violations = evaluateSolution(candidate, lockSolution(lock.id()),
+                    attestations, lock.rootName(), lock.rootVersion());
+            results.add(new LockMigrationResult(lock.id(), lock.rootName(), lock.rootVersion(),
+                    violations));
+        }
+        return new MigrationCheckResponse(request.minLevel(), repos, List.copyOf(results));
+    }
+
     // ------------------------------------------------------------------
     // 业务操作（运行在已加行锁的写事务内）
     // ------------------------------------------------------------------
@@ -138,7 +352,7 @@ public class ArtifactServiceImpl implements ArtifactService {
         }
 
         Instant now = Instant.now(clock);
-        long artifactId = repositoryDao.insertArtifact(name, version, now);
+        long artifactId = repositoryDao.insertArtifact(name, version, request.digest(), now);
         for (var dep : request.dependencies()) {
             repositoryDao.insertDependency(artifactId, dep.name().trim(),
                     dep.minimumVersion(), dep.maximumVersion());
@@ -193,6 +407,17 @@ public class ArtifactServiceImpl implements ArtifactService {
                     "不存在满足全部依赖区间的未撤回版本组合，无法锁定");
         }
 
+        // 来源策略门禁：存在策略时，全部直接及传递命中坐标必须满足当前策略版本，
+        // 任一违规则整个解析快照不写入（事务回滚）。
+        ProvenancePolicy policy = currentPolicy();
+        if (policy != null) {
+            List<PolicyViolation> violations = evaluateSolution(policy, solution,
+                    repositoryDao.loadCurrentAttestations(), rootName, rootVersion);
+            if (!violations.isEmpty()) {
+                throw ApiException.policyViolation(formatViolations(violations));
+            }
+        }
+
         Instant now = Instant.now(clock);
         long lockFileId = repositoryDao.insertLockFile(rootName, rootVersion, currentVersion,
                 currentRequestId.get(), now);
@@ -201,6 +426,143 @@ public class ArtifactServiceImpl implements ArtifactService {
         List<LockEntryResponse> entries = new ArrayList<>();
         solution.forEach((n, v) -> entries.add(new LockEntryResponse(n, v)));
         return new LockFileResponse(lockFileId, rootName, rootVersion, currentVersion, now, entries);
+    }
+
+    private PolicyResponse doCreatePolicy(int minLevel, List<String> repos) {
+        int version = repositoryDao.maxPolicyVersion() + 1;
+        Instant now = Instant.now(clock);
+        long policyId = repositoryDao.insertPolicy(version, minLevel, now);
+        for (String repo : repos) {
+            repositoryDao.insertPolicyRepo(policyId, repo);
+        }
+        return new PolicyResponse(version, minLevel, repos, now);
+    }
+
+    private AttestationResponse doAttest(String name, int version, String repoId,
+                                         String digest, int level) {
+        if (repositoryDao.loadArtifact(name, version) == null) {
+            throw ApiException.notFound("制品版本不存在: " + name + ":" + version);
+        }
+        int attestationVersion = repositoryDao.maxAttestationVersion(name, version) + 1;
+        Instant now = Instant.now(clock);
+        repositoryDao.insertAttestation(name, version, attestationVersion, repoId, digest, level, now);
+        return new AttestationResponse(name, version, attestationVersion, repoId, digest, level,
+                false, now);
+    }
+
+    private AttestationResponse doRevokeAttestation(String name, int version) {
+        Attestation current = repositoryDao.loadCurrentAttestation(name, version);
+        if (current == null) {
+            throw ApiException.notFound("坐标证明不存在: " + name + ":" + version);
+        }
+        if (current.revoked()) {
+            throw ApiException.conflict("坐标证明已撤销: " + name + ":" + version);
+        }
+        int affected = repositoryDao.markAttestationRevoked(current.id());
+        if (affected == 0) {
+            // 并发撤销抢先提交（持有行锁时理论上不会发生，防御性处理）。
+            throw ApiException.conflict("坐标证明已撤销: " + name + ":" + version);
+        }
+        return new AttestationResponse(name, version, current.attestationVersion(),
+                current.repoId(), current.digest(), current.level(), true, Instant.now(clock));
+    }
+
+    // ------------------------------------------------------------------
+    // 来源策略辅助
+    // ------------------------------------------------------------------
+
+    /** 当前策略版本（最高版本号），无策略返回 null。 */
+    private ProvenancePolicy currentPolicy() {
+        int maxVersion = repositoryDao.maxPolicyVersion();
+        if (maxVersion == 0) {
+            return null;
+        }
+        for (PolicyRow row : repositoryDao.listPolicies()) {
+            if (row.version() == maxVersion) {
+                return new ProvenancePolicy(row.version(), row.minLevel(),
+                        repositoryDao.listPolicyRepos(row.id()));
+            }
+        }
+        return null;
+    }
+
+    /** 锁文件的精确版本集合：名称 -> 版本。 */
+    private Map<String, Integer> lockSolution(long lockFileId) {
+        Map<String, Integer> solution = new TreeMap<>();
+        for (LockEntryRow entry : repositoryDao.listLockEntries(lockFileId)) {
+            solution.put(entry.name(), entry.version());
+        }
+        return solution;
+    }
+
+    /** 在精确版本集合上按策略校验，返回全部违规（含完整依赖路径）。 */
+    private List<PolicyViolation> evaluateSolution(ProvenancePolicy policy,
+                                                   Map<String, Integer> solution,
+                                                   Map<String, Attestation> attestations,
+                                                   String rootName,
+                                                   int rootVersion) {
+        Map<String, List<DependencyRange>> declared = repositoryDao.loadAllDependencies();
+        Map<String, List<String>> dependencyIndex =
+                ProvenanceChecker.dependencyIndex(solution, declared);
+        return ProvenanceChecker.check(policy, solution, dependencyIndex, attestations,
+                repositoryDao.loadArtifactDigests(), rootName, rootVersion);
+    }
+
+    /** 从根出发的完整依赖路径：名称 -> 路径串。 */
+    private Map<String, String> buildPaths(Map<String, Integer> solution,
+                                           String rootName, int rootVersion) {
+        Map<String, List<DependencyRange>> declared = repositoryDao.loadAllDependencies();
+        Map<String, List<String>> dependencyIndex =
+                ProvenanceChecker.dependencyIndex(solution, declared);
+        return ProvenanceChecker.buildPaths(solution, dependencyIndex, rootName, rootVersion);
+    }
+
+    private static String formatViolations(List<PolicyViolation> violations) {
+        StringBuilder sb = new StringBuilder("来源策略校验失败: ");
+        for (int i = 0; i < violations.size(); i++) {
+            PolicyViolation v = violations.get(i);
+            if (i > 0) {
+                sb.append("; ");
+            }
+            sb.append('[').append(v.code()).append("] ").append(v.path())
+                    .append(' ').append(v.message());
+        }
+        return sb.toString();
+    }
+
+    private static List<String> normalizeRepos(List<String> allowedRepos) {
+        if (allowedRepos == null || allowedRepos.isEmpty()) {
+            throw ApiException.badRequest("allowedRepos 不能为空");
+        }
+        Set<String> distinct = new HashSet<>();
+        for (String repo : allowedRepos) {
+            if (repo == null || repo.isBlank()) {
+                throw ApiException.badRequest("allowedRepos 不能包含空白项");
+            }
+            distinct.add(repo.trim());
+        }
+        return distinct.stream().sorted().toList();
+    }
+
+    private static String normalizeDigest(String digest) {
+        if (digest == null || digest.isBlank()) {
+            throw ApiException.badRequest("digest 不能为空");
+        }
+        String normalized = digest.trim().toLowerCase(Locale.ROOT);
+        if (!DIGEST_PATTERN.matcher(normalized).matches()) {
+            throw ApiException.badRequest("digest 必须是 64 位十六进制 SHA-256 摘要");
+        }
+        return normalized;
+    }
+
+    private PublishResponse toPublishResponse(PublishRow row) {
+        List<PublishEntryView> entries = new ArrayList<>();
+        for (PublishEntryRow entry : repositoryDao.listPublishEntries(row.id())) {
+            entries.add(new PublishEntryView(entry.name(), entry.version(),
+                    entry.attestationVersion(), entry.repoId(), entry.digest(), entry.level()));
+        }
+        return new PublishResponse(row.id(), row.lockFileId(), row.policyVersion(),
+                row.provenanceKey(), row.operatorName(), row.createdAt(), List.copyOf(entries));
     }
 
     // ------------------------------------------------------------------
@@ -274,6 +636,9 @@ public class ArtifactServiceImpl implements ArtifactService {
     private void validateRegisterRequest(RegisterArtifactRequest request) {
         if (request.name() == null || request.name().isBlank()) {
             throw ApiException.badRequest("name 不能为空");
+        }
+        if (request.digest() != null && !DIGEST_PATTERN.matcher(request.digest()).matches()) {
+            throw ApiException.badRequest("digest 必须是 64 位十六进制 SHA-256 摘要");
         }
         List<DependencySpec> deps = request.dependencies();
         if (deps.size() > 10) {

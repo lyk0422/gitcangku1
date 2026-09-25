@@ -3,6 +3,10 @@ package com.example.starter.api;
 import com.example.starter.api.dto.ArtifactResponse;
 import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
+import com.example.starter.api.dto.ProvenanceResponse;
+import com.example.starter.api.dto.PublishDiagnosticResponse;
+import com.example.starter.api.dto.PublishRequest;
+import com.example.starter.api.dto.PublishResponse;
 import com.example.starter.api.dto.RegisterArtifactRequest;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Positive;
@@ -68,5 +72,26 @@ public class ArtifactController {
     @GetMapping("/locks/{id}")
     public LockFileResponse getLock(@PathVariable long id) {
         return artifactService.getLock(id);
+    }
+
+    /** 发布锁定图：按当前策略版本校验，provenanceKey 同键重放。 */
+    @PostMapping("/locks/{id}/publish")
+    public ResponseEntity<PublishResponse> publish(
+            @PathVariable long id,
+            @Valid @RequestBody PublishRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(artifactService.publishLock(id, request));
+    }
+
+    /** 查询锁定图来源路径（已发布返回冻结快照）。 */
+    @GetMapping("/locks/{id}/provenance")
+    public ProvenanceResponse provenance(@PathVariable long id) {
+        return artifactService.getProvenance(id);
+    }
+
+    /** 查询锁定图发布阻断诊断。 */
+    @GetMapping("/locks/{id}/publish-diagnostic")
+    public PublishDiagnosticResponse publishDiagnostic(@PathVariable long id) {
+        return artifactService.getPublishDiagnostic(id);
     }
 }

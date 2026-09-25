@@ -41,6 +41,11 @@ class ArtifactServiceH2Test {
 
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM publish_entry");
+        jdbcTemplate.update("DELETE FROM publish_record");
+        jdbcTemplate.update("DELETE FROM attestation");
+        jdbcTemplate.update("DELETE FROM provenance_policy_repo");
+        jdbcTemplate.update("DELETE FROM provenance_policy");
         jdbcTemplate.update("DELETE FROM lock_file_entry");
         jdbcTemplate.update("DELETE FROM lock_file");
         jdbcTemplate.update("DELETE FROM artifact_dependency");

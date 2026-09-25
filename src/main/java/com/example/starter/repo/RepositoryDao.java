@@ -1,6 +1,7 @@
 package com.example.starter.repo;
 
 import com.example.starter.domain.ArtifactVersion;
+import com.example.starter.domain.Attestation;
 import com.example.starter.domain.DependencyRange;
 import com.example.starter.domain.RepositorySnapshot;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -101,16 +102,17 @@ public class RepositoryDao {
         return count == null ? 0 : count;
     }
 
-    /** 新增制品版本，返回自增主键。 */
-    public long insertArtifact(String name, int version, Instant createdAt) {
+    /** 新增制品版本，返回自增主键；digest 可空（未登记摘要）。 */
+    public long insertArtifact(String name, int version, String digest, Instant createdAt) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbcTemplate.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO artifact (name, version, withdrawn, created_at) VALUES (?, ?, 0, ?)",
+                    "INSERT INTO artifact (name, version, withdrawn, digest, created_at) VALUES (?, ?, 0, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, name);
             ps.setInt(2, version);
-            ps.setTimestamp(3, Timestamp.from(createdAt));
+            ps.setString(3, digest);
+            ps.setTimestamp(4, Timestamp.from(createdAt));
             return ps;
         }, keyHolder);
         Number key = keyHolder.getKey();
@@ -278,5 +280,262 @@ public class RepositoryDao {
     }
 
     private record DepRow(long artifactId, String name, int minimumVersion, int maximumVersion) {
+    }
+
+    // ------------------------------------------------------------------
+    // 来源策略
+    // ------------------------------------------------------------------
+
+    /** 当前最大策略版本号；无策略返回 0。 */
+    public int maxPolicyVersion() {
+        Integer version = jdbcTemplate.queryForObject(
+                "SELECT COALESCE(MAX(version), 0) FROM provenance_policy", Integer.class);
+        return version == null ? 0 : version;
+    }
+
+    /** 追加一个策略版本，返回自增主键。 */
+    public long insertPolicy(int version, int minLevel, Instant createdAt) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbcTemplate.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO provenance_policy (version, min_level, created_at) VALUES (?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setInt(1, version);
+            ps.setInt(2, minLevel);
+            ps.setTimestamp(3, Timestamp.from(createdAt));
+            return ps;
+        }, keyHolder);
+        Number key = keyHolder.getKey();
+        if (key == null) {
+            throw new IllegalStateException("插入策略版本未获取自增主键");
+        }
+        return key.longValue();
+    }
+
+    /** 为策略版本写入一个允许的来源仓标识。 */
+    public void insertPolicyRepo(long policyId, String repoId) {
+        jdbcTemplate.update(
+                "INSERT INTO provenance_policy_repo (policy_id, repo_id) VALUES (?, ?)",
+                policyId, repoId);
+    }
+
+    /** 策略版本行（不含允许仓集合）。 */
+    public record PolicyRow(long id, int version, int minLevel, Instant createdAt) {
+    }
+
+    /** 查询全部策略版本，按版本号升序。 */
+    public List<PolicyRow> listPolicies() {
+        return jdbcTemplate.query(
+                "SELECT id, version, min_level, created_at FROM provenance_policy ORDER BY version ASC",
+                (rs, n) -> new PolicyRow(rs.getLong("id"), rs.getInt("version"),
+                        rs.getInt("min_level"), rs.getTimestamp("created_at").toInstant()));
+    }
+
+    /** 查询某策略版本允许的来源仓标识，字典序升序。 */
+    public List<String> listPolicyRepos(long policyId) {
+        return jdbcTemplate.query(
+                "SELECT repo_id FROM provenance_policy_repo WHERE policy_id = ? ORDER BY repo_id ASC",
+                (rs, n) -> rs.getString("repo_id"), policyId);
+    }
+
+    // ------------------------------------------------------------------
+    // 来源证明
+    // ------------------------------------------------------------------
+
+    /** 指定坐标当前最大证明版本号；无证明返回 0。 */
+    public int maxAttestationVersion(String name, int version) {
+        Integer value = jdbcTemplate.queryForObject(
+                "SELECT COALESCE(MAX(attestation_version), 0) FROM attestation "
+                        + "WHERE name = ? AND version = ?",
+                Integer.class, name, version);
+        return value == null ? 0 : value;
+    }
+
+    /** 追加一条证明，返回自增主键。 */
+    public long insertAttestation(String name, int version, int attestationVersion,
+                                  String repoId, String digest, int level, Instant createdAt) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbcTemplate.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO attestation (name, version, attestation_version, repo_id, digest, "
+                            + "attestation_level, revoked, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, name);
+            ps.setInt(2, version);
+            ps.setInt(3, attestationVersion);
+            ps.setString(4, repoId);
+            ps.setString(5, digest);
+            ps.setInt(6, level);
+            ps.setTimestamp(7, Timestamp.from(createdAt));
+            return ps;
+        }, keyHolder);
+        Number key = keyHolder.getKey();
+        if (key == null) {
+            throw new IllegalStateException("插入证明未获取自增主键");
+        }
+        return key.longValue();
+    }
+
+    /** 读取指定坐标的当前证明（证明版本最大的一条），不存在返回 null。 */
+    public Attestation loadCurrentAttestation(String name, int version) {
+        List<Attestation> rows = jdbcTemplate.query(
+                "SELECT id, name, version, attestation_version, repo_id, digest, attestation_level, revoked "
+                        + "FROM attestation WHERE name = ? AND version = ? "
+                        + "ORDER BY attestation_version DESC",
+                (rs, n) -> mapAttestation(rs), name, version);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /**
+     * 读取全部坐标的当前证明：坐标键(name:version) -> 证明版本最大的一条。
+     */
+    public Map<String, Attestation> loadCurrentAttestations() {
+        List<Attestation> rows = jdbcTemplate.query(
+                "SELECT id, name, version, attestation_version, repo_id, digest, attestation_level, revoked "
+                        + "FROM attestation ORDER BY name ASC, version ASC, attestation_version ASC",
+                (rs, n) -> mapAttestation(rs));
+        Map<String, Attestation> current = new LinkedHashMap<>();
+        for (Attestation row : rows) {
+            // 按证明版本升序遍历，后写覆盖先写，最终保留最大版本。
+            current.put(row.coordinate(), row);
+        }
+        return current;
+    }
+
+    /**
+     * 撤销指定证明，仅当当前未撤销时生效，返回受影响行数。
+     */
+    public int markAttestationRevoked(long attestationId) {
+        return jdbcTemplate.update(
+                "UPDATE attestation SET revoked = 1 WHERE id = ? AND revoked = 0", attestationId);
+    }
+
+    private static Attestation mapAttestation(java.sql.ResultSet rs) throws java.sql.SQLException {
+        return new Attestation(rs.getLong("id"), rs.getString("name"), rs.getInt("version"),
+                rs.getInt("attestation_version"), rs.getString("repo_id"), rs.getString("digest"),
+                rs.getInt("attestation_level"), rs.getInt("revoked") == 1);
+    }
+
+    // ------------------------------------------------------------------
+    // 来源校验辅助数据
+    // ------------------------------------------------------------------
+
+    /** 全部制品坐标的登记摘要：坐标键 -> 摘要；未登记摘要的坐标不出现在结果中。 */
+    public Map<String, String> loadArtifactDigests() {
+        Map<String, String> digests = new LinkedHashMap<>();
+        jdbcTemplate.query(
+                "SELECT name, version, digest FROM artifact WHERE digest IS NOT NULL",
+                (rs, n) -> {
+                    digests.put(rs.getString("name") + ":" + rs.getInt("version"),
+                            rs.getString("digest"));
+                    return null;
+                });
+        return digests;
+    }
+
+    /** 全部制品坐标声明的依赖：坐标键 -> 依赖区间列表。 */
+    public Map<String, List<DependencyRange>> loadAllDependencies() {
+        List<DepRowWithCoord> depRows = jdbcTemplate.query(
+                "SELECT a.name AS artifact_name, a.version AS artifact_version, "
+                        + "d.name, d.minimum_version, d.maximum_version "
+                        + "FROM artifact_dependency d JOIN artifact a ON d.artifact_id = a.id",
+                (rs, n) -> new DepRowWithCoord(rs.getString("artifact_name"),
+                        rs.getInt("artifact_version"), rs.getString("name"),
+                        rs.getInt("minimum_version"), rs.getInt("maximum_version")));
+        Map<String, List<DependencyRange>> index = new LinkedHashMap<>();
+        for (DepRowWithCoord row : depRows) {
+            index.computeIfAbsent(row.artifactName() + ":" + row.artifactVersion(),
+                            k -> new ArrayList<>())
+                    .add(new DependencyRange(row.name(), row.minimumVersion(), row.maximumVersion()));
+        }
+        return index;
+    }
+
+    private record DepRowWithCoord(String artifactName, int artifactVersion, String name,
+                                   int minimumVersion, int maximumVersion) {
+    }
+
+    // ------------------------------------------------------------------
+    // 发布快照
+    // ------------------------------------------------------------------
+
+    /** 发布记录行。 */
+    public record PublishRow(long id, long lockFileId, int policyVersion, String provenanceKey,
+                             String operatorName, Instant createdAt) {
+    }
+
+    /** 发布条目行。 */
+    public record PublishEntryRow(long publishId, String name, int version, long attestationId,
+                                  int attestationVersion, String repoId, String digest, int level) {
+    }
+
+    /** 新增发布记录，返回自增主键；provenance_key 冲突由唯一索引抛出。 */
+    public long insertPublishRecord(long lockFileId, int policyVersion, String provenanceKey,
+                                    String operatorName, Instant createdAt) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbcTemplate.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO publish_record (lock_file_id, policy_version, provenance_key, "
+                            + "operator_name, created_at) VALUES (?, ?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setLong(1, lockFileId);
+            ps.setInt(2, policyVersion);
+            ps.setString(3, provenanceKey);
+            ps.setString(4, operatorName);
+            ps.setTimestamp(5, Timestamp.from(createdAt));
+            return ps;
+        }, keyHolder);
+        Number key = keyHolder.getKey();
+        if (key == null) {
+            throw new IllegalStateException("插入发布记录未获取自增主键");
+        }
+        return key.longValue();
+    }
+
+    /** 新增发布快照条目。 */
+    public void insertPublishEntry(long publishId, String name, int version, long attestationId,
+                                   int attestationVersion, String repoId, String digest, int level) {
+        jdbcTemplate.update(
+                "INSERT INTO publish_entry (publish_id, name, version, attestation_id, "
+                        + "attestation_version, repo_id, digest, attestation_level) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                publishId, name, version, attestationId, attestationVersion, repoId, digest, level);
+    }
+
+    /** 按 provenanceKey 查询发布记录，不存在返回 null。 */
+    public PublishRow findPublishByKey(String provenanceKey) {
+        List<PublishRow> rows = jdbcTemplate.query(
+                "SELECT id, lock_file_id, policy_version, provenance_key, operator_name, created_at "
+                        + "FROM publish_record WHERE provenance_key = ?",
+                (rs, n) -> mapPublishRow(rs), provenanceKey);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /** 查询某锁文件最近一次发布记录，未发布返回 null。 */
+    public PublishRow findLatestPublishByLock(long lockFileId) {
+        List<PublishRow> rows = jdbcTemplate.query(
+                "SELECT id, lock_file_id, policy_version, provenance_key, operator_name, created_at "
+                        + "FROM publish_record WHERE lock_file_id = ? ORDER BY id DESC",
+                (rs, n) -> mapPublishRow(rs), lockFileId);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    private static PublishRow mapPublishRow(java.sql.ResultSet rs) throws java.sql.SQLException {
+        return new PublishRow(rs.getLong("id"), rs.getLong("lock_file_id"),
+                rs.getInt("policy_version"), rs.getString("provenance_key"),
+                rs.getString("operator_name"), rs.getTimestamp("created_at").toInstant());
+    }
+
+    /** 查询某次发布的全部冻结条目，按名称升序。 */
+    public List<PublishEntryRow> listPublishEntries(long publishId) {
+        return jdbcTemplate.query(
+                "SELECT publish_id, name, version, attestation_id, attestation_version, repo_id, "
+                        + "digest, attestation_level FROM publish_entry "
+                        + "WHERE publish_id = ? ORDER BY name ASC",
+                (rs, n) -> new PublishEntryRow(rs.getLong("publish_id"), rs.getString("name"),
+                        rs.getInt("version"), rs.getLong("attestation_id"),
+                        rs.getInt("attestation_version"), rs.getString("repo_id"),
+                        rs.getString("digest"), rs.getInt("attestation_level")),
+                publishId);
     }
 }

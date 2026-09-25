@@ -37,4 +37,9 @@ public class ApiException extends RuntimeException {
     public static ApiException unprocessable(String message) {
         return new ApiException(422, "UNPROCESSABLE_ENTITY", message);
     }
+
+    /** 来源策略校验失败（422），message 中列出全部违规路径与可区分原因。 */
+    public static ApiException policyViolation(String message) {
+        return new ApiException(422, "POLICY_VIOLATION", message);
+    }
 }
