@@ -87,6 +87,7 @@ class ExposureConcurrencyTest {
         jdbc.update("DELETE FROM exposure_reservation");
         jdbc.update("DELETE FROM quota_visitor_ledger");
         jdbc.update("DELETE FROM quota_total_ledger");
+        jdbc.update("DELETE FROM suppression_interval");
         jdbc.update("DELETE FROM campaign");
     }
 
@@ -113,8 +114,9 @@ class ExposureConcurrencyTest {
             pool.submit(() -> {
                 try {
                     start.await();
-                    ReservationResponse r = service.apply(
-                            new ApplyExposureRequest("req-a-" + idx, "cap", "visitor-" + idx));
+                    ReservationResponse r = (ReservationResponse) service.apply(
+                            new ApplyExposureRequest("req-a-" + idx, "cap", "visitor-" + idx,
+                                    "slot-1", BASE.toEpochMilli()));
                     success.incrementAndGet();
                     reservationIds.add(r.reservationId());
                 } catch (ApiException ex) {
@@ -145,7 +147,8 @@ class ExposureConcurrencyTest {
     @DisplayName("同一预占并发确认/取消：只允许一个终态，额度不重复释放、不变负")
     void concurrentConfirmAndCancel_singleTerminal_noDoubleRelease() throws Exception {
         service.createCampaign(new CreateCampaignRequest("req-c", "cap", 1, 1));
-        ReservationResponse r = service.apply(new ApplyExposureRequest("req-a", "cap", "v1"));
+        ReservationResponse r = (ReservationResponse) service.apply(
+                new ApplyExposureRequest("req-a", "cap", "v1", "slot-1", BASE.toEpochMilli()));
 
         int threads = 24;
         ExecutorService pool = Executors.newFixedThreadPool(threads);
@@ -224,8 +227,9 @@ class ExposureConcurrencyTest {
             pool.submit(() -> {
                 try {
                     start.await();
-                    ReservationResponse r = service.apply(
-                            new ApplyExposureRequest("same-key", "cap", "visitor-x"));
+                    ReservationResponse r = (ReservationResponse) service.apply(
+                            new ApplyExposureRequest("same-key", "cap", "visitor-x",
+                                    "slot-1", BASE.toEpochMilli()));
                     reservationIds.add(r.reservationId());
                 } catch (Exception e) {
                     errors.incrementAndGet();

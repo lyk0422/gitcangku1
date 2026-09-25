@@ -16,7 +16,7 @@ import org.springframework.web.bind.annotation.RestController;
 import java.time.LocalDate;
 
 /**
- * 公告曝光频控 API。
+ * 公告曝光频控与访客抑制名单 API。
  */
 @RestController
 @RequestMapping("/api/exposure")
@@ -34,10 +34,15 @@ public class ExposureController {
         return ResponseEntity.status(HttpStatus.CREATED).body(exposureService.createCampaign(request));
     }
 
-    /** 申请曝光：创建 60 秒有效预占并占用两级额度。 */
+    /**
+     * 申请曝光：未命中抑制名单创建 60 秒有效预占（201）；
+     * 命中抑制名单返回 SUPPRESSED（200），不创建预占、不扣频次或预算。
+     */
     @PostMapping("/reservations")
-    public ResponseEntity<ReservationResponse> apply(@Valid @RequestBody ApplyExposureRequest request) {
-        return ResponseEntity.status(HttpStatus.CREATED).body(exposureService.apply(request));
+    public ResponseEntity<ApplyResult> apply(@Valid @RequestBody ApplyExposureRequest request) {
+        ApplyResult result = exposureService.apply(request);
+        HttpStatus status = result instanceof SuppressedResponse ? HttpStatus.OK : HttpStatus.CREATED;
+        return ResponseEntity.status(status).body(result);
     }
 
     /** 预占明细。 */
@@ -70,5 +75,59 @@ public class ExposureController {
                                     @RequestParam(required = false)
                                     @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate utcDate) {
         return exposureService.queryQuota(campaignId, visitorId, utcDate);
+    }
+
+    /** 创建单条抑制区间：起止非法 422，同访客重叠 409。 */
+    @PostMapping("/campaigns/{campaignId}/suppression-intervals")
+    public ResponseEntity<SuppressionIntervalResponse> createSuppressionInterval(
+            @PathVariable String campaignId,
+            @Valid @RequestBody CreateSuppressionIntervalRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(exposureService.createSuppressionInterval(campaignId, request));
+    }
+
+    /**
+     * 批量更新抑制名单：expectedVersion 不一致 409；
+     * 任一重叠或起止非法整批 422，原名单不变。
+     */
+    @PostMapping("/campaigns/{campaignId}/suppression-list:batch-update")
+    public SuppressionListResponse batchUpdateSuppressionList(
+            @PathVariable String campaignId,
+            @Valid @RequestBody BatchUpdateSuppressionListRequest request) {
+        return exposureService.batchUpdateSuppressionList(campaignId, request);
+    }
+
+    /** 删除未开始的抑制区间：立即失效并保留不可变删除记录。 */
+    @PostMapping("/campaigns/{campaignId}/suppression-intervals/{intervalId}/delete")
+    public SuppressionIntervalResponse deleteSuppressionInterval(
+            @PathVariable String campaignId,
+            @PathVariable String intervalId,
+            @Valid @RequestBody IdempotentRequest request) {
+        return exposureService.deleteSuppressionInterval(campaignId, intervalId, request);
+    }
+
+    /** 提前结束已开始的抑制区间：结束时刻不得早于当前时刻。 */
+    @PostMapping("/campaigns/{campaignId}/suppression-intervals/{intervalId}/end")
+    public SuppressionIntervalResponse endSuppressionInterval(
+            @PathVariable String campaignId,
+            @PathVariable String intervalId,
+            @Valid @RequestBody EndSuppressionIntervalRequest request) {
+        return exposureService.endSuppressionInterval(campaignId, intervalId, request);
+    }
+
+    /** 查询访客当前抑制状态与被抑制原因。 */
+    @GetMapping("/campaigns/{campaignId}/suppression-status")
+    public VisitorSuppressionStatusResponse getVisitorSuppressionStatus(
+            @PathVariable String campaignId,
+            @RequestParam String visitorId) {
+        return exposureService.getVisitorSuppressionStatus(campaignId, visitorId);
+    }
+
+    /** 查询区间历史（全部状态）；visitorId 缺省返回该公告全部区间。 */
+    @GetMapping("/campaigns/{campaignId}/suppression-intervals")
+    public SuppressionListResponse listSuppressionIntervals(
+            @PathVariable String campaignId,
+            @RequestParam(required = false) String visitorId) {
+        return exposureService.listSuppressionIntervals(campaignId, visitorId);
     }
 }

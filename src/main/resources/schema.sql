@@ -1,10 +1,12 @@
 -- 公告曝光频控建表脚本；H2 MySQL 兼容模式自动执行，仅使用合成数据。
 
--- 公告表：campaign_id 唯一，额度在创建时固定（每 UTC 日总额度、每访客每日上限）
+-- 公告表：campaign_id 唯一，额度在创建时固定（每 UTC 日总额度、每访客每日上限）；
+-- version 为活动版本（乐观锁），初始 0，每次抑制名单变更（创建/批量更新/删除/提前结束）后 +1
 CREATE TABLE IF NOT EXISTS campaign (
     campaign_id            VARCHAR(64)  NOT NULL,
     daily_total_cap        INT          NOT NULL,
     per_visitor_daily_cap  INT          NOT NULL,
+    version                BIGINT       NOT NULL DEFAULT 0,
     created_at_utc         BIGINT       NOT NULL,
     PRIMARY KEY (campaign_id)
 );
@@ -54,3 +56,26 @@ CREATE TABLE IF NOT EXISTS idempotency_record (
     created_at_utc      BIGINT       NOT NULL,
     PRIMARY KEY (request_id)
 );
+
+-- 访客曝光抑制区间：生效区间为 UTC 左闭右开 [valid_from_utc, valid_until_utc)，单位 epoch 毫秒。
+-- 同一公告同一访客的生效区间（ACTIVE 与 EARLY_ENDED）互不重叠。
+-- status：ACTIVE=生效中（含已缩短但未到的提前结束）；EARLY_ENDED=已提前结束且结束时刻已过，
+-- 记录不可变；DELETED=未开始即删除，立即失效并保留不可变删除记录（deleted_at_utc 为删除时刻）。
+-- original_valid_until_utc 记录首次提前结束前的原始结束时刻；未提前结束为 NULL。
+CREATE TABLE IF NOT EXISTS suppression_interval (
+    interval_id               VARCHAR(64) NOT NULL,
+    campaign_id               VARCHAR(64) NOT NULL,
+    visitor_id                VARCHAR(64) NOT NULL,
+    valid_from_utc            BIGINT      NOT NULL,
+    valid_until_utc           BIGINT      NOT NULL,
+    original_valid_until_utc  BIGINT,
+    status                    VARCHAR(16) NOT NULL,
+    created_at_utc            BIGINT      NOT NULL,
+    deleted_at_utc            BIGINT,
+    PRIMARY KEY (interval_id),
+    CHECK (valid_from_utc < valid_until_utc)
+);
+CREATE INDEX IF NOT EXISTS idx_suppression_campaign_visitor
+    ON suppression_interval (campaign_id, visitor_id, status);
+CREATE INDEX IF NOT EXISTS idx_suppression_match
+    ON suppression_interval (campaign_id, visitor_id, status, valid_from_utc, valid_until_utc);

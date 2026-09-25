@@ -26,7 +26,13 @@ public record ReservationResponse(
         long createdAtUtc,
         long expiresAtUtc,
         Long terminalAtUtc
-) {
+) implements ApplyResult {
+
+    @Override
+    public long decidedAtUtc() {
+        return createdAtUtc;
+    }
+
     public static ReservationResponse from(Reservation r) {
         return new ReservationResponse(
                 r.reservationId(),
