@@ -86,6 +86,15 @@ public class UnblindRequestRepository {
         return rows.isEmpty() ? null : rows.get(0);
     }
 
+    /** 实验范围内待处理揭盲申请数；协议修订生效前必须为 0。 */
+    public long countPendingByExperiment(String experimentId) {
+        Long count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM unblind_request "
+                        + "WHERE experiment_id = ? AND status = 'PENDING'",
+                Long.class, experimentId);
+        return count == null ? 0 : count;
+    }
+
     /**
      * 批准：仅 PENDING 可批准，写入处理代码、批准人与时间，并释放待审唯一占位。
      *

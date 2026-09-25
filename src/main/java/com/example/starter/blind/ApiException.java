@@ -44,8 +44,13 @@ public class ApiException extends RuntimeException {
         return new ApiException(HttpStatus.CONFLICT, message);
     }
 
-    /** 422 业务不可处理：实验满额，无空位可分配。 */
+    /** 422 业务不可处理：实验满额、容量不足、序列生成失败、有待处理揭盲等。 */
     public static ApiException full(String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, message);
+    }
+
+    /** 422 业务不可处理（协议修订/中心容量/序列等语义）。 */
+    public static ApiException unprocessable(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, message);
     }
 }

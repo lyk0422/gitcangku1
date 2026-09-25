@@ -27,15 +27,18 @@ public class UnblindService {
     private final UnblindRequestRepository unblindRequestRepository;
     private final ExperimentService experimentService;
     private final ExperimentRepository experimentRepository;
+    private final ProtocolAmendmentService protocolAmendmentService;
     private final Clock clock;
 
     public UnblindService(UnblindRequestRepository unblindRequestRepository,
                           ExperimentService experimentService,
                           ExperimentRepository experimentRepository,
+                          ProtocolAmendmentService protocolAmendmentService,
                           Clock clock) {
         this.unblindRequestRepository = unblindRequestRepository;
         this.experimentService = experimentService;
         this.experimentRepository = experimentRepository;
+        this.protocolAmendmentService = protocolAmendmentService;
         this.clock = clock;
     }
 
@@ -51,6 +54,8 @@ public class UnblindService {
         if (reason.length() > 500) {
             throw ApiException.badRequest("reason 最长 500 字符");
         }
+        // 揭盲申请提交同样按提交顺序裁决到期协议修订。
+        protocolAmendmentService.settleBeforeLegacyWrite(experimentId);
         AllocationRow allocation =
                 experimentService.mustFindAllocationRow(experimentId, participantId);
         UnblindRequestRow pending =
@@ -86,17 +91,24 @@ public class UnblindService {
         if (row.applicantActor().equals(reviewerActor)) {
             throw ApiException.forbidden("批准人必须是不同于申请人的另一名 REVIEWER");
         }
-        // 从数据库读取处理映射（盲底），批准时写入申请记录；处理代码不打日志。
+        // 揭盲结果按分配归属解析：中心协议登记固化了处理代码（永久归属其协议版本）；
+        // 旧的实验级区组登记仍从席位映射解码。处理代码不打日志。
         AllocationRow allocation =
                 experimentService.mustFindAllocationRow(row.experimentId(), row.participantId());
-        SeatRow seat = experimentRepository.findSeat(row.experimentId(),
-                allocation.blockNo(), allocation.seatNo());
-        if (seat == null) {
-            throw new IllegalStateException("席位映射缺失，数据不一致");
+        String treatment;
+        if (allocation.treatment() != null) {
+            treatment = allocation.treatment();
+        } else {
+            SeatRow seat = experimentRepository.findSeat(row.experimentId(),
+                    allocation.blockNo(), allocation.seatNo());
+            if (seat == null) {
+                throw new IllegalStateException("席位映射缺失，数据不一致");
+            }
+            treatment = seat.treatment();
         }
         long now = clock.nowMillis();
         unblindRequestRepository.approve(unblindRequestId, reviewerActor,
-                seat.treatment(), now);
+                treatment, now);
         return new UnblindRequestView(row.id(), row.experimentId(), row.participantId(),
                 row.reason(), row.applicantActor(), reviewerActor, "APPROVED",
                 row.createdAt(), now);

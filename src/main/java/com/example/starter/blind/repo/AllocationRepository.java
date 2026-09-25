@@ -18,9 +18,12 @@ public class AllocationRepository {
             long id,
             String experimentId,
             String participantId,
-            int blockNo,
-            int seatNo,
+            Integer blockNo,
+            Integer seatNo,
             String blindCode,
+            String treatment,
+            String centerId,
+            Integer versionNo,
             String status,
             String assignedActor,
             long assignedAt,
@@ -31,9 +34,12 @@ public class AllocationRepository {
             rs.getLong("id"),
             rs.getString("experiment_id"),
             rs.getString("participant_id"),
-            rs.getInt("block_no"),
-            rs.getInt("seat_no"),
+            (Integer) rs.getObject("block_no"),
+            (Integer) rs.getObject("seat_no"),
             rs.getString("blind_code"),
+            rs.getString("treatment"),
+            rs.getString("center_id"),
+            (Integer) rs.getObject("version_no"),
             rs.getString("status"),
             rs.getString("assigned_actor"),
             rs.getLong("assigned_at"),
@@ -48,15 +54,33 @@ public class AllocationRepository {
     public void insert(AllocationRow row) {
         jdbc.update("INSERT INTO allocation ("
                         + "experiment_id, participant_id, block_no, seat_no, blind_code, "
+                        + "treatment, center_id, version_no, "
                         + "status, assigned_actor, assigned_at, withdrawn_at"
-                        + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                row.experimentId(), row.participantId(), row.blockNo(), row.seatNo(), row.blindCode(),
-                row.status(), row.assignedActor(), row.assignedAt(), row.withdrawnAt());
+                        + ") VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?)",
+                row.experimentId(), row.participantId(), row.blockNo(), row.seatNo(),
+                row.blindCode(), row.status(), row.assignedActor(), row.assignedAt(),
+                row.withdrawnAt());
+    }
+
+    /**
+     * 插入中心协议登记：不占全局区组席位（block_no/seat_no 为 NULL），
+     * 盲码与处理代码取自中心协议序列，并固化协议版本归属。
+     */
+    public void insertCentered(AllocationRow row) {
+        jdbc.update("INSERT INTO allocation ("
+                        + "experiment_id, participant_id, block_no, seat_no, blind_code, "
+                        + "treatment, center_id, version_no, "
+                        + "status, assigned_actor, assigned_at, withdrawn_at"
+                        + ") VALUES (?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?)",
+                row.experimentId(), row.participantId(), row.blindCode(), row.treatment(),
+                row.centerId(), row.versionNo(), row.status(), row.assignedActor(),
+                row.assignedAt(), row.withdrawnAt());
     }
 
     public AllocationRow findByExperimentAndParticipant(String experimentId, String participantId) {
         List<AllocationRow> rows = jdbc.query(
-                "SELECT id, experiment_id, participant_id, block_no, seat_no, blind_code, status, "
+                "SELECT id, experiment_id, participant_id, block_no, seat_no, blind_code, "
+                        + "treatment, center_id, version_no, status, "
                         + "assigned_actor, assigned_at, withdrawn_at "
                         + "FROM allocation WHERE experiment_id = ? AND participant_id = ?",
                 ALLOCATION_MAPPER, experimentId, participantId);
@@ -90,6 +114,14 @@ public class AllocationRepository {
     public long countOccupied(String experimentId) {
         Long count = jdbc.queryForObject(
                 "SELECT COUNT(*) FROM allocation WHERE experiment_id = ?", Long.class, experimentId);
+        return count == null ? 0 : count;
+    }
+
+    /** 某中心累计已分配数（含已退组，退组不释放容量）。 */
+    public long countByCenter(String experimentId, String centerId) {
+        Long count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM allocation WHERE experiment_id = ? AND center_id = ?",
+                Long.class, experimentId, centerId);
         return count == null ? 0 : count;
     }
 

@@ -10,6 +10,8 @@ import com.example.starter.blind.repo.AllocationRepository.VacantSeat;
 import com.example.starter.blind.repo.ExperimentRepository;
 import com.example.starter.blind.repo.ExperimentRepository.ExperimentRow;
 import com.example.starter.blind.repo.ExperimentRepository.SeatRow;
+import com.example.starter.blind.repo.ProtocolVersionRepository;
+import com.example.starter.blind.repo.ProtocolVersionRepository.ProtocolVersionRow;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -30,15 +32,18 @@ public class ExperimentService {
     private final ExperimentRepository experimentRepository;
     private final AllocationRepository allocationRepository;
     private final BlindCodeGenerator blindCodeGenerator;
+    private final ProtocolAmendmentService protocolAmendmentService;
     private final Clock clock;
 
     public ExperimentService(ExperimentRepository experimentRepository,
                              AllocationRepository allocationRepository,
                              BlindCodeGenerator blindCodeGenerator,
+                             ProtocolAmendmentService protocolAmendmentService,
                              Clock clock) {
         this.experimentRepository = experimentRepository;
         this.allocationRepository = allocationRepository;
         this.blindCodeGenerator = blindCodeGenerator;
+        this.protocolAmendmentService = protocolAmendmentService;
         this.clock = clock;
     }
 
@@ -57,6 +62,8 @@ public class ExperimentService {
         long now = clock.nowMillis();
         experimentRepository.insertExperiment(
                 new ExperimentRow(experimentId, blockCount, "OPEN", now));
+        // 建实验即建立初始协议版本 1（50:50），与实验同一事务原子提交。
+        protocolAmendmentService.bootstrapInitialVersion(experimentId, now);
         List<SeatRow> seats = new ArrayList<>(blockCount * SEATS_PER_BLOCK);
         for (int blockNo = 1; blockNo <= blockCount; blockNo++) {
             for (int seatNo = 1; seatNo <= SEATS_PER_BLOCK; seatNo++) {
@@ -91,6 +98,8 @@ public class ExperimentService {
         if ("CLOSED".equals(experiment.status())) {
             throw ApiException.conflict("实验已关闭，拒绝新增分配");
         }
+        // 按提交顺序裁决已到期协议修订（实验行锁已持有，加入当前事务）。
+        protocolAmendmentService.settleBeforeLegacyWrite(experimentId);
         AllocationRow existing =
                 allocationRepository.findByExperimentAndParticipant(experimentId, participantId);
         if (existing != null) {
@@ -113,8 +122,8 @@ public class ExperimentService {
         for (int attempt = 0; attempt < 5; attempt++) {
             String blindCode = blindCodeGenerator.nextCode();
             AllocationRow row = new AllocationRow(0L, experimentId, participantId,
-                    vacant.blockNo(), vacant.seatNo(), blindCode, "ASSIGNED",
-                    actorId, now, null);
+                    vacant.blockNo(), vacant.seatNo(), blindCode, null, null, null,
+                    "ASSIGNED", actorId, now, null);
             try {
                 allocationRepository.insert(row);
                 return allocationRepository.findByExperimentAndParticipant(experimentId, participantId);
@@ -197,6 +206,7 @@ public class ExperimentService {
 
     private AllocationView toView(AllocationRow row) {
         return new AllocationView(row.experimentId(), row.participantId(), row.blindCode(),
-                row.blockNo(), row.status(), row.assignedAt(), row.withdrawnAt());
+                row.blockNo(), row.centerId(), row.versionNo(), row.status(),
+                row.assignedAt(), row.withdrawnAt());
     }
 }
