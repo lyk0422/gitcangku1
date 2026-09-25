@@ -1,6 +1,8 @@
 package com.example.starter.plan.web;
 
 import com.example.starter.plan.service.PlanService;
+import com.example.starter.plan.web.dto.BatchPublishRequest;
+import com.example.starter.plan.web.dto.BatchPublishResponse;
 import com.example.starter.plan.web.dto.CreatePlanRequest;
 import com.example.starter.plan.web.dto.PlanActionRequest;
 import com.example.starter.plan.web.dto.PlanResponse;
@@ -8,6 +10,9 @@ import com.example.starter.plan.web.dto.PublishedSlotView;
 import com.example.starter.plan.web.dto.RescheduleChainResponse;
 import com.example.starter.plan.web.dto.RescheduleRequest;
 import com.example.starter.plan.web.dto.RescheduleResponse;
+import com.example.starter.plan.web.dto.RollingStockView;
+import com.example.starter.plan.web.dto.StockChainResponse;
+import com.example.starter.plan.web.dto.TurnaroundUpdateRequest;
 import com.example.starter.plan.web.dto.UpdateOccupanciesRequest;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
@@ -61,7 +66,7 @@ public class PlanController {
     }
 
     /**
-     * 发布计划，原子校验时隙冲突。
+     * 发布计划，原子校验时隙冲突与车底交路衔接。
      */
     @PostMapping("/plans/{scheduleKey}/publish")
     public PlanResponse publish(@PathVariable String scheduleKey,
@@ -70,7 +75,15 @@ public class PlanController {
     }
 
     /**
-     * 取消已发布计划，时隙立即释放，历史保留。
+     * 整批发布：同批草稿统一校验时隙冲突与车底交路衔接，任一段不合法整单回滚。
+     */
+    @PostMapping("/plans/publish-batch")
+    public BatchPublishResponse publishBatch(@Valid @RequestBody BatchPublishRequest request) {
+        return service.publishBatch(request);
+    }
+
+    /**
+     * 取消已发布计划，时隙立即释放；取消交路中间段写入不可变断链并标记后续段待重排。
      */
     @PostMapping("/plans/{scheduleKey}/cancel")
     public PlanResponse cancel(@PathVariable String scheduleKey,
@@ -112,5 +125,23 @@ public class PlanController {
             @RequestParam @NotNull @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date,
             @RequestParam @NotBlank String sectionId) {
         return service.getPublishedSlots(date, sectionId);
+    }
+
+    /**
+     * 登记或修改车底最小周转分钟数（1～240），expectedVersion=0 为首次登记；
+     * 修改成功后重校验该车底全部已发布相邻段，不满足返回 422 且参数不生效。
+     */
+    @PutMapping("/rolling-stocks/{stockNo}/turnaround")
+    public RollingStockView updateTurnaround(@PathVariable String stockNo,
+                                             @Valid @RequestBody TurnaroundUpdateRequest request) {
+        return service.updateTurnaround(stockNo, request);
+    }
+
+    /**
+     * 按车底查询交路链明细（按运营日分组、日内按始发时刻升序）与不可变断链记录。
+     */
+    @GetMapping("/rolling-stocks/{stockNo}/chain")
+    public StockChainResponse getStockChain(@PathVariable String stockNo) {
+        return service.getStockChain(stockNo);
     }
 }
