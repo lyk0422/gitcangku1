@@ -7,6 +7,7 @@ import java.time.Instant;
  * commander 为当前指挥人（X-Actor-Id），仅 REPORTED 状态为空；
  * deadlineAt 为遏制期限（UTC）：首次进入 COMMANDING 时按该次接管时刻加等级时限确定，
  * S1=5分钟、S2=15分钟、S3=60分钟、S4=240分钟，交接不重置；REPORTED 状态为空。
+ * version 为事件版本号：每次状态/期限变更递增，用于疏散区域 zoneKey 指纹。
  * 时间均为 UTC 秒级以上的 Instant。
  */
 public record Incident(
@@ -17,6 +18,7 @@ public record Incident(
         String reporter,
         IncidentStatus status,
         String commander,
+        long version,
         Instant createdAt,
         Instant updatedAt,
         Instant deadlineAt) {

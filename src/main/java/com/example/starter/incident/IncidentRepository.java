@@ -49,6 +49,7 @@ public class IncidentRepository {
         return new Incident(rs.getLong("id"), rs.getString("incident_key"), rs.getString("severity"),
                 rs.getString("summary"), rs.getString("reporter"),
                 IncidentStatus.valueOf(rs.getString("status")), rs.getString("commander"),
+                rs.getLong("version"),
                 rs.getTimestamp("created_at").toInstant(), rs.getTimestamp("updated_at").toInstant(),
                 deadline == null ? null : deadline.toInstant());
     }
@@ -96,18 +97,20 @@ public class IncidentRepository {
     }
 
     /**
-     * 首次接管时写入遏制期限（只写一次，交接不重置）。
+     * 首次接管时写入遏制期限（只写一次，交接不重置），并递增事件版本号。
      */
     public void updateDeadline(long id, Instant deadlineAt, Instant updatedAt) {
-        jdbc.update("UPDATE incidents SET deadline_at = ?, updated_at = ? WHERE id = ?",
+        jdbc.update("UPDATE incidents SET deadline_at = ?, version = version + 1, updated_at = ?"
+                        + " WHERE id = ?",
                 Timestamp.from(deadlineAt), Timestamp.from(updatedAt), id);
     }
 
     /**
-     * 更新事件状态与指挥人（commander 可为 null 表示不变更时传入原值）。
+     * 更新事件状态与指挥人（commander 可为 null 表示不变更时传入原值），并递增事件版本号。
      */
     public void updateState(long id, IncidentStatus status, String commander, Instant updatedAt) {
-        jdbc.update("UPDATE incidents SET status = ?, commander = ?, updated_at = ? WHERE id = ?",
+        jdbc.update("UPDATE incidents SET status = ?, commander = ?, version = version + 1,"
+                        + " updated_at = ? WHERE id = ?",
                 status.name(), commander, Timestamp.from(updatedAt), id);
     }
 

@@ -56,4 +56,10 @@ public class ApiException extends RuntimeException {
     public static ApiException illegalTransition(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "ILLEGAL_TRANSITION", message, null);
     }
+
+    /** 422：业务门禁校验失败（如缺少最终位置/资源依赖/撤离豁免），携带结构化明细。 */
+    public static ApiException unprocessable(String message, Object details) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "UNPROCESSABLE_ENTITY",
+                message, details);
+    }
 }

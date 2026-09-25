@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS incidents (
     status VARCHAR(16) NOT NULL,
     commander VARCHAR(128) NULL,
     deadline_at TIMESTAMP(6) NULL,
+    version INT NOT NULL DEFAULT 1,
     created_at TIMESTAMP(6) NOT NULL,
     updated_at TIMESTAMP(6) NOT NULL,
     CONSTRAINT uk_incidents_key UNIQUE (incident_key)
@@ -77,12 +78,19 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     task_key VARCHAR(128) NOT NULL,
     group_code VARCHAR(64) NOT NULL,
     title VARCHAR(512) NOT NULL,
-    status VARCHAR(16) NOT NULL,
+    status VARCHAR(24) NOT NULL,
+    high_risk BOOLEAN NOT NULL DEFAULT FALSE,
+    work_grids VARCHAR(1024) NULL,
+    final_position VARCHAR(64) NULL,
     created_by VARCHAR(128) NOT NULL,
+    started_by VARCHAR(128) NULL,
+    started_at TIMESTAMP(6) NULL,
     done_by VARCHAR(128) NULL,
     done_at TIMESTAMP(6) NULL,
     cancelled_by VARCHAR(128) NULL,
     cancelled_at TIMESTAMP(6) NULL,
+    evacuated_by VARCHAR(128) NULL,
+    evacuated_at TIMESTAMP(6) NULL,
     created_at TIMESTAMP(6) NOT NULL,
     updated_at TIMESTAMP(6) NOT NULL,
     CONSTRAINT uk_task_key UNIQUE (incident_id, task_key)
@@ -97,5 +105,64 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 );
 
 CREATE TABLE IF NOT EXISTS task_graph_lock (
+    id TINYINT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS incident_zones (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    zone_key VARCHAR(80) NOT NULL,
+    group_key VARCHAR(80) NOT NULL,
+    version INT NOT NULL,
+    grids VARCHAR(1024) NOT NULL,
+    effective_from TIMESTAMP(6) NOT NULL,
+    effective_to TIMESTAMP(6) NOT NULL,
+    risk_level VARCHAR(16) NOT NULL,
+    operator VARCHAR(128) NOT NULL,
+    superseded_at TIMESTAMP(6) NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_zone_key UNIQUE (zone_key)
+);
+
+CREATE TABLE IF NOT EXISTS zone_exemptions (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    task_key VARCHAR(128) NOT NULL,
+    zone_id BIGINT NOT NULL,
+    zone_key VARCHAR(80) NOT NULL,
+    zone_version INT NOT NULL,
+    reason VARCHAR(512) NOT NULL,
+    granted_by VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_exemption UNIQUE (incident_id, task_key, zone_id, zone_version)
+);
+
+CREATE TABLE IF NOT EXISTS incident_task_zone_blocks (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    task_id BIGINT NOT NULL,
+    zone_id BIGINT NOT NULL,
+    zone_key VARCHAR(80) NOT NULL,
+    zone_version INT NOT NULL,
+    zone_grids VARCHAR(1024) NOT NULL,
+    zone_effective_from TIMESTAMP(6) NOT NULL,
+    zone_effective_to TIMESTAMP(6) NOT NULL,
+    risk_level VARCHAR(16) NOT NULL,
+    blocked_at TIMESTAMP(6) NOT NULL,
+    released_at TIMESTAMP(6) NULL,
+    CONSTRAINT uk_task_zone_block UNIQUE (task_id, zone_id)
+);
+
+CREATE TABLE IF NOT EXISTS resource_leases (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    task_id BIGINT NOT NULL,
+    resource_key VARCHAR(128) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    released_at TIMESTAMP(6) NULL
+);
+
+CREATE TABLE IF NOT EXISTS resource_lease_lock (
     id TINYINT PRIMARY KEY
 );
