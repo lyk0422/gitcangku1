@@ -1,11 +1,18 @@
 package com.example.starter.batch;
 
+import com.example.starter.batch.dto.AdjudicateExcursionRequest;
+import com.example.starter.batch.dto.AdjudicationResponse;
 import com.example.starter.batch.dto.ApproveRequest;
 import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
+import com.example.starter.batch.dto.ConfirmMinorExcursionRequest;
 import com.example.starter.batch.dto.CreateBatchRequest;
+import com.example.starter.batch.dto.DispositionRiskResponse;
+import com.example.starter.batch.dto.ExcursionResponse;
 import com.example.starter.batch.dto.LineageEntryResponse;
 import com.example.starter.batch.dto.RecallRequest;
+import com.example.starter.batch.dto.RegisterExcursionsRequest;
+import com.example.starter.batch.dto.ReleaseBlockResponse;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
 import jakarta.validation.Valid;
@@ -112,6 +119,71 @@ public class BatchController {
     @GetMapping("/{batchKey}/descendants")
     public List<LineageEntryResponse> descendants(@PathVariable String batchKey) {
         return service.listDescendants(batchKey);
+    }
+
+    /**
+     * 登记储运偏差（一次一条或多条，任一非法整批回滚）。
+     */
+    @PostMapping("/{batchKey}/excursions")
+    public ResponseEntity<String> registerExcursions(@PathVariable String batchKey,
+                                                     @Valid @RequestBody RegisterExcursionsRequest request) {
+        return stored(service.registerExcursions(batchKey, request));
+    }
+
+    /**
+     * 查询批次全部储运偏差区间。
+     */
+    @GetMapping("/{batchKey}/excursions")
+    public List<ExcursionResponse> excursions(@PathVariable String batchKey) {
+        return service.listExcursions(batchKey);
+    }
+
+    /**
+     * 查询放行持续门禁：未裁决 MAJOR 与未确认 MINOR 偏差标识。
+     */
+    @GetMapping("/{batchKey}/release-block")
+    public ReleaseBlockResponse releaseBlock(@PathVariable String batchKey) {
+        return service.getReleaseBlock(batchKey);
+    }
+
+    /**
+     * 裁决 MAJOR 偏差（REWORK/REJECT），写入不可变快照。
+     */
+    @PostMapping("/{batchKey}/excursions/{excursionKey}/adjudicate")
+    public ResponseEntity<String> adjudicate(@PathVariable String batchKey,
+                                             @PathVariable String excursionKey,
+                                             @RequestHeader(name = "X-Actor-Id", required = false) String actorId,
+                                             @RequestHeader(name = "X-Approval-Role", required = false) String role,
+                                             @Valid @RequestBody AdjudicateExcursionRequest request) {
+        return stored(service.adjudicateExcursion(batchKey, excursionKey, actorId, role, request));
+    }
+
+    /**
+     * MINOR 偏差质控确认。
+     */
+    @PostMapping("/{batchKey}/excursions/{excursionKey}/confirm")
+    public ResponseEntity<String> confirmMinor(@PathVariable String batchKey,
+                                               @PathVariable String excursionKey,
+                                               @RequestHeader(name = "X-Actor-Id", required = false) String actorId,
+                                               @RequestHeader(name = "X-Approval-Role", required = false) String role,
+                                               @Valid @RequestBody ConfirmMinorExcursionRequest request) {
+        return stored(service.confirmMinorExcursion(batchKey, excursionKey, actorId, role, request));
+    }
+
+    /**
+     * 查询批次 MAJOR 偏差裁决快照。
+     */
+    @GetMapping("/{batchKey}/adjudications")
+    public List<AdjudicationResponse> adjudications(@PathVariable String batchKey) {
+        return service.listAdjudications(batchKey);
+    }
+
+    /**
+     * 查询批次处置风险记录。
+     */
+    @GetMapping("/{batchKey}/disposition-risks")
+    public List<DispositionRiskResponse> dispositionRisks(@PathVariable String batchKey) {
+        return service.listDispositionRisks(batchKey);
     }
 
     private ResponseEntity<String> stored(StoredResponse response) {

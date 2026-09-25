@@ -26,9 +26,11 @@ import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -50,6 +52,15 @@ public class BatchService {
     private static final String CMD_APPROVE = "APPROVE";
     private static final String CMD_RECALL = "RECALL";
     private static final String CMD_SPLIT = "SPLIT";
+    private static final String CMD_REGISTER_EXCURSION = "REGISTER_EXCURSION";
+    private static final String CMD_ADJUDICATE = "ADJUDICATE_EXCURSION";
+    private static final String CMD_CONFIRM_MINOR = "CONFIRM_MINOR";
+
+    /**
+     * 批次储运温度规格缺省值（摄氏度，闭区间 2～8℃）。
+     */
+    private static final java.math.BigDecimal DEFAULT_MIN_STORAGE_TEMP = new java.math.BigDecimal("2.00");
+    private static final java.math.BigDecimal DEFAULT_MAX_STORAGE_TEMP = new java.math.BigDecimal("8.00");
 
     /**
      * 指纹拼接分隔符（NUL）：业务参数不可能包含该字符，避免拼接碰撞。
@@ -78,15 +89,28 @@ public class BatchService {
         if (new HashSet<>(items).size() != items.size()) {
             throw ApiException.badRequest("requiredTests 存在重复检验项");
         }
+        java.math.BigDecimal minSpec = req.minStorageTempC() == null
+                ? DEFAULT_MIN_STORAGE_TEMP : req.minStorageTempC();
+        java.math.BigDecimal maxSpec = req.maxStorageTempC() == null
+                ? DEFAULT_MAX_STORAGE_TEMP : req.maxStorageTempC();
+        if ((req.minStorageTempC() == null) != (req.maxStorageTempC() == null)) {
+            throw ApiException.badRequest("储运温度规格上下限必须同时提供或同时缺省（缺省 2～8℃）");
+        }
+        if (minSpec.compareTo(maxSpec) > 0) {
+            throw ApiException.badRequest("储运温度规格下限不得大于上限");
+        }
         String fingerprint = fingerprint("create", req.batchKey(), req.productCode(), req.batchNo(),
-                req.producedAt().toString(), String.join(SEP, items));
-        return executeIdempotent(CMD_CREATE, req.commandKey(), fingerprint, () -> {
+                req.producedAt().toString(), String.join(SEP, items),
+                minSpec.stripTrailingZeros().toPlainString(),
+                maxSpec.stripTrailingZeros().toPlainString());
+        return executeIdempotent(CMD_CREATE, req.commandKey(), fingerprint, null, () -> {
             repo.findBatch(req.batchKey()).ifPresent(b -> {
                 throw ApiException.conflict("batchKey 已存在: " + req.batchKey());
             });
             String now = now();
             repo.insertBatch(new BatchRepository.BatchRow(0L, req.batchKey(), req.productCode(),
-                    req.batchNo(), req.producedAt().toString(), BatchStatus.QUARANTINED.name(), now));
+                    req.batchNo(), req.producedAt().toString(), BatchStatus.QUARANTINED.name(), now,
+                    minSpec, maxSpec, 0L));
             for (int i = 0; i < items.size(); i++) {
                 repo.insertRequiredTest(req.batchKey(), items.get(i), i + 1);
             }
@@ -102,7 +126,7 @@ public class BatchService {
     public StoredResponse submitTest(String batchKey, SubmitTestRequest req) {
         String fingerprint = fingerprint("test", batchKey, req.testKey(), req.testItem(),
                 req.result().name(), req.inspector());
-        return executeIdempotent(CMD_TEST, req.commandKey(), fingerprint, () -> {
+        return executeIdempotent(CMD_TEST, req.commandKey(), fingerprint, null, () -> {
             BatchRepository.BatchRow batch = repo.findBatchForUpdate(batchKey)
                     .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
 
@@ -123,7 +147,9 @@ public class BatchService {
             BatchStatus status = BatchStatus.valueOf(batch.status());
             assertNoRecalledAncestor(batchKey);
             if (status == BatchStatus.REJECTED || status == BatchStatus.RELEASED
-                    || status == BatchStatus.RECALLED || status == BatchStatus.SPLIT) {
+                    || status == BatchStatus.RECALLED || status == BatchStatus.SPLIT
+                    || status == BatchStatus.PENDING_DISPOSITION || status == BatchStatus.REWORKED
+                    || status == BatchStatus.DISPOSED) {
                 throw ApiException.conflict("批次状态 " + status + " 不允许提交检验");
             }
             List<String> required = repo.findRequiredTests(batchKey);
@@ -165,11 +191,14 @@ public class BatchService {
         ApprovalRole role = parseRole(roleHeader);
         String actor = actorId.trim();
         String fingerprint = fingerprint("approve", batchKey, actor, role.name());
-        return executeIdempotent(CMD_APPROVE, req.commandKey(), fingerprint, () -> {
+        return executeIdempotent(CMD_APPROVE, req.commandKey(), fingerprint, null, () -> {
             BatchRepository.BatchRow batch = repo.findBatchForUpdate(batchKey)
                     .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
             BatchStatus status = BatchStatus.valueOf(batch.status());
             assertNoRecalledAncestor(batchKey);
+            // 放行持续门禁最优先：任一未裁决 MAJOR/未确认 MINOR 偏差返回 422 并列出偏差标识，
+            // 无论批次处于 QUARANTINED、PENDING_RELEASE、RELEASE_REVIEW 还是 PENDING_DISPOSITION
+            assertNoExcursionGate(batchKey);
             if (status == BatchStatus.QUARANTINED) {
                 throw ApiException.unprocessable("必做检验项未全部通过，不能批准");
             }
@@ -220,7 +249,7 @@ public class BatchService {
         }
         String actor = actorId.trim();
         String fingerprint = fingerprint("recall", batchKey, actor, req.reason());
-        return executeIdempotent(CMD_RECALL, req.commandKey(), fingerprint, () -> {
+        return executeIdempotent(CMD_RECALL, req.commandKey(), fingerprint, null, () -> {
             BatchRepository.BatchRow batch = repo.findBatchForUpdate(batchKey)
                     .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
             BatchStatus status = BatchStatus.valueOf(batch.status());
@@ -253,6 +282,9 @@ public class BatchService {
         Set<String> recalled = new HashSet<>(repo.findRecalledKeys());
         return repo.findAvailableBatches().stream()
                 .filter(b -> !BatchStatus.SPLIT.name().equals(b.status()))
+                .filter(b -> !BatchStatus.DISPOSED.name().equals(b.status()))
+                .filter(b -> !BatchStatus.REWORKED.name().equals(b.status()))
+                .filter(b -> !BatchStatus.PENDING_DISPOSITION.name().equals(b.status()))
                 .filter(b -> recalledAncestor(b.batchKey(), parentOf, recalled).isEmpty())
                 .map(this::toBatchResponse)
                 .toList();
@@ -292,8 +324,12 @@ public class BatchService {
     /**
      * 幂等执行：同事务内先查 command_log，命中则按指纹返回快照或 409；
      * 未命中执行业务动作并写入快照。并发同键插入冲突时重试，读取已提交结果。
+     *
+     * @param commandBatchVersion 命令归属批次的当前版本号；非批次级命令传 null。
+     *                            偏差类命令指纹已含版本，快照同时记录版本以便重放复核。
      */
     private StoredResponse executeIdempotent(String type, String commandKey, String fingerprint,
+                                             Long commandBatchVersion,
                                              Supplier<StoredResponse> action) {
         for (int attempt = 0; attempt < IDEMPOTENCY_MAX_ATTEMPTS; attempt++) {
             try {
@@ -304,7 +340,7 @@ public class BatchService {
                     }
                     StoredResponse response = action.get();
                     repo.insertCommand(new BatchRepository.CommandRow(type, commandKey, fingerprint,
-                            response.status(), response.body()), now());
+                            response.status(), response.body(), commandBatchVersion), now());
                     return response;
                 });
             } catch (DuplicateKeyException e) {
@@ -434,7 +470,7 @@ public class BatchService {
             parts.add(child.batchNo());
         }
         String fingerprint = fingerprint(parts.toArray(new String[0]));
-        return executeIdempotent(CMD_SPLIT, req.commandKey(), fingerprint, () -> {
+        return executeIdempotent(CMD_SPLIT, req.commandKey(), fingerprint, null, () -> {
             BatchRepository.BatchRow parent = repo.findBatchForUpdate(parentKey)
                     .orElseThrow(() -> ApiException.notFound("批次不存在: " + parentKey));
             // 父批行锁后重查命令快照：并发同键请求在锁等待期间可能已由对方提交，
@@ -459,12 +495,13 @@ public class BatchService {
             for (int i = 0; i < children.size(); i++) {
                 SplitRequest.ChildSpec spec = children.get(i);
                 repo.insertBatch(new BatchRepository.BatchRow(0L, spec.batchKey(), parent.productCode(),
-                        spec.batchNo(), parent.producedAt(), BatchStatus.QUARANTINED.name(), now));
+                        spec.batchNo(), parent.producedAt(), BatchStatus.QUARANTINED.name(), now,
+                        parent.minStorageTempC(), parent.maxStorageTempC(), 0L));
                 for (int j = 0; j < required.size(); j++) {
                     repo.insertRequiredTest(spec.batchKey(), required.get(j), j + 1);
                 }
                 repo.insertLineage(new BatchRepository.LineageRow(0L, parentKey, spec.batchKey(),
-                        i + 1, now));
+                        "SPLIT", i + 1, now));
                 childBodies.add(new SplitResponse.SplitChild(spec.batchKey(), spec.batchNo(),
                         parent.productCode(), Instant.parse(parent.producedAt()),
                         BatchStatus.QUARANTINED, required, Instant.parse(now)));
@@ -509,14 +546,15 @@ public class BatchService {
     }
 
     /**
-     * 若任一级祖先已被召回则抛 422：后代批次禁止新增检验、批准和拆分。
+     * 若任一级祖先已被召回（RECALLED）或拒收处置（DISPOSED）则抛 422：
+     * 后代批次禁止新增检验、批准和拆分。REJECT 裁决按召回口径拦截。
      */
     private void assertNoRecalledAncestor(String batchKey) {
         Optional<String> recalled = recalledAncestor(batchKey, childToParent(),
                 new HashSet<>(repo.findRecalledKeys()));
         if (recalled.isPresent()) {
             throw ApiException.unprocessable(
-                    "祖先批次 " + recalled.get() + " 已召回，禁止新增检验、批准和拆分");
+                    "祖先批次 " + recalled.get() + " 已召回或拒收处置，禁止新增检验、批准和拆分");
         }
     }
 
@@ -574,5 +612,494 @@ public class BatchService {
         return new LineageEntryResponse(row.batchKey(), row.batchNo(),
                 BatchStatus.valueOf(row.status()),
                 recalledAncestor(batchKey, parentOf, recalled).orElse(null));
+    }
+
+    // ==================== 储运偏差 ====================
+
+    /**
+     * 登记一条或多条储运偏差：先校验完整最终区间集合（下限不大于上限、同批次区间不重叠）
+     * 与批次规格分级，任一非法整批回滚。并发按批次行锁 + 事务提交顺序裁决。
+     */
+    public StoredResponse registerExcursions(String batchKey,
+                                             com.example.starter.batch.dto.RegisterExcursionsRequest req) {
+        List<com.example.starter.batch.dto.RegisterExcursionsRequest.ExcursionInput> inputs = req.excursions();
+        // 请求内基础校验：键不重复、温度下限不大于上限、区间左闭右开且起止严格递增
+        Set<String> requestKeys = new HashSet<>();
+        for (var in : inputs) {
+            if (!requestKeys.add(in.excursionKey())) {
+                throw ApiException.badRequest("excursionKey 在请求内重复: " + in.excursionKey());
+            }
+            if (in.minTempC().compareTo(in.maxTempC()) > 0) {
+                throw ApiException.badRequest(
+                        "偏差实测温度下限不得大于上限: " + in.excursionKey());
+            }
+            if (!in.startUtc().isBefore(in.endUtc())) {
+                throw ApiException.badRequest(
+                        "偏差区间起止必须满足 startUtc < endUtc（左闭右开）: " + in.excursionKey());
+            }
+        }
+        return executeLockedBatchCommand(CMD_REGISTER_EXCURSION, req.commandKey(), batch -> {
+            // 锁内先查命令快照：并发同键请求在锁等待期间可能已由对方提交
+            StoredResponse replay = replayExcursionCommandIfSameParams(
+                    CMD_REGISTER_EXCURSION, req.commandKey(), batchKey, inputs);
+            if (replay != null) {
+                return replay;
+            }
+            BatchStatus state = BatchStatus.valueOf(batch.status());
+            // SPLIT 父批与召回口径一致，仍可登记偏差并裁决（REJECT 时拦截其全部后代）；
+            // 检验拒绝/召回/返工/处置等终态不允许再登记
+            if (state == BatchStatus.REJECTED || state == BatchStatus.RECALLED
+                    || state == BatchStatus.REWORKED || state == BatchStatus.DISPOSED) {
+                throw ApiException.conflict("批次状态 " + state + " 不允许登记储运偏差");
+            }
+            List<BatchRepository.ExcursionRow> existing = repo.findExcursions(batchKey);
+            for (BatchRepository.ExcursionRow row : existing) {
+                if (requestKeys.contains(row.excursionKey())) {
+                    throw ApiException.conflict("excursionKey 已存在: " + row.excursionKey());
+                }
+            }
+            // 完整最终区间集合（既有 ∪ 本次）重叠校验：半开区间，端点相接不视为重叠
+            List<Interval> all = new ArrayList<>(existing.size() + inputs.size());
+            for (BatchRepository.ExcursionRow row : existing) {
+                all.add(new Interval(row.excursionKey(), Instant.parse(row.startUtc()),
+                        Instant.parse(row.endUtc())));
+            }
+            for (var in : inputs) {
+                all.add(new Interval(in.excursionKey(), in.startUtc(), in.endUtc()));
+            }
+            all.sort(Comparator.comparing(Interval::start).thenComparing(Interval::key));
+            for (int i = 1; i < all.size(); i++) {
+                Interval prev = all.get(i - 1);
+                Interval cur = all.get(i);
+                if (prev.end().isAfter(cur.start())) {
+                    throw ApiException.unprocessable("偏差区间重叠: " + prev.key() + " 与 " + cur.key());
+                }
+            }
+
+            long registeredVersion = batch.version();
+            String now = now();
+            List<com.example.starter.batch.dto.ExcursionResponse> bodies = new ArrayList<>(inputs.size());
+            List<com.example.starter.batch.dto.RegisterExcursionsRequest.ExcursionInput> majorInputs =
+                    new ArrayList<>();
+            // 按请求顺序写入；严重级别只取决于批次温度规格与实测温度边界
+            for (var in : inputs) {
+                boolean major = in.minTempC().compareTo(batch.minStorageTempC()) < 0
+                        || in.maxTempC().compareTo(batch.maxStorageTempC()) > 0;
+                if (major) {
+                    majorInputs.add(in);
+                }
+                BatchRepository.ExcursionRow row = new BatchRepository.ExcursionRow(0L, batchKey,
+                        in.excursionKey(), in.startUtc().toString(), in.endUtc().toString(),
+                        in.minTempC(), in.maxTempC(),
+                        major ? ExcursionSeverity.MAJOR.name() : ExcursionSeverity.MINOR.name(),
+                        ExcursionStatus.OPEN.name(), registeredVersion, null, null, now);
+                repo.insertExcursion(row);
+                bodies.add(toExcursionResponse(row));
+            }
+            long newVersion = repo.incrementVersion(batchKey);
+            // 已放行批次新增 MAJOR：立即转待处置并写风险记录（每条 MAJOR 一条），历史放行不删除
+            if (!majorInputs.isEmpty() && state == BatchStatus.RELEASED) {
+                repo.updateStatus(batchKey, BatchStatus.PENDING_DISPOSITION.name());
+                for (var in : majorInputs) {
+                    repo.insertDispositionRisk(new BatchRepository.DispositionRiskRow(0L, batchKey,
+                            in.excursionKey(), "POST_RELEASE_MAJOR",
+                            "已放行批次登记未裁决 MAJOR 储运偏差，立即转为待处置", now));
+                }
+            }
+            com.example.starter.batch.dto.RegisterExcursionsResponse body =
+                    new com.example.starter.batch.dto.RegisterExcursionsResponse(
+                            batchKey, newVersion, bodies);
+            StoredResponse response = new StoredResponse(201, toJson(body));
+            // 指纹含操作类型、批次版本、规范化区间与温度；同键同参重放首次结果，失败不占键
+            repo.insertCommand(new BatchRepository.CommandRow(CMD_REGISTER_EXCURSION, req.commandKey(),
+                    excursionFingerprint(CMD_REGISTER_EXCURSION, batchKey, registeredVersion, inputs),
+                    201, response.body(), registeredVersion), now);
+            return response;
+        }, batchKey);
+    }
+
+    /**
+     * 查询批次全部储运偏差区间（按登记顺序）。
+     */
+    public List<com.example.starter.batch.dto.ExcursionResponse> listExcursions(String batchKey) {
+        repo.findBatch(batchKey)
+                .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+        return repo.findExcursions(batchKey).stream().map(this::toExcursionResponse).toList();
+    }
+
+    /**
+     * 查询放行持续门禁：未裁决 MAJOR 与未确认 MINOR 偏差标识；两者皆空表示偏差门禁已解除。
+     */
+    public com.example.starter.batch.dto.ReleaseBlockResponse getReleaseBlock(String batchKey) {
+        repo.findBatch(batchKey)
+                .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+        List<String> majorKeys = repo.findOpenMajorExcursions(batchKey).stream()
+                .map(BatchRepository.ExcursionRow::excursionKey).toList();
+        List<String> minorKeys = repo.findOpenMinorExcursions(batchKey).stream()
+                .map(BatchRepository.ExcursionRow::excursionKey).toList();
+        return new com.example.starter.batch.dto.ReleaseBlockResponse(batchKey,
+                !majorKeys.isEmpty() || !minorKeys.isEmpty(), majorKeys, minorKeys);
+    }
+
+    /**
+     * 查询批次全部 MAJOR 偏差裁决不可变快照。
+     */
+    public List<com.example.starter.batch.dto.AdjudicationResponse> listAdjudications(String batchKey) {
+        repo.findBatch(batchKey)
+                .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+        return repo.findAdjudications(batchKey).stream().map(this::toAdjudicationResponse).toList();
+    }
+
+    /**
+     * 查询批次处置风险记录（只增不改）。
+     */
+    public List<com.example.starter.batch.dto.DispositionRiskResponse> listDispositionRisks(String batchKey) {
+        repo.findBatch(batchKey)
+                .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+        return repo.findDispositionRisks(batchKey).stream()
+                .map(r -> new com.example.starter.batch.dto.DispositionRiskResponse(r.batchKey(),
+                        r.excursionKey(), r.riskType(), r.detail(), Instant.parse(r.createdAt())))
+                .toList();
+    }
+
+    /**
+     * 放行持续门禁断言：任一未裁决 MAJOR 或未质控确认 MINOR 偏差均阻断放行（422，列出偏差标识）。
+     * 在每一笔批准落定前调用，保证已进入 RELEASE_REVIEW 后新增偏差同样持续阻断。
+     */
+    private void assertNoExcursionGate(String batchKey) {
+        List<String> majorKeys = repo.findOpenMajorExcursions(batchKey).stream()
+                .map(BatchRepository.ExcursionRow::excursionKey).toList();
+        List<String> minorKeys = repo.findOpenMinorExcursions(batchKey).stream()
+                .map(BatchRepository.ExcursionRow::excursionKey).toList();
+        if (!majorKeys.isEmpty() || !minorKeys.isEmpty()) {
+            throw new ReleaseBlockedException(majorKeys, minorKeys);
+        }
+    }
+
+    /**
+     * 锁内重放判定：同类型同键命令若已存在，则以响应快照重建业务参数指纹比对——
+     * 一致则重放首次结果，参数变化返回 409。快照指纹中的批次版本不参与重放比对，
+     * 因为首次成功后版本已经递增，但同参重放仍须返回首次结果。
+     */
+    private StoredResponse replayExcursionCommandIfSameParams(
+            String type, String commandKey, String batchKey,
+            List<com.example.starter.batch.dto.RegisterExcursionsRequest.ExcursionInput> inputs) {
+        var existing = repo.findCommand(type, commandKey);
+        if (existing.isEmpty()) {
+            return null;
+        }
+        BatchRepository.CommandRow row = existing.get();
+        try {
+            com.example.starter.batch.dto.RegisterExcursionsResponse snapshot = objectMapper.readValue(
+                    row.responseBody(),
+                    com.example.starter.batch.dto.RegisterExcursionsResponse.class);
+            List<String> snapshotParts = new ArrayList<>();
+            snapshotParts.add(batchKey);
+            for (com.example.starter.batch.dto.ExcursionResponse e : snapshot.excursions()) {
+                snapshotParts.add(e.excursionKey());
+                snapshotParts.add(e.startUtc().toString());
+                snapshotParts.add(e.endUtc().toString());
+                snapshotParts.add(normalizeTemp(e.minTempC()));
+                snapshotParts.add(normalizeTemp(e.maxTempC()));
+            }
+            List<String> requestParts = new ArrayList<>();
+            requestParts.add(batchKey);
+            for (var in : inputs) {
+                requestParts.add(in.excursionKey());
+                requestParts.add(in.startUtc().toString());
+                requestParts.add(in.endUtc().toString());
+                requestParts.add(normalizeTemp(in.minTempC()));
+                requestParts.add(normalizeTemp(in.maxTempC()));
+            }
+            if (!snapshot.batchKey().equals(batchKey)
+                    || !fingerprint(snapshotParts.toArray(new String[0]))
+                    .equals(fingerprint(requestParts.toArray(new String[0])))) {
+                throw ApiException.conflict("commandKey 已以不同参数使用: " + commandKey);
+            }
+            return new StoredResponse(row.responseStatus(), row.responseBody());
+        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+            throw ApiException.conflict("commandKey 已以不同参数使用: " + commandKey);
+        }
+    }
+
+    /**
+     * 偏差命令指纹：操作类型 + 批次版本 + 规范化区间与温度（温度去尾零，UTC instant 规范化）。
+     */
+    private String excursionFingerprint(
+            String type, String batchKey, long batchVersion,
+            List<com.example.starter.batch.dto.RegisterExcursionsRequest.ExcursionInput> inputs) {
+        List<String> parts = new ArrayList<>();
+        parts.add(type);
+        parts.add(batchKey);
+        parts.add(Long.toString(batchVersion));
+        for (var in : inputs) {
+            parts.add(in.excursionKey());
+            parts.add(in.startUtc().toString());
+            parts.add(in.endUtc().toString());
+            parts.add(normalizeTemp(in.minTempC()));
+            parts.add(normalizeTemp(in.maxTempC()));
+        }
+        return fingerprint(parts.toArray(new String[0]));
+    }
+
+    private String normalizeTemp(java.math.BigDecimal temp) {
+        return temp.stripTrailingZeros().toPlainString();
+    }
+
+    private com.example.starter.batch.dto.ExcursionResponse toExcursionResponse(
+            BatchRepository.ExcursionRow row) {
+        return new com.example.starter.batch.dto.ExcursionResponse(row.batchKey(), row.excursionKey(),
+                Instant.parse(row.startUtc()), Instant.parse(row.endUtc()),
+                row.minTempC(), row.maxTempC(),
+                ExcursionSeverity.valueOf(row.severity()), ExcursionStatus.valueOf(row.status()),
+                row.batchVersion(), row.confirmedBy(),
+                row.confirmedAt() == null ? null : Instant.parse(row.confirmedAt()),
+                Instant.parse(row.createdAt()));
+    }
+
+    private com.example.starter.batch.dto.AdjudicationResponse toAdjudicationResponse(
+            BatchRepository.AdjudicationRow row) {
+        return new com.example.starter.batch.dto.AdjudicationResponse(row.batchKey(),
+                row.excursionKey(), ExcursionDecision.valueOf(row.decision()), row.adjudicator(),
+                row.reworkBatchKey(), row.snapshotJson(), Instant.parse(row.createdAt()));
+    }
+
+    /**
+     * 裁决 MAJOR 偏差：只能 REWORK 或 REJECT，裁决写入不可变快照，按批次行锁 + 提交顺序并发裁决。
+     * REWORK：原批次置 REWORKED（仍有其他未裁决 MAJOR 时停留待处置），沿返工链创建返工子批；
+     * REJECT：本批次置 DISPOSED 并锁定全部后代，按召回口径拦截。
+     */
+    public StoredResponse adjudicateExcursion(String batchKey, String excursionKey, String actorId,
+                                              String roleHeader,
+                                              com.example.starter.batch.dto.AdjudicateExcursionRequest req) {
+        if (actorId == null || actorId.isBlank()) {
+            throw ApiException.badRequest("X-Actor-Id 不能为空");
+        }
+        ApprovalRole role = parseRole(roleHeader);
+        if (role != ApprovalRole.QUALITY) {
+            throw ApiException.badRequest("MAJOR 偏差裁决仅 QUALITY 角色可执行");
+        }
+        String actor = actorId.trim();
+        return executeLockedBatchCommand(CMD_ADJUDICATE, req.commandKey(), batch -> {
+            BatchRepository.ExcursionRow excursion = repo.findExcursion(batchKey, excursionKey)
+                    .orElseThrow(() -> ApiException.notFound(
+                            "偏差不存在: " + batchKey + "/" + excursionKey));
+            // 指纹含操作类型、偏差登记时固化的批次版本（不可变）、规范化区间温度与裁决结论；
+            // 实时批次版本在裁决后递增，不参与重放比对，保证同键同参始终重放首次结果
+            String fingerprint = fingerprint(CMD_ADJUDICATE, batchKey,
+                    Long.toString(excursion.batchVersion()), excursionKey,
+                    excursion.startUtc(), excursion.endUtc(),
+                    normalizeTemp(excursion.minTempC()), normalizeTemp(excursion.maxTempC()),
+                    req.decision().name(),
+                    req.reworkBatchKey() == null ? "" : req.reworkBatchKey().trim(),
+                    req.reworkBatchNo() == null ? "" : req.reworkBatchNo().trim(), actor);
+            // 重放优先于状态守卫：裁决成功后批次可能已进入 REWORKED/DISPOSED 终态，
+            // 同键同参重放仍须返回首次结果
+            StoredResponse replay = replayIfSameParams(CMD_ADJUDICATE, req.commandKey(), fingerprint);
+            if (replay != null) {
+                return replay;
+            }
+            BatchStatus state = BatchStatus.valueOf(batch.status());
+            // SPLIT 父批与召回口径一致，仍可裁决 MAJOR（REJECT 拦截全部后代）
+            if (state == BatchStatus.REJECTED || state == BatchStatus.RECALLED
+                    || state == BatchStatus.REWORKED || state == BatchStatus.DISPOSED) {
+                throw ApiException.conflict("批次状态 " + state + " 不允许裁决偏差");
+            }
+            if (!ExcursionSeverity.MAJOR.name().equals(excursion.severity())) {
+                throw ApiException.unprocessable("MINOR 偏差不能裁决，仅可质控确认: " + excursionKey);
+            }
+            if (ExcursionStatus.ADJUDICATED.name().equals(excursion.status())) {
+                throw ApiException.conflict("MAJOR 偏差已裁决，裁决快照不可变: " + excursionKey);
+            }
+            String now = now();
+            String reworkBatchKey = null;
+            if (req.decision() == ExcursionDecision.REWORK) {
+                if (req.reworkBatchKey() == null || req.reworkBatchKey().isBlank()
+                        || req.reworkBatchNo() == null || req.reworkBatchNo().isBlank()) {
+                    throw ApiException.badRequest("REWORK 裁决必须提供 reworkBatchKey 与 reworkBatchNo");
+                }
+                reworkBatchKey = req.reworkBatchKey().trim();
+                String reworkBatchNo = req.reworkBatchNo().trim();
+                if (repo.findBatch(reworkBatchKey).isPresent()) {
+                    throw ApiException.conflict("返工子批 batchKey 已存在: " + reworkBatchKey);
+                }
+                if (repo.findParentKey(reworkBatchKey).isPresent()) {
+                    throw ApiException.conflict("返工子批 batchKey 已存在血缘: " + reworkBatchKey);
+                }
+                // 返工子批继承产品、生产时间、储运规格与必做检验项，初始 QUARANTINED，沿返工链重新检验放行
+                List<String> required = repo.findRequiredTests(batchKey);
+                repo.insertBatch(new BatchRepository.BatchRow(0L, reworkBatchKey, batch.productCode(),
+                        reworkBatchNo, batch.producedAt(), BatchStatus.QUARANTINED.name(), now,
+                        batch.minStorageTempC(), batch.maxStorageTempC(), 0L));
+                for (int i = 0; i < required.size(); i++) {
+                    repo.insertRequiredTest(reworkBatchKey, required.get(i), i + 1);
+                }
+                repo.insertLineage(new BatchRepository.LineageRow(0L, batchKey, reworkBatchKey,
+                        "REWORK", 1, now));
+                // 条件更新：并发同偏差裁决只有一个事务能将 OPEN 改为 ADJUDICATED
+                if (repo.adjudicateMajorExcursion(batchKey, excursionKey) != 1) {
+                    throw ApiException.conflict("MAJOR 偏差已被并发裁决: " + excursionKey);
+                }
+                repo.insertDispositionRisk(new BatchRepository.DispositionRiskRow(0L, batchKey,
+                        excursionKey, "REWORK",
+                        "MAJOR 偏差裁决返工，返工子批: " + reworkBatchKey, now));
+                boolean otherOpenMajor = !repo.findOpenMajorExcursions(batchKey).isEmpty();
+                // 仍有其他未裁决 MAJOR：已放行来源批次继续待处置；否则原批次进入返工终态
+                if (!otherOpenMajor) {
+                    repo.updateStatus(batchKey, BatchStatus.REWORKED.name());
+                }
+                long newVersion = repo.incrementVersion(batchKey);
+                String snapshotJson = adjudicationSnapshotJson(excursion, req.decision(), actor,
+                        reworkBatchKey, newVersion);
+                repo.insertAdjudication(new BatchRepository.AdjudicationRow(0L, batchKey, excursionKey,
+                        req.decision().name(), actor, role.name(), reworkBatchKey, snapshotJson, now));
+                var body = new com.example.starter.batch.dto.AdjudicationResponse(batchKey, excursionKey,
+                        req.decision(), actor, reworkBatchKey, snapshotJson, Instant.parse(now));
+                StoredResponse response = new StoredResponse(201, toJson(body));
+                repo.insertCommand(new BatchRepository.CommandRow(CMD_ADJUDICATE, req.commandKey(),
+                        fingerprint, 201, response.body(), newVersion), now);
+                return response;
+            }
+            // REJECT：锁定全部后代（按键排序确定锁顺序），本批次置 DISPOSED，后代按召回口径拦截
+            List<String> descendants = descendantKeys(batchKey);
+            Collections.sort(descendants);
+            for (String descendantKey : descendants) {
+                repo.findBatchForUpdate(descendantKey);
+            }
+            if (repo.adjudicateMajorExcursion(batchKey, excursionKey) != 1) {
+                throw ApiException.conflict("MAJOR 偏差已被并发裁决: " + excursionKey);
+            }
+            repo.updateStatus(batchKey, BatchStatus.DISPOSED.name());
+            long newVersion = repo.incrementVersion(batchKey);
+            String snapshotJson = adjudicationSnapshotJson(excursion, req.decision(), actor,
+                    null, newVersion);
+            repo.insertAdjudication(new BatchRepository.AdjudicationRow(0L, batchKey, excursionKey,
+                    req.decision().name(), actor, role.name(), null, snapshotJson, now));
+            repo.insertDispositionRisk(new BatchRepository.DispositionRiskRow(0L, batchKey,
+                    excursionKey, "REJECT_DISPOSITION",
+                    "MAJOR 偏差裁决拒收，本批次及全部后代按召回口径拦截", now));
+            var body = new com.example.starter.batch.dto.AdjudicationResponse(batchKey, excursionKey,
+                    req.decision(), actor, null, snapshotJson, Instant.parse(now));
+            StoredResponse response = new StoredResponse(201, toJson(body));
+            repo.insertCommand(new BatchRepository.CommandRow(CMD_ADJUDICATE, req.commandKey(),
+                    fingerprint, 201, response.body(), newVersion), now);
+            return response;
+        }, batchKey);
+    }
+
+    /**
+     * MINOR 偏差质控确认：仅 QUALITY 角色可确认；确认后偏差门禁解除，批次版本递增。
+     */
+    public StoredResponse confirmMinorExcursion(String batchKey, String excursionKey, String actorId,
+                                                String roleHeader,
+                                                com.example.starter.batch.dto.ConfirmMinorExcursionRequest req) {
+        if (actorId == null || actorId.isBlank()) {
+            throw ApiException.badRequest("X-Actor-Id 不能为空");
+        }
+        ApprovalRole role = parseRole(roleHeader);
+        if (role != ApprovalRole.QUALITY) {
+            throw ApiException.badRequest("MINOR 偏差确认仅 QUALITY 角色可执行");
+        }
+        String actor = actorId.trim();
+        return executeLockedBatchCommand(CMD_CONFIRM_MINOR, req.commandKey(), batch -> {
+            BatchRepository.ExcursionRow excursion = repo.findExcursion(batchKey, excursionKey)
+                    .orElseThrow(() -> ApiException.notFound(
+                            "偏差不存在: " + batchKey + "/" + excursionKey));
+            // 指纹采用偏差登记时固化的批次版本，重放时版本不再变化
+            String fingerprint = fingerprint(CMD_CONFIRM_MINOR, batchKey,
+                    Long.toString(excursion.batchVersion()), excursionKey,
+                    excursion.startUtc(), excursion.endUtc(),
+                    normalizeTemp(excursion.minTempC()), normalizeTemp(excursion.maxTempC()), actor);
+            StoredResponse replay = replayIfSameParams(CMD_CONFIRM_MINOR, req.commandKey(), fingerprint);
+            if (replay != null) {
+                return replay;
+            }
+            if (!ExcursionSeverity.MINOR.name().equals(excursion.severity())) {
+                throw ApiException.unprocessable("MAJOR 偏差必须裁决（REWORK/REJECT），不能质控确认: "
+                        + excursionKey);
+            }
+            if (ExcursionStatus.CONFIRMED.name().equals(excursion.status())) {
+                throw ApiException.conflict("MINOR 偏差已经质控确认: " + excursionKey);
+            }
+            String now = now();
+            if (repo.confirmMinorExcursion(batchKey, excursionKey, actor, now) != 1) {
+                throw ApiException.conflict("MINOR 偏差已被并发确认或裁决: " + excursionKey);
+            }
+            long newVersion = repo.incrementVersion(batchKey);
+            BatchRepository.ExcursionRow confirmed = repo.findExcursion(batchKey, excursionKey).orElseThrow();
+            com.example.starter.batch.dto.ExcursionResponse body = toExcursionResponse(confirmed);
+            StoredResponse response = new StoredResponse(201, toJson(body));
+            repo.insertCommand(new BatchRepository.CommandRow(CMD_CONFIRM_MINOR, req.commandKey(),
+                    fingerprint, 201, response.body(), newVersion), now);
+            return response;
+        }, batchKey);
+    }
+
+    /**
+     * 批次行锁命令模板：锁内执行业务并自行完成命令快照重放判定与写入；
+     * 并发同键插入冲突时整事务回滚重试，读取对方已提交快照。
+     */
+    private StoredResponse executeLockedBatchCommand(String type, String commandKey,
+                                                     java.util.function.Function<BatchRepository.BatchRow, StoredResponse> action,
+                                                     String batchKey) {
+        for (int attempt = 0; attempt < IDEMPOTENCY_MAX_ATTEMPTS; attempt++) {
+            try {
+                return tx.execute(status -> {
+                    BatchRepository.BatchRow batch = repo.findBatchForUpdate(batchKey)
+                            .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+                    return action.apply(batch);
+                });
+            } catch (DuplicateKeyException e) {
+                // 并发同事务键或唯一约束冲突：回滚重试
+            }
+        }
+        throw ApiException.conflict("命令并发冲突，请重试: " + commandKey);
+    }
+
+    /**
+     * 锁内命令快照判定：指纹一致返回首次结果；指纹不一致 409；未占用返回 null（失败不占键）。
+     */
+    private StoredResponse replayIfSameParams(String type, String commandKey, String fingerprint) {
+        var existing = repo.findCommand(type, commandKey);
+        if (existing.isEmpty()) {
+            return null;
+        }
+        BatchRepository.CommandRow row = existing.get();
+        if (!row.fingerprint().equals(fingerprint)) {
+            throw ApiException.conflict("commandKey 已以不同参数使用: " + commandKey);
+        }
+        return new StoredResponse(row.responseStatus(), row.responseBody());
+    }
+
+    /**
+     * 裁决不可变快照 JSON：偏差区间/温度/级别/登记版本/裁决结论/裁决人/返工子批。
+     */
+    private String adjudicationSnapshotJson(BatchRepository.ExcursionRow excursion,
+                                           ExcursionDecision decision, String adjudicator,
+                                           String reworkBatchKey, long adjudicatedVersion) {
+        Map<String, Object> snapshot = new LinkedHashMap<>();
+        snapshot.put("batchKey", excursion.batchKey());
+        snapshot.put("excursionKey", excursion.excursionKey());
+        snapshot.put("startUtc", excursion.startUtc());
+        snapshot.put("endUtc", excursion.endUtc());
+        snapshot.put("minTempC", excursion.minTempC().stripTrailingZeros().toPlainString());
+        snapshot.put("maxTempC", excursion.maxTempC().stripTrailingZeros().toPlainString());
+        snapshot.put("severity", excursion.severity());
+        snapshot.put("registeredBatchVersion", excursion.batchVersion());
+        snapshot.put("adjudicatedBatchVersion", adjudicatedVersion);
+        snapshot.put("decision", decision.name());
+        snapshot.put("adjudicator", adjudicator);
+        snapshot.put("reworkBatchKey", reworkBatchKey);
+        try {
+            return objectMapper.writeValueAsString(snapshot);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("裁决快照序列化失败", e);
+        }
+    }
+
+    /**
+     * 半开区间 [start, end) 内部比较模型。
+     */
+    private record Interval(String key, Instant start, Instant end) {
     }
 }
