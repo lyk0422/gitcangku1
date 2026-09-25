@@ -38,8 +38,8 @@ class PersistenceTests {
         WaterRepository repo1 = new WaterRepository(new JdbcTemplate(first));
         long windowId = repo1.insertWindow("wk-persist", "ch-persist", 1_000L, 2_000L,
                 new BigDecimal("10.000"), 1L);
-        repo1.insertAllocation("ak-source", windowId, "user-1", new BigDecimal("6.000"), "alice", 2L);
-        repo1.insertAllocation("ak-target", windowId, "user-2", new BigDecimal("2.500"), "bob", 3L);
+        repo1.insertAllocation("ak-source", windowId, "user-1", new BigDecimal("6.000"), null, "alice", 2L);
+        repo1.insertAllocation("ak-target", windowId, "user-2", new BigDecimal("2.500"), null, "bob", 3L);
         AllocationRow source = repo1.findAllocationByKey("ak-source");
         AllocationRow target = repo1.findAllocationByKey("ak-target");
         // 普通批准：源持有额度等于原申请水量
@@ -103,7 +103,7 @@ class PersistenceTests {
         }
         WaterRepository repo = new WaterRepository(new JdbcTemplate(dataSource));
         long windowId = repo.insertWindow("wk-cancel", "ch-cancel", 1L, 2L, new BigDecimal("5"), 1L);
-        repo.insertAllocation("ak-cancel", windowId, "user-1", new BigDecimal("3.000"), "alice", 2L);
+        repo.insertAllocation("ak-cancel", windowId, "user-1", new BigDecimal("3.000"), null, "alice", 2L);
         AllocationRow allocation = repo.findAllocationByKey("ak-cancel");
         repo.updateAllocationStatus(allocation.id(), "APPROVED", 3L);
         assertEquals(new BigDecimal("3.000"), repo.sumApprovedAmount(windowId));

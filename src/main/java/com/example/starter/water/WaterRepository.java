@@ -25,9 +25,13 @@ public class WaterRepository {
                             BigDecimal plannedVolume, long createdNanos) {
     }
 
-    /** 配水申请行；amount 为不可改写的原申请水量，heldAmount 为当前持有额度。 */
+    /**
+     * 配水申请行；amount 为不可改写的原申请水量，heldAmount 为当前持有额度。
+     * salinityLimit 为申请声明的盐度上限（mg/L），null 表示不限制；version 为乐观版本，每次扣减自增。
+     */
     public record AllocationRow(long id, String allocationKey, long windowId, String userId, BigDecimal amount,
-                                BigDecimal heldAmount, String requester, String status,
+                                BigDecimal heldAmount, BigDecimal salinityLimit, long version,
+                                String requester, String status,
                                 long createdNanos, long updatedNanos) {
     }
 
@@ -39,6 +43,22 @@ public class WaterRepository {
     /** 限供行。 */
     public record CurtailmentRow(long id, long windowId, BigDecimal volume, String status, long createdNanos,
                                  Long cancelledNanos) {
+    }
+
+    /** 水源行：可用水量与盐度（mg/L），version 为盐度修改乐观版本。 */
+    public record SourceRow(long id, String sourceKey, BigDecimal availableAmount, BigDecimal salinity,
+                            long version, long createdNanos, long updatedNanos) {
+    }
+
+    /** 掺配核销快照行，创建后不可变。 */
+    public record BlendSnapshotRow(long id, String blendKey, String allocationKey, String actor,
+                                   BigDecimal totalAmount, BigDecimal weightedSalinity,
+                                   BigDecimal salinityLimit, long allocationVersion, long createdNanos) {
+    }
+
+    /** 掺配快照明细行，冻结取水量与核销时水源盐度。 */
+    public record BlendItemRow(long id, long snapshotId, String sourceKey, BigDecimal amount,
+                               BigDecimal salinity, int ordinal) {
     }
 
     /** 幂等命令行；response 为 null 表示响应尚未写回（同事务内）。 */
@@ -54,12 +74,13 @@ public class WaterRepository {
     private static final RowMapper<AllocationRow> ALLOCATION_MAPPER = (rs, n) -> new AllocationRow(
             rs.getLong("id"), rs.getString("allocation_key"), rs.getLong("window_id"),
             rs.getString("user_id"), rs.getBigDecimal("amount"), rs.getBigDecimal("held_amount"),
+            rs.getBigDecimal("salinity_limit"), rs.getLong("version"),
             rs.getString("requester"), rs.getString("status"),
             rs.getLong("created_nanos"), rs.getLong("updated_nanos"));
 
     private static final String ALLOCATION_SELECT =
-            "SELECT id, allocation_key, window_id, user_id, amount, held_amount, requester, status,"
-                    + " created_nanos, updated_nanos";
+            "SELECT id, allocation_key, window_id, user_id, amount, held_amount, salinity_limit, version,"
+                    + " requester, status, created_nanos, updated_nanos";
 
     private static final RowMapper<TransferRow> TRANSFER_MAPPER = (rs, n) -> new TransferRow(
             rs.getLong("id"), rs.getString("transfer_key"), rs.getLong("window_id"),
@@ -74,6 +95,24 @@ public class WaterRepository {
     private static final RowMapper<CommandRow> COMMAND_MAPPER = (rs, n) -> new CommandRow(
             rs.getString("command_key"), rs.getString("operation"), rs.getString("params"),
             rs.getString("response"), rs.getLong("created_nanos"));
+
+    private static final String SOURCE_SELECT =
+            "SELECT id, source_key, available_amount, salinity, version, created_nanos, updated_nanos";
+
+    private static final RowMapper<SourceRow> SOURCE_MAPPER = (rs, n) -> new SourceRow(
+            rs.getLong("id"), rs.getString("source_key"), rs.getBigDecimal("available_amount"),
+            rs.getBigDecimal("salinity"), rs.getLong("version"),
+            rs.getLong("created_nanos"), rs.getLong("updated_nanos"));
+
+    private static final RowMapper<BlendSnapshotRow> BLEND_SNAPSHOT_MAPPER = (rs, n) -> new BlendSnapshotRow(
+            rs.getLong("id"), rs.getString("blend_key"), rs.getString("allocation_key"),
+            rs.getString("actor"), rs.getBigDecimal("total_amount"), rs.getBigDecimal("weighted_salinity"),
+            rs.getBigDecimal("salinity_limit"), rs.getLong("allocation_version"),
+            rs.getLong("created_nanos"));
+
+    private static final RowMapper<BlendItemRow> BLEND_ITEM_MAPPER = (rs, n) -> new BlendItemRow(
+            rs.getLong("id"), rs.getLong("snapshot_id"), rs.getString("source_key"),
+            rs.getBigDecimal("amount"), rs.getBigDecimal("salinity"), rs.getInt("ordinal"));
 
     private final JdbcTemplate jdbc;
 
@@ -130,21 +169,23 @@ public class WaterRepository {
         return count != null && count > 0;
     }
 
-    /** 插入申请（初始 REQUESTED）并返回主键。 */
+    /** 插入申请（初始 REQUESTED）并返回主键；salinityLimit 为 null 表示不声明盐度上限。 */
     public long insertAllocation(String allocationKey, long windowId, String userId, BigDecimal amount,
-                                 String requester, long nowNanos) {
+                                 BigDecimal salinityLimit, String requester, long nowNanos) {
         KeyHolder keys = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO allocation (allocation_key, window_id, user_id, amount, held_amount, requester, status, created_nanos, updated_nanos)"
-                            + " VALUES (?, ?, ?, ?, 0, ?, 'REQUESTED', ?, ?)", Statement.RETURN_GENERATED_KEYS);
+                    "INSERT INTO allocation (allocation_key, window_id, user_id, amount, held_amount,"
+                            + " salinity_limit, version, requester, status, created_nanos, updated_nanos)"
+                            + " VALUES (?, ?, ?, ?, 0, ?, 0, ?, 'REQUESTED', ?, ?)", Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, allocationKey);
             ps.setLong(2, windowId);
             ps.setString(3, userId);
             ps.setBigDecimal(4, amount);
-            ps.setString(5, requester);
-            ps.setLong(6, nowNanos);
+            ps.setBigDecimal(5, salinityLimit);
+            ps.setString(6, requester);
             ps.setLong(7, nowNanos);
+            ps.setLong(8, nowNanos);
             return ps;
         }, keys);
         return Objects.requireNonNull(keys.getKey()).longValue();
@@ -173,19 +214,21 @@ public class WaterRepository {
 
     /**
      * 更新申请状态与变更时间，并同步持有额度：批准时持有额度等于原申请水量，取消时归零，
-     * REQUESTED 保持当前持有额度不变。
+     * REQUESTED 保持当前持有额度不变；每次状态变更自增乐观版本。
      */
     public void updateAllocationStatus(long id, String status, long updatedNanos) {
-        jdbc.update("UPDATE allocation SET status = ?, updated_nanos = ?,"
+        jdbc.update("UPDATE allocation SET status = ?, updated_nanos = ?, version = version + 1,"
                 + " held_amount = CASE WHEN ? = 'APPROVED' THEN amount WHEN ? = 'CANCELLED' THEN 0"
                 + " ELSE held_amount END WHERE id = ?",
                 status, updatedNanos, status, status, id);
     }
 
-    /** 转让扣减源持有额度（不得为负由事务内校验保证）并记录变更时间。 */
+    /**
+     * 转让/掺配核销扣减申请持有额度并自增乐观版本（不得为负由事务内校验与 CHECK 约束保证）。
+     */
     public void decrementHeldAmount(long id, BigDecimal delta, long updatedNanos) {
-        jdbc.update("UPDATE allocation SET held_amount = held_amount - ?, updated_nanos = ? WHERE id = ?",
-                delta, updatedNanos, id);
+        jdbc.update("UPDATE allocation SET held_amount = held_amount - ?, version = version + 1, updated_nanos = ?"
+                + " WHERE id = ?", delta, updatedNanos, id);
     }
 
     /** 窗口当前所有 APPROVED 申请的当前持有额度之和（BigDecimal 精确求和），无则 0。 */
@@ -303,5 +346,141 @@ public class WaterRepository {
     /** 写回命令首次成功响应。 */
     public void updateCommandResponse(String commandKey, String response) {
         jdbc.update("UPDATE command_log SET response = ? WHERE command_key = ?", response, commandKey);
+    }
+
+    // ------------------------------------------------------------------
+    // 水源
+    // ------------------------------------------------------------------
+
+    /** 注册水源（version 初始为 0）并返回主键。 */
+    public long insertSource(String sourceKey, BigDecimal availableAmount, BigDecimal salinity,
+                             long nowNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO water_source (source_key, available_amount, salinity, version,"
+                            + " created_nanos, updated_nanos) VALUES (?, ?, ?, 0, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, sourceKey);
+            ps.setBigDecimal(2, availableAmount);
+            ps.setBigDecimal(3, salinity);
+            ps.setLong(4, nowNanos);
+            ps.setLong(5, nowNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 按业务键查询水源，不存在返回 null。 */
+    public SourceRow findSourceByKey(String sourceKey) {
+        try {
+            return jdbc.queryForObject(SOURCE_SELECT + " FROM water_source WHERE source_key = ?",
+                    SOURCE_MAPPER, sourceKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 按业务键锁定水源行（FOR UPDATE），用于掺配核销串行扣减，不存在返回 null。 */
+    public SourceRow lockSourceByKey(String sourceKey) {
+        try {
+            return jdbc.queryForObject(SOURCE_SELECT + " FROM water_source WHERE source_key = ? FOR UPDATE",
+                    SOURCE_MAPPER, sourceKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 按规范化顺序（source_key 升序）锁定多个水源行。 */
+    public List<SourceRow> lockSourcesByKeys(List<String> sourceKeys) {
+        if (sourceKeys.isEmpty()) {
+            return List.of();
+        }
+        String placeholders = String.join(",", java.util.Collections.nCopies(sourceKeys.size(), "?"));
+        return jdbc.query(
+                SOURCE_SELECT + " FROM water_source WHERE source_key IN (" + placeholders
+                        + ") ORDER BY source_key ASC FOR UPDATE",
+                SOURCE_MAPPER, sourceKeys.toArray());
+    }
+
+    /** 掺配核销扣减水源可用量（不得为负由事务内校验与 CHECK 约束保证）。 */
+    public void decrementSourceAmount(long id, BigDecimal delta) {
+        jdbc.update("UPDATE water_source SET available_amount = available_amount - ? WHERE id = ?",
+                delta, id);
+    }
+
+    /**
+     * 携带期望版本修改水源盐度：仅当 version 等于 expectedVersion 时更新盐度并自增版本，返回受影响行数。
+     * 版本不符（并发已修改）返回 0，由上层映射为 409。
+     */
+    public int updateSourceSalinityIfVersion(String sourceKey, BigDecimal salinity, long expectedVersion,
+                                             long updatedNanos) {
+        return jdbc.update("UPDATE water_source SET salinity = ?, version = version + 1, updated_nanos = ?"
+                        + " WHERE source_key = ? AND version = ?",
+                salinity, updatedNanos, sourceKey, expectedVersion);
+    }
+
+    // ------------------------------------------------------------------
+    // 掺配核销快照
+    // ------------------------------------------------------------------
+
+    /** 插入不可变掺配核销快照头并返回主键。 */
+    public long insertBlendSnapshot(String blendKey, String allocationKey, String actor,
+                                    BigDecimal totalAmount, BigDecimal weightedSalinity,
+                                    BigDecimal salinityLimit, long allocationVersion, long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO blend_snapshot (blend_key, allocation_key, actor, total_amount,"
+                            + " weighted_salinity, salinity_limit, allocation_version, created_nanos)"
+                            + " VALUES (?, ?, ?, ?, ?, ?, ?, ?)", Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, blendKey);
+            ps.setString(2, allocationKey);
+            ps.setString(3, actor);
+            ps.setBigDecimal(4, totalAmount);
+            ps.setBigDecimal(5, weightedSalinity);
+            ps.setBigDecimal(6, salinityLimit);
+            ps.setLong(7, allocationVersion);
+            ps.setLong(8, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 插入快照明细（冻结核销时盐度），与快照头同事务写入。 */
+    public void insertBlendItem(long snapshotId, String sourceKey, BigDecimal amount, BigDecimal salinity,
+                                int ordinal) {
+        jdbc.update("INSERT INTO blend_snapshot_item (snapshot_id, source_key, amount, salinity, ordinal)"
+                + " VALUES (?, ?, ?, ?, ?)", snapshotId, sourceKey, amount, salinity, ordinal);
+    }
+
+    /** 按掺配业务键查询快照头，不存在返回 null。 */
+    public BlendSnapshotRow findBlendSnapshotByKey(String blendKey) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT id, blend_key, allocation_key, actor, total_amount, weighted_salinity,"
+                            + " salinity_limit, allocation_version, created_nanos"
+                            + " FROM blend_snapshot WHERE blend_key = ?",
+                    BLEND_SNAPSHOT_MAPPER, blendKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 查询快照全部明细，按规范化序号升序。 */
+    public List<BlendItemRow> listBlendItems(long snapshotId) {
+        return jdbc.query(
+                "SELECT id, snapshot_id, source_key, amount, salinity, ordinal"
+                        + " FROM blend_snapshot_item WHERE snapshot_id = ? ORDER BY ordinal ASC",
+                BLEND_ITEM_MAPPER, snapshotId);
+    }
+
+    /** 查询申请全部掺配快照，按发生顺序（主键升序）。 */
+    public List<BlendSnapshotRow> listBlendSnapshots(String allocationKey) {
+        return jdbc.query(
+                "SELECT id, blend_key, allocation_key, actor, total_amount, weighted_salinity,"
+                        + " salinity_limit, allocation_version, created_nanos"
+                        + " FROM blend_snapshot WHERE allocation_key = ? ORDER BY id ASC",
+                BLEND_SNAPSHOT_MAPPER, allocationKey);
     }
 }
