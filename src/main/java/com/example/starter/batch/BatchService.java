@@ -2,12 +2,21 @@ package com.example.starter.batch;
 
 import com.example.starter.batch.dto.ApprovalResponse;
 import com.example.starter.batch.dto.ApproveRequest;
+import com.example.starter.batch.dto.ApproveReleaseRequest;
 import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
 import com.example.starter.batch.dto.LineageEntryResponse;
+import com.example.starter.batch.dto.RecallImpactEntry;
+import com.example.starter.batch.dto.RecallReleaseApplyRequest;
+import com.example.starter.batch.dto.RecallReleaseDetailResponse;
+import com.example.starter.batch.dto.RecallReleaseResponse;
+import com.example.starter.batch.dto.RecallReleaseSnapshotResponse;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.RecallResponse;
+import com.example.starter.batch.dto.RetestGapResponse;
+import com.example.starter.batch.dto.RetestRequest;
+import com.example.starter.batch.dto.RetestResponse;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SplitResponse;
 import com.example.starter.batch.dto.SubmitTestRequest;
@@ -50,6 +59,9 @@ public class BatchService {
     private static final String CMD_APPROVE = "APPROVE";
     private static final String CMD_RECALL = "RECALL";
     private static final String CMD_SPLIT = "SPLIT";
+    private static final String CMD_RETEST = "RETEST";
+    private static final String CMD_RELEASE_APPLY = "RECALL_RELEASE";
+    private static final String CMD_RELEASE_APPROVE = "APPROVE_RELEASE";
 
     /**
      * 指纹拼接分隔符（NUL）：业务参数不可能包含该字符，避免拼接碰撞。
@@ -235,8 +247,10 @@ public class BatchService {
                 repo.findBatchForUpdate(descendantKey);
             }
             String now = now();
+            // 召回代次：同一批次解除后再次召回生成新代次，历史代次记录不删除
+            int version = repo.findRecall(batchKey).map(r -> r.version() + 1).orElse(1);
             repo.insertRecall(new BatchRepository.RecallRow(0L, batchKey, req.commandKey(),
-                    actor, req.reason(), now));
+                    actor, req.reason(), version, "ACTIVE", status.name(), now, null));
             repo.updateStatus(batchKey, BatchStatus.RECALLED.name());
             RecallResponse body = new RecallResponse(batchKey, actor, req.reason(),
                     BatchStatus.RECALLED, Instant.parse(now));
@@ -574,5 +588,281 @@ public class BatchService {
         return new LineageEntryResponse(row.batchKey(), row.batchNo(),
                 BatchStatus.valueOf(row.status()),
                 recalledAncestor(batchKey, parentOf, recalled).orElse(null));
+    }
+
+    /**
+     * 提交召回复检：仅自身 RECALLED 或祖先被召回的批次可提交；复检不改变批次状态，
+     * retestKey 批次内幂等，同内容重放返回原结果，不同内容返回 409。
+     */
+    public StoredResponse submitRetest(String batchKey, RetestRequest req) {
+        String fingerprint = fingerprint("retest", batchKey, req.retestKey(),
+                req.outcome().name(), req.inspector());
+        return executeIdempotent(CMD_RETEST, req.commandKey(), fingerprint, () -> {
+            BatchRepository.BatchRow batch = repo.findBatchForUpdate(batchKey)
+                    .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+            var existing = repo.findRetest(batchKey, req.retestKey());
+            if (existing.isPresent()) {
+                BatchRepository.RetestRow row = existing.get();
+                boolean sameContent = row.outcome().equals(req.outcome().name())
+                        && row.inspector().equals(req.inspector());
+                if (!sameContent) {
+                    throw ApiException.conflict("retestKey 已以不同内容提交: " + req.retestKey());
+                }
+                return new StoredResponse(200, toJson(toRetestResponse(row)));
+            }
+            boolean underRecall = BatchStatus.RECALLED.name().equals(batch.status())
+                    || recalledAncestor(batchKey, childToParent(),
+                            new HashSet<>(repo.findRecalledKeys())).isPresent();
+            if (!underRecall) {
+                throw ApiException.conflict("批次未处于召回影响范围，无需复检: " + batchKey);
+            }
+            String now = now();
+            repo.insertRetest(new BatchRepository.RetestRow(0L, batchKey, req.retestKey(),
+                    req.outcome().name(), req.inspector(), now));
+            RetestResponse body = new RetestResponse(batchKey, req.retestKey(), req.outcome(),
+                    req.inspector(), Instant.parse(now));
+            return new StoredResponse(201, toJson(body));
+        });
+    }
+
+    /**
+     * 申请召回解除：仅根召回记录为 ACTIVE 的批次可申请；复检批次集合去重并规范排序。
+     * releaseKey 幂等：指纹含召回版本、规范化复检集合、纠正措施和指定审批人；
+     * 同键同参重放返回首次结果，同键改参 409，失败不占键。
+     */
+    public StoredResponse applyRecallRelease(String batchKey, String actorId,
+                                             RecallReleaseApplyRequest req) {
+        if (actorId == null || actorId.isBlank()) {
+            throw ApiException.badRequest("X-Actor-Id 不能为空");
+        }
+        String actor = actorId.trim();
+        List<String> retestSet = req.retestBatches().stream().map(String::trim).distinct().sorted()
+                .toList();
+        String measures = req.correctiveMeasures().trim();
+        String approver = req.approver().trim();
+        String fingerprint = fingerprint("recall-release", batchKey,
+                String.valueOf(req.recallVersion()), String.join(SEP, retestSet), measures,
+                approver);
+        return executeIdempotent(CMD_RELEASE_APPLY, req.releaseKey(), fingerprint, () -> {
+            repo.findBatchForUpdate(batchKey)
+                    .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+            // 批次行锁后重查命令快照：并发同键请求在锁等待期间可能已由对方提交
+            var logged = loggedResponse(CMD_RELEASE_APPLY, req.releaseKey(), fingerprint);
+            if (logged.isPresent()) {
+                return logged.get();
+            }
+            BatchRepository.RecallRow recall = repo.findRecall(batchKey)
+                    .filter(r -> "ACTIVE".equals(r.recallStatus()))
+                    .orElseThrow(() -> ApiException.conflict(
+                            "批次无 ACTIVE 召回记录，不可申请解除: " + batchKey));
+            if (recall.version() != req.recallVersion()) {
+                throw ApiException.conflict("召回版本不匹配：当前 ACTIVE 召回版本为 "
+                        + recall.version() + "，申请版本为 " + req.recallVersion());
+            }
+            String now = now();
+            repo.insertRelease(new BatchRepository.ReleaseRow(0L, req.releaseKey(), batchKey,
+                    req.recallVersion(), measures, String.join(",", retestSet), approver, actor,
+                    "PENDING", now, null));
+            RecallReleaseResponse body = new RecallReleaseResponse(req.releaseKey(), batchKey,
+                    req.recallVersion(), measures, retestSet, approver, actor, "PENDING",
+                    Instant.parse(now), null);
+            return new StoredResponse(201, toJson(body));
+        });
+    }
+
+    /**
+     * 批准召回解除：按最终血缘闭包预校验——该批次及全部受影响后代均完成合格复检、
+     * 无未决隔离且血缘未新增未知来源；任一失败 422，所有召回状态与放行资格保持不变。
+     * 批准后仅解除申请所覆盖召回代次并写入不可变评审快照；后代历史召回记录不删除，
+     * 批次状态恢复为召回前状态，历史检验与放行记录不重写。
+     */
+    public StoredResponse approveRecallRelease(String batchKey, String releaseKey, String actorId,
+                                               ApproveReleaseRequest req) {
+        if (actorId == null || actorId.isBlank()) {
+            throw ApiException.badRequest("X-Actor-Id 不能为空");
+        }
+        String actor = actorId.trim();
+        String fingerprint = fingerprint("approve-release", batchKey, releaseKey, actor);
+        return executeIdempotent(CMD_RELEASE_APPROVE, req.commandKey(), fingerprint, () -> {
+            repo.findBatchForUpdate(batchKey)
+                    .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+            // 批次行锁后重查命令快照：并发同键请求在锁等待期间可能已由对方提交
+            var logged = loggedResponse(CMD_RELEASE_APPROVE, req.commandKey(), fingerprint);
+            if (logged.isPresent()) {
+                return logged.get();
+            }
+            BatchRepository.ReleaseRow release = repo.findRelease(releaseKey)
+                    .filter(r -> r.batchKey().equals(batchKey))
+                    .orElseThrow(() -> ApiException.notFound("解除申请不存在: " + releaseKey));
+            if (!"PENDING".equals(release.status())) {
+                throw ApiException.conflict("解除申请已批准，不可重复批准: " + releaseKey);
+            }
+            if (!release.approver().equals(actor)) {
+                throw ApiException.unprocessable("审批人必须为申请指定审批人: " + release.approver());
+            }
+            // 逐行锁定全部后代（按业务键排序保证锁顺序确定）：与后代上的检验/批准/拆分/召回
+            // 互斥，申请、复检、批准按事务提交顺序裁决
+            List<String> descendants = descendantKeys(batchKey);
+            Collections.sort(descendants);
+            for (String descendantKey : descendants) {
+                repo.findBatchForUpdate(descendantKey);
+            }
+            // 最终血缘闭包（含自身，规范排序）
+            List<String> closure = new ArrayList<>(descendants);
+            closure.add(batchKey);
+            Collections.sort(closure);
+            List<String> declared = release.retestBatches().isEmpty()
+                    ? List.of()
+                    : List.of(release.retestBatches().split(","));
+            List<String> unknown = declared.stream().filter(k -> !closure.contains(k)).toList();
+            if (!unknown.isEmpty()) {
+                throw ApiException.unprocessable(
+                        "复检批次集合包含血缘闭包外的未知来源批次: " + String.join(",", unknown));
+            }
+            List<String> missing = closure.stream().filter(k -> !declared.contains(k)).toList();
+            if (!missing.isEmpty()) {
+                throw ApiException.unprocessable(
+                        "复检批次集合缺少最终血缘闭包批次: " + String.join(",", missing));
+            }
+            List<String> quarantined = new ArrayList<>();
+            List<String> unqualified = new ArrayList<>();
+            for (String key : closure) {
+                BatchRepository.BatchRow row = repo.findBatch(key)
+                        .orElseThrow(() -> ApiException.notFound("批次不存在: " + key));
+                if (BatchStatus.QUARANTINED.name().equals(row.status())) {
+                    quarantined.add(key);
+                }
+                if (!retestQualified(key)) {
+                    unqualified.add(key);
+                }
+            }
+            if (!quarantined.isEmpty()) {
+                throw ApiException.unprocessable(
+                        "存在未决隔离批次，不可解除: " + String.join(",", quarantined));
+            }
+            if (!unqualified.isEmpty()) {
+                throw ApiException.unprocessable(
+                        "以下批次未完成合格复检: " + String.join(",", unqualified));
+            }
+            BatchRepository.RecallRow recall = repo.findRecall(batchKey)
+                    .filter(r -> "ACTIVE".equals(r.recallStatus()))
+                    .orElseThrow(() -> ApiException.conflict(
+                            "批次无 ACTIVE 召回记录，不可解除: " + batchKey));
+            String now = now();
+            // 仅解除申请所覆盖召回代次；后代历史召回记录不删除，仍需各自满足复检
+            repo.updateRecallReleased(recall.id(), now);
+            repo.updateStatus(batchKey, recall.priorStatus());
+            repo.updateReleaseApproved(releaseKey, now);
+            repo.insertSnapshot(new BatchRepository.SnapshotRow(0L, releaseKey, batchKey,
+                    release.recallVersion(), String.join(",", closure),
+                    release.correctiveMeasures(), actor, now));
+            RecallReleaseSnapshotResponse body = new RecallReleaseSnapshotResponse(releaseKey,
+                    batchKey, release.recallVersion(), closure, release.correctiveMeasures(),
+                    actor, Instant.parse(now));
+            return new StoredResponse(201, toJson(body));
+        });
+    }
+
+    /**
+     * 召回血缘影响查询：以该批次为根的闭包（自身在前，后代按拆分创建顺序展开），
+     * 每项含批次自身状态、最新召回代次与复检合格性。
+     */
+    public List<RecallImpactEntry> recallImpact(String batchKey) {
+        repo.findBatch(batchKey)
+                .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+        List<String> closure = new ArrayList<>();
+        closure.add(batchKey);
+        closure.addAll(descendantKeys(batchKey));
+        List<RecallImpactEntry> result = new ArrayList<>(closure.size());
+        for (String key : closure) {
+            BatchRepository.BatchRow row = repo.findBatch(key)
+                    .orElseThrow(() -> ApiException.notFound("批次不存在: " + key));
+            var recall = repo.findRecall(key);
+            var latest = latestRetest(key);
+            result.add(new RecallImpactEntry(key, BatchStatus.valueOf(row.status()),
+                    recall.map(BatchRepository.RecallRow::version).orElse(null),
+                    recall.map(BatchRepository.RecallRow::recallStatus).orElse(null),
+                    latest.map(r -> TestOutcome.valueOf(r.outcome())).orElse(null),
+                    latest.map(r -> TestOutcome.PASS.name().equals(r.outcome())).orElse(false)));
+        }
+        return result;
+    }
+
+    /**
+     * 复检缺口查询：最终血缘闭包（规范排序）内未满足解除条件的批次及可区分原因。
+     */
+    public RetestGapResponse retestGaps(String batchKey) {
+        repo.findBatch(batchKey)
+                .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+        List<String> closure = new ArrayList<>(descendantKeys(batchKey));
+        closure.add(batchKey);
+        Collections.sort(closure);
+        List<RetestGapResponse.RetestGap> gaps = new ArrayList<>();
+        for (String key : closure) {
+            BatchRepository.BatchRow row = repo.findBatch(key)
+                    .orElseThrow(() -> ApiException.notFound("批次不存在: " + key));
+            if (BatchStatus.QUARANTINED.name().equals(row.status())) {
+                gaps.add(new RetestGapResponse.RetestGap(key, "PENDING_QUARANTINE"));
+            }
+            var latest = latestRetest(key);
+            if (latest.isEmpty()) {
+                gaps.add(new RetestGapResponse.RetestGap(key, "MISSING_RETEST"));
+            } else if (!TestOutcome.PASS.name().equals(latest.get().outcome())) {
+                gaps.add(new RetestGapResponse.RetestGap(key, "FAILED_RETEST"));
+            }
+        }
+        return new RetestGapResponse(batchKey, closure, gaps);
+    }
+
+    /**
+     * 解除申请详情：申请本体 + 批准后的不可变评审快照（未批准时 snapshot 为 null）。
+     */
+    public RecallReleaseDetailResponse recallReleaseDetail(String batchKey, String releaseKey) {
+        repo.findBatch(batchKey)
+                .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+        BatchRepository.ReleaseRow release = repo.findRelease(releaseKey)
+                .filter(r -> r.batchKey().equals(batchKey))
+                .orElseThrow(() -> ApiException.notFound("解除申请不存在: " + releaseKey));
+        RecallReleaseSnapshotResponse snapshot = repo.findSnapshot(releaseKey)
+                .map(this::toSnapshotResponse)
+                .orElse(null);
+        return new RecallReleaseDetailResponse(toReleaseResponse(release), snapshot);
+    }
+
+    private Optional<BatchRepository.RetestRow> latestRetest(String batchKey) {
+        List<BatchRepository.RetestRow> retests = repo.findRetests(batchKey);
+        return retests.isEmpty()
+                ? Optional.empty()
+                : Optional.of(retests.get(retests.size() - 1));
+    }
+
+    /**
+     * 合格复检判定：该批次最新一条复检结论为 PASS。
+     */
+    private boolean retestQualified(String batchKey) {
+        return latestRetest(batchKey)
+                .map(r -> TestOutcome.PASS.name().equals(r.outcome()))
+                .orElse(false);
+    }
+
+    private RetestResponse toRetestResponse(BatchRepository.RetestRow row) {
+        return new RetestResponse(row.batchKey(), row.retestKey(),
+                TestOutcome.valueOf(row.outcome()), row.inspector(), Instant.parse(row.createdAt()));
+    }
+
+    private RecallReleaseResponse toReleaseResponse(BatchRepository.ReleaseRow row) {
+        List<String> retestBatches = row.retestBatches().isEmpty()
+                ? List.of()
+                : List.of(row.retestBatches().split(","));
+        return new RecallReleaseResponse(row.releaseKey(), row.batchKey(), row.recallVersion(),
+                row.correctiveMeasures(), retestBatches, row.approver(), row.applicant(),
+                row.status(), Instant.parse(row.createdAt()),
+                row.decidedAt() == null ? null : Instant.parse(row.decidedAt()));
+    }
+
+    private RecallReleaseSnapshotResponse toSnapshotResponse(BatchRepository.SnapshotRow row) {
+        return new RecallReleaseSnapshotResponse(row.releaseKey(), row.batchKey(),
+                row.recallVersion(), List.of(row.closureBatches().split(",")),
+                row.correctiveMeasures(), row.approver(), Instant.parse(row.createdAt()));
     }
 }

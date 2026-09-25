@@ -44,7 +44,11 @@ CREATE TABLE IF NOT EXISTS recall (
     command_key VARCHAR(64) NOT NULL COMMENT '召回命令幂等键',
     actor_id VARCHAR(64) NOT NULL COMMENT '召回操作人标识，任意操作人均可提交',
     reason VARCHAR(512) NOT NULL COMMENT '召回原因，非空',
-    created_at VARCHAR(40) NOT NULL COMMENT '召回时间，ISO-8601 UTC instant 字符串'
+    version INT NOT NULL COMMENT '召回代次，从 1 开始；解除后再次召回生成新代次，历史代次记录不删除',
+    recall_status VARCHAR(16) NOT NULL COMMENT '召回记录状态：ACTIVE 生效中 / RELEASED 已解除；解除不删除记录',
+    prior_status VARCHAR(32) NOT NULL COMMENT '召回前批次状态（RELEASED/SPLIT），解除时原样恢复；历史放行记录不重写',
+    created_at VARCHAR(40) NOT NULL COMMENT '召回时间，ISO-8601 UTC instant 字符串',
+    released_at VARCHAR(40) NULL COMMENT '解除时间，ISO-8601 UTC instant 字符串；未解除为空'
 );
 
 CREATE TABLE IF NOT EXISTS command_log (
@@ -65,4 +69,44 @@ CREATE TABLE IF NOT EXISTS batch_lineage (
     seq INT NOT NULL COMMENT '子批在拆分请求中的顺序，从 1 开始',
     created_at VARCHAR(40) NOT NULL COMMENT '拆分时间，ISO-8601 UTC instant 字符串',
     CONSTRAINT uk_lineage_child UNIQUE (child_key)
+);
+
+-- 召回复检：仅处于召回影响范围（自身 RECALLED 或祖先被召回）的批次可提交；不改变批次状态。
+CREATE TABLE IF NOT EXISTS retest (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键，同时作为复检提交顺序依据',
+    batch_key VARCHAR(64) NOT NULL COMMENT '所属批次业务键',
+    retest_key VARCHAR(64) NOT NULL COMMENT '复检业务键，同一批次内唯一；同内容重放返回原结果，不同内容返回 409',
+    outcome VARCHAR(8) NOT NULL COMMENT '复检结论：PASS/FAIL；以该批次最新一条复检判定是否合格',
+    inspector VARCHAR(64) NOT NULL COMMENT '复检人标识',
+    created_at VARCHAR(40) NOT NULL COMMENT '复检提交时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_retest_key UNIQUE (batch_key, retest_key)
+);
+
+-- 召回解除申请：仅根召回记录为 ACTIVE 的批次可申请；校验失败的批准不留半成品状态。
+CREATE TABLE IF NOT EXISTS recall_release (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    release_key VARCHAR(64) NOT NULL COMMENT '解除申请业务键，全局唯一；同键同参重放返回首次结果，同键改参 409，失败不占键',
+    batch_key VARCHAR(64) NOT NULL COMMENT '申请解除的批次业务键，须存在 ACTIVE 根召回记录',
+    recall_version INT NOT NULL COMMENT '申请覆盖的召回代次，须等于当前 ACTIVE 召回版本',
+    corrective_measures VARCHAR(1024) NOT NULL COMMENT '纠正措施说明，非空',
+    retest_batches TEXT NOT NULL COMMENT '复检批次集合，规范化去重排序后逗号分隔；批准时须等于最终血缘闭包',
+    approver VARCHAR(64) NOT NULL COMMENT '指定审批人标识，批准时 X-Actor-Id 必须一致',
+    applicant VARCHAR(64) NOT NULL COMMENT '申请人标识',
+    status VARCHAR(16) NOT NULL COMMENT '申请状态：PENDING 待批准 / APPROVED 已批准',
+    created_at VARCHAR(40) NOT NULL COMMENT '申请时间，ISO-8601 UTC instant 字符串',
+    decided_at VARCHAR(40) NULL COMMENT '批准时间，ISO-8601 UTC instant 字符串；未批准为空',
+    CONSTRAINT uk_release_key UNIQUE (release_key)
+);
+
+-- 召回解除评审快照：批准时写入，写入后不可变；历史召回记录与放行记录不因解除改写。
+CREATE TABLE IF NOT EXISTS recall_release_snapshot (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    release_key VARCHAR(64) NOT NULL COMMENT '对应解除申请业务键，一份申请至多一份快照',
+    batch_key VARCHAR(64) NOT NULL COMMENT '解除的批次业务键',
+    recall_version INT NOT NULL COMMENT '解除覆盖的召回代次',
+    closure_batches TEXT NOT NULL COMMENT '批准时最终血缘闭包（含自身与全部后代），规范排序逗号分隔',
+    corrective_measures VARCHAR(1024) NOT NULL COMMENT '纠正措施快照',
+    approver VARCHAR(64) NOT NULL COMMENT '实际审批人标识',
+    created_at VARCHAR(40) NOT NULL COMMENT '快照写入时间（批准时间），ISO-8601 UTC instant 字符串；快照不可变',
+    CONSTRAINT uk_snapshot_release UNIQUE (release_key)
 );

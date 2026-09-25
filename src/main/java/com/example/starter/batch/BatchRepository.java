@@ -35,10 +35,35 @@ public class BatchRepository {
     }
 
     /**
-     * recall 表行记录。
+     * recall 表行记录；version 为召回代次，recallStatus 为 ACTIVE/RELEASED，
+     * priorStatus 为召回前批次状态（解除时恢复），releasedAt 未解除时为 null。
      */
     public record RecallRow(long id, String batchKey, String commandKey, String actorId,
-                            String reason, String createdAt) {
+                            String reason, int version, String recallStatus, String priorStatus,
+                            String createdAt, String releasedAt) {
+    }
+
+    /**
+     * retest 表行记录：召回影响范围内的复检结果。
+     */
+    public record RetestRow(long id, String batchKey, String retestKey, String outcome,
+                            String inspector, String createdAt) {
+    }
+
+    /**
+     * recall_release 表行记录：召回解除申请；decidedAt 未批准时为 null。
+     */
+    public record ReleaseRow(long id, String releaseKey, String batchKey, int recallVersion,
+                             String correctiveMeasures, String retestBatches, String approver,
+                             String applicant, String status, String createdAt, String decidedAt) {
+    }
+
+    /**
+     * recall_release_snapshot 表行记录：批准时写入的不可变评审快照。
+     */
+    public record SnapshotRow(long id, String releaseKey, String batchKey, int recallVersion,
+                              String closureBatches, String correctiveMeasures, String approver,
+                              String createdAt) {
     }
 
     /**
@@ -71,7 +96,25 @@ public class BatchRepository {
 
     private static final RowMapper<RecallRow> RECALL_MAPPER = (rs, n) -> new RecallRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("command_key"),
-            rs.getString("actor_id"), rs.getString("reason"), rs.getString("created_at"));
+            rs.getString("actor_id"), rs.getString("reason"), rs.getInt("version"),
+            rs.getString("recall_status"), rs.getString("prior_status"),
+            rs.getString("created_at"), rs.getString("released_at"));
+
+    private static final RowMapper<RetestRow> RETEST_MAPPER = (rs, n) -> new RetestRow(
+            rs.getLong("id"), rs.getString("batch_key"), rs.getString("retest_key"),
+            rs.getString("outcome"), rs.getString("inspector"), rs.getString("created_at"));
+
+    private static final RowMapper<ReleaseRow> RELEASE_MAPPER = (rs, n) -> new ReleaseRow(
+            rs.getLong("id"), rs.getString("release_key"), rs.getString("batch_key"),
+            rs.getInt("recall_version"), rs.getString("corrective_measures"),
+            rs.getString("retest_batches"), rs.getString("approver"), rs.getString("applicant"),
+            rs.getString("status"), rs.getString("created_at"), rs.getString("decided_at"));
+
+    private static final RowMapper<SnapshotRow> SNAPSHOT_MAPPER = (rs, n) -> new SnapshotRow(
+            rs.getLong("id"), rs.getString("release_key"), rs.getString("batch_key"),
+            rs.getInt("recall_version"), rs.getString("closure_batches"),
+            rs.getString("corrective_measures"), rs.getString("approver"),
+            rs.getString("created_at"));
 
     private static final RowMapper<CommandRow> COMMAND_MAPPER = (rs, n) -> new CommandRow(
             rs.getString("command_type"), rs.getString("command_key"), rs.getString("fingerprint"),
@@ -156,15 +199,84 @@ public class BatchRepository {
                 row.seq(), row.createdAt());
     }
 
+    /**
+     * 某批次最新一代召回记录（可能为 ACTIVE 或 RELEASED）；无召回记录时为空。
+     */
     public Optional<RecallRow> findRecall(String batchKey) {
-        return jdbc.query("SELECT * FROM recall WHERE batch_key = ?", RECALL_MAPPER, batchKey)
+        return jdbc.query("SELECT * FROM recall WHERE batch_key = ? ORDER BY id DESC",
+                        RECALL_MAPPER, batchKey)
                 .stream().findFirst();
     }
 
     public void insertRecall(RecallRow row) {
-        jdbc.update("INSERT INTO recall (batch_key, command_key, actor_id, reason, created_at)"
+        jdbc.update("INSERT INTO recall (batch_key, command_key, actor_id, reason, version,"
+                        + " recall_status, prior_status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                row.batchKey(), row.commandKey(), row.actorId(), row.reason(), row.version(),
+                row.recallStatus(), row.priorStatus(), row.createdAt());
+    }
+
+    /**
+     * 将指定召回代次置为已解除：记录不删除，仅更新状态与解除时间。
+     */
+    public void updateRecallReleased(long id, String releasedAt) {
+        jdbc.update("UPDATE recall SET recall_status = 'RELEASED', released_at = ? WHERE id = ?",
+                releasedAt, id);
+    }
+
+    public Optional<RetestRow> findRetest(String batchKey, String retestKey) {
+        return jdbc.query("SELECT * FROM retest WHERE batch_key = ? AND retest_key = ?",
+                        RETEST_MAPPER, batchKey, retestKey)
+                .stream().findFirst();
+    }
+
+    public void insertRetest(RetestRow row) {
+        jdbc.update("INSERT INTO retest (batch_key, retest_key, outcome, inspector, created_at)"
                         + " VALUES (?, ?, ?, ?, ?)",
-                row.batchKey(), row.commandKey(), row.actorId(), row.reason(), row.createdAt());
+                row.batchKey(), row.retestKey(), row.outcome(), row.inspector(), row.createdAt());
+    }
+
+    /**
+     * 某批次全部复检结果，按提交顺序排列；最新一条决定是否合格。
+     */
+    public List<RetestRow> findRetests(String batchKey) {
+        return jdbc.query("SELECT * FROM retest WHERE batch_key = ? ORDER BY id",
+                RETEST_MAPPER, batchKey);
+    }
+
+    public void insertRelease(ReleaseRow row) {
+        jdbc.update("INSERT INTO recall_release (release_key, batch_key, recall_version,"
+                        + " corrective_measures, retest_batches, approver, applicant, status, created_at)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                row.releaseKey(), row.batchKey(), row.recallVersion(), row.correctiveMeasures(),
+                row.retestBatches(), row.approver(), row.applicant(), row.status(), row.createdAt());
+    }
+
+    public Optional<ReleaseRow> findRelease(String releaseKey) {
+        return jdbc.query("SELECT * FROM recall_release WHERE release_key = ?",
+                        RELEASE_MAPPER, releaseKey)
+                .stream().findFirst();
+    }
+
+    /**
+     * 批准解除申请：置为 APPROVED 并记录批准时间。
+     */
+    public void updateReleaseApproved(String releaseKey, String decidedAt) {
+        jdbc.update("UPDATE recall_release SET status = 'APPROVED', decided_at = ?"
+                + " WHERE release_key = ?", decidedAt, releaseKey);
+    }
+
+    public void insertSnapshot(SnapshotRow row) {
+        jdbc.update("INSERT INTO recall_release_snapshot (release_key, batch_key, recall_version,"
+                        + " closure_batches, corrective_measures, approver, created_at)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                row.releaseKey(), row.batchKey(), row.recallVersion(), row.closureBatches(),
+                row.correctiveMeasures(), row.approver(), row.createdAt());
+    }
+
+    public Optional<SnapshotRow> findSnapshot(String releaseKey) {
+        return jdbc.query("SELECT * FROM recall_release_snapshot WHERE release_key = ?",
+                        SNAPSHOT_MAPPER, releaseKey)
+                .stream().findFirst();
     }
 
     public Optional<CommandRow> findCommand(String commandType, String commandKey) {
