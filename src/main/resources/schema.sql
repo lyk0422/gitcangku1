@@ -62,8 +62,37 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_review_request ON review (request_id);
 -- 写操作幂等去重：同键同参重放原结果，异参冲突；失败不占键
 CREATE TABLE IF NOT EXISTS request_dedup (
     request_id     VARCHAR(64) PRIMARY KEY COMMENT '写操作全局唯一请求标识',
-    request_kind   VARCHAR(32) NOT NULL COMMENT '请求类型：ZONE_CREATE/ZONE_REVOKE/ROUTE_CREATE/ROUTE_REPLACE/REVIEW',
+    request_kind   VARCHAR(32) NOT NULL COMMENT '请求类型：ZONE_CREATE/ZONE_REVOKE/ROUTE_CREATE/ROUTE_REPLACE/REVIEW/CORRIDOR_CREATE/CORRIDOR_CAPACITY/RESERVATION_CREATE/RESERVATION_CANCEL',
     request_hash   VARCHAR(64) NOT NULL COMMENT '规范化参数的 SHA-256 十六进制摘要，用于同键异参冲突判定',
     response_json  CLOB NOT NULL COMMENT '首次成功响应 JSON，重放时原样返回',
     created_at     BIGINT NOT NULL COMMENT '首次成功时间，epoch 毫秒（UTC）'
 ) COMMENT = '写操作幂等去重记录（与业务变更同事务原子提交）';
+
+-- 航路走廊：corridorId 唯一；非退化轴对齐闭矩形（复用航线坐标范围）；同时容量上限 1~50
+CREATE TABLE IF NOT EXISTS corridor (
+    corridor_id  VARCHAR(64) PRIMARY KEY COMMENT '走廊唯一标识',
+    x_min        INT NOT NULL COMMENT '矩形左边界（含），单位米',
+    y_min        INT NOT NULL COMMENT '矩形下边界（含），单位米',
+    x_max        INT NOT NULL COMMENT '矩形右边界（含），单位米，x_min < x_max',
+    y_max        INT NOT NULL COMMENT '矩形上边界（含），单位米，y_min < y_max',
+    capacity     INT NOT NULL COMMENT '同时容量上限（1~50），仅可上调不可下调，调整立即生效',
+    touch        BIGINT NOT NULL COMMENT '仅用于预约创建/取消/调容事务加行级写锁的计数器，无业务含义',
+    created_at   BIGINT NOT NULL COMMENT '创建时间，epoch 毫秒（UTC）'
+) COMMENT = '航路走廊（矩形区域与同时容量上限）';
+
+-- 走廊时段预约：UTC 左闭右开 [start_millis, end_millis)，时长 1~120 分钟；取消后保留历史
+CREATE TABLE IF NOT EXISTS corridor_reservation (
+    reservation_id   VARCHAR(64) PRIMARY KEY COMMENT '预约唯一标识（不可变）',
+    corridor_id      VARCHAR(64) NOT NULL COMMENT '所属走廊标识',
+    review_id        VARCHAR(64) NOT NULL COMMENT '关联的已 CLEAR 审核结果标识（仅引用，不消费、不改写审核记录）',
+    route_id         VARCHAR(64) NOT NULL COMMENT '关联审核对应的航线标识（冗余存储，便于查询）',
+    start_millis     BIGINT NOT NULL COMMENT '时段起始（含），epoch 毫秒（UTC）',
+    end_millis       BIGINT NOT NULL COMMENT '时段结束（不含），epoch 毫秒（UTC）；时长 1~120 分钟',
+    status           VARCHAR(16) NOT NULL COMMENT 'ACTIVE 生效中（计入容量占用）；CANCELLED 已取消（保留历史，不计占用）',
+    reservation_key  VARCHAR(64) NOT NULL COMMENT '预约幂等键，全局唯一；失败不占键',
+    created_at       BIGINT NOT NULL COMMENT '创建时间，epoch 毫秒（UTC）',
+    cancelled_at     BIGINT NULL COMMENT '取消时间，epoch 毫秒（UTC）；NULL 表示未取消'
+) COMMENT = '走廊时段预约（左闭右开时段，取消后保留历史）';
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_reservation_key ON corridor_reservation (reservation_key);
+CREATE INDEX IF NOT EXISTS ix_reservation_corridor_time ON corridor_reservation (corridor_id, start_millis, end_millis);
