@@ -8,14 +8,9 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
-import java.util.HexFormat;
 import java.util.List;
 import java.util.Objects;
-import java.util.Optional;
 
 /**
  * 现场观测离线三方合并业务服务。
@@ -31,26 +26,24 @@ import java.util.Optional;
 @Service
 public class ObservationService {
 
-    private static final String SEPARATOR = "\u0001";
-
     private final ObservationRepository observationRepository;
-    private final RequestLogRepository requestLogRepository;
+    private final IdempotencyStore idempotencyStore;
     private final ObjectMapper objectMapper;
 
     public ObservationService(ObservationRepository observationRepository,
-                              RequestLogRepository requestLogRepository,
+                              IdempotencyStore idempotencyStore,
                               ObjectMapper objectMapper) {
         this.observationRepository = observationRepository;
-        this.requestLogRepository = requestLogRepository;
+        this.idempotencyStore = idempotencyStore;
         this.objectMapper = objectMapper;
     }
 
     /**
-     * 创建观测记录，初始版本为 1。记录已存在返回 409。
+     * 创建观测记录，初始版本为 1，初始置信度 100。记录已存在返回 409。
      */
     @Transactional
     public WriteOutcome create(CreateObservationRequest request) {
-        String fingerprint = fingerprint("CREATE", request.observationId(), request.location(),
+        String fingerprint = IdempotencyStore.fingerprint("CREATE", request.observationId(), request.location(),
                 request.reading(), request.note());
         WriteOutcome replayed = checkReplay(request.requestId(), fingerprint);
         if (replayed != null) {
@@ -65,7 +58,7 @@ public class ObservationService {
             throw ApiException.conflict("observation already exists: " + request.observationId(), null);
         }
         ObservationSnapshot snapshot = new ObservationSnapshot(request.observationId(), 1,
-                request.location(), request.reading(), request.note(), false);
+                request.location(), request.reading(), request.note(), false, 100);
         try {
             observationRepository.insertCurrent(snapshot);
         } catch (DuplicateKeyException e) {
@@ -81,7 +74,7 @@ public class ObservationService {
      */
     @Transactional
     public WriteOutcome merge(String observationId, MergeObservationRequest request) {
-        String fingerprint = fingerprint("MERGE", observationId, String.valueOf(request.baseVersion()),
+        String fingerprint = IdempotencyStore.fingerprint("MERGE", observationId, String.valueOf(request.baseVersion()),
                 request.location(), request.reading(), request.note());
         WriteOutcome replayed = checkReplay(request.requestId(), fingerprint);
         if (replayed != null) {
@@ -112,13 +105,13 @@ public class ObservationService {
         }
 
         ObservationSnapshot merged = new ObservationSnapshot(observationId, current.version(),
-                mergedLocation, mergedReading, mergedNote, false);
+                mergedLocation, mergedReading, mergedNote, false, current.confidence());
         if (sameContent(merged, current)) {
             // 合并结果与当前完全相同：返回当前版本，不加版本
             return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(current));
         }
         ObservationSnapshot next = new ObservationSnapshot(observationId, current.version() + 1,
-                mergedLocation, mergedReading, mergedNote, false);
+                mergedLocation, mergedReading, mergedNote, false, current.confidence());
         observationRepository.updateCurrent(next);
         observationRepository.insertVersion(next);
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(next));
@@ -129,7 +122,7 @@ public class ObservationService {
      */
     @Transactional
     public WriteOutcome delete(String observationId, DeleteObservationRequest request) {
-        String fingerprint = fingerprint("DELETE", observationId, String.valueOf(request.expectedVersion()));
+        String fingerprint = IdempotencyStore.fingerprint("DELETE", observationId, String.valueOf(request.expectedVersion()));
         WriteOutcome replayed = checkReplay(request.requestId(), fingerprint);
         if (replayed != null) {
             return replayed;
@@ -148,7 +141,7 @@ public class ObservationService {
             throw ApiException.conflict("expectedVersion mismatch", current.version());
         }
         ObservationSnapshot tombstone = new ObservationSnapshot(observationId, current.version() + 1,
-                null, null, null, true);
+                null, null, null, true, current.confidence());
         observationRepository.markDeleted(observationId, tombstone.version());
         observationRepository.insertVersion(tombstone);
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(tombstone));
@@ -222,57 +215,33 @@ public class ObservationService {
     }
 
     /**
-     * 幂等检查：同键同参返回原成功结果；同键异参返回 409；无记录返回 null 继续执行。
+     * 幂等检查：同键同参返回原成功结果；同键异参抛 409；无记录返回 null 继续执行。
      */
     private WriteOutcome checkReplay(String requestId, String fingerprint) {
-        Optional<RequestLogEntry> existing = requestLogRepository.find(requestId);
-        if (existing.isEmpty()) {
+        IdempotencyStore.StoredResult stored = idempotencyStore.findReplay(requestId, fingerprint);
+        if (stored == null) {
             return null;
         }
-        RequestLogEntry entry = existing.get();
-        if (!entry.fingerprint().equals(fingerprint)) {
-            throw ApiException.conflict("requestId reused with different parameters: " + requestId, null);
-        }
-        return new WriteOutcome(entry.responseStatus(), readBody(entry.responseBody()));
+        return new WriteOutcome(stored.status(), readBody(stored.bodyJson()));
     }
 
     /**
-     * 占位写入去重记录；并发同键时主键冲突，等待对方事务结束后读取已提交结果：
-     * 同参返回重放结果，异参抛 409；正常占位返回 null。业务失败时占位随事务回滚，不占键。
+     * 占位写入去重记录；并发同键时返回对方已提交的重放结果，正常占位返回 null。
      */
     private WriteOutcome insertPlaceholder(String requestId, String fingerprint, String operation) {
-        try {
-            requestLogRepository.insertPlaceholder(requestId, fingerprint, operation);
+        IdempotencyStore.StoredResult stored = idempotencyStore.insertPlaceholder(requestId, fingerprint, operation);
+        if (stored == null) {
             return null;
-        } catch (DuplicateKeyException e) {
-            RequestLogEntry entry = requestLogRepository.find(requestId)
-                    .orElseThrow(() -> ApiException.conflict("requestId conflict: " + requestId, null));
-            if (!entry.fingerprint().equals(fingerprint)) {
-                throw ApiException.conflict("requestId reused with different parameters: " + requestId, null);
-            }
-            return new WriteOutcome(entry.responseStatus(), readBody(entry.responseBody()));
         }
+        return new WriteOutcome(stored.status(), readBody(stored.bodyJson()));
     }
 
     /**
      * 业务成功后回填去重记录响应，并构造本次写操作结果；与业务变更同事务提交。
      */
     private WriteOutcome complete(String requestId, HttpStatus status, ObservationResponse body) {
-        requestLogRepository.complete(requestId, status.value(), writeBody(body));
+        idempotencyStore.complete(requestId, status.value(), writeBody(body));
         return new WriteOutcome(status.value(), body);
-    }
-
-    private String fingerprint(String operation, String... parts) {
-        StringBuilder raw = new StringBuilder(operation);
-        for (String part : parts) {
-            raw.append(SEPARATOR).append(part == null ? "<null>" : part);
-        }
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            return HexFormat.of().formatHex(digest.digest(raw.toString().getBytes(StandardCharsets.UTF_8)));
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("SHA-256 not available", e);
-        }
     }
 
     private String writeBody(ObservationResponse body) {

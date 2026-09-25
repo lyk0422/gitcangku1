@@ -2,6 +2,7 @@ package com.example.starter.observation;
 
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -36,6 +37,16 @@ public class ApiExceptionHandler {
                 .collect(Collectors.joining("; "));
         ErrorResponse body = new ErrorResponse(HttpStatus.BAD_REQUEST.value(),
                 HttpStatus.BAD_REQUEST.getReasonPhrase(), message, null, null);
+        return ResponseEntity.badRequest().body(body);
+    }
+
+    /**
+     * 请求体无法解析（JSON 格式错误或枚举取值非法）：400。
+     */
+    @ExceptionHandler(HttpMessageNotReadableException.class)
+    public ResponseEntity<ErrorResponse> handleNotReadable(HttpMessageNotReadableException ex) {
+        ErrorResponse body = new ErrorResponse(HttpStatus.BAD_REQUEST.value(),
+                HttpStatus.BAD_REQUEST.getReasonPhrase(), "request body is malformed or has invalid values", null, null);
         return ResponseEntity.badRequest().body(body);
     }
 

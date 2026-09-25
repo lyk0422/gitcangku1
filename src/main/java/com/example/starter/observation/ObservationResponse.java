@@ -8,6 +8,7 @@ import com.fasterxml.jackson.annotation.JsonInclude;
  * @param observationId 观测记录唯一标识
  * @param version       版本号
  * @param deleted       是否为删除墓碑
+ * @param confidence    置信度（0-100）：初始 100，每条不同类别的有效 CONFIRMED 复核扣减 20
  * @param location      观测地点（墓碑版本不返回）
  * @param reading       观测读数（墓碑版本不返回）
  * @param note          观测备注（墓碑版本不返回）
@@ -17,6 +18,7 @@ public record ObservationResponse(
         String observationId,
         int version,
         boolean deleted,
+        int confidence,
         String location,
         String reading,
         String note) {
@@ -26,9 +28,10 @@ public record ObservationResponse(
      */
     public static ObservationResponse of(ObservationSnapshot snapshot) {
         if (snapshot.deleted()) {
-            return new ObservationResponse(snapshot.observationId(), snapshot.version(), true, null, null, null);
+            return new ObservationResponse(snapshot.observationId(), snapshot.version(), true,
+                    snapshot.confidence(), null, null, null);
         }
         return new ObservationResponse(snapshot.observationId(), snapshot.version(), false,
-                snapshot.location(), snapshot.reading(), snapshot.note());
+                snapshot.confidence(), snapshot.location(), snapshot.reading(), snapshot.note());
     }
 }

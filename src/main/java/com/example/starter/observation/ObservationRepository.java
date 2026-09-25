@@ -4,6 +4,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
 
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -19,7 +20,8 @@ public class ObservationRepository {
             rs.getString("location"),
             rs.getString("reading"),
             rs.getString("note"),
-            rs.getBoolean("deleted"));
+            rs.getBoolean("deleted"),
+            rs.getInt("confidence"));
 
     private final JdbcTemplate jdbcTemplate;
 
@@ -32,7 +34,7 @@ public class ObservationRepository {
      */
     public Optional<ObservationSnapshot> findCurrent(String observationId) {
         return jdbcTemplate.query(
-                        "SELECT observation_id, version, location, reading, note, deleted "
+                        "SELECT observation_id, version, location, reading, note, deleted, confidence "
                                 + "FROM observation_current WHERE observation_id = ?",
                         SNAPSHOT_MAPPER, observationId)
                 .stream().findFirst();
@@ -43,7 +45,7 @@ public class ObservationRepository {
      */
     public Optional<ObservationSnapshot> findCurrentForUpdate(String observationId) {
         return jdbcTemplate.query(
-                        "SELECT observation_id, version, location, reading, note, deleted "
+                        "SELECT observation_id, version, location, reading, note, deleted, confidence "
                                 + "FROM observation_current WHERE observation_id = ? FOR UPDATE",
                         SNAPSHOT_MAPPER, observationId)
                 .stream().findFirst();
@@ -54,7 +56,7 @@ public class ObservationRepository {
      */
     public Optional<ObservationSnapshot> findVersion(String observationId, int version) {
         return jdbcTemplate.query(
-                        "SELECT observation_id, version, location, reading, note, deleted "
+                        "SELECT observation_id, version, location, reading, note, deleted, confidence "
                                 + "FROM observation_version WHERE observation_id = ? AND version = ?",
                         SNAPSHOT_MAPPER, observationId, version)
                 .stream().findFirst();
@@ -65,10 +67,10 @@ public class ObservationRepository {
      */
     public void insertCurrent(ObservationSnapshot snapshot) {
         jdbcTemplate.update(
-                "INSERT INTO observation_current (observation_id, location, reading, note, version, deleted, updated_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                "INSERT INTO observation_current (observation_id, location, reading, note, version, deleted, confidence, updated_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                 snapshot.observationId(), snapshot.location(), snapshot.reading(), snapshot.note(),
-                snapshot.version(), snapshot.deleted());
+                snapshot.version(), snapshot.deleted(), snapshot.confidence());
     }
 
     /**
@@ -77,9 +79,9 @@ public class ObservationRepository {
     public void updateCurrent(ObservationSnapshot snapshot) {
         jdbcTemplate.update(
                 "UPDATE observation_current SET location = ?, reading = ?, note = ?, version = ?, deleted = ?, "
-                        + "updated_at = CURRENT_TIMESTAMP WHERE observation_id = ?",
+                        + "confidence = ?, updated_at = CURRENT_TIMESTAMP WHERE observation_id = ?",
                 snapshot.location(), snapshot.reading(), snapshot.note(),
-                snapshot.version(), snapshot.deleted(), snapshot.observationId());
+                snapshot.version(), snapshot.deleted(), snapshot.confidence(), snapshot.observationId());
     }
 
     /**
@@ -97,9 +99,34 @@ public class ObservationRepository {
      */
     public void insertVersion(ObservationSnapshot snapshot) {
         jdbcTemplate.update(
-                "INSERT INTO observation_version (observation_id, version, location, reading, note, deleted, created_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                "INSERT INTO observation_version (observation_id, version, location, reading, note, deleted, confidence, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                 snapshot.observationId(), snapshot.version(), snapshot.location(),
-                snapshot.reading(), snapshot.note(), snapshot.deleted());
+                snapshot.reading(), snapshot.note(), snapshot.deleted(), snapshot.confidence());
+    }
+
+    /**
+     * 复核 CONFIRMED 生效后回写置信度：同时更新当前状态与该版本快照；
+     * 历史版本快照不回写，置信度随版本保留。
+     */
+    public void updateConfidence(String observationId, int version, int confidence) {
+        jdbcTemplate.update(
+                "UPDATE observation_current SET confidence = ? WHERE observation_id = ?",
+                confidence, observationId);
+        jdbcTemplate.update(
+                "UPDATE observation_version SET confidence = ? WHERE observation_id = ? AND version = ?",
+                confidence, observationId, version);
+    }
+
+    /**
+     * 查询置信度轨迹：按版本升序返回各版本快照的置信度。
+     */
+    public List<ConfidencePoint> findConfidenceTrajectory(String observationId) {
+        return jdbcTemplate.query(
+                "SELECT version, confidence, created_at FROM observation_version "
+                        + "WHERE observation_id = ? ORDER BY version",
+                (rs, rowNum) -> new ConfidencePoint(rs.getInt("version"), rs.getInt("confidence"),
+                        rs.getTimestamp("created_at").toLocalDateTime()),
+                observationId);
     }
 }
