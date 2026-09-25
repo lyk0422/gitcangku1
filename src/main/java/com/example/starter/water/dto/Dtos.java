@@ -74,6 +74,63 @@ public final class Dtos {
                                   List<CurtailmentResponse> curtailments) {
     }
 
+    /** 设置/调整应急储备命令；reserveKey 为幂等指纹键，expectedVersion 须匹配当前窗口储备版本。 */
+    public record SetReserveRequest(String reserveKey, String reserveVolume, Integer expectedVersion) {
+    }
+
+    /** 储备调整历史快照视图。 */
+    public record ReserveHistoryItem(String reserveKey, String actor, String oldVolume, String newVolume,
+                                     int version, String createdUtc) {
+    }
+
+    /** 常规核销命令。 */
+    public record RegularWriteOffRequest(String commandKey, String writeOffKey, String amount) {
+    }
+
+    /** 常规核销视图。 */
+    public record RegularWriteOffResponse(String writeOffKey, long windowId, String amount, String createdUtc) {
+    }
+
+    /** 单笔应急核销命令；emergencyId 同一窗口只能核销一次，approver 为审批人。 */
+    public record EmergencyWriteOffRequest(String commandKey, String writeOffKey, String emergencyId,
+                                           String approver, String amount) {
+    }
+
+    /** 批量应急核销命令；先整体校验再单事务扣减，任一失败整单回滚。 */
+    public record EmergencyBatchRequest(String commandKey, String batchKey,
+                                        List<EmergencyWriteOffItem> items) {
+    }
+
+    /** 批量应急核销明细项。 */
+    public record EmergencyWriteOffItem(String emergencyId, String approver, String amount) {
+    }
+
+    /** 应急核销视图；batchKey 为 null 表示单笔核销。 */
+    public record EmergencyWriteOffResponse(String writeOffKey, long windowId, String emergencyId,
+                                            String approver, String amount, String batchKey, String createdUtc) {
+    }
+
+    /** 批量应急核销视图。 */
+    public record EmergencyBatchResponse(String batchKey, long windowId, String totalAmount,
+                                         List<EmergencyWriteOffResponse> items) {
+    }
+
+    /**
+     * 窗口储备视图：储备量、储备余额、常规可用量、应急核销流水、储备调整历史与阻断原因。
+     * windowClosed 为 true 时禁止新建应急核销；blockedReasons 列出当前阻断原因，无阻断为空列表。
+     */
+    public record ReserveStatusResponse(long windowId, String availableTotal, String reserveVolume,
+                                        String reserveUsed, String reserveBalance, String regularUsed,
+                                        String regularAvailable, int version, boolean windowClosed,
+                                        List<String> blockedReasons,
+                                        List<EmergencyWriteOffResponse> emergencyWriteOffs,
+                                        List<ReserveHistoryItem> reserveHistory) {
+    }
+
+    /** 窗口关闭视图。 */
+    public record WindowCloseResponse(long windowId, boolean closed, String closedUtc) {
+    }
+
     /** 统一错误响应体。 */
     public record ErrorResponse(String code, String message) {
     }

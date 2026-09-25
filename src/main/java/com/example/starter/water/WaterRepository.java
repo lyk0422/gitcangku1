@@ -20,9 +20,10 @@ import java.util.Objects;
 @Repository
 public class WaterRepository {
 
-    /** 供水窗口行。 */
+    /** 供水窗口行；储备余额 = reserveVolume - reserveUsed，常规可用量 = 可用总量 - reserveVolume - regularUsed。 */
     public record WindowRow(long id, String windowKey, String channelId, long startNanos, long endNanos,
-                            BigDecimal plannedVolume, long createdNanos) {
+                            BigDecimal plannedVolume, BigDecimal reserveVolume, BigDecimal reserveUsed,
+                            BigDecimal regularUsed, int version, Long closedNanos, long createdNanos) {
     }
 
     /** 配水申请行；amount 为不可改写的原申请水量，heldAmount 为当前持有额度。 */
@@ -46,10 +47,35 @@ public class WaterRepository {
                              long createdNanos) {
     }
 
+    /** 常规核销流水行，创建后不可变。 */
+    public record RegularWriteOffRow(long id, String writeOffKey, long windowId, BigDecimal amount,
+                                     long createdNanos) {
+    }
+
+    /** 应急核销流水行，创建后不可变；batchKey 为 null 表示单笔核销。 */
+    public record EmergencyWriteOffRow(long id, String writeOffKey, long windowId, String emergencyId,
+                                       String approver, BigDecimal amount, String batchKey,
+                                       long createdNanos) {
+    }
+
+    /** 储备调整历史快照行。 */
+    public record ReserveHistoryRow(long id, String reserveKey, long windowId, String actor,
+                                    BigDecimal oldVolume, BigDecimal newVolume, int version,
+                                    long createdNanos) {
+    }
+
+    private static final String WINDOW_SELECT =
+            "SELECT id, window_key, channel_id, start_nanos, end_nanos, planned_volume, reserve_volume,"
+                    + " reserve_used, regular_used, version, closed_nanos, created_nanos";
+
     private static final RowMapper<WindowRow> WINDOW_MAPPER = (rs, n) -> new WindowRow(
             rs.getLong("id"), rs.getString("window_key"), rs.getString("channel_id"),
             rs.getLong("start_nanos"), rs.getLong("end_nanos"),
-            rs.getBigDecimal("planned_volume"), rs.getLong("created_nanos"));
+            rs.getBigDecimal("planned_volume"), rs.getBigDecimal("reserve_volume"),
+            rs.getBigDecimal("reserve_used"), rs.getBigDecimal("regular_used"),
+            rs.getInt("version"),
+            rs.getObject("closed_nanos") == null ? null : rs.getLong("closed_nanos"),
+            rs.getLong("created_nanos"));
 
     private static final RowMapper<AllocationRow> ALLOCATION_MAPPER = (rs, n) -> new AllocationRow(
             rs.getLong("id"), rs.getString("allocation_key"), rs.getLong("window_id"),
@@ -103,20 +129,17 @@ public class WaterRepository {
     /** 按主键查询窗口，不存在返回 null。 */
     public WindowRow findWindowById(long id) {
         try {
-            return jdbc.queryForObject(
-                    "SELECT id, window_key, channel_id, start_nanos, end_nanos, planned_volume, created_nanos"
-                            + " FROM supply_window WHERE id = ?", WINDOW_MAPPER, id);
+            return jdbc.queryForObject(WINDOW_SELECT + " FROM supply_window WHERE id = ?", WINDOW_MAPPER, id);
         } catch (EmptyResultDataAccessException e) {
             return null;
         }
     }
 
-    /** 按主键锁定窗口行（FOR UPDATE），用于串行化批准与限供。 */
+    /** 按主键锁定窗口行（FOR UPDATE），用于串行化批准、限供、储备调整、核销与窗口关闭。 */
     public WindowRow lockWindowById(long id) {
         try {
-            return jdbc.queryForObject(
-                    "SELECT id, window_key, channel_id, start_nanos, end_nanos, planned_volume, created_nanos"
-                            + " FROM supply_window WHERE id = ? FOR UPDATE", WINDOW_MAPPER, id);
+            return jdbc.queryForObject(WINDOW_SELECT + " FROM supply_window WHERE id = ? FOR UPDATE",
+                    WINDOW_MAPPER, id);
         } catch (EmptyResultDataAccessException e) {
             return null;
         }
@@ -303,5 +326,167 @@ public class WaterRepository {
     /** 写回命令首次成功响应。 */
     public void updateCommandResponse(String commandKey, String response) {
         jdbc.update("UPDATE command_log SET response = ? WHERE command_key = ?", response, commandKey);
+    }
+
+    // ------------------------------------------------------------------
+    // 应急储备与核销
+    // ------------------------------------------------------------------
+
+    private static final RowMapper<RegularWriteOffRow> REGULAR_WRITE_OFF_MAPPER =
+            (rs, n) -> new RegularWriteOffRow(
+                    rs.getLong("id"), rs.getString("write_off_key"), rs.getLong("window_id"),
+                    rs.getBigDecimal("amount"), rs.getLong("created_nanos"));
+
+    private static final RowMapper<EmergencyWriteOffRow> EMERGENCY_WRITE_OFF_MAPPER =
+            (rs, n) -> new EmergencyWriteOffRow(
+                    rs.getLong("id"), rs.getString("write_off_key"), rs.getLong("window_id"),
+                    rs.getString("emergency_id"), rs.getString("approver"), rs.getBigDecimal("amount"),
+                    rs.getString("batch_key"), rs.getLong("created_nanos"));
+
+    private static final RowMapper<ReserveHistoryRow> RESERVE_HISTORY_MAPPER = (rs, n) ->
+            new ReserveHistoryRow(
+                    rs.getLong("id"), rs.getString("reserve_key"), rs.getLong("window_id"),
+                    rs.getString("actor"), rs.getBigDecimal("old_volume"), rs.getBigDecimal("new_volume"),
+                    rs.getInt("version"), rs.getLong("created_nanos"));
+
+    private static final String EMERGENCY_WRITE_OFF_SELECT =
+            "SELECT id, write_off_key, window_id, emergency_id, approver, amount, batch_key, created_nanos";
+
+    /** 调整窗口储备量并递增版本号（调用方已在窗口行锁内校验 expectedVersion）。 */
+    public void updateReserve(long windowId, BigDecimal newVolume, int newVersion) {
+        jdbc.update("UPDATE supply_window SET reserve_volume = ?, version = ? WHERE id = ?",
+                newVolume, newVersion, windowId);
+    }
+
+    /** 累加窗口常规核销量（不得侵占储备由事务内校验保证）。 */
+    public void addRegularUsed(long windowId, BigDecimal delta) {
+        jdbc.update("UPDATE supply_window SET regular_used = regular_used + ? WHERE id = ?",
+                delta, windowId);
+    }
+
+    /** 累加窗口应急核销量（不超过储备量由事务内校验与 CHECK 约束保证）。 */
+    public void addReserveUsed(long windowId, BigDecimal delta) {
+        jdbc.update("UPDATE supply_window SET reserve_used = reserve_used + ? WHERE id = ?",
+                delta, windowId);
+    }
+
+    /** 关闭窗口，记录关闭时间。 */
+    public void closeWindow(long windowId, long closedNanos) {
+        jdbc.update("UPDATE supply_window SET closed_nanos = ? WHERE id = ?", closedNanos, windowId);
+    }
+
+    /** 插入常规核销流水并返回主键。 */
+    public long insertRegularWriteOff(String writeOffKey, long windowId, BigDecimal amount, long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO regular_write_off (write_off_key, window_id, amount, created_nanos)"
+                            + " VALUES (?, ?, ?, ?)", Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, writeOffKey);
+            ps.setLong(2, windowId);
+            ps.setBigDecimal(3, amount);
+            ps.setLong(4, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 按业务键查询常规核销，不存在返回 null。 */
+    public RegularWriteOffRow findRegularWriteOffByKey(String writeOffKey) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT id, write_off_key, window_id, amount, created_nanos"
+                            + " FROM regular_write_off WHERE write_off_key = ?",
+                    REGULAR_WRITE_OFF_MAPPER, writeOffKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 窗口全部常规核销流水，按主键升序。 */
+    public List<RegularWriteOffRow> listRegularWriteOffs(long windowId) {
+        return jdbc.query(
+                "SELECT id, write_off_key, window_id, amount, created_nanos"
+                        + " FROM regular_write_off WHERE window_id = ? ORDER BY id",
+                REGULAR_WRITE_OFF_MAPPER, windowId);
+    }
+
+    /** 插入应急核销流水并返回主键；同窗口同 emergencyId 由唯一约束拒绝。 */
+    public long insertEmergencyWriteOff(String writeOffKey, long windowId, String emergencyId, String approver,
+                                        BigDecimal amount, String batchKey, long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO emergency_write_off (write_off_key, window_id, emergency_id, approver,"
+                            + " amount, batch_key, created_nanos) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, writeOffKey);
+            ps.setLong(2, windowId);
+            ps.setString(3, emergencyId);
+            ps.setString(4, approver);
+            ps.setBigDecimal(5, amount);
+            ps.setString(6, batchKey);
+            ps.setLong(7, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 按业务键查询应急核销，不存在返回 null。 */
+    public EmergencyWriteOffRow findEmergencyWriteOffByKey(String writeOffKey) {
+        try {
+            return jdbc.queryForObject(
+                    EMERGENCY_WRITE_OFF_SELECT + " FROM emergency_write_off WHERE write_off_key = ?",
+                    EMERGENCY_WRITE_OFF_MAPPER, writeOffKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 查询窗口内指定应急编号的核销记录，不存在返回 null（同一窗口同一应急编号至多一条）。 */
+    public EmergencyWriteOffRow findEmergencyWriteOffByEmergencyId(long windowId, String emergencyId) {
+        try {
+            return jdbc.queryForObject(
+                    EMERGENCY_WRITE_OFF_SELECT
+                            + " FROM emergency_write_off WHERE window_id = ? AND emergency_id = ?",
+                    EMERGENCY_WRITE_OFF_MAPPER, windowId, emergencyId);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 窗口全部应急核销流水，按主键升序。 */
+    public List<EmergencyWriteOffRow> listEmergencyWriteOffs(long windowId) {
+        return jdbc.query(EMERGENCY_WRITE_OFF_SELECT + " FROM emergency_write_off WHERE window_id = ? ORDER BY id",
+                EMERGENCY_WRITE_OFF_MAPPER, windowId);
+    }
+
+    /** 插入储备调整历史快照并返回主键。 */
+    public long insertReserveHistory(String reserveKey, long windowId, String actor, BigDecimal oldVolume,
+                                     BigDecimal newVolume, int version, long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO reserve_history (reserve_key, window_id, actor, old_volume, new_volume,"
+                            + " version, created_nanos) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, reserveKey);
+            ps.setLong(2, windowId);
+            ps.setString(3, actor);
+            ps.setBigDecimal(4, oldVolume);
+            ps.setBigDecimal(5, newVolume);
+            ps.setInt(6, version);
+            ps.setLong(7, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 窗口全部储备调整历史快照，按主键升序；窗口结束后保留。 */
+    public List<ReserveHistoryRow> listReserveHistory(long windowId) {
+        return jdbc.query(
+                "SELECT id, reserve_key, window_id, actor, old_volume, new_volume, version, created_nanos"
+                        + " FROM reserve_history WHERE window_id = ? ORDER BY id",
+                RESERVE_HISTORY_MAPPER, windowId);
     }
 }

@@ -3,14 +3,24 @@ package com.example.starter.water;
 import com.example.starter.water.WaterRepository.AllocationRow;
 import com.example.starter.water.WaterRepository.CommandRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
+import com.example.starter.water.WaterRepository.EmergencyWriteOffRow;
+import com.example.starter.water.WaterRepository.RegularWriteOffRow;
+import com.example.starter.water.WaterRepository.ReserveHistoryRow;
 import com.example.starter.water.WaterRepository.TransferRow;
 import com.example.starter.water.WaterRepository.WindowRow;
 import com.example.starter.water.dto.Dtos.AllocationResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
+import com.example.starter.water.dto.Dtos.EmergencyBatchResponse;
+import com.example.starter.water.dto.Dtos.EmergencyWriteOffItem;
+import com.example.starter.water.dto.Dtos.EmergencyWriteOffResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.RegularWriteOffResponse;
+import com.example.starter.water.dto.Dtos.ReserveHistoryItem;
+import com.example.starter.water.dto.Dtos.ReserveStatusResponse;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferResponse;
+import com.example.starter.water.dto.Dtos.WindowCloseResponse;
 import com.example.starter.water.dto.Dtos.WindowResponse;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
@@ -21,7 +31,10 @@ import org.springframework.transaction.support.TransactionTemplate;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
@@ -192,7 +205,7 @@ public class WaterService {
                         "转入申请不存在: " + targetAllocationKey);
             }
             // 先锁窗口行，与普通批准、取消、限供调整按事务提交顺序串行裁决
-            lockWindowOf(source);
+            WindowRow window = lockWindowOf(source);
             // 窗口锁内再锁定源/目标申请行，得到最新状态与持有额度
             AllocationRow lockedSource = repository.lockAllocationByKey(sourceAllocationKey);
             AllocationRow lockedTarget = repository.lockAllocationByKey(targetAllocationKey);
@@ -216,6 +229,9 @@ public class WaterService {
                 throw ApiException.quotaExceeded("源申请当前持有额度 " + fmt(lockedSource.heldAmount())
                         + " 不足，无法转让 " + fmt(amount));
             }
+            // 储备隔离：常规转让不得使窗口可用常规量低于储备量；同窗口等额转让本身不改变窗口占用，
+            // 此处校验窗口常规池未被既有批准与常规核销透支（限供收紧或储备划定后的边界防御）
+            ensureRegularPoolNonNegative(window);
             long now = nowNanos();
             repository.decrementHeldAmount(lockedSource.id(), amount, now);
             repository.updateAllocationStatus(lockedTarget.id(), STATUS_APPROVED, now);
@@ -316,6 +332,200 @@ public class WaterService {
     }
 
     // ------------------------------------------------------------------
+    // 应急储备与核销
+    // ------------------------------------------------------------------
+
+    /**
+     * 设置/调整窗口应急储备量。reserveKey 为幂等指纹键（含操作者、窗口版本与数量）；
+     * expectedVersion 必须匹配当前窗口储备版本，不匹配返回 409。
+     * 储备量最多 3 位小数、不小于 0、不大于窗口总配额；调整（含下调）时回查已批准但未核销的
+     * 常规占用（已批准持有额度 + 已常规核销），若其结算后会侵占新储备量返回 422，不部分生效。
+     */
+    public ReserveStatusResponse setReserve(String reserveKey, long windowId, String reserveVolume,
+                                            Integer expectedVersion, String actor) {
+        requireKey("reserveKey", reserveKey);
+        requireKey("X-Actor-Id", actor);
+        if (expectedVersion == null) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "expectedVersion 不能为空");
+        }
+        BigDecimal newReserve = parseReserveAmount("reserveVolume", reserveVolume);
+        String params = "RESERVE_SET|" + windowId + "|" + expectedVersion + "|"
+                + newReserve.toPlainString() + "|" + actor;
+        return runCommand("RESERVE_SET", reserveKey, params, ReserveStatusResponse.class, () -> {
+            WindowRow window = repository.lockWindowById(windowId);
+            if (window == null) {
+                throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + windowId);
+            }
+            if (window.version() != expectedVersion) {
+                throw ApiException.conflict("VERSION_CONFLICT",
+                        "窗口储备版本不匹配：期望 " + expectedVersion + "，当前 " + window.version());
+            }
+            if (newReserve.compareTo(window.plannedVolume()) > 0) {
+                throw ApiException.badRequest("INVALID_ARGUMENT",
+                        "储备量不能大于窗口总配额 " + fmt(window.plannedVolume()));
+            }
+            if (newReserve.compareTo(window.reserveUsed()) < 0) {
+                throw ApiException.unprocessable("RESERVE_BELOW_USED",
+                        "储备量不能低于已应急核销量 " + fmt(window.reserveUsed()));
+            }
+            // 回查已批准但未核销的常规占用后态：占用 > 可用总量 - 新储备量 即结算后侵占新储备
+            BigDecimal available = availableTotal(window);
+            BigDecimal occupied = repository.sumApprovedAmount(windowId).add(window.regularUsed());
+            if (occupied.compareTo(available.subtract(newReserve)) > 0) {
+                throw ApiException.unprocessable("RESERVE_CONFLICT",
+                        "已批准未核销常规占用 " + fmt(occupied) + " 结算后将侵占新储备量 "
+                                + fmt(newReserve) + "（可用总量 " + fmt(available) + "）");
+            }
+            long now = nowNanos();
+            repository.updateReserve(windowId, newReserve, window.version() + 1);
+            repository.insertReserveHistory(reserveKey, windowId, actor, window.reserveVolume(),
+                    newReserve, window.version() + 1, now);
+            return toReserveStatus(repository.findWindowById(windowId));
+        });
+    }
+
+    /**
+     * 常规核销：仅从窗口常规可用量扣减，不得使可用常规量低于储备量；
+     * 违反返回 422 并给出常规余额与储备量。
+     */
+    public RegularWriteOffResponse regularWriteOff(String commandKey, String writeOffKey, long windowId,
+                                                   String amount) {
+        requireKey("commandKey", commandKey);
+        requireKey("writeOffKey", writeOffKey);
+        BigDecimal qty = parseAmount("amount", amount);
+        String params = "REGULAR_WRITE_OFF|" + writeOffKey + "|" + windowId + "|" + qty.toPlainString();
+        return runCommand("REGULAR_WRITE_OFF", commandKey, params, RegularWriteOffResponse.class, () -> {
+            WindowRow window = repository.lockWindowById(windowId);
+            if (window == null) {
+                throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + windowId);
+            }
+            if (repository.findRegularWriteOffByKey(writeOffKey) != null) {
+                throw ApiException.conflict("WRITE_OFF_KEY_REUSED", "writeOffKey 已被使用: " + writeOffKey);
+            }
+            BigDecimal regularAvailable = regularAvailable(window);
+            if (qty.compareTo(regularAvailable) > 0) {
+                throw ApiException.unprocessable("REGULAR_POOL_EXCEEDED",
+                        "常规核销 " + fmt(qty) + " 将使可用常规量低于储备量：常规余额 "
+                                + fmt(regularAvailable) + "，储备量 " + fmt(window.reserveVolume()));
+            }
+            long now = nowNanos();
+            repository.addRegularUsed(windowId, qty);
+            repository.insertRegularWriteOff(writeOffKey, windowId, qty, now);
+            return toRegularWriteOffResponse(repository.findRegularWriteOffByKey(writeOffKey));
+        });
+    }
+
+    /**
+     * 单笔应急核销：必须声明 emergencyId 与审批人，仅从储备余额扣减；
+     * 同一 emergencyId 在同一窗口只能核销一次；窗口结束后不得新建。
+     */
+    public EmergencyWriteOffResponse emergencyWriteOff(String commandKey, String writeOffKey, long windowId,
+                                                       String emergencyId, String approver, String amount) {
+        requireKey("commandKey", commandKey);
+        requireKey("writeOffKey", writeOffKey);
+        requireKey("emergencyId", emergencyId);
+        requireKey("approver", approver);
+        BigDecimal qty = parseAmount("amount", amount);
+        String params = "EMERGENCY_WRITE_OFF|" + writeOffKey + "|" + windowId + "|" + emergencyId + "|"
+                + approver + "|" + qty.toPlainString();
+        return runCommand("EMERGENCY_WRITE_OFF", commandKey, params, EmergencyWriteOffResponse.class, () -> {
+            WindowRow window = lockOpenWindow(windowId);
+            if (repository.findEmergencyWriteOffByKey(writeOffKey) != null) {
+                throw ApiException.conflict("WRITE_OFF_KEY_REUSED", "writeOffKey 已被使用: " + writeOffKey);
+            }
+            ensureEmergencyIdUnused(windowId, emergencyId);
+            ensureReserveSufficient(window, qty);
+            long now = nowNanos();
+            repository.addReserveUsed(windowId, qty);
+            insertEmergencyRow(writeOffKey, windowId, emergencyId, approver, qty, null, now);
+            return toEmergencyWriteOffResponse(repository.findEmergencyWriteOffByKey(writeOffKey));
+        });
+    }
+
+    /**
+     * 批量应急核销：先校验全部明细的储备余额与审批信息，再单事务扣减；
+     * 任一失败整单回滚，不产生部分核销。
+     */
+    public EmergencyBatchResponse emergencyWriteOffBatch(String commandKey, String batchKey, long windowId,
+                                                         List<EmergencyWriteOffItem> items) {
+        requireKey("commandKey", commandKey);
+        requireKey("batchKey", batchKey);
+        if (items == null || items.isEmpty()) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "items 不能为空");
+        }
+        List<BigDecimal> amounts = new ArrayList<>(items.size());
+        Set<String> seen = new HashSet<>();
+        BigDecimal total = BigDecimal.ZERO;
+        for (EmergencyWriteOffItem item : items) {
+            if (item == null) {
+                throw ApiException.badRequest("INVALID_ARGUMENT", "items 明细不能为空");
+            }
+            requireKey("emergencyId", item.emergencyId());
+            requireKey("approver", item.approver());
+            BigDecimal qty = parseAmount("amount", item.amount());
+            if (!seen.add(item.emergencyId())) {
+                throw ApiException.conflict("EMERGENCY_ID_REUSED",
+                        "同一批次内应急编号重复: " + item.emergencyId());
+            }
+            amounts.add(qty);
+            total = total.add(qty);
+        }
+        StringBuilder params = new StringBuilder("EMERGENCY_WRITE_OFF_BATCH|" + batchKey + "|" + windowId);
+        for (int i = 0; i < items.size(); i++) {
+            params.append('|').append(items.get(i).emergencyId()).append(':')
+                    .append(items.get(i).approver()).append(':').append(amounts.get(i).toPlainString());
+        }
+        BigDecimal batchTotal = total;
+        return runCommand("EMERGENCY_WRITE_OFF_BATCH", commandKey, params.toString(),
+                EmergencyBatchResponse.class, () -> {
+                    WindowRow window = lockOpenWindow(windowId);
+                    // 先整体校验：审批信息已在事务外校验，此处校验储备余额与应急编号占用
+                    for (EmergencyWriteOffItem item : items) {
+                        ensureEmergencyIdUnused(windowId, item.emergencyId());
+                    }
+                    ensureReserveSufficient(window, batchTotal);
+                    long now = nowNanos();
+                    repository.addReserveUsed(windowId, batchTotal);
+                    List<EmergencyWriteOffResponse> responses = new ArrayList<>(items.size());
+                    for (int i = 0; i < items.size(); i++) {
+                        String writeOffKey = batchKey + "-" + (i + 1);
+                        insertEmergencyRow(writeOffKey, windowId, items.get(i).emergencyId(),
+                                items.get(i).approver(), amounts.get(i), batchKey, now);
+                        responses.add(toEmergencyWriteOffResponse(
+                                repository.findEmergencyWriteOffByKey(writeOffKey)));
+                    }
+                    return new EmergencyBatchResponse(batchKey, windowId, fmt(batchTotal), responses);
+                });
+    }
+
+    /** 关闭窗口：关闭后不得新建应急核销，历史储备快照保留。 */
+    public WindowCloseResponse closeWindow(String commandKey, long windowId) {
+        requireKey("commandKey", commandKey);
+        String params = "WINDOW_CLOSE|" + windowId;
+        return runCommand("WINDOW_CLOSE", commandKey, params, WindowCloseResponse.class, () -> {
+            WindowRow window = repository.lockWindowById(windowId);
+            if (window == null) {
+                throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + windowId);
+            }
+            if (window.closedNanos() != null) {
+                throw ApiException.conflict("WINDOW_ALREADY_CLOSED", "窗口已关闭，不能重复关闭");
+            }
+            long now = nowNanos();
+            repository.closeWindow(windowId, now);
+            return new WindowCloseResponse(windowId, true, toIso(now));
+        });
+    }
+
+    /** 查询窗口储备余额、常规可用量、应急核销流水、储备调整历史与阻断原因。 */
+    public ReserveStatusResponse getReserveStatus(long windowId) {
+        WindowRow window = repository.findWindowById(windowId);
+        if (window == null) {
+            throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + windowId);
+        }
+        return toReserveStatus(window);
+    }
+
+    // ------------------------------------------------------------------
     // 幂等命令框架
     // ------------------------------------------------------------------
 
@@ -367,6 +577,111 @@ public class WaterService {
     private BigDecimal availableTotal(WindowRow window) {
         CurtailmentRow active = repository.findActiveCurtailment(window.id());
         return active != null ? active.volume() : window.plannedVolume();
+    }
+
+    /** 储备余额 = 储备量 - 已应急核销量。 */
+    private BigDecimal reserveBalance(WindowRow window) {
+        return window.reserveVolume().subtract(window.reserveUsed());
+    }
+
+    /** 常规可用量 = 可用总量 - 储备量 - 已常规核销量；常规转让与常规核销不得使其低于 0（即不低于储备量口径）。 */
+    private BigDecimal regularAvailable(WindowRow window) {
+        return availableTotal(window).subtract(window.reserveVolume()).subtract(window.regularUsed());
+    }
+
+    /** 窗口是否已结束（已关闭或已过结束时刻），结束后不得新建应急核销。 */
+    private boolean isWindowEnded(WindowRow window, long nowNanos) {
+        return window.closedNanos() != null || nowNanos >= window.endNanos();
+    }
+
+    /** 锁定窗口并校验未结束，用于新建应急核销。 */
+    private WindowRow lockOpenWindow(long windowId) {
+        WindowRow window = repository.lockWindowById(windowId);
+        if (window == null) {
+            throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + windowId);
+        }
+        if (isWindowEnded(window, nowNanos())) {
+            throw ApiException.conflict("WINDOW_CLOSED", "窗口已结束，不得新建应急核销");
+        }
+        return window;
+    }
+
+    /** 校验窗口常规池未被既有占用透支（常规转让的储备隔离防线）。 */
+    private void ensureRegularPoolNonNegative(WindowRow window) {
+        BigDecimal regularAvailable = regularAvailable(window);
+        if (regularAvailable.signum() < 0) {
+            throw ApiException.unprocessable("REGULAR_POOL_EXCEEDED",
+                    "可用常规量已低于储备量：常规余额 " + fmt(regularAvailable)
+                            + "，储备量 " + fmt(window.reserveVolume()));
+        }
+    }
+
+    /** 校验应急编号在同一窗口内尚未核销。 */
+    private void ensureEmergencyIdUnused(long windowId, String emergencyId) {
+        if (repository.findEmergencyWriteOffByEmergencyId(windowId, emergencyId) != null) {
+            throw ApiException.conflict("EMERGENCY_ID_REUSED",
+                    "应急编号 " + emergencyId + " 在该窗口已核销，不能重复核销");
+        }
+    }
+
+    /** 校验储备余额足以覆盖本次应急核销量。 */
+    private void ensureReserveSufficient(WindowRow window, BigDecimal amount) {
+        BigDecimal balance = reserveBalance(window);
+        if (amount.compareTo(balance) > 0) {
+            throw ApiException.unprocessable("EMERGENCY_RESERVE_EXCEEDED",
+                    "应急核销 " + fmt(amount) + " 超过储备余额 " + fmt(balance));
+        }
+    }
+
+    /** 插入应急核销流水，同窗口同应急编号的并发重复由唯一约束裁决为 409。 */
+    private void insertEmergencyRow(String writeOffKey, long windowId, String emergencyId, String approver,
+                                    BigDecimal amount, String batchKey, long now) {
+        try {
+            repository.insertEmergencyWriteOff(writeOffKey, windowId, emergencyId, approver, amount,
+                    batchKey, now);
+        } catch (DuplicateKeyException e) {
+            throw ApiException.conflict("EMERGENCY_WRITE_OFF_CONFLICT",
+                    "应急核销键或应急编号冲突: " + writeOffKey + " / " + emergencyId);
+        }
+    }
+
+    private ReserveStatusResponse toReserveStatus(WindowRow window) {
+        BigDecimal available = availableTotal(window);
+        BigDecimal reserveBalance = reserveBalance(window);
+        BigDecimal regularAvailable = regularAvailable(window);
+        boolean ended = isWindowEnded(window, nowNanos());
+        List<String> blockedReasons = new ArrayList<>();
+        if (ended) {
+            blockedReasons.add("窗口已结束，禁止新建应急核销");
+        }
+        if (reserveBalance.signum() <= 0) {
+            blockedReasons.add("储备余额不足，应急核销将被拒绝");
+        }
+        if (regularAvailable.signum() <= 0) {
+            blockedReasons.add("常规可用量已达储备下限，常规核销将被拒绝");
+        }
+        List<EmergencyWriteOffResponse> writeOffs = repository.listEmergencyWriteOffs(window.id())
+                .stream().map(this::toEmergencyWriteOffResponse).toList();
+        List<ReserveHistoryItem> history = repository.listReserveHistory(window.id()).stream()
+                .map(this::toReserveHistoryItem).toList();
+        return new ReserveStatusResponse(window.id(), fmt(available), fmt(window.reserveVolume()),
+                fmt(window.reserveUsed()), fmt(reserveBalance), fmt(window.regularUsed()),
+                fmt(regularAvailable), window.version(), ended, blockedReasons, writeOffs, history);
+    }
+
+    private ReserveHistoryItem toReserveHistoryItem(ReserveHistoryRow row) {
+        return new ReserveHistoryItem(row.reserveKey(), row.actor(), fmt(row.oldVolume()),
+                fmt(row.newVolume()), row.version(), toIso(row.createdNanos()));
+    }
+
+    private RegularWriteOffResponse toRegularWriteOffResponse(RegularWriteOffRow row) {
+        return new RegularWriteOffResponse(row.writeOffKey(), row.windowId(), fmt(row.amount()),
+                toIso(row.createdNanos()));
+    }
+
+    private EmergencyWriteOffResponse toEmergencyWriteOffResponse(EmergencyWriteOffRow row) {
+        return new EmergencyWriteOffResponse(row.writeOffKey(), row.windowId(), row.emergencyId(),
+                row.approver(), fmt(row.amount()), row.batchKey(), toIso(row.createdNanos()));
     }
 
     private WindowResponse toWindowResponse(WindowRow row, CurtailmentRow active) {
@@ -437,6 +752,19 @@ public class WaterService {
             throw ApiException.badRequest("INVALID_ARGUMENT", field + " 必须大于 0");
         }
         return amount;
+    }
+
+    /** 解析储备量：十进制字符串，不小于 0（允许 0 表示取消储备），最多 3 位小数。 */
+    static BigDecimal parseReserveAmount(String field, String value) {
+        if (value == null || value.isBlank()) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", field + " 不能为空");
+        }
+        String trimmed = value.trim();
+        if (!AMOUNT_PATTERN.matcher(trimmed).matches()) {
+            throw ApiException.badRequest("INVALID_ARGUMENT",
+                    field + " 必须为不小于 0 的十进制字符串，最多 3 位小数: " + value);
+        }
+        return new BigDecimal(trimmed);
     }
 
     static void requireKey(String field, String value) {

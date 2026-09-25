@@ -6,11 +6,20 @@ import com.example.starter.water.dto.Dtos.CommandRequest;
 import com.example.starter.water.dto.Dtos.CreateWindowRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
+import com.example.starter.water.dto.Dtos.EmergencyBatchRequest;
+import com.example.starter.water.dto.Dtos.EmergencyBatchResponse;
+import com.example.starter.water.dto.Dtos.EmergencyWriteOffRequest;
+import com.example.starter.water.dto.Dtos.EmergencyWriteOffResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.RegularWriteOffRequest;
+import com.example.starter.water.dto.Dtos.RegularWriteOffResponse;
+import com.example.starter.water.dto.Dtos.ReserveStatusResponse;
+import com.example.starter.water.dto.Dtos.SetReserveRequest;
 import com.example.starter.water.dto.Dtos.SubmitAllocationRequest;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferRequest;
 import com.example.starter.water.dto.Dtos.TransferResponse;
+import com.example.starter.water.dto.Dtos.WindowCloseResponse;
 import com.example.starter.water.dto.Dtos.WindowResponse;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -102,5 +111,51 @@ public class WaterController {
     @GetMapping("/windows/{windowId}/history")
     public HistoryResponse getHistory(@PathVariable long windowId) {
         return service.getHistory(windowId);
+    }
+
+    /** 设置/调整窗口应急储备量（携带 expectedVersion，操作人由 X-Actor-Id 提供）。 */
+    @PostMapping("/windows/{windowId}/reserve")
+    public ReserveStatusResponse setReserve(@PathVariable long windowId,
+                                            @RequestBody SetReserveRequest request,
+                                            @RequestHeader("X-Actor-Id") String actor) {
+        return service.setReserve(request.reserveKey(), windowId, request.reserveVolume(),
+                request.expectedVersion(), actor);
+    }
+
+    /** 查询窗口储备余额、常规可用量、应急核销流水与阻断原因。 */
+    @GetMapping("/windows/{windowId}/reserve")
+    public ReserveStatusResponse getReserveStatus(@PathVariable long windowId) {
+        return service.getReserveStatus(windowId);
+    }
+
+    /** 常规核销：仅从常规可用量扣减，不得使可用常规量低于储备量。 */
+    @PostMapping("/windows/{windowId}/write-offs")
+    public RegularWriteOffResponse regularWriteOff(@PathVariable long windowId,
+                                                   @RequestBody RegularWriteOffRequest request) {
+        return service.regularWriteOff(request.commandKey(), request.writeOffKey(), windowId,
+                request.amount());
+    }
+
+    /** 单笔应急核销：必须声明 emergencyId 与审批人，仅从储备余额扣减。 */
+    @PostMapping("/windows/{windowId}/emergency-write-offs")
+    public EmergencyWriteOffResponse emergencyWriteOff(@PathVariable long windowId,
+                                                       @RequestBody EmergencyWriteOffRequest request) {
+        return service.emergencyWriteOff(request.commandKey(), request.writeOffKey(), windowId,
+                request.emergencyId(), request.approver(), request.amount());
+    }
+
+    /** 批量应急核销：先整体校验，再单事务扣减，任一失败整单回滚。 */
+    @PostMapping("/windows/{windowId}/emergency-write-offs/batch")
+    public EmergencyBatchResponse emergencyWriteOffBatch(@PathVariable long windowId,
+                                                         @RequestBody EmergencyBatchRequest request) {
+        return service.emergencyWriteOffBatch(request.commandKey(), request.batchKey(), windowId,
+                request.items());
+    }
+
+    /** 关闭窗口：关闭后不得新建应急核销，历史储备快照保留。 */
+    @PostMapping("/windows/{windowId}/close")
+    public WindowCloseResponse closeWindow(@PathVariable long windowId,
+                                           @RequestBody CommandRequest request) {
+        return service.closeWindow(request.commandKey(), windowId);
     }
 }
