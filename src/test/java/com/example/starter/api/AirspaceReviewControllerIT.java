@@ -35,6 +35,8 @@ class AirspaceReviewControllerIT {
 
     @BeforeEach
     void cleanup() {
+        jdbc.update("DELETE FROM altitude_occupation");
+        jdbc.update("DELETE FROM altitude_band");
         jdbc.update("DELETE FROM review");
         jdbc.update("DELETE FROM request_dedup");
         jdbc.update("DELETE FROM route_point");
@@ -52,7 +54,9 @@ class AirspaceReviewControllerIT {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {"routeId":"r1","requestId":"req-route-1",
-                                 "points":[{"x":0,"y":10},{"x":100,"y":10}]}"""))
+                                 "points":[{"x":0,"y":10},{"x":100,"y":10}],
+                                 "cruiseAltitude":900,
+                                 "startUtc":1700000000000,"endUtc":1700003600000}"""))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.replayed").value(false))
                 .andExpect(jsonPath("$.data.version").value(1));
@@ -89,7 +93,7 @@ class AirspaceReviewControllerIT {
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("VERSION_CONFLICT"));
 
-        // 当前空域版本审核 → BLOCKED 且命中 z1
+        // 当前空域版本审核 → BLOCKED 且命中 z1（纯禁飞区，二维相交即拦截）
         MvcResult blockedResult = mockMvc.perform(post("/api/airspace/reviews")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
@@ -98,6 +102,7 @@ class AirspaceReviewControllerIT {
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.data.conclusion").value("BLOCKED"))
                 .andExpect(jsonPath("$.data.hitZoneIds[0]").value("z1"))
+                .andExpect(jsonPath("$.data.verticalSeparation[0].blocked").value(true))
                 .andReturn();
         String blockedReviewId = objectMapper.readTree(
                 blockedResult.getResponse().getContentAsString())
@@ -126,7 +131,9 @@ class AirspaceReviewControllerIT {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {"routeId":"s1","requestId":"req-s-route",
-                                 "points":[{"x":0,"y":0},{"x":10,"y":10}]}"""))
+                                 "points":[{"x":0,"y":0},{"x":10,"y":10}],
+                                 "cruiseAltitude":900,
+                                 "startUtc":1700000000000,"endUtc":1700003600000}"""))
                 .andExpect(status().isCreated());
         mockMvc.perform(post("/api/airspace/reviews")
                         .contentType(MediaType.APPLICATION_JSON)
@@ -141,7 +148,10 @@ class AirspaceReviewControllerIT {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {"routeId":"s1","expectedVersion":9,
-                                 "points":[{"x":0,"y":0},{"x":1,"y":1}],"requestId":"req-s-bad"}"""))
+                                 "points":[{"x":0,"y":0},{"x":1,"y":1}],
+                                 "cruiseAltitude":900,
+                                 "startUtc":1700000000000,"endUtc":1700003600000,
+                                 "requestId":"req-s-bad"}"""))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("VERSION_CONFLICT"));
 
@@ -150,7 +160,10 @@ class AirspaceReviewControllerIT {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {"routeId":"s1","expectedVersion":1,
-                                 "points":[{"x":0,"y":0},{"x":1,"y":1}],"requestId":"req-s-ok"}"""))
+                                 "points":[{"x":0,"y":0},{"x":1,"y":1}],
+                                 "cruiseAltitude":900,
+                                 "startUtc":1700000000000,"endUtc":1700003600000,
+                                 "requestId":"req-s-ok"}"""))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.version").value(2));
 
@@ -220,7 +233,9 @@ class AirspaceReviewControllerIT {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {"routeId":"v2","requestId":"req-v2",
-                                 "points":[{"x":0,"y":0}]}"""))
+                                 "points":[{"x":0,"y":0}],
+                                 "cruiseAltitude":900,
+                                 "startUtc":1700000000000,"endUtc":1700003600000}"""))
                 .andExpect(status().isBadRequest());
 
         // 查询不存在的审核 → 404

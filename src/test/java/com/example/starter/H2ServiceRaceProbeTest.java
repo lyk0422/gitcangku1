@@ -69,6 +69,7 @@ class H2ServiceRaceProbeTest {
                 String zoneId = "pz" + iter;
                 service.createRoute(new RouteCreateRequest(routeId,
                         List.of(new RoutePointDto(0, 10), new RoutePointDto(100, 10)),
+                        900, 1_700_000_000_000L, 1_700_003_600_000L,
                         "preq-route-" + iter));
 
                 Future<Object> zoneFuture;
@@ -143,6 +144,8 @@ class H2ServiceRaceProbeTest {
     }
 
     private void cleanup() {
+        jdbc.update("DELETE FROM altitude_occupation");
+        jdbc.update("DELETE FROM altitude_band");
         jdbc.update("DELETE FROM review");
         jdbc.update("DELETE FROM request_dedup");
         jdbc.update("DELETE FROM route_point");

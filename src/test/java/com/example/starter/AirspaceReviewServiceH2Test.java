@@ -37,9 +37,16 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * 禁飞区审查业务的 H2 数据库测试（MODE=MySQL）。
  * 覆盖主流程、失败分支、版本失效（STALE）、幂等边界与真实并发互斥。
+ *
+ * <p>高度层语义：未登记高度带的区域是纯禁飞区，二维相交即 BLOCKED；
+ * 登记高度带的容量管理空域不拦截（由 AltitudeBandOccupationH2Test 覆盖）。</p>
  */
 @SpringBootTest
 class AirspaceReviewServiceH2Test {
+
+    private static final int CRUISE = 900;
+    private static final long T0 = 1_700_000_000_000L;
+    private static final long T1 = T0 + 3_600_000L;
 
     @Autowired
     private com.example.starter.service.AirspaceReviewService service;
@@ -61,6 +68,8 @@ class AirspaceReviewServiceH2Test {
     }
 
     private void cleanup() {
+        jdbc.update("DELETE FROM altitude_occupation");
+        jdbc.update("DELETE FROM altitude_band");
         jdbc.update("DELETE FROM review");
         jdbc.update("DELETE FROM request_dedup");
         jdbc.update("DELETE FROM route_point");
@@ -79,6 +88,16 @@ class AirspaceReviewServiceH2Test {
                 .toList();
     }
 
+    private RouteCreateRequest routeReq(String routeId, List<RoutePointDto> points) {
+        return new RouteCreateRequest(routeId, points, CRUISE, T0, T1, "req-" + rid("route"));
+    }
+
+    private RouteReplaceRequest replaceReq(String routeId, int expectedVersion,
+                                           List<RoutePointDto> points) {
+        return new RouteReplaceRequest(routeId, expectedVersion, points, CRUISE, T0, T1,
+                "req-" + rid("replace"));
+    }
+
     private ZoneCreateRequest zoneReq(String zoneId, int xMin, int yMin, int xMax, int yMax) {
         return new ZoneCreateRequest(zoneId, xMin, yMin, xMax, yMax, "req-" + rid("zone"));
     }
@@ -92,8 +111,7 @@ class AirspaceReviewServiceH2Test {
     @Test
     void clearThenBlockedThenClearAfterRevoke() {
         // 航线水平穿过 y=10
-        MutationResponse route = service.createRoute(
-                new RouteCreateRequest("r1", pts(0, 10, 100, 10), "req-" + rid("route")));
+        MutationResponse route = service.createRoute(routeReq("r1", pts(0, 10, 100, 10)));
         assertFalse(route.replayed());
         assertEquals(1, objectMapper.convertValue(route.data(), Map.class).get("version"));
 
@@ -106,7 +124,7 @@ class AirspaceReviewServiceH2Test {
         assertEquals(0L, c1.airspaceVersion());
         assertTrue(c1.current());
 
-        // 创建与航线相交的禁飞区后，空域版本变为 1
+        // 创建与航线相交的纯禁飞区（未登记高度带）后，空域版本变为 1
         MutationResponse z1 = service.createZone(zoneReq("z1", 40, 5, 60, 15));
         assertEquals(1, ((Number) objectMapper.convertValue(z1.data(), Map.class)
                 .get("airspaceVersion")).intValue());
@@ -116,12 +134,16 @@ class AirspaceReviewServiceH2Test {
                 new ReviewRequest("r1", 1, 0L, "req-" + rid("review"))));
         assertEquals(HttpStatus.CONFLICT, oldVersion.status());
 
-        // 用新版本审核 → BLOCKED
+        // 用新版本审核 → BLOCKED；垂直分离明细记录该纯禁飞区（blocked=true，无高度带）
         MutationResponse r2 = service.review(
                 new ReviewRequest("r1", 1, 1L, "req-" + rid("review")));
         ReviewResultDto b1 = dataOf(r2);
         assertEquals("BLOCKED", b1.conclusion());
         assertEquals(List.of("z1"), b1.hitZoneIds());
+        assertEquals(1, b1.verticalSeparation().size());
+        assertEquals("z1", b1.verticalSeparation().get(0).zoneId());
+        assertTrue(b1.verticalSeparation().get(0).blocked());
+        assertTrue(b1.verticalSeparation().get(0).bands().isEmpty());
 
         // 撤销禁飞区，空域版本变为 2，再审核 → CLEAR
         service.revokeZone(new ZoneRevokeRequest("z1", "req-" + rid("revoke")));
@@ -136,8 +158,7 @@ class AirspaceReviewServiceH2Test {
 
     @Test
     void blockedReturnsAllHitZoneIdsSortedAndDeduplicated() {
-        service.createRoute(
-                new RouteCreateRequest("r2", pts(0, 10, 100, 10), "req-" + rid("route")));
+        service.createRoute(routeReq("r2", pts(0, 10, 100, 10)));
         // 三个相交区域 + 一个不相交区域，id 故意乱序
         service.createZone(zoneReq("zeta", 40, 5, 60, 15));
         service.createZone(zoneReq("alpha", 45, 8, 55, 12));
@@ -151,8 +172,7 @@ class AirspaceReviewServiceH2Test {
 
     @Test
     void crossingSegmentWithEndpointsOutsideIsBlocked() {
-        service.createRoute(
-                new RouteCreateRequest("r3", pts(0, 0, 100, 20), "req-" + rid("route")));
+        service.createRoute(routeReq("r3", pts(0, 0, 100, 20)));
         service.createZone(zoneReq("box", 40, 5, 60, 15));
         MutationResponse resp = service.review(
                 new ReviewRequest("r3", 1, 1L, "req-" + rid("review")));
@@ -163,8 +183,7 @@ class AirspaceReviewServiceH2Test {
     @Test
     void boundaryTouchIsBlocked() {
         // 航段恰与区域底边接触
-        service.createRoute(
-                new RouteCreateRequest("r4", pts(0, 5, 100, 5), "req-" + rid("route")));
+        service.createRoute(routeReq("r4", pts(0, 5, 100, 5)));
         service.createZone(zoneReq("edge", 40, 5, 60, 15));
         MutationResponse resp = service.review(
                 new ReviewRequest("r4", 1, 1L, "req-" + rid("review")));
@@ -204,15 +223,32 @@ class AirspaceReviewServiceH2Test {
     @Test
     void identicalPointsRejected() {
         ApiException ex = assertThrows(ApiException.class, () -> service.createRoute(
-                new RouteCreateRequest("same", pts(5, 5, 5, 5), "req-" + rid("route"))));
+                routeReq("same", pts(5, 5, 5, 5))));
         assertEquals(HttpStatus.BAD_REQUEST, ex.status());
+    }
+
+    @Test
+    void invalidTimeWindowRejected() {
+        ApiException equal = assertThrows(ApiException.class, () -> service.createRoute(
+                new RouteCreateRequest("tw1", pts(0, 0, 10, 10), CRUISE, T0, T0,
+                        "req-" + rid("route"))));
+        assertEquals(HttpStatus.BAD_REQUEST, equal.status());
+        ApiException reversed = assertThrows(ApiException.class, () -> service.createRoute(
+                new RouteCreateRequest("tw2", pts(0, 0, 10, 10), CRUISE, T1, T0,
+                        "req-" + rid("route"))));
+        assertEquals(HttpStatus.BAD_REQUEST, reversed.status());
+        // 替换请求同样先校验时间窗
+        ApiException replaceBad = assertThrows(ApiException.class, () -> service.replaceRoute(
+                new RouteReplaceRequest("tw3", 1, pts(0, 0, 10, 10), CRUISE, T1, T0,
+                        "req-" + rid("replace"))));
+        assertEquals(HttpStatus.BAD_REQUEST, replaceBad.status());
+        assertEquals("INVALID_TIME_WINDOW", replaceBad.code());
     }
 
     @Test
     void repeatedButNotAllIdenticalPointsAllowedAndZeroLengthSegmentHandled() {
         // 中间重复点合法（至少两个点不同）；零长度线段的几何判定也必须正确
-        service.createRoute(new RouteCreateRequest("dup",
-                pts(0, 10, 0, 10, 100, 10), "req-" + rid("route")));
+        service.createRoute(routeReq("dup", pts(0, 10, 0, 10, 100, 10)));
         service.createZone(zoneReq("zz", 40, 5, 60, 15));
         MutationResponse resp = service.review(
                 new ReviewRequest("dup", 1, 1L, "req-" + rid("review")));
@@ -222,8 +258,7 @@ class AirspaceReviewServiceH2Test {
 
     @Test
     void replayedReviewKeepsOriginalConclusionAfterAirspaceChanges() {
-        service.createRoute(
-                new RouteCreateRequest("hr", pts(0, 10, 100, 10), "req-" + rid("route")));
+        service.createRoute(routeReq("hr", pts(0, 10, 100, 10)));
         String requestId = "replay-after-change";
         MutationResponse first = service.review(
                 new ReviewRequest("hr", 1, 0L, requestId));
@@ -246,8 +281,7 @@ class AirspaceReviewServiceH2Test {
                 new ReviewRequest("ghost", 1, 0L, "req-" + rid("review"))));
         assertEquals(HttpStatus.NOT_FOUND, noRoute.status());
 
-        service.createRoute(
-                new RouteCreateRequest("rv", pts(0, 0, 10, 10), "req-" + rid("route")));
+        service.createRoute(routeReq("rv", pts(0, 0, 10, 10)));
         ApiException badRouteVersion = assertThrows(ApiException.class, () -> service.review(
                 new ReviewRequest("rv", 9, 0L, "req-" + rid("review"))));
         assertEquals(HttpStatus.CONFLICT, badRouteVersion.status());
@@ -260,18 +294,16 @@ class AirspaceReviewServiceH2Test {
 
     @Test
     void replaceRouteRejectsWrongExpectedVersionAndAdvancesVersion() {
-        service.createRoute(
-                new RouteCreateRequest("rp", pts(0, 0, 10, 10), "req-" + rid("route")));
+        service.createRoute(routeReq("rp", pts(0, 0, 10, 10)));
         ApiException wrong = assertThrows(ApiException.class, () -> service.replaceRoute(
-                new RouteReplaceRequest("rp", 7, pts(1, 1, 2, 2), "req-" + rid("replace"))));
+                replaceReq("rp", 7, pts(1, 1, 2, 2))));
         assertEquals(HttpStatus.CONFLICT, wrong.status());
 
         ApiException missing = assertThrows(ApiException.class, () -> service.replaceRoute(
-                new RouteReplaceRequest("ghost", 1, pts(1, 1, 2, 2), "req-" + rid("replace"))));
+                replaceReq("ghost", 1, pts(1, 1, 2, 2))));
         assertEquals(HttpStatus.NOT_FOUND, missing.status());
 
-        MutationResponse ok = service.replaceRoute(
-                new RouteReplaceRequest("rp", 1, pts(0, 0, 100, 100), "req-" + rid("replace")));
+        MutationResponse ok = service.replaceRoute(replaceReq("rp", 1, pts(0, 0, 100, 100)));
         assertEquals(2, objectMapper.convertValue(ok.data(), Map.class).get("version"));
         // 替换后旧航线版本审核 409
         ApiException stale = assertThrows(ApiException.class, () -> service.review(
@@ -287,8 +319,7 @@ class AirspaceReviewServiceH2Test {
 
     @Test
     void currentReviewBecomesStaleAfterZoneChangeAndRouteReplace() {
-        service.createRoute(
-                new RouteCreateRequest("st", pts(0, 10, 100, 10), "req-" + rid("route")));
+        service.createRoute(routeReq("st", pts(0, 10, 100, 10)));
         MutationResponse rev = service.review(
                 new ReviewRequest("st", 1, 0L, "req-" + rid("review")));
         ReviewResultDto dto = dataOf(rev);
@@ -314,8 +345,7 @@ class AirspaceReviewServiceH2Test {
         assertEquals("CLEAR", service.getCurrentReview("st").conclusion());
 
         // 航线替换后再次 STALE
-        service.replaceRoute(new RouteReplaceRequest(
-                "st", 1, pts(0, 10, 100, 10), "req-" + rid("replace")));
+        service.replaceRoute(replaceReq("st", 1, pts(0, 10, 100, 10)));
         assertEquals("STALE", service.getCurrentReview("st").conclusion());
 
         // 无审核记录查询 404
@@ -326,8 +356,7 @@ class AirspaceReviewServiceH2Test {
 
     @Test
     void blockedCurrentGoesStaleAndHistoricalBlockedStaysBlocked() {
-        service.createRoute(
-                new RouteCreateRequest("bs", pts(0, 10, 100, 10), "req-" + rid("route")));
+        service.createRoute(routeReq("bs", pts(0, 10, 100, 10)));
         service.createZone(zoneReq("bz", 40, 5, 60, 15));
         MutationResponse rev = service.review(
                 new ReviewRequest("bs", 1, 1L, "req-" + rid("review")));
@@ -396,8 +425,7 @@ class AirspaceReviewServiceH2Test {
 
     @Test
     void reviewIdempotentReplayKeepsImmutableResult() {
-        service.createRoute(
-                new RouteCreateRequest("ir", pts(0, 10, 100, 10), "req-" + rid("route")));
+        service.createRoute(routeReq("ir", pts(0, 10, 100, 10)));
         String requestId = "fixed-review-1";
         ReviewRequest req = new ReviewRequest("ir", 1, 0L, requestId);
         MutationResponse first = service.review(req);
@@ -426,8 +454,7 @@ class AirspaceReviewServiceH2Test {
                 String zoneId = "cz-" + i;
                 // 每轮使用互不相交的 y 几何，避免历史轮次已提交区域命中本轮新航线
                 int y = 10 + i * 100;
-                service.createRoute(new RouteCreateRequest(
-                        routeId, pts(0, y, 100, y), "req-" + rid("route")));
+                service.createRoute(routeReq(routeId, pts(0, y, 100, y)));
                 long versionBefore = jdbc.queryForObject(
                         "SELECT global_version FROM airspace_meta WHERE id=1", Long.class);
 
@@ -481,8 +508,7 @@ class AirspaceReviewServiceH2Test {
         try {
             for (int i = 0; i < 8; i++) {
                 String routeId = "rr-" + i;
-                service.createRoute(new RouteCreateRequest(
-                        routeId, pts(0, 10, 100, 10), "req-" + rid("route")));
+                service.createRoute(routeReq(routeId, pts(0, 10, 100, 10)));
                 CyclicBarrier barrier = new CyclicBarrier(2);
 
                 Future<Object> reviewFuture = pool.submit(() -> {
@@ -498,7 +524,8 @@ class AirspaceReviewServiceH2Test {
                     barrier.await(5, TimeUnit.SECONDS);
                     try {
                         return service.replaceRoute(new RouteReplaceRequest(
-                                routeId, 1, pts(0, 0, 100, 0), "req-rp-" + routeId));
+                                routeId, 1, pts(0, 0, 100, 0), CRUISE, T0, T1,
+                                "req-rp-" + routeId));
                     } catch (ApiException ex) {
                         return ex;
                     }
