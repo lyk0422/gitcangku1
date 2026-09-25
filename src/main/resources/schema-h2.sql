@@ -1,4 +1,4 @@
--- 测试库（H2 MySQL 兼容模式）建表语句，与主 MySQL DDL 结构一致，去掉行内 COMMENT
+-- 本地 H2（MODE=MySQL）建表语句，与 src/test/resources/schema.sql 保持一致，去掉行内 COMMENT
 CREATE TABLE IF NOT EXISTS consent_grant (
     subject_key VARCHAR(128) NOT NULL,
     purpose VARCHAR(32) NOT NULL,
@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS consent_record (
     purpose VARCHAR(32) NOT NULL,
     epoch INT NOT NULL,
     record_key VARCHAR(128) NOT NULL,
-    payload TEXT NOT NULL,
+    payload CLOB NOT NULL,
     request_id VARCHAR(128) NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (subject_key, purpose, epoch, record_key)

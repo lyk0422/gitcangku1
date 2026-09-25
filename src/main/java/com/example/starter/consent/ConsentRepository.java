@@ -71,6 +71,22 @@ public class ConsentRepository {
         return rows.stream().findFirst();
     }
 
+    /**
+     * 事务内以当前读锁定“主体＋用途”最新代次行（SELECT ... FOR UPDATE）。
+     *
+     * <p>串行化依据：产生新一代次前必先 UPDATE 撤回当前最新行，因此只要持有最新行行锁，
+     * 并发撤回/重新授权（用途迁移）就必须等待本事务提交，按事务提交顺序裁决。
+     * 该语句为加锁当前读，在 REPEATABLE-READ 下也能读到已提交的最新状态。
+     * 主体尚无任何授权时返回空（无行可锁）。
+     */
+    Optional<GrantRow> lockLatestGrant(String subjectKey, Purpose purpose) {
+        List<GrantRow> rows = jdbc.query(
+                "SELECT subject_key, purpose, epoch, status FROM consent_grant"
+                        + " WHERE subject_key = ? AND purpose = ? ORDER BY epoch DESC LIMIT 1 FOR UPDATE",
+                GRANT_MAPPER, subjectKey, purpose.name());
+        return rows.stream().findFirst();
+    }
+
     void insertGrant(String subjectKey, Purpose purpose, int epoch, String requestId) {
         jdbc.update(
                 "INSERT INTO consent_grant (subject_key, purpose, epoch, status, request_id)"

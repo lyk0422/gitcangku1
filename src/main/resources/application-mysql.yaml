@@ -1,0 +1,11 @@
+# MySQL 覆盖配置：以 mysql profile 启动（--spring.profiles.active=mysql），
+# 通过 DB_URL/DB_USER/DB_PASSWORD 环境变量提供外部 MySQL 连接。
+spring:
+  datasource:
+    url: ${DB_URL}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    username: ${DB_USER}
+    password: ${DB_PASSWORD}
+  sql:
+    init:
+      schema-locations: classpath:schema.sql
