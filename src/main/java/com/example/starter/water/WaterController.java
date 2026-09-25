@@ -2,6 +2,9 @@ package com.example.starter.water;
 
 import com.example.starter.water.dto.Dtos.AllocationResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
+import com.example.starter.water.dto.Dtos.CarryoverBalanceResponse;
+import com.example.starter.water.dto.Dtos.CarryoverRequest;
+import com.example.starter.water.dto.Dtos.CarryoverResponse;
 import com.example.starter.water.dto.Dtos.CommandRequest;
 import com.example.starter.water.dto.Dtos.CreateWindowRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentRequest;
@@ -15,7 +18,10 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+
+import java.util.List;
 
 /**
  * 灌区配水 REST 接口。所有写操作携带 commandKey 保证幂等；
@@ -35,7 +41,7 @@ public class WaterController {
     @PostMapping("/windows")
     public WindowResponse createWindow(@RequestBody CreateWindowRequest request) {
         return service.createWindow(request.commandKey(), request.windowKey(), request.channelId(),
-                request.startUtc(), request.endUtc(), request.plannedVolume());
+                request.startUtc(), request.endUtc(), request.plannedVolume(), request.quarter());
     }
 
     /** 提交配水申请。 */
@@ -85,5 +91,24 @@ public class WaterController {
     @GetMapping("/windows/{windowId}/history")
     public HistoryResponse getHistory(@PathVariable long windowId) {
         return service.getHistory(windowId);
+    }
+
+    /** 季度结转：把源窗口本用水户 APPROVED 申请的未用余量迁移到同季度目标窗口。 */
+    @PostMapping("/carryovers")
+    public CarryoverResponse carryover(@RequestBody CarryoverRequest request) {
+        return service.carryover(request.commandKey(), request.carryoverKey(), request.sourceWindowId(),
+                request.targetWindowId(), request.userId(), request.amount());
+    }
+
+    /** 查询结转流水；可选按用水户过滤。 */
+    @GetMapping("/carryovers")
+    public List<CarryoverResponse> listCarryovers(@RequestParam(required = false) String userId) {
+        return service.listCarryovers(userId);
+    }
+
+    /** 按用水户查询跨窗口余量。 */
+    @GetMapping("/users/{userId}/carryover-balance")
+    public CarryoverBalanceResponse getCarryoverBalance(@PathVariable String userId) {
+        return service.getCarryoverBalance(userId);
     }
 }

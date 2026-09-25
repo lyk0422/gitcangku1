@@ -20,19 +20,25 @@ import java.util.Objects;
 @Repository
 public class WaterRepository {
 
-    /** 供水窗口行。 */
+    /** 供水窗口行；quarter 为 null 表示未标记季度，不参与结转。 */
     public record WindowRow(long id, String windowKey, String channelId, long startNanos, long endNanos,
-                            BigDecimal plannedVolume, long createdNanos) {
+                            BigDecimal plannedVolume, Integer quarter, long createdNanos) {
     }
 
-    /** 配水申请行。 */
+    /** 配水申请行；可结转余量 = amount - consumedVolume - carriedOutVolume。 */
     public record AllocationRow(long id, String allocationKey, long windowId, String userId, BigDecimal amount,
+                                BigDecimal consumedVolume, BigDecimal carriedOutVolume,
                                 String requester, String status, long createdNanos, long updatedNanos) {
     }
 
     /** 限供行。 */
     public record CurtailmentRow(long id, long windowId, BigDecimal volume, String status, long createdNanos,
                                  Long cancelledNanos) {
+    }
+
+    /** 季度结转流水行，不可变。 */
+    public record CarryoverRow(long id, String carryoverKey, long sourceWindowId, long targetWindowId,
+                               String userId, BigDecimal amount, String targetAllocationKey, long createdNanos) {
     }
 
     /** 幂等命令行；response 为 null 表示响应尚未写回（同事务内）。 */
@@ -43,12 +49,16 @@ public class WaterRepository {
     private static final RowMapper<WindowRow> WINDOW_MAPPER = (rs, n) -> new WindowRow(
             rs.getLong("id"), rs.getString("window_key"), rs.getString("channel_id"),
             rs.getLong("start_nanos"), rs.getLong("end_nanos"),
-            rs.getBigDecimal("planned_volume"), rs.getLong("created_nanos"));
+            rs.getBigDecimal("planned_volume"),
+            rs.getObject("quarter") == null ? null : rs.getInt("quarter"),
+            rs.getLong("created_nanos"));
 
     private static final RowMapper<AllocationRow> ALLOCATION_MAPPER = (rs, n) -> new AllocationRow(
             rs.getLong("id"), rs.getString("allocation_key"), rs.getLong("window_id"),
-            rs.getString("user_id"), rs.getBigDecimal("amount"), rs.getString("requester"),
-            rs.getString("status"), rs.getLong("created_nanos"), rs.getLong("updated_nanos"));
+            rs.getString("user_id"), rs.getBigDecimal("amount"),
+            rs.getBigDecimal("consumed_volume"), rs.getBigDecimal("carried_out_volume"),
+            rs.getString("requester"), rs.getString("status"), rs.getLong("created_nanos"),
+            rs.getLong("updated_nanos"));
 
     private static final RowMapper<CurtailmentRow> CURTAILMENT_MAPPER = (rs, n) -> new CurtailmentRow(
             rs.getLong("id"), rs.getLong("window_id"), rs.getBigDecimal("volume"), rs.getString("status"),
@@ -59,26 +69,47 @@ public class WaterRepository {
             rs.getString("command_key"), rs.getString("operation"), rs.getString("params"),
             rs.getString("response"), rs.getLong("created_nanos"));
 
+    private static final RowMapper<CarryoverRow> CARRYOVER_MAPPER = (rs, n) -> new CarryoverRow(
+            rs.getLong("id"), rs.getString("carryover_key"), rs.getLong("source_window_id"),
+            rs.getLong("target_window_id"), rs.getString("user_id"), rs.getBigDecimal("amount"),
+            rs.getString("target_allocation_key"), rs.getLong("created_nanos"));
+
+    private static final String WINDOW_COLUMNS =
+            "id, window_key, channel_id, start_nanos, end_nanos, planned_volume, quarter, created_nanos";
+
+    private static final String ALLOCATION_COLUMNS =
+            "id, allocation_key, window_id, user_id, amount, consumed_volume, carried_out_volume,"
+                    + " requester, status, created_nanos, updated_nanos";
+
+    private static final String CARRYOVER_COLUMNS =
+            "id, carryover_key, source_window_id, target_window_id, user_id, amount,"
+                    + " target_allocation_key, created_nanos";
+
     private final JdbcTemplate jdbc;
 
     public WaterRepository(JdbcTemplate jdbc) {
         this.jdbc = jdbc;
     }
 
-    /** 插入窗口并返回自增主键。 */
+    /** 插入窗口并返回自增主键；quarter 为 null 表示未标记季度。 */
     public long insertWindow(String windowKey, String channelId, long startNanos, long endNanos,
-                             BigDecimal plannedVolume, long createdNanos) {
+                             BigDecimal plannedVolume, Integer quarter, long createdNanos) {
         KeyHolder keys = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO supply_window (window_key, channel_id, start_nanos, end_nanos, planned_volume, created_nanos)"
-                            + " VALUES (?, ?, ?, ?, ?, ?)", Statement.RETURN_GENERATED_KEYS);
+                    "INSERT INTO supply_window (window_key, channel_id, start_nanos, end_nanos, planned_volume, quarter, created_nanos)"
+                            + " VALUES (?, ?, ?, ?, ?, ?, ?)", Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, windowKey);
             ps.setString(2, channelId);
             ps.setLong(3, startNanos);
             ps.setLong(4, endNanos);
             ps.setBigDecimal(5, plannedVolume);
-            ps.setLong(6, createdNanos);
+            if (quarter == null) {
+                ps.setNull(6, java.sql.Types.TINYINT);
+            } else {
+                ps.setInt(6, quarter);
+            }
+            ps.setLong(7, createdNanos);
             return ps;
         }, keys);
         return Objects.requireNonNull(keys.getKey()).longValue();
@@ -88,8 +119,7 @@ public class WaterRepository {
     public WindowRow findWindowById(long id) {
         try {
             return jdbc.queryForObject(
-                    "SELECT id, window_key, channel_id, start_nanos, end_nanos, planned_volume, created_nanos"
-                            + " FROM supply_window WHERE id = ?", WINDOW_MAPPER, id);
+                    "SELECT " + WINDOW_COLUMNS + " FROM supply_window WHERE id = ?", WINDOW_MAPPER, id);
         } catch (EmptyResultDataAccessException e) {
             return null;
         }
@@ -99,8 +129,8 @@ public class WaterRepository {
     public WindowRow lockWindowById(long id) {
         try {
             return jdbc.queryForObject(
-                    "SELECT id, window_key, channel_id, start_nanos, end_nanos, planned_volume, created_nanos"
-                            + " FROM supply_window WHERE id = ? FOR UPDATE", WINDOW_MAPPER, id);
+                    "SELECT " + WINDOW_COLUMNS + " FROM supply_window WHERE id = ? FOR UPDATE",
+                    WINDOW_MAPPER, id);
         } catch (EmptyResultDataAccessException e) {
             return null;
         }
@@ -138,8 +168,8 @@ public class WaterRepository {
     public AllocationRow findAllocationByKey(String allocationKey) {
         try {
             return jdbc.queryForObject(
-                    "SELECT id, allocation_key, window_id, user_id, amount, requester, status, created_nanos, updated_nanos"
-                            + " FROM allocation WHERE allocation_key = ?", ALLOCATION_MAPPER, allocationKey);
+                    "SELECT " + ALLOCATION_COLUMNS + " FROM allocation WHERE allocation_key = ?",
+                    ALLOCATION_MAPPER, allocationKey);
         } catch (EmptyResultDataAccessException e) {
             return null;
         }
@@ -194,8 +224,8 @@ public class WaterRepository {
     /** 窗口全部申请，按主键升序。 */
     public List<AllocationRow> listAllocations(long windowId) {
         return jdbc.query(
-                "SELECT id, allocation_key, window_id, user_id, amount, requester, status, created_nanos, updated_nanos"
-                        + " FROM allocation WHERE window_id = ? ORDER BY id", ALLOCATION_MAPPER, windowId);
+                "SELECT " + ALLOCATION_COLUMNS + " FROM allocation WHERE window_id = ? ORDER BY id",
+                ALLOCATION_MAPPER, windowId);
     }
 
     /** 窗口全部限供记录（含已取消），按主键升序。 */
@@ -225,5 +255,107 @@ public class WaterRepository {
     /** 写回命令首次成功响应。 */
     public void updateCommandResponse(String commandKey, String response) {
         jdbc.update("UPDATE command_log SET response = ? WHERE command_key = ?", response, commandKey);
+    }
+
+    // ------------------------------------------------------------------
+    // 季度结转
+    // ------------------------------------------------------------------
+
+    /** 插入直接处于 APPROVED 状态的申请（结转在目标窗口新建），返回主键。 */
+    public long insertApprovedAllocation(String allocationKey, long windowId, String userId, BigDecimal amount,
+                                         String requester, long nowNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO allocation (allocation_key, window_id, user_id, amount, requester, status, created_nanos, updated_nanos)"
+                            + " VALUES (?, ?, ?, ?, ?, 'APPROVED', ?, ?)", Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, allocationKey);
+            ps.setLong(2, windowId);
+            ps.setString(3, userId);
+            ps.setBigDecimal(4, amount);
+            ps.setString(5, requester);
+            ps.setLong(6, nowNanos);
+            ps.setLong(7, nowNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 用水户在窗口内全部 APPROVED 申请，按主键升序（结转扣减顺序）。 */
+    public List<AllocationRow> listApprovedAllocations(long windowId, String userId) {
+        return jdbc.query(
+                "SELECT " + ALLOCATION_COLUMNS
+                        + " FROM allocation WHERE window_id = ? AND user_id = ? AND status = 'APPROVED' ORDER BY id",
+                ALLOCATION_MAPPER, windowId, userId);
+    }
+
+    /** 用水户在窗口内的全部申请（任意状态），按主键升序。 */
+    public List<AllocationRow> listAllocations(long windowId, String userId) {
+        return jdbc.query(
+                "SELECT " + ALLOCATION_COLUMNS + " FROM allocation WHERE window_id = ? AND user_id = ? ORDER BY id",
+                ALLOCATION_MAPPER, windowId, userId);
+    }
+
+    /** 用水户全部申请，按主键升序（跨窗口余量查询）。 */
+    public List<AllocationRow> listAllocationsByUser(String userId) {
+        return jdbc.query(
+                "SELECT " + ALLOCATION_COLUMNS + " FROM allocation WHERE user_id = ? ORDER BY id",
+                ALLOCATION_MAPPER, userId);
+    }
+
+    /**
+     * 乐观扣减源申请的可结转余量：仅当申请仍为 APPROVED 且剩余余量足够时累加 carried_out_volume。
+     * 返回受影响行数；0 表示并发下余量已被其他结转占用或状态已变化。
+     */
+    public int deductCarriedOut(long allocationId, BigDecimal amount) {
+        return jdbc.update(
+                "UPDATE allocation SET carried_out_volume = carried_out_volume + ?"
+                        + " WHERE id = ? AND status = 'APPROVED'"
+                        + " AND amount - consumed_volume - carried_out_volume >= ?",
+                amount, allocationId, amount);
+    }
+
+    /** 写入不可变结转流水并返回主键。 */
+    public long insertCarryover(String carryoverKey, long sourceWindowId, long targetWindowId, String userId,
+                                BigDecimal amount, String targetAllocationKey, long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO carryover (carryover_key, source_window_id, target_window_id, user_id, amount,"
+                            + " target_allocation_key, created_nanos) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, carryoverKey);
+            ps.setLong(2, sourceWindowId);
+            ps.setLong(3, targetWindowId);
+            ps.setString(4, userId);
+            ps.setBigDecimal(5, amount);
+            ps.setString(6, targetAllocationKey);
+            ps.setLong(7, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 按业务键查询结转流水，不存在返回 null。 */
+    public CarryoverRow findCarryoverByKey(String carryoverKey) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT " + CARRYOVER_COLUMNS + " FROM carryover WHERE carryover_key = ?",
+                    CARRYOVER_MAPPER, carryoverKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 全部结转流水，按主键升序。 */
+    public List<CarryoverRow> listCarryovers() {
+        return jdbc.query("SELECT " + CARRYOVER_COLUMNS + " FROM carryover ORDER BY id", CARRYOVER_MAPPER);
+    }
+
+    /** 指定用水户的结转流水，按主键升序。 */
+    public List<CarryoverRow> listCarryoversByUser(String userId) {
+        return jdbc.query(
+                "SELECT " + CARRYOVER_COLUMNS + " FROM carryover WHERE user_id = ? ORDER BY id",
+                CARRYOVER_MAPPER, userId);
     }
 }

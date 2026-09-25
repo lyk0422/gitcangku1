@@ -1,11 +1,15 @@
 package com.example.starter.water;
 
 import com.example.starter.water.WaterRepository.AllocationRow;
+import com.example.starter.water.WaterRepository.CarryoverRow;
 import com.example.starter.water.WaterRepository.CommandRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
 import com.example.starter.water.WaterRepository.WindowRow;
 import com.example.starter.water.dto.Dtos.AllocationResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
+import com.example.starter.water.dto.Dtos.CarryoverBalanceEntry;
+import com.example.starter.water.dto.Dtos.CarryoverBalanceResponse;
+import com.example.starter.water.dto.Dtos.CarryoverResponse;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
 import com.example.starter.water.dto.Dtos.WindowResponse;
@@ -57,9 +61,9 @@ public class WaterService {
     // 命令入口
     // ------------------------------------------------------------------
 
-    /** 创建供水窗口。 */
+    /** 创建供水窗口；quarter 为所属季度（1~4），可空。 */
     public WindowResponse createWindow(String commandKey, String windowKey, String channelId,
-                                       String startUtc, String endUtc, String plannedVolume) {
+                                       String startUtc, String endUtc, String plannedVolume, Integer quarter) {
         requireKey("commandKey", commandKey);
         requireKey("windowKey", windowKey);
         requireKey("channelId", channelId);
@@ -68,14 +72,18 @@ public class WaterService {
         if (startNanos >= endNanos) {
             throw ApiException.badRequest("INVALID_ARGUMENT", "startUtc 必须早于 endUtc");
         }
+        if (quarter != null && (quarter < 1 || quarter > 4)) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "quarter 必须为 1~4");
+        }
         BigDecimal planned = parseAmount("plannedVolume", plannedVolume);
         String params = "WINDOW_CREATE|" + windowKey + "|" + channelId + "|" + startNanos + "|" + endNanos
-                + "|" + planned.toPlainString();
+                + "|" + planned.toPlainString() + "|" + quarter;
         return runCommand("WINDOW_CREATE", commandKey, params, WindowResponse.class, () -> {
             if (repository.existsOverlappingWindow(channelId, startNanos, endNanos)) {
                 throw ApiException.conflict("WINDOW_OVERLAP", "同一渠道存在时间重叠的供水窗口");
             }
-            long id = repository.insertWindow(windowKey, channelId, startNanos, endNanos, planned, nowNanos());
+            long id = repository.insertWindow(windowKey, channelId, startNanos, endNanos, planned, quarter,
+                    nowNanos());
             WindowRow row = repository.findWindowById(id);
             return toWindowResponse(row, null);
         });
@@ -231,6 +239,130 @@ public class WaterService {
     }
 
     // ------------------------------------------------------------------
+    // 季度结转
+    // ------------------------------------------------------------------
+
+    /**
+     * 季度结转：把源窗口本用水户 APPROVED 申请的未用余量（申请水量 - 已核销 - 已转出）
+     * 迁移到同季度目标窗口的新建 APPROVED 申请，并写入不可变结转流水。
+     *
+     * <p>单事务内校验两窗口同季度、源申请 APPROVED、结转量不超过源余量与目标剩余容量；
+     * 源余量通过条件 UPDATE 乐观扣减，并发对同一源申请结转时最多一个成功，其余返回 409。</p>
+     */
+    public CarryoverResponse carryover(String commandKey, String carryoverKey, Long sourceWindowId,
+                                       Long targetWindowId, String userId, String amount) {
+        requireKey("commandKey", commandKey);
+        requireKey("carryoverKey", carryoverKey);
+        requireKey("userId", userId);
+        if (sourceWindowId == null || targetWindowId == null) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "sourceWindowId 与 targetWindowId 不能为空");
+        }
+        if (sourceWindowId.equals(targetWindowId)) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "源窗口与目标窗口不能相同");
+        }
+        BigDecimal qty = parseAmount("amount", amount);
+        String params = "CARRYOVER|" + carryoverKey + "|" + sourceWindowId + "|" + targetWindowId + "|"
+                + userId + "|" + qty.toPlainString();
+        return runCommand("CARRYOVER", commandKey, params, CarryoverResponse.class, () -> {
+            WindowRow source = repository.findWindowById(sourceWindowId);
+            if (source == null) {
+                throw ApiException.notFound("WINDOW_NOT_FOUND", "源供水窗口不存在: " + sourceWindowId);
+            }
+            WindowRow target = repository.findWindowById(targetWindowId);
+            if (target == null) {
+                throw ApiException.notFound("WINDOW_NOT_FOUND", "目标供水窗口不存在: " + targetWindowId);
+            }
+            if (source.quarter() == null || target.quarter() == null
+                    || !source.quarter().equals(target.quarter())) {
+                throw ApiException.unprocessable("QUARTER_MISMATCH",
+                        "源窗口与目标窗口必须同属一个季度（1~4）才能结转");
+            }
+            List<AllocationRow> userAllocations = repository.listAllocations(sourceWindowId, userId);
+            if (userAllocations.isEmpty()) {
+                throw ApiException.notFound("SOURCE_ALLOCATION_NOT_FOUND",
+                        "用水户在源窗口没有配水申请: " + userId);
+            }
+            List<AllocationRow> approvedSources = userAllocations.stream()
+                    .filter(a -> STATUS_APPROVED.equals(a.status())).toList();
+            if (approvedSources.isEmpty()) {
+                throw ApiException.conflict("SOURCE_ALLOCATION_NOT_APPROVED",
+                        "源申请当前状态不是 APPROVED，不能结转");
+            }
+            BigDecimal remaining = BigDecimal.ZERO;
+            for (AllocationRow src : approvedSources) {
+                remaining = remaining.add(remainderOf(src));
+            }
+            if (remaining.compareTo(qty) < 0) {
+                throw ApiException.quotaExceeded("结转量超过源申请可结转余量 " + fmt(remaining));
+            }
+            // 锁定目标窗口行，与批准/限供按事务提交顺序裁决容量
+            WindowRow lockedTarget = repository.lockWindowById(targetWindowId);
+            BigDecimal available = availableTotal(lockedTarget);
+            BigDecimal targetApproved = repository.sumApprovedAmount(targetWindowId);
+            if (targetApproved.add(qty).compareTo(available) > 0) {
+                throw ApiException.quotaExceeded("结转量超过目标窗口剩余可用容量 "
+                        + fmt(available.subtract(targetApproved)));
+            }
+            if (repository.findCarryoverByKey(carryoverKey) != null) {
+                throw ApiException.conflict("CARRYOVER_KEY_REUSED", "carryoverKey 已存在: " + carryoverKey);
+            }
+            // 乐观扣减源申请余量：并发下条件不满足则扣减 0 行，判定为双重占用
+            BigDecimal need = qty;
+            for (AllocationRow src : approvedSources) {
+                BigDecimal remainder = remainderOf(src);
+                if (remainder.signum() <= 0) {
+                    continue;
+                }
+                BigDecimal draw = remainder.min(need);
+                if (repository.deductCarriedOut(src.id(), draw) == 0) {
+                    throw ApiException.conflict("CARRYOVER_CONFLICT",
+                            "源申请余量被并发结转占用，本次结转失败");
+                }
+                need = need.subtract(draw);
+                if (need.signum() == 0) {
+                    break;
+                }
+            }
+            long now = nowNanos();
+            repository.insertApprovedAllocation(carryoverKey, targetWindowId, userId, qty, userId, now);
+            repository.insertCarryover(carryoverKey, sourceWindowId, targetWindowId, userId, qty,
+                    carryoverKey, now);
+            return toCarryoverResponse(repository.findCarryoverByKey(carryoverKey));
+        });
+    }
+
+    /** 查询结转流水；userId 为 null 时返回全部。 */
+    public List<CarryoverResponse> listCarryovers(String userId) {
+        List<CarryoverRow> rows = userId == null
+                ? repository.listCarryovers() : repository.listCarryoversByUser(userId);
+        return rows.stream().map(this::toCarryoverResponse).toList();
+    }
+
+    /** 按用水户查询跨窗口余量：每条申请的申请水量、已核销、已转出与剩余可结转余量。 */
+    public CarryoverBalanceResponse getCarryoverBalance(String userId) {
+        requireKey("userId", userId);
+        List<CarryoverBalanceEntry> entries = repository.listAllocationsByUser(userId).stream()
+                .map(a -> {
+                    WindowRow window = repository.findWindowById(a.windowId());
+                    return new CarryoverBalanceEntry(a.allocationKey(), a.windowId(),
+                            window == null ? null : window.quarter(), a.status(), fmt(a.amount()),
+                            fmt(a.consumedVolume()), fmt(a.carriedOutVolume()), fmt(remainderOf(a)));
+                })
+                .toList();
+        return new CarryoverBalanceResponse(userId, entries);
+    }
+
+    /** 申请的可结转余量 = 申请水量 - 已核销用水量 - 已结转转出水量。 */
+    private static BigDecimal remainderOf(AllocationRow row) {
+        return row.amount().subtract(row.consumedVolume()).subtract(row.carriedOutVolume());
+    }
+
+    private CarryoverResponse toCarryoverResponse(CarryoverRow row) {
+        return new CarryoverResponse(row.carryoverKey(), row.sourceWindowId(), row.targetWindowId(),
+                row.userId(), fmt(row.amount()), row.targetAllocationKey(), toIso(row.createdNanos()));
+    }
+
+    // ------------------------------------------------------------------
     // 幂等命令框架
     // ------------------------------------------------------------------
 
@@ -288,7 +420,8 @@ public class WaterService {
         BigDecimal available = active != null ? active.volume() : row.plannedVolume();
         return new WindowResponse(row.id(), row.windowKey(), row.channelId(), toIso(row.startNanos()),
                 toIso(row.endNanos()), fmt(row.plannedVolume()),
-                active != null ? fmt(active.volume()) : null, fmt(available), toIso(row.createdNanos()));
+                active != null ? fmt(active.volume()) : null, fmt(available), row.quarter(),
+                toIso(row.createdNanos()));
     }
 
     private AllocationResponse toAllocationResponse(AllocationRow row) {
