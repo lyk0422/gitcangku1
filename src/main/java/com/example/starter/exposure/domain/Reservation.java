@@ -2,11 +2,13 @@ package com.example.starter.exposure.domain;
 
 /**
  * 曝光预占单 PO。额度所属日（{@link #utcDate}）固定为申请时刻的 UTC 日期，
- * 确认跨日也不迁移计数。
+ * 确认跨日也不迁移计数；{@link #channelKey} 固化申请时公告归属的渠道，
+ * 公告迁移渠道或渠道配置变更均不改变本单的结算渠道。
  *
  * @param reservationId 预占单编号
  * @param campaignId    所属公告编号
  * @param visitorId     合成访客编号
+ * @param channelKey    申请时固化的渠道编号；null 表示申请时公告未归属渠道或该渠道未配置日额度
  * @param utcDate       额度所属 UTC 日（java.time.LocalDate 对应的 java.sql.Date）
  * @param status        预占状态
  * @param createdAtUtc  创建（申请）时刻，epoch 毫秒，UTC
@@ -17,6 +19,7 @@ public record Reservation(
         String reservationId,
         String campaignId,
         String visitorId,
+        String channelKey,
         java.sql.Date utcDate,
         ReservationStatus status,
         long createdAtUtc,

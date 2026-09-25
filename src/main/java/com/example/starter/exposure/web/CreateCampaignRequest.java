@@ -13,11 +13,13 @@ import jakarta.validation.constraints.Size;
  * @param campaignId          公告编号，全局唯一
  * @param dailyTotalCap       每 UTC 日总额度，单位次
  * @param perVisitorDailyCap  每访客每 UTC 日上限，单位次
+ * @param channelKey          归属渠道编号；null 表示不归属任何渠道，渠道未配置日额度时不受渠道频控
  */
 public record CreateCampaignRequest(
         @NotBlank @Size(max = 64) String requestId,
         @NotBlank @Size(max = 64) String campaignId,
         @NotNull @Min(1) @Max(100_000) Integer dailyTotalCap,
-        @NotNull @Min(1) @Max(100_000) Integer perVisitorDailyCap
+        @NotNull @Min(1) @Max(100_000) Integer perVisitorDailyCap,
+        @Size(max = 64) String channelKey
 ) {
 }

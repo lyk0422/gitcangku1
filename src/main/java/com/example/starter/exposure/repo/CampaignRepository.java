@@ -28,6 +28,7 @@ public class CampaignRepository {
                     rs.getString("campaign_id"),
                     rs.getInt("daily_total_cap"),
                     rs.getInt("per_visitor_daily_cap"),
+                    rs.getString("channel_key"),
                     rs.getLong("created_at_utc"));
         }
     };
@@ -36,7 +37,7 @@ public class CampaignRepository {
      * 按编号查询公告。
      */
     public Optional<Campaign> findById(String campaignId) {
-        return jdbc.query("SELECT campaign_id, daily_total_cap, per_visitor_daily_cap, created_at_utc "
+        return jdbc.query("SELECT campaign_id, daily_total_cap, per_visitor_daily_cap, channel_key, created_at_utc "
                         + "FROM campaign WHERE campaign_id = ?", MAPPER, campaignId)
                 .stream()
                 .findFirst();
@@ -46,11 +47,23 @@ public class CampaignRepository {
      * 插入公告；编号冲突由调用方依据唯一约束处理。
      */
     public void insert(Campaign campaign) {
-        jdbc.update("INSERT INTO campaign (campaign_id, daily_total_cap, per_visitor_daily_cap, created_at_utc) "
-                        + "VALUES (?, ?, ?, ?)",
+        jdbc.update("INSERT INTO campaign (campaign_id, daily_total_cap, per_visitor_daily_cap, channel_key, created_at_utc) "
+                        + "VALUES (?, ?, ?, ?, ?)",
                 campaign.campaignId(),
                 campaign.dailyTotalCap(),
                 campaign.perVisitorDailyCap(),
+                campaign.channelKey(),
                 campaign.createdAtUtc());
+    }
+
+    /**
+     * 迁移公告归属渠道（乐观版本无关：渠道配置本身携带版本）；仅影响迁移后的新申请。
+     */
+    public void updateChannel(String campaignId, String channelKey) {
+        int rows = jdbc.update("UPDATE campaign SET channel_key = ? WHERE campaign_id = ?",
+                channelKey, campaignId);
+        if (rows != 1) {
+            throw new IllegalStateException("campaign row missing: " + campaignId);
+        }
     }
 }

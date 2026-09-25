@@ -66,4 +66,15 @@ public class IdempotencyRepository {
                 record.responseJson(),
                 createdAtUtc);
     }
+
+    /**
+     * 写回事务内预占（pending）幂等行的成功响应 JSON；与业务变更在同一事务提交。
+     */
+    public void updateResponse(String requestId, String responseJson) {
+        int rows = jdbc.update("UPDATE idempotency_record SET response_json = ? WHERE request_id = ?",
+                responseJson, requestId);
+        if (rows != 1) {
+            throw new IllegalStateException("idempotency row missing: " + requestId);
+        }
+    }
 }

@@ -34,6 +34,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -108,8 +109,10 @@ class ExposureApiIntegrationTest {
     void cleanAndReset() {
         jdbc.update("DELETE FROM idempotency_record");
         jdbc.update("DELETE FROM exposure_reservation");
+        jdbc.update("DELETE FROM channel_daily_ledger");
         jdbc.update("DELETE FROM quota_visitor_ledger");
         jdbc.update("DELETE FROM quota_total_ledger");
+        jdbc.update("DELETE FROM channel_config");
         jdbc.update("DELETE FROM campaign");
         mutableClock().setInstant(BASE);
     }
@@ -120,7 +123,7 @@ class ExposureApiIntegrationTest {
     }
 
     private CreateCampaignRequest createReq(String requestId, String campaignId, int total, int perVisitor) {
-        return new CreateCampaignRequest(requestId, campaignId, total, perVisitor);
+        return new CreateCampaignRequest(requestId, campaignId, total, perVisitor, null);
     }
 
     @Test
@@ -343,6 +346,72 @@ class ExposureApiIntegrationTest {
                         .param("utcDate", "2026-09-22"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.usedTotal").value(1));
+    }
+
+    @Test
+    @DisplayName("HTTP 渠道语义：创建渠道/公告归属、渠道满 429、版本冲突 409、用量与明细查询")
+    void httpChannelSemantics() throws Exception {
+        mockMvc.perform(post("/api/exposure/channels")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"requestId\":\"ch1\",\"channelKey\":\"web\",\"dailyTotalCap\":1}"))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.channelKey").value("web"))
+                .andExpect(jsonPath("$.version").value(0));
+
+        mockMvc.perform(post("/api/exposure/campaigns")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"requestId\":\"cc1\",\"campaignId\":\"cw\",\"dailyTotalCap\":10,"
+                                + "\"perVisitorDailyCap\":10,\"channelKey\":\"web\"}"))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.channelKey").value("web"));
+
+        mockMvc.perform(post("/api/exposure/reservations")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"requestId\":\"ca1\",\"campaignId\":\"cw\",\"visitorId\":\"u1\"}"))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.channelKey").value("web"))
+                .andExpect(jsonPath("$.status").value("RESERVED"));
+
+        // 渠道日额度已满（=1）：第二个公告的申请同样 429
+        mockMvc.perform(post("/api/exposure/reservations")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"requestId\":\"ca2\",\"campaignId\":\"cw\",\"visitorId\":\"u2\"}"))
+                .andExpect(status().isTooManyRequests())
+                .andExpect(jsonPath("$.status").value(429));
+
+        // 用量查询
+        mockMvc.perform(get("/api/exposure/channels/web/usage").param("utcDate", "2026-09-22"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.used").value(1))
+                .andExpect(jsonPath("$.remaining").value(0));
+
+        // 版本冲突：携带错误 expectedVersion
+        mockMvc.perform(put("/api/exposure/channels/web/cap")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"requestId\":\"cu1\",\"dailyTotalCap\":5,\"expectedVersion\":9}"))
+                .andExpect(status().isConflict());
+
+        // 正确版本可修改
+        mockMvc.perform(put("/api/exposure/channels/web/cap")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"requestId\":\"cu2\",\"dailyTotalCap\":5,\"expectedVersion\":0}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.version").value(1));
+
+        // 预占明细与归属统计
+        mockMvc.perform(get("/api/exposure/reservations").param("channelKey", "web"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.length()").value(1))
+                .andExpect(jsonPath("$[0].visitorId").value("u1"));
+        mockMvc.perform(get("/api/exposure/campaigns/cw/attribution"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.entries.length()").value(1))
+                .andExpect(jsonPath("$.entries[0].channelKey").value("web"))
+                .andExpect(jsonPath("$.entries[0].reserved").value(1));
+
+        // 不存在渠道 404
+        mockMvc.perform(get("/api/exposure/channels/nope/usage"))
+                .andExpect(status().isNotFound());
     }
 
     private void assert409(Runnable action) {

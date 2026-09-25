@@ -85,8 +85,10 @@ class ExposureConcurrencyTest {
     void clean() {
         jdbc.update("DELETE FROM idempotency_record");
         jdbc.update("DELETE FROM exposure_reservation");
+        jdbc.update("DELETE FROM channel_daily_ledger");
         jdbc.update("DELETE FROM quota_visitor_ledger");
         jdbc.update("DELETE FROM quota_total_ledger");
+        jdbc.update("DELETE FROM channel_config");
         jdbc.update("DELETE FROM campaign");
     }
 
@@ -100,7 +102,7 @@ class ExposureConcurrencyTest {
     void concurrentApply_doesNotOversell() throws Exception {
         int totalCap = 20;
         int threads = 100;
-        service.createCampaign(new CreateCampaignRequest("req-c", "cap", totalCap, 100_000));
+        service.createCampaign(new CreateCampaignRequest("req-c", "cap", totalCap, 100_000, null));
 
         ExecutorService pool = Executors.newFixedThreadPool(16);
         CountDownLatch start = new CountDownLatch(1);
@@ -144,7 +146,7 @@ class ExposureConcurrencyTest {
     @Test
     @DisplayName("同一预占并发确认/取消：只允许一个终态，额度不重复释放、不变负")
     void concurrentConfirmAndCancel_singleTerminal_noDoubleRelease() throws Exception {
-        service.createCampaign(new CreateCampaignRequest("req-c", "cap", 1, 1));
+        service.createCampaign(new CreateCampaignRequest("req-c", "cap", 1, 1, null));
         ReservationResponse r = service.apply(new ApplyExposureRequest("req-a", "cap", "v1"));
 
         int threads = 24;
@@ -212,7 +214,7 @@ class ExposureConcurrencyTest {
     @Test
     @DisplayName("同一 requestId 并发重放：业务只执行一次，响应一致")
     void concurrentSameRequestId_executesOnce() throws Exception {
-        service.createCampaign(new CreateCampaignRequest("req-c", "cap", 100, 100));
+        service.createCampaign(new CreateCampaignRequest("req-c", "cap", 100, 100, null));
 
         int threads = 16;
         ExecutorService pool = Executors.newFixedThreadPool(threads);
