@@ -1,8 +1,10 @@
 package com.example.starter.incident;
 
 /**
- * 事件状态机：REPORTED → COMMANDING → CONTAINED → RESOLVED → CLOSED。
- * 只允许沿箭头前进一步，不允许跳转或回退；REPORTED → COMMANDING 仅能通过接管完成。
+ * 事件状态机：REPORTED → COMMANDING → CONTAINED → RESOLVED → CLOSED；
+ * 此外任何非终态可经重复事件合并进入 MERGED 终态。
+ * 主流程只允许沿箭头前进一步，不允许跳转或回退；REPORTED → COMMANDING 仅能通过接管完成；
+ * MERGED 仅能通过合并进入，不占用主流程箭头。
  */
 public enum IncidentStatus {
 
@@ -19,7 +21,10 @@ public enum IncidentStatus {
     RESOLVED,
 
     /** 已关闭，终态，禁止任何写入。 */
-    CLOSED;
+    CLOSED,
+
+    /** 已作为重复事件被并入其他事件，终态；任务与阻塞边已迁移到存续事件。 */
+    MERGED;
 
     /**
      * 返回当前状态经状态变更接口可到达的下一状态；不可变更时返回 null。

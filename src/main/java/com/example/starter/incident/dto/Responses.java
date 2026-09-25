@@ -11,10 +11,15 @@ public final class Responses {
     private Responses() {
     }
 
-    /** 事件当前视图：pendingTransferTo 为待接受的交接目标人，无则 null。 */
+    /**
+     * 事件当前视图：pendingTransferTo 为待接受的交接目标人，无则 null；
+     * version 为乐观并发版本号（合并成功时双方各加一）；
+     * mergedIntoIncidentKey 仅 MERGED 状态有值，指向存续事件键，其余为 null。
+     */
     public record IncidentView(String incidentKey, String severity, String summary, String reporter,
                                String status, String commander, String pendingTransferTo,
-                               Instant createdAt, Instant updatedAt, Instant deadlineAt) {
+                               Instant createdAt, Instant updatedAt, Instant deadlineAt,
+                               long version, String mergedIntoIncidentKey) {
     }
 
     /** 交接单视图。 */
@@ -77,5 +82,31 @@ public final class Responses {
 
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
+    }
+
+    /**
+     * 合并记录视图：migratedTaskKeys 为本次合并迁移到存续事件的任务键（按任务键排序）；
+     * 记录不可变，查询按落库顺序稳定返回。
+     */
+    public record MergeRecordView(String mergeKey, String survivingIncidentKey,
+                                  String mergedIncidentKey, String actor,
+                                  List<String> migratedTaskKeys, Instant createdAt) {
+    }
+
+    /** 合并记录列表视图：merges 按落库顺序稳定排序。 */
+    public record MergeRecordsView(List<MergeRecordView> merges) {
+    }
+
+    /** 单任务当前归属视图：ownerIncidentKey 为任务当前所属事件键（链式合并取最终存续事件）。 */
+    public record TaskOwnershipView(String taskKey, String ownerIncidentKey, String status) {
+    }
+
+    /**
+     * 事件任务归属查询视图：tasks 为源自该事件的全部任务当前归属（按 taskKey 稳定排序）；
+     * mergedIntoIncidentKey 仅 MERGED 状态有值。
+     */
+    public record IncidentTaskOwnershipView(String incidentKey, String status,
+                                            String mergedIntoIncidentKey,
+                                            List<TaskOwnershipView> tasks) {
     }
 }

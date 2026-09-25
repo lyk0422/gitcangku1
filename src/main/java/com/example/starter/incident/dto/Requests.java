@@ -55,4 +55,14 @@ public final class Requests {
     /** 任务完成/取消请求，操作人由 X-Actor-Id 指定且须为当前指挥人。 */
     public record TaskActionRequest(String commandKey) {
     }
+
+    /**
+     * 重复事件合并请求：mergeKey 全局唯一；两事件必须不同且当前指挥人均为操作人；
+     * survivingExpectedVersion/mergedExpectedVersion 为双方事件的期望版本号（乐观并发），
+     * 与当前版本不一致即 409。
+     */
+    public record MergeRequest(String commandKey, String mergeKey,
+                               String survivingIncidentKey, String mergedIncidentKey,
+                               Long survivingExpectedVersion, Long mergedExpectedVersion) {
+    }
 }

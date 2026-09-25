@@ -3,6 +3,7 @@ package com.example.starter.incident;
 import com.example.starter.incident.dto.Requests.ActionRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
 import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
+import com.example.starter.incident.dto.Requests.MergeRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
@@ -14,8 +15,11 @@ import com.example.starter.incident.dto.Responses.ActionView;
 import com.example.starter.incident.dto.Responses.EscalationHistoryView;
 import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
+import com.example.starter.incident.dto.Responses.IncidentTaskOwnershipView;
 import com.example.starter.incident.dto.Responses.IncidentTasksView;
 import com.example.starter.incident.dto.Responses.IncidentView;
+import com.example.starter.incident.dto.Responses.MergeRecordView;
+import com.example.starter.incident.dto.Responses.MergeRecordsView;
 import com.example.starter.incident.dto.Responses.TaskView;
 import com.example.starter.incident.dto.Responses.TransferView;
 import org.springframework.http.HttpStatus;
@@ -187,5 +191,31 @@ public class IncidentController {
                                @RequestHeader("X-Actor-Id") String actor,
                                @RequestBody TaskActionRequest req) {
         return service.cancelTask(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 重复事件合并：仅双方共同的当前指挥人可提交；单事务完成任务迁移、
+     * 阻塞边改挂与整图环检测，失败整体回滚。
+     */
+    @PostMapping("/merges")
+    public MergeRecordView merge(@RequestHeader("X-Actor-Id") String actor,
+                                 @RequestBody MergeRequest req) {
+        return service.merge(actor, req);
+    }
+
+    /**
+     * 查询全部合并记录（不可变，按落库顺序稳定排序）。只读，不隐式写入。
+     */
+    @GetMapping("/merges")
+    public MergeRecordsView listMerges() {
+        return service.listMerges();
+    }
+
+    /**
+     * 查询事件合并后任务归属（按 taskKey 稳定排序）。只读，不隐式写入。
+     */
+    @GetMapping("/{incidentKey}/task-ownership")
+    public IncidentTaskOwnershipView taskOwnership(@PathVariable String incidentKey) {
+        return service.taskOwnership(incidentKey);
     }
 }

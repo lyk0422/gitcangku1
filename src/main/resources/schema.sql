@@ -7,9 +7,11 @@ CREATE TABLE IF NOT EXISTS incidents (
     severity VARCHAR(2) NOT NULL COMMENT '严重等级，取值 S1~S4',
     summary VARCHAR(512) NOT NULL COMMENT '事件摘要',
     reporter VARCHAR(128) NOT NULL COMMENT '上报人标识',
-    status VARCHAR(16) NOT NULL COMMENT '状态：REPORTED/COMMANDING/CONTAINED/RESOLVED/CLOSED，仅允许单向逐级流转',
+    status VARCHAR(16) NOT NULL COMMENT '状态：REPORTED/COMMANDING/CONTAINED/RESOLVED/CLOSED/MERGED，主流程仅允许单向逐级流转，MERGED 仅经重复事件合并进入',
     commander VARCHAR(128) NULL COMMENT '当前指挥人（X-Actor-Id）；REPORTED 状态为空表示尚未接管',
-    deadline_at TIMESTAMP(6) NULL COMMENT '遏制期限 UTC；首次进入 COMMANDING 时按接管时刻加等级时限确定，S1=5分钟/S2=15分钟/S3=60分钟/S4=240分钟，交接不重置；REPORTED 为空',
+    deadline_at TIMESTAMP(6) NULL COMMENT '遏制期限 UTC；首次进入 COMMANDING 时按接管时刻加等级时限确定，S1=5分钟/S2=15分钟/S3=60分钟/S4=240分钟，交接不重置；REPORTED 为空；被并入事件合并成功时作废置空',
+    version INT NOT NULL DEFAULT 0 COMMENT '乐观并发版本号，初始 0；仅在重复事件合并成功时存续双方各加一',
+    merged_into_incident_id BIGINT NULL COMMENT '存续事件 id，关联 incidents.id；仅 MERGED 状态有值，其余为空',
     created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
     updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间',
     CONSTRAINT uk_incidents_key UNIQUE (incident_key)
@@ -49,7 +51,7 @@ CREATE TABLE IF NOT EXISTS incident_status_history (
 CREATE TABLE IF NOT EXISTS command_keys (
     id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
     command_key VARCHAR(128) NOT NULL COMMENT '调用方幂等键，全局唯一',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：takeover/transfer_initiate/transfer_accept/action/status/escalation_check/escalation_ack/task_create/task_complete/task_cancel',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：takeover/transfer_initiate/transfer_accept/action/status/escalation_check/escalation_ack/task_create/task_complete/task_cancel/merge',
     request_hash VARCHAR(64) NOT NULL COMMENT '规范化请求参数的 SHA-256 摘要，用于同键改参检测',
     response_status INT NULL COMMENT '首次成功的 HTTP 状态码；事务提交前必写入',
     response_body MEDIUMTEXT NULL COMMENT '首次成功响应 JSON，用于同键同参重放',
@@ -100,3 +102,23 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY COMMENT '固定为 1 的单行锁；创建任务时 SELECT ... FOR UPDATE 持有，串行化环检测与写入，保证并发反向依赖最终图无环'
 ) COMMENT='任务依赖图全局锁表';
+
+CREATE TABLE IF NOT EXISTS incident_merges (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    merge_key VARCHAR(128) NOT NULL COMMENT '合并业务键，全局唯一；重复提交按 409 拒绝',
+    surviving_incident_id BIGINT NOT NULL COMMENT '存续事件 id，关联 incidents.id；合并后保留全部任务与阻塞边',
+    merged_incident_id BIGINT NOT NULL COMMENT '被并入事件 id，关联 incidents.id；合并后进入 MERGED 终态；同一事件至多被合并一次',
+    actor VARCHAR(128) NOT NULL COMMENT '操作人（提交时双方共同的当前指挥人）',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '合并完成 UTC 时间；记录不可变，仅插入不更新',
+    CONSTRAINT uk_merge_key UNIQUE (merge_key),
+    CONSTRAINT uk_merge_merged UNIQUE (merged_incident_id)
+) COMMENT='重复事件合并记录表（不可变）';
+
+CREATE TABLE IF NOT EXISTS incident_merge_tasks (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    merge_id BIGINT NOT NULL COMMENT '所属合并记录 id，关联 incident_merges.id',
+    task_id BIGINT NOT NULL COMMENT '被迁移任务 id，关联 incident_tasks.id；任务的当前归属以 incident_tasks.incident_id 为准',
+    task_key VARCHAR(128) NOT NULL COMMENT '被迁移任务业务键（迁移时快照，用于归属查询展示）',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '迁移 UTC 时间',
+    CONSTRAINT uk_merge_task UNIQUE (task_id, merge_id)
+) COMMENT='合并任务迁移明细表（不可变）';

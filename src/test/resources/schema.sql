@@ -9,6 +9,8 @@ CREATE TABLE IF NOT EXISTS incidents (
     status VARCHAR(16) NOT NULL,
     commander VARCHAR(128) NULL,
     deadline_at TIMESTAMP(6) NULL,
+    version INT NOT NULL DEFAULT 0,
+    merged_into_incident_id BIGINT NULL,
     created_at TIMESTAMP(6) NOT NULL,
     updated_at TIMESTAMP(6) NOT NULL,
     CONSTRAINT uk_incidents_key UNIQUE (incident_key)
@@ -98,4 +100,24 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS incident_merges (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    merge_key VARCHAR(128) NOT NULL,
+    surviving_incident_id BIGINT NOT NULL,
+    merged_incident_id BIGINT NOT NULL,
+    actor VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_merge_key UNIQUE (merge_key),
+    CONSTRAINT uk_merge_merged UNIQUE (merged_incident_id)
+);
+
+CREATE TABLE IF NOT EXISTS incident_merge_tasks (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    merge_id BIGINT NOT NULL,
+    task_id BIGINT NOT NULL,
+    task_key VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_merge_task UNIQUE (task_id, merge_id)
 );

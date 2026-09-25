@@ -46,11 +46,14 @@ public class IncidentRepository {
 
     private static Incident mapIncident(ResultSet rs) throws SQLException {
         Timestamp deadline = rs.getTimestamp("deadline_at");
+        long mergedInto = rs.getLong("merged_into_incident_id");
         return new Incident(rs.getLong("id"), rs.getString("incident_key"), rs.getString("severity"),
                 rs.getString("summary"), rs.getString("reporter"),
                 IncidentStatus.valueOf(rs.getString("status")), rs.getString("commander"),
                 rs.getTimestamp("created_at").toInstant(), rs.getTimestamp("updated_at").toInstant(),
-                deadline == null ? null : deadline.toInstant());
+                deadline == null ? null : deadline.toInstant(),
+                rs.getLong("version"),
+                rs.wasNull() ? null : mergedInto);
     }
 
     /**
@@ -59,6 +62,15 @@ public class IncidentRepository {
     public Optional<Incident> findByKey(String incidentKey) {
         List<Incident> rows = jdbc.query("SELECT * FROM incidents WHERE incident_key = ?",
                 INCIDENT_MAPPER, incidentKey);
+        return rows.stream().findFirst();
+    }
+
+    /**
+     * 按主键查询事件（不加锁），用于解析 merged_into 等内部引用。
+     */
+    public Optional<Incident> findById(long id) {
+        List<Incident> rows = jdbc.query("SELECT * FROM incidents WHERE id = ?",
+                INCIDENT_MAPPER, id);
         return rows.stream().findFirst();
     }
 
@@ -72,14 +84,15 @@ public class IncidentRepository {
     }
 
     /**
-     * 插入新事件，初始状态 REPORTED、无指挥人、无遏制期限，返回生成主键。
+     * 插入新事件，初始状态 REPORTED、无指挥人、无遏制期限、版本 0，返回生成主键。
      */
     public long insert(Incident incident) {
         KeyHolder keys = new GeneratedKeyHolder();
         jdbc.update(con -> {
             var ps = con.prepareStatement(
                     "INSERT INTO incidents (incident_key, severity, summary, reporter, status, commander,"
-                            + " created_at, updated_at, deadline_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                            + " created_at, updated_at, deadline_at, version, merged_into_incident_id)"
+                            + " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, incident.incidentKey());
             ps.setString(2, incident.severity());
@@ -90,6 +103,8 @@ public class IncidentRepository {
             ps.setTimestamp(7, Timestamp.from(incident.createdAt()));
             ps.setTimestamp(8, Timestamp.from(incident.updatedAt()));
             ps.setTimestamp(9, incident.deadlineAt() == null ? null : Timestamp.from(incident.deadlineAt()));
+            ps.setLong(10, incident.version());
+            ps.setObject(11, incident.mergedIntoIncidentId());
             return ps;
         }, keys);
         return keys.getKey().longValue();
@@ -101,6 +116,31 @@ public class IncidentRepository {
     public void updateDeadline(long id, Instant deadlineAt, Instant updatedAt) {
         jdbc.update("UPDATE incidents SET deadline_at = ?, updated_at = ? WHERE id = ?",
                 Timestamp.from(deadlineAt), Timestamp.from(updatedAt), id);
+    }
+
+    /**
+     * 合并成功时作废被并入事件的遏制期限（置空）。
+     */
+    public void clearDeadline(long id, Instant updatedAt) {
+        jdbc.update("UPDATE incidents SET deadline_at = NULL, updated_at = ? WHERE id = ?",
+                Timestamp.from(updatedAt), id);
+    }
+
+    /**
+     * 合并成功时将被并入事件置为 MERGED 终态、记录存续事件并版本加一。
+     */
+    public void markMerged(long id, long survivingIncidentId, Instant updatedAt) {
+        jdbc.update("UPDATE incidents SET status = 'MERGED', merged_into_incident_id = ?,"
+                        + " version = version + 1, updated_at = ? WHERE id = ?",
+                survivingIncidentId, Timestamp.from(updatedAt), id);
+    }
+
+    /**
+     * 合并成功时存续事件版本加一（状态不变）。
+     */
+    public void incrementVersion(long id, Instant updatedAt) {
+        jdbc.update("UPDATE incidents SET version = version + 1, updated_at = ? WHERE id = ?",
+                Timestamp.from(updatedAt), id);
     }
 
     /**

@@ -200,4 +200,97 @@ public class IncidentTaskRepository {
         }
         return false;
     }
+
+    /**
+     * 合并事务内将被并入事件的全部任务迁移到存续事件（taskKey 冲突须已预检）。
+     */
+    public void migrateTasks(long fromIncidentId, long toIncidentId, Instant now) {
+        jdbc.update("UPDATE incident_tasks SET incident_id = ?, updated_at = ?"
+                        + " WHERE incident_id = ?",
+                toIncidentId, Timestamp.from(now), fromIncidentId);
+    }
+
+    /** 阻塞边行：主键、所属任务、阻塞事件。 */
+    private record BlockerRow(long id, long taskId, long blockerIncidentId) {
+    }
+
+    /**
+     * 合并事务内将全部指向被并入事件的阻塞边改指存续事件：
+     * 同一任务的重复边去重（保留先落库者），改挂后指向任务自身所属事件的边直接丢弃。
+     * 调用前必须已持有 lockGraph() 全局锁，且任务迁移已执行（自环判定按迁移后归属）。
+     */
+    public void repointBlockers(long mergedIncidentId, long survivingIncidentId) {
+        List<BlockerRow> rows = jdbc.query(
+                "SELECT id, task_id, blocker_incident_id FROM incident_task_blockers ORDER BY id",
+                (rs, n) -> new BlockerRow(rs.getLong(1), rs.getLong(2), rs.getLong(3)));
+        // 任务迁移后的所属事件（fromIncidentId 复用为任务 id）
+        Map<Long, Long> taskIncident = new HashMap<>();
+        for (Edge row : jdbc.query("SELECT id, incident_id FROM incident_tasks",
+                (rs, n) -> new Edge(rs.getLong(1), rs.getLong(2)))) {
+            taskIncident.put(row.fromIncidentId(), row.toIncidentId());
+        }
+        Set<String> seen = new HashSet<>();
+        List<Long> toDelete = new ArrayList<>();
+        List<Long> toRepoint = new ArrayList<>();
+        for (BlockerRow row : rows) {
+            long target = row.blockerIncidentId() == mergedIncidentId
+                    ? survivingIncidentId : row.blockerIncidentId();
+            if (target == taskIncident.getOrDefault(row.taskId(), -1L)
+                    || !seen.add(row.taskId() + ":" + target)) {
+                toDelete.add(row.id());
+            } else if (target != row.blockerIncidentId()) {
+                toRepoint.add(row.id());
+            }
+        }
+        for (Long id : toDelete) {
+            jdbc.update("DELETE FROM incident_task_blockers WHERE id = ?", id);
+        }
+        for (Long id : toRepoint) {
+            jdbc.update("UPDATE incident_task_blockers SET blocker_incident_id = ? WHERE id = ?",
+                    survivingIncidentId, id);
+        }
+    }
+
+    /**
+     * 整图环检测：对全部阻塞边构成的有向图（事件 → 阻塞事件）做三色 DFS，存在回边即有环。
+     * 调用前必须已持有 lockGraph() 全局锁，保证检测与合并改挂串行一致。
+     */
+    public boolean hasCycle() {
+        List<Edge> edges = jdbc.query(
+                "SELECT t.incident_id, b.blocker_incident_id FROM incident_task_blockers b"
+                        + " JOIN incident_tasks t ON t.id = b.task_id",
+                (rs, n) -> new Edge(rs.getLong(1), rs.getLong(2)));
+        Map<Long, List<Long>> adjacency = new HashMap<>();
+        Set<Long> nodes = new HashSet<>();
+        for (Edge edge : edges) {
+            adjacency.computeIfAbsent(edge.fromIncidentId(), k -> new ArrayList<>())
+                    .add(edge.toIncidentId());
+            nodes.add(edge.fromIncidentId());
+            nodes.add(edge.toIncidentId());
+        }
+        Map<Long, Integer> color = new HashMap<>();
+        for (Long node : nodes) {
+            if (color.getOrDefault(node, 0) == 0 && dfsCycle(node, adjacency, color)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 三色 DFS：0=未访问，1=访问中（在栈上），2=已完成；遇到访问中节点即有环。 */
+    private static boolean dfsCycle(long node, Map<Long, List<Long>> adjacency,
+                                    Map<Long, Integer> color) {
+        color.put(node, 1);
+        for (Long next : adjacency.getOrDefault(node, List.of())) {
+            int state = color.getOrDefault(next, 0);
+            if (state == 1) {
+                return true;
+            }
+            if (state == 0 && dfsCycle(next, adjacency, color)) {
+                return true;
+            }
+        }
+        color.put(node, 2);
+        return false;
+    }
 }
