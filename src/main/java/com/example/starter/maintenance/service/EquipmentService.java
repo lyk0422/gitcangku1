@@ -9,6 +9,7 @@ import org.springframework.stereotype.Service;
 import com.example.starter.maintenance.api.ApiException;
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
+import com.example.starter.maintenance.api.dto.ConversionView;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
@@ -33,7 +34,8 @@ public class EquipmentService {
     }
 
     public EquipmentResponse register(RegisterEquipmentRequest req) {
-        String fingerprint = req.equipmentId() + "|" + req.maintenancePeriodMinutes();
+        EquipmentTxService.ResolvedPeriod period = EquipmentTxService.resolvePeriod(req);
+        String fingerprint = EquipmentTxService.registerFingerprint(req.equipmentId(), period);
         return recoverDuplicateKey(req.requestId(), "REGISTER_EQUIPMENT", fingerprint,
                 EquipmentResponse.class, () -> txService.register(req));
     }
@@ -50,8 +52,12 @@ public class EquipmentService {
         return txService.completeMaintenance(equipmentId, req);
     }
 
-    public StatusResponse getStatus(String equipmentId) {
-        return txService.getStatus(equipmentId);
+    public StatusResponse getStatus(String equipmentId, String displayUnit) {
+        return txService.getStatus(equipmentId, displayUnit);
+    }
+
+    public EquipmentResponse getEquipment(String equipmentId) {
+        return txService.getEquipment(equipmentId);
     }
 
     public List<ReadingResponse> listReadings(String equipmentId) {
@@ -64,6 +70,11 @@ public class EquipmentService {
 
     public List<MaintenanceResponse> listMaintenances(String equipmentId) {
         return txService.listMaintenances(equipmentId);
+    }
+
+    /** 设备单位配置与换算记录查询（只读，稳定排序）。 */
+    public List<ConversionView> listConversions(String equipmentId) {
+        return txService.listConversions(equipmentId);
     }
 
     /**

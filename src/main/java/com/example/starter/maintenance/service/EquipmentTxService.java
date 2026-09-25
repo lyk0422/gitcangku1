@@ -1,5 +1,6 @@
 package com.example.starter.maintenance.service;
 
+import java.math.BigDecimal;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.List;
@@ -11,6 +12,7 @@ import org.springframework.transaction.annotation.Transactional;
 import com.example.starter.maintenance.api.ApiException;
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
+import com.example.starter.maintenance.api.dto.ConversionView;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
@@ -18,14 +20,21 @@ import com.example.starter.maintenance.api.dto.RegisterEquipmentRequest;
 import com.example.starter.maintenance.api.dto.ReviseReadingRequest;
 import com.example.starter.maintenance.api.dto.RevisionView;
 import com.example.starter.maintenance.api.dto.StatusResponse;
+import com.example.starter.maintenance.domain.ConversionRecord;
 import com.example.starter.maintenance.domain.Equipment;
 import com.example.starter.maintenance.domain.MaintenanceRecord;
+import com.example.starter.maintenance.domain.MeasurementUnit;
 import com.example.starter.maintenance.domain.Reading;
+import com.example.starter.maintenance.domain.UnitConverter;
 import com.example.starter.maintenance.store.EquipmentRepository;
 
 /**
  * 设备工时保养事务业务服务。写操作流程：设备行锁 → 幂等判定 → 版本校验 → 业务规则 → 变更并版本加一。
  * 去重记录与业务变更同事务提交；任一规则失败抛异常整体回滚。
+ *
+ * <p>多计量单位口径：所有读数与保养周期以设备登记单位十进制存储，同时冗余换算分钟数
+ * （HOURS × 60，BigDecimal 精确计算，HALF_UP 四舍五入到最近整数分钟）；单调性、保养锚点
+ * 与 DUE/OK 判定统一使用换算后的分钟口径。提交单位与登记单位不同时服务端换算并只读留痕。</p>
  */
 @Service
 public class EquipmentTxService {
@@ -44,14 +53,18 @@ public class EquipmentTxService {
 
     @Transactional
     public EquipmentResponse register(RegisterEquipmentRequest req) {
-        String fingerprint = req.equipmentId() + "|" + req.maintenancePeriodMinutes();
+        ResolvedPeriod period = resolvePeriod(req);
+        String fingerprint = registerFingerprint(req.equipmentId(), period);
         return idempotency.execute(req.requestId(), "REGISTER_EQUIPMENT", fingerprint,
                 EquipmentResponse.class, () -> {
                     if (repository.findEquipment(req.equipmentId()).isPresent()) {
                         throw ApiException.conflict("EQUIPMENT_EXISTS", "设备已存在：" + req.equipmentId());
                     }
-                    repository.insertEquipment(req.equipmentId(), req.maintenancePeriodMinutes(), clock.instant());
-                    return new EquipmentResponse(req.equipmentId(), req.maintenancePeriodMinutes(), 1L);
+                    Equipment equipment = new Equipment(req.equipmentId(), period.unit(), period.value(),
+                            period.minutes(), 1L);
+                    repository.insertEquipment(equipment, clock.instant());
+                    return new EquipmentResponse(req.equipmentId(), period.unit().name(), period.value(),
+                            period.minutes(), 1L);
                 });
     }
 
@@ -60,8 +73,10 @@ public class EquipmentTxService {
     @Transactional
     public ReadingResponse addReading(String equipmentId, AddReadingRequest req) {
         Equipment equipment = lockEquipment(equipmentId);
+        ResolvedValue value = resolveReadingValue(equipment, req.unit(),
+                req.cumulativeValue(), req.cumulativeMinutes());
         String fingerprint = equipmentId + "|" + req.readingId() + "|" + req.sampledAt()
-                + "|" + req.cumulativeMinutes() + "|" + req.expectedVersion();
+                + "|" + value.sourceUnit() + "|" + value.sourceValue() + "|" + req.expectedVersion();
         return idempotency.execute(req.requestId(), "ADD_READING", fingerprint,
                 ReadingResponse.class, () -> {
                     checkVersion(equipment, req.expectedVersion());
@@ -72,17 +87,19 @@ public class EquipmentTxService {
                         throw ApiException.unprocessable("READING_TIME_DUPLICATE",
                                 "同一设备同一采样时刻仅允许一条读数");
                     }
-                    checkMonotonic(equipmentId, req.sampledAt(), req.cumulativeMinutes());
+                    checkMonotonic(equipmentId, req.sampledAt(), value.minutes());
                     Instant now = clock.instant();
                     repository.insertReading(
                             new Reading(equipmentId, req.readingId(), req.sampledAt(),
-                                    req.cumulativeMinutes(), 1),
+                                    value.equipmentValue(), value.minutes(), 1),
                             now);
                     repository.insertRevision(equipmentId, req.readingId(), 1,
-                            req.cumulativeMinutes(), req.requestId(), now);
+                            value.equipmentValue(), value.minutes(), req.requestId(), now);
+                    recordConversionIfNeeded(equipment, req.readingId(), 1, value,
+                            req.requestId(), now);
                     repository.incrementVersion(equipmentId);
                     return new ReadingResponse(equipmentId, req.readingId(), req.sampledAt(),
-                            req.cumulativeMinutes(), 1, false, equipment.version() + 1);
+                            value.equipmentValue(), value.minutes(), 1, false, equipment.version() + 1);
                 });
     }
 
@@ -91,8 +108,10 @@ public class EquipmentTxService {
     @Transactional
     public ReadingResponse reviseReading(String equipmentId, String readingId, ReviseReadingRequest req) {
         Equipment equipment = lockEquipment(equipmentId);
-        String fingerprint = equipmentId + "|" + readingId + "|" + req.cumulativeMinutes()
-                + "|" + req.expectedVersion();
+        ResolvedValue value = resolveReadingValue(equipment, req.unit(),
+                req.cumulativeValue(), req.cumulativeMinutes());
+        String fingerprint = equipmentId + "|" + readingId + "|" + value.sourceUnit() + "|"
+                + value.sourceValue() + "|" + req.expectedVersion();
         return idempotency.execute(req.requestId(), "REVISE_READING", fingerprint,
                 ReadingResponse.class, () -> {
                     checkVersion(equipment, req.expectedVersion());
@@ -103,16 +122,19 @@ public class EquipmentTxService {
                         throw ApiException.conflict("READING_ANCHORED",
                                 "读数已作为历史保养锚点，不可修订：" + readingId);
                     }
-                    checkMonotonic(equipmentId, reading.sampledAt(), req.cumulativeMinutes());
+                    checkMonotonic(equipmentId, reading.sampledAt(), value.minutes());
                     int newRevisionNo = reading.revisionNo() + 1;
                     Instant now = clock.instant();
-                    repository.updateReadingValue(equipmentId, readingId, req.cumulativeMinutes(),
-                            newRevisionNo, now);
+                    repository.updateReadingValue(equipmentId, readingId, value.equipmentValue(),
+                            value.minutes(), newRevisionNo, now);
                     repository.insertRevision(equipmentId, readingId, newRevisionNo,
-                            req.cumulativeMinutes(), req.requestId(), now);
+                            value.equipmentValue(), value.minutes(), req.requestId(), now);
+                    recordConversionIfNeeded(equipment, readingId, newRevisionNo, value,
+                            req.requestId(), now);
                     repository.incrementVersion(equipmentId);
                     return new ReadingResponse(equipmentId, readingId, reading.sampledAt(),
-                            req.cumulativeMinutes(), newRevisionNo, false, equipment.version() + 1);
+                            value.equipmentValue(), value.minutes(), newRevisionNo, false,
+                            equipment.version() + 1);
                 });
     }
 
@@ -141,31 +163,53 @@ public class EquipmentTxService {
                     }
                     Instant now = clock.instant();
                     long maintenanceId = repository.insertMaintenance(equipmentId, req.readingId(),
-                            req.anchorRevisionNo(), anchor.sampledAt(), anchor.cumulativeMinutes(),
-                            req.requestId(), now);
+                            req.anchorRevisionNo(), anchor.sampledAt(), anchor.cumulativeValue(),
+                            anchor.cumulativeMinutes(), req.requestId(), now);
                     repository.incrementVersion(equipmentId);
                     return new MaintenanceResponse(maintenanceId, equipmentId, req.readingId(),
-                            req.anchorRevisionNo(), anchor.sampledAt(), anchor.cumulativeMinutes(),
-                            now, equipment.version() + 1);
+                            req.anchorRevisionNo(), anchor.sampledAt(), anchor.cumulativeValue(),
+                            anchor.cumulativeMinutes(), now, equipment.version() + 1);
                 });
     }
 
     // ---------- 查询 ----------
 
+    /** 设备单位配置（只读）：登记单位、保养周期与换算分钟数。 */
     @Transactional(readOnly = true)
-    public StatusResponse getStatus(String equipmentId) {
+    public EquipmentResponse getEquipment(String equipmentId) {
         Equipment equipment = repository.findEquipment(equipmentId)
                 .orElseThrow(() -> equipmentNotFound(equipmentId));
+        return new EquipmentResponse(equipmentId, equipment.measurementUnit().name(),
+                equipment.maintenancePeriodValue(), equipment.maintenancePeriodMinutes(),
+                equipment.version());
+    }
+
+    @Transactional(readOnly = true)
+    public StatusResponse getStatus(String equipmentId, String displayUnitName) {
+        Equipment equipment = repository.findEquipment(equipmentId)
+                .orElseThrow(() -> equipmentNotFound(equipmentId));
+        MeasurementUnit displayUnit = parseDisplayUnit(displayUnitName, equipment);
         Optional<Reading> latest = repository.findLatestReading(equipmentId);
         Optional<MaintenanceRecord> last = repository.findLastMaintenance(equipmentId);
-        long latestCumulative = latest.map(Reading::cumulativeMinutes).orElse(0L);
-        long anchorCumulative = last.map(MaintenanceRecord::anchorCumulativeMinutes).orElse(0L);
-        long runMinutes = latestCumulative - anchorCumulative;
+        long latestMinutes = latest.map(Reading::cumulativeMinutes).orElse(0L);
+        long anchorMinutes = last.map(MaintenanceRecord::anchorCumulativeMinutes).orElse(0L);
+        // 判定统一口径：本轮运行分钟由换算分钟数直接相减
+        long runMinutes = latestMinutes - anchorMinutes;
         String status = runMinutes >= equipment.maintenancePeriodMinutes() ? "DUE" : "OK";
-        return new StatusResponse(equipmentId, equipment.version(), equipment.maintenancePeriodMinutes(),
-                latest.map(Reading::sampledAt).orElse(null), latestCumulative,
-                last.map(MaintenanceRecord::anchorSampledAt).orElse(null), anchorCumulative,
-                runMinutes, status);
+        // 登记单位运行工时与展示值均由换算分钟数一次性换算，避免展示两次转换误差累积
+        BigDecimal runValue = UnitConverter.displayFromMinutes(runMinutes, equipment.measurementUnit());
+        BigDecimal displayRunValue = UnitConverter.displayFromMinutes(runMinutes, displayUnit);
+        BigDecimal displayPeriodValue = UnitConverter.displayFromMinutes(
+                equipment.maintenancePeriodMinutes(), displayUnit);
+        return new StatusResponse(equipmentId, equipment.version(), equipment.measurementUnit().name(),
+                equipment.maintenancePeriodValue(), equipment.maintenancePeriodMinutes(),
+                latest.map(Reading::sampledAt).orElse(null),
+                latest.map(Reading::cumulativeValue).orElse(BigDecimal.ZERO.setScale(2)),
+                latestMinutes,
+                last.map(MaintenanceRecord::anchorSampledAt).orElse(null),
+                last.map(MaintenanceRecord::anchorCumulativeValue).orElse(BigDecimal.ZERO.setScale(2)),
+                anchorMinutes, runValue, runMinutes, status, displayUnit.name(),
+                displayRunValue, displayPeriodValue);
     }
 
     @Transactional(readOnly = true)
@@ -174,7 +218,7 @@ public class EquipmentTxService {
                 .orElseThrow(() -> equipmentNotFound(equipmentId));
         return repository.listReadings(equipmentId).stream()
                 .map(reading -> new ReadingResponse(equipmentId, reading.readingId(), reading.sampledAt(),
-                        reading.cumulativeMinutes(), reading.revisionNo(),
+                        reading.cumulativeValue(), reading.cumulativeMinutes(), reading.revisionNo(),
                         repository.existsMaintenanceAnchoringReading(equipmentId, reading.readingId()),
                         equipment.version()))
                 .toList();
@@ -186,8 +230,8 @@ public class EquipmentTxService {
         repository.findReading(equipmentId, readingId)
                 .orElseThrow(() -> ApiException.notFound("READING_NOT_FOUND", "读数不存在：" + readingId));
         return repository.listRevisions(equipmentId, readingId).stream()
-                .map(row -> new RevisionView(row.revisionNo(), row.cumulativeMinutes(),
-                        row.requestId(), row.createdAt()))
+                .map(row -> new RevisionView(row.revisionNo(), row.cumulativeValue(),
+                        row.cumulativeMinutes(), row.requestId(), row.createdAt()))
                 .toList();
     }
 
@@ -197,7 +241,20 @@ public class EquipmentTxService {
         return repository.listMaintenances(equipmentId).stream()
                 .map(record -> new MaintenanceResponse(record.maintenanceId(), equipmentId,
                         record.readingId(), record.anchorRevisionNo(), record.anchorSampledAt(),
-                        record.anchorCumulativeMinutes(), record.completedAt(), 0L))
+                        record.anchorCumulativeValue(), record.anchorCumulativeMinutes(),
+                        record.completedAt(), 0L))
+                .toList();
+    }
+
+    /** 换算留痕查询（只读，稳定排序）。 */
+    @Transactional(readOnly = true)
+    public List<ConversionView> listConversions(String equipmentId) {
+        repository.findEquipment(equipmentId).orElseThrow(() -> equipmentNotFound(equipmentId));
+        return repository.listConversions(equipmentId).stream()
+                .map(record -> new ConversionView(record.conversionId(), record.equipmentId(),
+                        record.readingId(), record.revisionNo(), record.sourceUnit().name(),
+                        record.sourceValue(), record.convertedValue(), record.convertedMinutes(),
+                        record.requestId(), record.createdAt()))
                 .toList();
     }
 
@@ -219,17 +276,108 @@ public class EquipmentTxService {
         }
     }
 
-    /** 单调性校验：新值须同时不早于前相邻读数、不晚于后相邻读数（按采样时刻排序）。 */
+    /** 单调性校验（统一分钟口径）：换算误差导致相等视为非递减，不抛 422。 */
     private void checkMonotonic(String equipmentId, Instant sampledAt, long cumulativeMinutes) {
         Optional<Reading> prev = repository.findPrevReading(equipmentId, sampledAt);
         if (prev.isPresent() && cumulativeMinutes < prev.get().cumulativeMinutes()) {
             throw ApiException.unprocessable("READING_ORDER_VIOLATION",
-                    "累计工时小于前一条读数（" + prev.get().cumulativeMinutes() + "），违反单调不减约束");
+                    "累计工时小于前一条读数（" + prev.get().cumulativeMinutes() + " 分钟），违反单调不减约束");
         }
         Optional<Reading> next = repository.findNextReading(equipmentId, sampledAt);
         if (next.isPresent() && cumulativeMinutes > next.get().cumulativeMinutes()) {
             throw ApiException.unprocessable("READING_ORDER_VIOLATION",
-                    "累计工时大于后一条读数（" + next.get().cumulativeMinutes() + "），违反单调不减约束");
+                    "累计工时大于后一条读数（" + next.get().cumulativeMinutes() + " 分钟），违反单调不减约束");
         }
+    }
+
+    /** 登记设备幂等指纹（外观层并发补偿重放须使用同一规范形式）。 */
+    static String registerFingerprint(String equipmentId, ResolvedPeriod period) {
+        return equipmentId + "|" + period.unit() + "|" + period.value() + "|" + period.minutes();
+    }
+
+    /**
+     * 解析登记设备的保养周期：measurementUnit 缺省 MINUTES；
+     * maintenancePeriodValue（登记单位十进制）优先，否则用 maintenancePeriodMinutes 换算。
+     */
+    static ResolvedPeriod resolvePeriod(RegisterEquipmentRequest req) {
+        MeasurementUnit unit = req.measurementUnit() == null
+                ? MeasurementUnit.MINUTES
+                : MeasurementUnit.valueOf(req.measurementUnit());
+        BigDecimal value;
+        if (req.maintenancePeriodValue() != null) {
+            value = req.maintenancePeriodValue();
+        } else if (req.maintenancePeriodMinutes() != null) {
+            value = UnitConverter.convert(BigDecimal.valueOf(req.maintenancePeriodMinutes()),
+                    MeasurementUnit.MINUTES, unit);
+        } else {
+            throw ApiException.badRequest("PERIOD_REQUIRED",
+                    "须提供 maintenancePeriodValue 或 maintenancePeriodMinutes");
+        }
+        if (!UnitConverter.hasValidScale(value)) {
+            throw ApiException.badRequest("VALUE_SCALE_EXCEEDED", "保养周期最多允许 2 位小数");
+        }
+        BigDecimal normalized = UnitConverter.normalize(value);
+        return new ResolvedPeriod(unit, normalized, UnitConverter.toMinutes(normalized, unit));
+    }
+
+    /**
+     * 解析提交读数：unit 缺省为设备登记单位；cumulativeValue（提交单位十进制）优先，
+     * 否则用 cumulativeMinutes。换算为设备登记单位存储，并得到统一口径分钟数。
+     * 提交单位与登记单位不同时由调用方凭 sourceUnit 写换算留痕。
+     */
+    private ResolvedValue resolveReadingValue(Equipment equipment, String unitName,
+                                              BigDecimal submittedValue, Long submittedMinutes) {
+        MeasurementUnit sourceUnit = unitName == null
+                ? equipment.measurementUnit()
+                : MeasurementUnit.valueOf(unitName);
+        BigDecimal sourceValue;
+        if (submittedValue != null) {
+            sourceValue = submittedValue;
+        } else if (submittedMinutes != null) {
+            // 兼容字段 cumulativeMinutes 始终以分钟解释，忽略 unit 标签
+            sourceValue = BigDecimal.valueOf(submittedMinutes);
+            sourceUnit = MeasurementUnit.MINUTES;
+        } else {
+            throw ApiException.badRequest("VALUE_REQUIRED",
+                    "须提供 cumulativeValue 或 cumulativeMinutes");
+        }
+        if (!UnitConverter.hasValidScale(sourceValue)) {
+            throw ApiException.badRequest("VALUE_SCALE_EXCEEDED", "读数值最多允许 2 位小数");
+        }
+        BigDecimal normalized = UnitConverter.normalize(sourceValue);
+        BigDecimal equipmentValue = UnitConverter.convert(normalized, sourceUnit,
+                equipment.measurementUnit());
+        long minutes = UnitConverter.toMinutes(equipmentValue, equipment.measurementUnit());
+        return new ResolvedValue(sourceUnit, normalized, equipmentValue, minutes);
+    }
+
+    /** 提交单位与设备登记单位不同时追加只读换算留痕（不产生额外读数条目）。 */
+    private void recordConversionIfNeeded(Equipment equipment, String readingId, int revisionNo,
+                                          ResolvedValue value, String requestId, Instant now) {
+        if (value.sourceUnit() == equipment.measurementUnit()) {
+            return;
+        }
+        repository.insertConversion(new ConversionRecord(0L, equipment.equipmentId(), readingId,
+                revisionNo, value.sourceUnit(), value.sourceValue(), value.equipmentValue(),
+                value.minutes(), requestId, now));
+    }
+
+    private MeasurementUnit parseDisplayUnit(String displayUnitName, Equipment equipment) {
+        if (displayUnitName == null || displayUnitName.isBlank()) {
+            return equipment.measurementUnit();
+        }
+        try {
+            return MeasurementUnit.valueOf(displayUnitName);
+        } catch (IllegalArgumentException e) {
+            throw ApiException.badRequest("UNSUPPORTED_UNIT",
+                    "展示单位仅支持 MINUTES 或 HOURS：" + displayUnitName);
+        }
+    }
+
+    record ResolvedPeriod(MeasurementUnit unit, BigDecimal value, long minutes) {
+    }
+
+    private record ResolvedValue(MeasurementUnit sourceUnit, BigDecimal sourceValue,
+                                 BigDecimal equipmentValue, long minutes) {
     }
 }
