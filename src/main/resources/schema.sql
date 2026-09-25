@@ -86,3 +86,98 @@ COMMENT ON COLUMN idempotent_request.request_hash IS '规范化请求参数的 S
 COMMENT ON COLUMN idempotent_request.http_status IS '原成功响应 HTTP 状态码';
 COMMENT ON COLUMN idempotent_request.response_json IS '原成功响应 JSON，重放时原样返回';
 COMMENT ON COLUMN idempotent_request.created_at IS '首次成功提交时间，UTC 时间戳';
+
+-- 制品漏洞豁免与锁定图发布门禁 -----------------------------------------
+
+CREATE TABLE IF NOT EXISTS vulnerability_advisory (
+    id               BIGINT AUTO_INCREMENT PRIMARY KEY,
+    vulnerability_id VARCHAR(64)  NOT NULL,
+    artifact_name    VARCHAR(128) NOT NULL,
+    artifact_version INT          NOT NULL,
+    severity         VARCHAR(16)  NOT NULL,
+    expires_at       TIMESTAMP(6) NOT NULL,
+    updated_at       TIMESTAMP(6) NOT NULL
+);
+COMMENT ON TABLE vulnerability_advisory IS '漏洞公告：一条公告命中一个受影响制品坐标，可按编号+坐标更新';
+COMMENT ON COLUMN vulnerability_advisory.vulnerability_id IS '漏洞编号（如 CVE 编号）';
+COMMENT ON COLUMN vulnerability_advisory.artifact_name IS '受影响制品名称（精确坐标）';
+COMMENT ON COLUMN vulnerability_advisory.artifact_version IS '受影响制品精确版本号，正整数';
+COMMENT ON COLUMN vulnerability_advisory.severity IS '严重级别：CRITICAL/HIGH/MEDIUM/LOW，仅未过期 CRITICAL 参与门禁';
+COMMENT ON COLUMN vulnerability_advisory.expires_at IS '公告 UTC 到期时刻，之后不再命中';
+COMMENT ON COLUMN vulnerability_advisory.updated_at IS '公告最近写入时间，UTC 时间戳';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_advisory_coord
+    ON vulnerability_advisory (vulnerability_id, artifact_name, artifact_version);
+
+CREATE TABLE IF NOT EXISTS vulnerability_exception (
+    id               BIGINT AUTO_INCREMENT PRIMARY KEY,
+    exception_key    VARCHAR(64)  NOT NULL,
+    lock_file_id     BIGINT       NOT NULL,
+    vulnerability_id VARCHAR(64)  NOT NULL,
+    expires_at       TIMESTAMP(6) NOT NULL,
+    reason           VARCHAR(1000) NOT NULL,
+    status           VARCHAR(16)  NOT NULL,
+    reviewer1        VARCHAR(128) NOT NULL,
+    reviewer2        VARCHAR(128),
+    created_at       TIMESTAMP(6) NOT NULL,
+    confirmed_at     TIMESTAMP(6),
+    revoked_by       VARCHAR(128),
+    revoked_at       TIMESTAMP(6),
+    request_id       VARCHAR(64)  NOT NULL,
+    CONSTRAINT fk_exception_lock FOREIGN KEY (lock_file_id) REFERENCES lock_file (id)
+        ON DELETE CASCADE
+);
+COMMENT ON TABLE vulnerability_exception IS '漏洞豁免：精确锁定图版本+漏洞编号，需两名不同审核人确认';
+COMMENT ON COLUMN vulnerability_exception.exception_key IS '指纹：锁定图版本、漏洞、审核人、到期、理由的 SHA-256';
+COMMENT ON COLUMN vulnerability_exception.lock_file_id IS '豁免作用域锁定图 ID，不得跨锁定图复用';
+COMMENT ON COLUMN vulnerability_exception.vulnerability_id IS '豁免作用域漏洞编号，不得仅按漏洞编号跨图复用';
+COMMENT ON COLUMN vulnerability_exception.expires_at IS '豁免 UTC 到期时刻，必须晚于确认时刻';
+COMMENT ON COLUMN vulnerability_exception.reason IS '豁免理由';
+COMMENT ON COLUMN vulnerability_exception.status IS '状态：PENDING=单人/CONFIRMED=双人不可变/REVOKED=已撤销';
+COMMENT ON COLUMN vulnerability_exception.reviewer1 IS '第一审核人';
+COMMENT ON COLUMN vulnerability_exception.reviewer2 IS '第二审核人，必须与第一审核人不同';
+COMMENT ON COLUMN vulnerability_exception.created_at IS '第一名审核人创建时间，UTC 时间戳';
+COMMENT ON COLUMN vulnerability_exception.confirmed_at IS '第二名审核人确认完成时间，UTC 时间戳；PENDING 时为空';
+COMMENT ON COLUMN vulnerability_exception.revoked_by IS '撤销操作人；未撤销为空';
+COMMENT ON COLUMN vulnerability_exception.revoked_at IS '撤销时间，UTC 时间戳；未撤销为空';
+COMMENT ON COLUMN vulnerability_exception.request_id IS '触发首次创建的请求 ID（同键重放首次结果）';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_exception_key ON vulnerability_exception (exception_key);
+CREATE INDEX IF NOT EXISTS idx_exception_scope
+    ON vulnerability_exception (lock_file_id, vulnerability_id);
+
+CREATE TABLE IF NOT EXISTS publish_snapshot (
+    id                 BIGINT AUTO_INCREMENT PRIMARY KEY,
+    lock_file_id       BIGINT       NOT NULL,
+    root_name          VARCHAR(128) NOT NULL,
+    root_version       INT          NOT NULL,
+    repository_version BIGINT       NOT NULL,
+    request_id         VARCHAR(64)  NOT NULL,
+    published_at       TIMESTAMP(6) NOT NULL,
+    CONSTRAINT fk_publish_lock FOREIGN KEY (lock_file_id) REFERENCES lock_file (id)
+        ON DELETE CASCADE
+);
+COMMENT ON TABLE publish_snapshot IS '锁定图通过门禁后的不可变发布快照';
+COMMENT ON COLUMN publish_snapshot.lock_file_id IS '发布的锁定图版本 ID';
+COMMENT ON COLUMN publish_snapshot.repository_version IS '发布时锁定图记录的仓库版本（重解析后旧图不推进）';
+COMMENT ON COLUMN publish_snapshot.request_id IS '触发发布的全局唯一请求 ID，成功后幂等重放';
+COMMENT ON COLUMN publish_snapshot.published_at IS '发布时间，UTC 时间戳';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_publish_request ON publish_snapshot (request_id);
+CREATE INDEX IF NOT EXISTS idx_publish_lock ON publish_snapshot (lock_file_id);
+
+CREATE TABLE IF NOT EXISTS publish_snapshot_entry (
+    id           BIGINT AUTO_INCREMENT PRIMARY KEY,
+    publish_id   BIGINT       NOT NULL,
+    name         VARCHAR(128) NOT NULL,
+    version      INT          NOT NULL,
+    CONSTRAINT fk_pentry_publish FOREIGN KEY (publish_id) REFERENCES publish_snapshot (id)
+        ON DELETE CASCADE
+);
+COMMENT ON TABLE publish_snapshot_entry IS '发布快照中的精确制品版本副本，撤销/到期不改写';
+COMMENT ON COLUMN publish_snapshot_entry.publish_id IS '所属发布快照 ID';
+COMMENT ON COLUMN publish_snapshot_entry.name IS '被发布制品名称';
+COMMENT ON COLUMN publish_snapshot_entry.version IS '被发布的精确版本号，正整数';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_pentry_publish_name
+    ON publish_snapshot_entry (publish_id, name);

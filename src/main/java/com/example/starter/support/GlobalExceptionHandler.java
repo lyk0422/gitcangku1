@@ -1,6 +1,7 @@
 package com.example.starter.support;
 
 import com.example.starter.api.dto.ApiError;
+import com.example.starter.api.dto.GateBlockedResponse;
 import jakarta.validation.ConstraintViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -14,6 +15,13 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
  */
 @RestControllerAdvice
 public class GlobalExceptionHandler {
+
+    @ExceptionHandler(GateBlockedException.class)
+    public org.springframework.http.ResponseEntity<GateBlockedResponse> handleGateBlocked(
+            GateBlockedException ex) {
+        return org.springframework.http.ResponseEntity.status(ex.getStatus())
+                .body(new GateBlockedResponse(ex.getCode(), ex.getMessage(), ex.getBlocked()));
+    }
 
     @ExceptionHandler(ApiException.class)
     public org.springframework.http.ResponseEntity<ApiError> handleApi(ApiException ex) {

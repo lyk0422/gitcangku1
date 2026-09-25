@@ -41,6 +41,10 @@ class ArtifactServiceH2Test {
 
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM publish_snapshot_entry");
+        jdbcTemplate.update("DELETE FROM publish_snapshot");
+        jdbcTemplate.update("DELETE FROM vulnerability_exception");
+        jdbcTemplate.update("DELETE FROM vulnerability_advisory");
         jdbcTemplate.update("DELETE FROM lock_file_entry");
         jdbcTemplate.update("DELETE FROM lock_file");
         jdbcTemplate.update("DELETE FROM artifact_dependency");
