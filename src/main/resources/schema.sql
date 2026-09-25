@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS rail_day_plan (
     schedule_key VARCHAR(64) NOT NULL COMMENT '计划业务键，全局唯一，取消后仍保留历史',
     op_date DATE NOT NULL COMMENT '运营日期（Asia/Shanghai 日历日）',
     version INT NOT NULL COMMENT '计划版本，草稿占用整体替换成功一次加一',
-    status VARCHAR(16) NOT NULL COMMENT '计划状态：DRAFT 草稿 / PUBLISHED 已发布 / CANCELLED 已取消',
+    status VARCHAR(16) NOT NULL COMMENT '计划状态：DRAFT 草稿 / PUBLISHED 已发布 / CANCELLED 已取消 / PREEMPTED 被抢占（终态）',
     created_at BIGINT NOT NULL COMMENT '创建时刻，UTC 毫秒',
     updated_at BIGINT NOT NULL COMMENT '最近变更时刻，UTC 毫秒',
     PRIMARY KEY (id),
@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS rail_plan_occupancy (
 
 CREATE TABLE IF NOT EXISTS idempotency_record (
     id BIGINT NOT NULL AUTO_INCREMENT COMMENT '主键',
-    op_type VARCHAR(16) NOT NULL COMMENT '操作类型：CREATE / UPDATE / PUBLISH / CANCEL',
+    op_type VARCHAR(16) NOT NULL COMMENT '操作类型：CREATE / UPDATE / PUBLISH / CANCEL / SECTION',
     request_key VARCHAR(128) NOT NULL COMMENT '客户端幂等键，同一操作类型内唯一',
     request_hash CHAR(64) NOT NULL COMMENT '请求参数规范化后的 SHA-256，同键不同参判定 409',
     response_json MEDIUMTEXT NOT NULL COMMENT '首次成功响应快照（JSON），重放原样返回',
@@ -43,3 +43,37 @@ CREATE TABLE IF NOT EXISTS publish_lock (
 ) COMMENT='发布全局互斥锁，保证并发发布同一区段最多一张成功';
 
 INSERT IGNORE INTO publish_lock (id) VALUES (1);
+
+CREATE TABLE IF NOT EXISTS rail_section (
+    id BIGINT NOT NULL AUTO_INCREMENT COMMENT '主键',
+    section_id VARCHAR(64) NOT NULL COMMENT '区段 ID，全局唯一，登记后不可变更等级',
+    priority INT NOT NULL COMMENT '走廊等级 1～5，数值越大越高；未登记区段按 1 级处理',
+    created_at BIGINT NOT NULL COMMENT '登记时刻，UTC 毫秒',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_rail_section_section_id (section_id)
+) COMMENT='走廊区段等级登记，计划等级取其全部占用区段的最高等级';
+
+CREATE TABLE IF NOT EXISTS rail_preemption (
+    id BIGINT NOT NULL AUTO_INCREMENT COMMENT '主键',
+    preempting_plan_id BIGINT NOT NULL COMMENT '抢占方计划 id，关联 rail_day_plan.id',
+    preempting_schedule_key VARCHAR(64) NOT NULL COMMENT '抢占方计划业务键（快照）',
+    preempted_plan_id BIGINT NOT NULL COMMENT '被抢占计划 id，关联 rail_day_plan.id',
+    preempted_schedule_key VARCHAR(64) NOT NULL COMMENT '被抢占计划业务键（快照）',
+    preempting_level INT NOT NULL COMMENT '抢占方计划等级（其全部占用区段最高等级，抢占时快照）',
+    preempted_level INT NOT NULL COMMENT '被抢占方计划等级（抢占时快照）',
+    created_at BIGINT NOT NULL COMMENT '抢占发生时刻，UTC 毫秒',
+    PRIMARY KEY (id),
+    KEY idx_rail_preemption_preempting (preempting_schedule_key),
+    KEY idx_rail_preemption_preempted (preempted_schedule_key)
+) COMMENT='抢占记录，不可变；与被抢占计划降级、抢占草稿发布在同一事务提交';
+
+CREATE TABLE IF NOT EXISTS rail_preemption_slot (
+    id BIGINT NOT NULL AUTO_INCREMENT COMMENT '主键',
+    preemption_id BIGINT NOT NULL COMMENT '所属抢占记录 id，关联 rail_preemption.id',
+    section_id VARCHAR(64) NOT NULL COMMENT '涉及区段 ID',
+    section_level INT NOT NULL COMMENT '该区段登记等级（抢占时快照）',
+    start_utc BIGINT NOT NULL COMMENT '被抢占时隙开始（含），UTC 毫秒',
+    end_utc BIGINT NOT NULL COMMENT '被抢占时隙结束（不含），UTC 毫秒',
+    PRIMARY KEY (id),
+    KEY idx_rail_preemption_slot_section (section_id, start_utc, end_utc)
+) COMMENT='抢占涉及时隙，用于同一时隙只能被抢占一次的判定';
