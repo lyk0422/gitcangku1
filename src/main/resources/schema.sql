@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS batch (
     product_code VARCHAR(64) NOT NULL COMMENT '产品编码，创建后不可修改',
     batch_no VARCHAR(64) NOT NULL COMMENT '批号，创建后不可修改',
     produced_at VARCHAR(40) NOT NULL COMMENT '生产时间，ISO-8601 UTC  instant 字符串',
-    status VARCHAR(32) NOT NULL COMMENT '批次状态：QUARANTINED/PENDING_RELEASE/RELEASE_REVIEW/RELEASED/REJECTED/RECALLED/SPLIT',
+    status VARCHAR(32) NOT NULL COMMENT '批次状态：QUARANTINED/PENDING_RELEASE/RELEASE_REVIEW/RELEASED/REJECTED/RECALLED/SPLIT/ALLERGEN_RISK/MERGED',
     created_at VARCHAR(40) NOT NULL COMMENT '创建时间，ISO-8601 UTC instant 字符串',
     CONSTRAINT uk_batch_key UNIQUE (batch_key)
 );
@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS test_result (
     test_item VARCHAR(128) NOT NULL COMMENT '检验项名称，必须属于该批次必做检验项',
     outcome VARCHAR(8) NOT NULL COMMENT '检验结论：PASS/FAIL；任一 FAIL 立即使批次 REJECTED',
     inspector VARCHAR(64) NOT NULL COMMENT '检验人标识；检验人不得担任该批次批准人',
+    composition_version INT NOT NULL COMMENT '提交时批次当前成分版本号；成分修订后需对新版本重新检验',
     created_at VARCHAR(40) NOT NULL COMMENT '提交时间，ISO-8601 UTC instant 字符串',
     CONSTRAINT uk_test_key UNIQUE (batch_key, test_key)
 );
@@ -48,7 +49,7 @@ CREATE TABLE IF NOT EXISTS recall (
 );
 
 CREATE TABLE IF NOT EXISTS command_log (
-    command_type VARCHAR(32) NOT NULL COMMENT '命令类型：CREATE_BATCH/SUBMIT_TEST/APPROVE/RECALL/SPLIT',
+    command_type VARCHAR(32) NOT NULL COMMENT '命令类型：CREATE_BATCH/SUBMIT_TEST/APPROVE/RECALL/SPLIT/ALLERGEN_REVISE/MERGE_BATCH',
     command_key VARCHAR(64) NOT NULL COMMENT '命令幂等键；同类型同键同参重放返回首次结果，同键改参返回 409',
     fingerprint VARCHAR(64) NOT NULL COMMENT '业务参数（不含 commandKey）的 SHA-256 摘要，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行成功的 HTTP 状态码',
@@ -65,4 +66,81 @@ CREATE TABLE IF NOT EXISTS batch_lineage (
     seq INT NOT NULL COMMENT '子批在拆分请求中的顺序，从 1 开始',
     created_at VARCHAR(40) NOT NULL COMMENT '拆分时间，ISO-8601 UTC instant 字符串',
     CONSTRAINT uk_lineage_child UNIQUE (child_key)
+);
+
+-- 已知过敏原代码字典（合成数据）；修订成分时未知代码返回 422。
+CREATE TABLE IF NOT EXISTS allergen_code (
+    code VARCHAR(32) PRIMARY KEY COMMENT '过敏原代码，大写，全局唯一',
+    description VARCHAR(128) NOT NULL COMMENT '过敏原中文说明'
+);
+
+MERGE INTO allergen_code (code, description) KEY(code) VALUES
+    ('MILK', '乳及乳制品'),
+    ('EGG', '蛋及蛋制品'),
+    ('PEANUT', '花生及其制品'),
+    ('SOY', '大豆及其制品'),
+    ('WHEAT', '含麸质谷物-小麦'),
+    ('GLUTEN', '麸质'),
+    ('FISH', '鱼类及其制品'),
+    ('SHELLFISH', '甲壳类及其制品'),
+    ('TREE_NUT', '坚果及其制品'),
+    ('SESAME', '芝麻及其制品');
+
+-- 目标容器：合批落点；不同隔离级别批次仅在容器声明兼容矩阵时可合并。
+CREATE TABLE IF NOT EXISTS container (
+    container_key VARCHAR(64) PRIMARY KEY COMMENT '目标容器业务键，全局唯一',
+    description VARCHAR(128) NOT NULL COMMENT '容器说明'
+);
+
+-- 容器兼容矩阵：允许共线合批的不同隔离级别无序对，按级别序号小者存 level_a。
+CREATE TABLE IF NOT EXISTS container_compatibility (
+    container_key VARCHAR(64) NOT NULL COMMENT '所属容器业务键',
+    level_a VARCHAR(16) NOT NULL COMMENT '兼容级别对中序号较小的隔离级别：NONE/SEGREGATED/ISOLATED',
+    level_b VARCHAR(16) NOT NULL COMMENT '兼容级别对中序号较大的隔离级别：NONE/SEGREGATED/ISOLATED',
+    CONSTRAINT pk_container_compat PRIMARY KEY (container_key, level_a, level_b)
+);
+
+MERGE INTO container (container_key, description) KEY(container_key) VALUES
+    ('CONT-OPEN', '全兼容容器：允许任意不同隔离级别合批'),
+    ('CONT-SEG-ISO', '部分兼容容器：仅允许 SEGREGATED 与 ISOLATED 合批'),
+    ('CONT-STRICT', '严格容器：未声明兼容矩阵，仅允许同隔离级别合批');
+
+MERGE INTO container_compatibility (container_key, level_a, level_b) KEY(container_key, level_a, level_b) VALUES
+    ('CONT-OPEN', 'NONE', 'SEGREGATED'),
+    ('CONT-OPEN', 'NONE', 'ISOLATED'),
+    ('CONT-OPEN', 'SEGREGATED', 'ISOLATED'),
+    ('CONT-SEG-ISO', 'SEGREGATED', 'ISOLATED');
+
+-- 成分版本：每次过敏原集合/隔离级别变更追加一行，不可改写；版本号批次内从 1 递增。
+CREATE TABLE IF NOT EXISTS composition_version (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    batch_key VARCHAR(64) NOT NULL COMMENT '所属批次业务键',
+    version INT NOT NULL COMMENT '成分版本号，批次内从 1 递增；修订须携带 expectedVersion 乐观校验',
+    allergen_codes VARCHAR(512) NOT NULL COMMENT '规范化（去空白、大写、去重、排序）后逗号分隔的过敏原代码；空串表示无过敏原',
+    segregation_level VARCHAR(16) NOT NULL COMMENT '隔离级别：NONE/SEGREGATED/ISOLATED，序号递增表示隔离要求提高',
+    created_at VARCHAR(40) NOT NULL COMMENT '版本创建时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_composition_version UNIQUE (batch_key, version)
+);
+
+-- 合批血缘：多来源批次合并为同一目标批次的不可改写关系；与拆分血缘共同构成最终血缘集合。
+CREATE TABLE IF NOT EXISTS merge_lineage (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    target_key VARCHAR(64) NOT NULL COMMENT '合批目标批次业务键（新批次）',
+    source_key VARCHAR(64) NOT NULL COMMENT '合批来源批次业务键，合批后置为 MERGED 退出可用库存',
+    container_key VARCHAR(64) NOT NULL COMMENT '合批目标容器业务键',
+    seq INT NOT NULL COMMENT '来源在合批请求中的顺序，从 1 开始',
+    created_at VARCHAR(40) NOT NULL COMMENT '合批时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_merge_source UNIQUE (target_key, source_key)
+);
+
+-- 过敏原风险：已放行批次修订引入新增过敏原时进入 ALLERGEN_RISK，保留原放行快照；
+-- 仅重新检验（当前成分版本全部必做项 PASS）加双角色放行可解除。
+CREATE TABLE IF NOT EXISTS allergen_risk (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    batch_key VARCHAR(64) NOT NULL COMMENT '所属批次业务键，同一批次至多一条未解除风险',
+    entered_at VARCHAR(40) NOT NULL COMMENT '进入风险时间，ISO-8601 UTC instant 字符串',
+    approval_marker BIGINT NOT NULL COMMENT '进入风险时该批次最大批准记录 id；大于该 id 的批准才算风险后的重新放行批准',
+    snapshot_json TEXT NOT NULL COMMENT '进入风险前的原放行快照 JSON（状态与全部批准记录），解除后仍保留',
+    cleared_at VARCHAR(40) NULL COMMENT '风险解除时间，ISO-8601 UTC instant 字符串；NULL 表示风险未解除',
+    CONSTRAINT uk_allergen_risk_batch UNIQUE (batch_key)
 );

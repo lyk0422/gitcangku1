@@ -3,9 +3,16 @@ package com.example.starter.batch;
 import com.example.starter.batch.dto.ApproveRequest;
 import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
+import com.example.starter.batch.dto.CompositionVersionResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
 import com.example.starter.batch.dto.LineageEntryResponse;
+import com.example.starter.batch.dto.LineageSnapshotResponse;
+import com.example.starter.batch.dto.MergeDiagnoseRequest;
+import com.example.starter.batch.dto.MergeDiagnoseResponse;
+import com.example.starter.batch.dto.MergeRequest;
 import com.example.starter.batch.dto.RecallRequest;
+import com.example.starter.batch.dto.ReviseCompositionRequest;
+import com.example.starter.batch.dto.RiskResponse;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
 import jakarta.validation.Valid;
@@ -15,6 +22,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -112,6 +120,57 @@ public class BatchController {
     @GetMapping("/{batchKey}/descendants")
     public List<LineageEntryResponse> descendants(@PathVariable String batchKey) {
         return service.listDescendants(batchKey);
+    }
+
+    /**
+     * 成分修订：维护过敏原代码集合与隔离级别，追加不可变成分版本；
+     * expectedVersion 乐观校验，未知代码或空级别 422，allergenKey 幂等。
+     */
+    @PutMapping("/{batchKey}/composition")
+    public ResponseEntity<String> reviseComposition(@PathVariable String batchKey,
+                                                    @Valid @RequestBody ReviseCompositionRequest request) {
+        return stored(service.reviseComposition(batchKey, request));
+    }
+
+    /**
+     * 合批：多个 RELEASED 来源批次在目标容器内合并为全新目标批次；
+     * 先校验全部来源与兼容矩阵，任一不兼容整次失败并回滚全部血缘与库存。
+     */
+    @PostMapping("/merge")
+    public ResponseEntity<String> merge(@Valid @RequestBody MergeRequest request) {
+        return stored(service.merge(request));
+    }
+
+    /**
+     * 合批兼容诊断：只校验不执行，返回各来源状态与缺失兼容级别对。
+     */
+    @PostMapping("/merge/diagnose")
+    public MergeDiagnoseResponse diagnoseMerge(@Valid @RequestBody MergeDiagnoseRequest request) {
+        return service.diagnoseMerge(request);
+    }
+
+    /**
+     * 成分版本查询：批次全部不可变成分版本及各自检验状态。
+     */
+    @GetMapping("/{batchKey}/compositions")
+    public List<CompositionVersionResponse> compositions(@PathVariable String batchKey) {
+        return service.listCompositions(batchKey);
+    }
+
+    /**
+     * 风险查询：过敏原风险状态与原放行快照。
+     */
+    @GetMapping("/{batchKey}/risk")
+    public RiskResponse risk(@PathVariable String batchKey) {
+        return service.risk(batchKey);
+    }
+
+    /**
+     * 血缘快照：当前成分版本、跨拆分与合批的传递祖先集合、直接合批来源。
+     */
+    @GetMapping("/{batchKey}/lineage")
+    public LineageSnapshotResponse lineageSnapshot(@PathVariable String batchKey) {
+        return service.lineageSnapshot(batchKey);
     }
 
     private ResponseEntity<String> stored(StoredResponse response) {
