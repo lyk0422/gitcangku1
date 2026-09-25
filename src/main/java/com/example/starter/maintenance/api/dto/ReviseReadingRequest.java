@@ -6,13 +6,16 @@ import jakarta.validation.constraints.PositiveOrZero;
 
 /**
  * 修订读数请求：只改变累计分钟，不改采样时刻；作为历史保养锚点的读数不可修订（409）。
+ * 修订沿既有修订链创建新版本并回到 PENDING，须重新认证后才参与累计工时与保养判定。
  *
  * @param requestId          全局唯一请求标识（幂等键）
  * @param expectedVersion    设备期望版本号，与当前版本不一致时返回 409
  * @param cumulativeMinutes  修订后的累计工时（分钟），非负整数，须同时符合前后相邻读数值
+ * @param recordedBy         本次修订的录入人标识；认证人必须不同于录入人
  */
 public record ReviseReadingRequest(
         @NotBlank String requestId,
         @NotNull Long expectedVersion,
-        @NotNull @PositiveOrZero Long cumulativeMinutes) {
+        @NotNull @PositiveOrZero Long cumulativeMinutes,
+        @NotBlank String recordedBy) {
 }

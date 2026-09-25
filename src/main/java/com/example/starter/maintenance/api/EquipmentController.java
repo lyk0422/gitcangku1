@@ -14,11 +14,13 @@ import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
+import com.example.starter.maintenance.api.dto.CertificationSnapshotView;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
 import com.example.starter.maintenance.api.dto.RegisterEquipmentRequest;
+import com.example.starter.maintenance.api.dto.RetireEquipmentRequest;
 import com.example.starter.maintenance.api.dto.ReviseReadingRequest;
 import com.example.starter.maintenance.api.dto.RevisionView;
 import com.example.starter.maintenance.api.dto.StatusResponse;
@@ -42,6 +44,14 @@ public class EquipmentController {
     @ResponseStatus(HttpStatus.CREATED)
     public EquipmentResponse register(@Valid @RequestBody RegisterEquipmentRequest req) {
         return service.register(req);
+    }
+
+    /** 设备退役：退役后该设备的读数不可再认证（422）。 */
+    @PostMapping("/{equipmentId}/retirement")
+    @ResponseStatus(HttpStatus.CREATED)
+    public EquipmentResponse retire(@PathVariable String equipmentId,
+                                    @Valid @RequestBody RetireEquipmentRequest req) {
+        return service.retire(equipmentId, req);
     }
 
     /** 新增工时读数（允许补录历史）；按采样时刻排序后累计分钟须单调不减，否则 422。 */
@@ -92,5 +102,18 @@ public class EquipmentController {
     @GetMapping("/{equipmentId}/maintenances")
     public List<MaintenanceResponse> listMaintenances(@PathVariable String equipmentId) {
         return service.listMaintenances(equipmentId);
+    }
+
+    /** 指定读数最近一次认证快照（不可变）。 */
+    @GetMapping("/{equipmentId}/readings/{readingId}/certification")
+    public CertificationSnapshotView getCertification(@PathVariable String equipmentId,
+                                                      @PathVariable String readingId) {
+        return service.getCertification(equipmentId, readingId);
+    }
+
+    /** 设备全部认证快照（按认证顺序升序）。 */
+    @GetMapping("/{equipmentId}/certifications")
+    public List<CertificationSnapshotView> listCertifications(@PathVariable String equipmentId) {
+        return service.listCertifications(equipmentId);
     }
 }
