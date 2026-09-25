@@ -1,5 +1,5 @@
--- 测试用 H2（MySQL 兼容模式）表结构，内容与 src/main/resources/schema-h2.sql 保持一致。
--- 列含义见 src/main/resources/schema.sql 中的中文 COMMENT：
+-- H2（MySQL 兼容模式）表结构，与 src/main/resources/schema.sql 字段一一对应。
+-- 本地运行与测试共用；列含义见 schema.sql 中的中文 COMMENT：
 -- *_ms 为 UTC 纪元毫秒，business_day 为 Asia/Shanghai 日历日，分级取值为 G / PG / MATURE。
 
 CREATE TABLE IF NOT EXISTS playout_asset (

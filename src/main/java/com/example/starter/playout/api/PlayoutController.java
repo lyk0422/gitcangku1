@@ -2,17 +2,23 @@ package com.example.starter.playout.api;
 
 import com.example.starter.playout.PlayoutService;
 import com.example.starter.playout.api.Dtos.AssetResponse;
+import com.example.starter.playout.api.Dtos.BreakinRequest;
+import com.example.starter.playout.api.Dtos.BreakinResponse;
 import com.example.starter.playout.api.Dtos.ChannelResponse;
 import com.example.starter.playout.api.Dtos.CreateAssetRequest;
 import com.example.starter.playout.api.Dtos.CreateChannelRequest;
 import com.example.starter.playout.api.Dtos.CreateGrantRequest;
+import com.example.starter.playout.api.Dtos.CreateRatingWindowRequest;
 import com.example.starter.playout.api.Dtos.DraftResponse;
 import com.example.starter.playout.api.Dtos.GrantResponse;
 import com.example.starter.playout.api.Dtos.PlayoutDecisionResponse;
 import com.example.starter.playout.api.Dtos.PublishRequest;
 import com.example.starter.playout.api.Dtos.PublishResponse;
+import com.example.starter.playout.api.Dtos.RatingCheckResponse;
+import com.example.starter.playout.api.Dtos.RatingWindowResponse;
 import com.example.starter.playout.api.Dtos.ReplaceDraftRequest;
 import com.example.starter.playout.api.Dtos.RevokeGrantRequest;
+import com.example.starter.playout.api.Dtos.UpdateRatingWindowRequest;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import org.springframework.format.annotation.DateTimeFormat;
@@ -29,6 +35,7 @@ import org.springframework.web.bind.annotation.RestController;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeParseException;
+import java.util.List;
 
 /**
  * 播出编排 REST API。成功响应统一 200；错误区分 400 参数错误、404 资源不存在、
@@ -93,6 +100,42 @@ public class PlayoutController {
                                            @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME)
                                            OffsetDateTime at) {
         return service.playoutDecision(channelId, at);
+    }
+
+    /** 创建频道管控时段（幂等）。 */
+    @PostMapping("/channels/{channelId}/rating-windows")
+    public RatingWindowResponse createRatingWindow(@PathVariable @NotBlank String channelId,
+                                                   @Valid @RequestBody CreateRatingWindowRequest request) {
+        return service.createRatingWindow(channelId, request);
+    }
+
+    /** 修改频道管控时段（幂等）。 */
+    @PutMapping("/channels/{channelId}/rating-windows/{windowId}")
+    public RatingWindowResponse updateRatingWindow(@PathVariable @NotBlank String channelId,
+                                                   @PathVariable long windowId,
+                                                   @Valid @RequestBody UpdateRatingWindowRequest request) {
+        return service.updateRatingWindow(channelId, windowId, request);
+    }
+
+    /** 查询频道某运营日的管控时段配置。 */
+    @GetMapping("/channels/{channelId}/rating-windows")
+    public List<RatingWindowResponse> listRatingWindows(@PathVariable @NotBlank String channelId,
+                                                        @RequestParam String businessDay) {
+        return service.listRatingWindows(channelId, parseBusinessDay(businessDay));
+    }
+
+    /** 查询频道某业务日的发布分级校验记录（含被拦截记录）。 */
+    @GetMapping("/channels/{channelId}/rating-checks")
+    public List<RatingCheckResponse> listRatingChecks(@PathVariable @NotBlank String channelId,
+                                                      @RequestParam String businessDay) {
+        return service.listRatingChecks(channelId, parseBusinessDay(businessDay));
+    }
+
+    /** 创建紧急插播（幂等）；插播时刻命中管控时段时校验素材分级。 */
+    @PostMapping("/channels/{channelId}/breakins")
+    public BreakinResponse createBreakin(@PathVariable @NotBlank String channelId,
+                                         @Valid @RequestBody BreakinRequest request) {
+        return service.createBreakin(channelId, request);
     }
 
     private static LocalDate parseBusinessDay(String businessDay) {

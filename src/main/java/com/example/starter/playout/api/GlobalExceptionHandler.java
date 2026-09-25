@@ -24,7 +24,7 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(ApiException.class)
     public ResponseEntity<ErrorResponse> handleApi(ApiException ex) {
         return ResponseEntity.status(ex.status())
-                .body(new ErrorResponse(ex.code(), ex.getMessage()));
+                .body(new ErrorResponse(ex.code(), ex.getMessage(), ex.violations()));
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
@@ -32,7 +32,8 @@ public class GlobalExceptionHandler {
         String message = ex.getBindingResult().getFieldErrors().stream()
                 .map(this::describe)
                 .collect(Collectors.joining("; "));
-        return ResponseEntity.badRequest().body(new ErrorResponse("VALIDATION_FAILED", message));
+        return ResponseEntity.badRequest()
+                .body(new ErrorResponse("VALIDATION_FAILED", message, null));
     }
 
     @ExceptionHandler({
@@ -42,13 +43,13 @@ public class GlobalExceptionHandler {
     })
     public ResponseEntity<ErrorResponse> handleBadRequest(Exception ex) {
         return ResponseEntity.badRequest()
-                .body(new ErrorResponse("BAD_REQUEST", "请求格式不合法: " + ex.getMessage()));
+                .body(new ErrorResponse("BAD_REQUEST", "请求格式不合法: " + ex.getMessage(), null));
     }
 
     @ExceptionHandler(NoResourceFoundException.class)
     public ResponseEntity<ErrorResponse> handleNoResource(NoResourceFoundException ex) {
         return ResponseEntity.status(HttpStatus.NOT_FOUND)
-                .body(new ErrorResponse("NOT_FOUND", "资源不存在"));
+                .body(new ErrorResponse("NOT_FOUND", "资源不存在", null));
     }
 
     private String describe(FieldError error) {
