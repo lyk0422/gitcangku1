@@ -31,6 +31,8 @@ class ReleaseApiTest {
 
     @BeforeEach
     void clean() {
+        jdbc.update("DELETE FROM review_request");
+        jdbc.update("DELETE FROM measurement_review");
         jdbc.update("DELETE FROM release_record");
         jdbc.update("DELETE FROM measurement");
         jdbc.update("DELETE FROM calibration_certificate");
@@ -58,11 +60,25 @@ class ReleaseApiTest {
                 .andExpect(status().isCreated());
     }
 
+    /** 为新提交（版本 1）的测量补充一条有效 PASS 复核，满足放行门禁。 */
+    private void passReview(String key, String reviewer) throws Exception {
+        mvc.perform(post("/api/measurements/{key}/reviews", key)
+                        .header("X-Actor-Id", reviewer)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"reviewKey":"RV-%s","requestId":"REQ-%s","revision":1,
+                                 "conclusion":"PASS","comment":"复核通过"}
+                                """.formatted(key, key)))
+                .andExpect(status().isCreated());
+    }
+
     @Test
     void validBatchReleasedAtomically() throws Exception {
         createCert("INS-1", "1", "0");
         submit("R-1", "INS-1", "1", "0", "9", "alice");
         submit("R-2", "INS-1", "2", "0", "9", "bob");
+        passReview("R-1", "dave");
+        passReview("R-2", "dave");
 
         mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders
                         .post("/api/measurements/release")
@@ -95,6 +111,9 @@ class ReleaseApiTest {
         submit("R-OK", "INS-1", "1", "0", "9", "alice");        // 合格但提交人=放行人
         submit("R-FAIL", "INS-1", "100", "0", "9", "bob");      // 不合格
         submit("R-GOOD", "INS-1", "2", "0", "9", "bob");        // 合法可放行
+        passReview("R-OK", "dave");
+        passReview("R-FAIL", "dave");
+        passReview("R-GOOD", "dave");
 
         // 放行人 alice：R-OK 触发 SAME_ACTOR；R-FAIL 触发 NOT_PASSED → 整批 409
         mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders
@@ -120,6 +139,7 @@ class ReleaseApiTest {
     void missingMeasurementAndMultipleReasonsReported() throws Exception {
         createCert("INS-1", "1", "0");
         submit("R-FAIL", "INS-1", "100", "0", "9", "alice"); // 不合格且提交人=放行人
+        passReview("R-FAIL", "dave");
         mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders
                         .post("/api/measurements/release")
                         .header("X-Actor-Id", "alice")
@@ -136,6 +156,7 @@ class ReleaseApiTest {
     void repeatReleaseReturns409AlreadyReleased() throws Exception {
         createCert("INS-1", "1", "0");
         submit("R-1", "INS-1", "1", "0", "9", "alice");
+        passReview("R-1", "dave");
 
         mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders
                         .post("/api/measurements/release")
@@ -156,6 +177,7 @@ class ReleaseApiTest {
     void revokingCertificateDropsUsabilityButKeepsHistory() throws Exception {
         long certId = createCert("INS-1", "1", "0");
         submit("R-1", "INS-1", "1", "0", "9", "alice");
+        passReview("R-1", "dave");
         mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders
                         .post("/api/measurements/release")
                         .header("X-Actor-Id", "carol")
@@ -180,6 +202,7 @@ class ReleaseApiTest {
     void releasingUnderRevokedCertificateRejectedWith409() throws Exception {
         long certId = createCert("INS-1", "1", "0");
         submit("R-1", "INS-1", "1", "0", "9", "alice");
+        passReview("R-1", "dave");
         mvc.perform(post("/api/certificates/{id}/revoke", certId)).andExpect(status().isOk());
 
         mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders

@@ -20,9 +20,11 @@ import com.example.starter.calibration.model.MeasurementStatus;
 import com.example.starter.calibration.repo.CertificateRepository;
 import com.example.starter.calibration.repo.MeasurementRepository;
 import com.example.starter.calibration.repo.ReleaseRepository;
+import com.example.starter.calibration.repo.ReviewRepository;
 
 /**
- * 批量放行服务：每批 1～50 条，整批原子生效；任一项不满足条件则整批拒绝（409）并返回各项原因。
+ * 批量放行服务：每批 1～50 条，整批原子生效；任一项不满足条件则整批拒绝并返回各项原因。
+ * 放行门禁 = 既有判定条件 + 当前修订版本的有效 PASS 复核；缺复核门禁失败整批 422，其余失败整批 409。
  */
 @Service
 public class ReleaseService {
@@ -33,17 +35,21 @@ public class ReleaseService {
     private final MeasurementRepository measurements;
     private final CertificateRepository certificates;
     private final ReleaseRepository releases;
+    private final ReviewRepository reviews;
 
     public ReleaseService(MeasurementRepository measurements,
                           CertificateRepository certificates,
-                          ReleaseRepository releases) {
+                          ReleaseRepository releases,
+                          ReviewRepository reviews) {
         this.measurements = measurements;
         this.certificates = certificates;
         this.releases = releases;
+        this.reviews = reviews;
     }
 
     /**
-     * 原子批量放行。每条结果必须：处于待放行、判定合格、证书仍有效、放行人不同于提交人。
+     * 原子批量放行。每条结果必须：处于待放行、判定合格、证书仍有效、放行人不同于提交人，
+     * 且当前修订版本存在有效 PASS 复核。
      * 行锁按测量键字典序获取，避免并发批次间死锁；证书行锁使撤销与放行按事务提交顺序生效。
      */
     @Transactional
@@ -85,6 +91,8 @@ public class ReleaseService {
             if (measurement.submittedBy().equals(releaser)) {
                 reasons.add("SAME_ACTOR");
             }
+            reasons.addAll(ReviewService.ReleaseGate.evaluateReviewOnly(
+                    measurement, reviews.findByMeasurementId(measurement.id())));
             if (reasons.isEmpty()) {
                 approved.add(measurement);
             } else {
@@ -93,6 +101,14 @@ public class ReleaseService {
         }
 
         if (!failures.isEmpty()) {
+            boolean reviewGateFailed = failures.stream()
+                    .flatMap(f -> f.reasons().stream())
+                    .anyMatch(ReviewService.ReleaseGate::isReviewReason);
+            if (reviewGateFailed) {
+                throw new BatchRejectedException(failures,
+                        org.springframework.http.HttpStatus.UNPROCESSABLE_ENTITY,
+                        "批量放行被拒绝：存在缺少或无效复核的测量");
+            }
             throw new BatchRejectedException(failures);
         }
 

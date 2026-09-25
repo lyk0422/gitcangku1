@@ -43,6 +43,8 @@ class ConcurrencyApiTest {
 
     @BeforeEach
     void clean() {
+        jdbc.update("DELETE FROM review_request");
+        jdbc.update("DELETE FROM measurement_review");
         jdbc.update("DELETE FROM release_record");
         jdbc.update("DELETE FROM measurement");
         jdbc.update("DELETE FROM calibration_certificate");
@@ -102,6 +104,14 @@ class ConcurrencyApiTest {
                             {"measurementKey":"M-%d","instrumentId":"INS-R%d",
                              "measuredAt":"2026-06-01T00:00:00Z","reading":"1",
                              "lowerLimit":"0","upperLimit":"9","submittedBy":"alice"}""".formatted(r, r)))
+                    .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isCreated());
+            // 放行门禁：先补充当前版本的有效 PASS 复核
+            mvc.perform(post("/api/measurements/{key}/reviews", "M-" + r)
+                    .header("X-Actor-Id", "dave")
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .content("""
+                            {"reviewKey":"RV-M-%d","requestId":"REQ-M-%d","revision":1,
+                             "conclusion":"PASS","comment":"复核通过"}""".formatted(r, r)))
                     .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isCreated());
 
             ExecutorService pool = Executors.newFixedThreadPool(2);
@@ -164,6 +174,14 @@ class ConcurrencyApiTest {
                         {"measurementKey":"M-D","instrumentId":"INS-D",
                          "measuredAt":"2026-06-01T00:00:00Z","reading":"1",
                          "lowerLimit":"0","upperLimit":"9","submittedBy":"alice"}"""))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isCreated());
+        // 放行门禁：先补充当前版本的有效 PASS 复核
+        mvc.perform(post("/api/measurements/{key}/reviews", "M-D")
+                .header("X-Actor-Id", "dave")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("""
+                        {"reviewKey":"RV-M-D","requestId":"REQ-M-D","revision":1,
+                         "conclusion":"PASS","comment":"复核通过"}"""))
                 .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isCreated());
 
         int threads = 6;

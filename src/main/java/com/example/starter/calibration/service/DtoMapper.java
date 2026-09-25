@@ -5,11 +5,15 @@ import java.util.List;
 
 import com.example.starter.calibration.api.dto.CertificateResponse;
 import com.example.starter.calibration.api.dto.MeasurementResponse;
+import com.example.starter.calibration.api.dto.PendingReviewItem;
 import com.example.starter.calibration.api.dto.ReleaseRecordResponse;
+import com.example.starter.calibration.api.dto.ReviewResponse;
 import com.example.starter.calibration.model.Certificate;
 import com.example.starter.calibration.model.Measurement;
+import com.example.starter.calibration.model.MeasurementReview;
 import com.example.starter.calibration.model.MeasurementStatus;
 import com.example.starter.calibration.model.ReleaseRecord;
+import com.example.starter.calibration.model.ReviewStatus;
 
 /**
  * 领域模型到响应 DTO 的映射。
@@ -58,6 +62,7 @@ final class DtoMapper {
                 m.displayValue().toPlainString(),
                 m.passed(),
                 m.status().name(),
+                m.revision(),
                 usable,
                 m.createdAt(),
                 releases.stream().map(DtoMapper::toResponse).toList());
@@ -65,5 +70,27 @@ final class DtoMapper {
 
     static ReleaseRecordResponse toResponse(ReleaseRecord record) {
         return new ReleaseRecordResponse(record.batchId(), record.releasedBy(), record.releasedAt());
+    }
+
+    static ReviewResponse toResponse(MeasurementReview review, String measurementKey,
+                                     int currentRevision) {
+        boolean effective = review.status() == ReviewStatus.VALID
+                && review.measurementRevision() == currentRevision;
+        return new ReviewResponse(
+                review.reviewKey(),
+                measurementKey,
+                review.measurementRevision(),
+                review.certificateId(),
+                review.reviewer(),
+                review.conclusion().name(),
+                review.comment(),
+                review.status().name(),
+                effective,
+                review.createdAt());
+    }
+
+    static PendingReviewItem toPendingItem(Measurement m) {
+        return new PendingReviewItem(m.measurementKey(), m.instrumentId(), m.revision(),
+                m.submittedBy(), m.measuredAt(), m.createdAt());
     }
 }

@@ -19,7 +19,8 @@ import java.util.List;
  * @param computedValue  未舍入计算值（十进制字符串）
  * @param displayValue   显示值，HALF_UP 4 位小数（十进制字符串）
  * @param passed         是否合格（基于未舍入值，含端点）
- * @param status         状态：PENDING / RELEASED
+ * @param status         状态：PENDING / NEEDS_REVISION / RELEASED
+ * @param revision       当前修订版本号，从 1 开始
  * @param usable         当前是否可用（已放行且证书未撤销）
  * @param createdAt      提交时间（UTC）
  * @param releases       放行历史
@@ -38,6 +39,7 @@ public record MeasurementResponse(
         String displayValue,
         boolean passed,
         String status,
+        int revision,
         boolean usable,
         Instant createdAt,
         List<ReleaseRecordResponse> releases) {

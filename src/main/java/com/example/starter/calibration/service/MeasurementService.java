@@ -10,6 +10,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import com.example.starter.calibration.api.ApiException;
 import com.example.starter.calibration.api.dto.MeasurementResponse;
+import com.example.starter.calibration.api.dto.ReviseMeasurementRequest;
 import com.example.starter.calibration.api.dto.SubmitMeasurementRequest;
 import com.example.starter.calibration.model.Certificate;
 import com.example.starter.calibration.model.Measurement;
@@ -63,7 +64,7 @@ public class MeasurementService {
 
         Measurement measurement = new Measurement(
                 0L, key, instrumentId, measuredAt, reading, lower, upper, submittedBy,
-                cert.id(), computed, passed, MeasurementStatus.PENDING, Instant.now());
+                cert.id(), computed, passed, MeasurementStatus.PENDING, 1, Instant.now());
         try {
             measurements.insert(measurement);
         } catch (DuplicateKeyException ex) {
@@ -80,6 +81,42 @@ public class MeasurementService {
         Measurement measurement = measurements.findByKey(key)
                 .orElseThrow(() -> ApiException.notFound("测量不存在: " + key));
         return toDetail(measurement);
+    }
+
+    /**
+     * 修订测量：按新测量时刻重新匹配有效证书并重算，状态回到待放行，修订版本号 +1。
+     * 已放行返回 409；无匹配有效证书返回 422。旧版本复核仅保留历史，不迁移给新版本。
+     */
+    @Transactional
+    public MeasurementResponse revise(String key, ReviseMeasurementRequest request) {
+        String measurementKey = Inputs.requireText(key, "measurementKey");
+        Instant measuredAt = Inputs.requireInstant(request.measuredAt(), "measuredAt");
+        BigDecimal reading = Inputs.requireDecimal(request.reading(), "reading");
+        BigDecimal lower = Inputs.requireDecimal(request.lowerLimit(), "lowerLimit");
+        BigDecimal upper = Inputs.requireDecimal(request.upperLimit(), "upperLimit");
+        String submittedBy = Inputs.requireText(request.submittedBy(), "submittedBy");
+        if (lower.compareTo(upper) > 0) {
+            throw ApiException.badRequest("lowerLimit 不能大于 upperLimit");
+        }
+
+        Measurement current = measurements.findByKeyForUpdate(measurementKey)
+                .orElseThrow(() -> ApiException.notFound("测量不存在: " + measurementKey));
+        if (current.status() == MeasurementStatus.RELEASED) {
+            throw ApiException.conflict("ALREADY_RELEASED", "测量已放行，不能修订: " + measurementKey);
+        }
+
+        Certificate cert = certificates.findMatching(current.instrumentId(), measuredAt)
+                .orElseThrow(() -> ApiException.unprocessable(
+                        "测量时刻无匹配的有效证书: instrument=" + current.instrumentId()));
+
+        BigDecimal computed = cert.a().multiply(reading).add(cert.b());
+        boolean passed = computed.compareTo(lower) >= 0 && computed.compareTo(upper) <= 0;
+
+        Measurement revised = new Measurement(current.id(), measurementKey, current.instrumentId(),
+                measuredAt, reading, lower, upper, submittedBy, cert.id(), computed, passed,
+                MeasurementStatus.PENDING, current.revision() + 1, current.createdAt());
+        measurements.applyRevision(revised);
+        return toDetail(measurements.findByKey(measurementKey).orElseThrow());
     }
 
     /**

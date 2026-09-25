@@ -17,7 +17,8 @@ import java.time.Instant;
  * @param certificateId  提交时匹配到的校准证书 ID
  * @param computedValue  未舍入计算值 a×读数+b
  * @param passed         是否合格（基于未舍入值，含端点）
- * @param status         状态：PENDING 待放行 / RELEASED 已放行
+ * @param status         状态：PENDING 待放行 / NEEDS_REVISION 待修订 / RELEASED 已放行
+ * @param revision       当前修订版本号，从 1 开始，每次修订 +1
  * @param createdAt      提交时间（UTC）
  */
 public record Measurement(
@@ -33,6 +34,7 @@ public record Measurement(
         BigDecimal computedValue,
         boolean passed,
         MeasurementStatus status,
+        int revision,
         Instant createdAt) {
 
     /**

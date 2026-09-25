@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS measurement (
     certificate_id BIGINT NOT NULL COMMENT '提交时匹配到的校准证书 ID',
     computed_value DECIMAL(38,12) NOT NULL COMMENT '未舍入计算值 a×读数+b，最多 12 位小数',
     passed BOOLEAN NOT NULL COMMENT '是否合格；基于未舍入值判定且包含上下限端点',
-    status VARCHAR(16) NOT NULL COMMENT '状态：PENDING=待放行，RELEASED=已放行',
+    status VARCHAR(16) NOT NULL COMMENT '状态：PENDING=待放行，NEEDS_REVISION=待修订，RELEASED=已放行',
+    revision INT NOT NULL DEFAULT 1 COMMENT '当前修订版本号，从 1 开始，每次修订 +1',
     created_at DATETIME(6) NOT NULL COMMENT '提交时间（UTC）',
     CONSTRAINT uk_measurement_key UNIQUE (measurement_key),
     KEY idx_measurement_instrument (instrument_id),
@@ -51,3 +52,30 @@ CREATE TABLE IF NOT EXISTS release_record (
     released_at DATETIME(6) NOT NULL COMMENT '放行时间（UTC）',
     KEY idx_release_measurement (measurement_id)
 ) COMMENT='放行历史';
+
+-- 同行复核记录：不可变，固化被复核的测量修订版本、证书、结论、说明与时刻。
+-- 测量修订后旧版本复核仅保留历史（不再有效），不自动迁移给新版本。
+CREATE TABLE IF NOT EXISTS measurement_review (
+    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY COMMENT '复核记录 ID，自增',
+    review_key VARCHAR(64) NOT NULL COMMENT '业务复核键，全局唯一，作为幂等键',
+    request_id VARCHAR(64) NULL COMMENT '提交时的请求 ID（追溯用；占用关系见 review_request）',
+    measurement_id BIGINT NOT NULL COMMENT '被复核的测量记录 ID',
+    measurement_revision INT NOT NULL COMMENT '被复核的测量修订版本号（固化，不随后续修订变化）',
+    certificate_id BIGINT NOT NULL COMMENT '复核时测量关联的证书 ID（固化）',
+    reviewer VARCHAR(64) NOT NULL COMMENT '复核人（X-Actor-Id），须不同于测量提交人',
+    conclusion VARCHAR(8) NOT NULL COMMENT '复核结论：PASS=通过，RETURN=退回修订',
+    comment VARCHAR(1024) NOT NULL COMMENT '复核说明',
+    status VARCHAR(8) NOT NULL COMMENT '记录状态：VALID=提交时针对当时当前版本，STALE=提交时版本已过期',
+    created_at DATETIME(6) NOT NULL COMMENT '复核提交时间（UTC）',
+    CONSTRAINT uk_review_key UNIQUE (review_key),
+    KEY idx_review_measurement (measurement_id, measurement_revision)
+) COMMENT='同行复核记录';
+
+-- 复核请求幂等表：仅成功（2xx）的复核提交占用 request_id；
+-- 同键同参重放首次结果，同键异参 409，失败不占键。
+CREATE TABLE IF NOT EXISTS review_request (
+    request_id VARCHAR(64) NOT NULL PRIMARY KEY COMMENT '请求 ID，全局唯一，成功提交后占用',
+    fingerprint VARCHAR(128) NOT NULL COMMENT '请求参数指纹（SHA-256 十六进制），用于同参判定',
+    review_key VARCHAR(64) NOT NULL COMMENT '首次成功提交产生的复核键，用于重放',
+    created_at DATETIME(6) NOT NULL COMMENT '占用时间（UTC）'
+) COMMENT='复核请求幂等表';
