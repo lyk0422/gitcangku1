@@ -1,9 +1,13 @@
 package com.example.starter.water;
 
 import com.example.starter.water.WaterRepository.AllocationRow;
+import com.example.starter.water.WaterRepository.CorrectionRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
+import com.example.starter.water.WaterRepository.LedgerEntryRow;
+import com.example.starter.water.WaterRepository.RejectionRow;
 import com.example.starter.water.WaterRepository.TransferRow;
 import com.example.starter.water.WaterRepository.WindowRow;
+import com.example.starter.water.WaterRepository.WriteoffRow;
 import org.junit.jupiter.api.Test;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -12,6 +16,7 @@ import org.springframework.jdbc.datasource.init.ScriptUtils;
 
 import java.math.BigDecimal;
 import java.sql.Connection;
+import java.util.List;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -115,5 +120,76 @@ class PersistenceTests {
         assertEquals(new BigDecimal("3.000"), cancelled.amount());
         assertEquals(0, cancelled.heldAmount().compareTo(BigDecimal.ZERO));
         assertEquals(0, repo.sumApprovedAmount(windowId).compareTo(BigDecimal.ZERO));
+    }
+
+    @Test
+    void correctionsAndLedgerAreReadableFromNewConnection() throws Exception {
+        String url = String.format(URL_TEMPLATE, UUID.randomUUID().toString().substring(0, 8));
+
+        // 第一次“运行”：建表并写入核销原流水、已批准更正、反向流水、读表快照与拒绝日志
+        SimpleDriverDataSource first = new SimpleDriverDataSource(new org.h2.Driver(), url, "sa", "");
+        try (Connection connection = first.getConnection()) {
+            ScriptUtils.executeSqlScript(connection, new ClassPathResource("schema.sql"));
+        }
+        WaterRepository repo1 = new WaterRepository(new JdbcTemplate(first));
+        long windowId = repo1.insertWindow("wk-corr", "ch-corr", 1_000L, 2_000L,
+                new BigDecimal("10.000"), 1L);
+        repo1.insertAllocation("ak-corr", windowId, "user-1", new BigDecimal("10.000"), "alice", 2L);
+        AllocationRow allocation = repo1.findAllocationByKey("ak-corr");
+        repo1.updateAllocationStatus(allocation.id(), "APPROVED", 3L);
+        // 核销 4：持有 6，写原流水
+        repo1.insertWriteoff("wo-corr", "ak-corr", windowId, 1, new BigDecimal("4.000"), 100L,
+                "alice", 4L);
+        repo1.decrementHeldAmount(allocation.id(), new BigDecimal("4.000"), 4L);
+        repo1.insertLedgerEntry(windowId, "ak-corr", "WRITEOFF", "wo-corr",
+                new BigDecimal("-4.000"), new BigDecimal("6.000"), 100L, 4L);
+        // 更正 4 -> 2 并批准：持有 8，写反向流水与读表快照
+        repo1.insertCorrection("mc-corr", "wo-corr|1|2|200|读表误差|carol", "wo-corr", "ak-corr",
+                windowId, 1, new BigDecimal("2.000"), 200L, "读表误差", "carol", 5L);
+        CorrectionRow correction = repo1.findCorrectionByKey("mc-corr");
+        repo1.updateCorrectionStatus(correction.id(), "APPROVED", 6L);
+        repo1.setHeldAmount(allocation.id(), new BigDecimal("8.000"), 6L);
+        repo1.insertLedgerEntry(windowId, "ak-corr", "CORRECTION", "mc-corr",
+                new BigDecimal("2.000"), new BigDecimal("8.000"), 200L, 6L);
+        repo1.insertSnapshot("mc-corr", "wo-corr", windowId, 1, new BigDecimal("2.000"), 200L,
+                "读表误差", "carol", 6L);
+        repo1.insertRejection(windowId, "mc-corr", "CORRECTION_APPROVE", "NEGATIVE_BALANCE",
+                "历史时点之后可用量为负", 7L);
+
+        // 第二次读取：全新连接与仓储实例，同一 JVM 内数据仍在
+        WaterRepository repo2 = new WaterRepository(
+                new JdbcTemplate(new SimpleDriverDataSource(new org.h2.Driver(), url, "sa", "")));
+        WriteoffRow writeoff = repo2.findWriteoffByKey("wo-corr");
+        assertNotNull(writeoff);
+        assertEquals(1, writeoff.version());
+        assertEquals(new BigDecimal("4.000"), writeoff.amount());
+        assertEquals(100L, writeoff.meterNanos());
+        assertEquals(1, repo2.listWriteoffsByAllocation("ak-corr").size());
+
+        CorrectionRow correction2 = repo2.findCorrectionByKey("mc-corr");
+        assertNotNull(correction2);
+        assertEquals("APPROVED", correction2.status());
+        assertEquals(new BigDecimal("2.000"), correction2.correctedAmount());
+        assertEquals(1, correction2.originalVersion());
+        assertEquals(6L, correction2.decidedNanos());
+        assertEquals("读表误差", correction2.reason());
+        assertEquals(1, repo2.listApprovedCorrections("ak-corr").size());
+
+        List<LedgerEntryRow> entries = repo2.listLedgerEntries("ak-corr");
+        assertEquals(2, entries.size());
+        assertEquals("WRITEOFF", entries.get(0).kind());
+        assertEquals(new BigDecimal("-4.000"), entries.get(0).delta());
+        assertEquals("CORRECTION", entries.get(1).kind());
+        assertEquals(new BigDecimal("2.000"), entries.get(1).delta());
+        assertEquals(new BigDecimal("8.000"), entries.get(1).balanceAfter());
+
+        // 更正后持有额度 8 可从新连接汇总
+        assertEquals(new BigDecimal("8.000"), repo2.sumApprovedAmount(windowId));
+        assertEquals(1, repo2.listSnapshotIds(windowId).size());
+
+        List<RejectionRow> rejections = repo2.listRejections(windowId);
+        assertEquals(1, rejections.size());
+        assertEquals("NEGATIVE_BALANCE", rejections.get(0).code());
+        assertEquals("CORRECTION_APPROVE", rejections.get(0).operation());
     }
 }

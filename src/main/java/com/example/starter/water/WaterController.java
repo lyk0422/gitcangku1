@@ -1,17 +1,27 @@
 package com.example.starter.water;
 
 import com.example.starter.water.dto.Dtos.AllocationResponse;
+import com.example.starter.water.dto.Dtos.BalanceEvolutionResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
 import com.example.starter.water.dto.Dtos.CommandRequest;
+import com.example.starter.water.dto.Dtos.CorrectionApproveRequest;
+import com.example.starter.water.dto.Dtos.CorrectionApproveResponse;
+import com.example.starter.water.dto.Dtos.CorrectionRequest;
+import com.example.starter.water.dto.Dtos.CorrectionResponse;
 import com.example.starter.water.dto.Dtos.CreateWindowRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.LedgerResponse;
+import com.example.starter.water.dto.Dtos.RejectionListResponse;
 import com.example.starter.water.dto.Dtos.SubmitAllocationRequest;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferRequest;
 import com.example.starter.water.dto.Dtos.TransferResponse;
 import com.example.starter.water.dto.Dtos.WindowResponse;
+import com.example.starter.water.dto.Dtos.WriteoffListResponse;
+import com.example.starter.water.dto.Dtos.WriteoffRequest;
+import com.example.starter.water.dto.Dtos.WriteoffResponse;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -102,5 +112,66 @@ public class WaterController {
     @GetMapping("/windows/{windowId}/history")
     public HistoryResponse getHistory(@PathVariable long windowId) {
         return service.getHistory(windowId);
+    }
+
+    /** 核销：扣减 APPROVED 申请持有额度并写不可变原流水。 */
+    @PostMapping("/allocations/{allocationKey}/writeoffs")
+    public WriteoffResponse createWriteoff(@PathVariable String allocationKey,
+                                           @RequestBody WriteoffRequest request,
+                                           @RequestHeader("X-Actor-Id") String actor) {
+        return service.createWriteoff(request.commandKey(), allocationKey, request.writeoffKey(),
+                request.amount(), request.meterUtc(), actor);
+    }
+
+    /** 查询申请核销记录（原流水）。 */
+    @GetMapping("/allocations/{allocationKey}/writeoffs")
+    public WriteoffListResponse getWriteoffs(@PathVariable String allocationKey) {
+        return service.getWriteoffs(allocationKey);
+    }
+
+    /** 查询申请反向流水（更正/撤销）。 */
+    @GetMapping("/allocations/{allocationKey}/ledger")
+    public LedgerResponse getReverseLedger(@PathVariable String allocationKey) {
+        return service.getReverseLedger(allocationKey);
+    }
+
+    /** 查询申请余额演算（按业务事件时刻重放的余额曲线）。 */
+    @GetMapping("/allocations/{allocationKey}/balance-evolution")
+    public BalanceEvolutionResponse getBalanceEvolution(@PathVariable String allocationKey) {
+        return service.getBalanceEvolution(allocationKey);
+    }
+
+    /** 登记计量更正（meterKey 指纹幂等；窗口关闭后仍可登记）。 */
+    @PostMapping("/corrections")
+    public CorrectionResponse requestCorrection(@RequestBody CorrectionRequest request,
+                                                @RequestHeader("X-Actor-Id") String actor) {
+        return service.requestCorrection(request.meterKey(), request.writeoffKey(),
+                request.originalVersion(), request.correctedAmount(), request.meterUtc(),
+                request.reason(), actor);
+    }
+
+    /** 批量批准计量更正：任一失败全部回滚。 */
+    @PostMapping("/corrections/approve")
+    public CorrectionApproveResponse approveCorrections(@RequestBody CorrectionApproveRequest request) {
+        return service.approveCorrections(request.commandKey(), request.meterKeys());
+    }
+
+    /** 撤销已批准更正：再产生反向流水并通过最终态校验。 */
+    @PostMapping("/corrections/{meterKey}/revoke")
+    public CorrectionResponse revokeCorrection(@PathVariable String meterKey,
+                                               @RequestBody CommandRequest request) {
+        return service.revokeCorrection(request.commandKey(), meterKey);
+    }
+
+    /** 查询计量更正详情。 */
+    @GetMapping("/corrections/{meterKey}")
+    public CorrectionResponse getCorrection(@PathVariable String meterKey) {
+        return service.getCorrection(meterKey);
+    }
+
+    /** 查询窗口拒绝原因日志。 */
+    @GetMapping("/windows/{windowId}/rejections")
+    public RejectionListResponse getRejections(@PathVariable long windowId) {
+        return service.getRejections(windowId);
     }
 }

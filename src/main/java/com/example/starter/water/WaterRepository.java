@@ -46,6 +46,29 @@ public class WaterRepository {
                              long createdNanos) {
     }
 
+    /** 核销记录行（原流水），创建后不可变；version 为同一申请内自 1 递增的核销版本。 */
+    public record WriteoffRow(long id, String writeoffKey, String allocationKey, long windowId, int version,
+                              BigDecimal amount, long meterNanos, String actor, long createdNanos) {
+    }
+
+    /** 计量更正行；fingerprint 为 核销键|原核销版本|校正数|读表时刻|原因|操作者。 */
+    public record CorrectionRow(long id, String meterKey, String fingerprint, String writeoffKey,
+                                String allocationKey, long windowId, int originalVersion,
+                                BigDecimal correctedAmount, long meterNanos, String reason, String actor,
+                                String status, long createdNanos, Long decidedNanos) {
+    }
+
+    /** 结算流水行，创建后不可变；delta 为对持有额度的有符号影响。 */
+    public record LedgerEntryRow(long id, long windowId, String allocationKey, String kind, String refKey,
+                                 BigDecimal delta, BigDecimal balanceAfter, long eventNanos,
+                                 long createdNanos) {
+    }
+
+    /** 拒绝原因日志行。 */
+    public record RejectionRow(long id, Long windowId, String meterKey, String operation, String code,
+                               String message, long createdNanos) {
+    }
+
     private static final RowMapper<WindowRow> WINDOW_MAPPER = (rs, n) -> new WindowRow(
             rs.getLong("id"), rs.getString("window_key"), rs.getString("channel_id"),
             rs.getLong("start_nanos"), rs.getLong("end_nanos"),
@@ -74,6 +97,41 @@ public class WaterRepository {
     private static final RowMapper<CommandRow> COMMAND_MAPPER = (rs, n) -> new CommandRow(
             rs.getString("command_key"), rs.getString("operation"), rs.getString("params"),
             rs.getString("response"), rs.getLong("created_nanos"));
+
+    private static final RowMapper<WriteoffRow> WRITEOFF_MAPPER = (rs, n) -> new WriteoffRow(
+            rs.getLong("id"), rs.getString("writeoff_key"), rs.getString("allocation_key"),
+            rs.getLong("window_id"), rs.getInt("version"), rs.getBigDecimal("amount"),
+            rs.getLong("meter_nanos"), rs.getString("actor"), rs.getLong("created_nanos"));
+
+    private static final String WRITEOFF_SELECT =
+            "SELECT id, writeoff_key, allocation_key, window_id, version, amount, meter_nanos, actor,"
+                    + " created_nanos";
+
+    private static final RowMapper<CorrectionRow> CORRECTION_MAPPER = (rs, n) -> new CorrectionRow(
+            rs.getLong("id"), rs.getString("meter_key"), rs.getString("fingerprint"),
+            rs.getString("writeoff_key"), rs.getString("allocation_key"), rs.getLong("window_id"),
+            rs.getInt("original_version"), rs.getBigDecimal("corrected_amount"),
+            rs.getLong("meter_nanos"), rs.getString("reason"), rs.getString("actor"),
+            rs.getString("status"), rs.getLong("created_nanos"),
+            rs.getObject("decided_nanos") == null ? null : rs.getLong("decided_nanos"));
+
+    private static final String CORRECTION_SELECT =
+            "SELECT id, meter_key, fingerprint, writeoff_key, allocation_key, window_id, original_version,"
+                    + " corrected_amount, meter_nanos, reason, actor, status, created_nanos, decided_nanos";
+
+    private static final RowMapper<LedgerEntryRow> LEDGER_MAPPER = (rs, n) -> new LedgerEntryRow(
+            rs.getLong("id"), rs.getLong("window_id"), rs.getString("allocation_key"),
+            rs.getString("kind"), rs.getString("ref_key"), rs.getBigDecimal("delta"),
+            rs.getBigDecimal("balance_after"), rs.getLong("event_nanos"), rs.getLong("created_nanos"));
+
+    private static final String LEDGER_SELECT =
+            "SELECT id, window_id, allocation_key, kind, ref_key, delta, balance_after, event_nanos,"
+                    + " created_nanos";
+
+    private static final RowMapper<RejectionRow> REJECTION_MAPPER = (rs, n) -> new RejectionRow(
+            rs.getLong("id"), rs.getObject("window_id") == null ? null : rs.getLong("window_id"),
+            rs.getString("meter_key"), rs.getString("operation"), rs.getString("code"),
+            rs.getString("message"), rs.getLong("created_nanos"));
 
     private final JdbcTemplate jdbc;
 
@@ -303,5 +361,218 @@ public class WaterRepository {
     /** 写回命令首次成功响应。 */
     public void updateCommandResponse(String commandKey, String response) {
         jdbc.update("UPDATE command_log SET response = ? WHERE command_key = ?", response, commandKey);
+    }
+
+    // ------------------------------------------------------------------
+    // 核销（原流水）
+    // ------------------------------------------------------------------
+
+    /** 插入不可变核销记录并返回主键；version 由服务层在申请行锁内计算。 */
+    public long insertWriteoff(String writeoffKey, String allocationKey, long windowId, int version,
+                               BigDecimal amount, long meterNanos, String actor, long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO write_off (writeoff_key, allocation_key, window_id, version, amount,"
+                            + " meter_nanos, actor, created_nanos) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, writeoffKey);
+            ps.setString(2, allocationKey);
+            ps.setLong(3, windowId);
+            ps.setInt(4, version);
+            ps.setBigDecimal(5, amount);
+            ps.setLong(6, meterNanos);
+            ps.setString(7, actor);
+            ps.setLong(8, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 按业务键查询核销记录，不存在返回 null。 */
+    public WriteoffRow findWriteoffByKey(String writeoffKey) {
+        try {
+            return jdbc.queryForObject(WRITEOFF_SELECT + " FROM write_off WHERE writeoff_key = ?",
+                    WRITEOFF_MAPPER, writeoffKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 申请全部核销记录，按版本升序。 */
+    public List<WriteoffRow> listWriteoffsByAllocation(String allocationKey) {
+        return jdbc.query(WRITEOFF_SELECT + " FROM write_off WHERE allocation_key = ? ORDER BY version",
+                WRITEOFF_MAPPER, allocationKey);
+    }
+
+    /** 申请下一个核销版本（须在申请行锁内调用）。 */
+    public int nextWriteoffVersion(String allocationKey) {
+        Integer next = jdbc.queryForObject(
+                "SELECT COALESCE(MAX(version), 0) + 1 FROM write_off WHERE allocation_key = ?",
+                Integer.class, allocationKey);
+        return next == null ? 1 : next;
+    }
+
+    /** 直接设定申请持有额度（更正/撤销重算后的最终余额）并记录变更时间。 */
+    public void setHeldAmount(long id, BigDecimal heldAmount, long updatedNanos) {
+        jdbc.update("UPDATE allocation SET held_amount = ?, updated_nanos = ? WHERE id = ?",
+                heldAmount, updatedNanos, id);
+    }
+
+    /** 源申请的全部转出流水（已结算转让），按主键升序。 */
+    public List<TransferRow> listTransfersBySource(String sourceAllocationKey) {
+        return jdbc.query(
+                "SELECT id, transfer_key, window_id, source_allocation_key, target_allocation_key,"
+                        + " amount, actor, created_nanos FROM transfer WHERE source_allocation_key = ?"
+                        + " ORDER BY id",
+                TRANSFER_MAPPER, sourceAllocationKey);
+    }
+
+    // ------------------------------------------------------------------
+    // 计量更正
+    // ------------------------------------------------------------------
+
+    /** 插入更正申请（初始 REQUESTED）并返回主键。 */
+    public long insertCorrection(String meterKey, String fingerprint, String writeoffKey,
+                                 String allocationKey, long windowId, int originalVersion,
+                                 BigDecimal correctedAmount, long meterNanos, String reason, String actor,
+                                 long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO meter_correction (meter_key, fingerprint, writeoff_key, allocation_key,"
+                            + " window_id, original_version, corrected_amount, meter_nanos, reason, actor,"
+                            + " status, created_nanos, decided_nanos)"
+                            + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'REQUESTED', ?, NULL)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, meterKey);
+            ps.setString(2, fingerprint);
+            ps.setString(3, writeoffKey);
+            ps.setString(4, allocationKey);
+            ps.setLong(5, windowId);
+            ps.setInt(6, originalVersion);
+            ps.setBigDecimal(7, correctedAmount);
+            ps.setLong(8, meterNanos);
+            ps.setString(9, reason);
+            ps.setString(10, actor);
+            ps.setLong(11, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 按业务键查询更正，不存在返回 null。 */
+    public CorrectionRow findCorrectionByKey(String meterKey) {
+        try {
+            return jdbc.queryForObject(CORRECTION_SELECT + " FROM meter_correction WHERE meter_key = ?",
+                    CORRECTION_MAPPER, meterKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 按业务键锁定更正行（FOR UPDATE），不存在返回 null。 */
+    public CorrectionRow lockCorrectionByKey(String meterKey) {
+        try {
+            return jdbc.queryForObject(
+                    CORRECTION_SELECT + " FROM meter_correction WHERE meter_key = ? FOR UPDATE",
+                    CORRECTION_MAPPER, meterKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 申请全部已批准（未撤销）更正，按裁决时间、主键升序。 */
+    public List<CorrectionRow> listApprovedCorrections(String allocationKey) {
+        return jdbc.query(
+                CORRECTION_SELECT + " FROM meter_correction WHERE allocation_key = ? AND status = 'APPROVED'"
+                        + " ORDER BY decided_nanos, id",
+                CORRECTION_MAPPER, allocationKey);
+    }
+
+    /** 更新更正状态（APPROVED/REVOKED）并记录裁决时间。 */
+    public void updateCorrectionStatus(long id, String status, long decidedNanos) {
+        jdbc.update("UPDATE meter_correction SET status = ?, decided_nanos = ? WHERE id = ?",
+                status, decidedNanos, id);
+    }
+
+    // ------------------------------------------------------------------
+    // 结算流水 / 读表快照 / 拒绝原因
+    // ------------------------------------------------------------------
+
+    /** 插入不可变结算流水并返回主键。 */
+    public long insertLedgerEntry(long windowId, String allocationKey, String kind, String refKey,
+                                  BigDecimal delta, BigDecimal balanceAfter, long eventNanos,
+                                  long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO ledger_entry (window_id, allocation_key, kind, ref_key, delta,"
+                            + " balance_after, event_nanos, created_nanos) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setLong(1, windowId);
+            ps.setString(2, allocationKey);
+            ps.setString(3, kind);
+            ps.setString(4, refKey);
+            ps.setBigDecimal(5, delta);
+            ps.setBigDecimal(6, balanceAfter);
+            ps.setLong(7, eventNanos);
+            ps.setLong(8, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 申请全部结算流水，按主键升序。 */
+    public List<LedgerEntryRow> listLedgerEntries(String allocationKey) {
+        return jdbc.query(LEDGER_SELECT + " FROM ledger_entry WHERE allocation_key = ? ORDER BY id",
+                LEDGER_MAPPER, allocationKey);
+    }
+
+    /** 插入不可变读表快照并返回主键。 */
+    public long insertSnapshot(String meterKey, String writeoffKey, long windowId, int originalVersion,
+                               BigDecimal correctedAmount, long meterNanos, String reason, String actor,
+                               long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO meter_snapshot (meter_key, writeoff_key, window_id, original_version,"
+                            + " corrected_amount, meter_nanos, reason, actor, created_nanos)"
+                            + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, meterKey);
+            ps.setString(2, writeoffKey);
+            ps.setLong(3, windowId);
+            ps.setInt(4, originalVersion);
+            ps.setBigDecimal(5, correctedAmount);
+            ps.setLong(6, meterNanos);
+            ps.setString(7, reason);
+            ps.setString(8, actor);
+            ps.setLong(9, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 窗口全部读表快照，按主键升序。 */
+    public List<Long> listSnapshotIds(long windowId) {
+        return jdbc.query("SELECT id FROM meter_snapshot WHERE window_id = ? ORDER BY id",
+                (rs, n) -> rs.getLong("id"), windowId);
+    }
+
+    /** 插入拒绝原因日志（独立事务，业务失败回滚不影响本日志）。 */
+    public void insertRejection(Long windowId, String meterKey, String operation, String code,
+                                String message, long createdNanos) {
+        jdbc.update("INSERT INTO rejection_log (window_id, meter_key, operation, code, message,"
+                        + " created_nanos) VALUES (?, ?, ?, ?, ?, ?)",
+                windowId, meterKey, operation, code, message, createdNanos);
+    }
+
+    /** 窗口全部拒绝原因日志，按主键升序。 */
+    public List<RejectionRow> listRejections(long windowId) {
+        return jdbc.query(
+                "SELECT id, window_id, meter_key, operation, code, message, created_nanos"
+                        + " FROM rejection_log WHERE window_id = ? ORDER BY id",
+                REJECTION_MAPPER, windowId);
     }
 }

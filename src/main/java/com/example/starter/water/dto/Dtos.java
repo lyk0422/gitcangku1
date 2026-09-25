@@ -74,6 +74,69 @@ public final class Dtos {
                                   List<CurtailmentResponse> curtailments) {
     }
 
+    /** 核销命令；操作人由 X-Actor-Id 请求头提供，meterUtc 为 UTC 读表时刻。 */
+    public record WriteoffRequest(String commandKey, String writeoffKey, String amount, String meterUtc) {
+    }
+
+    /** 核销记录视图（原流水），创建后不可变；version 为同一申请内自 1 递增的核销版本。 */
+    public record WriteoffResponse(String writeoffKey, String allocationKey, long windowId, int version,
+                                   String amount, String meterUtc, String actor, String createdUtc) {
+    }
+
+    /** 核销记录（原流水）列表视图。 */
+    public record WriteoffListResponse(String allocationKey, List<WriteoffResponse> writeoffs) {
+    }
+
+    /** 计量更正登记命令；操作人由 X-Actor-Id 请求头提供。correctedAmount 不得为负，最多 3 位小数。 */
+    public record CorrectionRequest(String meterKey, String writeoffKey, Integer originalVersion,
+                                    String correctedAmount, String meterUtc, String reason) {
+    }
+
+    /**
+     * 计量更正视图。状态：REQUESTED 已登记 / APPROVED 已批准 / REVOKED 已撤销。
+     * decidedUtc 未裁决时为 null。
+     */
+    public record CorrectionResponse(String meterKey, String writeoffKey, String allocationKey, long windowId,
+                                     int originalVersion, String correctedAmount, String meterUtc, String reason,
+                                     String actor, String status, String createdUtc, String decidedUtc) {
+    }
+
+    /** 批量批准更正命令；meterKeys 按提交顺序裁决，任一失败全部回滚。 */
+    public record CorrectionApproveRequest(String commandKey, List<String> meterKeys) {
+    }
+
+    /** 批量批准结果视图，按提交顺序返回已批准更正。 */
+    public record CorrectionApproveResponse(List<CorrectionResponse> approved) {
+    }
+
+    /** 结算流水视图。kind：WRITEOFF 原核销流水 / CORRECTION 更正反向流水 / REVOCATION 撤销反向流水。 */
+    public record LedgerEntryResponse(long id, String kind, String refKey, String delta, String balanceAfter,
+                                      String eventUtc, String createdUtc) {
+    }
+
+    /** 反向流水列表视图（仅 CORRECTION/REVOCATION 条目）。 */
+    public record LedgerResponse(String allocationKey, List<LedgerEntryResponse> entries) {
+    }
+
+    /** 余额演算事件视图：按业务事件时刻排列的余额变化。 */
+    public record BalanceEventResponse(String eventUtc, String kind, String refKey, String delta,
+                                       String balance) {
+    }
+
+    /** 余额演算视图：自批准额度起，逐事件重放后的余额曲线。 */
+    public record BalanceEvolutionResponse(String allocationKey, String startBalance,
+                                           List<BalanceEventResponse> events, String finalBalance) {
+    }
+
+    /** 拒绝原因视图。 */
+    public record RejectionResponse(long id, Long windowId, String meterKey, String operation, String code,
+                                    String message, String createdUtc) {
+    }
+
+    /** 窗口拒绝原因列表视图。 */
+    public record RejectionListResponse(long windowId, List<RejectionResponse> rejections) {
+    }
+
     /** 统一错误响应体。 */
     public record ErrorResponse(String code, String message) {
     }
