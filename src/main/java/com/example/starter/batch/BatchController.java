@@ -1,11 +1,18 @@
 package com.example.starter.batch;
 
+import com.example.starter.batch.dto.ApproveReleaseRequest;
 import com.example.starter.batch.dto.ApproveRequest;
 import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
 import com.example.starter.batch.dto.LineageEntryResponse;
+import com.example.starter.batch.dto.RecallImpactResponse;
+import com.example.starter.batch.dto.RecallReleaseApplyRequest;
+import com.example.starter.batch.dto.RecallReleaseResponse;
+import com.example.starter.batch.dto.RecallReleaseSnapshotResponse;
 import com.example.starter.batch.dto.RecallRequest;
+import com.example.starter.batch.dto.ReinspectionGapsResponse;
+import com.example.starter.batch.dto.ReinspectionRequest;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
 import jakarta.validation.Valid;
@@ -112,6 +119,73 @@ public class BatchController {
     @GetMapping("/{batchKey}/descendants")
     public List<LineageEntryResponse> descendants(@PathVariable String batchKey) {
         return service.listDescendants(batchKey);
+    }
+
+    /**
+     * 召回解除申请：仅根召回记录为 ACTIVE 的批次可申请；申请含召回版本、
+     * 纠正措施与复检批次集合（规范化排序）；releaseKey 同键重放，失败不占键。
+     */
+    @PostMapping("/{batchKey}/recall-releases")
+    public ResponseEntity<String> applyRecallRelease(
+            @PathVariable String batchKey,
+            @RequestHeader(name = "X-Actor-Id", required = false) String actorId,
+            @Valid @RequestBody RecallReleaseApplyRequest request) {
+        return stored(service.applyRecallRelease(batchKey, actorId, request));
+    }
+
+    /**
+     * 提交复检：仅处于召回上下文的批次可提交；复检不改写批次状态。
+     */
+    @PostMapping("/{batchKey}/reinspections")
+    public ResponseEntity<String> submitReinspection(@PathVariable String batchKey,
+                                                     @Valid @RequestBody ReinspectionRequest request) {
+        return stored(service.submitReinspection(batchKey, request));
+    }
+
+    /**
+     * 批准召回解除：按最终血缘闭包预校验，任一失败 422 且状态不变；
+     * 批准后仅解除申请所覆盖召回代次并写入不可变评审快照。X-Actor-Id 为审批人。
+     */
+    @PostMapping("/{batchKey}/recall-releases/{releaseKey}/approve")
+    public ResponseEntity<String> approveRecallRelease(
+            @PathVariable String batchKey,
+            @PathVariable String releaseKey,
+            @RequestHeader(name = "X-Actor-Id", required = false) String actorId,
+            @Valid @RequestBody ApproveReleaseRequest request) {
+        return stored(service.approveRecallRelease(batchKey, releaseKey, actorId, request));
+    }
+
+    /**
+     * 血缘影响查询：最新一代召回的最终血缘闭包及各批合格复检进度。
+     */
+    @GetMapping("/{batchKey}/recall-impact")
+    public RecallImpactResponse recallImpact(@PathVariable String batchKey) {
+        return service.recallImpact(batchKey);
+    }
+
+    /**
+     * 复检缺口查询：当前 ACTIVE 召回下闭包内各批仍缺合格复检的必做检验项。
+     */
+    @GetMapping("/{batchKey}/reinspection-gaps")
+    public ReinspectionGapsResponse reinspectionGaps(@PathVariable String batchKey) {
+        return service.reinspectionGaps(batchKey);
+    }
+
+    /**
+     * 某批次全部召回解除申请。
+     */
+    @GetMapping("/{batchKey}/recall-releases")
+    public List<RecallReleaseResponse> recallReleases(@PathVariable String batchKey) {
+        return service.listRecallReleases(batchKey);
+    }
+
+    /**
+     * 解除评审快照：仅已批准申请存在快照，写入后不可变。
+     */
+    @GetMapping("/{batchKey}/recall-releases/{releaseKey}/snapshot")
+    public RecallReleaseSnapshotResponse recallReleaseSnapshot(@PathVariable String batchKey,
+                                                               @PathVariable String releaseKey) {
+        return service.recallReleaseSnapshot(batchKey, releaseKey);
     }
 
     private ResponseEntity<String> stored(StoredResponse response) {

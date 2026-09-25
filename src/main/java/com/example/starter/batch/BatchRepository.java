@@ -35,10 +35,11 @@ public class BatchRepository {
     }
 
     /**
-     * recall 表行记录。
+     * recall 表行记录；version 为召回代次，status 为 ACTIVE/LIFTED，priorStatus 为召回前批次状态。
      */
     public record RecallRow(long id, String batchKey, String commandKey, String actorId,
-                            String reason, String createdAt) {
+                            String reason, int version, String status, String priorStatus,
+                            String createdAt) {
     }
 
     /**
@@ -52,6 +53,31 @@ public class BatchRepository {
      * batch_lineage 表行记录：拆分父子关系，创建后不可改写。
      */
     public record LineageRow(long id, String parentKey, String childKey, int seq, String createdAt) {
+    }
+
+    /**
+     * reinspection 表行记录：召回上下文下的复检证据，不改写批次状态。
+     */
+    public record ReinspectionRow(long id, String batchKey, String rootKey, int recallVersion,
+                                  String testItem, String outcome, String inspector,
+                                  String commandKey, String createdAt) {
+    }
+
+    /**
+     * recall_release 表行记录：召回解除申请；status 为 PENDING/APPROVED。
+     */
+    public record ReleaseRow(long id, String batchKey, String releaseKey, String commandKey,
+                             int recallVersion, String correctiveAction, String reinspectionBatches,
+                             String applicant, String status, String approver, String decidedAt,
+                             String createdAt) {
+    }
+
+    /**
+     * recall_release_snapshot 表行记录：批准时写入的不可变评审快照。
+     */
+    public record SnapshotRow(long id, String releaseKey, String batchKey, int recallVersion,
+                              String correctiveAction, String approver, String closureBatches,
+                              String detail, String createdAt) {
     }
 
     private static final RowMapper<BatchRow> BATCH_MAPPER = (rs, n) -> new BatchRow(
@@ -71,7 +97,8 @@ public class BatchRepository {
 
     private static final RowMapper<RecallRow> RECALL_MAPPER = (rs, n) -> new RecallRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("command_key"),
-            rs.getString("actor_id"), rs.getString("reason"), rs.getString("created_at"));
+            rs.getString("actor_id"), rs.getString("reason"), rs.getInt("version"),
+            rs.getString("status"), rs.getString("prior_status"), rs.getString("created_at"));
 
     private static final RowMapper<CommandRow> COMMAND_MAPPER = (rs, n) -> new CommandRow(
             rs.getString("command_type"), rs.getString("command_key"), rs.getString("fingerprint"),
@@ -80,6 +107,24 @@ public class BatchRepository {
     private static final RowMapper<LineageRow> LINEAGE_MAPPER = (rs, n) -> new LineageRow(
             rs.getLong("id"), rs.getString("parent_key"), rs.getString("child_key"),
             rs.getInt("seq"), rs.getString("created_at"));
+
+    private static final RowMapper<ReinspectionRow> REINSPECTION_MAPPER = (rs, n) -> new ReinspectionRow(
+            rs.getLong("id"), rs.getString("batch_key"), rs.getString("root_key"),
+            rs.getInt("recall_version"), rs.getString("test_item"), rs.getString("outcome"),
+            rs.getString("inspector"), rs.getString("command_key"), rs.getString("created_at"));
+
+    private static final RowMapper<ReleaseRow> RELEASE_MAPPER = (rs, n) -> new ReleaseRow(
+            rs.getLong("id"), rs.getString("batch_key"), rs.getString("release_key"),
+            rs.getString("command_key"), rs.getInt("recall_version"),
+            rs.getString("corrective_action"), rs.getString("reinspection_batches"),
+            rs.getString("applicant"), rs.getString("status"), rs.getString("approver"),
+            rs.getString("decided_at"), rs.getString("created_at"));
+
+    private static final RowMapper<SnapshotRow> SNAPSHOT_MAPPER = (rs, n) -> new SnapshotRow(
+            rs.getLong("id"), rs.getString("release_key"), rs.getString("batch_key"),
+            rs.getInt("recall_version"), rs.getString("corrective_action"),
+            rs.getString("approver"), rs.getString("closure_batches"),
+            rs.getString("detail"), rs.getString("created_at"));
 
     private final JdbcTemplate jdbc;
 
@@ -156,15 +201,36 @@ public class BatchRepository {
                 row.seq(), row.createdAt());
     }
 
+    /**
+     * 最新一代召回记录（按召回代次倒序取第一条）；历史召回记录不删除。
+     */
     public Optional<RecallRow> findRecall(String batchKey) {
-        return jdbc.query("SELECT * FROM recall WHERE batch_key = ?", RECALL_MAPPER, batchKey)
+        return jdbc.query("SELECT * FROM recall WHERE batch_key = ? ORDER BY version DESC LIMIT 1",
+                        RECALL_MAPPER, batchKey)
                 .stream().findFirst();
     }
 
+    /**
+     * 全部召回记录，按召回代次升序；历史代次解除后为 LIFTED，不删除。
+     */
+    public List<RecallRow> findRecalls(String batchKey) {
+        return jdbc.query("SELECT * FROM recall WHERE batch_key = ? ORDER BY version",
+                RECALL_MAPPER, batchKey);
+    }
+
     public void insertRecall(RecallRow row) {
-        jdbc.update("INSERT INTO recall (batch_key, command_key, actor_id, reason, created_at)"
-                        + " VALUES (?, ?, ?, ?, ?)",
-                row.batchKey(), row.commandKey(), row.actorId(), row.reason(), row.createdAt());
+        jdbc.update("INSERT INTO recall (batch_key, command_key, actor_id, reason, version,"
+                        + " status, prior_status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                row.batchKey(), row.commandKey(), row.actorId(), row.reason(), row.version(),
+                row.status(), row.priorStatus(), row.createdAt());
+    }
+
+    /**
+     * 将指定召回代次标记为已解除（LIFTED）；仅更新状态，历史记录不删除。
+     */
+    public void liftRecall(String batchKey, int version) {
+        jdbc.update("UPDATE recall SET status = 'LIFTED' WHERE batch_key = ? AND version = ?",
+                batchKey, version);
     }
 
     public Optional<CommandRow> findCommand(String commandType, String commandKey) {
@@ -208,5 +274,93 @@ public class BatchRepository {
     public List<String> findRecalledKeys() {
         return jdbc.queryForList("SELECT batch_key FROM batch WHERE status = 'RECALLED'",
                 String.class);
+    }
+
+    /**
+     * 某批次在指定召回上下文（根批次+召回代次）下的全部复检记录，按 id 升序。
+     */
+    public List<ReinspectionRow> findReinspections(String batchKey, String rootKey, int recallVersion) {
+        return jdbc.query("SELECT * FROM reinspection"
+                        + " WHERE batch_key = ? AND root_key = ? AND recall_version = ? ORDER BY id",
+                REINSPECTION_MAPPER, batchKey, rootKey, recallVersion);
+    }
+
+    /**
+     * 某批次在指定召回上下文下某检验项的复检记录。
+     */
+    public Optional<ReinspectionRow> findReinspection(String batchKey, String rootKey,
+                                                      int recallVersion, String testItem) {
+        return jdbc.query("SELECT * FROM reinspection"
+                        + " WHERE batch_key = ? AND root_key = ? AND recall_version = ? AND test_item = ?",
+                        REINSPECTION_MAPPER, batchKey, rootKey, recallVersion, testItem)
+                .stream().findFirst();
+    }
+
+    public void insertReinspection(ReinspectionRow row) {
+        jdbc.update("INSERT INTO reinspection (batch_key, root_key, recall_version, test_item,"
+                        + " outcome, inspector, command_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                row.batchKey(), row.rootKey(), row.recallVersion(), row.testItem(),
+                row.outcome(), row.inspector(), row.commandKey(), row.createdAt());
+    }
+
+    /**
+     * 按解除业务键查询解除申请；releaseKey 全局唯一。
+     */
+    public Optional<ReleaseRow> findRelease(String releaseKey) {
+        return jdbc.query("SELECT * FROM recall_release WHERE release_key = ?",
+                        RELEASE_MAPPER, releaseKey)
+                .stream().findFirst();
+    }
+
+    /**
+     * 某批次当前待批准（PENDING）的解除申请；同一批次同一时间至多一条。
+     */
+    public Optional<ReleaseRow> findPendingRelease(String batchKey) {
+        return jdbc.query("SELECT * FROM recall_release WHERE batch_key = ? AND status = 'PENDING'",
+                        RELEASE_MAPPER, batchKey)
+                .stream().findFirst();
+    }
+
+    /**
+     * 某批次全部解除申请，按 id 升序。
+     */
+    public List<ReleaseRow> findReleases(String batchKey) {
+        return jdbc.query("SELECT * FROM recall_release WHERE batch_key = ? ORDER BY id",
+                RELEASE_MAPPER, batchKey);
+    }
+
+    public void insertRelease(ReleaseRow row) {
+        jdbc.update("INSERT INTO recall_release (batch_key, release_key, command_key, recall_version,"
+                        + " corrective_action, reinspection_batches, applicant, status, approver,"
+                        + " decided_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                row.batchKey(), row.releaseKey(), row.commandKey(), row.recallVersion(),
+                row.correctiveAction(), row.reinspectionBatches(), row.applicant(), row.status(),
+                row.approver(), row.decidedAt(), row.createdAt());
+    }
+
+    /**
+     * 批准解除申请：置为 APPROVED 并记录审批人与批准时间。
+     */
+    public void approveRelease(String releaseKey, String approver, String decidedAt) {
+        jdbc.update("UPDATE recall_release SET status = 'APPROVED', approver = ?, decided_at = ?"
+                        + " WHERE release_key = ?",
+                approver, decidedAt, releaseKey);
+    }
+
+    /**
+     * 按解除业务键查询评审快照；快照仅随批准产生一条，写入后不可变。
+     */
+    public Optional<SnapshotRow> findSnapshot(String releaseKey) {
+        return jdbc.query("SELECT * FROM recall_release_snapshot WHERE release_key = ?",
+                        SNAPSHOT_MAPPER, releaseKey)
+                .stream().findFirst();
+    }
+
+    public void insertSnapshot(SnapshotRow row) {
+        jdbc.update("INSERT INTO recall_release_snapshot (release_key, batch_key, recall_version,"
+                        + " corrective_action, approver, closure_batches, detail, created_at)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                row.releaseKey(), row.batchKey(), row.recallVersion(), row.correctiveAction(),
+                row.approver(), row.closureBatches(), row.detail(), row.createdAt());
     }
 }
