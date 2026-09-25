@@ -14,11 +14,16 @@ import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
+import com.example.starter.maintenance.api.dto.CertificationSnapshotView;
+import com.example.starter.maintenance.api.dto.CertifyBatchRequest;
+import com.example.starter.maintenance.api.dto.CertifyBatchResponse;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
 import com.example.starter.maintenance.api.dto.RegisterEquipmentRequest;
+import com.example.starter.maintenance.api.dto.RetireRequest;
+import com.example.starter.maintenance.api.dto.RetireResponse;
 import com.example.starter.maintenance.api.dto.ReviseReadingRequest;
 import com.example.starter.maintenance.api.dto.RevisionView;
 import com.example.starter.maintenance.api.dto.StatusResponse;
@@ -92,5 +97,18 @@ public class EquipmentController {
     @GetMapping("/{equipmentId}/maintenances")
     public List<MaintenanceResponse> listMaintenances(@PathVariable String equipmentId) {
         return service.listMaintenances(equipmentId);
+    }
+
+    /** 设备退役：退役后不可再认证读数（422）。 */
+    @PostMapping("/{equipmentId}/retire")
+    public RetireResponse retire(@PathVariable String equipmentId,
+                                 @Valid @RequestBody RetireRequest req) {
+        return service.retire(equipmentId, req);
+    }
+
+    /** 认证快照历史（不可变，按认证时刻升序）。 */
+    @GetMapping("/{equipmentId}/certifications")
+    public List<CertificationSnapshotView> listCertifications(@PathVariable String equipmentId) {
+        return service.listCertifications(equipmentId);
     }
 }

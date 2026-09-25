@@ -14,6 +14,7 @@ import org.springframework.jdbc.support.GeneratedKeyHolder;
 import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.stereotype.Repository;
 
+import com.example.starter.maintenance.domain.CertificationSnapshot;
 import com.example.starter.maintenance.domain.Equipment;
 import com.example.starter.maintenance.domain.MaintenanceRecord;
 import com.example.starter.maintenance.domain.Reading;
@@ -31,24 +32,30 @@ public class EquipmentRepository {
     }
 
     private static OffsetDateTime utc(Instant instant) {
-        return instant.atOffset(ZoneOffset.UTC);
+        return instant == null ? null : instant.atOffset(ZoneOffset.UTC);
     }
 
     private static Instant readInstant(java.sql.ResultSet rs, String column) throws java.sql.SQLException {
-        return rs.getObject(column, OffsetDateTime.class).toInstant();
+        OffsetDateTime value = rs.getObject(column, OffsetDateTime.class);
+        return value == null ? null : value.toInstant();
     }
 
     private static final RowMapper<Equipment> EQUIPMENT_MAPPER = (rs, rowNum) -> new Equipment(
             rs.getString("equipment_id"),
             rs.getLong("maintenance_period_minutes"),
-            rs.getLong("version"));
+            rs.getLong("version"),
+            readInstant(rs, "retired_at"));
 
     private static final RowMapper<Reading> READING_MAPPER = (rs, rowNum) -> new Reading(
             rs.getString("equipment_id"),
             rs.getString("reading_id"),
             readInstant(rs, "sampled_at"),
             rs.getLong("cumulative_minutes"),
-            rs.getInt("revision_no"));
+            rs.getInt("revision_no"),
+            rs.getString("cert_status"),
+            rs.getString("recorded_by"),
+            rs.getString("certified_by"),
+            readInstant(rs, "certified_at"));
 
     private static final RowMapper<MaintenanceRecord> MAINTENANCE_MAPPER = (rs, rowNum) -> new MaintenanceRecord(
             rs.getLong("maintenance_id"),
@@ -58,6 +65,24 @@ public class EquipmentRepository {
             readInstant(rs, "anchor_sampled_at"),
             rs.getLong("anchor_cumulative_minutes"),
             readInstant(rs, "completed_at"));
+
+    private static final RowMapper<CertificationSnapshot> SNAPSHOT_MAPPER = (rs, rowNum) -> new CertificationSnapshot(
+            rs.getLong("snapshot_id"),
+            rs.getString("cert_key"),
+            rs.getString("equipment_id"),
+            rs.getString("reading_id"),
+            rs.getInt("revision_no"),
+            rs.getString("recorded_by"),
+            rs.getString("certified_by"),
+            rs.getLong("cumulative_minutes"),
+            rs.getInt("batch_seq"),
+            rs.getLong("latest_cumulative_minutes"),
+            rs.getLong("run_minutes"),
+            rs.getString("due_status"),
+            readInstant(rs, "certified_at"));
+
+    private static final String READING_COLUMNS = "equipment_id, reading_id, sampled_at, cumulative_minutes,"
+            + " revision_no, cert_status, recorded_by, certified_by, certified_at";
 
     // ---------- 设备 ----------
 
@@ -69,7 +94,8 @@ public class EquipmentRepository {
 
     public Optional<Equipment> findEquipment(String equipmentId) {
         List<Equipment> rows = jdbc.query(
-                "SELECT equipment_id, maintenance_period_minutes, version FROM equipment WHERE equipment_id = ?",
+                "SELECT equipment_id, maintenance_period_minutes, version, retired_at"
+                        + " FROM equipment WHERE equipment_id = ?",
                 EQUIPMENT_MAPPER, equipmentId);
         return rows.stream().findFirst();
     }
@@ -77,8 +103,8 @@ public class EquipmentRepository {
     /** 悲观行锁：同一设备的写操作串行化，保证版本校验与业务变更原子。 */
     public Optional<Equipment> findEquipmentForUpdate(String equipmentId) {
         List<Equipment> rows = jdbc.query(
-                "SELECT equipment_id, maintenance_period_minutes, version FROM equipment"
-                        + " WHERE equipment_id = ? FOR UPDATE",
+                "SELECT equipment_id, maintenance_period_minutes, version, retired_at"
+                        + " FROM equipment WHERE equipment_id = ? FOR UPDATE",
                 EQUIPMENT_MAPPER, equipmentId);
         return rows.stream().findFirst();
     }
@@ -87,18 +113,25 @@ public class EquipmentRepository {
         jdbc.update("UPDATE equipment SET version = version + 1 WHERE equipment_id = ?", equipmentId);
     }
 
+    public void retireEquipment(String equipmentId, Instant retiredAt) {
+        jdbc.update("UPDATE equipment SET retired_at = ? WHERE equipment_id = ?",
+                utc(retiredAt), equipmentId);
+    }
+
     // ---------- 读数 ----------
 
     public void insertReading(Reading reading, Instant createdAt) {
         jdbc.update("INSERT INTO reading (equipment_id, reading_id, sampled_at, cumulative_minutes,"
-                        + " revision_no, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?)",
+                        + " revision_no, cert_status, recorded_by, created_at, updated_at)"
+                        + " VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)",
                 reading.equipmentId(), reading.readingId(), utc(reading.sampledAt()),
-                reading.cumulativeMinutes(), utc(createdAt), utc(createdAt));
+                reading.cumulativeMinutes(), Reading.STATUS_PENDING, reading.recordedBy(),
+                utc(createdAt), utc(createdAt));
     }
 
     public Optional<Reading> findReading(String equipmentId, String readingId) {
         List<Reading> rows = jdbc.query(
-                "SELECT equipment_id, reading_id, sampled_at, cumulative_minutes, revision_no"
+                "SELECT " + READING_COLUMNS
                         + " FROM reading WHERE equipment_id = ? AND reading_id = ?",
                 READING_MAPPER, equipmentId, readingId);
         return rows.stream().findFirst();
@@ -106,50 +139,52 @@ public class EquipmentRepository {
 
     public Optional<Reading> findReadingAt(String equipmentId, Instant sampledAt) {
         List<Reading> rows = jdbc.query(
-                "SELECT equipment_id, reading_id, sampled_at, cumulative_minutes, revision_no"
+                "SELECT " + READING_COLUMNS
                         + " FROM reading WHERE equipment_id = ? AND sampled_at = ?",
                 READING_MAPPER, equipmentId, utc(sampledAt));
         return rows.stream().findFirst();
     }
 
-    /** 采样时刻严格早于给定时刻的最近一条读数。 */
-    public Optional<Reading> findPrevReading(String equipmentId, Instant sampledAt) {
+    /** 最新一条已认证读数（PENDING 读数不参与累计工时与保养判定）。 */
+    public Optional<Reading> findLatestCertifiedReading(String equipmentId) {
         List<Reading> rows = jdbc.query(
-                "SELECT equipment_id, reading_id, sampled_at, cumulative_minutes, revision_no"
-                        + " FROM reading WHERE equipment_id = ? AND sampled_at < ?"
+                "SELECT " + READING_COLUMNS
+                        + " FROM reading WHERE equipment_id = ? AND cert_status = 'CERTIFIED'"
                         + " ORDER BY sampled_at DESC LIMIT 1",
-                READING_MAPPER, equipmentId, utc(sampledAt));
-        return rows.stream().findFirst();
-    }
-
-    /** 采样时刻严格晚于给定时刻的最近一条读数。 */
-    public Optional<Reading> findNextReading(String equipmentId, Instant sampledAt) {
-        List<Reading> rows = jdbc.query(
-                "SELECT equipment_id, reading_id, sampled_at, cumulative_minutes, revision_no"
-                        + " FROM reading WHERE equipment_id = ? AND sampled_at > ?"
-                        + " ORDER BY sampled_at ASC LIMIT 1",
-                READING_MAPPER, equipmentId, utc(sampledAt));
-        return rows.stream().findFirst();
-    }
-
-    public Optional<Reading> findLatestReading(String equipmentId) {
-        List<Reading> rows = jdbc.query(
-                "SELECT equipment_id, reading_id, sampled_at, cumulative_minutes, revision_no"
-                        + " FROM reading WHERE equipment_id = ? ORDER BY sampled_at DESC LIMIT 1",
                 READING_MAPPER, equipmentId);
         return rows.stream().findFirst();
     }
 
+    /** 全部已认证读数（按采样时刻升序），用于认证前最终序列单调性验证。 */
+    public List<Reading> listCertifiedReadings(String equipmentId) {
+        return jdbc.query(
+                "SELECT " + READING_COLUMNS
+                        + " FROM reading WHERE equipment_id = ? AND cert_status = 'CERTIFIED'"
+                        + " ORDER BY sampled_at ASC, reading_id ASC",
+                READING_MAPPER, equipmentId);
+    }
+
+    /** 修订：更新当前值与录入人，认证状态回到 PENDING（须重新认证）。 */
     public void updateReadingValue(String equipmentId, String readingId, long cumulativeMinutes,
-                                   int newRevisionNo, Instant updatedAt) {
-        jdbc.update("UPDATE reading SET cumulative_minutes = ?, revision_no = ?, updated_at = ?"
+                                   int newRevisionNo, String recordedBy, Instant updatedAt) {
+        jdbc.update("UPDATE reading SET cumulative_minutes = ?, revision_no = ?, recorded_by = ?,"
+                        + " cert_status = ?, certified_by = NULL, certified_at = NULL, updated_at = ?"
                         + " WHERE equipment_id = ? AND reading_id = ?",
-                cumulativeMinutes, newRevisionNo, utc(updatedAt), equipmentId, readingId);
+                cumulativeMinutes, newRevisionNo, recordedBy, Reading.STATUS_PENDING,
+                utc(updatedAt), equipmentId, readingId);
+    }
+
+    /** 认证通过：读数转 CERTIFIED 并记录认证人与认证时刻。 */
+    public void markReadingCertified(String equipmentId, String readingId,
+                                     String certifiedBy, Instant certifiedAt) {
+        jdbc.update("UPDATE reading SET cert_status = ?, certified_by = ?, certified_at = ?"
+                        + " WHERE equipment_id = ? AND reading_id = ?",
+                Reading.STATUS_CERTIFIED, certifiedBy, utc(certifiedAt), equipmentId, readingId);
     }
 
     public List<Reading> listReadings(String equipmentId) {
         return jdbc.query(
-                "SELECT equipment_id, reading_id, sampled_at, cumulative_minutes, revision_no"
+                "SELECT " + READING_COLUMNS
                         + " FROM reading WHERE equipment_id = ? ORDER BY sampled_at ASC, reading_id ASC",
                 READING_MAPPER, equipmentId);
     }
@@ -157,10 +192,13 @@ public class EquipmentRepository {
     // ---------- 修订历史 ----------
 
     public void insertRevision(String equipmentId, String readingId, int revisionNo,
-                               long cumulativeMinutes, String requestId, Instant createdAt) {
+                               long cumulativeMinutes, String recordedBy,
+                               String requestId, Instant createdAt) {
         jdbc.update("INSERT INTO reading_revision (equipment_id, reading_id, revision_no,"
-                        + " cumulative_minutes, request_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                equipmentId, readingId, revisionNo, cumulativeMinutes, requestId, utc(createdAt));
+                        + " cumulative_minutes, recorded_by, request_id, created_at)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                equipmentId, readingId, revisionNo, cumulativeMinutes, recordedBy,
+                requestId, utc(createdAt));
     }
 
     public List<RevisionRow> listRevisions(String equipmentId, String readingId) {
@@ -232,6 +270,30 @@ public class EquipmentRepository {
                 "SELECT COUNT(*) FROM maintenance WHERE equipment_id = ? AND reading_id = ?",
                 Integer.class, equipmentId, readingId);
         return count != null && count > 0;
+    }
+
+    // ---------- 认证快照 ----------
+
+    public void insertCertificationSnapshot(CertificationSnapshot snapshot) {
+        jdbc.update("INSERT INTO certification_snapshot (cert_key, equipment_id, reading_id,"
+                        + " revision_no, recorded_by, certified_by, cumulative_minutes, batch_seq,"
+                        + " latest_cumulative_minutes, run_minutes, due_status, certified_at)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                snapshot.certKey(), snapshot.equipmentId(), snapshot.readingId(),
+                snapshot.revisionNo(), snapshot.recordedBy(), snapshot.certifiedBy(),
+                snapshot.cumulativeMinutes(), snapshot.batchSeq(),
+                snapshot.latestCumulativeMinutes(), snapshot.runMinutes(), snapshot.dueStatus(),
+                utc(snapshot.certifiedAt()));
+    }
+
+    public List<CertificationSnapshot> listCertificationSnapshots(String equipmentId) {
+        return jdbc.query(
+                "SELECT snapshot_id, cert_key, equipment_id, reading_id, revision_no, recorded_by,"
+                        + " certified_by, cumulative_minutes, batch_seq, latest_cumulative_minutes,"
+                        + " run_minutes, due_status, certified_at"
+                        + " FROM certification_snapshot WHERE equipment_id = ?"
+                        + " ORDER BY certified_at ASC, snapshot_id ASC",
+                SNAPSHOT_MAPPER, equipmentId);
     }
 
     // ---------- 幂等去重 ----------

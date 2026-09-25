@@ -12,6 +12,10 @@ import java.time.Instant;
  * @param revisionNo         当前修订号，初始 1
  * @param anchored           是否已被某条保养记录锚定（锚定后不可修订）
  * @param equipmentVersion   操作后的设备版本号（仅写操作响应中有意义，查询时为当前版本）
+ * @param certStatus         认证状态：PENDING / CERTIFIED
+ * @param recordedBy         当前版本录入人
+ * @param certifiedBy        认证人；未认证为 null
+ * @param certifiedAt        认证时刻（UTC）；未认证为 null
  */
 public record ReadingResponse(
         String equipmentId,
@@ -20,5 +24,9 @@ public record ReadingResponse(
         long cumulativeMinutes,
         int revisionNo,
         boolean anchored,
-        long equipmentVersion) {
+        long equipmentVersion,
+        String certStatus,
+        String recordedBy,
+        String certifiedBy,
+        Instant certifiedAt) {
 }

@@ -8,18 +8,23 @@ import org.springframework.stereotype.Service;
 
 import com.example.starter.maintenance.api.ApiException;
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
+import com.example.starter.maintenance.api.dto.CertificationSnapshotView;
+import com.example.starter.maintenance.api.dto.CertifyBatchRequest;
+import com.example.starter.maintenance.api.dto.CertifyBatchResponse;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
 import com.example.starter.maintenance.api.dto.RegisterEquipmentRequest;
+import com.example.starter.maintenance.api.dto.RetireRequest;
+import com.example.starter.maintenance.api.dto.RetireResponse;
 import com.example.starter.maintenance.api.dto.ReviseReadingRequest;
 import com.example.starter.maintenance.api.dto.RevisionView;
 import com.example.starter.maintenance.api.dto.StatusResponse;
 
 /**
  * 设备工时保养外观服务：委托事务服务执行；并发下唯一键冲突（事务已回滚）时，
- * 优先按 requestId 重放已提交的成功结果，否则转换为 409 业务冲突。
+ * 优先按幂等键重放已提交的成功结果，否则转换为 409 业务冲突。
  */
 @Service
 public class EquipmentService {
@@ -50,6 +55,19 @@ public class EquipmentService {
         return txService.completeMaintenance(equipmentId, req);
     }
 
+    public RetireResponse retire(String equipmentId, RetireRequest req) {
+        String fingerprint = equipmentId + "|" + req.expectedVersion();
+        return recoverDuplicateKey(req.requestId(), "RETIRE_EQUIPMENT", fingerprint,
+                RetireResponse.class, () -> txService.retire(equipmentId, req));
+    }
+
+    public CertifyBatchResponse certifyBatch(CertifyBatchRequest req) {
+        String fingerprint = EquipmentTxService.certifyFingerprint(req.certifiedBy(),
+                EquipmentTxService.normalizeBatch(req.items()));
+        return recoverDuplicateKey(req.certKey(), "CERTIFY_READINGS", fingerprint,
+                CertifyBatchResponse.class, () -> txService.certifyBatch(req));
+    }
+
     public StatusResponse getStatus(String equipmentId) {
         return txService.getStatus(equipmentId);
     }
@@ -66,8 +84,12 @@ public class EquipmentService {
         return txService.listMaintenances(equipmentId);
     }
 
+    public List<CertificationSnapshotView> listCertifications(String equipmentId) {
+        return txService.listCertifications(equipmentId);
+    }
+
     /**
-     * 并发唯一键冲突补偿：冲突事务已回滚，若同 requestId 的成功记录已提交则重放（异参抛 409），
+     * 并发唯一键冲突补偿：冲突事务已回滚，若同幂等键的成功记录已提交则重放（异参抛 409），
      * 否则说明是业务唯一键冲突，返回 409。
      */
     private <T> T recoverDuplicateKey(String requestId, String operation, String fingerprint,
