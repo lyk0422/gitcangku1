@@ -77,6 +77,30 @@ public class LoanRecordRepository {
     }
 
     /**
+     * 条件追缴：仅当记录仍为 ACTIVE 时转为 RECLAIMED 终态，历史不可覆盖。
+     *
+     * @return 是否成功追缴（false 表示已被并发归还或追缴）
+     */
+    public boolean completeReclaim(long id) {
+        int updated = jdbc.update("""
+                        UPDATE loan_record
+                        SET status = ?
+                        WHERE id = ? AND status = ?
+                        """,
+                LoanStatus.RECLAIMED.name(), id, LoanStatus.ACTIVE.name());
+        return updated == 1;
+    }
+
+    /**
+     * 查询当前已逾期（ACTIVE 且应还时刻不晚于给定 UTC 时刻）的借出记录，按应还时刻升序。
+     */
+    public List<LoanRecord> findOverdue(LocalDateTime nowUtc) {
+        return jdbc.query(
+                "SELECT * FROM loan_record WHERE status = ? AND due_at <= ? ORDER BY due_at, id",
+                ROW_MAPPER, LoanStatus.ACTIVE.name(), nowUtc);
+    }
+
+    /**
      * 按借用人查询全部借出记录（按发生顺序），逾期标识由服务层按时钟计算。
      */
     public List<LoanRecord> findByBorrower(String borrowerId) {
