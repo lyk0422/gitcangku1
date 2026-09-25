@@ -47,6 +47,7 @@ class EquipmentConcurrencyTests {
     void setUp() {
         jdbc.update("DELETE FROM idempotency_request");
         jdbc.update("DELETE FROM maintenance");
+        jdbc.update("DELETE FROM downtime");
         jdbc.update("DELETE FROM reading_revision");
         jdbc.update("DELETE FROM reading");
         jdbc.update("DELETE FROM equipment");

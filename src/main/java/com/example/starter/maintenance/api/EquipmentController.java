@@ -15,12 +15,15 @@ import org.springframework.web.bind.annotation.RestController;
 
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
+import com.example.starter.maintenance.api.dto.DowntimeResponse;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
+import com.example.starter.maintenance.api.dto.RegisterDowntimeRequest;
 import com.example.starter.maintenance.api.dto.RegisterEquipmentRequest;
 import com.example.starter.maintenance.api.dto.ReviseReadingRequest;
 import com.example.starter.maintenance.api.dto.RevisionView;
+import com.example.starter.maintenance.api.dto.RevokeDowntimeRequest;
 import com.example.starter.maintenance.api.dto.StatusResponse;
 import com.example.starter.maintenance.service.EquipmentService;
 
@@ -92,5 +95,30 @@ public class EquipmentController {
     @GetMapping("/{equipmentId}/maintenances")
     public List<MaintenanceResponse> listMaintenances(@PathVariable String equipmentId) {
         return service.listMaintenances(equipmentId);
+    }
+
+    /**
+     * 登记停机区间：左闭右开，结束晚于开始；起止须落在最早与最晚读数采样时刻之间，
+     * 不得跨越已有保养锚点，与同设备生效区间不得重叠（端点相接合法），违反返回 422。
+     */
+    @PostMapping("/{equipmentId}/downtimes")
+    @ResponseStatus(HttpStatus.CREATED)
+    public DowntimeResponse registerDowntime(@PathVariable String equipmentId,
+                                             @Valid @RequestBody RegisterDowntimeRequest req) {
+        return service.registerDowntime(equipmentId, req);
+    }
+
+    /** 撤销停机区间：扣减量不再参与计算，原区间记录保留且不可改写。 */
+    @PostMapping("/{equipmentId}/downtimes/{downtimeKey}/revoke")
+    public DowntimeResponse revokeDowntime(@PathVariable String equipmentId,
+                                           @PathVariable String downtimeKey,
+                                           @Valid @RequestBody RevokeDowntimeRequest req) {
+        return service.revokeDowntime(equipmentId, downtimeKey, req);
+    }
+
+    /** 停机清单与扣减明细（含已撤销区间，按开始时刻升序）。 */
+    @GetMapping("/{equipmentId}/downtimes")
+    public List<DowntimeResponse> listDowntimes(@PathVariable String equipmentId) {
+        return service.listDowntimes(equipmentId);
     }
 }

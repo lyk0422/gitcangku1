@@ -61,6 +61,8 @@ CREATE TABLE IF NOT EXISTS maintenance (
     anchor_revision_no INT NOT NULL,
     anchor_sampled_at TIMESTAMP WITH TIME ZONE NOT NULL,
     anchor_cumulative_minutes BIGINT NOT NULL,
+    run_minutes BIGINT NOT NULL,
+    downtime_deduction_minutes BIGINT NOT NULL,
     request_id VARCHAR(128) NOT NULL,
     completed_at TIMESTAMP WITH TIME ZONE NOT NULL
 );
@@ -72,8 +74,36 @@ COMMENT ON COLUMN maintenance.reading_id IS '锚点读数标识';
 COMMENT ON COLUMN maintenance.anchor_revision_no IS '锚点读数在保养完成时的修订号';
 COMMENT ON COLUMN maintenance.anchor_sampled_at IS '锚点读数的 UTC 采样时刻（快照）';
 COMMENT ON COLUMN maintenance.anchor_cumulative_minutes IS '锚点读数在保养完成时的累计工时快照（分钟）';
+COMMENT ON COLUMN maintenance.run_minutes IS '保养完成时固化的本轮运行分钟（已扣减锚点之后生效停机区间，为负按 0 计）';
+COMMENT ON COLUMN maintenance.downtime_deduction_minutes IS '保养完成时固化的停机扣减合计（分钟）：当前锚点之后全部生效停机区间扣减量之和';
 COMMENT ON COLUMN maintenance.request_id IS '完成保养请求的 requestId';
 COMMENT ON COLUMN maintenance.completed_at IS '保养完成登记时刻（UTC）';
+
+-- 停机区间：downtime_key 全局唯一；左闭右开 [start_at, end_at)；撤销后记录保留且不可改写。
+CREATE TABLE IF NOT EXISTS downtime (
+    downtime_key VARCHAR(64) NOT NULL PRIMARY KEY,
+    equipment_id VARCHAR(64) NOT NULL,
+    start_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    end_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    reason VARCHAR(512) NOT NULL,
+    deduction_minutes BIGINT NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    request_id VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    revoked_at TIMESTAMP WITH TIME ZONE
+);
+CREATE INDEX IF NOT EXISTS idx_downtime_equipment ON downtime (equipment_id, start_at);
+COMMENT ON TABLE downtime IS '停机区间：同设备生效区间不得重叠（端点相接合法）；起止须落在最早与最晚读数采样时刻之间且不跨越保养锚点';
+COMMENT ON COLUMN downtime.downtime_key IS '停机区间标识，全局唯一';
+COMMENT ON COLUMN downtime.equipment_id IS '所属设备标识';
+COMMENT ON COLUMN downtime.start_at IS '停机开始时刻（UTC，含）；须不早于设备最早读数采样时刻';
+COMMENT ON COLUMN downtime.end_at IS '停机结束时刻（UTC，不含）；须晚于开始时刻且不晚于设备最晚读数采样时刻';
+COMMENT ON COLUMN downtime.reason IS '停机原因，非空';
+COMMENT ON COLUMN downtime.deduction_minutes IS '区间扣减量（分钟）：不晚于结束时刻的最近读数累计分钟减去不晚于开始时刻的最近读数累计分钟，取不到读数一侧为 0；读数新增/修订时重算，撤销后冻结';
+COMMENT ON COLUMN downtime.status IS '区间状态：ACTIVE=生效，REVOKED=已撤销（不再参与扣减，记录保留不可改写）';
+COMMENT ON COLUMN downtime.request_id IS '登记停机请求的 requestId';
+COMMENT ON COLUMN downtime.created_at IS '登记时刻（UTC）';
+COMMENT ON COLUMN downtime.revoked_at IS '撤销时刻（UTC）；未撤销为 NULL';
 
 -- 幂等去重表：requestId 全局唯一；仅成功结果占键，失败回滚不占键。
 CREATE TABLE IF NOT EXISTS idempotency_request (

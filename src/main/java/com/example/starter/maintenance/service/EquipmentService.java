@@ -9,12 +9,15 @@ import org.springframework.stereotype.Service;
 import com.example.starter.maintenance.api.ApiException;
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
+import com.example.starter.maintenance.api.dto.DowntimeResponse;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
+import com.example.starter.maintenance.api.dto.RegisterDowntimeRequest;
 import com.example.starter.maintenance.api.dto.RegisterEquipmentRequest;
 import com.example.starter.maintenance.api.dto.ReviseReadingRequest;
 import com.example.starter.maintenance.api.dto.RevisionView;
+import com.example.starter.maintenance.api.dto.RevokeDowntimeRequest;
 import com.example.starter.maintenance.api.dto.StatusResponse;
 
 /**
@@ -64,6 +67,22 @@ public class EquipmentService {
 
     public List<MaintenanceResponse> listMaintenances(String equipmentId) {
         return txService.listMaintenances(equipmentId);
+    }
+
+    public DowntimeResponse registerDowntime(String equipmentId, RegisterDowntimeRequest req) {
+        String fingerprint = equipmentId + "|" + req.downtimeKey() + "|" + req.startAt()
+                + "|" + req.endAt() + "|" + req.reason() + "|" + req.expectedVersion();
+        return recoverDuplicateKey(req.requestId(), "REGISTER_DOWNTIME", fingerprint,
+                DowntimeResponse.class, () -> txService.registerDowntime(equipmentId, req));
+    }
+
+    public DowntimeResponse revokeDowntime(String equipmentId, String downtimeKey,
+                                           RevokeDowntimeRequest req) {
+        return txService.revokeDowntime(equipmentId, downtimeKey, req);
+    }
+
+    public List<DowntimeResponse> listDowntimes(String equipmentId) {
+        return txService.listDowntimes(equipmentId);
     }
 
     /**

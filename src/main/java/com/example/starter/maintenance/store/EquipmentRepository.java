@@ -14,6 +14,7 @@ import org.springframework.jdbc.support.GeneratedKeyHolder;
 import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.stereotype.Repository;
 
+import com.example.starter.maintenance.domain.Downtime;
 import com.example.starter.maintenance.domain.Equipment;
 import com.example.starter.maintenance.domain.MaintenanceRecord;
 import com.example.starter.maintenance.domain.Reading;
@@ -57,7 +58,31 @@ public class EquipmentRepository {
             rs.getInt("anchor_revision_no"),
             readInstant(rs, "anchor_sampled_at"),
             rs.getLong("anchor_cumulative_minutes"),
+            rs.getLong("run_minutes"),
+            rs.getLong("downtime_deduction_minutes"),
             readInstant(rs, "completed_at"));
+
+    private static final RowMapper<Downtime> DOWNTIME_MAPPER = (rs, rowNum) -> new Downtime(
+            rs.getString("downtime_key"),
+            rs.getString("equipment_id"),
+            readInstant(rs, "start_at"),
+            readInstant(rs, "end_at"),
+            rs.getString("reason"),
+            rs.getLong("deduction_minutes"),
+            rs.getString("status"),
+            readInstant(rs, "created_at"),
+            rs.getObject("revoked_at", OffsetDateTime.class) == null
+                    ? null
+                    : rs.getObject("revoked_at", OffsetDateTime.class).toInstant());
+
+    private static final String MAINTENANCE_COLUMNS =
+            "maintenance_id, equipment_id, reading_id, anchor_revision_no,"
+                    + " anchor_sampled_at, anchor_cumulative_minutes, run_minutes,"
+                    + " downtime_deduction_minutes, completed_at";
+
+    private static final String DOWNTIME_COLUMNS =
+            "downtime_key, equipment_id, start_at, end_at, reason, deduction_minutes,"
+                    + " status, created_at, revoked_at";
 
     // ---------- 设备 ----------
 
@@ -182,21 +207,25 @@ public class EquipmentRepository {
 
     public long insertMaintenance(String equipmentId, String readingId, int anchorRevisionNo,
                                   Instant anchorSampledAt, long anchorCumulativeMinutes,
+                                  long runMinutes, long downtimeDeductionMinutes,
                                   String requestId, Instant completedAt) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(connection -> {
             PreparedStatement ps = connection.prepareStatement(
                     "INSERT INTO maintenance (equipment_id, reading_id, anchor_revision_no,"
-                            + " anchor_sampled_at, anchor_cumulative_minutes, request_id, completed_at)"
-                            + " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            + " anchor_sampled_at, anchor_cumulative_minutes, run_minutes,"
+                            + " downtime_deduction_minutes, request_id, completed_at)"
+                            + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, equipmentId);
             ps.setString(2, readingId);
             ps.setInt(3, anchorRevisionNo);
             ps.setObject(4, utc(anchorSampledAt));
             ps.setLong(5, anchorCumulativeMinutes);
-            ps.setString(6, requestId);
-            ps.setObject(7, utc(completedAt));
+            ps.setLong(6, runMinutes);
+            ps.setLong(7, downtimeDeductionMinutes);
+            ps.setString(8, requestId);
+            ps.setObject(9, utc(completedAt));
             return ps;
         }, keyHolder);
         Number key = keyHolder.getKey();
@@ -209,8 +238,7 @@ public class EquipmentRepository {
     /** 最近一次保养（锚点时间最大者；锚点时间严格递增，故唯一）。 */
     public Optional<MaintenanceRecord> findLastMaintenance(String equipmentId) {
         List<MaintenanceRecord> rows = jdbc.query(
-                "SELECT maintenance_id, equipment_id, reading_id, anchor_revision_no,"
-                        + " anchor_sampled_at, anchor_cumulative_minutes, completed_at"
+                "SELECT " + MAINTENANCE_COLUMNS
                         + " FROM maintenance WHERE equipment_id = ?"
                         + " ORDER BY anchor_sampled_at DESC, maintenance_id DESC LIMIT 1",
                 MAINTENANCE_MAPPER, equipmentId);
@@ -219,8 +247,7 @@ public class EquipmentRepository {
 
     public List<MaintenanceRecord> listMaintenances(String equipmentId) {
         return jdbc.query(
-                "SELECT maintenance_id, equipment_id, reading_id, anchor_revision_no,"
-                        + " anchor_sampled_at, anchor_cumulative_minutes, completed_at"
+                "SELECT " + MAINTENANCE_COLUMNS
                         + " FROM maintenance WHERE equipment_id = ?"
                         + " ORDER BY anchor_sampled_at ASC, maintenance_id ASC",
                 MAINTENANCE_MAPPER, equipmentId);
@@ -232,6 +259,74 @@ public class EquipmentRepository {
                 "SELECT COUNT(*) FROM maintenance WHERE equipment_id = ? AND reading_id = ?",
                 Integer.class, equipmentId, readingId);
         return count != null && count > 0;
+    }
+
+    // ---------- 停机区间 ----------
+
+    public void insertDowntime(Downtime downtime, String requestId, Instant createdAt) {
+        jdbc.update("INSERT INTO downtime (downtime_key, equipment_id, start_at, end_at, reason,"
+                        + " deduction_minutes, status, request_id, created_at, revoked_at)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                downtime.downtimeKey(), downtime.equipmentId(), utc(downtime.startAt()),
+                utc(downtime.endAt()), downtime.reason(), downtime.deductionMinutes(),
+                downtime.status(), requestId, utc(createdAt));
+    }
+
+    /** 按全局唯一键查询停机区间（不限设备）。 */
+    public Optional<Downtime> findDowntime(String downtimeKey) {
+        List<Downtime> rows = jdbc.query(
+                "SELECT " + DOWNTIME_COLUMNS + " FROM downtime WHERE downtime_key = ?",
+                DOWNTIME_MAPPER, downtimeKey);
+        return rows.stream().findFirst();
+    }
+
+    /** 设备全部停机区间（含已撤销），按开始时刻升序。 */
+    public List<Downtime> listDowntimes(String equipmentId) {
+        return jdbc.query(
+                "SELECT " + DOWNTIME_COLUMNS + " FROM downtime WHERE equipment_id = ?"
+                        + " ORDER BY start_at ASC, downtime_key ASC",
+                DOWNTIME_MAPPER, equipmentId);
+    }
+
+    /** 设备当前生效（未撤销）的停机区间。 */
+    public List<Downtime> listActiveDowntimes(String equipmentId) {
+        return jdbc.query(
+                "SELECT " + DOWNTIME_COLUMNS + " FROM downtime WHERE equipment_id = ?"
+                        + " AND status = '" + Downtime.STATUS_ACTIVE + "'"
+                        + " ORDER BY start_at ASC, downtime_key ASC",
+                DOWNTIME_MAPPER, equipmentId);
+    }
+
+    /** 重算并更新生效区间的扣减量（读数新增/修订后调用）。 */
+    public void updateDowntimeDeduction(String downtimeKey, long deductionMinutes) {
+        jdbc.update("UPDATE downtime SET deduction_minutes = ? WHERE downtime_key = ?",
+                deductionMinutes, downtimeKey);
+    }
+
+    /** 撤销停机区间：置状态与撤销时刻，其余字段不可改写。 */
+    public void revokeDowntime(String downtimeKey, Instant revokedAt) {
+        jdbc.update("UPDATE downtime SET status = '" + Downtime.STATUS_REVOKED + "', revoked_at = ?"
+                        + " WHERE downtime_key = ?",
+                utc(revokedAt), downtimeKey);
+    }
+
+    /** 采样时刻不晚于给定时刻的最近一条读数（停机扣减边界取值）。 */
+    public Optional<Reading> findReadingAtOrBefore(String equipmentId, Instant sampledAt) {
+        List<Reading> rows = jdbc.query(
+                "SELECT equipment_id, reading_id, sampled_at, cumulative_minutes, revision_no"
+                        + " FROM reading WHERE equipment_id = ? AND sampled_at <= ?"
+                        + " ORDER BY sampled_at DESC LIMIT 1",
+                READING_MAPPER, equipmentId, utc(sampledAt));
+        return rows.stream().findFirst();
+    }
+
+    /** 设备最早一条读数（按采样时刻）。 */
+    public Optional<Reading> findEarliestReading(String equipmentId) {
+        List<Reading> rows = jdbc.query(
+                "SELECT equipment_id, reading_id, sampled_at, cumulative_minutes, revision_no"
+                        + " FROM reading WHERE equipment_id = ? ORDER BY sampled_at ASC LIMIT 1",
+                READING_MAPPER, equipmentId);
+        return rows.stream().findFirst();
     }
 
     // ---------- 幂等去重 ----------

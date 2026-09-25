@@ -12,7 +12,8 @@ import java.time.Instant;
  * @param latestCumulativeMinutes                最新读数累计工时（无读数时为 0）
  * @param lastMaintenanceAnchorSampledAt         最近保养锚点时刻（无保养时为 null）
  * @param lastMaintenanceAnchorCumulativeMinutes 最近保养锚点工时快照（无保养时为 0）
- * @param runMinutes                             本轮运行分钟
+ * @param downtimeDeductionMinutes               停机扣减合计（分钟）：最近保养锚点之后全部生效停机区间扣减量之和
+ * @param runMinutes                             本轮运行分钟 = 最新读数 - 锚点工时 - 停机扣减合计，为负按 0 计
  * @param status                                 OK 或 DUE（runMinutes 达到保养周期即 DUE）
  */
 public record StatusResponse(
@@ -23,6 +24,7 @@ public record StatusResponse(
         long latestCumulativeMinutes,
         Instant lastMaintenanceAnchorSampledAt,
         long lastMaintenanceAnchorCumulativeMinutes,
+        long downtimeDeductionMinutes,
         long runMinutes,
         String status) {
 }

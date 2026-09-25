@@ -11,13 +11,17 @@ import org.springframework.transaction.annotation.Transactional;
 import com.example.starter.maintenance.api.ApiException;
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
+import com.example.starter.maintenance.api.dto.DowntimeResponse;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
+import com.example.starter.maintenance.api.dto.RegisterDowntimeRequest;
 import com.example.starter.maintenance.api.dto.RegisterEquipmentRequest;
 import com.example.starter.maintenance.api.dto.ReviseReadingRequest;
 import com.example.starter.maintenance.api.dto.RevisionView;
+import com.example.starter.maintenance.api.dto.RevokeDowntimeRequest;
 import com.example.starter.maintenance.api.dto.StatusResponse;
+import com.example.starter.maintenance.domain.Downtime;
 import com.example.starter.maintenance.domain.Equipment;
 import com.example.starter.maintenance.domain.MaintenanceRecord;
 import com.example.starter.maintenance.domain.Reading;
@@ -80,6 +84,7 @@ public class EquipmentTxService {
                             now);
                     repository.insertRevision(equipmentId, req.readingId(), 1,
                             req.cumulativeMinutes(), req.requestId(), now);
+                    recomputeDowntimeDeductions(equipmentId);
                     repository.incrementVersion(equipmentId);
                     return new ReadingResponse(equipmentId, req.readingId(), req.sampledAt(),
                             req.cumulativeMinutes(), 1, false, equipment.version() + 1);
@@ -110,6 +115,7 @@ public class EquipmentTxService {
                             newRevisionNo, now);
                     repository.insertRevision(equipmentId, readingId, newRevisionNo,
                             req.cumulativeMinutes(), req.requestId(), now);
+                    recomputeDowntimeDeductions(equipmentId);
                     repository.incrementVersion(equipmentId);
                     return new ReadingResponse(equipmentId, readingId, reading.sampledAt(),
                             req.cumulativeMinutes(), newRevisionNo, false, equipment.version() + 1);
@@ -139,14 +145,75 @@ public class EquipmentTxService {
                         throw ApiException.unprocessable("ANCHOR_TIME_NOT_LATER",
                                 "保养锚点时间必须晚于上次保养锚点时间");
                     }
+                    // 按新锚点结算：固化当时运行分钟与该锚点之后生效停机区间的扣减合计
+                    long deductionTotal = deductionTotalAfter(equipmentId, anchor.sampledAt());
+                    long latestCumulative = repository.findLatestReading(equipmentId)
+                            .map(Reading::cumulativeMinutes).orElse(0L);
+                    long runMinutes = Math.max(0L,
+                            latestCumulative - anchor.cumulativeMinutes() - deductionTotal);
                     Instant now = clock.instant();
                     long maintenanceId = repository.insertMaintenance(equipmentId, req.readingId(),
                             req.anchorRevisionNo(), anchor.sampledAt(), anchor.cumulativeMinutes(),
-                            req.requestId(), now);
+                            runMinutes, deductionTotal, req.requestId(), now);
                     repository.incrementVersion(equipmentId);
                     return new MaintenanceResponse(maintenanceId, equipmentId, req.readingId(),
                             req.anchorRevisionNo(), anchor.sampledAt(), anchor.cumulativeMinutes(),
-                            now, equipment.version() + 1);
+                            runMinutes, deductionTotal, now, equipment.version() + 1);
+                });
+    }
+
+    // ---------- 登记停机区间 ----------
+
+    @Transactional
+    public DowntimeResponse registerDowntime(String equipmentId, RegisterDowntimeRequest req) {
+        Equipment equipment = lockEquipment(equipmentId);
+        String fingerprint = equipmentId + "|" + req.downtimeKey() + "|" + req.startAt()
+                + "|" + req.endAt() + "|" + req.reason() + "|" + req.expectedVersion();
+        return idempotency.execute(req.requestId(), "REGISTER_DOWNTIME", fingerprint,
+                DowntimeResponse.class, () -> {
+                    checkVersion(equipment, req.expectedVersion());
+                    if (repository.findDowntime(req.downtimeKey()).isPresent()) {
+                        throw ApiException.conflict("DOWNTIME_EXISTS",
+                                "停机区间标识已存在：" + req.downtimeKey());
+                    }
+                    checkDowntimeRules(equipmentId, req.startAt(), req.endAt());
+                    Instant now = clock.instant();
+                    long deduction = computeDeduction(equipmentId, req.startAt(), req.endAt());
+                    Downtime downtime = new Downtime(req.downtimeKey(), equipmentId,
+                            req.startAt(), req.endAt(), req.reason(), deduction,
+                            Downtime.STATUS_ACTIVE, now, null);
+                    repository.insertDowntime(downtime, req.requestId(), now);
+                    repository.incrementVersion(equipmentId);
+                    return toDowntimeResponse(downtime, equipment.version() + 1);
+                });
+    }
+
+    // ---------- 撤销停机区间 ----------
+
+    @Transactional
+    public DowntimeResponse revokeDowntime(String equipmentId, String downtimeKey,
+                                           RevokeDowntimeRequest req) {
+        Equipment equipment = lockEquipment(equipmentId);
+        String fingerprint = equipmentId + "|" + downtimeKey + "|" + req.expectedVersion();
+        return idempotency.execute(req.requestId(), "REVOKE_DOWNTIME", fingerprint,
+                DowntimeResponse.class, () -> {
+                    checkVersion(equipment, req.expectedVersion());
+                    Downtime downtime = repository.findDowntime(downtimeKey)
+                            .filter(d -> d.equipmentId().equals(equipmentId))
+                            .orElseThrow(() -> ApiException.notFound("DOWNTIME_NOT_FOUND",
+                                    "停机区间不存在：" + downtimeKey));
+                    if (Downtime.STATUS_REVOKED.equals(downtime.status())) {
+                        throw ApiException.conflict("DOWNTIME_ALREADY_REVOKED",
+                                "停机区间已撤销，不可重复撤销：" + downtimeKey);
+                    }
+                    Instant now = clock.instant();
+                    repository.revokeDowntime(downtimeKey, now);
+                    repository.incrementVersion(equipmentId);
+                    Downtime revoked = new Downtime(downtime.downtimeKey(), downtime.equipmentId(),
+                            downtime.startAt(), downtime.endAt(), downtime.reason(),
+                            downtime.deductionMinutes(), Downtime.STATUS_REVOKED,
+                            downtime.createdAt(), now);
+                    return toDowntimeResponse(revoked, equipment.version() + 1);
                 });
     }
 
@@ -160,12 +227,14 @@ public class EquipmentTxService {
         Optional<MaintenanceRecord> last = repository.findLastMaintenance(equipmentId);
         long latestCumulative = latest.map(Reading::cumulativeMinutes).orElse(0L);
         long anchorCumulative = last.map(MaintenanceRecord::anchorCumulativeMinutes).orElse(0L);
-        long runMinutes = latestCumulative - anchorCumulative;
+        long deductionTotal = deductionTotalAfter(equipmentId,
+                last.map(MaintenanceRecord::anchorSampledAt).orElse(null));
+        long runMinutes = Math.max(0L, latestCumulative - anchorCumulative - deductionTotal);
         String status = runMinutes >= equipment.maintenancePeriodMinutes() ? "DUE" : "OK";
         return new StatusResponse(equipmentId, equipment.version(), equipment.maintenancePeriodMinutes(),
                 latest.map(Reading::sampledAt).orElse(null), latestCumulative,
                 last.map(MaintenanceRecord::anchorSampledAt).orElse(null), anchorCumulative,
-                runMinutes, status);
+                deductionTotal, runMinutes, status);
     }
 
     @Transactional(readOnly = true)
@@ -197,7 +266,17 @@ public class EquipmentTxService {
         return repository.listMaintenances(equipmentId).stream()
                 .map(record -> new MaintenanceResponse(record.maintenanceId(), equipmentId,
                         record.readingId(), record.anchorRevisionNo(), record.anchorSampledAt(),
-                        record.anchorCumulativeMinutes(), record.completedAt(), 0L))
+                        record.anchorCumulativeMinutes(), record.runMinutes(),
+                        record.downtimeDeductionMinutes(), record.completedAt(), 0L))
+                .toList();
+    }
+
+    @Transactional(readOnly = true)
+    public List<DowntimeResponse> listDowntimes(String equipmentId) {
+        Equipment equipment = repository.findEquipment(equipmentId)
+                .orElseThrow(() -> equipmentNotFound(equipmentId));
+        return repository.listDowntimes(equipmentId).stream()
+                .map(downtime -> toDowntimeResponse(downtime, equipment.version()))
                 .toList();
     }
 
@@ -231,5 +310,76 @@ public class EquipmentTxService {
             throw ApiException.unprocessable("READING_ORDER_VIOLATION",
                     "累计工时大于后一条读数（" + next.get().cumulativeMinutes() + "），违反单调不减约束");
         }
+    }
+
+    /**
+     * 停机区间登记规则：结束晚于开始；起止落在最早与最晚读数采样时刻之间（端点含）；
+     * 不跨越任何已有保养锚点时刻；与同设备生效区间不重叠（仅端点相接合法）。
+     */
+    private void checkDowntimeRules(String equipmentId, Instant startAt, Instant endAt) {
+        if (!endAt.isAfter(startAt)) {
+            throw ApiException.unprocessable("DOWNTIME_TIME_INVALID",
+                    "停机结束时刻必须晚于开始时刻");
+        }
+        Optional<Reading> earliest = repository.findEarliestReading(equipmentId);
+        Optional<Reading> latest = repository.findLatestReading(equipmentId);
+        if (earliest.isEmpty() || startAt.isBefore(earliest.get().sampledAt())
+                || endAt.isAfter(latest.get().sampledAt())) {
+            throw ApiException.unprocessable("DOWNTIME_OUT_OF_RANGE",
+                    "停机起止时刻须落在设备最早与最晚读数采样时刻之间");
+        }
+        for (MaintenanceRecord record : repository.listMaintenances(equipmentId)) {
+            Instant anchorTime = record.anchorSampledAt();
+            if (startAt.isBefore(anchorTime) && anchorTime.isBefore(endAt)) {
+                throw ApiException.unprocessable("DOWNTIME_CROSSES_ANCHOR",
+                        "停机区间不得跨越已有保养锚点时刻：" + anchorTime);
+            }
+        }
+        for (Downtime active : repository.listActiveDowntimes(equipmentId)) {
+            if (active.startAt().isBefore(endAt) && startAt.isBefore(active.endAt())) {
+                throw ApiException.unprocessable("DOWNTIME_OVERLAP",
+                        "停机区间与生效区间重叠：" + active.downtimeKey());
+            }
+        }
+    }
+
+    /**
+     * 区间扣减量：采样时刻不晚于结束时刻的最近读数累计分钟，
+     * 减去不晚于开始时刻的最近读数累计分钟；任一侧取不到读数时该侧按 0 计。
+     */
+    private long computeDeduction(String equipmentId, Instant startAt, Instant endAt) {
+        long endCumulative = repository.findReadingAtOrBefore(equipmentId, endAt)
+                .map(Reading::cumulativeMinutes).orElse(0L);
+        long startCumulative = repository.findReadingAtOrBefore(equipmentId, startAt)
+                .map(Reading::cumulativeMinutes).orElse(0L);
+        return endCumulative - startCumulative;
+    }
+
+    /** 读数新增/修订后重算该设备全部生效停机区间的扣减量（已撤销区间冻结不改写）。 */
+    private void recomputeDowntimeDeductions(String equipmentId) {
+        for (Downtime active : repository.listActiveDowntimes(equipmentId)) {
+            long deduction = computeDeduction(equipmentId, active.startAt(), active.endAt());
+            if (deduction != active.deductionMinutes()) {
+                repository.updateDowntimeDeduction(active.downtimeKey(), deduction);
+            }
+        }
+    }
+
+    /**
+     * 指定锚点时刻之后全部生效停机区间的扣减量之和；anchorTime 为 null 表示尚无保养，
+     * 统计全部生效区间。区间不得跨越锚点，故开始时刻不早于锚点即整体位于锚点之后。
+     */
+    private long deductionTotalAfter(String equipmentId, Instant anchorTime) {
+        return repository.listActiveDowntimes(equipmentId).stream()
+                .filter(d -> anchorTime == null || !d.startAt().isBefore(anchorTime))
+                .mapToLong(Downtime::deductionMinutes)
+                .sum();
+    }
+
+    private DowntimeResponse toDowntimeResponse(Downtime downtime, long equipmentVersion) {
+        return new DowntimeResponse(downtime.downtimeKey(), downtime.equipmentId(),
+                downtime.startAt(), downtime.endAt(), downtime.reason(),
+                downtime.deductionMinutes(), downtime.status(), downtime.createdAt(),
+                downtime.revokedAt(), equipmentVersion);
     }
 }
