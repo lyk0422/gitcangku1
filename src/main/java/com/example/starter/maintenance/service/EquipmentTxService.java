@@ -10,14 +10,19 @@ import org.springframework.transaction.annotation.Transactional;
 
 import com.example.starter.maintenance.api.ApiException;
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
+import com.example.starter.maintenance.api.dto.ApplyDeferralRequest;
+import com.example.starter.maintenance.api.dto.ApproveDeferralRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
+import com.example.starter.maintenance.api.dto.DeferralResponse;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
 import com.example.starter.maintenance.api.dto.RegisterEquipmentRequest;
+import com.example.starter.maintenance.api.dto.RejectDeferralRequest;
 import com.example.starter.maintenance.api.dto.ReviseReadingRequest;
 import com.example.starter.maintenance.api.dto.RevisionView;
 import com.example.starter.maintenance.api.dto.StatusResponse;
+import com.example.starter.maintenance.domain.Deferral;
 import com.example.starter.maintenance.domain.Equipment;
 import com.example.starter.maintenance.domain.MaintenanceRecord;
 import com.example.starter.maintenance.domain.Reading;
@@ -65,6 +70,7 @@ public class EquipmentTxService {
         return idempotency.execute(req.requestId(), "ADD_READING", fingerprint,
                 ReadingResponse.class, () -> {
                     checkVersion(equipment, req.expectedVersion());
+                    checkReadingAllowed(equipment);
                     if (repository.findReading(equipmentId, req.readingId()).isPresent()) {
                         throw ApiException.conflict("READING_EXISTS", "读数已存在：" + req.readingId());
                     }
@@ -143,6 +149,8 @@ public class EquipmentTxService {
                     long maintenanceId = repository.insertMaintenance(equipmentId, req.readingId(),
                             req.anchorRevisionNo(), anchor.sampledAt(), anchor.cumulativeMinutes(),
                             req.requestId(), now);
+                    // 保养完成即进入新周期：待审批延期自动失效，延期额度归零
+                    repository.expirePendingDeferrals(equipmentId, now);
                     repository.incrementVersion(equipmentId);
                     return new MaintenanceResponse(maintenanceId, equipmentId, req.readingId(),
                             req.anchorRevisionNo(), anchor.sampledAt(), anchor.cumulativeMinutes(),
@@ -161,11 +169,19 @@ public class EquipmentTxService {
         long latestCumulative = latest.map(Reading::cumulativeMinutes).orElse(0L);
         long anchorCumulative = last.map(MaintenanceRecord::anchorCumulativeMinutes).orElse(0L);
         long runMinutes = latestCumulative - anchorCumulative;
-        String status = runMinutes >= equipment.maintenancePeriodMinutes() ? "DUE" : "OK";
+        int cycleNo = repository.countMaintenances(equipmentId);
+        long approvedDeferral = repository.sumApprovedDeferMinutes(equipmentId, cycleNo);
+        long effectiveThreshold = equipment.maintenancePeriodMinutes() + approvedDeferral;
+        boolean overdueLocked = isOverdue(equipment.maintenancePeriodMinutes(), approvedDeferral, runMinutes);
+        String status = overdueLocked ? "OVERDUE"
+                : (runMinutes >= equipment.maintenancePeriodMinutes() ? "DUE" : "OK");
+        String pendingDeferralKey = repository.findPendingDeferral(equipmentId)
+                .map(Deferral::deferKey).orElse(null);
         return new StatusResponse(equipmentId, equipment.version(), equipment.maintenancePeriodMinutes(),
                 latest.map(Reading::sampledAt).orElse(null), latestCumulative,
                 last.map(MaintenanceRecord::anchorSampledAt).orElse(null), anchorCumulative,
-                runMinutes, status);
+                runMinutes, approvedDeferral, effectiveThreshold, pendingDeferralKey,
+                overdueLocked, status);
     }
 
     @Transactional(readOnly = true)
@@ -231,5 +247,174 @@ public class EquipmentTxService {
             throw ApiException.unprocessable("READING_ORDER_VIOLATION",
                     "累计工时大于后一条读数（" + next.get().cumulativeMinutes() + "），违反单调不减约束");
         }
+    }
+
+    // ---------- 延期申请 ----------
+
+    @Transactional
+    public DeferralResponse applyDeferral(String equipmentId, ApplyDeferralRequest req) {
+        Equipment equipment = lockEquipment(equipmentId);
+        String fingerprint = equipmentId + "|" + req.deferKey() + "|" + req.deferMinutes()
+                + "|" + req.reason() + "|" + req.applicant();
+        return idempotency.execute(req.requestId(), "APPLY_DEFERRAL", fingerprint,
+                DeferralResponse.class, () -> {
+                    int cycleNo = repository.countMaintenances(equipmentId);
+                    long period = equipment.maintenancePeriodMinutes();
+                    long runMinutes = currentRunMinutes(equipmentId);
+                    long approved = repository.sumApprovedDeferMinutes(equipmentId, cycleNo);
+                    if (isOverdue(period, approved, runMinutes)) {
+                        throw ApiException.conflict("EQUIPMENT_OVERDUE",
+                                "设备已超期封锁（本轮运行 " + runMinutes + " 分钟，生效阈值 "
+                                        + (period + approved) + " 分钟），须先完成保养");
+                    }
+                    if (runMinutes < period) {
+                        throw ApiException.conflict("EQUIPMENT_NOT_DUE",
+                                "设备未处于 DUE（本轮运行 " + runMinutes + " 分钟，保养周期 "
+                                        + period + " 分钟），不可申请延期");
+                    }
+                    if (repository.findPendingDeferral(equipmentId).isPresent()) {
+                        throw ApiException.conflict("DEFERRAL_PENDING_EXISTS",
+                                "同一设备同时只允许一条待审批延期");
+                    }
+                    if (repository.findDeferral(equipmentId, req.deferKey()).isPresent()) {
+                        throw ApiException.conflict("DEFERRAL_KEY_EXISTS",
+                                "延期标识已存在：" + req.deferKey());
+                    }
+                    checkDeferralLimits(period, approved, req.deferMinutes());
+                    long latestCumulative = repository.findLatestReading(equipmentId)
+                            .map(Reading::cumulativeMinutes).orElse(0L);
+                    long deferralId = repository.insertDeferral(equipmentId, req.deferKey(), cycleNo,
+                            req.deferMinutes(), req.reason(), req.applicant(), latestCumulative,
+                            req.requestId(), clock.instant());
+                    return toResponse(repository.findDeferral(equipmentId, req.deferKey())
+                            .orElseThrow(() -> new IllegalStateException("延期记录写入后读取失败："
+                                    + deferralId)));
+                });
+    }
+
+    // ---------- 延期批准 ----------
+
+    @Transactional
+    public DeferralResponse approveDeferral(String equipmentId, String deferKey,
+                                            ApproveDeferralRequest req) {
+        Equipment equipment = lockEquipment(equipmentId);
+        String fingerprint = equipmentId + "|" + deferKey + "|" + req.approver();
+        return idempotency.execute(req.requestId(), "APPROVE_DEFERRAL", fingerprint,
+                DeferralResponse.class, () -> {
+                    Deferral deferral = findPendingDeferralForDecision(equipmentId, deferKey);
+                    if (deferral.applicant().equals(req.approver())) {
+                        throw ApiException.unprocessable("APPROVER_SAME_AS_APPLICANT",
+                                "批准人必须与申请人不同：" + req.approver());
+                    }
+                    long period = equipment.maintenancePeriodMinutes();
+                    long approved = repository.sumApprovedDeferMinutes(equipmentId, deferral.cycleNo());
+                    checkDeferralLimits(period, approved, deferral.deferMinutes());
+                    long originalThreshold = period + approved;
+                    long newThreshold = originalThreshold + deferral.deferMinutes();
+                    repository.approveDeferral(deferral.deferralId(), req.approver(),
+                            originalThreshold, newThreshold, req.requestId(), clock.instant());
+                    return toResponse(repository.findDeferral(equipmentId, deferKey)
+                            .orElseThrow(() -> new IllegalStateException("延期记录批准后读取失败")));
+                });
+    }
+
+    // ---------- 延期拒绝 ----------
+
+    @Transactional
+    public DeferralResponse rejectDeferral(String equipmentId, String deferKey,
+                                           RejectDeferralRequest req) {
+        lockEquipment(equipmentId);
+        String fingerprint = equipmentId + "|" + deferKey + "|" + req.approver() + "|" + req.reason();
+        return idempotency.execute(req.requestId(), "REJECT_DEFERRAL", fingerprint,
+                DeferralResponse.class, () -> {
+                    Deferral deferral = findPendingDeferralForDecision(equipmentId, deferKey);
+                    repository.rejectDeferral(deferral.deferralId(), req.approver(), req.reason(),
+                            req.requestId(), clock.instant());
+                    return toResponse(repository.findDeferral(equipmentId, deferKey)
+                            .orElseThrow(() -> new IllegalStateException("延期记录拒绝后读取失败")));
+                });
+    }
+
+    // ---------- 延期历史 ----------
+
+    @Transactional(readOnly = true)
+    public List<DeferralResponse> listDeferrals(String equipmentId) {
+        repository.findEquipment(equipmentId).orElseThrow(() -> equipmentNotFound(equipmentId));
+        return repository.listDeferrals(equipmentId).stream().map(this::toResponse).toList();
+    }
+
+    // ---------- 延期内部规则 ----------
+
+    /** 待审批延期或超期封锁时禁止新增运行读数（不影响修订与查询）。 */
+    private void checkReadingAllowed(Equipment equipment) {
+        repository.findPendingDeferral(equipment.equipmentId()).ifPresent(pending -> {
+            throw ApiException.conflict("DEFERRAL_PENDING",
+                    "存在待审批延期（" + pending.deferKey() + "），审批完成前不允许新增运行读数");
+        });
+        int cycleNo = repository.countMaintenances(equipment.equipmentId());
+        long approved = repository.sumApprovedDeferMinutes(equipment.equipmentId(), cycleNo);
+        long runMinutes = currentRunMinutes(equipment.equipmentId());
+        if (isOverdue(equipment.maintenancePeriodMinutes(), approved, runMinutes)) {
+            throw ApiException.conflict("EQUIPMENT_OVERDUE",
+                    "设备已超期封锁（本轮运行 " + runMinutes + " 分钟，生效阈值 "
+                            + (equipment.maintenancePeriodMinutes() + approved) + " 分钟），"
+                            + "完成保养前不允许新增运行读数");
+        }
+    }
+
+    /** 超期封锁判定：本周期有批准延期且运行分钟已达到延期后新阈值。 */
+    private boolean isOverdue(long periodMinutes, long approvedDeferralMinutes, long runMinutes) {
+        return approvedDeferralMinutes > 0
+                && runMinutes >= periodMinutes + approvedDeferralMinutes;
+    }
+
+    /** 本轮运行分钟 = 最新读数累计工时 - 最近保养锚点工时（无保养从 0 计）。 */
+    private long currentRunMinutes(String equipmentId) {
+        long latestCumulative = repository.findLatestReading(equipmentId)
+                .map(Reading::cumulativeMinutes).orElse(0L);
+        long anchorCumulative = repository.findLastMaintenance(equipmentId)
+                .map(MaintenanceRecord::anchorCumulativeMinutes).orElse(0L);
+        return latestCumulative - anchorCumulative;
+    }
+
+    /** 延期额度校验：单次不超过周期 25%，本周期累计（含本次）不超过周期 50%，超限 422。 */
+    private void checkDeferralLimits(long periodMinutes, long approvedMinutes, long deferMinutes) {
+        if (deferMinutes * 4 > periodMinutes) {
+            throw ApiException.unprocessable("DEFERRAL_SINGLE_LIMIT",
+                    "单次延期 " + deferMinutes + " 分钟超过保养周期 25% 上限：周期 "
+                            + periodMinutes + " 分钟，单次最多允许 " + (periodMinutes / 4) + " 分钟");
+        }
+        if ((approvedMinutes + deferMinutes) * 2 > periodMinutes) {
+            throw ApiException.unprocessable("DEFERRAL_CUMULATIVE_LIMIT",
+                    "本周期累计延期超限：已累计 " + approvedMinutes + " 分钟，本次申请 "
+                            + deferMinutes + " 分钟，允许上限 " + (periodMinutes / 2)
+                            + " 分钟（保养周期 " + periodMinutes + " 分钟的 50%）");
+        }
+    }
+
+    /** 取出待审批延期供批准/拒绝：不存在 404，非待审批（含周期结束失效）409。 */
+    private Deferral findPendingDeferralForDecision(String equipmentId, String deferKey) {
+        Deferral deferral = repository.findDeferral(equipmentId, deferKey)
+                .orElseThrow(() -> ApiException.notFound("DEFERRAL_NOT_FOUND",
+                        "延期记录不存在：" + deferKey));
+        if (!Deferral.STATUS_PENDING.equals(deferral.status())) {
+            throw ApiException.conflict("DEFERRAL_NOT_PENDING",
+                    "延期不处于待审批状态（当前 " + deferral.status() + "），不可再审批");
+        }
+        int cycleNo = repository.countMaintenances(equipmentId);
+        if (deferral.cycleNo() != cycleNo) {
+            throw ApiException.conflict("DEFERRAL_CYCLE_CLOSED",
+                    "延期所属保养周期已结束，不可再审批");
+        }
+        return deferral;
+    }
+
+    private DeferralResponse toResponse(Deferral deferral) {
+        return new DeferralResponse(deferral.deferralId(), deferral.equipmentId(),
+                deferral.deferKey(), deferral.cycleNo(), deferral.deferMinutes(),
+                deferral.reason(), deferral.applicant(), deferral.approver(),
+                deferral.rejectReason(), deferral.status(), deferral.appliedCumulativeMinutes(),
+                deferral.originalThresholdMinutes(), deferral.newThresholdMinutes(),
+                deferral.createdAt(), deferral.decidedAt());
     }
 }

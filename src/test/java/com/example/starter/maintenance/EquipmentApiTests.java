@@ -32,6 +32,7 @@ class EquipmentApiTests {
     @BeforeEach
     void cleanTables() {
         jdbc.update("DELETE FROM idempotency_request");
+        jdbc.update("DELETE FROM deferral");
         jdbc.update("DELETE FROM maintenance");
         jdbc.update("DELETE FROM reading_revision");
         jdbc.update("DELETE FROM reading");
