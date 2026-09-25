@@ -1,4 +1,5 @@
--- 测试用 H2（MySQL 兼容模式）schema，与生产 schema.sql 结构一致，去掉 H2 不兼容的 COMMENT 子句。
+-- 本地/测试用 H2（MODE=MySQL）schema，与生产 schema.sql 结构一致，去掉 H2 不兼容的 COMMENT 子句。
+-- domain 为隔离域：REAL 真实事件 / DRILL 演练沙盘事件；两域键空间互不相通。
 
 CREATE TABLE IF NOT EXISTS incidents (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,

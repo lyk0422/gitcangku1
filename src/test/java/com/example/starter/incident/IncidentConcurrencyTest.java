@@ -42,10 +42,14 @@ class IncidentConcurrencyTest {
     @BeforeEach
     void clean() {
         jdbc.update("DELETE FROM command_keys");
+        jdbc.update("DELETE FROM incident_notifications");
+        jdbc.update("DELETE FROM incident_dependencies");
+        jdbc.update("DELETE FROM incident_escalations");
         jdbc.update("DELETE FROM incident_status_history");
         jdbc.update("DELETE FROM incident_transfers");
         jdbc.update("DELETE FROM incident_actions");
         jdbc.update("DELETE FROM incidents");
+        jdbc.update("DELETE FROM drill_batches");
     }
 
     private static String key() {
@@ -91,7 +95,7 @@ class IncidentConcurrencyTest {
         List<Callable<IncidentView>> tasks = new ArrayList<>();
         for (int i = 0; i < 4; i++) {
             String actor = "actor-" + i;
-            tasks.add(() -> service.takeover(ik, actor, new TakeoverRequest(key())));
+            tasks.add(() -> service.takeover(Domain.REAL, ik, actor, new TakeoverRequest(key())));
         }
         List<Object> results = runConcurrently(tasks);
         long successes = results.stream().filter(IncidentView.class::isInstance).count();
@@ -101,7 +105,7 @@ class IncidentConcurrencyTest {
         assertThat(successes).isEqualTo(1);
         assertThat(illegal).isEqualTo(3);
         // 状态只流转一次
-        assertThat(service.history(ik).statusHistory())
+        assertThat(service.history(Domain.REAL, ik).statusHistory())
                 .filteredOn(s -> "COMMANDING".equals(s.toStatus())).hasSize(1);
     }
 
@@ -109,21 +113,21 @@ class IncidentConcurrencyTest {
     void concurrentAcceptAndResolve_commitOrderWins() throws Exception {
         String ik = "INC-201";
         service.report(new ReportRequest(ik, "S1", "交接与解决并发", "r"));
-        service.takeover(ik, "alice", new TakeoverRequest(key()));
-        service.changeStatus(ik, "alice", new StatusRequest(key(), "CONTAINED"));
-        service.initiateTransfer(ik, "alice", new TransferRequest(key(), "bob"));
+        service.takeover(Domain.REAL, ik, "alice", new TakeoverRequest(key()));
+        service.changeStatus(Domain.REAL, ik, "alice", new StatusRequest(key(), "CONTAINED"));
+        service.initiateTransfer(Domain.REAL, ik, "alice", new TransferRequest(key(), "bob"));
 
         List<Object> results = runConcurrently(List.of(
-                () -> service.acceptTransfer(ik, "bob", new TransferAcceptRequest(key())),
-                () -> service.changeStatus(ik, "alice", new StatusRequest(key(), "RESOLVED"))));
+                () -> service.acceptTransfer(Domain.REAL, ik, "bob", new TransferAcceptRequest(key())),
+                () -> service.changeStatus(Domain.REAL, ik, "alice", new StatusRequest(key(), "RESOLVED"))));
 
         long successes = results.stream().filter(IncidentView.class::isInstance).count();
         long failures = results.stream().filter(ApiException.class::isInstance).count();
         assertThat(successes).isEqualTo(1);
         assertThat(failures).isEqualTo(1);
 
-        IncidentView end = service.get(ik);
-        var transfers = service.history(ik).transfers();
+        IncidentView end = service.get(Domain.REAL, ik);
+        var transfers = service.history(Domain.REAL, ik).transfers();
         if ("RESOLVED".equals(end.status())) {
             // 解决先提交：交接接受必须失败，指挥人不变
             assertThat(end.commander()).isEqualTo("alice");
@@ -143,7 +147,7 @@ class IncidentConcurrencyTest {
         String commandKey = key();
         List<Callable<IncidentView>> tasks = new ArrayList<>();
         for (int i = 0; i < 3; i++) {
-            tasks.add(() -> service.takeover(ik, "alice", new TakeoverRequest(commandKey)));
+            tasks.add(() -> service.takeover(Domain.REAL, ik, "alice", new TakeoverRequest(commandKey)));
         }
         List<Object> results = runConcurrently(tasks);
 
@@ -152,8 +156,8 @@ class IncidentConcurrencyTest {
         assertThat(successes).isNotEmpty();
         // 所有成功响应一致，且接管只生效一次
         assertThat(successes).allSatisfy(v -> assertThat(v).isEqualTo(successes.get(0)));
-        assertThat(service.get(ik).commander()).isEqualTo("alice");
-        assertThat(service.history(ik).statusHistory())
+        assertThat(service.get(Domain.REAL, ik).commander()).isEqualTo("alice");
+        assertThat(service.history(Domain.REAL, ik).statusHistory())
                 .filteredOn(s -> "COMMANDING".equals(s.toStatus())).hasSize(1);
         Integer keyCount = jdbc.queryForObject(
                 "SELECT COUNT(*) FROM command_keys WHERE command_key = ?", Integer.class, commandKey);
@@ -164,15 +168,15 @@ class IncidentConcurrencyTest {
     void concurrentActions_distinctKeysBothPersist() throws Exception {
         String ik = "INC-203";
         service.report(new ReportRequest(ik, "S3", "并发处置记录", "r"));
-        service.takeover(ik, "alice", new TakeoverRequest(key()));
+        service.takeover(Domain.REAL, ik, "alice", new TakeoverRequest(key()));
         List<Callable<Object>> tasks = new ArrayList<>();
         for (int i = 0; i < 4; i++) {
             String actionKey = "ACT-" + i;
-            tasks.add(() -> service.addAction(ik, "alice", new ActionRequest(key(), actionKey,
+            tasks.add(() -> service.addAction(Domain.REAL, ik, "alice", new ActionRequest(key(), actionKey,
                     "NOTE", "记录 " + actionKey, Instant.parse("2026-09-21T08:00:00Z"))));
         }
         List<Object> results = runConcurrently(tasks);
         assertThat(results).allSatisfy(r -> assertThat(r).isNotInstanceOf(Exception.class));
-        assertThat(service.history(ik).actions()).hasSize(4);
+        assertThat(service.history(Domain.REAL, ik).actions()).hasSize(4);
     }
 }
