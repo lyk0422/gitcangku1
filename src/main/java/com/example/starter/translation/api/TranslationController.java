@@ -136,6 +136,58 @@ public class TranslationController {
                 .body(translationService.getRelease(documentId, publishedVersion));
     }
 
+    /** 创建术语冻结：操作者取 X-Actor-Id；同一文档版本只允许一份有效冻结，同 freezeKey 重放。 */
+    @PostMapping("/{documentId}/freezes")
+    public ResponseEntity<String> createFreeze(@PathVariable long documentId,
+                                               @RequestHeader("X-Actor-Id") String actorId,
+                                               @Valid @RequestBody ApiDtos.CreateFreezeRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/freezes";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(201, translationService.createFreeze(documentId, actorId, request)))
+                .toResponseEntity();
+    }
+
+    /** 撤销术语冻结：只影响后续修订与发布，不重写既有快照。 */
+    @PostMapping("/{documentId}/freezes/{freezeVersion}/revoke")
+    public ResponseEntity<String> revokeFreeze(@PathVariable long documentId, @PathVariable int freezeVersion,
+                                               @Valid @RequestBody ApiDtos.RevokeFreezeRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/freezes/" + freezeVersion + "/revoke";
+        return writeExecutor.execute(request.requestId(), hash(operation, request),
+                () -> WriteResult.of(200, translationService.revokeFreeze(documentId, freezeVersion)))
+                .toResponseEntity();
+    }
+
+    /** 查询当前有效冻结的完整内容。 */
+    @GetMapping("/{documentId}/freezes/current")
+    public ResponseEntity<ApiDtos.FreezeView> getCurrentFreeze(@PathVariable long documentId) {
+        return ResponseEntity.ok(translationService.getCurrentFreeze(documentId));
+    }
+
+    /** 查询指定冻结版本的内容（含已撤销）。 */
+    @GetMapping("/{documentId}/freezes/{freezeVersion}")
+    public ResponseEntity<ApiDtos.FreezeView> getFreeze(@PathVariable long documentId,
+                                                        @PathVariable int freezeVersion) {
+        return ResponseEntity.ok(translationService.getFreeze(documentId, freezeVersion));
+    }
+
+    /** 冻结段落诊断：按当前有效冻结逐条核对全部译文。 */
+    @GetMapping("/{documentId}/freeze-diagnostics")
+    public ResponseEntity<ApiDtos.FreezeDiagnosticsResponse> getFreezeDiagnostics(
+            @PathVariable long documentId) {
+        return ResponseEntity.ok(translationService.getFreezeDiagnostics(documentId));
+    }
+
+    /** 批量译文修订：整批校验冻结与术语规则，任一失败整批回滚。 */
+    @PostMapping("/{documentId}/revisions")
+    public ResponseEntity<String> submitBatchRevisions(@PathVariable long documentId,
+                                                       @RequestHeader("X-Actor-Id") String actorId,
+                                                       @Valid @RequestBody ApiDtos.BatchRevisionRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/revisions";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(200, translationService.submitBatchRevisions(
+                        documentId, actorId, request))).toResponseEntity();
+    }
+
     /** 计算请求摘要：操作（含路径变量）+ 操作者 + 规范化请求体的 SHA-256。 */
     private String hash(String operation, Object... parts) {
         try {

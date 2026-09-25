@@ -11,16 +11,17 @@ public final class Rows {
     }
 
     /**
-     * 文档：全局唯一 documentId，含 1~5 种目标语言及草稿/发布/术语版本。
+     * 文档：全局唯一 documentId，含 1~5 种目标语言及草稿/发布/术语/文档版本。
      *
      * @param documentId       全局唯一文档 ID，自增
      * @param targetLanguages  目标语言列表，小写语言码，1~5 种
      * @param draftVersion     文档草稿版本，从 1 开始；增段落或修改源文/译文/术语时加一
      * @param publishedVersion 已发布版本号，从 0 开始，每次成功发布加一
      * @param termVersion      当前术语版本，从 0 开始（0 表示尚未建立术语版本）
+     * @param documentVersion  文档版本，从 1 开始；源文景观变化（增段落、源文修订）时加一，术语冻结绑定该版本
      */
     public record DocumentRow(long documentId, List<String> targetLanguages,
-                              int draftVersion, int publishedVersion, int termVersion) {
+                              int draftVersion, int publishedVersion, int termVersion, int documentVersion) {
     }
 
     /**
@@ -81,5 +82,28 @@ public final class Rows {
      */
     public record RequestLogRow(String requestId, String requestHash,
                                 int responseStatus, String responseBody) {
+    }
+
+    /**
+     * 术语冻结：文档某草稿版本上的不可变术语冻结，同一文档版本至多一份有效冻结。
+     *
+     * @param freezeVersion   冻结版本号，文档内从 1 开始单调递增
+     * @param documentVersion 冻结时绑定的文档版本；文档版本变化后该冻结失效
+     * @param status          冻结状态：ACTIVE 有效，REVOKED 已撤销
+     * @param freezeKey       freezeKey 指纹：文档版本、规范化术语、操作者与状态的 SHA-256
+     * @param operator        冻结操作者，取创建时 X-Actor-Id
+     */
+    public record TermFreezeRow(int freezeVersion, int documentVersion, String status,
+                                String freezeKey, String operator) {
+    }
+
+    /**
+     * 术语冻结条目：属于某冻结版本的不可变条目，创建后不可原地修改。
+     *
+     * @param normalizedTerm     规范化术语：去首尾空白、压缩连续空白并转小写
+     * @param language           目标语言码，小写
+     * @param allowedTranslation 该术语在目标语言中的一种允许译法（规范化存储）
+     */
+    public record TermFreezeEntryRow(String normalizedTerm, String language, String allowedTranslation) {
     }
 }

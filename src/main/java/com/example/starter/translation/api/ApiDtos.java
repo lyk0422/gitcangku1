@@ -127,9 +127,98 @@ public final class ApiDtos {
 
     /** 统一错误响应；violations 仅在术语违规 422 时返回，含全部违规术语。 */
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    public record ErrorResponse(String error, String message, List<TermRuleView> violations) {
+    public record ErrorResponse(String error, String message, List<TermRuleView> violations,
+                                List<FreezeViolationView> freezeViolations) {
         public ErrorResponse(String error, String message) {
-            this(error, message, null);
+            this(error, message, null, null);
         }
+
+        public ErrorResponse(String error, String message, List<TermRuleView> violations) {
+            this(error, message, violations, null);
+        }
+
+        public static ErrorResponse freezeViolation(String message, List<FreezeViolationView> violations) {
+            return new ErrorResponse("FREEZE_VIOLATION", message, null, violations);
+        }
+    }
+
+    /** 术语冻结条目输入：术语将规范化（去空白、转小写），允许译法 1~20 种。 */
+    public record FreezeEntryInput(
+            @NotBlank(message = "term 不能为空") @Size(max = 512) String term,
+            @NotBlank(message = "language 不能为空") String language,
+            @NotNull(message = "allowedTranslations 不能为空")
+            @Size(min = 1, max = 20, message = "允许译法须为 1~20 种")
+            List<@NotBlank(message = "允许译法不能为空") @Size(max = 2048) String> allowedTranslations) {
+    }
+
+    /** 创建术语冻结请求：携带当前文档草稿版本上的完整冻结条目（1~100 条）。 */
+    public record CreateFreezeRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @NotNull(message = "entries 不能为空") @Size(min = 1, max = 100, message = "冻结条目须为 1~100 条")
+            List<@Valid FreezeEntryInput> entries) {
+    }
+
+    /** 撤销术语冻结请求。 */
+    public record RevokeFreezeRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId) {
+    }
+
+    /** 冻结写操作响应。 */
+    public record FreezeResponse(long documentId, int freezeVersion, int documentVersion,
+                                 String status, String freezeKey, int entryCount) {
+    }
+
+    /** 冻结条目视图：规范化术语、语言与允许译法。 */
+    public record FreezeEntryView(String term, String language, List<String> allowedTranslations) {
+    }
+
+    /** 冻结查询视图：冻结内容、状态及是否仍绑定当前文档版本。 */
+    public record FreezeView(long documentId, int freezeVersion, int documentVersion, String status,
+                             String freezeKey, String operator, boolean current,
+                             List<FreezeEntryView> entries) {
+    }
+
+    /** 批量译文修订的单条修订输入。 */
+    public record RevisionInput(
+            @NotBlank(message = "segmentId 不能为空") @Size(max = 64) String segmentId,
+            @NotBlank(message = "language 不能为空") String language,
+            @NotBlank(message = "content 不能为空") String content,
+            @Positive(message = "sourceVersion 必须为正数") int sourceVersion) {
+    }
+
+    /** 批量译文修订请求：整批校验、整批提交，任一失败整批回滚。 */
+    public record BatchRevisionRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @NotNull(message = "revisions 不能为空") @Size(min = 1, max = 50, message = "单批修订须为 1~50 条")
+            List<@Valid RevisionInput> revisions) {
+    }
+
+    /** 批量修订中单条修订的应用结果。 */
+    public record RevisionResult(String segmentId, String language, int translationVersion,
+                                 int sourceVersion, int termVersion) {
+    }
+
+    /** 批量译文修订响应。 */
+    public record BatchRevisionResponse(long documentId, int draftVersion, int applied,
+                                        List<RevisionResult> revisions) {
+    }
+
+    /** 冻结违规明细：稳定列出段落、语言、命中术语与允许译法。 */
+    public record FreezeViolationView(String segmentId, String language, String term,
+                                      List<String> allowedTranslations) {
+    }
+
+    /** 单条译文对当前有效冻结的术语核对结果。 */
+    public record FreezeTermCheck(String term, String language, List<String> allowedTranslations,
+                                  boolean satisfied) {
+    }
+
+    /** 单条译文的冻结诊断：命中的冻结术语及是否采用允许译法。 */
+    public record FreezeDiagnosticView(String segmentId, String language, List<FreezeTermCheck> checks) {
+    }
+
+    /** 冻结段落诊断响应：freezeVersion 为 null 表示当前无有效冻结。 */
+    public record FreezeDiagnosticsResponse(long documentId, Integer freezeVersion,
+                                            List<FreezeDiagnosticView> translations) {
     }
 }

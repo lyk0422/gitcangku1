@@ -39,6 +39,8 @@ public abstract class AbstractIntegrationTest {
         jdbc.update("DELETE FROM translation");
         jdbc.update("DELETE FROM segment");
         jdbc.update("DELETE FROM release_snapshot");
+        jdbc.update("DELETE FROM term_freeze_entry");
+        jdbc.update("DELETE FROM term_freeze");
         jdbc.update("DELETE FROM term_rule");
         jdbc.update("DELETE FROM term_version");
         jdbc.update("DELETE FROM request_log");
@@ -128,6 +130,26 @@ public abstract class AbstractIntegrationTest {
         String body = "{\"requestId\":\"" + requestId + "\",\"expectedTermVersion\":" + expectedTermVersion
                 + ",\"rules\":" + rulesJson + "}";
         return putJson("/api/documents/" + documentId + "/terms", body);
+    }
+
+    /** 创建术语冻结：entriesJson 为冻结条目数组 JSON。 */
+    protected ApiResult createFreeze(long documentId, String actorId, String entriesJson,
+                                     String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"entries\":" + entriesJson + "}";
+        return postJson("/api/documents/" + documentId + "/freezes", body, actorId);
+    }
+
+    /** 撤销术语冻结。 */
+    protected ApiResult revokeFreeze(long documentId, int freezeVersion, String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\"}";
+        return postJson("/api/documents/" + documentId + "/freezes/" + freezeVersion + "/revoke", body);
+    }
+
+    /** 批量译文修订：revisionsJson 为修订数组 JSON。 */
+    protected ApiResult submitBatch(long documentId, String actorId, String revisionsJson,
+                                    String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"revisions\":" + revisionsJson + "}";
+        return postJson("/api/documents/" + documentId + "/revisions", body, actorId);
     }
 
     /** HTTP 响应结果：状态码与 JSON 响应体。 */
