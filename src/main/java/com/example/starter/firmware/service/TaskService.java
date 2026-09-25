@@ -11,6 +11,7 @@ import com.example.starter.firmware.domain.ReleaseStatus;
 import com.example.starter.firmware.domain.RolloutTask;
 import com.example.starter.firmware.domain.TaskStatus;
 import com.example.starter.firmware.error.ApiException;
+import com.example.starter.firmware.repo.CanaryRepository;
 import com.example.starter.firmware.repo.DeviceRepository;
 import com.example.starter.firmware.repo.ReleaseRepository;
 import com.example.starter.firmware.repo.TaskRepository;
@@ -21,6 +22,7 @@ import java.util.List;
 
 /**
  * 投放任务：设备拉取与回执。与取消并发时统一先锁发布单行，再操作任务，形成一致提交顺序。
+ * 金丝雀发布单的回执首次进入终态时，在发布单行锁保护下累计当前解锁级别样本。
  */
 @Service
 public class TaskService {
@@ -28,16 +30,19 @@ public class TaskService {
     private final TaskRepository taskRepository;
     private final ReleaseRepository releaseRepository;
     private final DeviceRepository deviceRepository;
+    private final CanaryRepository canaryRepository;
     private final DeviceService deviceService;
     private final ReleaseService releaseService;
     private final IdempotencyService idempotency;
 
     public TaskService(TaskRepository taskRepository, ReleaseRepository releaseRepository,
-                       DeviceRepository deviceRepository, DeviceService deviceService,
-                       ReleaseService releaseService, IdempotencyService idempotency) {
+                       DeviceRepository deviceRepository, CanaryRepository canaryRepository,
+                       DeviceService deviceService, ReleaseService releaseService,
+                       IdempotencyService idempotency) {
         this.taskRepository = taskRepository;
         this.releaseRepository = releaseRepository;
         this.deviceRepository = deviceRepository;
+        this.canaryRepository = canaryRepository;
         this.deviceService = deviceService;
         this.releaseService = releaseService;
         this.idempotency = idempotency;
@@ -97,6 +102,10 @@ public class TaskService {
                     taskRepository.complete(taskId, request.result());
                     if (request.result() == ReceiptResult.SUCCESS) {
                         deviceRepository.updateCurrentVersion(task.deviceId(), order.toVersion());
+                    }
+                    if (order.isCanary()) {
+                        canaryRepository.incrementSample(order.id(), order.unlockedLevel(),
+                                request.result() == ReceiptResult.FAILED);
                     }
                     yield TaskView.of(taskRepository.findById(taskId).orElseThrow(), order);
                 }

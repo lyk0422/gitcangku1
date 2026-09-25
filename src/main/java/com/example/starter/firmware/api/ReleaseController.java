@@ -2,6 +2,7 @@ package com.example.starter.firmware.api;
 
 import com.example.starter.firmware.domain.TaskStatus;
 import com.example.starter.firmware.error.ApiException;
+import com.example.starter.firmware.service.CanaryService;
 import com.example.starter.firmware.service.ReleaseService;
 import com.example.starter.firmware.service.TaskService;
 import jakarta.validation.Valid;
@@ -14,7 +15,7 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * 发布单：创建、扩量、取消与任务明细查询。
+ * 发布单：创建、扩量、取消、金丝雀推进与状态查询、任务明细查询。
  */
 @RestController
 @RequestMapping("/api/releases")
@@ -22,10 +23,13 @@ public class ReleaseController {
 
     private final ReleaseService releaseService;
     private final TaskService taskService;
+    private final CanaryService canaryService;
 
-    public ReleaseController(ReleaseService releaseService, TaskService taskService) {
+    public ReleaseController(ReleaseService releaseService, TaskService taskService,
+                             CanaryService canaryService) {
         this.releaseService = releaseService;
         this.taskService = taskService;
+        this.canaryService = canaryService;
     }
 
     @PostMapping
@@ -41,6 +45,16 @@ public class ReleaseController {
     @PostMapping("/{releaseId}/cancel")
     public ReleaseView cancel(@PathVariable long releaseId, @Valid @RequestBody RequestIdBody request) {
         return releaseService.cancel(releaseId, request.requestId());
+    }
+
+    @PostMapping("/{releaseId}/promote")
+    public CanaryStatusView promote(@PathVariable long releaseId, @Valid @RequestBody PromoteRequest request) {
+        return canaryService.promote(releaseId, request);
+    }
+
+    @GetMapping("/{releaseId}/canary")
+    public CanaryStatusView canary(@PathVariable long releaseId) {
+        return canaryService.status(releaseId);
     }
 
     @GetMapping("/{releaseId}/tasks")
