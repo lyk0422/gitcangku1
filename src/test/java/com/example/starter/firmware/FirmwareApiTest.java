@@ -39,6 +39,8 @@ class FirmwareApiTest {
         jdbc.update("DELETE FROM release_order");
         jdbc.update("DELETE FROM device");
         jdbc.update("DELETE FROM idempotency_record");
+        jdbc.update("DELETE FROM region_wait_record");
+        jdbc.update("DELETE FROM region_throttle_event");
     }
 
     private String registerDevice(String requestId, String deviceId, String model, String version, int bucket)
@@ -46,7 +48,7 @@ class FirmwareApiTest {
         MvcResult result = mockMvc.perform(post("/api/devices")
                         .contentType("application/json")
                         .content("""
-                                {"requestId":"%s","deviceId":"%s","model":"%s","currentVersion":"%s","bucketNo":%d}
+                                {"requestId":"%s","deviceId":"%s","model":"%s","currentVersion":"%s","bucketNo":%d,"region":"cn-north"}
                                 """.formatted(requestId, deviceId, model, version, bucket)))
                 .andReturn();
         return result.getResponse().getContentAsString();
@@ -71,11 +73,12 @@ class FirmwareApiTest {
     @Test
     void 主流程_登记发布拉取回执成功并更新设备版本() throws Exception {
         mockMvc.perform(post("/api/devices").contentType("application/json").content("""
-                        {"requestId":"r1","deviceId":"d1","model":"m1","currentVersion":"1.0.0","bucketNo":5}
+                        {"requestId":"r1","deviceId":"d1","model":"m1","currentVersion":"1.0.0","bucketNo":5,"region":"cn-north"}
                         """))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.deviceId").value("d1"))
-                .andExpect(jsonPath("$.bucketNo").value(5));
+                .andExpect(jsonPath("$.bucketNo").value(5))
+                .andExpect(jsonPath("$.region").value("cn-north"));
 
         MvcResult release = mockMvc.perform(post("/api/releases").contentType("application/json").content("""
                         {"requestId":"r2","model":"m1","fromVersion":"1.0.0","toVersion":"2.0.0","ratio":10}
@@ -115,18 +118,24 @@ class FirmwareApiTest {
         registerDevice("r1", "d1", "m1", "1.0.0", 5);
 
         mockMvc.perform(post("/api/devices").contentType("application/json").content("""
-                        {"requestId":"r2","deviceId":"d1","model":"m1","currentVersion":"1.0.0","bucketNo":5}
+                        {"requestId":"r2","deviceId":"d1","model":"m1","currentVersion":"1.0.0","bucketNo":5,"region":"cn-north"}
                         """))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("DEVICE_EXISTS"));
 
         mockMvc.perform(post("/api/devices").contentType("application/json").content("""
-                        {"requestId":"r3","deviceId":"d2","model":"m1","currentVersion":"1.0.0","bucketNo":100}
+                        {"requestId":"r3","deviceId":"d2","model":"m1","currentVersion":"1.0.0","bucketNo":100,"region":"cn-north"}
                         """))
                 .andExpect(status().isBadRequest());
 
         mockMvc.perform(post("/api/devices").contentType("application/json").content("""
-                        {"deviceId":"d3","model":"m1","currentVersion":"1.0.0","bucketNo":1}
+                        {"deviceId":"d3","model":"m1","currentVersion":"1.0.0","bucketNo":1,"region":"cn-north"}
+                        """))
+                .andExpect(status().isBadRequest());
+
+        // 缺少区域标识：400
+        mockMvc.perform(post("/api/devices").contentType("application/json").content("""
+                        {"requestId":"r4","deviceId":"d4","model":"m1","currentVersion":"1.0.0","bucketNo":1}
                         """))
                 .andExpect(status().isBadRequest());
     }
@@ -141,7 +150,7 @@ class FirmwareApiTest {
         assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM device", Long.class)).isEqualTo(1);
 
         mockMvc.perform(post("/api/devices").contentType("application/json").content("""
-                        {"requestId":"rid-1","deviceId":"d9","model":"m1","currentVersion":"1.0.0","bucketNo":5}
+                        {"requestId":"rid-1","deviceId":"d9","model":"m1","currentVersion":"1.0.0","bucketNo":5,"region":"cn-north"}
                         """))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("REQUEST_ID_CONFLICT"));

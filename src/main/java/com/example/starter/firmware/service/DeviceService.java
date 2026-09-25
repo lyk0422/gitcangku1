@@ -9,7 +9,7 @@ import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 
 /**
- * 设备登记与查询。型号与分桶号登记后不可修改。
+ * 设备登记与查询。型号、分桶号与区域标识登记后不可修改。
  */
 @Service
 public class DeviceService {
@@ -24,16 +24,16 @@ public class DeviceService {
 
     public DeviceView register(RegisterDeviceRequest request) {
         String fingerprint = String.join("|", "device.register", request.deviceId(), request.model(),
-                request.currentVersion(), String.valueOf(request.bucketNo()));
+                request.currentVersion(), String.valueOf(request.bucketNo()), request.region());
         return idempotency.execute(request.requestId(), "device.register", fingerprint, () -> {
             try {
                 deviceRepository.insert(new Device(request.deviceId(), request.model(),
-                        request.currentVersion(), request.bucketNo()));
+                        request.currentVersion(), request.bucketNo(), request.region()));
             } catch (DuplicateKeyException e) {
                 throw ApiException.conflict("DEVICE_EXISTS", "设备已登记: " + request.deviceId());
             }
             return new DeviceView(request.deviceId(), request.model(), request.currentVersion(),
-                    request.bucketNo());
+                    request.bucketNo(), request.region());
         }, DeviceView.class);
     }
 

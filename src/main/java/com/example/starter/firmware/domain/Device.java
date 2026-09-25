@@ -7,6 +7,7 @@ package com.example.starter.firmware.domain;
  * @param model          设备型号，登记后不可修改
  * @param currentVersion 设备当前固件版本
  * @param bucketNo       灰度分桶号，取值0~99，登记后不可修改
+ * @param region         设备所属区域标识，用于区域带宽限流，登记后不可修改
  */
-public record Device(String deviceId, String model, String currentVersion, int bucketNo) {
+public record Device(String deviceId, String model, String currentVersion, int bucketNo, String region) {
 }

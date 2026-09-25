@@ -19,14 +19,16 @@ public class DeviceRepository {
     }
 
     public void insert(Device device) {
-        jdbc.update("INSERT INTO device (device_id, model, current_version, bucket_no) VALUES (?, ?, ?, ?)",
-                device.deviceId(), device.model(), device.currentVersion(), device.bucketNo());
+        jdbc.update("INSERT INTO device (device_id, model, current_version, bucket_no, region)"
+                        + " VALUES (?, ?, ?, ?, ?)",
+                device.deviceId(), device.model(), device.currentVersion(), device.bucketNo(), device.region());
     }
 
     public Optional<Device> findById(String deviceId) {
-        return jdbc.query("SELECT device_id, model, current_version, bucket_no FROM device WHERE device_id = ?",
+        return jdbc.query("SELECT device_id, model, current_version, bucket_no, region FROM device"
+                        + " WHERE device_id = ?",
                 (rs, rowNum) -> new Device(rs.getString("device_id"), rs.getString("model"),
-                        rs.getString("current_version"), rs.getInt("bucket_no")),
+                        rs.getString("current_version"), rs.getInt("bucket_no"), rs.getString("region")),
                 deviceId).stream().findFirst();
     }
 
