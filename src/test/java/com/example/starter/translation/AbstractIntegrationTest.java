@@ -36,6 +36,8 @@ public abstract class AbstractIntegrationTest {
     @BeforeEach
     void cleanTables() {
         jdbc.update("DELETE FROM approval");
+        jdbc.update("DELETE FROM regional_variant");
+        jdbc.update("DELETE FROM fallback_record");
         jdbc.update("DELETE FROM translation");
         jdbc.update("DELETE FROM segment");
         jdbc.update("DELETE FROM release_snapshot");
@@ -117,9 +119,36 @@ public abstract class AbstractIntegrationTest {
 
     protected ApiResult publish(long documentId, int expectedDraftVersion, int expectedPublishedVersion,
                                 String requestId) throws Exception {
+        return publish(documentId, expectedDraftVersion, expectedPublishedVersion, null, requestId);
+    }
+
+    protected ApiResult publish(long documentId, int expectedDraftVersion, int expectedPublishedVersion,
+                                String region, String requestId) throws Exception {
+        String regionJson = region == null ? "" : ",\"region\":\"" + region + "\"";
         String body = "{\"requestId\":\"" + requestId + "\",\"expectedDraftVersion\":" + expectedDraftVersion
-                + ",\"expectedPublishedVersion\":" + expectedPublishedVersion + "}";
+                + ",\"expectedPublishedVersion\":" + expectedPublishedVersion + regionJson + "}";
         return postJson("/api/documents/" + documentId + "/publish", body);
+    }
+
+    protected ApiResult createVariant(long documentId, String segmentId, String language, String region,
+                                      int expectedVersion, String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"expectedVersion\":" + expectedVersion + "}";
+        return postJson("/api/documents/" + documentId + "/segments/" + segmentId + "/translations/" + language
+                + "/variants/" + region, body);
+    }
+
+    protected ApiResult approveVariant(long documentId, String segmentId, String language, String region,
+                                       String actorId, int expectedVersion, String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"expectedVersion\":" + expectedVersion + "}";
+        return postJson("/api/documents/" + documentId + "/segments/" + segmentId + "/translations/" + language
+                + "/variants/" + region + "/approve", body, actorId);
+    }
+
+    protected ApiResult revokeVariant(long documentId, String segmentId, String language, String region,
+                                      int expectedVersion, String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"expectedVersion\":" + expectedVersion + "}";
+        return postJson("/api/documents/" + documentId + "/segments/" + segmentId + "/translations/" + language
+                + "/variants/" + region + "/revoke", body);
     }
 
     /** 新增术语版本：rulesJson 为规则数组 JSON。 */

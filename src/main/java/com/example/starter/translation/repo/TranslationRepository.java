@@ -2,6 +2,8 @@ package com.example.starter.translation.repo;
 
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
+import com.example.starter.translation.domain.Rows.FallbackRecordRow;
+import com.example.starter.translation.domain.Rows.RegionVariantRow;
 import com.example.starter.translation.domain.Rows.RequestLogRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
@@ -45,6 +47,16 @@ public class TranslationRepository {
 
     private static final RowMapper<TermRuleRow> TERM_RULE_MAPPER = (rs, n) -> new TermRuleRow(
             rs.getString("source_term"), rs.getString("language"), rs.getString("required_translation"));
+
+    private static final RowMapper<RegionVariantRow> REGION_VARIANT_MAPPER = (rs, n) -> new RegionVariantRow(
+            rs.getString("segment_id"), rs.getString("language"), rs.getString("region"),
+            rs.getInt("translation_version"), rs.getString("content"), rs.getString("author"),
+            rs.getString("reviewer"), rs.getInt("source_version"), rs.getInt("term_version"),
+            rs.getString("status"));
+
+    private static final RowMapper<FallbackRecordRow> FALLBACK_MAPPER = (rs, n) -> new FallbackRecordRow(
+            rs.getInt("published_version"), rs.getString("segment_id"), rs.getString("language"),
+            rs.getString("requested_region"), rs.getInt("translation_version"));
 
     private final JdbcTemplate jdbc;
 
@@ -240,5 +252,79 @@ public class TranslationRepository {
     public void insertRequestLog(String requestId, String requestHash, int responseStatus, String responseBody) {
         jdbc.update("INSERT INTO request_log (request_id, request_hash, response_status, response_body) "
                 + "VALUES (?, ?, ?, ?)", requestId, requestHash, responseStatus, responseBody);
+    }
+
+    /** 查询文档全部区域变体，按段落、语言、区域、译文版本排序保证稳定输出。 */
+    public List<RegionVariantRow> listRegionVariants(long documentId) {
+        return jdbc.query(
+                "SELECT segment_id, language, region, translation_version, content, author, reviewer, "
+                        + "source_version, term_version, status FROM regional_variant "
+                        + "WHERE document_id = ? ORDER BY segment_id, language, region, translation_version",
+                REGION_VARIANT_MAPPER, documentId);
+    }
+
+    /** 按段落、语言、区域与译文版本查询单条变体。 */
+    public Optional<RegionVariantRow> findRegionVariant(long documentId, String segmentId, String language,
+                                                        String region, int translationVersion) {
+        List<RegionVariantRow> rows = jdbc.query(
+                "SELECT segment_id, language, region, translation_version, content, author, reviewer, "
+                        + "source_version, term_version, status FROM regional_variant "
+                        + "WHERE document_id = ? AND segment_id = ? AND language = ? AND region = ? "
+                        + "AND translation_version = ?",
+                REGION_VARIANT_MAPPER, documentId, segmentId, language, region, translationVersion);
+        return rows.stream().findFirst();
+    }
+
+    /** 插入一条区域变体（同段落/语言/区域/译文版本唯一，重复时主键冲突）。 */
+    public void insertRegionVariant(long documentId, RegionVariantRow row) {
+        jdbc.update("INSERT INTO regional_variant (document_id, segment_id, language, region, "
+                        + "translation_version, content, author, reviewer, source_version, term_version, status) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                documentId, row.segmentId(), row.language(), row.region(), row.translationVersion(),
+                row.content(), row.author(), row.reviewer(), row.sourceVersion(), row.termVersion(), row.status());
+    }
+
+    /** 批准待批准变体：仅 PENDING 行可更新，返回受影响行数（0 表示状态已变）。 */
+    public int approveRegionVariant(long documentId, String segmentId, String language, String region,
+                                    int translationVersion, String reviewer) {
+        return jdbc.update("UPDATE regional_variant SET status = 'ACTIVE', reviewer = ?, "
+                        + "approved_at = CURRENT_TIMESTAMP WHERE document_id = ? AND segment_id = ? "
+                        + "AND language = ? AND region = ? AND translation_version = ? AND status = 'PENDING'",
+                reviewer, documentId, segmentId, language, region, translationVersion);
+    }
+
+    /** 将同区域早于指定译文版本的待批准/有效变体置为 SUPERSEDED，返回受影响行数。 */
+    public int supersedeRegionVariants(long documentId, String segmentId, String language, String region,
+                                       int translationVersion) {
+        return jdbc.update("UPDATE regional_variant SET status = 'SUPERSEDED' WHERE document_id = ? "
+                        + "AND segment_id = ? AND language = ? AND region = ? AND translation_version < ? "
+                        + "AND status IN ('PENDING', 'ACTIVE')",
+                documentId, segmentId, language, region, translationVersion);
+    }
+
+    /** 撤销有效变体：仅 ACTIVE 行可更新，返回受影响行数（0 表示不存在或状态已变）。 */
+    public int revokeRegionVariant(long documentId, String segmentId, String language, String region,
+                                   int translationVersion) {
+        return jdbc.update("UPDATE regional_variant SET status = 'REVOKED', revoked_at = CURRENT_TIMESTAMP "
+                        + "WHERE document_id = ? AND segment_id = ? AND language = ? AND region = ? "
+                        + "AND translation_version = ? AND status = 'ACTIVE'",
+                documentId, segmentId, language, region, translationVersion);
+    }
+
+    /** 随发布快照原子写入一条回退记录。 */
+    public void insertFallbackRecord(long documentId, int publishedVersion, FallbackRecordRow row) {
+        jdbc.update("INSERT INTO fallback_record (document_id, published_version, segment_id, language, "
+                        + "requested_region, translation_version) VALUES (?, ?, ?, ?, ?, ?)",
+                documentId, publishedVersion, row.segmentId(), row.language(),
+                row.requestedRegion(), row.translationVersion());
+    }
+
+    /** 查询某文档某具体区域的全部回退历史，按发布版本、段落、语言稳定排序。 */
+    public List<FallbackRecordRow> listFallbackRecords(long documentId, String region) {
+        return jdbc.query(
+                "SELECT published_version, segment_id, language, requested_region, translation_version "
+                        + "FROM fallback_record WHERE document_id = ? AND requested_region = ? "
+                        + "ORDER BY published_version, segment_id, language",
+                FALLBACK_MAPPER, documentId, region);
     }
 }

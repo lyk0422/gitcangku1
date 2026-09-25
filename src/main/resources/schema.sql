@@ -85,6 +85,56 @@ COMMENT ON COLUMN release_snapshot.published_version IS '发布版本号，从 1
 COMMENT ON COLUMN release_snapshot.snapshot_json IS '快照内容 JSON：全部段落源文及各语言译文、作者、审核人与版本号';
 COMMENT ON COLUMN release_snapshot.created_at IS '发布时间，数据库默认时区';
 
+CREATE TABLE IF NOT EXISTS fallback_record (
+    document_id BIGINT NOT NULL,
+    published_version INT NOT NULL,
+    segment_id VARCHAR(64) NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    requested_region VARCHAR(16) NOT NULL,
+    translation_version INT NOT NULL,
+    PRIMARY KEY (document_id, published_version, segment_id, language)
+);
+COMMENT ON TABLE fallback_record IS '回退历史：区域发布中因具体区域有效变体缺失而回退 DEFAULT 的段落记录，随快照原子写入，不可修改';
+COMMENT ON COLUMN fallback_record.document_id IS '所属文档 ID';
+COMMENT ON COLUMN fallback_record.published_version IS '对应发布版本号，从 1 开始';
+COMMENT ON COLUMN fallback_record.segment_id IS '回退 DEFAULT 的段落 ID';
+COMMENT ON COLUMN fallback_record.language IS '回退 DEFAULT 的目标语言码，小写';
+COMMENT ON COLUMN fallback_record.requested_region IS '发布请求的具体区域码，大写';
+COMMENT ON COLUMN fallback_record.translation_version IS '回退所选用的 DEFAULT 基线译文版本';
+
+CREATE TABLE IF NOT EXISTS regional_variant (
+    document_id BIGINT NOT NULL,
+    segment_id VARCHAR(64) NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    region VARCHAR(16) NOT NULL,
+    translation_version INT NOT NULL,
+    content LONGTEXT NOT NULL,
+    author VARCHAR(128) NOT NULL,
+    reviewer VARCHAR(128),
+    source_version INT NOT NULL,
+    term_version INT NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    approved_at TIMESTAMP,
+    revoked_at TIMESTAMP,
+    PRIMARY KEY (document_id, segment_id, language, region, translation_version)
+);
+COMMENT ON TABLE regional_variant IS '区域译文变体：同一段落/语言/区域在同一译文版本只有一条；PENDING 待批准、ACTIVE 有效、SUPERSEDED 被新版本取代、REVOKED 已撤销';
+COMMENT ON COLUMN regional_variant.document_id IS '所属文档 ID；变体不得跨文档';
+COMMENT ON COLUMN regional_variant.segment_id IS '所属段落 ID；变体不得覆盖不同段落';
+COMMENT ON COLUMN regional_variant.language IS '目标语言码，小写；变体不得覆盖不同语言';
+COMMENT ON COLUMN regional_variant.region IS '适用区域码，大写具体区域（2~8 位字母）；全局默认 DEFAULT 由基线译文承担，不登记';
+COMMENT ON COLUMN regional_variant.translation_version IS '登记时所依据的基线译文版本；同段落/语言/区域/译文版本唯一';
+COMMENT ON COLUMN regional_variant.content IS '变体译文正文，登记时复制自已批准基线译文，UTF-8';
+COMMENT ON COLUMN regional_variant.author IS '基线译文作者，取基线译文提交时 X-Actor-Id；变体审核人不得与之相同';
+COMMENT ON COLUMN regional_variant.reviewer IS '变体审核人，取批准时 X-Actor-Id；待批准状态为 NULL';
+COMMENT ON COLUMN regional_variant.source_version IS '登记时基线译文所依据的源文版本；落后当前源文版本时该变体不再有效';
+COMMENT ON COLUMN regional_variant.term_version IS '登记时绑定的术语版本；不等于当前术语版本（术语版本已退役）时该变体不再有效';
+COMMENT ON COLUMN regional_variant.status IS '状态：PENDING 待批准、ACTIVE 有效、SUPERSEDED 被同区域更新版本取代、REVOKED 已撤销';
+COMMENT ON COLUMN regional_variant.created_at IS '变体登记时间，数据库默认时区';
+COMMENT ON COLUMN regional_variant.approved_at IS '变体批准时间，未批准为 NULL，数据库默认时区';
+COMMENT ON COLUMN regional_variant.revoked_at IS '变体撤销时间，未撤销为 NULL，数据库默认时区';
+
 CREATE TABLE IF NOT EXISTS term_version (
     document_id BIGINT NOT NULL,
     term_version INT NOT NULL,

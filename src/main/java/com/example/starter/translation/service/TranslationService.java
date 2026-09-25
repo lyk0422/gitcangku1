@@ -4,6 +4,8 @@ import com.example.starter.translation.api.ApiDtos;
 import com.example.starter.translation.api.ApiException;
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
+import com.example.starter.translation.domain.Rows.FallbackRecordRow;
+import com.example.starter.translation.domain.Rows.RegionVariantRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
 import com.example.starter.translation.domain.Rows.TranslationRow;
@@ -13,12 +15,14 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -29,6 +33,19 @@ import java.util.stream.Collectors;
  */
 @Service
 public class TranslationService {
+
+    /** 全局默认区域码；基线译文即为 DEFAULT 译文。 */
+    public static final String DEFAULT_REGION = "DEFAULT";
+    /** 回退来源：直接使用具体区域有效变体。 */
+    private static final String REGION = "REGION";
+    /** 回退来源：具体区域缺失，回退 DEFAULT。 */
+    private static final String DEFAULT_FALLBACK = "DEFAULT";
+    /** 回退来源：具体区域与 DEFAULT 均无有效译文。 */
+    private static final String NO_FALLBACK = "NONE";
+
+    private static final String STATUS_PENDING = "PENDING";
+    private static final String STATUS_ACTIVE = "ACTIVE";
+    private static final String STATUS_REVOKED = "REVOKED";
 
     private final TranslationRepository repository;
     private final ObjectMapper objectMapper;
@@ -174,10 +191,10 @@ public class TranslationService {
     }
 
     /**
-     * 发布：校验期望版本（不符 409），再校验全部段落在全部目标语言均有有效批准（缺译或审核失效 422）、
-     * 译文绑定当前术语版本（过期 422）且满足当前术语规则（违规 422 并返回全部违规术语），
-     * 全部通过后原子生成完整只读快照（固化术语版本与实际规则集）并递增发布版本；
-     * 任何失败回滚，不产生部分快照。
+     * 发布：校验期望版本（不符 409），在同一事务内读取一致的段落、基线译文、批准、区域变体与术语版本集合。
+     * region 为 DEFAULT 时沿用基线发布；为具体区域时每个段落/语言优先使用该区域有效变体，缺失回退 DEFAULT；
+     * 若具体区域与 DEFAULT 均无有效译文，整次发布 422 并稳定排序返回缺失段落，既有发布版本不变。
+     * 成功后原子生成只读快照（固化每段落最终译文版本、区域码与回退来源）并递增发布版本。
      */
     @Transactional
     public ApiDtos.PublishResponse publish(long documentId, ApiDtos.PublishRequest request) {
@@ -188,6 +205,7 @@ public class TranslationService {
                     + "、发布版本 " + document.publishedVersion() + "，与期望的 "
                     + request.expectedDraftVersion() + "/" + request.expectedPublishedVersion() + " 不一致");
         }
+        String region = normalizeRegion(request.region());
         List<SegmentRow> segments = repository.listSegments(documentId);
         Map<String, TranslationRow> translations = repository.listTranslations(documentId).stream()
                 .collect(Collectors.toMap(t -> key(t.segmentId(), t.language()), Function.identity()));
@@ -195,35 +213,63 @@ public class TranslationService {
                 .collect(Collectors.toMap(a -> key(a.segmentId(), a.language()), Function.identity()));
         List<TermRuleRow> termRules = repository.listTermRules(documentId, document.termVersion());
         List<ApiDtos.TermRuleView> termViolations = new ArrayList<>();
-        for (SegmentRow segment : segments) {
-            for (String language : document.targetLanguages()) {
-                TranslationRow translation = translations.get(key(segment.segmentId(), language));
-                if (translation == null) {
-                    throw ApiException.unprocessable(
-                            "缺少译文: " + segment.segmentId() + "/" + language);
+
+        Map<String, SelectedTranslation> selected;
+        List<FallbackRecordRow> fallbacks;
+        if (DEFAULT_REGION.equals(region)) {
+            // DEFAULT 发布：沿用既有基线校验，缺译/批准失效/术语过期立即失败。
+            for (SegmentRow segment : segments) {
+                for (String language : document.targetLanguages()) {
+                    TranslationRow translation = requireBaseline(
+                            document, segment, language, translations, approvals);
+                    termViolations.addAll(findViolations(
+                            segment.sourceText(), language, translation.content(), termRules));
                 }
-                if (translation.sourceVersion() != segment.sourceVersion()) {
-                    throw ApiException.unprocessable("译文待更新: " + segment.segmentId() + "/" + language
-                            + " 基于源文版本 " + translation.sourceVersion()
-                            + "，当前源文版本 " + segment.sourceVersion());
+            }
+            selected = Map.of();
+            fallbacks = List.of();
+        } else {
+            // 具体区域发布：逐段落/语言解析区域覆盖，收集全部缺失段落后统一 422。
+            Map<String, RegionVariantRow> activeVariants = activeVariantsByKey(
+                    repository.listRegionVariants(documentId), document, segments);
+            selected = new LinkedHashMap<>();
+            fallbacks = new ArrayList<>();
+            Set<String> missing = new TreeSet<>();
+            for (SegmentRow segment : segments) {
+                for (String language : document.targetLanguages()) {
+                    String mapKey = key(segment.segmentId(), language);
+                    TranslationRow baseline = translations.get(mapKey);
+                    ApprovalRow approval = approvals.get(mapKey);
+                    RegionVariantRow variant = activeVariants.get(variantKey(
+                            segment.segmentId(), language, region));
+                    boolean baselineValid = baseline != null
+                            && isBaselineEffective(document, segment, baseline, approval);
+                    if (variant != null) {
+                        SelectedTranslation chosen = new SelectedTranslation(
+                                variant.content(), variant.author(), variant.reviewer(),
+                                variant.translationVersion(), variant.sourceVersion(),
+                                variant.termVersion(), region, REGION);
+                        selected.put(mapKey, chosen);
+                        termViolations.addAll(findViolations(
+                                segment.sourceText(), language, variant.content(), termRules));
+                    } else if (baselineValid) {
+                        selected.put(mapKey, new SelectedTranslation(
+                                baseline.content(), baseline.author(), approval.reviewer(),
+                                baseline.translationVersion(), baseline.sourceVersion(),
+                                baseline.termVersion(), DEFAULT_REGION, DEFAULT_FALLBACK));
+                        fallbacks.add(new FallbackRecordRow(0, segment.segmentId(), language,
+                                region, baseline.translationVersion()));
+                        termViolations.addAll(findViolations(
+                                segment.sourceText(), language, baseline.content(), termRules));
+                    } else {
+                        missing.add(segment.segmentId());
+                    }
                 }
-                if (translation.termVersion() != document.termVersion()) {
-                    throw ApiException.unprocessable("译文术语版本过期: " + segment.segmentId() + "/" + language
-                            + " 绑定术语版本 " + translation.termVersion()
-                            + "，当前术语版本 " + document.termVersion());
-                }
-                ApprovalRow approval = approvals.get(key(segment.segmentId(), language));
-                if (approval == null) {
-                    throw ApiException.unprocessable(
-                            "缺少批准: " + segment.segmentId() + "/" + language);
-                }
-                if (approval.translationVersion() != translation.translationVersion()
-                        || approval.sourceVersion() != segment.sourceVersion()) {
-                    throw ApiException.unprocessable("批准已失效: " + segment.segmentId() + "/" + language
-                            + "，源文或译文版本已改变");
-                }
-                termViolations.addAll(findViolations(
-                        segment.sourceText(), language, translation.content(), termRules));
+            }
+            if (!missing.isEmpty()) {
+                throw ApiException.missingSegments(
+                        "区域 " + region + " 与 DEFAULT 均无有效译文的段落: " + String.join(",", missing),
+                        new ArrayList<>(missing));
             }
         }
         if (!termViolations.isEmpty()) {
@@ -231,9 +277,53 @@ public class TranslationService {
         }
         int publishedVersion = document.publishedVersion() + 1;
         repository.insertSnapshot(documentId, publishedVersion,
-                buildSnapshotJson(document, publishedVersion, segments, translations, approvals, termRules));
+                buildSnapshotJson(document, publishedVersion, region, segments, translations, approvals,
+                        termRules, selected, fallbacks));
+        for (FallbackRecordRow fallback : fallbacks) {
+            repository.insertFallbackRecord(documentId, publishedVersion, fallback);
+        }
         repository.updatePublishedVersion(documentId, publishedVersion);
-        return new ApiDtos.PublishResponse(documentId, publishedVersion);
+        return new ApiDtos.PublishResponse(documentId, publishedVersion, region);
+    }
+
+    /** DEFAULT 发布时校验并返回某段落/语言的有效基线译文，否则 422。 */
+    private TranslationRow requireBaseline(DocumentRow document, SegmentRow segment, String language,
+                                           Map<String, TranslationRow> translations,
+                                           Map<String, ApprovalRow> approvals) {
+        TranslationRow translation = translations.get(key(segment.segmentId(), language));
+        if (translation == null) {
+            throw ApiException.unprocessable("缺少译文: " + segment.segmentId() + "/" + language);
+        }
+        if (translation.sourceVersion() != segment.sourceVersion()) {
+            throw ApiException.unprocessable("译文待更新: " + segment.segmentId() + "/" + language
+                    + " 基于源文版本 " + translation.sourceVersion()
+                    + "，当前源文版本 " + segment.sourceVersion());
+        }
+        if (translation.termVersion() != document.termVersion()) {
+            throw ApiException.unprocessable("译文术语版本过期: " + segment.segmentId() + "/" + language
+                    + " 绑定术语版本 " + translation.termVersion()
+                    + "，当前术语版本 " + document.termVersion());
+        }
+        ApprovalRow approval = approvals.get(key(segment.segmentId(), language));
+        if (approval == null) {
+            throw ApiException.unprocessable("缺少批准: " + segment.segmentId() + "/" + language);
+        }
+        if (approval.translationVersion() != translation.translationVersion()
+                || approval.sourceVersion() != segment.sourceVersion()) {
+            throw ApiException.unprocessable("批准已失效: " + segment.segmentId() + "/" + language
+                    + "，源文或译文版本已改变");
+        }
+        return translation;
+    }
+
+    /** 判断基线译文在当前文档状态下是否有效（源文/术语版本一致且批准有效）。 */
+    private boolean isBaselineEffective(DocumentRow document, SegmentRow segment, TranslationRow baseline,
+                                        ApprovalRow approval) {
+        return baseline.sourceVersion() == segment.sourceVersion()
+                && baseline.termVersion() == document.termVersion()
+                && approval != null
+                && approval.translationVersion() == baseline.translationVersion()
+                && approval.sourceVersion() == segment.sourceVersion();
     }
 
     /** 查询指定发布版本的只读快照 JSON；不存在返回 404。 */
@@ -289,6 +379,220 @@ public class TranslationService {
                     translation.termVersion() != document.termVersion(), violations));
         }
         return new ApiDtos.TermStatusResponse(documentId, document.termVersion(), statuses);
+    }
+
+    /**
+     * 登记区域译文变体：区域为具体区域码（非 DEFAULT），语言须在文档目标语言中；
+     * 基线译文必须存在、已有效批准且其译文版本等于 expectedVersion（不符 409）；
+     * 同段落/语言/区域/译文版本只能有一条变体（重复 409）。登记后为 PENDING，需独立批准。
+     */
+    @Transactional
+    public ApiDtos.VariantResponse createVariant(long documentId, String segmentId, String language,
+                                                 String region, ApiDtos.CreateVariantRequest request) {
+        DocumentRow document = lockDocument(documentId);
+        String normalizedLanguage = normalizeLanguage(language);
+        String normalizedRegion = normalizeConcreteRegion(region);
+        if (!document.targetLanguages().contains(normalizedLanguage)) {
+            throw ApiException.unprocessable("语言不在文档目标语言中: " + normalizedLanguage);
+        }
+        findSegmentOrThrow(documentId, segmentId);
+        TranslationRow baseline = repository.findTranslation(documentId, segmentId, normalizedLanguage)
+                .orElseThrow(() -> ApiException.notFound(
+                        "基线译文不存在: " + segmentId + "/" + normalizedLanguage));
+        if (baseline.translationVersion() != request.expectedVersion()) {
+            throw ApiException.conflict("变体登记冲突：当前基线译文版本 " + baseline.translationVersion()
+                    + "，与期望的 " + request.expectedVersion() + " 不一致");
+        }
+        ApprovalRow approval = repository.findApproval(documentId, segmentId, normalizedLanguage)
+                .orElseThrow(() -> ApiException.unprocessable(
+                        "基线译文尚未批准，不能登记区域变体: " + segmentId + "/" + normalizedLanguage));
+        if (approval.translationVersion() != baseline.translationVersion()) {
+            throw ApiException.unprocessable(
+                    "基线译文批准已失效，不能登记区域变体: " + segmentId + "/" + normalizedLanguage);
+        }
+        RegionVariantRow row = new RegionVariantRow(segmentId, normalizedLanguage, normalizedRegion,
+                baseline.translationVersion(), baseline.content(), baseline.author(), null,
+                baseline.sourceVersion(), baseline.termVersion(), STATUS_PENDING);
+        try {
+            repository.insertRegionVariant(documentId, row);
+        } catch (org.springframework.dao.DuplicateKeyException e) {
+            throw ApiException.conflict("区域变体已存在: " + segmentId + "/" + normalizedLanguage
+                    + "/" + normalizedRegion + "@" + baseline.translationVersion());
+        }
+        int draftVersion = bumpDraftVersion(document);
+        return new ApiDtos.VariantResponse(documentId, segmentId, normalizedLanguage, normalizedRegion,
+                baseline.translationVersion(), STATUS_PENDING, draftVersion);
+    }
+
+    /**
+     * 批准区域变体：审核人取 X-Actor-Id 且不得是基线译文作者；expectedVersion 必须等于变体所依据的
+     * 基线译文版本（不符 409）。批准后同区域更早的待批准/有效变体置为 SUPERSEDED。
+     */
+    @Transactional
+    public ApiDtos.VariantResponse approveVariant(long documentId, String segmentId, String language,
+                                                  String region, String actorId,
+                                                  ApiDtos.VariantVersionRequest request) {
+        DocumentRow document = lockDocument(documentId);
+        String normalizedLanguage = normalizeLanguage(language);
+        String normalizedRegion = normalizeConcreteRegion(region);
+        RegionVariantRow variant = requireVariant(
+                documentId, segmentId, normalizedLanguage, normalizedRegion, request.expectedVersion());
+        if (!STATUS_PENDING.equals(variant.status())) {
+            throw ApiException.conflict("区域变体当前状态为 " + variant.status() + "，不能批准: "
+                    + segmentId + "/" + normalizedLanguage + "/" + normalizedRegion);
+        }
+        if (variant.author().equals(actorId)) {
+            throw ApiException.unprocessable("审核人不得是该基线译文作者");
+        }
+        int updated = repository.approveRegionVariant(documentId, segmentId, normalizedLanguage,
+                normalizedRegion, request.expectedVersion(), actorId);
+        if (updated == 0) {
+            throw ApiException.conflict("区域变体状态已改变，批准冲突: "
+                    + segmentId + "/" + normalizedLanguage + "/" + normalizedRegion);
+        }
+        repository.supersedeRegionVariants(documentId, segmentId, normalizedLanguage,
+                normalizedRegion, request.expectedVersion());
+        return new ApiDtos.VariantResponse(documentId, segmentId, normalizedLanguage, normalizedRegion,
+                request.expectedVersion(), STATUS_ACTIVE, document.draftVersion());
+    }
+
+    /**
+     * 撤销区域有效变体：expectedVersion 必须等于变体所依据的基线译文版本（不符 409）；
+     * 仅 ACTIVE 变体可撤销。撤销后后续区域发布与查询自动回退 DEFAULT。
+     */
+    @Transactional
+    public ApiDtos.VariantResponse revokeVariant(long documentId, String segmentId, String language,
+                                                 String region, ApiDtos.VariantVersionRequest request) {
+        DocumentRow document = lockDocument(documentId);
+        String normalizedLanguage = normalizeLanguage(language);
+        String normalizedRegion = normalizeConcreteRegion(region);
+        requireVariant(documentId, segmentId, normalizedLanguage, normalizedRegion, request.expectedVersion());
+        int updated = repository.revokeRegionVariant(documentId, segmentId, normalizedLanguage,
+                normalizedRegion, request.expectedVersion());
+        if (updated == 0) {
+            throw ApiException.conflict("区域变体不是有效状态，不能撤销: "
+                    + segmentId + "/" + normalizedLanguage + "/" + normalizedRegion
+                    + "@" + request.expectedVersion());
+        }
+        return new ApiDtos.VariantResponse(documentId, segmentId, normalizedLanguage, normalizedRegion,
+                request.expectedVersion(), STATUS_REVOKED, document.draftVersion());
+    }
+
+    /**
+     * 区域覆盖解析（只读）：给定区域，逐段落/语言返回最终选用译文。
+     * 具体区域有效变体优先，缺失回退 DEFAULT；DEFAULT 也无有效译文时标记 fallbackSource=NONE。
+     */
+    @Transactional(readOnly = true)
+    public ApiDtos.RegionResolutionResponse resolveRegions(long documentId, String region) {
+        DocumentRow document = repository.findDocument(documentId)
+                .orElseThrow(() -> ApiException.notFound("文档不存在: " + documentId));
+        String normalizedRegion = normalizeRegion(region);
+        List<SegmentRow> segments = repository.listSegments(documentId);
+        Map<String, TranslationRow> translations = repository.listTranslations(documentId).stream()
+                .collect(Collectors.toMap(t -> key(t.segmentId(), t.language()), Function.identity()));
+        Map<String, ApprovalRow> approvals = repository.listApprovals(documentId).stream()
+                .collect(Collectors.toMap(a -> key(a.segmentId(), a.language()), Function.identity()));
+        Map<String, RegionVariantRow> activeVariants = DEFAULT_REGION.equals(normalizedRegion)
+                ? Map.of() : activeVariantsByKey(repository.listRegionVariants(documentId), document, segments);
+        List<ApiDtos.RegionResolutionItem> items = new ArrayList<>();
+        for (SegmentRow segment : segments) {
+            for (String language : document.targetLanguages()) {
+                String mapKey = key(segment.segmentId(), language);
+                TranslationRow baseline = translations.get(mapKey);
+                ApprovalRow approval = approvals.get(mapKey);
+                RegionVariantRow variant = activeVariants.get(variantKey(
+                        segment.segmentId(), language, normalizedRegion));
+                if (variant != null) {
+                    items.add(new ApiDtos.RegionResolutionItem(segment.segmentId(), language,
+                            normalizedRegion, normalizedRegion, REGION, variant.translationVersion(),
+                            variant.content()));
+                } else if (baseline != null && isBaselineEffective(document, segment, baseline, approval)) {
+                    items.add(new ApiDtos.RegionResolutionItem(segment.segmentId(), language,
+                            normalizedRegion, DEFAULT_REGION, DEFAULT_FALLBACK, baseline.translationVersion(),
+                            baseline.content()));
+                } else {
+                    items.add(new ApiDtos.RegionResolutionItem(segment.segmentId(), language,
+                            normalizedRegion, null, NO_FALLBACK, 0, null));
+                }
+            }
+        }
+        return new ApiDtos.RegionResolutionResponse(documentId, normalizedRegion, items);
+    }
+
+    /** 查询某具体区域的发布回退历史，按发布版本、段落、语言稳定排序；DEFAULT 区域返回空列表。 */
+    @Transactional(readOnly = true)
+    public ApiDtos.FallbackHistoryResponse getFallbackHistory(long documentId, String region) {
+        repository.findDocument(documentId)
+                .orElseThrow(() -> ApiException.notFound("文档不存在: " + documentId));
+        String normalizedRegion = normalizeConcreteRegion(region);
+        List<ApiDtos.FallbackHistoryItem> items = repository.listFallbackRecords(documentId, normalizedRegion)
+                .stream()
+                .map(r -> new ApiDtos.FallbackHistoryItem(r.publishedVersion(), r.segmentId(), r.language(),
+                        r.requestedRegion(), r.translationVersion()))
+                .toList();
+        return new ApiDtos.FallbackHistoryResponse(documentId, normalizedRegion, items);
+    }
+
+    private RegionVariantRow requireVariant(long documentId, String segmentId, String language, String region,
+                                            int expectedVersion) {
+        return repository.findRegionVariant(documentId, segmentId, language, region, expectedVersion)
+                .orElseThrow(() -> ApiException.notFound("区域变体不存在: " + segmentId + "/" + language
+                        + "/" + region + "@" + expectedVersion));
+    }
+
+    /**
+     * 从全部变体中筛出当前有效（ACTIVE 且源文版本、术语版本与文档当前一致）的变体，
+     * 同段落/语言/区域若存在多条 ACTIVE（理论上不会），取译文版本最大者。
+     */
+    private Map<String, RegionVariantRow> activeVariantsByKey(List<RegionVariantRow> variants,
+                                                              DocumentRow document,
+                                                              List<SegmentRow> segments) {
+        Map<String, RegionVariantRow> active = new LinkedHashMap<>();
+        List<RegionVariantRow> sorted = variants.stream()
+                .filter(v -> STATUS_ACTIVE.equals(v.status()))
+                .sorted(Comparator.comparingInt(RegionVariantRow::translationVersion))
+                .toList();
+        Map<String, SegmentRow> segmentMap = segments.stream()
+                .collect(Collectors.toMap(SegmentRow::segmentId, Function.identity()));
+        for (RegionVariantRow variant : sorted) {
+            SegmentRow segment = segmentMap.get(variant.segmentId());
+            if (segment != null && variant.sourceVersion() == segment.sourceVersion()
+                    && variant.termVersion() == document.termVersion()) {
+                active.put(variantKey(variant.segmentId(), variant.language(), variant.region()), variant);
+            }
+        }
+        return active;
+    }
+
+    private static String variantKey(String segmentId, String language, String region) {
+        return segmentId + " " + language + " " + region;
+    }
+
+    /** 归一化区域码：空白视为 DEFAULT；DEFAULT 原样返回。 */
+    private static String normalizeRegion(String region) {
+        if (region == null || region.isBlank()) {
+            return DEFAULT_REGION;
+        }
+        String normalized = region.trim().toUpperCase(Locale.ROOT);
+        if (DEFAULT_REGION.equals(normalized)) {
+            return DEFAULT_REGION;
+        }
+        return normalized;
+    }
+
+    /** 归一化具体区域码：不允许 DEFAULT，长度 2~8 位大写字母/数字。 */
+    private static String normalizeConcreteRegion(String region) {
+        if (region == null || region.isBlank()) {
+            throw ApiException.unprocessable("区域码不能为空");
+        }
+        String normalized = region.trim().toUpperCase(Locale.ROOT);
+        if (DEFAULT_REGION.equals(normalized)) {
+            throw ApiException.unprocessable("具体区域码不能为 DEFAULT，DEFAULT 为全局默认");
+        }
+        if (!normalized.matches("[A-Z0-9]{2,8}")) {
+            throw ApiException.unprocessable("区域码须为 2~8 位大写字母或数字: " + normalized);
+        }
+        return normalized;
     }
 
     private DocumentRow lockDocument(long documentId) {
@@ -347,13 +651,20 @@ public class TranslationService {
         return new ApiDtos.TermRuleView(rule.sourceTerm(), rule.language(), rule.requiredTranslation());
     }
 
-    /** 生成完整只读快照 JSON：全部段落源文及各语言译文、作者、审核人、版本号与固化的术语版本及规则集。 */
-    private String buildSnapshotJson(DocumentRow document, int publishedVersion, List<SegmentRow> segments,
+    /**
+     * 生成完整只读快照 JSON：发布区域、全部段落源文及各语言最终选用译文（版本、区域码、回退来源）、
+     * 作者、审核人、版本号与固化的术语版本及规则集。快照一经写入不再随变体新增/撤销/修订改变。
+     */
+    private String buildSnapshotJson(DocumentRow document, int publishedVersion, String requestedRegion,
+                                     List<SegmentRow> segments,
                                      Map<String, TranslationRow> translations,
-                                     Map<String, ApprovalRow> approvals, List<TermRuleRow> termRules) {
+                                     Map<String, ApprovalRow> approvals, List<TermRuleRow> termRules,
+                                     Map<String, SelectedTranslation> selected,
+                                     List<FallbackRecordRow> fallbacks) {
         Map<String, Object> snapshot = new LinkedHashMap<>();
         snapshot.put("documentId", document.documentId());
         snapshot.put("publishedVersion", publishedVersion);
+        snapshot.put("region", requestedRegion);
         snapshot.put("draftVersion", document.draftVersion());
         snapshot.put("termVersion", document.termVersion());
         snapshot.put("targetLanguages", document.targetLanguages());
@@ -366,6 +677,8 @@ public class TranslationService {
             termList.add(termJson);
         }
         snapshot.put("terms", termList);
+        Set<String> fallbackKeys = fallbacks.stream()
+                .map(f -> key(f.segmentId(), f.language())).collect(Collectors.toSet());
         List<Map<String, Object>> segmentList = new ArrayList<>();
         for (SegmentRow segment : segments) {
             Map<String, Object> segmentJson = new LinkedHashMap<>();
@@ -374,16 +687,31 @@ public class TranslationService {
             segmentJson.put("sourceVersion", segment.sourceVersion());
             List<Map<String, Object>> translationList = new ArrayList<>();
             for (String language : document.targetLanguages()) {
-                TranslationRow translation = translations.get(key(segment.segmentId(), language));
+                TranslationRow baseline = translations.get(key(segment.segmentId(), language));
                 ApprovalRow approval = approvals.get(key(segment.segmentId(), language));
+                SelectedTranslation chosen = selected.get(key(segment.segmentId(), language));
                 Map<String, Object> translationJson = new LinkedHashMap<>();
                 translationJson.put("language", language);
-                translationJson.put("content", translation.content());
-                translationJson.put("author", translation.author());
-                translationJson.put("translationVersion", translation.translationVersion());
-                translationJson.put("sourceVersion", translation.sourceVersion());
-                translationJson.put("termVersion", translation.termVersion());
-                translationJson.put("reviewer", approval.reviewer());
+                if (chosen != null) {
+                    translationJson.put("content", chosen.content());
+                    translationJson.put("author", chosen.author());
+                    translationJson.put("translationVersion", chosen.translationVersion());
+                    translationJson.put("sourceVersion", chosen.sourceVersion());
+                    translationJson.put("termVersion", chosen.termVersion());
+                    translationJson.put("reviewer", chosen.reviewer());
+                    translationJson.put("region", chosen.region());
+                    translationJson.put("fallbackSource",
+                            fallbackKeys.contains(key(segment.segmentId(), language)) ? DEFAULT_FALLBACK : REGION);
+                } else {
+                    translationJson.put("content", baseline.content());
+                    translationJson.put("author", baseline.author());
+                    translationJson.put("translationVersion", baseline.translationVersion());
+                    translationJson.put("sourceVersion", baseline.sourceVersion());
+                    translationJson.put("termVersion", baseline.termVersion());
+                    translationJson.put("reviewer", approval.reviewer());
+                    translationJson.put("region", DEFAULT_REGION);
+                    translationJson.put("fallbackSource", DEFAULT_REGION);
+                }
                 translationList.add(translationJson);
             }
             segmentJson.put("translations", translationList);
@@ -395,5 +723,12 @@ public class TranslationService {
         } catch (Exception e) {
             throw new IllegalStateException("快照序列化失败", e);
         }
+    }
+
+    /**
+     * 发布快照中某段落/语言最终选用的译文：区域变体或 DEFAULT 基线，固化版本、区域码与回退来源。
+     */
+    private record SelectedTranslation(String content, String author, String reviewer, int translationVersion,
+                                       int sourceVersion, int termVersion, String region, String fallbackSource) {
     }
 }

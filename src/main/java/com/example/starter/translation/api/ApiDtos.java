@@ -58,11 +58,24 @@ public final class ApiDtos {
             @Positive(message = "translationVersion 必须为正数") int translationVersion) {
     }
 
-    /** 发布请求：携带期望的草稿与发布版本做乐观校验。 */
+    /** 发布请求：携带期望的草稿与发布版本做乐观校验；region 缺省或为 DEFAULT 表示全局默认发布。 */
     public record PublishRequest(
             @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
             @Positive(message = "expectedDraftVersion 必须为正数") int expectedDraftVersion,
-            @PositiveOrZero(message = "expectedPublishedVersion 不能为负数") int expectedPublishedVersion) {
+            @PositiveOrZero(message = "expectedPublishedVersion 不能为负数") int expectedPublishedVersion,
+            @Size(max = 16, message = "region 最长 16 个字符") String region) {
+    }
+
+    /** 登记区域变体请求：区域码取自路径，expectedVersion 为登记时当前基线译文版本。 */
+    public record CreateVariantRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @Positive(message = "expectedVersion 必须为正数") int expectedVersion) {
+    }
+
+    /** 批准/撤销区域变体请求：expectedVersion 为变体所依据的基线译文版本。 */
+    public record VariantVersionRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @Positive(message = "expectedVersion 必须为正数") int expectedVersion) {
     }
 
     /** 术语规则输入：sourceTerm 区分大小写，requiredTranslation 非空。 */
@@ -101,7 +114,32 @@ public final class ApiDtos {
     }
 
     /** 发布响应。 */
-    public record PublishResponse(long documentId, int publishedVersion) {
+    public record PublishResponse(long documentId, int publishedVersion, String region) {
+    }
+
+    /** 区域变体登记/批准/撤销响应。 */
+    public record VariantResponse(long documentId, String segmentId, String language, String region,
+                                  int translationVersion, String status, int draftVersion) {
+    }
+
+    /** 区域覆盖解析条目：每段落每语言最终选用的区域译文及回退来源。 */
+    public record RegionResolutionItem(String segmentId, String language, String requestedRegion,
+                                       String selectedRegion, String fallbackSource, int translationVersion,
+                                       String content) {
+    }
+
+    /** 区域覆盖解析结果。 */
+    public record RegionResolutionResponse(long documentId, String requestedRegion,
+                                           List<RegionResolutionItem> items) {
+    }
+
+    /** 回退历史条目：某次发布中因具体区域缺失而回退 DEFAULT 的段落/语言。 */
+    public record FallbackHistoryItem(int publishedVersion, String segmentId, String language,
+                                      String requestedRegion, int translationVersion) {
+    }
+
+    /** 回退历史查询结果，按发布版本与段落稳定排序。 */
+    public record FallbackHistoryResponse(long documentId, String region, List<FallbackHistoryItem> items) {
     }
 
     /** 术语规则视图。 */
@@ -125,11 +163,16 @@ public final class ApiDtos {
     public record TermStatusResponse(long documentId, int termVersion, List<TranslationTermStatus> translations) {
     }
 
-    /** 统一错误响应；violations 仅在术语违规 422 时返回，含全部违规术语。 */
+    /** 统一错误响应；violations 仅在术语违规 422 时返回，missingSegments 仅在缺失段落 422 时返回。 */
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    public record ErrorResponse(String error, String message, List<TermRuleView> violations) {
+    public record ErrorResponse(String error, String message, List<TermRuleView> violations,
+                                List<String> missingSegments) {
         public ErrorResponse(String error, String message) {
-            this(error, message, null);
+            this(error, message, null, null);
+        }
+
+        public ErrorResponse(String error, String message, List<TermRuleView> violations) {
+            this(error, message, violations, null);
         }
     }
 }

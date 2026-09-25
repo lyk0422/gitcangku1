@@ -92,13 +92,64 @@ public class TranslationController {
                         documentId, segmentId, language, actorId, request))).toResponseEntity();
     }
 
-    /** 发布：全部段落全部目标语言均有有效批准且术语校验通过时原子生成只读快照并递增发布版本。 */
+    /** 发布：给定区域优先使用区域有效变体、缺失回退 DEFAULT；全部失败段落稳定排序返回 422。 */
     @PostMapping("/{documentId}/publish")
     public ResponseEntity<String> publish(@PathVariable long documentId,
                                           @Valid @RequestBody ApiDtos.PublishRequest request) {
         String operation = "POST /api/documents/" + documentId + "/publish";
         return writeExecutor.execute(request.requestId(), hash(operation, request),
                 () -> WriteResult.of(201, translationService.publish(documentId, request))).toResponseEntity();
+    }
+
+    /** 登记区域译文变体：基于已批准基线译文登记具体区域，expectedVersion 为基线译文版本。 */
+    @PostMapping("/{documentId}/segments/{segmentId}/translations/{language}/variants/{region}")
+    public ResponseEntity<String> createVariant(@PathVariable long documentId, @PathVariable String segmentId,
+                                                @PathVariable String language, @PathVariable String region,
+                                                @Valid @RequestBody ApiDtos.CreateVariantRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/segments/" + segmentId
+                + "/translations/" + language + "/variants/" + region;
+        return writeExecutor.execute(request.requestId(), hash(operation, request),
+                () -> WriteResult.of(201, translationService.createVariant(
+                        documentId, segmentId, language, region, request))).toResponseEntity();
+    }
+
+    /** 批准区域变体：审核人取 X-Actor-Id，不得是基线译文作者。 */
+    @PostMapping("/{documentId}/segments/{segmentId}/translations/{language}/variants/{region}/approve")
+    public ResponseEntity<String> approveVariant(@PathVariable long documentId, @PathVariable String segmentId,
+                                                 @PathVariable String language, @PathVariable String region,
+                                                 @RequestHeader("X-Actor-Id") String actorId,
+                                                 @Valid @RequestBody ApiDtos.VariantVersionRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/segments/" + segmentId
+                + "/translations/" + language + "/variants/" + region + "/approve";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(200, translationService.approveVariant(
+                        documentId, segmentId, language, region, actorId, request))).toResponseEntity();
+    }
+
+    /** 撤销区域有效变体：撤销后发布与查询自动回退 DEFAULT。 */
+    @PostMapping("/{documentId}/segments/{segmentId}/translations/{language}/variants/{region}/revoke")
+    public ResponseEntity<String> revokeVariant(@PathVariable long documentId, @PathVariable String segmentId,
+                                                @PathVariable String language, @PathVariable String region,
+                                                @Valid @RequestBody ApiDtos.VariantVersionRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/segments/" + segmentId
+                + "/translations/" + language + "/variants/" + region + "/revoke";
+        return writeExecutor.execute(request.requestId(), hash(operation, request),
+                () -> WriteResult.of(200, translationService.revokeVariant(
+                        documentId, segmentId, language, region, request))).toResponseEntity();
+    }
+
+    /** 区域覆盖解析：给定区域返回每段落/语言最终选用译文与回退来源。 */
+    @GetMapping("/{documentId}/regions/{region}/resolution")
+    public ResponseEntity<ApiDtos.RegionResolutionResponse> resolveRegion(@PathVariable long documentId,
+                                                                          @PathVariable String region) {
+        return ResponseEntity.ok(translationService.resolveRegions(documentId, region));
+    }
+
+    /** 回退历史查询：某具体区域历次发布回退 DEFAULT 的段落记录。 */
+    @GetMapping("/{documentId}/regions/{region}/fallbacks")
+    public ResponseEntity<ApiDtos.FallbackHistoryResponse> fallbackHistory(@PathVariable long documentId,
+                                                                           @PathVariable String region) {
+        return ResponseEntity.ok(translationService.getFallbackHistory(documentId, region));
     }
 
     /** 新增术语版本：不可变快照，术语版本与草稿版本各加一；已有版本不可覆盖。 */

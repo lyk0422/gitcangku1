@@ -72,6 +72,39 @@ public final class Rows {
     }
 
     /**
+     * 区域译文变体：同一段落/语言/区域在同一译文版本只有一条。
+     * PENDING 待批准、ACTIVE 有效、SUPERSEDED 被同区域更新版本取代、REVOKED 已撤销。
+     *
+     * @param segmentId          所属段落 ID
+     * @param language           目标语言码，小写
+     * @param region             适用区域码，大写具体区域；DEFAULT 基线不登记
+     * @param translationVersion 登记时所依据的基线译文版本
+     * @param content            变体译文正文
+     * @param author             基线译文作者；变体审核人不得与之相同
+     * @param reviewer           变体审核人，待批准为 null
+     * @param sourceVersion      登记时基线译文所依据的源文版本
+     * @param termVersion        登记时绑定的术语版本
+     * @param status             PENDING / ACTIVE / SUPERSEDED / REVOKED
+     */
+    public record RegionVariantRow(String segmentId, String language, String region, int translationVersion,
+                                   String content, String author, String reviewer, int sourceVersion,
+                                   int termVersion, String status) {
+    }
+
+    /**
+     * 回退历史记录：某次区域发布中因具体区域有效变体缺失而回退 DEFAULT 的段落。
+     *
+     * @param publishedVersion   对应发布版本号
+     * @param segmentId          回退 DEFAULT 的段落 ID
+     * @param language           回退 DEFAULT 的目标语言码
+     * @param requestedRegion    发布请求的具体区域码
+     * @param translationVersion 回退所选用的 DEFAULT 基线译文版本
+     */
+    public record FallbackRecordRow(int publishedVersion, String segmentId, String language,
+                                    String requestedRegion, int translationVersion) {
+    }
+
+    /**
      * 写操作幂等去重记录：全局唯一 requestId，仅记录成功结果，与业务变更原子提交。
      *
      * @param requestId      全局唯一请求 ID
