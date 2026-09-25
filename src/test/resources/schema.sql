@@ -15,10 +15,24 @@ CREATE TABLE IF NOT EXISTS consent_record (
     purpose VARCHAR(32) NOT NULL,
     epoch INT NOT NULL,
     record_key VARCHAR(128) NOT NULL,
+    scope_key VARCHAR(128) NOT NULL DEFAULT 'default',
     payload TEXT NOT NULL,
     request_id VARCHAR(128) NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (subject_key, purpose, epoch, record_key)
+);
+
+CREATE TABLE IF NOT EXISTS consent_scope (
+    subject_key VARCHAR(128) NOT NULL,
+    purpose VARCHAR(32) NOT NULL,
+    epoch INT NOT NULL,
+    scope_key VARCHAR(128) NOT NULL,
+    label VARCHAR(256) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    request_id VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    revoked_at TIMESTAMP NULL DEFAULT NULL,
+    PRIMARY KEY (subject_key, purpose, epoch, scope_key)
 );
 
 CREATE TABLE IF NOT EXISTS idempotency_request (
