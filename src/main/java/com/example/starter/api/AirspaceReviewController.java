@@ -1,10 +1,15 @@
 package com.example.starter.api;
 
+import com.example.starter.api.dto.CapacityBucketDto;
+import com.example.starter.api.dto.CapacityBucketRequest;
+import com.example.starter.api.dto.DepartRequest;
 import com.example.starter.api.dto.MutationResponse;
+import com.example.starter.api.dto.PreemptionDto;
 import com.example.starter.api.dto.ReviewRequest;
 import com.example.starter.api.dto.ReviewResultDto;
 import com.example.starter.api.dto.RouteCreateRequest;
 import com.example.starter.api.dto.RouteReplaceRequest;
+import com.example.starter.api.dto.RouteStateResult;
 import com.example.starter.api.dto.ZoneCreateRequest;
 import com.example.starter.api.dto.ZoneRevokeRequest;
 import com.example.starter.service.AirspaceReviewService;
@@ -16,7 +21,10 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+
+import java.util.List;
 
 /**
  * 禁飞区域与航线版本审查 API。
@@ -71,5 +79,38 @@ public class AirspaceReviewController {
     @GetMapping("/routes/{routeId}/current-review")
     public ReviewResultDto getCurrentReview(@PathVariable String routeId) {
         return service.getCurrentReview(routeId);
+    }
+
+    /** 起飞登记（仅 APPROVED 航线）。 */
+    @PostMapping("/routes/depart")
+    public ResponseEntity<MutationResponse> depart(@Valid @RequestBody DepartRequest request) {
+        return ResponseEntity.ok(service.depart(request));
+    }
+
+    /** 创建时空容量桶。 */
+    @PostMapping("/capacity-buckets")
+    public ResponseEntity<MutationResponse> createCapacityBucket(
+            @Valid @RequestBody CapacityBucketRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(service.createCapacityBucket(request));
+    }
+
+    /** 查询全部容量桶及占用。 */
+    @GetMapping("/capacity-buckets")
+    public List<CapacityBucketDto> listCapacityBuckets() {
+        return service.listCapacityBuckets();
+    }
+
+    /** 查询抢占记录（可按 routeId、state 过滤）。 */
+    @GetMapping("/preemptions")
+    public List<PreemptionDto> listPreemptions(
+            @RequestParam(required = false) String routeId,
+            @RequestParam(required = false) String state) {
+        return service.listPreemptions(routeId, state);
+    }
+
+    /** 查询全部被置换（DISPLACED）航线。 */
+    @GetMapping("/routes/displaced")
+    public List<RouteStateResult> listDisplacedRoutes() {
+        return service.listDisplacedRoutes();
     }
 }

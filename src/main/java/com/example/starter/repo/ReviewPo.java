@@ -14,10 +14,14 @@ import java.util.List;
  * @param conclusion      CLEAR / BLOCKED
  * @param hitZoneIds      命中 zoneId（字典序去重）
  * @param pointsSnapshot  审核时航点不可变快照
+ * @param priority        本次审查声明的备降优先级（NORMAL / EMERGENCY）
+ * @param eventNo         EMERGENCY 的事件编号；NORMAL 为 null
+ * @param bucketKey       规范化时空桶键；未声明时空段为 null
  * @param requestId       提交审核的请求标识
  * @param createdAt       创建时间（epoch 毫秒）
  */
 public record ReviewPo(String reviewId, String routeId, int routeVersion, long airspaceVersion,
                        String conclusion, List<String> hitZoneIds, List<Point> pointsSnapshot,
+                       String priority, String eventNo, String bucketKey,
                        String requestId, long createdAt) {
 }

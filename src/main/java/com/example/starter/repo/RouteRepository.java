@@ -21,18 +21,12 @@ public class RouteRepository {
 
     /** 按 routeId 查询航线（含当前版本点列），不存在返回 null。 */
     public RoutePo findRoute(String routeId) {
-        Integer version;
-        try {
-            version = jdbc.queryForObject(
-                    "SELECT version FROM route WHERE route_id = ?", Integer.class, routeId);
-        } catch (EmptyResultDataAccessException ex) {
+        RoutePo row = findRouteRow(routeId);
+        if (row == null) {
             return null;
         }
-        if (version == null) {
-            return null;
-        }
-        List<Point> points = findPoints(routeId);
-        return new RoutePo(routeId, version, points);
+        return new RoutePo(row.routeId(), row.version(), findPoints(routeId),
+                row.status(), row.priority(), row.eventNo());
     }
 
     /**
@@ -49,13 +43,29 @@ public class RouteRepository {
         if (locked == 0) {
             return null;
         }
-        Integer version = jdbc.queryForObject(
-                "SELECT version FROM route WHERE route_id = ?", Integer.class, routeId);
-        if (version == null) {
+        return findRoute(routeId);
+    }
+
+    private RoutePo findRouteRow(String routeId) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT route_id, version, status, priority, event_no FROM route WHERE route_id = ?",
+                    (rs, n) -> new RoutePo(rs.getString("route_id"), rs.getInt("version"), List.of(),
+                            rs.getString("status"), rs.getString("priority"), rs.getString("event_no")),
+                    routeId);
+        } catch (EmptyResultDataAccessException ex) {
             return null;
         }
-        List<Point> points = findPoints(routeId);
-        return new RoutePo(routeId, version, points);
+    }
+
+    /** 查询指定状态的全部航线（按 routeId 字典序）。 */
+    public List<RoutePo> findRoutesByStatus(String status) {
+        return jdbc.query(
+                "SELECT route_id, version, status, priority, event_no FROM route "
+                        + "WHERE status = ? ORDER BY route_id",
+                (rs, n) -> new RoutePo(rs.getString("route_id"), rs.getInt("version"), List.of(),
+                        rs.getString("status"), rs.getString("priority"), rs.getString("event_no")),
+                status);
     }
 
     private List<Point> findPoints(String routeId) {
@@ -64,9 +74,10 @@ public class RouteRepository {
                 (rs, n) -> new Point(rs.getInt("x"), rs.getInt("y")), routeId);
     }
 
-    /** 创建航线（初始版本 1）并写入点列（调用方负责事务）。 */
+    /** 创建航线（初始版本 1，状态 PENDING）并写入点列（调用方负责事务）。 */
     public void insertRoute(String routeId, List<Point> points) {
-        jdbc.update("INSERT INTO route (route_id, version, touch) VALUES (?, 1, 0)", routeId);
+        jdbc.update("INSERT INTO route (route_id, version, touch, status, priority, event_no) "
+                + "VALUES (?, 1, 0, 'PENDING', 'NORMAL', NULL)", routeId);
         insertPoints(routeId, points);
     }
 
@@ -81,6 +92,32 @@ public class RouteRepository {
                 "UPDATE route SET version = version + 1, touch = touch + 1 "
                         + "WHERE route_id = ? AND version = ?",
                 routeId, expectedVersion);
+    }
+
+    /**
+     * 审查批准后更新航线状态与优先级声明（调用方负责事务与行锁）。
+     * DEPARTED 航线不被回退：仅当当前状态不是 DEPARTED 时更新。
+     *
+     * @return 更新行数
+     */
+    public int markReviewed(String routeId, String newStatus, String priority, String eventNo) {
+        return jdbc.update(
+                "UPDATE route SET status = ?, priority = ?, event_no = ? "
+                        + "WHERE route_id = ? AND status <> 'DEPARTED'",
+                newStatus, priority, eventNo, routeId);
+    }
+
+    /**
+     * 条件状态迁移：仅当当前状态等于 expectedStatus 时迁移到 newStatus。
+     * 用于抢占置换（APPROVED → DISPLACED）与起飞登记（APPROVED → DEPARTED）
+     * 的状态不符检测，更新 0 行即状态不符，调用方应回滚事务。
+     *
+     * @return 更新行数；0 表示状态不符
+     */
+    public int transitionStatus(String routeId, String expectedStatus, String newStatus) {
+        return jdbc.update(
+                "UPDATE route SET status = ? WHERE route_id = ? AND status = ?",
+                newStatus, routeId, expectedStatus);
     }
 
     /** 删除航线旧点列（调用方负责事务）。 */
