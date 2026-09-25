@@ -29,3 +29,28 @@ CREATE TABLE IF NOT EXISTS idempotency_request (
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (request_id)
 );
+
+CREATE TABLE IF NOT EXISTS export_snapshot (
+    export_key VARCHAR(128) NOT NULL,
+    subject_key VARCHAR(128) NOT NULL,
+    request_id VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP NOT NULL,
+    PRIMARY KEY (export_key)
+);
+
+CREATE TABLE IF NOT EXISTS export_snapshot_purpose (
+    export_key VARCHAR(128) NOT NULL,
+    purpose VARCHAR(32) NOT NULL,
+    epoch INT NOT NULL,
+    record_count INT NOT NULL,
+    PRIMARY KEY (export_key, purpose)
+);
+
+CREATE TABLE IF NOT EXISTS export_snapshot_record (
+    export_key VARCHAR(128) NOT NULL,
+    purpose VARCHAR(32) NOT NULL,
+    seq INT NOT NULL,
+    record_key VARCHAR(128) NOT NULL,
+    payload TEXT NOT NULL,
+    PRIMARY KEY (export_key, purpose, record_key)
+);

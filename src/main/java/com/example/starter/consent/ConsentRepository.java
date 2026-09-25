@@ -97,6 +97,37 @@ public class ConsentRepository {
         return rows.stream().findFirst();
     }
 
+    /**
+     * 主体是否在任何用途下存在授权代次（不论状态）。
+     */
+    boolean existsAnyGrant(String subjectKey) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM consent_grant WHERE subject_key = ?",
+                Integer.class, subjectKey);
+        return count != null && count > 0;
+    }
+
+    /**
+     * 行锁读取当前最新代次：与撤回的 UPDATE 互斥，使导出与撤回按提交顺序裁决。
+     */
+    Optional<GrantRow> findLatestGrantForUpdate(String subjectKey, Purpose purpose) {
+        List<GrantRow> rows = jdbc.query(
+                "SELECT subject_key, purpose, epoch, status FROM consent_grant"
+                        + " WHERE subject_key = ? AND purpose = ? ORDER BY epoch DESC LIMIT 1 FOR UPDATE",
+                GRANT_MAPPER, subjectKey, purpose.name());
+        return rows.stream().findFirst();
+    }
+
+    /**
+     * 读取指定代次全部记录，按 recordKey 升序。
+     */
+    List<RecordRow> findRecords(String subjectKey, Purpose purpose, int epoch) {
+        return jdbc.query(
+                "SELECT subject_key, purpose, epoch, record_key, payload FROM consent_record"
+                        + " WHERE subject_key = ? AND purpose = ? AND epoch = ? ORDER BY record_key ASC",
+                RECORD_MAPPER, subjectKey, purpose.name(), epoch);
+    }
+
     void insertRecord(String subjectKey, Purpose purpose, int epoch, String recordKey, String payload, String requestId) {
         jdbc.update(
                 "INSERT INTO consent_record (subject_key, purpose, epoch, record_key, payload, request_id)"
