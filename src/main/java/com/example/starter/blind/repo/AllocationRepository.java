@@ -13,7 +13,7 @@ import java.util.List;
 @Repository
 public class AllocationRepository {
 
-    /** 分配行（含盲底，仅供服务层内部使用）。 */
+    /** 分配行（含盲底，仅供服务层内部使用）。版本与序号在分配时固化，之后不改写。 */
     public record AllocationRow(
             long id,
             String experimentId,
@@ -24,8 +24,14 @@ public class AllocationRepository {
             String status,
             String assignedActor,
             long assignedAt,
-            Long withdrawnAt) {
+            Long withdrawnAt,
+            long tableVersionId,
+            int seqNo) {
     }
+
+    private static final String ALLOCATION_COLUMNS =
+            "id, experiment_id, participant_id, block_no, seat_no, blind_code, status, "
+                    + "assigned_actor, assigned_at, withdrawn_at, table_version_id, seq_no";
 
     private static final RowMapper<AllocationRow> ALLOCATION_MAPPER = (rs, n) -> new AllocationRow(
             rs.getLong("id"),
@@ -37,7 +43,9 @@ public class AllocationRepository {
             rs.getString("status"),
             rs.getString("assigned_actor"),
             rs.getLong("assigned_at"),
-            (Long) rs.getObject("withdrawn_at"));
+            (Long) rs.getObject("withdrawn_at"),
+            rs.getLong("table_version_id"),
+            rs.getInt("seq_no"));
 
     private final JdbcTemplate jdbc;
 
@@ -48,17 +56,18 @@ public class AllocationRepository {
     public void insert(AllocationRow row) {
         jdbc.update("INSERT INTO allocation ("
                         + "experiment_id, participant_id, block_no, seat_no, blind_code, "
-                        + "status, assigned_actor, assigned_at, withdrawn_at"
-                        + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        + "status, assigned_actor, assigned_at, withdrawn_at, "
+                        + "table_version_id, seq_no"
+                        + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 row.experimentId(), row.participantId(), row.blockNo(), row.seatNo(), row.blindCode(),
-                row.status(), row.assignedActor(), row.assignedAt(), row.withdrawnAt());
+                row.status(), row.assignedActor(), row.assignedAt(), row.withdrawnAt(),
+                row.tableVersionId(), row.seqNo());
     }
 
     public AllocationRow findByExperimentAndParticipant(String experimentId, String participantId) {
         List<AllocationRow> rows = jdbc.query(
-                "SELECT id, experiment_id, participant_id, block_no, seat_no, blind_code, status, "
-                        + "assigned_actor, assigned_at, withdrawn_at "
-                        + "FROM allocation WHERE experiment_id = ? AND participant_id = ?",
+                "SELECT " + ALLOCATION_COLUMNS + " FROM allocation "
+                        + "WHERE experiment_id = ? AND participant_id = ?",
                 ALLOCATION_MAPPER, experimentId, participantId);
         return rows.isEmpty() ? null : rows.get(0);
     }
@@ -67,29 +76,39 @@ public class AllocationRepository {
      * 原子领取按区组、席位顺序排列的第一个空位：把尚未被占用的最小 block_no/seat_no
      * 关联给新参与者。依赖 allocation(experiment_id, block_no, seat_no) 唯一索引兜底并发。
      *
-     * @return 领取到的席位；实验满额时返回 null
+     * @return 领取到的席位（含引入该席位的随机表版本）；实验满额时返回 null
      */
     public VacantSeat takeFirstVacantSeat(String experimentId) {
         List<VacantSeat> seats = jdbc.query(
-                "SELECT s.block_no, s.seat_no FROM seat s "
+                "SELECT s.block_no, s.seat_no, s.version_id FROM seat s "
                         + "LEFT JOIN allocation a "
                         + "ON a.experiment_id = s.experiment_id "
                         + "AND a.block_no = s.block_no "
                         + "AND a.seat_no = s.seat_no "
                         + "WHERE s.experiment_id = ? AND a.id IS NULL "
                         + "ORDER BY s.block_no, s.seat_no LIMIT 1",
-                (rs, n) -> new VacantSeat(rs.getInt(1), rs.getInt(2)),
+                (rs, n) -> new VacantSeat(rs.getInt(1), rs.getInt(2), rs.getLong(3)),
                 experimentId);
         return seats.isEmpty() ? null : seats.get(0);
     }
 
-    /** 原子领取结果。 */
-    public record VacantSeat(int blockNo, int seatNo) {
+    /** 原子领取结果。versionId 为引入该席位的随机表版本主键。 */
+    public record VacantSeat(int blockNo, int seatNo, long versionId) {
     }
 
     public long countOccupied(String experimentId) {
         Long count = jdbc.queryForObject(
                 "SELECT COUNT(*) FROM allocation WHERE experiment_id = ?", Long.class, experimentId);
+        return count == null ? 0 : count;
+    }
+
+    /**
+     * 统计区组已分配席位数（含已退组，席位仍保留）。
+     */
+    public long countOccupiedInBlock(String experimentId, int blockNo) {
+        Long count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM allocation WHERE experiment_id = ? AND block_no = ?",
+                Long.class, experimentId, blockNo);
         return count == null ? 0 : count;
     }
 

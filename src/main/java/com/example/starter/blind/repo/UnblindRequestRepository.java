@@ -97,4 +97,16 @@ public class UnblindRequestRepository {
                         + "WHERE id = ? AND status = 'PENDING'",
                 reviewerActor, treatment, reviewedAt, requestId);
     }
+
+    /**
+     * 统计区组内已批准的揭盲申请数；封存前置校验使用（已揭盲区组禁止封存）。
+     */
+    public long countApprovedInBlock(String experimentId, int blockNo) {
+        Long count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM unblind_request u "
+                        + "JOIN allocation a ON a.id = u.allocation_id "
+                        + "WHERE u.experiment_id = ? AND a.block_no = ? AND u.status = 'APPROVED'",
+                Long.class, experimentId, blockNo);
+        return count == null ? 0 : count;
+    }
 }

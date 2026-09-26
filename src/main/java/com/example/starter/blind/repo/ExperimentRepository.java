@@ -17,7 +17,8 @@ public class ExperimentRepository {
     }
 
     /** 席位行（盲底）：treatment 为 A/B，seatNo 可直接解码，禁止出现在普通接口。 */
-    public record SeatRow(String experimentId, int blockNo, int seatNo, String treatment) {
+    public record SeatRow(String experimentId, int blockNo, int seatNo, String treatment,
+                          long versionId) {
     }
 
     private static final RowMapper<ExperimentRow> EXPERIMENT_MAPPER = (rs, n) -> new ExperimentRow(
@@ -30,7 +31,8 @@ public class ExperimentRepository {
             rs.getString("experiment_id"),
             rs.getInt("block_no"),
             rs.getInt("seat_no"),
-            rs.getString("treatment"));
+            rs.getString("treatment"),
+            rs.getLong("version_id"));
 
     private final JdbcTemplate jdbc;
 
@@ -69,20 +71,32 @@ public class ExperimentRepository {
     }
 
     public void insertSeat(SeatRow seat) {
-        jdbc.update("INSERT INTO seat (experiment_id, block_no, seat_no, treatment) VALUES (?, ?, ?, ?)",
-                seat.experimentId(), seat.blockNo(), seat.seatNo(), seat.treatment());
+        jdbc.update("INSERT INTO seat (experiment_id, block_no, seat_no, treatment, version_id) "
+                        + "VALUES (?, ?, ?, ?, ?)",
+                seat.experimentId(), seat.blockNo(), seat.seatNo(), seat.treatment(),
+                seat.versionId());
     }
 
     public List<SeatRow> findSeats(String experimentId) {
         return jdbc.query(
-                "SELECT experiment_id, block_no, seat_no, treatment FROM seat "
+                "SELECT experiment_id, block_no, seat_no, treatment, version_id FROM seat "
                         + "WHERE experiment_id = ? ORDER BY block_no, seat_no",
                 SEAT_MAPPER, experimentId);
     }
 
+    /**
+     * 查询指定区组的全部席位（盲底），按席位号升序；仅供版本摘要计算与揭盲内部使用。
+     */
+    public List<SeatRow> findBlockSeats(String experimentId, int blockNo) {
+        return jdbc.query(
+                "SELECT experiment_id, block_no, seat_no, treatment, version_id FROM seat "
+                        + "WHERE experiment_id = ? AND block_no = ? ORDER BY seat_no",
+                SEAT_MAPPER, experimentId, blockNo);
+    }
+
     public SeatRow findSeat(String experimentId, int blockNo, int seatNo) {
         List<SeatRow> rows = jdbc.query(
-                "SELECT experiment_id, block_no, seat_no, treatment FROM seat "
+                "SELECT experiment_id, block_no, seat_no, treatment, version_id FROM seat "
                         + "WHERE experiment_id = ? AND block_no = ? AND seat_no = ?",
                 SEAT_MAPPER, experimentId, blockNo, seatNo);
         return rows.isEmpty() ? null : rows.get(0);

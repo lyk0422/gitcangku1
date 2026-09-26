@@ -10,6 +10,8 @@ import com.example.starter.blind.repo.AllocationRepository.VacantSeat;
 import com.example.starter.blind.repo.ExperimentRepository;
 import com.example.starter.blind.repo.ExperimentRepository.ExperimentRow;
 import com.example.starter.blind.repo.ExperimentRepository.SeatRow;
+import com.example.starter.blind.repo.RandomTableRepository;
+import com.example.starter.blind.repo.RandomTableRepository.VersionRow;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -19,31 +21,37 @@ import java.util.List;
 
 /**
  * 实验与分配核心业务：
- * 创建实验时固定区组与每区组两 A 两 B 的席位内容；分配按区组、席位顺序领取第一个空位；
+ * 创建实验时固定区组与每区组两 A 两 B 的席位内容，并为每区组生成初始随机表版本 v1；
+ * 分配按区组、席位顺序领取第一个空位，并固化随机表版本与序号；
  * 退组保留席位不重排；关闭后拒绝新增分配。普通视图不含席位号与处理代码。
  */
 @Service
 public class ExperimentService {
 
     static final int SEATS_PER_BLOCK = 4;
+    static final String TREATMENT_CODES = "A,B";
 
     private final ExperimentRepository experimentRepository;
     private final AllocationRepository allocationRepository;
+    private final RandomTableRepository randomTableRepository;
     private final BlindCodeGenerator blindCodeGenerator;
     private final Clock clock;
 
     public ExperimentService(ExperimentRepository experimentRepository,
                              AllocationRepository allocationRepository,
+                             RandomTableRepository randomTableRepository,
                              BlindCodeGenerator blindCodeGenerator,
                              Clock clock) {
         this.experimentRepository = experimentRepository;
         this.allocationRepository = allocationRepository;
+        this.randomTableRepository = randomTableRepository;
         this.blindCodeGenerator = blindCodeGenerator;
         this.clock = clock;
     }
 
     /**
-     * 创建实验并固定席位：每区组按席位顺序两个 A、两个 B。
+     * 创建实验并固定席位：每区组按席位顺序两个 A、两个 B；
+     * 同时为每区组生成初始随机表版本 v1（容量 4，无前驱）。
      * 不记录任何处理映射到日志。
      */
     @Transactional
@@ -57,15 +65,23 @@ public class ExperimentService {
         long now = clock.nowMillis();
         experimentRepository.insertExperiment(
                 new ExperimentRow(experimentId, blockCount, "OPEN", now));
-        List<SeatRow> seats = new ArrayList<>(blockCount * SEATS_PER_BLOCK);
         for (int blockNo = 1; blockNo <= blockCount; blockNo++) {
+            List<SeatRow> blockSeats = new ArrayList<>(SEATS_PER_BLOCK);
             for (int seatNo = 1; seatNo <= SEATS_PER_BLOCK; seatNo++) {
                 // 按提交顺序：每区组前两席 A，后两席 B；内容创建后不可改。
                 String treatment = seatNo <= 2 ? "A" : "B";
-                seats.add(new SeatRow(experimentId, blockNo, seatNo, treatment));
+                blockSeats.add(new SeatRow(experimentId, blockNo, seatNo, treatment, 0L));
+            }
+            String digest = RandomTableDigest.sha256(
+                    experimentId, blockNo, SEATS_PER_BLOCK, blockSeats);
+            VersionRow version = randomTableRepository.insertVersion(new VersionRow(0L,
+                    experimentId, blockNo, 1, SEATS_PER_BLOCK, TREATMENT_CODES,
+                    digest, null, now));
+            for (SeatRow seat : blockSeats) {
+                experimentRepository.insertSeat(new SeatRow(seat.experimentId(), seat.blockNo(),
+                        seat.seatNo(), seat.treatment(), version.id()));
             }
         }
-        seats.forEach(experimentRepository::insertSeat);
         return new ExperimentView(experimentId, blockCount, SEATS_PER_BLOCK,
                 blockCount * SEATS_PER_BLOCK, "OPEN", now);
     }
@@ -112,9 +128,10 @@ public class ExperimentService {
         // 盲码随机冲突概率极低，仍由唯一索引兜底并重试。
         for (int attempt = 0; attempt < 5; attempt++) {
             String blindCode = blindCodeGenerator.nextCode();
+            // 分配时固化随机表版本与序号（=席位号），后续扩容或揭盲不改写。
             AllocationRow row = new AllocationRow(0L, experimentId, participantId,
                     vacant.blockNo(), vacant.seatNo(), blindCode, "ASSIGNED",
-                    actorId, now, null);
+                    actorId, now, null, vacant.versionId(), vacant.seatNo());
             try {
                 allocationRepository.insert(row);
                 return allocationRepository.findByExperimentAndParticipant(experimentId, participantId);

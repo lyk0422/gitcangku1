@@ -20,35 +20,89 @@ CREATE TABLE IF NOT EXISTS seat (
     block_no      INT         NOT NULL,
     seat_no       INT         NOT NULL,
     treatment     VARCHAR(1)  NOT NULL,
+    version_id    BIGINT      NOT NULL,
     CONSTRAINT pk_seat PRIMARY KEY (experiment_id, block_no, seat_no),
     CONSTRAINT ck_seat_block_no CHECK (block_no >= 1),
-    CONSTRAINT ck_seat_seat_no CHECK (seat_no BETWEEN 1 AND 4),
+    CONSTRAINT ck_seat_seat_no CHECK (seat_no >= 1),
     CONSTRAINT ck_seat_treatment CHECK (treatment IN ('A', 'B'))
 );
-COMMENT ON TABLE  seat IS '席位表（处理映射）：每区组4席，按提交顺序固定两个A两个B，之后不可改；仅保存于数据库';
+COMMENT ON TABLE  seat IS '席位表（处理映射）：初始每区组4席，扩容后席位序号继续递增；按提交顺序固定处理代码，之后不可改；仅保存于数据库';
 COMMENT ON COLUMN seat.experiment_id IS '所属实验编号';
 COMMENT ON COLUMN seat.block_no IS '区组号，从1开始，按区组顺序分配';
-COMMENT ON COLUMN seat.seat_no IS '区组内席位号1~4，属于可直接解码信息，禁止通过普通接口暴露';
+COMMENT ON COLUMN seat.seat_no IS '区组内席位号（即随机表序号），从1开始连续递增，属于可直接解码信息，禁止通过普通接口暴露';
 COMMENT ON COLUMN seat.treatment IS '处理代码 A 或 B，盲底，仅揭盲批准后可返回给申请人';
+COMMENT ON COLUMN seat.version_id IS '引入该席位的随机表版本主键，创建后不可改';
+
+CREATE TABLE IF NOT EXISTS random_table_version (
+    id              BIGINT       NOT NULL AUTO_INCREMENT,
+    experiment_id   VARCHAR(64)  NOT NULL,
+    block_no        INT          NOT NULL,
+    version_no      INT          NOT NULL,
+    capacity        INT          NOT NULL,
+    treatment_codes VARCHAR(32)  NOT NULL,
+    table_digest    VARCHAR(64)  NOT NULL,
+    predecessor_id  BIGINT,
+    created_at      BIGINT       NOT NULL,
+    CONSTRAINT pk_random_table_version PRIMARY KEY (id),
+    CONSTRAINT uq_rtv_block_version UNIQUE (experiment_id, block_no, version_no),
+    CONSTRAINT ck_rtv_version_no CHECK (version_no >= 1),
+    CONSTRAINT ck_rtv_capacity CHECK (capacity >= 1)
+);
+COMMENT ON TABLE  random_table_version IS '随机表版本表：每区组初始版本v1，扩容只新建后继版本并显式引用已封存前驱；既有版本内容创建后不可改';
+COMMENT ON COLUMN random_table_version.id IS '随机表版本自增主键';
+COMMENT ON COLUMN random_table_version.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN random_table_version.block_no IS '区组号，从1开始';
+COMMENT ON COLUMN random_table_version.version_no IS '区组内版本号，从1开始递增';
+COMMENT ON COLUMN random_table_version.capacity IS '该版本覆盖的区组累计容量（席位序号1~capacity），后继版本只增不减';
+COMMENT ON COLUMN random_table_version.treatment_codes IS '处理代码集合，逗号分隔，如 A,B；版本间保持一致';
+COMMENT ON COLUMN random_table_version.table_digest IS '该版本完整序列的 SHA-256 摘要（hex），用于封存前校验，不等于可还原序列';
+COMMENT ON COLUMN random_table_version.predecessor_id IS '前驱版本主键；NULL 表示初始版本；扩容时必须显式引用已封存版本';
+COMMENT ON COLUMN random_table_version.created_at IS '版本生成时间，Unix 毫秒，UTC';
+
+CREATE TABLE IF NOT EXISTS random_table_seal (
+    id              BIGINT       NOT NULL AUTO_INCREMENT,
+    experiment_id   VARCHAR(64)  NOT NULL,
+    block_no        INT          NOT NULL,
+    version_id      BIGINT       NOT NULL,
+    table_digest    VARCHAR(64)  NOT NULL,
+    capacity        INT          NOT NULL,
+    treatment_codes VARCHAR(32)  NOT NULL,
+    sealed_actor    VARCHAR(64)  NOT NULL,
+    sealed_at       BIGINT       NOT NULL,
+    CONSTRAINT pk_random_table_seal PRIMARY KEY (id),
+    CONSTRAINT uq_rts_version UNIQUE (version_id)
+);
+COMMENT ON TABLE  random_table_seal IS '随机表封存记录：只保存表摘要、区组容量、处理代码集合与封存时刻，不保存 sealKey 与具体序列；封存不可撤销';
+COMMENT ON COLUMN random_table_seal.id IS '封存记录自增主键';
+COMMENT ON COLUMN random_table_seal.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN random_table_seal.block_no IS '区组号';
+COMMENT ON COLUMN random_table_seal.version_id IS '被封存的随机表版本主键，每版本至多封存一次';
+COMMENT ON COLUMN random_table_seal.table_digest IS '封存时表摘要（SHA-256 hex），与版本表一致才允许封存';
+COMMENT ON COLUMN random_table_seal.capacity IS '封存时区组累计容量';
+COMMENT ON COLUMN random_table_seal.treatment_codes IS '封存时处理代码集合，逗号分隔';
+COMMENT ON COLUMN random_table_seal.sealed_actor IS '执行封存的操作者编号（X-Actor-Id）';
+COMMENT ON COLUMN random_table_seal.sealed_at IS '封存时刻，Unix 毫秒，UTC';
 
 CREATE TABLE IF NOT EXISTS allocation (
-    id             BIGINT       NOT NULL AUTO_INCREMENT,
-    experiment_id  VARCHAR(64)  NOT NULL,
-    participant_id VARCHAR(64)  NOT NULL,
-    block_no       INT          NOT NULL,
-    seat_no        INT          NOT NULL,
-    blind_code     VARCHAR(32)  NOT NULL,
-    status         VARCHAR(16)  NOT NULL,
-    assigned_actor VARCHAR(64)  NOT NULL,
-    assigned_at    BIGINT       NOT NULL,
-    withdrawn_at   BIGINT,
+    id               BIGINT       NOT NULL AUTO_INCREMENT,
+    experiment_id    VARCHAR(64)  NOT NULL,
+    participant_id   VARCHAR(64)  NOT NULL,
+    block_no         INT          NOT NULL,
+    seat_no          INT          NOT NULL,
+    blind_code       VARCHAR(32)  NOT NULL,
+    status           VARCHAR(16)  NOT NULL,
+    assigned_actor   VARCHAR(64)  NOT NULL,
+    assigned_at      BIGINT       NOT NULL,
+    withdrawn_at     BIGINT,
+    table_version_id BIGINT       NOT NULL,
+    seq_no           INT          NOT NULL,
     CONSTRAINT pk_allocation PRIMARY KEY (id),
     CONSTRAINT uq_allocation_participant UNIQUE (experiment_id, participant_id),
     CONSTRAINT uq_allocation_seat UNIQUE (experiment_id, block_no, seat_no),
     CONSTRAINT uq_allocation_blind_code UNIQUE (blind_code),
     CONSTRAINT ck_allocation_status CHECK (status IN ('ASSIGNED', 'WITHDRAWN'))
 );
-COMMENT ON TABLE  allocation IS '参与者分配表；同实验同参与者只占一席，退组不释放席位、不重排已有分配';
+COMMENT ON TABLE  allocation IS '参与者分配表；同实验同参与者只占一席，退组不释放席位、不重排已有分配；分配时固化随机表版本与序号，后续扩容或揭盲不改写';
 COMMENT ON COLUMN allocation.id IS '分配自增主键';
 COMMENT ON COLUMN allocation.experiment_id IS '所属实验编号';
 COMMENT ON COLUMN allocation.participant_id IS '合成参与者编号，非真实医疗数据';
@@ -59,6 +113,8 @@ COMMENT ON COLUMN allocation.status IS '分配状态：ASSIGNED=在组；WITHDRA
 COMMENT ON COLUMN allocation.assigned_actor IS '执行登记的操作者编号（X-Actor-Id）';
 COMMENT ON COLUMN allocation.assigned_at IS '分配时间，Unix 毫秒，UTC';
 COMMENT ON COLUMN allocation.withdrawn_at IS '退组时间，Unix 毫秒，UTC；NULL 表示未退组';
+COMMENT ON COLUMN allocation.table_version_id IS '分配时固化的随机表版本主键，写入后不可改';
+COMMENT ON COLUMN allocation.seq_no IS '分配时固化的随机表序号（等于席位号），写入后不可改，禁止通过普通接口暴露';
 
 CREATE TABLE IF NOT EXISTS unblind_request (
     id                      VARCHAR(64)  NOT NULL,
