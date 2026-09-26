@@ -2,6 +2,7 @@ package com.example.starter.firmware.api;
 
 import com.example.starter.firmware.domain.TaskStatus;
 import com.example.starter.firmware.error.ApiException;
+import com.example.starter.firmware.service.IntegrityService;
 import com.example.starter.firmware.service.ReleaseService;
 import com.example.starter.firmware.service.TaskService;
 import jakarta.validation.Valid;
@@ -14,7 +15,7 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * 发布单：创建、扩量、取消、人工恢复、监控统计与暂停/恢复历史、任务明细查询。
+ * 发布单：创建、扩量、取消、人工恢复、监控统计与暂停/恢复历史、任务明细查询、分片清单登记与查询。
  */
 @RestController
 @RequestMapping("/api/releases")
@@ -22,10 +23,13 @@ public class ReleaseController {
 
     private final ReleaseService releaseService;
     private final TaskService taskService;
+    private final IntegrityService integrityService;
 
-    public ReleaseController(ReleaseService releaseService, TaskService taskService) {
+    public ReleaseController(ReleaseService releaseService, TaskService taskService,
+                             IntegrityService integrityService) {
         this.releaseService = releaseService;
         this.taskService = taskService;
+        this.integrityService = integrityService;
     }
 
     @PostMapping
@@ -56,6 +60,17 @@ public class ReleaseController {
     @GetMapping("/{releaseId}/history")
     public ReleaseHistoryResponse history(@PathVariable long releaseId) {
         return releaseService.history(releaseId);
+    }
+
+    @PostMapping("/{releaseId}/manifest")
+    public ManifestView registerManifest(@PathVariable long releaseId,
+                                         @Valid @RequestBody RegisterManifestRequest request) {
+        return integrityService.registerManifest(releaseId, request);
+    }
+
+    @GetMapping("/{releaseId}/manifest")
+    public ManifestView manifest(@PathVariable long releaseId) {
+        return integrityService.getManifest(releaseId);
     }
 
     @GetMapping("/{releaseId}/tasks")

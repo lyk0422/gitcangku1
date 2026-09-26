@@ -126,7 +126,7 @@ public class ReleaseService {
                     .orElseThrow(() -> ApiException.notFound("RELEASE_NOT_FOUND", "发布单不存在: " + releaseId));
             if (order.status() == ReleaseStatus.ACTIVE || order.status() == ReleaseStatus.PAUSED) {
                 releaseRepository.cancel(releaseId);
-                taskRepository.cancelPendingByRelease(releaseId);
+                taskRepository.cancelUnfinishedByRelease(releaseId);
             }
             return ReleaseView.of(findOrder(releaseId));
         }, ReleaseView.class);

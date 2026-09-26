@@ -34,13 +34,61 @@ CREATE TABLE IF NOT EXISTS rollout_task (
   id BIGINT NOT NULL AUTO_INCREMENT COMMENT '任务ID',
   release_id BIGINT NOT NULL COMMENT '所属发布单ID',
   device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
-  status VARCHAR(16) NOT NULL COMMENT 'PENDING待回执；SUCCESS成功；FAILED失败；CANCELLED已取消',
+  status VARCHAR(16) NOT NULL COMMENT 'PENDING待分片接收/待回执；INSTALLABLE分片核验通过可安装；SUCCESS成功；FAILED失败；INTEGRITY_FAILED分片完整性失败；CANCELLED已取消',
   first_result VARCHAR(16) NULL COMMENT '首次回执结果（SUCCESS/FAILED），未回执为NULL',
+  attempt INT NOT NULL DEFAULT 1 COMMENT '分片接收尝试代次，从1开始；INTEGRITY_FAILED后重新拉取加一并回到PENDING，旧代次证据保留',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
   PRIMARY KEY (id),
   CONSTRAINT uk_task_release_device UNIQUE (release_id, device_id)
 ) COMMENT='设备投放任务，同设备同发布单最多一条';
+
+CREATE TABLE IF NOT EXISTS release_manifest (
+  release_id BIGINT NOT NULL COMMENT '所属发布单ID',
+  firmware_version VARCHAR(64) NOT NULL COMMENT '目标固件版本快照，登记时固化，后续发布单变更不改写',
+  chunk_count INT NOT NULL COMMENT '分片总数，>=1，分片序号为0~chunk_count-1连续',
+  package_digest VARCHAR(64) NOT NULL COMMENT '完整包聚合摘要，64位小写十六进制SHA-256，等于按序号拼接全部分片摘要后的SHA-256',
+  registered_at_utc VARCHAR(40) NOT NULL COMMENT '最近一次登记时刻，UTC，ISO-8601毫秒精度（如2026-09-26T07:00:00.000Z）',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
+  PRIMARY KEY (release_id)
+) COMMENT='发布版本分片清单；任一任务拉取后锁定不可修改';
+
+CREATE TABLE IF NOT EXISTS release_manifest_chunk (
+  release_id BIGINT NOT NULL COMMENT '所属发布单ID',
+  chunk_index INT NOT NULL COMMENT '分片序号，从0开始连续无缺口',
+  digest VARCHAR(64) NOT NULL COMMENT '该序号分片摘要，64位小写十六进制SHA-256',
+  PRIMARY KEY (release_id, chunk_index)
+) COMMENT='发布版本分片摘要明细，按序号规范排序';
+
+CREATE TABLE IF NOT EXISTS task_chunk_receipt (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '接收记录ID',
+  task_id BIGINT NOT NULL COMMENT '任务ID',
+  attempt INT NOT NULL COMMENT '接收时的尝试代次；重新拉取后的新代次另起记录，旧记录不改写',
+  release_id BIGINT NOT NULL COMMENT '所属发布单ID快照',
+  firmware_version VARCHAR(64) NOT NULL COMMENT '接收时固化的目标固件版本',
+  chunk_index INT NOT NULL COMMENT '分片序号',
+  digest VARCHAR(64) NOT NULL COMMENT '设备上报的接收摘要，64位小写十六进制',
+  received_at_utc VARCHAR(40) NOT NULL COMMENT '接收时刻，UTC，ISO-8601毫秒精度',
+  PRIMARY KEY (id),
+  CONSTRAINT uk_chunk_task_attempt_index UNIQUE (task_id, attempt, chunk_index)
+) COMMENT='分片接收证据，只增不改；同任务同代次同序号最多一条';
+
+CREATE TABLE IF NOT EXISTS task_integrity_record (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '核验记录ID',
+  task_id BIGINT NOT NULL COMMENT '任务ID',
+  attempt INT NOT NULL COMMENT '核验时的尝试代次',
+  release_id BIGINT NOT NULL COMMENT '所属发布单ID快照',
+  firmware_version VARCHAR(64) NOT NULL COMMENT '核验时固化的目标固件版本',
+  result VARCHAR(16) NOT NULL COMMENT '核验结果：INSTALLABLE可安装；INTEGRITY_FAILED完整性失败',
+  reason VARCHAR(32) NULL COMMENT '失败原因：CHUNK_MISSING缺失/CHUNK_DUPLICATE重复/CHUNK_DIGEST_MISMATCH分片摘要不匹配/PACKAGE_DIGEST_MISMATCH聚合摘要不匹配；成功为NULL',
+  received_count INT NOT NULL COMMENT '判定时该代次已接收分片数',
+  required_count INT NOT NULL COMMENT '清单要求的分片总数',
+  computed_package_digest VARCHAR(64) NULL COMMENT '按已接收完整集合计算的聚合摘要；集合不完整无法计算时为NULL',
+  expected_package_digest VARCHAR(64) NOT NULL COMMENT '清单登记的完整包聚合摘要',
+  decided_at_utc VARCHAR(40) NOT NULL COMMENT '判定时刻，UTC，ISO-8601毫秒精度',
+  PRIMARY KEY (id)
+) COMMENT='分片完整性判定记录，只增不改；每次可安装判定与完整性失败各落一条';
 
 CREATE TABLE IF NOT EXISTS release_pause_record (
   id BIGINT NOT NULL AUTO_INCREMENT COMMENT '暂停记录ID',

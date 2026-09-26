@@ -35,6 +35,10 @@ class FirmwareApiTest {
 
     @BeforeEach
     void cleanUp() {
+        jdbc.update("DELETE FROM task_chunk_receipt");
+        jdbc.update("DELETE FROM task_integrity_record");
+        jdbc.update("DELETE FROM release_manifest_chunk");
+        jdbc.update("DELETE FROM release_manifest");
         jdbc.update("DELETE FROM rollout_task");
         jdbc.update("DELETE FROM release_pause_record");
         jdbc.update("DELETE FROM release_resume_record");
