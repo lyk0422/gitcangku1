@@ -60,13 +60,16 @@ public class PlanService {
 
     private final PlanRepository planRepo;
     private final IdempotencyRepository idemRepo;
+    private final WeatherRestrictionService restrictionService;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate tx;
 
     public PlanService(PlanRepository planRepo, IdempotencyRepository idemRepo,
+                       WeatherRestrictionService restrictionService,
                        ObjectMapper objectMapper, PlatformTransactionManager txManager) {
         this.planRepo = planRepo;
         this.idemRepo = idemRepo;
+        this.restrictionService = restrictionService;
         this.objectMapper = objectMapper;
         this.tx = new TransactionTemplate(txManager);
     }
@@ -135,11 +138,20 @@ public class PlanService {
     }
 
     /**
-     * 发布计划：全局发布锁内原子校验本计划列车重叠与跨计划区段重叠，
-     * 任一冲突则整张计划保持草稿并抛出 422（携带冲突区段与计划）。
+     * 发布计划（不携带操作者的兼容入口）。
      */
     public PlanResponse publish(String scheduleKey, String requestKey) {
-        String hash = hashAction(OP_PUBLISH, scheduleKey);
+        return publish(scheduleKey, requestKey, null);
+    }
+
+    /**
+     * 发布计划：全局发布锁内原子校验本计划列车重叠、气象限速裁决与跨计划区段重叠。
+     * 违反生效限速令时按线路既有最小间隔整体顺延并固化重排记录；
+     * 任一冲突则整张计划保持草稿并抛出 422（携带冲突区段与计划）。
+     */
+    public PlanResponse publish(String scheduleKey, String requestKey, String operator) {
+        String hash = hashAction(OP_PUBLISH, scheduleKey, operator,
+                restrictionSignatureFor(scheduleKey));
         Optional<PlanResponse> replay = replayIfPresent(OP_PUBLISH, requestKey, hash);
         if (replay.isPresent()) {
             return replay.get();
@@ -154,14 +166,23 @@ public class PlanService {
                             "仅草稿可发布，当前状态: " + plan.status());
                 }
                 List<Occupancy> occupancies = planRepo.findOccupancies(plan.id());
+                // 气象限速裁决：违反限速则整体顺延，已开始运行或运营日内无法避开时抛 422
+                WeatherRestrictionService.ShiftPlan shift =
+                        restrictionService.planShift(plan, occupancies).orElse(null);
+                List<Occupancy> effective = shift != null ? shift.shiftedOccupancies() : occupancies;
                 List<Map<String, Object>> conflicts = new ArrayList<>();
                 conflicts.addAll(findTrainOverlaps(scheduleKey, occupancies));
-                conflicts.addAll(findSectionConflicts(plan, occupancies, List.of(plan.id())));
+                conflicts.addAll(findSectionConflicts(plan, effective, List.of(plan.id())));
                 if (!conflicts.isEmpty()) {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "存在时隙冲突，计划保持草稿", conflicts);
                 }
                 long now = System.currentTimeMillis();
+                if (shift != null) {
+                    // 整体顺延：占用更新为新时刻，原计划时刻与新计划时刻固化到重排记录
+                    planRepo.replaceOccupancies(plan.id(), effective);
+                    restrictionService.recordRearrangement(plan, OP_PUBLISH, shift, operator, now);
+                }
                 planRepo.updateStatus(plan.id(), PlanStatus.PUBLISHED, now);
                 PlanResponse response = loadPlan(scheduleKey);
                 idemRepo.insert(OP_PUBLISH, requestKey, hash, toJson(response), now);
@@ -251,16 +272,26 @@ public class PlanService {
                     throw conflict("LINK_CONFLICT", "新计划已存在直接前驱: " + req.newScheduleKey());
                 }
                 List<Occupancy> occupancies = planRepo.findOccupancies(newPlan.id());
+                // 气象限速裁决：新草稿违反限速则整体顺延，已开始运行或运营日内无法避开时抛 422
+                WeatherRestrictionService.ShiftPlan shift =
+                        restrictionService.planShift(newPlan, occupancies).orElse(null);
+                List<Occupancy> effective = shift != null ? shift.shiftedOccupancies() : occupancies;
                 List<Map<String, Object>> conflicts = new ArrayList<>();
                 conflicts.addAll(findTrainOverlaps(req.newScheduleKey(), occupancies));
                 // 仅排除旧计划与自身占用，第三方已发布计划照常参与冲突裁决
-                conflicts.addAll(findSectionConflicts(newPlan, occupancies,
+                conflicts.addAll(findSectionConflicts(newPlan, effective,
                         List.of(newPlan.id(), oldPlan.id())));
                 if (!conflicts.isEmpty()) {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "新草稿存在时隙冲突，改签未生效", conflicts);
                 }
                 long now = System.currentTimeMillis();
+                if (shift != null) {
+                    // 整体顺延：占用更新为新时刻，原计划时刻与新计划时刻固化到重排记录
+                    planRepo.replaceOccupancies(newPlan.id(), effective);
+                    restrictionService.recordRearrangement(newPlan, OP_RESCHEDULE, shift,
+                            req.operator(), now);
+                }
                 planRepo.updateStatus(oldPlan.id(), PlanStatus.CANCELLED, now);
                 planRepo.updateStatus(newPlan.id(), PlanStatus.PUBLISHED, now);
                 planRepo.insertRescheduleLink(oldPlan.id(), newPlan.id(), now);
@@ -342,7 +373,7 @@ public class PlanService {
                 .map(o -> new OccupancyView(o.trainNo(), o.sectionId(), o.startUtc(), o.endUtc()))
                 .toList();
         return new PlanResponse(plan.scheduleKey(), plan.opDate(), plan.version(),
-                plan.status().name(), views);
+                plan.status().name(), views, restrictionService.latestRearrangement(plan.id()));
     }
 
     private List<Occupancy> toOccupancies(long planId, List<OccupancyRequest> requests) {
@@ -499,9 +530,32 @@ public class PlanService {
         return sha256(opType + '\n' + scheduleKey);
     }
 
+    /**
+     * 发布指纹：包含计划标识、操作者与计划涉及区段上的生效限速版本签名。
+     */
+    private String hashAction(String opType, String scheduleKey, String operator,
+                              String restrictionSignature) {
+        return sha256(opType + '\n' + scheduleKey + '\n'
+                + (operator == null ? "" : operator) + '\n' + restrictionSignature);
+    }
+
     private String hashReschedule(String oldScheduleKey, RescheduleRequest req) {
         return sha256(OP_RESCHEDULE + '\n' + oldScheduleKey + '\n' + req.newScheduleKey()
-                + '\n' + req.expectedOldVersion() + '\n' + req.expectedNewVersion());
+                + '\n' + req.expectedOldVersion() + '\n' + req.expectedNewVersion()
+                + '\n' + (req.operator() == null ? "" : req.operator())
+                + '\n' + restrictionSignatureFor(req.newScheduleKey()));
+    }
+
+    /**
+     * 计划涉及区段上的生效限速版本签名（计划不存在时为空串），纳入发布/改签幂等指纹。
+     */
+    private String restrictionSignatureFor(String scheduleKey) {
+        return planRepo.findByKey(scheduleKey)
+                .map(p -> restrictionService.restrictionSignature(planRepo.findOccupancies(p.id())
+                        .stream()
+                        .map(Occupancy::sectionId)
+                        .collect(java.util.stream.Collectors.toCollection(TreeSet::new))))
+                .orElse("");
     }
 
     private void appendOccupancies(StringBuilder sb, List<OccupancyRequest> occupancies) {

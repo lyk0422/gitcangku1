@@ -83,3 +83,84 @@ COMMENT ON TABLE publish_lock IS '发布/改签全局互斥锁，保证并发发
 COMMENT ON COLUMN publish_lock.id IS '锁行 id，固定为 1，发布与改签时 SELECT ... FOR UPDATE 串行化';
 
 MERGE INTO publish_lock KEY(id) VALUES (1);
+
+CREATE TABLE IF NOT EXISTS rail_weather_restriction (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    restriction_key VARCHAR(64) NOT NULL,
+    version INT NOT NULL,
+    section_id VARCHAR(64) NOT NULL,
+    start_utc BIGINT NOT NULL,
+    end_utc BIGINT NOT NULL,
+    max_speed_kmh INT NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    operator VARCHAR(64) NOT NULL,
+    created_at BIGINT NOT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT uk_restriction_key_version UNIQUE (restriction_key, version)
+);
+COMMENT ON TABLE rail_weather_restriction IS '铁路气象限速令，按区段与 UTC 左闭右开时段登记最高速度；同一 restriction_key 修订产生新版本行，历史版本行不改写';
+COMMENT ON COLUMN rail_weather_restriction.id IS '主键';
+COMMENT ON COLUMN rail_weather_restriction.restriction_key IS '限速令业务键，修订共享同一键';
+COMMENT ON COLUMN rail_weather_restriction.version IS '限速令版本，登记为 1，每次修订加一';
+COMMENT ON COLUMN rail_weather_restriction.section_id IS '限速区段 ID';
+COMMENT ON COLUMN rail_weather_restriction.start_utc IS '限速开始时刻（含），UTC 毫秒';
+COMMENT ON COLUMN rail_weather_restriction.end_utc IS '限速结束时刻（不含），UTC 毫秒，必须大于 start_utc';
+COMMENT ON COLUMN rail_weather_restriction.max_speed_kmh IS '最高速度，单位 km/h，合法范围 10～300；同区段同时刻多条生效时以最低速度为准';
+COMMENT ON COLUMN rail_weather_restriction.status IS '限速令状态：ACTIVE 生效 / REVOKED 已撤销；撤销只翻转状态，不改写历史行';
+COMMENT ON COLUMN rail_weather_restriction.operator IS '登记/修订操作者标识';
+COMMENT ON COLUMN rail_weather_restriction.created_at IS '本版本登记时刻，UTC 毫秒';
+CREATE INDEX IF NOT EXISTS idx_rail_weather_restriction_section ON rail_weather_restriction (section_id, start_utc, end_utc);
+
+CREATE TABLE IF NOT EXISTS rail_plan_rearrangement (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    plan_id BIGINT NOT NULL,
+    schedule_key VARCHAR(64) NOT NULL,
+    op_type VARCHAR(16) NOT NULL,
+    shift_minutes BIGINT NOT NULL,
+    operator VARCHAR(64) NOT NULL,
+    created_at BIGINT NOT NULL,
+    PRIMARY KEY (id)
+);
+COMMENT ON TABLE rail_plan_rearrangement IS '气象限速触发的计划整体顺延重排记录，追加后不可变，撤销或修订限速令不改写';
+COMMENT ON COLUMN rail_plan_rearrangement.id IS '主键';
+COMMENT ON COLUMN rail_plan_rearrangement.plan_id IS '被重排计划 id，关联 rail_day_plan.id';
+COMMENT ON COLUMN rail_plan_rearrangement.schedule_key IS '被重排计划业务键（冗余固化，便于历史查询）';
+COMMENT ON COLUMN rail_plan_rearrangement.op_type IS '触发场景：PUBLISH 发布 / RESCHEDULE 改签';
+COMMENT ON COLUMN rail_plan_rearrangement.shift_minutes IS '整体顺延分钟数，为线路既有最小间隔（计划内最短占用分钟数）的整数倍';
+COMMENT ON COLUMN rail_plan_rearrangement.operator IS '触发本次发布/改签的操作者标识，空操作者以空串固化';
+COMMENT ON COLUMN rail_plan_rearrangement.created_at IS '重排记录创建时刻，UTC 毫秒';
+CREATE INDEX IF NOT EXISTS idx_rail_plan_rearrangement_plan ON rail_plan_rearrangement (plan_id);
+
+CREATE TABLE IF NOT EXISTS rail_plan_rearrangement_segment (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    rearrangement_id BIGINT NOT NULL,
+    seq INT NOT NULL,
+    train_no VARCHAR(64) NOT NULL,
+    section_id VARCHAR(64) NOT NULL,
+    old_start_utc BIGINT NOT NULL,
+    old_end_utc BIGINT NOT NULL,
+    new_start_utc BIGINT NOT NULL,
+    new_end_utc BIGINT NOT NULL,
+    affected_minutes BIGINT NOT NULL,
+    restriction_id BIGINT NOT NULL,
+    restriction_key VARCHAR(64) NOT NULL,
+    restriction_version INT NOT NULL,
+    max_speed_kmh INT NOT NULL,
+    PRIMARY KEY (id)
+);
+COMMENT ON TABLE rail_plan_rearrangement_segment IS '重排逐段明细，固化原计划时刻、新计划时刻与起决定作用的限速令版本，追加后不可变';
+COMMENT ON COLUMN rail_plan_rearrangement_segment.id IS '主键';
+COMMENT ON COLUMN rail_plan_rearrangement_segment.rearrangement_id IS '所属重排记录 id，关联 rail_plan_rearrangement.id';
+COMMENT ON COLUMN rail_plan_rearrangement_segment.seq IS '段在计划内的序号，与 rail_plan_occupancy.seq 对齐';
+COMMENT ON COLUMN rail_plan_rearrangement_segment.train_no IS '列车编号';
+COMMENT ON COLUMN rail_plan_rearrangement_segment.section_id IS '区段 ID';
+COMMENT ON COLUMN rail_plan_rearrangement_segment.old_start_utc IS '原计划段开始时刻（含），UTC 毫秒';
+COMMENT ON COLUMN rail_plan_rearrangement_segment.old_end_utc IS '原计划段结束时刻（不含），UTC 毫秒';
+COMMENT ON COLUMN rail_plan_rearrangement_segment.new_start_utc IS '重排后段开始时刻（含），UTC 毫秒';
+COMMENT ON COLUMN rail_plan_rearrangement_segment.new_end_utc IS '重排后段结束时刻（不含），UTC 毫秒';
+COMMENT ON COLUMN rail_plan_rearrangement_segment.affected_minutes IS '该段与全部生效限速窗口交集的受影响运行分钟数（并集口径）';
+COMMENT ON COLUMN rail_plan_rearrangement_segment.restriction_id IS '起决定作用（速度最低）的限速令 id，关联 rail_weather_restriction.id';
+COMMENT ON COLUMN rail_plan_rearrangement_segment.restriction_key IS '起决定作用的限速令业务键（固化）';
+COMMENT ON COLUMN rail_plan_rearrangement_segment.restriction_version IS '起决定作用的限速令版本（固化，后续撤销/修订不改写）';
+COMMENT ON COLUMN rail_plan_rearrangement_segment.max_speed_kmh IS '起决定作用的限速速度，单位 km/h（固化）';
+CREATE INDEX IF NOT EXISTS idx_rail_rearrangement_segment_parent ON rail_plan_rearrangement_segment (rearrangement_id);
