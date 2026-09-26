@@ -1,5 +1,6 @@
 package com.example.starter.translation.api;
 
+import com.example.starter.translation.service.CitationLockService;
 import com.example.starter.translation.service.TranslationService;
 import com.example.starter.translation.service.WriteExecutor;
 import com.example.starter.translation.service.WriteResult;
@@ -14,6 +15,7 @@ import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.nio.charset.StandardCharsets;
@@ -30,12 +32,14 @@ import java.util.HexFormat;
 public class TranslationController {
 
     private final TranslationService translationService;
+    private final CitationLockService citationLockService;
     private final WriteExecutor writeExecutor;
     private final ObjectMapper objectMapper;
 
-    public TranslationController(TranslationService translationService, WriteExecutor writeExecutor,
-                                 ObjectMapper objectMapper) {
+    public TranslationController(TranslationService translationService, CitationLockService citationLockService,
+                                 WriteExecutor writeExecutor, ObjectMapper objectMapper) {
         this.translationService = translationService;
+        this.citationLockService = citationLockService;
         this.writeExecutor = writeExecutor;
         this.objectMapper = objectMapper;
     }
@@ -127,6 +131,69 @@ public class TranslationController {
     @GetMapping("/{documentId}/terms/status")
     public ResponseEntity<ApiDtos.TermStatusResponse> getTermStatus(@PathVariable long documentId) {
         return ResponseEntity.ok(translationService.getTermStatus(documentId));
+    }
+
+    /** 批量译文修订：先校验所有段落锚点映射与术语版本，任一失败整次回滚。 */
+    @PutMapping("/{documentId}/translations/batch")
+    public ResponseEntity<String> submitTranslationsBatch(
+            @PathVariable long documentId,
+            @RequestHeader("X-Actor-Id") String actorId,
+            @Valid @RequestBody ApiDtos.BatchSubmitTranslationsRequest request) {
+        String operation = "PUT /api/documents/" + documentId + "/translations/batch";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(200,
+                        translationService.submitTranslationsBatch(documentId, actorId, request)))
+                .toResponseEntity();
+    }
+
+    /** 法定引文锚点登记：仅可登记在当前已批准译文段落，区间左闭右开、互不交叉、引用标识段落内唯一。 */
+    @PostMapping("/{documentId}/segments/{segmentId}/translations/{language}/anchors")
+    public ResponseEntity<String> registerAnchors(@PathVariable long documentId,
+                                                  @PathVariable String segmentId,
+                                                  @PathVariable String language,
+                                                  @RequestHeader("X-Actor-Id") String actorId,
+                                                  @Valid @RequestBody ApiDtos.RegisterAnchorsRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/segments/" + segmentId
+                + "/translations/" + language + "/anchors";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(201, citationLockService.registerAnchors(
+                        documentId, segmentId, language, actorId, request))).toResponseEntity();
+    }
+
+    /** 锚点解除：须由 X-Actor-Roles 含 legal 且不同于登记人的法务确认，理由不可变。 */
+    @PostMapping("/{documentId}/anchors/{anchorId}/release")
+    public ResponseEntity<String> releaseAnchor(@PathVariable long documentId,
+                                                @PathVariable long anchorId,
+                                                @RequestHeader("X-Actor-Id") String actorId,
+                                                @RequestHeader(value = "X-Actor-Roles", required = false)
+                                                String actorRoles,
+                                                @Valid @RequestBody ApiDtos.ReleaseAnchorRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/anchors/" + anchorId + "/release";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, actorRoles, request),
+                () -> WriteResult.of(200, citationLockService.releaseAnchor(
+                        documentId, anchorId, actorId, actorRoles, request))).toResponseEntity();
+    }
+
+    /** 锚点明细查询：某段落某语言全部锚点（含已解除），只读。 */
+    @GetMapping("/{documentId}/segments/{segmentId}/translations/{language}/anchors")
+    public ResponseEntity<ApiDtos.AnchorListResponse> listAnchors(@PathVariable long documentId,
+                                                                  @PathVariable String segmentId,
+                                                                  @PathVariable String language) {
+        return ResponseEntity.ok(citationLockService.listAnchors(documentId, segmentId, language));
+    }
+
+    /** 锚点事件历史：anchorId 缺省返回文档全部锚点事件，按 eventId 排序，只读。 */
+    @GetMapping("/{documentId}/anchors/events")
+    public ResponseEntity<ApiDtos.AnchorHistoryResponse> anchorHistory(@PathVariable long documentId,
+                                                                       @RequestParam(value = "anchorId",
+                                                                               required = false) Long anchorId) {
+        return ResponseEntity.ok(citationLockService.listHistory(documentId, anchorId));
+    }
+
+    /** 锚点诊断：逐项给出区间是否在当前译文内、引用文本是否逐字符保留及实际/要求值，只读。 */
+    @GetMapping("/{documentId}/anchors/diagnostics")
+    public ResponseEntity<ApiDtos.AnchorDiagnosticsResponse> anchorDiagnostics(@PathVariable long documentId) {
+        return ResponseEntity.ok(citationLockService.diagnostics(documentId));
     }
 
     /** 查询指定发布版本的只读快照。 */

@@ -1,6 +1,8 @@
 package com.example.starter.translation.repo;
 
 import com.example.starter.translation.domain.Rows.ApprovalRow;
+import com.example.starter.translation.domain.Rows.CitationAnchorEventRow;
+import com.example.starter.translation.domain.Rows.CitationAnchorRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
 import com.example.starter.translation.domain.Rows.RequestLogRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
@@ -13,6 +15,7 @@ import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.stereotype.Repository;
 
 import java.sql.PreparedStatement;
+import java.sql.Timestamp;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
@@ -45,6 +48,30 @@ public class TranslationRepository {
 
     private static final RowMapper<TermRuleRow> TERM_RULE_MAPPER = (rs, n) -> new TermRuleRow(
             rs.getString("source_term"), rs.getString("language"), rs.getString("required_translation"));
+
+    private static final RowMapper<CitationAnchorRow> ANCHOR_MAPPER = (rs, n) -> {
+        Timestamp releasedAt = rs.getTimestamp("released_at");
+        return new CitationAnchorRow(
+                rs.getLong("anchor_id"), rs.getLong("document_id"), rs.getString("segment_id"),
+                rs.getString("language"), rs.getString("citation_key"), rs.getInt("range_start"),
+                rs.getInt("range_end"), rs.getString("anchor_text"), rs.getString("lock_reason"),
+                rs.getString("created_by"), rs.getInt("translation_version"), rs.getInt("source_version"),
+                rs.getString("status"), rs.getString("released_by"), rs.getString("release_reason"),
+                rs.getTimestamp("created_at").toInstant(),
+                releasedAt == null ? null : releasedAt.toInstant());
+    };
+
+    private static final RowMapper<CitationAnchorEventRow> ANCHOR_EVENT_MAPPER = (rs, n) -> {
+        Integer previousStart = (Integer) rs.getObject("previous_start");
+        Integer previousEnd = (Integer) rs.getObject("previous_end");
+        return new CitationAnchorEventRow(
+                rs.getLong("event_id"), rs.getLong("document_id"), rs.getLong("anchor_id"),
+                rs.getString("segment_id"), rs.getString("language"), rs.getString("citation_key"),
+                rs.getString("event_type"), rs.getInt("range_start"), rs.getInt("range_end"),
+                previousStart, previousEnd, rs.getString("anchor_text"), rs.getString("reason"),
+                rs.getString("actor_id"), rs.getInt("translation_version"), rs.getInt("source_version"),
+                rs.getTimestamp("occurred_at").toInstant());
+    };
 
     private final JdbcTemplate jdbc;
 
@@ -240,5 +267,145 @@ public class TranslationRepository {
     public void insertRequestLog(String requestId, String requestHash, int responseStatus, String responseBody) {
         jdbc.update("INSERT INTO request_log (request_id, request_hash, response_status, response_body) "
                 + "VALUES (?, ?, ?, ?)", requestId, requestHash, responseStatus, responseBody);
+    }
+
+    /** 登记锚点并回填自增 anchorId；时间由调用方以 UTC 传入，保证可测且精度稳定。 */
+    public long insertAnchor(CitationAnchorRow row) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO citation_anchor (document_id, segment_id, language, citation_key, "
+                            + "range_start, range_end, anchor_text, lock_reason, created_by, "
+                            + "translation_version, source_version, status, released_by, release_reason, "
+                            + "created_at, released_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    new String[]{"anchor_id"});
+            ps.setLong(1, row.documentId());
+            ps.setString(2, row.segmentId());
+            ps.setString(3, row.language());
+            ps.setString(4, row.citationKey());
+            ps.setInt(5, row.rangeStart());
+            ps.setInt(6, row.rangeEnd());
+            ps.setString(7, row.anchorText());
+            ps.setString(8, row.lockReason());
+            ps.setString(9, row.createdBy());
+            ps.setInt(10, row.translationVersion());
+            ps.setInt(11, row.sourceVersion());
+            ps.setString(12, row.status());
+            ps.setString(13, row.releasedBy());
+            ps.setString(14, row.releaseReason());
+            ps.setTimestamp(15, Timestamp.from(row.createdAt()));
+            ps.setTimestamp(16, row.releasedAt() == null ? null : Timestamp.from(row.releasedAt()));
+            return ps;
+        }, keyHolder);
+        Number key = keyHolder.getKey();
+        if (key == null) {
+            throw new IllegalStateException("锚点登记后未返回自增主键");
+        }
+        return key.longValue();
+    }
+
+    /** 按 ID 查询锚点。 */
+    public Optional<CitationAnchorRow> findAnchor(long anchorId) {
+        List<CitationAnchorRow> rows = jdbc.query(anchorSelect() + " WHERE anchor_id = ?",
+                ANCHOR_MAPPER, anchorId);
+        return rows.stream().findFirst();
+    }
+
+    /** 查询某段落某语言的全部锚点（含已解除），按登记先后排序。 */
+    public List<CitationAnchorRow> listAnchors(long documentId, String segmentId, String language) {
+        return jdbc.query(anchorSelect()
+                        + " WHERE document_id = ? AND segment_id = ? AND language = ? ORDER BY anchor_id",
+                ANCHOR_MAPPER, documentId, segmentId, language);
+    }
+
+    /** 查询某文档全部锚点（含已解除），按段落、语言、登记先后排序。 */
+    public List<CitationAnchorRow> listAllAnchors(long documentId) {
+        return jdbc.query(anchorSelect() + " WHERE document_id = ? ORDER BY segment_id, language, anchor_id",
+                ANCHOR_MAPPER, documentId);
+    }
+
+    /** 查询某文档当前生效（LOCKED）锚点。 */
+    public List<CitationAnchorRow> listLockedAnchors(long documentId) {
+        return jdbc.query(anchorSelect()
+                        + " WHERE document_id = ? AND status = 'LOCKED' ORDER BY segment_id, language, anchor_id",
+                ANCHOR_MAPPER, documentId);
+    }
+
+    /** 迁移锚点区间与锚定译文版本（区间随译文修订移动）。 */
+    public void updateAnchorRange(long anchorId, int rangeStart, int rangeEnd, int translationVersion) {
+        jdbc.update("UPDATE citation_anchor SET range_start = ?, range_end = ?, translation_version = ? "
+                + "WHERE anchor_id = ?", rangeStart, rangeEnd, translationVersion, anchorId);
+    }
+
+    /** 解除锚点：仅可 LOCKED→RELEASED 一次，写入解除人、不可变理由与 UTC 时间。 */
+    public int releaseAnchor(long anchorId, String releasedBy, String reason, java.time.Instant releasedAt) {
+        return jdbc.update("UPDATE citation_anchor SET status = 'RELEASED', released_by = ?, release_reason = ?, "
+                        + "released_at = ? WHERE anchor_id = ? AND status = 'LOCKED'",
+                releasedBy, reason, Timestamp.from(releasedAt), anchorId);
+    }
+
+    /** 追加锚点事件（只追加历史）。 */
+    public long insertAnchorEvent(CitationAnchorEventRow row) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO citation_anchor_event (document_id, anchor_id, segment_id, language, "
+                            + "citation_key, event_type, range_start, range_end, previous_start, previous_end, "
+                            + "anchor_text, reason, actor_id, translation_version, source_version, occurred_at) "
+                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    new String[]{"event_id"});
+            ps.setLong(1, row.documentId());
+            ps.setLong(2, row.anchorId());
+            ps.setString(3, row.segmentId());
+            ps.setString(4, row.language());
+            ps.setString(5, row.citationKey());
+            ps.setString(6, row.eventType());
+            ps.setInt(7, row.rangeStart());
+            ps.setInt(8, row.rangeEnd());
+            if (row.previousStart() == null) {
+                ps.setNull(9, java.sql.Types.INTEGER);
+            } else {
+                ps.setInt(9, row.previousStart());
+            }
+            if (row.previousEnd() == null) {
+                ps.setNull(10, java.sql.Types.INTEGER);
+            } else {
+                ps.setInt(10, row.previousEnd());
+            }
+            ps.setString(11, row.anchorText());
+            ps.setString(12, row.reason());
+            ps.setString(13, row.actorId());
+            ps.setInt(14, row.translationVersion());
+            ps.setInt(15, row.sourceVersion());
+            ps.setTimestamp(16, Timestamp.from(row.occurredAt()));
+            return ps;
+        }, keyHolder);
+        Number key = keyHolder.getKey();
+        if (key == null) {
+            throw new IllegalStateException("锚点事件落库后未返回自增主键");
+        }
+        return key.longValue();
+    }
+
+    /** 查询锚点事件历史：可按文档全量或单锚点，按 event_id 稳定排序。 */
+    public List<CitationAnchorEventRow> listAnchorEvents(long documentId, Long anchorId) {
+        if (anchorId == null) {
+            return jdbc.query(eventSelect() + " WHERE document_id = ? ORDER BY event_id",
+                    ANCHOR_EVENT_MAPPER, documentId);
+        }
+        return jdbc.query(eventSelect() + " WHERE document_id = ? AND anchor_id = ? ORDER BY event_id",
+                ANCHOR_EVENT_MAPPER, documentId, anchorId);
+    }
+
+    private static String anchorSelect() {
+        return "SELECT anchor_id, document_id, segment_id, language, citation_key, range_start, range_end, "
+                + "anchor_text, lock_reason, created_by, translation_version, source_version, status, "
+                + "released_by, release_reason, created_at, released_at FROM citation_anchor";
+    }
+
+    private static String eventSelect() {
+        return "SELECT event_id, document_id, anchor_id, segment_id, language, citation_key, event_type, "
+                + "range_start, range_end, previous_start, previous_end, anchor_text, reason, actor_id, "
+                + "translation_version, source_version, occurred_at FROM citation_anchor_event";
     }
 }

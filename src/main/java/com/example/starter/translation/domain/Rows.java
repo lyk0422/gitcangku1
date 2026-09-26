@@ -1,5 +1,6 @@
 package com.example.starter.translation.domain;
 
+import java.time.Instant;
 import java.util.List;
 
 /**
@@ -81,5 +82,65 @@ public final class Rows {
      */
     public record RequestLogRow(String requestId, String requestHash,
                                 int responseStatus, String responseBody) {
+    }
+
+    /** 锚点状态：LOCKED 生效中；RELEASED 已解除（行保留为证据，不物理删除）。 */
+    public static final String ANCHOR_LOCKED = "LOCKED";
+    public static final String ANCHOR_RELEASED = "RELEASED";
+
+    /**
+     * 法定引文锚点：锚定已批准译文段落内的引用文本；区间左闭右开，按 Java 字符偏移解释。
+     *
+     * @param anchorId           锚点全局 ID，自增，迁移区间时保持不变
+     * @param documentId         所属文档 ID
+     * @param segmentId          所属段落 ID
+     * @param language           目标语言码，小写
+     * @param citationKey        规范化引用标识；同一段落+语言内唯一，解除后也不得再次登记
+     * @param rangeStart         区间起点（含），从 0 开始
+     * @param rangeEnd           区间终点（不含）
+     * @param anchorText         登记/迁移时固化的引用文本，修订后必须逐字符保留
+     * @param lockReason         锁定原因，不可变
+     * @param createdBy          登记人；解除人必须与之不同
+     * @param translationVersion 最近一次登记/迁移时锚定的译文版本
+     * @param sourceVersion      登记时批准所对应的源文版本
+     * @param status             LOCKED 或 RELEASED
+     * @param releasedBy         解除人法务；LOCKED 时为 null
+     * @param releaseReason      不可变解除理由；LOCKED 时为 null
+     * @param createdAt          登记时间，UTC
+     * @param releasedAt         解除时间，UTC；LOCKED 时为 null
+     */
+    public record CitationAnchorRow(long anchorId, long documentId, String segmentId, String language,
+                                    String citationKey, int rangeStart, int rangeEnd, String anchorText,
+                                    String lockReason, String createdBy, int translationVersion,
+                                    int sourceVersion, String status, String releasedBy, String releaseReason,
+                                    Instant createdAt, Instant releasedAt) {
+    }
+
+    /**
+     * 引文锚点事件：只追加的历史证据（REGISTERED/MIGRATED/RELEASED），字段与 null 语义稳定。
+     *
+     * @param eventId            事件 ID，历史按此排序
+     * @param documentId         所属文档 ID
+     * @param anchorId           关联锚点 ID
+     * @param segmentId          所属段落 ID
+     * @param language           目标语言码，小写
+     * @param citationKey        事件发生时的引用标识
+     * @param eventType          REGISTERED / MIGRATED / RELEASED
+     * @param rangeStart         事件后区间起点（含）
+     * @param rangeEnd           事件后区间终点（不含）
+     * @param previousStart      迁移前区间起点；仅 MIGRATED 非 null
+     * @param previousEnd        迁移前区间终点；仅 MIGRATED 非 null
+     * @param anchorText         事件时的引用文本
+     * @param reason             REGISTERED/MIGRATED 为锁定原因，RELEASED 为解除理由
+     * @param actorId            触发事件的操作者
+     * @param translationVersion 事件时译文版本
+     * @param sourceVersion      事件时源文版本
+     * @param occurredAt         事件发生时间，UTC
+     */
+    public record CitationAnchorEventRow(long eventId, long documentId, long anchorId, String segmentId,
+                                         String language, String citationKey, String eventType,
+                                         int rangeStart, int rangeEnd, Integer previousStart, Integer previousEnd,
+                                         String anchorText, String reason, String actorId,
+                                         int translationVersion, int sourceVersion, Instant occurredAt) {
     }
 }

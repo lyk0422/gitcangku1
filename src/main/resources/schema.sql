@@ -1,5 +1,7 @@
 -- 多语种段落修订与发布快照 schema（H2 MySQL 兼容模式）。
 -- 所有时间字段为数据库默认时区时间戳；版本号均从 1（文档发布版本从 0）开始单调递增。
+-- 例外：citation_anchor 与 citation_anchor_event 的时间一律使用 UTC（TIMESTAMP(6) 微秒精度），
+-- 由应用层 Clock（systemUTC）写入，接口输出固定为 yyyy-MM-dd'T'HH:mm:ss.SSSSSS'Z'。
 
 CREATE TABLE IF NOT EXISTS document (
     document_id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -124,3 +126,82 @@ COMMENT ON COLUMN request_log.request_hash IS '请求参数规范化后的 SHA-2
 COMMENT ON COLUMN request_log.response_status IS '原成功响应的 HTTP 状态码，用于重放';
 COMMENT ON COLUMN request_log.response_body IS '原成功响应体 JSON，用于重放';
 COMMENT ON COLUMN request_log.created_at IS '记录时间，数据库默认时区';
+
+-- 法定引文锚点：锚定已批准译文段落内的引用文本，字符区间左闭右开，时间一律 UTC。
+CREATE TABLE IF NOT EXISTS citation_anchor (
+    anchor_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    document_id BIGINT NOT NULL,
+    segment_id VARCHAR(64) NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    citation_key VARCHAR(512) NOT NULL,
+    range_start INT NOT NULL,
+    range_end INT NOT NULL,
+    anchor_text LONGTEXT NOT NULL,
+    lock_reason VARCHAR(2048) NOT NULL,
+    created_by VARCHAR(128) NOT NULL,
+    translation_version INT NOT NULL,
+    source_version INT NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    released_by VARCHAR(128),
+    release_reason VARCHAR(2048),
+    created_at TIMESTAMP(6) NOT NULL,
+    released_at TIMESTAMP(6),
+    UNIQUE (document_id, segment_id, language, citation_key)
+);
+COMMENT ON TABLE citation_anchor IS '法定引文锚点：同一段落同一引用标识仅可登记一次；解除后行保留为 RELEASED 证据，不物理删除';
+COMMENT ON COLUMN citation_anchor.anchor_id IS '锚点全局 ID，自增，迁移区间时保持不变';
+COMMENT ON COLUMN citation_anchor.document_id IS '所属文档 ID';
+COMMENT ON COLUMN citation_anchor.segment_id IS '所属段落 ID';
+COMMENT ON COLUMN citation_anchor.language IS '目标语言码，小写';
+COMMENT ON COLUMN citation_anchor.citation_key IS '规范化引用标识（去首尾空白），同一段落+语言内唯一，解除后也不得再次登记';
+COMMENT ON COLUMN citation_anchor.range_start IS '字符区间起点（含），按 Java 字符偏移，从 0 开始';
+COMMENT ON COLUMN citation_anchor.range_end IS '字符区间终点（不含），不得超过译文字符长度';
+COMMENT ON COLUMN citation_anchor.anchor_text IS '登记时固化的引用文本；修订后必须逐字符保留，是业务证据';
+COMMENT ON COLUMN citation_anchor.lock_reason IS '锁定原因，登记时写入，不可变';
+COMMENT ON COLUMN citation_anchor.created_by IS '登记人（X-Actor-Id），解除人不得与登记人相同';
+COMMENT ON COLUMN citation_anchor.translation_version IS '最近一次迁移/登记时锚定的译文版本';
+COMMENT ON COLUMN citation_anchor.source_version IS '登记时批准所对应的源文版本';
+COMMENT ON COLUMN citation_anchor.status IS '状态：LOCKED 生效中 / RELEASED 已解除；仅可 LOCKED→RELEASED 一次';
+COMMENT ON COLUMN citation_anchor.released_by IS '解除人法务（X-Actor-Id），LOCKED 时为 NULL';
+COMMENT ON COLUMN citation_anchor.release_reason IS '解除理由，解除时写入不可变；LOCKED 时为 NULL';
+COMMENT ON COLUMN citation_anchor.created_at IS '登记时间，UTC，微秒精度';
+COMMENT ON COLUMN citation_anchor.released_at IS '解除时间，UTC，微秒精度；LOCKED 时为 NULL';
+
+-- 引文锚点事件历史：只追加，不更新不删除，按 event_id 稳定排序。
+CREATE TABLE IF NOT EXISTS citation_anchor_event (
+    event_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    document_id BIGINT NOT NULL,
+    anchor_id BIGINT NOT NULL,
+    segment_id VARCHAR(64) NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    citation_key VARCHAR(512) NOT NULL,
+    event_type VARCHAR(16) NOT NULL,
+    range_start INT NOT NULL,
+    range_end INT NOT NULL,
+    previous_start INT,
+    previous_end INT,
+    anchor_text LONGTEXT NOT NULL,
+    reason VARCHAR(2048) NOT NULL,
+    actor_id VARCHAR(128) NOT NULL,
+    translation_version INT NOT NULL,
+    source_version INT NOT NULL,
+    occurred_at TIMESTAMP(6) NOT NULL
+);
+COMMENT ON TABLE citation_anchor_event IS '引文锚点事件历史：REGISTERED/MIGRATED/RELEASED 只追加，字段、排序与 null 语义稳定';
+COMMENT ON COLUMN citation_anchor_event.event_id IS '事件 ID，自增，历史按此排序';
+COMMENT ON COLUMN citation_anchor_event.document_id IS '所属文档 ID';
+COMMENT ON COLUMN citation_anchor_event.anchor_id IS '关联锚点 ID';
+COMMENT ON COLUMN citation_anchor_event.segment_id IS '所属段落 ID';
+COMMENT ON COLUMN citation_anchor_event.language IS '目标语言码，小写';
+COMMENT ON COLUMN citation_anchor_event.citation_key IS '事件发生时的引用标识';
+COMMENT ON COLUMN citation_anchor_event.event_type IS '事件类型：REGISTERED 登记 / MIGRATED 区间迁移 / RELEASED 解除';
+COMMENT ON COLUMN citation_anchor_event.range_start IS '事件后区间起点（含）';
+COMMENT ON COLUMN citation_anchor_event.range_end IS '事件后区间终点（不含）';
+COMMENT ON COLUMN citation_anchor_event.previous_start IS '迁移前区间起点；仅 MIGRATED 非空，其余事件为 NULL';
+COMMENT ON COLUMN citation_anchor_event.previous_end IS '迁移前区间终点；仅 MIGRATED 非空，其余事件为 NULL';
+COMMENT ON COLUMN citation_anchor_event.anchor_text IS '事件时的引用文本，逐字符保留证据';
+COMMENT ON COLUMN citation_anchor_event.reason IS '事件理由：REGISTERED/MIGRATED 为锁定原因，RELEASED 为不可变解除理由';
+COMMENT ON COLUMN citation_anchor_event.actor_id IS '触发事件的操作者（X-Actor-Id）';
+COMMENT ON COLUMN citation_anchor_event.translation_version IS '事件时译文版本';
+COMMENT ON COLUMN citation_anchor_event.source_version IS '事件时源文版本';
+COMMENT ON COLUMN citation_anchor_event.occurred_at IS '事件发生时间，UTC，微秒精度';
