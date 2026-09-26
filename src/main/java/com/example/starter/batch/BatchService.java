@@ -59,13 +59,16 @@ public class BatchService {
     private static final int IDEMPOTENCY_MAX_ATTEMPTS = 3;
 
     private final BatchRepository repo;
+    private final LabelService labelService;
     private final TransactionTemplate tx;
     private final ObjectMapper objectMapper;
 
     public BatchService(BatchRepository repo,
+                        LabelService labelService,
                         PlatformTransactionManager transactionManager,
                         ObjectMapper objectMapper) {
         this.repo = repo;
+        this.labelService = labelService;
         this.tx = new TransactionTemplate(transactionManager);
         this.objectMapper = objectMapper;
     }
@@ -200,9 +203,18 @@ public class BatchService {
                 seq = 2;
                 newStatus = BatchStatus.RELEASED;
             }
+            // 放行门禁：登记了包装计划的批次，放行前活跃封箱数量之和必须等于计划数量（422）
+            if (newStatus == BatchStatus.RELEASED) {
+                labelService.assertReleaseReady(batchKey);
+            }
             repo.insertApproval(new BatchRepository.ApprovalRow(0L, batchKey, req.commandKey(),
                     actor, role.name(), seq, now));
             repo.updateStatus(batchKey, newStatus.name());
+            // 放行快照：固化计划数量、实际封箱数量、已用标签规范排序摘要与每个封箱版本，
+            // 与放行同事务提交；之后作废申请不得改写该快照
+            if (newStatus == BatchStatus.RELEASED) {
+                labelService.freezeReleaseSnapshot(batchKey);
+            }
             ApprovalResponse body = new ApprovalResponse(batchKey, actor, role, seq, newStatus,
                     Instant.parse(now));
             return new StoredResponse(201, toJson(body));
