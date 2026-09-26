@@ -2,6 +2,7 @@ package com.example.starter.evidence;
 
 import com.example.starter.error.ApiException;
 import com.example.starter.evidence.dto.CommandRequest;
+import com.example.starter.evidence.dto.CustodyCaseLinkView;
 import com.example.starter.evidence.dto.CustodyChainView;
 import com.example.starter.evidence.dto.EvidenceView;
 import com.example.starter.evidence.dto.InspectionView;
@@ -45,6 +46,7 @@ public class EvidenceService {
     private final TransferRecordRepository transferRepository;
     private final SealInspectionRepository inspectionRepository;
     private final LoanRecordRepository loanRepository;
+    private final CustodyCaseLinkRepository caseLinkRepository;
     private final CommandLogRepository commandLogRepository;
     private final ObjectMapper objectMapper;
     private final EvidenceClock clock;
@@ -53,6 +55,7 @@ public class EvidenceService {
                            TransferRecordRepository transferRepository,
                            SealInspectionRepository inspectionRepository,
                            LoanRecordRepository loanRepository,
+                           CustodyCaseLinkRepository caseLinkRepository,
                            CommandLogRepository commandLogRepository,
                            ObjectMapper objectMapper,
                            EvidenceClock clock) {
@@ -60,6 +63,7 @@ public class EvidenceService {
         this.transferRepository = transferRepository;
         this.inspectionRepository = inspectionRepository;
         this.loanRepository = loanRepository;
+        this.caseLinkRepository = caseLinkRepository;
         this.commandLogRepository = commandLogRepository;
         this.objectMapper = objectMapper;
         this.clock = clock;
@@ -336,7 +340,7 @@ public class EvidenceService {
     }
 
     /**
-     * 查询完整保管链：证物当前状态 + 全部交接记录 + 全部借出记录 + 全部核验记录。
+     * 查询完整保管链：证物当前状态 + 全部交接记录 + 全部借出记录 + 全部核验记录 + 全部跨案链事件。
      */
     @Transactional(readOnly = true)
     public CustodyChainView custodyChain(String evidenceKey) {
@@ -348,7 +352,9 @@ public class EvidenceService {
                 .stream().map(this::toView).toList();
         List<InspectionView> inspections = inspectionRepository.findByEvidenceKey(evidenceKey)
                 .stream().map(this::toView).toList();
-        return new CustodyChainView(toView(evidence), transfers, loans, inspections);
+        List<CustodyCaseLinkView> caseLinks = caseLinkRepository.findByEvidenceKey(evidenceKey)
+                .stream().map(this::toLinkView).toList();
+        return new CustodyChainView(toView(evidence), transfers, loans, inspections, caseLinks);
     }
 
     private Evidence lockEvidence(String evidenceKey) {
@@ -403,8 +409,13 @@ public class EvidenceService {
 
     private EvidenceView toView(Evidence evidence) {
         return new EvidenceView(evidence.evidenceKey(), evidence.caseKey(), evidence.category(),
-                evidence.sealNo(), evidence.custodianId(), evidence.status(),
-                evidence.createdAt(), evidence.updatedAt());
+                evidence.sealNo(), evidence.custodianId(), evidence.status(), evidence.location(),
+                evidence.sealVersion(), evidence.createdAt(), evidence.updatedAt());
+    }
+
+    private CustodyCaseLinkView toLinkView(CustodyCaseLink link) {
+        return new CustodyCaseLinkView(link.caseKey(), link.evidenceKey(), link.transferId(),
+                link.direction(), link.orderVersion(), link.actorId(), link.createdAt());
     }
 
     private TransferView toView(TransferRecord record) {

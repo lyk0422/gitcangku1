@@ -69,6 +69,16 @@ public class TransferRecordRepository {
                 ROW_MAPPER, evidenceKey);
     }
 
+    /**
+     * 证物当前交接链最大序号；无交接记录时为 0。跨案移交时固化，撤销时据此判断后续交接。
+     */
+    public long findMaxIdByEvidenceKey(String evidenceKey) {
+        List<Long> rows = jdbc.query(
+                "SELECT COALESCE(MAX(id), 0) FROM transfer_record WHERE evidence_key = ?",
+                (rs, rowNum) -> rs.getLong(1), evidenceKey);
+        return rows.isEmpty() ? 0 : rows.get(0);
+    }
+
     private static final class TransferRowMapper implements RowMapper<TransferRecord> {
         @Override
         public TransferRecord mapRow(ResultSet rs, int rowNum) throws SQLException {
