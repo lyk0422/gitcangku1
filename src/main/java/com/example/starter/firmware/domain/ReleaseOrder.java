@@ -15,8 +15,11 @@ package com.example.starter.firmware.domain;
  * @param monitorRound            当前监控轮次，从1开始，人工恢复后加一
  * @param roundSuccess            当前监控轮次内首次进入 SUCCESS 的任务数
  * @param roundFailed             当前监控轮次内首次进入 FAILED 的任务数
+ * @param shardCount              已登记分片总数；null 表示尚未登记分片摘要
+ * @param fullDigest              完整包聚合摘要（分片摘要按序号升序拼接后的SHA-256）；null 表示未登记
  */
 public record ReleaseOrder(long id, int version, String model, String fromVersion, String toVersion,
                            int ratio, ReleaseStatus status, int sampleFloor, int failureThresholdPercent,
-                           int monitorRound, int roundSuccess, int roundFailed) {
+                           int monitorRound, int roundSuccess, int roundFailed,
+                           Integer shardCount, String fullDigest) {
 }

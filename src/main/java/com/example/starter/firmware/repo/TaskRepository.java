@@ -14,7 +14,8 @@ import java.util.List;
 import java.util.Optional;
 
 /**
- * 投放任务数据访问。同设备同发布单由唯一约束 uk_task_release_device 保证最多一条。
+ * 投放任务尝试数据访问。同设备同发布单每代尝试一条，
+ * 由唯一约束 uk_task_release_device_attempt 保证；历史代次只增不改。
  */
 @Repository
 public class TaskRepository {
@@ -22,11 +23,13 @@ public class TaskRepository {
     private static final RowMapper<RolloutTask> MAPPER = (rs, rowNum) -> {
         String firstResult = rs.getString("first_result");
         return new RolloutTask(rs.getLong("id"), rs.getLong("release_id"), rs.getString("device_id"),
-                TaskStatus.valueOf(rs.getString("status")),
-                firstResult == null ? null : ReceiptResult.valueOf(firstResult));
+                rs.getInt("attempt_no"), TaskStatus.valueOf(rs.getString("status")),
+                firstResult == null ? null : ReceiptResult.valueOf(firstResult),
+                rs.getString("aggregate_digest"));
     };
 
-    private static final String COLUMNS = "id, release_id, device_id, status, first_result";
+    private static final String COLUMNS = "id, release_id, device_id, attempt_no, status, first_result,"
+            + " aggregate_digest";
 
     private final JdbcTemplate jdbc;
 
@@ -34,14 +37,16 @@ public class TaskRepository {
         this.jdbc = jdbc;
     }
 
-    public long insert(long releaseId, String deviceId) {
+    public long insert(long releaseId, String deviceId, int attemptNo) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO rollout_task (release_id, device_id, status) VALUES (?, ?, 'PENDING')",
+                    "INSERT INTO rollout_task (release_id, device_id, attempt_no, status)"
+                            + " VALUES (?, ?, ?, 'PENDING')",
                     new String[]{"id"});
             ps.setLong(1, releaseId);
             ps.setString(2, deviceId);
+            ps.setInt(3, attemptNo);
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();
@@ -57,9 +62,29 @@ public class TaskRepository {
                 .stream().findFirst();
     }
 
-    public Optional<RolloutTask> findByReleaseAndDevice(long releaseId, String deviceId) {
-        return jdbc.query("SELECT " + COLUMNS + " FROM rollout_task WHERE release_id = ? AND device_id = ?",
+    /**
+     * 设备在发布单上的最新一代尝试（attempt_no 最大）；重新拉取建立新代次后旧代次仍可查。
+     */
+    public Optional<RolloutTask> findLatestByReleaseAndDevice(long releaseId, String deviceId) {
+        return jdbc.query("SELECT " + COLUMNS + " FROM rollout_task"
+                        + " WHERE release_id = ? AND device_id = ? ORDER BY attempt_no DESC LIMIT 1",
                 MAPPER, releaseId, deviceId).stream().findFirst();
+    }
+
+    /**
+     * 可安装判定：任务转为 INSTALLABLE 并固化判定时刻的聚合摘要。
+     */
+    public void markInstallable(long id, String aggregateDigest) {
+        jdbc.update("UPDATE rollout_task SET status = 'INSTALLABLE', aggregate_digest = ?,"
+                + " updated_at = CURRENT_TIMESTAMP WHERE id = ?", aggregateDigest, id);
+    }
+
+    /**
+     * 完整性失败判定：任务转为 INTEGRITY_FAILED，禁止安装与成功回执，不计设备执行失败率。
+     */
+    public void markIntegrityFailed(long id) {
+        jdbc.update("UPDATE rollout_task SET status = 'INTEGRITY_FAILED',"
+                + " updated_at = CURRENT_TIMESTAMP WHERE id = ?", id);
     }
 
     public void complete(long id, ReceiptResult result) {
@@ -67,9 +92,13 @@ public class TaskRepository {
                 + " WHERE id = ?", result.name(), result.name(), id);
     }
 
-    public int cancelPendingByRelease(long releaseId) {
+    /**
+     * 发布单取消：未终结任务（分片接收中 PENDING、可安装 INSTALLABLE）转 CANCELLED；
+     * 已终结（SUCCESS/FAILED/INTEGRITY_FAILED）与已取消任务保持不变。
+     */
+    public int cancelOpenByRelease(long releaseId) {
         return jdbc.update("UPDATE rollout_task SET status = 'CANCELLED', updated_at = CURRENT_TIMESTAMP"
-                + " WHERE release_id = ? AND status = 'PENDING'", releaseId);
+                + " WHERE release_id = ? AND status IN ('PENDING', 'INSTALLABLE')", releaseId);
     }
 
     public List<RolloutTask> findByRelease(long releaseId, TaskStatus statusFilter) {
@@ -85,6 +114,12 @@ public class TaskRepository {
         Long count = jdbc.queryForObject(
                 "SELECT COUNT(*) FROM rollout_task WHERE release_id = ? AND device_id = ?",
                 Long.class, releaseId, deviceId);
+        return count == null ? 0 : count;
+    }
+
+    public long countByRelease(long releaseId) {
+        Long count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM rollout_task WHERE release_id = ?", Long.class, releaseId);
         return count == null ? 0 : count;
     }
 }

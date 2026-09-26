@@ -24,10 +24,12 @@ public class ReleaseRepository {
             rs.getString("from_version"), rs.getString("to_version"),
             rs.getInt("ratio"), ReleaseStatus.valueOf(rs.getString("status")),
             rs.getInt("sample_floor"), rs.getInt("failure_threshold_percent"),
-            rs.getInt("monitor_round"), rs.getInt("round_success"), rs.getInt("round_failed"));
+            rs.getInt("monitor_round"), rs.getInt("round_success"), rs.getInt("round_failed"),
+            (Integer) rs.getObject("shard_count"), rs.getString("full_digest"));
 
     private static final String COLUMNS = "id, version, model, from_version, to_version, ratio, status,"
-            + " sample_floor, failure_threshold_percent, monitor_round, round_success, round_failed";
+            + " sample_floor, failure_threshold_percent, monitor_round, round_success, round_failed,"
+            + " shard_count, full_digest";
 
     private final JdbcTemplate jdbc;
 
@@ -106,6 +108,15 @@ public class ReleaseRepository {
     public int pauseIfActive(long id) {
         return jdbc.update("UPDATE release_order SET status = 'PAUSED', updated_at = CURRENT_TIMESTAMP"
                 + " WHERE id = ? AND status = 'ACTIVE'", id);
+    }
+
+    /**
+     * 登记分片清单：写入分片总数与完整包聚合摘要。调用方必须已持有发布单行锁，
+     * 并已确认当前未登记或尚无任务拉取（摘要一经任务拉取即不可修改）。
+     */
+    public void updateShardManifest(long id, int shardCount, String fullDigest) {
+        jdbc.update("UPDATE release_order SET shard_count = ?, full_digest = ?,"
+                + " updated_at = CURRENT_TIMESTAMP WHERE id = ?", shardCount, fullDigest, id);
     }
 
     /**
