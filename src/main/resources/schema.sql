@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS bag (
     bag_tag             VARCHAR(64)  NOT NULL COMMENT '行李牌号，全局唯一',
     current_location    VARCHAR(64)  NOT NULL COMMENT '当前所在站点代码',
     next_leg_index      INT          NOT NULL DEFAULT 0 COMMENT '待乘航段在行程中的下标（0 起），等于行程长度表示已完成；短卸不推进',
-    status              VARCHAR(16)  NOT NULL DEFAULT 'IN_TRANSIT' COMMENT '行李状态：IN_TRANSIT 在途/SHORT_UNLOADED 短卸待补/RECOVERED 已补到在途/DELIVERED 已交付',
+    status              VARCHAR(16)  NOT NULL DEFAULT 'IN_TRANSIT' COMMENT '行李状态：IN_TRANSIT 在途/SHORT_UNLOADED 短卸待补/RECOVERED 已补到在途/DELIVERED 已交付/CLAIM_HOLD 认领冻结',
     loaded_leg_id       VARCHAR(64)  NULL COMMENT '当前已装载到的航段，未装载为 NULL',
     short_leg_id        VARCHAR(64)  NULL COMMENT '短卸缺失航段标识，仅 SHORT_UNLOADED 状态非 NULL',
     short_destination   VARCHAR(64)  NULL COMMENT '短卸应到站点代码，仅 SHORT_UNLOADED 状态非 NULL',
@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS bag_event (
     id         BIGINT AUTO_INCREMENT NOT NULL COMMENT '事件自增主键',
     bag_tag    VARCHAR(64)  NOT NULL COMMENT '行李牌号',
     seq        INT          NOT NULL COMMENT '该行李内事件顺序，0 起递增',
-    event_type VARCHAR(32)  NOT NULL COMMENT '事件类型：REGISTERED 登记/LOADED 装载/UNLOADED 到达卸下/SHORT_UNLOADED 短卸/RECOVERED 补到/DELIVERED 交付',
+    event_type VARCHAR(32)  NOT NULL COMMENT '事件类型：REGISTERED 登记/LOADED 装载/UNLOADED 到达卸下/SHORT_UNLOADED 短卸/RECOVERED 补到/DELIVERED 交付/CLAIM_HOLD 认领冻结/CLAIM_RELEASE 冻结解除',
     leg_id     VARCHAR(64)  NULL COMMENT '关联航段标识，与航段无关的事件为 NULL',
     location   VARCHAR(64)  NULL COMMENT '事件发生后行李所在站点代码',
     event_time TIMESTAMP WITH TIME ZONE NOT NULL COMMENT '事件发生时刻（UTC）',
@@ -64,10 +64,46 @@ CREATE TABLE IF NOT EXISTS bag_event (
 -- 幂等去重：仅记录成功请求；同 requestId 同参数重放原结果，异参数返回 409
 CREATE TABLE IF NOT EXISTS request_log (
     request_id      VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
-    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER',
+    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER/CLAIM_HOLD/CLAIM_REVIEW/CLAIM_RELEASE',
     request_hash    VARCHAR(64)  NOT NULL COMMENT '请求参数（不含 requestId）的 SHA-256 摘要',
     response_status INT          NOT NULL COMMENT '原成功响应的 HTTP 状态码',
     response_body   CLOB         NOT NULL COMMENT '原成功响应体（JSON）',
     created_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     PRIMARY KEY (request_id)
+);
+
+-- 认领冻结：同一行李同时最多一条生效冻结（ACTIVE/REVIEWED），由 active_bag_tag 唯一键兜底保证
+CREATE TABLE IF NOT EXISTS claim_hold (
+    hold_id          BIGINT AUTO_INCREMENT NOT NULL COMMENT '冻结记录自增主键',
+    bag_tag          VARCHAR(64)  NOT NULL COMMENT '行李牌号',
+    claim_key        VARCHAR(128) NOT NULL COMMENT '认领凭证标识',
+    passenger_digest VARCHAR(128) NOT NULL COMMENT '乘客核验摘要，复核时比对，不一致返回 422',
+    reason           VARCHAR(512) NOT NULL COMMENT '冻结原因',
+    prev_status      VARCHAR(16)  NOT NULL COMMENT '冻结前行李状态，解除确认时原子恢复为该状态',
+    removed_leg_id   VARCHAR(64)  NULL COMMENT '冻结时在同一事务移出的 OPEN 航段标识，未在装载清单中为 NULL',
+    status           VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE' COMMENT '冻结状态：ACTIVE 生效中/REVIEWED 已复核待确认/RELEASED 已解除',
+    hold_agent       VARCHAR(64)  NOT NULL COMMENT '登记冻结的客服标识',
+    review_agent     VARCHAR(64)  NULL COMMENT '复核客服标识，须不同于登记客服，未复核为 NULL',
+    release_agent    VARCHAR(64)  NULL COMMENT '确认解除的客服标识，须为复核客服本人，未解除为 NULL',
+    active_bag_tag   VARCHAR(64)  NULL COMMENT '生效冻结去重键：ACTIVE/REVIEWED 时等于 bag_tag，解除后置 NULL',
+    held_at          TIMESTAMP WITH TIME ZONE NOT NULL COMMENT '冻结时刻（UTC）',
+    reviewed_at      TIMESTAMP WITH TIME ZONE NULL COMMENT '复核时刻（UTC），未复核为 NULL',
+    released_at      TIMESTAMP WITH TIME ZONE NULL COMMENT '解除时刻（UTC），未解除为 NULL',
+    PRIMARY KEY (hold_id),
+    UNIQUE (active_bag_tag)
+);
+
+-- 认领冻结不可变链记录：只追加不改写不删除，(bag_tag, seq) 唯一保证每件行李链内顺序稳定
+CREATE TABLE IF NOT EXISTS claim_hold_event (
+    id         BIGINT AUTO_INCREMENT NOT NULL COMMENT '链记录自增主键',
+    bag_tag    VARCHAR(64)  NOT NULL COMMENT '行李牌号',
+    seq        INT          NOT NULL COMMENT '该行李认领链内顺序，0 起递增',
+    hold_id    BIGINT       NOT NULL COMMENT '关联的冻结记录主键',
+    event_type VARCHAR(24)  NOT NULL COMMENT '链事件：HOLD 冻结/MANIFEST_REMOVE 清单移出/REVIEW 复核/RELEASE 解除',
+    leg_id     VARCHAR(64)  NULL COMMENT '相关航段：HOLD/MANIFEST_REMOVE 为移出的 OPEN 航段，未在清单或其余事件为 NULL',
+    reason     VARCHAR(512) NULL COMMENT '冻结原因，仅 HOLD 事件非 NULL，其余事件为 NULL',
+    agent_id   VARCHAR(64)  NOT NULL COMMENT '该步操作客服标识',
+    event_time TIMESTAMP WITH TIME ZONE NOT NULL COMMENT '事件时刻（UTC）',
+    PRIMARY KEY (id),
+    UNIQUE (bag_tag, seq)
 );

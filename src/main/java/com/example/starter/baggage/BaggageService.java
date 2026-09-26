@@ -6,6 +6,7 @@ import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 import java.util.function.Supplier;
 
@@ -17,6 +18,15 @@ import org.springframework.stereotype.Service;
 import com.example.starter.baggage.BaggageDtos.ArriveRequest;
 import com.example.starter.baggage.BaggageDtos.ArriveResponse;
 import com.example.starter.baggage.BaggageDtos.BagResponse;
+import com.example.starter.baggage.BaggageDtos.ClaimHoldEventItem;
+import com.example.starter.baggage.BaggageDtos.ClaimHoldHistoryResponse;
+import com.example.starter.baggage.BaggageDtos.ClaimHoldListResponse;
+import com.example.starter.baggage.BaggageDtos.ClaimHoldRequest;
+import com.example.starter.baggage.BaggageDtos.ClaimHoldResponse;
+import com.example.starter.baggage.BaggageDtos.ClaimReleaseRequest;
+import com.example.starter.baggage.BaggageDtos.ClaimReleaseResponse;
+import com.example.starter.baggage.BaggageDtos.ClaimReviewRequest;
+import com.example.starter.baggage.BaggageDtos.ClaimReviewResponse;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveRequest;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveResponse;
 import com.example.starter.baggage.BaggageDtos.ItineraryItem;
@@ -55,6 +65,17 @@ public class BaggageService {
     private static final String BAG_SHORT_UNLOADED = "SHORT_UNLOADED";
     private static final String BAG_RECOVERED = "RECOVERED";
     private static final String BAG_DELIVERED = "DELIVERED";
+    private static final String BAG_CLAIM_HOLD = "CLAIM_HOLD";
+    private static final String BAG_LOST = "LOST";
+
+    private static final String HOLD_ACTIVE = "ACTIVE";
+    private static final String HOLD_REVIEWED = "REVIEWED";
+    private static final String HOLD_RELEASED = "RELEASED";
+
+    private static final String CHAIN_HOLD = "HOLD";
+    private static final String CHAIN_MANIFEST_REMOVE = "MANIFEST_REMOVE";
+    private static final String CHAIN_REVIEW = "REVIEW";
+    private static final String CHAIN_RELEASE = "RELEASE";
 
     private static final String EVT_REGISTERED = "REGISTERED";
     private static final String EVT_LOADED = "LOADED";
@@ -62,6 +83,8 @@ public class BaggageService {
     private static final String EVT_SHORT = "SHORT_UNLOADED";
     private static final String EVT_RECOVERED = "RECOVERED";
     private static final String EVT_DELIVERED = "DELIVERED";
+    private static final String EVT_CLAIM_HOLD = "CLAIM_HOLD";
+    private static final String EVT_CLAIM_RELEASE = "CLAIM_RELEASE";
 
     private static final RowMapper<LegRow> LEG_MAPPER = (rs, rowNum) -> new LegRow(
             rs.getString("leg_id"), rs.getString("origin"), rs.getString("destination"),
@@ -85,6 +108,18 @@ public class BaggageService {
             rs.getString("bag_tag"), rs.getString("short_leg_id"), rs.getString("short_destination"),
             getInstant(rs, "short_registered_at").toString(),
             rs.getInt("next_leg_index"), rs.getString("current_location"));
+
+    private static final RowMapper<ClaimHoldRow> HOLD_MAPPER = (rs, rowNum) -> new ClaimHoldRow(
+            rs.getLong("hold_id"), rs.getString("bag_tag"), rs.getString("claim_key"),
+            rs.getString("passenger_digest"), rs.getString("reason"), rs.getString("prev_status"),
+            rs.getString("removed_leg_id"), rs.getString("status"), rs.getString("hold_agent"),
+            rs.getString("review_agent"), rs.getString("release_agent"),
+            getInstant(rs, "held_at"), getInstant(rs, "reviewed_at"), getInstant(rs, "released_at"));
+
+    private static final RowMapper<ClaimHoldEventItem> CHAIN_EVENT_MAPPER = (rs, rowNum) -> new ClaimHoldEventItem(
+            rs.getInt("seq"), rs.getString("event_type"), rs.getLong("hold_id"),
+            rs.getString("leg_id"), rs.getString("reason"), rs.getString("agent_id"),
+            getInstant(rs, "event_time").toString());
 
     private final JdbcTemplate jdbcTemplate;
     private final IdempotencyService idempotencyService;
@@ -203,6 +238,83 @@ public class BaggageService {
                         + " WHERE status = ? ORDER BY short_registered_at, bag_tag",
                 SHORT_MAPPER, BAG_SHORT_UNLOADED);
         return new ShortListResponse(items);
+    }
+
+    /**
+     * 认领冻结：对未到达最终目的地的行李登记冻结，行李转 CLAIM_HOLD。
+     * 已最终交付、已丢失或已有生效冻结的行李返回 409；行李位于 OPEN 航段清单时，
+     * 在同一事务内先移出清单（航段版本递增）并写入链记录；所在航段已 SEALED 时返回 409。
+     * 冻结与装载/封舱按行锁提交顺序裁决：先取航段锁再取行李锁，与装载/到达的加锁顺序一致，
+     * 读取与加锁间隙状态变化时整体重试。
+     */
+    public ClaimHoldResponse hold(String bagTag, ClaimHoldRequest request) {
+        ClaimHoldPayload payload = new ClaimHoldPayload(bagTag, request.claimKey(),
+                request.agentId(), request.passengerDigest(), request.reason());
+        for (int attempt = 0; attempt < 3; attempt++) {
+            try {
+                return idempotencyService.execute(request.requestId(), "CLAIM_HOLD", 201,
+                        payload, ClaimHoldResponse.class, () -> doHold(bagTag, request));
+            } catch (StaleLockException stale) {
+                // 加锁间隙行李的装载航段发生变化，事务已回滚，按最新状态重试
+            }
+        }
+        throw ApiException.conflict("行李 " + bagTag + " 状态变更竞争激烈，请重新提交");
+    }
+
+    /** 冻结复核：须由不同于登记客服的客服核对乘客核验摘要，摘要不匹配返回 422。 */
+    public ClaimReviewResponse review(String bagTag, ClaimReviewRequest request) {
+        ClaimReviewPayload payload = new ClaimReviewPayload(bagTag, request.agentId(), request.passengerDigest());
+        return idempotencyService.execute(request.requestId(), "CLAIM_REVIEW", 200,
+                payload, ClaimReviewResponse.class, () -> doReview(bagTag, request));
+    }
+
+    /** 冻结解除确认：复核客服本人第二次确认，原子恢复行李为冻结前状态。 */
+    public ClaimReleaseResponse release(String bagTag, ClaimReleaseRequest request) {
+        ClaimReleasePayload payload = new ClaimReleasePayload(bagTag, request.agentId());
+        return idempotencyService.execute(request.requestId(), "CLAIM_RELEASE", 200,
+                payload, ClaimReleaseResponse.class, () -> doRelease(bagTag, request));
+    }
+
+    /** 认领冻结明细查询：返回该行李最近一次冻结记录，不改变任何状态。 */
+    public ClaimHoldResponse getClaimHold(String bagTag) {
+        if (findBag(bagTag) == null) {
+            throw ApiException.notFound("行李不存在: " + bagTag);
+        }
+        ClaimHoldRow hold = findLatestHold(bagTag);
+        if (hold == null) {
+            throw ApiException.notFound("行李无认领冻结记录: " + bagTag);
+        }
+        return toClaimHoldResponse(hold);
+    }
+
+    /** 认领冻结不可变链历史查询：按链内顺序返回，不改变任何状态。 */
+    public ClaimHoldHistoryResponse getClaimHoldHistory(String bagTag) {
+        if (findBag(bagTag) == null) {
+            throw ApiException.notFound("行李不存在: " + bagTag);
+        }
+        List<ClaimHoldEventItem> events = jdbcTemplate.query(
+                "SELECT seq, event_type, hold_id, leg_id, reason, agent_id, event_time"
+                        + " FROM claim_hold_event WHERE bag_tag = ? ORDER BY seq",
+                CHAIN_EVENT_MAPPER, bagTag);
+        return new ClaimHoldHistoryResponse(bagTag, events);
+    }
+
+    /** 认领冻结诊断查询：按冻结状态过滤（缺省返回全部），按 holdId 升序，不改变任何状态。 */
+    public ClaimHoldListResponse listClaimHolds(String status) {
+        String sql = "SELECT hold_id, bag_tag, claim_key, passenger_digest, reason, prev_status,"
+                + " removed_leg_id, status, hold_agent, review_agent, release_agent,"
+                + " held_at, reviewed_at, released_at FROM claim_hold";
+        List<ClaimHoldRow> rows;
+        if (status == null || status.isBlank()) {
+            rows = jdbcTemplate.query(sql + " ORDER BY hold_id", HOLD_MAPPER);
+        } else {
+            if (!HOLD_ACTIVE.equals(status) && !HOLD_REVIEWED.equals(status) && !HOLD_RELEASED.equals(status)) {
+                throw ApiException.unprocessable(
+                        "冻结状态过滤值非法: " + status + "，允许 ACTIVE/REVIEWED/RELEASED");
+            }
+            rows = jdbcTemplate.query(sql + " WHERE status = ? ORDER BY hold_id", HOLD_MAPPER, status);
+        }
+        return new ClaimHoldListResponse(rows.stream().map(BaggageService::toClaimHoldResponse).toList());
     }
 
     private LegResponse doRegisterLeg(RegisterLegRequest request) {
@@ -364,6 +476,10 @@ public class BaggageService {
         if (bag == null) {
             throw ApiException.notFound("行李不存在: " + request.bagTag());
         }
+        if (BAG_CLAIM_HOLD.equals(bag.status())) {
+            throw ApiException.conflict(
+                    "行李 " + bag.bagTag() + " 处于认领冻结状态，禁止补到确认");
+        }
         if (!BAG_SHORT_UNLOADED.equals(bag.status())) {
             if (BAG_RECOVERED.equals(bag.status()) || BAG_DELIVERED.equals(bag.status())) {
                 throw ApiException.conflict("行李 " + bag.bagTag() + " 已补到，不得再次推进");
@@ -400,6 +516,164 @@ public class BaggageService {
                 nextIndex, request.missingLegId());
     }
 
+    private ClaimHoldResponse doHold(String bagTag, ClaimHoldRequest request) {
+        BagRow preview = findBag(bagTag);
+        if (preview == null) {
+            throw ApiException.notFound("行李不存在: " + bagTag);
+        }
+        // 与装载/到达保持同一加锁顺序（先航段后行李），避免与到达确认互相等待
+        String previewLegId = preview.loadedLegId();
+        LegRow leg = previewLegId == null ? null : lockLeg(previewLegId);
+        BagRow bag = lockBag(bagTag);
+        if (bag == null) {
+            throw ApiException.notFound("行李不存在: " + bagTag);
+        }
+        if (!Objects.equals(bag.loadedLegId(), previewLegId)) {
+            throw new StaleLockException();
+        }
+        if (BAG_CLAIM_HOLD.equals(bag.status())) {
+            throw ApiException.conflict("行李 " + bagTag + " 已存在生效认领冻结");
+        }
+        if (BAG_DELIVERED.equals(bag.status())) {
+            throw ApiException.conflict("行李 " + bagTag + " 已最终交付，不可冻结");
+        }
+        if (BAG_LOST.equals(bag.status())) {
+            throw ApiException.conflict("行李 " + bagTag + " 已丢失，不可冻结");
+        }
+        String removedLegId = null;
+        if (bag.loadedLegId() != null) {
+            if (!LEG_OPEN.equals(leg.status())) {
+                throw ApiException.conflict("行李 " + bagTag + " 所在航段 " + leg.legId()
+                        + " 状态为 " + leg.status() + "，已封舱不可冻结");
+            }
+            removedLegId = leg.legId();
+            jdbcTemplate.update("DELETE FROM load_record WHERE bag_tag = ?", bagTag);
+            jdbcTemplate.update("UPDATE leg SET version = ? WHERE leg_id = ?",
+                    leg.version() + 1, leg.legId());
+        }
+        OffsetDateTime heldAt = OffsetDateTime.ofInstant(clock.get(), ZoneOffset.UTC);
+        jdbcTemplate.update(
+                "INSERT INTO claim_hold (bag_tag, claim_key, passenger_digest, reason, prev_status,"
+                        + " removed_leg_id, status, hold_agent, active_bag_tag, held_at)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                bagTag, request.claimKey(), request.passengerDigest(), request.reason(),
+                bag.status(), removedLegId, HOLD_ACTIVE, request.agentId(), bagTag, heldAt);
+        Long holdId = jdbcTemplate.queryForObject(
+                "SELECT hold_id FROM claim_hold WHERE active_bag_tag = ?", Long.class, bagTag);
+        jdbcTemplate.update("UPDATE bag SET status = ?, loaded_leg_id = NULL WHERE bag_tag = ?",
+                BAG_CLAIM_HOLD, bagTag);
+        if (removedLegId != null) {
+            insertChainEvent(bagTag, holdId, CHAIN_MANIFEST_REMOVE, removedLegId, null, request.agentId());
+        }
+        insertChainEvent(bagTag, holdId, CHAIN_HOLD, removedLegId, request.reason(), request.agentId());
+        insertEvent(bagTag, EVT_CLAIM_HOLD, removedLegId, bag.currentLocation());
+        return toClaimHoldResponse(findHold(holdId));
+    }
+
+    private ClaimReviewResponse doReview(String bagTag, ClaimReviewRequest request) {
+        BagRow bag = lockBag(bagTag);
+        if (bag == null) {
+            throw ApiException.notFound("行李不存在: " + bagTag);
+        }
+        ClaimHoldRow hold = lockActiveHold(bag, bagTag);
+        if (!HOLD_ACTIVE.equals(hold.status())) {
+            throw ApiException.conflict("冻结 " + hold.holdId() + " 已复核，不得重复复核");
+        }
+        if (hold.holdAgent().equals(request.agentId())) {
+            throw ApiException.conflict("复核客服须不同于登记客服: " + request.agentId());
+        }
+        if (!hold.passengerDigest().equals(request.passengerDigest())) {
+            throw ApiException.unprocessable("乘客核验摘要不匹配");
+        }
+        OffsetDateTime reviewedAt = OffsetDateTime.ofInstant(clock.get(), ZoneOffset.UTC);
+        jdbcTemplate.update(
+                "UPDATE claim_hold SET status = ?, review_agent = ?, reviewed_at = ? WHERE hold_id = ?",
+                HOLD_REVIEWED, request.agentId(), reviewedAt, hold.holdId());
+        insertChainEvent(bagTag, hold.holdId(), CHAIN_REVIEW, null, null, request.agentId());
+        return new ClaimReviewResponse(hold.holdId(), bagTag, HOLD_REVIEWED,
+                request.agentId(), reviewedAt.toInstant().toString());
+    }
+
+    private ClaimReleaseResponse doRelease(String bagTag, ClaimReleaseRequest request) {
+        BagRow bag = lockBag(bagTag);
+        if (bag == null) {
+            throw ApiException.notFound("行李不存在: " + bagTag);
+        }
+        ClaimHoldRow hold = lockActiveHold(bag, bagTag);
+        if (!HOLD_REVIEWED.equals(hold.status())) {
+            throw ApiException.conflict("冻结 " + hold.holdId() + " 尚未完成复核，不得解除");
+        }
+        if (!hold.reviewAgent().equals(request.agentId())) {
+            throw ApiException.conflict(
+                    "解除确认须由复核客服本人提交: 期望 " + hold.reviewAgent() + "，提交为 " + request.agentId());
+        }
+        OffsetDateTime releasedAt = OffsetDateTime.ofInstant(clock.get(), ZoneOffset.UTC);
+        jdbcTemplate.update(
+                "UPDATE claim_hold SET status = ?, release_agent = ?, released_at = ?,"
+                        + " active_bag_tag = NULL WHERE hold_id = ?",
+                HOLD_RELEASED, request.agentId(), releasedAt, hold.holdId());
+        // 原子恢复为冻结前状态；冻结期间被拒绝的装载不自动恢复，须重新提交
+        jdbcTemplate.update("UPDATE bag SET status = ? WHERE bag_tag = ?", hold.prevStatus(), bagTag);
+        insertChainEvent(bagTag, hold.holdId(), CHAIN_RELEASE, null, null, request.agentId());
+        insertEvent(bagTag, EVT_CLAIM_RELEASE, null, bag.currentLocation());
+        return new ClaimReleaseResponse(hold.holdId(), bagTag, HOLD_RELEASED, hold.prevStatus(),
+                request.agentId(), releasedAt.toInstant().toString());
+    }
+
+    /** 读取并锁定当前生效冻结；行李不处于 CLAIM_HOLD 或无生效冻结时抛 409。 */
+    private ClaimHoldRow lockActiveHold(BagRow bag, String bagTag) {
+        if (!BAG_CLAIM_HOLD.equals(bag.status())) {
+            throw ApiException.conflict("行李 " + bagTag + " 当前无生效认领冻结");
+        }
+        List<ClaimHoldRow> rows = jdbcTemplate.query(holdSelect("WHERE active_bag_tag = ?", true),
+                HOLD_MAPPER, bagTag);
+        if (rows.isEmpty()) {
+            throw ApiException.conflict("行李 " + bagTag + " 当前无生效认领冻结");
+        }
+        return rows.get(0);
+    }
+
+    private ClaimHoldRow findHold(long holdId) {
+        List<ClaimHoldRow> rows = jdbcTemplate.query(holdSelect("WHERE hold_id = ?", false),
+                HOLD_MAPPER, holdId);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    private ClaimHoldRow findLatestHold(String bagTag) {
+        List<ClaimHoldRow> rows = jdbcTemplate.query(
+                holdSelect("WHERE bag_tag = ? ORDER BY hold_id DESC LIMIT 1", false), HOLD_MAPPER, bagTag);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    private static String holdSelect(String suffix, boolean forUpdate) {
+        return "SELECT hold_id, bag_tag, claim_key, passenger_digest, reason, prev_status,"
+                + " removed_leg_id, status, hold_agent, review_agent, release_agent,"
+                + " held_at, reviewed_at, released_at FROM claim_hold " + suffix
+                + (forUpdate ? " FOR UPDATE" : "");
+    }
+
+    /** 在持有行李行锁后追加认领链记录，seq 按该行李已有链记录数递增。 */
+    private void insertChainEvent(String bagTag, long holdId, String eventType,
+                                  String legId, String reason, String agentId) {
+        Integer maxSeq = jdbcTemplate.queryForObject(
+                "SELECT MAX(seq) FROM claim_hold_event WHERE bag_tag = ?", Integer.class, bagTag);
+        int nextSeq = maxSeq == null ? 0 : maxSeq + 1;
+        jdbcTemplate.update(
+                "INSERT INTO claim_hold_event (bag_tag, seq, hold_id, event_type, leg_id, reason,"
+                        + " agent_id, event_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                bagTag, nextSeq, holdId, eventType, legId, reason, agentId,
+                OffsetDateTime.ofInstant(clock.get(), ZoneOffset.UTC));
+    }
+
+    private static ClaimHoldResponse toClaimHoldResponse(ClaimHoldRow hold) {
+        return new ClaimHoldResponse(hold.holdId(), hold.bagTag(), hold.claimKey(), hold.status(),
+                hold.reason(), hold.prevStatus(), hold.removedLegId(),
+                hold.holdAgent(), hold.reviewAgent(), hold.releaseAgent(),
+                hold.heldAt().toString(),
+                hold.reviewedAt() == null ? null : hold.reviewedAt().toString(),
+                hold.releasedAt() == null ? null : hold.releasedAt().toString());
+    }
+
     /** 实际到达行李的统一推进：移动到到达站、推进待乘索引，完成行程者交付。 */
     private void advanceArrivedBag(BagRow bag, String destination, String legId) {
         int nextIndex = bag.nextLegIndex() + 1;
@@ -416,6 +690,10 @@ public class BaggageService {
     }
 
     private void validateLoadable(BagRow bag, LegRow leg) {
+        if (BAG_CLAIM_HOLD.equals(bag.status())) {
+            throw ApiException.conflict(
+                    "行李 " + bag.bagTag() + " 处于认领冻结状态，禁止装载任何后续航段");
+        }
         if (BAG_SHORT_UNLOADED.equals(bag.status())) {
             throw ApiException.unprocessable(
                     "行李 " + bag.bagTag() + " 处于短卸状态，须先补到才能装载后续航段");
@@ -574,5 +852,28 @@ public class BaggageService {
 
     /** 差异到达幂等摘要参数：bagTags 已排序，顺序差异不视为异参。 */
     private record DifferenceArrivePayload(String legId, int expectedVersion, List<String> bagTags) {
+    }
+
+    /** 认领冻结幂等摘要参数。 */
+    private record ClaimHoldPayload(String bagTag, String claimKey, String agentId,
+                                    String passengerDigest, String reason) {
+    }
+
+    /** 冻结复核幂等摘要参数。 */
+    private record ClaimReviewPayload(String bagTag, String agentId, String passengerDigest) {
+    }
+
+    /** 冻结解除确认幂等摘要参数。 */
+    private record ClaimReleasePayload(String bagTag, String agentId) {
+    }
+
+    private record ClaimHoldRow(long holdId, String bagTag, String claimKey, String passengerDigest,
+                                String reason, String prevStatus, String removedLegId, String status,
+                                String holdAgent, String reviewAgent, String releaseAgent,
+                                Instant heldAt, Instant reviewedAt, Instant releasedAt) {
+    }
+
+    /** 加锁间隙目标状态已变化的信号，触发整体重试。 */
+    private static final class StaleLockException extends RuntimeException {
     }
 }

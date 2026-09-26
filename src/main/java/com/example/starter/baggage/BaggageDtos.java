@@ -125,4 +125,60 @@ public final class BaggageDtos {
     /** 未补到清单响应。 */
     public record ShortListResponse(List<ShortItem> shortUnloaded) {
     }
+
+    /** 认领冻结请求：claimKey 为认领凭证，passengerDigest 为乘客核验摘要，agentId 为登记客服。 */
+    public record ClaimHoldRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotBlank(message = "claimKey 不能为空") String claimKey,
+            @NotBlank(message = "agentId 不能为空") String agentId,
+            @NotBlank(message = "passengerDigest 不能为空") String passengerDigest,
+            @NotBlank(message = "reason 不能为空") String reason) {
+    }
+
+    /** 冻结复核请求：agentId 须不同于登记客服，passengerDigest 须与登记摘要一致。 */
+    public record ClaimReviewRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotBlank(message = "agentId 不能为空") String agentId,
+            @NotBlank(message = "passengerDigest 不能为空") String passengerDigest) {
+    }
+
+    /** 冻结解除确认请求：agentId 须为复核客服本人。 */
+    public record ClaimReleaseRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotBlank(message = "agentId 不能为空") String agentId) {
+    }
+
+    /**
+     * 认领冻结明细：status 为 ACTIVE/REVIEWED/RELEASED；
+     * removedLegId 为冻结时移出的 OPEN 航段，未在清单为 null；
+     * reviewAgent/reviewedAt、releaseAgent/releasedAt 在未复核/未解除时为 null。
+     */
+    public record ClaimHoldResponse(long holdId, String bagTag, String claimKey, String status,
+                                    String reason, String prevStatus, String removedLegId,
+                                    String holdAgent, String reviewAgent, String releaseAgent,
+                                    String heldAt, String reviewedAt, String releasedAt) {
+    }
+
+    /** 冻结复核响应。 */
+    public record ClaimReviewResponse(long holdId, String bagTag, String status,
+                                      String reviewAgent, String reviewedAt) {
+    }
+
+    /** 冻结解除确认响应：bagStatus 为原子恢复后的行李状态。 */
+    public record ClaimReleaseResponse(long holdId, String bagTag, String status, String bagStatus,
+                                       String releaseAgent, String releasedAt) {
+    }
+
+    /** 认领冻结不可变链记录项：legId/reason 的 null 语义见建表注释。 */
+    public record ClaimHoldEventItem(int seq, String eventType, long holdId, String legId,
+                                     String reason, String agentId, String eventTime) {
+    }
+
+    /** 认领冻结链历史响应：events 按 seq 升序。 */
+    public record ClaimHoldHistoryResponse(String bagTag, List<ClaimHoldEventItem> events) {
+    }
+
+    /** 认领冻结诊断清单响应：holds 按 holdId 升序。 */
+    public record ClaimHoldListResponse(List<ClaimHoldResponse> holds) {
+    }
 }

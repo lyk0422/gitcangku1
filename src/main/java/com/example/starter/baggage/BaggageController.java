@@ -9,10 +9,19 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import com.example.starter.baggage.BaggageDtos.ArriveRequest;
 import com.example.starter.baggage.BaggageDtos.ArriveResponse;
+import com.example.starter.baggage.BaggageDtos.ClaimHoldHistoryResponse;
+import com.example.starter.baggage.BaggageDtos.ClaimHoldListResponse;
+import com.example.starter.baggage.BaggageDtos.ClaimHoldRequest;
+import com.example.starter.baggage.BaggageDtos.ClaimHoldResponse;
+import com.example.starter.baggage.BaggageDtos.ClaimReleaseRequest;
+import com.example.starter.baggage.BaggageDtos.ClaimReleaseResponse;
+import com.example.starter.baggage.BaggageDtos.ClaimReviewRequest;
+import com.example.starter.baggage.BaggageDtos.ClaimReviewResponse;
 import com.example.starter.baggage.BaggageDtos.BagResponse;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveRequest;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveResponse;
@@ -107,5 +116,44 @@ public class BaggageController {
     @GetMapping("/bags/short-unloaded")
     public ShortListResponse listShortUnloaded() {
         return baggageService.listShortUnloaded();
+    }
+
+    /** 登记认领冻结：行李转 CLAIM_HOLD，位于 OPEN 清单时同事务移出。 */
+    @PostMapping("/bags/{bagTag}/claim-hold")
+    public ResponseEntity<ClaimHoldResponse> hold(@PathVariable String bagTag,
+                                                  @Valid @RequestBody ClaimHoldRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(baggageService.hold(bagTag, request));
+    }
+
+    /** 冻结复核：不同客服核对乘客核验摘要。 */
+    @PostMapping("/bags/{bagTag}/claim-hold/review")
+    public ClaimReviewResponse review(@PathVariable String bagTag,
+                                      @Valid @RequestBody ClaimReviewRequest request) {
+        return baggageService.review(bagTag, request);
+    }
+
+    /** 冻结解除确认：复核客服第二次确认，原子恢复可交接状态。 */
+    @PostMapping("/bags/{bagTag}/claim-hold/release")
+    public ClaimReleaseResponse release(@PathVariable String bagTag,
+                                        @Valid @RequestBody ClaimReleaseRequest request) {
+        return baggageService.release(bagTag, request);
+    }
+
+    /** 认领冻结明细查询。 */
+    @GetMapping("/bags/{bagTag}/claim-hold")
+    public ClaimHoldResponse getClaimHold(@PathVariable String bagTag) {
+        return baggageService.getClaimHold(bagTag);
+    }
+
+    /** 认领冻结不可变链历史查询。 */
+    @GetMapping("/bags/{bagTag}/claim-hold/history")
+    public ClaimHoldHistoryResponse getClaimHoldHistory(@PathVariable String bagTag) {
+        return baggageService.getClaimHoldHistory(bagTag);
+    }
+
+    /** 认领冻结诊断查询：可按 status=ACTIVE/REVIEWED/RELEASED 过滤。 */
+    @GetMapping("/claim-holds")
+    public ClaimHoldListResponse listClaimHolds(@RequestParam(required = false) String status) {
+        return baggageService.listClaimHolds(status);
     }
 }
