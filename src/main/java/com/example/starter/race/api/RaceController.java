@@ -87,6 +87,48 @@ public class RaceController {
         return toResponse(raceService.sealRace(raceId, request));
     }
 
+    /** 登记医疗暂停。 */
+    @PostMapping("/{raceId}/runners/{bib}/medical-holds")
+    public ResponseEntity<Object> startMedicalHold(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody StartMedicalHoldRequest request) {
+        return toResponse(raceService.startMedicalHold(raceId, bib, request));
+    }
+
+    /** 恢复适赛（结束医疗暂停）。 */
+    @PostMapping("/{raceId}/runners/{bib}/medical-holds/{holdId}/resume")
+    public ResponseEntity<Object> resumeMedicalHold(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @PathVariable String holdId,
+            @Valid @RequestBody ResumeMedicalHoldRequest request) {
+        return toResponse(raceService.resumeMedicalHold(raceId, bib, holdId, request));
+    }
+
+    /** 登记退赛。 */
+    @PostMapping("/{raceId}/runners/{bib}/withdrawal")
+    public ResponseEntity<Object> withdrawRunner(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody WithdrawRunnerRequest request) {
+        return toResponse(raceService.withdrawRunner(raceId, bib, request));
+    }
+
+    /** 查询赛事全部医疗暂停历史（明细与诊断）。 */
+    @GetMapping("/{raceId}/medical-holds")
+    public MedicalHoldHistoryResponse getMedicalHolds(@PathVariable String raceId) {
+        return raceService.getMedicalHolds(raceId);
+    }
+
+    /** 查询单个选手的医疗暂停历史。 */
+    @GetMapping("/{raceId}/runners/{bib}/medical-holds")
+    public MedicalHoldHistoryResponse getRunnerMedicalHolds(
+            @PathVariable String raceId,
+            @PathVariable String bib) {
+        return raceService.getRunnerMedicalHolds(raceId, bib);
+    }
+
     /** 查询即时成绩（封榜后返回只读快照内容）。 */
     @GetMapping("/{raceId}/results")
     public StandingResponse getResults(@PathVariable String raceId) {

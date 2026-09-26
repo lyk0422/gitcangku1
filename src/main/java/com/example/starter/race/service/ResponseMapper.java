@@ -2,16 +2,19 @@ package com.example.starter.race.service;
 
 import com.example.starter.race.api.CheckpointPassResponse;
 import com.example.starter.race.api.CheckpointTimingResponse;
+import com.example.starter.race.api.MedicalHoldResponse;
 import com.example.starter.race.api.PenaltyResponse;
 import com.example.starter.race.api.ResultEntryResponse;
 import com.example.starter.race.api.RunnerResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.StandingResponse;
+import com.example.starter.race.domain.ExclusionReason;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
+import com.example.starter.race.persistence.MedicalHoldRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
 import com.example.starter.race.persistence.RunnerRow;
@@ -32,7 +35,8 @@ final class ResponseMapper {
     }
 
     static RunnerResponse toRunnerResponse(RunnerRow row) {
-        return new RunnerResponse(row.bib(), row.finishTimeMs(), row.createdAt(), row.updatedAt());
+        return new RunnerResponse(row.bib(), row.finishTimeMs(), row.withdrawn(),
+                row.withdrawnAt(), row.createdAt(), row.updatedAt());
     }
 
     static PenaltyResponse toPenaltyResponse(PenaltyRow row) {
@@ -43,7 +47,15 @@ final class ResponseMapper {
     static CheckpointTimingResponse toTimingResponse(CheckpointTimingRow row) {
         return new CheckpointTimingResponse(
                 row.timingId(), row.bib(), row.checkpointCode(), row.position(),
-                row.elapsedMillis(), row.createdAt());
+                row.elapsedMillis(), row.medicalHold(), row.holdId(), row.createdAt());
+    }
+
+    static MedicalHoldResponse toMedicalHoldResponse(MedicalHoldRow row) {
+        Long durationMs = row.endAt() == null ? null : row.endAt() - row.startAt();
+        return new MedicalHoldResponse(
+                row.holdId(), row.raceId(), row.bib(), row.status(), row.startAt(),
+                row.endAt(), durationMs, row.reason(), row.startedBy(), row.resumedBy(),
+                row.fitnessConclusion(), row.createdAt(), row.resumedAt());
     }
 
     static StandingResponse liveStanding(
@@ -51,15 +63,29 @@ final class ResponseMapper {
             List<RunnerRow> runners,
             List<PenaltyRow> penalties,
             List<CheckpointRow> checkpoints,
-            List<CheckpointTimingRow> timings) {
+            List<CheckpointTimingRow> timings,
+            List<MedicalHoldRow> activeHolds) {
         List<ResultEntry> entries = ResultCalculator.compute(
-                runners, penalties, checkpoints, timings);
+                standingRunnerViews(runners, activeHolds), penalties, checkpoints, timings);
         return new StandingResponse(
                 race.raceId(),
                 race.version(),
                 race.status(),
                 null,
                 entries.stream().map(ResponseMapper::toEntryResponse).toList());
+    }
+
+    /** 实时成绩/封榜共用的选手视图：在 runner 行基础上叠加“是否存在生效中医疗暂停”。 */
+    static List<ResultCalculator.RunnerView> standingRunnerViews(
+            List<RunnerRow> runners, List<MedicalHoldRow> activeHolds) {
+        Map<String, Boolean> holdActiveByBib = new LinkedHashMap<>();
+        for (MedicalHoldRow hold : activeHolds) {
+            holdActiveByBib.put(hold.bib(), Boolean.TRUE);
+        }
+        return runners.stream()
+                .map(runner -> (ResultCalculator.RunnerView) new StandingRunnerView(
+                        runner, holdActiveByBib.containsKey(runner.bib())))
+                .toList();
     }
 
     static StandingResponse snapshotStanding(SnapshotRow snapshot) {
@@ -117,7 +143,9 @@ final class ResponseMapper {
                             checkpoint.checkpointCode(),
                             checkpoint.position(),
                             timing == null ? null : timing.elapsedMillis(),
-                            timing == null ? null : timing.timingId());
+                            timing == null ? null : timing.timingId(),
+                            timing != null && timing.medicalHold()
+                                    ? ExclusionReason.MEDICAL_HOLD : null);
                 })
                 .toList();
         return new RunnerTimingResponse(
@@ -141,14 +169,41 @@ final class ResponseMapper {
                     SnapshotCheckpointRow detail = byCode.get(checkpoint.checkpointCode());
                     if (detail == null) {
                         return new CheckpointPassResponse(
-                                checkpoint.checkpointCode(), checkpoint.position(), null, null);
+                                checkpoint.checkpointCode(), checkpoint.position(),
+                                null, null, null);
                     }
                     return new CheckpointPassResponse(
                             detail.checkpointCode(), detail.position(),
-                            detail.elapsedMillis(), detail.timingId());
+                            detail.elapsedMillis(), detail.timingId(), detail.exclusionReason());
                 })
                 .toList();
         return new RunnerTimingResponse(
                 snapshot.raceId(), bib, snapshot.version(), finishTimeMs, passes);
+    }
+
+    /** 实时成绩用的选手视图：在 runner 行基础上叠加“是否存在生效中医疗暂停”。 */
+    private record StandingRunnerView(
+            RunnerRow row,
+            boolean holdActive
+    ) implements ResultCalculator.RunnerView {
+        @Override
+        public String bib() {
+            return row.bib();
+        }
+
+        @Override
+        public Long finishTimeMs() {
+            return row.finishTimeMs();
+        }
+
+        @Override
+        public boolean withdrawn() {
+            return row.withdrawn();
+        }
+
+        @Override
+        public boolean medicalHoldActive() {
+            return holdActive;
+        }
     }
 }

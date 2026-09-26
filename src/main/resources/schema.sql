@@ -15,6 +15,9 @@ CREATE TABLE IF NOT EXISTS runner (
     race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
     bib VARCHAR(64) NOT NULL COMMENT '参赛号，同一赛事内唯一',
     finish_time_ms BIGINT COMMENT '原始完赛耗时（毫秒，取值1~86400000）；NULL表示计时缺失，状态UNTIMED',
+    withdrawn BOOLEAN NOT NULL DEFAULT FALSE COMMENT '是否已退赛：FALSE-在赛，TRUE-已退赛（状态WITHDRAWN，不排名，不可开始或恢复医疗暂停）',
+    withdrawn_at BIGINT COMMENT '退赛登记时间，Unix毫秒时间戳；未退赛为NULL',
+    withdraw_reason VARCHAR(512) COMMENT '退赛原因，登记时固化；未退赛为NULL',
     created_at BIGINT NOT NULL COMMENT '登记时间，Unix毫秒时间戳',
     updated_at BIGINT NOT NULL COMMENT '最近一次计时修订时间，Unix毫秒时间戳',
     CONSTRAINT pk_runner PRIMARY KEY (id),
@@ -76,6 +79,8 @@ CREATE TABLE IF NOT EXISTS checkpoint_timing (
     checkpoint_code VARCHAR(64) NOT NULL COMMENT '通过的检查点代码',
     position INT NOT NULL COMMENT '检查点顺序（配置时固化），用于严格递增校验',
     elapsed_millis BIGINT NOT NULL COMMENT '通过该检查点的累计耗时（毫秒，1~86400000），必须小于该选手原始完赛耗时',
+    medical_hold BOOLEAN NOT NULL DEFAULT FALSE COMMENT '提交时选手是否处于生效医疗暂停：TRUE-被排除计时，不参与排名且不可改写',
+    hold_id VARCHAR(64) COMMENT '排除该计时的医疗暂停ID；medical_hold为FALSE时为NULL',
     created_at BIGINT NOT NULL COMMENT '记录提交时间，Unix毫秒时间戳',
     CONSTRAINT pk_checkpoint_timing PRIMARY KEY (timing_id),
     CONSTRAINT uk_timing_runner_checkpoint UNIQUE (race_id, bib, checkpoint_code),
@@ -91,13 +96,32 @@ CREATE TABLE IF NOT EXISTS result_snapshot_checkpoint (
     position INT NOT NULL COMMENT '检查点顺序，从1递增',
     elapsed_millis BIGINT COMMENT '封榜时该选手通过该检查点的累计耗时（毫秒）；缺失检查点为NULL',
     timing_id VARCHAR(128) COMMENT '分段记录ID；缺失检查点为NULL',
+    exclusion_reason VARCHAR(32) COMMENT '封榜时该计时的排除原因：MEDICAL_HOLD-医疗暂停排除；未排除或缺失检查点为NULL',
     CONSTRAINT pk_snapshot_checkpoint PRIMARY KEY (race_id, bib, checkpoint_code),
     CONSTRAINT fk_snapshot_checkpoint_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
 );
 
+CREATE TABLE IF NOT EXISTS medical_hold (
+    hold_id VARCHAR(64) NOT NULL COMMENT '医疗暂停ID，全局唯一',
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    bib VARCHAR(64) NOT NULL COMMENT '暂停选手参赛号',
+    status VARCHAR(16) NOT NULL COMMENT '暂停状态：ACTIVE-生效中（同一选手同时仅一条），RESUMED-已恢复适赛',
+    start_at BIGINT NOT NULL COMMENT '声明的暂停开始时刻，Unix毫秒时间戳（UTC），区间左闭',
+    end_at BIGINT COMMENT '声明的暂停结束时刻，Unix毫秒时间戳（UTC），区间右开；恢复确认前为NULL；必须晚于start_at',
+    reason VARCHAR(512) NOT NULL COMMENT '医疗暂停原因，登记时固化不可改写',
+    started_by VARCHAR(64) NOT NULL COMMENT '登记暂停的医疗角色标识',
+    resumed_by VARCHAR(64) COMMENT '确认适赛的医疗角色标识，必须与started_by不同；未恢复为NULL',
+    fitness_conclusion VARCHAR(512) COMMENT '恢复时的适赛结论；未恢复为NULL',
+    created_at BIGINT NOT NULL COMMENT '暂停登记提交时间，Unix毫秒时间戳',
+    resumed_at BIGINT COMMENT '恢复确认提交时间，Unix毫秒时间戳；未恢复为NULL',
+    CONSTRAINT pk_medical_hold PRIMARY KEY (hold_id),
+    CONSTRAINT fk_medical_hold_runner FOREIGN KEY (race_id, bib) REFERENCES runner (race_id, bib),
+    INDEX idx_medical_hold_race_bib (race_id, bib)
+);
+
 CREATE TABLE IF NOT EXISTS idempotency_record (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求ID（写操作幂等键）',
-    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE',
+    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE/START_MEDICAL_HOLD/RESUME_MEDICAL_HOLD/WITHDRAW_RUNNER',
     request_digest CHAR(64) NOT NULL COMMENT '请求参数（requestId除外，含expectedVersion）规范化JSON的SHA-256摘要',
     response_status INT NOT NULL COMMENT '原成功请求的HTTP状态码，重放时原样返回',
     response_body TEXT COMMENT '原成功响应体JSON，重放时原样返回',

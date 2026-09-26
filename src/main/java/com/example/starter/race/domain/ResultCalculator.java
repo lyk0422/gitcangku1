@@ -16,6 +16,10 @@ import java.util.Set;
  * <ul>
  *   <li>总耗时=原始完赛耗时+全部未撤销 ADD_TIME 加时之和；</li>
  *   <li>存在未撤销 DISQUALIFY 处罚时状态 DISQUALIFIED，不排名，全部撤销后恢复计算；</li>
+ *   <li>已退赛选手状态 WITHDRAWN，不排名（优先级低于 DISQUALIFIED）；</li>
+ *   <li>存在生效中医疗暂停的选手状态 MEDICAL_HOLD，资格暂停不排名，
+ *       恢复后重新参与排名（优先级低于 WITHDRAWN）；</li>
+ *   <li>医疗暂停期间提交的分段为被排除计时，不计入检查点覆盖，但记录保留；</li>
  *   <li>原始耗时缺失（null）时状态 UNTIMED，不排名；</li>
  *   <li>赛事配置了检查点时：已有完赛耗时但未覆盖全部检查点的选手状态
  *       MISSING_CHECKPOINT，不排名；全部覆盖后恢复加时与并列排名规则；
@@ -57,18 +61,22 @@ public final class ResultCalculator {
 
         Map<String, Aggregate> aggregates = new LinkedHashMap<>();
         for (RunnerView runner : runnerView) {
-            aggregates.put(runner.bib(),
-                    new Aggregate(runner.bib(), runner.finishTimeMs(), orderedCheckpoints));
+            Aggregate aggregate = new Aggregate(
+                    runner.bib(), runner.finishTimeMs(), orderedCheckpoints);
+            aggregate.withdrawn = runner.withdrawn();
+            aggregate.medicalHoldActive = runner.medicalHoldActive();
+            aggregates.put(runner.bib(), aggregate);
         }
 
-        // 仅统计属于已配置检查点的分段（数据库外键已保证，这里做防御性过滤）。
+        // 仅统计属于已配置检查点且未被医疗暂停排除的分段（数据库外键已保证，这里做防御性过滤）。
         Set<String> configuredCodes = new HashSet<>();
         for (CheckpointView checkpoint : orderedCheckpoints) {
             configuredCodes.add(checkpoint.checkpointCode());
         }
         for (TimingView timing : timings) {
             Aggregate aggregate = aggregates.get(timing.bib());
-            if (aggregate == null || !configuredCodes.contains(timing.checkpointCode())) {
+            if (aggregate == null || timing.medicalHold()
+                    || !configuredCodes.contains(timing.checkpointCode())) {
                 continue;
             }
             aggregate.coveredCodes.add(timing.checkpointCode());
@@ -91,6 +99,12 @@ public final class ResultCalculator {
         for (Aggregate aggregate : aggregates.values()) {
             if (aggregate.disqualified) {
                 aggregate.status = EntryStatus.DISQUALIFIED;
+                others.add(aggregate);
+            } else if (aggregate.withdrawn) {
+                aggregate.status = EntryStatus.WITHDRAWN;
+                others.add(aggregate);
+            } else if (aggregate.medicalHoldActive) {
+                aggregate.status = EntryStatus.MEDICAL_HOLD;
                 others.add(aggregate);
             } else if (aggregate.finishTimeMs == null) {
                 aggregate.status = EntryStatus.UNTIMED;
@@ -139,6 +153,16 @@ public final class ResultCalculator {
         String bib();
 
         Long finishTimeMs();
+
+        /** 是否已退赛；默认 false 兼容无退赛概念的调用方。 */
+        default boolean withdrawn() {
+            return false;
+        }
+
+        /** 是否存在生效中（未恢复）的医疗暂停；默认 false 兼容无医疗暂停的调用方。 */
+        default boolean medicalHoldActive() {
+            return false;
+        }
     }
 
     /** 处罚视图。 */
@@ -160,6 +184,8 @@ public final class ResultCalculator {
         private final Set<String> coveredCodes = new HashSet<>();
         private long penaltyMs;
         private boolean disqualified;
+        private boolean withdrawn;
+        private boolean medicalHoldActive;
         private EntryStatus status;
         private int rank;
         private long totalTimeMs;
