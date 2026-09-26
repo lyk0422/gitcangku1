@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS bag (
     bag_tag             VARCHAR(64)  NOT NULL COMMENT '行李牌号，全局唯一',
     current_location    VARCHAR(64)  NOT NULL COMMENT '当前所在站点代码',
     next_leg_index      INT          NOT NULL DEFAULT 0 COMMENT '待乘航段在行程中的下标（0 起），等于行程长度表示已完成；短卸不推进',
-    status              VARCHAR(16)  NOT NULL DEFAULT 'IN_TRANSIT' COMMENT '行李状态：IN_TRANSIT 在途/SHORT_UNLOADED 短卸待补/RECOVERED 已补到在途/DELIVERED 已交付',
+    status              VARCHAR(16)  NOT NULL DEFAULT 'IN_TRANSIT' COMMENT '行李状态：IN_TRANSIT 在途/SHORT_UNLOADED 短卸待补/RECOVERED 已补到在途/DELIVERED 已交付/CLAIM_HOLD 认领冻结',
     loaded_leg_id       VARCHAR(64)  NULL COMMENT '当前已装载到的航段，未装载为 NULL',
     short_leg_id        VARCHAR(64)  NULL COMMENT '短卸缺失航段标识，仅 SHORT_UNLOADED 状态非 NULL',
     short_destination   VARCHAR(64)  NULL COMMENT '短卸应到站点代码，仅 SHORT_UNLOADED 状态非 NULL',
@@ -61,10 +61,46 @@ CREATE TABLE IF NOT EXISTS bag_event (
     UNIQUE (bag_tag, seq)
 );
 
+-- 认领冻结：claim_key 唯一；同一行李同时只允许一个生效冻结（ACTIVE/RELEASE_REVIEWED），
+-- 由冻结/复核/解除流程持有行李行锁（SELECT ... FOR UPDATE）保证；解除后记录保留不复删
+CREATE TABLE IF NOT EXISTS claim_hold (
+    claim_key        VARCHAR(64)  NOT NULL COMMENT '认领冻结业务键，全局唯一',
+    bag_tag          VARCHAR(64)  NOT NULL COMMENT '行李牌号',
+    status           VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE' COMMENT '冻结状态：ACTIVE 生效中/RELEASE_REVIEWED 已复核待确认/RELEASED 已解除',
+    reason           VARCHAR(256) NOT NULL COMMENT '冻结原因（登记时固化，后续不改写）',
+    passenger_digest VARCHAR(128) NOT NULL COMMENT '乘客核验摘要（登记时固化，复核时比对）',
+    freeze_agent     VARCHAR(64)  NOT NULL COMMENT '登记冻结的客服标识',
+    review_agent     VARCHAR(64)  NULL COMMENT '复核客服标识（须不同于冻结人），未复核为 NULL',
+    prev_bag_status  VARCHAR(16)  NOT NULL COMMENT '冻结前行李状态，解除确认时原子恢复',
+    removed_leg_id   VARCHAR(64)  NULL COMMENT '冻结时移出的 OPEN 航段标识，冻结时不在 OPEN 清单为 NULL',
+    frozen_at        TIMESTAMP WITH TIME ZONE NOT NULL COMMENT '冻结时刻（UTC）',
+    reviewed_at      TIMESTAMP WITH TIME ZONE NULL COMMENT '复核时刻（UTC），未复核为 NULL',
+    released_at      TIMESTAMP WITH TIME ZONE NULL COMMENT '解除时刻（UTC），未解除为 NULL',
+    created_at       TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    PRIMARY KEY (claim_key)
+);
+
+-- 认领冻结不可变链记录：冻结/清单移出/复核/解除逐条追加，只增不改不删，
+-- 固化航段、原因、两位操作人与时刻；(claim_key, seq) 唯一保证链内顺序不重复
+CREATE TABLE IF NOT EXISTS claim_hold_event (
+    id             BIGINT AUTO_INCREMENT NOT NULL COMMENT '事件自增主键，全链按 id 升序稳定排序',
+    claim_key      VARCHAR(64)  NOT NULL COMMENT '认领冻结业务键',
+    seq            INT          NOT NULL COMMENT '该冻结链内事件顺序，0 起递增',
+    event_type     VARCHAR(24)  NOT NULL COMMENT '事件类型：FROZEN 冻结/MANIFEST_REMOVED 清单移出/REVIEWED 复核/RELEASED 解除',
+    bag_tag        VARCHAR(64)  NOT NULL COMMENT '行李牌号',
+    leg_id         VARCHAR(64)  NULL COMMENT '关联航段标识（清单移出时固化移出航段），无关联为 NULL',
+    reason         VARCHAR(256) NULL COMMENT '冻结原因快照，仅 FROZEN 事件非 NULL',
+    operator_id    VARCHAR(64)  NOT NULL COMMENT '本事件操作客服标识',
+    counterpart_id VARCHAR(64)  NULL COMMENT '关联的另一方操作人（复核/解除事件固化为冻结人），无则 NULL',
+    event_time     TIMESTAMP WITH TIME ZONE NOT NULL COMMENT '事件发生时刻（UTC）',
+    PRIMARY KEY (id),
+    UNIQUE (claim_key, seq)
+);
+
 -- 幂等去重：仅记录成功请求；同 requestId 同参数重放原结果，异参数返回 409
 CREATE TABLE IF NOT EXISTS request_log (
     request_id      VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
-    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER',
+    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER/CLAIM_HOLD_FREEZE/CLAIM_HOLD_REVIEW/CLAIM_HOLD_RELEASE',
     request_hash    VARCHAR(64)  NOT NULL COMMENT '请求参数（不含 requestId）的 SHA-256 摘要',
     response_status INT          NOT NULL COMMENT '原成功响应的 HTTP 状态码',
     response_body   CLOB         NOT NULL COMMENT '原成功响应体（JSON）',

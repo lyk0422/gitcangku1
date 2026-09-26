@@ -65,6 +65,28 @@ public final class BaggageDtos {
             @NotBlank(message = "actualStation 不能为空") String actualStation) {
     }
 
+    /** 认领冻结登记请求：授权客服提交认领键、乘客核验摘要与冻结原因。 */
+    public record ClaimHoldFreezeRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotBlank(message = "claimKey 不能为空") String claimKey,
+            @NotBlank(message = "agentId 不能为空") String agentId,
+            @NotBlank(message = "passengerDigest 不能为空") String passengerDigest,
+            @NotBlank(message = "reason 不能为空") String reason) {
+    }
+
+    /** 认领冻结复核请求：须由不同于冻结人的客服复核乘客核验摘要。 */
+    public record ClaimHoldReviewRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotBlank(message = "agentId 不能为空") String agentId,
+            @NotBlank(message = "passengerDigest 不能为空") String passengerDigest) {
+    }
+
+    /** 认领冻结解除确认请求：由复核人第二次确认，原子恢复可交接状态。 */
+    public record ClaimHoldReleaseRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotBlank(message = "agentId 不能为空") String agentId) {
+    }
+
     /** 航段响应。 */
     public record LegResponse(String legId, String origin, String destination,
                               String status, int version) {
@@ -124,5 +146,29 @@ public final class BaggageDtos {
 
     /** 未补到清单响应。 */
     public record ShortListResponse(List<ShortItem> shortUnloaded) {
+    }
+
+    /**
+     * 认领冻结明细响应：固化两位操作人与各阶段时刻（UTC ISO 字符串）。
+     * reviewAgent/reviewedAt/releasedAt/removedLegId 未发生时为 null。
+     */
+    public record ClaimHoldResponse(String claimKey, String bagTag, String status, String reason,
+                                    String freezeAgent, String reviewAgent, String prevBagStatus,
+                                    String removedLegId, String frozenAt, String reviewedAt,
+                                    String releasedAt) {
+    }
+
+    /** 认领冻结不可变链记录项：legId/reason/counterpartId 无关联时为 null。 */
+    public record ClaimHoldEventItem(int seq, String eventType, String claimKey, String bagTag,
+                                     String legId, String reason, String operatorId,
+                                     String counterpartId, String eventTime) {
+    }
+
+    /** 认领冻结历史链响应：events 按写入顺序（链记录 id）稳定升序。 */
+    public record ClaimHoldHistoryResponse(String bagTag, List<ClaimHoldEventItem> events) {
+    }
+
+    /** 认领冻结诊断清单响应。 */
+    public record ClaimHoldListResponse(List<ClaimHoldResponse> holds) {
     }
 }
