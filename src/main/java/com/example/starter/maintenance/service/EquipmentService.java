@@ -1,5 +1,6 @@
 package com.example.starter.maintenance.service;
 
+import java.time.Instant;
 import java.util.List;
 import java.util.function.Supplier;
 
@@ -8,33 +9,50 @@ import org.springframework.stereotype.Service;
 
 import com.example.starter.maintenance.api.ApiException;
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
+import com.example.starter.maintenance.api.dto.BatchIsolationRequest;
+import com.example.starter.maintenance.api.dto.BatchIsolationResponse;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
+import com.example.starter.maintenance.api.dto.ConfirmLockPointRequest;
+import com.example.starter.maintenance.api.dto.CreateIsolationRequest;
+import com.example.starter.maintenance.api.dto.DeactivateEquipmentRequest;
+import com.example.starter.maintenance.api.dto.EquipmentDeactivationResponse;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
+import com.example.starter.maintenance.api.dto.FinalizeReleaseRequest;
+import com.example.starter.maintenance.api.dto.IsolationDiagnosticsResponse;
+import com.example.starter.maintenance.api.dto.IsolationEventView;
+import com.example.starter.maintenance.api.dto.IsolationOrderResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
 import com.example.starter.maintenance.api.dto.RegisterEquipmentRequest;
+import com.example.starter.maintenance.api.dto.ReleaseLockPointRequest;
+import com.example.starter.maintenance.api.dto.RejectedReadingView;
 import com.example.starter.maintenance.api.dto.ReviseReadingRequest;
 import com.example.starter.maintenance.api.dto.RevisionView;
 import com.example.starter.maintenance.api.dto.StatusResponse;
 
 /**
- * 设备工时保养外观服务：委托事务服务执行；并发下唯一键冲突（事务已回滚）时，
+ * 设备工时保养 + 能源隔离外观服务：委托事务服务执行；并发下唯一键冲突（事务已回滚）时，
  * 优先按 requestId 重放已提交的成功结果，否则转换为 409 业务冲突。
  */
 @Service
 public class EquipmentService {
 
     private final EquipmentTxService txService;
+    private final IsolationTxService isolationTxService;
     private final IdempotencyService idempotency;
+    private final FingerprintService fingerprints;
 
-    public EquipmentService(EquipmentTxService txService, IdempotencyService idempotency) {
+    public EquipmentService(EquipmentTxService txService, IsolationTxService isolationTxService,
+                            IdempotencyService idempotency, FingerprintService fingerprints) {
         this.txService = txService;
+        this.isolationTxService = isolationTxService;
         this.idempotency = idempotency;
+        this.fingerprints = fingerprints;
     }
 
     public EquipmentResponse register(RegisterEquipmentRequest req) {
-        String fingerprint = req.equipmentId() + "|" + req.maintenancePeriodMinutes();
-        return recoverDuplicateKey(req.requestId(), "REGISTER_EQUIPMENT", fingerprint,
+        String fingerprint = EquipmentTxService.registerFingerprint(req, fingerprints);
+        return recoverDuplicateKey(req.requestId(), EquipmentTxService.OP_REGISTER_EQUIPMENT, fingerprint,
                 EquipmentResponse.class, () -> txService.register(req));
     }
 
@@ -64,6 +82,59 @@ public class EquipmentService {
 
     public List<MaintenanceResponse> listMaintenances(String equipmentId) {
         return txService.listMaintenances(equipmentId);
+    }
+
+    // ---------- 能源隔离 ----------
+
+    public IsolationOrderResponse createIsolation(String equipmentId, CreateIsolationRequest req) {
+        return isolationTxService.createIsolation(equipmentId, req);
+    }
+
+    public BatchIsolationResponse createBatchIsolation(BatchIsolationRequest req) {
+        String fingerprint = IsolationTxService.batchFingerprint(req, isolationTxService.fingerprints());
+        return recoverDuplicateKey(req.requestId(), IsolationTxService.OP_BATCH_CREATE_ISOLATION,
+                fingerprint, BatchIsolationResponse.class,
+                () -> isolationTxService.createBatchIsolation(req));
+    }
+
+    public IsolationOrderResponse confirmLockPoint(String equipmentId, String lockPointId,
+                                                   ConfirmLockPointRequest req) {
+        return isolationTxService.confirmLockPoint(equipmentId, lockPointId, req);
+    }
+
+    public IsolationOrderResponse releaseLockPoint(String equipmentId, String lockPointId,
+                                                   ReleaseLockPointRequest req) {
+        return isolationTxService.releaseLockPoint(equipmentId, lockPointId, req);
+    }
+
+    public IsolationOrderResponse finalizeRelease(String equipmentId, FinalizeReleaseRequest req) {
+        return isolationTxService.finalizeRelease(equipmentId, req);
+    }
+
+    public EquipmentDeactivationResponse deactivateEquipment(String equipmentId,
+                                                             DeactivateEquipmentRequest req) {
+        return isolationTxService.deactivateEquipment(equipmentId, req);
+    }
+
+    public IsolationOrderResponse getIsolationOrder(String equipmentId, long orderId) {
+        return isolationTxService.getOrder(equipmentId, orderId);
+    }
+
+    public List<IsolationOrderResponse> listIsolationOrders(String equipmentId) {
+        return isolationTxService.listOrders(equipmentId);
+    }
+
+    public List<IsolationEventView> listIsolationEvents(String equipmentId) {
+        return isolationTxService.listEvents(equipmentId);
+    }
+
+    public List<RejectedReadingView> listRejectedReadings(String equipmentId) {
+        return isolationTxService.listRejectedReadings(equipmentId);
+    }
+
+    public IsolationDiagnosticsResponse isolationDiagnostics(String equipmentId, Instant windowFrom,
+                                                             Instant windowTo) {
+        return isolationTxService.diagnostics(equipmentId, windowFrom, windowTo);
     }
 
     /**
