@@ -12,6 +12,7 @@ import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SplitResponse;
 import com.example.starter.batch.dto.SubmitTestRequest;
 import com.example.starter.batch.dto.TestResultResponse;
+import com.example.starter.pallet.PalletRepository;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
@@ -59,13 +60,16 @@ public class BatchService {
     private static final int IDEMPOTENCY_MAX_ATTEMPTS = 3;
 
     private final BatchRepository repo;
+    private final PalletRepository palletRepo;
     private final TransactionTemplate tx;
     private final ObjectMapper objectMapper;
 
     public BatchService(BatchRepository repo,
+                        PalletRepository palletRepo,
                         PlatformTransactionManager transactionManager,
                         ObjectMapper objectMapper) {
         this.repo = repo;
+        this.palletRepo = palletRepo;
         this.tx = new TransactionTemplate(transactionManager);
         this.objectMapper = objectMapper;
     }
@@ -213,6 +217,7 @@ public class BatchService {
      * 召回：RELEASED 或 SPLIT 批次可召回，召回后进入 RECALLED 并不再出现在可用批次查询中。
      * 召回提交后其全部后代立即不可用（排除出可用查询、禁止新增检验/批准/拆分），
      * 但后代自身状态与既有检验、批准记录不改写，也不为后代补写召回记录。
+     * 托盘联动：召回命中（自身或后代）任一托盘在托批次时，该托盘所有未装运批次标记待复核。
      */
     public StoredResponse recall(String batchKey, String actorId, RecallRequest req) {
         if (actorId == null || actorId.isBlank()) {
@@ -238,6 +243,13 @@ public class BatchService {
             repo.insertRecall(new BatchRepository.RecallRow(0L, batchKey, req.commandKey(),
                     actor, req.reason(), now));
             repo.updateStatus(batchKey, BatchStatus.RECALLED.name());
+            // 托盘联动：血缘召回（自身或后代）命中任一托盘在托批次时，该托盘所有未装运批次
+            // 标记待复核。批次行锁之后计算命中托盘，此时在托关系已按提交顺序稳定；
+            // 单语句标记，不取托盘行锁，避免与装载（先托盘后批次）形成循环等待。
+            List<String> affected = new ArrayList<>(descendants);
+            affected.add(batchKey);
+            List<String> hitPallets = palletRepo.findActivePalletKeysOfBatches(affected);
+            palletRepo.markReviewForPallets(hitPallets, now);
             RecallResponse body = new RecallResponse(batchKey, actor, req.reason(),
                     BatchStatus.RECALLED, Instant.parse(now));
             return new StoredResponse(201, toJson(body));
