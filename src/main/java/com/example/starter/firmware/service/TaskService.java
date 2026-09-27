@@ -14,6 +14,7 @@ import com.example.starter.firmware.error.ApiException;
 import com.example.starter.firmware.repo.DeviceRepository;
 import com.example.starter.firmware.repo.PauseRecordRepository;
 import com.example.starter.firmware.repo.ReleaseRepository;
+import com.example.starter.firmware.repo.TargetPolicyRepository;
 import com.example.starter.firmware.repo.TaskRepository;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
@@ -33,6 +34,7 @@ public class TaskService {
     private final ReleaseRepository releaseRepository;
     private final DeviceRepository deviceRepository;
     private final PauseRecordRepository pauseRecordRepository;
+    private final TargetPolicyRepository targetPolicyRepository;
     private final DeviceService deviceService;
     private final ReleaseService releaseService;
     private final IdempotencyService idempotency;
@@ -40,12 +42,14 @@ public class TaskService {
 
     public TaskService(TaskRepository taskRepository, ReleaseRepository releaseRepository,
                        DeviceRepository deviceRepository, PauseRecordRepository pauseRecordRepository,
+                       TargetPolicyRepository targetPolicyRepository,
                        DeviceService deviceService, ReleaseService releaseService,
                        IdempotencyService idempotency, Clock clock) {
         this.taskRepository = taskRepository;
         this.releaseRepository = releaseRepository;
         this.deviceRepository = deviceRepository;
         this.pauseRecordRepository = pauseRecordRepository;
+        this.targetPolicyRepository = targetPolicyRepository;
         this.deviceService = deviceService;
         this.releaseService = releaseService;
         this.idempotency = idempotency;
@@ -53,11 +57,12 @@ public class TaskService {
     }
 
     /**
-     * 设备拉取：已存在任务直接返回；否则仅当型号与当前版本匹配、分桶号小于比例且发布单 ACTIVE 时创建。
-     * PAUSED 时不创建新任务，已有任务仍可查看与回执。
+     * 设备拉取：已存在任务直接返回；否则仅当型号与当前版本匹配、分桶号小于比例、
+     * 发布单 ACTIVE 且设备属于创建时固化的目标快照（有策略时）时创建。
+     * PAUSED 时不创建新任务，已有任务仍可查看与回执。设备标签后续变更不改变快照成员资格。
      */
     public PullResponse pull(String deviceId, String requestId) {
-        String fingerprint = String.join("|", "task.pull", deviceId);
+        String fingerprint = Fingerprints.of("api", "task.pull", "deviceId", deviceId);
         return idempotency.execute(requestId, "task.pull", fingerprint, () -> {
             Device device = deviceService.findDevice(deviceId);
             var activeOrder = releaseRepository.findActiveByModel(device.model());
@@ -72,7 +77,8 @@ public class TaskService {
             }
             if (order.status() != ReleaseStatus.ACTIVE
                     || !device.currentVersion().equals(order.fromVersion())
-                    || device.bucketNo() >= order.ratio()) {
+                    || device.bucketNo() >= order.ratio()
+                    || !targetPolicyRepository.allows(order.id(), deviceId)) {
                 return new PullResponse(null);
             }
             long taskId;

@@ -64,6 +64,16 @@ public class ReleaseController {
         return taskService.listByRelease(releaseId, filter);
     }
 
+    @GetMapping("/{releaseId}/target")
+    public ReleaseTargetView target(@PathVariable long releaseId) {
+        return releaseService.target(releaseId);
+    }
+
+    @GetMapping("/{releaseId}/target/diagnostics")
+    public TargetDiagnosticsView targetDiagnostics(@PathVariable long releaseId) {
+        return releaseService.targetDiagnostics(releaseId);
+    }
+
     private TaskStatus parseStatus(String status) {
         if (status == null || status.isBlank()) {
             return null;

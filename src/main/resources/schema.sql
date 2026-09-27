@@ -1,4 +1,6 @@
--- 固件灰度投放 schema（H2，MODE=MySQL）。时间均为服务器本地时区（Asia/Shanghai）。
+-- 固件灰度投放 schema（H2，MODE=MySQL）。
+-- created_at/updated_at 为服务器本地时区（Asia/Shanghai）；
+-- 业务证据时间（*_at_utc 字段及 API 响应中的时间）统一为 UTC，ISO-8601 格式，区间端点左闭右开。
 
 CREATE TABLE IF NOT EXISTS device (
   device_id VARCHAR(64) NOT NULL COMMENT '设备唯一标识',
@@ -71,3 +73,50 @@ CREATE TABLE IF NOT EXISTS idempotency_record (
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   PRIMARY KEY (request_id)
 ) COMMENT='写操作幂等去重记录，失败不占键';
+
+CREATE TABLE IF NOT EXISTS device_tag (
+  device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
+  tag VARCHAR(64) NOT NULL COMMENT '规范化标签：去除首尾空白并转小写，长度1~64',
+  PRIMARY KEY (device_id, tag)
+) COMMENT='设备规范化标签集合，同设备标签唯一';
+
+CREATE TABLE IF NOT EXISTS tag_dictionary (
+  id INT NOT NULL COMMENT '单行标识，固定为1',
+  version BIGINT NOT NULL COMMENT '标签字典版本：设备登记与标签批量变更每次成功提交加一，发布单创建时固化该版本',
+  updated_at_utc VARCHAR(40) NOT NULL COMMENT '最近变更时刻，UTC，ISO-8601格式（如2026-09-27T07:00:00Z）',
+  PRIMARY KEY (id)
+) COMMENT='标签字典版本（单行），其行锁用于串行化标签变更与发布单目标快照解析';
+
+INSERT INTO tag_dictionary (id, version, updated_at_utc)
+SELECT 1, 0, '1970-01-01T00:00:00Z'
+WHERE NOT EXISTS (SELECT 1 FROM tag_dictionary WHERE id = 1);
+
+CREATE TABLE IF NOT EXISTS release_target_policy (
+  release_id BIGINT NOT NULL COMMENT '所属发布单ID',
+  include_all CLOB NOT NULL COMMENT '必须包含的标签，JSON数组，规范化升序；无该条件为空数组',
+  exclude_any CLOB NOT NULL COMMENT '不得包含的标签，JSON数组，规范化升序；无该条件为空数组',
+  include_any CLOB NOT NULL COMMENT '至少包含一项的标签，JSON数组，规范化升序；无该条件为空数组',
+  tag_dict_version BIGINT NOT NULL COMMENT '解析目标快照时的标签字典版本',
+  resolved_at_utc VARCHAR(40) NOT NULL COMMENT '目标快照解析时刻，UTC，ISO-8601格式',
+  target_count INT NOT NULL COMMENT '目标快照设备数，创建时必大于0',
+  PRIMARY KEY (release_id)
+) COMMENT='发布单目标标签策略，创建时固化，后续标签修订不影响本记录';
+
+CREATE TABLE IF NOT EXISTS release_target_snapshot (
+  release_id BIGINT NOT NULL COMMENT '所属发布单ID',
+  seq INT NOT NULL COMMENT '规范排序序号，从0开始，按device_id升序',
+  device_id VARCHAR(64) NOT NULL COMMENT '目标设备ID',
+  PRIMARY KEY (release_id, seq),
+  CONSTRAINT uk_snapshot_release_device UNIQUE (release_id, device_id)
+) COMMENT='发布单目标设备快照，仅创建时生成一次，后续不增不减';
+
+CREATE TABLE IF NOT EXISTS tag_change_record (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '变更记录ID',
+  dict_version BIGINT NOT NULL COMMENT '本次变更后的标签字典版本',
+  operator VARCHAR(64) NOT NULL COMMENT '操作者',
+  device_count INT NOT NULL COMMENT '本次变更涉及的设备数',
+  changes CLOB NOT NULL COMMENT '规范化变更内容快照（JSON数组，按device_id升序，标签升序）',
+  changed_at_utc VARCHAR(40) NOT NULL COMMENT '变更时刻，UTC，ISO-8601格式',
+  PRIMARY KEY (id),
+  CONSTRAINT uk_tag_change_version UNIQUE (dict_version)
+) COMMENT='设备标签批量变更历史，历史只增不改';

@@ -4,13 +4,16 @@ import com.example.starter.firmware.domain.ReceiptResult;
 import com.example.starter.firmware.domain.RolloutTask;
 import com.example.starter.firmware.domain.TaskStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.RowCallbackHandler;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.jdbc.support.GeneratedKeyHolder;
 import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.stereotype.Repository;
 
 import java.sql.PreparedStatement;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -86,5 +89,17 @@ public class TaskRepository {
                 "SELECT COUNT(*) FROM rollout_task WHERE release_id = ? AND device_id = ?",
                 Long.class, releaseId, deviceId);
         return count == null ? 0 : count;
+    }
+
+    /**
+     * 按状态统计发布单任务数：status -> 数量。
+     */
+    public Map<String, Long> countByReleaseGroupByStatus(long releaseId) {
+        Map<String, Long> counts = new HashMap<>();
+        jdbc.query("SELECT status, COUNT(*) AS cnt FROM rollout_task WHERE release_id = ? GROUP BY status",
+                (RowCallbackHandler) rs ->
+                        counts.put(rs.getString("status"), rs.getLong("cnt")),
+                releaseId);
+        return counts;
     }
 }
