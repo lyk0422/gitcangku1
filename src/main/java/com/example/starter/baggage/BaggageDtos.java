@@ -125,4 +125,63 @@ public final class BaggageDtos {
     /** 未补到清单响应。 */
     public record ShortListResponse(List<ShortItem> shortUnloaded) {
     }
+
+    /** 认领冻结登记请求：claimKey 全局唯一，verifyDigest 为乘客核验摘要，operator 为登记客服。 */
+    public record ClaimHoldRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotBlank(message = "claimKey 不能为空") String claimKey,
+            @NotBlank(message = "verifyDigest 不能为空") String verifyDigest,
+            @NotBlank(message = "reason 不能为空") String reason,
+            @NotBlank(message = "operator 不能为空") String operator) {
+    }
+
+    /** 冻结复核请求：须由与登记人不同的客服提交，verifyDigest 须与登记摘要一致。 */
+    public record ClaimReviewRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotBlank(message = "verifyDigest 不能为空") String verifyDigest,
+            @NotBlank(message = "operator 不能为空") String operator) {
+    }
+
+    /** 冻结解除确认请求：须由复核客服本人提交。 */
+    public record ClaimReleaseRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotBlank(message = "operator 不能为空") String operator) {
+    }
+
+    /** 冻结登记响应：removedLegId 为同一事务内移出的 OPEN 航段，未装载为 null。 */
+    public record ClaimHoldResponse(String claimKey, String bagTag, String holdStatus, String bagStatus,
+                                    String priorStatus, String removedLegId, String reason,
+                                    String heldBy, String heldAt) {
+    }
+
+    /** 冻结复核响应。 */
+    public record ClaimReviewResponse(String claimKey, String bagTag, String holdStatus,
+                                      String reviewedBy, String reviewedAt) {
+    }
+
+    /** 冻结解除确认响应：bagStatus 为恢复后的可交接状态。 */
+    public record ClaimReleaseResponse(String claimKey, String bagTag, String holdStatus, String bagStatus,
+                                       String releasedBy, String releasedAt) {
+    }
+
+    /** 冻结单明细：未复核/未解除的字段为 null。 */
+    public record ClaimHoldDetail(String claimKey, String bagTag, String holdStatus,
+                                  String priorStatus, String removedLegId, String reason,
+                                  String heldBy, String heldAt,
+                                  String reviewedBy, String reviewedAt,
+                                  String releasedBy, String releasedAt) {
+    }
+
+    /** 冻结不可变链记录项：eventTime 为 UTC ISO 串，legId/reason 视类型为 null。 */
+    public record ClaimHoldEventItem(int seq, String eventType, String claimKey, String bagTag,
+                                     String legId, String reason, String actor, String eventTime) {
+    }
+
+    /** 行李冻结链历史响应：按链记录插入顺序（id 升序）稳定排序。 */
+    public record ClaimHoldHistoryResponse(String bagTag, List<ClaimHoldEventItem> events) {
+    }
+
+    /** 冻结单诊断清单响应。 */
+    public record ClaimHoldListResponse(List<ClaimHoldDetail> holds) {
+    }
 }

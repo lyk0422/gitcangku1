@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS bag (
     bag_tag             VARCHAR(64)  NOT NULL COMMENT '行李牌号，全局唯一',
     current_location    VARCHAR(64)  NOT NULL COMMENT '当前所在站点代码',
     next_leg_index      INT          NOT NULL DEFAULT 0 COMMENT '待乘航段在行程中的下标（0 起），等于行程长度表示已完成；短卸不推进',
-    status              VARCHAR(16)  NOT NULL DEFAULT 'IN_TRANSIT' COMMENT '行李状态：IN_TRANSIT 在途/SHORT_UNLOADED 短卸待补/RECOVERED 已补到在途/DELIVERED 已交付',
+    status              VARCHAR(16)  NOT NULL DEFAULT 'IN_TRANSIT' COMMENT '行李状态：IN_TRANSIT 在途/SHORT_UNLOADED 短卸待补/RECOVERED 已补到在途/DELIVERED 已交付/CLAIM_HOLD 认领冻结',
     loaded_leg_id       VARCHAR(64)  NULL COMMENT '当前已装载到的航段，未装载为 NULL',
     short_leg_id        VARCHAR(64)  NULL COMMENT '短卸缺失航段标识，仅 SHORT_UNLOADED 状态非 NULL',
     short_destination   VARCHAR(64)  NULL COMMENT '短卸应到站点代码，仅 SHORT_UNLOADED 状态非 NULL',
@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS bag_event (
     id         BIGINT AUTO_INCREMENT NOT NULL COMMENT '事件自增主键',
     bag_tag    VARCHAR(64)  NOT NULL COMMENT '行李牌号',
     seq        INT          NOT NULL COMMENT '该行李内事件顺序，0 起递增',
-    event_type VARCHAR(32)  NOT NULL COMMENT '事件类型：REGISTERED 登记/LOADED 装载/UNLOADED 到达卸下/SHORT_UNLOADED 短卸/RECOVERED 补到/DELIVERED 交付',
+    event_type VARCHAR(32)  NOT NULL COMMENT '事件类型：REGISTERED 登记/LOADED 装载/UNLOADED 到达卸下/SHORT_UNLOADED 短卸/RECOVERED 补到/DELIVERED 交付/CLAIM_HELD 认领冻结/CLAIM_RELEASED 冻结解除',
     leg_id     VARCHAR(64)  NULL COMMENT '关联航段标识，与航段无关的事件为 NULL',
     location   VARCHAR(64)  NULL COMMENT '事件发生后行李所在站点代码',
     event_time TIMESTAMP WITH TIME ZONE NOT NULL COMMENT '事件发生时刻（UTC）',
@@ -61,10 +61,47 @@ CREATE TABLE IF NOT EXISTS bag_event (
     UNIQUE (bag_tag, seq)
 );
 
+-- 认领冻结单：claim_key 唯一；同一行李同时只允许一个未解除冻结（由行李行锁 + CLAIM_HOLD 状态保证）
+CREATE TABLE IF NOT EXISTS claim_hold (
+    claim_key      VARCHAR(64)  NOT NULL COMMENT '认领冻结单号，全局唯一',
+    bag_tag        VARCHAR(64)  NOT NULL COMMENT '被冻结行李牌号',
+    status         VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE' COMMENT '冻结单状态：ACTIVE 生效中/REVIEWED 已复核待确认/RELEASED 已解除',
+    reason         VARCHAR(512) NOT NULL COMMENT '冻结原因',
+    verify_digest  VARCHAR(128) NOT NULL COMMENT '乘客核验摘要，解除复核时比对',
+    prior_status   VARCHAR(16)  NOT NULL COMMENT '冻结前行李状态，解除确认后原子恢复',
+    removed_leg_id VARCHAR(64)  NULL COMMENT '冻结时从 OPEN 航段清单移出的航段，冻结时未装载为 NULL',
+    held_by        VARCHAR(64)  NOT NULL COMMENT '冻结登记客服',
+    held_at        TIMESTAMP WITH TIME ZONE NOT NULL COMMENT '冻结时刻（UTC）',
+    reviewed_by    VARCHAR(64)  NULL COMMENT '复核客服（须与冻结登记人不同），未复核为 NULL',
+    reviewed_at    TIMESTAMP WITH TIME ZONE NULL COMMENT '复核时刻（UTC），未复核为 NULL',
+    released_by    VARCHAR(64)  NULL COMMENT '解除确认客服（须为复核人本人），未解除为 NULL',
+    released_at    TIMESTAMP WITH TIME ZONE NULL COMMENT '解除时刻（UTC），未解除为 NULL',
+    created_at     TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    PRIMARY KEY (claim_key)
+);
+
+-- 按行李查询冻结单的索引
+CREATE INDEX IF NOT EXISTS idx_claim_hold_bag ON claim_hold (bag_tag);
+
+-- 认领冻结不可变链记录：只插入不更新，(claim_key, seq) 唯一保证链内顺序稳定
+CREATE TABLE IF NOT EXISTS claim_hold_event (
+    id         BIGINT AUTO_INCREMENT NOT NULL COMMENT '链记录自增主键',
+    claim_key  VARCHAR(64)  NOT NULL COMMENT '认领冻结单号',
+    seq        INT          NOT NULL COMMENT '该冻结单内链记录顺序，0 起递增；清单移出先于冻结登记',
+    event_type VARCHAR(24)  NOT NULL COMMENT '链记录类型：MANIFEST_REMOVED 清单移出/HOLD 冻结登记/REVIEW 复核/RELEASE 解除确认',
+    bag_tag    VARCHAR(64)  NOT NULL COMMENT '行李牌号',
+    leg_id     VARCHAR(64)  NULL COMMENT '关联航段（清单移出时为被移出航段），其余为 NULL',
+    reason     VARCHAR(512) NULL COMMENT '冻结原因，仅 HOLD 记录非 NULL',
+    actor      VARCHAR(64)  NOT NULL COMMENT '该步操作客服',
+    event_time TIMESTAMP WITH TIME ZONE NOT NULL COMMENT '发生时刻（UTC）',
+    PRIMARY KEY (id),
+    UNIQUE (claim_key, seq)
+);
+
 -- 幂等去重：仅记录成功请求；同 requestId 同参数重放原结果，异参数返回 409
 CREATE TABLE IF NOT EXISTS request_log (
     request_id      VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
-    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER',
+    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER/CLAIM_HOLD/CLAIM_REVIEW/CLAIM_RELEASE',
     request_hash    VARCHAR(64)  NOT NULL COMMENT '请求参数（不含 requestId）的 SHA-256 摘要',
     response_status INT          NOT NULL COMMENT '原成功响应的 HTTP 状态码',
     response_body   CLOB         NOT NULL COMMENT '原成功响应体（JSON）',

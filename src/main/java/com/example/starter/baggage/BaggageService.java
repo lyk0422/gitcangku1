@@ -55,6 +55,7 @@ public class BaggageService {
     private static final String BAG_SHORT_UNLOADED = "SHORT_UNLOADED";
     private static final String BAG_RECOVERED = "RECOVERED";
     private static final String BAG_DELIVERED = "DELIVERED";
+    private static final String BAG_CLAIM_HOLD = "CLAIM_HOLD";
 
     private static final String EVT_REGISTERED = "REGISTERED";
     private static final String EVT_LOADED = "LOADED";
@@ -365,6 +366,10 @@ public class BaggageService {
             throw ApiException.notFound("行李不存在: " + request.bagTag());
         }
         if (!BAG_SHORT_UNLOADED.equals(bag.status())) {
+            if (BAG_CLAIM_HOLD.equals(bag.status())) {
+                throw ApiException.conflict(
+                        "行李 " + bag.bagTag() + " 处于认领冻结状态，禁止补到确认与改派");
+            }
             if (BAG_RECOVERED.equals(bag.status()) || BAG_DELIVERED.equals(bag.status())) {
                 throw ApiException.conflict("行李 " + bag.bagTag() + " 已补到，不得再次推进");
             }
@@ -416,6 +421,10 @@ public class BaggageService {
     }
 
     private void validateLoadable(BagRow bag, LegRow leg) {
+        if (BAG_CLAIM_HOLD.equals(bag.status())) {
+            throw ApiException.conflict(
+                    "行李 " + bag.bagTag() + " 处于认领冻结状态，禁止装载，须解除冻结后重提");
+        }
         if (BAG_SHORT_UNLOADED.equals(bag.status())) {
             throw ApiException.unprocessable(
                     "行李 " + bag.bagTag() + " 处于短卸状态，须先补到才能装载后续航段");

@@ -41,6 +41,8 @@ class BaggageApiTest {
 
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM claim_hold_event");
+        jdbcTemplate.update("DELETE FROM claim_hold");
         jdbcTemplate.update("DELETE FROM bag_event");
         jdbcTemplate.update("DELETE FROM load_record");
         jdbcTemplate.update("DELETE FROM bag_itinerary");
