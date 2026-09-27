@@ -35,6 +35,7 @@ public abstract class AbstractIntegrationTest {
 
     @BeforeEach
     void cleanTables() {
+        jdbc.update("DELETE FROM operation_history");
         jdbc.update("DELETE FROM approval");
         jdbc.update("DELETE FROM translation");
         jdbc.update("DELETE FROM segment");
@@ -128,6 +129,32 @@ public abstract class AbstractIntegrationTest {
         String body = "{\"requestId\":\"" + requestId + "\",\"expectedTermVersion\":" + expectedTermVersion
                 + ",\"rules\":" + rulesJson + "}";
         return putJson("/api/documents/" + documentId + "/terms", body);
+    }
+
+    /** 批量批准：itemsJson 为条目数组 JSON，审核人取 actorId。 */
+    protected ApiResult batchApprove(long documentId, String actorId, String itemsJson, String requestId)
+            throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"approvals\":" + itemsJson + "}";
+        return postJson("/api/documents/" + documentId + "/approvals", body, actorId);
+    }
+
+    /** 撤回指定段落语言的批准。 */
+    protected ApiResult withdraw(long documentId, String segmentId, String language, String actorId,
+                                 String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\"}";
+        return postJson("/api/documents/" + documentId + "/segments/" + segmentId + "/translations/" + language
+                + "/approve/withdraw", body, actorId);
+    }
+
+    /** 源文修订并携带占位符集合（JSON 数组字符串，如 ["{a}"]）；传 null 表示不带该字段。 */
+    protected ApiResult reviseSource(long documentId, String segmentId, String sourceText,
+                                     String placeholdersJson, String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"sourceText\":\"" + sourceText + "\"";
+        if (placeholdersJson != null) {
+            body += ",\"placeholders\":" + placeholdersJson;
+        }
+        body += "}";
+        return putJson("/api/documents/" + documentId + "/segments/" + segmentId + "/source", body);
     }
 
     /** HTTP 响应结果：状态码与 JSON 响应体。 */

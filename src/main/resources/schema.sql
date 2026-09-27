@@ -22,13 +22,15 @@ CREATE TABLE IF NOT EXISTS segment (
     segment_id VARCHAR(64) NOT NULL,
     source_text LONGTEXT NOT NULL,
     source_version INT NOT NULL,
+    placeholders LONGTEXT NULL,
     PRIMARY KEY (document_id, segment_id)
 );
-COMMENT ON TABLE segment IS '段落：文档内唯一 segmentId，含源文及源文版本';
+COMMENT ON TABLE segment IS '段落：文档内唯一 segmentId，含源文、源文版本与声明的版式占位符集合';
 COMMENT ON COLUMN segment.document_id IS '所属文档 ID';
 COMMENT ON COLUMN segment.segment_id IS '文档内唯一段落 ID';
 COMMENT ON COLUMN segment.source_text IS '源文正文，UTF-8';
 COMMENT ON COLUMN segment.source_version IS '源文版本，从 1 开始，每次源文修订加一';
+COMMENT ON COLUMN segment.placeholders IS '源段声明的版式占位符集合，JSON 数组字符串，按 Unicode 字典序排序并保留重复出现次数；NULL 表示未声明（当前建段/修订接口缺省写入空数组）';
 
 CREATE TABLE IF NOT EXISTS translation (
     document_id BIGINT NOT NULL,
@@ -124,3 +126,28 @@ COMMENT ON COLUMN request_log.request_hash IS '请求参数规范化后的 SHA-2
 COMMENT ON COLUMN request_log.response_status IS '原成功响应的 HTTP 状态码，用于重放';
 COMMENT ON COLUMN request_log.response_body IS '原成功响应体 JSON，用于重放';
 COMMENT ON COLUMN request_log.created_at IS '记录时间，数据库默认时区';
+
+CREATE TABLE IF NOT EXISTS operation_history (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    document_id BIGINT NOT NULL,
+    segment_id VARCHAR(64) NULL,
+    language VARCHAR(16) NULL,
+    request_id VARCHAR(128) NOT NULL,
+    actor VARCHAR(128) NULL,
+    operation_type VARCHAR(32) NOT NULL,
+    fingerprint VARCHAR(64) NOT NULL,
+    detail_json LONGTEXT NOT NULL,
+    occurred_at_utc TIMESTAMP(6) NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_operation_history_doc_time ON operation_history (document_id, occurred_at_utc, id);
+COMMENT ON TABLE operation_history IS '操作历史证据：只追加不修改不删除，按提交顺序（自增 id）裁决，occurred_at_utc 统一 UTC 微秒精度';
+COMMENT ON COLUMN operation_history.id IS '自增序列号，即提交顺序，历史查询的稳定排序依据';
+COMMENT ON COLUMN operation_history.document_id IS '所属文档 ID';
+COMMENT ON COLUMN operation_history.segment_id IS '相关段落 ID；文档级操作（建文档/发布/术语更新）为 NULL';
+COMMENT ON COLUMN operation_history.language IS '相关目标语言码，小写；非单语操作（批量批准/文档级操作）为 NULL';
+COMMENT ON COLUMN operation_history.request_id IS '触发操作的全局唯一 requestId';
+COMMENT ON COLUMN operation_history.actor IS '操作者 X-Actor-Id；无需操作者的写操作（建文档/发布/术语更新）为 NULL';
+COMMENT ON COLUMN operation_history.operation_type IS '操作类型：CREATE_DOCUMENT/ADD_SEGMENT/REVISE_SOURCE/SUBMIT_TRANSLATION/APPROVE_TRANSLATION/BATCH_APPROVE/WITHDRAW_APPROVAL/PUBLISH/UPDATE_TERMS';
+COMMENT ON COLUMN operation_history.fingerprint IS 'SHA-256 指纹：覆盖操作者、操作类型、规范化集合（JSON 转义，非裸分隔符拼接）及全部结果相关字段';
+COMMENT ON COLUMN operation_history.detail_json IS '操作结果明细 JSON，字段与排序在写入时固化，后续操作不得覆盖';
+COMMENT ON COLUMN operation_history.occurred_at_utc IS '操作时间，UTC，微秒精度（TIMESTAMP(6)），历史查询区间左闭右开';

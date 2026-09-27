@@ -1,5 +1,6 @@
 package com.example.starter.translation.domain;
 
+import java.time.LocalDateTime;
 import java.util.List;
 
 /**
@@ -24,13 +25,14 @@ public final class Rows {
     }
 
     /**
-     * 段落：文档内唯一 segmentId，含源文及源文版本。
+     * 段落：文档内唯一 segmentId，含源文、源文版本与声明的版式占位符集合。
      *
      * @param segmentId     文档内唯一段落 ID
      * @param sourceText    源文正文，UTF-8
      * @param sourceVersion 源文版本，从 1 开始，每次源文修订加一
+     * @param placeholders  源段声明的版式占位符集合；null 表示未声明，元素非空、按字典序排序并保留重复次数
      */
-    public record SegmentRow(String segmentId, String sourceText, int sourceVersion) {
+    public record SegmentRow(String segmentId, String sourceText, int sourceVersion, List<String> placeholders) {
     }
 
     /**
@@ -69,6 +71,24 @@ public final class Rows {
      */
     public record ApprovalRow(String segmentId, String language, String reviewer,
                               int sourceVersion, int translationVersion) {
+    }
+
+    /**
+     * 操作历史记录：只追加，按自增 id（提交顺序）稳定排序。
+     *
+     * @param documentId     所属文档 ID
+     * @param segmentId      相关段落 ID；文档级操作（建文档/发布/术语更新）时为 null
+     * @param language       相关语言码，小写；非单语操作（批量批准）或文档级操作时为 null
+     * @param requestId      触发操作的 requestId
+     * @param actor          操作者 X-Actor-Id；无操作者写操作时为 null
+     * @param operationType  操作类型字符串
+     * @param fingerprint    覆盖操作者、操作类型、规范化集合及结果字段的 SHA-256 指纹
+     * @param detailJson     写入时固化的结果明细 JSON，后续操作不得改写
+     * @param occurredAtUtc  操作完成时间，UTC，微秒精度，历史查询区间左闭右开
+     */
+    public record HistoryRow(long id, long documentId, String segmentId, String language, String requestId,
+                             String actor, String operationType, String fingerprint, String detailJson,
+                             LocalDateTime occurredAtUtc) {
     }
 
     /**
