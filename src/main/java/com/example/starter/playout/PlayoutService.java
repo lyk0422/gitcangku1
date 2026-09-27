@@ -2,6 +2,8 @@ package com.example.starter.playout;
 
 import com.example.starter.playout.PlayoutRepository.DraftRow;
 import com.example.starter.playout.PlayoutRepository.GrantRow;
+import com.example.starter.playout.PlayoutRepository.LiveOverrideChannelRow;
+import com.example.starter.playout.PlayoutRepository.LiveOverrideRow;
 import com.example.starter.playout.PlayoutRepository.OverrideRow;
 import com.example.starter.playout.PlayoutRepository.PublicationRow;
 import com.example.starter.playout.PlayoutRepository.PublicationSegmentRow;
@@ -242,10 +244,10 @@ public class PlayoutService {
     // ---------- 播出决定 ----------
 
     /**
-     * 按频道与时刻查询播出决定。先在命中该时刻的 ACTIVE 紧急插播中选取指定授权当前未撤销的
-     * 最高优先级插播（EMERGENCY 来源，随附 overrideKey）；高优先级插播授权失效时自动落到
-     * 仍有效的低优先级插播。无有效插播候选时沿用原节目与保底逻辑。查询不改变插播状态，
-     * 插播不随授权撤销自动换绑授权。到插播结束时刻（左闭右开）不再命中。
+     * 按频道与时刻查询播出决定。优先级：命中该时刻且授权有效的 ACTIVE 紧急插播（EMERGENCY）
+     * 高于直播覆盖（LIVE），直播覆盖高于原节目。覆盖时段内原编排素材不播出但保留占位；
+     * 覆盖结束后仅未开始的片段恢复播出，被覆盖错过且未恢复的片段返回 MISSED_BY_LIVE 保底，
+     * 不自动补播。无有效插播与覆盖候选时沿用原节目与保底逻辑。查询不改变任何状态。
      */
     @Transactional(readOnly = true)
     public PlayoutDecisionResponse playoutDecision(String channelId, OffsetDateTime at) {
@@ -258,6 +260,13 @@ public class PlayoutService {
             OverrideRow hit = override.get();
             return new PlayoutDecisionResponse(channelId, at, hit.assetId(),
                     DecisionSource.EMERGENCY, null, null, null, hit.overrideKey());
+        }
+
+        Optional<LiveOverrideRow> live = selectActiveLiveOverrideAt(channelId, atMs);
+        if (live.isPresent()) {
+            LiveOverrideRow hit = live.get();
+            return new PlayoutDecisionResponse(channelId, at, hit.liveAssetId(),
+                    DecisionSource.LIVE, null, null, null, hit.overrideKey());
         }
 
         LocalDate businessDay = at.atZoneSameInstant(ZONE).toLocalDate();
@@ -274,6 +283,12 @@ public class PlayoutService {
                     FallbackReason.GAP);
         }
         PublicationSegmentRow hit = segment.get();
+        if (repo.existsMissedLiveSegment(publication.get().id(), hit.segmentId(), atMs)) {
+            return new PlayoutDecisionResponse(channelId, at, channel.fallbackAssetId(),
+                    DecisionSource.FALLBACK,
+                    FallbackReason.MISSED_BY_LIVE,
+                    publication.get().id(), hit.segmentId(), null);
+        }
         GrantRow grant = repo.findGrant(hit.grantId())
                 .orElseThrow(() -> ApiException.unprocessable("SNAPSHOT_INCOMPLETE",
                         "发布快照引用的授权不存在: " + hit.grantId()));
@@ -286,6 +301,28 @@ public class PlayoutService {
         return new PlayoutDecisionResponse(channelId, at, hit.assetId(),
                 DecisionSource.PROGRAM, null,
                 publication.get().id(), hit.segmentId(), null);
+    }
+
+    /**
+     * 选取某时刻生效的直播覆盖令：候选为区间命中且 ACTIVE 的覆盖（同频道同时段至多一条），
+     * 其频道维度指定授权已撤销时不命中，沿用原节目与保底逻辑。授权状态为查询时的实时状态。
+     */
+    private Optional<LiveOverrideRow> selectActiveLiveOverrideAt(String channelId, long atMs) {
+        Optional<LiveOverrideRow> candidate = repo.findActiveLiveOverrideAt(channelId, atMs);
+        if (candidate.isEmpty()) {
+            return Optional.empty();
+        }
+        LiveOverrideRow row = candidate.get();
+        Optional<LiveOverrideChannelRow> channel =
+                repo.findLiveOverrideChannel(row.overrideKey(), channelId);
+        if (channel.isEmpty()) {
+            return Optional.empty();
+        }
+        GrantRow grant = repo.findGrant(channel.get().grantId()).orElse(null);
+        if (grant == null || grant.revoked()) {
+            return Optional.empty();
+        }
+        return Optional.of(row);
     }
 
     /**

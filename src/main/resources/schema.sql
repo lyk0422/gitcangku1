@@ -97,3 +97,46 @@ CREATE TABLE IF NOT EXISTS playout_emergency_override (
     PRIMARY KEY (override_key),
     KEY idx_override_playout (channel_id, status, start_ms, end_ms, priority)
 ) COMMENT = '限时紧急插播表；不改写日草稿与发布快照，同频道同优先级 ACTIVE 区间不得重叠';
+
+CREATE TABLE IF NOT EXISTS playout_live_override (
+    override_key      VARCHAR(64) NOT NULL COMMENT '直播覆盖令全局唯一键，客户端指定，创建后不变',
+    live_asset_id     VARCHAR(64) NOT NULL COMMENT '直播源素材 ID（不得为频道保底素材）',
+    operator          VARCHAR(64) NOT NULL COMMENT '创建操作者标识，计入幂等指纹',
+    start_ms          BIGINT      NOT NULL COMMENT '覆盖开始（含），UTC 纪元毫秒',
+    end_ms            BIGINT      NOT NULL COMMENT '覆盖结束（不含），UTC 纪元毫秒；区间左闭右开',
+    status            VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE 生效中 / REVOKED 已撤销 / SETTLED 已结算；创建即 ACTIVE，终态不可改写',
+    revoke_request_id VARCHAR(64) NULL COMMENT '撤销操作的幂等请求 ID；未撤销时为 NULL',
+    revoked_at_ms     BIGINT      NULL COMMENT '撤销时间，UTC 纪元毫秒；未撤销时为 NULL',
+    settle_request_id VARCHAR(64) NULL COMMENT '结算操作的幂等请求 ID；未结算时为 NULL',
+    settled_at_ms     BIGINT      NULL COMMENT '结算时间，UTC 纪元毫秒；未结算时为 NULL',
+    created_at_ms     BIGINT      NOT NULL COMMENT '创建时间，UTC 纪元毫秒',
+    PRIMARY KEY (override_key),
+    KEY idx_live_override_status (status, start_ms, end_ms)
+) COMMENT = '直播覆盖令表；覆盖内原编排素材不播出但保留占位，令本身创建后不可改写';
+
+CREATE TABLE IF NOT EXISTS playout_live_override_channel (
+    override_key        VARCHAR(64) NOT NULL COMMENT '所属直播覆盖令键',
+    channel_id          VARCHAR(64) NOT NULL COMMENT '被覆盖频道 ID',
+    grant_id            BIGINT      NOT NULL COMMENT '创建时选定的直播源授权 ID，作为授权版本证据不可变',
+    grant_valid_from_ms BIGINT      NOT NULL COMMENT '创建时授权生效起点快照（含），UTC 纪元毫秒',
+    grant_valid_to_ms   BIGINT      NOT NULL COMMENT '创建时授权生效终点快照（不含），UTC 纪元毫秒',
+    PRIMARY KEY (override_key, channel_id),
+    KEY idx_live_override_channel (channel_id)
+) COMMENT = '直播覆盖令频道维度表，一行一个频道；授权版本快照创建后不可变';
+
+CREATE TABLE IF NOT EXISTS playout_live_override_segment (
+    id                     BIGINT      NOT NULL AUTO_INCREMENT COMMENT '受影响素材记录自增 ID',
+    override_key           VARCHAR(64) NOT NULL COMMENT '所属直播覆盖令键',
+    channel_id             VARCHAR(64) NOT NULL COMMENT '受影响频道 ID',
+    publication_id         BIGINT      NOT NULL COMMENT '受影响发布快照 ID',
+    segment_id             VARCHAR(64) NOT NULL COMMENT '受影响快照片段 ID',
+    asset_id               VARCHAR(64) NOT NULL COMMENT '原计划播出素材 ID',
+    start_ms               BIGINT      NOT NULL COMMENT '片段播出开始（含），UTC 纪元毫秒',
+    end_ms                 BIGINT      NOT NULL COMMENT '片段播出结束（不含），UTC 纪元毫秒',
+    disposition            VARCHAR(16) NOT NULL COMMENT '恢复结果：PENDING 待结算 / RESTORED 撤销恢复 / MISSED_BY_LIVE 已错过不补播；终态不可改写',
+    disposition_request_id VARCHAR(64) NULL COMMENT '产生当前恢复结果的幂等请求 ID；PENDING 时为 NULL',
+    disposition_at_ms      BIGINT      NULL COMMENT '恢复结果写入时间，UTC 纪元毫秒；PENDING 时为 NULL',
+    PRIMARY KEY (id),
+    KEY idx_live_segment_override (override_key),
+    KEY idx_live_segment_publication (publication_id, segment_id)
+) COMMENT = '直播覆盖受影响素材表；创建时快照记录，撤销只恢复 PENDING，结算写入 MISSED_BY_LIVE';

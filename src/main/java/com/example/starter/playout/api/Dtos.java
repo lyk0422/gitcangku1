@@ -1,11 +1,13 @@
 package com.example.starter.playout.api;
 
+import jakarta.validation.Valid;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.PositiveOrZero;
+import jakarta.validation.constraints.Size;
 
 import java.time.OffsetDateTime;
 import java.util.List;
@@ -107,14 +109,14 @@ public final class Dtos {
             long draftVersion) {
     }
 
-    /** 播出决定来源：EMERGENCY 命中紧急插播，PROGRAM 命中节目片段，FALLBACK 返回保底素材。 */
+    /** 播出决定来源：EMERGENCY 命中紧急插播，LIVE 命中直播覆盖，PROGRAM 命中节目片段，FALLBACK 返回保底素材。 */
     public enum DecisionSource {
-        EMERGENCY, PROGRAM, FALLBACK
+        EMERGENCY, LIVE, PROGRAM, FALLBACK
     }
 
-    /** 保底原因：无已发布编排 / 处于空档 / 覆盖片段的授权已撤销。 */
+    /** 保底原因：无已发布编排 / 处于空档 / 覆盖片段的授权已撤销 / 片段被直播覆盖错过且不补播。 */
     public enum FallbackReason {
-        NO_PUBLISHED_SCHEDULE, GAP, GRANT_REVOKED
+        NO_PUBLISHED_SCHEDULE, GAP, GRANT_REVOKED, MISSED_BY_LIVE
     }
 
     /** 播出决定响应；source 为 FALLBACK 时 reason 非空；source 为 EMERGENCY 时 overrideKey 非空。 */
@@ -166,6 +168,117 @@ public final class Dtos {
             String cancelRequestId,
             OffsetDateTime cancelledAt,
             OffsetDateTime createdAt) {
+    }
+
+    /** 直播覆盖令状态：创建即 ACTIVE；REVOKED（未开始时撤销）与 SETTLED（结束后结算）为终态，不可改写。 */
+    public enum LiveOverrideStatus {
+        ACTIVE, REVOKED, SETTLED
+    }
+
+    /** 受影响素材恢复结果：PENDING 待结算 / RESTORED 撤销恢复 / MISSED_BY_LIVE 已错过不补播；终态不可改写。 */
+    public enum LiveSegmentDisposition {
+        PENDING, RESTORED, MISSED_BY_LIVE
+    }
+
+    /** 直播覆盖令的频道维度输入；grantId 为该频道下完整覆盖区间的直播源授权。 */
+    public record LiveOverrideChannelInput(
+            @NotBlank String channelId,
+            @NotNull @Positive Long grantId) {
+    }
+
+    /**
+     * 创建直播覆盖令请求。区间 [start, end) 左闭右开、时长大于 0；channels 至少一个频道，
+     * 跨频道创建全量校验，任一失败整体回滚不留部分覆盖。operator 计入幂等指纹。
+     */
+    public record CreateLiveOverrideRequest(
+            @NotBlank String requestId,
+            @NotBlank String operator,
+            @NotBlank String overrideKey,
+            @NotBlank String liveAssetId,
+            @NotNull OffsetDateTime start,
+            @NotNull OffsetDateTime end,
+            @NotNull @Size(min = 1) List<@NotNull @Valid LiveOverrideChannelInput> channels) {
+    }
+
+    /** 撤销直播覆盖令请求（仅尚未开始的覆盖可撤销，幂等）。 */
+    public record RevokeLiveOverrideRequest(
+            @NotBlank String requestId,
+            @NotBlank String operator) {
+    }
+
+    /** 结算直播覆盖令请求（仅覆盖结束后可结算，幂等）。 */
+    public record SettleLiveOverrideRequest(
+            @NotBlank String requestId,
+            @NotBlank String operator) {
+    }
+
+    /** 直播覆盖令频道维度响应，含创建时的授权版本快照。 */
+    public record LiveOverrideChannelResponse(
+            String channelId,
+            long grantId,
+            OffsetDateTime grantValidFrom,
+            OffsetDateTime grantValidTo) {
+    }
+
+    /** 受影响素材记录响应，含恢复结果。 */
+    public record LiveOverrideSegmentResponse(
+            long id,
+            String channelId,
+            long publicationId,
+            String segmentId,
+            String assetId,
+            OffsetDateTime start,
+            OffsetDateTime end,
+            LiveSegmentDisposition disposition) {
+    }
+
+    /** 直播覆盖令明细响应，含频道维度、受影响素材与撤销/结算证据。 */
+    public record LiveOverrideResponse(
+            String overrideKey,
+            String operator,
+            String liveAssetId,
+            OffsetDateTime start,
+            OffsetDateTime end,
+            LiveOverrideStatus status,
+            List<LiveOverrideChannelResponse> channels,
+            List<LiveOverrideSegmentResponse> affectedSegments,
+            String revokeRequestId,
+            OffsetDateTime revokedAt,
+            String settleRequestId,
+            OffsetDateTime settledAt,
+            OffsetDateTime createdAt) {
+    }
+
+    /** 直播覆盖令历史摘要，按开始时间、覆盖键稳定排序。 */
+    public record LiveOverrideSummary(
+            String overrideKey,
+            String liveAssetId,
+            LiveOverrideStatus status,
+            OffsetDateTime start,
+            OffsetDateTime end,
+            List<String> channelIds,
+            OffsetDateTime createdAt) {
+    }
+
+    /** 直播覆盖令单频道诊断：受影响素材数量与覆盖内节目时长（毫秒，实际值）。 */
+    public record LiveOverrideChannelDiagnostics(
+            String channelId,
+            int affectedSegmentCount,
+            long coveredProgramDurationMs) {
+    }
+
+    /** 直播覆盖令诊断响应：数量与时长均为实际值，读取不改变状态。 */
+    public record LiveOverrideDiagnostics(
+            String overrideKey,
+            LiveOverrideStatus status,
+            int channelCount,
+            long overrideDurationMs,
+            int affectedSegmentCount,
+            int pendingCount,
+            int restoredCount,
+            int missedCount,
+            long coveredProgramDurationMs,
+            List<LiveOverrideChannelDiagnostics> channels) {
     }
 
     /** 统一错误响应体。 */

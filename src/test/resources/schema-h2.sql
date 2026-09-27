@@ -91,3 +91,48 @@ CREATE TABLE IF NOT EXISTS playout_emergency_override (
 );
 CREATE INDEX IF NOT EXISTS idx_override_playout
     ON playout_emergency_override (channel_id, status, start_ms, end_ms, priority);
+
+CREATE TABLE IF NOT EXISTS playout_live_override (
+    override_key      VARCHAR(64) NOT NULL PRIMARY KEY,
+    live_asset_id     VARCHAR(64) NOT NULL,
+    operator          VARCHAR(64) NOT NULL,
+    start_ms          BIGINT      NOT NULL,
+    end_ms            BIGINT      NOT NULL,
+    status            VARCHAR(16) NOT NULL,
+    revoke_request_id VARCHAR(64) NULL,
+    revoked_at_ms     BIGINT      NULL,
+    settle_request_id VARCHAR(64) NULL,
+    settled_at_ms     BIGINT      NULL,
+    created_at_ms     BIGINT      NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_live_override_status
+    ON playout_live_override (status, start_ms, end_ms);
+
+CREATE TABLE IF NOT EXISTS playout_live_override_channel (
+    override_key        VARCHAR(64) NOT NULL,
+    channel_id          VARCHAR(64) NOT NULL,
+    grant_id            BIGINT      NOT NULL,
+    grant_valid_from_ms BIGINT      NOT NULL,
+    grant_valid_to_ms   BIGINT      NOT NULL,
+    PRIMARY KEY (override_key, channel_id)
+);
+CREATE INDEX IF NOT EXISTS idx_live_override_channel
+    ON playout_live_override_channel (channel_id);
+
+CREATE TABLE IF NOT EXISTS playout_live_override_segment (
+    id                     BIGINT      NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    override_key           VARCHAR(64) NOT NULL,
+    channel_id             VARCHAR(64) NOT NULL,
+    publication_id         BIGINT      NOT NULL,
+    segment_id             VARCHAR(64) NOT NULL,
+    asset_id               VARCHAR(64) NOT NULL,
+    start_ms               BIGINT      NOT NULL,
+    end_ms                 BIGINT      NOT NULL,
+    disposition            VARCHAR(16) NOT NULL,
+    disposition_request_id VARCHAR(64) NULL,
+    disposition_at_ms      BIGINT      NULL
+);
+CREATE INDEX IF NOT EXISTS idx_live_segment_override
+    ON playout_live_override_segment (override_key);
+CREATE INDEX IF NOT EXISTS idx_live_segment_publication
+    ON playout_live_override_segment (publication_id, segment_id);

@@ -1,5 +1,6 @@
 package com.example.starter.playout.api;
 
+import com.example.starter.playout.LiveOverrideService;
 import com.example.starter.playout.PlayoutService;
 import com.example.starter.playout.api.Dtos.AssetResponse;
 import com.example.starter.playout.api.Dtos.ChannelResponse;
@@ -7,15 +8,21 @@ import com.example.starter.playout.api.Dtos.CreateAssetRequest;
 import com.example.starter.playout.api.Dtos.CreateChannelRequest;
 import com.example.starter.playout.api.Dtos.CreateEmergencyOverrideRequest;
 import com.example.starter.playout.api.Dtos.CreateGrantRequest;
+import com.example.starter.playout.api.Dtos.CreateLiveOverrideRequest;
 import com.example.starter.playout.api.Dtos.DraftResponse;
 import com.example.starter.playout.api.Dtos.EmergencyOverrideResponse;
 import com.example.starter.playout.api.Dtos.GrantResponse;
 import com.example.starter.playout.api.Dtos.CancelEmergencyOverrideRequest;
+import com.example.starter.playout.api.Dtos.LiveOverrideDiagnostics;
+import com.example.starter.playout.api.Dtos.LiveOverrideResponse;
+import com.example.starter.playout.api.Dtos.LiveOverrideSummary;
 import com.example.starter.playout.api.Dtos.PlayoutDecisionResponse;
 import com.example.starter.playout.api.Dtos.PublishRequest;
 import com.example.starter.playout.api.Dtos.PublishResponse;
 import com.example.starter.playout.api.Dtos.ReplaceDraftRequest;
 import com.example.starter.playout.api.Dtos.RevokeGrantRequest;
+import com.example.starter.playout.api.Dtos.RevokeLiveOverrideRequest;
+import com.example.starter.playout.api.Dtos.SettleLiveOverrideRequest;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import org.springframework.format.annotation.DateTimeFormat;
@@ -32,6 +39,7 @@ import org.springframework.web.bind.annotation.RestController;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeParseException;
+import java.util.List;
 
 /**
  * 播出编排 REST API。成功响应统一 200；错误区分 400 参数错误、404 资源不存在、
@@ -43,9 +51,11 @@ import java.time.format.DateTimeParseException;
 public class PlayoutController {
 
     private final PlayoutService service;
+    private final LiveOverrideService liveOverrideService;
 
-    public PlayoutController(PlayoutService service) {
+    public PlayoutController(PlayoutService service, LiveOverrideService liveOverrideService) {
         this.service = service;
+        this.liveOverrideService = liveOverrideService;
     }
 
     /** 创建素材。 */
@@ -117,6 +127,49 @@ public class PlayoutController {
     @GetMapping("/emergency-overrides/{overrideKey}")
     public EmergencyOverrideResponse emergencyOverride(@PathVariable @NotBlank String overrideKey) {
         return service.getEmergencyOverride(overrideKey);
+    }
+
+    /** 创建直播覆盖令（跨频道全量校验、单事务提交，携带 requestId 幂等）。 */
+    @PostMapping("/live-overrides")
+    public LiveOverrideResponse createLiveOverride(
+            @Valid @RequestBody CreateLiveOverrideRequest request) {
+        return liveOverrideService.create(request);
+    }
+
+    /** 撤销直播覆盖令（仅尚未开始的覆盖可撤销，携带 requestId 幂等）。 */
+    @PostMapping("/live-overrides/{overrideKey}/revoke")
+    public LiveOverrideResponse revokeLiveOverride(
+            @PathVariable @NotBlank String overrideKey,
+            @Valid @RequestBody RevokeLiveOverrideRequest request) {
+        return liveOverrideService.revoke(overrideKey, request);
+    }
+
+    /** 结算直播覆盖令（仅覆盖结束后可结算，写入 MISSED_BY_LIVE，携带 requestId 幂等）。 */
+    @PostMapping("/live-overrides/{overrideKey}/settle")
+    public LiveOverrideResponse settleLiveOverride(
+            @PathVariable @NotBlank String overrideKey,
+            @Valid @RequestBody SettleLiveOverrideRequest request) {
+        return liveOverrideService.settle(overrideKey, request);
+    }
+
+    /** 查询直播覆盖令明细，含频道维度授权快照与受影响素材恢复结果；只读。 */
+    @GetMapping("/live-overrides/{overrideKey}")
+    public LiveOverrideResponse liveOverride(@PathVariable @NotBlank String overrideKey) {
+        return liveOverrideService.getLiveOverride(overrideKey);
+    }
+
+    /** 查询直播覆盖令诊断：数量与时长实际值；只读。 */
+    @GetMapping("/live-overrides/{overrideKey}/diagnostics")
+    public LiveOverrideDiagnostics liveOverrideDiagnostics(
+            @PathVariable @NotBlank String overrideKey) {
+        return liveOverrideService.getDiagnostics(overrideKey);
+    }
+
+    /** 查询频道直播覆盖令历史，按开始时间、覆盖键稳定排序；只读。 */
+    @GetMapping("/channels/{channelId}/live-overrides")
+    public List<LiveOverrideSummary> liveOverrideHistory(
+            @PathVariable @NotBlank String channelId) {
+        return liveOverrideService.listChannelHistory(channelId);
     }
 
     private static LocalDate parseBusinessDay(String businessDay) {
