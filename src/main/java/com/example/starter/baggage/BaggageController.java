@@ -13,9 +13,16 @@ import org.springframework.web.bind.annotation.RestController;
 
 import com.example.starter.baggage.BaggageDtos.ArriveRequest;
 import com.example.starter.baggage.BaggageDtos.ArriveResponse;
+import com.example.starter.baggage.BaggageDtos.BagDiagnosticsResponse;
 import com.example.starter.baggage.BaggageDtos.BagResponse;
+import com.example.starter.baggage.BaggageDtos.ClaimHoldResponse;
+import com.example.starter.baggage.BaggageDtos.ClaimReleaseRequest;
+import com.example.starter.baggage.BaggageDtos.ClaimReviewRequest;
+import com.example.starter.baggage.BaggageDtos.DeliveryDifferenceRequest;
+import com.example.starter.baggage.BaggageDtos.DeliveryDifferenceResponse;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveRequest;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveResponse;
+import com.example.starter.baggage.BaggageDtos.HoldClaimRequest;
 import com.example.starter.baggage.BaggageDtos.LegDifferenceResponse;
 import com.example.starter.baggage.BaggageDtos.LegResponse;
 import com.example.starter.baggage.BaggageDtos.LoadRequest;
@@ -30,7 +37,7 @@ import com.example.starter.baggage.BaggageDtos.SealResponse;
 import com.example.starter.baggage.BaggageDtos.ShortListResponse;
 
 /**
- * 联程行李装载交接 REST 入口。
+ * 联程行李装载交接与认领冻结 REST 入口。
  */
 @RestController
 @RequestMapping("/api")
@@ -54,7 +61,7 @@ public class BaggageController {
         return ResponseEntity.status(HttpStatus.CREATED).body(baggageService.registerBag(request));
     }
 
-    /** 批量装载：整批原子，任一行李不满足则 422 且无一件移动。 */
+    /** 批量装载：整批原子，任一行李不满足则失败且无一件移动；冻结行李与超容量均拒绝。 */
     @PostMapping("/legs/{legId}/load")
     public LoadResponse load(@PathVariable String legId, @Valid @RequestBody LoadRequest request) {
         return baggageService.load(legId, request);
@@ -85,10 +92,53 @@ public class BaggageController {
         return baggageService.recover(request);
     }
 
+    /** 认领冻结登记：客服登记 claimKey、乘客核验摘要与冻结原因，行李进入 CLAIM_HOLD。 */
+    @PostMapping("/bags/claims/hold")
+    public ClaimHoldResponse holdClaim(@Valid @RequestBody HoldClaimRequest request) {
+        return baggageService.holdClaim(request);
+    }
+
+    /** 冻结复核：不同客服角色复核乘客核验摘要，摘要不匹配返回 422。 */
+    @PostMapping("/bags/claims/{claimKey}/review")
+    public ClaimHoldResponse reviewClaim(@PathVariable String claimKey,
+                                         @Valid @RequestBody ClaimReviewRequest request) {
+        if (!claimKey.equals(request.claimKey())) {
+            throw ApiException.unprocessable("路径 claimKey 与请求体不一致");
+        }
+        return baggageService.reviewClaim(request);
+    }
+
+    /** 解除冻结：复核客服第二次确认，原子恢复为冻结前可交接状态。 */
+    @PostMapping("/bags/claims/{claimKey}/release")
+    public ClaimHoldResponse releaseClaim(@PathVariable String claimKey,
+                                          @Valid @RequestBody ClaimReleaseRequest request) {
+        if (!claimKey.equals(request.claimKey())) {
+            throw ApiException.unprocessable("路径 claimKey 与请求体不一致");
+        }
+        return baggageService.releaseClaim(request);
+    }
+
+    /** 误交付差异登记：冻结行李被误交付只登记差异，不删除认领记录。 */
+    @PostMapping("/bags/claims/{claimKey}/delivery-difference")
+    public DeliveryDifferenceResponse registerDeliveryDifference(
+            @PathVariable String claimKey,
+            @Valid @RequestBody DeliveryDifferenceRequest request) {
+        if (!claimKey.equals(request.claimKey())) {
+            throw ApiException.unprocessable("路径 claimKey 与请求体不一致");
+        }
+        return baggageService.registerDeliveryDifference(request);
+    }
+
     /** 行李完整轨迹查询。 */
     @GetMapping("/bags/{bagTag}/trace")
     public BagResponse getBagTrace(@PathVariable String bagTag) {
         return baggageService.getBagTrace(bagTag);
+    }
+
+    /** 行李诊断只读查询：待乘航段、容量差额、生效冻结与可交接状态。 */
+    @GetMapping("/bags/{bagTag}/diagnostics")
+    public BagDiagnosticsResponse getBagDiagnostics(@PathVariable String bagTag) {
+        return baggageService.getBagDiagnostics(bagTag);
     }
 
     /** 封舱清单查询。 */
@@ -107,5 +157,11 @@ public class BaggageController {
     @GetMapping("/bags/short-unloaded")
     public ShortListResponse listShortUnloaded() {
         return baggageService.listShortUnloaded();
+    }
+
+    /** 认领冻结明细与不可变链查询。 */
+    @GetMapping("/bags/claims/{claimKey}")
+    public ClaimHoldResponse getClaimHold(@PathVariable String claimKey) {
+        return baggageService.getClaimHold(claimKey);
     }
 }
