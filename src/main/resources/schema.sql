@@ -112,3 +112,106 @@ COMMENT ON COLUMN idempotent_request.fingerprint IS '请求参数指纹（含路
 COMMENT ON COLUMN idempotent_request.response_status IS '首次成功响应的 HTTP 状态码，重放时原样返回';
 COMMENT ON COLUMN idempotent_request.response_body IS '首次成功响应体 JSON，重放时原样返回';
 COMMENT ON COLUMN idempotent_request.created_at IS '记录时间，Unix 毫秒，UTC';
+
+-- ============ 盲态代码退役 ============
+
+CREATE TABLE IF NOT EXISTS code_retirement (
+    id              VARCHAR(64)  NOT NULL,
+    experiment_id   VARCHAR(64)  NOT NULL,
+    reason          VARCHAR(500) NOT NULL,
+    operator_actor  VARCHAR(64)  NOT NULL,
+    status          VARCHAR(16)  NOT NULL,
+    created_at      BIGINT       NOT NULL,
+    committed_at    BIGINT       NOT NULL,
+    CONSTRAINT pk_code_retirement PRIMARY KEY (id),
+    CONSTRAINT ck_code_retirement_status CHECK (status IN ('COMMITTED'))
+);
+COMMENT ON TABLE  code_retirement IS '盲态代码退役批次表；退役为不可变事件，仅记录整批校验通过后一次事务提交的批次，无半成品行';
+COMMENT ON COLUMN code_retirement.id IS '退役批次编号，全局唯一';
+COMMENT ON COLUMN code_retirement.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN code_retirement.reason IS '退役原因，必填非空，最长500字符，提交后不可变';
+COMMENT ON COLUMN code_retirement.operator_actor IS '执行退役的操作者编号（X-Actor-Id，COORDINATOR），不可变';
+COMMENT ON COLUMN code_retirement.status IS '批次状态：COMMITTED=已提交（退役不支持撤销，不存在中间态）';
+COMMENT ON COLUMN code_retirement.created_at IS '批次业务时间，Unix 毫秒，UTC，取提交时刻，不可变';
+COMMENT ON COLUMN code_retirement.committed_at IS '事务提交时间，Unix 毫秒，UTC，与 created_at 同值，不可变';
+
+CREATE TABLE IF NOT EXISTS retired_code (
+    id                BIGINT       NOT NULL AUTO_INCREMENT,
+    retirement_id     VARCHAR(64)  NOT NULL,
+    experiment_id     VARCHAR(64)  NOT NULL,
+    treatment         VARCHAR(1)   NOT NULL,
+    quota_before      INT          NOT NULL,
+    sealed_count      INT          NOT NULL,
+    quota_after       INT          NOT NULL,
+    assigned_count    INT          NOT NULL,
+    created_at        BIGINT       NOT NULL,
+    CONSTRAINT pk_retired_code PRIMARY KEY (id),
+    CONSTRAINT uq_retired_code UNIQUE (retirement_id, treatment),
+    CONSTRAINT ck_retired_code_treatment CHECK (treatment IN ('A', 'B')),
+    CONSTRAINT ck_retired_code_counts CHECK (quota_before >= 0 AND sealed_count >= 0
+        AND quota_after >= 0 AND assigned_count >= 0)
+);
+COMMENT ON TABLE  retired_code IS '退役批次代码明细；每个批次每个处理代码至多一行，配额字段为提交时刻不可变快照';
+COMMENT ON COLUMN retired_code.retirement_id IS '所属退役批次编号';
+COMMENT ON COLUMN retired_code.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN retired_code.treatment IS '被退役的处理代码 A/B；同批次重复退役同一代码将冲突';
+COMMENT ON COLUMN retired_code.quota_before IS '退役前该代码总配额（席位数），单位：个';
+COMMENT ON COLUMN retired_code.sealed_count IS '本次原子封存的未分配序号数量，单位：个；必须大于0';
+COMMENT ON COLUMN retired_code.quota_after IS '退役后该代码有效配额=quota_before-sealed_count，单位：个，后续新分配不得超过';
+COMMENT ON COLUMN retired_code.assigned_count IS '提交时刻该代码已分配（占用席位，含退组）序号数量，单位：个';
+COMMENT ON COLUMN retired_code.created_at IS '明细写入时间，Unix 毫秒，UTC，不可变';
+
+CREATE TABLE IF NOT EXISTS sealed_seat (
+    id              BIGINT       NOT NULL AUTO_INCREMENT,
+    retirement_id   VARCHAR(64)  NOT NULL,
+    experiment_id   VARCHAR(64)  NOT NULL,
+    block_no        INT          NOT NULL,
+    seat_no         INT          NOT NULL,
+    treatment       VARCHAR(1)   NOT NULL,
+    created_at      BIGINT       NOT NULL,
+    CONSTRAINT pk_sealed_seat PRIMARY KEY (id),
+    CONSTRAINT uq_sealed_seat UNIQUE (experiment_id, block_no, seat_no),
+    CONSTRAINT ck_sealed_seat_block_no CHECK (block_no >= 1),
+    CONSTRAINT ck_sealed_seat_seat_no CHECK (seat_no BETWEEN 1 AND 4),
+    CONSTRAINT ck_sealed_seat_treatment CHECK (treatment IN ('A', 'B'))
+);
+COMMENT ON TABLE  sealed_seat IS '封存序号明细；退役时原子封存的未分配席位序号，与 allocation 唯一约束共同保证同一序号不能同时分配和封存';
+COMMENT ON COLUMN sealed_seat.retirement_id IS '封存该序号的退役批次编号，不可变';
+COMMENT ON COLUMN sealed_seat.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN sealed_seat.block_no IS '被封存序号所在区组号，从1开始';
+COMMENT ON COLUMN sealed_seat.seat_no IS '被封存的区组内席位序号1~4；封存后新分配永远跳过该序号';
+COMMENT ON COLUMN sealed_seat.treatment IS '被封存序号对应的处理代码 A/B，仅库内与诊断使用，不进入普通接口';
+COMMENT ON COLUMN sealed_seat.created_at IS '封存时间，Unix 毫秒，UTC，不可变';
+
+CREATE TABLE IF NOT EXISTS retirement_block_quota (
+    id                  BIGINT      NOT NULL AUTO_INCREMENT,
+    retirement_id       VARCHAR(64) NOT NULL,
+    experiment_id       VARCHAR(64) NOT NULL,
+    block_no            INT         NOT NULL,
+    available_before    INT         NOT NULL,
+    sealed_in_block     INT         NOT NULL,
+    available_after     INT         NOT NULL,
+    quota_a_after       INT         NOT NULL,
+    quota_b_after       INT         NOT NULL,
+    created_at          BIGINT      NOT NULL,
+    CONSTRAINT pk_retirement_block_quota PRIMARY KEY (id),
+    CONSTRAINT uq_retirement_block UNIQUE (retirement_id, block_no),
+    CONSTRAINT ck_retirement_block_no CHECK (block_no >= 1)
+);
+COMMENT ON TABLE  retirement_block_quota IS '退役批次的区组配额重算快照；每个批次覆盖实验全部区组各一行，数值为提交时刻不可变快照';
+COMMENT ON COLUMN retirement_block_quota.retirement_id IS '所属退役批次编号';
+COMMENT ON COLUMN retirement_block_quota.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN retirement_block_quota.block_no IS '区组号，从1开始';
+COMMENT ON COLUMN retirement_block_quota.available_before IS '退役前区组内可分配名额（未被占用的席位数），单位：个';
+COMMENT ON COLUMN retirement_block_quota.sealed_in_block IS '本次退役在该区组封存的序号数，单位：个';
+COMMENT ON COLUMN retirement_block_quota.available_after IS '退役后区组内可分配名额=available_before-sealed_in_block，单位：个';
+COMMENT ON COLUMN retirement_block_quota.quota_a_after IS '退役后区组内处理代码A的有效配额（未占用且未封存的A席位数），单位：个';
+COMMENT ON COLUMN retirement_block_quota.quota_b_after IS '退役后区组内处理代码B的有效配额（未占用且未封存的B席位数），单位：个';
+COMMENT ON COLUMN retirement_block_quota.created_at IS '快照写入时间，Unix 毫秒，UTC，不可变';
+COMMENT ON COLUMN idempotent_request.actor_id IS '首次成功调用的操作者编号，属于幂等参数的一部分';
+COMMENT ON COLUMN idempotent_request.role IS '首次成功调用的角色 COORDINATOR/REVIEWER，属于幂等参数的一部分';
+COMMENT ON COLUMN idempotent_request.operation IS '写操作标识，如 experiment.create/allocation.create';
+COMMENT ON COLUMN idempotent_request.fingerprint IS '请求参数指纹（含路径参数与请求体），与 actor/role 共同判定同参/异参';
+COMMENT ON COLUMN idempotent_request.response_status IS '首次成功响应的 HTTP 状态码，重放时原样返回';
+COMMENT ON COLUMN idempotent_request.response_body IS '首次成功响应体 JSON，重放时原样返回';
+COMMENT ON COLUMN idempotent_request.created_at IS '记录时间，Unix 毫秒，UTC';

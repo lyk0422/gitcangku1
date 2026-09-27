@@ -21,21 +21,20 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(ApiException.class)
     public ResponseEntity<ErrorBody> handleApi(ApiException ex) {
         return ResponseEntity.status(ex.getStatus())
-                .body(new ErrorBody(ex.getStatus().getReasonPhrase(), ex.getMessage()));
+                .body(new ErrorBody(ex.getStatus().value(), ex.getStatus().getReasonPhrase(),
+                        ex.getCode(), ex.getMessage()));
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ResponseEntity<ErrorBody> handleValidation(MethodArgumentNotValidException ex) {
         FieldError fieldError = ex.getBindingResult().getFieldError();
         String message = fieldError != null ? fieldError.getDefaultMessage() : "请求参数不合法";
-        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
-                .body(new ErrorBody(HttpStatus.BAD_REQUEST.getReasonPhrase(), message));
+        return body(HttpStatus.BAD_REQUEST, message);
     }
 
     @ExceptionHandler(HttpMessageNotReadableException.class)
     public ResponseEntity<ErrorBody> handleUnreadable(HttpMessageNotReadableException ex) {
-        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
-                .body(new ErrorBody(HttpStatus.BAD_REQUEST.getReasonPhrase(), "请求体格式不正确"));
+        return body(HttpStatus.BAD_REQUEST, "请求体格式不正确");
     }
 
     @ExceptionHandler(MissingRequestHeaderException.class)
@@ -43,7 +42,12 @@ public class GlobalExceptionHandler {
         String message = IdempotencyService.HEADER_REQUEST_ID.equals(ex.getHeaderName())
                 ? "写操作必须携带全局唯一 X-Request-Id 请求头"
                 : "缺少必需请求头: " + ex.getHeaderName();
-        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
-                .body(new ErrorBody(HttpStatus.BAD_REQUEST.getReasonPhrase(), message));
+        return body(HttpStatus.BAD_REQUEST, message);
+    }
+
+    private ResponseEntity<ErrorBody> body(HttpStatus status, String message) {
+        return ResponseEntity.status(status)
+                .body(new ErrorBody(status.value(), status.getReasonPhrase(),
+                        status.getReasonPhrase(), message));
     }
 }

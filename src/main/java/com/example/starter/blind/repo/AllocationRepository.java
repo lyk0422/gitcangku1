@@ -64,10 +64,12 @@ public class AllocationRepository {
     }
 
     /**
-     * 原子领取按区组、席位顺序排列的第一个空位：把尚未被占用的最小 block_no/seat_no
-     * 关联给新参与者。依赖 allocation(experiment_id, block_no, seat_no) 唯一索引兜底并发。
+     * 原子领取按区组、席位顺序排列的第一个空位：把尚未被占用、且未被退役封存的最小
+     * block_no/seat_no 关联给新参与者。依赖 allocation(experiment_id, block_no, seat_no)
+     * 唯一索引与 sealed_seat(experiment_id, block_no, seat_no) 唯一索引共同兜底并发，
+     * 保证同一序号不能同时被分配与封存。
      *
-     * @return 领取到的席位；实验满额时返回 null
+     * @return 领取到的席位；实验满额（含全部余量被封存）时返回 null
      */
     public VacantSeat takeFirstVacantSeat(String experimentId) {
         List<VacantSeat> seats = jdbc.query(
@@ -77,6 +79,9 @@ public class AllocationRepository {
                         + "AND a.block_no = s.block_no "
                         + "AND a.seat_no = s.seat_no "
                         + "WHERE s.experiment_id = ? AND a.id IS NULL "
+                        + "AND NOT EXISTS (SELECT 1 FROM sealed_seat ss "
+                        + "WHERE ss.experiment_id = s.experiment_id "
+                        + "AND ss.block_no = s.block_no AND ss.seat_no = s.seat_no) "
                         + "ORDER BY s.block_no, s.seat_no LIMIT 1",
                 (rs, n) -> new VacantSeat(rs.getInt(1), rs.getInt(2)),
                 experimentId);

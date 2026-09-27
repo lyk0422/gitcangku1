@@ -87,6 +87,18 @@ public class UnblindRequestRepository {
     }
 
     /**
+     * 统计实验内待审揭盲申请数量；退役前必须为 0（存在待揭盲紧急申请时拒绝退役）。
+     * 调用方须持有实验行锁，与揭盲申请按提交顺序串行裁决。
+     */
+    public long countPendingByExperiment(String experimentId) {
+        Long count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM unblind_request "
+                        + "WHERE experiment_id = ? AND status = 'PENDING'",
+                Long.class, experimentId);
+        return count == null ? 0 : count;
+    }
+
+    /**
      * 批准：仅 PENDING 可批准，写入处理代码、批准人与时间，并释放待审唯一占位。
      *
      * @return 受影响行数；0 表示不存在或已批准

@@ -51,6 +51,11 @@ public class UnblindService {
         if (reason.length() > 500) {
             throw ApiException.badRequest("reason 最长 500 字符");
         }
+        // 先取实验行锁：揭盲申请与退役、分配、关闭按提交顺序串行裁决，
+        // 避免退役封存与待揭盲紧急申请相互竞态。
+        if (experimentRepository.lockById(experimentId) == null) {
+            throw ApiException.notFound("实验不存在: " + experimentId);
+        }
         AllocationRow allocation =
                 experimentService.mustFindAllocationRow(experimentId, participantId);
         UnblindRequestRow pending =

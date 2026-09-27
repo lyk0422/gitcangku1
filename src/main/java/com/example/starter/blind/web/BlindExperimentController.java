@@ -7,11 +7,15 @@ import com.example.starter.blind.RequestTokens;
 import com.example.starter.blind.dto.AllocationView;
 import com.example.starter.blind.dto.CreateExperimentRequest;
 import com.example.starter.blind.dto.ExperimentView;
+import com.example.starter.blind.dto.RetireCodesRequest;
+import com.example.starter.blind.dto.RetirementView;
+import com.example.starter.blind.dto.SealedSeatView;
 import com.example.starter.blind.dto.UnblindApplyRequest;
 import com.example.starter.blind.dto.UnblindRequestView;
 import com.example.starter.blind.dto.UnblindResultView;
 import com.example.starter.blind.service.ExperimentService;
 import com.example.starter.blind.service.IdempotencyService;
+import com.example.starter.blind.service.RetirementService;
 import com.example.starter.blind.service.UnblindService;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
@@ -22,8 +26,10 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -40,18 +46,22 @@ public class BlindExperimentController {
     static final String OP_ALLOCATION_WITHDRAW = "allocation.withdraw";
     static final String OP_UNBLIND_APPLY = "unblind.apply";
     static final String OP_UNBLIND_APPROVE = "unblind.approve";
+    static final String OP_CODE_RETIRE = "code.retire";
 
     private final ExperimentService experimentService;
     private final UnblindService unblindService;
+    private final RetirementService retirementService;
     private final IdempotencyService idempotencyService;
     private final ActorContext actorContext;
 
     public BlindExperimentController(ExperimentService experimentService,
                                      UnblindService unblindService,
+                                     RetirementService retirementService,
                                      IdempotencyService idempotencyService,
                                      ActorContext actorContext) {
         this.experimentService = experimentService;
         this.unblindService = unblindService;
+        this.retirementService = retirementService;
         this.idempotencyService = idempotencyService;
         this.actorContext = actorContext;
     }
@@ -96,9 +106,7 @@ public class BlindExperimentController {
                         experimentService.close(expId)));
     }
 
-    // ---------------- 分配 / 退组 / 查询 ----------------
-
-    /** 登记参与者（仅 COORDINATOR）：原子领取第一个空位。 */
+    // ---------------- 分配 / 退组 / 查询 ----------------    /** 登记参与者（仅 COORDINATOR）：原子领取第一个空位。 */
     @PostMapping("/experiments/{experimentId}/participants/{participantId}/allocations")
     public ResponseEntity<String> register(
             @PathVariable String experimentId,
@@ -140,6 +148,68 @@ public class BlindExperimentController {
         return experimentService.getAllocation(
                 RequestTokens.requireId("experimentId", experimentId),
                 RequestTokens.requireId("participantId", participantId));
+    }
+
+    // ---------------- 盲态代码退役 ----------------
+
+    /**
+     * 退役一批处理代码（仅 COORDINATOR）：原子封存这些代码全部未分配序号并记录原因；
+     * 多代码先校验完整后态，任一失败整次回滚；写操作幂等。
+     */
+    @PostMapping("/experiments/{experimentId}/code-retirements")
+    public ResponseEntity<String> retireCodes(
+            @PathVariable String experimentId,
+            @Valid @RequestBody RetireCodesRequest request,
+            @RequestHeader(IdempotencyService.HEADER_REQUEST_ID) String requestId) {
+        Actor actor = requireCoordinator();
+        String expId = RequestTokens.requireId("experimentId", experimentId);
+        String reqId = RequestTokens.requireRequestId(requestId);
+        // 指纹覆盖操作者（幂等层）、操作类型与规范化对象集合：codes 去重排序后整体序列化，
+        // 不使用任何未转义分隔符拼接。
+        String fingerprint = idempotencyService.fingerprint(OP_CODE_RETIRE,
+                Map.of("experimentId", expId,
+                        "reason", request.reason(),
+                        "codes", normalizeCodes(request.codes())));
+        return idempotencyService.runWrite(reqId, OP_CODE_RETIRE, fingerprint, actor,
+                () -> IdempotencyService.WriteOutcome.of(HttpStatus.CREATED.value(),
+                        retirementService.retire(expId, request.reason(),
+                                request.codes(), actor.actorId())));
+    }
+
+    /** 退役批次历史（只读，两种角色均可）；时间区间左闭右开 [from, to)。 */
+    @GetMapping("/experiments/{experimentId}/code-retirements")
+    public List<RetirementView> listRetirements(
+            @PathVariable String experimentId,
+            @RequestParam(name = "from", required = false) Long fromInclusive,
+            @RequestParam(name = "to", required = false) Long toExclusive) {
+        requireActor();
+        return retirementService.listHistory(
+                RequestTokens.requireId("experimentId", experimentId), fromInclusive, toExclusive);
+    }
+
+    /** 退役批次详情（只读，两种角色均可）：代码与区组配额不可变快照。 */
+    @GetMapping("/code-retirements/{retirementId}")
+    public RetirementView getRetirement(@PathVariable String retirementId) {
+        requireActor();
+        return retirementService.getRetirement(
+                RequestTokens.requireId("retirementId", retirementId));
+    }
+
+    /** 封存序号明细（只读）；不返回席位号与处理代码，保持盲态纪律。 */
+    @GetMapping("/code-retirements/{retirementId}/sealed-seats")
+    public List<SealedSeatView> listSealedSeats(@PathVariable String retirementId) {
+        requireActor();
+        return retirementService.listSealedSeats(
+                RequestTokens.requireId("retirementId", retirementId));
+    }
+
+    /** 代码/区组配额诊断（只读）：实际值、要求值与差额由数量字段表达。 */
+    @GetMapping("/experiments/{experimentId}/retirement-diagnostics")
+    public com.example.starter.blind.dto.RetirementDiagnosticsView retirementDiagnostics(
+            @PathVariable String experimentId) {
+        requireActor();
+        return retirementService.diagnostics(
+                RequestTokens.requireId("experimentId", experimentId));
     }
 
     // ---------------- 揭盲 ----------------
@@ -196,6 +266,14 @@ public class BlindExperimentController {
     }
 
     // ---------------- 权限辅助（先于幂等回放执行） ----------------
+
+    /**
+     * 规范化代码集合：trim、去重、按字典序升序；作为幂等指纹的“规范化对象集合”，
+     * 以 JSON 数组整体参与哈希，不做分隔符拼接。
+     */
+    private static List<String> normalizeCodes(List<String> codes) {
+        return codes.stream().map(String::trim).distinct().sorted().toList();
+    }
 
     private Actor requireActor() {
         Actor actor = actorContext.get();
