@@ -15,6 +15,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
+import com.example.starter.maintenance.api.dto.DecommissionEquipmentRequest;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
@@ -67,6 +68,13 @@ public class EquipmentController {
     public MaintenanceResponse completeMaintenance(@PathVariable String equipmentId,
                                                    @Valid @RequestBody CompleteMaintenanceRequest req) {
         return service.completeMaintenance(equipmentId, req);
+    }
+
+    /** 停用设备：存在未结束隔离令（PENDING/ISOLATED）时返回 422；已停用设备不可再创建隔离令。 */
+    @PostMapping("/{equipmentId}/decommission")
+    public EquipmentResponse decommission(@PathVariable String equipmentId,
+                                          @Valid @RequestBody DecommissionEquipmentRequest req) {
+        return service.decommission(equipmentId, req);
     }
 
     /** 保养状态：本轮运行分钟 = 最新读数 - 最近保养锚点工时（无保养从 0 计），达到周期即 DUE。 */

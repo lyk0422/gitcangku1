@@ -9,6 +9,7 @@ import org.springframework.stereotype.Service;
 import com.example.starter.maintenance.api.ApiException;
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
+import com.example.starter.maintenance.api.dto.DecommissionEquipmentRequest;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
@@ -48,6 +49,12 @@ public class EquipmentService {
 
     public MaintenanceResponse completeMaintenance(String equipmentId, CompleteMaintenanceRequest req) {
         return txService.completeMaintenance(equipmentId, req);
+    }
+
+    public EquipmentResponse decommission(String equipmentId, DecommissionEquipmentRequest req) {
+        String fingerprint = equipmentId + "|" + req.expectedVersion() + "|" + req.operator();
+        return recoverDuplicateKey(req.requestId(), "DECOMMISSION_EQUIPMENT", fingerprint,
+                EquipmentResponse.class, () -> txService.decommission(equipmentId, req));
     }
 
     public StatusResponse getStatus(String equipmentId) {

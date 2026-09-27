@@ -11,6 +11,7 @@ import org.springframework.transaction.annotation.Transactional;
 import com.example.starter.maintenance.api.ApiException;
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
+import com.example.starter.maintenance.api.dto.DecommissionEquipmentRequest;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
@@ -19,9 +20,11 @@ import com.example.starter.maintenance.api.dto.ReviseReadingRequest;
 import com.example.starter.maintenance.api.dto.RevisionView;
 import com.example.starter.maintenance.api.dto.StatusResponse;
 import com.example.starter.maintenance.domain.Equipment;
+import com.example.starter.maintenance.domain.IsolationOrder;
 import com.example.starter.maintenance.domain.MaintenanceRecord;
 import com.example.starter.maintenance.domain.Reading;
 import com.example.starter.maintenance.store.EquipmentRepository;
+import com.example.starter.maintenance.store.IsolationRepository;
 
 /**
  * 设备工时保养事务业务服务。写操作流程：设备行锁 → 幂等判定 → 版本校验 → 业务规则 → 变更并版本加一。
@@ -31,12 +34,18 @@ import com.example.starter.maintenance.store.EquipmentRepository;
 public class EquipmentTxService {
 
     private final EquipmentRepository repository;
+    private final IsolationRepository isolationRepository;
     private final IdempotencyService idempotency;
+    private final IsolationTxService isolationTxService;
     private final Clock clock;
 
-    public EquipmentTxService(EquipmentRepository repository, IdempotencyService idempotency, Clock clock) {
+    public EquipmentTxService(EquipmentRepository repository, IsolationRepository isolationRepository,
+                              IdempotencyService idempotency, IsolationTxService isolationTxService,
+                              Clock clock) {
         this.repository = repository;
+        this.isolationRepository = isolationRepository;
         this.idempotency = idempotency;
+        this.isolationTxService = isolationTxService;
         this.clock = clock;
     }
 
@@ -51,7 +60,8 @@ public class EquipmentTxService {
                         throw ApiException.conflict("EQUIPMENT_EXISTS", "设备已存在：" + req.equipmentId());
                     }
                     repository.insertEquipment(req.equipmentId(), req.maintenancePeriodMinutes(), clock.instant());
-                    return new EquipmentResponse(req.equipmentId(), req.maintenancePeriodMinutes(), 1L);
+                    return new EquipmentResponse(req.equipmentId(), req.maintenancePeriodMinutes(), 1L,
+                            Equipment.ACTIVE);
                 });
     }
 
@@ -61,10 +71,24 @@ public class EquipmentTxService {
     public ReadingResponse addReading(String equipmentId, AddReadingRequest req) {
         Equipment equipment = lockEquipment(equipmentId);
         String fingerprint = equipmentId + "|" + req.readingId() + "|" + req.sampledAt()
-                + "|" + req.cumulativeMinutes() + "|" + req.expectedVersion();
+                + "|" + req.cumulativeMinutes() + "|" + req.expectedVersion()
+                + "|" + (req.operator() == null ? "" : req.operator());
         return idempotency.execute(req.requestId(), "ADD_READING", fingerprint,
                 ReadingResponse.class, () -> {
                     checkVersion(equipment, req.expectedVersion());
+                    // 能源隔离写入门禁：隔离令生效期间禁止新增运行读数（保养提交不受限）。
+                    // 与隔离生效按设备行锁的提交顺序裁决：此处持锁读到的 ISOLATED 即已提交生效。
+                    Optional<IsolationOrder> isolated =
+                            isolationRepository.findIsolatedOrderForEquipment(equipmentId);
+                    if (isolated.isPresent()) {
+                        // 固化被拒证据（独立事务提交，本事务随后回滚不占幂等键）。
+                        isolationTxService.recordRejectedReading(equipmentId, isolated.get().orderId(),
+                                req.readingId(), req.sampledAt(), req.cumulativeMinutes(),
+                                req.operator(), req.requestId());
+                        throw ApiException.conflict("EQUIPMENT_ISOLATED",
+                                "设备处于能源隔离中（隔离令 " + isolated.get().orderId()
+                                        + "），解除前不得提交新增运行读数");
+                    }
                     if (repository.findReading(equipmentId, req.readingId()).isPresent()) {
                         throw ApiException.conflict("READING_EXISTS", "读数已存在：" + req.readingId());
                     }
@@ -147,6 +171,33 @@ public class EquipmentTxService {
                     return new MaintenanceResponse(maintenanceId, equipmentId, req.readingId(),
                             req.anchorRevisionNo(), anchor.sampledAt(), anchor.cumulativeMinutes(),
                             now, equipment.version() + 1);
+                });
+    }
+
+    // ---------- 停用设备 ----------
+
+    @Transactional
+    public EquipmentResponse decommission(String equipmentId, DecommissionEquipmentRequest req) {
+        Equipment equipment = lockEquipment(equipmentId);
+        String fingerprint = equipmentId + "|" + req.expectedVersion() + "|" + req.operator();
+        return idempotency.execute(req.requestId(), "DECOMMISSION_EQUIPMENT", fingerprint,
+                EquipmentResponse.class, () -> {
+                    checkVersion(equipment, req.expectedVersion());
+                    if (Equipment.DECOMMISSIONED.equals(equipment.status())) {
+                        throw ApiException.conflict("EQUIPMENT_ALREADY_DECOMMISSIONED",
+                                "设备已停用：" + equipmentId);
+                    }
+                    Optional<IsolationOrder> open =
+                            isolationRepository.findOpenOrderForEquipment(equipmentId);
+                    if (open.isPresent()) {
+                        throw ApiException.unprocessable("OPEN_ISOLATION_EXISTS",
+                                "设备存在未结束的隔离令 " + open.get().orderId() + "（状态 "
+                                        + open.get().state() + "），须解除后方可停用");
+                    }
+                    repository.updateEquipmentStatus(equipmentId, Equipment.DECOMMISSIONED);
+                    repository.incrementVersion(equipmentId);
+                    return new EquipmentResponse(equipmentId, equipment.maintenancePeriodMinutes(),
+                            equipment.version() + 1, Equipment.DECOMMISSIONED);
                 });
     }
 

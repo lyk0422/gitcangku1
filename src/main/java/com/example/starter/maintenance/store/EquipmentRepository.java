@@ -41,7 +41,8 @@ public class EquipmentRepository {
     private static final RowMapper<Equipment> EQUIPMENT_MAPPER = (rs, rowNum) -> new Equipment(
             rs.getString("equipment_id"),
             rs.getLong("maintenance_period_minutes"),
-            rs.getLong("version"));
+            rs.getLong("version"),
+            rs.getString("status"));
 
     private static final RowMapper<Reading> READING_MAPPER = (rs, rowNum) -> new Reading(
             rs.getString("equipment_id"),
@@ -62,14 +63,15 @@ public class EquipmentRepository {
     // ---------- 设备 ----------
 
     public void insertEquipment(String equipmentId, long maintenancePeriodMinutes, Instant createdAt) {
-        jdbc.update("INSERT INTO equipment (equipment_id, maintenance_period_minutes, version, created_at)"
-                        + " VALUES (?, ?, 1, ?)",
-                equipmentId, maintenancePeriodMinutes, utc(createdAt));
+        jdbc.update("INSERT INTO equipment (equipment_id, maintenance_period_minutes, version, status, created_at)"
+                        + " VALUES (?, ?, 1, ?, ?)",
+                equipmentId, maintenancePeriodMinutes, Equipment.ACTIVE, utc(createdAt));
     }
 
     public Optional<Equipment> findEquipment(String equipmentId) {
         List<Equipment> rows = jdbc.query(
-                "SELECT equipment_id, maintenance_period_minutes, version FROM equipment WHERE equipment_id = ?",
+                "SELECT equipment_id, maintenance_period_minutes, version, status FROM equipment"
+                        + " WHERE equipment_id = ?",
                 EQUIPMENT_MAPPER, equipmentId);
         return rows.stream().findFirst();
     }
@@ -77,7 +79,7 @@ public class EquipmentRepository {
     /** 悲观行锁：同一设备的写操作串行化，保证版本校验与业务变更原子。 */
     public Optional<Equipment> findEquipmentForUpdate(String equipmentId) {
         List<Equipment> rows = jdbc.query(
-                "SELECT equipment_id, maintenance_period_minutes, version FROM equipment"
+                "SELECT equipment_id, maintenance_period_minutes, version, status FROM equipment"
                         + " WHERE equipment_id = ? FOR UPDATE",
                 EQUIPMENT_MAPPER, equipmentId);
         return rows.stream().findFirst();
@@ -85,6 +87,11 @@ public class EquipmentRepository {
 
     public void incrementVersion(String equipmentId) {
         jdbc.update("UPDATE equipment SET version = version + 1 WHERE equipment_id = ?", equipmentId);
+    }
+
+    /** 更新设备状态（ACTIVE/DECOMMISSIONED）。 */
+    public void updateEquipmentStatus(String equipmentId, String status) {
+        jdbc.update("UPDATE equipment SET status = ? WHERE equipment_id = ?", status, equipmentId);
     }
 
     // ---------- 读数 ----------
