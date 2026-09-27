@@ -13,6 +13,8 @@ import org.springframework.test.web.servlet.MvcResult;
 import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
 import org.springframework.test.web.servlet.request.MockMvcRequestBuilders;
 
+import com.example.starter.translation.service.BusinessClock;
+
 import java.util.UUID;
 
 /**
@@ -33,9 +35,15 @@ public abstract class AbstractIntegrationTest {
     @Autowired
     protected ObjectMapper objectMapper;
 
+    @Autowired
+    protected BusinessClock clock;
+
     @BeforeEach
     void cleanTables() {
+        clock.reset();
         jdbc.update("DELETE FROM approval");
+        jdbc.update("DELETE FROM conflict_event");
+        jdbc.update("DELETE FROM conflict_declaration");
         jdbc.update("DELETE FROM translation");
         jdbc.update("DELETE FROM segment");
         jdbc.update("DELETE FROM release_snapshot");
@@ -51,19 +59,23 @@ public abstract class AbstractIntegrationTest {
 
     /** POST JSON，返回响应状态与解析后的响应体。 */
     protected ApiResult postJson(String url, String body) throws Exception {
-        return perform(MockMvcRequestBuilders.post(url), body, null);
+        return perform(MockMvcRequestBuilders.post(url), body, null, null);
     }
 
     protected ApiResult postJson(String url, String body, String actorId) throws Exception {
-        return perform(MockMvcRequestBuilders.post(url), body, actorId);
+        return perform(MockMvcRequestBuilders.post(url), body, actorId, null);
+    }
+
+    protected ApiResult postJson(String url, String body, String actorId, String actorRole) throws Exception {
+        return perform(MockMvcRequestBuilders.post(url), body, actorId, actorRole);
     }
 
     protected ApiResult putJson(String url, String body) throws Exception {
-        return perform(MockMvcRequestBuilders.put(url), body, null);
+        return perform(MockMvcRequestBuilders.put(url), body, null, null);
     }
 
     protected ApiResult putJson(String url, String body, String actorId) throws Exception {
-        return perform(MockMvcRequestBuilders.put(url), body, actorId);
+        return perform(MockMvcRequestBuilders.put(url), body, actorId, null);
     }
 
     protected ApiResult getJson(String url) throws Exception {
@@ -71,11 +83,14 @@ public abstract class AbstractIntegrationTest {
         return toApiResult(result);
     }
 
-    private ApiResult perform(MockHttpServletRequestBuilder builder, String body, String actorId)
-            throws Exception {
+    private ApiResult perform(MockHttpServletRequestBuilder builder, String body, String actorId,
+                              String actorRole) throws Exception {
         builder.contentType("application/json").content(body);
         if (actorId != null) {
             builder.header("X-Actor-Id", actorId);
+        }
+        if (actorRole != null) {
+            builder.header("X-Actor-Role", actorRole);
         }
         MvcResult result = mockMvc.perform(builder).andReturn();
         return toApiResult(result);
@@ -113,6 +128,28 @@ public abstract class AbstractIntegrationTest {
         String body = "{\"requestId\":\"" + requestId + "\",\"translationVersion\":" + translationVersion + "}";
         return postJson("/api/documents/" + documentId + "/segments/" + segmentId + "/translations/" + language
                 + "/approve", body, actorId);
+    }
+
+    protected ApiResult reject(long documentId, String segmentId, String language, String actorId,
+                               int translationVersion, String reason, String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"translationVersion\":" + translationVersion
+                + ",\"reason\":\"" + reason + "\"}";
+        return postJson("/api/documents/" + documentId + "/segments/" + segmentId + "/translations/" + language
+                + "/reject", body, actorId);
+    }
+
+    /** 批量登记冲突：rangesJson 为范围数组，声明人取 actorId。 */
+    protected ApiResult registerConflicts(long documentId, String actorId, String rangesJson,
+                                          String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"ranges\":" + rangesJson + "}";
+        return postJson("/api/documents/" + documentId + "/conflicts", body, actorId);
+    }
+
+    protected ApiResult resolveConflict(long documentId, long conflictId, String actorId, String actorRole,
+                                        String reason, String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"reason\":\"" + reason + "\"}";
+        return postJson("/api/documents/" + documentId + "/conflicts/" + conflictId + "/resolve",
+                body, actorId, actorRole);
     }
 
     protected ApiResult publish(long documentId, int expectedDraftVersion, int expectedPublishedVersion,
