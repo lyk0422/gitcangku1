@@ -62,13 +62,16 @@ public class PlanService {
     private final IdempotencyRepository idemRepo;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate tx;
+    private final ConnectionService connectionService;
 
     public PlanService(PlanRepository planRepo, IdempotencyRepository idemRepo,
-                       ObjectMapper objectMapper, PlatformTransactionManager txManager) {
+                       ObjectMapper objectMapper, PlatformTransactionManager txManager,
+                       ConnectionService connectionService) {
         this.planRepo = planRepo;
         this.idemRepo = idemRepo;
         this.objectMapper = objectMapper;
         this.tx = new TransactionTemplate(txManager);
+        this.connectionService = connectionService;
     }
 
     /**
@@ -85,6 +88,11 @@ public class PlanService {
         try {
             return tx.execute(status -> {
                 if (planRepo.findByKey(req.scheduleKey()).isPresent()) {
+                    // 并发下同键请求可能读到先提交事务的结果：同参重放首次结果，异参 409
+                    Optional<PlanResponse> replayed = replayIfPresent(OP_CREATE, req.requestKey(), hash);
+                    if (replayed.isPresent()) {
+                        return replayed.get();
+                    }
                     throw conflict("SCHEDULE_KEY_EXISTS", "scheduleKey 已存在: " + req.scheduleKey());
                 }
                 long now = System.currentTimeMillis();
@@ -264,6 +272,9 @@ public class PlanService {
                 planRepo.updateStatus(oldPlan.id(), PlanStatus.CANCELLED, now);
                 planRepo.updateStatus(newPlan.id(), PlanStatus.PUBLISHED, now);
                 planRepo.insertRescheduleLink(oldPlan.id(), newPlan.id(), now);
+                // 同一事务内重算旧计划作为前车的全部直接接续：保障不足的后车标记
+                // CONNECTION_AT_RISK 并追加不可变风险记录（不自动修改后车）
+                connectionService.reevaluateAfterPredecessorReschedule(oldPlan, newPlan);
                 RescheduleResponse response = new RescheduleResponse(
                         loadPlan(oldScheduleKey), loadPlan(req.newScheduleKey()));
                 idemRepo.insert(OP_RESCHEDULE, req.requestKey(), hash, toJson(response), now);
@@ -342,7 +353,7 @@ public class PlanService {
                 .map(o -> new OccupancyView(o.trainNo(), o.sectionId(), o.startUtc(), o.endUtc()))
                 .toList();
         return new PlanResponse(plan.scheduleKey(), plan.opDate(), plan.version(),
-                plan.status().name(), views);
+                plan.status().name(), plan.connectionRisk().name(), views);
     }
 
     private List<Occupancy> toOccupancies(long planId, List<OccupancyRequest> requests) {
