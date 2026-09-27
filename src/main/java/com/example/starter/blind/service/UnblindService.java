@@ -40,7 +40,8 @@ public class UnblindService {
     }
 
     /**
-     * 协调员提出揭盲申请。
+     * 协调员提出揭盲申请。先取实验行锁，与代码退役、分配、区组扩容按提交顺序裁决，
+     * 保证“存在待揭盲紧急申请则不得退役”的校验不被并发绕过。
      */
     @Transactional
     public UnblindRequestView apply(String experimentId, String participantId,
@@ -50,6 +51,9 @@ public class UnblindService {
         }
         if (reason.length() > 500) {
             throw ApiException.badRequest("reason 最长 500 字符");
+        }
+        if (experimentRepository.lockById(experimentId) == null) {
+            throw ApiException.notFound("实验不存在: " + experimentId);
         }
         AllocationRow allocation =
                 experimentService.mustFindAllocationRow(experimentId, participantId);

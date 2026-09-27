@@ -9,27 +9,40 @@ CREATE TABLE IF NOT EXISTS experiment (
     CONSTRAINT ck_experiment_block_count CHECK (block_count BETWEEN 2 AND 8),
     CONSTRAINT ck_experiment_status CHECK (status IN ('OPEN', 'CLOSED'))
 );
-COMMENT ON TABLE  experiment IS '实验表，experimentId 全局唯一，创建后区组数量与席位内容不可修改';
+COMMENT ON TABLE  experiment IS '实验表，experimentId 全局唯一；区组仅可经扩容追加（不重排既有分配），席位内容创建后不可修改';
 COMMENT ON COLUMN experiment.id IS '实验编号，业务唯一，创建时由请求给定';
-COMMENT ON COLUMN experiment.block_count IS '区组数量，取值2~8，创建时固定，每组固定4个席位';
+COMMENT ON COLUMN experiment.block_count IS '区组数量，取值2~8；创建时给定，扩容仅追加更大区组号，不缩减';
 COMMENT ON COLUMN experiment.status IS '实验状态：OPEN=开放登记；CLOSED=已关闭，关闭后拒绝新增分配';
 COMMENT ON COLUMN experiment.created_at IS '创建时间，Unix 毫秒，UTC';
 
 CREATE TABLE IF NOT EXISTS seat (
-    experiment_id VARCHAR(64) NOT NULL,
-    block_no      INT         NOT NULL,
-    seat_no       INT         NOT NULL,
-    treatment     VARCHAR(1)  NOT NULL,
+    experiment_id              VARCHAR(64) NOT NULL,
+    block_no                   INT         NOT NULL,
+    seat_no                    INT         NOT NULL,
+    treatment                  VARCHAR(1)  NOT NULL,
+    status                     VARCHAR(16) NOT NULL DEFAULT 'ACTIVE',
+    sealed_by_retirement_id    VARCHAR(64),
+    sealed_at                  BIGINT,
     CONSTRAINT pk_seat PRIMARY KEY (experiment_id, block_no, seat_no),
     CONSTRAINT ck_seat_block_no CHECK (block_no >= 1),
     CONSTRAINT ck_seat_seat_no CHECK (seat_no BETWEEN 1 AND 4),
-    CONSTRAINT ck_seat_treatment CHECK (treatment IN ('A', 'B'))
+    CONSTRAINT ck_seat_treatment CHECK (treatment IN ('A', 'B')),
+    CONSTRAINT ck_seat_status CHECK (status IN ('ACTIVE', 'SEALED')),
+    CONSTRAINT ck_seat_sealed_fields CHECK (
+        (status = 'ACTIVE' AND sealed_by_retirement_id IS NULL AND sealed_at IS NULL)
+        OR status = 'SEALED')
 );
-COMMENT ON TABLE  seat IS '席位表（处理映射）：每区组4席，按提交顺序固定两个A两个B，之后不可改；仅保存于数据库';
+COMMENT ON TABLE  seat IS '席位表（处理映射）：创建时每区组4席，按提交顺序固定两个A两个B，之后处理映射不可改；代码退役仅把未占席位封存(SEALED)，不改既有映射；退役后扩容的新区组只包含未退役代码的席位；仅保存于数据库';
 COMMENT ON COLUMN seat.experiment_id IS '所属实验编号';
-COMMENT ON COLUMN seat.block_no IS '区组号，从1开始，按区组顺序分配';
+COMMENT ON COLUMN seat.block_no IS '区组号，从1开始，按区组顺序分配；扩容仅追加更大区组号，不重排';
 COMMENT ON COLUMN seat.seat_no IS '区组内席位号1~4，属于可直接解码信息，禁止通过普通接口暴露';
 COMMENT ON COLUMN seat.treatment IS '处理代码 A 或 B，盲底，仅揭盲批准后可返回给申请人';
+COMMENT ON COLUMN seat.status IS '席位状态：ACTIVE=可分配；SEALED=随处理代码退役而封存，永不再分配。同一席位不能同时被分配与封存';
+COMMENT ON COLUMN seat.sealed_by_retirement_id IS '封存该席位的退役批次编号；NULL 表示未封存';
+COMMENT ON COLUMN seat.sealed_at IS '封存时间，Unix 毫秒，UTC；NULL 表示未封存';
+
+CREATE INDEX IF NOT EXISTS idx_seat_exp_treatment_status
+    ON seat (experiment_id, treatment, status);
 
 CREATE TABLE IF NOT EXISTS allocation (
     id             BIGINT       NOT NULL AUTO_INCREMENT,
@@ -112,3 +125,63 @@ COMMENT ON COLUMN idempotent_request.fingerprint IS '请求参数指纹（含路
 COMMENT ON COLUMN idempotent_request.response_status IS '首次成功响应的 HTTP 状态码，重放时原样返回';
 COMMENT ON COLUMN idempotent_request.response_body IS '首次成功响应体 JSON，重放时原样返回';
 COMMENT ON COLUMN idempotent_request.created_at IS '记录时间，Unix 毫秒，UTC';
+
+CREATE TABLE IF NOT EXISTS code_retirement (
+    id              VARCHAR(64)  NOT NULL,
+    experiment_id   VARCHAR(64)  NOT NULL,
+    reason          VARCHAR(500) NOT NULL,
+    actor_id        VARCHAR(64)  NOT NULL,
+    created_at      BIGINT       NOT NULL,
+    CONSTRAINT pk_code_retirement PRIMARY KEY (id)
+);
+COMMENT ON TABLE  code_retirement IS '处理代码退役批次表；一次批次可退役多个代码，批次、理由与封存结果不可变';
+COMMENT ON COLUMN code_retirement.id IS '退役批次编号，全局唯一';
+COMMENT ON COLUMN code_retirement.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN code_retirement.reason IS '退役理由，必填，写入后不可变';
+COMMENT ON COLUMN code_retirement.actor_id IS '执行退役的操作者编号（X-Actor-Id），须为 COORDINATOR';
+COMMENT ON COLUMN code_retirement.created_at IS '退役时间，Unix 毫秒，UTC';
+
+CREATE TABLE IF NOT EXISTS retired_code (
+    retirement_id      VARCHAR(64) NOT NULL,
+    experiment_id      VARCHAR(64) NOT NULL,
+    treatment          VARCHAR(1)  NOT NULL,
+    allocated_count    INT         NOT NULL,
+    sealed_count       INT         NOT NULL,
+    quota_before       INT         NOT NULL,
+    quota_after        INT         NOT NULL,
+    CONSTRAINT pk_retired_code PRIMARY KEY (retirement_id, treatment),
+    CONSTRAINT uq_retired_code UNIQUE (experiment_id, treatment),
+    CONSTRAINT ck_retired_code_treatment CHECK (treatment IN ('A', 'B')),
+    CONSTRAINT ck_retired_code_counts CHECK (
+        allocated_count >= 0 AND sealed_count >= 0
+        AND quota_before >= 0 AND quota_after >= 0)
+);
+COMMENT ON TABLE  retired_code IS '退役代码明细表；记录退役时刻的配额快照，写入后不可变；同一实验同一代码只能退役一次';
+COMMENT ON COLUMN retired_code.retirement_id IS '所属退役批次编号';
+COMMENT ON COLUMN retired_code.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN retired_code.treatment IS '被退役的处理代码 A/B；退役后不再参与新分配与扩容';
+COMMENT ON COLUMN retired_code.allocated_count IS '退役时该代码已分配的席位数即参与者数，保持有效且继续不暴露代码';
+COMMENT ON COLUMN retired_code.sealed_count IS '退役时封存的未分配序号数，即区组可用名额与代码配额的核减量';
+COMMENT ON COLUMN retired_code.quota_before IS '退役前该代码总配额（每区组2席 × 区组数）';
+COMMENT ON COLUMN retired_code.quota_after IS '退役后该代码剩余可分配配额，恒为 0';
+
+CREATE TABLE IF NOT EXISTS sealed_seat (
+    id              BIGINT       NOT NULL AUTO_INCREMENT,
+    retirement_id   VARCHAR(64)  NOT NULL,
+    experiment_id   VARCHAR(64)  NOT NULL,
+    treatment       VARCHAR(1)   NOT NULL,
+    block_no        INT          NOT NULL,
+    seat_no         INT          NOT NULL,
+    sealed_at       BIGINT       NOT NULL,
+    CONSTRAINT pk_sealed_seat PRIMARY KEY (id),
+    CONSTRAINT uq_sealed_seat UNIQUE (experiment_id, block_no, seat_no),
+    CONSTRAINT ck_sealed_seat_treatment CHECK (treatment IN ('A', 'B'))
+);
+COMMENT ON TABLE  sealed_seat IS '封存序号明细表；退役时原子封存该代码全部未分配席位，记录不可变；同一席位至多封存一次';
+COMMENT ON COLUMN sealed_seat.id IS '封存记录自增主键';
+COMMENT ON COLUMN sealed_seat.retirement_id IS '所属退役批次编号';
+COMMENT ON COLUMN sealed_seat.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN sealed_seat.treatment IS '被封存席位对应的处理代码 A/B';
+COMMENT ON COLUMN sealed_seat.block_no IS '封存席位所在区组号';
+COMMENT ON COLUMN sealed_seat.seat_no IS '封存席位号；仅退役诊断接口可见，普通接口不暴露';
+COMMENT ON COLUMN sealed_seat.sealed_at IS '封存时间，Unix 毫秒，UTC';

@@ -64,8 +64,10 @@ public class AllocationRepository {
     }
 
     /**
-     * 原子领取按区组、席位顺序排列的第一个空位：把尚未被占用的最小 block_no/seat_no
-     * 关联给新参与者。依赖 allocation(experiment_id, block_no, seat_no) 唯一索引兜底并发。
+     * 原子领取按区组、席位顺序排列的第一个空位：把尚未被占用且未封存的最小
+     * block_no/seat_no 关联给新参与者。封存（SEALED）席位永不再分配，
+     * 退役代码的未分配席位因此被排除。依赖 allocation(experiment_id, block_no, seat_no)
+     * 唯一索引兜底并发。
      *
      * @return 领取到的席位；实验满额时返回 null
      */
@@ -76,7 +78,7 @@ public class AllocationRepository {
                         + "ON a.experiment_id = s.experiment_id "
                         + "AND a.block_no = s.block_no "
                         + "AND a.seat_no = s.seat_no "
-                        + "WHERE s.experiment_id = ? AND a.id IS NULL "
+                        + "WHERE s.experiment_id = ? AND s.status = 'ACTIVE' AND a.id IS NULL "
                         + "ORDER BY s.block_no, s.seat_no LIMIT 1",
                 (rs, n) -> new VacantSeat(rs.getInt(1), rs.getInt(2)),
                 experimentId);
@@ -118,5 +120,52 @@ public class AllocationRepository {
 
     public boolean isDuplicateBlindCode(DuplicateKeyException e) {
         return e.getMessage() != null && e.getMessage().contains("uq_allocation_blind_code");
+    }
+
+    /**
+     * 指定代码的全部未分配 ACTIVE 席位（待封存序号），按区组号、席位号升序。
+     * 调用方须持有实验行锁，保证与并发分配互斥。
+     */
+    public List<VacantSeat> findUnallocatedActiveSeats(String experimentId, String treatment) {
+        return jdbc.query(
+                "SELECT s.block_no, s.seat_no FROM seat s "
+                        + "LEFT JOIN allocation a "
+                        + "ON a.experiment_id = s.experiment_id "
+                        + "AND a.block_no = s.block_no AND a.seat_no = s.seat_no "
+                        + "WHERE s.experiment_id = ? AND s.treatment = ? AND s.status = 'ACTIVE' "
+                        + "AND a.id IS NULL "
+                        + "ORDER BY s.block_no, s.seat_no",
+                (rs, n) -> new VacantSeat(rs.getInt(1), rs.getInt(2)),
+                experimentId, treatment);
+    }
+
+    /** 指定代码已分配的席位数（含已退组，席位不释放）。 */
+    public long countAllocatedByTreatment(String experimentId, String treatment) {
+        Long count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM allocation a JOIN seat s "
+                        + "ON s.experiment_id = a.experiment_id "
+                        + "AND s.block_no = a.block_no AND s.seat_no = a.seat_no "
+                        + "WHERE a.experiment_id = ? AND s.treatment = ?",
+                Long.class, experimentId, treatment);
+        return count == null ? 0 : count;
+    }
+
+    /**
+     * 各代码的未分配 ACTIVE 席位数（待封存数量）；key 为处理代码。
+     */
+    public java.util.Map<String, Long> countUnallocatedActiveByTreatment(String experimentId) {
+        java.util.Map<String, Long> result = new java.util.HashMap<>();
+        jdbc.query(
+                "SELECT s.treatment, COUNT(*) AS cnt FROM seat s "
+                        + "LEFT JOIN allocation a "
+                        + "ON a.experiment_id = s.experiment_id "
+                        + "AND a.block_no = s.block_no AND a.seat_no = s.seat_no "
+                        + "WHERE s.experiment_id = ? AND s.status = 'ACTIVE' AND a.id IS NULL "
+                        + "GROUP BY s.treatment",
+                rs -> {
+                    result.put(rs.getString("treatment"), rs.getLong("cnt"));
+                },
+                experimentId);
+        return result;
     }
 }

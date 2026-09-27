@@ -1,21 +1,28 @@
 package com.example.starter.blind.service;
 
 import com.example.starter.blind.ApiException;
+import com.example.starter.blind.BusinessException;
 import com.example.starter.blind.Clock;
 import com.example.starter.blind.dto.AllocationView;
+import com.example.starter.blind.dto.ExpansionView;
 import com.example.starter.blind.dto.ExperimentView;
+import com.example.starter.blind.dto.ViolationView;
 import com.example.starter.blind.repo.AllocationRepository;
 import com.example.starter.blind.repo.AllocationRepository.AllocationRow;
 import com.example.starter.blind.repo.AllocationRepository.VacantSeat;
 import com.example.starter.blind.repo.ExperimentRepository;
 import com.example.starter.blind.repo.ExperimentRepository.ExperimentRow;
 import com.example.starter.blind.repo.ExperimentRepository.SeatRow;
+import com.example.starter.blind.repo.RetirementRepository;
 import org.springframework.dao.DuplicateKeyException;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * 实验与分配核心业务：
@@ -27,17 +34,28 @@ public class ExperimentService {
 
     static final int SEATS_PER_BLOCK = 4;
 
+    /** 区组总数上限，与 ck_experiment_block_count 一致。 */
+    static final int MAX_BLOCKS = 8;
+
+    /** 违规原因码：实验已关闭，拒绝扩容。 */
+    public static final String EXPERIMENT_CLOSED = "EXPERIMENT_CLOSED";
+    /** 违规原因码：扩容后区组总数超过上限。 */
+    public static final String EXPANSION_EXCEEDS_MAX = "EXPANSION_EXCEEDS_MAX";
+
     private final ExperimentRepository experimentRepository;
     private final AllocationRepository allocationRepository;
+    private final RetirementRepository retirementRepository;
     private final BlindCodeGenerator blindCodeGenerator;
     private final Clock clock;
 
     public ExperimentService(ExperimentRepository experimentRepository,
                              AllocationRepository allocationRepository,
+                             RetirementRepository retirementRepository,
                              BlindCodeGenerator blindCodeGenerator,
                              Clock clock) {
         this.experimentRepository = experimentRepository;
         this.allocationRepository = allocationRepository;
+        this.retirementRepository = retirementRepository;
         this.blindCodeGenerator = blindCodeGenerator;
         this.clock = clock;
     }
@@ -198,5 +216,51 @@ public class ExperimentService {
     private AllocationView toView(AllocationRow row) {
         return new AllocationView(row.experimentId(), row.participantId(), row.blindCode(),
                 row.blockNo(), row.status(), row.assignedAt(), row.withdrawnAt());
+    }
+
+    /**
+     * 区组扩容：仅追加更大区组号，不重排已分配参与者；与退役、分配、揭盲申请
+     * 共用实验行锁按提交顺序裁决。已退役代码不产生新席位，新区组只包含未退役
+     * 代码的席位（沿用创建时的席位号设计：A=1,2；B=3,4）。
+     */
+    @Transactional
+    public ExpansionView expand(String experimentId, int additionalBlocks) {
+        ExperimentRow experiment = experimentRepository.lockById(experimentId);
+        if (experiment == null) {
+            throw ApiException.notFound("实验不存在: " + experimentId);
+        }
+        if ("CLOSED".equals(experiment.status())) {
+            throw BusinessException.single(HttpStatus.CONFLICT,
+                    new ViolationView(null, EXPERIMENT_CLOSED,
+                            "实验已关闭，拒绝区组扩容", null, null, null));
+        }
+        int current = experiment.blockCount();
+        int requestedTotal = current + additionalBlocks;
+        if (requestedTotal > MAX_BLOCKS) {
+            throw BusinessException.single(HttpStatus.UNPROCESSABLE_ENTITY,
+                    new ViolationView(null, EXPANSION_EXCEEDS_MAX,
+                            "扩容后区组总数超过上限",
+                            (long) requestedTotal, (long) MAX_BLOCKS,
+                            (long) (requestedTotal - MAX_BLOCKS)));
+        }
+        Set<String> retired =
+                new HashSet<>(retirementRepository.findRetiredTreatments(experimentId));
+        int addedSeats = 0;
+        for (int blockNo = current + 1; blockNo <= requestedTotal; blockNo++) {
+            for (String treatment : new String[]{"A", "B"}) {
+                if (retired.contains(treatment)) {
+                    continue;
+                }
+                int firstSeat = "A".equals(treatment) ? 1 : 3;
+                for (int seatNo = firstSeat; seatNo < firstSeat + 2; seatNo++) {
+                    experimentRepository.insertSeat(
+                            new SeatRow(experimentId, blockNo, seatNo, treatment));
+                    addedSeats++;
+                }
+            }
+        }
+        experimentRepository.updateBlockCount(experimentId, requestedTotal);
+        return new ExpansionView(experimentId, additionalBlocks, requestedTotal,
+                addedSeats, experiment.status());
     }
 }

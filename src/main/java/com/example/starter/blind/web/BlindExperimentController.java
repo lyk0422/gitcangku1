@@ -5,13 +5,19 @@ import com.example.starter.blind.ActorContext;
 import com.example.starter.blind.ApiException;
 import com.example.starter.blind.RequestTokens;
 import com.example.starter.blind.dto.AllocationView;
+import com.example.starter.blind.dto.CapacityView;
 import com.example.starter.blind.dto.CreateExperimentRequest;
+import com.example.starter.blind.dto.ExpandBlocksRequest;
 import com.example.starter.blind.dto.ExperimentView;
+import com.example.starter.blind.dto.RetireCodesRequest;
+import com.example.starter.blind.dto.RetirementDetailView;
+import com.example.starter.blind.dto.RetirementListView;
 import com.example.starter.blind.dto.UnblindApplyRequest;
 import com.example.starter.blind.dto.UnblindRequestView;
 import com.example.starter.blind.dto.UnblindResultView;
 import com.example.starter.blind.service.ExperimentService;
 import com.example.starter.blind.service.IdempotencyService;
+import com.example.starter.blind.service.RetirementService;
 import com.example.starter.blind.service.UnblindService;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
@@ -22,8 +28,10 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -36,22 +44,27 @@ public class BlindExperimentController {
 
     static final String OP_EXPERIMENT_CREATE = "experiment.create";
     static final String OP_EXPERIMENT_CLOSE = "experiment.close";
+    static final String OP_EXPERIMENT_EXPAND = "experiment.expand";
     static final String OP_ALLOCATION_CREATE = "allocation.create";
     static final String OP_ALLOCATION_WITHDRAW = "allocation.withdraw";
     static final String OP_UNBLIND_APPLY = "unblind.apply";
     static final String OP_UNBLIND_APPROVE = "unblind.approve";
+    static final String OP_CODE_RETIRE = "code.retire";
 
     private final ExperimentService experimentService;
     private final UnblindService unblindService;
+    private final RetirementService retirementService;
     private final IdempotencyService idempotencyService;
     private final ActorContext actorContext;
 
     public BlindExperimentController(ExperimentService experimentService,
                                      UnblindService unblindService,
+                                     RetirementService retirementService,
                                      IdempotencyService idempotencyService,
                                      ActorContext actorContext) {
         this.experimentService = experimentService;
         this.unblindService = unblindService;
+        this.retirementService = retirementService;
         this.idempotencyService = idempotencyService;
         this.actorContext = actorContext;
     }
@@ -193,6 +206,74 @@ public class BlindExperimentController {
         Actor actor = requireActor();
         return unblindService.getResult(
                 RequestTokens.requireId("unblindRequestId", unblindRequestId), actor.actorId());
+    }
+
+    // ---------------- 代码退役 / 区组扩容 / 容量诊断 ----------------
+
+    /**
+     * 退役一批处理代码（仅 COORDINATOR）：整批校验完整后态后一次事务提交，
+     * 原子封存各代码全部未分配序号；任一失败整次回滚并返回可区分原因。
+     * 代码集合先规范化（去重、排序、大写）再参与幂等指纹与业务裁决。
+     */
+    @PostMapping("/experiments/{experimentId}/code-retirements")
+    public ResponseEntity<String> retireCodes(
+            @PathVariable String experimentId,
+            @Valid @RequestBody RetireCodesRequest request,
+            @RequestHeader(IdempotencyService.HEADER_REQUEST_ID) String requestId) {
+        Actor actor = requireCoordinator();
+        String expId = RequestTokens.requireId("experimentId", experimentId);
+        String reqId = RequestTokens.requireRequestId(requestId);
+        List<String> codes = RetirementService.normalizeCodes(request.codes());
+        String fingerprint = idempotencyService.fingerprint(OP_CODE_RETIRE,
+                Map.of("experimentId", expId, "codes", codes, "reason", request.reason()));
+        return idempotencyService.runWrite(reqId, OP_CODE_RETIRE, fingerprint, actor,
+                () -> IdempotencyService.WriteOutcome.of(HttpStatus.CREATED.value(),
+                        retirementService.retire(expId, codes, request.reason(), actor.actorId())));
+    }
+
+    /** 退役历史（两种角色均可）：只读，按退役时间升序；from/to 为 UTC 毫秒，左闭右开。 */
+    @GetMapping("/experiments/{experimentId}/code-retirements")
+    public RetirementListView listRetirements(
+            @PathVariable String experimentId,
+            @RequestParam(required = false) Long from,
+            @RequestParam(required = false) Long to) {
+        requireActor();
+        return retirementService.listHistory(
+                RequestTokens.requireId("experimentId", experimentId), from, to);
+    }
+
+    /** 退役明细（仅 COORDINATOR）：只读，含封存序号。 */
+    @GetMapping("/experiments/{experimentId}/code-retirements/{retirementId}")
+    public RetirementDetailView getRetirement(
+            @PathVariable String experimentId,
+            @PathVariable String retirementId) {
+        requireCoordinator();
+        return retirementService.getDetail(
+                RequestTokens.requireId("experimentId", experimentId),
+                RequestTokens.requireId("retirementId", retirementId));
+    }
+
+    /** 容量诊断（两种角色均可）：只读，区组可用名额与代码配额按封存数量实时重算。 */
+    @GetMapping("/experiments/{experimentId}/capacity")
+    public CapacityView getCapacity(@PathVariable String experimentId) {
+        requireActor();
+        return retirementService.getCapacity(RequestTokens.requireId("experimentId", experimentId));
+    }
+
+    /** 区组扩容（仅 COORDINATOR）：仅追加区组，不重排已分配参与者；已退役代码不产生新席位。 */
+    @PostMapping("/experiments/{experimentId}/blocks")
+    public ResponseEntity<String> expandBlocks(
+            @PathVariable String experimentId,
+            @Valid @RequestBody ExpandBlocksRequest request,
+            @RequestHeader(IdempotencyService.HEADER_REQUEST_ID) String requestId) {
+        Actor actor = requireCoordinator();
+        String expId = RequestTokens.requireId("experimentId", experimentId);
+        String reqId = RequestTokens.requireRequestId(requestId);
+        String fingerprint = idempotencyService.fingerprint(OP_EXPERIMENT_EXPAND,
+                Map.of("experimentId", expId, "additionalBlocks", request.additionalBlocks()));
+        return idempotencyService.runWrite(reqId, OP_EXPERIMENT_EXPAND, fingerprint, actor,
+                () -> IdempotencyService.WriteOutcome.of(HttpStatus.CREATED.value(),
+                        experimentService.expand(expId, request.additionalBlocks())));
     }
 
     // ---------------- 权限辅助（先于幂等回放执行） ----------------

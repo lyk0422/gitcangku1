@@ -1,6 +1,8 @@
 package com.example.starter.blind.web;
 
 import com.example.starter.blind.ApiException;
+import com.example.starter.blind.BusinessException;
+import com.example.starter.blind.dto.BusinessErrorBody;
 import com.example.starter.blind.dto.ErrorBody;
 import com.example.starter.blind.service.IdempotencyService;
 import org.springframework.http.HttpStatus;
@@ -22,6 +24,14 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorBody> handleApi(ApiException ex) {
         return ResponseEntity.status(ex.getStatus())
                 .body(new ErrorBody(ex.getStatus().getReasonPhrase(), ex.getMessage()));
+    }
+
+    /** 业务规则异常：返回可区分的违规明细，数量类违规含实际值/要求值/差额。 */
+    @ExceptionHandler(BusinessException.class)
+    public ResponseEntity<BusinessErrorBody> handleBusiness(BusinessException ex) {
+        return ResponseEntity.status(ex.getStatus())
+                .body(new BusinessErrorBody(ex.getStatus().getReasonPhrase(),
+                        ex.getMessage(), ex.getViolations()));
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)

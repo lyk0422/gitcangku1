@@ -97,4 +97,24 @@ public class UnblindRequestRepository {
                         + "WHERE id = ? AND status = 'PENDING'",
                 reviewerActor, treatment, reviewedAt, requestId);
     }
+
+    /**
+     * 各处理代码当前待审（PENDING）揭盲申请数；key 为处理代码。
+     * 用于代码退役前校验“存在待揭盲紧急申请”。
+     */
+    public java.util.Map<String, Long> countPendingByTreatment(String experimentId) {
+        java.util.Map<String, Long> result = new java.util.HashMap<>();
+        jdbc.query(
+                "SELECT s.treatment, COUNT(*) AS cnt FROM unblind_request u "
+                        + "JOIN allocation a ON a.id = u.allocation_id "
+                        + "JOIN seat s ON s.experiment_id = a.experiment_id "
+                        + "AND s.block_no = a.block_no AND s.seat_no = a.seat_no "
+                        + "WHERE u.experiment_id = ? AND u.status = 'PENDING' "
+                        + "GROUP BY s.treatment",
+                rs -> {
+                    result.put(rs.getString("treatment"), rs.getLong("cnt"));
+                },
+                experimentId);
+        return result;
+    }
 }
