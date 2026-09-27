@@ -36,11 +36,40 @@ CREATE TABLE IF NOT EXISTS rollout_task (
   device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
   status VARCHAR(16) NOT NULL COMMENT 'PENDING待回执；SUCCESS成功；FAILED失败；CANCELLED已取消',
   first_result VARCHAR(16) NULL COMMENT '首次回执结果（SUCCESS/FAILED），未回执为NULL',
+  cert_chain_version VARCHAR(64) NULL COMMENT '任务创建时固化的签名证书链版本；目标固件未登记证书链时为NULL',
+  review_status VARCHAR(32) NOT NULL DEFAULT 'NONE' COMMENT '复核状态：NONE无需复核；CERTIFICATE_REVOKED_REVIEW证书已撤销待人工复核；CONFIRMED已人工确认',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
   PRIMARY KEY (id),
   CONSTRAINT uk_task_release_device UNIQUE (release_id, device_id)
 ) COMMENT='设备投放任务，同设备同发布单最多一条';
+
+CREATE TABLE IF NOT EXISTS cert_chain (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '证书链ID',
+  firmware_version VARCHAR(64) NOT NULL COMMENT '目标固件版本',
+  chain_version VARCHAR(64) NOT NULL COMMENT '证书链版本，同固件版本内唯一',
+  valid_from_utc VARCHAR(40) NOT NULL COMMENT '生效时刻，UTC，ISO-8601格式（含），半开区间起点',
+  valid_to_utc VARCHAR(40) NULL COMMENT '失效时刻，UTC，ISO-8601格式（不含），NULL表示长期有效',
+  device_set CLOB NOT NULL COMMENT '信任该链的设备ID集合（JSON数组），空数组表示全部设备信任',
+  operator VARCHAR(64) NOT NULL COMMENT '登记/轮换操作者',
+  revoked BOOLEAN NOT NULL DEFAULT FALSE COMMENT '是否已撤销，撤销后不再作为有效链',
+  revoked_at_utc VARCHAR(40) NULL COMMENT '撤销时刻，UTC，ISO-8601格式，未撤销为NULL',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '登记时间',
+  PRIMARY KEY (id),
+  CONSTRAINT uk_cert_chain UNIQUE (firmware_version, chain_version)
+) COMMENT='固件签名证书链，同一固件版本任意时刻至多一条未撤销且区间覆盖的有效链';
+
+CREATE TABLE IF NOT EXISTS cert_rejection_record (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '拒绝记录ID',
+  operation VARCHAR(32) NOT NULL COMMENT '被拒绝的操作：REGISTER/ROTATE/REVOKE/START/PULL/CONFIRM',
+  firmware_version VARCHAR(64) NULL COMMENT '相关固件版本，无则为NULL',
+  chain_version VARCHAR(64) NULL COMMENT '相关证书链版本，无则为NULL',
+  device_id VARCHAR(64) NULL COMMENT '相关设备ID，无则为NULL',
+  reason_code VARCHAR(64) NOT NULL COMMENT '拒绝原因码，与错误响应code一致',
+  detail VARCHAR(256) NOT NULL COMMENT '拒绝原因说明',
+  rejected_at_utc VARCHAR(40) NOT NULL COMMENT '拒绝时刻，UTC，ISO-8601格式',
+  PRIMARY KEY (id)
+) COMMENT='证书域拒绝原因审计日志，失败操作回滚后仍保留，用于拒绝原因查询';
 
 CREATE TABLE IF NOT EXISTS release_pause_record (
   id BIGINT NOT NULL AUTO_INCREMENT COMMENT '暂停记录ID',

@@ -1,6 +1,7 @@
 package com.example.starter.firmware.repo;
 
 import com.example.starter.firmware.domain.ReceiptResult;
+import com.example.starter.firmware.domain.ReviewStatus;
 import com.example.starter.firmware.domain.RolloutTask;
 import com.example.starter.firmware.domain.TaskStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -15,6 +16,7 @@ import java.util.Optional;
 
 /**
  * 投放任务数据访问。同设备同发布单由唯一约束 uk_task_release_device 保证最多一条。
+ * 任务创建时固化证书链版本；撤销链上的回执标记 CERTIFICATE_REVOKED_REVIEW，人工确认后转 CONFIRMED。
  */
 @Repository
 public class TaskRepository {
@@ -23,10 +25,13 @@ public class TaskRepository {
         String firstResult = rs.getString("first_result");
         return new RolloutTask(rs.getLong("id"), rs.getLong("release_id"), rs.getString("device_id"),
                 TaskStatus.valueOf(rs.getString("status")),
-                firstResult == null ? null : ReceiptResult.valueOf(firstResult));
+                firstResult == null ? null : ReceiptResult.valueOf(firstResult),
+                rs.getString("cert_chain_version"),
+                ReviewStatus.valueOf(rs.getString("review_status")));
     };
 
-    private static final String COLUMNS = "id, release_id, device_id, status, first_result";
+    private static final String COLUMNS = "id, release_id, device_id, status, first_result,"
+            + " cert_chain_version, review_status";
 
     private final JdbcTemplate jdbc;
 
@@ -34,14 +39,16 @@ public class TaskRepository {
         this.jdbc = jdbc;
     }
 
-    public long insert(long releaseId, String deviceId) {
+    public long insert(long releaseId, String deviceId, String certChainVersion) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO rollout_task (release_id, device_id, status) VALUES (?, ?, 'PENDING')",
+                    "INSERT INTO rollout_task (release_id, device_id, status, cert_chain_version)"
+                            + " VALUES (?, ?, 'PENDING', ?)",
                     new String[]{"id"});
             ps.setLong(1, releaseId);
             ps.setString(2, deviceId);
+            ps.setString(3, certChainVersion);
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();
@@ -62,9 +69,21 @@ public class TaskRepository {
                 MAPPER, releaseId, deviceId).stream().findFirst();
     }
 
-    public void complete(long id, ReceiptResult result) {
-        jdbc.update("UPDATE rollout_task SET status = ?, first_result = ?, updated_at = CURRENT_TIMESTAMP"
-                + " WHERE id = ?", result.name(), result.name(), id);
+    /**
+     * 首次回执终结任务，同时落复核状态（证书链已撤销时为 CERTIFICATE_REVOKED_REVIEW）。
+     */
+    public void complete(long id, ReceiptResult result, ReviewStatus reviewStatus) {
+        jdbc.update("UPDATE rollout_task SET status = ?, first_result = ?, review_status = ?,"
+                        + " updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                result.name(), result.name(), reviewStatus.name(), id);
+    }
+
+    /**
+     * 人工确认：仅当仍处于 CERTIFICATE_REVOKED_REVIEW 时转为 CONFIRMED，返回影响行数。
+     */
+    public int confirmReview(long id) {
+        return jdbc.update("UPDATE rollout_task SET review_status = 'CONFIRMED',"
+                + " updated_at = CURRENT_TIMESTAMP WHERE id = ? AND review_status = 'CERTIFICATE_REVOKED_REVIEW'", id);
     }
 
     public int cancelPendingByRelease(long releaseId) {
@@ -79,6 +98,15 @@ public class TaskRepository {
         }
         return jdbc.query("SELECT " + COLUMNS + " FROM rollout_task WHERE release_id = ? AND status = ? ORDER BY id",
                 MAPPER, releaseId, statusFilter.name());
+    }
+
+    /**
+     * 发布单下处于证书撤销复核或已确认状态的任务（回执复核查询）。
+     */
+    public List<RolloutTask> findReviewsByRelease(long releaseId) {
+        return jdbc.query("SELECT " + COLUMNS + " FROM rollout_task"
+                        + " WHERE release_id = ? AND review_status <> 'NONE' ORDER BY id",
+                MAPPER, releaseId);
     }
 
     public long countByReleaseAndDevice(long releaseId, String deviceId) {

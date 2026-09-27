@@ -35,6 +35,8 @@ class FirmwarePauseResumeTest {
         jdbc.update("DELETE FROM release_resume_record");
         jdbc.update("DELETE FROM release_order");
         jdbc.update("DELETE FROM device");
+        jdbc.update("DELETE FROM cert_chain");
+        jdbc.update("DELETE FROM cert_rejection_record");
         jdbc.update("DELETE FROM idempotency_record");
     }
 
