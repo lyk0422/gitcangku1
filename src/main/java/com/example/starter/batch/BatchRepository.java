@@ -49,9 +49,31 @@ public class BatchRepository {
     }
 
     /**
-     * batch_lineage 表行记录：拆分父子关系，创建后不可改写。
+     * batch_lineage 表行记录：拆分/合批父子关系，创建后不可改写。
      */
     public record LineageRow(long id, String parentKey, String childKey, int seq, String createdAt) {
+    }
+
+    /**
+     * batch_potency_model 表行记录：效价衰减模型某一版本；历史版本保留不改写。
+     */
+    public record PotencyModelRow(long id, String batchKey, int version,
+                                  java.math.BigDecimal initialPotency,
+                                  java.math.BigDecimal minReleasePotency,
+                                  java.math.BigDecimal decayRatePerDay,
+                                  String registeredAt, String createdAt) {
+    }
+
+    /**
+     * potency_evaluation 表行记录：放行/拆分/合批时固化的效价计算结果，不可改写。
+     */
+    public record PotencyEvalRow(long id, String batchKey, String operation, String relatedKey,
+                                 String evaluatedAt, int modelVersion,
+                                 java.math.BigDecimal initialPotency,
+                                 java.math.BigDecimal decayRatePerDay,
+                                 java.math.BigDecimal minReleasePotency,
+                                 long elapsedDays, java.math.BigDecimal currentPotency,
+                                 String createdAt) {
     }
 
     private static final RowMapper<BatchRow> BATCH_MAPPER = (rs, n) -> new BatchRow(
@@ -80,6 +102,20 @@ public class BatchRepository {
     private static final RowMapper<LineageRow> LINEAGE_MAPPER = (rs, n) -> new LineageRow(
             rs.getLong("id"), rs.getString("parent_key"), rs.getString("child_key"),
             rs.getInt("seq"), rs.getString("created_at"));
+
+    private static final RowMapper<PotencyModelRow> POTENCY_MODEL_MAPPER = (rs, n) ->
+            new PotencyModelRow(rs.getLong("id"), rs.getString("batch_key"), rs.getInt("version"),
+                    rs.getBigDecimal("initial_potency"), rs.getBigDecimal("min_release_potency"),
+                    rs.getBigDecimal("decay_rate_per_day"), rs.getString("registered_at"),
+                    rs.getString("created_at"));
+
+    private static final RowMapper<PotencyEvalRow> POTENCY_EVAL_MAPPER = (rs, n) ->
+            new PotencyEvalRow(rs.getLong("id"), rs.getString("batch_key"),
+                    rs.getString("operation"), rs.getString("related_key"),
+                    rs.getString("evaluated_at"), rs.getInt("model_version"),
+                    rs.getBigDecimal("initial_potency"), rs.getBigDecimal("decay_rate_per_day"),
+                    rs.getBigDecimal("min_release_potency"), rs.getLong("elapsed_days"),
+                    rs.getBigDecimal("current_potency"), rs.getString("created_at"));
 
     private final JdbcTemplate jdbc;
 
@@ -194,12 +230,12 @@ public class BatchRepository {
     }
 
     /**
-     * 某批次的直接父批业务键；每个子批仅一个父批。
+     * 某批次的直接父批业务键，按血缘创建顺序；拆分子批至多一个，合批子批可有多个。
      */
-    public Optional<String> findParentKey(String childKey) {
-        return jdbc.queryForList("SELECT parent_key FROM batch_lineage WHERE child_key = ?",
-                        String.class, childKey)
-                .stream().findFirst();
+    public List<String> findParentKeys(String childKey) {
+        return jdbc.queryForList(
+                "SELECT parent_key FROM batch_lineage WHERE child_key = ? ORDER BY id",
+                String.class, childKey);
     }
 
     /**
@@ -208,5 +244,47 @@ public class BatchRepository {
     public List<String> findRecalledKeys() {
         return jdbc.queryForList("SELECT batch_key FROM batch WHERE status = 'RECALLED'",
                 String.class);
+    }
+
+    /**
+     * 追加效价模型新版本；版本号由调用方按 当前最大版本+1 计算（同事务行锁保证）。
+     */
+    public void insertPotencyModel(PotencyModelRow row) {
+        jdbc.update("INSERT INTO batch_potency_model (batch_key, version, initial_potency,"
+                        + " min_release_potency, decay_rate_per_day, registered_at, created_at)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                row.batchKey(), row.version(), row.initialPotency(), row.minReleasePotency(),
+                row.decayRatePerDay(), row.registeredAt(), row.createdAt());
+    }
+
+    /**
+     * 批次当前最新版本效价模型；未登记时为空。
+     */
+    public Optional<PotencyModelRow> findLatestPotencyModel(String batchKey) {
+        return jdbc.query("SELECT * FROM batch_potency_model WHERE batch_key = ?"
+                        + " ORDER BY version DESC LIMIT 1", POTENCY_MODEL_MAPPER, batchKey)
+                .stream().findFirst();
+    }
+
+    /**
+     * 固化一条效价计算记录（放行/拆分/合批）。
+     */
+    public void insertPotencyEvaluation(PotencyEvalRow row) {
+        jdbc.update("INSERT INTO potency_evaluation (batch_key, operation, related_key,"
+                        + " evaluated_at, model_version, initial_potency, decay_rate_per_day,"
+                        + " min_release_potency, elapsed_days, current_potency, created_at)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                row.batchKey(), row.operation(), row.relatedKey(), row.evaluatedAt(),
+                row.modelVersion(), row.initialPotency(), row.decayRatePerDay(),
+                row.minReleasePotency(), row.elapsedDays(), row.currentPotency(), row.createdAt());
+    }
+
+    /**
+     * 批次相关的全部固化效价计算记录：自身被评估的记录 + 以其为关联子批的记录，
+     * 按写入顺序（id）稳定排序。
+     */
+    public List<PotencyEvalRow> findPotencyEvaluations(String batchKey) {
+        return jdbc.query("SELECT * FROM potency_evaluation WHERE batch_key = ? OR related_key = ?"
+                        + " ORDER BY id", POTENCY_EVAL_MAPPER, batchKey, batchKey);
     }
 }

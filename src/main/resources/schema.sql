@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS batch (
     product_code VARCHAR(64) NOT NULL COMMENT '产品编码，创建后不可修改',
     batch_no VARCHAR(64) NOT NULL COMMENT '批号，创建后不可修改',
     produced_at VARCHAR(40) NOT NULL COMMENT '生产时间，ISO-8601 UTC  instant 字符串',
-    status VARCHAR(32) NOT NULL COMMENT '批次状态：QUARANTINED/PENDING_RELEASE/RELEASE_REVIEW/RELEASED/REJECTED/RECALLED/SPLIT',
+    status VARCHAR(32) NOT NULL COMMENT '批次状态：QUARANTINED/PENDING_RELEASE/RELEASE_REVIEW/RELEASED/REJECTED/RECALLED/SPLIT/MERGED',
     created_at VARCHAR(40) NOT NULL COMMENT '创建时间，ISO-8601 UTC instant 字符串',
     CONSTRAINT uk_batch_key UNIQUE (batch_key)
 );
@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS recall (
 );
 
 CREATE TABLE IF NOT EXISTS command_log (
-    command_type VARCHAR(32) NOT NULL COMMENT '命令类型：CREATE_BATCH/SUBMIT_TEST/APPROVE/RECALL/SPLIT',
+    command_type VARCHAR(32) NOT NULL COMMENT '命令类型：CREATE_BATCH/SUBMIT_TEST/APPROVE/RECALL/SPLIT/POTENCY_MODEL/MERGE',
     command_key VARCHAR(64) NOT NULL COMMENT '命令幂等键；同类型同键同参重放返回首次结果，同键改参返回 409',
     fingerprint VARCHAR(64) NOT NULL COMMENT '业务参数（不含 commandKey）的 SHA-256 摘要，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行成功的 HTTP 状态码',
@@ -57,12 +57,44 @@ CREATE TABLE IF NOT EXISTS command_log (
     CONSTRAINT pk_command_log PRIMARY KEY (command_type, command_key)
 );
 
--- 拆分血缘：仅记录父子追溯关系，不涉及数量分摊；关系创建后不可改写。
+-- 拆分/合批血缘：仅记录父子追溯关系；拆分子批仅一个父批，合批子批可有多个父批；
+-- 关系创建后不可改写。
 CREATE TABLE IF NOT EXISTS batch_lineage (
-    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键，同时作为拆分关系创建顺序依据',
-    parent_key VARCHAR(64) NOT NULL COMMENT '父批业务键，拆分时必须为 RELEASED，拆分后置为 SPLIT',
-    child_key VARCHAR(64) NOT NULL COMMENT '子批业务键；每个子批仅一个父批，全局唯一，不可改写',
-    seq INT NOT NULL COMMENT '子批在拆分请求中的顺序，从 1 开始',
-    created_at VARCHAR(40) NOT NULL COMMENT '拆分时间，ISO-8601 UTC instant 字符串',
-    CONSTRAINT uk_lineage_child UNIQUE (child_key)
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键，同时作为血缘关系创建顺序依据',
+    parent_key VARCHAR(64) NOT NULL COMMENT '父批业务键，拆分/合批时必须为 RELEASED，拆分后置为 SPLIT、合批后置为 MERGED',
+    child_key VARCHAR(64) NOT NULL COMMENT '子批业务键；拆分子批仅一个父批，合批子批每个父批一行，不可改写',
+    seq INT NOT NULL COMMENT '血缘边在拆分/合批请求中的顺序，从 1 开始',
+    created_at VARCHAR(40) NOT NULL COMMENT '拆分/合批时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_lineage_parent_child UNIQUE (parent_key, child_key)
+);
+
+-- 批次效价衰减模型：初始效价、最低放行效价与每 UTC 日线性衰减率；
+-- 每次登记/修订追加新版本行，历史版本保留不改写；衰减自该行登记时刻（UTC 日）起算。
+CREATE TABLE IF NOT EXISTS batch_potency_model (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    batch_key VARCHAR(64) NOT NULL COMMENT '所属批次业务键',
+    version INT NOT NULL COMMENT '模型版本，从 1 开始递增；放行/拆分/合批读取事务内最新版本',
+    initial_potency DECIMAL(20,4) NOT NULL COMMENT '登记时刻初始效价，不允许为负',
+    min_release_potency DECIMAL(20,4) NOT NULL COMMENT '最低放行效价阈值，不允许为负',
+    decay_rate_per_day DECIMAL(20,4) NOT NULL COMMENT '每 UTC 日线性衰减率，不允许为负；当前效价=初始效价-衰减率×经过 UTC 整日数',
+    registered_at VARCHAR(40) NOT NULL COMMENT '模型登记时间，ISO-8601 UTC instant 字符串，同时作为衰减起算点',
+    created_at VARCHAR(40) NOT NULL COMMENT '创建时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_potency_model_version UNIQUE (batch_key, version)
+);
+
+-- 效价计算固化记录：放行/拆分/合批时写入计算时刻、模型版本、输入效价与舍入结果；
+-- 记录创建后不可改写，后续模型修订不影响历史结论。
+CREATE TABLE IF NOT EXISTS potency_evaluation (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键，同时作为评估记录排序依据',
+    batch_key VARCHAR(64) NOT NULL COMMENT '被评估批次业务键',
+    operation VARCHAR(16) NOT NULL COMMENT '触发操作：RELEASE/SPLIT/MERGE',
+    related_key VARCHAR(64) NULL COMMENT '操作关联批次业务键：拆分/合批为子批，放行为 NULL',
+    evaluated_at VARCHAR(40) NOT NULL COMMENT '效价计算时刻，ISO-8601 UTC instant 字符串',
+    model_version INT NOT NULL COMMENT '计算所用效价模型版本',
+    initial_potency DECIMAL(20,4) NOT NULL COMMENT '计算输入：模型初始效价',
+    decay_rate_per_day DECIMAL(20,4) NOT NULL COMMENT '计算输入：每 UTC 日衰减率',
+    min_release_potency DECIMAL(20,4) NOT NULL COMMENT '计算输入：最低放行效价阈值',
+    elapsed_days BIGINT NOT NULL COMMENT '模型登记至计算时刻经过的 UTC 整日数（左闭右开，不为负）',
+    current_potency DECIMAL(20,4) NOT NULL COMMENT '舍入后当前效价：初始效价-衰减率×经过天数，scale 4 HALF_UP',
+    created_at VARCHAR(40) NOT NULL COMMENT '记录写入时间，ISO-8601 UTC instant 字符串'
 );

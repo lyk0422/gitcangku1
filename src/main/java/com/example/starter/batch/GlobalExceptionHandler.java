@@ -19,7 +19,7 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(ApiException.class)
     public ResponseEntity<ErrorResponse> handleApi(ApiException ex) {
         return ResponseEntity.status(ex.status())
-                .body(new ErrorResponse(ex.code(), ex.getMessage()));
+                .body(new ErrorResponse(ex.code(), ex.getMessage(), ex.details()));
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
@@ -29,24 +29,26 @@ public class GlobalExceptionHandler {
                 .map(FieldError::getDefaultMessage)
                 .orElse("请求参数不合法");
         return ResponseEntity.status(HttpStatus.BAD_REQUEST)
-                .body(new ErrorResponse("INVALID_ARGUMENT", message));
+                .body(new ErrorResponse("INVALID_ARGUMENT", message, null));
     }
 
     @ExceptionHandler(HttpMessageNotReadableException.class)
     public ResponseEntity<ErrorResponse> handleNotReadable(HttpMessageNotReadableException ex) {
         return ResponseEntity.status(HttpStatus.BAD_REQUEST)
-                .body(new ErrorResponse("INVALID_ARGUMENT", "请求体无法解析: " + ex.getMostSpecificCause().getMessage()));
+                .body(new ErrorResponse("INVALID_ARGUMENT",
+                        "请求体无法解析: " + ex.getMostSpecificCause().getMessage(), null));
     }
 
     @ExceptionHandler(MissingRequestHeaderException.class)
     public ResponseEntity<ErrorResponse> handleMissingHeader(MissingRequestHeaderException ex) {
         return ResponseEntity.status(HttpStatus.BAD_REQUEST)
-                .body(new ErrorResponse("INVALID_ARGUMENT", "缺少必需请求头: " + ex.getHeaderName()));
+                .body(new ErrorResponse("INVALID_ARGUMENT", "缺少必需请求头: " + ex.getHeaderName(),
+                        null));
     }
 
     @ExceptionHandler(NoResourceFoundException.class)
     public ResponseEntity<ErrorResponse> handleNoResource(NoResourceFoundException ex) {
         return ResponseEntity.status(HttpStatus.NOT_FOUND)
-                .body(new ErrorResponse("NOT_FOUND", "资源不存在"));
+                .body(new ErrorResponse("NOT_FOUND", "资源不存在", null));
     }
 }

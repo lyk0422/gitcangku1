@@ -5,6 +5,9 @@ import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
 import com.example.starter.batch.dto.LineageEntryResponse;
+import com.example.starter.batch.dto.MergeRequest;
+import com.example.starter.batch.dto.PotencyModelRequest;
+import com.example.starter.batch.dto.PotencyStatusResponse;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
@@ -15,6 +18,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -112,6 +116,37 @@ public class BatchController {
     @GetMapping("/{batchKey}/descendants")
     public List<LineageEntryResponse> descendants(@PathVariable String batchKey) {
         return service.listDescendants(batchKey);
+    }
+
+    /**
+     * 登记或修订批次效价衰减模型；X-Actor-Id 为操作人。
+     * 初始效价、最低放行效价或衰减率为负返回 422。
+     */
+    @PutMapping("/{batchKey}/potency-model")
+    public ResponseEntity<String> registerPotencyModel(
+            @PathVariable String batchKey,
+            @RequestHeader(name = "X-Actor-Id", required = false) String actorId,
+            @Valid @RequestBody PotencyModelRequest request) {
+        return stored(service.registerPotencyModel(batchKey, actorId, request));
+    }
+
+    /**
+     * 合批：2～5 个已放行父批按权重合并为一个全新子批；X-Actor-Id 为操作人。
+     * 父批未检验/未放行、未登记效价模型、效价不合格或权重不守恒返回 422 并整次回滚。
+     */
+    @PostMapping("/merge")
+    public ResponseEntity<String> merge(
+            @RequestHeader(name = "X-Actor-Id", required = false) String actorId,
+            @Valid @RequestBody MergeRequest request) {
+        return stored(service.merge(actorId, request));
+    }
+
+    /**
+     * 批次当前效价诊断：最新效价模型、经过 UTC 天数、当前效价、放行阈值与差额。
+     */
+    @GetMapping("/{batchKey}/potency")
+    public PotencyStatusResponse potency(@PathVariable String batchKey) {
+        return service.potencyStatus(batchKey);
     }
 
     private ResponseEntity<String> stored(StoredResponse response) {
