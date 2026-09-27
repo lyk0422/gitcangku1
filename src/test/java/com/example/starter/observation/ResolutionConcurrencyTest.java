@@ -33,6 +33,10 @@ class ResolutionConcurrencyTest {
 
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM observation_version_attachment");
+        jdbcTemplate.update("DELETE FROM attachment_redaction");
+        jdbcTemplate.update("DELETE FROM observation_attachment");
+        jdbcTemplate.update("DELETE FROM redaction_rule");
         jdbcTemplate.update("DELETE FROM conflict_resolution");
         jdbcTemplate.update("DELETE FROM request_log");
         jdbcTemplate.update("DELETE FROM observation_version");

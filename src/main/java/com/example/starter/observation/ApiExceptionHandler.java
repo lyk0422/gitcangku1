@@ -16,13 +16,13 @@ import java.util.stream.Collectors;
 public class ApiExceptionHandler {
 
     /**
-     * 业务异常：404/409/410 等，携带冲突字段与当前版本（如有）。
+     * 业务异常：403/404/409/410/422 等，携带冲突字段、当前版本或数量差额（如有）。
      */
     @ExceptionHandler(ApiException.class)
     public ResponseEntity<ErrorResponse> handleApiException(ApiException ex) {
         HttpStatus status = ex.status();
         ErrorResponse body = new ErrorResponse(status.value(), status.getReasonPhrase(),
-                ex.getMessage(), ex.conflictFields(), ex.currentVersion());
+                ex.getMessage(), ex.conflictFields(), ex.currentVersion(), ex.actual(), ex.required());
         return ResponseEntity.status(status).body(body);
     }
 

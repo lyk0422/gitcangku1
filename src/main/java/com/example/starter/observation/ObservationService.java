@@ -50,17 +50,20 @@ public class ObservationService {
     private final ObservationRepository observationRepository;
     private final RequestLogRepository requestLogRepository;
     private final ResolutionRepository resolutionRepository;
+    private final AttachmentService attachmentService;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public ObservationService(ObservationRepository observationRepository,
                               RequestLogRepository requestLogRepository,
                               ResolutionRepository resolutionRepository,
+                              AttachmentService attachmentService,
                               ObjectMapper objectMapper,
                               Clock clock) {
         this.observationRepository = observationRepository;
         this.requestLogRepository = requestLogRepository;
         this.resolutionRepository = resolutionRepository;
+        this.attachmentService = attachmentService;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -141,6 +144,8 @@ public class ObservationService {
                 mergedLocation, mergedReading, mergedNote, false);
         observationRepository.updateCurrent(next);
         observationRepository.insertVersion(next);
+        // 固化新版本引用的附件脱敏版本；后续脱敏不追溯替换快照中的证据引用。
+        attachmentService.freezeReferencesForVersion(observationId, next.version());
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(next));
     }
 
@@ -261,6 +266,8 @@ public class ObservationService {
                     resolvedLocation, resolvedReading, resolvedNote, false);
             observationRepository.updateCurrent(next);
             observationRepository.insertVersion(next);
+            // 人工冲突选择生成的新版本同样固化当时的附件脱敏引用，后续脱敏不追溯。
+            attachmentService.freezeReferencesForVersion(observationId, next.version());
         }
 
         ResolutionRecord record = new ResolutionRecord(

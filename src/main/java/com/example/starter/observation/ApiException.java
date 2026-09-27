@@ -12,12 +12,21 @@ public class ApiException extends RuntimeException {
     private final HttpStatus status;
     private final List<String> conflictFields;
     private final Integer currentVersion;
+    private final Integer actual;
+    private final Integer required;
 
     private ApiException(HttpStatus status, String message, List<String> conflictFields, Integer currentVersion) {
+        this(status, message, conflictFields, currentVersion, null, null);
+    }
+
+    private ApiException(HttpStatus status, String message, List<String> conflictFields,
+                         Integer currentVersion, Integer actual, Integer required) {
         super(message);
         this.status = status;
         this.conflictFields = conflictFields;
         this.currentVersion = currentVersion;
+        this.actual = actual;
+        this.required = required;
     }
 
     public HttpStatus status() {
@@ -30,6 +39,20 @@ public class ApiException extends RuntimeException {
 
     public Integer currentVersion() {
         return currentVersion;
+    }
+
+    /**
+     * 数量类校验失败时的实际值（如超长摘要的实际长度）；无数量语境时为 null。
+     */
+    public Integer actual() {
+        return actual;
+    }
+
+    /**
+     * 数量类校验失败时的要求值（如允许的最大长度）；无数量语境时为 null。
+     */
+    public Integer required() {
+        return required;
     }
 
     /**
@@ -67,5 +90,26 @@ public class ApiException extends RuntimeException {
      */
     public static ApiException gone(String message) {
         return new ApiException(HttpStatus.GONE, message, null, null);
+    }
+
+    /**
+     * 403：角色不具备执行该操作的权限（如非脱敏角色提交脱敏、非证据角色读取原始摘要）。
+     */
+    public static ApiException forbidden(String message) {
+        return new ApiException(HttpStatus.FORBIDDEN, message, null, null);
+    }
+
+    /**
+     * 422：业务规则不满足（如规则版本未登记/已撤销、附件状态不允许）。
+     */
+    public static ApiException unprocessable(String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, message, null, null);
+    }
+
+    /**
+     * 422：数量类约束不满足，携带实际值与要求值，便于调用方直接比较。
+     */
+    public static ApiException unprocessable(String message, int actual, int required) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, message, null, null, actual, required);
     }
 }

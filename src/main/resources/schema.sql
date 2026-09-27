@@ -1,5 +1,7 @@
 -- 现场观测离线三方合并的持久化结构。
--- 兼容 H2（MODE=MySQL）与 MySQL 语法；时间戳均为服务器时区（Asia/Shanghai）。
+-- 兼容 H2（MODE=MySQL）与 MySQL 语法。
+-- 既有观测/请求日志表时间戳为服务器时区（Asia/Shanghai）；
+-- 附件与脱敏相关新表时间戳列名以 _utc 结尾，统一为 UTC。
 
 -- 观测记录当前状态表：每条观测记录一行，version 从 1 开始单调递增。
 CREATE TABLE IF NOT EXISTS observation_current (
@@ -34,6 +36,53 @@ CREATE TABLE IF NOT EXISTS request_log (
     response_body VARCHAR(4000) NULL COMMENT '成功响应体（JSON 原文），用于同键同参重放；提交过程中暂为 NULL',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '请求记录创建时间（服务器时区）',
     PRIMARY KEY (request_id)
+);
+
+-- 观测附件元数据表：附件属于且仅属于一条观测记录；原始内容摘要登记后不可修改。
+CREATE TABLE IF NOT EXISTS observation_attachment (
+    attachment_id VARCHAR(64) NOT NULL COMMENT '附件唯一标识',
+    observation_id VARCHAR(64) NOT NULL COMMENT '所属观测记录标识',
+    content_summary VARCHAR(1024) NOT NULL COMMENT '原始内容摘要（登记后不可修改）',
+    created_at_utc TIMESTAMP NOT NULL COMMENT '登记时刻（UTC）',
+    PRIMARY KEY (attachment_id)
+);
+
+-- 脱敏规则版本登记表：规则版本须先登记才能用于脱敏；撤销后不可再用于新脱敏。
+CREATE TABLE IF NOT EXISTS redaction_rule (
+    rule_version VARCHAR(64) NOT NULL COMMENT '规则版本标识',
+    description VARCHAR(512) NOT NULL COMMENT '规则描述',
+    status VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE / REVOKED',
+    registered_at_utc TIMESTAMP NOT NULL COMMENT '登记时刻（UTC）',
+    revoked_at_utc TIMESTAMP NULL COMMENT '撤销时刻（UTC），未撤销为 NULL',
+    PRIMARY KEY (rule_version)
+);
+
+-- 附件脱敏版本表：每次脱敏生成递增版本，仅追加受限展示版本，不改写原摘要与既有版本。
+CREATE TABLE IF NOT EXISTS attachment_redaction (
+    attachment_id VARCHAR(64) NOT NULL COMMENT '附件唯一标识',
+    redaction_version INT NOT NULL COMMENT '脱敏版本号，按附件从 1 开始递增',
+    rule_version VARCHAR(64) NOT NULL COMMENT '本次脱敏使用的规则版本',
+    redacted_summary VARCHAR(1024) NOT NULL COMMENT '受限展示摘要',
+    replacement_note VARCHAR(1024) NOT NULL COMMENT '替换说明',
+    status VARCHAR(16) NOT NULL COMMENT '状态：EFFECTIVE / REVOKED',
+    created_at_utc TIMESTAMP NOT NULL COMMENT '创建时刻（UTC）',
+    revoked_at_utc TIMESTAMP NULL COMMENT '撤销时刻（UTC），未撤销为 NULL',
+    revoke_reason VARCHAR(1024) NULL COMMENT '撤销理由，未撤销为 NULL',
+    request_id VARCHAR(128) NOT NULL COMMENT '创建该版本的请求标识',
+    PRIMARY KEY (attachment_id, redaction_version),
+    -- 同一附件同一规则版本只允许生成一个脱敏版本，并发由唯一键裁决。
+    UNIQUE (attachment_id, rule_version)
+);
+
+-- 观测版本附件引用固化表：合并快照与人工冲突选择生成观测版本时，
+-- 固化当时各附件引用的脱敏版本（NULL 表示引用原始摘要），后续脱敏不追溯改写。
+CREATE TABLE IF NOT EXISTS observation_version_attachment (
+    observation_id VARCHAR(64) NOT NULL COMMENT '观测记录标识',
+    version INT NOT NULL COMMENT '观测版本号',
+    attachment_id VARCHAR(64) NOT NULL COMMENT '附件标识',
+    redaction_version INT NULL COMMENT '快照时引用的脱敏版本；NULL 表示引用原始摘要',
+    frozen_at_utc TIMESTAMP NOT NULL COMMENT '固化时刻（UTC）',
+    PRIMARY KEY (observation_id, version, attachment_id)
 );
 
 -- 冲突解决记录表：成功解决后原子写入，不可变、永不更新或删除。
