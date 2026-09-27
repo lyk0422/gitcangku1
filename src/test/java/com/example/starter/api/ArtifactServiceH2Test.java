@@ -1,10 +1,12 @@
 package com.example.starter.api;
 
 import com.example.starter.api.dto.ArtifactResponse;
+import com.example.starter.api.dto.AttestationRequest;
 import com.example.starter.api.dto.DependencySpec;
 import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
 import com.example.starter.api.dto.RegisterArtifactRequest;
+import com.example.starter.api.dto.RegisterChecksumRequest;
 import com.example.starter.support.ApiException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -43,6 +45,8 @@ class ArtifactServiceH2Test {
     void cleanDatabase() {
         jdbcTemplate.update("DELETE FROM lock_file_entry");
         jdbcTemplate.update("DELETE FROM lock_file");
+        jdbcTemplate.update("DELETE FROM artifact_attestation");
+        jdbcTemplate.update("DELETE FROM artifact_checksum");
         jdbcTemplate.update("DELETE FROM artifact_dependency");
         jdbcTemplate.update("DELETE FROM artifact");
         jdbcTemplate.update("DELETE FROM idempotent_request");
@@ -59,6 +63,20 @@ class ArtifactServiceH2Test {
 
     private static DependencySpec dep(String name, int min, int max) {
         return new DependencySpec(name, min, max);
+    }
+
+    /** 由种子生成确定性的合法摘要：sha256: 加 64 位十六进制。 */
+    static String checksumOf(String seed) {
+        String unit = Integer.toHexString(seed.hashCode());
+        return "sha256:" + (unit.repeat(64)).substring(0, 64);
+    }
+
+    /** 登记摘要并由两名不同角色完成见证，使版本可进入锁定闭包。 */
+    void attestPair(String name, int version) {
+        String checksum = checksumOf(name + ":" + version);
+        service.registerChecksum(requestId(), name, version, new RegisterChecksumRequest(checksum));
+        service.attest(requestId(), name, version, new AttestationRequest("releaser", checksum));
+        service.attest(requestId(), name, version, new AttestationRequest("qa", checksum));
     }
 
     // ------------------------------------------------------------------
@@ -87,6 +105,10 @@ class ArtifactServiceH2Test {
         service.registerArtifact(requestId(), artifact("lib", 2));
         service.registerArtifact(requestId(), artifact("lib", 1));
         service.registerArtifact(requestId(), artifact("util", 1));
+        // 闭包内版本完成摘要登记与双人见证。
+        attestPair("app", 1);
+        attestPair("lib", 2);
+        attestPair("util", 1);
 
         LockFileResponse lock = service.createLock(requestId(), new LockRequest("app", 1, 4L));
 
@@ -107,6 +129,8 @@ class ArtifactServiceH2Test {
         // 串行准备：app:1 -> lib[1,1]，lib:1；当前仓库版本为 2。
         service.registerArtifact(requestId(), artifact("app", 1, dep("lib", 1, 1)));
         service.registerArtifact(requestId(), artifact("lib", 1));
+        attestPair("app", 1);
+        attestPair("lib", 1);
         long versionBefore = 2L;
 
         ExecutorService pool = Executors.newFixedThreadPool(2);
@@ -440,6 +464,8 @@ class ArtifactServiceH2Test {
     void lockReplayAfterUnrelatedChangesStillReturnsOriginalResolution() {
         service.registerArtifact(requestId(), artifact("app", 1, dep("lib", 1, 2)));
         service.registerArtifact(requestId(), artifact("lib", 1));
+        attestPair("app", 1);
+        attestPair("lib", 1);
         String rid = requestId();
         LockFileResponse first = service.createLock(rid, new LockRequest("app", 1, 2L));
 

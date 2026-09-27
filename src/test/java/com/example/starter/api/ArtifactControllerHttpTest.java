@@ -37,6 +37,8 @@ class ArtifactControllerHttpTest {
     void cleanDatabase() {
         jdbcTemplate.update("DELETE FROM lock_file_entry");
         jdbcTemplate.update("DELETE FROM lock_file");
+        jdbcTemplate.update("DELETE FROM artifact_attestation");
+        jdbcTemplate.update("DELETE FROM artifact_checksum");
         jdbcTemplate.update("DELETE FROM artifact_dependency");
         jdbcTemplate.update("DELETE FROM artifact");
         jdbcTemplate.update("DELETE FROM idempotent_request");
@@ -73,6 +75,31 @@ class ArtifactControllerHttpTest {
             return new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(value);
         } catch (Exception e) {
             throw new IllegalStateException(e);
+        }
+    }
+
+    /** 由种子生成确定性的合法摘要：sha256: 加 64 位十六进制。 */
+    private static String checksumOf(String seed) {
+        String unit = Integer.toHexString(seed.hashCode());
+        return "sha256:" + (unit.repeat(64)).substring(0, 64);
+    }
+
+    /** 通过 HTTP 登记摘要并由两名不同角色完成见证。 */
+    private void attestPairViaHttp(String name, int version) {
+        String checksum = checksumOf(name + ":" + version);
+        String checksumBody = "{\"checksum\":\"" + checksum + "\"}";
+        ResponseEntity<JsonNode> checksumResponse = restTemplate.postForEntity(
+                "/api/artifacts/" + name + "/versions/" + version + "/checksum",
+                new HttpEntity<>(checksumBody, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(checksumResponse.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        for (String role : new String[]{"releaser", "qa"}) {
+            String attestBody = "{\"role\":\"" + role + "\",\"checksum\":\"" + checksum + "\"}";
+            ResponseEntity<JsonNode> attested = restTemplate.postForEntity(
+                    "/api/artifacts/" + name + "/versions/" + version + "/attestations",
+                    new HttpEntity<>(attestBody, jsonHeaders(UUID.randomUUID().toString())),
+                    JsonNode.class);
+            assertThat(attested.getStatusCode()).isEqualTo(HttpStatus.CREATED);
         }
     }
 
@@ -138,6 +165,9 @@ class ArtifactControllerHttpTest {
         restTemplate.postForEntity("/api/artifacts",
                 new HttpEntity<>(registerBody("lib", 2),
                         jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        // 闭包内版本完成摘要登记与双人见证。
+        attestPairViaHttp("app", 1);
+        attestPairViaHttp("lib", 2);
 
         String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"expectedRepositoryVersion\":3}";
         ResponseEntity<JsonNode> lock = restTemplate.postForEntity("/api/artifacts/locks",
@@ -217,5 +247,80 @@ class ArtifactControllerHttpTest {
                 new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
                 JsonNode.class);
         assertThat(lockOnWithdrawn.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+    }
+
+    @Test
+    void checksumAttestationWorkflowViaHttp() {
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("app", 1),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+
+        // 摘要格式非法 → 422。
+        ResponseEntity<JsonNode> badChecksum = restTemplate.postForEntity(
+                "/api/artifacts/app/versions/1/checksum",
+                new HttpEntity<>("{\"checksum\":\"md5:abc\"}",
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        assertThat(badChecksum.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+
+        String checksum = checksumOf("app:1");
+        ResponseEntity<JsonNode> registered = restTemplate.postForEntity(
+                "/api/artifacts/app/versions/1/checksum",
+                new HttpEntity<>("{\"checksum\":\"" + checksum + "\"}",
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        assertThat(registered.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(registered.getBody().path("checksum").asText()).isEqualTo(checksum);
+
+        // 见证摘要与登记摘要不一致 → 422。
+        String other = checksumOf("other");
+        ResponseEntity<JsonNode> mismatched = restTemplate.postForEntity(
+                "/api/artifacts/app/versions/1/attestations",
+                new HttpEntity<>("{\"role\":\"qa\",\"checksum\":\"" + other + "\"}",
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        assertThat(mismatched.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+
+        // 同角色重复见证 → 409。
+        String attestBody = "{\"role\":\"qa\",\"checksum\":\"" + checksum + "\"}";
+        ResponseEntity<JsonNode> first = restTemplate.postForEntity(
+                "/api/artifacts/app/versions/1/attestations",
+                new HttpEntity<>(attestBody, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(first.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        ResponseEntity<JsonNode> duplicate = restTemplate.postForEntity(
+                "/api/artifacts/app/versions/1/attestations",
+                new HttpEntity<>(attestBody, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(duplicate.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+
+        // 状态明细：实际 1、要求 2、差额 1；只读不改状态。
+        ResponseEntity<JsonNode> status = restTemplate.getForEntity(
+                "/api/artifacts/app/versions/1/attestation", JsonNode.class);
+        assertThat(status.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(status.getBody().path("requiredAttestations").asInt()).isEqualTo(2);
+        assertThat(status.getBody().path("activeAttestations").asInt()).isEqualTo(1);
+        assertThat(status.getBody().path("missingAttestations").asInt()).isEqualTo(1);
+        assertThat(status.getBody().path("checksum").asText()).isEqualTo(checksum);
+
+        // 未达双人见证时锁定 → 422，且不含半成品。
+        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"expectedRepositoryVersion\":1}";
+        ResponseEntity<JsonNode> lock = restTemplate.postForEntity("/api/artifacts/locks",
+                new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(lock.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+        assertThat(lock.getBody().path("message").asText()).contains("app:1");
+        ResponseEntity<JsonNode> locks = restTemplate.getForEntity("/api/artifacts/locks", JsonNode.class);
+        assertThat(locks.getBody()).hasSize(0);
+
+        // 第二名角色见证后锁定成功，锁文件条目固化摘要与见证版本。
+        restTemplate.postForEntity("/api/artifacts/app/versions/1/attestations",
+                new HttpEntity<>("{\"role\":\"releaser\",\"checksum\":\"" + checksum + "\"}",
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        ResponseEntity<JsonNode> locked = restTemplate.postForEntity("/api/artifacts/locks",
+                new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(locked.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        JsonNode entry = locked.getBody().path("entries").get(0);
+        assertThat(entry.path("name").asText()).isEqualTo("app");
+        assertThat(entry.path("checksum").asText()).isEqualTo(checksum);
+        assertThat(entry.path("attestationVersion").asInt()).isEqualTo(2);
     }
 }

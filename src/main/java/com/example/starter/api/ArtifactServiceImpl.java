@@ -1,17 +1,25 @@
 package com.example.starter.api;
 
 import com.example.starter.api.dto.ArtifactResponse;
+import com.example.starter.api.dto.AttestationRequest;
+import com.example.starter.api.dto.AttestationResponse;
+import com.example.starter.api.dto.AttestationStatusResponse;
+import com.example.starter.api.dto.AttestationView;
+import com.example.starter.api.dto.ChecksumResponse;
 import com.example.starter.api.dto.DependencySpec;
 import com.example.starter.api.dto.DependencyView;
 import com.example.starter.api.dto.LockEntryResponse;
 import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
 import com.example.starter.api.dto.RegisterArtifactRequest;
+import com.example.starter.api.dto.RegisterChecksumRequest;
 import com.example.starter.domain.ArtifactVersion;
 import com.example.starter.domain.DependencyRange;
 import com.example.starter.domain.LockResolver;
 import com.example.starter.domain.RepositorySnapshot;
 import com.example.starter.repo.RepositoryDao;
+import com.example.starter.repo.RepositoryDao.AttestationRow;
+import com.example.starter.repo.RepositoryDao.ChecksumRow;
 import com.example.starter.repo.RepositoryDao.IdempotentRecord;
 import com.example.starter.repo.RepositoryDao.LockEntryRow;
 import com.example.starter.repo.RepositoryDao.LockFileRow;
@@ -28,17 +36,25 @@ import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.function.Supplier;
+import java.util.regex.Pattern;
 
 /**
  * 制品仓库业务服务实现。
  *
  * <p>所有写操作在单个事务内完成：先锁单行仓库版本表互斥并发写，
  * 再做业务变更并写入幂等成功记录，原子提交；业务失败整体回滚，不占用 requestId。
+ *
+ * <p>制品校验见证：版本须先登记内容校验摘要（{@code sha256:<64位十六进制>}），
+ * 再由两名不同发布角色提交与登记摘要一致的见证；只有满足双人见证的版本
+ * 才能进入新锁文件的依赖闭包。锁文件固化每个版本的摘要与见证版本号，
+ * 后续见证撤销不改写旧锁，仅影响后续锁定。
  */
 @Service
 public class ArtifactServiceImpl implements ArtifactService {
@@ -46,9 +62,18 @@ public class ArtifactServiceImpl implements ArtifactService {
     private static final int MAX_NAMES = 20;
     private static final int MAX_VERSIONS_PER_NAME = 5;
 
+    /** 进入锁定闭包所需的不同角色有效见证数量。 */
+    static final int REQUIRED_ATTESTATIONS = 2;
+
     private static final String OP_REGISTER = "REGISTER_ARTIFACT";
     private static final String OP_WITHDRAW = "WITHDRAW_ARTIFACT";
     private static final String OP_LOCK = "CREATE_LOCK";
+    private static final String OP_REGISTER_CHECKSUM = "REGISTER_CHECKSUM";
+    private static final String OP_ATTEST = "ATTEST";
+    private static final String OP_REVOKE_ATTESTATION = "REVOKE_ATTESTATION";
+
+    /** 摘要格式：sha256: 前缀加 64 位十六进制（比较前统一转小写）。 */
+    private static final Pattern CHECKSUM_PATTERN = Pattern.compile("sha256:[0-9a-f]{64}");
 
     private final RepositoryDao repositoryDao;
     private final TransactionTemplate transactionTemplate;
@@ -78,12 +103,78 @@ public class ArtifactServiceImpl implements ArtifactService {
     @Override
     public ArtifactResponse withdrawArtifact(String requestId, String name, int version) {
         requireRequestId(requestId);
-        if (name == null || name.isBlank()) {
-            throw ApiException.badRequest("name 不能为空");
-        }
+        requireName(name);
         String hash = sha256(OP_WITHDRAW + "|" + name.trim() + "|" + version);
         return executeIdempotent(requestId, OP_WITHDRAW, hash, 200,
                 () -> doWithdraw(name.trim(), version), ArtifactResponse.class);
+    }
+
+    @Override
+    public ChecksumResponse registerChecksum(String requestId, String name, int version,
+                                             RegisterChecksumRequest request) {
+        requireRequestId(requestId);
+        requireName(name);
+        String checksum = normalizeChecksum(request == null ? null : request.checksum());
+        // 指纹含操作类型、目标版本与规范化摘要；JSON 数组序列化避免未转义分隔符拼接。
+        String hash = fingerprint(OP_REGISTER_CHECKSUM, name.trim(), String.valueOf(version), checksum);
+        return executeIdempotent(requestId, OP_REGISTER_CHECKSUM, hash, 201,
+                () -> doRegisterChecksum(name.trim(), version, checksum), ChecksumResponse.class);
+    }
+
+    @Override
+    public AttestationResponse attest(String requestId, String name, int version,
+                                      AttestationRequest request) {
+        requireRequestId(requestId);
+        requireName(name);
+        if (request == null || request.role() == null || request.role().isBlank()) {
+            throw ApiException.badRequest("role 不能为空");
+        }
+        String role = request.role().trim();
+        String checksum = normalizeChecksum(request.checksum());
+        // 指纹含操作者（角色）、操作类型与规范化摘要。
+        String hash = fingerprint(OP_ATTEST, name.trim(), String.valueOf(version), role, checksum);
+        return executeIdempotent(requestId, OP_ATTEST, hash, 201,
+                () -> doAttest(name.trim(), version, role, checksum), AttestationResponse.class);
+    }
+
+    @Override
+    public AttestationResponse revokeAttestation(String requestId, String name, int version, String role) {
+        requireRequestId(requestId);
+        requireName(name);
+        if (role == null || role.isBlank()) {
+            throw ApiException.badRequest("role 不能为空");
+        }
+        String hash = fingerprint(OP_REVOKE_ATTESTATION, name.trim(), String.valueOf(version), role.trim());
+        return executeIdempotent(requestId, OP_REVOKE_ATTESTATION, hash, 200,
+                () -> doRevokeAttestation(name.trim(), version, role.trim()), AttestationResponse.class);
+    }
+
+    @Override
+    public AttestationStatusResponse getAttestationStatus(String name, int version) {
+        requireName(name);
+        String trimmed = name.trim();
+        ArtifactVersion artifact = repositoryDao.loadArtifact(trimmed, version);
+        if (artifact == null) {
+            throw ApiException.notFound("制品版本不存在: " + trimmed + ":" + version);
+        }
+        ChecksumRow checksum = repositoryDao.loadChecksum(artifact.id());
+        List<AttestationRow> rows = repositoryDao.listAttestations(artifact.id());
+        int active = 0;
+        List<AttestationView> views = new ArrayList<>();
+        for (AttestationRow row : rows) {
+            boolean valid = !row.revoked() && checksum != null
+                    && row.checksum().equals(checksum.checksum());
+            if (valid) {
+                active++;
+            }
+            views.add(new AttestationView(row.role(), row.checksum(), row.revoked(),
+                    row.createdAt(), row.revokedAt()));
+        }
+        return new AttestationStatusResponse(trimmed, version,
+                checksum == null ? null : checksum.checksum(),
+                repositoryDao.getAttestationVersion(artifact.id()),
+                REQUIRED_ATTESTATIONS, active, Math.max(0, REQUIRED_ATTESTATIONS - active),
+                List.copyOf(views));
     }
 
     @Override
@@ -167,6 +258,85 @@ public class ArtifactServiceImpl implements ArtifactService {
                 Instant.now(clock), toDependencyViews(artifact.dependencies()));
     }
 
+    private ChecksumResponse doRegisterChecksum(String name, int version, String checksum) {
+        ArtifactVersion artifact = repositoryDao.loadArtifact(name, version);
+        if (artifact == null) {
+            throw ApiException.notFound("制品版本不存在: " + name + ":" + version);
+        }
+        if (artifact.withdrawn()) {
+            throw ApiException.conflict("制品版本已撤回，无法登记摘要: " + name + ":" + version);
+        }
+        ChecksumRow existing = repositoryDao.loadChecksum(artifact.id());
+        if (existing != null) {
+            if (existing.checksum().equals(checksum)) {
+                // 同值重复登记：幂等无操作，返回当前状态，不改写历史。
+                return new ChecksumResponse(name, version, checksum,
+                        repositoryDao.getAttestationVersion(artifact.id()), existing.registeredAt());
+            }
+            throw ApiException.conflict("制品版本已登记不同摘要: " + name + ":" + version
+                    + "，已登记=" + existing.checksum() + "，本次=" + checksum);
+        }
+        Instant now = Instant.now(clock);
+        repositoryDao.insertChecksum(artifact.id(), checksum, currentRequestId.get(), now);
+        return new ChecksumResponse(name, version, checksum,
+                repositoryDao.getAttestationVersion(artifact.id()), now);
+    }
+
+    private AttestationResponse doAttest(String name, int version, String role, String checksum) {
+        ArtifactVersion artifact = repositoryDao.loadArtifact(name, version);
+        if (artifact == null) {
+            throw ApiException.notFound("制品版本不存在: " + name + ":" + version);
+        }
+        if (artifact.withdrawn()) {
+            throw ApiException.conflict("制品版本已撤回，无法见证: " + name + ":" + version);
+        }
+        ChecksumRow registered = repositoryDao.loadChecksum(artifact.id());
+        if (registered == null) {
+            throw ApiException.unprocessable("制品版本尚未登记摘要，无法见证: " + name + ":" + version);
+        }
+        if (!registered.checksum().equals(checksum)) {
+            throw ApiException.unprocessable("见证摘要与已登记摘要不一致: " + name + ":" + version
+                    + "，已登记=" + registered.checksum() + "，见证=" + checksum);
+        }
+        AttestationRow existing = repositoryDao.findAttestation(artifact.id(), role);
+        if (existing != null && !existing.revoked()) {
+            throw ApiException.conflict("同角色已存在有效见证: " + name + ":" + version
+                    + " 角色=" + role);
+        }
+        Instant now = Instant.now(clock);
+        Instant createdAt;
+        if (existing != null) {
+            // 同角色曾撤销：重新激活原记录，保留首次见证时间，不改写历史字段。
+            repositoryDao.reactivateAttestation(existing.id(), checksum, currentRequestId.get());
+            createdAt = existing.createdAt();
+        } else {
+            repositoryDao.insertAttestation(artifact.id(), role, checksum, currentRequestId.get(), now);
+            createdAt = now;
+        }
+        int attestationVersion = repositoryDao.incrementAttestationVersion(artifact.id());
+        return new AttestationResponse(name, version, role, checksum, false,
+                attestationVersion, createdAt, null);
+    }
+
+    private AttestationResponse doRevokeAttestation(String name, int version, String role) {
+        ArtifactVersion artifact = repositoryDao.loadArtifact(name, version);
+        if (artifact == null) {
+            throw ApiException.notFound("制品版本不存在: " + name + ":" + version);
+        }
+        AttestationRow existing = repositoryDao.findAttestation(artifact.id(), role);
+        if (existing == null) {
+            throw ApiException.notFound("见证不存在: " + name + ":" + version + " 角色=" + role);
+        }
+        if (existing.revoked()) {
+            throw ApiException.conflict("见证已撤销: " + name + ":" + version + " 角色=" + role);
+        }
+        Instant now = Instant.now(clock);
+        repositoryDao.markAttestationRevoked(existing.id(), now);
+        int attestationVersion = repositoryDao.incrementAttestationVersion(artifact.id());
+        return new AttestationResponse(name, version, role, existing.checksum(), true,
+                attestationVersion, existing.createdAt(), now);
+    }
+
     private LockFileResponse doLock(LockRequest request) {
         String rootName = request.rootName().trim();
         int rootVersion = request.rootVersion();
@@ -193,14 +363,63 @@ public class ArtifactServiceImpl implements ArtifactService {
                     "不存在满足全部依赖区间的未撤回版本组合，无法锁定");
         }
 
+        // 逐一验证闭包内版本的摘要与双人见证状态；按名称升序收集，失败原因稳定。
+        Map<String, ArtifactVersion> closure = resolveClosureVersions(snapshot, solution);
+        Map<String, String> checksums = new LinkedHashMap<>();
+        Map<String, Integer> attestationVersions = new LinkedHashMap<>();
+        List<String> failures = new ArrayList<>();
+        for (Map.Entry<String, ArtifactVersion> entry : closure.entrySet()) {
+            String label = entry.getKey() + ":" + entry.getValue().version();
+            long artifactId = entry.getValue().id();
+            ChecksumRow checksum = repositoryDao.loadChecksum(artifactId);
+            if (checksum == null) {
+                failures.add(label + " 未登记内容校验摘要（要求已登记 sha256 摘要）");
+                continue;
+            }
+            long activeRoles = repositoryDao.listAttestations(artifactId).stream()
+                    .filter(a -> !a.revoked() && a.checksum().equals(checksum.checksum()))
+                    .map(AttestationRow::role)
+                    .distinct()
+                    .count();
+            if (activeRoles < REQUIRED_ATTESTATIONS) {
+                failures.add(label + " 有效见证不足（实际=" + activeRoles
+                        + "，要求=" + REQUIRED_ATTESTATIONS
+                        + "，差额=" + (REQUIRED_ATTESTATIONS - activeRoles) + "）");
+                continue;
+            }
+            checksums.put(entry.getKey(), checksum.checksum());
+            attestationVersions.put(entry.getKey(), repositoryDao.getAttestationVersion(artifactId));
+        }
+        if (!failures.isEmpty()) {
+            throw ApiException.unprocessable(
+                    "依赖闭包存在未通过校验见证的版本，锁定失败: " + String.join("；", failures));
+        }
+
         Instant now = Instant.now(clock);
         long lockFileId = repositoryDao.insertLockFile(rootName, rootVersion, currentVersion,
                 currentRequestId.get(), now);
-        solution.forEach((n, v) -> repositoryDao.insertLockEntry(lockFileId, n, v));
+        solution.forEach((n, v) -> repositoryDao.insertLockEntry(lockFileId, n, v,
+                checksums.get(n), attestationVersions.get(n)));
 
         List<LockEntryResponse> entries = new ArrayList<>();
-        solution.forEach((n, v) -> entries.add(new LockEntryResponse(n, v)));
+        solution.forEach((n, v) -> entries.add(new LockEntryResponse(n, v,
+                checksums.get(n), attestationVersions.get(n))));
         return new LockFileResponse(lockFileId, rootName, rootVersion, currentVersion, now, entries);
+    }
+
+    /** 按名称升序定位闭包内每个精确版本对应的快照对象。 */
+    private static Map<String, ArtifactVersion> resolveClosureVersions(RepositorySnapshot snapshot,
+                                                                       Map<String, Integer> solution) {
+        Map<String, ArtifactVersion> closure = new TreeMap<>();
+        solution.forEach((name, version) -> {
+            for (ArtifactVersion candidate : snapshot.artifacts().getOrDefault(name, List.of())) {
+                if (candidate.version() == version) {
+                    closure.put(name, candidate);
+                    return;
+                }
+            }
+        });
+        return closure;
     }
 
     // ------------------------------------------------------------------
@@ -271,6 +490,36 @@ public class ArtifactServiceImpl implements ArtifactService {
     // 校验与转换
     // ------------------------------------------------------------------
 
+    /**
+     * 校验并规范化摘要：要求 {@code sha256:<64位十六进制>}，统一转小写。
+     * 格式非法返回 422。
+     */
+    private static String normalizeChecksum(String raw) {
+        if (raw == null || raw.isBlank()) {
+            throw ApiException.unprocessable("摘要格式非法：不能为空，要求 sha256:<64位十六进制>");
+        }
+        String value = raw.trim().toLowerCase(Locale.ROOT);
+        if (!CHECKSUM_PATTERN.matcher(value).matches()) {
+            throw ApiException.unprocessable("摘要格式非法：要求 sha256:<64位十六进制>，实际=" + raw.trim());
+        }
+        return value;
+    }
+
+    /**
+     * 幂等指纹：操作类型 + 规范化字段经 JSON 数组序列化后取 SHA-256，
+     * 避免未转义分隔符拼接导致的字段边界歧义。
+     */
+    private String fingerprint(String operation, String... fields) {
+        List<String> parts = new ArrayList<>();
+        parts.add(operation);
+        parts.addAll(List.of(fields));
+        try {
+            return sha256(objectMapper.writeValueAsString(parts));
+        } catch (Exception e) {
+            throw new IllegalStateException("幂等指纹序列化失败", e);
+        }
+    }
+
     private void validateRegisterRequest(RegisterArtifactRequest request) {
         if (request.name() == null || request.name().isBlank()) {
             throw ApiException.badRequest("name 不能为空");
@@ -319,7 +568,8 @@ public class ArtifactServiceImpl implements ArtifactService {
 
     private LockFileResponse toLockResponse(LockFileRow row, List<LockEntryRow> entries) {
         List<LockEntryResponse> entryViews = entries.stream()
-                .map(e -> new LockEntryResponse(e.name(), e.version()))
+                .map(e -> new LockEntryResponse(e.name(), e.version(),
+                        e.checksum(), e.attestationVersion()))
                 .toList();
         return new LockFileResponse(row.id(), row.rootName(), row.rootVersion(),
                 row.repositoryVersion(), row.createdAt(), entryViews);
@@ -328,6 +578,12 @@ public class ArtifactServiceImpl implements ArtifactService {
     private void requireRequestId(String requestId) {
         if (requestId == null || requestId.isBlank()) {
             throw ApiException.badRequest("缺少请求头 X-Request-Id");
+        }
+    }
+
+    private void requireName(String name) {
+        if (name == null || name.isBlank()) {
+            throw ApiException.badRequest("name 不能为空");
         }
     }
 
