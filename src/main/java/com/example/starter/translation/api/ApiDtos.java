@@ -1,6 +1,7 @@
 package com.example.starter.translation.api;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.databind.JsonNode;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
@@ -8,6 +9,7 @@ import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.PositiveOrZero;
 import jakarta.validation.constraints.Size;
 
+import java.util.Comparator;
 import java.util.List;
 
 /**
@@ -18,10 +20,12 @@ public final class ApiDtos {
     private ApiDtos() {
     }
 
-    /** 初始段落输入。 */
+    /** 初始段落输入；placeholders 为可选版式占位符声明，null 表示未声明。 */
     public record SegmentInput(
             @NotBlank(message = "segmentId 不能为空") @Size(max = 64) String segmentId,
-            @NotBlank(message = "sourceText 不能为空") String sourceText) {
+            @NotBlank(message = "sourceText 不能为空") String sourceText,
+            @Size(max = 100, message = "占位符最多 100 个")
+            List<@NotBlank(message = "占位符不能为空") @Size(max = 128) String> placeholders) {
     }
 
     /** 建文档请求：1~5 种目标语言，可携带初始段落。 */
@@ -32,17 +36,26 @@ public final class ApiDtos {
             @NotNull(message = "segments 不能为空") List<@Valid SegmentInput> segments) {
     }
 
-    /** 增加段落请求。 */
+    /** 增加段落请求；placeholders 为可选版式占位符声明，null 表示未声明。 */
     public record AddSegmentRequest(
             @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
             @NotBlank(message = "segmentId 不能为空") @Size(max = 64) String segmentId,
-            @NotBlank(message = "sourceText 不能为空") String sourceText) {
+            @NotBlank(message = "sourceText 不能为空") String sourceText,
+            @Size(max = 100, message = "占位符最多 100 个")
+            List<@NotBlank(message = "占位符不能为空") @Size(max = 128) String> placeholders) {
     }
 
     /** 源文修订请求。 */
     public record ReviseSourceRequest(
             @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
             @NotBlank(message = "sourceText 不能为空") String sourceText) {
+    }
+
+    /** 占位符修订请求：整体替换声明（可为空数组表示不允许任何占位符），源文版本加一。 */
+    public record RevisePlaceholdersRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @NotNull(message = "placeholders 不能为空") @Size(max = 100, message = "占位符最多 100 个")
+            List<@NotBlank(message = "占位符不能为空") @Size(max = 128) String> placeholders) {
     }
 
     /** 译文提交请求；作者取 X-Actor-Id 请求头。 */
@@ -56,6 +69,37 @@ public final class ApiDtos {
     public record ApproveTranslationRequest(
             @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
             @Positive(message = "translationVersion 必须为正数") int translationVersion) {
+    }
+
+    /** 批量批准的单项：段落、语言与期望译文版本。 */
+    public record BatchApproveItem(
+            @NotBlank(message = "segmentId 不能为空") @Size(max = 64) String segmentId,
+            @NotBlank(message = "language 不能为空") String language,
+            @Positive(message = "translationVersion 必须为正数") int translationVersion) {
+    }
+
+    /**
+     * 批量批准请求：任一项不完整则整次不改变批准状态。
+     * 构造时按 (segmentId, language) 规范排序 items，保证幂等指纹与处理顺序稳定，
+     * 不依赖客户端传入顺序，也不通过未转义分隔符拼接集合。
+     */
+    public record BatchApproveRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @NotNull(message = "items 不能为空") @Size(min = 1, max = 100, message = "批量批准须为 1~100 项")
+            List<@Valid BatchApproveItem> items) {
+        public BatchApproveRequest {
+            if (items != null) {
+                items = items.stream()
+                        .sorted(Comparator.comparing(BatchApproveItem::segmentId)
+                                .thenComparing(BatchApproveItem::language))
+                        .toList();
+            }
+        }
+    }
+
+    /** 撤回批准请求；操作者取 X-Actor-Id 请求头。 */
+    public record WithdrawApprovalRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId) {
     }
 
     /** 发布请求：携带期望的草稿与发布版本做乐观校验。 */
@@ -100,6 +144,15 @@ public final class ApiDtos {
                                    int translationVersion, int sourceVersion) {
     }
 
+    /** 批量批准响应：approvedCount 为实际批准数量，approvals 按 (segmentId, language) 规范排序。 */
+    public record BatchApproveResponse(long documentId, int approvedCount, List<ApprovalResponse> approvals) {
+    }
+
+    /** 撤回批准响应：携带被撤回批准的业务证据（原审核人与版本）。 */
+    public record WithdrawalResponse(long documentId, String segmentId, String language, String withdrawnBy,
+                                     String previousReviewer, int translationVersion, int sourceVersion) {
+    }
+
     /** 发布响应。 */
     public record PublishResponse(long documentId, int publishedVersion) {
     }
@@ -125,11 +178,72 @@ public final class ApiDtos {
     public record TermStatusResponse(long documentId, int termVersion, List<TranslationTermStatus> translations) {
     }
 
-    /** 统一错误响应；violations 仅在术语违规 422 时返回，含全部违规术语。 */
+    /** 占位符计数差异：要求值与实际值；expectedCount > actualCount 为缺失，反之为额外。 */
+    public record PlaceholderMismatchView(String segmentId, String language, String placeholder,
+                                          int expectedCount, int actualCount) {
+    }
+
+    /** 批量批准中单项的失败原因。 */
+    public record BatchItemErrorView(String segmentId, String language, String reason, String message) {
+    }
+
+    /** 操作历史记录视图：字段、排序、时间精度与 null 语义稳定；occurredAt 为 UTC ISO-8601。 */
+    public record HistoryView(long historyId, String operation, String segmentId, String language,
+                              String actor, JsonNode detail, String occurredAt) {
+    }
+
+    /** 操作历史查询响应：records 按 (occurredAt, historyId) 升序稳定排序。 */
+    public record HistoryListView(long documentId, List<HistoryView> records) {
+    }
+
+    /** 段落明细中某语言的译文状态；无译文时译文相关字段为 null。 */
+    public record TranslationStatusView(String language, boolean translationExists, String content,
+                                        String author, Integer translationVersion, Integer sourceVersion,
+                                        Integer termVersion, Boolean sourceStale, Boolean approved,
+                                        String reviewer) {
+    }
+
+    /** 段落明细：源文、版本、占位符声明（null 表示未声明）及各目标语言译文状态。 */
+    public record SegmentDetailView(long documentId, String segmentId, String sourceText, int sourceVersion,
+                                    List<String> placeholders, List<TranslationStatusView> translations) {
+    }
+
+    /** 单条译文的发布就绪诊断：占位符计数给出要求值与实际值（无译文或未声明时为 null）。 */
+    public record TranslationDiagnostics(String language, boolean translationExists, Integer translationVersion,
+                                         Boolean sourceStale, Boolean termStale, boolean approved,
+                                         boolean placeholdersDeclared, Boolean placeholdersMatch,
+                                         Integer expectedPlaceholderCount, Integer actualPlaceholderCount,
+                                         boolean publishReady) {
+    }
+
+    /** 单段的发布就绪诊断。 */
+    public record SegmentDiagnostics(String segmentId, int sourceVersion, List<String> placeholders,
+                                     List<TranslationDiagnostics> translations) {
+    }
+
+    /**
+     * 文档发布就绪诊断：数量字段均返回实际值与要求值。
+     * requiredApprovalCount = 段落数 × 目标语言数；readyCount 为当前可发布的段落-语言组合数。
+     */
+    public record DiagnosticsView(long documentId, int draftVersion, int publishedVersion, int termVersion,
+                                  int segmentCount, int languageCount, int requiredApprovalCount,
+                                  int approvedCount, int readyCount, List<SegmentDiagnostics> segments) {
+    }
+
+    /**
+     * 统一错误响应；violations 仅在术语违规 422 时返回，placeholderMismatches 仅在占位符不一致 422 时返回，
+     * items 仅在批量批准不完整 422 时返回，均含全部明细。
+     */
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    public record ErrorResponse(String error, String message, List<TermRuleView> violations) {
+    public record ErrorResponse(String error, String message, List<TermRuleView> violations,
+                                List<PlaceholderMismatchView> placeholderMismatches,
+                                List<BatchItemErrorView> items) {
         public ErrorResponse(String error, String message) {
-            this(error, message, null);
+            this(error, message, null, null, null);
+        }
+
+        public ErrorResponse(String error, String message, List<TermRuleView> violations) {
+            this(error, message, violations, null, null);
         }
     }
 }

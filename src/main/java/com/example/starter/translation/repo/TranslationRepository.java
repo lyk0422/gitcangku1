@@ -2,10 +2,12 @@ package com.example.starter.translation.repo;
 
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
+import com.example.starter.translation.domain.Rows.HistoryRow;
 import com.example.starter.translation.domain.Rows.RequestLogRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
 import com.example.starter.translation.domain.Rows.TranslationRow;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.jdbc.support.GeneratedKeyHolder;
@@ -13,6 +15,9 @@ import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.stereotype.Repository;
 
 import java.sql.PreparedStatement;
+import java.sql.Timestamp;
+import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
@@ -31,8 +36,36 @@ public class TranslationRepository {
             rs.getInt("published_version"),
             rs.getInt("term_version"));
 
+    private static final ObjectMapper JSON = new ObjectMapper();
+
     private static final RowMapper<SegmentRow> SEGMENT_MAPPER = (rs, n) -> new SegmentRow(
-            rs.getString("segment_id"), rs.getString("source_text"), rs.getInt("source_version"));
+            rs.getString("segment_id"), rs.getString("source_text"), rs.getInt("source_version"),
+            parsePlaceholders(rs.getString("placeholders")));
+
+    /** 解析占位符声明 JSON；NULL 表示未声明，返回 null。 */
+    private static List<String> parsePlaceholders(String json) {
+        if (json == null) {
+            return null;
+        }
+        try {
+            return List.copyOf(JSON.readValue(json,
+                    JSON.getTypeFactory().constructCollectionType(List.class, String.class)));
+        } catch (Exception e) {
+            throw new IllegalStateException("占位符声明反序列化失败", e);
+        }
+    }
+
+    /** 序列化占位符声明；null 表示未声明，存 NULL。 */
+    public static String placeholdersToJson(List<String> placeholders) {
+        if (placeholders == null) {
+            return null;
+        }
+        try {
+            return JSON.writeValueAsString(placeholders);
+        } catch (Exception e) {
+            throw new IllegalStateException("占位符声明序列化失败", e);
+        }
+    }
 
     private static final RowMapper<TranslationRow> TRANSLATION_MAPPER = (rs, n) -> new TranslationRow(
             rs.getString("segment_id"), rs.getString("language"), rs.getString("content"),
@@ -100,14 +133,27 @@ public class TranslationRepository {
         jdbc.update("UPDATE document SET term_version = ? WHERE document_id = ?", termVersion, documentId);
     }
 
-    public void insertSegment(long documentId, String segmentId, String sourceText) {
-        jdbc.update("INSERT INTO segment (document_id, segment_id, source_text, source_version) VALUES (?, ?, ?, 1)",
-                documentId, segmentId, sourceText);
+    public void insertSegment(long documentId, String segmentId, String sourceText, List<String> placeholders) {
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO segment (document_id, segment_id, source_text, source_version, placeholders) "
+                            + "VALUES (?, ?, ?, 1, ?)");
+            ps.setLong(1, documentId);
+            ps.setString(2, segmentId);
+            ps.setString(3, sourceText);
+            String json = placeholdersToJson(placeholders);
+            if (json == null) {
+                ps.setNull(4, java.sql.Types.LONGVARCHAR);
+            } else {
+                ps.setString(4, json);
+            }
+            return ps;
+        });
     }
 
     public Optional<SegmentRow> findSegment(long documentId, String segmentId) {
         List<SegmentRow> rows = jdbc.query(
-                "SELECT segment_id, source_text, source_version FROM segment "
+                "SELECT segment_id, source_text, source_version, placeholders FROM segment "
                         + "WHERE document_id = ? AND segment_id = ?",
                 SEGMENT_MAPPER, documentId, segmentId);
         return rows.stream().findFirst();
@@ -115,7 +161,7 @@ public class TranslationRepository {
 
     public List<SegmentRow> listSegments(long documentId) {
         return jdbc.query(
-                "SELECT segment_id, source_text, source_version FROM segment "
+                "SELECT segment_id, source_text, source_version, placeholders FROM segment "
                         + "WHERE document_id = ? ORDER BY segment_id",
                 SEGMENT_MAPPER, documentId);
     }
@@ -124,6 +170,26 @@ public class TranslationRepository {
         jdbc.update("UPDATE segment SET source_text = ?, source_version = ? "
                         + "WHERE document_id = ? AND segment_id = ?",
                 sourceText, sourceVersion, documentId, segmentId);
+    }
+
+    /** 修订占位符声明并递增源文版本；placeholders 为 null 时存 NULL（未声明）。 */
+    public void updateSegmentPlaceholders(long documentId, String segmentId, List<String> placeholders,
+                                          int sourceVersion) {
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "UPDATE segment SET placeholders = ?, source_version = ? "
+                            + "WHERE document_id = ? AND segment_id = ?");
+            String json = placeholdersToJson(placeholders);
+            if (json == null) {
+                ps.setNull(1, java.sql.Types.LONGVARCHAR);
+            } else {
+                ps.setString(1, json);
+            }
+            ps.setInt(2, sourceVersion);
+            ps.setLong(3, documentId);
+            ps.setString(4, segmentId);
+            return ps;
+        });
     }
 
     public Optional<TranslationRow> findTranslation(long documentId, String segmentId, String language) {
@@ -240,5 +306,59 @@ public class TranslationRepository {
     public void insertRequestLog(String requestId, String requestHash, int responseStatus, String responseBody) {
         jdbc.update("INSERT INTO request_log (request_id, request_hash, response_status, response_body) "
                 + "VALUES (?, ?, ?, ?)", requestId, requestHash, responseStatus, responseBody);
+    }
+
+    /** 删除批准（撤回）；历史证据已写入 operation_history。 */
+    public void deleteApproval(long documentId, String segmentId, String language) {
+        jdbc.update("DELETE FROM approval WHERE document_id = ? AND segment_id = ? AND language = ?",
+                documentId, segmentId, language);
+    }
+
+    /** 追加一条操作历史；记录不可变，occurredAt 为 UTC 时间。 */
+    public void insertHistory(long documentId, String operation, String segmentId, String language,
+                              String actor, String detailJson, Instant occurredAt) {
+        jdbc.update("INSERT INTO operation_history (document_id, operation, segment_id, language, actor, "
+                        + "detail_json, occurred_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                documentId, operation, segmentId, language, actor, detailJson,
+                Timestamp.from(occurredAt));
+    }
+
+    /**
+     * 查询操作历史：时间区间左闭右开（occurred_at >= from 且 < to），
+     * 可选按操作类型、段落、语言过滤；按 (occurred_at, history_id) 升序稳定排序。
+     */
+    public List<HistoryRow> listHistory(long documentId, Instant from, Instant to, String operation,
+                                        String segmentId, String language) {
+        StringBuilder sql = new StringBuilder(
+                "SELECT history_id, operation, segment_id, language, actor, detail_json, occurred_at "
+                        + "FROM operation_history WHERE document_id = ?");
+        List<Object> args = new ArrayList<>();
+        args.add(documentId);
+        if (from != null) {
+            sql.append(" AND occurred_at >= ?");
+            args.add(Timestamp.from(from));
+        }
+        if (to != null) {
+            sql.append(" AND occurred_at < ?");
+            args.add(Timestamp.from(to));
+        }
+        if (operation != null) {
+            sql.append(" AND operation = ?");
+            args.add(operation);
+        }
+        if (segmentId != null) {
+            sql.append(" AND segment_id = ?");
+            args.add(segmentId);
+        }
+        if (language != null) {
+            sql.append(" AND language = ?");
+            args.add(language);
+        }
+        sql.append(" ORDER BY occurred_at, history_id");
+        return jdbc.query(sql.toString(),
+                (rs, n) -> new HistoryRow(rs.getLong("history_id"), rs.getString("operation"),
+                        rs.getString("segment_id"), rs.getString("language"), rs.getString("actor"),
+                        rs.getString("detail_json"), rs.getTimestamp("occurred_at").toInstant()),
+                args.toArray());
     }
 }

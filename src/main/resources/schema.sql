@@ -22,13 +22,15 @@ CREATE TABLE IF NOT EXISTS segment (
     segment_id VARCHAR(64) NOT NULL,
     source_text LONGTEXT NOT NULL,
     source_version INT NOT NULL,
+    placeholders LONGTEXT NULL,
     PRIMARY KEY (document_id, segment_id)
 );
-COMMENT ON TABLE segment IS '段落：文档内唯一 segmentId，含源文及源文版本';
+COMMENT ON TABLE segment IS '段落：文档内唯一 segmentId，含源文、源文版本及版式占位符声明';
 COMMENT ON COLUMN segment.document_id IS '所属文档 ID';
 COMMENT ON COLUMN segment.segment_id IS '文档内唯一段落 ID';
 COMMENT ON COLUMN segment.source_text IS '源文正文，UTF-8';
-COMMENT ON COLUMN segment.source_version IS '源文版本，从 1 开始，每次源文修订加一';
+COMMENT ON COLUMN segment.source_version IS '源文版本，从 1 开始，每次源文或占位符修订加一';
+COMMENT ON COLUMN segment.placeholders IS '版式占位符声明，JSON 数组字符串，按 Unicode 码点升序规范排序，重复元素表示要求的出现次数；NULL 表示未声明（译文不做占位符校验）';
 
 CREATE TABLE IF NOT EXISTS translation (
     document_id BIGINT NOT NULL,
@@ -110,6 +112,28 @@ COMMENT ON COLUMN term_rule.term_version IS '所属术语版本号';
 COMMENT ON COLUMN term_rule.source_term IS '源文术语，Unicode 原文、区分大小写，按连续子串匹配';
 COMMENT ON COLUMN term_rule.language IS '目标语言码，小写';
 COMMENT ON COLUMN term_rule.required_translation IS '该术语在目标语言中的必译文本，非空';
+
+CREATE TABLE IF NOT EXISTS operation_history (
+    history_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    document_id BIGINT NOT NULL,
+    operation VARCHAR(32) NOT NULL,
+    segment_id VARCHAR(64) NULL,
+    language VARCHAR(16) NULL,
+    actor VARCHAR(128) NULL,
+    detail_json LONGTEXT NOT NULL,
+    occurred_at TIMESTAMP(6) NOT NULL
+);
+COMMENT ON TABLE operation_history IS '操作历史：源段修订、占位符修订、译文批准、批准撤回与发布的不可变业务证据，后续操作不得改写';
+COMMENT ON COLUMN operation_history.history_id IS '历史记录 ID，自增；同一操作产生的多条记录按 ID 升序稳定排序';
+COMMENT ON COLUMN operation_history.document_id IS '所属文档 ID';
+COMMENT ON COLUMN operation_history.operation IS '操作类型：SOURCE_REVISED 源文修订、PLACEHOLDERS_REVISED 占位符修订、TRANSLATION_APPROVED 译文批准、APPROVAL_WITHDRAWN 批准撤回、PUBLISHED 发布';
+COMMENT ON COLUMN operation_history.segment_id IS '涉及段落 ID；NULL 表示该操作不针对单一段落（如发布）';
+COMMENT ON COLUMN operation_history.language IS '涉及目标语言码，小写；NULL 表示该操作不针对单一语言';
+COMMENT ON COLUMN operation_history.actor IS '操作者，取 X-Actor-Id；NULL 表示该操作不记录操作者（如源文修订）';
+COMMENT ON COLUMN operation_history.detail_json IS '操作发生时的业务证据 JSON（版本号、占位符、审核人等），写入后不可变';
+COMMENT ON COLUMN operation_history.occurred_at IS '操作发生时间，UTC，精度到微秒；区间查询按左闭右开解释';
+
+CREATE INDEX IF NOT EXISTS idx_operation_history_doc ON operation_history (document_id, occurred_at, history_id);
 
 CREATE TABLE IF NOT EXISTS request_log (
     request_id VARCHAR(128) PRIMARY KEY,

@@ -41,6 +41,7 @@ public abstract class AbstractIntegrationTest {
         jdbc.update("DELETE FROM release_snapshot");
         jdbc.update("DELETE FROM term_rule");
         jdbc.update("DELETE FROM term_version");
+        jdbc.update("DELETE FROM operation_history");
         jdbc.update("DELETE FROM request_log");
         jdbc.update("DELETE FROM document");
     }
@@ -128,6 +129,28 @@ public abstract class AbstractIntegrationTest {
         String body = "{\"requestId\":\"" + requestId + "\",\"expectedTermVersion\":" + expectedTermVersion
                 + ",\"rules\":" + rulesJson + "}";
         return putJson("/api/documents/" + documentId + "/terms", body);
+    }
+
+    /** 修订占位符：placeholdersJson 为占位符数组 JSON。 */
+    protected ApiResult revisePlaceholders(long documentId, String segmentId, String placeholdersJson,
+                                           String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"placeholders\":" + placeholdersJson + "}";
+        return putJson("/api/documents/" + documentId + "/segments/" + segmentId + "/placeholders", body);
+    }
+
+    /** 批量批准：itemsJson 为批量项数组 JSON。 */
+    protected ApiResult batchApprove(long documentId, String actorId, String itemsJson,
+                                     String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"items\":" + itemsJson + "}";
+        return postJson("/api/documents/" + documentId + "/approvals/batch", body, actorId);
+    }
+
+    /** 撤回批准。 */
+    protected ApiResult withdraw(long documentId, String segmentId, String language, String actorId,
+                                 String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\"}";
+        return postJson("/api/documents/" + documentId + "/segments/" + segmentId + "/translations/" + language
+                + "/withdraw", body, actorId);
     }
 
     /** HTTP 响应结果：状态码与 JSON 响应体。 */

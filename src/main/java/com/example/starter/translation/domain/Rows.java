@@ -24,13 +24,16 @@ public final class Rows {
     }
 
     /**
-     * 段落：文档内唯一 segmentId，含源文及源文版本。
+     * 段落：文档内唯一 segmentId，含源文、源文版本及版式占位符声明。
      *
      * @param segmentId     文档内唯一段落 ID
      * @param sourceText    源文正文，UTF-8
-     * @param sourceVersion 源文版本，从 1 开始，每次源文修订加一
+     * @param sourceVersion 源文版本，从 1 开始，每次源文或占位符修订加一
+     * @param placeholders  版式占位符声明，按 Unicode 码点升序规范排序，重复元素表示要求的出现次数；
+     *                      null 表示未声明（译文不做占位符校验）
      */
-    public record SegmentRow(String segmentId, String sourceText, int sourceVersion) {
+    public record SegmentRow(String segmentId, String sourceText, int sourceVersion,
+                             List<String> placeholders) {
     }
 
     /**
@@ -81,5 +84,21 @@ public final class Rows {
      */
     public record RequestLogRow(String requestId, String requestHash,
                                 int responseStatus, String responseBody) {
+    }
+
+    /**
+     * 操作历史：源段修订、占位符修订、译文批准、批准撤回与发布的不可变业务证据。
+     *
+     * @param historyId  历史记录 ID，自增；同一操作产生的多条记录按 ID 升序稳定排序
+     * @param operation  操作类型：SOURCE_REVISED、PLACEHOLDERS_REVISED、TRANSLATION_APPROVED、
+     *                   APPROVAL_WITHDRAWN、PUBLISHED
+     * @param segmentId  涉及段落 ID；null 表示该操作不针对单一段落
+     * @param language   涉及目标语言码，小写；null 表示该操作不针对单一语言
+     * @param actor      操作者；null 表示该操作不记录操作者
+     * @param detailJson 操作发生时的业务证据 JSON，写入后不可变
+     * @param occurredAt 操作发生时间，UTC，精度到微秒
+     */
+    public record HistoryRow(long historyId, String operation, String segmentId, String language,
+                             String actor, String detailJson, java.time.Instant occurredAt) {
     }
 }
