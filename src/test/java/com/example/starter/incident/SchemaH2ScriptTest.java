@@ -108,6 +108,63 @@ class SchemaH2ScriptTest {
                     duplicateBlockerRejected = true;
                 }
                 assertThat(duplicateBlockerRejected).isTrue();
+
+                // 封存包：(incident_id, version) 唯一，版本不可重复
+                st.execute("INSERT INTO incident_log_seals (incident_id, version, cutoff_at,"
+                        + " sealed_at, created_by, record_count, content_hash) VALUES"
+                        + " (1,1,'" + Timestamp.from(now) + "','" + Timestamp.from(now)
+                        + "','alice',1,'h1')");
+                boolean duplicateSealVersionRejected = false;
+                try {
+                    st.execute("INSERT INTO incident_log_seals (incident_id, version, cutoff_at,"
+                            + " sealed_at, created_by, record_count, content_hash) VALUES"
+                            + " (1,1,'" + Timestamp.from(now) + "','" + Timestamp.from(now)
+                            + "','alice',1,'h2')");
+                } catch (Exception e) {
+                    duplicateSealVersionRejected = true;
+                }
+                assertThat(duplicateSealVersionRejected).isTrue();
+                // 不同事件可各自从版本 1 开始
+                st.execute("INSERT INTO incidents (incident_key, severity, summary, reporter,"
+                        + " status, created_at, updated_at) VALUES ('IK-2','S1','s','r',"
+                        + "'REPORTED','" + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                st.execute("INSERT INTO incident_log_seals (incident_id, version, cutoff_at,"
+                        + " sealed_at, created_by, record_count, content_hash) VALUES"
+                        + " (2,1,'" + Timestamp.from(now) + "','" + Timestamp.from(now)
+                        + "','alice',0,'h3')");
+
+                // 包条目：(seal_id, record_type, record_key) 唯一；序号与依赖边端点可空可非空
+                st.execute("INSERT INTO incident_log_seal_items (seal_id, seq_no, record_type,"
+                        + " record_key, occurred_at, record_version, from_task_key,"
+                        + " to_incident_key, payload) VALUES (1,1,'ACTION','A1','"
+                        + Timestamp.from(now) + "',1,NULL,NULL,'{}')");
+                st.execute("INSERT INTO incident_log_seal_items (seal_id, seq_no, record_type,"
+                        + " record_key, occurred_at, record_version, from_task_key,"
+                        + " to_incident_key, payload) VALUES (1,2,'DEPENDENCY','dep:T1:IK-2','"
+                        + Timestamp.from(now) + "',1,'T1','IK-2','{}')");
+                boolean duplicateItemRejected = false;
+                try {
+                    st.execute("INSERT INTO incident_log_seal_items (seal_id, seq_no, record_type,"
+                            + " record_key, occurred_at, record_version, from_task_key,"
+                            + " to_incident_key, payload) VALUES (1,3,'ACTION','A1','"
+                            + Timestamp.from(now) + "',1,NULL,NULL,'{}')");
+                } catch (Exception e) {
+                    duplicateItemRejected = true;
+                }
+                assertThat(duplicateItemRejected).isTrue();
+
+                // 更正附录：只追加，允许 old_value 为 NULL（保留 null 语义），new_value 非空
+                st.execute("INSERT INTO incident_log_corrections (incident_id, package_version,"
+                        + " record_type, record_key, field_name, old_value, new_value, reason,"
+                        + " operator, created_at) VALUES (1,1,'ACTION','A1','note',NULL,'新值',"
+                        + "'录入错误','alice','" + Timestamp.from(now) + "')");
+                try (ResultSet rs = st.executeQuery(
+                        "SELECT old_value, new_value FROM incident_log_corrections"
+                                + " WHERE incident_id = 1 AND package_version = 1")) {
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getString("old_value")).isNull();
+                    assertThat(rs.getString("new_value")).isEqualTo("新值");
+                }
             }
         }
     }

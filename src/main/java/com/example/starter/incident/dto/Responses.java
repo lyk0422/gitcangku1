@@ -3,6 +3,8 @@ package com.example.starter.incident.dto;
 import java.time.Instant;
 import java.util.List;
 
+import com.fasterxml.jackson.databind.JsonNode;
+
 /**
  * 读接口与写接口响应体集合。时间字段均为 UTC ISO-8601。
  */
@@ -77,5 +79,57 @@ public final class Responses {
 
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
+    }
+
+    /**
+     * 封存包条目视图：seqNo 从 1 开始，按 occurredAt 升序、同刻按 recordType+recordKey 升序；
+     * recordVersion 为封存时记录修订版本；fromTaskKey/toIncidentKey 仅 DEPENDENCY 有值；
+     * payload 为封存时原样固化的记录快照 JSON（保留字段与 null 语义）。
+     */
+    public record SealItemView(int seqNo, String recordType, String recordKey, Instant occurredAt,
+                               int recordVersion, String fromTaskKey, String toIncidentKey,
+                               JsonNode payload) {
+    }
+
+    /**
+     * 封存包视图：版本事件内递增；cutoffAt 为截至 UTC 时刻（左闭右开）；
+     * recordCount 为包内实际条数；contentHash 为包内容摘要；items 按 seqNo 升序。
+     */
+    public record SealView(int version, Instant cutoffAt, Instant sealedAt, String createdBy,
+                           int recordCount, String contentHash, List<SealItemView> items,
+                           List<CorrectionView> corrections) {
+    }
+
+    /**
+     * 事件封存包清单视图：seals 只含元数据（不含条目），按版本升序。
+     */
+    public record SealListView(String incidentKey, int latestVersion, List<SealSummaryView> seals) {
+    }
+
+    /** 封存包摘要视图（清单用）。 */
+    public record SealSummaryView(int version, Instant cutoffAt, Instant sealedAt, String createdBy,
+                                  int recordCount, String contentHash) {
+    }
+
+    /**
+     * 更正附录视图：oldValue 取自原包快照，原值为 null 时为 null；newValue 为更正值。
+     */
+    public record CorrectionView(long id, int packageVersion, String recordType, String recordKey,
+                                 String fieldName, String oldValue, String newValue, String reason,
+                                 String operator, Instant createdAt) {
+    }
+
+    /**
+     * 封存包诊断视图（只读）：actualItemCount 为实际重数条数，storedRecordCount 为包记录的
+     * 要求值；orderingConsistent 为发生时刻+同刻标识排序与序号一致性；
+     * storedHash/recomputedHash 分别为固化摘要与重算摘要；danglingEdges 为当前已无法解析到
+     * 事件的依赖边标识；healthy 为各检查全部通过。
+     */
+    public record SealDiagnosticsView(int version, Instant cutoffAt, int actualItemCount,
+                                      int storedRecordCount, boolean countMatch,
+                                      boolean orderingConsistent, String storedHash,
+                                      String recomputedHash, boolean hashMatch, int edgeCount,
+                                      List<String> danglingEdges, int correctionsCount,
+                                      boolean healthy, String message) {
     }
 }

@@ -63,6 +63,14 @@ public class IncidentTaskRepository {
     }
 
     /**
+     * 带任务与时刻信息的依赖边：fromTaskId/fromTaskKey 为边起点任务，
+     * blockerIncidentKey 为阻塞事件业务键（悬空引用时为 null），createdAt 为边创建 UTC 时刻。
+     */
+    public record TimedEdge(long taskId, String taskKey, long fromIncidentId, long blockerIncidentId,
+                            String blockerIncidentKey, Instant createdAt) {
+    }
+
+    /**
      * 插入 OPEN 任务，返回生成主键。(incident_id, task_key) 唯一约束兜底并发重复插入。
      */
     public long insert(IncidentTask task) {
@@ -199,5 +207,20 @@ public class IncidentTaskRepository {
             }
         }
         return false;
+    }
+
+    /**
+     * 查询全部依赖边及其任务键、所属事件与边创建时刻（左连接阻塞事件以识别悬空引用）。
+     * 封存服务在内存中按截至时刻过滤并做图校验；阻塞事件被合并删除等场景下
+     * blockerIncidentKey 可能为 null，由封存校验按悬空引用处理。
+     */
+    public List<TimedEdge> listAllEdges() {
+        return jdbc.query(
+                "SELECT t.id, t.task_key, t.incident_id, b.blocker_incident_id, i.incident_key,"
+                        + " b.created_at FROM incident_task_blockers b"
+                        + " JOIN incident_tasks t ON t.id = b.task_id"
+                        + " LEFT JOIN incidents i ON i.id = b.blocker_incident_id",
+                (rs, n) -> new TimedEdge(rs.getLong(1), rs.getString(2), rs.getLong(3),
+                        rs.getLong(4), rs.getString(5), rs.getTimestamp(6).toInstant()));
     }
 }

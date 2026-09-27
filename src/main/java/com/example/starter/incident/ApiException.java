@@ -56,4 +56,14 @@ public class ApiException extends RuntimeException {
     public static ApiException illegalTransition(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "ILLEGAL_TRANSITION", message, null);
     }
+
+    /** 409：携带专用错误码与结构化明细的冲突（如封存同刻未完成写入）。 */
+    public static ApiException conflict(String code, String message, Object details) {
+        return new ApiException(HttpStatus.CONFLICT, code, message, details);
+    }
+
+    /** 422：携带专用错误码与结构化明细的语义违规（如截至时刻越界、包内依赖图有环或引用越界）。 */
+    public static ApiException unprocessable(String code, String message, Object details) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, code, message, details);
+    }
 }

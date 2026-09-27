@@ -55,4 +55,21 @@ public final class Requests {
     /** 任务完成/取消请求，操作人由 X-Actor-Id 指定且须为当前指挥人。 */
     public record TaskActionRequest(String commandKey) {
     }
+
+    /**
+     * 日志封存请求：cutoffAt 为封存截至 UTC 时刻（左闭右开，仅含该时刻前记录）；
+     * 不得早于事件创建时刻，不得晚于服务端注入时钟的当前时刻。
+     */
+    public record SealRequest(String commandKey, Instant cutoffAt) {
+    }
+
+    /**
+     * 更正附录追加请求：定位 packageVersion 原包内 (recordType, recordKey) 原记录，
+     * 修正 fieldName 字段；newValue 为更正值，reason 为理由，操作人由 X-Actor-Id 指定。
+     * 原包不修改，只追加附录；事件关闭后仍允许追加。
+     */
+    public record CorrectionRequest(String commandKey, Integer packageVersion, String recordType,
+                                    String recordKey, String fieldName, String newValue,
+                                    String reason) {
+    }
 }

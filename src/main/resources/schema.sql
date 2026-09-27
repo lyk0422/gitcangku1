@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS incident_status_history (
 CREATE TABLE IF NOT EXISTS command_keys (
     id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
     command_key VARCHAR(128) NOT NULL COMMENT '调用方幂等键，全局唯一',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：takeover/transfer_initiate/transfer_accept/action/status/escalation_check/escalation_ack/task_create/task_complete/task_cancel',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：takeover/transfer_initiate/transfer_accept/action/status/escalation_check/escalation_ack/task_create/task_complete/task_cancel/log_seal/log_correction',
     request_hash VARCHAR(64) NOT NULL COMMENT '规范化请求参数的 SHA-256 摘要，用于同键改参检测',
     response_status INT NULL COMMENT '首次成功的 HTTP 状态码；事务提交前必写入',
     response_body MEDIUMTEXT NULL COMMENT '首次成功响应 JSON，用于同键同参重放',
@@ -100,3 +100,45 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY COMMENT '固定为 1 的单行锁；创建任务时 SELECT ... FOR UPDATE 持有，串行化环检测与写入，保证并发反向依赖最终图无环'
 ) COMMENT='任务依赖图全局锁表';
+
+CREATE TABLE IF NOT EXISTS incident_log_seals (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    incident_id BIGINT NOT NULL COMMENT '所属事件 id，关联 incidents.id；版本号事件内从 1 递增',
+    version INT NOT NULL COMMENT '封存包版本，事件内从 1 递增且不可变；(incident_id, version) 唯一',
+    cutoff_at TIMESTAMP(6) NOT NULL COMMENT '封存截至 UTC 时刻；区间左闭右开，仅固化 occurred_at 早于该时刻的记录；不得早于事件创建、不得晚于封存时注入时钟',
+    sealed_at TIMESTAMP(6) NOT NULL COMMENT '封存执行 UTC 时刻（注入时钟）',
+    created_by VARCHAR(128) NOT NULL COMMENT '封存操作人（X-Actor-Id），须为事件当前指挥人',
+    record_count INT NOT NULL COMMENT '包内记录实际条数（要求值即全部符合区间条件的记录，二者必须一致）',
+    content_hash VARCHAR(64) NOT NULL COMMENT '包内容 SHA-256（按 seqNo 排序的规范化条目），封存后不得变化，用于校验不可变性',
+    CONSTRAINT uk_log_seal_version UNIQUE (incident_id, version)
+) COMMENT='事件指挥日志封存包表（不可变快照，后续任务修订、撤销或事件合并不得修改）';
+
+CREATE TABLE IF NOT EXISTS incident_log_seal_items (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    seal_id BIGINT NOT NULL COMMENT '所属封存包 id，关联 incident_log_seals.id',
+    seq_no INT NOT NULL COMMENT '包内序号，从 1 开始；按记录发生 UTC 时刻升序、同刻按记录标识升序确定',
+    record_type VARCHAR(24) NOT NULL COMMENT '记录类型：ACTION 处置记录/TRANSFER 交接/STATUS 状态流转/TASK 任务状态/DEPENDENCY 任务依赖边',
+    record_key VARCHAR(256) NOT NULL COMMENT '记录标识：同刻排序键；ACTION=actionKey、TRANSFER=transfer:<id>、STATUS=status:<id>、TASK=task:<taskKey>、DEPENDENCY=dep:<taskKey>:<blockerIncidentKey>',
+    occurred_at TIMESTAMP(6) NOT NULL COMMENT '记录发生 UTC 时间（微秒精度）；TASK 取创建/完成/取消时刻，DEPENDENCY 取边创建时刻',
+    record_version INT NOT NULL COMMENT '封存时该记录的修订版本，从 1 开始；任务修订/撤销不改原包，仅后续包体现新版本',
+    from_task_key VARCHAR(128) NULL COMMENT 'DEPENDENCY 边起点任务键（任务所属事件内的 taskKey）；其他类型为空',
+    to_incident_key VARCHAR(128) NULL COMMENT 'DEPENDENCY 边终点阻塞事件键；其他类型为空',
+    payload MEDIUMTEXT NOT NULL COMMENT '记录快照 JSON（封存时刻字段值与 null 语义原样固化，随后续业务不改写）',
+    CONSTRAINT uk_log_seal_item UNIQUE (seal_id, record_type, record_key)
+) COMMENT='封存包条目表：排序、版本与任务依赖边随包固化，只追加不更新';
+
+CREATE TABLE IF NOT EXISTS incident_log_corrections (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    incident_id BIGINT NOT NULL COMMENT '所属事件 id，关联 incidents.id',
+    package_version INT NOT NULL COMMENT '被更正原包版本（incident_log_seals.version）；原包本身不修改',
+    record_type VARCHAR(24) NOT NULL COMMENT '被更正记录类型，含义同封存条目',
+    record_key VARCHAR(256) NOT NULL COMMENT '被更正原记录标识，含义同封存条目；必须存在于指定原包',
+    field_name VARCHAR(128) NOT NULL COMMENT '被更正字段名',
+    old_value MEDIUMTEXT NULL COMMENT '原值（取自原包快照）；原值为 null 时存 NULL，保留 null 语义',
+    new_value MEDIUMTEXT NOT NULL COMMENT '新值，不允许为空字符串',
+    reason VARCHAR(1024) NOT NULL COMMENT '更正理由，非空',
+    operator VARCHAR(128) NOT NULL COMMENT '更正操作人（X-Actor-Id）；已关闭事件也允许追加',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '更正追加 UTC 时刻（注入时钟）'
+) COMMENT='封存日志更正附录表：只新增附录，不更新原包';
+
+CREATE INDEX idx_log_corrections_pkg ON incident_log_corrections (incident_id, package_version);

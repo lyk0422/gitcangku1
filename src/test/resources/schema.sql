@@ -99,3 +99,46 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
 );
+
+CREATE TABLE IF NOT EXISTS incident_log_seals (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    version INT NOT NULL,
+    cutoff_at TIMESTAMP(6) NOT NULL,
+    sealed_at TIMESTAMP(6) NOT NULL,
+    created_by VARCHAR(128) NOT NULL,
+    record_count INT NOT NULL,
+    content_hash VARCHAR(64) NOT NULL,
+    CONSTRAINT uk_log_seal_version UNIQUE (incident_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS incident_log_seal_items (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    seal_id BIGINT NOT NULL,
+    seq_no INT NOT NULL,
+    record_type VARCHAR(24) NOT NULL,
+    record_key VARCHAR(256) NOT NULL,
+    occurred_at TIMESTAMP(6) NOT NULL,
+    record_version INT NOT NULL,
+    from_task_key VARCHAR(128) NULL,
+    to_incident_key VARCHAR(128) NULL,
+    payload CLOB NOT NULL,
+    CONSTRAINT uk_log_seal_item UNIQUE (seal_id, record_type, record_key)
+);
+
+CREATE TABLE IF NOT EXISTS incident_log_corrections (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    package_version INT NOT NULL,
+    record_type VARCHAR(24) NOT NULL,
+    record_key VARCHAR(256) NOT NULL,
+    field_name VARCHAR(128) NOT NULL,
+    old_value CLOB NULL,
+    new_value CLOB NOT NULL,
+    reason VARCHAR(1024) NOT NULL,
+    operator VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_log_corrections_pkg
+    ON incident_log_corrections (incident_id, package_version);
