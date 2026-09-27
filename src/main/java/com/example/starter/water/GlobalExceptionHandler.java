@@ -22,25 +22,26 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(ApiException.class)
     public ResponseEntity<ErrorResponse> handleApi(ApiException ex) {
-        return ResponseEntity.status(ex.status()).body(new ErrorResponse(ex.code(), ex.getMessage()));
+        return ResponseEntity.status(ex.status())
+                .body(new ErrorResponse(ex.code(), ex.getMessage(), ex.details()));
     }
 
     @ExceptionHandler({HttpMessageNotReadableException.class, MissingRequestHeaderException.class,
             MethodArgumentTypeMismatchException.class})
     public ResponseEntity<ErrorResponse> handleBadRequest(Exception ex) {
-        return ResponseEntity.badRequest().body(new ErrorResponse("INVALID_ARGUMENT", ex.getMessage()));
+        return ResponseEntity.badRequest().body(new ErrorResponse("INVALID_ARGUMENT", ex.getMessage(), null));
     }
 
     @ExceptionHandler(NoResourceFoundException.class)
     public ResponseEntity<ErrorResponse> handleNotFound(NoResourceFoundException ex) {
         return ResponseEntity.status(HttpStatus.NOT_FOUND)
-                .body(new ErrorResponse("NOT_FOUND", ex.getMessage()));
+                .body(new ErrorResponse("NOT_FOUND", ex.getMessage(), null));
     }
 
     @ExceptionHandler(Exception.class)
     public ResponseEntity<ErrorResponse> handleOther(Exception ex) {
         log.error("unhandled error", ex);
         return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                .body(new ErrorResponse("INTERNAL_ERROR", "internal error"));
+                .body(new ErrorResponse("INTERNAL_ERROR", "internal error", null));
     }
 }
