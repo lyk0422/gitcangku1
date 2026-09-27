@@ -2,26 +2,47 @@ package com.example.starter.water;
 
 import com.example.starter.water.WaterRepository.AllocationRow;
 import com.example.starter.water.WaterRepository.CommandRow;
+import com.example.starter.water.WaterRepository.CorrectionRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
+import com.example.starter.water.WaterRepository.EvaporationRateRow;
+import com.example.starter.water.WaterRepository.SettlementRow;
 import com.example.starter.water.WaterRepository.TransferRow;
 import com.example.starter.water.WaterRepository.WindowRow;
 import com.example.starter.water.dto.Dtos.AllocationResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
+import com.example.starter.water.dto.Dtos.EvaporationRateResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.RateDiagnostic;
+import com.example.starter.water.dto.Dtos.RateDiagnosticResponse;
+import com.example.starter.water.dto.Dtos.SettlementBatchResponse;
+import com.example.starter.water.dto.Dtos.SettlementItemRequest;
+import com.example.starter.water.dto.Dtos.SettlementListResponse;
+import com.example.starter.water.dto.Dtos.SettlementResponse;
+import com.example.starter.water.dto.Dtos.SettlementResultResponse;
+import com.example.starter.water.dto.Dtos.SettlementReversalResponse;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferResponse;
+import com.example.starter.water.dto.Dtos.UpstreamBalance;
 import com.example.starter.water.dto.Dtos.WindowResponse;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.time.Clock;
 import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneOffset;
 import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
@@ -40,20 +61,32 @@ public class WaterService {
     static final String STATUS_REQUESTED = "REQUESTED";
     static final String STATUS_APPROVED = "APPROVED";
     static final String STATUS_CANCELLED = "CANCELLED";
+    static final String STATUS_SETTLED = "SETTLED";
 
     private static final long NANOS_PER_SECOND = 1_000_000_000L;
     private static final Pattern AMOUNT_PATTERN = Pattern.compile("\\d{1,16}(\\.\\d{1,3})?");
+    private static final Pattern RATE_PATTERN = Pattern.compile("0(\\.\\d{1,4})?");
     private static final Pattern KEY_PATTERN = Pattern.compile("[\\w.\\-:]{1,128}");
+    private static final BigDecimal MAX_RATE = new BigDecimal("0.2000");
+    private static final int SETTLEMENT_SCALE = 2;
 
     private final WaterRepository repository;
     private final TransactionTemplate tx;
     private final ObjectMapper objectMapper;
+    private final Clock clock;
 
+    @org.springframework.beans.factory.annotation.Autowired
     public WaterService(WaterRepository repository, PlatformTransactionManager transactionManager,
                         ObjectMapper objectMapper) {
+        this(repository, transactionManager, objectMapper, Clock.systemUTC());
+    }
+
+    public WaterService(WaterRepository repository, PlatformTransactionManager transactionManager,
+                        ObjectMapper objectMapper, Clock clock) {
         this.repository = repository;
         this.tx = new TransactionTemplate(transactionManager);
         this.objectMapper = objectMapper;
+        this.clock = clock;
     }
 
     // ------------------------------------------------------------------
@@ -316,6 +349,534 @@ public class WaterService {
     }
 
     // ------------------------------------------------------------------
+    // 渠道日蒸发率
+    // ------------------------------------------------------------------
+
+    /**
+     * 登记或修改渠道 UTC 自然日蒸发率。首次登记版本为 1；该日首次核销前修改版本加一，
+     * 当日已存在核销记录（已冻结）后修改返回 409。
+     */
+    public EvaporationRateResponse putEvaporationRate(String commandKey, String channelId, String dayUtc,
+                                                      String rateText) {
+        requireKey("commandKey", commandKey);
+        requireKey("channelId", channelId);
+        long dayStart = parseDay("dayUtc", dayUtc);
+        BigDecimal rate = parseRate(rateText);
+        String params = "RATE_PUT|" + channelId + "|" + dayStart + "|" + rate.toPlainString();
+        return runCommand("RATE_PUT", commandKey, params, EvaporationRateResponse.class, () -> {
+            long now = nowNanos();
+            EvaporationRateRow existing = repository.lockRate(channelId, dayStart);
+            if (existing != null && repository.firstSettlementNanos(channelId, dayStart) != null) {
+                throw ApiException.conflict("RATE_FROZEN",
+                        "渠道 " + channelId + " 在 " + dayUtc + " 已有核销，日蒸发率冻结，不能修改");
+            }
+            if (existing == null) {
+                repository.insertRate(channelId, dayStart, rate, now);
+            } else {
+                repository.updateRate(existing.id(), rate, now);
+            }
+            EvaporationRateRow saved = repository.findRate(channelId, dayStart);
+            return toRateResponse(saved, repository.firstSettlementNanos(channelId, dayStart));
+        });
+    }
+
+    /** 查询渠道全部日蒸发率诊断，按 UTC 日升序，读取不改变冻结状态。 */
+    public RateDiagnosticResponse getRateDiagnostic(String channelId) {
+        requireKey("channelId", channelId);
+        List<RateDiagnostic> rates = repository.listRates(channelId).stream()
+                .map(row -> new RateDiagnostic(row.channelId(), toDayUtc(row.dayStartNanos()),
+                        rateText(row.rate()), row.version(),
+                        firstSettlementIso(row.channelId(), row.dayStartNanos()),
+                        repository.firstSettlementNanos(row.channelId(), row.dayStartNanos()) != null))
+                .toList();
+        return new RateDiagnosticResponse(channelId, rates);
+    }
+
+    // ------------------------------------------------------------------
+    // 送达核销
+    // ------------------------------------------------------------------
+
+    /** 单笔送达核销：上游扣减、送达、损耗同事务写入，任一前置不满足整体拒绝。 */
+    public SettlementResultResponse settleDelivery(String commandKey, String settlementKey, Long windowId,
+                                                   String allocationKey, String occurredUtc,
+                                                   String deliveredText, String downstreamUserId,
+                                                   String dayUtc, String actor) {
+        requireKey("commandKey", commandKey);
+        requireKey("settlementKey", settlementKey);
+        requireKey("allocationKey", allocationKey);
+        requireKey("X-Actor-Id", actor);
+        if (windowId == null) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "windowId 不能为空");
+        }
+        SettlementDraft draft = buildDraft(settlementKey, allocationKey, occurredUtc, deliveredText,
+                downstreamUserId, dayUtc);
+        String params = "SETTLEMENT_CREATE|" + settlementKey + "|" + windowId + "|" + allocationKey + "|"
+                + draft.occurredNanos() + "|" + draft.delivered().toPlainString() + "|"
+                + draft.dayStartNanos() + "|" + nvl(downstreamUserId) + "|" + actor;
+        return runCommand("SETTLEMENT_CREATE", commandKey, params, SettlementResultResponse.class,
+                () -> settleInternal(windowId, null, List.of(draft), actor).single());
+    }
+
+    /** 批量送达核销：按完整最终余额与逐笔舍入口径预校验，任一失败整批回滚。 */
+    public SettlementBatchResponse settleBatch(String commandKey, String batchKey, Long windowId,
+                                               List<SettlementItemRequest> items, String actor) {
+        requireKey("commandKey", commandKey);
+        requireKey("batchKey", batchKey);
+        requireKey("X-Actor-Id", actor);
+        if (windowId == null) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "windowId 不能为空");
+        }
+        if (items == null || items.isEmpty()) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "items 至少包含一笔核销明细");
+        }
+        List<SettlementDraft> drafts = new ArrayList<>();
+        java.util.Set<String> seenKeys = new java.util.HashSet<>();
+        for (int i = 0; i < items.size(); i++) {
+            SettlementItemRequest item = items.get(i);
+            if (item == null) {
+                throw ApiException.badRequest("INVALID_ARGUMENT", "items[" + i + "] 不能为空");
+            }
+            requireKeyWithIndex("settlementKey", item.settlementKey(), i);
+            requireKeyWithIndex("allocationKey", item.allocationKey(), i);            if (!seenKeys.add(item.settlementKey())) {
+                throw new ApiException(HttpStatus.BAD_REQUEST, "SETTLEMENT_KEY_DUPLICATED",
+                        "批量明细中 settlementKey 重复: " + item.settlementKey(), null, null, null, i);
+            }
+            drafts.add(buildDraft(item.settlementKey(), item.allocationKey(), item.occurredUtc(),
+                    item.deliveredVolume(), item.downstreamUserId(), item.dayUtc(), i));
+        }
+        StringBuilder digest = new StringBuilder("SETTLEMENT_BATCH|").append(batchKey).append("|")
+                .append(windowId).append("|").append(actor).append("|").append(items.size());
+        for (SettlementDraft draft : drafts) {
+            digest.append('|').append(draft.settlementKey()).append('@').append(draft.allocationKey())
+                    .append('@').append(draft.occurredNanos()).append('@')
+                    .append(draft.delivered().toPlainString()).append('@').append(draft.dayStartNanos())
+                    .append('@').append(nvl(draft.downstreamUserId()));
+        }
+        return runCommand("SETTLEMENT_BATCH", commandKey, digest.toString(), SettlementBatchResponse.class,
+                () -> {
+                    SettlementOutcome outcome = settleInternal(windowId, batchKey, drafts, actor);
+                    return outcome.batch(batchKey, windowId);
+                });
+    }
+
+    /** 反向更正：只追加更正记录并回补上游持有额度，原核销证据不改写。 */
+    public SettlementReversalResponse reverseSettlement(String commandKey, String correctionKey,
+                                                         String settlementKey, String reason, String actor) {
+        requireKey("commandKey", commandKey);
+        requireKey("correctionKey", correctionKey);
+        requireKey("settlementKey", settlementKey);
+        requireKey("X-Actor-Id", actor);
+        if (reason == null || reason.isBlank()) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "reason 不能为空");
+        }
+        String trimmedReason = reason.trim();
+        if (trimmedReason.length() > 512) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "reason 最长 512 字符");
+        }
+        String params = "SETTLEMENT_REVERSAL|" + correctionKey + "|" + settlementKey + "|"
+                + trimmedReason + "|" + actor;
+        return runCommand("SETTLEMENT_REVERSAL", commandKey, params, SettlementReversalResponse.class, () -> {
+            SettlementRow original = repository.findSettlementByKey(settlementKey);
+            if (original == null) {
+                throw ApiException.notFound("SETTLEMENT_NOT_FOUND", "核销记录不存在: " + settlementKey);
+            }
+            // 先锁窗口，与核销/转让按统一顺序串行
+            lockWindowById(original.windowId());
+            SettlementRow lockedOriginal = repository.lockSettlementById(original.id());
+            if (repository.findCorrectionByOriginalSettlement(lockedOriginal.id()) != null) {
+                throw ApiException.conflict("CORRECTION_EXISTS",
+                        "核销记录已反向更正，不能重复更正: " + settlementKey);
+            }
+            if (repository.findCorrectionByKey(correctionKey) != null) {
+                throw ApiException.conflict("CORRECTION_KEY_REUSED",
+                        "correctionKey 已被使用: " + correctionKey);
+            }
+            AllocationRow upstream = repository.lockAllocationByKey(lockedOriginal.allocationKey());
+            if (upstream == null) {
+                throw ApiException.notFound("ALLOCATION_NOT_FOUND",
+                        "上游申请不存在: " + lockedOriginal.allocationKey());
+            }
+            if (!STATUS_APPROVED.equals(upstream.status())) {
+                throw ApiException.conflict("UPSTREAM_NOT_APPROVED",
+                        "上游申请当前状态为 " + upstream.status() + "，不能回补额度: " + upstream.allocationKey());
+            }
+            BigDecimal restored = lockedOriginal.upstreamDeduction();
+            BigDecimal afterRestore = upstream.heldAmount().add(restored);
+            if (afterRestore.compareTo(upstream.amount()) > 0) {
+                throw ApiException.unprocessable("RESTORE_EXCEEDS_ORIGINAL",
+                        "回补后持有额度 " + fmt(afterRestore) + " 将超过原申请水量 " + fmt(upstream.amount()),
+                        fmt(afterRestore), fmt(upstream.amount()),
+                        fmt(afterRestore.subtract(upstream.amount())), null);
+            }
+            long now = nowNanos();
+            try {
+                repository.insertCorrection(correctionKey, lockedOriginal.id(), lockedOriginal.batchKey(),
+                        lockedOriginal.windowId(), lockedOriginal.channelId(), lockedOriginal.allocationKey(),
+                        lockedOriginal.downstreamUserId(), lockedOriginal.dayStartNanos(),
+                        lockedOriginal.deliveredVolume(), lockedOriginal.settledDeliveredVolume(),
+                        lockedOriginal.lossVolume(), lockedOriginal.upstreamDeduction(),
+                        lockedOriginal.rateValue(), lockedOriginal.rateVersion(), trimmedReason, actor, now);
+            } catch (DuplicateKeyException e) {
+                throw ApiException.conflict("CORRECTION_KEY_REUSED",
+                        "correctionKey 已被使用: " + correctionKey);
+            }
+            repository.incrementHeldAmount(upstream.id(), restored, now);
+            return toReversalResponse(repository.findCorrectionByKey(correctionKey), lockedOriginal);
+        });
+    }
+
+    /** 查询窗口全部核销与更正明细，按发生顺序返回；读取不改变状态。 */
+    public SettlementListResponse getWindowSettlements(long windowId) {
+        WindowRow window = repository.findWindowById(windowId);
+        if (window == null) {
+            throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + windowId);
+        }
+        return buildSettlementList(windowId, repository.listSettlementsByWindow(windowId));
+    }
+
+    /** 查询某上游申请的全部核销与更正明细。 */
+    public SettlementListResponse getAllocationSettlements(String allocationKey) {
+        requireKey("allocationKey", allocationKey);
+        AllocationRow allocation = repository.findAllocationByKey(allocationKey);
+        if (allocation == null) {
+            throw ApiException.notFound("ALLOCATION_NOT_FOUND", "配水申请不存在: " + allocationKey);
+        }
+        return buildSettlementList(allocation.windowId(), repository.listSettlementsByAllocation(allocationKey));
+    }
+
+    /** 核销事务主体：锁窗口→锁日率→按主键顺序锁上游，先预校验完整最终余额再统一写入。 */
+    private SettlementOutcome settleInternal(long windowId, String batchKey, List<SettlementDraft> drafts,
+                                             String actor) {
+        WindowRow window = lockWindowById(windowId);
+        String channelId = window.channelId();
+
+        // 先非锁定预读上游申请，校验存在性与窗口归属，避免跨窗口非法引用参与行锁形成死锁
+        List<String> allocationKeys = drafts.stream().map(SettlementDraft::allocationKey).distinct().sorted()
+                .toList();
+        for (String key : allocationKeys) {
+            AllocationRow preview = repository.findAllocationByKey(key);
+            if (preview == null) {
+                SettlementDraft hit = drafts.stream().filter(d -> d.allocationKey().equals(key)).findFirst()
+                        .orElseThrow();
+                throw notFoundWithIndex("ALLOCATION_NOT_FOUND", "上游配水申请不存在: " + key, hit.itemIndex());
+            }
+            if (preview.windowId() != windowId) {
+                SettlementDraft hit = drafts.stream().filter(d -> d.allocationKey().equals(key)).findFirst()
+                        .orElseThrow();
+                throw conflictWithIndex("DIFFERENT_WINDOW",
+                        "上游申请 " + key + " 不属于窗口 " + windowId, hit.itemIndex());
+            }
+        }
+
+        // 按 UTC 日有序锁定本批涉及的日蒸发率，缺失率在此拒绝
+        List<Long> days = drafts.stream().map(SettlementDraft::dayStartNanos).distinct().sorted().toList();
+        Map<Long, EvaporationRateRow> rates = new LinkedHashMap<>();
+        for (Long day : days) {
+            EvaporationRateRow rate = repository.lockRate(channelId, day);
+            if (rate == null) {
+                SettlementDraft hit = drafts.stream().filter(d -> d.dayStartNanos() == day).findFirst()
+                        .orElseThrow();
+                throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "EVAPORATION_RATE_MISSING",
+                        "渠道 " + channelId + " 在 UTC 日 " + toDayUtc(day) + " 未登记蒸发率，不能核销",
+                        null, null, null, hit.itemIndex());
+            }
+            rates.put(day, rate);
+        }
+
+        // 按业务键顺序锁定本批全部上游申请（已确认同属本窗口），与转让等多对象事务保持一致加锁顺序
+        Map<String, AllocationRow> allocations = new LinkedHashMap<>();
+        for (String key : allocationKeys) {
+            allocations.put(key, repository.lockAllocationByKey(key));
+        }
+
+        // 逐笔校验状态、配水窗口与逐笔舍入守恒；按提交顺序累计上游扣减量，得到完整最终余额
+        Map<String, BigDecimal> deducted = new LinkedHashMap<>();
+        List<SettlementComputation> computations = new ArrayList<>();
+        for (SettlementDraft draft : drafts) {
+            AllocationRow upstream = allocations.get(draft.allocationKey());
+            if (!STATUS_APPROVED.equals(upstream.status())) {
+                throw conflictWithIndex("UPSTREAM_NOT_APPROVED",
+                        "上游申请 " + draft.allocationKey() + " 当前状态为 " + upstream.status()
+                                + "，必须为 APPROVED 才能核销", draft.itemIndex());
+            }
+            if (draft.occurredNanos() < window.startNanos() || draft.occurredNanos() >= window.endNanos()) {
+                throw ApiException.unprocessable("SETTLEMENT_OUTSIDE_WINDOW",
+                        "送达时刻不在配水窗口 [" + toIso(window.startNanos()) + ", "
+                                + toIso(window.endNanos()) + ") 内",
+                        draft.occurredUtc(), toIso(window.startNanos()) + "/" + toIso(window.endNanos()),
+                        null, draft.itemIndex());
+            }
+            if (repository.findSettlementByKey(draft.settlementKey()) != null) {
+                throw conflictWithIndex("SETTLEMENT_KEY_REUSED",
+                        "settlementKey 已被使用: " + draft.settlementKey(), draft.itemIndex());
+            }
+            EvaporationRateRow rate = rates.get(draft.dayStartNanos());
+            SettlementMath math = computeSettlementMath(draft.delivered(), rate.rate());
+            if (math.deduction().signum() <= 0) {
+                throw ApiException.unprocessable("SETTLEMENT_VOLUME_TOO_SMALL",
+                        "送达量 " + fmt(draft.delivered()) + " 按两位小数银行家舍入后上游扣减为 0，"
+                                + "无法核销（舍入后上游扣减至少为 0.01 立方米）",
+                        fmt(math.deduction()), "0.01", "0.01", draft.itemIndex());
+            }
+            if (math.conservationBroken()) {
+                BigDecimal required = math.settledDelivered().add(math.loss());
+                throw ApiException.unprocessable("ROUNDING_CONSERVATION",
+                        "银行家舍入到两位小数后上游扣减 " + fmt(math.deduction()) + " 不等于计入送达 "
+                                + fmt(required) + "（原始送达 " + fmt(draft.delivered()) + "，计入送达 "
+                                + fmt(math.settledDelivered()) + "，损耗 " + fmt(math.loss()) + "）",
+                        fmt(math.deduction()), fmt(required),
+                        fmt(math.deduction().subtract(required)), draft.itemIndex());
+            }
+            computations.add(new SettlementComputation(draft, math, rate));
+            deducted.merge(draft.allocationKey(), math.deduction(), BigDecimal::add);
+        }
+
+        // 完整最终余额校验：任一上游最终持有额度为负则整批拒绝（整批回滚，不留半成品）
+        for (Map.Entry<String, BigDecimal> entry : deducted.entrySet()) {
+            AllocationRow upstream = allocations.get(entry.getKey());
+            BigDecimal total = entry.getValue();
+            if (upstream.heldAmount().compareTo(total) < 0) {
+                int itemIndex = drafts.stream()
+                        .filter(d -> d.allocationKey().equals(entry.getKey()))
+                        .mapToInt(SettlementDraft::itemIndexSafe).max().orElse(-1);
+                Integer idx = itemIndex < 0 ? null : itemIndex;
+                throw ApiException.unprocessable("UPSTREAM_QUOTA_INSUFFICIENT",
+                        "上游申请 " + entry.getKey() + " 剩余持有额度 " + fmt(upstream.heldAmount())
+                                + " 不足，本批累计要求扣减 " + fmt(total),
+                        fmt(upstream.heldAmount()), fmt(total),
+                        fmt(total.subtract(upstream.heldAmount())), idx);
+            }
+        }
+
+        long now = nowNanos();
+        if (batchKey != null) {
+            try {
+                repository.insertBatchKey(batchKey, windowId, now);
+            } catch (DuplicateKeyException e) {
+                throw ApiException.conflict("BATCH_KEY_REUSED", "batchKey 已被使用: " + batchKey);
+            }
+        }
+        List<SettlementResponse> responses = new ArrayList<>();
+        for (SettlementComputation computation : computations) {
+            SettlementDraft draft = computation.draft();
+            SettlementMath math = computation.math();
+            EvaporationRateRow rate = computation.rate();
+            long id;
+            try {
+                id = repository.insertSettlement(draft.settlementKey(), batchKey, windowId, channelId,
+                        draft.allocationKey(), draft.downstreamUserId(), draft.dayStartNanos(),
+                        draft.occurredNanos(), draft.delivered(), math.settledDelivered(), math.loss(),
+                        math.deduction(), rate.rate(), rate.version(), actor, now);
+            } catch (DuplicateKeyException e) {
+                throw conflictWithIndex("SETTLEMENT_KEY_REUSED",
+                        "settlementKey 已被使用: " + draft.settlementKey(), draft.itemIndex());
+            }
+            responses.add(toSettlementResponse(repository.findSettlementByKey(draft.settlementKey()), null));
+        }
+        // 同一上游只做一次聚合扣减，扣减额即完整最终余额口径下的累计上游扣减
+        for (Map.Entry<String, BigDecimal> entry : deducted.entrySet()) {
+            repository.decrementHeldAmount(allocations.get(entry.getKey()).id(), entry.getValue(), now);
+        }
+        List<UpstreamBalance> balances = deducted.entrySet().stream()
+                .sorted(Map.Entry.comparingByKey())
+                .map(e -> {
+                    AllocationRow upstream = allocations.get(e.getKey());
+                    BigDecimal remaining = upstream.heldAmount().subtract(e.getValue());
+                    return new UpstreamBalance(e.getKey(), fmt(remaining), fmt(e.getValue()), fmt(e.getValue()));
+                }).toList();
+        return new SettlementOutcome(responses, balances);
+    }
+
+    private SettlementListResponse buildSettlementList(long windowId, List<SettlementRow> rows) {
+        java.util.Set<Long> rowIds = rows.stream().map(SettlementRow::id).collect(java.util.stream.Collectors.toSet());
+        // 按申请查询时只返回该申请核销对应的更正；按窗口查询时 rows 覆盖窗口全部核销
+        List<CorrectionRow> corrections = repository.listCorrectionsByWindow(windowId).stream()
+                .filter(c -> rowIds.contains(c.originalSettlementId())).toList();
+        Map<Long, String> correctionKeyByOriginal = new LinkedHashMap<>();
+        for (CorrectionRow correction : corrections) {
+            correctionKeyByOriginal.put(correction.originalSettlementId(), correction.correctionKey());
+        }
+        List<SettlementResponse> settlements = rows.stream()
+                .map(row -> toSettlementResponse(row, correctionKeyByOriginal.get(row.id()))).toList();
+        Map<Long, SettlementRow> originals = new LinkedHashMap<>();
+        for (SettlementRow row : rows) {
+            originals.put(row.id(), row);
+        }
+        List<SettlementReversalResponse> reversalViews = corrections.stream()
+                .map(c -> toReversalResponse(c, originals.get(c.originalSettlementId()))).toList();
+        return new SettlementListResponse(windowId, settlements, reversalViews);
+    }
+
+    // ------------------------------------------------------------------
+    // 蒸发结算口径与解析
+    // ------------------------------------------------------------------
+
+    /**
+     * 蒸发结算舍入口径（均银行家舍入到两位小数）：计入送达 = round2(送达量)，
+     * 损耗 = round2(送达量 × 率)，上游扣减 = round2(送达量 × (1 + 率))；
+     * 三者独立舍入后再校验 上游扣减 = 计入送达 + 损耗。
+     */
+    static SettlementMath computeSettlementMath(BigDecimal delivered, BigDecimal rate) {
+        BigDecimal settledDelivered = delivered.setScale(SETTLEMENT_SCALE, RoundingMode.HALF_EVEN);
+        BigDecimal loss = delivered.multiply(rate).setScale(SETTLEMENT_SCALE, RoundingMode.HALF_EVEN);
+        BigDecimal deduction = delivered.multiply(BigDecimal.ONE.add(rate))
+                .setScale(SETTLEMENT_SCALE, RoundingMode.HALF_EVEN);
+        return new SettlementMath(settledDelivered, loss, deduction);
+    }
+
+    /** 单笔核销预校验后的舍入结果，三个量均为两位小数口径。 */
+    record SettlementMath(BigDecimal settledDelivered, BigDecimal loss, BigDecimal deduction) {
+        /** 独立舍入后守恒不成立：上游扣减 != 计入送达 + 损耗。 */
+        boolean conservationBroken() {
+            return deduction.compareTo(settledDelivered.add(loss)) != 0;
+        }
+    }
+
+    private SettlementDraft buildDraft(String settlementKey, String allocationKey, String occurredUtc,
+                                       String deliveredText, String downstreamUserId, String dayUtc) {
+        return buildDraft(settlementKey, allocationKey, occurredUtc, deliveredText, downstreamUserId, dayUtc,
+                null);
+    }
+
+    private SettlementDraft buildDraft(String settlementKey, String allocationKey, String occurredUtc,
+                                       String deliveredText, String downstreamUserId, String dayUtc,
+                                       Integer itemIndex) {
+        long occurredNanos = parseInstant("occurredUtc", occurredUtc);
+        BigDecimal delivered = parseAmount("deliveredVolume", deliveredText);
+        long derivedDay = toDayStartNanos(occurredNanos);
+        if (dayUtc != null && !dayUtc.isBlank()) {
+            long explicitDay = parseDay("dayUtc", dayUtc);
+            if (explicitDay != derivedDay) {
+                throw ApiException.badRequest("DAY_MISMATCH",
+                        "dayUtc " + dayUtc + " 与 occurredUtc 所属 UTC 日 " + toDayUtc(derivedDay) + " 不一致");
+            }
+        }
+        String downstream = downstreamUserId == null || downstreamUserId.isBlank() ? null
+                : downstreamUserId.trim();
+        if (downstream != null && !KEY_PATTERN.matcher(downstream).matches()) {
+            throw ApiException.badRequest("INVALID_ARGUMENT",
+                    "downstreamUserId 仅允许字母数字及 . - _ :，最长 128 字符");
+        }
+        return new SettlementDraft(settlementKey, allocationKey, occurredNanos, occurredUtc.trim(), derivedDay,
+                delivered, downstream, itemIndex);
+    }
+
+    /** 解析 UTC 自然日（yyyy-MM-dd）为当日 00:00:00Z 的纳秒时间戳。 */
+    static long parseDay(String field, String value) {
+        if (value == null || value.isBlank()) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", field + " 不能为空");
+        }
+        try {
+            LocalDate date = LocalDate.parse(value.trim());
+            return toNanos(date.atStartOfDay(ZoneOffset.UTC).toInstant());
+        } catch (DateTimeParseException e) {
+            throw ApiException.badRequest("INVALID_ARGUMENT",
+                    field + " 必须为 UTC 日期（yyyy-MM-dd）: " + value);
+        }
+    }
+
+    /** 解析蒸发率：十进制比例 0~0.2000，最多四位小数。 */
+    static BigDecimal parseRate(String value) {
+        if (value == null || value.isBlank()) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "rate 不能为空");
+        }
+        String trimmed = value.trim();
+        if (!RATE_PATTERN.matcher(trimmed).matches()) {
+            throw ApiException.badRequest("INVALID_ARGUMENT",
+                    "rate 必须为 0~0.2000 的十进制比例，最多四位小数: " + value);
+        }
+        BigDecimal rate = new BigDecimal(trimmed);
+        if (rate.compareTo(BigDecimal.ZERO) < 0 || rate.compareTo(MAX_RATE) > 0) {
+            throw ApiException.badRequest("INVALID_ARGUMENT",
+                    "rate 必须在 0~0.2000（含）之间: " + value);
+        }
+        return rate;
+    }
+
+    private static long toDayStartNanos(long nanos) {
+        LocalDate day = LocalDate.ofInstant(toInstant(nanos), ZoneOffset.UTC);
+        return toNanos(day.atStartOfDay(ZoneOffset.UTC).toInstant());
+    }
+
+    private static String toDayUtc(long dayStartNanos) {
+        return LocalDate.ofInstant(toInstant(dayStartNanos), ZoneOffset.UTC).toString();
+    }
+
+    private static String rateText(BigDecimal rate) {
+        return rate.setScale(4, RoundingMode.UNNECESSARY).toPlainString();
+    }
+
+    private String firstSettlementIso(String channelId, long dayStartNanos) {
+        Long first = repository.firstSettlementNanos(channelId, dayStartNanos);
+        return first == null ? null : toIso(first);
+    }
+
+    private EvaporationRateResponse toRateResponse(EvaporationRateRow row, Long firstSettlementNanos) {
+        return new EvaporationRateResponse(row.channelId(), toDayUtc(row.dayStartNanos()), rateText(row.rate()),
+                row.version(), toIso(row.createdNanos()), toIso(row.updatedNanos()),
+                firstSettlementNanos == null ? null : toIso(firstSettlementNanos),
+                firstSettlementNanos != null);
+    }
+
+    private SettlementResponse toSettlementResponse(SettlementRow row, String correctionKey) {
+        return new SettlementResponse(row.settlementKey(), row.batchKey(), row.windowId(), row.channelId(),
+                row.allocationKey(), row.downstreamUserId(), toDayUtc(row.dayStartNanos()),
+                toIso(row.occurredNanos()), fmt(row.deliveredVolume()), fmt(row.settledDeliveredVolume()),
+                fmt(row.lossVolume()), fmt(row.upstreamDeduction()), rateText(row.rateValue()), row.rateVersion(), row.status(),
+                row.actor(), toIso(row.createdNanos()), correctionKey);
+    }
+
+    private SettlementReversalResponse toReversalResponse(CorrectionRow row, SettlementRow original) {
+        String originalKey = original == null ? null : original.settlementKey();
+        return new SettlementReversalResponse(row.correctionKey(), row.originalSettlementId(), originalKey,
+                row.batchKey(), row.windowId(), row.channelId(), row.allocationKey(), row.downstreamUserId(),
+                toDayUtc(row.dayStartNanos()), fmt(row.reversedDeliveredVolume()),
+                fmt(row.reversedSettledDeliveredVolume()), fmt(row.reversedLossVolume()),
+                fmt(row.restoredUpstreamVolume()), rateText(row.rateValue()), row.rateVersion(), row.reason(), row.actor(),
+                toIso(row.createdNanos()));
+    }
+
+    /** 单笔/批量共用的已解析核销明细。 */
+    private record SettlementDraft(String settlementKey, String allocationKey, long occurredNanos,
+                                   String occurredUtc, long dayStartNanos, BigDecimal delivered,
+                                   String downstreamUserId, Integer itemIndex) {
+        int itemIndexSafe() {
+            return itemIndex == null ? -1 : itemIndex;
+        }
+    }
+
+    /** 明细与按当日率版本完成的舍入计算结果。 */
+    private record SettlementComputation(SettlementDraft draft, SettlementMath math, EvaporationRateRow rate) {
+    }
+
+    /** 一次核销事务的全部写入结果。 */
+    private record SettlementOutcome(List<SettlementResponse> responses, List<UpstreamBalance> balances) {
+        SettlementResultResponse single() {
+            SettlementResponse response = responses.get(0);
+            UpstreamBalance balance = balances.get(0);
+            return new SettlementResultResponse(response, balance.remaining(), balance.required());
+        }
+
+        SettlementBatchResponse batch(String batchKey, long windowId) {
+            return new SettlementBatchResponse(batchKey, windowId, responses, balances);
+        }
+    }
+
+    private static String nvl(String value) {
+        return value == null ? "" : value.trim();
+    }
+
+    private static ApiException conflictWithIndex(String code, String message, Integer itemIndex) {
+        return new ApiException(org.springframework.http.HttpStatus.CONFLICT, code, message, null, null, null,
+                itemIndex);
+    }
+
+    private static ApiException notFoundWithIndex(String code, String message, Integer itemIndex) {
+        return new ApiException(org.springframework.http.HttpStatus.NOT_FOUND, code, message, null, null, null,
+                itemIndex);
+    }
+
+    // ------------------------------------------------------------------
     // 幂等命令框架
     // ------------------------------------------------------------------
 
@@ -357,11 +918,24 @@ public class WaterService {
     // ------------------------------------------------------------------
 
     private WindowRow lockWindowOf(AllocationRow allocation) {
-        WindowRow window = repository.lockWindowById(allocation.windowId());
+        return lockWindowById(allocation.windowId());
+    }
+
+    private WindowRow lockWindowById(long windowId) {
+        WindowRow window = repository.lockWindowById(windowId);
         if (window == null) {
-            throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + allocation.windowId());
+            throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + windowId);
         }
         return window;
+    }
+
+    /** 键校验并附带批量明细索引，错误返回 400 且可定位明细。 */
+    private static void requireKeyWithIndex(String field, String value, int itemIndex) {
+        if (value == null || !KEY_PATTERN.matcher(value).matches()) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "INVALID_ARGUMENT",
+                    field + " 不能为空，且仅允许字母数字及 . - _ :，最长 128 字符（明细 " + itemIndex + "）",
+                    null, null, null, itemIndex);
+        }
     }
 
     private BigDecimal availableTotal(WindowRow window) {
@@ -392,8 +966,8 @@ public class WaterService {
                 toIso(row.createdNanos()), row.cancelledNanos() == null ? null : toIso(row.cancelledNanos()));
     }
 
-    static long nowNanos() {
-        return toNanos(Instant.now());
+    long nowNanos() {
+        return toNanos(clock.instant());
     }
 
     /** Instant -> UTC 纳秒时间戳。 */
