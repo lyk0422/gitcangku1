@@ -62,13 +62,16 @@ public class PlanService {
     private final IdempotencyRepository idemRepo;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate tx;
+    private final ConnectionService connectionService;
 
     public PlanService(PlanRepository planRepo, IdempotencyRepository idemRepo,
-                       ObjectMapper objectMapper, PlatformTransactionManager txManager) {
+                       ObjectMapper objectMapper, PlatformTransactionManager txManager,
+                       ConnectionService connectionService) {
         this.planRepo = planRepo;
         this.idemRepo = idemRepo;
         this.objectMapper = objectMapper;
         this.tx = new TransactionTemplate(txManager);
+        this.connectionService = connectionService;
     }
 
     /**
@@ -173,7 +176,8 @@ public class PlanService {
     }
 
     /**
-     * 取消已发布计划：时隙立即释放，历史计划与占用保留不改写。
+     * 取消已发布计划：时隙立即释放，历史计划与占用保留不改写；
+     * 全局发布锁内同事务取消其全部生效接续（接续历史保留）。
      */
     public PlanResponse cancel(String scheduleKey, String requestKey) {
         String hash = hashAction(OP_CANCEL, scheduleKey);
@@ -183,6 +187,7 @@ public class PlanService {
         }
         try {
             return tx.execute(status -> {
+                planRepo.acquirePublishLock();
                 DayPlan plan = planRepo.findByKeyForUpdate(scheduleKey)
                         .orElseThrow(() -> notFound(scheduleKey));
                 if (plan.status() != PlanStatus.PUBLISHED) {
@@ -191,6 +196,7 @@ public class PlanService {
                 }
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(plan.id(), PlanStatus.CANCELLED, now);
+                connectionService.onPlanCancelled(plan);
                 PlanResponse response = loadPlan(scheduleKey);
                 idemRepo.insert(OP_CANCEL, requestKey, hash, toJson(response), now);
                 return response;
@@ -264,6 +270,7 @@ public class PlanService {
                 planRepo.updateStatus(oldPlan.id(), PlanStatus.CANCELLED, now);
                 planRepo.updateStatus(newPlan.id(), PlanStatus.PUBLISHED, now);
                 planRepo.insertRescheduleLink(oldPlan.id(), newPlan.id(), now);
+                connectionService.onPredecessorRescheduled(oldPlan, newPlan);
                 RescheduleResponse response = new RescheduleResponse(
                         loadPlan(oldScheduleKey), loadPlan(req.newScheduleKey()));
                 idemRepo.insert(OP_RESCHEDULE, req.requestKey(), hash, toJson(response), now);
@@ -339,17 +346,19 @@ public class PlanService {
         DayPlan plan = planRepo.findByKey(scheduleKey)
                 .orElseThrow(() -> notFound(scheduleKey));
         List<OccupancyView> views = planRepo.findOccupancies(plan.id()).stream()
-                .map(o -> new OccupancyView(o.trainNo(), o.sectionId(), o.startUtc(), o.endUtc()))
+                .map(o -> new OccupancyView(o.trainNo(), o.sectionId(), o.fromStation(), o.toStation(),
+                        o.startUtc(), o.endUtc()))
                 .toList();
         return new PlanResponse(plan.scheduleKey(), plan.opDate(), plan.version(),
-                plan.status().name(), views);
+                plan.status().name(), views, plan.connectionRisk());
     }
 
     private List<Occupancy> toOccupancies(long planId, List<OccupancyRequest> requests) {
         List<Occupancy> result = new ArrayList<>(requests.size());
         for (int i = 0; i < requests.size(); i++) {
             OccupancyRequest r = requests.get(i);
-            result.add(new Occupancy(0L, planId, i, r.trainNo(), r.sectionId(), r.startUtc(), r.endUtc()));
+            result.add(new Occupancy(0L, planId, i, r.trainNo(), r.sectionId(),
+                    r.fromStation(), r.toStation(), r.startUtc(), r.endUtc()));
         }
         return result;
     }

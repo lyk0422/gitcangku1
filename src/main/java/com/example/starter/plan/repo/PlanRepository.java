@@ -32,7 +32,8 @@ public class PlanRepository {
             rs.getString("schedule_key"),
             rs.getObject("op_date", LocalDate.class),
             rs.getInt("version"),
-            PlanStatus.valueOf(rs.getString("status")));
+            PlanStatus.valueOf(rs.getString("status")),
+            rs.getString("connection_risk"));
 
     private static final RowMapper<Occupancy> OCCUPANCY_MAPPER = (rs, n) -> new Occupancy(
             rs.getLong("id"),
@@ -40,6 +41,8 @@ public class PlanRepository {
             rs.getInt("seq"),
             rs.getString("train_no"),
             rs.getString("section_id"),
+            rs.getString("from_station"),
+            rs.getString("to_station"),
             Instant.ofEpochMilli(rs.getLong("start_utc")),
             Instant.ofEpochMilli(rs.getLong("end_utc")));
 
@@ -79,8 +82,8 @@ public class PlanRepository {
      * 按业务键查询计划（不加锁）。
      */
     public Optional<DayPlan> findByKey(String scheduleKey) {
-        return jdbc.query("SELECT id, schedule_key, op_date, version, status FROM rail_day_plan"
-                        + " WHERE schedule_key = ?",
+        return jdbc.query("SELECT id, schedule_key, op_date, version, status, connection_risk"
+                        + " FROM rail_day_plan WHERE schedule_key = ?",
                 PLAN_MAPPER, scheduleKey).stream().findFirst();
     }
 
@@ -88,8 +91,17 @@ public class PlanRepository {
      * 按主键查询计划（不加锁），用于改签链遍历。
      */
     public Optional<DayPlan> findById(long planId) {
-        return jdbc.query("SELECT id, schedule_key, op_date, version, status FROM rail_day_plan"
-                        + " WHERE id = ?",
+        return jdbc.query("SELECT id, schedule_key, op_date, version, status, connection_risk"
+                        + " FROM rail_day_plan WHERE id = ?",
+                PLAN_MAPPER, planId).stream().findFirst();
+    }
+
+    /**
+     * 按主键查询计划并加行级写锁，须在事务内调用，用于接续登记/批量保障改签串行化。
+     */
+    public Optional<DayPlan> findByIdForUpdate(long planId) {
+        return jdbc.query("SELECT id, schedule_key, op_date, version, status, connection_risk"
+                        + " FROM rail_day_plan WHERE id = ? FOR UPDATE",
                 PLAN_MAPPER, planId).stream().findFirst();
     }
 
@@ -97,8 +109,8 @@ public class PlanRepository {
      * 按业务键查询计划并加行级写锁，须在事务内调用，用于串行化同一计划的更新/发布/取消。
      */
     public Optional<DayPlan> findByKeyForUpdate(String scheduleKey) {
-        return jdbc.query("SELECT id, schedule_key, op_date, version, status FROM rail_day_plan"
-                        + " WHERE schedule_key = ? FOR UPDATE",
+        return jdbc.query("SELECT id, schedule_key, op_date, version, status, connection_risk"
+                        + " FROM rail_day_plan WHERE schedule_key = ? FOR UPDATE",
                 PLAN_MAPPER, scheduleKey).stream().findFirst();
     }
 
@@ -115,16 +127,19 @@ public class PlanRepository {
      */
     public void insertOccupancies(long planId, List<Occupancy> occupancies) {
         jdbc.batchUpdate(
-                "INSERT INTO rail_plan_occupancy (plan_id, seq, train_no, section_id, start_utc, end_utc)"
-                        + " VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO rail_plan_occupancy"
+                        + " (plan_id, seq, train_no, section_id, from_station, to_station, start_utc, end_utc)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 occupancies, occupancies.size(),
                 (ps, o) -> {
                     ps.setLong(1, planId);
                     ps.setInt(2, o.seq());
                     ps.setString(3, o.trainNo());
                     ps.setString(4, o.sectionId());
-                    ps.setLong(5, o.startUtc().toEpochMilli());
-                    ps.setLong(6, o.endUtc().toEpochMilli());
+                    ps.setString(5, o.fromStation());
+                    ps.setString(6, o.toStation());
+                    ps.setLong(7, o.startUtc().toEpochMilli());
+                    ps.setLong(8, o.endUtc().toEpochMilli());
                 });
     }
 
@@ -132,7 +147,8 @@ public class PlanRepository {
      * 查询计划占用，按计划内序号升序。
      */
     public List<Occupancy> findOccupancies(long planId) {
-        return jdbc.query("SELECT id, plan_id, seq, train_no, section_id, start_utc, end_utc"
+        return jdbc.query("SELECT id, plan_id, seq, train_no, section_id, from_station, to_station,"
+                        + " start_utc, end_utc"
                         + " FROM rail_plan_occupancy WHERE plan_id = ? ORDER BY seq",
                 OCCUPANCY_MAPPER, planId);
     }
@@ -151,6 +167,14 @@ public class PlanRepository {
     public void updateStatus(long planId, PlanStatus status, long nowMillis) {
         jdbc.update("UPDATE rail_day_plan SET status = ?, updated_at = ? WHERE id = ?",
                 status.name(), nowMillis, planId);
+    }
+
+    /**
+     * 更新接续风险标记（null 表示清除）；不改变版本与占用。
+     */
+    public void updateConnectionRisk(long planId, String connectionRisk, long nowMillis) {
+        jdbc.update("UPDATE rail_day_plan SET connection_risk = ?, updated_at = ? WHERE id = ?",
+                connectionRisk, nowMillis, planId);
     }
 
     /**
