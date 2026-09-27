@@ -48,6 +48,12 @@ public class ReleaseController {
         return releaseService.resume(releaseId, request);
     }
 
+    @PostMapping("/{releaseId}/batch-start")
+    public BatchStartResponse batchStart(@PathVariable long releaseId,
+                                         @Valid @RequestBody BatchStartRequest request) {
+        return taskService.batchStart(releaseId, request);
+    }
+
     @GetMapping("/{releaseId}/monitor")
     public MonitorView monitor(@PathVariable long releaseId) {
         return releaseService.monitor(releaseId);

@@ -20,10 +20,10 @@ public class StarterApplication {
     }
 
     /**
-     * 业务时钟：暂停/恢复记录使用 UTC 时刻，测试可替换为可控时钟。
+     * 业务时钟：暂停/恢复记录与证书生效/到期/撤销均使用 UTC 时刻；测试可替换/固定该时钟。
      */
     @Bean
     public Clock businessClock() {
-        return Clock.systemUTC();
+        return new com.example.starter.firmware.service.MutableClock();
     }
 }

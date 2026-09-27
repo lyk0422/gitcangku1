@@ -15,18 +15,21 @@ import java.util.Optional;
 
 /**
  * 投放任务数据访问。同设备同发布单由唯一约束 uk_task_release_device 保证最多一条。
+ * frozen_chain_id 在创建时写入后不再变更，构成拉取时刻证书链快照。
  */
 @Repository
 public class TaskRepository {
 
     private static final RowMapper<RolloutTask> MAPPER = (rs, rowNum) -> {
         String firstResult = rs.getString("first_result");
+        Long frozenChainId = rs.getObject("frozen_chain_id", Long.class);
         return new RolloutTask(rs.getLong("id"), rs.getLong("release_id"), rs.getString("device_id"),
                 TaskStatus.valueOf(rs.getString("status")),
-                firstResult == null ? null : ReceiptResult.valueOf(firstResult));
+                firstResult == null ? null : ReceiptResult.valueOf(firstResult),
+                frozenChainId);
     };
 
-    private static final String COLUMNS = "id, release_id, device_id, status, first_result";
+    private static final String COLUMNS = "id, release_id, device_id, status, first_result, frozen_chain_id";
 
     private final JdbcTemplate jdbc;
 
@@ -34,14 +37,20 @@ public class TaskRepository {
         this.jdbc = jdbc;
     }
 
-    public long insert(long releaseId, String deviceId) {
+    public long insert(long releaseId, String deviceId, Long frozenChainId) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO rollout_task (release_id, device_id, status) VALUES (?, ?, 'PENDING')",
+                    "INSERT INTO rollout_task (release_id, device_id, status, frozen_chain_id)"
+                            + " VALUES (?, ?, 'PENDING', ?)",
                     new String[]{"id"});
             ps.setLong(1, releaseId);
             ps.setString(2, deviceId);
+            if (frozenChainId == null) {
+                ps.setNull(3, java.sql.Types.BIGINT);
+            } else {
+                ps.setLong(3, frozenChainId);
+            }
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();

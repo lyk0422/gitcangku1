@@ -8,6 +8,7 @@ import com.example.starter.firmware.api.ReleaseHistoryResponse;
 import com.example.starter.firmware.api.ReleaseView;
 import com.example.starter.firmware.api.ResumeRecordView;
 import com.example.starter.firmware.api.ResumeReleaseRequest;
+import com.example.starter.firmware.domain.FirmwareVersion;
 import com.example.starter.firmware.domain.ReleaseOrder;
 import com.example.starter.firmware.domain.ReleaseStatus;
 import com.example.starter.firmware.error.ApiException;
@@ -32,17 +33,22 @@ public class ReleaseService {
     private final TaskRepository taskRepository;
     private final PauseRecordRepository pauseRecordRepository;
     private final ResumeRecordRepository resumeRecordRepository;
+    private final FirmwareService firmwareService;
+    private final CertService certService;
     private final IdempotencyService idempotency;
     private final Clock clock;
 
     public ReleaseService(ReleaseRepository releaseRepository, TaskRepository taskRepository,
                           PauseRecordRepository pauseRecordRepository,
                           ResumeRecordRepository resumeRecordRepository,
+                          FirmwareService firmwareService, CertService certService,
                           IdempotencyService idempotency, Clock clock) {
         this.releaseRepository = releaseRepository;
         this.taskRepository = taskRepository;
         this.pauseRecordRepository = pauseRecordRepository;
         this.resumeRecordRepository = resumeRecordRepository;
+        this.firmwareService = firmwareService;
+        this.certService = certService;
         this.idempotency = idempotency;
         this.clock = clock;
     }
@@ -57,6 +63,15 @@ public class ReleaseService {
                 request.toVersion(), String.valueOf(request.ratio()), String.valueOf(sampleFloor),
                 String.valueOf(threshold));
         return idempotency.execute(request.requestId(), "release.create", fingerprint, () -> {
+            // 启动发布按请求时刻校验兼容矩阵；目标固件若已登记证书链，则此刻必须存在唯一当前有效链
+            firmwareService.assertCompatible(request.model(), request.fromVersion(), request.toVersion());
+            FirmwareVersion targetFirmware = firmwareService.findFirmware(request.model(), request.toVersion());
+            if (targetFirmware != null
+                    && certService.lockCurrentForFirmware(targetFirmware.id(), Instant.now(clock)).isEmpty()) {
+                throw ApiException.conflict("NO_CURRENT_CERT_CHAIN",
+                        "目标固件当前时刻不存在有效签名证书链，不能启动发布: "
+                                + request.model() + "/" + request.toVersion());
+            }
             long id;
             try {
                 id = releaseRepository.insert(request.model(), request.fromVersion(), request.toVersion(),
