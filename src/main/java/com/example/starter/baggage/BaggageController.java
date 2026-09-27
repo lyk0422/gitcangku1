@@ -14,9 +14,17 @@ import org.springframework.web.bind.annotation.RestController;
 import com.example.starter.baggage.BaggageDtos.ArriveRequest;
 import com.example.starter.baggage.BaggageDtos.ArriveResponse;
 import com.example.starter.baggage.BaggageDtos.BagResponse;
+import com.example.starter.baggage.BaggageDtos.ConfigureDwellLimitRequest;
+import com.example.starter.baggage.BaggageDtos.ConfigureLegOpsRequest;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveRequest;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveResponse;
+import com.example.starter.baggage.BaggageDtos.DwellConfigResponse;
+import com.example.starter.baggage.BaggageDtos.DwellHistoryResponse;
+import com.example.starter.baggage.BaggageDtos.DwellRecordResponse;
+import com.example.starter.baggage.BaggageDtos.DwellTimeoutCheckRequest;
+import com.example.starter.baggage.BaggageDtos.DwellTimeoutCheckResponse;
 import com.example.starter.baggage.BaggageDtos.LegDifferenceResponse;
+import com.example.starter.baggage.BaggageDtos.LegOpsConfigResponse;
 import com.example.starter.baggage.BaggageDtos.LegResponse;
 import com.example.starter.baggage.BaggageDtos.LoadRequest;
 import com.example.starter.baggage.BaggageDtos.LoadResponse;
@@ -25,9 +33,16 @@ import com.example.starter.baggage.BaggageDtos.RecoverRequest;
 import com.example.starter.baggage.BaggageDtos.RecoverResponse;
 import com.example.starter.baggage.BaggageDtos.RegisterBagRequest;
 import com.example.starter.baggage.BaggageDtos.RegisterLegRequest;
+import com.example.starter.baggage.BaggageDtos.ReleaseDwellRequest;
+import com.example.starter.baggage.BaggageDtos.ReleaseDwellResponse;
+import com.example.starter.baggage.BaggageDtos.RerouteRequest;
+import com.example.starter.baggage.BaggageDtos.RerouteResponse;
 import com.example.starter.baggage.BaggageDtos.SealRequest;
 import com.example.starter.baggage.BaggageDtos.SealResponse;
 import com.example.starter.baggage.BaggageDtos.ShortListResponse;
+import com.example.starter.baggage.BaggageDtos.StationDwellDiagnostics;
+import com.example.starter.baggage.BaggageDtos.TransitArriveRequest;
+import com.example.starter.baggage.BaggageDtos.TransitArriveResponse;
 
 /**
  * 联程行李装载交接 REST 入口。
@@ -107,5 +122,65 @@ public class BaggageController {
     @GetMapping("/bags/short-unloaded")
     public ShortListResponse listShortUnloaded() {
         return baggageService.listShortUnloaded();
+    }
+
+    /** 配置中转点最大滞留分钟数。 */
+    @PostMapping("/stations/{station}/dwell-config")
+    public DwellConfigResponse configureDwellLimit(@PathVariable String station,
+                                                   @Valid @RequestBody ConfigureDwellLimitRequest request) {
+        return baggageService.configureDwellLimit(station, request);
+    }
+
+    /** 配置航段装载截止时刻与最大容量。 */
+    @PostMapping("/legs/{legId}/ops-config")
+    public LegOpsConfigResponse configureLegOps(@PathVariable String legId,
+                                                @Valid @RequestBody ConfigureLegOpsRequest request) {
+        return baggageService.configureLegOps(legId, request);
+    }
+
+    /** 中转到达核对：批量登记行李到达中转点，任一行李非法整次回滚。 */
+    @PostMapping("/stations/{station}/transit-arrive")
+    public TransitArriveResponse transitArrive(@PathVariable String station,
+                                               @Valid @RequestBody TransitArriveRequest request) {
+        return baggageService.transitArrive(station, request);
+    }
+
+    /** 滞留超时判定：超过上限的行李转 DWELL_EXCEEDED 并阻断后续装载与改派。 */
+    @PostMapping("/stations/{station}/dwell-timeout-check")
+    public DwellTimeoutCheckResponse checkDwellTimeout(@PathVariable String station,
+                                                       @Valid @RequestBody DwellTimeoutCheckRequest request) {
+        return baggageService.checkDwellTimeout(station, request);
+    }
+
+    /** 复核解除：登记复核结论并指定下一航段，重新校验截止与容量后解除阻断。 */
+    @PostMapping("/bags/{bagTag}/release")
+    public ReleaseDwellResponse releaseDwell(@PathVariable String bagTag,
+                                             @Valid @RequestBody ReleaseDwellRequest request) {
+        return baggageService.releaseDwell(bagTag, request);
+    }
+
+    /** 改派：整体替换待乘行程，不改写历史超时证据。 */
+    @PostMapping("/bags/{bagTag}/reroute")
+    public RerouteResponse reroute(@PathVariable String bagTag,
+                                   @Valid @RequestBody RerouteRequest request) {
+        return baggageService.reroute(bagTag, request);
+    }
+
+    /** 行李最新滞留明细查询。 */
+    @GetMapping("/bags/{bagTag}/dwell")
+    public DwellRecordResponse getDwellDetail(@PathVariable String bagTag) {
+        return baggageService.getDwellDetail(bagTag);
+    }
+
+    /** 行李滞留历史查询：追加只写事件流，按 seq 稳定升序。 */
+    @GetMapping("/bags/{bagTag}/dwell-history")
+    public DwellHistoryResponse getDwellHistory(@PathVariable String bagTag) {
+        return baggageService.getDwellHistory(bagTag);
+    }
+
+    /** 中转点滞留诊断查询。 */
+    @GetMapping("/stations/{station}/dwell-diagnostics")
+    public StationDwellDiagnostics getStationDwellDiagnostics(@PathVariable String station) {
+        return baggageService.getStationDwellDiagnostics(station);
     }
 }

@@ -50,7 +50,9 @@ public class IdempotencyService {
      */
     public <T> T execute(String requestId, String operation, int successStatus,
                          Object payload, Class<T> resultType, Supplier<T> action) {
-        String hash = sha256(writeJson(payload));
+        // 指纹覆盖操作类型与规范化后的全部请求参数（含操作者、结果相关字段）；
+        // 集合经 JSON 序列化转义，不以未转义分隔符直接拼接
+        String hash = sha256(operation + "\n" + writeJson(payload));
         Object lock = locks.computeIfAbsent(requestId, key -> new Object());
         synchronized (lock) {
             try {

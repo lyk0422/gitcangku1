@@ -2,6 +2,7 @@ package com.example.starter.baggage;
 
 import java.util.List;
 
+import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Size;
@@ -124,5 +125,117 @@ public final class BaggageDtos {
 
     /** 未补到清单响应。 */
     public record ShortListResponse(List<ShortItem> shortUnloaded) {
+    }
+
+    /** 配置中转点最大滞留分钟数请求：可重复提交更新同一站点。 */
+    public record ConfigureDwellLimitRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotBlank(message = "operator 不能为空") @Size(max = 64, message = "operator 过长") String operator,
+            @NotNull(message = "maxDwellMinutes 不能为空")
+            @Min(value = 1, message = "maxDwellMinutes 必须为正数") Long maxDwellMinutes) {
+    }
+
+    /** 中转点滞留上限配置响应。 */
+    public record DwellConfigResponse(String station, long maxDwellMinutes) {
+    }
+
+    /** 配置航段装载截止与容量请求：loadDeadline 为 ISO-8601 UTC 时刻。 */
+    public record ConfigureLegOpsRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotBlank(message = "operator 不能为空") @Size(max = 64, message = "operator 过长") String operator,
+            @NotBlank(message = "loadDeadline 不能为空") String loadDeadline,
+            @NotNull(message = "maxCapacity 不能为空")
+            @Min(value = 1, message = "maxCapacity 必须为正数") Integer maxCapacity) {
+    }
+
+    /** 航段运行配置响应。 */
+    public record LegOpsConfigResponse(String legId, String loadDeadline, int maxCapacity) {
+    }
+
+    /** 中转到达核对请求：批量登记行李到达中转点，任一行李非法整次回滚。 */
+    public record TransitArriveRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotBlank(message = "operator 不能为空") @Size(max = 64, message = "operator 过长") String operator,
+            @NotNull(message = "bagTags 不能为空")
+            @Size(min = 1, max = 20, message = "批量到达数量必须为 1~20") List<@NotBlank(message = "bagTag 不能为空") String> bagTags) {
+    }
+
+    /** 中转到达明细项：arrivedAt 为到达中转点时刻（UTC）。 */
+    public record TransitArriveItem(String bagTag, String arrivedAt) {
+    }
+
+    /** 中转到达核对响应。 */
+    public record TransitArriveResponse(String station, List<TransitArriveItem> arrived) {
+    }
+
+    /** 滞留超时判定请求：对在中转点滞留中的行李按可注入时钟判定。 */
+    public record DwellTimeoutCheckRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotBlank(message = "operator 不能为空") @Size(max = 64, message = "operator 过长") String operator,
+            @NotNull(message = "bagTags 不能为空")
+            @Size(min = 1, max = 20, message = "批量判定数量必须为 1~20") List<@NotBlank(message = "bagTag 不能为空") String> bagTags) {
+    }
+
+    /**
+     * 超时判定明细项：dwellMinutes 为实际滞留分钟数，maxDwellMinutes 为要求上限，
+     * exceedByMinutes 为超出差额（仅超时时非 null）；status 为 OPEN 滞留中或 EXCEEDED 已超时。
+     */
+    public record DwellCheckItem(String bagTag, String station, String status,
+                                 String arrivedAt, long dwellMinutes, Long maxDwellMinutes,
+                                 Long exceedByMinutes) {
+    }
+
+    /** 超时判定响应。 */
+    public record DwellTimeoutCheckResponse(String station, List<DwellCheckItem> items) {
+    }
+
+    /** 复核解除请求：必须指定下一航段，解除时重新校验该航段装载截止与容量。 */
+    public record ReleaseDwellRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotBlank(message = "reviewer 不能为空") @Size(max = 64, message = "reviewer 过长") String reviewer,
+            @NotBlank(message = "conclusion 不能为空") @Size(max = 256, message = "conclusion 过长") String conclusion,
+            @NotBlank(message = "nextLegId 不能为空") String nextLegId) {
+    }
+
+    /** 复核解除响应。 */
+    public record ReleaseDwellResponse(String bagTag, String status, String nextLegId,
+                                       String releasedAt, String reviewer) {
+    }
+
+    /** 改派请求：以 newLegIds 整体替换待乘行程（自当前 nextLegIndex 起），不改写历史证据。 */
+    public record RerouteRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotBlank(message = "operator 不能为空") @Size(max = 64, message = "operator 过长") String operator,
+            @NotNull(message = "newLegIds 不能为空")
+            @Size(min = 1, max = 5, message = "改派航段数必须为 1~5") List<@NotBlank(message = "航段不能为空") String> newLegIds) {
+    }
+
+    /** 改派响应：itinerary 为替换后的完整行程。 */
+    public record RerouteResponse(String bagTag, int nextLegIndex, List<ItineraryItem> itinerary) {
+    }
+
+    /**
+     * 滞留明细响应：arrivedAt/exceededAt/releasedAt/reviewer/reviewConclusion/nextLegId 为不可变证据字段，
+     * 未发生对应事件时为 null；closedAt 为离开滞留站点时刻，未离开为 null。
+     */
+    public record DwellRecordResponse(String bagTag, String station, String status,
+                                      String arrivedAt, String exceededAt, String releasedAt,
+                                      String reviewer, String reviewConclusion, String nextLegId,
+                                      String closedAt) {
+    }
+
+    /** 滞留历史事件项：operator/nextLegId/detail 仅对相应事件类型非 null。 */
+    public record DwellEventItem(int seq, String eventType, String station, String operator,
+                                 String nextLegId, String detail, String eventTime) {
+    }
+
+    /** 滞留历史响应：事件按 seq 稳定升序。 */
+    public record DwellHistoryResponse(String bagTag, List<DwellEventItem> events) {
+    }
+
+    /** 中转点滞留诊断响应：maxDwellMinutes 未配置为 null；各计数为当前状态分布。 */
+    public record StationDwellDiagnostics(String station, Long maxDwellMinutes,
+                                          int openCount, int exceededCount,
+                                          int releasedCount, int closedCount) {
     }
 }
