@@ -21,11 +21,15 @@ import com.example.starter.maintenance.api.dto.StatusResponse;
 import com.example.starter.maintenance.domain.Equipment;
 import com.example.starter.maintenance.domain.MaintenanceRecord;
 import com.example.starter.maintenance.domain.Reading;
+import com.example.starter.maintenance.domain.IsolationOrder;
 import com.example.starter.maintenance.store.EquipmentRepository;
 
 /**
  * 设备工时保养事务业务服务。写操作流程：设备行锁 → 幂等判定 → 版本校验 → 业务规则 → 变更并版本加一。
  * 去重记录与业务变更同事务提交；任一规则失败抛异常整体回滚。
+ *
+ * <p>能源隔离门禁：设备存在 ACTIVE 隔离令时新增运行读数一律 409，拒绝证据（锁定点集合快照、操作人）
+ * 在独立事务固化；保养检查项不受门禁影响。
  */
 @Service
 public class EquipmentTxService {
@@ -33,11 +37,17 @@ public class EquipmentTxService {
     private final EquipmentRepository repository;
     private final IdempotencyService idempotency;
     private final Clock clock;
+    private final IsolationTxService isolationTxService;
+    private final IsolatedRejectionRecorder rejectionRecorder;
 
-    public EquipmentTxService(EquipmentRepository repository, IdempotencyService idempotency, Clock clock) {
+    public EquipmentTxService(EquipmentRepository repository, IdempotencyService idempotency, Clock clock,
+                              IsolationTxService isolationTxService,
+                              IsolatedRejectionRecorder rejectionRecorder) {
         this.repository = repository;
         this.idempotency = idempotency;
         this.clock = clock;
+        this.isolationTxService = isolationTxService;
+        this.rejectionRecorder = rejectionRecorder;
     }
 
     // ---------- 登记设备 ----------
@@ -61,9 +71,20 @@ public class EquipmentTxService {
     public ReadingResponse addReading(String equipmentId, AddReadingRequest req) {
         Equipment equipment = lockEquipment(equipmentId);
         String fingerprint = equipmentId + "|" + req.readingId() + "|" + req.sampledAt()
-                + "|" + req.cumulativeMinutes() + "|" + req.expectedVersion();
+                + "|" + req.cumulativeMinutes() + "|" + req.expectedVersion() + "|" + req.operatorId();
         return idempotency.execute(req.requestId(), "ADD_READING", fingerprint,
                 ReadingResponse.class, () -> {
+                    // 能源隔离门禁优先：ACTIVE 期间新增读数一律 409，证据独立事务固化、本事务回滚不占键。
+                    Optional<IsolationOrder> activeOrder = isolationTxService.findActiveOrder(equipmentId);
+                    if (activeOrder.isPresent()) {
+                        IsolationOrder order = activeOrder.get();
+                        java.util.List<String> snapshot =
+                                isolationTxService.lockPointSnapshot(order.orderId());
+                        rejectionRecorder.record(equipmentId, order, req, snapshot);
+                        throw ApiException.conflict("EQUIPMENT_ISOLATED",
+                                "设备处于能源隔离生效期，隔离解除前不得新增运行读数：隔离令 "
+                                        + order.orderId() + "，锁定点数量（实际值）" + snapshot.size());
+                    }
                     checkVersion(equipment, req.expectedVersion());
                     if (repository.findReading(equipmentId, req.readingId()).isPresent()) {
                         throw ApiException.conflict("READING_EXISTS", "读数已存在：" + req.readingId());

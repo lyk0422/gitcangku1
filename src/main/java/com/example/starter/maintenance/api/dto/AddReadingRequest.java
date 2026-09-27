@@ -14,11 +14,13 @@ import jakarta.validation.constraints.PositiveOrZero;
  * @param readingId          读数标识，设备内唯一
  * @param sampledAt          UTC 采样时刻；同设备同一时刻仅允许一条读数
  * @param cumulativeMinutes  累计工时（分钟），非负整数
+ * @param operatorId         提交读数的操作人（可选）；读数在隔离生效期被拒时该字段随证据固化
  */
 public record AddReadingRequest(
         @NotBlank String requestId,
         @NotNull Long expectedVersion,
         @NotBlank String readingId,
         @NotNull Instant sampledAt,
-        @NotNull @PositiveOrZero Long cumulativeMinutes) {
+        @NotNull @PositiveOrZero Long cumulativeMinutes,
+        String operatorId) {
 }
