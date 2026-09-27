@@ -10,8 +10,9 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+
 /**
- * 赛事计时处罚与成绩封榜 HTTP 接口。
+ * 赛事计时处罚、医疗暂停与成绩封榜 HTTP 接口。
  */
 @RestController
 @RequestMapping("/api/races")
@@ -85,6 +86,47 @@ public class RaceController {
             @PathVariable String raceId,
             @Valid @RequestBody SealRaceRequest request) {
         return toResponse(raceService.sealRace(raceId, request));
+    }
+
+    /** 选手退赛。 */
+    @PostMapping("/{raceId}/runners/{bib}/withdrawal")
+    public ResponseEntity<Object> withdrawRunner(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody WithdrawRunnerRequest request) {
+        return toResponse(raceService.withdrawRunner(raceId, bib, request));
+    }
+
+    /** 登记医疗暂停开始。 */
+    @PostMapping("/{raceId}/runners/{bib}/medical-holds")
+    public ResponseEntity<Object> startMedicalHold(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody StartMedicalHoldRequest request) {
+        return toResponse(raceService.startMedicalHold(raceId, bib, request));
+    }
+
+    /** 由不同医疗角色确认适赛并恢复医疗暂停。 */
+    @PostMapping("/{raceId}/medical-holds/{holdId}/resumption")
+    public ResponseEntity<Object> resumeMedicalHold(
+            @PathVariable String raceId,
+            @PathVariable String holdId,
+            @Valid @RequestBody ResumeMedicalHoldRequest request) {
+        return toResponse(raceService.resumeMedicalHold(raceId, holdId, request));
+    }
+
+    /** 查询赛事医疗暂停历史（含生效中与已恢复）。 */
+    @GetMapping("/{raceId}/medical-holds")
+    public MedicalHoldHistoryResponse getMedicalHoldHistory(@PathVariable String raceId) {
+        return raceService.getMedicalHoldHistory(raceId);
+    }
+
+    /** 查询单个选手医疗状态诊断。 */
+    @GetMapping("/{raceId}/runners/{bib}/medical-diagnosis")
+    public RunnerMedicalDiagnosisResponse getRunnerMedicalDiagnosis(
+            @PathVariable String raceId,
+            @PathVariable String bib) {
+        return raceService.getRunnerMedicalDiagnosis(raceId, bib);
     }
 
     /** 查询即时成绩（封榜后返回只读快照内容）。 */
