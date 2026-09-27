@@ -1,10 +1,13 @@
 package com.example.starter.plan.repo;
 
 import com.example.starter.plan.model.DayPlan;
+import com.example.starter.plan.model.EffectiveStationStop;
 import com.example.starter.plan.model.Occupancy;
 import com.example.starter.plan.model.PlanStatus;
 import com.example.starter.plan.model.PublishedSlot;
+import com.example.starter.plan.model.PublishedStop;
 import com.example.starter.plan.model.RescheduleLink;
+import com.example.starter.plan.model.StationStop;
 import java.sql.Date;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
@@ -48,6 +51,41 @@ public class PlanRepository {
             rs.getLong("predecessor_plan_id"),
             rs.getLong("successor_plan_id"),
             rs.getLong("created_at"));
+
+    private static final RowMapper<StationStop> STOP_MAPPER = (rs, n) -> {
+        long arrival = rs.getLong("arrival_utc");
+        Long arrivalMillis = rs.wasNull() ? null : arrival;
+        long departure = rs.getLong("departure_utc");
+        Long departureMillis = rs.wasNull() ? null : departure;
+        return new StationStop(
+                rs.getLong("id"),
+                rs.getLong("plan_id"),
+                rs.getInt("seq"),
+                rs.getString("train_no"),
+                rs.getString("station_id"),
+                arrivalMillis == null ? null : Instant.ofEpochMilli(arrivalMillis),
+                departureMillis == null ? null : Instant.ofEpochMilli(departureMillis));
+    };
+
+    private static final RowMapper<PublishedStop> PUBLISHED_STOP_MAPPER = (rs, n) -> {
+        long arrival = rs.getLong("arrival_utc");
+        Long arrivalMillis = rs.wasNull() ? null : arrival;
+        long departure = rs.getLong("departure_utc");
+        Long departureMillis = rs.wasNull() ? null : departure;
+        return new PublishedStop(
+                rs.getLong("id"),
+                rs.getLong("plan_id"),
+                rs.getObject("op_date", LocalDate.class),
+                rs.getInt("seq"),
+                rs.getString("train_no"),
+                rs.getString("station_id"),
+                arrivalMillis == null ? null : Instant.ofEpochMilli(arrivalMillis),
+                departureMillis == null ? null : Instant.ofEpochMilli(departureMillis),
+                rs.getInt("station_version"),
+                rs.getInt("min_dwell_minutes"),
+                rs.getInt("platform_capacity"),
+                rs.getLong("published_at"));
+    };
 
     private final JdbcTemplate jdbc;
 
@@ -218,5 +256,147 @@ public class PlanRepository {
      */
     public void acquirePublishLock() {
         jdbc.queryForObject("SELECT id FROM publish_lock WHERE id = 1 FOR UPDATE", Integer.class);
+    }
+
+    /**
+     * 整体替换计划的站停登记：先删后插，须与占用替换处于同一事务。
+     */
+    public void replaceStationStops(long planId, List<StationStop> stops) {
+        jdbc.update("DELETE FROM rail_plan_station_stop WHERE plan_id = ?", planId);
+        insertStationStops(planId, stops);
+    }
+
+    /**
+     * 批量插入站停登记。
+     */
+    public void insertStationStops(long planId, List<StationStop> stops) {
+        if (stops.isEmpty()) {
+            return;
+        }
+        jdbc.batchUpdate(
+                "INSERT INTO rail_plan_station_stop (plan_id, seq, train_no, station_id,"
+                        + " arrival_utc, departure_utc) VALUES (?, ?, ?, ?, ?, ?)",
+                stops, stops.size(),
+                (ps, s) -> {
+                    ps.setLong(1, planId);
+                    ps.setInt(2, s.seq());
+                    ps.setString(3, s.trainNo());
+                    ps.setString(4, s.stationId());
+                    if (s.arrivalUtc() == null) {
+                        ps.setNull(5, java.sql.Types.BIGINT);
+                    } else {
+                        ps.setLong(5, s.arrivalUtc().toEpochMilli());
+                    }
+                    if (s.departureUtc() == null) {
+                        ps.setNull(6, java.sql.Types.BIGINT);
+                    } else {
+                        ps.setLong(6, s.departureUtc().toEpochMilli());
+                    }
+                });
+    }
+
+    /**
+     * 查询计划登记站停，按计划内序号升序，null 时刻原样返回。
+     */
+    public List<StationStop> findStationStops(long planId) {
+        return jdbc.query("SELECT id, plan_id, seq, train_no, station_id, arrival_utc, departure_utc"
+                        + " FROM rail_plan_station_stop WHERE plan_id = ? ORDER BY seq",
+                STOP_MAPPER, planId);
+    }
+
+    /**
+     * 批量固化发布站停快照。重复发布同一计划同一序号时违反唯一约束并整体回滚。
+     */
+    public void insertPublishedStops(List<PublishedStop> snapshots) {
+        if (snapshots.isEmpty()) {
+            return;
+        }
+        jdbc.batchUpdate(
+                "INSERT INTO rail_published_stop (plan_id, op_date, seq, train_no, station_id,"
+                        + " arrival_utc, departure_utc, station_version, min_dwell_minutes,"
+                        + " platform_capacity, published_at)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                snapshots, snapshots.size(),
+                (ps, s) -> {
+                    ps.setLong(1, s.planId());
+                    ps.setDate(2, Date.valueOf(s.opDate()));
+                    ps.setInt(3, s.seq());
+                    ps.setString(4, s.trainNo());
+                    ps.setString(5, s.stationId());
+                    if (s.arrivalUtc() == null) {
+                        ps.setNull(6, java.sql.Types.BIGINT);
+                    } else {
+                        ps.setLong(6, s.arrivalUtc().toEpochMilli());
+                    }
+                    if (s.departureUtc() == null) {
+                        ps.setNull(7, java.sql.Types.BIGINT);
+                    } else {
+                        ps.setLong(7, s.departureUtc().toEpochMilli());
+                    }
+                    ps.setInt(8, s.stationVersion());
+                    ps.setInt(9, s.minDwellMinutes());
+                    ps.setInt(10, s.platformCapacity());
+                    ps.setLong(11, s.publishedAt());
+                });
+    }
+
+    /**
+     * 查询计划的发布站停快照（取消后仍保留），按序号升序。
+     */
+    public List<PublishedStop> findPublishedStopsByPlan(long planId) {
+        return jdbc.query("SELECT id, plan_id, op_date, seq, train_no, station_id, arrival_utc,"
+                        + " departure_utc, station_version, min_dwell_minutes, platform_capacity,"
+                        + " published_at FROM rail_published_stop WHERE plan_id = ? ORDER BY seq",
+                PUBLISHED_STOP_MAPPER, planId);
+    }
+
+    /**
+     * 查询指定运营日、给定站点集合上仍生效（计划状态为 PUBLISHED）的全部站停快照，
+     * 携带计划业务键；按站点、到达时刻、id 升序返回，作为容量裁决与诊断查询的稳定排序。
+     * 排除给定计划集合（发布排除自身，改签排除新旧两个计划）。
+     */
+    public List<EffectiveStationStop> findEffectiveStationStops(LocalDate opDate,
+                                                                Collection<String> stationIds,
+                                                                Collection<Long> excludePlanIds) {
+        if (stationIds.isEmpty()) {
+            return List.of();
+        }
+        StringJoiner stationPlaceholders = new StringJoiner(", ");
+        stationIds.forEach(s -> stationPlaceholders.add("?"));
+        StringBuilder sql = new StringBuilder(
+                "SELECT s.plan_id, p.schedule_key, s.op_date, s.seq, s.train_no, s.station_id,"
+                        + " s.arrival_utc, s.departure_utc, s.station_version,"
+                        + " s.min_dwell_minutes, s.platform_capacity"
+                        + " FROM rail_published_stop s JOIN rail_day_plan p ON p.id = s.plan_id"
+                        + " WHERE p.status = 'PUBLISHED' AND s.op_date = ?");
+        List<Object> args = new ArrayList<>();
+        args.add(Date.valueOf(opDate));
+        if (!excludePlanIds.isEmpty()) {
+            StringJoiner excludePlaceholders = new StringJoiner(", ");
+            excludePlanIds.forEach(id -> excludePlaceholders.add("?"));
+            sql.append(" AND s.plan_id NOT IN (").append(excludePlaceholders).append(')');
+            args.addAll(excludePlanIds);
+        }
+        sql.append(" AND s.station_id IN (").append(stationPlaceholders)
+                .append(") ORDER BY s.station_id, s.arrival_utc, s.id");
+        args.addAll(stationIds);
+        return jdbc.query(sql.toString(), (rs, n) -> {
+            long arrival = rs.getLong("arrival_utc");
+            Long arrivalMillis = rs.wasNull() ? null : arrival;
+            long departure = rs.getLong("departure_utc");
+            Long departureMillis = rs.wasNull() ? null : departure;
+            return new EffectiveStationStop(
+                    rs.getLong("plan_id"),
+                    rs.getString("schedule_key"),
+                    rs.getObject("op_date", LocalDate.class),
+                    rs.getInt("seq"),
+                    rs.getString("train_no"),
+                    rs.getString("station_id"),
+                    arrivalMillis == null ? null : Instant.ofEpochMilli(arrivalMillis),
+                    departureMillis == null ? null : Instant.ofEpochMilli(departureMillis),
+                    rs.getInt("station_version"),
+                    rs.getInt("min_dwell_minutes"),
+                    rs.getInt("platform_capacity"));
+        }, args.toArray());
     }
 }

@@ -85,7 +85,7 @@ class PlanConcurrencyTest {
         List<Callable<PlanResponse>> tasks = new ArrayList<>();
         for (int i = 0; i < threads; i++) {
             tasks.add(() -> service.createDraft(new CreatePlanRequest(
-                    requestKey, scheduleKey, DAY, occupancies)));
+                    requestKey, scheduleKey, DAY, occupancies, null, null)));
         }
         ExecutorService pool = Executors.newFixedThreadPool(threads);
         CountDownLatch ready = new CountDownLatch(threads);
@@ -122,7 +122,7 @@ class PlanConcurrencyTest {
                 () -> {
                     try {
                         service.replaceOccupancies(scheduleKey, new UpdateOccupanciesRequest(
-                                key("REQ"), 1, List.of(occ(section, 10, 11))));
+                                key("REQ"), 1, List.of(occ(section, 10, 11)), null, null));
                         return Outcome.OK;
                     } catch (ApiException e) {
                         // 发布先提交时更新应得 409 状态冲突
@@ -186,7 +186,7 @@ class PlanConcurrencyTest {
 
     private void createDraft(String scheduleKey, String section, int startHour, int endHour) {
         service.createDraft(new CreatePlanRequest(key("REQ"), scheduleKey, DAY,
-                List.of(occ(section, startHour, endHour))));
+                List.of(occ(section, startHour, endHour)), null, null));
     }
 
     private List<Outcome> runConcurrently(List<Callable<Outcome>> tasks) throws Exception {

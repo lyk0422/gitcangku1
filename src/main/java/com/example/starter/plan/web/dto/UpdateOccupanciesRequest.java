@@ -7,10 +7,13 @@ import jakarta.validation.constraints.Size;
 import java.util.List;
 
 /**
- * 整体替换草稿占用清单请求，expectedVersion 必须与当前版本一致。
+ * 整体替换草稿占用清单请求，expectedVersion 必须与当前版本一致；
+ * 站停清单随占用清单在同一请求内整体替换（可为空列表或 null，均归一为空）。
  */
 public record UpdateOccupanciesRequest(
         @NotBlank String requestKey,
         @NotNull Integer expectedVersion,
-        @NotNull @Size(min = 1, max = 30) List<@Valid OccupancyRequest> occupancies) {
+        @NotNull @Size(min = 1, max = 30) List<@Valid OccupancyRequest> occupancies,
+        @Size(max = 30) List<@Valid StationStopRequest> stationStops,
+        String operatorId) {
 }

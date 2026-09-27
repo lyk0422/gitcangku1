@@ -79,7 +79,99 @@ CREATE TABLE IF NOT EXISTS publish_lock (
     id INT NOT NULL,
     PRIMARY KEY (id)
 );
-COMMENT ON TABLE publish_lock IS '发布/改签全局互斥锁，保证并发发布与改签按事务提交顺序裁决';
-COMMENT ON COLUMN publish_lock.id IS '锁行 id，固定为 1，发布与改签时 SELECT ... FOR UPDATE 串行化';
+COMMENT ON TABLE publish_lock IS '发布/改签/站台配置全局互斥锁，保证并发发布、改签与规则修订按事务提交顺序裁决';
+COMMENT ON COLUMN publish_lock.id IS '锁行 id，固定为 1，发布、改签与站台配置修订时 SELECT ... FOR UPDATE 串行化';
 
 MERGE INTO publish_lock KEY(id) VALUES (1);
+
+-- 站台（中间站）当前配置：最小停站分钟数与站台容量（同站可并行停靠的列车数上限）。
+-- 修订只更新本表并追加 rail_station_version 不可变版本；历史发布快照不被改写。
+CREATE TABLE IF NOT EXISTS rail_station (
+    station_id VARCHAR(64) NOT NULL,
+    min_dwell_minutes INT NOT NULL,
+    platform_capacity INT NOT NULL,
+    version INT NOT NULL,
+    operator_id VARCHAR(64) NOT NULL,
+    created_at BIGINT NOT NULL,
+    updated_at BIGINT NOT NULL,
+    PRIMARY KEY (station_id)
+);
+COMMENT ON TABLE rail_station IS '站台当前配置表，业务键为 station_id；每次修订版本加一，历史版本见 rail_station_version';
+COMMENT ON COLUMN rail_station.station_id IS '站点业务键，全局唯一';
+COMMENT ON COLUMN rail_station.min_dwell_minutes IS '当前要求的最小停站时长（分钟，整数，>=0），发布时到发停留按向下取整分钟数比较';
+COMMENT ON COLUMN rail_station.platform_capacity IS '当前站台容量（>=1）：同一时刻按到发区间左闭右开允许并行停靠的最大列车数';
+COMMENT ON COLUMN rail_station.version IS '当前配置版本，从 1 开始，每次修订加一';
+COMMENT ON COLUMN rail_station.operator_id IS '最近一次配置修订的操作者标识；未提供时为 anonymous';
+COMMENT ON COLUMN rail_station.created_at IS '配置首次创建时刻，UTC 毫秒';
+COMMENT ON COLUMN rail_station.updated_at IS '最近一次配置修订时刻，UTC 毫秒';
+
+CREATE TABLE IF NOT EXISTS rail_station_version (
+    station_id VARCHAR(64) NOT NULL,
+    version INT NOT NULL,
+    min_dwell_minutes INT NOT NULL,
+    platform_capacity INT NOT NULL,
+    operator_id VARCHAR(64) NOT NULL,
+    created_at BIGINT NOT NULL,
+    PRIMARY KEY (station_id, version)
+);
+COMMENT ON TABLE rail_station_version IS '站台配置不可变版本历史，追加后任何操作不得改写';
+COMMENT ON COLUMN rail_station_version.station_id IS '站点业务键，关联 rail_station.station_id';
+COMMENT ON COLUMN rail_station_version.version IS '配置版本，从 1 开始，站内唯一';
+COMMENT ON COLUMN rail_station_version.min_dwell_minutes IS '该版本要求的最小停站分钟数（>=0）';
+COMMENT ON COLUMN rail_station_version.platform_capacity IS '该版本站台容量（>=1）';
+COMMENT ON COLUMN rail_station_version.operator_id IS '产生该版本的操作者标识；未提供时为 anonymous';
+COMMENT ON COLUMN rail_station_version.created_at IS '该版本提交时刻，UTC 毫秒';
+
+-- 草稿登记的站停（到达/发车）时刻，随占用清单整体替换；发布时固化为 rail_published_stop 快照。
+CREATE TABLE IF NOT EXISTS rail_plan_station_stop (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    plan_id BIGINT NOT NULL,
+    seq INT NOT NULL,
+    train_no VARCHAR(64) NOT NULL,
+    station_id VARCHAR(64) NOT NULL,
+    arrival_utc BIGINT NULL,
+    departure_utc BIGINT NULL,
+    PRIMARY KEY (id)
+);
+COMMENT ON TABLE rail_plan_station_stop IS '计划登记的站停时刻草稿表，随草稿整体替换（先删后插，同一事务）';
+COMMENT ON COLUMN rail_plan_station_stop.id IS '主键';
+COMMENT ON COLUMN rail_plan_station_stop.plan_id IS '所属计划 id，关联 rail_day_plan.id';
+COMMENT ON COLUMN rail_plan_station_stop.seq IS '站停在计划内的序号，从 0 开始，保持提交顺序与稳定排序';
+COMMENT ON COLUMN rail_plan_station_stop.train_no IS '站停所属列车编号，须为计划占用清单中存在的列车';
+COMMENT ON COLUMN rail_plan_station_stop.station_id IS '站点业务键，发布时必须存在于 rail_station';
+COMMENT ON COLUMN rail_plan_station_stop.arrival_utc IS '到达时刻（含），UTC 毫秒；NULL 表示始发站仅登记发车';
+COMMENT ON COLUMN rail_plan_station_stop.departure_utc IS '发车时刻（不含），UTC 毫秒；NULL 表示终到站仅登记到达；与 arrival 均非空时必须晚于到达';
+CREATE INDEX IF NOT EXISTS idx_rail_plan_station_stop_plan ON rail_plan_station_stop (plan_id);
+
+-- 发布快照：固化站停规则（最小停站/容量）、到发时刻与站点配置版本，规则修订不改写本表。
+CREATE TABLE IF NOT EXISTS rail_published_stop (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    plan_id BIGINT NOT NULL,
+    op_date DATE NOT NULL,
+    seq INT NOT NULL,
+    train_no VARCHAR(64) NOT NULL,
+    station_id VARCHAR(64) NOT NULL,
+    arrival_utc BIGINT NULL,
+    departure_utc BIGINT NULL,
+    station_version INT NOT NULL,
+    min_dwell_minutes INT NOT NULL,
+    platform_capacity INT NOT NULL,
+    published_at BIGINT NOT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT uk_rail_published_stop_plan_seq UNIQUE (plan_id, seq)
+);
+COMMENT ON TABLE rail_published_stop IS '发布时固化的站停快照，不可变；计划取消后行保留作为历史业务证据';
+COMMENT ON COLUMN rail_published_stop.id IS '主键';
+COMMENT ON COLUMN rail_published_stop.plan_id IS '所属计划 id，关联 rail_day_plan.id；每个计划每序号仅一条快照';
+COMMENT ON COLUMN rail_published_stop.op_date IS '运营日期（Asia/Shanghai 日历日），随计划冗余便于容量裁决';
+COMMENT ON COLUMN rail_published_stop.seq IS '站停在计划内的序号，从 0 开始，稳定排序';
+COMMENT ON COLUMN rail_published_stop.train_no IS '站停所属列车编号';
+COMMENT ON COLUMN rail_published_stop.station_id IS '站点业务键';
+COMMENT ON COLUMN rail_published_stop.arrival_utc IS '固化的到达时刻（含），UTC 毫秒；NULL 语义同草稿：始发站仅发车';
+COMMENT ON COLUMN rail_published_stop.departure_utc IS '固化的发车时刻（不含），UTC 毫秒；NULL 语义同草稿：终到站仅到达';
+COMMENT ON COLUMN rail_published_stop.station_version IS '发布时刻站点配置版本，规则修订后本值保持不变';
+COMMENT ON COLUMN rail_published_stop.min_dwell_minutes IS '发布时刻站点最小停站分钟数，固化不改写';
+COMMENT ON COLUMN rail_published_stop.platform_capacity IS '发布时刻站点站台容量，固化不改写';
+COMMENT ON COLUMN rail_published_stop.published_at IS '快照固化时刻（发布提交时刻），UTC 毫秒';
+CREATE INDEX IF NOT EXISTS idx_rail_published_stop_station_date
+    ON rail_published_stop (station_id, op_date, arrival_utc);

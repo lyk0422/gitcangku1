@@ -5,6 +5,7 @@ import com.example.starter.plan.web.dto.CreatePlanRequest;
 import com.example.starter.plan.web.dto.PlanActionRequest;
 import com.example.starter.plan.web.dto.PlanResponse;
 import com.example.starter.plan.web.dto.PublishedSlotView;
+import com.example.starter.plan.web.dto.PublishedStopView;
 import com.example.starter.plan.web.dto.RescheduleChainResponse;
 import com.example.starter.plan.web.dto.RescheduleRequest;
 import com.example.starter.plan.web.dto.RescheduleResponse;
@@ -61,21 +62,21 @@ public class PlanController {
     }
 
     /**
-     * 发布计划，原子校验时隙冲突。
+     * 发布计划，原子校验区段时隙与站停规则/容量；操作者参与幂等指纹。
      */
     @PostMapping("/plans/{scheduleKey}/publish")
     public PlanResponse publish(@PathVariable String scheduleKey,
                                 @Valid @RequestBody PlanActionRequest request) {
-        return service.publish(scheduleKey, request.requestKey());
+        return service.publish(scheduleKey, request.requestKey(), request.operatorId());
     }
 
     /**
-     * 取消已发布计划，时隙立即释放，历史保留。
+     * 取消已发布计划，时隙与站台容量立即释放，历史保留。
      */
     @PostMapping("/plans/{scheduleKey}/cancel")
     public PlanResponse cancel(@PathVariable String scheduleKey,
                                @Valid @RequestBody PlanActionRequest request) {
-        return service.cancel(scheduleKey, request.requestKey());
+        return service.cancel(scheduleKey, request.requestKey(), request.operatorId());
     }
 
     /**
@@ -102,6 +103,14 @@ public class PlanController {
     @GetMapping("/plans/{scheduleKey}")
     public PlanResponse getPlan(@PathVariable String scheduleKey) {
         return service.getPlan(scheduleKey);
+    }
+
+    /**
+     * 计划发布时固化的站停快照历史（到发时刻、站点版本与当时规则），按序号升序。
+     */
+    @GetMapping("/plans/{scheduleKey}/published-stops")
+    public List<PublishedStopView> getPublishedStops(@PathVariable String scheduleKey) {
+        return service.getPublishedStops(scheduleKey);
     }
 
     /**
