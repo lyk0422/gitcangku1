@@ -1,6 +1,11 @@
 package com.example.starter.api;
 
 import com.example.starter.api.dto.ArtifactResponse;
+import com.example.starter.api.dto.BatchDeprecationRequest;
+import com.example.starter.api.dto.BatchDeprecationResponse;
+import com.example.starter.api.dto.DeprecationEventResponse;
+import com.example.starter.api.dto.DeprecationRequest;
+import com.example.starter.api.dto.DeprecationResponse;
 import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
 import com.example.starter.api.dto.RegisterArtifactRequest;
@@ -20,7 +25,7 @@ import org.springframework.web.bind.annotation.RestController;
 import java.util.List;
 
 /**
- * 软件制品依赖锁定 REST API。
+ * 软件制品依赖锁定与弃用窗口 REST API。
  */
 @RestController
 @RequestMapping("/api/artifacts")
@@ -48,6 +53,50 @@ public class ArtifactController {
             @PathVariable String name,
             @PathVariable @Positive int version) {
         return artifactService.withdrawArtifact(requestId, name, version);
+    }
+
+    /** 登记单个弃用窗口。 */
+    @PostMapping("/deprecations")
+    public ResponseEntity<DeprecationResponse> registerDeprecation(
+            @RequestHeader("X-Request-Id") String requestId,
+            @Valid @RequestBody DeprecationRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(artifactService.registerDeprecation(requestId, request));
+    }
+
+    /** 批量设置弃用窗口：完整替代图先校验，任一失败整次不写入。 */
+    @PostMapping("/deprecations/batch")
+    public ResponseEntity<BatchDeprecationResponse> batchDeprecations(
+            @RequestHeader("X-Request-Id") String requestId,
+            @Valid @RequestBody BatchDeprecationRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(artifactService.batchDeprecations(requestId, request));
+    }
+
+    /** 撤销尚未生效的弃用窗口。 */
+    @PostMapping("/deprecations/{id}/revoke")
+    public DeprecationResponse revokeDeprecation(
+            @RequestHeader("X-Request-Id") String requestId,
+            @PathVariable @Positive long id) {
+        return artifactService.revokeDeprecation(requestId, id);
+    }
+
+    /** 查询全部有效弃用窗口（只读）。 */
+    @GetMapping("/deprecations")
+    public List<DeprecationResponse> listDeprecations() {
+        return artifactService.listActiveDeprecations();
+    }
+
+    /** 查询弃用事件历史（登记、批量调整、撤销，只追加）。 */
+    @GetMapping("/deprecations/history")
+    public List<DeprecationEventResponse> deprecationHistory() {
+        return artifactService.listDeprecationHistory();
+    }
+
+    /** 按 ID 查询单个弃用窗口（含已撤销）。 */
+    @GetMapping("/deprecations/{id}")
+    public DeprecationResponse getDeprecation(@PathVariable @Positive long id) {
+        return artifactService.getDeprecation(id);
     }
 
     /** 创建锁文件。 */

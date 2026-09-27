@@ -2,6 +2,9 @@ package com.example.starter.repo;
 
 import com.example.starter.domain.ArtifactVersion;
 import com.example.starter.domain.DependencyRange;
+import com.example.starter.domain.DeprecationStatus;
+import com.example.starter.domain.DeprecationWindow;
+import com.example.starter.domain.DeprecationEvent;
 import com.example.starter.domain.RepositorySnapshot;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.support.GeneratedKeyHolder;
@@ -163,20 +166,21 @@ public class RepositoryDao {
                 "UPDATE artifact SET withdrawn = 1 WHERE id = ? AND withdrawn = 0", artifactId);
     }
 
-    /** 新增锁文件主记录，返回自增主键。 */
+    /** 新增锁文件主记录，返回自增主键。resolvedAt 为该锁固化的 UTC 解析时刻。 */
     public long insertLockFile(String rootName, int rootVersion, long repositoryVersion,
-                               String requestId, Instant createdAt) {
+                               String requestId, Instant resolvedAt, Instant createdAt) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbcTemplate.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO lock_file (root_name, root_version, repository_version, request_id, created_at) "
-                            + "VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO lock_file (root_name, root_version, repository_version, request_id, "
+                            + "resolved_at, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, rootName);
             ps.setInt(2, rootVersion);
             ps.setLong(3, repositoryVersion);
             ps.setString(4, requestId);
-            ps.setTimestamp(5, Timestamp.from(createdAt));
+            ps.setTimestamp(5, Timestamp.from(resolvedAt));
+            ps.setTimestamp(6, Timestamp.from(createdAt));
             return ps;
         }, keyHolder);
         Number key = keyHolder.getKey();
@@ -233,32 +237,40 @@ public class RepositoryDao {
         return records.isEmpty() ? null : records.get(0);
     }
 
-    /** 锁文件列表行：不含条目明细。 */
+    /** 锁文件列表行：不含条目明细与弃用警告。 */
     public record LockFileRow(long id, String rootName, int rootVersion,
-                              long repositoryVersion, Instant createdAt) {
+                              long repositoryVersion, Instant resolvedAt, Instant createdAt) {
     }
 
     /** 锁文件条目行。 */
     public record LockEntryRow(long lockFileId, String name, int version) {
     }
 
+    /** 锁文件固化的弃用警告行。 */
+    public record LockWarningRow(long lockFileId, String name, int version,
+                                 String replacementName, int replacementVersion,
+                                 Instant effectiveAt, String note, Instant resolvedAt) {
+    }
+
     /** 查询全部历史锁文件，按 ID 升序。 */
     public List<LockFileRow> listLockFiles() {
         return jdbcTemplate.query(
-                "SELECT id, root_name, root_version, repository_version, created_at "
+                "SELECT id, root_name, root_version, repository_version, resolved_at, created_at "
                         + "FROM lock_file ORDER BY id ASC",
                 (rs, n) -> new LockFileRow(rs.getLong("id"), rs.getString("root_name"),
                         rs.getInt("root_version"), rs.getLong("repository_version"),
+                        rs.getTimestamp("resolved_at").toInstant(),
                         rs.getTimestamp("created_at").toInstant()));
     }
 
     /** 按主键查询锁文件，不存在返回 null。 */
     public LockFileRow getLockFile(long id) {
         List<LockFileRow> rows = jdbcTemplate.query(
-                "SELECT id, root_name, root_version, repository_version, created_at "
+                "SELECT id, root_name, root_version, repository_version, resolved_at, created_at "
                         + "FROM lock_file WHERE id = ?",
                 (rs, n) -> new LockFileRow(rs.getLong("id"), rs.getString("root_name"),
                         rs.getInt("root_version"), rs.getLong("repository_version"),
+                        rs.getTimestamp("resolved_at").toInstant(),
                         rs.getTimestamp("created_at").toInstant()),
                 id);
         return rows.isEmpty() ? null : rows.get(0);
@@ -274,9 +286,206 @@ public class RepositoryDao {
                 lockFileId);
     }
 
+    /** 查询某锁文件固化的全部弃用警告，按制品、版本升序。 */
+    public List<LockWarningRow> listLockWarnings(long lockFileId) {
+        return jdbcTemplate.query(
+                "SELECT lock_file_id, name, version, replacement_name, replacement_version, "
+                        + "effective_at, note, resolved_at FROM lock_deprecation_warning "
+                        + "WHERE lock_file_id = ? ORDER BY name ASC, version ASC",
+                (rs, n) -> new LockWarningRow(rs.getLong("lock_file_id"),
+                        rs.getString("name"), rs.getInt("version"),
+                        rs.getString("replacement_name"), rs.getInt("replacement_version"),
+                        rs.getTimestamp("effective_at").toInstant(),
+                        rs.getString("note"),
+                        rs.getTimestamp("resolved_at").toInstant()),
+                lockFileId);
+    }
+
     private record ArtifactRow(long id, String name, int version, boolean withdrawn) {
     }
 
     private record DepRow(long artifactId, String name, int minimumVersion, int maximumVersion) {
+    }
+
+    // ------------------------------------------------------------------
+    // 弃用窗口
+    // ------------------------------------------------------------------
+
+    private static final String DEPRECATION_SELECT =
+            "SELECT d.id, d.artifact_id, a.name AS artifact_name, a.version AS artifact_version, "
+                    + "d.effective_at, d.replacement_artifact_id, "
+                    + "ra.name AS replacement_name, ra.version AS replacement_version, "
+                    + "d.note, d.status, d.revoked_at, d.created_at "
+                    + "FROM artifact_deprecation d "
+                    + "JOIN artifact a ON a.id = d.artifact_id "
+                    + "JOIN artifact ra ON ra.id = d.replacement_artifact_id ";
+
+    private static DeprecationWindow mapDeprecation(java.sql.ResultSet rs, int n) throws java.sql.SQLException {
+        return new DeprecationWindow(
+                rs.getLong("id"),
+                rs.getLong("artifact_id"),
+                rs.getString("artifact_name"),
+                rs.getInt("artifact_version"),
+                rs.getTimestamp("effective_at").toInstant(),
+                rs.getLong("replacement_artifact_id"),
+                rs.getString("replacement_name"),
+                rs.getInt("replacement_version"),
+                rs.getString("note"),
+                DeprecationStatus.valueOf(rs.getString("status")),
+                rs.getTimestamp("revoked_at") == null ? null : rs.getTimestamp("revoked_at").toInstant(),
+                rs.getTimestamp("created_at").toInstant());
+    }
+
+    /** 新增弃用窗口，返回自增主键。 */
+    public long insertDeprecation(long artifactId, Instant effectiveAt, long replacementArtifactId,
+                                  String note, String requestId, Instant createdAt) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbcTemplate.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO artifact_deprecation (artifact_id, effective_at, replacement_artifact_id, "
+                            + "note, status, revoked_at, request_id, created_at) "
+                            + "VALUES (?, ?, ?, ?, 'ACTIVE', NULL, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setLong(1, artifactId);
+            ps.setTimestamp(2, Timestamp.from(effectiveAt));
+            ps.setLong(3, replacementArtifactId);
+            ps.setString(4, note);
+            ps.setString(5, requestId);
+            ps.setTimestamp(6, Timestamp.from(createdAt));
+            return ps;
+        }, keyHolder);
+        Number key = keyHolder.getKey();
+        if (key == null) {
+            throw new IllegalStateException("插入弃用窗口未获取自增主键");
+        }
+        return key.longValue();
+    }
+
+    /** 调整既有 ACTIVE 窗口的生效时刻、替代版本与说明（批量设置使用）。 */
+    public void updateDeprecation(long deprecationId, Instant effectiveAt, long replacementArtifactId,
+                                  String note, String requestId) {
+        jdbcTemplate.update(
+                "UPDATE artifact_deprecation SET effective_at = ?, replacement_artifact_id = ?, "
+                        + "note = ?, request_id = ? WHERE id = ? AND status = 'ACTIVE'",
+                ps -> {
+                    ps.setTimestamp(1, Timestamp.from(effectiveAt));
+                    ps.setLong(2, replacementArtifactId);
+                    ps.setString(3, note);
+                    ps.setString(4, requestId);
+                    ps.setLong(5, deprecationId);
+                });
+    }
+
+    /**
+     * 撤销窗口，仅当 ACTIVE 且尚未撤销时生效，返回受影响行数。
+     * 是否允许撤销（尚未到生效时刻）由服务层按当前时钟判定。
+     */
+    public int markDeprecationRevoked(long deprecationId, Instant revokedAt) {
+        return jdbcTemplate.update(
+                "UPDATE artifact_deprecation SET status = 'REVOKED', revoked_at = ? "
+                        + "WHERE id = ? AND status = 'ACTIVE' AND revoked_at IS NULL",
+                Timestamp.from(revokedAt), deprecationId);
+    }
+
+    /** 追加一条弃用事件（只追加历史）。 */
+    public void insertDeprecationEvent(long deprecationId, long artifactId, long replacementArtifactId,
+                                       String eventType, Instant effectiveAt, String note,
+                                       String requestId, Instant eventAt) {
+        jdbcTemplate.update(
+                "INSERT INTO artifact_deprecation_event (deprecation_id, artifact_id, replacement_artifact_id, "
+                        + "event_type, effective_at, note, request_id, event_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ps -> {
+                    ps.setLong(1, deprecationId);
+                    ps.setLong(2, artifactId);
+                    ps.setLong(3, replacementArtifactId);
+                    ps.setString(4, eventType);
+                    ps.setTimestamp(5, Timestamp.from(effectiveAt));
+                    ps.setString(6, note);
+                    ps.setString(7, requestId);
+                    ps.setTimestamp(8, Timestamp.from(eventAt));
+                });
+    }
+
+    /** 按主键查询弃用窗口（含已撤销），不存在返回 null。 */
+    public DeprecationWindow getDeprecation(long id) {
+        List<DeprecationWindow> windows = jdbcTemplate.query(
+                DEPRECATION_SELECT + "WHERE d.id = ?", RepositoryDao::mapDeprecation, id);
+        return windows.isEmpty() ? null : windows.get(0);
+    }
+
+    /** 查询某制品版本当前 ACTIVE 窗口，不存在返回 null。 */
+    public DeprecationWindow findActiveDeprecation(long artifactId) {
+        List<DeprecationWindow> windows = jdbcTemplate.query(
+                DEPRECATION_SELECT + "WHERE d.artifact_id = ? AND d.status = 'ACTIVE'",
+                RepositoryDao::mapDeprecation, artifactId);
+        return windows.isEmpty() ? null : windows.get(0);
+    }
+
+    /** 查询全部 ACTIVE 窗口，按制品名称、版本升序（完整替代图校验使用）。 */
+    public List<DeprecationWindow> listActiveDeprecations() {
+        return jdbcTemplate.query(
+                DEPRECATION_SELECT + "WHERE d.status = 'ACTIVE' "
+                        + "ORDER BY a.name ASC, a.version ASC, d.id ASC",
+                RepositoryDao::mapDeprecation);
+    }
+
+    /** 查询弃用事件历史，按事件时刻、ID 升序；只读。 */
+    public List<DeprecationEvent> listDeprecationEvents() {
+        String sql = eventSelect() + " ORDER BY e.event_at ASC, e.id ASC";
+        return jdbcTemplate.query(sql, RepositoryDao::mapEvent);
+    }
+
+    /** 查询单个窗口的事件历史，按事件时刻、ID 升序；只读。 */
+    public List<DeprecationEvent> listDeprecationEvents(long deprecationId) {
+        String sql = eventSelect() + " WHERE e.deprecation_id = ? ORDER BY e.event_at ASC, e.id ASC";
+        return jdbcTemplate.query(sql, RepositoryDao::mapEvent, deprecationId);
+    }
+
+    private static String eventSelect() {
+        return "SELECT e.id, e.deprecation_id, e.artifact_id, a.name AS artifact_name, "
+                + "a.version AS artifact_version, e.replacement_artifact_id, "
+                + "ra.name AS replacement_name, ra.version AS replacement_version, "
+                + "e.event_type, e.effective_at, e.note, e.request_id, e.event_at "
+                + "FROM artifact_deprecation_event e "
+                + "JOIN artifact a ON a.id = e.artifact_id "
+                + "JOIN artifact ra ON ra.id = e.replacement_artifact_id";
+    }
+
+    private static DeprecationEvent mapEvent(java.sql.ResultSet rs, int n) throws java.sql.SQLException {
+        return new DeprecationEvent(
+                rs.getLong("id"),
+                rs.getLong("deprecation_id"),
+                rs.getLong("artifact_id"),
+                rs.getString("artifact_name"),
+                rs.getInt("artifact_version"),
+                rs.getLong("replacement_artifact_id"),
+                rs.getString("replacement_name"),
+                rs.getInt("replacement_version"),
+                rs.getString("event_type"),
+                rs.getTimestamp("effective_at").toInstant(),
+                rs.getString("note"),
+                rs.getString("request_id"),
+                rs.getTimestamp("event_at").toInstant());
+    }
+
+    /** 固化一条锁定时刻命中的待生效弃用警告。 */
+    public void insertLockWarning(long lockFileId, String name, int version,
+                                  String replacementName, int replacementVersion,
+                                  Instant effectiveAt, String note, Instant resolvedAt) {
+        jdbcTemplate.update(
+                "INSERT INTO lock_deprecation_warning (lock_file_id, name, version, replacement_name, "
+                        + "replacement_version, effective_at, note, resolved_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ps -> {
+                    ps.setLong(1, lockFileId);
+                    ps.setString(2, name);
+                    ps.setInt(3, version);
+                    ps.setString(4, replacementName);
+                    ps.setInt(5, replacementVersion);
+                    ps.setTimestamp(6, Timestamp.from(effectiveAt));
+                    ps.setString(7, note);
+                    ps.setTimestamp(8, Timestamp.from(resolvedAt));
+                });
     }
 }

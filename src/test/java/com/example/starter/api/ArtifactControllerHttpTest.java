@@ -35,8 +35,11 @@ class ArtifactControllerHttpTest {
 
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM lock_deprecation_warning");
         jdbcTemplate.update("DELETE FROM lock_file_entry");
         jdbcTemplate.update("DELETE FROM lock_file");
+        jdbcTemplate.update("DELETE FROM artifact_deprecation_event");
+        jdbcTemplate.update("DELETE FROM artifact_deprecation");
         jdbcTemplate.update("DELETE FROM artifact_dependency");
         jdbcTemplate.update("DELETE FROM artifact");
         jdbcTemplate.update("DELETE FROM idempotent_request");
@@ -217,5 +220,116 @@ class ArtifactControllerHttpTest {
                 new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
                 JsonNode.class);
         assertThat(lockOnWithdrawn.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+    }
+
+    @Test
+    void deprecationWorkflowProducesWarningThenRevokesAndKeepsHistory() {
+        // app:1 -> lib[1,1]；lib1/lib2；登记 lib1 的未来弃用窗口，锁定时应固化警告。
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("app", 1, dependency("lib", 1, 1)),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("lib", 1),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("lib", 2),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+
+        String deprecationBody = "{\"name\":\"lib\",\"version\":1,"
+                + "\"effectiveAt\":\"2099-01-01T00:00:00Z\","
+                + "\"replacementVersion\":2,\"note\":\"升级到 lib2\"}";
+        ResponseEntity<JsonNode> created = restTemplate.postForEntity(
+                "/api/artifacts/deprecations",
+                new HttpEntity<>(deprecationBody, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(created.getBody().path("status").asText()).isEqualTo("ACTIVE");
+        long deprecationId = created.getBody().path("id").asLong();
+
+        // 列表与单查可读。
+        ResponseEntity<JsonNode> list = restTemplate.getForEntity(
+                "/api/artifacts/deprecations", JsonNode.class);
+        assertThat(list.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(list.getBody()).hasSize(1);
+        ResponseEntity<JsonNode> one = restTemplate.getForEntity(
+                "/api/artifacts/deprecations/{id}", JsonNode.class, deprecationId);
+        assertThat(one.getStatusCode()).isEqualTo(HttpStatus.OK);
+
+        // 生效前锁定：201 且响应携带一条 DEPRECATION_WARNING 快照。
+        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"expectedRepositoryVersion\":4}";
+        ResponseEntity<JsonNode> lock = restTemplate.postForEntity(
+                "/api/artifacts/locks",
+                new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(lock.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        JsonNode warnings = lock.getBody().path("deprecationWarnings");
+        assertThat(warnings).hasSize(1);
+        assertThat(warnings.get(0).path("name").asText()).isEqualTo("lib");
+        assertThat(warnings.get(0).path("version").asInt()).isEqualTo(1);
+        assertThat(warnings.get(0).path("replacementVersion").asInt()).isEqualTo(2);
+        assertThat(warnings.get(0).path("effectiveAt").asText())
+                .isEqualTo("2099-01-01T00:00:00Z");
+        assertThat(lock.getBody().path("resolvedAt").asText())
+                .isEqualTo(lock.getBody().path("createdAt").asText());
+
+        // 撤销未生效窗口：200，ACTIVE 列表清空但历史保留两条事件。
+        ResponseEntity<JsonNode> revoked = restTemplate.exchange(
+                "/api/artifacts/deprecations/{id}/revoke",
+                HttpMethod.POST,
+                new HttpEntity<>("", jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class,
+                deprecationId);
+        assertThat(revoked.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(revoked.getBody().path("status").asText()).isEqualTo("REVOKED");
+        ResponseEntity<JsonNode> activeAfter = restTemplate.getForEntity(
+                "/api/artifacts/deprecations", JsonNode.class);
+        assertThat(activeAfter.getBody()).hasSize(0);
+        ResponseEntity<JsonNode> history = restTemplate.getForEntity(
+                "/api/artifacts/deprecations/history", JsonNode.class);
+        assertThat(history.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(history.getBody()).hasSize(2);
+        assertThat(history.getBody().get(0).path("eventType").asText()).isEqualTo("REGISTERED");
+        assertThat(history.getBody().get(1).path("eventType").asText()).isEqualTo("REVOKED");
+    }
+
+    @Test
+    void batchDeprecationCycleReturns422AndWritesNothing() {
+        // lib1/lib2；同批互指形成替代环 → 422，整批回滚。
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("lib", 1),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("lib", 2),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+
+        String batchBody = "{\"items\":["
+                + "{\"name\":\"lib\",\"version\":1,\"effectiveAt\":\"2099-01-01T00:00:00Z\","
+                + "\"replacementVersion\":2,\"note\":null},"
+                + "{\"name\":\"lib\",\"version\":2,\"effectiveAt\":\"2099-01-02T00:00:00Z\","
+                + "\"replacementVersion\":1,\"note\":null}]}";
+        ResponseEntity<JsonNode> response = restTemplate.postForEntity(
+                "/api/artifacts/deprecations/batch",
+                new HttpEntity<>(batchBody, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+        assertThat(response.getBody().path("error").asText())
+                .isEqualTo("UNPROCESSABLE_ENTITY");
+
+        ResponseEntity<JsonNode> active = restTemplate.getForEntity(
+                "/api/artifacts/deprecations", JsonNode.class);
+        assertThat(active.getBody()).hasSize(0);
+    }
+
+    @Test
+    void deprecationWithMissingEffectiveAtReturns400() {
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("lib", 1),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        String body = "{\"name\":\"lib\",\"version\":1,\"replacementVersion\":1}";
+        ResponseEntity<JsonNode> response = restTemplate.postForEntity(
+                "/api/artifacts/deprecations",
+                new HttpEntity<>(body, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
     }
 }
