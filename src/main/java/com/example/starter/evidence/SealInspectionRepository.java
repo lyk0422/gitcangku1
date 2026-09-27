@@ -45,6 +45,16 @@ public class SealInspectionRepository {
                 ROW_MAPPER, evidenceKey);
     }
 
+    /**
+     * 统计证物已有核验记录数（用于计算跨案移交快照的封签版本）。
+     */
+    public int countByEvidenceKey(String evidenceKey) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM seal_inspection WHERE evidence_key = ?",
+                Integer.class, evidenceKey);
+        return count == null ? 0 : count;
+    }
+
     private static final class InspectionRowMapper implements RowMapper<SealInspection> {
         @Override
         public SealInspection mapRow(ResultSet rs, int rowNum) throws SQLException {
