@@ -55,4 +55,30 @@ public final class Requests {
     /** 任务完成/取消请求，操作人由 X-Actor-Id 指定且须为当前指挥人。 */
     public record TaskActionRequest(String commandKey) {
     }
+
+    /** 任务修订请求：标题与分组为修订后的完整值；修订使任务版本加 1 并使提案旧票转 STALE。 */
+    public record TaskReviseRequest(String commandKey, String groupCode, String title) {
+    }
+
+    /**
+     * 决策提案登记请求：taskAction 为生效时写入的任务变更（COMPLETE/CANCEL）；
+     * requiredRoles 为所需角色集合（非空、去重后排序固化）；quorum 为法定人数（1..角色数）；
+     * expiresAt 为 UTC 到期时刻，不得早于登记当前时刻；投票窗口 [登记时刻, expiresAt) 左闭右开。
+     */
+    public record DecisionCreateRequest(String commandKey, String proposalKey, String taskKey,
+                                        String taskAction, List<String> requiredRoles,
+                                        Integer quorum, Instant expiresAt) {
+    }
+
+    /** 投票请求：role 必须属于提案所需角色集合；ballot 为 SUPPORT/OPPOSE。 */
+    public record VoteRequest(String commandKey, String role, String ballot) {
+    }
+
+    /** 撤回投票请求：仅可撤回本角色当前任务版本下的 CAST 票。 */
+    public record VoteWithdrawRequest(String commandKey, String role) {
+    }
+
+    /** 到期判定请求：以注入 Clock 的当前时刻评估，到期则提案转 EXPIRED。 */
+    public record DecisionExpireCheckRequest(String commandKey) {
+    }
 }

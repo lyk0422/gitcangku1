@@ -64,11 +64,12 @@ public final class Responses {
 
     /**
      * 处置任务视图：blockers 按阻塞事件键排序；doneBy/doneAt 仅 DONE 有值，
-     * cancelledBy/cancelledAt 仅 CANCELLED 有值。
+     * cancelledBy/cancelledAt 仅 CANCELLED 有值；version 自 1 起，每次修订加 1。
      */
     public record TaskView(String taskKey, String groupCode, String title, String status,
-                           List<TaskBlockerView> blockers, String createdBy, Instant createdAt,
-                           String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt) {
+                           int version, List<TaskBlockerView> blockers, String createdBy,
+                           Instant createdAt, String doneBy, Instant doneAt,
+                           String cancelledBy, Instant cancelledAt) {
     }
 
     /** 按事件分组的任务列表视图：tasks 按创建顺序返回。 */
@@ -77,5 +78,42 @@ public final class Responses {
 
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
+    }
+
+    /**
+     * 决策提案视图：requiredRoles 为登记时固化的有序角色集合；
+     * supportCount/opposeCount 为当前任务版本下 CAST 票统计，remainingToQuorum 为距法定人数差额；
+     * decidedTaskVersion 仅 EFFECTIVE 有值，decidedAt 为生效/到期判定时刻（OPEN 为空）。
+     */
+    public record DecisionView(String proposalKey, String taskKey, String taskAction,
+                               int currentTaskVersion, List<String> requiredRoles, int quorum,
+                               int supportCount, int opposeCount, int remainingToQuorum,
+                               String status, Integer decidedTaskVersion, Instant decidedAt,
+                               Instant expiresAt, String createdBy, Instant createdAt) {
+    }
+
+    /**
+     * 投票视图：taskVersion/castAt 为投票时固化的任务版本与 UTC 时刻，不被后续操作改写；
+     * status 为 CAST/WITHDRAWN/STALE，updatedAt 为状态最近变更时刻（未变更等于 castAt）。
+     */
+    public record VoteView(String role, String ballot, int taskVersion, String status,
+                           String actor, Instant castAt, Instant updatedAt) {
+    }
+
+    /** 提案完整历史：提案当前视图 + 全部投票证据（按投票顺序，含 WITHDRAWN/STALE）。 */
+    public record DecisionHistoryView(DecisionView decision, List<VoteView> votes) {
+    }
+
+    /** 按事件分组的提案列表视图：decisions 按登记顺序返回。 */
+    public record DecisionListView(String incidentKey, List<DecisionView> decisions) {
+    }
+
+    /**
+     * 提案诊断视图：各状态票数与法定人数差额；读取本身不改变任何状态。
+     */
+    public record DecisionDiagnosticsView(String proposalKey, String status, int quorum,
+                                          int supportCount, int opposeCount, int withdrawnCount,
+                                          int staleCount, int remainingToQuorum,
+                                          Instant expiresAt, Instant decidedAt) {
     }
 }

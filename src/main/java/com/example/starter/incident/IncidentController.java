@@ -1,6 +1,8 @@
 package com.example.starter.incident;
 
 import com.example.starter.incident.dto.Requests.ActionRequest;
+import com.example.starter.incident.dto.Requests.DecisionCreateRequest;
+import com.example.starter.incident.dto.Requests.DecisionExpireCheckRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
 import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
@@ -8,9 +10,16 @@ import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
 import com.example.starter.incident.dto.Requests.TaskActionRequest;
 import com.example.starter.incident.dto.Requests.TaskCreateRequest;
+import com.example.starter.incident.dto.Requests.TaskReviseRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
+import com.example.starter.incident.dto.Requests.VoteRequest;
+import com.example.starter.incident.dto.Requests.VoteWithdrawRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
+import com.example.starter.incident.dto.Responses.DecisionDiagnosticsView;
+import com.example.starter.incident.dto.Responses.DecisionHistoryView;
+import com.example.starter.incident.dto.Responses.DecisionListView;
+import com.example.starter.incident.dto.Responses.DecisionView;
 import com.example.starter.incident.dto.Responses.EscalationHistoryView;
 import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
@@ -18,6 +27,7 @@ import com.example.starter.incident.dto.Responses.IncidentTasksView;
 import com.example.starter.incident.dto.Responses.IncidentView;
 import com.example.starter.incident.dto.Responses.TaskView;
 import com.example.starter.incident.dto.Responses.TransferView;
+import com.example.starter.incident.dto.Responses.VoteView;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -36,9 +46,11 @@ import org.springframework.web.bind.annotation.RestController;
 public class IncidentController {
 
     private final IncidentService service;
+    private final DecisionService decisionService;
 
-    public IncidentController(IncidentService service) {
+    public IncidentController(IncidentService service, DecisionService decisionService) {
         this.service = service;
+        this.decisionService = decisionService;
     }
 
     /**
@@ -187,5 +199,92 @@ public class IncidentController {
                                @RequestHeader("X-Actor-Id") String actor,
                                @RequestBody TaskActionRequest req) {
         return service.cancelTask(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 任务修订（仅当前指挥人；仅 OPEN 可修订；版本加 1 并使提案旧票转 STALE）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/revise")
+    public TaskView reviseTask(@PathVariable String incidentKey, @PathVariable String taskKey,
+                               @RequestHeader("X-Actor-Id") String actor,
+                               @RequestBody TaskReviseRequest req) {
+        return service.reviseTask(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 登记决策提案（仅当前指挥人；登记 UTC 到期时刻、所需角色集合与法定人数）。
+     */
+    @PostMapping("/{incidentKey}/decisions")
+    public ResponseEntity<DecisionView> registerDecision(@PathVariable String incidentKey,
+                                                         @RequestHeader("X-Actor-Id") String actor,
+                                                         @RequestBody DecisionCreateRequest req) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(decisionService.register(incidentKey, actor, req));
+    }
+
+    /**
+     * 按事件查询全部决策提案（按登记顺序，只读）。
+     */
+    @GetMapping("/{incidentKey}/decisions")
+    public DecisionListView listDecisions(@PathVariable String incidentKey) {
+        return decisionService.list(incidentKey);
+    }
+
+    /**
+     * 查询决策提案明细（含当前计票统计，只读）。
+     */
+    @GetMapping("/{incidentKey}/decisions/{proposalKey}")
+    public DecisionView getDecision(@PathVariable String incidentKey,
+                                    @PathVariable String proposalKey) {
+        return decisionService.get(incidentKey, proposalKey);
+    }
+
+    /**
+     * 查询提案完整历史（全部投票证据，含 WITHDRAWN/STALE，只读）。
+     */
+    @GetMapping("/{incidentKey}/decisions/{proposalKey}/history")
+    public DecisionHistoryView decisionHistory(@PathVariable String incidentKey,
+                                               @PathVariable String proposalKey) {
+        return decisionService.history(incidentKey, proposalKey);
+    }
+
+    /**
+     * 查询提案诊断（各状态票数与法定人数差额，只读）。
+     */
+    @GetMapping("/{incidentKey}/decisions/{proposalKey}/diagnostics")
+    public DecisionDiagnosticsView decisionDiagnostics(@PathVariable String incidentKey,
+                                                       @PathVariable String proposalKey) {
+        return decisionService.diagnostics(incidentKey, proposalKey);
+    }
+
+    /**
+     * 投票（角色须属于所需角色集合；到期后投票返回 410 且提案转 EXPIRED）。
+     */
+    @PostMapping("/{incidentKey}/decisions/{proposalKey}/votes")
+    public VoteView vote(@PathVariable String incidentKey, @PathVariable String proposalKey,
+                         @RequestHeader("X-Actor-Id") String actor,
+                         @RequestBody VoteRequest req) {
+        return decisionService.vote(incidentKey, proposalKey, actor, req);
+    }
+
+    /**
+     * 撤回投票（仅本角色当前任务版本下的 CAST 票）。
+     */
+    @PostMapping("/{incidentKey}/decisions/{proposalKey}/votes/withdraw")
+    public VoteView withdrawVote(@PathVariable String incidentKey, @PathVariable String proposalKey,
+                                 @RequestHeader("X-Actor-Id") String actor,
+                                 @RequestBody VoteWithdrawRequest req) {
+        return decisionService.withdraw(incidentKey, proposalKey, actor, req);
+    }
+
+    /**
+     * 到期判定：以服务端注入 Clock 的当前时刻评估，到期则提案转 EXPIRED；
+     * 携带 commandKey，同键重放首次结果。
+     */
+    @PostMapping("/{incidentKey}/decisions/{proposalKey}/expire-check")
+    public DecisionView expireCheck(@PathVariable String incidentKey,
+                                    @PathVariable String proposalKey,
+                                    @RequestBody DecisionExpireCheckRequest req) {
+        return decisionService.expireCheck(incidentKey, proposalKey, req);
     }
 }

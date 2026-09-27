@@ -56,4 +56,14 @@ public class ApiException extends RuntimeException {
     public static ApiException illegalTransition(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "ILLEGAL_TRANSITION", message, null);
     }
+
+    /** 422：语义校验失败（如法定人数超过角色集合、到期时刻早于当前时刻、投票角色无效），可携带实际值/要求值明细。 */
+    public static ApiException unprocessable(String message, Object details) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "UNPROCESSABLE", message, details);
+    }
+
+    /** 410：资源已到期（如提案到期后投票）。 */
+    public static ApiException gone(String message) {
+        return new ApiException(HttpStatus.GONE, "GONE", message, null);
+    }
 }

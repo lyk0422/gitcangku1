@@ -1,14 +1,10 @@
 package com.example.starter.incident;
 
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.EnumSet;
-import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -22,6 +18,7 @@ import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
 import com.example.starter.incident.dto.Requests.TaskActionRequest;
 import com.example.starter.incident.dto.Requests.TaskCreateRequest;
+import com.example.starter.incident.dto.Requests.TaskReviseRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
@@ -35,8 +32,6 @@ import com.example.starter.incident.dto.Responses.TaskBlockerView;
 import com.example.starter.incident.dto.Responses.TaskView;
 import com.example.starter.incident.dto.Responses.TransferView;
 import com.example.starter.incident.dto.Responses.UnfinishedTaskView;
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -48,11 +43,11 @@ import org.springframework.transaction.annotation.Transactional;
  * 幂等约定：commandKey 全局唯一，同键同参重放首次响应，同键改参返回 409。
  * 遏制期限：首次进入 COMMANDING 时以该次接管 UTC 时刻按等级确定
  * （S1=5分钟、S2=15分钟、S3=60分钟、S4=240分钟），交接不重置。
+ * 任务修订：标题/分组变更使任务版本加 1，同事务内将未到期的 OPEN 决策提案
+ * 旧票转 STALE 并推进计票版本；已到期的提案转 EXPIRED。
  */
 @Service
 public class IncidentService {
-
-    private static final String SEP = "\\u001F";
 
     /** 各严重等级的遏制时限（分钟），等级沿用上报值且不可修改。 */
     private static final Map<String, Long> CONTAINMENT_MINUTES = Map.of(
@@ -71,18 +66,18 @@ public class IncidentService {
     private final IncidentRepository incidents;
     private final EscalationRepository escalations;
     private final IncidentTaskRepository tasks;
-    private final CommandKeyRepository commandKeys;
-    private final ObjectMapper objectMapper;
+    private final DecisionRepository decisions;
+    private final CommandKeyExecutor executor;
     private final Clock clock;
 
     public IncidentService(IncidentRepository incidents, EscalationRepository escalations,
-                           IncidentTaskRepository tasks, CommandKeyRepository commandKeys,
-                           ObjectMapper objectMapper, Clock clock) {
+                           IncidentTaskRepository tasks, DecisionRepository decisions,
+                           CommandKeyExecutor executor, Clock clock) {
         this.incidents = incidents;
         this.escalations = escalations;
         this.tasks = tasks;
-        this.commandKeys = commandKeys;
-        this.objectMapper = objectMapper;
+        this.decisions = decisions;
+        this.executor = executor;
         this.clock = clock;
     }
 
@@ -414,7 +409,8 @@ public class IncidentService {
         }
         Incident incident = lockIncident(incidentKey);
         return runIdempotent(commandKey, "task_create",
-                hash(incidentKey, actor, taskKey, groupCode, title, String.join(",", blockerKeys)),
+                hash(incidentKey, actor, taskKey, groupCode, title,
+                        CommandKeyExecutor.hashSet(blockerKeys)),
                 TaskView.class, () -> {
                     requireCommander(incident, actor);
                     if (incident.status() == IncidentStatus.CLOSED) {
@@ -452,7 +448,7 @@ public class IncidentService {
                     }
                     Instant now = now();
                     long taskId = tasks.insert(new IncidentTask(0L, incident.id(), taskKey,
-                            groupCode, title, TaskStatus.OPEN, actor, null, null, null, null,
+                            groupCode, title, TaskStatus.OPEN, 1, actor, null, null, null, null,
                             now, now));
                     for (Incident blocker : blockers) {
                         tasks.insertBlocker(taskId, blocker.id(), now);
@@ -509,6 +505,41 @@ public class IncidentService {
                                 "任务已处于终态 " + task.status() + "，不能取消");
                     }
                     tasks.markCancelled(task.id(), actor, now());
+                    return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
+                });
+    }
+
+    /**
+     * 任务修订：仅当前指挥人；仅 OPEN 任务可修订；标题/分组更新后版本加 1。
+     * 同事务内联动决策提案：已到期的 OPEN 提案转 EXPIRED，其余 OPEN 提案的
+     * 全部 CAST 票转 STALE（保留历史证据）并推进计票版本，旧票不计入新版本。
+     */
+    @Transactional
+    public TaskView reviseTask(String incidentKey, String taskKey, String actor,
+                               TaskReviseRequest req) {
+        String commandKey = requireText(req.commandKey(), "commandKey");
+        String groupCode = requireText(req.groupCode(), "groupCode");
+        String title = requireText(req.title(), "title");
+        Incident incident = lockIncident(incidentKey);
+        return runIdempotent(commandKey, "task_revise", hash(incidentKey, taskKey, actor,
+                groupCode, title), TaskView.class, () -> {
+                    requireCommander(incident, actor);
+                    IncidentTask task = tasks.findByKey(incident.id(), taskKey)
+                            .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
+                    if (task.status() != TaskStatus.OPEN) {
+                        throw ApiException.conflict(
+                                "任务已处于终态 " + task.status() + "，不能修订");
+                    }
+                    Instant now = now();
+                    int newVersion = tasks.revise(task.id(), groupCode, title, now);
+                    for (IncidentDecision proposal : decisions.listOpenByTask(task.id())) {
+                        if (!now.isBefore(proposal.expiresAt())) {
+                            decisions.markExpired(proposal.id(), now);
+                        } else {
+                            decisions.staleCastVotes(proposal.id(), now);
+                            decisions.bumpCurrentTaskVersion(proposal.id(), newVersion, now);
+                        }
+                    }
                     return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
                 });
     }
@@ -572,52 +603,11 @@ public class IncidentService {
      */
     private <T> T runIdempotent(String commandKey, String operation, String requestHash,
                                 Class<T> type, Supplier<T> business) {
-        var existing = commandKeys.find(commandKey);
-        if (existing.isPresent()) {
-            return replay(existing.get(), operation, requestHash, type);
-        }
-        try {
-            commandKeys.insertPlaceholder(commandKey, operation, requestHash, now());
-        } catch (DuplicateKeyException e) {
-            var committed = commandKeys.findForUpdate(commandKey)
-                    .orElseThrow(() -> ApiException.conflict("commandKey 处理冲突: " + commandKey));
-            return replay(committed, operation, requestHash, type);
-        }
-        T result = business.get();
-        commandKeys.fillResponse(commandKey, 200, toJson(result));
-        return result;
-    }
-
-    private <T> T replay(CommandKeyRecord record, String operation, String requestHash, Class<T> type) {
-        if (!record.operation().equals(operation) || !record.requestHash().equals(requestHash)) {
-            throw ApiException.conflict("commandKey 已被不同参数的请求使用: " + record.commandKey());
-        }
-        if (record.responseBody() == null) {
-            throw ApiException.conflict("commandKey 正在处理中: " + record.commandKey());
-        }
-        try {
-            return objectMapper.readValue(record.responseBody(), type);
-        } catch (JsonProcessingException e) {
-            throw new IllegalStateException("幂等响应反序列化失败", e);
-        }
-    }
-
-    private String toJson(Object value) {
-        try {
-            return objectMapper.writeValueAsString(value);
-        } catch (JsonProcessingException e) {
-            throw new IllegalStateException("响应序列化失败", e);
-        }
+        return executor.run(commandKey, operation, requestHash, type, business);
     }
 
     private static String hash(String... parts) {
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] out = digest.digest(String.join(SEP, parts).getBytes(StandardCharsets.UTF_8));
-            return HexFormat.of().formatHex(out);
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException(e);
-        }
+        return CommandKeyExecutor.hash(parts);
     }
 
     private IncidentView toView(Incident incident, String pendingTransferTo) {
@@ -640,8 +630,8 @@ public class IncidentService {
                         UNBLOCKING_STATUSES.contains(b.status())))
                 .toList();
         return new TaskView(task.taskKey(), task.groupCode(), task.title(), task.status().name(),
-                blockers, task.createdBy(), task.createdAt(), task.doneBy(), task.doneAt(),
-                task.cancelledBy(), task.cancelledAt());
+                task.version(), blockers, task.createdBy(), task.createdAt(), task.doneBy(),
+                task.doneAt(), task.cancelledBy(), task.cancelledAt());
     }
 
     private static TransferView toTransferView(IncidentTransfer transfer) {
