@@ -10,6 +10,7 @@ import org.springframework.stereotype.Repository;
 import java.math.BigDecimal;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
+import java.time.LocalDate;
 import java.util.List;
 import java.util.Objects;
 
@@ -46,6 +47,23 @@ public class WaterRepository {
                              long createdNanos) {
     }
 
+    /** 渠道日蒸发率行；rate 为 0~0.2 的小数（最多四位小数），version 随每次修改递增。 */
+    public record EvaporationRateRow(long id, String channelId, LocalDate rateDate, BigDecimal rate,
+                                     int version, long createdNanos, long updatedNanos) {
+    }
+
+    /** 核销记录行，创建后不可变；反向更正记录 amounts 为负值并通过 reversalOfKey 指向原核销。 */
+    public record SettlementRow(long id, String settlementKey, String kind, long windowId,
+                                String allocationKey, String channelId, LocalDate rateDate, int rateVersion,
+                                BigDecimal rate, BigDecimal deliveredAmount, BigDecimal lossAmount,
+                                BigDecimal deductedAmount, BigDecimal remainingHeld, String reversalOfKey,
+                                long createdNanos) {
+    }
+
+    /** 渠道某日核销合计（按类型分别统计）；反向更正的合计为负值。 */
+    public record SettlementTotals(BigDecimal delivered, BigDecimal loss, BigDecimal deducted, long count) {
+    }
+
     private static final RowMapper<WindowRow> WINDOW_MAPPER = (rs, n) -> new WindowRow(
             rs.getLong("id"), rs.getString("window_key"), rs.getString("channel_id"),
             rs.getLong("start_nanos"), rs.getLong("end_nanos"),
@@ -74,6 +92,27 @@ public class WaterRepository {
     private static final RowMapper<CommandRow> COMMAND_MAPPER = (rs, n) -> new CommandRow(
             rs.getString("command_key"), rs.getString("operation"), rs.getString("params"),
             rs.getString("response"), rs.getLong("created_nanos"));
+
+    private static final RowMapper<EvaporationRateRow> RATE_MAPPER = (rs, n) -> new EvaporationRateRow(
+            rs.getLong("id"), rs.getString("channel_id"), rs.getObject("rate_date", LocalDate.class),
+            rs.getBigDecimal("rate"), rs.getInt("version"),
+            rs.getLong("created_nanos"), rs.getLong("updated_nanos"));
+
+    private static final String RATE_SELECT =
+            "SELECT id, channel_id, rate_date, rate, version, created_nanos, updated_nanos";
+
+    private static final RowMapper<SettlementRow> SETTLEMENT_MAPPER = (rs, n) -> new SettlementRow(
+            rs.getLong("id"), rs.getString("settlement_key"), rs.getString("kind"), rs.getLong("window_id"),
+            rs.getString("allocation_key"), rs.getString("channel_id"),
+            rs.getObject("rate_date", LocalDate.class), rs.getInt("rate_version"), rs.getBigDecimal("rate"),
+            rs.getBigDecimal("delivered_amount"), rs.getBigDecimal("loss_amount"),
+            rs.getBigDecimal("deducted_amount"), rs.getBigDecimal("remaining_held"),
+            rs.getString("reversal_of_key"), rs.getLong("created_nanos"));
+
+    private static final String SETTLEMENT_SELECT =
+            "SELECT id, settlement_key, kind, window_id, allocation_key, channel_id, rate_date, rate_version,"
+                    + " rate, delivered_amount, loss_amount, deducted_amount, remaining_held,"
+                    + " reversal_of_key, created_nanos";
 
     private final JdbcTemplate jdbc;
 
@@ -303,5 +342,145 @@ public class WaterRepository {
     /** 写回命令首次成功响应。 */
     public void updateCommandResponse(String commandKey, String response) {
         jdbc.update("UPDATE command_log SET response = ? WHERE command_key = ?", response, commandKey);
+    }
+
+    // ------------------------------------------------------------------
+    // 蒸发率
+    // ------------------------------------------------------------------
+
+    /** 按渠道+日期查询蒸发率，不存在返回 null。 */
+    public EvaporationRateRow findRate(String channelId, LocalDate rateDate) {
+        try {
+            return jdbc.queryForObject(RATE_SELECT + " FROM evaporation_rate WHERE channel_id = ? AND rate_date = ?",
+                    RATE_MAPPER, channelId, rateDate);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 按渠道+日期锁定蒸发率行（FOR UPDATE），串行化“修改率”与“当日首次核销”，不存在返回 null。 */
+    public EvaporationRateRow lockRate(String channelId, LocalDate rateDate) {
+        try {
+            return jdbc.queryForObject(
+                    RATE_SELECT + " FROM evaporation_rate WHERE channel_id = ? AND rate_date = ? FOR UPDATE",
+                    RATE_MAPPER, channelId, rateDate);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 首次登记蒸发率（版本 1）并返回主键。 */
+    public long insertRate(String channelId, LocalDate rateDate, BigDecimal rate, long nowNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO evaporation_rate (channel_id, rate_date, rate, version, created_nanos, updated_nanos)"
+                            + " VALUES (?, ?, ?, 1, ?, ?)", Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, channelId);
+            ps.setObject(2, rateDate);
+            ps.setBigDecimal(3, rate);
+            ps.setLong(4, nowNanos);
+            ps.setLong(5, nowNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 修改蒸发率并递增版本。 */
+    public void updateRate(long id, BigDecimal rate, int version, long updatedNanos) {
+        jdbc.update("UPDATE evaporation_rate SET rate = ?, version = ?, updated_nanos = ? WHERE id = ?",
+                rate, version, updatedNanos, id);
+    }
+
+    /** 渠道全部蒸发率，按日期升序。 */
+    public List<EvaporationRateRow> listRates(String channelId) {
+        return jdbc.query(RATE_SELECT + " FROM evaporation_rate WHERE channel_id = ? ORDER BY rate_date",
+                RATE_MAPPER, channelId);
+    }
+
+    /** 渠道某日是否已存在正常核销（存在则当日率锁定）。 */
+    public boolean existsSettlementForChannelDate(String channelId, LocalDate rateDate) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM settlement WHERE channel_id = ? AND rate_date = ? AND kind = 'SETTLEMENT'",
+                Integer.class, channelId, rateDate);
+        return count != null && count > 0;
+    }
+
+    // ------------------------------------------------------------------
+    // 核销记录
+    // ------------------------------------------------------------------
+
+    /** 插入不可变核销记录（正常核销或反向更正）并返回主键。 */
+    public long insertSettlement(String settlementKey, String kind, long windowId, String allocationKey,
+                                 String channelId, LocalDate rateDate, int rateVersion, BigDecimal rate,
+                                 BigDecimal deliveredAmount, BigDecimal lossAmount, BigDecimal deductedAmount,
+                                 BigDecimal remainingHeld, String reversalOfKey, long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO settlement (settlement_key, kind, window_id, allocation_key, channel_id,"
+                            + " rate_date, rate_version, rate, delivered_amount, loss_amount, deducted_amount,"
+                            + " remaining_held, reversal_of_key, created_nanos)"
+                            + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, settlementKey);
+            ps.setString(2, kind);
+            ps.setLong(3, windowId);
+            ps.setString(4, allocationKey);
+            ps.setString(5, channelId);
+            ps.setObject(6, rateDate);
+            ps.setInt(7, rateVersion);
+            ps.setBigDecimal(8, rate);
+            ps.setBigDecimal(9, deliveredAmount);
+            ps.setBigDecimal(10, lossAmount);
+            ps.setBigDecimal(11, deductedAmount);
+            ps.setBigDecimal(12, remainingHeld);
+            ps.setString(13, reversalOfKey);
+            ps.setLong(14, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 按业务键查询核销记录，不存在返回 null。 */
+    public SettlementRow findSettlementByKey(String settlementKey) {
+        try {
+            return jdbc.queryForObject(SETTLEMENT_SELECT + " FROM settlement WHERE settlement_key = ?",
+                    SETTLEMENT_MAPPER, settlementKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 查询某核销的反向更正记录，不存在返回 null。 */
+    public SettlementRow findReversalOf(String settlementKey) {
+        try {
+            return jdbc.queryForObject(SETTLEMENT_SELECT + " FROM settlement WHERE reversal_of_key = ?",
+                    SETTLEMENT_MAPPER, settlementKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 申请全部核销记录（含反向更正），按主键升序。 */
+    public List<SettlementRow> listSettlementsByAllocation(String allocationKey) {
+        return jdbc.query(SETTLEMENT_SELECT + " FROM settlement WHERE allocation_key = ? ORDER BY id",
+                SETTLEMENT_MAPPER, allocationKey);
+    }
+
+    /** 渠道某日指定类型核销的合计（送达/损耗/扣减与条数），无记录时合计为 0。 */
+    public SettlementTotals sumSettlements(String channelId, LocalDate rateDate, String kind) {
+        return jdbc.queryForObject(
+                "SELECT COALESCE(SUM(delivered_amount), 0), COALESCE(SUM(loss_amount), 0),"
+                        + " COALESCE(SUM(deducted_amount), 0), COUNT(*) FROM settlement"
+                        + " WHERE channel_id = ? AND rate_date = ? AND kind = ?",
+                (rs, n) -> new SettlementTotals(rs.getBigDecimal(1), rs.getBigDecimal(2),
+                        rs.getBigDecimal(3), rs.getLong(4)),
+                channelId, rateDate, kind);
+    }
+
+    /** 反向更正回补上游持有额度（不得突破原申请水量由事务内校验保证）并记录变更时间。 */
+    public void incrementHeldAmount(long id, BigDecimal delta, long updatedNanos) {
+        jdbc.update("UPDATE allocation SET held_amount = held_amount + ?, updated_nanos = ? WHERE id = ?",
+                delta, updatedNanos, id);
     }
 }

@@ -74,6 +74,66 @@ public final class Dtos {
                                   List<CurtailmentResponse> curtailments) {
     }
 
+    /** 登记或修改渠道日蒸发率命令；rate 为 0~0.2 的十进制字符串，最多四位小数。 */
+    public record UpsertEvaporationRateRequest(String commandKey, String rate) {
+    }
+
+    /**
+     * 渠道日蒸发率视图。date 为 UTC 自然日（yyyy-MM-dd）；version 首次登记为 1，每次修改加 1；
+     * locked 为 true 表示当日已存在核销，率不可再修改。
+     */
+    public record EvaporationRateResponse(String channelId, String date, String rate, int version,
+                                          boolean locked, String createdUtc, String updatedUtc) {
+    }
+
+    /** 渠道蒸发率列表视图。 */
+    public record EvaporationRateListResponse(String channelId, List<EvaporationRateResponse> rates) {
+    }
+
+    /** 单笔核销项：对 allocationKey 的持有额度按 date 当日渠道蒸发率核销 deliveredAmount 送达水量。 */
+    public record SettlementItemRequest(String settlementKey, String allocationKey, String date,
+                                        String deliveredAmount) {
+    }
+
+    /** 批量核销命令：整批预校验完整最终余额与逐笔舍入口径，任一失败整批回滚。 */
+    public record SettlementBatchRequest(String commandKey, List<SettlementItemRequest> items) {
+    }
+
+    /**
+     * 核销记录视图，创建后不可变。kind：SETTLEMENT 正常核销 / REVERSAL 反向更正（数量为负）。
+     * 固化核销时的蒸发率与版本；deductedAmount = deliveredAmount + lossAmount（两位小数）；
+     * remainingHeldAmount 为本记录生效后上游申请的剩余持有额度；reversalOfKey 仅反向更正记录非空。
+     */
+    public record SettlementResponse(String settlementKey, String kind, long windowId, String allocationKey,
+                                     String channelId, String date, int rateVersion, String rate,
+                                     String deliveredAmount, String lossAmount, String deductedAmount,
+                                     String reversalOfKey, String remainingHeldAmount, String createdUtc) {
+    }
+
+    /** 批量核销结果视图，顺序与请求 items 一致。 */
+    public record SettlementBatchResponse(List<SettlementResponse> settlements) {
+    }
+
+    /** 反向更正命令：对指定已结算核销生成等额反向记录并回补上游额度。 */
+    public record ReverseSettlementRequest(String commandKey, String reversalKey) {
+    }
+
+    /** 申请核销历史视图（含反向更正），按发生顺序返回。 */
+    public record SettlementListResponse(String allocationKey, List<SettlementResponse> settlements) {
+    }
+
+    /**
+     * 渠道某日蒸发结算诊断视图（只读）。rate/version 未登记时为 null；
+     * settled* 为正常核销合计，reversed* 为反向更正合计（负值），net* 为两者之和。
+     */
+    public record EvaporationDiagnosticsResponse(String channelId, String date, String rate, Integer version,
+                                                 boolean locked, long settlementCount, long reversalCount,
+                                                 String settledDelivered, String settledLoss,
+                                                 String settledDeducted, String reversedDelivered,
+                                                 String reversedLoss, String reversedDeducted,
+                                                 String netDelivered, String netLoss, String netDeducted) {
+    }
+
     /** 统一错误响应体。 */
     public record ErrorResponse(String code, String message) {
     }

@@ -2,6 +2,9 @@ package com.example.starter.water;
 
 import com.example.starter.water.WaterRepository.AllocationRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
+import com.example.starter.water.WaterRepository.EvaporationRateRow;
+import com.example.starter.water.WaterRepository.SettlementRow;
+import com.example.starter.water.WaterRepository.SettlementTotals;
 import com.example.starter.water.WaterRepository.TransferRow;
 import com.example.starter.water.WaterRepository.WindowRow;
 import org.junit.jupiter.api.Test;
@@ -12,10 +15,12 @@ import org.springframework.jdbc.datasource.init.ScriptUtils;
 
 import java.math.BigDecimal;
 import java.sql.Connection;
+import java.time.LocalDate;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * 持久化验证：同一 JVM 内使用命名 H2 内存库（MODE=MySQL），建表写入后以全新连接与仓储实例
@@ -95,8 +100,7 @@ class PersistenceTests {
     }
 
     @Test
-    void cancelledAllocationHeldAmountIsZero() throws Exception {
-        String url = String.format(URL_TEMPLATE, UUID.randomUUID().toString().substring(0, 8));
+    void cancelledAllocationHeldAmountIsZero() throws Exception {        String url = String.format(URL_TEMPLATE, UUID.randomUUID().toString().substring(0, 8));
         SimpleDriverDataSource dataSource = new SimpleDriverDataSource(new org.h2.Driver(), url, "sa", "");
         try (Connection connection = dataSource.getConnection()) {
             ScriptUtils.executeSqlScript(connection, new ClassPathResource("schema.sql"));
@@ -115,5 +119,59 @@ class PersistenceTests {
         assertEquals(new BigDecimal("3.000"), cancelled.amount());
         assertEquals(0, cancelled.heldAmount().compareTo(BigDecimal.ZERO));
         assertEquals(0, repo.sumApprovedAmount(windowId).compareTo(BigDecimal.ZERO));
+    }
+
+    @Test
+    void evaporationRateAndSettlementAreReadableFromNewConnection() throws Exception {
+        String url = String.format(URL_TEMPLATE, UUID.randomUUID().toString().substring(0, 8));
+        LocalDate date = LocalDate.of(2026, 10, 1);
+
+        // 第一次“运行”：建表并写入蒸发率与固化的核销记录
+        SimpleDriverDataSource first = new SimpleDriverDataSource(new org.h2.Driver(), url, "sa", "");
+        try (Connection connection = first.getConnection()) {
+            ScriptUtils.executeSqlScript(connection, new ClassPathResource("schema.sql"));
+        }
+        WaterRepository repo1 = new WaterRepository(new JdbcTemplate(first));
+        long windowId = repo1.insertWindow("wk-evap", "ch-evap", 1_000L, 2_000L,
+                new BigDecimal("100.000"), 1L);
+        repo1.insertAllocation("ak-evap", windowId, "user-1", new BigDecimal("50.000"), "alice", 2L);
+        AllocationRow allocation = repo1.findAllocationByKey("ak-evap");
+        repo1.updateAllocationStatus(allocation.id(), "APPROVED", 3L);
+        repo1.insertRate("ch-evap", date, new BigDecimal("0.1250"), 4L);
+        // 核销：送达 10、损耗 1.25、上游扣减 11.25，扣减后剩余 38.75
+        repo1.decrementHeldAmount(allocation.id(), new BigDecimal("11.25"), 5L);
+        repo1.insertSettlement("sk-evap", "SETTLEMENT", windowId, "ak-evap", "ch-evap", date, 1,
+                new BigDecimal("0.1250"), new BigDecimal("10.00"), new BigDecimal("1.25"),
+                new BigDecimal("11.25"), new BigDecimal("38.75"), null, 5L);
+
+        // 第二次读取：全新连接与仓储实例，同一 JVM 内数据仍在
+        WaterRepository repo2 = new WaterRepository(
+                new JdbcTemplate(new SimpleDriverDataSource(new org.h2.Driver(), url, "sa", "")));
+        EvaporationRateRow rate = repo2.findRate("ch-evap", date);
+        assertNotNull(rate);
+        assertEquals(new BigDecimal("0.1250"), rate.rate());
+        assertEquals(1, rate.version());
+        assertEquals(date, rate.rateDate());
+
+        SettlementRow settlement = repo2.findSettlementByKey("sk-evap");
+        assertNotNull(settlement);
+        assertEquals("SETTLEMENT", settlement.kind());
+        assertEquals("ak-evap", settlement.allocationKey());
+        assertEquals(1, settlement.rateVersion());
+        // DECIMAL(19,3) 读回 scale 为 3，按数值比较
+        assertEquals(0, settlement.deliveredAmount().compareTo(new BigDecimal("10.00")));
+        assertEquals(0, settlement.lossAmount().compareTo(new BigDecimal("1.25")));
+        assertEquals(0, settlement.deductedAmount().compareTo(new BigDecimal("11.25")));
+        assertEquals(0, settlement.remainingHeld().compareTo(new BigDecimal("38.75")));
+        assertEquals(0, repo2.findAllocationByKey("ak-evap").heldAmount()
+                .compareTo(new BigDecimal("38.75")));
+        assertTrue(repo2.existsSettlementForChannelDate("ch-evap", date));
+        assertEquals(1, repo2.listSettlementsByAllocation("ak-evap").size());
+
+        SettlementTotals totals = repo2.sumSettlements("ch-evap", date, "SETTLEMENT");
+        assertEquals(1, totals.count());
+        assertEquals(0, totals.delivered().compareTo(new BigDecimal("10.00")));
+        assertEquals(0, totals.deducted().compareTo(new BigDecimal("11.25")));
+        assertEquals(0, repo2.sumSettlements("ch-evap", date, "REVERSAL").count());
     }
 }

@@ -49,9 +49,41 @@ CREATE TABLE IF NOT EXISTS transfer (
     CONSTRAINT fk_transfer_window FOREIGN KEY (window_id) REFERENCES supply_window (id)
 ) COMMENT='配水额度转让流水，与源扣减、目标批准同事务提交，创建后不可变，不提供撤销';
 
+CREATE TABLE IF NOT EXISTS evaporation_rate (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '蒸发率记录主键',
+    channel_id VARCHAR(128) NOT NULL COMMENT '渠道 ID',
+    rate_date DATE NOT NULL COMMENT 'UTC 自然日，对应左闭右开日区间 [当日 00:00Z, 次日 00:00Z)',
+    rate DECIMAL(6,4) NOT NULL COMMENT '蒸发率，0~0.2（即 0~20%），最多四位小数',
+    version INT NOT NULL COMMENT '率版本，首次登记为 1，每次修改加 1；核销时固化到核销记录',
+    created_nanos BIGINT NOT NULL COMMENT '创建时间，UTC 纳秒时间戳',
+    updated_nanos BIGINT NOT NULL COMMENT '最近修改时间，UTC 纳秒时间戳',
+    CONSTRAINT uk_evap_rate_channel_date UNIQUE (channel_id, rate_date)
+) COMMENT='渠道日蒸发率，当日首次核销后锁定，再修改返回 409';
+
+CREATE TABLE IF NOT EXISTS settlement (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '核销记录主键',
+    settlement_key VARCHAR(128) NOT NULL COMMENT '核销业务键，全局唯一；换 commandKey 复用返回 409',
+    kind VARCHAR(16) NOT NULL COMMENT '类型：SETTLEMENT 正常核销 / REVERSAL 反向更正',
+    window_id BIGINT NOT NULL COMMENT '所属供水窗口 ID',
+    allocation_key VARCHAR(128) NOT NULL COMMENT '上游配水申请业务键（被扣减持有额度的申请）',
+    channel_id VARCHAR(128) NOT NULL COMMENT '渠道 ID（冗余自窗口，便于按渠道+日期查询）',
+    rate_date DATE NOT NULL COMMENT '核销对应的 UTC 自然日',
+    rate_version INT NOT NULL COMMENT '核销时固化的蒸发率版本，后续修率不改写',
+    rate DECIMAL(6,4) NOT NULL COMMENT '核销时固化的蒸发率，后续修率不改写',
+    delivered_amount DECIMAL(19,3) NOT NULL COMMENT '下游送达水量（原始值），单位立方米，最多 3 位小数；反向更正为负值',
+    loss_amount DECIMAL(19,3) NOT NULL COMMENT '蒸发损耗水量，单位立方米，按银行家舍入到两位小数；反向更正为负值',
+    deducted_amount DECIMAL(19,3) NOT NULL COMMENT '上游额度扣减量=送达+损耗，单位立方米，两位小数；反向更正为负值',
+    remaining_held DECIMAL(19,3) NOT NULL COMMENT '本记录生效后上游申请的剩余持有额度，单位立方米，固化不随后续操作改写',
+    reversal_of_key VARCHAR(128) NULL COMMENT '反向更正对应的原核销业务键；正常核销为 NULL',
+    created_nanos BIGINT NOT NULL COMMENT '创建时间，UTC 纳秒时间戳',
+    CONSTRAINT uk_settlement_key UNIQUE (settlement_key),
+    CONSTRAINT uk_settlement_reversal_of UNIQUE (reversal_of_key),
+    CONSTRAINT fk_settlement_window FOREIGN KEY (window_id) REFERENCES supply_window (id)
+) COMMENT='渠道蒸发损耗核销记录，创建后不可变；已结算核销只能通过反向更正记录处理';
+
 CREATE TABLE IF NOT EXISTS command_log (
     command_key VARCHAR(128) PRIMARY KEY COMMENT '命令幂等键',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：WINDOW_CREATE/ALLOCATION_SUBMIT/ALLOCATION_APPROVE/ALLOCATION_CANCEL/CURTAILMENT_CREATE/CURTAILMENT_CANCEL/TRANSFER',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：WINDOW_CREATE/ALLOCATION_SUBMIT/ALLOCATION_APPROVE/ALLOCATION_CANCEL/CURTAILMENT_CREATE/CURTAILMENT_CANCEL/TRANSFER/EVAP_RATE_UPSERT/SETTLEMENT_BATCH/SETTLEMENT_REVERSAL',
     params VARCHAR(2048) NOT NULL COMMENT '规范化请求参数串，用于同键改参检测',
     response MEDIUMTEXT NULL COMMENT '首次成功响应 JSON；命令事务提交前写入',
     created_nanos BIGINT NOT NULL COMMENT '创建时间，UTC 纳秒时间戳'

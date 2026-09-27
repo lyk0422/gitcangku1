@@ -6,15 +6,25 @@ import com.example.starter.water.dto.Dtos.CommandRequest;
 import com.example.starter.water.dto.Dtos.CreateWindowRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
+import com.example.starter.water.dto.Dtos.EvaporationDiagnosticsResponse;
+import com.example.starter.water.dto.Dtos.EvaporationRateListResponse;
+import com.example.starter.water.dto.Dtos.EvaporationRateResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.ReverseSettlementRequest;
+import com.example.starter.water.dto.Dtos.SettlementBatchRequest;
+import com.example.starter.water.dto.Dtos.SettlementBatchResponse;
+import com.example.starter.water.dto.Dtos.SettlementListResponse;
+import com.example.starter.water.dto.Dtos.SettlementResponse;
 import com.example.starter.water.dto.Dtos.SubmitAllocationRequest;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferRequest;
 import com.example.starter.water.dto.Dtos.TransferResponse;
+import com.example.starter.water.dto.Dtos.UpsertEvaporationRateRequest;
 import com.example.starter.water.dto.Dtos.WindowResponse;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -102,5 +112,58 @@ public class WaterController {
     @GetMapping("/windows/{windowId}/history")
     public HistoryResponse getHistory(@PathVariable long windowId) {
         return service.getHistory(windowId);
+    }
+
+    /** 登记或修改渠道某日（UTC 自然日）蒸发率；当日首次核销后锁定，再修改返回 409。 */
+    @PutMapping("/channels/{channelId}/evaporation-rates/{date}")
+    public EvaporationRateResponse upsertEvaporationRate(@PathVariable String channelId,
+                                                         @PathVariable String date,
+                                                         @RequestBody UpsertEvaporationRateRequest request) {
+        return service.upsertEvaporationRate(request.commandKey(), channelId, date, request.rate());
+    }
+
+    /** 查询渠道某日蒸发率。 */
+    @GetMapping("/channels/{channelId}/evaporation-rates/{date}")
+    public EvaporationRateResponse getEvaporationRate(@PathVariable String channelId,
+                                                      @PathVariable String date) {
+        return service.getEvaporationRate(channelId, date);
+    }
+
+    /** 查询渠道全部蒸发率。 */
+    @GetMapping("/channels/{channelId}/evaporation-rates")
+    public EvaporationRateListResponse listEvaporationRates(@PathVariable String channelId) {
+        return service.listEvaporationRates(channelId);
+    }
+
+    /** 查询渠道某日蒸发结算诊断（只读）。 */
+    @GetMapping("/channels/{channelId}/evaporation-rates/{date}/diagnostics")
+    public EvaporationDiagnosticsResponse getEvaporationDiagnostics(@PathVariable String channelId,
+                                                                    @PathVariable String date) {
+        return service.getEvaporationDiagnostics(channelId, date);
+    }
+
+    /** 批量核销送达水量：整批预校验，任一失败整批回滚。 */
+    @PostMapping("/settlements")
+    public SettlementBatchResponse settleDeliveries(@RequestBody SettlementBatchRequest request) {
+        return service.settleDeliveries(request.commandKey(), request.items());
+    }
+
+    /** 查询单笔核销记录明细。 */
+    @GetMapping("/settlements/{settlementKey}")
+    public SettlementResponse getSettlement(@PathVariable String settlementKey) {
+        return service.getSettlement(settlementKey);
+    }
+
+    /** 对已结算核销生成反向更正记录并回补上游额度。 */
+    @PostMapping("/settlements/{settlementKey}/reverse")
+    public SettlementResponse reverseSettlement(@PathVariable String settlementKey,
+                                                @RequestBody ReverseSettlementRequest request) {
+        return service.reverseSettlement(request.commandKey(), settlementKey, request.reversalKey());
+    }
+
+    /** 查询申请全部核销历史（含反向更正）。 */
+    @GetMapping("/allocations/{allocationKey}/settlements")
+    public SettlementListResponse getAllocationSettlements(@PathVariable String allocationKey) {
+        return service.getAllocationSettlements(allocationKey);
     }
 }
