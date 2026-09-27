@@ -32,7 +32,15 @@ class EquipmentApiTests {
     @BeforeEach
     void cleanTables() {
         jdbc.update("DELETE FROM idempotency_request");
+        jdbc.update("DELETE FROM evidence_appendix");
+        jdbc.update("DELETE FROM maintenance_confirmation");
         jdbc.update("DELETE FROM maintenance");
+        jdbc.update("DELETE FROM evidence_material");
+        jdbc.update("DELETE FROM evidence_check_result");
+        jdbc.update("DELETE FROM evidence_package");
+        jdbc.update("DELETE FROM maintenance_template_item");
+        jdbc.update("DELETE FROM maintenance_template");
+        jdbc.update("DELETE FROM material");
         jdbc.update("DELETE FROM reading_revision");
         jdbc.update("DELETE FROM reading");
         jdbc.update("DELETE FROM equipment");
@@ -66,50 +74,115 @@ class EquipmentApiTests {
                 .andExpect(status().is(expectedStatus));
     }
 
-    // ---------- 主流程：登记 → 读数 → DUE → 保养 → OK → 历史 ----------
+    /** 建模板版本 1（必检项 I1/I2），版本号推进一次。 */
+    private void createTemplateV1(String equipmentId, long thresholdMinutes) throws Exception {
+        mockMvc.perform(post("/api/equipment/" + equipmentId + "/template-versions")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"requestId":"tpl-%s","expectedVersion":1,
+                                 "overdueThresholdMinutes":%d,
+                                 "items":[{"itemCode":"I1","itemTitle":"润滑"},
+                                          {"itemCode":"I2","itemTitle":"紧固"}]}
+                                """.formatted(equipmentId, thresholdMinutes)))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.templateVersion").value(1));
+    }
+
+    private void registerMaterial(String batchCode) throws Exception {
+        mockMvc.perform(post("/api/materials")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"requestId":"matreg-%s","batchCode":"%s","description":"合成材料"}
+                                """.formatted(batchCode, batchCode)))
+                .andExpect(status().isCreated());
+    }
+
+    /** 提交齐备证据包（I1/I2 均 PASS + 一条材料摘要）。 */
+    private void submitCompleteEvidence(String equipmentId, String requestId, long expectedVersion,
+                                        String batchCode, String submitter) throws Exception {
+        mockMvc.perform(post("/api/equipment/" + equipmentId + "/evidence")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"requestId":"%s","expectedVersion":%d,"submittedBy":"%s",
+                                 "checkResults":[{"itemCode":"I1","result":"PASS"},
+                                                 {"itemCode":"I2","result":"PASS"}],
+                                 "materials":[{"batchCode":"%s","quantity":1,"unit":"PCS"}]}
+                                """.formatted(requestId, expectedVersion, submitter, batchCode)))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.complete").value(true));
+    }
+
+    private String maintenanceBody(String requestId, long expectedVersion, String readingId,
+                                   int anchorRevision, int packageVersion, int templateVersion,
+                                   String confirmer) {
+        return """
+                {"requestId":"%s","expectedVersion":%d,"readingId":"%s","anchorRevisionNo":%d,
+                 "expectedPackageVersion":%d,"expectedTemplateVersion":%d,"confirmerId":"%s"}
+                """.formatted(requestId, expectedVersion, readingId, anchorRevision,
+                packageVersion, templateVersion, confirmer);
+    }
+
+    // ---------- 主流程：登记 → 模板 → 读数 → DUE → 证据 → 双人完工 → OK → 历史 ----------
 
     @Test
     void mainFlow_statusTransitionsAndHistory() throws Exception {
         register("eq-main", 100);
 
-        // 初始状态：累计工时 0，OK
+        // 初始状态：累计工时 0，OK；无模板时 OVERDUE 阈值为 null
         mockMvc.perform(get("/api/equipment/eq-main/status"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.version").value(1))
                 .andExpect(jsonPath("$.latestCumulativeMinutes").value(0))
                 .andExpect(jsonPath("$.runMinutes").value(0))
+                .andExpect(jsonPath("$.overdueThresholdMinutes").value(org.hamcrest.Matchers.nullValue()))
+                .andExpect(jsonPath("$.currentCycleNo").value(1))
                 .andExpect(jsonPath("$.status").value("OK"));
 
-        addReading("eq-main", "add-r1", 1, "r1", "2026-01-01T10:00:00Z", 50, 201);
+        createTemplateV1("eq-main", 200);
+        mockMvc.perform(get("/api/equipment/eq-main/status"))
+                .andExpect(jsonPath("$.version").value(2))
+                .andExpect(jsonPath("$.overdueThresholdMinutes").value(200));
+
+        addReading("eq-main", "add-r1", 2, "r1", "2026-01-01T10:00:00Z", 50, 201);
         mockMvc.perform(get("/api/equipment/eq-main/status"))
                 .andExpect(jsonPath("$.runMinutes").value(50))
+                .andExpect(jsonPath("$.remainingMinutes").value(50))
                 .andExpect(jsonPath("$.status").value("OK"));
 
-        // 达到保养周期 → DUE
-        addReading("eq-main", "add-r2", 2, "r2", "2026-01-01T11:00:00Z", 130, 201);
+        // 达到保养周期 → DUE（左闭右开 [100,200)）
+        addReading("eq-main", "add-r2", 3, "r2", "2026-01-01T11:00:00Z", 130, 201);
         mockMvc.perform(get("/api/equipment/eq-main/status"))
                 .andExpect(jsonPath("$.runMinutes").value(130))
+                .andExpect(jsonPath("$.remainingMinutes").value(-30))
+                .andExpect(jsonPath("$.overdueByMinutes").value(0))
                 .andExpect(jsonPath("$.status").value("DUE"));
 
-        // 完成保养：锚点 r2 修订号 1
+        registerMaterial("MAT-MAIN1");
+        submitCompleteEvidence("eq-main", "ev-1", 4, "MAT-MAIN1", "alice");
+
+        // 完成保养：另一维护人员 bob 确认证据包版本 1 / 模板版本 1
         mockMvc.perform(post("/api/equipment/eq-main/maintenances")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("""
-                                {"requestId":"mnt-1","expectedVersion":3,"readingId":"r2","anchorRevisionNo":1}
-                                """))
+                        .content(maintenanceBody("mnt-1", 5, "r2", 1, 1, 1, "bob")))
                 .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.cycleNo").value(1))
                 .andExpect(jsonPath("$.anchorSampledAt").value("2026-01-01T11:00:00Z"))
                 .andExpect(jsonPath("$.anchorCumulativeMinutes").value(130))
-                .andExpect(jsonPath("$.equipmentVersion").value(4));
+                .andExpect(jsonPath("$.templateVersion").value(1))
+                .andExpect(jsonPath("$.packageVersion").value(1))
+                .andExpect(jsonPath("$.submitterId").value("alice"))
+                .andExpect(jsonPath("$.confirmerId").value("bob"))
+                .andExpect(jsonPath("$.equipmentVersion").value(6));
 
-        // 保养后本轮运行分钟从锚点重算
+        // 保养后本轮运行分钟从锚点重算，进入周期 2
         mockMvc.perform(get("/api/equipment/eq-main/status"))
-                .andExpect(jsonPath("$.version").value(4))
+                .andExpect(jsonPath("$.version").value(6))
+                .andExpect(jsonPath("$.currentCycleNo").value(2))
                 .andExpect(jsonPath("$.lastMaintenanceAnchorCumulativeMinutes").value(130))
                 .andExpect(jsonPath("$.runMinutes").value(0))
                 .andExpect(jsonPath("$.status").value("OK"));
 
-        addReading("eq-main", "add-r3", 4, "r3", "2026-01-01T12:00:00Z", 180, 201);
+        addReading("eq-main", "add-r3", 6, "r3", "2026-01-01T12:00:00Z", 180, 201);
         mockMvc.perform(get("/api/equipment/eq-main/status"))
                 .andExpect(jsonPath("$.runMinutes").value(50))
                 .andExpect(jsonPath("$.status").value("OK"));
@@ -123,12 +196,17 @@ class EquipmentApiTests {
                 .andExpect(jsonPath("$[1].anchored").value(true))
                 .andExpect(jsonPath("$[2].readingId").value("r3"));
 
-        // 保养历史：锚点快照保留
+        // 保养历史：锚点快照、周期、模板/证据版本、双人确认保留
         mockMvc.perform(get("/api/equipment/eq-main/maintenances"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$", hasSize(1)))
+                .andExpect(jsonPath("$[0].cycleNo").value(1))
                 .andExpect(jsonPath("$[0].readingId").value("r2"))
                 .andExpect(jsonPath("$[0].anchorRevisionNo").value(1))
+                .andExpect(jsonPath("$[0].templateVersion").value(1))
+                .andExpect(jsonPath("$[0].packageVersion").value(1))
+                .andExpect(jsonPath("$[0].submitterId").value("alice"))
+                .andExpect(jsonPath("$[0].confirmerId").value("bob"))
                 .andExpect(jsonPath("$[0].anchorCumulativeMinutes").value(130));
 
         // 修订历史：初始登记为修订 1
@@ -276,40 +354,36 @@ class EquipmentApiTests {
     @Test
     void maintenance_anchorRules() throws Exception {
         register("eq-mnt", 1000);
-        addReading("eq-mnt", "a1", 1, "r1", "2026-01-01T10:00:00Z", 100, 201);
-        addReading("eq-mnt", "a2", 2, "r2", "2026-01-01T11:00:00Z", 200, 201);
+        createTemplateV1("eq-mnt", 2000);
+        addReading("eq-mnt", "a1", 2, "r1", "2026-01-01T10:00:00Z", 100, 201);
+        addReading("eq-mnt", "a2", 3, "r2", "2026-01-01T11:00:00Z", 200, 201);
 
         // 锚点读数不存在 → 404
         mockMvc.perform(post("/api/equipment/eq-mnt/maintenances")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("""
-                                {"requestId":"mn-x","expectedVersion":3,"readingId":"nope","anchorRevisionNo":1}
-                                """))
+                        .content(maintenanceBody("mn-x", 4, "nope", 1, 1, 1, "bob")))
                 .andExpect(status().isNotFound());
 
         // 锚点修订号与当前修订号不一致 → 409
         mockMvc.perform(post("/api/equipment/eq-mnt/maintenances")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("""
-                                {"requestId":"mn-x2","expectedVersion":3,"readingId":"r1","anchorRevisionNo":7}
-                                """))
+                        .content(maintenanceBody("mn-x2", 4, "r1", 7, 1, 1, "bob")))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("ANCHOR_REVISION_CONFLICT"));
+
+        registerMaterial("MAT-MNT01");
+        submitCompleteEvidence("eq-mnt", "ev-mnt-1", 4, "MAT-MNT01", "alice");
 
         // 第一次保养可选任意读数
         mockMvc.perform(post("/api/equipment/eq-mnt/maintenances")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("""
-                                {"requestId":"mn-1","expectedVersion":3,"readingId":"r1","anchorRevisionNo":1}
-                                """))
+                        .content(maintenanceBody("mn-1", 5, "r1", 1, 1, 1, "bob")))
                 .andExpect(status().isCreated());
 
-        // 锚点时间必须严格晚于上次保养锚点：同读数/更早读数均 422
+        // 锚点时间必须严格晚于上次保养锚点：同读数/更早读数均 422（周期 2 无证据也不影响该校验先触发）
         mockMvc.perform(post("/api/equipment/eq-mnt/maintenances")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("""
-                                {"requestId":"mn-2","expectedVersion":4,"readingId":"r1","anchorRevisionNo":1}
-                                """))
+                        .content(maintenanceBody("mn-2", 6, "r1", 1, 1, 1, "bob")))
                 .andExpect(status().isUnprocessableEntity())
                 .andExpect(jsonPath("$.code").value("ANCHOR_TIME_NOT_LATER"));
 
@@ -317,31 +391,34 @@ class EquipmentApiTests {
         mockMvc.perform(post("/api/equipment/eq-mnt/readings/r1/revisions")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"requestId":"mn-3","expectedVersion":4,"cumulativeMinutes":120}
+                                {"requestId":"mn-3","expectedVersion":6,"cumulativeMinutes":120}
                                 """))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("READING_ANCHORED"));
 
-        // 非锚点读数可正常修订，随后以其新修订号完成第二次保养
+        // 非锚点读数可正常修订，随后为周期 2 提交新证据并以其新修订号完成第二次保养
         mockMvc.perform(post("/api/equipment/eq-mnt/readings/r2/revisions")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"requestId":"mn-4","expectedVersion":4,"cumulativeMinutes":210}
+                                {"requestId":"mn-4","expectedVersion":6,"cumulativeMinutes":210}
                                 """))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.revisionNo").value(2));
+        submitCompleteEvidence("eq-mnt", "ev-mnt-2", 7, "MAT-MNT01", "alice");
         mockMvc.perform(post("/api/equipment/eq-mnt/maintenances")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("""
-                                {"requestId":"mn-5","expectedVersion":5,"readingId":"r2","anchorRevisionNo":2}
-                                """))
+                        .content(maintenanceBody("mn-5", 8, "r2", 2, 1, 1, "carol")))
                 .andExpect(status().isCreated())
-                .andExpect(jsonPath("$.anchorCumulativeMinutes").value(210));
+                .andExpect(jsonPath("$.cycleNo").value(2))
+                .andExpect(jsonPath("$.anchorCumulativeMinutes").value(210))
+                .andExpect(jsonPath("$.confirmerId").value("carol"));
 
         // 保养记录保存锚点快照且不允许删除（无删除接口），历史完整
         mockMvc.perform(get("/api/equipment/eq-mnt/maintenances"))
                 .andExpect(jsonPath("$", hasSize(2)))
+                .andExpect(jsonPath("$[0].cycleNo").value(1))
                 .andExpect(jsonPath("$[0].anchorCumulativeMinutes").value(100))
+                .andExpect(jsonPath("$[1].cycleNo").value(2))
                 .andExpect(jsonPath("$[1].anchorCumulativeMinutes").value(210));
     }
 

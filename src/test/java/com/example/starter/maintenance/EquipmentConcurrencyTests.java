@@ -46,7 +46,15 @@ class EquipmentConcurrencyTests {
     @BeforeEach
     void setUp() {
         jdbc.update("DELETE FROM idempotency_request");
+        jdbc.update("DELETE FROM evidence_appendix");
+        jdbc.update("DELETE FROM maintenance_confirmation");
         jdbc.update("DELETE FROM maintenance");
+        jdbc.update("DELETE FROM evidence_material");
+        jdbc.update("DELETE FROM evidence_check_result");
+        jdbc.update("DELETE FROM evidence_package");
+        jdbc.update("DELETE FROM maintenance_template_item");
+        jdbc.update("DELETE FROM maintenance_template");
+        jdbc.update("DELETE FROM material");
         jdbc.update("DELETE FROM reading_revision");
         jdbc.update("DELETE FROM reading");
         jdbc.update("DELETE FROM equipment");
@@ -123,18 +131,31 @@ class EquipmentConcurrencyTests {
                 {"requestId":"race-r2","expectedVersion":2,"readingId":"r2",
                  "sampledAt":"2026-01-01T11:00:00Z","cumulativeMinutes":200}
                 """);
+        postJson("/api/equipment/eq-race/template-versions", """
+                {"requestId":"race-tpl","expectedVersion":3,"overdueThresholdMinutes":2000,
+                 "items":[{"itemCode":"I1","itemTitle":"润滑"}]}
+                """);
+        postJson("/api/materials", """
+                {"requestId":"race-mat","batchCode":"MAT-RACE1","description":"x"}
+                """);
+        postJson("/api/equipment/eq-race/evidence", """
+                {"requestId":"race-ev","expectedVersion":4,"submittedBy":"alice",
+                 "checkResults":[{"itemCode":"I1","result":"PASS"}],
+                 "materials":[{"batchCode":"MAT-RACE1","quantity":1,"unit":"PCS"}]}
+                """);
 
         CountDownLatch gate = new CountDownLatch(1);
         Future<MvcResult> reviseFuture = executor.submit(() -> {
             gate.await(5, TimeUnit.SECONDS);
             return postJson("/api/equipment/eq-race/readings/r1/revisions", """
-                    {"requestId":"race-revise","expectedVersion":3,"cumulativeMinutes":150}
+                    {"requestId":"race-revise","expectedVersion":5,"cumulativeMinutes":150}
                     """);
         });
         Future<MvcResult> maintenanceFuture = executor.submit(() -> {
             gate.await(5, TimeUnit.SECONDS);
             return postJson("/api/equipment/eq-race/maintenances", """
-                    {"requestId":"race-mnt","expectedVersion":3,"readingId":"r1","anchorRevisionNo":1}
+                    {"requestId":"race-mnt","expectedVersion":5,"readingId":"r1","anchorRevisionNo":1,
+                     "expectedPackageVersion":1,"expectedTemplateVersion":1,"confirmerId":"bob"}
                     """);
         });
         gate.countDown();
@@ -153,7 +174,7 @@ class EquipmentConcurrencyTests {
 
         // 版本只前进一次
         mockMvc.perform(get("/api/equipment/eq-race/status"))
-                .andExpect(jsonPath("$.version").value(4));
+                .andExpect(jsonPath("$.version").value(6));
 
         if (maintenanceStatus == 201) {
             // 保养胜出：锚点快照为修订号 1、工时 100，且之后不可再修订该读数

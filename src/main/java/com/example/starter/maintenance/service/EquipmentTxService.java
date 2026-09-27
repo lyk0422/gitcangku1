@@ -19,9 +19,13 @@ import com.example.starter.maintenance.api.dto.ReviseReadingRequest;
 import com.example.starter.maintenance.api.dto.RevisionView;
 import com.example.starter.maintenance.api.dto.StatusResponse;
 import com.example.starter.maintenance.domain.Equipment;
+import com.example.starter.maintenance.domain.MaintenanceConfirmation;
 import com.example.starter.maintenance.domain.MaintenanceRecord;
+import com.example.starter.maintenance.domain.MaintenanceTemplate;
 import com.example.starter.maintenance.domain.Reading;
 import com.example.starter.maintenance.store.EquipmentRepository;
+import com.example.starter.maintenance.store.EvidenceRepository;
+import com.example.starter.maintenance.store.TemplateRepository;
 
 /**
  * 设备工时保养事务业务服务。写操作流程：设备行锁 → 幂等判定 → 版本校验 → 业务规则 → 变更并版本加一。
@@ -33,11 +37,20 @@ public class EquipmentTxService {
     private final EquipmentRepository repository;
     private final IdempotencyService idempotency;
     private final Clock clock;
+    private final EvidenceTxService evidenceTxService;
+    private final EvidenceRepository evidenceRepository;
+    private final TemplateRepository templateRepository;
 
-    public EquipmentTxService(EquipmentRepository repository, IdempotencyService idempotency, Clock clock) {
+    public EquipmentTxService(EquipmentRepository repository, IdempotencyService idempotency, Clock clock,
+                              EvidenceTxService evidenceTxService,
+                              EvidenceRepository evidenceRepository,
+                              TemplateRepository templateRepository) {
         this.repository = repository;
         this.idempotency = idempotency;
         this.clock = clock;
+        this.evidenceTxService = evidenceTxService;
+        this.evidenceRepository = evidenceRepository;
+        this.templateRepository = templateRepository;
     }
 
     // ---------- 登记设备 ----------
@@ -122,10 +135,12 @@ public class EquipmentTxService {
     public MaintenanceResponse completeMaintenance(String equipmentId, CompleteMaintenanceRequest req) {
         Equipment equipment = lockEquipment(equipmentId);
         String fingerprint = equipmentId + "|" + req.readingId() + "|" + req.anchorRevisionNo()
-                + "|" + req.expectedVersion();
+                + "|" + req.expectedPackageVersion() + "|" + req.expectedTemplateVersion()
+                + "|" + req.confirmerId() + "|" + req.expectedVersion();
         return idempotency.execute(req.requestId(), "COMPLETE_MAINTENANCE", fingerprint,
                 MaintenanceResponse.class, () -> {
                     checkVersion(equipment, req.expectedVersion());
+                    int cycleNo = repository.countMaintenance(equipmentId) + 1;
                     Reading anchor = repository.findReading(equipmentId, req.readingId())
                             .orElseThrow(() -> ApiException.notFound("READING_NOT_FOUND",
                                     "锚点读数不存在：" + req.readingId()));
@@ -134,19 +149,62 @@ public class EquipmentTxService {
                                 "锚点修订号与读数当前修订号不一致：期望 " + req.anchorRevisionNo()
                                         + "，当前 " + anchor.revisionNo());
                     }
-                    Optional<MaintenanceRecord> last = repository.findLastMaintenance(equipmentId);
+                    Optional<MaintenanceRecord> last = repository.findLastMaintenanceRecord(equipmentId);
                     if (last.isPresent() && !anchor.sampledAt().isAfter(last.get().anchorSampledAt())) {
                         throw ApiException.unprocessable("ANCHOR_TIME_NOT_LATER",
                                 "保养锚点时间必须晚于上次保养锚点时间");
                     }
+
+                    // 证据准入门禁：当前周期证据包须齐备（每项恰一个 PASS、至少一条材料摘要、无撤销材料）
+                    EvidenceTxService.CompletableEvidence evidence =
+                            evidenceTxService.requireCompletable(equipmentId, cycleNo);
+                    int fixedTemplateVersion = evidence.evidencePackage().templateVersion();
+                    int latestPackageVersion = evidence.evidencePackage().packageVersion();
+                    if (req.expectedPackageVersion() != latestPackageVersion) {
+                        throw ApiException.conflict("EVIDENCE_VERSION_CONFLICT",
+                                "确认时证据包版本已变化：期望确认版本 " + req.expectedPackageVersion()
+                                        + "，当前最新版本 " + latestPackageVersion);
+                    }
+                    if (req.expectedTemplateVersion() != fixedTemplateVersion) {
+                        throw ApiException.conflict("TEMPLATE_VERSION_CONFLICT",
+                                "确认时模板版本不一致：期望 " + req.expectedTemplateVersion()
+                                        + "，证据包固化版本 " + fixedTemplateVersion);
+                    }
+                    String submitterId = evidence.evidencePackage().submittedBy();
+                    if (req.confirmerId().equals(submitterId)) {
+                        throw ApiException.unprocessable("CONFIRMER_IS_SUBMITTER",
+                                "提交人不能确认完工：确认人须为另一维护人员（提交人 " + submitterId + "）");
+                    }
+
+                    // OVERDUE 门禁：设备“当前”是否已 OVERDUE 以最新读数的本轮运行分钟判定，
+                    // 达到当前模板 OVERDUE 阈值则禁止完工（阈值在周期证据提交后模板修订不影响在途周期判定）
+                    long anchorBase = last.map(MaintenanceRecord::anchorCumulativeMinutes).orElse(0L);
+                    Optional<MaintenanceTemplate> currentTemplate =
+                            templateRepository.findLatestTemplate(equipmentId);
+                    long currentRunMinutes = repository.findLatestReading(equipmentId)
+                            .map(Reading::cumulativeMinutes).orElse(0L) - anchorBase;
+                    if (currentTemplate.isPresent()
+                            && currentRunMinutes >= currentTemplate.get().overdueThresholdMinutes()) {
+                        throw ApiException.unprocessable("EQUIPMENT_OVERDUE",
+                                "设备当前已 OVERDUE，不可完成保养：本轮实际运行 " + currentRunMinutes
+                                        + " 分钟，OVERDUE 阈值 "
+                                        + currentTemplate.get().overdueThresholdMinutes()
+                                        + " 分钟，超出 " + (currentRunMinutes
+                                        - currentTemplate.get().overdueThresholdMinutes()) + " 分钟");
+                    }
+
                     Instant now = clock.instant();
-                    long maintenanceId = repository.insertMaintenance(equipmentId, req.readingId(),
-                            req.anchorRevisionNo(), anchor.sampledAt(), anchor.cumulativeMinutes(),
-                            req.requestId(), now);
+                    long maintenanceId = repository.insertMaintenance(equipmentId, cycleNo, req.readingId(),
+                            req.anchorRevisionNo(), fixedTemplateVersion, latestPackageVersion,
+                            anchor.sampledAt(), anchor.cumulativeMinutes(), req.requestId(), now);
+                    evidenceRepository.insertConfirmation(new MaintenanceConfirmation(
+                            maintenanceId, equipmentId, cycleNo, fixedTemplateVersion, latestPackageVersion,
+                            submitterId, req.confirmerId(), now), req.requestId());
                     repository.incrementVersion(equipmentId);
-                    return new MaintenanceResponse(maintenanceId, equipmentId, req.readingId(),
-                            req.anchorRevisionNo(), anchor.sampledAt(), anchor.cumulativeMinutes(),
-                            now, equipment.version() + 1);
+                    return new MaintenanceResponse(maintenanceId, equipmentId, cycleNo, req.readingId(),
+                            req.anchorRevisionNo(), fixedTemplateVersion, latestPackageVersion,
+                            submitterId, req.confirmerId(), anchor.sampledAt(),
+                            anchor.cumulativeMinutes(), now, equipment.version() + 1);
                 });
     }
 
@@ -157,15 +215,28 @@ public class EquipmentTxService {
         Equipment equipment = repository.findEquipment(equipmentId)
                 .orElseThrow(() -> equipmentNotFound(equipmentId));
         Optional<Reading> latest = repository.findLatestReading(equipmentId);
-        Optional<MaintenanceRecord> last = repository.findLastMaintenance(equipmentId);
+        Optional<MaintenanceRecord> last = repository.findLastMaintenanceRecord(equipmentId);
+        Optional<MaintenanceTemplate> template = templateRepository.findLatestTemplate(equipmentId);
         long latestCumulative = latest.map(Reading::cumulativeMinutes).orElse(0L);
         long anchorCumulative = last.map(MaintenanceRecord::anchorCumulativeMinutes).orElse(0L);
         long runMinutes = latestCumulative - anchorCumulative;
-        String status = runMinutes >= equipment.maintenancePeriodMinutes() ? "DUE" : "OK";
+        // 区间左闭右开：[0, 周期) OK；[周期, 阈值) DUE；达到阈值 OVERDUE。无模板时仅有 OK/DUE。
+        String status;
+        long overdueBy = 0L;
+        Long threshold = template.map(MaintenanceTemplate::overdueThresholdMinutes).orElse(null);
+        if (threshold != null && runMinutes >= threshold) {
+            status = "OVERDUE";
+            overdueBy = runMinutes - threshold;
+        } else {
+            status = runMinutes >= equipment.maintenancePeriodMinutes() ? "DUE" : "OK";
+        }
+        long remaining = equipment.maintenancePeriodMinutes() - runMinutes;
+        int currentCycleNo = repository.countMaintenance(equipmentId) + 1;
         return new StatusResponse(equipmentId, equipment.version(), equipment.maintenancePeriodMinutes(),
+                threshold,
                 latest.map(Reading::sampledAt).orElse(null), latestCumulative,
                 last.map(MaintenanceRecord::anchorSampledAt).orElse(null), anchorCumulative,
-                runMinutes, status);
+                runMinutes, remaining, overdueBy, currentCycleNo, status);
     }
 
     @Transactional(readOnly = true)
@@ -195,9 +266,17 @@ public class EquipmentTxService {
     public List<MaintenanceResponse> listMaintenances(String equipmentId) {
         repository.findEquipment(equipmentId).orElseThrow(() -> equipmentNotFound(equipmentId));
         return repository.listMaintenances(equipmentId).stream()
-                .map(record -> new MaintenanceResponse(record.maintenanceId(), equipmentId,
-                        record.readingId(), record.anchorRevisionNo(), record.anchorSampledAt(),
-                        record.anchorCumulativeMinutes(), record.completedAt(), 0L))
+                .map(record -> {
+                    var confirmation = evidenceRepository
+                            .findConfirmationByMaintenance(record.maintenanceId()).orElse(null);
+                    return new MaintenanceResponse(record.maintenanceId(), equipmentId, record.cycleNo(),
+                            record.readingId(), record.anchorRevisionNo(),
+                            record.templateVersion(), record.packageVersion(),
+                            confirmation == null ? null : confirmation.submitterId(),
+                            confirmation == null ? null : confirmation.confirmerId(),
+                            record.anchorSampledAt(), record.anchorCumulativeMinutes(),
+                            record.completedAt(), 0L);
+                })
                 .toList();
     }
 

@@ -53,8 +53,11 @@ public class EquipmentRepository {
     private static final RowMapper<MaintenanceRecord> MAINTENANCE_MAPPER = (rs, rowNum) -> new MaintenanceRecord(
             rs.getLong("maintenance_id"),
             rs.getString("equipment_id"),
+            rs.getInt("cycle_no"),
             rs.getString("reading_id"),
             rs.getInt("anchor_revision_no"),
+            rs.getInt("template_version"),
+            rs.getInt("package_version"),
             readInstant(rs, "anchor_sampled_at"),
             rs.getLong("anchor_cumulative_minutes"),
             readInstant(rs, "completed_at"));
@@ -180,23 +183,28 @@ public class EquipmentRepository {
 
     // ---------- 保养记录 ----------
 
-    public long insertMaintenance(String equipmentId, String readingId, int anchorRevisionNo,
+    public long insertMaintenance(String equipmentId, int cycleNo, String readingId, int anchorRevisionNo,
+                                  int templateVersion, int packageVersion,
                                   Instant anchorSampledAt, long anchorCumulativeMinutes,
                                   String requestId, Instant completedAt) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(connection -> {
             PreparedStatement ps = connection.prepareStatement(
-                    "INSERT INTO maintenance (equipment_id, reading_id, anchor_revision_no,"
-                            + " anchor_sampled_at, anchor_cumulative_minutes, request_id, completed_at)"
-                            + " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO maintenance (equipment_id, cycle_no, reading_id, anchor_revision_no,"
+                            + " template_version, package_version, anchor_sampled_at,"
+                            + " anchor_cumulative_minutes, request_id, completed_at)"
+                            + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, equipmentId);
-            ps.setString(2, readingId);
-            ps.setInt(3, anchorRevisionNo);
-            ps.setObject(4, utc(anchorSampledAt));
-            ps.setLong(5, anchorCumulativeMinutes);
-            ps.setString(6, requestId);
-            ps.setObject(7, utc(completedAt));
+            ps.setInt(2, cycleNo);
+            ps.setString(3, readingId);
+            ps.setInt(4, anchorRevisionNo);
+            ps.setInt(5, templateVersion);
+            ps.setInt(6, packageVersion);
+            ps.setObject(7, utc(anchorSampledAt));
+            ps.setLong(8, anchorCumulativeMinutes);
+            ps.setString(9, requestId);
+            ps.setObject(10, utc(completedAt));
             return ps;
         }, keyHolder);
         Number key = keyHolder.getKey();
@@ -206,11 +214,42 @@ public class EquipmentRepository {
         return key.longValue();
     }
 
+    /** 已完成保养次数；当前在途周期号 = 次数 + 1。 */
+    public int countMaintenance(String equipmentId) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM maintenance WHERE equipment_id = ?", Integer.class, equipmentId);
+        return count == null ? 0 : count;
+    }
+
+    /** 按周期序号查保养记录（周期号严格递增，至多一条）。 */
+    public Optional<MaintenanceRecord> findMaintenanceByCycle(String equipmentId, int cycleNo) {
+        List<MaintenanceRecord> rows = jdbc.query(
+                "SELECT maintenance_id, equipment_id, cycle_no, reading_id, anchor_revision_no,"
+                        + " template_version, package_version, anchor_sampled_at,"
+                        + " anchor_cumulative_minutes, completed_at"
+                        + " FROM maintenance WHERE equipment_id = ? AND cycle_no = ?",
+                MAINTENANCE_MAPPER, equipmentId, cycleNo);
+        return rows.stream().findFirst();
+    }
+
+    /** 最近一次保养（周期序号最大者）。 */
+    public Optional<MaintenanceRecord> findLastMaintenanceRecord(String equipmentId) {
+        List<MaintenanceRecord> rows = jdbc.query(
+                "SELECT maintenance_id, equipment_id, cycle_no, reading_id, anchor_revision_no,"
+                        + " template_version, package_version, anchor_sampled_at,"
+                        + " anchor_cumulative_minutes, completed_at"
+                        + " FROM maintenance WHERE equipment_id = ?"
+                        + " ORDER BY cycle_no DESC LIMIT 1",
+                MAINTENANCE_MAPPER, equipmentId);
+        return rows.stream().findFirst();
+    }
+
     /** 最近一次保养（锚点时间最大者；锚点时间严格递增，故唯一）。 */
     public Optional<MaintenanceRecord> findLastMaintenance(String equipmentId) {
         List<MaintenanceRecord> rows = jdbc.query(
-                "SELECT maintenance_id, equipment_id, reading_id, anchor_revision_no,"
-                        + " anchor_sampled_at, anchor_cumulative_minutes, completed_at"
+                "SELECT maintenance_id, equipment_id, cycle_no, reading_id, anchor_revision_no,"
+                        + " template_version, package_version, anchor_sampled_at,"
+                        + " anchor_cumulative_minutes, completed_at"
                         + " FROM maintenance WHERE equipment_id = ?"
                         + " ORDER BY anchor_sampled_at DESC, maintenance_id DESC LIMIT 1",
                 MAINTENANCE_MAPPER, equipmentId);
@@ -219,8 +258,9 @@ public class EquipmentRepository {
 
     public List<MaintenanceRecord> listMaintenances(String equipmentId) {
         return jdbc.query(
-                "SELECT maintenance_id, equipment_id, reading_id, anchor_revision_no,"
-                        + " anchor_sampled_at, anchor_cumulative_minutes, completed_at"
+                "SELECT maintenance_id, equipment_id, cycle_no, reading_id, anchor_revision_no,"
+                        + " template_version, package_version, anchor_sampled_at,"
+                        + " anchor_cumulative_minutes, completed_at"
                         + " FROM maintenance WHERE equipment_id = ?"
                         + " ORDER BY anchor_sampled_at ASC, maintenance_id ASC",
                 MAINTENANCE_MAPPER, equipmentId);
