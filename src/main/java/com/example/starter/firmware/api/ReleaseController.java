@@ -33,6 +33,17 @@ public class ReleaseController {
         return releaseService.create(request);
     }
 
+    @PostMapping("/{releaseId}/manifest")
+    public ManifestView updateManifest(@PathVariable long releaseId,
+                                       @Valid @RequestBody UpdateManifestRequest request) {
+        return releaseService.updateManifest(releaseId, request);
+    }
+
+    @GetMapping("/{releaseId}/manifest")
+    public ManifestView manifest(@PathVariable long releaseId) {
+        return releaseService.manifest(releaseId);
+    }
+
     @PostMapping("/{releaseId}/expand")
     public ReleaseView expand(@PathVariable long releaseId, @Valid @RequestBody ExpandReleaseRequest request) {
         return releaseService.expand(releaseId, request);

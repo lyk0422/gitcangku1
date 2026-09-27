@@ -24,10 +24,13 @@ public class ReleaseRepository {
             rs.getString("from_version"), rs.getString("to_version"),
             rs.getInt("ratio"), ReleaseStatus.valueOf(rs.getString("status")),
             rs.getInt("sample_floor"), rs.getInt("failure_threshold_percent"),
-            rs.getInt("monitor_round"), rs.getInt("round_success"), rs.getInt("round_failed"));
+            rs.getInt("monitor_round"), rs.getInt("round_success"), rs.getInt("round_failed"),
+            rs.getString("package_digest"), rs.getInt("manifest_locked") == 1,
+            rs.getString("manifest_locked_at_utc"));
 
     private static final String COLUMNS = "id, version, model, from_version, to_version, ratio, status,"
-            + " sample_floor, failure_threshold_percent, monitor_round, round_success, round_failed";
+            + " sample_floor, failure_threshold_percent, monitor_round, round_success, round_failed,"
+            + " package_digest, manifest_locked, manifest_locked_at_utc";
 
     private final JdbcTemplate jdbc;
 
@@ -35,14 +38,17 @@ public class ReleaseRepository {
         this.jdbc = jdbc;
     }
 
+    /**
+     * 登记发布单。packageDigest 为 null 表示无分片清单的遗留发布单（不做完整性闸门）。
+     */
     public long insert(String model, String fromVersion, String toVersion, int ratio,
-                       int sampleFloor, int failureThresholdPercent) {
+                       int sampleFloor, int failureThresholdPercent, String packageDigest) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
                     "INSERT INTO release_order (version, model, from_version, to_version, ratio, status,"
-                            + " sample_floor, failure_threshold_percent, monitor_round, active_model)"
-                            + " VALUES (1, ?, ?, ?, ?, 'ACTIVE', ?, ?, 1, ?)",
+                            + " sample_floor, failure_threshold_percent, monitor_round, active_model, package_digest)"
+                            + " VALUES (1, ?, ?, ?, ?, 'ACTIVE', ?, ?, 1, ?, ?)",
                     new String[]{"id"});
             ps.setString(1, model);
             ps.setString(2, fromVersion);
@@ -51,6 +57,7 @@ public class ReleaseRepository {
             ps.setInt(5, sampleFloor);
             ps.setInt(6, failureThresholdPercent);
             ps.setString(7, model);
+            ps.setString(8, packageDigest);
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();
@@ -116,5 +123,21 @@ public class ReleaseRepository {
                 + " monitor_round = monitor_round + 1, round_success = 0, round_failed = 0,"
                 + " updated_at = CURRENT_TIMESTAMP"
                 + " WHERE id = ? AND version = ? AND status = 'PAUSED'", id, expectedVersion);
+    }
+
+    /**
+     * 首个任务拉取时冻结分片摘要：仅未锁定时生效，返回影响行数。调用方持有发布单行锁。
+     */
+    public int lockManifestIfUnlocked(long id, String lockedAtUtc) {
+        return jdbc.update("UPDATE release_order SET manifest_locked = 1, manifest_locked_at_utc = ?,"
+                + " updated_at = CURRENT_TIMESTAMP WHERE id = ? AND manifest_locked = 0", lockedAtUtc, id);
+    }
+
+    /**
+     * 摘要未锁定时整体替换完整包摘要。调用方持有发布单行锁并已确认未锁定。
+     */
+    public void updatePackageDigest(long id, String packageDigest) {
+        jdbc.update("UPDATE release_order SET package_digest = ?, updated_at = CURRENT_TIMESTAMP"
+                + " WHERE id = ? AND manifest_locked = 0", packageDigest, id);
     }
 }

@@ -15,8 +15,12 @@ package com.example.starter.firmware.domain;
  * @param monitorRound            当前监控轮次，从1开始，人工恢复后加一
  * @param roundSuccess            当前监控轮次内首次进入 SUCCESS 的任务数
  * @param roundFailed             当前监控轮次内首次进入 FAILED 的任务数
+ * @param packageDigest           完整包摘要（64位小写十六进制SHA-256）；null 表示未登记分片清单的遗留发布单
+ * @param manifestLocked          分片摘要是否已被任务拉取锁定，锁定后不可修改
+ * @param manifestLockedAtUtc     摘要首次锁定时刻，UTC ISO-8601；未锁定为 null
  */
 public record ReleaseOrder(long id, int version, String model, String fromVersion, String toVersion,
                            int ratio, ReleaseStatus status, int sampleFloor, int failureThresholdPercent,
-                           int monitorRound, int roundSuccess, int roundFailed) {
+                           int monitorRound, int roundSuccess, int roundFailed, String packageDigest,
+                           boolean manifestLocked, String manifestLockedAtUtc) {
 }
