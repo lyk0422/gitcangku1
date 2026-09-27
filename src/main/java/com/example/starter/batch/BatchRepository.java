@@ -4,6 +4,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
 
+import java.math.BigDecimal;
 import java.util.List;
 import java.util.Optional;
 
@@ -17,7 +18,7 @@ public class BatchRepository {
      * batch 表行记录；id 同时作为同批次事件的提交顺序依据。
      */
     public record BatchRow(long id, String batchKey, String productCode, String batchNo,
-                           String producedAt, String status, String createdAt) {
+                           String producedAt, String status, BigDecimal quantity, String createdAt) {
     }
 
     /**
@@ -54,10 +55,37 @@ public class BatchRepository {
     public record LineageRow(long id, String parentKey, String childKey, int seq, String createdAt) {
     }
 
+    /**
+     * batch_merge_parent 表行记录：合批父贡献，创建后不可改写。
+     */
+    public record MergeParentRow(long id, String childKey, String parentKey, int seq,
+                                 BigDecimal quantity, BigDecimal weight, BigDecimal potency,
+                                 String createdAt) {
+    }
+
+    /**
+     * potency_model 表行记录：版本化效价模型，只增不改。
+     */
+    public record PotencyModelRow(long id, String batchKey, int version, BigDecimal initialPotency,
+                                  BigDecimal minPotency, BigDecimal decayRate, String actorId,
+                                  String commandKey, String effectiveAt, String createdAt) {
+    }
+
+    /**
+     * potency_evidence 表行记录：固化的效价业务证据，只增不改；id 为 null 时表示待插入。
+     */
+    public record EvidenceRow(Long id, String batchKey, String eventType, String commandType,
+                              String commandKey, String occurredAt, Integer modelVersion,
+                              BigDecimal initialPotency, BigDecimal minPotency, BigDecimal decayRate,
+                              BigDecimal elapsedDays, BigDecimal decayedPotency, BigDecimal currentPotency,
+                              BigDecimal thresholdPotency, BigDecimal difference, String decision,
+                              String inputsJson, String createdAt) {
+    }
+
     private static final RowMapper<BatchRow> BATCH_MAPPER = (rs, n) -> new BatchRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("product_code"),
             rs.getString("batch_no"), rs.getString("produced_at"),
-            rs.getString("status"), rs.getString("created_at"));
+            rs.getString("status"), rs.getBigDecimal("quantity"), rs.getString("created_at"));
 
     private static final RowMapper<TestRow> TEST_MAPPER = (rs, n) -> new TestRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("test_key"),
@@ -81,6 +109,27 @@ public class BatchRepository {
             rs.getLong("id"), rs.getString("parent_key"), rs.getString("child_key"),
             rs.getInt("seq"), rs.getString("created_at"));
 
+    private static final RowMapper<MergeParentRow> MERGE_PARENT_MAPPER = (rs, n) -> new MergeParentRow(
+            rs.getLong("id"), rs.getString("child_key"), rs.getString("parent_key"),
+            rs.getInt("seq"), rs.getBigDecimal("quantity"), rs.getBigDecimal("weight"),
+            rs.getBigDecimal("potency"), rs.getString("created_at"));
+
+    private static final RowMapper<PotencyModelRow> MODEL_MAPPER = (rs, n) -> new PotencyModelRow(
+            rs.getLong("id"), rs.getString("batch_key"), rs.getInt("version"),
+            rs.getBigDecimal("initial_potency"), rs.getBigDecimal("min_potency"),
+            rs.getBigDecimal("decay_rate"), rs.getString("actor_id"), rs.getString("command_key"),
+            rs.getString("effective_at"), rs.getString("created_at"));
+
+    private static final RowMapper<EvidenceRow> EVIDENCE_MAPPER = (rs, n) -> new EvidenceRow(
+            rs.getLong("id"), rs.getString("batch_key"), rs.getString("event_type"),
+            rs.getString("command_type"), rs.getString("command_key"), rs.getString("occurred_at"),
+            (Integer) rs.getObject("model_version"),
+            rs.getBigDecimal("initial_potency"), rs.getBigDecimal("min_potency"),
+            rs.getBigDecimal("decay_rate"), rs.getBigDecimal("elapsed_days"),
+            rs.getBigDecimal("decayed_potency"), rs.getBigDecimal("current_potency"),
+            rs.getBigDecimal("threshold_potency"), rs.getBigDecimal("difference"),
+            rs.getString("decision"), rs.getString("inputs_json"), rs.getString("created_at"));
+
     private final JdbcTemplate jdbc;
 
     public BatchRepository(JdbcTemplate jdbc) {
@@ -93,7 +142,7 @@ public class BatchRepository {
     }
 
     /**
-     * 行锁读取批次，串行化同一批次上的检验/批准/召回事务。
+     * 行锁读取批次，串行化同一批次上的检验/批准/召回/模型修订事务。
      */
     public Optional<BatchRow> findBatchForUpdate(String batchKey) {
         return jdbc.query("SELECT * FROM batch WHERE batch_key = ? FOR UPDATE", BATCH_MAPPER, batchKey)
@@ -101,10 +150,10 @@ public class BatchRepository {
     }
 
     public void insertBatch(BatchRow row) {
-        jdbc.update("INSERT INTO batch (batch_key, product_code, batch_no, produced_at, status, created_at)"
-                        + " VALUES (?, ?, ?, ?, ?, ?)",
+        jdbc.update("INSERT INTO batch (batch_key, product_code, batch_no, produced_at, status, quantity, created_at)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?)",
                 row.batchKey(), row.productCode(), row.batchNo(), row.producedAt(),
-                row.status(), row.createdAt());
+                row.status(), row.quantity(), row.createdAt());
     }
 
     public void insertRequiredTest(String batchKey, String testItem, int seq) {
@@ -187,19 +236,70 @@ public class BatchRepository {
     }
 
     /**
-     * 全部血缘边（父→子），用于在内存中推导祖先链与后代集合；关系不可改写，只增不改。
+     * 全部拆分层血缘边（父→子），用于在内存中推导祖先链与后代集合；关系不可改写，只增不改。
      */
     public List<LineageRow> findAllLineage() {
         return jdbc.query("SELECT * FROM batch_lineage ORDER BY id", LINEAGE_MAPPER);
     }
 
     /**
-     * 某批次的直接父批业务键；每个子批仅一个父批。
+     * 全部合批层血缘边，按固化顺序返回；与拆分层共同构成完整祖先/后代图。
      */
-    public Optional<String> findParentKey(String childKey) {
-        return jdbc.queryForList("SELECT parent_key FROM batch_lineage WHERE child_key = ?",
-                        String.class, childKey)
+    public List<MergeParentRow> findAllMergeEdges() {
+        return jdbc.query("SELECT * FROM batch_merge_parent ORDER BY id", MERGE_PARENT_MAPPER);
+    }
+
+    /**
+     * 某合批子批的全部父贡献，按 seq（规范化 batchKey 顺序）稳定排序。
+     */
+    public List<MergeParentRow> findMergeParents(String childKey) {
+        return jdbc.query("SELECT * FROM batch_merge_parent WHERE child_key = ? ORDER BY seq",
+                MERGE_PARENT_MAPPER, childKey);
+    }
+
+    public void insertMergeParent(MergeParentRow row) {
+        jdbc.update("INSERT INTO batch_merge_parent (child_key, parent_key, seq, quantity, weight,"
+                        + " potency, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                row.childKey(), row.parentKey(), row.seq(), row.quantity(), row.weight(),
+                row.potency(), row.createdAt());
+    }
+
+    /**
+     * 某批次的最新效价模型版本；版本只增不改，调用方须已持有批次行锁以保证与修订命令按提交顺序互斥。
+     */
+    public Optional<PotencyModelRow> findLatestModel(String batchKey) {
+        return jdbc.query("SELECT * FROM potency_model WHERE batch_key = ? ORDER BY version DESC LIMIT 1",
+                        MODEL_MAPPER, batchKey)
                 .stream().findFirst();
+    }
+
+    public void insertModel(PotencyModelRow row) {
+        jdbc.update("INSERT INTO potency_model (batch_key, version, initial_potency, min_potency,"
+                        + " decay_rate, actor_id, command_key, effective_at, created_at)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                row.batchKey(), row.version(), row.initialPotency(), row.minPotency(),
+                row.decayRate(), row.actorId(), row.commandKey(), row.effectiveAt(), row.createdAt());
+    }
+
+    public void insertEvidence(EvidenceRow row) {
+        jdbc.update("INSERT INTO potency_evidence (batch_key, event_type, command_type, command_key,"
+                        + " occurred_at, model_version, initial_potency, min_potency, decay_rate,"
+                        + " elapsed_days, decayed_potency, current_potency, threshold_potency,"
+                        + " difference, decision, inputs_json, created_at)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                row.batchKey(), row.eventType(), row.commandType(), row.commandKey(),
+                row.occurredAt(), row.modelVersion(), row.initialPotency(), row.minPotency(),
+                row.decayRate(), row.elapsedDays(), row.decayedPotency(), row.currentPotency(),
+                row.thresholdPotency(), row.difference(), row.decision(), row.inputsJson(),
+                row.createdAt());
+    }
+
+    /**
+     * 某批次全部效价证据，按固化 id 稳定排序，只增不改。
+     */
+    public List<EvidenceRow> findEvidence(String batchKey) {
+        return jdbc.query("SELECT * FROM potency_evidence WHERE batch_key = ? ORDER BY id",
+                EVIDENCE_MAPPER, batchKey);
     }
 
     /**
