@@ -2,16 +2,20 @@ package com.example.starter.race.service;
 
 import com.example.starter.race.api.CheckpointPassResponse;
 import com.example.starter.race.api.CheckpointTimingResponse;
+import com.example.starter.race.api.ExcludedTimingResponse;
+import com.example.starter.race.api.MedicalHoldResponse;
 import com.example.starter.race.api.PenaltyResponse;
 import com.example.starter.race.api.ResultEntryResponse;
 import com.example.starter.race.api.RunnerResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.StandingResponse;
+import com.example.starter.race.domain.EligibilityStatus;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
+import com.example.starter.race.persistence.MedicalHoldRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
 import com.example.starter.race.persistence.RunnerRow;
@@ -22,6 +26,7 @@ import com.example.starter.race.persistence.SnapshotRow;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * 持久化行记录与 API 响应之间的转换。
@@ -43,15 +48,36 @@ final class ResponseMapper {
     static CheckpointTimingResponse toTimingResponse(CheckpointTimingRow row) {
         return new CheckpointTimingResponse(
                 row.timingId(), row.bib(), row.checkpointCode(), row.position(),
-                row.elapsedMillis(), row.createdAt());
+                row.elapsedMillis(), row.excluded(), row.exclusionReason(), row.holdId(),
+                row.createdAt());
     }
 
+    static MedicalHoldResponse toMedicalHoldResponse(MedicalHoldRow row) {
+        return new MedicalHoldResponse(
+                row.holdId(), row.raceId(), row.bib(), row.startAt(), row.endAt(), row.reason(),
+                row.startedBy(), row.startRecordedAt(), row.endedBy(), row.fitnessConclusion(),
+                row.endRecordedAt(), row.status(), row.createdAt());
+    }
+
+    static ExcludedTimingResponse toExcludedTimingResponse(CheckpointTimingRow row) {
+        return new ExcludedTimingResponse(
+                row.timingId(), row.checkpointCode(), row.position(), row.elapsedMillis(),
+                row.exclusionReason(), row.holdId(), row.createdAt());
+    }
+
+    /**
+     * 即时成绩榜。
+     *
+     * @param timings          参与排名的分段记录（调用方已过滤被排除分段）
+     * @param medicalHoldBibs  当前有生效中医疗暂停的选手参赛号
+     */
     static StandingResponse liveStanding(
             RaceRow race,
             List<RunnerRow> runners,
             List<PenaltyRow> penalties,
             List<CheckpointRow> checkpoints,
-            List<CheckpointTimingRow> timings) {
+            List<CheckpointTimingRow> timings,
+            Set<String> medicalHoldBibs) {
         List<ResultEntry> entries = ResultCalculator.compute(
                 runners, penalties, checkpoints, timings);
         return new StandingResponse(
@@ -59,7 +85,9 @@ final class ResponseMapper {
                 race.version(),
                 race.status(),
                 null,
-                entries.stream().map(ResponseMapper::toEntryResponse).toList());
+                entries.stream()
+                        .map(entry -> toEntryResponse(entry, eligibilityOf(entry.bib(), medicalHoldBibs)))
+                        .toList());
     }
 
     static StandingResponse snapshotStanding(SnapshotRow snapshot) {
@@ -71,7 +99,7 @@ final class ResponseMapper {
                 snapshot.entries().stream().map(ResponseMapper::toEntryResponse).toList());
     }
 
-    static ResultEntryResponse toEntryResponse(ResultEntry entry) {
+    static ResultEntryResponse toEntryResponse(ResultEntry entry, EligibilityStatus eligibility) {
         return new ResultEntryResponse(
                 entry.bib(),
                 entry.rank(),
@@ -81,7 +109,8 @@ final class ResponseMapper {
                 entry.totalTimeMs(),
                 entry.checkpointCount(),
                 entry.coveredCheckpointCount(),
-                entry.missingCheckpoints());
+                entry.missingCheckpoints(),
+                eligibility);
     }
 
     static ResultEntryResponse toEntryResponse(SnapshotEntryRow entry) {
@@ -94,7 +123,14 @@ final class ResponseMapper {
                 entry.totalTimeMs(),
                 entry.checkpointCount(),
                 entry.coveredCheckpointCount(),
-                entry.missingCheckpoints());
+                entry.missingCheckpoints(),
+                entry.eligibilityStatus());
+    }
+
+    private static EligibilityStatus eligibilityOf(String bib, Set<String> medicalHoldBibs) {
+        return medicalHoldBibs.contains(bib)
+                ? EligibilityStatus.MEDICAL_HOLD
+                : EligibilityStatus.ELIGIBLE;
     }
 
     /**
@@ -117,7 +153,9 @@ final class ResponseMapper {
                             checkpoint.checkpointCode(),
                             checkpoint.position(),
                             timing == null ? null : timing.elapsedMillis(),
-                            timing == null ? null : timing.timingId());
+                            timing == null ? null : timing.timingId(),
+                            timing != null && timing.excluded(),
+                            timing == null ? null : timing.exclusionReason());
                 })
                 .toList();
         return new RunnerTimingResponse(
@@ -145,7 +183,8 @@ final class ResponseMapper {
                     }
                     return new CheckpointPassResponse(
                             detail.checkpointCode(), detail.position(),
-                            detail.elapsedMillis(), detail.timingId());
+                            detail.elapsedMillis(), detail.timingId(),
+                            detail.excluded(), detail.exclusionReason());
                 })
                 .toList();
         return new RunnerTimingResponse(

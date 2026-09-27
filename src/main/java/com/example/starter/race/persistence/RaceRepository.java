@@ -1,6 +1,8 @@
 package com.example.starter.race.persistence;
 
+import com.example.starter.race.domain.EligibilityStatus;
 import com.example.starter.race.domain.EntryStatus;
+import com.example.starter.race.domain.MedicalHoldStatus;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -30,6 +32,16 @@ public class RaceRepository {
             new CheckpointTimingRowMapper();
     private static final SnapshotCheckpointRowMapper SNAPSHOT_CHECKPOINT_ROW_MAPPER =
             new SnapshotCheckpointRowMapper();
+    private static final MedicalHoldRowMapper MEDICAL_HOLD_ROW_MAPPER = new MedicalHoldRowMapper();
+
+    /** 分段记录的列清单（含排除标记），所有分段查询统一使用。 */
+    private static final String TIMING_COLUMNS =
+            "timing_id, race_id, bib, checkpoint_code, position, elapsed_millis, "
+                    + "excluded, exclusion_reason, hold_id, created_at";
+    /** 医疗暂停记录的列清单。 */
+    private static final String HOLD_COLUMNS =
+            "hold_id, race_id, bib, start_at, end_at, reason, started_by, start_recorded_at, "
+                    + "ended_by, fitness_conclusion, end_recorded_at, status, active_bib, created_at";
 
     private final JdbcTemplate jdbcTemplate;
 
@@ -124,7 +136,7 @@ public class RaceRepository {
     /** 查询某选手的全部分段记录，按 position 升序排列。 */
     public List<CheckpointTimingRow> findTimingsForRunner(String raceId, String bib) {
         return jdbcTemplate.query(
-                "SELECT timing_id, race_id, bib, checkpoint_code, position, elapsed_millis, created_at "
+                "SELECT " + TIMING_COLUMNS + " "
                         + "FROM checkpoint_timing WHERE race_id = ? AND bib = ? ORDER BY position",
                 CHECKPOINT_TIMING_ROW_MAPPER, raceId, bib);
     }
@@ -132,7 +144,7 @@ public class RaceRepository {
     /** 查询赛事下全部分段记录（用于实时成绩与封榜计算）。 */
     public List<CheckpointTimingRow> findAllTimings(String raceId) {
         return jdbcTemplate.query(
-                "SELECT timing_id, race_id, bib, checkpoint_code, position, elapsed_millis, created_at "
+                "SELECT " + TIMING_COLUMNS + " "
                         + "FROM checkpoint_timing WHERE race_id = ? ORDER BY bib, position",
                 CHECKPOINT_TIMING_ROW_MAPPER, raceId);
     }
@@ -140,21 +152,32 @@ public class RaceRepository {
     /** 按全局分段ID查询记录（用于 timingId 幂等重放）。 */
     public Optional<CheckpointTimingRow> findTiming(String timingId) {
         return jdbcTemplate
-                .query("SELECT timing_id, race_id, bib, checkpoint_code, position, elapsed_millis, created_at "
+                .query("SELECT " + TIMING_COLUMNS + " "
                                 + "FROM checkpoint_timing WHERE timing_id = ?",
                         CHECKPOINT_TIMING_ROW_MAPPER, timingId)
                 .stream()
                 .findFirst();
     }
 
+    /** 查询某选手被排除出排名的分段记录，按 position 升序排列（诊断查询）。 */
+    public List<CheckpointTimingRow> findExcludedTimings(String raceId, String bib) {
+        return jdbcTemplate.query(
+                "SELECT " + TIMING_COLUMNS + " "
+                        + "FROM checkpoint_timing WHERE race_id = ? AND bib = ? AND excluded = TRUE "
+                        + "ORDER BY position",
+                CHECKPOINT_TIMING_ROW_MAPPER, raceId, bib);
+    }
+
     /** 新增选手分段通过记录（全局唯一 timingId 与选手+检查点唯一键由数据库约束保证）。 */
     public void insertTiming(CheckpointTimingRow row) {
         jdbcTemplate.update(
                 "INSERT INTO checkpoint_timing "
-                        + "(timing_id, race_id, bib, checkpoint_code, position, elapsed_millis, created_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        + "(timing_id, race_id, bib, checkpoint_code, position, elapsed_millis, "
+                        + "excluded, exclusion_reason, hold_id, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 row.timingId(), row.raceId(), row.bib(), row.checkpointCode(),
-                row.position(), row.elapsedMillis(), row.createdAt());
+                row.position(), row.elapsedMillis(), row.excluded(), row.exclusionReason(),
+                row.holdId(), row.createdAt());
     }
 
     /** 一次性写入赛事检查点配置（配置后不可修改）。 */
@@ -170,6 +193,72 @@ public class RaceRepository {
                     ps.setInt(3, row.position());
                     ps.setLong(4, row.createdAt());
                 });
+    }
+
+    /** 登记医疗暂停（ACTIVE）；同选手生效中唯一性由 uk_medical_hold_active 保证。 */
+    public void insertMedicalHold(MedicalHoldRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO medical_hold "
+                        + "(hold_id, race_id, bib, start_at, end_at, reason, started_by, "
+                        + "start_recorded_at, ended_by, fitness_conclusion, end_recorded_at, "
+                        + "status, active_bib, created_at) "
+                        + "VALUES (?, ?, ?, ?, NULL, ?, ?, ?, NULL, NULL, NULL, 'ACTIVE', ?, ?)",
+                row.holdId(), row.raceId(), row.bib(), row.startAt(), row.reason(),
+                row.startedBy(), row.startRecordedAt(), row.bib(), row.createdAt());
+    }
+
+    /**
+     * 恢复医疗暂停：仅对当前 ACTIVE 的记录生效，把结束时刻、确认角色与适赛结论
+     * 一次性固化并转为 RESUMED；历史登记字段不改写。
+     *
+     * @return 受影响行数；0 表示记录不存在或已恢复
+     */
+    public int resumeMedicalHold(
+            String holdId,
+            long endAt,
+            String endedBy,
+            String fitnessConclusion,
+            long endRecordedAt) {
+        return jdbcTemplate.update(
+                "UPDATE medical_hold SET status = 'RESUMED', end_at = ?, ended_by = ?, "
+                        + "fitness_conclusion = ?, end_recorded_at = ?, active_bib = NULL "
+                        + "WHERE hold_id = ? AND status = 'ACTIVE'",
+                endAt, endedBy, fitnessConclusion, endRecordedAt, holdId);
+    }
+
+    /** 按全局暂停ID查询医疗暂停记录。 */
+    public Optional<MedicalHoldRow> findMedicalHold(String holdId) {
+        return jdbcTemplate
+                .query("SELECT " + HOLD_COLUMNS + " FROM medical_hold WHERE hold_id = ?",
+                        MEDICAL_HOLD_ROW_MAPPER, holdId)
+                .stream()
+                .findFirst();
+    }
+
+    /** 查询选手当前生效中的医疗暂停；无则 empty。 */
+    public Optional<MedicalHoldRow> findActiveMedicalHold(String raceId, String bib) {
+        return jdbcTemplate
+                .query("SELECT " + HOLD_COLUMNS + " FROM medical_hold "
+                                + "WHERE race_id = ? AND bib = ? AND status = 'ACTIVE'",
+                        MEDICAL_HOLD_ROW_MAPPER, raceId, bib)
+                .stream()
+                .findFirst();
+    }
+
+    /** 查询赛事下全部生效中的医疗暂停（用于成绩资格状态判定）。 */
+    public List<MedicalHoldRow> findActiveMedicalHolds(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT " + HOLD_COLUMNS + " FROM medical_hold "
+                        + "WHERE race_id = ? AND status = 'ACTIVE' ORDER BY bib",
+                MEDICAL_HOLD_ROW_MAPPER, raceId);
+    }
+
+    /** 查询选手的全部医疗暂停历史，按登记提交时刻与暂停ID稳定排序。 */
+    public List<MedicalHoldRow> findMedicalHoldsForRunner(String raceId, String bib) {
+        return jdbcTemplate.query(
+                "SELECT " + HOLD_COLUMNS + " FROM medical_hold "
+                        + "WHERE race_id = ? AND bib = ? ORDER BY start_recorded_at, hold_id",
+                MEDICAL_HOLD_ROW_MAPPER, raceId, bib);
     }
 
     /** 查询封榜快照（含全部条目与分段明细）；未封榜返回 empty。 */
@@ -188,18 +277,19 @@ public class RaceRepository {
         SnapshotRow header = headers.getFirst();
         List<SnapshotEntryRow> entryRows = jdbcTemplate.query(
                 "SELECT race_id, bib, rank_no, status, finish_time_ms, penalty_ms, total_time_ms, "
-                        + "display_order, checkpoint_count, covered_checkpoint_count "
+                        + "display_order, checkpoint_count, covered_checkpoint_count, eligibility_status "
                         + "FROM result_snapshot_entry WHERE race_id = ? ORDER BY display_order",
                 SNAPSHOT_ENTRY_ROW_MAPPER, raceId);
         List<SnapshotCheckpointRow> checkpoints = jdbcTemplate.query(
-                "SELECT race_id, bib, checkpoint_code, position, elapsed_millis, timing_id "
+                "SELECT race_id, bib, checkpoint_code, position, elapsed_millis, timing_id, "
+                        + "excluded, exclusion_reason "
                         + "FROM result_snapshot_checkpoint WHERE race_id = ? "
                         + "ORDER BY bib, position",
                 SNAPSHOT_CHECKPOINT_ROW_MAPPER, raceId);
-        // 缺失检查点由明细表中 elapsed_millis 为 NULL 的行派生，保持展示顺序稳定。
+        // 缺失检查点由明细表中 elapsed_millis 为 NULL 或被排除的行派生，保持展示顺序稳定。
         java.util.Map<String, List<String>> missingByBib = new java.util.LinkedHashMap<>();
         for (SnapshotCheckpointRow detail : checkpoints) {
-            if (detail.elapsedMillis() == null) {
+            if (detail.elapsedMillis() == null || detail.excluded()) {
                 missingByBib.computeIfAbsent(detail.bib(), key -> new java.util.ArrayList<>())
                         .add(detail.checkpointCode());
             }
@@ -210,7 +300,8 @@ public class RaceRepository {
                         entry.finishTimeMs(), entry.penaltyMs(), entry.totalTimeMs(),
                         entry.displayOrder(), entry.checkpointCount(),
                         entry.coveredCheckpointCount(),
-                        missingByBib.getOrDefault(entry.bib(), List.of())))
+                        missingByBib.getOrDefault(entry.bib(), List.of()),
+                        entry.eligibilityStatus()))
                 .toList();
         return Optional.of(new SnapshotRow(header.raceId(), header.version(), header.sealedAt(),
                 entries, checkpoints));
@@ -292,8 +383,8 @@ public class RaceRepository {
         jdbcTemplate.batchUpdate(
                 "INSERT INTO result_snapshot_entry "
                         + "(race_id, bib, rank_no, status, finish_time_ms, penalty_ms, total_time_ms, "
-                        + "display_order, checkpoint_count, covered_checkpoint_count) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        + "display_order, checkpoint_count, covered_checkpoint_count, eligibility_status) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 snapshot.entries(),
                 snapshot.entries().size(),
                 (ps, entry) -> {
@@ -307,11 +398,13 @@ public class RaceRepository {
                     ps.setInt(8, entry.displayOrder());
                     ps.setInt(9, entry.checkpointCount());
                     ps.setInt(10, entry.coveredCheckpointCount());
+                    ps.setString(11, entry.eligibilityStatus().name());
                 });
         jdbcTemplate.batchUpdate(
                 "INSERT INTO result_snapshot_checkpoint "
-                        + "(race_id, bib, checkpoint_code, position, elapsed_millis, timing_id) "
-                        + "VALUES (?, ?, ?, ?, ?, ?)",
+                        + "(race_id, bib, checkpoint_code, position, elapsed_millis, timing_id, "
+                        + "excluded, exclusion_reason) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 snapshot.checkpoints(),
                 snapshot.checkpoints().size(),
                 (ps, detail) -> {
@@ -321,6 +414,8 @@ public class RaceRepository {
                     ps.setInt(4, detail.position());
                     ps.setObject(5, detail.elapsedMillis());
                     ps.setString(6, detail.timingId());
+                    ps.setBoolean(7, detail.excluded());
+                    ps.setString(8, detail.exclusionReason());
                 });
     }
 
@@ -375,6 +470,7 @@ public class RaceRepository {
         jdbcTemplate.update("DELETE FROM result_snapshot");
         jdbcTemplate.update("DELETE FROM idempotency_record");
         jdbcTemplate.update("DELETE FROM checkpoint_timing");
+        jdbcTemplate.update("DELETE FROM medical_hold");
         jdbcTemplate.update("DELETE FROM checkpoint");
         jdbcTemplate.update("DELETE FROM penalty");
         jdbcTemplate.update("DELETE FROM runner");
@@ -435,7 +531,8 @@ public class RaceRepository {
                     rs.getInt("display_order"),
                     rs.getInt("checkpoint_count"),
                     rs.getInt("covered_checkpoint_count"),
-                    List.of());
+                    List.of(),
+                    EligibilityStatus.valueOf(rs.getString("eligibility_status")));
         }
     }
 
@@ -460,6 +557,9 @@ public class RaceRepository {
                     rs.getString("checkpoint_code"),
                     rs.getInt("position"),
                     rs.getLong("elapsed_millis"),
+                    rs.getBoolean("excluded"),
+                    rs.getString("exclusion_reason"),
+                    rs.getString("hold_id"),
                     rs.getLong("created_at"));
         }
     }
@@ -474,7 +574,30 @@ public class RaceRepository {
                     rs.getString("checkpoint_code"),
                     rs.getInt("position"),
                     (Long) rs.getObject("elapsed_millis"),
-                    rs.getString("timing_id"));
+                    rs.getString("timing_id"),
+                    rs.getBoolean("excluded"),
+                    rs.getString("exclusion_reason"));
+        }
+    }
+
+    private static final class MedicalHoldRowMapper implements RowMapper<MedicalHoldRow> {
+        @Override
+        public MedicalHoldRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new MedicalHoldRow(
+                    rs.getString("hold_id"),
+                    rs.getString("race_id"),
+                    rs.getString("bib"),
+                    rs.getLong("start_at"),
+                    (Long) rs.getObject("end_at"),
+                    rs.getString("reason"),
+                    rs.getString("started_by"),
+                    rs.getLong("start_recorded_at"),
+                    rs.getString("ended_by"),
+                    rs.getString("fitness_conclusion"),
+                    (Long) rs.getObject("end_recorded_at"),
+                    MedicalHoldStatus.valueOf(rs.getString("status")),
+                    rs.getString("active_bib"),
+                    rs.getLong("created_at"));
         }
     }
 

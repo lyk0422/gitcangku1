@@ -113,6 +113,50 @@ public class RaceController {
         return raceService.getMissingCheckpoints(raceId);
     }
 
+    /** 登记选手医疗暂停。 */
+    @PostMapping("/{raceId}/runners/{bib}/medical-holds")
+    public ResponseEntity<Object> startMedicalHold(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody StartMedicalHoldRequest request) {
+        return toResponse(raceService.startMedicalHold(raceId, bib, request));
+    }
+
+    /** 恢复选手医疗暂停（由不同医疗角色确认适赛）。 */
+    @PostMapping("/{raceId}/runners/{bib}/medical-holds/{holdId}/resume")
+    public ResponseEntity<Object> resumeMedicalHold(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @PathVariable String holdId,
+            @Valid @RequestBody ResumeMedicalHoldRequest request) {
+        return toResponse(raceService.resumeMedicalHold(raceId, bib, holdId, request));
+    }
+
+    /** 查询单个医疗暂停明细。 */
+    @GetMapping("/{raceId}/runners/{bib}/medical-holds/{holdId}")
+    public MedicalHoldResponse getMedicalHold(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @PathVariable String holdId) {
+        return raceService.getMedicalHold(raceId, bib, holdId);
+    }
+
+    /** 查询选手医疗暂停历史。 */
+    @GetMapping("/{raceId}/runners/{bib}/medical-holds")
+    public MedicalHoldHistoryResponse getMedicalHoldHistory(
+            @PathVariable String raceId,
+            @PathVariable String bib) {
+        return raceService.getMedicalHoldHistory(raceId, bib);
+    }
+
+    /** 查询选手被排除出排名的分段计时（诊断）。 */
+    @GetMapping("/{raceId}/runners/{bib}/excluded-timings")
+    public ExcludedTimingsResponse getExcludedTimings(
+            @PathVariable String raceId,
+            @PathVariable String bib) {
+        return raceService.getExcludedTimings(raceId, bib);
+    }
+
     private ResponseEntity<Object> toResponse(ServiceResult result) {
         return ResponseEntity.status(result.status()).body(result.body());
     }
