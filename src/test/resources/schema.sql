@@ -79,7 +79,95 @@ CREATE TABLE IF NOT EXISTS publish_lock (
     id INT NOT NULL,
     PRIMARY KEY (id)
 );
-COMMENT ON TABLE publish_lock IS '发布/改签全局互斥锁，保证并发发布与改签按事务提交顺序裁决';
-COMMENT ON COLUMN publish_lock.id IS '锁行 id，固定为 1，发布与改签时 SELECT ... FOR UPDATE 串行化';
+COMMENT ON TABLE publish_lock IS '发布/改签/取消/站台配置全局互斥锁，保证并发裁决按事务提交顺序生效';
+COMMENT ON COLUMN publish_lock.id IS '锁行 id，固定为 1，相关写事务 SELECT ... FOR UPDATE 串行化';
 
 MERGE INTO publish_lock KEY(id) VALUES (1);
+
+CREATE TABLE IF NOT EXISTS rail_station_config (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    station_id VARCHAR(64) NOT NULL,
+    min_dwell_minutes INT NOT NULL,
+    platform_capacity INT NOT NULL,
+    version INT NOT NULL,
+    updated_by VARCHAR(64),
+    created_at BIGINT NOT NULL,
+    updated_at BIGINT NOT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT uk_rail_station_config_station UNIQUE (station_id)
+);
+COMMENT ON TABLE rail_station_config IS '中间站站台配置，按站点保存最小停站时长与站台容量；修订产生新版本，发布快照固化历史版本';
+COMMENT ON COLUMN rail_station_config.id IS '主键';
+COMMENT ON COLUMN rail_station_config.station_id IS '站点 ID，全局唯一';
+COMMENT ON COLUMN rail_station_config.min_dwell_minutes IS '最小停站时长下限，单位分钟（UTC 整分钟）；发布时实际停留分钟数不得小于该值';
+COMMENT ON COLUMN rail_station_config.platform_capacity IS '站台容量，单位个：同站到发区间 [arrival, departure) 左闭右开内并发停靠列车数上限';
+COMMENT ON COLUMN rail_station_config.version IS '配置版本，首次登记为 1，每次修订加一；发布快照固化该版本，规则修订不改写历史';
+COMMENT ON COLUMN rail_station_config.updated_by IS '最近修订操作者；null 表示未登记操作者';
+COMMENT ON COLUMN rail_station_config.created_at IS '创建时刻，UTC 毫秒';
+COMMENT ON COLUMN rail_station_config.updated_at IS '最近修订时刻，UTC 毫秒';
+
+CREATE TABLE IF NOT EXISTS rail_plan_station_dwell (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    plan_id BIGINT NOT NULL,
+    seq INT NOT NULL,
+    train_no VARCHAR(64) NOT NULL,
+    station_id VARCHAR(64) NOT NULL,
+    arrival_utc BIGINT NOT NULL,
+    departure_utc BIGINT NOT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT uk_rail_plan_dwell_plan_train_station UNIQUE (plan_id, train_no, station_id)
+);
+COMMENT ON TABLE rail_plan_station_dwell IS '计划为中间站登记的列车到发时刻，区间左闭右开 [arrival, departure)；随草稿整体替换，发布后历史保留';
+COMMENT ON COLUMN rail_plan_station_dwell.id IS '主键';
+COMMENT ON COLUMN rail_plan_station_dwell.plan_id IS '所属计划 id，关联 rail_day_plan.id';
+COMMENT ON COLUMN rail_plan_station_dwell.seq IS '登记在计划内的序号，从 0 开始，保持提交顺序';
+COMMENT ON COLUMN rail_plan_station_dwell.train_no IS '停靠列车编号';
+COMMENT ON COLUMN rail_plan_station_dwell.station_id IS '中间站站点 ID，须在 rail_station_config 中存在';
+COMMENT ON COLUMN rail_plan_station_dwell.arrival_utc IS '到达时刻（含），UTC 毫秒，须对齐整分钟';
+COMMENT ON COLUMN rail_plan_station_dwell.departure_utc IS '发车时刻（不含），UTC 毫秒，须对齐整分钟；发布时须晚于到达且停留满足站点下限';
+CREATE INDEX IF NOT EXISTS idx_rail_plan_dwell_plan ON rail_plan_station_dwell (plan_id);
+CREATE INDEX IF NOT EXISTS idx_rail_plan_dwell_station ON rail_plan_station_dwell (station_id, arrival_utc, departure_utc);
+
+CREATE TABLE IF NOT EXISTS rail_publish_snapshot (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    plan_id BIGINT NOT NULL,
+    schedule_key VARCHAR(64) NOT NULL,
+    published_by VARCHAR(64),
+    published_at BIGINT NOT NULL,
+    PRIMARY KEY (id)
+);
+COMMENT ON TABLE rail_publish_snapshot IS '发布快照主记录，每次发布（含改签发布）固化一份，追加后不可变、不删除';
+COMMENT ON COLUMN rail_publish_snapshot.id IS '主键，亦为快照历史稳定排序依据';
+COMMENT ON COLUMN rail_publish_snapshot.plan_id IS '被发布计划 id，关联 rail_day_plan.id';
+COMMENT ON COLUMN rail_publish_snapshot.schedule_key IS '发布时计划业务键快照';
+COMMENT ON COLUMN rail_publish_snapshot.published_by IS '发布操作者；null 表示请求未登记操作者';
+COMMENT ON COLUMN rail_publish_snapshot.published_at IS '发布时刻，UTC 毫秒';
+CREATE INDEX IF NOT EXISTS idx_rail_publish_snapshot_plan ON rail_publish_snapshot (plan_id);
+
+CREATE TABLE IF NOT EXISTS rail_snapshot_station_dwell (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    snapshot_id BIGINT NOT NULL,
+    seq INT NOT NULL,
+    train_no VARCHAR(64) NOT NULL,
+    station_id VARCHAR(64) NOT NULL,
+    arrival_utc BIGINT NOT NULL,
+    departure_utc BIGINT NOT NULL,
+    station_version INT NOT NULL,
+    min_dwell_minutes INT NOT NULL,
+    platform_capacity INT NOT NULL,
+    actual_dwell_minutes INT NOT NULL,
+    PRIMARY KEY (id)
+);
+COMMENT ON TABLE rail_snapshot_station_dwell IS '发布快照中的站停固化行：到发时刻、站台配置版本与规则值、实际停留分钟；规则修订不改写本表';
+COMMENT ON COLUMN rail_snapshot_station_dwell.id IS '主键';
+COMMENT ON COLUMN rail_snapshot_station_dwell.snapshot_id IS '所属发布快照 id，关联 rail_publish_snapshot.id';
+COMMENT ON COLUMN rail_snapshot_station_dwell.seq IS '快照内序号，从 0 开始，按提交顺序固化';
+COMMENT ON COLUMN rail_snapshot_station_dwell.train_no IS '停靠列车编号';
+COMMENT ON COLUMN rail_snapshot_station_dwell.station_id IS '中间站站点 ID';
+COMMENT ON COLUMN rail_snapshot_station_dwell.arrival_utc IS '到达时刻（含），UTC 毫秒';
+COMMENT ON COLUMN rail_snapshot_station_dwell.departure_utc IS '发车时刻（不含），UTC 毫秒';
+COMMENT ON COLUMN rail_snapshot_station_dwell.station_version IS '发布时该站站台配置版本，后续修订不影响本值';
+COMMENT ON COLUMN rail_snapshot_station_dwell.min_dwell_minutes IS '发布时固化的最小停站分钟数下限，单位分钟';
+COMMENT ON COLUMN rail_snapshot_station_dwell.platform_capacity IS '发布时固化的站台容量，单位个';
+COMMENT ON COLUMN rail_snapshot_station_dwell.actual_dwell_minutes IS '实际停留分钟数 = (发车-到达)/60000，UTC 整分钟';
+CREATE INDEX IF NOT EXISTS idx_rail_snapshot_dwell_snapshot ON rail_snapshot_station_dwell (snapshot_id);

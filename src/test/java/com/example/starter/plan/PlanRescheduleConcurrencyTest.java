@@ -47,7 +47,7 @@ class PlanRescheduleConcurrencyTest {
         String section = key("SEC");
         String oldKey = key("SCH");
         createDraft(oldKey, section, 8, 9);
-        service.publish(oldKey, key("REQ"));
+        service.publish(oldKey, key("REQ"), null);
         String newA = key("SCH");
         String newB = key("SCH");
         createDraft(newA, section, 9, 10);
@@ -56,7 +56,7 @@ class PlanRescheduleConcurrencyTest {
         List<Outcome> outcomes = runConcurrently(List.of(
                 () -> {
                     try {
-                        service.reschedule(oldKey, new RescheduleRequest(key("REQ"), newA, 1, 1));
+                        service.reschedule(oldKey, new RescheduleRequest(key("REQ"), newA, 1, 1, null));
                         return Outcome.OK;
                     } catch (ApiException e) {
                         assertThat(e.status()).isEqualTo(HttpStatus.CONFLICT);
@@ -65,7 +65,7 @@ class PlanRescheduleConcurrencyTest {
                 },
                 () -> {
                     try {
-                        service.reschedule(oldKey, new RescheduleRequest(key("REQ"), newB, 1, 1));
+                        service.reschedule(oldKey, new RescheduleRequest(key("REQ"), newB, 1, 1, null));
                         return Outcome.OK;
                     } catch (ApiException e) {
                         assertThat(e.status()).isEqualTo(HttpStatus.CONFLICT);
@@ -102,7 +102,7 @@ class PlanRescheduleConcurrencyTest {
         String section = key("SEC");
         String oldKey = key("SCH");
         createDraft(oldKey, section, 8, 9);
-        service.publish(oldKey, key("REQ"));
+        service.publish(oldKey, key("REQ"), null);
         // 改签新草稿与第三方草稿争夺同一时隙 10:00-11:00
         String newKey = key("SCH");
         String thirdParty = key("SCH");
@@ -112,7 +112,7 @@ class PlanRescheduleConcurrencyTest {
         List<Outcome> outcomes = runConcurrently(List.of(
                 () -> {
                     try {
-                        service.reschedule(oldKey, new RescheduleRequest(key("REQ"), newKey, 1, 1));
+                        service.reschedule(oldKey, new RescheduleRequest(key("REQ"), newKey, 1, 1, null));
                         return Outcome.OK;
                     } catch (ApiException e) {
                         assertThat(e.status()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
@@ -121,7 +121,7 @@ class PlanRescheduleConcurrencyTest {
                 },
                 () -> {
                     try {
-                        service.publish(thirdParty, key("REQ"));
+                        service.publish(thirdParty, key("REQ"), null);
                         return Outcome.OK;
                     } catch (ApiException e) {
                         assertThat(e.status()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
@@ -163,7 +163,7 @@ class PlanRescheduleConcurrencyTest {
     private void createDraft(String scheduleKey, String section, int startHour, int endHour) {
         service.createDraft(new CreatePlanRequest(key("REQ"), scheduleKey, DAY,
                 List.of(new OccupancyRequest("G-" + UUID.randomUUID(), section,
-                        at(startHour), at(endHour)))));
+                        at(startHour), at(endHour))), null, null));
     }
 
     private List<Outcome> runConcurrently(List<Callable<Outcome>> tasks) throws Exception {

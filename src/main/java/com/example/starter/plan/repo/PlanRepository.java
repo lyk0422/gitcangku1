@@ -3,8 +3,12 @@ package com.example.starter.plan.repo;
 import com.example.starter.plan.model.DayPlan;
 import com.example.starter.plan.model.Occupancy;
 import com.example.starter.plan.model.PlanStatus;
+import com.example.starter.plan.model.PublishSnapshot;
+import com.example.starter.plan.model.PublishedDwell;
 import com.example.starter.plan.model.PublishedSlot;
 import com.example.starter.plan.model.RescheduleLink;
+import com.example.starter.plan.model.SnapshotDwell;
+import com.example.starter.plan.model.StationDwell;
 import java.sql.Date;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
@@ -48,6 +52,43 @@ public class PlanRepository {
             rs.getLong("predecessor_plan_id"),
             rs.getLong("successor_plan_id"),
             rs.getLong("created_at"));
+
+    private static final RowMapper<StationDwell> DWELL_MAPPER = (rs, n) -> new StationDwell(
+            rs.getLong("id"),
+            rs.getLong("plan_id"),
+            rs.getInt("seq"),
+            rs.getString("train_no"),
+            rs.getString("station_id"),
+            Instant.ofEpochMilli(rs.getLong("arrival_utc")),
+            Instant.ofEpochMilli(rs.getLong("departure_utc")));
+
+    private static final RowMapper<PublishedDwell> PUBLISHED_DWELL_MAPPER = (rs, n) ->
+            new PublishedDwell(
+                    rs.getString("schedule_key"),
+                    rs.getString("train_no"),
+                    rs.getString("station_id"),
+                    Instant.ofEpochMilli(rs.getLong("arrival_utc")),
+                    Instant.ofEpochMilli(rs.getLong("departure_utc")));
+
+    private static final RowMapper<PublishSnapshot> SNAPSHOT_MAPPER = (rs, n) -> new PublishSnapshot(
+            rs.getLong("id"),
+            rs.getLong("plan_id"),
+            rs.getString("schedule_key"),
+            rs.getString("published_by"),
+            rs.getLong("published_at"));
+
+    private static final RowMapper<SnapshotDwell> SNAPSHOT_DWELL_MAPPER = (rs, n) ->
+            new SnapshotDwell(
+                    rs.getLong("snapshot_id"),
+                    rs.getInt("seq"),
+                    rs.getString("train_no"),
+                    rs.getString("station_id"),
+                    Instant.ofEpochMilli(rs.getLong("arrival_utc")),
+                    Instant.ofEpochMilli(rs.getLong("departure_utc")),
+                    rs.getInt("station_version"),
+                    rs.getInt("min_dwell_minutes"),
+                    rs.getInt("platform_capacity"),
+                    rs.getInt("actual_dwell_minutes"));
 
     private final JdbcTemplate jdbc;
 
@@ -218,5 +259,157 @@ public class PlanRepository {
      */
     public void acquirePublishLock() {
         jdbc.queryForObject("SELECT id FROM publish_lock WHERE id = 1 FOR UPDATE", Integer.class);
+    }
+
+    /**
+     * 整体替换计划的中间站到发登记：先删后插，保持提交顺序。
+     */
+    public void replaceStationDwells(long planId, List<StationDwell> dwells) {
+        jdbc.update("DELETE FROM rail_plan_station_dwell WHERE plan_id = ?", planId);
+        insertStationDwells(planId, dwells);
+    }
+
+    /**
+     * 批量插入中间站到发登记。
+     */
+    public void insertStationDwells(long planId, List<StationDwell> dwells) {
+        if (dwells.isEmpty()) {
+            return;
+        }
+        jdbc.batchUpdate(
+                "INSERT INTO rail_plan_station_dwell"
+                        + " (plan_id, seq, train_no, station_id, arrival_utc, departure_utc)"
+                        + " VALUES (?, ?, ?, ?, ?, ?)",
+                dwells, dwells.size(),
+                (ps, d) -> {
+                    ps.setLong(1, planId);
+                    ps.setInt(2, d.seq());
+                    ps.setString(3, d.trainNo());
+                    ps.setString(4, d.stationId());
+                    ps.setLong(5, d.arrivalUtc().toEpochMilli());
+                    ps.setLong(6, d.departureUtc().toEpochMilli());
+                });
+    }
+
+    /**
+     * 查询计划的中间站到发登记，按计划内序号升序。
+     */
+    public List<StationDwell> findStationDwells(long planId) {
+        return jdbc.query("SELECT id, plan_id, seq, train_no, station_id, arrival_utc, departure_utc"
+                        + " FROM rail_plan_station_dwell WHERE plan_id = ? ORDER BY seq",
+                DWELL_MAPPER, planId);
+    }
+
+    /**
+     * 查询指定运营日、指定站点集合上其他已发布计划的生效站停（排除给定计划集合），
+     * 按站点与到达时刻排序。区间左闭右开 [arrival, departure)。
+     */
+    public List<PublishedDwell> findPublishedDwells(LocalDate opDate, Collection<String> stationIds,
+                                                    Collection<Long> excludePlanIds) {
+        if (stationIds.isEmpty()) {
+            return List.of();
+        }
+        StringJoiner stationPlaceholders = new StringJoiner(", ");
+        stationIds.forEach(s -> stationPlaceholders.add("?"));
+        StringBuilder sql = new StringBuilder(
+                "SELECT p.schedule_key, d.train_no, d.station_id, d.arrival_utc, d.departure_utc"
+                        + " FROM rail_plan_station_dwell d JOIN rail_day_plan p ON p.id = d.plan_id"
+                        + " WHERE p.status = 'PUBLISHED' AND p.op_date = ?");
+        List<Object> args = new ArrayList<>();
+        args.add(Date.valueOf(opDate));
+        if (!excludePlanIds.isEmpty()) {
+            StringJoiner excludePlaceholders = new StringJoiner(", ");
+            excludePlanIds.forEach(id -> excludePlaceholders.add("?"));
+            sql.append(" AND p.id NOT IN (").append(excludePlaceholders).append(')');
+            args.addAll(excludePlanIds);
+        }
+        sql.append(" AND d.station_id IN (").append(stationPlaceholders)
+                .append(") ORDER BY d.station_id, d.arrival_utc");
+        args.addAll(stationIds);
+        return jdbc.query(sql.toString(), PUBLISHED_DWELL_MAPPER, args.toArray());
+    }
+
+    /**
+     * 写入发布快照主记录，返回自增快照 id。
+     */
+    public long insertSnapshot(long planId, String scheduleKey, String publishedBy, long nowMillis) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO rail_publish_snapshot"
+                            + " (plan_id, schedule_key, published_by, published_at)"
+                            + " VALUES (?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setLong(1, planId);
+            ps.setString(2, scheduleKey);
+            ps.setString(3, publishedBy);
+            ps.setLong(4, nowMillis);
+            return ps;
+        }, keys);
+        return keys.getKey().longValue();
+    }
+
+    /**
+     * 批量写入快照站停固化行（不可变）。
+     */
+    public void insertSnapshotDwells(long snapshotId, List<SnapshotDwell> dwells) {
+        if (dwells.isEmpty()) {
+            return;
+        }
+        jdbc.batchUpdate(
+                "INSERT INTO rail_snapshot_station_dwell"
+                        + " (snapshot_id, seq, train_no, station_id, arrival_utc, departure_utc,"
+                        + " station_version, min_dwell_minutes, platform_capacity, actual_dwell_minutes)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                dwells, dwells.size(),
+                (ps, d) -> {
+                    ps.setLong(1, snapshotId);
+                    ps.setInt(2, d.seq());
+                    ps.setString(3, d.trainNo());
+                    ps.setString(4, d.stationId());
+                    ps.setLong(5, d.arrivalUtc().toEpochMilli());
+                    ps.setLong(6, d.departureUtc().toEpochMilli());
+                    ps.setInt(7, d.stationVersion());
+                    ps.setInt(8, d.minDwellMinutes());
+                    ps.setInt(9, d.platformCapacity());
+                    ps.setInt(10, d.actualDwellMinutes());
+                });
+    }
+
+    /**
+     * 按计划 id 查询全部发布快照，按快照 id 升序（发布提交顺序，稳定排序）。
+     */
+    public List<PublishSnapshot> findSnapshotsByPlan(long planId) {
+        return jdbc.query("SELECT id, plan_id, schedule_key, published_by, published_at"
+                        + " FROM rail_publish_snapshot WHERE plan_id = ? ORDER BY id",
+                SNAPSHOT_MAPPER, planId);
+    }
+
+    /**
+     * 按站点查询发布快照主记录（经快照站停关联），按快照 id 升序去重。
+     */
+    public List<PublishSnapshot> findSnapshotsByStation(String stationId) {
+        return jdbc.query(
+                "SELECT s.id, s.plan_id, s.schedule_key, s.published_by, s.published_at"
+                        + " FROM rail_publish_snapshot s"
+                        + " WHERE s.id IN (SELECT DISTINCT snapshot_id FROM rail_snapshot_station_dwell"
+                        + " WHERE station_id = ?) ORDER BY s.id",
+                SNAPSHOT_MAPPER, stationId);
+    }
+
+    /**
+     * 按快照 id 集合批量查询快照站停固化行，按快照 id、序号升序。
+     */
+    public List<SnapshotDwell> findSnapshotDwells(Collection<Long> snapshotIds) {
+        if (snapshotIds.isEmpty()) {
+            return List.of();
+        }
+        StringJoiner placeholders = new StringJoiner(", ");
+        snapshotIds.forEach(id -> placeholders.add("?"));
+        return jdbc.query("SELECT snapshot_id, seq, train_no, station_id, arrival_utc, departure_utc,"
+                        + " station_version, min_dwell_minutes, platform_capacity, actual_dwell_minutes"
+                        + " FROM rail_snapshot_station_dwell WHERE snapshot_id IN ("
+                        + placeholders + ") ORDER BY snapshot_id, seq",
+                SNAPSHOT_DWELL_MAPPER, snapshotIds.toArray());
     }
 }
