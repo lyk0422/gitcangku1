@@ -5,6 +5,8 @@ import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
 import com.example.starter.batch.dto.LineageEntryResponse;
+import com.example.starter.batch.dto.MergeRequest;
+import com.example.starter.batch.dto.PotencyEvidenceResponse;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
@@ -112,6 +114,23 @@ public class BatchController {
     @GetMapping("/{batchKey}/descendants")
     public List<LineageEntryResponse> descendants(@PathVariable String batchKey) {
         return service.listDescendants(batchKey);
+    }
+
+    /**
+     * 合批：2～5 个已放行且已登记效价的父批整体并入一个全新子批，
+     * 子批初始效价为父批在合批时刻效价的数量加权平均。
+     */
+    @PostMapping("/merge")
+    public ResponseEntity<String> merge(@Valid @RequestBody MergeRequest request) {
+        return stored(service.merge(request));
+    }
+
+    /**
+     * 批次效价证据查询：放行/拆分/合批固化的计算时刻、模型版本、输入效价与舍入结果。
+     */
+    @GetMapping("/{batchKey}/potency-evidence")
+    public List<PotencyEvidenceResponse> potencyEvidence(@PathVariable String batchKey) {
+        return service.listPotencyEvidence(batchKey);
     }
 
     private ResponseEntity<String> stored(StoredResponse response) {
