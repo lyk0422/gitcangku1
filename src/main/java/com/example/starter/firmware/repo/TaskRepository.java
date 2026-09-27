@@ -23,10 +23,11 @@ public class TaskRepository {
         String firstResult = rs.getString("first_result");
         return new RolloutTask(rs.getLong("id"), rs.getLong("release_id"), rs.getString("device_id"),
                 TaskStatus.valueOf(rs.getString("status")),
-                firstResult == null ? null : ReceiptResult.valueOf(firstResult));
+                firstResult == null ? null : ReceiptResult.valueOf(firstResult),
+                rs.getInt("current_attempt"));
     };
 
-    private static final String COLUMNS = "id, release_id, device_id, status, first_result";
+    private static final String COLUMNS = "id, release_id, device_id, status, first_result, current_attempt";
 
     private final JdbcTemplate jdbc;
 
@@ -67,9 +68,34 @@ public class TaskRepository {
                 + " WHERE id = ?", result.name(), result.name(), id);
     }
 
+    /**
+     * 更新任务状态（不改变 first_result），用于完整性判定与重新拉取。
+     */
+    public void updateStatus(long id, TaskStatus status) {
+        jdbc.update("UPDATE rollout_task SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                status.name(), id);
+    }
+
+    /**
+     * 重新拉取：状态回到 PENDING，当前尝试代次加一。
+     */
+    public void startNewAttempt(long id, int newAttempt) {
+        jdbc.update("UPDATE rollout_task SET status = 'PENDING', current_attempt = ?,"
+                + " updated_at = CURRENT_TIMESTAMP WHERE id = ?", newAttempt, id);
+    }
+
+    /**
+     * 取消所有未终结任务（PENDING/INSTALLABLE/INTEGRITY_FAILED）。
+     */
     public int cancelPendingByRelease(long releaseId) {
         return jdbc.update("UPDATE rollout_task SET status = 'CANCELLED', updated_at = CURRENT_TIMESTAMP"
-                + " WHERE release_id = ? AND status = 'PENDING'", releaseId);
+                + " WHERE release_id = ? AND status IN ('PENDING', 'INSTALLABLE', 'INTEGRITY_FAILED')", releaseId);
+    }
+
+    public long countByRelease(long releaseId) {
+        Long count = jdbc.queryForObject("SELECT COUNT(*) FROM rollout_task WHERE release_id = ?",
+                Long.class, releaseId);
+        return count == null ? 0 : count;
     }
 
     public List<RolloutTask> findByRelease(long releaseId, TaskStatus statusFilter) {

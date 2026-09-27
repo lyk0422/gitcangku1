@@ -11,7 +11,9 @@ import com.example.starter.firmware.domain.ReleaseStatus;
 import com.example.starter.firmware.domain.RolloutTask;
 import com.example.starter.firmware.domain.TaskStatus;
 import com.example.starter.firmware.error.ApiException;
+import com.example.starter.firmware.repo.AttemptRepository;
 import com.example.starter.firmware.repo.DeviceRepository;
+import com.example.starter.firmware.repo.ManifestRepository;
 import com.example.starter.firmware.repo.PauseRecordRepository;
 import com.example.starter.firmware.repo.ReleaseRepository;
 import com.example.starter.firmware.repo.TaskRepository;
@@ -25,6 +27,8 @@ import java.util.List;
 /**
  * 投放任务：设备拉取与回执。与取消、恢复并发时统一先锁发布单行，再操作任务，形成一致提交顺序。
  * 回执首次终结任务时在发布单行锁内累计当前监控轮次统计，达到阈值即在同一事务原子暂停。
+ * 登记了分片清单的发布单，其任务必须经完整性核验进入 INSTALLABLE 才允许安装回执；
+ * INTEGRITY_FAILED 任务禁止一切回执且不计入设备执行失败率。
  */
 @Service
 public class TaskService {
@@ -33,6 +37,8 @@ public class TaskService {
     private final ReleaseRepository releaseRepository;
     private final DeviceRepository deviceRepository;
     private final PauseRecordRepository pauseRecordRepository;
+    private final ManifestRepository manifestRepository;
+    private final AttemptRepository attemptRepository;
     private final DeviceService deviceService;
     private final ReleaseService releaseService;
     private final IdempotencyService idempotency;
@@ -40,12 +46,15 @@ public class TaskService {
 
     public TaskService(TaskRepository taskRepository, ReleaseRepository releaseRepository,
                        DeviceRepository deviceRepository, PauseRecordRepository pauseRecordRepository,
+                       ManifestRepository manifestRepository, AttemptRepository attemptRepository,
                        DeviceService deviceService, ReleaseService releaseService,
                        IdempotencyService idempotency, Clock clock) {
         this.taskRepository = taskRepository;
         this.releaseRepository = releaseRepository;
         this.deviceRepository = deviceRepository;
         this.pauseRecordRepository = pauseRecordRepository;
+        this.manifestRepository = manifestRepository;
+        this.attemptRepository = attemptRepository;
         this.deviceService = deviceService;
         this.releaseService = releaseService;
         this.idempotency = idempotency;
@@ -55,6 +64,7 @@ public class TaskService {
     /**
      * 设备拉取：已存在任务直接返回；否则仅当型号与当前版本匹配、分桶号小于比例且发布单 ACTIVE 时创建。
      * PAUSED 时不创建新任务，已有任务仍可查看与回执。
+     * 新建任务同时建立第1代尝试，固化当时的目标版本与分片清单聚合摘要。
      */
     public PullResponse pull(String deviceId, String requestId) {
         String fingerprint = String.join("|", "task.pull", deviceId);
@@ -83,6 +93,7 @@ public class TaskService {
                         .orElseThrow(() -> new IllegalStateException("任务唯一约束冲突后未找到任务"));
                 return new PullResponse(TaskView.of(task, order));
             }
+            createAttempt(taskId, 1, order);
             RolloutTask task = taskRepository.findById(taskId)
                     .orElseThrow(() -> new IllegalStateException("任务创建后读取失败"));
             return new PullResponse(TaskView.of(task, order));
@@ -90,9 +101,21 @@ public class TaskService {
     }
 
     /**
-     * 回执：首次回执终结任务并计入完成时所在监控轮次，仅 SUCCESS 更新设备当前版本；
-     * 同结果重复成功（不重复计数），改结果 409；已取消任务的后到回执 409 且不更新设备版本。
-     * 样本达到下限且失败率越限时，同事务将仍为 ACTIVE 的发布单原子转为 PAUSED 并落暂停记录。
+     * 建立新尝试代次：固化当时发布单ID、目标版本与分片清单（聚合摘要与要求分片数）。
+     */
+    private void createAttempt(long taskId, int attemptNo, ReleaseOrder order) {
+        var manifest = manifestRepository.findManifest(order.id());
+        attemptRepository.insert(taskId, attemptNo, order.id(), order.toVersion(),
+                manifest.map(ManifestRepository.ManifestRow::aggregateDigest).orElse(null),
+                manifest.map(ManifestRepository.ManifestRow::chunkCount).orElse(0),
+                Instant.now(clock).toString());
+    }
+
+    /**
+     * 回执：INSTALLABLE（或未登记分片清单的 PENDING）任务首次回执终结并计入完成时所在监控轮次，
+     * 仅 SUCCESS 更新设备当前版本；同结果重复成功（不重复计数），改结果 409。
+     * 登记了分片清单的 PENDING 任务禁止回执（409 TASK_NOT_INSTALLABLE）；
+     * INTEGRITY_FAILED 任务禁止一切回执（409），不计入失败率；已取消任务的后到回执 409。
      */
     public TaskView receipt(long taskId, ReceiptRequest request) {
         String fingerprint = String.join("|", "task.receipt", String.valueOf(taskId), request.result().name());
@@ -105,15 +128,15 @@ public class TaskService {
                     .orElseThrow(() -> ApiException.notFound("TASK_NOT_FOUND", "任务不存在: " + taskId));
             return switch (task.status()) {
                 case PENDING -> {
-                    taskRepository.complete(taskId, request.result());
-                    releaseRepository.incrementRoundStats(snapshot.releaseId(), request.result());
-                    if (request.result() == ReceiptResult.SUCCESS) {
-                        deviceRepository.updateCurrentVersion(task.deviceId(), lockedOrder.toVersion());
+                    if (manifestRepository.findManifest(snapshot.releaseId()).isPresent()) {
+                        throw ApiException.conflict("TASK_NOT_INSTALLABLE",
+                                "任务未完成分片完整性核验，禁止安装回执");
                     }
-                    ReleaseOrder updated = releaseRepository.findById(snapshot.releaseId()).orElseThrow();
-                    pauseIfThresholdReached(updated, taskId);
-                    yield TaskView.of(taskRepository.findById(taskId).orElseThrow(), updated);
+                    yield completeLocked(taskId, snapshot, lockedOrder, request.result());
                 }
+                case INSTALLABLE -> completeLocked(taskId, snapshot, lockedOrder, request.result());
+                case INTEGRITY_FAILED -> throw ApiException.conflict("TASK_INTEGRITY_FAILED",
+                        "任务完整性核验失败，禁止安装和成功回执");
                 case SUCCESS, FAILED -> {
                     if (task.firstResult() == request.result()) {
                         yield TaskView.of(task, lockedOrder);
@@ -124,6 +147,22 @@ public class TaskService {
                 case CANCELLED -> throw ApiException.conflict("TASK_CANCELLED", "任务已取消，回执不再受理");
             };
         }, TaskView.class);
+    }
+
+    /**
+     * 首次回执终结任务：累计当前监控轮次统计，仅 SUCCESS 更新设备版本，达到阈值同事务原子暂停。
+     * 调用方已持有发布单行锁与任务行锁。
+     */
+    private TaskView completeLocked(long taskId, RolloutTask snapshot, ReleaseOrder lockedOrder,
+                                    ReceiptResult result) {
+        taskRepository.complete(taskId, result);
+        releaseRepository.incrementRoundStats(snapshot.releaseId(), result);
+        if (result == ReceiptResult.SUCCESS) {
+            deviceRepository.updateCurrentVersion(snapshot.deviceId(), lockedOrder.toVersion());
+        }
+        ReleaseOrder updated = releaseRepository.findById(snapshot.releaseId()).orElseThrow();
+        pauseIfThresholdReached(updated, taskId);
+        return TaskView.of(taskRepository.findById(taskId).orElseThrow(), updated);
     }
 
     /**
