@@ -2,12 +2,15 @@ package com.example.starter.consent;
 
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import com.example.starter.consent.dto.EraseRequest;
+import com.example.starter.consent.dto.EraseResponse;
 import com.example.starter.consent.dto.GrantRequest;
 import com.example.starter.consent.dto.GrantResponse;
 import com.example.starter.consent.dto.RecordResponse;
@@ -18,7 +21,7 @@ import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 
 /**
- * 本地数据授权 API：授权、记录写入、撤回与查询。
+ * 本地数据授权 API：授权、记录写入、撤回、查询与数据清除。
  */
 @Validated
 @RestController
@@ -39,6 +42,11 @@ public class ConsentController {
     @PostMapping("/consents/revocations")
     public GrantResponse revoke(@Valid @RequestBody RevokeRequest request) {
         return consentService.revoke(request);
+    }
+
+    @PostMapping("/consents/erasures")
+    public EraseResponse erase(@Valid @RequestBody EraseRequest request) {
+        return consentService.erase(request);
     }
 
     @PostMapping("/records")

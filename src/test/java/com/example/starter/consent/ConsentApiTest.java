@@ -45,9 +45,12 @@ class ConsentApiTest {
 
     @BeforeEach
     void cleanTables() {
+        jdbc.update("DELETE FROM consent_snapshot_item");
+        jdbc.update("DELETE FROM consent_snapshot");
         jdbc.update("DELETE FROM consent_record");
         jdbc.update("DELETE FROM consent_grant");
         jdbc.update("DELETE FROM idempotency_request");
+        jdbc.update("DELETE FROM residency_region");
     }
 
     private ResultActions grant(String requestId, String subjectKey, String purpose) throws Exception {
@@ -382,7 +385,7 @@ class ConsentApiTest {
                 ready.countDown();
                 start.await();
                 return consentService.write(new RecordWriteRequest(
-                        requestId, "subj-a", Purpose.RESEARCH, "rec-1", "same-payload")).payload();
+                        requestId, "subj-a", Purpose.RESEARCH, "rec-1", "same-payload", null)).payload();
             });
         }
         List<Future<String>> futures = new ArrayList<>();
