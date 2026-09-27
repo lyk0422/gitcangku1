@@ -2,6 +2,7 @@ package com.example.starter.playout;
 
 import com.example.starter.playout.PlayoutRepository.DraftRow;
 import com.example.starter.playout.PlayoutRepository.GrantRow;
+import com.example.starter.playout.PlayoutRepository.LiveOverrideRow;
 import com.example.starter.playout.PlayoutRepository.OverrideRow;
 import com.example.starter.playout.PlayoutRepository.PublicationRow;
 import com.example.starter.playout.PlayoutRepository.PublicationSegmentRow;
@@ -14,11 +15,14 @@ import com.example.starter.playout.api.Dtos.CreateAssetRequest;
 import com.example.starter.playout.api.Dtos.CreateChannelRequest;
 import com.example.starter.playout.api.Dtos.CreateEmergencyOverrideRequest;
 import com.example.starter.playout.api.Dtos.CreateGrantRequest;
+import com.example.starter.playout.api.Dtos.CreateLiveOverrideRequest;
 import com.example.starter.playout.api.Dtos.DecisionSource;
 import com.example.starter.playout.api.Dtos.DraftResponse;
 import com.example.starter.playout.api.Dtos.EmergencyOverrideResponse;
 import com.example.starter.playout.api.Dtos.FallbackReason;
 import com.example.starter.playout.api.Dtos.GrantResponse;
+import com.example.starter.playout.api.Dtos.LiveOverrideResponse;
+import com.example.starter.playout.api.Dtos.LiveOverrideStatus;
 import com.example.starter.playout.api.Dtos.OverrideStatus;
 import com.example.starter.playout.api.Dtos.PlayoutDecisionResponse;
 import com.example.starter.playout.api.Dtos.PublishRequest;
@@ -63,6 +67,8 @@ public class PlayoutService {
     private static final String OP_REVOKE_GRANT = "REVOKE_GRANT";
     private static final String OP_CREATE_OVERRIDE = "CREATE_OVERRIDE";
     private static final String OP_CANCEL_OVERRIDE = "CANCEL_OVERRIDE";
+    private static final String OP_CREATE_LIVE_OVERRIDE = "CREATE_LIVE_OVERRIDE";
+    private static final String OP_CANCEL_LIVE_OVERRIDE = "CANCEL_LIVE_OVERRIDE";
 
     /** 紧急插播时长上限（含）：30 分钟，单位毫秒。 */
     private static final long OVERRIDE_MAX_DURATION_MS = 30L * 60L * 1000L;
@@ -244,8 +250,9 @@ public class PlayoutService {
     /**
      * 按频道与时刻查询播出决定。先在命中该时刻的 ACTIVE 紧急插播中选取指定授权当前未撤销的
      * 最高优先级插播（EMERGENCY 来源，随附 overrideKey）；高优先级插播授权失效时自动落到
-     * 仍有效的低优先级插播。无有效插播候选时沿用原节目与保底逻辑。查询不改变插播状态，
-     * 插播不随授权撤销自动换绑授权。到插播结束时刻（左闭右开）不再命中。
+     * 仍有效的低优先级插播。无有效插播候选时再查命中该时刻且授权未撤销的直播覆盖令
+     * （LIVE 来源，随附 overrideKey）；均无则沿用原节目与保底逻辑。查询不改变插播/覆盖令状态，
+     * 插播与覆盖令不随授权撤销自动换绑授权。到结束时刻（左闭右开）不再命中。
      */
     @Transactional(readOnly = true)
     public PlayoutDecisionResponse playoutDecision(String channelId, OffsetDateTime at) {
@@ -258,6 +265,13 @@ public class PlayoutService {
             OverrideRow hit = override.get();
             return new PlayoutDecisionResponse(channelId, at, hit.assetId(),
                     DecisionSource.EMERGENCY, null, null, null, hit.overrideKey());
+        }
+
+        Optional<LiveOverrideRow> liveOverride = selectActiveLiveOverrideAt(channelId, atMs);
+        if (liveOverride.isPresent()) {
+            LiveOverrideRow hit = liveOverride.get();
+            return new PlayoutDecisionResponse(channelId, at, hit.liveAssetId(),
+                    DecisionSource.LIVE, null, null, null, hit.overrideKey());
         }
 
         LocalDate businessDay = at.atZoneSameInstant(ZONE).toLocalDate();
@@ -294,6 +308,20 @@ public class PlayoutService {
      */
     private Optional<OverrideRow> selectActiveOverrideAt(String channelId, long atMs) {
         for (OverrideRow candidate : repo.findActiveOverridesAt(channelId, atMs)) {
+            GrantRow grant = repo.findGrant(candidate.grantId()).orElse(null);
+            if (grant != null && !grant.revoked()) {
+                return Optional.of(candidate);
+            }
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * 选取某时刻生效的直播覆盖令：候选为区间命中且 ACTIVE 的覆盖令（同频道同时刻至多一条），
+     * 跳过其指定授权已撤销的覆盖令。授权状态为查询时的实时状态。
+     */
+    private Optional<LiveOverrideRow> selectActiveLiveOverrideAt(String channelId, long atMs) {
+        for (LiveOverrideRow candidate : repo.findActiveLiveOverridesAt(channelId, atMs)) {
             GrantRow grant = repo.findGrant(candidate.grantId()).orElse(null);
             if (grant != null && !grant.revoked()) {
                 return Optional.of(candidate);
@@ -423,6 +451,133 @@ public class PlayoutService {
         return new EmergencyOverrideResponse(row.overrideKey(), row.channelId(), row.assetId(),
                 row.grantId(), row.priority(), atMs(row.startMs()), atMs(row.endMs()),
                 row.active() ? OverrideStatus.ACTIVE : OverrideStatus.CANCELLED,
+                row.cancelRequestId(),
+                row.cancelledAtMs() == null ? null : atMs(row.cancelledAtMs()),
+                atMs(row.createdAtMs()));
+    }
+
+    // ---------- 直播覆盖令 ----------
+
+    /**
+     * 创建直播覆盖令：创建即 ACTIVE，只可取消不可改写。校验频道/直播源素材/授权存在、授权属于
+     * 该频道与直播源素材且未撤销并完整覆盖区间、end 大于 start（不限制时长与跨日）；同频道
+     * ACTIVE 覆盖区间不得重叠（左闭右开，相邻合法）。携带 requestId 幂等：同键同参返回首次
+     * 结果，改参 409，失败不占键；已取消覆盖令不能用相同 overrideKey 重放复活。
+     */
+    @Transactional
+    public LiveOverrideResponse createLiveOverride(CreateLiveOverrideRequest request) {
+        String hash = sha256(OP_CREATE_LIVE_OVERRIDE + "|" + request.overrideKey() + "|"
+                + request.channelId() + "|" + request.liveAssetId() + "|" + request.grantId() + "|"
+                + toMs(request.start()) + "|" + toMs(request.end()));
+        return idempotent(request.requestId(), OP_CREATE_LIVE_OVERRIDE, hash,
+                LiveOverrideResponse.class, () -> doCreateLiveOverride(request));
+    }
+
+    private LiveOverrideResponse doCreateLiveOverride(CreateLiveOverrideRequest request) {
+        long startMs = toMs(request.start());
+        long endMs = toMs(request.end());
+        if (endMs <= startMs) {
+            throw ApiException.badRequest("直播覆盖结束时间必须大于开始时间");
+        }
+
+        repo.lockChannelForUpdate(request.channelId());
+        var channel = repo.findChannel(request.channelId())
+                .orElseThrow(() -> ApiException.notFound("频道不存在: " + request.channelId()));
+        if (repo.findAsset(request.liveAssetId()).isEmpty()) {
+            throw ApiException.notFound("直播源素材不存在: " + request.liveAssetId());
+        }
+        if (channel.fallbackAssetId().equals(request.liveAssetId())) {
+            throw ApiException.unprocessable("FALLBACK_ASSET_NOT_GRANTABLE",
+                    "保底素材不得用于直播覆盖");
+        }
+
+        // 同键语义：已存在（含已取消）即冲突，重放创建不能复活已取消覆盖令。
+        if (repo.findLiveOverrideForUpdate(request.overrideKey()).isPresent()) {
+            throw ApiException.conflict("DUPLICATE_OVERRIDE_KEY",
+                    "直播覆盖令 overrideKey 已存在: " + request.overrideKey());
+        }
+
+        // 锁定授权行：与撤销事务按提交顺序串行。撤销先提交时 revoked=1，此处 422 拒绝。
+        GrantRow grant = repo.findGrantForUpdate(request.grantId())
+                .orElseThrow(() -> ApiException.notFound("授权不存在: " + request.grantId()));
+        if (!grant.channelId().equals(request.channelId())
+                || !grant.assetId().equals(request.liveAssetId())) {
+            throw ApiException.unprocessable("GRANT_NOT_MATCHED",
+                    "指定授权不属于该频道或直播源素材: " + request.grantId());
+        }
+        if (grant.revoked()) {
+            throw ApiException.unprocessable("GRANT_INVALID",
+                    "指定授权已撤销: " + request.grantId());
+        }
+        if (grant.validFromMs() > startMs || grant.validToMs() < endMs) {
+            throw ApiException.unprocessable("GRANT_NOT_COVERING",
+                    "指定授权未完整覆盖直播覆盖区间: " + request.grantId());
+        }
+
+        List<LiveOverrideRow> overlapping = repo.findActiveOverlappingLiveOverridesForUpdate(
+                request.channelId(), startMs, endMs);
+        if (!overlapping.isEmpty()) {
+            throw ApiException.conflict("LIVE_OVERRIDE_INTERVAL_CONFLICT",
+                    "同频道 ACTIVE 直播覆盖区间重叠: " + overlapping.get(0).overrideKey());
+        }
+
+        long createdAtMs = nowMs();
+        try {
+            repo.insertLiveOverride(request.overrideKey(), request.channelId(),
+                    request.liveAssetId(), request.grantId(), startMs, endMs, createdAtMs);
+        } catch (DuplicateKeyException e) {
+            throw ApiException.conflict("DUPLICATE_OVERRIDE_KEY",
+                    "直播覆盖令 overrideKey 已存在: " + request.overrideKey());
+        }
+        return new LiveOverrideResponse(request.overrideKey(), request.channelId(),
+                request.liveAssetId(), request.grantId(), request.start(), request.end(),
+                LiveOverrideStatus.ACTIVE, null, null, atMs(createdAtMs));
+    }
+
+    /**
+     * 取消直播覆盖令：仅 ACTIVE 可取消，已取消再取消为 409 状态冲突；取消提交后释放冲突区间。
+     * 携带 requestId 幂等：同键同参返回首次结果（含 CANCELLED 明细），改参 409，失败不占键。
+     */
+    @Transactional
+    public LiveOverrideResponse cancelLiveOverride(String overrideKey, String requestId) {
+        String hash = sha256(OP_CANCEL_LIVE_OVERRIDE + "|" + overrideKey);
+        return idempotent(requestId, OP_CANCEL_LIVE_OVERRIDE, hash,
+                LiveOverrideResponse.class, () -> {
+                    // 先在频道锁上与同频道创建/取消串行，取消提交后并发创建即可复用该区间。
+                    LiveOverrideRow existing = repo.findLiveOverride(overrideKey)
+                            .orElseThrow(() -> ApiException.notFound("直播覆盖令不存在: " + overrideKey));
+                    repo.lockChannelForUpdate(existing.channelId());
+                    int updated = repo.cancelLiveOverride(overrideKey, requestId, nowMs());
+                    if (updated == 0) {
+                        throw ApiException.conflict("LIVE_OVERRIDE_NOT_ACTIVE",
+                                "直播覆盖令已取消，不能重复取消: " + overrideKey);
+                    }
+                    return toLiveOverrideResponse(repo.findLiveOverrideForUpdate(overrideKey).orElseThrow());
+                });
+    }
+
+    /** 查询直播覆盖令明细（不做状态校验，ACTIVE/CANCELLED 均返回，含取消情况与原授权关联）。 */
+    @Transactional(readOnly = true)
+    public LiveOverrideResponse getLiveOverride(String overrideKey) {
+        LiveOverrideRow row = repo.findLiveOverride(overrideKey)
+                .orElseThrow(() -> ApiException.notFound("直播覆盖令不存在: " + overrideKey));
+        return toLiveOverrideResponse(row);
+    }
+
+    /** 查询频道全部直播覆盖令，按开始时间、键稳定排序。 */
+    @Transactional(readOnly = true)
+    public List<LiveOverrideResponse> listLiveOverrides(String channelId) {
+        repo.findChannel(channelId)
+                .orElseThrow(() -> ApiException.notFound("频道不存在: " + channelId));
+        return repo.findLiveOverridesByChannel(channelId).stream()
+                .map(PlayoutService::toLiveOverrideResponse)
+                .toList();
+    }
+
+    private static LiveOverrideResponse toLiveOverrideResponse(LiveOverrideRow row) {
+        return new LiveOverrideResponse(row.overrideKey(), row.channelId(), row.liveAssetId(),
+                row.grantId(), atMs(row.startMs()), atMs(row.endMs()),
+                row.active() ? LiveOverrideStatus.ACTIVE : LiveOverrideStatus.CANCELLED,
                 row.cancelRequestId(),
                 row.cancelledAtMs() == null ? null : atMs(row.cancelledAtMs()),
                 atMs(row.createdAtMs()));

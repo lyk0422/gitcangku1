@@ -74,7 +74,7 @@ CREATE TABLE IF NOT EXISTS playout_publication_segment (
 
 CREATE TABLE IF NOT EXISTS playout_request (
     request_id    VARCHAR(64)  NOT NULL COMMENT '幂等请求 ID，客户端生成',
-    operation     VARCHAR(32)  NOT NULL COMMENT '操作类型：REPLACE_DRAFT / PUBLISH / REVOKE_GRANT / CREATE_OVERRIDE / CANCEL_OVERRIDE',
+    operation     VARCHAR(32)  NOT NULL COMMENT '操作类型：REPLACE_DRAFT / PUBLISH / REVOKE_GRANT / CREATE_OVERRIDE / CANCEL_OVERRIDE / CREATE_LIVE_OVERRIDE / CANCEL_LIVE_OVERRIDE',
     params_hash   VARCHAR(64)  NOT NULL COMMENT '业务参数（不含 requestId）的 SHA-256，十六进制',
     response_body TEXT         NULL COMMENT '成功时的响应 JSON；失败请求回滚不占用 requestId',
     created_at_ms BIGINT       NOT NULL COMMENT '记录创建时间，UTC 纪元毫秒',
@@ -97,3 +97,18 @@ CREATE TABLE IF NOT EXISTS playout_emergency_override (
     PRIMARY KEY (override_key),
     KEY idx_override_playout (channel_id, status, start_ms, end_ms, priority)
 ) COMMENT = '限时紧急插播表；不改写日草稿与发布快照，同频道同优先级 ACTIVE 区间不得重叠';
+
+CREATE TABLE IF NOT EXISTS playout_live_override (
+    override_key      VARCHAR(64)  NOT NULL COMMENT '直播覆盖令全局唯一键，客户端指定，创建后不变',
+    channel_id        VARCHAR(64)  NOT NULL COMMENT '覆盖频道 ID',
+    live_asset_id     VARCHAR(64)  NOT NULL COMMENT '直播源普通素材 ID（不得为频道保底素材）',
+    grant_id          BIGINT       NOT NULL COMMENT '创建时指定的授权 ID，须属于该频道与直播源素材并完整覆盖区间；撤销后不自动换绑',
+    start_ms          BIGINT       NOT NULL COMMENT '覆盖开始（含），UTC 纪元毫秒',
+    end_ms            BIGINT       NOT NULL COMMENT '覆盖结束（不含），UTC 纪元毫秒；区间左闭右开，不限制时长与跨日',
+    status            VARCHAR(16)  NOT NULL COMMENT '状态：ACTIVE 生效中 / CANCELLED 已取消；创建即 ACTIVE，只能取消不可改写',
+    cancel_request_id VARCHAR(64)  NULL COMMENT '取消操作的幂等请求 ID；未取消时为 NULL',
+    cancelled_at_ms   BIGINT       NULL COMMENT '取消时间，UTC 纪元毫秒；未取消时为 NULL',
+    created_at_ms     BIGINT       NOT NULL COMMENT '创建时间，UTC 纪元毫秒',
+    PRIMARY KEY (override_key),
+    KEY idx_live_override_playout (channel_id, status, start_ms, end_ms)
+) COMMENT = '直播覆盖令表；不改写日草稿与发布快照，同频道 ACTIVE 区间不得重叠；覆盖时段内原编排不播出，结束后按原时间轴恢复';

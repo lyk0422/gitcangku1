@@ -107,9 +107,9 @@ public final class Dtos {
             long draftVersion) {
     }
 
-    /** 播出决定来源：EMERGENCY 命中紧急插播，PROGRAM 命中节目片段，FALLBACK 返回保底素材。 */
+    /** 播出决定来源：EMERGENCY 命中紧急插播，LIVE 命中直播覆盖令，PROGRAM 命中节目片段，FALLBACK 返回保底素材。 */
     public enum DecisionSource {
-        EMERGENCY, PROGRAM, FALLBACK
+        EMERGENCY, LIVE, PROGRAM, FALLBACK
     }
 
     /** 保底原因：无已发布编排 / 处于空档 / 覆盖片段的授权已撤销。 */
@@ -117,7 +117,7 @@ public final class Dtos {
         NO_PUBLISHED_SCHEDULE, GAP, GRANT_REVOKED
     }
 
-    /** 播出决定响应；source 为 FALLBACK 时 reason 非空；source 为 EMERGENCY 时 overrideKey 非空。 */
+    /** 播出决定响应；source 为 FALLBACK 时 reason 非空；source 为 EMERGENCY 或 LIVE 时 overrideKey 非空。 */
     public record PlayoutDecisionResponse(
             String channelId,
             OffsetDateTime at,
@@ -163,6 +163,43 @@ public final class Dtos {
             OffsetDateTime start,
             OffsetDateTime end,
             OverrideStatus status,
+            String cancelRequestId,
+            OffsetDateTime cancelledAt,
+            OffsetDateTime createdAt) {
+    }
+
+    /** 直播覆盖令状态：创建即 ACTIVE，取消后为 CANCELLED（终态），只能取消不可改写。 */
+    public enum LiveOverrideStatus {
+        ACTIVE, CANCELLED
+    }
+
+    /**
+     * 创建直播覆盖令请求。区间 [start, end) 左闭右开，end 必须大于 start，不限制时长与跨日；
+     * grantId 必须属于该频道与直播源素材、未撤销并完整覆盖区间。携带 requestId 幂等。
+     */
+    public record CreateLiveOverrideRequest(
+            @NotBlank String requestId,
+            @NotBlank String overrideKey,
+            @NotBlank String channelId,
+            @NotBlank String liveAssetId,
+            @NotNull @Positive Long grantId,
+            @NotNull OffsetDateTime start,
+            @NotNull OffsetDateTime end) {
+    }
+
+    /** 取消直播覆盖令请求（幂等）。 */
+    public record CancelLiveOverrideRequest(@NotBlank String requestId) {
+    }
+
+    /** 直播覆盖令明细响应，保留取消情况与原授权关联，不随授权撤销自动换绑。 */
+    public record LiveOverrideResponse(
+            String overrideKey,
+            String channelId,
+            String liveAssetId,
+            long grantId,
+            OffsetDateTime start,
+            OffsetDateTime end,
+            LiveOverrideStatus status,
             String cancelRequestId,
             OffsetDateTime cancelledAt,
             OffsetDateTime createdAt) {

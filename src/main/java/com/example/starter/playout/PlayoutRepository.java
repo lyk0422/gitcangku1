@@ -73,6 +73,16 @@ public class PlayoutRepository {
         }
     }
 
+    /** 直播覆盖令行；status 为 ACTIVE / CANCELLED，grantId 始终保留创建时指定的原授权关联。 */
+    public record LiveOverrideRow(String overrideKey, String channelId, String liveAssetId,
+                                  long grantId, long startMs, long endMs,
+                                  String status, String cancelRequestId, Long cancelledAtMs,
+                                  long createdAtMs) {
+        public boolean active() {
+            return "ACTIVE".equals(status);
+        }
+    }
+
     private static final RowMapper<AssetRow> ASSET_MAPPER = (rs, n) ->
             new AssetRow(rs.getString("id"), rs.getLong("duration_ms"));
 
@@ -110,6 +120,13 @@ public class PlayoutRepository {
                     rs.getString("asset_id"), rs.getLong("grant_id"), rs.getInt("priority"),
                     rs.getLong("start_ms"), rs.getLong("end_ms"),
                     rs.getDate("business_day").toLocalDate(), rs.getString("status"),
+                    rs.getString("cancel_request_id"),
+                    (Long) rs.getObject("cancelled_at_ms"), rs.getLong("created_at_ms"));
+
+    private static final RowMapper<LiveOverrideRow> LIVE_OVERRIDE_MAPPER = (rs, n) ->
+            new LiveOverrideRow(rs.getString("override_key"), rs.getString("channel_id"),
+                    rs.getString("live_asset_id"), rs.getLong("grant_id"),
+                    rs.getLong("start_ms"), rs.getLong("end_ms"), rs.getString("status"),
                     rs.getString("cancel_request_id"),
                     (Long) rs.getObject("cancelled_at_ms"), rs.getLong("created_at_ms"));
 
@@ -377,6 +394,75 @@ public class PlayoutRepository {
     /** 取消插播；返回受影响行数，0 表示不存在或已取消。 */
     public int cancelOverride(String overrideKey, String cancelRequestId, long cancelledAtMs) {
         return jdbc.update("UPDATE playout_emergency_override"
+                        + " SET status = 'CANCELLED', cancel_request_id = ?, cancelled_at_ms = ?"
+                        + " WHERE override_key = ? AND status = 'ACTIVE'",
+                cancelRequestId, cancelledAtMs, overrideKey);
+    }
+
+    // ---------- 直播覆盖令 ----------
+
+    public void insertLiveOverride(String overrideKey, String channelId, String liveAssetId,
+                                  long grantId, long startMs, long endMs, long createdAtMs) {
+        jdbc.update("INSERT INTO playout_live_override"
+                        + " (override_key, channel_id, live_asset_id, grant_id, start_ms, end_ms,"
+                        + "  status, created_at_ms)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', ?)",
+                overrideKey, channelId, liveAssetId, grantId, startMs, endMs, createdAtMs);
+    }
+
+    public Optional<LiveOverrideRow> findLiveOverride(String overrideKey) {
+        return jdbc.query("SELECT override_key, channel_id, live_asset_id, grant_id, start_ms,"
+                        + " end_ms, status, cancel_request_id, cancelled_at_ms, created_at_ms"
+                        + " FROM playout_live_override WHERE override_key = ?",
+                LIVE_OVERRIDE_MAPPER, overrideKey).stream().findFirst();
+    }
+
+    /** 按全局键查询并加行锁。 */
+    public Optional<LiveOverrideRow> findLiveOverrideForUpdate(String overrideKey) {
+        return jdbc.query("SELECT override_key, channel_id, live_asset_id, grant_id, start_ms,"
+                        + " end_ms, status, cancel_request_id, cancelled_at_ms, created_at_ms"
+                        + " FROM playout_live_override WHERE override_key = ? FOR UPDATE",
+                LIVE_OVERRIDE_MAPPER, overrideKey).stream().findFirst();
+    }
+
+    /**
+     * 同频道、状态 ACTIVE 且与 [startMs, endMs) 相交的直播覆盖令（区间左闭右开：相邻不算相交）。
+     * 须在持频道锁后调用，用于创建时的重叠冲突检测。
+     */
+    public List<LiveOverrideRow> findActiveOverlappingLiveOverridesForUpdate(String channelId,
+                                                                              long startMs, long endMs) {
+        return jdbc.query("SELECT override_key, channel_id, live_asset_id, grant_id, start_ms,"
+                        + " end_ms, status, cancel_request_id, cancelled_at_ms, created_at_ms"
+                        + " FROM playout_live_override"
+                        + " WHERE channel_id = ? AND status = 'ACTIVE'"
+                        + " AND start_ms < ? AND end_ms > ?"
+                        + " ORDER BY start_ms, override_key FOR UPDATE",
+                LIVE_OVERRIDE_MAPPER, channelId, endMs, startMs);
+    }
+
+    /** 命中某时刻的 ACTIVE 直播覆盖令（同频道同时刻至多一条，排序结果确定）。 */
+    public List<LiveOverrideRow> findActiveLiveOverridesAt(String channelId, long atMs) {
+        return jdbc.query("SELECT override_key, channel_id, live_asset_id, grant_id, start_ms,"
+                        + " end_ms, status, cancel_request_id, cancelled_at_ms, created_at_ms"
+                        + " FROM playout_live_override"
+                        + " WHERE channel_id = ? AND status = 'ACTIVE'"
+                        + " AND start_ms <= ? AND end_ms > ?"
+                        + " ORDER BY start_ms, override_key",
+                LIVE_OVERRIDE_MAPPER, channelId, atMs, atMs);
+    }
+
+    /** 频道全部直播覆盖令，按开始时间、键稳定排序。 */
+    public List<LiveOverrideRow> findLiveOverridesByChannel(String channelId) {
+        return jdbc.query("SELECT override_key, channel_id, live_asset_id, grant_id, start_ms,"
+                        + " end_ms, status, cancel_request_id, cancelled_at_ms, created_at_ms"
+                        + " FROM playout_live_override WHERE channel_id = ?"
+                        + " ORDER BY start_ms, override_key",
+                LIVE_OVERRIDE_MAPPER, channelId);
+    }
+
+    /** 取消直播覆盖令；返回受影响行数，0 表示不存在或已取消。 */
+    public int cancelLiveOverride(String overrideKey, String cancelRequestId, long cancelledAtMs) {
+        return jdbc.update("UPDATE playout_live_override"
                         + " SET status = 'CANCELLED', cancel_request_id = ?, cancelled_at_ms = ?"
                         + " WHERE override_key = ? AND status = 'ACTIVE'",
                 cancelRequestId, cancelledAtMs, overrideKey);

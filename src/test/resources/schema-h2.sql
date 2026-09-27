@@ -91,3 +91,18 @@ CREATE TABLE IF NOT EXISTS playout_emergency_override (
 );
 CREATE INDEX IF NOT EXISTS idx_override_playout
     ON playout_emergency_override (channel_id, status, start_ms, end_ms, priority);
+
+CREATE TABLE IF NOT EXISTS playout_live_override (
+    override_key      VARCHAR(64) NOT NULL PRIMARY KEY,
+    channel_id        VARCHAR(64) NOT NULL,
+    live_asset_id     VARCHAR(64) NOT NULL,
+    grant_id          BIGINT      NOT NULL,
+    start_ms          BIGINT      NOT NULL,
+    end_ms            BIGINT      NOT NULL,
+    status            VARCHAR(16) NOT NULL,
+    cancel_request_id VARCHAR(64) NULL,
+    cancelled_at_ms   BIGINT      NULL,
+    created_at_ms     BIGINT      NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_live_override_playout
+    ON playout_live_override (channel_id, status, start_ms, end_ms);
