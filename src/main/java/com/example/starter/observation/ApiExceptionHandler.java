@@ -21,8 +21,9 @@ public class ApiExceptionHandler {
     @ExceptionHandler(ApiException.class)
     public ResponseEntity<ErrorResponse> handleApiException(ApiException ex) {
         HttpStatus status = ex.status();
+        String reason = ex.reason() == null ? null : ex.reason().name();
         ErrorResponse body = new ErrorResponse(status.value(), status.getReasonPhrase(),
-                ex.getMessage(), ex.conflictFields(), ex.currentVersion());
+                ex.getMessage(), ex.conflictFields(), ex.currentVersion(), reason);
         return ResponseEntity.status(status).body(body);
     }
 
