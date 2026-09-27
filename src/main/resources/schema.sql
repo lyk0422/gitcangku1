@@ -50,9 +50,13 @@ CREATE TABLE IF NOT EXISTS review (
     route_id          VARCHAR(64) NOT NULL COMMENT '被审核航线标识',
     route_version     INT NOT NULL COMMENT '审核明确指定的航线版本',
     airspace_version  BIGINT NOT NULL COMMENT '审核明确指定的空域版本',
-    conclusion        VARCHAR(16) NOT NULL COMMENT '保存时的原结论：CLEAR 通过或 BLOCKED 命中，永不改变',
+    conclusion        VARCHAR(16) NOT NULL COMMENT '保存时的原结论：CLEAR 通过、BLOCKED 命中或 WEATHER_BLOCKED 气象不满足，永不改变',
     hit_zone_ids      CLOB NOT NULL COMMENT '命中的全部 zoneId，字典序去重后逗号拼接；未命中为空串',
     points_snapshot   VARCHAR(4000) NOT NULL COMMENT '审核时航点不可变快照，格式 x,y;x,y',
+    forecast_version  BIGINT NULL COMMENT '审核时固化的预测气象版本；NULL 表示未提交预测（不做气象检查）',
+    standards_version BIGINT NULL COMMENT '审核时固化的气象最低标准版本；NULL 表示未做气象检查',
+    weather_snapshot  CLOB NULL COMMENT '审核时固化的气象标准与预测快照（JSON）；NULL 表示未做气象检查',
+    weather_violations CLOB NULL COMMENT '审核时固化的气象不达标明细（JSON，含实际值/要求值/差额）；NULL 表示未做气象检查',
     request_id        VARCHAR(64) NOT NULL COMMENT '提交审核的写操作请求标识',
     created_at        BIGINT NOT NULL COMMENT '创建时间，epoch 毫秒（UTC）'
 ) COMMENT = '审核不可变结果';
@@ -62,8 +66,53 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_review_request ON review (request_id);
 -- 写操作幂等去重：同键同参重放原结果，异参冲突；失败不占键
 CREATE TABLE IF NOT EXISTS request_dedup (
     request_id     VARCHAR(64) PRIMARY KEY COMMENT '写操作全局唯一请求标识',
-    request_kind   VARCHAR(32) NOT NULL COMMENT '请求类型：ZONE_CREATE/ZONE_REVOKE/ROUTE_CREATE/ROUTE_REPLACE/REVIEW',
+    request_kind   VARCHAR(32) NOT NULL COMMENT '请求类型：ZONE_CREATE/ZONE_REVOKE/ROUTE_CREATE/ROUTE_REPLACE/REVIEW/REVIEW_BATCH/WEATHER_MINIMA_SET/WEATHER_FORECAST_UPLOAD/OCCUPATION_CREATE',
     request_hash   VARCHAR(64) NOT NULL COMMENT '规范化参数的 SHA-256 十六进制摘要，用于同键异参冲突判定',
     response_json  CLOB NOT NULL COMMENT '首次成功响应 JSON，重放时原样返回',
     created_at     BIGINT NOT NULL COMMENT '首次成功时间，epoch 毫秒（UTC）'
 ) COMMENT = '写操作幂等去重记录（与业务变更同事务原子提交）';
+
+-- 气象元数据（单行）：标准版本与预测版本各自单调递增
+CREATE TABLE IF NOT EXISTS weather_meta (
+    id                INT PRIMARY KEY COMMENT '固定为 1 的单行主键',
+    standards_version BIGINT NOT NULL COMMENT '当前气象最低标准版本，初始 0；每次标准配置整体替换后加一',
+    forecast_version  BIGINT NOT NULL COMMENT '当前预测气象版本，初始 0；每次预测上传后加一'
+) COMMENT = '气象标准与预测版本元数据';
+
+-- 区域气象最低标准（当前生效集合；按 zone 整体替换，旧集合不保留——审核快照已固化证据）
+-- 时段为 UTC epoch 毫秒，左闭右开 [effective_from, effective_to)；同一区域内时段不得重叠
+CREATE TABLE IF NOT EXISTS weather_minima (
+    zone_id          VARCHAR(64) NOT NULL COMMENT '所属区域标识',
+    effective_from   BIGINT NOT NULL COMMENT '时段起点（含），epoch 毫秒（UTC）',
+    effective_to     BIGINT NOT NULL COMMENT '时段终点（不含），epoch 毫秒（UTC），必须大于起点',
+    min_visibility_m INT NOT NULL COMMENT '能见度最低标准，单位米，必须 >= 0',
+    min_cloud_base_m INT NOT NULL COMMENT '云底最低标准，单位米，必须 >= 0',
+    standards_version BIGINT NOT NULL COMMENT '本行写入时生效的气象标准版本',
+    PRIMARY KEY (zone_id, effective_from)
+) COMMENT = '区域气象最低标准（按 UTC 时段生效，左闭右开）';
+
+-- 预测气象：按版本整体上传，版本内记录不可变；时段左闭右开
+CREATE TABLE IF NOT EXISTS weather_forecast (
+    forecast_version BIGINT NOT NULL COMMENT '所属预测气象版本',
+    zone_id          VARCHAR(64) NOT NULL COMMENT '预测区域标识',
+    valid_from       BIGINT NOT NULL COMMENT '预测时段起点（含），epoch 毫秒（UTC）',
+    valid_to         BIGINT NOT NULL COMMENT '预测时段终点（不含），epoch 毫秒（UTC），必须大于起点',
+    visibility_m     INT NOT NULL COMMENT '预测能见度，单位米，必须 >= 0',
+    cloud_base_m     INT NOT NULL COMMENT '预测云底，单位米，必须 >= 0',
+    PRIMARY KEY (forecast_version, zone_id, valid_from)
+) COMMENT = '预测气象（按版本不可变，时段左闭右开）';
+
+-- 占用：仅允许引用未失效的 CLEAR 审核结果创建，固化审核时的全部版本
+CREATE TABLE IF NOT EXISTS occupation (
+    occupation_id     VARCHAR(64) PRIMARY KEY COMMENT '占用记录唯一标识（不可变）',
+    review_id         VARCHAR(64) NOT NULL COMMENT '所依据的审核记录标识',
+    route_id          VARCHAR(64) NOT NULL COMMENT '占用航线标识',
+    route_version     INT NOT NULL COMMENT '审核时固化的航线版本',
+    airspace_version  BIGINT NOT NULL COMMENT '审核时固化的空域版本',
+    forecast_version  BIGINT NULL COMMENT '审核时固化的预测气象版本；NULL 表示审核未做气象检查',
+    standards_version BIGINT NULL COMMENT '审核时固化的气象标准版本；NULL 表示审核未做气象检查',
+    request_id        VARCHAR(64) NOT NULL COMMENT '创建占用的写操作请求标识',
+    created_at        BIGINT NOT NULL COMMENT '创建时间，epoch 毫秒（UTC）'
+) COMMENT = '航线占用（基于未失效的 CLEAR 审核结果创建，不可变）';
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_occupation_request ON occupation (request_id);
