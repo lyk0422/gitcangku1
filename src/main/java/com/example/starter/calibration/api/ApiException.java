@@ -44,4 +44,14 @@ public class ApiException extends RuntimeException {
     public static ApiException unprocessable(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "NO_MATCHING_CERTIFICATE", message);
     }
+
+    /** 422：携带业务错误码的不可处理请求（如存在未裁决离群值阻断放行）。 */
+    public static ApiException unprocessable(String code, String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, code, message);
+    }
+
+    /** 410：引用的测量修订版本或证书版本已失效（复核标记为 STALE）。 */
+    public static ApiException gone(String code, String message) {
+        return new ApiException(HttpStatus.GONE, code, message);
+    }
 }
