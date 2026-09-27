@@ -12,6 +12,7 @@ import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
 import java.time.LocalDateTime;
+import java.time.ZoneOffset;
 import java.util.stream.Collectors;
 
 /**
@@ -25,7 +26,7 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(ApiException.class)
     public ResponseEntity<ErrorBody> handleApi(ApiException ex) {
         return ResponseEntity.status(ex.status())
-                .body(new ErrorBody(ex.status().value(), ex.getMessage(), LocalDateTime.now()));
+                .body(new ErrorBody(ex.status().value(), ex.getMessage(), LocalDateTime.now(ZoneOffset.UTC)));
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
@@ -35,13 +36,13 @@ public class GlobalExceptionHandler {
                 .distinct()
                 .collect(Collectors.joining(", ", "参数非法: ", ""));
         return ResponseEntity.badRequest()
-                .body(new ErrorBody(400, message, LocalDateTime.now()));
+                .body(new ErrorBody(400, message, LocalDateTime.now(ZoneOffset.UTC)));
     }
 
     @ExceptionHandler({MissingRequestHeaderException.class, HttpMessageNotReadableException.class})
     public ResponseEntity<ErrorBody> handleBadRequest(Exception ex) {
         return ResponseEntity.badRequest()
-                .body(new ErrorBody(400, "参数非法: " + ex.getMessage(), LocalDateTime.now()));
+                .body(new ErrorBody(400, "参数非法: " + ex.getMessage(), LocalDateTime.now(ZoneOffset.UTC)));
     }
 
     @ExceptionHandler(Exception.class)
@@ -56,7 +57,7 @@ public class GlobalExceptionHandler {
      *
      * @param status    HTTP 状态码
      * @param message   错误描述
-     * @param timestamp 发生时间（Asia/Shanghai）
+     * @param timestamp 发生时间（UTC）
      */
     public record ErrorBody(int status, String message, LocalDateTime timestamp) {
     }

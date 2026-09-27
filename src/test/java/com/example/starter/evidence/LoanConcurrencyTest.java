@@ -60,7 +60,7 @@ class LoanConcurrencyTest {
     private void intake(String actor, String evidenceKey) {
         ResponseEntity<String> response = controller.intake(actor,
                 new com.example.starter.evidence.dto.IntakeRequest(
-                        uniqueKey("CMD"), evidenceKey, "CASE-1", "DOCUMENT", "SEAL-1"));
+                        uniqueKey("CMD"), evidenceKey, "CASE-1", "DOCUMENT", "SEAL-1", null));
         assertThat(response.getStatusCode().value()).isEqualTo(201);
     }
 

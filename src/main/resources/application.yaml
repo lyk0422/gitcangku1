@@ -14,7 +14,7 @@ spring:
       connection-timeout: 10000
       validation-timeout: 3000
   jackson:
-    time-zone: Asia/Shanghai
+    time-zone: UTC
   sql:
     init:
       mode: always

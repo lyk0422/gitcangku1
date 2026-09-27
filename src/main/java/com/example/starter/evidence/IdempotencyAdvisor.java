@@ -37,12 +37,34 @@ public class IdempotencyAdvisor {
                     actorId == null ? "" : actorId,
                     evidenceKey == null ? "" : evidenceKey,
                     objectMapper.writeValueAsString(request));
+            return sha256(canonical);
+        } catch (Exception e) {
+            throw new IllegalStateException("请求序列化失败", e);
+        }
+    }
+
+    /**
+     * 计算已规范化负载的请求指纹：操作类型 + 操作人 + 规范化 JSON 的 SHA-256。
+     * 调用方须保证负载内集合（如证物列表）已规范化排序。
+     */
+    public String hashPayload(String operation, String actorId, Object canonicalPayload) {
+        try {
+            String canonical = String.join("\n",
+                    operation,
+                    actorId == null ? "" : actorId,
+                    objectMapper.writeValueAsString(canonicalPayload));
+            return sha256(canonical);
+        } catch (Exception e) {
+            throw new IllegalStateException("请求序列化失败", e);
+        }
+    }
+
+    private static String sha256(String canonical) {
+        try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             return HexFormat.of().formatHex(digest.digest(canonical.getBytes(StandardCharsets.UTF_8)));
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException("SHA-256 不可用", e);
-        } catch (Exception e) {
-            throw new IllegalStateException("请求序列化失败", e);
         }
     }
 

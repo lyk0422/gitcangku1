@@ -40,7 +40,7 @@ class EvidenceConcurrencyTest {
 
     private void intake(String actor, String evidenceKey) {
         ResponseEntity<String> response = controller.intake(actor,
-                new IntakeRequest(uniqueKey("CMD"), evidenceKey, "CASE-1", "DOCUMENT", "SEAL-1"));
+                new IntakeRequest(uniqueKey("CMD"), evidenceKey, "CASE-1", "DOCUMENT", "SEAL-1", null));
         assertThat(response.getStatusCode().value()).isEqualTo(201);
     }
 
@@ -153,7 +153,7 @@ class EvidenceConcurrencyTest {
     void concurrentDuplicateIntakeWithSameCommandKeyReplaysSingleResult() throws Exception {
         String evidenceKey = uniqueKey("EV");
         String commandKey = uniqueKey("CMD");
-        IntakeRequest request = new IntakeRequest(commandKey, evidenceKey, "CASE-1", "DOCUMENT", "SEAL-1");
+        IntakeRequest request = new IntakeRequest(commandKey, evidenceKey, "CASE-1", "DOCUMENT", "SEAL-1", null);
 
         List<Integer> statuses = runConcurrently(
                 () -> controller.intake("alice", request),
