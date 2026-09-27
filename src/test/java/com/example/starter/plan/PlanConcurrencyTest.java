@@ -57,7 +57,7 @@ class PlanConcurrencyTest {
         List<Outcome> outcomes = runConcurrently(scheduleKeys.stream()
                 .<Callable<Outcome>>map(sk -> () -> {
                     try {
-                        service.publish(sk, key("REQ"));
+                        service.publish(sk, key("REQ"), null);
                         return Outcome.OK;
                     } catch (ApiException e) {
                         assertThat(e.status()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
@@ -85,7 +85,7 @@ class PlanConcurrencyTest {
         List<Callable<PlanResponse>> tasks = new ArrayList<>();
         for (int i = 0; i < threads; i++) {
             tasks.add(() -> service.createDraft(new CreatePlanRequest(
-                    requestKey, scheduleKey, DAY, occupancies)));
+                    requestKey, scheduleKey, DAY, occupancies, null)));
         }
         ExecutorService pool = Executors.newFixedThreadPool(threads);
         CountDownLatch ready = new CountDownLatch(threads);
@@ -122,7 +122,7 @@ class PlanConcurrencyTest {
                 () -> {
                     try {
                         service.replaceOccupancies(scheduleKey, new UpdateOccupanciesRequest(
-                                key("REQ"), 1, List.of(occ(section, 10, 11))));
+                                key("REQ"), 1, List.of(occ(section, 10, 11)), null));
                         return Outcome.OK;
                     } catch (ApiException e) {
                         // 发布先提交时更新应得 409 状态冲突
@@ -131,7 +131,7 @@ class PlanConcurrencyTest {
                     }
                 },
                 () -> {
-                    service.publish(scheduleKey, key("REQ"));
+                    service.publish(scheduleKey, key("REQ"), null);
                     return Outcome.OK;
                 }));
 
@@ -154,21 +154,21 @@ class PlanConcurrencyTest {
         String planB = key("SCH");
         createDraft(planA, section, 8, 9);
         createDraft(planB, section, 9, 10);
-        service.publish(planA, key("REQ"));
-        service.publish(planB, key("REQ"));
+        service.publish(planA, key("REQ"), null);
+        service.publish(planB, key("REQ"), null);
 
-        service.cancel(planA, key("REQ"));
+        service.cancel(planA, key("REQ"), null);
 
         // A 的时隙释放：新计划可占用 08:00-09:00
         String intoA = key("SCH");
         createDraft(intoA, section, 8, 9);
-        service.publish(intoA, key("REQ"));
+        service.publish(intoA, key("REQ"), null);
 
         // B 的时隙不受影响：09:30-10:30 与 B 冲突，必须 422
         String intoB = key("SCH");
         createDraft(intoB, section, 9, 10);
         try {
-            service.publish(intoB, key("REQ"));
+            service.publish(intoB, key("REQ"), null);
             org.assertj.core.api.Assertions.fail("应抛出 422 时隙冲突");
         } catch (ApiException e) {
             assertThat(e.status()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
@@ -186,7 +186,7 @@ class PlanConcurrencyTest {
 
     private void createDraft(String scheduleKey, String section, int startHour, int endHour) {
         service.createDraft(new CreatePlanRequest(key("REQ"), scheduleKey, DAY,
-                List.of(occ(section, startHour, endHour))));
+                List.of(occ(section, startHour, endHour)), null));
     }
 
     private List<Outcome> runConcurrently(List<Callable<Outcome>> tasks) throws Exception {

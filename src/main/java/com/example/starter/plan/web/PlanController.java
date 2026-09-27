@@ -1,6 +1,8 @@
 package com.example.starter.plan.web;
 
 import com.example.starter.plan.service.PlanService;
+import com.example.starter.plan.web.dto.BatchRescheduleRequest;
+import com.example.starter.plan.web.dto.BatchRescheduleResponse;
 import com.example.starter.plan.web.dto.CreatePlanRequest;
 import com.example.starter.plan.web.dto.PlanActionRequest;
 import com.example.starter.plan.web.dto.PlanResponse;
@@ -61,21 +63,21 @@ public class PlanController {
     }
 
     /**
-     * 发布计划，原子校验时隙冲突。
+     * 发布计划，原子校验时隙冲突与危险品编组隔离/区段通行，成功后固化发布快照。
      */
     @PostMapping("/plans/{scheduleKey}/publish")
     public PlanResponse publish(@PathVariable String scheduleKey,
                                 @Valid @RequestBody PlanActionRequest request) {
-        return service.publish(scheduleKey, request.requestKey());
+        return service.publish(scheduleKey, request.requestKey(), request.operator());
     }
 
     /**
-     * 取消已发布计划，时隙立即释放，历史保留。
+     * 取消已发布计划，时隙立即释放，历史与发布快照保留。
      */
     @PostMapping("/plans/{scheduleKey}/cancel")
     public PlanResponse cancel(@PathVariable String scheduleKey,
                                @Valid @RequestBody PlanActionRequest request) {
-        return service.cancel(scheduleKey, request.requestKey());
+        return service.cancel(scheduleKey, request.requestKey(), request.operator());
     }
 
     /**
@@ -86,6 +88,16 @@ public class PlanController {
     public RescheduleResponse reschedule(@PathVariable String scheduleKey,
                                          @Valid @RequestBody RescheduleRequest request) {
         return service.reschedule(scheduleKey, request);
+    }
+
+    /**
+     * 批量原子改签：整批先校验完整最终状态，任一计划非法则整批不改变时隙或编组；
+     * 全部通过后在同一事务提交。
+     */
+    @PostMapping("/plans/batch-reschedule")
+    public BatchRescheduleResponse batchReschedule(
+            @Valid @RequestBody BatchRescheduleRequest request) {
+        return service.batchReschedule(request);
     }
 
     /**
