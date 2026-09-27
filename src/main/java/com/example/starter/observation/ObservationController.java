@@ -60,6 +60,16 @@ public class ObservationController {
     }
 
     /**
+     * 墓碑恢复：expectedVersion 匹配当前墓碑版本时以删除前最后有效内容生成新版本恢复。
+     */
+    @PostMapping("/{observationId}/restore")
+    public ResponseEntity<ObservationResponse> restore(@PathVariable String observationId,
+                                                       @Valid @RequestBody RestoreObservationRequest request) {
+        ObservationService.WriteOutcome outcome = observationService.restore(observationId, request);
+        return ResponseEntity.status(outcome.status()).body(outcome.body());
+    }
+
+    /**
      * 查询当前内容；墓碑只返回删除状态和版本。
      */
     @GetMapping("/{observationId}")

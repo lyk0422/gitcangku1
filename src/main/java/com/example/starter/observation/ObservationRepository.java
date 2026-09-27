@@ -61,6 +61,18 @@ public class ObservationRepository {
     }
 
     /**
+     * 读取删除前最后一个有效（非墓碑）历史版本快照；无有效版本时返回空。供墓碑恢复使用。
+     */
+    public Optional<ObservationSnapshot> findLatestLiveVersion(String observationId) {
+        return jdbcTemplate.query(
+                        "SELECT observation_id, version, location, reading, note, deleted "
+                                + "FROM observation_version WHERE observation_id = ? AND deleted = FALSE "
+                                + "ORDER BY version DESC LIMIT 1",
+                        SNAPSHOT_MAPPER, observationId)
+                .stream().findFirst();
+    }
+
+    /**
      * 插入新记录的当前状态（version = 1）。
      */
     public void insertCurrent(ObservationSnapshot snapshot) {

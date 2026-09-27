@@ -50,17 +50,20 @@ public class ObservationService {
     private final ObservationRepository observationRepository;
     private final RequestLogRepository requestLogRepository;
     private final ResolutionRepository resolutionRepository;
+    private final EvidenceFreezer evidenceFreezer;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public ObservationService(ObservationRepository observationRepository,
                               RequestLogRepository requestLogRepository,
                               ResolutionRepository resolutionRepository,
+                              EvidenceFreezer evidenceFreezer,
                               ObjectMapper objectMapper,
                               Clock clock) {
         this.observationRepository = observationRepository;
         this.requestLogRepository = requestLogRepository;
         this.resolutionRepository = resolutionRepository;
+        this.evidenceFreezer = evidenceFreezer;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -93,6 +96,7 @@ public class ObservationService {
             throw ApiException.conflict("observation already exists: " + request.observationId(), null);
         }
         observationRepository.insertVersion(snapshot);
+        evidenceFreezer.freezeForVersion(snapshot.observationId(), snapshot.version());
         return complete(request.requestId(), HttpStatus.CREATED, ObservationResponse.of(snapshot));
     }
 
@@ -141,6 +145,7 @@ public class ObservationService {
                 mergedLocation, mergedReading, mergedNote, false);
         observationRepository.updateCurrent(next);
         observationRepository.insertVersion(next);
+        evidenceFreezer.freezeForVersion(observationId, next.version());
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(next));
     }
 
@@ -171,7 +176,44 @@ public class ObservationService {
                 null, null, null, true);
         observationRepository.markDeleted(observationId, tombstone.version());
         observationRepository.insertVersion(tombstone);
+        evidenceFreezer.freezeForVersion(observationId, tombstone.version());
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(tombstone));
+    }
+
+    /**
+     * 墓碑恢复：expectedVersion 匹配当前墓碑版本时，以删除前最后一个有效版本内容生成新版本恢复观测。
+     * 恢复后版本号继续单调递增；证据固化按恢复提交时刻的最新有效脱敏版本重新固化，不回写历史。
+     * 观测不存在返回 404；当前非墓碑返回 422；版本不匹配返回 409。
+     */
+    @Transactional
+    public WriteOutcome restore(String observationId, RestoreObservationRequest request) {
+        String fingerprint = fingerprint("RESTORE", observationId, String.valueOf(request.expectedVersion()));
+        WriteOutcome replayed = checkReplay(request.requestId(), fingerprint);
+        if (replayed != null) {
+            return replayed;
+        }
+        WriteOutcome concurrent = insertPlaceholder(request.requestId(), fingerprint, "RESTORE");
+        if (concurrent != null) {
+            return concurrent;
+        }
+
+        ObservationSnapshot current = observationRepository.findCurrentForUpdate(observationId)
+                .orElseThrow(() -> ApiException.notFound("observation not found: " + observationId));
+        if (!current.deleted()) {
+            throw ApiException.unprocessable("observation is not deleted: " + observationId);
+        }
+        if (request.expectedVersion() != current.version()) {
+            throw ApiException.conflict("expectedVersion mismatch", current.version());
+        }
+        ObservationSnapshot lastLive = observationRepository.findLatestLiveVersion(observationId)
+                .orElseThrow(() -> ApiException.unprocessable(
+                        "no live version to restore: " + observationId));
+        ObservationSnapshot restored = new ObservationSnapshot(observationId, current.version() + 1,
+                lastLive.location(), lastLive.reading(), lastLive.note(), false);
+        observationRepository.updateCurrent(restored);
+        observationRepository.insertVersion(restored);
+        evidenceFreezer.freezeForVersion(observationId, restored.version());
+        return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(restored));
     }
 
     /**
@@ -182,6 +224,14 @@ public class ObservationService {
         ObservationSnapshot current = observationRepository.findCurrent(observationId)
                 .orElseThrow(() -> ApiException.notFound("observation not found: " + observationId));
         return ObservationResponse.of(current);
+    }
+
+    /**
+     * 判断观测记录当前行是否已存在（含墓碑）；仅供本地演示数据初始化做幂等判断，不参与业务接口。
+     */
+    @Transactional(readOnly = true)
+    public boolean safeExists(String observationId) {
+        return observationRepository.findCurrent(observationId).isPresent();
     }
 
     /**
@@ -261,6 +311,7 @@ public class ObservationService {
                     resolvedLocation, resolvedReading, resolvedNote, false);
             observationRepository.updateCurrent(next);
             observationRepository.insertVersion(next);
+            evidenceFreezer.freezeForVersion(observationId, newVersion);
         }
 
         ResolutionRecord record = new ResolutionRecord(
