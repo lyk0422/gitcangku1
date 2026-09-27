@@ -45,9 +45,16 @@ class ConsentApiTest {
 
     @BeforeEach
     void cleanTables() {
+        jdbc.update("DELETE FROM query_snapshot_item");
+        jdbc.update("DELETE FROM query_snapshot");
+        jdbc.update("DELETE FROM legal_hold");
+        jdbc.update("DELETE FROM erasure_request");
+        jdbc.update("DELETE FROM residency_migration_item");
+        jdbc.update("DELETE FROM residency_migration");
         jdbc.update("DELETE FROM consent_record");
         jdbc.update("DELETE FROM consent_grant");
         jdbc.update("DELETE FROM idempotency_request");
+        // DEFAULT 预置区域由启动种子幂等登记，跨用例保留，不删除
     }
 
     private ResultActions grant(String requestId, String subjectKey, String purpose) throws Exception {
@@ -382,7 +389,7 @@ class ConsentApiTest {
                 ready.countDown();
                 start.await();
                 return consentService.write(new RecordWriteRequest(
-                        requestId, "subj-a", Purpose.RESEARCH, "rec-1", "same-payload")).payload();
+                        requestId, "subj-a", Purpose.RESEARCH, "rec-1", "same-payload", null)).payload();
             });
         }
         List<Future<String>> futures = new ArrayList<>();
@@ -412,7 +419,8 @@ class ConsentApiTest {
                 ready.countDown();
                 start.await();
                 return consentService.grant(
-                        new com.example.starter.consent.dto.GrantRequest(requestId, "subj-c", Purpose.RESEARCH)).epoch();
+                        new com.example.starter.consent.dto.GrantRequest(
+                                requestId, "subj-c", Purpose.RESEARCH, null)).epoch();
             });
         }
         List<Future<Integer>> futures = new ArrayList<>();
