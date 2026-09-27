@@ -1,30 +1,49 @@
 package com.example.starter.race.service;
 
 import com.example.starter.race.api.AddPenaltyRequest;
+import com.example.starter.race.api.ApproveReclassRequest;
+import com.example.starter.race.api.CategoryResponse;
+import com.example.starter.race.api.CategoryStandingResponse;
 import com.example.starter.race.api.CheckpointResponse;
 import com.example.starter.race.api.CheckpointsConfigResponse;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
+import com.example.starter.race.api.CreateCategoryRequest;
 import com.example.starter.race.api.CreateRaceRequest;
 import com.example.starter.race.api.MissingCheckpointsResponse;
 import com.example.starter.race.api.RaceResponse;
+import com.example.starter.race.api.ReclassApplicationResponse;
+import com.example.starter.race.api.ReclassApprovalResponse;
+import com.example.starter.race.api.ReclassRecordResponse;
 import com.example.starter.race.api.RegisterRunnerRequest;
+import com.example.starter.race.api.RejectReclassRequest;
+import com.example.starter.race.api.ResultEntryResponse;
 import com.example.starter.race.api.ReviseTimeRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
 import com.example.starter.race.api.RunnerMissingCheckpointsResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
+import com.example.starter.race.api.SealCategoryRequest;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
+import com.example.starter.race.api.SubmitReclassApplicationRequest;
 import com.example.starter.race.api.SubmitTimingRequest;
+import com.example.starter.race.api.WithdrawRunnerRequest;
 import com.example.starter.race.domain.CheckpointRules;
+import com.example.starter.race.domain.CategoryStatus;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
+import com.example.starter.race.domain.RunnerStatus;
+import com.example.starter.race.persistence.CategoryRow;
+import com.example.starter.race.persistence.CategorySnapshotEntryRow;
+import com.example.starter.race.persistence.CategorySnapshotRow;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
 import com.example.starter.race.persistence.IdempotencyRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
+import com.example.starter.race.persistence.ReclassRecordRow;
+import com.example.starter.race.persistence.ReclassRequestRow;
 import com.example.starter.race.persistence.RunnerRow;
 import com.example.starter.race.persistence.SnapshotCheckpointRow;
 import com.example.starter.race.persistence.SnapshotEntryRow;
@@ -41,11 +60,15 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.function.Supplier;
 
 /**
@@ -112,10 +135,26 @@ public class RaceServiceImpl implements RaceService {
                     RaceRow race = requireOpenRace(raceId, request.expectedVersion());
                     Long finishTimeMs = request.finishTimeMs();
                     validateFinishTime(finishTimeMs, true);
+                    String categoryCode = request.categoryCode();
+                    if (categoryCode != null) {
+                        CategoryRow category = repository.findCategory(raceId, categoryCode)
+                                .orElseThrow(() -> new UnprocessableEntityException(
+                                        "目标组别不存在: " + categoryCode));
+                        if (category.status() == CategoryStatus.SEALED) {
+                            throw new UnprocessableEntityException(
+                                    "目标组别已封榜: " + categoryCode);
+                        }
+                        if (category.capacity() != null
+                                && repository.countActiveRunnersInCategory(raceId, categoryCode)
+                                        >= category.capacity()) {
+                            throw new UnprocessableEntityException(
+                                    "目标组别容量已满: " + categoryCode);
+                        }
+                    }
                     long now = clock.millis();
                     bumpVersion(race, request.expectedVersion());
                     try {
-                        repository.insertRunner(raceId, request.bib(), finishTimeMs, now);
+                        repository.insertRunner(raceId, request.bib(), categoryCode, finishTimeMs, now);
                     } catch (DuplicateKeyException ex) {
                         throw new ConflictException("参赛号已存在: " + request.bib());
                     }
@@ -369,12 +408,18 @@ public class RaceServiceImpl implements RaceService {
                         throw new ConflictException("版本冲突或赛事已封榜");
                     }
                     long now = clock.millis();
+                    // 封榜仅固化提交时刻选手所属组别；历史快照不随后续重分追溯重写。
+                    Map<String, String> categoryByBib = new TreeMap<>();
+                    for (RunnerRow runner : runners) {
+                        categoryByBib.put(runner.bib(), runner.categoryCode());
+                    }
                     List<SnapshotEntryRow> snapshotEntries = new ArrayList<>(entries.size());
                     for (int order = 0; order < entries.size(); order++) {
                         ResultEntry entry = entries.get(order);
                         snapshotEntries.add(new SnapshotEntryRow(
                                 raceId,
                                 entry.bib(),
+                                categoryByBib.get(entry.bib()),
                                 entry.rank(),
                                 entry.status(),
                                 entry.finishTimeMs(),
@@ -723,5 +768,468 @@ public class RaceServiceImpl implements RaceService {
         String message = cause.getMessage();
         return message != null
                 && message.toUpperCase(java.util.Locale.ROOT).contains(constraintName.toUpperCase(java.util.Locale.ROOT));
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult createCategory(String raceId, CreateCategoryRequest request) {
+        return withIdempotency(request.requestId(), "CREATE_CATEGORY",
+                orderedParams(
+                        "raceId", raceId,
+                        "categoryCode", request.categoryCode(),
+                        "capacity", request.capacity(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    if (request.capacity() != null && request.capacity() < 1) {
+                        throw new BadRequestException("组别容量必须为正整数");
+                    }
+                    long now = clock.millis();
+                    bumpVersion(race, request.expectedVersion());
+                    try {
+                        repository.insertCategory(
+                                raceId, request.categoryCode(), request.capacity(), now);
+                    } catch (DuplicateKeyException ex) {
+                        throw new ConflictException("组别已存在: " + request.categoryCode());
+                    }
+                    CategoryRow category =
+                            repository.findCategory(raceId, request.categoryCode()).orElseThrow();
+                    return ServiceResult.created(ResponseMapper.toCategoryResponse(category, 0));
+                });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult withdrawRunner(String raceId, String bib, WithdrawRunnerRequest request) {
+        return withIdempotency(request.requestId(), "WITHDRAW_RUNNER",
+                orderedParams(
+                        "raceId", raceId,
+                        "bib", bib,
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    RunnerRow runner = requireRunner(raceId, bib);
+                    if (runner.status() == RunnerStatus.WITHDRAWN) {
+                        throw new ConflictException("选手已退赛: " + bib);
+                    }
+                    long now = clock.millis();
+                    bumpVersion(race, request.expectedVersion());
+                    int updated = repository.withdrawRunnerIfActive(raceId, bib, now);
+                    if (updated == 0) {
+                        throw new ConflictException("选手已退赛: " + bib);
+                    }
+                    RunnerRow refreshed = repository.findRunner(raceId, bib).orElseThrow();
+                    return ServiceResult.ok(ResponseMapper.toRunnerResponse(refreshed));
+                });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult submitReclassApplication(
+            String raceId, SubmitReclassApplicationRequest request) {
+        return withIdempotency(request.requestId(), "SUBMIT_RECLASS",
+                orderedParams(
+                        "raceId", raceId,
+                        "applicationId", request.applicationId(),
+                        "bib", request.bib(),
+                        "targetCategory", request.targetCategory(),
+                        "reason", request.reason(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    RunnerRow runner = requireRunner(raceId, request.bib());
+                    if (runner.status() == RunnerStatus.WITHDRAWN) {
+                        throw new ConflictException("选手已退赛，不能申请组别重分: " + request.bib());
+                    }
+                    CategoryRow target = repository.findCategory(raceId, request.targetCategory())
+                            .orElseThrow(() -> new UnprocessableEntityException(
+                                    "目标组别不存在: " + request.targetCategory()));
+                    if (target.status() == CategoryStatus.SEALED) {
+                        throw new UnprocessableEntityException(
+                                "目标组别已封榜: " + request.targetCategory());
+                    }
+                    if (request.targetCategory().equals(runner.categoryCode())) {
+                        throw new UnprocessableEntityException(
+                                "目标组别与当前组别相同: " + request.targetCategory());
+                    }
+                    if (repository.countPendingReclassRequests(raceId, request.bib()) > 0) {
+                        throw new ConflictException("选手已存在待审批的重分申请: " + request.bib());
+                    }
+                    long now = clock.millis();
+                    bumpVersion(race, request.expectedVersion());
+                    ReclassRequestRow row = new ReclassRequestRow(
+                            request.applicationId(), raceId, request.bib(),
+                            request.targetCategory(), request.reason(), request.expectedVersion(),
+                            ReclassRequestRow.ReclassRequestStatus.PENDING, null, now, null);
+                    try {
+                        repository.insertReclassRequest(row);
+                    } catch (DuplicateKeyException ex) {
+                        throw new ConflictException("申请ID已存在: " + request.applicationId());
+                    }
+                    ReclassRequestRow saved =
+                            repository.findReclassRequest(request.applicationId()).orElseThrow();
+                    return ServiceResult.created(ResponseMapper.toReclassApplicationResponse(saved));
+                });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult rejectReclassApplication(
+            String raceId, String applicationId, RejectReclassRequest request) {
+        return withIdempotency(request.requestId(), "REJECT_RECLASS",
+                orderedParams(
+                        "raceId", raceId,
+                        "applicationId", applicationId,
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    ReclassRequestRow application = requireReclassRequest(raceId, applicationId);
+                    if (application.status() != ReclassRequestRow.ReclassRequestStatus.PENDING) {
+                        throw new ConflictException("申请已审批，不能拒绝: " + applicationId);
+                    }
+                    long now = clock.millis();
+                    bumpVersion(race, request.expectedVersion());
+                    // 仅状态迁移，不触碰任何成绩数据。
+                    int updated = repository.decideReclassRequestIfPending(
+                            applicationId, ReclassRequestRow.ReclassRequestStatus.REJECTED,
+                            null, now);
+                    if (updated == 0) {
+                        throw new ConflictException("申请已审批，不能拒绝: " + applicationId);
+                    }
+                    ReclassRequestRow refreshed =
+                            repository.findReclassRequest(applicationId).orElseThrow();
+                    return ServiceResult.ok(ResponseMapper.toReclassApplicationResponse(refreshed));
+                });
+    }
+
+    private ReclassRequestRow requireReclassRequest(String raceId, String applicationId) {
+        ReclassRequestRow application = repository.findReclassRequest(applicationId)
+                .orElseThrow(() -> new NotFoundException("重分申请不存在: " + applicationId));
+        if (!application.raceId().equals(raceId)) {
+            throw new NotFoundException("重分申请不属于该赛事: " + applicationId);
+        }
+        return application;
+    }
+
+    private RaceRow requireRace(String raceId) {
+        return repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult approveReclassApplications(String raceId, ApproveReclassRequest request) {
+        // reclassKey 指纹：操作者 + 赛事版本 + 规范化申请集合（排序去重）+ 规范化目标组别集合；
+        // 同键同参重放完整排名结果，异参409，业务失败随事务回滚不占键。
+        List<String> normalizedIds =
+                request.applicationIds().stream().sorted().distinct().toList();
+        List<String> targetCategories = normalizedIds.stream()
+                .map(id -> repository.findReclassRequest(id)
+                        .map(ReclassRequestRow::targetCategory)
+                        .orElse("<missing:" + id + ">"))
+                .sorted()
+                .distinct()
+                .toList();
+        return withIdempotency(request.reclassKey(), "APPROVE_RECLASS",
+                orderedParams(
+                        "raceId", raceId,
+                        "operator", request.operator(),
+                        "expectedVersion", request.expectedVersion(),
+                        "applicationIds", normalizedIds,
+                        "targetCategories", targetCategories),
+                () -> doApproveReclass(raceId, request, normalizedIds));
+    }
+
+    private ServiceResult doApproveReclass(
+            String raceId, ApproveReclassRequest request, List<String> normalizedIds) {
+        RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+        List<ReclassRequestRow> applications = new ArrayList<>(normalizedIds.size());
+        for (String applicationId : normalizedIds) {
+            applications.add(requireReclassRequest(raceId, applicationId));
+        }
+        // 整批静态校验：任一不合法整批失败，不产生部分迁移。
+        Set<String> seenBibs = new HashSet<>();
+        for (ReclassRequestRow application : applications) {
+            if (application.status() != ReclassRequestRow.ReclassRequestStatus.PENDING) {
+                throw new ConflictException("申请非待审批状态: " + application.applicationId());
+            }
+            if (!seenBibs.add(application.bib())) {
+                throw new UnprocessableEntityException(
+                        "同一参赛者在批内仅允许出现一次: " + application.bib());
+            }
+        }
+        List<RunnerRow> runners = repository.findRunners(raceId);
+        Map<String, RunnerRow> runnerByBib = new HashMap<>();
+        for (RunnerRow runner : runners) {
+            runnerByBib.put(runner.bib(), runner);
+        }
+        Map<String, CategoryRow> categoryByCode = new HashMap<>();
+        for (CategoryRow category : repository.findCategories(raceId)) {
+            categoryByCode.put(category.categoryCode(), category);
+        }
+        for (ReclassRequestRow application : applications) {
+            RunnerRow runner = runnerByBib.get(application.bib());
+            if (runner == null) {
+                throw new NotFoundException("选手不存在: " + application.bib());
+            }
+            if (runner.status() == RunnerStatus.WITHDRAWN) {
+                throw new ConflictException("参赛者已退赛，不能批准重分: " + application.bib());
+            }
+            CategoryRow target = categoryByCode.get(application.targetCategory());
+            if (target == null) {
+                throw new UnprocessableEntityException(
+                        "目标组别不存在: " + application.targetCategory());
+            }
+            if (target.status() == CategoryStatus.SEALED) {
+                throw new UnprocessableEntityException(
+                        "目标组别已封榜: " + application.targetCategory());
+            }
+            if (application.targetCategory().equals(runner.categoryCode())) {
+                throw new UnprocessableEntityException(
+                        "目标组别与当前组别相同: " + application.targetCategory());
+            }
+            if (runner.categoryCode() != null) {
+                CategoryRow source = categoryByCode.get(runner.categoryCode());
+                if (source != null && source.status() == CategoryStatus.SEALED) {
+                    throw new ConflictException("来源组别已封榜: " + runner.categoryCode());
+                }
+            }
+        }
+        // 容量校验：目标组别当前在赛人数 + 批内净迁入 ≤ 容量（NULL 容量不限）。
+        Map<String, Integer> headcountByCategory = new HashMap<>();
+        for (RunnerRow runner : runners) {
+            if (runner.status() == RunnerStatus.ACTIVE && runner.categoryCode() != null) {
+                headcountByCategory.merge(runner.categoryCode(), 1, Integer::sum);
+            }
+        }
+        Map<String, Integer> deltaByCategory = new HashMap<>();
+        for (ReclassRequestRow application : applications) {
+            deltaByCategory.merge(application.targetCategory(), 1, Integer::sum);
+            String source = runnerByBib.get(application.bib()).categoryCode();
+            if (source != null) {
+                deltaByCategory.merge(source, -1, Integer::sum);
+            }
+        }
+        for (String targetCode : deltaByCategory.keySet()) {
+            CategoryRow target = categoryByCode.get(targetCode);
+            if (target != null && target.capacity() != null) {
+                int resulting = headcountByCategory.getOrDefault(targetCode, 0)
+                        + deltaByCategory.get(targetCode);
+                if (resulting > target.capacity()) {
+                    throw new UnprocessableEntityException(
+                            "目标组别容量超限: " + targetCode);
+                }
+            }
+        }
+        // 迁移前名次与计时快照：按来源组别当前榜单计算（未分组选手无来源榜单）。
+        List<PenaltyRow> penalties = repository.findPenalties(raceId);
+        List<CheckpointRow> checkpoints = repository.findCheckpoints(raceId);
+        List<CheckpointTimingRow> timings = repository.findAllTimings(raceId);
+        Set<String> involvedCategories = new TreeSet<>();
+        for (ReclassRequestRow application : applications) {
+            involvedCategories.add(application.targetCategory());
+            String source = runnerByBib.get(application.bib()).categoryCode();
+            if (source != null) {
+                involvedCategories.add(source);
+            }
+        }
+        Map<String, List<ResultEntry>> prevEntriesByCategory = new HashMap<>();
+        for (String categoryCode : involvedCategories) {
+            prevEntriesByCategory.put(categoryCode, computeCategoryEntries(
+                    categoryCode, runners, penalties, checkpoints, timings));
+        }
+        Map<String, Long> activePenaltyByBib = new HashMap<>();
+        for (PenaltyRow penalty : penalties) {
+            if (!penalty.revoked() && penalty.type() == PenaltyType.ADD_TIME
+                    && penalty.amountMs() != null) {
+                activePenaltyByBib.merge(penalty.bib(), penalty.amountMs(), Long::sum);
+            }
+        }
+        long now = clock.millis();
+        bumpVersion(race, request.expectedVersion());
+        List<ReclassRecordRow> records = new ArrayList<>(applications.size());
+        for (ReclassRequestRow application : applications) {
+            RunnerRow runner = runnerByBib.get(application.bib());
+            ResultEntry prevEntry = null;
+            if (runner.categoryCode() != null) {
+                prevEntry = prevEntriesByCategory.get(runner.categoryCode()).stream()
+                        .filter(entry -> entry.bib().equals(application.bib()))
+                        .findFirst()
+                        .orElse(null);
+            }
+            int decided = repository.decideReclassRequestIfPending(
+                    application.applicationId(),
+                    ReclassRequestRow.ReclassRequestStatus.APPROVED,
+                    request.reclassKey(), now);
+            if (decided == 0) {
+                throw new ConflictException("申请已被并发审批: " + application.applicationId());
+            }
+            repository.updateRunnerCategory(
+                    raceId, application.bib(), application.targetCategory(), now);
+            records.add(buildReclassRecord(
+                    request.reclassKey(), raceId, application, runner, prevEntry,
+                    activePenaltyByBib.getOrDefault(application.bib(), 0L), now));
+        }
+        repository.insertReclassRecords(records);
+        // 重算来源与目标组别排名（迁移后），作为完整排名结果返回并被幂等记录固化。
+        List<RunnerRow> migratedRunners = repository.findRunners(raceId);
+        Map<String, List<ResultEntryResponse>> standings = new TreeMap<>();
+        for (String categoryCode : involvedCategories) {
+            standings.put(categoryCode, computeCategoryEntries(
+                    categoryCode, migratedRunners, penalties, checkpoints, timings)
+                    .stream()
+                    .map(ResponseMapper::toEntryResponse)
+                    .toList());
+        }
+        return ServiceResult.ok(new ReclassApprovalResponse(
+                raceId, request.expectedVersion() + 1, request.reclassKey(),
+                records.stream().map(ResponseMapper::toReclassRecordResponse).toList(),
+                standings));
+    }
+
+    /** 组装不可变重分记录：来源组别内迁移前名次与计时快照；未分组选手无来源名次。 */
+    private static ReclassRecordRow buildReclassRecord(
+            String batchId,
+            String raceId,
+            ReclassRequestRow application,
+            RunnerRow runner,
+            ResultEntry prevEntry,
+            long activePenaltyMs,
+            long now) {
+        if (prevEntry != null) {
+            return new ReclassRecordRow(
+                    batchId, application.bib(), raceId,
+                    runner.categoryCode(), application.targetCategory(),
+                    prevEntry.rank(), prevEntry.status(), prevEntry.finishTimeMs(),
+                    prevEntry.penaltyMs(), prevEntry.totalTimeMs(), now);
+        }
+        Long finishTimeMs = runner.finishTimeMs();
+        return new ReclassRecordRow(
+                batchId, application.bib(), raceId,
+                runner.categoryCode(), application.targetCategory(),
+                null, null, finishTimeMs, activePenaltyMs,
+                finishTimeMs == null ? null : finishTimeMs + activePenaltyMs,
+                now);
+    }
+
+    /** 计算某组别当前榜单（该组别全部选手，退赛选手以 WITHDRAWN 状态列出不排名）。 */
+    private List<ResultEntry> computeCategoryEntries(
+            String categoryCode,
+            List<RunnerRow> runners,
+            List<PenaltyRow> penalties,
+            List<CheckpointRow> checkpoints,
+            List<CheckpointTimingRow> timings) {
+        List<RunnerRow> categoryRunners = runners.stream()
+                .filter(runner -> categoryCode.equals(runner.categoryCode()))
+                .toList();
+        return ResultCalculator.compute(categoryRunners, penalties, checkpoints, timings);
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult sealCategory(
+            String raceId, String categoryCode, SealCategoryRequest request) {
+        return withIdempotency(request.requestId(), "SEAL_CATEGORY",
+                orderedParams(
+                        "raceId", raceId,
+                        "categoryCode", categoryCode,
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    CategoryRow category = repository.findCategory(raceId, categoryCode)
+                            .orElseThrow(() -> new NotFoundException("组别不存在: " + categoryCode));
+                    if (category.status() == CategoryStatus.SEALED) {
+                        throw new ConflictException("组别已封榜: " + categoryCode);
+                    }
+                    // 仅固化封榜时刻归属该组别的选手成绩；历史快照不追溯重写。
+                    List<ResultEntry> entries = computeCategoryEntries(
+                            categoryCode,
+                            repository.findRunnersByCategory(raceId, categoryCode),
+                            repository.findPenalties(raceId),
+                            repository.findCheckpoints(raceId),
+                            repository.findAllTimings(raceId));
+                    long now = clock.millis();
+                    bumpVersion(race, request.expectedVersion());
+                    int sealed = repository.sealCategoryIfOpen(raceId, categoryCode, now);
+                    if (sealed == 0) {
+                        throw new ConflictException("组别已封榜: " + categoryCode);
+                    }
+                    int newVersion = request.expectedVersion() + 1;
+                    List<CategorySnapshotEntryRow> snapshotEntries =
+                            new ArrayList<>(entries.size());
+                    for (int order = 0; order < entries.size(); order++) {
+                        ResultEntry entry = entries.get(order);
+                        snapshotEntries.add(new CategorySnapshotEntryRow(
+                                raceId, categoryCode, entry.bib(), entry.rank(), entry.status(),
+                                entry.finishTimeMs(), entry.penaltyMs(), entry.totalTimeMs(),
+                                order));
+                    }
+                    repository.insertCategorySnapshot(new CategorySnapshotRow(
+                            raceId, categoryCode, newVersion, now, snapshotEntries));
+                    return ServiceResult.ok(new CategoryStandingResponse(
+                            raceId, categoryCode, newVersion, CategoryStatus.SEALED, now,
+                            snapshotEntries.stream()
+                                    .map(ResponseMapper::toEntryResponse)
+                                    .toList()));
+                });
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<CategoryResponse> listCategories(String raceId) {
+        requireRace(raceId);
+        return repository.findCategories(raceId).stream()
+                .map(category -> ResponseMapper.toCategoryResponse(category,
+                        repository.countActiveRunnersInCategory(raceId, category.categoryCode())))
+                .toList();
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<ReclassApplicationResponse> listReclassApplications(String raceId) {
+        requireRace(raceId);
+        return repository.findReclassRequests(raceId).stream()
+                .map(ResponseMapper::toReclassApplicationResponse)
+                .toList();
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<ReclassRecordResponse> listReclassRecords(String raceId) {
+        requireRace(raceId);
+        return repository.findReclassRecords(raceId).stream()
+                .map(ResponseMapper::toReclassRecordResponse)
+                .toList();
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public CategoryStandingResponse getCategoryStandings(String raceId, String categoryCode) {
+        RaceRow race = requireRace(raceId);
+        CategoryRow category = repository.findCategory(raceId, categoryCode)
+                .orElseThrow(() -> new NotFoundException("组别不存在: " + categoryCode));
+        if (category.status() == CategoryStatus.SEALED) {
+            CategorySnapshotRow snapshot =
+                    repository.findCategorySnapshot(raceId, categoryCode)
+                            .orElseThrow(() -> new IllegalStateException(
+                                    "组别已封榜但缺少快照: " + categoryCode));
+            return ResponseMapper.snapshotCategoryStanding(snapshot);
+        }
+        List<ResultEntry> entries = computeCategoryEntries(
+                categoryCode,
+                repository.findRunnersByCategory(raceId, categoryCode),
+                repository.findPenalties(raceId),
+                repository.findCheckpoints(raceId),
+                repository.findAllTimings(raceId));
+        return ResponseMapper.liveCategoryStanding(race, category, entries);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<CategoryStandingResponse> listCategorySnapshots(String raceId) {
+        requireRace(raceId);
+        return repository.findCategorySnapshots(raceId).stream()
+                .map(ResponseMapper::snapshotCategoryStanding)
+                .toList();
     }
 }

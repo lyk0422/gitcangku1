@@ -9,6 +9,7 @@ import java.util.List;
  *
  * @param raceId                    所属快照的赛事ID
  * @param bib                       参赛号
+ * @param categoryCode              封榜时刻所属组别代码；未分组为 null，固化后不随后续重分改写
  * @param rank                      名次；非 RANKED 为 null
  * @param status                    成绩状态
  * @param finishTimeMs              原始完赛耗时（毫秒）；计时缺失为 null
@@ -22,6 +23,7 @@ import java.util.List;
 public record SnapshotEntryRow(
         String raceId,
         String bib,
+        String categoryCode,
         Integer rank,
         EntryStatus status,
         Long finishTimeMs,
@@ -33,7 +35,7 @@ public record SnapshotEntryRow(
         List<String> missingCheckpoints
 ) {
 
-    /** 兼容旧调用的构造器：检查点计数为 0、缺失列表为空。 */
+    /** 兼容旧调用的构造器：组别为 null。 */
     public SnapshotEntryRow(
             String raceId,
             String bib,
@@ -42,8 +44,11 @@ public record SnapshotEntryRow(
             Long finishTimeMs,
             long penaltyMs,
             Long totalTimeMs,
-            int displayOrder) {
-        this(raceId, bib, rank, status, finishTimeMs, penaltyMs, totalTimeMs, displayOrder,
-                0, 0, List.of());
+            int displayOrder,
+            int checkpointCount,
+            int coveredCheckpointCount,
+            List<String> missingCheckpoints) {
+        this(raceId, bib, null, rank, status, finishTimeMs, penaltyMs, totalTimeMs, displayOrder,
+                checkpointCount, coveredCheckpointCount, missingCheckpoints);
     }
 }

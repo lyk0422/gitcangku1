@@ -58,7 +58,8 @@ public final class ResultCalculator {
         Map<String, Aggregate> aggregates = new LinkedHashMap<>();
         for (RunnerView runner : runnerView) {
             aggregates.put(runner.bib(),
-                    new Aggregate(runner.bib(), runner.finishTimeMs(), orderedCheckpoints));
+                    new Aggregate(runner.bib(), runner.finishTimeMs(), runner.withdrawn(),
+                            orderedCheckpoints));
         }
 
         // 仅统计属于已配置检查点的分段（数据库外键已保证，这里做防御性过滤）。
@@ -89,7 +90,10 @@ public final class ResultCalculator {
         List<Aggregate> ranked = new ArrayList<>();
         List<Aggregate> others = new ArrayList<>();
         for (Aggregate aggregate : aggregates.values()) {
-            if (aggregate.disqualified) {
+            if (aggregate.withdrawn) {
+                aggregate.status = EntryStatus.WITHDRAWN;
+                others.add(aggregate);
+            } else if (aggregate.disqualified) {
                 aggregate.status = EntryStatus.DISQUALIFIED;
                 others.add(aggregate);
             } else if (aggregate.finishTimeMs == null) {
@@ -139,6 +143,11 @@ public final class ResultCalculator {
         String bib();
 
         Long finishTimeMs();
+
+        /** 是否已退赛；退赛选手状态 WITHDRAWN，不参与排名。默认 false 兼容旧实现。 */
+        default boolean withdrawn() {
+            return false;
+        }
     }
 
     /** 处罚视图。 */
@@ -156,6 +165,7 @@ public final class ResultCalculator {
     private static final class Aggregate {
         private final String bib;
         private final Long finishTimeMs;
+        private final boolean withdrawn;
         private final List<CheckpointView> checkpoints;
         private final Set<String> coveredCodes = new HashSet<>();
         private long penaltyMs;
@@ -164,9 +174,11 @@ public final class ResultCalculator {
         private int rank;
         private long totalTimeMs;
 
-        private Aggregate(String bib, Long finishTimeMs, List<CheckpointView> checkpoints) {
+        private Aggregate(
+                String bib, Long finishTimeMs, boolean withdrawn, List<CheckpointView> checkpoints) {
             this.bib = bib;
             this.finishTimeMs = finishTimeMs;
+            this.withdrawn = withdrawn;
             this.checkpoints = checkpoints;
         }
 

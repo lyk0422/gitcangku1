@@ -1,8 +1,10 @@
 package com.example.starter.race.persistence;
 
+import com.example.starter.race.domain.CategoryStatus;
 import com.example.starter.race.domain.EntryStatus;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
+import com.example.starter.race.domain.RunnerStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
@@ -30,6 +32,13 @@ public class RaceRepository {
             new CheckpointTimingRowMapper();
     private static final SnapshotCheckpointRowMapper SNAPSHOT_CHECKPOINT_ROW_MAPPER =
             new SnapshotCheckpointRowMapper();
+    private static final CategoryRowMapper CATEGORY_ROW_MAPPER = new CategoryRowMapper();
+    private static final ReclassRequestRowMapper RECLASS_REQUEST_ROW_MAPPER =
+            new ReclassRequestRowMapper();
+    private static final ReclassRecordRowMapper RECLASS_RECORD_ROW_MAPPER =
+            new ReclassRecordRowMapper();
+    private static final CategorySnapshotEntryRowMapper CATEGORY_SNAPSHOT_ENTRY_ROW_MAPPER =
+            new CategorySnapshotEntryRowMapper();
 
     private final JdbcTemplate jdbcTemplate;
 
@@ -62,7 +71,7 @@ public class RaceRepository {
     /** 查询赛事下全部选手，按参赛号字典序排列。 */
     public List<RunnerRow> findRunners(String raceId) {
         return jdbcTemplate.query(
-                "SELECT id, race_id, bib, finish_time_ms, created_at, updated_at "
+                "SELECT id, race_id, bib, category_code, status, finish_time_ms, created_at, updated_at "
                         + "FROM runner WHERE race_id = ? ORDER BY bib",
                 RUNNER_ROW_MAPPER, raceId);
     }
@@ -70,11 +79,28 @@ public class RaceRepository {
     /** 按赛事与参赛号查询选手。 */
     public Optional<RunnerRow> findRunner(String raceId, String bib) {
         return jdbcTemplate
-                .query("SELECT id, race_id, bib, finish_time_ms, created_at, updated_at "
+                .query("SELECT id, race_id, bib, category_code, status, finish_time_ms, created_at, updated_at "
                                 + "FROM runner WHERE race_id = ? AND bib = ?",
                         RUNNER_ROW_MAPPER, raceId, bib)
                 .stream()
                 .findFirst();
+    }
+
+    /** 查询赛事下某组别的全部选手，按参赛号字典序排列。 */
+    public List<RunnerRow> findRunnersByCategory(String raceId, String categoryCode) {
+        return jdbcTemplate.query(
+                "SELECT id, race_id, bib, category_code, status, finish_time_ms, created_at, updated_at "
+                        + "FROM runner WHERE race_id = ? AND category_code = ? ORDER BY bib",
+                RUNNER_ROW_MAPPER, raceId, categoryCode);
+    }
+
+    /** 统计组别内在赛（ACTIVE）选手人数（容量校验用）。 */
+    public int countActiveRunnersInCategory(String raceId, String categoryCode) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM runner "
+                        + "WHERE race_id = ? AND category_code = ? AND status = 'ACTIVE'",
+                Integer.class, raceId, categoryCode);
+        return count == null ? 0 : count;
     }
 
     /** 查询赛事下全部处罚（含已撤销），按新增时间与处罚ID排列。 */
@@ -187,7 +213,7 @@ public class RaceRepository {
         }
         SnapshotRow header = headers.getFirst();
         List<SnapshotEntryRow> entryRows = jdbcTemplate.query(
-                "SELECT race_id, bib, rank_no, status, finish_time_ms, penalty_ms, total_time_ms, "
+                "SELECT race_id, bib, category_code, rank_no, status, finish_time_ms, penalty_ms, total_time_ms, "
                         + "display_order, checkpoint_count, covered_checkpoint_count "
                         + "FROM result_snapshot_entry WHERE race_id = ? ORDER BY display_order",
                 SNAPSHOT_ENTRY_ROW_MAPPER, raceId);
@@ -206,7 +232,7 @@ public class RaceRepository {
         }
         List<SnapshotEntryRow> entries = entryRows.stream()
                 .map(entry -> new SnapshotEntryRow(
-                        entry.raceId(), entry.bib(), entry.rank(), entry.status(),
+                        entry.raceId(), entry.bib(), entry.categoryCode(), entry.rank(), entry.status(),
                         entry.finishTimeMs(), entry.penaltyMs(), entry.totalTimeMs(),
                         entry.displayOrder(), entry.checkpointCount(),
                         entry.coveredCheckpointCount(),
@@ -223,12 +249,27 @@ public class RaceRepository {
                 raceId, now);
     }
 
-    /** 登记选手；finishTimeMs 为 null 表示计时缺失。 */
-    public void insertRunner(String raceId, String bib, Long finishTimeMs, long now) {
+    /** 登记选手；finishTimeMs 为 null 表示计时缺失，categoryCode 为 null 表示未分组。 */
+    public void insertRunner(String raceId, String bib, String categoryCode, Long finishTimeMs, long now) {
         jdbcTemplate.update(
-                "INSERT INTO runner (race_id, bib, finish_time_ms, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, ?, ?)",
-                raceId, bib, finishTimeMs, now, now);
+                "INSERT INTO runner (race_id, bib, category_code, status, finish_time_ms, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, 'ACTIVE', ?, ?, ?)",
+                raceId, bib, categoryCode, finishTimeMs, now, now);
+    }
+
+    /** 更新选手所属组别（重分批准迁移）；返回受影响行数。 */
+    public int updateRunnerCategory(String raceId, String bib, String categoryCode, long now) {
+        return jdbcTemplate.update(
+                "UPDATE runner SET category_code = ?, updated_at = ? WHERE race_id = ? AND bib = ?",
+                categoryCode, now, raceId, bib);
+    }
+
+    /** 退赛：仅对在赛选手生效；返回受影响行数（0 表示不存在或已退赛）。 */
+    public int withdrawRunnerIfActive(String raceId, String bib, long now) {
+        return jdbcTemplate.update(
+                "UPDATE runner SET status = 'WITHDRAWN', updated_at = ? "
+                        + "WHERE race_id = ? AND bib = ? AND status = 'ACTIVE'",
+                now, raceId, bib);
     }
 
     /** 修订选手原始完赛耗时；返回受影响行数（0 表示选手不存在）。 */
@@ -291,22 +332,23 @@ public class RaceRepository {
                 snapshot.raceId(), snapshot.version(), snapshot.sealedAt());
         jdbcTemplate.batchUpdate(
                 "INSERT INTO result_snapshot_entry "
-                        + "(race_id, bib, rank_no, status, finish_time_ms, penalty_ms, total_time_ms, "
+                        + "(race_id, bib, category_code, rank_no, status, finish_time_ms, penalty_ms, total_time_ms, "
                         + "display_order, checkpoint_count, covered_checkpoint_count) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 snapshot.entries(),
                 snapshot.entries().size(),
                 (ps, entry) -> {
                     ps.setString(1, entry.raceId());
                     ps.setString(2, entry.bib());
-                    ps.setObject(3, entry.rank());
-                    ps.setString(4, entry.status().name());
-                    ps.setObject(5, entry.finishTimeMs());
-                    ps.setLong(6, entry.penaltyMs());
-                    ps.setObject(7, entry.totalTimeMs());
-                    ps.setInt(8, entry.displayOrder());
-                    ps.setInt(9, entry.checkpointCount());
-                    ps.setInt(10, entry.coveredCheckpointCount());
+                    ps.setString(3, entry.categoryCode());
+                    ps.setObject(4, entry.rank());
+                    ps.setString(5, entry.status().name());
+                    ps.setObject(6, entry.finishTimeMs());
+                    ps.setLong(7, entry.penaltyMs());
+                    ps.setObject(8, entry.totalTimeMs());
+                    ps.setInt(9, entry.displayOrder());
+                    ps.setInt(10, entry.checkpointCount());
+                    ps.setInt(11, entry.coveredCheckpointCount());
                 });
         jdbcTemplate.batchUpdate(
                 "INSERT INTO result_snapshot_checkpoint "
@@ -368,8 +410,200 @@ public class RaceRepository {
                 responseStatus, responseBody, requestId);
     }
 
-    /** 测试辅助：清空全部业务数据，按外键依赖顺序删除。 */
-    public void deleteAllForTesting() {
+    /** 新建组别（初始 OPEN）。 */
+    public void insertCategory(String raceId, String categoryCode, Integer capacity, long now) {
+        jdbcTemplate.update(
+                "INSERT INTO race_category (race_id, category_code, capacity, status, created_at, sealed_at) "
+                        + "VALUES (?, ?, ?, 'OPEN', ?, NULL)",
+                raceId, categoryCode, capacity, now);
+    }
+
+    /** 按赛事与代码查询组别。 */
+    public Optional<CategoryRow> findCategory(String raceId, String categoryCode) {
+        return jdbcTemplate
+                .query("SELECT race_id, category_code, capacity, status, created_at, sealed_at "
+                                + "FROM race_category WHERE race_id = ? AND category_code = ?",
+                        CATEGORY_ROW_MAPPER, raceId, categoryCode)
+                .stream()
+                .findFirst();
+    }
+
+    /** 查询赛事下全部组别，按组别代码字典序排列。 */
+    public List<CategoryRow> findCategories(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT race_id, category_code, capacity, status, created_at, sealed_at "
+                        + "FROM race_category WHERE race_id = ? ORDER BY category_code",
+                CATEGORY_ROW_MAPPER, raceId);
+    }
+
+    /** 条件封组别：仅当组别仍为 OPEN 时转 SEALED；返回受影响行数。 */
+    public int sealCategoryIfOpen(String raceId, String categoryCode, long now) {
+        return jdbcTemplate.update(
+                "UPDATE race_category SET status = 'SEALED', sealed_at = ? "
+                        + "WHERE race_id = ? AND category_code = ? AND status = 'OPEN'",
+                now, raceId, categoryCode);
+    }
+
+    /** 新增重分申请（初始 PENDING）。 */
+    public void insertReclassRequest(ReclassRequestRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO reclass_request "
+                        + "(application_id, race_id, bib, target_category, reason, expected_version, "
+                        + "status, batch_id, created_at, decided_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                row.applicationId(), row.raceId(), row.bib(), row.targetCategory(), row.reason(),
+                row.expectedVersion(), row.status().name(), row.batchId(), row.createdAt(),
+                row.decidedAt());
+    }
+
+    /** 按申请ID查询重分申请。 */
+    public Optional<ReclassRequestRow> findReclassRequest(String applicationId) {
+        return jdbcTemplate
+                .query("SELECT application_id, race_id, bib, target_category, reason, expected_version, "
+                                + "status, batch_id, created_at, decided_at "
+                                + "FROM reclass_request WHERE application_id = ?",
+                        RECLASS_REQUEST_ROW_MAPPER, applicationId)
+                .stream()
+                .findFirst();
+    }
+
+    /** 查询赛事下全部重分申请，按提交时间与申请ID排列。 */
+    public List<ReclassRequestRow> findReclassRequests(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT application_id, race_id, bib, target_category, reason, expected_version, "
+                        + "status, batch_id, created_at, decided_at "
+                        + "FROM reclass_request WHERE race_id = ? ORDER BY created_at, application_id",
+                RECLASS_REQUEST_ROW_MAPPER, raceId);
+    }
+
+    /** 查询选手当前待审批申请数量（同一选手同一时刻最多一条 PENDING）。 */
+    public int countPendingReclassRequests(String raceId, String bib) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM reclass_request "
+                        + "WHERE race_id = ? AND bib = ? AND status = 'PENDING'",
+                Integer.class, raceId, bib);
+        return count == null ? 0 : count;
+    }
+
+    /** 条件更新申请状态：仅当仍为 PENDING 时迁移；返回受影响行数。 */
+    public int decideReclassRequestIfPending(
+            String applicationId,
+            ReclassRequestRow.ReclassRequestStatus newStatus,
+            String batchId,
+            long now) {
+        return jdbcTemplate.update(
+                "UPDATE reclass_request SET status = ?, batch_id = ?, decided_at = ? "
+                        + "WHERE application_id = ? AND status = 'PENDING'",
+                newStatus.name(), batchId, now, applicationId);
+    }
+
+    /** 写入不可变重分记录（只插入，无更新路径）。 */
+    public void insertReclassRecords(List<ReclassRecordRow> rows) {
+        jdbcTemplate.batchUpdate(
+                "INSERT INTO reclass_record "
+                        + "(batch_id, bib, race_id, from_category, to_category, prev_rank, prev_status, "
+                        + "prev_finish_time_ms, prev_penalty_ms, prev_total_time_ms, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rows,
+                rows.size(),
+                (ps, row) -> {
+                    ps.setString(1, row.batchId());
+                    ps.setString(2, row.bib());
+                    ps.setString(3, row.raceId());
+                    ps.setString(4, row.fromCategory());
+                    ps.setString(5, row.toCategory());
+                    ps.setObject(6, row.prevRank());
+                    ps.setString(7, row.prevStatus() == null ? null : row.prevStatus().name());
+                    ps.setObject(8, row.prevFinishTimeMs());
+                    ps.setObject(9, row.prevPenaltyMs());
+                    ps.setObject(10, row.prevTotalTimeMs());
+                    ps.setLong(11, row.createdAt());
+                });
+    }
+
+    /** 查询赛事下全部重分记录，按迁移时间、批次与参赛号排列。 */
+    public List<ReclassRecordRow> findReclassRecords(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT batch_id, bib, race_id, from_category, to_category, prev_rank, prev_status, "
+                        + "prev_finish_time_ms, prev_penalty_ms, prev_total_time_ms, created_at "
+                        + "FROM reclass_record WHERE race_id = ? ORDER BY created_at, batch_id, bib",
+                RECLASS_RECORD_ROW_MAPPER, raceId);
+    }
+
+    /** 原子写入组别封榜快照头表与全部条目。 */
+    public void insertCategorySnapshot(CategorySnapshotRow snapshot) {
+        jdbcTemplate.update(
+                "INSERT INTO category_snapshot (race_id, category_code, version, sealed_at) "
+                        + "VALUES (?, ?, ?, ?)",
+                snapshot.raceId(), snapshot.categoryCode(), snapshot.version(), snapshot.sealedAt());
+        jdbcTemplate.batchUpdate(
+                "INSERT INTO category_snapshot_entry "
+                        + "(race_id, category_code, bib, rank_no, status, finish_time_ms, penalty_ms, "
+                        + "total_time_ms, display_order) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                snapshot.entries(),
+                snapshot.entries().size(),
+                (ps, entry) -> {
+                    ps.setString(1, entry.raceId());
+                    ps.setString(2, entry.categoryCode());
+                    ps.setString(3, entry.bib());
+                    ps.setObject(4, entry.rank());
+                    ps.setString(5, entry.status().name());
+                    ps.setObject(6, entry.finishTimeMs());
+                    ps.setLong(7, entry.penaltyMs());
+                    ps.setObject(8, entry.totalTimeMs());
+                    ps.setInt(9, entry.displayOrder());
+                });
+    }
+
+    /** 按赛事与组别查询组别封榜快照；未封榜返回 empty。 */
+    public Optional<CategorySnapshotRow> findCategorySnapshot(String raceId, String categoryCode) {
+        List<CategorySnapshotRow> headers = jdbcTemplate.query(
+                "SELECT race_id, category_code, version, sealed_at FROM category_snapshot "
+                        + "WHERE race_id = ? AND category_code = ?",
+                (rs, rowNum) -> new CategorySnapshotRow(
+                        rs.getString("race_id"),
+                        rs.getString("category_code"),
+                        rs.getInt("version"),
+                        rs.getLong("sealed_at"),
+                        List.of()),
+                raceId, categoryCode);
+        if (headers.isEmpty()) {
+            return Optional.empty();
+        }
+        CategorySnapshotRow header = headers.getFirst();
+        List<CategorySnapshotEntryRow> entries = jdbcTemplate.query(
+                "SELECT race_id, category_code, bib, rank_no, status, finish_time_ms, penalty_ms, "
+                        + "total_time_ms, display_order "
+                        + "FROM category_snapshot_entry "
+                        + "WHERE race_id = ? AND category_code = ? ORDER BY display_order",
+                CATEGORY_SNAPSHOT_ENTRY_ROW_MAPPER, raceId, categoryCode);
+        return Optional.of(new CategorySnapshotRow(
+                header.raceId(), header.categoryCode(), header.version(), header.sealedAt(), entries));
+    }
+
+    /** 查询赛事下全部组别封榜快照（历史快照），按封榜时间与组别代码排列。 */
+    public List<CategorySnapshotRow> findCategorySnapshots(String raceId) {
+        List<CategorySnapshotRow> headers = jdbcTemplate.query(
+                "SELECT race_id, category_code, version, sealed_at FROM category_snapshot "
+                        + "WHERE race_id = ? ORDER BY sealed_at, category_code",
+                (rs, rowNum) -> new CategorySnapshotRow(
+                        rs.getString("race_id"),
+                        rs.getString("category_code"),
+                        rs.getInt("version"),
+                        rs.getLong("sealed_at"),
+                        List.of()),
+                raceId);
+        return headers.stream()
+                .map(header -> findCategorySnapshot(raceId, header.categoryCode()).orElseThrow())
+                .toList();
+    }
+
+    /** 测试辅助：清空全部业务数据，按外键依赖顺序删除。 */    public void deleteAllForTesting() {
+        jdbcTemplate.update("DELETE FROM category_snapshot_entry");
+        jdbcTemplate.update("DELETE FROM category_snapshot");
+        jdbcTemplate.update("DELETE FROM reclass_record");
+        jdbcTemplate.update("DELETE FROM reclass_request");
         jdbcTemplate.update("DELETE FROM result_snapshot_checkpoint");
         jdbcTemplate.update("DELETE FROM result_snapshot_entry");
         jdbcTemplate.update("DELETE FROM result_snapshot");
@@ -378,6 +612,7 @@ public class RaceRepository {
         jdbcTemplate.update("DELETE FROM checkpoint");
         jdbcTemplate.update("DELETE FROM penalty");
         jdbcTemplate.update("DELETE FROM runner");
+        jdbcTemplate.update("DELETE FROM race_category");
         jdbcTemplate.update("DELETE FROM race");
     }
 
@@ -400,6 +635,8 @@ public class RaceRepository {
                     rs.getLong("id"),
                     rs.getString("race_id"),
                     rs.getString("bib"),
+                    rs.getString("category_code"),
+                    RunnerStatus.valueOf(rs.getString("status")),
                     finishTimeMs,
                     rs.getLong("created_at"),
                     rs.getLong("updated_at"));
@@ -427,6 +664,7 @@ public class RaceRepository {
             return new SnapshotEntryRow(
                     rs.getString("race_id"),
                     rs.getString("bib"),
+                    rs.getString("category_code"),
                     (Integer) rs.getObject("rank_no"),
                     EntryStatus.valueOf(rs.getString("status")),
                     (Long) rs.getObject("finish_time_ms"),
@@ -488,6 +726,72 @@ public class RaceRepository {
                     rs.getInt("response_status"),
                     rs.getString("response_body"),
                     rs.getLong("created_at"));
+        }
+    }
+
+    private static final class CategoryRowMapper implements RowMapper<CategoryRow> {
+        @Override
+        public CategoryRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new CategoryRow(
+                    rs.getString("race_id"),
+                    rs.getString("category_code"),
+                    (Integer) rs.getObject("capacity"),
+                    CategoryStatus.valueOf(rs.getString("status")),
+                    rs.getLong("created_at"),
+                    (Long) rs.getObject("sealed_at"));
+        }
+    }
+
+    private static final class ReclassRequestRowMapper implements RowMapper<ReclassRequestRow> {
+        @Override
+        public ReclassRequestRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new ReclassRequestRow(
+                    rs.getString("application_id"),
+                    rs.getString("race_id"),
+                    rs.getString("bib"),
+                    rs.getString("target_category"),
+                    rs.getString("reason"),
+                    rs.getInt("expected_version"),
+                    ReclassRequestRow.ReclassRequestStatus.valueOf(rs.getString("status")),
+                    rs.getString("batch_id"),
+                    rs.getLong("created_at"),
+                    (Long) rs.getObject("decided_at"));
+        }
+    }
+
+    private static final class ReclassRecordRowMapper implements RowMapper<ReclassRecordRow> {
+        @Override
+        public ReclassRecordRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            String prevStatus = rs.getString("prev_status");
+            return new ReclassRecordRow(
+                    rs.getString("batch_id"),
+                    rs.getString("bib"),
+                    rs.getString("race_id"),
+                    rs.getString("from_category"),
+                    rs.getString("to_category"),
+                    (Integer) rs.getObject("prev_rank"),
+                    prevStatus == null ? null : EntryStatus.valueOf(prevStatus),
+                    (Long) rs.getObject("prev_finish_time_ms"),
+                    (Long) rs.getObject("prev_penalty_ms"),
+                    (Long) rs.getObject("prev_total_time_ms"),
+                    rs.getLong("created_at"));
+        }
+    }
+
+    private static final class CategorySnapshotEntryRowMapper
+            implements RowMapper<CategorySnapshotEntryRow> {
+        @Override
+        public CategorySnapshotEntryRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new CategorySnapshotEntryRow(
+                    rs.getString("race_id"),
+                    rs.getString("category_code"),
+                    rs.getString("bib"),
+                    (Integer) rs.getObject("rank_no"),
+                    EntryStatus.valueOf(rs.getString("status")),
+                    (Long) rs.getObject("finish_time_ms"),
+                    rs.getLong("penalty_ms"),
+                    (Long) rs.getObject("total_time_ms"),
+                    rs.getInt("display_order"));
         }
     }
 }

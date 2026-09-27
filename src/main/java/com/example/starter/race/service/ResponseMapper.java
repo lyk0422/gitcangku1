@@ -1,19 +1,29 @@
 package com.example.starter.race.service;
 
+import com.example.starter.race.api.CategoryResponse;
+import com.example.starter.race.api.CategoryStandingResponse;
 import com.example.starter.race.api.CheckpointPassResponse;
 import com.example.starter.race.api.CheckpointTimingResponse;
 import com.example.starter.race.api.PenaltyResponse;
+import com.example.starter.race.api.ReclassApplicationResponse;
+import com.example.starter.race.api.ReclassRecordResponse;
 import com.example.starter.race.api.ResultEntryResponse;
 import com.example.starter.race.api.RunnerResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.StandingResponse;
+import com.example.starter.race.domain.CategoryStatus;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
+import com.example.starter.race.persistence.CategoryRow;
+import com.example.starter.race.persistence.CategorySnapshotEntryRow;
+import com.example.starter.race.persistence.CategorySnapshotRow;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
+import com.example.starter.race.persistence.ReclassRecordRow;
+import com.example.starter.race.persistence.ReclassRequestRow;
 import com.example.starter.race.persistence.RunnerRow;
 import com.example.starter.race.persistence.SnapshotCheckpointRow;
 import com.example.starter.race.persistence.SnapshotEntryRow;
@@ -32,7 +42,8 @@ final class ResponseMapper {
     }
 
     static RunnerResponse toRunnerResponse(RunnerRow row) {
-        return new RunnerResponse(row.bib(), row.finishTimeMs(), row.createdAt(), row.updatedAt());
+        return new RunnerResponse(row.bib(), row.categoryCode(), row.status(),
+                row.finishTimeMs(), row.createdAt(), row.updatedAt());
     }
 
     static PenaltyResponse toPenaltyResponse(PenaltyRow row) {
@@ -95,6 +106,61 @@ final class ResponseMapper {
                 entry.checkpointCount(),
                 entry.coveredCheckpointCount(),
                 entry.missingCheckpoints());
+    }
+
+    static CategoryResponse toCategoryResponse(CategoryRow row, int activeCount) {
+        return new CategoryResponse(row.raceId(), row.categoryCode(), row.capacity(),
+                row.status(), activeCount, row.createdAt(), row.sealedAt());
+    }
+
+    static ReclassApplicationResponse toReclassApplicationResponse(ReclassRequestRow row) {
+        return new ReclassApplicationResponse(row.applicationId(), row.raceId(), row.bib(),
+                row.targetCategory(), row.reason(), row.status(), row.batchId(),
+                row.createdAt(), row.decidedAt());
+    }
+
+    static ReclassRecordResponse toReclassRecordResponse(ReclassRecordRow row) {
+        return new ReclassRecordResponse(row.batchId(), row.bib(), row.fromCategory(),
+                row.toCategory(), row.prevRank(), row.prevStatus(), row.prevFinishTimeMs(),
+                row.prevPenaltyMs(), row.prevTotalTimeMs(), row.createdAt());
+    }
+
+    static ResultEntryResponse toEntryResponse(CategorySnapshotEntryRow entry) {
+        return new ResultEntryResponse(
+                entry.bib(),
+                entry.rank(),
+                entry.status(),
+                entry.finishTimeMs(),
+                entry.penaltyMs(),
+                entry.totalTimeMs(),
+                0,
+                0,
+                List.of());
+    }
+
+    /** 组别实时排名响应（组别 OPEN）。 */
+    static CategoryStandingResponse liveCategoryStanding(
+            RaceRow race,
+            CategoryRow category,
+            List<ResultEntry> entries) {
+        return new CategoryStandingResponse(
+                race.raceId(),
+                category.categoryCode(),
+                race.version(),
+                CategoryStatus.OPEN,
+                null,
+                entries.stream().map(ResponseMapper::toEntryResponse).toList());
+    }
+
+    /** 组别封榜快照响应（组别 SEALED）。 */
+    static CategoryStandingResponse snapshotCategoryStanding(CategorySnapshotRow snapshot) {
+        return new CategoryStandingResponse(
+                snapshot.raceId(),
+                snapshot.categoryCode(),
+                snapshot.version(),
+                CategoryStatus.SEALED,
+                snapshot.sealedAt(),
+                snapshot.entries().stream().map(ResponseMapper::toEntryResponse).toList());
     }
 
     /**

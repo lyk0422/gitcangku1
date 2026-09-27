@@ -10,6 +10,8 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+
+import java.util.List;
 /**
  * 赛事计时处罚与成绩封榜 HTTP 接口。
  */
@@ -111,6 +113,89 @@ public class RaceController {
     @GetMapping("/{raceId}/missing-checkpoints")
     public MissingCheckpointsResponse getMissingCheckpoints(@PathVariable String raceId) {
         return raceService.getMissingCheckpoints(raceId);
+    }
+
+    /** 新建组别。 */
+    @PostMapping("/{raceId}/categories")
+    public ResponseEntity<Object> createCategory(
+            @PathVariable String raceId,
+            @Valid @RequestBody CreateCategoryRequest request) {
+        return toResponse(raceService.createCategory(raceId, request));
+    }
+
+    /** 查询赛事全部组别。 */
+    @GetMapping("/{raceId}/categories")
+    public List<CategoryResponse> listCategories(@PathVariable String raceId) {
+        return raceService.listCategories(raceId);
+    }
+
+    /** 选手退赛。 */
+    @PostMapping("/{raceId}/runners/{bib}/withdrawal")
+    public ResponseEntity<Object> withdrawRunner(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody WithdrawRunnerRequest request) {
+        return toResponse(raceService.withdrawRunner(raceId, bib, request));
+    }
+
+    /** 提交组别重分申请。 */
+    @PostMapping("/{raceId}/reclass-requests")
+    public ResponseEntity<Object> submitReclassApplication(
+            @PathVariable String raceId,
+            @Valid @RequestBody SubmitReclassApplicationRequest request) {
+        return toResponse(raceService.submitReclassApplication(raceId, request));
+    }
+
+    /** 查询赛事全部重分申请。 */
+    @GetMapping("/{raceId}/reclass-requests")
+    public List<ReclassApplicationResponse> listReclassApplications(@PathVariable String raceId) {
+        return raceService.listReclassApplications(raceId);
+    }
+
+    /** 拒绝重分申请（不改变成绩）。 */
+    @PostMapping("/{raceId}/reclass-requests/{applicationId}/rejection")
+    public ResponseEntity<Object> rejectReclassApplication(
+            @PathVariable String raceId,
+            @PathVariable String applicationId,
+            @Valid @RequestBody RejectReclassRequest request) {
+        return toResponse(raceService.rejectReclassApplication(raceId, applicationId, request));
+    }
+
+    /** 批量批准重分申请（原子迁移 + 两组排名重算 + 不可变重分记录）。 */
+    @PostMapping("/{raceId}/reclass-approvals")
+    public ResponseEntity<Object> approveReclassApplications(
+            @PathVariable String raceId,
+            @Valid @RequestBody ApproveReclassRequest request) {
+        return toResponse(raceService.approveReclassApplications(raceId, request));
+    }
+
+    /** 查询赛事全部不可变重分记录。 */
+    @GetMapping("/{raceId}/reclass-records")
+    public List<ReclassRecordResponse> listReclassRecords(@PathVariable String raceId) {
+        return raceService.listReclassRecords(raceId);
+    }
+
+    /** 组别封榜。 */
+    @PostMapping("/{raceId}/categories/{categoryCode}/seal")
+    public ResponseEntity<Object> sealCategory(
+            @PathVariable String raceId,
+            @PathVariable String categoryCode,
+            @Valid @RequestBody SealCategoryRequest request) {
+        return toResponse(raceService.sealCategory(raceId, categoryCode, request));
+    }
+
+    /** 查询组别排名（OPEN 实时；SEALED 快照）。 */
+    @GetMapping("/{raceId}/categories/{categoryCode}/standings")
+    public CategoryStandingResponse getCategoryStandings(
+            @PathVariable String raceId,
+            @PathVariable String categoryCode) {
+        return raceService.getCategoryStandings(raceId, categoryCode);
+    }
+
+    /** 查询赛事全部组别封榜历史快照。 */
+    @GetMapping("/{raceId}/category-snapshots")
+    public List<CategoryStandingResponse> listCategorySnapshots(@PathVariable String raceId) {
+        return raceService.listCategorySnapshots(raceId);
     }
 
     private ResponseEntity<Object> toResponse(ServiceResult result) {
