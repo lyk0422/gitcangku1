@@ -1,7 +1,9 @@
 package com.example.starter.evidence;
 
 import com.example.starter.error.ApiException;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Component;
 
@@ -9,12 +11,15 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
+import java.util.Map;
 import java.util.Optional;
 import java.util.function.Supplier;
 
 /**
  * 幂等编排（非事务）：计算请求指纹、处理并发下 command_key 唯一约束冲突。
  * 同键同参重放返回首次结果；同键改参返回 409；并发重复插入时回滚后重放先提交事务的结果。
+ * 指纹使用结构化 JSON（操作类型、操作者、规范化资源范围、全部结果相关请求字段），
+ * 不使用未转义的分隔符拼接，集合类入参在 DTO 访问器中完成稳定排序后再序列化。
  */
 @Component
 public class IdempotencyAdvisor {
@@ -28,22 +33,37 @@ public class IdempotencyAdvisor {
     }
 
     /**
-     * 计算请求指纹：操作类型 + 操作人 + 证物键 + 请求体规范化 JSON 的 SHA-256。
+     * 计算请求指纹：结构化 JSON {operation, actorId, scope, request} 的 SHA-256。
+     *
+     * @param operation 操作类型
+     * @param actorId   操作者（X-Actor-Id）
+     * @param scope     规范化资源范围（路径变量等结果相关字段），null 视为空对象
+     * @param request   请求体（记录结果相关全部字段）
      */
-    public String hash(String operation, String actorId, String evidenceKey, Object request) {
+    public String hash(String operation, String actorId, Object scope, Object request) {
         try {
-            String canonical = String.join("\n",
-                    operation,
-                    actorId == null ? "" : actorId,
-                    evidenceKey == null ? "" : evidenceKey,
-                    objectMapper.writeValueAsString(request));
+            ObjectNode canonical = objectMapper.createObjectNode();
+            canonical.put("operation", operation);
+            canonical.put("actorId", actorId == null ? "" : actorId);
+            JsonNode scopeNode = objectMapper.valueToTree(scope == null ? Map.of() : scope);
+            canonical.set("scope", scopeNode);
+            canonical.set("request", objectMapper.valueToTree(request));
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            return HexFormat.of().formatHex(digest.digest(canonical.getBytes(StandardCharsets.UTF_8)));
+            return HexFormat.of().formatHex(
+                    digest.digest(canonical.toString().getBytes(StandardCharsets.UTF_8)));
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException("SHA-256 不可用", e);
         } catch (Exception e) {
             throw new IllegalStateException("请求序列化失败", e);
         }
+    }
+
+    /**
+     * 计算请求指纹，资源范围仅含证物键。
+     */
+    public String hash(String operation, String actorId, String evidenceKey, Object request) {
+        return hash(operation, actorId, Map.of("evidenceKey", evidenceKey == null ? "" : evidenceKey),
+                request);
     }
 
     /**
