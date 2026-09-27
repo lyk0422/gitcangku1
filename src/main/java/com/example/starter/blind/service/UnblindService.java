@@ -51,6 +51,10 @@ public class UnblindService {
         if (reason.length() > 500) {
             throw ApiException.badRequest("reason 最长 500 字符");
         }
+        // 与封存/扩容/分配共用实验行级锁，揭盲申请与封存按事务提交顺序裁决。
+        if (experimentRepository.lockById(experimentId) == null) {
+            throw ApiException.notFound("实验不存在: " + experimentId);
+        }
         AllocationRow allocation =
                 experimentService.mustFindAllocationRow(experimentId, participantId);
         UnblindRequestRow pending =
@@ -86,11 +90,12 @@ public class UnblindService {
         if (row.applicantActor().equals(reviewerActor)) {
             throw ApiException.forbidden("批准人必须是不同于申请人的另一名 REVIEWER");
         }
-        // 从数据库读取处理映射（盲底），批准时写入申请记录；处理代码不打日志。
+        // 从数据库按分配固化的版本与序号读取处理映射（盲底），批准时写入申请记录；
+        // 扩容不改写历史版本，旧分配永远定位到旧版本序号。处理代码不打日志。
         AllocationRow allocation =
                 experimentService.mustFindAllocationRow(row.experimentId(), row.participantId());
-        SeatRow seat = experimentRepository.findSeat(row.experimentId(),
-                allocation.blockNo(), allocation.seatNo());
+        SeatRow seat = experimentRepository.findSeatByVersionAndSeq(
+                allocation.tableVersionId(), allocation.seatNo());
         if (seat == null) {
             throw new IllegalStateException("席位映射缺失，数据不一致");
         }

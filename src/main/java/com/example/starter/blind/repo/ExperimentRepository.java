@@ -8,6 +8,7 @@ import java.util.List;
 
 /**
  * 实验与席位数据访问；席位处理映射仅落库，不输出到日志。
+ * 席位按随机表版本隔离，同区组不同版本各自从序号 1 开始。
  */
 @Repository
 public class ExperimentRepository {
@@ -17,7 +18,8 @@ public class ExperimentRepository {
     }
 
     /** 席位行（盲底）：treatment 为 A/B，seatNo 可直接解码，禁止出现在普通接口。 */
-    public record SeatRow(String experimentId, int blockNo, int seatNo, String treatment) {
+    public record SeatRow(long tableVersionId, String experimentId, int blockNo, int seatNo,
+                          String treatment) {
     }
 
     private static final RowMapper<ExperimentRow> EXPERIMENT_MAPPER = (rs, n) -> new ExperimentRow(
@@ -27,6 +29,7 @@ public class ExperimentRepository {
             rs.getLong("created_at"));
 
     private static final RowMapper<SeatRow> SEAT_MAPPER = (rs, n) -> new SeatRow(
+            rs.getLong("table_version_id"),
             rs.getString("experiment_id"),
             rs.getInt("block_no"),
             rs.getInt("seat_no"),
@@ -69,22 +72,26 @@ public class ExperimentRepository {
     }
 
     public void insertSeat(SeatRow seat) {
-        jdbc.update("INSERT INTO seat (experiment_id, block_no, seat_no, treatment) VALUES (?, ?, ?, ?)",
-                seat.experimentId(), seat.blockNo(), seat.seatNo(), seat.treatment());
+        jdbc.update("INSERT INTO seat (experiment_id, block_no, seat_no, treatment, table_version_id) "
+                        + "VALUES (?, ?, ?, ?, ?)",
+                seat.experimentId(), seat.blockNo(), seat.seatNo(), seat.treatment(),
+                seat.tableVersionId());
     }
 
-    public List<SeatRow> findSeats(String experimentId) {
+    /** 某随机表版本的全部席位，按序号升序（封存复核摘要时使用）。 */
+    public List<SeatRow> findSeatsByVersion(long tableVersionId) {
         return jdbc.query(
-                "SELECT experiment_id, block_no, seat_no, treatment FROM seat "
-                        + "WHERE experiment_id = ? ORDER BY block_no, seat_no",
-                SEAT_MAPPER, experimentId);
+                "SELECT table_version_id, experiment_id, block_no, seat_no, treatment FROM seat "
+                        + "WHERE table_version_id = ? ORDER BY seat_no",
+                SEAT_MAPPER, tableVersionId);
     }
 
-    public SeatRow findSeat(String experimentId, int blockNo, int seatNo) {
+    /** 按分配固化的版本与序号定位席位（受控揭盲时使用，不依赖可变的实验级席位顺序）。 */
+    public SeatRow findSeatByVersionAndSeq(long tableVersionId, int seatNo) {
         List<SeatRow> rows = jdbc.query(
-                "SELECT experiment_id, block_no, seat_no, treatment FROM seat "
-                        + "WHERE experiment_id = ? AND block_no = ? AND seat_no = ?",
-                SEAT_MAPPER, experimentId, blockNo, seatNo);
+                "SELECT table_version_id, experiment_id, block_no, seat_no, treatment FROM seat "
+                        + "WHERE table_version_id = ? AND seat_no = ?",
+                SEAT_MAPPER, tableVersionId, seatNo);
         return rows.isEmpty() ? null : rows.get(0);
     }
 }

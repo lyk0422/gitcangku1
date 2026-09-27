@@ -87,6 +87,19 @@ public class UnblindRequestRepository {
     }
 
     /**
+     * 统计区组内揭盲申请数量（含待审与已批准）；封存前置校验使用：
+     * 区组已进入揭盲流程则随机表不可再封存，避免封存/扩容与揭盲证据相互矛盾。
+     */
+    public int countAnyByBlock(String experimentId, int blockNo) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM unblind_request u "
+                        + "JOIN allocation a ON a.id = u.allocation_id "
+                        + "WHERE a.experiment_id = ? AND a.block_no = ?",
+                Integer.class, experimentId, blockNo);
+        return count == null ? 0 : count;
+    }
+
+    /**
      * 批准：仅 PENDING 可批准，写入处理代码、批准人与时间，并释放待审唯一占位。
      *
      * @return 受影响行数；0 表示不存在或已批准
