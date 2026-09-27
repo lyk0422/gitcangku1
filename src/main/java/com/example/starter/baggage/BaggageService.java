@@ -1,5 +1,6 @@
 package com.example.starter.baggage;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -19,6 +20,18 @@ import com.example.starter.baggage.BaggageDtos.ArriveResponse;
 import com.example.starter.baggage.BaggageDtos.BagResponse;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveRequest;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveResponse;
+import com.example.starter.baggage.BaggageDtos.DwellCheckItem;
+import com.example.starter.baggage.BaggageDtos.DwellCheckRequest;
+import com.example.starter.baggage.BaggageDtos.DwellCheckResponse;
+import com.example.starter.baggage.BaggageDtos.DwellConfigRequest;
+import com.example.starter.baggage.BaggageDtos.DwellConfigResponse;
+import com.example.starter.baggage.BaggageDtos.DwellExceededItem;
+import com.example.starter.baggage.BaggageDtos.DwellExceededListResponse;
+import com.example.starter.baggage.BaggageDtos.DwellRecordItem;
+import com.example.starter.baggage.BaggageDtos.DwellRecordListResponse;
+import com.example.starter.baggage.BaggageDtos.DwellReleaseRequest;
+import com.example.starter.baggage.BaggageDtos.DwellReleaseResponse;
+import com.example.starter.baggage.BaggageDtos.DwellStatusResponse;
 import com.example.starter.baggage.BaggageDtos.ItineraryItem;
 import com.example.starter.baggage.BaggageDtos.LegDifferenceResponse;
 import com.example.starter.baggage.BaggageDtos.LegResponse;
@@ -55,6 +68,7 @@ public class BaggageService {
     private static final String BAG_SHORT_UNLOADED = "SHORT_UNLOADED";
     private static final String BAG_RECOVERED = "RECOVERED";
     private static final String BAG_DELIVERED = "DELIVERED";
+    private static final String BAG_DWELL_EXCEEDED = "DWELL_EXCEEDED";
 
     private static final String EVT_REGISTERED = "REGISTERED";
     private static final String EVT_LOADED = "LOADED";
@@ -62,6 +76,15 @@ public class BaggageService {
     private static final String EVT_SHORT = "SHORT_UNLOADED";
     private static final String EVT_RECOVERED = "RECOVERED";
     private static final String EVT_DELIVERED = "DELIVERED";
+    private static final String EVT_DWELL_EXCEEDED = "DWELL_EXCEEDED";
+    private static final String EVT_DWELL_RELEASED = "DWELL_RELEASED";
+
+    private static final String REC_ARRIVAL = "ARRIVAL";
+    private static final String REC_EXCEEDED = "EXCEEDED";
+    private static final String REC_RELEASED = "RELEASED";
+
+    /** 航段装载容量上限（件），解除滞留阻断时重新校验。 */
+    private static final int MAX_LEG_CAPACITY = 20;
 
     private static final RowMapper<LegRow> LEG_MAPPER = (rs, rowNum) -> new LegRow(
             rs.getString("leg_id"), rs.getString("origin"), rs.getString("destination"),
@@ -72,7 +95,8 @@ public class BaggageService {
             rs.getString("bag_tag"), rs.getString("current_location"),
             rs.getInt("next_leg_index"), rs.getString("status"), rs.getString("loaded_leg_id"),
             rs.getString("short_leg_id"), rs.getString("short_destination"),
-            getInstant(rs, "short_registered_at"));
+            getInstant(rs, "short_registered_at"),
+            rs.getString("dwell_station"), getInstant(rs, "dwell_arrived_at"));
 
     private static final RowMapper<ItineraryItem> ITINERARY_MAPPER = (rs, rowNum) -> new ItineraryItem(
             rs.getInt("seq"), rs.getString("leg_id"), rs.getString("origin"), rs.getString("destination"));
@@ -85,6 +109,15 @@ public class BaggageService {
             rs.getString("bag_tag"), rs.getString("short_leg_id"), rs.getString("short_destination"),
             getInstant(rs, "short_registered_at").toString(),
             rs.getInt("next_leg_index"), rs.getString("current_location"));
+
+    private static final RowMapper<DwellRecordItem> DWELL_RECORD_MAPPER = (rs, rowNum) -> {
+        Instant arrivedAt = getInstant(rs, "arrived_at");
+        return new DwellRecordItem(rs.getLong("id"), rs.getString("record_type"),
+                rs.getString("station"), arrivedAt == null ? null : arrivedAt.toString(),
+                getInstant(rs, "recorded_at").toString(),
+                (Long) rs.getObject("dwell_minutes"), (Integer) rs.getObject("max_dwell_minutes"),
+                rs.getString("next_leg_id"), rs.getString("reviewer"), rs.getString("review_note"));
+    };
 
     private final JdbcTemplate jdbcTemplate;
     private final IdempotencyService idempotencyService;
@@ -205,6 +238,212 @@ public class BaggageService {
         return new ShortListResponse(items);
     }
 
+    /** 配置中转点最大滞留分钟数：同中转点重复配置覆盖上限，历史证据保留判定时上限。 */
+    public DwellConfigResponse configureDwell(DwellConfigRequest request) {
+        return idempotencyService.execute(request.requestId(), "CONFIG_DWELL", 201,
+                request, DwellConfigResponse.class, () -> doConfigureDwell(request));
+    }
+
+    /**
+     * 批量到达核对（超时判定）：中转点缺配置、到达时刻缺失或任一行李状态非法均 422 整次回滚；
+     * 滞留时长达到或超过上限（区间左闭右开 [0, max)）的行李转 DWELL_EXCEEDED 并追加不可变超时证据。
+     */
+    public DwellCheckResponse checkDwell(String station, DwellCheckRequest request) {
+        DwellCheckPayload payload = new DwellCheckPayload(station, sortedCopy(request.bagTags()));
+        return idempotencyService.execute(request.requestId(), "DWELL_CHECK", 200,
+                payload, DwellCheckResponse.class, () -> doCheckDwell(station, request));
+    }
+
+    /**
+     * 解除滞留阻断：登记复核人与复核结论，必须指定行程内下一航段，
+     * 并重新校验该航段装载截止（仍为 OPEN）与容量（未达上限）。
+     */
+    public DwellReleaseResponse releaseDwell(String bagTag, DwellReleaseRequest request) {
+        DwellReleasePayload payload = new DwellReleasePayload(
+                bagTag, request.reviewer(), request.reviewNote(), request.nextLegId());
+        return idempotencyService.execute(request.requestId(), "DWELL_RELEASE", 200,
+                payload, DwellReleaseResponse.class, () -> doReleaseDwell(bagTag, request));
+    }
+
+    /** 行李当前滞留诊断：只读，不改状态。 */
+    public DwellStatusResponse getDwellStatus(String bagTag) {
+        BagRow bag = findBag(bagTag);
+        if (bag == null) {
+            throw ApiException.notFound("行李不存在: " + bagTag);
+        }
+        Long dwellMinutes = null;
+        Integer maxDwellMinutes = null;
+        if (bag.dwellArrivedAt() != null) {
+            dwellMinutes = Duration.between(bag.dwellArrivedAt(), clock.get()).toMinutes();
+            maxDwellMinutes = findDwellConfig(bag.dwellStation());
+        }
+        return new DwellStatusResponse(bag.bagTag(), bag.status(), bag.dwellStation(),
+                bag.dwellArrivedAt() == null ? null : bag.dwellArrivedAt().toString(),
+                dwellMinutes, maxDwellMinutes);
+    }
+
+    /** 行李滞留证据历史：按 id 升序（提交顺序），只读，不改状态。 */
+    public DwellRecordListResponse listDwellRecords(String bagTag) {
+        if (findBag(bagTag) == null) {
+            throw ApiException.notFound("行李不存在: " + bagTag);
+        }
+        List<DwellRecordItem> records = jdbcTemplate.query(
+                "SELECT id, record_type, station, arrived_at, recorded_at, dwell_minutes,"
+                        + " max_dwell_minutes, next_leg_id, reviewer, review_note"
+                        + " FROM dwell_record WHERE bag_tag = ? ORDER BY id",
+                DWELL_RECORD_MAPPER, bagTag);
+        return new DwellRecordListResponse(bagTag, records);
+    }
+
+    /** 中转点当前滞留超时行李清单：按到达时刻、袋号稳定排序，只读。 */
+    public DwellExceededListResponse listDwellExceeded(String station) {
+        List<DwellExceededItem> items = jdbcTemplate.query(
+                "SELECT bag_tag, dwell_station, dwell_arrived_at FROM bag"
+                        + " WHERE status = ? AND dwell_station = ?"
+                        + " ORDER BY dwell_arrived_at, bag_tag",
+                (rs, rowNum) -> new DwellExceededItem(rs.getString("bag_tag"),
+                        rs.getString("dwell_station"),
+                        getInstant(rs, "dwell_arrived_at").toString()),
+                BAG_DWELL_EXCEEDED, station);
+        return new DwellExceededListResponse(station, items);
+    }
+
+    private DwellConfigResponse doConfigureDwell(DwellConfigRequest request) {
+        Integer existing = findDwellConfig(request.station());
+        if (existing == null) {
+            jdbcTemplate.update(
+                    "INSERT INTO dwell_config (station, max_dwell_minutes) VALUES (?, ?)",
+                    request.station(), request.maxDwellMinutes());
+        } else {
+            jdbcTemplate.update(
+                    "UPDATE dwell_config SET max_dwell_minutes = ? WHERE station = ?",
+                    request.maxDwellMinutes(), request.station());
+        }
+        return new DwellConfigResponse(request.station(), request.maxDwellMinutes());
+    }
+
+    private DwellCheckResponse doCheckDwell(String station, DwellCheckRequest request) {
+        Integer maxDwellMinutes = findDwellConfig(station);
+        if (maxDwellMinutes == null) {
+            throw ApiException.unprocessable("中转点 " + station + " 缺少滞留配置，无法核对");
+        }
+        List<String> bagTags = request.bagTags();
+        if (new HashSet<>(bagTags).size() != bagTags.size()) {
+            throw ApiException.unprocessable("批量核对的 bagTag 不得重复");
+        }
+        // 先对全部行李完成最终状态校验，任一非法则整次回滚，不产生半成品
+        List<BagRow> bags = new ArrayList<>();
+        for (String bagTag : sortedCopy(bagTags)) {
+            BagRow bag = lockBag(bagTag);
+            if (bag == null) {
+                throw ApiException.unprocessable("行李不存在: " + bagTag);
+            }
+            validateDwellCheckable(bag, station);
+            bags.add(bag);
+        }
+        Instant now = clock.get();
+        List<DwellCheckItem> results = new ArrayList<>();
+        for (BagRow bag : bags) {
+            long dwellMinutes = Duration.between(bag.dwellArrivedAt(), now).toMinutes();
+            boolean exceeded = dwellMinutes >= maxDwellMinutes;
+            if (exceeded) {
+                jdbcTemplate.update("UPDATE bag SET status = ? WHERE bag_tag = ?",
+                        BAG_DWELL_EXCEEDED, bag.bagTag());
+                insertDwellRecord(new DwellEvidence(bag.bagTag(), station, REC_EXCEEDED,
+                        bag.dwellArrivedAt(), dwellMinutes, maxDwellMinutes, null, null, null));
+                insertEvent(bag.bagTag(), EVT_DWELL_EXCEEDED, null, station);
+            }
+            results.add(new DwellCheckItem(bag.bagTag(), dwellMinutes, maxDwellMinutes, exceeded));
+        }
+        return new DwellCheckResponse(station, maxDwellMinutes, now.toString(), results);
+    }
+
+    /** 核对前状态校验：仅允许在中转点等待（未装载、行程未完）的行李参与。 */
+    private void validateDwellCheckable(BagRow bag, String station) {
+        if (BAG_DWELL_EXCEEDED.equals(bag.status())) {
+            throw ApiException.unprocessable(
+                    "行李 " + bag.bagTag() + " 已处于滞留超时阻断状态，须先复核解除");
+        }
+        if (!BAG_IN_TRANSIT.equals(bag.status()) && !BAG_RECOVERED.equals(bag.status())) {
+            throw ApiException.unprocessable(
+                    "行李 " + bag.bagTag() + " 状态为 " + bag.status() + "，不可参与到达核对");
+        }
+        if (bag.loadedLegId() != null) {
+            throw ApiException.unprocessable(
+                    "行李 " + bag.bagTag() + " 已装载到航段 " + bag.loadedLegId() + "，不在中转点等待");
+        }
+        if (!bag.currentLocation().equals(station)) {
+            throw ApiException.unprocessable(
+                    "行李 " + bag.bagTag() + " 当前位于 " + bag.currentLocation()
+                            + "，不在中转点 " + station);
+        }
+        if (bag.dwellArrivedAt() == null) {
+            throw ApiException.unprocessable(
+                    "行李 " + bag.bagTag() + " 到达中转点 " + station + " 的时刻缺失，无法核对");
+        }
+    }
+
+    private DwellReleaseResponse doReleaseDwell(String bagTag, DwellReleaseRequest request) {
+        BagRow bag = lockBag(bagTag);
+        if (bag == null) {
+            throw ApiException.notFound("行李不存在: " + bagTag);
+        }
+        if (!BAG_DWELL_EXCEEDED.equals(bag.status())) {
+            throw ApiException.unprocessable(
+                    "行李 " + bagTag + " 状态为 " + bag.status() + "，不在滞留阻断中");
+        }
+        ItineraryItem next = nextItinerary(bagTag, bag.nextLegIndex());
+        if (next == null || !next.legId().equals(request.nextLegId())) {
+            throw ApiException.unprocessable(
+                    "下一航段 " + request.nextLegId() + " 不属于行李 " + bagTag + " 的行程待乘航段");
+        }
+        LegRow leg = findLeg(request.nextLegId());
+        if (leg == null) {
+            throw ApiException.unprocessable("下一航段不存在: " + request.nextLegId());
+        }
+        if (!LEG_OPEN.equals(leg.status())) {
+            throw ApiException.unprocessable(
+                    "下一航段 " + leg.legId() + " 已过装载截止: 当前状态 " + leg.status() + "，要求 OPEN");
+        }
+        Integer loaded = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM load_record WHERE leg_id = ?", Integer.class, leg.legId());
+        int loadedCount = loaded == null ? 0 : loaded;
+        if (loadedCount >= MAX_LEG_CAPACITY) {
+            throw ApiException.unprocessable(
+                    "下一航段 " + leg.legId() + " 容量不足: 已装载 " + loadedCount
+                            + " 件，上限 " + MAX_LEG_CAPACITY + " 件");
+        }
+        Instant now = clock.get();
+        jdbcTemplate.update("UPDATE bag SET status = ? WHERE bag_tag = ?", BAG_IN_TRANSIT, bagTag);
+        insertDwellRecord(new DwellEvidence(bagTag, bag.dwellStation(), REC_RELEASED,
+                bag.dwellArrivedAt(), null, null, request.nextLegId(),
+                request.reviewer(), request.reviewNote()));
+        insertEvent(bagTag, EVT_DWELL_RELEASED, request.nextLegId(), bag.currentLocation());
+        return new DwellReleaseResponse(bagTag, BAG_IN_TRANSIT, request.nextLegId(),
+                request.reviewer(), now.toString());
+    }
+
+    /** 追加不可变滞留证据，recorded_at 取当前时钟（UTC）。 */
+    private void insertDwellRecord(DwellEvidence evidence) {
+        jdbcTemplate.update(
+                "INSERT INTO dwell_record (bag_tag, station, record_type, arrived_at, recorded_at,"
+                        + " dwell_minutes, max_dwell_minutes, next_leg_id, reviewer, review_note)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                evidence.bagTag(), evidence.station(), evidence.recordType(),
+                evidence.arrivedAt() == null ? null
+                        : OffsetDateTime.ofInstant(evidence.arrivedAt(), ZoneOffset.UTC),
+                OffsetDateTime.ofInstant(clock.get(), ZoneOffset.UTC),
+                evidence.dwellMinutes(), evidence.maxDwellMinutes(),
+                evidence.nextLegId(), evidence.reviewer(), evidence.reviewNote());
+    }
+
+    private Integer findDwellConfig(String station) {
+        List<Integer> rows = jdbcTemplate.query(
+                "SELECT max_dwell_minutes FROM dwell_config WHERE station = ?",
+                (rs, rowNum) -> rs.getInt("max_dwell_minutes"), station);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
     private LegResponse doRegisterLeg(RegisterLegRequest request) {
         if (findLeg(request.legId()) != null) {
             throw ApiException.conflict("航段已存在: " + request.legId());
@@ -273,7 +512,10 @@ public class BaggageService {
         }
         for (BagRow bag : bags) {
             jdbcTemplate.update("INSERT INTO load_record (bag_tag, leg_id) VALUES (?, ?)", bag.bagTag(), legId);
-            jdbcTemplate.update("UPDATE bag SET loaded_leg_id = ? WHERE bag_tag = ?", legId, bag.bagTag());
+            jdbcTemplate.update(
+                    "UPDATE bag SET loaded_leg_id = ?, dwell_station = NULL, dwell_arrived_at = NULL"
+                            + " WHERE bag_tag = ?",
+                    legId, bag.bagTag());
             insertEvent(bag.bagTag(), EVT_LOADED, legId, leg.origin());
         }
         int newVersion = leg.version() + 1;
@@ -364,6 +606,10 @@ public class BaggageService {
         if (bag == null) {
             throw ApiException.notFound("行李不存在: " + request.bagTag());
         }
+        if (BAG_DWELL_EXCEEDED.equals(bag.status())) {
+            throw ApiException.conflict(
+                    "行李 " + bag.bagTag() + " 滞留超时已阻断，须复核解除后才能改派");
+        }
         if (!BAG_SHORT_UNLOADED.equals(bag.status())) {
             if (BAG_RECOVERED.equals(bag.status()) || BAG_DELIVERED.equals(bag.status())) {
                 throw ApiException.conflict("行李 " + bag.bagTag() + " 已补到，不得再次推进");
@@ -387,11 +633,24 @@ public class BaggageService {
         int nextIndex = bag.nextLegIndex() + 1;
         int total = itineraryCount(bag.bagTag());
         String newStatus = nextIndex >= total ? BAG_DELIVERED : BAG_RECOVERED;
-        jdbcTemplate.update(
-                "UPDATE bag SET current_location = ?, next_leg_index = ?, status = ?, loaded_leg_id = NULL,"
-                        + " short_leg_id = NULL, short_destination = NULL, short_registered_at = NULL"
-                        + " WHERE bag_tag = ?",
-                request.actualStation(), nextIndex, newStatus, bag.bagTag());
+        if (BAG_DELIVERED.equals(newStatus)) {
+            jdbcTemplate.update(
+                    "UPDATE bag SET current_location = ?, next_leg_index = ?, status = ?, loaded_leg_id = NULL,"
+                            + " short_leg_id = NULL, short_destination = NULL, short_registered_at = NULL,"
+                            + " dwell_station = NULL, dwell_arrived_at = NULL WHERE bag_tag = ?",
+                    request.actualStation(), nextIndex, newStatus, bag.bagTag());
+        } else {
+            // 补到后行程未完：实际到站即中转点，记录滞留起点并追加到达证据
+            OffsetDateTime arrivedAt = OffsetDateTime.ofInstant(clock.get(), ZoneOffset.UTC);
+            jdbcTemplate.update(
+                    "UPDATE bag SET current_location = ?, next_leg_index = ?, status = ?, loaded_leg_id = NULL,"
+                            + " short_leg_id = NULL, short_destination = NULL, short_registered_at = NULL,"
+                            + " dwell_station = ?, dwell_arrived_at = ? WHERE bag_tag = ?",
+                    request.actualStation(), nextIndex, newStatus,
+                    request.actualStation(), arrivedAt, bag.bagTag());
+            insertDwellRecord(new DwellEvidence(bag.bagTag(), request.actualStation(), REC_ARRIVAL,
+                    arrivedAt.toInstant(), null, null, null, null, null));
+        }
         insertEvent(bag.bagTag(), EVT_RECOVERED, request.missingLegId(), request.actualStation());
         if (BAG_DELIVERED.equals(newStatus)) {
             insertEvent(bag.bagTag(), EVT_DELIVERED, request.missingLegId(), request.actualStation());
@@ -400,15 +659,26 @@ public class BaggageService {
                 nextIndex, request.missingLegId());
     }
 
-    /** 实际到达行李的统一推进：移动到到达站、推进待乘索引，完成行程者交付。 */
+    /** 实际到达行李的统一推进：移动到到达站、推进待乘索引，完成行程者交付；
+     *  行程未完者到达站即中转点，记录滞留起点并追加到达证据。 */
     private void advanceArrivedBag(BagRow bag, String destination, String legId) {
         int nextIndex = bag.nextLegIndex() + 1;
         int total = itineraryCount(bag.bagTag());
         String status = nextIndex >= total ? BAG_DELIVERED : BAG_IN_TRANSIT;
-        jdbcTemplate.update(
-                "UPDATE bag SET current_location = ?, next_leg_index = ?, status = ?, loaded_leg_id = NULL"
-                        + " WHERE bag_tag = ?",
-                destination, nextIndex, status, bag.bagTag());
+        if (BAG_DELIVERED.equals(status)) {
+            jdbcTemplate.update(
+                    "UPDATE bag SET current_location = ?, next_leg_index = ?, status = ?, loaded_leg_id = NULL,"
+                            + " dwell_station = NULL, dwell_arrived_at = NULL WHERE bag_tag = ?",
+                    destination, nextIndex, status, bag.bagTag());
+        } else {
+            OffsetDateTime arrivedAt = OffsetDateTime.ofInstant(clock.get(), ZoneOffset.UTC);
+            jdbcTemplate.update(
+                    "UPDATE bag SET current_location = ?, next_leg_index = ?, status = ?, loaded_leg_id = NULL,"
+                            + " dwell_station = ?, dwell_arrived_at = ? WHERE bag_tag = ?",
+                    destination, nextIndex, status, destination, arrivedAt, bag.bagTag());
+            insertDwellRecord(new DwellEvidence(bag.bagTag(), destination, REC_ARRIVAL,
+                    arrivedAt.toInstant(), null, null, null, null, null));
+        }
         insertEvent(bag.bagTag(), EVT_UNLOADED, legId, destination);
         if (BAG_DELIVERED.equals(status)) {
             insertEvent(bag.bagTag(), EVT_DELIVERED, legId, destination);
@@ -416,6 +686,10 @@ public class BaggageService {
     }
 
     private void validateLoadable(BagRow bag, LegRow leg) {
+        if (BAG_DWELL_EXCEEDED.equals(bag.status())) {
+            throw ApiException.conflict(
+                    "行李 " + bag.bagTag() + " 滞留超时已阻断，须复核解除后才能装载");
+        }
         if (BAG_SHORT_UNLOADED.equals(bag.status())) {
             throw ApiException.unprocessable(
                     "行李 " + bag.bagTag() + " 处于短卸状态，须先补到才能装载后续航段");
@@ -474,7 +748,8 @@ public class BaggageService {
 
     private static String bagSelect(boolean forUpdate) {
         return "SELECT bag_tag, current_location, next_leg_index, status, loaded_leg_id,"
-                + " short_leg_id, short_destination, short_registered_at FROM bag WHERE bag_tag = ?"
+                + " short_leg_id, short_destination, short_registered_at,"
+                + " dwell_station, dwell_arrived_at FROM bag WHERE bag_tag = ?"
                 + (forUpdate ? " FOR UPDATE" : "");
     }
 
@@ -521,6 +796,8 @@ public class BaggageService {
                 bag.status(), bag.loadedLegId(), toItinerary(bag.bagTag()),
                 bag.shortLegId(), bag.shortDestination(),
                 bag.shortRegisteredAt() == null ? null : bag.shortRegisteredAt().toString(),
+                bag.dwellStation(),
+                bag.dwellArrivedAt() == null ? null : bag.dwellArrivedAt().toString(),
                 toEvents(bag.bagTag()));
     }
 
@@ -557,7 +834,8 @@ public class BaggageService {
 
     private record BagRow(String bagTag, String currentLocation, int nextLegIndex,
                           String status, String loadedLegId, String shortLegId,
-                          String shortDestination, Instant shortRegisteredAt) {
+                          String shortDestination, Instant shortRegisteredAt,
+                          String dwellStation, Instant dwellArrivedAt) {
     }
 
     /** 装载幂等摘要参数：bagTags 已排序，顺序差异不视为异参。 */
@@ -574,5 +852,20 @@ public class BaggageService {
 
     /** 差异到达幂等摘要参数：bagTags 已排序，顺序差异不视为异参。 */
     private record DifferenceArrivePayload(String legId, int expectedVersion, List<String> bagTags) {
+    }
+
+    /** 批量到达核对幂等摘要参数：bagTags 已排序，顺序差异不视为异参。 */
+    private record DwellCheckPayload(String station, List<String> bagTags) {
+    }
+
+    /** 滞留解除幂等摘要参数：覆盖复核人、复核结论与下一航段。 */
+    private record DwellReleasePayload(String bagTag, String reviewer, String reviewNote,
+                                       String nextLegId) {
+    }
+
+    /** 滞留证据写入参数：recordedAt 由写入时统一取时钟，null 含义见 dwell_record 表注释。 */
+    private record DwellEvidence(String bagTag, String station, String recordType, Instant arrivedAt,
+                                 Long dwellMinutes, Integer maxDwellMinutes, String nextLegId,
+                                 String reviewer, String reviewNote) {
     }
 }

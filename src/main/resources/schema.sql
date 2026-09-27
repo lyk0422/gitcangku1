@@ -21,11 +21,13 @@ CREATE TABLE IF NOT EXISTS bag (
     bag_tag             VARCHAR(64)  NOT NULL COMMENT '行李牌号，全局唯一',
     current_location    VARCHAR(64)  NOT NULL COMMENT '当前所在站点代码',
     next_leg_index      INT          NOT NULL DEFAULT 0 COMMENT '待乘航段在行程中的下标（0 起），等于行程长度表示已完成；短卸不推进',
-    status              VARCHAR(16)  NOT NULL DEFAULT 'IN_TRANSIT' COMMENT '行李状态：IN_TRANSIT 在途/SHORT_UNLOADED 短卸待补/RECOVERED 已补到在途/DELIVERED 已交付',
+    status              VARCHAR(16)  NOT NULL DEFAULT 'IN_TRANSIT' COMMENT '行李状态：IN_TRANSIT 在途/SHORT_UNLOADED 短卸待补/RECOVERED 已补到在途/DELIVERED 已交付/DWELL_EXCEEDED 滞留超时阻断',
     loaded_leg_id       VARCHAR(64)  NULL COMMENT '当前已装载到的航段，未装载为 NULL',
     short_leg_id        VARCHAR(64)  NULL COMMENT '短卸缺失航段标识，仅 SHORT_UNLOADED 状态非 NULL',
     short_destination   VARCHAR(64)  NULL COMMENT '短卸应到站点代码，仅 SHORT_UNLOADED 状态非 NULL',
     short_registered_at TIMESTAMP WITH TIME ZONE NULL COMMENT '短卸登记时刻（UTC），仅 SHORT_UNLOADED 状态非 NULL',
+    dwell_station       VARCHAR(64)  NULL COMMENT '当前滞留中转点站点代码，仅在到达中转点且行程未完时非 NULL，装载离站或交付后为 NULL',
+    dwell_arrived_at    TIMESTAMP WITH TIME ZONE NULL COMMENT '到达当前中转点时刻（UTC），仅 dwell_station 非 NULL 时非 NULL',
     created_at          TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     PRIMARY KEY (bag_tag)
 );
@@ -53,7 +55,7 @@ CREATE TABLE IF NOT EXISTS bag_event (
     id         BIGINT AUTO_INCREMENT NOT NULL COMMENT '事件自增主键',
     bag_tag    VARCHAR(64)  NOT NULL COMMENT '行李牌号',
     seq        INT          NOT NULL COMMENT '该行李内事件顺序，0 起递增',
-    event_type VARCHAR(32)  NOT NULL COMMENT '事件类型：REGISTERED 登记/LOADED 装载/UNLOADED 到达卸下/SHORT_UNLOADED 短卸/RECOVERED 补到/DELIVERED 交付',
+    event_type VARCHAR(32)  NOT NULL COMMENT '事件类型：REGISTERED 登记/LOADED 装载/UNLOADED 到达卸下/SHORT_UNLOADED 短卸/RECOVERED 补到/DELIVERED 交付/DWELL_EXCEEDED 滞留超时/DWELL_RELEASED 滞留解除',
     leg_id     VARCHAR(64)  NULL COMMENT '关联航段标识，与航段无关的事件为 NULL',
     location   VARCHAR(64)  NULL COMMENT '事件发生后行李所在站点代码',
     event_time TIMESTAMP WITH TIME ZONE NOT NULL COMMENT '事件发生时刻（UTC）',
@@ -64,10 +66,34 @@ CREATE TABLE IF NOT EXISTS bag_event (
 -- 幂等去重：仅记录成功请求；同 requestId 同参数重放原结果，异参数返回 409
 CREATE TABLE IF NOT EXISTS request_log (
     request_id      VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
-    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER',
+    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER/CONFIG_DWELL/DWELL_CHECK/DWELL_RELEASE',
     request_hash    VARCHAR(64)  NOT NULL COMMENT '请求参数（不含 requestId）的 SHA-256 摘要',
     response_status INT          NOT NULL COMMENT '原成功响应的 HTTP 状态码',
     response_body   CLOB         NOT NULL COMMENT '原成功响应体（JSON）',
     created_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     PRIMARY KEY (request_id)
+);
+
+-- 中转点滞留配置：station 唯一，上限可重复配置覆盖；历史证据保留判定时的上限，不被覆盖
+CREATE TABLE IF NOT EXISTS dwell_config (
+    station           VARCHAR(64) NOT NULL COMMENT '中转点站点代码',
+    max_dwell_minutes INT         NOT NULL COMMENT '最大滞留分钟数；滞留时长区间为 [0, max)，达到或超过上限判定超时',
+    updated_at        TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近配置时间',
+    PRIMARY KEY (station)
+);
+
+-- 滞留证据：不可变追加，id 自增顺序即提交顺序；后续航段变更与再次配置均不改写历史记录
+CREATE TABLE IF NOT EXISTS dwell_record (
+    id                BIGINT AUTO_INCREMENT NOT NULL COMMENT '证据自增主键，排序稳定',
+    bag_tag           VARCHAR(64)  NOT NULL COMMENT '行李牌号',
+    station           VARCHAR(64)  NOT NULL COMMENT '中转点站点代码',
+    record_type       VARCHAR(16)  NOT NULL COMMENT '记录类型：ARRIVAL 到达/EXCEEDED 超时/RELEASED 解除',
+    arrived_at        TIMESTAMP WITH TIME ZONE NULL COMMENT '行李到达中转点时刻（UTC），仅 ARRIVAL/EXCEEDED 记录非 NULL',
+    recorded_at       TIMESTAMP WITH TIME ZONE NOT NULL COMMENT '记录生成时刻（UTC）',
+    dwell_minutes     BIGINT       NULL COMMENT '超时判定时的实际滞留分钟数，仅 EXCEEDED 记录非 NULL',
+    max_dwell_minutes INT          NULL COMMENT '超时判定时生效的配置上限分钟数，仅 EXCEEDED 记录非 NULL',
+    next_leg_id       VARCHAR(64)  NULL COMMENT '解除时指定的下一航段，仅 RELEASED 记录非 NULL',
+    reviewer          VARCHAR(64)  NULL COMMENT '复核人，仅 RELEASED 记录非 NULL',
+    review_note       VARCHAR(512) NULL COMMENT '复核结论，仅 RELEASED 记录非 NULL',
+    PRIMARY KEY (id)
 );
