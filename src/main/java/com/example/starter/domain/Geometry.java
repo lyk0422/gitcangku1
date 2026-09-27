@@ -100,4 +100,53 @@ public final class Geometry {
                                       int xMin, int yMin, int xMax, int yMax) {
         return x >= xMin && x <= xMax && y >= yMin && y <= yMax;
     }
+
+    /**
+     * 判断两条线段（含端点）是否相交，接触端点或共线重叠也算相交。
+     * 坐标为整数，叉积使用 long 运算不会溢出。
+     */
+    public static boolean segmentsIntersect(long ax, long ay, long bx, long by,
+                                            long cx, long cy, long dx, long dy) {
+        long d1 = cross(cx, cy, dx, dy, ax, ay);
+        long d2 = cross(cx, cy, dx, dy, bx, by);
+        long d3 = cross(ax, ay, bx, by, cx, cy);
+        long d4 = cross(ax, ay, bx, by, dx, dy);
+        if (((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0))
+                && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))) {
+            return true;
+        }
+        return (d1 == 0 && onSegment(cx, cy, dx, dy, ax, ay))
+                || (d2 == 0 && onSegment(cx, cy, dx, dy, bx, by))
+                || (d3 == 0 && onSegment(ax, ay, bx, by, cx, cy))
+                || (d4 == 0 && onSegment(ax, ay, bx, by, dx, dy));
+    }
+
+    /**
+     * 判断两条折线（各自按顺序连接的航点）是否有任意线段相交（含接触）。
+     */
+    public static boolean polylinesIntersect(List<Point> first, List<Point> second) {
+        for (int i = 0; i + 1 < first.size(); i++) {
+            Point a = first.get(i);
+            Point b = first.get(i + 1);
+            for (int j = 0; j + 1 < second.size(); j++) {
+                Point c = second.get(j);
+                Point d = second.get(j + 1);
+                if (segmentsIntersect(a.x(), a.y(), b.x(), b.y(), c.x(), c.y(), d.x(), d.y())) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /** 向量 (ox,oy)→(px,py) 与 (ox,oy)→(qx,qy) 的叉积。 */
+    private static long cross(long ox, long oy, long px, long py, long qx, long qy) {
+        return (px - ox) * (qy - oy) - (py - oy) * (qx - ox);
+    }
+
+    /** 点 (qx,qy) 是否在线段 (px,py)→(rx,ry) 上（前提：共线）。 */
+    private static boolean onSegment(long px, long py, long rx, long ry, long qx, long qy) {
+        return qx >= Math.min(px, rx) && qx <= Math.max(px, rx)
+                && qy >= Math.min(py, ry) && qy <= Math.max(py, ry);
+    }
 }

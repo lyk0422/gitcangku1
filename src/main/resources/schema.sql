@@ -62,8 +62,76 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_review_request ON review (request_id);
 -- 写操作幂等去重：同键同参重放原结果，异参冲突；失败不占键
 CREATE TABLE IF NOT EXISTS request_dedup (
     request_id     VARCHAR(64) PRIMARY KEY COMMENT '写操作全局唯一请求标识',
-    request_kind   VARCHAR(32) NOT NULL COMMENT '请求类型：ZONE_CREATE/ZONE_REVOKE/ROUTE_CREATE/ROUTE_REPLACE/REVIEW',
+    request_kind   VARCHAR(32) NOT NULL COMMENT '请求类型：ZONE_CREATE/ZONE_REVOKE/ROUTE_CREATE/ROUTE_REPLACE/REVIEW/CORRIDOR_CREATE/CORRIDOR_REVOKE/OCCUPATION_CREATE/OCCUPATION_DEPART/OCCUPATION_REAPPLY',
     request_hash   VARCHAR(64) NOT NULL COMMENT '规范化参数的 SHA-256 十六进制摘要，用于同键异参冲突判定',
     response_json  CLOB NOT NULL COMMENT '首次成功响应 JSON，重放时原样返回',
     created_at     BIGINT NOT NULL COMMENT '首次成功时间，epoch 毫秒（UTC）'
 ) COMMENT = '写操作幂等去重记录（与业务变更同事务原子提交）';
+
+-- 应急走廊：授权调度员在指定区域、UTC 时段与高度范围预留，仅供应急航线使用。
+-- 时间窗与高度范围均为左闭右开区间；撤销或自然到期只影响后续占用。
+CREATE TABLE IF NOT EXISTS emergency_corridor (
+    corridor_id  VARCHAR(64) PRIMARY KEY COMMENT '应急走廊唯一标识',
+    x_min        INT NOT NULL COMMENT '区域左边界（含），单位米',
+    y_min        INT NOT NULL COMMENT '区域下边界（含），单位米',
+    x_max        INT NOT NULL COMMENT '区域右边界（含），单位米，x_min < x_max',
+    y_max        INT NOT NULL COMMENT '区域上边界（含），单位米，y_min < y_max',
+    start_utc    BIGINT NOT NULL COMMENT '生效起点（含），epoch 毫秒（UTC）',
+    end_utc      BIGINT NOT NULL COMMENT '生效终点（不含），epoch 毫秒（UTC），start_utc < end_utc',
+    alt_min      INT NOT NULL COMMENT '高度下限（含），单位米',
+    alt_max      INT NOT NULL COMMENT '高度上限（不含），单位米，alt_min < alt_max',
+    priority     INT NOT NULL COMMENT '走廊优先级；同优先级 ACTIVE 走廊时空不得重叠',
+    status       VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE 有效；REVOKED 已撤销（仅影响后续占用，已让渡不自动恢复）',
+    version      INT NOT NULL COMMENT '走廊版本，创建为 1，撤销后加一',
+    operator     VARCHAR(64) NOT NULL COMMENT '创建走廊的授权调度员标识',
+    created_at   BIGINT NOT NULL COMMENT '创建时间，epoch 毫秒（UTC）',
+    revoked_at   BIGINT NULL COMMENT '撤销时间，epoch 毫秒（UTC）；NULL 表示未撤销'
+) COMMENT = '空域应急走廊预留（区域闭矩形 + 左闭右开时段与高度范围）';
+
+-- 空域占用：航线在指定 UTC 时段与高度范围（均左闭右开）占用空域。
+-- 创建时完成禁飞审查并固化审查记录与航点快照；状态机 ACTIVE→YIELDED/DEPARTED。
+CREATE TABLE IF NOT EXISTS occupation (
+    occupation_id    VARCHAR(64) PRIMARY KEY COMMENT '占用唯一标识',
+    route_id         VARCHAR(64) NOT NULL COMMENT '占用航线标识',
+    route_version    INT NOT NULL COMMENT '占用时审查的航线版本',
+    kind             VARCHAR(16) NOT NULL COMMENT '占用类型：REGULAR 常规 / EMERGENCY 应急',
+    start_utc        BIGINT NOT NULL COMMENT '占用起点（含），epoch 毫秒（UTC）',
+    end_utc          BIGINT NOT NULL COMMENT '占用终点（不含），epoch 毫秒（UTC），start_utc < end_utc',
+    alt_min          INT NOT NULL COMMENT '占用高度下限（含），单位米',
+    alt_max          INT NOT NULL COMMENT '占用高度上限（不含），单位米，alt_min < alt_max',
+    yieldable        BOOLEAN NOT NULL COMMENT '是否可被应急走廊强制让渡；FALSE 为不可让渡',
+    status           VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE 占用中；YIELDED 已被走廊让渡；DEPARTED 已起飞（不可让渡）',
+    review_id        VARCHAR(64) NOT NULL COMMENT '授权本次占用的不可变审查记录标识',
+    airspace_version BIGINT NOT NULL COMMENT '占用审查时的全局空域版本',
+    points_snapshot  VARCHAR(4000) NOT NULL COMMENT '占用时航点不可变快照，格式 x,y;x,y',
+    superseded_by    VARCHAR(64) NULL COMMENT '重新申请生成的新占用标识；NULL 表示未被接替',
+    created_at       BIGINT NOT NULL COMMENT '创建时间，epoch 毫秒（UTC）',
+    departed_at      BIGINT NULL COMMENT '起飞登记时间，epoch 毫秒（UTC）；NULL 表示未起飞'
+) COMMENT = '空域占用（常规/应急），含审查证据快照';
+
+-- 走廊让渡历史（不可变）：走廊创建时被强制让渡的常规占用，
+-- 固化原审查版本、走廊版本与让渡原因，后续操作不得改写。
+CREATE TABLE IF NOT EXISTS corridor_yield (
+    yield_id         VARCHAR(64) PRIMARY KEY COMMENT '让渡记录唯一标识（不可变）',
+    corridor_id      VARCHAR(64) NOT NULL COMMENT '触发让渡的应急走廊标识',
+    corridor_version INT NOT NULL COMMENT '让渡发生时的走廊版本',
+    occupation_id    VARCHAR(64) NOT NULL COMMENT '被让渡的常规占用标识',
+    route_id         VARCHAR(64) NOT NULL COMMENT '被让渡航线标识',
+    review_id        VARCHAR(64) NOT NULL COMMENT '原占用的授权审查记录标识',
+    route_version    INT NOT NULL COMMENT '原审查固化的航线版本',
+    reason           VARCHAR(256) NOT NULL COMMENT '让渡原因',
+    created_at       BIGINT NOT NULL COMMENT '让渡时间，epoch 毫秒（UTC）'
+) COMMENT = '应急走廊强制让渡历史（不可变）';
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_corridor_yield_occupation ON corridor_yield (occupation_id);
+
+-- 重新申请历史（不可变）：已让渡占用经重新审查后显式申请的新占用关联。
+CREATE TABLE IF NOT EXISTS occupation_reapply (
+    reapply_id           VARCHAR(64) PRIMARY KEY COMMENT '重新申请记录唯一标识（不可变）',
+    source_occupation_id VARCHAR(64) NOT NULL COMMENT '被让渡的原占用标识',
+    new_occupation_id    VARCHAR(64) NOT NULL COMMENT '重新申请生成的新占用标识',
+    review_id            VARCHAR(64) NOT NULL COMMENT '重新审查的不可变审查记录标识',
+    created_at           BIGINT NOT NULL COMMENT '重新申请时间，epoch 毫秒（UTC）'
+) COMMENT = '已让渡占用重新申请历史（不可变）';
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_reapply_new_occupation ON occupation_reapply (new_occupation_id);
