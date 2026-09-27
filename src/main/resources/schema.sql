@@ -36,6 +36,76 @@ CREATE TABLE IF NOT EXISTS request_log (
     PRIMARY KEY (request_id)
 );
 
+-- 观测站表：记录站点启用时刻（UTC），维护窗口不得早于该时刻。
+CREATE TABLE IF NOT EXISTS observation_station (
+    station_id VARCHAR(64) NOT NULL COMMENT '观测站唯一标识',
+    activated_at_utc TIMESTAMP NOT NULL COMMENT '站点启用时刻（UTC）；维护窗口开始时刻不得早于此时刻',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间（服务器时区）',
+    PRIMARY KEY (station_id)
+);
+
+-- 观测站维护窗口表：UTC 左闭右开区间 + 维护版本；同一站点 ACTIVE 窗口不得重叠。
+-- 历史窗口永不物理删除：更正追加新窗口并将原窗口置为 SUPERSEDED，撤回置为 WITHDRAWN。
+CREATE TABLE IF NOT EXISTS maintenance_window (
+    window_id VARCHAR(128) NOT NULL COMMENT '维护窗口唯一标识',
+    station_id VARCHAR(64) NOT NULL COMMENT '所属观测站标识',
+    start_utc TIMESTAMP NOT NULL COMMENT '维护开始时刻（UTC，区间左闭）',
+    end_utc TIMESTAMP NOT NULL COMMENT '维护结束时刻（UTC，区间右开）',
+    window_version INT NOT NULL COMMENT '维护版本号；更正窗口必须大于被更正窗口的版本',
+    status VARCHAR(16) NOT NULL COMMENT '窗口状态：ACTIVE 生效中 / SUPERSEDED 已被更正取代 / WITHDRAWN 已撤回',
+    corrects_window_id VARCHAR(128) NULL COMMENT '更正目标窗口标识；普通登记窗口为 NULL',
+    request_id VARCHAR(128) NOT NULL COMMENT '登记或更正该窗口的请求标识',
+    created_at_utc TIMESTAMP NOT NULL COMMENT '窗口登记时刻（UTC，服务端时钟）',
+    PRIMARY KEY (window_id)
+);
+
+-- 站点观测原始记录表：批量提交逐条落库，提交时刻命中维护窗口则标记 MAINTENANCE_AFFECTED。
+-- 提交后不可变：维护标记与命中窗口版本在提交时刻固化，后续窗口变更不回写。
+CREATE TABLE IF NOT EXISTS station_observation (
+    submission_id VARCHAR(128) NOT NULL COMMENT '观测提交唯一标识',
+    cluster_id VARCHAR(128) NOT NULL COMMENT '冲突簇标识：同簇观测参与同一次合并裁决',
+    station_id VARCHAR(64) NOT NULL COMMENT '观测站标识',
+    observed_at_utc TIMESTAMP NOT NULL COMMENT '观测时刻（UTC，客户端提供）',
+    submitted_at_utc TIMESTAMP NOT NULL COMMENT '提交受理时刻（UTC，服务端时钟，维护窗口匹配基准）',
+    location VARCHAR(512) NOT NULL COMMENT '观测地点',
+    reading VARCHAR(64) NOT NULL COMMENT '观测读数，十进制字符串，最多三位小数',
+    note VARCHAR(1024) NOT NULL COMMENT '观测备注',
+    maintenance_flag VARCHAR(32) NOT NULL COMMENT '维护标记：NONE 未受影响 / MAINTENANCE_AFFECTED 命中维护窗口',
+    window_id VARCHAR(128) NULL COMMENT '提交时刻命中的维护窗口标识；未命中为 NULL',
+    window_version INT NULL COMMENT '命中窗口的维护版本；未命中为 NULL',
+    request_id VARCHAR(128) NOT NULL COMMENT '批次提交请求标识',
+    batch_seq INT NOT NULL COMMENT '批内序号（从 0 开始），保证批量结果顺序稳定',
+    PRIMARY KEY (submission_id)
+);
+
+-- 冲突簇合并快照表：合并时刻固化各提交的维护标记与窗口版本，不可变、永不更新。
+-- 每个冲突簇只允许一次自动合并；结果为 PENDING_MANUAL 时只能经人工裁决定案。
+CREATE TABLE IF NOT EXISTS cluster_merge_snapshot (
+    cluster_id VARCHAR(128) NOT NULL COMMENT '冲突簇标识',
+    status VARCHAR(16) NOT NULL COMMENT '合并结果：MERGED 已自动定案 / PENDING_MANUAL 待人工裁决',
+    winner_submission_id VARCHAR(128) NULL COMMENT '胜出提交标识；待人工裁决时为 NULL',
+    total_count INT NOT NULL COMMENT '簇内观测提交总数',
+    affected_count INT NOT NULL COMMENT '簇内维护受影响（MAINTENANCE_AFFECTED）提交数',
+    eligible_count INT NOT NULL COMMENT '可参与自动胜出的未受影响提交数（= total_count - affected_count）',
+    marks_json VARCHAR(4000) NOT NULL COMMENT '各提交维护标记快照（JSON 数组原文，含窗口标识与版本）',
+    request_id VARCHAR(128) NOT NULL COMMENT '合并请求标识',
+    merged_at_utc TIMESTAMP NOT NULL COMMENT '合并完成时刻（UTC）',
+    PRIMARY KEY (cluster_id)
+);
+
+-- 人工裁决记录表：不可变追加；可选择维护受影响观测，但必须记录理由与裁决人。
+CREATE TABLE IF NOT EXISTS cluster_adjudication (
+    adjudication_id VARCHAR(128) NOT NULL COMMENT '全局唯一裁决记录标识',
+    cluster_id VARCHAR(128) NOT NULL COMMENT '冲突簇标识',
+    chosen_submission_id VARCHAR(128) NOT NULL COMMENT '人工选择的胜出提交标识，可为维护受影响观测',
+    reason VARCHAR(1024) NOT NULL COMMENT '裁决理由（必填）',
+    adjudicator VARCHAR(128) NOT NULL COMMENT '裁决人标识（必填）',
+    request_id VARCHAR(128) NOT NULL COMMENT '裁决请求标识',
+    adjudicated_at_utc TIMESTAMP NOT NULL COMMENT '裁决完成时刻（UTC）',
+    PRIMARY KEY (adjudication_id),
+    UNIQUE (cluster_id, request_id)
+);
+
 -- 冲突解决记录表：成功解决后原子写入，不可变、永不更新或删除。
 CREATE TABLE IF NOT EXISTS conflict_resolution (
     resolution_id VARCHAR(128) NOT NULL COMMENT '全局唯一冲突解决记录标识',

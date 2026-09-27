@@ -3,21 +3,30 @@ package com.example.starter.observation;
 import org.springframework.http.HttpStatus;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * 业务异常：携带 HTTP 状态及可选的冲突详情（冲突字段、当前版本），由全局异常处理器转为错误响应。
+ * details 用于携带结构化的实际值/要求值/差额等诊断信息，便于调用方直接读取。
  */
 public class ApiException extends RuntimeException {
 
     private final HttpStatus status;
     private final List<String> conflictFields;
     private final Integer currentVersion;
+    private final Map<String, Object> details;
 
     private ApiException(HttpStatus status, String message, List<String> conflictFields, Integer currentVersion) {
+        this(status, message, conflictFields, currentVersion, null);
+    }
+
+    private ApiException(HttpStatus status, String message, List<String> conflictFields,
+                         Integer currentVersion, Map<String, Object> details) {
         super(message);
         this.status = status;
         this.conflictFields = conflictFields;
         this.currentVersion = currentVersion;
+        this.details = details;
     }
 
     public HttpStatus status() {
@@ -30,6 +39,10 @@ public class ApiException extends RuntimeException {
 
     public Integer currentVersion() {
         return currentVersion;
+    }
+
+    public Map<String, Object> details() {
+        return details;
     }
 
     /**
@@ -67,5 +80,19 @@ public class ApiException extends RuntimeException {
      */
     public static ApiException gone(String message) {
         return new ApiException(HttpStatus.GONE, message, null, null);
+    }
+
+    /**
+     * 400：请求参数不合法，携带结构化诊断明细（实际值/要求值/差额等）。
+     */
+    public static ApiException badRequest(String message, Map<String, Object> details) {
+        return new ApiException(HttpStatus.BAD_REQUEST, message, null, null, details);
+    }
+
+    /**
+     * 409：业务状态冲突，携带结构化诊断明细（实际值/要求值/差额等）。
+     */
+    public static ApiException conflict(String message, Integer currentVersion, Map<String, Object> details) {
+        return new ApiException(HttpStatus.CONFLICT, message, null, currentVersion, details);
     }
 }

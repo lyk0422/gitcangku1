@@ -1,5 +1,9 @@
 #!/bin/sh
 
+# 环境兜底：部分执行环境 PATH 缺少 POSIX 工具目录，补充 Git Bash 标准路径。
+PATH="/usr/bin:/bin:$PATH"
+export PATH
+
 #
 # Copyright © 2015-2021 the original authors.
 #
