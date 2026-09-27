@@ -57,4 +57,14 @@ public class ApiException extends RuntimeException {
     public static ApiException termViolation(String message, List<ApiDtos.TermRuleView> violations) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "TERM_VIOLATION", message, violations);
     }
+
+    /** 422：引文锚点规则不满足（区间越界/交叉、映射缺失重复或引用文本不一致等）。 */
+    public static ApiException anchorViolation(String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "ANCHOR_MAPPING_VIOLATION", message);
+    }
+
+    /** 403：操作者角色或身份不满足（解除锚点须为非创建人的法务角色）。 */
+    public static ApiException forbidden(String message) {
+        return new ApiException(HttpStatus.FORBIDDEN, "FORBIDDEN", message);
+    }
 }

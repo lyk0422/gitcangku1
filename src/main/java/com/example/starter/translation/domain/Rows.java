@@ -1,5 +1,6 @@
 package com.example.starter.translation.domain;
 
+import java.time.Instant;
 import java.util.List;
 
 /**
@@ -81,5 +82,69 @@ public final class Rows {
      */
     public record RequestLogRow(String requestId, String requestHash,
                                 int responseStatus, String responseBody) {
+    }
+
+    /**
+     * 引文锚点：依附段落+语言的已批准译文，码点区间左闭右开；解除后行保留，解除字段不可变。
+     *
+     * @param anchorId           锚点 ID，迁移中保持不变
+     * @param segmentId          所属段落 ID
+     * @param language           目标语言码，小写
+     * @param citationKey        规范化引用标识（NFKC、去空白、小写）
+     * @param citationKeyRaw     登记时的原始引用标识
+     * @param startOffset        起始码点偏移，从 0 开始，闭区间端
+     * @param endOffset          结束码点偏移，开区间端
+     * @param quoteText          锁定引用文本，迁移时必须保持一致
+     * @param translationVersion 区间当前所在译文版本
+     * @param lockReason         登记时的锁定原因，不可变
+     * @param createdBy          创建人，迁移保留原创建人
+     * @param createdAt          登记时间，UTC
+     * @param status            ACTIVE 生效中；RELEASED 已解除（终态）
+     * @param migratedBy         最近一次迁移操作人；未迁移为 null
+     * @param migratedAt         最近一次迁移时间，UTC；未迁移为 null
+     * @param releasedBy         解除确认人（法务、非创建人）；未解除为 null
+     * @param releasedReason     不可变解除理由；未解除为 null
+     * @param releasedAt         解除时间，UTC；未解除为 null
+     */
+    public record AnchorRow(long anchorId, String segmentId, String language, String citationKey,
+                            String citationKeyRaw, int startOffset, int endOffset, String quoteText,
+                            int translationVersion, String lockReason, String createdBy, Instant createdAt,
+                            String status, String migratedBy, Instant migratedAt,
+                            String releasedBy, String releasedReason, Instant releasedAt) {
+    }
+
+    /**
+     * 引文锚点事件：登记、迁移、解除的不可变追加历史。
+     *
+     * @param eventId            事件 ID，即历史排序
+     * @param anchorId           关联锚点 ID
+     * @param segmentId          所属段落 ID
+     * @param language           目标语言码，小写
+     * @param eventType          REGISTERED / MIGRATED / RELEASED
+     * @param translationVersion 事件时锚点所在译文版本
+     * @param startOffset        该事件下区间起始码点偏移
+     * @param endOffset          该事件下区间结束码点偏移
+     * @param actor              事件操作人
+     * @param reason             登记为锁定原因，解除为不可变解除理由，迁移可为 null
+     * @param eventAt            事件时间，UTC
+     */
+    public record AnchorEventRow(long eventId, long anchorId, String segmentId, String language,
+                                 String eventType, int translationVersion, int startOffset, int endOffset,
+                                 String actor, String reason, Instant eventAt) {
+    }
+
+    /**
+     * 发布快照固化的锚点引用：发布时写入，之后锚点迁移或解除均不改写。
+     *
+     * @param anchorId           被固化的锚点 ID（可用于追溯锚点当前状态与完整历史）
+     * @param segmentId          发布时所属段落 ID
+     * @param language           目标语言码，小写
+     * @param citationKey        发布时的规范化引用标识
+     * @param startOffset        发布时区间起始码点偏移
+     * @param endOffset          发布时区间结束码点偏移
+     * @param translationVersion 发布时锚点所在译文版本
+     */
+    public record ReleaseAnchorRefRow(long anchorId, String segmentId, String language, String citationKey,
+                                      int startOffset, int endOffset, int translationVersion) {
     }
 }

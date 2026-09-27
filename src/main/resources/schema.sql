@@ -124,3 +124,103 @@ COMMENT ON COLUMN request_log.request_hash IS '请求参数规范化后的 SHA-2
 COMMENT ON COLUMN request_log.response_status IS '原成功响应的 HTTP 状态码，用于重放';
 COMMENT ON COLUMN request_log.response_body IS '原成功响应体 JSON，用于重放';
 COMMENT ON COLUMN request_log.created_at IS '记录时间，数据库默认时区';
+
+-- 译文引文锚点：锚点依附已批准译文（段落+语言），区间为 Unicode 码点偏移、左闭右开，时间一律 UTC。
+-- 区间迁移采用原地更新并由 citation_anchor_event 保存完整历史；解除后行保留且解除字段不可变。
+CREATE TABLE IF NOT EXISTS citation_anchor (
+    anchor_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    document_id BIGINT NOT NULL,
+    segment_id VARCHAR(64) NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    citation_key VARCHAR(512) NOT NULL,
+    citation_key_raw VARCHAR(512) NOT NULL,
+    start_offset INT NOT NULL,
+    end_offset INT NOT NULL,
+    quote_text LONGTEXT NOT NULL,
+    translation_version INT NOT NULL,
+    lock_reason VARCHAR(2048) NOT NULL,
+    created_by VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    migrated_by VARCHAR(128),
+    migrated_at TIMESTAMP(6),
+    released_by VARCHAR(128),
+    released_reason LONGTEXT,
+    released_at TIMESTAMP(6)
+);
+COMMENT ON TABLE citation_anchor IS '引文锚点：段落+语言内锁定引用文本；同一规范化引用标识在同一段落+语言只能锁定一次（含已解除行）';
+COMMENT ON COLUMN citation_anchor.anchor_id IS '锚点 ID，自增，迁移中保持不变';
+COMMENT ON COLUMN citation_anchor.document_id IS '所属文档 ID';
+COMMENT ON COLUMN citation_anchor.segment_id IS '所属段落 ID';
+COMMENT ON COLUMN citation_anchor.language IS '目标语言码，小写';
+COMMENT ON COLUMN citation_anchor.citation_key IS '规范化引用标识：NFKC、去空白、小写；同段落+语言全局唯一';
+COMMENT ON COLUMN citation_anchor.citation_key_raw IS '登记时提交的原始引用标识，历史原值不改写';
+COMMENT ON COLUMN citation_anchor.start_offset IS '引用文本起始码点偏移，从 0 开始，闭区间端';
+COMMENT ON COLUMN citation_anchor.end_offset IS '引用文本结束码点偏移，开区间端，等于内容码点长度时表示取到末尾';
+COMMENT ON COLUMN citation_anchor.quote_text IS '锁定的引用文本，登记时由服务端按区间截取，迁移区间时文本必须保持一致';
+COMMENT ON COLUMN citation_anchor.translation_version IS '区间当前所在的译文版本；译文修订后随迁移或原样保留更新到新译文版本';
+COMMENT ON COLUMN citation_anchor.lock_reason IS '登记时的锁定原因，不可变';
+COMMENT ON COLUMN citation_anchor.created_by IS '创建人（登记锚点的 X-Actor-Id），迁移保留原创建人';
+COMMENT ON COLUMN citation_anchor.created_at IS '登记时间，UTC，微秒精度';
+COMMENT ON COLUMN citation_anchor.status IS '状态：ACTIVE 生效中；RELEASED 已由法务解除（终态，不可变）';
+COMMENT ON COLUMN citation_anchor.migrated_by IS '最近一次区间迁移操作人（修订提交者）；未迁移为 NULL';
+COMMENT ON COLUMN citation_anchor.migrated_at IS '最近一次区间迁移时间，UTC；未迁移为 NULL';
+COMMENT ON COLUMN citation_anchor.released_by IS '解除确认人，法务角色且不同于创建人；未解除为 NULL';
+COMMENT ON COLUMN citation_anchor.released_reason IS '解除时写入的不可变理由；未解除为 NULL';
+COMMENT ON COLUMN citation_anchor.released_at IS '解除时间，UTC；未解除为 NULL';
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_citation_anchor_key
+    ON citation_anchor (document_id, segment_id, language, citation_key);
+CREATE INDEX IF NOT EXISTS ix_citation_anchor_doc
+    ON citation_anchor (document_id, segment_id, language, start_offset);
+
+CREATE TABLE IF NOT EXISTS citation_anchor_event (
+    event_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    anchor_id BIGINT NOT NULL,
+    document_id BIGINT NOT NULL,
+    segment_id VARCHAR(64) NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    event_type VARCHAR(16) NOT NULL,
+    translation_version INT NOT NULL,
+    start_offset INT NOT NULL,
+    end_offset INT NOT NULL,
+    actor VARCHAR(128) NOT NULL,
+    reason LONGTEXT,
+    event_at TIMESTAMP(6) NOT NULL
+);
+COMMENT ON TABLE citation_anchor_event IS '引文锚点事件历史：登记、区间迁移、解除均追加不可变事件，保证旧快照外仍可追溯';
+COMMENT ON COLUMN citation_anchor_event.event_id IS '事件 ID，自增，即历史排序';
+COMMENT ON COLUMN citation_anchor_event.anchor_id IS '关联锚点 ID';
+COMMENT ON COLUMN citation_anchor_event.document_id IS '所属文档 ID';
+COMMENT ON COLUMN citation_anchor_event.segment_id IS '所属段落 ID';
+COMMENT ON COLUMN citation_anchor_event.language IS '目标语言码，小写';
+COMMENT ON COLUMN citation_anchor_event.event_type IS '事件类型：REGISTERED 登记、MIGRATED 区间迁移、RELEASED 解除';
+COMMENT ON COLUMN citation_anchor_event.translation_version IS '事件发生时锚点区间所在的译文版本';
+COMMENT ON COLUMN citation_anchor_event.start_offset IS '该事件下区间起始码点偏移，闭区间端';
+COMMENT ON COLUMN citation_anchor_event.end_offset IS '该事件下区间结束码点偏移，开区间端';
+COMMENT ON COLUMN citation_anchor_event.actor IS '事件操作人 X-Actor-Id';
+COMMENT ON COLUMN citation_anchor_event.reason IS '登记/迁移时为锁定原因，解除时为不可变解除理由，迁移事件可为 NULL';
+COMMENT ON COLUMN citation_anchor_event.event_at IS '事件时间，UTC，微秒精度';
+
+CREATE TABLE IF NOT EXISTS release_anchor_ref (
+    document_id BIGINT NOT NULL,
+    published_version INT NOT NULL,
+    anchor_id BIGINT NOT NULL,
+    segment_id VARCHAR(64) NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    citation_key VARCHAR(512) NOT NULL,
+    start_offset INT NOT NULL,
+    end_offset INT NOT NULL,
+    translation_version INT NOT NULL,
+    PRIMARY KEY (document_id, published_version, anchor_id)
+);
+COMMENT ON TABLE release_anchor_ref IS '发布快照锚点固化：发布时写入，之后锚点迁移/解除均不改写，支撑已发布锚点追溯';
+COMMENT ON COLUMN release_anchor_ref.document_id IS '所属文档 ID';
+COMMENT ON COLUMN release_anchor_ref.published_version IS '发布版本号，从 1 开始';
+COMMENT ON COLUMN release_anchor_ref.anchor_id IS '被固化的锚点 ID';
+COMMENT ON COLUMN release_anchor_ref.segment_id IS '所属段落 ID';
+COMMENT ON COLUMN release_anchor_ref.language IS '目标语言码，小写';
+COMMENT ON COLUMN release_anchor_ref.citation_key IS '发布时的规范化引用标识';
+COMMENT ON COLUMN release_anchor_ref.start_offset IS '发布时区间起始码点偏移，闭区间端';
+COMMENT ON COLUMN release_anchor_ref.end_offset IS '发布时区间结束码点偏移，开区间端';
+COMMENT ON COLUMN release_anchor_ref.translation_version IS '发布时锚点所在译文版本';

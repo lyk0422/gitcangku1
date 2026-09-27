@@ -1,5 +1,6 @@
 package com.example.starter.translation.api;
 
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -41,5 +42,12 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ApiDtos.ErrorResponse> handleUnreadable(HttpMessageNotReadableException ex) {
         return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                 .body(new ApiDtos.ErrorResponse("BAD_REQUEST", "请求体无法解析"));
+    }
+
+    /** 唯一约束并发冲突兜底（如锚点引用标识并发登记），转换为业务 409。 */
+    @ExceptionHandler(DuplicateKeyException.class)
+    public ResponseEntity<ApiDtos.ErrorResponse> handleDuplicateKey(DuplicateKeyException ex) {
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(new ApiDtos.ErrorResponse("CONFLICT", "唯一约束冲突，资源已被并发请求锁定"));
     }
 }

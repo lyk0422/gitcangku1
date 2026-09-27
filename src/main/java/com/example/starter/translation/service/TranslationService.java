@@ -2,8 +2,10 @@ package com.example.starter.translation.service;
 
 import com.example.starter.translation.api.ApiDtos;
 import com.example.starter.translation.api.ApiException;
+import com.example.starter.translation.domain.Rows.AnchorRow;
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
+import com.example.starter.translation.domain.Rows.ReleaseAnchorRefRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
 import com.example.starter.translation.domain.Rows.TranslationRow;
@@ -31,10 +33,13 @@ import java.util.stream.Collectors;
 public class TranslationService {
 
     private final TranslationRepository repository;
+    private final CitationService citationService;
     private final ObjectMapper objectMapper;
 
-    public TranslationService(TranslationRepository repository, ObjectMapper objectMapper) {
+    public TranslationService(TranslationRepository repository, CitationService citationService,
+                              ObjectMapper objectMapper) {
         this.repository = repository;
+        this.citationService = citationService;
         this.objectMapper = objectMapper;
     }
 
@@ -81,7 +86,8 @@ public class TranslationService {
     /**
      * 译文提交：所依据源文版本必须等于当前源文版本；绑定当前术语版本，
      * 当前源文命中的术语规则要求译文包含对应必译文本，否则 422 返回全部违规术语且不写译文；
-     * 译文版本递增，草稿版本加一。
+     * 若该段落+语言存在生效引文锚点，修订必须保留全部锚点引用文本，区间变动须给一一映射
+     * （缺失、重复、指向未知锚点或文本不一致 422）；全部校验通过后才写译文、迁移锚点并使草稿版本加一。
      */
     @Transactional
     public ApiDtos.TranslationResponse submitTranslation(long documentId, String segmentId, String language,
@@ -102,13 +108,87 @@ public class TranslationService {
         if (!violations.isEmpty()) {
             throw ApiException.termViolation("译文违反 " + violations.size() + " 条术语规则", violations);
         }
+        List<AnchorRow> activeAnchors = repository.listAnchors(documentId, segmentId, normalizedLanguage).stream()
+                .filter(a -> "ACTIVE".equals(a.status())).toList();
+        List<CitationService.MovedAnchor> moved = citationService.validateRevision(
+                segmentId, normalizedLanguage, request.content(), activeAnchors, request.anchorMappings());
         int translationVersion = repository.findTranslation(documentId, segmentId, normalizedLanguage)
                 .map(TranslationRow::translationVersion).orElse(0) + 1;
         repository.upsertTranslation(documentId, new TranslationRow(segmentId, normalizedLanguage,
                 request.content(), actorId, segment.sourceVersion(), translationVersion, document.termVersion()));
+        citationService.applyRevision(documentId, segmentId, normalizedLanguage, translationVersion,
+                actorId, activeAnchors, moved);
         int draftVersion = bumpDraftVersion(document);
         return new ApiDtos.TranslationResponse(documentId, segmentId, normalizedLanguage,
                 translationVersion, segment.sourceVersion(), document.termVersion(), draftVersion);
+    }
+
+    /**
+     * 批量修订多段译文：先整批校验期望术语版本（不符 409）、段落与语言存在性、源文版本、
+     * 术语规则（收集全部违规后一次性 422）以及每个段落的锚点映射，全部通过后才一次事务落库；
+     * 任一失败整批回滚，既有译文、已批准版本与发布快照均不变。每段译文版本各自加一，文档草稿版本整批加一。
+     */
+    @Transactional
+    public ApiDtos.BatchReviseResponse batchRevise(long documentId, String actorId,
+                                                   ApiDtos.BatchReviseRequest request) {
+        DocumentRow document = lockDocument(documentId);
+        if (document.termVersion() != request.expectedTermVersion()) {
+            throw ApiException.conflict("术语版本冲突：当前术语版本 " + document.termVersion()
+                    + "，批量修订要求 " + request.expectedTermVersion() + "，差额 "
+                    + Math.abs(document.termVersion() - request.expectedTermVersion()));
+        }
+        Set<String> itemKeys = new HashSet<>();
+        for (ApiDtos.BatchTranslationItem item : request.revisions()) {
+            String normalizedLanguage = normalizeLanguage(item.language());
+            if (!document.targetLanguages().contains(normalizedLanguage)) {
+                throw ApiException.unprocessable("语言不在文档目标语言中: " + normalizedLanguage);
+            }
+            if (!itemKeys.add(item.segmentId() + " " + normalizedLanguage)) {
+                throw ApiException.unprocessable("批量修订包含重复的段落+语言: "
+                        + item.segmentId() + "/" + normalizedLanguage);
+            }
+        }
+        List<TermRuleRow> termRules = repository.listTermRules(documentId, document.termVersion());
+        List<ApiDtos.TermRuleView> allViolations = new ArrayList<>();
+        List<PlannedRevision> planned = new ArrayList<>();
+        for (ApiDtos.BatchTranslationItem item : request.revisions()) {
+            String normalizedLanguage = normalizeLanguage(item.language());
+            SegmentRow segment = findSegmentOrThrow(documentId, item.segmentId());
+            if (item.sourceVersion() != segment.sourceVersion()) {
+                throw ApiException.unprocessable("批量修订中 " + item.segmentId() + "/" + normalizedLanguage
+                        + " 依据源文版本 " + item.sourceVersion() + " 与当前源文版本 "
+                        + segment.sourceVersion() + " 不匹配");
+            }
+            allViolations.addAll(findViolations(
+                    segment.sourceText(), normalizedLanguage, item.content(), termRules));
+            List<AnchorRow> activeAnchors = repository.listAnchors(
+                    documentId, item.segmentId(), normalizedLanguage).stream()
+                    .filter(a -> "ACTIVE".equals(a.status())).toList();
+            List<CitationService.MovedAnchor> moved = citationService.validateRevision(
+                    item.segmentId(), normalizedLanguage, item.content(), activeAnchors,
+                    item.anchorMappings());
+            int translationVersion = repository.findTranslation(
+                    documentId, item.segmentId(), normalizedLanguage)
+                    .map(TranslationRow::translationVersion).orElse(0) + 1;
+            planned.add(new PlannedRevision(segment, normalizedLanguage, item.content(), translationVersion,
+                    activeAnchors, moved));
+        }
+        if (!allViolations.isEmpty()) {
+            throw ApiException.termViolation(
+                    "批量修订违反 " + allViolations.size() + " 条术语规则", allViolations);
+        }
+        List<ApiDtos.BatchRevisionResult> results = new ArrayList<>();
+        for (PlannedRevision plan : planned) {
+            repository.upsertTranslation(documentId, new TranslationRow(plan.segment().segmentId(),
+                    plan.language(), plan.content(), actorId, plan.segment().sourceVersion(),
+                    plan.translationVersion(), document.termVersion()));
+            citationService.applyRevision(documentId, plan.segment().segmentId(), plan.language(),
+                    plan.translationVersion(), actorId, plan.activeAnchors(), plan.moved());
+            results.add(new ApiDtos.BatchRevisionResult(plan.segment().segmentId(), plan.language(),
+                    plan.translationVersion(), plan.segment().sourceVersion(), document.termVersion()));
+        }
+        int draftVersion = bumpDraftVersion(document);
+        return new ApiDtos.BatchReviseResponse(documentId, draftVersion, results);
     }
 
     /** 译文批准：审核人不得是作者，且必须同时匹配当前源文与译文版本。 */
@@ -230,8 +310,18 @@ public class TranslationService {
             throw ApiException.termViolation("译文违反 " + termViolations.size() + " 条术语规则", termViolations);
         }
         int publishedVersion = document.publishedVersion() + 1;
+        List<AnchorRow> anchors = repository.listAllAnchors(documentId);
         repository.insertSnapshot(documentId, publishedVersion,
-                buildSnapshotJson(document, publishedVersion, segments, translations, approvals, termRules));
+                buildSnapshotJson(document, publishedVersion, segments, translations, approvals, termRules,
+                        anchors));
+        for (AnchorRow anchor : anchors) {
+            if (!"ACTIVE".equals(anchor.status())) {
+                continue;
+            }
+            repository.insertReleaseAnchorRef(documentId, publishedVersion, new ReleaseAnchorRefRow(
+                    anchor.anchorId(), anchor.segmentId(), anchor.language(), anchor.citationKey(),
+                    anchor.startOffset(), anchor.endOffset(), anchor.translationVersion()));
+        }
         repository.updatePublishedVersion(documentId, publishedVersion);
         return new ApiDtos.PublishResponse(documentId, publishedVersion);
     }
@@ -347,10 +437,32 @@ public class TranslationService {
         return new ApiDtos.TermRuleView(rule.sourceTerm(), rule.language(), rule.requiredTranslation());
     }
 
-    /** 生成完整只读快照 JSON：全部段落源文及各语言译文、作者、审核人、版本号与固化的术语版本及规则集。 */
+    /**
+     * 生成完整只读快照 JSON：全部段落源文及各语言译文、作者、审核人、版本号、固化的术语版本及规则集，
+     * 以及发布时点生效的引文锚点集合（含锚点 ID、引用标识、区间、引用文本与锁定原因）。
+     */
     private String buildSnapshotJson(DocumentRow document, int publishedVersion, List<SegmentRow> segments,
                                      Map<String, TranslationRow> translations,
-                                     Map<String, ApprovalRow> approvals, List<TermRuleRow> termRules) {
+                                     Map<String, ApprovalRow> approvals, List<TermRuleRow> termRules,
+                                     List<AnchorRow> anchors) {
+        Map<String, List<Map<String, Object>>> anchorsByTranslation = new LinkedHashMap<>();
+        for (AnchorRow anchor : anchors) {
+            if (!"ACTIVE".equals(anchor.status())) {
+                continue;
+            }
+            Map<String, Object> anchorJson = new LinkedHashMap<>();
+            anchorJson.put("anchorId", anchor.anchorId());
+            anchorJson.put("citationId", anchor.citationKeyRaw());
+            anchorJson.put("normalizedCitationId", anchor.citationKey());
+            anchorJson.put("startOffset", anchor.startOffset());
+            anchorJson.put("endOffset", anchor.endOffset());
+            anchorJson.put("quoteText", anchor.quoteText());
+            anchorJson.put("translationVersion", anchor.translationVersion());
+            anchorJson.put("lockReason", anchor.lockReason());
+            anchorJson.put("createdBy", anchor.createdBy());
+            anchorsByTranslation.computeIfAbsent(
+                    key(anchor.segmentId(), anchor.language()), k -> new ArrayList<>()).add(anchorJson);
+        }
         Map<String, Object> snapshot = new LinkedHashMap<>();
         snapshot.put("documentId", document.documentId());
         snapshot.put("publishedVersion", publishedVersion);
@@ -384,6 +496,8 @@ public class TranslationService {
                 translationJson.put("sourceVersion", translation.sourceVersion());
                 translationJson.put("termVersion", translation.termVersion());
                 translationJson.put("reviewer", approval.reviewer());
+                translationJson.put("citationAnchors",
+                        anchorsByTranslation.getOrDefault(key(segment.segmentId(), language), List.of()));
                 translationList.add(translationJson);
             }
             segmentJson.put("translations", translationList);
@@ -395,5 +509,10 @@ public class TranslationService {
         } catch (Exception e) {
             throw new IllegalStateException("快照序列化失败", e);
         }
+    }
+
+    /** 批量修订中单条已通过整批校验、待一次落库的修订计划。 */
+    private record PlannedRevision(SegmentRow segment, String language, String content, int translationVersion,
+                                   List<AnchorRow> activeAnchors, List<CitationService.MovedAnchor> moved) {
     }
 }

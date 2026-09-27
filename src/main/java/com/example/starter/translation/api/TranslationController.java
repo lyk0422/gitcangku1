@@ -1,5 +1,6 @@
 package com.example.starter.translation.api;
 
+import com.example.starter.translation.service.CitationService;
 import com.example.starter.translation.service.TranslationService;
 import com.example.starter.translation.service.WriteExecutor;
 import com.example.starter.translation.service.WriteResult;
@@ -20,6 +21,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
+import java.util.List;
 
 /**
  * 多语种段落修订与发布快照 REST API。
@@ -30,12 +32,14 @@ import java.util.HexFormat;
 public class TranslationController {
 
     private final TranslationService translationService;
+    private final CitationService citationService;
     private final WriteExecutor writeExecutor;
     private final ObjectMapper objectMapper;
 
-    public TranslationController(TranslationService translationService, WriteExecutor writeExecutor,
-                                 ObjectMapper objectMapper) {
+    public TranslationController(TranslationService translationService, CitationService citationService,
+                                 WriteExecutor writeExecutor, ObjectMapper objectMapper) {
         this.translationService = translationService;
+        this.citationService = citationService;
         this.writeExecutor = writeExecutor;
         this.objectMapper = objectMapper;
     }
@@ -90,6 +94,71 @@ public class TranslationController {
         return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
                 () -> WriteResult.of(200, translationService.approveTranslation(
                         documentId, segmentId, language, actorId, request))).toResponseEntity();
+    }
+
+    /** 登记引文锚点：仅允许对当前已批准译文登记，创建人取 X-Actor-Id。 */
+    @PostMapping("/{documentId}/segments/{segmentId}/translations/{language}/anchors")
+    public ResponseEntity<String> registerAnchors(@PathVariable long documentId,
+                                                  @PathVariable String segmentId,
+                                                  @PathVariable String language,
+                                                  @RequestHeader("X-Actor-Id") String actorId,
+                                                  @Valid @RequestBody ApiDtos.RegisterAnchorsRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/segments/" + segmentId
+                + "/translations/" + language + "/anchors";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(201, citationService.registerAnchors(
+                        documentId, segmentId, language, actorId, request))).toResponseEntity();
+    }
+
+    /** 查询单段译文的全部引文锚点（含已解除），只读。 */
+    @GetMapping("/{documentId}/segments/{segmentId}/translations/{language}/anchors")
+    public ResponseEntity<List<ApiDtos.AnchorView>> listTranslationAnchors(@PathVariable long documentId,
+                                                                           @PathVariable String segmentId,
+                                                                           @PathVariable String language) {
+        return ResponseEntity.ok(citationService.listTranslationAnchors(documentId, segmentId, language));
+    }
+
+    /** 解除引文锚点：须由不同于创建人的法务角色（X-Actor-Role: LEGAL）确认，理由不可变。 */
+    @PostMapping("/{documentId}/anchors/{anchorId}/release")
+    public ResponseEntity<String> releaseAnchor(@PathVariable long documentId, @PathVariable long anchorId,
+                                                @RequestHeader("X-Actor-Id") String actorId,
+                                                @RequestHeader(value = "X-Actor-Role", required = false)
+                                                String actorRole,
+                                                @Valid @RequestBody ApiDtos.ReleaseAnchorRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/anchors/" + anchorId + "/release";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, actorRole, request),
+                () -> WriteResult.of(200, citationService.releaseAnchor(
+                        documentId, anchorId, actorId, actorRole, request))).toResponseEntity();
+    }
+
+    /** 查询锚点明细与完整事件历史，只读；不存在返回 404。 */
+    @GetMapping("/{documentId}/anchors/{anchorId}")
+    public ResponseEntity<ApiDtos.AnchorDetailResponse> getAnchor(@PathVariable long documentId,
+                                                                  @PathVariable long anchorId) {
+        return ResponseEntity.ok(citationService.getAnchorDetail(documentId, anchorId));
+    }
+
+    /** 查询文档全部引文锚点（含已解除），只读。 */
+    @GetMapping("/{documentId}/anchors")
+    public ResponseEntity<List<ApiDtos.AnchorView>> listAnchors(@PathVariable long documentId) {
+        return ResponseEntity.ok(citationService.listAnchors(documentId));
+    }
+
+    /** 锚点一致性诊断查询，只读：实际锚点数、要求数、差额及越界/文本漂移/交叉/重复标识明细。 */
+    @GetMapping("/{documentId}/anchors/diagnostics")
+    public ResponseEntity<ApiDtos.AnchorDiagnosticsResponse> anchorDiagnostics(@PathVariable long documentId) {
+        return ResponseEntity.ok(citationService.diagnose(documentId));
+    }
+
+    /** 批量修订多段译文：先整批校验锚点映射与术语版本，全部通过后一次事务提交。 */
+    @PostMapping("/{documentId}/translations/revisions")
+    public ResponseEntity<String> batchRevise(@PathVariable long documentId,
+                                              @RequestHeader("X-Actor-Id") String actorId,
+                                              @Valid @RequestBody ApiDtos.BatchReviseRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/translations/revisions";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(200, translationService.batchRevise(documentId, actorId, request)))
+                .toResponseEntity();
     }
 
     /** 发布：全部段落全部目标语言均有有效批准且术语校验通过时原子生成只读快照并递增发布版本。 */

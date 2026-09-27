@@ -36,6 +36,9 @@ public abstract class AbstractIntegrationTest {
     @BeforeEach
     void cleanTables() {
         jdbc.update("DELETE FROM approval");
+        jdbc.update("DELETE FROM release_anchor_ref");
+        jdbc.update("DELETE FROM citation_anchor_event");
+        jdbc.update("DELETE FROM citation_anchor");
         jdbc.update("DELETE FROM translation");
         jdbc.update("DELETE FROM segment");
         jdbc.update("DELETE FROM release_snapshot");
@@ -56,6 +59,19 @@ public abstract class AbstractIntegrationTest {
 
     protected ApiResult postJson(String url, String body, String actorId) throws Exception {
         return perform(MockMvcRequestBuilders.post(url), body, actorId);
+    }
+
+    protected ApiResult postJson(String url, String body, String actorId, String actorRole) throws Exception {
+        MockHttpServletRequestBuilder builder = MockMvcRequestBuilders.post(url)
+                .contentType("application/json").content(body);
+        if (actorId != null) {
+            builder.header("X-Actor-Id", actorId);
+        }
+        if (actorRole != null) {
+            builder.header("X-Actor-Role", actorRole);
+        }
+        MvcResult result = mockMvc.perform(builder).andReturn();
+        return toApiResult(result);
     }
 
     protected ApiResult putJson(String url, String body) throws Exception {
@@ -128,6 +144,41 @@ public abstract class AbstractIntegrationTest {
         String body = "{\"requestId\":\"" + requestId + "\",\"expectedTermVersion\":" + expectedTermVersion
                 + ",\"rules\":" + rulesJson + "}";
         return putJson("/api/documents/" + documentId + "/terms", body);
+    }
+
+    /** 登记引文锚点：anchorsJson 为锚点数组 JSON。 */
+    protected ApiResult registerAnchors(long documentId, String segmentId, String language, String actorId,
+                                        String anchorsJson, String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"anchors\":" + anchorsJson + "}";
+        return postJson("/api/documents/" + documentId + "/segments/" + segmentId + "/translations/"
+                + language + "/anchors", body, actorId);
+    }
+
+    /** 解除引文锚点：actorRole 为 null 时不带头。 */
+    protected ApiResult releaseAnchor(long documentId, long anchorId, String actorId, String actorRole,
+                                      String reason, String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"reason\":\"" + reason + "\"}";
+        return postJson("/api/documents/" + documentId + "/anchors/" + anchorId + "/release",
+                body, actorId, actorRole);
+    }
+
+    /** 批量修订：revisionsJson 为修订条目数组 JSON。 */
+    protected ApiResult batchRevise(long documentId, int expectedTermVersion, String revisionsJson,
+                                    String actorId, String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"expectedTermVersion\":" + expectedTermVersion
+                + ",\"revisions\":" + revisionsJson + "}";
+        return postJson("/api/documents/" + documentId + "/translations/revisions", body, actorId);
+    }
+
+    /** 译文提交并携带锚点映射 JSON（可为 null 表示不带字段）。 */
+    protected ApiResult submitTranslationWithMappings(long documentId, String segmentId, String language,
+                                                      String actorId, String content, int sourceVersion,
+                                                      String mappingsJson, String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"content\":\"" + content
+                + "\",\"sourceVersion\":" + sourceVersion
+                + (mappingsJson == null ? "" : ",\"anchorMappings\":" + mappingsJson) + "}";
+        return putJson("/api/documents/" + documentId + "/segments/" + segmentId + "/translations/" + language,
+                body, actorId);
     }
 
     /** HTTP 响应结果：状态码与 JSON 响应体。 */
