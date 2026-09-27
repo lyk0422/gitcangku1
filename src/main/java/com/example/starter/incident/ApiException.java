@@ -56,4 +56,14 @@ public class ApiException extends RuntimeException {
     public static ApiException illegalTransition(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "ILLEGAL_TRANSITION", message, null);
     }
+
+    /** 410：提案已到达到期时刻（左闭右开区间终点），投票/撤回不再受理。 */
+    public static ApiException gone(String message) {
+        return new ApiException(HttpStatus.GONE, "GONE", message, null);
+    }
+
+    /** 422：提案登记参数非法（到期时刻早于当前、角色集合为空、法定人数超过角色数）。 */
+    public static ApiException invalidProposal(String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "INVALID_PROPOSAL", message, null);
+    }
 }

@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     incident_id BIGINT NOT NULL,
     task_key VARCHAR(128) NOT NULL,
+    revision INT NOT NULL DEFAULT 1,
     group_code VARCHAR(64) NOT NULL,
     title VARCHAR(512) NOT NULL,
     status VARCHAR(16) NOT NULL,
@@ -99,4 +100,45 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS incident_decisions (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    proposal_key VARCHAR(128) NOT NULL,
+    task_key VARCHAR(128) NOT NULL,
+    decision_type VARCHAR(16) NOT NULL,
+    expires_at TIMESTAMP(6) NOT NULL,
+    quorum INT NOT NULL,
+    base_task_revision INT NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    created_by VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    effective_at TIMESTAMP(6) NULL,
+    effective_by VARCHAR(128) NULL,
+    effective_task_revision INT NULL,
+    expired_at TIMESTAMP(6) NULL,
+    CONSTRAINT uk_decision_key UNIQUE (incident_id, proposal_key)
+);
+
+CREATE TABLE IF NOT EXISTS decision_required_roles (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    proposal_id BIGINT NOT NULL,
+    role_code VARCHAR(64) NOT NULL,
+    CONSTRAINT uk_decision_role UNIQUE (proposal_id, role_code)
+);
+
+CREATE TABLE IF NOT EXISTS decision_votes (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    proposal_id BIGINT NOT NULL,
+    task_revision INT NOT NULL,
+    voter_actor VARCHAR(128) NOT NULL,
+    role_code VARCHAR(64) NOT NULL,
+    choice VARCHAR(16) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    voted_at TIMESTAMP(6) NOT NULL,
+    stale_at TIMESTAMP(6) NULL,
+    withdrawn_at TIMESTAMP(6) NULL,
+    active_role VARCHAR(64) NULL,
+    CONSTRAINT uk_decision_active_role UNIQUE (proposal_id, active_role)
 );

@@ -46,6 +46,7 @@ public class IncidentTaskRepository {
         Timestamp cancelledAt = rs.getTimestamp("cancelled_at");
         return new IncidentTask(
                 rs.getLong("id"), rs.getLong("incident_id"), rs.getString("task_key"),
+                rs.getInt("revision"),
                 rs.getString("group_code"), rs.getString("title"),
                 TaskStatus.valueOf(rs.getString("status")),
                 rs.getString("created_by"), rs.getString("done_by"),
@@ -63,28 +64,30 @@ public class IncidentTaskRepository {
     }
 
     /**
-     * 插入 OPEN 任务，返回生成主键。(incident_id, task_key) 唯一约束兜底并发重复插入。
+     * 插入 OPEN 任务（revision 初始为 1），返回生成主键。
+     * (incident_id, task_key) 唯一约束兜底并发重复插入。
      */
     public long insert(IncidentTask task) {
         KeyHolder keys = new GeneratedKeyHolder();
         jdbc.update(con -> {
             var ps = con.prepareStatement(
-                    "INSERT INTO incident_tasks (incident_id, task_key, group_code, title, status,"
-                            + " created_by, done_by, done_at, cancelled_by, cancelled_at,"
-                            + " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO incident_tasks (incident_id, task_key, revision, group_code, title,"
+                            + " status, created_by, done_by, done_at, cancelled_by, cancelled_at,"
+                            + " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setLong(1, task.incidentId());
             ps.setString(2, task.taskKey());
-            ps.setString(3, task.groupCode());
-            ps.setString(4, task.title());
-            ps.setString(5, task.status().name());
-            ps.setString(6, task.createdBy());
-            ps.setString(7, task.doneBy());
-            ps.setTimestamp(8, task.doneAt() == null ? null : Timestamp.from(task.doneAt()));
-            ps.setString(9, task.cancelledBy());
-            ps.setTimestamp(10, task.cancelledAt() == null ? null : Timestamp.from(task.cancelledAt()));
-            ps.setTimestamp(11, Timestamp.from(task.createdAt()));
-            ps.setTimestamp(12, Timestamp.from(task.updatedAt()));
+            ps.setInt(3, task.revision());
+            ps.setString(4, task.groupCode());
+            ps.setString(5, task.title());
+            ps.setString(6, task.status().name());
+            ps.setString(7, task.createdBy());
+            ps.setString(8, task.doneBy());
+            ps.setTimestamp(9, task.doneAt() == null ? null : Timestamp.from(task.doneAt()));
+            ps.setString(10, task.cancelledBy());
+            ps.setTimestamp(11, task.cancelledAt() == null ? null : Timestamp.from(task.cancelledAt()));
+            ps.setTimestamp(12, Timestamp.from(task.createdAt()));
+            ps.setTimestamp(13, Timestamp.from(task.updatedAt()));
             return ps;
         }, keys);
         return keys.getKey().longValue();
@@ -97,6 +100,13 @@ public class IncidentTaskRepository {
         List<IncidentTask> rows = jdbc.query(
                 "SELECT * FROM incident_tasks WHERE incident_id = ? AND task_key = ?",
                 TASK_MAPPER, incidentId, taskKey);
+        return rows.stream().findFirst();
+    }
+
+    /** 按主键锁定任务行（SELECT ... FOR UPDATE），用于提案生效与修订串行化。 */
+    public Optional<IncidentTask> lockById(long id) {
+        List<IncidentTask> rows = jdbc.query(
+                "SELECT * FROM incident_tasks WHERE id = ? FOR UPDATE", TASK_MAPPER, id);
         return rows.stream().findFirst();
     }
 
@@ -141,6 +151,45 @@ public class IncidentTaskRepository {
         jdbc.update("UPDATE incident_tasks SET status = 'CANCELLED', cancelled_by = ?,"
                         + " cancelled_at = ?, updated_at = ? WHERE id = ?",
                 actor, Timestamp.from(at), Timestamp.from(at), id);
+    }
+
+    /**
+     * 条件完成：仅当任务当前版本与期望版本一致且仍为 OPEN 时置为 DONE。
+     * 用于提案生效原子写入，版本被并发修订时更新 0 行，事务回滚不产生半成品。
+     */
+    public int markDoneIfRevision(long id, int expectedRevision, String actor, Instant at) {
+        return jdbc.update("UPDATE incident_tasks SET status = 'DONE', done_by = ?, done_at = ?,"
+                        + " updated_at = ? WHERE id = ? AND revision = ? AND status = 'OPEN'",
+                actor, Timestamp.from(at), Timestamp.from(at), id, expectedRevision);
+    }
+
+    /**
+     * 条件取消：仅当任务当前版本与期望版本一致且仍为 OPEN 时置为 CANCELLED。
+     */
+    public int markCancelledIfRevision(long id, int expectedRevision, String actor, Instant at) {
+        return jdbc.update("UPDATE incident_tasks SET status = 'CANCELLED', cancelled_by = ?,"
+                        + " cancelled_at = ?, updated_at = ? WHERE id = ? AND revision = ?"
+                        + " AND status = 'OPEN'",
+                actor, Timestamp.from(at), Timestamp.from(at), id, expectedRevision);
+    }
+
+    /**
+     * 修订任务：版本号 +1，可选更新标题；仅 OPEN 任务可修订。
+     * 返回更新后的版本号（0 表示任务非 OPEN，修订被拒绝）。
+     */
+    public int revise(long id, String newTitle, String actor, Instant at) {
+        if (newTitle != null) {
+            jdbc.update("UPDATE incident_tasks SET revision = revision + 1, title = ?,"
+                            + " updated_at = ? WHERE id = ? AND status = 'OPEN'",
+                    newTitle, Timestamp.from(at), id);
+        } else {
+            jdbc.update("UPDATE incident_tasks SET revision = revision + 1, updated_at = ?"
+                            + " WHERE id = ? AND status = 'OPEN'",
+                    Timestamp.from(at), id);
+        }
+        Integer revision = jdbc.queryForObject(
+                "SELECT revision FROM incident_tasks WHERE id = ?", Integer.class, id);
+        return revision == null ? 0 : revision;
     }
 
     /**

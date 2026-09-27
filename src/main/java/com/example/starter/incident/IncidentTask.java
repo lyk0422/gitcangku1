@@ -5,13 +5,16 @@ import java.time.Instant;
 /**
  * 处置任务实体，对应 incident_tasks 表。
  * (incidentId, taskKey) 唯一，同键同内容幂等，同键不同内容冲突；
- * 每事件至多 20 个任务。doneBy/doneAt 仅 DONE 有值，cancelledBy/cancelledAt 仅 CANCELLED 有值。
+ * 每事件至多 20 个任务。revision 为任务版本号，创建时为 1，每次修订 +1；
+ * 引用该任务的处置提案按版本计票，版本变化后旧版本票全部 STALE。
+ * doneBy/doneAt 仅 DONE 有值，cancelledBy/cancelledAt 仅 CANCELLED 有值。
  * 时间均为 UTC。
  */
 public record IncidentTask(
         long id,
         long incidentId,
         String taskKey,
+        int revision,
         String groupCode,
         String title,
         TaskStatus status,
