@@ -78,7 +78,7 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     task_key VARCHAR(128) NOT NULL,
     group_code VARCHAR(64) NOT NULL,
     title VARCHAR(512) NOT NULL,
-    status VARCHAR(16) NOT NULL,
+    status VARCHAR(32) NOT NULL,
     created_by VARCHAR(128) NOT NULL,
     done_by VARCHAR(128) NULL,
     done_at TIMESTAMP(6) NULL,
@@ -99,4 +99,43 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS incident_task_leases (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    task_id BIGINT NOT NULL,
+    incident_id BIGINT NOT NULL,
+    resource_key VARCHAR(128) NOT NULL,
+    auth_version INT NOT NULL,
+    assigned_by VARCHAR(128) NOT NULL,
+    assigned_at TIMESTAMP(6) NOT NULL,
+    expires_at TIMESTAMP(6) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    released_by VARCHAR(128) NULL,
+    released_at TIMESTAMP(6) NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    INDEX idx_lease_resource (resource_key, status),
+    INDEX idx_lease_incident (incident_id)
+);
+
+CREATE TABLE IF NOT EXISTS incident_resource_events (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    task_id BIGINT NOT NULL,
+    resource_key VARCHAR(128) NOT NULL,
+    event_type VARCHAR(24) NOT NULL,
+    old_version INT NULL,
+    new_version INT NULL,
+    actor VARCHAR(128) NOT NULL,
+    occurred_at TIMESTAMP(6) NOT NULL,
+    detail VARCHAR(512) NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    INDEX idx_resource_events_task (task_id),
+    INDEX idx_resource_events_incident (incident_id)
+);
+
+CREATE TABLE IF NOT EXISTS resource_locks (
+    resource_key VARCHAR(128) PRIMARY KEY,
+    created_at TIMESTAMP(6) NOT NULL
 );

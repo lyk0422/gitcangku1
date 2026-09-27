@@ -78,4 +78,48 @@ public final class Responses {
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
     }
+
+    /**
+     * 资源租约视图：expired 为按查询时刻计算的派生标志（ACTIVE 且当前时刻 >= expiresAt），
+     * 只读计算不写回；releasedBy/releasedAt 仅 RELEASED 有值。
+     */
+    public record ResourceLeaseView(String taskKey, String resourceKey, int authVersion,
+                                    String assignedBy, Instant assignedAt, Instant expiresAt,
+                                    String status, boolean expired,
+                                    String releasedBy, Instant releasedAt) {
+    }
+
+    /**
+     * 资源证据事件视图：oldVersion/newVersion 为空含义与落库一致（ASSIGN/执行类无旧版本）。
+     */
+    public record ResourceEventView(long id, String taskKey, String eventType, String resourceKey,
+                                    Integer oldVersion, Integer newVersion, String actor,
+                                    Instant occurredAt, String detail) {
+    }
+
+    /**
+     * 单任务续期结果：返回旧新授权版本、旧新到期时刻与续期时长差额（秒），
+     * 调用方无需自行换算。
+     */
+    public record RenewedLeaseView(String taskKey, String resourceKey, int oldVersion,
+                                   int newVersion, Instant oldExpiresAt, Instant newExpiresAt,
+                                   long extensionSeconds) {
+    }
+
+    /** 续期响应：renewedAt 为续期 UTC 时刻（注入时钟）。 */
+    public record ResourceRenewalView(String incidentKey, String renewedBy, Instant renewedAt,
+                                      List<RenewedLeaseView> items) {
+    }
+
+    /**
+     * 资源诊断项：任务当前状态 + 租约关键字段 + 按查询时刻计算的 expired 派生标志。
+     */
+    public record ResourceDiagnosticsItem(String taskKey, String taskStatus, String resourceKey,
+                                          int authVersion, Instant expiresAt, String leaseStatus,
+                                          boolean expired) {
+    }
+
+    /** 事件级资源诊断视图：leases 按租约创建顺序返回。 */
+    public record ResourceDiagnosticsView(String incidentKey, List<ResourceDiagnosticsItem> leases) {
+    }
 }

@@ -227,4 +227,13 @@ public class IncidentRepository {
                         + " WHERE b.task_id = ? ORDER BY i.incident_key",
                 INCIDENT_MAPPER, taskId);
     }
+
+    /**
+     * 按主键查询事件（不加锁），用于资源占用诊断等需要按 id 反查业务键的场景。
+     */
+    public Optional<Incident> findById(long id) {
+        List<Incident> rows = jdbc.query("SELECT * FROM incidents WHERE id = ?",
+                INCIDENT_MAPPER, id);
+        return rows.stream().findFirst();
+    }
 }

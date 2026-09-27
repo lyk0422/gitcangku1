@@ -200,4 +200,31 @@ public class IncidentTaskRepository {
         }
         return false;
     }
+
+    /**
+     * 查询事件仍未终结的任务（OPEN/IN_PROGRESS/AUTHORIZATION_EXPIRED），
+     * 供解决门禁使用：全部任务进入 DONE/CANCELLED 后才可解决。
+     */
+    public List<IncidentTask> listUnfinishedByIncident(long incidentId) {
+        return jdbc.query("SELECT * FROM incident_tasks WHERE incident_id = ?"
+                        + " AND status IN ('OPEN','IN_PROGRESS','AUTHORIZATION_EXPIRED') ORDER BY id",
+                TASK_MAPPER, incidentId);
+    }
+
+    /**
+     * 将 OPEN 任务置为 IN_PROGRESS（开始执行），记录操作时刻。
+     */
+    public void markStarted(long id, Instant at) {
+        jdbc.update("UPDATE incident_tasks SET status = 'IN_PROGRESS', updated_at = ? WHERE id = ?",
+                Timestamp.from(at), id);
+    }
+
+    /**
+     * 将 OPEN/IN_PROGRESS 任务置为 AUTHORIZATION_EXPIRED（资源授权到期固化，终态）。
+     */
+    public void markAuthorizationExpired(long id, Instant at) {
+        jdbc.update("UPDATE incident_tasks SET status = 'AUTHORIZATION_EXPIRED', updated_at = ?"
+                        + " WHERE id = ? AND status IN ('OPEN','IN_PROGRESS')",
+                Timestamp.from(at), id);
+    }
 }

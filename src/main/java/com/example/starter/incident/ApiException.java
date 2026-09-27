@@ -12,7 +12,10 @@ public class ApiException extends RuntimeException {
     private final String code;
     private final transient Object details;
 
-    private ApiException(HttpStatus status, String code, String message, Object details) {
+    /**
+     * protected 以便需要特殊事务语义的子类（如到期拦截提交证据不回滚）复用。
+     */
+    protected ApiException(HttpStatus status, String code, String message, Object details) {
         super(message);
         this.status = status;
         this.code = code;
@@ -55,5 +58,10 @@ public class ApiException extends RuntimeException {
     /** 422：非法状态流转。 */
     public static ApiException illegalTransition(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "ILLEGAL_TRANSITION", message, null);
+    }
+
+    /** 422：业务规则冲突（如续期闭包校验失败），携带结构化明细（实际值/要求值/差额）。 */
+    public static ApiException unprocessable(String message, Object details) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "UNPROCESSABLE", message, details);
     }
 }

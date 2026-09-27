@@ -108,6 +108,58 @@ class SchemaH2ScriptTest {
                     duplicateBlockerRejected = true;
                 }
                 assertThat(duplicateBlockerRejected).isTrue();
+
+                // 资源租约：AUTHORIZATION_EXPIRED 状态可落库（status 列宽足够），
+                // 占用查询只命中 ACTIVE 且 expires_at 晚于当前时刻的租约（左闭右开）
+                st.execute("INSERT INTO incident_task_leases (task_id, incident_id, resource_key,"
+                        + " auth_version, assigned_by, assigned_at, expires_at, status,"
+                        + " created_at, updated_at) VALUES (1,1,'res-1',1,'alice','"
+                        + Timestamp.from(now) + "','" + Timestamp.from(now.plusSeconds(300))
+                        + "','ACTIVE','" + Timestamp.from(now) + "','" + Timestamp.from(now)
+                        + "')");
+                try (ResultSet rs = st.executeQuery(
+                        "SELECT COUNT(*) FROM incident_task_leases WHERE resource_key = 'res-1'"
+                                + " AND status = 'ACTIVE' AND expires_at > '"
+                                + Timestamp.from(now.plusSeconds(299)) + "'")) {
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getInt(1)).isEqualTo(1);
+                }
+                try (ResultSet rs = st.executeQuery(
+                        "SELECT COUNT(*) FROM incident_task_leases WHERE resource_key = 'res-1'"
+                                + " AND status = 'ACTIVE' AND expires_at > '"
+                                + Timestamp.from(now.plusSeconds(300)) + "'")) {
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getInt(1)).isZero();
+                }
+                int expired = st.executeUpdate("UPDATE incident_tasks SET"
+                        + " status = 'AUTHORIZATION_EXPIRED' WHERE id = 1 AND status = 'OPEN'");
+                assertThat(expired).isEqualTo(1);
+
+                // 资源锁行：resource_key 主键唯一
+                st.execute("INSERT INTO resource_locks (resource_key, created_at) VALUES"
+                        + " ('res-1','" + Timestamp.from(now) + "')");
+                boolean duplicateLockRejected = false;
+                try {
+                    st.execute("INSERT INTO resource_locks (resource_key, created_at) VALUES"
+                            + " ('res-1','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateLockRejected = true;
+                }
+                assertThat(duplicateLockRejected).isTrue();
+
+                // 资源证据事件：只追加，版本列可空
+                st.execute("INSERT INTO incident_resource_events (incident_id, task_id,"
+                        + " resource_key, event_type, old_version, new_version, actor,"
+                        + " occurred_at, detail, created_at) VALUES (1,1,'res-1','ASSIGN',NULL,1,"
+                        + "'alice','" + Timestamp.from(now) + "',NULL,'" + Timestamp.from(now)
+                        + "')");
+                try (ResultSet rs = st.executeQuery(
+                        "SELECT old_version, new_version FROM incident_resource_events"
+                                + " WHERE task_id = 1")) {
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getObject("old_version")).isNull();
+                    assertThat(rs.getInt("new_version")).isEqualTo(1);
+                }
             }
         }
     }
