@@ -2,6 +2,7 @@ package com.example.starter.evidence;
 
 import com.example.starter.error.ApiException;
 import com.example.starter.evidence.dto.CommandRequest;
+import com.example.starter.evidence.dto.ChainEventView;
 import com.example.starter.evidence.dto.CustodyChainView;
 import com.example.starter.evidence.dto.EvidenceView;
 import com.example.starter.evidence.dto.InspectionView;
@@ -35,6 +36,8 @@ public class EvidenceService {
     static final String OP_SEAL_INSPECTION = "SEAL_INSPECTION";
     static final String OP_LOAN_BORROW = "LOAN_BORROW";
     static final String OP_LOAN_RETURN = "LOAN_RETURN";
+    static final String OP_CASE_TRANSFER_INITIATE = "CASE_TRANSFER_INITIATE";
+    static final String OP_CASE_TRANSFER_REVOKE = "CASE_TRANSFER_REVOKE";
 
     /**
      * 借出最长期限：72 小时。
@@ -45,6 +48,7 @@ public class EvidenceService {
     private final TransferRecordRepository transferRepository;
     private final SealInspectionRepository inspectionRepository;
     private final LoanRecordRepository loanRepository;
+    private final CaseTransferRepository caseTransferRepository;
     private final CommandLogRepository commandLogRepository;
     private final ObjectMapper objectMapper;
     private final EvidenceClock clock;
@@ -53,6 +57,7 @@ public class EvidenceService {
                            TransferRecordRepository transferRepository,
                            SealInspectionRepository inspectionRepository,
                            LoanRecordRepository loanRepository,
+                           CaseTransferRepository caseTransferRepository,
                            CommandLogRepository commandLogRepository,
                            ObjectMapper objectMapper,
                            EvidenceClock clock) {
@@ -60,6 +65,7 @@ public class EvidenceService {
         this.transferRepository = transferRepository;
         this.inspectionRepository = inspectionRepository;
         this.loanRepository = loanRepository;
+        this.caseTransferRepository = caseTransferRepository;
         this.commandLogRepository = commandLogRepository;
         this.objectMapper = objectMapper;
         this.clock = clock;
@@ -79,7 +85,7 @@ public class EvidenceService {
         }
         LocalDateTime now = LocalDateTime.now();
         evidenceRepository.insert(request.evidenceKey(), request.caseKey(), request.category(),
-                request.sealNo(), actorId, now);
+                request.sealNo(), request.location(), actorId, now);
         Evidence evidence = evidenceRepository.findByKey(request.evidenceKey()).orElseThrow();
         return record(request.commandKey(), OP_INTAKE, actorId, requestHash, 201, toView(evidence));
     }
@@ -348,7 +354,10 @@ public class EvidenceService {
                 .stream().map(this::toView).toList();
         List<InspectionView> inspections = inspectionRepository.findByEvidenceKey(evidenceKey)
                 .stream().map(this::toView).toList();
-        return new CustodyChainView(toView(evidence), transfers, loans, inspections);
+        List<ChainEventView> caseEvents = caseTransferRepository
+                .findEventsByEvidence(evidenceKey).stream()
+                .map(this::toChainEventView).toList();
+        return new CustodyChainView(toView(evidence), transfers, loans, inspections, caseEvents);
     }
 
     private Evidence lockEvidence(String evidenceKey) {
@@ -403,7 +412,7 @@ public class EvidenceService {
 
     private EvidenceView toView(Evidence evidence) {
         return new EvidenceView(evidence.evidenceKey(), evidence.caseKey(), evidence.category(),
-                evidence.sealNo(), evidence.custodianId(), evidence.status(),
+                evidence.sealNo(), evidence.location(), evidence.custodianId(), evidence.status(),
                 evidence.createdAt(), evidence.updatedAt());
     }
 
@@ -415,6 +424,12 @@ public class EvidenceService {
     private InspectionView toView(SealInspection inspection) {
         return new InspectionView(inspection.evidenceKey(), inspection.inspectorId(),
                 inspection.passed(), inspection.note(), inspection.createdAt());
+    }
+
+    private ChainEventView toChainEventView(CustodyChainEvent event) {
+        return new ChainEventView(event.id(), event.transferId(), event.evidenceKey(),
+                event.caseKey(), event.eventType(), event.actorId(), event.detail(),
+                event.eventTime());
     }
 
     private LoanView toView(LoanRecord loan) {

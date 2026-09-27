@@ -16,6 +16,7 @@ import java.util.stream.Collectors;
 
 /**
  * 全局异常映射：业务异常按携带状态码返回；参数校验/请求解析失败返回 400；其余异常返回 500。
+ * 错误体携带可区分错误码 code，便于调用方区分失败原因（如封签异常、借出未归还、令版本失效）。
  */
 @RestControllerAdvice
 public class GlobalExceptionHandler {
@@ -25,7 +26,7 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(ApiException.class)
     public ResponseEntity<ErrorBody> handleApi(ApiException ex) {
         return ResponseEntity.status(ex.status())
-                .body(new ErrorBody(ex.status().value(), ex.getMessage(), LocalDateTime.now()));
+                .body(new ErrorBody(ex.status().value(), ex.code(), ex.getMessage(), LocalDateTime.now()));
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
@@ -35,29 +36,30 @@ public class GlobalExceptionHandler {
                 .distinct()
                 .collect(Collectors.joining(", ", "参数非法: ", ""));
         return ResponseEntity.badRequest()
-                .body(new ErrorBody(400, message, LocalDateTime.now()));
+                .body(new ErrorBody(400, "BAD_REQUEST", message, LocalDateTime.now()));
     }
 
     @ExceptionHandler({MissingRequestHeaderException.class, HttpMessageNotReadableException.class})
     public ResponseEntity<ErrorBody> handleBadRequest(Exception ex) {
         return ResponseEntity.badRequest()
-                .body(new ErrorBody(400, "参数非法: " + ex.getMessage(), LocalDateTime.now()));
+                .body(new ErrorBody(400, "BAD_REQUEST", "参数非法: " + ex.getMessage(), LocalDateTime.now()));
     }
 
     @ExceptionHandler(Exception.class)
     public ResponseEntity<ErrorBody> handleOther(Exception ex) {
         log.error("未处理异常", ex);
         return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                .body(new ErrorBody(500, "服务内部错误", LocalDateTime.now()));
+                .body(new ErrorBody(500, "INTERNAL_ERROR", "服务内部错误", LocalDateTime.now()));
     }
 
     /**
      * 统一错误响应体。
      *
      * @param status    HTTP 状态码
+     * @param code      可区分错误码
      * @param message   错误描述
      * @param timestamp 发生时间（Asia/Shanghai）
      */
-    public record ErrorBody(int status, String message, LocalDateTime timestamp) {
+    public record ErrorBody(int status, String code, String message, LocalDateTime timestamp) {
     }
 }

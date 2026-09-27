@@ -45,6 +45,27 @@ public class SealInspectionRepository {
                 ROW_MAPPER, evidenceKey);
     }
 
+    /**
+     * 证物当前最大核验记录 id（跨案移交前水位）；无记录时为 null。
+     */
+    public Long findMaxIdByEvidenceKey(String evidenceKey) {
+        List<Long> ids = jdbc.queryForList(
+                "SELECT COALESCE(MAX(id), NULL) FROM seal_inspection WHERE evidence_key = ?",
+                Long.class, evidenceKey);
+        return ids.isEmpty() ? null : ids.get(0);
+    }
+
+    /**
+     * 水位之后是否发生过封签复核（撤销时识别目标案件后续复核，含归还时核验）。
+     */
+    public boolean existsAfterId(String evidenceKey, Long afterId) {
+        Long watermark = afterId == null ? 0L : afterId;
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(1) FROM seal_inspection WHERE evidence_key = ? AND id > ?",
+                Integer.class, evidenceKey, watermark);
+        return count != null && count > 0;
+    }
+
     private static final class InspectionRowMapper implements RowMapper<SealInspection> {
         @Override
         public SealInspection mapRow(ResultSet rs, int rowNum) throws SQLException {

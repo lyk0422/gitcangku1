@@ -7,12 +7,14 @@ import org.springframework.stereotype.Repository;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.LocalDateTime;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 
 /**
  * 证物表访问。状态与保管人变更必须先通过 {@link #findByKeyForUpdate} 锁定证物行，
- * 保证并发交接/取消/核验按事务提交顺序生效。
+ * 跨案批量移交通过 {@link #findByKeysForUpdateOrdered} 按证物键排序统一加锁，
+ * 保证并发交接/取消/核验/移交按事务提交顺序生效且不死锁。
  */
 @Repository
 public class EvidenceRepository {
@@ -26,17 +28,18 @@ public class EvidenceRepository {
     }
 
     /**
-     * 插入新证物，初始状态 SEALED，保管人为入库操作人。
+     * 插入新证物，初始状态 SEALED，保管人为入库操作人；location 为 null 表示未登记库位。
      */
     public void insert(String evidenceKey, String caseKey, String category, String sealNo,
-                       String custodianId, LocalDateTime now) {
+                       String location, String custodianId, LocalDateTime now) {
         jdbc.update("""
                         INSERT INTO evidence
-                            (evidence_key, case_key, category, seal_no, custodian_id, status, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            (evidence_key, case_key, category, seal_no, location,
+                             custodian_id, status, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
-                evidenceKey, caseKey, category, sealNo, custodianId,
-                EvidenceStatus.SEALED.name(), now, now);
+                evidenceKey, caseKey, category, sealNo, location,
+                custodianId, EvidenceStatus.SEALED.name(), now, now);
     }
 
     /**
@@ -55,6 +58,22 @@ public class EvidenceRepository {
         List<Evidence> rows = jdbc.query(
                 "SELECT * FROM evidence WHERE evidence_key = ? FOR UPDATE", ROW_MAPPER, evidenceKey);
         return rows.stream().findFirst();
+    }
+
+    /**
+     * 按给定证物键集合排序后批量锁定证物行（统一加锁顺序，避免并发事务交叉等锁死锁）。
+     * 调用方负责比对返回行与请求键：缺失即证物不存在。
+     */
+    public List<Evidence> findByKeysForUpdateOrdered(Collection<String> evidenceKeys) {
+        List<String> ordered = evidenceKeys.stream().distinct().sorted().toList();
+        if (ordered.isEmpty()) {
+            return List.of();
+        }
+        String placeholders = String.join(",", ordered.stream().map(k -> "?").toList());
+        return jdbc.query(
+                "SELECT * FROM evidence WHERE evidence_key IN (" + placeholders
+                        + ") ORDER BY evidence_key FOR UPDATE",
+                ROW_MAPPER, ordered.toArray());
     }
 
     /**
@@ -77,6 +96,19 @@ public class EvidenceRepository {
     }
 
     /**
+     * 跨案移交事务内切换案件归属、保管人与库位；历史链事件与快照已先固化旧归属，不得借本更新改写历史。
+     */
+    public void reassignCase(String evidenceKey, String caseKey, String custodianId,
+                             String location, LocalDateTime now) {
+        jdbc.update("""
+                        UPDATE evidence
+                        SET case_key = ?, custodian_id = ?, location = ?, updated_at = ?
+                        WHERE evidence_key = ?
+                        """,
+                caseKey, custodianId, location, now, evidenceKey);
+    }
+
+    /**
      * 查询指定保管人当前可交接的证物（本人保管且状态 SEALED）。
      */
     public List<Evidence> findTransferable(String custodianId) {
@@ -94,6 +126,7 @@ public class EvidenceRepository {
                     rs.getString("case_key"),
                     rs.getString("category"),
                     rs.getString("seal_no"),
+                    rs.getString("location"),
                     rs.getString("custodian_id"),
                     EvidenceStatus.valueOf(rs.getString("status")),
                     rs.getObject("created_at", LocalDateTime.class),

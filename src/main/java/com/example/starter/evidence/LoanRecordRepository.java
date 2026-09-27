@@ -94,6 +94,27 @@ public class LoanRecordRepository {
                 ROW_MAPPER, evidenceKey);
     }
 
+    /**
+     * 证物当前最大借出记录 id（跨案移交前水位）；无记录时为 null。
+     */
+    public Long findMaxIdByEvidenceKey(String evidenceKey) {
+        List<Long> ids = jdbc.queryForList(
+                "SELECT COALESCE(MAX(id), NULL) FROM loan_record WHERE evidence_key = ?",
+                Long.class, evidenceKey);
+        return ids.isEmpty() ? null : ids.get(0);
+    }
+
+    /**
+     * 水位之后是否发生过借出（撤销时识别目标案件后续借出，含未归还与已归还）。
+     */
+    public boolean existsAfterId(String evidenceKey, Long afterId) {
+        Long watermark = afterId == null ? 0L : afterId;
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(1) FROM loan_record WHERE evidence_key = ? AND id > ?",
+                Integer.class, evidenceKey, watermark);
+        return count != null && count > 0;
+    }
+
     private static final class LoanRowMapper implements RowMapper<LoanRecord> {
         @Override
         public LoanRecord mapRow(ResultSet rs, int rowNum) throws SQLException {

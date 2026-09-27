@@ -69,6 +69,27 @@ public class TransferRecordRepository {
                 ROW_MAPPER, evidenceKey);
     }
 
+    /**
+     * 证物当前最大双人保管链交接 id（跨案移交前水位）；无记录时为 null。
+     */
+    public Long findMaxIdByEvidenceKey(String evidenceKey) {
+        List<Long> ids = jdbc.queryForList(
+                "SELECT COALESCE(MAX(id), NULL) FROM transfer_record WHERE evidence_key = ?",
+                Long.class, evidenceKey);
+        return ids.isEmpty() ? null : ids.get(0);
+    }
+
+    /**
+     * 水位之后是否发生过保管链交接（撤销时识别目标案件后续交接，含已取消）。
+     */
+    public boolean existsAfterId(String evidenceKey, Long afterId) {
+        Long watermark = afterId == null ? 0L : afterId;
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(1) FROM transfer_record WHERE evidence_key = ? AND id > ?",
+                Integer.class, evidenceKey, watermark);
+        return count != null && count > 0;
+    }
+
     private static final class TransferRowMapper implements RowMapper<TransferRecord> {
         @Override
         public TransferRecord mapRow(ResultSet rs, int rowNum) throws SQLException {

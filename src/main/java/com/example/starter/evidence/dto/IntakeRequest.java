@@ -10,12 +10,22 @@ import jakarta.validation.constraints.Size;
  * @param evidenceKey 证物业务键，全局唯一
  * @param caseKey     所属案件键
  * @param category    证物类别
- * @param sealNo      封条编号
+ * @param sealNo      封条编号（封签版本）
+ * @param location    证物库位；null 表示未登记库位（跨案移交时该空值语义被快照原样固化）
  */
 public record IntakeRequest(
         @NotBlank @Size(max = 64) String commandKey,
         @NotBlank @Size(max = 64) String evidenceKey,
         @NotBlank @Size(max = 64) String caseKey,
         @NotBlank @Size(max = 64) String category,
-        @NotBlank @Size(max = 64) String sealNo) {
+        @NotBlank @Size(max = 64) String sealNo,
+        @Size(max = 128) String location) {
+
+    /**
+     * 兼容不含库位的入库调用（库位记为 null）。
+     */
+    public IntakeRequest(String commandKey, String evidenceKey, String caseKey,
+                         String category, String sealNo) {
+        this(commandKey, evidenceKey, caseKey, category, sealNo, null);
+    }
 }
