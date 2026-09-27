@@ -2,6 +2,7 @@ package com.example.starter.evidence;
 
 import com.example.starter.error.ApiException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Component;
 
@@ -37,12 +38,34 @@ public class IdempotencyAdvisor {
                     actorId == null ? "" : actorId,
                     evidenceKey == null ? "" : evidenceKey,
                     objectMapper.writeValueAsString(request));
+            return sha256(canonical);
+        } catch (Exception e) {
+            throw new IllegalStateException("请求序列化失败", e);
+        }
+    }
+
+    /**
+     * 计算规范化请求指纹：操作者、操作类型与全部结果相关字段统一序列化为 JSON 对象后哈希，
+     * 不使用未转义分隔符拼接；集合类字段须由调用方先排序（规范化集合）后传入。
+     */
+    public String hashCanonical(String operation, String actorId, Object payload) {
+        try {
+            ObjectNode root = objectMapper.createObjectNode();
+            root.put("operation", operation);
+            root.put("actorId", actorId == null ? "" : actorId);
+            root.set("payload", objectMapper.valueToTree(payload));
+            return sha256(objectMapper.writeValueAsString(root));
+        } catch (Exception e) {
+            throw new IllegalStateException("请求序列化失败", e);
+        }
+    }
+
+    private String sha256(String canonical) {
+        try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             return HexFormat.of().formatHex(digest.digest(canonical.getBytes(StandardCharsets.UTF_8)));
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException("SHA-256 不可用", e);
-        } catch (Exception e) {
-            throw new IllegalStateException("请求序列化失败", e);
         }
     }
 

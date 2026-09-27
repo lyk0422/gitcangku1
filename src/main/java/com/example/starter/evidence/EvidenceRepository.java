@@ -7,12 +7,13 @@ import org.springframework.stereotype.Repository;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.LocalDateTime;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 
 /**
  * 证物表访问。状态与保管人变更必须先通过 {@link #findByKeyForUpdate} 锁定证物行，
- * 保证并发交接/取消/核验按事务提交顺序生效。
+ * 保证并发交接/取消/核验/检验按事务提交顺序生效。
  */
 @Repository
 public class EvidenceRepository {
@@ -26,16 +27,17 @@ public class EvidenceRepository {
     }
 
     /**
-     * 插入新证物，初始状态 SEALED，保管人为入库操作人。
+     * 插入新证物，初始状态 SEALED，封签版本为 1，保管人为入库操作人。
      */
     public void insert(String evidenceKey, String caseKey, String category, String sealNo,
                        String custodianId, LocalDateTime now) {
         jdbc.update("""
                         INSERT INTO evidence
-                            (evidence_key, case_key, category, seal_no, custodian_id, status, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            (evidence_key, case_key, category, seal_no, seal_version,
+                             custodian_id, status, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
-                evidenceKey, caseKey, category, sealNo, custodianId,
+                evidenceKey, caseKey, category, sealNo, 1, custodianId,
                 EvidenceStatus.SEALED.name(), now, now);
     }
 
@@ -58,6 +60,20 @@ public class EvidenceRepository {
     }
 
     /**
+     * 按业务键集合批量查询并按主键顺序加锁（SELECT ... FOR UPDATE），
+     * 用于批量预约：统一加锁顺序避免多证物事务交叉等待导致死锁。
+     */
+    public List<Evidence> findByKeysForUpdateOrdered(Collection<String> evidenceKeys) {
+        if (evidenceKeys.isEmpty()) {
+            return List.of();
+        }
+        String placeholders = String.join(",", evidenceKeys.stream().map(k -> "?").toList());
+        return jdbc.query(
+                "SELECT * FROM evidence WHERE evidence_key IN (" + placeholders + ") ORDER BY id FOR UPDATE",
+                ROW_MAPPER, evidenceKeys.toArray());
+    }
+
+    /**
      * 更新证物状态与保管人（交接接受时原子切换保管人）。
      */
     public void updateCustody(String evidenceKey, String custodianId, EvidenceStatus status,
@@ -68,12 +84,22 @@ public class EvidenceRepository {
     }
 
     /**
-     * 仅更新证物状态（交接发起/取消、核验失败）。
+     * 仅更新证物状态（交接发起/取消、核验失败、检验开始）。
      */
     public void updateStatus(String evidenceKey, EvidenceStatus status, LocalDateTime now) {
         jdbc.update(
                 "UPDATE evidence SET status = ?, updated_at = ? WHERE evidence_key = ?",
                 status.name(), now, evidenceKey);
+    }
+
+    /**
+     * 检验完成重封：原子写入新封签编号、递增后的封签版本、新状态与变更时间。
+     */
+    public void updateSeal(String evidenceKey, String newSealNo, int newSealVersion,
+                           EvidenceStatus status, LocalDateTime now) {
+        jdbc.update(
+                "UPDATE evidence SET seal_no = ?, seal_version = ?, status = ?, updated_at = ? WHERE evidence_key = ?",
+                newSealNo, newSealVersion, status.name(), now, evidenceKey);
     }
 
     /**
@@ -94,6 +120,7 @@ public class EvidenceRepository {
                     rs.getString("case_key"),
                     rs.getString("category"),
                     rs.getString("seal_no"),
+                    rs.getInt("seal_version"),
                     rs.getString("custodian_id"),
                     EvidenceStatus.valueOf(rs.getString("status")),
                     rs.getObject("created_at", LocalDateTime.class),
