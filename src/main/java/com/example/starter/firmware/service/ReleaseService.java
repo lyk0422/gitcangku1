@@ -32,17 +32,20 @@ public class ReleaseService {
     private final TaskRepository taskRepository;
     private final PauseRecordRepository pauseRecordRepository;
     private final ResumeRecordRepository resumeRecordRepository;
+    private final CertificateService certificateService;
     private final IdempotencyService idempotency;
     private final Clock clock;
 
     public ReleaseService(ReleaseRepository releaseRepository, TaskRepository taskRepository,
                           PauseRecordRepository pauseRecordRepository,
                           ResumeRecordRepository resumeRecordRepository,
+                          CertificateService certificateService,
                           IdempotencyService idempotency, Clock clock) {
         this.releaseRepository = releaseRepository;
         this.taskRepository = taskRepository;
         this.pauseRecordRepository = pauseRecordRepository;
         this.resumeRecordRepository = resumeRecordRepository;
+        this.certificateService = certificateService;
         this.idempotency = idempotency;
         this.clock = clock;
     }
@@ -57,6 +60,8 @@ public class ReleaseService {
                 request.toVersion(), String.valueOf(request.ratio()), String.valueOf(sampleFloor),
                 String.valueOf(threshold));
         return idempotency.execute(request.requestId(), "release.create", fingerprint, () -> {
+            // 启动发布守卫：目标固件纳管证书后，必须兼容矩阵允许且当前存在有效证书链
+            certificateService.assertStartupGuard(request.model(), request.fromVersion(), request.toVersion());
             long id;
             try {
                 id = releaseRepository.insert(request.model(), request.fromVersion(), request.toVersion(),
