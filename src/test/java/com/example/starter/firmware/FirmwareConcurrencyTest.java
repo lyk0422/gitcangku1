@@ -66,6 +66,15 @@ class FirmwareConcurrencyTest {
 
     @BeforeEach
     void setUp() {
+        jdbc.update("DELETE FROM module_block_item");
+        jdbc.update("DELETE FROM module_block_record");
+        jdbc.update("DELETE FROM release_exemption");
+        jdbc.update("DELETE FROM device_module_report");
+        jdbc.update("DELETE FROM device_module");
+        jdbc.update("DELETE FROM compat_matrix_revision");
+        jdbc.update("DELETE FROM firmware_requirement");
+        jdbc.update("DELETE FROM module_dependency");
+        jdbc.update("UPDATE compat_matrix_meta SET version = 0 WHERE id = 1");
         jdbc.update("DELETE FROM rollout_task");
         jdbc.update("DELETE FROM release_pause_record");
         jdbc.update("DELETE FROM release_resume_record");

@@ -23,10 +23,14 @@ public class TaskRepository {
         String firstResult = rs.getString("first_result");
         return new RolloutTask(rs.getLong("id"), rs.getLong("release_id"), rs.getString("device_id"),
                 TaskStatus.valueOf(rs.getString("status")),
-                firstResult == null ? null : ReceiptResult.valueOf(firstResult));
+                firstResult == null ? null : ReceiptResult.valueOf(firstResult),
+                rs.getString("module_digest"),
+                (Integer) rs.getObject("matrix_version"),
+                (Integer) rs.getObject("exemption_version"));
     };
 
-    private static final String COLUMNS = "id, release_id, device_id, status, first_result";
+    private static final String COLUMNS = "id, release_id, device_id, status, first_result,"
+            + " module_digest, matrix_version, exemption_version";
 
     private final JdbcTemplate jdbc;
 
@@ -34,14 +38,31 @@ public class TaskRepository {
         this.jdbc = jdbc;
     }
 
-    public long insert(long releaseId, String deviceId) {
+    /**
+     * 创建任务并固化当时的设备模块摘要、兼容矩阵版本与豁免版本快照，历史不改写。
+     */
+    public long insert(long releaseId, String deviceId, String moduleDigest,
+                       Integer matrixVersion, Integer exemptionVersion) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO rollout_task (release_id, device_id, status) VALUES (?, ?, 'PENDING')",
+                    "INSERT INTO rollout_task (release_id, device_id, status,"
+                            + " module_digest, matrix_version, exemption_version)"
+                            + " VALUES (?, ?, 'PENDING', ?, ?, ?)",
                     new String[]{"id"});
             ps.setLong(1, releaseId);
             ps.setString(2, deviceId);
+            ps.setString(3, moduleDigest);
+            if (matrixVersion == null) {
+                ps.setNull(4, java.sql.Types.INTEGER);
+            } else {
+                ps.setInt(4, matrixVersion);
+            }
+            if (exemptionVersion == null) {
+                ps.setNull(5, java.sql.Types.INTEGER);
+            } else {
+                ps.setInt(5, exemptionVersion);
+            }
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();

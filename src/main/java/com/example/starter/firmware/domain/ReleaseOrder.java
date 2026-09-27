@@ -15,8 +15,9 @@ package com.example.starter.firmware.domain;
  * @param monitorRound            当前监控轮次，从1开始，人工恢复后加一
  * @param roundSuccess            当前监控轮次内首次进入 SUCCESS 的任务数
  * @param roundFailed             当前监控轮次内首次进入 FAILED 的任务数
+ * @param exemptionVersion        模块豁免版本，从0开始，每次豁免修改加一
  */
 public record ReleaseOrder(long id, int version, String model, String fromVersion, String toVersion,
                            int ratio, ReleaseStatus status, int sampleFloor, int failureThresholdPercent,
-                           int monitorRound, int roundSuccess, int roundFailed) {
+                           int monitorRound, int roundSuccess, int roundFailed, int exemptionVersion) {
 }

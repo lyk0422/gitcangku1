@@ -2,6 +2,7 @@ package com.example.starter.firmware.api;
 
 import com.example.starter.firmware.domain.TaskStatus;
 import com.example.starter.firmware.error.ApiException;
+import com.example.starter.firmware.service.ExemptionService;
 import com.example.starter.firmware.service.ReleaseService;
 import com.example.starter.firmware.service.TaskService;
 import jakarta.validation.Valid;
@@ -14,7 +15,8 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * 发布单：创建、扩量、取消、人工恢复、监控统计与暂停/恢复历史、任务明细查询。
+ * 发布单：创建、扩量、取消、人工恢复、监控统计与暂停/恢复历史、任务明细查询、
+ * 模块豁免配置与历史、模块阻断诊断查询。
  */
 @RestController
 @RequestMapping("/api/releases")
@@ -22,10 +24,13 @@ public class ReleaseController {
 
     private final ReleaseService releaseService;
     private final TaskService taskService;
+    private final ExemptionService exemptionService;
 
-    public ReleaseController(ReleaseService releaseService, TaskService taskService) {
+    public ReleaseController(ReleaseService releaseService, TaskService taskService,
+                             ExemptionService exemptionService) {
         this.releaseService = releaseService;
         this.taskService = taskService;
+        this.exemptionService = exemptionService;
     }
 
     @PostMapping
@@ -62,6 +67,27 @@ public class ReleaseController {
     public TaskListResponse tasks(@PathVariable long releaseId, @RequestParam(required = false) String status) {
         TaskStatus filter = parseStatus(status);
         return taskService.listByRelease(releaseId, filter);
+    }
+
+    @PostMapping("/{releaseId}/exemptions")
+    public ExemptionListResponse replaceExemptions(@PathVariable long releaseId,
+                                                   @Valid @RequestBody ExemptionUpdateRequest request) {
+        return exemptionService.replace(releaseId, request);
+    }
+
+    @GetMapping("/{releaseId}/exemptions")
+    public ExemptionListResponse exemptions(@PathVariable long releaseId) {
+        return exemptionService.current(releaseId);
+    }
+
+    @GetMapping("/{releaseId}/exemptions/history")
+    public ExemptionHistoryResponse exemptionHistory(@PathVariable long releaseId) {
+        return exemptionService.history(releaseId);
+    }
+
+    @GetMapping("/{releaseId}/blocks")
+    public BlockListResponse blocks(@PathVariable long releaseId) {
+        return taskService.listBlocks(releaseId);
     }
 
     private TaskStatus parseStatus(String status) {

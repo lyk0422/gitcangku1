@@ -23,17 +23,18 @@ public class DeviceService {
     }
 
     public DeviceView register(RegisterDeviceRequest request) {
+        String deviceGroup = request.effectiveDeviceGroup();
         String fingerprint = String.join("|", "device.register", request.deviceId(), request.model(),
-                request.currentVersion(), String.valueOf(request.bucketNo()));
+                request.currentVersion(), String.valueOf(request.bucketNo()), deviceGroup);
         return idempotency.execute(request.requestId(), "device.register", fingerprint, () -> {
             try {
                 deviceRepository.insert(new Device(request.deviceId(), request.model(),
-                        request.currentVersion(), request.bucketNo()));
+                        request.currentVersion(), request.bucketNo(), deviceGroup, null, 0));
             } catch (DuplicateKeyException e) {
                 throw ApiException.conflict("DEVICE_EXISTS", "设备已登记: " + request.deviceId());
             }
             return new DeviceView(request.deviceId(), request.model(), request.currentVersion(),
-                    request.bucketNo());
+                    request.bucketNo(), deviceGroup, null, 0);
         }, DeviceView.class);
     }
 
