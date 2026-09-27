@@ -44,7 +44,7 @@ CREATE INDEX IF NOT EXISTS idx_rail_plan_occupancy_section ON rail_plan_occupanc
 
 CREATE TABLE IF NOT EXISTS idempotency_record (
     id BIGINT NOT NULL AUTO_INCREMENT,
-    op_type VARCHAR(16) NOT NULL,
+    op_type VARCHAR(32) NOT NULL,
     request_key VARCHAR(128) NOT NULL,
     request_hash CHAR(64) NOT NULL,
     response_json CLOB NOT NULL,
@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS idempotency_record (
 );
 COMMENT ON TABLE idempotency_record IS '写操作幂等记录，仅缓存成功结果，失败不缓存可重试';
 COMMENT ON COLUMN idempotency_record.id IS '主键';
-COMMENT ON COLUMN idempotency_record.op_type IS '操作类型：CREATE / UPDATE / PUBLISH / CANCEL / RESCHEDULE';
+COMMENT ON COLUMN idempotency_record.op_type IS '操作类型：CREATE / UPDATE / PUBLISH / CANCEL / RESCHEDULE / RESTRICTION_REGISTER / RESTRICTION_REVOKE';
 COMMENT ON COLUMN idempotency_record.request_key IS '客户端幂等键，同一操作类型内唯一';
 COMMENT ON COLUMN idempotency_record.request_hash IS '请求参数规范化后的 SHA-256，同键不同参判定 409';
 COMMENT ON COLUMN idempotency_record.response_json IS '首次成功响应快照（JSON），重放原样返回';
@@ -74,6 +74,57 @@ COMMENT ON COLUMN rail_plan_reschedule_link.id IS '主键';
 COMMENT ON COLUMN rail_plan_reschedule_link.predecessor_plan_id IS '直接前驱（被改签取消的旧计划）id，关联 rail_day_plan.id，全表唯一';
 COMMENT ON COLUMN rail_plan_reschedule_link.successor_plan_id IS '直接后继（改签发布的新计划）id，关联 rail_day_plan.id，全表唯一';
 COMMENT ON COLUMN rail_plan_reschedule_link.created_at IS '关联创建时刻，UTC 毫秒';
+
+CREATE TABLE IF NOT EXISTS rail_speed_restriction (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    section_id VARCHAR(64) NOT NULL,
+    start_utc BIGINT NOT NULL,
+    end_utc BIGINT NOT NULL,
+    max_speed_kmh INT NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    version INT NOT NULL,
+    operator VARCHAR(64),
+    created_at BIGINT NOT NULL,
+    revoked_at BIGINT,
+    PRIMARY KEY (id)
+);
+COMMENT ON TABLE rail_speed_restriction IS '铁路气象限速令，按区段与 UTC 左闭右开时段登记；同区段同时刻可叠加多条，以最低速度为准';
+COMMENT ON COLUMN rail_speed_restriction.id IS '主键，同时作为限速令标识';
+COMMENT ON COLUMN rail_speed_restriction.section_id IS '区段 ID';
+COMMENT ON COLUMN rail_speed_restriction.start_utc IS '限速开始时刻（含），UTC 毫秒';
+COMMENT ON COLUMN rail_speed_restriction.end_utc IS '限速结束时刻（不含），UTC 毫秒，必须大于 start_utc';
+COMMENT ON COLUMN rail_speed_restriction.max_speed_kmh IS '最高速度，单位 km/h，范围 10～300';
+COMMENT ON COLUMN rail_speed_restriction.status IS '限速令状态：ACTIVE 生效 / REVOKED 已撤销；撤销后仅影响后续发布或改签，不改写已生成的重排记录';
+COMMENT ON COLUMN rail_speed_restriction.version IS '限速令版本，登记时恒为 1；修订通过撤销原令并登记新令完成，原行不改写';
+COMMENT ON COLUMN rail_speed_restriction.operator IS '操作者标识，可为空（未提供）';
+COMMENT ON COLUMN rail_speed_restriction.created_at IS '登记时刻，UTC 毫秒';
+COMMENT ON COLUMN rail_speed_restriction.revoked_at IS '撤销时刻，UTC 毫秒；NULL 表示未撤销';
+CREATE INDEX IF NOT EXISTS idx_rail_speed_restriction_section ON rail_speed_restriction (section_id, start_utc, end_utc);
+
+CREATE TABLE IF NOT EXISTS rail_plan_rearrangement (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    plan_id BIGINT NOT NULL,
+    schedule_key VARCHAR(64) NOT NULL,
+    op_type VARCHAR(16) NOT NULL,
+    shift_minutes INT NOT NULL,
+    restriction_snapshot_json CLOB NOT NULL,
+    original_json CLOB NOT NULL,
+    shifted_json CLOB NOT NULL,
+    created_at BIGINT NOT NULL,
+    PRIMARY KEY (id)
+);
+COMMENT ON TABLE rail_plan_rearrangement IS '气象限速触发的计划整体顺延重排记录，追加后不可变；撤销或修订限速令不改写本表';
+COMMENT ON COLUMN rail_plan_rearrangement.id IS '主键';
+COMMENT ON COLUMN rail_plan_rearrangement.plan_id IS '被顺延计划 id，关联 rail_day_plan.id';
+COMMENT ON COLUMN rail_plan_rearrangement.schedule_key IS '被顺延计划业务键（冗余，便于历史查询）';
+COMMENT ON COLUMN rail_plan_rearrangement.op_type IS '触发重排的操作：PUBLISH 发布 / RESCHEDULE 改签';
+COMMENT ON COLUMN rail_plan_rearrangement.shift_minutes IS '实际整体顺延分钟数，为线路最小间隔的整数倍，恒大于 0';
+COMMENT ON COLUMN rail_plan_rearrangement.original_json IS '原计划时刻快照（JSON 数组，逐占用 trainNo/sectionId/startUtc/endUtc）';
+COMMENT ON COLUMN rail_plan_rearrangement.shifted_json IS '顺延后的新计划时刻快照（JSON 数组，结构同 original_json）';
+COMMENT ON COLUMN rail_plan_rearrangement.restriction_snapshot_json IS '重排时使用的限速令版本快照（JSON 数组，含 id/version/区段/时段/限速），固化业务证据';
+COMMENT ON COLUMN rail_plan_rearrangement.created_at IS '记录创建时刻，UTC 毫秒';
+CREATE INDEX IF NOT EXISTS idx_rail_plan_rearrangement_plan ON rail_plan_rearrangement (plan_id);
+CREATE INDEX IF NOT EXISTS idx_rail_plan_rearrangement_key ON rail_plan_rearrangement (schedule_key);
 
 CREATE TABLE IF NOT EXISTS publish_lock (
     id INT NOT NULL,

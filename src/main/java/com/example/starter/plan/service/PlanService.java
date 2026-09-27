@@ -5,8 +5,11 @@ import com.example.starter.plan.model.Occupancy;
 import com.example.starter.plan.model.PlanStatus;
 import com.example.starter.plan.model.PublishedSlot;
 import com.example.starter.plan.model.RescheduleLink;
+import com.example.starter.plan.model.SpeedRestriction;
 import com.example.starter.plan.repo.IdempotencyRepository;
 import com.example.starter.plan.repo.PlanRepository;
+import com.example.starter.plan.repo.RearrangementRepository;
+import com.example.starter.plan.repo.RestrictionRepository;
 import com.example.starter.plan.web.ApiException;
 import com.example.starter.plan.web.dto.CreatePlanRequest;
 import com.example.starter.plan.web.dto.OccupancyRequest;
@@ -22,6 +25,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.Clock;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
@@ -60,14 +64,26 @@ public class PlanService {
 
     private final PlanRepository planRepo;
     private final IdempotencyRepository idemRepo;
+    private final RestrictionRepository restrictionRepo;
+    private final RearrangementRepository rearrangementRepo;
+    private final RearrangementPlanner planner;
     private final ObjectMapper objectMapper;
+    private final Clock clock;
     private final TransactionTemplate tx;
 
     public PlanService(PlanRepository planRepo, IdempotencyRepository idemRepo,
-                       ObjectMapper objectMapper, PlatformTransactionManager txManager) {
+                       RestrictionRepository restrictionRepo,
+                       RearrangementRepository rearrangementRepo,
+                       RearrangementPlanner planner,
+                       ObjectMapper objectMapper, Clock clock,
+                       PlatformTransactionManager txManager) {
         this.planRepo = planRepo;
         this.idemRepo = idemRepo;
+        this.restrictionRepo = restrictionRepo;
+        this.rearrangementRepo = rearrangementRepo;
+        this.planner = planner;
         this.objectMapper = objectMapper;
+        this.clock = clock;
         this.tx = new TransactionTemplate(txManager);
     }
 
@@ -135,11 +151,20 @@ public class PlanService {
     }
 
     /**
-     * 发布计划：全局发布锁内原子校验本计划列车重叠与跨计划区段重叠，
-     * 任一冲突则整张计划保持草稿并抛出 422（携带冲突区段与计划）。
+     * 发布计划（兼容不携带操作者的调用）。
      */
     public PlanResponse publish(String scheduleKey, String requestKey) {
-        String hash = hashAction(OP_PUBLISH, scheduleKey);
+        return publish(scheduleKey, requestKey, null);
+    }
+
+    /**
+     * 发布计划：全局发布锁内先按生效限速令计算整体顺延（需要时整计划按最小间隔倍数顺延，
+     * 已开始运行的计划不可重排返回 409），再原子校验本计划列车重叠与跨计划区段重叠，
+     * 任一冲突则整张计划保持草稿并抛出 422（携带冲突区段与计划）。
+     * 成功顺延在同一事务内更新占用、追加不可变重排记录并发布。
+     */
+    public PlanResponse publish(String scheduleKey, String requestKey, String operator) {
+        String hash = hashAction(OP_PUBLISH, scheduleKey, operator);
         Optional<PlanResponse> replay = replayIfPresent(OP_PUBLISH, requestKey, hash);
         if (replay.isPresent()) {
             return replay.get();
@@ -154,15 +179,24 @@ public class PlanService {
                             "仅草稿可发布，当前状态: " + plan.status());
                 }
                 List<Occupancy> occupancies = planRepo.findOccupancies(plan.id());
+                ShiftContext shift = computeShift(plan, occupancies);
+                List<Occupancy> effective = shift.outcome().shiftedOccupancies();
                 List<Map<String, Object>> conflicts = new ArrayList<>();
-                conflicts.addAll(findTrainOverlaps(scheduleKey, occupancies));
-                conflicts.addAll(findSectionConflicts(plan, occupancies, List.of(plan.id())));
+                conflicts.addAll(findTrainOverlaps(scheduleKey, effective));
+                conflicts.addAll(findSectionConflicts(plan, effective, List.of(plan.id())));
                 if (!conflicts.isEmpty()) {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "存在时隙冲突，计划保持草稿", conflicts);
                 }
                 long now = System.currentTimeMillis();
-                planRepo.updateStatus(plan.id(), PlanStatus.PUBLISHED, now);
+                if (shift.outcome().shiftMinutes() > 0) {
+                    planRepo.replaceOccupancies(plan.id(), effective);
+                    planRepo.updateVersionAndStatus(plan.id(), plan.version() + 1,
+                            PlanStatus.PUBLISHED, now);
+                    recordRearrangement(plan, "PUBLISH", shift, occupancies, now);
+                } else {
+                    planRepo.updateStatus(plan.id(), PlanStatus.PUBLISHED, now);
+                }
                 PlanResponse response = loadPlan(scheduleKey);
                 idemRepo.insert(OP_PUBLISH, requestKey, hash, toJson(response), now);
                 return response;
@@ -173,10 +207,17 @@ public class PlanService {
     }
 
     /**
-     * 取消已发布计划：时隙立即释放，历史计划与占用保留不改写。
+     * 取消已发布计划（兼容不携带操作者的调用）。
      */
     public PlanResponse cancel(String scheduleKey, String requestKey) {
-        String hash = hashAction(OP_CANCEL, scheduleKey);
+        return cancel(scheduleKey, requestKey, null);
+    }
+
+    /**
+     * 取消已发布计划：时隙立即释放，历史计划与占用保留不改写。
+     */
+    public PlanResponse cancel(String scheduleKey, String requestKey, String operator) {
+        String hash = hashAction(OP_CANCEL, scheduleKey, operator);
         Optional<PlanResponse> replay = replayIfPresent(OP_CANCEL, requestKey, hash);
         if (replay.isPresent()) {
             return replay.get();
@@ -251,10 +292,12 @@ public class PlanService {
                     throw conflict("LINK_CONFLICT", "新计划已存在直接前驱: " + req.newScheduleKey());
                 }
                 List<Occupancy> occupancies = planRepo.findOccupancies(newPlan.id());
+                ShiftContext shift = computeShift(newPlan, occupancies);
+                List<Occupancy> effective = shift.outcome().shiftedOccupancies();
                 List<Map<String, Object>> conflicts = new ArrayList<>();
-                conflicts.addAll(findTrainOverlaps(req.newScheduleKey(), occupancies));
+                conflicts.addAll(findTrainOverlaps(req.newScheduleKey(), effective));
                 // 仅排除旧计划与自身占用，第三方已发布计划照常参与冲突裁决
-                conflicts.addAll(findSectionConflicts(newPlan, occupancies,
+                conflicts.addAll(findSectionConflicts(newPlan, effective,
                         List.of(newPlan.id(), oldPlan.id())));
                 if (!conflicts.isEmpty()) {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
@@ -262,7 +305,14 @@ public class PlanService {
                 }
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(oldPlan.id(), PlanStatus.CANCELLED, now);
-                planRepo.updateStatus(newPlan.id(), PlanStatus.PUBLISHED, now);
+                if (shift.outcome().shiftMinutes() > 0) {
+                    planRepo.replaceOccupancies(newPlan.id(), effective);
+                    planRepo.updateVersionAndStatus(newPlan.id(), newPlan.version() + 1,
+                            PlanStatus.PUBLISHED, now);
+                    recordRearrangement(newPlan, "RESCHEDULE", shift, occupancies, now);
+                } else {
+                    planRepo.updateStatus(newPlan.id(), PlanStatus.PUBLISHED, now);
+                }
                 planRepo.insertRescheduleLink(oldPlan.id(), newPlan.id(), now);
                 RescheduleResponse response = new RescheduleResponse(
                         loadPlan(oldScheduleKey), loadPlan(req.newScheduleKey()));
@@ -334,6 +384,61 @@ public class PlanService {
     }
 
     // ---------- 内部实现 ----------
+
+    /**
+     * 限速重排上下文：顺延计算结果与参与裁决的生效限速令。
+     */
+    private record ShiftContext(RearrangementPlanner.ShiftOutcome outcome,
+                                List<SpeedRestriction> restrictions) {
+    }
+
+    /**
+     * 按当前生效限速令计算计划所需整体顺延；需要顺延但计划已开始运行时抛出 409。
+     */
+    private ShiftContext computeShift(DayPlan plan, List<Occupancy> occupancies) {
+        List<String> sectionIds = occupancies.stream()
+                .map(Occupancy::sectionId)
+                .collect(java.util.stream.Collectors.toCollection(TreeSet::new))
+                .stream().toList();
+        List<SpeedRestriction> restrictions = restrictionRepo.findActiveBySections(sectionIds);
+        Instant dayEnd = plan.opDate().plusDays(1).atStartOfDay(OPERATION_ZONE).toInstant();
+        RearrangementPlanner.ShiftOutcome outcome = planner.compute(occupancies, restrictions, dayEnd);
+        if (outcome.shiftMinutes() > 0 && started(occupancies)) {
+            throw conflict("PLAN_ALREADY_RUNNING",
+                    "计划已开始运行，不可按限速重排: " + plan.scheduleKey());
+        }
+        return new ShiftContext(outcome, restrictions);
+    }
+
+    /**
+     * 计划是否已开始运行：最早占用开始时刻不晚于当前时刻。
+     */
+    private boolean started(List<Occupancy> occupancies) {
+        Instant firstStart = occupancies.stream()
+                .map(Occupancy::startUtc)
+                .min(Comparator.naturalOrder())
+                .orElse(Instant.MAX);
+        return !clock.instant().isBefore(firstStart);
+    }
+
+    /**
+     * 追加不可变重排记录：固化使用的限速令版本快照、原计划时刻与新计划时刻。
+     */
+    private void recordRearrangement(DayPlan plan, String opType, ShiftContext shift,
+                                     List<Occupancy> original, long now) {
+        java.util.Set<Long> usedIds = new java.util.HashSet<>();
+        shift.outcome().impacts().forEach(i -> usedIds.addAll(i.restrictionIds()));
+        List<SpeedRestriction> used = shift.restrictions().stream()
+                .filter(r -> usedIds.contains(r.id()))
+                .sorted(Comparator.comparingLong(SpeedRestriction::id))
+                .toList();
+        rearrangementRepo.insert(plan.id(), plan.scheduleKey(), opType,
+                shift.outcome().shiftMinutes(),
+                toJson(WeatherRestrictionService.snapshotsOf(used)),
+                toJson(WeatherRestrictionService.occupancyViews(original)),
+                toJson(WeatherRestrictionService.occupancyViews(shift.outcome().shiftedOccupancies())),
+                now);
+    }
 
     private PlanResponse loadPlan(String scheduleKey) {
         DayPlan plan = planRepo.findByKey(scheduleKey)
@@ -495,13 +600,17 @@ public class PlanService {
         return sha256(sb.toString());
     }
 
-    private String hashAction(String opType, String scheduleKey) {
-        return sha256(opType + '\n' + scheduleKey);
+    private String hashAction(String opType, String scheduleKey, String operator) {
+        // 指纹包含计划标识、操作者与限速令全集版本：限速令登记/撤销后同键重放判定为异参 409
+        return sha256(opType + '\n' + scheduleKey + '\n' + String.valueOf(operator)
+                + '\n' + restrictionRepo.versionToken());
     }
 
     private String hashReschedule(String oldScheduleKey, RescheduleRequest req) {
+        // 指纹包含计划集合（旧+新）、期望版本、操作者与限速令全集版本
         return sha256(OP_RESCHEDULE + '\n' + oldScheduleKey + '\n' + req.newScheduleKey()
-                + '\n' + req.expectedOldVersion() + '\n' + req.expectedNewVersion());
+                + '\n' + req.expectedOldVersion() + '\n' + req.expectedNewVersion()
+                + '\n' + String.valueOf(req.operator()) + '\n' + restrictionRepo.versionToken());
     }
 
     private void appendOccupancies(StringBuilder sb, List<OccupancyRequest> occupancies) {
