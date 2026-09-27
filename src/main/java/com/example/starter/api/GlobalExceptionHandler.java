@@ -37,6 +37,13 @@ public class GlobalExceptionHandler {
                 .body(body("MALFORMED_REQUEST", "请求体格式不正确"));
     }
 
+    /** 左闭右开时空窗等非法参数（如 endMs <= startMs）统一按 400 处理。 */
+    @ExceptionHandler(IllegalArgumentException.class)
+    public ResponseEntity<Map<String, Object>> handleIllegalArgument(IllegalArgumentException ex) {
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                .body(body("INVALID_ARGUMENT", ex.getMessage() == null ? "非法请求参数" : ex.getMessage()));
+    }
+
     private static Map<String, Object> body(String code, String message) {
         Map<String, Object> map = new LinkedHashMap<>();
         map.put("code", code);

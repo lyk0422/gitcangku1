@@ -100,4 +100,39 @@ public final class Geometry {
                                       int xMin, int yMin, int xMax, int yMax) {
         return x >= xMin && x <= xMax && y >= yMin && y <= yMax;
     }
+
+    /**
+     * 两个左闭右开区间是否相交。区间端点为任意可比较的全序量（时间毫秒、高度米）。
+     * 左闭右开语义：[a1,a2) 与 [b1,b2) 在 {@code max(a1,b1) < min(a2,b2)} 时相交，
+     * 仅端点相接（a2 == b1）不算相交。
+     */
+    public static <T extends Comparable<T>> boolean halfOpenOverlap(T a1, T a2, T b1, T b2) {
+        return a1.compareTo(b2) < 0 && b1.compareTo(a2) < 0;
+    }
+
+    /**
+     * 折线在指定高度层与左闭右开时间窗内是否与轴对齐闭矩形相交。
+     * 时间窗与高度范围均为左闭右开：恰好从走廊结束时刻开始，或下边界等于走廊上界，
+     * 都不算命中。
+     *
+     * @param points 有序航点
+     * @param rect   走廊覆盖矩形（闭）
+     * @param startMs 占用/审查时间窗起点（含），epoch 毫秒 UTC
+     * @param endMs   时间窗终点（不含）
+     * @param altMin  占用/审查高度下界（含），单位米
+     * @param altMax  高度上界（不含）
+     * @param cStartMs 走廊时间窗起点（含）
+     * @param cEndMs   走廊时间窗终点（不含）
+     * @param cAltMin  走廊高度下界（含）
+     * @param cAltMax  走廊高度上界（不含）
+     * @return true 表示水平、时间、高度三维均相交
+     */
+    public static boolean polylineHitsCorridor(List<Point> points,
+                                               int rectXMin, int rectYMin, int rectXMax, int rectYMax,
+                                               long startMs, long endMs, int altMin, int altMax,
+                                               long cStartMs, long cEndMs, int cAltMin, int cAltMax) {
+        return polylineHitsRectangle(points, rectXMin, rectYMin, rectXMax, rectYMax)
+                && halfOpenOverlap(startMs, endMs, cStartMs, cEndMs)
+                && halfOpenOverlap(altMin, altMax, cAltMin, cAltMax);
+    }
 }

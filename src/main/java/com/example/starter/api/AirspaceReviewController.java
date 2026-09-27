@@ -1,6 +1,7 @@
 package com.example.starter.api;
 
 import com.example.starter.api.dto.MutationResponse;
+import com.example.starter.api.dto.RegularWindowReviewRequest;
 import com.example.starter.api.dto.ReviewRequest;
 import com.example.starter.api.dto.ReviewResultDto;
 import com.example.starter.api.dto.RouteCreateRequest;
@@ -8,6 +9,7 @@ import com.example.starter.api.dto.RouteReplaceRequest;
 import com.example.starter.api.dto.ZoneCreateRequest;
 import com.example.starter.api.dto.ZoneRevokeRequest;
 import com.example.starter.service.AirspaceReviewService;
+import com.example.starter.service.SpaceTimeWindow;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -59,6 +61,20 @@ public class AirspaceReviewController {
     @PostMapping("/reviews")
     public ResponseEntity<MutationResponse> review(@Valid @RequestBody ReviewRequest request) {
         return ResponseEntity.status(HttpStatus.CREATED).body(service.review(request));
+    }
+
+    /**
+     * 提交携带 UTC 左闭右开时空窗的常规审核：命中任一有效应急走廊返回 409，
+     * 错误信息与错误码（CORRIDOR_CONFLICT）中给出走廊标识。
+     */
+    @PostMapping("/reviews/window")
+    public ResponseEntity<MutationResponse> reviewWithWindow(
+            @Valid @RequestBody RegularWindowReviewRequest request) {
+        SpaceTimeWindow window = new SpaceTimeWindow(
+                request.startMs(), request.endMs(), request.altMin(), request.altMax());
+        return ResponseEntity.status(HttpStatus.CREATED).body(service.reviewWithWindow(
+                request.routeId(), request.routeVersion(), request.airspaceVersion(),
+                window, request.requestId()));
     }
 
     /** 按 reviewId 查询历史审核结果（保留原结论）。 */

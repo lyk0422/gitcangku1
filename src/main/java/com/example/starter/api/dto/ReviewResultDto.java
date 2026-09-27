@@ -13,6 +13,7 @@ import java.util.List;
  * @param hitZoneIds      BLOCKED 时命中的全部 zoneId（字典序去重），否则为空列表
  * @param pointsSnapshot  审核时不可变的航点快照
  * @param current         仅当前查询返回：当前航线/空域是否仍与审核版本匹配
+ * @param reviewKind      审查种类：REGULAR 常规；EMERGENCY 应急
  */
 public record ReviewResultDto(
         String reviewId,
@@ -22,5 +23,6 @@ public record ReviewResultDto(
         String conclusion,
         List<String> hitZoneIds,
         List<RoutePointDto> pointsSnapshot,
-        Boolean current) {
+        Boolean current,
+        String reviewKind) {
 }

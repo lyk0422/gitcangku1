@@ -16,8 +16,9 @@ import java.util.List;
  * @param pointsSnapshot  审核时航点不可变快照
  * @param requestId       提交审核的请求标识
  * @param createdAt       创建时间（epoch 毫秒）
+ * @param reviewKind      审查种类：REGULAR / EMERGENCY
  */
 public record ReviewPo(String reviewId, String routeId, int routeVersion, long airspaceVersion,
                        String conclusion, List<String> hitZoneIds, List<Point> pointsSnapshot,
-                       String requestId, long createdAt) {
+                       String requestId, long createdAt, String reviewKind) {
 }
