@@ -31,9 +31,13 @@ class ReleaseApiTest {
 
     @BeforeEach
     void clean() {
+        jdbc.update("DELETE FROM idempotent_request");
         jdbc.update("DELETE FROM release_record");
+        jdbc.update("DELETE FROM uncertainty_component");
+        jdbc.update("DELETE FROM measurement_revision");
         jdbc.update("DELETE FROM measurement");
         jdbc.update("DELETE FROM calibration_certificate");
+        jdbc.update("DELETE FROM instrument_threshold_version");
         jdbc.update("DELETE FROM instrument_lock");
     }
 
@@ -44,6 +48,13 @@ class ReleaseApiTest {
                                  "validTo":"2028-01-01T00:00:00Z","a":"%s","b":"%s"}
                                 """.formatted(instrument, a, b)))
                 .andExpect(status().isCreated()).andReturn().getResponse().getContentAsString();
+        // 放行新前置条件：测量时刻必须有生效阈值版本（开放区间覆盖测试时间窗）
+        mvc.perform(post("/api/thresholds").contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"instrumentId":"%s","validFrom":"2026-01-01T00:00:00Z",
+                                 "maxUncertainty":"1"}
+                                """.formatted(instrument)))
+                .andExpect(status().isCreated());
         return ((Number) com.jayway.jsonpath.JsonPath.read(body, "$.id")).longValue();
     }
 
@@ -56,6 +67,14 @@ class ReleaseApiTest {
                                  "lowerLimit":"%s","upperLimit":"%s","submittedBy":"%s"}
                                 """.formatted(key, instrument, reading, lower, upper, by)))
                 .andExpect(status().isCreated());
+        // 放行新前置条件：必须登记不确定度预算；默认单分量 0.1（合成 0.1000 ≤ 阈值 1）
+        mvc.perform(post("/api/measurements/{key}/budget", key)
+                        .header("X-Actor-Id", by)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"components":[{"name":"u_std","magnitude":"0.1"}]}
+                                """))
+                .andExpect(status().isOk());
     }
 
     @Test

@@ -2,6 +2,7 @@ package com.example.starter.calibration.service;
 
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.util.Map;
 
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -18,10 +19,15 @@ import com.example.starter.calibration.repo.CertificateRepository;
 @Service
 public class CertificateService {
 
-    private final CertificateRepository certificates;
+    /** 撤销请求未携带 X-Actor-Id 时的默认操作者。 */
+    private static final String DEFAULT_ACTOR = "system";
 
-    public CertificateService(CertificateRepository certificates) {
+    private final CertificateRepository certificates;
+    private final IdempotencyService idempotency;
+
+    public CertificateService(CertificateRepository certificates, IdempotencyService idempotency) {
         this.certificates = certificates;
+        this.idempotency = idempotency;
     }
 
     /**
@@ -50,16 +56,22 @@ public class CertificateService {
     /**
      * 撤销证书。不存在返回 404；重复撤销返回 409。
      * 与批量放行并发时按事务提交顺序生效：撤销先提交则放行整批拒绝。
+     * 携带 X-Request-Id 时按幂等裁决：同参重放返回首次响应快照，失败不占键。
      */
     @Transactional
-    public CertificateResponse revoke(long id) {
+    public CertificateResponse revoke(long id, String actor, String requestId) {
+        String operator = (actor == null || actor.isBlank()) ? DEFAULT_ACTOR : actor.trim();
+        var gate = idempotency.begin(requestId, "CERT_REVOKE:" + id, operator,
+                "REVOKE_CERTIFICATE", Map.of("certificateId", id));
         Certificate cert = certificates.findByIdForUpdate(id)
                 .orElseThrow(() -> ApiException.notFound("证书不存在: " + id));
         if (cert.revoked()) {
             throw ApiException.conflict("ALREADY_REVOKED", "证书已撤销: " + id);
         }
         certificates.markRevoked(id, Instant.now());
-        return DtoMapper.toResponse(certificates.findById(id).orElseThrow());
+        CertificateResponse response = DtoMapper.toResponse(certificates.findById(id).orElseThrow());
+        idempotency.recordSuccess(gate, 200, response);
+        return response;
     }
 
     /**

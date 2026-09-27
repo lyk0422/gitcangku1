@@ -1,6 +1,7 @@
 package com.example.starter.calibration.api;
 
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.MissingRequestHeaderException;
@@ -15,6 +16,16 @@ import org.springframework.web.servlet.resource.NoResourceFoundException;
  */
 @RestControllerAdvice
 public class GlobalExceptionHandler {
+
+    /**
+     * 幂等同参重放：原样返回首次成功响应的状态码与 JSON 快照，不改变任何状态。
+     */
+    @ExceptionHandler(IdempotentReplayException.class)
+    public ResponseEntity<String> handleReplay(IdempotentReplayException ex) {
+        return ResponseEntity.status(ex.getStatus())
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(ex.getResponseBody());
+    }
 
     @ExceptionHandler(BatchRejectedException.class)
     public ResponseEntity<ErrorResponse> handleBatchRejected(BatchRejectedException ex) {

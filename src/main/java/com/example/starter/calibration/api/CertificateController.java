@@ -6,6 +6,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -36,10 +37,13 @@ public class CertificateController {
 
     /**
      * 撤销证书：200；不存在 404；重复撤销 409。
+     * X-Request-Id 可选；X-Actor-Id 可选（缺省 system）。
      */
     @PostMapping("/{id}/revoke")
-    public CertificateResponse revoke(@PathVariable long id) {
-        return certificates.revoke(id);
+    public CertificateResponse revoke(@PathVariable long id,
+                                      @RequestHeader(value = "X-Actor-Id", required = false) String actor,
+                                      @RequestHeader(value = "X-Request-Id", required = false) String requestId) {
+        return certificates.revoke(id, actor, requestId);
     }
 
     /**

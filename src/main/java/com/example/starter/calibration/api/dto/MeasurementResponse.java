@@ -21,6 +21,9 @@ import java.util.List;
  * @param passed         是否合格（基于未舍入值，含端点）
  * @param status         状态：PENDING / RELEASED
  * @param usable         当前是否可用（已放行且证书未撤销）
+ * @param version        测量版本号；修订自增
+ * @param budget         当前不确定度预算视图（budgetVersion=0 表示尚未登记分量）
+ * @param revisions      测量修订历史（按修订先后升序）
  * @param createdAt      提交时间（UTC）
  * @param releases       放行历史
  */
@@ -39,6 +42,24 @@ public record MeasurementResponse(
         boolean passed,
         String status,
         boolean usable,
+        long version,
+        BudgetView budget,
+        List<RevisionResponse> revisions,
         Instant createdAt,
         List<ReleaseRecordResponse> releases) {
+
+    /**
+     * 当前不确定度预算视图。
+     *
+     * @param budgetVersion       预算版本号；0 表示尚未登记任何分量
+     * @param components          当前分量，名称升序
+     * @param combinedUncertainty 合成不确定度（RSS，HALF_UP 4 位）
+     * @param calculationMethod   合成口径标识
+     */
+    public record BudgetView(
+            long budgetVersion,
+            List<UncertaintyComponentResponse> components,
+            String combinedUncertainty,
+            String calculationMethod) {
+    }
 }

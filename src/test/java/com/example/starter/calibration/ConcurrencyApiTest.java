@@ -43,9 +43,13 @@ class ConcurrencyApiTest {
 
     @BeforeEach
     void clean() {
+        jdbc.update("DELETE FROM idempotent_request");
         jdbc.update("DELETE FROM release_record");
+        jdbc.update("DELETE FROM uncertainty_component");
+        jdbc.update("DELETE FROM measurement_revision");
         jdbc.update("DELETE FROM measurement");
         jdbc.update("DELETE FROM calibration_certificate");
+        jdbc.update("DELETE FROM instrument_threshold_version");
         jdbc.update("DELETE FROM instrument_lock");
     }
 
@@ -96,6 +100,13 @@ class ConcurrencyApiTest {
                     .andReturn().getResponse().getContentAsString();
             long certId = ((Number) com.jayway.jsonpath.JsonPath.read(certBody, "$.id")).longValue();
 
+            mvc.perform(post("/api/thresholds")
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .content("""
+                            {"instrumentId":"INS-R%d","validFrom":"2026-01-01T00:00:00Z",
+                             "maxUncertainty":"1"}""".formatted(r)))
+                    .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isCreated());
+
             mvc.perform(post("/api/measurements")
                     .contentType(MediaType.APPLICATION_JSON)
                     .content("""
@@ -103,6 +114,13 @@ class ConcurrencyApiTest {
                              "measuredAt":"2026-06-01T00:00:00Z","reading":"1",
                              "lowerLimit":"0","upperLimit":"9","submittedBy":"alice"}""".formatted(r, r)))
                     .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isCreated());
+
+            mvc.perform(post("/api/measurements/{key}/budget", "M-" + r)
+                            .header("X-Actor-Id", "alice")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content("""
+                                    {"components":[{"name":"u_std","magnitude":"0.1"}]}"""))
+                    .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isOk());
 
             ExecutorService pool = Executors.newFixedThreadPool(2);
             CountDownLatch start = new CountDownLatch(1);
@@ -158,6 +176,12 @@ class ConcurrencyApiTest {
                                 {"instrumentId":"INS-D","validFrom":"2026-01-01T00:00:00Z",
                                  "validTo":"2028-01-01T00:00:00Z","a":"1","b":"0"}"""))
                 .andReturn().getResponse().getContentAsString();
+        mvc.perform(post("/api/thresholds")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("""
+                        {"instrumentId":"INS-D","validFrom":"2026-01-01T00:00:00Z",
+                         "maxUncertainty":"1"}"""))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isCreated());
         mvc.perform(post("/api/measurements")
                 .contentType(MediaType.APPLICATION_JSON)
                 .content("""
@@ -165,6 +189,12 @@ class ConcurrencyApiTest {
                          "measuredAt":"2026-06-01T00:00:00Z","reading":"1",
                          "lowerLimit":"0","upperLimit":"9","submittedBy":"alice"}"""))
                 .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isCreated());
+        mvc.perform(post("/api/measurements/{key}/budget", "M-D")
+                        .header("X-Actor-Id", "alice")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"components":[{"name":"u_std","magnitude":"0.1"}]}"""))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isOk());
 
         int threads = 6;
         ExecutorService pool = Executors.newFixedThreadPool(threads);

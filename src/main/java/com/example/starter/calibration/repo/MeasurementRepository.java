@@ -34,6 +34,7 @@ public class MeasurementRepository {
             rs.getBigDecimal("computed_value"),
             rs.getBoolean("passed"),
             MeasurementStatus.valueOf(rs.getString("status")),
+            rs.getLong("version"),
             JdbcTimes.fromDb(rs.getObject("created_at", LocalDateTime.class)));
 
     private final JdbcTemplate jdbc;
@@ -51,8 +52,8 @@ public class MeasurementRepository {
             PreparedStatement ps = con.prepareStatement(
                     "INSERT INTO measurement "
                             + "(measurement_key, instrument_id, measured_at, raw_reading, lower_limit, upper_limit, "
-                            + "submitted_by, certificate_id, computed_value, passed, status, created_at) "
-                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            + "submitted_by, certificate_id, computed_value, passed, status, version, created_at) "
+                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, measurement.measurementKey());
             ps.setString(2, measurement.instrumentId());
@@ -65,7 +66,8 @@ public class MeasurementRepository {
             ps.setBigDecimal(9, measurement.computedValue());
             ps.setBoolean(10, measurement.passed());
             ps.setString(11, measurement.status().name());
-            ps.setObject(12, JdbcTimes.toDb(measurement.createdAt()));
+            ps.setLong(12, measurement.version());
+            ps.setObject(13, JdbcTimes.toDb(measurement.createdAt()));
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();
@@ -80,7 +82,7 @@ public class MeasurementRepository {
     }
 
     /**
-     * 按测量键查询并加行锁（须在事务内调用），用于放行时串行化状态流转。
+     * 按测量键查询并加行锁（须在事务内调用），用于放行、修订与预算修改时串行化状态流转。
      */
     public Optional<Measurement> findByKeyForUpdate(String key) {
         return jdbc.query("SELECT * FROM measurement WHERE measurement_key = ? FOR UPDATE", MAPPER, key)
@@ -93,6 +95,19 @@ public class MeasurementRepository {
     public void markReleased(long id) {
         jdbc.update("UPDATE measurement SET status = ? WHERE id = ?",
                 MeasurementStatus.RELEASED.name(), id);
+    }
+
+    /**
+     * 修订测量（须在持有行锁的事务内调用）：覆盖测量字段、重新固化计算与判定，版本号自增 1，
+     * 并显式把状态置回 PENDING（新版本需重新裁决放行）。
+     */
+    public void applyRevision(Measurement m) {
+        jdbc.update("UPDATE measurement SET measured_at = ?, raw_reading = ?, lower_limit = ?, "
+                        + "upper_limit = ?, certificate_id = ?, computed_value = ?, passed = ?, "
+                        + "status = ?, version = ? WHERE id = ?",
+                JdbcTimes.toDb(m.measuredAt()), m.rawReading(), m.lowerLimit(), m.upperLimit(),
+                m.certificateId(), m.computedValue(), m.passed(),
+                MeasurementStatus.PENDING.name(), m.version(), m.id());
     }
 
     /**

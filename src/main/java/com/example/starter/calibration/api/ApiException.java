@@ -40,8 +40,18 @@ public class ApiException extends RuntimeException {
         return new ApiException(HttpStatus.CONFLICT, code, message);
     }
 
+    /** 410：资源版本已过期（如修订请求基于的测量版本不是当前版本）。 */
+    public static ApiException gone(String code, String message) {
+        return new ApiException(HttpStatus.GONE, code, message);
+    }
+
     /** 422：测量时刻无匹配的有效证书。 */
     public static ApiException unprocessable(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "NO_MATCHING_CERTIFICATE", message);
+    }
+
+    /** 422：业务前置条件不满足（阈值缺失、预算缺失、分量非法等），携带可区分错误码。 */
+    public static ApiException unprocessable(String code, String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, code, message);
     }
 }
