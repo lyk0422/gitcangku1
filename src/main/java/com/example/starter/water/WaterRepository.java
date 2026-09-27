@@ -46,6 +46,38 @@ public class WaterRepository {
                              long createdNanos) {
     }
 
+    /** 渠道计量规则版本行，创建后不可变。 */
+    public record ChannelConfigRow(long id, String channelId, int version, BigDecimal maxFlowRate,
+                                   BigDecimal maxIntervalMinutes, long effectiveFromNanos,
+                                   String actor, long createdNanos) {
+    }
+
+    /** 渠道累计读数行，提交后不可变（异常读数同样保留）。 */
+    public record ReadingRow(long id, String channelId, long readingAtNanos, BigDecimal cumulativeReading,
+                             int ruleVersion, String reporter, long createdNanos) {
+    }
+
+    /** 异常行；status 只允许 OPEN -> RESOLVED 一次状态翻转，证据字段不再改写。 */
+    public record AnomalyRow(long id, String channelId, long readingId, Long prevReadingId, String type,
+                             int ruleVersion, Long windowStartNanos, long windowEndNanos,
+                             Long prevReadingAtNanos, BigDecimal prevValue,
+                             long readingAtNanos, BigDecimal readingValue,
+                             BigDecimal actualValue, BigDecimal requiredValue, BigDecimal differenceValue,
+                             String metric, String reporter, String status, Long resolutionId,
+                             long createdNanos) {
+    }
+
+    /** 异常解除行，创建后不可变。 */
+    public record ResolutionRow(long id, long anomalyId, String resolver, String diagnosisNote,
+                                long replacementAtNanos, BigDecimal replacementValue, long createdNanos) {
+    }
+
+    /** 实际核销流水行，创建后不可变；heldAfter 为核销后持有额度快照。 */
+    public record WriteoffRow(long id, String writeoffKey, long windowId, String channelId,
+                              String allocationKey, BigDecimal amount, BigDecimal heldAfter, String actor,
+                              long atNanos, long createdNanos) {
+    }
+
     private static final RowMapper<WindowRow> WINDOW_MAPPER = (rs, n) -> new WindowRow(
             rs.getLong("id"), rs.getString("window_key"), rs.getString("channel_id"),
             rs.getLong("start_nanos"), rs.getLong("end_nanos"),
@@ -74,6 +106,47 @@ public class WaterRepository {
     private static final RowMapper<CommandRow> COMMAND_MAPPER = (rs, n) -> new CommandRow(
             rs.getString("command_key"), rs.getString("operation"), rs.getString("params"),
             rs.getString("response"), rs.getLong("created_nanos"));
+
+    private static final RowMapper<ChannelConfigRow> CHANNEL_CONFIG_MAPPER = (rs, n) -> new ChannelConfigRow(
+            rs.getLong("id"), rs.getString("channel_id"), rs.getInt("version"),
+            rs.getBigDecimal("max_flow_rate"), rs.getBigDecimal("max_interval_minutes"),
+            rs.getLong("effective_from_nanos"), rs.getString("actor"), rs.getLong("created_nanos"));
+
+    private static final RowMapper<ReadingRow> READING_MAPPER = (rs, n) -> new ReadingRow(
+            rs.getLong("id"), rs.getString("channel_id"), rs.getLong("reading_at_nanos"),
+            rs.getBigDecimal("cumulative_reading"), rs.getInt("rule_version"),
+            rs.getString("reporter"), rs.getLong("created_nanos"));
+
+    private static final String ANOMALY_COLUMNS =
+            "id, channel_id, reading_id, prev_reading_id, type, rule_version, window_start_nanos,"
+                    + " window_end_nanos, prev_reading_at_nanos, prev_value, reading_at_nanos, reading_value,"
+                    + " actual_value, required_value, difference_value, metric, reporter, status,"
+                    + " resolution_id, created_nanos";
+
+    private static final RowMapper<AnomalyRow> ANOMALY_MAPPER = (rs, n) -> new AnomalyRow(
+            rs.getLong("id"), rs.getString("channel_id"), rs.getLong("reading_id"),
+            rs.getObject("prev_reading_id") == null ? null : rs.getLong("prev_reading_id"),
+            rs.getString("type"), rs.getInt("rule_version"),
+            rs.getObject("window_start_nanos") == null ? null : rs.getLong("window_start_nanos"),
+            rs.getLong("window_end_nanos"),
+            rs.getObject("prev_reading_at_nanos") == null ? null : rs.getLong("prev_reading_at_nanos"),
+            rs.getBigDecimal("prev_value"), rs.getLong("reading_at_nanos"),
+            rs.getBigDecimal("reading_value"), rs.getBigDecimal("actual_value"),
+            rs.getBigDecimal("required_value"), rs.getBigDecimal("difference_value"),
+            rs.getString("metric"), rs.getString("reporter"), rs.getString("status"),
+            rs.getObject("resolution_id") == null ? null : rs.getLong("resolution_id"),
+            rs.getLong("created_nanos"));
+
+    private static final RowMapper<ResolutionRow> RESOLUTION_MAPPER = (rs, n) -> new ResolutionRow(
+            rs.getLong("id"), rs.getLong("anomaly_id"), rs.getString("resolver"),
+            rs.getString("diagnosis_note"), rs.getLong("replacement_at_nanos"),
+            rs.getBigDecimal("replacement_value"), rs.getLong("created_nanos"));
+
+    private static final RowMapper<WriteoffRow> WRITEOFF_MAPPER = (rs, n) -> new WriteoffRow(
+            rs.getLong("id"), rs.getString("writeoff_key"), rs.getLong("window_id"),
+            rs.getString("channel_id"), rs.getString("allocation_key"), rs.getBigDecimal("amount"),
+            rs.getBigDecimal("held_after"), rs.getString("actor"),
+            rs.getLong("at_nanos"), rs.getLong("created_nanos"));
 
     private final JdbcTemplate jdbc;
 
@@ -303,5 +376,323 @@ public class WaterRepository {
     /** 写回命令首次成功响应。 */
     public void updateCommandResponse(String commandKey, String response) {
         jdbc.update("UPDATE command_log SET response = ? WHERE command_key = ?", response, commandKey);
+    }
+
+    // ------------------------------------------------------------------
+    // 渠道主数据与计量规则版本
+    // ------------------------------------------------------------------
+
+    /** 首次配置规则时登记渠道（幂等插入，已存在忽略）。 */
+    public void insertChannelIfAbsent(String channelId, long createdNanos, String createdBy) {
+        jdbc.update("MERGE INTO channel (channel_id, created_nanos, created_by) KEY (channel_id)"
+                + " VALUES (?, ?, ?)", channelId, createdNanos, createdBy);
+    }
+
+    /** 锁定渠道主数据行（FOR UPDATE），串行化该渠道的配置、读数、解除与核销，不存在返回 false。 */
+    public boolean lockChannel(String channelId) {
+        List<String> locked = jdbc.queryForList(
+                "SELECT channel_id FROM channel WHERE channel_id = ? FOR UPDATE", String.class, channelId);
+        return !locked.isEmpty();
+    }
+
+    /** 插入规则新版本并返回主键；版本号由服务层在渠道锁内分配。 */
+    public long insertChannelConfig(String channelId, int version, BigDecimal maxFlowRate,
+                                    BigDecimal maxIntervalMinutes, long effectiveFromNanos,
+                                    String actor, long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO channel_config (channel_id, version, max_flow_rate, max_interval_minutes,"
+                            + " effective_from_nanos, actor, created_nanos) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, channelId);
+            ps.setInt(2, version);
+            ps.setBigDecimal(3, maxFlowRate);
+            ps.setBigDecimal(4, maxIntervalMinutes);
+            ps.setLong(5, effectiveFromNanos);
+            ps.setString(6, actor);
+            ps.setLong(7, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 渠道最新规则版本，不存在返回 null。 */
+    public ChannelConfigRow findLatestChannelConfig(String channelId) {
+        List<ChannelConfigRow> rows = jdbc.query(
+                "SELECT id, channel_id, version, max_flow_rate, max_interval_minutes, effective_from_nanos,"
+                        + " actor, created_nanos FROM channel_config WHERE channel_id = ?"
+                        + " ORDER BY version DESC LIMIT 1", CHANNEL_CONFIG_MAPPER, channelId);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /** 锁定渠道最新规则版本行（FOR UPDATE），用于串行化该渠道的读数判定、配置与核销裁决。 */
+    public ChannelConfigRow lockLatestChannelConfig(String channelId) {
+        List<ChannelConfigRow> rows = jdbc.query(
+                "SELECT id, channel_id, version, max_flow_rate, max_interval_minutes, effective_from_nanos,"
+                        + " actor, created_nanos FROM channel_config WHERE channel_id = ?"
+                        + " ORDER BY version DESC LIMIT 1 FOR UPDATE", CHANNEL_CONFIG_MAPPER, channelId);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /** 渠道全部规则版本，按版本号升序（不可变历史）。 */
+    public List<ChannelConfigRow> listChannelConfigs(String channelId) {
+        return jdbc.query(
+                "SELECT id, channel_id, version, max_flow_rate, max_interval_minutes, effective_from_nanos,"
+                        + " actor, created_nanos FROM channel_config WHERE channel_id = ? ORDER BY version",
+                CHANNEL_CONFIG_MAPPER, channelId);
+    }
+
+    /** 渠道是否存在任何规则版本。 */
+    public boolean existsChannelConfig(String channelId) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM channel_config WHERE channel_id = ?", Integer.class, channelId);
+        return count != null && count > 0;
+    }
+
+    /** 查询读数时刻适用的规则版本：effective_from_nanos 不晚于该时刻的最新版本，无则 null。 */
+    public ChannelConfigRow findEffectiveChannelConfigAt(String channelId, long readingAtNanos) {
+        List<ChannelConfigRow> rows = jdbc.query(
+                "SELECT id, channel_id, version, max_flow_rate, max_interval_minutes, effective_from_nanos,"
+                        + " actor, created_nanos FROM channel_config WHERE channel_id = ?"
+                        + " AND effective_from_nanos <= ? ORDER BY version DESC LIMIT 1",
+                CHANNEL_CONFIG_MAPPER, channelId, readingAtNanos);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    // ------------------------------------------------------------------
+    // 渠道累计读数
+    // ------------------------------------------------------------------
+
+    /** 插入读数并返回主键；同一渠道 reading_at_nanos 唯一，重复由唯一约束拒绝。 */
+    public long insertReading(String channelId, long readingAtNanos, BigDecimal cumulativeReading,
+                              int ruleVersion, String reporter, long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO sensor_reading (channel_id, reading_at_nanos, cumulative_reading,"
+                            + " rule_version, reporter, created_nanos) VALUES (?, ?, ?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, channelId);
+            ps.setLong(2, readingAtNanos);
+            ps.setBigDecimal(3, cumulativeReading);
+            ps.setInt(4, ruleVersion);
+            ps.setString(5, reporter);
+            ps.setLong(6, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 渠道最新一条读数（按采样时刻，其次主键），不存在返回 null。 */
+    public ReadingRow findLatestReading(String channelId) {
+        List<ReadingRow> rows = jdbc.query(
+                "SELECT id, channel_id, reading_at_nanos, cumulative_reading, rule_version, reporter,"
+                        + " created_nanos FROM sensor_reading WHERE channel_id = ?"
+                        + " ORDER BY reading_at_nanos DESC, id DESC LIMIT 1", READING_MAPPER, channelId);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /** 渠道全部读数，按采样时刻升序（同时刻按主键），历史不可变。 */
+    public List<ReadingRow> listReadings(String channelId) {
+        return jdbc.query(
+                "SELECT id, channel_id, reading_at_nanos, cumulative_reading, rule_version, reporter,"
+                        + " created_nanos FROM sensor_reading WHERE channel_id = ?"
+                        + " ORDER BY reading_at_nanos, id", READING_MAPPER, channelId);
+    }
+
+    /** 按主键查询读数，不存在返回 null。 */
+    public ReadingRow findReadingById(long id) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT id, channel_id, reading_at_nanos, cumulative_reading, rule_version, reporter,"
+                            + " created_nanos FROM sensor_reading WHERE id = ?", READING_MAPPER, id);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 传感异常与解除
+    // ------------------------------------------------------------------
+
+    /** 插入异常（OPEN）并返回主键。 */
+    public long insertAnomaly(String channelId, long readingId, Long prevReadingId, String type,
+                              int ruleVersion, Long windowStartNanos, long windowEndNanos,
+                              Long prevReadingAtNanos, BigDecimal prevValue,
+                              long readingAtNanos, BigDecimal readingValue,
+                              BigDecimal actualValue, BigDecimal requiredValue, BigDecimal differenceValue,
+                              String metric, String reporter, long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO anomaly (channel_id, reading_id, prev_reading_id, type, rule_version,"
+                            + " window_start_nanos, window_end_nanos, prev_reading_at_nanos, prev_value,"
+                            + " reading_at_nanos, reading_value, actual_value, required_value,"
+                            + " difference_value, metric, reporter, status, resolution_id, created_nanos)"
+                            + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', NULL, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, channelId);
+            ps.setLong(2, readingId);
+            if (prevReadingId == null) {
+                ps.setNull(3, java.sql.Types.BIGINT);
+            } else {
+                ps.setLong(3, prevReadingId);
+            }
+            ps.setString(4, type);
+            ps.setInt(5, ruleVersion);
+            if (windowStartNanos == null) {
+                ps.setNull(6, java.sql.Types.BIGINT);
+            } else {
+                ps.setLong(6, windowStartNanos);
+            }
+            ps.setLong(7, windowEndNanos);
+            if (prevReadingAtNanos == null) {
+                ps.setNull(8, java.sql.Types.BIGINT);
+            } else {
+                ps.setLong(8, prevReadingAtNanos);
+            }
+            ps.setBigDecimal(9, prevValue);
+            ps.setLong(10, readingAtNanos);
+            ps.setBigDecimal(11, readingValue);
+            ps.setBigDecimal(12, actualValue);
+            ps.setBigDecimal(13, requiredValue);
+            ps.setBigDecimal(14, differenceValue);
+            ps.setString(15, metric);
+            ps.setString(16, reporter);
+            ps.setLong(17, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 按主键查询异常，不存在返回 null。 */
+    public AnomalyRow findAnomalyById(long id) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT " + ANOMALY_COLUMNS + " FROM anomaly WHERE id = ?", ANOMALY_MAPPER, id);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 锁定异常行（FOR UPDATE），用于串行化解除操作，不存在返回 null。 */
+    public AnomalyRow lockAnomalyById(long id) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT " + ANOMALY_COLUMNS + " FROM anomaly WHERE id = ? FOR UPDATE",
+                    ANOMALY_MAPPER, id);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 渠道全部异常，按主键升序（历史不可变）。 */
+    public List<AnomalyRow> listAnomalies(String channelId) {
+        return jdbc.query("SELECT " + ANOMALY_COLUMNS + " FROM anomaly WHERE channel_id = ? ORDER BY id",
+                ANOMALY_MAPPER, channelId);
+    }
+
+    /** 渠道当前未解除异常数量；大于 0 即冻结该渠道新核销。 */
+    public int countOpenAnomalies(String channelId) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM anomaly WHERE channel_id = ? AND status = 'OPEN'",
+                Integer.class, channelId);
+        return count == null ? 0 : count;
+    }
+
+    /** 渠道当前未解除异常，按主键升序。 */
+    public List<AnomalyRow> listOpenAnomalies(String channelId) {
+        return jdbc.query(
+                "SELECT " + ANOMALY_COLUMNS + " FROM anomaly WHERE channel_id = ? AND status = 'OPEN'"
+                        + " ORDER BY id", ANOMALY_MAPPER, channelId);
+    }
+
+    /** 解除异常：仅当仍为 OPEN 时置为 RESOLVED 并关联解除记录；返回是否成功翻转。 */
+    public boolean resolveAnomaly(long anomalyId, long resolutionId) {
+        int updated = jdbc.update(
+                "UPDATE anomaly SET status = 'RESOLVED', resolution_id = ?"
+                        + " WHERE id = ? AND status = 'OPEN'", resolutionId, anomalyId);
+        return updated == 1;
+    }
+
+    /** 插入解除记录并返回主键；同一异常至多一条，由唯一约束兜底。 */
+    public long insertResolution(long anomalyId, String resolver, String diagnosisNote,
+                                 long replacementAtNanos, BigDecimal replacementValue, long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO anomaly_resolution (anomaly_id, resolver, diagnosis_note,"
+                            + " replacement_at_nanos, replacement_value, created_nanos)"
+                            + " VALUES (?, ?, ?, ?, ?, ?)", Statement.RETURN_GENERATED_KEYS);
+            ps.setLong(1, anomalyId);
+            ps.setString(2, resolver);
+            ps.setString(3, diagnosisNote);
+            ps.setLong(4, replacementAtNanos);
+            ps.setBigDecimal(5, replacementValue);
+            ps.setLong(6, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 按异常 ID 查询解除记录，未解除返回 null。 */
+    public ResolutionRow findResolutionByAnomalyId(long anomalyId) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT id, anomaly_id, resolver, diagnosis_note, replacement_at_nanos,"
+                            + " replacement_value, created_nanos FROM anomaly_resolution WHERE anomaly_id = ?",
+                    RESOLUTION_MAPPER, anomalyId);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 实际核销
+    // ------------------------------------------------------------------
+
+    /** 插入核销流水并返回主键；writeoff_key 全局唯一。 */
+    public long insertWriteoff(String writeoffKey, long windowId, String channelId, String allocationKey,
+                               BigDecimal amount, BigDecimal heldAfter, String actor, long atNanos,
+                               long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO writeoff (writeoff_key, window_id, channel_id, allocation_key, amount,"
+                            + " held_after, actor, at_nanos, created_nanos) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, writeoffKey);
+            ps.setLong(2, windowId);
+            ps.setString(3, channelId);
+            ps.setString(4, allocationKey);
+            ps.setBigDecimal(5, amount);
+            ps.setBigDecimal(6, heldAfter);
+            ps.setString(7, actor);
+            ps.setLong(8, atNanos);
+            ps.setLong(9, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 按业务键查询核销流水，不存在返回 null。 */
+    public WriteoffRow findWriteoffByKey(String writeoffKey) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT id, writeoff_key, window_id, channel_id, allocation_key, amount, held_after,"
+                            + " actor, at_nanos, created_nanos FROM writeoff WHERE writeoff_key = ?",
+                    WRITEOFF_MAPPER, writeoffKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 窗口全部核销流水，按主键升序（历史不可变）。 */
+    public List<WriteoffRow> listWriteoffs(long windowId) {
+        return jdbc.query(
+                "SELECT id, writeoff_key, window_id, channel_id, allocation_key, amount, held_after, actor,"
+                        + " at_nanos, created_nanos FROM writeoff WHERE window_id = ? ORDER BY id",
+                WRITEOFF_MAPPER, windowId);
     }
 }

@@ -74,6 +74,81 @@ public final class Dtos {
                                   List<CurtailmentResponse> curtailments) {
     }
 
+    /** 渠道计量规则版本配置命令；每次配置产生一个不可变新版本。 */
+    public record ChannelConfigRequest(String commandKey, String channelId, String maxFlowRate,
+                                       String maxIntervalMinutes, String effectiveFromUtc) {
+    }
+
+    /** 规则版本视图，创建后不可变。 */
+    public record ChannelConfigResponse(long id, String channelId, int version, String maxFlowRate,
+                                        String maxIntervalMinutes, String effectiveFromUtc,
+                                        String actor, String createdUtc) {
+    }
+
+    /** 单条累计读数输入：readingAtUtc 为采样 UTC 时刻，cumulativeReading 为非负累计读数（立方米）。 */
+    public record ReadingInput(String readingAtUtc, String cumulativeReading) {
+    }
+
+    /** 批量读数提交命令；整批先完整校验，任一错误整批不写入。 */
+    public record ReadingsRequest(String commandKey, String channelId, List<ReadingInput> readings) {
+    }
+
+    /** 异常视图（历史证据，字段、排序、时间精度与 null 含义稳定）。 */
+    public record AnomalyResponse(long id, String channelId, String type, int ruleVersion,
+                                  String windowStartUtc, String windowEndUtc,
+                                  String previousReadingAtUtc, String previousValue,
+                                  String readingAtUtc, String readingValue,
+                                  String actualValue, String requiredValue, String difference,
+                                  String metric, String reporter, String status,
+                                  Long resolutionId, String createdUtc,
+                                  ResolutionResponse resolution) {
+    }
+
+    /** 异常解除证据视图；未解除的异常在 anomaly 视图中为 null。 */
+    public record ResolutionResponse(long id, long anomalyId, String resolver, String diagnosisNote,
+                                     String replacementAtUtc, String replacementValue, String createdUtc) {
+    }
+
+    /** 入库读数视图，创建后不可变。 */
+    public record ReadingResponse(long id, String channelId, String readingAtUtc, String cumulativeReading,
+                                  int ruleVersion, String reporter, String createdUtc) {
+    }
+
+    /** 批量读数提交结果：入库读数与本批新生成异常（均按提交顺序）。 */
+    public record ReadingsResponse(String channelId, List<ReadingResponse> storedReadings,
+                                   List<AnomalyResponse> anomalies) {
+    }
+
+    /** 异常解除命令；操作人由 X-Actor-Id 提供且必须不同于异常读数提交人。 */
+    public record ResolveAnomalyRequest(String commandKey, String diagnosisNote,
+                                        String replacementAtUtc, String replacementValue) {
+    }
+
+    /** 实际核销命令；生效时刻由 atUtc 给出，操作人由 X-Actor-Id 提供。 */
+    public record WriteoffRequest(String commandKey, String writeoffKey, String allocationKey,
+                                  String amount, String atUtc) {
+    }
+
+    /** 核销流水视图，创建后不可变。 */
+    public record WriteoffResponse(String writeoffKey, long windowId, String channelId,
+                                   String allocationKey, String amount, String actor,
+                                   String atUtc, String heldAmountAfter, String createdUtc) {
+    }
+
+    /** 窗口核销流水列表视图（按提交顺序）。 */
+    public record WriteoffListResponse(long windowId, List<WriteoffResponse> writeoffs) {
+    }
+
+    /** 渠道读数与异常历史（均不可变，按时间/主键稳定排序）。 */
+    public record ChannelHistoryResponse(String channelId, List<ReadingResponse> readings,
+                                         List<AnomalyResponse> anomalies,
+                                         List<ChannelConfigResponse> ruleVersions) {
+    }
+
+    /** 异常诊断明细：异常证据 + 解除证据（未解除时 resolution 为 null）。 */
+    public record AnomalyDetailResponse(AnomalyResponse anomaly, ResolutionResponse resolution) {
+    }
+
     /** 统一错误响应体。 */
     public record ErrorResponse(String code, String message) {
     }
