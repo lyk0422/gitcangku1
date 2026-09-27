@@ -59,13 +59,16 @@ public class BatchService {
     private static final int IDEMPOTENCY_MAX_ATTEMPTS = 3;
 
     private final BatchRepository repo;
+    private final LabelService labelService;
     private final TransactionTemplate tx;
     private final ObjectMapper objectMapper;
 
     public BatchService(BatchRepository repo,
+                        LabelService labelService,
                         PlatformTransactionManager transactionManager,
                         ObjectMapper objectMapper) {
         this.repo = repo;
+        this.labelService = labelService;
         this.tx = new TransactionTemplate(transactionManager);
         this.objectMapper = objectMapper;
     }
@@ -199,6 +202,9 @@ public class BatchService {
                 }
                 seq = 2;
                 newStatus = BatchStatus.RELEASED;
+                // 放行闸门：已登记标签计划的批次必须完成全部计划数量封箱且标签数=封箱数，
+                // 通过后在同一事务固化放行快照；未达标返回 422，批准不写入。
+                labelService.assertReleasableAndCaptureSnapshot(batchKey, now);
             }
             repo.insertApproval(new BatchRepository.ApprovalRow(0L, batchKey, req.commandKey(),
                     actor, role.name(), seq, now));
