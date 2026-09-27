@@ -3,14 +3,19 @@ package com.example.starter.race.service;
 import com.example.starter.race.api.AddPenaltyRequest;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
 import com.example.starter.race.api.CreateRaceRequest;
+import com.example.starter.race.api.MedicalHoldResponse;
 import com.example.starter.race.api.RegisterRunnerRequest;
+import com.example.starter.race.api.ResumeMedicalHoldRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
 import com.example.starter.race.api.MissingCheckpointsResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
+import com.example.starter.race.api.StartMedicalHoldRequest;
 import com.example.starter.race.api.SubmitTimingRequest;
+
+import java.util.List;
 
 /**
  * 赛事成绩封榜应用服务；每个写方法在单个数据库事务内完成
@@ -59,4 +64,25 @@ public interface RaceService {
 
     /** 查询赛事全部选手缺失检查点汇总，按参赛号与检查点顺序稳定返回；只读。 */
     MissingCheckpointsResponse getMissingCheckpoints(String raceId);
+
+    /**
+     * 登记医疗暂停：仅 OPEN 赛事、未取消资格且无生效中暂停的选手可登记；
+     * 生效期间该选手新提交的分段计时保留但标记 MEDICAL_HOLD 不参与排名；
+     * 重复开始返回409。
+     */
+    ServiceResult startMedicalHold(String raceId, String bib, StartMedicalHoldRequest request);
+
+    /**
+     * 恢复医疗暂停：须由与登记角色不同的医疗角色确认适赛；结束时刻必须晚于开始时刻；
+     * 暂停声明区间 [startedAt, endedAt) 内存在终点计时返回422；
+     * 已取消资格或已封榜不可恢复。
+     */
+    ServiceResult resumeMedicalHold(
+            String raceId, String bib, String holdId, ResumeMedicalHoldRequest request);
+
+    /** 查询单个选手的医疗暂停历史（含已恢复），按登记时间稳定返回；只读。 */
+    List<MedicalHoldResponse> getMedicalHoldHistory(String raceId, String bib);
+
+    /** 查询赛事全部医疗暂停记录（诊断用），按登记时间稳定返回；只读。 */
+    List<MedicalHoldResponse> getRaceMedicalHolds(String raceId);
 }

@@ -10,6 +10,8 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+
+import java.util.List;
 /**
  * 赛事计时处罚与成绩封榜 HTTP 接口。
  */
@@ -111,6 +113,39 @@ public class RaceController {
     @GetMapping("/{raceId}/missing-checkpoints")
     public MissingCheckpointsResponse getMissingCheckpoints(@PathVariable String raceId) {
         return raceService.getMissingCheckpoints(raceId);
+    }
+
+    /** 登记选手医疗暂停。 */
+    @PostMapping("/{raceId}/runners/{bib}/medical-holds")
+    public ResponseEntity<Object> startMedicalHold(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody StartMedicalHoldRequest request) {
+        return toResponse(raceService.startMedicalHold(raceId, bib, request));
+    }
+
+    /** 恢复选手医疗暂停（不同医疗角色确认适赛）。 */
+    @PostMapping("/{raceId}/runners/{bib}/medical-holds/{holdId}/resume")
+    public ResponseEntity<Object> resumeMedicalHold(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @PathVariable String holdId,
+            @Valid @RequestBody ResumeMedicalHoldRequest request) {
+        return toResponse(raceService.resumeMedicalHold(raceId, bib, holdId, request));
+    }
+
+    /** 查询单个选手的医疗暂停历史。 */
+    @GetMapping("/{raceId}/runners/{bib}/medical-holds")
+    public List<MedicalHoldResponse> getMedicalHoldHistory(
+            @PathVariable String raceId,
+            @PathVariable String bib) {
+        return raceService.getMedicalHoldHistory(raceId, bib);
+    }
+
+    /** 查询赛事全部医疗暂停记录（诊断用）。 */
+    @GetMapping("/{raceId}/medical-holds")
+    public List<MedicalHoldResponse> getRaceMedicalHolds(@PathVariable String raceId) {
+        return raceService.getRaceMedicalHolds(raceId);
     }
 
     private ResponseEntity<Object> toResponse(ServiceResult result) {

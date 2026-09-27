@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS checkpoint_timing (
     checkpoint_code VARCHAR(64) NOT NULL COMMENT '通过的检查点代码',
     position INT NOT NULL COMMENT '检查点顺序（配置时固化），用于严格递增校验',
     elapsed_millis BIGINT NOT NULL COMMENT '通过该检查点的累计耗时（毫秒，1~86400000），必须小于该选手原始完赛耗时',
+    exclusion_reason VARCHAR(16) COMMENT '计时排除原因：MEDICAL_HOLD-提交时选手处于生效中的医疗暂停，记录保留但不参与排名；NULL-正常参与排名',
     created_at BIGINT NOT NULL COMMENT '记录提交时间，Unix毫秒时间戳',
     CONSTRAINT pk_checkpoint_timing PRIMARY KEY (timing_id),
     CONSTRAINT uk_timing_runner_checkpoint UNIQUE (race_id, bib, checkpoint_code),
@@ -91,13 +92,32 @@ CREATE TABLE IF NOT EXISTS result_snapshot_checkpoint (
     position INT NOT NULL COMMENT '检查点顺序，从1递增',
     elapsed_millis BIGINT COMMENT '封榜时该选手通过该检查点的累计耗时（毫秒）；缺失检查点为NULL',
     timing_id VARCHAR(128) COMMENT '分段记录ID；缺失检查点为NULL',
+    exclusion_reason VARCHAR(16) COMMENT '封榜时该分段的排除原因：MEDICAL_HOLD-医疗暂停期间提交不参与排名；正常参与或缺失检查点为NULL',
     CONSTRAINT pk_snapshot_checkpoint PRIMARY KEY (race_id, bib, checkpoint_code),
     CONSTRAINT fk_snapshot_checkpoint_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
 );
 
+CREATE TABLE IF NOT EXISTS medical_hold (
+    hold_id VARCHAR(128) NOT NULL COMMENT '医疗暂停ID，全局唯一（第二层幂等键）',
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    bib VARCHAR(64) NOT NULL COMMENT '选手参赛号',
+    medic_role VARCHAR(64) NOT NULL COMMENT '登记暂停的医疗角色标识',
+    reason VARCHAR(512) NOT NULL COMMENT '暂停原因',
+    started_at BIGINT NOT NULL COMMENT '声明的暂停开始时刻，Unix毫秒时间戳（UTC），区间左端点（含）',
+    status VARCHAR(16) NOT NULL COMMENT '暂停状态：ACTIVE-生效中，RESUMED-已恢复',
+    confirm_role VARCHAR(64) COMMENT '确认适赛的医疗角色标识，必须与登记角色不同；未恢复为NULL',
+    ended_at BIGINT COMMENT '声明的暂停结束时刻，Unix毫秒时间戳（UTC），区间右端点（不含），必须晚于started_at；未恢复为NULL',
+    fitness_conclusion VARCHAR(256) COMMENT '适赛结论；未恢复为NULL',
+    created_at BIGINT NOT NULL COMMENT '暂停登记提交时间，Unix毫秒时间戳',
+    resumed_at BIGINT COMMENT '恢复提交时间，Unix毫秒时间戳；未恢复为NULL',
+    CONSTRAINT pk_medical_hold PRIMARY KEY (hold_id),
+    CONSTRAINT fk_medical_hold_runner FOREIGN KEY (race_id, bib) REFERENCES runner (race_id, bib),
+    INDEX idx_medical_hold_race_bib (race_id, bib)
+);
+
 CREATE TABLE IF NOT EXISTS idempotency_record (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求ID（写操作幂等键）',
-    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE',
+    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE/START_MEDICAL_HOLD/RESUME_MEDICAL_HOLD',
     request_digest CHAR(64) NOT NULL COMMENT '请求参数（requestId除外，含expectedVersion）规范化JSON的SHA-256摘要',
     response_status INT NOT NULL COMMENT '原成功请求的HTTP状态码，重放时原样返回',
     response_body TEXT COMMENT '原成功响应体JSON，重放时原样返回',

@@ -5,17 +5,22 @@ import com.example.starter.race.api.CheckpointResponse;
 import com.example.starter.race.api.CheckpointsConfigResponse;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
 import com.example.starter.race.api.CreateRaceRequest;
+import com.example.starter.race.api.MedicalHoldResponse;
 import com.example.starter.race.api.MissingCheckpointsResponse;
 import com.example.starter.race.api.RaceResponse;
 import com.example.starter.race.api.RegisterRunnerRequest;
+import com.example.starter.race.api.ResumeMedicalHoldRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
 import com.example.starter.race.api.RunnerMissingCheckpointsResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
+import com.example.starter.race.api.StartMedicalHoldRequest;
 import com.example.starter.race.api.SubmitTimingRequest;
 import com.example.starter.race.domain.CheckpointRules;
+import com.example.starter.race.domain.ExclusionReason;
+import com.example.starter.race.domain.MedicalHoldStatus;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
@@ -23,6 +28,7 @@ import com.example.starter.race.domain.ResultEntry;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
 import com.example.starter.race.persistence.IdempotencyRow;
+import com.example.starter.race.persistence.MedicalHoldRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
 import com.example.starter.race.persistence.RunnerRow;
@@ -305,9 +311,13 @@ public class RaceServiceImpl implements RaceService {
                     }
                     bumpVersion(race, request.expectedVersion());
                     long now = clock.millis();
+                    // 提交时该选手存在生效中的医疗暂停：记录保留但标记 MEDICAL_HOLD，不参与排名。
+                    ExclusionReason exclusionReason =
+                            repository.findActiveHold(raceId, bib).isPresent()
+                                    ? ExclusionReason.MEDICAL_HOLD : null;
                     CheckpointTimingRow row = new CheckpointTimingRow(
                             request.timingId(), raceId, bib, request.checkpointCode(),
-                            checkpoint.position(), elapsedMillis, now);
+                            checkpoint.position(), elapsedMillis, exclusionReason, now);
                     try {
                         repository.insertTiming(row);
                     } catch (DuplicateKeyException ex) {
@@ -360,7 +370,8 @@ public class RaceServiceImpl implements RaceService {
                     List<CheckpointRow> checkpoints = repository.findCheckpoints(raceId);
                     List<CheckpointTimingRow> timings = repository.findAllTimings(raceId);
                     List<ResultEntry> entries =
-                            ResultCalculator.compute(runners, penalties, checkpoints, timings);
+                            ResultCalculator.compute(runners, penalties, checkpoints,
+                                    rankable(timings));
 
                     int newVersion = request.expectedVersion() + 1;
                     int updated = repository.sealIfOpenAtVersion(
@@ -412,7 +423,14 @@ public class RaceServiceImpl implements RaceService {
                 repository.findRunners(raceId),
                 repository.findPenalties(raceId),
                 repository.findCheckpoints(raceId),
-                repository.findAllTimings(raceId));
+                rankable(repository.findAllTimings(raceId)));
+    }
+
+    /** 过滤出参与排名的分段记录：被医疗暂停排除（MEDICAL_HOLD）的记录保留但不计入覆盖。 */
+    private static List<CheckpointTimingRow> rankable(List<CheckpointTimingRow> timings) {
+        return timings.stream()
+                .filter(timing -> timing.exclusionReason() == null)
+                .toList();
     }
 
     @Override
@@ -446,10 +464,11 @@ public class RaceServiceImpl implements RaceService {
             SnapshotRow snapshot = repository.findSnapshot(raceId)
                     .orElseThrow(() -> new IllegalStateException(
                             "赛事已封榜但缺少快照: " + raceId));
-            // 封榜后由固化明细派生缺失检查点，缺失行 elapsedMillis 为 null。
+            // 封榜后由固化明细派生缺失检查点：无记录（elapsedMillis 为 null）
+            // 或被排除（exclusionReason 非 null）的检查点均视为未覆盖。
             Map<String, List<String>> missingByBib = new TreeMap<>();
             for (SnapshotCheckpointRow detail : snapshot.checkpoints()) {
-                if (detail.elapsedMillis() == null) {
+                if (detail.elapsedMillis() == null || detail.exclusionReason() != null) {
                     missingByBib.computeIfAbsent(detail.bib(), key -> new ArrayList<>())
                             .add(detail.checkpointCode());
                 }
@@ -471,6 +490,10 @@ public class RaceServiceImpl implements RaceService {
             coveredByBib.put(runner.bib(), new java.util.HashSet<>());
         }
         for (CheckpointTimingRow timing : timings) {
+            // 被排除（如 MEDICAL_HOLD）的分段不计入覆盖，与排名口径一致。
+            if (timing.exclusionReason() != null) {
+                continue;
+            }
             java.util.Set<String> covered = coveredByBib.get(timing.bib());
             if (covered != null) {
                 covered.add(timing.checkpointCode());
@@ -496,6 +519,168 @@ public class RaceServiceImpl implements RaceService {
         SnapshotRow snapshot = repository.findSnapshot(raceId)
                 .orElseThrow(() -> new NotFoundException("赛事尚未封榜: " + raceId));
         return ResponseMapper.snapshotStanding(snapshot);
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult startMedicalHold(
+            String raceId, String bib, StartMedicalHoldRequest request) {
+        return withIdempotency(request.requestId(), "START_MEDICAL_HOLD",
+                orderedParams(
+                        "raceId", raceId,
+                        "bib", bib,
+                        "holdId", request.holdId(),
+                        "medicRole", request.medicRole(),
+                        "startedAt", request.startedAt(),
+                        "reason", request.reason(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    // holdId 是第二层全局幂等键：同参重放首次结果，异参409。
+                    MedicalHoldRow existingHold =
+                            repository.findHold(request.holdId()).orElse(null);
+                    if (existingHold != null) {
+                        return replayHoldOrConflict(raceId, bib, request, existingHold);
+                    }
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    requireRunner(raceId, bib);
+                    requireNotDisqualified(raceId, bib, "开始医疗暂停");
+                    Optional<MedicalHoldRow> active = repository.findActiveHold(raceId, bib);
+                    if (active.isPresent()) {
+                        throw new ConflictException(
+                                "选手已存在生效中的医疗暂停: " + active.get().holdId());
+                    }
+                    bumpVersion(race, request.expectedVersion());
+                    long now = clock.millis();
+                    MedicalHoldRow row = new MedicalHoldRow(
+                            request.holdId(), raceId, bib, request.medicRole(), request.reason(),
+                            request.startedAt(), MedicalHoldStatus.ACTIVE,
+                            null, null, null, now, null);
+                    try {
+                        repository.insertHold(row);
+                    } catch (DuplicateKeyException ex) {
+                        // 并发下唯一约束兜底：同 holdId 走重放/异参冲突。
+                        MedicalHoldRow concurrent =
+                                repository.findHold(request.holdId()).orElseThrow();
+                        return replayHoldOrConflict(raceId, bib, request, concurrent);
+                    }
+                    MedicalHoldRow saved = repository.findHold(request.holdId()).orElseThrow();
+                    return ServiceResult.created(ResponseMapper.toHoldResponse(saved));
+                });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult resumeMedicalHold(
+            String raceId, String bib, String holdId, ResumeMedicalHoldRequest request) {
+        return withIdempotency(request.requestId(), "RESUME_MEDICAL_HOLD",
+                orderedParams(
+                        "raceId", raceId,
+                        "bib", bib,
+                        "holdId", holdId,
+                        "confirmRole", request.confirmRole(),
+                        "endedAt", request.endedAt(),
+                        "fitnessConclusion", request.fitnessConclusion(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    RunnerRow runner = requireRunner(raceId, bib);
+                    MedicalHoldRow hold = repository.findHold(holdId)
+                            .orElseThrow(() -> new NotFoundException("医疗暂停不存在: " + holdId));
+                    if (!hold.raceId().equals(raceId) || !hold.bib().equals(bib)) {
+                        throw new NotFoundException("医疗暂停不属于该选手: " + holdId);
+                    }
+                    if (hold.status() == MedicalHoldStatus.RESUMED) {
+                        throw new ConflictException("医疗暂停已恢复: " + holdId);
+                    }
+                    requireNotDisqualified(raceId, bib, "恢复医疗暂停");
+                    if (request.confirmRole().equals(hold.medicRole())) {
+                        throw new UnprocessableEntityException(
+                                "恢复须由不同医疗角色确认适赛: medicRole=" + hold.medicRole()
+                                        + ", confirmRole=" + request.confirmRole());
+                    }
+                    if (request.endedAt() <= hold.startedAt()) {
+                        throw new UnprocessableEntityException(
+                                "暂停结束必须晚于开始: startedAt=" + hold.startedAt()
+                                        + ", endedAt=" + request.endedAt());
+                    }
+                    // 暂停声明区间 [startedAt, endedAt)（左闭右开）内已记录终点计时：
+                    // 须先按既有规则（计时修订/处罚）裁定完赛状态后再恢复。
+                    if (runner.finishTimeMs() != null
+                            && runner.updatedAt() >= hold.startedAt()
+                            && runner.updatedAt() < request.endedAt()) {
+                        throw new UnprocessableEntityException(
+                                "暂停期间存在终点计时，请先按既有规则裁定完赛状态: finishRecordedAt="
+                                        + runner.updatedAt() + ", holdStart=" + hold.startedAt()
+                                        + ", holdEnd=" + request.endedAt());
+                    }
+                    bumpVersion(race, request.expectedVersion());
+                    long now = clock.millis();
+                    int updated = repository.resumeHold(
+                            holdId, request.confirmRole(), request.endedAt(),
+                            request.fitnessConclusion(), now);
+                    if (updated == 0) {
+                        throw new ConflictException("医疗暂停已恢复: " + holdId);
+                    }
+                    MedicalHoldRow saved = repository.findHold(holdId).orElseThrow();
+                    return ServiceResult.ok(ResponseMapper.toHoldResponse(saved));
+                });
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<MedicalHoldResponse> getMedicalHoldHistory(String raceId, String bib) {
+        repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        requireRunner(raceId, bib);
+        return repository.findHoldsForRunner(raceId, bib).stream()
+                .map(ResponseMapper::toHoldResponse)
+                .toList();
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<MedicalHoldResponse> getRaceMedicalHolds(String raceId) {
+        repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        return repository.findHoldsForRace(raceId).stream()
+                .map(ResponseMapper::toHoldResponse)
+                .toList();
+    }
+
+    /**
+     * holdId 幂等重放：同参返回首次登记时的响应（即使此后已恢复，也按当时证据回放），
+     * 异参返回409。
+     */
+    private ServiceResult replayHoldOrConflict(
+            String raceId,
+            String bib,
+            StartMedicalHoldRequest request,
+            MedicalHoldRow existing) {
+        boolean sameParams = existing.raceId().equals(raceId)
+                && existing.bib().equals(bib)
+                && existing.medicRole().equals(request.medicRole())
+                && existing.startedAt() == request.startedAt()
+                && existing.reason().equals(request.reason());
+        if (!sameParams) {
+            throw new ConflictException(
+                    "holdId 已用于不同参数的医疗暂停: " + request.holdId());
+        }
+        MedicalHoldRow atCreation = new MedicalHoldRow(
+                existing.holdId(), existing.raceId(), existing.bib(), existing.medicRole(),
+                existing.reason(), existing.startedAt(), MedicalHoldStatus.ACTIVE,
+                null, null, null, existing.createdAt(), null);
+        return ServiceResult.created(ResponseMapper.toHoldResponse(atCreation));
+    }
+
+    /** 已取消资格（存在生效的 DISQUALIFY 处罚）的选手不可开始或恢复医疗暂停。 */
+    private void requireNotDisqualified(String raceId, String bib, String operation) {
+        boolean disqualified = repository.findPenalties(raceId).stream()
+                .anyMatch(penalty -> penalty.bib().equals(bib)
+                        && !penalty.revoked()
+                        && penalty.type() == PenaltyType.DISQUALIFY);
+        if (disqualified) {
+            throw new ConflictException("已取消资格选手不可" + operation + ": " + bib);
+        }
     }
 
     /**
@@ -708,11 +893,12 @@ public class RaceServiceImpl implements RaceService {
             if (timing == null) {
                 rows.add(new SnapshotCheckpointRow(
                         raceId, bib, checkpoint.checkpointCode(),
-                        checkpoint.position(), null, null));
+                        checkpoint.position(), null, null, null));
             } else {
                 rows.add(new SnapshotCheckpointRow(
                         raceId, bib, checkpoint.checkpointCode(),
-                        checkpoint.position(), timing.elapsedMillis(), timing.timingId()));
+                        checkpoint.position(), timing.elapsedMillis(), timing.timingId(),
+                        timing.exclusionReason()));
             }
         }
     }
