@@ -22,13 +22,28 @@ CREATE TABLE IF NOT EXISTS segment (
     segment_id VARCHAR(64) NOT NULL,
     source_text LONGTEXT NOT NULL,
     source_version INT NOT NULL,
+    placeholder_version INT NOT NULL DEFAULT 0,
     PRIMARY KEY (document_id, segment_id)
 );
-COMMENT ON TABLE segment IS '段落：文档内唯一 segmentId，含源文及源文版本';
+COMMENT ON TABLE segment IS '段落：文档内唯一 segmentId，含源文、源文版本及版式占位符版本';
 COMMENT ON COLUMN segment.document_id IS '所属文档 ID';
 COMMENT ON COLUMN segment.segment_id IS '文档内唯一段落 ID';
 COMMENT ON COLUMN segment.source_text IS '源文正文，UTF-8';
-COMMENT ON COLUMN segment.source_version IS '源文版本，从 1 开始，每次源文修订加一';
+COMMENT ON COLUMN segment.source_version IS '源文版本，从 1 开始，每次源文修订（含占位符修订）加一';
+COMMENT ON COLUMN segment.placeholder_version IS '版式占位符版本，从 0 开始（0 表示尚未声明占位符），每次声明加一';
+
+CREATE TABLE IF NOT EXISTS segment_placeholder (
+    document_id BIGINT NOT NULL,
+    segment_id VARCHAR(64) NOT NULL,
+    placeholder VARCHAR(128) NOT NULL,
+    occurrence INT NOT NULL,
+    PRIMARY KEY (document_id, segment_id, placeholder)
+);
+COMMENT ON TABLE segment_placeholder IS '段落实效版式占位符：当前声明的规范排序占位符集合及源文中的要求出现次数，随占位符声明整体替换';
+COMMENT ON COLUMN segment_placeholder.document_id IS '所属文档 ID';
+COMMENT ON COLUMN segment_placeholder.segment_id IS '所属段落 ID';
+COMMENT ON COLUMN segment_placeholder.placeholder IS '占位符原文，形如 {name}，name 以字母开头、仅含字母数字下划线';
+COMMENT ON COLUMN segment_placeholder.occurrence IS '该占位符在源文中的要求出现次数，译文必须保持相同次数';
 
 CREATE TABLE IF NOT EXISTS translation (
     document_id BIGINT NOT NULL,

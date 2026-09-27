@@ -2,6 +2,7 @@ package com.example.starter.translation.repo;
 
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
+import com.example.starter.translation.domain.Rows.PlaceholderRow;
 import com.example.starter.translation.domain.Rows.RequestLogRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
@@ -32,7 +33,11 @@ public class TranslationRepository {
             rs.getInt("term_version"));
 
     private static final RowMapper<SegmentRow> SEGMENT_MAPPER = (rs, n) -> new SegmentRow(
-            rs.getString("segment_id"), rs.getString("source_text"), rs.getInt("source_version"));
+            rs.getString("segment_id"), rs.getString("source_text"), rs.getInt("source_version"),
+            rs.getInt("placeholder_version"));
+
+    private static final RowMapper<PlaceholderRow> PLACEHOLDER_MAPPER = (rs, n) -> new PlaceholderRow(
+            rs.getString("segment_id"), rs.getString("placeholder"), rs.getInt("occurrence"));
 
     private static final RowMapper<TranslationRow> TRANSLATION_MAPPER = (rs, n) -> new TranslationRow(
             rs.getString("segment_id"), rs.getString("language"), rs.getString("content"),
@@ -107,7 +112,7 @@ public class TranslationRepository {
 
     public Optional<SegmentRow> findSegment(long documentId, String segmentId) {
         List<SegmentRow> rows = jdbc.query(
-                "SELECT segment_id, source_text, source_version FROM segment "
+                "SELECT segment_id, source_text, source_version, placeholder_version FROM segment "
                         + "WHERE document_id = ? AND segment_id = ?",
                 SEGMENT_MAPPER, documentId, segmentId);
         return rows.stream().findFirst();
@@ -115,7 +120,7 @@ public class TranslationRepository {
 
     public List<SegmentRow> listSegments(long documentId) {
         return jdbc.query(
-                "SELECT segment_id, source_text, source_version FROM segment "
+                "SELECT segment_id, source_text, source_version, placeholder_version FROM segment "
                         + "WHERE document_id = ? ORDER BY segment_id",
                 SEGMENT_MAPPER, documentId);
     }
@@ -124,6 +129,41 @@ public class TranslationRepository {
         jdbc.update("UPDATE segment SET source_text = ?, source_version = ? "
                         + "WHERE document_id = ? AND segment_id = ?",
                 sourceText, sourceVersion, documentId, segmentId);
+    }
+
+    /** 占位符声明：整体更新源文、源文版本与占位符版本。 */
+    public void updateSegmentPlaceholders(long documentId, String segmentId, String sourceText,
+                                          int sourceVersion, int placeholderVersion) {
+        jdbc.update("UPDATE segment SET source_text = ?, source_version = ?, placeholder_version = ? "
+                        + "WHERE document_id = ? AND segment_id = ?",
+                sourceText, sourceVersion, placeholderVersion, documentId, segmentId);
+    }
+
+    /** 整体替换段落当前占位符集合（先删后插，与占位符声明同事务）。 */
+    public void replaceSegmentPlaceholders(long documentId, String segmentId, List<PlaceholderRow> placeholders) {
+        jdbc.update("DELETE FROM segment_placeholder WHERE document_id = ? AND segment_id = ?",
+                documentId, segmentId);
+        for (PlaceholderRow row : placeholders) {
+            jdbc.update("INSERT INTO segment_placeholder (document_id, segment_id, placeholder, occurrence) "
+                            + "VALUES (?, ?, ?, ?)",
+                    documentId, segmentId, row.placeholder(), row.occurrence());
+        }
+    }
+
+    /** 查询段落当前占位符集合，按占位符原文排序保证稳定输出。 */
+    public List<PlaceholderRow> listSegmentPlaceholders(long documentId, String segmentId) {
+        return jdbc.query(
+                "SELECT segment_id, placeholder, occurrence FROM segment_placeholder "
+                        + "WHERE document_id = ? AND segment_id = ? ORDER BY placeholder",
+                PLACEHOLDER_MAPPER, documentId, segmentId);
+    }
+
+    /** 查询文档全部段落的当前占位符集合，按段落与占位符原文排序。 */
+    public List<PlaceholderRow> listSegmentPlaceholders(long documentId) {
+        return jdbc.query(
+                "SELECT segment_id, placeholder, occurrence FROM segment_placeholder "
+                        + "WHERE document_id = ? ORDER BY segment_id, placeholder",
+                PLACEHOLDER_MAPPER, documentId);
     }
 
     public Optional<TranslationRow> findTranslation(long documentId, String segmentId, String language) {

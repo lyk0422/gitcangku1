@@ -72,6 +72,28 @@ public final class ApiDtos {
             @NotBlank(message = "requiredTranslation 不能为空") @Size(max = 2048) String requiredTranslation) {
     }
 
+    /** 占位符声明请求：同时给出新源文与规范排序的占位符集合，整体创建新源版本。 */
+    public record DeclarePlaceholdersRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @NotBlank(message = "sourceText 不能为空") String sourceText,
+            @NotNull(message = "placeholders 不能为空") @Size(max = 100, message = "占位符最多 100 个")
+            List<@NotBlank(message = "占位符不能为空") @Size(max = 128) String> placeholders) {
+    }
+
+    /** 批量批准项：段落、语言与所针对的译文版本。 */
+    public record BatchApproveItem(
+            @NotBlank(message = "segmentId 不能为空") @Size(max = 64) String segmentId,
+            @NotBlank(message = "language 不能为空") String language,
+            @Positive(message = "translationVersion 必须为正数") int translationVersion) {
+    }
+
+    /** 批量批准请求：任一段不完整时整次不改变批准状态。 */
+    public record BatchApproveRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @NotNull(message = "items 不能为空") @Size(min = 1, max = 100, message = "批量批准项须为 1~100 条")
+            List<@Valid BatchApproveItem> items) {
+    }
+
     /** 新增术语版本请求：携带期望的当前术语版本与完整规则集（0~100 条）。 */
     public record UpdateTermsRequest(
             @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
@@ -125,11 +147,45 @@ public final class ApiDtos {
     public record TermStatusResponse(long documentId, int termVersion, List<TranslationTermStatus> translations) {
     }
 
-    /** 统一错误响应；violations 仅在术语违规 422 时返回，含全部违规术语。 */
+    /** 占位符声明响应：新源版本、占位符版本与规范排序后的占位符集合。 */
+    public record PlaceholderResponse(long documentId, String segmentId, int sourceVersion,
+                                      int placeholderVersion, List<String> placeholders, int draftVersion) {
+    }
+
+    /** 占位符违规明细：type 为 MISSING/EXTRA/COUNT_MISMATCH，含要求与实际出现次数。 */
+    public record PlaceholderViolation(String placeholder, String type, int requiredCount, int actualCount) {
+    }
+
+    /** 批量批准响应：审核人、实际批准条数与逐项批准结果。 */
+    public record BatchApproveResponse(long documentId, String reviewer, int approvedCount,
+                                       List<ApprovalResponse> approvals) {
+    }
+
+    /** 占位符及要求出现次数视图。 */
+    public record PlaceholderCountView(String placeholder, int requiredCount) {
+    }
+
+    /** 单条译文的占位符诊断：是否满足当前声明及全部违规明细（无违规为空列表）。 */
+    public record TranslationPlaceholderStatus(String language, int translationVersion, int sourceVersion,
+                                               boolean placeholderStale, List<PlaceholderViolation> violations) {
+    }
+
+    /** 段落占位符明细与诊断查询视图：当前声明集合及各语言译文完整性。 */
+    public record PlaceholderStatusView(long documentId, String segmentId, int placeholderVersion,
+                                        List<PlaceholderCountView> placeholders,
+                                        List<TranslationPlaceholderStatus> translations) {
+    }
+
+    /** 统一错误响应；violations 仅在术语违规 422 时返回，placeholderViolations 仅在占位符违规 422 时返回。 */
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    public record ErrorResponse(String error, String message, List<TermRuleView> violations) {
+    public record ErrorResponse(String error, String message, List<TermRuleView> violations,
+                                List<PlaceholderViolation> placeholderViolations) {
         public ErrorResponse(String error, String message) {
-            this(error, message, null);
+            this(error, message, null, null);
+        }
+
+        public ErrorResponse(String error, String message, List<TermRuleView> violations) {
+            this(error, message, violations, null);
         }
     }
 }

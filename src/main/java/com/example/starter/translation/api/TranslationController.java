@@ -129,6 +129,35 @@ public class TranslationController {
         return ResponseEntity.ok(translationService.getTermStatus(documentId));
     }
 
+    /** 占位符声明：整体给出新源文与规范排序占位符集合，创建新源版本，所有目标译文转为待修订。 */
+    @PutMapping("/{documentId}/segments/{segmentId}/placeholders")
+    public ResponseEntity<String> declarePlaceholders(@PathVariable long documentId,
+                                                      @PathVariable String segmentId,
+                                                      @Valid @RequestBody ApiDtos.DeclarePlaceholdersRequest request) {
+        String operation = "PUT /api/documents/" + documentId + "/segments/" + segmentId + "/placeholders";
+        return writeExecutor.execute(request.requestId(), hash(operation, request),
+                () -> WriteResult.of(200, translationService.declarePlaceholders(
+                        documentId, segmentId, request))).toResponseEntity();
+    }
+
+    /** 批量批准：任一段不完整时整次 422 且不改变批准状态，全部通过后一个事务写入。 */
+    @PostMapping("/{documentId}/translations/approve-batch")
+    public ResponseEntity<String> batchApprove(@PathVariable long documentId,
+                                               @RequestHeader("X-Actor-Id") String actorId,
+                                               @Valid @RequestBody ApiDtos.BatchApproveRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/translations/approve-batch";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(200, translationService.batchApprove(documentId, actorId, request)))
+                .toResponseEntity();
+    }
+
+    /** 段落占位符明细与诊断查询：当前声明集合及各语言译文完整性。 */
+    @GetMapping("/{documentId}/segments/{segmentId}/placeholders")
+    public ResponseEntity<ApiDtos.PlaceholderStatusView> getPlaceholderStatus(
+            @PathVariable long documentId, @PathVariable String segmentId) {
+        return ResponseEntity.ok(translationService.getPlaceholderStatus(documentId, segmentId));
+    }
+
     /** 查询指定发布版本的只读快照。 */
     @GetMapping("/{documentId}/releases/{publishedVersion}")
     public ResponseEntity<String> getRelease(@PathVariable long documentId, @PathVariable int publishedVersion) {

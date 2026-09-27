@@ -24,13 +24,24 @@ public final class Rows {
     }
 
     /**
-     * 段落：文档内唯一 segmentId，含源文及源文版本。
+     * 段落：文档内唯一 segmentId，含源文、源文版本及版式占位符版本。
      *
-     * @param segmentId     文档内唯一段落 ID
-     * @param sourceText    源文正文，UTF-8
-     * @param sourceVersion 源文版本，从 1 开始，每次源文修订加一
+     * @param segmentId          文档内唯一段落 ID
+     * @param sourceText         源文正文，UTF-8
+     * @param sourceVersion      源文版本，从 1 开始，每次源文修订（含占位符修订）加一
+     * @param placeholderVersion 版式占位符版本，从 0 开始（0 表示尚未声明占位符），每次声明加一
      */
-    public record SegmentRow(String segmentId, String sourceText, int sourceVersion) {
+    public record SegmentRow(String segmentId, String sourceText, int sourceVersion, int placeholderVersion) {
+    }
+
+    /**
+     * 段落实效版式占位符：当前声明的占位符及源文中的要求出现次数。
+     *
+     * @param segmentId   所属段落 ID
+     * @param placeholder 占位符原文，形如 {name}
+     * @param occurrence  该占位符在源文中的要求出现次数，译文必须保持相同次数
+     */
+    public record PlaceholderRow(String segmentId, String placeholder, int occurrence) {
     }
 
     /**

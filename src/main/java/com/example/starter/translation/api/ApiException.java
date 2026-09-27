@@ -12,17 +12,25 @@ public class ApiException extends RuntimeException {
     private final HttpStatus status;
     private final String code;
     private final List<ApiDtos.TermRuleView> violations;
+    private final List<ApiDtos.PlaceholderViolation> placeholderViolations;
 
     public ApiException(HttpStatus status, String code, String message) {
-        this(status, code, message, null);
+        this(status, code, message, null, null);
     }
 
     public ApiException(HttpStatus status, String code, String message,
                         List<ApiDtos.TermRuleView> violations) {
+        this(status, code, message, violations, null);
+    }
+
+    public ApiException(HttpStatus status, String code, String message,
+                        List<ApiDtos.TermRuleView> violations,
+                        List<ApiDtos.PlaceholderViolation> placeholderViolations) {
         super(message);
         this.status = status;
         this.code = code;
         this.violations = violations;
+        this.placeholderViolations = placeholderViolations;
     }
 
     public HttpStatus status() {
@@ -36,6 +44,11 @@ public class ApiException extends RuntimeException {
     /** 术语违规明细，仅术语违规 422 时非空。 */
     public List<ApiDtos.TermRuleView> violations() {
         return violations;
+    }
+
+    /** 占位符违规明细，仅占位符违规 422 时非空。 */
+    public List<ApiDtos.PlaceholderViolation> placeholderViolations() {
+        return placeholderViolations;
     }
 
     /** 404：资源不存在。 */
@@ -56,5 +69,12 @@ public class ApiException extends RuntimeException {
     /** 422：译文违反术语规则，返回全部违规术语。 */
     public static ApiException termViolation(String message, List<ApiDtos.TermRuleView> violations) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "TERM_VIOLATION", message, violations);
+    }
+
+    /** 422：译文占位符不完整（缺失、额外或计数不一致），返回全部违规明细。 */
+    public static ApiException placeholderViolation(String message,
+                                                    List<ApiDtos.PlaceholderViolation> violations) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "PLACEHOLDER_VIOLATION", message,
+                null, violations);
     }
 }

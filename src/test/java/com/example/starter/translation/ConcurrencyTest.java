@@ -200,6 +200,58 @@ class ConcurrencyTest extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("发布与占位符声明并发：对应一个一致状态，快照固化声明前完整状态或发布失败")
+    void concurrentPublishAndDeclare() throws Exception {
+        long docId = createDocument(newRequestId(), "[\"en\"]",
+                "[{\"segmentId\":\"s1\",\"sourceText\":\"原文\"}]");
+        submitTranslation(docId, "s1", "en", "alice", "hello", 1, newRequestId());
+        approve(docId, "s1", "en", "bob", 1, newRequestId());
+        // 当前草稿版本 2、发布版本 0
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        CountDownLatch gate = new CountDownLatch(1);
+        Future<ApiResult> publishFuture = pool.submit(() -> {
+            gate.await();
+            return publish(docId, 2, 0, newRequestId());
+        });
+        Future<ApiResult> declareFuture = pool.submit(() -> {
+            gate.await();
+            return declarePlaceholders(docId, "s1", "原文 {icon}", "[\"{icon}\"]", newRequestId());
+        });
+        gate.countDown();
+        ApiResult publishResult = publishFuture.get(30, TimeUnit.SECONDS);
+        ApiResult declareResult = declareFuture.get(30, TimeUnit.SECONDS);
+        pool.shutdown();
+
+        // 声明必然成功并推进草稿版本；发布要么先于声明成功，要么因草稿版本变化 409
+        assertThat(declareResult.status()).isEqualTo(200);
+        assertThat(publishResult.status()).isIn(201, 409);
+
+        Integer draftVersion = jdbc.queryForObject(
+                "SELECT draft_version FROM document WHERE document_id = ?", Integer.class, docId);
+        Integer publishedVersion = jdbc.queryForObject(
+                "SELECT published_version FROM document WHERE document_id = ?", Integer.class, docId);
+        Integer snapshots = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM release_snapshot WHERE document_id = ?", Integer.class, docId);
+
+        assertThat(draftVersion).isEqualTo(3);
+        assertThat(snapshots).isEqualTo(publishedVersion);
+        if (publishResult.status() == 201) {
+            // 发布先于声明：快照为声明前完整状态（无占位符锁定）
+            assertThat(publishedVersion).isEqualTo(1);
+            ApiResult release = getJson("/api/documents/" + docId + "/releases/1");
+            assertThat(release.status()).isEqualTo(200);
+            var segment = release.body().get("segments").get(0);
+            assertThat(segment.get("sourceText").asText()).isEqualTo("原文");
+            assertThat(segment.get("placeholderVersion").asInt()).isZero();
+            assertThat(segment.get("placeholders")).isEmpty();
+        } else {
+            // 声明先于发布：期望草稿版本不符，发布 409 且无快照
+            assertThat(publishedVersion).isZero();
+        }
+    }
+
+    @Test
     @DisplayName("并发术语更新：同一期望版本仅一个成功，术语版本无丢失更新")
     void concurrentTermUpdates() throws Exception {
         long docId = createDocument(newRequestId(), "[\"en\"]", "[]");
