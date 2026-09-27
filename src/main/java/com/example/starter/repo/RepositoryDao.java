@@ -1,6 +1,7 @@
 package com.example.starter.repo;
 
 import com.example.starter.domain.ArtifactVersion;
+import com.example.starter.domain.Attestation;
 import com.example.starter.domain.DependencyRange;
 import com.example.starter.domain.RepositorySnapshot;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -69,11 +70,34 @@ public class RepositoryDao {
                         Collectors.mapping(d -> new DependencyRange(d.name(), d.minimumVersion(), d.maximumVersion()),
                                 Collectors.toList())));
 
+        Map<Long, String> checksumByArtifact = jdbcTemplate.query(
+                "SELECT artifact_id, checksum_value FROM artifact_checksum",
+                rs -> {
+                    Map<Long, String> map = new LinkedHashMap<>();
+                    while (rs.next()) {
+                        map.put(rs.getLong("artifact_id"), rs.getString("checksum_value"));
+                    }
+                    return map;
+                });
+        Map<Long, List<AttestationRow>> attestationsByArtifact = jdbcTemplate.query(
+                "SELECT id, artifact_id, role, checksum_value, state, attested_at, revoked_at, revoked_by "
+                        + "FROM artifact_attestation ORDER BY artifact_id ASC, role ASC",
+                rs -> {
+                    Map<Long, List<AttestationRow>> map = new LinkedHashMap<>();
+                    while (rs.next()) {
+                        AttestationRow row = mapAttestation(rs);
+                        map.computeIfAbsent(row.artifactId(), k -> new ArrayList<>()).add(row);
+                    }
+                    return map;
+                });
+
         Map<String, List<ArtifactVersion>> artifacts = new LinkedHashMap<>();
         for (ArtifactRow row : rows) {
             List<DependencyRange> deps = depsByArtifact.getOrDefault(row.id(), List.of());
             ArtifactVersion version = new ArtifactVersion(row.id(), row.name(), row.version(),
-                    row.withdrawn(), List.copyOf(deps));
+                    row.withdrawn(), List.copyOf(deps),
+                    checksumByArtifact.get(row.id()),
+                    toDomainAttestations(attestationsByArtifact.get(row.id())));
             artifacts.computeIfAbsent(row.name(), k -> new ArrayList<>()).add(version);
         }
         return new RepositorySnapshot(getRepositoryVersion(), Map.copyOf(artifacts));
@@ -128,7 +152,7 @@ public class RepositoryDao {
                 artifactId, name, minimumVersion, maximumVersion);
     }
 
-    /** 读取单个制品版本（含依赖），不存在返回 null。 */
+    /** 读取单个制品版本（含依赖、摘要与见证），不存在返回 null。 */
     public ArtifactVersion loadArtifact(String name, int version) {
         List<ArtifactRow> rows = jdbcTemplate.query(
                 "SELECT id, name, version, withdrawn FROM artifact WHERE name = ? AND version = ?",
@@ -144,8 +168,21 @@ public class RepositoryDao {
                 (rs, n) -> new DependencyRange(rs.getString("name"),
                         rs.getInt("minimum_version"), rs.getInt("maximum_version")),
                 row.id());
+        ChecksumRow checksumRow = findChecksum(row.id());
+        List<Attestation> attestations = toDomainAttestations(listAttestations(row.id()));
         return new ArtifactVersion(row.id(), row.name(), row.version(), row.withdrawn(),
-                List.copyOf(deps));
+                List.copyOf(deps), checksumRow == null ? null : checksumRow.checksumValue(),
+                attestations);
+    }
+
+    private List<Attestation> toDomainAttestations(List<AttestationRow> rows) {
+        if (rows == null || rows.isEmpty()) {
+            return List.of();
+        }
+        return rows.stream()
+                .map(r -> new Attestation(r.id(), r.artifactId(), r.role(), r.checksumValue(),
+                        r.active(), r.attestedAt(), r.revokedAt(), r.revokedBy()))
+                .toList();
     }
 
     /** 仓库版本号加一，返回加一后的版本号（须在持有行锁时调用）。 */
@@ -186,11 +223,143 @@ public class RepositoryDao {
         return key.longValue();
     }
 
-    /** 新增锁文件精确版本条目。 */
-    public void insertLockEntry(long lockFileId, String name, int version) {
+    /** 新增锁文件精确版本条目，同时固化该版本登记的摘要，返回自增主键。 */
+    public long insertLockEntry(long lockFileId, String name, int version, String checksum) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbcTemplate.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO lock_file_entry (lock_file_id, name, version, checksum_value) "
+                            + "VALUES (?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setLong(1, lockFileId);
+            ps.setString(2, name);
+            ps.setInt(3, version);
+            ps.setString(4, checksum);
+            return ps;
+        }, keyHolder);
+        Number key = keyHolder.getKey();
+        if (key == null) {
+            throw new IllegalStateException("插入锁文件条目未获取自增主键");
+        }
+        return key.longValue();
+    }
+
+    /** 新增锁条目固化的单条见证快照，返回自增主键。 */
+    public long insertLockEntryAttestation(long lockFileEntryId, String role,
+                                           String checksum, Instant attestedAt) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbcTemplate.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO lock_entry_attestation "
+                            + "(lock_file_entry_id, role, checksum_value, attested_at) "
+                            + "VALUES (?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setLong(1, lockFileEntryId);
+            ps.setString(2, role);
+            ps.setString(3, checksum);
+            ps.setTimestamp(4, Timestamp.from(attestedAt));
+            return ps;
+        }, keyHolder);
+        Number key = keyHolder.getKey();
+        if (key == null) {
+            throw new IllegalStateException("插入固化见证未获取自增主键");
+        }
+        return key.longValue();
+    }
+
+    /** 查询某锁文件条目固化的全部见证，按角色升序。 */
+    public List<FrozenAttestationRow> listLockEntryAttestations(long lockFileEntryId) {
+        return jdbcTemplate.query(
+                "SELECT lock_file_entry_id, role, checksum_value, attested_at "
+                        + "FROM lock_entry_attestation WHERE lock_file_entry_id = ? ORDER BY role ASC",
+                (rs, n) -> new FrozenAttestationRow(rs.getLong("lock_file_entry_id"),
+                        rs.getString("role"), rs.getString("checksum_value"),
+                        rs.getTimestamp("attested_at").toInstant()),
+                lockFileEntryId);
+    }
+
+    /** 新增制品版本的内容校验摘要（artifact_id 唯一，重复由唯一索引报错）。 */
+    public void insertChecksum(long artifactId, String checksum, String registeredBy, Instant createdAt) {
         jdbcTemplate.update(
-                "INSERT INTO lock_file_entry (lock_file_id, name, version) VALUES (?, ?, ?)",
-                lockFileId, name, version);
+                "INSERT INTO artifact_checksum (artifact_id, checksum_value, registered_by, created_at) "
+                        + "VALUES (?, ?, ?, ?)",
+                artifactId, checksum, registeredBy, Timestamp.from(createdAt));
+    }
+
+    /** 读取制品版本的登记摘要，不存在返回 null。 */
+    public ChecksumRow findChecksum(long artifactId) {
+        List<ChecksumRow> rows = jdbcTemplate.query(
+                "SELECT artifact_id, checksum_value, registered_by, created_at "
+                        + "FROM artifact_checksum WHERE artifact_id = ?",
+                (rs, n) -> new ChecksumRow(rs.getLong("artifact_id"),
+                        rs.getString("checksum_value"), rs.getString("registered_by"),
+                        rs.getTimestamp("created_at").toInstant()),
+                artifactId);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /** 新增一条见证（artifact_id+role 唯一，同角色重复由唯一索引报错），返回自增主键。 */
+    public long insertAttestation(long artifactId, String role, String checksum,
+                                  Instant attestedAt, String requestId) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbcTemplate.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO artifact_attestation "
+                            + "(artifact_id, role, checksum_value, state, attested_at, request_id) "
+                            + "VALUES (?, ?, ?, 'ACTIVE', ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setLong(1, artifactId);
+            ps.setString(2, role);
+            ps.setString(3, checksum);
+            ps.setTimestamp(4, Timestamp.from(attestedAt));
+            ps.setString(5, requestId);
+            return ps;
+        }, keyHolder);
+        Number key = keyHolder.getKey();
+        if (key == null) {
+            throw new IllegalStateException("插入见证未获取自增主键");
+        }
+        return key.longValue();
+    }
+
+    /** 读取某制品版本某角色的见证（含已撤销），不存在返回 null。 */
+    public AttestationRow findAttestation(long artifactId, String role) {
+        List<AttestationRow> rows = jdbcTemplate.query(
+                "SELECT id, artifact_id, role, checksum_value, state, attested_at, revoked_at, revoked_by "
+                        + "FROM artifact_attestation WHERE artifact_id = ? AND role = ?",
+                (rs, n) -> mapAttestation(rs),
+                artifactId, role);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /** 读取某制品版本的全部见证（含已撤销），按角色升序。 */
+    public List<AttestationRow> listAttestations(long artifactId) {
+        return jdbcTemplate.query(
+                "SELECT id, artifact_id, role, checksum_value, state, attested_at, revoked_at, revoked_by "
+                        + "FROM artifact_attestation WHERE artifact_id = ? ORDER BY role ASC",
+                (rs, n) -> mapAttestation(rs),
+                artifactId);
+    }
+
+    /**
+     * 撤销指定见证，仅当当前为 ACTIVE 时生效，返回受影响行数。
+     * 条件更新保证重复撤销/并发撤销的原子判定。
+     */
+    public int revokeAttestation(long attestationId, String revokedBy, Instant revokedAt) {
+        return jdbcTemplate.update(
+                "UPDATE artifact_attestation SET state = 'REVOKED', revoked_at = ?, revoked_by = ? "
+                        + "WHERE id = ? AND state = 'ACTIVE'",
+                Timestamp.from(revokedAt), revokedBy, attestationId);
+    }
+
+    private AttestationRow mapAttestation(java.sql.ResultSet rs) throws java.sql.SQLException {
+        Timestamp revokedAt = rs.getTimestamp("revoked_at");
+        return new AttestationRow(rs.getLong("id"), rs.getLong("artifact_id"),
+                rs.getString("role"), rs.getString("checksum_value"),
+                "ACTIVE".equals(rs.getString("state")),
+                rs.getTimestamp("attested_at").toInstant(),
+                revokedAt == null ? null : revokedAt.toInstant(),
+                rs.getString("revoked_by"));
     }
 
     /** 幂等记录视图。 */
@@ -238,8 +407,25 @@ public class RepositoryDao {
                               long repositoryVersion, Instant createdAt) {
     }
 
-    /** 锁文件条目行。 */
-    public record LockEntryRow(long lockFileId, String name, int version) {
+    /** 锁文件条目行：含锁定时固化的摘要。 */
+    public record LockEntryRow(long id, long lockFileId, String name, int version,
+                               String checksum) {
+    }
+
+    /** 锁条目固化的见证快照行。 */
+    public record FrozenAttestationRow(long lockFileEntryId, String role,
+                                       String checksum, Instant attestedAt) {
+    }
+
+    /** 制品版本登记摘要行。 */
+    public record ChecksumRow(long artifactId, String checksumValue,
+                              String registeredBy, Instant createdAt) {
+    }
+
+    /** 见证记录行（含已撤销）。 */
+    public record AttestationRow(long id, long artifactId, String role, String checksumValue,
+                                 boolean active, Instant attestedAt,
+                                 Instant revokedAt, String revokedBy) {
     }
 
     /** 查询全部历史锁文件，按 ID 升序。 */
@@ -264,13 +450,14 @@ public class RepositoryDao {
         return rows.isEmpty() ? null : rows.get(0);
     }
 
-    /** 查询某锁文件的全部条目，按名称升序。 */
+    /** 查询某锁文件的全部条目（含固化摘要），按名称升序。 */
     public List<LockEntryRow> listLockEntries(long lockFileId) {
         return jdbcTemplate.query(
-                "SELECT lock_file_id, name, version FROM lock_file_entry "
+                "SELECT id, lock_file_id, name, version, checksum_value FROM lock_file_entry "
                         + "WHERE lock_file_id = ? ORDER BY name ASC",
-                (rs, n) -> new LockEntryRow(rs.getLong("lock_file_id"),
-                        rs.getString("name"), rs.getInt("version")),
+                (rs, n) -> new LockEntryRow(rs.getLong("id"), rs.getLong("lock_file_id"),
+                        rs.getString("name"), rs.getInt("version"),
+                        rs.getString("checksum_value")),
                 lockFileId);
     }
 
