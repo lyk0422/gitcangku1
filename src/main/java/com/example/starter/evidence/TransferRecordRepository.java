@@ -69,6 +69,17 @@ public class TransferRecordRepository {
                 ROW_MAPPER, evidenceKey);
     }
 
+    /**
+     * 查询证物在指定时刻（本机默认时区，与 created_at 同域）之后发起的交接记录数，
+     * 用于跨案移交撤销前校验是否已发生后续交接。
+     */
+    public int countSince(String evidenceKey, LocalDateTime since) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM transfer_record WHERE evidence_key = ? AND created_at > ?",
+                Integer.class, evidenceKey, since);
+        return count == null ? 0 : count;
+    }
+
     private static final class TransferRowMapper implements RowMapper<TransferRecord> {
         @Override
         public TransferRecord mapRow(ResultSet rs, int rowNum) throws SQLException {

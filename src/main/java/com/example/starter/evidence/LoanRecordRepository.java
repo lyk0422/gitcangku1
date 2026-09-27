@@ -94,6 +94,16 @@ public class LoanRecordRepository {
                 ROW_MAPPER, evidenceKey);
     }
 
+    /**
+     * 查询证物在指定 UTC 时刻之后发生的借出记录数（loan_at 为 UTC），用于跨案移交撤销前校验。
+     */
+    public int countLoansSince(String evidenceKey, LocalDateTime sinceUtc) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM loan_record WHERE evidence_key = ? AND loan_at > ?",
+                Integer.class, evidenceKey, sinceUtc);
+        return count == null ? 0 : count;
+    }
+
     private static final class LoanRowMapper implements RowMapper<LoanRecord> {
         @Override
         public LoanRecord mapRow(ResultSet rs, int rowNum) throws SQLException {

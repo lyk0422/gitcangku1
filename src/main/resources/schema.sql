@@ -5,7 +5,7 @@
 CREATE TABLE IF NOT EXISTS evidence (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     evidence_key VARCHAR(64) NOT NULL COMMENT '证物业务键，全局唯一，入库后不可修改',
-    case_key VARCHAR(64) NOT NULL COMMENT '所属案件键，入库后不可修改',
+    case_key VARCHAR(64) NOT NULL COMMENT '所属案件键，仅可经跨案移交或其撤销整体变更，历史链不改写',
     category VARCHAR(64) NOT NULL COMMENT '证物类别，入库后不可修改',
     seal_no VARCHAR(64) NOT NULL COMMENT '封条编号，入库后不可修改',
     custodian_id VARCHAR(64) NOT NULL COMMENT '当前保管人（操作人标识），交接接受后原子切换；借出期间不变',
@@ -60,12 +60,68 @@ CREATE TABLE IF NOT EXISTS loan_record (
     KEY idx_loan_borrower_status (borrower_id, status)
 );
 
+-- 案件保管人权限：入库与交接接受时自动授权；跨案移交要求双方保管人均具备对应案件权限。
+CREATE TABLE IF NOT EXISTS case_custodian (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    case_key VARCHAR(64) NOT NULL COMMENT '案件键',
+    custodian_id VARCHAR(64) NOT NULL COMMENT '被授权的保管人（操作人标识）',
+    granted_at DATETIME(6) NOT NULL COMMENT '授权时间，UTC',
+    CONSTRAINT uk_case_custodian UNIQUE (case_key, custodian_id)
+);
+
+-- 移交令：跨案移交必须提交有效令版本；撤销后版本失效，仅追加状态不删除。
+CREATE TABLE IF NOT EXISTS transfer_order (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    order_version VARCHAR(64) NOT NULL COMMENT '移交令版本，全局唯一',
+    source_case_key VARCHAR(64) NOT NULL COMMENT '来源案件键',
+    target_case_key VARCHAR(64) NOT NULL COMMENT '目标案件键，须与来源案件不同',
+    status VARCHAR(16) NOT NULL COMMENT '令状态：VALID 有效 / REVOKED 已撤销（失效）',
+    created_by VARCHAR(64) NOT NULL COMMENT '登记操作人',
+    created_at DATETIME(6) NOT NULL COMMENT '登记时间，UTC',
+    revoked_at DATETIME(6) NULL COMMENT '撤销时间，UTC；NULL 表示仍有效',
+    CONSTRAINT uk_transfer_order_version UNIQUE (order_version)
+);
+
+-- 跨案移交保管链：只追加；同一 transferId 下每条证物写来源案件移出（OUT）与目标案件移入（IN）各一条；
+-- 撤销仅追加反向链（REVOKE_OUT/REVOKE_IN），不删除、不改写原移交记录。
+CREATE TABLE IF NOT EXISTS case_transfer_chain (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    transfer_id VARCHAR(64) NOT NULL COMMENT '跨案移交批次标识，同批移出/移入/快照/反向链共用',
+    evidence_key VARCHAR(64) NOT NULL COMMENT '关联证物业务键',
+    direction VARCHAR(16) NOT NULL COMMENT '链方向：OUT 来源案件移出 / IN 目标案件移入 / REVOKE_OUT 撤销自目标案件移出 / REVOKE_IN 撤销回来源案件移入',
+    case_key VARCHAR(64) NOT NULL COMMENT '本链条目所属案件',
+    counter_case_key VARCHAR(64) NOT NULL COMMENT '对方案件键',
+    custodian_id VARCHAR(64) NOT NULL COMMENT '本条目确认保管人：OUT 为交出方，IN 为接收方，反向链为对应确认人',
+    order_version VARCHAR(64) NOT NULL COMMENT '移交令版本（快照固化，后续令撤销不影响历史）',
+    created_at DATETIME(6) NOT NULL COMMENT '条目写入时间，UTC',
+    KEY idx_ct_chain_transfer (transfer_id),
+    KEY idx_ct_chain_evidence (evidence_key),
+    KEY idx_ct_chain_case (case_key)
+);
+
+-- 双案封存快照：同一 transferId 每条证物一行，固化双方案件、原位置、封签版本与令版本；只追加不可变。
+CREATE TABLE IF NOT EXISTS case_transfer_snapshot (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    transfer_id VARCHAR(64) NOT NULL COMMENT '跨案移交批次标识',
+    evidence_key VARCHAR(64) NOT NULL COMMENT '关联证物业务键',
+    source_case_key VARCHAR(64) NOT NULL COMMENT '来源案件键（移交时固化）',
+    target_case_key VARCHAR(64) NOT NULL COMMENT '目标案件键（移交时固化）',
+    source_custodian_id VARCHAR(64) NOT NULL COMMENT '来源案件保管人（移交时固化）',
+    target_custodian_id VARCHAR(64) NOT NULL COMMENT '目标案件保管人（移交时固化）',
+    origin_location VARCHAR(160) NOT NULL COMMENT '原位置：来源案件键#来源保管人 的固化标识',
+    seal_no VARCHAR(64) NOT NULL COMMENT '封签版本（移交时封条编号快照）',
+    order_version VARCHAR(64) NOT NULL COMMENT '移交令版本（移交时固化）',
+    created_at DATETIME(6) NOT NULL COMMENT '快照固化时间，UTC',
+    KEY idx_ct_snapshot_transfer (transfer_id),
+    KEY idx_ct_snapshot_evidence (evidence_key)
+);
+
 -- 幂等命令日志：command_key 全局唯一；同键同参重放返回首次结果，同键改参返回 409。
 CREATE TABLE IF NOT EXISTS command_log (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     command_key VARCHAR(64) NOT NULL COMMENT '幂等命令键，全局唯一',
     actor_id VARCHAR(64) NOT NULL COMMENT '发起操作人',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN/TRANSFER_ORDER_REGISTER/TRANSFER_ORDER_REVOKE/CASE_TRANSFER/CASE_TRANSFER_REVOKE',
     request_hash VARCHAR(64) NOT NULL COMMENT '请求参数规范化后的 SHA-256，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行的 HTTP 状态码',
     response_body TEXT NOT NULL COMMENT '首次执行的响应体 JSON，重放时原样返回',

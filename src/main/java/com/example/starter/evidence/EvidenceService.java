@@ -46,6 +46,7 @@ public class EvidenceService {
     private final SealInspectionRepository inspectionRepository;
     private final LoanRecordRepository loanRepository;
     private final CommandLogRepository commandLogRepository;
+    private final CaseCustodianRepository caseCustodianRepository;
     private final ObjectMapper objectMapper;
     private final EvidenceClock clock;
 
@@ -54,6 +55,7 @@ public class EvidenceService {
                            SealInspectionRepository inspectionRepository,
                            LoanRecordRepository loanRepository,
                            CommandLogRepository commandLogRepository,
+                           CaseCustodianRepository caseCustodianRepository,
                            ObjectMapper objectMapper,
                            EvidenceClock clock) {
         this.evidenceRepository = evidenceRepository;
@@ -61,6 +63,7 @@ public class EvidenceService {
         this.inspectionRepository = inspectionRepository;
         this.loanRepository = loanRepository;
         this.commandLogRepository = commandLogRepository;
+        this.caseCustodianRepository = caseCustodianRepository;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -80,6 +83,8 @@ public class EvidenceService {
         LocalDateTime now = LocalDateTime.now();
         evidenceRepository.insert(request.evidenceKey(), request.caseKey(), request.category(),
                 request.sealNo(), actorId, now);
+        // 入库操作人自动获得该案件的保管人权限（跨案移交权限校验依据）
+        caseCustodianRepository.grant(request.caseKey(), actorId, clock.nowUtc());
         Evidence evidence = evidenceRepository.findByKey(request.evidenceKey()).orElseThrow();
         return record(request.commandKey(), OP_INTAKE, actorId, requestHash, 201, toView(evidence));
     }
@@ -145,6 +150,8 @@ public class EvidenceService {
             throw ApiException.conflict("交接已被处理: " + evidenceKey);
         }
         evidenceRepository.updateCustody(evidenceKey, actorId, EvidenceStatus.SEALED, now);
+        // 新保管人自动获得该案件的保管人权限（跨案移交权限校验依据）
+        caseCustodianRepository.grant(evidence.caseKey(), actorId, clock.nowUtc());
         Evidence updated = evidenceRepository.findByKey(evidenceKey).orElseThrow();
         return record(request.commandKey(), OP_TRANSFER_ACCEPT, actorId, requestHash,
                 200, toView(updated));
