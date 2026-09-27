@@ -5,11 +5,12 @@ import com.fasterxml.jackson.annotation.JsonInclude;
 import java.util.List;
 
 /**
- * 统一错误响应体；conflictFields 与 currentVersion 仅在合并/删除冲突时携带。
+ * 统一错误响应体；conflictFields 与 currentVersion 仅在合并/删除冲突时携带，errorCode 仅在需要区分失败原因时携带。
  *
  * @param status         HTTP 状态码
  * @param error          状态短语
  * @param message        错误描述
+ * @param errorCode      稳定错误码（如 ATTACHMENT_NOT_FOUND / RULE_REVOKED / FORBIDDEN_ROLE），可空
  * @param conflictFields 三方合并冲突的字段名列表（仅 409 合并冲突时非空）
  * @param currentVersion 冲突时服务端的当前版本号（仅冲突场景非空）
  */
@@ -18,6 +19,7 @@ public record ErrorResponse(
         int status,
         String error,
         String message,
+        String errorCode,
         List<String> conflictFields,
         Integer currentVersion) {
 }

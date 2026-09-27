@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS observation_version (
 CREATE TABLE IF NOT EXISTS request_log (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
     fingerprint VARCHAR(128) NOT NULL COMMENT '请求操作与参数的指纹，同键异参时判定 409',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：CREATE / MERGE / DELETE / RESOLVE',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：CREATE / MERGE / DELETE / RESOLVE / REGISTER_ATTACHMENT / REGISTER_RULE / REVOKE_RULE / REDACT / REVOKE_REDACTION / PURGE_ATTACHMENT',
     response_status INT NULL COMMENT '成功响应的 HTTP 状态码；提交过程中暂为 NULL',
     response_body VARCHAR(4000) NULL COMMENT '成功响应体（JSON 原文），用于同键同参重放；提交过程中暂为 NULL',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '请求记录创建时间（服务器时区）',
@@ -58,4 +58,60 @@ CREATE TABLE IF NOT EXISTS conflict_resolution (
     -- 不设置指向 observation_current 的外键：观测记录删除仅置墓碑（当前行保留），
     -- 且不可变解决历史必须在任何数据清理/归档场景下继续可查。
     UNIQUE (observation_id, request_id)
+);
+
+-- 观测附件元数据表：附件必须属于某条观测记录；只保存内容摘要而非附件内容本身。
+CREATE TABLE IF NOT EXISTS attachment (
+    attachment_id VARCHAR(128) NOT NULL COMMENT '附件唯一标识',
+    observation_id VARCHAR(64) NOT NULL COMMENT '所属观测记录唯一标识',
+    content_summary VARCHAR(2048) NULL COMMENT '附件原始内容摘要；物理清除后为 NULL，null 表示原文不可恢复',
+    media_type VARCHAR(128) NOT NULL COMMENT '附件媒体类型（如 image/jpeg），非空',
+    purged BOOLEAN NOT NULL DEFAULT FALSE COMMENT '附件内容是否已被物理清除：TRUE 时 content_summary 必为 NULL',
+    created_at_utc TIMESTAMP NOT NULL COMMENT '附件登记完成时刻（UTC）',
+    purged_at_utc TIMESTAMP NULL COMMENT '物理清除完成时刻（UTC）；未清除时为 NULL',
+    PRIMARY KEY (attachment_id),
+    -- 同一观测记录内附件标识唯一，归属校验与按观测加锁排序均依赖此键。
+    UNIQUE (observation_id, attachment_id)
+);
+
+-- 脱敏规则版本登记表：规则版本须先登记为 ACTIVE 才能用于脱敏；撤销后不可再用于新版本。
+CREATE TABLE IF NOT EXISTS redaction_rule (
+    rule_version VARCHAR(64) NOT NULL COMMENT '脱敏规则版本唯一标识',
+    status VARCHAR(16) NOT NULL COMMENT '规则状态：ACTIVE 可用 / REVOKED 已撤销',
+    description VARCHAR(1024) NOT NULL COMMENT '规则版本说明',
+    created_at_utc TIMESTAMP NOT NULL COMMENT '规则登记完成时刻（UTC）',
+    revoked_at_utc TIMESTAMP NULL COMMENT '规则撤销时刻（UTC）；未撤销时为 NULL',
+    PRIMARY KEY (rule_version)
+);
+
+-- 附件脱敏版本表：每次成功脱敏按附件生成递增版本，只新增受限展示版本，永不修改或删除行。
+CREATE TABLE IF NOT EXISTS attachment_redaction (
+    redaction_id VARCHAR(128) NOT NULL COMMENT '脱敏版本全局唯一标识',
+    observation_id VARCHAR(64) NOT NULL COMMENT '所属观测记录唯一标识（冗余归属，便于隔离查询）',
+    attachment_id VARCHAR(128) NOT NULL COMMENT '被脱敏附件唯一标识',
+    version INT NOT NULL COMMENT '同一附件内递增的脱敏版本号，从 1 开始',
+    rule_version VARCHAR(64) NOT NULL COMMENT '本次脱敏使用的规则版本（提交时必须为 ACTIVE）',
+    replacement_note VARCHAR(1024) NOT NULL COMMENT '替换说明，即脱敏后公开展示的受限摘要原文',
+    status VARCHAR(16) NOT NULL COMMENT '脱敏版本公开展示状态：ACTIVE 公开展示 / REVOKED 仅保留历史',
+    request_id VARCHAR(128) NOT NULL COMMENT '生成该脱敏版本的请求标识（requestId）',
+    created_at_utc TIMESTAMP NOT NULL COMMENT '脱敏版本生成时刻（UTC）',
+    revoked_at_utc TIMESTAMP NULL COMMENT '撤销公开展示资格时刻（UTC）；未撤销时为 NULL',
+    revoke_reason VARCHAR(1024) NULL COMMENT '撤销理由；未撤销时为 NULL',
+    PRIMARY KEY (redaction_id),
+    -- 版本号按附件递增；(附件, 规则版本) 唯一保证并发重复提交只生成一个版本。
+    UNIQUE (attachment_id, version),
+    UNIQUE (attachment_id, rule_version)
+);
+
+-- 合并/人工冲突解决证据固化表：观测新版本生成时快照当时各附件引用的脱敏版本，后续脱敏不追溯改写。
+CREATE TABLE IF NOT EXISTS observation_evidence (
+    observation_id VARCHAR(64) NOT NULL COMMENT '观测记录唯一标识',
+    observation_version INT NOT NULL COMMENT '固化证据时观测记录的版本号',
+    attachment_id VARCHAR(128) NOT NULL COMMENT '证据引用的附件唯一标识',
+    ref_type VARCHAR(16) NOT NULL COMMENT '引用类型：ORIGINAL 原始摘要 / REDACTION 某脱敏版本',
+    redaction_id VARCHAR(128) NULL COMMENT 'ref_type=REDACTION 时固化的脱敏版本标识；ORIGINAL 时为 NULL',
+    redaction_version INT NULL COMMENT '固化的脱敏版本号；ORIGINAL 时为 NULL',
+    rule_version VARCHAR(64) NULL COMMENT '固化脱敏版本所用规则版本；ORIGINAL 时为 NULL',
+    fixed_at_utc TIMESTAMP NOT NULL COMMENT '证据固化时刻（UTC）',
+    PRIMARY KEY (observation_id, observation_version, attachment_id)
 );
