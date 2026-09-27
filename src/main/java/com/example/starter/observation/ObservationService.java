@@ -112,21 +112,35 @@ public class ObservationService {
             return concurrent;
         }
 
+        ObservationSnapshot result = mergeForSubmission(observationId, request.baseVersion(),
+                request.location(), request.reading(), request.note());
+        return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(result));
+    }
+
+    /**
+     * 三方合并核心逻辑（无幂等处理）：供离线提交接口与地理围栏批量提交/人工裁决共用。
+     * 调用方须处于事务内；通过行锁串行化同一记录的并发变更，合并结果与当前完全相同则不加版本。
+     *
+     * @return 合并后指向的版本快照（无变化时为当前版本）
+     */
+    @Transactional
+    public ObservationSnapshot mergeForSubmission(String observationId, int baseVersion,
+                                                  String location, String reading, String note) {
         ObservationSnapshot current = observationRepository.findCurrentForUpdate(observationId)
                 .orElseThrow(() -> ApiException.notFound("observation not found: " + observationId));
         if (current.deleted()) {
             throw ApiException.gone("observation already deleted: " + observationId);
         }
-        ObservationSnapshot base = observationRepository.findVersion(observationId, request.baseVersion())
+        ObservationSnapshot base = observationRepository.findVersion(observationId, baseVersion)
                 .orElseThrow(() -> ApiException.notFound(
-                        "base version not found: " + observationId + "@" + request.baseVersion()));
+                        "base version not found: " + observationId + "@" + baseVersion));
 
         List<String> conflictFields = new ArrayList<>();
         String mergedLocation = mergeField("location", base.location(), current.location(),
-                request.location(), conflictFields);
+                location, conflictFields);
         String mergedReading = mergeReadingField(base.reading(), current.reading(),
-                request.reading(), conflictFields);
-        String mergedNote = mergeField("note", base.note(), current.note(), request.note(), conflictFields);
+                reading, conflictFields);
+        String mergedNote = mergeField("note", base.note(), current.note(), note, conflictFields);
         if (!conflictFields.isEmpty()) {
             throw ApiException.mergeConflict(conflictFields, current.version());
         }
@@ -135,13 +149,13 @@ public class ObservationService {
                 mergedLocation, mergedReading, mergedNote, false);
         if (sameContent(merged, current)) {
             // 合并结果与当前完全相同：返回当前版本，不加版本
-            return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(current));
+            return current;
         }
         ObservationSnapshot next = new ObservationSnapshot(observationId, current.version() + 1,
                 mergedLocation, mergedReading, mergedNote, false);
         observationRepository.updateCurrent(next);
         observationRepository.insertVersion(next);
-        return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(next));
+        return next;
     }
 
     /**

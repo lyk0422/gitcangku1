@@ -5,19 +5,29 @@ import org.springframework.http.HttpStatus;
 import java.util.List;
 
 /**
- * 业务异常：携带 HTTP 状态及可选的冲突详情（冲突字段、当前版本），由全局异常处理器转为错误响应。
+ * 业务异常：携带 HTTP 状态及可选的冲突详情（冲突字段、当前版本）与校验详情（实际值、要求值），
+ * 由全局异常处理器转为错误响应。
  */
 public class ApiException extends RuntimeException {
 
     private final HttpStatus status;
     private final List<String> conflictFields;
     private final Integer currentVersion;
+    private final String actualValue;
+    private final String requiredValue;
 
     private ApiException(HttpStatus status, String message, List<String> conflictFields, Integer currentVersion) {
+        this(status, message, conflictFields, currentVersion, null, null);
+    }
+
+    private ApiException(HttpStatus status, String message, List<String> conflictFields, Integer currentVersion,
+                         String actualValue, String requiredValue) {
         super(message);
         this.status = status;
         this.conflictFields = conflictFields;
         this.currentVersion = currentVersion;
+        this.actualValue = actualValue;
+        this.requiredValue = requiredValue;
     }
 
     public HttpStatus status() {
@@ -30,6 +40,14 @@ public class ApiException extends RuntimeException {
 
     public Integer currentVersion() {
         return currentVersion;
+    }
+
+    public String actualValue() {
+        return actualValue;
+    }
+
+    public String requiredValue() {
+        return requiredValue;
     }
 
     /**
@@ -67,5 +85,13 @@ public class ApiException extends RuntimeException {
      */
     public static ApiException gone(String message) {
         return new ApiException(HttpStatus.GONE, message, null, null);
+    }
+
+    /**
+     * 422：经纬度范围、围栏边界或生效区间等语义校验失败，携带实际值与要求值（或差额说明）。
+     */
+    public static ApiException unprocessable(String message, String actualValue, String requiredValue) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, message, null, null,
+                actualValue, requiredValue);
     }
 }

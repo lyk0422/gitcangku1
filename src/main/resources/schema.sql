@@ -29,9 +29,9 @@ CREATE TABLE IF NOT EXISTS observation_version (
 CREATE TABLE IF NOT EXISTS request_log (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
     fingerprint VARCHAR(128) NOT NULL COMMENT '请求操作与参数的指纹，同键异参时判定 409',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：CREATE / MERGE / DELETE / RESOLVE',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：CREATE / MERGE / DELETE / RESOLVE / FENCE_CREATE / FENCE_UPDATE / SUBMIT_BATCH / ADJUDICATE',
     response_status INT NULL COMMENT '成功响应的 HTTP 状态码；提交过程中暂为 NULL',
-    response_body VARCHAR(4000) NULL COMMENT '成功响应体（JSON 原文），用于同键同参重放；提交过程中暂为 NULL',
+    response_body VARCHAR(16000) NULL COMMENT '成功响应体（JSON 原文），用于同键同参重放；提交过程中暂为 NULL',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '请求记录创建时间（服务器时区）',
     PRIMARY KEY (request_id)
 );
@@ -58,4 +58,69 @@ CREATE TABLE IF NOT EXISTS conflict_resolution (
     -- 不设置指向 observation_current 的外键：观测记录删除仅置墓碑（当前行保留），
     -- 且不可变解决历史必须在任何数据清理/归档场景下继续可查。
     UNIQUE (observation_id, request_id)
+);
+
+-- 站点矩形地理围栏表：每次创建/变更追加一行新版本（fence_version 从 1 开始单调递增），
+-- 历史版本永不修改；同站点各围栏当前版本的生效区间不得重叠（左闭右开，UTC）。
+CREATE TABLE IF NOT EXISTS geofence (
+    fence_id VARCHAR(64) NOT NULL COMMENT '围栏唯一标识',
+    fence_version INT NOT NULL COMMENT '围栏版本号，从 1 开始单调递增，不可变',
+    site_id VARCHAR(64) NOT NULL COMMENT '站点标识',
+    min_latitude DECIMAL(10,7) NOT NULL COMMENT '矩形围栏最小纬度（含边界），范围 [-90,90]',
+    max_latitude DECIMAL(10,7) NOT NULL COMMENT '矩形围栏最大纬度（含边界），范围 [-90,90]',
+    min_longitude DECIMAL(11,7) NOT NULL COMMENT '矩形围栏最小经度（含边界），范围 [-180,180]',
+    max_longitude DECIMAL(11,7) NOT NULL COMMENT '矩形围栏最大经度（含边界），范围 [-180,180]',
+    effective_from_utc TIMESTAMP NOT NULL COMMENT '生效起始时刻（UTC，区间左闭）',
+    effective_to_utc TIMESTAMP NOT NULL COMMENT '生效结束时刻（UTC，区间右开）',
+    operator VARCHAR(128) NOT NULL COMMENT '配置该版本的操作者标识',
+    request_id VARCHAR(128) NOT NULL COMMENT '产生该版本的请求标识',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '该版本落库时间（服务器时区）',
+    PRIMARY KEY (fence_id, fence_version)
+);
+
+-- 站点围栏写锁表：每站点一行，同站点围栏创建/变更先 SELECT ... FOR UPDATE 串行化，
+-- 保证并发下生效区间重叠校验与写入之间不被插入新围栏。
+CREATE TABLE IF NOT EXISTS geofence_site_lock (
+    site_id VARCHAR(64) NOT NULL COMMENT '站点标识（同站点围栏写操作的串行化锁行）',
+    PRIMARY KEY (site_id)
+);
+
+-- 离线观测提交表：批量提交的逐条证据。原始坐标、采集时刻、提交时刻、匹配结果不可变；
+-- 仅 status/merged_version 可经人工裁决推进（GEOFENCE_REJECTED -> MANUAL_ACCEPTED）。
+CREATE TABLE IF NOT EXISTS observation_submission (
+    submission_id VARCHAR(128) NOT NULL COMMENT '提交记录唯一标识',
+    batch_request_id VARCHAR(128) NOT NULL COMMENT '所属批量提交的请求标识（requestId）',
+    batch_seq INT NOT NULL COMMENT '批内顺序号，从 1 开始，保证历史排序稳定',
+    site_id VARCHAR(64) NOT NULL COMMENT '站点标识',
+    observation_id VARCHAR(64) NOT NULL COMMENT '目标观测记录标识',
+    base_version INT NOT NULL COMMENT '离线修改所基于的基线版本号',
+    location VARCHAR(512) NOT NULL COMMENT '观测地点候选完整值',
+    reading VARCHAR(64) NOT NULL COMMENT '观测读数候选完整值（十进制原文，最多三位小数）',
+    note VARCHAR(1024) NOT NULL COMMENT '观测备注候选完整值',
+    latitude DECIMAL(10,7) NOT NULL COMMENT '采集纬度，范围 [-90,90]',
+    longitude DECIMAL(11,7) NOT NULL COMMENT '采集经度，范围 [-180,180]',
+    collected_at_utc TIMESTAMP NOT NULL COMMENT '采集时刻（UTC），围栏匹配依据，不可变',
+    submitted_at_utc TIMESTAMP NOT NULL COMMENT '服务端接收提交时刻（UTC），不可变',
+    status VARCHAR(32) NOT NULL COMMENT '状态：ACCEPTED（围栏内自动合并）/ GEOFENCE_REJECTED（围栏外保留证据）/ MANUAL_ACCEPTED（人工裁决接受）',
+    match_result VARCHAR(16) NOT NULL COMMENT '围栏匹配结果：INSIDE / OUTSIDE / NO_FENCE，不可变',
+    matched_fence_id VARCHAR(64) NULL COMMENT '匹配到的围栏标识；NO_FENCE 时为 NULL',
+    matched_fence_version INT NULL COMMENT '匹配到的围栏版本；NO_FENCE 时为 NULL',
+    merged_version INT NULL COMMENT '自动或人工合并后的观测记录版本号；未合并（被拒）时为 NULL',
+    PRIMARY KEY (submission_id)
+);
+
+-- 人工裁决记录表：成功裁决后原子写入，不可变、永不更新或删除。
+CREATE TABLE IF NOT EXISTS submission_adjudication (
+    adjudication_id VARCHAR(128) NOT NULL COMMENT '人工裁决记录唯一标识',
+    submission_id VARCHAR(128) NOT NULL COMMENT '被裁决的提交记录标识',
+    request_id VARCHAR(128) NOT NULL COMMENT '生成该裁决的请求标识（requestId）',
+    decision VARCHAR(16) NOT NULL COMMENT '裁决结果：ACCEPT（接受被拒观测）',
+    reason VARCHAR(1024) NOT NULL COMMENT '人工裁决理由（必填，非空）',
+    operator VARCHAR(128) NOT NULL COMMENT '裁决操作者标识',
+    merged_version INT NOT NULL COMMENT '裁决接受后合并产生的观测记录版本号',
+    adjudicated_at_utc TIMESTAMP NOT NULL COMMENT '裁决完成时刻（UTC）',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录落库时间（服务器时区）',
+    PRIMARY KEY (adjudication_id),
+    -- 每条提交最多一次裁决；不设外键：不可变裁决历史在任何数据清理场景下继续可查。
+    UNIQUE (submission_id)
 );

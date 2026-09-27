@@ -22,7 +22,8 @@ public class ApiExceptionHandler {
     public ResponseEntity<ErrorResponse> handleApiException(ApiException ex) {
         HttpStatus status = ex.status();
         ErrorResponse body = new ErrorResponse(status.value(), status.getReasonPhrase(),
-                ex.getMessage(), ex.conflictFields(), ex.currentVersion());
+                ex.getMessage(), ex.conflictFields(), ex.currentVersion(),
+                ex.actualValue(), ex.requiredValue());
         return ResponseEntity.status(status).body(body);
     }
 
@@ -35,7 +36,7 @@ public class ApiExceptionHandler {
                 .map(ApiExceptionHandler::formatFieldError)
                 .collect(Collectors.joining("; "));
         ErrorResponse body = new ErrorResponse(HttpStatus.BAD_REQUEST.value(),
-                HttpStatus.BAD_REQUEST.getReasonPhrase(), message, null, null);
+                HttpStatus.BAD_REQUEST.getReasonPhrase(), message, null, null, null, null);
         return ResponseEntity.badRequest().body(body);
     }
 
