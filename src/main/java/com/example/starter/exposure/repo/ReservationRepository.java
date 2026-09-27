@@ -6,8 +6,6 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
 
-import java.sql.ResultSet;
-import java.sql.SQLException;
 import java.util.List;
 import java.util.Optional;
 
@@ -31,14 +29,16 @@ public class ReservationRepository {
             ReservationStatus.valueOf(rs.getString("status")),
             rs.getLong("created_at_utc"),
             rs.getLong("expires_at_utc"),
-            (Long) rs.getObject("terminal_at_utc"));
+            (Long) rs.getObject("terminal_at_utc"),
+            rs.getInt("window_version"),
+            rs.getInt("window_minutes"));
 
     private static final String COLUMNS =
             "reservation_id, campaign_id, visitor_id, utc_date, status, "
-                    + "created_at_utc, expires_at_utc, terminal_at_utc";
+                    + "created_at_utc, expires_at_utc, terminal_at_utc, window_version, window_minutes";
 
     public void insert(Reservation reservation) {
-        jdbc.update("INSERT INTO exposure_reservation (" + COLUMNS + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        jdbc.update("INSERT INTO exposure_reservation (" + COLUMNS + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 reservation.reservationId(),
                 reservation.campaignId(),
                 reservation.visitorId(),
@@ -46,7 +46,9 @@ public class ReservationRepository {
                 reservation.status().name(),
                 reservation.createdAtUtc(),
                 reservation.expiresAtUtc(),
-                reservation.terminalAtUtc());
+                reservation.terminalAtUtc(),
+                reservation.windowVersion(),
+                reservation.windowMinutes());
     }
 
     public Optional<Reservation> findById(String reservationId) {
