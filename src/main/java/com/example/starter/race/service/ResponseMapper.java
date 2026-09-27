@@ -2,6 +2,8 @@ package com.example.starter.race.service;
 
 import com.example.starter.race.api.CheckpointPassResponse;
 import com.example.starter.race.api.CheckpointTimingResponse;
+import com.example.starter.race.api.ExcludedTimingResponse;
+import com.example.starter.race.api.MedicalHoldResponse;
 import com.example.starter.race.api.PenaltyResponse;
 import com.example.starter.race.api.ResultEntryResponse;
 import com.example.starter.race.api.RunnerResponse;
@@ -12,6 +14,7 @@ import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
+import com.example.starter.race.persistence.MedicalHoldRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
 import com.example.starter.race.persistence.RunnerRow;
@@ -43,7 +46,24 @@ final class ResponseMapper {
     static CheckpointTimingResponse toTimingResponse(CheckpointTimingRow row) {
         return new CheckpointTimingResponse(
                 row.timingId(), row.bib(), row.checkpointCode(), row.position(),
-                row.elapsedMillis(), row.createdAt());
+                row.elapsedMillis(), row.holdStatus(), row.excludedByHoldId(), row.createdAt());
+    }
+
+    /** 医疗暂停记录转响应；已恢复时返回实际暂停时长（毫秒）。 */
+    static MedicalHoldResponse toMedicalHoldResponse(MedicalHoldRow row) {
+        Long durationMs = row.endMs() == null ? null : row.endMs() - row.startMs();
+        return new MedicalHoldResponse(
+                row.holdId(), row.raceId(), row.bib(), row.status(),
+                row.startMs(), row.endMs(), durationMs, row.reason(),
+                row.startedBy(), row.startedAt(),
+                row.resumedBy(), row.resumedAt(), row.fitnessNote());
+    }
+
+    /** 被排除分段计时转诊断视图；reason 为导致排除的医疗暂停原因。 */
+    static ExcludedTimingResponse toExcludedTimingResponse(CheckpointTimingRow row, String reason) {
+        return new ExcludedTimingResponse(
+                row.timingId(), row.bib(), row.checkpointCode(), row.position(),
+                row.elapsedMillis(), row.excludedByHoldId(), reason, row.createdAt());
     }
 
     static StandingResponse liveStanding(
@@ -81,7 +101,8 @@ final class ResponseMapper {
                 entry.totalTimeMs(),
                 entry.checkpointCount(),
                 entry.coveredCheckpointCount(),
-                entry.missingCheckpoints());
+                entry.missingCheckpoints(),
+                entry.excludedTimingCount());
     }
 
     static ResultEntryResponse toEntryResponse(SnapshotEntryRow entry) {
@@ -94,7 +115,8 @@ final class ResponseMapper {
                 entry.totalTimeMs(),
                 entry.checkpointCount(),
                 entry.coveredCheckpointCount(),
-                entry.missingCheckpoints());
+                entry.missingCheckpoints(),
+                entry.excludedTimingCount());
     }
 
     /**
@@ -117,7 +139,10 @@ final class ResponseMapper {
                             checkpoint.checkpointCode(),
                             checkpoint.position(),
                             timing == null ? null : timing.elapsedMillis(),
-                            timing == null ? null : timing.timingId());
+                            timing == null ? null : timing.timingId(),
+                            timing == null ? null : timing.holdStatus(),
+                            timing == null ? null : timing.excludedByHoldId(),
+                            null);
                 })
                 .toList();
         return new RunnerTimingResponse(
@@ -141,11 +166,14 @@ final class ResponseMapper {
                     SnapshotCheckpointRow detail = byCode.get(checkpoint.checkpointCode());
                     if (detail == null) {
                         return new CheckpointPassResponse(
-                                checkpoint.checkpointCode(), checkpoint.position(), null, null);
+                                checkpoint.checkpointCode(), checkpoint.position(),
+                                null, null, null, null, null);
                     }
                     return new CheckpointPassResponse(
                             detail.checkpointCode(), detail.position(),
-                            detail.elapsedMillis(), detail.timingId());
+                            detail.elapsedMillis(), detail.timingId(),
+                            detail.holdStatus(), detail.excludedByHoldId(),
+                            detail.exclusionReason());
                 })
                 .toList();
         return new RunnerTimingResponse(

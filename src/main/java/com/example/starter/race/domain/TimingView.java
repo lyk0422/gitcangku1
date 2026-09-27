@@ -19,4 +19,9 @@ public interface TimingView {
 
     /** 通过该检查点的累计耗时（毫秒，1~86400000）。 */
     long elapsedMillis();
+
+    /** 计时资格；默认 COUNTED（历史记录与纯逻辑测试视图无医疗暂停概念）。 */
+    default TimingHoldStatus holdStatus() {
+        return TimingHoldStatus.COUNTED;
+    }
 }

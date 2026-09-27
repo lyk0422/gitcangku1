@@ -113,6 +113,45 @@ public class RaceController {
         return raceService.getMissingCheckpoints(raceId);
     }
 
+    /** 登记医疗暂停。 */
+    @PostMapping("/{raceId}/runners/{bib}/medical-holds")
+    public ResponseEntity<Object> startMedicalHold(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody StartMedicalHoldRequest request) {
+        return toResponse(raceService.startMedicalHold(raceId, bib, request));
+    }
+
+    /** 恢复（确认适赛）：结束指定医疗暂停。 */
+    @PostMapping("/{raceId}/runners/{bib}/medical-holds/{holdId}/resume")
+    public ResponseEntity<Object> resumeMedicalHold(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @PathVariable String holdId,
+            @Valid @RequestBody ResumeMedicalHoldRequest request) {
+        return toResponse(raceService.resumeMedicalHold(raceId, bib, holdId, request));
+    }
+
+    /** 查询单个选手的医疗暂停历史。 */
+    @GetMapping("/{raceId}/runners/{bib}/medical-holds")
+    public MedicalHoldListResponse getRunnerMedicalHolds(
+            @PathVariable String raceId,
+            @PathVariable String bib) {
+        return raceService.getRunnerMedicalHolds(raceId, bib);
+    }
+
+    /** 查询赛事全部医疗暂停历史。 */
+    @GetMapping("/{raceId}/medical-holds")
+    public MedicalHoldListResponse getRaceMedicalHolds(@PathVariable String raceId) {
+        return raceService.getRaceMedicalHolds(raceId);
+    }
+
+    /** 查询赛事被医疗暂停排除的分段计时诊断视图。 */
+    @GetMapping("/{raceId}/excluded-timings")
+    public ExcludedTimingsResponse getExcludedTimings(@PathVariable String raceId) {
+        return raceService.getExcludedTimings(raceId);
+    }
+
     private ResponseEntity<Object> toResponse(ServiceResult result) {
         return ResponseEntity.status(result.status()).body(result.body());
     }

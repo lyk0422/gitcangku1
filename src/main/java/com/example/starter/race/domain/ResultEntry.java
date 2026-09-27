@@ -12,8 +12,9 @@ import java.util.List;
  * @param penaltyMs               全部未撤销加时处罚的合计毫秒数；无加时为 0
  * @param totalTimeMs             总耗时=原始完赛耗时+生效加时（毫秒）；未排名时为 null
  * @param checkpointCount         赛事配置的检查点总数；未配置检查点的赛事为 0
- * @param coveredCheckpointCount  该选手已有分段记录的检查点数量
+ * @param coveredCheckpointCount  该选手已有 COUNTED 分段记录的检查点数量
  * @param missingCheckpoints      该选手尚未通过的检查点代码，按检查点顺序排列；全部覆盖或无检查点时为空列表
+ * @param excludedTimingCount     被医疗暂停排除（MEDICAL_HOLD）的分段计时数量；无为 0
  */
 public record ResultEntry(
         String bib,
@@ -24,10 +25,11 @@ public record ResultEntry(
         Long totalTimeMs,
         int checkpointCount,
         int coveredCheckpointCount,
-        List<String> missingCheckpoints
+        List<String> missingCheckpoints,
+        int excludedTimingCount
 ) {
 
-    /** 未配置检查点赛事使用的兼容构造器：检查点计数均为 0、缺失列表为空。 */
+    /** 未配置检查点赛事使用的兼容构造器：检查点计数均为 0、缺失列表为空、无排除计时。 */
     public ResultEntry(
             String bib,
             Integer rank,
@@ -35,6 +37,6 @@ public record ResultEntry(
             Long finishTimeMs,
             long penaltyMs,
             Long totalTimeMs) {
-        this(bib, rank, status, finishTimeMs, penaltyMs, totalTimeMs, 0, 0, List.of());
+        this(bib, rank, status, finishTimeMs, penaltyMs, totalTimeMs, 0, 0, List.of(), 0);
     }
 }

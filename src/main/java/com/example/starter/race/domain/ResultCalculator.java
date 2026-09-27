@@ -21,7 +21,9 @@ import java.util.Set;
  *       MISSING_CHECKPOINT，不排名；全部覆盖后恢复加时与并列排名规则；
  *       未配置检查点的赛事沿用原排名规则；</li>
  *   <li>正常选手按总耗时升序，同耗时同名次，下一名次跳过并列人数（1、1、3）；</li>
- *   <li>并列者及未排名者内部均按参赛号字典序展示。</li>
+ *   <li>并列者及未排名者内部均按参赛号字典序展示；</li>
+ *   <li>MEDICAL_HOLD 分段（医疗暂停期间提交）不参与检查点覆盖统计，
+ *       仅计入条目的 excludedTimingCount，原始记录不删除。</li>
  * </ul>
  */
 public final class ResultCalculator {
@@ -61,7 +63,8 @@ public final class ResultCalculator {
                     new Aggregate(runner.bib(), runner.finishTimeMs(), orderedCheckpoints));
         }
 
-        // 仅统计属于已配置检查点的分段（数据库外键已保证，这里做防御性过滤）。
+        // 仅统计属于已配置检查点且资格为 COUNTED 的分段（数据库外键已保证归属，这里做防御性过滤）；
+        // MEDICAL_HOLD 分段保存为证据但不参与覆盖统计，单独计入排除数量。
         Set<String> configuredCodes = new HashSet<>();
         for (CheckpointView checkpoint : orderedCheckpoints) {
             configuredCodes.add(checkpoint.checkpointCode());
@@ -69,6 +72,10 @@ public final class ResultCalculator {
         for (TimingView timing : timings) {
             Aggregate aggregate = aggregates.get(timing.bib());
             if (aggregate == null || !configuredCodes.contains(timing.checkpointCode())) {
+                continue;
+            }
+            if (timing.holdStatus() == TimingHoldStatus.MEDICAL_HOLD) {
+                aggregate.excludedTimingCount++;
                 continue;
             }
             aggregate.coveredCodes.add(timing.checkpointCode());
@@ -160,6 +167,7 @@ public final class ResultCalculator {
         private final Set<String> coveredCodes = new HashSet<>();
         private long penaltyMs;
         private boolean disqualified;
+        private int excludedTimingCount;
         private EntryStatus status;
         private int rank;
         private long totalTimeMs;
@@ -190,7 +198,8 @@ public final class ResultCalculator {
                     status == EntryStatus.RANKED ? totalTimeMs : null,
                     checkpoints.size(),
                     coveredCodes.size(),
-                    missingCheckpoints());
+                    missingCheckpoints(),
+                    excludedTimingCount);
         }
     }
 }

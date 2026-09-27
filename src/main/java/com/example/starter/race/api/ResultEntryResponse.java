@@ -15,8 +15,9 @@ import java.util.List;
  * @param penaltyMs             生效加时合计毫秒数
  * @param totalTimeMs           总耗时毫秒；未排名为 null
  * @param checkpointCount       赛事检查点总数；未配置检查点为 0
- * @param coveredCheckpointCount 该选手已覆盖检查点数量
+ * @param coveredCheckpointCount 该选手已覆盖检查点数量（仅统计 COUNTED 分段）
  * @param missingCheckpoints    缺失检查点代码，按检查点顺序排列；无缺失为空列表
+ * @param excludedTimingCount   被医疗暂停排除（MEDICAL_HOLD）的分段计时数量；无为 0
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public record ResultEntryResponse(
@@ -28,6 +29,7 @@ public record ResultEntryResponse(
         Long totalTimeMs,
         int checkpointCount,
         int coveredCheckpointCount,
-        List<String> missingCheckpoints
+        List<String> missingCheckpoints,
+        int excludedTimingCount
 ) {
 }
