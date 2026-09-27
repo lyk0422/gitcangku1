@@ -46,6 +46,8 @@ public class EvidenceService {
     private final SealInspectionRepository inspectionRepository;
     private final LoanRecordRepository loanRepository;
     private final CommandLogRepository commandLogRepository;
+    private final ExamReservationRepository examReservationRepository;
+    private final ExamService examService;
     private final ObjectMapper objectMapper;
     private final EvidenceClock clock;
 
@@ -54,6 +56,8 @@ public class EvidenceService {
                            SealInspectionRepository inspectionRepository,
                            LoanRecordRepository loanRepository,
                            CommandLogRepository commandLogRepository,
+                           ExamReservationRepository examReservationRepository,
+                           ExamService examService,
                            ObjectMapper objectMapper,
                            EvidenceClock clock) {
         this.evidenceRepository = evidenceRepository;
@@ -61,6 +65,8 @@ public class EvidenceService {
         this.inspectionRepository = inspectionRepository;
         this.loanRepository = loanRepository;
         this.commandLogRepository = commandLogRepository;
+        this.examReservationRepository = examReservationRepository;
+        this.examService = examService;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -111,6 +117,10 @@ public class EvidenceService {
         if (evidence.status() == EvidenceStatus.BORROWED) {
             throw ApiException.conflict("借出期间禁止发起交接: " + evidenceKey);
         }
+        if (evidence.status() == EvidenceStatus.EXAMINATION) {
+            throw ApiException.conflict("检验期间禁止发起交接: " + evidenceKey);
+        }
+        requireNoActiveExamReservation(evidenceKey);
         LocalDateTime now = LocalDateTime.now();
         transferRepository.insert(evidenceKey, actorId, request.toCustodian(), now);
         evidenceRepository.updateStatus(evidenceKey, EvidenceStatus.TRANSFER_PENDING, now);
@@ -205,6 +215,10 @@ public class EvidenceService {
         if (evidence.status() == EvidenceStatus.BORROWED) {
             throw ApiException.conflict("借出期间禁止独立封条核验: " + evidenceKey);
         }
+        if (evidence.status() == EvidenceStatus.EXAMINATION) {
+            throw ApiException.conflict("检验期间禁止独立封条核验: " + evidenceKey);
+        }
+        requireNoActiveExamReservation(evidenceKey);
         LocalDateTime now = LocalDateTime.now();
         inspectionRepository.insert(evidenceKey, actorId, request.passed(), request.note(), now);
         if (!request.passed() && evidence.status() != EvidenceStatus.SEAL_BROKEN) {
@@ -247,6 +261,10 @@ public class EvidenceService {
         if (evidence.status() == EvidenceStatus.BORROWED) {
             throw ApiException.conflict("证物已存在未归还借出: " + evidenceKey);
         }
+        if (evidence.status() == EvidenceStatus.EXAMINATION) {
+            throw ApiException.conflict("检验期间禁止借出: " + evidenceKey);
+        }
+        requireNoActiveExamReservation(evidenceKey);
         LocalDateTime nowUtc = clock.nowUtc();
         if (!request.dueAt().isAfter(nowUtc)) {
             throw ApiException.badRequest("应还时刻须晚于服务端当前时刻");
@@ -336,7 +354,8 @@ public class EvidenceService {
     }
 
     /**
-     * 查询完整保管链：证物当前状态 + 全部交接记录 + 全部借出记录 + 全部核验记录。
+     * 查询完整保管链：证物当前状态 + 全部交接记录 + 全部借出记录 + 全部核验记录
+     * + 全部检验预约与检验事件（均按发生顺序，只追加）。
      */
     @Transactional(readOnly = true)
     public CustodyChainView custodyChain(String evidenceKey) {
@@ -348,7 +367,9 @@ public class EvidenceService {
                 .stream().map(this::toView).toList();
         List<InspectionView> inspections = inspectionRepository.findByEvidenceKey(evidenceKey)
                 .stream().map(this::toView).toList();
-        return new CustodyChainView(toView(evidence), transfers, loans, inspections);
+        return new CustodyChainView(toView(evidence), transfers, loans, inspections,
+                examService.listByEvidence(evidenceKey),
+                examService.listEventsByEvidence(evidenceKey));
     }
 
     private Evidence lockEvidence(String evidenceKey) {
@@ -365,6 +386,12 @@ public class EvidenceService {
     private void requireCustodian(Evidence evidence, String actorId) {
         if (!evidence.custodianId().equals(actorId)) {
             throw ApiException.conflict("操作人不是当前保管人: " + actorId);
+        }
+    }
+
+    private void requireNoActiveExamReservation(String evidenceKey) {
+        if (examReservationRepository.findActiveByEvidenceKey(evidenceKey).isPresent()) {
+            throw ApiException.conflict("证物存在进行中的检验预约: " + evidenceKey);
         }
     }
 
@@ -404,7 +431,7 @@ public class EvidenceService {
     private EvidenceView toView(Evidence evidence) {
         return new EvidenceView(evidence.evidenceKey(), evidence.caseKey(), evidence.category(),
                 evidence.sealNo(), evidence.custodianId(), evidence.status(),
-                evidence.createdAt(), evidence.updatedAt());
+                evidence.sealVersion(), evidence.createdAt(), evidence.updatedAt());
     }
 
     private TransferView toView(TransferRecord record) {

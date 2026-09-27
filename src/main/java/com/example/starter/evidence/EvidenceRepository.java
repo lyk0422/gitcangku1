@@ -26,14 +26,14 @@ public class EvidenceRepository {
     }
 
     /**
-     * 插入新证物，初始状态 SEALED，保管人为入库操作人。
+     * 插入新证物，初始状态 SEALED，封签版本 1，保管人为入库操作人。
      */
     public void insert(String evidenceKey, String caseKey, String category, String sealNo,
                        String custodianId, LocalDateTime now) {
         jdbc.update("""
                         INSERT INTO evidence
-                            (evidence_key, case_key, category, seal_no, custodian_id, status, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            (evidence_key, case_key, category, seal_no, custodian_id, status, seal_version, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
                         """,
                 evidenceKey, caseKey, category, sealNo, custodianId,
                 EvidenceStatus.SEALED.name(), now, now);
@@ -77,6 +77,16 @@ public class EvidenceRepository {
     }
 
     /**
+     * 检验完成时原子更新封签与状态：换上新封签编号、版本递增、回到 SEALED。
+     */
+    public void updateSealAndStatus(String evidenceKey, String newSealNo, int newSealVersion,
+                                    EvidenceStatus status, LocalDateTime now) {
+        jdbc.update(
+                "UPDATE evidence SET seal_no = ?, seal_version = ?, status = ?, updated_at = ? WHERE evidence_key = ?",
+                newSealNo, newSealVersion, status.name(), now, evidenceKey);
+    }
+
+    /**
      * 查询指定保管人当前可交接的证物（本人保管且状态 SEALED）。
      */
     public List<Evidence> findTransferable(String custodianId) {
@@ -96,6 +106,7 @@ public class EvidenceRepository {
                     rs.getString("seal_no"),
                     rs.getString("custodian_id"),
                     EvidenceStatus.valueOf(rs.getString("status")),
+                    rs.getInt("seal_version"),
                     rs.getObject("created_at", LocalDateTime.class),
                     rs.getObject("updated_at", LocalDateTime.class));
         }
