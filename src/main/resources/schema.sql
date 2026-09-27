@@ -65,10 +65,61 @@ CREATE TABLE IF NOT EXISTS command_log (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     command_key VARCHAR(64) NOT NULL COMMENT '幂等命令键，全局唯一',
     actor_id VARCHAR(64) NOT NULL COMMENT '发起操作人',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN/DISCLOSURE_PACKAGE_CREATE/DISCLOSURE_PACKAGE_UPDATE_ITEMS/DISCLOSURE_PACKAGE_DELIVER/DISCLOSURE_PACKAGE_REVOKE',
     request_hash VARCHAR(64) NOT NULL COMMENT '请求参数规范化后的 SHA-256，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行的 HTTP 状态码',
     response_body TEXT NOT NULL COMMENT '首次执行的响应体 JSON，重放时原样返回',
     created_at DATETIME(6) NOT NULL COMMENT '首次执行时间，Asia/Shanghai',
     CONSTRAINT uk_command_key UNIQUE (command_key)
+);
+
+-- 披露包案件锁：每个案件一行，建包/增删/交付/撤销前先 SELECT ... FOR UPDATE 取得案件锁，
+-- 使同一案件的包操作按事务提交顺序裁决版本号与最新版本状态。
+CREATE TABLE IF NOT EXISTS disclosure_case_lock (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    case_key VARCHAR(64) NOT NULL COMMENT '案件业务键，每个披露案件一行',
+    created_at DATETIME(6) NOT NULL COMMENT '锁行首次创建时间，Asia/Shanghai',
+    CONSTRAINT uk_disclosure_case_lock_key UNIQUE (case_key)
+);
+
+-- 披露包版本：版本行只追加不可变；同一案件版本号严格递增，增删证物生成新版本而非覆盖。
+-- 状态仅允许 GENERATED->DELIVERED 或 GENERATED->REVOKED；交付与撤销留痕字段一经写入不可再变。
+CREATE TABLE IF NOT EXISTS disclosure_package (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    case_key VARCHAR(64) NOT NULL COMMENT '所属案件键',
+    package_version INT NOT NULL COMMENT '案件内包版本号，从 1 开始严格递增；增删生成更高修订版本',
+    as_of_utc DATETIME(6) NOT NULL COMMENT '截至 UTC 时刻，证物封签/待核验/借出/保管链均按该时刻历史状态重放',
+    status VARCHAR(20) NOT NULL COMMENT '版本状态：GENERATED 未交付 / DELIVERED 已交付（终态不可撤销） / REVOKED 已撤销（终态）',
+    package_key VARCHAR(64) NOT NULL COMMENT '包指纹 SHA-256：案件+规范化证物集合+截至时刻+包版本+操作者，同键重放',
+    actor_id VARCHAR(64) NOT NULL COMMENT '生成该版本的操作人',
+    frozen_summary TEXT NOT NULL COMMENT '包级冻结摘要 JSON：逐件链版本/位置/封签结论，生成后不随后续迁移复核改写',
+    item_count INT NOT NULL COMMENT '版本内证物件数（规范化去重后）',
+    deliver_reason VARCHAR(512) NULL COMMENT '交付备注；NULL 表示未交付',
+    delivered_by VARCHAR(64) NULL COMMENT '交付操作人；NULL 表示未交付',
+    delivered_at DATETIME(6) NULL COMMENT '交付时间，Asia/Shanghai；NULL 表示未交付',
+    revoke_reason VARCHAR(512) NULL COMMENT '撤销原因，非空；NULL 表示未撤销',
+    revoked_by VARCHAR(64) NULL COMMENT '撤销操作人；NULL 表示未撤销',
+    revoked_at DATETIME(6) NULL COMMENT '撤销时间，Asia/Shanghai；NULL 表示未撤销',
+    created_at DATETIME(6) NOT NULL COMMENT '版本生成时间，Asia/Shanghai',
+    CONSTRAINT uk_disclosure_package_key UNIQUE (package_key),
+    CONSTRAINT uk_disclosure_package_version UNIQUE (case_key, package_version),
+    KEY idx_disclosure_package_case (case_key)
+);
+
+-- 披露包逐件固化条目：只追加不可变；链版本/位置/封签快照/逐件摘要在生成事务内冻结。
+-- 之后证物迁移、封条复核或新增保管链记录只影响证物当前状态，不回写这些快照。
+CREATE TABLE IF NOT EXISTS disclosure_package_item (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    package_id BIGINT NOT NULL COMMENT '所属披露包版本主键',
+    case_key VARCHAR(64) NOT NULL COMMENT '所属案件键',
+    package_version INT NOT NULL COMMENT '所属包版本号',
+    position INT NOT NULL COMMENT '规范化排序后的件次，从 0 开始',
+    evidence_key VARCHAR(64) NOT NULL COMMENT '证物业务键，必须属于该案件且重放通过',
+    chain_version INT NOT NULL COMMENT '截至时刻链版本：截至时刻前交接+借出+封条核验记录总条数',
+    custodian_at_as_of VARCHAR(64) NOT NULL COMMENT '截至时刻保管人（位置快照），UTC 时刻重放交接得到',
+    seal_snapshot_json TEXT NOT NULL COMMENT '截至时刻封签快照 JSON：封条编号/是否正常/最近核验结果与时间/核验条数',
+    item_summary_json TEXT NOT NULL COMMENT '逐件生成摘要 JSON：链版本、交接/借出/核验分类计数、待核验与借还状态',
+    created_at DATETIME(6) NOT NULL COMMENT '条目固化时间，Asia/Shanghai',
+    CONSTRAINT uk_disclosure_item UNIQUE (package_id, evidence_key),
+    KEY idx_disclosure_item_case (case_key, package_version)
 );
