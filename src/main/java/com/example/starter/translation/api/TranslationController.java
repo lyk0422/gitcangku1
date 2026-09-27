@@ -11,9 +11,11 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.nio.charset.StandardCharsets;
@@ -92,6 +94,32 @@ public class TranslationController {
                         documentId, segmentId, language, actorId, request))).toResponseEntity();
     }
 
+    /** 批量批准：审核人取 X-Actor-Id，任一项不满足时整次不改变批准状态。 */
+    @PostMapping("/{documentId}/approvals")
+    public ResponseEntity<String> batchApprove(@PathVariable long documentId,
+                                               @RequestHeader("X-Actor-Id") String actorId,
+                                               @Valid @RequestBody ApiDtos.BatchApproveRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/approvals";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(200, translationService.batchApprove(documentId, actorId, request)))
+                .toResponseEntity();
+    }
+
+    /** 撤回批准：撤回人取 X-Actor-Id；幂等写操作，删除当前有效批准。 */
+    @DeleteMapping("/{documentId}/segments/{segmentId}/translations/{language}/approve")
+    public ResponseEntity<String> withdrawApproval(@PathVariable long documentId,
+                                                   @PathVariable String segmentId,
+                                                   @PathVariable String language,
+                                                   @RequestHeader("X-Actor-Id") String actorId,
+                                                   @Valid @RequestBody ApiDtos.WithdrawApprovalRequest request) {
+        String operation = "DELETE /api/documents/" + documentId + "/segments/" + segmentId
+                + "/translations/" + language + "/approve";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(200,
+                        translationService.withdrawApproval(documentId, segmentId, language, actorId, request)))
+                .toResponseEntity();
+    }
+
     /** 发布：全部段落全部目标语言均有有效批准且术语校验通过时原子生成只读快照并递增发布版本。 */
     @PostMapping("/{documentId}/publish")
     public ResponseEntity<String> publish(@PathVariable long documentId,
@@ -108,6 +136,30 @@ public class TranslationController {
         String operation = "PUT /api/documents/" + documentId + "/terms";
         return writeExecutor.execute(request.requestId(), hash(operation, request),
                 () -> WriteResult.of(201, translationService.updateTerms(documentId, request))).toResponseEntity();
+    }
+
+    /** 查询文档明细：版本、段落占位符集合与各语言译文/批准状态；读取不改变状态。 */
+    @GetMapping("/{documentId}")
+    public ResponseEntity<ApiDtos.DocumentDetailResponse> getDocument(@PathVariable long documentId) {
+        return ResponseEntity.ok(translationService.getDocumentDetail(documentId));
+    }
+
+    /** 发布诊断：只读汇总发布阻塞原因，含实际值、要求值与差额，不改变状态。 */
+    @GetMapping("/{documentId}/diagnosis")
+    public ResponseEntity<ApiDtos.DiagnosisResponse> diagnose(@PathVariable long documentId) {
+        return ResponseEntity.ok(translationService.diagnose(documentId));
+    }
+
+    /**
+     * 查询操作历史：UTC 纪元毫秒区间左闭右开，from/to 均可缺省；
+     * 按发生时间、序号稳定升序，返回操作者、操作类型、指纹与结果明细。
+     */
+    @GetMapping("/{documentId}/history")
+    public ResponseEntity<ApiDtos.HistoryResponse> getHistory(
+            @PathVariable long documentId,
+            @RequestParam(name = "from", required = false) Long fromInclusive,
+            @RequestParam(name = "to", required = false) Long toExclusive) {
+        return ResponseEntity.ok(translationService.getHistory(documentId, fromInclusive, toExclusive));
     }
 
     /** 查询当前术语版本及完整规则集。 */

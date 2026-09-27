@@ -2,10 +2,13 @@ package com.example.starter.translation.repo;
 
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
+import com.example.starter.translation.domain.Rows.OperationLogRow;
 import com.example.starter.translation.domain.Rows.RequestLogRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
 import com.example.starter.translation.domain.Rows.TranslationRow;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.jdbc.support.GeneratedKeyHolder;
@@ -19,10 +22,14 @@ import java.util.Optional;
 
 /**
  * 多语种段落发布的数据访问层，基于 JdbcTemplate 与参数化 SQL。
- * 目标语言在 document 表中以逗号分隔存储，行记录中还原为列表。
+ * 目标语言在 document 表中以逗号分隔存储，行记录中还原为列表；
+ * 占位符集合在 segment 表中以规范排序的 JSON 数组字符串存储。
  */
 @Repository
 public class TranslationRepository {
+
+    private static final TypeReference<List<String>> STRING_LIST = new TypeReference<>() {
+    };
 
     private static final RowMapper<DocumentRow> DOCUMENT_MAPPER = (rs, n) -> new DocumentRow(
             rs.getLong("document_id"),
@@ -31,13 +38,46 @@ public class TranslationRepository {
             rs.getInt("published_version"),
             rs.getInt("term_version"));
 
-    private static final RowMapper<SegmentRow> SEGMENT_MAPPER = (rs, n) -> new SegmentRow(
-            rs.getString("segment_id"), rs.getString("source_text"), rs.getInt("source_version"));
+    private final JdbcTemplate jdbc;
+    private final ObjectMapper objectMapper;
 
-    private static final RowMapper<TranslationRow> TRANSLATION_MAPPER = (rs, n) -> new TranslationRow(
-            rs.getString("segment_id"), rs.getString("language"), rs.getString("content"),
-            rs.getString("author"), rs.getInt("source_version"), rs.getInt("translation_version"),
-            rs.getInt("term_version"));
+    public TranslationRepository(JdbcTemplate jdbc, ObjectMapper objectMapper) {
+        this.jdbc = jdbc;
+        this.objectMapper = objectMapper;
+    }
+
+    /** 占位符集合序列化为规范 JSON 数组字符串（调用方已去重排序）。 */
+    private String writePlaceholders(List<String> placeholders) {
+        try {
+            return objectMapper.writeValueAsString(placeholders);
+        } catch (Exception e) {
+            throw new IllegalStateException("占位符集合序列化失败", e);
+        }
+    }
+
+    /** 占位符 JSON 数组字符串还原为列表。 */
+    private List<String> readPlaceholders(String json) {
+        if (json == null || json.isBlank()) {
+            return List.of();
+        }
+        try {
+            return objectMapper.readValue(json, STRING_LIST);
+        } catch (Exception e) {
+            throw new IllegalStateException("占位符集合反序列化失败: " + json, e);
+        }
+    }
+
+    private RowMapper<SegmentRow> segmentMapper() {
+        return (rs, n) -> new SegmentRow(rs.getString("segment_id"), rs.getString("source_text"),
+                rs.getInt("source_version"), readPlaceholders(rs.getString("placeholders")));
+    }
+
+    private RowMapper<TranslationRow> translationMapper() {
+        return (rs, n) -> new TranslationRow(
+                rs.getString("segment_id"), rs.getString("language"), rs.getString("content"),
+                rs.getString("author"), rs.getInt("source_version"), rs.getInt("translation_version"),
+                rs.getInt("term_version"), rs.getString("status"));
+    }
 
     private static final RowMapper<ApprovalRow> APPROVAL_MAPPER = (rs, n) -> new ApprovalRow(
             rs.getString("segment_id"), rs.getString("language"), rs.getString("reviewer"),
@@ -45,12 +85,6 @@ public class TranslationRepository {
 
     private static final RowMapper<TermRuleRow> TERM_RULE_MAPPER = (rs, n) -> new TermRuleRow(
             rs.getString("source_term"), rs.getString("language"), rs.getString("required_translation"));
-
-    private final JdbcTemplate jdbc;
-
-    public TranslationRepository(JdbcTemplate jdbc) {
-        this.jdbc = jdbc;
-    }
 
     /** 插入文档并返回自增 ID，初始草稿版本 1、发布版本 0、术语版本 0。 */
     public long insertDocument(List<String> targetLanguages) {
@@ -100,61 +134,71 @@ public class TranslationRepository {
         jdbc.update("UPDATE document SET term_version = ? WHERE document_id = ?", termVersion, documentId);
     }
 
-    public void insertSegment(long documentId, String segmentId, String sourceText) {
-        jdbc.update("INSERT INTO segment (document_id, segment_id, source_text, source_version) VALUES (?, ?, ?, 1)",
-                documentId, segmentId, sourceText);
+    public void insertSegment(long documentId, String segmentId, String sourceText, List<String> placeholders) {
+        jdbc.update("INSERT INTO segment (document_id, segment_id, source_text, source_version, placeholders) "
+                        + "VALUES (?, ?, ?, 1, ?)",
+                documentId, segmentId, sourceText, writePlaceholders(placeholders));
     }
 
     public Optional<SegmentRow> findSegment(long documentId, String segmentId) {
         List<SegmentRow> rows = jdbc.query(
-                "SELECT segment_id, source_text, source_version FROM segment "
+                "SELECT segment_id, source_text, source_version, placeholders FROM segment "
                         + "WHERE document_id = ? AND segment_id = ?",
-                SEGMENT_MAPPER, documentId, segmentId);
+                segmentMapper(), documentId, segmentId);
         return rows.stream().findFirst();
     }
 
     public List<SegmentRow> listSegments(long documentId) {
         return jdbc.query(
-                "SELECT segment_id, source_text, source_version FROM segment "
+                "SELECT segment_id, source_text, source_version, placeholders FROM segment "
                         + "WHERE document_id = ? ORDER BY segment_id",
-                SEGMENT_MAPPER, documentId);
+                segmentMapper(), documentId);
     }
 
-    public void updateSegmentSource(long documentId, String segmentId, String sourceText, int sourceVersion) {
-        jdbc.update("UPDATE segment SET source_text = ?, source_version = ? "
+    public void updateSegmentSource(long documentId, String segmentId, String sourceText,
+                                    List<String> placeholders, int sourceVersion) {
+        jdbc.update("UPDATE segment SET source_text = ?, placeholders = ?, source_version = ? "
                         + "WHERE document_id = ? AND segment_id = ?",
-                sourceText, sourceVersion, documentId, segmentId);
+                sourceText, writePlaceholders(placeholders), sourceVersion, documentId, segmentId);
     }
 
     public Optional<TranslationRow> findTranslation(long documentId, String segmentId, String language) {
         List<TranslationRow> rows = jdbc.query(
-                "SELECT segment_id, language, content, author, source_version, translation_version, term_version "
-                        + "FROM translation WHERE document_id = ? AND segment_id = ? AND language = ?",
-                TRANSLATION_MAPPER, documentId, segmentId, language);
+                "SELECT segment_id, language, content, author, source_version, translation_version, "
+                        + "term_version, status FROM translation WHERE document_id = ? AND segment_id = ? AND language = ?",
+                translationMapper(), documentId, segmentId, language);
         return rows.stream().findFirst();
     }
 
     public List<TranslationRow> listTranslations(long documentId) {
         return jdbc.query(
-                "SELECT segment_id, language, content, author, source_version, translation_version, term_version "
-                        + "FROM translation WHERE document_id = ? ORDER BY segment_id, language",
-                TRANSLATION_MAPPER, documentId);
+                "SELECT segment_id, language, content, author, source_version, translation_version, "
+                        + "term_version, status FROM translation WHERE document_id = ? ORDER BY segment_id, language",
+                translationMapper(), documentId);
     }
 
-    /** 插入或覆盖译文（按主键段落+语言唯一）。 */
+    /** 插入或覆盖译文（按主键段落+语言唯一），覆盖时状态恢复为 ACTIVE。 */
     public void upsertTranslation(long documentId, TranslationRow row) {
         int updated = jdbc.update(
                 "UPDATE translation SET content = ?, author = ?, source_version = ?, translation_version = ?, "
-                        + "term_version = ?, updated_at = CURRENT_TIMESTAMP "
+                        + "term_version = ?, status = ?, updated_at = CURRENT_TIMESTAMP "
                         + "WHERE document_id = ? AND segment_id = ? AND language = ?",
                 row.content(), row.author(), row.sourceVersion(), row.translationVersion(), row.termVersion(),
-                documentId, row.segmentId(), row.language());
+                row.status(), documentId, row.segmentId(), row.language());
         if (updated == 0) {
             jdbc.update("INSERT INTO translation (document_id, segment_id, language, content, author, "
-                            + "source_version, translation_version, term_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            + "source_version, translation_version, term_version, status) "
+                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     documentId, row.segmentId(), row.language(), row.content(), row.author(),
-                    row.sourceVersion(), row.translationVersion(), row.termVersion());
+                    row.sourceVersion(), row.translationVersion(), row.termVersion(), row.status());
         }
+    }
+
+    /** 源段修订时把该段全部目标译文置为待修订，旧译文不再允许发布。 */
+    public int markTranslationsNeedsRevision(long documentId, String segmentId) {
+        return jdbc.update(
+                "UPDATE translation SET status = ? WHERE document_id = ? AND segment_id = ? AND status <> ?",
+                TranslationRow.NEEDS_REVISION, documentId, segmentId, TranslationRow.NEEDS_REVISION);
     }
 
     public Optional<ApprovalRow> findApproval(long documentId, String segmentId, String language) {
@@ -186,6 +230,68 @@ public class TranslationRepository {
                     documentId, row.segmentId(), row.language(), row.reviewer(),
                     row.sourceVersion(), row.translationVersion());
         }
+    }
+
+    /** 删除批准（撤回），返回受影响行数；0 表示原本无批准。 */
+    public int deleteApproval(long documentId, String segmentId, String language) {
+        return jdbc.update("DELETE FROM approval WHERE document_id = ? AND segment_id = ? AND language = ?",
+                documentId, segmentId, language);
+    }
+
+    /** 追加一条操作历史证据；只允许 INSERT，任何代码路径都不得 UPDATE/DELETE。 */
+    public long insertOperationLog(OperationLogRow row) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO operation_log (document_id, operation_type, actor, segment_id, language, "
+                            + "request_id, occurred_at, fingerprint, detail_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    new String[]{"seq"});
+            ps.setLong(1, row.documentId());
+            ps.setString(2, row.operationType());
+            ps.setString(3, row.actor());
+            ps.setString(4, row.segmentId());
+            ps.setString(5, row.language());
+            ps.setString(6, row.requestId());
+            ps.setLong(7, row.occurredAt());
+            ps.setString(8, row.fingerprint());
+            ps.setString(9, row.detailJson());
+            return ps;
+        }, keyHolder);
+        Number key = keyHolder.getKey();
+        if (key == null) {
+            throw new IllegalStateException("操作历史写入后未返回自增序号");
+        }
+        return key.longValue();
+    }
+
+    /**
+     * 按 UTC 毫秒区间查询操作历史，区间左闭右开（occurred_at &gt;= from 且 occurred_at &lt; to）；
+     * 同一文档内按发生时间、序号稳定升序。
+     */
+    public List<OperationLogRow> listOperationLogs(long documentId, long fromInclusive, long toExclusive) {
+        return jdbc.query(
+                "SELECT seq, document_id, operation_type, actor, segment_id, language, request_id, "
+                        + "occurred_at, fingerprint, detail_json FROM operation_log "
+                        + "WHERE document_id = ? AND occurred_at >= ? AND occurred_at < ? "
+                        + "ORDER BY occurred_at, seq",
+                (rs, n) -> new OperationLogRow(rs.getLong("seq"), rs.getLong("document_id"),
+                        rs.getString("operation_type"), rs.getString("actor"), rs.getString("segment_id"),
+                        rs.getString("language"), rs.getString("request_id"), rs.getLong("occurred_at"),
+                        rs.getString("fingerprint"), rs.getString("detail_json")),
+                documentId, fromInclusive, toExclusive);
+    }
+
+    /** 查询文档全部操作历史，按发生时间、序号稳定升序。 */
+    public List<OperationLogRow> listOperationLogs(long documentId) {
+        return jdbc.query(
+                "SELECT seq, document_id, operation_type, actor, segment_id, language, request_id, "
+                        + "occurred_at, fingerprint, detail_json FROM operation_log "
+                        + "WHERE document_id = ? ORDER BY occurred_at, seq",
+                (rs, n) -> new OperationLogRow(rs.getLong("seq"), rs.getLong("document_id"),
+                        rs.getString("operation_type"), rs.getString("actor"), rs.getString("segment_id"),
+                        rs.getString("language"), rs.getString("request_id"), rs.getLong("occurred_at"),
+                        rs.getString("fingerprint"), rs.getString("detail_json")),
+                documentId);
     }
 
     public void insertSnapshot(long documentId, int publishedVersion, String snapshotJson) {

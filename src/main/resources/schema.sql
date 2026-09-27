@@ -22,13 +22,15 @@ CREATE TABLE IF NOT EXISTS segment (
     segment_id VARCHAR(64) NOT NULL,
     source_text LONGTEXT NOT NULL,
     source_version INT NOT NULL,
+    placeholders VARCHAR(4000) NOT NULL DEFAULT '[]',
     PRIMARY KEY (document_id, segment_id)
 );
-COMMENT ON TABLE segment IS '段落：文档内唯一 segmentId，含源文及源文版本';
+COMMENT ON TABLE segment IS '段落：文档内唯一 segmentId，含源文、源文版本与版式占位符集合';
 COMMENT ON COLUMN segment.document_id IS '所属文档 ID';
 COMMENT ON COLUMN segment.segment_id IS '文档内唯一段落 ID';
 COMMENT ON COLUMN segment.source_text IS '源文正文，UTF-8';
-COMMENT ON COLUMN segment.source_version IS '源文版本，从 1 开始，每次源文修订加一';
+COMMENT ON COLUMN segment.source_version IS '源文版本，从 1 开始；修订正文或占位符集合均加一';
+COMMENT ON COLUMN segment.placeholders IS '源段声明的规范排序占位符集合，JSON 数组字符串（无占位符为 []）；译文须保留完全相同的占位符及出现次数';
 
 CREATE TABLE IF NOT EXISTS translation (
     document_id BIGINT NOT NULL,
@@ -39,10 +41,11 @@ CREATE TABLE IF NOT EXISTS translation (
     source_version INT NOT NULL,
     translation_version INT NOT NULL,
     term_version INT NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (document_id, segment_id, language)
 );
-COMMENT ON TABLE translation IS '译文：按段落与语言唯一，保存正文、作者、所依据源文版本、绑定术语版本及递增译文版本';
+COMMENT ON TABLE translation IS '译文：按段落与语言唯一，保存正文、作者、所依据源文版本、绑定术语版本、递增译文版本及修订状态';
 COMMENT ON COLUMN translation.document_id IS '所属文档 ID';
 COMMENT ON COLUMN translation.segment_id IS '所属段落 ID';
 COMMENT ON COLUMN translation.language IS '目标语言码，小写';
@@ -51,6 +54,7 @@ COMMENT ON COLUMN translation.author IS '译文作者，取提交时 X-Actor-Id'
 COMMENT ON COLUMN translation.source_version IS '译文所依据的源文版本；提交时必须等于当前源文版本';
 COMMENT ON COLUMN translation.translation_version IS '译文版本，从 1 开始，每次重新提交加一';
 COMMENT ON COLUMN translation.term_version IS '译文提交时绑定的术语版本；不等于当前术语版本时视为术语过期';
+COMMENT ON COLUMN translation.status IS '修订状态：ACTIVE=可进入批准/发布流程，NEEDS_REVISION=源段已修订（正文或占位符集合变化）须重新提交；源段每次修订时该段全部译文置为 NEEDS_REVISION，重新提交后恢复 ACTIVE';
 COMMENT ON COLUMN translation.updated_at IS '最近提交时间，数据库默认时区';
 
 CREATE TABLE IF NOT EXISTS approval (
@@ -124,3 +128,29 @@ COMMENT ON COLUMN request_log.request_hash IS '请求参数规范化后的 SHA-2
 COMMENT ON COLUMN request_log.response_status IS '原成功响应的 HTTP 状态码，用于重放';
 COMMENT ON COLUMN request_log.response_body IS '原成功响应体 JSON，用于重放';
 COMMENT ON COLUMN request_log.created_at IS '记录时间，数据库默认时区';
+
+-- 只追加的操作历史证据：任何后续操作都不得 UPDATE/DELETE 本表记录。
+CREATE TABLE IF NOT EXISTS operation_log (
+    seq BIGINT AUTO_INCREMENT PRIMARY KEY,
+    document_id BIGINT NOT NULL,
+    operation_type VARCHAR(40) NOT NULL,
+    actor VARCHAR(128),
+    segment_id VARCHAR(64),
+    language VARCHAR(16),
+    request_id VARCHAR(128) NOT NULL,
+    occurred_at BIGINT NOT NULL,
+    fingerprint CHAR(64) NOT NULL,
+    detail_json LONGTEXT NOT NULL
+);
+COMMENT ON TABLE operation_log IS '操作历史：只追加证据表，记录操作者、操作类型、UTC 毫秒时间与结果指纹，任何后续操作不得覆盖或删除';
+COMMENT ON COLUMN operation_log.seq IS '全局单调递增序号，与 occurred_at 共同保证稳定排序';
+COMMENT ON COLUMN operation_log.document_id IS '所属文档 ID';
+COMMENT ON COLUMN operation_log.operation_type IS '操作类型：DOCUMENT_CREATED/SEGMENT_ADDED/SOURCE_REVISED/TRANSLATION_SUBMITTED/TRANSLATION_APPROVED/TRANSLATION_APPROVAL_WITHDRAWN/TRANSLATIONS_BATCH_APPROVED/PUBLISHED/TERMS_UPDATED';
+COMMENT ON COLUMN operation_log.actor IS '操作者 X-Actor-Id；文档级无操作者操作（建文档、发布、术语更新）为 NULL';
+COMMENT ON COLUMN operation_log.segment_id IS '关联段落 ID；文档级操作为 NULL';
+COMMENT ON COLUMN operation_log.language IS '关联目标语言码；文档级或跨语言操作为 NULL';
+COMMENT ON COLUMN operation_log.request_id IS '写操作携带的幂等 requestId；重放不产生新记录';
+COMMENT ON COLUMN operation_log.occurred_at IS '操作发生时间，UTC 纪元毫秒；历史查询区间左闭右开（>=from 且 <to）';
+COMMENT ON COLUMN operation_log.fingerprint IS 'SHA-256 指纹十六进制，覆盖操作者、操作类型、规范化 JSON 集合与全部结果相关字段';
+COMMENT ON COLUMN operation_log.detail_json IS '结果相关字段的规范化 JSON 明细；集合以 JSON 数组编码，null 字段显式保留表示无关联值';
+CREATE INDEX IF NOT EXISTS idx_operation_log_doc_time ON operation_log (document_id, occurred_at, seq);

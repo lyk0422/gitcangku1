@@ -35,6 +35,7 @@ public abstract class AbstractIntegrationTest {
 
     @BeforeEach
     void cleanTables() {
+        jdbc.update("DELETE FROM operation_log");
         jdbc.update("DELETE FROM approval");
         jdbc.update("DELETE FROM translation");
         jdbc.update("DELETE FROM segment");
@@ -64,6 +65,11 @@ public abstract class AbstractIntegrationTest {
 
     protected ApiResult putJson(String url, String body, String actorId) throws Exception {
         return perform(MockMvcRequestBuilders.put(url), body, actorId);
+    }
+
+    protected ApiResult deleteJson(String url, String body, String actorId) throws Exception {
+        return perform(MockMvcRequestBuilders.request(org.springframework.http.HttpMethod.DELETE, url), body,
+                actorId);
     }
 
     protected ApiResult getJson(String url) throws Exception {

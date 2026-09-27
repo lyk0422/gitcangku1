@@ -24,17 +24,19 @@ public final class Rows {
     }
 
     /**
-     * 段落：文档内唯一 segmentId，含源文及源文版本。
+     * 段落：文档内唯一 segmentId，含源文、源文版本及规范排序的版式占位符集合。
      *
      * @param segmentId     文档内唯一段落 ID
      * @param sourceText    源文正文，UTF-8
-     * @param sourceVersion 源文版本，从 1 开始，每次源文修订加一
+     * @param sourceVersion 源文版本，从 1 开始；修订正文或占位符集合均加一
+     * @param placeholders  源段声明的占位符集合，去重后按字典序排序；译文须保留完全相同的集合及出现次数
      */
-    public record SegmentRow(String segmentId, String sourceText, int sourceVersion) {
+    public record SegmentRow(String segmentId, String sourceText, int sourceVersion,
+                             List<String> placeholders) {
     }
 
     /**
-     * 译文：按段落与语言唯一，保存正文、作者、所依据源文版本、绑定术语版本及递增译文版本。
+     * 译文：按段落与语言唯一，保存正文、作者、所依据源文版本、绑定术语版本、递增译文版本及修订状态。
      *
      * @param segmentId          所属段落 ID
      * @param language           目标语言码，小写
@@ -43,9 +45,17 @@ public final class Rows {
      * @param sourceVersion      译文所依据的源文版本；提交时必须等于当前源文版本
      * @param translationVersion 译文版本，从 1 开始，每次重新提交加一
      * @param termVersion        译文提交时绑定的术语版本；不等于当前术语版本时视为术语过期
+     * @param status             修订状态：ACTIVE=可批准/发布；NEEDS_REVISION=源段已修订须重新提交
      */
     public record TranslationRow(String segmentId, String language, String content, String author,
-                                 int sourceVersion, int translationVersion, int termVersion) {
+                                 int sourceVersion, int translationVersion, int termVersion,
+                                 String status) {
+
+        /** 源段未发生修订：可进入批准与发布流程。 */
+        public static final String ACTIVE = "ACTIVE";
+
+        /** 源段正文或占位符集合已修订：旧译文禁止发布，须重新提交。 */
+        public static final String NEEDS_REVISION = "NEEDS_REVISION";
     }
 
     /**
@@ -81,5 +91,24 @@ public final class Rows {
      */
     public record RequestLogRow(String requestId, String requestHash,
                                 int responseStatus, String responseBody) {
+    }
+
+    /**
+     * 操作历史证据：只追加，任何后续操作不得更新或删除。
+     *
+     * @param seq           全局单调递增序号，与 occurredAt 共同保证稳定排序
+     * @param documentId    所属文档 ID
+     * @param operationType 操作类型（SOURCE_REVISED、TRANSLATION_SUBMITTED 等）
+     * @param actor         操作者 X-Actor-Id；文档级无操作者操作为 null
+     * @param segmentId     关联段落 ID；文档级操作为 null
+     * @param language      关联目标语言码；文档级或跨语言操作为 null
+     * @param requestId     写操作的幂等 requestId
+     * @param occurredAt    操作发生时间，UTC 纪元毫秒
+     * @param fingerprint   SHA-256 指纹，覆盖操作者、操作类型、规范化集合与全部结果字段
+     * @param detailJson    结果相关字段的规范化 JSON 明细
+     */
+    public record OperationLogRow(long seq, long documentId, String operationType, String actor,
+                                  String segmentId, String language, String requestId, long occurredAt,
+                                  String fingerprint, String detailJson) {
     }
 }
