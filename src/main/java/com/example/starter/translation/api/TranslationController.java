@@ -79,7 +79,7 @@ public class TranslationController {
                         documentId, segmentId, language, actorId, request))).toResponseEntity();
     }
 
-    /** 译文批准：审核人取 X-Actor-Id，不得是作者，须同时匹配当前源文与译文版本。 */
+    /** 译文批准：审核人取 X-Actor-Id，不得是作者，须同时匹配当前源文与译文版本且未命中有效利益冲突。 */
     @PostMapping("/{documentId}/segments/{segmentId}/translations/{language}/approve")
     public ResponseEntity<String> approveTranslation(@PathVariable long documentId, @PathVariable String segmentId,
                                                      @PathVariable String language,
@@ -89,6 +89,19 @@ public class TranslationController {
                 + "/translations/" + language + "/approve";
         return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
                 () -> WriteResult.of(200, translationService.approveTranslation(
+                        documentId, segmentId, language, actorId, request))).toResponseEntity();
+    }
+
+    /** 译文否决：校验同批准，决定记为 REJECTED，否决不计入发布法定人数。 */
+    @PostMapping("/{documentId}/segments/{segmentId}/translations/{language}/reject")
+    public ResponseEntity<String> rejectTranslation(@PathVariable long documentId, @PathVariable String segmentId,
+                                                    @PathVariable String language,
+                                                    @RequestHeader("X-Actor-Id") String actorId,
+                                                    @Valid @RequestBody ApiDtos.RejectTranslationRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/segments/" + segmentId
+                + "/translations/" + language + "/reject";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(200, translationService.rejectTranslation(
                         documentId, segmentId, language, actorId, request))).toResponseEntity();
     }
 

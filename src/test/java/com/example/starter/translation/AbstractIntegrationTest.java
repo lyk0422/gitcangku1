@@ -2,6 +2,7 @@ package com.example.starter.translation;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
@@ -13,6 +14,9 @@ import org.springframework.test.web.servlet.MvcResult;
 import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
 import org.springframework.test.web.servlet.request.MockMvcRequestBuilders;
 
+import com.example.starter.translation.service.TimeProvider;
+
+import java.time.Clock;
 import java.util.UUID;
 
 /**
@@ -33,8 +37,19 @@ public abstract class AbstractIntegrationTest {
     @Autowired
     protected ObjectMapper objectMapper;
 
+    @Autowired
+    protected TimeProvider timeProvider;
+
+    @AfterEach
+    void resetClock() {
+        timeProvider.setClock(Clock.systemUTC());
+    }
+
     @BeforeEach
     void cleanTables() {
+        jdbc.update("DELETE FROM review_history");
+        jdbc.update("DELETE FROM conflict_event");
+        jdbc.update("DELETE FROM conflict_declaration");
         jdbc.update("DELETE FROM approval");
         jdbc.update("DELETE FROM translation");
         jdbc.update("DELETE FROM segment");
@@ -51,19 +66,23 @@ public abstract class AbstractIntegrationTest {
 
     /** POST JSON，返回响应状态与解析后的响应体。 */
     protected ApiResult postJson(String url, String body) throws Exception {
-        return perform(MockMvcRequestBuilders.post(url), body, null);
+        return perform(MockMvcRequestBuilders.post(url), body, null, null);
     }
 
     protected ApiResult postJson(String url, String body, String actorId) throws Exception {
-        return perform(MockMvcRequestBuilders.post(url), body, actorId);
+        return perform(MockMvcRequestBuilders.post(url), body, actorId, null);
+    }
+
+    protected ApiResult postJson(String url, String body, String actorId, String actorRole) throws Exception {
+        return perform(MockMvcRequestBuilders.post(url), body, actorId, actorRole);
     }
 
     protected ApiResult putJson(String url, String body) throws Exception {
-        return perform(MockMvcRequestBuilders.put(url), body, null);
+        return perform(MockMvcRequestBuilders.put(url), body, null, null);
     }
 
     protected ApiResult putJson(String url, String body, String actorId) throws Exception {
-        return perform(MockMvcRequestBuilders.put(url), body, actorId);
+        return perform(MockMvcRequestBuilders.put(url), body, actorId, null);
     }
 
     protected ApiResult getJson(String url) throws Exception {
@@ -71,11 +90,14 @@ public abstract class AbstractIntegrationTest {
         return toApiResult(result);
     }
 
-    private ApiResult perform(MockHttpServletRequestBuilder builder, String body, String actorId)
-            throws Exception {
+    private ApiResult perform(MockHttpServletRequestBuilder builder, String body, String actorId,
+                              String actorRole) throws Exception {
         builder.contentType("application/json").content(body);
         if (actorId != null) {
             builder.header("X-Actor-Id", actorId);
+        }
+        if (actorRole != null) {
+            builder.header("X-Actor-Role", actorRole);
         }
         MvcResult result = mockMvc.perform(builder).andReturn();
         return toApiResult(result);
@@ -113,6 +135,38 @@ public abstract class AbstractIntegrationTest {
         String body = "{\"requestId\":\"" + requestId + "\",\"translationVersion\":" + translationVersion + "}";
         return postJson("/api/documents/" + documentId + "/segments/" + segmentId + "/translations/" + language
                 + "/approve", body, actorId);
+    }
+
+    protected ApiResult reject(long documentId, String segmentId, String language, String actorId,
+                               int translationVersion, String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"translationVersion\":" + translationVersion + "}";
+        return postJson("/api/documents/" + documentId + "/segments/" + segmentId + "/translations/" + language
+                + "/reject", body, actorId);
+    }
+
+    /** 单条登记利益冲突；区间为 UTC ISO-8601，左闭右开。 */
+    protected ApiResult declareConflict(long documentId, String actorId, String language,
+                                        String validFrom, String validTo, String reason,
+                                        String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"language\":\"" + language
+                + "\",\"validFrom\":\"" + validFrom + "\",\"validTo\":\"" + validTo
+                + "\",\"reason\":\"" + reason + "\"}";
+        return postJson("/api/documents/" + documentId + "/conflicts", body, actorId);
+    }
+
+    /** 批量登记利益冲突；rangesJson 为区间数组 JSON。 */
+    protected ApiResult batchDeclareConflict(long documentId, String actorId, String rangesJson,
+                                             String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"declarations\":" + rangesJson + "}";
+        return postJson("/api/documents/" + documentId + "/conflicts/batch", body, actorId);
+    }
+
+    /** 解除冲突：须由不同于声明人的 COMPLIANCE 角色确认。 */
+    protected ApiResult releaseConflict(long documentId, long declarationId, String actorId, String actorRole,
+                                        String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\"}";
+        return postJson("/api/documents/" + documentId + "/conflicts/" + declarationId + "/release",
+                body, actorId, actorRole);
     }
 
     protected ApiResult publish(long documentId, int expectedDraftVersion, int expectedPublishedVersion,

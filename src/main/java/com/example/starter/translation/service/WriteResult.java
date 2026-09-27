@@ -1,6 +1,8 @@
 package com.example.starter.translation.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 
@@ -9,7 +11,13 @@ import org.springframework.http.ResponseEntity;
  */
 public record WriteResult(int status, String body) {
 
-    private static final ObjectMapper MAPPER = new ObjectMapper();
+    /**
+     * 独立于 Web 层的序列化器：注册 JSR-310 以输出 UTC ISO-8601 时间（Instant），
+     * 关闭时间戳数组写法，保证 request_log 重放快照与接口响应字段格式一致。
+     */
+    private static final ObjectMapper MAPPER = new ObjectMapper()
+            .registerModule(new JavaTimeModule())
+            .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
 
     /** 以给定状态码序列化响应体。 */
     public static WriteResult of(int status, Object body) {
