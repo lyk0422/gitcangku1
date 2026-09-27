@@ -186,11 +186,113 @@ public class RepositoryDao {
         return key.longValue();
     }
 
-    /** 新增锁文件精确版本条目。 */
-    public void insertLockEntry(long lockFileId, String name, int version) {
+    /** 新增锁文件精确版本条目，固化锁定时刻的摘要与见证人。 */
+    public void insertLockEntry(long lockFileId, String name, int version,
+                                String checksumAlgorithm, String checksumDigest,
+                                String attesters, int attestationCount) {
         jdbcTemplate.update(
-                "INSERT INTO lock_file_entry (lock_file_id, name, version) VALUES (?, ?, ?)",
-                lockFileId, name, version);
+                "INSERT INTO lock_file_entry (lock_file_id, name, version, checksum_algorithm, "
+                        + "checksum_digest, attesters, attestation_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                lockFileId, name, version, checksumAlgorithm, checksumDigest,
+                attesters, attestationCount);
+    }
+
+    // ------------------------------------------------------------------
+    // 校验摘要与见证
+    // ------------------------------------------------------------------
+
+    /** 摘要记录视图。 */
+    public record ChecksumRow(String algorithm, String digest, String registeredBy,
+                              Instant createdAt) {
+    }
+
+    /** 见证记录视图。 */
+    public record AttestationRow(String operator, String digest, boolean revoked,
+                                 Instant createdAt, Instant revokedAt) {
+    }
+
+    /** 为制品版本登记内容校验摘要（每版本仅一条，主键冲突抛 DuplicateKeyException）。 */
+    public void insertChecksum(long artifactId, String algorithm, String digest,
+                               String registeredBy, Instant createdAt) {
+        jdbcTemplate.update(
+                "INSERT INTO artifact_checksum (artifact_id, algorithm, digest, registered_by, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?)",
+                artifactId, algorithm, digest, registeredBy, Timestamp.from(createdAt));
+    }
+
+    /** 读取制品版本的摘要记录，未登记返回 null。 */
+    public ChecksumRow loadChecksum(long artifactId) {
+        List<ChecksumRow> rows = jdbcTemplate.query(
+                "SELECT algorithm, digest, registered_by, created_at FROM artifact_checksum "
+                        + "WHERE artifact_id = ?",
+                (rs, n) -> new ChecksumRow(rs.getString("algorithm"), rs.getString("digest"),
+                        rs.getString("registered_by"), rs.getTimestamp("created_at").toInstant()),
+                artifactId);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /** 新增一条有效见证。 */
+    public void insertAttestation(long artifactId, String operator, String digest, Instant createdAt) {
+        jdbcTemplate.update(
+                "INSERT INTO artifact_attestation (artifact_id, operator, digest, revoked, created_at, "
+                        + "revoked_at) VALUES (?, ?, ?, 0, ?, NULL)",
+                artifactId, operator, digest, Timestamp.from(createdAt));
+    }
+
+    /** 读取指定操作者对某版本的见证记录，不存在返回 null。 */
+    public AttestationRow loadAttestation(long artifactId, String operator) {
+        List<AttestationRow> rows = jdbcTemplate.query(
+                "SELECT operator, digest, revoked, created_at, revoked_at FROM artifact_attestation "
+                        + "WHERE artifact_id = ? AND operator = ?",
+                (rs, n) -> mapAttestation(rs), artifactId, operator);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /** 读取某版本全部见证记录（含已撤销），按操作者字典序升序。 */
+    public List<AttestationRow> listAttestations(long artifactId) {
+        return jdbcTemplate.query(
+                "SELECT operator, digest, revoked, created_at, revoked_at FROM artifact_attestation "
+                        + "WHERE artifact_id = ? ORDER BY operator ASC",
+                (rs, n) -> mapAttestation(rs), artifactId);
+    }
+
+    /** 某版本当前有效（未撤销）见证人数。 */
+    public int countActiveAttestations(long artifactId) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM artifact_attestation WHERE artifact_id = ? AND revoked = 0",
+                Integer.class, artifactId);
+        return count == null ? 0 : count;
+    }
+
+    /** 某版本当前有效见证人列表，按字典序升序。 */
+    public List<String> listActiveAttesters(long artifactId) {
+        return jdbcTemplate.query(
+                "SELECT operator FROM artifact_attestation WHERE artifact_id = ? AND revoked = 0 "
+                        + "ORDER BY operator ASC",
+                (rs, n) -> rs.getString("operator"), artifactId);
+    }
+
+    /** 撤销指定操作者的有效见证，返回受影响行数（0 表示无有效见证可撤）。 */
+    public int revokeAttestation(long artifactId, String operator, Instant revokedAt) {
+        return jdbcTemplate.update(
+                "UPDATE artifact_attestation SET revoked = 1, revoked_at = ? "
+                        + "WHERE artifact_id = ? AND operator = ? AND revoked = 0",
+                Timestamp.from(revokedAt), artifactId, operator);
+    }
+
+    /** 重新激活已撤销的见证（同一操作者撤销后再次见证），更新摘要与时间。 */
+    public void reactivateAttestation(long artifactId, String operator, String digest, Instant createdAt) {
+        jdbcTemplate.update(
+                "UPDATE artifact_attestation SET revoked = 0, digest = ?, created_at = ?, "
+                        + "revoked_at = NULL WHERE artifact_id = ? AND operator = ? AND revoked = 1",
+                digest, Timestamp.from(createdAt), artifactId, operator);
+    }
+
+    private static AttestationRow mapAttestation(java.sql.ResultSet rs) throws java.sql.SQLException {
+        Timestamp revokedAt = rs.getTimestamp("revoked_at");
+        return new AttestationRow(rs.getString("operator"), rs.getString("digest"),
+                rs.getInt("revoked") == 1, rs.getTimestamp("created_at").toInstant(),
+                revokedAt == null ? null : revokedAt.toInstant());
     }
 
     /** 幂等记录视图。 */
@@ -238,8 +340,10 @@ public class RepositoryDao {
                               long repositoryVersion, Instant createdAt) {
     }
 
-    /** 锁文件条目行。 */
-    public record LockEntryRow(long lockFileId, String name, int version) {
+    /** 锁文件条目行：含锁定时固化的摘要与见证人。 */
+    public record LockEntryRow(long lockFileId, String name, int version,
+                               String checksumAlgorithm, String checksumDigest,
+                               String attesters, int attestationCount) {
     }
 
     /** 查询全部历史锁文件，按 ID 升序。 */
@@ -267,10 +371,13 @@ public class RepositoryDao {
     /** 查询某锁文件的全部条目，按名称升序。 */
     public List<LockEntryRow> listLockEntries(long lockFileId) {
         return jdbcTemplate.query(
-                "SELECT lock_file_id, name, version FROM lock_file_entry "
+                "SELECT lock_file_id, name, version, checksum_algorithm, checksum_digest, "
+                        + "attesters, attestation_count FROM lock_file_entry "
                         + "WHERE lock_file_id = ? ORDER BY name ASC",
                 (rs, n) -> new LockEntryRow(rs.getLong("lock_file_id"),
-                        rs.getString("name"), rs.getInt("version")),
+                        rs.getString("name"), rs.getInt("version"),
+                        rs.getString("checksum_algorithm"), rs.getString("checksum_digest"),
+                        rs.getString("attesters"), rs.getInt("attestation_count")),
                 lockFileId);
     }
 

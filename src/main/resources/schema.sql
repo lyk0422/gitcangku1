@@ -57,17 +57,60 @@ COMMENT ON COLUMN lock_file.created_at IS '锁定生成时间，UTC 时间戳';
 CREATE UNIQUE INDEX IF NOT EXISTS uk_lock_request ON lock_file (request_id);
 CREATE INDEX IF NOT EXISTS idx_lock_root ON lock_file (root_name, root_version);
 
+CREATE TABLE IF NOT EXISTS artifact_checksum (
+    artifact_id  BIGINT       NOT NULL PRIMARY KEY,
+    algorithm    VARCHAR(16)  NOT NULL,
+    digest       VARCHAR(128) NOT NULL,
+    registered_by VARCHAR(64) NOT NULL,
+    created_at   TIMESTAMP(6) NOT NULL,
+    CONSTRAINT fk_checksum_artifact FOREIGN KEY (artifact_id) REFERENCES artifact (id)
+);
+COMMENT ON TABLE artifact_checksum IS '制品版本登记的内容校验摘要，每个版本仅一条，登记后不可改';
+COMMENT ON COLUMN artifact_checksum.artifact_id IS '所属制品版本 ID';
+COMMENT ON COLUMN artifact_checksum.algorithm IS '摘要算法，当前仅支持 SHA-256';
+COMMENT ON COLUMN artifact_checksum.digest IS '十六进制小写摘要串，SHA-256 为 64 位';
+COMMENT ON COLUMN artifact_checksum.registered_by IS '登记摘要的操作者（发布角色）';
+COMMENT ON COLUMN artifact_checksum.created_at IS '摘要登记时间，UTC 时间戳';
+
+CREATE TABLE IF NOT EXISTS artifact_attestation (
+    id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+    artifact_id BIGINT       NOT NULL,
+    operator    VARCHAR(64)  NOT NULL,
+    digest      VARCHAR(128) NOT NULL,
+    revoked     TINYINT      NOT NULL DEFAULT 0,
+    created_at  TIMESTAMP(6) NOT NULL,
+    revoked_at  TIMESTAMP(6) NULL,
+    CONSTRAINT fk_att_artifact FOREIGN KEY (artifact_id) REFERENCES artifact (id)
+);
+COMMENT ON TABLE artifact_attestation IS '发布角色对制品版本摘要的见证记录，撤销不删除记录';
+COMMENT ON COLUMN artifact_attestation.artifact_id IS '被见证的制品版本 ID';
+COMMENT ON COLUMN artifact_attestation.operator IS '见证操作者（发布角色），同一版本内唯一';
+COMMENT ON COLUMN artifact_attestation.digest IS '见证时确认的摘要串，必须与已登记摘要一致';
+COMMENT ON COLUMN artifact_attestation.revoked IS '撤销状态：0=有效见证，1=已撤销（记录保留）';
+COMMENT ON COLUMN artifact_attestation.created_at IS '见证提交时间，UTC 时间戳';
+COMMENT ON COLUMN artifact_attestation.revoked_at IS '见证撤销时间，UTC 时间戳；未撤销为 NULL';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_att_artifact_operator ON artifact_attestation (artifact_id, operator);
+
 CREATE TABLE IF NOT EXISTS lock_file_entry (
-    id           BIGINT AUTO_INCREMENT PRIMARY KEY,
-    lock_file_id BIGINT       NOT NULL,
-    name         VARCHAR(128) NOT NULL,
-    version      INT          NOT NULL,
+    id                 BIGINT AUTO_INCREMENT PRIMARY KEY,
+    lock_file_id       BIGINT       NOT NULL,
+    name               VARCHAR(128) NOT NULL,
+    version            INT          NOT NULL,
+    checksum_algorithm VARCHAR(16)  NOT NULL,
+    checksum_digest    VARCHAR(128) NOT NULL,
+    attesters          VARCHAR(512) NOT NULL,
+    attestation_count  INT          NOT NULL,
     CONSTRAINT fk_entry_lock FOREIGN KEY (lock_file_id) REFERENCES lock_file (id)
 );
-COMMENT ON TABLE lock_file_entry IS '锁文件中的精确制品版本，每个名称仅一个版本';
+COMMENT ON TABLE lock_file_entry IS '锁文件中的精确制品版本，每个名称仅一个版本；摘要与见证在锁定时固化，后续撤销不改写';
 COMMENT ON COLUMN lock_file_entry.lock_file_id IS '所属锁文件 ID';
 COMMENT ON COLUMN lock_file_entry.name IS '被锁定制品名称';
 COMMENT ON COLUMN lock_file_entry.version IS '被锁定的精确版本号，正整数';
+COMMENT ON COLUMN lock_file_entry.checksum_algorithm IS '锁定时固化的摘要算法';
+COMMENT ON COLUMN lock_file_entry.checksum_digest IS '锁定时固化的内容校验摘要';
+COMMENT ON COLUMN lock_file_entry.attesters IS '锁定时固化的有效见证人列表，逗号分隔、按字典序排列';
+COMMENT ON COLUMN lock_file_entry.attestation_count IS '锁定时固化的有效见证人数（锁定要求 >= 2）';
 
 CREATE UNIQUE INDEX IF NOT EXISTS uk_entry_lock_name ON lock_file_entry (lock_file_id, name);
 
@@ -81,7 +124,7 @@ CREATE TABLE IF NOT EXISTS idempotent_request (
 );
 COMMENT ON TABLE idempotent_request IS '写操作幂等记录，仅保存成功请求；失败不占键';
 COMMENT ON COLUMN idempotent_request.request_id IS '客户端提供的全局唯一请求 ID';
-COMMENT ON COLUMN idempotent_request.operation IS '操作类型：REGISTER_ARTIFACT/WITHDRAW_ARTIFACT/CREATE_LOCK';
+COMMENT ON COLUMN idempotent_request.operation IS '操作类型：REGISTER_ARTIFACT/WITHDRAW_ARTIFACT/CREATE_LOCK/REGISTER_CHECKSUM/ATTEST/REVOKE_ATTESTATION';
 COMMENT ON COLUMN idempotent_request.request_hash IS '规范化请求参数的 SHA-256 摘要，异参重放用于冲突判定';
 COMMENT ON COLUMN idempotent_request.http_status IS '原成功响应 HTTP 状态码';
 COMMENT ON COLUMN idempotent_request.response_json IS '原成功响应 JSON，重放时原样返回';

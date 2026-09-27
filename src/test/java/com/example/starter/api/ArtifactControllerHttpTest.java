@@ -37,6 +37,8 @@ class ArtifactControllerHttpTest {
     void cleanDatabase() {
         jdbcTemplate.update("DELETE FROM lock_file_entry");
         jdbcTemplate.update("DELETE FROM lock_file");
+        jdbcTemplate.update("DELETE FROM artifact_attestation");
+        jdbcTemplate.update("DELETE FROM artifact_checksum");
         jdbcTemplate.update("DELETE FROM artifact_dependency");
         jdbcTemplate.update("DELETE FROM artifact");
         jdbcTemplate.update("DELETE FROM idempotent_request");
@@ -44,12 +46,43 @@ class ArtifactControllerHttpTest {
     }
 
     private static HttpHeaders jsonHeaders(String requestId) {
+        return jsonHeaders(requestId, null);
+    }
+
+    private static HttpHeaders jsonHeaders(String requestId, String operator) {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
         if (requestId != null) {
             headers.set("X-Request-Id", requestId);
         }
+        if (operator != null) {
+            headers.set("X-Operator", operator);
+        }
         return headers;
+    }
+
+    private long repoVersion() {
+        return jdbcTemplate.queryForObject(
+                "SELECT version FROM repository_state WHERE id = 1", Long.class);
+    }
+
+    /** 通过 HTTP 完成摘要登记与两名不同发布角色的见证。 */
+    private void attestFullyViaHttp(String name, int version, String digest) {
+        String checksumBody = "{\"algorithm\":\"SHA-256\",\"digest\":\"" + digest + "\"}";
+        ResponseEntity<JsonNode> checksum = restTemplate.postForEntity(
+                "/api/artifacts/{name}/versions/{version}/checksum",
+                new HttpEntity<>(checksumBody,
+                        jsonHeaders(UUID.randomUUID().toString(), "rel-lead")),
+                JsonNode.class, name, version);
+        assertThat(checksum.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        for (String operator : List.of("ops-a", "ops-b")) {
+            ResponseEntity<JsonNode> attestation = restTemplate.postForEntity(
+                    "/api/artifacts/{name}/versions/{version}/attestations",
+                    new HttpEntity<>("{\"digest\":\"" + digest + "\"}",
+                            jsonHeaders(UUID.randomUUID().toString(), operator)),
+                    JsonNode.class, name, version);
+            assertThat(attestation.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        }
     }
 
     private String registerBody(String name, int version, Object... dependencies) {
@@ -138,18 +171,28 @@ class ArtifactControllerHttpTest {
         restTemplate.postForEntity("/api/artifacts",
                 new HttpEntity<>(registerBody("lib", 2),
                         jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        // 闭包版本 app:1、lib:2 完成摘要登记与双人见证。
+        attestFullyViaHttp("app", 1, "a".repeat(64));
+        attestFullyViaHttp("lib", 2, "b".repeat(64));
 
-        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"expectedRepositoryVersion\":3}";
+        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"expectedRepositoryVersion\":"
+                + repoVersion() + "}";
         ResponseEntity<JsonNode> lock = restTemplate.postForEntity("/api/artifacts/locks",
                 new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
                 JsonNode.class);
         assertThat(lock.getStatusCode()).isEqualTo(HttpStatus.CREATED);
         long lockId = lock.getBody().path("id").asLong();
-        assertThat(lock.getBody().path("repositoryVersion").asLong()).isEqualTo(3L);
+        assertThat(lock.getBody().path("repositoryVersion").asLong()).isEqualTo(repoVersion());
         assertThat(lock.getBody().path("entries")).hasSize(2);
         assertThat(lock.getBody().path("entries").get(0).path("name").asText()).isEqualTo("app");
         assertThat(lock.getBody().path("entries").get(1).path("name").asText()).isEqualTo("lib");
         assertThat(lock.getBody().path("entries").get(1).path("version").asInt()).isEqualTo(2);
+        // 锁条目固化摘要与双人见证。
+        assertThat(lock.getBody().path("entries").get(0).path("checksumDigest").asText())
+                .isEqualTo("a".repeat(64));
+        assertThat(lock.getBody().path("entries").get(0).path("attestationCount").asInt())
+                .isEqualTo(2);
+        assertThat(lock.getBody().path("entries").get(0).path("attesters")).hasSize(2);
 
         ResponseEntity<JsonNode> list = restTemplate.getForEntity(
                 "/api/artifacts/locks", JsonNode.class);
@@ -192,6 +235,69 @@ class ArtifactControllerHttpTest {
                 new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
                 JsonNode.class);
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+    }
+
+    @Test
+    void checksumAndAttestationHttpWorkflow() {
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("app", 1),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+
+        // 缺少 X-Operator 头 → 400。
+        ResponseEntity<JsonNode> noOperator = restTemplate.postForEntity(
+                "/api/artifacts/app/versions/1/checksum",
+                new HttpEntity<>("{\"algorithm\":\"SHA-256\",\"digest\":\"" + "a".repeat(64) + "\"}",
+                        jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(noOperator.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+
+        // 非法摘要格式 → 422。
+        ResponseEntity<JsonNode> badDigest = restTemplate.postForEntity(
+                "/api/artifacts/app/versions/1/checksum",
+                new HttpEntity<>("{\"algorithm\":\"SHA-256\",\"digest\":\"xyz\"}",
+                        jsonHeaders(UUID.randomUUID().toString(), "rel-lead")),
+                JsonNode.class);
+        assertThat(badDigest.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+
+        attestFullyViaHttp("app", 1, "a".repeat(64));
+
+        // 明细查询：双人见证就绪。
+        ResponseEntity<JsonNode> detail = restTemplate.getForEntity(
+                "/api/artifacts/app/versions/1/checksum", JsonNode.class);
+        assertThat(detail.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(detail.getBody().path("digest").asText()).isEqualTo("a".repeat(64));
+        assertThat(detail.getBody().path("activeAttestations").asInt()).isEqualTo(2);
+        assertThat(detail.getBody().path("missingAttestations").asInt()).isEqualTo(0);
+        assertThat(detail.getBody().path("attestations")).hasSize(2);
+
+        // 诊断查询：单版本闭包就绪。
+        ResponseEntity<JsonNode> diagnostics = restTemplate.getForEntity(
+                "/api/artifacts/lock-diagnostics?rootName=app&rootVersion=1", JsonNode.class);
+        assertThat(diagnostics.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(diagnostics.getBody().path("resolvable").asBoolean()).isTrue();
+        assertThat(diagnostics.getBody().path("ready").asBoolean()).isTrue();
+
+        // 同角色重复见证 → 409。
+        ResponseEntity<JsonNode> duplicate = restTemplate.postForEntity(
+                "/api/artifacts/app/versions/1/attestations",
+                new HttpEntity<>("{\"digest\":\"" + "a".repeat(64) + "\"}",
+                        jsonHeaders(UUID.randomUUID().toString(), "ops-a")),
+                JsonNode.class);
+        assertThat(duplicate.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+
+        // 撤销见证后诊断不再就绪；撤销不影响已生成的查询结构。
+        ResponseEntity<JsonNode> revoke = restTemplate.exchange(
+                "/api/artifacts/app/versions/1/attestations/ops-b/revoke",
+                HttpMethod.POST,
+                new HttpEntity<>("", jsonHeaders(UUID.randomUUID().toString(), "sec-admin")),
+                JsonNode.class);
+        assertThat(revoke.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(revoke.getBody().path("revoked").asBoolean()).isTrue();
+        assertThat(revoke.getBody().path("activeAttestations").asInt()).isEqualTo(1);
+
+        ResponseEntity<JsonNode> notReady = restTemplate.getForEntity(
+                "/api/artifacts/lock-diagnostics?rootName=app&rootVersion=1", JsonNode.class);
+        assertThat(notReady.getBody().path("ready").asBoolean()).isFalse();
     }
 
     @Test

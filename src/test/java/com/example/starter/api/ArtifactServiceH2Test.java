@@ -1,10 +1,12 @@
 package com.example.starter.api;
 
 import com.example.starter.api.dto.ArtifactResponse;
+import com.example.starter.api.dto.AttestRequest;
 import com.example.starter.api.dto.DependencySpec;
 import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
 import com.example.starter.api.dto.RegisterArtifactRequest;
+import com.example.starter.api.dto.RegisterChecksumRequest;
 import com.example.starter.support.ApiException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -43,6 +45,8 @@ class ArtifactServiceH2Test {
     void cleanDatabase() {
         jdbcTemplate.update("DELETE FROM lock_file_entry");
         jdbcTemplate.update("DELETE FROM lock_file");
+        jdbcTemplate.update("DELETE FROM artifact_attestation");
+        jdbcTemplate.update("DELETE FROM artifact_checksum");
         jdbcTemplate.update("DELETE FROM artifact_dependency");
         jdbcTemplate.update("DELETE FROM artifact");
         jdbcTemplate.update("DELETE FROM idempotent_request");
@@ -51,6 +55,19 @@ class ArtifactServiceH2Test {
 
     private static String requestId() {
         return UUID.randomUUID().toString();
+    }
+
+    private long repoVersion() {
+        return jdbcTemplate.queryForObject(
+                "SELECT version FROM repository_state WHERE id = 1", Long.class);
+    }
+
+    /** 为版本登记摘要并由两名不同发布角色见证，使其满足锁定门槛。 */
+    private void attestFully(String name, int version, String digest) {
+        service.registerChecksum(requestId(), "rel-lead", name, version,
+                new RegisterChecksumRequest("SHA-256", digest));
+        service.attest(requestId(), "ops-a", name, version, new AttestRequest(digest));
+        service.attest(requestId(), "ops-b", name, version, new AttestRequest(digest));
     }
 
     private RegisterArtifactRequest artifact(String name, int version, DependencySpec... deps) {
@@ -87,14 +104,24 @@ class ArtifactServiceH2Test {
         service.registerArtifact(requestId(), artifact("lib", 2));
         service.registerArtifact(requestId(), artifact("lib", 1));
         service.registerArtifact(requestId(), artifact("util", 1));
+        // 闭包版本（app:1、lib:2、util:1）须先完成摘要登记与双人见证。
+        attestFully("app", 1, "a".repeat(64));
+        attestFully("lib", 2, "b".repeat(64));
+        attestFully("util", 1, "c".repeat(64));
+        long versionBeforeLock = repoVersion();
 
-        LockFileResponse lock = service.createLock(requestId(), new LockRequest("app", 1, 4L));
+        LockFileResponse lock = service.createLock(requestId(),
+                new LockRequest("app", 1, versionBeforeLock));
 
-        assertThat(lock.repositoryVersion()).isEqualTo(4L);
+        assertThat(lock.repositoryVersion()).isEqualTo(versionBeforeLock);
         assertThat(lock.rootName()).isEqualTo("app");
         assertThat(lock.rootVersion()).isEqualTo(1);
         assertThat(lock.entries()).extracting("name", "version")
                 .containsExactly(tuple("app", 1), tuple("lib", 2), tuple("util", 1));
+        // 锁条目固化摘要与见证人。
+        assertThat(lock.entries().get(0).checksumDigest()).isEqualTo("a".repeat(64));
+        assertThat(lock.entries().get(0).attesters()).containsExactly("ops-a", "ops-b");
+        assertThat(lock.entries().get(0).attestationCount()).isEqualTo(2);
 
         // 历史查询：列表与单查一致，条目按名称升序。
         List<LockFileResponse> locks = service.listLocks();
@@ -104,10 +131,12 @@ class ArtifactServiceH2Test {
 
     @Test
     void lockWithdrawConflictConcurrencyLeavesQueryableLock() throws Exception {
-        // 串行准备：app:1 -> lib[1,1]，lib:1；当前仓库版本为 2。
+        // 串行准备：app:1 -> lib[1,1]，lib:1；两个版本均完成摘要与双人见证。
         service.registerArtifact(requestId(), artifact("app", 1, dep("lib", 1, 1)));
         service.registerArtifact(requestId(), artifact("lib", 1));
-        long versionBefore = 2L;
+        attestFully("app", 1, "a".repeat(64));
+        attestFully("lib", 1, "b".repeat(64));
+        long versionBefore = repoVersion();
 
         ExecutorService pool = Executors.newFixedThreadPool(2);
         CyclicBarrier barrier = new CyclicBarrier(2);
@@ -440,16 +469,20 @@ class ArtifactServiceH2Test {
     void lockReplayAfterUnrelatedChangesStillReturnsOriginalResolution() {
         service.registerArtifact(requestId(), artifact("app", 1, dep("lib", 1, 2)));
         service.registerArtifact(requestId(), artifact("lib", 1));
+        attestFully("app", 1, "a".repeat(64));
+        attestFully("lib", 1, "b".repeat(64));
         String rid = requestId();
-        LockFileResponse first = service.createLock(rid, new LockRequest("app", 1, 2L));
+        LockFileResponse first = service.createLock(rid,
+                new LockRequest("app", 1, repoVersion()));
 
         // 登记 lib2 并撤回 lib1，仓库前进。
         service.registerArtifact(requestId(), artifact("lib", 2));
         service.withdrawArtifact(requestId(), "lib", 1);
 
-        LockFileResponse replay = service.createLock(rid, new LockRequest("app", 1, 2L));
+        LockFileResponse replay = service.createLock(rid,
+                new LockRequest("app", 1, first.repositoryVersion()));
         assertThat(replay.id()).isEqualTo(first.id());
-        assertThat(replay.repositoryVersion()).isEqualTo(2L);
+        assertThat(replay.repositoryVersion()).isEqualTo(first.repositoryVersion());
         assertThat(replay.entries()).isEqualTo(first.entries());
     }
 }
