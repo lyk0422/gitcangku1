@@ -26,17 +26,17 @@ public class EvidenceRepository {
     }
 
     /**
-     * 插入新证物，初始状态 SEALED，保管人为入库操作人。
+     * 插入新证物，初始状态 SEALED，保管人为入库操作人；locationCode 为 null 表示未分配库位。
      */
     public void insert(String evidenceKey, String caseKey, String category, String sealNo,
-                       String custodianId, LocalDateTime now) {
+                       String custodianId, String locationCode, LocalDateTime now) {
         jdbc.update("""
                         INSERT INTO evidence
-                            (evidence_key, case_key, category, seal_no, custodian_id, status, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            (evidence_key, case_key, category, seal_no, custodian_id, status, location_code, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                 evidenceKey, caseKey, category, sealNo, custodianId,
-                EvidenceStatus.SEALED.name(), now, now);
+                EvidenceStatus.SEALED.name(), locationCode, now, now);
     }
 
     /**
@@ -77,6 +77,35 @@ public class EvidenceRepository {
     }
 
     /**
+     * 仅更新证物当前库位（双人迁移完成时调用；调用前必须已锁定证物行）。
+     */
+    public void updateLocation(String evidenceKey, String locationCode, LocalDateTime now) {
+        jdbc.update(
+                "UPDATE evidence SET location_code = ?, updated_at = ? WHERE evidence_key = ?",
+                locationCode, now, evidenceKey);
+    }
+
+    /**
+     * 按业务键集合批量查询并锁定证物行（SELECT ... FOR UPDATE），
+     * 用于迁移第二人确认时一次性锁定完整集合；keys 必须已去重升序，避免锁顺序不一致。
+     */
+    public List<Evidence> findByKeysForUpdate(List<String> evidenceKeys) {
+        String placeholders = String.join(", ", evidenceKeys.stream().map(k -> "?").toList());
+        return jdbc.query(
+                "SELECT * FROM evidence WHERE evidence_key IN (" + placeholders + ") FOR UPDATE",
+                ROW_MAPPER, evidenceKeys.toArray());
+    }
+
+    /**
+     * 查询当前位于指定库位的证物（按入库顺序），用于库位库存查询。
+     */
+    public List<Evidence> findByLocationCode(String locationCode) {
+        return jdbc.query(
+                "SELECT * FROM evidence WHERE location_code = ? ORDER BY id",
+                ROW_MAPPER, locationCode);
+    }
+
+    /**
      * 查询指定保管人当前可交接的证物（本人保管且状态 SEALED）。
      */
     public List<Evidence> findTransferable(String custodianId) {
@@ -96,6 +125,7 @@ public class EvidenceRepository {
                     rs.getString("seal_no"),
                     rs.getString("custodian_id"),
                     EvidenceStatus.valueOf(rs.getString("status")),
+                    rs.getString("location_code"),
                     rs.getObject("created_at", LocalDateTime.class),
                     rs.getObject("updated_at", LocalDateTime.class));
         }

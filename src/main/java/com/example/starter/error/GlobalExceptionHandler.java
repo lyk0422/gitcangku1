@@ -1,5 +1,7 @@
 package com.example.starter.error;
 
+import com.example.starter.evidence.MoveRejectionException;
+import com.example.starter.evidence.dto.ItemRejection;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
@@ -12,6 +14,7 @@ import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
 import java.time.LocalDateTime;
+import java.util.List;
 import java.util.stream.Collectors;
 
 /**
@@ -26,6 +29,12 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorBody> handleApi(ApiException ex) {
         return ResponseEntity.status(ex.status())
                 .body(new ErrorBody(ex.status().value(), ex.getMessage(), LocalDateTime.now()));
+    }
+
+    @ExceptionHandler(MoveRejectionException.class)
+    public ResponseEntity<RejectionBody> handleMoveRejection(MoveRejectionException ex) {
+        return ResponseEntity.unprocessableEntity()
+                .body(new RejectionBody(422, ex.getMessage(), LocalDateTime.now(), ex.items()));
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
@@ -59,5 +68,17 @@ public class GlobalExceptionHandler {
      * @param timestamp 发生时间（Asia/Shanghai）
      */
     public record ErrorBody(int status, String message, LocalDateTime timestamp) {
+    }
+
+    /**
+     * 迁移申请 422 错误响应体，携带逐项失败说明。
+     *
+     * @param status    HTTP 状态码
+     * @param message   错误描述
+     * @param timestamp 发生时间（Asia/Shanghai）
+     * @param items     逐项失败说明（证物业务键 + 原因）
+     */
+    public record RejectionBody(int status, String message, LocalDateTime timestamp,
+                                List<ItemRejection> items) {
     }
 }

@@ -46,6 +46,7 @@ public class EvidenceService {
     private final SealInspectionRepository inspectionRepository;
     private final LoanRecordRepository loanRepository;
     private final CommandLogRepository commandLogRepository;
+    private final StorageLocationRepository locationRepository;
     private final ObjectMapper objectMapper;
     private final EvidenceClock clock;
 
@@ -54,6 +55,7 @@ public class EvidenceService {
                            SealInspectionRepository inspectionRepository,
                            LoanRecordRepository loanRepository,
                            CommandLogRepository commandLogRepository,
+                           StorageLocationRepository locationRepository,
                            ObjectMapper objectMapper,
                            EvidenceClock clock) {
         this.evidenceRepository = evidenceRepository;
@@ -61,12 +63,14 @@ public class EvidenceService {
         this.inspectionRepository = inspectionRepository;
         this.loanRepository = loanRepository;
         this.commandLogRepository = commandLogRepository;
+        this.locationRepository = locationRepository;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
 
     /**
      * 证物入库：初始状态 SEALED，保管人为操作人。evidenceKey 全局唯一。
+     * 提供 locationCode 时证物直接放入该库位（库位须存在且为 ACTIVE），库存版本 +1。
      */
     @Transactional
     public StoredResponse intake(String actorId, IntakeRequest request, String requestHash) {
@@ -77,9 +81,20 @@ public class EvidenceService {
         if (evidenceRepository.findByKey(request.evidenceKey()).isPresent()) {
             throw ApiException.conflict("证物已存在: " + request.evidenceKey());
         }
+        String locationCode = request.locationCode();
+        if (locationCode != null) {
+            StorageLocation location = locationRepository.findByCodeForUpdate(locationCode)
+                    .orElseThrow(() -> ApiException.notFound("库位不存在: " + locationCode));
+            if (location.status() == LocationStatus.DISABLED) {
+                throw ApiException.conflict("库位已停用，禁止放入证物: " + locationCode);
+            }
+        }
         LocalDateTime now = LocalDateTime.now();
         evidenceRepository.insert(request.evidenceKey(), request.caseKey(), request.category(),
-                request.sealNo(), actorId, now);
+                request.sealNo(), actorId, locationCode, now);
+        if (locationCode != null) {
+            locationRepository.bumpVersion(locationCode, now);
+        }
         Evidence evidence = evidenceRepository.findByKey(request.evidenceKey()).orElseThrow();
         return record(request.commandKey(), OP_INTAKE, actorId, requestHash, 201, toView(evidence));
     }
@@ -404,7 +419,7 @@ public class EvidenceService {
     private EvidenceView toView(Evidence evidence) {
         return new EvidenceView(evidence.evidenceKey(), evidence.caseKey(), evidence.category(),
                 evidence.sealNo(), evidence.custodianId(), evidence.status(),
-                evidence.createdAt(), evidence.updatedAt());
+                evidence.locationCode(), evidence.createdAt(), evidence.updatedAt());
     }
 
     private TransferView toView(TransferRecord record) {
