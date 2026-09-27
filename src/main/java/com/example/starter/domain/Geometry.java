@@ -1,5 +1,6 @@
 package com.example.starter.domain;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -99,5 +100,32 @@ public final class Geometry {
     public static boolean inRectangle(long x, long y,
                                       int xMin, int yMin, int xMax, int yMax) {
         return x >= xMin && x <= xMax && y >= yMin && y <= yMax;
+    }
+
+    /**
+     * 判断两个轴对齐闭矩形是否相交（边界接触也算相交）。
+     *
+     * @return true 表示两矩形存在公共点（含仅边界/角点接触）
+     */
+    public static boolean rectanglesIntersect(int axMin, int ayMin, int axMax, int ayMax,
+                                              int bxMin, int byMin, int bxMax, int byMax) {
+        return axMin <= bxMax && bxMin <= axMax && ayMin <= byMax && byMin <= ayMax;
+    }
+
+    /**
+     * 返回折线中与闭矩形相交的全部段序号（段 i 连接 points[i] 与 points[i+1]）。
+     * 段序号按升序返回；用于固化走廊覆盖的路径段位置，空列表表示不相交。
+     */
+    public static List<Integer> hitSegmentIndexes(List<Point> points,
+                                                  int xMin, int yMin, int xMax, int yMax) {
+        List<Integer> indexes = new ArrayList<>();
+        for (int i = 0; i + 1 < points.size(); i++) {
+            Point a = points.get(i);
+            Point b = points.get(i + 1);
+            if (segmentHitsRectangle(a.x(), a.y(), b.x(), b.y(), xMin, yMin, xMax, yMax)) {
+                indexes.add(i);
+            }
+        }
+        return indexes;
     }
 }

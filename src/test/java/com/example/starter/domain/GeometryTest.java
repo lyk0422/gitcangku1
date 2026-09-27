@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.List;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -89,5 +90,40 @@ class GeometryTest {
         List<Point> laterSegment = List.of(
                 new Point(0, 0), new Point(10, 10), new Point(100, 10));
         assertTrue(Geometry.polylineHitsRectangle(laterSegment, X_MIN, Y_MIN, X_MAX, Y_MAX));
+    }
+
+    @Test
+    void rectangleIntersectionIncludesBoundaryContact() {
+        // 完全分离
+        assertFalse(Geometry.rectanglesIntersect(0, 0, 10, 10, 20, 20, 30, 30));
+        // 正常重叠
+        assertTrue(Geometry.rectanglesIntersect(0, 0, 10, 10, 5, 5, 15, 15));
+        // 仅共享一条边（x 轴相接）也算重叠
+        assertTrue(Geometry.rectanglesIntersect(0, 0, 10, 10, 10, 0, 20, 10));
+        // 仅角点接触
+        assertTrue(Geometry.rectanglesIntersect(0, 0, 10, 10, 10, 10, 20, 20));
+        // 一边在另一边内部
+        assertTrue(Geometry.rectanglesIntersect(0, 0, 100, 100, 10, 10, 20, 20));
+    }
+
+    @Test
+    void hitSegmentIndexesReturnsAllAndOnlyCrossingSegmentsInOrder() {
+        // 四段：段0 竖线在 x=0（矩形外）；段1 水平穿过矩形（y=10, x 0..100）；
+        // 段2 竖线在 x=100（矩形外）
+        List<Point> middle = List.of(
+                new Point(0, 0), new Point(0, 10),
+                new Point(100, 10), new Point(100, 0));
+        assertEquals(List.of(1), Geometry.hitSegmentIndexes(middle, X_MIN, Y_MIN, X_MAX, Y_MAX));
+
+        // 五段：段0 与段4 水平穿过，中间连接段在矩形外
+        List<Point> skipOne = List.of(
+                new Point(0, 10), new Point(100, 10),
+                new Point(100, -50), new Point(0, -50),
+                new Point(0, 10), new Point(100, 10));
+        assertEquals(List.of(0, 4), Geometry.hitSegmentIndexes(skipOne, X_MIN, Y_MIN, X_MAX, Y_MAX));
+
+        // 不相交返回空列表
+        List<Point> none = List.of(new Point(-50, -50), new Point(-40, -40));
+        assertTrue(Geometry.hitSegmentIndexes(none, X_MIN, Y_MIN, X_MAX, Y_MAX).isEmpty());
     }
 }

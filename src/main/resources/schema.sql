@@ -62,8 +62,81 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_review_request ON review (request_id);
 -- 写操作幂等去重：同键同参重放原结果，异参冲突；失败不占键
 CREATE TABLE IF NOT EXISTS request_dedup (
     request_id     VARCHAR(64) PRIMARY KEY COMMENT '写操作全局唯一请求标识',
-    request_kind   VARCHAR(32) NOT NULL COMMENT '请求类型：ZONE_CREATE/ZONE_REVOKE/ROUTE_CREATE/ROUTE_REPLACE/REVIEW',
+    request_kind   VARCHAR(32) NOT NULL COMMENT '请求类型：ZONE_CREATE/ZONE_REVOKE/ROUTE_CREATE/ROUTE_REPLACE/REVIEW/CORRIDOR_CREATE/CORRIDOR_REVOKE/REGULAR_OCCUPANCY/EMERGENCY_OCCUPANCY/OCCUPANCY_REAPPLY/DEPARTURE_REGISTER',
     request_hash   VARCHAR(64) NOT NULL COMMENT '规范化参数的 SHA-256 十六进制摘要，用于同键异参冲突判定',
     response_json  CLOB NOT NULL COMMENT '首次成功响应 JSON，重放时原样返回',
     created_at     BIGINT NOT NULL COMMENT '首次成功时间，epoch 毫秒（UTC）'
 ) COMMENT = '写操作幂等去重记录（与业务变更同事务原子提交）';
+
+-- 空域应急走廊：授权调度员建立，有效期 [start_utc, end_utc) 左闭右开、
+-- 高度 [alt_min, alt_max) 左闭右开；覆盖路径段在有效期内只允许应急航线使用。
+-- 只能创建（ACTIVE）或撤销（REVOKED）；自然到期不改状态，按时间窗判定有效。
+CREATE TABLE IF NOT EXISTS corridor (
+    corridor_id              VARCHAR(64) PRIMARY KEY COMMENT '应急走廊唯一标识',
+    priority                 INT NOT NULL COMMENT '走廊优先级（非负整数）；同优先级走廊不得在时空高度上重叠',
+    x_min                    INT NOT NULL COMMENT '走廊矩形左边界（含），单位米',
+    y_min                    INT NOT NULL COMMENT '走廊矩形下边界（含），单位米',
+    x_max                    INT NOT NULL COMMENT '走廊矩形右边界（含），单位米，x_min < x_max',
+    y_max                    INT NOT NULL COMMENT '走廊矩形上边界（含），单位米，y_min < y_max',
+    start_utc                BIGINT NOT NULL COMMENT '生效起点，epoch 毫秒（UTC），区间含该时刻',
+    end_utc                  BIGINT NOT NULL COMMENT '生效终点，epoch 毫秒（UTC），区间不含该时刻，start_utc < end_utc',
+    alt_min                  INT NOT NULL COMMENT '最低高度（含），单位米',
+    alt_max                  INT NOT NULL COMMENT '最高高度（不含），单位米，alt_min < alt_max',
+    status                   VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE 未撤销（是否当前有效另按时间窗判定）；REVOKED 已撤销',
+    reason                   VARCHAR(255) NOT NULL COMMENT '建立走廊并要求相关常规占用让渡的原因（让渡记录固化同一文案）',
+    created_by               VARCHAR(64) NOT NULL COMMENT '建立走廊的授权调度员标识',
+    created_airspace_version BIGINT NOT NULL COMMENT '走廊版本：创建生效时的全局空域版本',
+    revoked_airspace_version BIGINT NULL COMMENT '撤销生效时的全局空域版本；NULL 表示未撤销',
+    created_at               BIGINT NOT NULL COMMENT '创建时间，epoch 毫秒（UTC）',
+    revoked_at               BIGINT NULL COMMENT '撤销时间，epoch 毫秒（UTC）；NULL 表示未撤销'
+) COMMENT = '空域应急走廊（时间、高度区间左闭右开，只能创建或撤销）';
+
+-- 空域占用：审查通过的航线对指定时间窗、高度窗与路径快照的占用。
+-- 常规占用可被应急走廊让渡（ACTIVE -> YIELDED）；应急占用不参与让渡。
+CREATE TABLE IF NOT EXISTS occupancy (
+    occupancy_id      VARCHAR(64) PRIMARY KEY COMMENT '占用唯一标识（登记时由客户端指定）',
+    route_id          VARCHAR(64) NOT NULL COMMENT '占用对应的航线标识',
+    review_id         VARCHAR(64) NOT NULL COMMENT '占用所依据的不可变审查标识（必须为 CLEAR）',
+    route_version     INT NOT NULL COMMENT '登记时固化的航线版本（取自审查记录）',
+    airspace_version  BIGINT NOT NULL COMMENT '登记时固化的空域版本（取自审查记录）',
+    kind              VARCHAR(16) NOT NULL COMMENT '占用类型：REGULAR 常规；EMERGENCY 应急',
+    start_utc         BIGINT NOT NULL COMMENT '占用起点，epoch 毫秒（UTC），区间含该时刻',
+    end_utc           BIGINT NOT NULL COMMENT '占用终点，epoch 毫秒（UTC），区间不含该时刻',
+    alt_min           INT NOT NULL COMMENT '占用最低高度（含），单位米',
+    alt_max           INT NOT NULL COMMENT '占用最高高度（不含），单位米',
+    status            VARCHAR(16) NOT NULL COMMENT 'ACTIVE 有效占用；YIELDED 已让渡给应急走廊（不自动恢复）',
+    yieldable         BOOLEAN NOT NULL COMMENT '常规占用是否允许被应急走廊让渡；应急占用恒为 TRUE 且不适用',
+    departed          BOOLEAN NOT NULL COMMENT '是否已登记起飞；TRUE 后占用不可让渡',
+    corridor_id       VARCHAR(64) NULL COMMENT '让渡本占用的走廊标识；NULL 表示未让渡',
+    parent_occupancy_id VARCHAR(64) NULL COMMENT '重新申请时原占用标识；NULL 表示原始登记而非重新申请',
+    points_snapshot   VARCHAR(4000) NOT NULL COMMENT '审查时航点不可变快照，格式 x,y;x,y',
+    created_at        BIGINT NOT NULL COMMENT '登记时间，epoch 毫秒（UTC）',
+    departed_at       BIGINT NULL COMMENT '起飞登记时间，epoch 毫秒（UTC）；NULL 表示尚未起飞'
+) COMMENT = '航线时空高度占用（常规可让渡，应急优先）';
+
+-- 让渡不可变历史：走廊创建事务内对每个让渡占用追加一行，
+-- 固化原审查版本、走廊版本与让渡原因，永不更新或删除。
+CREATE TABLE IF NOT EXISTS yield_record (
+    seq               BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增序号，仅用于稳定排序',
+    occupancy_id      VARCHAR(64) NOT NULL COMMENT '被让渡的常规占用标识',
+    corridor_id       VARCHAR(64) NOT NULL COMMENT '受让渡的应急走廊标识',
+    corridor_version  BIGINT NOT NULL COMMENT '让渡时固化的走廊版本（走廊创建时的全局空域版本）',
+    review_id         VARCHAR(64) NOT NULL COMMENT '让渡时固化的原审查标识',
+    route_version     INT NOT NULL COMMENT '让渡时固化的原航线版本',
+    airspace_version  BIGINT NOT NULL COMMENT '让渡时固化的原空域版本',
+    reason            VARCHAR(255) NOT NULL COMMENT '让渡原因（与走廊创建请求一致）',
+    created_at        BIGINT NOT NULL COMMENT '让渡时间，epoch 毫秒（UTC）'
+) COMMENT = '应急走廊让渡不可变历史';
+
+-- 占用处置事件不可变流：登记/让渡/重新申请/起飞各追加一行，永不更新或删除。
+-- 排序固定按 seq 升序；时间精度为 epoch 毫秒；可空列的 NULL 语义见各列注释。
+CREATE TABLE IF NOT EXISTS occupancy_event (
+    seq                   BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增序号，事件固定按此升序排序',
+    occupancy_id          VARCHAR(64) NOT NULL COMMENT '事件所属占用标识',
+    event_type            VARCHAR(16) NOT NULL COMMENT '事件类型：CREATED 登记；YIELDED 让渡；REAPPLIED 原占用被重新申请；DEPARTED 起飞',
+    event_time            BIGINT NOT NULL COMMENT '事件时间，epoch 毫秒（UTC）',
+    corridor_id           VARCHAR(64) NULL COMMENT 'YIELDED 事件关联的走廊标识；其余事件为 NULL',
+    related_occupancy_id  VARCHAR(64) NULL COMMENT 'REAPPLIED 事件关联的新占用标识；其余事件为 NULL',
+    review_id             VARCHAR(64) NULL COMMENT 'CREATED 事件依据的审查标识；其余事件为 NULL',
+    reason                VARCHAR(255) NULL COMMENT 'YIELDED 事件的让渡原因；其余事件为 NULL'
+) COMMENT = '占用处置不可变事件流（登记/让渡/重新申请/起飞）';
