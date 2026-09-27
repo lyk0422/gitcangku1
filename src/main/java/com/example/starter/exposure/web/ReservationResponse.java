@@ -12,6 +12,8 @@ import java.time.LocalDate;
  * @param campaignId    所属公告编号
  * @param visitorId     合成访客编号
  * @param utcDate       额度所属 UTC 日，格式 yyyy-MM-dd；固定为申请时的 UTC 日期
+ * @param activityId    申请时刻公告所属活动编号；无活动为 null，固化不随迁移改变
+ * @param hourOfDay     申请时刻的 UTC 小时（0-23）；无活动为 null
  * @param status        预占状态
  * @param createdAtUtc  创建时刻，epoch 毫秒，UTC
  * @param expiresAtUtc  到期时刻（创建 + 60 秒），epoch 毫秒，UTC
@@ -22,6 +24,8 @@ public record ReservationResponse(
         String campaignId,
         String visitorId,
         LocalDate utcDate,
+        String activityId,
+        Integer hourOfDay,
         ReservationStatus status,
         long createdAtUtc,
         long expiresAtUtc,
@@ -33,6 +37,8 @@ public record ReservationResponse(
                 r.campaignId(),
                 r.visitorId(),
                 r.utcDate().toLocalDate(),
+                r.activityId(),
+                r.hourOfDay(),
                 r.status(),
                 r.createdAtUtc(),
                 r.expiresAtUtc(),

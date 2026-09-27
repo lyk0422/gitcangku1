@@ -6,8 +6,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
 
-import java.sql.ResultSet;
-import java.sql.SQLException;
+import java.time.LocalDate;
 import java.util.List;
 import java.util.Optional;
 
@@ -28,21 +27,25 @@ public class ReservationRepository {
             rs.getString("campaign_id"),
             rs.getString("visitor_id"),
             rs.getDate("utc_date"),
+            rs.getString("activity_id"),
+            (Integer) rs.getObject("hour_of_day"),
             ReservationStatus.valueOf(rs.getString("status")),
             rs.getLong("created_at_utc"),
             rs.getLong("expires_at_utc"),
             (Long) rs.getObject("terminal_at_utc"));
 
     private static final String COLUMNS =
-            "reservation_id, campaign_id, visitor_id, utc_date, status, "
+            "reservation_id, campaign_id, visitor_id, utc_date, activity_id, hour_of_day, status, "
                     + "created_at_utc, expires_at_utc, terminal_at_utc";
 
     public void insert(Reservation reservation) {
-        jdbc.update("INSERT INTO exposure_reservation (" + COLUMNS + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        jdbc.update("INSERT INTO exposure_reservation (" + COLUMNS + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 reservation.reservationId(),
                 reservation.campaignId(),
                 reservation.visitorId(),
                 reservation.utcDate(),
+                reservation.activityId(),
+                reservation.hourOfDay(),
                 reservation.status().name(),
                 reservation.createdAtUtc(),
                 reservation.expiresAtUtc(),
@@ -73,6 +76,44 @@ public class ReservationRepository {
         return jdbc.query("SELECT " + COLUMNS + " FROM exposure_reservation "
                         + "WHERE campaign_id = ? AND status = 'RESERVED' AND expires_at_utc <= ? FOR UPDATE",
                 MAPPER, campaignId, nowUtc);
+    }
+
+    /**
+     * 行锁查询某活动某 UTC 日某小时下已到期但仍为 RESERVED 的预占单（申请前结算当前小时）。
+     */
+    public List<Reservation> lockExpiredReservedForActivityHour(String activityId, LocalDate utcDate,
+                                                                int hourOfDay, long nowUtc) {
+        return jdbc.query("SELECT " + COLUMNS + " FROM exposure_reservation "
+                        + "WHERE activity_id = ? AND utc_date = ? AND hour_of_day = ? "
+                        + "AND status = 'RESERVED' AND expires_at_utc <= ? FOR UPDATE",
+                MAPPER, activityId, java.sql.Date.valueOf(utcDate), hourOfDay, nowUtc);
+    }
+
+    /**
+     * 行锁查询某活动某 UTC 日下已到期但仍为 RESERVED 的预占单（日结前结算）。
+     */
+    public List<Reservation> lockExpiredReservedForActivityDay(String activityId, LocalDate utcDate,
+                                                               long nowUtc) {
+        return jdbc.query("SELECT " + COLUMNS + " FROM exposure_reservation "
+                        + "WHERE activity_id = ? AND utc_date = ? "
+                        + "AND status = 'RESERVED' AND expires_at_utc <= ? FOR UPDATE",
+                MAPPER, activityId, java.sql.Date.valueOf(utcDate), nowUtc);
+    }
+
+    /**
+     * 活动某 UTC 日（可按小时过滤）的预占历史，按创建时刻与编号稳定升序；纯读取。
+     */
+    public List<Reservation> listByActivityAndDay(String activityId, LocalDate utcDate, Integer hourOfDay) {
+        if (hourOfDay != null) {
+            return jdbc.query("SELECT " + COLUMNS + " FROM exposure_reservation "
+                            + "WHERE activity_id = ? AND utc_date = ? AND hour_of_day = ? "
+                            + "ORDER BY created_at_utc, reservation_id",
+                    MAPPER, activityId, java.sql.Date.valueOf(utcDate), hourOfDay);
+        }
+        return jdbc.query("SELECT " + COLUMNS + " FROM exposure_reservation "
+                        + "WHERE activity_id = ? AND utc_date = ? "
+                        + "ORDER BY created_at_utc, reservation_id",
+                MAPPER, activityId, java.sql.Date.valueOf(utcDate));
     }
 
     /**
