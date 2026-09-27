@@ -24,10 +24,13 @@ public class ReleaseRepository {
             rs.getString("from_version"), rs.getString("to_version"),
             rs.getInt("ratio"), ReleaseStatus.valueOf(rs.getString("status")),
             rs.getInt("sample_floor"), rs.getInt("failure_threshold_percent"),
-            rs.getInt("monitor_round"), rs.getInt("round_success"), rs.getInt("round_failed"));
+            rs.getInt("monitor_round"), rs.getInt("round_success"), rs.getInt("round_failed"),
+            rs.getObject("chunk_count") == null ? null : rs.getInt("chunk_count"),
+            rs.getString("package_digest"));
 
     private static final String COLUMNS = "id, version, model, from_version, to_version, ratio, status,"
-            + " sample_floor, failure_threshold_percent, monitor_round, round_success, round_failed";
+            + " sample_floor, failure_threshold_percent, monitor_round, round_success, round_failed,"
+            + " chunk_count, package_digest";
 
     private final JdbcTemplate jdbc;
 
@@ -36,13 +39,15 @@ public class ReleaseRepository {
     }
 
     public long insert(String model, String fromVersion, String toVersion, int ratio,
-                       int sampleFloor, int failureThresholdPercent) {
+                       int sampleFloor, int failureThresholdPercent,
+                       Integer chunkCount, String packageDigest) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
                     "INSERT INTO release_order (version, model, from_version, to_version, ratio, status,"
-                            + " sample_floor, failure_threshold_percent, monitor_round, active_model)"
-                            + " VALUES (1, ?, ?, ?, ?, 'ACTIVE', ?, ?, 1, ?)",
+                            + " sample_floor, failure_threshold_percent, monitor_round, active_model,"
+                            + " chunk_count, package_digest)"
+                            + " VALUES (1, ?, ?, ?, ?, 'ACTIVE', ?, ?, 1, ?, ?, ?)",
                     new String[]{"id"});
             ps.setString(1, model);
             ps.setString(2, fromVersion);
@@ -51,6 +56,12 @@ public class ReleaseRepository {
             ps.setInt(5, sampleFloor);
             ps.setInt(6, failureThresholdPercent);
             ps.setString(7, model);
+            if (chunkCount == null) {
+                ps.setNull(8, java.sql.Types.INTEGER);
+            } else {
+                ps.setInt(8, chunkCount);
+            }
+            ps.setString(9, packageDigest);
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();
@@ -116,5 +127,14 @@ public class ReleaseRepository {
                 + " monitor_round = monitor_round + 1, round_success = 0, round_failed = 0,"
                 + " updated_at = CURRENT_TIMESTAMP"
                 + " WHERE id = ? AND version = ? AND status = 'PAUSED'", id, expectedVersion);
+    }
+
+    /**
+     * 补登分片清单：仅当尚未登记时生效（清单一经登记不可修改），返回影响行数。
+     */
+    public int registerManifest(long id, int chunkCount, String packageDigest) {
+        return jdbc.update("UPDATE release_order SET chunk_count = ?, package_digest = ?,"
+                + " updated_at = CURRENT_TIMESTAMP WHERE id = ? AND chunk_count IS NULL",
+                chunkCount, packageDigest, id);
     }
 }

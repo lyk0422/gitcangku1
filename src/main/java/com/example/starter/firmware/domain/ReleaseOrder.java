@@ -15,8 +15,18 @@ package com.example.starter.firmware.domain;
  * @param monitorRound            当前监控轮次，从1开始，人工恢复后加一
  * @param roundSuccess            当前监控轮次内首次进入 SUCCESS 的任务数
  * @param roundFailed             当前监控轮次内首次进入 FAILED 的任务数
+ * @param chunkCount              分片总数；null 表示未登记分片清单（旧式发布单，回执不做完整性门禁）
+ * @param packageDigest           完整包聚合摘要（SHA-256，64位小写十六进制）；未登记分片清单时为 null
  */
 public record ReleaseOrder(long id, int version, String model, String fromVersion, String toVersion,
                            int ratio, ReleaseStatus status, int sampleFloor, int failureThresholdPercent,
-                           int monitorRound, int roundSuccess, int roundFailed) {
+                           int monitorRound, int roundSuccess, int roundFailed,
+                           Integer chunkCount, String packageDigest) {
+
+    /**
+     * 是否已登记分片清单（任务需通过完整性核验才可安装）。
+     */
+    public boolean hasManifest() {
+        return chunkCount != null;
+    }
 }

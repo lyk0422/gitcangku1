@@ -22,6 +22,8 @@ CREATE TABLE IF NOT EXISTS release_order (
   monitor_round INT NOT NULL DEFAULT 1 COMMENT '当前监控轮次，从1开始，人工恢复后加一并清零统计',
   round_success INT NOT NULL DEFAULT 0 COMMENT '当前监控轮次内首次进入SUCCESS的任务数，重复回执不重复计数',
   round_failed INT NOT NULL DEFAULT 0 COMMENT '当前监控轮次内首次进入FAILED的任务数，重复回执不重复计数',
+  chunk_count INT NULL COMMENT '分片总数；NULL表示未登记分片清单（旧式发布单，回执不做完整性门禁）',
+  package_digest VARCHAR(64) NULL COMMENT '完整包聚合摘要，SHA-256，64位小写十六进制；按分片序号顺序拼接各分片摘要后计算',
   active_model VARCHAR(64) NULL COMMENT 'ACTIVE或PAUSED时等于model，取消后置NULL；用于同型号至多一张未终结发布单的唯一约束',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
@@ -34,7 +36,7 @@ CREATE TABLE IF NOT EXISTS rollout_task (
   id BIGINT NOT NULL AUTO_INCREMENT COMMENT '任务ID',
   release_id BIGINT NOT NULL COMMENT '所属发布单ID',
   device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
-  status VARCHAR(16) NOT NULL COMMENT 'PENDING待回执；SUCCESS成功；FAILED失败；CANCELLED已取消',
+  status VARCHAR(16) NOT NULL COMMENT 'PENDING待回执；INSTALLABLE完整性核验通过可安装；INTEGRITY_FAILED完整性失败；SUCCESS成功；FAILED失败；CANCELLED已取消',
   first_result VARCHAR(16) NULL COMMENT '首次回执结果（SUCCESS/FAILED），未回执为NULL',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
@@ -62,6 +64,56 @@ CREATE TABLE IF NOT EXISTS release_resume_record (
   resumed_at_utc VARCHAR(40) NOT NULL COMMENT '恢复时刻，UTC，ISO-8601格式（如2026-09-22T07:00:00Z）',
   PRIMARY KEY (id)
 ) COMMENT='发布单人工恢复记录，历史不可改';
+
+CREATE TABLE IF NOT EXISTS firmware_chunk (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '分片记录ID',
+  release_id BIGINT NOT NULL COMMENT '所属发布单ID',
+  chunk_index INT NOT NULL COMMENT '分片序号，从0开始连续',
+  digest VARCHAR(64) NOT NULL COMMENT '分片摘要，SHA-256，64位小写十六进制',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '登记时间',
+  PRIMARY KEY (id),
+  CONSTRAINT uk_chunk_release_index UNIQUE (release_id, chunk_index)
+) COMMENT='发布单分片摘要清单，登记后不可修改；有任务拉取后禁止补登';
+
+CREATE TABLE IF NOT EXISTS task_attempt (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '尝试记录ID',
+  task_id BIGINT NOT NULL COMMENT '所属任务ID',
+  attempt_no INT NOT NULL COMMENT '尝试代次，从1开始；INTEGRITY_FAILED后重新拉取加一',
+  status VARCHAR(16) NOT NULL COMMENT '本尝试状态：PENDING/INSTALLABLE/INTEGRITY_FAILED/SUCCESS/FAILED/CANCELLED',
+  created_at_utc VARCHAR(40) NOT NULL COMMENT '尝试建立时刻，UTC，ISO-8601格式',
+  finalized_at_utc VARCHAR(40) NULL COMMENT '本尝试终结时刻，UTC，ISO-8601格式；未终结为NULL',
+  PRIMARY KEY (id),
+  CONSTRAINT uk_attempt_task_no UNIQUE (task_id, attempt_no)
+) COMMENT='任务尝试代次，旧代次记录保留不改';
+
+CREATE TABLE IF NOT EXISTS chunk_receipt (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '分片接收记录ID',
+  task_id BIGINT NOT NULL COMMENT '所属任务ID',
+  attempt_no INT NOT NULL COMMENT '接收时所属尝试代次',
+  chunk_index INT NOT NULL COMMENT '分片序号',
+  digest VARCHAR(64) NOT NULL COMMENT '设备提交的分片摘要，SHA-256，64位小写十六进制',
+  received_at_utc VARCHAR(40) NOT NULL COMMENT '接收时刻，UTC，ISO-8601格式',
+  PRIMARY KEY (id),
+  CONSTRAINT uk_receipt_task_attempt_index UNIQUE (task_id, attempt_no, chunk_index)
+) COMMENT='分片接收证据，只增不改；重新拉取的新代次不影响旧证据';
+
+CREATE TABLE IF NOT EXISTS integrity_event (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '完整性事件ID',
+  task_id BIGINT NOT NULL COMMENT '所属任务ID',
+  attempt_no INT NOT NULL COMMENT '事件所属尝试代次',
+  release_id BIGINT NOT NULL COMMENT '所属发布单ID',
+  event_type VARCHAR(24) NOT NULL COMMENT '事件类型：CHUNK_ACCEPTED分片接收，INTEGRITY_FAILED完整性失败，INSTALLABLE可安装判定',
+  chunk_index INT NULL COMMENT '相关分片序号；与单分片无关的事件为NULL',
+  expected_digest VARCHAR(64) NULL COMMENT '清单登记的期望摘要；无对应分片时为NULL',
+  received_digest VARCHAR(64) NULL COMMENT '设备实际提交的摘要；非分片事件为NULL',
+  chunk_count INT NULL COMMENT '判定时分片总数；非判定事件为NULL',
+  aggregate_digest VARCHAR(64) NULL COMMENT '判定时按序号顺序拼接分片摘要计算的聚合摘要；非判定事件为NULL',
+  package_digest VARCHAR(64) NULL COMMENT '判定时发布单登记的完整包摘要；非判定事件为NULL',
+  reason VARCHAR(32) NULL COMMENT '失败原因：INDEX_OUT_OF_RANGE/DIGEST_MISMATCH/DUPLICATE_INDEX/INCOMPLETE_SET/AGGREGATE_MISMATCH；非失败事件为NULL',
+  detail VARCHAR(512) NULL COMMENT '补充说明（如缺失序号列表）；无补充为NULL',
+  occurred_at_utc VARCHAR(40) NOT NULL COMMENT '事件发生时刻，UTC，ISO-8601格式',
+  PRIMARY KEY (id)
+) COMMENT='分片完整性事件，固化判定证据，只增不改';
 
 CREATE TABLE IF NOT EXISTS idempotency_record (
   request_id VARCHAR(64) NOT NULL COMMENT '全局唯一请求ID',

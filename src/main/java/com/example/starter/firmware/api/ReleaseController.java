@@ -48,6 +48,17 @@ public class ReleaseController {
         return releaseService.resume(releaseId, request);
     }
 
+    @PostMapping("/{releaseId}/manifest")
+    public ManifestView registerManifest(@PathVariable long releaseId,
+                                         @Valid @RequestBody RegisterManifestRequest request) {
+        return releaseService.registerManifest(releaseId, request);
+    }
+
+    @GetMapping("/{releaseId}/manifest")
+    public ManifestView getManifest(@PathVariable long releaseId) {
+        return releaseService.getManifest(releaseId);
+    }
+
     @GetMapping("/{releaseId}/monitor")
     public MonitorView monitor(@PathVariable long releaseId) {
         return releaseService.monitor(releaseId);

@@ -72,6 +72,23 @@ public class TaskRepository {
                 + " WHERE release_id = ? AND status = 'PENDING'", releaseId);
     }
 
+    /**
+     * 发布单取消：未终结任务（PENDING/INSTALLABLE/INTEGRITY_FAILED）一并转为 CANCELLED。
+     */
+    public int cancelUnfinishedByRelease(long releaseId) {
+        return jdbc.update("UPDATE rollout_task SET status = 'CANCELLED', updated_at = CURRENT_TIMESTAMP"
+                + " WHERE release_id = ? AND status IN ('PENDING', 'INSTALLABLE', 'INTEGRITY_FAILED')",
+                releaseId);
+    }
+
+    /**
+     * 通用状态迁移（调用方已持有任务行锁）。
+     */
+    public void updateStatus(long id, TaskStatus status) {
+        jdbc.update("UPDATE rollout_task SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                status.name(), id);
+    }
+
     public List<RolloutTask> findByRelease(long releaseId, TaskStatus statusFilter) {
         if (statusFilter == null) {
             return jdbc.query("SELECT " + COLUMNS + " FROM rollout_task WHERE release_id = ? ORDER BY id",
@@ -85,6 +102,12 @@ public class TaskRepository {
         Long count = jdbc.queryForObject(
                 "SELECT COUNT(*) FROM rollout_task WHERE release_id = ? AND device_id = ?",
                 Long.class, releaseId, deviceId);
+        return count == null ? 0 : count;
+    }
+
+    public long countByRelease(long releaseId) {
+        Long count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM rollout_task WHERE release_id = ?", Long.class, releaseId);
         return count == null ? 0 : count;
     }
 }

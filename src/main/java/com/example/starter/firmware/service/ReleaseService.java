@@ -2,24 +2,30 @@ package com.example.starter.firmware.service;
 
 import com.example.starter.firmware.api.CreateReleaseRequest;
 import com.example.starter.firmware.api.ExpandReleaseRequest;
+import com.example.starter.firmware.api.ManifestView;
 import com.example.starter.firmware.api.MonitorView;
 import com.example.starter.firmware.api.PauseRecordView;
+import com.example.starter.firmware.api.RegisterManifestRequest;
 import com.example.starter.firmware.api.ReleaseHistoryResponse;
 import com.example.starter.firmware.api.ReleaseView;
 import com.example.starter.firmware.api.ResumeRecordView;
 import com.example.starter.firmware.api.ResumeReleaseRequest;
+import com.example.starter.firmware.domain.ChunkEntry;
 import com.example.starter.firmware.domain.ReleaseOrder;
 import com.example.starter.firmware.domain.ReleaseStatus;
 import com.example.starter.firmware.error.ApiException;
+import com.example.starter.firmware.repo.ChunkManifestRepository;
 import com.example.starter.firmware.repo.PauseRecordRepository;
 import com.example.starter.firmware.repo.ReleaseRepository;
 import com.example.starter.firmware.repo.ResumeRecordRepository;
+import com.example.starter.firmware.repo.TaskAttemptRepository;
 import com.example.starter.firmware.repo.TaskRepository;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 
 import java.time.Clock;
 import java.time.Instant;
+import java.util.List;
 
 /**
  * 发布单生命周期：创建（版本从1开始）、扩量（版本校验+只增不减）、失败率自动暂停、
@@ -32,17 +38,23 @@ public class ReleaseService {
     private final TaskRepository taskRepository;
     private final PauseRecordRepository pauseRecordRepository;
     private final ResumeRecordRepository resumeRecordRepository;
+    private final ChunkManifestRepository chunkManifestRepository;
+    private final TaskAttemptRepository taskAttemptRepository;
     private final IdempotencyService idempotency;
     private final Clock clock;
 
     public ReleaseService(ReleaseRepository releaseRepository, TaskRepository taskRepository,
                           PauseRecordRepository pauseRecordRepository,
                           ResumeRecordRepository resumeRecordRepository,
+                          ChunkManifestRepository chunkManifestRepository,
+                          TaskAttemptRepository taskAttemptRepository,
                           IdempotencyService idempotency, Clock clock) {
         this.releaseRepository = releaseRepository;
         this.taskRepository = taskRepository;
         this.pauseRecordRepository = pauseRecordRepository;
         this.resumeRecordRepository = resumeRecordRepository;
+        this.chunkManifestRepository = chunkManifestRepository;
+        this.taskAttemptRepository = taskAttemptRepository;
         this.idempotency = idempotency;
         this.clock = clock;
     }
@@ -53,19 +65,67 @@ public class ReleaseService {
         }
         int sampleFloor = request.effectiveSampleFloor();
         int threshold = request.effectiveFailureThresholdPercent();
+        List<ChunkEntry> manifest = Manifests.validate(request.chunks(), request.packageDigest());
+        String manifestFingerprint = manifest == null ? "none"
+                : Manifests.fingerprintOf(manifest, request.packageDigest());
         String fingerprint = String.join("|", "release.create", request.model(), request.fromVersion(),
                 request.toVersion(), String.valueOf(request.ratio()), String.valueOf(sampleFloor),
-                String.valueOf(threshold));
+                String.valueOf(threshold), manifestFingerprint);
         return idempotency.execute(request.requestId(), "release.create", fingerprint, () -> {
             long id;
             try {
                 id = releaseRepository.insert(request.model(), request.fromVersion(), request.toVersion(),
-                        request.ratio(), sampleFloor, threshold);
+                        request.ratio(), sampleFloor, threshold,
+                        manifest == null ? null : manifest.size(), request.packageDigest());
             } catch (DuplicateKeyException e) {
                 throw ApiException.conflict("ACTIVE_RELEASE_EXISTS", "型号已存在未终结发布单: " + request.model());
             }
+            if (manifest != null) {
+                for (ChunkEntry entry : manifest) {
+                    chunkManifestRepository.insert(id, entry.chunkIndex(), entry.digest());
+                }
+            }
             return ReleaseView.of(findOrder(id));
         }, ReleaseView.class);
+    }
+
+    /**
+     * 补登分片清单：仅允许在发布单尚未登记清单且无任何任务拉取前登记；登记后不可修改。
+     * 清单校验（重复序号、缺口、聚合摘要不匹配）失败返回 422。
+     */
+    public ManifestView registerManifest(long releaseId, RegisterManifestRequest request) {
+        List<ChunkEntry> manifest = Manifests.validate(request.chunks(), request.packageDigest());
+        String fingerprint = String.join("|", "release.manifest", String.valueOf(releaseId),
+                Manifests.fingerprintOf(manifest, request.packageDigest()));
+        return idempotency.execute(request.requestId(), "release.manifest", fingerprint, () -> {
+            ReleaseOrder order = releaseRepository.findByIdForUpdate(releaseId)
+                    .orElseThrow(() -> ApiException.notFound("RELEASE_NOT_FOUND", "发布单不存在: " + releaseId));
+            if (order.hasManifest()) {
+                throw ApiException.conflict("MANIFEST_ALREADY_REGISTERED",
+                        "发布单已登记分片清单，摘要不可修改");
+            }
+            if (taskRepository.countByRelease(releaseId) > 0) {
+                throw ApiException.conflict("MANIFEST_LOCKED",
+                        "发布单已有任务拉取，分片摘要不可再登记或修改");
+            }
+            releaseRepository.registerManifest(releaseId, manifest.size(), request.packageDigest());
+            for (ChunkEntry entry : manifest) {
+                chunkManifestRepository.insert(releaseId, entry.chunkIndex(), entry.digest());
+            }
+            return new ManifestView(releaseId, manifest.size(), request.packageDigest(), manifest);
+        }, ManifestView.class);
+    }
+
+    /**
+     * 分片清单查询（只读，不触发状态变化）。未登记清单返回 404。
+     */
+    public ManifestView getManifest(long releaseId) {
+        ReleaseOrder order = findOrder(releaseId);
+        if (!order.hasManifest()) {
+            throw ApiException.notFound("MANIFEST_NOT_REGISTERED", "发布单未登记分片清单: " + releaseId);
+        }
+        return new ManifestView(releaseId, order.chunkCount(), order.packageDigest(),
+                chunkManifestRepository.findByRelease(releaseId));
     }
 
     public ReleaseView expand(long releaseId, ExpandReleaseRequest request) {
@@ -126,7 +186,8 @@ public class ReleaseService {
                     .orElseThrow(() -> ApiException.notFound("RELEASE_NOT_FOUND", "发布单不存在: " + releaseId));
             if (order.status() == ReleaseStatus.ACTIVE || order.status() == ReleaseStatus.PAUSED) {
                 releaseRepository.cancel(releaseId);
-                taskRepository.cancelPendingByRelease(releaseId);
+                taskRepository.cancelUnfinishedByRelease(releaseId);
+                taskAttemptRepository.cancelUnfinishedByRelease(releaseId, Instant.now(clock).toString());
             }
             return ReleaseView.of(findOrder(releaseId));
         }, ReleaseView.class);
