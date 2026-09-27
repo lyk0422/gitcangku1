@@ -35,4 +35,11 @@ public class ApiException extends RuntimeException {
     public static ApiException conflict(String code, String message) {
         return new ApiException(HttpStatus.CONFLICT, code, message);
     }
+
+    /**
+     * 422：请求语义可解析但业务规则不接受（标签表达式非法、目标快照为空、批量标签修改预检失败等）。
+     */
+    public static ApiException unprocessable(String code, String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, code, message);
+    }
 }

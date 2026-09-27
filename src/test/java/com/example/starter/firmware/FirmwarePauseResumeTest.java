@@ -33,8 +33,13 @@ class FirmwarePauseResumeTest {
         jdbc.update("DELETE FROM rollout_task");
         jdbc.update("DELETE FROM release_pause_record");
         jdbc.update("DELETE FROM release_resume_record");
+        jdbc.update("DELETE FROM release_target_device");
+        jdbc.update("DELETE FROM release_target_snapshot");
         jdbc.update("DELETE FROM release_order");
+        jdbc.update("DELETE FROM label_revision");
         jdbc.update("DELETE FROM device");
+        jdbc.update("DELETE FROM label_dict_tag");
+        jdbc.update("UPDATE label_dict_meta SET version = 0 WHERE id = 1");
         jdbc.update("DELETE FROM idempotency_record");
     }
 
@@ -45,7 +50,7 @@ class FirmwarePauseResumeTest {
 
     private void registerDevice(String requestId, String deviceId, String model, int bucket) throws Exception {
         mockMvc.perform(post("/api/devices").contentType("application/json").content("""
-                {"requestId":"%s","deviceId":"%s","model":"%s","currentVersion":"1.0.0","bucketNo":%d}
+                {"requestId":"%s","deviceId":"%s","model":"%s","currentVersion":"1.0.0","bucketNo":%d,"labels":["fleet-a"]}
                 """.formatted(requestId, deviceId, model, bucket)))
                 .andExpect(status().isOk());
     }
@@ -54,7 +59,7 @@ class FirmwarePauseResumeTest {
             throws Exception {
         MvcResult result = mockMvc.perform(post("/api/releases").contentType("application/json").content("""
                 {"requestId":"%s","model":"%s","fromVersion":"1.0.0","toVersion":"2.0.0","ratio":%d,
-                "sampleFloor":%d,"failureThresholdPercent":%d}
+                "sampleFloor":%d,"failureThresholdPercent":%d,"target":{"includeAny":["fleet-a"]}}
                 """.formatted(requestId, model, ratio, sampleFloor, threshold)))
                 .andExpect(status().isOk())
                 .andReturn();
@@ -79,10 +84,10 @@ class FirmwarePauseResumeTest {
     @Test
     void 阈值边界_达到阈值当次回执同事务原子暂停并落暂停记录() throws Exception {
         // floor=3, threshold=50：失败数×100 >= 样本数×50 时暂停
-        long releaseId = createRelease("r-create", "m1", 100, 3, 50);
         for (int i = 1; i <= 4; i++) {
             registerDevice("r-dev" + i, "d" + i, "m1", i);
         }
+        long releaseId = createRelease("r-create", "m1", 100, 3, 50);
         long t1 = pullTask("r-pull1", "d1");
         long t2 = pullTask("r-pull2", "d2");
         long t3 = pullTask("r-pull3", "d3");
@@ -138,10 +143,10 @@ class FirmwarePauseResumeTest {
     @Test
     void 重复回执不重复计数_取消任务不计样本() throws Exception {
         // floor=2, threshold=100：仅当 2/2 全失败才暂停
-        long releaseId = createRelease("r-create", "m1", 100, 2, 100);
         registerDevice("r-dev1", "d1", "m1", 1);
         registerDevice("r-dev2", "d2", "m1", 2);
         registerDevice("r-dev3", "d3", "m1", 3);
+        long releaseId = createRelease("r-create", "m1", 100, 2, 100);
         long t1 = pullTask("r-pull1", "d1");
         long t2 = pullTask("r-pull2", "d2");
         long t3 = pullTask("r-pull3", "d3");
@@ -178,11 +183,11 @@ class FirmwarePauseResumeTest {
 
     @Test
     void PAUSED时不得扩量或新建任务_已有任务可回执并继续计数() throws Exception {
-        long releaseId = createRelease("r-create", "m1", 100, 2, 50);
         registerDevice("r-dev1", "d1", "m1", 1);
         registerDevice("r-dev2", "d2", "m1", 2);
         registerDevice("r-dev3", "d3", "m1", 3);
         registerDevice("r-dev4", "d4", "m1", 4);
+        long releaseId = createRelease("r-create", "m1", 100, 2, 50);
         long t1 = pullTask("r-pull1", "d1");
         long t2 = pullTask("r-pull2", "d2");
         long t3 = pullTask("r-pull3", "d3");
@@ -224,10 +229,10 @@ class FirmwarePauseResumeTest {
 
     @Test
     void 恢复_版本加一开启新轮次_统计清零_历史可查_不重开已终结任务() throws Exception {
-        long releaseId = createRelease("r-create", "m1", 100, 2, 50);
         registerDevice("r-dev1", "d1", "m1", 1);
         registerDevice("r-dev2", "d2", "m1", 2);
         registerDevice("r-dev3", "d3", "m1", 3);
+        long releaseId = createRelease("r-create", "m1", 100, 2, 50);
         long t1 = pullTask("r-pull1", "d1");
         long t2 = pullTask("r-pull2", "d2");
         receipt(t1, "r-rc1", "FAILED");
@@ -285,9 +290,9 @@ class FirmwarePauseResumeTest {
 
     @Test
     void 恢复幂等_同键同参重放版本只加一次_异参409() throws Exception {
-        long releaseId = createRelease("r-create", "m1", 100, 2, 50);
         registerDevice("r-dev1", "d1", "m1", 1);
         registerDevice("r-dev2", "d2", "m1", 2);
+        long releaseId = createRelease("r-create", "m1", 100, 2, 50);
         receipt(pullTask("r-pull1", "d1"), "r-rc1", "FAILED");
         receipt(pullTask("r-pull2", "d2"), "r-rc2", "FAILED");
 
@@ -317,10 +322,10 @@ class FirmwarePauseResumeTest {
 
     @Test
     void 取消先提交则恢复409_取消PAUSED继续取消未终结任务() throws Exception {
-        long releaseId = createRelease("r-create", "m1", 100, 2, 50);
         registerDevice("r-dev1", "d1", "m1", 1);
         registerDevice("r-dev2", "d2", "m1", 2);
         registerDevice("r-dev3", "d3", "m1", 3);
+        long releaseId = createRelease("r-create", "m1", 100, 2, 50);
         long t1 = pullTask("r-pull1", "d1");
         long t2 = pullTask("r-pull2", "d2");
         long t3 = pullTask("r-pull3", "d3");
@@ -355,10 +360,10 @@ class FirmwarePauseResumeTest {
 
     @Test
     void 恢复后回执计入新轮次_可再次暂停并各留一条记录() throws Exception {
-        long releaseId = createRelease("r-create", "m1", 100, 2, 50);
         for (int i = 1; i <= 4; i++) {
             registerDevice("r-dev" + i, "d" + i, "m1", i);
         }
+        long releaseId = createRelease("r-create", "m1", 100, 2, 50);
         long t1 = pullTask("r-pull1", "d1");
         long t2 = pullTask("r-pull2", "d2");
         long t3 = pullTask("r-pull3", "d3");
@@ -410,9 +415,10 @@ class FirmwarePauseResumeTest {
                 {"requestId":"r-b4","model":"m1","fromVersion":"1.0.0","toVersion":"2.0.0","ratio":10,"failureThresholdPercent":101}
                 """)).andExpect(status().isBadRequest());
 
-        // 旧客户端不传监控参数：默认值 floor=2 / threshold=100
+        // 旧客户端不传监控参数：默认值 floor=2 / threshold=100（标签目标仍须显式提供）
+        registerDevice("r-dev0", "d0", "m1", 1);
         mockMvc.perform(post("/api/releases").contentType("application/json").content("""
-                {"requestId":"r-ok","model":"m1","fromVersion":"1.0.0","toVersion":"2.0.0","ratio":10}
+                {"requestId":"r-ok","model":"m1","fromVersion":"1.0.0","toVersion":"2.0.0","ratio":10,"target":{"includeAny":["fleet-a"]}}
                 """))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.sampleFloor").value(2))

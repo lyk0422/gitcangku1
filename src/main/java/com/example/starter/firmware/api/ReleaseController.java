@@ -58,6 +58,11 @@ public class ReleaseController {
         return releaseService.history(releaseId);
     }
 
+    @GetMapping("/{releaseId}/target")
+    public TargetSnapshotView target(@PathVariable long releaseId) {
+        return releaseService.targetSnapshot(releaseId);
+    }
+
     @GetMapping("/{releaseId}/tasks")
     public TaskListResponse tasks(@PathVariable long releaseId, @RequestParam(required = false) String status) {
         TaskStatus filter = parseStatus(status);

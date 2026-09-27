@@ -15,6 +15,7 @@ import java.util.Optional;
 /**
  * 发布单数据访问。扩量、取消、恢复、拉取、回执共用行锁（SELECT ... FOR UPDATE）形成一致提交顺序。
  * 当前轮次统计（round_success/round_failed）只在持有发布单行锁的事务内增减。
+ * 目标快照字段（label_dict_version/target_count/resolved_at_utc）只在创建时写入，后续不再改写。
  */
 @Repository
 public class ReleaseRepository {
@@ -24,10 +25,12 @@ public class ReleaseRepository {
             rs.getString("from_version"), rs.getString("to_version"),
             rs.getInt("ratio"), ReleaseStatus.valueOf(rs.getString("status")),
             rs.getInt("sample_floor"), rs.getInt("failure_threshold_percent"),
-            rs.getInt("monitor_round"), rs.getInt("round_success"), rs.getInt("round_failed"));
+            rs.getInt("monitor_round"), rs.getInt("round_success"), rs.getInt("round_failed"),
+            rs.getLong("label_dict_version"), rs.getInt("target_count"), rs.getString("resolved_at_utc"));
 
     private static final String COLUMNS = "id, version, model, from_version, to_version, ratio, status,"
-            + " sample_floor, failure_threshold_percent, monitor_round, round_success, round_failed";
+            + " sample_floor, failure_threshold_percent, monitor_round, round_success, round_failed,"
+            + " label_dict_version, target_count, resolved_at_utc";
 
     private final JdbcTemplate jdbc;
 
@@ -36,13 +39,15 @@ public class ReleaseRepository {
     }
 
     public long insert(String model, String fromVersion, String toVersion, int ratio,
-                       int sampleFloor, int failureThresholdPercent) {
+                       int sampleFloor, int failureThresholdPercent,
+                       long labelDictVersion, int targetCount, String resolvedAtUtc) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
                     "INSERT INTO release_order (version, model, from_version, to_version, ratio, status,"
-                            + " sample_floor, failure_threshold_percent, monitor_round, active_model)"
-                            + " VALUES (1, ?, ?, ?, ?, 'ACTIVE', ?, ?, 1, ?)",
+                            + " sample_floor, failure_threshold_percent, monitor_round, active_model,"
+                            + " label_dict_version, target_count, resolved_at_utc)"
+                            + " VALUES (1, ?, ?, ?, ?, 'ACTIVE', ?, ?, 1, ?, ?, ?, ?)",
                     new String[]{"id"});
             ps.setString(1, model);
             ps.setString(2, fromVersion);
@@ -51,6 +56,9 @@ public class ReleaseRepository {
             ps.setInt(5, sampleFloor);
             ps.setInt(6, failureThresholdPercent);
             ps.setString(7, model);
+            ps.setLong(8, labelDictVersion);
+            ps.setInt(9, targetCount);
+            ps.setString(10, resolvedAtUtc);
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();

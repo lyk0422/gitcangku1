@@ -38,8 +38,13 @@ class FirmwareApiTest {
         jdbc.update("DELETE FROM rollout_task");
         jdbc.update("DELETE FROM release_pause_record");
         jdbc.update("DELETE FROM release_resume_record");
+        jdbc.update("DELETE FROM release_target_device");
+        jdbc.update("DELETE FROM release_target_snapshot");
         jdbc.update("DELETE FROM release_order");
+        jdbc.update("DELETE FROM label_revision");
         jdbc.update("DELETE FROM device");
+        jdbc.update("DELETE FROM label_dict_tag");
+        jdbc.update("UPDATE label_dict_meta SET version = 0 WHERE id = 1");
         jdbc.update("DELETE FROM idempotency_record");
     }
 
@@ -48,7 +53,7 @@ class FirmwareApiTest {
         MvcResult result = mockMvc.perform(post("/api/devices")
                         .contentType("application/json")
                         .content("""
-                                {"requestId":"%s","deviceId":"%s","model":"%s","currentVersion":"%s","bucketNo":%d}
+                                {"requestId":"%s","deviceId":"%s","model":"%s","currentVersion":"%s","bucketNo":%d,"labels":["fleet-a"]}
                                 """.formatted(requestId, deviceId, model, version, bucket)))
                 .andReturn();
         return result.getResponse().getContentAsString();
@@ -59,7 +64,7 @@ class FirmwareApiTest {
         MvcResult result = mockMvc.perform(post("/api/releases")
                         .contentType("application/json")
                         .content("""
-                                {"requestId":"%s","model":"%s","fromVersion":"%s","toVersion":"%s","ratio":%d}
+                                {"requestId":"%s","model":"%s","fromVersion":"%s","toVersion":"%s","ratio":%d,"target":{"includeAny":["fleet-a"]}}
                                 """.formatted(requestId, model, from, to, ratio)))
                 .andReturn();
         return result.getResponse().getContentAsString();
@@ -73,14 +78,15 @@ class FirmwareApiTest {
     @Test
     void 主流程_登记发布拉取回执成功并更新设备版本() throws Exception {
         mockMvc.perform(post("/api/devices").contentType("application/json").content("""
-                        {"requestId":"r1","deviceId":"d1","model":"m1","currentVersion":"1.0.0","bucketNo":5}
+                        {"requestId":"r1","deviceId":"d1","model":"m1","currentVersion":"1.0.0","bucketNo":5,"labels":["fleet-a"]}
                         """))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.deviceId").value("d1"))
-                .andExpect(jsonPath("$.bucketNo").value(5));
+                .andExpect(jsonPath("$.bucketNo").value(5))
+                .andExpect(jsonPath("$.labels[0]").value("fleet-a"));
 
         MvcResult release = mockMvc.perform(post("/api/releases").contentType("application/json").content("""
-                        {"requestId":"r2","model":"m1","fromVersion":"1.0.0","toVersion":"2.0.0","ratio":10}
+                        {"requestId":"r2","model":"m1","fromVersion":"1.0.0","toVersion":"2.0.0","ratio":10,"target":{"includeAny":["fleet-a"]}}
                         """))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.version").value(1))
@@ -151,7 +157,7 @@ class FirmwareApiTest {
         // 失败不占键：先以错误参数触发 409，再用同 requestId 正确参数成功
         createRelease("rid-x", "m1", "1.0.0", "1.0.0", 10); // 400 在 Service 外，requestId 未入库
         MvcResult created = mockMvc.perform(post("/api/releases").contentType("application/json").content("""
-                        {"requestId":"rid-y","model":"m1","fromVersion":"1.0.0","toVersion":"2.0.0","ratio":10}
+                        {"requestId":"rid-y","model":"m1","fromVersion":"1.0.0","toVersion":"2.0.0","ratio":10,"target":{"includeAny":["fleet-a"]}}
                         """))
                 .andExpect(status().isOk())
                 .andReturn();
@@ -171,6 +177,7 @@ class FirmwareApiTest {
 
     @Test
     void 发布单_目标来源相同400_同型号第二张ACTIVE409() throws Exception {
+        registerDevice("r0", "d0", "m1", "1.0.0", 1);
         mockMvc.perform(post("/api/releases").contentType("application/json").content("""
                         {"requestId":"r1","model":"m1","fromVersion":"1.0.0","toVersion":"1.0.0","ratio":10}
                         """))
@@ -179,7 +186,7 @@ class FirmwareApiTest {
 
         createRelease("r2", "m1", "1.0.0", "2.0.0", 10);
         mockMvc.perform(post("/api/releases").contentType("application/json").content("""
-                        {"requestId":"r3","model":"m1","fromVersion":"1.0.0","toVersion":"3.0.0","ratio":20}
+                        {"requestId":"r3","model":"m1","fromVersion":"1.0.0","toVersion":"3.0.0","ratio":20,"target":{"includeAny":["fleet-a"]}}
                         """))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("ACTIVE_RELEASE_EXISTS"));
@@ -187,6 +194,7 @@ class FirmwareApiTest {
 
     @Test
     void 扩量_版本校验_比例只增不减_重放不再加版本() throws Exception {
+        registerDevice("r0", "d0", "m1", "1.0.0", 1);
         long releaseId = releaseIdOf(createRelease("r1", "m1", "1.0.0", "2.0.0", 10));
 
         mockMvc.perform(post("/api/releases/" + releaseId + "/expand").contentType("application/json").content("""
@@ -233,17 +241,20 @@ class FirmwareApiTest {
 
     @Test
     void 拉取_不匹配不创建任务_重复拉取返回已有任务() throws Exception {
+        // 快照解析要求同型号同来源版本且标签匹配：d1 命中快照但分桶不小于比例，d2 版本不符不进快照，
+        // d4 命中快照且分桶命中；目标快照非空（{d1,d4}），发布单可创建
         registerDevice("r1", "d1", "m1", "1.0.0", 50);
         registerDevice("r2", "d2", "m1", "9.9.9", 1);
+        registerDevice("r8", "d4", "m1", "1.0.0", 3);
         createRelease("r3", "m1", "1.0.0", "2.0.0", 10);
 
-        // 分桶号不小于比例：不投放
+        // 快照成员但分桶号不小于比例：不投放
         mockMvc.perform(post("/api/devices/d1/pull").contentType("application/json")
                         .content("{\"requestId\":\"r4\"}"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.task").doesNotExist());
 
-        // 当前版本不匹配：不投放
+        // 非快照成员（来源版本不符）：不投放
         mockMvc.perform(post("/api/devices/d2/pull").contentType("application/json")
                         .content("{\"requestId\":\"r5\"}"))
                 .andExpect(status().isOk())
@@ -256,8 +267,7 @@ class FirmwareApiTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.task").doesNotExist());
 
-        // 命中后重复拉取返回同一任务
-        registerDevice("r8", "d4", "m1", "1.0.0", 3);
+        // 快照成员且分桶命中：拉取到任务，重复拉取返回同一任务
         MvcResult first = mockMvc.perform(post("/api/devices/d4/pull").contentType("application/json")
                         .content("{\"requestId\":\"r9\"}"))
                 .andExpect(status().isOk())
@@ -269,6 +279,13 @@ class FirmwareApiTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.task.taskId").value(taskId));
         assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM rollout_task", Long.class)).isEqualTo(1);
+
+        // 发布单创建后才登记的匹配设备不属于固化快照：不投放
+        registerDevice("r12", "d5", "m1", "1.0.0", 1);
+        mockMvc.perform(post("/api/devices/d5/pull").contentType("application/json")
+                        .content("{\"requestId\":\"r13\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.task").doesNotExist());
 
         // 设备不存在：404
         mockMvc.perform(post("/api/devices/ghost/pull").contentType("application/json")
