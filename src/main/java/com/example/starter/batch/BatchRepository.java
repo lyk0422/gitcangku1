@@ -54,6 +54,49 @@ public class BatchRepository {
     public record LineageRow(long id, String parentKey, String childKey, int seq, String createdAt) {
     }
 
+    /**
+     * packing_plan 表行记录：批次包装计划与连续标签号段，登记后不可修改。
+     */
+    public record PackingPlanRow(String batchKey, long plannedQuantity, long labelRangeStart,
+                                 long labelRangeEnd, String createdAt) {
+    }
+
+    /**
+     * box_seal_event 表行记录：只增不改的封箱历史证据；作废只置状态/原因/作废时间。
+     */
+    public record SealEventRow(long id, String batchKey, String sealKey, int version, long labelNo,
+                               long quantity, String status, String voidReason,
+                               String sealedAt, String voidedAt) {
+    }
+
+    /**
+     * box_seal_active 表行记录：活跃封箱占用（数量与标签），作废时删除。
+     */
+    public record ActiveSealRow(String batchKey, long labelNo, String sealKey, int version,
+                                long quantity, String sealedAt) {
+    }
+
+    /**
+     * label_binding 表行记录：标签号与批次的永久绑定（作废也不解除）。
+     */
+    public record LabelBindingRow(long labelNo, String batchKey, String firstSealedAt) {
+    }
+
+    /**
+     * release_snapshot 表行记录：放行时刻固化的计划/实际数量与标签排序摘要。
+     */
+    public record ReleaseSnapshotRow(String batchKey, long plannedQuantity, long sealedQuantity,
+                                     long usedLabelCount, long sealCount, String usedLabels,
+                                     String createdAt) {
+    }
+
+    /**
+     * release_snapshot_seal 表行记录：放行快照内固化的单个封箱版本。
+     */
+    public record SnapshotSealRow(long id, String batchKey, String sealKey, int version, long labelNo,
+                                  long quantity, String sealedAt, int seq) {
+    }
+
     private static final RowMapper<BatchRow> BATCH_MAPPER = (rs, n) -> new BatchRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("product_code"),
             rs.getString("batch_no"), rs.getString("produced_at"),
@@ -80,6 +123,36 @@ public class BatchRepository {
     private static final RowMapper<LineageRow> LINEAGE_MAPPER = (rs, n) -> new LineageRow(
             rs.getLong("id"), rs.getString("parent_key"), rs.getString("child_key"),
             rs.getInt("seq"), rs.getString("created_at"));
+
+    private static final RowMapper<PackingPlanRow> PACKING_PLAN_MAPPER = (rs, n) -> new PackingPlanRow(
+            rs.getString("batch_key"), rs.getLong("planned_quantity"),
+            rs.getLong("label_range_start"), rs.getLong("label_range_end"),
+            rs.getString("created_at"));
+
+    private static final RowMapper<SealEventRow> SEAL_EVENT_MAPPER = (rs, n) -> new SealEventRow(
+            rs.getLong("id"), rs.getString("batch_key"), rs.getString("seal_key"),
+            rs.getInt("version"), rs.getLong("label_no"), rs.getLong("quantity"),
+            rs.getString("status"), rs.getString("void_reason"),
+            rs.getString("sealed_at"), rs.getString("voided_at"));
+
+    private static final RowMapper<ActiveSealRow> ACTIVE_SEAL_MAPPER = (rs, n) -> new ActiveSealRow(
+            rs.getString("batch_key"), rs.getLong("label_no"), rs.getString("seal_key"),
+            rs.getInt("version"), rs.getLong("quantity"), rs.getString("sealed_at"));
+
+    private static final RowMapper<LabelBindingRow> LABEL_BINDING_MAPPER = (rs, n) ->
+            new LabelBindingRow(rs.getLong("label_no"), rs.getString("batch_key"),
+                    rs.getString("first_sealed_at"));
+
+    private static final RowMapper<ReleaseSnapshotRow> RELEASE_SNAPSHOT_MAPPER = (rs, n) ->
+            new ReleaseSnapshotRow(rs.getString("batch_key"), rs.getLong("planned_quantity"),
+                    rs.getLong("sealed_quantity"), rs.getLong("used_label_count"),
+                    rs.getLong("seal_count"), rs.getString("used_labels"),
+                    rs.getString("created_at"));
+
+    private static final RowMapper<SnapshotSealRow> SNAPSHOT_SEAL_MAPPER = (rs, n) ->
+            new SnapshotSealRow(rs.getLong("id"), rs.getString("batch_key"),
+                    rs.getString("seal_key"), rs.getInt("version"), rs.getLong("label_no"),
+                    rs.getLong("quantity"), rs.getString("sealed_at"), rs.getInt("seq"));
 
     private final JdbcTemplate jdbc;
 
@@ -208,5 +281,131 @@ public class BatchRepository {
     public List<String> findRecalledKeys() {
         return jdbc.queryForList("SELECT batch_key FROM batch WHERE status = 'RECALLED'",
                 String.class);
+    }
+
+    // ---------- 包装计划与标签核销 ----------
+
+    public Optional<PackingPlanRow> findPackingPlan(String batchKey) {
+        return jdbc.query("SELECT * FROM packing_plan WHERE batch_key = ?",
+                        PACKING_PLAN_MAPPER, batchKey)
+                .stream().findFirst();
+    }
+
+    public void insertPackingPlan(PackingPlanRow row) {
+        jdbc.update("INSERT INTO packing_plan (batch_key, planned_quantity, label_range_start,"
+                        + " label_range_end, created_at) VALUES (?, ?, ?, ?, ?)",
+                row.batchKey(), row.plannedQuantity(), row.labelRangeStart(),
+                row.labelRangeEnd(), row.createdAt());
+    }
+
+    /**
+     * 某批次全部封箱事件（含已作废与历史版本），按自增 id 即提交顺序返回。
+     */
+    public List<SealEventRow> findSealEvents(String batchKey) {
+        return jdbc.query("SELECT * FROM box_seal_event WHERE batch_key = ? ORDER BY id",
+                SEAL_EVENT_MAPPER, batchKey);
+    }
+
+    /**
+     * 某 sealKey 的最新版本事件（作废重封后版本递增）；不存在返回空。
+     */
+    public Optional<SealEventRow> findLatestSealEvent(String batchKey, String sealKey) {
+        return jdbc.query("SELECT * FROM box_seal_event WHERE batch_key = ? AND seal_key = ?"
+                        + " ORDER BY version DESC LIMIT 1",
+                        SEAL_EVENT_MAPPER, batchKey, sealKey)
+                .stream().findFirst();
+    }
+
+    public void insertSealEvent(SealEventRow row) {
+        jdbc.update("INSERT INTO box_seal_event (batch_key, seal_key, version, label_no, quantity,"
+                        + " status, void_reason, sealed_at, voided_at)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                row.batchKey(), row.sealKey(), row.version(), row.labelNo(), row.quantity(),
+                row.status(), row.voidReason(), row.sealedAt(), row.voidedAt());
+    }
+
+    /**
+     * 作废封箱事件：仅置状态、原因与作废时间；封箱数量、标签号、封箱时间等原始字段不被覆盖。
+     */
+    public int voidSealEvent(String batchKey, String sealKey, int version,
+                             String reason, String voidedAt) {
+        return jdbc.update("UPDATE box_seal_event SET status = 'VOIDED', void_reason = ?,"
+                        + " voided_at = ? WHERE batch_key = ? AND seal_key = ? AND version = ?"
+                        + " AND status = 'SEALED'",
+                reason, voidedAt, batchKey, sealKey, version);
+    }
+
+    /**
+     * 某批次全部活跃封箱占用，按标签号升序返回。
+     */
+    public List<ActiveSealRow> findActiveSeals(String batchKey) {
+        return jdbc.query("SELECT * FROM box_seal_active WHERE batch_key = ? ORDER BY label_no",
+                ACTIVE_SEAL_MAPPER, batchKey);
+    }
+
+    public Optional<ActiveSealRow> findActiveSealByKey(String batchKey, String sealKey) {
+        return jdbc.query("SELECT * FROM box_seal_active WHERE batch_key = ? AND seal_key = ?",
+                        ACTIVE_SEAL_MAPPER, batchKey, sealKey)
+                .stream().findFirst();
+    }
+
+    public void insertActiveSeal(ActiveSealRow row) {
+        jdbc.update("INSERT INTO box_seal_active (batch_key, label_no, seal_key, version, quantity,"
+                        + " sealed_at) VALUES (?, ?, ?, ?, ?, ?)",
+                row.batchKey(), row.labelNo(), row.sealKey(), row.version(),
+                row.quantity(), row.sealedAt());
+    }
+
+    public int deleteActiveSeal(String batchKey, String sealKey) {
+        return jdbc.update("DELETE FROM box_seal_active WHERE batch_key = ? AND seal_key = ?",
+                batchKey, sealKey);
+    }
+
+    public long sumActiveQuantity(String batchKey) {
+        Long sum = jdbc.queryForObject(
+                "SELECT COALESCE(SUM(quantity), 0) FROM box_seal_active WHERE batch_key = ?",
+                Long.class, batchKey);
+        return sum == null ? 0L : sum;
+    }
+
+    public Optional<LabelBindingRow> findLabelBinding(long labelNo) {
+        return jdbc.query("SELECT * FROM label_binding WHERE label_no = ?",
+                        LABEL_BINDING_MAPPER, labelNo)
+                .stream().findFirst();
+    }
+
+    public void insertLabelBinding(LabelBindingRow row) {
+        jdbc.update("INSERT INTO label_binding (label_no, batch_key, first_sealed_at)"
+                        + " VALUES (?, ?, ?)",
+                row.labelNo(), row.batchKey(), row.firstSealedAt());
+    }
+
+    public Optional<ReleaseSnapshotRow> findReleaseSnapshot(String batchKey) {
+        return jdbc.query("SELECT * FROM release_snapshot WHERE batch_key = ?",
+                        RELEASE_SNAPSHOT_MAPPER, batchKey)
+                .stream().findFirst();
+    }
+
+    public void insertReleaseSnapshot(ReleaseSnapshotRow row) {
+        jdbc.update("INSERT INTO release_snapshot (batch_key, planned_quantity, sealed_quantity,"
+                        + " used_label_count, seal_count, used_labels, created_at)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                row.batchKey(), row.plannedQuantity(), row.sealedQuantity(), row.usedLabelCount(),
+                row.sealCount(), row.usedLabels(), row.createdAt());
+    }
+
+    public void insertSnapshotSeal(String batchKey, String sealKey, int version, long labelNo,
+                                   long quantity, String sealedAt, int seq) {
+        jdbc.update("INSERT INTO release_snapshot_seal (batch_key, seal_key, version, label_no,"
+                        + " quantity, sealed_at, seq) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                batchKey, sealKey, version, labelNo, quantity, sealedAt, seq);
+    }
+
+    /**
+     * 快照内固化的封箱版本，按标签号升序序号返回。
+     */
+    public List<SnapshotSealRow> findSnapshotSeals(String batchKey) {
+        return jdbc.query("SELECT * FROM release_snapshot_seal WHERE batch_key = ? ORDER BY seq",
+                SNAPSHOT_SEAL_MAPPER, batchKey);
     }
 }

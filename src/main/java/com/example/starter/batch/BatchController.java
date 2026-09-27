@@ -4,11 +4,17 @@ import com.example.starter.batch.dto.ApproveRequest;
 import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
+import com.example.starter.batch.dto.LabelDiagnosticResponse;
 import com.example.starter.batch.dto.LineageEntryResponse;
+import com.example.starter.batch.dto.PackingDetailResponse;
 import com.example.starter.batch.dto.RecallRequest;
+import com.example.starter.batch.dto.RegisterPackingRequest;
+import com.example.starter.batch.dto.SealBoxesRequest;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
+import com.example.starter.batch.dto.VoidSealRequest;
 import jakarta.validation.Valid;
+import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -18,8 +24,10 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.time.Instant;
 import java.util.List;
 
 /**
@@ -112,6 +120,55 @@ public class BatchController {
     @GetMapping("/{batchKey}/descendants")
     public List<LineageEntryResponse> descendants(@PathVariable String batchKey) {
         return service.listDescendants(batchKey);
+    }
+
+    /**
+     * 登记包装计划：计划数量与连续标签号段（号段容量不得小于计划数量）。
+     */
+    @PostMapping("/{batchKey}/packing-plan")
+    public ResponseEntity<String> registerPacking(@PathVariable String batchKey,
+                                                  @Valid @RequestBody RegisterPackingRequest request) {
+        return stored(service.registerPacking(batchKey, request));
+    }
+
+    /**
+     * 批量封箱：一次提交完整集合，先校验完整最终集合，任一标签失败整次回滚。
+     */
+    @PostMapping("/{batchKey}/seals")
+    public ResponseEntity<String> sealBoxes(@PathVariable String batchKey,
+                                            @Valid @RequestBody SealBoxesRequest request) {
+        return stored(service.sealBoxes(batchKey, request));
+    }
+
+    /**
+     封箱作废：仅未放行批次允许，写入原因并释放数量与标签占用。
+     */
+    @PostMapping("/{batchKey}/seals/{sealKey}/void")
+    public ResponseEntity<String> voidSeal(@PathVariable String batchKey,
+                                           @PathVariable String sealKey,
+                                           @Valid @RequestBody VoidSealRequest request) {
+        return stored(service.voidSeal(batchKey, sealKey, request));
+    }
+
+    /**
+     * 包装核销明细与差异诊断（只读）：计划、活跃封箱、历史版本、放行快照与诊断；
+     * 可选 from/to 查询参数按 UTC 左闭右开 [from, to) 做时间窗统计。
+     */
+    @GetMapping("/{batchKey}/packing")
+    public PackingDetailResponse packing(@PathVariable String batchKey,
+                                         @RequestParam(name = "from", required = false)
+                                         @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) Instant from,
+                                         @RequestParam(name = "to", required = false)
+                                         @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) Instant to) {
+        return service.packingDetail(batchKey, from, to);
+    }
+
+    /**
+     * 标签核销差异诊断（只读）。
+     */
+    @GetMapping("/{batchKey}/labels/diagnostic")
+    public LabelDiagnosticResponse diagnostic(@PathVariable String batchKey) {
+        return service.labelDiagnostic(batchKey);
     }
 
     private ResponseEntity<String> stored(StoredResponse response) {

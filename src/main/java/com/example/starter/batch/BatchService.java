@@ -5,13 +5,24 @@ import com.example.starter.batch.dto.ApproveRequest;
 import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
+import com.example.starter.batch.dto.LabelDiagnosticResponse;
 import com.example.starter.batch.dto.LineageEntryResponse;
+import com.example.starter.batch.dto.PackingDetailResponse;
+import com.example.starter.batch.dto.PackingPlanResponse;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.RecallResponse;
+import com.example.starter.batch.dto.RegisterPackingRequest;
+import com.example.starter.batch.dto.ReleaseSnapshotResponse;
+import com.example.starter.batch.dto.SealBoxesRequest;
+import com.example.starter.batch.dto.SealBoxesResponse;
+import com.example.starter.batch.dto.SealEventResponse;
+import com.example.starter.batch.dto.SealWindowResponse;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SplitResponse;
 import com.example.starter.batch.dto.SubmitTestRequest;
 import com.example.starter.batch.dto.TestResultResponse;
+import com.example.starter.batch.dto.VoidSealRequest;
+import com.example.starter.batch.dto.VoidSealResponse;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
@@ -22,18 +33,23 @@ import org.springframework.transaction.support.TransactionTemplate;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Supplier;
+import java.util.stream.Collectors;
 
 /**
  * 批次隔离与放行核心服务。
@@ -50,6 +66,12 @@ public class BatchService {
     private static final String CMD_APPROVE = "APPROVE";
     private static final String CMD_RECALL = "RECALL";
     private static final String CMD_SPLIT = "SPLIT";
+    private static final String CMD_REGISTER_PACKING = "REGISTER_PACKING";
+    private static final String CMD_SEAL_BOXES = "SEAL_BOXES";
+    private static final String CMD_VOID_SEAL = "VOID_SEAL";
+
+    private static final String SEAL_STATUS_SEALED = "SEALED";
+    private static final String SEAL_STATUS_VOIDED = "VOIDED";
 
     /**
      * 指纹拼接分隔符（NUL）：业务参数不可能包含该字符，避免拼接碰撞。
@@ -61,13 +83,16 @@ public class BatchService {
     private final BatchRepository repo;
     private final TransactionTemplate tx;
     private final ObjectMapper objectMapper;
+    private final Clock clock;
 
     public BatchService(BatchRepository repo,
                         PlatformTransactionManager transactionManager,
-                        ObjectMapper objectMapper) {
+                        ObjectMapper objectMapper,
+                        Clock clock) {
         this.repo = repo;
         this.tx = new TransactionTemplate(transactionManager);
         this.objectMapper = objectMapper;
+        this.clock = clock;
     }
 
     /**
@@ -199,6 +224,9 @@ public class BatchService {
                 }
                 seq = 2;
                 newStatus = BatchStatus.RELEASED;
+                // 放行最终校验：已登记包装计划时，全部计划数量必须封箱完成且标签数与封箱数一致，
+                // 校验通过后与批准在同一事务固化放行快照；任一不满足整笔回滚，查不到半成品。
+                freezeReleaseSnapshotIfPlanned(batchKey, now);
             }
             repo.insertApproval(new BatchRepository.ApprovalRow(0L, batchKey, req.commandKey(),
                     actor, role.name(), seq, now));
@@ -286,7 +314,10 @@ public class BatchService {
                 .map(r -> new RecallResponse(r.batchKey(), r.actorId(), r.reason(),
                         BatchStatus.RECALLED, Instant.parse(r.createdAt())))
                 .orElse(null);
-        return new BatchHistoryResponse(toBatchResponse(batch), tests, approvals, recall);
+        PackingDetailResponse packing = repo.findPackingPlan(batchKey).isPresent()
+                ? packingDetail(batchKey, null, null)
+                : null;
+        return new BatchHistoryResponse(toBatchResponse(batch), tests, approvals, recall, packing);
     }
 
     /**
@@ -396,7 +427,7 @@ public class BatchService {
     }
 
     private String now() {
-        return Instant.now().toString();
+        return Instant.now(clock).toString();
     }
 
     private String fingerprint(String... parts) {        String canonical = String.join(SEP, parts);
@@ -574,5 +605,352 @@ public class BatchService {
         return new LineageEntryResponse(row.batchKey(), row.batchNo(),
                 BatchStatus.valueOf(row.status()),
                 recalledAncestor(batchKey, parentOf, recalled).orElse(null));
+    }
+
+    // ==================== 批次标签核销（包装计划、封箱、作废、放行快照、诊断） ====================
+
+    /**
+     * 登记包装计划：计划数量为正整数，号段 [start,end] 两端含且起点不得大于终点。
+     * 每个批次至多登记一次，重复登记返回 409；批次不存在返回 404；
+     * 已召回/已放行批次禁止登记返回 409。号段容量无需等于计划数量：一标签对应一封箱，
+     * 每箱数量为正整数，放行时要求数量之和恰为计划数量且已用标签数等于封箱数。
+     */
+    public StoredResponse registerPacking(String batchKey, RegisterPackingRequest req) {
+        if (req.labelRangeEnd() < req.labelRangeStart()) {
+            throw ApiException.badRequest("labelRangeEnd 不得小于 labelRangeStart");
+        }
+        String fingerprint = fingerprint("registerPacking", batchKey,
+                Long.toString(req.plannedQuantity()), Long.toString(req.labelRangeStart()),
+                Long.toString(req.labelRangeEnd()));
+        return executeIdempotent(CMD_REGISTER_PACKING, req.commandKey(), fingerprint, () -> {
+            BatchRepository.BatchRow batch = repo.findBatchForUpdate(batchKey)
+                    .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+            var logged = loggedResponse(CMD_REGISTER_PACKING, req.commandKey(), fingerprint);
+            if (logged.isPresent()) {
+                return logged.get();
+            }
+            if (BatchStatus.RECALLED.name().equals(batch.status())) {
+                throw ApiException.conflict("批次已召回，禁止登记包装计划");
+            }
+            if (BatchStatus.RELEASED.name().equals(batch.status())
+                    || BatchStatus.SPLIT.name().equals(batch.status())) {
+                throw ApiException.conflict("批次已放行，不能补登记包装计划: " + batchKey);
+            }
+            if (repo.findPackingPlan(batchKey).isPresent()) {
+                throw ApiException.conflict("批次已登记包装计划，计划数量与号段不可修改: " + batchKey);
+            }
+            String now = now();
+            repo.insertPackingPlan(new BatchRepository.PackingPlanRow(batchKey,
+                    req.plannedQuantity(), req.labelRangeStart(), req.labelRangeEnd(), now));
+            PackingPlanResponse body = new PackingPlanResponse(batchKey, req.plannedQuantity(),
+                    req.labelRangeStart(), req.labelRangeEnd(), 0L, 0L,
+                    req.plannedQuantity(), Instant.parse(now));
+            return new StoredResponse(201, toJson(body));
+        });
+    }
+
+    /**
+     * 批量封箱：先按完整最终集合（既有活跃占用 + 本次全部条目）统一校验，
+     * 任一条目越界/重复/超数量/状态非法则整次回滚，不留下部分占用。
+     * 并发同标签由 box_seal_active 与 label_binding 唯一约束保证最多一次成功。
+     */
+    public StoredResponse sealBoxes(String batchKey, SealBoxesRequest req) {
+        List<SealBoxesRequest.Box> boxes = req.boxes();
+        Set<String> sealKeys = new HashSet<>();
+        Set<Long> labelNos = new HashSet<>();
+        List<String> parts = new ArrayList<>();
+        parts.add("sealBoxes");
+        parts.add(batchKey);
+        for (SealBoxesRequest.Box box : boxes) {
+            if (!sealKeys.add(box.sealKey())) {
+                throw ApiException.conflict("请求内 sealKey 重复: " + box.sealKey());
+            }
+            if (!labelNos.add(box.labelNo())) {
+                throw ApiException.unprocessable("请求内标签号重复: " + box.labelNo());
+            }
+            parts.add(box.sealKey());
+            parts.add(Long.toString(box.labelNo()));
+            parts.add(Long.toString(box.quantity()));
+        }
+        String fingerprint = fingerprint(parts.toArray(new String[0]));
+        // 同批次并发由 batch 行 FOR UPDATE 串行化；跨批次同标签号并发由 label_binding 主键兜底，
+        // 负者事务回滚后在 executeIdempotent 的重试中重新读到绑定，转为“已关联其他批次”409。
+        return executeIdempotent(CMD_SEAL_BOXES, req.commandKey(), fingerprint, () -> {
+            BatchRepository.BatchRow batch = repo.findBatchForUpdate(batchKey)
+                    .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+            var logged = loggedResponse(CMD_SEAL_BOXES, req.commandKey(), fingerprint);
+            if (logged.isPresent()) {
+                return logged.get();
+            }
+            BatchStatus status = BatchStatus.valueOf(batch.status());
+            if (status == BatchStatus.RECALLED) {
+                throw ApiException.conflict("批次已召回，禁止封箱");
+            }
+            if (status == BatchStatus.RELEASED || status == BatchStatus.SPLIT) {
+                throw ApiException.conflict("批次已放行，禁止再封箱；标签差异只能按召回流程处置");
+            }
+            BatchRepository.PackingPlanRow plan = repo.findPackingPlan(batchKey)
+                    .orElseThrow(() -> ApiException.unprocessable("批次尚未登记包装计划，不能封箱"));
+
+            List<BatchRepository.ActiveSealRow> active = repo.findActiveSeals(batchKey);
+            Map<String, BatchRepository.ActiveSealRow> activeBySeal = active.stream()
+                    .collect(Collectors.toMap(BatchRepository.ActiveSealRow::sealKey, r -> r));
+            Map<Long, BatchRepository.ActiveSealRow> activeByLabel = active.stream()
+                    .collect(Collectors.toMap(BatchRepository.ActiveSealRow::labelNo, r -> r));
+
+            // 第一阶段：仅校验完整最终集合（既有活跃占用 + 本次全部条目），不写任何数据。
+            long currentQuantity = active.stream()
+                    .mapToLong(BatchRepository.ActiveSealRow::quantity).sum();
+            long requestQuantity = 0L;
+            for (SealBoxesRequest.Box box : boxes) {
+                if (box.labelNo() < plan.labelRangeStart() || box.labelNo() > plan.labelRangeEnd()) {
+                    throw ApiException.unprocessable("标签号越界: " + box.labelNo()
+                            + "，要求落在 [" + plan.labelRangeStart() + ", " + plan.labelRangeEnd() + "]");
+                }
+                var binding = repo.findLabelBinding(box.labelNo());
+                if (binding.isPresent() && !binding.get().batchKey().equals(batchKey)) {
+                    throw ApiException.conflict("标签号 " + box.labelNo()
+                            + " 已关联其他批次 " + binding.get().batchKey() + "，每个标签只能关联一个批次");
+                }
+                if (activeBySeal.containsKey(box.sealKey())) {
+                    throw ApiException.conflict("封箱键已存在活跃封箱，不能重复封箱: " + box.sealKey());
+                }
+                if (activeByLabel.containsKey(box.labelNo())) {
+                    throw ApiException.unprocessable("标签号已被本批次其他封箱占用: " + box.labelNo());
+                }
+                requestQuantity += box.quantity();
+            }
+            long finalQuantity = currentQuantity + requestQuantity;
+            if (finalQuantity > plan.plannedQuantity()) {
+                throw ApiException.unprocessable("封箱数量超过计划数量: 实际累计 " + finalQuantity
+                        + "，要求上限 " + plan.plannedQuantity()
+                        + "，超出 " + (finalQuantity - plan.plannedQuantity()));
+            }
+
+            // 第二阶段：校验通过后统一写入；任一唯一约束冲突上抛，整事务回滚不留部分占用。
+            String now = now();
+            List<SealEventResponse> sealed = new ArrayList<>(boxes.size());
+            for (SealBoxesRequest.Box box : boxes) {
+                int version = repo.findLatestSealEvent(batchKey, box.sealKey())
+                        .map(e -> e.version() + 1).orElse(1);
+                repo.insertSealEvent(new BatchRepository.SealEventRow(0L, batchKey, box.sealKey(),
+                        version, box.labelNo(), box.quantity(), SEAL_STATUS_SEALED,
+                        null, now, null));
+                repo.insertActiveSeal(new BatchRepository.ActiveSealRow(batchKey, box.labelNo(),
+                        box.sealKey(), version, box.quantity(), now));
+                // 全局标签绑定只在标签首次成功封箱时落库，作废不解除；唯一主键兜底并发跨批同号。
+                if (repo.findLabelBinding(box.labelNo()).isEmpty()) {
+                    repo.insertLabelBinding(new BatchRepository.LabelBindingRow(box.labelNo(),
+                            batchKey, now));
+                }
+                sealed.add(new SealEventResponse(box.sealKey(), version, box.labelNo(),
+                        box.quantity(), SEAL_STATUS_SEALED, null,
+                        Instant.parse(now), null));
+            }
+
+            long sealedQuantity = repo.sumActiveQuantity(batchKey);
+            List<BatchRepository.ActiveSealRow> finalActive = repo.findActiveSeals(batchKey);
+            SealBoxesResponse body = new SealBoxesResponse(batchKey, sealedQuantity,
+                    plan.plannedQuantity(), finalActive.size(), finalActive.size(),
+                    plan.plannedQuantity() - sealedQuantity,
+                    sealed.stream().sorted(Comparator.comparingLong(SealEventResponse::labelNo)).toList());
+            return new StoredResponse(201, toJson(body));
+        });
+    }
+
+    /**
+     * 作废封箱：仅未放行（无放行快照）批次允许；写入作废原因，释放数量与标签活跃占用。
+     * 作废后同 sealKey 可重封（version 递增），历史版本永久保留。
+     */
+    public StoredResponse voidSeal(String batchKey, String sealKey, VoidSealRequest req) {
+        String fingerprint = fingerprint("voidSeal", batchKey, sealKey, req.reason());
+        return executeIdempotent(CMD_VOID_SEAL, req.commandKey(), fingerprint, () -> {
+            BatchRepository.BatchRow batch = repo.findBatchForUpdate(batchKey)
+                    .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+            var logged = loggedResponse(CMD_VOID_SEAL, req.commandKey(), fingerprint);
+            if (logged.isPresent()) {
+                return logged.get();
+            }
+            if (repo.findReleaseSnapshot(batchKey).isPresent()) {
+                throw ApiException.conflict("批次已放行，快照不可改写，封箱不能作废；差异只能按召回流程处置");
+            }
+            if (BatchStatus.RECALLED.name().equals(batch.status())) {
+                throw ApiException.conflict("批次已召回，封箱不能作废");
+            }
+            BatchRepository.ActiveSealRow active = repo.findActiveSealByKey(batchKey, sealKey)
+                    .orElseThrow(() -> {
+                        BatchRepository.SealEventRow last = repo.findLatestSealEvent(batchKey, sealKey)
+                                .orElse(null);
+                        if (last == null) {
+                            return ApiException.notFound("封箱不存在: " + sealKey);
+                        }
+                        return ApiException.conflict("封箱已作废，不能重复作废: " + sealKey);
+                    });
+            String now = now();
+            int updated = repo.voidSealEvent(batchKey, sealKey, active.version(), req.reason(), now);
+            if (updated != 1) {
+                throw ApiException.conflict("封箱状态已变化，作废失败: " + sealKey);
+            }
+            repo.deleteActiveSeal(batchKey, sealKey);
+            List<BatchRepository.ActiveSealRow> remaining = repo.findActiveSeals(batchKey);
+            long sealedQuantity = remaining.stream().mapToLong(BatchRepository.ActiveSealRow::quantity).sum();
+            VoidSealResponse body = new VoidSealResponse(batchKey, sealKey, active.version(),
+                    req.reason(), sealedQuantity, remaining.size(), Instant.parse(now));
+            return new StoredResponse(201, toJson(body));
+        });
+    }
+
+    /**
+     * 包装核销明细（只读）：计划、活跃封箱、全部历史版本、放行快照、差异诊断，
+     * 可选 UTC 左闭右开时间窗 [from,to) 统计。读取不改变任何状态。
+     */
+    public PackingDetailResponse packingDetail(String batchKey, Instant from, Instant to) {
+        BatchRepository.BatchRow batch = repo.findBatch(batchKey)
+                .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+        BatchRepository.PackingPlanRow planRow = repo.findPackingPlan(batchKey)
+                .orElseThrow(() -> ApiException.notFound("批次尚未登记包装计划: " + batchKey));
+        List<BatchRepository.ActiveSealRow> activeRows = repo.findActiveSeals(batchKey);
+        List<BatchRepository.SealEventRow> eventRows = repo.findSealEvents(batchKey);
+
+        long sealedQuantity = activeRows.stream().mapToLong(BatchRepository.ActiveSealRow::quantity).sum();
+        PackingPlanResponse plan = new PackingPlanResponse(batchKey, planRow.plannedQuantity(),
+                planRow.labelRangeStart(), planRow.labelRangeEnd(), sealedQuantity,
+                activeRows.size(), planRow.plannedQuantity() - sealedQuantity,
+                Instant.parse(planRow.createdAt()));
+
+        List<SealEventResponse> activeSeals = activeRows.stream()
+                .sorted(Comparator.comparingLong(BatchRepository.ActiveSealRow::labelNo))
+                .map(a -> new SealEventResponse(a.sealKey(), a.version(), a.labelNo(), a.quantity(),
+                        SEAL_STATUS_SEALED, null, Instant.parse(a.sealedAt()), null))
+                .toList();
+        List<SealEventResponse> history = eventRows.stream().map(this::toSealEventResponse).toList();
+
+        ReleaseSnapshotResponse snapshot = repo.findReleaseSnapshot(batchKey)
+                .map(r -> toSnapshotResponse(batchKey, r)).orElse(null);
+        LabelDiagnosticResponse diagnostic = buildDiagnostic(planRow, activeRows, snapshot);
+
+        SealWindowResponse window = null;
+        if (from != null || to != null) {
+            if (from != null && to != null && !to.isAfter(from)) {
+                throw ApiException.badRequest("时间窗要求 to 晚于 from（左闭右开 [from, to)）");
+            }
+            List<BatchRepository.SealEventRow> inWindow = eventRows.stream()
+                    .filter(e -> from == null || !Instant.parse(e.sealedAt()).isBefore(from))
+                    .filter(e -> to == null || Instant.parse(e.sealedAt()).isBefore(to))
+                    .toList();
+            Long duration = (from != null && to != null)
+                    ? Duration.between(from, to).getSeconds() : null;
+            window = new SealWindowResponse(from, to, duration, inWindow.size(),
+                    inWindow.stream().mapToLong(BatchRepository.SealEventRow::quantity).sum());
+        }
+        return new PackingDetailResponse(batchKey, plan, activeSeals, history, snapshot,
+                diagnostic, window);
+    }
+
+    /**
+     * 只读差异诊断明细入口（与 packingDetail 同源，便于直接查询诊断）。
+     */
+    public LabelDiagnosticResponse labelDiagnostic(String batchKey) {
+        repo.findBatch(batchKey)
+                .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+        BatchRepository.PackingPlanRow planRow = repo.findPackingPlan(batchKey)
+                .orElseThrow(() -> ApiException.unprocessable("批次尚未登记包装计划: " + batchKey));
+        List<BatchRepository.ActiveSealRow> activeRows = repo.findActiveSeals(batchKey);
+        ReleaseSnapshotResponse snapshot = repo.findReleaseSnapshot(batchKey)
+                .map(r -> toSnapshotResponse(batchKey, r)).orElse(null);
+        return buildDiagnostic(planRow, activeRows, snapshot);
+    }
+
+    /**
+     * 构造差异诊断：数量差额、标签数与封箱数差额、越界标签，以及与放行快照的标签集合差异。
+     */
+    private LabelDiagnosticResponse buildDiagnostic(BatchRepository.PackingPlanRow plan,
+                                                    List<BatchRepository.ActiveSealRow> active,
+                                                    ReleaseSnapshotResponse snapshot) {
+        String batchKey = plan.batchKey();
+        long sealedQuantity = active.stream().mapToLong(BatchRepository.ActiveSealRow::quantity).sum();
+        long quantityDifference = sealedQuantity - plan.plannedQuantity();
+        List<Long> usedLabels = active.stream()
+                .map(BatchRepository.ActiveSealRow::labelNo)
+                .sorted().toList();
+        long distinctLabelCount = new HashSet<>(usedLabels).size();
+        long labelSealDifference = distinctLabelCount - active.size();
+        List<Long> outside = usedLabels.stream()
+                .filter(l -> l < plan.labelRangeStart() || l > plan.labelRangeEnd())
+                .toList();
+        boolean reconciled = quantityDifference == 0L
+                && labelSealDifference == 0L
+                && outside.isEmpty();
+        Boolean snapshotConsistent = null;
+        List<Long> missing = null;
+        List<Long> extra = null;
+        if (snapshot != null) {
+            Set<Long> frozen = new LinkedHashSet<>(snapshot.usedLabels());
+            Set<Long> current = new LinkedHashSet<>(usedLabels);
+            missing = frozen.stream().filter(l -> !current.contains(l)).sorted().toList();
+            extra = current.stream().filter(l -> !frozen.contains(l)).sorted().toList();
+            snapshotConsistent = missing.isEmpty() && extra.isEmpty()
+                    && snapshot.sealedQuantity() == sealedQuantity;
+        }
+        return new LabelDiagnosticResponse(reconciled, plan.plannedQuantity(), sealedQuantity,
+                quantityDifference, active.size(), usedLabels.size(), labelSealDifference,
+                outside, snapshotConsistent, missing, extra);
+    }
+
+    /**
+     * 放行最终校验与快照固化：计划数量必须全部完成，且号段内已用标签数等于活跃封箱数。
+     * 校验与快照写入、第二批准、状态翻转在同一事务；失败整体回滚。
+     */
+    private void freezeReleaseSnapshotIfPlanned(String batchKey, String now) {
+        var planOpt = repo.findPackingPlan(batchKey);
+        if (planOpt.isEmpty()) {
+            return;
+        }
+        BatchRepository.PackingPlanRow plan = planOpt.get();
+        List<BatchRepository.ActiveSealRow> active = repo.findActiveSeals(batchKey);
+        long sealedQuantity = active.stream().mapToLong(BatchRepository.ActiveSealRow::quantity).sum();
+        if (sealedQuantity != plan.plannedQuantity()) {
+            throw ApiException.unprocessable("放行前必须完成全部计划数量封箱: 实际 " + sealedQuantity
+                    + "，要求 " + plan.plannedQuantity()
+                    + "，差额 " + (plan.plannedQuantity() - sealedQuantity));
+        }
+        long distinctLabels = active.stream().map(BatchRepository.ActiveSealRow::labelNo).distinct().count();
+        if (distinctLabels != active.size()) {
+            throw ApiException.unprocessable("已用标签数与封箱数不一致: 标签数 " + distinctLabels
+                    + "，封箱数 " + active.size());
+        }
+        List<BatchRepository.ActiveSealRow> ordered = active.stream()
+                .sorted(Comparator.comparingLong(BatchRepository.ActiveSealRow::labelNo)).toList();
+        List<Long> labels = ordered.stream().map(BatchRepository.ActiveSealRow::labelNo).toList();
+        String usedLabelsCsv = labels.stream().map(String::valueOf).collect(Collectors.joining(","));
+        repo.insertReleaseSnapshot(new BatchRepository.ReleaseSnapshotRow(batchKey,
+                plan.plannedQuantity(), sealedQuantity, distinctLabels, active.size(),
+                usedLabelsCsv, now));
+        int seq = 1;
+        for (BatchRepository.ActiveSealRow a : ordered) {
+            repo.insertSnapshotSeal(batchKey, a.sealKey(), a.version(), a.labelNo(), a.quantity(),
+                    a.sealedAt(), seq++);
+        }
+    }
+
+    private SealEventResponse toSealEventResponse(BatchRepository.SealEventRow row) {
+        return new SealEventResponse(row.sealKey(), row.version(), row.labelNo(), row.quantity(),
+                row.status(), row.voidReason(), Instant.parse(row.sealedAt()),
+                row.voidedAt() == null ? null : Instant.parse(row.voidedAt()));
+    }
+
+    private ReleaseSnapshotResponse toSnapshotResponse(String batchKey,
+                                                       BatchRepository.ReleaseSnapshotRow row) {
+        List<Long> labels = row.usedLabels().isBlank()
+                ? List.of()
+                : java.util.Arrays.stream(row.usedLabels().split(","))
+                        .map(Long::valueOf).sorted().toList();
+        List<ReleaseSnapshotResponse.FrozenSeal> seals = repo.findSnapshotSeals(batchKey).stream()
+                .map(s -> new ReleaseSnapshotResponse.FrozenSeal(s.sealKey(), s.version(),
+                        s.labelNo(), s.quantity(), Instant.parse(s.sealedAt())))
+                .toList();
+        return new ReleaseSnapshotResponse(batchKey, row.plannedQuantity(), row.sealedQuantity(),
+                row.sealedQuantity() - row.plannedQuantity(), row.usedLabelCount(),
+                row.sealCount(), labels, seals, Instant.parse(row.createdAt()));
     }
 }
