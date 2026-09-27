@@ -74,6 +74,57 @@ public final class Dtos {
                                   List<CurtailmentResponse> curtailments) {
     }
 
+    /** 登记渠道日蒸发率命令；date 为 UTC 自然日（yyyy-MM-dd），rate 为小数 0～0.2、最多四位小数。 */
+    public record RegisterEvaporationRateRequest(String commandKey, String date, String rate) {
+    }
+
+    /** 蒸发率版本视图，登记后不可变。 */
+    public record EvaporationRateResponse(long id, String channelId, String date, int version, String rate,
+                                          String createdUtc) {
+    }
+
+    /** 单笔核销送达水量命令。 */
+    public record SettleRequest(String commandKey, String allocationKey, String date, String delivered) {
+    }
+
+    /** 批量核销的单项。 */
+    public record SettleItemRequest(String allocationKey, String date, String delivered) {
+    }
+
+    /** 批量核销命令：任一 item 预校验失败则整批回滚。 */
+    public record BatchSettleRequest(String commandKey, List<SettleItemRequest> items) {
+    }
+
+    /**
+     * 核销记录视图（创建后不可变）。kind：SETTLEMENT / CORRECTION；
+     * 更正记录的 delivered/loss/deduction 为原记录相反数；correctsId 非更正记录为 null；
+     * upstreamRemaining 为本记录应用后上游持有额度快照。
+     */
+    public record SettlementResponse(long id, String allocationKey, long windowId, String channelId, String date,
+                                     int rateVersion, String rate, String delivered, String loss, String deduction,
+                                     String kind, Long correctsId, int batchNo, String upstreamRemaining,
+                                     String createdUtc) {
+    }
+
+    /** 批量核销结果视图。 */
+    public record BatchSettleResponse(List<SettlementResponse> settlements) {
+    }
+
+    /** 申请维度核销历史视图，按记录主键升序（含更正记录）。 */
+    public record SettlementListResponse(String allocationKey, List<SettlementResponse> settlements) {
+    }
+
+    /**
+     * 渠道日蒸发诊断视图（只读）。currentVersion/currentRate 为 null 表示当日未登记；
+     * locked 为 true 表示当日已发生首次核销、禁止再改率；净额汇总把更正记录按负值计入。
+     */
+    public record EvaporationDiagnosticsResponse(String channelId, String date, Integer currentVersion,
+                                                 String currentRate, boolean locked,
+                                                 List<EvaporationRateResponse> versions,
+                                                 String netDelivered, String netLoss, String netDeduction,
+                                                 long settlementCount) {
+    }
+
     /** 统一错误响应体。 */
     public record ErrorResponse(String code, String message) {
     }

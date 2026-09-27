@@ -3,12 +3,21 @@ package com.example.starter.water;
 import com.example.starter.water.WaterRepository.AllocationRow;
 import com.example.starter.water.WaterRepository.CommandRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
+import com.example.starter.water.WaterRepository.EvaporationRateRow;
+import com.example.starter.water.WaterRepository.SettlementRow;
+import com.example.starter.water.WaterRepository.SettlementTotals;
 import com.example.starter.water.WaterRepository.TransferRow;
 import com.example.starter.water.WaterRepository.WindowRow;
 import com.example.starter.water.dto.Dtos.AllocationResponse;
+import com.example.starter.water.dto.Dtos.BatchSettleResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
+import com.example.starter.water.dto.Dtos.EvaporationDiagnosticsResponse;
+import com.example.starter.water.dto.Dtos.EvaporationRateResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.SettleItemRequest;
+import com.example.starter.water.dto.Dtos.SettlementListResponse;
+import com.example.starter.water.dto.Dtos.SettlementResponse;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferResponse;
 import com.example.starter.water.dto.Dtos.WindowResponse;
@@ -19,11 +28,19 @@ import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneOffset;
 import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 /**
  * 灌区配水业务服务。
@@ -41,8 +58,13 @@ public class WaterService {
     static final String STATUS_APPROVED = "APPROVED";
     static final String STATUS_CANCELLED = "CANCELLED";
 
+    static final String KIND_SETTLEMENT = "SETTLEMENT";
+    static final String KIND_CORRECTION = "CORRECTION";
+
     private static final long NANOS_PER_SECOND = 1_000_000_000L;
     private static final Pattern AMOUNT_PATTERN = Pattern.compile("\\d{1,16}(\\.\\d{1,3})?");
+    private static final Pattern RATE_PATTERN = Pattern.compile("\\d(\\.\\d{1,4})?");
+    private static final BigDecimal MAX_RATE = new BigDecimal("0.2");
     private static final Pattern KEY_PATTERN = Pattern.compile("[\\w.\\-:]{1,128}");
 
     private final WaterRepository repository;
@@ -316,6 +338,284 @@ public class WaterService {
     }
 
     // ------------------------------------------------------------------
+    // 蒸发率登记
+    // ------------------------------------------------------------------
+
+    /**
+     * 登记渠道某日（UTC 自然日）蒸发率新版本。该日首次核销后禁止再登记（409 RATE_LOCKED）；
+     * 版本行登记后不可变，核销记录固化当时版本。
+     */
+    public EvaporationRateResponse registerEvaporationRate(String commandKey, String channelId, String dateStr,
+                                                           String rateStr) {
+        requireKey("commandKey", commandKey);
+        requireKey("channelId", channelId);
+        LocalDate date = parseRateDate("date", dateStr);
+        BigDecimal rate = parseRate("rate", rateStr);
+        String params = "EVAP_RATE_REGISTER|" + channelId + "|" + date + "|" + rate.toPlainString();
+        return runCommand("EVAP_RATE_REGISTER", commandKey, params, EvaporationRateResponse.class, () -> {
+            // 锁定当日最新版本行：与核销（同样锁该行）按事务提交顺序串行裁决
+            EvaporationRateRow latest = repository.lockLatestRateVersion(channelId, date);
+            if (latest != null && repository.existsSettlementForChannelDate(channelId, date)) {
+                throw ApiException.conflict("RATE_LOCKED",
+                        "渠道 " + channelId + " 在 " + date + " 已发生首次核销，蒸发率不可再修改");
+            }
+            int version = latest == null ? 1 : latest.version() + 1;
+            long id;
+            try {
+                id = repository.insertEvaporationRate(channelId, date, version, rate, nowNanos());
+            } catch (DuplicateKeyException e) {
+                // 并发首次登记同一渠道同一日：唯一约束兜底
+                throw ApiException.conflict("RATE_REGISTER_CONFLICT",
+                        "渠道 " + channelId + " 在 " + date + " 的蒸发率正在并发登记，请重试");
+            }
+            return toRateResponse(repository.findRateById(id));
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // 蒸发损耗核销
+    // ------------------------------------------------------------------
+
+    /** 单笔核销送达水量：上游扣减=送达+损耗（损耗按银行家舍入到两位小数），同事务写入。 */
+    public SettlementResponse settle(String commandKey, String allocationKey, String dateStr,
+                                     String deliveredStr) {
+        requireKey("commandKey", commandKey);
+        requireKey("allocationKey", allocationKey);
+        LocalDate date = parseRateDate("date", dateStr);
+        BigDecimal delivered = parseAmount("delivered", deliveredStr);
+        String params = "SETTLEMENT|" + allocationKey + "|" + date + "|" + delivered.toPlainString();
+        return runCommand("SETTLEMENT", commandKey, params, SettlementResponse.class, () -> {
+            List<SettlementRow> rows = doSettle(
+                    List.of(new SettleItem(allocationKey, date, delivered)), commandKey);
+            return toSettlementResponse(rows.get(0));
+        });
+    }
+
+    /**
+     * 批量核销：锁内按完整最终余额与逐笔舍入口径预校验，任一失败整批回滚；
+     * 全部通过后在一个事务内提交所有上游扣减与核销记录。
+     */
+    public BatchSettleResponse settleBatch(String commandKey, List<SettleItemRequest> items) {
+        requireKey("commandKey", commandKey);
+        if (items == null || items.isEmpty()) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "items 不能为空");
+        }
+        List<SettleItem> parsed = new ArrayList<>();
+        for (SettleItemRequest item : items) {
+            if (item == null) {
+                throw ApiException.badRequest("INVALID_ARGUMENT", "items 不能包含空项");
+            }
+            requireKey("allocationKey", item.allocationKey());
+            parsed.add(new SettleItem(item.allocationKey(), parseRateDate("date", item.date()),
+                    parseAmount("delivered", item.delivered())));
+        }
+        String params = "SETTLEMENT_BATCH|" + parsed.stream()
+                .map(i -> i.allocationKey() + "|" + i.date() + "|" + i.delivered().toPlainString())
+                .collect(Collectors.joining(";"));
+        return runCommand("SETTLEMENT_BATCH", commandKey, params, BatchSettleResponse.class, () -> {
+            List<SettlementRow> rows = doSettle(parsed, commandKey);
+            return new BatchSettleResponse(rows.stream().map(this::toSettlementResponse).toList());
+        });
+    }
+
+    /**
+     * 反向更正：已结算核销不可改写，只能新增一条 CORRECTION 记录（金额为原记录相反数）并回补上游额度。
+     * 同一核销只能更正一次；更正记录本身不能再被更正。
+     */
+    public SettlementResponse correctSettlement(String commandKey, long settlementId) {
+        requireKey("commandKey", commandKey);
+        String params = "SETTLEMENT_CORRECT|" + settlementId;
+        return runCommand("SETTLEMENT_CORRECT", commandKey, params, SettlementResponse.class, () -> {
+            SettlementRow original = repository.findSettlementById(settlementId);
+            if (original == null) {
+                throw ApiException.notFound("SETTLEMENT_NOT_FOUND", "核销记录不存在: " + settlementId);
+            }
+            // 与核销/转让/取消同一窗口锁顺序：窗口 -> 申请 -> 核销记录
+            WindowRow window = repository.lockWindowById(original.windowId());
+            if (window == null) {
+                throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + original.windowId());
+            }
+            AllocationRow allocation = repository.lockAllocationByKey(original.allocationKey());
+            SettlementRow locked = repository.lockSettlementById(settlementId);
+            if (!KIND_SETTLEMENT.equals(locked.kind())) {
+                throw ApiException.conflict("NOT_A_SETTLEMENT", "更正记录不能再次被更正: " + settlementId);
+            }
+            if (repository.existsCorrectionFor(settlementId)) {
+                throw ApiException.conflict("ALREADY_CORRECTED", "核销记录已被更正，不能重复更正: " + settlementId);
+            }
+            BigDecimal newHeld = allocation.heldAmount().add(locked.deduction());
+            if (newHeld.compareTo(allocation.amount()) > 0) {
+                throw ApiException.unprocessable("CORRECTION_OVERFLOW",
+                        "更正回补后持有额度 " + fmt(newHeld) + " 将超过原申请水量 " + fmt(allocation.amount())
+                                + "（当前持有 " + fmt(allocation.heldAmount()) + "，回补 "
+                                + fmt(locked.deduction()) + "）");
+            }
+            long now = nowNanos();
+            repository.incrementHeldAmount(allocation.id(), locked.deduction(), now);
+            long id = repository.insertSettlement(locked.allocationKey(), locked.windowId(), locked.channelId(),
+                    locked.rateDate(), locked.rateVersion(), locked.rate(), locked.delivered().negate(),
+                    locked.loss().negate(), locked.deduction().negate(), newHeld, KIND_CORRECTION,
+                    locked.id(), 0, commandKey, now);
+            return toSettlementResponse(repository.findSettlementById(id));
+        });
+    }
+
+    /** 核销记录明细查询（只读）。 */
+    public SettlementResponse getSettlement(long settlementId) {
+        SettlementRow row = repository.findSettlementById(settlementId);
+        if (row == null) {
+            throw ApiException.notFound("SETTLEMENT_NOT_FOUND", "核销记录不存在: " + settlementId);
+        }
+        return toSettlementResponse(row);
+    }
+
+    /** 申请维度核销历史（含更正记录），按发生顺序返回，只读。 */
+    public SettlementListResponse getAllocationSettlements(String allocationKey) {
+        if (repository.findAllocationByKey(allocationKey) == null) {
+            throw ApiException.notFound("ALLOCATION_NOT_FOUND", "配水申请不存在: " + allocationKey);
+        }
+        List<SettlementResponse> settlements = repository.listSettlementsByAllocation(allocationKey).stream()
+                .map(this::toSettlementResponse).toList();
+        return new SettlementListResponse(allocationKey, settlements);
+    }
+
+    /** 渠道日蒸发诊断：版本历史、是否已锁定、核销净额汇总，只读。 */
+    public EvaporationDiagnosticsResponse getEvaporationDiagnostics(String channelId, String dateStr) {
+        requireKey("channelId", channelId);
+        LocalDate date = parseRateDate("date", dateStr);
+        List<EvaporationRateRow> versions = repository.listRateVersions(channelId, date);
+        EvaporationRateRow latest = versions.isEmpty() ? null : versions.get(versions.size() - 1);
+        boolean locked = repository.existsSettlementForChannelDate(channelId, date);
+        SettlementTotals totals = repository.sumSettlementsForChannelDate(channelId, date);
+        return new EvaporationDiagnosticsResponse(channelId, date.toString(),
+                latest == null ? null : latest.version(), latest == null ? null : fmt(latest.rate()), locked,
+                versions.stream().map(this::toRateResponse).toList(),
+                fmt(totals.netDelivered()), fmt(totals.netLoss()), fmt(totals.netDeduction()),
+                totals.settlementCount());
+    }
+
+    // ------------------------------------------------------------------
+    // 核销内部实现
+    // ------------------------------------------------------------------
+
+    /** 批量核销项（已解析）。 */
+    private record SettleItem(String allocationKey, LocalDate date, BigDecimal delivered) {
+    }
+
+    /** 单笔计算结果。 */
+    private record Computed(AllocationRow allocation, WindowRow window, LocalDate date, BigDecimal delivered,
+                            EvaporationRateRow rate, BigDecimal loss, BigDecimal deduction) {
+    }
+
+    /**
+     * 在命令事务内执行批量核销：先按确定顺序锁定窗口与申请，再在锁内按当日最新率逐笔计算、
+     * 按完整最终余额预校验，全部通过后才写入上游扣减与不可变核销记录。
+     */
+    private List<SettlementRow> doSettle(List<SettleItem> items, String commandKey) {
+        // 解析申请与窗口（无锁快速失败），并校验核销日落在配水窗口内
+        List<AllocationRow> allocations = new ArrayList<>();
+        List<WindowRow> windows = new ArrayList<>();
+        for (SettleItem item : items) {
+            AllocationRow allocation = repository.findAllocationByKey(item.allocationKey());
+            if (allocation == null) {
+                throw ApiException.notFound("ALLOCATION_NOT_FOUND", "配水申请不存在: " + item.allocationKey());
+            }
+            WindowRow window = repository.findWindowById(allocation.windowId());
+            if (window == null) {
+                throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + allocation.windowId());
+            }
+            checkDateInWindow(item.date(), window);
+            allocations.add(allocation);
+            windows.add(window);
+        }
+        // 按确定顺序锁定窗口行与申请行，与转让/取消/更正/限供按事务提交顺序串行裁决
+        windows.stream().mapToLong(WindowRow::id).distinct().sorted()
+                .forEach(repository::lockWindowById);
+        Map<String, AllocationRow> lockedAllocations = new LinkedHashMap<>();
+        allocations.stream().map(AllocationRow::allocationKey).distinct().sorted()
+                .forEach(key -> lockedAllocations.put(key, repository.lockAllocationByKey(key)));
+        // 锁内逐笔计算：锁定当日最新率版本行，阻断并发改率；损耗银行家舍入到两位小数
+        Map<String, EvaporationRateRow> rates = new HashMap<>();
+        List<Computed> computedList = new ArrayList<>();
+        for (int i = 0; i < items.size(); i++) {
+            SettleItem item = items.get(i);
+            WindowRow window = windows.get(i);
+            String rateKey = window.channelId() + "|" + item.date();
+            EvaporationRateRow rate = rates.get(rateKey);
+            if (rate == null) {
+                rate = repository.lockLatestRateVersion(window.channelId(), item.date());
+                if (rate == null) {
+                    throw ApiException.unprocessable("RATE_NOT_FOUND",
+                            "渠道 " + window.channelId() + " 未登记 " + item.date() + " 的蒸发率");
+                }
+                rates.put(rateKey, rate);
+            }
+            computedList.add(computeItem(lockedAllocations.get(item.allocationKey()), window, item, rate));
+        }
+        // 完整最终余额预校验：同一上游多笔扣减累计后不得超过当前持有额度
+        Map<String, BigDecimal> requiredByAllocation = new LinkedHashMap<>();
+        for (Computed computed : computedList) {
+            requiredByAllocation.merge(computed.allocation().allocationKey(), computed.deduction(),
+                    BigDecimal::add);
+        }
+        requiredByAllocation.forEach((allocationKey, required) -> {
+            BigDecimal held = lockedAllocations.get(allocationKey).heldAmount();
+            if (held.compareTo(required) < 0) {
+                throw ApiException.unprocessable("QUOTA_EXCEEDED",
+                        "上游剩余额度不足：当前持有 " + fmt(held) + "，本批需要扣减 " + fmt(required)
+                                + "，差额 " + fmt(required.subtract(held)) + "（申请 " + allocationKey + "）");
+            }
+        });
+        // 全部通过后统一写入：逐笔扣减上游额度并固化核销记录
+        long now = nowNanos();
+        Map<String, BigDecimal> runningHeld = new LinkedHashMap<>();
+        lockedAllocations.forEach((key, row) -> runningHeld.put(key, row.heldAmount()));
+        List<SettlementRow> rows = new ArrayList<>();
+        int batchNo = 0;
+        for (Computed computed : computedList) {
+            String allocationKey = computed.allocation().allocationKey();
+            BigDecimal remaining = runningHeld.get(allocationKey).subtract(computed.deduction());
+            runningHeld.put(allocationKey, remaining);
+            long id = repository.insertSettlement(allocationKey, computed.window().id(),
+                    computed.window().channelId(), computed.date(), computed.rate().version(),
+                    computed.rate().rate(), computed.delivered(), computed.loss(), computed.deduction(),
+                    remaining, KIND_SETTLEMENT, null, batchNo++, commandKey, now);
+            rows.add(repository.findSettlementById(id));
+        }
+        lockedAllocations.forEach((key, row) -> {
+            BigDecimal total = row.heldAmount().subtract(runningHeld.get(key));
+            if (total.signum() > 0) {
+                repository.decrementHeldAmount(row.id(), total, now);
+            }
+        });
+        return rows;
+    }
+
+    /** 逐笔计算损耗与上游扣减，并校验舍入后守恒（扣减=送达+损耗，两位小数口径）。 */
+    private Computed computeItem(AllocationRow allocation, WindowRow window, SettleItem item,
+                                 EvaporationRateRow rate) {
+        BigDecimal loss = item.delivered().multiply(rate.rate()).setScale(2, RoundingMode.HALF_EVEN);
+        BigDecimal deduction = item.delivered().add(loss);
+        if (deduction.stripTrailingZeros().scale() > 2) {
+            throw ApiException.unprocessable("CONSERVATION_VIOLATED",
+                    "舍入后守恒不成立：送达 " + fmt(item.delivered()) + " + 损耗 " + fmt(loss) + " = "
+                            + fmt(deduction) + " 超出两位小数口径，无法保证上游扣减=送达+损耗");
+        }
+        return new Computed(allocation, window, item.date(), item.delivered(), rate, loss, deduction);
+    }
+
+    /** 核销日（UTC 自然日，左闭右开）必须与配水窗口 [start, end) 相交，否则 422。 */
+    private void checkDateInWindow(LocalDate date, WindowRow window) {
+        long dayStart = toNanos(date.atStartOfDay().toInstant(ZoneOffset.UTC));
+        long dayEnd = toNanos(date.plusDays(1).atStartOfDay().toInstant(ZoneOffset.UTC));
+        if (!(dayStart < window.endNanos() && window.startNanos() < dayEnd)) {
+            throw ApiException.unprocessable("DATE_OUT_OF_WINDOW",
+                    "核销日期 " + date + " 不在配水窗口 [" + toIso(window.startNanos()) + ", "
+                            + toIso(window.endNanos()) + ") 内");
+        }
+    }
+
+    // ------------------------------------------------------------------
     // 幂等命令框架
     // ------------------------------------------------------------------
 
@@ -390,6 +690,49 @@ public class WaterService {
     private CurtailmentResponse toCurtailmentResponse(CurtailmentRow row) {
         return new CurtailmentResponse(row.id(), row.windowId(), fmt(row.volume()), row.status(),
                 toIso(row.createdNanos()), row.cancelledNanos() == null ? null : toIso(row.cancelledNanos()));
+    }
+
+    private EvaporationRateResponse toRateResponse(EvaporationRateRow row) {
+        return new EvaporationRateResponse(row.id(), row.channelId(), row.rateDate().toString(), row.version(),
+                fmt(row.rate()), toIso(row.createdNanos()));
+    }
+
+    private SettlementResponse toSettlementResponse(SettlementRow row) {
+        return new SettlementResponse(row.id(), row.allocationKey(), row.windowId(), row.channelId(),
+                row.rateDate().toString(), row.rateVersion(), fmt(row.rate()), fmt(row.delivered()),
+                fmt(row.loss()), fmt(row.deduction()), row.kind(), row.correctsId(), row.batchNo(),
+                fmt(row.upstreamRemaining()), toIso(row.createdNanos()));
+    }
+
+    /** 解析 UTC 自然日（yyyy-MM-dd）。 */
+    static LocalDate parseRateDate(String field, String value) {
+        if (value == null || value.isBlank()) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", field + " 不能为空");
+        }
+        try {
+            return LocalDate.parse(value.trim());
+        } catch (DateTimeParseException e) {
+            throw ApiException.badRequest("INVALID_ARGUMENT",
+                    field + " 不是合法的 UTC 自然日（yyyy-MM-dd）: " + value);
+        }
+    }
+
+    /** 解析蒸发率：小数 0～0.2（0～20%），最多四位小数。 */
+    static BigDecimal parseRate(String field, String value) {
+        if (value == null || value.isBlank()) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", field + " 不能为空");
+        }
+        String trimmed = value.trim();
+        if (!RATE_PATTERN.matcher(trimmed).matches()) {
+            throw ApiException.badRequest("INVALID_ARGUMENT",
+                    field + " 必须为 0～0.2 的十进制字符串，最多四位小数: " + value);
+        }
+        BigDecimal rate = new BigDecimal(trimmed);
+        if (rate.compareTo(MAX_RATE) > 0) {
+            throw ApiException.badRequest("INVALID_ARGUMENT",
+                    field + " 不能超过 0.2（20%）: " + value);
+        }
+        return rate;
     }
 
     static long nowNanos() {
