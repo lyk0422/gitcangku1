@@ -84,6 +84,16 @@ public class ResolutionRepository {
                 RESOLUTION_MAPPER, observationId);
     }
 
+    /**
+     * 判断观测记录是否已存在人工裁决（冲突解决）记录；许可撤销时跳过这些观测，不重算。
+     */
+    public boolean existsByObservationId(String observationId) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM conflict_resolution WHERE observation_id = ?",
+                Integer.class, observationId);
+        return count != null && count > 0;
+    }
+
     private String writeJson(Object value) {
         try {
             return objectMapper.writeValueAsString(value);

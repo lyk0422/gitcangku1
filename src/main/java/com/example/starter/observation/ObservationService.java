@@ -14,6 +14,7 @@ import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -23,11 +24,21 @@ import java.util.Optional;
 import java.util.Set;
 
 /**
- * 现场观测离线三方合并业务服务。
+ * 现场观测离线三方合并与观测采样许可业务服务。
  *
- * <p>写操作（创建/离线提交/删除）均在单事务内完成：先占位写入幂等去重记录，
- * 再对 observation_current 行加锁（SELECT ... FOR UPDATE）完成业务判定与变更，
+ * <p>写操作（创建/离线提交/删除/批量合并）均在单事务内完成：先占位写入幂等去重记录，
+ * 再对相关行加锁（SELECT ... FOR UPDATE）完成业务判定与变更，
  * 最后回填去重记录的响应并整体提交；任何业务失败都会回滚，去重记录不占键。
+ *
+ * <p>提交观测（创建）时，设备、采集网格与采集时刻必须命中唯一有效许可（ACTIVE/ENDED 且
+ * 网格闭区间与 UTC 左闭右开有效期均覆盖）：无许可 422 PERMIT_NOT_FOUND、命中不唯一
+ * 422 PERMIT_AMBIGUOUS、超出许可最大观测数 422 PERMIT_LIMIT_EXCEEDED；成功只扣减该许可计数。
+ * permitKey（requestId）指纹含设备、许可版本、网格、时刻与观测内容；同键重放返回原结果，
+ * 失败不占键。重放判定的许可版本取自首次提交落库的观测记录，许可之后被结束/撤销不影响重放。
+ *
+ * <p>批量离线合并在同一事务内先预校验：每项唯一命中许可、按许可汇总的完整最终计数不超上限、
+ * 每项三方合并无冲突簇；任一失败（许可 422 / 冲突 409 / 记录缺失 404）整批回滚，
+ * 全部观测与簇变化不落地。预校验通过后按提交顺序逐项应用并扣减许可计数。
  *
  * <p>合并规则（按字段比较基线 base、当前 current、候选 candidate）：
  * 候选未改（等于基线）保留当前；当前未改接受候选；两边改为相同值也接受；
@@ -40,7 +51,8 @@ import java.util.Set;
 @Service
 public class ObservationService {
 
-    private static final String SEPARATOR = "\u0001";
+    private static final String SEPARATOR = "";
+    private static final String ITEM_SEPARATOR = "";
 
     /**
      * 三个可编辑字段的固定顺序：冲突重算、选择校验与指纹均以此顺序处理，保证结果稳定。
@@ -50,32 +62,44 @@ public class ObservationService {
     private final ObservationRepository observationRepository;
     private final RequestLogRepository requestLogRepository;
     private final ResolutionRepository resolutionRepository;
+    private final PermitRepository permitRepository;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public ObservationService(ObservationRepository observationRepository,
                               RequestLogRepository requestLogRepository,
                               ResolutionRepository resolutionRepository,
+                              PermitRepository permitRepository,
                               ObjectMapper objectMapper,
                               Clock clock) {
         this.observationRepository = observationRepository;
         this.requestLogRepository = requestLogRepository;
         this.resolutionRepository = resolutionRepository;
+        this.permitRepository = permitRepository;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
 
     /**
-     * 创建观测记录，初始版本为 1。记录已存在返回 409。
+     * 创建（提交）观测记录，初始版本为 1。记录已存在返回 409；
+     * 设备、采集网格与采集时刻必须命中唯一有效许可，且只扣减该许可的计数、不得超过上限。
      */
     @Transactional
     public WriteOutcome create(CreateObservationRequest request) {
-        String fingerprint = fingerprint("CREATE", request.observationId(), request.location(),
-                request.reading(), request.note());
-        WriteOutcome replayed = checkReplay(request.requestId(), fingerprint);
-        if (replayed != null) {
-            return replayed;
+        Optional<RequestLogEntry> existing = requestLogRepository.find(request.requestId());
+        if (existing.isPresent()) {
+            RequestLogEntry entry = existing.get();
+            String fingerprint = createFingerprint(request, recordedPermitVersion(request.observationId()));
+            if (!entry.fingerprint().equals(fingerprint)) {
+                throw ApiException.conflict("requestId reused with different parameters: " + request.requestId(), null);
+            }
+            return new WriteOutcome(entry.responseStatus(), readBody(entry.responseBody()));
         }
+
+        // 解析唯一有效许可（设备行锁串行化同设备提交）；无许可或命中不唯一返回 422，失败不占键
+        SamplingPermit permit = resolveUniquePermit(request.deviceId(), request.gridX(), request.gridY(),
+                request.collectedAtUtc());
+        String fingerprint = createFingerprint(request, permit.permitVersion());
         WriteOutcome concurrent = insertPlaceholder(request.requestId(), fingerprint, "CREATE");
         if (concurrent != null) {
             return concurrent;
@@ -84,8 +108,15 @@ public class ObservationService {
         if (observationRepository.findCurrentForUpdate(request.observationId()).isPresent()) {
             throw ApiException.conflict("observation already exists: " + request.observationId(), null);
         }
+        if (permit.usedCount() >= permit.maxObservations()) {
+            throw ApiException.unprocessable("PERMIT_LIMIT_EXCEEDED",
+                    "permit observation limit exceeded: " + permit.permitId()
+                            + " (" + permit.usedCount() + "/" + permit.maxObservations() + ")");
+        }
         ObservationSnapshot snapshot = new ObservationSnapshot(request.observationId(), 1,
-                request.location(), request.reading(), request.note(), false);
+                request.location(), request.reading(), request.note(), false,
+                request.deviceId(), request.gridX(), request.gridY(), request.collectedAtUtc(),
+                permit.permitId(), permit.permitVersion(), SamplingPermit.REVIEW_NONE);
         try {
             observationRepository.insertCurrent(snapshot);
         } catch (DuplicateKeyException e) {
@@ -93,6 +124,7 @@ public class ObservationService {
             throw ApiException.conflict("observation already exists: " + request.observationId(), null);
         }
         observationRepository.insertVersion(snapshot);
+        permitRepository.incrementUsedCount(permit.permitId());
         return complete(request.requestId(), HttpStatus.CREATED, ObservationResponse.of(snapshot));
     }
 
@@ -131,17 +163,114 @@ public class ObservationService {
             throw ApiException.mergeConflict(conflictFields, current.version());
         }
 
-        ObservationSnapshot merged = new ObservationSnapshot(observationId, current.version(),
-                mergedLocation, mergedReading, mergedNote, false);
+        ObservationSnapshot merged = mergedSnapshot(current, current.version(),
+                mergedLocation, mergedReading, mergedNote);
         if (sameContent(merged, current)) {
             // 合并结果与当前完全相同：返回当前版本，不加版本
             return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(current));
         }
-        ObservationSnapshot next = new ObservationSnapshot(observationId, current.version() + 1,
-                mergedLocation, mergedReading, mergedNote, false);
+        ObservationSnapshot next = mergedSnapshot(current, current.version() + 1,
+                mergedLocation, mergedReading, mergedNote);
         observationRepository.updateCurrent(next);
         observationRepository.insertVersion(next);
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(next));
+    }
+
+    /**
+     * 批量离线合并：整批先按完整最终计数、坐标边界与冲突簇预校验，任一失败整批回滚；
+     * 预校验通过后按提交顺序逐项应用三方合并并扣减对应许可计数。
+     */
+    @Transactional
+    public BatchOutcome batchMerge(BatchMergeRequest request) {
+        String fingerprint = batchFingerprint(request);
+        Optional<RequestLogEntry> existing = requestLogRepository.find(request.requestId());
+        if (existing.isPresent()) {
+            RequestLogEntry entry = existing.get();
+            if (!entry.fingerprint().equals(fingerprint)) {
+                throw ApiException.conflict("requestId reused with different parameters: " + request.requestId(), null);
+            }
+            return new BatchOutcome(entry.responseStatus(), readBatchBody(entry.responseBody()));
+        }
+        BatchOutcome concurrent = insertBatchPlaceholder(request.requestId(), fingerprint);
+        if (concurrent != null) {
+            return concurrent;
+        }
+
+        Set<String> seenIds = new HashSet<>();
+        for (BatchMergeItem item : request.items()) {
+            if (!seenIds.add(item.observationId())) {
+                throw ApiException.badRequest("duplicate observationId in batch: " + item.observationId());
+            }
+        }
+
+        // 预校验一：每项按设备、网格与采集时刻唯一命中有效许可（设备行锁串行化）
+        List<SamplingPermit> permits = new ArrayList<>();
+        for (BatchMergeItem item : request.items()) {
+            permits.add(resolveUniquePermit(item.deviceId(), item.gridX(), item.gridY(), item.collectedAtUtc()));
+        }
+
+        // 预校验二：按许可汇总的完整最终计数不得超过上限
+        Map<String, Integer> consumption = new LinkedHashMap<>();
+        Map<String, SamplingPermit> permitById = new LinkedHashMap<>();
+        for (SamplingPermit permit : permits) {
+            consumption.merge(permit.permitId(), 1, Integer::sum);
+            permitById.putIfAbsent(permit.permitId(), permit);
+        }
+        for (Map.Entry<String, Integer> entry : consumption.entrySet()) {
+            SamplingPermit permit = permitById.get(entry.getKey());
+            if (permit.usedCount() + entry.getValue() > permit.maxObservations()) {
+                throw ApiException.unprocessable("PERMIT_LIMIT_EXCEEDED",
+                        "permit observation limit exceeded: " + permit.permitId()
+                                + " (" + permit.usedCount() + " + " + entry.getValue()
+                                + " > " + permit.maxObservations() + ")");
+            }
+        }
+
+        // 预校验三：逐项重读当前与基线版本，按三方规则重算冲突簇；任一冲突整批 409 回滚
+        List<ObservationSnapshot> currents = new ArrayList<>();
+        List<ObservationSnapshot> mergedList = new ArrayList<>();
+        for (BatchMergeItem item : request.items()) {
+            ObservationSnapshot current = observationRepository.findCurrentForUpdate(item.observationId())
+                    .orElseThrow(() -> ApiException.notFound("observation not found: " + item.observationId()));
+            if (current.deleted()) {
+                throw ApiException.gone("observation already deleted: " + item.observationId());
+            }
+            ObservationSnapshot base = observationRepository.findVersion(item.observationId(), item.baseVersion())
+                    .orElseThrow(() -> ApiException.notFound(
+                            "base version not found: " + item.observationId() + "@" + item.baseVersion()));
+            List<String> conflictFields = new ArrayList<>();
+            String mergedLocation = mergeField("location", base.location(), current.location(),
+                    item.location(), conflictFields);
+            String mergedReading = mergeReadingField(base.reading(), current.reading(),
+                    item.reading(), conflictFields);
+            String mergedNote = mergeField("note", base.note(), current.note(), item.note(), conflictFields);
+            if (!conflictFields.isEmpty()) {
+                throw ApiException.mergeConflict(conflictFields, current.version());
+            }
+            currents.add(current);
+            mergedList.add(mergedSnapshot(current, current.version(),
+                    mergedLocation, mergedReading, mergedNote));
+        }
+
+        // 应用：逐项写入合并结果（内容无变化则不加版本）并扣减对应许可计数
+        List<ObservationResponse> results = new ArrayList<>();
+        for (int i = 0; i < request.items().size(); i++) {
+            ObservationSnapshot current = currents.get(i);
+            ObservationSnapshot merged = mergedList.get(i);
+            ObservationSnapshot effective = current;
+            if (!sameContent(merged, current)) {
+                ObservationSnapshot next = mergedSnapshot(current, current.version() + 1,
+                        merged.location(), merged.reading(), merged.note());
+                observationRepository.updateCurrent(next);
+                observationRepository.insertVersion(next);
+                effective = next;
+            }
+            permitRepository.incrementUsedCount(permits.get(i).permitId());
+            results.add(ObservationResponse.of(effective));
+        }
+        BatchMergeResponse body = new BatchMergeResponse(results);
+        requestLogRepository.complete(request.requestId(), HttpStatus.OK.value(), writeBatchBody(body));
+        return new BatchOutcome(HttpStatus.OK.value(), body);
     }
 
     /**
@@ -168,7 +297,7 @@ public class ObservationService {
             throw ApiException.conflict("expectedVersion mismatch", current.version());
         }
         ObservationSnapshot tombstone = new ObservationSnapshot(observationId, current.version() + 1,
-                null, null, null, true);
+                null, null, null, true, null, null, null, null, null, null, null);
         observationRepository.markDeleted(observationId, tombstone.version());
         observationRepository.insertVersion(tombstone);
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(tombstone));
@@ -252,13 +381,13 @@ public class ObservationService {
         String resolvedNote = resolveFieldValue(noteConflict, selections.get("note"),
                 base.note(), current.note(), request.note(), false);
 
-        ObservationSnapshot merged = new ObservationSnapshot(observationId, current.version(),
-                resolvedLocation, resolvedReading, resolvedNote, false);
+        ObservationSnapshot merged = mergedSnapshot(current, current.version(),
+                resolvedLocation, resolvedReading, resolvedNote);
         boolean contentChanged = !sameContent(merged, current);
         int newVersion = contentChanged ? current.version() + 1 : current.version();
         if (contentChanged) {
-            ObservationSnapshot next = new ObservationSnapshot(observationId, newVersion,
-                    resolvedLocation, resolvedReading, resolvedNote, false);
+            ObservationSnapshot next = mergedSnapshot(current, newVersion,
+                    resolvedLocation, resolvedReading, resolvedNote);
             observationRepository.updateCurrent(next);
             observationRepository.insertVersion(next);
         }
@@ -285,7 +414,7 @@ public class ObservationService {
         }
 
         ObservationSnapshot pointed = contentChanged
-                ? new ObservationSnapshot(observationId, newVersion, resolvedLocation, resolvedReading, resolvedNote, false)
+                ? mergedSnapshot(current, newVersion, resolvedLocation, resolvedReading, resolvedNote)
                 : current;
         return completeResolve(request.requestId(), HttpStatus.OK,
                 ResolutionResponse.of(record, pointed, objectMapper));
@@ -329,6 +458,69 @@ public class ObservationService {
                 .orElseThrow(() -> ApiException.notFound(
                         "version not found: " + observationId + "@" + version));
         return ObservationResponse.of(snapshot);
+    }
+
+    /**
+     * 构造合并/解决结果快照：可编辑字段取合并值，设备、网格、采集时刻与许可信息沿用当前版本。
+     */
+    private ObservationSnapshot mergedSnapshot(ObservationSnapshot current, int version,
+                                               String location, String reading, String note) {
+        return new ObservationSnapshot(current.observationId(), version, location, reading, note, false,
+                current.deviceId(), current.gridX(), current.gridY(), current.collectedAtUtc(),
+                current.permitId(), current.permitVersion(), current.reviewStatus());
+    }
+
+    /**
+     * 解析设备在指定网格与采集时刻（UTC）的唯一有效许可：无命中 422 PERMIT_NOT_FOUND，
+     * 命中不唯一 422 PERMIT_AMBIGUOUS。查询对设备全部有效许可加行锁，串行化同设备提交。
+     */
+    private SamplingPermit resolveUniquePermit(String deviceId, int gridX, int gridY, Instant collectedAtUtc) {
+        List<SamplingPermit> matches = permitRepository.findValidByDeviceForUpdate(deviceId).stream()
+                .filter(permit -> permit.covers(gridX, gridY, collectedAtUtc))
+                .toList();
+        if (matches.isEmpty()) {
+            throw ApiException.unprocessable("PERMIT_NOT_FOUND",
+                    "no valid permit for device " + deviceId + " at grid (" + gridX + ", " + gridY
+                            + ") and time " + collectedAtUtc);
+        }
+        if (matches.size() > 1) {
+            throw ApiException.unprocessable("PERMIT_AMBIGUOUS",
+                    "multiple valid permits for device " + deviceId + " at grid (" + gridX + ", " + gridY
+                            + ") and time " + collectedAtUtc);
+        }
+        return matches.get(0);
+    }
+
+    /**
+     * 读取首次提交落库的许可版本（供重放判定构造指纹）；记录不存在时返回 null，指纹必然不匹配。
+     */
+    private Integer recordedPermitVersion(String observationId) {
+        return observationRepository.findCurrent(observationId)
+                .map(ObservationSnapshot::permitVersion)
+                .orElse(null);
+    }
+
+    /**
+     * 提交（创建）指纹：含设备、许可版本、网格、采集时刻与观测内容。
+     */
+    private String createFingerprint(CreateObservationRequest request, Integer permitVersion) {
+        return fingerprint("CREATE", request.observationId(), request.location(), request.reading(),
+                request.note(), request.deviceId(), String.valueOf(request.gridX()),
+                String.valueOf(request.gridY()), String.valueOf(request.collectedAtUtc()),
+                String.valueOf(permitVersion));
+    }
+
+    /**
+     * 批量合并指纹：按请求项顺序覆盖每项全部字段。
+     */
+    private String batchFingerprint(BatchMergeRequest request) {
+        List<String> parts = new ArrayList<>();
+        for (BatchMergeItem item : request.items()) {
+            parts.add(String.join("", item.observationId(), String.valueOf(item.baseVersion()),
+                    item.deviceId(), String.valueOf(item.gridX()), String.valueOf(item.gridY()),
+                    String.valueOf(item.collectedAtUtc()), item.location(), item.reading(), item.note()));
+        }
+        return fingerprint("BATCH_MERGE", parts.toArray(new String[0]));
     }
 
     /**
@@ -411,6 +603,23 @@ public class ObservationService {
     }
 
     /**
+     * 批量合并的占位写入，语义与普通写操作一致：冲突后读已提交记录，同参重放、异参 409。
+     */
+    private BatchOutcome insertBatchPlaceholder(String requestId, String fingerprint) {
+        try {
+            requestLogRepository.insertPlaceholder(requestId, fingerprint, "BATCH_MERGE");
+            return null;
+        } catch (DuplicateKeyException e) {
+            RequestLogEntry entry = requestLogRepository.find(requestId)
+                    .orElseThrow(() -> ApiException.conflict("requestId conflict: " + requestId, null));
+            if (!entry.fingerprint().equals(fingerprint)) {
+                throw ApiException.conflict("requestId reused with different parameters: " + requestId, null);
+            }
+            return new BatchOutcome(entry.responseStatus(), readBatchBody(entry.responseBody()));
+        }
+    }
+
+    /**
      * 业务成功后回填去重记录响应，并构造本次写操作结果；与业务变更同事务提交。
      */
     private WriteOutcome complete(String requestId, HttpStatus status, ObservationResponse body) {
@@ -444,6 +653,22 @@ public class ObservationService {
             return objectMapper.readValue(json, ObservationResponse.class);
         } catch (JsonProcessingException e) {
             throw new IllegalStateException("failed to deserialize stored response", e);
+        }
+    }
+
+    private String writeBatchBody(BatchMergeResponse body) {
+        try {
+            return objectMapper.writeValueAsString(body);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("failed to serialize batch response", e);
+        }
+    }
+
+    private BatchMergeResponse readBatchBody(String json) {
+        try {
+            return objectMapper.readValue(json, BatchMergeResponse.class);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("failed to deserialize stored batch response", e);
         }
     }
 
@@ -628,6 +853,12 @@ public class ObservationService {
      * 写操作结果：HTTP 状态码与响应体。
      */
     public record WriteOutcome(int status, ObservationResponse body) {
+    }
+
+    /**
+     * 批量离线合并结果：HTTP 状态码与批量响应体。
+     */
+    public record BatchOutcome(int status, BatchMergeResponse body) {
     }
 
     /**

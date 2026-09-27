@@ -4,6 +4,8 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
 
+import java.sql.Timestamp;
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -13,13 +15,43 @@ import java.util.Optional;
 @Repository
 public class ObservationRepository {
 
-    private static final RowMapper<ObservationSnapshot> SNAPSHOT_MAPPER = (rs, rowNum) -> new ObservationSnapshot(
+    private static final String CURRENT_COLUMNS =
+            "observation_id, version, location, reading, note, deleted, "
+                    + "device_id, grid_x, grid_y, collected_at_utc, permit_id, permit_version, review_status";
+
+    private static final String VERSION_COLUMNS =
+            "observation_id, version, location, reading, note, deleted, "
+                    + "device_id, grid_x, grid_y, collected_at_utc, permit_id, permit_version";
+
+    private static final RowMapper<ObservationSnapshot> CURRENT_MAPPER = (rs, rowNum) -> new ObservationSnapshot(
             rs.getString("observation_id"),
             rs.getInt("version"),
             rs.getString("location"),
             rs.getString("reading"),
             rs.getString("note"),
-            rs.getBoolean("deleted"));
+            rs.getBoolean("deleted"),
+            rs.getString("device_id"),
+            (Integer) rs.getObject("grid_x"),
+            (Integer) rs.getObject("grid_y"),
+            rs.getTimestamp("collected_at_utc") == null ? null : rs.getTimestamp("collected_at_utc").toInstant(),
+            rs.getString("permit_id"),
+            (Integer) rs.getObject("permit_version"),
+            rs.getString("review_status"));
+
+    private static final RowMapper<ObservationSnapshot> VERSION_MAPPER = (rs, rowNum) -> new ObservationSnapshot(
+            rs.getString("observation_id"),
+            rs.getInt("version"),
+            rs.getString("location"),
+            rs.getString("reading"),
+            rs.getString("note"),
+            rs.getBoolean("deleted"),
+            rs.getString("device_id"),
+            (Integer) rs.getObject("grid_x"),
+            (Integer) rs.getObject("grid_y"),
+            rs.getTimestamp("collected_at_utc") == null ? null : rs.getTimestamp("collected_at_utc").toInstant(),
+            rs.getString("permit_id"),
+            (Integer) rs.getObject("permit_version"),
+            null);
 
     private final JdbcTemplate jdbcTemplate;
 
@@ -32,9 +64,8 @@ public class ObservationRepository {
      */
     public Optional<ObservationSnapshot> findCurrent(String observationId) {
         return jdbcTemplate.query(
-                        "SELECT observation_id, version, location, reading, note, deleted "
-                                + "FROM observation_current WHERE observation_id = ?",
-                        SNAPSHOT_MAPPER, observationId)
+                        "SELECT " + CURRENT_COLUMNS + " FROM observation_current WHERE observation_id = ?",
+                        CURRENT_MAPPER, observationId)
                 .stream().findFirst();
     }
 
@@ -43,9 +74,8 @@ public class ObservationRepository {
      */
     public Optional<ObservationSnapshot> findCurrentForUpdate(String observationId) {
         return jdbcTemplate.query(
-                        "SELECT observation_id, version, location, reading, note, deleted "
-                                + "FROM observation_current WHERE observation_id = ? FOR UPDATE",
-                        SNAPSHOT_MAPPER, observationId)
+                        "SELECT " + CURRENT_COLUMNS + " FROM observation_current WHERE observation_id = ? FOR UPDATE",
+                        CURRENT_MAPPER, observationId)
                 .stream().findFirst();
     }
 
@@ -54,9 +84,9 @@ public class ObservationRepository {
      */
     public Optional<ObservationSnapshot> findVersion(String observationId, int version) {
         return jdbcTemplate.query(
-                        "SELECT observation_id, version, location, reading, note, deleted "
-                                + "FROM observation_version WHERE observation_id = ? AND version = ?",
-                        SNAPSHOT_MAPPER, observationId, version)
+                        "SELECT " + VERSION_COLUMNS
+                                + " FROM observation_version WHERE observation_id = ? AND version = ?",
+                        VERSION_MAPPER, observationId, version)
                 .stream().findFirst();
     }
 
@@ -65,14 +95,19 @@ public class ObservationRepository {
      */
     public void insertCurrent(ObservationSnapshot snapshot) {
         jdbcTemplate.update(
-                "INSERT INTO observation_current (observation_id, location, reading, note, version, deleted, updated_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                "INSERT INTO observation_current (observation_id, location, reading, note, "
+                        + "device_id, grid_x, grid_y, collected_at_utc, permit_id, permit_version, review_status, "
+                        + "version, deleted, updated_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                 snapshot.observationId(), snapshot.location(), snapshot.reading(), snapshot.note(),
+                snapshot.deviceId(), snapshot.gridX(), snapshot.gridY(),
+                Timestamp.from(snapshot.collectedAtUtc()),
+                snapshot.permitId(), snapshot.permitVersion(), snapshot.reviewStatus(),
                 snapshot.version(), snapshot.deleted());
     }
 
     /**
-     * 更新当前状态为新版本内容。
+     * 更新当前状态为新版本内容；设备、网格、采集时刻与许可信息在提交时绑定，不随合并变化。
      */
     public void updateCurrent(ObservationSnapshot snapshot) {
         jdbcTemplate.update(
@@ -93,13 +128,39 @@ public class ObservationRepository {
     }
 
     /**
+     * 更新复核标记（许可撤销时将未合并观测标记为 PERMIT_REVIEW）。
+     */
+    public void updateReviewStatus(String observationId, String reviewStatus) {
+        jdbcTemplate.update(
+                "UPDATE observation_current SET review_status = ?, updated_at = CURRENT_TIMESTAMP "
+                        + "WHERE observation_id = ?",
+                reviewStatus, observationId);
+    }
+
+    /**
+     * 查询指定许可下、指定复核标记的当前观测记录（用于许可撤销时筛出待复核观测）。
+     */
+    public List<ObservationSnapshot> findByPermitAndReviewStatus(String permitId, String reviewStatus) {
+        return jdbcTemplate.query(
+                "SELECT " + CURRENT_COLUMNS
+                        + " FROM observation_current WHERE permit_id = ? AND review_status = ? AND deleted = FALSE "
+                        + "ORDER BY observation_id FOR UPDATE",
+                CURRENT_MAPPER, permitId, reviewStatus);
+    }
+
+    /**
      * 追加一条完整版本快照，历史永不删除。
      */
     public void insertVersion(ObservationSnapshot snapshot) {
         jdbcTemplate.update(
-                "INSERT INTO observation_version (observation_id, version, location, reading, note, deleted, created_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                "INSERT INTO observation_version (observation_id, version, location, reading, note, "
+                        + "device_id, grid_x, grid_y, collected_at_utc, permit_id, permit_version, "
+                        + "deleted, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                 snapshot.observationId(), snapshot.version(), snapshot.location(),
-                snapshot.reading(), snapshot.note(), snapshot.deleted());
+                snapshot.reading(), snapshot.note(),
+                snapshot.deviceId(), snapshot.gridX(), snapshot.gridY(),
+                snapshot.collectedAtUtc() == null ? null : Timestamp.from(snapshot.collectedAtUtc()),
+                snapshot.permitId(), snapshot.permitVersion(), snapshot.deleted());
     }
 }

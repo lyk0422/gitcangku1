@@ -50,6 +50,16 @@ public class ObservationController {
     }
 
     /**
+     * 批量离线合并：整批先按完整最终计数、坐标边界与冲突簇预校验，
+     * 任一项无许可、命中不唯一或超限返回 422，全部观测与簇变化回滚。
+     */
+    @PostMapping("/batch-merge")
+    public ResponseEntity<BatchMergeResponse> batchMerge(@Valid @RequestBody BatchMergeRequest request) {
+        ObservationService.BatchOutcome outcome = observationService.batchMerge(request);
+        return ResponseEntity.status(outcome.status()).body(outcome.body());
+    }
+
+    /**
      * 删除观测记录：expectedVersion 匹配当前版本时生成新版本墓碑。
      */
     @PostMapping("/{observationId}/delete")

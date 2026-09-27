@@ -28,13 +28,20 @@ class ObservationConcurrencyTest {
     private ObservationService observationService;
 
     @Autowired
+    private PermitService permitService;
+
+    @Autowired
     private JdbcTemplate jdbcTemplate;
 
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM permit_review_snapshot");
         jdbcTemplate.update("DELETE FROM request_log");
         jdbcTemplate.update("DELETE FROM observation_version");
         jdbcTemplate.update("DELETE FROM observation_current");
+        jdbcTemplate.update("DELETE FROM sampling_permit");
+        jdbcTemplate.update("DELETE FROM permit_device_lock");
+        PermitTestSupport.createDefaultPermit(permitService);
     }
 
     private <T> List<T> runConcurrently(List<Callable<T>> tasks) throws Exception {
@@ -65,7 +72,7 @@ class ObservationConcurrencyTest {
     }
 
     private void createObservation(String id, String requestId) {
-        observationService.create(new CreateObservationRequest(requestId, id, "站点A", "1.0", "初始备注"));
+        observationService.create(PermitTestSupport.createRequest(requestId, id, "站点A", "1.0", "初始备注"));
     }
 
     @Test
@@ -168,7 +175,7 @@ class ObservationConcurrencyTest {
             final int index = i;
             tasks.add(() -> {
                 try {
-                    observationService.create(new CreateObservationRequest(
+                    observationService.create(PermitTestSupport.createRequest(
                             "req-ck" + index, "obs-c4", "站点" + index, "1.0", "备注"));
                     return "ok";
                 } catch (ApiException e) {

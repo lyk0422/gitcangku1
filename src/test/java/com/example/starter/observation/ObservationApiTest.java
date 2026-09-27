@@ -36,11 +36,18 @@ class ObservationApiTest {
     @Autowired
     private JdbcTemplate jdbcTemplate;
 
+    @Autowired
+    private PermitService permitService;
+
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM permit_review_snapshot");
         jdbcTemplate.update("DELETE FROM request_log");
         jdbcTemplate.update("DELETE FROM observation_version");
         jdbcTemplate.update("DELETE FROM observation_current");
+        jdbcTemplate.update("DELETE FROM sampling_permit");
+        jdbcTemplate.update("DELETE FROM permit_device_lock");
+        PermitTestSupport.createDefaultPermit(permitService);
     }
 
     private ResultActions create(String requestId, String observationId,
@@ -51,6 +58,10 @@ class ObservationApiTest {
         body.put("location", location);
         body.put("reading", reading);
         body.put("note", note);
+        body.put("deviceId", PermitTestSupport.DEVICE_ID);
+        body.put("gridX", PermitTestSupport.GRID_X);
+        body.put("gridY", PermitTestSupport.GRID_Y);
+        body.put("collectedAtUtc", PermitTestSupport.COLLECTED_AT.toString());
         return mockMvc.perform(post("/api/observations")
                 .contentType(MediaType.APPLICATION_JSON)
                 .content(objectMapper.writeValueAsString(body)));

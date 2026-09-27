@@ -29,14 +29,21 @@ class ResolutionConcurrencyTest {
     private ObservationService observationService;
 
     @Autowired
+    private PermitService permitService;
+
+    @Autowired
     private JdbcTemplate jdbcTemplate;
 
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM permit_review_snapshot");
         jdbcTemplate.update("DELETE FROM conflict_resolution");
         jdbcTemplate.update("DELETE FROM request_log");
         jdbcTemplate.update("DELETE FROM observation_version");
         jdbcTemplate.update("DELETE FROM observation_current");
+        jdbcTemplate.update("DELETE FROM sampling_permit");
+        jdbcTemplate.update("DELETE FROM permit_device_lock");
+        PermitTestSupport.createDefaultPermit(permitService);
     }
 
     private <T> List<T> runConcurrently(List<Callable<T>> tasks) throws Exception {
@@ -67,7 +74,7 @@ class ResolutionConcurrencyTest {
     }
 
     private void setupLocationConflict(String observationId, String tag) {
-        observationService.create(new CreateObservationRequest(
+        observationService.create(PermitTestSupport.createRequest(
                 "req-" + tag + "-0", observationId, "站点A", "1.0", "备注"));
         observationService.merge(observationId, new MergeObservationRequest(
                 "req-" + tag + "-1", 1, "站点B", "1.0", "备注"));
