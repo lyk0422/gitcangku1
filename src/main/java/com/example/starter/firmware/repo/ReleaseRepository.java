@@ -24,10 +24,12 @@ public class ReleaseRepository {
             rs.getString("from_version"), rs.getString("to_version"),
             rs.getInt("ratio"), ReleaseStatus.valueOf(rs.getString("status")),
             rs.getInt("sample_floor"), rs.getInt("failure_threshold_percent"),
-            rs.getInt("monitor_round"), rs.getInt("round_success"), rs.getInt("round_failed"));
+            rs.getInt("monitor_round"), rs.getInt("round_success"), rs.getInt("round_failed"),
+            rs.getInt("exemption_version"));
 
     private static final String COLUMNS = "id, version, model, from_version, to_version, ratio, status,"
-            + " sample_floor, failure_threshold_percent, monitor_round, round_success, round_failed";
+            + " sample_floor, failure_threshold_percent, monitor_round, round_success, round_failed,"
+            + " exemption_version";
 
     private final JdbcTemplate jdbc;
 
@@ -116,5 +118,13 @@ public class ReleaseRepository {
                 + " monitor_round = monitor_round + 1, round_success = 0, round_failed = 0,"
                 + " updated_at = CURRENT_TIMESTAMP"
                 + " WHERE id = ? AND version = ? AND status = 'PAUSED'", id, expectedVersion);
+    }
+
+    /**
+     * 模块豁免版本加一，调用方必须已持有发布单行锁（与拉取、回执、取消、恢复串行）。
+     */
+    public void bumpExemptionVersion(long id) {
+        jdbc.update("UPDATE release_order SET exemption_version = exemption_version + 1,"
+                + " updated_at = CURRENT_TIMESTAMP WHERE id = ?", id);
     }
 }

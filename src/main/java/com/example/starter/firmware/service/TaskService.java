@@ -1,10 +1,13 @@
 package com.example.starter.firmware.service;
 
+import com.example.starter.firmware.api.BlockedModuleView;
 import com.example.starter.firmware.api.PullResponse;
 import com.example.starter.firmware.api.ReceiptRequest;
 import com.example.starter.firmware.api.TaskListResponse;
 import com.example.starter.firmware.api.TaskView;
+import com.example.starter.firmware.domain.CompatibilityOutcome;
 import com.example.starter.firmware.domain.Device;
+import com.example.starter.firmware.domain.GrantedVia;
 import com.example.starter.firmware.domain.ReceiptResult;
 import com.example.starter.firmware.domain.ReleaseOrder;
 import com.example.starter.firmware.domain.ReleaseStatus;
@@ -23,7 +26,10 @@ import java.time.Instant;
 import java.util.List;
 
 /**
- * 投放任务：设备拉取与回执。与取消、恢复并发时统一先锁发布单行，再操作任务，形成一致提交顺序。
+ * 投放任务：设备拉取与回执。与取消、恢复、豁免修改并发时统一先锁发布单行，再操作任务，形成一致提交顺序。
+ * 拉取在既有门禁（ACTIVE、型号与来源版本、分桶）通过后逐项校验目标固件完整依赖集合：
+ * 缺失/低版本模块返回 MODULE_BLOCKED 并固化证据，不创建任务、不计入失败率；
+ * 放行（直接满足或有效豁免）才创建任务，并把设备模块摘要、矩阵版本、豁免版本固化到任务行。
  * 回执首次终结任务时在发布单行锁内累计当前监控轮次统计，达到阈值即在同一事务原子暂停。
  */
 @Service
@@ -35,12 +41,14 @@ public class TaskService {
     private final PauseRecordRepository pauseRecordRepository;
     private final DeviceService deviceService;
     private final ReleaseService releaseService;
+    private final CompatibilityService compatibilityService;
     private final IdempotencyService idempotency;
     private final Clock clock;
 
     public TaskService(TaskRepository taskRepository, ReleaseRepository releaseRepository,
                        DeviceRepository deviceRepository, PauseRecordRepository pauseRecordRepository,
                        DeviceService deviceService, ReleaseService releaseService,
+                       CompatibilityService compatibilityService,
                        IdempotencyService idempotency, Clock clock) {
         this.taskRepository = taskRepository;
         this.releaseRepository = releaseRepository;
@@ -48,13 +56,14 @@ public class TaskService {
         this.pauseRecordRepository = pauseRecordRepository;
         this.deviceService = deviceService;
         this.releaseService = releaseService;
+        this.compatibilityService = compatibilityService;
         this.idempotency = idempotency;
         this.clock = clock;
     }
 
     /**
-     * 设备拉取：已存在任务直接返回；否则仅当型号与当前版本匹配、分桶号小于比例且发布单 ACTIVE 时创建。
-     * PAUSED 时不创建新任务，已有任务仍可查看与回执。
+     * 设备拉取：已存在任务直接返回；否则仅当型号与当前版本匹配、分桶号小于比例且发布单 ACTIVE 时进入兼容校验。
+     * PAUSED、版本或分桶不匹配时不创建任务也不做兼容判定；兼容阻断返回 MODULE_BLOCKED 明细。
      */
     public PullResponse pull(String deviceId, String requestId) {
         String fingerprint = String.join("|", "task.pull", deviceId);
@@ -75,23 +84,42 @@ public class TaskService {
                     || device.bucketNo() >= order.ratio()) {
                 return new PullResponse(null);
             }
+            Instant now = Instant.now(clock);
+            CompatibilityService.Decision decision = compatibilityService.evaluate(order, device, now);
+            if (decision.outcome() == CompatibilityOutcome.BLOCKED) {
+                // 阻断同样固化证据（设备摘要、矩阵/豁免版本、阻断明细），但不创建任务、不计失败率
+                compatibilityService.persist(decision, order, device, requestId, now);
+                return blockedResponse(decision);
+            }
+            GrantedVia grantedVia = decision.outcome() == CompatibilityOutcome.EXEMPTION
+                    ? GrantedVia.EXEMPTION : GrantedVia.DIRECT;
             long taskId;
             try {
-                taskId = taskRepository.insert(order.id(), deviceId);
+                taskId = taskRepository.insert(order.id(), deviceId, decision.matrixVersion(),
+                        decision.exemptionVersion(), grantedVia, decision.snapshotsJson());
             } catch (DuplicateKeyException e) {
                 RolloutTask task = taskRepository.findByReleaseAndDevice(order.id(), deviceId)
                         .orElseThrow(() -> new IllegalStateException("任务唯一约束冲突后未找到任务"));
                 return new PullResponse(TaskView.of(task, order));
             }
+            compatibilityService.persist(decision, order, device, requestId, now);
             RolloutTask task = taskRepository.findById(taskId)
                     .orElseThrow(() -> new IllegalStateException("任务创建后读取失败"));
-            return new PullResponse(TaskView.of(task, order));
+            return new PullResponse(TaskView.of(task, order), decision.outcome().name(), List.of(),
+                    decision.exemptedModules(), decision.matrixVersion(), decision.exemptionVersion());
         }, PullResponse.class);
+    }
+
+    private PullResponse blockedResponse(CompatibilityService.Decision decision) {
+        return new PullResponse(null, "MODULE_BLOCKED",
+                decision.blocked().stream().map(BlockedModuleView::of).toList(),
+                decision.exemptedModules(), decision.matrixVersion(), decision.exemptionVersion());
     }
 
     /**
      * 回执：首次回执终结任务并计入完成时所在监控轮次，仅 SUCCESS 更新设备当前版本；
      * 同结果重复成功（不重复计数），改结果 409；已取消任务的后到回执 409 且不更新设备版本。
+     * 模块阻断不创建任务，故不可能产生回执，也从不会计入失败率。
      * 样本达到下限且失败率越限时，同事务将仍为 ACTIVE 的发布单原子转为 PAUSED 并落暂停记录。
      */
     public TaskView receipt(long taskId, ReceiptRequest request) {

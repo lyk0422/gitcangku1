@@ -35,4 +35,11 @@ public class ApiException extends RuntimeException {
     public static ApiException conflict(String code, String message) {
         return new ApiException(HttpStatus.CONFLICT, code, message);
     }
+
+    /**
+     * 422：请求结构合法但业务语义不可处理（版本号/时刻格式非法、依赖成环、后态校验失败等）。
+     */
+    public static ApiException unprocessable(String code, String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, code, message);
+    }
 }

@@ -66,12 +66,18 @@ class FirmwareConcurrencyTest {
 
     @BeforeEach
     void setUp() {
+        jdbc.update("DELETE FROM compatibility_check");
         jdbc.update("DELETE FROM rollout_task");
+        jdbc.update("DELETE FROM module_exemption");
         jdbc.update("DELETE FROM release_pause_record");
         jdbc.update("DELETE FROM release_resume_record");
         jdbc.update("DELETE FROM release_order");
+        jdbc.update("DELETE FROM device_module");
         jdbc.update("DELETE FROM device");
+        jdbc.update("DELETE FROM module_dependency");
+        jdbc.update("DELETE FROM firmware_requirement");
         jdbc.update("DELETE FROM idempotency_record");
+        jdbc.update("UPDATE matrix_state SET version = 0, updated_at_utc = NULL WHERE id = 0");
         executor = Executors.newFixedThreadPool(8);
     }
 

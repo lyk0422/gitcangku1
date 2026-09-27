@@ -1,5 +1,6 @@
 package com.example.starter.firmware.repo;
 
+import com.example.starter.firmware.domain.GrantedVia;
 import com.example.starter.firmware.domain.ReceiptResult;
 import com.example.starter.firmware.domain.RolloutTask;
 import com.example.starter.firmware.domain.TaskStatus;
@@ -15,6 +16,7 @@ import java.util.Optional;
 
 /**
  * 投放任务数据访问。同设备同发布单由唯一约束 uk_task_release_device 保证最多一条。
+ * 任务创建时固化矩阵版本、豁免版本、下发途径与设备模块清单快照，此后不再改写。
  */
 @Repository
 public class TaskRepository {
@@ -23,10 +25,13 @@ public class TaskRepository {
         String firstResult = rs.getString("first_result");
         return new RolloutTask(rs.getLong("id"), rs.getLong("release_id"), rs.getString("device_id"),
                 TaskStatus.valueOf(rs.getString("status")),
-                firstResult == null ? null : ReceiptResult.valueOf(firstResult));
+                firstResult == null ? null : ReceiptResult.valueOf(firstResult),
+                rs.getInt("matrix_version"), rs.getInt("exemption_version"),
+                GrantedVia.valueOf(rs.getString("granted_via")), rs.getString("device_modules"));
     };
 
-    private static final String COLUMNS = "id, release_id, device_id, status, first_result";
+    private static final String COLUMNS = "id, release_id, device_id, status, first_result, matrix_version,"
+            + " exemption_version, granted_via, device_modules";
 
     private final JdbcTemplate jdbc;
 
@@ -34,14 +39,21 @@ public class TaskRepository {
         this.jdbc = jdbc;
     }
 
-    public long insert(long releaseId, String deviceId) {
+    public long insert(long releaseId, String deviceId, int matrixVersion, int exemptionVersion,
+                       GrantedVia grantedVia, String deviceModulesJson) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO rollout_task (release_id, device_id, status) VALUES (?, ?, 'PENDING')",
+                    "INSERT INTO rollout_task (release_id, device_id, status, matrix_version,"
+                            + " exemption_version, granted_via, device_modules)"
+                            + " VALUES (?, ?, 'PENDING', ?, ?, ?, ?)",
                     new String[]{"id"});
             ps.setLong(1, releaseId);
             ps.setString(2, deviceId);
+            ps.setInt(3, matrixVersion);
+            ps.setInt(4, exemptionVersion);
+            ps.setString(5, grantedVia.name());
+            ps.setString(6, deviceModulesJson);
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();
