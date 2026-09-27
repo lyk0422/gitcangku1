@@ -3,6 +3,8 @@ package com.example.starter.incident.dto;
 import java.time.Instant;
 import java.util.List;
 
+import com.fasterxml.jackson.databind.JsonNode;
+
 /**
  * 读接口与写接口响应体集合。时间字段均为 UTC ISO-8601。
  */
@@ -77,5 +79,50 @@ public final class Responses {
 
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
+    }
+
+    /**
+     * 封存包内一条明细视图：seq 从 1 起按 (occurredAt, recordKey) 升序；
+     * recordType 为 COMMAND/TRANSFER/TASK_STATUS/TASK_BLOCKER_EDGE；
+     * recordVersion 为该记录固化时的版本序号；payload 为原始快照 JSON（原样返回）。
+     * taskId/blockerIncidentId 仅任务相关条目有值，其余为 null。
+     */
+    public record SealRecordView(int seq, String recordType, String recordKey, Instant occurredAt,
+                                 int recordVersion, Long taskId, Long blockerIncidentId,
+                                 JsonNode payload) {
+    }
+
+    /**
+     * 封存更正附录视图：oldValue/newValue 允许为 null，表达原值或更正值为空。
+     */
+    public record SealCorrectionView(long id, int sealVersion, String recordKey, String fieldName,
+                                     String oldValue, String newValue, String reason,
+                                     String correctedBy, Instant createdAt) {
+    }
+
+    /**
+     * 封存包视图：版本事件内递增；cutoffAt 为左闭右开截至时刻；
+     * recordCount/edgeCount 为包内实际值；contentHash 为验真摘要；
+     * records 为明细（列表查询时可能为空数组，详情查询时完整返回）。
+     */
+    public record SealView(long id, int version, Instant cutoffAt, int recordCount, int edgeCount,
+                           String contentHash, String sealedBy, Instant sealedAt,
+                           List<SealRecordView> records) {
+    }
+
+    /** 封存包列表视图：seals 按版本升序。 */
+    public record SealListView(String incidentKey, List<SealView> seals) {
+    }
+
+    /** 封存包详情视图：含全部明细与该包更正附录（按追加顺序）。 */
+    public record SealDetailView(SealView seal, List<SealCorrectionView> corrections) {
+    }
+
+    /**
+     * 封存验真视图：recomputedHash 为按当前明细重算的摘要；
+     * verified 为 true 表示与封存时 contentHash 一致（包内容未被改写）。
+     */
+    public record SealVerifyView(int version, String storedHash, String recomputedHash,
+                                 boolean verified) {
     }
 }

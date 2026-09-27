@@ -108,6 +108,61 @@ class SchemaH2ScriptTest {
                     duplicateBlockerRejected = true;
                 }
                 assertThat(duplicateBlockerRejected).isTrue();
+
+                // 封存包：(incident_id, version) 唯一；版本可递增
+                st.execute("INSERT INTO incident_log_seals (incident_id, version, cutoff_at,"
+                        + " record_count, edge_count, content_hash, sealed_by, sealed_at) VALUES"
+                        + " (1,1,'" + Timestamp.from(now) + "',0,0,'h1','alice','"
+                        + Timestamp.from(now) + "')");
+                st.execute("INSERT INTO incident_log_seals (incident_id, version, cutoff_at,"
+                        + " record_count, edge_count, content_hash, sealed_by, sealed_at) VALUES"
+                        + " (1,2,'" + Timestamp.from(now) + "',0,0,'h2','alice','"
+                        + Timestamp.from(now) + "')");
+                boolean duplicateSealVersionRejected = false;
+                try {
+                    st.execute("INSERT INTO incident_log_seals (incident_id, version, cutoff_at,"
+                            + " record_count, edge_count, content_hash, sealed_by, sealed_at) VALUES"
+                            + " (1,1,'" + Timestamp.from(now) + "',0,0,'h3','alice','"
+                            + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateSealVersionRejected = true;
+                }
+                assertThat(duplicateSealVersionRejected).isTrue();
+
+                // 包明细：(seal_id, seq) 唯一；payload 必填；任务/边引用列允许为空
+                st.execute("INSERT INTO incident_log_seal_records (seal_id, seq, record_type,"
+                        + " record_key, occurred_at, record_version, task_id, blocker_incident_id,"
+                        + " payload) VALUES (1,1,'COMMAND','action:A1','" + Timestamp.from(now)
+                        + "',1,NULL,NULL,'{}')");
+                st.execute("INSERT INTO incident_log_seal_records (seal_id, seq, record_type,"
+                        + " record_key, occurred_at, record_version, task_id, blocker_incident_id,"
+                        + " payload) VALUES (1,2,'TASK_BLOCKER_EDGE','edge:1:1','"
+                        + Timestamp.from(now) + "',1,1,1,'{}')");
+                boolean duplicateSeqRejected = false;
+                try {
+                    st.execute("INSERT INTO incident_log_seal_records (seal_id, seq, record_type,"
+                            + " record_key, occurred_at, record_version, task_id,"
+                            + " blocker_incident_id, payload) VALUES (1,1,'COMMAND','action:A2','"
+                            + Timestamp.from(now) + "',2,NULL,NULL,'{}')");
+                } catch (Exception e) {
+                    duplicateSeqRejected = true;
+                }
+                assertThat(duplicateSeqRejected).isTrue();
+
+                // 更正附录：原值/新值允许 NULL，可重复追加（只追加）
+                st.execute("INSERT INTO incident_log_corrections (incident_id, seal_id,"
+                        + " seal_version, record_key, field_name, old_value, new_value, reason,"
+                        + " corrected_by, created_at) VALUES (1,1,1,'action:A1','note',NULL,NULL,"
+                        + "'原值为空','auditor','" + Timestamp.from(now) + "')");
+                st.execute("INSERT INTO incident_log_corrections (incident_id, seal_id,"
+                        + " seal_version, record_key, field_name, old_value, new_value, reason,"
+                        + " corrected_by, created_at) VALUES (1,1,1,'action:A1','note','n','n2',"
+                        + "'事实更正','auditor','" + Timestamp.from(now) + "')");
+                try (ResultSet rs = st.executeQuery(
+                        "SELECT COUNT(*) FROM incident_log_corrections WHERE seal_id = 1")) {
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getInt(1)).isEqualTo(2);
+                }
             }
         }
     }

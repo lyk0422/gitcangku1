@@ -4,6 +4,8 @@ import com.example.starter.incident.dto.Requests.ActionRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
 import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
+import com.example.starter.incident.dto.Requests.SealCorrectionRequest;
+import com.example.starter.incident.dto.Requests.SealLogRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
 import com.example.starter.incident.dto.Requests.TaskActionRequest;
@@ -16,6 +18,11 @@ import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
 import com.example.starter.incident.dto.Responses.IncidentTasksView;
 import com.example.starter.incident.dto.Responses.IncidentView;
+import com.example.starter.incident.dto.Responses.SealCorrectionView;
+import com.example.starter.incident.dto.Responses.SealDetailView;
+import com.example.starter.incident.dto.Responses.SealListView;
+import com.example.starter.incident.dto.Responses.SealVerifyView;
+import com.example.starter.incident.dto.Responses.SealView;
 import com.example.starter.incident.dto.Responses.TaskView;
 import com.example.starter.incident.dto.Responses.TransferView;
 import org.springframework.http.HttpStatus;
@@ -36,9 +43,11 @@ import org.springframework.web.bind.annotation.RestController;
 public class IncidentController {
 
     private final IncidentService service;
+    private final LogSealService sealService;
 
-    public IncidentController(IncidentService service) {
+    public IncidentController(IncidentService service, LogSealService sealService) {
         this.service = service;
+        this.sealService = sealService;
     }
 
     /**
@@ -187,5 +196,51 @@ public class IncidentController {
                                @RequestHeader("X-Actor-Id") String actor,
                                @RequestBody TaskActionRequest req) {
         return service.cancelTask(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 封存指挥日志：对未关闭事件按截至 UTC 时刻（左闭右开）固化指令、交接、
+     * 任务状态与依赖边，生成事件内版本递增的不可变日志包。
+     */
+    @PostMapping("/{incidentKey}/log-seals")
+    public SealView sealLog(@PathVariable String incidentKey,
+                            @RequestHeader("X-Actor-Id") String actor,
+                            @RequestBody SealLogRequest req) {
+        return sealService.seal(incidentKey, actor, req);
+    }
+
+    /**
+     * 查询事件全部封存包（按版本升序，不含明细），只读。
+     */
+    @GetMapping("/{incidentKey}/log-seals")
+    public SealListView listSeals(@PathVariable String incidentKey) {
+        return sealService.listSeals(incidentKey);
+    }
+
+    /**
+     * 查询单个封存包详情：全部明细（按发生时刻、同刻标识排序）与更正附录，只读。
+     */
+    @GetMapping("/{incidentKey}/log-seals/{version}")
+    public SealDetailView getSeal(@PathVariable String incidentKey, @PathVariable int version) {
+        return sealService.getSeal(incidentKey, version);
+    }
+
+    /**
+     * 封存包验真诊断：按当前明细重算摘要并与封存时摘要比对，只读。
+     */
+    @GetMapping("/{incidentKey}/log-seals/{version}/verify")
+    public SealVerifyView verifySeal(@PathVariable String incidentKey, @PathVariable int version) {
+        return sealService.verifySeal(incidentKey, version);
+    }
+
+    /**
+     * 追加封存更正附录（已关闭事件仍允许）；不修改原包，仅追加引用原版本与原记录的更正。
+     */
+    @PostMapping("/{incidentKey}/log-seals/{version}/corrections")
+    public SealCorrectionView addCorrection(
+            @PathVariable String incidentKey, @PathVariable int version,
+            @RequestHeader("X-Actor-Id") String actor,
+            @RequestBody SealCorrectionRequest req) {
+        return sealService.appendCorrection(incidentKey, version, actor, req);
     }
 }

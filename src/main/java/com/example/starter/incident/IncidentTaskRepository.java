@@ -41,7 +41,7 @@ public class IncidentTaskRepository {
 
     private static final RowMapper<IncidentTask> TASK_MAPPER = (rs, n) -> mapTask(rs);
 
-    private static IncidentTask mapTask(ResultSet rs) throws SQLException {
+    static IncidentTask mapTask(ResultSet rs) throws SQLException {
         Timestamp doneAt = rs.getTimestamp("done_at");
         Timestamp cancelledAt = rs.getTimestamp("cancelled_at");
         return new IncidentTask(
@@ -163,6 +163,16 @@ public class IncidentTaskRepository {
         }
         jdbc.queryForObject("SELECT id FROM task_graph_lock WHERE id = ? FOR UPDATE",
                 Long.class, GRAPH_LOCK_ID);
+    }
+
+    /**
+     * 加载全局依赖图的全部边（含所有状态任务的边），封存前做无环校验用。
+     */
+    public List<Edge> listAllEdges() {
+        return jdbc.query(
+                "SELECT t.incident_id, b.blocker_incident_id FROM incident_task_blockers b"
+                        + " JOIN incident_tasks t ON t.id = b.task_id",
+                (rs, n) -> new Edge(rs.getLong(1), rs.getLong(2)));
     }
 
     /**

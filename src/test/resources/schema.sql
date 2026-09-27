@@ -99,3 +99,47 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
 );
+
+-- 事件指挥日志封存包：每事件版本从 1 递增，只插入不更新（更正走附录表）。
+CREATE TABLE IF NOT EXISTS incident_log_seals (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    version INT NOT NULL,
+    cutoff_at TIMESTAMP(6) NOT NULL,
+    record_count INT NOT NULL,
+    edge_count INT NOT NULL,
+    content_hash VARCHAR(64) NOT NULL,
+    sealed_by VARCHAR(128) NOT NULL,
+    sealed_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_log_seal_version UNIQUE (incident_id, version)
+);
+
+-- 封存包明细：固化记录快照、版本与任务依赖边，按 (occurred_at, record_key) 排序赋 seq。
+CREATE TABLE IF NOT EXISTS incident_log_seal_records (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    seal_id BIGINT NOT NULL,
+    seq INT NOT NULL,
+    record_type VARCHAR(32) NOT NULL,
+    record_key VARCHAR(256) NOT NULL,
+    occurred_at TIMESTAMP(6) NOT NULL,
+    record_version INT NOT NULL,
+    task_id BIGINT NULL,
+    blocker_incident_id BIGINT NULL,
+    payload CLOB NOT NULL,
+    CONSTRAINT uk_log_seal_record_seq UNIQUE (seal_id, seq)
+);
+
+-- 封存更正附录：仅追加，引用原包版本与原记录标识，不修改原包与明细。
+CREATE TABLE IF NOT EXISTS incident_log_corrections (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    seal_id BIGINT NOT NULL,
+    seal_version INT NOT NULL,
+    record_key VARCHAR(256) NOT NULL,
+    field_name VARCHAR(64) NOT NULL,
+    old_value CLOB NULL,
+    new_value CLOB NULL,
+    reason VARCHAR(1024) NOT NULL,
+    corrected_by VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL
+);
