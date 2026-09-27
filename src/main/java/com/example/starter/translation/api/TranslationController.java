@@ -22,8 +22,9 @@ import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
 
 /**
- * 多语种段落修订与发布快照 REST API。
- * 所有写操作携带全局唯一 requestId 做幂等去重；提交/批准以 X-Actor-Id 表示本地操作者。
+ * 多语种段落修订、评审利益冲突与发布快照 REST API。
+ * 所有写操作携带全局唯一 requestId 做幂等去重；提交/评审/冲突操作以 X-Actor-Id 表示本地操作者，
+ * 解除冲突另以 X-Actor-Role 表示合规角色。
  */
 @RestController
 @RequestMapping("/api/documents")
@@ -40,7 +41,7 @@ public class TranslationController {
         this.objectMapper = objectMapper;
     }
 
-    /** 建文档：1~5 种目标语言，可携带初始段落。 */
+    /** 建文档：1~5 种目标语言，可携带初始段落；requiredReviewCount 缺省 1。 */
     @PostMapping
     public ResponseEntity<String> createDocument(@Valid @RequestBody ApiDtos.CreateDocumentRequest request) {
         return writeExecutor.execute(request.requestId(), hash("POST /api/documents", request),
@@ -79,7 +80,7 @@ public class TranslationController {
                         documentId, segmentId, language, actorId, request))).toResponseEntity();
     }
 
-    /** 译文批准：审核人取 X-Actor-Id，不得是作者，须同时匹配当前源文与译文版本。 */
+    /** 译文批准：评审人取 X-Actor-Id，不得是作者、不得命中当前有效冲突，须匹配当前源文与译文版本。 */
     @PostMapping("/{documentId}/segments/{segmentId}/translations/{language}/approve")
     public ResponseEntity<String> approveTranslation(@PathVariable long documentId, @PathVariable String segmentId,
                                                      @PathVariable String language,
@@ -92,7 +93,72 @@ public class TranslationController {
                         documentId, segmentId, language, actorId, request))).toResponseEntity();
     }
 
-    /** 发布：全部段落全部目标语言均有有效批准且术语校验通过时原子生成只读快照并递增发布版本。 */
+    /** 译文否决：资格校验同批准；有效否决进入发布快照并阻断发布。 */
+    @PostMapping("/{documentId}/segments/{segmentId}/translations/{language}/reject")
+    public ResponseEntity<String> rejectTranslation(@PathVariable long documentId, @PathVariable String segmentId,
+                                                    @PathVariable String language,
+                                                    @RequestHeader("X-Actor-Id") String actorId,
+                                                    @Valid @RequestBody ApiDtos.RejectTranslationRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/segments/" + segmentId
+                + "/translations/" + language + "/reject";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(200, translationService.rejectTranslation(
+                        documentId, segmentId, language, actorId, request))).toResponseEntity();
+    }
+
+    /** 登记单条利益冲突声明：评审人取 X-Actor-Id，UTC 左闭右开区间与原因固化。 */
+    @PostMapping("/{documentId}/conflicts")
+    public ResponseEntity<String> declareConflict(@PathVariable long documentId,
+                                                  @RequestHeader("X-Actor-Id") String actorId,
+                                                  @Valid @RequestBody ApiDtos.DeclareConflictRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/conflicts";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(201, translationService.declareConflict(documentId, actorId, request)))
+                .toResponseEntity();
+    }
+
+    /** 批量登记利益冲突声明：任一范围非法整批不改变评审资格。 */
+    @PostMapping("/{documentId}/conflicts/batch")
+    public ResponseEntity<String> declareConflicts(@PathVariable long documentId,
+                                                   @RequestHeader("X-Actor-Id") String actorId,
+                                                   @Valid @RequestBody ApiDtos.DeclareConflictsBatchRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/conflicts/batch";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(201, translationService.declareConflicts(documentId, actorId, request)))
+                .toResponseEntity();
+    }
+
+    /** 解除冲突：须由不同于声明人的 COMPLIANCE 角色（X-Actor-Role）确认，追加历史，不追溯旧快照。 */
+    @PostMapping("/conflicts/{conflictId}/lift")
+    public ResponseEntity<String> liftConflict(@PathVariable long conflictId,
+                                               @RequestHeader("X-Actor-Id") String actorId,
+                                               @RequestHeader("X-Actor-Role") String actorRole,
+                                               @Valid @RequestBody ApiDtos.LiftConflictRequest request) {
+        String operation = "POST /api/documents/conflicts/" + conflictId + "/lift";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, actorRole, request),
+                () -> WriteResult.of(200, translationService.liftConflict(conflictId, actorId, actorRole,
+                        request.liftReason()))).toResponseEntity();
+    }
+
+    /** 查询文档内全部冲突声明明细及当前命中状态。 */
+    @GetMapping("/{documentId}/conflicts")
+    public ResponseEntity<ApiDtos.ConflictListResponse> getConflicts(@PathVariable long documentId) {
+        return ResponseEntity.ok(translationService.getConflicts(documentId));
+    }
+
+    /** 查询文档内冲突声明与解除的只追加历史。 */
+    @GetMapping("/{documentId}/conflicts/history")
+    public ResponseEntity<ApiDtos.ConflictHistoryResponse> getConflictHistory(@PathVariable long documentId) {
+        return ResponseEntity.ok(translationService.getConflictHistory(documentId));
+    }
+
+    /** 查询评审诊断：评审明细、是否计入法定人数、要求/实际/缺失批准数。 */
+    @GetMapping("/{documentId}/reviews/diagnostics")
+    public ResponseEntity<ApiDtos.ReviewDiagnosticsResponse> getReviewDiagnostics(@PathVariable long documentId) {
+        return ResponseEntity.ok(translationService.getReviewDiagnostics(documentId));
+    }
+
+    /** 发布：全部段落全部目标语言均满足非冲突有效评审法定人数且术语校验通过时原子生成只读快照并递增发布版本。 */
     @PostMapping("/{documentId}/publish")
     public ResponseEntity<String> publish(@PathVariable long documentId,
                                           @Valid @RequestBody ApiDtos.PublishRequest request) {

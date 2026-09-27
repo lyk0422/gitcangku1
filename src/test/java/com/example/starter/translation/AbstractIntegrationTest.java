@@ -2,6 +2,7 @@ package com.example.starter.translation;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.example.starter.translation.service.UtcClock;
 import org.junit.jupiter.api.BeforeEach;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
@@ -13,6 +14,7 @@ import org.springframework.test.web.servlet.MvcResult;
 import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
 import org.springframework.test.web.servlet.request.MockMvcRequestBuilders;
 
+import java.time.Clock;
 import java.util.UUID;
 
 /**
@@ -33,9 +35,15 @@ public abstract class AbstractIntegrationTest {
     @Autowired
     protected ObjectMapper objectMapper;
 
+    @Autowired
+    protected UtcClock clock;
+
     @BeforeEach
     void cleanTables() {
-        jdbc.update("DELETE FROM approval");
+        clock.setClock(Clock.systemUTC());
+        jdbc.update("DELETE FROM review");
+        jdbc.update("DELETE FROM conflict_history");
+        jdbc.update("DELETE FROM reviewer_conflict");
         jdbc.update("DELETE FROM translation");
         jdbc.update("DELETE FROM segment");
         jdbc.update("DELETE FROM release_snapshot");
@@ -100,6 +108,18 @@ public abstract class AbstractIntegrationTest {
         return result.body().get("documentId").asLong();
     }
 
+    /** 建文档（指定法定人数）并返回 documentId。 */
+    protected long createDocument(String requestId, String targetLanguagesJson, String segmentsJson,
+                                  int requiredReviewCount) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"targetLanguages\":" + targetLanguagesJson
+                + ",\"segments\":" + segmentsJson + ",\"requiredReviewCount\":" + requiredReviewCount + "}";
+        ApiResult result = postJson("/api/documents", body);
+        if (result.status() != 201) {
+            throw new IllegalStateException("建文档失败: " + result.status() + " " + result.body());
+        }
+        return result.body().get("documentId").asLong();
+    }
+
     protected ApiResult submitTranslation(long documentId, String segmentId, String language, String actorId,
                                           String content, int sourceVersion, String requestId) throws Exception {
         String body = "{\"requestId\":\"" + requestId + "\",\"content\":\"" + content
@@ -113,6 +133,59 @@ public abstract class AbstractIntegrationTest {
         String body = "{\"requestId\":\"" + requestId + "\",\"translationVersion\":" + translationVersion + "}";
         return postJson("/api/documents/" + documentId + "/segments/" + segmentId + "/translations/" + language
                 + "/approve", body, actorId);
+    }
+
+    protected ApiResult reject(long documentId, String segmentId, String language, String actorId,
+                               int translationVersion, String reason, String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"translationVersion\":" + translationVersion
+                + ",\"reason\":" + (reason == null ? "null" : "\"" + reason + "\"") + "}";
+        return postJson("/api/documents/" + documentId + "/segments/" + segmentId + "/translations/" + language
+                + "/reject", body, actorId);
+    }
+
+    /** 登记单条冲突声明，区间为 UTC 毫秒、左闭右开。 */
+    protected ApiResult declareConflict(long documentId, String actorId, String language,
+                                        long validFrom, long validTo, String reason, String requestId)
+            throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"language\":\"" + language + "\",\"validFrom\":"
+                + validFrom + ",\"validTo\":" + validTo + ",\"reason\":\"" + reason + "\"}";
+        return postJson("/api/documents/" + documentId + "/conflicts", body, actorId);
+    }
+
+    /** 批量登记冲突声明，declarationsJson 为声明对象数组。 */
+    protected ApiResult declareConflictsBatch(long documentId, String actorId, String declarationsJson,
+                                              String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"declarations\":" + declarationsJson + "}";
+        return postJson("/api/documents/" + documentId + "/conflicts/batch", body, actorId);
+    }
+
+    /** 解除冲突；actorId 为合规确认人，角色须为 COMPLIANCE。 */
+    protected ApiResult liftConflict(long conflictId, String actorId, String role, String liftReason,
+                                     String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"liftReason\":"
+                + (liftReason == null ? "null" : "\"" + liftReason + "\"") + "}";
+        MvcResult result = mockMvc.perform(MockMvcRequestBuilders
+                        .post("/api/documents/conflicts/" + conflictId + "/lift")
+                        .contentType("application/json").content(body)
+                        .header("X-Actor-Id", actorId).header("X-Actor-Role", role)).andReturn();
+        return toApiResult(result);
+    }
+
+    protected ApiResult getConflicts(long documentId) throws Exception {
+        return getJson("/api/documents/" + documentId + "/conflicts");
+    }
+
+    protected ApiResult getConflictHistory(long documentId) throws Exception {
+        return getJson("/api/documents/" + documentId + "/conflicts/history");
+    }
+
+    protected ApiResult getReviewDiagnostics(long documentId) throws Exception {
+        return getJson("/api/documents/" + documentId + "/reviews/diagnostics");
+    }
+
+    /** 将业务 UTC 时钟固定到指定毫秒，保证冲突命中、声明/解除时刻可控。 */
+    protected void fixClock(long epochMilli) {
+        clock.setClock(Clock.fixed(java.time.Instant.ofEpochMilli(epochMilli), java.time.ZoneOffset.UTC));
     }
 
     protected ApiResult publish(long documentId, int expectedDraftVersion, int expectedPublishedVersion,
