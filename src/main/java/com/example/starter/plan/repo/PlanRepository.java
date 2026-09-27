@@ -1,8 +1,10 @@
 package com.example.starter.plan.repo;
 
 import com.example.starter.plan.model.DayPlan;
+import com.example.starter.plan.model.HazardCar;
 import com.example.starter.plan.model.Occupancy;
 import com.example.starter.plan.model.PlanStatus;
+import com.example.starter.plan.model.PublishSnapshot;
 import com.example.starter.plan.model.PublishedSlot;
 import com.example.starter.plan.model.RescheduleLink;
 import java.sql.Date;
@@ -48,6 +50,13 @@ public class PlanRepository {
             rs.getLong("predecessor_plan_id"),
             rs.getLong("successor_plan_id"),
             rs.getLong("created_at"));
+
+    private static final RowMapper<HazardCar> HAZARD_CAR_MAPPER = (rs, n) -> new HazardCar(
+            rs.getLong("id"),
+            rs.getLong("plan_id"),
+            rs.getString("train_no"),
+            rs.getInt("position"),
+            rs.getString("hazard_class"));
 
     private final JdbcTemplate jdbc;
 
@@ -135,6 +144,208 @@ public class PlanRepository {
         return jdbc.query("SELECT id, plan_id, seq, train_no, section_id, start_utc, end_utc"
                         + " FROM rail_plan_occupancy WHERE plan_id = ? ORDER BY seq",
                 OCCUPANCY_MAPPER, planId);
+    }
+
+    /**
+     * 整体替换计划的危险品编组：先删后插，与占用替换保持同一提交顺序。
+     */
+    public void replaceHazardCars(long planId, List<HazardCar> cars) {
+        jdbc.update("DELETE FROM rail_plan_hazard_car WHERE plan_id = ?", planId);
+        insertHazardCars(planId, cars);
+    }
+
+    /**
+     * 批量插入危险品车厢。
+     */
+    public void insertHazardCars(long planId, List<HazardCar> cars) {
+        if (cars.isEmpty()) {
+            return;
+        }
+        jdbc.batchUpdate(
+                "INSERT INTO rail_plan_hazard_car (plan_id, train_no, position, hazard_class)"
+                        + " VALUES (?, ?, ?, ?)",
+                cars, cars.size(),
+                (ps, c) -> {
+                    ps.setLong(1, planId);
+                    ps.setString(2, c.trainNo());
+                    ps.setInt(3, c.position());
+                    ps.setString(4, c.hazardClass());
+                });
+    }
+
+    /**
+     * 查询计划危险品编组，按列车、位置升序稳定排列。
+     */
+    public List<HazardCar> findHazardCars(long planId) {
+        return jdbc.query("SELECT id, plan_id, train_no, position, hazard_class"
+                + " FROM rail_plan_hazard_car WHERE plan_id = ?"
+                + " ORDER BY train_no, position", HAZARD_CAR_MAPPER, planId);
+    }
+
+    /**
+     * 追加发布快照主记录，返回自增主键。配置版本为空（无生效配置）时各版本字段为 null。
+     */
+    public long insertPublishSnapshot(long planId, Long configVersionId, Integer configVersionNo,
+                                      String configFingerprint, String conclusion, String operator,
+                                      long nowMillis) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO plan_publish_snapshot"
+                            + " (plan_id, config_version_id, config_version_no, config_fingerprint,"
+                            + " conclusion, operator, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setLong(1, planId);
+            if (configVersionId == null) {
+                ps.setNull(2, java.sql.Types.BIGINT);
+            } else {
+                ps.setLong(2, configVersionId);
+            }
+            if (configVersionNo == null) {
+                ps.setNull(3, java.sql.Types.INTEGER);
+            } else {
+                ps.setInt(3, configVersionNo);
+            }
+            ps.setString(4, configFingerprint);
+            ps.setString(5, conclusion);
+            ps.setString(6, operator);
+            ps.setLong(7, nowMillis);
+            return ps;
+        }, keys);
+        return keys.getKey().longValue();
+    }
+
+    /**
+     * 批量插入快照危险品车厢副本。
+     */
+    public void insertSnapshotCars(long snapshotId, List<HazardCar> cars) {
+        if (cars.isEmpty()) {
+            return;
+        }
+        List<PublishSnapshot.SnapshotHazardCar> snapshotCars = cars.stream()
+                .map(c -> new PublishSnapshot.SnapshotHazardCar(c.trainNo(), c.position(),
+                        c.hazardClass()))
+                .toList();
+        jdbc.batchUpdate(
+                "INSERT INTO plan_publish_snapshot_car (snapshot_id, train_no, position, hazard_class)"
+                        + " VALUES (?, ?, ?, ?)",
+                snapshotCars, snapshotCars.size(),
+                (ps, c) -> {
+                    ps.setLong(1, snapshotId);
+                    ps.setString(2, c.trainNo());
+                    ps.setInt(3, c.position());
+                    ps.setString(4, c.hazardClass());
+                });
+    }
+
+    /**
+     * 批量插入快照限制区段开放清单副本。
+     */
+    public void insertSnapshotSections(long snapshotId,
+                                       List<PublishSnapshot.SnapshotOpenSection> sections) {
+        if (sections.isEmpty()) {
+            return;
+        }
+        jdbc.batchUpdate(
+                "INSERT INTO plan_publish_snapshot_section (snapshot_id, section_id, hazard_class)"
+                        + " VALUES (?, ?, ?)",
+                sections, sections.size(),
+                (ps, s) -> {
+                    ps.setLong(1, snapshotId);
+                    ps.setString(2, s.sectionId());
+                    ps.setString(3, s.hazardClass());
+                });
+    }
+
+    /**
+     * 按计划查询发布快照（每计划最多一行，追加后不可变）。
+     */
+    public Optional<PublishSnapshot> findSnapshotByPlan(long planId) {
+        List<PublishSnapshot> snapshots = jdbc.query(
+                "SELECT id, plan_id, config_version_id, config_version_no, config_fingerprint,"
+                        + " conclusion, operator, created_at FROM plan_publish_snapshot"
+                        + " WHERE plan_id = ?",
+                (rs, n) -> new PublishSnapshot(
+                        rs.getLong("id"),
+                        rs.getLong("plan_id"),
+                        rs.getObject("config_version_id", Long.class),
+                        rs.getObject("config_version_no", Integer.class),
+                        rs.getString("config_fingerprint"),
+                        rs.getString("conclusion"),
+                        rs.getString("operator"),
+                        rs.getLong("created_at"),
+                        List.of(),
+                        List.of()),
+                planId);
+        if (snapshots.isEmpty()) {
+            return Optional.empty();
+        }
+        PublishSnapshot snapshot = snapshots.get(0);
+        return Optional.of(new PublishSnapshot(snapshot.id(), snapshot.planId(),
+                snapshot.configVersionId(), snapshot.configVersionNo(), snapshot.configFingerprint(),
+                snapshot.conclusion(), snapshot.operator(), snapshot.createdAt(),
+                findSnapshotCars(snapshot.id()), findSnapshotSections(snapshot.id())));
+    }
+
+    /**
+     * 查询发布历史，按创建时刻升序、快照 id 升序稳定排列；查询不修改状态。
+     */
+    public List<PublishSnapshot> findSnapshots(LocalDate fromOpDate, LocalDate toOpDate,
+                                               Integer limit) {
+        StringBuilder sql = new StringBuilder(
+                "SELECT s.id, s.plan_id, s.config_version_id, s.config_version_no,"
+                        + " s.config_fingerprint, s.conclusion, s.operator, s.created_at"
+                        + " FROM plan_publish_snapshot s"
+                        + " JOIN rail_day_plan p ON p.id = s.plan_id WHERE 1 = 1");
+        List<Object> args = new ArrayList<>();
+        if (fromOpDate != null) {
+            sql.append(" AND p.op_date >= ?");
+            args.add(Date.valueOf(fromOpDate));
+        }
+        if (toOpDate != null) {
+            sql.append(" AND p.op_date <= ?");
+            args.add(Date.valueOf(toOpDate));
+        }
+        sql.append(" ORDER BY s.created_at, s.id");
+        if (limit != null && limit > 0) {
+            sql.append(" LIMIT ").append(limit);
+        }
+        List<PublishSnapshot> result = jdbc.query(sql.toString(), (rs, n) ->
+                new PublishSnapshot(
+                        rs.getLong("id"),
+                        rs.getLong("plan_id"),
+                        rs.getObject("config_version_id", Long.class),
+                        rs.getObject("config_version_no", Integer.class),
+                        rs.getString("config_fingerprint"),
+                        rs.getString("conclusion"),
+                        rs.getString("operator"),
+                        rs.getLong("created_at"),
+                        List.of(),
+                        List.of()), args.toArray());
+        for (int i = 0; i < result.size(); i++) {
+            PublishSnapshot s = result.get(i);
+            result.set(i, new PublishSnapshot(s.id(), s.planId(), s.configVersionId(),
+                    s.configVersionNo(), s.configFingerprint(), s.conclusion(), s.operator(),
+                    s.createdAt(), findSnapshotCars(s.id()), findSnapshotSections(s.id())));
+        }
+        return result;
+    }
+
+    private List<PublishSnapshot.SnapshotHazardCar> findSnapshotCars(long snapshotId) {
+        return jdbc.query("SELECT train_no, position, hazard_class FROM plan_publish_snapshot_car"
+                        + " WHERE snapshot_id = ? ORDER BY train_no, position",
+                (rs, n) -> new PublishSnapshot.SnapshotHazardCar(
+                        rs.getString("train_no"), rs.getInt("position"),
+                        rs.getString("hazard_class")),
+                snapshotId);
+    }
+
+    private List<PublishSnapshot.SnapshotOpenSection> findSnapshotSections(long snapshotId) {
+        return jdbc.query("SELECT section_id, hazard_class FROM plan_publish_snapshot_section"
+                        + " WHERE snapshot_id = ? ORDER BY section_id, hazard_class",
+                (rs, n) -> new PublishSnapshot.SnapshotOpenSection(
+                        rs.getString("section_id"), rs.getString("hazard_class")),
+                snapshotId);
     }
 
     /**
