@@ -28,16 +28,32 @@ public class CampaignRepository {
                     rs.getString("campaign_id"),
                     rs.getInt("daily_total_cap"),
                     rs.getInt("per_visitor_daily_cap"),
+                    rs.getInt("attribution_window_minutes"),
+                    rs.getInt("window_version"),
                     rs.getLong("created_at_utc"));
         }
     };
+
+    private static final String COLUMNS =
+            "campaign_id, daily_total_cap, per_visitor_daily_cap, "
+                    + "attribution_window_minutes, window_version, created_at_utc";
 
     /**
      * 按编号查询公告。
      */
     public Optional<Campaign> findById(String campaignId) {
-        return jdbc.query("SELECT campaign_id, daily_total_cap, per_visitor_daily_cap, created_at_utc "
-                        + "FROM campaign WHERE campaign_id = ?", MAPPER, campaignId)
+        return jdbc.query("SELECT " + COLUMNS + " FROM campaign WHERE campaign_id = ?",
+                        MAPPER, campaignId)
+                .stream()
+                .findFirst();
+    }
+
+    /**
+     * 行锁读取公告（调整窗口时使用）。
+     */
+    public Optional<Campaign> lockById(String campaignId) {
+        return jdbc.query("SELECT " + COLUMNS + " FROM campaign WHERE campaign_id = ? FOR UPDATE",
+                        MAPPER, campaignId)
                 .stream()
                 .findFirst();
     }
@@ -46,11 +62,26 @@ public class CampaignRepository {
      * 插入公告；编号冲突由调用方依据唯一约束处理。
      */
     public void insert(Campaign campaign) {
-        jdbc.update("INSERT INTO campaign (campaign_id, daily_total_cap, per_visitor_daily_cap, created_at_utc) "
-                        + "VALUES (?, ?, ?, ?)",
+        jdbc.update("INSERT INTO campaign (campaign_id, daily_total_cap, per_visitor_daily_cap, "
+                        + "attribution_window_minutes, window_version, created_at_utc) "
+                        + "VALUES (?, ?, ?, ?, ?, ?)",
                 campaign.campaignId(),
                 campaign.dailyTotalCap(),
                 campaign.perVisitorDailyCap(),
+                campaign.attributionWindowMinutes(),
+                campaign.windowVersion(),
                 campaign.createdAtUtc());
+    }
+
+    /**
+     * 调整归因窗口并把版本号 +1（调用方须持行锁）。
+     */
+    public void updateWindow(String campaignId, int newWindowMinutes, int newVersion) {
+        int rows = jdbc.update("UPDATE campaign SET attribution_window_minutes = ?, window_version = ? "
+                        + "WHERE campaign_id = ?",
+                newWindowMinutes, newVersion, campaignId);
+        if (rows != 1) {
+            throw new IllegalStateException("campaign row missing: " + campaignId);
+        }
     }
 }

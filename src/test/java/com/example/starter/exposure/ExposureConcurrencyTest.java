@@ -83,10 +83,12 @@ class ExposureConcurrencyTest {
 
     @BeforeEach
     void clean() {
+        jdbc.update("DELETE FROM attribution_receipt");
         jdbc.update("DELETE FROM idempotency_record");
         jdbc.update("DELETE FROM exposure_reservation");
         jdbc.update("DELETE FROM quota_visitor_ledger");
         jdbc.update("DELETE FROM quota_total_ledger");
+        jdbc.update("DELETE FROM campaign_window_version");
         jdbc.update("DELETE FROM campaign");
     }
 
@@ -100,7 +102,7 @@ class ExposureConcurrencyTest {
     void concurrentApply_doesNotOversell() throws Exception {
         int totalCap = 20;
         int threads = 100;
-        service.createCampaign(new CreateCampaignRequest("req-c", "cap", totalCap, 100_000));
+        service.createCampaign(new CreateCampaignRequest("req-c", "cap", totalCap, 100_000, 60, null));
 
         ExecutorService pool = Executors.newFixedThreadPool(16);
         CountDownLatch start = new CountDownLatch(1);
@@ -144,7 +146,7 @@ class ExposureConcurrencyTest {
     @Test
     @DisplayName("同一预占并发确认/取消：只允许一个终态，额度不重复释放、不变负")
     void concurrentConfirmAndCancel_singleTerminal_noDoubleRelease() throws Exception {
-        service.createCampaign(new CreateCampaignRequest("req-c", "cap", 1, 1));
+        service.createCampaign(new CreateCampaignRequest("req-c", "cap", 1, 1, 60, null));
         ReservationResponse r = service.apply(new ApplyExposureRequest("req-a", "cap", "v1"));
 
         int threads = 24;
@@ -165,7 +167,7 @@ class ExposureConcurrencyTest {
                                     new ReservationActionRequest("req-t-" + idx))
                             : service.cancel(r.reservationId(),
                                     new ReservationActionRequest("req-t-" + idx));
-                    if (result.status().name().equals("CONFIRMED")) {
+                    if (result.status().equals("CONFIRMED")) {
                         confirmed.incrementAndGet();
                     } else {
                         cancelled.incrementAndGet();
@@ -200,7 +202,7 @@ class ExposureConcurrencyTest {
                         + "WHERE campaign_id = 'cap' AND visitor_id = 'v1' AND utc_date = ?",
                 Integer.class, java.sql.Date.valueOf(DAY));
         assertTrue(usedTotal >= 0 && usedVisitor >= 0, "账目不得为负");
-        if (detail.status().name().equals("CANCELLED")) {
+        if (detail.status().equals("CANCELLED")) {
             assertEquals(0, usedTotal, "取消后总额度应恰好释放一次");
             assertEquals(0, usedVisitor, "取消后访客额度应恰好释放一次");
         } else {
@@ -212,7 +214,7 @@ class ExposureConcurrencyTest {
     @Test
     @DisplayName("同一 requestId 并发重放：业务只执行一次，响应一致")
     void concurrentSameRequestId_executesOnce() throws Exception {
-        service.createCampaign(new CreateCampaignRequest("req-c", "cap", 100, 100));
+        service.createCampaign(new CreateCampaignRequest("req-c", "cap", 100, 100, 60, null));
 
         int threads = 16;
         ExecutorService pool = Executors.newFixedThreadPool(threads);

@@ -18,7 +18,7 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(ApiException.class)
     public ResponseEntity<ErrorResponse> handleApi(ApiException ex) {
-        return build(ex.getStatus(), ex.getMessage(), null);
+        return build(ex.getStatus(), ex.getCode(), ex.getMessage(), null);
     }
 
     @ExceptionHandler({
@@ -34,16 +34,16 @@ public class GlobalExceptionHandler {
         if (ex instanceof MethodArgumentNotValidException manv && manv.getBindingResult().getFieldError() != null) {
             message = manv.getBindingResult().getFieldError().getDefaultMessage();
         }
-        return build(HttpStatus.BAD_REQUEST, message, null);
+        return build(HttpStatus.BAD_REQUEST, null, message, null);
     }
 
     @ExceptionHandler(Exception.class)
     public ResponseEntity<ErrorResponse> handleOther(Exception ex) {
-        return build(HttpStatus.INTERNAL_SERVER_ERROR, "internal server error", null);
+        return build(HttpStatus.INTERNAL_SERVER_ERROR, null, "internal server error", null);
     }
 
-    private ResponseEntity<ErrorResponse> build(HttpStatus status, String message, String requestId) {
+    private ResponseEntity<ErrorResponse> build(HttpStatus status, String code, String message, String requestId) {
         return ResponseEntity.status(status)
-                .body(new ErrorResponse(status.value(), status.getReasonPhrase(), message, requestId));
+                .body(new ErrorResponse(status.value(), status.getReasonPhrase(), code, message, requestId));
     }
 }

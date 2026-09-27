@@ -106,10 +106,12 @@ class ExposureApiIntegrationTest {
 
     @BeforeEach
     void cleanAndReset() {
+        jdbc.update("DELETE FROM attribution_receipt");
         jdbc.update("DELETE FROM idempotency_record");
         jdbc.update("DELETE FROM exposure_reservation");
         jdbc.update("DELETE FROM quota_visitor_ledger");
         jdbc.update("DELETE FROM quota_total_ledger");
+        jdbc.update("DELETE FROM campaign_window_version");
         jdbc.update("DELETE FROM campaign");
         mutableClock().setInstant(BASE);
     }
@@ -120,7 +122,7 @@ class ExposureApiIntegrationTest {
     }
 
     private CreateCampaignRequest createReq(String requestId, String campaignId, int total, int perVisitor) {
-        return new CreateCampaignRequest(requestId, campaignId, total, perVisitor);
+        return new CreateCampaignRequest(requestId, campaignId, total, perVisitor, 60, null);
     }
 
     @Test
@@ -133,7 +135,7 @@ class ExposureApiIntegrationTest {
         assertEquals("c1", r.campaignId());
         assertEquals("v1", r.visitorId());
         assertEquals(LocalDate.of(2026, 9, 22), r.utcDate());
-        assertEquals("RESERVED", r.status().name());
+        assertEquals("RESERVED", r.status());
         assertEquals(BASE.toEpochMilli(), r.createdAtUtc());
         assertEquals(BASE.toEpochMilli() + 60_000L, r.expiresAtUtc());
         assertNull(r.terminalAtUtc());
@@ -159,18 +161,18 @@ class ExposureApiIntegrationTest {
 
         ReservationResponse confirmed = service.confirm(r.reservationId(),
                 new ReservationActionRequest("req-ok1"));
-        assertEquals("CONFIRMED", confirmed.status().name());
+        assertEquals("CONFIRMED", confirmed.status());
         assertEquals(BASE.toEpochMilli(), confirmed.terminalAtUtc());
 
         // 同 requestId 重放：原成功结果
         ReservationResponse replay = service.confirm(r.reservationId(),
                 new ReservationActionRequest("req-ok1"));
-        assertEquals("CONFIRMED", replay.status().name());
+        assertEquals("CONFIRMED", replay.status());
 
         // 新 requestId 的重复同类终态操作：仍返回原状态，不重复变更
         ReservationResponse again = service.confirm(r.reservationId(),
                 new ReservationActionRequest("req-ok2"));
-        assertEquals("CONFIRMED", again.status().name());
+        assertEquals("CONFIRMED", again.status());
 
         assertEquals(1, service.queryQuota("c1", "v1", LocalDate.of(2026, 9, 22)).usedVisitor());
         assertEquals(1, service.queryQuota("c1", null, LocalDate.of(2026, 9, 22)).usedTotal());
@@ -184,14 +186,14 @@ class ExposureApiIntegrationTest {
 
         ReservationResponse cancelled = service.cancel(r.reservationId(),
                 new ReservationActionRequest("req-x1"));
-        assertEquals("CANCELLED", cancelled.status().name());
+        assertEquals("CANCELLED", cancelled.status());
 
         ReservationResponse replay = service.cancel(r.reservationId(),
                 new ReservationActionRequest("req-x1"));
-        assertEquals("CANCELLED", replay.status().name());
+        assertEquals("CANCELLED", replay.status());
         ReservationResponse again = service.cancel(r.reservationId(),
                 new ReservationActionRequest("req-x2"));
-        assertEquals("CANCELLED", again.status().name());
+        assertEquals("CANCELLED", again.status());
 
         QuotaResponse quota = service.queryQuota("c1", "v1", LocalDate.of(2026, 9, 22));
         assertEquals(0, quota.usedTotal());
@@ -201,7 +203,7 @@ class ExposureApiIntegrationTest {
 
         // 释放后额度可再次申请
         ReservationResponse second = service.apply(new ApplyExposureRequest("req-a2", "c1", "v1"));
-        assertEquals("RESERVED", second.status().name());
+        assertEquals("RESERVED", second.status());
     }
 
     @Test
@@ -231,7 +233,7 @@ class ExposureApiIntegrationTest {
         assert409(() -> service.cancel(r.reservationId(), new ReservationActionRequest("req-e2")));
 
         ReservationResponse detail = service.getReservation(r.reservationId());
-        assertEquals("EXPIRED", detail.status().name());
+        assertEquals("EXPIRED", detail.status());
         assertEquals(BASE.toEpochMilli() + 60_000L, detail.terminalAtUtc());
 
         QuotaResponse quota = service.queryQuota("c1", "v1", LocalDate.of(2026, 9, 22));
@@ -251,7 +253,7 @@ class ExposureApiIntegrationTest {
         mutableClock().setInstant(Instant.parse("2026-09-23T00:00:01Z"));
         ReservationResponse confirmed = service.confirm(r.reservationId(),
                 new ReservationActionRequest("req-k1"));
-        assertEquals("CONFIRMED", confirmed.status().name());
+        assertEquals("CONFIRMED", confirmed.status());
 
         // 原 UTC 日仍计数，新 UTC 日额度全新
         assertEquals(1, service.queryQuota("c1", "v1", LocalDate.of(2026, 9, 22)).usedTotal());
@@ -297,7 +299,7 @@ class ExposureApiIntegrationTest {
         assert429(() -> service.apply(new ApplyExposureRequest("key-fail", "c1", "v2")));
         service.cancel(first.reservationId(), new ReservationActionRequest("req-x1"));
         ReservationResponse retried = service.apply(new ApplyExposureRequest("key-fail", "c1", "v2"));
-        assertEquals("RESERVED", retried.status().name());
+        assertEquals("RESERVED", retried.status());
         assertEquals(1, service.queryQuota("c1", null, LocalDate.of(2026, 9, 22)).usedTotal());
     }
 
@@ -316,7 +318,7 @@ class ExposureApiIntegrationTest {
         mockMvc.perform(post("/api/exposure/campaigns")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"requestId\":\"h1\",\"campaignId\":\"ch\",\"dailyTotalCap\":1,"
-                                + "\"perVisitorDailyCap\":1}"))
+                                + "\"perVisitorDailyCap\":1,\"attributionWindowMinutes\":60}"))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.campaignId").value("ch"));
 
@@ -335,7 +337,7 @@ class ExposureApiIntegrationTest {
         mockMvc.perform(post("/api/exposure/campaigns")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"requestId\":\"h4\",\"campaignId\":\"bad\",\"dailyTotalCap\":0,"
-                                + "\"perVisitorDailyCap\":1}"))
+                                + "\"perVisitorDailyCap\":1,\"attributionWindowMinutes\":60}"))
                 .andExpect(status().isBadRequest());
 
         mockMvc.perform(get("/api/exposure/campaigns/ch/quota")
