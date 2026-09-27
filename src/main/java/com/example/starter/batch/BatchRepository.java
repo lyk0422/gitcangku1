@@ -15,9 +15,10 @@ public class BatchRepository {
 
     /**
      * batch 表行记录；id 同时作为同批次事件的提交顺序依据。
+     * segregationCategory 为批次声明的隔离类别，null 表示尚未声明。
      */
     public record BatchRow(long id, String batchKey, String productCode, String batchNo,
-                           String producedAt, String status, String createdAt) {
+                           String producedAt, String segregationCategory, String status, String createdAt) {
     }
 
     /**
@@ -57,6 +58,7 @@ public class BatchRepository {
     private static final RowMapper<BatchRow> BATCH_MAPPER = (rs, n) -> new BatchRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("product_code"),
             rs.getString("batch_no"), rs.getString("produced_at"),
+            rs.getString("segregation_category"),
             rs.getString("status"), rs.getString("created_at"));
 
     private static final RowMapper<TestRow> TEST_MAPPER = (rs, n) -> new TestRow(
@@ -101,10 +103,36 @@ public class BatchRepository {
     }
 
     public void insertBatch(BatchRow row) {
-        jdbc.update("INSERT INTO batch (batch_key, product_code, batch_no, produced_at, status, created_at)"
-                        + " VALUES (?, ?, ?, ?, ?, ?)",
+        jdbc.update("INSERT INTO batch (batch_key, product_code, batch_no, produced_at,"
+                        + " segregation_category, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 row.batchKey(), row.productCode(), row.batchNo(), row.producedAt(),
-                row.status(), row.createdAt());
+                row.segregationCategory(), row.status(), row.createdAt());
+    }
+
+    /**
+     * 声明批次隔离类别；仅在 segregation_category 仍为 NULL 时生效（声明后不可更改），返回受影响行数。
+     */
+    public int declareCategory(String batchKey, String category, String declaredAt) {
+        return jdbc.update("UPDATE batch SET segregation_category = ?, segregation_declared_at = ?"
+                + " WHERE batch_key = ? AND segregation_category IS NULL",
+                category, declaredAt, batchKey);
+    }
+
+    /**
+     * 读取批次隔离类别及声明时间；未声明时两者均为 null（Optional 仍命中行）。
+     */
+    public Optional<CategoryView> findCategory(String batchKey) {
+        return jdbc.query("SELECT segregation_category, segregation_declared_at FROM batch"
+                        + " WHERE batch_key = ?",
+                        (rs, n) -> new CategoryView(rs.getString("segregation_category"),
+                                rs.getString("segregation_declared_at")), batchKey)
+                .stream().findFirst();
+    }
+
+    /**
+     * 隔离类别视图：类别与声明时间（UTC 字符串），未声明均为 null。
+     */
+    public record CategoryView(String category, String declaredAt) {
     }
 
     public void insertRequiredTest(String batchKey, String testItem, int seq) {

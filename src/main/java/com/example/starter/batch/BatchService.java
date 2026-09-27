@@ -59,13 +59,16 @@ public class BatchService {
     private static final int IDEMPOTENCY_MAX_ATTEMPTS = 3;
 
     private final BatchRepository repo;
+    private final PalletService palletService;
     private final TransactionTemplate tx;
     private final ObjectMapper objectMapper;
 
     public BatchService(BatchRepository repo,
+                        PalletService palletService,
                         PlatformTransactionManager transactionManager,
                         ObjectMapper objectMapper) {
         this.repo = repo;
+        this.palletService = palletService;
         this.tx = new TransactionTemplate(transactionManager);
         this.objectMapper = objectMapper;
     }
@@ -86,12 +89,13 @@ public class BatchService {
             });
             String now = now();
             repo.insertBatch(new BatchRepository.BatchRow(0L, req.batchKey(), req.productCode(),
-                    req.batchNo(), req.producedAt().toString(), BatchStatus.QUARANTINED.name(), now));
+                    req.batchNo(), req.producedAt().toString(), null,
+                    BatchStatus.QUARANTINED.name(), now));
             for (int i = 0; i < items.size(); i++) {
                 repo.insertRequiredTest(req.batchKey(), items.get(i), i + 1);
             }
             BatchResponse body = new BatchResponse(req.batchKey(), req.productCode(), req.batchNo(),
-                    req.producedAt(), BatchStatus.QUARANTINED, items, Instant.parse(now));
+                    req.producedAt(), null, BatchStatus.QUARANTINED, items, Instant.parse(now));
             return new StoredResponse(201, toJson(body));
         });
     }
@@ -221,23 +225,28 @@ public class BatchService {
         String actor = actorId.trim();
         String fingerprint = fingerprint("recall", batchKey, actor, req.reason());
         return executeIdempotent(CMD_RECALL, req.commandKey(), fingerprint, () -> {
-            BatchRepository.BatchRow batch = repo.findBatchForUpdate(batchKey)
+            // 先确定召回命中点（自身 + 全部后代；血缘只增不改，无锁读取即可），
+            // 再按业务键全局排序一次性锁定全部批次行——与托盘装载路径“先批次（按 key 升序）
+            // 后托盘”保持同一锁顺序，避免并发交叉死锁；之后按事务提交顺序裁决。
+            List<String> hitKeys = new ArrayList<>();
+            hitKeys.add(batchKey);
+            hitKeys.addAll(descendantKeys(batchKey));
+            Collections.sort(hitKeys);
+            for (String hitKey : hitKeys) {
+                repo.findBatchForUpdate(hitKey);
+            }
+            BatchRepository.BatchRow batch = repo.findBatch(batchKey)
                     .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
             BatchStatus status = BatchStatus.valueOf(batch.status());
             if (status != BatchStatus.RELEASED && status != BatchStatus.SPLIT) {
                 throw ApiException.conflict("批次状态 " + status + " 不允许召回，仅 RELEASED 或 SPLIT 可召回");
             }
-            // 逐行锁定全部后代（按业务键排序保证锁顺序确定）：与后代上的检验/批准/拆分
-            // 互斥，按事务提交顺序裁决——召回先提交则后代新操作看到召回并返回 422。
-            List<String> descendants = descendantKeys(batchKey);
-            Collections.sort(descendants);
-            for (String descendantKey : descendants) {
-                repo.findBatchForUpdate(descendantKey);
-            }
             String now = now();
             repo.insertRecall(new BatchRepository.RecallRow(0L, batchKey, req.commandKey(),
                     actor, req.reason(), now));
             repo.updateStatus(batchKey, BatchStatus.RECALLED.name());
+            // 命中未装运托盘中任一批次时，同托盘所有未装运批次在同一事务内标记待复核
+            palletService.applyRecallReview(batchKey, hitKeys);
             RecallResponse body = new RecallResponse(batchKey, actor, req.reason(),
                     BatchStatus.RECALLED, Instant.parse(now));
             return new StoredResponse(201, toJson(body));
@@ -342,7 +351,8 @@ public class BatchService {
 
     private BatchResponse toBatchResponse(BatchRepository.BatchRow row) {
         return new BatchResponse(row.batchKey(), row.productCode(), row.batchNo(),
-                Instant.parse(row.producedAt()), BatchStatus.valueOf(row.status()),
+                Instant.parse(row.producedAt()), row.segregationCategory(),
+                BatchStatus.valueOf(row.status()),
                 repo.findRequiredTests(row.batchKey()), Instant.parse(row.createdAt()));
     }
 
@@ -459,14 +469,15 @@ public class BatchService {
             for (int i = 0; i < children.size(); i++) {
                 SplitRequest.ChildSpec spec = children.get(i);
                 repo.insertBatch(new BatchRepository.BatchRow(0L, spec.batchKey(), parent.productCode(),
-                        spec.batchNo(), parent.producedAt(), BatchStatus.QUARANTINED.name(), now));
+                        spec.batchNo(), parent.producedAt(), null,
+                        BatchStatus.QUARANTINED.name(), now));
                 for (int j = 0; j < required.size(); j++) {
                     repo.insertRequiredTest(spec.batchKey(), required.get(j), j + 1);
                 }
                 repo.insertLineage(new BatchRepository.LineageRow(0L, parentKey, spec.batchKey(),
                         i + 1, now));
                 childBodies.add(new SplitResponse.SplitChild(spec.batchKey(), spec.batchNo(),
-                        parent.productCode(), Instant.parse(parent.producedAt()),
+                        parent.productCode(), Instant.parse(parent.producedAt()), null,
                         BatchStatus.QUARANTINED, required, Instant.parse(now)));
             }
             repo.updateStatus(parentKey, BatchStatus.SPLIT.name());

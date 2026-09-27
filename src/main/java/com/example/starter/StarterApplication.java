@@ -2,6 +2,9 @@ package com.example.starter;
 
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.context.annotation.Bean;
+
+import java.time.Clock;
 
 /**
  * 业务题目工程入口；提供生产批次隔离、放行、拆分血缘与召回追溯 Web 服务及数据库健康检查。
@@ -15,4 +18,13 @@ public class StarterApplication {
     public static void main(String[] args) {
         SpringApplication.run(StarterApplication.class, args);
     }
+
+    /**
+     * UTC 系统时钟；托盘域全部时间戳经此获取，测试可替换为固定/可控时钟。
+     */
+    @Bean
+    public Clock clock() {
+        return Clock.systemUTC();
+    }
 }
+
