@@ -274,6 +274,116 @@ public class RepositoryDao {
                 lockFileId);
     }
 
+    // ------------------------------------------------------------------
+    // 弃用窗口
+    // ------------------------------------------------------------------
+
+    /** 弃用窗口行。 */
+    public record DeprecationRow(long id, String name, int version, Instant effectiveAt,
+                                 int replacementVersion, String reason, boolean revoked,
+                                 Instant revokedAt, Instant createdAt) {
+    }
+
+    /** 锁文件弃用警告快照行。 */
+    public record LockWarningRow(String name, int version, int replacementVersion,
+                                 Instant effectiveAt, String reason) {
+    }
+
+    /** 新增弃用窗口，返回自增主键。 */
+    public long insertDeprecation(String name, int version, Instant effectiveAt,
+                                  int replacementVersion, String reason,
+                                  String requestId, Instant createdAt) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbcTemplate.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO deprecation_window (name, version, effective_at, replacement_version, "
+                            + "reason, revoked, revoked_at, request_id, created_at) "
+                            + "VALUES (?, ?, ?, ?, ?, 0, NULL, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, name);
+            ps.setInt(2, version);
+            ps.setTimestamp(3, Timestamp.from(effectiveAt));
+            ps.setInt(4, replacementVersion);
+            ps.setString(5, reason);
+            ps.setString(6, requestId);
+            ps.setTimestamp(7, Timestamp.from(createdAt));
+            return ps;
+        }, keyHolder);
+        Number key = keyHolder.getKey();
+        if (key == null) {
+            throw new IllegalStateException("插入弃用窗口未获取自增主键");
+        }
+        return key.longValue();
+    }
+
+    /** 按名称+版本查询弃用窗口（含已撤销），不存在返回 null。 */
+    public DeprecationRow findDeprecation(String name, int version) {
+        List<DeprecationRow> rows = jdbcTemplate.query(
+                "SELECT id, name, version, effective_at, replacement_version, reason, revoked, "
+                        + "revoked_at, created_at FROM deprecation_window "
+                        + "WHERE name = ? AND version = ?",
+                (rs, n) -> mapDeprecationRow(rs),
+                name, version);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /** 查询全部弃用窗口（含已撤销），按名称、版本升序，供历史查询。 */
+    public List<DeprecationRow> listDeprecations() {
+        return jdbcTemplate.query(
+                "SELECT id, name, version, effective_at, replacement_version, reason, revoked, "
+                        + "revoked_at, created_at FROM deprecation_window "
+                        + "ORDER BY name ASC, version ASC",
+                (rs, n) -> mapDeprecationRow(rs));
+    }
+
+    /** 查询全部未撤销的弃用窗口，供锁定裁决。 */
+    public List<DeprecationRow> listActiveDeprecations() {
+        return jdbcTemplate.query(
+                "SELECT id, name, version, effective_at, replacement_version, reason, revoked, "
+                        + "revoked_at, created_at FROM deprecation_window WHERE revoked = 0",
+                (rs, n) -> mapDeprecationRow(rs));
+    }
+
+    /**
+     * 撤销指定弃用窗口，仅当当前未撤销时生效，返回受影响行数。
+     * 条件更新保证重复撤销/并发撤销的原子判定。
+     */
+    public int markDeprecationRevoked(long id, Instant revokedAt) {
+        return jdbcTemplate.update(
+                "UPDATE deprecation_window SET revoked = 1, revoked_at = ? WHERE id = ? AND revoked = 0",
+                Timestamp.from(revokedAt), id);
+    }
+
+    /** 为锁文件写入一条弃用警告快照。 */
+    public void insertLockWarning(long lockFileId, String name, int version,
+                                  int replacementVersion, Instant effectiveAt, String reason) {
+        jdbcTemplate.update(
+                "INSERT INTO lock_deprecation_warning (lock_file_id, name, version, "
+                        + "replacement_version, effective_at, reason) VALUES (?, ?, ?, ?, ?, ?)",
+                lockFileId, name, version, replacementVersion,
+                Timestamp.from(effectiveAt), reason);
+    }
+
+    /** 查询某锁文件固化的弃用警告快照，按名称升序。 */
+    public List<LockWarningRow> listLockWarnings(long lockFileId) {
+        return jdbcTemplate.query(
+                "SELECT name, version, replacement_version, effective_at, reason "
+                        + "FROM lock_deprecation_warning WHERE lock_file_id = ? ORDER BY name ASC",
+                (rs, n) -> new LockWarningRow(rs.getString("name"), rs.getInt("version"),
+                        rs.getInt("replacement_version"), rs.getTimestamp("effective_at").toInstant(),
+                        rs.getString("reason")),
+                lockFileId);
+    }
+
+    private static DeprecationRow mapDeprecationRow(java.sql.ResultSet rs) throws java.sql.SQLException {
+        Timestamp revokedAt = rs.getTimestamp("revoked_at");
+        return new DeprecationRow(rs.getLong("id"), rs.getString("name"), rs.getInt("version"),
+                rs.getTimestamp("effective_at").toInstant(), rs.getInt("replacement_version"),
+                rs.getString("reason"), rs.getInt("revoked") == 1,
+                revokedAt == null ? null : revokedAt.toInstant(),
+                rs.getTimestamp("created_at").toInstant());
+    }
+
     private record ArtifactRow(long id, String name, int version, boolean withdrawn) {
     }
 

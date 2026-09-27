@@ -1,17 +1,26 @@
 package com.example.starter.api;
 
 import com.example.starter.api.dto.ArtifactResponse;
+import com.example.starter.api.dto.BatchDeprecationRequest;
+import com.example.starter.api.dto.BatchDeprecationResponse;
 import com.example.starter.api.dto.DependencySpec;
 import com.example.starter.api.dto.DependencyView;
+import com.example.starter.api.dto.DeprecatedClosureItem;
+import com.example.starter.api.dto.DeprecationDiagnosticsResponse;
+import com.example.starter.api.dto.DeprecationResponse;
+import com.example.starter.api.dto.DeprecationSpec;
+import com.example.starter.api.dto.DeprecationWarningView;
 import com.example.starter.api.dto.LockEntryResponse;
 import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
 import com.example.starter.api.dto.RegisterArtifactRequest;
+import com.example.starter.api.dto.RevokeDeprecationResponse;
 import com.example.starter.domain.ArtifactVersion;
 import com.example.starter.domain.DependencyRange;
 import com.example.starter.domain.LockResolver;
 import com.example.starter.domain.RepositorySnapshot;
 import com.example.starter.repo.RepositoryDao;
+import com.example.starter.repo.RepositoryDao.DeprecationRow;
 import com.example.starter.repo.RepositoryDao.IdempotentRecord;
 import com.example.starter.repo.RepositoryDao.LockEntryRow;
 import com.example.starter.repo.RepositoryDao.LockFileRow;
@@ -27,6 +36,7 @@ import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -49,6 +59,8 @@ public class ArtifactServiceImpl implements ArtifactService {
     private static final String OP_REGISTER = "REGISTER_ARTIFACT";
     private static final String OP_WITHDRAW = "WITHDRAW_ARTIFACT";
     private static final String OP_LOCK = "CREATE_LOCK";
+    private static final String OP_DEPRECATE = "REGISTER_DEPRECATION";
+    private static final String OP_REVOKE_DEPRECATION = "REVOKE_DEPRECATION";
 
     private final RepositoryDao repositoryDao;
     private final TransactionTemplate transactionTemplate;
@@ -96,6 +108,69 @@ public class ArtifactServiceImpl implements ArtifactService {
                 + "|" + request.expectedRepositoryVersion());
         return executeIdempotent(requestId, OP_LOCK, hash, 201,
                 () -> doLock(request), LockFileResponse.class);
+    }
+
+    @Override
+    public BatchDeprecationResponse registerDeprecations(String requestId, BatchDeprecationRequest request) {
+        requireRequestId(requestId);
+        if (request.windows() == null || request.windows().isEmpty()) {
+            throw ApiException.badRequest("windows 不能为空");
+        }
+        for (DeprecationSpec spec : request.windows()) {
+            validateDeprecationSpec(spec);
+        }
+        String hash = sha256(OP_DEPRECATE + "|" + canonicalDeprecations(request.windows()));
+        return executeIdempotent(requestId, OP_DEPRECATE, hash, 201,
+                () -> doRegisterDeprecations(request), BatchDeprecationResponse.class);
+    }
+
+    @Override
+    public RevokeDeprecationResponse revokeDeprecation(String requestId, String name, int version) {
+        requireRequestId(requestId);
+        if (name == null || name.isBlank()) {
+            throw ApiException.badRequest("name 不能为空");
+        }
+        String hash = sha256(OP_REVOKE_DEPRECATION + "|" + name.trim() + "|" + version);
+        return executeIdempotent(requestId, OP_REVOKE_DEPRECATION, hash, 200,
+                () -> doRevokeDeprecation(name.trim(), version), RevokeDeprecationResponse.class);
+    }
+
+    @Override
+    public List<DeprecationResponse> listDeprecations() {
+        return repositoryDao.listDeprecations().stream()
+                .map(ArtifactServiceImpl::toDeprecationResponse)
+                .toList();
+    }
+
+    @Override
+    public DeprecationResponse getDeprecation(String name, int version) {
+        DeprecationRow row = repositoryDao.findDeprecation(name, version);
+        if (row == null) {
+            throw ApiException.notFound("弃用窗口不存在: " + name + ":" + version);
+        }
+        return toDeprecationResponse(row);
+    }
+
+    @Override
+    public DeprecationDiagnosticsResponse getDeprecationDiagnostics() {
+        Instant now = Instant.now(clock);
+        List<DeprecationRow> all = repositoryDao.listDeprecations();
+        int pending = 0;
+        int effective = 0;
+        int revoked = 0;
+        List<DeprecationResponse> effectiveWindows = new ArrayList<>();
+        for (DeprecationRow row : all) {
+            if (row.revoked()) {
+                revoked++;
+            } else if (now.isBefore(row.effectiveAt())) {
+                pending++;
+            } else {
+                effective++;
+                effectiveWindows.add(toDeprecationResponse(row));
+            }
+        }
+        return new DeprecationDiagnosticsResponse(now, all.size(), pending, effective, revoked,
+                List.copyOf(effectiveWindows));
     }
 
     @Override
@@ -193,14 +268,149 @@ public class ArtifactServiceImpl implements ArtifactService {
                     "不存在满足全部依赖区间的未撤回版本组合，无法锁定");
         }
 
+        // 弃用裁决：与解析使用同一事务内的一致快照和同一时钟读数。
         Instant now = Instant.now(clock);
+        Map<String, DeprecationRow> activeWindows = new HashMap<>();
+        for (DeprecationRow row : repositoryDao.listActiveDeprecations()) {
+            activeWindows.put(row.name() + ":" + row.version(), row);
+        }
+        List<DeprecatedClosureItem> violations = new ArrayList<>();
+        List<DeprecationWarningView> warnings = new ArrayList<>();
+        for (Map.Entry<String, Integer> entry : solution.entrySet()) {
+            DeprecationRow window = activeWindows.get(entry.getKey() + ":" + entry.getValue());
+            if (window == null) {
+                continue;
+            }
+            // 左闭右开：now >= effectiveAt 即已生效，整次 422；生效前仍可解析但产生警告。
+            if (!now.isBefore(window.effectiveAt())) {
+                violations.add(new DeprecatedClosureItem(window.name(), window.version(),
+                        window.replacementVersion(), window.effectiveAt()));
+            } else {
+                warnings.add(new DeprecationWarningView(window.name(), window.version(),
+                        window.replacementVersion(), window.effectiveAt(), window.reason()));
+            }
+        }
+        if (!violations.isEmpty()) {
+            throw ApiException.unprocessable(
+                    "依赖闭包包含已生效弃用版本，无法锁定：required=全部弃用版本替换为替代版本, "
+                            + "actual=" + violations.size() + " 个已生效弃用版本",
+                    List.copyOf(violations));
+        }
+
         long lockFileId = repositoryDao.insertLockFile(rootName, rootVersion, currentVersion,
                 currentRequestId.get(), now);
         solution.forEach((n, v) -> repositoryDao.insertLockEntry(lockFileId, n, v));
+        // 固化命中的弃用警告与替代建议，后续弃用变更或替代版本撤回不改写历史锁。
+        for (DeprecationWarningView warning : warnings) {
+            repositoryDao.insertLockWarning(lockFileId, warning.name(), warning.version(),
+                    warning.replacementVersion(), warning.effectiveAt(), warning.reason());
+        }
 
         List<LockEntryResponse> entries = new ArrayList<>();
         solution.forEach((n, v) -> entries.add(new LockEntryResponse(n, v)));
-        return new LockFileResponse(lockFileId, rootName, rootVersion, currentVersion, now, entries);
+        return new LockFileResponse(lockFileId, rootName, rootVersion, currentVersion, now, entries,
+                List.copyOf(warnings));
+    }
+
+    private BatchDeprecationResponse doRegisterDeprecations(BatchDeprecationRequest request) {
+        Instant now = Instant.now(clock);
+        List<DeprecationSpec> specs = request.windows();
+
+        // 批量内重复（同一制品版本仅允许一个窗口）。
+        Set<String> seen = new HashSet<>();
+        for (DeprecationSpec spec : specs) {
+            String key = spec.name().trim() + ":" + spec.version();
+            if (!seen.add(key)) {
+                throw ApiException.conflict("批量请求内弃用窗口重复: " + key);
+            }
+        }
+
+        // 先校验完整最终状态：生效时刻、制品存在、窗口未占用、替代版本存在且未撤回。
+        for (DeprecationSpec spec : specs) {
+            String name = spec.name().trim();
+            String key = name + ":" + spec.version();
+            if (spec.effectiveAt().isBefore(now)) {
+                throw ApiException.unprocessable("弃用生效时刻早于当前时钟: " + key
+                        + ", effectiveAt=" + spec.effectiveAt() + ", now=" + now);
+            }
+            if (repositoryDao.loadArtifact(name, spec.version()) == null) {
+                throw ApiException.notFound("制品版本不存在: " + key);
+            }
+            if (repositoryDao.findDeprecation(name, spec.version()) != null) {
+                throw ApiException.conflict("弃用窗口已存在: " + key);
+            }
+            ArtifactVersion replacement = repositoryDao.loadArtifact(name, spec.replacementVersion());
+            if (replacement == null) {
+                throw ApiException.unprocessable("替代版本不存在: " + name + ":"
+                        + spec.replacementVersion() + "（弃用版本 " + key + " 的替代）");
+            }
+            if (replacement.withdrawn()) {
+                throw ApiException.unprocessable("替代版本已撤回: " + name + ":"
+                        + spec.replacementVersion() + "（弃用版本 " + key + " 的替代）");
+            }
+        }
+
+        // 替代环校验：在既有有效窗口与本次批量合并后的完整替代图上检测。
+        Map<String, Map<Integer, Integer>> replacementGraph = new HashMap<>();
+        for (DeprecationRow row : repositoryDao.listActiveDeprecations()) {
+            replacementGraph.computeIfAbsent(row.name(), k -> new HashMap<>())
+                    .put(row.version(), row.replacementVersion());
+        }
+        for (DeprecationSpec spec : specs) {
+            replacementGraph.computeIfAbsent(spec.name().trim(), k -> new HashMap<>())
+                    .put(spec.version(), spec.replacementVersion());
+        }
+        for (DeprecationSpec spec : specs) {
+            String name = spec.name().trim();
+            Map<Integer, Integer> edges = replacementGraph.get(name);
+            Set<Integer> visited = new HashSet<>();
+            visited.add(spec.version());
+            int next = spec.replacementVersion();
+            while (edges.containsKey(next)) {
+                if (!visited.add(next)) {
+                    throw ApiException.unprocessable("替代版本形成环: " + name
+                            + "（弃用版本 " + name + ":" + spec.version() + " 的替代链回到自身）");
+                }
+                next = edges.get(next);
+            }
+        }
+
+        // 全部校验通过后在同一事务提交。
+        List<DeprecationResponse> windows = new ArrayList<>();
+        for (DeprecationSpec spec : specs) {
+            String name = spec.name().trim();
+            long id = repositoryDao.insertDeprecation(name, spec.version(), spec.effectiveAt(),
+                    spec.replacementVersion(), spec.reason(), currentRequestId.get(), now);
+            windows.add(new DeprecationResponse(id, name, spec.version(), spec.effectiveAt(),
+                    spec.replacementVersion(), spec.reason(), false, null, now));
+        }
+        long repositoryVersion = repositoryDao.incrementRepositoryVersion();
+        return new BatchDeprecationResponse(repositoryVersion, List.copyOf(windows));
+    }
+
+    private RevokeDeprecationResponse doRevokeDeprecation(String name, int version) {
+        DeprecationRow row = repositoryDao.findDeprecation(name, version);
+        if (row == null) {
+            throw ApiException.notFound("弃用窗口不存在: " + name + ":" + version);
+        }
+        Instant now = Instant.now(clock);
+        if (row.revoked()) {
+            throw ApiException.conflict("弃用窗口已撤销: " + name + ":" + version);
+        }
+        // 仅允许撤销尚未生效的窗口（左闭：now >= effectiveAt 即已生效）。
+        if (!now.isBefore(row.effectiveAt())) {
+            throw ApiException.conflict("弃用窗口已生效，不能撤销: " + name + ":" + version
+                    + ", effectiveAt=" + row.effectiveAt() + ", now=" + now);
+        }
+        int affected = repositoryDao.markDeprecationRevoked(row.id(), now);
+        if (affected == 0) {
+            // 并发撤销抢先提交（持有行锁时理论上不会发生，防御性处理）。
+            throw ApiException.conflict("弃用窗口已撤销: " + name + ":" + version);
+        }
+        long repositoryVersion = repositoryDao.incrementRepositoryVersion();
+        DeprecationResponse window = new DeprecationResponse(row.id(), row.name(), row.version(),
+                row.effectiveAt(), row.replacementVersion(), row.reason(), true, now, row.createdAt());
+        return new RevokeDeprecationResponse(repositoryVersion, window);
     }
 
     // ------------------------------------------------------------------
@@ -317,12 +527,46 @@ public class ArtifactServiceImpl implements ArtifactService {
         return List.copyOf(sorted.values());
     }
 
+    private void validateDeprecationSpec(DeprecationSpec spec) {
+        if (spec.name() == null || spec.name().isBlank()) {
+            throw ApiException.badRequest("弃用窗口的 name 不能为空");
+        }
+        if (spec.effectiveAt() == null) {
+            throw ApiException.badRequest("弃用窗口的 effectiveAt 不能为空");
+        }
+        if (spec.version() <= 0 || spec.replacementVersion() <= 0) {
+            throw ApiException.badRequest("弃用窗口的版本号必须为正整数");
+        }
+        if (spec.reason() != null && spec.reason().length() > 512) {
+            throw ApiException.badRequest("弃用说明最长 512 字符，实际 " + spec.reason().length());
+        }
+    }
+
+    private String canonicalDeprecations(List<DeprecationSpec> specs) {
+        return specs.stream()
+                .map(s -> s.name().trim() + ":" + s.version() + ":" + s.effectiveAt()
+                        + ":" + s.replacementVersion() + ":" + (s.reason() == null ? "" : s.reason()))
+                .sorted()
+                .reduce((a, b) -> a + "," + b)
+                .orElse("");
+    }
+
+    private static DeprecationResponse toDeprecationResponse(DeprecationRow row) {
+        return new DeprecationResponse(row.id(), row.name(), row.version(), row.effectiveAt(),
+                row.replacementVersion(), row.reason(), row.revoked(), row.revokedAt(),
+                row.createdAt());
+    }
+
     private LockFileResponse toLockResponse(LockFileRow row, List<LockEntryRow> entries) {
         List<LockEntryResponse> entryViews = entries.stream()
                 .map(e -> new LockEntryResponse(e.name(), e.version()))
                 .toList();
+        List<DeprecationWarningView> warnings = repositoryDao.listLockWarnings(row.id()).stream()
+                .map(w -> new DeprecationWarningView(w.name(), w.version(), w.replacementVersion(),
+                        w.effectiveAt(), w.reason()))
+                .toList();
         return new LockFileResponse(row.id(), row.rootName(), row.rootVersion(),
-                row.repositoryVersion(), row.createdAt(), entryViews);
+                row.repositoryVersion(), row.createdAt(), entryViews, warnings);
     }
 
     private void requireRequestId(String requestId) {
