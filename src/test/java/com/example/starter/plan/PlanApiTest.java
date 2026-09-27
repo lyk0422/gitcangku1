@@ -455,17 +455,25 @@ class PlanApiTest {
     }
 
     private static String createBody(String requestKey, String scheduleKey, String... occupancies) {
-        return "{\"requestKey\":\"" + requestKey + "\",\"scheduleKey\":\"" + scheduleKey
-                + "\",\"opDate\":\"" + DAY + "\",\"occupancies\":[" + String.join(",", occupancies)
-                + "]}";
+        return createBodyOnDate(requestKey, scheduleKey, DAY, occupancies);
+    }
+
+    private static String createBodyOnDate(String requestKey, String scheduleKey, LocalDate opDate,
+                                           String... occupancies) {
+        return "{\"requestKey\":\"" + requestKey + "\",\"operator\":\"tester\","
+                + "\"scheduleKey\":\"" + scheduleKey
+                + "\",\"opDate\":\"" + opDate + "\",\"occupancies\":[" + String.join(",", occupancies)
+                + "],\"stationStops\":[]}";
     }
 
     private static String updateBody(String requestKey, int expectedVersion, String... occupancies) {
-        return "{\"requestKey\":\"" + requestKey + "\",\"expectedVersion\":" + expectedVersion
-                + ",\"occupancies\":[" + String.join(",", occupancies) + "]}";
+        return "{\"requestKey\":\"" + requestKey + "\",\"operator\":\"tester\","
+                + "\"expectedVersion\":" + expectedVersion
+                + ",\"occupancies\":[" + String.join(",", occupancies)
+                + "],\"stationStops\":[]}";
     }
 
     private static String actionBody(String requestKey) {
-        return "{\"requestKey\":\"" + requestKey + "\"}";
+        return "{\"requestKey\":\"" + requestKey + "\",\"operator\":\"tester\"}";
     }
 }

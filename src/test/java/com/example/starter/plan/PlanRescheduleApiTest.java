@@ -473,23 +473,27 @@ class PlanRescheduleApiTest {
 
     private static String createBodyOnDate(String requestKey, String scheduleKey, LocalDate opDate,
                                            String... occupancies) {
-        return "{\"requestKey\":\"" + requestKey + "\",\"scheduleKey\":\"" + scheduleKey
+        return "{\"requestKey\":\"" + requestKey + "\",\"operator\":\"tester\","
+                + "\"scheduleKey\":\"" + scheduleKey
                 + "\",\"opDate\":\"" + opDate + "\",\"occupancies\":[" + String.join(",", occupancies)
-                + "]}";
+                + "],\"stationStops\":[]}";
     }
 
     private static String updateBody(String requestKey, int expectedVersion, String... occupancies) {
-        return "{\"requestKey\":\"" + requestKey + "\",\"expectedVersion\":" + expectedVersion
-                + ",\"occupancies\":[" + String.join(",", occupancies) + "]}";
+        return "{\"requestKey\":\"" + requestKey + "\",\"operator\":\"tester\","
+                + "\"expectedVersion\":" + expectedVersion
+                + ",\"occupancies\":[" + String.join(",", occupancies)
+                + "],\"stationStops\":[]}";
     }
 
     private static String actionBody(String requestKey) {
-        return "{\"requestKey\":\"" + requestKey + "\"}";
+        return "{\"requestKey\":\"" + requestKey + "\",\"operator\":\"tester\"}";
     }
 
     private static String rescheduleBody(String requestKey, String newScheduleKey,
                                          int expectedOldVersion, int expectedNewVersion) {
-        return "{\"requestKey\":\"" + requestKey + "\",\"newScheduleKey\":\"" + newScheduleKey
+        return "{\"requestKey\":\"" + requestKey + "\",\"operator\":\"tester\","
+                + "\"newScheduleKey\":\"" + newScheduleKey
                 + "\",\"expectedOldVersion\":" + expectedOldVersion
                 + ",\"expectedNewVersion\":" + expectedNewVersion + "}";
     }

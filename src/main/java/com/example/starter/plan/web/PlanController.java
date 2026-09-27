@@ -61,21 +61,21 @@ public class PlanController {
     }
 
     /**
-     * 发布计划，原子校验时隙冲突。
+     * 发布计划，同一事务原子校验时隙冲突与站停规则、站台容量。
      */
     @PostMapping("/plans/{scheduleKey}/publish")
     public PlanResponse publish(@PathVariable String scheduleKey,
                                 @Valid @RequestBody PlanActionRequest request) {
-        return service.publish(scheduleKey, request.requestKey());
+        return service.publish(scheduleKey, request.requestKey(), request.operator());
     }
 
     /**
-     * 取消已发布计划，时隙立即释放，历史保留。
+     * 取消已发布计划，时隙与站台占用立即释放，历史保留。
      */
     @PostMapping("/plans/{scheduleKey}/cancel")
     public PlanResponse cancel(@PathVariable String scheduleKey,
                                @Valid @RequestBody PlanActionRequest request) {
-        return service.cancel(scheduleKey, request.requestKey());
+        return service.cancel(scheduleKey, request.requestKey(), request.operator());
     }
 
     /**
