@@ -1,24 +1,29 @@
 package com.example.starter.firmware.service;
 
+import com.example.starter.firmware.api.DeviceTrustView;
 import com.example.starter.firmware.api.DeviceView;
 import com.example.starter.firmware.api.RegisterDeviceRequest;
 import com.example.starter.firmware.domain.Device;
 import com.example.starter.firmware.error.ApiException;
 import com.example.starter.firmware.repo.DeviceRepository;
+import com.example.starter.firmware.repo.DeviceTrustRepository;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 
 /**
- * 设备登记与查询。型号与分桶号登记后不可修改。
+ * 设备登记与查询。型号与分桶号登记后不可修改。信任集合由证书链登记时授予。
  */
 @Service
 public class DeviceService {
 
     private final DeviceRepository deviceRepository;
+    private final DeviceTrustRepository deviceTrustRepository;
     private final IdempotencyService idempotency;
 
-    public DeviceService(DeviceRepository deviceRepository, IdempotencyService idempotency) {
+    public DeviceService(DeviceRepository deviceRepository, DeviceTrustRepository deviceTrustRepository,
+                         IdempotencyService idempotency) {
         this.deviceRepository = deviceRepository;
+        this.deviceTrustRepository = deviceTrustRepository;
         this.idempotency = idempotency;
     }
 
@@ -39,6 +44,14 @@ public class DeviceService {
 
     public DeviceView get(String deviceId) {
         return DeviceView.of(findDevice(deviceId));
+    }
+
+    /**
+     * 设备信任集合查询：设备当前信任的全部证书链ID。
+     */
+    public DeviceTrustView trustOf(String deviceId) {
+        findDevice(deviceId);
+        return new DeviceTrustView(deviceId, deviceTrustRepository.findChainIdsByDevice(deviceId));
     }
 
     public Device findDevice(String deviceId) {

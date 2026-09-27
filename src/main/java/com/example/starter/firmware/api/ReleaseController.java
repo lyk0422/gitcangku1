@@ -14,7 +14,7 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * 发布单：创建、扩量、取消、人工恢复、监控统计与暂停/恢复历史、任务明细查询。
+ * 发布单：创建、扩量、批量启动、取消、人工恢复、监控统计与暂停/恢复历史、任务明细与回执复核查询。
  */
 @RestController
 @RequestMapping("/api/releases")
@@ -56,6 +56,17 @@ public class ReleaseController {
     @GetMapping("/{releaseId}/history")
     public ReleaseHistoryResponse history(@PathVariable long releaseId) {
         return releaseService.history(releaseId);
+    }
+
+    @PostMapping("/{releaseId}/start")
+    public BatchStartResponse start(@PathVariable long releaseId,
+                                    @Valid @RequestBody StartReleaseRequest request) {
+        return taskService.startRelease(releaseId, request);
+    }
+
+    @GetMapping("/{releaseId}/reviews")
+    public ReviewListResponse reviews(@PathVariable long releaseId) {
+        return taskService.listReviewByRelease(releaseId);
     }
 
     @GetMapping("/{releaseId}/tasks")

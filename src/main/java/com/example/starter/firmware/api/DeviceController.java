@@ -35,6 +35,11 @@ public class DeviceController {
         return deviceService.get(deviceId);
     }
 
+    @GetMapping("/{deviceId}/trust")
+    public DeviceTrustView trustOf(@PathVariable String deviceId) {
+        return deviceService.trustOf(deviceId);
+    }
+
     @PostMapping("/{deviceId}/pull")
     public PullResponse pull(@PathVariable String deviceId, @Valid @RequestBody RequestIdBody request) {
         return taskService.pull(deviceId, request.requestId());

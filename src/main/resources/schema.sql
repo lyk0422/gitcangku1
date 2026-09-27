@@ -36,11 +36,34 @@ CREATE TABLE IF NOT EXISTS rollout_task (
   device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
   status VARCHAR(16) NOT NULL COMMENT 'PENDING待回执；SUCCESS成功；FAILED失败；CANCELLED已取消',
   first_result VARCHAR(16) NULL COMMENT '首次回执结果（SUCCESS/FAILED），未回执为NULL',
+  chain_id BIGINT NULL COMMENT '拉取时固化的证书链ID；目标版本无证书链登记时为NULL（兼容无证书投放）',
+  chain_version VARCHAR(64) NULL COMMENT '拉取时固化的证书链版本；无证书要求时为NULL',
+  review_status VARCHAR(32) NULL COMMENT '回执复核标记：CERTIFICATE_REVOKED_REVIEW证书已撤销待人工复核；REVIEW_CONFIRMED人工已确认；NULL表示无复核',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
   PRIMARY KEY (id),
   CONSTRAINT uk_task_release_device UNIQUE (release_id, device_id)
 ) COMMENT='设备投放任务，同设备同发布单最多一条';
+
+CREATE TABLE IF NOT EXISTS cert_chain (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '证书链ID',
+  firmware_version VARCHAR(64) NOT NULL COMMENT '固件版本（发布单目标版本）',
+  chain_version VARCHAR(64) NOT NULL COMMENT '证书链版本，同固件版本内唯一',
+  valid_from_utc VARCHAR(40) NOT NULL COMMENT '生效时刻，UTC，ISO-8601格式（如2026-09-27T01:00:00Z），含该时刻',
+  valid_to_utc VARCHAR(40) NOT NULL COMMENT '失效时刻，UTC，ISO-8601格式，不含该时刻',
+  operator VARCHAR(64) NOT NULL COMMENT '登记操作者',
+  revoked_at_utc VARCHAR(40) NULL COMMENT '撤销时刻，UTC，ISO-8601格式；NULL表示未撤销',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '登记时间',
+  PRIMARY KEY (id),
+  CONSTRAINT uk_cert_chain_version UNIQUE (firmware_version, chain_version)
+) COMMENT='固件签名证书链；同一固件版本任意时刻至多一条有效链，轮换区间不得重叠';
+
+CREATE TABLE IF NOT EXISTS device_trust (
+  device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
+  chain_id BIGINT NOT NULL COMMENT '设备信任的证书链ID',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '信任授权时间',
+  PRIMARY KEY (device_id, chain_id)
+) COMMENT='设备信任集合：设备与可信证书链的对应关系';
 
 CREATE TABLE IF NOT EXISTS release_pause_record (
   id BIGINT NOT NULL AUTO_INCREMENT COMMENT '暂停记录ID',
