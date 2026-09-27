@@ -80,6 +80,16 @@ public class ExperimentRepository {
                 SEAT_MAPPER, experimentId);
     }
 
+    /**
+     * 按席位号升序返回指定区组的全部席位（盲底，仅供服务层内部使用）。
+     */
+    public List<SeatRow> findSeatsByBlock(String experimentId, int blockNo) {
+        return jdbc.query(
+                "SELECT experiment_id, block_no, seat_no, treatment FROM seat "
+                        + "WHERE experiment_id = ? AND block_no = ? ORDER BY seat_no",
+                SEAT_MAPPER, experimentId, blockNo);
+    }
+
     public SeatRow findSeat(String experimentId, int blockNo, int seatNo) {
         List<SeatRow> rows = jdbc.query(
                 "SELECT experiment_id, block_no, seat_no, treatment FROM seat "

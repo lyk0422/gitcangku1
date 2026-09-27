@@ -87,6 +87,18 @@ public class UnblindRequestRepository {
     }
 
     /**
+     * 统计指定区组已批准（已揭盲）的申请数；用于封存前置校验。
+     */
+    public long countApprovedByBlock(String experimentId, int blockNo) {
+        Long count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM unblind_request u "
+                        + "JOIN allocation a ON u.allocation_id = a.id "
+                        + "WHERE u.experiment_id = ? AND a.block_no = ? AND u.status = 'APPROVED'",
+                Long.class, experimentId, blockNo);
+        return count == null ? 0 : count;
+    }
+
+    /**
      * 批准：仅 PENDING 可批准，写入处理代码、批准人与时间，并释放待审唯一占位。
      *
      * @return 受影响行数；0 表示不存在或已批准

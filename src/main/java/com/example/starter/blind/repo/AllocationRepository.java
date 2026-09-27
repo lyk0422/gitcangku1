@@ -24,7 +24,9 @@ public class AllocationRepository {
             String status,
             String assignedActor,
             long assignedAt,
-            Long withdrawnAt) {
+            Long withdrawnAt,
+            Integer tableVersion,
+            int seqNo) {
     }
 
     private static final RowMapper<AllocationRow> ALLOCATION_MAPPER = (rs, n) -> new AllocationRow(
@@ -37,7 +39,13 @@ public class AllocationRepository {
             rs.getString("status"),
             rs.getString("assigned_actor"),
             rs.getLong("assigned_at"),
-            (Long) rs.getObject("withdrawn_at"));
+            (Long) rs.getObject("withdrawn_at"),
+            (Integer) rs.getObject("table_version"),
+            rs.getInt("seq_no"));
+
+    private static final String COLUMNS =
+            "id, experiment_id, participant_id, block_no, seat_no, blind_code, status, "
+                    + "assigned_actor, assigned_at, withdrawn_at, table_version, seq_no";
 
     private final JdbcTemplate jdbc;
 
@@ -48,24 +56,25 @@ public class AllocationRepository {
     public void insert(AllocationRow row) {
         jdbc.update("INSERT INTO allocation ("
                         + "experiment_id, participant_id, block_no, seat_no, blind_code, "
-                        + "status, assigned_actor, assigned_at, withdrawn_at"
-                        + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        + "status, assigned_actor, assigned_at, withdrawn_at, table_version, seq_no"
+                        + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 row.experimentId(), row.participantId(), row.blockNo(), row.seatNo(), row.blindCode(),
-                row.status(), row.assignedActor(), row.assignedAt(), row.withdrawnAt());
+                row.status(), row.assignedActor(), row.assignedAt(), row.withdrawnAt(),
+                row.tableVersion(), row.seqNo());
     }
 
     public AllocationRow findByExperimentAndParticipant(String experimentId, String participantId) {
         List<AllocationRow> rows = jdbc.query(
-                "SELECT id, experiment_id, participant_id, block_no, seat_no, blind_code, status, "
-                        + "assigned_actor, assigned_at, withdrawn_at "
-                        + "FROM allocation WHERE experiment_id = ? AND participant_id = ?",
+                "SELECT " + COLUMNS + " FROM allocation "
+                        + "WHERE experiment_id = ? AND participant_id = ?",
                 ALLOCATION_MAPPER, experimentId, participantId);
         return rows.isEmpty() ? null : rows.get(0);
     }
 
     /**
      * 原子领取按区组、席位顺序排列的第一个空位：把尚未被占用的最小 block_no/seat_no
-     * 关联给新参与者。依赖 allocation(experiment_id, block_no, seat_no) 唯一索引兜底并发。
+     * 关联给新参与者；已关闭余量版本覆盖的席位不参与分配。
+     * 依赖 allocation(experiment_id, block_no, seat_no) 唯一索引兜底并发。
      *
      * @return 领取到的席位；实验满额时返回 null
      */
@@ -77,6 +86,11 @@ public class AllocationRepository {
                         + "AND a.block_no = s.block_no "
                         + "AND a.seat_no = s.seat_no "
                         + "WHERE s.experiment_id = ? AND a.id IS NULL "
+                        + "AND NOT EXISTS (SELECT 1 FROM random_table_version v "
+                        + "  WHERE v.experiment_id = s.experiment_id "
+                        + "  AND v.block_no = s.block_no "
+                        + "  AND s.seat_no BETWEEN v.seat_from AND v.seat_to "
+                        + "  AND v.status = 'CLOSED') "
                         + "ORDER BY s.block_no, s.seat_no LIMIT 1",
                 (rs, n) -> new VacantSeat(rs.getInt(1), rs.getInt(2)),
                 experimentId);
@@ -90,6 +104,35 @@ public class AllocationRepository {
     public long countOccupied(String experimentId) {
         Long count = jdbc.queryForObject(
                 "SELECT COUNT(*) FROM allocation WHERE experiment_id = ?", Long.class, experimentId);
+        return count == null ? 0 : count;
+    }
+
+    /**
+     * 统计指定区组的分配条数（含已退组，席位不释放）。
+     */
+    public long countByBlock(String experimentId, int blockNo) {
+        Long count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM allocation WHERE experiment_id = ? AND block_no = ?",
+                Long.class, experimentId, blockNo);
+        return count == null ? 0 : count;
+    }
+
+    /**
+     * 统计指定区组当前可分配的剩余名额：未被占用且不属于已关闭余量版本的席位。
+     */
+    public long countRemainingAllocatable(String experimentId, int blockNo) {
+        Long count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM seat s "
+                        + "WHERE s.experiment_id = ? AND s.block_no = ? "
+                        + "AND NOT EXISTS (SELECT 1 FROM allocation a "
+                        + "  WHERE a.experiment_id = s.experiment_id "
+                        + "  AND a.block_no = s.block_no AND a.seat_no = s.seat_no) "
+                        + "AND NOT EXISTS (SELECT 1 FROM random_table_version v "
+                        + "  WHERE v.experiment_id = s.experiment_id "
+                        + "  AND v.block_no = s.block_no "
+                        + "  AND s.seat_no BETWEEN v.seat_from AND v.seat_to "
+                        + "  AND v.status = 'CLOSED')",
+                Long.class, experimentId, blockNo);
         return count == null ? 0 : count;
     }
 

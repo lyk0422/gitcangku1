@@ -5,13 +5,18 @@ import com.example.starter.blind.ActorContext;
 import com.example.starter.blind.ApiException;
 import com.example.starter.blind.RequestTokens;
 import com.example.starter.blind.dto.AllocationView;
+import com.example.starter.blind.dto.BlockDiagnosticsView;
 import com.example.starter.blind.dto.CreateExperimentRequest;
+import com.example.starter.blind.dto.ExpandBlockRequest;
 import com.example.starter.blind.dto.ExperimentView;
+import com.example.starter.blind.dto.RandomTableVersionView;
+import com.example.starter.blind.dto.SealRandomTableRequest;
 import com.example.starter.blind.dto.UnblindApplyRequest;
 import com.example.starter.blind.dto.UnblindRequestView;
 import com.example.starter.blind.dto.UnblindResultView;
 import com.example.starter.blind.service.ExperimentService;
 import com.example.starter.blind.service.IdempotencyService;
+import com.example.starter.blind.service.RandomTableService;
 import com.example.starter.blind.service.UnblindService;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
@@ -24,6 +29,7 @@ import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -40,18 +46,24 @@ public class BlindExperimentController {
     static final String OP_ALLOCATION_WITHDRAW = "allocation.withdraw";
     static final String OP_UNBLIND_APPLY = "unblind.apply";
     static final String OP_UNBLIND_APPROVE = "unblind.approve";
+    static final String OP_RANDOM_TABLE_SEAL = "randomTable.seal";
+    static final String OP_RANDOM_TABLE_EXPAND = "randomTable.expand";
+    static final String OP_RANDOM_TABLE_CLOSE_REMAINDER = "randomTable.closeRemainder";
 
     private final ExperimentService experimentService;
     private final UnblindService unblindService;
+    private final RandomTableService randomTableService;
     private final IdempotencyService idempotencyService;
     private final ActorContext actorContext;
 
     public BlindExperimentController(ExperimentService experimentService,
                                      UnblindService unblindService,
+                                     RandomTableService randomTableService,
                                      IdempotencyService idempotencyService,
                                      ActorContext actorContext) {
         this.experimentService = experimentService;
         this.unblindService = unblindService;
+        this.randomTableService = randomTableService;
         this.idempotencyService = idempotencyService;
         this.actorContext = actorContext;
     }
@@ -193,6 +205,95 @@ public class BlindExperimentController {
         Actor actor = requireActor();
         return unblindService.getResult(
                 RequestTokens.requireId("unblindRequestId", unblindRequestId), actor.actorId());
+    }
+
+    // ---------------- 随机表封存 / 扩容 / 诊断 ----------------
+
+    /** 封存区组随机表版本（仅 COORDINATOR）；首次分配前可封存，封存不可撤销。 */
+    @PostMapping("/experiments/{experimentId}/blocks/{blockNo}/seal")
+    public ResponseEntity<String> sealRandomTable(
+            @PathVariable String experimentId,
+            @PathVariable int blockNo,
+            @Valid @RequestBody SealRandomTableRequest request,
+            @RequestHeader(IdempotencyService.HEADER_REQUEST_ID) String requestId) {
+        Actor actor = requireCoordinator();
+        String expId = RequestTokens.requireId("experimentId", experimentId);
+        String reqId = RequestTokens.requireRequestId(requestId);
+        String fingerprint = idempotencyService.fingerprint(OP_RANDOM_TABLE_SEAL,
+                Map.of("experimentId", expId, "blockNo", blockNo,
+                        "sealKey", request.sealKey(),
+                        "expectedDigest", request.expectedDigest() == null
+                                ? "" : request.expectedDigest()));
+        return idempotencyService.runWrite(reqId, OP_RANDOM_TABLE_SEAL, fingerprint, actor,
+                () -> IdempotencyService.WriteOutcome.of(HttpStatus.CREATED.value(),
+                        randomTableService.seal(expId, blockNo, request)));
+    }
+
+    /** 区组扩容（仅 COORDINATOR）：显式引用已封存版本，新建后继随机表版本。 */
+    @PostMapping("/experiments/{experimentId}/blocks/{blockNo}/expansions")
+    public ResponseEntity<String> expandBlock(
+            @PathVariable String experimentId,
+            @PathVariable int blockNo,
+            @Valid @RequestBody ExpandBlockRequest request,
+            @RequestHeader(IdempotencyService.HEADER_REQUEST_ID) String requestId) {
+        Actor actor = requireCoordinator();
+        String expId = RequestTokens.requireId("experimentId", experimentId);
+        String reqId = RequestTokens.requireRequestId(requestId);
+        String fingerprint = idempotencyService.fingerprint(OP_RANDOM_TABLE_EXPAND,
+                Map.of("experimentId", expId, "blockNo", blockNo,
+                        "baseVersion", request.baseVersion(),
+                        "addedSeats", request.addedSeats(),
+                        "expectedUnallocated", request.expectedUnallocated(),
+                        "sealKey", request.sealKey()));
+        return idempotencyService.runWrite(reqId, OP_RANDOM_TABLE_EXPAND, fingerprint, actor,
+                () -> IdempotencyService.WriteOutcome.of(HttpStatus.CREATED.value(),
+                        randomTableService.expand(expId, blockNo, request)));
+    }
+
+    /** 关闭当前最新版本的未分配余量（仅 COORDINATOR）；不可撤销，不重排既有参与者。 */
+    @PostMapping("/experiments/{experimentId}/blocks/{blockNo}/versions/{versionNo}/remainder-closure")
+    public ResponseEntity<String> closeRemainder(
+            @PathVariable String experimentId,
+            @PathVariable int blockNo,
+            @PathVariable int versionNo,
+            @RequestHeader(IdempotencyService.HEADER_REQUEST_ID) String requestId) {
+        Actor actor = requireCoordinator();
+        String expId = RequestTokens.requireId("experimentId", experimentId);
+        String reqId = RequestTokens.requireRequestId(requestId);
+        String fingerprint = idempotencyService.fingerprint(OP_RANDOM_TABLE_CLOSE_REMAINDER,
+                Map.of("experimentId", expId, "blockNo", blockNo, "versionNo", versionNo));
+        return idempotencyService.runWrite(reqId, OP_RANDOM_TABLE_CLOSE_REMAINDER, fingerprint,
+                actor,
+                () -> IdempotencyService.WriteOutcome.of(HttpStatus.OK.value(),
+                        randomTableService.closeRemainder(expId, blockNo, versionNo)));
+    }
+
+    /** 随机表版本历史查询（两种角色均可，只读）：不含具体序列与封存密钥。 */
+    @GetMapping("/experiments/{experimentId}/blocks/{blockNo}/versions")
+    public List<RandomTableVersionView> listVersions(@PathVariable String experimentId,
+                                                     @PathVariable int blockNo) {
+        requireActor();
+        return randomTableService.listVersions(
+                RequestTokens.requireId("experimentId", experimentId), blockNo);
+    }
+
+    /** 随机表版本明细查询（两种角色均可，只读）。 */
+    @GetMapping("/experiments/{experimentId}/blocks/{blockNo}/versions/{versionNo}")
+    public RandomTableVersionView getVersion(@PathVariable String experimentId,
+                                             @PathVariable int blockNo,
+                                             @PathVariable int versionNo) {
+        requireActor();
+        return randomTableService.getVersion(
+                RequestTokens.requireId("experimentId", experimentId), blockNo, versionNo);
+    }
+
+    /** 区组诊断查询（两种角色均可，只读）：返回容量与名额的实际值。 */
+    @GetMapping("/experiments/{experimentId}/blocks/{blockNo}/diagnostics")
+    public BlockDiagnosticsView getDiagnostics(@PathVariable String experimentId,
+                                               @PathVariable int blockNo) {
+        requireActor();
+        return randomTableService.getDiagnostics(
+                RequestTokens.requireId("experimentId", experimentId), blockNo);
     }
 
     // ---------------- 权限辅助（先于幂等回放执行） ----------------

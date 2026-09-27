@@ -22,13 +22,13 @@ CREATE TABLE IF NOT EXISTS seat (
     treatment     VARCHAR(1)  NOT NULL,
     CONSTRAINT pk_seat PRIMARY KEY (experiment_id, block_no, seat_no),
     CONSTRAINT ck_seat_block_no CHECK (block_no >= 1),
-    CONSTRAINT ck_seat_seat_no CHECK (seat_no BETWEEN 1 AND 4),
+    CONSTRAINT ck_seat_seat_no CHECK (seat_no >= 1),
     CONSTRAINT ck_seat_treatment CHECK (treatment IN ('A', 'B'))
 );
-COMMENT ON TABLE  seat IS '席位表（处理映射）：每区组4席，按提交顺序固定两个A两个B，之后不可改；仅保存于数据库';
+COMMENT ON TABLE  seat IS '席位表（处理映射）：每区组初始4席，按提交顺序固定两个A两个B，之后不可改；扩容只追加新席位；仅保存于数据库';
 COMMENT ON COLUMN seat.experiment_id IS '所属实验编号';
 COMMENT ON COLUMN seat.block_no IS '区组号，从1开始，按区组顺序分配';
-COMMENT ON COLUMN seat.seat_no IS '区组内席位号1~4，属于可直接解码信息，禁止通过普通接口暴露';
+COMMENT ON COLUMN seat.seat_no IS '区组内席位号（即随机表序号），初始1~4，扩容后顺延；属于可直接解码信息，禁止通过普通接口暴露';
 COMMENT ON COLUMN seat.treatment IS '处理代码 A 或 B，盲底，仅揭盲批准后可返回给申请人';
 
 CREATE TABLE IF NOT EXISTS allocation (
@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS allocation (
     assigned_actor VARCHAR(64)  NOT NULL,
     assigned_at    BIGINT       NOT NULL,
     withdrawn_at   BIGINT,
+    table_version  INT,
+    seq_no         INT          NOT NULL,
     CONSTRAINT pk_allocation PRIMARY KEY (id),
     CONSTRAINT uq_allocation_participant UNIQUE (experiment_id, participant_id),
     CONSTRAINT uq_allocation_seat UNIQUE (experiment_id, block_no, seat_no),
@@ -59,6 +61,40 @@ COMMENT ON COLUMN allocation.status IS '分配状态：ASSIGNED=在组；WITHDRA
 COMMENT ON COLUMN allocation.assigned_actor IS '执行登记的操作者编号（X-Actor-Id）';
 COMMENT ON COLUMN allocation.assigned_at IS '分配时间，Unix 毫秒，UTC';
 COMMENT ON COLUMN allocation.withdrawn_at IS '退组时间，Unix 毫秒，UTC；NULL 表示未退组';
+COMMENT ON COLUMN allocation.table_version IS '分配时区组当前随机表版本号，分配时固化，后续扩容/揭盲不改写；NULL 表示分配时区组尚未封存';
+COMMENT ON COLUMN allocation.seq_no IS '分配在随机表中的序号（等于席位号），分配时固化，不重排；属于盲底，禁止通过普通接口暴露';
+
+CREATE TABLE IF NOT EXISTS random_table_version (
+    experiment_id       VARCHAR(64)  NOT NULL,
+    block_no            INT          NOT NULL,
+    version_no          INT          NOT NULL,
+    table_digest        VARCHAR(64)  NOT NULL,
+    seat_from           INT          NOT NULL,
+    seat_to             INT          NOT NULL,
+    added_seats         INT          NOT NULL,
+    treatment_codes     VARCHAR(8)   NOT NULL,
+    predecessor_version INT,
+    status              VARCHAR(16)  NOT NULL,
+    sealed_at           BIGINT       NOT NULL,
+    closed_at           BIGINT,
+    CONSTRAINT pk_random_table_version PRIMARY KEY (experiment_id, block_no, version_no),
+    CONSTRAINT ck_rtv_status CHECK (status IN ('SEALED', 'CLOSED')),
+    CONSTRAINT ck_rtv_seat_range CHECK (seat_from >= 1 AND seat_to >= seat_from),
+    CONSTRAINT ck_rtv_added_seats CHECK (added_seats >= 0)
+);
+COMMENT ON TABLE  random_table_version IS '随机表版本表：区组封存与扩容的版本记录；只保存表摘要、容量、处理代码集合与时刻，不保存具体序列或封存密钥；封存不可撤销';
+COMMENT ON COLUMN random_table_version.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN random_table_version.block_no IS '区组号，从1开始';
+COMMENT ON COLUMN random_table_version.version_no IS '版本号，区组内从1开始递增；1=首次封存，扩容产生后继版本';
+COMMENT ON COLUMN random_table_version.table_digest IS '随机表摘要 SHA-256 十六进制：绑定实验、区组、版本、席位区间、处理序列与封存密钥';
+COMMENT ON COLUMN random_table_version.seat_from IS '本版本新增席位的起始序号（含），左闭';
+COMMENT ON COLUMN random_table_version.seat_to IS '本版本覆盖的累计容量（即最大席位序号），等于前一版本 seat_to + added_seats';
+COMMENT ON COLUMN random_table_version.added_seats IS '本版本相对前序版本新增的席位数；版本1等于初始容量4';
+COMMENT ON COLUMN random_table_version.treatment_codes IS '处理代码集合（去重排序，如 AB），封存后禁止修改';
+COMMENT ON COLUMN random_table_version.predecessor_version IS '显式引用的已封存前序版本号；版本1为 NULL';
+COMMENT ON COLUMN random_table_version.status IS '版本状态：SEALED=已封存可分配；CLOSED=未分配余量已关闭，仅保留历史，不再参与分配';
+COMMENT ON COLUMN random_table_version.sealed_at IS '封存（生成）时刻，Unix 毫秒，UTC';
+COMMENT ON COLUMN random_table_version.closed_at IS '余量关闭时刻，Unix 毫秒，UTC；NULL 表示未关闭';
 
 CREATE TABLE IF NOT EXISTS unblind_request (
     id                      VARCHAR(64)  NOT NULL,

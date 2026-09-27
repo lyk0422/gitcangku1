@@ -10,6 +10,8 @@ import com.example.starter.blind.repo.AllocationRepository.VacantSeat;
 import com.example.starter.blind.repo.ExperimentRepository;
 import com.example.starter.blind.repo.ExperimentRepository.ExperimentRow;
 import com.example.starter.blind.repo.ExperimentRepository.SeatRow;
+import com.example.starter.blind.repo.RandomTableVersionRepository;
+import com.example.starter.blind.repo.RandomTableVersionRepository.RandomTableVersionRow;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -21,6 +23,7 @@ import java.util.List;
  * 实验与分配核心业务：
  * 创建实验时固定区组与每区组两 A 两 B 的席位内容；分配按区组、席位顺序领取第一个空位；
  * 退组保留席位不重排；关闭后拒绝新增分配。普通视图不含席位号与处理代码。
+ * 每次分配固化当时区组的随机表版本与序号，后续扩容或揭盲不改写历史。
  */
 @Service
 public class ExperimentService {
@@ -29,15 +32,18 @@ public class ExperimentService {
 
     private final ExperimentRepository experimentRepository;
     private final AllocationRepository allocationRepository;
+    private final RandomTableVersionRepository randomTableVersionRepository;
     private final BlindCodeGenerator blindCodeGenerator;
     private final Clock clock;
 
     public ExperimentService(ExperimentRepository experimentRepository,
                              AllocationRepository allocationRepository,
+                             RandomTableVersionRepository randomTableVersionRepository,
                              BlindCodeGenerator blindCodeGenerator,
                              Clock clock) {
         this.experimentRepository = experimentRepository;
         this.allocationRepository = allocationRepository;
+        this.randomTableVersionRepository = randomTableVersionRepository;
         this.blindCodeGenerator = blindCodeGenerator;
         this.clock = clock;
     }
@@ -109,12 +115,16 @@ public class ExperimentService {
 
     private AllocationRow insertWithUniqueBlindCode(String experimentId, String participantId,
                                                     String actorId, VacantSeat vacant, long now) {
+        // 固化分配时区组当前随机表版本（未封存为 null）与随机表序号；后续扩容/揭盲不改写。
+        RandomTableVersionRow version =
+                randomTableVersionRepository.findLatest(experimentId, vacant.blockNo());
+        Integer tableVersion = version == null ? null : version.versionNo();
         // 盲码随机冲突概率极低，仍由唯一索引兜底并重试。
         for (int attempt = 0; attempt < 5; attempt++) {
             String blindCode = blindCodeGenerator.nextCode();
             AllocationRow row = new AllocationRow(0L, experimentId, participantId,
                     vacant.blockNo(), vacant.seatNo(), blindCode, "ASSIGNED",
-                    actorId, now, null);
+                    actorId, now, null, tableVersion, vacant.seatNo());
             try {
                 allocationRepository.insert(row);
                 return allocationRepository.findByExperimentAndParticipant(experimentId, participantId);
@@ -197,6 +207,7 @@ public class ExperimentService {
 
     private AllocationView toView(AllocationRow row) {
         return new AllocationView(row.experimentId(), row.participantId(), row.blindCode(),
-                row.blockNo(), row.status(), row.assignedAt(), row.withdrawnAt());
+                row.blockNo(), row.status(), row.assignedAt(), row.withdrawnAt(),
+                row.tableVersion());
     }
 }
