@@ -74,6 +74,98 @@ public final class Dtos {
                                   List<CurtailmentResponse> curtailments) {
     }
 
+    /** 配置渠道异常判定规则命令；操作人由 X-Actor-Id 请求头提供，每次成功配置生成新的不可变版本。 */
+    public record ChannelRuleRequest(String commandKey, String maxFlowRate, Long maxIntervalMinutes) {
+    }
+
+    /**
+     * 规则版本视图。maxFlowRate 单位立方米/秒；maxIntervalMinutes 单位分钟。
+     * 创建后不可变，读数判定使用判定时刻的最新版本。
+     */
+    public record RuleVersionResponse(long id, int version, String maxFlowRate, long maxIntervalMinutes,
+                                      String actor, String createdUtc) {
+    }
+
+    /** 渠道规则版本历史；currentVersion 为 null 表示尚未配置。 */
+    public record ChannelRuleListResponse(String channelId, Integer currentVersion,
+                                          List<RuleVersionResponse> versions) {
+    }
+
+    /** 单条累计读数项；observedUtc 为 ISO-8601 UTC 时刻，cumulativeValue 单位立方米。 */
+    public record ReadingItem(String observedUtc, String cumulativeValue) {
+    }
+
+    /** 批量提交读数命令；先校验完整序列，任一错误不写入。 */
+    public record SubmitReadingsRequest(String commandKey, List<ReadingItem> readings) {
+    }
+
+    /** 读数视图，创建后不可变。 */
+    public record ReadingResponse(long id, String observedUtc, String cumulativeValue, String actor,
+                                  String createdUtc) {
+    }
+
+    /**
+     * 计量异常视图。类型：REGRESSION 相邻读数倒退 / FLOW_EXCEEDED 瞬时流量超限 / INTERVAL_EXCEEDED 间隔超限。
+     * actualValue/requiredValue/deltaValue 按类型分别表示读数（立方米）、流量（立方米/秒）或间隔（分钟）；
+     * released 表示是否已解除（解除记录不改写本异常）。
+     */
+    public record AnomalyResponse(long id, String channelId, int ruleVersion, long readingId, String type,
+                                  String actualValue, String requiredValue, String deltaValue,
+                                  String prevObservedUtc, String prevValue, String readingObservedUtc,
+                                  String readingValue, String readingActor, boolean released,
+                                  String createdUtc) {
+    }
+
+    /** 批量读数提交结果；frozen 为提交后渠道是否处于冻结状态。 */
+    public record SubmitReadingsResponse(String channelId, int submitted, boolean frozen,
+                                         List<ReadingResponse> readings, List<AnomalyResponse> anomalies) {
+    }
+
+    /** 渠道读数历史，按读数时刻与主键稳定排序。 */
+    public record ReadingListResponse(String channelId, List<ReadingResponse> readings) {
+    }
+
+    /** 异常解除命令；操作人（X-Actor-Id）必须与触发读数提交人不同。 */
+    public record ReleaseRequest(String commandKey, String diagnosis, String substituteValue,
+                                 String substituteObservedUtc) {
+    }
+
+    /** 解除记录视图；channelFrozen 为解除后渠道是否仍有其他未解除冻结。 */
+    public record ReleaseResponse(long id, long anomalyId, String channelId, String diagnosis,
+                                  String substituteValue, String substituteObservedUtc, String actor,
+                                  boolean channelFrozen, String createdUtc) {
+    }
+
+    /** 异常诊断明细：异常本身 + 解除记录（未解除为 null）。 */
+    public record AnomalyDetailResponse(AnomalyResponse anomaly, ReleaseResponse release) {
+    }
+
+    /** 渠道异常与诊断查询结果，按异常主键稳定排序。 */
+    public record AnomalyListResponse(String channelId, List<AnomalyDetailResponse> anomalies) {
+    }
+
+    /** 渠道状态视图；openAnomalyCount 为未解除异常数，currentRuleVersion 为 null 表示未配置规则。 */
+    public record ChannelStatusResponse(String channelId, boolean frozen, int openAnomalyCount,
+                                        Integer currentRuleVersion) {
+    }
+
+    /** 实际核销命令；操作人由 X-Actor-Id 请求头提供。 */
+    public record SettlementRequest(String commandKey, String settlementKey, String allocationKey,
+                                    String amount) {
+    }
+
+    /**
+     * 核销流水视图，创建后不可变；remainingHeld 为核销后申请剩余持有额度（实际值），
+     * 仅在核销创建响应（含幂等重放快照）中返回，历史查询中为 null。
+     */
+    public record SettlementResponse(String settlementKey, String allocationKey, long windowId, String channelId,
+                                     String amount, String remainingHeld, String actor, String createdUtc) {
+    }
+
+    /** 申请核销历史，按主键稳定排序。 */
+    public record SettlementListResponse(String allocationKey, List<SettlementResponse> settlements) {
+    }
+
     /** 统一错误响应体。 */
     public record ErrorResponse(String code, String message) {
     }

@@ -1,12 +1,25 @@
 package com.example.starter.water;
 
 import com.example.starter.water.dto.Dtos.AllocationResponse;
+import com.example.starter.water.dto.Dtos.AnomalyListResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
+import com.example.starter.water.dto.Dtos.ChannelRuleListResponse;
+import com.example.starter.water.dto.Dtos.ChannelRuleRequest;
+import com.example.starter.water.dto.Dtos.ChannelStatusResponse;
 import com.example.starter.water.dto.Dtos.CommandRequest;
 import com.example.starter.water.dto.Dtos.CreateWindowRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.ReadingListResponse;
+import com.example.starter.water.dto.Dtos.ReleaseRequest;
+import com.example.starter.water.dto.Dtos.ReleaseResponse;
+import com.example.starter.water.dto.Dtos.RuleVersionResponse;
+import com.example.starter.water.dto.Dtos.SettlementListResponse;
+import com.example.starter.water.dto.Dtos.SettlementRequest;
+import com.example.starter.water.dto.Dtos.SettlementResponse;
+import com.example.starter.water.dto.Dtos.SubmitReadingsRequest;
+import com.example.starter.water.dto.Dtos.SubmitReadingsResponse;
 import com.example.starter.water.dto.Dtos.SubmitAllocationRequest;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferRequest;
@@ -102,5 +115,69 @@ public class WaterController {
     @GetMapping("/windows/{windowId}/history")
     public HistoryResponse getHistory(@PathVariable long windowId) {
         return service.getHistory(windowId);
+    }
+
+    /** 配置渠道异常判定规则（生成新的不可变版本）。 */
+    @PostMapping("/channels/{channelId}/rules")
+    public RuleVersionResponse configureChannelRule(@PathVariable String channelId,
+                                                    @RequestBody ChannelRuleRequest request,
+                                                    @RequestHeader("X-Actor-Id") String actor) {
+        return service.configureChannelRule(request.commandKey(), channelId, request.maxFlowRate(),
+                request.maxIntervalMinutes(), actor);
+    }
+
+    /** 查询渠道规则版本历史。 */
+    @GetMapping("/channels/{channelId}/rules")
+    public ChannelRuleListResponse getChannelRules(@PathVariable String channelId) {
+        return service.getChannelRules(channelId);
+    }
+
+    /** 批量提交渠道计量点累计读数。 */
+    @PostMapping("/channels/{channelId}/readings")
+    public SubmitReadingsResponse submitReadings(@PathVariable String channelId,
+                                                 @RequestBody SubmitReadingsRequest request,
+                                                 @RequestHeader("X-Actor-Id") String actor) {
+        return service.submitReadings(request.commandKey(), channelId, request.readings(), actor);
+    }
+
+    /** 查询渠道读数历史。 */
+    @GetMapping("/channels/{channelId}/readings")
+    public ReadingListResponse getReadings(@PathVariable String channelId) {
+        return service.getReadings(channelId);
+    }
+
+    /** 查询渠道异常与诊断明细。 */
+    @GetMapping("/channels/{channelId}/anomalies")
+    public AnomalyListResponse getAnomalies(@PathVariable String channelId) {
+        return service.getAnomalies(channelId);
+    }
+
+    /** 查询渠道冻结状态。 */
+    @GetMapping("/channels/{channelId}/status")
+    public ChannelStatusResponse getChannelStatus(@PathVariable String channelId) {
+        return service.getChannelStatus(channelId);
+    }
+
+    /** 解除异常（须由与触发读数提交人不同的操作人确认诊断说明与替代读数）。 */
+    @PostMapping("/anomalies/{anomalyId}/release")
+    public ReleaseResponse releaseAnomaly(@PathVariable long anomalyId,
+                                          @RequestBody ReleaseRequest request,
+                                          @RequestHeader("X-Actor-Id") String actor) {
+        return service.releaseAnomaly(request.commandKey(), anomalyId, request.diagnosis(),
+                request.substituteValue(), request.substituteObservedUtc(), actor);
+    }
+
+    /** 实际核销：扣减 APPROVED 申请持有额度并写不可变核销流水。 */
+    @PostMapping("/settlements")
+    public SettlementResponse settle(@RequestBody SettlementRequest request,
+                                     @RequestHeader("X-Actor-Id") String actor) {
+        return service.settle(request.commandKey(), request.settlementKey(), request.allocationKey(),
+                request.amount(), actor);
+    }
+
+    /** 查询申请核销历史。 */
+    @GetMapping("/allocations/{allocationKey}/settlements")
+    public SettlementListResponse getSettlements(@PathVariable String allocationKey) {
+        return service.getSettlements(allocationKey);
     }
 }
