@@ -1,18 +1,34 @@
 package com.example.starter.api;
 
 import com.example.starter.api.dto.ArtifactResponse;
+import com.example.starter.api.dto.DeprecationBatchRequest;
+import com.example.starter.api.dto.DeprecationBatchResponse;
+import com.example.starter.api.dto.DeprecationBlockedView;
+import com.example.starter.api.dto.DeprecationDiagnosisResponse;
+import com.example.starter.api.dto.DeprecationEventView;
+import com.example.starter.api.dto.DeprecationFailureDetails;
+import com.example.starter.api.dto.DeprecationLockBlockedDetails;
+import com.example.starter.api.dto.DeprecationSpec;
+import com.example.starter.api.dto.DeprecationWindowView;
 import com.example.starter.api.dto.DependencySpec;
 import com.example.starter.api.dto.DependencyView;
+import com.example.starter.api.dto.LockDeprecationWarningView;
 import com.example.starter.api.dto.LockEntryResponse;
 import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
 import com.example.starter.api.dto.RegisterArtifactRequest;
+import com.example.starter.domain.ActiveDeprecation;
 import com.example.starter.domain.ArtifactVersion;
-import com.example.starter.domain.DependencyRange;
+import com.example.starter.domain.DeprecationAdjudicator;
+import com.example.starter.domain.DeprecationGraph;
 import com.example.starter.domain.LockResolver;
+import com.example.starter.domain.NameVersion;
 import com.example.starter.domain.RepositorySnapshot;
 import com.example.starter.repo.RepositoryDao;
+import com.example.starter.repo.RepositoryDao.DeprecationEventRow;
+import com.example.starter.repo.RepositoryDao.DeprecationWindowRow;
 import com.example.starter.repo.RepositoryDao.IdempotentRecord;
+import com.example.starter.repo.RepositoryDao.LockDeprecationRow;
 import com.example.starter.repo.RepositoryDao.LockEntryRow;
 import com.example.starter.repo.RepositoryDao.LockFileRow;
 import com.example.starter.support.ApiException;
@@ -25,8 +41,11 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -39,16 +58,25 @@ import java.util.function.Supplier;
  *
  * <p>所有写操作在单个事务内完成：先锁单行仓库版本表互斥并发写，
  * 再做业务变更并写入幂等成功记录，原子提交；业务失败整体回滚，不占用 requestId。
+ * 弃用登记、撤销、替代版本撤回与锁定因此按提交顺序裁决，锁定读取一致闭包与时间口径。
  */
 @Service
 public class ArtifactServiceImpl implements ArtifactService {
 
     private static final int MAX_NAMES = 20;
     private static final int MAX_VERSIONS_PER_NAME = 5;
+    private static final int MAX_DEPRECATION_BATCH = 20;
 
     private static final String OP_REGISTER = "REGISTER_ARTIFACT";
     private static final String OP_WITHDRAW = "WITHDRAW_ARTIFACT";
     private static final String OP_LOCK = "CREATE_LOCK";
+    private static final String OP_SET_DEPRECATIONS = "SET_DEPRECATIONS";
+    private static final String OP_REVOKE_DEPRECATION = "REVOKE_DEPRECATION";
+
+    private static final String WINDOW_REGISTERED = "REGISTERED";
+    private static final String WINDOW_REVOKED = "REVOKED";
+    private static final String EVENT_REGISTERED = "REGISTERED";
+    private static final String EVENT_REVOKED = "REVOKED";
 
     private final RepositoryDao repositoryDao;
     private final TransactionTemplate transactionTemplate;
@@ -102,7 +130,7 @@ public class ArtifactServiceImpl implements ArtifactService {
     public List<LockFileResponse> listLocks() {
         List<LockFileResponse> result = new ArrayList<>();
         for (LockFileRow row : repositoryDao.listLockFiles()) {
-            result.add(toLockResponse(row, repositoryDao.listLockEntries(row.id())));
+            result.add(toLockResponse(row));
         }
         return result;
     }
@@ -113,7 +141,83 @@ public class ArtifactServiceImpl implements ArtifactService {
         if (row == null) {
             throw ApiException.notFound("锁文件不存在: " + id);
         }
-        return toLockResponse(row, repositoryDao.listLockEntries(id));
+        return toLockResponse(row);
+    }
+
+    // ------------------------------------------------------------------
+    // 弃用窗口
+    // ------------------------------------------------------------------
+
+    @Override
+    public DeprecationBatchResponse setDeprecations(String requestId, DeprecationBatchRequest request) {
+        requireRequestId(requestId);
+        List<DeprecationSpec> specs = request.windows();
+        if (specs == null || specs.isEmpty()) {
+            throw ApiException.badRequest("弃用窗口批次不能为空");
+        }
+        if (specs.size() > MAX_DEPRECATION_BATCH) {
+            throw ApiException.badRequest("每批弃用窗口最多 " + MAX_DEPRECATION_BATCH + " 条，实际 "
+                    + specs.size() + " 条");
+        }
+        String hash = sha256(OP_SET_DEPRECATIONS + "|" + canonicalDeprecations(specs));
+        return executeIdempotent(requestId, OP_SET_DEPRECATIONS, hash, 200,
+                () -> doSetDeprecations(requestId, specs), DeprecationBatchResponse.class);
+    }
+
+    @Override
+    public DeprecationWindowView revokeDeprecation(String requestId, String name, int version) {
+        requireRequestId(requestId);
+        if (name == null || name.isBlank()) {
+            throw ApiException.badRequest("name 不能为空");
+        }
+        String trimmedName = name.trim();
+        String hash = sha256(OP_REVOKE_DEPRECATION + "|" + trimmedName + "|" + version);
+        return executeIdempotent(requestId, OP_REVOKE_DEPRECATION, hash, 200,
+                () -> doRevoke(requestId, trimmedName, version), DeprecationWindowView.class);
+    }
+
+    @Override
+    public List<DeprecationWindowView> listDeprecations() {
+        return repositoryDao.listWindows().stream().map(ArtifactServiceImpl::toWindowView).toList();
+    }
+
+    @Override
+    public DeprecationWindowView getDeprecation(String name, int version) {
+        DeprecationWindowRow row = repositoryDao.getWindow(name, version);
+        if (row == null) {
+            throw ApiException.notFound("弃用窗口不存在: " + name + ":" + version);
+        }
+        return toWindowView(row);
+    }
+
+    @Override
+    public List<DeprecationEventView> listDeprecationEvents() {
+        return repositoryDao.listEvents().stream().map(ArtifactServiceImpl::toEventView).toList();
+    }
+
+    @Override
+    public List<DeprecationEventView> getDeprecationEvents(String name, int version) {
+        return repositoryDao.listEventsOf(name, version).stream()
+                .map(ArtifactServiceImpl::toEventView).toList();
+    }
+
+    @Override
+    public DeprecationDiagnosisResponse diagnose(String rootName, int rootVersion, Instant at) {
+        if (rootName == null || rootName.isBlank()) {
+            throw ApiException.badRequest("rootName 不能为空");
+        }
+        String trimmedRoot = rootName.trim();
+        // 只读预演：在单个事务内读取一致闭包与窗口，不写入、不推进仓库版本。
+        return transactionTemplate.execute(status -> {
+            long repositoryVersion = repositoryDao.getRepositoryVersion();
+            Resolution resolution = resolveClosure(trimmedRoot, rootVersion);
+            Instant resolvedAt = at != null ? at : Instant.now(clock);
+            DeprecationAdjudicator.Adjudication adjudication = adjudicate(
+                    resolution.closure(), loadActiveDeprecations(), resolvedAt);
+            return new DeprecationDiagnosisResponse(trimmedRoot, rootVersion, repositoryVersion,
+                    resolvedAt, toEntryViews(resolution.closure()),
+                    toBlockedViews(adjudication.blocked()), toWarningViews(adjudication.warnings()));
+        });
     }
 
     // ------------------------------------------------------------------
@@ -178,6 +282,152 @@ public class ArtifactServiceImpl implements ArtifactService {
                     + request.expectedRepositoryVersion() + ", actual=" + currentVersion);
         }
 
+        Resolution resolution = resolveClosure(rootName, rootVersion);
+
+        // 解析时刻在闭包求解之后、写入之前取一次；闭包与窗口在同一行锁事务内一致读取。
+        Instant resolvedAt = Instant.now(clock);
+        DeprecationAdjudicator.Adjudication adjudication =
+                adjudicate(resolution.closure(), loadActiveDeprecations(), resolvedAt);
+        if (!adjudication.blocked().isEmpty()) {
+            // 生效后闭包仍含弃用版本：整次 422，稳定排序返回制品、版本、替代与生效时刻。
+            throw ApiException.unprocessable("DEPRECATION_EFFECTIVE",
+                    "依赖闭包含 " + adjudication.blocked().size()
+                            + " 个已生效弃用版本，无法锁定（resolvedAt=" + resolvedAt + "）",
+                    new DeprecationLockBlockedDetails(resolvedAt, adjudication.blocked().size(),
+                            toBlockedViews(adjudication.blocked())));
+        }
+
+        Instant now = Instant.now(clock);
+        long lockFileId = repositoryDao.insertLockFile(rootName, rootVersion, currentVersion,
+                currentRequestId.get(), now, resolvedAt);
+        resolution.closure().forEach((n, v) -> repositoryDao.insertLockEntry(lockFileId, n, v));
+        for (DeprecationAdjudicator.WarningHit warning : adjudication.warnings()) {
+            repositoryDao.insertLockDeprecation(lockFileId, warning.name(), warning.version(),
+                    warning.replacementVersion(), warning.effectiveAt(), warning.note(),
+                    warning.secondsUntilEffective());
+        }
+
+        return new LockFileResponse(lockFileId, rootName, rootVersion, currentVersion, now,
+                resolvedAt, toEntryViews(resolution.closure()),
+                toWarningViews(adjudication.warnings()));
+    }
+
+    private DeprecationBatchResponse doSetDeprecations(String requestId, List<DeprecationSpec> rawSpecs) {
+        Instant now = Instant.now(clock);
+
+        // 名称 trim 后按名称、版本稳定排序，保证错误下标与响应顺序确定。
+        List<DeprecationSpec> specs = rawSpecs.stream()
+                .map(s -> new DeprecationSpec(s.name().trim(), s.version(), s.replacementVersion(),
+                        s.effectiveAt(), s.note()))
+                .sorted(Comparator.comparing(DeprecationSpec::name)
+                        .thenComparingInt(DeprecationSpec::version))
+                .toList();
+
+        // 批次内同一制品版本出现多次：整次拒绝，返回实际条数与去重后条数。
+        Set<NameVersion> uniqueKeys = new HashSet<>();
+        for (DeprecationSpec spec : specs) {
+            if (!uniqueKeys.add(new NameVersion(spec.name(), spec.version()))) {
+                throw deprecationFailure("DUPLICATE_ITEM", "批次内同一制品版本出现多次: "
+                        + spec.name() + ":" + spec.version(), specs.indexOf(spec), spec, now,
+                        specs.size(), uniqueKeys.size(), null);
+            }
+        }
+
+        // 逐条校验被弃用版本、替代版本与生效时刻；任一失败整次不写入。
+        for (int i = 0; i < specs.size(); i++) {
+            DeprecationSpec spec = specs.get(i);
+            ArtifactVersion subject = repositoryDao.loadArtifact(spec.name(), spec.version());
+            if (subject == null) {
+                throw deprecationFailure("SUBJECT_MISSING",
+                        "被弃用制品版本不存在: " + spec.name() + ":" + spec.version(),
+                        i, spec, now, specs.size(), null, null);
+            }
+            if (spec.effectiveAt().isBefore(now)) {
+                // 生效时刻不得早于当前时钟；恰等于是边界（登记即生效，锁定按左闭阻断），允许登记。
+                long secondsBehind = Duration.between(spec.effectiveAt(), now).getSeconds();
+                throw deprecationFailure("EFFECTIVE_IN_PAST",
+                        "弃用生效时刻不得早于当前时钟：effectiveAt=" + spec.effectiveAt()
+                                + ", now=" + now + ", 落后 " + secondsBehind + " 秒",
+                        i, spec, now, specs.size(), null, secondsBehind);
+            }
+            ArtifactVersion replacement = repositoryDao.loadArtifact(
+                    spec.name(), spec.replacementVersion());
+            if (replacement == null) {
+                throw deprecationFailure("REPLACEMENT_MISSING",
+                        "替代版本不存在: " + spec.name() + ":" + spec.replacementVersion(),
+                        i, spec, now, specs.size(), null, null);
+            }
+            if (replacement.withdrawn()) {
+                throw deprecationFailure("REPLACEMENT_WITHDRAWN",
+                        "替代版本已撤回: " + spec.name() + ":" + spec.replacementVersion(),
+                        i, spec, now, specs.size(), null, null);
+            }
+        }
+
+        // 合并已有有效窗口与本次窗口，校验完整最终替代图无环（含自环）。
+        Map<String, Map<Integer, Integer>> finalGraph = loadFinalGraph(specs);
+        DeprecationGraph.Cycle cycle = DeprecationGraph.firstCycle(finalGraph);
+        if (cycle != null) {
+            DeprecationSpec firstCycleSpec = findCycleSpec(specs, cycle);
+            Integer index = firstCycleSpec == null ? null : specs.indexOf(firstCycleSpec);
+            throw deprecationFailure("REPLACEMENT_CYCLE",
+                    "制品 " + cycle.name() + " 的替代版本形成环: " + cycle.versions(),
+                    index, firstCycleSpec, now, specs.size(), null, null, cycle.versions());
+        }
+
+        // 全部校验通过后才写入：每条窗口 upsert 当前状态并追加登记事件，整批一个事务提交。
+        List<DeprecationWindowView> views = new ArrayList<>();
+        for (DeprecationSpec spec : specs) {
+            long windowId = repositoryDao.upsertWindow(spec.name(), spec.version(),
+                    spec.replacementVersion(), spec.effectiveAt(), spec.note(), requestId, now);
+            repositoryDao.insertEvent(windowId, EVENT_REGISTERED, spec.name(), spec.version(),
+                    spec.replacementVersion(), spec.effectiveAt(), spec.note(), requestId, now);
+            views.add(toWindowView(repositoryDao.getWindowById(windowId)));
+        }
+        long repositoryVersion = repositoryDao.incrementRepositoryVersion();
+        return new DeprecationBatchResponse(now, specs.size(), specs.size(),
+                repositoryVersion, List.copyOf(views));
+    }
+
+    private DeprecationWindowView doRevoke(String requestId, String name, int version) {
+        Instant now = Instant.now(clock);
+        DeprecationWindowRow window = repositoryDao.getWindow(name, version);
+        if (window == null) {
+            throw ApiException.notFound("弃用窗口不存在: " + name + ":" + version);
+        }
+        if (WINDOW_REVOKED.equals(window.status())) {
+            throw ApiException.conflict("弃用窗口已撤销: " + name + ":" + version);
+        }
+        if (!window.effectiveAt().isAfter(now)) {
+            // 只允许撤销尚未生效窗口；返回已生效时长差额，调用方无需猜测。
+            long secondsEffective = Duration.between(window.effectiveAt(), now).getSeconds();
+            throw ApiException.unprocessable("DEPRECATION_ALREADY_EFFECTIVE",
+                    "弃用窗口已生效，不可撤销：effectiveAt=" + window.effectiveAt()
+                            + ", now=" + now + ", 已生效 " + secondsEffective + " 秒",
+                    new DeprecationFailureDetails("DEPRECATION_ALREADY_EFFECTIVE", null,
+                            name, version, window.replacementVersion(), window.effectiveAt(), now,
+                            secondsEffective, null, 0, null));
+        }
+        int affected = repositoryDao.markWindowRevoked(window.id(), requestId, now);
+        if (affected == 0) {
+            throw ApiException.conflict("弃用窗口状态已变化: " + name + ":" + version);
+        }
+        // 撤销事件保留撤销前的替代版本、生效时刻与说明，不隐藏历史证据。
+        repositoryDao.insertEvent(window.id(), EVENT_REVOKED, name, version,
+                window.replacementVersion(), window.effectiveAt(), window.note(), requestId, now);
+        repositoryDao.incrementRepositoryVersion();
+        return toWindowView(repositoryDao.getWindowById(window.id()));
+    }
+
+    // ------------------------------------------------------------------
+    // 解析与裁决辅助
+    // ------------------------------------------------------------------
+
+    /** 闭包解析结果：名称 -> 精确版本（名称升序）。 */
+    private record Resolution(Map<String, Integer> closure) {
+    }
+
+    private Resolution resolveClosure(String rootName, int rootVersion) {
         ArtifactVersion root = repositoryDao.loadArtifact(rootName, rootVersion);
         if (root == null) {
             throw ApiException.notFound("根制品版本不存在: " + rootName + ":" + rootVersion);
@@ -185,22 +435,59 @@ public class ArtifactServiceImpl implements ArtifactService {
         if (root.withdrawn()) {
             throw ApiException.conflict("根制品版本已撤回: " + rootName + ":" + rootVersion);
         }
-
         RepositorySnapshot snapshot = repositoryDao.loadSnapshot();
         Map<String, Integer> solution = LockResolver.resolve(snapshot, rootName, rootVersion);
         if (solution == null) {
             throw ApiException.unprocessable(
                     "不存在满足全部依赖区间的未撤回版本组合，无法锁定");
         }
+        return new Resolution(solution);
+    }
 
-        Instant now = Instant.now(clock);
-        long lockFileId = repositoryDao.insertLockFile(rootName, rootVersion, currentVersion,
-                currentRequestId.get(), now);
-        solution.forEach((n, v) -> repositoryDao.insertLockEntry(lockFileId, n, v));
+    private Map<NameVersion, ActiveDeprecation> loadActiveDeprecations() {
+        Map<NameVersion, ActiveDeprecation> active = new HashMap<>();
+        for (DeprecationWindowRow row : repositoryDao.listActiveWindows()) {
+            active.put(new NameVersion(row.name(), row.version()), new ActiveDeprecation(
+                    row.name(), row.version(), row.replacementVersion(),
+                    row.effectiveAt(), row.note()));
+        }
+        return active;
+    }
 
-        List<LockEntryResponse> entries = new ArrayList<>();
-        solution.forEach((n, v) -> entries.add(new LockEntryResponse(n, v)));
-        return new LockFileResponse(lockFileId, rootName, rootVersion, currentVersion, now, entries);
+    private static DeprecationAdjudicator.Adjudication adjudicate(
+            Map<String, Integer> closure, Map<NameVersion, ActiveDeprecation> active, Instant now) {
+        return DeprecationAdjudicator.adjudicate(closure, active, now);
+    }
+
+    /**
+     * 合并已有有效窗口与本次批次，得到最终完整替代图（按制品名称分组）。
+     * 本次批次的窗口覆盖同键的已有窗口；已撤销窗口不参与。
+     */
+    private Map<String, Map<Integer, Integer>> loadFinalGraph(List<DeprecationSpec> specs) {
+        Map<String, Map<Integer, Integer>> graph = new TreeMap<>();
+        for (DeprecationWindowRow row : repositoryDao.listActiveWindows()) {
+            graph.computeIfAbsent(row.name(), k -> new TreeMap<>())
+                    .put(row.version(), row.replacementVersion());
+        }
+        for (DeprecationSpec spec : specs) {
+            graph.computeIfAbsent(spec.name(), k -> new TreeMap<>())
+                    .put(spec.version(), spec.replacementVersion());
+        }
+        return graph;
+    }
+
+    /**
+     * 在环中定位属于本次批次的首个制品版本对应项；环可能全部来自既有窗口，此时返回 null。
+     */
+    private DeprecationSpec findCycleSpec(List<DeprecationSpec> specs, DeprecationGraph.Cycle cycle) {
+        for (int version : cycle.versions()) {
+            for (DeprecationSpec spec : specs) {
+                if (spec.name().equals(cycle.name()) && spec.version() == version) {
+                    return spec;
+                }
+            }
+        }
+        return null;
     }
 
     // ------------------------------------------------------------------
@@ -303,13 +590,50 @@ public class ArtifactServiceImpl implements ArtifactService {
                 .orElse("");
     }
 
+    private String canonicalDeprecations(List<DeprecationSpec> specs) {
+        return specs.stream()
+                .map(s -> s.name().trim() + ":" + s.version() + ":" + s.replacementVersion()
+                        + ":" + s.effectiveAt() + ":" + s.note())
+                .sorted()
+                .reduce((a, b) -> a + "," + b)
+                .orElse("");
+    }
+
+    private ApiException deprecationFailure(String reason, String message, Integer itemIndex,
+                                            DeprecationSpec spec, Instant now,
+                                            int requestedCount, Integer uniqueCount) {
+        return deprecationFailure(reason, message, itemIndex, spec, now,
+                requestedCount, uniqueCount, null, null);
+    }
+
+    private ApiException deprecationFailure(String reason, String message, Integer itemIndex,
+                                            DeprecationSpec spec, Instant now,
+                                            int requestedCount, Integer uniqueCount,
+                                            Long secondsDifference) {
+        return deprecationFailure(reason, message, itemIndex, spec, now,
+                requestedCount, uniqueCount, secondsDifference, null);
+    }
+
+    private ApiException deprecationFailure(String reason, String message, Integer itemIndex,
+                                            DeprecationSpec spec, Instant now,
+                                            int requestedCount, Integer uniqueCount,
+                                            Long secondsDifference, List<Integer> cycle) {
+        DeprecationFailureDetails details = new DeprecationFailureDetails(reason, itemIndex,
+                spec == null ? null : spec.name(),
+                spec == null ? null : spec.version(),
+                spec == null ? null : spec.replacementVersion(),
+                spec == null ? null : spec.effectiveAt(),
+                now, secondsDifference, cycle, requestedCount, uniqueCount);
+        return ApiException.unprocessable(reason, message, details);
+    }
+
     private List<DependencyView> toDependencyViews(List<?> raw) {
         TreeMap<String, DependencyView> sorted = new TreeMap<>();
         for (Object o : raw) {
-            if (o instanceof com.example.starter.api.dto.DependencySpec spec) {
+            if (o instanceof DependencySpec spec) {
                 sorted.put(spec.name().trim(), new DependencyView(
                         spec.name().trim(), spec.minimumVersion(), spec.maximumVersion()));
-            } else if (o instanceof DependencyRange range) {
+            } else if (o instanceof com.example.starter.domain.DependencyRange range) {
                 sorted.put(range.name(), new DependencyView(
                         range.name(), range.minimumVersion(), range.maximumVersion()));
             }
@@ -317,12 +641,56 @@ public class ArtifactServiceImpl implements ArtifactService {
         return List.copyOf(sorted.values());
     }
 
-    private LockFileResponse toLockResponse(LockFileRow row, List<LockEntryRow> entries) {
-        List<LockEntryResponse> entryViews = entries.stream()
+    private static List<LockEntryResponse> toEntryViews(Map<String, Integer> closure) {
+        return closure.entrySet().stream()
+                .map(e -> new LockEntryResponse(e.getKey(), e.getValue()))
+                .toList();
+    }
+
+    private static List<DeprecationBlockedView> toBlockedViews(List<ActiveDeprecation> blocked) {
+        return blocked.stream()
+                .map(d -> new DeprecationBlockedView(d.name(), d.version(),
+                        d.replacementVersion(), d.effectiveAt()))
+                .toList();
+    }
+
+    private static List<LockDeprecationWarningView> toWarningViews(
+            List<DeprecationAdjudicator.WarningHit> warnings) {
+        return warnings.stream()
+                .map(w -> new LockDeprecationWarningView(w.name(), w.version(),
+                        w.replacementVersion(), w.effectiveAt(), w.note(),
+                        w.secondsUntilEffective()))
+                .toList();
+    }
+
+    private LockFileResponse toLockResponse(LockFileRow row) {
+        List<LockEntryResponse> entryViews = repositoryDao.listLockEntries(row.id()).stream()
                 .map(e -> new LockEntryResponse(e.name(), e.version()))
                 .toList();
+        List<LockDeprecationWarningView> warningViews = repositoryDao.listLockDeprecations(row.id())
+                .stream()
+                .map(ArtifactServiceImpl::toLockWarningView)
+                .toList();
         return new LockFileResponse(row.id(), row.rootName(), row.rootVersion(),
-                row.repositoryVersion(), row.createdAt(), entryViews);
+                row.repositoryVersion(), row.createdAt(), row.resolvedAt(),
+                entryViews, warningViews);
+    }
+
+    private static LockDeprecationWarningView toLockWarningView(LockDeprecationRow row) {
+        return new LockDeprecationWarningView(row.name(), row.version(),
+                row.replacementVersion(), row.effectiveAt(), row.note(),
+                row.secondsUntilEffective());
+    }
+
+    private static DeprecationWindowView toWindowView(DeprecationWindowRow row) {
+        return new DeprecationWindowView(row.name(), row.version(), row.replacementVersion(),
+                row.effectiveAt(), row.note(), row.status(), row.createdAt(), row.revokedAt());
+    }
+
+    private static DeprecationEventView toEventView(DeprecationEventRow row) {
+        return new DeprecationEventView(row.id(), row.windowId(), row.action(), row.name(),
+                row.version(), row.replacementVersion(), row.effectiveAt(), row.note(),
+                row.requestId(), row.createdAt());
     }
 
     private void requireRequestId(String requestId) {
