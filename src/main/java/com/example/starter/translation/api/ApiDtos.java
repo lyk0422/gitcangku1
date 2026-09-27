@@ -3,11 +3,13 @@ package com.example.starter.translation.api;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotEmpty;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.PositiveOrZero;
 import jakarta.validation.constraints.Size;
 
+import java.time.Instant;
 import java.util.List;
 
 /**
@@ -125,11 +127,78 @@ public final class ApiDtos {
     public record TermStatusResponse(long documentId, int termVersion, List<TranslationTermStatus> translations) {
     }
 
-    /** 统一错误响应；violations 仅在术语违规 422 时返回，含全部违规术语。 */
+    /** 冲突声明输入：评审人、语种、有效 UTC 区间（左闭右开，秒精度）与原因。 */
+    public record ConflictDeclarationInput(
+            @NotBlank(message = "reviewer 不能为空") @Size(max = 128) String reviewer,
+            @NotBlank(message = "language 不能为空") String language,
+            @NotNull(message = "validFrom 不能为空") Instant validFrom,
+            @NotNull(message = "validTo 不能为空") Instant validTo,
+            @NotBlank(message = "reason 不能为空") @Size(max = 1024) String reason) {
+    }
+
+    /** 批量登记冲突声明请求：任一非法整批不生效。 */
+    public record DeclareConflictsRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @NotEmpty(message = "declarations 不能为空") @Size(max = 100, message = "单次最多 100 条声明")
+            List<@Valid ConflictDeclarationInput> declarations) {
+    }
+
+    /** 解除冲突声明请求：须由不同于声明人的合规角色（X-Actor-Role: COMPLIANCE）确认。 */
+    public record LiftConflictRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @NotBlank(message = "reason 不能为空") @Size(max = 1024) String reason) {
+    }
+
+    /** 冲突声明视图：区间与原因固化；未解除时 liftedBy/liftedAt/liftReason 为 null。 */
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    public record ErrorResponse(String error, String message, List<TermRuleView> violations) {
+    public record ConflictView(long conflictId, long documentId, String reviewer, String language,
+                               String reason, Instant validFrom, Instant validTo, String status,
+                               String declaredBy, Instant declaredAt, String liftedBy,
+                               Instant liftedAt, String liftReason) {
+    }
+
+    /** 批量登记响应：含每条声明及本次排除的评审数。 */
+    public record DeclareConflictsResponse(long documentId, int declaredCount, int excludedReviewCount,
+                                           List<ConflictView> conflicts) {
+    }
+
+    /** 冲突历史记录视图：登记与解除按 historyId 升序，字段与时间精度固定。 */
+    public record ConflictHistoryView(long historyId, long conflictId, String action, String actor,
+                                      String reason, Instant validFrom, Instant validTo,
+                                      Instant recordedAt) {
+    }
+
+    /** 冲突历史查询响应。 */
+    public record ConflictHistoryResponse(long documentId, List<ConflictHistoryView> records) {
+    }
+
+    /** 冲突声明明细查询响应。 */
+    public record ConflictListResponse(long documentId, List<ConflictView> conflicts) {
+    }
+
+    /** 评审范围：段落与语言。 */
+    public record ScopeView(String segmentId, String language) {
+    }
+
+    /** 冲突诊断视图：当前有效冲突、被排除评审与按当前状态重算的法定人数缺口；只读不改状态。 */
+    public record ConflictDiagnosticsView(long documentId, Instant asOf, int requiredReviews,
+                                          int effectiveReviews, int missingReviews,
+                                          int conflictedReviewCount, List<ScopeView> affectedScopes,
+                                          List<ConflictView> effectiveConflicts) {
+    }
+
+    /** 统一错误响应；violations 仅在术语违规 422 时返回，含全部违规术语；
+     *  法定人数不足 422 时返回缺失/要求/实际评审数与受影响范围。 */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public record ErrorResponse(String error, String message, List<TermRuleView> violations,
+                                Integer missingReviews, Integer requiredReviews, Integer actualReviews,
+                                List<ScopeView> affectedScopes) {
         public ErrorResponse(String error, String message) {
-            this(error, message, null);
+            this(error, message, null, null, null, null, null);
+        }
+
+        public ErrorResponse(String error, String message, List<TermRuleView> violations) {
+            this(error, message, violations, null, null, null, null);
         }
     }
 }

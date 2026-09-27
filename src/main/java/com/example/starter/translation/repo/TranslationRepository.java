@@ -1,7 +1,10 @@
 package com.example.starter.translation.repo;
 
 import com.example.starter.translation.domain.Rows.ApprovalRow;
+import com.example.starter.translation.domain.Rows.ConflictHistoryRow;
+import com.example.starter.translation.domain.Rows.ConflictRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
+import com.example.starter.translation.domain.Rows.ExclusionRow;
 import com.example.starter.translation.domain.Rows.RequestLogRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
@@ -13,6 +16,7 @@ import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.stereotype.Repository;
 
 import java.sql.PreparedStatement;
+import java.sql.Timestamp;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
@@ -41,7 +45,32 @@ public class TranslationRepository {
 
     private static final RowMapper<ApprovalRow> APPROVAL_MAPPER = (rs, n) -> new ApprovalRow(
             rs.getString("segment_id"), rs.getString("language"), rs.getString("reviewer"),
-            rs.getInt("source_version"), rs.getInt("translation_version"));
+            rs.getInt("source_version"), rs.getInt("translation_version"),
+            rs.getString("status"),
+            rs.getObject("conflict_id") == null ? null : rs.getLong("conflict_id"),
+            rs.getTimestamp("conflicted_at") == null ? null
+                    : rs.getTimestamp("conflicted_at").toInstant());
+
+    private static final RowMapper<ConflictRow> CONFLICT_MAPPER = (rs, n) -> new ConflictRow(
+            rs.getLong("conflict_id"), rs.getLong("document_id"), rs.getString("reviewer"),
+            rs.getString("language"), rs.getString("reason"),
+            rs.getTimestamp("valid_from").toInstant(), rs.getTimestamp("valid_to").toInstant(),
+            rs.getString("status"), rs.getString("declared_by"),
+            rs.getTimestamp("declared_at").toInstant(),
+            rs.getString("lifted_by"),
+            rs.getTimestamp("lifted_at") == null ? null : rs.getTimestamp("lifted_at").toInstant(),
+            rs.getString("lift_reason"));
+
+    private static final RowMapper<ConflictHistoryRow> CONFLICT_HISTORY_MAPPER = (rs, n) ->
+            new ConflictHistoryRow(rs.getLong("history_id"), rs.getLong("conflict_id"),
+                    rs.getString("action"), rs.getString("actor"), rs.getString("reason"),
+                    rs.getTimestamp("valid_from").toInstant(), rs.getTimestamp("valid_to").toInstant(),
+                    rs.getTimestamp("recorded_at").toInstant());
+
+    private static final RowMapper<ExclusionRow> EXCLUSION_MAPPER = (rs, n) -> new ExclusionRow(
+            rs.getLong("exclusion_id"), rs.getString("segment_id"), rs.getString("language"),
+            rs.getString("reviewer"), rs.getInt("source_version"), rs.getInt("translation_version"),
+            rs.getLong("conflict_id"), rs.getTimestamp("excluded_at").toInstant());
 
     private static final RowMapper<TermRuleRow> TERM_RULE_MAPPER = (rs, n) -> new TermRuleRow(
             rs.getString("source_term"), rs.getString("language"), rs.getString("required_translation"));
@@ -159,7 +188,8 @@ public class TranslationRepository {
 
     public Optional<ApprovalRow> findApproval(long documentId, String segmentId, String language) {
         List<ApprovalRow> rows = jdbc.query(
-                "SELECT segment_id, language, reviewer, source_version, translation_version "
+                "SELECT segment_id, language, reviewer, source_version, translation_version, "
+                        + "status, conflict_id, conflicted_at "
                         + "FROM approval WHERE document_id = ? AND segment_id = ? AND language = ?",
                 APPROVAL_MAPPER, documentId, segmentId, language);
         return rows.stream().findFirst();
@@ -167,25 +197,35 @@ public class TranslationRepository {
 
     public List<ApprovalRow> listApprovals(long documentId) {
         return jdbc.query(
-                "SELECT segment_id, language, reviewer, source_version, translation_version "
+                "SELECT segment_id, language, reviewer, source_version, translation_version, "
+                        + "status, conflict_id, conflicted_at "
                         + "FROM approval WHERE document_id = ? ORDER BY segment_id, language",
                 APPROVAL_MAPPER, documentId);
     }
 
-    /** 插入或覆盖批准（按主键段落+语言唯一）。 */
+    /** 插入或覆盖批准（按主键段落+语言唯一）；重新批准重置为 ACTIVE 并清除排除标记。 */
     public void upsertApproval(long documentId, ApprovalRow row) {
         int updated = jdbc.update(
                 "UPDATE approval SET reviewer = ?, source_version = ?, translation_version = ?, "
+                        + "status = 'ACTIVE', conflict_id = NULL, conflicted_at = NULL, "
                         + "approved_at = CURRENT_TIMESTAMP "
                         + "WHERE document_id = ? AND segment_id = ? AND language = ?",
                 row.reviewer(), row.sourceVersion(), row.translationVersion(),
                 documentId, row.segmentId(), row.language());
         if (updated == 0) {
             jdbc.update("INSERT INTO approval (document_id, segment_id, language, reviewer, "
-                            + "source_version, translation_version) VALUES (?, ?, ?, ?, ?, ?)",
+                            + "source_version, translation_version, status) VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE')",
                     documentId, row.segmentId(), row.language(), row.reviewer(),
                     row.sourceVersion(), row.translationVersion());
         }
+    }
+
+    /** 将指定批准标记为 CONFLICTED 并记录导致排除的冲突声明与排除时间（UTC）。 */
+    public void markApprovalConflicted(long documentId, String segmentId, String language,
+                                       long conflictId, Timestamp conflictedAt) {
+        jdbc.update("UPDATE approval SET status = 'CONFLICTED', conflict_id = ?, conflicted_at = ? "
+                        + "WHERE document_id = ? AND segment_id = ? AND language = ?",
+                conflictId, conflictedAt, documentId, segmentId, language);
     }
 
     public void insertSnapshot(long documentId, int publishedVersion, String snapshotJson) {
@@ -240,5 +280,96 @@ public class TranslationRepository {
     public void insertRequestLog(String requestId, String requestHash, int responseStatus, String responseBody) {
         jdbc.update("INSERT INTO request_log (request_id, request_hash, response_status, response_body) "
                 + "VALUES (?, ?, ?, ?)", requestId, requestHash, responseStatus, responseBody);
+    }
+
+    /** 插入利益冲突声明并返回自增 ID，初始状态 ACTIVE；时间均为 UTC 秒精度。 */
+    public long insertConflict(long documentId, String reviewer, String language, String reason,
+                               Timestamp validFrom, Timestamp validTo, String declaredBy,
+                               Timestamp declaredAt) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO reviewer_conflict (document_id, reviewer, language, reason, valid_from, "
+                            + "valid_to, status, declared_by, declared_at) "
+                            + "VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?)",
+                    new String[]{"conflict_id"});
+            ps.setLong(1, documentId);
+            ps.setString(2, reviewer);
+            ps.setString(3, language);
+            ps.setString(4, reason);
+            ps.setTimestamp(5, validFrom);
+            ps.setTimestamp(6, validTo);
+            ps.setString(7, declaredBy);
+            ps.setTimestamp(8, declaredAt);
+            return ps;
+        }, keyHolder);
+        Number key = keyHolder.getKey();
+        if (key == null) {
+            throw new IllegalStateException("冲突声明创建后未返回自增主键");
+        }
+        return key.longValue();
+    }
+
+    /** 按 ID 查询冲突声明（限定文档）。 */
+    public Optional<ConflictRow> findConflict(long documentId, long conflictId) {
+        List<ConflictRow> rows = jdbc.query(
+                "SELECT conflict_id, document_id, reviewer, language, reason, valid_from, valid_to, "
+                        + "status, declared_by, declared_at, lifted_by, lifted_at, lift_reason "
+                        + "FROM reviewer_conflict WHERE document_id = ? AND conflict_id = ?",
+                CONFLICT_MAPPER, documentId, conflictId);
+        return rows.stream().findFirst();
+    }
+
+    /** 查询文档全部冲突声明，按 conflict_id 升序保证稳定输出。 */
+    public List<ConflictRow> listConflicts(long documentId) {
+        return jdbc.query(
+                "SELECT conflict_id, document_id, reviewer, language, reason, valid_from, valid_to, "
+                        + "status, declared_by, declared_at, lifted_by, lifted_at, lift_reason "
+                        + "FROM reviewer_conflict WHERE document_id = ? ORDER BY conflict_id",
+                CONFLICT_MAPPER, documentId);
+    }
+
+    /** 解除冲突声明：状态置 LIFTED 并固化确认人、时间与原因；不改动登记时信息。 */
+    public void liftConflict(long conflictId, String liftedBy, Timestamp liftedAt, String liftReason) {
+        jdbc.update("UPDATE reviewer_conflict SET status = 'LIFTED', lifted_by = ?, lifted_at = ?, "
+                        + "lift_reason = ? WHERE conflict_id = ?",
+                liftedBy, liftedAt, liftReason, conflictId);
+    }
+
+    /** 追加冲突历史记录（DECLARED/LIFTED），只增不改。 */
+    public void insertConflictHistory(long conflictId, long documentId, String action, String actor,
+                                      String reason, Timestamp validFrom, Timestamp validTo,
+                                      Timestamp recordedAt) {
+        jdbc.update("INSERT INTO reviewer_conflict_history (conflict_id, document_id, action, actor, "
+                        + "reason, valid_from, valid_to, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                conflictId, documentId, action, actor, reason, validFrom, validTo, recordedAt);
+    }
+
+    /** 查询文档全部冲突历史，按 history_id 升序（即发生顺序）保证稳定输出。 */
+    public List<ConflictHistoryRow> listConflictHistory(long documentId) {
+        return jdbc.query(
+                "SELECT history_id, conflict_id, action, actor, reason, valid_from, valid_to, recorded_at "
+                        + "FROM reviewer_conflict_history WHERE document_id = ? ORDER BY history_id",
+                CONFLICT_HISTORY_MAPPER, documentId);
+    }
+
+    /** 追加评审资格排除记录，只增不改；固化被排除评审当时的版本与导致排除的冲突声明。 */
+    public void insertExclusion(long documentId, String segmentId, String language, String reviewer,
+                                int sourceVersion, int translationVersion, long conflictId,
+                                Timestamp excludedAt) {
+        jdbc.update("INSERT INTO review_exclusion (document_id, segment_id, language, reviewer, "
+                        + "source_version, translation_version, conflict_id, excluded_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                documentId, segmentId, language, reviewer, sourceVersion, translationVersion,
+                conflictId, excludedAt);
+    }
+
+    /** 查询文档全部排除记录，按 exclusion_id 升序保证稳定输出。 */
+    public List<ExclusionRow> listExclusions(long documentId) {
+        return jdbc.query(
+                "SELECT exclusion_id, segment_id, language, reviewer, source_version, "
+                        + "translation_version, conflict_id, excluded_at "
+                        + "FROM review_exclusion WHERE document_id = ? ORDER BY exclusion_id",
+                EXCLUSION_MAPPER, documentId);
     }
 }

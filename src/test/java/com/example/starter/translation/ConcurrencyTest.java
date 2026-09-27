@@ -238,4 +238,98 @@ class ConcurrencyTest extends AbstractIntegrationTest {
                 "SELECT term_version FROM document WHERE document_id = ?", Integer.class, docId);
         assertThat(termVersion).isEqualTo(1);
     }
+
+    @Test
+    @DisplayName("并发同范围冲突声明：仅一条登记成功，其余 409，既有批准只被排除一次")
+    void concurrentConflictDeclarations() throws Exception {
+        long docId = createDocument(newRequestId(), "[\"en\"]",
+                "[{\"segmentId\":\"s1\",\"sourceText\":\"原文\"}]");
+        submitTranslation(docId, "s1", "en", "alice", "hello", 1, newRequestId());
+        approve(docId, "s1", "en", "bob", 1, newRequestId());
+        String declarations = "[{\"reviewer\":\"bob\",\"language\":\"en\","
+                + "\"validFrom\":\"2020-01-01T00:00:00Z\",\"validTo\":\"2030-01-01T00:00:00Z\","
+                + "\"reason\":\"利益关系\"}]";
+
+        int threads = 4;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch gate = new CountDownLatch(1);
+        List<Future<ApiResult>> futures = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            futures.add(pool.submit(() -> {
+                gate.await();
+                return declareConflicts(docId, "bob", declarations, newRequestId());
+            }));
+        }
+        gate.countDown();
+        int created = 0;
+        int conflicted = 0;
+        for (Future<ApiResult> future : futures) {
+            int status = future.get(30, TimeUnit.SECONDS).status();
+            if (status == 201) {
+                created++;
+            } else if (status == 409) {
+                conflicted++;
+            }
+        }
+        pool.shutdown();
+
+        assertThat(created).isEqualTo(1);
+        assertThat(conflicted).isEqualTo(threads - 1);
+        assertThat(jdbc.queryForObject(
+                "SELECT COUNT(*) FROM reviewer_conflict WHERE document_id = ?", Integer.class, docId))
+                .isEqualTo(1);
+        assertThat(jdbc.queryForObject(
+                "SELECT COUNT(*) FROM review_exclusion WHERE document_id = ?", Integer.class, docId))
+                .isEqualTo(1);
+        assertThat(jdbc.queryForObject(
+                "SELECT status FROM approval WHERE document_id = ?", String.class, docId))
+                .isEqualTo("CONFLICTED");
+    }
+
+    @Test
+    @DisplayName("冲突登记与发布并发：对应一个一致状态，发布要么完整成功要么 422 且无部分快照")
+    void concurrentDeclareAndPublish() throws Exception {
+        long docId = createDocument(newRequestId(), "[\"en\"]",
+                "[{\"segmentId\":\"s1\",\"sourceText\":\"原文\"}]");
+        submitTranslation(docId, "s1", "en", "alice", "hello", 1, newRequestId());
+        approve(docId, "s1", "en", "bob", 1, newRequestId());
+        // 当前草稿版本 2、发布版本 0
+        String declarations = "[{\"reviewer\":\"bob\",\"language\":\"en\","
+                + "\"validFrom\":\"2020-01-01T00:00:00Z\",\"validTo\":\"2030-01-01T00:00:00Z\","
+                + "\"reason\":\"利益关系\"}]";
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        CountDownLatch gate = new CountDownLatch(1);
+        Future<ApiResult> publishFuture = pool.submit(() -> {
+            gate.await();
+            return publish(docId, 2, 0, newRequestId());
+        });
+        Future<ApiResult> declareFuture = pool.submit(() -> {
+            gate.await();
+            return declareConflicts(docId, "bob", declarations, newRequestId());
+        });
+        gate.countDown();
+        ApiResult publishResult = publishFuture.get(30, TimeUnit.SECONDS);
+        ApiResult declareResult = declareFuture.get(30, TimeUnit.SECONDS);
+        pool.shutdown();
+
+        // 声明必然成功；发布要么先于声明完整成功，要么在排除后法定人数不足 422
+        assertThat(declareResult.status()).isEqualTo(201);
+        assertThat(publishResult.status()).isIn(201, 422);
+
+        Integer publishedVersion = jdbc.queryForObject(
+                "SELECT published_version FROM document WHERE document_id = ?", Integer.class, docId);
+        Integer snapshots = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM release_snapshot WHERE document_id = ?", Integer.class, docId);
+        assertThat(snapshots).isEqualTo(publishedVersion);
+        if (publishResult.status() == 201) {
+            assertThat(publishedVersion).isEqualTo(1);
+            ApiResult release = getJson("/api/documents/" + docId + "/releases/1");
+            assertThat(release.body().get("quorum").get("actualReviews").asInt()).isEqualTo(1);
+        } else {
+            assertThat(publishedVersion).isZero();
+            assertThat(publishResult.body().get("error").asText()).isEqualTo("QUORUM_NOT_MET");
+            assertThat(publishResult.body().get("missingReviews").asInt()).isEqualTo(1);
+        }
+    }
 }

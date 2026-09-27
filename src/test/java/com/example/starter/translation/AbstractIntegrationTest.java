@@ -35,6 +35,9 @@ public abstract class AbstractIntegrationTest {
 
     @BeforeEach
     void cleanTables() {
+        jdbc.update("DELETE FROM review_exclusion");
+        jdbc.update("DELETE FROM reviewer_conflict_history");
+        jdbc.update("DELETE FROM reviewer_conflict");
         jdbc.update("DELETE FROM approval");
         jdbc.update("DELETE FROM translation");
         jdbc.update("DELETE FROM segment");
@@ -128,6 +131,27 @@ public abstract class AbstractIntegrationTest {
         String body = "{\"requestId\":\"" + requestId + "\",\"expectedTermVersion\":" + expectedTermVersion
                 + ",\"rules\":" + rulesJson + "}";
         return putJson("/api/documents/" + documentId + "/terms", body);
+    }
+
+    /** 批量登记冲突声明：declarationsJson 为声明数组 JSON，声明人取 actorId。 */
+    protected ApiResult declareConflicts(long documentId, String actorId, String declarationsJson,
+                                         String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"declarations\":" + declarationsJson + "}";
+        return postJson("/api/documents/" + documentId + "/reviewer-conflicts", body, actorId);
+    }
+
+    /** 解除冲突声明：actorRole 为 null 时不携带 X-Actor-Role 头。 */
+    protected ApiResult liftConflict(long documentId, long conflictId, String actorId, String actorRole,
+                                     String reason, String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"reason\":\"" + reason + "\"}";
+        MockHttpServletRequestBuilder builder = MockMvcRequestBuilders
+                .post("/api/documents/" + documentId + "/reviewer-conflicts/" + conflictId + "/lift")
+                .contentType("application/json").content(body)
+                .header("X-Actor-Id", actorId);
+        if (actorRole != null) {
+            builder.header("X-Actor-Role", actorRole);
+        }
+        return toApiResult(mockMvc.perform(builder).andReturn());
     }
 
     /** HTTP 响应结果：状态码与 JSON 响应体。 */

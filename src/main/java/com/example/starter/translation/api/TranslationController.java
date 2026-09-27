@@ -1,5 +1,6 @@
 package com.example.starter.translation.api;
 
+import com.example.starter.translation.service.ConflictService;
 import com.example.starter.translation.service.TranslationService;
 import com.example.starter.translation.service.WriteExecutor;
 import com.example.starter.translation.service.WriteResult;
@@ -24,18 +25,21 @@ import java.util.HexFormat;
 /**
  * 多语种段落修订与发布快照 REST API。
  * 所有写操作携带全局唯一 requestId 做幂等去重；提交/批准以 X-Actor-Id 表示本地操作者。
+ * 冲突解除另需 X-Actor-Role: COMPLIANCE 表示合规角色确认。
  */
 @RestController
 @RequestMapping("/api/documents")
 public class TranslationController {
 
     private final TranslationService translationService;
+    private final ConflictService conflictService;
     private final WriteExecutor writeExecutor;
     private final ObjectMapper objectMapper;
 
-    public TranslationController(TranslationService translationService, WriteExecutor writeExecutor,
-                                 ObjectMapper objectMapper) {
+    public TranslationController(TranslationService translationService, ConflictService conflictService,
+                                 WriteExecutor writeExecutor, ObjectMapper objectMapper) {
         this.translationService = translationService;
+        this.conflictService = conflictService;
         this.writeExecutor = writeExecutor;
         this.objectMapper = objectMapper;
     }
@@ -134,6 +138,47 @@ public class TranslationController {
     public ResponseEntity<String> getRelease(@PathVariable long documentId, @PathVariable int publishedVersion) {
         return ResponseEntity.ok().contentType(MediaType.APPLICATION_JSON)
                 .body(translationService.getRelease(documentId, publishedVersion));
+    }
+
+    /** 批量登记评审利益冲突声明：预校验全部范围，任一非法整批不生效；声明人取 X-Actor-Id。 */
+    @PostMapping("/{documentId}/reviewer-conflicts")
+    public ResponseEntity<String> declareConflicts(@PathVariable long documentId,
+                                                   @RequestHeader("X-Actor-Id") String actorId,
+                                                   @Valid @RequestBody ApiDtos.DeclareConflictsRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/reviewer-conflicts";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(201, conflictService.declareConflicts(documentId, actorId, request)))
+                .toResponseEntity();
+    }
+
+    /** 解除冲突声明：须合规角色（X-Actor-Role: COMPLIANCE）且不同于声明人确认，追加历史记录。 */
+    @PostMapping("/{documentId}/reviewer-conflicts/{conflictId}/lift")
+    public ResponseEntity<String> liftConflict(@PathVariable long documentId, @PathVariable long conflictId,
+                                               @RequestHeader("X-Actor-Id") String actorId,
+                                               @RequestHeader("X-Actor-Role") String actorRole,
+                                               @Valid @RequestBody ApiDtos.LiftConflictRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/reviewer-conflicts/" + conflictId + "/lift";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, actorRole, request),
+                () -> WriteResult.of(200, conflictService.liftConflict(
+                        documentId, conflictId, actorId, actorRole, request))).toResponseEntity();
+    }
+
+    /** 冲突声明明细查询：按 conflictId 升序。 */
+    @GetMapping("/{documentId}/reviewer-conflicts")
+    public ResponseEntity<ApiDtos.ConflictListResponse> listConflicts(@PathVariable long documentId) {
+        return ResponseEntity.ok(conflictService.listConflicts(documentId));
+    }
+
+    /** 冲突历史查询：登记与解除按 historyId 升序。 */
+    @GetMapping("/{documentId}/reviewer-conflicts/history")
+    public ResponseEntity<ApiDtos.ConflictHistoryResponse> listConflictHistory(@PathVariable long documentId) {
+        return ResponseEntity.ok(conflictService.listHistory(documentId));
+    }
+
+    /** 冲突诊断：当前有效冲突、被排除评审数与按当前状态重算的法定人数缺口；只读。 */
+    @GetMapping("/{documentId}/reviewer-conflicts/diagnostics")
+    public ResponseEntity<ApiDtos.ConflictDiagnosticsView> conflictDiagnostics(@PathVariable long documentId) {
+        return ResponseEntity.ok(conflictService.diagnostics(documentId));
     }
 
     /** 计算请求摘要：操作（含路径变量）+ 操作者 + 规范化请求体的 SHA-256。 */

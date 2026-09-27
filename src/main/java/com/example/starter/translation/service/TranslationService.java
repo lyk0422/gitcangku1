@@ -3,6 +3,7 @@ package com.example.starter.translation.service;
 import com.example.starter.translation.api.ApiDtos;
 import com.example.starter.translation.api.ApiException;
 import com.example.starter.translation.domain.Rows.ApprovalRow;
+import com.example.starter.translation.domain.Rows.ConflictRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
@@ -12,7 +13,12 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.sql.Timestamp;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -32,10 +38,12 @@ public class TranslationService {
 
     private final TranslationRepository repository;
     private final ObjectMapper objectMapper;
+    private final Clock clock;
 
-    public TranslationService(TranslationRepository repository, ObjectMapper objectMapper) {
+    public TranslationService(TranslationRepository repository, ObjectMapper objectMapper, Clock clock) {
         this.repository = repository;
         this.objectMapper = objectMapper;
+        this.clock = clock;
     }
 
     /** 建文档：1~5 种目标语言，可携带初始段落，初始草稿版本 1、发布版本 0。 */
@@ -111,7 +119,7 @@ public class TranslationService {
                 translationVersion, segment.sourceVersion(), document.termVersion(), draftVersion);
     }
 
-    /** 译文批准：审核人不得是作者，且必须同时匹配当前源文与译文版本。 */
+    /** 译文批准：审核人不得是作者，必须同时匹配当前源文与译文版本，且不得命中当前有效利益冲突。 */
     @Transactional
     public ApiDtos.ApprovalResponse approveTranslation(long documentId, String segmentId, String language,
                                                        String actorId, ApiDtos.ApproveTranslationRequest request) {
@@ -124,6 +132,12 @@ public class TranslationService {
         if (translation.author().equals(actorId)) {
             throw ApiException.unprocessable("审核人不得是该译文作者");
         }
+        ConflictRow conflict = findEffectiveConflict(listActiveConflicts(documentId), actorId,
+                normalizedLanguage, nowUtc());
+        if (conflict != null) {
+            throw ApiException.unprocessable("评审人 " + actorId + " 命中有效利益冲突声明 "
+                    + conflict.conflictId() + "（" + normalizedLanguage + "），不得批准该范围译文");
+        }
         if (translation.translationVersion() != request.translationVersion()) {
             throw ApiException.unprocessable("批准所针对的译文版本 " + request.translationVersion()
                     + " 与当前译文版本 " + translation.translationVersion() + " 不匹配");
@@ -133,7 +147,7 @@ public class TranslationService {
                     + "，当前源文版本 " + segment.sourceVersion() + "，译文待更新，不能批准");
         }
         repository.upsertApproval(documentId, new ApprovalRow(segmentId, normalizedLanguage, actorId,
-                segment.sourceVersion(), translation.translationVersion()));
+                segment.sourceVersion(), translation.translationVersion(), "ACTIVE", null, null));
         return new ApiDtos.ApprovalResponse(documentId, segmentId, normalizedLanguage, actorId,
                 translation.translationVersion(), segment.sourceVersion());
     }
@@ -174,10 +188,12 @@ public class TranslationService {
     }
 
     /**
-     * 发布：校验期望版本（不符 409），再校验全部段落在全部目标语言均有有效批准（缺译或审核失效 422）、
-     * 译文绑定当前术语版本（过期 422）且满足当前术语规则（违规 422 并返回全部违规术语），
-     * 全部通过后原子生成完整只读快照（固化术语版本与实际规则集）并递增发布版本；
-     * 任何失败回滚，不产生部分快照。
+     * 发布：校验期望版本（不符 409），再校验全部段落在全部目标语言均有有效批准、
+     * 译文绑定当前术语版本（过期 422）且满足当前术语规则（违规 422 并返回全部违规术语）。
+     * 法定人数按当前译文版本、术语版本与非冲突有效评审重新计算：发布时命中当前有效冲突的
+     * ACTIVE 批准先标记 CONFLICTED 并追加排除记录，之后有效评审不足时 422 返回缺失/要求/
+     * 实际评审数与受影响范围，不发布部分语种；全部通过后原子生成完整只读快照
+     * （固化术语版本、实际规则集与法定人数）并递增发布版本；任何失败回滚，不产生部分快照。
      */
     @Transactional
     public ApiDtos.PublishResponse publish(long documentId, ApiDtos.PublishRequest request) {
@@ -191,12 +207,34 @@ public class TranslationService {
         List<SegmentRow> segments = repository.listSegments(documentId);
         Map<String, TranslationRow> translations = repository.listTranslations(documentId).stream()
                 .collect(Collectors.toMap(t -> key(t.segmentId(), t.language()), Function.identity()));
-        Map<String, ApprovalRow> approvals = repository.listApprovals(documentId).stream()
-                .collect(Collectors.toMap(a -> key(a.segmentId(), a.language()), Function.identity()));
+        List<ConflictRow> activeConflicts = listActiveConflicts(documentId);
+        Instant now = nowUtc();
+        Map<String, ApprovalRow> approvals = new HashMap<>();
+        for (ApprovalRow approval : repository.listApprovals(documentId)) {
+            ApprovalRow current = approval;
+            if ("ACTIVE".equals(approval.status())) {
+                ConflictRow hit = findEffectiveConflict(activeConflicts, approval.reviewer(),
+                        approval.language(), now);
+                if (hit != null) {
+                    repository.markApprovalConflicted(documentId, approval.segmentId(),
+                            approval.language(), hit.conflictId(), Timestamp.from(now));
+                    repository.insertExclusion(documentId, approval.segmentId(), approval.language(),
+                            approval.reviewer(), approval.sourceVersion(), approval.translationVersion(),
+                            hit.conflictId(), Timestamp.from(now));
+                    current = new ApprovalRow(approval.segmentId(), approval.language(),
+                            approval.reviewer(), approval.sourceVersion(), approval.translationVersion(),
+                            "CONFLICTED", hit.conflictId(), now);
+                }
+            }
+            approvals.put(key(approval.segmentId(), approval.language()), current);
+        }
         List<TermRuleRow> termRules = repository.listTermRules(documentId, document.termVersion());
         List<ApiDtos.TermRuleView> termViolations = new ArrayList<>();
+        List<ApiDtos.ScopeView> missingScopes = new ArrayList<>();
+        int requiredReviews = 0;
         for (SegmentRow segment : segments) {
             for (String language : document.targetLanguages()) {
+                requiredReviews++;
                 TranslationRow translation = translations.get(key(segment.segmentId(), language));
                 if (translation == null) {
                     throw ApiException.unprocessable(
@@ -213,25 +251,29 @@ public class TranslationService {
                             + "，当前术语版本 " + document.termVersion());
                 }
                 ApprovalRow approval = approvals.get(key(segment.segmentId(), language));
-                if (approval == null) {
-                    throw ApiException.unprocessable(
-                            "缺少批准: " + segment.segmentId() + "/" + language);
-                }
-                if (approval.translationVersion() != translation.translationVersion()
+                if (approval == null || !"ACTIVE".equals(approval.status())
+                        || approval.translationVersion() != translation.translationVersion()
                         || approval.sourceVersion() != segment.sourceVersion()) {
-                    throw ApiException.unprocessable("批准已失效: " + segment.segmentId() + "/" + language
-                            + "，源文或译文版本已改变");
+                    missingScopes.add(new ApiDtos.ScopeView(segment.segmentId(), language));
+                    continue;
                 }
                 termViolations.addAll(findViolations(
                         segment.sourceText(), language, translation.content(), termRules));
             }
+        }
+        if (!missingScopes.isEmpty()) {
+            throw ApiException.quorumNotMet(
+                    "法定人数不足：缺失 " + missingScopes.size() + " 项非冲突有效评审",
+                    missingScopes.size(), requiredReviews, requiredReviews - missingScopes.size(),
+                    missingScopes);
         }
         if (!termViolations.isEmpty()) {
             throw ApiException.termViolation("译文违反 " + termViolations.size() + " 条术语规则", termViolations);
         }
         int publishedVersion = document.publishedVersion() + 1;
         repository.insertSnapshot(documentId, publishedVersion,
-                buildSnapshotJson(document, publishedVersion, segments, translations, approvals, termRules));
+                buildSnapshotJson(document, publishedVersion, segments, translations, approvals, termRules,
+                        requiredReviews, requiredReviews));
         repository.updatePublishedVersion(documentId, publishedVersion);
         return new ApiDtos.PublishResponse(documentId, publishedVersion);
     }
@@ -307,6 +349,30 @@ public class TranslationService {
         return draftVersion;
     }
 
+    /** 当前 UTC 时间（秒精度），取自可替换的时钟 Bean。 */
+    private Instant nowUtc() {
+        return clock.instant().truncatedTo(ChronoUnit.SECONDS);
+    }
+
+    /** 查询文档当前 ACTIVE（未解除）的冲突声明。 */
+    private List<ConflictRow> listActiveConflicts(long documentId) {
+        return repository.listConflicts(documentId).stream()
+                .filter(c -> "ACTIVE".equals(c.status()))
+                .toList();
+    }
+
+    /** 在 ACTIVE 冲突声明中查找指定评审人与语种在当前时刻有效（左闭右开）的第一条声明。 */
+    private static ConflictRow findEffectiveConflict(List<ConflictRow> activeConflicts, String reviewer,
+                                                     String language, Instant now) {
+        for (ConflictRow conflict : activeConflicts) {
+            if (conflict.reviewer().equals(reviewer) && conflict.language().equals(language)
+                    && !conflict.validFrom().isAfter(now) && conflict.validTo().isAfter(now)) {
+                return conflict;
+            }
+        }
+        return null;
+    }
+
     private static String key(String segmentId, String language) {
         return segmentId + " " + language;
     }
@@ -347,16 +413,22 @@ public class TranslationService {
         return new ApiDtos.TermRuleView(rule.sourceTerm(), rule.language(), rule.requiredTranslation());
     }
 
-    /** 生成完整只读快照 JSON：全部段落源文及各语言译文、作者、审核人、版本号与固化的术语版本及规则集。 */
+    /** 生成完整只读快照 JSON：全部段落源文及各语言译文、作者、审核人、版本号、
+     *  固化的术语版本及规则集与发布时重算的法定人数。 */
     private String buildSnapshotJson(DocumentRow document, int publishedVersion, List<SegmentRow> segments,
                                      Map<String, TranslationRow> translations,
-                                     Map<String, ApprovalRow> approvals, List<TermRuleRow> termRules) {
+                                     Map<String, ApprovalRow> approvals, List<TermRuleRow> termRules,
+                                     int requiredReviews, int actualReviews) {
         Map<String, Object> snapshot = new LinkedHashMap<>();
         snapshot.put("documentId", document.documentId());
         snapshot.put("publishedVersion", publishedVersion);
         snapshot.put("draftVersion", document.draftVersion());
         snapshot.put("termVersion", document.termVersion());
         snapshot.put("targetLanguages", document.targetLanguages());
+        Map<String, Object> quorum = new LinkedHashMap<>();
+        quorum.put("requiredReviews", requiredReviews);
+        quorum.put("actualReviews", actualReviews);
+        snapshot.put("quorum", quorum);
         List<Map<String, Object>> termList = new ArrayList<>();
         for (TermRuleRow rule : termRules) {
             Map<String, Object> termJson = new LinkedHashMap<>();
