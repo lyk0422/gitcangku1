@@ -50,17 +50,20 @@ public class ObservationService {
     private final ObservationRepository observationRepository;
     private final RequestLogRepository requestLogRepository;
     private final ResolutionRepository resolutionRepository;
+    private final SnapshotEvidenceRecorder snapshotEvidenceRecorder;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public ObservationService(ObservationRepository observationRepository,
                               RequestLogRepository requestLogRepository,
                               ResolutionRepository resolutionRepository,
+                              SnapshotEvidenceRecorder snapshotEvidenceRecorder,
                               ObjectMapper objectMapper,
                               Clock clock) {
         this.observationRepository = observationRepository;
         this.requestLogRepository = requestLogRepository;
         this.resolutionRepository = resolutionRepository;
+        this.snapshotEvidenceRecorder = snapshotEvidenceRecorder;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -102,7 +105,7 @@ public class ObservationService {
     @Transactional
     public WriteOutcome merge(String observationId, MergeObservationRequest request) {
         String fingerprint = fingerprint("MERGE", observationId, String.valueOf(request.baseVersion()),
-                request.location(), request.reading(), request.note());
+                request.location(), request.reading(), request.note(), refsFingerprint(request.attachmentRefs()));
         WriteOutcome replayed = checkReplay(request.requestId(), fingerprint);
         if (replayed != null) {
             return replayed;
@@ -131,17 +134,28 @@ public class ObservationService {
             throw ApiException.mergeConflict(conflictFields, current.version());
         }
 
+        // 先验证附件证据引用的完整后态（归属、原始/脱敏版本可读性），再与观测版本在同一事务提交。
+        List<SnapshotEvidenceRecorder.ResolvedRef> resolvedRefs =
+                snapshotEvidenceRecorder.validate(observationId, request.attachmentRefs());
+
         ObservationSnapshot merged = new ObservationSnapshot(observationId, current.version(),
                 mergedLocation, mergedReading, mergedNote, false);
+        int pointedVersion;
         if (sameContent(merged, current)) {
             // 合并结果与当前完全相同：返回当前版本，不加版本
-            return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(current));
+            pointedVersion = current.version();
+        } else {
+            ObservationSnapshot next = new ObservationSnapshot(observationId, current.version() + 1,
+                    mergedLocation, mergedReading, mergedNote, false);
+            observationRepository.updateCurrent(next);
+            observationRepository.insertVersion(next);
+            pointedVersion = next.version();
         }
-        ObservationSnapshot next = new ObservationSnapshot(observationId, current.version() + 1,
-                mergedLocation, mergedReading, mergedNote, false);
-        observationRepository.updateCurrent(next);
-        observationRepository.insertVersion(next);
-        return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(next));
+        snapshotEvidenceRecorder.record("MERGE", request.requestId(), null,
+                observationId, pointedVersion, resolvedRefs);
+        ObservationSnapshot pointed = observationRepository.findVersion(observationId, pointedVersion)
+                .orElseThrow(() -> new IllegalStateException("pointed version missing after merge"));
+        return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(pointed));
     }
 
     /**
@@ -194,7 +208,8 @@ public class ObservationService {
         String normalizedSelections = writeSelectionsJson(selections);
         String fingerprint = fingerprint("RESOLVE", observationId, request.resolutionId(),
                 String.valueOf(request.baseVersion()), String.valueOf(request.expectedCurrentVersion()),
-                request.location(), request.reading(), request.note(), normalizedSelections, request.operator());
+                request.location(), request.reading(), request.note(), normalizedSelections, request.operator(),
+                refsFingerprint(request.attachmentRefs()));
         ResolveOutcome replayed = checkResolveReplay(request.requestId(), fingerprint);
         if (replayed != null) {
             return replayed;
@@ -252,6 +267,10 @@ public class ObservationService {
         String resolvedNote = resolveFieldValue(noteConflict, selections.get("note"),
                 base.note(), current.note(), request.note(), false);
 
+        // 先验证附件证据引用的完整后态，再与观测版本、解决记录在同一事务提交。
+        List<SnapshotEvidenceRecorder.ResolvedRef> resolvedRefs =
+                snapshotEvidenceRecorder.validate(observationId, request.attachmentRefs());
+
         ObservationSnapshot merged = new ObservationSnapshot(observationId, current.version(),
                 resolvedLocation, resolvedReading, resolvedNote, false);
         boolean contentChanged = !sameContent(merged, current);
@@ -287,6 +306,9 @@ public class ObservationService {
         ObservationSnapshot pointed = contentChanged
                 ? new ObservationSnapshot(observationId, newVersion, resolvedLocation, resolvedReading, resolvedNote, false)
                 : current;
+        // 证据引用与新版本、解决记录同事务固化；后续脱敏/撤销/清除不回写这些快照行。
+        snapshotEvidenceRecorder.record("RESOLVE", request.requestId(), request.resolutionId(),
+                observationId, newVersion, resolvedRefs);
         return completeResolve(request.requestId(), HttpStatus.OK,
                 ResolutionResponse.of(record, pointed, objectMapper));
     }
@@ -418,8 +440,24 @@ public class ObservationService {
         return new WriteOutcome(status.value(), body);
     }
 
-    private String fingerprint(String operation, String... parts) {
-        StringBuilder raw = new StringBuilder(operation);
+    /**
+     * 计算附件证据引用列表的稳定指纹：按请求顺序拼接附件、引用类型与脱敏版本标识，
+     * 使同 requestId 改引用重放判为异参 409。
+     */
+    private String refsFingerprint(List<AttachmentRefRequest> refs) {
+        if (refs == null || refs.isEmpty()) {
+            return "<none>";
+        }
+        StringBuilder raw = new StringBuilder();
+        for (AttachmentRefRequest ref : refs) {
+            raw.append(ref.attachmentId()).append(SEPARATOR)
+                    .append(ref.kind() == null ? "<null>" : ref.kind().name()).append(SEPARATOR)
+                    .append(ref.redactionId() == null ? "<null>" : ref.redactionId()).append(';');
+        }
+        return raw.toString();
+    }
+
+    private String fingerprint(String operation, String... parts) {        StringBuilder raw = new StringBuilder(operation);
         for (String part : parts) {
             raw.append(SEPARATOR).append(part == null ? "<null>" : part);
         }

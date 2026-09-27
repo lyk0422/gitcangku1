@@ -1,11 +1,13 @@
 package com.example.starter.observation;
 
+import jakarta.validation.Valid;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
 
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -20,6 +22,7 @@ import java.util.Map;
  * @param note                   观测备注候选完整值
  * @param selections             冲突字段选择，键为字段名，值为 CURRENT 或 CANDIDATE；必须恰好覆盖本次仍冲突的字段
  * @param operator               操作者标识
+ * @param attachmentRefs         本次人工选择需要固化的附件证据引用；为空或 null 表示不固化附件证据
  */
 public record ResolveConflictRequest(
         @NotBlank @Size(max = 128) String requestId,
@@ -31,5 +34,16 @@ public record ResolveConflictRequest(
         String reading,
         @NotNull @Size(max = 1024) String note,
         @NotNull Map<String, String> selections,
-        @NotBlank @Size(max = 128) String operator) {
+        @NotBlank @Size(max = 128) String operator,
+        @Valid List<AttachmentRefRequest> attachmentRefs) {
+
+    /**
+     * 兼容不带附件证据引用的冲突解决请求。
+     */
+    public ResolveConflictRequest(String requestId, String resolutionId, Integer baseVersion,
+                                  Integer expectedCurrentVersion, String location, String reading,
+                                  String note, Map<String, String> selections, String operator) {
+        this(requestId, resolutionId, baseVersion, expectedCurrentVersion, location, reading, note,
+                selections, operator, List.of());
+    }
 }

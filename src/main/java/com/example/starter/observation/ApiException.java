@@ -47,6 +47,20 @@ public class ApiException extends RuntimeException {
     }
 
     /**
+     * 403：调用角色未授权执行该操作。
+     */
+    public static ApiException forbidden(String message) {
+        return new ApiException(HttpStatus.FORBIDDEN, message, null, null);
+    }
+
+    /**
+     * 422：请求语义不合法（规则版本未登记或已撤销、业务状态不允许等），区别于参数格式错误的 400。
+     */
+    public static ApiException unprocessable(String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, message, null, null);
+    }
+
+    /**
      * 409：通用冲突（记录已存在、删除版本不匹配、requestId 异参复用）。
      */
     public static ApiException conflict(String message, Integer currentVersion) {
