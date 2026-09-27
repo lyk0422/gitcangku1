@@ -3,7 +3,7 @@ package com.example.starter.maintenance.api.dto;
 import java.time.Instant;
 
 /**
- * 保养记录视图。
+ * 保养记录视图。固化周期、模板版本、证据包版本与完工确认人。
  *
  * @param maintenanceId             保养记录标识
  * @param equipmentId               所属设备标识
@@ -11,6 +11,10 @@ import java.time.Instant;
  * @param anchorRevisionNo          锚点读数在保养完成时的修订号
  * @param anchorSampledAt           锚点读数的 UTC 采样时刻（快照）
  * @param anchorCumulativeMinutes   锚点读数在保养完成时的累计工时快照（分钟）
+ * @param cycleNo                   完工周期号（固化）
+ * @param templateVersion           完工证据包固化的模板版本（固化）
+ * @param evidencePackageVersion    完工确认指向的证据包版本（固化）
+ * @param confirmedBy               完工确认人（另一维护角色，固化）
  * @param completedAt               保养完成登记时刻（UTC）
  * @param equipmentVersion          操作后的设备版本号（查询历史时为 0，无意义）
  */
@@ -21,6 +25,10 @@ public record MaintenanceResponse(
         int anchorRevisionNo,
         Instant anchorSampledAt,
         long anchorCumulativeMinutes,
+        int cycleNo,
+        int templateVersion,
+        int evidencePackageVersion,
+        String confirmedBy,
         Instant completedAt,
         long equipmentVersion) {
 }

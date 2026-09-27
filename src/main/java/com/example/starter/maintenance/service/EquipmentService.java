@@ -9,13 +9,23 @@ import org.springframework.stereotype.Service;
 import com.example.starter.maintenance.api.ApiException;
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
+import com.example.starter.maintenance.api.dto.CorrectionCreateRequest;
+import com.example.starter.maintenance.api.dto.CorrectionResponse;
+import com.example.starter.maintenance.api.dto.CycleResponse;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
+import com.example.starter.maintenance.api.dto.EvidencePackageResponse;
+import com.example.starter.maintenance.api.dto.EvidenceSubmitRequest;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
+import com.example.starter.maintenance.api.dto.MaterialRegisterRequest;
+import com.example.starter.maintenance.api.dto.MaterialResponse;
+import com.example.starter.maintenance.api.dto.MaterialRevokeRequest;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
 import com.example.starter.maintenance.api.dto.RegisterEquipmentRequest;
 import com.example.starter.maintenance.api.dto.ReviseReadingRequest;
 import com.example.starter.maintenance.api.dto.RevisionView;
 import com.example.starter.maintenance.api.dto.StatusResponse;
+import com.example.starter.maintenance.api.dto.TemplateResponse;
+import com.example.starter.maintenance.api.dto.TemplateRevisionRequest;
 
 /**
  * 设备工时保养外观服务：委托事务服务执行；并发下唯一键冲突（事务已回滚）时，
@@ -33,7 +43,8 @@ public class EquipmentService {
     }
 
     public EquipmentResponse register(RegisterEquipmentRequest req) {
-        String fingerprint = req.equipmentId() + "|" + req.maintenancePeriodMinutes();
+        String fingerprint = req.equipmentId() + "|" + req.maintenancePeriodMinutes() + "|"
+                + req.overdueThresholdMinutes();
         return recoverDuplicateKey(req.requestId(), "REGISTER_EQUIPMENT", fingerprint,
                 EquipmentResponse.class, () -> txService.register(req));
     }
@@ -46,8 +57,30 @@ public class EquipmentService {
         return txService.reviseReading(equipmentId, readingId, req);
     }
 
+    public TemplateResponse reviseTemplate(String equipmentId, TemplateRevisionRequest req) {
+        return txService.reviseTemplate(equipmentId, req);
+    }
+
+    public EvidencePackageResponse submitEvidence(String equipmentId, EvidenceSubmitRequest req) {
+        return txService.submitEvidence(equipmentId, req);
+    }
+
+    public MaterialResponse registerMaterial(MaterialRegisterRequest req) {
+        String fingerprint = req.materialId() + "|" + req.materialName() + "|" + req.unit();
+        return recoverDuplicateKey(req.requestId(), "REGISTER_MATERIAL", fingerprint,
+                MaterialResponse.class, () -> txService.registerMaterial(req));
+    }
+
+    public MaterialResponse revokeMaterial(String materialId, MaterialRevokeRequest req) {
+        return txService.revokeMaterial(materialId, req);
+    }
+
     public MaintenanceResponse completeMaintenance(String equipmentId, CompleteMaintenanceRequest req) {
         return txService.completeMaintenance(equipmentId, req);
+    }
+
+    public CorrectionResponse addCorrection(long maintenanceId, CorrectionCreateRequest req) {
+        return txService.addCorrection(maintenanceId, req);
     }
 
     public StatusResponse getStatus(String equipmentId) {
@@ -64,6 +97,34 @@ public class EquipmentService {
 
     public List<MaintenanceResponse> listMaintenances(String equipmentId) {
         return txService.listMaintenances(equipmentId);
+    }
+
+    public TemplateResponse getTemplate(String equipmentId) {
+        return txService.getTemplate(equipmentId);
+    }
+
+    public List<EvidencePackageResponse> listEvidence(String equipmentId, int cycleNo) {
+        return txService.listEvidence(equipmentId, cycleNo);
+    }
+
+    public EvidencePackageResponse getEvidence(String equipmentId, int cycleNo, int packageVersion) {
+        return txService.getEvidence(equipmentId, cycleNo, packageVersion);
+    }
+
+    public CycleResponse getCurrentCycle(String equipmentId) {
+        return txService.getCurrentCycle(equipmentId);
+    }
+
+    public List<CycleResponse> listCycles(String equipmentId) {
+        return txService.listCycles(equipmentId);
+    }
+
+    public List<MaterialResponse> listMaterials() {
+        return txService.listMaterials();
+    }
+
+    public List<CorrectionResponse> listCorrections(String equipmentId, Long maintenanceId) {
+        return txService.listCorrections(equipmentId, maintenanceId);
     }
 
     /**
