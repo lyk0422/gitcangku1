@@ -66,3 +66,54 @@ CREATE TABLE IF NOT EXISTS batch_lineage (
     created_at VARCHAR(40) NOT NULL COMMENT '拆分时间，ISO-8601 UTC instant 字符串',
     CONSTRAINT uk_lineage_child UNIQUE (child_key)
 );
+
+-- 批次标签核销：一个批次至多登记一份包装计划，登记后不可修改。
+CREATE TABLE IF NOT EXISTS packaging_plan (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    batch_key VARCHAR(64) NOT NULL COMMENT '所属批次业务键，全局唯一，登记后不可补登或修改',
+    planned_quantity INT NOT NULL COMMENT '计划包装数量，正整数；放行时有效封箱数量之和必须恰好等于该值，单位：件',
+    label_start BIGINT NOT NULL COMMENT '连续标签号段起点（含），正整数',
+    label_end BIGINT NOT NULL COMMENT '连续标签号段终点（含），正整数；号段长度 label_end-label_start+1 必须不小于计划数量',
+    created_at VARCHAR(40) NOT NULL COMMENT '登记时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_packaging_plan_batch UNIQUE (batch_key)
+);
+
+-- 封箱记录（封箱版本只增不改：作废仅翻转本行状态并写作废信息，不删除历史）。
+CREATE TABLE IF NOT EXISTS packing_record (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键，同时作为封箱版本号与同批次封箱提交顺序依据',
+    batch_key VARCHAR(64) NOT NULL COMMENT '所属批次业务键',
+    command_key VARCHAR(64) NOT NULL COMMENT '封箱/重放命令幂等键，同一批次内唯一',
+    label_no BIGINT NOT NULL COMMENT '标签号；必须落在该批次号段 [label_start,label_end] 内，作废释放前不可重复',
+    quantity INT NOT NULL COMMENT '本箱封箱数量，正整数，单位：件',
+    packed_by VARCHAR(64) NOT NULL COMMENT '封箱操作人标识（X-Actor-Id）',
+    status VARCHAR(16) NOT NULL COMMENT '封箱状态：ACTIVE 有效占用 / VOID 已作废（数量与标签已释放，历史保留）',
+    packed_at VARCHAR(40) NOT NULL COMMENT '封箱时间，ISO-8601 UTC instant 字符串',
+    voided_by VARCHAR(64) COMMENT '作废操作人标识；仅 status=VOID 时非空，ACTIVE 时为 NULL',
+    void_reason VARCHAR(512) COMMENT '作废原因；仅 status=VOID 时非空，ACTIVE 时为 NULL',
+    voided_at VARCHAR(40) COMMENT '作废时间，ISO-8601 UTC instant 字符串；仅 status=VOID 时非空，ACTIVE 时为 NULL'
+);
+
+-- 一次批量封箱命令可产生多个封箱版本，命令幂等由 command_log 主键保证；此索引仅用于按命令追溯版本。
+CREATE INDEX IF NOT EXISTS idx_packing_batch_command ON packing_record (batch_key, command_key);
+
+-- 有效标签占用：封箱插入、作废删除；标签号全局唯一，数据库约束保证并发同标签最多一次封箱成功。
+CREATE TABLE IF NOT EXISTS label_occupancy (
+    label_no BIGINT NOT NULL COMMENT '标签号，全局唯一：一个标签只能关联一个批次的一个有效封箱',
+    batch_key VARCHAR(64) NOT NULL COMMENT '占用该标签的批次业务键',
+    packing_id BIGINT NOT NULL COMMENT '占用该标签的封箱版本 packing_record.id',
+    occupied_at VARCHAR(40) NOT NULL COMMENT '占用时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT pk_label_occupancy PRIMARY KEY (label_no)
+);
+
+-- 放行快照：REJECTED 之前的第二个有效批准随放行事务写入，只插不改，放行后的作废申请一律拒绝、不得改写本行。
+CREATE TABLE IF NOT EXISTS release_snapshot (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    batch_key VARCHAR(64) NOT NULL COMMENT '所属批次业务键，全局唯一，一个批次至多一次放行快照',
+    planned_quantity INT NOT NULL COMMENT '固化的计划包装数量，单位：件',
+    packed_quantity INT NOT NULL COMMENT '固化的实际封箱数量（全部 ACTIVE 封箱数量之和），单位：件',
+    used_label_count INT NOT NULL COMMENT '固化的号段内已用标签数，等于有效封箱记录数',
+    label_summary TEXT NOT NULL COMMENT '已用标签规范排序摘要：标签号按数值升序，以英文逗号拼接，排序与空值含义长期稳定',
+    records_json TEXT NOT NULL COMMENT '每个封箱版本的明细 JSON 数组：[{packingId,labelNo,quantity,packedBy,packedAt}]，按标签号升序',
+    created_at VARCHAR(40) NOT NULL COMMENT '放行快照固化时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_release_snapshot_batch UNIQUE (batch_key)
+);

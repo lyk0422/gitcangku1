@@ -22,6 +22,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -59,15 +60,21 @@ public class BatchService {
     private static final int IDEMPOTENCY_MAX_ATTEMPTS = 3;
 
     private final BatchRepository repo;
+    private final PackingService packingService;
     private final TransactionTemplate tx;
     private final ObjectMapper objectMapper;
+    private final Clock clock;
 
     public BatchService(BatchRepository repo,
+                        PackingService packingService,
                         PlatformTransactionManager transactionManager,
-                        ObjectMapper objectMapper) {
+                        ObjectMapper objectMapper,
+                        Clock clock) {
         this.repo = repo;
+        this.packingService = packingService;
         this.tx = new TransactionTemplate(transactionManager);
         this.objectMapper = objectMapper;
+        this.clock = clock;
     }
 
     /**
@@ -186,6 +193,7 @@ public class BatchService {
             String now = now();
             int seq;
             BatchStatus newStatus;
+            PackingService.SnapshotDraft snapshotDraft = null;
             if (approvals.isEmpty()) {
                 seq = 1;
                 newStatus = BatchStatus.RELEASE_REVIEW;
@@ -199,10 +207,17 @@ public class BatchService {
                 }
                 seq = 2;
                 newStatus = BatchStatus.RELEASED;
+                // 放行前标签核销门禁：已登记包装计划时，全部计划数量必须封箱完成，
+                // 且号段内已用标签数等于封箱数；不满足抛 422，批准与快照都不落库。
+                snapshotDraft = packingService.prepareReleaseSnapshot(batchKey);
             }
             repo.insertApproval(new BatchRepository.ApprovalRow(0L, batchKey, req.commandKey(),
                     actor, role.name(), seq, now));
             repo.updateStatus(batchKey, newStatus.name());
+            if (snapshotDraft != null) {
+                // 放行快照与放行在同一事务固化：之后作废申请一律拒绝，快照不可改写。
+                packingService.saveReleaseSnapshot(snapshotDraft);
+            }
             ApprovalResponse body = new ApprovalResponse(batchKey, actor, role, seq, newStatus,
                     Instant.parse(now));
             return new StoredResponse(201, toJson(body));
@@ -396,7 +411,7 @@ public class BatchService {
     }
 
     private String now() {
-        return Instant.now().toString();
+        return Instant.now(clock).toString();
     }
 
     private String fingerprint(String... parts) {        String canonical = String.join(SEP, parts);
