@@ -30,6 +30,8 @@ dependencies {
 
 tasks.named('test') {
     useJUnitPlatform()
+    // 证物/交接/核验时间戳按 Asia/Shanghai 墙钟入库，测试固定 JVM 时区，保证截至 UTC 时刻重放与运行环境无关。
+    systemProperty 'user.timezone', 'Asia/Shanghai'
 }
 
 tasks.withType(JavaCompile).configureEach {

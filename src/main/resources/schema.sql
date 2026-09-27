@@ -65,10 +65,60 @@ CREATE TABLE IF NOT EXISTS command_log (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     command_key VARCHAR(64) NOT NULL COMMENT '幂等命令键，全局唯一',
     actor_id VARCHAR(64) NOT NULL COMMENT '发起操作人',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN/PACKAGE_CREATE/PACKAGE_ADJUST/PACKAGE_DELIVER/PACKAGE_REVOKE',
     request_hash VARCHAR(64) NOT NULL COMMENT '请求参数规范化后的 SHA-256，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行的 HTTP 状态码',
     response_body TEXT NOT NULL COMMENT '首次执行的响应体 JSON，重放时原样返回',
     created_at DATETIME(6) NOT NULL COMMENT '首次执行时间，Asia/Shanghai',
     CONSTRAINT uk_command_key UNIQUE (command_key)
+);
+
+-- 披露包案件串行锁：建包/增删修订包先抢占案件行锁，包版本按事务提交顺序裁决。
+CREATE TABLE IF NOT EXISTS disclosure_case_lock (
+    case_key VARCHAR(64) NOT NULL COMMENT '案件键，建包时自动登记',
+    created_at DATETIME(6) NOT NULL COMMENT '首次登记时间，Asia/Shanghai',
+    PRIMARY KEY (case_key)
+);
+
+-- 证物披露包：包键为 案件+规范化证物集+截至UTC时刻+包版本+操作者 的指纹；成功后内容冻结不可改写。
+CREATE TABLE IF NOT EXISTS disclosure_package (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    package_key VARCHAR(80) NOT NULL COMMENT '披露包业务键（SHA-256 指纹），全局唯一，同指纹重放、失败不占键',
+    case_key VARCHAR(64) NOT NULL COMMENT '所属案件键',
+    cutoff_at DATETIME(6) NOT NULL COMMENT '截至 UTC 时刻，链/位置/封签/借还均按该时刻历史状态重放',
+    package_version INT NOT NULL COMMENT '案件内包版本号，从 1 递增；修订包版本必须更高',
+    status VARCHAR(20) NOT NULL COMMENT '包状态：FROZEN 已冻结待交付 / DELIVERED 已交付（不可撤销）/ REVOKED 已撤销（仅未交付可撤销）',
+    operator_id VARCHAR(64) NOT NULL COMMENT '建包操作者（指纹组成部分）',
+    evidence_count INT NOT NULL COMMENT '冻结证物件数',
+    package_digest VARCHAR(64) NOT NULL COMMENT '整包生成摘要 SHA-256（含案件/规范化证物/截至时刻/版本/逐件摘要）',
+    base_package_key VARCHAR(80) NULL COMMENT '增删修订时基准包业务键；直接建包为 NULL',
+    delivered_by VARCHAR(64) NULL COMMENT '交付操作人；NULL 表示未交付',
+    delivered_at DATETIME(6) NULL COMMENT '交付时间（Asia/Shanghai）；NULL 表示未交付',
+    revoke_reason VARCHAR(512) NULL COMMENT '撤销原因，非空；已交付包不可撤销',
+    revoked_by VARCHAR(64) NULL COMMENT '撤销操作人；NULL 表示未撤销',
+    revoked_at DATETIME(6) NULL COMMENT '撤销时间（Asia/Shanghai）；NULL 表示未撤销',
+    created_at DATETIME(6) NOT NULL COMMENT '建包时间，Asia/Shanghai',
+    updated_at DATETIME(6) NOT NULL COMMENT '最近状态变更时间，Asia/Shanghai',
+    CONSTRAINT uk_disclosure_package_key UNIQUE (package_key),
+    CONSTRAINT uk_disclosure_case_version UNIQUE (case_key, package_version)
+);
+
+-- 披露包逐件冻结快照：建包时复制，之后迁移/复核/新增链记录均不得改写。
+CREATE TABLE IF NOT EXISTS disclosure_package_item (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    package_key VARCHAR(80) NOT NULL COMMENT '所属披露包业务键',
+    evidence_key VARCHAR(64) NOT NULL COMMENT '证物业务键（冻结时属于该案件）',
+    sort_order INT NOT NULL COMMENT '规范化（字典序）集合中的序号，从 0 开始',
+    chain_version INT NOT NULL COMMENT '截至时刻链版本：入库+截至时刻前已决交接/借出/核验事件总数',
+    chain_hash VARCHAR(64) NOT NULL COMMENT '截至时刻保管链指纹 SHA-256（链事件规范化摘要）',
+    custodian_id VARCHAR(64) NOT NULL COMMENT '截至时刻位置（保管人）快照',
+    evidence_status VARCHAR(20) NOT NULL COMMENT '截至时刻重放证物状态：SEALED/TRANSFER_PENDING/BORROWED/SEAL_BROKEN',
+    seal_no VARCHAR(64) NOT NULL COMMENT '封条编号快照',
+    seal_ok TINYINT NOT NULL COMMENT '截至时刻封签是否正常：1 正常 / 0 已异常',
+    latest_inspection_passed TINYINT NULL COMMENT '截至时刻最近一次封签核验结果：NULL 从未核验 / 1 通过 / 0 失败',
+    item_digest VARCHAR(64) NOT NULL COMMENT '单件生成摘要 SHA-256（链版本/位置/封签快照）',
+    snapshot_json TEXT NOT NULL COMMENT '逐件链/位置/封签完整快照 JSON，冻结后不可变',
+    created_at DATETIME(6) NOT NULL COMMENT '快照固化时间，Asia/Shanghai',
+    CONSTRAINT uk_disclosure_item UNIQUE (package_key, evidence_key),
+    KEY idx_disclosure_item_package (package_key)
 );
