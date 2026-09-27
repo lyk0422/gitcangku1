@@ -18,7 +18,7 @@ import java.time.LocalDateTime;
  * @param sealPassed  归还封条核验结果：null 未归还 / true 完好 / false 异常
  * @param returnNote  归还说明；null 表示未归还
  * @param returnedAt  实际归还时刻（UTC）；null 表示未归还
- * @param createdAt   记录创建时间（Asia/Shanghai）
+ * @param createdAt   记录创建时间（UTC）
  */
 public record LoanRecord(
         Long id,

@@ -11,7 +11,7 @@ import java.time.LocalDateTime;
  * @param toCustodian   指定接收人
  * @param status        交接状态
  * @param initiatedBy   发起操作人
- * @param createdAt     发起时间（Asia/Shanghai）
+ * @param createdAt     发起时间（UTC）
  * @param decidedAt     接受或取消时间；null 表示仍待接收
  */
 public record TransferRecord(

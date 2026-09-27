@@ -6,8 +6,9 @@ import java.time.Clock;
 import java.time.LocalDateTime;
 
 /**
- * 可注入时钟：借出/归还与逾期判定统一从该时钟取当前 UTC 时刻。
- * 默认 systemUTC()；测试可替换为固定或偏移时钟以验证逾期边界，无需真实等待。
+ * 可注入时钟：入库、交接、核验、借还等全部业务事件时间戳统一从该时钟取当前 UTC 时刻，
+ * 保证保管链历史可按同一 UTC 时间轴重放（披露包截至时刻判定依赖该不变量）。
+ * 默认 systemUTC()；测试可替换为固定或偏移时钟以验证逾期与历史快照边界，无需真实等待。
  */
 @Component
 public class EvidenceClock {

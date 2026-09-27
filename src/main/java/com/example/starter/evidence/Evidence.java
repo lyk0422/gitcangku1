@@ -13,8 +13,8 @@ import java.time.LocalDateTime;
  * @param sealNo      封条编号
  * @param custodianId 当前保管人
  * @param status      证物状态
- * @param createdAt   入库时间（Asia/Shanghai）
- * @param updatedAt   最近一次变更时间（Asia/Shanghai）
+ * @param createdAt   入库时间（UTC）
+ * @param updatedAt   最近一次变更时间（UTC）
  */
 public record Evidence(
         Long id,

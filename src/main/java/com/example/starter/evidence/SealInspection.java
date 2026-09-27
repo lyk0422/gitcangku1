@@ -10,7 +10,7 @@ import java.time.LocalDateTime;
  * @param inspectorId 提交核验的当前保管人
  * @param passed      核验结果：true 通过 / false 失败（证物进入 SEAL_BROKEN）
  * @param note        核验备注；null 表示未填写
- * @param createdAt   核验提交时间（Asia/Shanghai）
+ * @param createdAt   核验提交时间（UTC）
  */
 public record SealInspection(
         Long id,

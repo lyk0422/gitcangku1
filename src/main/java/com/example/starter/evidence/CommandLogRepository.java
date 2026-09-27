@@ -55,7 +55,7 @@ public class CommandLogRepository {
      * @param requestHash    请求参数规范化后的 SHA-256
      * @param responseStatus 首次执行的 HTTP 状态码
      * @param responseBody   首次执行的响应体 JSON
-     * @param createdAt      首次执行时间（Asia/Shanghai）
+     * @param createdAt      首次执行时间（UTC）
      */
     public record CommandLog(
             String commandKey,

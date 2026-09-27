@@ -77,7 +77,7 @@ public class EvidenceService {
         if (evidenceRepository.findByKey(request.evidenceKey()).isPresent()) {
             throw ApiException.conflict("证物已存在: " + request.evidenceKey());
         }
-        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime now = clock.nowUtc();
         evidenceRepository.insert(request.evidenceKey(), request.caseKey(), request.category(),
                 request.sealNo(), actorId, now);
         Evidence evidence = evidenceRepository.findByKey(request.evidenceKey()).orElseThrow();
@@ -111,7 +111,7 @@ public class EvidenceService {
         if (evidence.status() == EvidenceStatus.BORROWED) {
             throw ApiException.conflict("借出期间禁止发起交接: " + evidenceKey);
         }
-        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime now = clock.nowUtc();
         transferRepository.insert(evidenceKey, actorId, request.toCustodian(), now);
         evidenceRepository.updateStatus(evidenceKey, EvidenceStatus.TRANSFER_PENDING, now);
         TransferRecord pending = transferRepository.findPendingByEvidenceKey(evidenceKey).orElseThrow();
@@ -140,7 +140,7 @@ public class EvidenceService {
         if (!pending.toCustodian().equals(actorId)) {
             throw ApiException.conflict("操作人不是指定接收人: " + actorId);
         }
-        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime now = clock.nowUtc();
         if (!transferRepository.decide(pending.id(), TransferStatus.ACCEPTED, now)) {
             throw ApiException.conflict("交接已被处理: " + evidenceKey);
         }
@@ -171,7 +171,7 @@ public class EvidenceService {
         if (!pending.fromCustodian().equals(actorId)) {
             throw ApiException.conflict("仅原保管人可取消交接: " + actorId);
         }
-        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime now = clock.nowUtc();
         if (!transferRepository.decide(pending.id(), TransferStatus.CANCELLED, now)) {
             throw ApiException.conflict("交接已被处理: " + evidenceKey);
         }
@@ -205,7 +205,7 @@ public class EvidenceService {
         if (evidence.status() == EvidenceStatus.BORROWED) {
             throw ApiException.conflict("借出期间禁止独立封条核验: " + evidenceKey);
         }
-        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime now = clock.nowUtc();
         inspectionRepository.insert(evidenceKey, actorId, request.passed(), request.note(), now);
         if (!request.passed() && evidence.status() != EvidenceStatus.SEAL_BROKEN) {
             evidenceRepository.updateStatus(evidenceKey, EvidenceStatus.SEAL_BROKEN, now);
@@ -258,8 +258,8 @@ public class EvidenceService {
             throw ApiException.conflict("借出键已存在: " + request.loanKey());
         }
         loanRepository.insert(request.loanKey(), evidenceKey, actorId, request.borrowerId(),
-                request.purpose(), nowUtc, request.dueAt(), LocalDateTime.now());
-        evidenceRepository.updateStatus(evidenceKey, EvidenceStatus.BORROWED, LocalDateTime.now());
+                request.purpose(), nowUtc, request.dueAt(), nowUtc);
+        evidenceRepository.updateStatus(evidenceKey, EvidenceStatus.BORROWED, nowUtc);
         LoanRecord loan = loanRepository.findByLoanKey(request.loanKey()).orElseThrow();
         return record(request.commandKey(), OP_LOAN_BORROW, actorId, requestHash,
                 200, toView(loan));
@@ -307,10 +307,10 @@ public class EvidenceService {
             throw ApiException.conflict("借出已被并发归还: " + request.loanKey());
         }
         inspectionRepository.insert(evidenceKey, actorId, request.sealIntact(), request.note(),
-                LocalDateTime.now());
+                nowUtc);
         EvidenceStatus restored = request.sealIntact()
                 ? EvidenceStatus.SEALED : EvidenceStatus.SEAL_BROKEN;
-        evidenceRepository.updateStatus(evidenceKey, restored, LocalDateTime.now());
+        evidenceRepository.updateStatus(evidenceKey, restored, nowUtc);
         LoanRecord returned = loanRepository.findByLoanKey(request.loanKey()).orElseThrow();
         return record(request.commandKey(), OP_LOAN_RETURN, actorId, requestHash,
                 200, toView(returned));
@@ -389,7 +389,7 @@ public class EvidenceService {
                                   String requestHash, int status, Object body) {
         String json = toJson(body);
         commandLogRepository.insert(commandKey, actorId, operation, requestHash, status, json,
-                LocalDateTime.now());
+                clock.nowUtc());
         return new StoredResponse(status, json);
     }
 
