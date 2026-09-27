@@ -4,7 +4,8 @@ import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 
 /**
- * 业务题目工程入口；当前仅提供 Web 服务及数据库健康检查，不包含题目业务实现。
+ * 业务工程入口：证物封存交接与证物披露包服务。
+ * 默认使用 H2 内存库（MODE=MySQL）启动，schema.sql 自动建表；可通过 DB_URL 等环境变量切换 MySQL。
  */
 @SpringBootApplication
 public class StarterApplication {

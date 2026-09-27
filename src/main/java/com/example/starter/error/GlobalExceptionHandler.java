@@ -25,7 +25,8 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(ApiException.class)
     public ResponseEntity<ErrorBody> handleApi(ApiException ex) {
         return ResponseEntity.status(ex.status())
-                .body(new ErrorBody(ex.status().value(), ex.getMessage(), LocalDateTime.now()));
+                .body(new ErrorBody(ex.status().value(), ex.reasonCode(), ex.getMessage(),
+                        LocalDateTime.now()));
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
@@ -35,29 +36,30 @@ public class GlobalExceptionHandler {
                 .distinct()
                 .collect(Collectors.joining(", ", "参数非法: ", ""));
         return ResponseEntity.badRequest()
-                .body(new ErrorBody(400, message, LocalDateTime.now()));
+                .body(new ErrorBody(400, null, message, LocalDateTime.now()));
     }
 
     @ExceptionHandler({MissingRequestHeaderException.class, HttpMessageNotReadableException.class})
     public ResponseEntity<ErrorBody> handleBadRequest(Exception ex) {
         return ResponseEntity.badRequest()
-                .body(new ErrorBody(400, "参数非法: " + ex.getMessage(), LocalDateTime.now()));
+                .body(new ErrorBody(400, null, "参数非法: " + ex.getMessage(), LocalDateTime.now()));
     }
 
     @ExceptionHandler(Exception.class)
     public ResponseEntity<ErrorBody> handleOther(Exception ex) {
         log.error("未处理异常", ex);
         return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                .body(new ErrorBody(500, "服务内部错误", LocalDateTime.now()));
+                .body(new ErrorBody(500, null, "服务内部错误", LocalDateTime.now()));
     }
 
     /**
      * 统一错误响应体。
      *
-     * @param status    HTTP 状态码
-     * @param message   错误描述
-     * @param timestamp 发生时间（Asia/Shanghai）
+     * @param status     HTTP 状态码
+     * @param reasonCode 机器可区分的失败原因码；无细分原因时为 null
+     * @param message    错误描述
+     * @param timestamp  发生时间（Asia/Shanghai）
      */
-    public record ErrorBody(int status, String message, LocalDateTime timestamp) {
+    public record ErrorBody(int status, String reasonCode, String message, LocalDateTime timestamp) {
     }
 }
