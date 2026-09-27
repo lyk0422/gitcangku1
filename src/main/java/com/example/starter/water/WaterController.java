@@ -1,12 +1,23 @@
 package com.example.starter.water;
 
 import com.example.starter.water.dto.Dtos.AllocationResponse;
+import com.example.starter.water.dto.Dtos.BatchSettleRequest;
+import com.example.starter.water.dto.Dtos.BatchSettleResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
 import com.example.starter.water.dto.Dtos.CommandRequest;
+import com.example.starter.water.dto.Dtos.CorrectionRequest;
+import com.example.starter.water.dto.Dtos.CorrectionResponse;
 import com.example.starter.water.dto.Dtos.CreateWindowRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
+import com.example.starter.water.dto.Dtos.EvaporationRateHistoryResponse;
+import com.example.starter.water.dto.Dtos.EvaporationRateRequest;
+import com.example.starter.water.dto.Dtos.EvaporationRateResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.SettleRequest;
+import com.example.starter.water.dto.Dtos.SettlementDiagnosticResponse;
+import com.example.starter.water.dto.Dtos.SettlementHistoryResponse;
+import com.example.starter.water.dto.Dtos.SettlementResponse;
 import com.example.starter.water.dto.Dtos.SubmitAllocationRequest;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferRequest;
@@ -18,6 +29,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
@@ -102,5 +114,59 @@ public class WaterController {
     @GetMapping("/windows/{windowId}/history")
     public HistoryResponse getHistory(@PathVariable long windowId) {
         return service.getHistory(windowId);
+    }
+
+    /** 登记或修改渠道某 UTC 自然日蒸发率（当天首次核销前可改，之后 409）。 */
+    @PostMapping("/evaporation-rates")
+    public EvaporationRateResponse registerRate(@RequestBody EvaporationRateRequest request) {
+        return service.registerEvaporationRate(request.commandKey(), request.channelId(),
+                request.rateDate(), request.rate());
+    }
+
+    /** 查询渠道蒸发率版本历史（含已被取代的版本），只读。 */
+    @GetMapping("/channels/{channelId}/evaporation-rates")
+    public EvaporationRateHistoryResponse getRateHistory(@PathVariable String channelId) {
+        return service.getRateHistory(channelId);
+    }
+
+    /** 单笔送达水量核销（上游扣减、下游送达与损耗同事务写入）。 */
+    @PostMapping("/settlements")
+    public SettlementResponse settle(@RequestBody SettleRequest request) {
+        return service.settleDelivery(request.commandKey(), request.batchKey(), request.allocationKey(),
+                request.deliveryDate(), request.deliveredVolume());
+    }
+
+    /** 批量送达核销：完整最终余额与逐笔舍入预校验，任一失败整批回滚。 */
+    @PostMapping("/settlements/batch")
+    public BatchSettleResponse settleBatch(@RequestBody BatchSettleRequest request) {
+        return service.settleDeliveries(request.commandKey(), request.batchKey(), request.items());
+    }
+
+    /** 查询单笔核销凭证（固化证据），只读。 */
+    @GetMapping("/settlements/{settlementKey}")
+    public SettlementResponse getSettlement(@PathVariable String settlementKey) {
+        return service.getSettlement(settlementKey);
+    }
+
+    /** 对已结算核销做反向更正（冲回额度与累计，原凭证保留为 REVERSED）。 */
+    @PostMapping("/settlements/{settlementKey}/corrections")
+    public CorrectionResponse correct(@PathVariable String settlementKey,
+                                      @RequestBody CorrectionRequest request) {
+        return service.correctSettlement(request.commandKey(), request.correctionKey(),
+                settlementKey, request.reason());
+    }
+
+    /** 查询窗口核销明细（全部凭证与更正），只读。 */
+    @GetMapping("/windows/{windowId}/settlements")
+    public SettlementHistoryResponse getSettlements(@PathVariable long windowId) {
+        return service.getSettlementHistory(windowId);
+    }
+
+    /** 单申请核销诊断：实际持有/已结算/剩余可核销额度与试算要求扣减、差额，只读不落库。 */
+    @GetMapping("/allocations/{allocationKey}/settlement-diagnostic")
+    public SettlementDiagnosticResponse getDiagnostic(@PathVariable String allocationKey,
+                                                      @RequestParam(required = false) String deliveryDate,
+                                                      @RequestParam(required = false) String deliveredVolume) {
+        return service.getSettlementDiagnostic(allocationKey, deliveryDate, deliveredVolume);
     }
 }
