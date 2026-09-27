@@ -34,6 +34,7 @@ public class MeasurementRepository {
             rs.getBigDecimal("computed_value"),
             rs.getBoolean("passed"),
             MeasurementStatus.valueOf(rs.getString("status")),
+            rs.getInt("version"),
             JdbcTimes.fromDb(rs.getObject("created_at", LocalDateTime.class)));
 
     private final JdbcTemplate jdbc;
@@ -51,8 +52,8 @@ public class MeasurementRepository {
             PreparedStatement ps = con.prepareStatement(
                     "INSERT INTO measurement "
                             + "(measurement_key, instrument_id, measured_at, raw_reading, lower_limit, upper_limit, "
-                            + "submitted_by, certificate_id, computed_value, passed, status, created_at) "
-                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            + "submitted_by, certificate_id, computed_value, passed, status, version, created_at) "
+                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, measurement.measurementKey());
             ps.setString(2, measurement.instrumentId());
@@ -65,7 +66,8 @@ public class MeasurementRepository {
             ps.setBigDecimal(9, measurement.computedValue());
             ps.setBoolean(10, measurement.passed());
             ps.setString(11, measurement.status().name());
-            ps.setObject(12, JdbcTimes.toDb(measurement.createdAt()));
+            ps.setInt(12, measurement.version());
+            ps.setObject(13, JdbcTimes.toDb(measurement.createdAt()));
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();
@@ -93,6 +95,13 @@ public class MeasurementRepository {
     public void markReleased(long id) {
         jdbc.update("UPDATE measurement SET status = ? WHERE id = ?",
                 MeasurementStatus.RELEASED.name(), id);
+    }
+
+    /**
+     * 测量版本加 1（须在持有行锁的事务内调用），用于不确定度分量批量修改。
+     */
+    public void incrementVersion(long id) {
+        jdbc.update("UPDATE measurement SET version = version + 1 WHERE id = ?", id);
     }
 
     /**

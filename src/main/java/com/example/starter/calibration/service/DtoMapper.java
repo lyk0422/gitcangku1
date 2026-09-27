@@ -1,15 +1,23 @@
 package com.example.starter.calibration.service;
 
 import java.math.BigDecimal;
+import java.util.ArrayList;
 import java.util.List;
 
+import com.example.starter.calibration.api.dto.BudgetResponse;
+import com.example.starter.calibration.api.dto.BudgetRevisionResponse;
 import com.example.starter.calibration.api.dto.CertificateResponse;
+import com.example.starter.calibration.api.dto.ComponentView;
 import com.example.starter.calibration.api.dto.MeasurementResponse;
 import com.example.starter.calibration.api.dto.ReleaseRecordResponse;
+import com.example.starter.calibration.api.dto.ThresholdView;
+import com.example.starter.calibration.model.BudgetRevision;
 import com.example.starter.calibration.model.Certificate;
+import com.example.starter.calibration.model.InstrumentThreshold;
 import com.example.starter.calibration.model.Measurement;
 import com.example.starter.calibration.model.MeasurementStatus;
 import com.example.starter.calibration.model.ReleaseRecord;
+import com.example.starter.calibration.model.UncertaintyComponent;
 
 /**
  * 领域模型到响应 DTO 的映射。
@@ -58,12 +66,68 @@ final class DtoMapper {
                 m.displayValue().toPlainString(),
                 m.passed(),
                 m.status().name(),
+                m.version(),
                 usable,
                 m.createdAt(),
                 releases.stream().map(DtoMapper::toResponse).toList());
     }
 
     static ReleaseRecordResponse toResponse(ReleaseRecord record) {
-        return new ReleaseRecordResponse(record.batchId(), record.releasedBy(), record.releasedAt());
+        return new ReleaseRecordResponse(record.batchId(), record.releasedBy(), record.releasedAt(),
+                record.combinedUncertainty().toPlainString(), format(record.thresholdValue()),
+                record.thresholdVersion(), record.formula());
+    }
+
+    static ThresholdView toResponse(InstrumentThreshold threshold) {
+        return new ThresholdView(threshold.id(), threshold.instrumentId(),
+                format(threshold.threshold()), threshold.version(),
+                threshold.createdBy(), threshold.requestId(), threshold.createdAt());
+    }
+
+    /**
+     * 预算明细与诊断：合成不确定度为实际值，阈值为要求值，margin 为差额（threshold - combined）。
+     * 未登记阈值时 threshold/margin 为 null，诊断包含 THRESHOLD_MISSING。
+     */
+    static BudgetResponse toBudget(Measurement measurement, List<UncertaintyComponent> components,
+                                   BigDecimal combined, InstrumentThreshold threshold) {
+        List<String> blocking = new ArrayList<>();
+        String margin = null;
+        boolean satisfied = false;
+        if (threshold == null) {
+            blocking.add("THRESHOLD_MISSING");
+        } else {
+            BigDecimal diff = threshold.threshold().subtract(combined);
+            margin = format(diff);
+            if (diff.signum() < 0) {
+                blocking.add("UNCERTAINTY_EXCEEDED");
+            } else {
+                satisfied = true;
+            }
+        }
+        return new BudgetResponse(
+                measurement.measurementKey(),
+                measurement.version(),
+                UncertaintyCalculator.FORMULA,
+                components.stream()
+                        .map(c -> new ComponentView(c.componentName(), format(c.componentValue())))
+                        .toList(),
+                combined.toPlainString(),
+                threshold == null ? null : toResponse(threshold),
+                margin,
+                satisfied,
+                blocking);
+    }
+
+    static BudgetRevisionResponse toResponse(BudgetRevision revision) {
+        return new BudgetRevisionResponse(
+                revision.version(),
+                revision.combinedUncertainty().toPlainString(),
+                revision.formula(),
+                revision.changedBy(),
+                revision.requestId(),
+                revision.createdAt(),
+                revision.components().stream()
+                        .map(c -> new ComponentView(c.componentName(), format(c.componentValue())))
+                        .toList());
     }
 }

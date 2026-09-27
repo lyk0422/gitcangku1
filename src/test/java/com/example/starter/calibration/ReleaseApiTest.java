@@ -12,6 +12,7 @@ import org.springframework.test.web.servlet.MockMvc;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -31,6 +32,11 @@ class ReleaseApiTest {
 
     @BeforeEach
     void clean() {
+        jdbc.update("DELETE FROM idempotency_record");
+        jdbc.update("DELETE FROM budget_revision_component");
+        jdbc.update("DELETE FROM budget_revision");
+        jdbc.update("DELETE FROM uncertainty_component");
+        jdbc.update("DELETE FROM instrument_threshold");
         jdbc.update("DELETE FROM release_record");
         jdbc.update("DELETE FROM measurement");
         jdbc.update("DELETE FROM calibration_certificate");
@@ -44,7 +50,17 @@ class ReleaseApiTest {
                                  "validTo":"2028-01-01T00:00:00Z","a":"%s","b":"%s"}
                                 """.formatted(instrument, a, b)))
                 .andExpect(status().isCreated()).andReturn().getResponse().getContentAsString();
+        allowUncertainty(instrument);
         return ((Number) com.jayway.jsonpath.JsonPath.read(body, "$.id")).longValue();
+    }
+
+    /** 登记足够大的不确定度阈值，使既有放行用例不受不确定度约束影响。 */
+    private void allowUncertainty(String instrument) throws Exception {
+        mvc.perform(put("/api/instruments/{id}/threshold", instrument)
+                        .header("X-Actor-Id", "setup")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"requestId\":\"setup-th-" + instrument + "\",\"threshold\":\"999999\"}"))
+                .andExpect(status().isOk());
     }
 
     private void submit(String key, String instrument, String reading, String lower,

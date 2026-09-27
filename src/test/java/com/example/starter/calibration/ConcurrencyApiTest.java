@@ -24,6 +24,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
 
 /**
  * 并发与幂等边界测试：
@@ -43,10 +44,24 @@ class ConcurrencyApiTest {
 
     @BeforeEach
     void clean() {
+        jdbc.update("DELETE FROM idempotency_record");
+        jdbc.update("DELETE FROM budget_revision_component");
+        jdbc.update("DELETE FROM budget_revision");
+        jdbc.update("DELETE FROM uncertainty_component");
+        jdbc.update("DELETE FROM instrument_threshold");
         jdbc.update("DELETE FROM release_record");
         jdbc.update("DELETE FROM measurement");
         jdbc.update("DELETE FROM calibration_certificate");
         jdbc.update("DELETE FROM instrument_lock");
+    }
+
+    /** 登记足够大的不确定度阈值，使放行不受不确定度约束影响。 */
+    private void allowUncertainty(String instrument, String requestId) throws Exception {
+        mvc.perform(put("/api/instruments/{id}/threshold", instrument)
+                        .header("X-Actor-Id", "setup")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"requestId\":\"" + requestId + "\",\"threshold\":\"999999\"}"))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isOk());
     }
 
     @Test
@@ -95,6 +110,7 @@ class ConcurrencyApiTest {
                                      "validTo":"2028-01-01T00:00:00Z","a":"1","b":"0"}""".formatted(r)))
                     .andReturn().getResponse().getContentAsString();
             long certId = ((Number) com.jayway.jsonpath.JsonPath.read(certBody, "$.id")).longValue();
+            allowUncertainty("INS-R" + r, "setup-th-r" + r);
 
             mvc.perform(post("/api/measurements")
                     .contentType(MediaType.APPLICATION_JSON)
@@ -158,6 +174,7 @@ class ConcurrencyApiTest {
                                 {"instrumentId":"INS-D","validFrom":"2026-01-01T00:00:00Z",
                                  "validTo":"2028-01-01T00:00:00Z","a":"1","b":"0"}"""))
                 .andReturn().getResponse().getContentAsString();
+        allowUncertainty("INS-D", "setup-th-d");
         mvc.perform(post("/api/measurements")
                 .contentType(MediaType.APPLICATION_JSON)
                 .content("""
