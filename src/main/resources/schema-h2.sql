@@ -100,3 +100,49 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
 );
+
+CREATE TABLE IF NOT EXISTS incident_seal_packages (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    version INT NOT NULL,
+    lower_bound_at TIMESTAMP(6) NOT NULL,
+    cutoff_at TIMESTAMP(6) NOT NULL,
+    entry_count INT NOT NULL,
+    edge_count INT NOT NULL,
+    sealed_by VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_seal_version UNIQUE (incident_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS incident_seal_entries (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    package_id BIGINT NOT NULL,
+    seq_no INT NOT NULL,
+    record_type VARCHAR(16) NOT NULL,
+    record_key VARCHAR(128) NOT NULL,
+    occurred_at TIMESTAMP(6) NOT NULL,
+    record_version INT NOT NULL,
+    payload CLOB NOT NULL,
+    CONSTRAINT uk_seal_entry_seq UNIQUE (package_id, seq_no)
+);
+
+CREATE TABLE IF NOT EXISTS incident_seal_edges (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    package_id BIGINT NOT NULL,
+    task_key VARCHAR(128) NOT NULL,
+    blocker_incident_key VARCHAR(128) NOT NULL,
+    edge_created_at TIMESTAMP(6) NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS incident_seal_appendices (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    package_id BIGINT NOT NULL,
+    package_version INT NOT NULL,
+    record_key VARCHAR(128) NOT NULL,
+    old_value CLOB NOT NULL,
+    new_value CLOB NOT NULL,
+    reason VARCHAR(1024) NOT NULL,
+    actor VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL
+);

@@ -100,3 +100,49 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY COMMENT '固定为 1 的单行锁；创建任务时 SELECT ... FOR UPDATE 持有，串行化环检测与写入，保证并发反向依赖最终图无环'
 ) COMMENT='任务依赖图全局锁表';
+
+CREATE TABLE IF NOT EXISTS incident_seal_packages (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    incident_id BIGINT NOT NULL COMMENT '所属事件 id，关联 incidents.id',
+    version INT NOT NULL COMMENT '封存包版本号，事件内从 1 递增',
+    lower_bound_at TIMESTAMP(6) NOT NULL COMMENT '本包覆盖区间下界 UTC（含）：上一包截至时刻，首包为事件创建时刻',
+    cutoff_at TIMESTAMP(6) NOT NULL COMMENT '本包截至时刻 UTC（不含）：仅封存发生时刻早于该时刻的记录；不得早于事件创建、不得晚于封存时服务端当前时刻、必须晚于上一包截至时刻',
+    entry_count INT NOT NULL COMMENT '包内记录条目数（指令/交接/状态流转/任务快照合计）',
+    edge_count INT NOT NULL COMMENT '包内任务依赖边数',
+    sealed_by VARCHAR(128) NOT NULL COMMENT '封存操作人（封存时的当前指挥人）',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '封存落库 UTC 时间',
+    CONSTRAINT uk_seal_version UNIQUE (incident_id, version)
+) COMMENT='事件指挥日志封存包表；封存后不可变，后续任务修订/撤销/事件合并不回写';
+
+CREATE TABLE IF NOT EXISTS incident_seal_entries (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    package_id BIGINT NOT NULL COMMENT '所属封存包 id，关联 incident_seal_packages.id',
+    seq_no INT NOT NULL COMMENT '包内序号，从 1 递增；按记录发生时刻、同刻按记录标识排序',
+    record_type VARCHAR(16) NOT NULL COMMENT '记录类型：ACTION 指令 / TRANSFER 交接 / STATUS_CHANGE 状态流转 / TASK 任务状态快照',
+    record_key VARCHAR(128) NOT NULL COMMENT '记录标识：ACTION 为 actionKey，TRANSFER 为 TR-<id>，STATUS_CHANGE 为 SC-<id>，TASK 为 taskKey',
+    occurred_at TIMESTAMP(6) NOT NULL COMMENT '记录发生 UTC 时刻：ACTION/STATUS_CHANGE 取 occurred_at，TRANSFER/TASK 取 created_at',
+    record_version INT NOT NULL COMMENT '记录版本：ACTION/TRANSFER/STATUS_CHANGE 恒为 1（仅封存一次）；TASK 为截至本包被收录的次数，每次封存快照递增',
+    payload MEDIUMTEXT NOT NULL COMMENT '封存时刻的完整字段快照 JSON；不可变，事实错误只能追加更正附录',
+    CONSTRAINT uk_seal_entry_seq UNIQUE (package_id, seq_no)
+) COMMENT='封存包记录条目表；只增不改';
+
+CREATE TABLE IF NOT EXISTS incident_seal_edges (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    package_id BIGINT NOT NULL COMMENT '所属封存包 id，关联 incident_seal_packages.id',
+    task_key VARCHAR(128) NOT NULL COMMENT '依赖方任务键（本事件任务）',
+    blocker_incident_key VARCHAR(128) NOT NULL COMMENT '阻塞事件业务键',
+    edge_created_at TIMESTAMP(6) NOT NULL COMMENT '依赖边创建 UTC 时间（复制自 incident_task_blockers.created_at）'
+) COMMENT='封存包任务依赖边快照表；固化封存时刻的依赖图，后续修订不回写';
+
+CREATE TABLE IF NOT EXISTS incident_seal_appendices (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    incident_id BIGINT NOT NULL COMMENT '所属事件 id，关联 incidents.id',
+    package_id BIGINT NOT NULL COMMENT '引用的封存包 id，关联 incident_seal_packages.id',
+    package_version INT NOT NULL COMMENT '引用的封存包版本号（冗余便于查询）',
+    record_key VARCHAR(128) NOT NULL COMMENT '引用的原记录标识（对应 incident_seal_entries.record_key）',
+    old_value MEDIUMTEXT NOT NULL COMMENT '原值：被更正记录在封存包中的完整快照 JSON（复制自条目 payload）',
+    new_value MEDIUMTEXT NOT NULL COMMENT '新值：更正后的内容（调用方提交的文本/JSON）',
+    reason VARCHAR(1024) NOT NULL COMMENT '更正理由，非空',
+    actor VARCHAR(128) NOT NULL COMMENT '更正操作人（X-Actor-Id）',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '附录创建 UTC 时间'
+) COMMENT='封存记录更正附录表；只增不改，已关闭事件仍可追加';

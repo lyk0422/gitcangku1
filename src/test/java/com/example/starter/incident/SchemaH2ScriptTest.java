@@ -108,6 +108,52 @@ class SchemaH2ScriptTest {
                     duplicateBlockerRejected = true;
                 }
                 assertThat(duplicateBlockerRejected).isTrue();
+
+                // 封存包：(incident_id, version) 唯一
+                st.execute("INSERT INTO incident_seal_packages (incident_id, version,"
+                        + " lower_bound_at, cutoff_at, entry_count, edge_count, sealed_by,"
+                        + " created_at) VALUES (1,1,'" + Timestamp.from(now) + "','"
+                        + Timestamp.from(now.plusSeconds(60)) + "',2,0,'alice','"
+                        + Timestamp.from(now) + "')");
+                boolean duplicateSealRejected = false;
+                try {
+                    st.execute("INSERT INTO incident_seal_packages (incident_id, version,"
+                            + " lower_bound_at, cutoff_at, entry_count, edge_count, sealed_by,"
+                            + " created_at) VALUES (1,1,'" + Timestamp.from(now) + "','"
+                            + Timestamp.from(now.plusSeconds(60)) + "',0,0,'alice','"
+                            + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateSealRejected = true;
+                }
+                assertThat(duplicateSealRejected).isTrue();
+
+                // 封存条目：(package_id, seq_no) 唯一
+                st.execute("INSERT INTO incident_seal_entries (package_id, seq_no, record_type,"
+                        + " record_key, occurred_at, record_version, payload) VALUES (1,1,"
+                        + "'ACTION','A1','" + Timestamp.from(now) + "',1,'{}')");
+                boolean duplicateEntryRejected = false;
+                try {
+                    st.execute("INSERT INTO incident_seal_entries (package_id, seq_no, record_type,"
+                            + " record_key, occurred_at, record_version, payload) VALUES (1,1,"
+                            + "'ACTION','A2','" + Timestamp.from(now) + "',1,'{}')");
+                } catch (Exception e) {
+                    duplicateEntryRejected = true;
+                }
+                assertThat(duplicateEntryRejected).isTrue();
+
+                // 依赖边快照与更正附录可写入（只增表）
+                st.execute("INSERT INTO incident_seal_edges (package_id, task_key,"
+                        + " blocker_incident_key, edge_created_at) VALUES (1,'T-1','IK-1','"
+                        + Timestamp.from(now) + "')");
+                st.execute("INSERT INTO incident_seal_appendices (incident_id, package_id,"
+                        + " package_version, record_key, old_value, new_value, reason, actor,"
+                        + " created_at) VALUES (1,1,1,'A1','{}','{\"v\":2}','更正','auditor','"
+                        + Timestamp.from(now) + "')");
+                try (ResultSet rs = st.executeQuery(
+                        "SELECT COUNT(*) FROM incident_seal_appendices")) {
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getInt(1)).isEqualTo(1);
+                }
             }
         }
     }

@@ -78,4 +78,59 @@ public final class Responses {
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
     }
+
+    /**
+     * 封存包摘要视图：覆盖区间 [lowerBoundAt, cutoffAt) 左闭右开；
+     * entryCount/edgeCount 为包内实际条目数与依赖边数。
+     */
+    public record SealPackageView(int version, Instant lowerBoundAt, Instant cutoffAt,
+                                  int entryCount, int edgeCount, String sealedBy,
+                                  Instant createdAt) {
+    }
+
+    /**
+     * 封存包记录条目视图：seqNo 为包内序号（按发生时刻、同刻按记录标识排序）；
+     * payload 为封存时刻固化的完整字段快照（JSON 对象）。
+     */
+    public record SealEntryView(int seqNo, String recordType, String recordKey,
+                                Instant occurredAt, int recordVersion, Object payload) {
+    }
+
+    /** 封存包任务依赖边视图：taskKey（本事件任务）→ blockerIncidentKey。 */
+    public record SealEdgeView(String taskKey, String blockerIncidentKey, Instant edgeCreatedAt) {
+    }
+
+    /** 封存包明细视图：摘要 + 全部条目 + 全部依赖边。只读，不隐式写入。 */
+    public record SealPackageDetailView(int version, Instant lowerBoundAt, Instant cutoffAt,
+                                        int entryCount, int edgeCount, String sealedBy,
+                                        Instant createdAt, List<SealEntryView> entries,
+                                        List<SealEdgeView> edges) {
+    }
+
+    /**
+     * 更正附录视图：oldValue 为原包中该记录的封存快照（JSON 对象），
+     * newValue 为更正后内容；原包内容不被修改。
+     */
+    public record SealAppendixView(long id, int packageVersion, String recordKey, Object oldValue,
+                                   String newValue, String reason, String actor,
+                                   Instant createdAt) {
+    }
+
+    /** 封存历史视图：版本递增的包摘要列表 + 全部更正附录。只读，不隐式写入。 */
+    public record SealHistoryView(String incidentKey, List<SealPackageView> packages,
+                                  List<SealAppendixView> appendices) {
+    }
+
+    /**
+     * 封存诊断视图：当前可封存窗口 [nextLowerBoundAt, currentTime) 内各类型待封存记录数、
+     * 与当前时刻同刻的指令标识列表（非空时以当前时刻封存将返回 409）。
+     * lastVersion/lastCutoffAt 无封存包时为 null。只读，不隐式写入。
+     */
+    public record SealDiagnosticsView(String incidentKey, String incidentStatus,
+                                      Instant incidentCreatedAt, Instant currentTime,
+                                      Integer lastVersion, Instant lastCutoffAt,
+                                      Instant nextLowerBoundAt, long pendingActionCount,
+                                      long pendingTransferCount, long pendingStatusChangeCount,
+                                      long taskCount, List<String> boundaryConflictActionKeys) {
+    }
 }
