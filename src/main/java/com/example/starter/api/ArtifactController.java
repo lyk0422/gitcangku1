@@ -1,6 +1,8 @@
 package com.example.starter.api;
 
 import com.example.starter.api.dto.ArtifactResponse;
+import com.example.starter.api.dto.DeprecationBatchRequest;
+import com.example.starter.api.dto.DeprecationWindowResponse;
 import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
 import com.example.starter.api.dto.RegisterArtifactRequest;
@@ -50,12 +52,44 @@ public class ArtifactController {
         return artifactService.withdrawArtifact(requestId, name, version);
     }
 
+    /** 批量登记弃用窗口：先校验完整替代图，任一失败整批不写入。 */
+    @PostMapping("/deprecations")
+    public ResponseEntity<List<DeprecationWindowResponse>> registerDeprecations(
+            @RequestHeader("X-Request-Id") String requestId,
+            @Valid @RequestBody DeprecationBatchRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(artifactService.registerDeprecations(requestId, request));
+    }
+
+    /** 撤销尚未生效的弃用窗口，记录保留。 */
+    @PostMapping("/{name}/versions/{version}/deprecation/revoke")
+    public DeprecationWindowResponse revokeDeprecation(
+            @RequestHeader("X-Request-Id") String requestId,
+            @PathVariable String name,
+            @PathVariable @Positive int version) {
+        return artifactService.revokeDeprecation(requestId, name, version);
+    }
+
+    /** 查询全部弃用窗口（含已撤销历史）。 */
+    @GetMapping("/deprecations")
+    public List<DeprecationWindowResponse> listDeprecations() {
+        return artifactService.listDeprecations();
+    }
+
     /** 创建锁文件。 */
     @PostMapping("/locks")
     public ResponseEntity<LockFileResponse> lock(
             @RequestHeader("X-Request-Id") String requestId,
             @Valid @RequestBody LockRequest request) {
         return ResponseEntity.status(HttpStatus.CREATED).body(artifactService.createLock(requestId, request));
+    }
+
+    /** 按重解析时刻重新裁决并生成新锁文件。 */
+    @PostMapping("/locks/{id}/re-resolve")
+    public ResponseEntity<LockFileResponse> reResolve(
+            @RequestHeader("X-Request-Id") String requestId,
+            @PathVariable long id) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(artifactService.reResolveLock(requestId, id));
     }
 
     /** 查询全部历史锁文件。 */
