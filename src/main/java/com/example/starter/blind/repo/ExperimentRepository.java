@@ -8,6 +8,7 @@ import java.util.List;
 
 /**
  * 实验与席位数据访问；席位处理映射仅落库，不输出到日志。
+ * seat_no 为区内跨版本连续序号：版本1固定1~4，后继版本从既有最大序号之后顺延。
  */
 @Repository
 public class ExperimentRepository {
@@ -17,7 +18,7 @@ public class ExperimentRepository {
     }
 
     /** 席位行（盲底）：treatment 为 A/B，seatNo 可直接解码，禁止出现在普通接口。 */
-    public record SeatRow(String experimentId, int blockNo, int seatNo, String treatment) {
+    public record SeatRow(String experimentId, int blockNo, int versionNo, int seatNo, String treatment) {
     }
 
     private static final RowMapper<ExperimentRow> EXPERIMENT_MAPPER = (rs, n) -> new ExperimentRow(
@@ -29,6 +30,7 @@ public class ExperimentRepository {
     private static final RowMapper<SeatRow> SEAT_MAPPER = (rs, n) -> new SeatRow(
             rs.getString("experiment_id"),
             rs.getInt("block_no"),
+            rs.getInt("version_no"),
             rs.getInt("seat_no"),
             rs.getString("treatment"));
 
@@ -51,7 +53,7 @@ public class ExperimentRepository {
     }
 
     /**
-     * 行级锁定实验，串行化同实验的分配并发；事务结束时释放。
+     * 行级锁定实验，串行化同实验的分配/封存/扩容并发；事务结束时释放。
      */
     public ExperimentRow lockById(String experimentId) {
         List<ExperimentRow> rows = jdbc.query(
@@ -69,22 +71,47 @@ public class ExperimentRepository {
     }
 
     public void insertSeat(SeatRow seat) {
-        jdbc.update("INSERT INTO seat (experiment_id, block_no, seat_no, treatment) VALUES (?, ?, ?, ?)",
-                seat.experimentId(), seat.blockNo(), seat.seatNo(), seat.treatment());
+        jdbc.update("INSERT INTO seat (experiment_id, block_no, version_no, seat_no, treatment) "
+                        + "VALUES (?, ?, ?, ?, ?)",
+                seat.experimentId(), seat.blockNo(), seat.versionNo(), seat.seatNo(), seat.treatment());
     }
 
     public List<SeatRow> findSeats(String experimentId) {
         return jdbc.query(
-                "SELECT experiment_id, block_no, seat_no, treatment FROM seat "
-                        + "WHERE experiment_id = ? ORDER BY block_no, seat_no",
+                "SELECT experiment_id, block_no, version_no, seat_no, treatment FROM seat "
+                        + "WHERE experiment_id = ? ORDER BY block_no, version_no, seat_no",
                 SEAT_MAPPER, experimentId);
     }
 
+    /**
+     * 按区内跨版本连续序号读取席位（揭盲固化历史用）；seat_no 在区内全局唯一。
+     */
     public SeatRow findSeat(String experimentId, int blockNo, int seatNo) {
         List<SeatRow> rows = jdbc.query(
-                "SELECT experiment_id, block_no, seat_no, treatment FROM seat "
+                "SELECT experiment_id, block_no, version_no, seat_no, treatment FROM seat "
                         + "WHERE experiment_id = ? AND block_no = ? AND seat_no = ?",
                 SEAT_MAPPER, experimentId, blockNo, seatNo);
         return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /**
+     * 读取指定版本的全部席位，按区内序号升序。
+     */
+    public List<SeatRow> findSeatsByVersion(String experimentId, int blockNo, int versionNo) {
+        return jdbc.query(
+                "SELECT experiment_id, block_no, version_no, seat_no, treatment FROM seat "
+                        + "WHERE experiment_id = ? AND block_no = ? AND version_no = ? "
+                        + "ORDER BY seat_no",
+                SEAT_MAPPER, experimentId, blockNo, versionNo);
+    }
+
+    /**
+     * 区组内已存在的最大区内序号；无席位时返回 0。
+     */
+    public int findMaxSeatNo(String experimentId, int blockNo) {
+        Integer max = jdbc.queryForObject(
+                "SELECT MAX(seat_no) FROM seat WHERE experiment_id = ? AND block_no = ?",
+                Integer.class, experimentId, blockNo);
+        return max == null ? 0 : max;
     }
 }

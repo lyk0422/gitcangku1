@@ -60,9 +60,9 @@ public class ExperimentService {
         List<SeatRow> seats = new ArrayList<>(blockCount * SEATS_PER_BLOCK);
         for (int blockNo = 1; blockNo <= blockCount; blockNo++) {
             for (int seatNo = 1; seatNo <= SEATS_PER_BLOCK; seatNo++) {
-                // 按提交顺序：每区组前两席 A，后两席 B；内容创建后不可改。
+                // 版本1初始随机表：每区组前两席 A，后两席 B；封存后内容不可改。
                 String treatment = seatNo <= 2 ? "A" : "B";
-                seats.add(new SeatRow(experimentId, blockNo, seatNo, treatment));
+                seats.add(new SeatRow(experimentId, blockNo, 1, seatNo, treatment));
             }
         }
         seats.forEach(experimentRepository::insertSeat);
@@ -112,9 +112,10 @@ public class ExperimentService {
         // 盲码随机冲突概率极低，仍由唯一索引兜底并重试。
         for (int attempt = 0; attempt < 5; attempt++) {
             String blindCode = blindCodeGenerator.nextCode();
+            // 固化本次分配使用的随机表版本、区内序号与封存编号；后续扩容/揭盲不改写。
             AllocationRow row = new AllocationRow(0L, experimentId, participantId,
-                    vacant.blockNo(), vacant.seatNo(), blindCode, "ASSIGNED",
-                    actorId, now, null);
+                    vacant.blockNo(), vacant.versionNo(), vacant.seatNo(), vacant.sealId(),
+                    blindCode, "ASSIGNED", actorId, now, null);
             try {
                 allocationRepository.insert(row);
                 return allocationRepository.findByExperimentAndParticipant(experimentId, participantId);
