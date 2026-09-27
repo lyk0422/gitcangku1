@@ -3,6 +3,8 @@ package com.example.starter.incident.dto;
 import java.time.Instant;
 import java.util.List;
 
+import com.fasterxml.jackson.databind.JsonNode;
+
 /**
  * 读接口与写接口响应体集合。时间字段均为 UTC ISO-8601。
  */
@@ -77,5 +79,58 @@ public final class Responses {
 
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
+    }
+
+    /**
+     * 封存包头视图：version 为事件内递增版本；sealUntil 为封存截至 UTC 时刻
+     * （左闭右开，不含该时刻）；recordCount/edgeCount 为包内实际记录数与依赖边数。
+     */
+    public record SealView(int version, Instant sealUntil, Instant sealedAt, String sealedBy,
+                           int recordCount, int edgeCount) {
+    }
+
+    /**
+     * 封存记录视图：recordVersion 为固化时该记录的业务版本；seq 为包内
+     * 按 (occurredAt, recordKey) 升序的序号；payload 为固化快照 JSON，不可变。
+     */
+    public record SealRecordView(String recordType, String recordKey, int recordVersion,
+                                 Instant occurredAt, int seq, JsonNode payload) {
+    }
+
+    /** 固化依赖边视图：本事件任务 taskKey → 阻塞事件 blockerIncidentKey。 */
+    public record SealEdgeView(String taskKey, String blockerIncidentKey, int seq) {
+    }
+
+    /**
+     * 封存包明细视图：包头 + 全部封存记录 + 全部固化依赖边 + 该包全部更正附录。
+     */
+    public record SealDetailView(SealView seal, List<SealRecordView> records,
+                                 List<SealEdgeView> edges, List<AppendixView> appendices) {
+    }
+
+    /** 封存历史视图：seals 按版本升序返回。 */
+    public record SealHistoryView(String incidentKey, List<SealView> seals) {
+    }
+
+    /**
+     * 更正附录视图：引用原包版本与原记录标识，保留原值、新值、理由与操作人；
+     * oldValue 为 null 表示原字段为 null。
+     */
+    public record AppendixView(long id, int sealVersion, String recordKey, String fieldName,
+                               String oldValue, String newValue, String reason, String operator,
+                               Instant createdAt) {
+    }
+
+    /** 更正附录历史视图：appendices 按追加顺序返回。 */
+    public record AppendixHistoryView(String incidentKey, List<AppendixView> appendices) {
+    }
+
+    /**
+     * 封存诊断视图（只读）：汇总该事件封存包数量、最新版本、截至时刻范围、
+     * 封存记录与依赖边总数、更正附录总数；无封存包时 latestVersion 与时间范围为 null。
+     */
+    public record SealDiagnosticsView(String incidentKey, int sealCount, Integer latestVersion,
+                                      Instant earliestSealUntil, Instant latestSealUntil,
+                                      long recordCount, long edgeCount, long appendixCount) {
     }
 }

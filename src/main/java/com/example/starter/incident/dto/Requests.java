@@ -55,4 +55,19 @@ public final class Requests {
     /** 任务完成/取消请求，操作人由 X-Actor-Id 指定且须为当前指挥人。 */
     public record TaskActionRequest(String commandKey) {
     }
+
+    /**
+     * 日志封存请求：sealUntil 为封存截至 UTC 时刻（左闭右开区间右端，不含该时刻），
+     * 不得早于事件创建时刻、不得晚于服务端当前时刻。
+     */
+    public record SealCreateRequest(String commandKey, Instant sealUntil) {
+    }
+
+    /**
+     * 更正附录追加请求：引用原包版本与原记录标识；oldValue 须与固化快照一致
+     * （为空表示原字段为 null），newValue 与 reason 非空；操作人由 X-Actor-Id 指定。
+     */
+    public record AppendixRequest(String commandKey, Integer sealVersion, String recordKey,
+                                  String fieldName, String oldValue, String newValue, String reason) {
+    }
 }

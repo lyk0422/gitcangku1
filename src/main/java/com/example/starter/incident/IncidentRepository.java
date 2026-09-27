@@ -152,6 +152,15 @@ public class IncidentRepository {
     }
 
     /**
+     * 查询事件发生时刻早于指定 UTC 时刻的处置记录（封存用，左闭右开），按落库顺序返回。
+     */
+    public List<IncidentAction> listActionsBefore(long incidentId, Instant until) {
+        return jdbc.query("SELECT * FROM incident_actions WHERE incident_id = ? AND occurred_at < ?"
+                        + " ORDER BY id",
+                ACTION_MAPPER, incidentId, Timestamp.from(until));
+    }
+
+    /**
      * 创建交接单（PENDING），返回生成主键。
      */
     public long insertTransfer(IncidentTransfer transfer) {
@@ -196,6 +205,15 @@ public class IncidentRepository {
     public List<IncidentTransfer> listTransfers(long incidentId) {
         return jdbc.query("SELECT * FROM incident_transfers WHERE incident_id = ? ORDER BY id",
                 TRANSFER_MAPPER, incidentId);
+    }
+
+    /**
+     * 查询事件发起时刻早于指定 UTC 时刻的交接单（封存用，左闭右开），按发起顺序返回。
+     */
+    public List<IncidentTransfer> listTransfersBefore(long incidentId, Instant until) {
+        return jdbc.query("SELECT * FROM incident_transfers WHERE incident_id = ? AND created_at < ?"
+                        + " ORDER BY id",
+                TRANSFER_MAPPER, incidentId, Timestamp.from(until));
     }
 
     /**

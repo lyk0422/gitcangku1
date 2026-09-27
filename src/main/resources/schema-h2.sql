@@ -100,3 +100,52 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
 );
+
+CREATE TABLE IF NOT EXISTS incident_log_seals (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    version INT NOT NULL,
+    seal_until TIMESTAMP(6) NOT NULL,
+    sealed_at TIMESTAMP(6) NOT NULL,
+    sealed_by VARCHAR(128) NOT NULL,
+    record_count INT NOT NULL,
+    edge_count INT NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_seal_version UNIQUE (incident_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS incident_log_seal_records (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    seal_id BIGINT NOT NULL,
+    record_type VARCHAR(16) NOT NULL,
+    record_key VARCHAR(128) NOT NULL,
+    record_version INT NOT NULL,
+    occurred_at TIMESTAMP(6) NOT NULL,
+    seq INT NOT NULL,
+    payload CLOB NOT NULL,
+    CONSTRAINT uk_seal_record UNIQUE (seal_id, record_type, record_key),
+    CONSTRAINT uk_seal_record_seq UNIQUE (seal_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS incident_log_seal_edges (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    seal_id BIGINT NOT NULL,
+    task_key VARCHAR(128) NOT NULL,
+    blocker_incident_key VARCHAR(128) NOT NULL,
+    seq INT NOT NULL,
+    CONSTRAINT uk_seal_edge UNIQUE (seal_id, task_key, blocker_incident_key)
+);
+
+CREATE TABLE IF NOT EXISTS incident_log_appendices (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    seal_id BIGINT NOT NULL,
+    seal_version INT NOT NULL,
+    record_key VARCHAR(128) NOT NULL,
+    field_name VARCHAR(64) NOT NULL,
+    old_value VARCHAR(1024) NULL,
+    new_value VARCHAR(1024) NOT NULL,
+    reason VARCHAR(1024) NOT NULL,
+    operator VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL
+);

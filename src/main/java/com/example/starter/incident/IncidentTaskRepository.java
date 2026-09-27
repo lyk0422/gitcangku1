@@ -109,6 +109,15 @@ public class IncidentTaskRepository {
     }
 
     /**
+     * 查询事件创建时刻早于指定 UTC 时刻的任务（封存用，左闭右开），按创建顺序返回。
+     */
+    public List<IncidentTask> listByIncidentCreatedBefore(long incidentId, Instant until) {
+        return jdbc.query("SELECT * FROM incident_tasks WHERE incident_id = ? AND created_at < ?"
+                        + " ORDER BY id",
+                TASK_MAPPER, incidentId, Timestamp.from(until));
+    }
+
+    /**
      * 查询事件仍 OPEN 的任务（解决门禁用），按创建顺序返回。
      */
     public List<IncidentTask> listOpenByIncident(long incidentId) {
