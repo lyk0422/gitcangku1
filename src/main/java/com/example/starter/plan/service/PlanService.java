@@ -62,13 +62,16 @@ public class PlanService {
     private final IdempotencyRepository idemRepo;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate tx;
+    private final ConnectionService connectionService;
 
     public PlanService(PlanRepository planRepo, IdempotencyRepository idemRepo,
-                       ObjectMapper objectMapper, PlatformTransactionManager txManager) {
+                       ObjectMapper objectMapper, PlatformTransactionManager txManager,
+                       ConnectionService connectionService) {
         this.planRepo = planRepo;
         this.idemRepo = idemRepo;
         this.objectMapper = objectMapper;
         this.tx = new TransactionTemplate(txManager);
+        this.connectionService = connectionService;
     }
 
     /**
@@ -84,6 +87,11 @@ public class PlanService {
         }
         try {
             return tx.execute(status -> {
+                // 并发下同键请求在此串行：对方已提交时直接重放首次结果，而非误判键冲突
+                Optional<PlanResponse> inTxReplay = replayIfPresent(OP_CREATE, req.requestKey(), hash);
+                if (inTxReplay.isPresent()) {
+                    return inTxReplay.get();
+                }
                 if (planRepo.findByKey(req.scheduleKey()).isPresent()) {
                     throw conflict("SCHEDULE_KEY_EXISTS", "scheduleKey 已存在: " + req.scheduleKey());
                 }
@@ -191,6 +199,8 @@ public class PlanService {
                 }
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(plan.id(), PlanStatus.CANCELLED, now);
+                // 同事务：计划参与的生效接续取消并固化事件，对侧后车风险重估
+                connectionService.afterPlanCancelled(plan);
                 PlanResponse response = loadPlan(scheduleKey);
                 idemRepo.insert(OP_CANCEL, requestKey, hash, toJson(response), now);
                 return response;
@@ -264,6 +274,9 @@ public class PlanService {
                 planRepo.updateStatus(oldPlan.id(), PlanStatus.CANCELLED, now);
                 planRepo.updateStatus(newPlan.id(), PlanStatus.PUBLISHED, now);
                 planRepo.insertRescheduleLink(oldPlan.id(), newPlan.id(), now);
+                // 同事务：生效接续迁移至新计划并重算全部直接接续，
+                // 保障不足的未开始后车标记 CONNECTION_AT_RISK（不自动改时刻）
+                connectionService.afterReschedule(oldPlan, newPlan);
                 RescheduleResponse response = new RescheduleResponse(
                         loadPlan(oldScheduleKey), loadPlan(req.newScheduleKey()));
                 idemRepo.insert(OP_RESCHEDULE, req.requestKey(), hash, toJson(response), now);
