@@ -333,9 +333,10 @@ public class ObservationService {
 
     /**
      * 普通字段三方合并：候选未改保留当前；当前未改接受候选；两边改为相同值接受；否则记录冲突。
+     * 包内共享：离线提交自动合并与人工裁决合并复用同一套规则。
      */
-    private String mergeField(String field, String base, String current, String candidate,
-                              List<String> conflictFields) {
+    static String mergeField(String field, String base, String current, String candidate,
+                             List<String> conflictFields) {
         if (Objects.equals(candidate, base)) {
             return current;
         }
@@ -349,8 +350,8 @@ public class ObservationService {
     /**
      * 读数字段三方合并：按数值比较（BigDecimal），其余规则与普通字段一致。
      */
-    private String mergeReadingField(String base, String current, String candidate,
-                                     List<String> conflictFields) {
+    static String mergeReadingField(String base, String current, String candidate,
+                                    List<String> conflictFields) {
         if (readingEquals(candidate, base)) {
             return current;
         }
@@ -364,13 +365,13 @@ public class ObservationService {
     /**
      * 判断合并结果与当前版本内容是否完全相同（读数按数值，其余按原文）。
      */
-    private boolean sameContent(ObservationSnapshot merged, ObservationSnapshot current) {
+    static boolean sameContent(ObservationSnapshot merged, ObservationSnapshot current) {
         return Objects.equals(merged.location(), current.location())
                 && Objects.equals(merged.note(), current.note())
                 && readingEquals(merged.reading(), current.reading());
     }
 
-    private boolean readingEquals(String left, String right) {
+    static boolean readingEquals(String left, String right) {
         if (left == null || right == null) {
             return Objects.equals(left, right);
         }
