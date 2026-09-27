@@ -94,6 +94,16 @@ public class LoanRecordRepository {
                 ROW_MAPPER, evidenceKey);
     }
 
+    /**
+     * 统计证物借出记录数（跨案移交快照固化，撤销时校验未发生后续借出）。
+     */
+    public int countByEvidenceKey(String evidenceKey) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM loan_record WHERE evidence_key = ?",
+                Integer.class, evidenceKey);
+        return count == null ? 0 : count;
+    }
+
     private static final class LoanRowMapper implements RowMapper<LoanRecord> {
         @Override
         public LoanRecord mapRow(ResultSet rs, int rowNum) throws SQLException {

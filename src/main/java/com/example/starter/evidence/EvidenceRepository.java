@@ -77,6 +77,17 @@ public class EvidenceRepository {
     }
 
     /**
+     * 跨案移交/撤销时原子切换案件归属与保管人（调用前必须已锁定证物行）。
+     * 仅更新当前归属，历史保管链与快照不改写。
+     */
+    public void updateCaseCustody(String evidenceKey, String caseKey, String custodianId,
+                                  LocalDateTime now) {
+        jdbc.update(
+                "UPDATE evidence SET case_key = ?, custodian_id = ?, updated_at = ? WHERE evidence_key = ?",
+                caseKey, custodianId, now, evidenceKey);
+    }
+
+    /**
      * 查询指定保管人当前可交接的证物（本人保管且状态 SEALED）。
      */
     public List<Evidence> findTransferable(String custodianId) {

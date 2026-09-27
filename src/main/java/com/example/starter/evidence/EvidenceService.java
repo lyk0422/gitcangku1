@@ -46,6 +46,7 @@ public class EvidenceService {
     private final SealInspectionRepository inspectionRepository;
     private final LoanRecordRepository loanRepository;
     private final CommandLogRepository commandLogRepository;
+    private final CaseCustodianRepository caseCustodianRepository;
     private final ObjectMapper objectMapper;
     private final EvidenceClock clock;
 
@@ -54,6 +55,7 @@ public class EvidenceService {
                            SealInspectionRepository inspectionRepository,
                            LoanRecordRepository loanRepository,
                            CommandLogRepository commandLogRepository,
+                           CaseCustodianRepository caseCustodianRepository,
                            ObjectMapper objectMapper,
                            EvidenceClock clock) {
         this.evidenceRepository = evidenceRepository;
@@ -61,6 +63,7 @@ public class EvidenceService {
         this.inspectionRepository = inspectionRepository;
         this.loanRepository = loanRepository;
         this.commandLogRepository = commandLogRepository;
+        this.caseCustodianRepository = caseCustodianRepository;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -80,6 +83,7 @@ public class EvidenceService {
         LocalDateTime now = LocalDateTime.now();
         evidenceRepository.insert(request.evidenceKey(), request.caseKey(), request.category(),
                 request.sealNo(), actorId, now);
+        grantCaseCustodianIfAbsent(request.caseKey(), actorId);
         Evidence evidence = evidenceRepository.findByKey(request.evidenceKey()).orElseThrow();
         return record(request.commandKey(), OP_INTAKE, actorId, requestHash, 201, toView(evidence));
     }
@@ -145,6 +149,7 @@ public class EvidenceService {
             throw ApiException.conflict("交接已被处理: " + evidenceKey);
         }
         evidenceRepository.updateCustody(evidenceKey, actorId, EvidenceStatus.SEALED, now);
+        grantCaseCustodianIfAbsent(evidence.caseKey(), actorId);
         Evidence updated = evidenceRepository.findByKey(evidenceKey).orElseThrow();
         return record(request.commandKey(), OP_TRANSFER_ACCEPT, actorId, requestHash,
                 200, toView(updated));
@@ -376,8 +381,16 @@ public class EvidenceService {
                 .orElseThrow(() -> ApiException.conflict("证物不存在待接收交接: " + evidenceKey));
     }
 
-    private Optional<StoredResponse> checkReplay(String commandKey, String requestHash) {
-        return commandLogRepository.findByKey(commandKey).map(log -> {
+    /**
+     * 入库操作人与交接接受人自动获得对应案件保管权限（已具备时不重复授权）。
+     */
+    private void grantCaseCustodianIfAbsent(String caseKey, String custodianId) {
+        if (!caseCustodianRepository.exists(caseKey, custodianId)) {
+            caseCustodianRepository.insert(caseKey, custodianId, custodianId, clock.nowUtc());
+        }
+    }
+
+    private Optional<StoredResponse> checkReplay(String commandKey, String requestHash) {        return commandLogRepository.findByKey(commandKey).map(log -> {
             if (!log.requestHash().equals(requestHash)) {
                 throw ApiException.conflict("幂等键已被不同参数使用: " + commandKey);
             }

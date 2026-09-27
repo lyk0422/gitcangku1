@@ -69,6 +69,16 @@ public class TransferRecordRepository {
                 ROW_MAPPER, evidenceKey);
     }
 
+    /**
+     * 统计证物交接记录数（跨案移交快照固化，撤销时校验未发生后续交接）。
+     */
+    public int countByEvidenceKey(String evidenceKey) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM transfer_record WHERE evidence_key = ?",
+                Integer.class, evidenceKey);
+        return count == null ? 0 : count;
+    }
+
     private static final class TransferRowMapper implements RowMapper<TransferRecord> {
         @Override
         public TransferRecord mapRow(ResultSet rs, int rowNum) throws SQLException {
