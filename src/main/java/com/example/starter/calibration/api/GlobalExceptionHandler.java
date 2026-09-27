@@ -22,6 +22,13 @@ public class GlobalExceptionHandler {
                 .body(new ErrorResponse(ex.getCode(), ex.getMessage(), ex.getFailures()));
     }
 
+    @ExceptionHandler(IdempotentReplayException.class)
+    public ResponseEntity<String> handleReplay(IdempotentReplayException ex) {
+        return ResponseEntity.status(ex.getStatus())
+                .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+                .body(ex.getBody());
+    }
+
     @ExceptionHandler(ApiException.class)
     public ResponseEntity<ErrorResponse> handleApi(ApiException ex) {
         return ResponseEntity.status(ex.getStatus())

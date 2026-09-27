@@ -59,11 +59,21 @@ final class DtoMapper {
                 m.passed(),
                 m.status().name(),
                 usable,
+                m.measurementVersion(),
                 m.createdAt(),
                 releases.stream().map(DtoMapper::toResponse).toList());
     }
 
     static ReleaseRecordResponse toResponse(ReleaseRecord record) {
-        return new ReleaseRecordResponse(record.batchId(), record.releasedBy(), record.releasedAt());
+        return new ReleaseRecordResponse(
+                record.batchId(),
+                record.releasedBy(),
+                record.releasedAt(),
+                record.combinedUncertainty().setScale(4, java.math.RoundingMode.HALF_UP).toPlainString(),
+                record.thresholdVersion(),
+                format(record.thresholdValue()),
+                record.budgetVersion(),
+                record.calcSpec(),
+                ComponentSnapshots.fromJson(record.componentsSnapshot()));
     }
 }

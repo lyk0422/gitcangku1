@@ -29,6 +29,10 @@ class CertificateApiTest {
 
     @BeforeEach
     void clean() {
+        jdbc.update("DELETE FROM idempotency_record");
+        jdbc.update("DELETE FROM uncertainty_budget_revision");
+        jdbc.update("DELETE FROM uncertainty_component");
+        jdbc.update("DELETE FROM uncertainty_threshold");
         jdbc.update("DELETE FROM release_record");
         jdbc.update("DELETE FROM measurement");
         jdbc.update("DELETE FROM calibration_certificate");

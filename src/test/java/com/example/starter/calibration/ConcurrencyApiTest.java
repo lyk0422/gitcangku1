@@ -43,10 +43,25 @@ class ConcurrencyApiTest {
 
     @BeforeEach
     void clean() {
+        jdbc.update("DELETE FROM idempotency_record");
+        jdbc.update("DELETE FROM uncertainty_budget_revision");
+        jdbc.update("DELETE FROM uncertainty_component");
+        jdbc.update("DELETE FROM uncertainty_threshold");
         jdbc.update("DELETE FROM release_record");
         jdbc.update("DELETE FROM measurement");
         jdbc.update("DELETE FROM calibration_certificate");
         jdbc.update("DELETE FROM instrument_lock");
+    }
+
+    private void setThreshold(String instrument) throws Exception {
+        mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders
+                        .put("/api/instruments/{id}/uncertainty-threshold", instrument)
+                        .header("X-Actor-Id", "metrology")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"requestId\":\"" + java.util.UUID.randomUUID()
+                                + "\",\"maxUncertainty\":\"1000\"}"))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers
+                        .status().isCreated());
     }
 
     @Test
@@ -95,6 +110,7 @@ class ConcurrencyApiTest {
                                      "validTo":"2028-01-01T00:00:00Z","a":"1","b":"0"}""".formatted(r)))
                     .andReturn().getResponse().getContentAsString();
             long certId = ((Number) com.jayway.jsonpath.JsonPath.read(certBody, "$.id")).longValue();
+            setThreshold("INS-R" + r);
 
             mvc.perform(post("/api/measurements")
                     .contentType(MediaType.APPLICATION_JSON)
@@ -158,6 +174,7 @@ class ConcurrencyApiTest {
                                 {"instrumentId":"INS-D","validFrom":"2026-01-01T00:00:00Z",
                                  "validTo":"2028-01-01T00:00:00Z","a":"1","b":"0"}"""))
                 .andReturn().getResponse().getContentAsString();
+        setThreshold("INS-D");
         mvc.perform(post("/api/measurements")
                 .contentType(MediaType.APPLICATION_JSON)
                 .content("""

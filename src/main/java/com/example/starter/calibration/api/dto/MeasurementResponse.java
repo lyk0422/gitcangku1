@@ -21,6 +21,7 @@ import java.util.List;
  * @param passed         是否合格（基于未舍入值，含端点）
  * @param status         状态：PENDING / RELEASED
  * @param usable         当前是否可用（已放行且证书未撤销）
+ * @param measurementVersion 当前测量版本（不确定度预算修订后递增）
  * @param createdAt      提交时间（UTC）
  * @param releases       放行历史
  */
@@ -39,6 +40,7 @@ public record MeasurementResponse(
         boolean passed,
         String status,
         boolean usable,
+        int measurementVersion,
         Instant createdAt,
         List<ReleaseRecordResponse> releases) {
 }

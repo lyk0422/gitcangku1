@@ -1,5 +1,6 @@
 package com.example.starter.calibration.repo;
 
+import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.util.List;
@@ -11,7 +12,8 @@ import org.springframework.stereotype.Repository;
 import com.example.starter.calibration.model.ReleaseRecord;
 
 /**
- * 放行历史持久化。历史只增不改，证书撤销后保留。
+ * 放行历史持久化。历史只增不改，证书撤销后保留；
+ * 放行时写入不确定度预算快照（分量、计算口径、阈值版本），后续阈值修订不改写。
  */
 @Repository
 public class ReleaseRepository {
@@ -21,7 +23,13 @@ public class ReleaseRepository {
             rs.getString("batch_id"),
             rs.getLong("measurement_id"),
             rs.getString("released_by"),
-            JdbcTimes.fromDb(rs.getObject("released_at", LocalDateTime.class)));
+            JdbcTimes.fromDb(rs.getObject("released_at", LocalDateTime.class)),
+            rs.getBigDecimal("combined_uncertainty"),
+            rs.getInt("threshold_version"),
+            rs.getBigDecimal("threshold_value"),
+            rs.getInt("budget_version"),
+            rs.getString("calc_spec"),
+            rs.getString("components_snapshot"));
 
     private final JdbcTemplate jdbc;
 
@@ -30,12 +38,18 @@ public class ReleaseRepository {
     }
 
     /**
-     * 追加一条放行历史。
+     * 追加一条放行历史（含不确定度预算快照）。
      */
-    public void insert(String batchId, long measurementId, String releasedBy, Instant releasedAt) {
-        jdbc.update("INSERT INTO release_record (batch_id, measurement_id, released_by, released_at) "
-                        + "VALUES (?, ?, ?, ?)",
-                batchId, measurementId, releasedBy, JdbcTimes.toDb(releasedAt));
+    public void insert(String batchId, long measurementId, String releasedBy, Instant releasedAt,
+                       BigDecimal combinedUncertainty, int thresholdVersion, BigDecimal thresholdValue,
+                       int budgetVersion, String calcSpec, String componentsSnapshot) {
+        jdbc.update("INSERT INTO release_record (batch_id, measurement_id, released_by, released_at, "
+                        + "combined_uncertainty, threshold_version, threshold_value, budget_version, "
+                        + "calc_spec, components_snapshot) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                batchId, measurementId, releasedBy, JdbcTimes.toDb(releasedAt),
+                combinedUncertainty, thresholdVersion, thresholdValue, budgetVersion,
+                calcSpec, componentsSnapshot);
     }
 
     /**

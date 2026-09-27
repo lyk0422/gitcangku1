@@ -31,10 +31,24 @@ class ReleaseApiTest {
 
     @BeforeEach
     void clean() {
+        jdbc.update("DELETE FROM idempotency_record");
+        jdbc.update("DELETE FROM uncertainty_budget_revision");
+        jdbc.update("DELETE FROM uncertainty_component");
+        jdbc.update("DELETE FROM uncertainty_threshold");
         jdbc.update("DELETE FROM release_record");
         jdbc.update("DELETE FROM measurement");
         jdbc.update("DELETE FROM calibration_certificate");
         jdbc.update("DELETE FROM instrument_lock");
+    }
+
+    private void setThreshold(String instrument, String maxUncertainty) throws Exception {
+        mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders
+                        .put("/api/instruments/{id}/uncertainty-threshold", instrument)
+                        .header("X-Actor-Id", "metrology")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"requestId\":\"" + java.util.UUID.randomUUID()
+                                + "\",\"maxUncertainty\":\"" + maxUncertainty + "\"}"))
+                .andExpect(status().isCreated());
     }
 
     private long createCert(String instrument, String a, String b) throws Exception {
@@ -44,6 +58,7 @@ class ReleaseApiTest {
                                  "validTo":"2028-01-01T00:00:00Z","a":"%s","b":"%s"}
                                 """.formatted(instrument, a, b)))
                 .andExpect(status().isCreated()).andReturn().getResponse().getContentAsString();
+        setThreshold(instrument, "1000");
         return ((Number) com.jayway.jsonpath.JsonPath.read(body, "$.id")).longValue();
     }
 
