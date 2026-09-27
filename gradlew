@@ -107,7 +107,7 @@ cygwin=false
 msys=false
 darwin=false
 nonstop=false
-case "$( uname )" in                #(
+case "$( command uname 2>/dev/null )" in    #(
   CYGWIN* )         cygwin=true  ;; #(
   Darwin* )         darwin=true  ;; #(
   MSYS* | MINGW* )  msys=true    ;; #(
@@ -216,36 +216,20 @@ set -- \
         -jar "$APP_HOME/gradle/wrapper/gradle-wrapper.jar" \
         "$@"
 
-# Stop when "xargs" is not available.
-if ! command -v xargs >/dev/null 2>&1
+# 精简环境兼容：缺少 xargs/sed/tr 时跳过引号解析，直接展开默认 JVM 参数。
+if command -v xargs >/dev/null 2>&1
 then
-    die "xargs is not available"
+    eval "set -- $(
+            printf '%s\n' "$DEFAULT_JVM_OPTS $JAVA_OPTS $GRADLE_OPTS" |
+            xargs -n1 |
+            sed ' s~[^-[:alnum:]+,./:=@_]~\\&~g; ' |
+            tr '\n' ' '
+        )" '"$@"'
+else
+    # 无 xargs 的最小环境：DEFAULT_JVM_OPTS 固定为 -Dfile.encoding=UTF-8 "-Xmx64m" "-Xms64m"，
+    # JAVA_OPTS/GRADLE_OPTS 视为不含引号的空白分隔参数直接展开。
+    # shellcheck disable=SC2086
+    set -- -Dfile.encoding=UTF-8 "-Xmx64m" "-Xms64m" $JAVA_OPTS $GRADLE_OPTS "$@"
 fi
-
-# Use "xargs" to parse quoted args.
-#
-# With -n1 it outputs one arg per line, with the quotes and backslashes removed.
-#
-# In Bash we could simply go:
-#
-#   readarray ARGS < <( xargs -n1 <<<"$var" ) &&
-#   set -- "${ARGS[@]}" "$@"
-#
-# but POSIX shell has neither arrays nor command substitution, so instead we
-# post-process each arg (as a line of input to sed) to backslash-escape any
-# character that might be a shell metacharacter, then use eval to reverse
-# that process (while maintaining the separation between arguments), and wrap
-# the whole thing up as a single "set" statement.
-#
-# This will of course break if any of these variables contains a newline or
-# an unmatched quote.
-#
-
-eval "set -- $(
-        printf '%s\n' "$DEFAULT_JVM_OPTS $JAVA_OPTS $GRADLE_OPTS" |
-        xargs -n1 |
-        sed ' s~[^-[:alnum:]+,./:=@_]~\\&~g; ' |
-        tr '\n' ' '
-    )" '"$@"'
 
 exec "$JAVACMD" "$@"
