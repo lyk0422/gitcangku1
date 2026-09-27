@@ -35,6 +35,11 @@ public class EvidenceService {
     static final String OP_SEAL_INSPECTION = "SEAL_INSPECTION";
     static final String OP_LOAN_BORROW = "LOAN_BORROW";
     static final String OP_LOAN_RETURN = "LOAN_RETURN";
+    static final String OP_LOCATION_CREATE = "LOCATION_CREATE";
+    static final String OP_LOCATION_DISABLE = "LOCATION_DISABLE";
+    static final String OP_MOVE_APPLY = "MOVE_APPLY";
+    static final String OP_MOVE_CONFIRM = "MOVE_CONFIRM";
+    static final String OP_MOVE_CANCEL = "MOVE_CANCEL";
 
     /**
      * 借出最长期限：72 小时。
@@ -46,6 +51,7 @@ public class EvidenceService {
     private final SealInspectionRepository inspectionRepository;
     private final LoanRecordRepository loanRepository;
     private final CommandLogRepository commandLogRepository;
+    private final StorageLocationRepository storageLocationRepository;
     private final ObjectMapper objectMapper;
     private final EvidenceClock clock;
 
@@ -54,6 +60,7 @@ public class EvidenceService {
                            SealInspectionRepository inspectionRepository,
                            LoanRecordRepository loanRepository,
                            CommandLogRepository commandLogRepository,
+                           StorageLocationRepository storageLocationRepository,
                            ObjectMapper objectMapper,
                            EvidenceClock clock) {
         this.evidenceRepository = evidenceRepository;
@@ -61,12 +68,14 @@ public class EvidenceService {
         this.inspectionRepository = inspectionRepository;
         this.loanRepository = loanRepository;
         this.commandLogRepository = commandLogRepository;
+        this.storageLocationRepository = storageLocationRepository;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
 
     /**
      * 证物入库：初始状态 SEALED，保管人为操作人。evidenceKey 全局唯一。
+     * 指定初始库位时库位必须存在且为 ACTIVE，初始库位版本号为 1；未指定则不在库（NULL，版本 0）。
      */
     @Transactional
     public StoredResponse intake(String actorId, IntakeRequest request, String requestHash) {
@@ -77,9 +86,17 @@ public class EvidenceService {
         if (evidenceRepository.findByKey(request.evidenceKey()).isPresent()) {
             throw ApiException.conflict("证物已存在: " + request.evidenceKey());
         }
+        String locationCode = normalizeLocation(request.locationCode());
+        if (locationCode != null) {
+            StorageLocation location = storageLocationRepository.findByCode(locationCode)
+                    .orElseThrow(() -> ApiException.notFound("库位不存在: " + locationCode));
+            if (location.status() == LocationStatus.DISABLED) {
+                throw ApiException.unprocessable("库位已停用，禁止入库: " + locationCode);
+            }
+        }
         LocalDateTime now = LocalDateTime.now();
         evidenceRepository.insert(request.evidenceKey(), request.caseKey(), request.category(),
-                request.sealNo(), actorId, now);
+                request.sealNo(), actorId, locationCode, now);
         Evidence evidence = evidenceRepository.findByKey(request.evidenceKey()).orElseThrow();
         return record(request.commandKey(), OP_INTAKE, actorId, requestHash, 201, toView(evidence));
     }
@@ -404,6 +421,7 @@ public class EvidenceService {
     private EvidenceView toView(Evidence evidence) {
         return new EvidenceView(evidence.evidenceKey(), evidence.caseKey(), evidence.category(),
                 evidence.sealNo(), evidence.custodianId(), evidence.status(),
+                evidence.locationCode(), evidence.locationVersion(),
                 evidence.createdAt(), evidence.updatedAt());
     }
 
@@ -424,5 +442,15 @@ public class EvidenceService {
         return new LoanView(loan.loanKey(), loan.evidenceKey(), loan.custodianId(),
                 loan.borrowerId(), loan.purpose(), loan.loanAt(), loan.dueAt(), loan.status(),
                 overdue, loan.sealPassed(), loan.returnNote(), loan.returnedAt());
+    }
+
+    /**
+     * 规范化可选库位编码：空白视为未指定（null）。
+     */
+    private static String normalizeLocation(String locationCode) {
+        if (locationCode == null || locationCode.isBlank()) {
+            return null;
+        }
+        return locationCode;
     }
 }

@@ -12,7 +12,8 @@ import java.util.Optional;
 
 /**
  * 证物表访问。状态与保管人变更必须先通过 {@link #findByKeyForUpdate} 锁定证物行，
- * 保证并发交接/取消/核验按事务提交顺序生效。
+ * 集合迁移通过 {@link #findByKeysForUpdateOrdered} 按升序逐行加锁，避免死锁，
+ * 保证并发交接/取消/核验/迁移按事务提交顺序生效。
  */
 @Repository
 public class EvidenceRepository {
@@ -26,17 +27,19 @@ public class EvidenceRepository {
     }
 
     /**
-     * 插入新证物，初始状态 SEALED，保管人为入库操作人。
+     * 插入新证物，初始状态 SEALED，保管人为入库操作人；
+     * 指定初始库位时库位版本号为 1，否则库位为 NULL、版本号为 0。
      */
     public void insert(String evidenceKey, String caseKey, String category, String sealNo,
-                       String custodianId, LocalDateTime now) {
+                       String custodianId, String locationCode, LocalDateTime now) {
         jdbc.update("""
                         INSERT INTO evidence
-                            (evidence_key, case_key, category, seal_no, custodian_id, status, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            (evidence_key, case_key, category, seal_no, custodian_id, status,
+                             location_code, location_version, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                 evidenceKey, caseKey, category, sealNo, custodianId,
-                EvidenceStatus.SEALED.name(), now, now);
+                EvidenceStatus.SEALED.name(), locationCode, locationCode == null ? 0L : 1L, now, now);
     }
 
     /**
@@ -55,6 +58,21 @@ public class EvidenceRepository {
         List<Evidence> rows = jdbc.query(
                 "SELECT * FROM evidence WHERE evidence_key = ? FOR UPDATE", ROW_MAPPER, evidenceKey);
         return rows.stream().findFirst();
+    }
+
+    /**
+     * 按业务键集合查询并逐行锁定（调用方须传入升序去重集合，保证多事务加锁顺序一致）。
+     * 用于库位迁移的集合级前置校验与原子更新。
+     */
+    public List<Evidence> findByKeysForUpdateOrdered(List<String> evidenceKeys) {
+        if (evidenceKeys.isEmpty()) {
+            return List.of();
+        }
+        String placeholders = String.join(",", evidenceKeys.stream().map(k -> "?").toList());
+        return jdbc.query(
+                "SELECT * FROM evidence WHERE evidence_key IN (" + placeholders
+                        + ") ORDER BY evidence_key FOR UPDATE",
+                ROW_MAPPER, evidenceKeys.toArray());
     }
 
     /**
@@ -77,12 +95,39 @@ public class EvidenceRepository {
     }
 
     /**
+     * 库位迁移：仅当证物仍在源库位且版本号为期望值时，原子更新目标库位与版本号 +1。
+     *
+     * @return 是否更新成功（false 表示已被并发迁移、借出归还改库位等前置条件不再满足）
+     */
+    public boolean updateLocation(String evidenceKey, String sourceLocationCode,
+                                  String targetLocationCode, long expectedVersion,
+                                  LocalDateTime now) {
+        int updated = jdbc.update("""
+                        UPDATE evidence
+                        SET location_code = ?, location_version = ?, updated_at = ?
+                        WHERE evidence_key = ? AND location_code = ? AND location_version = ?
+                        """,
+                targetLocationCode, expectedVersion + 1, now,
+                evidenceKey, sourceLocationCode, expectedVersion);
+        return updated == 1;
+    }
+
+    /**
      * 查询指定保管人当前可交接的证物（本人保管且状态 SEALED）。
      */
     public List<Evidence> findTransferable(String custodianId) {
         return jdbc.query(
                 "SELECT * FROM evidence WHERE custodian_id = ? AND status = ? ORDER BY id",
                 ROW_MAPPER, custodianId, EvidenceStatus.SEALED.name());
+    }
+
+    /**
+     * 查询指定库位当前库存（当前库位等于该库位的全部证物），按证物键排序。
+     */
+    public List<Evidence> findByLocation(String locationCode) {
+        return jdbc.query(
+                "SELECT * FROM evidence WHERE location_code = ? ORDER BY evidence_key",
+                ROW_MAPPER, locationCode);
     }
 
     private static final class EvidenceRowMapper implements RowMapper<Evidence> {
@@ -96,6 +141,8 @@ public class EvidenceRepository {
                     rs.getString("seal_no"),
                     rs.getString("custodian_id"),
                     EvidenceStatus.valueOf(rs.getString("status")),
+                    rs.getString("location_code"),
+                    rs.getLong("location_version"),
                     rs.getObject("created_at", LocalDateTime.class),
                     rs.getObject("updated_at", LocalDateTime.class));
         }

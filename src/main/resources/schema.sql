@@ -9,7 +9,9 @@ CREATE TABLE IF NOT EXISTS evidence (
     category VARCHAR(64) NOT NULL COMMENT '证物类别，入库后不可修改',
     seal_no VARCHAR(64) NOT NULL COMMENT '封条编号，入库后不可修改',
     custodian_id VARCHAR(64) NOT NULL COMMENT '当前保管人（操作人标识），交接接受后原子切换；借出期间不变',
-    status VARCHAR(20) NOT NULL COMMENT '证物状态：SEALED 已封存 / TRANSFER_PENDING 待接收 / BORROWED 借出未归还 / SEAL_BROKEN 封条异常（终态）',
+    status VARCHAR(20) NOT NULL COMMENT '证物状态：SEALED 已封存 / TRANSFER_PENDING 待接收（待核验）/ BORROWED 借出未归还 / SEAL_BROKEN 封条异常（终态）',
+    location_code VARCHAR(64) NULL COMMENT '当前库位编码；NULL 表示未分配库位（不在库），仅随双人确认迁移变更',
+    location_version BIGINT NOT NULL COMMENT '库位版本号，自 1 起，每次迁移完成 +1，用于迁移申请 expectedVersion 乐观校验',
     created_at DATETIME(6) NOT NULL COMMENT '入库时间，Asia/Shanghai',
     updated_at DATETIME(6) NOT NULL COMMENT '最近一次状态或保管人变更时间，Asia/Shanghai',
     CONSTRAINT uk_evidence_key UNIQUE (evidence_key)
@@ -65,10 +67,58 @@ CREATE TABLE IF NOT EXISTS command_log (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     command_key VARCHAR(64) NOT NULL COMMENT '幂等命令键，全局唯一',
     actor_id VARCHAR(64) NOT NULL COMMENT '发起操作人',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN/LOCATION_CREATE/LOCATION_DISABLE/MOVE_APPLY/MOVE_CONFIRM/MOVE_CANCEL',
     request_hash VARCHAR(64) NOT NULL COMMENT '请求参数规范化后的 SHA-256，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行的 HTTP 状态码',
     response_body TEXT NOT NULL COMMENT '首次执行的响应体 JSON，重放时原样返回',
     created_at DATETIME(6) NOT NULL COMMENT '首次执行时间，Asia/Shanghai',
     CONSTRAINT uk_command_key UNIQUE (command_key)
+);
+
+-- 库位表：location_code 全局唯一；停用后不可作为迁移目标，历史迁移不受影响。
+CREATE TABLE IF NOT EXISTS storage_location (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    location_code VARCHAR(64) NOT NULL COMMENT '库位编码，全局唯一',
+    location_name VARCHAR(128) NOT NULL COMMENT '库位名称',
+    status VARCHAR(20) NOT NULL COMMENT '库位状态：ACTIVE 可用 / DISABLED 已停用（不可再作为迁移目标）',
+    created_at DATETIME(6) NOT NULL COMMENT '创建时间，Asia/Shanghai',
+    updated_at DATETIME(6) NOT NULL COMMENT '最近一次状态变更时间，Asia/Shanghai',
+    CONSTRAINT uk_location_code UNIQUE (location_code)
+);
+
+-- 库位迁移单：move_key 全局唯一（即迁移申请命令键）；双人确认制。
+-- 首人确认（申请）后进入 AWAITING_SECOND，可撤销；第二人确认完成后 COMPLETED，不可再变。
+-- 迁移单只追加一次、条件更新一次（完成或撤销），历史字段不可改写。
+CREATE TABLE IF NOT EXISTS location_move_order (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    move_key VARCHAR(64) NOT NULL COMMENT '迁移业务键，全局唯一；同键同参重放返回首次结果',
+    evidence_keys TEXT NOT NULL COMMENT '规范化（升序去重）证物集合 JSON 数组；换序视为同参',
+    source_location_code VARCHAR(64) NOT NULL COMMENT '源库位编码，全部证物当前库位必须等于该库位',
+    target_location_code VARCHAR(64) NOT NULL COMMENT '目标库位编码，必须存在且未停用',
+    expected_version BIGINT NOT NULL COMMENT '期望的每件证物库位版本号，迁移前置校验用',
+    requested_by VARCHAR(64) NOT NULL COMMENT '首人确认（申请）操作人',
+    status VARCHAR(20) NOT NULL COMMENT '迁移单状态：AWAITING_SECOND 待第二人确认 / COMPLETED 已完成 / CANCELLED 已撤销',
+    first_confirmed_by VARCHAR(64) NOT NULL COMMENT '首人确认操作人（与 requested_by 相同）',
+    first_confirmed_at DATETIME(6) NOT NULL COMMENT '首人确认时间，Asia/Shanghai',
+    second_confirmed_by VARCHAR(64) NULL COMMENT '第二人确认操作人，必须与首人不同；NULL 表示未确认',
+    second_confirmed_at DATETIME(6) NULL COMMENT '第二人确认时间，Asia/Shanghai；NULL 表示未确认',
+    cancelled_by VARCHAR(64) NULL COMMENT '撤销操作人（仅首人确认人）；NULL 表示未撤销',
+    cancelled_at DATETIME(6) NULL COMMENT '撤销时间，Asia/Shanghai；NULL 表示未撤销',
+    created_at DATETIME(6) NOT NULL COMMENT '迁移单创建时间，Asia/Shanghai',
+    CONSTRAINT uk_move_key UNIQUE (move_key)
+);
+
+-- 迁移封签核验快照：第二人确认时对每件证物写入一条，只追加、不可变。
+CREATE TABLE IF NOT EXISTS location_move_seal_snapshot (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    move_key VARCHAR(64) NOT NULL COMMENT '关联迁移业务键',
+    evidence_key VARCHAR(64) NOT NULL COMMENT '关联证物业务键',
+    seal_no VARCHAR(64) NOT NULL COMMENT '迁移确认时刻的封条编号快照',
+    seal_intact TINYINT NOT NULL COMMENT '迁移确认时刻封条状态：1 正常 / 0 异常（异常则整单回滚，不会产生快照）',
+    location_code VARCHAR(64) NOT NULL COMMENT '迁移确认时刻的源库位编码快照',
+    location_version BIGINT NOT NULL COMMENT '迁移确认时刻的库位版本号快照（迁移前版本）',
+    checked_by VARCHAR(64) NOT NULL COMMENT '第二人确认操作人',
+    checked_at DATETIME(6) NOT NULL COMMENT '快照写入时间，Asia/Shanghai',
+    KEY idx_snapshot_move (move_key),
+    KEY idx_snapshot_evidence (evidence_key)
 );

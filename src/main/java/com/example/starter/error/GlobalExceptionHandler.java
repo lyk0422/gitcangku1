@@ -12,6 +12,7 @@ import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
 import java.time.LocalDateTime;
+import java.util.List;
 import java.util.stream.Collectors;
 
 /**
@@ -26,6 +27,13 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorBody> handleApi(ApiException ex) {
         return ResponseEntity.status(ex.status())
                 .body(new ErrorBody(ex.status().value(), ex.getMessage(), LocalDateTime.now()));
+    }
+
+    @ExceptionHandler(MovePreconditionException.class)
+    public ResponseEntity<MoveErrorBody> handleMovePrecondition(MovePreconditionException ex) {
+        return ResponseEntity.status(ex.status())
+                .body(new MoveErrorBody(ex.status().value(), ex.getMessage(), ex.items(),
+                        LocalDateTime.now()));
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
@@ -59,5 +67,18 @@ public class GlobalExceptionHandler {
      * @param timestamp 发生时间（Asia/Shanghai）
      */
     public record ErrorBody(int status, String message, LocalDateTime timestamp) {
+    }
+
+    /**
+     * 迁移前置校验失败错误响应体：在统一错误体基础上附带逐项失败说明。
+     *
+     * @param status    HTTP 状态码（422）
+     * @param message   错误描述
+     * @param items     逐项失败说明（证物键 + 原因）
+     * @param timestamp 发生时间（Asia/Shanghai）
+     */
+    public record MoveErrorBody(int status, String message,
+                                List<com.example.starter.evidence.dto.MoveItemFailure> items,
+                                LocalDateTime timestamp) {
     }
 }
