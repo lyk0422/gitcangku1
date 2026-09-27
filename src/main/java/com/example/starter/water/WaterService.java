@@ -46,12 +46,14 @@ public class WaterService {
     private static final Pattern KEY_PATTERN = Pattern.compile("[\\w.\\-:]{1,128}");
 
     private final WaterRepository repository;
+    private final MeterRepository meterRepository;
     private final TransactionTemplate tx;
     private final ObjectMapper objectMapper;
 
-    public WaterService(WaterRepository repository, PlatformTransactionManager transactionManager,
-                        ObjectMapper objectMapper) {
+    public WaterService(WaterRepository repository, MeterRepository meterRepository,
+                        PlatformTransactionManager transactionManager, ObjectMapper objectMapper) {
         this.repository = repository;
+        this.meterRepository = meterRepository;
         this.tx = new TransactionTemplate(transactionManager);
         this.objectMapper = objectMapper;
     }
@@ -118,6 +120,13 @@ public class WaterService {
                 throw ApiException.notFound("ALLOCATION_NOT_FOUND", "配水申请不存在: " + allocationKey);
             }
             WindowRow window = lockWindowOf(allocation);
+            // 窗口锁内再锁渠道计量点行，与读数提交、异常解除按事务提交顺序裁决：
+            // 异常先提交（渠道冻结）则本笔核销被拦截；解除先提交则放行
+            if (meterRepository.lockChannel(window.channelId()) != null
+                    && meterRepository.countActiveAnomalies(window.channelId()) > 0) {
+                throw ApiException.unprocessable("CHANNEL_FROZEN",
+                        "渠道 " + window.channelId() + " 存在未解除的传感异常，已冻结新核销");
+            }
             // 窗口锁内重读申请，避免与转让/取消并发时使用过期状态与持有额度
             allocation = repository.lockAllocationByKey(allocationKey);
             switch (allocation.status()) {
