@@ -8,7 +8,7 @@ import java.util.Optional;
 
 /**
  * 观测记录持久化：维护 observation_current 当前状态与 observation_version 完整历史快照。
- * 所有 SQL 使用参数化查询。
+ * 所有 SQL 使用参数化查询。维护窗口字段随版本固化写入，历史快照不提供更新接口。
  */
 @Repository
 public class ObservationRepository {
@@ -19,7 +19,10 @@ public class ObservationRepository {
             rs.getString("location"),
             rs.getString("reading"),
             rs.getString("note"),
-            rs.getBoolean("deleted"));
+            rs.getBoolean("deleted"),
+            rs.getBoolean("maintenance_affected"),
+            rs.getString("maintenance_window_id"),
+            (Integer) rs.getObject("maintenance_window_version"));
 
     private final JdbcTemplate jdbcTemplate;
 
@@ -32,7 +35,8 @@ public class ObservationRepository {
      */
     public Optional<ObservationSnapshot> findCurrent(String observationId) {
         return jdbcTemplate.query(
-                        "SELECT observation_id, version, location, reading, note, deleted "
+                        "SELECT observation_id, version, location, reading, note, deleted, "
+                                + "maintenance_affected, maintenance_window_id, maintenance_window_version "
                                 + "FROM observation_current WHERE observation_id = ?",
                         SNAPSHOT_MAPPER, observationId)
                 .stream().findFirst();
@@ -43,7 +47,8 @@ public class ObservationRepository {
      */
     public Optional<ObservationSnapshot> findCurrentForUpdate(String observationId) {
         return jdbcTemplate.query(
-                        "SELECT observation_id, version, location, reading, note, deleted "
+                        "SELECT observation_id, version, location, reading, note, deleted, "
+                                + "maintenance_affected, maintenance_window_id, maintenance_window_version "
                                 + "FROM observation_current WHERE observation_id = ? FOR UPDATE",
                         SNAPSHOT_MAPPER, observationId)
                 .stream().findFirst();
@@ -54,36 +59,42 @@ public class ObservationRepository {
      */
     public Optional<ObservationSnapshot> findVersion(String observationId, int version) {
         return jdbcTemplate.query(
-                        "SELECT observation_id, version, location, reading, note, deleted "
+                        "SELECT observation_id, version, location, reading, note, deleted, "
+                                + "maintenance_affected, maintenance_window_id, maintenance_window_version "
                                 + "FROM observation_version WHERE observation_id = ? AND version = ?",
                         SNAPSHOT_MAPPER, observationId, version)
                 .stream().findFirst();
     }
 
     /**
-     * 插入新记录的当前状态（version = 1）。
+     * 插入新记录的当前状态（version = 1），不携带维护窗口信息。
      */
     public void insertCurrent(ObservationSnapshot snapshot) {
         jdbcTemplate.update(
-                "INSERT INTO observation_current (observation_id, location, reading, note, version, deleted, updated_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                "INSERT INTO observation_current (observation_id, location, reading, note, version, deleted, "
+                        + "maintenance_affected, maintenance_window_id, maintenance_window_version, updated_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                 snapshot.observationId(), snapshot.location(), snapshot.reading(), snapshot.note(),
-                snapshot.version(), snapshot.deleted());
+                snapshot.version(), snapshot.deleted(), snapshot.maintenanceAffected(),
+                snapshot.maintenanceWindowId(), snapshot.maintenanceWindowVersion());
     }
 
     /**
-     * 更新当前状态为新版本内容。
+     * 更新当前状态为新版本内容（常规三方合并/解决路径，维护字段透传快照值）。
      */
     public void updateCurrent(ObservationSnapshot snapshot) {
         jdbcTemplate.update(
                 "UPDATE observation_current SET location = ?, reading = ?, note = ?, version = ?, deleted = ?, "
+                        + "maintenance_affected = ?, maintenance_window_id = ?, maintenance_window_version = ?, "
                         + "updated_at = CURRENT_TIMESTAMP WHERE observation_id = ?",
                 snapshot.location(), snapshot.reading(), snapshot.note(),
-                snapshot.version(), snapshot.deleted(), snapshot.observationId());
+                snapshot.version(), snapshot.deleted(), snapshot.maintenanceAffected(),
+                snapshot.maintenanceWindowId(), snapshot.maintenanceWindowVersion(),
+                snapshot.observationId());
     }
 
     /**
-     * 将当前状态标记为删除墓碑：版本号前进，业务字段保留原值（查询时不返回）。
+     * 将当前状态标记为删除墓碑：版本号前进，业务字段保留原值（查询时不返回）；维护固化字段原样保留。
      */
     public void markDeleted(String observationId, int newVersion) {
         jdbcTemplate.update(
@@ -93,13 +104,16 @@ public class ObservationRepository {
     }
 
     /**
-     * 追加一条完整版本快照，历史永不删除。
+     * 追加一条完整版本快照，历史永不删除；维护标记与窗口标识按快照固化写入。
      */
     public void insertVersion(ObservationSnapshot snapshot) {
         jdbcTemplate.update(
-                "INSERT INTO observation_version (observation_id, version, location, reading, note, deleted, created_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                "INSERT INTO observation_version (observation_id, version, location, reading, note, deleted, "
+                        + "maintenance_affected, maintenance_window_id, maintenance_window_version, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                 snapshot.observationId(), snapshot.version(), snapshot.location(),
-                snapshot.reading(), snapshot.note(), snapshot.deleted());
+                snapshot.reading(), snapshot.note(), snapshot.deleted(),
+                snapshot.maintenanceAffected(), snapshot.maintenanceWindowId(),
+                snapshot.maintenanceWindowVersion());
     }
 }

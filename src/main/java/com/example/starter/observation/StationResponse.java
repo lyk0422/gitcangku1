@@ -1,0 +1,18 @@
+package com.example.starter.observation;
+
+import java.time.Instant;
+
+/**
+ * 观测站响应。
+ *
+ * @param stationId      观测站唯一标识
+ * @param activatedAtUtc 站点启用时刻（UTC）
+ */
+public record StationResponse(
+        String stationId,
+        Instant activatedAtUtc) {
+
+    public static StationResponse of(Station station) {
+        return new StationResponse(station.stationId(), station.activatedAtUtc());
+    }
+}
