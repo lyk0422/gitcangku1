@@ -38,10 +38,15 @@ public class EquipmentRepository {
         return rs.getObject(column, OffsetDateTime.class).toInstant();
     }
 
+    private static final String EQUIPMENT_COLUMNS =
+            "equipment_id, maintenance_period_minutes, version, template_id, current_cycle_no";
+
     private static final RowMapper<Equipment> EQUIPMENT_MAPPER = (rs, rowNum) -> new Equipment(
             rs.getString("equipment_id"),
             rs.getLong("maintenance_period_minutes"),
-            rs.getLong("version"));
+            rs.getLong("version"),
+            rs.getString("template_id"),
+            rs.getLong("current_cycle_no"));
 
     private static final RowMapper<Reading> READING_MAPPER = (rs, rowNum) -> new Reading(
             rs.getString("equipment_id"),
@@ -61,15 +66,16 @@ public class EquipmentRepository {
 
     // ---------- 设备 ----------
 
-    public void insertEquipment(String equipmentId, long maintenancePeriodMinutes, Instant createdAt) {
-        jdbc.update("INSERT INTO equipment (equipment_id, maintenance_period_minutes, version, created_at)"
-                        + " VALUES (?, ?, 1, ?)",
-                equipmentId, maintenancePeriodMinutes, utc(createdAt));
+    public void insertEquipment(String equipmentId, long maintenancePeriodMinutes, String templateId,
+                                Instant createdAt) {
+        jdbc.update("INSERT INTO equipment (equipment_id, maintenance_period_minutes, version,"
+                        + " template_id, current_cycle_no, created_at) VALUES (?, ?, 1, ?, 1, ?)",
+                equipmentId, maintenancePeriodMinutes, templateId, utc(createdAt));
     }
 
     public Optional<Equipment> findEquipment(String equipmentId) {
         List<Equipment> rows = jdbc.query(
-                "SELECT equipment_id, maintenance_period_minutes, version FROM equipment WHERE equipment_id = ?",
+                "SELECT " + EQUIPMENT_COLUMNS + " FROM equipment WHERE equipment_id = ?",
                 EQUIPMENT_MAPPER, equipmentId);
         return rows.stream().findFirst();
     }
@@ -77,7 +83,7 @@ public class EquipmentRepository {
     /** 悲观行锁：同一设备的写操作串行化，保证版本校验与业务变更原子。 */
     public Optional<Equipment> findEquipmentForUpdate(String equipmentId) {
         List<Equipment> rows = jdbc.query(
-                "SELECT equipment_id, maintenance_period_minutes, version FROM equipment"
+                "SELECT " + EQUIPMENT_COLUMNS + " FROM equipment"
                         + " WHERE equipment_id = ? FOR UPDATE",
                 EQUIPMENT_MAPPER, equipmentId);
         return rows.stream().findFirst();
@@ -85,6 +91,12 @@ public class EquipmentRepository {
 
     public void incrementVersion(String equipmentId) {
         jdbc.update("UPDATE equipment SET version = version + 1 WHERE equipment_id = ?", equipmentId);
+    }
+
+    /** 双人确认完工后进入下一保养周期。 */
+    public void incrementCycle(String equipmentId) {
+        jdbc.update("UPDATE equipment SET current_cycle_no = current_cycle_no + 1"
+                + " WHERE equipment_id = ?", equipmentId);
     }
 
     // ---------- 读数 ----------
@@ -232,6 +244,16 @@ public class EquipmentRepository {
                 "SELECT COUNT(*) FROM maintenance WHERE equipment_id = ? AND reading_id = ?",
                 Integer.class, equipmentId, readingId);
         return count != null && count > 0;
+    }
+
+    /** 按标识查询保养记录（限定设备，防止跨设备引用）。 */
+    public Optional<MaintenanceRecord> findMaintenance(String equipmentId, long maintenanceId) {
+        List<MaintenanceRecord> rows = jdbc.query(
+                "SELECT maintenance_id, equipment_id, reading_id, anchor_revision_no,"
+                        + " anchor_sampled_at, anchor_cumulative_minutes, completed_at"
+                        + " FROM maintenance WHERE equipment_id = ? AND maintenance_id = ?",
+                MAINTENANCE_MAPPER, equipmentId, maintenanceId);
+        return rows.stream().findFirst();
     }
 
     // ---------- 幂等去重 ----------

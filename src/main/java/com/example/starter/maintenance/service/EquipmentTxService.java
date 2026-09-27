@@ -2,6 +2,7 @@ package com.example.starter.maintenance.service;
 
 import java.time.Clock;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 
@@ -9,6 +10,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import com.example.starter.maintenance.api.ApiException;
+import com.example.starter.maintenance.api.ErrorDetail;
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
@@ -22,6 +24,7 @@ import com.example.starter.maintenance.domain.Equipment;
 import com.example.starter.maintenance.domain.MaintenanceRecord;
 import com.example.starter.maintenance.domain.Reading;
 import com.example.starter.maintenance.store.EquipmentRepository;
+import com.example.starter.maintenance.store.EvidenceRepository;
 
 /**
  * 设备工时保养事务业务服务。写操作流程：设备行锁 → 幂等判定 → 版本校验 → 业务规则 → 变更并版本加一。
@@ -31,12 +34,18 @@ import com.example.starter.maintenance.store.EquipmentRepository;
 public class EquipmentTxService {
 
     private final EquipmentRepository repository;
+    private final EvidenceRepository evidenceRepository;
     private final IdempotencyService idempotency;
+    private final EvidenceRules evidenceRules;
     private final Clock clock;
 
-    public EquipmentTxService(EquipmentRepository repository, IdempotencyService idempotency, Clock clock) {
+    public EquipmentTxService(EquipmentRepository repository, EvidenceRepository evidenceRepository,
+                              IdempotencyService idempotency, EvidenceRules evidenceRules,
+                              Clock clock) {
         this.repository = repository;
+        this.evidenceRepository = evidenceRepository;
         this.idempotency = idempotency;
+        this.evidenceRules = evidenceRules;
         this.clock = clock;
     }
 
@@ -44,14 +53,21 @@ public class EquipmentTxService {
 
     @Transactional
     public EquipmentResponse register(RegisterEquipmentRequest req) {
-        String fingerprint = req.equipmentId() + "|" + req.maintenancePeriodMinutes();
+        String fingerprint = req.equipmentId() + "|" + req.maintenancePeriodMinutes() + "|" + req.templateId();
         return idempotency.execute(req.requestId(), "REGISTER_EQUIPMENT", fingerprint,
                 EquipmentResponse.class, () -> {
                     if (repository.findEquipment(req.equipmentId()).isPresent()) {
                         throw ApiException.conflict("EQUIPMENT_EXISTS", "设备已存在：" + req.equipmentId());
                     }
-                    repository.insertEquipment(req.equipmentId(), req.maintenancePeriodMinutes(), clock.instant());
-                    return new EquipmentResponse(req.equipmentId(), req.maintenancePeriodMinutes(), 1L);
+                    if (req.templateId() != null
+                            && evidenceRepository.findTemplateCurrentVersion(req.templateId()).isEmpty()) {
+                        throw ApiException.notFound("TEMPLATE_NOT_FOUND",
+                                "保养模板不存在：" + req.templateId());
+                    }
+                    repository.insertEquipment(req.equipmentId(), req.maintenancePeriodMinutes(),
+                            req.templateId(), clock.instant());
+                    return new EquipmentResponse(req.equipmentId(), req.maintenancePeriodMinutes(), 1L,
+                            req.templateId(), 1L);
                 });
     }
 
@@ -139,6 +155,28 @@ public class EquipmentTxService {
                         throw ApiException.unprocessable("ANCHOR_TIME_NOT_LATER",
                                 "保养锚点时间必须晚于上次保养锚点时间");
                     }
+                    // 证据包门禁：OVERDUE 一律禁止完成；模板设备证据包未齐/存在 FAIL 时 422 列明细，
+                    // 证据包齐备时仍须走双人完工确认端点（提交人不能确认完工）。
+                    EvidenceDiagnostics diagnostics = evidenceRules.diagnose(equipment);
+                    if (diagnostics.overdue()) {
+                        long overdueLimit = equipment.maintenancePeriodMinutes()
+                                * EvidenceTxService.OVERDUE_MULTIPLE;
+                        throw ApiException.unprocessable("EQUIPMENT_OVERDUE",
+                                "设备已 OVERDUE，禁止完成保养",
+                                List.of(ErrorDetail.ofQuantity("EQUIPMENT_OVERDUE", equipmentId,
+                                        "本轮运行分钟达到保养周期 " + EvidenceTxService.OVERDUE_MULTIPLE
+                                                + " 倍",
+                                        diagnostics.runMinutes(), overdueLimit)));
+                    }
+                    if (equipment.templateId() != null) {
+                        if (!diagnostics.readyForCompletion()) {
+                            throw ApiException.unprocessable("EVIDENCE_NOT_READY",
+                                    "证据包未齐或存在 FAIL 项，不能完成保养",
+                                    buildGateDetails(diagnostics));
+                        }
+                        throw ApiException.unprocessable("DUAL_CONFIRMATION_REQUIRED",
+                                "设备已启用保养模板，须由另一维护角色通过完工确认端点完成保养");
+                    }
                     Instant now = clock.instant();
                     long maintenanceId = repository.insertMaintenance(equipmentId, req.readingId(),
                             req.anchorRevisionNo(), anchor.sampledAt(), anchor.cumulativeMinutes(),
@@ -148,6 +186,26 @@ public class EquipmentTxService {
                             req.anchorRevisionNo(), anchor.sampledAt(), anchor.cumulativeMinutes(),
                             now, equipment.version() + 1);
                 });
+    }
+
+    /** 既有完成保养门禁的 422 明细：缺失必检项、FAIL 项、已撤销材料、缺少材料摘要。 */
+    private List<ErrorDetail> buildGateDetails(EvidenceDiagnostics d) {
+        List<ErrorDetail> details = new ArrayList<>();
+        for (String code : d.missingRequiredItems()) {
+            details.add(ErrorDetail.of("MISSING_REQUIRED_ITEM", code,
+                    "必检项缺少 PASS 结果：" + code));
+        }
+        for (String code : d.failedItems()) {
+            details.add(ErrorDetail.of("FAILED_ITEM", code, "检查项结果为 FAIL：" + code));
+        }
+        for (String batch : d.revokedMaterials()) {
+            details.add(ErrorDetail.of("REVOKED_MATERIAL", batch,
+                    "证据包引用了已撤销（或不存在）的材料批次：" + batch));
+        }
+        if (d.materialCount() == 0) {
+            details.add(ErrorDetail.of("MATERIAL_REQUIRED", null, "证据包缺少材料批次摘要（至少 1 个）"));
+        }
+        return details;
     }
 
     // ---------- 查询 ----------
@@ -161,11 +219,12 @@ public class EquipmentTxService {
         long latestCumulative = latest.map(Reading::cumulativeMinutes).orElse(0L);
         long anchorCumulative = last.map(MaintenanceRecord::anchorCumulativeMinutes).orElse(0L);
         long runMinutes = latestCumulative - anchorCumulative;
-        String status = runMinutes >= equipment.maintenancePeriodMinutes() ? "DUE" : "OK";
-        return new StatusResponse(equipmentId, equipment.version(), equipment.maintenancePeriodMinutes(),
+        long period = equipment.maintenancePeriodMinutes();
+        String status = runMinutes >= period * 2 ? "OVERDUE" : runMinutes >= period ? "DUE" : "OK";
+        return new StatusResponse(equipmentId, equipment.version(), period,
                 latest.map(Reading::sampledAt).orElse(null), latestCumulative,
                 last.map(MaintenanceRecord::anchorSampledAt).orElse(null), anchorCumulative,
-                runMinutes, status);
+                runMinutes, period - runMinutes, status);
     }
 
     @Transactional(readOnly = true)
