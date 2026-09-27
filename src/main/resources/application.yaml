@@ -38,3 +38,7 @@ management:
   endpoint:
     health:
       show-details: never
+
+airspace:
+  # 授权创建/撤销应急走廊的调度员名单；为空表示不限制
+  authorized-dispatchers: ops-lead,emergency-desk

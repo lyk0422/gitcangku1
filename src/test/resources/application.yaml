@@ -11,3 +11,7 @@ spring:
     init:
       mode: always
       schema-locations: classpath:schema.sql
+
+airspace:
+  # 测试用授权调度员名单
+  authorized-dispatchers: ops-lead,emergency-desk

@@ -7,9 +7,10 @@ import java.util.List;
 /**
  * 航线当前状态记录（点列为当前版本的点）。
  *
- * @param routeId 航线唯一标识
- * @param version 当前航线版本（从 1 开始）
- * @param points  当前版本有序航点
+ * @param routeId   航线唯一标识
+ * @param version   当前航线版本（从 1 开始）
+ * @param points    当前版本有序航点
+ * @param routeType 航线类型：REGULAR 常规 / EMERGENCY 应急
  */
-public record RoutePo(String routeId, int version, List<Point> points) {
+public record RoutePo(String routeId, int version, List<Point> points, String routeType) {
 }

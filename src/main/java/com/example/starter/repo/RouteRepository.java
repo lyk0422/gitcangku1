@@ -21,18 +21,7 @@ public class RouteRepository {
 
     /** 按 routeId 查询航线（含当前版本点列），不存在返回 null。 */
     public RoutePo findRoute(String routeId) {
-        Integer version;
-        try {
-            version = jdbc.queryForObject(
-                    "SELECT version FROM route WHERE route_id = ?", Integer.class, routeId);
-        } catch (EmptyResultDataAccessException ex) {
-            return null;
-        }
-        if (version == null) {
-            return null;
-        }
-        List<Point> points = findPoints(routeId);
-        return new RoutePo(routeId, version, points);
+        return findRouteRow(routeId, false);
     }
 
     /**
@@ -44,18 +33,26 @@ public class RouteRepository {
      * @return 航线当前状态；航线不存在返回 null（更新 0 行）
      */
     public RoutePo findRouteForUpdate(String routeId) {
-        int locked = jdbc.update(
-                "UPDATE route SET touch = touch + 1 WHERE route_id = ?", routeId);
-        if (locked == 0) {
+        return findRouteRow(routeId, true);
+    }
+
+    private RoutePo findRouteRow(String routeId, boolean forUpdate) {
+        if (forUpdate) {
+            int locked = jdbc.update(
+                    "UPDATE route SET touch = touch + 1 WHERE route_id = ?", routeId);
+            if (locked == 0) {
+                return null;
+            }
+        }
+        try {
+            return jdbc.queryForObject(
+                    "SELECT version, route_type FROM route WHERE route_id = ?",
+                    (rs, n) -> new RoutePo(routeId, rs.getInt("version"),
+                            findPoints(routeId), rs.getString("route_type")),
+                    routeId);
+        } catch (EmptyResultDataAccessException ex) {
             return null;
         }
-        Integer version = jdbc.queryForObject(
-                "SELECT version FROM route WHERE route_id = ?", Integer.class, routeId);
-        if (version == null) {
-            return null;
-        }
-        List<Point> points = findPoints(routeId);
-        return new RoutePo(routeId, version, points);
     }
 
     private List<Point> findPoints(String routeId) {
@@ -65,8 +62,9 @@ public class RouteRepository {
     }
 
     /** 创建航线（初始版本 1）并写入点列（调用方负责事务）。 */
-    public void insertRoute(String routeId, List<Point> points) {
-        jdbc.update("INSERT INTO route (route_id, version, touch) VALUES (?, 1, 0)", routeId);
+    public void insertRoute(String routeId, List<Point> points, String routeType) {
+        jdbc.update("INSERT INTO route (route_id, version, touch, route_type) VALUES (?, 1, 0, ?)",
+                routeId, routeType);
         insertPoints(routeId, points);
     }
 
