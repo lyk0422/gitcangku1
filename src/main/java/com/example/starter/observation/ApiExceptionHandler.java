@@ -1,5 +1,6 @@
 package com.example.starter.observation;
 
+import com.example.starter.sampling.SamplingException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.validation.FieldError;
@@ -23,6 +24,17 @@ public class ApiExceptionHandler {
         HttpStatus status = ex.status();
         ErrorResponse body = new ErrorResponse(status.value(), status.getReasonPhrase(),
                 ex.getMessage(), ex.conflictFields(), ex.currentVersion());
+        return ResponseEntity.status(status).body(body);
+    }
+
+    /**
+     * 采样许可异常：携带可区分的失败原因码（如 NO_PERMIT、PERMIT_LIMIT_EXCEEDED）。
+     */
+    @ExceptionHandler(SamplingException.class)
+    public ResponseEntity<ErrorResponse> handleSamplingException(SamplingException ex) {
+        HttpStatus status = ex.status();
+        ErrorResponse body = new ErrorResponse(status.value(), status.getReasonPhrase(),
+                ex.getMessage(), null, null, ex.reason());
         return ResponseEntity.status(status).body(body);
     }
 
