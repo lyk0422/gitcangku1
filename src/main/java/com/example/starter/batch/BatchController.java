@@ -5,6 +5,9 @@ import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
 import com.example.starter.batch.dto.LineageEntryResponse;
+import com.example.starter.batch.dto.MergeRequest;
+import com.example.starter.batch.dto.PotencyDiagnosticsResponse;
+import com.example.starter.batch.dto.PotencyRevisionRequest;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
@@ -23,7 +26,7 @@ import org.springframework.web.bind.annotation.RestController;
 import java.util.List;
 
 /**
- * 生产批次隔离与放行接口。
+ * 生产批次隔离、检验、血缘、放行与效价衰减接口。
  */
 @RestController
 @RequestMapping("/api/batches")
@@ -36,7 +39,7 @@ public class BatchController {
     }
 
     /**
-     * 创建批次，初始状态 QUARANTINED。
+     * 创建批次，初始状态 QUARANTINED；可整组登记数量与线性效价模型 v1。
      */
     @PostMapping
     public ResponseEntity<String> create(@Valid @RequestBody CreateBatchRequest request) {
@@ -54,6 +57,7 @@ public class BatchController {
 
     /**
      * 提交放行批准；X-Actor-Id 为批准人，X-Approval-Role 为 QUALITY 或 OPERATIONS。
+     * 第二次批准按可注入时钟计算当前效价，低于最低放行阈值返回 422（含实际/要求/差额）。
      */
     @PostMapping("/{batchKey}/approvals")
     public ResponseEntity<String> approve(@PathVariable String batchKey,
@@ -64,7 +68,7 @@ public class BatchController {
     }
 
     /**
-     * 召回已放行批次。
+     * 召回已放行/已拆分批次。
      */
     @PostMapping("/{batchKey}/recall")
     public ResponseEntity<String> recall(@PathVariable String batchKey,
@@ -74,7 +78,17 @@ public class BatchController {
     }
 
     /**
-     * 当前可用批次：不含已召回批次。
+     * 效价模型修订：只追加新版本，与检验/放行按提交顺序裁决。
+     */
+    @PostMapping("/{batchKey}/potency-revisions")
+    public ResponseEntity<String> revisePotency(@PathVariable String batchKey,
+                                                @RequestHeader(name = "X-Actor-Id", required = false) String actorId,
+                                                @Valid @RequestBody PotencyRevisionRequest request) {
+        return stored(service.revisePotency(batchKey, actorId, request));
+    }
+
+    /**
+     * 当前可用批次：不含已召回批次及召回祖先的后代。
      */
     @GetMapping("/available")
     public List<BatchResponse> available() {
@@ -82,7 +96,7 @@ public class BatchController {
     }
 
     /**
-     * 批次完整历史明细：批次概要、全部检验、全部批准与召回记录。
+     * 批次完整历史明细：批次概要、全部检验、全部批准、召回记录与效价固化计算。
      */
     @GetMapping("/{batchKey}/history")
     public BatchHistoryResponse history(@PathVariable String batchKey) {
@@ -90,7 +104,16 @@ public class BatchController {
     }
 
     /**
-     * 拆分批次：仅当前可用的 RELEASED 父批可拆成 2～5 个全新子批，父批置为 SPLIT。
+     * 效价只读诊断：当前模型、当前效价/阈值/余量、历史版本与固化记录；查询不修改状态。
+     */
+    @GetMapping("/{batchKey}/potency")
+    public PotencyDiagnosticsResponse potency(@PathVariable String batchKey) {
+        return service.potencyDiagnostics(batchKey);
+    }
+
+    /**
+     * 拆分批次：仅当前可用的 RELEASED 父批可拆成 2～5 个全新子批，父批置为 SPLIT；
+     * 登记数量/效价时按分摊数量守恒并固化子批初始效价。
      */
     @PostMapping("/{batchKey}/split")
     public ResponseEntity<String> split(@PathVariable String batchKey,
@@ -99,7 +122,15 @@ public class BatchController {
     }
 
     /**
-     * 祖先查询：从直接父批到根，含各批自身状态及导致不可用的召回祖先。
+     * 合批：2～5 个已放行父批按投入数量加权产生一个全新批次，任一父批效价不合格或数量不守恒整次回滚。
+     */
+    @PostMapping("/merge")
+    public ResponseEntity<String> merge(@Valid @RequestBody MergeRequest request) {
+        return stored(service.merge(request));
+    }
+
+    /**
+     * 祖先查询：DAG 广度优先，含各批自身状态及导致不可用的召回祖先。
      */
     @GetMapping("/{batchKey}/ancestors")
     public List<LineageEntryResponse> ancestors(@PathVariable String batchKey) {
@@ -107,7 +138,7 @@ public class BatchController {
     }
 
     /**
-     * 后代查询：按拆分创建顺序展开，含各批自身状态及导致不可用的召回祖先。
+     * 后代查询：按血缘创建顺序广度优先展开，含各批自身状态及导致不可用的召回祖先。
      */
     @GetMapping("/{batchKey}/descendants")
     public List<LineageEntryResponse> descendants(@PathVariable String batchKey) {

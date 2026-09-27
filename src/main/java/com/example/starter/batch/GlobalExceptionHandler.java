@@ -11,15 +11,16 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 /**
- * 全局异常映射：业务异常按 ApiException 状态返回；参数解析/校验失败统一 400。
+ * 全局异常映射：业务异常按 ApiException 状态返回（携带结构化诊断载荷时直接返回载荷）；
+ * 参数解析/校验失败统一 400。
  */
 @RestControllerAdvice
 public class GlobalExceptionHandler {
 
     @ExceptionHandler(ApiException.class)
-    public ResponseEntity<ErrorResponse> handleApi(ApiException ex) {
-        return ResponseEntity.status(ex.status())
-                .body(new ErrorResponse(ex.code(), ex.getMessage()));
+    public ResponseEntity<Object> handleApi(ApiException ex) {
+        Object body = ex.payload() != null ? ex.payload() : new ErrorResponse(ex.code(), ex.getMessage());
+        return ResponseEntity.status(ex.status()).body(body);
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
