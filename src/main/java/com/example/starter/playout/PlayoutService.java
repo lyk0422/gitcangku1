@@ -2,6 +2,10 @@ package com.example.starter.playout;
 
 import com.example.starter.playout.PlayoutRepository.DraftRow;
 import com.example.starter.playout.PlayoutRepository.GrantRow;
+import com.example.starter.playout.PlayoutRepository.LiveAffectedRow;
+import com.example.starter.playout.PlayoutRepository.LiveGrantSnapshotRow;
+import com.example.starter.playout.PlayoutRepository.LiveOverrideRow;
+import com.example.starter.playout.PlayoutRepository.LiveRecoveryRow;
 import com.example.starter.playout.PlayoutRepository.OverrideRow;
 import com.example.starter.playout.PlayoutRepository.PublicationRow;
 import com.example.starter.playout.PlayoutRepository.PublicationSegmentRow;
@@ -14,16 +18,26 @@ import com.example.starter.playout.api.Dtos.CreateAssetRequest;
 import com.example.starter.playout.api.Dtos.CreateChannelRequest;
 import com.example.starter.playout.api.Dtos.CreateEmergencyOverrideRequest;
 import com.example.starter.playout.api.Dtos.CreateGrantRequest;
+import com.example.starter.playout.api.Dtos.CreateLiveOverrideItem;
 import com.example.starter.playout.api.Dtos.DecisionSource;
 import com.example.starter.playout.api.Dtos.DraftResponse;
 import com.example.starter.playout.api.Dtos.EmergencyOverrideResponse;
 import com.example.starter.playout.api.Dtos.FallbackReason;
 import com.example.starter.playout.api.Dtos.GrantResponse;
+import com.example.starter.playout.api.Dtos.LiveAffectedItem;
+import com.example.starter.playout.api.Dtos.LiveDiagnosticsResponse;
+import com.example.starter.playout.api.Dtos.LiveGrantSnapshot;
+import com.example.starter.playout.api.Dtos.LiveOverrideBatchResponse;
+import com.example.starter.playout.api.Dtos.LiveOverrideResponse;
+import com.example.starter.playout.api.Dtos.LiveOverrideStatus;
+import com.example.starter.playout.api.Dtos.LiveOverrideSummary;
+import com.example.starter.playout.api.Dtos.LiveRecoveryItem;
 import com.example.starter.playout.api.Dtos.OverrideStatus;
 import com.example.starter.playout.api.Dtos.PlayoutDecisionResponse;
 import com.example.starter.playout.api.Dtos.PublishRequest;
 import com.example.starter.playout.api.Dtos.PublishResponse;
 import com.example.starter.playout.api.Dtos.ReplaceDraftRequest;
+import com.example.starter.playout.api.Dtos.RevokeLiveOverrideRequest;
 import com.example.starter.playout.api.Dtos.SegmentInput;
 import com.example.starter.playout.api.Dtos.SegmentResponse;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -40,17 +54,26 @@ import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.TreeMap;
 import java.util.UUID;
 import java.util.function.Supplier;
 
 /**
- * 播出编排核心服务：素材、频道、授权、草稿、发布与播出决定。
+ * 播出编排核心服务：素材、频道、授权、草稿、发布、播出决定、紧急插播与直播覆盖。
  *
  * <p>约定：数据库内时间统一为 UTC 纪元毫秒；API 边界统一为 Asia/Shanghai、毫秒精度 ISO 8601；
- * 业务日为 Asia/Shanghai 日历日。授权区间为左闭右开。所有写操作与幂等去重记录在同一事务提交，
+ * 业务日为 Asia/Shanghai 日历日。所有区间左闭右开。所有写操作与幂等去重记录在同一事务提交，
  * 失败整体回滚、不占用 requestId。</p>
+ *
+ * <p>直播覆盖令：同一频道时段仅一个有效覆盖；覆盖创建、撤销、日草稿修改、发布与紧急插播均在
+ * 频道行锁上按事务提交顺序裁决。覆盖结束（ACTIVE 到点）后对受影响素材逐条裁决：覆盖结束时刻
+ * 尚未开始的素材 RESUMED 恢复播出，其余 MISSED_BY_LIVE 不补播；裁决一经写入不可变。</p>
  */
 @Service
 public class PlayoutService {
@@ -63,16 +86,20 @@ public class PlayoutService {
     private static final String OP_REVOKE_GRANT = "REVOKE_GRANT";
     private static final String OP_CREATE_OVERRIDE = "CREATE_OVERRIDE";
     private static final String OP_CANCEL_OVERRIDE = "CANCEL_OVERRIDE";
+    private static final String OP_CREATE_LIVE_OVERRIDE = "CREATE_LIVE_OVERRIDE";
+    private static final String OP_REVOKE_LIVE_OVERRIDE = "REVOKE_LIVE_OVERRIDE";
 
     /** 紧急插播时长上限（含）：30 分钟，单位毫秒。 */
     private static final long OVERRIDE_MAX_DURATION_MS = 30L * 60L * 1000L;
 
     private final PlayoutRepository repo;
     private final ObjectMapper objectMapper;
+    private final PlayoutClock clock;
 
-    public PlayoutService(PlayoutRepository repo, ObjectMapper objectMapper) {
+    public PlayoutService(PlayoutRepository repo, ObjectMapper objectMapper, PlayoutClock clock) {
         this.repo = repo;
         this.objectMapper = objectMapper;
+        this.clock = clock;
     }
 
     // ---------- 素材 ----------
@@ -135,7 +162,7 @@ public class PlayoutService {
     /** 撤销授权；幂等：同 requestId 同参数返回原结果，改参数返回 409。 */
     @Transactional
     public GrantResponse revokeGrant(long grantId, String requestId) {
-        String hash = sha256(OP_REVOKE_GRANT + "|" + grantId);
+        String hash = fingerprint(OP_REVOKE_GRANT, Map.of("grantId", grantId));
         return idempotent(requestId, OP_REVOKE_GRANT, hash, GrantResponse.class, () -> {
             GrantRow grant = repo.findGrant(grantId)
                     .orElseThrow(() -> ApiException.notFound("授权不存在: " + grantId));
@@ -154,12 +181,18 @@ public class PlayoutService {
     @Transactional
     public DraftResponse replaceDraft(String channelId, LocalDate businessDay,
                                       ReplaceDraftRequest request) {
-        repo.findChannel(channelId)
-                .orElseThrow(() -> ApiException.notFound("频道不存在: " + channelId));
-
-        String hash = sha256(OP_REPLACE_DRAFT + "|" + channelId + "|" + businessDay
-                + "|" + request.expectedDraftVersion() + "|" + canonicalSegments(request.segments()));
+        String hash = fingerprint(OP_REPLACE_DRAFT, orderedMap(
+                "channelId", channelId,
+                "businessDay", businessDay.toString(),
+                "expectedDraftVersion", request.expectedDraftVersion(),
+                "segments", canonicalSegments(request.segments())));
         return idempotent(request.requestId(), OP_REPLACE_DRAFT, hash, DraftResponse.class, () -> {
+            // 频道锁：与同频道覆盖创建/结束裁决、发布、紧急插播按提交顺序串行。
+            repo.lockChannelForUpdate(channelId);
+            repo.findChannel(channelId)
+                    .orElseThrow(() -> ApiException.notFound("频道不存在: " + channelId));
+            advanceLiveOverrides(channelId, nowMs());
+
             List<ValidatedSegment> segments = validateSegments(channelId, businessDay, request.segments());
             long newVersion;
             if (request.expectedDraftVersion() == 0) {
@@ -197,12 +230,18 @@ public class PlayoutService {
      */
     @Transactional
     public PublishResponse publish(String channelId, LocalDate businessDay, PublishRequest request) {
-        repo.findChannel(channelId)
-                .orElseThrow(() -> ApiException.notFound("频道不存在: " + channelId));
-
-        String hash = sha256(OP_PUBLISH + "|" + channelId + "|" + businessDay
-                + "|" + request.draftVersion() + "|" + request.expectedPublishedVersion());
+        String hash = fingerprint(OP_PUBLISH, orderedMap(
+                "channelId", channelId,
+                "businessDay", businessDay.toString(),
+                "draftVersion", request.draftVersion(),
+                "expectedPublishedVersion", request.expectedPublishedVersion()));
         return idempotent(request.requestId(), OP_PUBLISH, hash, PublishResponse.class, () -> {
+            // 频道锁：新快照发布与覆盖令选取受影响素材必须按提交顺序互斥。
+            repo.lockChannelForUpdate(channelId);
+            repo.findChannel(channelId)
+                    .orElseThrow(() -> ApiException.notFound("频道不存在: " + channelId));
+            advanceLiveOverrides(channelId, nowMs());
+
             DraftRow draft = repo.findDraft(channelId, businessDay)
                     .orElseThrow(() -> ApiException.notFound("草稿不存在: " + channelId + " " + businessDay));
             List<SegmentRow> segments = repo.findDraftSegments(channelId, businessDay);
@@ -242,10 +281,9 @@ public class PlayoutService {
     // ---------- 播出决定 ----------
 
     /**
-     * 按频道与时刻查询播出决定。先在命中该时刻的 ACTIVE 紧急插播中选取指定授权当前未撤销的
-     * 最高优先级插播（EMERGENCY 来源，随附 overrideKey）；高优先级插播授权失效时自动落到
-     * 仍有效的低优先级插播。无有效插播候选时沿用原节目与保底逻辑。查询不改变插播状态，
-     * 插播不随授权撤销自动换绑授权。到插播结束时刻（左闭右开）不再命中。
+     * 按频道与时刻查询播出决定。命中直播覆盖窗口（授权实时仍未撤销）时来源 LIVE；
+     * 否则在命中该时刻的 ACTIVE 紧急插播中选取授权当前未撤销的最高优先级插播；
+     * 再否则沿用原节目与保底逻辑。查询为只读，不推进覆盖状态、不写任何证据。
      */
     @Transactional(readOnly = true)
     public PlayoutDecisionResponse playoutDecision(String channelId, OffsetDateTime at) {
@@ -253,11 +291,17 @@ public class PlayoutService {
                 .orElseThrow(() -> ApiException.notFound("频道不存在: " + channelId));
         long atMs = toMs(at);
 
+        Optional<LiveOverrideRow> live = repo.findLiveWindowAt(channelId, atMs);
+        if (live.isPresent() && isGrantCurrentlyValid(live.get().grantId())) {
+            return new PlayoutDecisionResponse(channelId, at, live.get().sourceId(),
+                    DecisionSource.LIVE, null, null, null, null, live.get().overrideKey());
+        }
+
         Optional<OverrideRow> override = selectActiveOverrideAt(channelId, atMs);
         if (override.isPresent()) {
             OverrideRow hit = override.get();
             return new PlayoutDecisionResponse(channelId, at, hit.assetId(),
-                    DecisionSource.EMERGENCY, null, null, null, hit.overrideKey());
+                    DecisionSource.EMERGENCY, null, null, null, hit.overrideKey(), null);
         }
 
         LocalDate businessDay = at.atZoneSameInstant(ZONE).toLocalDate();
@@ -274,6 +318,22 @@ public class PlayoutService {
                     FallbackReason.GAP);
         }
         PublicationSegmentRow hit = segment.get();
+
+        // 覆盖窗口仍在但直播授权已失效：原素材保留占位、不得播出（窗口结束后也不会补播）。
+        if (live.isPresent()) {
+            return new PlayoutDecisionResponse(channelId, at, channel.fallbackAssetId(),
+                    DecisionSource.FALLBACK, FallbackReason.LIVE_PREEMPTED,
+                    publication.get().id(), hit.segmentId(), null, live.get().overrideKey());
+        }
+        // 覆盖已结束：被裁决为 MISSED_BY_LIVE 的素材永久不播；RESUMED 的素材正常恢复。
+        Optional<String> liveResult = repo.findLiveRecoveryResultForSegment(
+                channelId, publication.get().id(), hit.segmentId());
+        if (liveResult.isPresent() && "MISSED_BY_LIVE".equals(liveResult.get())) {
+            return new PlayoutDecisionResponse(channelId, at, channel.fallbackAssetId(),
+                    DecisionSource.FALLBACK, FallbackReason.LIVE_PREEMPTED,
+                    publication.get().id(), hit.segmentId(), null, null);
+        }
+
         GrantRow grant = repo.findGrant(hit.grantId())
                 .orElseThrow(() -> ApiException.unprocessable("SNAPSHOT_INCOMPLETE",
                         "发布快照引用的授权不存在: " + hit.grantId()));
@@ -281,11 +341,11 @@ public class PlayoutService {
             return new PlayoutDecisionResponse(channelId, at, channel.fallbackAssetId(),
                     DecisionSource.FALLBACK,
                     FallbackReason.GRANT_REVOKED,
-                    publication.get().id(), hit.segmentId(), null);
+                    publication.get().id(), hit.segmentId(), null, null);
         }
         return new PlayoutDecisionResponse(channelId, at, hit.assetId(),
                 DecisionSource.PROGRAM, null,
-                publication.get().id(), hit.segmentId(), null);
+                publication.get().id(), hit.segmentId(), null, null);
     }
 
     /**
@@ -294,12 +354,16 @@ public class PlayoutService {
      */
     private Optional<OverrideRow> selectActiveOverrideAt(String channelId, long atMs) {
         for (OverrideRow candidate : repo.findActiveOverridesAt(channelId, atMs)) {
-            GrantRow grant = repo.findGrant(candidate.grantId()).orElse(null);
-            if (grant != null && !grant.revoked()) {
+            if (isGrantCurrentlyValid(candidate.grantId())) {
                 return Optional.of(candidate);
             }
         }
         return Optional.empty();
+    }
+
+    private boolean isGrantCurrentlyValid(long grantId) {
+        GrantRow grant = repo.findGrant(grantId).orElse(null);
+        return grant != null && !grant.revoked();
     }
 
     // ---------- 紧急插播 ----------
@@ -307,14 +371,18 @@ public class PlayoutService {
     /**
      * 创建限时紧急插播：创建即 ACTIVE，只可取消不可改写。校验频道/素材/授权存在、授权属于该
      * 频道与素材且未撤销并完整覆盖区间、区间同日且时长在 (0, 30 分钟]；同频道同优先级 ACTIVE
-     * 区间不得重叠（相邻合法）。携带 requestId 幂等：同键同参返回首次结果，改参 409，失败不占键；
-     * 已取消插播不能用相同 overrideKey 重放复活。
+     * 区间不得重叠（相邻合法），且不得与有效直播覆盖窗口相交。携带 requestId 幂等。
      */
     @Transactional
     public EmergencyOverrideResponse createEmergencyOverride(CreateEmergencyOverrideRequest request) {
-        String hash = sha256(OP_CREATE_OVERRIDE + "|" + request.overrideKey() + "|"
-                + request.channelId() + "|" + request.assetId() + "|" + request.grantId() + "|"
-                + request.priority() + "|" + toMs(request.start()) + "|" + toMs(request.end()));
+        String hash = fingerprint(OP_CREATE_OVERRIDE, orderedMap(
+                "overrideKey", request.overrideKey(),
+                "channelId", request.channelId(),
+                "assetId", request.assetId(),
+                "grantId", request.grantId(),
+                "priority", request.priority(),
+                "start", toMs(request.start()),
+                "end", toMs(request.end())));
         return idempotent(request.requestId(), OP_CREATE_OVERRIDE, hash,
                 EmergencyOverrideResponse.class, () -> doCreateOverride(request));
     }
@@ -336,6 +404,7 @@ public class PlayoutService {
         }
 
         repo.lockChannelForUpdate(request.channelId());
+        advanceLiveOverrides(request.channelId(), nowMs());
         var channel = repo.findChannel(request.channelId())
                 .orElseThrow(() -> ApiException.notFound("频道不存在: " + request.channelId()));
         if (repo.findAsset(request.assetId()).isEmpty()) {
@@ -365,7 +434,10 @@ public class PlayoutService {
         }
         if (grant.validFromMs() > startMs || grant.validToMs() < endMs) {
             throw ApiException.unprocessable("GRANT_NOT_COVERING",
-                    "指定授权未完整覆盖插播区间: " + request.grantId());
+                    "指定授权未完整覆盖插播区间: 实际[" + grant.validFromMs() + "," + grant.validToMs()
+                            + ") 要求覆盖[" + startMs + "," + endMs + ")，差额 "
+                            + Math.max(0L, startMs - grant.validFromMs()) + "/"
+                            + Math.max(0L, grant.validToMs() - endMs) + " 毫秒");
         }
 
         List<OverrideRow> overlapping = repo.findActiveOverlappingForUpdate(
@@ -373,6 +445,13 @@ public class PlayoutService {
         if (!overlapping.isEmpty()) {
             throw ApiException.conflict("OVERRIDE_INTERVAL_CONFLICT",
                     "同频道同优先级 ACTIVE 插播区间重叠: " + overlapping.get(0).overrideKey());
+        }
+        // 与直播覆盖互斥：同频道时段仅一个有效覆盖。
+        List<LiveOverrideRow> liveConflicts = repo.findLiveOverlappingForUpdate(
+                request.channelId(), startMs, endMs);
+        if (!liveConflicts.isEmpty()) {
+            throw ApiException.conflict("LIVE_OVERRIDE_INTERVAL_CONFLICT",
+                    "区间与有效直播覆盖令重叠: " + liveConflicts.get(0).overrideKey());
         }
 
         long createdAtMs = nowMs();
@@ -391,17 +470,17 @@ public class PlayoutService {
 
     /**
      * 取消紧急插播：仅 ACTIVE 可取消，已取消再取消为 409 状态冲突；取消提交后释放同优先级
-     * 冲突区间。携带 requestId 幂等：同键同参返回首次结果（含 CANCELLED 明细），改参 409，
-     * 失败不占键。
+     * 冲突区间。携带 requestId 幂等：同键同参返回首次结果（含 CANCELLED 明细），改参 409。
      */
     @Transactional
     public EmergencyOverrideResponse cancelEmergencyOverride(String overrideKey, String requestId) {
-        String hash = sha256(OP_CANCEL_OVERRIDE + "|" + overrideKey);
+        String hash = fingerprint(OP_CANCEL_OVERRIDE, Map.of("overrideKey", overrideKey));
         return idempotent(requestId, OP_CANCEL_OVERRIDE, hash, EmergencyOverrideResponse.class, () -> {
             // 先在频道锁上与同频道创建/取消串行，取消提交后并发创建即可复用该区间。
             OverrideRow existing = repo.findOverride(overrideKey)
                     .orElseThrow(() -> ApiException.notFound("紧急插播不存在: " + overrideKey));
             repo.lockChannelForUpdate(existing.channelId());
+            advanceLiveOverrides(existing.channelId(), nowMs());
             int updated = repo.cancelOverride(overrideKey, requestId, nowMs());
             if (updated == 0) {
                 throw ApiException.conflict("OVERRIDE_NOT_ACTIVE",
@@ -426,6 +505,496 @@ public class PlayoutService {
                 row.cancelRequestId(),
                 row.cancelledAtMs() == null ? null : atMs(row.cancelledAtMs()),
                 atMs(row.createdAtMs()));
+    }
+
+    // ---------- 直播覆盖令 ----------
+
+    /**
+     * 批量创建直播覆盖令（可跨频道）：全部条目先完整校验通过，再在单事务内提交；
+     * 任一条目失败整体回滚，不留部分覆盖、不占用 requestId。同 requestId 同参重放返回
+     * 首次完整响应快照，异参 409。幂等指纹含操作者、操作类型、按 overrideKey 规范化后的
+     * 完整条目集合（JSON 序列化，不做未转义分隔符拼接）。
+     */
+    @Transactional
+    public LiveOverrideBatchResponse createLiveOverrides(List<CreateLiveOverrideItem> items,
+                                                         String operator, String requestId) {
+        List<CreateLiveOverrideItem> canonical = items == null ? List.of() : items.stream()
+                .sorted(Comparator.comparing(CreateLiveOverrideItem::overrideKey))
+                .toList();
+        List<Map<String, Object>> itemHashes = new ArrayList<>();
+        for (CreateLiveOverrideItem item : canonical) {
+            itemHashes.add(orderedMap(
+                    "overrideKey", item.overrideKey(),
+                    "channelId", item.channelId(),
+                    "sourceId", item.sourceId(),
+                    "grantId", item.grantId(),
+                    "start", toMs(item.start()),
+                    "end", toMs(item.end())));
+        }
+        String hash = fingerprint(OP_CREATE_LIVE_OVERRIDE, orderedMap(
+                "operator", operator, "items", itemHashes));
+        return idempotent(requestId, OP_CREATE_LIVE_OVERRIDE, hash,
+                LiveOverrideBatchResponse.class,
+                () -> doCreateLiveOverrides(canonical, operator, requestId));
+    }
+
+    private LiveOverrideBatchResponse doCreateLiveOverrides(List<CreateLiveOverrideItem> items,
+                                                            String operator, String requestId) {
+        if (items.isEmpty()) {
+            throw ApiException.badRequest("直播覆盖令条目不能为空");
+        }
+        long now = nowMs();
+
+        // 基础参数校验（区间左闭右开）。
+        for (CreateLiveOverrideItem item : items) {
+            if (toMs(item.end()) <= toMs(item.start())) {
+                throw ApiException.badRequest(
+                        "直播覆盖结束时间必须大于开始时间: " + item.overrideKey());
+            }
+        }
+
+        // 多频道按频道 ID 排序加锁，避免跨频道死锁；锁内先推进到点覆盖状态。
+        List<String> channelIds = items.stream().map(CreateLiveOverrideItem::channelId)
+                .distinct().sorted().toList();
+        for (String channelId : channelIds) {
+            repo.lockChannelForUpdate(channelId);
+        }
+        for (String channelId : channelIds) {
+            if (repo.findChannel(channelId).isEmpty()) {
+                throw ApiException.notFound("频道不存在: " + channelId);
+            }
+            advanceLiveOverrides(channelId, now);
+        }
+
+        // 批次内键、同频道区间不得自相冲突。
+        Set<String> keysInBatch = new LinkedHashSet<>();
+        for (CreateLiveOverrideItem item : items) {
+            if (!keysInBatch.add(item.overrideKey())) {
+                throw ApiException.conflict("DUPLICATE_LIVE_OVERRIDE_KEY",
+                        "批次内直播覆盖令键重复: " + item.overrideKey());
+            }
+        }
+        for (int i = 0; i < items.size(); i++) {
+            CreateLiveOverrideItem a = items.get(i);
+            for (int j = i + 1; j < items.size(); j++) {
+                CreateLiveOverrideItem b = items.get(j);
+                if (a.channelId().equals(b.channelId())
+                        && toMs(a.start()) < toMs(b.end()) && toMs(b.start()) < toMs(a.end())) {
+                    throw ApiException.conflict("LIVE_OVERRIDE_INTERVAL_CONFLICT",
+                            "批次内同频道覆盖区间重叠: " + a.overrideKey() + " 与 " + b.overrideKey());
+                }
+            }
+        }
+
+        // 占用键行锁（按键排序），已存在即冲突。
+        List<LiveOverrideRow> existingRows =
+                repo.findLiveOverridesForUpdate(new ArrayList<>(keysInBatch));
+        if (!existingRows.isEmpty()) {
+            throw ApiException.conflict("DUPLICATE_LIVE_OVERRIDE_KEY",
+                    "直播覆盖令键已存在: " + existingRows.get(0).overrideKey());
+        }
+
+        // 预锁全部授权行（按 ID 排序），与授权撤销按提交顺序串行。
+        List<Long> grantIds = items.stream().map(CreateLiveOverrideItem::grantId)
+                .distinct().sorted().toList();
+        Map<Long, GrantRow> grants = new LinkedHashMap<>();
+        for (Long grantId : grantIds) {
+            GrantRow grant = repo.findGrantForUpdate(grantId)
+                    .orElseThrow(() -> ApiException.notFound("授权不存在: " + grantId));
+            grants.put(grantId, grant);
+        }
+
+        // 逐条完整校验，收集待写入的最终状态；此阶段不做任何业务插入。
+        List<PlannedLiveOverride> planned = new ArrayList<>();
+        for (CreateLiveOverrideItem item : items) {
+            planned.add(planLiveOverride(item, grants.get(item.grantId()), now));
+        }
+
+        // 校验完整最终状态后统一提交写入。
+        for (PlannedLiveOverride plan : planned) {
+            long id = repo.insertLiveOverride(plan.key(), plan.channelId(), plan.sourceId(),
+                    plan.grantId(), plan.startMs(), plan.endMs(), "SCHEDULED", requestId,
+                    operator, now);
+            repo.insertLiveGrantSnapshot(id, plan.grantId(), plan.channelId(), plan.sourceId(),
+                    plan.grantValidFromMs(), plan.grantValidToMs(), false, now);
+            for (PlannedAffected affected : plan.affected()) {
+                repo.insertLiveAffected(id, plan.channelId(), affected.businessDay(),
+                        affected.publicationId(), affected.segmentId(), affected.assetId(),
+                        affected.startMs(), affected.endMs());
+            }
+        }
+        // 新覆盖令统一以 SCHEDULED 落库，再按当前时钟激活已到点者，started_at_ms 由条件更新写入。
+        for (String channelId : channelIds) {
+            advanceLiveOverrides(channelId, now);
+        }
+
+        List<LiveOverrideResponse> responses = new ArrayList<>();
+        long totalDurationMs = 0L;
+        int totalAffected = 0;
+        long totalSuppressedMs = 0L;
+        for (PlannedLiveOverride plan : planned) {
+            LiveOverrideRow row = repo.findLiveOverrideByKey(plan.key()).orElseThrow();
+            responses.add(assembleLiveResponse(plan.key()));
+            totalDurationMs += plan.endMs() - plan.startMs();
+            totalAffected += plan.affected().size();
+            totalSuppressedMs += plan.affected().stream().mapToLong(PlannedAffected::suppressedMs).sum();
+        }
+        // responses 顺序与规范化后的 canonical 一致（按 overrideKey 排序），保持稳定。
+        return new LiveOverrideBatchResponse(requestId, responses.size(), channelIds,
+                totalDurationMs, totalAffected, totalSuppressedMs, 0, 0, responses);
+    }
+
+    /** 校验单条覆盖令并计算受影响素材集合（不写库）。 */
+    private PlannedLiveOverride planLiveOverride(CreateLiveOverrideItem item, GrantRow grant, long now) {
+        long startMs = toMs(item.start());
+        long endMs = toMs(item.end());
+
+        if (repo.findAsset(item.sourceId()).isEmpty()) {
+            throw ApiException.notFound("直播源素材不存在: " + item.sourceId());
+        }
+        var channel = repo.findChannel(item.channelId())
+                .orElseThrow(() -> ApiException.notFound("频道不存在: " + item.channelId()));
+        if (channel.fallbackAssetId().equals(item.sourceId())) {
+            throw ApiException.unprocessable("FALLBACK_ASSET_NOT_GRANTABLE",
+                    "保底素材不得作为直播源: " + item.sourceId());
+        }
+        if (!grant.channelId().equals(item.channelId()) || !grant.assetId().equals(item.sourceId())) {
+            throw ApiException.unprocessable("GRANT_NOT_MATCHED",
+                    "指定授权不属于该频道或直播源: " + item.grantId());
+        }
+        if (grant.revoked()) {
+            throw ApiException.unprocessable("GRANT_INVALID",
+                    "直播源授权已撤销: " + item.grantId());
+        }
+        if (grant.validFromMs() > startMs || grant.validToMs() < endMs) {
+            long shortfallFrom = Math.max(0L, startMs - grant.validFromMs());
+            long shortfallTo = Math.max(0L, grant.validToMs() - endMs);
+            throw ApiException.unprocessable("GRANT_NOT_COVERING",
+                    "直播源授权未完整覆盖时段: 实际授权[" + grant.validFromMs() + "," + grant.validToMs()
+                            + ")，要求覆盖[" + startMs + "," + endMs + ")，起点差额 " + shortfallFrom
+                            + " 毫秒、终点差额 " + shortfallTo + " 毫秒");
+        }
+        if (now >= endMs) {
+            throw ApiException.unprocessable("LIVE_INTERVAL_IN_PAST",
+                    "直播覆盖区间已完全过去，当前 " + now + "，区间结束 " + endMs);
+        }
+
+        // 与同频道已有有效覆盖令区间相交即冲突（相邻合法）。
+        List<LiveOverrideRow> overlapping =
+                repo.findLiveOverlappingForUpdate(item.channelId(), startMs, endMs);
+        if (!overlapping.isEmpty()) {
+            throw ApiException.conflict("LIVE_OVERRIDE_INTERVAL_CONFLICT",
+                    "同频道时段仅允许一个有效直播覆盖: 与 " + overlapping.get(0).overrideKey() + " 重叠");
+        }
+        // 与同频道 ACTIVE 紧急插播冲突，按提交顺序后者拒绝。
+        List<OverrideRow> emergencyConflicts =
+                repo.findAnyActiveEmergencyOverlappingForUpdate(item.channelId(), startMs, endMs);
+        if (!emergencyConflicts.isEmpty()) {
+            throw ApiException.conflict("EMERGENCY_OVERRIDE_CONFLICT",
+                    "覆盖时段与进行中的紧急插播冲突: " + emergencyConflicts.get(0).overrideKey());
+        }
+
+        // 与已开始节目冲突：创建时刻正在播出、且开播早于本令的节目不能被截断。
+        if (startMs <= now) {
+            LocalDate today = atMs(now).atZoneSameInstant(ZONE).toLocalDate();
+            Optional<PublicationRow> currentPublication =
+                    repo.findLatestPublication(item.channelId(), today);
+            if (currentPublication.isPresent()) {
+                Optional<PublicationSegmentRow> onAir = repo.findPublicationSegments(
+                        currentPublication.get().id()).stream()
+                        .filter(seg -> seg.startMs() < now && seg.endMs() > now)
+                        .findFirst();
+                if (onAir.isPresent()) {
+                    throw ApiException.conflict("LIVE_PROGRAM_ALREADY_STARTED",
+                            "覆盖开始时刻节目已开始播出，实际在播片段 " + onAir.get().segmentId()
+                                    + " [" + onAir.get().startMs() + "," + onAir.get().endMs()
+                                    + ")，覆盖起点 " + startMs);
+                }
+            }
+        }
+
+        // 受影响素材：覆盖窗口跨越的每个业务日取最新发布快照，与区间相交的片段全部保留占位。
+        List<PlannedAffected> affected = collectAffected(item.channelId(), startMs, endMs);
+        return new PlannedLiveOverride(item.overrideKey(), item.channelId(), item.sourceId(),
+                item.grantId(), startMs, endMs, grant.validFromMs(), grant.validToMs(), affected);
+    }
+
+    /**
+     * 计算受覆盖决策影响的已发布快照片段：严格相交片段在覆盖窗口内保留占位（抑制交集时长），
+     * 与覆盖结束端点相接（恰在结束时开播，左闭右开下不属于覆盖内）的后续片段也纳入，
+     * 供覆盖结束时裁决为 RESUMED；其抑制交集时长为 0。逐业务日取最新快照。
+     */
+    private List<PlannedAffected> collectAffected(String channelId, long startMs, long endMs) {
+        List<PlannedAffected> affected = new ArrayList<>();
+        LocalDate day = atMs(startMs).atZoneSameInstant(ZONE).toLocalDate();
+        LocalDate endDay = atMs(endMs - 1).atZoneSameInstant(ZONE).toLocalDate();
+        while (!day.isAfter(endDay)) {
+            long dayStart = day.atStartOfDay(ZONE).toInstant().toEpochMilli();
+            long dayEnd = day.plusDays(1).atStartOfDay(ZONE).toInstant().toEpochMilli();
+            long windowStart = Math.max(startMs, dayStart);
+            long windowEnd = Math.min(endMs, dayEnd);
+            Optional<PublicationRow> publication = repo.findLatestPublication(channelId, day);
+            if (publication.isPresent()) {
+                for (PublicationSegmentRow seg : repo.findPublicationSegments(publication.get().id())) {
+                    if (seg.startMs() < windowEnd && seg.endMs() > windowStart) {
+                        long suppressedMs = Math.min(seg.endMs(), endMs) - Math.max(seg.startMs(), startMs);
+                        affected.add(new PlannedAffected(day, publication.get().id(), seg.segmentId(),
+                                seg.assetId(), seg.startMs(), seg.endMs(), Math.max(0L, suppressedMs)));
+                    }
+                }
+            }
+            day = day.plusDays(1);
+        }
+        // 仅在覆盖真正结束端点处纳入恰在结束时开播的后续片段（跨日边界不重复纳入）。
+        LocalDate finishDay = atMs(endMs).atZoneSameInstant(ZONE).toLocalDate();
+        repo.findLatestPublication(channelId, finishDay).ifPresent(publication -> {
+            for (PublicationSegmentRow seg : repo.findPublicationSegments(publication.id())) {
+                if (seg.startMs() == endMs) {
+                    affected.add(new PlannedAffected(finishDay, publication.id(), seg.segmentId(),
+                            seg.assetId(), seg.startMs(), seg.endMs(), 0L));
+                }
+            }
+        });
+        affected.sort(Comparator.comparingLong(PlannedAffected::startMs)
+                .thenComparing(PlannedAffected::publicationId)
+                .thenComparing(PlannedAffected::segmentId));
+        return affected;
+    }
+
+    /**
+     * 撤销直播覆盖令：仅 SCHEDULED（尚未开始覆盖）可撤销；ACTIVE/ENDED/REVOKED 一律 409。
+     * 已产生的受影响素材与授权快照为不可变证据保留，撤销不删除、不改写。
+     */
+    @Transactional
+    public LiveOverrideResponse revokeLiveOverride(String overrideKey,
+                                                   RevokeLiveOverrideRequest request) {
+        String hash = fingerprint(OP_REVOKE_LIVE_OVERRIDE, orderedMap(
+                "overrideKey", overrideKey, "operator", request.operator()));
+        return idempotent(request.requestId(), OP_REVOKE_LIVE_OVERRIDE, hash,
+                LiveOverrideResponse.class, () -> {
+                    LiveOverrideRow existing = repo.findLiveOverrideByKey(overrideKey)
+                            .orElseThrow(() -> ApiException.notFound(
+                                    "直播覆盖令不存在: " + overrideKey));
+                    repo.lockChannelForUpdate(existing.channelId());
+                    advanceLiveOverrides(existing.channelId(), nowMs());
+                    LiveOverrideRow locked = repo.findLiveOverrideForUpdate(overrideKey).orElseThrow();
+                    if (locked.status().equals("REVOKED")) {
+                        throw ApiException.conflict("LIVE_OVERRIDE_ALREADY_REVOKED",
+                                "直播覆盖令已撤销: " + overrideKey);
+                    }
+                    int updated = repo.revokeLiveOverride(overrideKey, request.requestId(),
+                            request.operator(), nowMs());
+                    if (updated == 0) {
+                        throw ApiException.conflict("LIVE_OVERRIDE_NOT_REVOKABLE",
+                                "仅尚未开始的直播覆盖令可撤销，当前状态 " + locked.status()
+                                        + ": " + overrideKey);
+                    }
+                    return assembleLiveResponse(overrideKey);
+                });
+    }
+
+    /** 查询直播覆盖令明细：受影响素材、恢复裁决与授权版本快照均随明细返回，读取不改状态。 */
+    @Transactional(readOnly = true)
+    public LiveOverrideResponse getLiveOverride(String overrideKey) {
+        repo.findLiveOverrideByKey(overrideKey)
+                .orElseThrow(() -> ApiException.notFound("直播覆盖令不存在: " + overrideKey));
+        return assembleLiveResponse(overrideKey);
+    }
+
+    /** 直播覆盖令历史，排序固定为开始时间升序、ID 升序；频道与 UTC 时间窗口可选，读取不改状态。 */
+    @Transactional(readOnly = true)
+    public List<LiveOverrideSummary> listLiveOverrides(String channelId,
+                                                       OffsetDateTime from, OffsetDateTime to) {
+        Long fromMs = from == null ? null : toMs(from);
+        Long toMs = to == null ? null : toMs(to);
+        return repo.listLiveOverrides(channelId, fromMs, toMs).stream()
+                .map(this::toSummary).toList();
+    }
+
+    /**
+     * 频道某时刻直播诊断：实际在播覆盖、抑制/错过/恢复片段数量与直播毫秒数均为实际值，
+     * 统计窗口为 at 所属 Asia/Shanghai 业务日 [dayStart, at]。纯读操作，不推进任何状态。
+     */
+    @Transactional(readOnly = true)
+    public LiveDiagnosticsResponse liveDiagnostics(String channelId, OffsetDateTime at) {
+        repo.findChannel(channelId)
+                .orElseThrow(() -> ApiException.notFound("频道不存在: " + channelId));
+        long atMs = toMs(at);
+        LocalDate day = at.atZoneSameInstant(ZONE).toLocalDate();
+        long dayStart = day.atStartOfDay(ZONE).toInstant().toEpochMilli();
+
+        List<LiveOverrideRow> dayOverrides =
+                repo.findLiveOverridesInWindow(channelId, dayStart, atMs + 1);
+        List<LiveOverrideSummary> summaries = dayOverrides.stream().map(this::toSummary).toList();
+
+        LiveOverrideRow active = repo.findLiveWindowAt(channelId, atMs).orElse(null);
+        boolean liveOnAir = false;
+        long liveOnAirMs = 0L;
+        long suppressedNow = 0L;
+        if (active != null && isGrantCurrentlyValid(active.grantId())) {
+            liveOnAir = true;
+            for (LiveAffectedRow affected : repo.findLiveAffected(active.id())) {
+                if (affected.scheduledStartMs() <= atMs && affected.scheduledEndMs() > atMs) {
+                    suppressedNow++;
+                }
+            }
+        }
+        // 业务日内截至 at 的实际已直播毫秒：每个非撤销覆盖窗口与 [dayStart, at] 的交集（at 恰在起点为 0）。
+        for (LiveOverrideRow row : dayOverrides) {
+            if (row.status().equals("REVOKED")) {
+                continue;
+            }
+            long from = Math.max(row.startMs(), dayStart);
+            long to = Math.min(row.endMs(), atMs);
+            if (to > from) {
+                liveOnAirMs += to - from;
+            }
+        }
+        long missed = 0L;
+        long resumed = 0L;
+        for (LiveOverrideRow row : dayOverrides) {
+            missed += repo.countLiveRecovery(row.id(), "MISSED_BY_LIVE");
+            resumed += repo.countLiveRecovery(row.id(), "RESUMED");
+        }
+        return new LiveDiagnosticsResponse(channelId, at, liveOnAir,
+                active == null ? null : active.overrideKey(),
+                active == null ? null : active.sourceId(),
+                dayOverrides.stream().filter(r -> !r.status().equals("REVOKED")).count(),
+                suppressedNow, missed, resumed, liveOnAirMs, summaries);
+    }
+
+    /**
+     * 主动推进频道内到点直播覆盖状态并完成结束裁决（写路径在频道锁内也会自动调用）。
+     * 供测试与运维触发使用；已完成的状态推进与裁决为条件更新，重复执行不产生重复证据。
+     */
+    @Transactional
+    public void settleChannel(String channelId) {
+        repo.lockChannelForUpdate(channelId);
+        repo.findChannel(channelId)
+                .orElseThrow(() -> ApiException.notFound("频道不存在: " + channelId));
+        advanceLiveOverrides(channelId, nowMs());
+    }
+
+    /**
+     * 持频道锁后调用：SCHEDULED 到开始转 ACTIVE；ACTIVE 到结束转 ENDED 并逐条写入不可变
+     * 恢复裁决。裁决基准为覆盖结束时刻：原计划开始不早于结束时刻（左闭右开，恰在结束时
+     * 开播）的素材 RESUMED 恢复，其余 MISSED_BY_LIVE，不自动补播。
+     */
+    private void advanceLiveOverrides(String channelId, long now) {
+        for (LiveOverrideRow row : repo.findDueLiveOverridesForUpdate(channelId, now)) {
+            if ("SCHEDULED".equals(row.status()) && row.startMs() <= now) {
+                if (repo.activateLiveOverride(row.id(), now) == 0) {
+                    continue;
+                }
+                if (row.endMs() <= now) {
+                    finishLiveOverride(row, now);
+                }
+            } else if ("ACTIVE".equals(row.status()) && row.endMs() <= now) {
+                finishLiveOverride(row, now);
+            }
+        }
+    }
+
+    private void finishLiveOverride(LiveOverrideRow row, long now) {
+        if (repo.finishLiveOverride(row.id(), now) == 0) {
+            return;
+        }
+        List<LiveAffectedRow> affectedRows = repo.findLiveAffected(row.id());
+        if (!repo.findLiveRecovery(row.id()).isEmpty()) {
+            return;
+        }
+        for (LiveAffectedRow affected : affectedRows) {
+            String result = affected.scheduledStartMs() >= row.endMs()
+                    ? "RESUMED" : "MISSED_BY_LIVE";
+            try {
+                repo.insertLiveRecovery(row.id(), row.channelId(), affected.businessDay(),
+                        affected.publicationId(), affected.segmentId(), result,
+                        affected.scheduledStartMs(), affected.scheduledEndMs(), now);
+            } catch (DuplicateKeyException ignored) {
+                // 并发重复裁决以已有证据为准。
+            }
+        }
+    }
+
+    private LiveOverrideResponse assembleLiveResponse(String overrideKey) {
+        LiveOverrideRow row = repo.findLiveOverrideByKey(overrideKey).orElseThrow();
+        List<LiveAffectedRow> affectedRows = repo.findLiveAffected(row.id());
+        List<LiveRecoveryRow> recoveryRows = repo.findLiveRecovery(row.id());
+        Optional<LiveGrantSnapshotRow> snapshot = repo.findLiveGrantSnapshot(row.id());
+        Long startedAt = row.status().equals("ACTIVE") || row.status().equals("ENDED")
+                ? row.startedAtMs() : null;
+        return toLiveResponse(row,
+                affectedRows.stream().map(a -> toPlanned(row, a)).toList(),
+                recoveryRows, snapshot.orElse(null), startedAt);
+    }
+
+    private PlannedAffected toPlanned(LiveOverrideRow row, LiveAffectedRow a) {
+        long suppressedMs = Math.min(row.endMs(), a.scheduledEndMs())
+                - Math.max(row.startMs(), a.scheduledStartMs());
+        return new PlannedAffected(a.businessDay(), a.publicationId(), a.segmentId(),
+                a.assetId(), a.scheduledStartMs(), a.scheduledEndMs(), Math.max(0L, suppressedMs));
+    }
+
+    private LiveOverrideResponse toLiveResponse(LiveOverrideRow row,
+                                                List<PlannedAffected> affected,
+                                                List<LiveRecoveryRow> recoveries,
+                                                LiveGrantSnapshotRow snapshot,
+                                                Long startedAtMs) {
+        Map<String, LiveRecoveryRow> recoveryBySegment = new LinkedHashMap<>();
+        for (LiveRecoveryRow recovery : recoveries) {
+            recoveryBySegment.put(recovery.publicationId() + ":" + recovery.segmentId(), recovery);
+        }
+        long suppressedDurationMs = affected.stream().mapToLong(PlannedAffected::suppressedMs).sum();
+        List<LiveAffectedItem> items = affected.stream()
+                .map(a -> {
+                    LiveRecoveryRow recovery =
+                            recoveryBySegment.get(a.publicationId() + ":" + a.segmentId());
+                    return new LiveAffectedItem(a.publicationId(), a.businessDay().toString(),
+                            a.segmentId(), a.assetId(), atMs(a.startMs()), atMs(a.endMs()),
+                            recovery == null ? "SUPPRESSED" : recovery.result(),
+                            recovery == null ? null : atMs(recovery.recoveredAtMs()));
+                })
+                .toList();
+        List<LiveRecoveryItem> recoveryItems = recoveries.stream()
+                .sorted(Comparator.comparingLong(LiveRecoveryRow::scheduledStartMs)
+                        .thenComparing(LiveRecoveryRow::publicationId)
+                        .thenComparing(LiveRecoveryRow::segmentId))
+                .map(r -> new LiveRecoveryItem(r.publicationId(), r.businessDay().toString(),
+                        r.segmentId(), r.result(), atMs(r.scheduledStartMs()),
+                        atMs(r.scheduledEndMs()), atMs(r.recoveredAtMs())))
+                .toList();
+        int resumed = (int) recoveries.stream().filter(r -> "RESUMED".equals(r.result())).count();
+        int missed = (int) recoveries.stream().filter(r -> "MISSED_BY_LIVE".equals(r.result())).count();
+        LiveGrantSnapshot snapshotDto = snapshot == null ? null : new LiveGrantSnapshot(
+                snapshot.grantId(), snapshot.channelId(), snapshot.assetId(),
+                atMs(snapshot.validFromMs()), atMs(snapshot.validToMs()), snapshot.revoked(),
+                atMs(snapshot.capturedAtMs()));
+        return new LiveOverrideResponse(row.id(), row.overrideKey(), row.channelId(), row.sourceId(),
+                row.grantId(), atMs(row.startMs()), atMs(row.endMs()),
+                LiveOverrideStatus.valueOf(row.status()), row.operator(),
+                startedAtMs == null ? null : atMs(startedAtMs),
+                row.endedAtMs() == null ? null : atMs(row.endedAtMs()),
+                atMs(row.createdAtMs()), row.revokeRequestId(), row.revokeOperator(),
+                row.revokedAtMs() == null ? null : atMs(row.revokedAtMs()),
+                row.endMs() - row.startMs(), affected.size(), suppressedDurationMs,
+                resumed, missed, items, recoveryItems, snapshotDto);
+    }
+
+    private LiveOverrideSummary toSummary(LiveOverrideRow row) {
+        long id = row.id();
+        int resumed = (int) repo.findLiveRecovery(id).stream()
+                .filter(r -> "RESUMED".equals(r.result())).count();
+        int missed = (int) repo.findLiveRecovery(id).stream()
+                .filter(r -> "MISSED_BY_LIVE".equals(r.result())).count();
+        int affectedCount = repo.findLiveAffected(id).size();
+        return new LiveOverrideSummary(row.id(), row.overrideKey(), row.channelId(), row.sourceId(),
+                row.grantId(), atMs(row.startMs()), atMs(row.endMs()),
+                LiveOverrideStatus.valueOf(row.status()), row.operator(),
+                row.startedAtMs() == null ? null : atMs(row.startedAtMs()),
+                row.endedAtMs() == null ? null : atMs(row.endedAtMs()),
+                atMs(row.createdAtMs()), row.revokeRequestId(),
+                row.revokedAtMs() == null ? null : atMs(row.revokedAtMs()),
+                affectedCount, resumed, missed);
     }
 
     // ---------- 内部方法 ----------
@@ -541,21 +1110,47 @@ public class PlayoutService {
         }
     }
 
-    private static String canonicalSegments(List<SegmentInput> segments) {
-        StringBuilder sb = new StringBuilder();
-        for (SegmentInput s : segments) {
-            sb.append(s.id() == null ? "" : s.id()).append(',')
-                    .append(s.assetId()).append(',')
-                    .append(s.start() == null ? "" : toMs(s.start())).append(',')
-                    .append(s.end() == null ? "" : toMs(s.end())).append(';');
+    /**
+     * 幂等指纹：将规范化对象（Map/List/标量）序列化为 JSON 后取 SHA-256。
+     * JSON 转义天然消除分隔符歧义，禁止改用未转义分隔符拼接。
+     */
+    private String fingerprint(String operation, Object canonical) {
+        try {
+            Map<String, Object> envelope = new TreeMap<>();
+            envelope.put("operation", operation);
+            envelope.put("params", canonical);
+            return sha256(objectMapper.writeValueAsString(envelope));
+        } catch (Exception e) {
+            throw new IllegalStateException("幂等指纹序列化失败", e);
         }
-        return sb.toString();
+    }
+
+    /** 保持插入顺序的字段映射，配合 {@link #fingerprint} 做稳定 JSON 序列化。 */
+    private static Map<String, Object> orderedMap(Object... kv) {
+        Map<String, Object> map = new LinkedHashMap<>();
+        for (int i = 0; i < kv.length; i += 2) {
+            map.put((String) kv[i], kv[i + 1]);
+        }
+        return map;
+    }
+
+    private List<Map<String, Object>> canonicalSegments(List<SegmentInput> segments) {
+        return segments.stream()
+                .sorted(Comparator.comparingLong((SegmentInput s) ->
+                                s.start() == null ? Long.MIN_VALUE : toMs(s.start()))
+                        .thenComparing(s -> s.id() == null ? "" : s.id()))
+                .map(s -> orderedMap(
+                        "id", s.id() == null ? "" : s.id(),
+                        "assetId", s.assetId(),
+                        "start", s.start() == null ? "" : toMs(s.start()),
+                        "end", s.end() == null ? "" : toMs(s.end())))
+                .toList();
     }
 
     private PlayoutDecisionResponse fallback(String channelId, OffsetDateTime at, String assetId,
                                              FallbackReason reason) {
         return new PlayoutDecisionResponse(channelId, at, assetId,
-                DecisionSource.FALLBACK, reason, null, null, null);
+                DecisionSource.FALLBACK, reason, null, null, null, null);
     }
 
     private static long toMs(OffsetDateTime time) {
@@ -566,8 +1161,8 @@ public class PlayoutService {
         return OffsetDateTime.ofInstant(Instant.ofEpochMilli(epochMs), ZONE);
     }
 
-    private static long nowMs() {
-        return System.currentTimeMillis();
+    private long nowMs() {
+        return clock.nowMs();
     }
 
     private static String sha256(String text) {
@@ -590,5 +1185,16 @@ public class PlayoutService {
         SegmentResponse toResponse() {
             return new SegmentResponse(id, assetId, atMs(startMs), atMs(endMs));
         }
+    }
+
+    /** 通过校验、待写入的单条直播覆盖令最终状态。 */
+    private record PlannedLiveOverride(String key, String channelId, String sourceId, long grantId,
+                                       long startMs, long endMs, long grantValidFromMs,
+                                       long grantValidToMs, List<PlannedAffected> affected) {
+    }
+
+    /** 待写入的受影响素材及该片段实际被抑制毫秒数。 */
+    private record PlannedAffected(LocalDate businessDay, long publicationId, String segmentId,
+                                   String assetId, long startMs, long endMs, long suppressedMs) {
     }
 }

@@ -91,3 +91,75 @@ CREATE TABLE IF NOT EXISTS playout_emergency_override (
 );
 CREATE INDEX IF NOT EXISTS idx_override_playout
     ON playout_emergency_override (channel_id, status, start_ms, end_ms, priority);
+
+CREATE TABLE IF NOT EXISTS playout_live_override (
+    id                BIGINT      NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    override_key      VARCHAR(64) NOT NULL,
+    channel_id        VARCHAR(64) NOT NULL,
+    source_id         VARCHAR(64) NOT NULL,
+    grant_id          BIGINT      NOT NULL,
+    start_ms          BIGINT      NOT NULL,
+    end_ms            BIGINT      NOT NULL,
+    status            VARCHAR(16) NOT NULL,
+    started_at_ms     BIGINT      NULL,
+    ended_at_ms       BIGINT      NULL,
+    create_request_id VARCHAR(64) NOT NULL,
+    operator          VARCHAR(64) NOT NULL,
+    created_at_ms     BIGINT      NOT NULL,
+    revoke_request_id VARCHAR(64) NULL,
+    revoke_operator   VARCHAR(64) NULL,
+    revoked_at_ms     BIGINT      NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uk_live_override_key
+    ON playout_live_override (override_key);
+CREATE INDEX IF NOT EXISTS idx_live_override_channel_time
+    ON playout_live_override (channel_id, status, start_ms, end_ms);
+
+CREATE TABLE IF NOT EXISTS playout_live_affected (
+    id                 BIGINT      NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    live_override_id   BIGINT      NOT NULL,
+    channel_id         VARCHAR(64) NOT NULL,
+    business_day       DATE        NOT NULL,
+    publication_id     BIGINT      NOT NULL,
+    segment_id         VARCHAR(64) NOT NULL,
+    asset_id           VARCHAR(64) NOT NULL,
+    scheduled_start_ms BIGINT      NOT NULL,
+    scheduled_end_ms   BIGINT      NOT NULL,
+    result             VARCHAR(24) NOT NULL,
+    decided_at_ms      BIGINT      NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uk_live_affected
+    ON playout_live_affected (live_override_id, publication_id, segment_id);
+CREATE INDEX IF NOT EXISTS idx_live_affected_segment
+    ON playout_live_affected (channel_id, publication_id, segment_id, result);
+
+CREATE TABLE IF NOT EXISTS playout_live_grant_snapshot (
+    id               BIGINT      NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    live_override_id BIGINT      NOT NULL,
+    grant_id         BIGINT      NOT NULL,
+    channel_id       VARCHAR(64) NOT NULL,
+    asset_id         VARCHAR(64) NOT NULL,
+    valid_from_ms    BIGINT      NOT NULL,
+    valid_to_ms      BIGINT      NOT NULL,
+    revoked          TINYINT(1)  NOT NULL,
+    captured_at_ms   BIGINT      NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uk_live_grant_snapshot
+    ON playout_live_grant_snapshot (live_override_id, grant_id);
+
+CREATE TABLE IF NOT EXISTS playout_live_recovery (
+    id                 BIGINT      NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    live_override_id   BIGINT      NOT NULL,
+    channel_id         VARCHAR(64) NOT NULL,
+    business_day       DATE        NOT NULL,
+    publication_id     BIGINT      NOT NULL,
+    segment_id         VARCHAR(64) NOT NULL,
+    result             VARCHAR(24) NOT NULL,
+    scheduled_start_ms BIGINT      NOT NULL,
+    scheduled_end_ms   BIGINT      NOT NULL,
+    recovered_at_ms    BIGINT      NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uk_live_recovery
+    ON playout_live_recovery (live_override_id, publication_id, segment_id);
+CREATE INDEX IF NOT EXISTS idx_live_recovery_channel
+    ON playout_live_recovery (channel_id, business_day);

@@ -97,3 +97,72 @@ CREATE TABLE IF NOT EXISTS playout_emergency_override (
     PRIMARY KEY (override_key),
     KEY idx_override_playout (channel_id, status, start_ms, end_ms, priority)
 ) COMMENT = '限时紧急插播表；不改写日草稿与发布快照，同频道同优先级 ACTIVE 区间不得重叠';
+
+CREATE TABLE IF NOT EXISTS playout_live_override (
+    id                BIGINT      NOT NULL AUTO_INCREMENT COMMENT '直播覆盖令自增 ID',
+    override_key      VARCHAR(64) NOT NULL COMMENT '直播覆盖令全局唯一键，客户端指定，创建后不变',
+    channel_id        VARCHAR(64) NOT NULL COMMENT '覆盖频道 ID',
+    source_id         VARCHAR(64) NOT NULL COMMENT '直播源 ID（素材表中存在的直播源素材）',
+    grant_id          BIGINT      NOT NULL COMMENT '创建时锁定的频道+直播源授权 ID，须未撤销并完整覆盖区间',
+    start_ms          BIGINT      NOT NULL COMMENT '覆盖开始（含），UTC 纪元毫秒',
+    end_ms            BIGINT      NOT NULL COMMENT '覆盖结束（不含），UTC 纪元毫秒；区间左闭右开',
+    status            VARCHAR(16) NOT NULL COMMENT '状态：SCHEDULED 未开始 / ACTIVE 覆盖中 / ENDED 已结束并完成裁决 / REVOKED 开始前撤销；均为不可变历史',
+    started_at_ms     BIGINT      NULL COMMENT '进入 ACTIVE 的时间，UTC 纪元毫秒；未开始时为 NULL',
+    ended_at_ms       BIGINT      NULL COMMENT '进入 ENDED 的时间，UTC 纪元毫秒；未结束时为 NULL',
+    create_request_id VARCHAR(64) NOT NULL COMMENT '创建操作的幂等请求 ID',
+    operator          VARCHAR(64) NOT NULL COMMENT '创建操作者标识，参与幂等指纹，创建后不可变',
+    created_at_ms     BIGINT      NOT NULL COMMENT '创建时间，UTC 纪元毫秒',
+    revoke_request_id VARCHAR(64) NULL COMMENT '撤销操作的幂等请求 ID；未撤销时为 NULL，撤销后不可改写',
+    revoke_operator   VARCHAR(64) NULL COMMENT '撤销操作者标识；未撤销时为 NULL',
+    revoked_at_ms     BIGINT      NULL COMMENT '撤销时间，UTC 纪元毫秒；未撤销时为 NULL',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_live_override_key (override_key),
+    KEY idx_live_override_channel_time (channel_id, status, start_ms, end_ms)
+) COMMENT = '直播覆盖令表；同一频道时段仅一个有效覆盖，创建/撤销/草稿修改/紧急插播按提交顺序裁决';
+
+CREATE TABLE IF NOT EXISTS playout_live_affected (
+    id                 BIGINT      NOT NULL AUTO_INCREMENT COMMENT '受影响素材记录自增 ID',
+    live_override_id   BIGINT      NOT NULL COMMENT '所属直播覆盖令 ID',
+    channel_id         VARCHAR(64) NOT NULL COMMENT '频道 ID',
+    business_day       DATE        NOT NULL COMMENT '受影响片段业务日，Asia/Shanghai 日历日',
+    publication_id     BIGINT      NOT NULL COMMENT '创建覆盖令时命中的已发布编排快照 ID（不可变证据）',
+    segment_id         VARCHAR(64) NOT NULL COMMENT '快照内被覆盖的片段 ID',
+    asset_id           VARCHAR(64) NOT NULL COMMENT '被覆盖的原计划素材 ID',
+    scheduled_start_ms BIGINT      NOT NULL COMMENT '原计划开始（含），UTC 纪元毫秒',
+    scheduled_end_ms   BIGINT      NOT NULL COMMENT '原计划结束（不含），UTC 纪元毫秒',
+    result             VARCHAR(24) NOT NULL COMMENT '裁决结果：SUPPRESSED 覆盖中占位 / RESUMED 覆盖结束后恢复播出 / MISSED_BY_LIVE 已错过不补播；写入后不可变',
+    decided_at_ms      BIGINT      NULL COMMENT '结果最近裁决时间，UTC 纪元毫秒；创建时为 NULL',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_live_affected (live_override_id, publication_id, segment_id),
+    KEY idx_live_affected_segment (channel_id, publication_id, segment_id, result)
+) COMMENT = '直播覆盖受影响素材表，覆盖内素材保留占位但不播出，恢复/错过记录不可变';
+
+CREATE TABLE IF NOT EXISTS playout_live_grant_snapshot (
+    id               BIGINT      NOT NULL AUTO_INCREMENT COMMENT '授权版本快照自增 ID',
+    live_override_id BIGINT      NOT NULL COMMENT '所属直播覆盖令 ID',
+    grant_id         BIGINT      NOT NULL COMMENT '授权 ID',
+    channel_id       VARCHAR(64) NOT NULL COMMENT '授权频道 ID（快照值）',
+    asset_id         VARCHAR(64) NOT NULL COMMENT '授权素材 ID（快照值）',
+    valid_from_ms    BIGINT      NOT NULL COMMENT '授权生效起点（含）快照值，UTC 纪元毫秒',
+    valid_to_ms      BIGINT      NOT NULL COMMENT '授权生效终点（不含）快照值，UTC 纪元毫秒',
+    revoked          TINYINT(1)  NOT NULL COMMENT '创建覆盖令时的授权撤销状态：0 未撤销，1 已撤销',
+    captured_at_ms   BIGINT      NOT NULL COMMENT '快照抓取时间，UTC 纪元毫秒',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_live_grant_snapshot (live_override_id, grant_id)
+) COMMENT = '直播覆盖授权版本快照表，记录创建时授权证据，后续撤销不改写快照';
+
+CREATE TABLE IF NOT EXISTS playout_live_recovery (
+    id                 BIGINT      NOT NULL AUTO_INCREMENT COMMENT '恢复结果记录自增 ID',
+    live_override_id   BIGINT      NOT NULL COMMENT '所属直播覆盖令 ID',
+    channel_id         VARCHAR(64) NOT NULL COMMENT '频道 ID',
+    business_day       DATE        NOT NULL COMMENT '恢复片段业务日，Asia/Shanghai 日历日',
+    publication_id     BIGINT      NOT NULL COMMENT '恢复依据的已发布编排快照 ID',
+    segment_id         VARCHAR(64) NOT NULL COMMENT '被裁决的片段 ID',
+    result             VARCHAR(24) NOT NULL COMMENT '恢复裁决结果：RESUMED 未开始已恢复 / MISSED_BY_LIVE 已开始或已结束而错过',
+    scheduled_start_ms BIGINT      NOT NULL COMMENT '原计划开始（含），UTC 纪元毫秒',
+    scheduled_end_ms   BIGINT      NOT NULL COMMENT '原计划结束（不含），UTC 纪元毫秒',
+    recovered_at_ms    BIGINT      NOT NULL COMMENT '裁决时间（覆盖结束处理时刻），UTC 纪元毫秒',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_live_recovery (live_override_id, publication_id, segment_id),
+    KEY idx_live_recovery_channel (channel_id, business_day)
+) COMMENT = '直播覆盖结束恢复结果表，每个受影响素材一条不可变裁决，不自动补播';

@@ -11,6 +11,7 @@ import java.sql.Date;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
 import java.time.LocalDate;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 
@@ -291,6 +292,14 @@ public class PlayoutRepository {
                 PUBLICATION_SEGMENT_MAPPER, publicationId, atMs, atMs).stream().findFirst();
     }
 
+    /** 某发布快照的全部片段，按开始时间、片段 ID 排序。 */
+    public List<PublicationSegmentRow> findPublicationSegments(long publicationId) {
+        return jdbc.query("SELECT id, publication_id, segment_id, asset_id, grant_id, start_ms, end_ms"
+                        + " FROM playout_publication_segment"
+                        + " WHERE publication_id = ? ORDER BY start_ms, segment_id",
+                PUBLICATION_SEGMENT_MAPPER, publicationId);
+    }
+
     // ---------- 幂等请求记录 ----------
 
     /** 按请求 ID 查询并加行锁，用于去重判定。 */
@@ -380,5 +389,290 @@ public class PlayoutRepository {
                         + " SET status = 'CANCELLED', cancel_request_id = ?, cancelled_at_ms = ?"
                         + " WHERE override_key = ? AND status = 'ACTIVE'",
                 cancelRequestId, cancelledAtMs, overrideKey);
+    }
+
+    // ---------- 直播覆盖令 ----------
+
+    /** 直播覆盖令行；status 为 SCHEDULED / ACTIVE / ENDED / REVOKED。 */
+    public record LiveOverrideRow(long id, String overrideKey, String channelId, String sourceId,
+                                  long grantId, long startMs, long endMs, String status,
+                                  Long startedAtMs, Long endedAtMs, String createRequestId,
+                                  String operator, long createdAtMs, String revokeRequestId,
+                                  String revokeOperator, Long revokedAtMs) {
+    }
+
+    /** 受影响素材行（不可变证据）；result 创建时为 SUPPRESSED，最终裁决见恢复结果表。 */
+    public record LiveAffectedRow(long id, long liveOverrideId, String channelId,
+                                  LocalDate businessDay, long publicationId, String segmentId,
+                                  String assetId, long scheduledStartMs, long scheduledEndMs,
+                                  String result) {
+    }
+
+    /** 授权版本快照行。 */
+    public record LiveGrantSnapshotRow(long id, long liveOverrideId, long grantId, String channelId,
+                                       String assetId, long validFromMs, long validToMs,
+                                       boolean revoked, long capturedAtMs) {
+    }
+
+    /** 覆盖结束恢复裁决行；result 为 RESUMED / MISSED_BY_LIVE。 */
+    public record LiveRecoveryRow(long id, long liveOverrideId, String channelId,
+                                  LocalDate businessDay, long publicationId, String segmentId,
+                                  String result, long scheduledStartMs, long scheduledEndMs,
+                                  long recoveredAtMs) {
+    }
+
+    private static final RowMapper<LiveOverrideRow> LIVE_OVERRIDE_MAPPER = (rs, n) ->
+            new LiveOverrideRow(rs.getLong("id"), rs.getString("override_key"),
+                    rs.getString("channel_id"), rs.getString("source_id"), rs.getLong("grant_id"),
+                    rs.getLong("start_ms"), rs.getLong("end_ms"), rs.getString("status"),
+                    (Long) rs.getObject("started_at_ms"), (Long) rs.getObject("ended_at_ms"),
+                    rs.getString("create_request_id"), rs.getString("operator"),
+                    rs.getLong("created_at_ms"), rs.getString("revoke_request_id"),
+                    rs.getString("revoke_operator"), (Long) rs.getObject("revoked_at_ms"));
+
+    private static final RowMapper<LiveAffectedRow> LIVE_AFFECTED_MAPPER = (rs, n) ->
+            new LiveAffectedRow(rs.getLong("id"), rs.getLong("live_override_id"),
+                    rs.getString("channel_id"), rs.getDate("business_day").toLocalDate(),
+                    rs.getLong("publication_id"), rs.getString("segment_id"),
+                    rs.getString("asset_id"), rs.getLong("scheduled_start_ms"),
+                    rs.getLong("scheduled_end_ms"), rs.getString("result"));
+
+    private static final RowMapper<LiveGrantSnapshotRow> LIVE_GRANT_SNAPSHOT_MAPPER = (rs, n) ->
+            new LiveGrantSnapshotRow(rs.getLong("id"), rs.getLong("live_override_id"),
+                    rs.getLong("grant_id"), rs.getString("channel_id"), rs.getString("asset_id"),
+                    rs.getLong("valid_from_ms"), rs.getLong("valid_to_ms"),
+                    rs.getBoolean("revoked"), rs.getLong("captured_at_ms"));
+
+    private static final RowMapper<LiveRecoveryRow> LIVE_RECOVERY_MAPPER = (rs, n) ->
+            new LiveRecoveryRow(rs.getLong("id"), rs.getLong("live_override_id"),
+                    rs.getString("channel_id"), rs.getDate("business_day").toLocalDate(),
+                    rs.getLong("publication_id"), rs.getString("segment_id"),
+                    rs.getString("result"), rs.getLong("scheduled_start_ms"),
+                    rs.getLong("scheduled_end_ms"), rs.getLong("recovered_at_ms"));
+
+    private static final String LIVE_OVERRIDE_COLUMNS =
+            "id, override_key, channel_id, source_id, grant_id, start_ms, end_ms, status,"
+                    + " started_at_ms, ended_at_ms, create_request_id, operator, created_at_ms,"
+                    + " revoke_request_id, revoke_operator, revoked_at_ms";
+
+    public long insertLiveOverride(String overrideKey, String channelId, String sourceId, long grantId,
+                                   long startMs, long endMs, String status, String createRequestId,
+                                   String operator, long createdAtMs) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO playout_live_override (override_key, channel_id, source_id, grant_id,"
+                            + " start_ms, end_ms, status, create_request_id, operator, created_at_ms)"
+                            + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, overrideKey);
+            ps.setString(2, channelId);
+            ps.setString(3, sourceId);
+            ps.setLong(4, grantId);
+            ps.setLong(5, startMs);
+            ps.setLong(6, endMs);
+            ps.setString(7, status);
+            ps.setString(8, createRequestId);
+            ps.setString(9, operator);
+            ps.setLong(10, createdAtMs);
+            return ps;
+        }, keyHolder);
+        return keyHolder.getKey().longValue();
+    }
+
+    public Optional<LiveOverrideRow> findLiveOverrideByKey(String overrideKey) {
+        return jdbc.query("SELECT " + LIVE_OVERRIDE_COLUMNS
+                        + " FROM playout_live_override WHERE override_key = ?",
+                LIVE_OVERRIDE_MAPPER, overrideKey).stream().findFirst();
+    }
+
+    /** 按全局键查询并加行锁。 */
+    public Optional<LiveOverrideRow> findLiveOverrideForUpdate(String overrideKey) {
+        return jdbc.query("SELECT " + LIVE_OVERRIDE_COLUMNS
+                        + " FROM playout_live_override WHERE override_key = ? FOR UPDATE",
+                LIVE_OVERRIDE_MAPPER, overrideKey).stream().findFirst();
+    }
+
+    /** 按有序键列表批量加行锁（锁顺序与列表一致，调用方须先排序）。 */
+    public List<LiveOverrideRow> findLiveOverridesForUpdate(List<String> overrideKeys) {
+        if (overrideKeys.isEmpty()) {
+            return List.of();
+        }
+        String placeholders = String.join(",", overrideKeys.stream().map(k -> "?").toList());
+        return jdbc.query("SELECT " + LIVE_OVERRIDE_COLUMNS
+                        + " FROM playout_live_override WHERE override_key IN (" + placeholders
+                        + ") ORDER BY id FOR UPDATE",
+                LIVE_OVERRIDE_MAPPER, overrideKeys.toArray());
+    }
+
+    /** 同频道状态为 SCHEDULED/ACTIVE 且与 [startMs, endMs) 严格相交的覆盖令（相邻不相交），加锁。 */
+    public List<LiveOverrideRow> findLiveOverlappingForUpdate(String channelId, long startMs, long endMs) {
+        return jdbc.query("SELECT " + LIVE_OVERRIDE_COLUMNS
+                        + " FROM playout_live_override"
+                        + " WHERE channel_id = ? AND status IN ('SCHEDULED', 'ACTIVE')"
+                        + " AND start_ms < ? AND end_ms > ? ORDER BY start_ms, id FOR UPDATE",
+                LIVE_OVERRIDE_MAPPER, channelId, endMs, startMs);
+    }
+
+    /** 同频道与业务日窗口 [dayStartMs, dayEndMs) 相交的非终态覆盖令，加锁。 */
+    public List<LiveOverrideRow> findLiveIntersectingDayForUpdate(String channelId,
+                                                                  long dayStartMs, long dayEndMs) {
+        return jdbc.query("SELECT " + LIVE_OVERRIDE_COLUMNS
+                        + " FROM playout_live_override"
+                        + " WHERE channel_id = ? AND status IN ('SCHEDULED', 'ACTIVE')"
+                        + " AND start_ms < ? AND end_ms > ? ORDER BY start_ms, id FOR UPDATE",
+                LIVE_OVERRIDE_MAPPER, channelId, dayEndMs, dayStartMs);
+    }
+
+    /** 到点应推进状态的覆盖令：SCHEDULED 已到开始，或 ACTIVE 已到结束，加锁。 */
+    public List<LiveOverrideRow> findDueLiveOverridesForUpdate(String channelId, long nowMs) {
+        return jdbc.query("SELECT " + LIVE_OVERRIDE_COLUMNS
+                        + " FROM playout_live_override WHERE channel_id = ?"
+                        + " AND ((status = 'SCHEDULED' AND start_ms <= ?)"
+                        + " OR (status = 'ACTIVE' AND end_ms <= ?)) ORDER BY start_ms, id FOR UPDATE",
+                LIVE_OVERRIDE_MAPPER, channelId, nowMs, nowMs);
+    }
+
+    /** 某时刻按时间窗口命中的直播覆盖（读路径不依赖状态推进，REVOKED/ENDED 不命中）。 */
+    public Optional<LiveOverrideRow> findLiveWindowAt(String channelId, long atMs) {
+        return jdbc.query("SELECT " + LIVE_OVERRIDE_COLUMNS
+                        + " FROM playout_live_override"
+                        + " WHERE channel_id = ? AND status IN ('SCHEDULED', 'ACTIVE')"
+                        + " AND start_ms <= ? AND end_ms > ? ORDER BY start_ms, id LIMIT 1",
+                LIVE_OVERRIDE_MAPPER, channelId, atMs, atMs).stream().findFirst();
+    }
+
+    /** SCHEDULED → ACTIVE；返回受影响行数。 */
+    public int activateLiveOverride(long id, long startedAtMs) {
+        return jdbc.update("UPDATE playout_live_override SET status = 'ACTIVE', started_at_ms = ?"
+                + " WHERE id = ? AND status = 'SCHEDULED'", startedAtMs, id);
+    }
+
+    /** ACTIVE → ENDED；返回受影响行数。 */
+    public int finishLiveOverride(long id, long endedAtMs) {
+        return jdbc.update("UPDATE playout_live_override SET status = 'ENDED', ended_at_ms = ?"
+                + " WHERE id = ? AND status = 'ACTIVE'", endedAtMs, id);
+    }
+
+    /** 撤销未开始的覆盖令；返回受影响行数，0 表示不存在或已非 SCHEDULED。 */
+    public int revokeLiveOverride(String overrideKey, String revokeRequestId, String operator,
+                                  long revokedAtMs) {
+        return jdbc.update("UPDATE playout_live_override"
+                        + " SET status = 'REVOKED', revoke_request_id = ?, revoke_operator = ?,"
+                        + " revoked_at_ms = ? WHERE override_key = ? AND status = 'SCHEDULED'",
+                revokeRequestId, operator, revokedAtMs, overrideKey);
+    }
+
+    /** 历史查询：频道可选、UTC 时间窗口可选，排序固定为开始时间升序、ID 升序。 */
+    public List<LiveOverrideRow> listLiveOverrides(String channelId, Long fromMs, Long toMs) {
+        StringBuilder sql = new StringBuilder("SELECT ").append(LIVE_OVERRIDE_COLUMNS)
+                .append(" FROM playout_live_override WHERE 1 = 1");
+        List<Object> args = new ArrayList<>();
+        if (channelId != null) {
+            sql.append(" AND channel_id = ?");
+            args.add(channelId);
+        }
+        if (fromMs != null) {
+            sql.append(" AND end_ms > ?");
+            args.add(fromMs);
+        }
+        if (toMs != null) {
+            sql.append(" AND start_ms < ?");
+            args.add(toMs);
+        }
+        sql.append(" ORDER BY start_ms ASC, id ASC");
+        return jdbc.query(sql.toString(), LIVE_OVERRIDE_MAPPER, args.toArray());
+    }
+
+    /** 某频道窗口内的全部覆盖令（诊断用），排序同为开始时间、ID 升序。 */
+    public List<LiveOverrideRow> findLiveOverridesInWindow(String channelId, long fromMs, long toMs) {
+        return jdbc.query("SELECT " + LIVE_OVERRIDE_COLUMNS
+                        + " FROM playout_live_override WHERE channel_id = ?"
+                        + " AND start_ms < ? AND end_ms > ? ORDER BY start_ms, id",
+                LIVE_OVERRIDE_MAPPER, channelId, toMs, fromMs);
+    }
+
+    public void insertLiveAffected(long liveOverrideId, String channelId, LocalDate businessDay,
+                                   long publicationId, String segmentId, String assetId,
+                                   long scheduledStartMs, long scheduledEndMs) {
+        jdbc.update("INSERT INTO playout_live_affected (live_override_id, channel_id, business_day,"
+                        + " publication_id, segment_id, asset_id, scheduled_start_ms, scheduled_end_ms,"
+                        + " result) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'SUPPRESSED')",
+                liveOverrideId, channelId, Date.valueOf(businessDay), publicationId, segmentId,
+                assetId, scheduledStartMs, scheduledEndMs);
+    }
+
+    /** 受影响素材按原计划开始时间、快照 ID、片段 ID 稳定排序。 */
+    public List<LiveAffectedRow> findLiveAffected(long liveOverrideId) {
+        return jdbc.query("SELECT id, live_override_id, channel_id, business_day, publication_id,"
+                        + " segment_id, asset_id, scheduled_start_ms, scheduled_end_ms, result"
+                        + " FROM playout_live_affected WHERE live_override_id = ?"
+                        + " ORDER BY scheduled_start_ms, publication_id, segment_id",
+                LIVE_AFFECTED_MAPPER, liveOverrideId);
+    }
+
+    public void insertLiveGrantSnapshot(long liveOverrideId, long grantId, String channelId,
+                                        String assetId, long validFromMs, long validToMs,
+                                        boolean revoked, long capturedAtMs) {
+        jdbc.update("INSERT INTO playout_live_grant_snapshot (live_override_id, grant_id, channel_id,"
+                        + " asset_id, valid_from_ms, valid_to_ms, revoked, captured_at_ms)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                liveOverrideId, grantId, channelId, assetId, validFromMs, validToMs,
+                revoked ? 1 : 0, capturedAtMs);
+    }
+
+    public Optional<LiveGrantSnapshotRow> findLiveGrantSnapshot(long liveOverrideId) {
+        return jdbc.query("SELECT id, live_override_id, grant_id, channel_id, asset_id, valid_from_ms,"
+                        + " valid_to_ms, revoked, captured_at_ms FROM playout_live_grant_snapshot"
+                        + " WHERE live_override_id = ?",
+                LIVE_GRANT_SNAPSHOT_MAPPER, liveOverrideId).stream().findFirst();
+    }
+
+    public void insertLiveRecovery(long liveOverrideId, String channelId, LocalDate businessDay,
+                                   long publicationId, String segmentId, String result,
+                                   long scheduledStartMs, long scheduledEndMs, long recoveredAtMs) {
+        jdbc.update("INSERT INTO playout_live_recovery (live_override_id, channel_id, business_day,"
+                        + " publication_id, segment_id, result, scheduled_start_ms, scheduled_end_ms,"
+                        + " recovered_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                liveOverrideId, channelId, Date.valueOf(businessDay), publicationId, segmentId,
+                result, scheduledStartMs, scheduledEndMs, recoveredAtMs);
+    }
+
+    /** 恢复裁决按原计划开始时间、快照 ID、片段 ID 稳定排序。 */
+    public List<LiveRecoveryRow> findLiveRecovery(long liveOverrideId) {
+        return jdbc.query("SELECT id, live_override_id, channel_id, business_day, publication_id,"
+                        + " segment_id, result, scheduled_start_ms, scheduled_end_ms, recovered_at_ms"
+                        + " FROM playout_live_recovery WHERE live_override_id = ?"
+                        + " ORDER BY scheduled_start_ms, publication_id, segment_id",
+                LIVE_RECOVERY_MAPPER, liveOverrideId);
+    }
+
+    /** 统计某覆盖令某裁决结果数量。 */
+    public long countLiveRecovery(long liveOverrideId, String result) {
+        Long count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM playout_live_recovery WHERE live_override_id = ? AND result = ?",
+                Long.class, liveOverrideId, result);
+        return count == null ? 0L : count;
+    }
+
+    /** 查询某快照片段在该频道的恢复裁决结果（RESUMED / MISSED_BY_LIVE），无证据时为空。 */
+    public Optional<String> findLiveRecoveryResultForSegment(String channelId, long publicationId,
+                                                             String segmentId) {
+        return jdbc.query("SELECT r.result FROM playout_live_recovery r"
+                        + " WHERE r.channel_id = ? AND r.publication_id = ? AND r.segment_id = ?"
+                        + " ORDER BY r.id LIMIT 1",
+                (rs, n) -> rs.getString("result"), channelId, publicationId, segmentId)
+                .stream().findFirst();
+    }
+
+    /** 同频道任意优先级、与区间相交的 ACTIVE 紧急插播（用于直播覆盖创建冲突判定）。 */
+    public List<OverrideRow> findAnyActiveEmergencyOverlappingForUpdate(String channelId,
+                                                                        long startMs, long endMs) {
+        return jdbc.query("SELECT override_key, channel_id, asset_id, grant_id, priority, start_ms,"
+                        + " end_ms, business_day, status, cancel_request_id, cancelled_at_ms, created_at_ms"
+                        + " FROM playout_emergency_override"
+                        + " WHERE channel_id = ? AND status = 'ACTIVE'"
+                        + " AND start_ms < ? AND end_ms > ?"
+                        + " ORDER BY start_ms, override_key FOR UPDATE",
+                OVERRIDE_MAPPER, channelId, endMs, startMs);
     }
 }

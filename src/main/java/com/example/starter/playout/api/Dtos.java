@@ -1,5 +1,6 @@
 package com.example.starter.playout.api;
 
+import jakarta.validation.Valid;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
@@ -107,17 +108,20 @@ public final class Dtos {
             long draftVersion) {
     }
 
-    /** 播出决定来源：EMERGENCY 命中紧急插播，PROGRAM 命中节目片段，FALLBACK 返回保底素材。 */
+    /** 播出决定来源：LIVE 命中直播覆盖，EMERGENCY 命中紧急插播，PROGRAM 命中节目片段，FALLBACK 返回保底素材。 */
     public enum DecisionSource {
-        EMERGENCY, PROGRAM, FALLBACK
+        LIVE, EMERGENCY, PROGRAM, FALLBACK
     }
 
-    /** 保底原因：无已发布编排 / 处于空档 / 覆盖片段的授权已撤销。 */
+    /** 保底原因：无已发布编排 / 处于空档 / 覆盖片段的授权已撤销 / 原素材已被直播错过且不补播。 */
     public enum FallbackReason {
-        NO_PUBLISHED_SCHEDULE, GAP, GRANT_REVOKED
+        NO_PUBLISHED_SCHEDULE, GAP, GRANT_REVOKED, LIVE_PREEMPTED
     }
 
-    /** 播出决定响应；source 为 FALLBACK 时 reason 非空；source 为 EMERGENCY 时 overrideKey 非空。 */
+    /**
+     * 播出决定响应；source 为 FALLBACK 时 reason 非空；source 为 EMERGENCY 时 overrideKey 非空；
+     * source 为 LIVE 时 liveOverrideKey 非空。
+     */
     public record PlayoutDecisionResponse(
             String channelId,
             OffsetDateTime at,
@@ -126,7 +130,8 @@ public final class Dtos {
             FallbackReason reason,
             Long publicationId,
             String segmentId,
-            String overrideKey) {
+            String overrideKey,
+            String liveOverrideKey) {
     }
 
     /** 紧急插播状态：创建即 ACTIVE，取消后为 CANCELLED，均为终态语义（ACTIVE 只能转为 CANCELLED）。 */
@@ -170,5 +175,152 @@ public final class Dtos {
 
     /** 统一错误响应体。 */
     public record ErrorResponse(String error, String message) {
+    }
+
+    /** 直播覆盖令状态：SCHEDULED 未开始 / ACTIVE 覆盖中 / ENDED 已结束并裁决 / REVOKED 开始前撤销。 */
+    public enum LiveOverrideStatus {
+        SCHEDULED, ACTIVE, ENDED, REVOKED
+    }
+
+    /**
+     * 创建直播覆盖令条目（批量中的一项，支持跨频道）。区间 [start, end) 为 UTC 左闭右开；
+     * 直播源 sourceId 必须是频道已授权素材，grantId 必须属于该频道与直播源、未撤销且完整覆盖区间。
+     */
+    public record CreateLiveOverrideItem(
+            @NotBlank String overrideKey,
+            @NotBlank String channelId,
+            @NotBlank String sourceId,
+            @NotNull @Positive Long grantId,
+            @NotNull OffsetDateTime start,
+            @NotNull OffsetDateTime end) {
+    }
+
+    /**
+     * 批量创建直播覆盖令请求。operator 为操作者标识，对全部条目生效并参与幂等指纹；
+     * 任一条目校验失败则整体拒绝，不留部分覆盖。
+     */
+    public record CreateLiveOverridesRequest(
+            @NotBlank String requestId,
+            @NotBlank String operator,
+            @NotNull List<@NotNull @Valid CreateLiveOverrideItem> items) {
+    }
+
+    /** 撤销直播覆盖令请求；仅 SCHEDULED（尚未开始覆盖）可撤销。 */
+    public record RevokeLiveOverrideRequest(
+            @NotBlank String requestId,
+            @NotBlank String operator) {
+    }
+
+    /** 受影响素材明细；result 为 SUPPRESSED / RESUMED / MISSED_BY_LIVE，decidedAt 未裁决时为 null。 */
+    public record LiveAffectedItem(
+            long publicationId,
+            String businessDay,
+            String segmentId,
+            String assetId,
+            OffsetDateTime scheduledStart,
+            OffsetDateTime scheduledEnd,
+            String result,
+            OffsetDateTime decidedAt) {
+    }
+
+    /** 覆盖结束后的不可变恢复裁决明细。 */
+    public record LiveRecoveryItem(
+            long publicationId,
+            String businessDay,
+            String segmentId,
+            String result,
+            OffsetDateTime scheduledStart,
+            OffsetDateTime scheduledEnd,
+            OffsetDateTime recoveredAt) {
+    }
+
+    /** 创建覆盖令时的授权版本快照（不可变证据）。 */
+    public record LiveGrantSnapshot(
+            long grantId,
+            String channelId,
+            String assetId,
+            OffsetDateTime validFrom,
+            OffsetDateTime validTo,
+            boolean revoked,
+            OffsetDateTime capturedAt) {
+    }
+
+    /** 直播覆盖令明细响应，含受影响素材、授权快照与恢复结果；历史字段创建后不再改写。 */
+    public record LiveOverrideResponse(
+            long id,
+            String overrideKey,
+            String channelId,
+            String sourceId,
+            long grantId,
+            OffsetDateTime start,
+            OffsetDateTime end,
+            LiveOverrideStatus status,
+            String operator,
+            OffsetDateTime startedAt,
+            OffsetDateTime endedAt,
+            OffsetDateTime createdAt,
+            String revokeRequestId,
+            String revokeOperator,
+            OffsetDateTime revokedAt,
+            long overrideDurationMs,
+            int affectedCount,
+            long suppressedDurationMs,
+            int resumedCount,
+            int missedCount,
+            List<LiveAffectedItem> affectedItems,
+            List<LiveRecoveryItem> recoveryItems,
+            LiveGrantSnapshot grantSnapshot) {
+    }
+
+    /** 直播覆盖令历史列表项（不含明细集合），排序稳定：开始时间升序、ID 升序。 */
+    public record LiveOverrideSummary(
+            long id,
+            String overrideKey,
+            String channelId,
+            String sourceId,
+            long grantId,
+            OffsetDateTime start,
+            OffsetDateTime end,
+            LiveOverrideStatus status,
+            String operator,
+            OffsetDateTime startedAt,
+            OffsetDateTime endedAt,
+            OffsetDateTime createdAt,
+            String revokeRequestId,
+            OffsetDateTime revokedAt,
+            int affectedCount,
+            int resumedCount,
+            int missedCount) {
+    }
+
+    /**
+     * 批量创建直播覆盖令响应：返回实际创建数量、涉及频道、实际覆盖总时长、受影响素材总数与
+     * 实际抑制总毫秒数，以及每条覆盖令的完整明细（成功重放返回首次响应快照）。
+     */
+    public record LiveOverrideBatchResponse(
+            String requestId,
+            int createdCount,
+            List<String> channelIds,
+            long totalOverrideDurationMs,
+            int affectedCount,
+            long suppressedDurationMs,
+            int resumedCount,
+            int missedCount,
+            List<LiveOverrideResponse> items) {
+    }
+
+    /** 某频道某时刻的直播覆盖诊断；数量与时长均为实际值，单位毫秒。 */
+    public record LiveDiagnosticsResponse(
+            String channelId,
+            OffsetDateTime at,
+            boolean liveOnAir,
+            String activeOverrideKey,
+            String sourceId,
+            long activeOverrideCount,
+            long suppressedSegmentCount,
+            long missedSegmentCount,
+            long resumedSegmentCount,
+            long liveOnAirMs,
+            List<LiveOverrideSummary> overrides) {
     }
 }
