@@ -22,6 +22,9 @@ public class DataInitializer {
                     "INSERT INTO airspace_meta (id, global_version) VALUES (1, 0)");
             insertIfMissing(jdbc, "coord_lock",
                     "INSERT INTO coord_lock (id, touched) VALUES (1, 0)");
+            insertIfMissing(jdbc, "weather_meta",
+                    "INSERT INTO weather_meta (id, weather_version, forecast_version, duty_version) "
+                            + "VALUES (1, 0, 0, 0)");
         };
     }
 

@@ -3,24 +3,32 @@ package com.example.starter.api.dto;
 import java.util.List;
 
 /**
- * 审核结果。历史查询保留原结论；当前查询在版本不再匹配时 conclusion 为 STALE。
+ * 审核结果。历史查询保留原结论；当前查询在任一固化版本不再匹配时 conclusion 为 STALE。
  *
- * @param reviewId        审核记录唯一标识（不可变）
- * @param routeId         航线标识
- * @param routeVersion    审核时的航线版本
- * @param airspaceVersion 审核时的空域版本
- * @param conclusion      CLEAR / BLOCKED / STALE
- * @param hitZoneIds      BLOCKED 时命中的全部 zoneId（字典序去重），否则为空列表
- * @param pointsSnapshot  审核时不可变的航点快照
- * @param current         仅当前查询返回：当前航线/空域是否仍与审核版本匹配
+ * @param reviewId          审核记录唯一标识（不可变）
+ * @param routeId           航线标识
+ * @param routeVersion      审核时的航线版本
+ * @param airspaceVersion   审核时的空域版本
+ * @param weatherVersion    审核时固化的气象标准版本
+ * @param forecastVersion   审核时固化的预测气象版本；null 表示本次审核未涉及预测
+ * @param dutyVersion       审核时固化的值班版本
+ * @param conclusion        CLEAR / BLOCKED / WEATHER_BLOCKED / STALE
+ * @param hitZoneIds        BLOCKED 时命中绝对禁飞区的全部 zoneId（字典序去重），否则为空列表
+ * @param weatherViolations WEATHER_BLOCKED 时的不达标明细（含实际值、要求值、差额），否则为空列表
+ * @param pointsSnapshot    审核时不可变的航点快照
+ * @param current           仅当前查询返回：当前各版本是否仍与审核固化版本一致
  */
 public record ReviewResultDto(
         String reviewId,
         String routeId,
         Integer routeVersion,
         Long airspaceVersion,
+        Long weatherVersion,
+        Long forecastVersion,
+        Long dutyVersion,
         String conclusion,
         List<String> hitZoneIds,
+        List<WeatherViolationDto> weatherViolations,
         List<RoutePointDto> pointsSnapshot,
         Boolean current) {
 }
