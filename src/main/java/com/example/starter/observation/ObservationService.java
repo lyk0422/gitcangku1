@@ -15,6 +15,7 @@ import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HexFormat;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -50,17 +51,26 @@ public class ObservationService {
     private final ObservationRepository observationRepository;
     private final RequestLogRepository requestLogRepository;
     private final ResolutionRepository resolutionRepository;
+    private final AttachmentRepository attachmentRepository;
+    private final RedactionVersionRepository redactionVersionRepository;
+    private final VersionAttachmentRepository versionAttachmentRepository;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public ObservationService(ObservationRepository observationRepository,
                               RequestLogRepository requestLogRepository,
                               ResolutionRepository resolutionRepository,
+                              AttachmentRepository attachmentRepository,
+                              RedactionVersionRepository redactionVersionRepository,
+                              VersionAttachmentRepository versionAttachmentRepository,
                               ObjectMapper objectMapper,
                               Clock clock) {
         this.observationRepository = observationRepository;
         this.requestLogRepository = requestLogRepository;
         this.resolutionRepository = resolutionRepository;
+        this.attachmentRepository = attachmentRepository;
+        this.redactionVersionRepository = redactionVersionRepository;
+        this.versionAttachmentRepository = versionAttachmentRepository;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -102,7 +112,7 @@ public class ObservationService {
     @Transactional
     public WriteOutcome merge(String observationId, MergeObservationRequest request) {
         String fingerprint = fingerprint("MERGE", observationId, String.valueOf(request.baseVersion()),
-                request.location(), request.reading(), request.note());
+                request.location(), request.reading(), request.note(), attachmentRefsFingerprint(request.attachmentRefs()));
         WriteOutcome replayed = checkReplay(request.requestId(), fingerprint);
         if (replayed != null) {
             return replayed;
@@ -131,16 +141,25 @@ public class ObservationService {
             throw ApiException.mergeConflict(conflictFields, current.version());
         }
 
+        // 附件证据引用先校验归属与版本存在性；仅在生成新版本时随版本固化，历史永不更新。
+        validateAttachmentRefs(observationId, request.attachmentRefs());
+
         ObservationSnapshot merged = new ObservationSnapshot(observationId, current.version(),
                 mergedLocation, mergedReading, mergedNote, false);
-        if (sameContent(merged, current)) {
-            // 合并结果与当前完全相同：返回当前版本，不加版本
+        boolean contentChanged = !sameContent(merged, current);
+        if (!contentChanged) {
+            // 合并结果与当前完全相同：不加版本。此时携带附件引用无新版本可固化，明确拒绝避免静默丢弃。
+            if (hasAttachmentRefs(request.attachmentRefs())) {
+                throw ApiException.unprocessable("ATTACHMENT_REFS_WITHOUT_NEW_VERSION",
+                        "attachment refs can only be frozen when the merge creates a new version");
+            }
             return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(current));
         }
         ObservationSnapshot next = new ObservationSnapshot(observationId, current.version() + 1,
                 mergedLocation, mergedReading, mergedNote, false);
         observationRepository.updateCurrent(next);
         observationRepository.insertVersion(next);
+        freezeAttachmentRefs(observationId, next.version(), request.attachmentRefs());
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(next));
     }
 
@@ -194,7 +213,8 @@ public class ObservationService {
         String normalizedSelections = writeSelectionsJson(selections);
         String fingerprint = fingerprint("RESOLVE", observationId, request.resolutionId(),
                 String.valueOf(request.baseVersion()), String.valueOf(request.expectedCurrentVersion()),
-                request.location(), request.reading(), request.note(), normalizedSelections, request.operator());
+                request.location(), request.reading(), request.note(), normalizedSelections, request.operator(),
+                attachmentRefsFingerprint(request.attachmentRefs()));
         ResolveOutcome replayed = checkResolveReplay(request.requestId(), fingerprint);
         if (replayed != null) {
             return replayed;
@@ -245,6 +265,9 @@ public class ObservationService {
         }
         validateSelectionCoverage(selections.keySet(), conflictFields);
 
+        // 附件证据引用先校验归属与版本存在性；仅在生成新版本时随版本固化，历史永不更新。
+        validateAttachmentRefs(observationId, request.attachmentRefs());
+
         String resolvedLocation = resolveFieldValue(locationConflict, selections.get("location"),
                 base.location(), current.location(), request.location(), false);
         String resolvedReading = resolveFieldValue(readingConflict, selections.get("reading"),
@@ -255,12 +278,18 @@ public class ObservationService {
         ObservationSnapshot merged = new ObservationSnapshot(observationId, current.version(),
                 resolvedLocation, resolvedReading, resolvedNote, false);
         boolean contentChanged = !sameContent(merged, current);
+        if (!contentChanged && hasAttachmentRefs(request.attachmentRefs())) {
+            // 无变化解决不生成新版本，携带附件引用无版本可固化，明确拒绝避免静默丢弃。
+            throw ApiException.unprocessable("ATTACHMENT_REFS_WITHOUT_NEW_VERSION",
+                    "attachment refs can only be frozen when the resolution creates a new version");
+        }
         int newVersion = contentChanged ? current.version() + 1 : current.version();
         if (contentChanged) {
             ObservationSnapshot next = new ObservationSnapshot(observationId, newVersion,
                     resolvedLocation, resolvedReading, resolvedNote, false);
             observationRepository.updateCurrent(next);
             observationRepository.insertVersion(next);
+            freezeAttachmentRefs(observationId, next.version(), request.attachmentRefs());
         }
 
         ResolutionRecord record = new ResolutionRecord(
@@ -622,6 +651,72 @@ public class ObservationService {
                 .orElseThrow(() -> new IllegalStateException(
                         "pointed version missing for resolution: " + record.resolutionId()));
         return ResolutionResponse.of(record, pointed, objectMapper);
+    }
+
+    // ---------- 附件证据引用固化 ----------
+
+    /**
+     * 校验合并/解决请求携带的附件证据引用：附件必须归属该观测、脱敏版本号必须存在。
+     * 校验在写事务内、持有观测行锁后执行；任一失败整次不写版本也不固化引用。
+     */
+    private void validateAttachmentRefs(String observationId, List<AttachmentRefInput> refs) {
+        if (refs == null || refs.isEmpty()) {
+            return;
+        }
+        Set<String> seen = new HashSet<>();
+        for (AttachmentRefInput ref : refs) {
+            if (!seen.add(ref.attachmentId())) {
+                throw ApiException.badRequest("DUPLICATE_ATTACHMENT_IN_REQUEST",
+                        "duplicate attachment ref in request: " + ref.attachmentId());
+            }
+            AttachmentRecord attachment = attachmentRepository.find(ref.attachmentId())
+                    .orElseThrow(() -> ApiException.notFound("ATTACHMENT_NOT_FOUND",
+                            "attachment not found: " + ref.attachmentId()));
+            if (!attachment.observationId().equals(observationId)) {
+                throw ApiException.unprocessable("ATTACHMENT_OWNERSHIP",
+                        "attachment does not belong to observation " + observationId + ": "
+                                + ref.attachmentId());
+            }
+            if (ref.redactionVersion() != null
+                    && redactionVersionRepository.find(ref.attachmentId(), ref.redactionVersion()).isEmpty()) {
+                throw ApiException.unprocessable("REDACTION_VERSION_NOT_FOUND",
+                        "redaction version not found: " + ref.attachmentId() + "@" + ref.redactionVersion());
+            }
+        }
+    }
+
+    /**
+     * 将附件证据引用随新观测版本固化；历史版本永不更新，后续脱敏/撤销不追溯替换这些引用。
+     */
+    private void freezeAttachmentRefs(String observationId, int version, List<AttachmentRefInput> refs) {
+        if (refs == null || refs.isEmpty()) {
+            return;
+        }
+        Instant frozenAt = Instant.now(clock);
+        for (AttachmentRefInput ref : refs) {
+            versionAttachmentRepository.insert(new VersionAttachmentRef(
+                    observationId, version, ref.attachmentId(), ref.redactionVersion(), frozenAt));
+        }
+    }
+
+    private boolean hasAttachmentRefs(List<AttachmentRefInput> refs) {
+        return refs != null && !refs.isEmpty();
+    }
+
+    /**
+     * 附件引用的稳定指纹：纳入幂等判定；原始证据引用（redactionVersion 为 null）记为 ORIG。
+     */
+    private String attachmentRefsFingerprint(List<AttachmentRefInput> refs) {
+        if (refs == null || refs.isEmpty()) {
+            return "<none>";
+        }
+        StringBuilder sb = new StringBuilder();
+        for (AttachmentRefInput ref : refs) {
+            sb.append(SEPARATOR).append(ref.attachmentId())
+                    .append('@')
+                    .append(ref.redactionVersion() == null ? "ORIG" : ref.redactionVersion().toString());
+        }
+        return sb.toString();
     }
 
     /**

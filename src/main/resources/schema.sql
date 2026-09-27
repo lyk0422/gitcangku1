@@ -1,5 +1,8 @@
 -- 现场观测离线三方合并的持久化结构。
--- 兼容 H2（MODE=MySQL）与 MySQL 语法；时间戳均为服务器时区（Asia/Shanghai）。
+-- 兼容 H2（MODE=MySQL）与 MySQL 语法。
+-- observation_* 与 request_log 既有表时间戳为服务器时区（Asia/Shanghai）；
+-- 附件脱敏相关表（observation_attachment / redaction_rule / redaction_version /
+-- observation_version_attachment）统一使用 UTC 纳秒精度时间戳（列名以 _utc 结尾）。
 
 -- 观测记录当前状态表：每条观测记录一行，version 从 1 开始单调递增。
 CREATE TABLE IF NOT EXISTS observation_current (
@@ -58,4 +61,68 @@ CREATE TABLE IF NOT EXISTS conflict_resolution (
     -- 不设置指向 observation_current 的外键：观测记录删除仅置墓碑（当前行保留），
     -- 且不可变解决历史必须在任何数据清理/归档场景下继续可查。
     UNIQUE (observation_id, request_id)
+);
+
+-- 观测附件元数据表：附件归属一经登记不可变更；原始内容摘要业务不可修改。
+-- 物理清除是合规处置：仅清空 content_summary 并置位 content_purged，归属与指纹保留，内容不可恢复。
+CREATE TABLE IF NOT EXISTS observation_attachment (
+    attachment_id VARCHAR(128) NOT NULL COMMENT '附件唯一标识',
+    observation_id VARCHAR(64) NOT NULL COMMENT '所属观测记录标识；归属不可变更',
+    filename VARCHAR(256) NULL COMMENT '附件文件名（元数据，可为 NULL）',
+    media_type VARCHAR(128) NULL COMMENT '附件媒体类型（元数据，可为 NULL）',
+    content_summary VARCHAR(4000) NULL COMMENT '附件原始内容摘要；业务不可修改；物理清除后为 NULL 且不可恢复',
+    content_digest VARCHAR(128) NOT NULL COMMENT '原始内容摘要的 SHA-256 指纹，物理清除后仍保留用于核验',
+    content_purged BOOLEAN NOT NULL DEFAULT FALSE COMMENT '附件内容是否已物理清除：TRUE 时 content_summary 为 NULL',
+    purged_at_utc TIMESTAMP(9) NULL COMMENT '物理清除完成时刻（UTC，纳秒精度）；未清除为 NULL',
+    created_at_utc TIMESTAMP(9) NOT NULL COMMENT '附件登记完成时刻（UTC，纳秒精度）',
+    PRIMARY KEY (attachment_id),
+    -- 归属由 (observation_id, attachment_id) 二次约束，便于按观测加锁与诊断。
+    UNIQUE (observation_id, attachment_id)
+);
+
+-- 脱敏规则版本登记表：规则版本先登记（ACTIVE）才可用于脱敏；撤销（REVOKED）不可逆。
+-- 规则定义为合成的词条替换：对摘要中出现的任一敏感词条（不区分大小写）整体替换为 replacementToken。
+CREATE TABLE IF NOT EXISTS redaction_rule (
+    rule_version VARCHAR(128) NOT NULL COMMENT '脱敏规则版本标识，登记后不可变',
+    description VARCHAR(1024) NULL COMMENT '规则版本说明；可为 NULL',
+    mask_terms VARCHAR(2000) NOT NULL COMMENT '敏感词条列表（JSON 数组原文）；按长度降序替换，空数组表示恒等规则',
+    replacement_token VARCHAR(128) NOT NULL COMMENT '命中敏感词条时使用的替换标记，如 ***REDACTED***',
+    status VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE 登记可用 / REVOKED 已撤销，撤销不可逆',
+    registered_at_utc TIMESTAMP(9) NOT NULL COMMENT '登记完成时刻（UTC，纳秒精度）',
+    revoked_at_utc TIMESTAMP(9) NULL COMMENT '规则撤销时刻（UTC，纳秒精度）；未撤销为 NULL',
+    revoke_reason VARCHAR(1024) NULL COMMENT '规则撤销理由；未撤销为 NULL',
+    PRIMARY KEY (rule_version)
+);
+
+-- 附件脱敏版本表：每次成功脱敏按附件追加一行递增版本，仅新增受限展示版本，不改动原始证据。
+-- 撤销只翻转公开展示资格（status/撤销字段一次写入），版本行与脱敏内容永不删除。
+CREATE TABLE IF NOT EXISTS redaction_version (
+    attachment_id VARCHAR(128) NOT NULL COMMENT '被脱敏附件标识',
+    observation_id VARCHAR(64) NOT NULL COMMENT '脱敏时附件所属观测标识（冗余用于裁决与诊断）',
+    version INT NOT NULL COMMENT '该附件的脱敏版本号，从 1 开始按附件递增',
+    rule_version VARCHAR(128) NOT NULL COMMENT '本版本使用的脱敏规则版本（生成时必须为 ACTIVE）',
+    redacted_summary VARCHAR(4000) NOT NULL COMMENT '脱敏后展示摘要（受限展示内容，落库后不可变）',
+    replacement_note VARCHAR(2048) NOT NULL COMMENT '替换说明：记录替换了什么及如何替换（落库后不可变）',
+    status VARCHAR(16) NOT NULL COMMENT '公开展示资格：ACTIVE 有效 / REVOKED 已撤销；撤销不删除版本',
+    request_id VARCHAR(128) NOT NULL COMMENT '生成该脱敏版本的请求标识（requestId）',
+    operator VARCHAR(128) NOT NULL COMMENT '执行脱敏的操作者标识',
+    created_at_utc TIMESTAMP(9) NOT NULL COMMENT '脱敏版本生成时刻（UTC，纳秒精度）',
+    revoked_at_utc TIMESTAMP(9) NULL COMMENT '公开展示资格撤销时刻（UTC，纳秒精度）；未撤销为 NULL',
+    revoke_reason VARCHAR(1024) NULL COMMENT '脱敏撤销理由；未撤销为 NULL',
+    revoked_by VARCHAR(128) NULL COMMENT '撤销操作者；未撤销为 NULL',
+    revoke_request_id VARCHAR(128) NULL COMMENT '撤销请求标识；未撤销为 NULL',
+    PRIMARY KEY (attachment_id, version),
+    -- 同一附件同一规则版本只允许一个脱敏版本；并发由数据库唯一约束最终串行化。
+    UNIQUE (attachment_id, rule_version)
+);
+
+-- 观测版本的附件证据引用固化表：观测版本生成时写入，历史永不更新；
+-- 后续新增/撤销脱敏版本不追溯替换这些引用。
+CREATE TABLE IF NOT EXISTS observation_version_attachment (
+    observation_id VARCHAR(64) NOT NULL COMMENT '观测记录标识',
+    version INT NOT NULL COMMENT '固化引用所属的观测版本号',
+    attachment_id VARCHAR(128) NOT NULL COMMENT '被引用的附件标识（必须归属该观测）',
+    redaction_version INT NULL COMMENT '固化引用的脱敏版本号；NULL 表示引用原始附件证据',
+    created_at_utc TIMESTAMP(9) NOT NULL COMMENT '引用固化时刻（UTC，纳秒精度，等于观测版本生成时刻）',
+    PRIMARY KEY (observation_id, version, attachment_id)
 );

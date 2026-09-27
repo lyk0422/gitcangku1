@@ -70,11 +70,11 @@ class ResolutionConcurrencyTest {
         observationService.create(new CreateObservationRequest(
                 "req-" + tag + "-0", observationId, "站点A", "1.0", "备注"));
         observationService.merge(observationId, new MergeObservationRequest(
-                "req-" + tag + "-1", 1, "站点B", "1.0", "备注"));
+                "req-" + tag + "-1", 1, "站点B", "1.0", "备注", null));
         // 离线端基于 v1 改站点C：与服务端站点B 冲突，普通合并失败不占键
         try {
             observationService.merge(observationId, new MergeObservationRequest(
-                    "req-" + tag + "-2", 1, "站点C", "1.0", "备注"));
+                    "req-" + tag + "-2", 1, "站点C", "1.0", "备注", null));
             throw new IllegalStateException("expected merge conflict");
         } catch (ApiException e) {
             assertThat(e.status().value()).isEqualTo(409);
@@ -84,7 +84,7 @@ class ResolutionConcurrencyTest {
     private ResolveConflictRequest resolveRequest(String requestId, String resolutionId,
                                                   int expectedCurrentVersion) {
         return new ResolveConflictRequest(requestId, resolutionId, 1, expectedCurrentVersion,
-                "站点C", "1.0", "备注", Map.of("location", "CANDIDATE"), "operator-a");
+                "站点C", "1.0", "备注", Map.of("location", "CANDIDATE"), "operator-a", null);
     }
 
     @Test
