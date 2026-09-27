@@ -14,6 +14,7 @@ import com.example.starter.firmware.error.ApiException;
 import com.example.starter.firmware.repo.DeviceRepository;
 import com.example.starter.firmware.repo.PauseRecordRepository;
 import com.example.starter.firmware.repo.ReleaseRepository;
+import com.example.starter.firmware.repo.ReleaseTargetRepository;
 import com.example.starter.firmware.repo.TaskRepository;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
@@ -21,9 +22,11 @@ import org.springframework.stereotype.Service;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.List;
+import java.util.TreeMap;
 
 /**
  * 投放任务：设备拉取与回执。与取消、恢复并发时统一先锁发布单行，再操作任务，形成一致提交顺序。
+ * 启用目标标签策略的发布单仅对创建时固化的目标快照成员下发；标签后续修订不改变成员集合。
  * 回执首次终结任务时在发布单行锁内累计当前监控轮次统计，达到阈值即在同一事务原子暂停。
  */
 @Service
@@ -33,31 +36,39 @@ public class TaskService {
     private final ReleaseRepository releaseRepository;
     private final DeviceRepository deviceRepository;
     private final PauseRecordRepository pauseRecordRepository;
+    private final ReleaseTargetRepository releaseTargetRepository;
     private final DeviceService deviceService;
     private final ReleaseService releaseService;
     private final IdempotencyService idempotency;
+    private final Fingerprints fingerprints;
     private final Clock clock;
 
     public TaskService(TaskRepository taskRepository, ReleaseRepository releaseRepository,
                        DeviceRepository deviceRepository, PauseRecordRepository pauseRecordRepository,
+                       ReleaseTargetRepository releaseTargetRepository,
                        DeviceService deviceService, ReleaseService releaseService,
-                       IdempotencyService idempotency, Clock clock) {
+                       IdempotencyService idempotency, Fingerprints fingerprints, Clock clock) {
         this.taskRepository = taskRepository;
         this.releaseRepository = releaseRepository;
         this.deviceRepository = deviceRepository;
         this.pauseRecordRepository = pauseRecordRepository;
+        this.releaseTargetRepository = releaseTargetRepository;
         this.deviceService = deviceService;
         this.releaseService = releaseService;
         this.idempotency = idempotency;
+        this.fingerprints = fingerprints;
         this.clock = clock;
     }
 
     /**
-     * 设备拉取：已存在任务直接返回；否则仅当型号与当前版本匹配、分桶号小于比例且发布单 ACTIVE 时创建。
+     * 设备拉取：已存在任务直接返回；否则仅当设备属于发布单目标快照（启用策略时）、
+     * 型号与当前版本匹配、分桶号小于比例且发布单 ACTIVE 时创建。
      * PAUSED 时不创建新任务，已有任务仍可查看与回执。
      */
     public PullResponse pull(String deviceId, String requestId) {
-        String fingerprint = String.join("|", "task.pull", deviceId);
+        TreeMap<String, Object> fp = fingerprints.builder("task.pull");
+        fp.put("deviceId", deviceId);
+        String fingerprint = fingerprints.canonical(fp);
         return idempotency.execute(requestId, "task.pull", fingerprint, () -> {
             Device device = deviceService.findDevice(deviceId);
             var activeOrder = releaseRepository.findActiveByModel(device.model());
@@ -69,6 +80,11 @@ public class TaskService {
             var existing = taskRepository.findByReleaseAndDevice(order.id(), deviceId);
             if (existing.isPresent()) {
                 return new PullResponse(TaskView.of(existing.get(), order));
+            }
+            // 启用目标策略：非快照成员不下发，且标签后续修订不追溯扩大目标
+            if (order.tagExpressionJson() != null
+                    && !releaseTargetRepository.isMember(order.id(), deviceId)) {
+                return new PullResponse(null);
             }
             if (order.status() != ReleaseStatus.ACTIVE
                     || !device.currentVersion().equals(order.fromVersion())
@@ -95,7 +111,10 @@ public class TaskService {
      * 样本达到下限且失败率越限时，同事务将仍为 ACTIVE 的发布单原子转为 PAUSED 并落暂停记录。
      */
     public TaskView receipt(long taskId, ReceiptRequest request) {
-        String fingerprint = String.join("|", "task.receipt", String.valueOf(taskId), request.result().name());
+        TreeMap<String, Object> fp = fingerprints.builder("task.receipt");
+        fp.put("taskId", taskId);
+        fp.put("result", request.result().name());
+        String fingerprint = fingerprints.canonical(fp);
         return idempotency.execute(request.requestId(), "task.receipt", fingerprint, () -> {
             RolloutTask snapshot = taskRepository.findById(taskId)
                     .orElseThrow(() -> ApiException.notFound("TASK_NOT_FOUND", "任务不存在: " + taskId));

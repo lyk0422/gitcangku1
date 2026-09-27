@@ -1,10 +1,12 @@
 package com.example.starter.firmware.api;
 
+import com.example.starter.firmware.api.ReleaseHistoryResponse;
+import com.example.starter.firmware.api.ReleaseTargetView;
+import com.example.starter.firmware.api.ReleaseView;
 import com.example.starter.firmware.domain.TaskStatus;
 import com.example.starter.firmware.error.ApiException;
 import com.example.starter.firmware.service.ReleaseService;
-import com.example.starter.firmware.service.TaskService;
-import jakarta.validation.Valid;
+import com.example.starter.firmware.service.TaskService;import jakarta.validation.Valid;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -56,6 +58,14 @@ public class ReleaseController {
     @GetMapping("/{releaseId}/history")
     public ReleaseHistoryResponse history(@PathVariable long releaseId) {
         return releaseService.history(releaseId);
+    }
+
+    /**
+     * 目标设备快照诊断（只读）：固化表达式、字典版本、解析时刻与规范排序快照成员。
+     */
+    @GetMapping("/{releaseId}/target")
+    public ReleaseTargetView target(@PathVariable long releaseId) {
+        return releaseService.target(releaseId);
     }
 
     @GetMapping("/{releaseId}/tasks")

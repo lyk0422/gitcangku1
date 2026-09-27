@@ -15,8 +15,13 @@ package com.example.starter.firmware.domain;
  * @param monitorRound            当前监控轮次，从1开始，人工恢复后加一
  * @param roundSuccess            当前监控轮次内首次进入 SUCCESS 的任务数
  * @param roundFailed             当前监控轮次内首次进入 FAILED 的任务数
+ * @param operator                创建发布单的操作者，旧客户端未传为 null
+ * @param tagExpressionJson       固化的目标标签表达式 JSON；null 表示未启用目标策略（按型号动态匹配）
+ * @param tagDictVersion          目标快照解析时的标签字典版本；null 表示未启用目标策略；后续修订不追溯
+ * @param resolvedAtUtc           目标快照解析时刻（UTC ISO-8601）；null 表示未启用目标策略
  */
 public record ReleaseOrder(long id, int version, String model, String fromVersion, String toVersion,
                            int ratio, ReleaseStatus status, int sampleFloor, int failureThresholdPercent,
-                           int monitorRound, int roundSuccess, int roundFailed) {
+                           int monitorRound, int roundSuccess, int roundFailed, String operator,
+                           String tagExpressionJson, Long tagDictVersion, String resolvedAtUtc) {
 }

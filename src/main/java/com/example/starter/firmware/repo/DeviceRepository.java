@@ -4,6 +4,7 @@ import com.example.starter.firmware.domain.Device;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
 
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -28,6 +29,17 @@ public class DeviceRepository {
                 (rs, rowNum) -> new Device(rs.getString("device_id"), rs.getString("model"),
                         rs.getString("current_version"), rs.getInt("bucket_no")),
                 deviceId).stream().findFirst();
+    }
+
+    /**
+     * 指定型号全部设备，按 device_id 字典序升序（目标快照解析的候选集合）。
+     */
+    public List<Device> findByModel(String model) {
+        return jdbc.query(
+                "SELECT device_id, model, current_version, bucket_no FROM device WHERE model = ? ORDER BY device_id",
+                (rs, rowNum) -> new Device(rs.getString("device_id"), rs.getString("model"),
+                        rs.getString("current_version"), rs.getInt("bucket_no")),
+                model);
     }
 
     public void updateCurrentVersion(String deviceId, String newVersion) {

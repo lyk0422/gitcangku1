@@ -8,23 +8,32 @@ import com.example.starter.firmware.repo.DeviceRepository;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 
+import java.util.TreeMap;
+
 /**
- * 设备登记与查询。型号与分桶号登记后不可修改。
+ * 设备登记与查询。型号与分桶号登记后不可修改；设备标签通过批量标签接口维护。
  */
 @Service
 public class DeviceService {
 
     private final DeviceRepository deviceRepository;
     private final IdempotencyService idempotency;
+    private final Fingerprints fingerprints;
 
-    public DeviceService(DeviceRepository deviceRepository, IdempotencyService idempotency) {
+    public DeviceService(DeviceRepository deviceRepository, IdempotencyService idempotency,
+                         Fingerprints fingerprints) {
         this.deviceRepository = deviceRepository;
         this.idempotency = idempotency;
+        this.fingerprints = fingerprints;
     }
 
     public DeviceView register(RegisterDeviceRequest request) {
-        String fingerprint = String.join("|", "device.register", request.deviceId(), request.model(),
-                request.currentVersion(), String.valueOf(request.bucketNo()));
+        TreeMap<String, Object> fp = fingerprints.builder("device.register");
+        fp.put("deviceId", request.deviceId());
+        fp.put("model", request.model());
+        fp.put("currentVersion", request.currentVersion());
+        fp.put("bucketNo", request.bucketNo());
+        String fingerprint = fingerprints.canonical(fp);
         return idempotency.execute(request.requestId(), "device.register", fingerprint, () -> {
             try {
                 deviceRepository.insert(new Device(request.deviceId(), request.model(),

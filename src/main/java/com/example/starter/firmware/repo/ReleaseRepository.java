@@ -15,6 +15,7 @@ import java.util.Optional;
 /**
  * 发布单数据访问。扩量、取消、恢复、拉取、回执共用行锁（SELECT ... FOR UPDATE）形成一致提交顺序。
  * 当前轮次统计（round_success/round_failed）只在持有发布单行锁的事务内增减。
+ * 目标标签表达式、字典版本、解析时刻在创建时固化写入，之后任何操作都不回写。
  */
 @Repository
 public class ReleaseRepository {
@@ -24,10 +25,13 @@ public class ReleaseRepository {
             rs.getString("from_version"), rs.getString("to_version"),
             rs.getInt("ratio"), ReleaseStatus.valueOf(rs.getString("status")),
             rs.getInt("sample_floor"), rs.getInt("failure_threshold_percent"),
-            rs.getInt("monitor_round"), rs.getInt("round_success"), rs.getInt("round_failed"));
+            rs.getInt("monitor_round"), rs.getInt("round_success"), rs.getInt("round_failed"),
+            rs.getString("operator"), rs.getString("tag_expression"),
+            (Long) rs.getObject("tag_dict_version"), rs.getString("resolved_at_utc"));
 
     private static final String COLUMNS = "id, version, model, from_version, to_version, ratio, status,"
-            + " sample_floor, failure_threshold_percent, monitor_round, round_success, round_failed";
+            + " sample_floor, failure_threshold_percent, monitor_round, round_success, round_failed,"
+            + " operator, tag_expression, tag_dict_version, resolved_at_utc";
 
     private final JdbcTemplate jdbc;
 
@@ -35,14 +39,20 @@ public class ReleaseRepository {
         this.jdbc = jdbc;
     }
 
+    /**
+     * 创建发布单。tagExpressionJson/tagDictVersion/resolvedAtUtc 同时为 null 表示未启用目标策略；
+     * 启用目标策略时三者必须同时非空（由服务层保证）。
+     */
     public long insert(String model, String fromVersion, String toVersion, int ratio,
-                       int sampleFloor, int failureThresholdPercent) {
+                       int sampleFloor, int failureThresholdPercent, String operator,
+                       String tagExpressionJson, Long tagDictVersion, String resolvedAtUtc) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
                     "INSERT INTO release_order (version, model, from_version, to_version, ratio, status,"
-                            + " sample_floor, failure_threshold_percent, monitor_round, active_model)"
-                            + " VALUES (1, ?, ?, ?, ?, 'ACTIVE', ?, ?, 1, ?)",
+                            + " sample_floor, failure_threshold_percent, monitor_round, active_model, operator,"
+                            + " tag_expression, tag_dict_version, resolved_at_utc)"
+                            + " VALUES (1, ?, ?, ?, ?, 'ACTIVE', ?, ?, 1, ?, ?, ?, ?, ?)",
                     new String[]{"id"});
             ps.setString(1, model);
             ps.setString(2, fromVersion);
@@ -51,6 +61,10 @@ public class ReleaseRepository {
             ps.setInt(5, sampleFloor);
             ps.setInt(6, failureThresholdPercent);
             ps.setString(7, model);
+            ps.setString(8, operator);
+            ps.setString(9, tagExpressionJson);
+            ps.setObject(10, tagDictVersion);
+            ps.setString(11, resolvedAtUtc);
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();
