@@ -8,12 +8,14 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.time.LocalDate;
+import java.util.List;
 
 /**
  * 公告曝光频控 API。
@@ -70,5 +72,57 @@ public class ExposureController {
                                     @RequestParam(required = false)
                                     @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate utcDate) {
         return exposureService.queryQuota(campaignId, visitorId, utcDate);
+    }
+
+    /** 创建活动（24 个小时预算合计必须等于日总确认额度）。 */
+    @PostMapping("/activities")
+    public ResponseEntity<ActivityResponse> createActivity(@Valid @RequestBody CreateActivityRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(exposureService.createActivity(request));
+    }
+
+    /** 修改活动配置：携带 expectedVersion，已开始小时不可下调。 */
+    @PutMapping("/activities/{activityId}")
+    public ActivityResponse updateActivity(@PathVariable String activityId,
+                                           @Valid @RequestBody UpdateActivityRequest request) {
+        return exposureService.updateActivity(activityId, request);
+    }
+
+    /** 活动明细（含 24 个小时预算与当前版本）。 */
+    @GetMapping("/activities/{activityId}")
+    public ActivityResponse getActivity(@PathVariable String activityId) {
+        return exposureService.getActivity(activityId);
+    }
+
+    /** 公告活动迁移：只影响迁移后的新预占。 */
+    @PostMapping("/campaigns/{campaignId}/activity")
+    public CampaignResponse migrateCampaign(@PathVariable String campaignId,
+                                            @Valid @RequestBody MigrateCampaignActivityRequest request) {
+        return exposureService.migrateCampaign(campaignId, request);
+    }
+
+    /** 活动日结快照：固化每小时确认/取消/过期数；utcDate 缺省为服务端当前 UTC 日。 */
+    @GetMapping("/activities/{activityId}/daily-close")
+    public DailyCloseResponse getDailyClose(@PathVariable String activityId,
+                                            @RequestParam(required = false)
+                                            @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate utcDate) {
+        return exposureService.getDailyClose(activityId, utcDate);
+    }
+
+    /** 活动小时诊断：实时统计每小时占用与终态计数，只读不改变状态。 */
+    @GetMapping("/activities/{activityId}/hours")
+    public ActivityHourDiagnosticsResponse getHourDiagnostics(@PathVariable String activityId,
+                                                              @RequestParam(required = false)
+                                                              @DateTimeFormat(iso = DateTimeFormat.ISO.DATE)
+                                                              LocalDate utcDate) {
+        return exposureService.getHourDiagnostics(activityId, utcDate);
+    }
+
+    /** 活动某 UTC 日的预占历史，按创建时刻与编号稳定排序，只读。 */
+    @GetMapping("/activities/{activityId}/reservations")
+    public List<ReservationResponse> getActivityReservations(@PathVariable String activityId,
+                                                             @RequestParam(required = false)
+                                                             @DateTimeFormat(iso = DateTimeFormat.ISO.DATE)
+                                                             LocalDate utcDate) {
+        return exposureService.getActivityReservations(activityId, utcDate);
     }
 }
