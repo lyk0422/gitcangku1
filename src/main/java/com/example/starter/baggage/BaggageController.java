@@ -14,6 +14,16 @@ import org.springframework.web.bind.annotation.RestController;
 import com.example.starter.baggage.BaggageDtos.ArriveRequest;
 import com.example.starter.baggage.BaggageDtos.ArriveResponse;
 import com.example.starter.baggage.BaggageDtos.BagResponse;
+import com.example.starter.baggage.BaggageDtos.ClaimDetailResponse;
+import com.example.starter.baggage.BaggageDtos.ClaimDiagnosticResponse;
+import com.example.starter.baggage.BaggageDtos.ClaimHoldRequest;
+import com.example.starter.baggage.BaggageDtos.ClaimHoldResponse;
+import com.example.starter.baggage.BaggageDtos.ClaimReleaseRequest;
+import com.example.starter.baggage.BaggageDtos.ClaimReleaseResponse;
+import com.example.starter.baggage.BaggageDtos.ClaimReviewRequest;
+import com.example.starter.baggage.BaggageDtos.ClaimReviewResponse;
+import com.example.starter.baggage.BaggageDtos.DeliveryDifferenceRequest;
+import com.example.starter.baggage.BaggageDtos.DeliveryDifferenceResponse;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveRequest;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveResponse;
 import com.example.starter.baggage.BaggageDtos.LegDifferenceResponse;
@@ -107,5 +117,54 @@ public class BaggageController {
     @GetMapping("/bags/short-unloaded")
     public ShortListResponse listShortUnloaded() {
         return baggageService.listShortUnloaded();
+    }
+
+    /** 认领冻结登记：未到达最终目的地的在途行李进入 CLAIM_HOLD，同事务移出 OPEN 清单。 */
+    @PostMapping("/claims")
+    public ClaimHoldResponse claimHold(@Valid @RequestBody ClaimHoldRequest request) {
+        return baggageService.claimHold(request);
+    }
+
+    /** 复核：不同角色客服核对乘客核验摘要。 */
+    @PostMapping("/claims/{claimKey}/review")
+    public ClaimReviewResponse claimReview(@PathVariable String claimKey,
+                                           @Valid @RequestBody ClaimReviewRequest claimReviewRequest) {
+        if (!claimKey.equals(claimReviewRequest.claimKey())) {
+            throw ApiException.unprocessable("路径 claimKey 与请求体不一致");
+        }
+        return baggageService.claimReview(claimReviewRequest);
+    }
+
+    /** 第二次确认解除：复核人再次确认摘要后原子恢复为可交接状态。 */
+    @PostMapping("/claims/{claimKey}/release")
+    public ClaimReleaseResponse claimRelease(@PathVariable String claimKey,
+                                             @Valid @RequestBody ClaimReleaseRequest claimReleaseRequest) {
+        if (!claimKey.equals(claimReleaseRequest.claimKey())) {
+            throw ApiException.unprocessable("路径 claimKey 与请求体不一致");
+        }
+        return baggageService.claimRelease(claimReleaseRequest);
+    }
+
+    /** 冻结解除后误交付：只登记差异，不删除认领记录、不改写证据链。 */
+    @PostMapping("/claims/{claimKey}/delivery-difference")
+    public DeliveryDifferenceResponse deliveryDifference(
+            @PathVariable String claimKey,
+            @Valid @RequestBody DeliveryDifferenceRequest deliveryDifferenceRequest) {
+        if (!claimKey.equals(deliveryDifferenceRequest.claimKey())) {
+            throw ApiException.unprocessable("路径 claimKey 与请求体不一致");
+        }
+        return baggageService.registerDeliveryDifference(deliveryDifferenceRequest);
+    }
+
+    /** 冻结明细与不可变证据链查询，纯只读。 */
+    @GetMapping("/claims/{claimKey}")
+    public ClaimDetailResponse getClaimDetail(@PathVariable String claimKey) {
+        return baggageService.getClaimDetail(claimKey);
+    }
+
+    /** 只读诊断：定位行李相关冻结/装载/解除的可行性与原因。 */
+    @GetMapping("/bags/{bagTag}/claim-diagnostic")
+    public ClaimDiagnosticResponse getClaimDiagnostic(@PathVariable String bagTag) {
+        return baggageService.getClaimDiagnostic(bagTag);
     }
 }
