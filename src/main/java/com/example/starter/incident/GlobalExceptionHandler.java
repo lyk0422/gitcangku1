@@ -27,6 +27,12 @@ public class GlobalExceptionHandler {
                 .body(new ErrorBody(ex.code(), ex.getMessage(), ex.details()));
     }
 
+    @ExceptionHandler(ProposalGoneException.class)
+    public ResponseEntity<ErrorBody> handleGone(ProposalGoneException ex) {
+        return ResponseEntity.status(HttpStatus.GONE)
+                .body(new ErrorBody("GONE", ex.getMessage(), null));
+    }
+
     @ExceptionHandler({HttpMessageNotReadableException.class, MissingRequestHeaderException.class})
     public ResponseEntity<ErrorBody> handleBadRequest(Exception ex) {
         return ResponseEntity.status(HttpStatus.BAD_REQUEST)

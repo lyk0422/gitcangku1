@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS incident_status_history (
 CREATE TABLE IF NOT EXISTS command_keys (
     id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
     command_key VARCHAR(128) NOT NULL COMMENT '调用方幂等键，全局唯一',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：takeover/transfer_initiate/transfer_accept/action/status/escalation_check/escalation_ack/task_create/task_complete/task_cancel',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：takeover/transfer_initiate/transfer_accept/action/status/escalation_check/escalation_ack/task_create/task_complete/task_cancel/proposal_create/proposal_vote/proposal_withdraw/task_revise',
     request_hash VARCHAR(64) NOT NULL COMMENT '规范化请求参数的 SHA-256 摘要，用于同键改参检测',
     response_status INT NULL COMMENT '首次成功的 HTTP 状态码；事务提交前必写入',
     response_body MEDIUMTEXT NULL COMMENT '首次成功响应 JSON，用于同键同参重放',
@@ -77,7 +77,8 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     incident_id BIGINT NOT NULL COMMENT '所属事件 id，关联 incidents.id；每事件至多 20 个任务',
     task_key VARCHAR(128) NOT NULL COMMENT '任务业务键，事件内唯一；同键同内容幂等，同键不同内容冲突',
     group_code VARCHAR(64) NOT NULL COMMENT '分组编码，非空',
-    title VARCHAR(512) NOT NULL COMMENT '任务标题，非空',
+    title VARCHAR(512) NOT NULL COMMENT '任务标题，非空；任务修订或生效提案可更新',
+    version INT NOT NULL DEFAULT 1 COMMENT '任务版本号，初始 1；仅任务修订（revise）时 +1；提案生效写入任务变更不递增',
     status VARCHAR(16) NOT NULL COMMENT '状态：OPEN 待处理 / DONE 已完成 / CANCELLED 已取消；仅允许 OPEN→DONE 或 OPEN→CANCELLED，DONE 与 CANCELLED 为终态',
     created_by VARCHAR(128) NOT NULL COMMENT '创建人（创建时的当前指挥人）',
     done_by VARCHAR(128) NULL COMMENT '完成人（操作时的当前指挥人）；仅 DONE 有值，否则为空',
@@ -100,3 +101,38 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY COMMENT '固定为 1 的单行锁；创建任务时 SELECT ... FOR UPDATE 持有，串行化环检测与写入，保证并发反向依赖最终图无环'
 ) COMMENT='任务依赖图全局锁表';
+
+CREATE TABLE IF NOT EXISTS decision_proposals (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    incident_id BIGINT NOT NULL COMMENT '所属事件 id，关联 incidents.id',
+    proposal_key VARCHAR(128) NOT NULL COMMENT '提案业务键，事件内唯一；同键同内容幂等，同键不同内容冲突',
+    task_id BIGINT NOT NULL COMMENT '提案针对的任务 id，关联 incident_tasks.id',
+    task_version INT NOT NULL COMMENT '登记时固化的任务版本号；后续任务修订不改写该值',
+    proposed_title VARCHAR(512) NOT NULL COMMENT '提案通过后要原子写入的任务新标题',
+    quorum INT NOT NULL COMMENT '生效所需法定人数（支持票下限），1..角色集合大小',
+    expires_at TIMESTAMP(6) NOT NULL COMMENT '提案到期 UTC 时刻（左闭右开区间的右端点：当前时刻 ≥ 该时刻即到期）；登记时不得早于当前时刻',
+    status VARCHAR(16) NOT NULL COMMENT '状态：OPEN 表决中 / EFFECTIVE 已生效 / EXPIRED 已到期失效；仅允许 OPEN→EFFECTIVE 或 OPEN→EXPIRED',
+    created_by VARCHAR(128) NOT NULL COMMENT '登记人（登记时的当前指挥人）',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '登记 UTC 时间',
+    decided_at TIMESTAMP(6) NULL COMMENT '裁决（生效或到期失效）UTC 时刻；仅 EFFECTIVE/EXPIRED 有值，否则为空',
+    decided_task_version INT NULL COMMENT '裁决时固化的任务版本号；仅 EFFECTIVE/EXPIRED 有值，否则为空',
+    CONSTRAINT uk_proposal_key UNIQUE (incident_id, proposal_key)
+) COMMENT='事件决策提案表';
+
+CREATE TABLE IF NOT EXISTS decision_proposal_roles (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    proposal_id BIGINT NOT NULL COMMENT '所属提案 id，关联 decision_proposals.id',
+    role VARCHAR(128) NOT NULL COMMENT '可投票角色标识（投票人 X-Actor-Id），提案内唯一；登记后不可变',
+    CONSTRAINT uk_proposal_role UNIQUE (proposal_id, role)
+) COMMENT='决策提案所需角色集合表';
+
+CREATE TABLE IF NOT EXISTS decision_proposal_votes (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    proposal_id BIGINT NOT NULL COMMENT '所属提案 id，关联 decision_proposals.id',
+    role VARCHAR(128) NOT NULL COMMENT '投票角色标识（投票人 X-Actor-Id）；同一角色同一提案至多一票 CAST',
+    vote VARCHAR(16) NOT NULL COMMENT '投票取向：SUPPORT 支持 / OPPOSE 反对；落库后不可变',
+    task_version INT NOT NULL COMMENT '投票时固化的任务版本号；任务修订后低于当前版本的票转为 STALE，不计入新版本',
+    status VARCHAR(16) NOT NULL COMMENT '状态：CAST 有效票 / WITHDRAWN 已撤回 / STALE 已失效（任务修订导致）；仅 CAST 计入法定人数',
+    cast_at TIMESTAMP(6) NOT NULL COMMENT '投票 UTC 时刻，落库后不可变',
+    updated_at TIMESTAMP(6) NOT NULL COMMENT '最近状态变更 UTC 时间（撤回或转 STALE 时更新）'
+) COMMENT='决策提案投票记录表';

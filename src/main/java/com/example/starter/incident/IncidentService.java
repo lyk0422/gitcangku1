@@ -452,7 +452,7 @@ public class IncidentService {
                     }
                     Instant now = now();
                     long taskId = tasks.insert(new IncidentTask(0L, incident.id(), taskKey,
-                            groupCode, title, TaskStatus.OPEN, actor, null, null, null, null,
+                            groupCode, title, 1, TaskStatus.OPEN, actor, null, null, null, null,
                             now, now));
                     for (Incident blocker : blockers) {
                         tasks.insertBlocker(taskId, blocker.id(), now);
@@ -639,7 +639,8 @@ public class IncidentService {
                 .map(b -> new TaskBlockerView(b.incidentKey(), b.status().name(),
                         UNBLOCKING_STATUSES.contains(b.status())))
                 .toList();
-        return new TaskView(task.taskKey(), task.groupCode(), task.title(), task.status().name(),
+        return new TaskView(task.taskKey(), task.groupCode(), task.title(), task.version(),
+                task.status().name(),
                 blockers, task.createdBy(), task.createdAt(), task.doneBy(), task.doneAt(),
                 task.cancelledBy(), task.cancelledAt());
     }

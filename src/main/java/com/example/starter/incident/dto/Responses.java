@@ -64,9 +64,10 @@ public final class Responses {
 
     /**
      * 处置任务视图：blockers 按阻塞事件键排序；doneBy/doneAt 仅 DONE 有值，
-     * cancelledBy/cancelledAt 仅 CANCELLED 有值。
+     * cancelledBy/cancelledAt 仅 CANCELLED 有值；version 为任务版本号（修订时 +1）。
      */
-    public record TaskView(String taskKey, String groupCode, String title, String status,
+    public record TaskView(String taskKey, String groupCode, String title, int version,
+                           String status,
                            List<TaskBlockerView> blockers, String createdBy, Instant createdAt,
                            String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt) {
     }
@@ -77,5 +78,34 @@ public final class Responses {
 
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
+    }
+
+    /**
+     * 决策提案视图：taskVersion 为登记时固化的任务版本；requiredRoles 按字典序返回；
+     * supportCount/opposeCount 为当前有效（CAST）票实际数，quorum 为法定人数要求值，
+     * remainingToQuorum 为距生效的差额（max(quorum - supportCount, 0)）；
+     * decidedAt/decidedTaskVersion 仅 EFFECTIVE/EXPIRED 有值，否则为 null。
+     */
+    public record ProposalView(String proposalKey, String taskKey, int taskVersion,
+                               String proposedTitle, List<String> requiredRoles, int quorum,
+                               Instant expiresAt, String status, long supportCount,
+                               long opposeCount, long remainingToQuorum, String createdBy,
+                               Instant createdAt, Instant decidedAt, Integer decidedTaskVersion) {
+    }
+
+    /**
+     * 投票记录视图：taskVersion 为投票时固化的任务版本；status 为
+     * CAST/WITHDRAWN/STALE；castAt 为投票 UTC 时刻，updatedAt 为最近状态变更时刻。
+     */
+    public record VoteView(String role, String vote, int taskVersion, String status,
+                           Instant castAt, Instant updatedAt) {
+    }
+
+    /** 提案明细视图：提案本体 + 完整投票历史（按投票先后排序，只读不改写）。 */
+    public record ProposalDetailView(ProposalView proposal, List<VoteView> votes) {
+    }
+
+    /** 事件提案列表视图：proposals 按登记顺序返回。 */
+    public record ProposalListView(String incidentKey, List<ProposalView> proposals) {
     }
 }

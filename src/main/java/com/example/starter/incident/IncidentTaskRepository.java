@@ -47,6 +47,7 @@ public class IncidentTaskRepository {
         return new IncidentTask(
                 rs.getLong("id"), rs.getLong("incident_id"), rs.getString("task_key"),
                 rs.getString("group_code"), rs.getString("title"),
+                rs.getInt("version"),
                 TaskStatus.valueOf(rs.getString("status")),
                 rs.getString("created_by"), rs.getString("done_by"),
                 doneAt == null ? null : doneAt.toInstant(),
@@ -69,22 +70,23 @@ public class IncidentTaskRepository {
         KeyHolder keys = new GeneratedKeyHolder();
         jdbc.update(con -> {
             var ps = con.prepareStatement(
-                    "INSERT INTO incident_tasks (incident_id, task_key, group_code, title, status,"
-                            + " created_by, done_by, done_at, cancelled_by, cancelled_at,"
-                            + " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO incident_tasks (incident_id, task_key, group_code, title, version,"
+                            + " status, created_by, done_by, done_at, cancelled_by, cancelled_at,"
+                            + " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setLong(1, task.incidentId());
             ps.setString(2, task.taskKey());
             ps.setString(3, task.groupCode());
             ps.setString(4, task.title());
-            ps.setString(5, task.status().name());
-            ps.setString(6, task.createdBy());
-            ps.setString(7, task.doneBy());
-            ps.setTimestamp(8, task.doneAt() == null ? null : Timestamp.from(task.doneAt()));
-            ps.setString(9, task.cancelledBy());
-            ps.setTimestamp(10, task.cancelledAt() == null ? null : Timestamp.from(task.cancelledAt()));
-            ps.setTimestamp(11, Timestamp.from(task.createdAt()));
-            ps.setTimestamp(12, Timestamp.from(task.updatedAt()));
+            ps.setInt(5, task.version());
+            ps.setString(6, task.status().name());
+            ps.setString(7, task.createdBy());
+            ps.setString(8, task.doneBy());
+            ps.setTimestamp(9, task.doneAt() == null ? null : Timestamp.from(task.doneAt()));
+            ps.setString(10, task.cancelledBy());
+            ps.setTimestamp(11, task.cancelledAt() == null ? null : Timestamp.from(task.cancelledAt()));
+            ps.setTimestamp(12, Timestamp.from(task.createdAt()));
+            ps.setTimestamp(13, Timestamp.from(task.updatedAt()));
             return ps;
         }, keys);
         return keys.getKey().longValue();
@@ -98,6 +100,32 @@ public class IncidentTaskRepository {
                 "SELECT * FROM incident_tasks WHERE incident_id = ? AND task_key = ?",
                 TASK_MAPPER, incidentId, taskKey);
         return rows.stream().findFirst();
+    }
+
+    /**
+     * 按主键查询任务，用于决策提案读取投票时的当前任务版本。
+     */
+    public Optional<IncidentTask> findById(long id) {
+        List<IncidentTask> rows = jdbc.query(
+                "SELECT * FROM incident_tasks WHERE id = ?", TASK_MAPPER, id);
+        return rows.stream().findFirst();
+    }
+
+    /**
+     * 任务修订：更新标题并将版本号 +1。调用方负责在同一事务内将旧版本投票转为 STALE。
+     */
+    public void revise(long id, String title, Instant at) {
+        jdbc.update("UPDATE incident_tasks SET title = ?, version = version + 1, updated_at = ?"
+                        + " WHERE id = ?",
+                title, Timestamp.from(at), id);
+    }
+
+    /**
+     * 决策提案生效：原子写入提案携带的任务新标题，不递增版本号。
+     */
+    public void applyProposedTitle(long id, String title, Instant at) {
+        jdbc.update("UPDATE incident_tasks SET title = ?, updated_at = ? WHERE id = ?",
+                title, Timestamp.from(at), id);
     }
 
     /**

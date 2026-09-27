@@ -55,4 +55,27 @@ public final class Requests {
     /** 任务完成/取消请求，操作人由 X-Actor-Id 指定且须为当前指挥人。 */
     public record TaskActionRequest(String commandKey) {
     }
+
+    /** 任务修订请求：title 为新标题，修订后任务版本 +1，旧版本投票转 STALE。 */
+    public record TaskReviseRequest(String commandKey, String title) {
+    }
+
+    /**
+     * 决策提案登记请求：proposalKey 事件内唯一；taskKey 为提案针对的任务；
+     * proposedTitle 为生效后原子写入的任务新标题；requiredRoles 为可投票角色集合
+     * （去重去空白后非空）；quorum 为法定人数（1..角色数）；expiresAt 为 UTC 到期时刻，
+     * 不得早于服务端当前时刻。
+     */
+    public record ProposalCreateRequest(String commandKey, String proposalKey, String taskKey,
+                                        String proposedTitle, List<String> requiredRoles,
+                                        Integer quorum, Instant expiresAt) {
+    }
+
+    /** 投票请求：vote 取值 SUPPORT / OPPOSE，投票人由 X-Actor-Id 指定且须在角色集合内。 */
+    public record VoteRequest(String commandKey, String vote) {
+    }
+
+    /** 撤回投票请求，操作人由 X-Actor-Id 指定，仅可撤回自己的有效票。 */
+    public record WithdrawRequest(String commandKey) {
+    }
 }

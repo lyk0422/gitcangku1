@@ -56,4 +56,9 @@ public class ApiException extends RuntimeException {
     public static ApiException illegalTransition(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "ILLEGAL_TRANSITION", message, null);
     }
+
+    /** 422：请求参数语义校验失败（如提案到期时刻早于当前、角色集合为空、法定人数越界）。 */
+    public static ApiException unprocessable(String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "UNPROCESSABLE", message, null);
+    }
 }
