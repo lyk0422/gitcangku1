@@ -3,11 +3,17 @@ package com.example.starter.batch;
 import com.example.starter.batch.dto.ApproveRequest;
 import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
+import com.example.starter.batch.dto.CaseResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
+import com.example.starter.batch.dto.LabelReconciliationResponse;
+import com.example.starter.batch.dto.LabelSummaryResponse;
 import com.example.starter.batch.dto.LineageEntryResponse;
 import com.example.starter.batch.dto.RecallRequest;
+import com.example.starter.batch.dto.RegisterLabelPlanRequest;
+import com.example.starter.batch.dto.SealCasesRequest;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
+import com.example.starter.batch.dto.VoidCaseRequest;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
@@ -118,5 +124,57 @@ public class BatchController {
         return ResponseEntity.status(response.status())
                 .header(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
                 .body(response.body());
+    }
+
+    /**
+     * 登记包装标签计划：计划包装数量与左闭右开标签号段；每批次一份，不可改写。
+     */
+    @PostMapping("/{batchKey}/label-plan")
+    public ResponseEntity<String> registerLabelPlan(@PathVariable String batchKey,
+                                                    @Valid @RequestBody RegisterLabelPlanRequest request) {
+        return stored(service.registerLabelPlan(batchKey, request));
+    }
+
+    /**
+     * 批量封箱：按标签号提交封箱记录，任一标签失败整次回滚。
+     */
+    @PostMapping("/{batchKey}/cases")
+    public ResponseEntity<String> sealCases(@PathVariable String batchKey,
+                                            @Valid @RequestBody SealCasesRequest request) {
+        return stored(service.sealCases(batchKey, request));
+    }
+
+    /**
+     * 作废封箱：仅未放行批次允许，写入原因并释放数量与标签占用。
+     */
+    @PostMapping("/{batchKey}/cases/{caseKey}/void")
+    public ResponseEntity<String> voidCase(@PathVariable String batchKey,
+                                           @PathVariable String caseKey,
+                                           @Valid @RequestBody VoidCaseRequest request) {
+        return stored(service.voidCase(batchKey, caseKey, request));
+    }
+
+    /**
+     * 封箱明细查询：全部封箱记录（含已作废），按提交顺序。
+     */
+    @GetMapping("/{batchKey}/cases")
+    public List<CaseResponse> listCases(@PathVariable String batchKey) {
+        return service.listCases(batchKey);
+    }
+
+    /**
+     * 标签核销汇总：计划、已封数量、差额、已用标签规范排序与放行快照。
+     */
+    @GetMapping("/{batchKey}/label-summary")
+    public LabelSummaryResponse labelSummary(@PathVariable String batchKey) {
+        return service.labelSummary(batchKey);
+    }
+
+    /**
+     * 标签核销诊断：比对放行快照或计划与当前封箱状态，返回差异列表。
+     */
+    @GetMapping("/{batchKey}/label-reconciliation")
+    public LabelReconciliationResponse labelReconciliation(@PathVariable String batchKey) {
+        return service.labelReconciliation(batchKey);
     }
 }

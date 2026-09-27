@@ -54,6 +54,29 @@ public class BatchRepository {
     public record LineageRow(long id, String parentKey, String childKey, int seq, String createdAt) {
     }
 
+    /**
+     * label_plan 表行记录：每批次一份，登记后不可改写；号段左闭右开。
+     */
+    public record LabelPlanRow(long id, String batchKey, int plannedQuantity,
+                               long labelStart, long labelEnd, String createdAt) {
+    }
+
+    /**
+     * pack_case 表行记录：含已作废记录；voidReason/voidedAt 未作废时为 null。
+     */
+    public record PackCaseRow(long id, String batchKey, String caseKey, long labelNo,
+                              int quantity, String status, int version, String voidReason,
+                              String createdAt, String voidedAt) {
+    }
+
+    /**
+     * release_label_snapshot 表行记录：放行时固化，之后不改写。
+     */
+    public record SnapshotRow(long id, String batchKey, int plannedQuantity, int sealedQuantity,
+                              int caseCount, String labelDigest, String caseVersions,
+                              String createdAt) {
+    }
+
     private static final RowMapper<BatchRow> BATCH_MAPPER = (rs, n) -> new BatchRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("product_code"),
             rs.getString("batch_no"), rs.getString("produced_at"),
@@ -80,6 +103,22 @@ public class BatchRepository {
     private static final RowMapper<LineageRow> LINEAGE_MAPPER = (rs, n) -> new LineageRow(
             rs.getLong("id"), rs.getString("parent_key"), rs.getString("child_key"),
             rs.getInt("seq"), rs.getString("created_at"));
+
+    private static final RowMapper<LabelPlanRow> LABEL_PLAN_MAPPER = (rs, n) -> new LabelPlanRow(
+            rs.getLong("id"), rs.getString("batch_key"), rs.getInt("planned_quantity"),
+            rs.getLong("label_start"), rs.getLong("label_end"), rs.getString("created_at"));
+
+    private static final RowMapper<PackCaseRow> PACK_CASE_MAPPER = (rs, n) -> new PackCaseRow(
+            rs.getLong("id"), rs.getString("batch_key"), rs.getString("case_key"),
+            rs.getLong("label_no"), rs.getInt("quantity"), rs.getString("status"),
+            rs.getInt("version"), rs.getString("void_reason"),
+            rs.getString("created_at"), rs.getString("voided_at"));
+
+    private static final RowMapper<SnapshotRow> SNAPSHOT_MAPPER = (rs, n) -> new SnapshotRow(
+            rs.getLong("id"), rs.getString("batch_key"), rs.getInt("planned_quantity"),
+            rs.getInt("sealed_quantity"), rs.getInt("case_count"),
+            rs.getString("label_digest"), rs.getString("case_versions"),
+            rs.getString("created_at"));
 
     private final JdbcTemplate jdbc;
 
@@ -208,5 +247,104 @@ public class BatchRepository {
     public List<String> findRecalledKeys() {
         return jdbc.queryForList("SELECT batch_key FROM batch WHERE status = 'RECALLED'",
                 String.class);
+    }
+
+    public void insertLabelPlan(LabelPlanRow row) {
+        jdbc.update("INSERT INTO label_plan (batch_key, planned_quantity, label_start, label_end,"
+                        + " created_at) VALUES (?, ?, ?, ?, ?)",
+                row.batchKey(), row.plannedQuantity(), row.labelStart(), row.labelEnd(),
+                row.createdAt());
+    }
+
+    public Optional<LabelPlanRow> findLabelPlan(String batchKey) {
+        return jdbc.query("SELECT * FROM label_plan WHERE batch_key = ?", LABEL_PLAN_MAPPER,
+                        batchKey)
+                .stream().findFirst();
+    }
+
+    public void insertPackCase(PackCaseRow row) {
+        jdbc.update("INSERT INTO pack_case (batch_key, case_key, label_no, quantity, status,"
+                        + " version, void_reason, created_at, voided_at)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                row.batchKey(), row.caseKey(), row.labelNo(), row.quantity(), row.status(),
+                row.version(), row.voidReason(), row.createdAt(), row.voidedAt());
+    }
+
+    public Optional<PackCaseRow> findPackCase(String batchKey, String caseKey) {
+        return jdbc.query("SELECT * FROM pack_case WHERE batch_key = ? AND case_key = ?",
+                        PACK_CASE_MAPPER, batchKey, caseKey)
+                .stream().findFirst();
+    }
+
+    /**
+     * 某批次全部封箱记录（含已作废），按提交顺序；历史记录不因作废删除。
+     */
+    public List<PackCaseRow> findPackCases(String batchKey) {
+        return jdbc.query("SELECT * FROM pack_case WHERE batch_key = ? ORDER BY id",
+                PACK_CASE_MAPPER, batchKey);
+    }
+
+    /**
+     * 某批次当前有效（ACTIVE）封箱记录，按提交顺序。
+     */
+    public List<PackCaseRow> findActivePackCases(String batchKey) {
+        return jdbc.query("SELECT * FROM pack_case WHERE batch_key = ? AND status = 'ACTIVE'"
+                        + " ORDER BY id", PACK_CASE_MAPPER, batchKey);
+    }
+
+    /**
+     * 作废封箱：状态置 VOIDED、版本 +1、写入原因与作废时间；原行保留不改写其他字段。
+     */
+    public void voidPackCase(String batchKey, String caseKey, int newVersion, String reason,
+                             String voidedAt) {
+        jdbc.update("UPDATE pack_case SET status = 'VOIDED', version = ?, void_reason = ?,"
+                        + " voided_at = ? WHERE batch_key = ? AND case_key = ?",
+                newVersion, reason, voidedAt, batchKey, caseKey);
+    }
+
+    /**
+     * 占用标签号；主键冲突时抛 DuplicateKeyException，保证并发同标签最多一次成功。
+     */
+    public void insertLabelUsage(long labelNo, String batchKey, String caseKey, String createdAt) {
+        jdbc.update("INSERT INTO label_usage (label_no, batch_key, case_key, created_at)"
+                + " VALUES (?, ?, ?, ?)", labelNo, batchKey, caseKey, createdAt);
+    }
+
+    /**
+     * 释放标签占用（作废时调用）。
+     */
+    public void deleteLabelUsage(long labelNo) {
+        jdbc.update("DELETE FROM label_usage WHERE label_no = ?", labelNo);
+    }
+
+    /**
+     * 某批次当前已占用的标签号，按数值升序（规范排序）。
+     */
+    public List<Long> findUsedLabels(String batchKey) {
+        return jdbc.queryForList("SELECT label_no FROM label_usage WHERE batch_key = ?"
+                + " ORDER BY label_no", Long.class, batchKey);
+    }
+
+    /**
+     * 某批次当前有效封箱数量之和（件）；无有效封箱时为 0。
+     */
+    public int sumActiveQuantity(String batchKey) {
+        Integer sum = jdbc.queryForObject("SELECT COALESCE(SUM(quantity), 0) FROM pack_case"
+                + " WHERE batch_key = ? AND status = 'ACTIVE'", Integer.class, batchKey);
+        return sum == null ? 0 : sum;
+    }
+
+    public void insertSnapshot(SnapshotRow row) {
+        jdbc.update("INSERT INTO release_label_snapshot (batch_key, planned_quantity,"
+                        + " sealed_quantity, case_count, label_digest, case_versions, created_at)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                row.batchKey(), row.plannedQuantity(), row.sealedQuantity(), row.caseCount(),
+                row.labelDigest(), row.caseVersions(), row.createdAt());
+    }
+
+    public Optional<SnapshotRow> findSnapshot(String batchKey) {
+        return jdbc.query("SELECT * FROM release_label_snapshot WHERE batch_key = ?",
+                        SNAPSHOT_MAPPER, batchKey)
+                .stream().findFirst();
     }
 }

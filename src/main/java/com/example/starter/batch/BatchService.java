@@ -4,14 +4,23 @@ import com.example.starter.batch.dto.ApprovalResponse;
 import com.example.starter.batch.dto.ApproveRequest;
 import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
+import com.example.starter.batch.dto.CaseResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
+import com.example.starter.batch.dto.LabelPlanResponse;
+import com.example.starter.batch.dto.LabelReconciliationResponse;
+import com.example.starter.batch.dto.LabelSummaryResponse;
 import com.example.starter.batch.dto.LineageEntryResponse;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.RecallResponse;
+import com.example.starter.batch.dto.RegisterLabelPlanRequest;
+import com.example.starter.batch.dto.SealCasesRequest;
+import com.example.starter.batch.dto.SealCasesResponse;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SplitResponse;
 import com.example.starter.batch.dto.SubmitTestRequest;
 import com.example.starter.batch.dto.TestResultResponse;
+import com.example.starter.batch.dto.VoidCaseRequest;
+import com.example.starter.batch.dto.VoidCaseResponse;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
@@ -50,6 +59,9 @@ public class BatchService {
     private static final String CMD_APPROVE = "APPROVE";
     private static final String CMD_RECALL = "RECALL";
     private static final String CMD_SPLIT = "SPLIT";
+    private static final String CMD_LABEL_PLAN = "REGISTER_LABEL_PLAN";
+    private static final String CMD_SEAL = "SEAL_CASES";
+    private static final String CMD_VOID = "VOID_CASE";
 
     /**
      * 指纹拼接分隔符（NUL）：业务参数不可能包含该字符，避免拼接碰撞。
@@ -199,6 +211,11 @@ public class BatchService {
                 }
                 seq = 2;
                 newStatus = BatchStatus.RELEASED;
+            }
+            if (newStatus == BatchStatus.RELEASED) {
+                // 放行门禁：已登记标签计划的批次须完成全部计划数量的封箱，
+                // 且号段内已用标签数等于有效封箱数；通过后在同一事务固化放行快照
+                freezeLabelSnapshotIfPlanned(batchKey, now);
             }
             repo.insertApproval(new BatchRepository.ApprovalRow(0L, batchKey, req.commandKey(),
                     actor, role.name(), seq, now));
@@ -574,5 +591,276 @@ public class BatchService {
         return new LineageEntryResponse(row.batchKey(), row.batchNo(),
                 BatchStatus.valueOf(row.status()),
                 recalledAncestor(batchKey, parentOf, recalled).orElse(null));
+    }
+
+    /**
+     * 登记包装标签计划：每批次一份，登记后不可改写；号段按左闭右开 [labelStart, labelEnd)。
+     * 已放行/已召回/已拆分/已拒收批次返回 409；重复登记返回 409。
+     */
+    public StoredResponse registerLabelPlan(String batchKey, RegisterLabelPlanRequest req) {
+        if (req.labelEnd() <= req.labelStart()) {
+            throw ApiException.badRequest("labelEnd 必须大于 labelStart（号段按左闭右开解释）");
+        }
+        String fingerprint = fingerprint("labelPlan", batchKey, String.valueOf(req.plannedQuantity()),
+                String.valueOf(req.labelStart()), String.valueOf(req.labelEnd()));
+        return executeIdempotent(CMD_LABEL_PLAN, req.commandKey(), fingerprint, () -> {
+            BatchRepository.BatchRow batch = repo.findBatchForUpdate(batchKey)
+                    .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+            BatchStatus status = BatchStatus.valueOf(batch.status());
+            if (status == BatchStatus.REJECTED || status == BatchStatus.RELEASED
+                    || status == BatchStatus.RECALLED || status == BatchStatus.SPLIT) {
+                throw ApiException.conflict("批次状态 " + status + " 不允许登记标签计划");
+            }
+            repo.findLabelPlan(batchKey).ifPresent(p -> {
+                throw ApiException.conflict("该批次已登记标签计划，不可改写: " + batchKey);
+            });
+            String now = now();
+            repo.insertLabelPlan(new BatchRepository.LabelPlanRow(0L, batchKey,
+                    req.plannedQuantity(), req.labelStart(), req.labelEnd(), now));
+            LabelPlanResponse body = new LabelPlanResponse(batchKey, req.plannedQuantity(),
+                    req.labelStart(), req.labelEnd(), Instant.parse(now));
+            return new StoredResponse(201, toJson(body));
+        });
+    }
+
+    /**
+     * 批量封箱：先校验完整最终集合（号段、标签占用、caseKey、数量上限），任一失败整次回滚；
+     * 全部有效封箱数量之和不得超过计划数量。标签占用由 label_usage 主键保证并发唯一。
+     */
+    public StoredResponse sealCases(String batchKey, SealCasesRequest req) {
+        List<SealCasesRequest.CaseSpec> specs = req.cases();
+        Set<String> caseKeys = new HashSet<>();
+        Set<Long> labelNos = new HashSet<>();
+        for (SealCasesRequest.CaseSpec spec : specs) {
+            if (!caseKeys.add(spec.caseKey())) {
+                throw ApiException.conflict("caseKey 在请求内重复: " + spec.caseKey());
+            }
+            if (!labelNos.add(spec.labelNo())) {
+                throw ApiException.conflict("标签号在请求内重复: " + spec.labelNo());
+            }
+        }
+        List<String> parts = new ArrayList<>();
+        parts.add("seal");
+        parts.add(batchKey);
+        for (SealCasesRequest.CaseSpec spec : specs) {
+            parts.add(spec.caseKey());
+            parts.add(String.valueOf(spec.labelNo()));
+            parts.add(String.valueOf(spec.quantity()));
+        }
+        String fingerprint = fingerprint(parts.toArray(new String[0]));
+        return executeIdempotent(CMD_SEAL, req.commandKey(), fingerprint, () -> {
+            BatchRepository.BatchRow batch = repo.findBatchForUpdate(batchKey)
+                    .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+            BatchStatus status = BatchStatus.valueOf(batch.status());
+            if (status != BatchStatus.QUARANTINED && status != BatchStatus.PENDING_RELEASE
+                    && status != BatchStatus.RELEASE_REVIEW) {
+                throw ApiException.conflict("批次状态 " + status + " 不允许封箱");
+            }
+            BatchRepository.LabelPlanRow plan = repo.findLabelPlan(batchKey)
+                    .orElseThrow(() -> ApiException.unprocessable(
+                            "批次尚未登记标签计划，不能封箱: " + batchKey));
+            // 校验完整最终集合：任一标签/封箱非法则整次回滚，不留下部分占用
+            Set<String> usedCaseKeys = new HashSet<>();
+            for (BatchRepository.PackCaseRow row : repo.findPackCases(batchKey)) {
+                usedCaseKeys.add(row.caseKey());
+            }
+            Set<Long> usedLabels = new HashSet<>(repo.findUsedLabels(batchKey));
+            for (SealCasesRequest.CaseSpec spec : specs) {
+                if (spec.labelNo() < plan.labelStart() || spec.labelNo() >= plan.labelEnd()) {
+                    throw ApiException.unprocessable("标签号超出该批次号段 [" + plan.labelStart()
+                            + ", " + plan.labelEnd() + "): " + spec.labelNo());
+                }
+                if (usedLabels.contains(spec.labelNo())) {
+                    throw ApiException.conflict("标签号已被占用: " + spec.labelNo());
+                }
+                if (usedCaseKeys.contains(spec.caseKey())) {
+                    throw ApiException.conflict("caseKey 已存在: " + spec.caseKey());
+                }
+            }
+            int currentSealed = repo.sumActiveQuantity(batchKey);
+            int newQuantity = specs.stream().mapToInt(SealCasesRequest.CaseSpec::quantity).sum();
+            int totalSealed = currentSealed + newQuantity;
+            if (totalSealed > plan.plannedQuantity()) {
+                throw ApiException.unprocessable("封箱数量超计划：已封箱 " + currentSealed
+                        + " 件，本次 " + newQuantity + " 件，计划 " + plan.plannedQuantity()
+                        + " 件，超出 " + (totalSealed - plan.plannedQuantity()) + " 件");
+            }
+            String now = now();
+            List<CaseResponse> sealed = new ArrayList<>(specs.size());
+            for (SealCasesRequest.CaseSpec spec : specs) {
+                repo.insertPackCase(new BatchRepository.PackCaseRow(0L, batchKey, spec.caseKey(),
+                        spec.labelNo(), spec.quantity(), "ACTIVE", 1, null, now, null));
+                repo.insertLabelUsage(spec.labelNo(), batchKey, spec.caseKey(), now);
+                sealed.add(new CaseResponse(batchKey, spec.caseKey(), spec.labelNo(),
+                        spec.quantity(), "ACTIVE", 1, Instant.parse(now), null, null));
+            }
+            SealCasesResponse body = new SealCasesResponse(batchKey, sealed, totalSealed,
+                    plan.plannedQuantity(), plan.plannedQuantity() - totalSealed,
+                    Instant.parse(now));
+            return new StoredResponse(201, toJson(body));
+        });
+    }
+
+    /**
+     * 作废封箱：仅未放行批次允许；写入作废原因、版本 +1，释放数量与标签占用；
+     * 原封箱记录保留为历史证据。已放行/已召回/已拆分批次返回 409。
+     */
+    public StoredResponse voidCase(String batchKey, String caseKey, VoidCaseRequest req) {
+        String fingerprint = fingerprint("voidCase", batchKey, caseKey, req.reason());
+        return executeIdempotent(CMD_VOID, req.commandKey(), fingerprint, () -> {
+            BatchRepository.BatchRow batch = repo.findBatchForUpdate(batchKey)
+                    .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+            BatchStatus status = BatchStatus.valueOf(batch.status());
+            if (status == BatchStatus.RELEASED || status == BatchStatus.RECALLED
+                    || status == BatchStatus.SPLIT) {
+                throw ApiException.conflict("批次状态 " + status + " 不允许作废封箱，仅未放行批次可作废");
+            }
+            BatchRepository.PackCaseRow caseRow = repo.findPackCase(batchKey, caseKey)
+                    .orElseThrow(() -> ApiException.notFound(
+                            "封箱不存在: " + batchKey + "/" + caseKey));
+            if (!"ACTIVE".equals(caseRow.status())) {
+                throw ApiException.conflict("封箱已作废，不可重复作废: " + caseKey);
+            }
+            BatchRepository.LabelPlanRow plan = repo.findLabelPlan(batchKey)
+                    .orElseThrow(() -> ApiException.unprocessable(
+                            "批次尚未登记标签计划: " + batchKey));
+            String now = now();
+            int newVersion = caseRow.version() + 1;
+            repo.voidPackCase(batchKey, caseKey, newVersion, req.reason(), now);
+            repo.deleteLabelUsage(caseRow.labelNo());
+            int activeSealed = repo.sumActiveQuantity(batchKey);
+            VoidCaseResponse body = new VoidCaseResponse(batchKey, caseKey, caseRow.labelNo(),
+                    caseRow.quantity(), "VOIDED", newVersion, req.reason(), Instant.parse(now),
+                    activeSealed, plan.plannedQuantity(), plan.plannedQuantity() - activeSealed);
+            return new StoredResponse(200, toJson(body));
+        });
+    }
+
+    /**
+     * 封箱明细查询：返回该批次全部封箱记录（含已作废），按提交顺序；只读不改状态。
+     */
+    public List<CaseResponse> listCases(String batchKey) {
+        repo.findBatch(batchKey)
+                .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+        return repo.findPackCases(batchKey).stream().map(this::toCaseResponse).toList();
+    }
+
+    /**
+     * 标签核销汇总（历史视图）：计划、当前有效封箱数量、差额、已用标签规范排序与放行快照；
+     * 只读不改状态。
+     */
+    public LabelSummaryResponse labelSummary(String batchKey) {
+        repo.findBatch(batchKey)
+                .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+        BatchRepository.LabelPlanRow plan = repo.findLabelPlan(batchKey).orElse(null);
+        int sealed = repo.sumActiveQuantity(batchKey);
+        int planned = plan == null ? 0 : plan.plannedQuantity();
+        List<Long> usedLabels = repo.findUsedLabels(batchKey);
+        LabelSummaryResponse.SnapshotView snapshot = repo.findSnapshot(batchKey)
+                .map(s -> new LabelSummaryResponse.SnapshotView(s.plannedQuantity(),
+                        s.sealedQuantity(), s.caseCount(), s.labelDigest(), s.caseVersions(),
+                        Instant.parse(s.createdAt())))
+                .orElse(null);
+        return new LabelSummaryResponse(batchKey, plan == null ? null : toPlanResponse(plan),
+                sealed, planned, planned - sealed, usedLabels.size(), usedLabels, snapshot);
+    }
+
+    /**
+     * 标签核销诊断：已放行批次比对放行快照与当前有效封箱，保留差异诊断；
+     * 未放行批次比对计划与当前进度。只读不改状态。
+     */
+    public LabelReconciliationResponse labelReconciliation(String batchKey) {
+        BatchRepository.BatchRow batch = repo.findBatch(batchKey)
+                .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+        BatchRepository.LabelPlanRow plan = repo.findLabelPlan(batchKey).orElse(null);
+        int sealed = repo.sumActiveQuantity(batchKey);
+        int planned = plan == null ? 0 : plan.plannedQuantity();
+        List<Long> usedLabels = repo.findUsedLabels(batchKey);
+        List<BatchRepository.PackCaseRow> activeCases = repo.findActivePackCases(batchKey);
+        List<String> discrepancies = new ArrayList<>();
+        var snapshot = repo.findSnapshot(batchKey);
+        if (snapshot.isPresent()) {
+            BatchRepository.SnapshotRow snap = snapshot.get();
+            if (snap.sealedQuantity() != sealed) {
+                discrepancies.add("放行快照封箱数量 " + snap.sealedQuantity()
+                        + " 件与当前有效封箱数量 " + sealed + " 件不一致");
+            }
+            if (!snap.labelDigest().equals(labelDigest(usedLabels))) {
+                discrepancies.add("当前已用标签摘要与放行快照不一致");
+            }
+            if (!snap.caseVersions().equals(caseVersions(activeCases))) {
+                discrepancies.add("当前有效封箱版本与放行快照不一致");
+            }
+        } else if (plan != null) {
+            if (sealed != planned) {
+                discrepancies.add("已封箱 " + sealed + " 件，计划 " + planned
+                        + " 件，差额 " + (planned - sealed) + " 件");
+            }
+            if (usedLabels.size() != activeCases.size()) {
+                discrepancies.add("已用标签数 " + usedLabels.size() + " 与有效封箱数 "
+                        + activeCases.size() + " 不一致");
+            }
+        }
+        return new LabelReconciliationResponse(batchKey, batch.status(),
+                BatchStatus.RELEASED.name().equals(batch.status()), plan != null,
+                planned, sealed, planned - sealed, activeCases.size(), usedLabels.size(),
+                discrepancies);
+    }
+
+    /**
+     * 放行门禁与快照：已登记标签计划的批次，放行时要求有效封箱数量之和等于计划数量、
+     * 已用标签数等于有效封箱数；通过后固化计划数量、实际封箱数量、已用标签规范排序摘要
+     * 与每个封箱版本。快照一旦写入不改写。
+     */
+    private void freezeLabelSnapshotIfPlanned(String batchKey, String now) {
+        var planOpt = repo.findLabelPlan(batchKey);
+        if (planOpt.isEmpty()) {
+            return;
+        }
+        BatchRepository.LabelPlanRow plan = planOpt.get();
+        int sealed = repo.sumActiveQuantity(batchKey);
+        if (sealed != plan.plannedQuantity()) {
+            throw ApiException.unprocessable("标签核销未完成，不能放行：已封箱 " + sealed
+                    + " 件，计划 " + plan.plannedQuantity() + " 件，差额 "
+                    + (plan.plannedQuantity() - sealed) + " 件");
+        }
+        List<Long> usedLabels = repo.findUsedLabels(batchKey);
+        List<BatchRepository.PackCaseRow> activeCases = repo.findActivePackCases(batchKey);
+        if (usedLabels.size() != activeCases.size()) {
+            throw ApiException.unprocessable("标签核销不一致，不能放行：已用标签数 "
+                    + usedLabels.size() + "，有效封箱数 " + activeCases.size());
+        }
+        repo.insertSnapshot(new BatchRepository.SnapshotRow(0L, batchKey, plan.plannedQuantity(),
+                sealed, activeCases.size(), labelDigest(usedLabels), caseVersions(activeCases),
+                now));
+    }
+
+    /**
+     * 已用标签规范排序摘要：标签号按数值升序以 NUL 分隔后的 SHA-256 十六进制。
+     */
+    private String labelDigest(List<Long> sortedLabels) {
+        return fingerprint(sortedLabels.stream().map(String::valueOf).toArray(String[]::new));
+    }
+
+    /**
+     * 有效封箱版本串：caseKey:version 按 caseKey 字典序拼接。
+     */
+    private String caseVersions(List<BatchRepository.PackCaseRow> activeCases) {
+        return activeCases.stream()
+                .map(c -> c.caseKey() + ":" + c.version())
+                .sorted()
+                .reduce((a, b) -> a + "," + b)
+                .orElse("");
+    }
+
+    private CaseResponse toCaseResponse(BatchRepository.PackCaseRow row) {
+        return new CaseResponse(row.batchKey(), row.caseKey(), row.labelNo(), row.quantity(),
+                row.status(), row.version(), Instant.parse(row.createdAt()),
+                row.voidedAt() == null ? null : Instant.parse(row.voidedAt()), row.voidReason());
+    }
+
+    private LabelPlanResponse toPlanResponse(BatchRepository.LabelPlanRow row) {
+        return new LabelPlanResponse(row.batchKey(), row.plannedQuantity(), row.labelStart(),
+                row.labelEnd(), Instant.parse(row.createdAt()));
     }
 }
