@@ -3,6 +3,7 @@ package com.example.starter.exposure;
 import com.example.starter.exposure.exposure.ExposureService;
 import com.example.starter.exposure.web.ApiException;
 import com.example.starter.exposure.web.ApplyExposureRequest;
+import com.example.starter.exposure.web.CreateActivityRequest;
 import com.example.starter.exposure.web.CreateCampaignRequest;
 import com.example.starter.exposure.web.QuotaResponse;
 import com.example.starter.exposure.web.ReservationActionRequest;
@@ -85,9 +86,16 @@ class ExposureConcurrencyTest {
     void clean() {
         jdbc.update("DELETE FROM idempotency_record");
         jdbc.update("DELETE FROM exposure_reservation");
+        jdbc.update("DELETE FROM activity_hour_snapshot");
+        jdbc.update("DELETE FROM activity_hour_ledger");
         jdbc.update("DELETE FROM quota_visitor_ledger");
         jdbc.update("DELETE FROM quota_total_ledger");
         jdbc.update("DELETE FROM campaign");
+        jdbc.update("DELETE FROM activity");
+        // 当前小时（UTC 10 时）预算 200，日总 2500（23 小时各 100 + 10 时 200）；公告访客额度足够大
+        java.util.List<Integer> budgets = new java.util.ArrayList<>(java.util.Collections.nCopies(24, 100));
+        budgets.set(10, 200);
+        service.createActivity(new CreateActivityRequest("req-act", "act", 2500, budgets));
     }
 
     @AfterAll
@@ -100,7 +108,7 @@ class ExposureConcurrencyTest {
     void concurrentApply_doesNotOversell() throws Exception {
         int totalCap = 20;
         int threads = 100;
-        service.createCampaign(new CreateCampaignRequest("req-c", "cap", totalCap, 100_000));
+        service.createCampaign(new CreateCampaignRequest("req-c", "cap", totalCap, 100_000, "act"));
 
         ExecutorService pool = Executors.newFixedThreadPool(16);
         CountDownLatch start = new CountDownLatch(1);
@@ -144,7 +152,7 @@ class ExposureConcurrencyTest {
     @Test
     @DisplayName("同一预占并发确认/取消：只允许一个终态，额度不重复释放、不变负")
     void concurrentConfirmAndCancel_singleTerminal_noDoubleRelease() throws Exception {
-        service.createCampaign(new CreateCampaignRequest("req-c", "cap", 1, 1));
+        service.createCampaign(new CreateCampaignRequest("req-c", "cap", 1, 1, "act"));
         ReservationResponse r = service.apply(new ApplyExposureRequest("req-a", "cap", "v1"));
 
         int threads = 24;
@@ -211,8 +219,7 @@ class ExposureConcurrencyTest {
 
     @Test
     @DisplayName("同一 requestId 并发重放：业务只执行一次，响应一致")
-    void concurrentSameRequestId_executesOnce() throws Exception {
-        service.createCampaign(new CreateCampaignRequest("req-c", "cap", 100, 100));
+    void concurrentSameRequestId_executesOnce() throws Exception {        service.createCampaign(new CreateCampaignRequest("req-c", "cap", 100, 100, "act"));
 
         int threads = 16;
         ExecutorService pool = Executors.newFixedThreadPool(threads);
@@ -239,5 +246,56 @@ class ExposureConcurrencyTest {
         assertEquals(0, errors.get(), "并发同键重放不应报错");
         assertEquals(1, reservationIds.size(), "业务只执行一次");
         assertEquals(1, service.queryQuota("cap", "visitor-x", DAY).usedVisitor());
+    }
+
+    @Test
+    @DisplayName("并发跨公告申请共享活动小时预算：成功数恰好等于小时预算，不超卖")
+    void concurrentApplyAcrossCampaigns_doesNotOversellHourBudget() throws Exception {
+        // 活动 10 时预算 5、日总 2305（其余 23 小时各 100）
+        java.util.List<Integer> budgets = new java.util.ArrayList<>(java.util.Collections.nCopies(24, 100));
+        budgets.set(10, 5);
+        service.createActivity(new CreateActivityRequest("req-act2", "act-shared", 2305, budgets));
+        // 两个公告同属一个活动，公告/访客侧额度足够大
+        service.createCampaign(new CreateCampaignRequest("req-ca", "ca", 100_000, 100_000, "act-shared"));
+        service.createCampaign(new CreateCampaignRequest("req-cb", "cb", 100_000, 100_000, "act-shared"));
+
+        int threads = 40;
+        ExecutorService pool = Executors.newFixedThreadPool(16);
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicInteger success = new AtomicInteger();
+        AtomicInteger rejected = new AtomicInteger();
+
+        for (int i = 0; i < threads; i++) {
+            final int idx = i;
+            pool.submit(() -> {
+                try {
+                    start.await();
+                    String campaignId = idx % 2 == 0 ? "ca" : "cb";
+                    service.apply(new ApplyExposureRequest(
+                            "req-h-" + idx, campaignId, "visitor-h-" + idx));
+                    success.incrementAndGet();
+                } catch (ApiException ex) {
+                    if (ex.getStatus().value() == 429) {
+                        rejected.incrementAndGet();
+                    } else {
+                        throw ex;
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+        }
+        start.countDown();
+        pool.shutdown();
+        assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS), "并发任务应在超时前完成");
+
+        assertEquals(5, success.get(), "活动当前小时只能成功预算数个名额");
+        assertEquals(threads - 5, rejected.get(), "其余跨公告请求必须全部 429");
+
+        Integer reserved = jdbc.queryForObject(
+                "SELECT reserved_count FROM activity_hour_ledger "
+                        + "WHERE activity_id = 'act-shared' AND utc_date = ? AND utc_hour = 10",
+                Integer.class, java.sql.Date.valueOf(DAY));
+        assertEquals(5, reserved, "活动小时占用不得超卖");
     }
 }

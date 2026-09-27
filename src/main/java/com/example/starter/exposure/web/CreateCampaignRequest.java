@@ -13,11 +13,19 @@ import jakarta.validation.constraints.Size;
  * @param campaignId          公告编号，全局唯一
  * @param dailyTotalCap       每 UTC 日总额度，单位次
  * @param perVisitorDailyCap  每访客每 UTC 日上限，单位次
+ * @param activityId          归属活动编号；为 null 或空串表示创建时不归入活动（之后可迁移）。
+ *                            未归入活动（未配置小时预算）时申请曝光将被拒绝
  */
 public record CreateCampaignRequest(
         @NotBlank @Size(max = 64) String requestId,
         @NotBlank @Size(max = 64) String campaignId,
         @NotNull @Min(1) @Max(100_000) Integer dailyTotalCap,
-        @NotNull @Min(1) @Max(100_000) Integer perVisitorDailyCap
+        @NotNull @Min(1) @Max(100_000) Integer perVisitorDailyCap,
+        @Size(max = 64) String activityId
 ) {
+    /** 兼容旧调用：创建时不归入任何活动。 */
+    public CreateCampaignRequest(String requestId, String campaignId,
+                                 Integer dailyTotalCap, Integer perVisitorDailyCap) {
+        this(requestId, campaignId, dailyTotalCap, perVisitorDailyCap, null);
+    }
 }

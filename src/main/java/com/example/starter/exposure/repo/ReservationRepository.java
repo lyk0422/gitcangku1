@@ -6,8 +6,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
 
-import java.sql.ResultSet;
-import java.sql.SQLException;
+import java.time.LocalDate;
 import java.util.List;
 import java.util.Optional;
 
@@ -28,21 +27,26 @@ public class ReservationRepository {
             rs.getString("campaign_id"),
             rs.getString("visitor_id"),
             rs.getDate("utc_date"),
+            rs.getString("activity_id"),
+            (Integer) rs.getObject("utc_hour"),
             ReservationStatus.valueOf(rs.getString("status")),
             rs.getLong("created_at_utc"),
             rs.getLong("expires_at_utc"),
             (Long) rs.getObject("terminal_at_utc"));
 
     private static final String COLUMNS =
-            "reservation_id, campaign_id, visitor_id, utc_date, status, "
+            "reservation_id, campaign_id, visitor_id, utc_date, activity_id, utc_hour, status, "
                     + "created_at_utc, expires_at_utc, terminal_at_utc";
 
     public void insert(Reservation reservation) {
-        jdbc.update("INSERT INTO exposure_reservation (" + COLUMNS + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        jdbc.update("INSERT INTO exposure_reservation (" + COLUMNS + ") "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 reservation.reservationId(),
                 reservation.campaignId(),
                 reservation.visitorId(),
                 reservation.utcDate(),
+                reservation.activityId(),
+                reservation.utcHour(),
                 reservation.status().name(),
                 reservation.createdAtUtc(),
                 reservation.expiresAtUtc(),
@@ -67,12 +71,18 @@ public class ReservationRepository {
     }
 
     /**
-     * 行锁查询某公告下已到期（now &gt;= expires_at_utc）但仍为 RESERVED 的预占单。
+     * 查询属于指定公告或指定活动的全部已到期 RESERVED 预占单（普通读，按编号升序）。
+     * 申请预占前结算使用：既释放本公告跨迁移（旧活动/无活动）到期单的公告/访客额度，
+     * 也释放同活动其他公告到期单的小时名额。调用方按本顺序逐行 CAS，
+     * 保证跨事务共享单据的加锁相对顺序一致，避免交叉加锁死锁。
      */
-    public List<Reservation> lockExpiredReserved(String campaignId, long nowUtc) {
+    public List<Reservation> findExpiredForCampaignOrActivity(String campaignId,
+                                                              String activityId, long nowUtc) {
         return jdbc.query("SELECT " + COLUMNS + " FROM exposure_reservation "
-                        + "WHERE campaign_id = ? AND status = 'RESERVED' AND expires_at_utc <= ? FOR UPDATE",
-                MAPPER, campaignId, nowUtc);
+                        + "WHERE status = 'RESERVED' AND expires_at_utc <= ? "
+                        + "AND (campaign_id = ? OR activity_id = ?) "
+                        + "ORDER BY reservation_id",
+                MAPPER, nowUtc, campaignId, activityId);
     }
 
     /**
@@ -86,5 +96,28 @@ public class ReservationRepository {
                         + "WHERE reservation_id = ? AND status = ?",
                 target.name(), terminalAtUtc, reservationId, expect.name());
         return rows == 1;
+    }
+
+    /**
+     * 只读历史查询：按公告（可叠加 UTC 日、状态过滤）倒序返回预占单，
+     * 排序固定为 created_at_utc 降序、reservation_id 降序，保证分页稳定。
+     */
+    public List<Reservation> listHistory(String campaignId, LocalDate utcDate,
+                                         ReservationStatus status, int limit) {
+        StringBuilder sql = new StringBuilder("SELECT " + COLUMNS
+                + " FROM exposure_reservation WHERE campaign_id = ?");
+        List<Object> args = new java.util.ArrayList<>();
+        args.add(campaignId);
+        if (utcDate != null) {
+            sql.append(" AND utc_date = ?");
+            args.add(java.sql.Date.valueOf(utcDate));
+        }
+        if (status != null) {
+            sql.append(" AND status = ?");
+            args.add(status.name());
+        }
+        sql.append(" ORDER BY created_at_utc DESC, reservation_id DESC LIMIT ?");
+        args.add(limit);
+        return jdbc.query(sql.toString(), MAPPER, args.toArray());
     }
 }

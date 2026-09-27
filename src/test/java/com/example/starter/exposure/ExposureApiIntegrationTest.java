@@ -1,6 +1,7 @@
 package com.example.starter.exposure;
 
 import com.example.starter.exposure.web.ApplyExposureRequest;
+import com.example.starter.exposure.web.CreateActivityRequest;
 import com.example.starter.exposure.web.CreateCampaignRequest;
 import com.example.starter.exposure.web.QuotaResponse;
 import com.example.starter.exposure.web.ReservationActionRequest;
@@ -108,10 +109,19 @@ class ExposureApiIntegrationTest {
     void cleanAndReset() {
         jdbc.update("DELETE FROM idempotency_record");
         jdbc.update("DELETE FROM exposure_reservation");
+        jdbc.update("DELETE FROM activity_hour_snapshot");
+        jdbc.update("DELETE FROM activity_hour_ledger");
         jdbc.update("DELETE FROM quota_visitor_ledger");
         jdbc.update("DELETE FROM quota_total_ledger");
         jdbc.update("DELETE FROM campaign");
+        jdbc.update("DELETE FROM activity");
         mutableClock().setInstant(BASE);
+        // 每个公告归入同一活动：24 个 UTC 小时各 100、日总 2400，保证既有额度断言由公告/访客侧裁决
+        service.createActivity(new CreateActivityRequest("req-act", "act", 2400, hourly100()));
+    }
+
+    private static java.util.List<Integer> hourly100() {
+        return java.util.Collections.nCopies(24, 100);
     }
 
     @AfterAll
@@ -120,7 +130,7 @@ class ExposureApiIntegrationTest {
     }
 
     private CreateCampaignRequest createReq(String requestId, String campaignId, int total, int perVisitor) {
-        return new CreateCampaignRequest(requestId, campaignId, total, perVisitor);
+        return new CreateCampaignRequest(requestId, campaignId, total, perVisitor, "act");
     }
 
     @Test
@@ -316,7 +326,7 @@ class ExposureApiIntegrationTest {
         mockMvc.perform(post("/api/exposure/campaigns")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"requestId\":\"h1\",\"campaignId\":\"ch\",\"dailyTotalCap\":1,"
-                                + "\"perVisitorDailyCap\":1}"))
+                                + "\"perVisitorDailyCap\":1,\"activityId\":\"act\"}"))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.campaignId").value("ch"));
 
