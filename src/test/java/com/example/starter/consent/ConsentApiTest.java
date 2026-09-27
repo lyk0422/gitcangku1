@@ -45,6 +45,10 @@ class ConsentApiTest {
 
     @BeforeEach
     void cleanTables() {
+        jdbc.update("DELETE FROM query_snapshot_item");
+        jdbc.update("DELETE FROM query_snapshot");
+        jdbc.update("DELETE FROM residency_migration");
+        jdbc.update("DELETE FROM residency_region");
         jdbc.update("DELETE FROM consent_record");
         jdbc.update("DELETE FROM consent_grant");
         jdbc.update("DELETE FROM idempotency_request");

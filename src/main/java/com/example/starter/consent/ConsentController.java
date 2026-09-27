@@ -8,6 +8,8 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import com.example.starter.consent.dto.EraseRequest;
+import com.example.starter.consent.dto.EraseResponse;
 import com.example.starter.consent.dto.GrantRequest;
 import com.example.starter.consent.dto.GrantResponse;
 import com.example.starter.consent.dto.RecordResponse;
@@ -44,6 +46,11 @@ public class ConsentController {
     @PostMapping("/records")
     public RecordResponse write(@Valid @RequestBody RecordWriteRequest request) {
         return consentService.write(request);
+    }
+
+    @PostMapping("/records/erasures")
+    public EraseResponse erase(@Valid @RequestBody EraseRequest request) {
+        return consentService.erase(request);
     }
 
     @GetMapping("/records")
