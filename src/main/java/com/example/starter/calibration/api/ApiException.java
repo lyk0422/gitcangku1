@@ -35,6 +35,11 @@ public class ApiException extends RuntimeException {
         return new ApiException(HttpStatus.NOT_FOUND, "NOT_FOUND", message);
     }
 
+    /** 403：复核人不具备资格（如与读数提交人相同）。 */
+    public static ApiException forbidden(String code, String message) {
+        return new ApiException(HttpStatus.FORBIDDEN, code, message);
+    }
+
     /** 409：状态冲突（重复放行、重复撤销、区间重叠、幂等键冲突等）。 */
     public static ApiException conflict(String code, String message) {
         return new ApiException(HttpStatus.CONFLICT, code, message);
@@ -43,5 +48,15 @@ public class ApiException extends RuntimeException {
     /** 422：测量时刻无匹配的有效证书。 */
     public static ApiException unprocessable(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "NO_MATCHING_CERTIFICATE", message);
+    }
+
+    /** 422：业务规则不满足（携带可区分的错误码）。 */
+    public static ApiException unprocessable(String code, String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, code, message);
+    }
+
+    /** 410：复核引用的测量修订版本或证书版本已变更/失效。 */
+    public static ApiException gone(String code, String message) {
+        return new ApiException(HttpStatus.GONE, code, message);
     }
 }
