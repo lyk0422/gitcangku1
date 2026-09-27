@@ -238,4 +238,148 @@ class ConcurrencyTest extends AbstractIntegrationTest {
                 "SELECT term_version FROM document WHERE document_id = ?", Integer.class, docId);
         assertThat(termVersion).isEqualTo(1);
     }
+
+    @Test
+    @DisplayName("并发登记同一引用标识：仅一个成功，其余 409，无重复锚点")
+    void concurrentRegisterSameCitationKey() throws Exception {
+        long docId = createDocument(newRequestId(), "[\"en\"]",
+                "[{\"segmentId\":\"s1\",\"sourceText\":\"原文\"}]");
+        submitTranslation(docId, "s1", "en", "alice", "hello world", 1, newRequestId());
+        approve(docId, "s1", "en", "bob", 1, newRequestId());
+
+        int threads = 6;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch gate = new CountDownLatch(1);
+        List<Future<ApiResult>> futures = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            futures.add(pool.submit(() -> {
+                gate.await();
+                return registerAnchors(docId, "s1", "en", "alice", "EDITOR", 1,
+                        "[{\"citationKey\":\"cite/one\",\"startOffset\":0,\"endOffset\":1,\"lockReason\":\"r\"}]",
+                        newRequestId());
+            }));
+        }
+        gate.countDown();
+        int success = 0;
+        int conflict = 0;
+        for (Future<ApiResult> future : futures) {
+            int status = future.get(30, TimeUnit.SECONDS).status();
+            if (status == 201) {
+                success++;
+            } else if (status == 409) {
+                conflict++;
+            } else {
+                throw new AssertionError("并发登记出现非预期状态码: " + status);
+            }
+        }
+        pool.shutdown();
+
+        assertThat(success).isEqualTo(1);
+        assertThat(conflict).isEqualTo(threads - 1);
+        assertThat(jdbc.queryForObject(
+                "SELECT COUNT(*) FROM citation_anchor WHERE document_id = ?", Integer.class, docId)).isOne();
+        assertThat(jdbc.queryForObject(
+                "SELECT COUNT(*) FROM citation_anchor_event WHERE event_type = 'REGISTERED' AND document_id = ?",
+                Integer.class, docId)).isOne();
+    }
+
+    @Test
+    @DisplayName("锚点迁移与发布并发：发布要么读到迁移后一致状态成功，要么 409/422 失败，无混合快照")
+    void concurrentMigrationAndPublish() throws Exception {
+        long docId = createDocument(newRequestId(), "[\"en\"]",
+                "[{\"segmentId\":\"s1\",\"sourceText\":\"原文\"}]");
+        submitTranslation(docId, "s1", "en", "alice", "hello world", 1, newRequestId());
+        approve(docId, "s1", "en", "bob", 1, newRequestId());
+        registerAnchors(docId, "s1", "en", "alice", "EDITOR", 1,
+                "[{\"citationKey\":\"cite/one\",\"startOffset\":0,\"endOffset\":5,\"lockReason\":\"出处\"}]",
+                newRequestId());
+        // 当前草稿版本 3、发布版本 0
+
+        String revisions = "[{\"segmentId\":\"s1\",\"language\":\"en\",\"content\":\"xhello world\","
+                + "\"sourceVersion\":1,\"anchorMappings\":["
+                + "{\"citationKey\":\"cite/one\",\"startOffset\":1,\"endOffset\":6}]}]";
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        CountDownLatch gate = new CountDownLatch(1);
+        Future<ApiResult> reviseFuture = pool.submit(() -> {
+            gate.await();
+            return batchRevise(docId, "alice", "EDITOR", revisions, newRequestId());
+        });
+        Future<ApiResult> publishFuture = pool.submit(() -> {
+            gate.await();
+            return publish(docId, 3, 0, newRequestId());
+        });
+        gate.countDown();
+        ApiResult reviseResult = reviseFuture.get(30, TimeUnit.SECONDS);
+        ApiResult publishResult = publishFuture.get(30, TimeUnit.SECONDS);
+        pool.shutdown();
+
+        Integer draftVersion = jdbc.queryForObject(
+                "SELECT draft_version FROM document WHERE document_id = ?", Integer.class, docId);
+        Integer publishedVersion = jdbc.queryForObject(
+                "SELECT published_version FROM document WHERE document_id = ?", Integer.class, docId);
+        Integer snapshots = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM release_snapshot WHERE document_id = ?", Integer.class, docId);
+
+        // 修订必然成功（草稿版本 4）；发布先于修订可成功（快照固化旧区间 [0,5)），后于修订则因期望版本不符 409
+        assertThat(reviseResult.status()).isEqualTo(200);
+        assertThat(publishResult.status()).isIn(201, 409);
+        assertThat(draftVersion).isEqualTo(4);
+        assertThat(snapshots).isEqualTo(publishedVersion);
+        if (publishResult.status() == 201) {
+            assertThat(publishedVersion).isEqualTo(1);
+            ApiResult release = getJson("/api/documents/" + docId + "/releases/1");
+            assertThat(release.body().get("citations").get(0).get("startOffset").asInt()).isZero();
+        } else {
+            assertThat(publishedVersion).isZero();
+        }
+    }
+
+    @Test
+    @DisplayName("并发解除同一锚点：仅一个法务成功，另一个得到 409/422，锚点只解除一次")
+    void concurrentReleaseSameAnchor() throws Exception {
+        long docId = createDocument(newRequestId(), "[\"en\"]",
+                "[{\"segmentId\":\"s1\",\"sourceText\":\"原文\"}]");
+        submitTranslation(docId, "s1", "en", "alice", "hello world", 1, newRequestId());
+        approve(docId, "s1", "en", "bob", 1, newRequestId());
+        ApiResult registered = registerAnchors(docId, "s1", "en", "alice", "EDITOR", 1,
+                "[{\"citationKey\":\"cite/one\",\"startOffset\":0,\"endOffset\":5,\"lockReason\":\"出处\"}]",
+                newRequestId());
+        long anchorId = registered.body().get("anchors").get(0).get("anchorId").asLong();
+
+        String[] actors = {"carol", "dave"};
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        CountDownLatch gate = new CountDownLatch(1);
+        List<Future<ApiResult>> futures = new ArrayList<>();
+        for (String actor : actors) {
+            futures.add(pool.submit(() -> {
+                gate.await();
+                return releaseAnchor(docId, anchorId, actor, "LEGAL", "法务解除-" + actor, newRequestId());
+            }));
+        }
+        gate.countDown();
+        int success = 0;
+        int failure = 0;
+        String winner = null;
+        for (int i = 0; i < futures.size(); i++) {
+            ApiResult result = futures.get(i).get(30, TimeUnit.SECONDS);
+            if (result.status() == 200) {
+                success++;
+                winner = result.body().get("anchor").get("releasedBy").asText();
+            } else {
+                assertThat(result.status()).isIn(409, 422);
+                failure++;
+            }
+        }
+        pool.shutdown();
+
+        assertThat(success).isEqualTo(1);
+        assertThat(failure).isEqualTo(1);
+        assertThat(jdbc.queryForObject(
+                "SELECT released_by FROM citation_anchor WHERE anchor_id = ?", String.class, anchorId))
+                .isEqualTo(winner);
+        assertThat(jdbc.queryForObject(
+                "SELECT COUNT(*) FROM citation_anchor_event WHERE event_type = 'RELEASED'",
+                Integer.class)).isEqualTo(1);
+    }
 }

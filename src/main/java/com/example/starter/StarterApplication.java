@@ -4,7 +4,8 @@ import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 
 /**
- * 业务题目工程入口；当前仅提供 Web 服务及数据库健康检查，不包含题目业务实现。
+ * 业务题目工程入口：提供多语种段落修订、术语版本、发布快照与译文引文锁定的 Web 服务。
+ * 默认使用 H2 内存库（MODE=MySQL）本地启动，无需外部数据库。
  */
 @SpringBootApplication
 public class StarterApplication {

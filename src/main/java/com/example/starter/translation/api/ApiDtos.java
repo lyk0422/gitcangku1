@@ -8,6 +8,7 @@ import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.PositiveOrZero;
 import jakarta.validation.constraints.Size;
 
+import java.time.Instant;
 import java.util.List;
 
 /**
@@ -45,11 +46,12 @@ public final class ApiDtos {
             @NotBlank(message = "sourceText 不能为空") String sourceText) {
     }
 
-    /** 译文提交请求；作者取 X-Actor-Id 请求头。 */
+    /** 译文提交请求；作者取 X-Actor-Id 请求头；存在生效锚点时可随提交携带旧锚点到新区间的一一映射。 */
     public record SubmitTranslationRequest(
             @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
             @NotBlank(message = "content 不能为空") String content,
-            @Positive(message = "sourceVersion 必须为正数") int sourceVersion) {
+            @Positive(message = "sourceVersion 必须为正数") int sourceVersion,
+            List<@Valid AnchorMappingInput> anchorMappings) {
     }
 
     /** 译文批准请求；审核人取 X-Actor-Id 请求头。 */
@@ -131,5 +133,115 @@ public final class ApiDtos {
         public ErrorResponse(String error, String message) {
             this(error, message, null);
         }
+    }
+
+    /** 引文锚点登记输入：规范化引用标识、左闭右开字符区间与锁定原因。 */
+    public record AnchorInput(
+            @NotBlank(message = "citationKey 不能为空") @Size(max = 512) String citationKey,
+            @PositiveOrZero(message = "startOffset 不能为负数") int startOffset,
+            @Positive(message = "endOffset 必须为正数") int endOffset,
+            @NotBlank(message = "lockReason 不能为空") @Size(max = 2048) String lockReason) {
+    }
+
+    /** 锚点登记请求：可一次登记一个或多个锚点，区间必须落在指定的已批准译文版本内。 */
+    public record RegisterAnchorsRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @Positive(message = "translationVersion 必须为正数") int translationVersion,
+            @NotNull(message = "anchors 不能为空") @Size(min = 1, max = 100, message = "每次登记 1~100 个锚点")
+            List<@Valid AnchorInput> anchors) {
+    }
+
+    /** 旧锚点到新锚点区间的一一映射；引用标识不变，仅提供变动后的区间。 */
+    public record AnchorMappingInput(
+            @NotBlank(message = "citationKey 不能为空") @Size(max = 512) String citationKey,
+            @PositiveOrZero(message = "startOffset 不能为负数") int startOffset,
+            @Positive(message = "endOffset 必须为正数") int endOffset) {
+    }
+
+    /** 批量修订中的单条译文修订；mappings 可省略（区间未变时），但锚点文本必须全部保留。 */
+    public record SegmentRevisionInput(
+            @NotBlank(message = "segmentId 不能为空") @Size(max = 64) String segmentId,
+            @NotBlank(message = "language 不能为空") String language,
+            @NotBlank(message = "content 不能为空") String content,
+            @Positive(message = "sourceVersion 必须为正数") int sourceVersion,
+            List<@Valid AnchorMappingInput> anchorMappings) {
+    }
+
+    /** 批量译文修订请求：先整批校验锚点映射与术语版本，任一失败整次回滚。 */
+    public record BatchReviseTranslationsRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @NotNull(message = "revisions 不能为空") @Size(min = 1, max = 50, message = "每批 1~50 条译文修订")
+            List<@Valid SegmentRevisionInput> revisions) {
+    }
+
+    /** 锚点解除请求：须由异于创建人的法务角色确认并写入不可变理由。 */
+    public record ReleaseAnchorRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @NotBlank(message = "reason 不能为空") @Size(max = 2048) String reason) {
+    }
+
+    /** 锚点明细视图；解除相关字段未解除时为 null。 */
+    public record AnchorView(long anchorId, long documentId, String segmentId, String language,
+                             String citationKey, int startOffset, int endOffset, int length,
+                             String anchorText, String lockReason, String createdBy, Instant createdAt,
+                             int translationVersion, String status,
+                             String releasedBy, String releaseReason, Instant releasedAt) {
+    }
+
+    /** 锚点登记响应。 */
+    public record RegisterAnchorsResponse(long documentId, String segmentId, String language,
+                                          int draftVersion, List<AnchorView> anchors) {
+    }
+
+    /** 批量修订中单条结果：新版本与迁移后的生效锚点集合。 */
+    public record SegmentRevisionResult(String segmentId, String language, int translationVersion,
+                                        int sourceVersion, int termVersion, List<AnchorView> anchors) {
+    }
+
+    /** 批量译文修订响应：整批共用一个草稿版本（仅加一）。 */
+    public record BatchReviseTranslationsResponse(long documentId, int draftVersion,
+                                                  List<SegmentRevisionResult> results) {
+    }
+
+    /** 锚点解除响应：返回解除后的锚点终态。 */
+    public record ReleaseAnchorResponse(long documentId, String segmentId, String language,
+                                        int draftVersion, AnchorView anchor) {
+    }
+
+    /** 锚点不可变事件视图：REGISTERED/MIGRATED/RELEASED；from* 字段在登记/解除事件为 null。 */
+    public record AnchorEventView(long eventId, long anchorId, String eventType,
+                                  Integer fromStart, Integer fromEnd, int toStart, int toEnd,
+                                  String anchorText, String actorId, String actorRole, String reason,
+                                  Instant eventTime) {
+    }
+
+    /** 段落锚点历史响应：按事件提交顺序排列。 */
+    public record AnchorHistoryResponse(long documentId, String segmentId, List<AnchorEventView> events) {
+    }
+
+    /**
+     * 锚点诊断视图：在当前（可能已修订但尚未重新登记/迁移）译文状态下的只读核对结果。
+     *
+     * @param anchorId                   锚点 ID
+     * @param citationKey                规范化引用标识
+     * @param language                   目标语言码
+     * @param status                     ACTIVE / RELEASED
+     * @param boundTranslationVersion    登记/迁移时绑定的译文版本
+     * @param currentTranslationVersion  该语言当前译文版本
+     * @param currentContentLength       该语言当前译文长度，字符数（UTF-16 代码单元）
+     * @param rangeInCurrentContent      区间是否仍落在当前译文长度内且非空
+     * @param textIntactInCurrentContent 当前译文在该区间切片是否与固化引用文本逐字一致
+     * @param drift                      是否需要随下一次译文修订迁移（版本漂移或区间/文本失效）
+     */
+    public record AnchorDiagnosticView(long anchorId, String segmentId, String language, String citationKey,
+                                       String status, int startOffset, int endOffset, String anchorText,
+                                       int boundTranslationVersion, Integer currentTranslationVersion,
+                                       Integer currentContentLength, boolean rangeInCurrentContent,
+                                       boolean textIntactInCurrentContent, boolean drift) {
+    }
+
+    /** 锚点诊断响应：当前生效与已解除锚点的核对明细，只读。 */
+    public record AnchorDiagnosticsResponse(long documentId, int draftVersion, int termVersion,
+                                            List<AnchorDiagnosticView> anchors) {
     }
 }

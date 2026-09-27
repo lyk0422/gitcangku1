@@ -1,5 +1,6 @@
 package com.example.starter.translation.api;
 
+import com.example.starter.translation.service.CitationService;
 import com.example.starter.translation.service.TranslationService;
 import com.example.starter.translation.service.WriteExecutor;
 import com.example.starter.translation.service.WriteResult;
@@ -20,6 +21,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
+import java.util.List;
 
 /**
  * 多语种段落修订与发布快照 REST API。
@@ -30,12 +32,14 @@ import java.util.HexFormat;
 public class TranslationController {
 
     private final TranslationService translationService;
+    private final CitationService citationService;
     private final WriteExecutor writeExecutor;
     private final ObjectMapper objectMapper;
 
-    public TranslationController(TranslationService translationService, WriteExecutor writeExecutor,
-                                 ObjectMapper objectMapper) {
+    public TranslationController(TranslationService translationService, CitationService citationService,
+                                 WriteExecutor writeExecutor, ObjectMapper objectMapper) {
         this.translationService = translationService;
+        this.citationService = citationService;
         this.writeExecutor = writeExecutor;
         this.objectMapper = objectMapper;
     }
@@ -99,6 +103,73 @@ public class TranslationController {
         String operation = "POST /api/documents/" + documentId + "/publish";
         return writeExecutor.execute(request.requestId(), hash(operation, request),
                 () -> WriteResult.of(201, translationService.publish(documentId, request))).toResponseEntity();
+    }
+
+    /**
+     * 引文锚点登记：在指定语言的已批准译文版本上登记一个或多个锚点；
+     * 创建人取 X-Actor-Id，角色取 X-Actor-Role（缺省 EDITOR）。
+     */
+    @PostMapping("/{documentId}/segments/{segmentId}/translations/{language}/anchors")
+    public ResponseEntity<String> registerAnchors(@PathVariable long documentId,
+                                                  @PathVariable String segmentId,
+                                                  @PathVariable String language,
+                                                  @RequestHeader("X-Actor-Id") String actorId,
+                                                  @RequestHeader(value = "X-Actor-Role", required = false)
+                                                  String actorRole,
+                                                  @Valid @RequestBody ApiDtos.RegisterAnchorsRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/segments/" + segmentId
+                + "/translations/" + language + "/anchors";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, actorRole, request),
+                () -> WriteResult.of(201, citationService.registerAnchors(
+                        documentId, segmentId, language, actorId, actorRole, request))).toResponseEntity();
+    }
+
+    /** 批量译文修订：先整批校验锚点映射与术语版本，任一失败整次回滚，草稿版本只加一。 */
+    @PostMapping("/{documentId}/translation-revisions")
+    public ResponseEntity<String> batchReviseTranslations(@PathVariable long documentId,
+                                                          @RequestHeader("X-Actor-Id") String actorId,
+                                                          @RequestHeader(value = "X-Actor-Role", required = false)
+                                                          String actorRole,
+                                                          @Valid @RequestBody
+                                                          ApiDtos.BatchReviseTranslationsRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/translation-revisions";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, actorRole, request),
+                () -> WriteResult.of(200, citationService.batchRevise(
+                        documentId, actorId, actorRole, request))).toResponseEntity();
+    }
+
+    /** 解除锚点：须由异于创建人的法务角色（X-Actor-Role: LEGAL）确认并写入不可变理由。 */
+    @PostMapping("/{documentId}/anchors/{anchorId}/release")
+    public ResponseEntity<String> releaseAnchor(@PathVariable long documentId, @PathVariable long anchorId,
+                                                @RequestHeader("X-Actor-Id") String actorId,
+                                                @RequestHeader(value = "X-Actor-Role", required = false)
+                                                String actorRole,
+                                                @Valid @RequestBody ApiDtos.ReleaseAnchorRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/anchors/" + anchorId + "/release";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, actorRole, request),
+                () -> WriteResult.of(200, citationService.releaseAnchor(
+                        documentId, anchorId, actorId, actorRole, request))).toResponseEntity();
+    }
+
+    /** 查询段落全部引文锚点明细（含已解除），只读。 */
+    @GetMapping("/{documentId}/segments/{segmentId}/anchors")
+    public ResponseEntity<List<ApiDtos.AnchorView>> getAnchors(@PathVariable long documentId,
+                                                               @PathVariable String segmentId) {
+        return ResponseEntity.ok(citationService.getAnchors(documentId, segmentId));
+    }
+
+    /** 查询段落锚点不可变事件历史（登记/迁移/解除，按提交顺序），只读。 */
+    @GetMapping("/{documentId}/segments/{segmentId}/anchors/history")
+    public ResponseEntity<ApiDtos.AnchorHistoryResponse> getAnchorHistory(@PathVariable long documentId,
+                                                                          @PathVariable String segmentId) {
+        return ResponseEntity.ok(citationService.getHistory(documentId, segmentId));
+    }
+
+    /** 查询文档全部锚点的当前一致性诊断，只读。 */
+    @GetMapping("/{documentId}/anchors/diagnostics")
+    public ResponseEntity<ApiDtos.AnchorDiagnosticsResponse> getAnchorDiagnostics(
+            @PathVariable long documentId) {
+        return ResponseEntity.ok(citationService.getDiagnostics(documentId));
     }
 
     /** 新增术语版本：不可变快照，术语版本与草稿版本各加一；已有版本不可覆盖。 */
