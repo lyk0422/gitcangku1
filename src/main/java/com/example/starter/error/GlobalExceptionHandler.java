@@ -1,5 +1,6 @@
 package com.example.starter.error;
 
+import com.example.starter.evidence.MovePreconditionException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
@@ -12,6 +13,7 @@ import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
 import java.time.LocalDateTime;
+import java.util.List;
 import java.util.stream.Collectors;
 
 /**
@@ -26,6 +28,18 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorBody> handleApi(ApiException ex) {
         return ResponseEntity.status(ex.status())
                 .body(new ErrorBody(ex.status().value(), ex.getMessage(), LocalDateTime.now()));
+    }
+
+    /**
+     * 位置迁移前置条件失败：422 且逐项说明每件证物的不满足原因。
+     */
+    @ExceptionHandler(MovePreconditionException.class)
+    public ResponseEntity<MoveErrorBody> handleMovePrecondition(MovePreconditionException ex) {
+        List<MoveErrorBody.ItemError> items = ex.itemErrors().stream()
+                .map(item -> new MoveErrorBody.ItemError(item.evidenceKey(), item.reason()))
+                .toList();
+        return ResponseEntity.status(ex.status())
+                .body(new MoveErrorBody(ex.status().value(), ex.getMessage(), LocalDateTime.now(), items));
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
@@ -59,5 +73,26 @@ public class GlobalExceptionHandler {
      * @param timestamp 发生时间（Asia/Shanghai）
      */
     public record ErrorBody(int status, String message, LocalDateTime timestamp) {
+    }
+
+    /**
+     * 位置迁移 422 错误响应体：除通用字段外携带逐项证物错误明细。
+     *
+     * @param status    HTTP 状态码（422）
+     * @param message   错误汇总描述
+     * @param timestamp 发生时间（Asia/Shanghai）
+     * @param itemErrors 逐件证物的错误原因
+     */
+    public record MoveErrorBody(int status, String message, LocalDateTime timestamp,
+                                List<ItemError> itemErrors) {
+
+        /**
+         * 单件证物错误项。
+         *
+         * @param evidenceKey 证物业务键
+         * @param reason      错误原因
+         */
+        public record ItemError(String evidenceKey, String reason) {
+        }
     }
 }

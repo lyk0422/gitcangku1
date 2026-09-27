@@ -10,6 +10,7 @@ import com.example.starter.evidence.dto.LoanCreateRequest;
 import com.example.starter.evidence.dto.LoanReturnRequest;
 import com.example.starter.evidence.dto.LoanView;
 import com.example.starter.evidence.dto.SealInspectionRequest;
+import com.example.starter.evidence.dto.SealSnapshotView;
 import com.example.starter.evidence.dto.TransferInitiateRequest;
 import com.example.starter.evidence.dto.TransferView;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -45,6 +46,7 @@ public class EvidenceService {
     private final TransferRecordRepository transferRepository;
     private final SealInspectionRepository inspectionRepository;
     private final LoanRecordRepository loanRepository;
+    private final SealSnapshotRepository sealSnapshotRepository;
     private final CommandLogRepository commandLogRepository;
     private final ObjectMapper objectMapper;
     private final EvidenceClock clock;
@@ -53,6 +55,7 @@ public class EvidenceService {
                            TransferRecordRepository transferRepository,
                            SealInspectionRepository inspectionRepository,
                            LoanRecordRepository loanRepository,
+                           SealSnapshotRepository sealSnapshotRepository,
                            CommandLogRepository commandLogRepository,
                            ObjectMapper objectMapper,
                            EvidenceClock clock) {
@@ -60,6 +63,7 @@ public class EvidenceService {
         this.transferRepository = transferRepository;
         this.inspectionRepository = inspectionRepository;
         this.loanRepository = loanRepository;
+        this.sealSnapshotRepository = sealSnapshotRepository;
         this.commandLogRepository = commandLogRepository;
         this.objectMapper = objectMapper;
         this.clock = clock;
@@ -348,7 +352,9 @@ public class EvidenceService {
                 .stream().map(this::toView).toList();
         List<InspectionView> inspections = inspectionRepository.findByEvidenceKey(evidenceKey)
                 .stream().map(this::toView).toList();
-        return new CustodyChainView(toView(evidence), transfers, loans, inspections);
+        List<SealSnapshotView> sealSnapshots = sealSnapshotRepository.findByEvidenceKey(evidenceKey)
+                .stream().map(this::toSnapshotView).toList();
+        return new CustodyChainView(toView(evidence), transfers, loans, inspections, sealSnapshots);
     }
 
     private Evidence lockEvidence(String evidenceKey) {
@@ -404,6 +410,7 @@ public class EvidenceService {
     private EvidenceView toView(Evidence evidence) {
         return new EvidenceView(evidence.evidenceKey(), evidence.caseKey(), evidence.category(),
                 evidence.sealNo(), evidence.custodianId(), evidence.status(),
+                evidence.locationCode(), evidence.version(),
                 evidence.createdAt(), evidence.updatedAt());
     }
 
@@ -424,5 +431,12 @@ public class EvidenceService {
         return new LoanView(loan.loanKey(), loan.evidenceKey(), loan.custodianId(),
                 loan.borrowerId(), loan.purpose(), loan.loanAt(), loan.dueAt(), loan.status(),
                 overdue, loan.sealPassed(), loan.returnNote(), loan.returnedAt());
+    }
+
+    private SealSnapshotView toSnapshotView(SealSnapshot snapshot) {
+        return new SealSnapshotView(snapshot.moveKey(), snapshot.evidenceKey(), snapshot.sealNo(),
+                snapshot.evidenceStatus(), snapshot.custodianId(), snapshot.locationCode(),
+                snapshot.version(), snapshot.firstConfirmer(), snapshot.secondConfirmer(),
+                snapshot.snapshotAt());
     }
 }
