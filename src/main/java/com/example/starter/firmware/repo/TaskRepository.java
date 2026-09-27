@@ -15,18 +15,23 @@ import java.util.Optional;
 
 /**
  * 投放任务数据访问。同设备同发布单由唯一约束 uk_task_release_device 保证最多一条。
+ * 模块摘要、矩阵版本、豁免版本在创建时固化，之后不提供改写入口，保证历史证据稳定。
  */
 @Repository
 public class TaskRepository {
 
     private static final RowMapper<RolloutTask> MAPPER = (rs, rowNum) -> {
         String firstResult = rs.getString("first_result");
+        Integer matrixVersion = rs.getObject("matrix_version", Integer.class);
+        Integer exemptionVersion = rs.getObject("exemption_version", Integer.class);
         return new RolloutTask(rs.getLong("id"), rs.getLong("release_id"), rs.getString("device_id"),
                 TaskStatus.valueOf(rs.getString("status")),
-                firstResult == null ? null : ReceiptResult.valueOf(firstResult));
+                firstResult == null ? null : ReceiptResult.valueOf(firstResult),
+                rs.getString("module_summary"), matrixVersion, exemptionVersion);
     };
 
-    private static final String COLUMNS = "id, release_id, device_id, status, first_result";
+    private static final String COLUMNS = "id, release_id, device_id, status, first_result,"
+            + " module_summary, matrix_version, exemption_version";
 
     private final JdbcTemplate jdbc;
 
@@ -34,14 +39,27 @@ public class TaskRepository {
         this.jdbc = jdbc;
     }
 
-    public long insert(long releaseId, String deviceId) {
+    /**
+     * 创建任务并固化模块兼容证据。
+     *
+     * @param moduleSummary    设备模块摘要 JSON；设备从未上报为 null
+     * @param matrixVersion    目标固件矩阵版本；目标固件未登记需求为 null
+     * @param exemptionVersion 生效豁免版本；未使用豁免为 null
+     */
+    public long insert(long releaseId, String deviceId, String moduleSummary,
+                       Integer matrixVersion, Integer exemptionVersion) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO rollout_task (release_id, device_id, status) VALUES (?, ?, 'PENDING')",
+                    "INSERT INTO rollout_task (release_id, device_id, status, module_summary,"
+                            + " matrix_version, exemption_version)"
+                            + " VALUES (?, ?, 'PENDING', ?, ?, ?)",
                     new String[]{"id"});
             ps.setLong(1, releaseId);
             ps.setString(2, deviceId);
+            ps.setString(3, moduleSummary);
+            ps.setObject(4, matrixVersion);
+            ps.setObject(5, exemptionVersion);
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();

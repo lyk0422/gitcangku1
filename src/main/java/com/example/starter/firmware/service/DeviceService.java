@@ -23,17 +23,20 @@ public class DeviceService {
     }
 
     public DeviceView register(RegisterDeviceRequest request) {
+        String groupName = request.groupName() == null || request.groupName().isBlank()
+                ? null : request.groupName();
         String fingerprint = String.join("|", "device.register", request.deviceId(), request.model(),
-                request.currentVersion(), String.valueOf(request.bucketNo()));
+                request.currentVersion(), String.valueOf(request.bucketNo()),
+                groupName == null ? "" : groupName);
         return idempotency.execute(request.requestId(), "device.register", fingerprint, () -> {
             try {
                 deviceRepository.insert(new Device(request.deviceId(), request.model(),
-                        request.currentVersion(), request.bucketNo()));
+                        request.currentVersion(), request.bucketNo(), groupName));
             } catch (DuplicateKeyException e) {
                 throw ApiException.conflict("DEVICE_EXISTS", "设备已登记: " + request.deviceId());
             }
             return new DeviceView(request.deviceId(), request.model(), request.currentVersion(),
-                    request.bucketNo());
+                    request.bucketNo(), groupName);
         }, DeviceView.class);
     }
 
@@ -43,6 +46,14 @@ public class DeviceService {
 
     public Device findDevice(String deviceId) {
         return deviceRepository.findById(deviceId)
+                .orElseThrow(() -> ApiException.notFound("DEVICE_NOT_FOUND", "设备不存在: " + deviceId));
+    }
+
+    /**
+     * 持有设备行锁的查询，用于串行化同设备模块上报等修订事务。
+     */
+    public Device findDeviceForUpdate(String deviceId) {
+        return deviceRepository.findByIdForUpdate(deviceId)
                 .orElseThrow(() -> ApiException.notFound("DEVICE_NOT_FOUND", "设备不存在: " + deviceId));
     }
 }

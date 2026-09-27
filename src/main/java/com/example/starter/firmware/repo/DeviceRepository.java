@@ -19,14 +19,28 @@ public class DeviceRepository {
     }
 
     public void insert(Device device) {
-        jdbc.update("INSERT INTO device (device_id, model, current_version, bucket_no) VALUES (?, ?, ?, ?)",
-                device.deviceId(), device.model(), device.currentVersion(), device.bucketNo());
+        jdbc.update("INSERT INTO device (device_id, model, current_version, bucket_no, group_name)"
+                + " VALUES (?, ?, ?, ?, ?)",
+                device.deviceId(), device.model(), device.currentVersion(), device.bucketNo(),
+                device.groupName());
     }
 
     public Optional<Device> findById(String deviceId) {
-        return jdbc.query("SELECT device_id, model, current_version, bucket_no FROM device WHERE device_id = ?",
+        return jdbc.query("SELECT device_id, model, current_version, bucket_no, group_name"
+                        + " FROM device WHERE device_id = ?",
                 (rs, rowNum) -> new Device(rs.getString("device_id"), rs.getString("model"),
-                        rs.getString("current_version"), rs.getInt("bucket_no")),
+                        rs.getString("current_version"), rs.getInt("bucket_no"), rs.getString("group_name")),
+                deviceId).stream().findFirst();
+    }
+
+    /**
+     * 持有设备行锁至事务结束，串行化同设备的模块上报等修订。
+     */
+    public Optional<Device> findByIdForUpdate(String deviceId) {
+        return jdbc.query("SELECT device_id, model, current_version, bucket_no, group_name"
+                        + " FROM device WHERE device_id = ? FOR UPDATE",
+                (rs, rowNum) -> new Device(rs.getString("device_id"), rs.getString("model"),
+                        rs.getString("current_version"), rs.getInt("bucket_no"), rs.getString("group_name")),
                 deviceId).stream().findFirst();
     }
 

@@ -1,5 +1,7 @@
 package com.example.starter.firmware.service;
 
+import com.example.starter.firmware.api.MissingModuleView;
+import com.example.starter.firmware.api.ModuleEntryView;
 import com.example.starter.firmware.api.PullResponse;
 import com.example.starter.firmware.api.ReceiptRequest;
 import com.example.starter.firmware.api.TaskListResponse;
@@ -25,6 +27,8 @@ import java.util.List;
 /**
  * 投放任务：设备拉取与回执。与取消、恢复并发时统一先锁发布单行，再操作任务，形成一致提交顺序。
  * 回执首次终结任务时在发布单行锁内累计当前监控轮次统计，达到阈值即在同一事务原子暂停。
+ * 拉取在既有门禁（ACTIVE/来源版本/分桶）通过后逐项校验目标固件完整模块依赖集合：
+ * 缺失或低版本返回 MODULE_BLOCKED（稳定排序明细），不创建任务且不计入失败率统计。
  */
 @Service
 public class TaskService {
@@ -35,12 +39,14 @@ public class TaskService {
     private final PauseRecordRepository pauseRecordRepository;
     private final DeviceService deviceService;
     private final ReleaseService releaseService;
+    private final CompatibilityService compatibilityService;
     private final IdempotencyService idempotency;
     private final Clock clock;
 
     public TaskService(TaskRepository taskRepository, ReleaseRepository releaseRepository,
                        DeviceRepository deviceRepository, PauseRecordRepository pauseRecordRepository,
                        DeviceService deviceService, ReleaseService releaseService,
+                       CompatibilityService compatibilityService,
                        IdempotencyService idempotency, Clock clock) {
         this.taskRepository = taskRepository;
         this.releaseRepository = releaseRepository;
@@ -48,12 +54,14 @@ public class TaskService {
         this.pauseRecordRepository = pauseRecordRepository;
         this.deviceService = deviceService;
         this.releaseService = releaseService;
+        this.compatibilityService = compatibilityService;
         this.idempotency = idempotency;
         this.clock = clock;
     }
 
     /**
-     * 设备拉取：已存在任务直接返回；否则仅当型号与当前版本匹配、分桶号小于比例且发布单 ACTIVE 时创建。
+     * 设备拉取：已存在任务直接返回；否则仅当型号与当前版本匹配、分桶号小于比例且发布单 ACTIVE 时，
+     * 再逐项校验完整模块依赖集合；校验失败返回 MODULE_BLOCKED 明细，不建任务、不计失败率。
      * PAUSED 时不创建新任务，已有任务仍可查看与回执。
      */
     public PullResponse pull(String deviceId, String requestId) {
@@ -68,31 +76,48 @@ public class TaskService {
                     .orElseThrow(() -> ApiException.notFound("RELEASE_NOT_FOUND", "发布单不存在"));
             var existing = taskRepository.findByReleaseAndDevice(order.id(), deviceId);
             if (existing.isPresent()) {
-                return new PullResponse(TaskView.of(existing.get(), order));
+                return new PullResponse(toTaskView(existing.get(), order));
             }
             if (order.status() != ReleaseStatus.ACTIVE
                     || !device.currentVersion().equals(order.fromVersion())
                     || device.bucketNo() >= order.ratio()) {
                 return new PullResponse(null);
             }
+            // 既有门禁全部通过后才做模块兼容校验；豁免不绕过上述任一门禁。
+            CompatibilityService.Evaluation evaluation = compatibilityService.evaluate(order, device);
+            if (!evaluation.compatible()) {
+                long blockId = compatibilityService.recordBlock(order, device, requestId, evaluation);
+                List<MissingModuleView> missing = evaluation.missing().stream()
+                        .map(m -> new MissingModuleView(m.moduleName(), m.deviceVersion(), m.requiredVersion()))
+                        .toList();
+                return PullResponse.blocked(blockId, evaluation.matrixVersion(),
+                        evaluation.exemptionVersion(), missing);
+            }
             long taskId;
             try {
-                taskId = taskRepository.insert(order.id(), deviceId);
+                taskId = taskRepository.insert(order.id(), deviceId, evaluation.deviceSummaryJson(),
+                        evaluation.matrixVersion(), evaluation.exemptionVersion());
             } catch (DuplicateKeyException e) {
                 RolloutTask task = taskRepository.findByReleaseAndDevice(order.id(), deviceId)
                         .orElseThrow(() -> new IllegalStateException("任务唯一约束冲突后未找到任务"));
-                return new PullResponse(TaskView.of(task, order));
+                return new PullResponse(toTaskView(task, order));
             }
             RolloutTask task = taskRepository.findById(taskId)
                     .orElseThrow(() -> new IllegalStateException("任务创建后读取失败"));
-            return new PullResponse(TaskView.of(task, order));
+            return new PullResponse(toTaskView(task, order));
         }, PullResponse.class);
+    }
+
+    private TaskView toTaskView(RolloutTask task, ReleaseOrder order) {
+        List<ModuleEntryView> summary = compatibilityService.summaryToViews(task.moduleSummary());
+        return TaskView.of(task, order, summary);
     }
 
     /**
      * 回执：首次回执终结任务并计入完成时所在监控轮次，仅 SUCCESS 更新设备当前版本；
      * 同结果重复成功（不重复计数），改结果 409；已取消任务的后到回执 409 且不更新设备版本。
      * 样本达到下限且失败率越限时，同事务将仍为 ACTIVE 的发布单原子转为 PAUSED 并落暂停记录。
+     * SUCCESS 只更新设备固件版本，不虚构设备模块已升级。
      */
     public TaskView receipt(long taskId, ReceiptRequest request) {
         String fingerprint = String.join("|", "task.receipt", String.valueOf(taskId), request.result().name());
@@ -112,11 +137,11 @@ public class TaskService {
                     }
                     ReleaseOrder updated = releaseRepository.findById(snapshot.releaseId()).orElseThrow();
                     pauseIfThresholdReached(updated, taskId);
-                    yield TaskView.of(taskRepository.findById(taskId).orElseThrow(), updated);
+                    yield toTaskView(taskRepository.findById(taskId).orElseThrow(), updated);
                 }
                 case SUCCESS, FAILED -> {
                     if (task.firstResult() == request.result()) {
-                        yield TaskView.of(task, lockedOrder);
+                        yield toTaskView(task, lockedOrder);
                     }
                     throw ApiException.conflict("RECEIPT_RESULT_CONFLICT",
                             "任务已终结为 " + task.firstResult() + "，不能改为 " + request.result());
@@ -150,7 +175,7 @@ public class TaskService {
     public TaskListResponse listByRelease(long releaseId, TaskStatus statusFilter) {
         ReleaseOrder order = releaseService.findOrder(releaseId);
         List<TaskView> tasks = taskRepository.findByRelease(releaseId, statusFilter).stream()
-                .map(task -> TaskView.of(task, order))
+                .map(task -> toTaskView(task, order))
                 .toList();
         return new TaskListResponse(tasks);
     }
