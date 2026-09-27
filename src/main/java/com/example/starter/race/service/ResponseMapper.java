@@ -1,8 +1,11 @@
 package com.example.starter.race.service;
 
+import com.example.starter.race.api.CategoryResponse;
 import com.example.starter.race.api.CheckpointPassResponse;
 import com.example.starter.race.api.CheckpointTimingResponse;
 import com.example.starter.race.api.PenaltyResponse;
+import com.example.starter.race.api.ReclassRecordResponse;
+import com.example.starter.race.api.ReclassRequestResponse;
 import com.example.starter.race.api.ResultEntryResponse;
 import com.example.starter.race.api.RunnerResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
@@ -10,10 +13,14 @@ import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
+import com.example.starter.race.persistence.CategoryRow;
+import com.example.starter.race.persistence.CategorySnapshotEntryRow;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
+import com.example.starter.race.persistence.ReclassRecordRow;
+import com.example.starter.race.persistence.ReclassRequestRow;
 import com.example.starter.race.persistence.RunnerRow;
 import com.example.starter.race.persistence.SnapshotCheckpointRow;
 import com.example.starter.race.persistence.SnapshotEntryRow;
@@ -32,7 +39,41 @@ final class ResponseMapper {
     }
 
     static RunnerResponse toRunnerResponse(RunnerRow row) {
-        return new RunnerResponse(row.bib(), row.finishTimeMs(), row.createdAt(), row.updatedAt());
+        return new RunnerResponse(row.bib(), row.finishTimeMs(), row.categoryCode(),
+                row.withdrawn(), row.withdrawnAt(), row.createdAt(), row.updatedAt());
+    }
+
+    static CategoryResponse toCategoryResponse(CategoryRow row, int activeCount) {
+        return new CategoryResponse(row.raceId(), row.categoryCode(), row.capacity(),
+                activeCount, row.status(), row.createdAt(), row.sealedAt());
+    }
+
+    static ReclassRequestResponse toReclassRequestResponse(ReclassRequestRow row) {
+        return new ReclassRequestResponse(row.requestId(), row.raceId(), row.bib(),
+                row.fromCategory(), row.toCategory(), row.reason(), row.status(),
+                row.raceVersion(), row.batchId(), row.rejectReason(),
+                row.createdAt(), row.decidedAt());
+    }
+
+    static ReclassRecordResponse toReclassRecordResponse(ReclassRecordRow row) {
+        return new ReclassRecordResponse(row.recordId(), row.batchId(), row.raceId(), row.bib(),
+                row.fromCategory(), row.toCategory(), row.preRank(), row.preStatus(),
+                row.preFinishTimeMs(), row.prePenaltyMs(), row.preTotalTimeMs(),
+                row.operator(), row.approvedAt());
+    }
+
+    /** 组别快照条目转成绩条目响应；组别排名不固化检查点计数，统一为 0 与空缺失列表。 */
+    static ResultEntryResponse toEntryResponse(CategorySnapshotEntryRow entry) {
+        return new ResultEntryResponse(
+                entry.bib(),
+                entry.rank(),
+                entry.status(),
+                entry.finishTimeMs(),
+                entry.penaltyMs(),
+                entry.totalTimeMs(),
+                0,
+                0,
+                List.of());
     }
 
     static PenaltyResponse toPenaltyResponse(PenaltyRow row) {

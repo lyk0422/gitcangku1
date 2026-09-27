@@ -10,16 +10,31 @@ CREATE TABLE IF NOT EXISTS race (
     CONSTRAINT pk_race PRIMARY KEY (race_id)
 );
 
+CREATE TABLE IF NOT EXISTS race_category (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    category_code VARCHAR(64) NOT NULL COMMENT '组别代码，同一赛事内唯一',
+    capacity INT NOT NULL COMMENT '组别容量（在赛人数上限，>=1）；已退赛者不占容量',
+    status VARCHAR(16) NOT NULL COMMENT '组别状态：OPEN-可迁入迁出，SEALED-已封榜冻结',
+    created_at BIGINT NOT NULL COMMENT '创建时间，Unix毫秒时间戳',
+    sealed_at BIGINT COMMENT '组别封榜时间，Unix毫秒时间戳；未封榜为NULL',
+    CONSTRAINT pk_race_category PRIMARY KEY (race_id, category_code),
+    CONSTRAINT fk_category_race FOREIGN KEY (race_id) REFERENCES race (race_id)
+);
+
 CREATE TABLE IF NOT EXISTS runner (
     id BIGINT NOT NULL AUTO_INCREMENT COMMENT '自增主键',
     race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
     bib VARCHAR(64) NOT NULL COMMENT '参赛号，同一赛事内唯一',
     finish_time_ms BIGINT COMMENT '原始完赛耗时（毫秒，取值1~86400000）；NULL表示计时缺失，状态UNTIMED',
+    category_code VARCHAR(64) COMMENT '当前所属组别代码；NULL表示未分组',
+    withdrawn BOOLEAN NOT NULL DEFAULT FALSE COMMENT '是否已退赛：FALSE-在赛，TRUE-已退赛；退赛者不占组别容量、不参与组别排名',
+    withdrawn_at BIGINT COMMENT '退赛时间，Unix毫秒时间戳；未退赛为NULL',
     created_at BIGINT NOT NULL COMMENT '登记时间，Unix毫秒时间戳',
     updated_at BIGINT NOT NULL COMMENT '最近一次计时修订时间，Unix毫秒时间戳',
     CONSTRAINT pk_runner PRIMARY KEY (id),
     CONSTRAINT uk_runner_race_bib UNIQUE (race_id, bib),
-    CONSTRAINT fk_runner_race FOREIGN KEY (race_id) REFERENCES race (race_id)
+    CONSTRAINT fk_runner_race FOREIGN KEY (race_id) REFERENCES race (race_id),
+    CONSTRAINT fk_runner_category FOREIGN KEY (race_id, category_code) REFERENCES race_category (race_id, category_code)
 );
 
 CREATE TABLE IF NOT EXISTS penalty (
@@ -95,9 +110,68 @@ CREATE TABLE IF NOT EXISTS result_snapshot_checkpoint (
     CONSTRAINT fk_snapshot_checkpoint_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
 );
 
+CREATE TABLE IF NOT EXISTS reclass_request (
+    request_id VARCHAR(128) NOT NULL COMMENT '重分申请ID，全局唯一（兼作提交幂等键）',
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    bib VARCHAR(64) NOT NULL COMMENT '申请参赛者参赛号',
+    from_category VARCHAR(64) COMMENT '申请提交时参赛者所属组别；NULL表示未分组',
+    to_category VARCHAR(64) NOT NULL COMMENT '目标组别代码',
+    reason VARCHAR(512) NOT NULL COMMENT '申请理由',
+    status VARCHAR(16) NOT NULL COMMENT '申请状态：PENDING-待审批，APPROVED-已批准，REJECTED-已拒绝',
+    race_version INT NOT NULL COMMENT '提交时客户端所见赛事版本（expectedVersion）',
+    batch_id VARCHAR(128) COMMENT '批准批次ID（=批准请求的reclassKey）；未批准为NULL',
+    reject_reason VARCHAR(512) COMMENT '拒绝理由；未拒绝为NULL',
+    created_at BIGINT NOT NULL COMMENT '申请提交时间，Unix毫秒时间戳',
+    decided_at BIGINT COMMENT '审批时间，Unix毫秒时间戳；待审批为NULL',
+    CONSTRAINT pk_reclass_request PRIMARY KEY (request_id),
+    CONSTRAINT fk_reclass_runner FOREIGN KEY (race_id, bib) REFERENCES runner (race_id, bib),
+    INDEX idx_reclass_race_bib (race_id, bib)
+);
+
+CREATE TABLE IF NOT EXISTS reclass_record (
+    record_id BIGINT NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    batch_id VARCHAR(128) NOT NULL COMMENT '批准批次ID（=批准请求的reclassKey）',
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    bib VARCHAR(64) NOT NULL COMMENT '被迁移参赛者参赛号',
+    from_category VARCHAR(64) COMMENT '迁移前所属组别；NULL表示未分组',
+    to_category VARCHAR(64) NOT NULL COMMENT '迁移后所属组别',
+    pre_rank INT COMMENT '迁移前在来源组别中的名次（并列同名次）；未排名为NULL',
+    pre_status VARCHAR(24) NOT NULL COMMENT '迁移前成绩状态：RANKED/UNTIMED/MISSING_CHECKPOINT/DISQUALIFIED',
+    pre_finish_time_ms BIGINT COMMENT '迁移前原始完赛耗时（毫秒）快照；计时缺失为NULL',
+    pre_penalty_ms BIGINT NOT NULL COMMENT '迁移前生效加时合计（毫秒）快照，无加时为0',
+    pre_total_time_ms BIGINT COMMENT '迁移前总耗时（毫秒）快照；未排名为NULL',
+    operator VARCHAR(64) NOT NULL COMMENT '批准操作者',
+    approved_at BIGINT NOT NULL COMMENT '批准时间，Unix毫秒时间戳',
+    CONSTRAINT pk_reclass_record PRIMARY KEY (record_id),
+    CONSTRAINT fk_reclass_record_race FOREIGN KEY (race_id) REFERENCES race (race_id),
+    INDEX idx_reclass_record_race (race_id)
+);
+
+CREATE TABLE IF NOT EXISTS category_snapshot (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    category_code VARCHAR(64) NOT NULL COMMENT '组别代码；每个组别封榜后仅一份只读快照，后续重分不追溯重写',
+    sealed_at BIGINT NOT NULL COMMENT '组别封榜时间，Unix毫秒时间戳',
+    CONSTRAINT pk_category_snapshot PRIMARY KEY (race_id, category_code),
+    CONSTRAINT fk_category_snapshot_category FOREIGN KEY (race_id, category_code) REFERENCES race_category (race_id, category_code)
+);
+
+CREATE TABLE IF NOT EXISTS category_snapshot_entry (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属快照的赛事ID',
+    category_code VARCHAR(64) NOT NULL COMMENT '所属快照的组别代码',
+    bib VARCHAR(64) NOT NULL COMMENT '参赛号（封榜时刻所属该组别的在赛选手）',
+    rank_no INT COMMENT '名次（从1开始，并列同名次并跳号）；未计时/漏点/取消资格为NULL',
+    status VARCHAR(24) NOT NULL COMMENT '成绩状态：RANKED/UNTIMED/MISSING_CHECKPOINT/DISQUALIFIED',
+    finish_time_ms BIGINT COMMENT '原始完赛耗时（毫秒）；计时缺失为NULL',
+    penalty_ms BIGINT NOT NULL COMMENT '生效加时合计毫秒数，无加时为0',
+    total_time_ms BIGINT COMMENT '总耗时=原始完赛耗时+生效加时（毫秒）；未排名时为NULL',
+    display_order INT NOT NULL COMMENT '展示顺序，从0开始：先名次顺序，其余按参赛号字典序',
+    CONSTRAINT pk_category_snapshot_entry PRIMARY KEY (race_id, category_code, bib),
+    CONSTRAINT fk_category_snapshot_entry_snapshot FOREIGN KEY (race_id, category_code) REFERENCES category_snapshot (race_id, category_code)
+);
+
 CREATE TABLE IF NOT EXISTS idempotency_record (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求ID（写操作幂等键）',
-    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE',
+    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE/CREATE_CATEGORY/WITHDRAW_RUNNER/SUBMIT_RECLASS/APPROVE_RECLASS/REJECT_RECLASS/SEAL_CATEGORY',
     request_digest CHAR(64) NOT NULL COMMENT '请求参数（requestId除外，含expectedVersion）规范化JSON的SHA-256摘要',
     response_status INT NOT NULL COMMENT '原成功请求的HTTP状态码，重放时原样返回',
     response_body TEXT COMMENT '原成功响应体JSON，重放时原样返回',
