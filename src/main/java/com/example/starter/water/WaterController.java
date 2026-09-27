@@ -1,16 +1,25 @@
 package com.example.starter.water;
 
+import com.example.starter.water.dto.Dtos.AllocationDetailResponse;
 import com.example.starter.water.dto.Dtos.AllocationResponse;
+import com.example.starter.water.dto.Dtos.BatchApproveRequest;
+import com.example.starter.water.dto.Dtos.BatchApproveResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
 import com.example.starter.water.dto.Dtos.CommandRequest;
 import com.example.starter.water.dto.Dtos.CreateWindowRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
+import com.example.starter.water.dto.Dtos.CurveResponse;
+import com.example.starter.water.dto.Dtos.CurveVersionsResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.PutCurveRequest;
+import com.example.starter.water.dto.Dtos.RedeemRequest;
+import com.example.starter.water.dto.Dtos.RedemptionResponse;
 import com.example.starter.water.dto.Dtos.SubmitAllocationRequest;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferRequest;
 import com.example.starter.water.dto.Dtos.TransferResponse;
+import com.example.starter.water.dto.Dtos.WindowHoursResponse;
 import com.example.starter.water.dto.Dtos.WindowResponse;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -46,7 +55,7 @@ public class WaterController {
     public AllocationResponse submitAllocation(@RequestBody SubmitAllocationRequest request,
                                                @RequestHeader("X-Actor-Id") String actor) {
         return service.submitAllocation(request.commandKey(), request.allocationKey(), request.windowId(),
-                request.userId(), request.amount(), actor);
+                request.userId(), request.amount(), actor, request.hourlyAmounts());
     }
 
     /** 批准配水申请。 */
@@ -54,6 +63,27 @@ public class WaterController {
     public AllocationResponse approveAllocation(@PathVariable String allocationKey,
                                                 @RequestBody CommandRequest request) {
         return service.approveAllocation(request.commandKey(), allocationKey);
+    }
+
+    /** 批量批准配水申请：任一失败整次回滚。 */
+    @PostMapping("/allocations/approve-batch")
+    public BatchApproveResponse approveBatch(@RequestBody BatchApproveRequest request) {
+        return service.approveBatch(request.commandKey(), request.allocationKeys());
+    }
+
+    /** 实际核销：按发生小时扣减同一小时额度。 */
+    @PostMapping("/allocations/{allocationKey}/redeem")
+    public RedemptionResponse redeemAllocation(@PathVariable String allocationKey,
+                                               @RequestBody RedeemRequest request,
+                                               @RequestHeader("X-Actor-Id") String actor) {
+        return service.redeemAllocation(request.commandKey(), allocationKey, request.hourStartUtc(),
+                request.amount(), actor);
+    }
+
+    /** 查询申请明细（逐小时状态、批准快照、核销流水）。 */
+    @GetMapping("/allocations/{allocationKey}")
+    public AllocationDetailResponse getAllocationDetail(@PathVariable String allocationKey) {
+        return service.getAllocationDetail(allocationKey);
     }
 
     /** 取消配水申请（仅申请人本人）。 */
@@ -102,5 +132,29 @@ public class WaterController {
     @GetMapping("/windows/{windowId}/history")
     public HistoryResponse getHistory(@PathVariable long windowId) {
         return service.getHistory(windowId);
+    }
+
+    /** 全量替换窗口下泄曲线（每次替换产生新版本；已开始小时不得修改）。 */
+    @PostMapping("/windows/{windowId}/curve")
+    public CurveResponse putCurve(@PathVariable long windowId, @RequestBody PutCurveRequest request) {
+        return service.putCurve(request.commandKey(), windowId, request.points());
+    }
+
+    /** 查询窗口当前下泄曲线。 */
+    @GetMapping("/windows/{windowId}/curve")
+    public CurveResponse getCurve(@PathVariable long windowId) {
+        return service.getCurve(windowId);
+    }
+
+    /** 查询窗口下泄曲线全部历史版本。 */
+    @GetMapping("/windows/{windowId}/curve/versions")
+    public CurveVersionsResponse getCurveVersions(@PathVariable long windowId) {
+        return service.getCurveVersions(windowId);
+    }
+
+    /** 查询窗口逐小时诊断（上限/已批准未核销/已核销/剩余）。 */
+    @GetMapping("/windows/{windowId}/hours")
+    public WindowHoursResponse getWindowHours(@PathVariable long windowId) {
+        return service.getWindowHours(windowId);
     }
 }

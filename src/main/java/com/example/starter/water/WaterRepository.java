@@ -46,6 +46,36 @@ public class WaterRepository {
                              long createdNanos) {
     }
 
+    /** 下泄曲线版本行。 */
+    public record CurveRow(long id, long windowId, int version, long createdNanos) {
+    }
+
+    /** 下泄曲线逐小时上限点行。 */
+    public record CurvePointRow(long curveId, long hourStartNanos, BigDecimal limitAmount) {
+    }
+
+    /** 申请逐小时预留行；amount 为当前预留，redeemed 为已核销。 */
+    public record AllocationHourRow(long allocationId, long hourStartNanos, BigDecimal amount,
+                                    BigDecimal redeemed) {
+    }
+
+    /** 批准快照行；curveVersion 为 null 表示批准时窗口无曲线。 */
+    public record SnapshotRow(long allocationId, Integer curveVersion, long createdNanos) {
+    }
+
+    /** 批准快照逐小时预留行。 */
+    public record SnapshotHourRow(long allocationId, long hourStartNanos, BigDecimal amount) {
+    }
+
+    /** 核销流水行，创建后不可变。 */
+    public record RedemptionRow(long id, long allocationId, long hourStartNanos, BigDecimal amount,
+                                String actor, long createdNanos) {
+    }
+
+    /** 窗口逐小时负载行：reserved 为已批准未核销，redeemed 为已核销合计。 */
+    public record HourLoadRow(long hourStartNanos, BigDecimal reserved, BigDecimal redeemed) {
+    }
+
     private static final RowMapper<WindowRow> WINDOW_MAPPER = (rs, n) -> new WindowRow(
             rs.getLong("id"), rs.getString("window_key"), rs.getString("channel_id"),
             rs.getLong("start_nanos"), rs.getLong("end_nanos"),
@@ -74,6 +104,31 @@ public class WaterRepository {
     private static final RowMapper<CommandRow> COMMAND_MAPPER = (rs, n) -> new CommandRow(
             rs.getString("command_key"), rs.getString("operation"), rs.getString("params"),
             rs.getString("response"), rs.getLong("created_nanos"));
+
+    private static final RowMapper<CurveRow> CURVE_MAPPER = (rs, n) -> new CurveRow(
+            rs.getLong("id"), rs.getLong("window_id"), rs.getInt("version"), rs.getLong("created_nanos"));
+
+    private static final RowMapper<CurvePointRow> CURVE_POINT_MAPPER = (rs, n) -> new CurvePointRow(
+            rs.getLong("curve_id"), rs.getLong("hour_start_nanos"), rs.getBigDecimal("limit_amount"));
+
+    private static final RowMapper<AllocationHourRow> ALLOCATION_HOUR_MAPPER = (rs, n) -> new AllocationHourRow(
+            rs.getLong("allocation_id"), rs.getLong("hour_start_nanos"), rs.getBigDecimal("amount"),
+            rs.getBigDecimal("redeemed"));
+
+    private static final RowMapper<SnapshotRow> SNAPSHOT_MAPPER = (rs, n) -> new SnapshotRow(
+            rs.getLong("allocation_id"),
+            rs.getObject("curve_version") == null ? null : rs.getInt("curve_version"),
+            rs.getLong("created_nanos"));
+
+    private static final RowMapper<SnapshotHourRow> SNAPSHOT_HOUR_MAPPER = (rs, n) -> new SnapshotHourRow(
+            rs.getLong("allocation_id"), rs.getLong("hour_start_nanos"), rs.getBigDecimal("amount"));
+
+    private static final RowMapper<RedemptionRow> REDEMPTION_MAPPER = (rs, n) -> new RedemptionRow(
+            rs.getLong("id"), rs.getLong("allocation_id"), rs.getLong("hour_start_nanos"),
+            rs.getBigDecimal("amount"), rs.getString("actor"), rs.getLong("created_nanos"));
+
+    private static final RowMapper<HourLoadRow> HOUR_LOAD_MAPPER = (rs, n) -> new HourLoadRow(
+            rs.getLong("hour_start_nanos"), rs.getBigDecimal("reserved"), rs.getBigDecimal("redeemed"));
 
     private final JdbcTemplate jdbc;
 
@@ -303,5 +358,178 @@ public class WaterRepository {
     /** 写回命令首次成功响应。 */
     public void updateCommandResponse(String commandKey, String response) {
         jdbc.update("UPDATE command_log SET response = ? WHERE command_key = ?", response, commandKey);
+    }
+
+    // ------------------------------------------------------------------
+    // 下泄曲线
+    // ------------------------------------------------------------------
+
+    /** 插入新曲线版本并返回主键。 */
+    public long insertCurve(long windowId, int version, long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO release_curve (window_id, version, created_nanos) VALUES (?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setLong(1, windowId);
+            ps.setInt(2, version);
+            ps.setLong(3, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 插入曲线逐小时上限点。 */
+    public void insertCurvePoint(long curveId, long hourStartNanos, BigDecimal limitAmount) {
+        jdbc.update("INSERT INTO release_curve_point (curve_id, hour_start_nanos, limit_amount)"
+                + " VALUES (?, ?, ?)", curveId, hourStartNanos, limitAmount);
+    }
+
+    /** 查询窗口最新曲线版本，无则 null。 */
+    public CurveRow findLatestCurve(long windowId) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT id, window_id, version, created_nanos FROM release_curve"
+                            + " WHERE window_id = ? ORDER BY version DESC LIMIT 1", CURVE_MAPPER, windowId);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 窗口全部曲线版本，按版本号升序。 */
+    public List<CurveRow> listCurves(long windowId) {
+        return jdbc.query(
+                "SELECT id, window_id, version, created_nanos FROM release_curve"
+                        + " WHERE window_id = ? ORDER BY version", CURVE_MAPPER, windowId);
+    }
+
+    /** 曲线版本全部小时点，按小时升序。 */
+    public List<CurvePointRow> listCurvePoints(long curveId) {
+        return jdbc.query(
+                "SELECT curve_id, hour_start_nanos, limit_amount FROM release_curve_point"
+                        + " WHERE curve_id = ? ORDER BY hour_start_nanos", CURVE_POINT_MAPPER, curveId);
+    }
+
+    // ------------------------------------------------------------------
+    // 逐小时预留
+    // ------------------------------------------------------------------
+
+    /** 插入申请逐小时预留声明（提交时）。 */
+    public void insertAllocationHour(long allocationId, long hourStartNanos, BigDecimal amount) {
+        jdbc.update("INSERT INTO allocation_hour (allocation_id, hour_start_nanos, amount, redeemed)"
+                + " VALUES (?, ?, ?, 0)", allocationId, hourStartNanos, amount);
+    }
+
+    /** 申请全部逐小时预留行，按小时升序。 */
+    public List<AllocationHourRow> listAllocationHours(long allocationId) {
+        return jdbc.query(
+                "SELECT allocation_id, hour_start_nanos, amount, redeemed FROM allocation_hour"
+                        + " WHERE allocation_id = ? ORDER BY hour_start_nanos", ALLOCATION_HOUR_MAPPER,
+                allocationId);
+    }
+
+    /** 申请某小时的预留行，不存在返回 null。 */
+    public AllocationHourRow findAllocationHour(long allocationId, long hourStartNanos) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT allocation_id, hour_start_nanos, amount, redeemed FROM allocation_hour"
+                            + " WHERE allocation_id = ? AND hour_start_nanos = ?",
+                    ALLOCATION_HOUR_MAPPER, allocationId, hourStartNanos);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 转让扣减源申请某小时预留（不得压过已核销由事务内校验与 CHECK 约束保证）。 */
+    public void decrementAllocationHour(long allocationId, long hourStartNanos, BigDecimal delta) {
+        jdbc.update("UPDATE allocation_hour SET amount = amount - ?"
+                + " WHERE allocation_id = ? AND hour_start_nanos = ?", delta, allocationId, hourStartNanos);
+    }
+
+    /** 取消申请：逐小时预留压降为已核销量，释放未核销部分。 */
+    public void releaseAllocationHours(long allocationId) {
+        jdbc.update("UPDATE allocation_hour SET amount = redeemed WHERE allocation_id = ?", allocationId);
+    }
+
+    /** 核销：同一小时已核销量累加。 */
+    public void addRedeemed(long allocationId, long hourStartNanos, BigDecimal delta) {
+        jdbc.update("UPDATE allocation_hour SET redeemed = redeemed + ?"
+                + " WHERE allocation_id = ? AND hour_start_nanos = ?", delta, allocationId, hourStartNanos);
+    }
+
+    /**
+     * 窗口逐小时负载：已批准未核销（APPROVED 的 amount - redeemed）与已核销合计
+     * （APPROVED 与已取消申请的 redeemed；取消时预留已压降为已核销量，其 amount 即 redeemed）。
+     */
+    public List<HourLoadRow> sumHourLoad(long windowId) {
+        return jdbc.query(
+                "SELECT ah.hour_start_nanos,"
+                        + " SUM(CASE WHEN a.status = 'APPROVED' THEN ah.amount - ah.redeemed ELSE 0 END) AS reserved,"
+                        + " SUM(ah.redeemed) AS redeemed"
+                        + " FROM allocation_hour ah JOIN allocation a ON a.id = ah.allocation_id"
+                        + " WHERE a.window_id = ? AND a.status IN ('APPROVED', 'CANCELLED')"
+                        + " GROUP BY ah.hour_start_nanos ORDER BY ah.hour_start_nanos",
+                HOUR_LOAD_MAPPER, windowId);
+    }
+
+    // ------------------------------------------------------------------
+    // 批准快照与核销流水
+    // ------------------------------------------------------------------
+
+    /** 固化批准快照（曲线版本可为 null）。 */
+    public void insertSnapshot(long allocationId, Integer curveVersion, long createdNanos) {
+        jdbc.update("INSERT INTO approval_snapshot (allocation_id, curve_version, created_nanos)"
+                + " VALUES (?, ?, ?)", allocationId, curveVersion, createdNanos);
+    }
+
+    /** 固化批准快照逐小时预留。 */
+    public void insertSnapshotHour(long allocationId, long hourStartNanos, BigDecimal amount) {
+        jdbc.update("INSERT INTO approval_snapshot_hour (allocation_id, hour_start_nanos, amount)"
+                + " VALUES (?, ?, ?)", allocationId, hourStartNanos, amount);
+    }
+
+    /** 查询批准快照，未批准返回 null。 */
+    public SnapshotRow findSnapshot(long allocationId) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT allocation_id, curve_version, created_nanos FROM approval_snapshot"
+                            + " WHERE allocation_id = ?", SNAPSHOT_MAPPER, allocationId);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 批准快照逐小时预留，按小时升序。 */
+    public List<SnapshotHourRow> listSnapshotHours(long allocationId) {
+        return jdbc.query(
+                "SELECT allocation_id, hour_start_nanos, amount FROM approval_snapshot_hour"
+                        + " WHERE allocation_id = ? ORDER BY hour_start_nanos", SNAPSHOT_HOUR_MAPPER,
+                allocationId);
+    }
+
+    /** 插入不可变核销流水并返回主键。 */
+    public long insertRedemption(long allocationId, long hourStartNanos, BigDecimal amount, String actor,
+                                 long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO redemption (allocation_id, hour_start_nanos, amount, actor, created_nanos)"
+                            + " VALUES (?, ?, ?, ?, ?)", Statement.RETURN_GENERATED_KEYS);
+            ps.setLong(1, allocationId);
+            ps.setLong(2, hourStartNanos);
+            ps.setBigDecimal(3, amount);
+            ps.setString(4, actor);
+            ps.setLong(5, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 申请全部核销流水，按主键升序。 */
+    public List<RedemptionRow> listRedemptions(long allocationId) {
+        return jdbc.query(
+                "SELECT id, allocation_id, hour_start_nanos, amount, actor, created_nanos"
+                        + " FROM redemption WHERE allocation_id = ? ORDER BY id", REDEMPTION_MAPPER,
+                allocationId);
     }
 }

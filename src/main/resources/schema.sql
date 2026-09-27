@@ -51,8 +51,61 @@ CREATE TABLE IF NOT EXISTS transfer (
 
 CREATE TABLE IF NOT EXISTS command_log (
     command_key VARCHAR(128) PRIMARY KEY COMMENT '命令幂等键',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：WINDOW_CREATE/ALLOCATION_SUBMIT/ALLOCATION_APPROVE/ALLOCATION_CANCEL/CURTAILMENT_CREATE/CURTAILMENT_CANCEL/TRANSFER',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：WINDOW_CREATE/ALLOCATION_SUBMIT/ALLOCATION_APPROVE/ALLOCATION_CANCEL/CURTAILMENT_CREATE/CURTAILMENT_CANCEL/TRANSFER/CURVE_PUT/ALLOCATION_REDEEM/ALLOCATION_APPROVE_BATCH',
     params VARCHAR(2048) NOT NULL COMMENT '规范化请求参数串，用于同键改参检测',
     response MEDIUMTEXT NULL COMMENT '首次成功响应 JSON；命令事务提交前写入',
     created_nanos BIGINT NOT NULL COMMENT '创建时间，UTC 纳秒时间戳'
 ) COMMENT='命令幂等日志，同键同参重放返回首次结果，同键改参返回 409';
+
+CREATE TABLE IF NOT EXISTS release_curve (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '下泄曲线版本主键',
+    window_id BIGINT NOT NULL COMMENT '所属供水窗口 ID',
+    version INT NOT NULL COMMENT '曲线版本号，窗口内从 1 递增，不可复用',
+    created_nanos BIGINT NOT NULL COMMENT '创建时间，UTC 纳秒时间戳',
+    CONSTRAINT uk_release_curve_window_version UNIQUE (window_id, version),
+    CONSTRAINT fk_release_curve_window FOREIGN KEY (window_id) REFERENCES supply_window (id)
+) COMMENT='水库下泄曲线版本，每次全量替换产生新版本，历史版本不可改写';
+
+CREATE TABLE IF NOT EXISTS release_curve_point (
+    curve_id BIGINT NOT NULL COMMENT '所属下泄曲线版本 ID',
+    hour_start_nanos BIGINT NOT NULL COMMENT '小时起点（含），UTC 纳秒时间戳，整点对齐，区间左闭右开',
+    limit_amount DECIMAL(19,2) NOT NULL COMMENT '该小时下泄上限，单位立方米，非负，最多 2 位小数',
+    PRIMARY KEY (curve_id, hour_start_nanos),
+    CONSTRAINT fk_curve_point_curve FOREIGN KEY (curve_id) REFERENCES release_curve (id),
+    CONSTRAINT chk_curve_point_nonneg CHECK (limit_amount >= 0)
+) COMMENT='下泄曲线逐小时上限点，必须恰好覆盖窗口全部小时';
+
+CREATE TABLE IF NOT EXISTS allocation_hour (
+    allocation_id BIGINT NOT NULL COMMENT '所属配水申请 ID',
+    hour_start_nanos BIGINT NOT NULL COMMENT '小时起点（含），UTC 纳秒时间戳，整点对齐',
+    amount DECIMAL(19,3) NOT NULL COMMENT '当前逐小时预留量，单位立方米；转出等额扣减，取消时压降为已核销量',
+    redeemed DECIMAL(19,3) NOT NULL DEFAULT 0 COMMENT '该小时已核销量，单位立方米，只增不减',
+    PRIMARY KEY (allocation_id, hour_start_nanos),
+    CONSTRAINT fk_allocation_hour_allocation FOREIGN KEY (allocation_id) REFERENCES allocation (id),
+    CONSTRAINT chk_allocation_hour CHECK (amount >= 0 AND redeemed >= 0 AND redeemed <= amount)
+) COMMENT='申请逐小时预留分布，提交时声明，批准/转让/取消/核销在窗口行锁内变更';
+
+CREATE TABLE IF NOT EXISTS approval_snapshot (
+    allocation_id BIGINT PRIMARY KEY COMMENT '所属配水申请 ID，一次批准固化一份',
+    curve_version INT NULL COMMENT '批准时使用的下泄曲线版本号；批准时窗口无曲线为 NULL',
+    created_nanos BIGINT NOT NULL COMMENT '快照固化时间，UTC 纳秒时间戳',
+    CONSTRAINT fk_snapshot_allocation FOREIGN KEY (allocation_id) REFERENCES allocation (id)
+) COMMENT='批准快照，固化曲线版本，后续曲线调整、取消、核销不得改写';
+
+CREATE TABLE IF NOT EXISTS approval_snapshot_hour (
+    allocation_id BIGINT NOT NULL COMMENT '所属配水申请 ID',
+    hour_start_nanos BIGINT NOT NULL COMMENT '小时起点（含），UTC 纳秒时间戳，整点对齐',
+    amount DECIMAL(19,3) NOT NULL COMMENT '批准时固化的该小时预留量，单位立方米，不可改写',
+    PRIMARY KEY (allocation_id, hour_start_nanos),
+    CONSTRAINT fk_snapshot_hour_allocation FOREIGN KEY (allocation_id) REFERENCES allocation (id)
+) COMMENT='批准快照逐小时预留分布，创建后不可变';
+
+CREATE TABLE IF NOT EXISTS redemption (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '核销流水主键',
+    allocation_id BIGINT NOT NULL COMMENT '所属配水申请 ID',
+    hour_start_nanos BIGINT NOT NULL COMMENT '核销发生小时起点（含），UTC 纳秒时间戳，整点对齐',
+    amount DECIMAL(19,3) NOT NULL COMMENT '本次核销量，单位立方米，只扣减同一小时额度',
+    actor VARCHAR(128) NOT NULL COMMENT '操作人（X-Actor-Id）',
+    created_nanos BIGINT NOT NULL COMMENT '创建时间，UTC 纳秒时间戳',
+    CONSTRAINT fk_redemption_allocation FOREIGN KEY (allocation_id) REFERENCES allocation (id)
+) COMMENT='实际核销流水，创建后不可变，不提供撤销';

@@ -1,7 +1,13 @@
 package com.example.starter.water;
 
+import com.example.starter.water.WaterRepository.AllocationHourRow;
 import com.example.starter.water.WaterRepository.AllocationRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
+import com.example.starter.water.WaterRepository.CurvePointRow;
+import com.example.starter.water.WaterRepository.CurveRow;
+import com.example.starter.water.WaterRepository.HourLoadRow;
+import com.example.starter.water.WaterRepository.RedemptionRow;
+import com.example.starter.water.WaterRepository.SnapshotRow;
 import com.example.starter.water.WaterRepository.TransferRow;
 import com.example.starter.water.WaterRepository.WindowRow;
 import org.junit.jupiter.api.Test;
@@ -12,6 +18,7 @@ import org.springframework.jdbc.datasource.init.ScriptUtils;
 
 import java.math.BigDecimal;
 import java.sql.Connection;
+import java.util.List;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -115,5 +122,65 @@ class PersistenceTests {
         assertEquals(new BigDecimal("3.000"), cancelled.amount());
         assertEquals(0, cancelled.heldAmount().compareTo(BigDecimal.ZERO));
         assertEquals(0, repo.sumApprovedAmount(windowId).compareTo(BigDecimal.ZERO));
+    }
+
+    @Test
+    void curveHoursAndRedemptionsAreReadableFromNewConnection() throws Exception {
+        String url = String.format(URL_TEMPLATE, UUID.randomUUID().toString().substring(0, 8));
+        SimpleDriverDataSource first = new SimpleDriverDataSource(new org.h2.Driver(), url, "sa", "");
+        try (Connection connection = first.getConnection()) {
+            ScriptUtils.executeSqlScript(connection, new ClassPathResource("schema.sql"));
+        }
+        WaterRepository repo1 = new WaterRepository(new JdbcTemplate(first));
+        long windowId = repo1.insertWindow("wk-curve", "ch-curve", 0L, 7_200_000_000_000L,
+                new BigDecimal("10.000"), 1L);
+        // 曲线版本 1：两个小时上限
+        long curveId = repo1.insertCurve(windowId, 1, 2L);
+        repo1.insertCurvePoint(curveId, 0L, new BigDecimal("5.50"));
+        repo1.insertCurvePoint(curveId, 3_600_000_000_000L, new BigDecimal("2.25"));
+        // 申请逐小时预留、批准快照与核销
+        repo1.insertAllocation("ak-hourly", windowId, "user-1", new BigDecimal("3.000"), "alice", 3L);
+        AllocationRow allocation = repo1.findAllocationByKey("ak-hourly");
+        repo1.insertAllocationHour(allocation.id(), 0L, new BigDecimal("2.000"));
+        repo1.insertAllocationHour(allocation.id(), 3_600_000_000_000L, new BigDecimal("1.000"));
+        repo1.updateAllocationStatus(allocation.id(), "APPROVED", 4L);
+        repo1.insertSnapshot(allocation.id(), 1, 4L);
+        repo1.insertSnapshotHour(allocation.id(), 0L, new BigDecimal("2.000"));
+        repo1.insertSnapshotHour(allocation.id(), 3_600_000_000_000L, new BigDecimal("1.000"));
+        repo1.addRedeemed(allocation.id(), 0L, new BigDecimal("0.500"));
+        repo1.insertRedemption(allocation.id(), 0L, new BigDecimal("0.500"), "alice", 5L);
+
+        // 第二次读取：全新连接与仓储实例，同一 JVM 内数据仍在
+        WaterRepository repo2 = new WaterRepository(
+                new JdbcTemplate(new SimpleDriverDataSource(new org.h2.Driver(), url, "sa", "")));
+        CurveRow curve = repo2.findLatestCurve(windowId);
+        assertNotNull(curve);
+        assertEquals(1, curve.version());
+        List<CurvePointRow> points = repo2.listCurvePoints(curve.id());
+        assertEquals(2, points.size());
+        assertEquals(new BigDecimal("5.50"), points.get(0).limitAmount());
+        assertEquals(new BigDecimal("2.25"), points.get(1).limitAmount());
+
+        List<AllocationHourRow> hours = repo2.listAllocationHours(allocation.id());
+        assertEquals(2, hours.size());
+        assertEquals(new BigDecimal("2.000"), hours.get(0).amount());
+        assertEquals(new BigDecimal("0.500"), hours.get(0).redeemed());
+
+        SnapshotRow snapshot = repo2.findSnapshot(allocation.id());
+        assertNotNull(snapshot);
+        assertEquals(1, snapshot.curveVersion());
+        assertEquals(2, repo2.listSnapshotHours(allocation.id()).size());
+
+        List<RedemptionRow> redemptions = repo2.listRedemptions(allocation.id());
+        assertEquals(1, redemptions.size());
+        assertEquals(new BigDecimal("0.500"), redemptions.get(0).amount());
+        assertEquals("alice", redemptions.get(0).actor());
+
+        // 逐小时负载：已批准未核销 1.5 + 2 = 3.5，已核销 0.5
+        List<HourLoadRow> loads = repo2.sumHourLoad(windowId);
+        assertEquals(2, loads.size());
+        assertEquals(new BigDecimal("1.500"), loads.get(0).reserved());
+        assertEquals(new BigDecimal("0.500"), loads.get(0).redeemed());
+        assertEquals(new BigDecimal("1.000"), loads.get(1).reserved());
     }
 }

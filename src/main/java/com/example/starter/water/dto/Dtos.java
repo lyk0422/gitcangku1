@@ -1,5 +1,7 @@
 package com.example.starter.water.dto;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
+
 import java.util.List;
 
 /**
@@ -22,9 +24,13 @@ public final class Dtos {
                                  String createdUtc) {
     }
 
-    /** 提交配水申请命令；申请人由 X-Actor-Id 请求头提供。 */
+    /** 提交配水申请命令；申请人由 X-Actor-Id 请求头提供。hourlyAmounts 为可选逐小时预留分布。 */
     public record SubmitAllocationRequest(String commandKey, String allocationKey, Long windowId,
-                                          String userId, String amount) {
+                                          String userId, String amount, List<HourAmountRequest> hourlyAmounts) {
+    }
+
+    /** 逐小时水量项：hourStartUtc 必须整点对齐（区间左闭右开），amount 为十进制字符串。 */
+    public record HourAmountRequest(String hourStartUtc, String amount) {
     }
 
     /**
@@ -74,7 +80,79 @@ public final class Dtos {
                                   List<CurtailmentResponse> curtailments) {
     }
 
-    /** 统一错误响应体。 */
-    public record ErrorResponse(String code, String message) {
+    /** 下泄曲线点命令项：hourStartUtc 整点对齐，limit 非负且最多 2 位小数。 */
+    public record CurvePointRequest(String hourStartUtc, String limit) {
+    }
+
+    /** 全量替换下泄曲线命令：points 必须恰好覆盖窗口全部小时，不得重复、缺失或跨窗口。 */
+    public record PutCurveRequest(String commandKey, List<CurvePointRequest> points) {
+    }
+
+    /** 下泄曲线点视图。 */
+    public record CurvePointResponse(String hourStartUtc, String limit) {
+    }
+
+    /** 下泄曲线版本视图。 */
+    public record CurveResponse(long windowId, int version, List<CurvePointResponse> points, String createdUtc) {
+    }
+
+    /** 下泄曲线全部历史版本视图，按版本号升序。 */
+    public record CurveVersionsResponse(long windowId, List<CurveResponse> versions) {
+    }
+
+    /** 窗口逐小时诊断视图；limit/remaining 在窗口未配置曲线时为 null。 */
+    public record HourDiagnostics(String hourStartUtc, String limit, String reserved, String redeemed,
+                                  String remaining) {
+    }
+
+    /** 窗口逐小时诊断列表视图，覆盖窗口全部小时，按小时升序。 */
+    public record WindowHoursResponse(long windowId, List<HourDiagnostics> hours) {
+    }
+
+    /** 核销命令：按发生小时扣减同一小时额度；操作人由 X-Actor-Id 请求头提供。 */
+    public record RedeemRequest(String commandKey, String hourStartUtc, String amount) {
+    }
+
+    /** 核销流水视图，创建后不可变。 */
+    public record RedemptionResponse(long id, String allocationKey, String hourStartUtc, String amount,
+                                     String actor, String createdUtc) {
+    }
+
+    /** 申请逐小时状态视图：reserved 为当前预留，redeemed 为已核销，remaining 为二者差额。 */
+    public record AllocationHourView(String hourStartUtc, String reserved, String redeemed, String remaining) {
+    }
+
+    /** 批准快照逐小时预留项。 */
+    public record SnapshotHourView(String hourStartUtc, String amount) {
+    }
+
+    /** 批准快照视图：curveVersion 为批准时固化的曲线版本，无曲线时为 null；未批准时整个快照为 null。 */
+    public record ApprovalSnapshotView(Integer curveVersion, List<SnapshotHourView> hours, String createdUtc) {
+    }
+
+    /** 申请明细视图：申请本体 + 逐小时状态 + 批准快照 + 核销流水。 */
+    public record AllocationDetailResponse(AllocationResponse allocation, List<AllocationHourView> hours,
+                                           ApprovalSnapshotView approvalSnapshot,
+                                           List<RedemptionResponse> redemptions) {
+    }
+
+    /** 批量批准命令：任一失败整次回滚。 */
+    public record BatchApproveRequest(String commandKey, List<String> allocationKeys) {
+    }
+
+    /** 批量批准结果视图，按请求顺序返回。 */
+    public record BatchApproveResponse(List<AllocationResponse> allocations) {
+    }
+
+    /** 小时超限明细：limit 为小时上限，required 为累计要求值，deficit 为差额（required - limit）。 */
+    public record HourViolation(String hourStartUtc, String limit, String required, String deficit) {
+    }
+
+    /** 统一错误响应体；violations 仅在逐小时校验失败（422）时出现，其余为 null 不序列化。 */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public record ErrorResponse(String code, String message, List<HourViolation> violations) {
+        public ErrorResponse(String code, String message) {
+            this(code, message, null);
+        }
     }
 }
