@@ -58,6 +58,16 @@ public class ReleaseController {
         return releaseService.history(releaseId);
     }
 
+    /**
+     * 完整性事件流水（只读）：UTC 时间区间左闭右开，参数 fromUtc/toUtc 均可省略。
+     */
+    @GetMapping("/{releaseId}/integrity-events")
+    public IntegrityEventsResponse integrityEvents(@PathVariable long releaseId,
+                                                   @RequestParam(required = false) String fromUtc,
+                                                   @RequestParam(required = false) String toUtc) {
+        return releaseService.integrityEvents(releaseId, fromUtc, toUtc);
+    }
+
     @GetMapping("/{releaseId}/tasks")
     public TaskListResponse tasks(@PathVariable long releaseId, @RequestParam(required = false) String status) {
         TaskStatus filter = parseStatus(status);

@@ -9,14 +9,17 @@ package com.example.starter.firmware.domain;
  * @param fromVersion             来源固件版本
  * @param toVersion               目标固件版本，必须与来源版本不同
  * @param ratio                   投放比例，取值0~100，只增不减
- * @param status                  状态：ACTIVE 投放中，PAUSED 失败率自动暂停，CANCELLED 已取消（终态）
+ * @param status                  状态：ACTIVE 投放中，PAUSED 失败率自动暂停，CANCELLED 已撤回（终态）
  * @param sampleFloor             失败率统计样本下限，取值2~100
  * @param failureThresholdPercent 失败率阈值百分比，取值1~100
  * @param monitorRound            当前监控轮次，从1开始，人工恢复后加一
- * @param roundSuccess            当前监控轮次内首次进入 SUCCESS 的任务数
- * @param roundFailed             当前监控轮次内首次进入 FAILED 的任务数
+ * @param roundSuccess            当前监控轮次内首次安装回执 SUCCESS 的任务数；完整性失败不计入
+ * @param roundFailed             当前监控轮次内首次安装回执 FAILED 的任务数；完整性失败不计入
+ * @param packageDigest           完整包摘要，64位小写十六进制 SHA-256
+ * @param fragmentCount           登记分片数量，序号为 0~fragmentCount-1 连续
  */
 public record ReleaseOrder(long id, int version, String model, String fromVersion, String toVersion,
                            int ratio, ReleaseStatus status, int sampleFloor, int failureThresholdPercent,
-                           int monitorRound, int roundSuccess, int roundFailed) {
+                           int monitorRound, int roundSuccess, int roundFailed,
+                           String packageDigest, int fragmentCount) {
 }

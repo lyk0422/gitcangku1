@@ -1,6 +1,5 @@
 package com.example.starter.firmware;
 
-import com.example.starter.firmware.api.CreateReleaseRequest;
 import com.example.starter.firmware.api.PullResponse;
 import com.example.starter.firmware.api.ReceiptRequest;
 import com.example.starter.firmware.api.RegisterDeviceRequest;
@@ -66,12 +65,7 @@ class FirmwareConcurrencyTest {
 
     @BeforeEach
     void setUp() {
-        jdbc.update("DELETE FROM rollout_task");
-        jdbc.update("DELETE FROM release_pause_record");
-        jdbc.update("DELETE FROM release_resume_record");
-        jdbc.update("DELETE FROM release_order");
-        jdbc.update("DELETE FROM device");
-        jdbc.update("DELETE FROM idempotency_record");
+        FirmwareFixtures.cleanAll(jdbc);
         executor = Executors.newFixedThreadPool(8);
     }
 
@@ -108,11 +102,18 @@ class FirmwareConcurrencyTest {
         return results;
     }
 
+    /**
+     * 收齐全部分片使任务进入 INSTALLABLE（安装回执前置条件）。
+     */
+    private void receiveAll(long taskId, String requestId) {
+        taskService.receiveFragments(taskId, FirmwareFixtures.allFragmentsRequest(requestId));
+    }
+
     @Test
     void 并发拉取_同设备同发布单最多一条任务() throws Exception {
         deviceService.register(new RegisterDeviceRequest("req-d", "d1", "m1", "1.0.0", 5));
-        long releaseId = releaseService.create(new CreateReleaseRequest("req-r", "m1", "1.0.0", "2.0.0", 100))
-                .releaseId();
+        long releaseId = releaseService.create(FirmwareFixtures.createRequest(
+                "req-r", "m1", "1.0.0", "2.0.0", 100)).releaseId();
 
         int threads = 8;
         List<Callable<PullResponse>> tasks = new ArrayList<>();
@@ -139,7 +140,7 @@ class FirmwareConcurrencyTest {
         for (int i = 0; i < 2; i++) {
             int seq = i;
             tasks.add(() -> releaseService.create(
-                    new CreateReleaseRequest("req-c" + seq, "m1", "1.0.0", "2.0.0", 10)).releaseId());
+                    FirmwareFixtures.createRequest("req-c" + seq, "m1", "1.0.0", "2.0.0", 10)).releaseId());
         }
         List<Object> results = runConcurrently(tasks);
 
@@ -161,7 +162,8 @@ class FirmwareConcurrencyTest {
             String model = "m" + round;
             deviceService.register(new RegisterDeviceRequest("req-d" + round, deviceId, model, "1.0.0", 5));
             long releaseId = releaseService.create(
-                    new CreateReleaseRequest("req-r" + round, model, "1.0.0", "2.0.0", 100)).releaseId();
+                    FirmwareFixtures.createRequest("req-r" + round, model, "1.0.0", "2.0.0", 100))
+                    .releaseId();
             final int seq = round;
 
             List<Object> results = runConcurrently(List.of(
@@ -186,8 +188,10 @@ class FirmwareConcurrencyTest {
             String model = "m" + round;
             deviceService.register(new RegisterDeviceRequest("req-d" + round, deviceId, model, "1.0.0", 5));
             long releaseId = releaseService.create(
-                    new CreateReleaseRequest("req-r" + round, model, "1.0.0", "2.0.0", 100)).releaseId();
+                    FirmwareFixtures.createRequest("req-r" + round, model, "1.0.0", "2.0.0", 100))
+                    .releaseId();
             long taskId = taskService.pull(deviceId, "req-p" + round).task().taskId();
+            receiveAll(taskId, "req-frag" + round);
             final int seq = round;
 
             List<Object> results = runConcurrently(List.of(
@@ -218,8 +222,8 @@ class FirmwareConcurrencyTest {
     @Test
     void 并发同requestId_重放一致且副作用只发生一次() throws Exception {
         deviceService.register(new RegisterDeviceRequest("req-d", "d1", "m1", "1.0.0", 5));
-        long releaseId = releaseService.create(new CreateReleaseRequest("req-r", "m1", "1.0.0", "2.0.0", 10))
-                .releaseId();
+        long releaseId = releaseService.create(FirmwareFixtures.createRequest(
+                "req-r", "m1", "1.0.0", "2.0.0", 10)).releaseId();
 
         int threads = 6;
         List<Callable<Object>> tasks = new ArrayList<>();
@@ -244,10 +248,12 @@ class FirmwareConcurrencyTest {
             deviceService.register(new RegisterDeviceRequest("req-d" + i, "d" + i, "m1", "1.0.0", i));
         }
         long releaseId = releaseService.create(
-                new CreateReleaseRequest("req-r", "m1", "1.0.0", "2.0.0", 100, 2, 50)).releaseId();
+                FirmwareFixtures.createRequest("req-r", "m1", "1.0.0", "2.0.0", 100, 2, 50)).releaseId();
         List<Long> taskIds = new ArrayList<>();
         for (int i = 0; i < devices; i++) {
-            taskIds.add(taskService.pull("d" + i, "req-p" + i).task().taskId());
+            long pulled = taskService.pull("d" + i, "req-p" + i).task().taskId();
+            receiveAll(pulled, "req-frag" + i);
+            taskIds.add(pulled);
         }
 
         List<Callable<Object>> tasks = new ArrayList<>();
@@ -276,9 +282,12 @@ class FirmwareConcurrencyTest {
             deviceService.register(new RegisterDeviceRequest("req-d" + round, "d" + round, model, "1.0.0", 1));
             deviceService.register(new RegisterDeviceRequest("req-e" + round, "e" + round, model, "1.0.0", 2));
             long releaseId = releaseService.create(
-                    new CreateReleaseRequest("req-r" + round, model, "1.0.0", "2.0.0", 100, 2, 50)).releaseId();
+                    FirmwareFixtures.createRequest("req-r" + round, model, "1.0.0", "2.0.0", 100, 2, 50))
+                    .releaseId();
             long t1 = taskService.pull("d" + round, "req-p1-" + round).task().taskId();
             long t2 = taskService.pull("e" + round, "req-p2-" + round).task().taskId();
+            receiveAll(t1, "req-f1frag-" + round);
+            receiveAll(t2, "req-f2frag-" + round);
             taskService.receipt(t1, new ReceiptRequest("req-f1-" + round, ReceiptResult.FAILED));
             taskService.receipt(t2, new ReceiptRequest("req-f2-" + round, ReceiptResult.FAILED));
             assertThat(releaseService.findOrder(releaseId).status()).isEqualTo(ReleaseStatus.PAUSED);
@@ -318,9 +327,11 @@ class FirmwareConcurrencyTest {
         deviceService.register(new RegisterDeviceRequest("req-d1", "d1", "m1", "1.0.0", 1));
         deviceService.register(new RegisterDeviceRequest("req-d2", "d2", "m1", "1.0.0", 2));
         long releaseId = releaseService.create(
-                new CreateReleaseRequest("req-r", "m1", "1.0.0", "2.0.0", 100, 2, 50)).releaseId();
+                FirmwareFixtures.createRequest("req-r", "m1", "1.0.0", "2.0.0", 100, 2, 50)).releaseId();
         long t1 = taskService.pull("d1", "req-p1").task().taskId();
         long t2 = taskService.pull("d2", "req-p2").task().taskId();
+        receiveAll(t1, "req-f1frag");
+        receiveAll(t2, "req-f2frag");
         taskService.receipt(t1, new ReceiptRequest("req-f1", ReceiptResult.FAILED));
         taskService.receipt(t2, new ReceiptRequest("req-f2", ReceiptResult.FAILED));
         assertThat(releaseService.findOrder(releaseId).status()).isEqualTo(ReleaseStatus.PAUSED);

@@ -13,8 +13,9 @@ import java.sql.PreparedStatement;
 import java.util.Optional;
 
 /**
- * 发布单数据访问。扩量、取消、恢复、拉取、回执共用行锁（SELECT ... FOR UPDATE）形成一致提交顺序。
+ * 发布单数据访问。扩量、撤回、恢复、拉取、分片接收、回执共用行锁（SELECT ... FOR UPDATE）形成一致提交顺序。
  * 当前轮次统计（round_success/round_failed）只在持有发布单行锁的事务内增减。
+ * 分片摘要（package_digest/fragment_count）一经插入不提供任何更新途径。
  */
 @Repository
 public class ReleaseRepository {
@@ -24,10 +25,12 @@ public class ReleaseRepository {
             rs.getString("from_version"), rs.getString("to_version"),
             rs.getInt("ratio"), ReleaseStatus.valueOf(rs.getString("status")),
             rs.getInt("sample_floor"), rs.getInt("failure_threshold_percent"),
-            rs.getInt("monitor_round"), rs.getInt("round_success"), rs.getInt("round_failed"));
+            rs.getInt("monitor_round"), rs.getInt("round_success"), rs.getInt("round_failed"),
+            rs.getString("package_digest"), rs.getInt("fragment_count"));
 
     private static final String COLUMNS = "id, version, model, from_version, to_version, ratio, status,"
-            + " sample_floor, failure_threshold_percent, monitor_round, round_success, round_failed";
+            + " sample_floor, failure_threshold_percent, monitor_round, round_success, round_failed,"
+            + " package_digest, fragment_count";
 
     private final JdbcTemplate jdbc;
 
@@ -36,13 +39,15 @@ public class ReleaseRepository {
     }
 
     public long insert(String model, String fromVersion, String toVersion, int ratio,
-                       int sampleFloor, int failureThresholdPercent) {
+                       int sampleFloor, int failureThresholdPercent,
+                       String packageDigest, int fragmentCount) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
                     "INSERT INTO release_order (version, model, from_version, to_version, ratio, status,"
-                            + " sample_floor, failure_threshold_percent, monitor_round, active_model)"
-                            + " VALUES (1, ?, ?, ?, ?, 'ACTIVE', ?, ?, 1, ?)",
+                            + " sample_floor, failure_threshold_percent, monitor_round,"
+                            + " package_digest, fragment_count, active_model)"
+                            + " VALUES (1, ?, ?, ?, ?, 'ACTIVE', ?, ?, 1, ?, ?, ?)",
                     new String[]{"id"});
             ps.setString(1, model);
             ps.setString(2, fromVersion);
@@ -50,7 +55,9 @@ public class ReleaseRepository {
             ps.setInt(4, ratio);
             ps.setInt(5, sampleFloor);
             ps.setInt(6, failureThresholdPercent);
-            ps.setString(7, model);
+            ps.setString(7, packageDigest);
+            ps.setInt(8, fragmentCount);
+            ps.setString(9, model);
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();

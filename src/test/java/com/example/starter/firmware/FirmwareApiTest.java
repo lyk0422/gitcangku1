@@ -35,12 +35,7 @@ class FirmwareApiTest {
 
     @BeforeEach
     void cleanUp() {
-        jdbc.update("DELETE FROM rollout_task");
-        jdbc.update("DELETE FROM release_pause_record");
-        jdbc.update("DELETE FROM release_resume_record");
-        jdbc.update("DELETE FROM release_order");
-        jdbc.update("DELETE FROM device");
-        jdbc.update("DELETE FROM idempotency_record");
+        FirmwareFixtures.cleanAll(jdbc);
     }
 
     private String registerDevice(String requestId, String deviceId, String model, String version, int bucket)
@@ -58,9 +53,7 @@ class FirmwareApiTest {
             throws Exception {
         MvcResult result = mockMvc.perform(post("/api/releases")
                         .contentType("application/json")
-                        .content("""
-                                {"requestId":"%s","model":"%s","fromVersion":"%s","toVersion":"%s","ratio":%d}
-                                """.formatted(requestId, model, from, to, ratio)))
+                        .content(FirmwareFixtures.createBody(requestId, model, from, to, ratio)))
                 .andReturn();
         return result.getResponse().getContentAsString();
     }
@@ -79,9 +72,8 @@ class FirmwareApiTest {
                 .andExpect(jsonPath("$.deviceId").value("d1"))
                 .andExpect(jsonPath("$.bucketNo").value(5));
 
-        MvcResult release = mockMvc.perform(post("/api/releases").contentType("application/json").content("""
-                        {"requestId":"r2","model":"m1","fromVersion":"1.0.0","toVersion":"2.0.0","ratio":10}
-                        """))
+        MvcResult release = mockMvc.perform(post("/api/releases").contentType("application/json")
+                        .content(FirmwareFixtures.createBody("r2", "m1", "1.0.0", "2.0.0", 10)))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.version").value(1))
                 .andExpect(jsonPath("$.status").value("ACTIVE"))
@@ -92,10 +84,41 @@ class FirmwareApiTest {
                         .content("{\"requestId\":\"r3\"}"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.task.status").value("PENDING"))
+                .andExpect(jsonPath("$.task.attempt").value(1))
                 .andExpect(jsonPath("$.task.fromVersion").value("1.0.0"))
                 .andExpect(jsonPath("$.task.toVersion").value("2.0.0"))
+                .andExpect(jsonPath("$.manifest.attempt").value(1))
+                .andExpect(jsonPath("$.manifest.fragments.length()").value(2))
+                .andExpect(jsonPath("$.manifest.fragments[0].seqNo").value(0))
+                .andExpect(jsonPath("$.manifest.fragments[1].seqNo").value(1))
+                .andExpect(jsonPath("$.manifest.packageDigest").isString())
                 .andReturn();
         long taskId = idOf(pull, "$.task.taskId");
+
+        // 逐分片提交：先缺一片仍为 PENDING，收齐且聚合匹配后才进入 INSTALLABLE
+        mockMvc.perform(post("/api/tasks/" + taskId + "/fragments").contentType("application/json")
+                        .content("""
+                                {"requestId":"r-f0","fragments":[{"seqNo":0,"digest":"%s"}]}
+                                """.formatted(FirmwareFixtures.DIGEST_0)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.task.status").value("PENDING"))
+                .andExpect(jsonPath("$.requiredCount").value(2))
+                .andExpect(jsonPath("$.receivedCount").value(1))
+                .andExpect(jsonPath("$.missingCount").value(1))
+                .andExpect(jsonPath("$.missingSeqs[0]").value(1))
+                .andExpect(jsonPath("$.aggregateActual").doesNotExist());
+
+        mockMvc.perform(post("/api/tasks/" + taskId + "/fragments").contentType("application/json")
+                        .content("""
+                                {"requestId":"r-f1","fragments":[{"seqNo":1,"digest":"%s"}]}
+                                """.formatted(FirmwareFixtures.DIGEST_1)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.task.status").value("INSTALLABLE"))
+                .andExpect(jsonPath("$.receivedCount").value(2))
+                .andExpect(jsonPath("$.missingCount").value(0))
+                .andExpect(jsonPath("$.aggregateActual").value(FirmwareFixtures.PACKAGE_DIGEST))
+                .andExpect(jsonPath("$.aggregateExpected").value(FirmwareFixtures.PACKAGE_DIGEST))
+                .andExpect(jsonPath("$.task.installableAtUtc").isString());
 
         mockMvc.perform(post("/api/tasks/" + taskId + "/receipt").contentType("application/json")
                         .content("{\"requestId\":\"r4\",\"result\":\"SUCCESS\"}"))
@@ -150,9 +173,8 @@ class FirmwareApiTest {
 
         // 失败不占键：先以错误参数触发 409，再用同 requestId 正确参数成功
         createRelease("rid-x", "m1", "1.0.0", "1.0.0", 10); // 400 在 Service 外，requestId 未入库
-        MvcResult created = mockMvc.perform(post("/api/releases").contentType("application/json").content("""
-                        {"requestId":"rid-y","model":"m1","fromVersion":"1.0.0","toVersion":"2.0.0","ratio":10}
-                        """))
+        MvcResult created = mockMvc.perform(post("/api/releases").contentType("application/json")
+                        .content(FirmwareFixtures.createBody("rid-y", "m1", "1.0.0", "2.0.0", 10)))
                 .andExpect(status().isOk())
                 .andReturn();
         long releaseId = releaseIdOf(created.getResponse().getContentAsString());
@@ -171,16 +193,14 @@ class FirmwareApiTest {
 
     @Test
     void 发布单_目标来源相同400_同型号第二张ACTIVE409() throws Exception {
-        mockMvc.perform(post("/api/releases").contentType("application/json").content("""
-                        {"requestId":"r1","model":"m1","fromVersion":"1.0.0","toVersion":"1.0.0","ratio":10}
-                        """))
+        mockMvc.perform(post("/api/releases").contentType("application/json")
+                        .content(FirmwareFixtures.createBody("r1", "m1", "1.0.0", "1.0.0", 10)))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.code").value("SAME_VERSION"));
 
         createRelease("r2", "m1", "1.0.0", "2.0.0", 10);
-        mockMvc.perform(post("/api/releases").contentType("application/json").content("""
-                        {"requestId":"r3","model":"m1","fromVersion":"1.0.0","toVersion":"3.0.0","ratio":20}
-                        """))
+        mockMvc.perform(post("/api/releases").contentType("application/json")
+                        .content(FirmwareFixtures.createBody("r3", "m1", "1.0.0", "3.0.0", 20)))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("ACTIVE_RELEASE_EXISTS"));
     }
@@ -277,13 +297,21 @@ class FirmwareApiTest {
     }
 
     @Test
-    void 回执_失败终结且本轮不再投放_同结果重复成功_改结果409() throws Exception {
+    void 回执_未收齐分片禁止回执_失败终结且本轮不再投放_同结果重复成功_改结果409() throws Exception {
         registerDevice("r1", "d1", "m1", "1.0.0", 1);
         createRelease("r2", "m1", "1.0.0", "2.0.0", 100);
         MvcResult pull = mockMvc.perform(post("/api/devices/d1/pull").contentType("application/json")
                         .content("{\"requestId\":\"r3\"}"))
                 .andReturn();
         long taskId = idOf(pull, "$.task.taskId");
+
+        // PENDING 未收齐：安装回执被拒（完整性未通过，禁止安装）
+        mockMvc.perform(post("/api/tasks/" + taskId + "/receipt").contentType("application/json")
+                        .content("{\"requestId\":\"r-pre\",\"result\":\"SUCCESS\"}"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("NOT_INSTALLABLE"));
+
+        FirmwareFixtures.submitAllFragments(mockMvc, taskId, "r-frag");
 
         mockMvc.perform(post("/api/tasks/" + taskId + "/receipt").contentType("application/json")
                         .content("{\"requestId\":\"r4\",\"result\":\"FAILED\"}"))

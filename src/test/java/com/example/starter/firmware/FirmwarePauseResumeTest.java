@@ -30,12 +30,7 @@ class FirmwarePauseResumeTest {
 
     @BeforeEach
     void cleanUp() {
-        jdbc.update("DELETE FROM rollout_task");
-        jdbc.update("DELETE FROM release_pause_record");
-        jdbc.update("DELETE FROM release_resume_record");
-        jdbc.update("DELETE FROM release_order");
-        jdbc.update("DELETE FROM device");
-        jdbc.update("DELETE FROM idempotency_record");
+        FirmwareFixtures.cleanAll(jdbc);
     }
 
     private static long idOf(MvcResult result, String path) throws Exception {
@@ -52,22 +47,25 @@ class FirmwarePauseResumeTest {
 
     private long createRelease(String requestId, String model, int ratio, int sampleFloor, int threshold)
             throws Exception {
-        MvcResult result = mockMvc.perform(post("/api/releases").contentType("application/json").content("""
-                {"requestId":"%s","model":"%s","fromVersion":"1.0.0","toVersion":"2.0.0","ratio":%d,
-                "sampleFloor":%d,"failureThresholdPercent":%d}
-                """.formatted(requestId, model, ratio, sampleFloor, threshold)))
+        MvcResult result = mockMvc.perform(post("/api/releases").contentType("application/json")
+                        .content(FirmwareFixtures.createBody(requestId, model, ratio, sampleFloor, threshold)))
                 .andExpect(status().isOk())
                 .andReturn();
         return idOf(result, "$.releaseId");
     }
 
+    /**
+     * 拉取任务并收齐两片正确摘要，任务进入 INSTALLABLE，返回任务ID。
+     */
     private long pullTask(String requestId, String deviceId) throws Exception {
         MvcResult result = mockMvc.perform(post("/api/devices/" + deviceId + "/pull")
                         .contentType("application/json").content("{\"requestId\":\"%s\"}".formatted(requestId)))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.task.status").value("PENDING"))
                 .andReturn();
-        return idOf(result, "$.task.taskId");
+        long taskId = idOf(result, "$.task.taskId");
+        FirmwareFixtures.submitAllFragments(mockMvc, taskId, requestId + "-frag");
+        return taskId;
     }
 
     private void receipt(long taskId, String requestId, String result) throws Exception {
@@ -203,12 +201,12 @@ class FirmwarePauseResumeTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.task").doesNotExist());
 
-        // 已有任务持有设备重复拉取仍返回原任务
+        // 已有任务持有设备重复拉取仍返回原任务（收齐分片后为 INSTALLABLE，PAUSED 不改变其状态）
         mockMvc.perform(post("/api/devices/d3/pull").contentType("application/json")
                         .content("{\"requestId\":\"r-pull3b\"}"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.task.taskId").value(t3))
-                .andExpect(jsonPath("$.task.status").value("PENDING"));
+                .andExpect(jsonPath("$.task.status").value("INSTALLABLE"));
 
         // 已有任务仍可提交回执，且计入当前轮次统计
         receipt(t3, "r-rc3", "SUCCESS");
@@ -410,15 +408,15 @@ class FirmwarePauseResumeTest {
                 {"requestId":"r-b4","model":"m1","fromVersion":"1.0.0","toVersion":"2.0.0","ratio":10,"failureThresholdPercent":101}
                 """)).andExpect(status().isBadRequest());
 
-        // 旧客户端不传监控参数：默认值 floor=2 / threshold=100
-        mockMvc.perform(post("/api/releases").contentType("application/json").content("""
-                {"requestId":"r-ok","model":"m1","fromVersion":"1.0.0","toVersion":"2.0.0","ratio":10}
-                """))
+        // 旧客户端不传监控参数：默认值 floor=2 / threshold=100（分片摘要必带）
+        mockMvc.perform(post("/api/releases").contentType("application/json")
+                        .content(FirmwareFixtures.createBodyWithoutMonitorParams("r-ok", "m1", 10)))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.sampleFloor").value(2))
                 .andExpect(jsonPath("$.failureThresholdPercent").value(100))
                 .andExpect(jsonPath("$.monitorRound").value(1))
-                .andExpect(jsonPath("$.status").value("ACTIVE"));
+                .andExpect(jsonPath("$.status").value("ACTIVE"))
+                .andExpect(jsonPath("$.fragmentCount").value(2));
         long releaseId = jdbc.queryForObject("SELECT id FROM release_order", Long.class);
 
         // 只读查询不触发状态变化：连续查询后版本/状态/统计不变
