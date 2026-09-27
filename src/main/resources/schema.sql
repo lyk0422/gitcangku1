@@ -1,6 +1,6 @@
 -- 赛事成绩封榜领域表结构。
 -- 本地默认以 H2 内存库运行：jdbc:h2:mem:race_demo;MODE=MySQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1
--- 标识符统一小写；时间字段均为 Unix 毫秒时间戳（BIGINT），不涉及时区换算。
+-- 标识符统一小写；时间字段均为 UTC 毫秒时间戳（BIGINT）：既有耗时/间隔为相对毫秒，医疗暂停与终点事件为绝对UTC时刻。
 
 CREATE TABLE IF NOT EXISTS race (
     race_id VARCHAR(64) NOT NULL COMMENT '赛事ID，全局唯一',
@@ -48,13 +48,15 @@ CREATE TABLE IF NOT EXISTS result_snapshot_entry (
     race_id VARCHAR(64) NOT NULL COMMENT '所属快照的赛事ID',
     bib VARCHAR(64) NOT NULL COMMENT '参赛号',
     rank_no INT COMMENT '名次（从1开始，并列同名次并跳号，如1、1、3）；未计时/漏点/取消资格为NULL',
-    status VARCHAR(24) NOT NULL COMMENT '成绩状态：RANKED-参与排名，UNTIMED-计时缺失，MISSING_CHECKPOINT-有完赛但未覆盖全部检查点，DISQUALIFIED-取消资格',
+    status VARCHAR(24) NOT NULL COMMENT '成绩状态：RANKED-参与排名，UNTIMED-计时缺失，MISSING_CHECKPOINT-有完赛但未覆盖全部检查点，DISQUALIFIED-取消资格，WITHDRAWN-已退赛，MEDICAL_HOLD-医疗暂停生效中',
     finish_time_ms BIGINT COMMENT '原始完赛耗时（毫秒）；计时缺失为NULL',
     penalty_ms BIGINT NOT NULL COMMENT '生效（未撤销）加时处罚合计毫秒数，无加时为0',
     total_time_ms BIGINT COMMENT '总耗时=原始完赛耗时+生效加时（毫秒）；未排名时为NULL',
     checkpoint_count INT NOT NULL DEFAULT 0 COMMENT '赛事检查点总数；未配置检查点为0',
     covered_checkpoint_count INT NOT NULL DEFAULT 0 COMMENT '封榜时该选手已覆盖检查点数量；缺失检查点由result_snapshot_checkpoint中elapsed_millis为NULL的行固化',
     display_order INT NOT NULL COMMENT '展示顺序，从0开始：先名次顺序，并列者按参赛号字典序，其余按参赛号字典序',
+    eligibility VARCHAR(16) NOT NULL DEFAULT 'ELIGIBLE' COMMENT '封榜时资格状态：ELIGIBLE-适赛可排名，WITHDRAWN-已退赛，MEDICAL_HOLD-医疗暂停生效中，不可追溯修改',
+    excluded_timing_count INT NOT NULL DEFAULT 0 COMMENT '被排除、不参与排名的计时条数（医疗暂停期间提交的分段数，实际值）',
     CONSTRAINT pk_snapshot_entry PRIMARY KEY (race_id, bib),
     CONSTRAINT fk_snapshot_entry_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
 );
@@ -76,7 +78,8 @@ CREATE TABLE IF NOT EXISTS checkpoint_timing (
     checkpoint_code VARCHAR(64) NOT NULL COMMENT '通过的检查点代码',
     position INT NOT NULL COMMENT '检查点顺序（配置时固化），用于严格递增校验',
     elapsed_millis BIGINT NOT NULL COMMENT '通过该检查点的累计耗时（毫秒，1~86400000），必须小于该选手原始完赛耗时',
-    created_at BIGINT NOT NULL COMMENT '记录提交时间，Unix毫秒时间戳',
+    exclusion_reason VARCHAR(16) COMMENT '计时排除原因：NULL-正常参与排名，MEDICAL_HOLD-医疗暂停生效期间提交，不参与排名',
+    created_at BIGINT NOT NULL COMMENT '记录提交时间，UTC毫秒时间戳',
     CONSTRAINT pk_checkpoint_timing PRIMARY KEY (timing_id),
     CONSTRAINT uk_timing_runner_checkpoint UNIQUE (race_id, bib, checkpoint_code),
     CONSTRAINT fk_timing_checkpoint FOREIGN KEY (race_id, checkpoint_code) REFERENCES checkpoint (race_id, checkpoint_code),
@@ -91,16 +94,60 @@ CREATE TABLE IF NOT EXISTS result_snapshot_checkpoint (
     position INT NOT NULL COMMENT '检查点顺序，从1递增',
     elapsed_millis BIGINT COMMENT '封榜时该选手通过该检查点的累计耗时（毫秒）；缺失检查点为NULL',
     timing_id VARCHAR(128) COMMENT '分段记录ID；缺失检查点为NULL',
+    exclusion_reason VARCHAR(16) COMMENT '计时排除原因：NULL-正常计时或缺失检查点，MEDICAL_HOLD-暂停生效期间被排除的计时',
     CONSTRAINT pk_snapshot_checkpoint PRIMARY KEY (race_id, bib, checkpoint_code),
     CONSTRAINT fk_snapshot_checkpoint_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
 );
 
 CREATE TABLE IF NOT EXISTS idempotency_record (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求ID（写操作幂等键）',
-    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE',
+    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/WITHDRAW_RUNNER/START_MEDICAL_HOLD/RESUME_MEDICAL_HOLD/SEAL_RACE',
     request_digest CHAR(64) NOT NULL COMMENT '请求参数（requestId除外，含expectedVersion）规范化JSON的SHA-256摘要',
     response_status INT NOT NULL COMMENT '原成功请求的HTTP状态码，重放时原样返回',
     response_body TEXT COMMENT '原成功响应体JSON，重放时原样返回',
-    created_at BIGINT NOT NULL COMMENT '首次成功提交时间，Unix毫秒时间戳',
+    created_at BIGINT NOT NULL COMMENT '首次成功提交时间，UTC毫秒时间戳',
     CONSTRAINT pk_idempotency_record PRIMARY KEY (request_id)
+);
+
+-- 选手退赛：不可变证据，一人一行。退赛后不可开始/恢复医疗暂停，亦不再参与排名。
+CREATE TABLE IF NOT EXISTS runner_withdrawal (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    bib VARCHAR(64) NOT NULL COMMENT '退赛选手参赛号',
+    reason VARCHAR(256) NOT NULL COMMENT '退赛原因，1~256字符',
+    official_role VARCHAR(64) NOT NULL COMMENT '登记退赛的裁判角色标识',
+    withdrawn_at BIGINT NOT NULL COMMENT '退赛提交时刻（绝对UTC时间，毫秒时间戳），作为排序与裁决依据',
+    created_at BIGINT NOT NULL COMMENT '记录写入时间，UTC毫秒时间戳',
+    CONSTRAINT pk_runner_withdrawal PRIMARY KEY (race_id, bib),
+    CONSTRAINT fk_withdrawal_runner FOREIGN KEY (race_id, bib) REFERENCES runner (race_id, bib)
+);
+
+-- 医疗暂停/恢复：不可变证据，每次开始一条，恢复时回填恢复字段；区间[start_at,end_at)左闭右开。
+CREATE TABLE IF NOT EXISTS medical_hold (
+    hold_id VARCHAR(128) NOT NULL COMMENT '医疗暂停ID，全局唯一',
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    bib VARCHAR(64) NOT NULL COMMENT '被暂停选手参赛号',
+    start_at BIGINT NOT NULL COMMENT '暂停开始的绝对UTC时刻（毫秒时间戳，区间左端点，含）',
+    end_at BIGINT COMMENT '暂停结束的绝对UTC时刻（毫秒时间戳，区间右端点，不含）；NULL表示生效中',
+    hold_reason VARCHAR(256) NOT NULL COMMENT '登记暂停原因，1~256字符',
+    start_role VARCHAR(64) NOT NULL COMMENT '登记暂停的医疗角色标识',
+    resume_role VARCHAR(64) COMMENT '确认恢复（适赛）的医疗角色标识，必须与start_role不同；未恢复为NULL',
+    fit_conclusion VARCHAR(256) COMMENT '恢复时的适赛结论，1~256字符；未恢复为NULL',
+    started_at BIGINT NOT NULL COMMENT '开始暂停的提交时刻（绝对UTC毫秒时间戳），用于同刻裁决排序',
+    resumed_at BIGINT COMMENT '恢复的提交时刻（绝对UTC毫秒时间戳）；未恢复为NULL',
+    CONSTRAINT pk_medical_hold PRIMARY KEY (hold_id),
+    CONSTRAINT fk_medical_hold_runner FOREIGN KEY (race_id, bib) REFERENCES runner (race_id, bib),
+    INDEX idx_medical_hold_race_bib (race_id, bib)
+);
+
+-- 终点（完赛）计时事件：不可变证据，用于暂停恢复时判定暂停期间是否已出现终点计时。
+CREATE TABLE IF NOT EXISTS finish_timing_record (
+    finish_timing_id VARCHAR(128) NOT NULL COMMENT '终点计时事件ID，全局唯一',
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    bib VARCHAR(64) NOT NULL COMMENT '选手参赛号',
+    occurred_at BIGINT NOT NULL COMMENT '终点计时事件发生的绝对UTC时刻（毫秒时间戳），用于判定是否落在暂停区间内',
+    finish_time_ms BIGINT NOT NULL COMMENT '该次终点计时的原始完赛耗时（毫秒）',
+    created_at BIGINT NOT NULL COMMENT '记录提交时刻（绝对UTC毫秒时间戳）',
+    CONSTRAINT pk_finish_timing_record PRIMARY KEY (finish_timing_id),
+    CONSTRAINT fk_finish_timing_runner FOREIGN KEY (race_id, bib) REFERENCES runner (race_id, bib),
+    INDEX idx_finish_timing_race_bib (race_id, bib)
 );

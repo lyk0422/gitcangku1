@@ -2,6 +2,7 @@ package com.example.starter.race.service;
 
 import com.example.starter.race.api.CheckpointPassResponse;
 import com.example.starter.race.api.CheckpointTimingResponse;
+import com.example.starter.race.api.ExcludedTimingResponse;
 import com.example.starter.race.api.PenaltyResponse;
 import com.example.starter.race.api.ResultEntryResponse;
 import com.example.starter.race.api.RunnerResponse;
@@ -12,12 +13,14 @@ import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
+import com.example.starter.race.persistence.MedicalHoldRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
 import com.example.starter.race.persistence.RunnerRow;
 import com.example.starter.race.persistence.SnapshotCheckpointRow;
 import com.example.starter.race.persistence.SnapshotEntryRow;
 import com.example.starter.race.persistence.SnapshotRow;
+import com.example.starter.race.persistence.WithdrawalRow;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -43,7 +46,30 @@ final class ResponseMapper {
     static CheckpointTimingResponse toTimingResponse(CheckpointTimingRow row) {
         return new CheckpointTimingResponse(
                 row.timingId(), row.bib(), row.checkpointCode(), row.position(),
-                row.elapsedMillis(), row.createdAt());
+                row.elapsedMillis(),
+                row.exclusionReason() == null ? null : row.exclusionReason().name(),
+                row.createdAt());
+    }
+
+    static ExcludedTimingResponse toExcludedTimingResponse(CheckpointTimingRow row) {
+        return new ExcludedTimingResponse(
+                row.timingId(), row.checkpointCode(), row.position(), row.elapsedMillis(),
+                row.exclusionReason() == null ? null : row.exclusionReason().name(),
+                row.createdAt());
+    }
+
+    static com.example.starter.race.api.MedicalHoldResponse toMedicalHoldResponse(
+            MedicalHoldRow row) {
+        return new com.example.starter.race.api.MedicalHoldResponse(
+                row.holdId(), row.raceId(), row.bib(), row.startAt(), row.endAt(),
+                row.holdReason(), row.startRole(), row.resumeRole(), row.fitConclusion(),
+                row.startedAt(), row.resumedAt());
+    }
+
+    static com.example.starter.race.api.WithdrawalResponse toWithdrawalResponse(WithdrawalRow row) {
+        return new com.example.starter.race.api.WithdrawalResponse(
+                row.raceId(), row.bib(), row.reason(), row.officialRole(),
+                row.withdrawnAt(), row.createdAt());
     }
 
     static StandingResponse liveStanding(
@@ -51,9 +77,11 @@ final class ResponseMapper {
             List<RunnerRow> runners,
             List<PenaltyRow> penalties,
             List<CheckpointRow> checkpoints,
-            List<CheckpointTimingRow> timings) {
+            List<CheckpointTimingRow> timings,
+            List<WithdrawalRow> withdrawals,
+            List<MedicalHoldRow> holds) {
         List<ResultEntry> entries = ResultCalculator.compute(
-                runners, penalties, checkpoints, timings);
+                runners, penalties, checkpoints, timings, withdrawals, holds);
         return new StandingResponse(
                 race.raceId(),
                 race.version(),
@@ -81,7 +109,9 @@ final class ResponseMapper {
                 entry.totalTimeMs(),
                 entry.checkpointCount(),
                 entry.coveredCheckpointCount(),
-                entry.missingCheckpoints());
+                entry.missingCheckpoints(),
+                entry.eligibility(),
+                entry.excludedTimingCount());
     }
 
     static ResultEntryResponse toEntryResponse(SnapshotEntryRow entry) {
@@ -94,12 +124,14 @@ final class ResponseMapper {
                 entry.totalTimeMs(),
                 entry.checkpointCount(),
                 entry.coveredCheckpointCount(),
-                entry.missingCheckpoints());
+                entry.missingCheckpoints(),
+                entry.eligibility(),
+                entry.excludedTimingCount());
     }
 
     /**
      * 组装单个选手的分段明细：按检查点顺序，把已有通过记录映射到对应检查点，
-     * 未通过的检查点 elapsedMillis/timingId 为 null。
+     * 未通过的检查点 elapsedMillis/timingId/exclusionReason 为 null。
      */
     static RunnerTimingResponse runnerTiming(
             RaceRow race,
@@ -113,18 +145,24 @@ final class ResponseMapper {
         List<CheckpointPassResponse> passes = checkpoints.stream()
                 .map(checkpoint -> {
                     CheckpointTimingRow timing = byCode.get(checkpoint.checkpointCode());
+                    if (timing == null) {
+                        return new CheckpointPassResponse(
+                                checkpoint.checkpointCode(), checkpoint.position(), null, null);
+                    }
                     return new CheckpointPassResponse(
                             checkpoint.checkpointCode(),
                             checkpoint.position(),
-                            timing == null ? null : timing.elapsedMillis(),
-                            timing == null ? null : timing.timingId());
+                            timing.elapsedMillis(),
+                            timing.timingId(),
+                            timing.exclusionReason() == null
+                                    ? null : timing.exclusionReason().name());
                 })
                 .toList();
         return new RunnerTimingResponse(
                 race.raceId(), runner.bib(), race.version(), runner.finishTimeMs(), passes);
     }
 
-    /** 由封榜快照中的分段明细组装单选手分段视图（缺失检查点 elapsedMillis/timingId 为 null）。 */
+    /** 由封榜快照中的分段明细组装单选手分段视图（缺失检查点各字段为 null）。 */
     static RunnerTimingResponse snapshotRunnerTiming(
             SnapshotRow snapshot,
             String bib,
@@ -145,7 +183,9 @@ final class ResponseMapper {
                     }
                     return new CheckpointPassResponse(
                             detail.checkpointCode(), detail.position(),
-                            detail.elapsedMillis(), detail.timingId());
+                            detail.elapsedMillis(), detail.timingId(),
+                            detail.exclusionReason() == null
+                                    ? null : detail.exclusionReason().name());
                 })
                 .toList();
         return new RunnerTimingResponse(

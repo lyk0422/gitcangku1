@@ -19,4 +19,13 @@ public interface TimingView {
 
     /** 通过该检查点的累计耗时（毫秒，1~86400000）。 */
     long elapsedMillis();
+
+    /**
+     * 计时排除原因；null 表示正常计时、参与覆盖与排名。
+     * 医疗暂停生效期间提交的计时返回 {@link TimingExclusionReason#MEDICAL_HOLD}，
+     * 不覆盖检查点、不参与排名，但原始记录保留。
+     */
+    default TimingExclusionReason exclusionReason() {
+        return null;
+    }
 }

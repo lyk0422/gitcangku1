@@ -87,6 +87,58 @@ public class RaceController {
         return toResponse(raceService.sealRace(raceId, request));
     }
 
+    /** 选手退赛（不可变）。 */
+    @PostMapping("/{raceId}/runners/{bib}/withdrawal")
+    public ResponseEntity<Object> withdrawRunner(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody WithdrawRunnerRequest request) {
+        return toResponse(raceService.withdrawRunner(raceId, bib, request));
+    }
+
+    /** 登记不可变终点（完赛）计时事件。 */
+    @PostMapping("/{raceId}/runners/{bib}/finish-timings")
+    public ResponseEntity<Object> recordFinishTiming(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody RecordFinishTimingRequest request) {
+        return toResponse(raceService.recordFinishTiming(raceId, bib, request));
+    }
+
+    /** 开始医疗暂停。 */
+    @PostMapping("/{raceId}/runners/{bib}/medical-holds")
+    public ResponseEntity<Object> startMedicalHold(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody StartMedicalHoldRequest request) {
+        return toResponse(raceService.startMedicalHold(raceId, bib, request));
+    }
+
+    /** 由不同医疗角色确认适赛并恢复。 */
+    @PostMapping("/{raceId}/medical-holds/{holdId}/resume")
+    public ResponseEntity<Object> resumeMedicalHold(
+            @PathVariable String raceId,
+            @PathVariable String holdId,
+            @Valid @RequestBody ResumeMedicalHoldRequest request) {
+        return toResponse(raceService.resumeMedicalHold(raceId, holdId, request));
+    }
+
+    /** 查询选手医疗暂停/恢复不可变历史。 */
+    @GetMapping("/{raceId}/runners/{bib}/medical-holds")
+    public MedicalHoldHistoryResponse getMedicalHoldHistory(
+            @PathVariable String raceId,
+            @PathVariable String bib) {
+        return raceService.getMedicalHoldHistory(raceId, bib);
+    }
+
+    /** 查询选手医疗暂停诊断（资格、生效暂停、被排除计时）。 */
+    @GetMapping("/{raceId}/runners/{bib}/medical-diagnostics")
+    public MedicalDiagnosticsResponse getMedicalDiagnostics(
+            @PathVariable String raceId,
+            @PathVariable String bib) {
+        return raceService.getMedicalDiagnostics(raceId, bib);
+    }
+
     /** 查询即时成绩（封榜后返回只读快照内容）。 */
     @GetMapping("/{raceId}/results")
     public StandingResponse getResults(@PathVariable String raceId) {

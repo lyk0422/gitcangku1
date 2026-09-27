@@ -9,15 +9,20 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * 成绩排名纯逻辑：依据选手原始耗时、处罚列表与检查点覆盖情况计算榜单，
+ * 成绩排名纯逻辑：依据选手原始耗时、处罚列表、检查点覆盖、退赛与医疗暂停情况计算榜单，
  * 不涉及数据库与时间。
  *
  * <p>规则：
  * <ul>
  *   <li>总耗时=原始完赛耗时+全部未撤销 ADD_TIME 加时之和；</li>
  *   <li>存在未撤销 DISQUALIFY 处罚时状态 DISQUALIFIED，不排名，全部撤销后恢复计算；</li>
+ *   <li>已退赛选手状态 WITHDRAWN、资格 WITHDRAWN，不排名（退赛为不可变事实）；</li>
+ *   <li>医疗暂停生效中（存在 endAt 为 null 的区间）状态 MEDICAL_HOLD、资格 MEDICAL_HOLD，
+ *       不参与临时排名；已恢复区间不影响资格；</li>
+ *   <li>暂停生效期间提交、带排除原因（MEDICAL_HOLD）的计时仍保留原始记录，
+ *       但不覆盖检查点、不参与排名，恢复后仅暂停结束后的新计时参与排名；</li>
  *   <li>原始耗时缺失（null）时状态 UNTIMED，不排名；</li>
- *   <li>赛事配置了检查点时：已有完赛耗时但未覆盖全部检查点的选手状态
+ *   <li>赛事配置了检查点时：已有完赛耗时但未覆盖全部（未被排除的）检查点的选手状态
  *       MISSING_CHECKPOINT，不排名；全部覆盖后恢复加时与并列排名规则；
  *       未配置检查点的赛事沿用原排名规则；</li>
  *   <li>正常选手按总耗时升序，同耗时同名次，下一名次跳过并列人数（1、1、3）；</li>
@@ -29,11 +34,20 @@ public final class ResultCalculator {
     private ResultCalculator() {
     }
 
-    /** 未配置检查点的赛事使用的兼容入口：无检查点、无分段记录。 */
+    /** 未配置检查点的赛事使用的兼容入口：无检查点、无分段记录、无退赛、无暂停。 */
     public static List<ResultEntry> compute(
             List<? extends RunnerView> runnerView,
             List<? extends PenaltyView> penalties) {
         return compute(runnerView, penalties, List.of(), List.of());
+    }
+
+    /** 无医疗暂停/退赛场景的入口。 */
+    public static List<ResultEntry> compute(
+            List<? extends RunnerView> runnerView,
+            List<? extends PenaltyView> penalties,
+            List<? extends CheckpointView> checkpoints,
+            List<? extends TimingView> timings) {
+        return compute(runnerView, penalties, checkpoints, timings, List.of(), List.of());
     }
 
     /**
@@ -42,14 +56,18 @@ public final class ResultCalculator {
      * @param runnerView  全部选手视图（参赛号、原始完赛耗时）
      * @param penalties   全部处罚（含已撤销）
      * @param checkpoints 赛事检查点配置（按 position 排序后使用）；为空表示赛事未配置检查点
-     * @param timings     全部选手的分段通过记录
+     * @param timings     全部选手的分段通过记录（含被医疗暂停排除的记录）
+     * @param withdrawals 全部退赛记录（不可变事实）
+     * @param holds       全部医疗暂停区间；endAt 为 null 表示生效中
      * @return 按展示顺序排列的成绩条目
      */
     public static List<ResultEntry> compute(
             List<? extends RunnerView> runnerView,
             List<? extends PenaltyView> penalties,
             List<? extends CheckpointView> checkpoints,
-            List<? extends TimingView> timings) {
+            List<? extends TimingView> timings,
+            List<? extends WithdrawalView> withdrawals,
+            List<? extends MedicalHoldView> holds) {
         List<CheckpointView> orderedCheckpoints = new ArrayList<>(checkpoints);
         orderedCheckpoints.sort(Comparator.comparingInt(CheckpointView::position)
                 .thenComparing(CheckpointView::checkpointCode));
@@ -71,7 +89,28 @@ public final class ResultCalculator {
             if (aggregate == null || !configuredCodes.contains(timing.checkpointCode())) {
                 continue;
             }
-            aggregate.coveredCodes.add(timing.checkpointCode());
+            // 任何原始记录都占用该检查点（缺失明细据此不产生 null 行）；
+            // 被医疗暂停排除的计时不覆盖检查点、不参与排名。
+            aggregate.presentCodes.add(timing.checkpointCode());
+            if (timing.exclusionReason() == null) {
+                aggregate.coveredCodes.add(timing.checkpointCode());
+            } else {
+                aggregate.excludedTimingCount++;
+            }
+        }
+
+        for (WithdrawalView withdrawal : withdrawals) {
+            Aggregate aggregate = aggregates.get(withdrawal.bib());
+            if (aggregate != null) {
+                aggregate.withdrawn = true;
+            }
+        }
+
+        for (MedicalHoldView hold : holds) {
+            Aggregate aggregate = aggregates.get(hold.bib());
+            if (aggregate != null && hold.endAt() == null) {
+                aggregate.activeHold = true;
+            }
         }
 
         for (PenaltyView penalty : penalties) {
@@ -91,6 +130,12 @@ public final class ResultCalculator {
         for (Aggregate aggregate : aggregates.values()) {
             if (aggregate.disqualified) {
                 aggregate.status = EntryStatus.DISQUALIFIED;
+                others.add(aggregate);
+            } else if (aggregate.withdrawn) {
+                aggregate.status = EntryStatus.WITHDRAWN;
+                others.add(aggregate);
+            } else if (aggregate.activeHold) {
+                aggregate.status = EntryStatus.MEDICAL_HOLD;
                 others.add(aggregate);
             } else if (aggregate.finishTimeMs == null) {
                 aggregate.status = EntryStatus.UNTIMED;
@@ -157,9 +202,13 @@ public final class ResultCalculator {
         private final String bib;
         private final Long finishTimeMs;
         private final List<CheckpointView> checkpoints;
+        private final Set<String> presentCodes = new HashSet<>();
         private final Set<String> coveredCodes = new HashSet<>();
         private long penaltyMs;
         private boolean disqualified;
+        private boolean withdrawn;
+        private boolean activeHold;
+        private int excludedTimingCount;
         private EntryStatus status;
         private int rank;
         private long totalTimeMs;
@@ -170,10 +219,21 @@ public final class ResultCalculator {
             this.checkpoints = checkpoints;
         }
 
+        private EligibilityStatus eligibility() {
+            if (withdrawn) {
+                return EligibilityStatus.WITHDRAWN;
+            }
+            if (activeHold) {
+                return EligibilityStatus.MEDICAL_HOLD;
+            }
+            return EligibilityStatus.ELIGIBLE;
+        }
+
         private List<String> missingCheckpoints() {
             List<String> missing = new ArrayList<>();
             for (CheckpointView checkpoint : checkpoints) {
-                if (!coveredCodes.contains(checkpoint.checkpointCode())) {
+                // 被排除计时仍在该检查点留有原始记录，因此不算“缺失”，只是不计入覆盖数。
+                if (!presentCodes.contains(checkpoint.checkpointCode())) {
                     missing.add(checkpoint.checkpointCode());
                 }
             }
@@ -190,7 +250,9 @@ public final class ResultCalculator {
                     status == EntryStatus.RANKED ? totalTimeMs : null,
                     checkpoints.size(),
                     coveredCodes.size(),
-                    missingCheckpoints());
+                    missingCheckpoints(),
+                    eligibility(),
+                    excludedTimingCount);
         }
     }
 }

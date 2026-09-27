@@ -1,8 +1,10 @@
 package com.example.starter.race.persistence;
 
+import com.example.starter.race.domain.EligibilityStatus;
 import com.example.starter.race.domain.EntryStatus;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
+import com.example.starter.race.domain.TimingExclusionReason;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
@@ -30,6 +32,10 @@ public class RaceRepository {
             new CheckpointTimingRowMapper();
     private static final SnapshotCheckpointRowMapper SNAPSHOT_CHECKPOINT_ROW_MAPPER =
             new SnapshotCheckpointRowMapper();
+    private static final WithdrawalRowMapper WITHDRAWAL_ROW_MAPPER = new WithdrawalRowMapper();
+    private static final MedicalHoldRowMapper MEDICAL_HOLD_ROW_MAPPER = new MedicalHoldRowMapper();
+    private static final FinishTimingRowMapper FINISH_TIMING_ROW_MAPPER =
+            new FinishTimingRowMapper();
 
     private final JdbcTemplate jdbcTemplate;
 
@@ -124,7 +130,8 @@ public class RaceRepository {
     /** 查询某选手的全部分段记录，按 position 升序排列。 */
     public List<CheckpointTimingRow> findTimingsForRunner(String raceId, String bib) {
         return jdbcTemplate.query(
-                "SELECT timing_id, race_id, bib, checkpoint_code, position, elapsed_millis, created_at "
+                "SELECT timing_id, race_id, bib, checkpoint_code, position, elapsed_millis, "
+                        + "exclusion_reason, created_at "
                         + "FROM checkpoint_timing WHERE race_id = ? AND bib = ? ORDER BY position",
                 CHECKPOINT_TIMING_ROW_MAPPER, raceId, bib);
     }
@@ -132,7 +139,8 @@ public class RaceRepository {
     /** 查询赛事下全部分段记录（用于实时成绩与封榜计算）。 */
     public List<CheckpointTimingRow> findAllTimings(String raceId) {
         return jdbcTemplate.query(
-                "SELECT timing_id, race_id, bib, checkpoint_code, position, elapsed_millis, created_at "
+                "SELECT timing_id, race_id, bib, checkpoint_code, position, elapsed_millis, "
+                        + "exclusion_reason, created_at "
                         + "FROM checkpoint_timing WHERE race_id = ? ORDER BY bib, position",
                 CHECKPOINT_TIMING_ROW_MAPPER, raceId);
     }
@@ -140,7 +148,8 @@ public class RaceRepository {
     /** 按全局分段ID查询记录（用于 timingId 幂等重放）。 */
     public Optional<CheckpointTimingRow> findTiming(String timingId) {
         return jdbcTemplate
-                .query("SELECT timing_id, race_id, bib, checkpoint_code, position, elapsed_millis, created_at "
+                .query("SELECT timing_id, race_id, bib, checkpoint_code, position, elapsed_millis, "
+                                + "exclusion_reason, created_at "
                                 + "FROM checkpoint_timing WHERE timing_id = ?",
                         CHECKPOINT_TIMING_ROW_MAPPER, timingId)
                 .stream()
@@ -151,10 +160,13 @@ public class RaceRepository {
     public void insertTiming(CheckpointTimingRow row) {
         jdbcTemplate.update(
                 "INSERT INTO checkpoint_timing "
-                        + "(timing_id, race_id, bib, checkpoint_code, position, elapsed_millis, created_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        + "(timing_id, race_id, bib, checkpoint_code, position, elapsed_millis, "
+                        + "exclusion_reason, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 row.timingId(), row.raceId(), row.bib(), row.checkpointCode(),
-                row.position(), row.elapsedMillis(), row.createdAt());
+                row.position(), row.elapsedMillis(),
+                row.exclusionReason() == null ? null : row.exclusionReason().name(),
+                row.createdAt());
     }
 
     /** 一次性写入赛事检查点配置（配置后不可修改）。 */
@@ -188,11 +200,13 @@ public class RaceRepository {
         SnapshotRow header = headers.getFirst();
         List<SnapshotEntryRow> entryRows = jdbcTemplate.query(
                 "SELECT race_id, bib, rank_no, status, finish_time_ms, penalty_ms, total_time_ms, "
-                        + "display_order, checkpoint_count, covered_checkpoint_count "
+                        + "display_order, checkpoint_count, covered_checkpoint_count, "
+                        + "eligibility, excluded_timing_count "
                         + "FROM result_snapshot_entry WHERE race_id = ? ORDER BY display_order",
                 SNAPSHOT_ENTRY_ROW_MAPPER, raceId);
         List<SnapshotCheckpointRow> checkpoints = jdbcTemplate.query(
-                "SELECT race_id, bib, checkpoint_code, position, elapsed_millis, timing_id "
+                "SELECT race_id, bib, checkpoint_code, position, elapsed_millis, timing_id, "
+                        + "exclusion_reason "
                         + "FROM result_snapshot_checkpoint WHERE race_id = ? "
                         + "ORDER BY bib, position",
                 SNAPSHOT_CHECKPOINT_ROW_MAPPER, raceId);
@@ -210,7 +224,8 @@ public class RaceRepository {
                         entry.finishTimeMs(), entry.penaltyMs(), entry.totalTimeMs(),
                         entry.displayOrder(), entry.checkpointCount(),
                         entry.coveredCheckpointCount(),
-                        missingByBib.getOrDefault(entry.bib(), List.of())))
+                        missingByBib.getOrDefault(entry.bib(), List.of()),
+                        entry.eligibility(), entry.excludedTimingCount()))
                 .toList();
         return Optional.of(new SnapshotRow(header.raceId(), header.version(), header.sealedAt(),
                 entries, checkpoints));
@@ -292,8 +307,9 @@ public class RaceRepository {
         jdbcTemplate.batchUpdate(
                 "INSERT INTO result_snapshot_entry "
                         + "(race_id, bib, rank_no, status, finish_time_ms, penalty_ms, total_time_ms, "
-                        + "display_order, checkpoint_count, covered_checkpoint_count) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        + "display_order, checkpoint_count, covered_checkpoint_count, "
+                        + "eligibility, excluded_timing_count) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 snapshot.entries(),
                 snapshot.entries().size(),
                 (ps, entry) -> {
@@ -307,11 +323,14 @@ public class RaceRepository {
                     ps.setInt(8, entry.displayOrder());
                     ps.setInt(9, entry.checkpointCount());
                     ps.setInt(10, entry.coveredCheckpointCount());
+                    ps.setString(11, entry.eligibility().name());
+                    ps.setInt(12, entry.excludedTimingCount());
                 });
         jdbcTemplate.batchUpdate(
                 "INSERT INTO result_snapshot_checkpoint "
-                        + "(race_id, bib, checkpoint_code, position, elapsed_millis, timing_id) "
-                        + "VALUES (?, ?, ?, ?, ?, ?)",
+                        + "(race_id, bib, checkpoint_code, position, elapsed_millis, timing_id, "
+                        + "exclusion_reason) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 snapshot.checkpoints(),
                 snapshot.checkpoints().size(),
                 (ps, detail) -> {
@@ -321,6 +340,8 @@ public class RaceRepository {
                     ps.setInt(4, detail.position());
                     ps.setObject(5, detail.elapsedMillis());
                     ps.setString(6, detail.timingId());
+                    ps.setString(7,
+                            detail.exclusionReason() == null ? null : detail.exclusionReason().name());
                 });
     }
 
@@ -374,11 +395,140 @@ public class RaceRepository {
         jdbcTemplate.update("DELETE FROM result_snapshot_entry");
         jdbcTemplate.update("DELETE FROM result_snapshot");
         jdbcTemplate.update("DELETE FROM idempotency_record");
+        jdbcTemplate.update("DELETE FROM finish_timing_record");
+        jdbcTemplate.update("DELETE FROM medical_hold");
+        jdbcTemplate.update("DELETE FROM runner_withdrawal");
         jdbcTemplate.update("DELETE FROM checkpoint_timing");
         jdbcTemplate.update("DELETE FROM checkpoint");
         jdbcTemplate.update("DELETE FROM penalty");
         jdbcTemplate.update("DELETE FROM runner");
         jdbcTemplate.update("DELETE FROM race");
+    }
+
+    /** 新增选手退赛不可变记录（一人一行由主键保证）。 */
+    public void insertWithdrawal(WithdrawalRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO runner_withdrawal "
+                        + "(race_id, bib, reason, official_role, withdrawn_at, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?)",
+                row.raceId(), row.bib(), row.reason(), row.officialRole(),
+                row.withdrawnAt(), row.createdAt());
+    }
+
+    /** 查询某选手退赛记录；未退赛为 empty。 */
+    public Optional<WithdrawalRow> findWithdrawal(String raceId, String bib) {
+        return jdbcTemplate
+                .query("SELECT race_id, bib, reason, official_role, withdrawn_at, created_at "
+                                + "FROM runner_withdrawal WHERE race_id = ? AND bib = ?",
+                        WITHDRAWAL_ROW_MAPPER, raceId, bib)
+                .stream()
+                .findFirst();
+    }
+
+    /** 查询赛事下全部退赛记录（封榜实时计算用），按参赛号升序。 */
+    public List<WithdrawalRow> findWithdrawals(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT race_id, bib, reason, official_role, withdrawn_at, created_at "
+                        + "FROM runner_withdrawal WHERE race_id = ? ORDER BY bib",
+                WITHDRAWAL_ROW_MAPPER, raceId);
+    }
+
+    /** 新增医疗暂停记录（生效中 end_at 为 NULL）。 */
+    public void insertMedicalHold(MedicalHoldRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO medical_hold "
+                        + "(hold_id, race_id, bib, start_at, end_at, hold_reason, start_role, "
+                        + "resume_role, fit_conclusion, started_at, resumed_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                row.holdId(), row.raceId(), row.bib(), row.startAt(), row.endAt(),
+                row.holdReason(), row.startRole(), row.resumeRole(), row.fitConclusion(),
+                row.startedAt(), row.resumedAt());
+    }
+
+    /** 按全局暂停ID查询。 */
+    public Optional<MedicalHoldRow> findMedicalHold(String holdId) {
+        return jdbcTemplate
+                .query("SELECT hold_id, race_id, bib, start_at, end_at, hold_reason, start_role, "
+                                + "resume_role, fit_conclusion, started_at, resumed_at "
+                                + "FROM medical_hold WHERE hold_id = ?",
+                        MEDICAL_HOLD_ROW_MAPPER, holdId)
+                .stream()
+                .findFirst();
+    }
+
+    /** 查询某选手全部医疗暂停记录，按开始时刻、暂停ID升序（历史顺序稳定）。 */
+    public List<MedicalHoldRow> findMedicalHoldsForRunner(String raceId, String bib) {
+        return jdbcTemplate.query(
+                "SELECT hold_id, race_id, bib, start_at, end_at, hold_reason, start_role, "
+                        + "resume_role, fit_conclusion, started_at, resumed_at "
+                        + "FROM medical_hold WHERE race_id = ? AND bib = ? "
+                        + "ORDER BY start_at, hold_id",
+                MEDICAL_HOLD_ROW_MAPPER, raceId, bib);
+    }
+
+    /** 查询赛事下全部医疗暂停记录（封榜实时计算用），按参赛号、开始时刻升序。 */
+    public List<MedicalHoldRow> findAllMedicalHolds(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT hold_id, race_id, bib, start_at, end_at, hold_reason, start_role, "
+                        + "resume_role, fit_conclusion, started_at, resumed_at "
+                        + "FROM medical_hold WHERE race_id = ? ORDER BY bib, start_at, hold_id",
+                MEDICAL_HOLD_ROW_MAPPER, raceId);
+    }
+
+    /** 查询某选手当前生效（未恢复）暂停；无生效暂停为 empty。 */
+    public Optional<MedicalHoldRow> findActiveMedicalHold(String raceId, String bib) {
+        return jdbcTemplate
+                .query("SELECT hold_id, race_id, bib, start_at, end_at, hold_reason, start_role, "
+                                + "resume_role, fit_conclusion, started_at, resumed_at "
+                                + "FROM medical_hold WHERE race_id = ? AND bib = ? AND end_at IS NULL",
+                        MEDICAL_HOLD_ROW_MAPPER, raceId, bib)
+                .stream()
+                .findFirst();
+    }
+
+    /**
+     * 恢复暂停：仅当记录仍生效（end_at IS NULL）时回填恢复信息；返回受影响行数，
+     * 0 表示暂停不存在或已被并发恢复。
+     */
+    public int resumeMedicalHold(
+            String holdId, long endAt, String resumeRole, String fitConclusion, long resumedAt) {
+        return jdbcTemplate.update(
+                "UPDATE medical_hold SET end_at = ?, resume_role = ?, fit_conclusion = ?, "
+                        + "resumed_at = ? WHERE hold_id = ? AND end_at IS NULL",
+                endAt, resumeRole, fitConclusion, resumedAt, holdId);
+    }
+
+    /** 新增不可变终点计时事件。 */
+    public void insertFinishTiming(FinishTimingRecordRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO finish_timing_record "
+                        + "(finish_timing_id, race_id, bib, occurred_at, finish_time_ms, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?)",
+                row.finishTimingId(), row.raceId(), row.bib(), row.occurredAt(),
+                row.finishTimeMs(), row.createdAt());
+    }
+
+    /** 按全局终点事件ID查询。 */
+    public Optional<FinishTimingRecordRow> findFinishTiming(String finishTimingId) {
+        return jdbcTemplate
+                .query("SELECT finish_timing_id, race_id, bib, occurred_at, finish_time_ms, created_at "
+                                + "FROM finish_timing_record WHERE finish_timing_id = ?",
+                        FINISH_TIMING_ROW_MAPPER, finishTimingId)
+                .stream()
+                .findFirst();
+    }
+
+    /**
+     * 判断某选手在半开区间 [startAt, endAt) 内是否已存在终点计时事件。
+     * 恢复暂停时据此返回422，要求先按既有规则裁定完赛状态。
+     */
+    public boolean existsFinishTimingBetween(
+            String raceId, String bib, long startAt, long endAt) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM finish_timing_record "
+                        + "WHERE race_id = ? AND bib = ? AND occurred_at >= ? AND occurred_at < ?",
+                Integer.class, raceId, bib, startAt, endAt);
+        return count != null && count > 0;
     }
 
     private static final class RaceRowMapper implements RowMapper<RaceRow> {
@@ -435,7 +585,9 @@ public class RaceRepository {
                     rs.getInt("display_order"),
                     rs.getInt("checkpoint_count"),
                     rs.getInt("covered_checkpoint_count"),
-                    List.of());
+                    List.of(),
+                    EligibilityStatus.valueOf(rs.getString("eligibility")),
+                    rs.getInt("excluded_timing_count"));
         }
     }
 
@@ -453,6 +605,7 @@ public class RaceRepository {
     private static final class CheckpointTimingRowMapper implements RowMapper<CheckpointTimingRow> {
         @Override
         public CheckpointTimingRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            String reason = rs.getString("exclusion_reason");
             return new CheckpointTimingRow(
                     rs.getString("timing_id"),
                     rs.getString("race_id"),
@@ -460,6 +613,7 @@ public class RaceRepository {
                     rs.getString("checkpoint_code"),
                     rs.getInt("position"),
                     rs.getLong("elapsed_millis"),
+                    reason == null ? null : TimingExclusionReason.valueOf(reason),
                     rs.getLong("created_at"));
         }
     }
@@ -468,13 +622,15 @@ public class RaceRepository {
             implements RowMapper<SnapshotCheckpointRow> {
         @Override
         public SnapshotCheckpointRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            String reason = rs.getString("exclusion_reason");
             return new SnapshotCheckpointRow(
                     rs.getString("race_id"),
                     rs.getString("bib"),
                     rs.getString("checkpoint_code"),
                     rs.getInt("position"),
                     (Long) rs.getObject("elapsed_millis"),
-                    rs.getString("timing_id"));
+                    rs.getString("timing_id"),
+                    reason == null ? null : TimingExclusionReason.valueOf(reason));
         }
     }
 
@@ -487,6 +643,50 @@ public class RaceRepository {
                     rs.getString("request_digest"),
                     rs.getInt("response_status"),
                     rs.getString("response_body"),
+                    rs.getLong("created_at"));
+        }
+    }
+
+    private static final class WithdrawalRowMapper implements RowMapper<WithdrawalRow> {
+        @Override
+        public WithdrawalRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new WithdrawalRow(
+                    rs.getString("race_id"),
+                    rs.getString("bib"),
+                    rs.getString("reason"),
+                    rs.getString("official_role"),
+                    rs.getLong("withdrawn_at"),
+                    rs.getLong("created_at"));
+        }
+    }
+
+    private static final class MedicalHoldRowMapper implements RowMapper<MedicalHoldRow> {
+        @Override
+        public MedicalHoldRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new MedicalHoldRow(
+                    rs.getString("hold_id"),
+                    rs.getString("race_id"),
+                    rs.getString("bib"),
+                    rs.getLong("start_at"),
+                    (Long) rs.getObject("end_at"),
+                    rs.getString("hold_reason"),
+                    rs.getString("start_role"),
+                    rs.getString("resume_role"),
+                    rs.getString("fit_conclusion"),
+                    rs.getLong("started_at"),
+                    (Long) rs.getObject("resumed_at"));
+        }
+    }
+
+    private static final class FinishTimingRowMapper implements RowMapper<FinishTimingRecordRow> {
+        @Override
+        public FinishTimingRecordRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new FinishTimingRecordRow(
+                    rs.getString("finish_timing_id"),
+                    rs.getString("race_id"),
+                    rs.getString("bib"),
+                    rs.getLong("occurred_at"),
+                    rs.getLong("finish_time_ms"),
                     rs.getLong("created_at"));
         }
     }
