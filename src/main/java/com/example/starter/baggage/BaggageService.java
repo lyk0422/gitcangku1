@@ -89,15 +89,18 @@ public class BaggageService {
     private final JdbcTemplate jdbcTemplate;
     private final IdempotencyService idempotencyService;
     private final ObjectMapper objectMapper;
+    private final DwellService dwellService;
     /** 可控时钟，默认系统 UTC 时钟，测试可替换。 */
     private Supplier<Instant> clock = Instant::now;
 
     public BaggageService(JdbcTemplate jdbcTemplate,
                           IdempotencyService idempotencyService,
-                          ObjectMapper objectMapper) {
+                          ObjectMapper objectMapper,
+                          DwellService dwellService) {
         this.jdbcTemplate = jdbcTemplate;
         this.idempotencyService = idempotencyService;
         this.objectMapper = objectMapper;
+        this.dwellService = dwellService;
     }
 
     /** 替换时钟（测试使用），所有登记时刻均取该时钟的 UTC 时刻。 */
@@ -261,6 +264,15 @@ public class BaggageService {
         if (new HashSet<>(bagTags).size() != bagTags.size()) {
             throw ApiException.unprocessable("批量装载的 bagTag 不得重复");
         }
+        // 航段装载约束（未配置行不限制）：截单按左闭右开，容量须容纳整批
+        LegConstraintRow constraint = findLegConstraint(legId);
+        Instant now = clock.get();
+        if (constraint != null && constraint.checkinDeadline() != null
+                && !now.isBefore(constraint.checkinDeadline())) {
+            throw ApiException.unprocessable(
+                    "已超过航段 " + legId + " 截单时刻 " + constraint.checkinDeadline()
+                            + "（当前 " + now + "，左闭右开）");
+        }
         List<String> sorted = sortedCopy(bagTags);
         List<BagRow> bags = new ArrayList<>();
         for (String bagTag : sorted) {
@@ -269,12 +281,26 @@ public class BaggageService {
                 throw ApiException.unprocessable("行李不存在: " + bagTag);
             }
             validateLoadable(bag, leg);
+            // 滞留超时先提交则在此抛 409；WITHIN_LIMIT 行加锁，保证与超时裁决按提交顺序串行
+            dwellService.assertNotBlockedForLoad(bagTag);
             bags.add(bag);
+        }
+        Integer capacity = constraint == null ? null : constraint.capacity();
+        if (capacity != null) {
+            int loadedCount = countLoaded(legId);
+            if (loadedCount + bags.size() > capacity) {
+                throw ApiException.unprocessable(
+                        "航段容量不足：要求容量 " + capacity + " 件，实际已装 " + loadedCount
+                                + " 件，本批 " + bags.size() + " 件，剩余差额 "
+                                + (capacity - loadedCount) + " 件");
+            }
         }
         for (BagRow bag : bags) {
             jdbcTemplate.update("INSERT INTO load_record (bag_tag, leg_id) VALUES (?, ?)", bag.bagTag(), legId);
             jdbcTemplate.update("UPDATE bag SET loaded_leg_id = ? WHERE bag_tag = ?", legId, bag.bagTag());
             insertEvent(bag.bagTag(), EVT_LOADED, legId, leg.origin());
+            // 行李随航段离站，关闭在该中转点未超时的开放滞留周期
+            dwellService.closeOpenStateOnDeparture(bag.bagTag());
         }
         int newVersion = leg.version() + 1;
         jdbcTemplate.update("UPDATE leg SET version = ? WHERE leg_id = ?", newVersion, legId);
@@ -443,6 +469,25 @@ public class BaggageService {
         }
     }
 
+    /** 航段装载约束（容量/截单），未配置返回 null。 */
+    private LegConstraintRow findLegConstraint(String legId) {
+        List<LegConstraintRow> rows = jdbcTemplate.query(
+                "SELECT capacity, checkin_deadline FROM leg_constraint WHERE leg_id = ?",
+                (rs, n) -> {
+                    OffsetDateTime deadline = rs.getObject("checkin_deadline", OffsetDateTime.class);
+                    return new LegConstraintRow(rs.getObject("capacity", Integer.class),
+                            deadline == null ? null : deadline.toInstant());
+                },
+                legId);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    private int countLoaded(String legId) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM load_record WHERE leg_id = ?", Integer.class, legId);
+        return count == null ? 0 : count;
+    }
+
     private LegRow findLeg(String legId) {
         List<LegRow> rows = jdbcTemplate.query(legSelect(false), LEG_MAPPER, legId);
         return rows.isEmpty() ? null : rows.get(0);
@@ -553,6 +598,10 @@ public class BaggageService {
     private record LegRow(String legId, String origin, String destination,
                           String status, int version, String sealedManifest,
                           String arrivalType, String arrivalActual) {
+    }
+
+    /** 航段装载约束行：字段为 null 表示该项未配置（不限制）。 */
+    private record LegConstraintRow(Integer capacity, Instant checkinDeadline) {
     }
 
     private record BagRow(String bagTag, String currentLocation, int nextLegIndex,

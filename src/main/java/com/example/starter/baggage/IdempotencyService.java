@@ -50,7 +50,7 @@ public class IdempotencyService {
      */
     public <T> T execute(String requestId, String operation, int successStatus,
                          Object payload, Class<T> resultType, Supplier<T> action) {
-        String hash = sha256(writeJson(payload));
+        String hash = sha256(writeJson(new Fingerprint(operation, payload)));
         Object lock = locks.computeIfAbsent(requestId, key -> new Object());
         synchronized (lock) {
             try {
@@ -118,5 +118,12 @@ public class IdempotencyService {
     }
 
     private record StoredRequest(String requestHash, String responseBody) {
+    }
+
+    /**
+     * 请求幂等指纹：必须包含操作类型与全部影响结果的字段（操作者、规范化对象集合等由 payload 承载，
+     * 集合在调用侧排序后作为结构化 JSON 数组参与摘要，不通过未转义分隔符拼接）。
+     */
+    private record Fingerprint(String operation, Object payload) {
     }
 }

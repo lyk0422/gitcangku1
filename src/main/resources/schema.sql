@@ -64,10 +64,63 @@ CREATE TABLE IF NOT EXISTS bag_event (
 -- 幂等去重：仅记录成功请求；同 requestId 同参数重放原结果，异参数返回 409
 CREATE TABLE IF NOT EXISTS request_log (
     request_id      VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
-    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER',
-    request_hash    VARCHAR(64)  NOT NULL COMMENT '请求参数（不含 requestId）的 SHA-256 摘要',
+    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER/CONFIG_TRANSIT_POINT/CONFIG_LEG_CONSTRAINT/TRANSIT_ARRIVAL/DWELL_CHECK/DWELL_RELEASE/REASSIGN',
+    request_hash    VARCHAR(64)  NOT NULL COMMENT '请求指纹（SHA-256，含操作者、操作类型、规范化对象集合及全部影响结果字段的结构化 JSON）',
     response_status INT          NOT NULL COMMENT '原成功响应的 HTTP 状态码',
-    response_body   CLOB         NOT NULL COMMENT '原成功响应体（JSON）',
+    response_body   CLOB         NOT NULL COMMENT '原成功响应体（JSON），重放返回该首次完整快照',
     created_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     PRIMARY KEY (request_id)
+);
+
+-- 中转点滞留配置：每个中转点最大滞留分钟数；滞留区间按 [到达时刻, 到达时刻+max_dwell_minutes) 左闭右开解释
+CREATE TABLE IF NOT EXISTS transit_point_config (
+    station_code      VARCHAR(64) NOT NULL COMMENT '中转点站点代码，全局唯一',
+    max_dwell_minutes INT         NOT NULL COMMENT '最大允许滞留分钟数（正整数，要求值）；到达时刻起算，UTC',
+    created_at        TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    PRIMARY KEY (station_code)
+);
+
+-- 航段装载约束（可选）：未配置行表示该航段不限制容量与截单时刻
+CREATE TABLE IF NOT EXISTS leg_constraint (
+    leg_id           VARCHAR(64) NOT NULL COMMENT '航段标识',
+    capacity         INT         NULL COMMENT '航段容量（件，要求值），NULL 不限制；须满足 已装件数+待装件数 <= 容量',
+    checkin_deadline TIMESTAMP WITH TIME ZONE NULL COMMENT '截单时刻（UTC），装载/解除时刻须早于该点（左闭右开），NULL 不限制',
+    created_at       TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    PRIMARY KEY (leg_id)
+);
+
+-- 行李当前开放的滞留周期：到达中转点登记后写入，正常装载离站或解除阻断后删除；超时证据另存不可变的 dwell_record
+CREATE TABLE IF NOT EXISTS bag_dwell_state (
+    bag_tag           VARCHAR(64) NOT NULL COMMENT '行李牌号，一件行李同一时间至多一个开放滞留周期',
+    station           VARCHAR(64) NOT NULL COMMENT '滞留中转点站点代码',
+    dwell_status      VARCHAR(16) NOT NULL DEFAULT 'WITHIN_LIMIT' COMMENT '当前滞留状态：WITHIN_LIMIT 未超上限（不阻断）/DWELL_EXCEEDED 已超时并阻断装载与改派',
+    arrived_at        TIMESTAMP WITH TIME ZONE NOT NULL COMMENT '到达中转点时刻（UTC，区间起点，左闭）',
+    max_dwell_minutes INT         NOT NULL COMMENT '本周期适用的滞留上限（分钟，登记时配置快照，要求值）',
+    PRIMARY KEY (bag_tag)
+);
+
+-- 滞留不可变记录：到达、超时、解除、改派追加写入；后续航段变更不改写既有超时证据
+CREATE TABLE IF NOT EXISTS dwell_record (
+    id                     BIGINT AUTO_INCREMENT NOT NULL COMMENT '记录自增主键',
+    bag_tag                VARCHAR(64)  NOT NULL COMMENT '行李牌号',
+    seq                    INT          NOT NULL COMMENT '该行李滞留记录顺序，0 起递增，历史按 (bag_tag, seq) 稳定排序',
+    record_type            VARCHAR(16)  NOT NULL COMMENT '记录类型：ARRIVAL 到达/DWELL_EXCEEDED 超时/RELEASED 解除/REASSIGNED 改派',
+    station                VARCHAR(64)  NOT NULL COMMENT '滞留中转点站点代码',
+    arrived_at             TIMESTAMP WITH TIME ZONE NOT NULL COMMENT '本滞留周期到达时刻（UTC）；超时/解除记录冗余同一快照，不改写',
+    event_time             TIMESTAMP WITH TIME ZONE NOT NULL COMMENT '记录产生时刻（UTC）：ARRIVAL 取到达时刻，超时/解除/改派取可注入时钟裁决时刻',
+    max_dwell_minutes      BIGINT       NULL COMMENT '要求滞留上限（分钟）；REASSIGNED 为 NULL',
+    actual_dwell_minutes   BIGINT       NULL COMMENT '实际滞留分钟数=event_time-arrived_at 向下取整；ARRIVAL 为 0，REASSIGNED 为 NULL',
+    difference_minutes     BIGINT       NULL COMMENT '差额（分钟）：未超时/解除为剩余=max-actual，超时为超出=actual-max；REASSIGNED 为 NULL',
+    deadline_at            TIMESTAMP WITH TIME ZONE NULL COMMENT '滞留截止=arrived_at+max_dwell_minutes（UTC，右端点开）；REASSIGNED 为 NULL',
+    next_leg_id            VARCHAR(64)  NULL COMMENT '解除/改派指定的下一航段标识；ARRIVAL/DWELL_EXCEEDED 为 NULL',
+    reviewer               VARCHAR(64)  NULL COMMENT '解除阻断的复核人工号；其余记录为 NULL',
+    conclusion             VARCHAR(256) NULL COMMENT '复核结论；其余记录为 NULL',
+    operator               VARCHAR(64)  NULL COMMENT '操作者工号（改派登记人；解除以复核人为准）；其余记录为 NULL',
+    leg_capacity           INT          NULL COMMENT '解除时下一航段容量要求快照（件），NULL 表示该航段未配置容量',
+    leg_loaded_count       INT          NULL COMMENT '解除时下一航段已装载件数（实际值），未配置容量行也为 NULL',
+    leg_remaining_capacity INT          NULL COMMENT '解除时下一航段剩余容量差额=capacity-loaded_count；NULL 表示未配置容量',
+    checkin_deadline       TIMESTAMP WITH TIME ZONE NULL COMMENT '解除时下一航段截单时刻快照（UTC），NULL 表示未配置',
+    created_at             TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间（数据库时钟，仅审计用）',
+    PRIMARY KEY (id),
+    UNIQUE (bag_tag, seq)
 );
