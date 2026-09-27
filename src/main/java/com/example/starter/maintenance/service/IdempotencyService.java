@@ -4,6 +4,7 @@ import java.time.Clock;
 import java.util.Optional;
 import java.util.function.Supplier;
 
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 
 import com.example.starter.maintenance.api.ApiException;
@@ -56,6 +57,23 @@ public class IdempotencyService {
             return null;
         }
         return replay(existing.get(), operation, fingerprint, type);
+    }
+
+    /**
+     * 并发唯一键冲突补偿包装：冲突事务已回滚，若同 requestId 的成功记录已提交则重放（异参抛 409），
+     * 否则说明是业务唯一键冲突，返回 409。
+     */
+    public <T> T executeWithRecovery(String requestId, String operation, String fingerprint,
+                                     Class<T> type, Supplier<T> action) {
+        try {
+            return action.get();
+        } catch (DuplicateKeyException e) {
+            T replayed = replayExisting(requestId, operation, fingerprint, type);
+            if (replayed != null) {
+                return replayed;
+            }
+            throw ApiException.conflict("DUPLICATE_KEY", "唯一约束冲突，请核对业务标识是否已被占用");
+        }
     }
 
     private <T> T replay(IdempotencyRow row, String operation, String fingerprint, Class<T> type) {

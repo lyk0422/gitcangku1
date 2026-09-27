@@ -14,6 +14,7 @@ import java.time.Instant;
  * @param lastMaintenanceAnchorCumulativeMinutes 最近保养锚点工时快照（无保养时为 0）
  * @param runMinutes                             本轮运行分钟
  * @param status                                 OK 或 DUE（runMinutes 达到保养周期即 DUE）
+ * @param equipmentState                         设备状态：ACTIVE 在用 / DECOMMISSIONED 已停用（新增字段，置于末尾）
  */
 public record StatusResponse(
         String equipmentId,
@@ -24,5 +25,6 @@ public record StatusResponse(
         Instant lastMaintenanceAnchorSampledAt,
         long lastMaintenanceAnchorCumulativeMinutes,
         long runMinutes,
-        String status) {
+        String status,
+        String equipmentState) {
 }
