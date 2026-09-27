@@ -59,13 +59,16 @@ public class BatchService {
     private static final int IDEMPOTENCY_MAX_ATTEMPTS = 3;
 
     private final BatchRepository repo;
+    private final PalletRepository palletRepo;
     private final TransactionTemplate tx;
     private final ObjectMapper objectMapper;
 
     public BatchService(BatchRepository repo,
+                        PalletRepository palletRepo,
                         PlatformTransactionManager transactionManager,
                         ObjectMapper objectMapper) {
         this.repo = repo;
+        this.palletRepo = palletRepo;
         this.tx = new TransactionTemplate(transactionManager);
         this.objectMapper = objectMapper;
     }
@@ -238,6 +241,12 @@ public class BatchService {
             repo.insertRecall(new BatchRepository.RecallRow(0L, batchKey, req.commandKey(),
                     actor, req.reason(), now));
             repo.updateStatus(batchKey, BatchStatus.RECALLED.name());
+            // 血缘召回命中托盘批次：命中批次及其后代所在托盘的全部未装运批次标记待复核，
+            // 与召回同事务提交；装载记录保留不删除
+            List<String> palletAffected = new ArrayList<>(descendants.size() + 1);
+            palletAffected.add(batchKey);
+            palletAffected.addAll(descendants);
+            palletRepo.markPendingReview(palletAffected, now);
             RecallResponse body = new RecallResponse(batchKey, actor, req.reason(),
                     BatchStatus.RECALLED, Instant.parse(now));
             return new StoredResponse(201, toJson(body));

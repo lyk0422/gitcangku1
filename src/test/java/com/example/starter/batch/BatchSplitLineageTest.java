@@ -46,6 +46,11 @@ class BatchSplitLineageTest {
     @BeforeEach
     void cleanTables() {
         jdbc.update("DELETE FROM command_log");
+        jdbc.update("DELETE FROM pallet_disposal");
+        jdbc.update("DELETE FROM pallet_shipment");
+        jdbc.update("DELETE FROM batch_occupancy");
+        jdbc.update("DELETE FROM pallet_load");
+        jdbc.update("DELETE FROM pallet");
         jdbc.update("DELETE FROM approval");
         jdbc.update("DELETE FROM recall");
         jdbc.update("DELETE FROM test_result");
