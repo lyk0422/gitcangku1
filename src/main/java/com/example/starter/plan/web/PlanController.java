@@ -1,13 +1,22 @@
 package com.example.starter.plan.web;
 
+import com.example.starter.plan.service.HazardService;
 import com.example.starter.plan.service.PlanService;
+import com.example.starter.plan.web.dto.BatchRescheduleRequest;
+import com.example.starter.plan.web.dto.BatchRescheduleResponse;
 import com.example.starter.plan.web.dto.CreatePlanRequest;
+import com.example.starter.plan.web.dto.HazardConfigRequest;
+import com.example.starter.plan.web.dto.HazardConfigResponse;
+import com.example.starter.plan.web.dto.HazardDiagnosticView;
 import com.example.starter.plan.web.dto.PlanActionRequest;
 import com.example.starter.plan.web.dto.PlanResponse;
+import com.example.starter.plan.web.dto.PublishSnapshotSummary;
+import com.example.starter.plan.web.dto.PublishSnapshotView;
 import com.example.starter.plan.web.dto.PublishedSlotView;
 import com.example.starter.plan.web.dto.RescheduleChainResponse;
 import com.example.starter.plan.web.dto.RescheduleRequest;
 import com.example.starter.plan.web.dto.RescheduleResponse;
+import com.example.starter.plan.web.dto.UpdateCarsRequest;
 import com.example.starter.plan.web.dto.UpdateOccupanciesRequest;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
@@ -37,9 +46,11 @@ import org.springframework.web.bind.annotation.RestController;
 public class PlanController {
 
     private final PlanService service;
+    private final HazardService hazardService;
 
-    public PlanController(PlanService service) {
+    public PlanController(PlanService service, HazardService hazardService) {
         this.service = service;
+        this.hazardService = hazardService;
     }
 
     /**
@@ -61,21 +72,32 @@ public class PlanController {
     }
 
     /**
-     * 发布计划，原子校验时隙冲突。
+     * 整体替换草稿计划危险品编组（expectedVersion 乐观校验，成功版本加一）；
+     * 车厢位置重复返回 422 并列出冲突对。
+     */
+    @PutMapping("/plans/{scheduleKey}/cars")
+    public PlanResponse replaceCars(@PathVariable String scheduleKey,
+                                    @Valid @RequestBody UpdateCarsRequest request) {
+        return service.replaceCars(scheduleKey, request);
+    }
+
+    /**
+     * 发布计划，原子校验时隙冲突与危险品联合校验（完整编组 + 完整区段路径），
+     * 通过后固化发布快照。
      */
     @PostMapping("/plans/{scheduleKey}/publish")
     public PlanResponse publish(@PathVariable String scheduleKey,
                                 @Valid @RequestBody PlanActionRequest request) {
-        return service.publish(scheduleKey, request.requestKey());
+        return service.publish(scheduleKey, request.requestKey(), request.operator());
     }
 
     /**
-     * 取消已发布计划，时隙立即释放，历史保留。
+     * 取消已发布计划，时隙立即释放，历史与发布快照保留。
      */
     @PostMapping("/plans/{scheduleKey}/cancel")
     public PlanResponse cancel(@PathVariable String scheduleKey,
                                @Valid @RequestBody PlanActionRequest request) {
-        return service.cancel(scheduleKey, request.requestKey());
+        return service.cancel(scheduleKey, request.requestKey(), request.operator());
     }
 
     /**
@@ -86,6 +108,57 @@ public class PlanController {
     public RescheduleResponse reschedule(@PathVariable String scheduleKey,
                                          @Valid @RequestBody RescheduleRequest request) {
         return service.reschedule(scheduleKey, request);
+    }
+
+    /**
+     * 批量原子改签：先校验全部计划的完整最终状态，再在一个事务中提交；
+     * 任一计划非法则整次不改变时隙或编组。
+     */
+    @PostMapping("/plans/batch-reschedule")
+    public BatchRescheduleResponse batchReschedule(@Valid @RequestBody BatchRescheduleRequest request) {
+        return service.batchReschedule(request);
+    }
+
+    /**
+     * 整体替换危险品配置（隔离规则 + 限制区段）：先校验完整最终状态，
+     * 再在一个事务中提交；配置非法返回 422 且整体不生效。
+     */
+    @PutMapping("/hazard/config")
+    public HazardConfigResponse replaceHazardConfig(@Valid @RequestBody HazardConfigRequest request) {
+        return hazardService.replaceConfig(request);
+    }
+
+    /**
+     * 查询当前危险品配置（隔离规则与限制区段），稳定排序。
+     */
+    @GetMapping("/hazard/config")
+    public HazardConfigResponse getHazardConfig() {
+        return hazardService.getConfig();
+    }
+
+    /**
+     * 危险品联合校验诊断：对计划当前编组与完整区段路径做只读校验，不改变状态。
+     */
+    @GetMapping("/plans/{scheduleKey}/hazard-diagnostic")
+    public HazardDiagnosticView getHazardDiagnostic(@PathVariable String scheduleKey) {
+        return hazardService.getDiagnostic(scheduleKey);
+    }
+
+    /**
+     * 查询计划发布快照明细（固化编组、类别、区段限制版本与校验结论）。
+     */
+    @GetMapping("/plans/{scheduleKey}/publish-snapshot")
+    public PublishSnapshotView getPublishSnapshot(@PathVariable String scheduleKey) {
+        return hazardService.getSnapshot(scheduleKey);
+    }
+
+    /**
+     * 按运营日查询发布快照历史，按 (createdAt, id) 稳定排序。
+     */
+    @GetMapping("/publish-snapshots")
+    public List<PublishSnapshotSummary> listPublishSnapshots(
+            @RequestParam @NotNull @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date) {
+        return hazardService.listSnapshots(date);
     }
 
     /**
