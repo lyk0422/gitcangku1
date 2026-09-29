@@ -1,5 +1,6 @@
--- 多语种段落修订与发布快照 schema（H2 MySQL 兼容模式）。
--- 所有时间字段为数据库默认时区时间戳；版本号均从 1（文档发布版本从 0）开始单调递增。
+-- 多语种段落修订、发布快照与译文归档包 schema（H2 MySQL 兼容模式）。
+-- 业务表组时间字段为数据库默认时区时间戳；版本号均从 1（文档发布版本从 0）开始单调递增。
+-- 发布撤回、术语退役与归档包表组的时间字段均为 UTC（应用层以 Instant 写入），毫秒精度；区间一律按左闭右开解释。
 
 CREATE TABLE IF NOT EXISTS document (
     document_id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -124,3 +125,58 @@ COMMENT ON COLUMN request_log.request_hash IS '请求参数规范化后的 SHA-2
 COMMENT ON COLUMN request_log.response_status IS '原成功响应的 HTTP 状态码，用于重放';
 COMMENT ON COLUMN request_log.response_body IS '原成功响应体 JSON，用于重放';
 COMMENT ON COLUMN request_log.created_at IS '记录时间，数据库默认时区';
+
+CREATE TABLE IF NOT EXISTS release_withdrawal (
+    document_id BIGINT NOT NULL,
+    published_version INT NOT NULL,
+    withdrawn_by VARCHAR(128) NOT NULL,
+    reason VARCHAR(512) NOT NULL,
+    withdrawn_at TIMESTAMP NOT NULL,
+    PRIMARY KEY (document_id, published_version)
+);
+COMMENT ON TABLE release_withdrawal IS '发布撤回记录：针对单个发布版本，撤回为终态（重复撤回 409）；撤回后不可对该版本新建归档包，但发布快照与已有归档证据一律保留';
+COMMENT ON COLUMN release_withdrawal.document_id IS '所属文档 ID';
+COMMENT ON COLUMN release_withdrawal.published_version IS '被撤回的发布版本号，从 1 开始';
+COMMENT ON COLUMN release_withdrawal.withdrawn_by IS '撤回操作者，取提交时 X-Actor-Id';
+COMMENT ON COLUMN release_withdrawal.reason IS '撤回原因，非空，最长 512 字符';
+COMMENT ON COLUMN release_withdrawal.withdrawn_at IS '撤回时刻，UTC 毫秒精度';
+
+CREATE TABLE IF NOT EXISTS term_retirement (
+    document_id BIGINT NOT NULL,
+    term_version INT NOT NULL,
+    retired_by VARCHAR(128) NOT NULL,
+    reason VARCHAR(512) NOT NULL,
+    retired_at TIMESTAMP NOT NULL,
+    PRIMARY KEY (document_id, term_version)
+);
+COMMENT ON TABLE term_retirement IS '术语版本退役记录：仅标记退役，不删除或改写任何术语版本/规则；退役为终态（重复退役 409），不影响已固化的归档证据';
+COMMENT ON COLUMN term_retirement.document_id IS '所属文档 ID';
+COMMENT ON COLUMN term_retirement.term_version IS '被退役的术语版本号，从 1 开始';
+COMMENT ON COLUMN term_retirement.retired_by IS '退役操作者，取提交时 X-Actor-Id';
+COMMENT ON COLUMN term_retirement.reason IS '退役原因，非空，最长 512 字符';
+COMMENT ON COLUMN term_retirement.retired_at IS '退役时刻，UTC 毫秒精度';
+
+CREATE TABLE IF NOT EXISTS archive_package (
+    archive_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    document_id BIGINT NOT NULL,
+    published_version INT NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    created_by VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP NOT NULL,
+    revoked_by VARCHAR(128),
+    revoked_at TIMESTAMP,
+    revoked_reason VARCHAR(512),
+    package_json LONGTEXT NOT NULL,
+    UNIQUE (document_id, published_version)
+);
+COMMENT ON TABLE archive_package IS '译文归档包：一个文档的同一发布版本至多一个包；包体（package_json）、生成时刻与引用版本不可变，发布撤回/译文修订/术语退役均不改写；撤销仅置 REVOKED 并保留原因与证据';
+COMMENT ON COLUMN archive_package.archive_id IS '全局唯一归档包 ID，自增';
+COMMENT ON COLUMN archive_package.document_id IS '所属文档 ID';
+COMMENT ON COLUMN archive_package.published_version IS '归档包引用的唯一发布版本号；同文档同版本唯一';
+COMMENT ON COLUMN archive_package.status IS '归档状态：ACTIVE 可访问明细；REVOKED 访问失效（明细 410），行与包体保留';
+COMMENT ON COLUMN archive_package.created_by IS '归档操作者，取提交时 X-Actor-Id';
+COMMENT ON COLUMN archive_package.created_at IS '归档包生成时刻，UTC 毫秒精度，不可变';
+COMMENT ON COLUMN archive_package.revoked_by IS '撤销操作者；ACTIVE 时为 NULL，REVOKED 时非 NULL';
+COMMENT ON COLUMN archive_package.revoked_at IS '撤销时刻，UTC 毫秒精度；ACTIVE 时为 NULL，REVOKED 时非 NULL';
+COMMENT ON COLUMN archive_package.revoked_reason IS '撤销原因；ACTIVE 时为 NULL，REVOKED 时非 NULL';
+COMMENT ON COLUMN archive_package.package_json IS '归档包完整证据 JSON：规范排序的目标语种、逐段译文版本、术语版本与规则、审批记录及发布快照摘要，生成后只读';

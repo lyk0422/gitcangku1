@@ -13,6 +13,8 @@ import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.stereotype.Repository;
 
 import java.sql.PreparedStatement;
+import java.sql.Timestamp;
+import java.time.Instant;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
@@ -227,6 +229,14 @@ public class TranslationRepository {
                 "SELECT snapshot_json FROM release_snapshot WHERE document_id = ? AND published_version = ?",
                 (rs, n) -> rs.getString(1), documentId, publishedVersion);
         return rows.stream().findFirst();
+    }
+
+    /** 查询指定发布快照的生成时刻（数据库默认时区时间戳），用于归档包发布摘要。 */
+    public Optional<Instant> findSnapshotCreatedAt(long documentId, int publishedVersion) {
+        List<Timestamp> rows = jdbc.query(
+                "SELECT created_at FROM release_snapshot WHERE document_id = ? AND published_version = ?",
+                (rs, n) -> rs.getTimestamp(1), documentId, publishedVersion);
+        return rows.stream().findFirst().map(Timestamp::toInstant);
     }
 
     public Optional<RequestLogRow> findRequestLog(String requestId) {

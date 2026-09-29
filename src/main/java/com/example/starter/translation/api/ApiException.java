@@ -38,6 +38,11 @@ public class ApiException extends RuntimeException {
         return violations;
     }
 
+    /** 400：请求参数不合法（如时间区间格式错误、from 晚于 to）。 */
+    public static ApiException badRequest(String message) {
+        return new ApiException(HttpStatus.BAD_REQUEST, "BAD_REQUEST", message);
+    }
+
     /** 404：资源不存在。 */
     public static ApiException notFound(String message) {
         return new ApiException(HttpStatus.NOT_FOUND, "NOT_FOUND", message);
@@ -46,6 +51,11 @@ public class ApiException extends RuntimeException {
     /** 409：版本冲突、段落冲突或 requestId 同键异参。 */
     public static ApiException conflict(String message) {
         return new ApiException(HttpStatus.CONFLICT, "CONFLICT", message);
+    }
+
+    /** 410：归档包已撤销，证据访问失效（证据仍保留）。 */
+    public static ApiException gone(String message) {
+        return new ApiException(HttpStatus.GONE, "GONE", message);
     }
 
     /** 422：业务规则不满足（缺译、审核失效、版本不匹配等）。 */

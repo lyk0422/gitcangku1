@@ -41,6 +41,9 @@ public abstract class AbstractIntegrationTest {
         jdbc.update("DELETE FROM release_snapshot");
         jdbc.update("DELETE FROM term_rule");
         jdbc.update("DELETE FROM term_version");
+        jdbc.update("DELETE FROM archive_package");
+        jdbc.update("DELETE FROM release_withdrawal");
+        jdbc.update("DELETE FROM term_retirement");
         jdbc.update("DELETE FROM request_log");
         jdbc.update("DELETE FROM document");
     }
@@ -128,6 +131,43 @@ public abstract class AbstractIntegrationTest {
         String body = "{\"requestId\":\"" + requestId + "\",\"expectedTermVersion\":" + expectedTermVersion
                 + ",\"rules\":" + rulesJson + "}";
         return putJson("/api/documents/" + documentId + "/terms", body);
+    }
+
+    /** 撤回发布版本。 */
+    protected ApiResult withdrawRelease(long documentId, int publishedVersion, String actorId, String reason,
+                                        String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"reason\":\"" + reason + "\"}";
+        return postJson("/api/documents/" + documentId + "/releases/" + publishedVersion + "/withdraw",
+                body, actorId);
+    }
+
+    /** 退役术语版本。 */
+    protected ApiResult retireTerms(long documentId, int termVersion, String actorId, String reason,
+                                    String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"termVersion\":" + termVersion
+                + ",\"reason\":\"" + reason + "\"}";
+        return postJson("/api/documents/" + documentId + "/terms/" + termVersion + "/retire", body, actorId);
+    }
+
+    /** 创建单个归档包。 */
+    protected ApiResult createArchive(long documentId, int publishedVersion, String actorId,
+                                      String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"publishedVersion\":" + publishedVersion + "}";
+        return postJson("/api/documents/" + documentId + "/archives", body, actorId);
+    }
+
+    /** 批量创建归档包。 */
+    protected ApiResult batchArchive(long documentId, String versionsJson, String actorId,
+                                     String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"publishedVersions\":" + versionsJson + "}";
+        return postJson("/api/documents/" + documentId + "/archives/batch", body, actorId);
+    }
+
+    /** 撤销归档包。 */
+    protected ApiResult revokeArchive(long documentId, long archiveId, String actorId, String reason,
+                                      String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"reason\":\"" + reason + "\"}";
+        return postJson("/api/documents/" + documentId + "/archives/" + archiveId + "/revoke", body, actorId);
     }
 
     /** HTTP 响应结果：状态码与 JSON 响应体。 */
