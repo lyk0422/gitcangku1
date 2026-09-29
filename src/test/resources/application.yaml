@@ -11,6 +11,8 @@ spring:
   sql:
     init:
       mode: always
+  jackson:
+    time-zone: UTC
 
 server:
   error:

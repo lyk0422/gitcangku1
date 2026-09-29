@@ -14,6 +14,8 @@ import com.example.starter.calibration.api.dto.SubmitMeasurementRequest;
 import com.example.starter.calibration.model.Certificate;
 import com.example.starter.calibration.model.Measurement;
 import com.example.starter.calibration.model.MeasurementStatus;
+import com.example.starter.calibration.model.UncertaintyBudget;
+import com.example.starter.calibration.repo.BudgetRepository;
 import com.example.starter.calibration.repo.CertificateRepository;
 import com.example.starter.calibration.repo.MeasurementRepository;
 import com.example.starter.calibration.repo.ReleaseRepository;
@@ -27,19 +29,22 @@ public class MeasurementService {
     private final MeasurementRepository measurements;
     private final CertificateRepository certificates;
     private final ReleaseRepository releases;
+    private final BudgetRepository budgets;
 
     public MeasurementService(MeasurementRepository measurements,
                               CertificateRepository certificates,
-                              ReleaseRepository releases) {
+                              ReleaseRepository releases,
+                              BudgetRepository budgets) {
         this.measurements = measurements;
         this.certificates = certificates;
         this.releases = releases;
+        this.budgets = budgets;
     }
 
     /**
      * 提交测量。按测量时刻匹配唯一有效证书，无匹配返回 422；
      * 使用 BigDecimal 精确计算 a×读数+b，合格判断基于未舍入值且包含端点。
-     * measurementKey 重复返回 409（幂等键冲突）。
+     * measurementKey 重复返回 409（幂等键冲突）。初始修订版本为 1，尚无不确定度预算。
      */
     @Transactional
     public MeasurementResponse submit(SubmitMeasurementRequest request) {
@@ -56,6 +61,7 @@ public class MeasurementService {
 
         Certificate cert = certificates.findMatching(instrumentId, measuredAt)
                 .orElseThrow(() -> ApiException.unprocessable(
+                        "NO_MATCHING_CERTIFICATE",
                         "测量时刻无匹配的有效证书: instrument=" + instrumentId));
 
         BigDecimal computed = cert.a().multiply(reading).add(cert.b());
@@ -63,7 +69,7 @@ public class MeasurementService {
 
         Measurement measurement = new Measurement(
                 0L, key, instrumentId, measuredAt, reading, lower, upper, submittedBy,
-                cert.id(), computed, passed, MeasurementStatus.PENDING, Instant.now());
+                cert.id(), computed, passed, MeasurementStatus.PENDING, 1L, null, Instant.now());
         try {
             measurements.insert(measurement);
         } catch (DuplicateKeyException ex) {
@@ -73,7 +79,7 @@ public class MeasurementService {
     }
 
     /**
-     * 历史明细：包含原始测量、未舍入计算值、显示值与放行历史；不存在返回 404。
+     * 历史明细：包含原始测量、未舍入计算值、显示值、当前不确定度预算与放行历史；不存在返回 404。
      */
     @Transactional(readOnly = true)
     public MeasurementResponse detail(String key) {
@@ -97,7 +103,19 @@ public class MeasurementService {
         boolean certRevoked = certificates.findById(measurement.certificateId())
                 .map(Certificate::revoked)
                 .orElse(true);
+        UncertaintyBudget currentBudget = null;
+        if (measurement.currentBudgetId() != null) {
+            currentBudget = budgets.findById(measurement.currentBudgetId()).orElse(null);
+            if (currentBudget != null) {
+                currentBudget = new UncertaintyBudget(
+                        currentBudget.id(), currentBudget.measurementId(), currentBudget.budgetVersion(),
+                        currentBudget.method(), currentBudget.combinedUncertainty(),
+                        currentBudget.thresholdId(), currentBudget.thresholdVersion(),
+                        currentBudget.thresholdValue(), currentBudget.createdBy(), currentBudget.createdAt(),
+                        budgets.findComponents(currentBudget.id()));
+            }
+        }
         return DtoMapper.toResponse(measurement, certRevoked,
-                releases.findByMeasurementId(measurement.id()));
+                releases.findByMeasurementId(measurement.id()), currentBudget);
     }
 }

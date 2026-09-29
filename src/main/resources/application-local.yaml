@@ -1,0 +1,5 @@
+# 本地 profile：H2 内存库启动时加载合成演示数据（JVM 生命周期内有效，进程退出即丢失）。
+spring:
+  sql:
+    init:
+      data-locations: classpath:data.sql

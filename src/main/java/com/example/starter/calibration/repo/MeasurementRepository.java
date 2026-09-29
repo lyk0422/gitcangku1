@@ -2,7 +2,6 @@ package com.example.starter.calibration.repo;
 
 import java.sql.PreparedStatement;
 import java.sql.Statement;
-import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
 
@@ -17,6 +16,7 @@ import com.example.starter.calibration.model.MeasurementStatus;
 
 /**
  * 测量记录持久化。measurement_key 全局唯一作为幂等键；状态流转由放行事务在行锁内完成。
+ * version 为测量修订版本号，预算修订通过 compare-and-set（WHERE version = ?）推进。
  */
 @Repository
 public class MeasurementRepository {
@@ -25,7 +25,7 @@ public class MeasurementRepository {
             rs.getLong("id"),
             rs.getString("measurement_key"),
             rs.getString("instrument_id"),
-            JdbcTimes.fromDb(rs.getObject("measured_at", LocalDateTime.class)),
+            JdbcTimes.fromDb(rs.getObject("measured_at", java.time.LocalDateTime.class)),
             rs.getBigDecimal("raw_reading"),
             rs.getBigDecimal("lower_limit"),
             rs.getBigDecimal("upper_limit"),
@@ -34,7 +34,9 @@ public class MeasurementRepository {
             rs.getBigDecimal("computed_value"),
             rs.getBoolean("passed"),
             MeasurementStatus.valueOf(rs.getString("status")),
-            JdbcTimes.fromDb(rs.getObject("created_at", LocalDateTime.class)));
+            rs.getLong("version"),
+            (Long) rs.getObject("current_budget_id"),
+            JdbcTimes.fromDb(rs.getObject("created_at", java.time.LocalDateTime.class)));
 
     private final JdbcTemplate jdbc;
 
@@ -51,8 +53,9 @@ public class MeasurementRepository {
             PreparedStatement ps = con.prepareStatement(
                     "INSERT INTO measurement "
                             + "(measurement_key, instrument_id, measured_at, raw_reading, lower_limit, upper_limit, "
-                            + "submitted_by, certificate_id, computed_value, passed, status, created_at) "
-                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            + "submitted_by, certificate_id, computed_value, passed, status, version, "
+                            + "current_budget_id, created_at) "
+                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, measurement.measurementKey());
             ps.setString(2, measurement.instrumentId());
@@ -65,7 +68,9 @@ public class MeasurementRepository {
             ps.setBigDecimal(9, measurement.computedValue());
             ps.setBoolean(10, measurement.passed());
             ps.setString(11, measurement.status().name());
-            ps.setObject(12, JdbcTimes.toDb(measurement.createdAt()));
+            ps.setLong(12, measurement.version());
+            ps.setObject(13, measurement.currentBudgetId());
+            ps.setObject(14, JdbcTimes.toDb(measurement.createdAt()));
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();
@@ -80,7 +85,7 @@ public class MeasurementRepository {
     }
 
     /**
-     * 按测量键查询并加行锁（须在事务内调用），用于放行时串行化状态流转。
+     * 按测量键查询并加行锁（须在事务内调用），用于放行与预算修订的串行化裁决。
      */
     public Optional<Measurement> findByKeyForUpdate(String key) {
         return jdbc.query("SELECT * FROM measurement WHERE measurement_key = ? FOR UPDATE", MAPPER, key)
@@ -93,6 +98,16 @@ public class MeasurementRepository {
     public void markReleased(long id) {
         jdbc.update("UPDATE measurement SET status = ? WHERE id = ?",
                 MeasurementStatus.RELEASED.name(), id);
+    }
+
+    /**
+     * 比较并设置当前预算版本（须在持有测量行锁的事务内调用）：
+     * 仅当测量仍为期望修订版本时推进到下一版本并指向新预算；返回受影响行数。
+     */
+    public int compareAndSetBudget(long id, long expectedVersion, long nextVersion, long newBudgetId) {
+        return jdbc.update(
+                "UPDATE measurement SET version = ?, current_budget_id = ? WHERE id = ? AND version = ?",
+                nextVersion, newBudgetId, id, expectedVersion);
     }
 
     /**

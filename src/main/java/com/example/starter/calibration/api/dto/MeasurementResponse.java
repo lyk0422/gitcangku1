@@ -23,6 +23,8 @@ import java.util.List;
  * @param usable         当前是否可用（已放行且证书未撤销）
  * @param createdAt      提交时间（UTC）
  * @param releases       放行历史
+ * @param version        测量修订版本号，从 1 起，每次预算修订加 1
+ * @param budget         当前生效不确定度预算摘要；从未登记预算为 null（null 语义：空预算，合成不确定度视为 0）
  */
 public record MeasurementResponse(
         long id,
@@ -40,5 +42,7 @@ public record MeasurementResponse(
         String status,
         boolean usable,
         Instant createdAt,
-        List<ReleaseRecordResponse> releases) {
+        List<ReleaseRecordResponse> releases,
+        long version,
+        BudgetResponse budget) {
 }

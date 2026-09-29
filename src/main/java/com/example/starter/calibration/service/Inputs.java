@@ -34,6 +34,17 @@ final class Inputs {
         return new BigDecimal(value.trim());
     }
 
+    /**
+     * 非负十进制：复用十进制格式校验，且不得小于 0；不确定度分量与阈值使用。
+     */
+    static BigDecimal requireNonNegativeDecimal(String value, String field) {
+        BigDecimal decimal = requireDecimal(value, field);
+        if (decimal.compareTo(BigDecimal.ZERO) < 0) {
+            throw ApiException.unprocessable("INVALID_VALUE", field + " 不能为负数");
+        }
+        return decimal;
+    }
+
     static Instant requireInstant(String value, String field) {
         if (value == null || value.isBlank()) {
             throw ApiException.badRequest(field + " 不能为空");

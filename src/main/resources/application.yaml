@@ -1,11 +1,18 @@
 spring:
   application:
     name: gitcangku1
+  profiles:
+    # 本地入口默认 local（H2 内存库 + schema.sql 建表 + data.sql 合成数据）；
+    # 部署外部数据库时通过 SPRING_PROFILES_ACTIVE 切换，基线 profile 不加载演示数据。
+    active: ${SPRING_PROFILES_ACTIVE:local}
   config:
     import: "optional:configtree:/run/secrets/"
   datasource:
-    url: ${DB_URL}
-    username: ${DB_USER}
+    # 本地入口默认使用 H2 内存库（MODE=MySQL）；外部部署用 DB_URL/DB_DRIVER/DB_USER/DB_PASSWORD 覆盖。
+    url: ${DB_URL:jdbc:h2:mem:calibration;MODE=MySQL;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=10000}
+    driver-class-name: ${DB_DRIVER:org.h2.Driver}
+    username: ${DB_USER:sa}
+    password: ${DB_PASSWORD:}
     hikari:
       maximum-pool-size: 5
       minimum-idle: 1
@@ -14,8 +21,10 @@ spring:
   sql:
     init:
       mode: always
+      # 基线不加载演示数据；local profile（application-local.yaml）才挂载 data.sql 合成种子。
+      data-locations: []
   jackson:
-    time-zone: Asia/Shanghai
+    time-zone: UTC
   lifecycle:
     timeout-per-shutdown-phase: 20s
 

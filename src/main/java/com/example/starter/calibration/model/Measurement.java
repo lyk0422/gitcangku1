@@ -18,6 +18,8 @@ import java.time.Instant;
  * @param computedValue  未舍入计算值 a×读数+b
  * @param passed         是否合格（基于未舍入值，含端点）
  * @param status         状态：PENDING 待放行 / RELEASED 已放行
+ * @param version        测量修订版本号，从 1 起；每次不确定度预算修订加 1，用于乐观裁决
+ * @param currentBudgetId 当前生效的不确定度预算版本 ID；从未登记预算为 null（空预算，合成不确定度视为 0）
  * @param createdAt      提交时间（UTC）
  */
 public record Measurement(
@@ -33,6 +35,8 @@ public record Measurement(
         BigDecimal computedValue,
         boolean passed,
         MeasurementStatus status,
+        long version,
+        Long currentBudgetId,
         Instant createdAt) {
 
     /**
