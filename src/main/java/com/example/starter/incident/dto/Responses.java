@@ -78,4 +78,26 @@ public final class Responses {
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
     }
+
+    /**
+     * 单个通报机构视图（机构排序稳定，按 agencyKey 升序）。
+     * firstRequestId/signer/receivedAt 仅首份有效回执有值，无回执为空；
+     * overdue 按查询时刻（注入 Clock）评估：无有效回执且当前时刻 ≥ ackDeadline 即为逾期
+     * （恰好到期算逾期）；critical 标识关键机构。
+     */
+    public record AgencyAckView(String agencyKey, boolean critical, Instant ackDeadline,
+                                String firstRequestId, String signer, Instant receivedAt,
+                                boolean acknowledged, boolean overdue) {
+    }
+
+    /**
+     * 通报视图：agencies 按 agencyKey 稳定排序；
+     * acknowledgedCount 为已有首份有效回执的机构数（重复报文不增加）；
+     * overdueCritical 为当前逾期未回执的关键机构（降级门禁缺失清单）；
+     * followUp 为当前逾期未回执的普通机构（只进待跟进清单）。
+     */
+    public record NotificationView(long id, Long escalationId, int totalCount, int acknowledgedCount,
+                                   List<AgencyAckView> agencies, List<String> overdueCritical,
+                                   List<String> followUp) {
+    }
 }

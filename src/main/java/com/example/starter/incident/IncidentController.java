@@ -3,6 +3,7 @@ package com.example.starter.incident;
 import com.example.starter.incident.dto.Requests.ActionRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
 import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
+import com.example.starter.incident.dto.Requests.NotificationAckRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
@@ -16,6 +17,7 @@ import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
 import com.example.starter.incident.dto.Responses.IncidentTasksView;
 import com.example.starter.incident.dto.Responses.IncidentView;
+import com.example.starter.incident.dto.Responses.NotificationView;
 import com.example.starter.incident.dto.Responses.TaskView;
 import com.example.starter.incident.dto.Responses.TransferView;
 import org.springframework.http.HttpStatus;
@@ -91,6 +93,24 @@ public class IncidentController {
                                                 @RequestHeader("X-Actor-Id") String actor,
                                                 @RequestBody EscalationAckRequest req) {
         return service.acknowledgeEscalation(incidentKey, actor, req);
+    }
+
+    /**
+     * 查询外部通报回执：每机构首份有效回执、逾期状态与缺失清单，机构按键稳定排序。
+     */
+    @GetMapping("/{incidentKey}/notifications")
+    public NotificationView notificationStatus(@PathVariable String incidentKey) {
+        return service.notificationStatus(incidentKey);
+    }
+
+    /**
+     * 录入外部机构回执：按机构仅计首份有效回执；requestId 同键重放首次响应，
+     * 换机构或内容返回 409。
+     */
+    @PostMapping("/{incidentKey}/notifications/ack")
+    public NotificationView recordNotificationAck(@PathVariable String incidentKey,
+                                                  @RequestBody NotificationAckRequest req) {
+        return service.recordNotificationAck(incidentKey, req).view();
     }
 
     /**

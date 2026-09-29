@@ -100,3 +100,38 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
 );
+
+CREATE TABLE IF NOT EXISTS incident_notifications (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    escalation_id BIGINT NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_notification_incident UNIQUE (incident_id),
+    CONSTRAINT uk_notification_escalation UNIQUE (escalation_id)
+);
+
+CREATE TABLE IF NOT EXISTS incident_notification_agencies (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    notification_id BIGINT NOT NULL,
+    agency_key VARCHAR(128) NOT NULL,
+    critical BOOLEAN NOT NULL,
+    ack_deadline TIMESTAMP(6) NOT NULL,
+    first_request_id VARCHAR(128) NULL,
+    signer VARCHAR(128) NULL,
+    received_at TIMESTAMP(6) NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_notification_agency UNIQUE (notification_id, agency_key)
+);
+
+CREATE TABLE IF NOT EXISTS incident_notification_acks (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    agency_notification_id BIGINT NOT NULL,
+    request_id VARCHAR(128) NOT NULL,
+    signer VARCHAR(128) NOT NULL,
+    content VARCHAR(1024) NOT NULL,
+    received_at TIMESTAMP(6) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_ack_request UNIQUE (request_id)
+);
