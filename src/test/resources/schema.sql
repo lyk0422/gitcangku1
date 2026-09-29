@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS idempotency_record (
 );
 COMMENT ON TABLE idempotency_record IS '写操作幂等记录，仅缓存成功结果，失败不缓存可重试';
 COMMENT ON COLUMN idempotency_record.id IS '主键';
-COMMENT ON COLUMN idempotency_record.op_type IS '操作类型：CREATE / UPDATE / PUBLISH / CANCEL / RESCHEDULE';
+COMMENT ON COLUMN idempotency_record.op_type IS '操作类型：CREATE / UPDATE / PUBLISH / CANCEL / RESTORE / RESCHEDULE / WORKBLOCK / BATCH_RESCHEDULE';
 COMMENT ON COLUMN idempotency_record.request_key IS '客户端幂等键，同一操作类型内唯一';
 COMMENT ON COLUMN idempotency_record.request_hash IS '请求参数规范化后的 SHA-256，同键不同参判定 409';
 COMMENT ON COLUMN idempotency_record.response_json IS '首次成功响应快照（JSON），重放原样返回';
@@ -79,7 +79,51 @@ CREATE TABLE IF NOT EXISTS publish_lock (
     id INT NOT NULL,
     PRIMARY KEY (id)
 );
-COMMENT ON TABLE publish_lock IS '发布/改签全局互斥锁，保证并发发布与改签按事务提交顺序裁决';
-COMMENT ON COLUMN publish_lock.id IS '锁行 id，固定为 1，发布与改签时 SELECT ... FOR UPDATE 串行化';
+COMMENT ON TABLE publish_lock IS '发布/改签/封锁全局互斥锁，保证并发写按事务提交顺序裁决';
+COMMENT ON COLUMN publish_lock.id IS '锁行 id，固定为 1，发布、改签、恢复与封锁登记时 SELECT ... FOR UPDATE 串行化';
 
 MERGE INTO publish_lock KEY(id) VALUES (1);
+
+CREATE TABLE IF NOT EXISTS rail_work_block (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    block_key VARCHAR(64) NOT NULL,
+    op_date DATE NOT NULL,
+    section_id VARCHAR(64) NOT NULL,
+    start_utc BIGINT NOT NULL,
+    end_utc BIGINT NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    created_at BIGINT NOT NULL,
+    updated_at BIGINT NOT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT uk_rail_work_block_key UNIQUE (block_key)
+);
+COMMENT ON TABLE rail_work_block IS '区段维护封锁窗口表，登记事务全部相交计划处理完成后才插入 ACTIVE 记录';
+COMMENT ON COLUMN rail_work_block.id IS '主键';
+COMMENT ON COLUMN rail_work_block.block_key IS '封锁业务键，全局唯一';
+COMMENT ON COLUMN rail_work_block.op_date IS '运营日期（Asia/Shanghai 日历日），封锁窗口必须完全落在该日内';
+COMMENT ON COLUMN rail_work_block.section_id IS '被封锁区段 ID';
+COMMENT ON COLUMN rail_work_block.start_utc IS '封锁开始时刻（含），UTC 毫秒';
+COMMENT ON COLUMN rail_work_block.end_utc IS '封锁结束时刻（不含），UTC 毫秒，必须大于 start_utc；相邻端点不冲突';
+COMMENT ON COLUMN rail_work_block.status IS '封锁状态：ACTIVE 已生效（登记失败后无记录，无中间状态）';
+COMMENT ON COLUMN rail_work_block.created_at IS '创建时刻，UTC 毫秒';
+COMMENT ON COLUMN rail_work_block.updated_at IS '最近变更时刻，UTC 毫秒';
+CREATE INDEX IF NOT EXISTS idx_rail_work_block_lookup
+    ON rail_work_block (op_date, section_id, status, start_utc);
+
+CREATE TABLE IF NOT EXISTS rail_work_block_action (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    block_id BIGINT NOT NULL,
+    plan_id BIGINT NOT NULL,
+    action VARCHAR(16) NOT NULL,
+    successor_plan_id BIGINT,
+    created_at BIGINT NOT NULL,
+    PRIMARY KEY (id)
+);
+COMMENT ON TABLE rail_work_block_action IS '封锁登记事务内对受影响计划的处理结果，追加后不可变；原计划历史区段时段保留不改写';
+COMMENT ON COLUMN rail_work_block_action.id IS '主键';
+COMMENT ON COLUMN rail_work_block_action.block_id IS '所属封锁 id，关联 rail_work_block.id';
+COMMENT ON COLUMN rail_work_block_action.plan_id IS '被处理的原计划 id，关联 rail_day_plan.id；处理后该计划为 CANCELLED 且占用保留';
+COMMENT ON COLUMN rail_work_block_action.action IS '实际动作：CANCELLED 撤销 / RESCHEDULED 整单改签';
+COMMENT ON COLUMN rail_work_block_action.successor_plan_id IS '改签后继新计划 id，关联 rail_day_plan.id；撤销时为 NULL';
+COMMENT ON COLUMN rail_work_block_action.created_at IS '记录创建时刻，UTC 毫秒';
+CREATE INDEX IF NOT EXISTS idx_rail_work_block_action_block ON rail_work_block_action (block_id);

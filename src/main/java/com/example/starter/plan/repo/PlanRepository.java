@@ -219,4 +219,31 @@ public class PlanRepository {
     public void acquirePublishLock() {
         jdbc.queryForObject("SELECT id FROM publish_lock WHERE id = 1 FOR UPDATE", Integer.class);
     }
+
+    /**
+     * 查询同运营日、同区段上占用与给定 UTC 窗口 [startUtc, endUtc) 按左闭右开相交的全部已发布计划
+     * （相邻端点不算相交），按计划 id 升序；excludePlanIds 中的计划不参与。
+     */
+    public List<DayPlan> findPublishedPlansOccupying(LocalDate opDate, String sectionId,
+                                                     Instant startUtc, Instant endUtc,
+                                                     Collection<Long> excludePlanIds) {
+        StringBuilder sql = new StringBuilder(
+                "SELECT DISTINCT p.id, p.schedule_key, p.op_date, p.version, p.status"
+                        + " FROM rail_day_plan p JOIN rail_plan_occupancy o ON o.plan_id = p.id"
+                        + " WHERE p.status = 'PUBLISHED' AND p.op_date = ? AND o.section_id = ?"
+                        + " AND o.start_utc < ? AND ? < o.end_utc");
+        List<Object> args = new ArrayList<>();
+        args.add(Date.valueOf(opDate));
+        args.add(sectionId);
+        args.add(endUtc.toEpochMilli());
+        args.add(startUtc.toEpochMilli());
+        if (!excludePlanIds.isEmpty()) {
+            StringJoiner placeholders = new StringJoiner(", ");
+            excludePlanIds.forEach(id -> placeholders.add("?"));
+            sql.append(" AND p.id NOT IN (").append(placeholders).append(')');
+            args.addAll(excludePlanIds);
+        }
+        sql.append(" ORDER BY p.id");
+        return jdbc.query(sql.toString(), PLAN_MAPPER, args.toArray());
+    }
 }

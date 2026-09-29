@@ -4,6 +4,7 @@ import com.example.starter.plan.service.PlanService;
 import com.example.starter.plan.web.dto.CreatePlanRequest;
 import com.example.starter.plan.web.dto.PlanActionRequest;
 import com.example.starter.plan.web.dto.PlanResponse;
+import com.example.starter.plan.web.dto.PlanRestoreRequest;
 import com.example.starter.plan.web.dto.PublishedSlotView;
 import com.example.starter.plan.web.dto.RescheduleChainResponse;
 import com.example.starter.plan.web.dto.RescheduleRequest;
@@ -94,6 +95,15 @@ public class PlanController {
     @GetMapping("/plans/{scheduleKey}/reschedule-chain")
     public RescheduleChainResponse getRescheduleChain(@PathVariable String scheduleKey) {
         return service.getRescheduleChain(scheduleKey);
+    }
+
+    /**
+     * 恢复已撤销计划：锁内裁决时隙与封锁窗口冲突后回到已发布，有冲突返回 422。
+     */
+    @PostMapping("/plans/{scheduleKey}/restore")
+    public PlanResponse restore(@PathVariable String scheduleKey,
+                                @Valid @RequestBody PlanRestoreRequest request) {
+        return service.restore(scheduleKey, request.requestKey());
     }
 
     /**

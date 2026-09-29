@@ -3,7 +3,6 @@ package com.example.starter.plan.service;
 import com.example.starter.plan.model.DayPlan;
 import com.example.starter.plan.model.Occupancy;
 import com.example.starter.plan.model.PlanStatus;
-import com.example.starter.plan.model.PublishedSlot;
 import com.example.starter.plan.model.RescheduleLink;
 import com.example.starter.plan.repo.IdempotencyRepository;
 import com.example.starter.plan.repo.PlanRepository;
@@ -57,17 +56,21 @@ public class PlanService {
     private static final String OP_PUBLISH = "PUBLISH";
     private static final String OP_CANCEL = "CANCEL";
     private static final String OP_RESCHEDULE = "RESCHEDULE";
+    private static final String OP_RESTORE = "RESTORE";
 
     private final PlanRepository planRepo;
     private final IdempotencyRepository idemRepo;
     private final ObjectMapper objectMapper;
+    private final SlotConflictSupport conflicts;
     private final TransactionTemplate tx;
 
     public PlanService(PlanRepository planRepo, IdempotencyRepository idemRepo,
-                       ObjectMapper objectMapper, PlatformTransactionManager txManager) {
+                       ObjectMapper objectMapper, SlotConflictSupport conflicts,
+                       PlatformTransactionManager txManager) {
         this.planRepo = planRepo;
         this.idemRepo = idemRepo;
         this.objectMapper = objectMapper;
+        this.conflicts = conflicts;
         this.tx = new TransactionTemplate(txManager);
     }
 
@@ -147,6 +150,10 @@ public class PlanService {
         try {
             return tx.execute(status -> {
                 planRepo.acquirePublishLock();
+                Optional<PlanResponse> lockedReplay = replayIfPresent(OP_PUBLISH, requestKey, hash);
+                if (lockedReplay.isPresent()) {
+                    return lockedReplay.get();
+                }
                 DayPlan plan = planRepo.findByKeyForUpdate(scheduleKey)
                         .orElseThrow(() -> notFound(scheduleKey));
                 if (plan.status() != PlanStatus.DRAFT) {
@@ -154,12 +161,13 @@ public class PlanService {
                             "仅草稿可发布，当前状态: " + plan.status());
                 }
                 List<Occupancy> occupancies = planRepo.findOccupancies(plan.id());
-                List<Map<String, Object>> conflicts = new ArrayList<>();
-                conflicts.addAll(findTrainOverlaps(scheduleKey, occupancies));
-                conflicts.addAll(findSectionConflicts(plan, occupancies, List.of(plan.id())));
-                if (!conflicts.isEmpty()) {
+                List<Map<String, Object>> conflictList = new ArrayList<>();
+                conflictList.addAll(conflicts.trainOverlaps(scheduleKey, occupancies));
+                conflictList.addAll(conflicts.sectionConflicts(plan, occupancies, List.of(plan.id())));
+                conflictList.addAll(conflicts.blockConflicts(plan.opDate(), scheduleKey, occupancies));
+                if (!conflictList.isEmpty()) {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
-                            "存在时隙冲突，计划保持草稿", conflicts);
+                            "存在时隙冲突，计划保持草稿", conflictList);
                 }
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(plan.id(), PlanStatus.PUBLISHED, now);
@@ -218,54 +226,15 @@ public class PlanService {
         try {
             return tx.execute(status -> {
                 planRepo.acquirePublishLock();
-                DayPlan oldPlan = planRepo.findByKeyForUpdate(oldScheduleKey)
-                        .orElseThrow(() -> notFound(oldScheduleKey));
-                DayPlan newPlan = planRepo.findByKeyForUpdate(req.newScheduleKey())
-                        .orElseThrow(() -> notFound(req.newScheduleKey()));
-                if (oldPlan.status() != PlanStatus.PUBLISHED) {
-                    throw conflict("PLAN_STATE_CONFLICT",
-                            "仅已发布计划可改签，旧计划当前状态: " + oldPlan.status());
+                Optional<RescheduleResponse> lockedReplay =
+                        replayIfPresent(OP_RESCHEDULE, req.requestKey(), hash, RescheduleResponse.class);
+                if (lockedReplay.isPresent()) {
+                    return lockedReplay.get();
                 }
-                if (newPlan.status() != PlanStatus.DRAFT) {
-                    throw conflict("PLAN_STATE_CONFLICT",
-                            "改签新计划必须为草稿，当前状态: " + newPlan.status());
-                }
-                if (req.expectedOldVersion() != oldPlan.version()) {
-                    throw conflict("VERSION_CONFLICT",
-                            "expectedOldVersion=" + req.expectedOldVersion()
-                                    + " 与旧计划当前版本 " + oldPlan.version() + " 不一致");
-                }
-                if (req.expectedNewVersion() != newPlan.version()) {
-                    throw conflict("VERSION_CONFLICT",
-                            "expectedNewVersion=" + req.expectedNewVersion()
-                                    + " 与新计划当前版本 " + newPlan.version() + " 不一致");
-                }
-                if (!oldPlan.opDate().equals(newPlan.opDate())) {
-                    throw conflict("OP_DATE_MISMATCH",
-                            "新旧计划运营日必须相同: 旧=" + oldPlan.opDate() + " 新=" + newPlan.opDate());
-                }
-                if (planRepo.findLinkByPredecessor(oldPlan.id()).isPresent()) {
-                    throw conflict("LINK_CONFLICT", "旧计划已存在直接后继: " + oldScheduleKey);
-                }
-                if (planRepo.findLinkBySuccessor(newPlan.id()).isPresent()) {
-                    throw conflict("LINK_CONFLICT", "新计划已存在直接前驱: " + req.newScheduleKey());
-                }
-                List<Occupancy> occupancies = planRepo.findOccupancies(newPlan.id());
-                List<Map<String, Object>> conflicts = new ArrayList<>();
-                conflicts.addAll(findTrainOverlaps(req.newScheduleKey(), occupancies));
-                // 仅排除旧计划与自身占用，第三方已发布计划照常参与冲突裁决
-                conflicts.addAll(findSectionConflicts(newPlan, occupancies,
-                        List.of(newPlan.id(), oldPlan.id())));
-                if (!conflicts.isEmpty()) {
-                    throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
-                            "新草稿存在时隙冲突，改签未生效", conflicts);
-                }
+                RescheduleResponse response = applyRescheduleInTx(oldScheduleKey,
+                        req.newScheduleKey(), req.expectedOldVersion(), req.expectedNewVersion(),
+                        List.of());
                 long now = System.currentTimeMillis();
-                planRepo.updateStatus(oldPlan.id(), PlanStatus.CANCELLED, now);
-                planRepo.updateStatus(newPlan.id(), PlanStatus.PUBLISHED, now);
-                planRepo.insertRescheduleLink(oldPlan.id(), newPlan.id(), now);
-                RescheduleResponse response = new RescheduleResponse(
-                        loadPlan(oldScheduleKey), loadPlan(req.newScheduleKey()));
                 idemRepo.insert(OP_RESCHEDULE, req.requestKey(), hash, toJson(response), now);
                 return response;
             });
@@ -273,6 +242,115 @@ public class PlanService {
             return replayIfPresent(OP_RESCHEDULE, req.requestKey(), hash, RescheduleResponse.class)
                     .orElseThrow(() -> conflict("LINK_CONFLICT", "改签前后继关联冲突"));
         }
+    }
+
+    /**
+     * 恢复已撤销（CANCELLED）计划：全局发布锁内原子裁决列车内部、跨计划区段与封锁窗口冲突，
+     * 通过后状态改回 PUBLISHED，历史占用与版本不变；有冲突返回 422，计划保持 CANCELLED。
+     * 已被整单改签的旧计划同样走此入口；若其原时段落入封锁窗口则返回 422。
+     */
+    public PlanResponse restore(String scheduleKey, String requestKey) {
+        String hash = hashAction(OP_RESTORE, scheduleKey);
+        Optional<PlanResponse> replay = replayIfPresent(OP_RESTORE, requestKey, hash);
+        if (replay.isPresent()) {
+            return replay.get();
+        }
+        try {
+            return tx.execute(status -> {
+                planRepo.acquirePublishLock();
+                Optional<PlanResponse> lockedReplay = replayIfPresent(OP_RESTORE, requestKey, hash);
+                if (lockedReplay.isPresent()) {
+                    return lockedReplay.get();
+                }
+                DayPlan plan = planRepo.findByKeyForUpdate(scheduleKey)
+                        .orElseThrow(() -> notFound(scheduleKey));
+                if (plan.status() != PlanStatus.CANCELLED) {
+                    throw conflict("PLAN_STATE_CONFLICT",
+                            "仅已取消计划可恢复，当前状态: " + plan.status());
+                }
+                List<Occupancy> occupancies = planRepo.findOccupancies(plan.id());
+                List<Map<String, Object>> conflictList = new ArrayList<>();
+                conflictList.addAll(conflicts.trainOverlaps(scheduleKey, occupancies));
+                conflictList.addAll(conflicts.sectionConflicts(plan, occupancies, List.of(plan.id())));
+                conflictList.addAll(conflicts.blockConflicts(plan.opDate(), scheduleKey, occupancies));
+                if (!conflictList.isEmpty()) {
+                    throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
+                            "恢复计划存在时隙冲突，计划保持已取消", conflictList);
+                }
+                long now = System.currentTimeMillis();
+                planRepo.updateStatus(plan.id(), PlanStatus.PUBLISHED, now);
+                PlanResponse response = loadPlan(scheduleKey);
+                idemRepo.insert(OP_RESTORE, requestKey, hash, toJson(response), now);
+                return response;
+            });
+        } catch (DuplicateKeyException e) {
+            return resolveDuplicate(OP_RESTORE, requestKey, hash);
+        }
+    }
+
+    /**
+     * 在调用方事务（已持有全局发布锁）内执行单条改签，供封锁登记与批量改签复用：
+     * 不做幂等处理、不再加全局锁；跨计划冲突检测始终排除本条新旧计划，
+     * 并额外排除 extraExcludePlanIds（同事务内其他新旧计划），
+     * 同时裁决与已生效封锁窗口的冲突。任一冲突抛出 422，由调用方事务整体回滚。
+     */
+    public RescheduleResponse applyRescheduleInTx(String oldScheduleKey, String newScheduleKey,
+                                                  Integer expectedOldVersion,
+                                                  Integer expectedNewVersion,
+                                                  List<Long> extraExcludePlanIds) {
+        if (oldScheduleKey.equals(newScheduleKey)) {
+            throw badRequest("新旧计划必须不同: " + oldScheduleKey);
+        }
+        DayPlan oldPlan = planRepo.findByKeyForUpdate(oldScheduleKey)
+                .orElseThrow(() -> notFound(oldScheduleKey));
+        DayPlan newPlan = planRepo.findByKeyForUpdate(newScheduleKey)
+                .orElseThrow(() -> notFound(newScheduleKey));
+        if (oldPlan.status() != PlanStatus.PUBLISHED) {
+            throw conflict("PLAN_STATE_CONFLICT",
+                    "仅已发布计划可改签，旧计划当前状态: " + oldPlan.status());
+        }
+        if (newPlan.status() != PlanStatus.DRAFT) {
+            throw conflict("PLAN_STATE_CONFLICT",
+                    "改签新计划必须为草稿，当前状态: " + newPlan.status());
+        }
+        if (expectedOldVersion != null && expectedOldVersion != oldPlan.version()) {
+            throw conflict("VERSION_CONFLICT",
+                    "expectedOldVersion=" + expectedOldVersion
+                            + " 与旧计划当前版本 " + oldPlan.version() + " 不一致");
+        }
+        if (expectedNewVersion != null && expectedNewVersion != newPlan.version()) {
+            throw conflict("VERSION_CONFLICT",
+                    "expectedNewVersion=" + expectedNewVersion
+                            + " 与新计划当前版本 " + newPlan.version() + " 不一致");
+        }
+        if (!oldPlan.opDate().equals(newPlan.opDate())) {
+            throw conflict("OP_DATE_MISMATCH",
+                    "新旧计划运营日必须相同: 旧=" + oldPlan.opDate() + " 新=" + newPlan.opDate());
+        }
+        if (planRepo.findLinkByPredecessor(oldPlan.id()).isPresent()) {
+            throw conflict("LINK_CONFLICT", "旧计划已存在直接后继: " + oldScheduleKey);
+        }
+        if (planRepo.findLinkBySuccessor(newPlan.id()).isPresent()) {
+            throw conflict("LINK_CONFLICT", "新计划已存在直接前驱: " + newScheduleKey);
+        }
+        List<Occupancy> occupancies = planRepo.findOccupancies(newPlan.id());
+        List<Long> excludeIds = new ArrayList<>();
+        excludeIds.add(newPlan.id());
+        excludeIds.add(oldPlan.id());
+        excludeIds.addAll(extraExcludePlanIds);
+        List<Map<String, Object>> conflictList = new ArrayList<>();
+        conflictList.addAll(conflicts.trainOverlaps(newScheduleKey, occupancies));
+        conflictList.addAll(conflicts.sectionConflicts(newPlan, occupancies, excludeIds));
+        conflictList.addAll(conflicts.blockConflicts(newPlan.opDate(), newScheduleKey, occupancies));
+        if (!conflictList.isEmpty()) {
+            throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
+                    "新草稿占用封锁区段或存在其他时隙冲突", conflictList);
+        }
+        long now = System.currentTimeMillis();
+        planRepo.updateStatus(oldPlan.id(), PlanStatus.CANCELLED, now);
+        planRepo.updateStatus(newPlan.id(), PlanStatus.PUBLISHED, now);
+        planRepo.insertRescheduleLink(oldPlan.id(), newPlan.id(), now);
+        return new RescheduleResponse(loadPlan(oldScheduleKey), loadPlan(newScheduleKey));
     }
 
     /**
@@ -335,6 +413,23 @@ public class PlanService {
 
     // ---------- 内部实现 ----------
 
+    /**
+     * 供同包封锁服务拼装查询结果的计划快照（含历史占用），不存在抛 404。
+     */
+    PlanResponse loadPlanSnapshot(String scheduleKey) {
+        return loadPlan(scheduleKey);
+    }
+
+    /**
+     * 在调用方事务内按给定时刻落库一次改签（旧取消、新发布、追加不可变关联），
+     * 调用方须已完成全部状态、版本、关联与时隙冲突校验。
+     */
+    void applyRescheduleCommit(DayPlan oldPlan, DayPlan newPlan, long nowMillis) {
+        planRepo.updateStatus(oldPlan.id(), PlanStatus.CANCELLED, nowMillis);
+        planRepo.updateStatus(newPlan.id(), PlanStatus.PUBLISHED, nowMillis);
+        planRepo.insertRescheduleLink(oldPlan.id(), newPlan.id(), nowMillis);
+    }
+
     private PlanResponse loadPlan(String scheduleKey) {
         DayPlan plan = planRepo.findByKey(scheduleKey)
                 .orElseThrow(() -> notFound(scheduleKey));
@@ -383,73 +478,6 @@ public class PlanService {
                 throw badRequest("第 " + i + " 条占用不在运营日 " + opDate + "（Asia/Shanghai）内");
             }
         }
-    }
-
-    /**
-     * 本计划内同一列车的重叠占用检测（左闭右开，相邻合法）。
-     */
-    private List<Map<String, Object>> findTrainOverlaps(String scheduleKey, List<Occupancy> occupancies) {
-        List<Map<String, Object>> conflicts = new ArrayList<>();
-        Map<String, List<Occupancy>> byTrain = new LinkedHashMap<>();
-        for (Occupancy o : occupancies) {
-            byTrain.computeIfAbsent(o.trainNo(), k -> new ArrayList<>()).add(o);
-        }
-        byTrain.forEach((trainNo, list) -> {
-            List<Occupancy> sorted = list.stream()
-                    .sorted(Comparator.comparing(Occupancy::startUtc)).toList();
-            for (int i = 1; i < sorted.size(); i++) {
-                Occupancy prev = sorted.get(i - 1);
-                Occupancy cur = sorted.get(i);
-                if (cur.startUtc().isBefore(prev.endUtc())) {
-                    Map<String, Object> detail = new LinkedHashMap<>();
-                    detail.put("type", "TRAIN_OVERLAP");
-                    detail.put("scheduleKey", scheduleKey);
-                    detail.put("trainNo", trainNo);
-                    detail.put("sectionId", cur.sectionId());
-                    detail.put("startUtc", cur.startUtc().toString());
-                    detail.put("endUtc", cur.endUtc().toString());
-                    conflicts.add(detail);
-                }
-            }
-        });
-        return conflicts;
-    }
-
-    /**
-     * 与其他已发布计划在同日期、同区段上的重叠检测（左闭右开，相邻合法）。
-     *
-     * @param excludePlanIds 检测时排除的计划 id（发布为自身；改签为新旧两个计划）
-     */
-    private List<Map<String, Object>> findSectionConflicts(DayPlan plan, List<Occupancy> occupancies,
-                                                           List<Long> excludePlanIds) {
-        List<String> sectionIds = occupancies.stream()
-                .map(Occupancy::sectionId)
-                .collect(java.util.stream.Collectors.toCollection(TreeSet::new))
-                .stream().toList();
-        List<PublishedSlot> published = planRepo.findPublishedSlots(plan.opDate(), sectionIds,
-                excludePlanIds);
-        List<Map<String, Object>> conflicts = new ArrayList<>();
-        for (Occupancy o : occupancies) {
-            for (PublishedSlot slot : published) {
-                if (!o.sectionId().equals(slot.sectionId())) {
-                    continue;
-                }
-                boolean overlap = o.startUtc().isBefore(slot.endUtc())
-                        && slot.startUtc().isBefore(o.endUtc());
-                if (overlap) {
-                    Map<String, Object> detail = new LinkedHashMap<>();
-                    detail.put("type", "SECTION_CONFLICT");
-                    detail.put("sectionId", o.sectionId());
-                    detail.put("scheduleKey", plan.scheduleKey());
-                    detail.put("conflictingScheduleKey", slot.scheduleKey());
-                    detail.put("trainNo", o.trainNo());
-                    detail.put("startUtc", o.startUtc().toString());
-                    detail.put("endUtc", o.endUtc().toString());
-                    conflicts.add(detail);
-                }
-            }
-        }
-        return conflicts;
     }
 
     /**
