@@ -78,15 +78,17 @@ public class BatchService {
         if (new HashSet<>(items).size() != items.size()) {
             throw ApiException.badRequest("requiredTests 存在重复检验项");
         }
+        java.math.BigDecimal toleranceLimit = resolveToleranceLimit(req.toleranceLimit());
         String fingerprint = fingerprint("create", req.batchKey(), req.productCode(), req.batchNo(),
-                req.producedAt().toString(), String.join(SEP, items));
+                req.producedAt().toString(), String.join(SEP, items), toleranceLimit.toPlainString());
         return executeIdempotent(CMD_CREATE, req.commandKey(), fingerprint, () -> {
             repo.findBatch(req.batchKey()).ifPresent(b -> {
                 throw ApiException.conflict("batchKey 已存在: " + req.batchKey());
             });
             String now = now();
             repo.insertBatch(new BatchRepository.BatchRow(0L, req.batchKey(), req.productCode(),
-                    req.batchNo(), req.producedAt().toString(), BatchStatus.QUARANTINED.name(), now));
+                    req.batchNo(), req.producedAt().toString(), BatchStatus.QUARANTINED.name(),
+                    toleranceLimit, now));
             for (int i = 0; i < items.size(); i++) {
                 repo.insertRequiredTest(req.batchKey(), items.get(i), i + 1);
             }
@@ -459,7 +461,8 @@ public class BatchService {
             for (int i = 0; i < children.size(); i++) {
                 SplitRequest.ChildSpec spec = children.get(i);
                 repo.insertBatch(new BatchRepository.BatchRow(0L, spec.batchKey(), parent.productCode(),
-                        spec.batchNo(), parent.producedAt(), BatchStatus.QUARANTINED.name(), now));
+                        spec.batchNo(), parent.producedAt(), BatchStatus.QUARANTINED.name(),
+                        parent.toleranceLimit(), now));
                 for (int j = 0; j < required.size(); j++) {
                     repo.insertRequiredTest(spec.batchKey(), required.get(j), j + 1);
                 }
@@ -574,5 +577,18 @@ public class BatchService {
         return new LineageEntryResponse(row.batchKey(), row.batchNo(),
                 BatchStatus.valueOf(row.status()),
                 recalledAncestor(batchKey, parentOf, recalled).orElse(null));
+    }
+
+    /**
+     * 解析建批时冻结的产率偏差允许上限：为空按默认 0.500；负数返回 400；统一三位小数。
+     */
+    private java.math.BigDecimal resolveToleranceLimit(java.math.BigDecimal requested) {
+        java.math.BigDecimal limit = requested == null
+                ? new java.math.BigDecimal("0.500")
+                : YieldCalculator.normalize(requested);
+        if (limit.signum() < 0) {
+            throw ApiException.badRequest("toleranceLimit 不能为负");
+        }
+        return limit;
     }
 }
