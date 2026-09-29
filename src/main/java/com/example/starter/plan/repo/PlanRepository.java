@@ -219,4 +219,33 @@ public class PlanRepository {
     public void acquirePublishLock() {
         jdbc.queryForObject("SELECT id FROM publish_lock WHERE id = 1 FOR UPDATE", Integer.class);
     }
+
+    /**
+     * 查询指定运营日、指定区段上与 [startUtc, endUtc) 相交的已发布计划占用
+     * （左闭右开：o.start &lt; end 且 start &lt; o.end，相邻端点不算），按计划 id、开始时刻排序。
+     *
+     * @param excludePlanIds 排除的计划 id（如同事务内即将被取消/改签的受影响计划）
+     */
+    public List<Occupancy> findPublishedOccupanciesInWindow(LocalDate opDate, String sectionId,
+                                                            Instant startUtc, Instant endUtc,
+                                                            Collection<Long> excludePlanIds) {
+        StringBuilder sql = new StringBuilder(
+                "SELECT o.id, o.plan_id, o.seq, o.train_no, o.section_id, o.start_utc, o.end_utc"
+                        + " FROM rail_plan_occupancy o JOIN rail_day_plan p ON p.id = o.plan_id"
+                        + " WHERE p.status = 'PUBLISHED' AND p.op_date = ? AND o.section_id = ?"
+                        + " AND o.start_utc < ? AND ? < o.end_utc");
+        List<Object> args = new ArrayList<>();
+        args.add(Date.valueOf(opDate));
+        args.add(sectionId);
+        args.add(endUtc.toEpochMilli());
+        args.add(startUtc.toEpochMilli());
+        if (!excludePlanIds.isEmpty()) {
+            StringJoiner excludePlaceholders = new StringJoiner(", ");
+            excludePlanIds.forEach(id -> excludePlaceholders.add("?"));
+            sql.append(" AND p.id NOT IN (").append(excludePlaceholders).append(')');
+            args.addAll(excludePlanIds);
+        }
+        sql.append(" ORDER BY o.plan_id, o.start_utc, o.id");
+        return jdbc.query(sql.toString(), OCCUPANCY_MAPPER, args.toArray());
+    }
 }
