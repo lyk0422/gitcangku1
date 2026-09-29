@@ -71,6 +71,17 @@ public class ConsentRepository {
         return rows.stream().findFirst();
     }
 
+    /**
+     * 当前读授权代次行并加行锁（须在事务内调用）：与撤回操作按提交顺序互斥裁决。
+     */
+    public Optional<GrantRow> findGrantForUpdate(String subjectKey, Purpose purpose, int epoch) {
+        List<GrantRow> rows = jdbc.query(
+                "SELECT subject_key, purpose, epoch, status FROM consent_grant"
+                        + " WHERE subject_key = ? AND purpose = ? AND epoch = ? FOR UPDATE",
+                GRANT_MAPPER, subjectKey, purpose.name(), epoch);
+        return rows.stream().findFirst();
+    }
+
     void insertGrant(String subjectKey, Purpose purpose, int epoch, String requestId) {
         jdbc.update(
                 "INSERT INTO consent_grant (subject_key, purpose, epoch, status, request_id)"
