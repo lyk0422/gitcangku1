@@ -44,7 +44,12 @@ class BatchSplitLineageTest {
     private JdbcTemplate jdbc;
 
     @BeforeEach
-    void cleanTables() {
+    void cleanTables() throws Exception {
+        jdbc.update("DELETE FROM release_certificate_snapshot");
+        jdbc.update("DELETE FROM batch_merge_lineage");
+        jdbc.update("DELETE FROM batch_certificate_binding");
+        jdbc.update("DELETE FROM declaration_prefix");
+        jdbc.update("DELETE FROM certificate_declaration");
         jdbc.update("DELETE FROM command_log");
         jdbc.update("DELETE FROM approval");
         jdbc.update("DELETE FROM recall");
@@ -52,7 +57,20 @@ class BatchSplitLineageTest {
         jdbc.update("DELETE FROM batch_required_test");
         jdbc.update("DELETE FROM batch_lineage");
         jdbc.update("DELETE FROM batch");
+        // 新门禁：发布覆盖父批批号（LOT-1）与拆分子批批号（LOT-/L/G 前缀）的宽有效期声明
+        declarationKey = "DECL-SPLIT-" + unique();
+        String declBody = "{\"commandKey\":\"CK-DECL-" + unique() + "\","
+                + "\"declarationKey\":\"" + declarationKey + "\",\"materialCode\":\"PROD-1\","
+                + "\"priority\":0,\"validFrom\":\"2000-01-01T00:00:00Z\","
+                + "\"validTo\":\"2100-01-01T00:00:00Z\","
+                + "\"allowedBatchNoPrefixes\":[\"LOT\",\"L\",\"G\"]}";
+        mockMvc.perform(post("/api/certificates/declarations")
+                        .header("X-Actor-Id", "supplier")
+                        .contentType(MediaType.APPLICATION_JSON).content(declBody))
+                .andExpect(status().isCreated());
     }
+
+    private String declarationKey;
 
     // ---------- 拆分主流程 ----------
 
@@ -560,6 +578,15 @@ class BatchSplitLineageTest {
         mockMvc.perform(post("/api/batches")
                         .contentType(MediaType.APPLICATION_JSON).content(createBody(batchKey, items)))
                 .andExpect(status().is(expected));
+        if (expected == 201) {
+            // 自动绑定宽有效期合格证声明，使放行流程满足新门禁；拆分子批随后继承该引用
+            mockMvc.perform(post("/api/batches/" + batchKey + "/certificate-bindings")
+                            .header("X-Actor-Id", "operator")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content("{\"commandKey\":\"CK-BIND-" + unique()
+                                    + "\",\"declarationKey\":\"" + declarationKey + "\"}"))
+                    .andExpect(status().isCreated());
+        }
     }
 
     /**

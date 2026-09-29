@@ -43,7 +43,12 @@ class BatchFlowTest {
     private JdbcTemplate jdbc;
 
     @BeforeEach
-    void cleanTables() {
+    void cleanTables() throws Exception {
+        jdbc.update("DELETE FROM release_certificate_snapshot");
+        jdbc.update("DELETE FROM batch_merge_lineage");
+        jdbc.update("DELETE FROM batch_certificate_binding");
+        jdbc.update("DELETE FROM declaration_prefix");
+        jdbc.update("DELETE FROM certificate_declaration");
         jdbc.update("DELETE FROM command_log");
         jdbc.update("DELETE FROM approval");
         jdbc.update("DELETE FROM recall");
@@ -51,7 +56,20 @@ class BatchFlowTest {
         jdbc.update("DELETE FROM batch_required_test");
         jdbc.update("DELETE FROM batch_lineage");
         jdbc.update("DELETE FROM batch");
+        // 既有放行流程现在强制合格证门禁：发布一条覆盖合成批号前缀（LOT/L/G）的宽有效期声明
+        declarationKey = "DECL-FLOW-" + unique();
+        String declBody = "{\"commandKey\":\"CK-DECL-" + unique() + "\","
+                + "\"declarationKey\":\"" + declarationKey + "\",\"materialCode\":\"PROD-1\","
+                + "\"priority\":0,\"validFrom\":\"2000-01-01T00:00:00Z\","
+                + "\"validTo\":\"2100-01-01T00:00:00Z\","
+                + "\"allowedBatchNoPrefixes\":[\"LOT\",\"L\",\"G\"]}";
+        mockMvc.perform(post("/api/certificates/declarations")
+                        .header("X-Actor-Id", "supplier")
+                        .contentType(MediaType.APPLICATION_JSON).content(declBody))
+                .andExpect(status().isCreated());
     }
+
+    private String declarationKey;
 
     // ---------- 主流程 ----------
 
@@ -512,6 +530,15 @@ class BatchFlowTest {
         mockMvc.perform(post("/api/batches")
                         .contentType(MediaType.APPLICATION_JSON).content(createBody(batchKey, items)))
                 .andExpect(status().is(expectedStatus));
+        if (expectedStatus == 201) {
+            // 自动绑定宽有效期合格证声明，使既有放行流程满足新门禁
+            mockMvc.perform(post("/api/batches/" + batchKey + "/certificate-bindings")
+                            .header("X-Actor-Id", "operator")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content("{\"commandKey\":\"CK-BIND-" + unique()
+                                    + "\",\"declarationKey\":\"" + declarationKey + "\"}"))
+                    .andExpect(status().isCreated());
+        }
     }
 
     private String testReq(String testKey, String item, String result, String inspector) throws Exception {

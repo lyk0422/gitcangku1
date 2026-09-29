@@ -3,8 +3,11 @@ package com.example.starter.batch;
 import com.example.starter.batch.dto.ApproveRequest;
 import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
+import com.example.starter.batch.dto.BindCertificateRequest;
+import com.example.starter.batch.dto.CertificateDiagnosticsResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
 import com.example.starter.batch.dto.LineageEntryResponse;
+import com.example.starter.batch.dto.MergeRequest;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
@@ -30,9 +33,11 @@ import java.util.List;
 public class BatchController {
 
     private final BatchService service;
+    private final CertificateService certificateService;
 
-    public BatchController(BatchService service) {
+    public BatchController(BatchService service, CertificateService certificateService) {
         this.service = service;
+        this.certificateService = certificateService;
     }
 
     /**
@@ -74,6 +79,15 @@ public class BatchController {
     }
 
     /**
+     * 合批：2～5 个全部可用的 RELEASED 父批合并为一个全新产物，父批置 MERGED。
+     */
+    @PostMapping("/merge")
+    public ResponseEntity<String> merge(@RequestHeader(name = "X-Actor-Id", required = false) String actorId,
+                                        @Valid @RequestBody MergeRequest request) {
+        return stored(service.merge(request, actorId));
+    }
+
+    /**
      * 当前可用批次：不含已召回批次。
      */
     @GetMapping("/available")
@@ -112,6 +126,25 @@ public class BatchController {
     @GetMapping("/{batchKey}/descendants")
     public List<LineageEntryResponse> descendants(@PathVariable String batchKey) {
         return service.listDescendants(batchKey);
+    }
+
+    /**
+     * 单批次绑定合格证声明版本：声明须与批次物料、批号前缀匹配且在绑定时点（UTC）有效。
+     */
+    @PostMapping("/{batchKey}/certificate-bindings")
+    public ResponseEntity<String> bindCertificate(@PathVariable String batchKey,
+                                                  @RequestHeader(name = "X-Actor-Id", required = false)
+                                                  String actorId,
+                                                  @Valid @RequestBody BindCertificateRequest request) {
+        return stored(certificateService.bindOne(batchKey, actorId, request));
+    }
+
+    /**
+     * 合格证放行门禁诊断：返回逐物料的实际值、要求值与差额，不改变状态。
+     */
+    @GetMapping("/{batchKey}/certificate-diagnostics")
+    public CertificateDiagnosticsResponse certificateDiagnostics(@PathVariable String batchKey) {
+        return certificateService.diagnostics(batchKey);
     }
 
     private ResponseEntity<String> stored(StoredResponse response) {
