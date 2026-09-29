@@ -12,6 +12,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 
+import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -45,6 +46,8 @@ class BatchFlowTest {
     @BeforeEach
     void cleanTables() {
         jdbc.update("DELETE FROM command_log");
+        jdbc.update("DELETE FROM yield_disposal");
+        jdbc.update("DELETE FROM yield_reconciliation");
         jdbc.update("DELETE FROM approval");
         jdbc.update("DELETE FROM recall");
         jdbc.update("DELETE FROM test_result");
@@ -70,6 +73,9 @@ class BatchFlowTest {
         assertEquals("QUARANTINED", currentStatus(batchKey));
         submitTest(batchKey, testReq("TK-3", "无菌", "PASS", "inspect-c"), null, null, 201);
         assertEquals("PENDING_RELEASE", currentStatus(batchKey));
+
+        // 放行前必须提交产率平衡核算：投料 100 全为合格产出，偏差 0，门禁通过
+        submitBalancedYield(batchKey);
 
         approve(batchKey, "qa-1", "QUALITY", "CK-AP-1", 201);
         assertEquals("RELEASE_REVIEW", currentStatus(batchKey));
@@ -135,6 +141,7 @@ class BatchFlowTest {
         approve(batchKey, "inspector-1", "QUALITY", "CK-A0", 422);
         assertEquals("PENDING_RELEASE", currentStatus(batchKey));
 
+        submitBalancedYield(batchKey);
         approve(batchKey, "qa-1", "QUALITY", "CK-A1", 201);
         // 重复角色
         approve(batchKey, "ops-1", "QUALITY", "CK-A2", 409);
@@ -231,7 +238,8 @@ class BatchFlowTest {
 
         // 同 commandKey 改参（批号不同）→ 409
         String changed = objectMapper.writeValueAsString(new CreateCmd("CK-1", batchKey + "-X",
-                "p", "n-changed", Instant.parse("2026-03-01T00:00:00Z"), List.of("t1")));
+                "p", "n-changed", Instant.parse("2026-03-01T00:00:00Z"), List.of("t1"),
+                new BigDecimal("0.500")));
         mockMvc.perform(post("/api/batches")
                         .contentType(MediaType.APPLICATION_JSON).content(changed))
                 .andExpect(status().isConflict());
@@ -284,6 +292,7 @@ class BatchFlowTest {
         String batchKey = "BK-CMD-" + unique();
         createBatch(batchKey, List.of("t1"), 201);
         submitTest(batchKey, testReq("TK-1", "t1", "PASS", "insp"), null, null, 201);
+        submitBalancedYield(batchKey);
 
         String body = "{\"commandKey\":\"CK-A1\"}";
         MvcResult first = mockMvc.perform(post("/api/batches/" + batchKey + "/approvals")
@@ -355,6 +364,7 @@ class BatchFlowTest {
         String batchKey = "BK-RACE-ACTOR-" + unique();
         createBatch(batchKey, List.of("t1"), 201);
         submitTest(batchKey, testReq("TK-1", "t1", "PASS", "insp"), null, null, 201);
+        submitBalancedYield(batchKey);
 
         List<Future<Integer>> results = runConcurrent(
                 () -> callStatus(post("/api/batches/" + batchKey + "/approvals")
@@ -403,6 +413,7 @@ class BatchFlowTest {
         String batchKey = "BK-RACE-RC-" + unique();
         createBatch(batchKey, List.of("t1"), 201);
         submitTest(batchKey, testReq("TK-1", "t1", "PASS", "insp"), null, null, 201);
+        submitBalancedYield(batchKey);
         approve(batchKey, "qa", "QUALITY", "CK-Q", 201);
 
         List<Future<Integer>> results = runConcurrent(
@@ -444,6 +455,7 @@ class BatchFlowTest {
         String batchKey = "BK-PERSIST-" + unique();
         createBatch(batchKey, List.of("t1"), 201);
         submitTest(batchKey, testReq("TK-1", "t1", "PASS", "insp"), null, null, 201);
+        submitBalancedYield(batchKey);
         approve(batchKey, "qa", "QUALITY", "CK-A1", 201);
         approve(batchKey, "ops", "OPERATIONS", "CK-A2", 201);
         recall(batchKey, "u", "原因", "CK-R1", 201);
@@ -496,7 +508,7 @@ class BatchFlowTest {
     // ---------- helpers ----------
 
     private record CreateCmd(String commandKey, String batchKey, String productCode, String batchNo,
-                             Instant producedAt, List<String> requiredTests) {
+                             Instant producedAt, List<String> requiredTests, BigDecimal deviationLimit) {
     }
 
     private String unique() {
@@ -505,13 +517,24 @@ class BatchFlowTest {
 
     private String createBody(String batchKey, List<String> items) throws Exception {
         return objectMapper.writeValueAsString(new CreateCmd("CK-1", batchKey, "PROD-1", "LOT-1",
-                Instant.parse("2026-01-02T03:04:05Z"), items));
+                Instant.parse("2026-01-02T03:04:05Z"), items, new BigDecimal("0.500")));
     }
 
     private void createBatch(String batchKey, List<String> items, int expectedStatus) throws Exception {
         mockMvc.perform(post("/api/batches")
                         .contentType(MediaType.APPLICATION_JSON).content(createBody(batchKey, items)))
                 .andExpect(status().is(expectedStatus));
+    }
+
+    /**
+     * 提交一次必然合格的产率核算（投料等于合格产出，偏差 0），解除放行前的产率门禁。
+     */
+    private void submitBalancedYield(String batchKey) throws Exception {
+        String body = "{\"requestId\":\"RY-" + unique() + "\",\"inputQty\":100.000,"
+                + "\"goodQty\":100.000,\"lossQty\":0.000,\"scrapQty\":0.000}";
+        mockMvc.perform(post("/api/batches/" + batchKey + "/yields")
+                        .contentType(MediaType.APPLICATION_JSON).content(body))
+                .andExpect(status().isCreated());
     }
 
     private String testReq(String testKey, String item, String result, String inspector) throws Exception {

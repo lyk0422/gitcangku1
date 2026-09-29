@@ -15,9 +15,12 @@ public class BatchRepository {
 
     /**
      * batch 表行记录；id 同时作为同批次事件的提交顺序依据。
+     * deviationLimit 为创建时冻结的产率偏差允许上限（三位小数字符串）；
+     * yieldStatus 为产率门禁状态，只反映最新核算版本。
      */
     public record BatchRow(long id, String batchKey, String productCode, String batchNo,
-                           String producedAt, String status, String createdAt) {
+                           String producedAt, String status, String deviationLimit,
+                           String yieldStatus, String createdAt) {
     }
 
     /**
@@ -57,7 +60,9 @@ public class BatchRepository {
     private static final RowMapper<BatchRow> BATCH_MAPPER = (rs, n) -> new BatchRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("product_code"),
             rs.getString("batch_no"), rs.getString("produced_at"),
-            rs.getString("status"), rs.getString("created_at"));
+            rs.getString("status"),
+            rs.getBigDecimal("deviation_limit").setScale(YieldMath.SCALE).toPlainString(),
+            rs.getString("yield_status"), rs.getString("created_at"));
 
     private static final RowMapper<TestRow> TEST_MAPPER = (rs, n) -> new TestRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("test_key"),
@@ -101,10 +106,10 @@ public class BatchRepository {
     }
 
     public void insertBatch(BatchRow row) {
-        jdbc.update("INSERT INTO batch (batch_key, product_code, batch_no, produced_at, status, created_at)"
-                        + " VALUES (?, ?, ?, ?, ?, ?)",
-                row.batchKey(), row.productCode(), row.batchNo(), row.producedAt(),
-                row.status(), row.createdAt());
+        jdbc.update("INSERT INTO batch (batch_key, product_code, batch_no, produced_at, status,"
+                        + " deviation_limit, yield_status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                row.batchKey(), row.productCode(), row.batchNo(), row.producedAt(), row.status(),
+                row.deviationLimit(), row.yieldStatus(), row.createdAt());
     }
 
     public void insertRequiredTest(String batchKey, String testItem, int seq) {

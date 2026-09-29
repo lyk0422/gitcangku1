@@ -12,6 +12,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 
+import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -46,6 +47,8 @@ class BatchSplitLineageTest {
     @BeforeEach
     void cleanTables() {
         jdbc.update("DELETE FROM command_log");
+        jdbc.update("DELETE FROM yield_disposal");
+        jdbc.update("DELETE FROM yield_reconciliation");
         jdbc.update("DELETE FROM approval");
         jdbc.update("DELETE FROM recall");
         jdbc.update("DELETE FROM test_result");
@@ -377,6 +380,7 @@ class BatchSplitLineageTest {
         assertFalse(available.contains(childA));
         assertTrue(available.contains(childB));
         submitTest(childB, "t1", "PASS", "insp-b2", 201);
+        submitBalancedYield(childB);
         approve(childB, "qa-b", "QUALITY", "CK-UT-AB1", 201);
         approve(childB, "ops-b", "OPERATIONS", "CK-UT-AB2", 201);
         assertEquals("RELEASED", currentStatus(childB));
@@ -415,6 +419,7 @@ class BatchSplitLineageTest {
         split(root, "CK-CRA-S", List.of(new String[]{child, "L1"},
                 new String[]{"BK-CRA-C2-" + unique(), "L2"}), 201);
         submitTest(child, "t1", "PASS", "insp-2", 201);
+        submitBalancedYield(child);
         approve(child, "qa-1", "QUALITY", "CK-CRA-A1", 201);
 
         List<Future<Integer>> results = runConcurrent(
@@ -549,11 +554,11 @@ class BatchSplitLineageTest {
 
     private String createBody(String batchKey, List<String> items) throws Exception {
         return objectMapper.writeValueAsString(new CreateCmd("CK-C-" + unique(), batchKey, "PROD-1",
-                "LOT-1", Instant.parse("2026-01-02T03:04:05Z"), items));
+                "LOT-1", Instant.parse("2026-01-02T03:04:05Z"), items, new BigDecimal("0.500")));
     }
 
     private record CreateCmd(String commandKey, String batchKey, String productCode, String batchNo,
-                             Instant producedAt, List<String> requiredTests) {
+                             Instant producedAt, List<String> requiredTests, BigDecimal deviationLimit) {
     }
 
     private void createBatch(String batchKey, List<String> items, int expected) throws Exception {
@@ -563,7 +568,7 @@ class BatchSplitLineageTest {
     }
 
     /**
-     * 让批次走完 检验 PASS + 双角色批准 进入 RELEASED。
+     * 让批次走完 检验 PASS + 合格产率核算 + 双角色批准 进入 RELEASED。
      */
     private void releaseBatch(String batchKey, String inspector) throws Exception {
         MvcResult history = mockMvc.perform(get("/api/batches/" + batchKey + "/history"))
@@ -572,8 +577,20 @@ class BatchSplitLineageTest {
         for (JsonNode item : node.path("batch").path("requiredTests")) {
             submitTest(batchKey, item.asText(), "PASS", inspector, 201);
         }
+        submitBalancedYield(batchKey);
         approve(batchKey, "qa-" + unique(), "QUALITY", "CK-AQ-" + unique(), 201);
         approve(batchKey, "ops-" + unique(), "OPERATIONS", "CK-AO-" + unique(), 201);
+    }
+
+    /**
+     * 提交必然合格的产率核算（投料等于合格产出，偏差 0）。
+     */
+    private void submitBalancedYield(String batchKey) throws Exception {
+        String body = "{\"requestId\":\"RY-" + unique() + "\",\"inputQty\":100.000,"
+                + "\"goodQty\":100.000,\"lossQty\":0.000,\"scrapQty\":0.000}";
+        mockMvc.perform(post("/api/batches/" + batchKey + "/yields")
+                        .contentType(MediaType.APPLICATION_JSON).content(body))
+                .andExpect(status().isCreated());
     }
 
     private void submitTest(String batchKey, String item, String result, String inspector,

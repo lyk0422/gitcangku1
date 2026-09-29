@@ -19,6 +19,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.math.RoundingMode;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -59,13 +60,16 @@ public class BatchService {
     private static final int IDEMPOTENCY_MAX_ATTEMPTS = 3;
 
     private final BatchRepository repo;
+    private final YieldService yieldService;
     private final TransactionTemplate tx;
     private final ObjectMapper objectMapper;
 
     public BatchService(BatchRepository repo,
+                        YieldService yieldService,
                         PlatformTransactionManager transactionManager,
                         ObjectMapper objectMapper) {
         this.repo = repo;
+        this.yieldService = yieldService;
         this.tx = new TransactionTemplate(transactionManager);
         this.objectMapper = objectMapper;
     }
@@ -79,14 +83,17 @@ public class BatchService {
             throw ApiException.badRequest("requiredTests 存在重复检验项");
         }
         String fingerprint = fingerprint("create", req.batchKey(), req.productCode(), req.batchNo(),
-                req.producedAt().toString(), String.join(SEP, items));
+                req.producedAt().toString(), String.join(SEP, items),
+                req.deviationLimit().setScale(YieldMath.SCALE, RoundingMode.HALF_UP).toPlainString());
         return executeIdempotent(CMD_CREATE, req.commandKey(), fingerprint, () -> {
             repo.findBatch(req.batchKey()).ifPresent(b -> {
                 throw ApiException.conflict("batchKey 已存在: " + req.batchKey());
             });
             String now = now();
             repo.insertBatch(new BatchRepository.BatchRow(0L, req.batchKey(), req.productCode(),
-                    req.batchNo(), req.producedAt().toString(), BatchStatus.QUARANTINED.name(), now));
+                    req.batchNo(), req.producedAt().toString(), BatchStatus.QUARANTINED.name(),
+                    req.deviationLimit().setScale(YieldMath.SCALE, RoundingMode.HALF_UP).toPlainString(),
+                    YieldGateStatus.NONE.name(), now));
             for (int i = 0; i < items.size(); i++) {
                 repo.insertRequiredTest(req.batchKey(), items.get(i), i + 1);
             }
@@ -175,6 +182,15 @@ public class BatchService {
             }
             if (status != BatchStatus.PENDING_RELEASE && status != BatchStatus.RELEASE_REVIEW) {
                 throw ApiException.conflict("批次状态 " + status + " 不允许批准");
+            }
+            // 产率门禁：必须已提交核算且最新版本不超限（含超限版本已双人处置解除门禁）。
+            // 行锁内读取 yield_status，与核算提交/处置事务互斥，按已提交状态裁决。
+            String yieldGate = batch.yieldStatus();
+            if (YieldGateStatus.NONE.name().equals(yieldGate)) {
+                throw ApiException.unprocessable("尚未提交产率平衡核算，不能放行");
+            }
+            if (YieldGateStatus.EXCEEDED_PENDING.name().equals(yieldGate)) {
+                throw ApiException.unprocessable("产率偏差超限待处置，两名不同处置人确认前不能放行");
             }
             boolean actorInspected = repo.findTests(batchKey).stream()
                     .anyMatch(t -> t.inspector().equals(actor));
@@ -286,7 +302,8 @@ public class BatchService {
                 .map(r -> new RecallResponse(r.batchKey(), r.actorId(), r.reason(),
                         BatchStatus.RECALLED, Instant.parse(r.createdAt())))
                 .orElse(null);
-        return new BatchHistoryResponse(toBatchResponse(batch), tests, approvals, recall);
+        return new BatchHistoryResponse(toBatchResponse(batch), tests, approvals, recall,
+                yieldService.history(batchKey));
     }
 
     /**
@@ -459,7 +476,8 @@ public class BatchService {
             for (int i = 0; i < children.size(); i++) {
                 SplitRequest.ChildSpec spec = children.get(i);
                 repo.insertBatch(new BatchRepository.BatchRow(0L, spec.batchKey(), parent.productCode(),
-                        spec.batchNo(), parent.producedAt(), BatchStatus.QUARANTINED.name(), now));
+                        spec.batchNo(), parent.producedAt(), BatchStatus.QUARANTINED.name(),
+                        parent.deviationLimit(), YieldGateStatus.NONE.name(), now));
                 for (int j = 0; j < required.size(); j++) {
                     repo.insertRequiredTest(spec.batchKey(), required.get(j), j + 1);
                 }
