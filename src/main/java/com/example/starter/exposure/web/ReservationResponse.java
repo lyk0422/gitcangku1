@@ -1,12 +1,11 @@
 package com.example.starter.exposure.web;
 
 import com.example.starter.exposure.domain.Reservation;
-import com.example.starter.exposure.domain.ReservationStatus;
 
 import java.time.LocalDate;
 
 /**
- * 预占单视图。
+ * 预占单视图。历史字段顺序保持稳定，活动与小时字段追加在末尾。
  *
  * @param reservationId 预占单编号
  * @param campaignId    所属公告编号
@@ -16,16 +15,20 @@ import java.time.LocalDate;
  * @param createdAtUtc  创建时刻，epoch 毫秒，UTC
  * @param expiresAtUtc  到期时刻（创建 + 60 秒），epoch 毫秒，UTC
  * @param terminalAtUtc 终态时刻，未进入终态为 null
+ * @param activityId    申请时固化的活动编号；公告当时未归属活动为 null
+ * @param utcHour       申请时固化的 UTC 小时（0～23）；无活动归属的历史单为 null
  */
 public record ReservationResponse(
         String reservationId,
         String campaignId,
         String visitorId,
         LocalDate utcDate,
-        ReservationStatus status,
+        com.example.starter.exposure.domain.ReservationStatus status,
         long createdAtUtc,
         long expiresAtUtc,
-        Long terminalAtUtc
+        Long terminalAtUtc,
+        String activityId,
+        Integer utcHour
 ) {
     public static ReservationResponse from(Reservation r) {
         return new ReservationResponse(
@@ -36,6 +39,8 @@ public record ReservationResponse(
                 r.status(),
                 r.createdAtUtc(),
                 r.expiresAtUtc(),
-                r.terminalAtUtc());
+                r.terminalAtUtc(),
+                r.activityId(),
+                r.utcHour());
     }
 }

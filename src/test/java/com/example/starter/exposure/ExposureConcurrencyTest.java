@@ -84,10 +84,14 @@ class ExposureConcurrencyTest {
     @BeforeEach
     void clean() {
         jdbc.update("DELETE FROM idempotency_record");
+        jdbc.update("DELETE FROM activity_hour_snapshot");
         jdbc.update("DELETE FROM exposure_reservation");
+        jdbc.update("DELETE FROM quota_activity_hour_ledger");
         jdbc.update("DELETE FROM quota_visitor_ledger");
         jdbc.update("DELETE FROM quota_total_ledger");
+        jdbc.update("DELETE FROM activity_day_config");
         jdbc.update("DELETE FROM campaign");
+        jdbc.update("DELETE FROM activity");
     }
 
     @AfterAll

@@ -16,9 +16,17 @@ import org.springframework.web.method.annotation.MethodArgumentTypeMismatchExcep
 @RestControllerAdvice
 public class GlobalExceptionHandler {
 
+    @ExceptionHandler(QuotaExceededException.class)
+    public ResponseEntity<ErrorResponse> handleQuotaExceeded(QuotaExceededException ex) {
+        return build(HttpStatus.TOO_MANY_REQUESTS, ex.getMessage(), null,
+                ex.getReason().name(), ex.getActualValue(), ex.getRequiredValue(),
+                ex.getDifferenceValue(), ex.getNextAvailableAtUtc());
+    }
+
     @ExceptionHandler(ApiException.class)
     public ResponseEntity<ErrorResponse> handleApi(ApiException ex) {
-        return build(ex.getStatus(), ex.getMessage(), null);
+        return build(ex.getStatus(), ex.getMessage(), null,
+                null, null, null, null, null);
     }
 
     @ExceptionHandler({
@@ -34,16 +42,21 @@ public class GlobalExceptionHandler {
         if (ex instanceof MethodArgumentNotValidException manv && manv.getBindingResult().getFieldError() != null) {
             message = manv.getBindingResult().getFieldError().getDefaultMessage();
         }
-        return build(HttpStatus.BAD_REQUEST, message, null);
+        return build(HttpStatus.BAD_REQUEST, message, null,
+                null, null, null, null, null);
     }
 
     @ExceptionHandler(Exception.class)
     public ResponseEntity<ErrorResponse> handleOther(Exception ex) {
-        return build(HttpStatus.INTERNAL_SERVER_ERROR, "internal server error", null);
+        return build(HttpStatus.INTERNAL_SERVER_ERROR, "internal server error", null,
+                null, null, null, null, null);
     }
 
-    private ResponseEntity<ErrorResponse> build(HttpStatus status, String message, String requestId) {
+    private ResponseEntity<ErrorResponse> build(HttpStatus status, String message, String requestId,
+                                                String reason, Long actualValue, Long requiredValue,
+                                                Long differenceValue, Long nextAvailableAtUtc) {
         return ResponseEntity.status(status)
-                .body(new ErrorResponse(status.value(), status.getReasonPhrase(), message, requestId));
+                .body(new ErrorResponse(status.value(), status.getReasonPhrase(), message, requestId,
+                        reason, actualValue, requiredValue, differenceValue, nextAvailableAtUtc));
     }
 }

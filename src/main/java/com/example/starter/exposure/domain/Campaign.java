@@ -6,12 +6,15 @@ package com.example.starter.exposure.domain;
  * @param campaignId          公告编号，全局唯一
  * @param dailyTotalCap       每 UTC 日总额度，单位次，取值 1～100000
  * @param perVisitorDailyCap  每访客每 UTC 日上限，单位次，取值 1～100000
+ * @param activityId          当前归属活动编号；不参与活动匀速投放时为 null。
+ *                            迁移活动只改当前归属，既有预占固化原活动与小时
  * @param createdAtUtc        创建时刻（epoch 毫秒，UTC）
  */
 public record Campaign(
         String campaignId,
         int dailyTotalCap,
         int perVisitorDailyCap,
+        String activityId,
         long createdAtUtc
 ) {
 }

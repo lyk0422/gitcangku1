@@ -28,16 +28,29 @@ public class CampaignRepository {
                     rs.getString("campaign_id"),
                     rs.getInt("daily_total_cap"),
                     rs.getInt("per_visitor_daily_cap"),
+                    rs.getString("activity_id"),
                     rs.getLong("created_at_utc"));
         }
     };
 
     /**
+     * 按编号查询公告（含行锁）。配置类写操作（活动迁移）使用，避免并发迁移/申请读到旧归属。
+     */
+    public Optional<Campaign> lockById(String campaignId) {
+        return jdbc.query("SELECT campaign_id, daily_total_cap, per_visitor_daily_cap, activity_id, "
+                        + "created_at_utc FROM campaign WHERE campaign_id = ? FOR UPDATE",
+                        MAPPER, campaignId)
+                .stream()
+                .findFirst();
+    }
+
+    /**
      * 按编号查询公告。
      */
     public Optional<Campaign> findById(String campaignId) {
-        return jdbc.query("SELECT campaign_id, daily_total_cap, per_visitor_daily_cap, created_at_utc "
-                        + "FROM campaign WHERE campaign_id = ?", MAPPER, campaignId)
+        return jdbc.query("SELECT campaign_id, daily_total_cap, per_visitor_daily_cap, activity_id, "
+                        + "created_at_utc FROM campaign WHERE campaign_id = ?",
+                        MAPPER, campaignId)
                 .stream()
                 .findFirst();
     }
@@ -46,11 +59,24 @@ public class CampaignRepository {
      * 插入公告；编号冲突由调用方依据唯一约束处理。
      */
     public void insert(Campaign campaign) {
-        jdbc.update("INSERT INTO campaign (campaign_id, daily_total_cap, per_visitor_daily_cap, created_at_utc) "
-                        + "VALUES (?, ?, ?, ?)",
+        jdbc.update("INSERT INTO campaign (campaign_id, daily_total_cap, per_visitor_daily_cap, "
+                        + "activity_id, created_at_utc) VALUES (?, ?, ?, ?, ?)",
                 campaign.campaignId(),
                 campaign.dailyTotalCap(),
                 campaign.perVisitorDailyCap(),
+                campaign.activityId(),
                 campaign.createdAtUtc());
+    }
+
+    /**
+     * 迁移公告当前归属活动（activityId 传 null 表示移出活动）；调用方须已持公告行锁。
+     * 既有预占的固化活动与小时不受影响。
+     */
+    public void updateActivityId(String campaignId, String activityId) {
+        int rows = jdbc.update("UPDATE campaign SET activity_id = ? WHERE campaign_id = ?",
+                activityId, campaignId);
+        if (rows != 1) {
+            throw new IllegalStateException("campaign row missing: " + campaignId);
+        }
     }
 }
