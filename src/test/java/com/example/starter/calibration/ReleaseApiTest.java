@@ -31,10 +31,16 @@ class ReleaseApiTest {
 
     @BeforeEach
     void clean() {
+        jdbc.update("DELETE FROM release_snapshot_component");
+        jdbc.update("DELETE FROM release_snapshot");
         jdbc.update("DELETE FROM release_record");
+        jdbc.update("DELETE FROM uncertainty_component");
+        jdbc.update("DELETE FROM uncertainty_budget");
         jdbc.update("DELETE FROM measurement");
+        jdbc.update("DELETE FROM uncertainty_threshold");
         jdbc.update("DELETE FROM calibration_certificate");
         jdbc.update("DELETE FROM instrument_lock");
+        jdbc.update("DELETE FROM idempotent_request");
     }
 
     private long createCert(String instrument, String a, String b) throws Exception {
@@ -44,7 +50,18 @@ class ReleaseApiTest {
                                  "validTo":"2028-01-01T00:00:00Z","a":"%s","b":"%s"}
                                 """.formatted(instrument, a, b)))
                 .andExpect(status().isCreated()).andReturn().getResponse().getContentAsString();
-        return ((Number) com.jayway.jsonpath.JsonPath.read(body, "$.id")).longValue();
+        long certId = ((Number) com.jayway.jsonpath.JsonPath.read(body, "$.id")).longValue();
+        // 合成数据：为该仪器登记宽松不确定度阈值（2000 年生效），使既有偏差判定用例不受影响
+        createThreshold(instrument, "2000-01-01T00:00:00Z", "999");
+        return certId;
+    }
+
+    private void createThreshold(String instrument, String validFrom, String threshold) throws Exception {
+        mvc.perform(post("/api/thresholds").contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"instrumentId":"%s","validFrom":"%s","threshold":"%s"}
+                                """.formatted(instrument, validFrom, threshold)))
+                .andExpect(status().isCreated());
     }
 
     private void submit(String key, String instrument, String reading, String lower,

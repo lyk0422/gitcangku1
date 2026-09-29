@@ -29,10 +29,16 @@ class MeasurementSubmitTest {
 
     @BeforeEach
     void clean() {
+        jdbc.update("DELETE FROM release_snapshot_component");
+        jdbc.update("DELETE FROM release_snapshot");
         jdbc.update("DELETE FROM release_record");
+        jdbc.update("DELETE FROM uncertainty_component");
+        jdbc.update("DELETE FROM uncertainty_budget");
         jdbc.update("DELETE FROM measurement");
+        jdbc.update("DELETE FROM uncertainty_threshold");
         jdbc.update("DELETE FROM calibration_certificate");
         jdbc.update("DELETE FROM instrument_lock");
+        jdbc.update("DELETE FROM idempotent_request");
     }
 
     private void createCert(String instrument, String from, String to, String a, String b) throws Exception {

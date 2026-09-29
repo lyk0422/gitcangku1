@@ -43,10 +43,24 @@ class ConcurrencyApiTest {
 
     @BeforeEach
     void clean() {
+        jdbc.update("DELETE FROM release_snapshot_component");
+        jdbc.update("DELETE FROM release_snapshot");
         jdbc.update("DELETE FROM release_record");
+        jdbc.update("DELETE FROM uncertainty_component");
+        jdbc.update("DELETE FROM uncertainty_budget");
         jdbc.update("DELETE FROM measurement");
+        jdbc.update("DELETE FROM uncertainty_threshold");
         jdbc.update("DELETE FROM calibration_certificate");
         jdbc.update("DELETE FROM instrument_lock");
+        jdbc.update("DELETE FROM idempotent_request");
+    }
+
+    private void createThreshold(String instrument, String validFrom, String threshold) throws Exception {
+        mvc.perform(post("/api/thresholds").contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"instrumentId":"%s","validFrom":"%s","threshold":"%s"}
+                                """.formatted(instrument, validFrom, threshold)))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isCreated());
     }
 
     @Test
@@ -95,6 +109,7 @@ class ConcurrencyApiTest {
                                      "validTo":"2028-01-01T00:00:00Z","a":"1","b":"0"}""".formatted(r)))
                     .andReturn().getResponse().getContentAsString();
             long certId = ((Number) com.jayway.jsonpath.JsonPath.read(certBody, "$.id")).longValue();
+            createThreshold("INS-R" + r, "2000-01-01T00:00:00Z", "999");
 
             mvc.perform(post("/api/measurements")
                     .contentType(MediaType.APPLICATION_JSON)
@@ -158,6 +173,7 @@ class ConcurrencyApiTest {
                                 {"instrumentId":"INS-D","validFrom":"2026-01-01T00:00:00Z",
                                  "validTo":"2028-01-01T00:00:00Z","a":"1","b":"0"}"""))
                 .andReturn().getResponse().getContentAsString();
+        createThreshold("INS-D", "2000-01-01T00:00:00Z", "999");
         mvc.perform(post("/api/measurements")
                 .contentType(MediaType.APPLICATION_JSON)
                 .content("""

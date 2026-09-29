@@ -34,6 +34,27 @@ final class Inputs {
         return new BigDecimal(value.trim());
     }
 
+    /**
+     * 非负十进制（含 0）：用于不确定度分量大小与阈值。格式非法或负值均按题干以 422 拒绝。
+     */
+    static BigDecimal requireNonNegativeDecimal(String value, String field) {
+        return requireNonNegativeDecimal(value, field, "INVALID_VALUE");
+    }
+
+    /**
+     * 非负十进制（含 0），携带 422 业务错误码。
+     */
+    static BigDecimal requireNonNegativeDecimal(String value, String field, String code) {
+        if (value == null || !DECIMAL.matcher(value.trim()).matches()) {
+            throw ApiException.unprocessable(code, field + " 必须为最多 6 位小数的十进制字符串");
+        }
+        BigDecimal decimal = new BigDecimal(value.trim());
+        if (decimal.signum() < 0) {
+            throw ApiException.unprocessable(code, field + " 必须非负");
+        }
+        return decimal;
+    }
+
     static Instant requireInstant(String value, String field) {
         if (value == null || value.isBlank()) {
             throw ApiException.badRequest(field + " 不能为空");

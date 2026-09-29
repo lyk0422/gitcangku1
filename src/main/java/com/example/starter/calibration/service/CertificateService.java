@@ -19,9 +19,11 @@ import com.example.starter.calibration.repo.CertificateRepository;
 public class CertificateService {
 
     private final CertificateRepository certificates;
+    private final BusinessClock clock;
 
-    public CertificateService(CertificateRepository certificates) {
+    public CertificateService(CertificateRepository certificates, BusinessClock clock) {
         this.certificates = certificates;
+        this.clock = clock;
     }
 
     /**
@@ -43,7 +45,7 @@ public class CertificateService {
         if (certificates.countActiveOverlap(instrumentId, validFrom, validTo) > 0) {
             throw ApiException.conflict("CERTIFICATE_OVERLAP", "同一仪器存在区间重叠的未撤销证书");
         }
-        long id = certificates.insert(instrumentId, validFrom, validTo, a, b, Instant.now());
+        long id = certificates.insert(instrumentId, validFrom, validTo, a, b, clock.now());
         return DtoMapper.toResponse(certificates.findById(id).orElseThrow());
     }
 
@@ -58,7 +60,7 @@ public class CertificateService {
         if (cert.revoked()) {
             throw ApiException.conflict("ALREADY_REVOKED", "证书已撤销: " + id);
         }
-        certificates.markRevoked(id, Instant.now());
+        certificates.markRevoked(id, clock.now());
         return DtoMapper.toResponse(certificates.findById(id).orElseThrow());
     }
 
