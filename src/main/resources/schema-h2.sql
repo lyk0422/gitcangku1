@@ -100,3 +100,64 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
 );
+
+-- 升级阶梯：阈值版本（行不可变）
+CREATE TABLE IF NOT EXISTS escalation_threshold_versions (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    version_key VARCHAR(64) NOT NULL,
+    threshold_1 BIGINT NOT NULL,
+    threshold_2 BIGINT NOT NULL,
+    threshold_3 BIGINT NOT NULL,
+    threshold_4 BIGINT NOT NULL,
+    threshold_5 BIGINT NOT NULL,
+    cooldown_minutes INT NOT NULL,
+    note VARCHAR(512) NULL,
+    created_by VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_threshold_version_key UNIQUE (version_key),
+    CONSTRAINT ck_thresholds_order CHECK (
+        threshold_1 >= 0 AND threshold_1 < threshold_2 AND threshold_2 < threshold_3
+        AND threshold_3 < threshold_4 AND threshold_4 < threshold_5),
+    CONSTRAINT ck_cooldown_range CHECK (cooldown_minutes BETWEEN 0 AND 527040)
+);
+
+-- 升级阶梯：当前生效阈值版本单行指针（固定 id=1，无行表示尚未发布任何版本）
+CREATE TABLE IF NOT EXISTS ladder_current_version (
+    id TINYINT PRIMARY KEY,
+    threshold_version_id BIGINT NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL
+);
+
+-- 升级阶梯：事件当前态（每事件至多一行；无行表示分数缺失）
+CREATE TABLE IF NOT EXISTS incident_ladder_state (
+    incident_id BIGINT PRIMARY KEY,
+    score BIGINT NOT NULL,
+    current_level INT NOT NULL,
+    threshold_version_id BIGINT NOT NULL,
+    last_escalated_at TIMESTAMP(6) NOT NULL,
+    last_escalated_by VARCHAR(128) NOT NULL,
+    entered_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    updated_by VARCHAR(128) NOT NULL,
+    CONSTRAINT ck_ladder_level CHECK (current_level BETWEEN 1 AND 5),
+    CONSTRAINT ck_ladder_score CHECK (score >= 0)
+);
+
+-- 升级阶梯：等级历史（append-only，不可更新/删除）
+CREATE TABLE IF NOT EXISTS incident_ladder_history (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    change_type VARCHAR(16) NOT NULL,
+    from_level INT NULL,
+    to_level INT NOT NULL,
+    from_score BIGINT NULL,
+    to_score BIGINT NOT NULL,
+    threshold_version_id BIGINT NOT NULL,
+    threshold_version_key VARCHAR(64) NOT NULL,
+    actor VARCHAR(128) NOT NULL,
+    cooldown_start_at TIMESTAMP(6) NOT NULL,
+    command_key VARCHAR(128) NOT NULL,
+    occurred_at TIMESTAMP(6) NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ladder_history_incident ON incident_ladder_history (incident_id, id);

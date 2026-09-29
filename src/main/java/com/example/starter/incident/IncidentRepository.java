@@ -227,4 +227,28 @@ public class IncidentRepository {
                         + " WHERE b.task_id = ? ORDER BY i.incident_key",
                 INCIDENT_MAPPER, taskId);
     }
+
+    /**
+     * 按主键查询事件（不加锁），用于只读场景。
+     */
+    public Optional<Incident> findById(long id) {
+        List<Incident> rows = jdbc.query("SELECT * FROM incidents WHERE id = ?",
+                INCIDENT_MAPPER, id);
+        return rows.stream().findFirst();
+    }
+
+    /**
+     * 按主键集合加锁读取事件行，固定按 id 升序返回（SELECT ... FOR UPDATE）。
+     * 批量写路径用统一加锁顺序（id 升序）避免与同事件的其他写路径死锁；
+     * 返回行数少于入参个数即说明存在不存在的 id。
+     */
+    public List<Incident> lockByIdsOrdered(java.util.Collection<Long> ids) {
+        if (ids.isEmpty()) {
+            return List.of();
+        }
+        String placeholders = String.join(",", java.util.Collections.nCopies(ids.size(), "?"));
+        return jdbc.query("SELECT * FROM incidents WHERE id IN (" + placeholders
+                        + ") ORDER BY id FOR UPDATE",
+                INCIDENT_MAPPER, ids.toArray());
+    }
 }
