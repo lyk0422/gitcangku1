@@ -1,5 +1,7 @@
 package com.example.starter.consent;
 
+import java.util.List;
+
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -11,6 +13,8 @@ import org.springframework.web.method.annotation.HandlerMethodValidationExceptio
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
+import com.example.starter.consent.dto.QueryFailureDetail;
+
 /**
  * 全局异常处理：把业务异常与参数错误统一转换为带稳定业务码的错误响应。
  */
@@ -19,8 +23,9 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(ApiException.class)
     public ResponseEntity<ErrorResponse> handleApi(ApiException ex) {
+        List<QueryFailureDetail> details = ex.getDetails().isEmpty() ? null : ex.getDetails();
         return ResponseEntity.status(ex.getStatus())
-                .body(new ErrorResponse(ex.getCode(), ex.getMessage()));
+                .body(new ErrorResponse(ex.getCode(), ex.getMessage(), details));
     }
 
     @ExceptionHandler({

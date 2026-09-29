@@ -12,8 +12,6 @@ import com.example.starter.consent.dto.GrantResponse;
 import com.example.starter.consent.dto.RecordResponse;
 import com.example.starter.consent.dto.RecordWriteRequest;
 import com.example.starter.consent.dto.RevokeRequest;
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
 
 /**
  * 授权域服务：实现授权、写入、撤回与查询的业务规则及幂等语义。
@@ -27,7 +25,6 @@ public class ConsentService {
 
     static final String CODE_GRANT_NOT_FOUND = "GRANT_NOT_FOUND";
     static final String CODE_RECORD_NOT_FOUND = "RECORD_NOT_FOUND";
-    static final String CODE_REQUEST_ID_CONFLICT = "REQUEST_ID_CONFLICT";
     static final String CODE_RECORD_PAYLOAD_CONFLICT = "RECORD_PAYLOAD_CONFLICT";
     static final String CODE_GRANT_ALREADY_REVOKED = "GRANT_ALREADY_REVOKED";
     static final String CODE_CONSENT_REVOKED = "CONSENT_REVOKED";
@@ -37,15 +34,11 @@ public class ConsentService {
     private static final String OP_REVOKE = "REVOKE";
 
     private final ConsentRepository consentRepository;
-    private final IdempotencyRepository idempotencyRepository;
-    private final ObjectMapper objectMapper;
+    private final IdempotencySupport idempotency;
 
-    public ConsentService(ConsentRepository consentRepository,
-                          IdempotencyRepository idempotencyRepository,
-                          ObjectMapper objectMapper) {
+    public ConsentService(ConsentRepository consentRepository, IdempotencySupport idempotency) {
         this.consentRepository = consentRepository;
-        this.idempotencyRepository = idempotencyRepository;
-        this.objectMapper = objectMapper;
+        this.idempotency = idempotency;
     }
 
     /**
@@ -54,9 +47,9 @@ public class ConsentService {
     @Transactional
     public GrantResponse grant(GrantRequest request) {
         String fingerprint = OP_GRANT + "|" + request.subjectKey() + "|" + request.purpose();
-        Optional<IdempotencyRow> replayed = checkReplay(request.requestId(), fingerprint);
+        Optional<IdempotencyRow> replayed = idempotency.checkReplay(request.requestId(), fingerprint);
         if (replayed.isPresent()) {
-            return readSnapshot(replayed.get().responseBody(), GrantResponse.class);
+            return idempotency.readSnapshot(replayed.get().responseBody(), GrantResponse.class);
         }
 
         Optional<ConsentRepository.GrantRow> latest =
@@ -76,12 +69,12 @@ public class ConsentService {
                                 .orElseThrow(() -> concurrent);
                 response = new GrantResponse(committed.subjectKey(), committed.purpose(),
                         committed.epoch(), committed.status());
-                storeSuccess(request.requestId(), OP_GRANT, fingerprint, response);
+                idempotency.storeSuccess(request.requestId(), OP_GRANT, fingerprint, response);
                 return response;
             }
             response = new GrantResponse(request.subjectKey(), request.purpose(), nextEpoch, GrantStatus.ACTIVE);
         }
-        storeSuccess(request.requestId(), OP_GRANT, fingerprint, response);
+        idempotency.storeSuccess(request.requestId(), OP_GRANT, fingerprint, response);
         return response;
     }
 
@@ -92,9 +85,9 @@ public class ConsentService {
     public RecordResponse write(RecordWriteRequest request) {
         String fingerprint = OP_WRITE + "|" + request.subjectKey() + "|" + request.purpose()
                 + "|" + request.recordKey() + "|" + request.payload();
-        Optional<IdempotencyRow> replayed = checkReplay(request.requestId(), fingerprint);
+        Optional<IdempotencyRow> replayed = idempotency.checkReplay(request.requestId(), fingerprint);
         if (replayed.isPresent()) {
-            RecordResponse snapshot = readSnapshot(replayed.get().responseBody(), RecordResponse.class);
+            RecordResponse snapshot = idempotency.readSnapshot(replayed.get().responseBody(), RecordResponse.class);
             requireGrantActive(snapshot.subjectKey(), snapshot.purpose(), snapshot.epoch());
             return snapshot;
         }
@@ -111,7 +104,7 @@ public class ConsentService {
                 throw ApiException.conflict(CODE_RECORD_PAYLOAD_CONFLICT, "相同 recordKey 已存在不同内容");
             }
             RecordResponse response = toResponse(existing.get());
-            storeSuccess(request.requestId(), OP_WRITE, fingerprint, response);
+            idempotency.storeSuccess(request.requestId(), OP_WRITE, fingerprint, response);
             return response;
         }
 
@@ -127,13 +120,13 @@ public class ConsentService {
                 throw ApiException.conflict(CODE_RECORD_PAYLOAD_CONFLICT, "相同 recordKey 已存在不同内容");
             }
             RecordResponse response = toResponse(committed);
-            storeSuccess(request.requestId(), OP_WRITE, fingerprint, response);
+            idempotency.storeSuccess(request.requestId(), OP_WRITE, fingerprint, response);
             return response;
         }
 
         RecordResponse response = new RecordResponse(request.subjectKey(), request.purpose(),
                 latest.epoch(), request.recordKey(), request.payload());
-        storeSuccess(request.requestId(), OP_WRITE, fingerprint, response);
+        idempotency.storeSuccess(request.requestId(), OP_WRITE, fingerprint, response);
         return response;
     }
 
@@ -143,9 +136,9 @@ public class ConsentService {
     @Transactional
     public GrantResponse revoke(RevokeRequest request) {
         String fingerprint = OP_REVOKE + "|" + request.subjectKey() + "|" + request.purpose() + "|" + request.epoch();
-        Optional<IdempotencyRow> replayed = checkReplay(request.requestId(), fingerprint);
+        Optional<IdempotencyRow> replayed = idempotency.checkReplay(request.requestId(), fingerprint);
         if (replayed.isPresent()) {
-            return readSnapshot(replayed.get().responseBody(), GrantResponse.class);
+            return idempotency.readSnapshot(replayed.get().responseBody(), GrantResponse.class);
         }
 
         consentRepository.findGrant(request.subjectKey(), request.purpose(), request.epoch())
@@ -156,7 +149,7 @@ public class ConsentService {
         }
         GrantResponse response = new GrantResponse(request.subjectKey(), request.purpose(),
                 request.epoch(), GrantStatus.REVOKED);
-        storeSuccess(request.requestId(), OP_REVOKE, fingerprint, response);
+        idempotency.storeSuccess(request.requestId(), OP_REVOKE, fingerprint, response);
         return response;
     }
 
@@ -181,47 +174,7 @@ public class ConsentService {
         }
     }
 
-    /**
-     * 幂等重放检查：命中且参数一致返回原快照；参数不一致返回 409。
-     */
-    private Optional<IdempotencyRow> checkReplay(String requestId, String fingerprint) {
-        Optional<IdempotencyRow> row = idempotencyRepository.find(requestId);
-        if (row.isPresent() && !row.get().paramsFingerprint().equals(fingerprint)) {
-            throw ApiException.conflict(CODE_REQUEST_ID_CONFLICT, "同一 requestId 参数不一致");
-        }
-        return row;
-    }
-
-    private void storeSuccess(String requestId, String operation, String fingerprint, Object response) {
-        try {
-            idempotencyRepository.insert(requestId, operation, fingerprint, writeSnapshot(response));
-        } catch (DuplicateKeyException concurrent) {
-            // 并发同 requestId：校验已提交快照参数一致，否则视为冲突
-            IdempotencyRow committed = idempotencyRepository.find(requestId)
-                    .orElseThrow(() -> concurrent);
-            if (!committed.paramsFingerprint().equals(fingerprint)) {
-                throw ApiException.conflict(CODE_REQUEST_ID_CONFLICT, "同一 requestId 参数不一致");
-            }
-        }
-    }
-
     private RecordResponse toResponse(ConsentRepository.RecordRow row) {
         return new RecordResponse(row.subjectKey(), row.purpose(), row.epoch(), row.recordKey(), row.payload());
-    }
-
-    private String writeSnapshot(Object response) {
-        try {
-            return objectMapper.writeValueAsString(response);
-        } catch (JsonProcessingException e) {
-            throw new IllegalStateException("响应快照序列化失败", e);
-        }
-    }
-
-    private <T> T readSnapshot(String body, Class<T> type) {
-        try {
-            return objectMapper.readValue(body, type);
-        } catch (JsonProcessingException e) {
-            throw new IllegalStateException("响应快照反序列化失败", e);
-        }
     }
 }

@@ -45,6 +45,8 @@ class ConsentApiTest {
 
     @BeforeEach
     void cleanTables() {
+        jdbc.update("DELETE FROM purpose_query_ledger");
+        jdbc.update("DELETE FROM purpose_quota");
         jdbc.update("DELETE FROM consent_record");
         jdbc.update("DELETE FROM consent_grant");
         jdbc.update("DELETE FROM idempotency_request");
