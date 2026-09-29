@@ -15,6 +15,7 @@ import com.example.starter.firmware.repo.PauseRecordRepository;
 import com.example.starter.firmware.repo.ReleaseRepository;
 import com.example.starter.firmware.repo.ResumeRecordRepository;
 import com.example.starter.firmware.repo.TaskRepository;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 
@@ -34,22 +35,31 @@ public class ReleaseService {
     private final ResumeRecordRepository resumeRecordRepository;
     private final IdempotencyService idempotency;
     private final Clock clock;
+    private final boolean releaseGateEnabled;
+    private final RehearsalService rehearsalService;
 
     public ReleaseService(ReleaseRepository releaseRepository, TaskRepository taskRepository,
                           PauseRecordRepository pauseRecordRepository,
                           ResumeRecordRepository resumeRecordRepository,
-                          IdempotencyService idempotency, Clock clock) {
+                          IdempotencyService idempotency, Clock clock, RehearsalService rehearsalService,
+                          @Value("${firmware.release-gate.enabled:true}") boolean releaseGateEnabled) {
         this.releaseRepository = releaseRepository;
         this.taskRepository = taskRepository;
         this.pauseRecordRepository = pauseRecordRepository;
         this.resumeRecordRepository = resumeRecordRepository;
         this.idempotency = idempotency;
         this.clock = clock;
+        this.rehearsalService = rehearsalService;
+        this.releaseGateEnabled = releaseGateEnabled;
     }
 
     public ReleaseView create(CreateReleaseRequest request) {
         if (request.fromVersion().equals(request.toVersion())) {
             throw ApiException.badRequest("SAME_VERSION", "目标版本必须与来源版本不同");
+        }
+        // 正式投放前门禁：来源版本->目标版本必须存在 READY_FOR_RELEASE（由一次全成功回滚演练授予）。
+        if (releaseGateEnabled) {
+            rehearsalService.requireReleaseGate(request.model(), request.fromVersion(), request.toVersion());
         }
         int sampleFloor = request.effectiveSampleFloor();
         int threshold = request.effectiveFailureThresholdPercent();

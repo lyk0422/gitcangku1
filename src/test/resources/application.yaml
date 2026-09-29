@@ -14,6 +14,11 @@ spring:
   jackson:
     time-zone: Asia/Shanghai
 
+# 既有投放测试不经过回滚演练门禁；门禁相关用例在用例类上显式开启。
+firmware:
+  release-gate:
+    enabled: false
+
 server:
   port: 0
 

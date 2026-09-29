@@ -35,3 +35,8 @@ management:
   endpoint:
     health:
       show-details: never
+
+# 正式投放前门禁开关：默认开启，创建发布单要求目标版本持有 READY_FOR_RELEASE 门禁。
+firmware:
+  release-gate:
+    enabled: true
