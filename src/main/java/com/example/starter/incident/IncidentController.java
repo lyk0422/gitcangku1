@@ -3,6 +3,7 @@ package com.example.starter.incident;
 import com.example.starter.incident.dto.Requests.ActionRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
 import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
+import com.example.starter.incident.dto.Requests.NotificationReceiptRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
@@ -11,11 +12,13 @@ import com.example.starter.incident.dto.Requests.TaskCreateRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
+import com.example.starter.incident.dto.Responses.AgencyReceiptView;
 import com.example.starter.incident.dto.Responses.EscalationHistoryView;
 import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
 import com.example.starter.incident.dto.Responses.IncidentTasksView;
 import com.example.starter.incident.dto.Responses.IncidentView;
+import com.example.starter.incident.dto.Responses.NotificationStatusView;
 import com.example.starter.incident.dto.Responses.TaskView;
 import com.example.starter.incident.dto.Responses.TransferView;
 import org.springframework.http.HttpStatus;
@@ -91,6 +94,25 @@ public class IncidentController {
                                                 @RequestHeader("X-Actor-Id") String actor,
                                                 @RequestBody EscalationAckRequest req) {
         return service.acknowledgeEscalation(incidentKey, actor, req);
+    }
+
+    /**
+     * 外部机构提交通报回执：同一机构只计首份有效回执；同一 requestId 原报文重放原响应，
+     * 换机构或内容返回 409。回执以服务端注入 Clock 记录收到 UTC 时刻。
+     */
+    @PostMapping("/{incidentKey}/notifications/receipts")
+    public AgencyReceiptView submitReceipt(@PathVariable String incidentKey,
+                                           @RequestBody NotificationReceiptRequest req) {
+        return service.submitReceipt(incidentKey, req);
+    }
+
+    /**
+     * 查询每个通报机构的首次有效回执、逾期状态与缺失清单（机构按创建顺序稳定排列）。
+     * 只读，不隐式写入。
+     */
+    @GetMapping("/{incidentKey}/notifications")
+    public NotificationStatusView notificationStatus(@PathVariable String incidentKey) {
+        return service.notificationStatus(incidentKey);
     }
 
     /**

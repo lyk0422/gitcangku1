@@ -78,4 +78,28 @@ public final class Responses {
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
     }
+
+    /**
+     * 单个通报机构的回执视图，机构按创建顺序（稳定排序）返回。
+     * critical 是否关键机构；ackDeadline 为 UTC 回执截止时刻；
+     * overdue 为查询时（注入时钟）是否逾期（当前时刻 ≥ 截止时刻，恰好到期算逾期）；
+     * signer/receivedAt 仅在已收到首份有效回执时有值，重复报文不覆盖；
+     * missing 表示仍缺失（尚未收到回执）。
+     */
+    public record AgencyReceiptView(String agencyCode, boolean critical, Instant ackDeadline,
+                                    boolean overdue, boolean missing, String signer,
+                                    Instant receivedAt) {
+    }
+
+    /**
+     * 外部通报回执总览：createdAt 为通报创建 UTC 时刻（无通报时为 null）；
+     * agencies 为按创建顺序稳定排列的各机构首次有效回执/逾期/缺失情况；
+     * missingCritical 为当前仍缺失回执的关键机构（逾期与否都列出，供降级门禁展示）；
+     * overdueCritical/overdueNormal 分别为已逾期（含恰好到期）仍缺失的关键/普通机构；
+     * followUp 为待跟进清单：已逾期仍缺失的普通机构。
+     */
+    public record NotificationStatusView(Instant createdAt, List<AgencyReceiptView> agencies,
+                                         List<String> missingCritical, List<String> overdueCritical,
+                                         List<String> overdueNormal, List<String> followUp) {
+    }
 }

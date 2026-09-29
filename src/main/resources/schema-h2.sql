@@ -100,3 +100,44 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
 );
+
+-- 外部通报：每次遏制逾期升级创建一份，每事件至多一份（与 incident_escalations 对应）。
+CREATE TABLE IF NOT EXISTS incident_notifications (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    escalation_id BIGINT NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_notification_incident UNIQUE (incident_id)
+);
+
+-- 通报机构清单：critical=TRUE 为关键机构（逾期未回执阻止降级），FALSE 为普通机构；
+-- 按 id（即创建请求顺序）稳定排序。所有截止时刻均为 UTC，当前时刻 ≥ 截止时刻即逾期。
+CREATE TABLE IF NOT EXISTS incident_notification_agencies (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    notification_id BIGINT NOT NULL,
+    incident_id BIGINT NOT NULL,
+    agency_code VARCHAR(128) NOT NULL,
+    critical BOOLEAN NOT NULL,
+    ack_deadline TIMESTAMP(6) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_notification_agency UNIQUE (notification_id, agency_code)
+);
+CREATE INDEX IF NOT EXISTS idx_notif_agency_incident ON incident_notification_agencies (incident_id);
+
+-- 通报回执：agency_id 唯一保证同一机构只落首份有效回执；request_id 全局唯一保证报文幂等。
+-- received_at 为服务端收到首份有效回执的 UTC 时刻，重复报文不覆盖。
+CREATE TABLE IF NOT EXISTS incident_notification_receipts (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    agency_id BIGINT NOT NULL,
+    incident_id BIGINT NOT NULL,
+    agency_code VARCHAR(128) NOT NULL,
+    request_id VARCHAR(128) NOT NULL,
+    signer VARCHAR(128) NOT NULL,
+    content VARCHAR(1024) NOT NULL,
+    received_at TIMESTAMP(6) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_receipt_agency UNIQUE (agency_id),
+    CONSTRAINT uk_receipt_request UNIQUE (request_id)
+);
+CREATE INDEX IF NOT EXISTS idx_receipt_incident_agency
+    ON incident_notification_receipts (incident_id, agency_code);

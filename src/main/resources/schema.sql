@@ -100,3 +100,38 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY COMMENT '固定为 1 的单行锁；创建任务时 SELECT ... FOR UPDATE 持有，串行化环检测与写入，保证并发反向依赖最终图无环'
 ) COMMENT='任务依赖图全局锁表';
+
+CREATE TABLE IF NOT EXISTS incident_notifications (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    incident_id BIGINT NOT NULL COMMENT '所属事件 id，关联 incidents.id；每事件至多一份通报（随唯一遏制逾期升级创建）',
+    escalation_id BIGINT NOT NULL COMMENT '关联的遏制逾期升级记录 id，关联 incident_escalations.id',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '通报创建 UTC 时刻（升级触发当时）',
+    CONSTRAINT uk_notification_incident UNIQUE (incident_id)
+) COMMENT='外部通报单表：每次事件升级确定需通报机构及各自 UTC 回执截止时刻';
+
+CREATE TABLE IF NOT EXISTS incident_notification_agencies (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键，同时作为机构稳定排序键（创建请求顺序）',
+    notification_id BIGINT NOT NULL COMMENT '所属通报 id，关联 incident_notifications.id',
+    incident_id BIGINT NOT NULL COMMENT '所属事件 id，冗余便于按事件查询与加锁',
+    agency_code VARCHAR(128) NOT NULL COMMENT '被通报机构标识；同一通报内唯一',
+    critical BOOLEAN NOT NULL COMMENT '是否关键机构：TRUE 关键（逾期未回执阻止事件降级），FALSE 普通（逾期只进待跟进清单）',
+    ack_deadline TIMESTAMP(6) NOT NULL COMMENT 'UTC 回执截止时刻；由注入时钟判断，当前时刻 ≥ 该时刻即逾期，恰好到期视为逾期',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时刻',
+    CONSTRAINT uk_notification_agency UNIQUE (notification_id, agency_code),
+    INDEX idx_notif_agency_incident (incident_id)
+) COMMENT='通报机构清单表';
+
+CREATE TABLE IF NOT EXISTS incident_notification_receipts (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    agency_id BIGINT NOT NULL COMMENT '回执对应机构行 id，关联 incident_notification_agencies.id；唯一约束保证同一机构只计首份有效回执',
+    incident_id BIGINT NOT NULL COMMENT '所属事件 id，冗余便于按事件查询与清理',
+    agency_code VARCHAR(128) NOT NULL COMMENT '签收机构标识，冗余用于查询展示',
+    request_id VARCHAR(128) NOT NULL COMMENT '回执报文幂等键，全局唯一；同键原报文重放原响应，换机构或内容返回 409',
+    signer VARCHAR(128) NOT NULL COMMENT '签收人标识，非空',
+    content VARCHAR(1024) NOT NULL COMMENT '回执内容；同 requestId 必须一致，不一致返回 409',
+    received_at TIMESTAMP(6) NOT NULL COMMENT '服务端收到首份有效回执的 UTC 时刻（注入时钟）；重复报文不覆盖该时刻与签收人',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '落库 UTC 时刻',
+    CONSTRAINT uk_receipt_agency UNIQUE (agency_id),
+    CONSTRAINT uk_receipt_request UNIQUE (request_id),
+    INDEX idx_receipt_incident_agency (incident_id, agency_code)
+) COMMENT='外部通报回执表：同一机构只落首份有效回执，后来重复报文不增加完成数也不覆盖原时间';

@@ -8,6 +8,8 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.EnumSet;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
@@ -17,6 +19,8 @@ import java.util.function.Supplier;
 import com.example.starter.incident.dto.Requests.ActionRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
 import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
+import com.example.starter.incident.dto.Requests.NotifiedAgencyRequest;
+import com.example.starter.incident.dto.Requests.NotificationReceiptRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
@@ -25,11 +29,13 @@ import com.example.starter.incident.dto.Requests.TaskCreateRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
+import com.example.starter.incident.dto.Responses.AgencyReceiptView;
 import com.example.starter.incident.dto.Responses.EscalationHistoryView;
 import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
 import com.example.starter.incident.dto.Responses.IncidentTasksView;
 import com.example.starter.incident.dto.Responses.IncidentView;
+import com.example.starter.incident.dto.Responses.NotificationStatusView;
 import com.example.starter.incident.dto.Responses.StatusChangeView;
 import com.example.starter.incident.dto.Responses.TaskBlockerView;
 import com.example.starter.incident.dto.Responses.TaskView;
@@ -72,16 +78,19 @@ public class IncidentService {
     private final EscalationRepository escalations;
     private final IncidentTaskRepository tasks;
     private final CommandKeyRepository commandKeys;
+    private final NotificationRepository notifications;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public IncidentService(IncidentRepository incidents, EscalationRepository escalations,
                            IncidentTaskRepository tasks, CommandKeyRepository commandKeys,
+                           NotificationRepository notifications,
                            ObjectMapper objectMapper, Clock clock) {
         this.incidents = incidents;
         this.escalations = escalations;
         this.tasks = tasks;
         this.commandKeys = commandKeys;
+        this.notifications = notifications;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -274,6 +283,17 @@ public class IncidentService {
                         }
                     }
                     Instant now = now();
+                    if (targetStatus == IncidentStatus.CONTAINED) {
+                        // 降级门禁：通报存在时，逾期（含恰好到期）仍缺失回执的关键机构阻止降级。
+                        // 已持有事件行锁，读到的是事务提交时已生效的回执状态，与并发回执按提交顺序决胜。
+                        NotificationStatusView notification = buildNotificationStatus(incident.id(), now);
+                        if (notification.createdAt() != null && !notification.overdueCritical().isEmpty()) {
+                            throw ApiException.conflict(
+                                    "关键机构逾期未回执，不能降级: "
+                                            + String.join(",", notification.overdueCritical()),
+                                    notification.overdueCritical());
+                        }
+                    }
                     incidents.updateState(incident.id(), targetStatus, incident.commander(), now);
                     incidents.insertStatusChange(new StatusChange(0L, incident.id(),
                             incident.status(), targetStatus, actor, now));
@@ -287,15 +307,25 @@ public class IncidentService {
     /**
      * 单事件遏制逾期检查：以注入 Clock 的当前时刻评估，不做定时扫描。
      * 仅当事件仍为 COMMANDING、尚无升级记录且当前时刻 ≥ 接管时确定的期限时，
-     * 追加一条 OPEN 记录（保存期限、触发时刻、当时指挥人），每事件至多一条。
-     * 期限前或其他状态不产生记录；同键重放首次结果（含期限前的无记录结果），
-     * 失败不占键；需要重新评估必须更换 commandKey。
+     * 追加一条 OPEN 记录（保存期限、触发时刻、当时指挥人），每事件至多一条；
+     * 同事务为本次升级创建外部通报单，并按 agencies 记录需通报机构、是否关键机构及
+     * 各自 UTC 回执截止时刻（顺序即机构稳定排序）。
+     * 期限前或其他状态不产生记录；agencies 为空表示本次升级不通报。
+     * 同键重放首次结果（含期限前的无记录结果），失败不占键；需要重新评估必须更换 commandKey。
      */
     @Transactional
     public EscalationHistoryView checkEscalation(String incidentKey, EscalationCheckRequest req) {
         String commandKey = requireText(req.commandKey(), "commandKey");
+        List<NotifiedAgencyRequest> agencies = normalizeAgencies(req.agencies());
+        List<String> hashParts = new ArrayList<>();
+        hashParts.add(incidentKey);
+        for (NotifiedAgencyRequest agency : agencies) {
+            hashParts.add(agency.agencyCode());
+            hashParts.add(String.valueOf(agency.critical()));
+            hashParts.add(agency.ackDeadline().toString());
+        }
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "escalation_check", hash(incidentKey),
+        return runIdempotent(commandKey, "escalation_check", hash(hashParts.toArray(String[]::new)),
                 EscalationHistoryView.class, () -> {
                     var existing = escalations.findByIncident(incident.id());
                     if (existing.isPresent()) {
@@ -305,13 +335,68 @@ public class IncidentService {
                     if (incident.status() == IncidentStatus.COMMANDING
                             && incident.deadlineAt() != null
                             && !currentTime.isBefore(incident.deadlineAt())) {
-                        escalations.insert(new Escalation(0L, incident.id(), incident.deadlineAt(),
-                                currentTime, incident.commander(), EscalationStatus.OPEN,
-                                null, null, null, currentTime, currentTime));
+                        long escalationId = escalations.insert(new Escalation(0L, incident.id(),
+                                incident.deadlineAt(), currentTime, incident.commander(),
+                                EscalationStatus.OPEN, null, null, null, currentTime, currentTime));
+                        createNotification(incident.id(), escalationId, agencies, currentTime);
                     }
                     return toEscalationHistory(incident,
                             escalations.listByIncident(incident.id()));
                 });
+    }
+
+    /**
+     * 外部机构提交通报回执：同一机构只计首份有效回执，后来报文不增加完成数也不覆盖原时间。
+     * 同一 requestId 提交相同机构与内容重放首次响应；换机构或内容返回 409；
+     * 机构不在本次通报清单返回 404；失败不占用 requestId（成功才落库）。
+     */
+    @Transactional
+    public AgencyReceiptView submitReceipt(String incidentKey, NotificationReceiptRequest req) {
+        String agencyCode = requireText(req.agencyCode(), "agencyCode");
+        String requestId = requireText(req.requestId(), "requestId");
+        String signer = requireText(req.signer(), "signer");
+        String content = requireText(req.content(), "content");
+        Incident incident = lockIncident(incidentKey);
+        // 行锁已持有：同事件的回执与降级按事务提交顺序串行，降级以提交时已生效回执为准。
+        NotificationAgency agency = notifications.findAgency(incident.id(), agencyCode)
+                .orElseThrow(() -> ApiException.notFound(
+                        "通报机构不存在或该事件未发起通报: " + agencyCode));
+
+        NotificationReceipt byRequest = notifications.findReceiptByRequest(requestId).orElse(null);
+        if (byRequest != null) {
+            return replayReceipt(byRequest, incident.id(), agencyCode, signer, content);
+        }
+        NotificationReceipt byAgency = notifications.findReceiptByAgency(agency.id()).orElse(null);
+        if (byAgency != null) {
+            // 该机构首份有效回执已计入：不同 requestId 的新报文一律 409，不重复计数、不覆盖。
+            throw ApiException.conflict("机构 " + agencyCode + " 已存在首份有效回执，"
+                    + "后续报文不再计入");
+        }
+
+        Instant receivedAt = now();
+        NotificationReceipt receipt = new NotificationReceipt(0L, agency.id(), incident.id(),
+                agencyCode, requestId, signer, content, receivedAt, receivedAt);
+        try {
+            notifications.insertReceipt(receipt);
+        } catch (DuplicateKeyException e) {
+            // 跨事件 requestId 唯一竞争或同机构并发竞争：以已提交的首份回执为准。
+            NotificationReceipt committed = notifications.findReceiptByRequestForUpdate(requestId)
+                    .orElseThrow(() -> ApiException.conflict(
+                            "机构 " + agencyCode + " 的回执已被并发请求处理"));
+            return replayReceipt(committed, incident.id(), agencyCode, signer, content);
+        }
+        return toAgencyView(agency, receipt, receivedAt);
+    }
+
+    /**
+     * 查询每个机构的首次有效回执、逾期状态与缺失清单（机构按创建顺序稳定排列）。
+     * 只读，不隐式写入。
+     */
+    @Transactional(readOnly = true)
+    public NotificationStatusView notificationStatus(String incidentKey) {
+        Incident incident = incidents.findByKey(incidentKey)
+                .orElseThrow(() -> ApiException.notFound("事件不存在: " + incidentKey));
+        return buildNotificationStatus(incident.id(), now());
     }
 
     /**
@@ -662,5 +747,111 @@ public class IncidentService {
         List<EscalationView> views = list.stream().map(this::toEscalationView).toList();
         EscalationView current = views.isEmpty() ? null : views.get(views.size() - 1);
         return new EscalationHistoryView(incident.deadlineAt(), current, views);
+    }
+
+    /**
+     * 规范化通报机构请求：去空白、校验机构标识非空、截止时刻非空，并按机构标识去重
+     * （保留首次出现，避免同一通报重复机构触发唯一约束）。返回空列表表示不通报。
+     */
+    private static List<NotifiedAgencyRequest> normalizeAgencies(List<NotifiedAgencyRequest> raw) {
+        if (raw == null || raw.isEmpty()) {
+            return List.of();
+        }
+        List<NotifiedAgencyRequest> normalized = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        for (NotifiedAgencyRequest agency : raw) {
+            if (agency == null) {
+                throw ApiException.badRequest("通报机构项不能为空");
+            }
+            String code = requireText(agency.agencyCode(), "agencyCode");
+            if (agency.ackDeadline() == null) {
+                throw ApiException.badRequest("机构 " + code + " 的 ackDeadline 不能为空");
+            }
+            if (seen.add(code)) {
+                normalized.add(new NotifiedAgencyRequest(code, agency.critical(), agency.ackDeadline()));
+            }
+        }
+        return normalized;
+    }
+
+    /**
+     * 升级触发同事务创建通报单与机构清单；agencies 为空则不创建通报。
+     */
+    private void createNotification(long incidentId, long escalationId,
+                                    List<NotifiedAgencyRequest> agencies, Instant now) {
+        if (agencies.isEmpty()) {
+            return;
+        }
+        long notificationId = notifications.insertNotification(
+                new Notification(0L, incidentId, escalationId, now));
+        for (NotifiedAgencyRequest agency : agencies) {
+            notifications.insertAgency(new NotificationAgency(0L, notificationId, incidentId,
+                    agency.agencyCode(), agency.critical(), agency.ackDeadline(), now));
+        }
+    }
+
+    /**
+     * requestId 已存在时的重放/改参判定：机构、签收人、内容任一不同返回 409，
+     * 完全一致则重放首份回执对应视图（receivedAt 为首份回执时刻，不被覆盖）。
+     */
+    private AgencyReceiptView replayReceipt(NotificationReceipt existing, long incidentId,
+                                            String agencyCode, String signer, String content) {
+        if (existing.incidentId() != incidentId || !existing.agencyCode().equals(agencyCode)
+                || !existing.signer().equals(signer) || !existing.content().equals(content)) {
+            throw ApiException.conflict("requestId 已被不同机构或内容的回执使用: " + existing.requestId());
+        }
+        NotificationAgency agency = notifications.findAgency(incidentId, agencyCode).orElseThrow();
+        // 以首份回执的收到时刻重算视图，与首次成功响应完全一致，不受重放当时时钟影响。
+        return toAgencyView(agency, existing, existing.receivedAt());
+    }
+
+    /**
+     * 组装通报状态：机构按 id（创建顺序）稳定排列；以 at 时刻（注入时钟）计算逾期，
+     * 当前时刻 ≥ 截止时刻即逾期（恰好到期算逾期）；缺失清单、关键/普通逾期与待跟进分类汇总。
+     */
+    private NotificationStatusView buildNotificationStatus(long incidentId, Instant at) {
+        var notification = notifications.findByIncident(incidentId);
+        if (notification.isEmpty()) {
+            return new NotificationStatusView(null, List.of(), List.of(), List.of(), List.of(), List.of());
+        }
+        List<NotificationReceipt> receipts = notifications.listReceiptsByIncident(incidentId);
+        Map<Long, NotificationReceipt> byAgencyId = new HashMap<>();
+        for (NotificationReceipt receipt : receipts) {
+            byAgencyId.putIfAbsent(receipt.agencyId(), receipt);
+        }
+        List<AgencyReceiptView> views = new ArrayList<>();
+        List<String> missingCritical = new ArrayList<>();
+        List<String> overdueCritical = new ArrayList<>();
+        List<String> overdueNormal = new ArrayList<>();
+        for (NotificationAgency agency : notifications.listAgenciesByIncident(incidentId)) {
+            NotificationReceipt receipt = byAgencyId.get(agency.id());
+            boolean missing = receipt == null;
+            boolean overdue = !at.isBefore(agency.ackDeadline());
+            views.add(toAgencyView(agency, receipt, at));
+            if (missing) {
+                if (agency.critical()) {
+                    missingCritical.add(agency.agencyCode());
+                    if (overdue) {
+                        overdueCritical.add(agency.agencyCode());
+                    }
+                } else if (overdue) {
+                    overdueNormal.add(agency.agencyCode());
+                }
+            }
+        }
+        return new NotificationStatusView(notification.get().createdAt(), List.copyOf(views),
+                List.copyOf(missingCritical), List.copyOf(overdueCritical),
+                List.copyOf(overdueNormal), List.copyOf(overdueNormal));
+    }
+
+    /**
+     * 组装单机构回执视图：无首份回执时 signer/receivedAt 为空；逾期以查询时刻 at 计算。
+     */
+    private AgencyReceiptView toAgencyView(NotificationAgency agency, NotificationReceipt receipt,
+                                           Instant at) {
+        boolean overdue = !at.isBefore(agency.ackDeadline());
+        return new AgencyReceiptView(agency.agencyCode(), agency.critical(), agency.ackDeadline(),
+                overdue, receipt == null, receipt == null ? null : receipt.signer(),
+                receipt == null ? null : receipt.receivedAt());
     }
 }

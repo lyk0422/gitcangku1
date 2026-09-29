@@ -36,8 +36,32 @@ public final class Requests {
     public record StatusRequest(String commandKey, String targetStatus) {
     }
 
-    /** 遏制逾期检查请求：以注入 Clock 的当前时刻评估，不做定时扫描。 */
-    public record EscalationCheckRequest(String commandKey) {
+    /**
+     * 遏制逾期检查请求：以注入 Clock 的当前时刻评估，不做定时扫描。
+     * 触发升级时可携带 agencies 确定本次需外部通报的机构清单及各自 UTC 回执截止时刻；
+     * 为 null 或空时沿用旧行为（仅创建升级记录、不产生通报）。
+     */
+    public record EscalationCheckRequest(String commandKey, List<NotifiedAgencyRequest> agencies) {
+
+        /** 不含通报机构的兼容构造。 */
+        public EscalationCheckRequest(String commandKey) {
+            this(commandKey, null);
+        }
+    }
+
+    /**
+     * 被通报机构：agencyCode 机构标识；critical 是否关键机构（关键机构逾期未回执阻止降级，
+     * 普通机构逾期只进待跟进清单）；ackDeadline 为 UTC 回执截止时刻，恰好到期视为逾期。
+     */
+    public record NotifiedAgencyRequest(String agencyCode, boolean critical, Instant ackDeadline) {
+    }
+
+    /**
+     * 外部通报回执请求：requestId 为回执报文幂等键（同键原报文重放原响应，
+     * 换机构或内容返回 409）；signer 签收人；content 回执内容；agencyCode 签收机构。
+     */
+    public record NotificationReceiptRequest(String agencyCode, String requestId,
+                                             String signer, String content) {
     }
 
     /** 升级确认请求：note 为非空处置说明，操作人由 X-Actor-Id 指定且须为当前指挥人。 */

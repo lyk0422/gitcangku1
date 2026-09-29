@@ -108,6 +108,71 @@ class SchemaH2ScriptTest {
                     duplicateBlockerRejected = true;
                 }
                 assertThat(duplicateBlockerRejected).isTrue();
+
+                // 外部通报：每事件至多一份通报单
+                st.execute("INSERT INTO incident_notifications (incident_id, escalation_id, created_at)"
+                        + " VALUES (1,1,'" + Timestamp.from(now) + "')");
+                boolean duplicateNotificationRejected = false;
+                try {
+                    st.execute("INSERT INTO incident_notifications (incident_id, escalation_id, created_at)"
+                            + " VALUES (1,1,'" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateNotificationRejected = true;
+                }
+                assertThat(duplicateNotificationRejected).isTrue();
+
+                // 通报机构：同通报机构标识唯一
+                st.execute("INSERT INTO incident_notification_agencies (notification_id, incident_id,"
+                        + " agency_code, critical, ack_deadline, created_at) VALUES (1,1,'甲',TRUE,'"
+                        + Timestamp.from(now.plusSeconds(300)) + "','" + Timestamp.from(now) + "')");
+                boolean duplicateAgencyRejected = false;
+                try {
+                    st.execute("INSERT INTO incident_notification_agencies (notification_id, incident_id,"
+                            + " agency_code, critical, ack_deadline, created_at) VALUES (1,1,'甲',FALSE,'"
+                            + Timestamp.from(now.plusSeconds(600)) + "','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateAgencyRejected = true;
+                }
+                assertThat(duplicateAgencyRejected).isTrue();
+                st.execute("INSERT INTO incident_notification_agencies (notification_id, incident_id,"
+                        + " agency_code, critical, ack_deadline, created_at) VALUES (1,1,'乙',FALSE,'"
+                        + Timestamp.from(now.plusSeconds(600)) + "','" + Timestamp.from(now) + "')");
+
+                // 回执：同一机构（agency_id）唯一——只计首份有效回执
+                st.execute("INSERT INTO incident_notification_receipts (agency_id, incident_id,"
+                        + " agency_code, request_id, signer, content, received_at, created_at) VALUES"
+                        + " (1,1,'甲','R-1','s','c','" + Timestamp.from(now) + "','"
+                        + Timestamp.from(now) + "')");
+                boolean duplicateAgencyReceiptRejected = false;
+                try {
+                    st.execute("INSERT INTO incident_notification_receipts (agency_id, incident_id,"
+                            + " agency_code, request_id, signer, content, received_at, created_at) VALUES"
+                            + " (1,1,'甲','R-2','s2','c2','" + Timestamp.from(now) + "','"
+                            + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateAgencyReceiptRejected = true;
+                }
+                assertThat(duplicateAgencyReceiptRejected).isTrue();
+
+                // 回执：request_id 全局唯一——报文幂等
+                boolean duplicateRequestRejected = false;
+                try {
+                    st.execute("INSERT INTO incident_notification_receipts (agency_id, incident_id,"
+                            + " agency_code, request_id, signer, content, received_at, created_at) VALUES"
+                            + " (2,1,'乙','R-1','s','c','" + Timestamp.from(now) + "','"
+                            + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateRequestRejected = true;
+                }
+                assertThat(duplicateRequestRejected).isTrue();
+
+                // 恰好到期（当前时刻 = 截止时刻）在 SQL 层即判定为逾期
+                try (ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM"
+                        + " incident_notification_agencies WHERE '" + Timestamp.from(now.plusSeconds(300))
+                        + "' >= ack_deadline")) {
+                    rs.next();
+                    assertThat(rs.getInt(1)).isEqualTo(1);
+                }
             }
         }
     }
