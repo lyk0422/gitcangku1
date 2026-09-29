@@ -1,5 +1,6 @@
 package com.example.starter.translation.domain;
 
+import java.time.Instant;
 import java.util.List;
 
 /**
@@ -81,5 +82,97 @@ public final class Rows {
      */
     public record RequestLogRow(String requestId, String requestHash,
                                 int responseStatus, String responseBody) {
+    }
+
+    /**
+     * 发布快照状态行：撤回只改状态字段，绝不改写 snapshot_json 证据。
+     *
+     * @param status          发布状态：PUBLISHED 有效；WITHDRAWN 已撤回
+     * @param withdrawnAt     撤回时刻，UTC；null 表示未撤回
+     * @param withdrawnBy     撤回操作者；null 表示未撤回
+     * @param withdrawReason  撤回原因；null 表示未撤回
+     */
+    public record ReleaseStatusRow(String status, Instant withdrawnAt,
+                                   String withdrawnBy, String withdrawReason) {
+    }
+
+    /**
+     * 发布快照元数据：快照 JSON、生成时刻与撤回状态；证据 JSON 读出后不依赖可变业务表。
+     *
+     * @param snapshotJson    发布时固化的完整快照 JSON
+     * @param createdAt       发布快照生成时刻，UTC
+     * @param status          发布状态：PUBLISHED / WITHDRAWN
+     * @param withdrawnAt     撤回时刻，UTC；null 表示未撤回
+     * @param withdrawnBy     撤回操作者；null 表示未撤回
+     * @param withdrawReason  撤回原因；null 表示未撤回
+     */
+    public record ReleaseSnapshotMeta(String snapshotJson, Instant createdAt, String status,
+                                      Instant withdrawnAt, String withdrawnBy, String withdrawReason) {
+    }
+
+    /**
+     * 归档包主记录：生成后证据不可变，撤销仅置访问失效状态并保留原因。
+     *
+     * @param archiveId        全局唯一归档包 ID
+     * @param documentId       所属文档 ID
+     * @param archiveVersion   文档内归档包序号，从 1 开始
+     * @param publishedVersion 引用的发布版本号
+     * @param targetLanguages  规范排序的目标语言码列表
+     * @param termVersion      固化的术语版本
+     * @param segmentCount     每语种段落数
+     * @param languageCount    语种数
+     * @param approvalCount    审批记录条数
+     * @param evidenceJson     归档证据 JSON
+     * @param status           访问状态：ACTIVE / REVOKED
+     * @param revokedAt        撤销时刻，UTC；null 表示未撤销
+     * @param revokedBy        撤销操作者；null 表示未撤销
+     * @param revokeReason     撤销原因；null 表示未撤销
+     * @param createdAt        生成时刻，UTC，不可变
+     */
+    public record ArchivePackageRow(long archiveId, long documentId, int archiveVersion,
+                                    int publishedVersion, List<String> targetLanguages, int termVersion,
+                                    int segmentCount, int languageCount, int approvalCount,
+                                    String evidenceJson, String status, Instant revokedAt, String revokedBy,
+                                    String revokeReason, Instant createdAt) {
+    }
+
+    /**
+     * 归档逐段译文版本证据。
+     *
+     * @param archiveId          所属归档包 ID
+     * @param segmentId          段落 ID
+     * @param language           目标语言码，小写
+     * @param translationVersion 固化的译文版本
+     * @param sourceVersion      固化的源文版本
+     * @param termVersion        固化的术语版本
+     */
+    public record ArchiveSegmentRow(long archiveId, String segmentId, String language,
+                                    int translationVersion, int sourceVersion, int termVersion) {
+    }
+
+    /**
+     * 归档领域事件：自增序列表示提交顺序。
+     *
+     * @param eventId          事件自增序列
+     * @param documentId       所属文档 ID
+     * @param archiveId        关联归档包 ID；发布撤回事件为 null
+     * @param eventType        事件类型
+     * @param publishedVersion 关联发布版本；不涉及为 null
+     * @param actor            操作者；系统事件为 null
+     * @param reason           撤回/撤销原因；归档生成事件为 null
+     * @param eventTime        事件时刻，UTC
+     */
+    public record ArchiveEventRow(long eventId, long documentId, Long archiveId, String eventType,
+                                  Integer publishedVersion, String actor, String reason, Instant eventTime) {
+    }
+
+    /**
+     * 历史查询行：事件关联归档包时附带归档版本，字段与 null 语义对外稳定。
+     *
+     * @param archiveVersion 关联归档包版本；发布撤回事件为 null
+     */
+    public record ArchiveHistoryRow(long eventId, long documentId, Long archiveId, Integer archiveVersion,
+                                    String eventType, Integer publishedVersion, String actor, String reason,
+                                    Instant eventTime) {
     }
 }

@@ -124,3 +124,87 @@ COMMENT ON COLUMN request_log.request_hash IS '请求参数规范化后的 SHA-2
 COMMENT ON COLUMN request_log.response_status IS '原成功响应的 HTTP 状态码，用于重放';
 COMMENT ON COLUMN request_log.response_body IS '原成功响应体 JSON，用于重放';
 COMMENT ON COLUMN request_log.created_at IS '记录时间，数据库默认时区';
+
+-- 发布撤回：状态固化在发布快照行上，撤回不改写 snapshot_json 证据；时间列为 UTC、毫秒精度。
+ALTER TABLE release_snapshot ADD COLUMN IF NOT EXISTS status VARCHAR(16) NOT NULL DEFAULT 'PUBLISHED';
+ALTER TABLE release_snapshot ADD COLUMN IF NOT EXISTS withdrawn_at TIMESTAMP(3);
+ALTER TABLE release_snapshot ADD COLUMN IF NOT EXISTS withdrawn_by VARCHAR(128);
+ALTER TABLE release_snapshot ADD COLUMN IF NOT EXISTS withdraw_reason VARCHAR(512);
+COMMENT ON COLUMN release_snapshot.status IS '发布状态：PUBLISHED 有效；WITHDRAWN 已撤回，撤回后不能新建归档包但证据保留';
+COMMENT ON COLUMN release_snapshot.withdrawn_at IS '撤回时刻，UTC、毫秒精度；null 表示未撤回';
+COMMENT ON COLUMN release_snapshot.withdrawn_by IS '撤回操作者，取 X-Actor-Id；null 表示未撤回';
+COMMENT ON COLUMN release_snapshot.withdraw_reason IS '撤回原因，UTF-8，非空；null 表示未撤回';
+
+CREATE TABLE IF NOT EXISTS archive_package (
+    archive_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    document_id BIGINT NOT NULL,
+    archive_version INT NOT NULL,
+    published_version INT NOT NULL,
+    target_languages VARCHAR(255) NOT NULL,
+    term_version INT NOT NULL,
+    segment_count INT NOT NULL,
+    language_count INT NOT NULL,
+    approval_count INT NOT NULL,
+    evidence_json LONGTEXT NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    revoked_at TIMESTAMP(3),
+    revoked_by VARCHAR(128),
+    revoke_reason VARCHAR(512),
+    created_at TIMESTAMP(3) NOT NULL,
+    UNIQUE (document_id, archive_version)
+);
+COMMENT ON TABLE archive_package IS '译文归档包：生成后不可变，固化规范排序语种、逐段译文版本、术语版本、审批记录与发布快照摘要';
+COMMENT ON COLUMN archive_package.archive_id IS '全局唯一归档包 ID，自增';
+COMMENT ON COLUMN archive_package.document_id IS '所属文档 ID';
+COMMENT ON COLUMN archive_package.archive_version IS '文档内归档包序号，从 1 开始单调递增';
+COMMENT ON COLUMN archive_package.published_version IS '归档包引用的发布版本号；一个包只能引用同一发布版本';
+COMMENT ON COLUMN archive_package.target_languages IS '规范排序（小写、字典序）的目标语言码，逗号分隔';
+COMMENT ON COLUMN archive_package.term_version IS '归档固化的术语版本，取自发布快照；术语退役不改写本值';
+COMMENT ON COLUMN archive_package.segment_count IS '每语种固化的段落数（实际值）';
+COMMENT ON COLUMN archive_package.language_count IS '固化的目标语种数（要求值）';
+COMMENT ON COLUMN archive_package.approval_count IS '固化的审批记录条数 = 段数 × 语种数';
+COMMENT ON COLUMN archive_package.evidence_json IS '归档证据 JSON，生成后任何操作不得改写';
+COMMENT ON COLUMN archive_package.status IS '访问状态：ACTIVE 可查明细；REVOKED 已撤销，明细 410 但证据保留';
+COMMENT ON COLUMN archive_package.revoked_at IS '撤销时刻，UTC、毫秒精度；null 表示未撤销';
+COMMENT ON COLUMN archive_package.revoked_by IS '撤销操作者，取 X-Actor-Id；null 表示未撤销';
+COMMENT ON COLUMN archive_package.revoke_reason IS '撤销原因，UTF-8，非空；null 表示未撤销';
+COMMENT ON COLUMN archive_package.created_at IS '归档包生成时刻，UTC、毫秒精度，生成后不可变';
+
+CREATE TABLE IF NOT EXISTS archive_segment (
+    archive_id BIGINT NOT NULL,
+    document_id BIGINT NOT NULL,
+    segment_id VARCHAR(64) NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    translation_version INT NOT NULL,
+    source_version INT NOT NULL,
+    term_version INT NOT NULL,
+    PRIMARY KEY (archive_id, segment_id, language)
+);
+COMMENT ON TABLE archive_segment IS '归档逐段译文版本证据：按包、段落、语种唯一，与归档包同一事务写入，失败不留半成品';
+COMMENT ON COLUMN archive_segment.archive_id IS '所属归档包 ID';
+COMMENT ON COLUMN archive_segment.document_id IS '所属文档 ID';
+COMMENT ON COLUMN archive_segment.segment_id IS '段落 ID';
+COMMENT ON COLUMN archive_segment.language IS '目标语言码，小写';
+COMMENT ON COLUMN archive_segment.translation_version IS '归档时该段该语种的译文版本（固化证据）';
+COMMENT ON COLUMN archive_segment.source_version IS '归档时该段源文版本，须与译文依据源文版本一致';
+COMMENT ON COLUMN archive_segment.term_version IS '归档时译文绑定的术语版本，须与发布快照术语版本一致';
+
+CREATE TABLE IF NOT EXISTS archive_event (
+    event_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    document_id BIGINT NOT NULL,
+    archive_id BIGINT,
+    event_type VARCHAR(32) NOT NULL,
+    published_version INT,
+    actor VARCHAR(128),
+    reason VARCHAR(512),
+    event_time TIMESTAMP(3) NOT NULL
+);
+COMMENT ON TABLE archive_event IS '归档领域事件历史：按提交顺序裁决，自增序列保证稳定排序，后续操作不得改写既有事件';
+COMMENT ON COLUMN archive_event.event_id IS '事件自增序列，按提交顺序单调递增';
+COMMENT ON COLUMN archive_event.document_id IS '所属文档 ID';
+COMMENT ON COLUMN archive_event.archive_id IS '关联归档包 ID；发布撤回事件不关联具体包时为 null';
+COMMENT ON COLUMN archive_event.event_type IS '事件类型：ARCHIVE_CREATED 归档生成 / ARCHIVE_REVOKED 归档撤销 / RELEASE_WITHDRAWN 发布撤回';
+COMMENT ON COLUMN archive_event.published_version IS '关联发布版本；不涉及发布版本时为 null';
+COMMENT ON COLUMN archive_event.actor IS '操作者，取 X-Actor-Id；系统事件为 null';
+COMMENT ON COLUMN archive_event.reason IS '撤回或撤销原因；归档生成事件为 null';
+COMMENT ON COLUMN archive_event.event_time IS '事件时刻，UTC、毫秒精度，区间按左闭右开解释';

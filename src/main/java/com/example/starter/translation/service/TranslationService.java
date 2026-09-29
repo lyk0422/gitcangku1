@@ -2,6 +2,7 @@ package com.example.starter.translation.service;
 
 import com.example.starter.translation.api.ApiDtos;
 import com.example.starter.translation.api.ApiException;
+import com.example.starter.translation.archive.UtcClock;
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
@@ -32,10 +33,12 @@ public class TranslationService {
 
     private final TranslationRepository repository;
     private final ObjectMapper objectMapper;
+    private final UtcClock clock;
 
-    public TranslationService(TranslationRepository repository, ObjectMapper objectMapper) {
+    public TranslationService(TranslationRepository repository, ObjectMapper objectMapper, UtcClock clock) {
         this.repository = repository;
         this.objectMapper = objectMapper;
+        this.clock = clock;
     }
 
     /** 建文档：1~5 种目标语言，可携带初始段落，初始草稿版本 1、发布版本 0。 */
@@ -231,8 +234,8 @@ public class TranslationService {
         }
         int publishedVersion = document.publishedVersion() + 1;
         repository.insertSnapshot(documentId, publishedVersion,
-                buildSnapshotJson(document, publishedVersion, segments, translations, approvals, termRules));
-        repository.updatePublishedVersion(documentId, publishedVersion);
+                buildSnapshotJson(document, publishedVersion, segments, translations, approvals, termRules,
+                        clock.now()));        repository.updatePublishedVersion(documentId, publishedVersion);
         return new ApiDtos.PublishResponse(documentId, publishedVersion);
     }
 
@@ -350,8 +353,10 @@ public class TranslationService {
     /** 生成完整只读快照 JSON：全部段落源文及各语言译文、作者、审核人、版本号与固化的术语版本及规则集。 */
     private String buildSnapshotJson(DocumentRow document, int publishedVersion, List<SegmentRow> segments,
                                      Map<String, TranslationRow> translations,
-                                     Map<String, ApprovalRow> approvals, List<TermRuleRow> termRules) {
+                                     Map<String, ApprovalRow> approvals, List<TermRuleRow> termRules,
+                                     java.time.Instant createdAt) {
         Map<String, Object> snapshot = new LinkedHashMap<>();
+        snapshot.put("createdAt", createdAt.toString());
         snapshot.put("documentId", document.documentId());
         snapshot.put("publishedVersion", publishedVersion);
         snapshot.put("draftVersion", document.draftVersion());

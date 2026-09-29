@@ -35,6 +35,9 @@ public abstract class AbstractIntegrationTest {
 
     @BeforeEach
     void cleanTables() {
+        jdbc.update("DELETE FROM archive_segment");
+        jdbc.update("DELETE FROM archive_event");
+        jdbc.update("DELETE FROM archive_package");
         jdbc.update("DELETE FROM approval");
         jdbc.update("DELETE FROM translation");
         jdbc.update("DELETE FROM segment");
@@ -128,6 +131,35 @@ public abstract class AbstractIntegrationTest {
         String body = "{\"requestId\":\"" + requestId + "\",\"expectedTermVersion\":" + expectedTermVersion
                 + ",\"rules\":" + rulesJson + "}";
         return putJson("/api/documents/" + documentId + "/terms", body);
+    }
+
+    /** 创建归档包；languagesJson 为语种数组 JSON，[] 表示全部语种。 */
+    protected ApiResult createArchive(long documentId, int publishedVersion, String languagesJson,
+                                      String actorId, String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"publishedVersion\":" + publishedVersion
+                + ",\"targetLanguages\":" + languagesJson + "}";
+        return postJson("/api/documents/" + documentId + "/archives", body, actorId);
+    }
+
+    /** 批量归档；itemsJson 为批量项数组 JSON。 */
+    protected ApiResult batchArchive(long documentId, String itemsJson, String actorId,
+                                     String requestId) throws Exception {
+        return postJson("/api/documents/" + documentId + "/archives/batch",
+                "{\"requestId\":\"" + requestId + "\",\"items\":" + itemsJson + "}", actorId);
+    }
+
+    /** 撤回发布。 */
+    protected ApiResult withdrawRelease(long documentId, int publishedVersion, String reason, String actorId,
+                                        String requestId) throws Exception {
+        return postJson("/api/documents/" + documentId + "/releases/" + publishedVersion + "/withdraw",
+                "{\"requestId\":\"" + requestId + "\",\"reason\":\"" + reason + "\"}", actorId);
+    }
+
+    /** 撤销归档。 */
+    protected ApiResult revokeArchive(long documentId, int archiveVersion, String reason, String actorId,
+                                      String requestId) throws Exception {
+        return postJson("/api/documents/" + documentId + "/archives/" + archiveVersion + "/revoke",
+                "{\"requestId\":\"" + requestId + "\",\"reason\":\"" + reason + "\"}", actorId);
     }
 
     /** HTTP 响应结果：状态码与 JSON 响应体。 */

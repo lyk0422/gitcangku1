@@ -43,6 +43,11 @@ public class ApiException extends RuntimeException {
         return new ApiException(HttpStatus.NOT_FOUND, "NOT_FOUND", message);
     }
 
+    /** 410：归档包已撤销，访问失效但证据保留（可经历史/诊断查询）。 */
+    public static ApiException gone(String message) {
+        return new ApiException(HttpStatus.GONE, "ARCHIVE_REVOKED", message);
+    }
+
     /** 409：版本冲突、段落冲突或 requestId 同键异参。 */
     public static ApiException conflict(String message) {
         return new ApiException(HttpStatus.CONFLICT, "CONFLICT", message);
