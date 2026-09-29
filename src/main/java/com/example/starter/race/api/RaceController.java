@@ -10,8 +10,9 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+
 /**
- * 赛事计时处罚与成绩封榜 HTTP 接口。
+ * 赛事计时处罚、芯片更换与成绩封榜 HTTP 接口。
  */
 @RestController
 @RequestMapping("/api/races")
@@ -79,6 +80,24 @@ public class RaceController {
         return toResponse(raceService.submitTiming(raceId, bib, request));
     }
 
+    /** 为选手更换计时芯片（未冲线、在赛、未封榜时允许）。 */
+    @PostMapping("/{raceId}/runners/{bib}/chip-replacements")
+    public ResponseEntity<Object> replaceChip(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody ReplaceChipRequest request) {
+        return toResponse(raceService.replaceChip(raceId, bib, request));
+    }
+
+    /** 选手退赛。 */
+    @PostMapping("/{raceId}/runners/{bib}/withdrawal")
+    public ResponseEntity<Object> withdrawRunner(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody WithdrawRunnerRequest request) {
+        return toResponse(raceService.withdrawRunner(raceId, bib, request));
+    }
+
     /** 封榜。 */
     @PostMapping("/{raceId}/seal")
     public ResponseEntity<Object> sealRace(
@@ -105,6 +124,20 @@ public class RaceController {
             @PathVariable String raceId,
             @PathVariable String bib) {
         return raceService.getRunnerTimings(raceId, bib);
+    }
+
+    /** 查询赛事当前芯片绑定诊断（只读）。 */
+    @GetMapping("/{raceId}/chip-bindings")
+    public ChipBindingsResponse getChipBindings(@PathVariable String raceId) {
+        return raceService.getChipBindings(raceId);
+    }
+
+    /** 查询选手芯片更换历史（只读）。 */
+    @GetMapping("/{raceId}/runners/{bib}/chip-replacements")
+    public ChipHistoryResponse getChipHistory(
+            @PathVariable String raceId,
+            @PathVariable String bib) {
+        return raceService.getChipHistory(raceId, bib);
     }
 
     /** 查询赛事缺失检查点汇总。 */

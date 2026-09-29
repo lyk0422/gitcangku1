@@ -3,6 +3,7 @@ package com.example.starter.race.persistence;
 import com.example.starter.race.domain.EntryStatus;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
+import com.example.starter.race.domain.RunnerStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
@@ -15,6 +16,14 @@ import java.util.Optional;
 /**
  * 赛事封榜领域的 JDBC 仓储；所有写方法均假定运行在业务事务内，
  * 版本推进与封榜全部使用条件 UPDATE 保证并发下无丢失更新。
+ *
+ * <p>芯片相关一致性：
+ * <ul>
+ *   <li>{@code chip_binding.chip_code} 主键保证同一芯片当前至多绑定一名未完赛选手，
+ *       并发绑定由数据库唯一约束兜底，至多一次成功；</li>
+ *   <li>{@code chip_binding (race_id,bib)} 唯一约束保证一名选手当前至多一枚芯片；</li>
+ *   <li>更换历史 {@code chip_replacement} 只追加不改写，按自增 id 稳定排序。</li>
+ * </ul>
  */
 @Repository
 public class RaceRepository {
@@ -30,6 +39,9 @@ public class RaceRepository {
             new CheckpointTimingRowMapper();
     private static final SnapshotCheckpointRowMapper SNAPSHOT_CHECKPOINT_ROW_MAPPER =
             new SnapshotCheckpointRowMapper();
+    private static final ChipBindingRowMapper CHIP_BINDING_ROW_MAPPER = new ChipBindingRowMapper();
+    private static final ChipReplacementRowMapper CHIP_REPLACEMENT_ROW_MAPPER =
+            new ChipReplacementRowMapper();
 
     private final JdbcTemplate jdbcTemplate;
 
@@ -62,7 +74,8 @@ public class RaceRepository {
     /** 查询赛事下全部选手，按参赛号字典序排列。 */
     public List<RunnerRow> findRunners(String raceId) {
         return jdbcTemplate.query(
-                "SELECT id, race_id, bib, finish_time_ms, created_at, updated_at "
+                "SELECT id, race_id, bib, finish_time_ms, runner_status, chip_code, "
+                        + "created_at, updated_at "
                         + "FROM runner WHERE race_id = ? ORDER BY bib",
                 RUNNER_ROW_MAPPER, raceId);
     }
@@ -70,8 +83,20 @@ public class RaceRepository {
     /** 按赛事与参赛号查询选手。 */
     public Optional<RunnerRow> findRunner(String raceId, String bib) {
         return jdbcTemplate
-                .query("SELECT id, race_id, bib, finish_time_ms, created_at, updated_at "
+                .query("SELECT id, race_id, bib, finish_time_ms, runner_status, chip_code, "
+                                + "created_at, updated_at "
                                 + "FROM runner WHERE race_id = ? AND bib = ?",
+                        RUNNER_ROW_MAPPER, raceId, bib)
+                .stream()
+                .findFirst();
+    }
+
+    /** 行锁方式查询选手，持有到事务结束（更换芯片/退赛前使用）。 */
+    public Optional<RunnerRow> findRunnerForUpdate(String raceId, String bib) {
+        return jdbcTemplate
+                .query("SELECT id, race_id, bib, finish_time_ms, runner_status, chip_code, "
+                                + "created_at, updated_at "
+                                + "FROM runner WHERE race_id = ? AND bib = ? FOR UPDATE",
                         RUNNER_ROW_MAPPER, raceId, bib)
                 .stream()
                 .findFirst();
@@ -124,7 +149,8 @@ public class RaceRepository {
     /** 查询某选手的全部分段记录，按 position 升序排列。 */
     public List<CheckpointTimingRow> findTimingsForRunner(String raceId, String bib) {
         return jdbcTemplate.query(
-                "SELECT timing_id, race_id, bib, checkpoint_code, position, elapsed_millis, created_at "
+                "SELECT timing_id, race_id, bib, checkpoint_code, position, elapsed_millis, "
+                        + "chip_code, read_at_ms, created_at "
                         + "FROM checkpoint_timing WHERE race_id = ? AND bib = ? ORDER BY position",
                 CHECKPOINT_TIMING_ROW_MAPPER, raceId, bib);
     }
@@ -132,7 +158,8 @@ public class RaceRepository {
     /** 查询赛事下全部分段记录（用于实时成绩与封榜计算）。 */
     public List<CheckpointTimingRow> findAllTimings(String raceId) {
         return jdbcTemplate.query(
-                "SELECT timing_id, race_id, bib, checkpoint_code, position, elapsed_millis, created_at "
+                "SELECT timing_id, race_id, bib, checkpoint_code, position, elapsed_millis, "
+                        + "chip_code, read_at_ms, created_at "
                         + "FROM checkpoint_timing WHERE race_id = ? ORDER BY bib, position",
                 CHECKPOINT_TIMING_ROW_MAPPER, raceId);
     }
@@ -140,7 +167,8 @@ public class RaceRepository {
     /** 按全局分段ID查询记录（用于 timingId 幂等重放）。 */
     public Optional<CheckpointTimingRow> findTiming(String timingId) {
         return jdbcTemplate
-                .query("SELECT timing_id, race_id, bib, checkpoint_code, position, elapsed_millis, created_at "
+                .query("SELECT timing_id, race_id, bib, checkpoint_code, position, elapsed_millis, "
+                                + "chip_code, read_at_ms, created_at "
                                 + "FROM checkpoint_timing WHERE timing_id = ?",
                         CHECKPOINT_TIMING_ROW_MAPPER, timingId)
                 .stream()
@@ -151,10 +179,12 @@ public class RaceRepository {
     public void insertTiming(CheckpointTimingRow row) {
         jdbcTemplate.update(
                 "INSERT INTO checkpoint_timing "
-                        + "(timing_id, race_id, bib, checkpoint_code, position, elapsed_millis, created_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        + "(timing_id, race_id, bib, checkpoint_code, position, elapsed_millis, "
+                        + "chip_code, read_at_ms, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 row.timingId(), row.raceId(), row.bib(), row.checkpointCode(),
-                row.position(), row.elapsedMillis(), row.createdAt());
+                row.position(), row.elapsedMillis(), row.chipCode(), row.readAtMs(),
+                row.createdAt());
     }
 
     /** 一次性写入赛事检查点配置（配置后不可修改）。 */
@@ -170,6 +200,88 @@ public class RaceRepository {
                     ps.setInt(3, row.position());
                     ps.setLong(4, row.createdAt());
                 });
+    }
+
+    // ===== 芯片绑定与更换历史 =====
+
+    /** 按芯片代码查询当前绑定；未绑定返回 empty。 */
+    public Optional<ChipBindingRow> findChipBinding(String chipCode) {
+        return jdbcTemplate
+                .query("SELECT chip_code, race_id, bib, bound_at FROM chip_binding WHERE chip_code = ?",
+                        CHIP_BINDING_ROW_MAPPER, chipCode)
+                .stream()
+                .findFirst();
+    }
+
+    /** 行锁方式按芯片代码查询当前绑定，用于并发绑定串行化。 */
+    public Optional<ChipBindingRow> findChipBindingForUpdate(String chipCode) {
+        return jdbcTemplate
+                .query("SELECT chip_code, race_id, bib, bound_at FROM chip_binding "
+                                + "WHERE chip_code = ? FOR UPDATE",
+                        CHIP_BINDING_ROW_MAPPER, chipCode)
+                .stream()
+                .findFirst();
+    }
+
+    /** 查询某选手当前持有的芯片绑定。 */
+    public Optional<ChipBindingRow> findChipBindingForRunner(String raceId, String bib) {
+        return jdbcTemplate
+                .query("SELECT chip_code, race_id, bib, bound_at FROM chip_binding "
+                                + "WHERE race_id = ? AND bib = ?",
+                        CHIP_BINDING_ROW_MAPPER, raceId, bib)
+                .stream()
+                .findFirst();
+    }
+
+    /** 查询赛事下全部当前芯片绑定，按芯片代码排序（诊断只读查询）。 */
+    public List<ChipBindingRow> findChipBindings(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT chip_code, race_id, bib, bound_at FROM chip_binding "
+                        + "WHERE race_id = ? ORDER BY chip_code",
+                CHIP_BINDING_ROW_MAPPER, raceId);
+    }
+
+    /** 新建芯片-选手当前绑定（芯片主键与选手唯一键冲突由数据库约束拒绝）。 */
+    public void insertChipBinding(ChipBindingRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO chip_binding (chip_code, race_id, bib, bound_at) "
+                        + "VALUES (?, ?, ?, ?)",
+                row.chipCode(), row.raceId(), row.bib(), row.boundAt());
+    }
+
+    /** 删除某芯片的当前绑定（更换生效后释放旧芯片，使其可被重新发放）。 */
+    public int deleteChipBinding(String chipCode) {
+        return jdbcTemplate.update("DELETE FROM chip_binding WHERE chip_code = ?", chipCode);
+    }
+
+    /** 追加一条芯片更换历史（只追加不改写）。 */
+    public void insertChipReplacement(ChipReplacementRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO chip_replacement "
+                        + "(replacement_id, race_id, bib, old_chip_code, new_chip_code, "
+                        + "effective_at, referee, before_attribution, after_attribution, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                row.replacementId(), row.raceId(), row.bib(), row.oldChipCode(),
+                row.newChipCode(), row.effectiveAt(), row.referee(),
+                row.beforeAttribution(), row.afterAttribution(), row.createdAt());
+    }
+
+    /** 查询某选手的全部芯片更换历史，按提交顺序（自增 id）稳定返回。 */
+    public List<ChipReplacementRow> findChipReplacementsForRunner(String raceId, String bib) {
+        return jdbcTemplate.query(
+                "SELECT id, replacement_id, race_id, bib, old_chip_code, new_chip_code, "
+                        + "effective_at, referee, before_attribution, after_attribution, created_at "
+                        + "FROM chip_replacement WHERE race_id = ? AND bib = ? ORDER BY id",
+                CHIP_REPLACEMENT_ROW_MAPPER, raceId, bib);
+    }
+
+    /** 查询赛事下全部芯片更换历史，先按参赛号、再按提交顺序稳定返回。 */
+    public List<ChipReplacementRow> findAllChipReplacements(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT id, replacement_id, race_id, bib, old_chip_code, new_chip_code, "
+                        + "effective_at, referee, before_attribution, after_attribution, created_at "
+                        + "FROM chip_replacement WHERE race_id = ? ORDER BY bib, id",
+                CHIP_REPLACEMENT_ROW_MAPPER, raceId);
     }
 
     /** 查询封榜快照（含全部条目与分段明细）；未封榜返回 empty。 */
@@ -192,7 +304,7 @@ public class RaceRepository {
                         + "FROM result_snapshot_entry WHERE race_id = ? ORDER BY display_order",
                 SNAPSHOT_ENTRY_ROW_MAPPER, raceId);
         List<SnapshotCheckpointRow> checkpoints = jdbcTemplate.query(
-                "SELECT race_id, bib, checkpoint_code, position, elapsed_millis, timing_id "
+                "SELECT race_id, bib, checkpoint_code, position, elapsed_millis, timing_id, chip_code "
                         + "FROM result_snapshot_checkpoint WHERE race_id = ? "
                         + "ORDER BY bib, position",
                 SNAPSHOT_CHECKPOINT_ROW_MAPPER, raceId);
@@ -223,12 +335,16 @@ public class RaceRepository {
                 raceId, now);
     }
 
-    /** 登记选手；finishTimeMs 为 null 表示计时缺失。 */
-    public void insertRunner(String raceId, String bib, Long finishTimeMs, long now) {
+    /** 登记选手；finishTimeMs 为 null 表示计时缺失；chipCode 非空时同步建立当前芯片绑定。 */
+    public void insertRunner(String raceId, String bib, Long finishTimeMs, String chipCode, long now) {
         jdbcTemplate.update(
-                "INSERT INTO runner (race_id, bib, finish_time_ms, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, ?, ?)",
-                raceId, bib, finishTimeMs, now, now);
+                "INSERT INTO runner (race_id, bib, finish_time_ms, runner_status, chip_code, "
+                        + "created_at, updated_at) "
+                        + "VALUES (?, ?, ?, 'ACTIVE', ?, ?, ?)",
+                raceId, bib, finishTimeMs, chipCode, now, now);
+        if (chipCode != null && !chipCode.isBlank()) {
+            insertChipBinding(new ChipBindingRow(chipCode, raceId, bib, now));
+        }
     }
 
     /** 修订选手原始完赛耗时；返回受影响行数（0 表示选手不存在）。 */
@@ -236,6 +352,21 @@ public class RaceRepository {
         return jdbcTemplate.update(
                 "UPDATE runner SET finish_time_ms = ?, updated_at = ? WHERE race_id = ? AND bib = ?",
                 finishTimeMs, now, raceId, bib);
+    }
+
+    /** 更换芯片生效：更新选手当前芯片并刷新 updated_at。 */
+    public int updateRunnerChip(String raceId, String bib, String chipCode, long now) {
+        return jdbcTemplate.update(
+                "UPDATE runner SET chip_code = ?, updated_at = ? WHERE race_id = ? AND bib = ?",
+                chipCode, now, raceId, bib);
+    }
+
+    /** 标记选手退赛（仅当前 ACTIVE 生效），返回受影响行数。 */
+    public int markRunnerWithdrawn(String raceId, String bib, long now) {
+        return jdbcTemplate.update(
+                "UPDATE runner SET runner_status = 'WITHDRAWN', updated_at = ? "
+                        + "WHERE race_id = ? AND bib = ? AND runner_status = 'ACTIVE'",
+                now, raceId, bib);
     }
 
     /** 新增处罚（不可覆盖历史）。 */
@@ -310,8 +441,8 @@ public class RaceRepository {
                 });
         jdbcTemplate.batchUpdate(
                 "INSERT INTO result_snapshot_checkpoint "
-                        + "(race_id, bib, checkpoint_code, position, elapsed_millis, timing_id) "
-                        + "VALUES (?, ?, ?, ?, ?, ?)",
+                        + "(race_id, bib, checkpoint_code, position, elapsed_millis, timing_id, chip_code) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 snapshot.checkpoints(),
                 snapshot.checkpoints().size(),
                 (ps, detail) -> {
@@ -321,6 +452,7 @@ public class RaceRepository {
                     ps.setInt(4, detail.position());
                     ps.setObject(5, detail.elapsedMillis());
                     ps.setString(6, detail.timingId());
+                    ps.setString(7, detail.chipCode());
                 });
     }
 
@@ -374,8 +506,10 @@ public class RaceRepository {
         jdbcTemplate.update("DELETE FROM result_snapshot_entry");
         jdbcTemplate.update("DELETE FROM result_snapshot");
         jdbcTemplate.update("DELETE FROM idempotency_record");
+        jdbcTemplate.update("DELETE FROM chip_replacement");
         jdbcTemplate.update("DELETE FROM checkpoint_timing");
         jdbcTemplate.update("DELETE FROM checkpoint");
+        jdbcTemplate.update("DELETE FROM chip_binding");
         jdbcTemplate.update("DELETE FROM penalty");
         jdbcTemplate.update("DELETE FROM runner");
         jdbcTemplate.update("DELETE FROM race");
@@ -401,6 +535,8 @@ public class RaceRepository {
                     rs.getString("race_id"),
                     rs.getString("bib"),
                     finishTimeMs,
+                    RunnerStatus.valueOf(rs.getString("runner_status")),
+                    rs.getString("chip_code"),
                     rs.getLong("created_at"),
                     rs.getLong("updated_at"));
         }
@@ -460,6 +596,8 @@ public class RaceRepository {
                     rs.getString("checkpoint_code"),
                     rs.getInt("position"),
                     rs.getLong("elapsed_millis"),
+                    rs.getString("chip_code"),
+                    (Long) rs.getObject("read_at_ms"),
                     rs.getLong("created_at"));
         }
     }
@@ -474,7 +612,37 @@ public class RaceRepository {
                     rs.getString("checkpoint_code"),
                     rs.getInt("position"),
                     (Long) rs.getObject("elapsed_millis"),
-                    rs.getString("timing_id"));
+                    rs.getString("timing_id"),
+                    rs.getString("chip_code"));
+        }
+    }
+
+    private static final class ChipBindingRowMapper implements RowMapper<ChipBindingRow> {
+        @Override
+        public ChipBindingRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new ChipBindingRow(
+                    rs.getString("chip_code"),
+                    rs.getString("race_id"),
+                    rs.getString("bib"),
+                    rs.getLong("bound_at"));
+        }
+    }
+
+    private static final class ChipReplacementRowMapper implements RowMapper<ChipReplacementRow> {
+        @Override
+        public ChipReplacementRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new ChipReplacementRow(
+                    rs.getLong("id"),
+                    rs.getString("replacement_id"),
+                    rs.getString("race_id"),
+                    rs.getString("bib"),
+                    rs.getString("old_chip_code"),
+                    rs.getString("new_chip_code"),
+                    rs.getLong("effective_at"),
+                    rs.getString("referee"),
+                    rs.getString("before_attribution"),
+                    rs.getString("after_attribution"),
+                    rs.getLong("created_at"));
         }
     }
 

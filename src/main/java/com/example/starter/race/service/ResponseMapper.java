@@ -2,6 +2,8 @@ package com.example.starter.race.service;
 
 import com.example.starter.race.api.CheckpointPassResponse;
 import com.example.starter.race.api.CheckpointTimingResponse;
+import com.example.starter.race.api.ChipAttributionItem;
+import com.example.starter.race.api.ChipReplacementResponse;
 import com.example.starter.race.api.PenaltyResponse;
 import com.example.starter.race.api.ResultEntryResponse;
 import com.example.starter.race.api.RunnerResponse;
@@ -12,13 +14,17 @@ import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
+import com.example.starter.race.persistence.ChipReplacementRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
 import com.example.starter.race.persistence.RunnerRow;
 import com.example.starter.race.persistence.SnapshotCheckpointRow;
 import com.example.starter.race.persistence.SnapshotEntryRow;
 import com.example.starter.race.persistence.SnapshotRow;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -32,7 +38,8 @@ final class ResponseMapper {
     }
 
     static RunnerResponse toRunnerResponse(RunnerRow row) {
-        return new RunnerResponse(row.bib(), row.finishTimeMs(), row.createdAt(), row.updatedAt());
+        return new RunnerResponse(row.bib(), row.status().name(), row.chipCode(),
+                row.finishTimeMs(), row.createdAt(), row.updatedAt());
     }
 
     static PenaltyResponse toPenaltyResponse(PenaltyRow row) {
@@ -43,7 +50,47 @@ final class ResponseMapper {
     static CheckpointTimingResponse toTimingResponse(CheckpointTimingRow row) {
         return new CheckpointTimingResponse(
                 row.timingId(), row.bib(), row.checkpointCode(), row.position(),
-                row.elapsedMillis(), row.createdAt());
+                row.elapsedMillis(), row.chipCode(), row.readAtMs(), row.createdAt());
+    }
+
+    /** 把固化的更换历史行转为响应；归属 JSON 文本反序列化为明细列表（解析失败抛状态异常）。 */
+    static ChipReplacementResponse toReplacementResponse(
+            ChipReplacementRow row, ObjectMapper objectMapper) {
+        return new ChipReplacementResponse(
+                row.replacementId(),
+                row.raceId(),
+                row.bib(),
+                row.oldChipCode(),
+                row.newChipCode(),
+                row.effectiveAt(),
+                row.referee(),
+                row.createdAt(),
+                parseAttribution(row.beforeAttribution(), objectMapper),
+                parseAttribution(row.afterAttribution(), objectMapper));
+    }
+
+    static List<ChipAttributionItem> parseAttribution(String json, ObjectMapper objectMapper) {
+        try {
+            JsonNode root = objectMapper.readTree(json);
+            List<ChipAttributionItem> items = new ArrayList<>(root.size());
+            for (JsonNode node : root) {
+                items.add(new ChipAttributionItem(
+                        textOrNull(node, "timingId"),
+                        textOrNull(node, "checkpointCode"),
+                        node.path("position").asInt(),
+                        node.path("elapsedMillis").asLong(),
+                        node.path("readAtMs").asLong(),
+                        textOrNull(node, "chipCode")));
+            }
+            return items;
+        } catch (Exception ex) {
+            throw new IllegalStateException("解析芯片归属历史失败", ex);
+        }
+    }
+
+    private static String textOrNull(JsonNode node, String field) {
+        JsonNode value = node.get(field);
+        return value == null || value.isNull() ? null : value.asText();
     }
 
     static StandingResponse liveStanding(
@@ -99,7 +146,7 @@ final class ResponseMapper {
 
     /**
      * 组装单个选手的分段明细：按检查点顺序，把已有通过记录映射到对应检查点，
-     * 未通过的检查点 elapsedMillis/timingId 为 null。
+     * 未通过的检查点 elapsedMillis/timingId/chipCode 为 null。
      */
     static RunnerTimingResponse runnerTiming(
             RaceRow race,
@@ -117,14 +164,15 @@ final class ResponseMapper {
                             checkpoint.checkpointCode(),
                             checkpoint.position(),
                             timing == null ? null : timing.elapsedMillis(),
-                            timing == null ? null : timing.timingId());
+                            timing == null ? null : timing.timingId(),
+                            timing == null ? null : timing.chipCode());
                 })
                 .toList();
         return new RunnerTimingResponse(
                 race.raceId(), runner.bib(), race.version(), runner.finishTimeMs(), passes);
     }
 
-    /** 由封榜快照中的分段明细组装单选手分段视图（缺失检查点 elapsedMillis/timingId 为 null）。 */
+    /** 由封榜快照中的分段明细组装单选手分段视图（缺失检查点各字段为 null，芯片随快照固化）。 */
     static RunnerTimingResponse snapshotRunnerTiming(
             SnapshotRow snapshot,
             String bib,
@@ -141,11 +189,12 @@ final class ResponseMapper {
                     SnapshotCheckpointRow detail = byCode.get(checkpoint.checkpointCode());
                     if (detail == null) {
                         return new CheckpointPassResponse(
-                                checkpoint.checkpointCode(), checkpoint.position(), null, null);
+                                checkpoint.checkpointCode(), checkpoint.position(),
+                                null, null, null);
                     }
                     return new CheckpointPassResponse(
                             detail.checkpointCode(), detail.position(),
-                            detail.elapsedMillis(), detail.timingId());
+                            detail.elapsedMillis(), detail.timingId(), detail.chipCode());
                 })
                 .toList();
         return new RunnerTimingResponse(

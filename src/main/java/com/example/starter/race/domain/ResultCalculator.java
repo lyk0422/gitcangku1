@@ -16,6 +16,8 @@ import java.util.Set;
  * <ul>
  *   <li>总耗时=原始完赛耗时+全部未撤销 ADD_TIME 加时之和；</li>
  *   <li>存在未撤销 DISQUALIFY 处罚时状态 DISQUALIFIED，不排名，全部撤销后恢复计算；</li>
+ *   <li>已退赛（WITHDRAWN）选手不参与排名，状态 WITHDRAWN；退赛不改变其历史读数，
+ *       仅按在赛状态移出榜单；</li>
  *   <li>原始耗时缺失（null）时状态 UNTIMED，不排名；</li>
  *   <li>赛事配置了检查点时：已有完赛耗时但未覆盖全部检查点的选手状态
  *       MISSING_CHECKPOINT，不排名；全部覆盖后恢复加时与并列排名规则；
@@ -58,7 +60,8 @@ public final class ResultCalculator {
         Map<String, Aggregate> aggregates = new LinkedHashMap<>();
         for (RunnerView runner : runnerView) {
             aggregates.put(runner.bib(),
-                    new Aggregate(runner.bib(), runner.finishTimeMs(), orderedCheckpoints));
+                    new Aggregate(runner.bib(), runner.finishTimeMs(), runner.withdrawn(),
+                            orderedCheckpoints));
         }
 
         // 仅统计属于已配置检查点的分段（数据库外键已保证，这里做防御性过滤）。
@@ -91,6 +94,9 @@ public final class ResultCalculator {
         for (Aggregate aggregate : aggregates.values()) {
             if (aggregate.disqualified) {
                 aggregate.status = EntryStatus.DISQUALIFIED;
+                others.add(aggregate);
+            } else if (aggregate.withdrawn) {
+                aggregate.status = EntryStatus.WITHDRAWN;
                 others.add(aggregate);
             } else if (aggregate.finishTimeMs == null) {
                 aggregate.status = EntryStatus.UNTIMED;
@@ -139,6 +145,11 @@ public final class ResultCalculator {
         String bib();
 
         Long finishTimeMs();
+
+        /** 是否已退赛；默认 false 以兼容无退赛概念的调用方与历史测试夹具。 */
+        default boolean withdrawn() {
+            return false;
+        }
     }
 
     /** 处罚视图。 */
@@ -156,6 +167,7 @@ public final class ResultCalculator {
     private static final class Aggregate {
         private final String bib;
         private final Long finishTimeMs;
+        private final boolean withdrawn;
         private final List<CheckpointView> checkpoints;
         private final Set<String> coveredCodes = new HashSet<>();
         private long penaltyMs;
@@ -164,9 +176,11 @@ public final class ResultCalculator {
         private int rank;
         private long totalTimeMs;
 
-        private Aggregate(String bib, Long finishTimeMs, List<CheckpointView> checkpoints) {
+        private Aggregate(String bib, Long finishTimeMs, boolean withdrawn,
+                          List<CheckpointView> checkpoints) {
             this.bib = bib;
             this.finishTimeMs = finishTimeMs;
+            this.withdrawn = withdrawn;
             this.checkpoints = checkpoints;
         }
 
