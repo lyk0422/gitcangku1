@@ -57,7 +57,15 @@ public class TaskService {
      * PAUSED 时不创建新任务，已有任务仍可查看与回执。
      */
     public PullResponse pull(String deviceId, String requestId) {
-        String fingerprint = String.join("|", "task.pull", deviceId);
+        return pull(deviceId, requestId, null);
+    }
+
+    public PullResponse pull(String deviceId, String requestId, String operator) {
+        String effectiveOperator =
+                operator == null || operator.isBlank()
+                        ? com.example.starter.firmware.api.CreateReleaseRequest.DEFAULT_OPERATOR
+                        : operator.trim();
+        String fingerprint = String.join("|", "task.pull", effectiveOperator, deviceId);
         return idempotency.execute(requestId, "task.pull", fingerprint, () -> {
             Device device = deviceService.findDevice(deviceId);
             var activeOrder = releaseRepository.findActiveByModel(device.model());
@@ -95,7 +103,8 @@ public class TaskService {
      * 样本达到下限且失败率越限时，同事务将仍为 ACTIVE 的发布单原子转为 PAUSED 并落暂停记录。
      */
     public TaskView receipt(long taskId, ReceiptRequest request) {
-        String fingerprint = String.join("|", "task.receipt", String.valueOf(taskId), request.result().name());
+        String fingerprint = String.join("|", "task.receipt", request.effectiveOperator(),
+                String.valueOf(taskId), request.result().name());
         return idempotency.execute(request.requestId(), "task.receipt", fingerprint, () -> {
             RolloutTask snapshot = taskRepository.findById(taskId)
                     .orElseThrow(() -> ApiException.notFound("TASK_NOT_FOUND", "任务不存在: " + taskId));

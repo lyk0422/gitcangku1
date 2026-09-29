@@ -40,7 +40,7 @@ public class ReleaseController {
 
     @PostMapping("/{releaseId}/cancel")
     public ReleaseView cancel(@PathVariable long releaseId, @Valid @RequestBody RequestIdBody request) {
-        return releaseService.cancel(releaseId, request.requestId());
+        return releaseService.cancel(releaseId, request.requestId(), request.operator());
     }
 
     @PostMapping("/{releaseId}/resume")

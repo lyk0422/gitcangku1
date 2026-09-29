@@ -34,8 +34,15 @@ class FirmwarePauseResumeTest {
         jdbc.update("DELETE FROM release_pause_record");
         jdbc.update("DELETE FROM release_resume_record");
         jdbc.update("DELETE FROM release_order");
+        jdbc.update("DELETE FROM release_gate");
+        jdbc.update("DELETE FROM rollback_rehearsal_device");
+        jdbc.update("DELETE FROM rollback_rehearsal");
         jdbc.update("DELETE FROM device");
         jdbc.update("DELETE FROM idempotency_record");
+        // 新增门禁后，正式投放创建须先取得 READY_FOR_RELEASE；为既有投放用例补齐门禁种子
+        jdbc.update("INSERT INTO release_gate (model, target_version, status, rehearsal_id,"
+                        + " required_device_count, actual_success_count, granted_at_utc)"
+                        + " VALUES ('m1', '2.0.0', 'READY_FOR_RELEASE', -1, 1, 1, '2026-09-01T00:00:00Z')");
     }
 
     private static long idOf(MvcResult result, String path) throws Exception {

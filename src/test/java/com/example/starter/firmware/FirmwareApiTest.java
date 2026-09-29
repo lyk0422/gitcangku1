@@ -39,8 +39,22 @@ class FirmwareApiTest {
         jdbc.update("DELETE FROM release_pause_record");
         jdbc.update("DELETE FROM release_resume_record");
         jdbc.update("DELETE FROM release_order");
+        jdbc.update("DELETE FROM release_gate");
+        jdbc.update("DELETE FROM rollback_rehearsal_device");
+        jdbc.update("DELETE FROM rollback_rehearsal");
         jdbc.update("DELETE FROM device");
         jdbc.update("DELETE FROM idempotency_record");
+        // 新增门禁后，正式投放创建须先取得 READY_FOR_RELEASE；为既有投放用例补齐门禁种子
+        grantGate("m1", "2.0.0");
+        grantGate("m1", "3.0.0");
+        grantGate("m2", "2.0.0");
+    }
+
+    private void grantGate(String model, String targetVersion) {
+        jdbc.update("INSERT INTO release_gate (model, target_version, status, rehearsal_id,"
+                        + " required_device_count, actual_success_count, granted_at_utc)"
+                        + " VALUES (?, ?, 'READY_FOR_RELEASE', -1, 1, 1, '2026-09-01T00:00:00Z')",
+                model, targetVersion);
     }
 
     private String registerDevice(String requestId, String deviceId, String model, String version, int bucket)

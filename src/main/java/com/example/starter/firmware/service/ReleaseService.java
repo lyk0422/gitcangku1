@@ -32,17 +32,20 @@ public class ReleaseService {
     private final TaskRepository taskRepository;
     private final PauseRecordRepository pauseRecordRepository;
     private final ResumeRecordRepository resumeRecordRepository;
+    private final RehearsalService rehearsalService;
     private final IdempotencyService idempotency;
     private final Clock clock;
 
     public ReleaseService(ReleaseRepository releaseRepository, TaskRepository taskRepository,
                           PauseRecordRepository pauseRecordRepository,
                           ResumeRecordRepository resumeRecordRepository,
+                          RehearsalService rehearsalService,
                           IdempotencyService idempotency, Clock clock) {
         this.releaseRepository = releaseRepository;
         this.taskRepository = taskRepository;
         this.pauseRecordRepository = pauseRecordRepository;
         this.resumeRecordRepository = resumeRecordRepository;
+        this.rehearsalService = rehearsalService;
         this.idempotency = idempotency;
         this.clock = clock;
     }
@@ -53,10 +56,13 @@ public class ReleaseService {
         }
         int sampleFloor = request.effectiveSampleFloor();
         int threshold = request.effectiveFailureThresholdPercent();
-        String fingerprint = String.join("|", "release.create", request.model(), request.fromVersion(),
+        String operator = request.effectiveOperator();
+        String fingerprint = String.join("|", "release.create", operator, request.model(), request.fromVersion(),
                 request.toVersion(), String.valueOf(request.ratio()), String.valueOf(sampleFloor),
                 String.valueOf(threshold));
         return idempotency.execute(request.requestId(), "release.create", fingerprint, () -> {
+            // 正式投放前门禁：型号+目标版本必须已取得 READY_FOR_RELEASE（来自一次全部成功的回滚演练）
+            rehearsalService.requireReadyGate(request.model(), request.toVersion());
             long id;
             try {
                 id = releaseRepository.insert(request.model(), request.fromVersion(), request.toVersion(),
@@ -69,8 +75,9 @@ public class ReleaseService {
     }
 
     public ReleaseView expand(long releaseId, ExpandReleaseRequest request) {
-        String fingerprint = String.join("|", "release.expand", String.valueOf(releaseId),
-                String.valueOf(request.expectedVersion()), String.valueOf(request.ratio()));
+        String fingerprint = String.join("|", "release.expand", request.effectiveOperator(),
+                String.valueOf(releaseId), String.valueOf(request.expectedVersion()),
+                String.valueOf(request.ratio()));
         return idempotency.execute(request.requestId(), "release.expand", fingerprint, () -> {
             ReleaseOrder order = releaseRepository.findByIdForUpdate(releaseId)
                     .orElseThrow(() -> ApiException.notFound("RELEASE_NOT_FOUND", "发布单不存在: " + releaseId));
@@ -95,8 +102,8 @@ public class ReleaseService {
      * 与取消并发时按行锁提交顺序决定唯一结果：取消先提交则恢复 409。
      */
     public ReleaseView resume(long releaseId, ResumeReleaseRequest request) {
-        String fingerprint = String.join("|", "release.resume", String.valueOf(releaseId),
-                String.valueOf(request.expectedVersion()), request.reason());
+        String fingerprint = String.join("|", "release.resume", request.effectiveOperator(),
+                String.valueOf(releaseId), String.valueOf(request.expectedVersion()), request.reason());
         return idempotency.execute(request.requestId(), "release.resume", fingerprint, () -> {
             ReleaseOrder order = releaseRepository.findByIdForUpdate(releaseId)
                     .orElseThrow(() -> ApiException.notFound("RELEASE_NOT_FOUND", "发布单不存在: " + releaseId));
@@ -120,7 +127,13 @@ public class ReleaseService {
     }
 
     public ReleaseView cancel(long releaseId, String requestId) {
-        String fingerprint = String.join("|", "release.cancel", String.valueOf(releaseId));
+        return cancel(releaseId, requestId, null);
+    }
+
+    public ReleaseView cancel(long releaseId, String requestId, String operator) {
+        String effectiveOperator =
+                operator == null || operator.isBlank() ? CreateReleaseRequest.DEFAULT_OPERATOR : operator.trim();
+        String fingerprint = String.join("|", "release.cancel", effectiveOperator, String.valueOf(releaseId));
         return idempotency.execute(requestId, "release.cancel", fingerprint, () -> {
             ReleaseOrder order = releaseRepository.findByIdForUpdate(releaseId)
                     .orElseThrow(() -> ApiException.notFound("RELEASE_NOT_FOUND", "发布单不存在: " + releaseId));

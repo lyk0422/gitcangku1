@@ -23,8 +23,8 @@ public class DeviceService {
     }
 
     public DeviceView register(RegisterDeviceRequest request) {
-        String fingerprint = String.join("|", "device.register", request.deviceId(), request.model(),
-                request.currentVersion(), String.valueOf(request.bucketNo()));
+        String fingerprint = String.join("|", "device.register", request.effectiveOperator(),
+                request.deviceId(), request.model(), request.currentVersion(), String.valueOf(request.bucketNo()));
         return idempotency.execute(request.requestId(), "device.register", fingerprint, () -> {
             try {
                 deviceRepository.insert(new Device(request.deviceId(), request.model(),

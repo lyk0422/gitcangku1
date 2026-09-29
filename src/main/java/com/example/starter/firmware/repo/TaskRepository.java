@@ -87,4 +87,13 @@ public class TaskRepository {
                 Long.class, releaseId, deviceId);
         return count == null ? 0 : count;
     }
+
+    /**
+     * 统计设备在任意正式发布单上的任务数（含已取消/已终结）。已进入正式投放的设备不能再作为演练规范设备。
+     */
+    public long countByDeviceAcrossReleases(String deviceId) {
+        Long count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM rollout_task WHERE device_id = ?", Long.class, deviceId);
+        return count == null ? 0 : count;
+    }
 }

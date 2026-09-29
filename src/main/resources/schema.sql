@@ -71,3 +71,51 @@ CREATE TABLE IF NOT EXISTS idempotency_record (
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   PRIMARY KEY (request_id)
 ) COMMENT='写操作幂等去重记录，失败不占键';
+
+-- 回滚演练与正式投放门禁 schema。所有业务时刻均为 UTC（ISO-8601，以Z结尾），
+-- 时间区间按左闭右开 [started_at_utc, ended_at_utc) 解释；历史只增不改。
+
+CREATE TABLE IF NOT EXISTS rollback_rehearsal (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '演练ID',
+  model VARCHAR(64) NOT NULL COMMENT '演练目标设备型号，与规范集合内每台设备型号一致',
+  target_version VARCHAR(64) NOT NULL COMMENT '目标固件版本（正式投放的to_version），演练开始时设备当前版本须等于此版本',
+  rollback_version VARCHAR(64) NOT NULL COMMENT '回退固件版本，必须与目标版本不同',
+  status VARCHAR(16) NOT NULL COMMENT '演练状态：RUNNING已开始未提交结果，SUCCEEDED全部设备成功回退且结束不早于开始（终态）',
+  operator VARCHAR(64) NOT NULL COMMENT '发起演练的操作者，参与幂等指纹，不可变',
+  device_count INT NOT NULL COMMENT '规范设备集合数量（去重排序后），即要求成功的设备数',
+  success_count INT NOT NULL DEFAULT 0 COMMENT '实际成功回退设备数；未提交结果为0',
+  failed_count INT NOT NULL DEFAULT 0 COMMENT '实际失败设备数；未提交结果为0',
+  started_at_utc VARCHAR(40) NOT NULL COMMENT '演练开始时刻，UTC，ISO-8601（如2026-09-29T10:00:00Z），左闭端点',
+  ended_at_utc VARCHAR(40) NULL COMMENT '演练结束时刻，UTC，ISO-8601，右端点（不含）；未提交结果为NULL',
+  duration_seconds BIGINT NULL COMMENT '演练时长秒数=结束-开始（实际值）；未提交结果为NULL',
+  active_key VARCHAR(129) NULL COMMENT 'RUNNING时为 型号+0x1F+目标版本，完成后置NULL；用于同型号同目标版本至多一个未完成演练的唯一约束',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  PRIMARY KEY (id)
+) COMMENT='固件回滚演练单，历史不可改';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_rehearsal_active ON rollback_rehearsal (active_key);
+
+CREATE TABLE IF NOT EXISTS rollback_rehearsal_device (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '演练设备行ID',
+  rehearsal_id BIGINT NOT NULL COMMENT '所属演练ID',
+  device_id VARCHAR(64) NOT NULL COMMENT '规范集合内设备ID',
+  ordinal INT NOT NULL COMMENT '规范集合中的排序序号（设备ID字典序，从0开始），用于稳定排序',
+  result VARCHAR(16) NULL COMMENT '回退结果SUCCESS/FAILED；未提交结果为NULL（null语义稳定）',
+  recorded_at_utc VARCHAR(40) NULL COMMENT '结果记录时刻，UTC，ISO-8601；未提交结果为NULL',
+  PRIMARY KEY (id),
+  CONSTRAINT uk_rehearsal_device UNIQUE (rehearsal_id, device_id)
+) COMMENT='演练规范设备集合与每台结果，结果批量提交，失败整批回滚不留半成品';
+
+CREATE TABLE IF NOT EXISTS release_gate (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '门禁记录ID',
+  model VARCHAR(64) NOT NULL COMMENT '发布设备型号',
+  target_version VARCHAR(64) NOT NULL COMMENT '发布目标固件版本（正式投放的to_version）',
+  status VARCHAR(32) NOT NULL COMMENT '门禁结论：READY_FOR_RELEASE可创建正式投放，结论不可变',
+  rehearsal_id BIGINT NOT NULL COMMENT '授予该门禁的成功演练ID（业务证据，不可变）',
+  required_device_count INT NOT NULL COMMENT '要求成功的设备数（演练规范集合数量）',
+  actual_success_count INT NOT NULL COMMENT '实际成功回退设备数，授予时等于要求数',
+  granted_at_utc VARCHAR(40) NOT NULL COMMENT '门禁授予时刻，UTC，ISO-8601',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  PRIMARY KEY (id),
+  CONSTRAINT uk_gate_model_version UNIQUE (model, target_version)
+) COMMENT='正式投放前门禁结论，按型号+目标版本唯一且不可变';
