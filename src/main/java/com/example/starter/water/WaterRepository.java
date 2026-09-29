@@ -25,9 +25,13 @@ public class WaterRepository {
                             BigDecimal plannedVolume, long createdNanos) {
     }
 
-    /** 配水申请行；amount 为不可改写的原申请水量，heldAmount 为当前持有额度。 */
+    /**
+     * 配水申请行；amount 为不可改写的原申请水量，heldAmount 为当前持有额度。
+     * creditCoefficient 为每毫米降雨抵扣系数（立方米/毫米），null 表示不参与降雨抵扣。
+     */
     public record AllocationRow(long id, String allocationKey, long windowId, String userId, BigDecimal amount,
                                 BigDecimal heldAmount, String requester, String status,
+                                BigDecimal creditCoefficient,
                                 long createdNanos, long updatedNanos) {
     }
 
@@ -39,6 +43,28 @@ public class WaterRepository {
     /** 限供行。 */
     public record CurtailmentRow(long id, long windowId, BigDecimal volume, String status, long createdNanos,
                                  Long cancelledNanos) {
+    }
+
+    /** 降雨确认证据行，不可变。 */
+    public record RainConfirmationRow(long id, long rainRecordId, String confirmer, long createdNanos) {
+    }
+
+    /** 降雨记录行；effectiveNanos 未生效为 null；revokedNanos/revokedBy 未撤销为 null。 */
+    public record RainRecordRow(long id, String rainKey, long windowId, BigDecimal rainMillis,
+                                long observedNanos, String status, String registeredBy, long createdNanos,
+                                Long effectiveNanos, Long revokedNanos, String revokedBy) {
+    }
+
+    /** 核销单行，创建后不可变。 */
+    public record WriteoffRow(long id, String writeoffKey, long windowId, BigDecimal totalAmount,
+                              BigDecimal totalCredit, BigDecimal totalQuota, String status, String actor,
+                              long createdNanos) {
+    }
+
+    /** 核销明细行，创建后不可变；coefficient 为结算时申请系数快照，appliedRainKeys 为 JSON 数组字符串。 */
+    public record WriteoffItemRow(long id, long writeoffId, String allocationKey, int seqNo, BigDecimal amount,
+                                  BigDecimal credit, BigDecimal quotaDeduction, BigDecimal coefficient,
+                                  String appliedRainKeys) {
     }
 
     /** 幂等命令行；response 为 null 表示响应尚未写回（同事务内）。 */
@@ -55,11 +81,12 @@ public class WaterRepository {
             rs.getLong("id"), rs.getString("allocation_key"), rs.getLong("window_id"),
             rs.getString("user_id"), rs.getBigDecimal("amount"), rs.getBigDecimal("held_amount"),
             rs.getString("requester"), rs.getString("status"),
+            rs.getBigDecimal("credit_coefficient"),
             rs.getLong("created_nanos"), rs.getLong("updated_nanos"));
 
     private static final String ALLOCATION_SELECT =
             "SELECT id, allocation_key, window_id, user_id, amount, held_amount, requester, status,"
-                    + " created_nanos, updated_nanos";
+                    + " credit_coefficient, created_nanos, updated_nanos";
 
     private static final RowMapper<TransferRow> TRANSFER_MAPPER = (rs, n) -> new TransferRow(
             rs.getLong("id"), rs.getString("transfer_key"), rs.getLong("window_id"),
@@ -74,6 +101,39 @@ public class WaterRepository {
     private static final RowMapper<CommandRow> COMMAND_MAPPER = (rs, n) -> new CommandRow(
             rs.getString("command_key"), rs.getString("operation"), rs.getString("params"),
             rs.getString("response"), rs.getLong("created_nanos"));
+
+    private static final RowMapper<RainRecordRow> RAIN_MAPPER = (rs, n) -> new RainRecordRow(
+            rs.getLong("id"), rs.getString("rain_key"), rs.getLong("window_id"),
+            rs.getBigDecimal("rain_millis"), rs.getLong("observed_nanos"), rs.getString("status"),
+            rs.getString("registered_by"), rs.getLong("created_nanos"),
+            rs.getObject("effective_nanos") == null ? null : rs.getLong("effective_nanos"),
+            rs.getObject("revoked_nanos") == null ? null : rs.getLong("revoked_nanos"),
+            rs.getString("revoked_by"));
+
+    private static final String RAIN_SELECT =
+            "SELECT id, rain_key, window_id, rain_millis, observed_nanos, status, registered_by,"
+                    + " created_nanos, effective_nanos, revoked_nanos, revoked_by";
+
+    private static final RowMapper<RainConfirmationRow> RAIN_CONFIRMATION_MAPPER = (rs, n) ->
+            new RainConfirmationRow(rs.getLong("id"), rs.getLong("rain_record_id"),
+                    rs.getString("confirmer"), rs.getLong("created_nanos"));
+
+    private static final RowMapper<WriteoffRow> WRITEOFF_MAPPER = (rs, n) -> new WriteoffRow(
+            rs.getLong("id"), rs.getString("writeoff_key"), rs.getLong("window_id"),
+            rs.getBigDecimal("total_amount"), rs.getBigDecimal("total_credit"),
+            rs.getBigDecimal("total_quota"), rs.getString("status"), rs.getString("actor"),
+            rs.getLong("created_nanos"));
+
+    private static final String WRITEOFF_SELECT =
+            "SELECT id, writeoff_key, window_id, total_amount, total_credit, total_quota, status,"
+                    + " actor, created_nanos";
+
+    private static final RowMapper<WriteoffItemRow> WRITEOFF_ITEM_MAPPER = (rs, n) -> new WriteoffItemRow(
+            rs.getLong("id"), rs.getLong("writeoff_id"), rs.getString("allocation_key"),
+            rs.getInt("seq_no"), rs.getBigDecimal("amount"), rs.getBigDecimal("credit"),
+            rs.getBigDecimal("quota_deduction"),
+            rs.getObject("coefficient") == null ? null : rs.getBigDecimal("coefficient"),
+            rs.getString("applied_rains"));
 
     private final JdbcTemplate jdbc;
 
@@ -130,21 +190,23 @@ public class WaterRepository {
         return count != null && count > 0;
     }
 
-    /** 插入申请（初始 REQUESTED）并返回主键。 */
+    /** 插入申请（初始 REQUESTED）并返回主键；creditCoefficient 为 null 表示不参与降雨抵扣。 */
     public long insertAllocation(String allocationKey, long windowId, String userId, BigDecimal amount,
-                                 String requester, long nowNanos) {
+                                 String requester, BigDecimal creditCoefficient, long nowNanos) {
         KeyHolder keys = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO allocation (allocation_key, window_id, user_id, amount, held_amount, requester, status, created_nanos, updated_nanos)"
-                            + " VALUES (?, ?, ?, ?, 0, ?, 'REQUESTED', ?, ?)", Statement.RETURN_GENERATED_KEYS);
+                    "INSERT INTO allocation (allocation_key, window_id, user_id, amount, held_amount, requester,"
+                            + " credit_coefficient, status, created_nanos, updated_nanos)"
+                            + " VALUES (?, ?, ?, ?, 0, ?, ?, 'REQUESTED', ?, ?)", Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, allocationKey);
             ps.setLong(2, windowId);
             ps.setString(3, userId);
             ps.setBigDecimal(4, amount);
             ps.setString(5, requester);
-            ps.setLong(6, nowNanos);
+            ps.setBigDecimal(6, creditCoefficient);
             ps.setLong(7, nowNanos);
+            ps.setLong(8, nowNanos);
             return ps;
         }, keys);
         return Objects.requireNonNull(keys.getKey()).longValue();
@@ -303,5 +365,190 @@ public class WaterRepository {
     /** 写回命令首次成功响应。 */
     public void updateCommandResponse(String commandKey, String response) {
         jdbc.update("UPDATE command_log SET response = ? WHERE command_key = ?", response, commandKey);
+    }
+
+    // ------------------------------------------------------------------
+    // 降雨记录与确认
+    // ------------------------------------------------------------------
+
+    /** 插入降雨记录（初始 PENDING）并返回主键。 */
+    public long insertRainRecord(String rainKey, long windowId, BigDecimal rainMillis, long observedNanos,
+                                 String registeredBy, long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            // 显式声明仅 id 为生成键：表内含生成列 effective_window_id，RETURN_GENERATED_KEYS 会返回多键
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO rain_record (rain_key, window_id, rain_millis, observed_nanos, status,"
+                            + " registered_by, created_nanos, effective_nanos, revoked_nanos, revoked_by)"
+                            + " VALUES (?, ?, ?, ?, 'PENDING', ?, ?, NULL, NULL, NULL)",
+                    new String[]{"id"});
+            ps.setString(1, rainKey);
+            ps.setLong(2, windowId);
+            ps.setBigDecimal(3, rainMillis);
+            ps.setLong(4, observedNanos);
+            ps.setString(5, registeredBy);
+            ps.setLong(6, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 按业务键查询降雨记录，不存在返回 null。 */
+    public RainRecordRow findRainByKey(String rainKey) {
+        try {
+            return jdbc.queryForObject(RAIN_SELECT + " FROM rain_record WHERE rain_key = ?",
+                    RAIN_MAPPER, rainKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 按业务键锁定降雨记录行（FOR UPDATE），不存在返回 null。 */
+    public RainRecordRow lockRainByKey(String rainKey) {
+        try {
+            return jdbc.queryForObject(RAIN_SELECT + " FROM rain_record WHERE rain_key = ? FOR UPDATE",
+                    RAIN_MAPPER, rainKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 判断窗口是否已存在 EFFECTIVE 降雨记录（同窗口唯一生效约束的事务内预检）。 */
+    public boolean existsEffectiveRain(long windowId) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM rain_record WHERE window_id = ? AND status = 'EFFECTIVE'",
+                Integer.class, windowId);
+        return count != null && count > 0;
+    }
+
+    /** 窗口全部降雨记录，按主键升序（登记先后稳定排序）。 */
+    public List<RainRecordRow> listRainRecords(long windowId) {
+        return jdbc.query(RAIN_SELECT + " FROM rain_record WHERE window_id = ? ORDER BY id",
+                RAIN_MAPPER, windowId);
+    }
+
+    /** 窗口当前 EFFECTIVE 降雨记录，按主键升序（通常至多一条）。 */
+    public List<RainRecordRow> listEffectiveRain(long windowId) {
+        return jdbc.query(
+                RAIN_SELECT + " FROM rain_record WHERE window_id = ? AND status = 'EFFECTIVE' ORDER BY id",
+                RAIN_MAPPER, windowId);
+    }
+
+    /** 插入确认证据（每名操作人对同一记录至多一次，由唯一约束保证）。 */
+    public void insertRainConfirmation(long rainRecordId, String confirmer, long createdNanos) {
+        jdbc.update("INSERT INTO rain_confirmation (rain_record_id, confirmer, created_nanos)"
+                + " VALUES (?, ?, ?)", rainRecordId, confirmer, createdNanos);
+    }
+
+    /** 统计记录当前确认人数。 */
+    public int countRainConfirmations(long rainRecordId) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM rain_confirmation WHERE rain_record_id = ?",
+                Integer.class, rainRecordId);
+        return count == null ? 0 : count;
+    }
+
+    /** 记录全部确认证据，按主键升序（确认先后稳定排序）。 */
+    public List<RainConfirmationRow> listRainConfirmations(long rainRecordId) {
+        return jdbc.query(
+                "SELECT id, rain_record_id, confirmer, created_nanos FROM rain_confirmation"
+                        + " WHERE rain_record_id = ? ORDER BY id",
+                RAIN_CONFIRMATION_MAPPER, rainRecordId);
+    }
+
+    /** 降雨记录生效：置 EFFECTIVE 并记录生效时刻。 */
+    public void markRainEffective(long rainRecordId, long effectiveNanos) {
+        jdbc.update("UPDATE rain_record SET status = 'EFFECTIVE', effective_nanos = ? WHERE id = ?",
+                effectiveNanos, rainRecordId);
+    }
+
+    /** 撤销降雨记录：置 REVOKED 并记录撤销时刻与操作人；不改写 effective_nanos 历史证据。 */
+    public void markRainRevoked(long rainRecordId, long revokedNanos, String revokedBy) {
+        jdbc.update("UPDATE rain_record SET status = 'REVOKED', revoked_nanos = ?, revoked_by = ? WHERE id = ?",
+                revokedNanos, revokedBy, rainRecordId);
+    }
+
+    // ------------------------------------------------------------------
+    // 核销
+    // ------------------------------------------------------------------
+
+    /** 插入核销单（SETTLED）并返回主键；金额已满足守恒约束。 */
+    public long insertWriteoff(String writeoffKey, long windowId, BigDecimal totalAmount, BigDecimal totalCredit,
+                               BigDecimal totalQuota, String actor, long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO writeoff (writeoff_key, window_id, total_amount, total_credit, total_quota,"
+                            + " status, actor, created_nanos)"
+                            + " VALUES (?, ?, ?, ?, ?, 'SETTLED', ?, ?)", Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, writeoffKey);
+            ps.setLong(2, windowId);
+            ps.setBigDecimal(3, totalAmount);
+            ps.setBigDecimal(4, totalCredit);
+            ps.setBigDecimal(5, totalQuota);
+            ps.setString(6, actor);
+            ps.setLong(7, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 插入不可变核销明细并返回主键；appliedRainKeys 为 JSON 数组字符串快照。 */
+    public long insertWriteoffItem(long writeoffId, int seqNo, String allocationKey, BigDecimal amount,
+                                   BigDecimal credit, BigDecimal quotaDeduction, BigDecimal coefficient,
+                                   String appliedRainKeys) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO writeoff_item (writeoff_id, allocation_key, seq_no, amount, credit,"
+                            + " quota_deduction, coefficient, applied_rains)"
+                            + " VALUES (?, ?, ?, ?, ?, ?, ?, ?)", Statement.RETURN_GENERATED_KEYS);
+            ps.setLong(1, writeoffId);
+            ps.setString(2, allocationKey);
+            ps.setInt(3, seqNo);
+            ps.setBigDecimal(4, amount);
+            ps.setBigDecimal(5, credit);
+            ps.setBigDecimal(6, quotaDeduction);
+            ps.setBigDecimal(7, coefficient);
+            ps.setString(8, appliedRainKeys);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 按业务键查询核销单，不存在返回 null。 */
+    public WriteoffRow findWriteoffByKey(String writeoffKey) {
+        try {
+            return jdbc.queryForObject(WRITEOFF_SELECT + " FROM writeoff WHERE writeoff_key = ?",
+                    WRITEOFF_MAPPER, writeoffKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 核销单全部明细，按 seq_no 升序稳定排序。 */
+    public List<WriteoffItemRow> listWriteoffItems(long writeoffId) {
+        return jdbc.query(
+                "SELECT id, writeoff_id, allocation_key, seq_no, amount, credit, quota_deduction, coefficient,"
+                        + " applied_rains FROM writeoff_item WHERE writeoff_id = ? ORDER BY seq_no",
+                WRITEOFF_ITEM_MAPPER, writeoffId);
+    }
+
+    /** 窗口全部核销单，按主键升序（核销先后稳定排序）。 */
+    public List<WriteoffRow> listWriteoffs(long windowId) {
+        return jdbc.query(WRITEOFF_SELECT + " FROM writeoff WHERE window_id = ? ORDER BY id",
+                WRITEOFF_MAPPER, windowId);
+    }
+
+    /**
+     * 条件扣减持有配额：仅当 held_amount >= deduction 时扣减并返回 true，否则不改动返回 false。
+     * 用于在窗口/申请行锁内做最终余额裁决，保证持有额度不会为负。
+     */
+    public boolean deductHeldAmountIfSufficient(long allocationId, BigDecimal deduction, long updatedNanos) {
+        int rows = jdbc.update(
+                "UPDATE allocation SET held_amount = held_amount - ?, updated_nanos = ?"
+                        + " WHERE id = ? AND held_amount >= ?",
+                deduction, updatedNanos, allocationId, deduction);
+        return rows > 0;
     }
 }

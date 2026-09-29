@@ -22,7 +22,9 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(ApiException.class)
     public ResponseEntity<ErrorResponse> handleApi(ApiException ex) {
-        return ResponseEntity.status(ex.status()).body(new ErrorResponse(ex.code(), ex.getMessage()));
+        return ResponseEntity.status(ex.status())
+                .body(new ErrorResponse(ex.code(), ex.getMessage(),
+                        ex.details().isEmpty() ? null : ex.details()));
     }
 
     @ExceptionHandler({HttpMessageNotReadableException.class, MissingRequestHeaderException.class,
