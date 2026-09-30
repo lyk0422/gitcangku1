@@ -1,0 +1,14 @@
+# 显式 -Dspring.profiles.active=test 时的等价配置；标准 test 默认已使用同目录 application.yaml。
+spring:
+  datasource:
+    url: jdbc:h2:mem:billing-test-profile;MODE=MySQL;LOCK_TIMEOUT=10000
+    username: sa
+    password:
+    driver-class-name: org.h2.Driver
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 1
+  sql:
+    init:
+      mode: always
+      encoding: UTF-8

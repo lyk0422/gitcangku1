@@ -1,0 +1,15 @@
+spring:
+  datasource:
+    # 测试专用独立命名内存库：MODE=MySQL；不设 DB_CLOSE_DELAY=-1，
+    # 连接池在测试上下文期间保持连接使库存活，上下文关闭、连接全部释放后内存库即销毁。
+    url: jdbc:h2:mem:billing-test;MODE=MySQL;LOCK_TIMEOUT=10000
+    username: sa
+    password:
+    driver-class-name: org.h2.Driver
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 1
+  sql:
+    init:
+      mode: always
+      encoding: UTF-8
