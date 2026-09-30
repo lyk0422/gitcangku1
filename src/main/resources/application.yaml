@@ -4,13 +4,20 @@ spring:
   config:
     import: "optional:configtree:/run/secrets/"
   datasource:
-    url: ${DB_URL}
-    username: ${DB_USER}
+    # 本地默认使用 H2 内存库（MySQL 兼容模式）；数据仅在本 JVM 进程内保留，进程退出即丢失。
+    # 如需外部数据库，可通过 DB_URL/DB_USER/DB_PASSWORD 覆盖。
+    url: ${DB_URL:jdbc:h2:mem:salinity;MODE=MySQL;DB_CLOSE_DELAY=-1;DATABASE_TO_LOWER=TRUE;LOCK_TIMEOUT=10000}
+    username: ${DB_USER:sa}
+    password: ${DB_PASSWORD:}
     hikari:
       maximum-pool-size: 5
       minimum-idle: 1
       connection-timeout: 10000
       validation-timeout: 3000
+  sql:
+    init:
+      mode: always
+      encoding: UTF-8
   jackson:
     time-zone: Asia/Shanghai
   lifecycle:

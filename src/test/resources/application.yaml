@@ -1,0 +1,12 @@
+spring:
+  datasource:
+    # 测试独立命名的内存库，与本地运行库隔离；MySQL 兼容模式。
+    url: jdbc:h2:mem:salinity_test;MODE=MySQL;DB_CLOSE_DELAY=-1;DATABASE_TO_LOWER=TRUE;LOCK_TIMEOUT=10000
+    username: sa
+    password:
+  sql:
+    init:
+      mode: always
+      encoding: UTF-8
+      # 测试只建表，不加载主程序的合成演示数据；场景数据由各测试自行准备与清理。
+      data-locations: classpath:test-data.sql
