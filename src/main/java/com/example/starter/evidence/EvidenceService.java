@@ -9,6 +9,7 @@ import com.example.starter.evidence.dto.IntakeRequest;
 import com.example.starter.evidence.dto.LoanCreateRequest;
 import com.example.starter.evidence.dto.LoanReturnRequest;
 import com.example.starter.evidence.dto.LoanView;
+import com.example.starter.evidence.dto.PlacementView;
 import com.example.starter.evidence.dto.SealInspectionRequest;
 import com.example.starter.evidence.dto.TransferInitiateRequest;
 import com.example.starter.evidence.dto.TransferView;
@@ -46,6 +47,7 @@ public class EvidenceService {
     private final SealInspectionRepository inspectionRepository;
     private final LoanRecordRepository loanRepository;
     private final CommandLogRepository commandLogRepository;
+    private final EvidencePlacementRepository placementRepository;
     private final ObjectMapper objectMapper;
     private final EvidenceClock clock;
 
@@ -54,6 +56,7 @@ public class EvidenceService {
                            SealInspectionRepository inspectionRepository,
                            LoanRecordRepository loanRepository,
                            CommandLogRepository commandLogRepository,
+                           EvidencePlacementRepository placementRepository,
                            ObjectMapper objectMapper,
                            EvidenceClock clock) {
         this.evidenceRepository = evidenceRepository;
@@ -61,6 +64,7 @@ public class EvidenceService {
         this.inspectionRepository = inspectionRepository;
         this.loanRepository = loanRepository;
         this.commandLogRepository = commandLogRepository;
+        this.placementRepository = placementRepository;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -104,6 +108,7 @@ public class EvidenceService {
             throw ApiException.badRequest("接收人不能与发起保管人相同");
         }
         requireSealIntact(evidence);
+        requireNotQuarantined(evidence, "发起交接");
         requireCustodian(evidence, actorId);
         if (evidence.status() == EvidenceStatus.TRANSFER_PENDING) {
             throw ApiException.conflict("证物已存在待接收交接: " + evidenceKey);
@@ -136,6 +141,7 @@ public class EvidenceService {
             return replay.get();
         }
         requireSealIntact(evidence);
+        requireNotQuarantined(evidence, "接受交接");
         TransferRecord pending = requirePending(evidence, evidenceKey);
         if (!pending.toCustodian().equals(actorId)) {
             throw ApiException.conflict("操作人不是指定接收人: " + actorId);
@@ -167,6 +173,7 @@ public class EvidenceService {
             return replay.get();
         }
         requireSealIntact(evidence);
+        requireNotQuarantined(evidence, "取消交接");
         TransferRecord pending = requirePending(evidence, evidenceKey);
         if (!pending.fromCustodian().equals(actorId)) {
             throw ApiException.conflict("仅原保管人可取消交接: " + actorId);
@@ -199,6 +206,7 @@ public class EvidenceService {
             return replay.get();
         }
         requireCustodian(evidence, actorId);
+        requireNotQuarantined(evidence, "封条核验");
         if (evidence.status() == EvidenceStatus.TRANSFER_PENDING) {
             throw ApiException.conflict("待接收期间禁止封条核验: " + evidenceKey);
         }
@@ -238,6 +246,10 @@ public class EvidenceService {
             throw ApiException.badRequest("借用人不能与当前保管人相同");
         }
         requireCustodian(evidence, actorId);
+        requireNotQuarantined(evidence, "借出");
+        if (evidence.containerKey() != null) {
+            throw ApiException.conflict("证物在容器内，须先移出再借出: " + evidenceKey);
+        }
         if (evidence.status() == EvidenceStatus.SEAL_BROKEN) {
             throw ApiException.unprocessable("封条已异常，禁止借出: " + evidenceKey);
         }
@@ -285,6 +297,7 @@ public class EvidenceService {
         }
         LoanRecord loan = loanRepository.findByLoanKey(request.loanKey())
                 .orElseThrow(() -> ApiException.notFound("借出记录不存在: " + request.loanKey()));
+        requireNotQuarantined(evidence, "归还");
         if (!loan.evidenceKey().equals(evidenceKey)) {
             throw ApiException.notFound("借出记录不属于该证物: " + request.loanKey());
         }
@@ -336,7 +349,7 @@ public class EvidenceService {
     }
 
     /**
-     * 查询完整保管链：证物当前状态 + 全部交接记录 + 全部借出记录 + 全部核验记录。
+     * 查询完整保管链：证物当前状态 + 全部交接记录 + 全部借出记录 + 全部核验记录 + 全部位置轨迹。
      */
     @Transactional(readOnly = true)
     public CustodyChainView custodyChain(String evidenceKey) {
@@ -348,7 +361,9 @@ public class EvidenceService {
                 .stream().map(this::toView).toList();
         List<InspectionView> inspections = inspectionRepository.findByEvidenceKey(evidenceKey)
                 .stream().map(this::toView).toList();
-        return new CustodyChainView(toView(evidence), transfers, loans, inspections);
+        List<PlacementView> placements = placementRepository.findByEvidenceKey(evidenceKey)
+                .stream().map(this::toView).toList();
+        return new CustodyChainView(toView(evidence), transfers, loans, inspections, placements);
     }
 
     private Evidence lockEvidence(String evidenceKey) {
@@ -359,6 +374,13 @@ public class EvidenceService {
     private void requireSealIntact(Evidence evidence) {
         if (evidence.status() == EvidenceStatus.SEAL_BROKEN) {
             throw ApiException.unprocessable("封条已异常，禁止交接相关操作: " + evidence.evidenceKey());
+        }
+    }
+
+    private void requireNotQuarantined(Evidence evidence, String operation) {
+        if (evidence.status() == EvidenceStatus.QUARANTINED) {
+            throw ApiException.conflict(
+                    "证物隔离待复核，复核放行前禁止" + operation + ": " + evidence.evidenceKey());
         }
     }
 
@@ -424,5 +446,10 @@ public class EvidenceService {
         return new LoanView(loan.loanKey(), loan.evidenceKey(), loan.custodianId(),
                 loan.borrowerId(), loan.purpose(), loan.loanAt(), loan.dueAt(), loan.status(),
                 overdue, loan.sealPassed(), loan.returnNote(), loan.returnedAt());
+    }
+
+    private PlacementView toView(EvidencePlacement placement) {
+        return new PlacementView(placement.evidenceKey(), placement.containerKey(),
+                placement.location(), placement.placedAt(), placement.removedAt());
     }
 }

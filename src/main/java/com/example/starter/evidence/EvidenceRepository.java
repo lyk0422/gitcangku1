@@ -85,6 +85,38 @@ public class EvidenceRepository {
                 ROW_MAPPER, custodianId, EvidenceStatus.SEALED.name());
     }
 
+    /**
+     * 变更证物所在容器（调用前必须已锁定目标容器行与证物行）。
+     *
+     * @param containerKey 目标容器业务键；null 表示移出容器
+     */
+    public void updateContainer(String evidenceKey, String containerKey, LocalDateTime now) {
+        jdbc.update(
+                "UPDATE evidence SET container_key = ?, updated_at = ? WHERE evidence_key = ?",
+                containerKey, now, evidenceKey);
+    }
+
+    /**
+     * 查询当前仍在指定容器内的全部证物（按入库顺序；调用前必须已锁定容器行）。
+     */
+    public List<Evidence> findByContainerKey(String containerKey) {
+        return jdbc.query(
+                "SELECT * FROM evidence WHERE container_key = ? ORDER BY id",
+                ROW_MAPPER, containerKey);
+    }
+
+    /**
+     * 复核放行：仅当证物仍为 QUARANTINED 时回到 SEALED，防止覆盖并发状态变更。
+     *
+     * @return 是否成功放行
+     */
+    public boolean releaseQuarantine(String evidenceKey, LocalDateTime now) {
+        int updated = jdbc.update(
+                "UPDATE evidence SET status = ?, updated_at = ? WHERE evidence_key = ? AND status = ?",
+                EvidenceStatus.SEALED.name(), now, evidenceKey, EvidenceStatus.QUARANTINED.name());
+        return updated == 1;
+    }
+
     private static final class EvidenceRowMapper implements RowMapper<Evidence> {
         @Override
         public Evidence mapRow(ResultSet rs, int rowNum) throws SQLException {
@@ -95,6 +127,7 @@ public class EvidenceRepository {
                     rs.getString("category"),
                     rs.getString("seal_no"),
                     rs.getString("custodian_id"),
+                    rs.getString("container_key"),
                     EvidenceStatus.valueOf(rs.getString("status")),
                     rs.getObject("created_at", LocalDateTime.class),
                     rs.getObject("updated_at", LocalDateTime.class));
