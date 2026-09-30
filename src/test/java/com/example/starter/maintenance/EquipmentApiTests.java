@@ -44,10 +44,12 @@ class EquipmentApiTests {
     }
 
     private void register(String equipmentId, long periodMinutes) throws Exception {
+        // 既有场景不涉及大幅修订：阈值给足大，使修订保持阈值内直接生效的原语义
         mockMvc.perform(post("/api/equipment")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"requestId":"reg-%s","equipmentId":"%s","maintenancePeriodMinutes":%d}
+                                {"requestId":"reg-%s","equipmentId":"%s","maintenancePeriodMinutes":%d,
+                                 "revisionThresholdMinutes":1000000000}
                                 """.formatted(equipmentId, equipmentId, periodMinutes)))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.version").value(1));
@@ -147,7 +149,8 @@ class EquipmentApiTests {
         mockMvc.perform(post("/api/equipment")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"requestId":"reg-dup-2","equipmentId":"eq-dup","maintenancePeriodMinutes":200}
+                                {"requestId":"reg-dup-2","equipmentId":"eq-dup","maintenancePeriodMinutes":200,
+                                 "revisionThresholdMinutes":1000000000}
                                 """))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("EQUIPMENT_EXISTS"));
@@ -186,7 +189,8 @@ class EquipmentApiTests {
         mockMvc.perform(post("/api/equipment/eq-ver/readings/r1/revisions")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"requestId":"rev-v1","expectedVersion":1,"cumulativeMinutes":20}
+                                {"requestId":"rev-v1","expectedVersion":1,"cumulativeMinutes":20,
+                                 "submitterId":"alice"}
                                 """))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("VERSION_CONFLICT"));
@@ -239,7 +243,8 @@ class EquipmentApiTests {
         mockMvc.perform(post("/api/equipment/eq-rev/readings/r1/revisions")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"requestId":"rv3","expectedVersion":3,"cumulativeMinutes":150}
+                                {"requestId":"rv3","expectedVersion":3,"cumulativeMinutes":150,
+                                 "submitterId":"alice"}
                                 """))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.sampledAt").value("2026-01-01T10:00:00Z"))
@@ -259,14 +264,16 @@ class EquipmentApiTests {
         mockMvc.perform(post("/api/equipment/eq-rev/readings/r1/revisions")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"requestId":"rv4","expectedVersion":4,"cumulativeMinutes":250}
+                                {"requestId":"rv4","expectedVersion":4,"cumulativeMinutes":250,
+                                 "submitterId":"alice"}
                                 """))
                 .andExpect(status().isUnprocessableEntity())
                 .andExpect(jsonPath("$.code").value("READING_ORDER_VIOLATION"));
         mockMvc.perform(post("/api/equipment/eq-rev/readings/r2/revisions")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"requestId":"rv5","expectedVersion":4,"cumulativeMinutes":50}
+                                {"requestId":"rv5","expectedVersion":4,"cumulativeMinutes":50,
+                                 "submitterId":"alice"}
                                 """))
                 .andExpect(status().isUnprocessableEntity());
     }
@@ -317,7 +324,8 @@ class EquipmentApiTests {
         mockMvc.perform(post("/api/equipment/eq-mnt/readings/r1/revisions")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"requestId":"mn-3","expectedVersion":4,"cumulativeMinutes":120}
+                                {"requestId":"mn-3","expectedVersion":4,"cumulativeMinutes":120,
+                                 "submitterId":"alice"}
                                 """))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("READING_ANCHORED"));
@@ -326,7 +334,8 @@ class EquipmentApiTests {
         mockMvc.perform(post("/api/equipment/eq-mnt/readings/r2/revisions")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"requestId":"mn-4","expectedVersion":4,"cumulativeMinutes":210}
+                                {"requestId":"mn-4","expectedVersion":4,"cumulativeMinutes":210,
+                                 "submitterId":"alice"}
                                 """))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.revisionNo").value(2));
@@ -409,7 +418,8 @@ class EquipmentApiTests {
         mockMvc.perform(post("/api/equipment/eq-nf/readings/nope/revisions")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"requestId":"nf-2","expectedVersion":1,"cumulativeMinutes":10}
+                                {"requestId":"nf-2","expectedVersion":1,"cumulativeMinutes":10,
+                                 "submitterId":"alice"}
                                 """))
                 .andExpect(status().isNotFound());
         mockMvc.perform(get("/api/equipment/eq-nf/readings/nope/revisions"))

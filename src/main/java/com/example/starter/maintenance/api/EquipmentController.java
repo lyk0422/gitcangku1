@@ -20,8 +20,10 @@ import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
 import com.example.starter.maintenance.api.dto.RegisterEquipmentRequest;
 import com.example.starter.maintenance.api.dto.ReviseReadingRequest;
+import com.example.starter.maintenance.api.dto.RevisionRequestView;
 import com.example.starter.maintenance.api.dto.RevisionView;
 import com.example.starter.maintenance.api.dto.StatusResponse;
+import com.example.starter.maintenance.api.dto.WitnessReadingRequest;
 import com.example.starter.maintenance.service.EquipmentService;
 
 /**
@@ -52,13 +54,29 @@ public class EquipmentController {
         return service.addReading(equipmentId, req);
     }
 
-    /** 修订读数：只改累计分钟、不改采样时刻；作为历史保养锚点的读数返回 409。 */
+    /**
+     * 修订读数：只改累计分钟、不改采样时刻；作为历史保养锚点的读数返回 409。
+     * 修订值与当前有效值差额绝对值超出设备见证阈值时返回 201 且状态 PENDING（待另一名维护人见证），
+     * 待确认值不覆盖有效读数、不触发 DUE 或重置周期。
+     */
     @PostMapping("/{equipmentId}/readings/{readingId}/revisions")
     @ResponseStatus(HttpStatus.CREATED)
     public ReadingResponse reviseReading(@PathVariable String equipmentId,
                                          @PathVariable String readingId,
                                          @Valid @RequestBody ReviseReadingRequest req) {
         return service.reviseReading(equipmentId, readingId, req);
+    }
+
+    /**
+     * 见证大幅读数修订：另一名维护人见证申请指定的读数版本（baseRevisionNo）后待确认值生效。
+     * 读数版本已变化、同人见证、无待确认申请等返回 422；期望版本不匹配返回 409。
+     */
+    @PostMapping("/{equipmentId}/readings/{readingId}/witness")
+    @ResponseStatus(HttpStatus.CREATED)
+    public ReadingResponse witnessReading(@PathVariable String equipmentId,
+                                          @PathVariable String readingId,
+                                          @Valid @RequestBody WitnessReadingRequest req) {
+        return service.witnessReading(equipmentId, readingId, req);
     }
 
     /** 完成保养：以现存读数及其当前修订号为锚点，锚点时间须晚于上次保养锚点。 */
@@ -81,11 +99,18 @@ public class EquipmentController {
         return service.listReadings(equipmentId);
     }
 
-    /** 指定读数的修订历史。 */
+    /** 指定读数的修订历史（含初始登记行、直接生效行、见证生效行及其提交人/见证人）。 */
     @GetMapping("/{equipmentId}/readings/{readingId}/revisions")
     public List<RevisionView> listRevisions(@PathVariable String equipmentId,
                                             @PathVariable String readingId) {
         return service.listRevisions(equipmentId, readingId);
+    }
+
+    /** 指定读数的大幅修订见证申请历史（PENDING/EFFECTIVE/SUPERSEDED，含差额、阈值与见证人）。 */
+    @GetMapping("/{equipmentId}/readings/{readingId}/revision-requests")
+    public List<RevisionRequestView> listRevisionRequests(@PathVariable String equipmentId,
+                                                          @PathVariable String readingId) {
+        return service.listRevisionRequests(equipmentId, readingId);
     }
 
     /** 保养历史（锚点快照，按锚点时间升序）。 */

@@ -5,13 +5,15 @@
 CREATE TABLE IF NOT EXISTS equipment (
     equipment_id VARCHAR(64) NOT NULL PRIMARY KEY,
     maintenance_period_minutes BIGINT NOT NULL,
+    revision_threshold_minutes BIGINT NOT NULL,
     version BIGINT NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL
 );
 COMMENT ON TABLE equipment IS '设备主表：每台设备一行';
 COMMENT ON COLUMN equipment.equipment_id IS '设备唯一标识（客户端提供）';
 COMMENT ON COLUMN equipment.maintenance_period_minutes IS '保养周期（分钟），正整数，登记后不可修改';
-COMMENT ON COLUMN equipment.version IS '设备版本号，初始 1；新增读数/修订/完成保养均校验 expectedVersion 并加一';
+COMMENT ON COLUMN equipment.revision_threshold_minutes IS '大幅读数修订见证阈值（分钟），正整数，登记后不可修改；修订值与当前有效值差额绝对值超出该阈值时须另一维护人见证';
+COMMENT ON COLUMN equipment.version IS '设备版本号，初始 1；新增读数/修订申请/见证/完成保养均校验 expectedVersion 并加一';
 COMMENT ON COLUMN equipment.created_at IS '登记时刻（UTC）';
 
 -- 工时读数当前值表：reading_id 设备内唯一，同设备同一采样时刻仅一条。
@@ -42,16 +44,58 @@ CREATE TABLE IF NOT EXISTS reading_revision (
     revision_no INT NOT NULL,
     cumulative_minutes BIGINT NOT NULL,
     request_id VARCHAR(128) NOT NULL,
+    submitter_id VARCHAR(64),
+    witness_id VARCHAR(64),
     created_at TIMESTAMP WITH TIME ZONE NOT NULL,
     PRIMARY KEY (equipment_id, reading_id, revision_no)
 );
-COMMENT ON TABLE reading_revision IS '读数修订历史：revision_no=1 为初始登记值，其后每行对应一次修订';
+COMMENT ON TABLE reading_revision IS '读数修订历史：revision_no=1 为初始登记值，其后每行对应一次修订；大幅修订生效行记录提交人与见证人';
 COMMENT ON COLUMN reading_revision.equipment_id IS '所属设备标识';
 COMMENT ON COLUMN reading_revision.reading_id IS '读数标识';
 COMMENT ON COLUMN reading_revision.revision_no IS '修订号，从 1 开始递增';
 COMMENT ON COLUMN reading_revision.cumulative_minutes IS '该修订版本的累计工时（分钟）';
 COMMENT ON COLUMN reading_revision.request_id IS '产生该修订的请求 requestId';
+COMMENT ON COLUMN reading_revision.submitter_id IS '修订提交人标识；revision_no=1 的初始登记行为 NULL';
+COMMENT ON COLUMN reading_revision.witness_id IS '见证该修订版本生效的另一维护人标识；阈值内直接生效的修订为 NULL';
 COMMENT ON COLUMN reading_revision.created_at IS '该修订生效时刻（UTC）';
+
+-- 大幅读数修订见证申请：超出阈值的修订先待确认，另一名维护人见证同一读数版本后才生效。
+CREATE TABLE IF NOT EXISTS reading_revision_request (
+    equipment_id VARCHAR(64) NOT NULL,
+    reading_id VARCHAR(64) NOT NULL,
+    request_id VARCHAR(128) NOT NULL,
+    base_revision_no INT NOT NULL,
+    proposed_revision_no INT NOT NULL,
+    current_cumulative_minutes BIGINT NOT NULL,
+    proposed_cumulative_minutes BIGINT NOT NULL,
+    delta_minutes BIGINT NOT NULL,
+    threshold_minutes BIGINT NOT NULL,
+    submitter_id VARCHAR(64) NOT NULL,
+    witness_id VARCHAR(64),
+    status VARCHAR(16) NOT NULL,
+    expected_version BIGINT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    witnessed_at TIMESTAMP WITH TIME ZONE,
+    PRIMARY KEY (equipment_id, reading_id, request_id)
+);
+CREATE INDEX IF NOT EXISTS idx_revision_request_pending
+    ON reading_revision_request (equipment_id, reading_id, status);
+COMMENT ON TABLE reading_revision_request IS '大幅读数修订见证申请：PENDING 待确认，EFFECTIVE 已见证生效，SUPERSEDED 被更新的修订取代';
+COMMENT ON COLUMN reading_revision_request.equipment_id IS '所属设备标识';
+COMMENT ON COLUMN reading_revision_request.reading_id IS '被修订读数标识';
+COMMENT ON COLUMN reading_revision_request.request_id IS '提交修订的请求 requestId（幂等键）';
+COMMENT ON COLUMN reading_revision_request.base_revision_no IS '提交时读数当前有效修订号（见证版本基准）';
+COMMENT ON COLUMN reading_revision_request.proposed_revision_no IS '生效后将占用的读数修订号（申请提交时预分配）';
+COMMENT ON COLUMN reading_revision_request.current_cumulative_minutes IS '提交时最后一条有效读数累计工时快照（分钟）';
+COMMENT ON COLUMN reading_revision_request.proposed_cumulative_minutes IS '申请的新读数累计工时（分钟）';
+COMMENT ON COLUMN reading_revision_request.delta_minutes IS '差额（分钟）= 申请值 - 提交时有效值，保留正负号';
+COMMENT ON COLUMN reading_revision_request.threshold_minutes IS '提交时设备当前见证阈值快照（分钟），不随后续配置变化';
+COMMENT ON COLUMN reading_revision_request.submitter_id IS '提交修订的维护人标识';
+COMMENT ON COLUMN reading_revision_request.witness_id IS '见证维护人标识；PENDING/SUPERSEDED 时为 NULL';
+COMMENT ON COLUMN reading_revision_request.status IS '状态：PENDING 待确认、EFFECTIVE 已见证生效、SUPERSEDED 已被新修订取代';
+COMMENT ON COLUMN reading_revision_request.expected_version IS '提交时设备期望版本（乐观锁快照）';
+COMMENT ON COLUMN reading_revision_request.created_at IS '申请提交时刻（UTC）';
+COMMENT ON COLUMN reading_revision_request.witnessed_at IS '见证生效时刻（UTC）；PENDING/SUPERSEDED 时为 NULL';
 
 -- 保养记录：锚定某读数的特定修订号，保存锚点时刻与工时快照，不允许删除。
 CREATE TABLE IF NOT EXISTS maintenance (
