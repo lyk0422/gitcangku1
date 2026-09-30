@@ -59,13 +59,16 @@ public class BatchService {
     private static final int IDEMPOTENCY_MAX_ATTEMPTS = 3;
 
     private final BatchRepository repo;
+    private final StorageRepository storageRepo;
     private final TransactionTemplate tx;
     private final ObjectMapper objectMapper;
 
     public BatchService(BatchRepository repo,
+                        StorageRepository storageRepo,
                         PlatformTransactionManager transactionManager,
                         ObjectMapper objectMapper) {
         this.repo = repo;
+        this.storageRepo = storageRepo;
         this.tx = new TransactionTemplate(transactionManager);
         this.objectMapper = objectMapper;
     }
@@ -170,6 +173,7 @@ public class BatchService {
                     .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
             BatchStatus status = BatchStatus.valueOf(batch.status());
             assertNoRecalledAncestor(batchKey);
+            assertNoOpenDeviation(batchKey);
             if (status == BatchStatus.QUARANTINED) {
                 throw ApiException.unprocessable("必做检验项未全部通过，不能批准");
             }
@@ -210,9 +214,11 @@ public class BatchService {
     }
 
     /**
-     * 召回：RELEASED 或 SPLIT 批次可召回，召回后进入 RECALLED 并不再出现在可用批次查询中。
+     * 召回：RELEASED、RELEASE_HOLD 或 SPLIT 批次可召回，召回后进入 RECALLED 并不再出现在可用批次查询中。
+     * RELEASE_HOLD（已放行但存在未处置仓储偏差）语义上仍是已放行批次，允许直接召回；
      * 召回提交后其全部后代立即不可用（排除出可用查询、禁止新增检验/批准/拆分），
-     * 但后代自身状态与既有检验、批准记录不改写，也不为后代补写召回记录。
+     * 但后代自身状态与既有检验、批准记录不改写，也不为后代补写召回记录；
+     * 召回后即使偏差再被双人确认，批次状态也停留在 RECALLED 不恢复。
      */
     public StoredResponse recall(String batchKey, String actorId, RecallRequest req) {
         if (actorId == null || actorId.isBlank()) {
@@ -224,8 +230,10 @@ public class BatchService {
             BatchRepository.BatchRow batch = repo.findBatchForUpdate(batchKey)
                     .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
             BatchStatus status = BatchStatus.valueOf(batch.status());
-            if (status != BatchStatus.RELEASED && status != BatchStatus.SPLIT) {
-                throw ApiException.conflict("批次状态 " + status + " 不允许召回，仅 RELEASED 或 SPLIT 可召回");
+            if (status != BatchStatus.RELEASED && status != BatchStatus.RELEASE_HOLD
+                    && status != BatchStatus.SPLIT) {
+                throw ApiException.conflict("批次状态 " + status
+                        + " 不允许召回，仅 RELEASED、RELEASE_HOLD 或 SPLIT 可召回");
             }
             // 逐行锁定全部后代（按业务键排序保证锁顺序确定）：与后代上的检验/批准/拆分
             // 互斥，按事务提交顺序裁决——召回先提交则后代新操作看到召回并返回 422。
@@ -245,15 +253,17 @@ public class BatchService {
     }
 
     /**
-     * 当前可用批次：排除已召回（RECALLED）、已拆分（SPLIT）批次，
+     * 当前可用批次：排除已召回（RECALLED）、已拆分（SPLIT）批次、存在未处置仓储温度偏差的批次，
      * 以及任一祖先被召回的后代批次；后代自身状态不改写。
      */
     public List<BatchResponse> listAvailable() {
-        Map<String, String> parentOf = childToParent();
+        Map<String, List<String>> parentsOf = childToParents();
         Set<String> recalled = new HashSet<>(repo.findRecalledKeys());
+        Set<String> gated = new HashSet<>(storageRepo.findBatchesWithOpenDeviations());
         return repo.findAvailableBatches().stream()
                 .filter(b -> !BatchStatus.SPLIT.name().equals(b.status()))
-                .filter(b -> recalledAncestor(b.batchKey(), parentOf, recalled).isEmpty())
+                .filter(b -> !gated.contains(b.batchKey()))
+                .filter(b -> recalledAncestor(b.batchKey(), parentsOf, recalled).isEmpty())
                 .map(this::toBatchResponse)
                 .toList();
     }
@@ -444,6 +454,7 @@ public class BatchService {
                 return logged.get();
             }
             assertNoRecalledAncestor(parentKey);
+            assertNoOpenDeviation(parentKey);
             if (!BatchStatus.RELEASED.name().equals(parent.status())) {
                 throw ApiException.conflict(
                         "批次状态 " + parent.status() + " 不允许拆分，仅当前可用的 RELEASED 批次可拆分");
@@ -478,17 +489,17 @@ public class BatchService {
 
     /**
      * 祖先查询：从直接父批逐级向上到根，每项含批次自身状态及导致其不可用的召回祖先。
+     * 合批子批可有多个父批，按血缘关系创建顺序逐层（BFS）展开并去重；
+     * 拆分子批仅一个父批时，结果顺序与原父链一致。
      */
     public List<LineageEntryResponse> listAncestors(String batchKey) {
         repo.findBatch(batchKey)
                 .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
-        Map<String, String> parentOf = childToParent();
+        Map<String, List<String>> parentsOf = childToParents();
         Set<String> recalled = new HashSet<>(repo.findRecalledKeys());
         List<LineageEntryResponse> result = new ArrayList<>();
-        String current = batchKey;
-        while (parentOf.containsKey(current)) {
-            current = parentOf.get(current);
-            result.add(toLineageEntry(current, parentOf, recalled));
+        for (String ancestorKey : ancestorKeys(batchKey, parentsOf)) {
+            result.add(toLineageEntry(ancestorKey, parentsOf, recalled));
         }
         return result;
     }
@@ -499,11 +510,11 @@ public class BatchService {
     public List<LineageEntryResponse> listDescendants(String batchKey) {
         repo.findBatch(batchKey)
                 .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
-        Map<String, String> parentOf = childToParent();
+        Map<String, List<String>> parentsOf = childToParents();
         Set<String> recalled = new HashSet<>(repo.findRecalledKeys());
         List<LineageEntryResponse> result = new ArrayList<>();
         for (String key : descendantKeys(batchKey)) {
-            result.add(toLineageEntry(key, parentOf, recalled));
+            result.add(toLineageEntry(key, parentsOf, recalled));
         }
         return result;
     }
@@ -512,7 +523,7 @@ public class BatchService {
      * 若任一级祖先已被召回则抛 422：后代批次禁止新增检验、批准和拆分。
      */
     private void assertNoRecalledAncestor(String batchKey) {
-        Optional<String> recalled = recalledAncestor(batchKey, childToParent(),
+        Optional<String> recalled = recalledAncestor(batchKey, childToParents(),
                 new HashSet<>(repo.findRecalledKeys()));
         if (recalled.isPresent()) {
             throw ApiException.unprocessable(
@@ -521,33 +532,53 @@ public class BatchService {
     }
 
     /**
-     * 沿父链向上查找最近的被直接召回（RECALLED）祖先；批次自身召回不算祖先召回。
+     * 逐层向上查找最近的被直接召回（RECALLED）祖先；批次自身召回不算祖先召回。
      */
-    private Optional<String> recalledAncestor(String batchKey, Map<String, String> parentOf,
+    private Optional<String> recalledAncestor(String batchKey, Map<String, List<String>> parentsOf,
                                               Set<String> recalled) {
-        String current = batchKey;
-        while (parentOf.containsKey(current)) {
-            current = parentOf.get(current);
-            if (recalled.contains(current)) {
-                return Optional.of(current);
+        for (String ancestorKey : ancestorKeys(batchKey, parentsOf)) {
+            if (recalled.contains(ancestorKey)) {
+                return Optional.of(ancestorKey);
             }
         }
         return Optional.empty();
     }
 
     /**
-     * 全部血缘边的 子批→父批 映射；关系不可改写，只增不改。
+     * 全部血缘边的 子批→父批列表 映射（按血缘 id 排序）；关系不可改写，只增不改。
+     * 拆分子批仅一个父批；合批子批可有多个父批。
      */
-    private Map<String, String> childToParent() {
-        Map<String, String> parentOf = new HashMap<>();
+    private Map<String, List<String>> childToParents() {
+        Map<String, List<String>> parentsOf = new HashMap<>();
         for (BatchRepository.LineageRow row : repo.findAllLineage()) {
-            parentOf.put(row.childKey(), row.parentKey());
+            parentsOf.computeIfAbsent(row.childKey(), k -> new ArrayList<>()).add(row.parentKey());
         }
-        return parentOf;
+        return parentsOf;
     }
 
     /**
-     * 某批次的全部后代业务键，按血缘关系创建顺序广度优先展开（不含自身）。
+     * 某批次的全部祖先业务键，按血缘关系创建顺序逐层（BFS）展开并去重（不含自身）。
+     */
+    private List<String> ancestorKeys(String batchKey, Map<String, List<String>> parentsOf) {
+        List<String> result = new ArrayList<>();
+        Set<String> visited = new HashSet<>();
+        Deque<String> queue = new ArrayDeque<>();
+        queue.add(batchKey);
+        visited.add(batchKey);
+        while (!queue.isEmpty()) {
+            String current = queue.poll();
+            for (String parent : parentsOf.getOrDefault(current, List.of())) {
+                if (visited.add(parent)) {
+                    result.add(parent);
+                    queue.add(parent);
+                }
+            }
+        }
+        return result;
+    }
+
+    /**
+     * 某批次的全部后代业务键，按血缘关系创建顺序广度优先展开并去重（不含自身）。
      */
     private List<String> descendantKeys(String rootKey) {
         Map<String, List<String>> childrenOf = new HashMap<>();
@@ -555,24 +586,38 @@ public class BatchService {
             childrenOf.computeIfAbsent(row.parentKey(), k -> new ArrayList<>()).add(row.childKey());
         }
         List<String> result = new ArrayList<>();
+        Set<String> visited = new HashSet<>();
         Deque<String> queue = new ArrayDeque<>();
         queue.add(rootKey);
+        visited.add(rootKey);
         while (!queue.isEmpty()) {
             String current = queue.poll();
             for (String child : childrenOf.getOrDefault(current, List.of())) {
-                result.add(child);
-                queue.add(child);
+                if (visited.add(child)) {
+                    result.add(child);
+                    queue.add(child);
+                }
             }
         }
         return result;
     }
 
-    private LineageEntryResponse toLineageEntry(String batchKey, Map<String, String> parentOf,
+    private LineageEntryResponse toLineageEntry(String batchKey, Map<String, List<String>> parentsOf,
                                                 Set<String> recalled) {
         BatchRepository.BatchRow row = repo.findBatch(batchKey)
                 .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
         return new LineageEntryResponse(row.batchKey(), row.batchNo(),
                 BatchStatus.valueOf(row.status()),
-                recalledAncestor(batchKey, parentOf, recalled).orElse(null));
+                recalledAncestor(batchKey, parentsOf, recalled).orElse(null));
+    }
+
+    /**
+     * 批次存在未处置仓储温度偏差时抛 422：未放行批次禁止完成放行（第二步批准），
+     * 已放行批次处于 RELEASE_HOLD 挂起态，禁止拆分。调用方须已持有该批 batch 行锁。
+     */
+    private void assertNoOpenDeviation(String batchKey) {
+        if (!storageRepo.findOpenDeviationsByBatch(batchKey).isEmpty()) {
+            throw ApiException.unprocessable("批次存在未处置仓储温度偏差，门禁关闭，禁止放行或拆分");
+        }
     }
 }
