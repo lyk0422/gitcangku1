@@ -77,4 +77,39 @@ public final class Dtos {
     /** 统一错误响应体。 */
     public record ErrorResponse(String code, String message) {
     }
+
+    /** 注册水质来源命令；qualityIndex 为该来源当前水质指标（无量纲），totalQuota 为可用配额（立方米）。 */
+    public record RegisterSourceRequest(String commandKey, String sourceKey, String name,
+                                        String qualityIndex, String totalQuota) {
+    }
+
+    /** 水质来源视图；reservedVolume 为未取消申请的预占体积合计，remaining = totalQuota - reservedVolume。 */
+    public record BlendSourceResponse(String sourceKey, String name, String qualityIndex, String totalQuota,
+                                      String reservedVolume, String remaining, String createdUtc,
+                                      String updatedUtc) {
+    }
+
+    /** 混配申请中的单个来源：体积（立方米，大于 0）与该来源水质指标（无量纲）。 */
+    public record BlendSourceInput(String sourceKey, String volume, String qualityIndex) {
+    }
+
+    /**
+     * 提交多来源水质混配申请命令。同一 requestId 重放首次配额与计算结果；
+     * 受理时按 Σ(来源体积×指标)/Σ来源体积 计算加权指标，与 threshold 比较（相等可受理）。
+     */
+    public record SubmitBlendRequest(String requestId, String userId, String purpose, String threshold,
+                                     List<BlendSourceInput> sources) {
+    }
+
+    /** 申请来源明细视图；qualityIndex/weightedIndex 为受理当时快照，取消后不重算。 */
+    public record BlendSourceItemResponse(String sourceKey, String volume, String qualityIndex,
+                                          String weightedIndex, String reservedStatus) {
+    }
+
+    /** 混配申请视图。状态：RESERVED 已预占 / CANCELLED 已取消；取消后保留原体积、指标与加权值依据。 */
+    public record BlendApplicationResponse(String requestId, String userId, String purpose, String threshold,
+                                           String totalVolume, String weightedIndex, String requester,
+                                           String status, String createdUtc, String updatedUtc,
+                                           String cancelledUtc, List<BlendSourceItemResponse> sources) {
+    }
 }
