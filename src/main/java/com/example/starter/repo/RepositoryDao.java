@@ -13,6 +13,7 @@ import java.sql.Statement;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -186,11 +187,21 @@ public class RepositoryDao {
         return key.longValue();
     }
 
-    /** 新增锁文件精确版本条目。 */
-    public void insertLockEntry(long lockFileId, String name, int version) {
+    /** 新增锁文件精确版本条目，固化锁定时风险级别与豁免依据。 */
+    public void insertLockEntry(long lockFileId, String name, int version, String riskLevel,
+                                Long exceptionId, Integer exceptionVersion, String statusAtLock) {
         jdbcTemplate.update(
-                "INSERT INTO lock_file_entry (lock_file_id, name, version) VALUES (?, ?, ?)",
-                lockFileId, name, version);
+                "INSERT INTO lock_file_entry (lock_file_id, name, version, risk_level, "
+                        + "exception_id, exception_version, status_at_lock) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                lockFileId, name, version, riskLevel, exceptionId, exceptionVersion, statusAtLock);
+    }
+
+    /** 固化历史锁文件条目的豁免审批人快照（seq 从 1 开始）。 */
+    public void insertLockEntryApprover(long lockFileId, String entryName, String approver, int seq) {
+        jdbcTemplate.update(
+                "INSERT INTO lock_entry_exception_approver (lock_file_id, entry_name, approver, seq) "
+                        + "VALUES (?, ?, ?, ?)",
+                lockFileId, entryName, approver, seq);
     }
 
     /** 幂等记录视图。 */
@@ -238,8 +249,9 @@ public class RepositoryDao {
                               long repositoryVersion, Instant createdAt) {
     }
 
-    /** 锁文件条目行。 */
-    public record LockEntryRow(long lockFileId, String name, int version) {
+    /** 锁文件条目行：含锁定时固化的风险级别与豁免依据。 */
+    public record LockEntryRow(long lockFileId, String name, int version, String riskLevel,
+                               Long exceptionId, Integer exceptionVersion, String statusAtLock) {
     }
 
     /** 查询全部历史锁文件，按 ID 升序。 */
@@ -267,11 +279,250 @@ public class RepositoryDao {
     /** 查询某锁文件的全部条目，按名称升序。 */
     public List<LockEntryRow> listLockEntries(long lockFileId) {
         return jdbcTemplate.query(
-                "SELECT lock_file_id, name, version FROM lock_file_entry "
-                        + "WHERE lock_file_id = ? ORDER BY name ASC",
+                "SELECT lock_file_id, name, version, risk_level, exception_id, exception_version, status_at_lock "
+                        + "FROM lock_file_entry WHERE lock_file_id = ? ORDER BY name ASC",
                 (rs, n) -> new LockEntryRow(rs.getLong("lock_file_id"),
-                        rs.getString("name"), rs.getInt("version")),
+                        rs.getString("name"), rs.getInt("version"), rs.getString("risk_level"),
+                        rs.getObject("exception_id", Long.class),
+                        rs.getObject("exception_version", Integer.class),
+                        rs.getString("status_at_lock")),
                 lockFileId);
+    }
+
+    /** 查询历史锁条目中固化的豁免审批人，按审批顺序号升序。 */
+    public List<String> listLockEntryApprovers(long lockFileId, String entryName) {
+        return jdbcTemplate.queryForList(
+                "SELECT approver FROM lock_entry_exception_approver "
+                        + "WHERE lock_file_id = ? AND entry_name = ? ORDER BY seq ASC",
+                String.class, lockFileId, entryName);
+    }
+
+    // ------------------------------------------------------------------
+    // 风险标记
+    // ------------------------------------------------------------------
+
+    /** 风险标记行。 */
+    public record RiskRow(String name, int version, String riskLevel, String reason,
+                          Instant createdAt, Instant updatedAt) {
+    }
+
+    /** 新增制品版本风险标记，返回自增主键。 */
+    public long insertRisk(String name, int version, String riskLevel, String reason, Instant now) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbcTemplate.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO artifact_risk (name, version, risk_level, reason, created_at, updated_at) "
+                            + "VALUES (?, ?, ?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, name);
+            ps.setInt(2, version);
+            ps.setString(3, riskLevel);
+            ps.setString(4, reason);
+            ps.setTimestamp(5, Timestamp.from(now));
+            ps.setTimestamp(6, Timestamp.from(now));
+            return ps;
+        }, keyHolder);
+        Number key = keyHolder.getKey();
+        if (key == null) {
+            throw new IllegalStateException("插入风险标记未获取自增主键");
+        }
+        return key.longValue();
+    }
+
+    /** 更新风险标记（等级、说明、更新时间），返回受影响行数。 */
+    public int updateRisk(String name, int version, String riskLevel, String reason, Instant now) {
+        return jdbcTemplate.update(
+                "UPDATE artifact_risk SET risk_level = ?, reason = ?, updated_at = ? "
+                        + "WHERE name = ? AND version = ?",
+                ps -> {
+                    ps.setString(1, riskLevel);
+                    ps.setString(2, reason);
+                    ps.setTimestamp(3, Timestamp.from(now));
+                    ps.setString(4, name);
+                    ps.setInt(5, version);
+                });
+    }
+
+    /** 按 name+version 查询风险标记，不存在返回 null。 */
+    public RiskRow findRisk(String name, int version) {
+        List<RiskRow> rows = jdbcTemplate.query(
+                "SELECT name, version, risk_level, reason, created_at, updated_at "
+                        + "FROM artifact_risk WHERE name = ? AND version = ?",
+                (rs, n) -> new RiskRow(rs.getString("name"), rs.getInt("version"),
+                        rs.getString("risk_level"), rs.getString("reason"),
+                        rs.getTimestamp("created_at").toInstant(),
+                        rs.getTimestamp("updated_at").toInstant()),
+                name, version);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /** 批量查询多个 name+version 的风险标记，键为 name + '\u0000' + version。 */
+    public Map<String, RiskRow> findRisks(Collection<Map.Entry<String, Integer>> targets) {
+        Map<String, RiskRow> result = new LinkedHashMap<>();
+        for (Map.Entry<String, Integer> target : targets) {
+            RiskRow row = findRisk(target.getKey(), target.getValue());
+            if (row != null) {
+                result.put(riskKey(target.getKey(), target.getValue()), row);
+            }
+        }
+        return result;
+    }
+
+    /** 组装 name+version 的内存映射键。 */
+    public static String riskKey(String name, int version) {
+        return name + '\u0000' + version;
+    }
+
+    /** 查询全部风险标记，按名称、版本升序。 */
+    public List<RiskRow> listRisks() {
+        return jdbcTemplate.query(
+                "SELECT name, version, risk_level, reason, created_at, updated_at "
+                        + "FROM artifact_risk ORDER BY name ASC, version ASC",
+                (rs, n) -> new RiskRow(rs.getString("name"), rs.getInt("version"),
+                        rs.getString("risk_level"), rs.getString("reason"),
+                        rs.getTimestamp("created_at").toInstant(),
+                        rs.getTimestamp("updated_at").toInstant()));
+    }
+
+    // ------------------------------------------------------------------
+    // 高风险豁免
+    // ------------------------------------------------------------------
+
+    /** 豁免申请行。 */
+    public record RiskExceptionRow(long id, String dependencyName, int dependencyVersion,
+                                   int exceptionVersion, String status, String reason,
+                                   Instant expiresAt, Instant createdAt, Instant decidedAt) {
+    }
+
+    /** 豁免审批记录行。 */
+    public record ApprovalRow(long exceptionId, String approver, int exceptionVersion,
+                              Instant approvedAt) {
+    }
+
+    /** 创建豁免申请（PENDING），返回自增主键。 */
+    public long insertRiskException(String dependencyName, int dependencyVersion, String reason,
+                                    Instant expiresAt, Instant now) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbcTemplate.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO risk_exception (dependency_name, dependency_version, exception_version, "
+                            + "status, reason, expires_at, created_at) VALUES (?, ?, 1, 'PENDING', ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, dependencyName);
+            ps.setInt(2, dependencyVersion);
+            ps.setString(3, reason);
+            ps.setTimestamp(4, Timestamp.from(expiresAt));
+            ps.setTimestamp(5, Timestamp.from(now));
+            return ps;
+        }, keyHolder);
+        Number key = keyHolder.getKey();
+        if (key == null) {
+            throw new IllegalStateException("插入豁免申请未获取自增主键");
+        }
+        return key.longValue();
+    }
+
+    /** 按 ID 查询豁免申请（加行锁），不存在返回 null；须在事务内调用。 */
+    public RiskExceptionRow lockRiskException(long id) {
+        List<RiskExceptionRow> rows = jdbcTemplate.query(
+                "SELECT id, dependency_name, dependency_version, exception_version, status, reason, "
+                        + "expires_at, created_at, decided_at FROM risk_exception WHERE id = ? FOR UPDATE",
+                (rs, n) -> mapExceptionRow(rs),
+                id);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /** 按 ID 查询豁免申请（不加锁），不存在返回 null。 */
+    public RiskExceptionRow findRiskException(long id) {
+        List<RiskExceptionRow> rows = jdbcTemplate.query(
+                "SELECT id, dependency_name, dependency_version, exception_version, status, reason, "
+                        + "expires_at, created_at, decided_at FROM risk_exception WHERE id = ?",
+                (rs, n) -> mapExceptionRow(rs),
+                id);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    private RiskExceptionRow mapExceptionRow(java.sql.ResultSet rs) throws java.sql.SQLException {
+        java.sql.Timestamp decided = rs.getTimestamp("decided_at");
+        return new RiskExceptionRow(rs.getLong("id"), rs.getString("dependency_name"),
+                rs.getInt("dependency_version"), rs.getInt("exception_version"),
+                rs.getString("status"), rs.getString("reason"),
+                rs.getTimestamp("expires_at").toInstant(),
+                rs.getTimestamp("created_at").toInstant(),
+                decided == null ? null : decided.toInstant());
+    }
+
+    /** 修订 PENDING 申请：原因、到期时刻更新，申请版本加一。 */
+    public int reviseRiskException(long id, String reason, Instant expiresAt) {
+        return jdbcTemplate.update(
+                "UPDATE risk_exception SET reason = ?, expires_at = ?, exception_version = exception_version + 1 "
+                        + "WHERE id = ? AND status = 'PENDING'",
+                reason, Timestamp.from(expiresAt), id);
+    }
+
+    /** 删除指定申请版本之外的历史审批（修订后旧版本审批作废）。 */
+    public int deleteApprovalsExceptVersion(long exceptionId, int exceptionVersion) {
+        return jdbcTemplate.update(
+                "DELETE FROM risk_exception_approval WHERE exception_id = ? AND exception_version <> ?",
+                exceptionId, exceptionVersion);
+    }
+
+    /**
+     * 插入审批记录；同一豁免同一审批人重复确认由唯一索引拒绝。
+     * 返回受影响行数（0 表示该审批人已审批过）。
+     */
+    public int insertApproval(long exceptionId, String approver, int exceptionVersion, Instant now) {
+        try {
+            return jdbcTemplate.update(
+                    "INSERT INTO risk_exception_approval (exception_id, approver, exception_version, approved_at) "
+                            + "VALUES (?, ?, ?, ?)",
+                    exceptionId, approver, exceptionVersion, Timestamp.from(now));
+        } catch (org.springframework.dao.DuplicateKeyException e) {
+            return 0;
+        }
+    }
+
+    /** 统计针对指定申请版本的不同审批人数。 */
+    public int countApprovalsForVersion(long exceptionId, int exceptionVersion) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM risk_exception_approval "
+                        + "WHERE exception_id = ? AND exception_version = ?",
+                Integer.class, exceptionId, exceptionVersion);
+        return count == null ? 0 : count;
+    }
+
+    /** 将豁免置为 APPROVED 并记录生效时间，仅 PENDING 可转换。 */
+    public int markExceptionApproved(long id, Instant now) {
+        return jdbcTemplate.update(
+                "UPDATE risk_exception SET status = 'APPROVED', decided_at = ? "
+                        + "WHERE id = ? AND status = 'PENDING'",
+                Timestamp.from(now), id);
+    }
+
+    /** 撤销豁免（APPROVED -> REVOKED），返回受影响行数。 */
+    public int revokeRiskException(long id, Instant now) {
+        return jdbcTemplate.update(
+                "UPDATE risk_exception SET status = 'REVOKED', decided_at = ? "
+                        + "WHERE id = ? AND status = 'APPROVED'",
+                Timestamp.from(now), id);
+    }
+
+    /** 查询豁免的全部审批记录，按审批时间升序。 */
+    public List<ApprovalRow> listApprovals(long exceptionId) {
+        return jdbcTemplate.query(
+                "SELECT exception_id, approver, exception_version, approved_at "
+                        + "FROM risk_exception_approval WHERE exception_id = ? ORDER BY approved_at ASC, id ASC",
+                (rs, n) -> new ApprovalRow(rs.getLong("exception_id"), rs.getString("approver"),
+                        rs.getInt("exception_version"), rs.getTimestamp("approved_at").toInstant()),
+                exceptionId);
+    }
+
+    /** 查询全部豁免申请，按 ID 升序。 */
+    public List<RiskExceptionRow> listRiskExceptions() {
+        return jdbcTemplate.query(
+                "SELECT id, dependency_name, dependency_version, exception_version, status, reason, "
+                        + "expires_at, created_at, decided_at FROM risk_exception ORDER BY id ASC",
+                (rs, n) -> mapExceptionRow(rs));
     }
 
     private record ArtifactRow(long id, String name, int version, boolean withdrawn) {

@@ -1,9 +1,15 @@
 package com.example.starter.api;
 
+import com.example.starter.api.dto.ApproveRiskExceptionRequest;
 import com.example.starter.api.dto.ArtifactResponse;
+import com.example.starter.api.dto.CreateRiskExceptionRequest;
 import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
+import com.example.starter.api.dto.MarkRiskRequest;
 import com.example.starter.api.dto.RegisterArtifactRequest;
+import com.example.starter.api.dto.ReviseRiskExceptionRequest;
+import com.example.starter.api.dto.RiskExceptionView;
+import com.example.starter.api.dto.RiskResponse;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Positive;
 import org.springframework.http.HttpStatus;
@@ -48,6 +54,67 @@ public class ArtifactController {
             @PathVariable String name,
             @PathVariable @Positive int version) {
         return artifactService.withdrawArtifact(requestId, name, version);
+    }
+
+    /** 标记或更新制品版本的依赖风险等级。 */
+    @PostMapping("/risks")
+    public RiskResponse markRisk(
+            @RequestHeader("X-Request-Id") String requestId,
+            @Valid @RequestBody MarkRiskRequest request) {
+        return artifactService.markRisk(requestId, request);
+    }
+
+    /** 查询全部风险标记。 */
+    @GetMapping("/risks")
+    public List<RiskResponse> listRisks() {
+        return artifactService.listRisks();
+    }
+
+    /** 创建高风险依赖豁免申请。 */
+    @PostMapping("/risk-exceptions")
+    public ResponseEntity<RiskExceptionView> createRiskException(
+            @RequestHeader("X-Request-Id") String requestId,
+            @Valid @RequestBody CreateRiskExceptionRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(artifactService.createRiskException(requestId, request));
+    }
+
+    /** 查询全部豁免申请（含审批人、当前有效性与适用版本）。 */
+    @GetMapping("/risk-exceptions")
+    public List<RiskExceptionView> listRiskExceptions() {
+        return artifactService.listRiskExceptions();
+    }
+
+    /** 按 ID 查询豁免申请。 */
+    @GetMapping("/risk-exceptions/{id}")
+    public RiskExceptionView getRiskException(@PathVariable long id) {
+        return artifactService.getRiskException(id);
+    }
+
+    /** 审批人确认豁免申请版本；两名不同审批人确认同一版本后生效。 */
+    @PostMapping("/risk-exceptions/{id}/approvals")
+    public RiskExceptionView approveRiskException(
+            @RequestHeader("X-Request-Id") String requestId,
+            @PathVariable long id,
+            @Valid @RequestBody ApproveRiskExceptionRequest request) {
+        return artifactService.approveRiskException(requestId, id, request);
+    }
+
+    /** 修订 PENDING 豁免：原因/到期时刻更新，申请版本加一，既有审批作废。 */
+    @PostMapping("/risk-exceptions/{id}/revise")
+    public RiskExceptionView reviseRiskException(
+            @RequestHeader("X-Request-Id") String requestId,
+            @PathVariable long id,
+            @Valid @RequestBody ReviseRiskExceptionRequest request) {
+        return artifactService.reviseRiskException(requestId, id, request);
+    }
+
+    /** 撤销已生效豁免；仅影响新锁定，不改写历史锁文件。 */
+    @PostMapping("/risk-exceptions/{id}/revoke")
+    public RiskExceptionView revokeRiskException(
+            @RequestHeader("X-Request-Id") String requestId,
+            @PathVariable long id) {
+        return artifactService.revokeRiskException(requestId, id);
     }
 
     /** 创建锁文件。 */
