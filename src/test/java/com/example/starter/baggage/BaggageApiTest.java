@@ -41,6 +41,7 @@ class BaggageApiTest {
 
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM load_rejection");
         jdbcTemplate.update("DELETE FROM bag_event");
         jdbcTemplate.update("DELETE FROM load_record");
         jdbcTemplate.update("DELETE FROM bag_itinerary");
@@ -223,7 +224,8 @@ class BaggageApiTest {
     void idempotency_replaysSameKeySameParams() throws Exception {
         String requestId = UUID.randomUUID().toString();
         Map<String, Object> body = Map.of(
-                "requestId", requestId, "legId", "LEG1", "origin", "PEK", "destination", "SHA");
+                "requestId", requestId, "legId", "LEG1", "origin", "PEK", "destination", "SHA",
+                "cutoffTime", "2099-01-01T00:00:00Z");
         postJson("/api/legs", body).andExpect(status().isCreated())
                 .andExpect(jsonPath("$.version").value(1));
         // 同键同参重放：返回原成功结果，不产生第二条航段
@@ -250,9 +252,11 @@ class BaggageApiTest {
     void idempotency_sameKeyDifferentParamsReturns409() throws Exception {
         String requestId = UUID.randomUUID().toString();
         postJson("/api/legs", Map.of("requestId", requestId, "legId", "LEG1",
-                "origin", "PEK", "destination", "SHA")).andExpect(status().isCreated());
+                "origin", "PEK", "destination", "SHA",
+                "cutoffTime", "2099-01-01T00:00:00Z")).andExpect(status().isCreated());
         postJson("/api/legs", Map.of("requestId", requestId, "legId", "LEG2",
-                "origin", "PEK", "destination", "SHA")).andExpect(status().isConflict());
+                "origin", "PEK", "destination", "SHA",
+                "cutoffTime", "2099-01-01T00:00:00Z")).andExpect(status().isConflict());
     }
 
     @Test
@@ -282,7 +286,8 @@ class BaggageApiTest {
 
     private ResultActions registerLeg(String legId, String origin, String destination) throws Exception {
         return postJson("/api/legs", Map.of("requestId", UUID.randomUUID().toString(),
-                "legId", legId, "origin", origin, "destination", destination));
+                "legId", legId, "origin", origin, "destination", destination,
+                "cutoffTime", "2099-01-01T00:00:00Z"));
     }
 
     private ResultActions registerBag(String bagTag, List<String> legIds) throws Exception {

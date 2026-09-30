@@ -7,6 +7,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
@@ -16,6 +17,7 @@ import com.example.starter.baggage.BaggageDtos.ArriveResponse;
 import com.example.starter.baggage.BaggageDtos.BagResponse;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveRequest;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveResponse;
+import com.example.starter.baggage.BaggageDtos.LegBagStatusResponse;
 import com.example.starter.baggage.BaggageDtos.LegDifferenceResponse;
 import com.example.starter.baggage.BaggageDtos.LegResponse;
 import com.example.starter.baggage.BaggageDtos.LoadRequest;
@@ -28,6 +30,7 @@ import com.example.starter.baggage.BaggageDtos.RegisterLegRequest;
 import com.example.starter.baggage.BaggageDtos.SealRequest;
 import com.example.starter.baggage.BaggageDtos.SealResponse;
 import com.example.starter.baggage.BaggageDtos.ShortListResponse;
+import com.example.starter.baggage.BaggageDtos.UpdateCutoffRequest;
 
 /**
  * 联程行李装载交接 REST 入口。
@@ -52,6 +55,18 @@ public class BaggageController {
     @PostMapping("/bags")
     public ResponseEntity<BagResponse> registerBag(@Valid @RequestBody RegisterBagRequest request) {
         return ResponseEntity.status(HttpStatus.CREATED).body(baggageService.registerBag(request));
+    }
+
+    /** 修改航段 UTC 截止时刻：仅 OPEN 航段可改，封舱或最终到达后返回 409。 */
+    @PutMapping("/legs/{legId}/cutoff")
+    public LegResponse updateCutoff(@PathVariable String legId, @Valid @RequestBody UpdateCutoffRequest request) {
+        return baggageService.updateCutoff(legId, request);
+    }
+
+    /** 按行李和航段查询交接、截止、装载状态及拒绝原因。 */
+    @GetMapping("/bags/{bagTag}/legs/{legId}/status")
+    public LegBagStatusResponse getLegBagStatus(@PathVariable String bagTag, @PathVariable String legId) {
+        return baggageService.getLegBagStatus(bagTag, legId);
     }
 
     /** 批量装载：整批原子，任一行李不满足则 422 且无一件移动。 */

@@ -64,6 +64,7 @@ class BaggageShortUnloadTest {
 
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM load_rejection");
         jdbcTemplate.update("DELETE FROM bag_event");
         jdbcTemplate.update("DELETE FROM load_record");
         jdbcTemplate.update("DELETE FROM bag_itinerary");
@@ -133,10 +134,13 @@ class BaggageShortUnloadTest {
                 .andExpect(jsonPath("$.shortUnloaded[0].expectedStation").value("SHA"))
                 .andExpect(jsonPath("$.shortUnloaded[0].registeredAt").value(FIXED_NOW.toString()));
 
-        // 到达后 load_record 已清空，短卸行李不残留装载记录
-        Integer loadRecords = jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM load_record", Integer.class);
-        assertThat(loadRecords).isZero();
+        // 到达后 load_record 按航段独立留痕：LEG1 两条装载记录保留，但在舱引用全部解除
+        Integer legRecords = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM load_record WHERE leg_id = 'LEG1'", Integer.class);
+        assertThat(legRecords).isEqualTo(2);
+        Integer stillLoaded = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM bag WHERE loaded_leg_id = 'LEG1'", Integer.class);
+        assertThat(stillLoaded).isZero();
 
         // 未补到前装载后续航段失败
         load("LEG2", 1, List.of("BAG2")).andExpect(status().isUnprocessableEntity());
@@ -334,7 +338,7 @@ class BaggageShortUnloadTest {
                 .andExpect(jsonPath("$.version").value(1))
                 .andExpect(jsonPath("$.status").value("OPEN"));
         Integer records = jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM load_record", Integer.class);
+                "SELECT COUNT(*) FROM load_record WHERE leg_id = 'LEG2'", Integer.class);
         assertThat(records).isZero();
 
         // 补到后整批可成功
@@ -420,18 +424,24 @@ class BaggageShortUnloadTest {
         assertThat(loadSucceeded).isNotEqualTo(loadFailed);
 
         Integer okLoaded = jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM load_record WHERE bag_tag = 'BAG_OK'", Integer.class);
+                "SELECT COUNT(*) FROM load_record WHERE bag_tag = 'BAG_OK' AND leg_id = 'LEG2'",
+                Integer.class);
         if (loadSucceeded) {
-            // 补到先提交：整批两件都进入清单
+            // 补到先提交：整批两件都进入 LEG2 清单（BAG_SHORT 在 LEG1 的历史装载记录仍独立保留）
             assertThat(okLoaded).isEqualTo(1);
             Integer shortLoaded = jdbcTemplate.queryForObject(
-                    "SELECT COUNT(*) FROM load_record WHERE bag_tag = 'BAG_SHORT'", Integer.class);
+                    "SELECT COUNT(*) FROM load_record WHERE bag_tag = 'BAG_SHORT' AND leg_id = 'LEG2'",
+                    Integer.class);
             assertThat(shortLoaded).isEqualTo(1);
+            Integer shortLeg1Trail = jdbcTemplate.queryForObject(
+                    "SELECT COUNT(*) FROM load_record WHERE bag_tag = 'BAG_SHORT' AND leg_id = 'LEG1'",
+                    Integer.class);
+            assertThat(shortLeg1Trail).isEqualTo(1);
             String shortStatus = jdbcTemplate.queryForObject(
                     "SELECT status FROM bag WHERE bag_tag = 'BAG_SHORT'", String.class);
             assertThat(shortStatus).isEqualTo("RECOVERED");
         } else {
-            // 装载先尝试且失败：整批不移动，补到完成后再装载必然成功
+            // 装载先尝试且失败：LEG2 整批不移动，补到完成后再装载必然成功
             assertThat(okLoaded).isZero();
             recover("BAG_SHORT", "LEG1", "SHA").andExpect(status().isOk());
             load("LEG2", 1, List.of("BAG_OK", "BAG_SHORT")).andExpect(status().isOk());
@@ -439,8 +449,8 @@ class BaggageShortUnloadTest {
     }
 
     private void registerLeg(String legId, String origin, String destination) {
-        baggageService.registerLeg(
-                new RegisterLegRequest(UUID.randomUUID().toString(), legId, origin, destination));
+        baggageService.registerLeg(new RegisterLegRequest(UUID.randomUUID().toString(),
+                legId, origin, destination, "2099-01-01T00:00:00Z"));
     }
 
     private void registerBag(String bagTag, List<String> legIds) {

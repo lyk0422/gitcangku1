@@ -43,6 +43,7 @@ class BaggageConcurrencyTest {
 
     @BeforeEach
     void setUp() {
+        jdbcTemplate.update("DELETE FROM load_rejection");
         jdbcTemplate.update("DELETE FROM bag_event");
         jdbcTemplate.update("DELETE FROM load_record");
         jdbcTemplate.update("DELETE FROM bag_itinerary");
@@ -158,8 +159,8 @@ class BaggageConcurrencyTest {
     }
 
     private void registerLeg(String legId, String origin, String destination) {
-        baggageService.registerLeg(
-                new RegisterLegRequest(UUID.randomUUID().toString(), legId, origin, destination));
+        baggageService.registerLeg(new RegisterLegRequest(UUID.randomUUID().toString(),
+                legId, origin, destination, "2099-01-01T00:00:00Z"));
     }
 
     private void registerBag(String bagTag, List<String> legIds) {

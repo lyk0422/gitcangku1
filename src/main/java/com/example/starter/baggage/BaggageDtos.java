@@ -8,18 +8,27 @@ import jakarta.validation.constraints.Size;
 
 /**
  * 联程行李装载交接 API 的请求与响应 DTO。
+ * 时间字段统一使用带偏移量的 UTC ISO-8601 字符串（如 2026-09-30T12:00:00Z）。
  */
 public final class BaggageDtos {
 
     private BaggageDtos() {
     }
 
-    /** 登记航段请求。 */
+    /** 登记航段请求：cutoffTime 为该航段 UTC 装载截止时刻。 */
     public record RegisterLegRequest(
             @NotBlank(message = "requestId 不能为空") String requestId,
             @NotBlank(message = "legId 不能为空") String legId,
             @NotBlank(message = "origin 不能为空") String origin,
-            @NotBlank(message = "destination 不能为空") String destination) {
+            @NotBlank(message = "destination 不能为空") String destination,
+            @NotBlank(message = "cutoffTime 不能为空") String cutoffTime) {
+    }
+
+    /** 修改航段截止时刻请求：expectedVersion 做并发版本校验，仅 OPEN（未封舱）航段可改。 */
+    public record UpdateCutoffRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotNull(message = "expectedVersion 不能为空") Integer expectedVersion,
+            @NotBlank(message = "cutoffTime 不能为空") String cutoffTime) {
     }
 
     /** 登记行李请求：legIds 为 1~5 个有序航段。 */
@@ -65,9 +74,9 @@ public final class BaggageDtos {
             @NotBlank(message = "actualStation 不能为空") String actualStation) {
     }
 
-    /** 航段响应。 */
+    /** 航段响应：cutoffTime 为当前 UTC 装载截止时刻。 */
     public record LegResponse(String legId, String origin, String destination,
-                              String status, int version) {
+                              String cutoffTime, String status, int version) {
     }
 
     /** 行程明细项。 */
@@ -86,8 +95,11 @@ public final class BaggageDtos {
                               List<TraceEvent> events) {
     }
 
-    /** 批量装载响应。 */
-    public record LoadResponse(String legId, String status, int version, List<String> loaded) {
+    /**
+     * 批量装载响应：cutoffTime 为装载成功时的截止时刻只读快照，重放同 requestId 时保持首值。
+     */
+    public record LoadResponse(String legId, String cutoffTime, String status,
+                               int version, List<String> loaded) {
     }
 
     /** 封舱响应：manifest 为只读装载清单快照。 */
@@ -124,5 +136,25 @@ public final class BaggageDtos {
 
     /** 未补到清单响应。 */
     public record ShortListResponse(List<ShortItem> shortUnloaded) {
+    }
+
+    /** 装载拒绝留痕项：按时间升序，reasonCode 见 load_rejection 表注释。 */
+    public record RejectionItem(String bagTag, String legId, String requestId,
+                                String reasonCode, String reasonDetail, String rejectedAt) {
+    }
+
+    /**
+     * 按行李 + 航段查询交接、截止与装载状态。
+     * handedOver：该行李本航段交接是否完成（行李当前位于航段始发站且待乘索引指向该航段，
+     * 或该航段已存在装载/到达留痕）；
+     * loadStatus：NOT_LOADED 未装载/LOADED 已在本航段装载/SEALED 航段已封舱/ARRIVED 航段已到达；
+     * cutoffOpen：当前时刻是否仍严格早于截止时刻（now=cutoff 为 false）；
+     * rejections：该行李在该航段的拒绝留痕（含批量连带拒绝），最新在最后。
+     */
+    public record LegBagStatusResponse(String bagTag, String legId, String legStatus,
+                                       int legVersion, String cutoffTime, boolean cutoffOpen,
+                                       boolean handedOver, String loadStatus,
+                                       String cutoffSnapshot, String loadedAt,
+                                       List<RejectionItem> rejections) {
     }
 }
