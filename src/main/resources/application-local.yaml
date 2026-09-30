@@ -1,0 +1,16 @@
+# 本地启动 profile：H2 内存库（MODE=MySQL），自动建表并初始化合成数据。
+# 不依赖外部 MySQL、Docker；数据仅存于 JVM 内存，进程退出即丢失，不承诺跨重启恢复。
+# 启动：./gradlew bootRun --args='--spring.profiles.active=local'
+spring:
+  datasource:
+    url: jdbc:h2:mem:calibration-local;MODE=MySQL;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=10000
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+    hikari:
+      maximum-pool-size: 5
+      minimum-idle: 1
+  sql:
+    init:
+      mode: always
+      data-locations: classpath:data-local.sql

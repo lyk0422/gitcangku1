@@ -11,6 +11,7 @@ import com.example.starter.calibration.api.dto.CertificateResponse;
 import com.example.starter.calibration.api.dto.CreateCertificateRequest;
 import com.example.starter.calibration.model.Certificate;
 import com.example.starter.calibration.repo.CertificateRepository;
+import com.example.starter.calibration.repo.InstrumentLockRepository;
 
 /**
  * 校准证书服务：创建（区间不重叠，并发安全）、撤销、查询。
@@ -19,9 +20,11 @@ import com.example.starter.calibration.repo.CertificateRepository;
 public class CertificateService {
 
     private final CertificateRepository certificates;
+    private final InstrumentLockRepository locks;
 
-    public CertificateService(CertificateRepository certificates) {
+    public CertificateService(CertificateRepository certificates, InstrumentLockRepository locks) {
         this.certificates = certificates;
+        this.locks = locks;
     }
 
     /**
@@ -39,11 +42,26 @@ public class CertificateService {
             throw ApiException.badRequest("validFrom 必须早于 validTo");
         }
 
-        certificates.lockInstrument(instrumentId);
+        BigDecimal tempMin = Inputs.optionalDecimal(request.tempMin(), "tempMin");
+        BigDecimal tempMax = Inputs.optionalDecimal(request.tempMax(), "tempMax");
+        BigDecimal humidityMin = Inputs.optionalDecimal(request.humidityMin(), "humidityMin");
+        BigDecimal humidityMax = Inputs.optionalDecimal(request.humidityMax(), "humidityMax");
+        boolean rangeComplete = tempMin != null && tempMax != null && humidityMin != null && humidityMax != null;
+        boolean rangeEmpty = tempMin == null && tempMax == null && humidityMin == null && humidityMax == null;
+        if (!rangeComplete && !rangeEmpty) {
+            throw ApiException.badRequest("温湿度允许范围必须四个边界同时提供或同时省略");
+        }
+        if (rangeComplete
+                && (tempMin.compareTo(tempMax) > 0 || humidityMin.compareTo(humidityMax) > 0)) {
+            throw ApiException.badRequest("温湿度允许范围下限不能大于上限");
+        }
+
+        locks.lock(instrumentId);
         if (certificates.countActiveOverlap(instrumentId, validFrom, validTo) > 0) {
             throw ApiException.conflict("CERTIFICATE_OVERLAP", "同一仪器存在区间重叠的未撤销证书");
         }
-        long id = certificates.insert(instrumentId, validFrom, validTo, a, b, Instant.now());
+        long id = certificates.insert(instrumentId, validFrom, validTo, a, b,
+                tempMin, tempMax, humidityMin, humidityMax, Instant.now());
         return DtoMapper.toResponse(certificates.findById(id).orElseThrow());
     }
 

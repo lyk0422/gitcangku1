@@ -44,4 +44,9 @@ public class ApiException extends RuntimeException {
     public static ApiException unprocessable(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "NO_MATCHING_CERTIFICATE", message);
     }
+
+    /** 422：业务规则不满足（环境越界、系数未生效/多版本命中），携带专用错误码与实际值。 */
+    public static ApiException unprocessable(String code, String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, code, message);
+    }
 }

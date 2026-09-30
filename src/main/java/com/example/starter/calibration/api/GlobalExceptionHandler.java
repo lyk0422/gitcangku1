@@ -22,6 +22,12 @@ public class GlobalExceptionHandler {
                 .body(new ErrorResponse(ex.getCode(), ex.getMessage(), ex.getFailures()));
     }
 
+    @ExceptionHandler(EnvironmentRejectedException.class)
+    public ResponseEntity<ErrorResponse> handleEnvironmentRejected(EnvironmentRejectedException ex) {
+        return ResponseEntity.status(ex.getStatus())
+                .body(new ErrorResponse(ex.getCode(), ex.getMessage(), ex.getFailures()));
+    }
+
     @ExceptionHandler(ApiException.class)
     public ResponseEntity<ErrorResponse> handleApi(ApiException ex) {
         return ResponseEntity.status(ex.getStatus())

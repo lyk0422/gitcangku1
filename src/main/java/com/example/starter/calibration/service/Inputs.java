@@ -34,6 +34,26 @@ final class Inputs {
         return new BigDecimal(value.trim());
     }
 
+    /**
+     * 可选十进制：null/空白返回 null；非空时按 {@link #requireDecimal} 校验。
+     */
+    static BigDecimal optionalDecimal(String value, String field) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        return requireDecimal(value, field);
+    }
+
+    /**
+     * 可选时间：null/空白返回 null；非空时按 {@link #requireInstant} 校验。
+     */
+    static Instant optionalInstant(String value, String field) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        return requireInstant(value, field);
+    }
+
     static Instant requireInstant(String value, String field) {
         if (value == null || value.isBlank()) {
             throw ApiException.badRequest(field + " 不能为空");

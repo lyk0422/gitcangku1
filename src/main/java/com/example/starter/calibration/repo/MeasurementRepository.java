@@ -1,5 +1,6 @@
 package com.example.starter.calibration.repo;
 
+import java.math.BigDecimal;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
 import java.time.LocalDateTime;
@@ -33,6 +34,11 @@ public class MeasurementRepository {
             rs.getLong("certificate_id"),
             rs.getBigDecimal("computed_value"),
             rs.getBoolean("passed"),
+            rs.getBigDecimal("temperature"),
+            rs.getBigDecimal("humidity"),
+            (Long) rs.getObject("coeff_version_id"),
+            rs.getBigDecimal("compensation_value"),
+            rs.getBigDecimal("final_value"),
             MeasurementStatus.valueOf(rs.getString("status")),
             JdbcTimes.fromDb(rs.getObject("created_at", LocalDateTime.class)));
 
@@ -44,6 +50,7 @@ public class MeasurementRepository {
 
     /**
      * 插入测量记录并返回生成的 ID；measurement_key 冲突时抛出 DuplicateKeyException。
+     * 环境补偿相关五列在提交阶段均为 NULL，放行成功时再于同一事务固化。
      */
     public long insert(Measurement measurement) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
@@ -51,8 +58,10 @@ public class MeasurementRepository {
             PreparedStatement ps = con.prepareStatement(
                     "INSERT INTO measurement "
                             + "(measurement_key, instrument_id, measured_at, raw_reading, lower_limit, upper_limit, "
-                            + "submitted_by, certificate_id, computed_value, passed, status, created_at) "
-                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            + "submitted_by, certificate_id, computed_value, passed, "
+                            + "temperature, humidity, coeff_version_id, compensation_value, final_value, "
+                            + "status, created_at) "
+                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, measurement.measurementKey());
             ps.setString(2, measurement.instrumentId());
@@ -93,6 +102,18 @@ public class MeasurementRepository {
     public void markReleased(long id) {
         jdbc.update("UPDATE measurement SET status = ? WHERE id = ?",
                 MeasurementStatus.RELEASED.name(), id);
+    }
+
+    /**
+     * 环境补偿放行：一次性固化环境读数、系数版本、未舍入补偿值、四位小数最终值并置为已放行。
+     * 与状态更新同一条 SQL 提交，保证一条放行结果只引用一个完整版本，事后不被重算。
+     */
+    public void applyEnvironmentRelease(long id, long coeffVersionId, BigDecimal temperature,
+                                        BigDecimal humidity, BigDecimal compensation, BigDecimal finalValue) {
+        jdbc.update("UPDATE measurement SET status = ?, temperature = ?, humidity = ?, "
+                        + "coeff_version_id = ?, compensation_value = ?, final_value = ? WHERE id = ?",
+                MeasurementStatus.RELEASED.name(), temperature, humidity,
+                coeffVersionId, compensation, finalValue, id);
     }
 
     /**
