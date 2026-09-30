@@ -108,6 +108,84 @@ class SchemaH2ScriptTest {
                     duplicateBlockerRejected = true;
                 }
                 assertThat(duplicateBlockerRejected).isTrue();
+
+                // 资源凭据：(resource_key, version) 唯一
+                st.execute("INSERT INTO resource_credentials (resource_key, version,"
+                        + " credential_type, region, status, expires_at, revoked_at, created_at,"
+                        + " updated_at) VALUES ('R','v1','AWS_AK','A','ACTIVE','"
+                        + Timestamp.from(now.plusSeconds(3600)) + "',NULL,'" + Timestamp.from(now)
+                        + "','" + Timestamp.from(now) + "')");
+                boolean duplicateCredentialRejected = false;
+                try {
+                    st.execute("INSERT INTO resource_credentials (resource_key, version,"
+                            + " credential_type, region, status, expires_at, revoked_at, created_at,"
+                            + " updated_at) VALUES ('R','v1','AWS_AK','B','ACTIVE','"
+                            + Timestamp.from(now.plusSeconds(3600)) + "',NULL,'"
+                            + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateCredentialRejected = true;
+                }
+                assertThat(duplicateCredentialRejected).isTrue();
+
+                // 派发记录：request_id 全局唯一、(task_id, seq) 唯一；
+                // 条件更新只作用于 DISPATCHED（撤销/执行竞争按已提交状态转移）
+                st.execute("INSERT INTO task_dispatches (task_id, seq, request_id, resource_key,"
+                        + " credential_version, credential_type, region, expires_at, status,"
+                        + " block_reason, blocked_at, dispatched_at, dispatched_by, started_at)"
+                        + " VALUES (1,1,'REQ-1','R','v1','AWS_AK','A','"
+                        + Timestamp.from(now.plusSeconds(3600)) + "','DISPATCHED',NULL,NULL,'"
+                        + Timestamp.from(now) + "','alice',NULL)");
+                boolean duplicateRequestRejected = false;
+                try {
+                    st.execute("INSERT INTO task_dispatches (task_id, seq, request_id,"
+                            + " resource_key, credential_version, credential_type, region,"
+                            + " expires_at, status, block_reason, blocked_at, dispatched_at,"
+                            + " dispatched_by, started_at) VALUES (1,2,'REQ-1','R','v2','AWS_AK',"
+                            + "'A','" + Timestamp.from(now.plusSeconds(3600))
+                            + "','DISPATCHED',NULL,NULL,'" + Timestamp.from(now)
+                            + "','alice',NULL)");
+                } catch (Exception e) {
+                    duplicateRequestRejected = true;
+                }
+                assertThat(duplicateRequestRejected).isTrue();
+                boolean duplicateSeqRejected = false;
+                try {
+                    st.execute("INSERT INTO task_dispatches (task_id, seq, request_id,"
+                            + " resource_key, credential_version, credential_type, region,"
+                            + " expires_at, status, block_reason, blocked_at, dispatched_at,"
+                            + " dispatched_by, started_at) VALUES (1,1,'REQ-2','R','v1','AWS_AK',"
+                            + "'A','" + Timestamp.from(now.plusSeconds(3600))
+                            + "','DISPATCHED',NULL,NULL,'" + Timestamp.from(now)
+                            + "','alice',NULL)");
+                } catch (Exception e) {
+                    duplicateSeqRejected = true;
+                }
+                assertThat(duplicateSeqRejected).isTrue();
+
+                // 阻断条件更新命中 DISPATCHED 行；重复阻断更新 0 行
+                int blocked = st.executeUpdate("UPDATE task_dispatches SET status='BLOCKED',"
+                        + " block_reason='CREDENTIAL_EXPIRED', blocked_at='" + Timestamp.from(now)
+                        + "' WHERE id = 1 AND status = 'DISPATCHED'");
+                assertThat(blocked).isEqualTo(1);
+                int blockedAgain = st.executeUpdate("UPDATE task_dispatches SET status='BLOCKED'"
+                        + " WHERE id = 1 AND status = 'DISPATCHED'");
+                assertThat(blockedAgain).isZero();
+                int lateExecute = st.executeUpdate("UPDATE task_dispatches SET status='EXECUTING'"
+                        + " WHERE id = 1 AND status = 'DISPATCHED'");
+                assertThat(lateExecute).isZero();
+
+                // 任务阻断字段与当前派发指针落库后可查
+                st.executeUpdate("UPDATE incident_tasks SET status='BLOCKED',"
+                        + " current_dispatch_id=1, block_reason='CREDENTIAL_EXPIRED', blocked_at='"
+                        + Timestamp.from(now) + "' WHERE id = 1 AND status = 'OPEN'");
+                try (ResultSet rs = st.executeQuery(
+                        "SELECT status, current_dispatch_id, block_reason FROM incident_tasks"
+                                + " WHERE id = 1")) {
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getString("status")).isEqualTo("BLOCKED");
+                    assertThat(rs.getLong("current_dispatch_id")).isEqualTo(1L);
+                    assertThat(rs.getString("block_reason")).isEqualTo("CREDENTIAL_EXPIRED");
+                }
             }
         }
     }

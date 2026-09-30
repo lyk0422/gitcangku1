@@ -44,6 +44,9 @@ public class IncidentTaskRepository {
     private static IncidentTask mapTask(ResultSet rs) throws SQLException {
         Timestamp doneAt = rs.getTimestamp("done_at");
         Timestamp cancelledAt = rs.getTimestamp("cancelled_at");
+        Timestamp blockedAt = rs.getTimestamp("blocked_at");
+        String blockReason = rs.getString("block_reason");
+        long currentDispatchId = rs.getLong("current_dispatch_id");
         return new IncidentTask(
                 rs.getLong("id"), rs.getLong("incident_id"), rs.getString("task_key"),
                 rs.getString("group_code"), rs.getString("title"),
@@ -53,7 +56,10 @@ public class IncidentTaskRepository {
                 rs.getString("cancelled_by"),
                 cancelledAt == null ? null : cancelledAt.toInstant(),
                 rs.getTimestamp("created_at").toInstant(),
-                rs.getTimestamp("updated_at").toInstant());
+                rs.getTimestamp("updated_at").toInstant(),
+                rs.wasNull() ? null : currentDispatchId,
+                blockReason == null ? null : BlockReason.valueOf(blockReason),
+                blockedAt == null ? null : blockedAt.toInstant());
     }
 
     /**
@@ -71,7 +77,8 @@ public class IncidentTaskRepository {
             var ps = con.prepareStatement(
                     "INSERT INTO incident_tasks (incident_id, task_key, group_code, title, status,"
                             + " created_by, done_by, done_at, cancelled_by, cancelled_at,"
-                            + " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                            + " created_at, updated_at, current_dispatch_id, block_reason, blocked_at)"
+                            + " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setLong(1, task.incidentId());
             ps.setString(2, task.taskKey());
@@ -85,6 +92,13 @@ public class IncidentTaskRepository {
             ps.setTimestamp(10, task.cancelledAt() == null ? null : Timestamp.from(task.cancelledAt()));
             ps.setTimestamp(11, Timestamp.from(task.createdAt()));
             ps.setTimestamp(12, Timestamp.from(task.updatedAt()));
+            if (task.currentDispatchId() == null) {
+                ps.setObject(13, null);
+            } else {
+                ps.setLong(13, task.currentDispatchId());
+            }
+            ps.setString(14, task.blockReason() == null ? null : task.blockReason().name());
+            ps.setTimestamp(15, task.blockedAt() == null ? null : Timestamp.from(task.blockedAt()));
             return ps;
         }, keys);
         return keys.getKey().longValue();
@@ -109,11 +123,12 @@ public class IncidentTaskRepository {
     }
 
     /**
-     * 查询事件仍 OPEN 的任务（解决门禁用），按创建顺序返回。
+     * 查询事件仍未终结的任务（OPEN/DISPATCHED/EXECUTING/BLOCKED，解决门禁用），按创建顺序返回。
      */
     public List<IncidentTask> listOpenByIncident(long incidentId) {
-        return jdbc.query("SELECT * FROM incident_tasks WHERE incident_id = ? AND status = 'OPEN'"
-                + " ORDER BY id", TASK_MAPPER, incidentId);
+        return jdbc.query("SELECT * FROM incident_tasks WHERE incident_id = ?"
+                        + " AND status IN ('OPEN','DISPATCHED','EXECUTING','BLOCKED') ORDER BY id",
+                TASK_MAPPER, incidentId);
     }
 
     /**
@@ -126,20 +141,23 @@ public class IncidentTaskRepository {
     }
 
     /**
-     * 将 OPEN 任务置为 DONE，记录完成人与 UTC 时刻。
+     * 将任务置为 DONE，记录完成人与 UTC 时刻。
+     * 仅 OPEN（未派发直接完成）或 EXECUTING（执行前检查通过后完成）可完成。
      */
-    public void markDone(long id, String actor, Instant at) {
-        jdbc.update("UPDATE incident_tasks SET status = 'DONE', done_by = ?, done_at = ?,"
-                        + " updated_at = ? WHERE id = ?",
+    public int markDone(long id, String actor, Instant at) {
+        return jdbc.update("UPDATE incident_tasks SET status = 'DONE', done_by = ?, done_at = ?,"
+                        + " updated_at = ? WHERE id = ? AND status IN ('OPEN','EXECUTING')",
                 actor, Timestamp.from(at), Timestamp.from(at), id);
     }
 
     /**
-     * 将 OPEN 任务置为 CANCELLED，记录取消人与 UTC 时刻。
+     * 将任务置为 CANCELLED，记录取消人与 UTC 时刻。
+     * 仅 OPEN/DISPATCHED/BLOCKED 可取消；EXECUTING 已启动执行，不允许取消。
      */
-    public void markCancelled(long id, String actor, Instant at) {
-        jdbc.update("UPDATE incident_tasks SET status = 'CANCELLED', cancelled_by = ?,"
-                        + " cancelled_at = ?, updated_at = ? WHERE id = ?",
+    public int markCancelled(long id, String actor, Instant at) {
+        return jdbc.update("UPDATE incident_tasks SET status = 'CANCELLED', cancelled_by = ?,"
+                        + " cancelled_at = ?, updated_at = ? WHERE id = ?"
+                        + " AND status IN ('OPEN','DISPATCHED','BLOCKED')",
                 actor, Timestamp.from(at), Timestamp.from(at), id);
     }
 
@@ -199,5 +217,46 @@ public class IncidentTaskRepository {
             }
         }
         return false;
+    }
+
+    /**
+     * 按主键锁定任务行（SELECT ... FOR UPDATE），用于执行前检查等需与任务状态转移互斥的路径。
+     */
+    public Optional<IncidentTask> lockById(long id) {
+        List<IncidentTask> rows = jdbc.query(
+                "SELECT * FROM incident_tasks WHERE id = ? FOR UPDATE", TASK_MAPPER, id);
+        return rows.stream().findFirst();
+    }
+
+    /**
+     * 派发落库：OPEN 或 BLOCKED → DISPATCHED，指向新派发记录并清空阻断字段。
+     * 条件更新兜底并发/重复派发，返回受影响行数。
+     */
+    public int applyDispatch(long id, long dispatchId, Instant at) {
+        return jdbc.update(
+                "UPDATE incident_tasks SET status = 'DISPATCHED', current_dispatch_id = ?,"
+                        + " block_reason = NULL, blocked_at = NULL, updated_at = ? WHERE id = ?"
+                        + " AND status IN ('OPEN','BLOCKED')",
+                dispatchId, Timestamp.from(at), id);
+    }
+
+    /**
+     * 执行前检查通过：DISPATCHED → EXECUTING。条件更新返回受影响行数。
+     */
+    public int markExecuting(long id, Instant at) {
+        return jdbc.update(
+                "UPDATE incident_tasks SET status = 'EXECUTING', updated_at = ? WHERE id = ?"
+                        + " AND status = 'DISPATCHED'",
+                Timestamp.from(at), id);
+    }
+
+    /**
+     * 执行前检查不通过：DISPATCHED → BLOCKED，写入阻断原因与 UTC 时刻。条件更新返回受影响行数。
+     */
+    public int markBlocked(long id, BlockReason reason, Instant at) {
+        return jdbc.update(
+                "UPDATE incident_tasks SET status = 'BLOCKED', block_reason = ?, blocked_at = ?,"
+                        + " updated_at = ? WHERE id = ? AND status = 'DISPATCHED'",
+                reason.name(), Timestamp.from(at), Timestamp.from(at), id);
     }
 }

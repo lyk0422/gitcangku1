@@ -8,6 +8,8 @@ import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
 import com.example.starter.incident.dto.Requests.TaskActionRequest;
 import com.example.starter.incident.dto.Requests.TaskCreateRequest;
+import com.example.starter.incident.dto.Requests.TaskDispatchRequest;
+import com.example.starter.incident.dto.Requests.TaskStartRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
@@ -177,6 +179,29 @@ public class IncidentController {
                                  @RequestHeader("X-Actor-Id") String actor,
                                  @RequestBody TaskActionRequest req) {
         return service.completeTask(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 派发任务（首次派发或 BLOCKED 后凭新凭据再派发）：派发时校验凭据类型、区域与 UTC 有效期，
+     * 快照凭据版本；requestId 同键重放首次任务与凭据版本，换资源/版本/任务 409。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/dispatches")
+    public TaskView dispatchTask(@PathVariable String incidentKey, @PathVariable String taskKey,
+                                 @RequestHeader("X-Actor-Id") String actor,
+                                 @RequestBody TaskDispatchRequest req) {
+        return service.dispatchTask(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 执行前凭据检查并启动执行：检查通过 DISPATCHED → EXECUTING；
+     * 凭据过期/撤销则任务转为 BLOCKED（响应体 status 为 BLOCKED），不能直接完成。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/start")
+    public TaskView startTaskExecution(@PathVariable String incidentKey,
+                                       @PathVariable String taskKey,
+                                       @RequestHeader("X-Actor-Id") String actor,
+                                       @RequestBody TaskStartRequest req) {
+        return service.startTaskExecution(incidentKey, taskKey, actor, req);
     }
 
     /**

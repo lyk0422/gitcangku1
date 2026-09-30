@@ -65,10 +65,45 @@ public final class Responses {
     /**
      * 处置任务视图：blockers 按阻塞事件键排序；doneBy/doneAt 仅 DONE 有值，
      * cancelledBy/cancelledAt 仅 CANCELLED 有值。
+     * credential 为当前生效派发的凭据依据（从未派发为 null）；
+     * blockReason 仅 BLOCKED 有值（CREDENTIAL_EXPIRED/CREDENTIAL_REVOKED）；
+     * dispatches 为历次派发记录（含首次派发与再派发），按派发次序返回。
      */
     public record TaskView(String taskKey, String groupCode, String title, String status,
                            List<TaskBlockerView> blockers, String createdBy, Instant createdAt,
-                           String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt) {
+                           String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt,
+                           TaskCredentialView credential, String blockReason, Instant blockedAt,
+                           List<TaskDispatchView> dispatches) {
+    }
+
+    /**
+     * 任务当前凭据依据视图：取自最新一次派发记录的不可变快照；
+     * expiresAt 为该凭据版本的 UTC 失效时刻；dispatchStatus 为该次派发的当前状态
+     * （DISPATCHED/EXECUTING/BLOCKED）。
+     */
+    public record TaskCredentialView(String resourceKey, String credentialVersion,
+                                     String credentialType, String region, Instant expiresAt,
+                                     String dispatchStatus, Instant dispatchedAt, Instant startedAt) {
+    }
+
+    /**
+     * 单次派发记录视图：区域与凭据版本为派发当时快照，历史不可变；
+     * blockReason/blockedAt 仅 BLOCKED 有值；startedAt 仅 EXECUTING 有值。时间均为 UTC。
+     */
+    public record TaskDispatchView(int seq, String requestId, String resourceKey,
+                                   String credentialVersion, String credentialType, String region,
+                                   Instant expiresAt, String status, String blockReason,
+                                   Instant blockedAt, Instant dispatchedAt, String dispatchedBy,
+                                   Instant startedAt) {
+    }
+
+    /**
+     * 资源凭据视图：status 为 ACTIVE/REVOKED；revokedAt 仅 REVOKED 有值；
+     * expiresAt 为 UTC 失效时刻。
+     */
+    public record CredentialView(String resourceKey, String version, String credentialType,
+                                 String region, String status, Instant expiresAt, Instant revokedAt,
+                                 Instant createdAt) {
     }
 
     /** 按事件分组的任务列表视图：tasks 按创建顺序返回。 */

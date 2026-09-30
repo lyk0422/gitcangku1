@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS incident_status_history (
 CREATE TABLE IF NOT EXISTS command_keys (
     id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
     command_key VARCHAR(128) NOT NULL COMMENT '调用方幂等键，全局唯一',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：takeover/transfer_initiate/transfer_accept/action/status/escalation_check/escalation_ack/task_create/task_complete/task_cancel',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：takeover/transfer_initiate/transfer_accept/action/status/escalation_check/escalation_ack/task_create/task_complete/task_cancel/task_dispatch/task_start/credential_register/credential_revoke',
     request_hash VARCHAR(64) NOT NULL COMMENT '规范化请求参数的 SHA-256 摘要，用于同键改参检测',
     response_status INT NULL COMMENT '首次成功的 HTTP 状态码；事务提交前必写入',
     response_body MEDIUMTEXT NULL COMMENT '首次成功响应 JSON，用于同键同参重放',
@@ -78,7 +78,7 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     task_key VARCHAR(128) NOT NULL COMMENT '任务业务键，事件内唯一；同键同内容幂等，同键不同内容冲突',
     group_code VARCHAR(64) NOT NULL COMMENT '分组编码，非空',
     title VARCHAR(512) NOT NULL COMMENT '任务标题，非空',
-    status VARCHAR(16) NOT NULL COMMENT '状态：OPEN 待处理 / DONE 已完成 / CANCELLED 已取消；仅允许 OPEN→DONE 或 OPEN→CANCELLED，DONE 与 CANCELLED 为终态',
+    status VARCHAR(16) NOT NULL COMMENT '状态：OPEN 未派发 / DISPATCHED 已派发待执行前检查 / EXECUTING 执行中 / BLOCKED 凭据检查阻断 / DONE 已完成 / CANCELLED 已取消；BLOCKED 仅能凭有效新凭据再派发，旧凭据不自动解锁',
     created_by VARCHAR(128) NOT NULL COMMENT '创建人（创建时的当前指挥人）',
     done_by VARCHAR(128) NULL COMMENT '完成人（操作时的当前指挥人）；仅 DONE 有值，否则为空',
     done_at TIMESTAMP(6) NULL COMMENT '完成 UTC 时间；仅 DONE 有值，否则为空',
@@ -86,8 +86,45 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     cancelled_at TIMESTAMP(6) NULL COMMENT '取消 UTC 时间；仅 CANCELLED 有值，否则为空',
     created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
     updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间',
+    current_dispatch_id BIGINT NULL COMMENT '当前生效派发记录 id，关联 task_dispatches.id；从未派发为空，再派发后指向最新记录',
+    block_reason VARCHAR(32) NULL COMMENT '阻断原因：CREDENTIAL_EXPIRED 凭据有效期已结束 / CREDENTIAL_REVOKED 凭据已撤销；仅 BLOCKED 有值，再派发成功清空',
+    blocked_at TIMESTAMP(6) NULL COMMENT '阻断 UTC 时间（执行前检查时刻）；仅 BLOCKED 有值，否则为空',
     CONSTRAINT uk_task_key UNIQUE (incident_id, task_key)
 ) COMMENT='事件处置任务表';
+
+CREATE TABLE IF NOT EXISTS resource_credentials (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    resource_key VARCHAR(128) NOT NULL COMMENT '资源业务键；同一资源可登记多个凭据版本',
+    version VARCHAR(64) NOT NULL COMMENT '凭据版本，资源内唯一；版本内容不可变，更新有效凭据通过登记新版本实现',
+    credential_type VARCHAR(64) NOT NULL COMMENT '凭据类型；派发时必须与任务要求类型一致',
+    region VARCHAR(64) NOT NULL COMMENT '凭据覆盖的单个区域；派发任务区域必须与之相等',
+    status VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE 有效 / REVOKED 已撤销；撤销不可逆，撤销后的凭据任何派发与执行前检查均不通过',
+    expires_at TIMESTAMP(6) NOT NULL COMMENT 'UTC 失效时刻；当前时刻到达该时刻即失效（有效期未结束要求 now < expires_at）',
+    revoked_at TIMESTAMP(6) NULL COMMENT '撤销 UTC 时刻；仅 REVOKED 有值，否则为空',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '登记 UTC 时间',
+    updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间',
+    CONSTRAINT uk_credential_version UNIQUE (resource_key, version)
+) COMMENT='资源凭据表（版本不可变，旧版本保留作为派发与执行历史依据）';
+
+CREATE TABLE IF NOT EXISTS task_dispatches (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    task_id BIGINT NOT NULL COMMENT '所属任务 id，关联 incident_tasks.id；每次派发（含再派发）追加一行',
+    seq INT NOT NULL COMMENT '任务内派发序号，从 1 递增；首次派发为 1，BLOCKED 后再派发依次递增',
+    request_id VARCHAR(128) NOT NULL COMMENT '调用方派发幂等键，全局唯一；同键重放首次任务与凭据版本，换资源/版本/任务返回 409',
+    resource_key VARCHAR(128) NOT NULL COMMENT '派发所指定资源键的不可变快照',
+    credential_version VARCHAR(64) NOT NULL COMMENT '派发当时校验通过的凭据版本的不可变快照；执行前按该版本重新检查，旧版本不得用于自动解锁',
+    credential_type VARCHAR(64) NOT NULL COMMENT '派发要求并校验通过的凭据类型快照',
+    region VARCHAR(64) NOT NULL COMMENT '任务区域快照；凭据必须覆盖该区域',
+    expires_at TIMESTAMP(6) NOT NULL COMMENT '该凭据版本的 UTC 失效时刻快照；历史执行记录保持当时依据不变',
+    status VARCHAR(16) NOT NULL COMMENT '派发记录状态：DISPATCHED 已派发待检查 / EXECUTING 执行前检查通过执行已启动 / BLOCKED 执行前检查不通过',
+    block_reason VARCHAR(32) NULL COMMENT '阻断原因：CREDENTIAL_EXPIRED 凭据有效期已结束 / CREDENTIAL_REVOKED 凭据已撤销；仅 BLOCKED 有值',
+    blocked_at TIMESTAMP(6) NULL COMMENT '阻断 UTC 时刻（执行前检查时刻）；仅 BLOCKED 有值，否则为空',
+    dispatched_at TIMESTAMP(6) NOT NULL COMMENT '派发 UTC 时间',
+    dispatched_by VARCHAR(128) NOT NULL COMMENT '派发操作人（派发时的当前指挥人）',
+    started_at TIMESTAMP(6) NULL COMMENT '执行启动 UTC 时刻（执行前检查通过时刻）；仅 EXECUTING 有值，否则为空',
+    CONSTRAINT uk_dispatch_request UNIQUE (request_id),
+    CONSTRAINT uk_dispatch_seq UNIQUE (task_id, seq)
+) COMMENT='任务派发记录表（区域与凭据版本等为派发当时不可变快照，保留历史执行依据）';
 
 CREATE TABLE IF NOT EXISTS incident_task_blockers (
     id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',

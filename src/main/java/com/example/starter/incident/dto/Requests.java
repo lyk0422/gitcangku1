@@ -55,4 +55,29 @@ public final class Requests {
     /** 任务完成/取消请求，操作人由 X-Actor-Id 指定且须为当前指挥人。 */
     public record TaskActionRequest(String commandKey) {
     }
+
+    /**
+     * 资源凭据登记请求：resourceKey+version 全局唯一；credentialType 为凭据类型；
+     * region 为该凭据覆盖的单个区域；expiresAt 为 UTC 失效时刻（时刻到达即失效）。
+     */
+    public record CredentialRegisterRequest(String commandKey, String resourceKey, String version,
+                                            String credentialType, String region, Instant expiresAt) {
+    }
+
+    /** 凭据撤销请求：撤销不可逆，操作人由 X-Actor-Id 指定。 */
+    public record CredentialRevokeRequest(String commandKey) {
+    }
+
+    /**
+     * 任务派发请求：requestId 为派发幂等键（全局唯一）；
+     * resourceKey+credentialVersion 指定凭据；requiredType 为任务要求的凭据类型；
+     * region 为任务区域，凭据必须同类型且覆盖该区域、有效期未结束才可派发。
+     */
+    public record TaskDispatchRequest(String requestId, String resourceKey, String credentialVersion,
+                                      String requiredType, String region) {
+    }
+
+    /** 执行启动请求：执行前按已提交凭据状态重新检查，commandKey 为该操作幂等键。 */
+    public record TaskStartRequest(String commandKey) {
+    }
 }

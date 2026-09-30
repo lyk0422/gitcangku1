@@ -86,7 +86,44 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     cancelled_at TIMESTAMP(6) NULL,
     created_at TIMESTAMP(6) NOT NULL,
     updated_at TIMESTAMP(6) NOT NULL,
+    current_dispatch_id BIGINT NULL,
+    block_reason VARCHAR(32) NULL,
+    blocked_at TIMESTAMP(6) NULL,
     CONSTRAINT uk_task_key UNIQUE (incident_id, task_key)
+);
+
+CREATE TABLE IF NOT EXISTS resource_credentials (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    resource_key VARCHAR(128) NOT NULL,
+    version VARCHAR(64) NOT NULL,
+    credential_type VARCHAR(64) NOT NULL,
+    region VARCHAR(64) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    expires_at TIMESTAMP(6) NOT NULL,
+    revoked_at TIMESTAMP(6) NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_credential_version UNIQUE (resource_key, version)
+);
+
+CREATE TABLE IF NOT EXISTS task_dispatches (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    task_id BIGINT NOT NULL,
+    seq INT NOT NULL,
+    request_id VARCHAR(128) NOT NULL,
+    resource_key VARCHAR(128) NOT NULL,
+    credential_version VARCHAR(64) NOT NULL,
+    credential_type VARCHAR(64) NOT NULL,
+    region VARCHAR(64) NOT NULL,
+    expires_at TIMESTAMP(6) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    block_reason VARCHAR(32) NULL,
+    blocked_at TIMESTAMP(6) NULL,
+    dispatched_at TIMESTAMP(6) NOT NULL,
+    dispatched_by VARCHAR(128) NOT NULL,
+    started_at TIMESTAMP(6) NULL,
+    CONSTRAINT uk_dispatch_request UNIQUE (request_id),
+    CONSTRAINT uk_dispatch_seq UNIQUE (task_id, seq)
 );
 
 CREATE TABLE IF NOT EXISTS incident_task_blockers (

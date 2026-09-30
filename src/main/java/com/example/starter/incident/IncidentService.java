@@ -15,6 +15,8 @@ import java.util.Set;
 import java.util.function.Supplier;
 
 import com.example.starter.incident.dto.Requests.ActionRequest;
+import com.example.starter.incident.dto.Requests.CredentialRegisterRequest;
+import com.example.starter.incident.dto.Requests.CredentialRevokeRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
 import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
@@ -22,9 +24,12 @@ import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
 import com.example.starter.incident.dto.Requests.TaskActionRequest;
 import com.example.starter.incident.dto.Requests.TaskCreateRequest;
+import com.example.starter.incident.dto.Requests.TaskDispatchRequest;
+import com.example.starter.incident.dto.Requests.TaskStartRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
+import com.example.starter.incident.dto.Responses.CredentialView;
 import com.example.starter.incident.dto.Responses.EscalationHistoryView;
 import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
@@ -32,6 +37,8 @@ import com.example.starter.incident.dto.Responses.IncidentTasksView;
 import com.example.starter.incident.dto.Responses.IncidentView;
 import com.example.starter.incident.dto.Responses.StatusChangeView;
 import com.example.starter.incident.dto.Responses.TaskBlockerView;
+import com.example.starter.incident.dto.Responses.TaskCredentialView;
+import com.example.starter.incident.dto.Responses.TaskDispatchView;
 import com.example.starter.incident.dto.Responses.TaskView;
 import com.example.starter.incident.dto.Responses.TransferView;
 import com.example.starter.incident.dto.Responses.UnfinishedTaskView;
@@ -72,16 +79,22 @@ public class IncidentService {
     private final EscalationRepository escalations;
     private final IncidentTaskRepository tasks;
     private final CommandKeyRepository commandKeys;
+    private final ResourceCredentialRepository credentials;
+    private final TaskDispatchRepository dispatches;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public IncidentService(IncidentRepository incidents, EscalationRepository escalations,
                            IncidentTaskRepository tasks, CommandKeyRepository commandKeys,
+                           ResourceCredentialRepository credentials,
+                           TaskDispatchRepository dispatches,
                            ObjectMapper objectMapper, Clock clock) {
         this.incidents = incidents;
         this.escalations = escalations;
         this.tasks = tasks;
         this.commandKeys = commandKeys;
+        this.credentials = credentials;
+        this.dispatches = dispatches;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -453,7 +466,7 @@ public class IncidentService {
                     Instant now = now();
                     long taskId = tasks.insert(new IncidentTask(0L, incident.id(), taskKey,
                             groupCode, title, TaskStatus.OPEN, actor, null, null, null, null,
-                            now, now));
+                            now, now, null, null, null));
                     for (Incident blocker : blockers) {
                         tasks.insertBlocker(taskId, blocker.id(), now);
                     }
@@ -462,8 +475,9 @@ public class IncidentService {
     }
 
     /**
-     * 完成任务：仅当前指挥人；仅 OPEN 可完成；全部阻塞事件进入
-     * CONTAINED/RESOLVED/CLOSED 后才可完成，否则 409 并返回未解除事件列表。
+     * 完成任务：仅当前指挥人；未派发的 OPEN 任务或已通过执行前检查的 EXECUTING 任务可完成；
+     * DISPATCHED 必须先通过执行前检查进入 EXECUTING；BLOCKED 必须凭有效新凭据再派发并通过检查。
+     * 全部阻塞事件进入 CONTAINED/RESOLVED/CLOSED 后才可完成，否则 409 并返回未解除事件列表。
      * DONE/CANCELLED 为终态，重复操作按 commandKey 幂等规则返回首次结果。
      */
     @Transactional
@@ -476,7 +490,13 @@ public class IncidentService {
                     requireCommander(incident, actor);
                     IncidentTask task = tasks.findByKey(incident.id(), taskKey)
                             .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
-                    if (task.status() != TaskStatus.OPEN) {
+                    if (task.status() == TaskStatus.DISPATCHED) {
+                        throw ApiException.conflict("任务已派发但尚未通过执行前凭据检查，不能完成");
+                    }
+                    if (task.status() == TaskStatus.BLOCKED) {
+                        throw ApiException.conflict("任务因凭据问题被阻断，不能完成；请使用有效新凭据重新派发");
+                    }
+                    if (task.status() != TaskStatus.OPEN && task.status() != TaskStatus.EXECUTING) {
                         throw ApiException.conflict(
                                 "任务已处于终态 " + task.status() + "，不能完成");
                     }
@@ -485,14 +505,17 @@ public class IncidentService {
                         throw ApiException.conflict("存在未解除阻塞的事件: "
                                 + String.join(",", unresolved), List.copyOf(unresolved));
                     }
-                    tasks.markDone(task.id(), actor, now());
+                    int updated = tasks.markDone(task.id(), actor, now());
+                    if (updated == 0) {
+                        throw ApiException.conflict("任务状态已被并发改变，不能完成");
+                    }
                     return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
                 });
     }
 
     /**
-     * 取消任务：仅当前指挥人；仅 OPEN 可取消；DONE/CANCELLED 为终态，
-     * 重复操作按 commandKey 幂等规则返回首次结果。
+     * 取消任务：仅当前指挥人；OPEN/DISPATCHED/BLOCKED 可取消；EXECUTING 执行已启动不可取消；
+     * DONE/CANCELLED 为终态，重复操作按 commandKey 幂等规则返回首次结果。
      */
     @Transactional
     public TaskView cancelTask(String incidentKey, String taskKey, String actor,
@@ -504,11 +527,19 @@ public class IncidentService {
                     requireCommander(incident, actor);
                     IncidentTask task = tasks.findByKey(incident.id(), taskKey)
                             .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
-                    if (task.status() != TaskStatus.OPEN) {
+                    if (task.status() == TaskStatus.EXECUTING) {
+                        throw ApiException.conflict("任务执行已启动，不能取消");
+                    }
+                    if (task.status() != TaskStatus.OPEN
+                            && task.status() != TaskStatus.DISPATCHED
+                            && task.status() != TaskStatus.BLOCKED) {
                         throw ApiException.conflict(
                                 "任务已处于终态 " + task.status() + "，不能取消");
                     }
-                    tasks.markCancelled(task.id(), actor, now());
+                    int updated = tasks.markCancelled(task.id(), actor, now());
+                    if (updated == 0) {
+                        throw ApiException.conflict("任务状态已被并发改变，不能取消");
+                    }
                     return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
                 });
     }
@@ -535,6 +566,265 @@ public class IncidentService {
         IncidentTask task = tasks.findByKey(incident.id(), taskKey)
                 .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
         return toTaskView(task);
+    }
+
+    /**
+     * 登记资源凭据新版本：(resourceKey, version) 唯一，版本内容不可变；
+     * 更新有效凭据通过登记新版本实现。同 commandKey 同参重放首次结果，同键改参 409；
+     * 不同 commandKey 但同资源同版本且内容一致亦幂等返回，内容冲突 409。
+     */
+    @Transactional
+    public CredentialView registerCredential(CredentialRegisterRequest req) {
+        String commandKey = requireText(req.commandKey(), "commandKey");
+        String resourceKey = requireText(req.resourceKey(), "resourceKey");
+        String version = requireText(req.version(), "version");
+        String credentialType = requireText(req.credentialType(), "credentialType");
+        String region = requireText(req.region(), "region");
+        if (req.expiresAt() == null) {
+            throw ApiException.badRequest("expiresAt 不能为空");
+        }
+        Instant expiresAt = req.expiresAt();
+        return runIdempotent(commandKey, "credential_register",
+                hash(resourceKey, version, credentialType, region, expiresAt.toString()),
+                CredentialView.class, () -> {
+                    var existing = credentials.findByKey(resourceKey, version);
+                    if (existing.isPresent()) {
+                        ResourceCredential found = existing.get();
+                        if (!found.credentialType().equals(credentialType)
+                                || !found.region().equals(region)
+                                || !found.expiresAt().equals(expiresAt)) {
+                            throw ApiException.conflict(
+                                    "资源凭据版本已被不同内容使用: " + resourceKey + "/" + version);
+                        }
+                        return toCredentialView(found);
+                    }
+                    Instant now = now();
+                    ResourceCredential credential = new ResourceCredential(0L, resourceKey, version,
+                            credentialType, region, CredentialStatus.ACTIVE, expiresAt, null, now, now);
+                    try {
+                        credentials.insert(credential);
+                    } catch (DuplicateKeyException e) {
+                        ResourceCredential committed = credentials.findByKey(resourceKey, version)
+                                .orElseThrow();
+                        if (!committed.credentialType().equals(credentialType)
+                                || !committed.region().equals(region)
+                                || !committed.expiresAt().equals(expiresAt)) {
+                            throw ApiException.conflict(
+                                    "资源凭据版本已被不同内容使用: " + resourceKey + "/" + version);
+                        }
+                        return toCredentialView(committed);
+                    }
+                    return toCredentialView(credentials.findByKey(resourceKey, version).orElseThrow());
+                });
+    }
+
+    /**
+     * 撤销资源凭据（不可逆）：与派发/执行前检查互斥，只按已提交状态生效。
+     * 重复撤销同版本幂等返回当前视图；凭据不存在 404。
+     */
+    @Transactional
+    public CredentialView revokeCredential(String resourceKey, String version, String actor,
+                                           CredentialRevokeRequest req) {
+        String commandKey = requireText(req.commandKey(), "commandKey");
+        requireText(resourceKey, "resourceKey");
+        requireText(version, "version");
+        return runIdempotent(commandKey, "credential_revoke",
+                hash(resourceKey, version, actor), CredentialView.class, () -> {
+                    List<ResourceCredential> locked = credentials.lockByResource(resourceKey);
+                    ResourceCredential credential = locked.stream()
+                            .filter(c -> c.version().equals(version)).findFirst()
+                            .orElseThrow(() -> ApiException.notFound(
+                                    "资源凭据不存在: " + resourceKey + "/" + version));
+                    if (credential.status() == CredentialStatus.ACTIVE) {
+                        int updated = credentials.revoke(credential.id(), now());
+                        if (updated == 0) {
+                            throw ApiException.conflict("凭据已被并发撤销: "
+                                    + resourceKey + "/" + version);
+                        }
+                    }
+                    return toCredentialView(
+                            credentials.findByKey(resourceKey, version).orElseThrow());
+                });
+    }
+
+    /**
+     * 查询资源全部凭据版本（按登记顺序）。只读。
+     */
+    @Transactional(readOnly = true)
+    public List<CredentialView> listCredentials(String resourceKey) {
+        requireText(resourceKey, "resourceKey");
+        return credentials.listByResource(resourceKey).stream()
+                .map(IncidentService::toCredentialView).toList();
+    }
+
+    /**
+     * 派发任务（首次派发或 BLOCKED 后再派发）：仅当前指挥人；任务须为 OPEN 或 BLOCKED。
+     * 派发时校验凭据同类型、覆盖任务区域、ACTIVE 且 UTC 有效期未结束；通过后追加不可变派发记录
+     * （快照资源、版本、类型、区域、失效时刻）并将任务置为 DISPATCHED。
+     * 以 requestId 作为派发幂等键：同键重放首次任务与凭据版本（原样返回首次响应），
+     * 换资源/换版本/换任务/换区域返回 409；失败回滚不占用 requestId。
+     */
+    @Transactional
+    public TaskView dispatchTask(String incidentKey, String taskKey, String actor,
+                                 TaskDispatchRequest req) {
+        String requestId = requireText(req.requestId(), "requestId");
+        String resourceKey = requireText(req.resourceKey(), "resourceKey");
+        String credentialVersion = requireText(req.credentialVersion(), "credentialVersion");
+        String requiredType = requireText(req.requiredType(), "requiredType");
+        String region = requireText(req.region(), "region");
+        Incident incident = lockIncident(incidentKey);
+        return runIdempotent(requestId, "task_dispatch",
+                hash(incidentKey, taskKey, actor, resourceKey, credentialVersion,
+                        requiredType, region),
+                TaskView.class, () -> {
+                    requireCommander(incident, actor);
+                    IncidentTask task = tasks.findByKey(incident.id(), taskKey)
+                            .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
+                    if (task.status() != TaskStatus.OPEN && task.status() != TaskStatus.BLOCKED) {
+                        if (task.status() == TaskStatus.DISPATCHED
+                                || task.status() == TaskStatus.EXECUTING) {
+                            throw ApiException.conflict(
+                                    "任务已派发且在执行流程中（状态 " + task.status()
+                                            + "），不能重复派发");
+                        }
+                        throw ApiException.conflict(
+                                "任务已处于终态 " + task.status() + "，不能派发");
+                    }
+                    // 锁定凭据资源全部版本行，与撤销互斥，按已提交状态校验
+                    ResourceCredential credential = requireUsableCredential(
+                            resourceKey, credentialVersion, requiredType, region);
+                    Instant now = now();
+                    int seq = dispatches.maxSeq(task.id()) + 1;
+                    TaskDispatch dispatch = new TaskDispatch(0L, task.id(), seq, requestId,
+                            resourceKey, credentialVersion, requiredType, region,
+                            credential.expiresAt(), DispatchStatus.DISPATCHED, null, null,
+                            now, actor, null);
+                    long dispatchId;
+                    try {
+                        dispatchId = dispatches.insert(dispatch);
+                    } catch (DuplicateKeyException e) {
+                        // 并发同 requestId 已提交：由 runIdempotent 占位兜底，此处防御性转冲突
+                        throw ApiException.conflict("派发 requestId 处理冲突: " + requestId);
+                    }
+                    int updated = tasks.applyDispatch(task.id(), dispatchId, now);
+                    if (updated == 0) {
+                        throw ApiException.conflict("任务状态已被并发改变，不能派发");
+                    }
+                    return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
+                });
+    }
+
+    /**
+     * 执行前检查与执行启动：仅当前指挥人；任务须为 DISPATCHED。
+     * 锁定任务行与凭据资源行后，只按已提交的凭据状态重新校验：同类型、覆盖任务区域、
+     * 未撤销且 UTC 有效期未结束才允许 DISPATCHED → EXECUTING；
+     * 凭据已撤销或已过期则将当前派发记录与任务一并转为 BLOCKED 并落库阻断原因，
+     * 返回 status=BLOCKED 的任务视图（不抛错，状态转移随事务提交）。
+     * BLOCKED 后只能凭有效新凭据重新派发；旧凭据不会自动解锁。
+     */
+    @Transactional
+    public TaskView startTaskExecution(String incidentKey, String taskKey, String actor,
+                                       TaskStartRequest req) {
+        String commandKey = requireText(req.commandKey(), "commandKey");
+        Incident incident = lockIncident(incidentKey);
+        return runIdempotent(commandKey, "task_start", hash(incidentKey, taskKey, actor),
+                TaskView.class, () -> {
+                    requireCommander(incident, actor);
+                    IncidentTask task = tasks.findByKey(incident.id(), taskKey)
+                            .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
+                    if (task.status() == TaskStatus.OPEN) {
+                        throw ApiException.conflict("任务尚未派发资源凭据，不能启动执行");
+                    }
+                    if (task.status() == TaskStatus.BLOCKED) {
+                        throw ApiException.conflict(
+                                "任务已被凭据检查阻断，需使用有效新凭据重新派发后再启动");
+                    }
+                    if (task.status() == TaskStatus.EXECUTING) {
+                        throw ApiException.conflict("任务执行已启动");
+                    }
+                    if (task.status() == TaskStatus.DONE
+                            || task.status() == TaskStatus.CANCELLED) {
+                        throw ApiException.conflict(
+                                "任务已处于终态 " + task.status() + "，不能启动执行");
+                    }
+                    // 锁定任务行后再锁凭据行，与撤销/派发互斥，只按已提交状态转移
+                    IncidentTask locked = tasks.lockById(task.id()).orElseThrow();
+                    if (locked.status() != TaskStatus.DISPATCHED) {
+                        throw ApiException.conflict(
+                                "任务状态已被并发改变，当前状态: " + locked.status());
+                    }
+                    TaskDispatch current = dispatches.listByTask(task.id()).stream()
+                            .filter(d -> d.id() == task.currentDispatchId())
+                            .findFirst()
+                            .orElseThrow(() -> ApiException.conflict("任务缺少当前派发记录"));
+                    List<ResourceCredential> credentialRows =
+                            credentials.lockByResource(current.resourceKey());
+                    ResourceCredential credential = credentialRows.stream()
+                            .filter(c -> c.version().equals(current.credentialVersion()))
+                            .findFirst()
+                            .orElseThrow(() -> ApiException.conflict(
+                                    "派发所依据的凭据版本不存在: " + current.resourceKey()
+                                            + "/" + current.credentialVersion()));
+                    Instant now = now();
+                    BlockReason reason = null;
+                    if (credential.status() == CredentialStatus.REVOKED) {
+                        reason = BlockReason.CREDENTIAL_REVOKED;
+                    } else if (!now.isBefore(credential.expiresAt())) {
+                        reason = BlockReason.CREDENTIAL_EXPIRED;
+                    } else if (!credential.credentialType().equals(current.credentialType())
+                            || !credential.region().equals(current.region())) {
+                        // 版本内容不可变，正常流程不可达；防御性按过期阻断处理
+                        reason = BlockReason.CREDENTIAL_EXPIRED;
+                    }
+                    if (reason != null) {
+                        int blockDispatch = dispatches.markBlocked(current.id(), reason, now);
+                        int blockTask = tasks.markBlocked(task.id(), reason, now);
+                        if (blockDispatch == 0 || blockTask == 0) {
+                            throw ApiException.conflict("任务状态已被并发改变，阻断未生效");
+                        }
+                        return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
+                    }
+                    int execDispatch = dispatches.markExecuting(current.id(), now);
+                    int execTask = tasks.markExecuting(task.id(), now);
+                    if (execDispatch == 0 || execTask == 0) {
+                        throw ApiException.conflict("任务状态已被并发改变，不能启动执行");
+                    }
+                    return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
+                });
+    }
+
+    /**
+     * 在已持有资源凭据行锁的前提下，校验指定版本凭据可用于任务：
+     * 凭据存在、ACTIVE 未撤销、类型一致、覆盖区域且 UTC 有效期未结束。
+     */
+    private ResourceCredential requireUsableCredential(String resourceKey, String version,
+                                                       String requiredType, String region) {
+        List<ResourceCredential> rows = credentials.lockByResource(resourceKey);
+        ResourceCredential credential = rows.stream()
+                .filter(c -> c.version().equals(version)).findFirst()
+                .orElseThrow(() -> ApiException.notFound(
+                        "资源凭据不存在: " + resourceKey + "/" + version));
+        if (credential.status() == CredentialStatus.REVOKED) {
+            throw ApiException.conflict("凭据已被撤销: " + resourceKey + "/" + version);
+        }
+        if (!credential.credentialType().equals(requiredType)) {
+            throw ApiException.conflict("凭据类型不匹配：要求 " + requiredType + "，凭据为 "
+                    + credential.credentialType());
+        }
+        if (!credential.region().equals(region)) {
+            throw ApiException.conflict("凭据未覆盖任务区域 " + region + "（凭据区域: "
+                    + credential.region() + "）");
+        }
+        if (!now().isBefore(credential.expiresAt())) {
+            throw ApiException.conflict("凭据已过 UTC 有效期: 失效时刻 "
+                    + credential.expiresAt() + "，当前 " + now());
+        }
+        return credential;
+    }
+
+    private static CredentialView toCredentialView(ResourceCredential c) {
+        return new CredentialView(c.resourceKey(), c.version(), c.credentialType(), c.region(),
+                c.status().name(), c.expiresAt(), c.revokedAt(), c.createdAt());
     }
 
     /**
@@ -632,16 +922,37 @@ public class IncidentService {
     }
 
     /**
-     * 组装任务视图：阻塞状态按目标事件查询时的当前状态计算，不写回依赖任务。
+     * 组装任务视图：阻塞状态按目标事件查询时的当前状态计算，不写回依赖任务；
+     * credential 取当前派发指针所指记录的快照，dispatches 为全部派发历史（不可变）。
      */
     private TaskView toTaskView(IncidentTask task) {
         List<TaskBlockerView> blockers = incidents.listBlockingIncidents(task.id()).stream()
                 .map(b -> new TaskBlockerView(b.incidentKey(), b.status().name(),
                         UNBLOCKING_STATUSES.contains(b.status())))
                 .toList();
+        List<TaskDispatch> dispatchList = dispatches.listByTask(task.id());
+        TaskDispatch current = dispatchList.isEmpty() || task.currentDispatchId() == null ? null
+                : dispatchList.stream()
+                        .filter(d -> d.id() == task.currentDispatchId())
+                        .findFirst().orElse(null);
+        TaskCredentialView credential = current == null ? null
+                : new TaskCredentialView(current.resourceKey(), current.credentialVersion(),
+                        current.credentialType(), current.region(), current.expiresAt(),
+                        current.status().name(), current.dispatchedAt(), current.startedAt());
+        List<TaskDispatchView> dispatchViews = dispatchList.stream()
+                .map(IncidentService::toDispatchView).toList();
         return new TaskView(task.taskKey(), task.groupCode(), task.title(), task.status().name(),
                 blockers, task.createdBy(), task.createdAt(), task.doneBy(), task.doneAt(),
-                task.cancelledBy(), task.cancelledAt());
+                task.cancelledBy(), task.cancelledAt(), credential,
+                task.blockReason() == null ? null : task.blockReason().name(), task.blockedAt(),
+                dispatchViews);
+    }
+
+    private static TaskDispatchView toDispatchView(TaskDispatch d) {
+        return new TaskDispatchView(d.seq(), d.requestId(), d.resourceKey(), d.credentialVersion(),
+                d.credentialType(), d.region(), d.expiresAt(), d.status().name(),
+                d.blockReason() == null ? null : d.blockReason().name(), d.blockedAt(),
+                d.dispatchedAt(), d.dispatchedBy(), d.startedAt());
     }
 
     private static TransferView toTransferView(IncidentTransfer transfer) {
