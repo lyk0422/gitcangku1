@@ -63,6 +63,32 @@ CREATE TABLE IF NOT EXISTS release_resume_record (
   PRIMARY KEY (id)
 ) COMMENT='发布单人工恢复记录，历史不可改';
 
+CREATE TABLE IF NOT EXISTS device_failure_round (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '轮次记录ID',
+  device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
+  version VARCHAR(64) NOT NULL COMMENT '投放目标固件版本（发布单to_version）；版本变化时计数独立',
+  round_no INT NOT NULL COMMENT '同设备同版本的连续失败轮次序号，从1开始；解除或成功后再失败加一',
+  consecutive_failures INT NOT NULL DEFAULT 1 COMMENT '本轮连续失败次数，重复回执不重复计数',
+  status VARCHAR(16) NOT NULL COMMENT 'COUNTING连续失败计数中；QUARANTINED已隔离；RELEASED已解除可开新一轮；RECOVERED设备已成功升级',
+  first_task_id BIGINT NOT NULL COMMENT '本轮第一次失败任务ID',
+  first_reason VARCHAR(256) NULL COMMENT '第一次失败原因，设备未上报为NULL',
+  second_task_id BIGINT NULL COMMENT '本轮第二次失败（触发隔离）任务ID，未发生为NULL',
+  second_reason VARCHAR(256) NULL COMMENT '第二次失败原因，设备未上报为NULL',
+  confirmed_by VARCHAR(64) NULL COMMENT '隔离确认人，即第二次失败回执提交人；未隔离为NULL',
+  quarantined_at_utc VARCHAR(40) NULL COMMENT '隔离时刻，UTC，ISO-8601格式（如2026-09-30T07:00:00Z）；未隔离为NULL',
+  released_by VARCHAR(64) NULL COMMENT '解除审核人，必须不同于confirmed_by；未解除为NULL',
+  release_reason VARCHAR(256) NULL COMMENT '解除审核原因；未解除为NULL',
+  released_at_utc VARCHAR(40) NULL COMMENT '解除时刻，UTC，ISO-8601格式；未解除为NULL',
+  counting_key VARCHAR(140) GENERATED ALWAYS AS (CASE WHEN status = 'COUNTING' THEN CONCAT(device_id, '|', version) ELSE NULL END) COMMENT 'COUNTING轮次唯一键：设备ID|版本，非COUNTING为NULL',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
+  PRIMARY KEY (id),
+  CONSTRAINT uk_failure_round UNIQUE (device_id, version, round_no)
+) COMMENT='设备-版本连续失败轮次：连续两次失败隔离，解除不清除历史，历史只增不删';
+
+-- 每设备每版本至多一条 COUNTING 轮次；唯一索引允许多个NULL。
+CREATE UNIQUE INDEX IF NOT EXISTS uk_failure_round_counting ON device_failure_round (counting_key);
+
 CREATE TABLE IF NOT EXISTS idempotency_record (
   request_id VARCHAR(64) NOT NULL COMMENT '全局唯一请求ID',
   api VARCHAR(64) NOT NULL COMMENT '接口标识',
