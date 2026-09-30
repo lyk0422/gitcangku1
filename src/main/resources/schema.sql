@@ -65,10 +65,76 @@ CREATE TABLE IF NOT EXISTS command_log (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     command_key VARCHAR(64) NOT NULL COMMENT '幂等命令键，全局唯一',
     actor_id VARCHAR(64) NOT NULL COMMENT '发起操作人',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN/DIGEST_SEAL/DIGEST_CONTENT_REPLACE/DIGEST_WITNESS/DIGEST_EXPORT',
     request_hash VARCHAR(64) NOT NULL COMMENT '请求参数规范化后的 SHA-256，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行的 HTTP 状态码',
     response_body TEXT NOT NULL COMMENT '首次执行的响应体 JSON，重放时原样返回',
     created_at DATETIME(6) NOT NULL COMMENT '首次执行时间，Asia/Shanghai',
     CONSTRAINT uk_command_key UNIQUE (command_key)
+);
+
+-- 证物当前内容：封存登记摘要后，文件可能被改动或恢复；导出前据此重新计算 SHA-256。
+-- 行的读写均在持有证物行锁（evidence FOR UPDATE）的事务内进行，保证封存/导出按提交顺序裁决。
+CREATE TABLE IF NOT EXISTS digest_content (
+    evidence_key VARCHAR(64) NOT NULL COMMENT '关联证物业务键，主键',
+    content_ref VARCHAR(512) NOT NULL COMMENT '当前内容定位引用（如存储路径/对象键）',
+    content_base64 TEXT NOT NULL COMMENT '当前文件内容的 Base-64；导出前重新解码计算 SHA-256，与封存登记摘要核对',
+    updated_at DATETIME(6) NOT NULL COMMENT '内容最近替换时间，Asia/Shanghai',
+    CONSTRAINT pk_digest_content PRIMARY KEY (evidence_key)
+);
+
+-- 数字摘要封存版本：每次封存生成新版本号，登记该版本下每件证物内容的 SHA-256 摘要。
+-- 同一 (evidence_key, version_no) 只允许一行；旧版本永久保留，导出后内容变化也不改写其摘要。
+CREATE TABLE IF NOT EXISTS digest_version (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    evidence_key VARCHAR(64) NOT NULL COMMENT '关联证物业务键',
+    version_no INT NOT NULL COMMENT '封存版本号，同一证物从 1 开始递增；重新封存产生新版本',
+    sealed_by VARCHAR(64) NOT NULL COMMENT '执行封存的保管人（须为当前保管人）',
+    content_ref VARCHAR(512) NOT NULL COMMENT '封存内容定位引用（如存储路径/对象键），同内容恢复时须与封存时一致',
+    content_sha256 VARCHAR(64) NOT NULL COMMENT '封存时登记的内容 SHA-256 十六进制摘要（64 位小写）',
+    status VARCHAR(20) NOT NULL COMMENT '版本状态：ACTIVE 当前版本 / SUPERSEDED 已被新版本取代（旧见证不自动转移）',
+    created_at DATETIME(6) NOT NULL COMMENT '封存时间，Asia/Shanghai',
+    CONSTRAINT uk_digest_version UNIQUE (evidence_key, version_no),
+    KEY idx_digest_version_evidence (evidence_key)
+);
+
+-- 摘要见证记录：只追加；同一版本须两名不同保管人分别见证，重复见证由唯一约束拒绝。
+CREATE TABLE IF NOT EXISTS digest_witness (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    evidence_key VARCHAR(64) NOT NULL COMMENT '关联证物业务键',
+    version_no INT NOT NULL COMMENT '被见证的封存版本号；见证已失效版本（SUPERSEDED）返回 422',
+    witness_id VARCHAR(64) NOT NULL COMMENT '见证保管人，须与该版本另一名见证人不同；同一人不能重复见证',
+    command_key VARCHAR(64) NOT NULL COMMENT '见证命令幂等键，便于审计重放',
+    created_at DATETIME(6) NOT NULL COMMENT '见证时间，Asia/Shanghai',
+    CONSTRAINT uk_digest_witness_cmd UNIQUE (command_key),
+    CONSTRAINT uk_digest_witness_version_actor UNIQUE (evidence_key, version_no, witness_id),
+    KEY idx_digest_witness_version (evidence_key, version_no)
+);
+
+-- 导出包：只有包内每件证物版本摘要重算全部匹配且两名见证人齐备时才落库一行；失败返回 422，不产生任何部分包。
+CREATE TABLE IF NOT EXISTS export_package (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    package_id VARCHAR(64) NOT NULL COMMENT '导出包业务标识，全局唯一；同 requestId 重放原样返回首次标识',
+    request_id VARCHAR(64) NOT NULL COMMENT '导出请求幂等键，全局唯一；同键换证物集合/版本返回 409',
+    evidence_key VARCHAR(64) NOT NULL COMMENT '包内排序后第一件证物键（反范式索引列，完整清单以 export_item 为准）',
+    version_no INT NOT NULL COMMENT '首件证物导出版本号（反范式列）',
+    content_sha256 VARCHAR(64) NOT NULL COMMENT '首件证物导出时核对通过的 SHA-256（反范式列）',
+    witness1 VARCHAR(64) NULL COMMENT '各明细两名见证人完全一致时记录第一名见证人；否则 NULL，完整见证以 export_item.witness_ids 为准',
+    witness2 VARCHAR(64) NULL COMMENT '各明细两名见证人完全一致时记录第二名见证人；否则 NULL',
+    created_at DATETIME(6) NOT NULL COMMENT '导出时间，Asia/Shanghai',
+    CONSTRAINT uk_export_package_id UNIQUE (package_id),
+    CONSTRAINT uk_export_request UNIQUE (request_id),
+    KEY idx_export_evidence (evidence_key)
+);
+
+-- 导出包明细：导出成功时随主包同一事务写入，只追加；版本、摘要与见证人在导出时固化，后续内容变化不改写。
+CREATE TABLE IF NOT EXISTS export_item (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    package_id VARCHAR(64) NOT NULL COMMENT '所属导出包业务标识',
+    evidence_key VARCHAR(64) NOT NULL COMMENT '明细证物业务键',
+    version_no INT NOT NULL COMMENT '明细裁决的封存版本号（提交时锁定的完整版本，不与其他版本内容混装）',
+    content_ref VARCHAR(512) NOT NULL COMMENT '导出版本的内容定位引用',
+    content_sha256 VARCHAR(64) NOT NULL COMMENT '导出版本登记的内容 SHA-256 摘要（重算匹配后固化）',
+    witness_ids VARCHAR(256) NOT NULL COMMENT '导出时该版本已确认的两名见证保管人，按见证顺序逗号分隔；历史固化不随后续见证改写',
+    KEY idx_export_item_package (package_id)
 );
