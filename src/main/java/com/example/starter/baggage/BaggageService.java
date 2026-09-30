@@ -3,6 +3,7 @@ package com.example.starter.baggage;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -13,9 +14,13 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import com.example.starter.baggage.BaggageDtos.ArriveRequest;
 import com.example.starter.baggage.BaggageDtos.ArriveResponse;
+import com.example.starter.baggage.BaggageDtos.BagLegStatusResponse;
 import com.example.starter.baggage.BaggageDtos.BagResponse;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveRequest;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveResponse;
@@ -34,12 +39,17 @@ import com.example.starter.baggage.BaggageDtos.SealResponse;
 import com.example.starter.baggage.BaggageDtos.ShortItem;
 import com.example.starter.baggage.BaggageDtos.ShortListResponse;
 import com.example.starter.baggage.BaggageDtos.TraceEvent;
+import com.example.starter.baggage.BaggageDtos.UpdateCutoffRequest;
 
 /**
  * 联程行李装载交接核心业务：航段/行李登记、批量装载、封舱、精确/差异到达、补到与查询。
  * 所有写操作经 {@link IdempotencyService} 去重，业务变更与去重记录原子提交；
  * 航段行级锁（SELECT ... FOR UPDATE）保证装载与封舱并发时以版本决定唯一先后，
  * load_record 以 bag_tag 为主键保证同件行李不会进入两个清单。
+ * 每个航段带 UTC 装载截止时刻：仅在当前时刻严格早于截止时刻、且行李已完成本航段交接
+ * （待乘航段匹配且位于始发站、未装载、非短卸）时才能装载，当前时刻 >= 截止时刻即关闭装载并返回 422；
+ * 成功装载在 bag_leg_load 中按 (bag_tag, leg_id) 独立留痕并保存截止快照，逾期拒绝在 load_rejection
+ * 中留痕且不占装载名额；截止时刻仅 OPEN 航段可修改，封舱或最终到达后修改返回 409，不能借改时刻追认被拒装载。
  * 差异到达仅允许 SEALED 航段提交封舱清单子集；缺失行李转 SHORT_UNLOADED 并冻结待乘索引，
  * 补到前无法装载任何后续航段，补到提交后才恢复参与装载。
  */
@@ -63,9 +73,39 @@ public class BaggageService {
     private static final String EVT_RECOVERED = "RECOVERED";
     private static final String EVT_DELIVERED = "DELIVERED";
 
+    /** 装载状态：未装载（含已交接待装载）。 */
+    private static final String LOAD_NOT_LOADED = "NOT_LOADED";
+    /** 装载状态：已装载到当前航段、尚未到达卸下。 */
+    private static final String LOAD_LOADED = "LOADED";
+    /** 装载状态：已随航段到达卸下。 */
+    private static final String LOAD_UNLOADED = "UNLOADED";
+    /** 装载状态：在该航段短卸待补。 */
+    private static final String LOAD_SHORT = "SHORT_UNLOADED";
+    /** 装载状态：尚未交接或与该航段无关。 */
+    private static final String LOAD_NOT_APPLICABLE = "NOT_APPLICABLE";
+
+    /** 拒绝原因码：当前 UTC 时刻已到达截止时刻。 */
+    private static final String REASON_CUTOFF_CLOSED = "CUTOFF_CLOSED";
+    /** 拒绝原因码：行李处于短卸状态，须先补到。 */
+    private static final String REASON_SHORT_UNLOADED = "SHORT_UNLOADED";
+    /** 拒绝原因码：行李已装载在某航段清单中。 */
+    private static final String REASON_ALREADY_LOADED = "ALREADY_LOADED";
+    /** 拒绝原因码：行李当前待乘航段与目标航段不匹配。 */
+    private static final String REASON_ITINERARY_MISMATCH = "ITINERARY_MISMATCH";
+    /** 拒绝原因码：行李未在航段始发站完成交接。 */
+    private static final String REASON_NOT_AT_ORIGIN = "NOT_AT_ORIGIN";
+    /** 拒绝原因码：行李不存在。 */
+    private static final String REASON_BAG_NOT_FOUND = "BAG_NOT_FOUND";
+    /** 拒绝原因码：同次批量请求内 bagTag 重复。 */
+    private static final String REASON_BAG_DUPLICATE = "BAG_DUPLICATE";
+    /** 拒绝原因码：航段非 OPEN（已封舱或已到达）。 */
+    private static final String REASON_LEG_NOT_OPEN = "LEG_NOT_OPEN";
+
     private static final RowMapper<LegRow> LEG_MAPPER = (rs, rowNum) -> new LegRow(
             rs.getString("leg_id"), rs.getString("origin"), rs.getString("destination"),
-            rs.getString("status"), rs.getInt("version"), rs.getString("sealed_manifest"),
+            rs.getString("status"), rs.getInt("version"),
+            getInstant(rs, "loading_cutoff"),
+            rs.getString("sealed_manifest"),
             rs.getString("arrival_type"), rs.getString("arrival_actual"));
 
     private static final RowMapper<BagRow> BAG_MAPPER = (rs, rowNum) -> new BagRow(
@@ -89,15 +129,20 @@ public class BaggageService {
     private final JdbcTemplate jdbcTemplate;
     private final IdempotencyService idempotencyService;
     private final ObjectMapper objectMapper;
+    /** 拒绝流水使用独立事务提交，与失败装载事务回滚互不影响。 */
+    private final TransactionTemplate rejectionTransaction;
     /** 可控时钟，默认系统 UTC 时钟，测试可替换。 */
     private Supplier<Instant> clock = Instant::now;
 
     public BaggageService(JdbcTemplate jdbcTemplate,
                           IdempotencyService idempotencyService,
-                          ObjectMapper objectMapper) {
+                          ObjectMapper objectMapper,
+                          PlatformTransactionManager transactionManager) {
         this.jdbcTemplate = jdbcTemplate;
         this.idempotencyService = idempotencyService;
         this.objectMapper = objectMapper;
+        this.rejectionTransaction = new TransactionTemplate(transactionManager);
+        this.rejectionTransaction.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
     }
 
     /** 替换时钟（测试使用），所有登记时刻均取该时钟的 UTC 时刻。 */
@@ -105,10 +150,21 @@ public class BaggageService {
         this.clock = clock;
     }
 
-    /** 登记航段：legId 唯一，初始状态 OPEN、版本 1。 */
+    /** 登记航段：legId 唯一，初始状态 OPEN、版本 1，并带 UTC 装载截止时刻。 */
     public LegResponse registerLeg(RegisterLegRequest request) {
         return idempotencyService.execute(request.requestId(), "REGISTER_LEG", 201,
                 request, LegResponse.class, () -> doRegisterLeg(request));
+    }
+
+    /**
+     * 修改航段 UTC 装载截止时刻：仅 OPEN 航段允许；
+     * 航段已封舱（SEALED）或已最终到达（ARRIVED）返回 409，不能借改时刻追认被拒装载。
+     */
+    public LegResponse updateCutoff(String legId, UpdateCutoffRequest request) {
+        Instant cutoff = parseCutoff(request.loadingCutoff());
+        UpdateCutoffPayload payload = new UpdateCutoffPayload(legId, cutoff.toString());
+        return idempotencyService.execute(request.requestId(), "UPDATE_CUTOFF", 200,
+                payload, LegResponse.class, () -> doUpdateCutoff(legId, cutoff));
     }
 
     /** 登记行李：1~5 个无重复有序航段，相邻航段首尾站衔接，初始位于首段始发站。 */
@@ -117,11 +173,25 @@ public class BaggageService {
                 request, BagResponse.class, () -> doRegisterBag(request));
     }
 
-    /** 批量装载：整批原子，任一行李不满足则 422 且无一件移动。 */
+    /**
+     * 批量装载：整批原子，任一行李不满足则 422 且无一件移动。
+     * 装载条件：当前 UTC 时刻严格早于航段截止时刻（恰好到达即关闭）且每件行李均已完成本航段交接；
+     * 成功装载保留航段与当时截止快照，逾期/交接不满足的 422 在 load_rejection 留痕且不占装载名额。
+     */
     public LoadResponse load(String legId, LoadRequest request) {
         LoadPayload payload = new LoadPayload(legId, request.expectedVersion(), sortedCopy(request.bagTags()));
         return idempotencyService.execute(request.requestId(), "LOAD", 200,
-                payload, LoadResponse.class, () -> doLoad(legId, request));
+                payload, LoadResponse.class, () -> doLoadAudited(legId, request));
+    }
+
+    private LoadResponse doLoadAudited(String legId, LoadRequest request) {
+        try {
+            return doLoad(legId, request);
+        } catch (LoadRejectedException ex) {
+            // 业务装载被拒：外层事务回滚，拒绝流水以独立事务提交留痕
+            recordRejections(ex.rows());
+            throw ApiException.unprocessable(ex.getMessage());
+        }
     }
 
     /** 封舱：校验版本，保存只读装载清单并转 SEALED；空清单也可封舱。 */
@@ -205,14 +275,87 @@ public class BaggageService {
         return new ShortListResponse(items);
     }
 
+    /**
+     * 按行李 + 航段查询交接、截止、装载状态及最近一次拒绝原因。
+     * 各航段状态独立取数：已完成航段记录取自 bag_leg_load 留痕，不被后续航段时刻变化覆盖。
+     */
+    public BagLegStatusResponse getBagLegStatus(String bagTag, String legId) {
+        BagRow bag = findBag(bagTag);
+        if (bag == null) {
+            throw ApiException.notFound("行李不存在: " + bagTag);
+        }
+        LegRow leg = findLeg(legId);
+        if (leg == null) {
+            throw ApiException.notFound("航段不存在: " + legId);
+        }
+        List<ItineraryItem> itinerary = toItinerary(bagTag);
+        int seq = -1;
+        for (ItineraryItem item : itinerary) {
+            if (item.legId().equals(legId)) {
+                seq = item.seq();
+                break;
+            }
+        }
+        Instant now = clock.get();
+        boolean cutoffClosed = !now.isBefore(leg.loadingCutoff());
+
+        LoadTrail trail = findLoadTrail(bagTag, legId);
+        boolean onThisLeg = legId.equals(bag.loadedLegId());
+        boolean waitingAtOrigin = seq >= 0 && bag.nextLegIndex() == seq
+                && bag.currentLocation().equals(leg.origin())
+                && bag.loadedLegId() == null && !BAG_SHORT_UNLOADED.equals(bag.status());
+        // 已成功装载留痕（含在舱、到达卸下与短卸）或当前正在始发站待乘，均视为已完成本航段交接
+        boolean handedOver = seq >= 0 && (trail != null || onThisLeg || waitingAtOrigin);
+
+        String loadStatus;
+        if (onThisLeg) {
+            loadStatus = LOAD_LOADED;
+        } else if (legId.equals(bag.shortLegId()) && BAG_SHORT_UNLOADED.equals(bag.status())) {
+            loadStatus = LOAD_SHORT;
+        } else if (trail != null) {
+            // 留痕存在且当前不在舱内：已随航段到达卸下（或补到后完成），记录不因后续航段改时刻而变化
+            loadStatus = LOAD_UNLOADED;
+        } else if (handedOver) {
+            loadStatus = LOAD_NOT_LOADED;
+        } else {
+            loadStatus = LOAD_NOT_APPLICABLE;
+        }
+
+        RejectionRow lastRejection = findLastRejection(bagTag, legId);
+        return new BagLegStatusResponse(
+                bagTag, legId, leg.status(), leg.version(), leg.loadingCutoff().toString(),
+                cutoffClosed, handedOver, loadStatus,
+                trail == null ? null : trail.cutoffSnapshot().toString(),
+                trail == null ? null : trail.loadedAt().toString(),
+                lastRejection == null ? null : lastRejection.reason(),
+                lastRejection == null ? null : lastRejection.detail(),
+                lastRejection == null ? null : lastRejection.attemptedAt().toString());
+    }
+
     private LegResponse doRegisterLeg(RegisterLegRequest request) {
         if (findLeg(request.legId()) != null) {
             throw ApiException.conflict("航段已存在: " + request.legId());
         }
+        Instant cutoff = parseCutoff(request.loadingCutoff());
         jdbcTemplate.update(
-                "INSERT INTO leg (leg_id, origin, destination, status, version) VALUES (?, ?, ?, ?, 1)",
-                request.legId(), request.origin(), request.destination(), LEG_OPEN);
-        return new LegResponse(request.legId(), request.origin(), request.destination(), LEG_OPEN, 1);
+                "INSERT INTO leg (leg_id, origin, destination, status, version, loading_cutoff)"
+                        + " VALUES (?, ?, ?, ?, 1, ?)",
+                request.legId(), request.origin(), request.destination(), LEG_OPEN,
+                OffsetDateTime.ofInstant(cutoff, ZoneOffset.UTC));
+        return new LegResponse(request.legId(), request.origin(), request.destination(),
+                LEG_OPEN, 1, cutoff.toString());
+    }
+
+    private LegResponse doUpdateCutoff(String legId, Instant cutoff) {
+        LegRow leg = lockLeg(legId);
+        if (!LEG_OPEN.equals(leg.status())) {
+            throw ApiException.conflict(
+                    "航段状态为 " + leg.status() + "，已封舱或最终到达，禁止修改截止时刻");
+        }
+        jdbcTemplate.update("UPDATE leg SET loading_cutoff = ? WHERE leg_id = ?",
+                OffsetDateTime.ofInstant(cutoff, ZoneOffset.UTC), legId);
+        return new LegResponse(leg.legId(), leg.origin(), leg.destination(),
+                LEG_OPEN, leg.version(), cutoff.toString());
     }
 
     private BagResponse doRegisterBag(RegisterBagRequest request) {
@@ -252,33 +395,82 @@ public class BaggageService {
     }
 
     private LoadResponse doLoad(String legId, LoadRequest request) {
+        Instant now = clock.get();
         LegRow leg = lockLeg(legId);
         checkVersion(leg, request.expectedVersion());
         if (!LEG_OPEN.equals(leg.status())) {
-            throw ApiException.unprocessable("航段状态为 " + leg.status() + "，禁止装载");
+            // 航段封舱/到达：整批拒绝并按袋留痕，不产生任何装载
+            throw loadRejected(request.requestId(), legId, leg.loadingCutoff(), now,
+                    sortedCopy(request.bagTags()), REASON_LEG_NOT_OPEN,
+                    "航段状态为 " + leg.status() + "，禁止装载");
+        }
+        // 截止时刻恰好到达即关闭装载：当前 UTC 时刻必须严格早于截止时刻
+        if (!now.isBefore(leg.loadingCutoff())) {
+            throw loadRejected(request.requestId(), legId, leg.loadingCutoff(), now,
+                    sortedCopy(request.bagTags()), REASON_CUTOFF_CLOSED,
+                    "已到 UTC 装载截止时刻 " + leg.loadingCutoff() + "（当前 " + now + "），装载关闭");
         }
         List<String> bagTags = request.bagTags();
-        if (new HashSet<>(bagTags).size() != bagTags.size()) {
-            throw ApiException.unprocessable("批量装载的 bagTag 不得重复");
-        }
         List<String> sorted = sortedCopy(bagTags);
+        if (new HashSet<>(bagTags).size() != bagTags.size()) {
+            throw loadRejected(request.requestId(), legId, leg.loadingCutoff(), now,
+                    sorted, REASON_BAG_DUPLICATE, "批量装载的 bagTag 不得重复");
+        }
         List<BagRow> bags = new ArrayList<>();
         for (String bagTag : sorted) {
             BagRow bag = lockBag(bagTag);
             if (bag == null) {
-                throw ApiException.unprocessable("行李不存在: " + bagTag);
+                throw loadRejected(request.requestId(), legId, leg.loadingCutoff(), now,
+                        List.of(bagTag), REASON_BAG_NOT_FOUND, "行李不存在: " + bagTag);
             }
-            validateLoadable(bag, leg);
+            String[] problem = loadableProblem(bag, leg);
+            if (problem != null) {
+                throw loadRejected(request.requestId(), legId, leg.loadingCutoff(), now,
+                        List.of(bagTag), problem[0], problem[1]);
+            }
             bags.add(bag);
         }
         for (BagRow bag : bags) {
             jdbcTemplate.update("INSERT INTO load_record (bag_tag, leg_id) VALUES (?, ?)", bag.bagTag(), legId);
             jdbcTemplate.update("UPDATE bag SET loaded_leg_id = ? WHERE bag_tag = ?", legId, bag.bagTag());
+            // 各航段独立留痕：保留成功装载时刻与当时的截止快照，后续改时刻不回写
+            jdbcTemplate.update(
+                    "INSERT INTO bag_leg_load (bag_tag, leg_id, cutoff_snapshot, loaded_at, request_id)"
+                            + " VALUES (?, ?, ?, ?, ?)",
+                    bag.bagTag(), legId,
+                    OffsetDateTime.ofInstant(leg.loadingCutoff(), ZoneOffset.UTC),
+                    OffsetDateTime.ofInstant(now, ZoneOffset.UTC), request.requestId());
             insertEvent(bag.bagTag(), EVT_LOADED, legId, leg.origin());
         }
         int newVersion = leg.version() + 1;
         jdbcTemplate.update("UPDATE leg SET version = ? WHERE leg_id = ?", newVersion, legId);
-        return new LoadResponse(legId, LEG_OPEN, newVersion, sorted);
+        return new LoadResponse(legId, LEG_OPEN, newVersion, sorted, leg.loadingCutoff().toString());
+    }
+
+    /** 构造按袋留痕的装载拒绝异常（同一次拒绝内所有袋共用原因与截止快照）。 */
+    private LoadRejectedException loadRejected(String requestId, String legId, Instant cutoff,
+                                               Instant attemptedAt, List<String> bagTags,
+                                               String reason, String detail) {
+        List<RejectionRow> rows = bagTags.stream()
+                .map(bagTag -> new RejectionRow(requestId, bagTag, legId, cutoff, attemptedAt, reason, detail))
+                .toList();
+        return new LoadRejectedException(detail, rows);
+    }
+
+    /** 以独立事务写入拒绝流水，失败装载事务的回滚不影响留痕。 */
+    private void recordRejections(List<RejectionRow> rows) {
+        rejectionTransaction.executeWithoutResult(status -> {
+            for (RejectionRow row : rows) {
+                jdbcTemplate.update(
+                        "INSERT INTO load_rejection (request_id, bag_tag, leg_id, cutoff_snapshot,"
+                                + " attempted_at, reason, detail) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        row.requestId(), row.bagTag(), row.legId(),
+                        row.cutoff() == null ? null
+                                : OffsetDateTime.ofInstant(row.cutoff(), ZoneOffset.UTC),
+                        OffsetDateTime.ofInstant(row.attemptedAt(), ZoneOffset.UTC),
+                        row.reason(), row.detail());
+            }
+        });
     }
 
     private SealResponse doSeal(String legId, SealRequest request) {
@@ -415,25 +607,34 @@ public class BaggageService {
         }
     }
 
-    private void validateLoadable(BagRow bag, LegRow leg) {
+    /**
+     * 沿用原有交接状态判断：行李须非短卸、未装载、待乘航段即目标航段且位于航段始发站。
+     * 返回 {原因码, 说明}；满足交接条件返回 null。
+     */
+    private String[] loadableProblem(BagRow bag, LegRow leg) {
         if (BAG_SHORT_UNLOADED.equals(bag.status())) {
-            throw ApiException.unprocessable(
-                    "行李 " + bag.bagTag() + " 处于短卸状态，须先补到才能装载后续航段");
+            return new String[] {REASON_SHORT_UNLOADED,
+                    "行李 " + bag.bagTag() + " 处于短卸状态，须先补到才能装载后续航段"};
         }
         if (bag.loadedLegId() != null) {
-            throw ApiException.unprocessable("行李 " + bag.bagTag() + " 已装载到航段 " + bag.loadedLegId());
+            return new String[] {REASON_ALREADY_LOADED,
+                    "行李 " + bag.bagTag() + " 已装载到航段 " + bag.loadedLegId()};
         }
         ItineraryItem next = nextItinerary(bag.bagTag(), bag.nextLegIndex());
         if (next == null) {
-            throw ApiException.unprocessable("行李 " + bag.bagTag() + " 已完成全部行程");
+            return new String[] {REASON_ITINERARY_MISMATCH,
+                    "行李 " + bag.bagTag() + " 已完成全部行程"};
         }
         if (!next.legId().equals(leg.legId())) {
-            throw ApiException.unprocessable(
-                    "行李 " + bag.bagTag() + " 当前待乘航段为 " + next.legId() + "，不能装载到 " + leg.legId());
+            return new String[] {REASON_ITINERARY_MISMATCH,
+                    "行李 " + bag.bagTag() + " 当前待乘航段为 " + next.legId()
+                            + "，不能装载到 " + leg.legId()};
         }
         if (!bag.currentLocation().equals(leg.origin())) {
-            throw ApiException.unprocessable("行李 " + bag.bagTag() + " 不在航段始发站 " + leg.origin());
+            return new String[] {REASON_NOT_AT_ORIGIN,
+                    "行李 " + bag.bagTag() + " 不在航段始发站 " + leg.origin()};
         }
+        return null;
     }
 
     private void checkVersion(LegRow leg, int expectedVersion) {
@@ -457,7 +658,7 @@ public class BaggageService {
     }
 
     private static String legSelect(boolean forUpdate) {
-        return "SELECT leg_id, origin, destination, status, version, sealed_manifest,"
+        return "SELECT leg_id, origin, destination, status, version, loading_cutoff, sealed_manifest,"
                 + " arrival_type, arrival_actual FROM leg WHERE leg_id = ?"
                 + (forUpdate ? " FOR UPDATE" : "");
     }
@@ -489,6 +690,28 @@ public class BaggageService {
         Integer count = jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM bag_itinerary WHERE bag_tag = ?", Integer.class, bagTag);
         return count == null ? 0 : count;
+    }
+
+    private LoadTrail findLoadTrail(String bagTag, String legId) {
+        List<LoadTrail> rows = jdbcTemplate.query(
+                "SELECT cutoff_snapshot, loaded_at FROM bag_leg_load WHERE bag_tag = ? AND leg_id = ?",
+                (rs, rowNum) -> new LoadTrail(getInstant(rs, "cutoff_snapshot"),
+                        getInstant(rs, "loaded_at")),
+                bagTag, legId);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    private RejectionRow findLastRejection(String bagTag, String legId) {
+        List<RejectionRow> rows = jdbcTemplate.query(
+                "SELECT request_id, bag_tag, leg_id, cutoff_snapshot, attempted_at, reason, detail"
+                        + " FROM load_rejection WHERE bag_tag = ? AND leg_id = ?"
+                        + " ORDER BY id DESC LIMIT 1",
+                (rs, rowNum) -> new RejectionRow(
+                        rs.getString("request_id"), rs.getString("bag_tag"), rs.getString("leg_id"),
+                        getInstant(rs, "cutoff_snapshot"), getInstant(rs, "attempted_at"),
+                        rs.getString("reason"), rs.getString("detail")),
+                bagTag, legId);
+        return rows.isEmpty() ? null : rows.get(0);
     }
 
     private List<ItineraryItem> toItinerary(String bagTag) {
@@ -533,6 +756,16 @@ public class BaggageService {
         return values.stream().sorted().toList();
     }
 
+    /** 解析 ISO-8601 UTC 装载截止时刻；非法格式返回 400。 */
+    private static Instant parseCutoff(String text) {
+        try {
+            return Instant.parse(text);
+        } catch (DateTimeParseException ex) {
+            throw ApiException.badRequest(
+                    "loadingCutoff 必须为 UTC ISO-8601 时刻（如 2026-09-30T12:00:00Z）: " + text);
+        }
+    }
+
     private String writeJson(List<String> values) {
         try {
             return objectMapper.writeValueAsString(values);
@@ -551,8 +784,8 @@ public class BaggageService {
     }
 
     private record LegRow(String legId, String origin, String destination,
-                          String status, int version, String sealedManifest,
-                          String arrivalType, String arrivalActual) {
+                          String status, int version, Instant loadingCutoff,
+                          String sealedManifest, String arrivalType, String arrivalActual) {
     }
 
     private record BagRow(String bagTag, String currentLocation, int nextLegIndex,
@@ -574,5 +807,32 @@ public class BaggageService {
 
     /** 差异到达幂等摘要参数：bagTags 已排序，顺序差异不视为异参。 */
     private record DifferenceArrivePayload(String legId, int expectedVersion, List<String> bagTags) {
+    }
+
+    /** 修改截止时刻幂等摘要参数。 */
+    private record UpdateCutoffPayload(String legId, String loadingCutoff) {
+    }
+
+    /** 成功装载留痕行：截止快照与 UTC 装载时刻。 */
+    private record LoadTrail(Instant cutoffSnapshot, Instant loadedAt) {
+    }
+
+    /** 装载拒绝流水行。 */
+    private record RejectionRow(String requestId, String bagTag, String legId, Instant cutoff,
+                                Instant attemptedAt, String reason, String detail) {
+    }
+
+    /** 装载被拒异常：携带按袋留痕行，消息即返回给调用方的拒绝原因。 */
+    private static final class LoadRejectedException extends RuntimeException {
+        private final transient List<RejectionRow> rows;
+
+        private LoadRejectedException(String message, List<RejectionRow> rows) {
+            super(message);
+            this.rows = rows;
+        }
+
+        private List<RejectionRow> rows() {
+            return rows;
+        }
     }
 }

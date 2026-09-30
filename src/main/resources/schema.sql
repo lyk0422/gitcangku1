@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS leg (
     destination     VARCHAR(64)  NOT NULL COMMENT '到达站代码',
     status          VARCHAR(16)  NOT NULL DEFAULT 'OPEN' COMMENT '航段状态：OPEN/SEALED/ARRIVED',
     version         INT          NOT NULL DEFAULT 1 COMMENT '乐观锁版本，每次状态或装载变更后递增',
+    loading_cutoff  TIMESTAMP WITH TIME ZONE NOT NULL COMMENT 'UTC 装载截止时刻；当前时刻 >= 该时刻即关闭装载，仅 OPEN 航段可修改',
     sealed_manifest CLOB         NULL COMMENT '封舱时的只读装载清单（JSON 数组），未封舱为 NULL',
     arrival_type    VARCHAR(16)  NULL COMMENT '到达确认类型：NULL 未到达，EXACT 精确到达，DIFF 差异到达',
     arrival_actual  CLOB         NULL COMMENT '差异到达实际到达袋号只读快照（JSON 数组），未差异到达为 NULL',
@@ -64,10 +65,36 @@ CREATE TABLE IF NOT EXISTS bag_event (
 -- 幂等去重：仅记录成功请求；同 requestId 同参数重放原结果，异参数返回 409
 CREATE TABLE IF NOT EXISTS request_log (
     request_id      VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
-    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER',
+    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER/UPDATE_CUTOFF',
     request_hash    VARCHAR(64)  NOT NULL COMMENT '请求参数（不含 requestId）的 SHA-256 摘要',
     response_status INT          NOT NULL COMMENT '原成功响应的 HTTP 状态码',
     response_body   CLOB         NOT NULL COMMENT '原成功响应体（JSON）',
     created_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     PRIMARY KEY (request_id)
+);
+
+-- 各航段成功装载留痕：每个 (bag_tag, leg_id) 唯一，只增不改；
+-- 保留装载时刻与当时的截止快照，后续航段改时刻或行李最终到达均不覆盖已完成航段记录。
+CREATE TABLE IF NOT EXISTS bag_leg_load (
+    id              BIGINT AUTO_INCREMENT NOT NULL COMMENT '自增主键',
+    bag_tag         VARCHAR(64)  NOT NULL COMMENT '行李牌号',
+    leg_id          VARCHAR(64)  NOT NULL COMMENT '装载航段标识',
+    cutoff_snapshot TIMESTAMP WITH TIME ZONE NOT NULL COMMENT '装载成功时该航段 UTC 截止时刻快照，之后修改截止时刻不回改本条',
+    loaded_at       TIMESTAMP WITH TIME ZONE NOT NULL COMMENT 'UTC 装载成功时刻，严格早于截止时刻（相等即拒绝）',
+    request_id      VARCHAR(128) NOT NULL COMMENT '首次成功装载的 requestId',
+    PRIMARY KEY (id),
+    UNIQUE (bag_tag, leg_id)
+);
+
+-- 装载拒绝流水：只增不改；逾期或交接不满足的整批请求按袋留痕，422 不占装载名额、不写 request_log。
+CREATE TABLE IF NOT EXISTS load_rejection (
+    id              BIGINT AUTO_INCREMENT NOT NULL COMMENT '自增主键',
+    request_id      VARCHAR(128)  NOT NULL COMMENT '被拒请求的 requestId（失败请求不进幂等表）',
+    bag_tag         VARCHAR(64)  NOT NULL COMMENT '被拒行李牌号',
+    leg_id          VARCHAR(64)  NOT NULL COMMENT '目标航段标识',
+    cutoff_snapshot TIMESTAMP WITH TIME ZONE NULL COMMENT '拒绝时航段 UTC 截止时刻快照；行李/航段不存在等场景为 NULL',
+    attempted_at    TIMESTAMP WITH TIME ZONE NOT NULL COMMENT 'UTC 尝试装载时刻',
+    reason          VARCHAR(32)  NOT NULL COMMENT '拒绝原因码：CUTOFF_CLOSED 已到截止时刻/SHORT_UNLOADED 短卸未补到/ALREADY_LOADED 已在其他航段清单/ITINERARY_MISMATCH 待乘航段不匹配/NOT_AT_ORIGIN 未在始发站交接/BAG_NOT_FOUND 行李不存在/BAG_DUPLICATE 请求内重复/LEG_NOT_OPEN 航段已封舱',
+    detail          VARCHAR(255) NOT NULL COMMENT '拒绝原因中文说明',
+    PRIMARY KEY (id)
 );

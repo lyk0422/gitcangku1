@@ -13,6 +13,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 import com.example.starter.baggage.BaggageDtos.ArriveRequest;
 import com.example.starter.baggage.BaggageDtos.ArriveResponse;
+import com.example.starter.baggage.BaggageDtos.BagLegStatusResponse;
 import com.example.starter.baggage.BaggageDtos.BagResponse;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveRequest;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveResponse;
@@ -28,6 +29,7 @@ import com.example.starter.baggage.BaggageDtos.RegisterLegRequest;
 import com.example.starter.baggage.BaggageDtos.SealRequest;
 import com.example.starter.baggage.BaggageDtos.SealResponse;
 import com.example.starter.baggage.BaggageDtos.ShortListResponse;
+import com.example.starter.baggage.BaggageDtos.UpdateCutoffRequest;
 
 /**
  * 联程行李装载交接 REST 入口。
@@ -46,6 +48,13 @@ public class BaggageController {
     @PostMapping("/legs")
     public ResponseEntity<LegResponse> registerLeg(@Valid @RequestBody RegisterLegRequest request) {
         return ResponseEntity.status(HttpStatus.CREATED).body(baggageService.registerLeg(request));
+    }
+
+    /** 修改航段 UTC 装载截止时刻：仅 OPEN 航段允许，封舱或最终到达后返回 409。 */
+    @PostMapping("/legs/{legId}/cutoff")
+    public LegResponse updateCutoff(@PathVariable String legId,
+                                    @Valid @RequestBody UpdateCutoffRequest request) {
+        return baggageService.updateCutoff(legId, request);
     }
 
     /** 登记行李及其有序行程。 */
@@ -89,6 +98,13 @@ public class BaggageController {
     @GetMapping("/bags/{bagTag}/trace")
     public BagResponse getBagTrace(@PathVariable String bagTag) {
         return baggageService.getBagTrace(bagTag);
+    }
+
+    /** 按行李 + 航段查询交接、截止、装载状态及最近一次拒绝原因。 */
+    @GetMapping("/bags/{bagTag}/legs/{legId}/status")
+    public BagLegStatusResponse getBagLegStatus(@PathVariable String bagTag,
+                                                @PathVariable String legId) {
+        return baggageService.getBagLegStatus(bagTag, legId);
     }
 
     /** 封舱清单查询。 */

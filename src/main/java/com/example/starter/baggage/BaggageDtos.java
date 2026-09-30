@@ -14,12 +14,19 @@ public final class BaggageDtos {
     private BaggageDtos() {
     }
 
-    /** 登记航段请求。 */
+    /** 登记航段请求：loadingCutoff 为 UTC 装载截止时刻（ISO-8601，如 2026-09-30T12:00:00Z）。 */
     public record RegisterLegRequest(
             @NotBlank(message = "requestId 不能为空") String requestId,
             @NotBlank(message = "legId 不能为空") String legId,
             @NotBlank(message = "origin 不能为空") String origin,
-            @NotBlank(message = "destination 不能为空") String destination) {
+            @NotBlank(message = "destination 不能为空") String destination,
+            @NotBlank(message = "loadingCutoff 不能为空") String loadingCutoff) {
+    }
+
+    /** 修改航段 UTC 装载截止时刻请求：仅 OPEN 航段允许，封舱或最终到达后提交返回 409。 */
+    public record UpdateCutoffRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotBlank(message = "loadingCutoff 不能为空") String loadingCutoff) {
     }
 
     /** 登记行李请求：legIds 为 1~5 个有序航段。 */
@@ -65,9 +72,9 @@ public final class BaggageDtos {
             @NotBlank(message = "actualStation 不能为空") String actualStation) {
     }
 
-    /** 航段响应。 */
+    /** 航段响应：loadingCutoff 为 UTC 装载截止时刻。 */
     public record LegResponse(String legId, String origin, String destination,
-                              String status, int version) {
+                              String status, int version, String loadingCutoff) {
     }
 
     /** 行程明细项。 */
@@ -86,8 +93,9 @@ public final class BaggageDtos {
                               List<TraceEvent> events) {
     }
 
-    /** 批量装载响应。 */
-    public record LoadResponse(String legId, String status, int version, List<String> loaded) {
+    /** 批量装载响应：cutoffSnapshot 为装载成功时航段 UTC 截止时刻快照。 */
+    public record LoadResponse(String legId, String status, int version, List<String> loaded,
+                               String cutoffSnapshot) {
     }
 
     /** 封舱响应：manifest 为只读装载清单快照。 */
@@ -124,5 +132,17 @@ public final class BaggageDtos {
 
     /** 未补到清单响应。 */
     public record ShortListResponse(List<ShortItem> shortUnloaded) {
+    }
+
+    /**
+     * 按行李 + 航段查询的交接、截止与装载状态。
+     * loadStatus：NOT_LOADED 已交接待装载/LOADED 已装载未到达/UNLOADED 已随航段到达卸下/
+     * SHORT_UNLOADED 该航段短卸待补/NOT_APPLICABLE 尚未交接或与该航段无关。
+     */
+    public record BagLegStatusResponse(String bagTag, String legId, String legStatus, int legVersion,
+                                       String loadingCutoff, boolean cutoffClosed, boolean handedOver,
+                                       String loadStatus, String cutoffSnapshot, String loadedAt,
+                                       String lastRejectReason, String lastRejectDetail,
+                                       String lastRejectAt) {
     }
 }

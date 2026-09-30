@@ -22,6 +22,11 @@ public class ApiException extends RuntimeException {
         return new ApiException(HttpStatus.NOT_FOUND, message);
     }
 
+    /** 请求参数格式非法（如 UTC 时刻无法解析）。 */
+    public static ApiException badRequest(String message) {
+        return new ApiException(HttpStatus.BAD_REQUEST, message);
+    }
+
     public static ApiException conflict(String message) {
         return new ApiException(HttpStatus.CONFLICT, message);
     }
