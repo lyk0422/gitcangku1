@@ -123,9 +123,17 @@ public class LedgerRepository {
 
     /** 释放一次公告当日额度（-1）；CHECK 约束保证不变负。 */
     public void releaseTotal(String campaignId, LocalDate utcDate) {
-        int rows = jdbc.update("UPDATE quota_total_ledger SET used_total = used_total - 1 "
+        releaseTotal(campaignId, utcDate, 1);
+    }
+
+    /**
+     * 释放多笔预占合计占用的公告当日额度（-delta）；
+     * delta 为同一账目行上被取消/过期预占的笔数，CHECK 约束保证不变负。
+     */
+    public void releaseTotal(String campaignId, LocalDate utcDate, int delta) {
+        int rows = jdbc.update("UPDATE quota_total_ledger SET used_total = used_total - ? "
                         + "WHERE campaign_id = ? AND utc_date = ?",
-                campaignId, java.sql.Date.valueOf(utcDate));
+                delta, campaignId, java.sql.Date.valueOf(utcDate));
         if (rows != 1) {
             throw new IllegalStateException("total ledger row missing for " + campaignId + " " + utcDate);
         }
@@ -133,9 +141,17 @@ public class LedgerRepository {
 
     /** 释放一次访客当日额度（-1）；CHECK 约束保证不变负。 */
     public void releaseVisitor(String campaignId, String visitorId, LocalDate utcDate) {
-        int rows = jdbc.update("UPDATE quota_visitor_ledger SET used_visitor = used_visitor - 1 "
+        releaseVisitor(campaignId, visitorId, utcDate, 1);
+    }
+
+    /**
+     * 释放多笔预占合计占用的访客当日额度（-delta）；
+     * delta 为同一账目行上被取消/过期预占的笔数，CHECK 约束保证不变负。
+     */
+    public void releaseVisitor(String campaignId, String visitorId, LocalDate utcDate, int delta) {
+        int rows = jdbc.update("UPDATE quota_visitor_ledger SET used_visitor = used_visitor - ? "
                         + "WHERE campaign_id = ? AND visitor_id = ? AND utc_date = ?",
-                campaignId, visitorId, java.sql.Date.valueOf(utcDate));
+                delta, campaignId, visitorId, java.sql.Date.valueOf(utcDate));
         if (rows != 1) {
             throw new IllegalStateException("visitor ledger row missing for "
                     + campaignId + " " + visitorId + " " + utcDate);
