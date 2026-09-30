@@ -10,6 +10,7 @@ import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.stereotype.Repository;
 
 import java.sql.PreparedStatement;
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -72,6 +73,15 @@ public class ReleaseRepository {
     public Optional<ReleaseOrder> findActiveByModel(String model) {
         return jdbc.query("SELECT " + COLUMNS + " FROM release_order WHERE active_model = ?", MAPPER, model)
                 .stream().findFirst();
+    }
+
+    /**
+     * 锁定所有以指定版本为目标版本的未终结发布单；版本冻结在同一事务内持有这些行锁，
+     * 与任务拉取形成一致提交顺序：先提交冻结则拉取侧 409，先提交拉取则任务已建。
+     */
+    public List<ReleaseOrder> findOpenByToVersionForUpdate(String toVersion) {
+        return jdbc.query("SELECT " + COLUMNS + " FROM release_order WHERE to_version = ?"
+                + " AND active_model IS NOT NULL ORDER BY id FOR UPDATE", MAPPER, toVersion);
     }
 
     /**

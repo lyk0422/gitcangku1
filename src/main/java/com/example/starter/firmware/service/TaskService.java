@@ -35,12 +35,14 @@ public class TaskService {
     private final PauseRecordRepository pauseRecordRepository;
     private final DeviceService deviceService;
     private final ReleaseService releaseService;
+    private final FreezeService freezeService;
     private final IdempotencyService idempotency;
     private final Clock clock;
 
     public TaskService(TaskRepository taskRepository, ReleaseRepository releaseRepository,
                        DeviceRepository deviceRepository, PauseRecordRepository pauseRecordRepository,
                        DeviceService deviceService, ReleaseService releaseService,
+                       FreezeService freezeService,
                        IdempotencyService idempotency, Clock clock) {
         this.taskRepository = taskRepository;
         this.releaseRepository = releaseRepository;
@@ -48,13 +50,18 @@ public class TaskService {
         this.pauseRecordRepository = pauseRecordRepository;
         this.deviceService = deviceService;
         this.releaseService = releaseService;
+        this.freezeService = freezeService;
         this.idempotency = idempotency;
         this.clock = clock;
     }
 
     /**
-     * 设备拉取：已存在任务直接返回；否则仅当型号与当前版本匹配、分桶号小于比例且发布单 ACTIVE 时创建。
-     * PAUSED 时不创建新任务，已有任务仍可查看与回执。
+     * 设备拉取：已存在任务直接返回；否则仅当型号与当前版本匹配、分桶号小于比例、发布单 ACTIVE
+     * 且目标版本未处于正式发布冻结时创建。PAUSED 时不创建新任务，已有任务仍可查看与回执。
+     *
+     * <p>冻结并发：进入发布单行锁前先锁版本当前生效冻结行（F→R 顺序，与冻结操作一致）；
+     * 持有发布单行锁后再非锁定复查冻结状态，按提交顺序决定：先提交冻结则 409 VERSION_FROZEN
+     * 且不插入任务（不占分桶容量），先提交拉取则任务已建。</p>
      */
     public PullResponse pull(String deviceId, String requestId) {
         String fingerprint = String.join("|", "task.pull", deviceId);
@@ -64,6 +71,8 @@ public class TaskService {
             if (activeOrder.isEmpty()) {
                 return new PullResponse(null);
             }
+            // 先锁冻结行（存在时），维持与冻结一致的 F→R 加锁顺序。
+            freezeService.lockActiveFreezeIfPresent(activeOrder.get().toVersion());
             ReleaseOrder order = releaseRepository.findByIdForUpdate(activeOrder.get().id())
                     .orElseThrow(() -> ApiException.notFound("RELEASE_NOT_FOUND", "发布单不存在"));
             var existing = taskRepository.findByReleaseAndDevice(order.id(), deviceId);
@@ -74,6 +83,11 @@ public class TaskService {
                     || !device.currentVersion().equals(order.fromVersion())
                     || device.bucketNo() >= order.ratio()) {
                 return new PullResponse(null);
+            }
+            // 持有发布单行锁后复查：冻结先提交则拒绝新建，任务不落库、不占分桶容量。
+            if (freezeService.isFrozen(order.toVersion())) {
+                throw ApiException.conflict("VERSION_FROZEN",
+                        "目标版本已正式发布冻结，暂不新建投放任务: " + order.toVersion());
             }
             long taskId;
             try {

@@ -63,6 +63,37 @@ CREATE TABLE IF NOT EXISTS release_resume_record (
   PRIMARY KEY (id)
 ) COMMENT='发布单人工恢复记录，历史不可改';
 
+CREATE TABLE IF NOT EXISTS release_freeze_record (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '冻结记录ID',
+  version VARCHAR(64) NOT NULL COMMENT '被冻结的目标固件版本（对应release_order.to_version）',
+  status VARCHAR(16) NOT NULL COMMENT '状态：FROZEN冻结生效中；RESUMED已审批恢复（区间保留）',
+  created_by VARCHAR(64) NOT NULL COMMENT '冻结创建人（申请人）',
+  reason VARCHAR(256) NOT NULL COMMENT '冻结原因，恢复失败也不得清除',
+  frozen_at_utc VARCHAR(40) NOT NULL COMMENT '冻结生效时刻，UTC，ISO-8601格式（如2026-09-30T14:00:00Z）',
+  resume_requested_by VARCHAR(64) NULL COMMENT '恢复申请人，未申请为NULL',
+  resume_reason VARCHAR(256) NULL COMMENT '恢复申请原因，未申请为NULL',
+  resume_requested_at_utc VARCHAR(40) NULL COMMENT '恢复申请时刻，UTC，未申请为NULL',
+  approved_by VARCHAR(64) NULL COMMENT '恢复审批人，必须与冻结创建人不同，未审批为NULL',
+  resumed_at_utc VARCHAR(40) NULL COMMENT '审批恢复时刻，UTC，未审批为NULL',
+  active_version VARCHAR(64) NULL COMMENT 'FROZEN时等于version，恢复后置NULL；用于每版本至多一条生效冻结的唯一约束',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
+  PRIMARY KEY (id)
+) COMMENT='目标固件版本正式发布冻结记录，恢复不抹除冻结区间';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_freeze_active_version ON release_freeze_record (active_version);
+
+CREATE TABLE IF NOT EXISTS release_freeze_event (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '审计流水ID',
+  freeze_id BIGINT NOT NULL COMMENT '所属冻结记录ID',
+  version VARCHAR(64) NOT NULL COMMENT '被冻结的目标固件版本',
+  event_type VARCHAR(24) NOT NULL COMMENT '动作：FROZEN冻结；RESUME_REQUESTED申请恢复；RESUME_APPROVED审批恢复',
+  operator VARCHAR(64) NOT NULL COMMENT '操作人：冻结创建人、恢复申请人或审批人',
+  reason VARCHAR(256) NOT NULL COMMENT '本次动作原因，审批沿用恢复申请原因',
+  event_at_utc VARCHAR(40) NOT NULL COMMENT '动作发生时刻，UTC，ISO-8601格式',
+  PRIMARY KEY (id)
+) COMMENT='版本冻结审计流水，只增不改';
+
 CREATE TABLE IF NOT EXISTS idempotency_record (
   request_id VARCHAR(64) NOT NULL COMMENT '全局唯一请求ID',
   api VARCHAR(64) NOT NULL COMMENT '接口标识',
