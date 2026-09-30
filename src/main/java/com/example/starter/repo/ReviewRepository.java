@@ -63,25 +63,6 @@ public class ReviewRepository {
                 po.requestId(), po.createdAt());
     }
 
-    /** 查询幂等去重记录，不存在返回 null。 */
-    public DedupPo findDedup(String requestId) {
-        return jdbc.query(
-                "SELECT request_id, request_kind, request_hash, response_json, created_at "
-                        + "FROM request_dedup WHERE request_id = ?",
-                (rs, n) -> new DedupPo(rs.getString("request_id"), rs.getString("request_kind"),
-                        rs.getString("request_hash"), rs.getString("response_json"),
-                        rs.getLong("created_at")),
-                requestId).stream().findFirst().orElse(null);
-    }
-
-    /** 插入幂等去重记录（与业务变更在同一事务提交）。 */
-    public void insertDedup(DedupPo po) {
-        jdbc.update("INSERT INTO request_dedup "
-                        + "(request_id, request_kind, request_hash, response_json, created_at) "
-                        + "VALUES (?, ?, ?, ?, ?)",
-                po.requestId(), po.requestKind(), po.requestHash(), po.responseJson(), po.createdAt());
-    }
-
     /** 点列表编码："x,y;x,y"；空列表编码为空串。 */
     public static String encodePoints(List<Point> points) {
         StringBuilder sb = new StringBuilder();

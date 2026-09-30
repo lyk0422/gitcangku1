@@ -62,8 +62,40 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_review_request ON review (request_id);
 -- 写操作幂等去重：同键同参重放原结果，异参冲突；失败不占键
 CREATE TABLE IF NOT EXISTS request_dedup (
     request_id     VARCHAR(64) PRIMARY KEY COMMENT '写操作全局唯一请求标识',
-    request_kind   VARCHAR(32) NOT NULL COMMENT '请求类型：ZONE_CREATE/ZONE_REVOKE/ROUTE_CREATE/ROUTE_REPLACE/REVIEW',
+    request_kind   VARCHAR(32) NOT NULL COMMENT '请求类型：ZONE_CREATE/ZONE_REVOKE/ROUTE_CREATE/ROUTE_REPLACE/REVIEW/DIVERSION_AIRPORT_CREATE/DIVERSION_RESERVATION/DIVERSION_DEPARTURE',
     request_hash   VARCHAR(64) NOT NULL COMMENT '规范化参数的 SHA-256 十六进制摘要，用于同键异参冲突判定',
     response_json  CLOB NOT NULL COMMENT '首次成功响应 JSON，重放时原样返回',
     created_at     BIGINT NOT NULL COMMENT '首次成功时间，epoch 毫秒（UTC）'
 ) COMMENT = '写操作幂等去重记录（与业务变更同事务原子提交）';
+
+-- 备降机场：airportId 唯一；capacity 为同一时段窗口允许同时占用的预留数量（至少 1）。
+-- touch 仅用于对机场行产生真实更新以加行级排他锁，使同机场的申请/起飞事务串行。
+CREATE TABLE IF NOT EXISTS diversion_airport (
+    airport_id  VARCHAR(64) PRIMARY KEY COMMENT '备降机场唯一标识',
+    capacity    INT NOT NULL COMMENT '同一时段窗口允许同时占用的预留数量，必须为正整数',
+    touch       BIGINT NOT NULL COMMENT '仅用于申请/起飞事务加行级排他锁的计数器，无业务含义'
+) COMMENT = '备降机场容量配置';
+
+-- 备降机场预留：窗口为 UTC 左闭右开 [window_start, window_end)；
+-- status 为 RESERVED 占用中 / DEPARTED 已起飞（仍占窗口容量直至窗口结束，不可再被挤出）/
+-- DISPLACED 已被更高优先级申请整体挤出（不再占用容量，记录与替换链不可变保留）。
+-- replaced_by 一旦写入永不改变，表示挤出本预留的新预留标识。
+CREATE TABLE IF NOT EXISTS diversion_reservation (
+    reservation_id  VARCHAR(64) PRIMARY KEY COMMENT '预留唯一标识（申请成功时生成，不可变）',
+    airport_id      VARCHAR(64) NOT NULL COMMENT '占用的备降机场标识',
+    route_id        VARCHAR(64) NOT NULL COMMENT '申请预留的航线标识',
+    priority        INT NOT NULL COMMENT '预留优先级，数值越大优先级越高，同级不得互相挤出',
+    window_start    BIGINT NOT NULL COMMENT 'UTC 窗口开始（含），epoch 毫秒',
+    window_end      BIGINT NOT NULL COMMENT 'UTC 窗口结束（不含），epoch 毫秒，window_start < window_end',
+    status          VARCHAR(16) NOT NULL COMMENT '状态：RESERVED 占用中且可被高优先级挤出；DEPARTED 已起飞仍占容量但不可挤出；DISPLACED 已被整体挤出不占容量',
+    replaced_by     VARCHAR(64) NULL COMMENT '挤出本预留的新预留标识；NULL 表示从未被挤出；写入后不可变',
+    request_id      VARCHAR(64) NOT NULL COMMENT '首次申请的写操作请求标识，用于幂等重放首次挤出清单',
+    created_at      BIGINT NOT NULL COMMENT '创建时间，epoch 毫秒（UTC）',
+    updated_at      BIGINT NOT NULL COMMENT '最近一次状态变更（挤出/起飞）时间，epoch 毫秒（UTC）'
+) COMMENT = '备降机场预留与不可变替换链记录';
+
+CREATE INDEX IF NOT EXISTS ix_diversion_res_airport_window
+    ON diversion_reservation (airport_id, status, window_start, window_end);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_diversion_res_request
+    ON diversion_reservation (request_id);
