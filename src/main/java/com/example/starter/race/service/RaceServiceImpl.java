@@ -5,6 +5,9 @@ import com.example.starter.race.api.CheckpointResponse;
 import com.example.starter.race.api.CheckpointsConfigResponse;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
 import com.example.starter.race.api.CreateRaceRequest;
+import com.example.starter.race.api.CurrentRosterResponse;
+import com.example.starter.race.api.LockRosterRequest;
+import com.example.starter.race.api.MemberWithdrawalResponse;
 import com.example.starter.race.api.MissingCheckpointsResponse;
 import com.example.starter.race.api.RaceResponse;
 import com.example.starter.race.api.RegisterRunnerRequest;
@@ -15,11 +18,17 @@ import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.api.SubmitTimingRequest;
+import com.example.starter.race.api.TeamRosterResponse;
+import com.example.starter.race.api.TeamStandingsResponse;
+import com.example.starter.race.api.WithdrawRosterMemberRequest;
 import com.example.starter.race.domain.CheckpointRules;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
+import com.example.starter.race.domain.RosterMemberState;
+import com.example.starter.race.domain.TeamRankCalculator;
+import com.example.starter.race.domain.TeamStanding;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
 import com.example.starter.race.persistence.IdempotencyRow;
@@ -30,6 +39,10 @@ import com.example.starter.race.persistence.SnapshotCheckpointRow;
 import com.example.starter.race.persistence.SnapshotEntryRow;
 import com.example.starter.race.persistence.SnapshotRow;
 import com.example.starter.race.persistence.RaceRepository;
+import com.example.starter.race.persistence.TeamMembershipRow;
+import com.example.starter.race.persistence.TeamRosterMemberRow;
+import com.example.starter.race.persistence.TeamRosterRow;
+import com.example.starter.race.persistence.TeamStandingSnapshotRow;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
@@ -390,6 +403,18 @@ public class RaceServiceImpl implements RaceService {
                             buildSnapshotCheckpoints(raceId, runners, checkpoints, timings);
                     repository.insertSnapshot(new SnapshotRow(raceId, newVersion, now,
                             snapshotEntries, snapshotCheckpoints));
+                    // 团队榜同事务固化：每个团队引用其封榜时刻最新一个完整名单版本，
+                    // 积分剔除当时已退赛成员；锁定与封榜靠 race 行锁互斥，不会引用半个版本。
+                    List<TeamStanding> teamStandings = computeLiveTeamStandings(raceId);
+                    List<TeamStandingSnapshotRow> teamRows = new ArrayList<>(teamStandings.size());
+                    for (int order = 0; order < teamStandings.size(); order++) {
+                        TeamStanding standing = teamStandings.get(order);
+                        teamRows.add(new TeamStandingSnapshotRow(
+                                raceId, standing.teamId(), standing.rosterVersionNo(),
+                                standing.teamPoints(), standing.memberCount(),
+                                standing.rankNo(), order));
+                    }
+                    repository.insertTeamStandingSnapshot(raceId, teamRows);
                     return ServiceResult.ok(new StandingResponse(
                             raceId, newVersion, RaceStatus.SEALED, now,
                             snapshotEntries.stream().map(ResponseMapper::toEntryResponse).toList()));
@@ -496,6 +521,264 @@ public class RaceServiceImpl implements RaceService {
         SnapshotRow snapshot = repository.findSnapshot(raceId)
                 .orElseThrow(() -> new NotFoundException("赛事尚未封榜: " + raceId));
         return ResponseMapper.snapshotStanding(snapshot);
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult lockRoster(String raceId, String teamId, LockRosterRequest request) {
+        // 名单成员按参赛号字典序规范化后参与摘要，保证提交顺序不同但成员相同视为同一请求。
+        List<String> canonicalMembers = request.members().stream().sorted().toList();
+        return withIdempotency(request.requestId(), "LOCK_ROSTER",
+                orderedParams(
+                        "raceId", raceId,
+                        "teamId", teamId,
+                        "expectedVersion", request.expectedVersion(),
+                        "members", canonicalMembers),
+                () -> {
+                    // 先取 race 行写锁：锁定与封榜、其它写者互斥，榜单不会引用到半个名单版本。
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+
+                    // 整单校验：空单/同单重复/存在未登记选手，任一不合法即整体拒绝，不产生半份名单。
+                    if (request.members().isEmpty()) {
+                        throw new BadRequestException("名单成员不能为空");
+                    }
+                    java.util.Set<String> uniqueInRequest = new java.util.HashSet<>();
+                    for (String bib : request.members()) {
+                        if (!uniqueInRequest.add(bib)) {
+                            throw new ConflictException("成员重复入队: " + bib);
+                        }
+                    }
+                    List<RunnerRow> runners = repository.findRunners(raceId);
+                    java.util.Map<String, RunnerRow> runnerByBib = new TreeMap<>();
+                    for (RunnerRow runner : runners) {
+                        runnerByBib.put(runner.bib(), runner);
+                    }
+                    for (String bib : canonicalMembers) {
+                        if (!runnerByBib.containsKey(bib)) {
+                            throw new UnprocessableEntityException(
+                                    "名单成员未在该赛事登记: " + bib);
+                        }
+                    }
+
+                    // 跨队校验：成员在同一赛事内只能归属一个团队；同队成员可随新版本再次锁定。
+                    java.util.Map<String, TeamMembershipRow> membershipByBib = new TreeMap<>();
+                    for (TeamMembershipRow membership : repository.findMemberships(raceId)) {
+                        membershipByBib.put(membership.bib(), membership);
+                    }
+                    for (String bib : canonicalMembers) {
+                        TeamMembershipRow membership = membershipByBib.get(bib);
+                        if (membership != null && !membership.teamId().equals(teamId)) {
+                            throw new ConflictException("成员已属于其它团队 "
+                                    + membership.teamId() + ": " + bib);
+                        }
+                        if (membership != null && membership.withdrawnAt() != null) {
+                            // 已退赛成员不得再进入新名单版本：退赛状态与成员唯一归属绑定，避免“复出”歧义。
+                            throw new ConflictException("成员已退赛，不能再次进入名单: " + bib);
+                        }
+                    }
+
+                    // 锁定时刻计算个人成绩并固化到该名单版本；后续计时/处罚/退赛均不改写本版本。
+                    List<ResultEntry> entries = ResultCalculator.compute(
+                            runners,
+                            repository.findPenalties(raceId),
+                            repository.findCheckpoints(raceId),
+                            repository.findAllTimings(raceId));
+                    java.util.Map<String, ResultEntry> entryByBib = new TreeMap<>();
+                    for (ResultEntry entry : entries) {
+                        entryByBib.put(entry.bib(), entry);
+                    }
+
+                    int nextVersion = repository.findLatestRosterVersionNo(raceId, teamId) + 1;
+                    List<TeamRosterMemberRow> memberRows = new ArrayList<>(canonicalMembers.size());
+                    int teamPoints = 0;
+                    int order = 0;
+                    for (String bib : canonicalMembers) {
+                        ResultEntry entry = entryByBib.get(bib);
+                        int memberPoints = TeamRankCalculator.pointsForRank(entry.rank());
+                        teamPoints += memberPoints;
+                        memberRows.add(new TeamRosterMemberRow(
+                                raceId, teamId, nextVersion, bib,
+                                entry.rank(), entry.status(), entry.finishTimeMs(),
+                                entry.penaltyMs(), entry.totalTimeMs(),
+                                memberPoints, order++));
+                    }
+
+                    bumpVersion(race, request.expectedVersion());
+                    long now = clock.millis();
+                    repository.insertRoster(new TeamRosterRow(
+                            raceId, teamId, nextVersion, now, teamPoints, memberRows));
+                    // 首次入队的成员写唯一归属；唯一约束兜底并发跨队。
+                    for (String bib : canonicalMembers) {
+                        if (membershipByBib.containsKey(bib)) {
+                            continue;
+                        }
+                        try {
+                            repository.insertMembership(new TeamMembershipRow(
+                                    raceId, bib, teamId, nextVersion, now, null, null, null));
+                        } catch (DuplicateKeyException ex) {
+                            TeamMembershipRow concurrent =
+                                    repository.findMembership(raceId, bib).orElseThrow();
+                            if (!concurrent.teamId().equals(teamId)) {
+                                throw new ConflictException("成员已属于其它团队 "
+                                        + concurrent.teamId() + ": " + bib);
+                            }
+                            throw ex;
+                        }
+                    }
+                    TeamRosterRow saved =
+                            repository.findRoster(raceId, teamId, nextVersion).orElseThrow();
+                    return ServiceResult.created(ResponseMapper.toRosterResponse(saved));
+                });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult withdrawRosterMember(
+            String raceId, String teamId, WithdrawRosterMemberRequest request) {
+        return withIdempotency(request.requestId(), "WITHDRAW_MEMBER",
+                orderedParams(
+                        "raceId", raceId,
+                        "teamId", teamId,
+                        "bib", request.bib(),
+                        "effectiveSession", request.effectiveSession(),
+                        "reason", request.reason(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    // 退赛取 race 行写锁：OPEN 时与锁定/封榜互斥；SEALED 后也允许登记，
+                    // 因为退赛只回填归属表的生效场次与原因（留痕），不触碰任何已锁定名单或已封榜快照。
+                    RaceRow race = repository.findRaceForUpdate(raceId)
+                            .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+                    if (race.version() != request.expectedVersion()) {
+                        throw new ConflictException("版本冲突: expected=" + request.expectedVersion()
+                                + ", actual=" + race.version());
+                    }
+                    TeamMembershipRow membership = repository
+                            .findMembership(raceId, request.bib())
+                            .orElseThrow(() -> new UnprocessableEntityException(
+                                    "成员尚未进入任何已锁定名单: " + request.bib()));
+                    if (!membership.teamId().equals(teamId)) {
+                        throw new ConflictException("成员不属于团队 " + teamId + ": "
+                                + request.bib() + "，实际属于 " + membership.teamId());
+                    }
+                    if (membership.withdrawnAt() != null) {
+                        throw new ConflictException("成员已退赛: " + request.bib());
+                    }
+                    // OPEN 时退赛影响未封榜的后续计分（实时团队榜剔除该成员），随其它写一并推进版本；
+                    // SEALED 后退赛仅留痕，不推进版本、不重算已封榜团队积分。
+                    if (race.status() == RaceStatus.OPEN) {
+                        bumpVersion(race, request.expectedVersion());
+                    }
+                    long now = clock.millis();
+                    int updated = repository.markMembershipWithdrawn(
+                            raceId, request.bib(),
+                            request.effectiveSession(), request.reason(), now);
+                    if (updated == 0) {
+                        throw new ConflictException("成员已退赛: " + request.bib());
+                    }
+                    TeamMembershipRow refreshed =
+                            repository.findMembership(raceId, request.bib()).orElseThrow();
+                    return ServiceResult.ok(new MemberWithdrawalResponse(
+                            raceId, teamId, refreshed.bib(),
+                            RosterMemberState.WITHDRAWN.name(),
+                            refreshed.firstVersionNo(),
+                            refreshed.effectiveSession(),
+                            refreshed.withdrawalReason(),
+                            refreshed.withdrawnAt()));
+                });
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public CurrentRosterResponse getCurrentRoster(String raceId, String teamId) {
+        repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        int latestVersion = repository.findLatestRosterVersionNo(raceId, teamId);
+        if (latestVersion == 0) {
+            return new CurrentRosterResponse(raceId, teamId, 0, List.of());
+        }
+        TeamRosterRow latestRoster =
+                repository.findRoster(raceId, teamId, latestVersion).orElseThrow();
+        java.util.Map<String, TeamMembershipRow> membershipByBib = new TreeMap<>();
+        for (TeamMembershipRow membership : repository.findMemberships(raceId)) {
+            membershipByBib.put(membership.bib(), membership);
+        }
+        return ResponseMapper.toCurrentRosterResponse(latestRoster, membershipByBib);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public TeamRosterResponse getRosterVersion(String raceId, String teamId, int versionNo) {
+        repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        TeamRosterRow roster = repository.findRoster(raceId, teamId, versionNo)
+                .orElseThrow(() -> new NotFoundException(
+                        "名单版本不存在: team=" + teamId + ", version=" + versionNo));
+        return ResponseMapper.toRosterResponse(roster);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<TeamRosterResponse> getRosterVersions(String raceId, String teamId) {
+        repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        return repository.findRostersForTeam(raceId, teamId).stream()
+                .map(ResponseMapper::toRosterResponse)
+                .toList();
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public TeamStandingsResponse getTeamResults(String raceId) {
+        RaceRow race = repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        if (race.status() == RaceStatus.SEALED) {
+            // 没有任何团队名单的赛事封榜后团队榜为空列表，而非错误。
+            return ResponseMapper.toTeamSnapshotResponse(
+                    raceId, race.version(), repository.findTeamStandingSnapshot(raceId));
+        }
+        return ResponseMapper.toTeamStandingsResponse(
+                raceId, race.version(), RaceStatus.OPEN, computeLiveTeamStandings(raceId));
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public TeamStandingsResponse getTeamSnapshot(String raceId) {
+        RaceRow race = repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        if (race.status() != RaceStatus.SEALED) {
+            throw new NotFoundException("赛事尚未封榜: " + raceId);
+        }
+        // 已封榜但从未锁定过团队名单时，团队榜快照为空列表。
+        return ResponseMapper.toTeamSnapshotResponse(
+                raceId, race.version(), repository.findTeamStandingSnapshot(raceId));
+    }
+
+    /**
+     * 实时团队榜：各团队引用其最新锁定名单版本，成员固化名次积分不变，
+     * 但剔除当前已退赛成员后重新汇总团队积分与名次（不影响任何已锁定/已封榜数据）。
+     */
+    private List<TeamStanding> computeLiveTeamStandings(String raceId) {
+        java.util.Set<String> withdrawnBibs = new java.util.HashSet<>();
+        for (TeamMembershipRow membership : repository.findMemberships(raceId)) {
+            if (membership.withdrawnAt() != null) {
+                withdrawnBibs.add(membership.bib());
+            }
+        }
+        List<TeamRankCalculator.TeamScore> scores = new ArrayList<>();
+        for (TeamRosterRow roster : repository.findLatestTeamRosters(raceId)) {
+            int teamPoints = 0;
+            int memberCount = 0;
+            for (TeamRosterMemberRow member : roster.members()) {
+                if (withdrawnBibs.contains(member.bib())) {
+                    continue;
+                }
+                teamPoints += member.memberPoints();
+                memberCount++;
+            }
+            scores.add(new TeamRankCalculator.TeamScore(
+                    roster.teamId(), roster.versionNo(), teamPoints, memberCount));
+        }
+        return TeamRankCalculator.rank(scores);
     }
 
     /**

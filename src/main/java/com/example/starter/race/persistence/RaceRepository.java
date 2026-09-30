@@ -9,6 +9,7 @@ import org.springframework.stereotype.Repository;
 
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 
@@ -370,6 +371,10 @@ public class RaceRepository {
 
     /** 测试辅助：清空全部业务数据，按外键依赖顺序删除。 */
     public void deleteAllForTesting() {
+        jdbcTemplate.update("DELETE FROM team_standing_snapshot");
+        jdbcTemplate.update("DELETE FROM team_roster_member");
+        jdbcTemplate.update("DELETE FROM team_roster");
+        jdbcTemplate.update("DELETE FROM team_membership");
         jdbcTemplate.update("DELETE FROM result_snapshot_checkpoint");
         jdbcTemplate.update("DELETE FROM result_snapshot_entry");
         jdbcTemplate.update("DELETE FROM result_snapshot");
@@ -380,6 +385,238 @@ public class RaceRepository {
         jdbcTemplate.update("DELETE FROM runner");
         jdbcTemplate.update("DELETE FROM race");
     }
+
+    /** 查询团队最新已锁定名单版本号；从未锁定时返回 0。 */
+    public int findLatestRosterVersionNo(String raceId, String teamId) {
+        Integer version = jdbcTemplate.queryForObject(
+                "SELECT COALESCE(MAX(version_no), 0) FROM team_roster WHERE race_id = ? AND team_id = ?",
+                Integer.class, raceId, teamId);
+        return version == null ? 0 : version;
+    }
+
+    /** 查询团队指定名单版本（含全部固化成员，按 display_order）；不存在返回 empty。 */
+    public Optional<TeamRosterRow> findRoster(String raceId, String teamId, int versionNo) {
+        List<TeamRosterRow> headers = jdbcTemplate.query(
+                "SELECT race_id, team_id, version_no, locked_at, team_points "
+                        + "FROM team_roster WHERE race_id = ? AND team_id = ? AND version_no = ?",
+                (rs, rowNum) -> new TeamRosterRow(
+                        rs.getString("race_id"),
+                        rs.getString("team_id"),
+                        rs.getInt("version_no"),
+                        rs.getLong("locked_at"),
+                        rs.getInt("team_points"),
+                        List.of()),
+                raceId, teamId, versionNo);
+        if (headers.isEmpty()) {
+            return Optional.empty();
+        }
+        TeamRosterRow header = headers.getFirst();
+        List<TeamRosterMemberRow> members = jdbcTemplate.query(
+                "SELECT race_id, team_id, version_no, bib, rank_no, entry_status, finish_time_ms, "
+                        + "penalty_ms, total_time_ms, member_points, display_order "
+                        + "FROM team_roster_member WHERE race_id = ? AND team_id = ? AND version_no = ? "
+                        + "ORDER BY display_order",
+                TEAM_ROSTER_MEMBER_ROW_MAPPER, raceId, teamId, versionNo);
+        return Optional.of(new TeamRosterRow(header.raceId(), header.teamId(), header.versionNo(),
+                header.lockedAt(), header.teamPoints(), members));
+    }
+
+    /** 查询团队全部已锁定名单版本（含成员），版本号升序。 */
+    public List<TeamRosterRow> findRostersForTeam(String raceId, String teamId) {
+        List<Integer> versionNos = jdbcTemplate.queryForList(
+                "SELECT version_no FROM team_roster WHERE race_id = ? AND team_id = ? ORDER BY version_no",
+                Integer.class, raceId, teamId);
+        List<TeamRosterRow> rosters = new ArrayList<>(versionNos.size());
+        for (Integer versionNo : versionNos) {
+            findRoster(raceId, teamId, versionNo).ifPresent(rosters::add);
+        }
+        return rosters;
+    }
+
+    /** 查询赛事下每个团队的最新名单版本（含固化成员），按团队ID字典序。 */
+    public List<TeamRosterRow> findLatestTeamRosters(String raceId) {
+        List<TeamRosterRow> result = new ArrayList<>();
+        jdbcTemplate.query(
+                "SELECT r.race_id, r.team_id, r.version_no, r.locked_at, r.team_points "
+                        + "FROM team_roster r "
+                        + "INNER JOIN (SELECT race_id, team_id, MAX(version_no) AS max_version "
+                        + "FROM team_roster WHERE race_id = ? GROUP BY team_id) latest "
+                        + "ON r.race_id = latest.race_id AND r.team_id = latest.team_id "
+                        + "AND r.version_no = latest.max_version ORDER BY r.team_id",
+                (org.springframework.jdbc.core.RowCallbackHandler) rs -> result.add(new TeamRosterRow(
+                        rs.getString("race_id"),
+                        rs.getString("team_id"),
+                        rs.getInt("version_no"),
+                        rs.getLong("locked_at"),
+                        rs.getInt("team_points"),
+                        List.of())),
+                raceId);
+        for (int i = 0; i < result.size(); i++) {
+            TeamRosterRow header = result.get(i);
+            List<TeamRosterMemberRow> members = jdbcTemplate.query(
+                    "SELECT race_id, team_id, version_no, bib, rank_no, entry_status, finish_time_ms, "
+                            + "penalty_ms, total_time_ms, member_points, display_order "
+                            + "FROM team_roster_member WHERE race_id = ? AND team_id = ? AND version_no = ? "
+                            + "ORDER BY display_order",
+                    TEAM_ROSTER_MEMBER_ROW_MAPPER,
+                    header.raceId(), header.teamId(), header.versionNo());
+            result.set(i, new TeamRosterRow(header.raceId(), header.teamId(), header.versionNo(),
+                    header.lockedAt(), header.teamPoints(), members));
+        }
+        return result;
+    }
+
+    /** 原子写入一个名单版本头及其全部固化成员。 */
+    public void insertRoster(TeamRosterRow roster) {
+        jdbcTemplate.update(
+                "INSERT INTO team_roster (race_id, team_id, version_no, locked_at, team_points) "
+                        + "VALUES (?, ?, ?, ?, ?)",
+                roster.raceId(), roster.teamId(), roster.versionNo(),
+                roster.lockedAt(), roster.teamPoints());
+        jdbcTemplate.batchUpdate(
+                "INSERT INTO team_roster_member (race_id, team_id, version_no, bib, rank_no, entry_status, "
+                        + "finish_time_ms, penalty_ms, total_time_ms, member_points, display_order) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                roster.members(),
+                roster.members().size(),
+                (ps, member) -> {
+                    ps.setString(1, member.raceId());
+                    ps.setString(2, member.teamId());
+                    ps.setInt(3, member.versionNo());
+                    ps.setString(4, member.bib());
+                    ps.setObject(5, member.rankNo());
+                    ps.setString(6, member.entryStatus().name());
+                    ps.setObject(7, member.finishTimeMs());
+                    ps.setLong(8, member.penaltyMs());
+                    ps.setObject(9, member.totalTimeMs());
+                    ps.setInt(10, member.memberPoints());
+                    ps.setInt(11, member.displayOrder());
+                });
+    }
+
+    /** 查询赛事下全部成员归属，按参赛号字典序。 */
+    public List<TeamMembershipRow> findMemberships(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT race_id, bib, team_id, first_version_no, locked_at, "
+                        + "effective_session, withdrawal_reason, withdrawn_at "
+                        + "FROM team_membership WHERE race_id = ? ORDER BY bib",
+                TEAM_MEMBERSHIP_ROW_MAPPER, raceId);
+    }
+
+    /** 按赛事与参赛号查询成员归属。 */
+    public Optional<TeamMembershipRow> findMembership(String raceId, String bib) {
+        return jdbcTemplate
+                .query("SELECT race_id, bib, team_id, first_version_no, locked_at, "
+                                + "effective_session, withdrawal_reason, withdrawn_at "
+                                + "FROM team_membership WHERE race_id = ? AND bib = ?",
+                        TEAM_MEMBERSHIP_ROW_MAPPER, raceId, bib)
+                .stream()
+                .findFirst();
+    }
+
+    /** 新增成员归属（成员首次被锁定入队）；(race_id,bib) 唯一约束兜底跨队竞争。 */
+    public void insertMembership(TeamMembershipRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO team_membership (race_id, bib, team_id, first_version_no, locked_at, "
+                        + "effective_session, withdrawal_reason, withdrawn_at) "
+                        + "VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL)",
+                row.raceId(), row.bib(), row.teamId(), row.firstVersionNo(), row.lockedAt());
+    }
+
+    /**
+     * 登记退赛：仅当成员尚未退赛时回填生效场次与原因。
+     *
+     * @return 受影响行数；0 表示成员不存在或已退赛（并发）
+     */
+    public int markMembershipWithdrawn(
+            String raceId, String bib, String effectiveSession, String reason, long now) {
+        return jdbcTemplate.update(
+                "UPDATE team_membership SET effective_session = ?, withdrawal_reason = ?, withdrawn_at = ? "
+                        + "WHERE race_id = ? AND bib = ? AND withdrawn_at IS NULL",
+                effectiveSession, reason, now, raceId, bib);
+    }
+
+    /** 原子写入封榜团队榜（先清除旧行再批量插入，正常封榜每赛事仅一次）。 */
+    public void insertTeamStandingSnapshot(String raceId, List<TeamStandingSnapshotRow> rows) {
+        jdbcTemplate.batchUpdate(
+                "INSERT INTO team_standing_snapshot (race_id, team_id, roster_version_no, team_points, "
+                        + "member_count, rank_no, display_order) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                rows,
+                Math.max(rows.size(), 1),
+                (ps, row) -> {
+                    ps.setString(1, row.raceId());
+                    ps.setString(2, row.teamId());
+                    ps.setInt(3, row.rosterVersionNo());
+                    ps.setInt(4, row.teamPoints());
+                    ps.setInt(5, row.memberCount());
+                    ps.setInt(6, row.rankNo());
+                    ps.setInt(7, row.displayOrder());
+                });
+    }
+
+    /** 查询封榜团队榜，按展示顺序；未封榜（无行）时返回空列表。 */
+    public List<TeamStandingSnapshotRow> findTeamStandingSnapshot(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT race_id, team_id, roster_version_no, team_points, member_count, rank_no, display_order "
+                        + "FROM team_standing_snapshot WHERE race_id = ? ORDER BY display_order",
+                TEAM_STANDING_SNAPSHOT_ROW_MAPPER, raceId);
+    }
+
+    private static final TeamRosterMemberRowMapper TEAM_ROSTER_MEMBER_ROW_MAPPER =
+            new TeamRosterMemberRowMapper();
+    private static final TeamMembershipRowMapper TEAM_MEMBERSHIP_ROW_MAPPER =
+            new TeamMembershipRowMapper();
+    private static final TeamStandingSnapshotRowMapper TEAM_STANDING_SNAPSHOT_ROW_MAPPER =
+            new TeamStandingSnapshotRowMapper();
+
+    private static final class TeamRosterMemberRowMapper implements RowMapper<TeamRosterMemberRow> {
+        @Override
+        public TeamRosterMemberRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new TeamRosterMemberRow(
+                    rs.getString("race_id"),
+                    rs.getString("team_id"),
+                    rs.getInt("version_no"),
+                    rs.getString("bib"),
+                    (Integer) rs.getObject("rank_no"),
+                    EntryStatus.valueOf(rs.getString("entry_status")),
+                    (Long) rs.getObject("finish_time_ms"),
+                    rs.getLong("penalty_ms"),
+                    (Long) rs.getObject("total_time_ms"),
+                    rs.getInt("member_points"),
+                    rs.getInt("display_order"));
+        }
+    }
+
+    private static final class TeamMembershipRowMapper implements RowMapper<TeamMembershipRow> {
+        @Override
+        public TeamMembershipRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new TeamMembershipRow(
+                    rs.getString("race_id"),
+                    rs.getString("bib"),
+                    rs.getString("team_id"),
+                    rs.getInt("first_version_no"),
+                    rs.getLong("locked_at"),
+                    rs.getString("effective_session"),
+                    rs.getString("withdrawal_reason"),
+                    (Long) rs.getObject("withdrawn_at"));
+        }
+    }
+
+    private static final class TeamStandingSnapshotRowMapper
+            implements RowMapper<TeamStandingSnapshotRow> {
+        @Override
+        public TeamStandingSnapshotRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new TeamStandingSnapshotRow(
+                    rs.getString("race_id"),
+                    rs.getString("team_id"),
+                    rs.getInt("roster_version_no"),
+                    rs.getInt("team_points"),
+                    rs.getInt("member_count"),
+                    rs.getInt("rank_no"),
+                    rs.getInt("display_order"));
+        }
+    }
+
 
     private static final class RaceRowMapper implements RowMapper<RaceRow> {
         @Override

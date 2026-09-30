@@ -113,6 +113,61 @@ public class RaceController {
         return raceService.getMissingCheckpoints(raceId);
     }
 
+    /** 封榜前锁定团队的一个名单版本。 */
+    @PostMapping("/{raceId}/teams/{teamId}/rosters")
+    public ResponseEntity<Object> lockRoster(
+            @PathVariable String raceId,
+            @PathVariable String teamId,
+            @Valid @RequestBody LockRosterRequest request) {
+        return toResponse(raceService.lockRoster(raceId, teamId, request));
+    }
+
+    /** 登记团队成员退赛（生效场次与原因，不删名单成员）。 */
+    @PostMapping("/{raceId}/teams/{teamId}/withdrawals")
+    public ResponseEntity<Object> withdrawRosterMember(
+            @PathVariable String raceId,
+            @PathVariable String teamId,
+            @Valid @RequestBody WithdrawRosterMemberRequest request) {
+        return toResponse(raceService.withdrawRosterMember(raceId, teamId, request));
+    }
+
+    /** 查询团队当前名单（最新锁定版本叠加退赛状态）。 */
+    @GetMapping("/{raceId}/teams/{teamId}/roster")
+    public CurrentRosterResponse getCurrentRoster(
+            @PathVariable String raceId,
+            @PathVariable String teamId) {
+        return raceService.getCurrentRoster(raceId, teamId);
+    }
+
+    /** 查询团队指定的已锁定名单版本（只读固化快照）。 */
+    @GetMapping("/{raceId}/teams/{teamId}/rosters/{versionNo}")
+    public TeamRosterResponse getRosterVersion(
+            @PathVariable String raceId,
+            @PathVariable String teamId,
+            @PathVariable int versionNo) {
+        return raceService.getRosterVersion(raceId, teamId, versionNo);
+    }
+
+    /** 查询团队全部已锁定名单版本头（版本号升序）。 */
+    @GetMapping("/{raceId}/teams/{teamId}/rosters")
+    public java.util.List<TeamRosterResponse> getRosterVersions(
+            @PathVariable String raceId,
+            @PathVariable String teamId) {
+        return raceService.getRosterVersions(raceId, teamId);
+    }
+
+    /** 查询团队成绩榜（OPEN 实时；SEALED 返回封榜只读团队榜）。 */
+    @GetMapping("/{raceId}/team-results")
+    public TeamStandingsResponse getTeamResults(@PathVariable String raceId) {
+        return raceService.getTeamResults(raceId);
+    }
+
+    /** 查询封榜团队榜只读快照。 */
+    @GetMapping("/{raceId}/team-snapshot")
+    public TeamStandingsResponse getTeamSnapshot(@PathVariable String raceId) {
+        return raceService.getTeamSnapshot(raceId);
+    }
+
     private ResponseEntity<Object> toResponse(ServiceResult result) {
         return ResponseEntity.status(result.status()).body(result.body());
     }

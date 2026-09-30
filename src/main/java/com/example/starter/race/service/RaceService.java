@@ -3,6 +3,8 @@ package com.example.starter.race.service;
 import com.example.starter.race.api.AddPenaltyRequest;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
 import com.example.starter.race.api.CreateRaceRequest;
+import com.example.starter.race.api.CurrentRosterResponse;
+import com.example.starter.race.api.LockRosterRequest;
 import com.example.starter.race.api.RegisterRunnerRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
@@ -11,6 +13,9 @@ import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.api.SubmitTimingRequest;
+import com.example.starter.race.api.TeamRosterResponse;
+import com.example.starter.race.api.TeamStandingsResponse;
+import com.example.starter.race.api.WithdrawRosterMemberRequest;
 
 /**
  * 赛事成绩封榜应用服务；每个写方法在单个数据库事务内完成
@@ -59,4 +64,33 @@ public interface RaceService {
 
     /** 查询赛事全部选手缺失检查点汇总，按参赛号与检查点顺序稳定返回；只读。 */
     MissingCheckpointsResponse getMissingCheckpoints(String raceId);
+
+    /**
+     * 封榜前锁定团队的一个名单版本：成员成绩归属在锁定时刻固化，
+     * 同一赛事内成员不得跨队（含同单重复），整单校验失败不生成半份名单。
+     * 成员已属其它团队或同 requestId 换名单重放均返回409。
+     */
+    ServiceResult lockRoster(String raceId, String teamId, LockRosterRequest request);
+
+    /**
+     * 记录成员退赛（具体生效场次与原因），不删除任何已锁定名单行；
+     * 退赛只影响未封榜的后续计分，已锁定版本与已封榜团队积分不重算。
+     */
+    ServiceResult withdrawRosterMember(
+            String raceId, String teamId, WithdrawRosterMemberRequest request);
+
+    /** 查询团队当前名单（最新锁定版本叠加退赛状态）；从未锁定时版本号为0、成员为空。 */
+    CurrentRosterResponse getCurrentRoster(String raceId, String teamId);
+
+    /** 查询团队指定的已锁定名单版本（只读固化快照）；不存在为404。 */
+    TeamRosterResponse getRosterVersion(String raceId, String teamId, int versionNo);
+
+    /** 查询团队全部已锁定名单版本头（版本号升序），用于区分不同历史版本。 */
+    java.util.List<TeamRosterResponse> getRosterVersions(String raceId, String teamId);
+
+    /** 查询团队成绩榜（OPEN 实时汇总剔除退赛成员；SEALED 返回封榜只读团队榜）。 */
+    TeamStandingsResponse getTeamResults(String raceId);
+
+    /** 查询封榜团队榜只读快照；未封榜为404。 */
+    TeamStandingsResponse getTeamSnapshot(String raceId);
 }
