@@ -1,0 +1,12 @@
+spring:
+  datasource:
+    # 测试独立命名的 H2 内存库，MODE=MySQL；DB_CLOSE_DELAY=-1 仅在本 JVM、连接存活期保留
+    url: jdbc:h2:mem:filmrestoration-test;MODE=MySQL;DB_CLOSE_DELAY=-1;DATABASE_TO_LOWER=TRUE
+    username: sa
+    password:
+  sql:
+    init:
+      mode: always
+      encoding: UTF-8
+  jackson:
+    time-zone: Asia/Shanghai
