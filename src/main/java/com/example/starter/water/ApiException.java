@@ -40,4 +40,9 @@ public class ApiException extends RuntimeException {
     public static ApiException quotaExceeded(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "QUOTA_EXCEEDED", message);
     }
+
+    /** 422：紧急储备业务规则不满足（非紧急用途、储备不足、重复角色确认、归还/核销超量等）。 */
+    public static ApiException unprocessable(String code, String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, code, message);
+    }
 }
