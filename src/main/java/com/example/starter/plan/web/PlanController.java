@@ -1,6 +1,8 @@
 package com.example.starter.plan.web;
 
 import com.example.starter.plan.service.PlanService;
+import com.example.starter.plan.service.PlatformService;
+import com.example.starter.plan.web.dto.CandidatePlatformView;
 import com.example.starter.plan.web.dto.CreatePlanRequest;
 import com.example.starter.plan.web.dto.PlanActionRequest;
 import com.example.starter.plan.web.dto.PlanResponse;
@@ -37,9 +39,11 @@ import org.springframework.web.bind.annotation.RestController;
 public class PlanController {
 
     private final PlanService service;
+    private final PlatformService platformService;
 
-    public PlanController(PlanService service) {
+    public PlanController(PlanService service, PlatformService platformService) {
         this.service = service;
+        this.platformService = platformService;
     }
 
     /**
@@ -112,5 +116,14 @@ public class PlanController {
             @RequestParam @NotNull @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date,
             @RequestParam @NotBlank String sectionId) {
         return service.getPublishedSlots(date, sectionId);
+    }
+
+    /**
+     * 调度员查询某草稿计划的候选站台：对所有站台当前有效能力评估长度/制式/无障碍
+     * 与申请到发窗口占用情况，available=true 的站台可直接用于发布。
+     */
+    @GetMapping("/plans/{scheduleKey}/candidate-platforms")
+    public List<CandidatePlatformView> getCandidatePlatforms(@PathVariable String scheduleKey) {
+        return platformService.evaluateCandidates(scheduleKey);
     }
 }
