@@ -16,6 +16,8 @@ import com.example.starter.maintenance.api.dto.RegisterEquipmentRequest;
 import com.example.starter.maintenance.api.dto.ReviseReadingRequest;
 import com.example.starter.maintenance.api.dto.RevisionView;
 import com.example.starter.maintenance.api.dto.StatusResponse;
+import com.example.starter.maintenance.api.dto.WitnessReadingRequest;
+import com.example.starter.maintenance.api.dto.WitnessResponse;
 
 /**
  * 设备工时保养外观服务：委托事务服务执行；并发下唯一键冲突（事务已回滚）时，
@@ -33,7 +35,8 @@ public class EquipmentService {
     }
 
     public EquipmentResponse register(RegisterEquipmentRequest req) {
-        String fingerprint = req.equipmentId() + "|" + req.maintenancePeriodMinutes();
+        String fingerprint = req.equipmentId() + "|" + req.maintenancePeriodMinutes()
+                + "|" + req.witnessThresholdMinutes();
         return recoverDuplicateKey(req.requestId(), "REGISTER_EQUIPMENT", fingerprint,
                 EquipmentResponse.class, () -> txService.register(req));
     }
@@ -44,6 +47,10 @@ public class EquipmentService {
 
     public ReadingResponse reviseReading(String equipmentId, String readingId, ReviseReadingRequest req) {
         return txService.reviseReading(equipmentId, readingId, req);
+    }
+
+    public ReadingResponse witnessReading(String equipmentId, String readingId, WitnessReadingRequest req) {
+        return txService.witnessReading(equipmentId, readingId, req);
     }
 
     public MaintenanceResponse completeMaintenance(String equipmentId, CompleteMaintenanceRequest req) {
@@ -60,6 +67,14 @@ public class EquipmentService {
 
     public List<RevisionView> listRevisions(String equipmentId, String readingId) {
         return txService.listRevisions(equipmentId, readingId);
+    }
+
+    public List<WitnessResponse> listWitnesses(String equipmentId) {
+        return txService.listWitnesses(equipmentId);
+    }
+
+    public WitnessResponse getWitness(String equipmentId, String readingId) {
+        return txService.getWitness(equipmentId, readingId);
     }
 
     public List<MaintenanceResponse> listMaintenances(String equipmentId) {

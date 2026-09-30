@@ -40,13 +40,32 @@ public class IdempotencyService {
      */
     public <T> T execute(String requestId, String operation, String fingerprint,
                          Class<T> type, Supplier<T> action) {
+        return execute(requestId, operation, fingerprint, type, action, null);
+    }
+
+    /**
+     * 带自定义重放映射的幂等执行：同键同参命中已存记录时，默认原样反序列化原响应，
+     * 调用方可通过 replayOverride 按当前业务状态重放（例如大幅修订重放时区分待确认/已生效）。
+     */
+    public <T> T execute(String requestId, String operation, String fingerprint,
+                         Class<T> type, Supplier<T> action,
+                         java.util.function.Function<IdempotencyRow, T> replayOverride) {
         Optional<IdempotencyRow> existing = repository.findIdempotency(requestId);
         if (existing.isPresent()) {
-            return replay(existing.get(), operation, fingerprint, type);
+            IdempotencyRow row = existing.get();
+            if (!row.operation().equals(operation) || !row.fingerprint().equals(fingerprint)) {
+                throw ApiException.conflict("REQUEST_ID_CONFLICT", "requestId 已被不同参数的请求使用");
+            }
+            return replayOverride != null ? replayOverride.apply(row) : readJson(row.responseBody(), type);
         }
         T result = action.get();
         repository.insertIdempotency(requestId, operation, fingerprint, writeJson(result), clock.instant());
         return result;
+    }
+
+    /** 将已存的原成功响应报文反序列化为指定类型。 */
+    public <T> T parseStoredBody(IdempotencyRow row, Class<T> type) {
+        return readJson(row.responseBody(), type);
     }
 
     /** 事务外重放：用于并发唯一键冲突后的补偿查询。 */

@@ -46,6 +46,7 @@ class EquipmentConcurrencyTests {
     @BeforeEach
     void setUp() {
         jdbc.update("DELETE FROM idempotency_request");
+        jdbc.update("DELETE FROM reading_witness");
         jdbc.update("DELETE FROM maintenance");
         jdbc.update("DELETE FROM reading_revision");
         jdbc.update("DELETE FROM reading");
@@ -62,7 +63,8 @@ class EquipmentConcurrencyTests {
         mockMvc.perform(post("/api/equipment")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"requestId":"reg-%s","equipmentId":"%s","maintenancePeriodMinutes":%d}
+                                {"requestId":"reg-%s","equipmentId":"%s","maintenancePeriodMinutes":%d,
+                                 "witnessThresholdMinutes":1000000}
                                 """.formatted(equipmentId, equipmentId, periodMinutes)))
                 .andExpect(status().isCreated());
     }
@@ -128,7 +130,8 @@ class EquipmentConcurrencyTests {
         Future<MvcResult> reviseFuture = executor.submit(() -> {
             gate.await(5, TimeUnit.SECONDS);
             return postJson("/api/equipment/eq-race/readings/r1/revisions", """
-                    {"requestId":"race-revise","expectedVersion":3,"cumulativeMinutes":150}
+                    {"requestId":"race-revise","expectedVersion":3,"cumulativeMinutes":150,
+                     "submittedBy":"alice"}
                     """);
         });
         Future<MvcResult> maintenanceFuture = executor.submit(() -> {
@@ -180,10 +183,69 @@ class EquipmentConcurrencyTests {
         }
     }
 
+    /**
+     * 新修订与见证并发：设备行锁串行化，见证只能确认申请中的指定版本；
+     * 新修订无论先后都不得让旧见证批准新读数。最终读数恰有一个版本生效，数据一致。
+     */
+    @Test
+    void concurrentReviseVsWitness_witnessOnlyConfirmsSpecifiedVersion() throws Exception {
+        mockMvc.perform(post("/api/equipment")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"requestId":"reg-eq-rw","equipmentId":"eq-rw",
+                                 "maintenancePeriodMinutes":100000,"witnessThresholdMinutes":100}
+                                """))
+                .andExpect(status().isCreated());
+        postJson("/api/equipment/eq-rw/readings", """
+                {"requestId":"rw-add","expectedVersion":1,"readingId":"r1",
+                 "sampledAt":"2026-01-01T10:00:00Z","cumulativeMinutes":1000}
+                """);
+        postJson("/api/equipment/eq-rw/readings/r1/revisions", """
+                {"requestId":"rw-rev-1","expectedVersion":2,"cumulativeMinutes":1200,
+                 "submittedBy":"alice"}
+                """);
+
+        CountDownLatch gate = new CountDownLatch(1);
+        Future<MvcResult> witnessFuture = executor.submit(() -> {
+            gate.await(5, TimeUnit.SECONDS);
+            return postJson("/api/equipment/eq-rw/readings/r1/witness", """
+                    {"requestId":"rw-wit","expectedVersion":3,"expectedRevisionNo":2,
+                     "cumulativeMinutes":1200,"witnessedBy":"bob"}
+                    """);
+        });
+        // 并发新修订（阈值内 1210）：有待确认时被 422 拦截；若见证先生效，则因期望版本过旧 409
+        Future<MvcResult> reviseFuture = executor.submit(() -> {
+            gate.await(5, TimeUnit.SECONDS);
+            return postJson("/api/equipment/eq-rw/readings/r1/revisions", """
+                    {"requestId":"rw-rev-2","expectedVersion":3,"cumulativeMinutes":1210,
+                     "submittedBy":"alice"}
+                    """);
+        });
+        gate.countDown();
+
+        int witnessStatus = witnessFuture.get(15, TimeUnit.SECONDS).getResponse().getStatus();
+        int reviseStatus = reviseFuture.get(15, TimeUnit.SECONDS).getResponse().getStatus();
+
+        // 见证必成功（指定版本 2/值 1200 始终与申请一致）；新修订必失败（422 待确认占用 或 409 版本冲突）
+        assertEquals(201, witnessStatus, "见证应确认其指定的待确认版本");
+        assertTrue(reviseStatus == 422 || reviseStatus == 409,
+                "并发新修订不得干扰见证指定版本，实际：" + reviseStatus);
+
+        // 最终读数确定为见证生效值 1200、修订号 2，待确认行清空、版本只到 4
+        mockMvc.perform(get("/api/equipment/eq-rw/status"))
+                .andExpect(jsonPath("$.version").value(4))
+                .andExpect(jsonPath("$.latestCumulativeMinutes").value(1200));
+        mockMvc.perform(get("/api/equipment/eq-rw/witnesses"))
+                .andExpect(jsonPath("$.length()").value(0));
+        Integer revisionNo = jdbc.queryForObject(
+                "SELECT revision_no FROM reading WHERE equipment_id = 'eq-rw' AND reading_id = 'r1'",
+                Integer.class);
+        assertEquals(2, revisionNo, "旧见证不得批准新读数，新修订也不得越过待确认直接生效");
+    }
+
     /** 并发不同 requestId 新增不同读数：串行化后均按版本推进，无丢失更新。 */
     @Test
-    void concurrentDistinctWrites_noLostUpdate() throws Exception {
-        register("eq-par", 10000);
+    void concurrentDistinctWrites_noLostUpdate() throws Exception {        register("eq-par", 10000);
         int threads = 6;
         CountDownLatch gate = new CountDownLatch(1);
         List<Future<MvcResult>> futures = new ArrayList<>();
@@ -219,5 +281,119 @@ class EquipmentConcurrencyTests {
                 .andExpect(jsonPath("$.length()").value(threads));
         mockMvc.perform(get("/api/equipment/eq-par/status"))
                 .andExpect(jsonPath("$.version").value(1 + threads));
+    }
+
+    /**
+     * 并发两个见证（同一待确认版本、不同 requestId/见证人）：设备行锁串行化，
+     * 恰有一个见证生效（201），另一个因版本已前进返回 409；读数只生效一次、修订历史只追加一行。
+     */
+    @Test
+    void concurrentWitnesses_onlyOneConfirmsSpecifiedVersion() throws Exception {
+        mockMvc.perform(post("/api/equipment")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"requestId":"reg-eq-wrace","equipmentId":"eq-wrace",
+                                 "maintenancePeriodMinutes":100000,"witnessThresholdMinutes":100}
+                                """))
+                .andExpect(status().isCreated());
+        postJson("/api/equipment/eq-wrace/readings", """
+                {"requestId":"wr-add","expectedVersion":1,"readingId":"r1",
+                 "sampledAt":"2026-01-01T10:00:00Z","cumulativeMinutes":1000}
+                """);
+        // 大幅修订 1200 进入待确认（版本 2 → 3，待生效修订号 2）
+        postJson("/api/equipment/eq-wrace/readings/r1/revisions", """
+                {"requestId":"wr-rev","expectedVersion":2,"cumulativeMinutes":1200,
+                 "submittedBy":"alice"}
+                """);
+
+        CountDownLatch gate = new CountDownLatch(1);
+        String witnessBody = """
+                {"requestId":"%s","expectedVersion":3,"expectedRevisionNo":2,
+                 "cumulativeMinutes":1200,"witnessedBy":"%s"}
+                """;
+        Future<MvcResult> bob = executor.submit(() -> {
+            gate.await(5, TimeUnit.SECONDS);
+            return postJson("/api/equipment/eq-wrace/readings/r1/witness",
+                    witnessBody.formatted("wr-wit-bob", "bob"));
+        });
+        Future<MvcResult> carol = executor.submit(() -> {
+            gate.await(5, TimeUnit.SECONDS);
+            return postJson("/api/equipment/eq-wrace/readings/r1/witness",
+                    witnessBody.formatted("wr-wit-carol", "carol"));
+        });
+        gate.countDown();
+
+        int bobStatus = bob.get(15, TimeUnit.SECONDS).getResponse().getStatus();
+        int carolStatus = carol.get(15, TimeUnit.SECONDS).getResponse().getStatus();
+        assertTrue(
+                (bobStatus == 201 && carolStatus == 409)
+                        || (bobStatus == 409 && carolStatus == 201),
+                "并发见证应恰有一个生效，实际：bob=" + bobStatus + ", carol=" + carolStatus);
+
+        // 版本只前进一次（3 → 4），待确认申请已删除，修订历史恰为 2 行
+        mockMvc.perform(get("/api/equipment/eq-wrace/status"))
+                .andExpect(jsonPath("$.version").value(4))
+                .andExpect(jsonPath("$.latestCumulativeMinutes").value(1200));
+        mockMvc.perform(get("/api/equipment/eq-wrace/witnesses"))
+                .andExpect(jsonPath("$.length()").value(0));
+        mockMvc.perform(get("/api/equipment/eq-wrace/readings/r1/revisions"))
+                .andExpect(jsonPath("$.length()").value(2))
+                .andExpect(jsonPath("$[1].revisionNo").value(2))
+                .andExpect(jsonPath("$[1].cumulativeMinutes").value(1200));
+        Integer pendingCount = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM reading_witness WHERE equipment_id = 'eq-wrace'", Integer.class);
+        assertEquals(0, pendingCount, "见证生效后待确认行必须删除");
+    }
+
+    /**
+     * 见证与完成保养并发（同一期望版本）：待确认读数不得放行，故保养必失败（422），
+     * 见证不受影响地生效（201）；最终无保养记录、读数按待确认值生效。
+     */
+    @Test
+    void concurrentWitnessVsMaintenance_witnessWinsAndMaintenanceRejected() throws Exception {
+        mockMvc.perform(post("/api/equipment")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"requestId":"reg-eq-wm","equipmentId":"eq-wm",
+                                 "maintenancePeriodMinutes":100000,"witnessThresholdMinutes":100}
+                                """))
+                .andExpect(status().isCreated());
+        postJson("/api/equipment/eq-wm/readings", """
+                {"requestId":"wm-add","expectedVersion":1,"readingId":"r1",
+                 "sampledAt":"2026-01-01T10:00:00Z","cumulativeMinutes":1000}
+                """);
+        postJson("/api/equipment/eq-wm/readings/r1/revisions", """
+                {"requestId":"wm-rev","expectedVersion":2,"cumulativeMinutes":1200,
+                 "submittedBy":"alice"}
+                """);
+
+        CountDownLatch gate = new CountDownLatch(1);
+        Future<MvcResult> witnessFuture = executor.submit(() -> {
+            gate.await(5, TimeUnit.SECONDS);
+            return postJson("/api/equipment/eq-wm/readings/r1/witness", """
+                    {"requestId":"wm-wit","expectedVersion":3,"expectedRevisionNo":2,
+                     "cumulativeMinutes":1200,"witnessedBy":"bob"}
+                    """);
+        });
+        Future<MvcResult> maintenanceFuture = executor.submit(() -> {
+            gate.await(5, TimeUnit.SECONDS);
+            return postJson("/api/equipment/eq-wm/maintenances", """
+                    {"requestId":"wm-mnt","expectedVersion":3,"readingId":"r1","anchorRevisionNo":1}
+                    """);
+        });
+        gate.countDown();
+
+        int witnessStatus = witnessFuture.get(15, TimeUnit.SECONDS).getResponse().getStatus();
+        int maintenanceStatus = maintenanceFuture.get(15, TimeUnit.SECONDS).getResponse().getStatus();
+        assertEquals(201, witnessStatus, "待确认读数见证应正常生效");
+        assertTrue(maintenanceStatus == 422 || maintenanceStatus == 409,
+                "待确认读数不得触发保养放行（先到 422；见证先到则锚点修订号不符 409），实际："
+                        + maintenanceStatus);
+
+        mockMvc.perform(get("/api/equipment/eq-wm/status"))
+                .andExpect(jsonPath("$.version").value(4))
+                .andExpect(jsonPath("$.latestCumulativeMinutes").value(1200));
+        mockMvc.perform(get("/api/equipment/eq-wm/maintenances"))
+                .andExpect(jsonPath("$.length()").value(0));
     }
 }

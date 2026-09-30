@@ -18,10 +18,13 @@ import org.springframework.test.web.servlet.MvcResult;
 
 /**
  * 设备工时保养 API 主流程与失败分支测试（真实 H2 内存库，MySQL 兼容模式）。
+ * 既有用例统一登记较大的见证阈值，使阈值内修订保持即时生效的原行为。
  */
 @SpringBootTest
 @AutoConfigureMockMvc
 class EquipmentApiTests {
+
+    private static final long LARGE_THRESHOLD = 1_000_000L;
 
     @Autowired
     private MockMvc mockMvc;
@@ -32,6 +35,7 @@ class EquipmentApiTests {
     @BeforeEach
     void cleanTables() {
         jdbc.update("DELETE FROM idempotency_request");
+        jdbc.update("DELETE FROM reading_witness");
         jdbc.update("DELETE FROM maintenance");
         jdbc.update("DELETE FROM reading_revision");
         jdbc.update("DELETE FROM reading");
@@ -44,11 +48,16 @@ class EquipmentApiTests {
     }
 
     private void register(String equipmentId, long periodMinutes) throws Exception {
+        register(equipmentId, periodMinutes, LARGE_THRESHOLD);
+    }
+
+    private void register(String equipmentId, long periodMinutes, long thresholdMinutes) throws Exception {
         mockMvc.perform(post("/api/equipment")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"requestId":"reg-%s","equipmentId":"%s","maintenancePeriodMinutes":%d}
-                                """.formatted(equipmentId, equipmentId, periodMinutes)))
+                                {"requestId":"reg-%s","equipmentId":"%s","maintenancePeriodMinutes":%d,
+                                 "witnessThresholdMinutes":%d}
+                                """.formatted(equipmentId, equipmentId, periodMinutes, thresholdMinutes)))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.version").value(1));
     }
@@ -147,7 +156,8 @@ class EquipmentApiTests {
         mockMvc.perform(post("/api/equipment")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"requestId":"reg-dup-2","equipmentId":"eq-dup","maintenancePeriodMinutes":200}
+                                {"requestId":"reg-dup-2","equipmentId":"eq-dup","maintenancePeriodMinutes":200,
+                                 "witnessThresholdMinutes":10}
                                 """))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("EQUIPMENT_EXISTS"));
@@ -159,7 +169,8 @@ class EquipmentApiTests {
         mockMvc.perform(post("/api/equipment")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"requestId":"reg-bad-1","equipmentId":"eq-bad","maintenancePeriodMinutes":0}
+                                {"requestId":"reg-bad-1","equipmentId":"eq-bad","maintenancePeriodMinutes":0,
+                                 "witnessThresholdMinutes":10}
                                 """))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.code").value("VALIDATION_FAILED"));
@@ -170,6 +181,15 @@ class EquipmentApiTests {
                                 {"equipmentId":"eq-bad","maintenancePeriodMinutes":100}
                                 """))
                 .andExpect(status().isBadRequest());
+        // 见证阈值必须为正整数
+        mockMvc.perform(post("/api/equipment")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"requestId":"reg-bad-2","equipmentId":"eq-bad2","maintenancePeriodMinutes":100,
+                                 "witnessThresholdMinutes":0}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("VALIDATION_FAILED"));
     }
 
     // ---------- 版本校验 ----------
@@ -186,7 +206,8 @@ class EquipmentApiTests {
         mockMvc.perform(post("/api/equipment/eq-ver/readings/r1/revisions")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"requestId":"rev-v1","expectedVersion":1,"cumulativeMinutes":20}
+                                {"requestId":"rev-v1","expectedVersion":1,"cumulativeMinutes":20,
+                                 "submittedBy":"alice"}
                                 """))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("VERSION_CONFLICT"));
@@ -235,17 +256,19 @@ class EquipmentApiTests {
         addReading("eq-rev", "rv1", 1, "r1", "2026-01-01T10:00:00Z", 100, 201);
         addReading("eq-rev", "rv2", 2, "r2", "2026-01-01T11:00:00Z", 200, 201);
 
-        // 修订只改累计分钟，不改采样时刻；修订号 +1
+        // 修订只改累计分钟，不改采样时刻；修订号 +1（差额在见证阈值内，即时生效）
         mockMvc.perform(post("/api/equipment/eq-rev/readings/r1/revisions")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"requestId":"rv3","expectedVersion":3,"cumulativeMinutes":150}
+                                {"requestId":"rv3","expectedVersion":3,"cumulativeMinutes":150,
+                                 "submittedBy":"alice"}
                                 """))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.sampledAt").value("2026-01-01T10:00:00Z"))
                 .andExpect(jsonPath("$.cumulativeMinutes").value(150))
                 .andExpect(jsonPath("$.revisionNo").value(2))
-                .andExpect(jsonPath("$.equipmentVersion").value(4));
+                .andExpect(jsonPath("$.equipmentVersion").value(4))
+                .andExpect(jsonPath("$.pendingCumulativeMinutes").value(org.hamcrest.Matchers.nullValue()));
 
         // 历史保留：修订 1（初始值 100）与修订 2（150）
         mockMvc.perform(get("/api/equipment/eq-rev/readings/r1/revisions"))
@@ -259,14 +282,16 @@ class EquipmentApiTests {
         mockMvc.perform(post("/api/equipment/eq-rev/readings/r1/revisions")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"requestId":"rv4","expectedVersion":4,"cumulativeMinutes":250}
+                                {"requestId":"rv4","expectedVersion":4,"cumulativeMinutes":250,
+                                 "submittedBy":"alice"}
                                 """))
                 .andExpect(status().isUnprocessableEntity())
                 .andExpect(jsonPath("$.code").value("READING_ORDER_VIOLATION"));
         mockMvc.perform(post("/api/equipment/eq-rev/readings/r2/revisions")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"requestId":"rv5","expectedVersion":4,"cumulativeMinutes":50}
+                                {"requestId":"rv5","expectedVersion":4,"cumulativeMinutes":50,
+                                 "submittedBy":"alice"}
                                 """))
                 .andExpect(status().isUnprocessableEntity());
     }
@@ -317,16 +342,18 @@ class EquipmentApiTests {
         mockMvc.perform(post("/api/equipment/eq-mnt/readings/r1/revisions")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"requestId":"mn-3","expectedVersion":4,"cumulativeMinutes":120}
+                                {"requestId":"mn-3","expectedVersion":4,"cumulativeMinutes":120,
+                                 "submittedBy":"alice"}
                                 """))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("READING_ANCHORED"));
 
-        // 非锚点读数可正常修订，随后以其新修订号完成第二次保养
+        // 非锚点读数可正常修订（阈值内即时生效），随后以其新修订号完成第二次保养
         mockMvc.perform(post("/api/equipment/eq-mnt/readings/r2/revisions")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"requestId":"mn-4","expectedVersion":4,"cumulativeMinutes":210}
+                                {"requestId":"mn-4","expectedVersion":4,"cumulativeMinutes":210,
+                                 "submittedBy":"alice"}
                                 """))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.revisionNo").value(2));
@@ -409,10 +436,15 @@ class EquipmentApiTests {
         mockMvc.perform(post("/api/equipment/eq-nf/readings/nope/revisions")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"requestId":"nf-2","expectedVersion":1,"cumulativeMinutes":10}
+                                {"requestId":"nf-2","expectedVersion":1,"cumulativeMinutes":10,
+                                 "submittedBy":"alice"}
                                 """))
                 .andExpect(status().isNotFound());
         mockMvc.perform(get("/api/equipment/eq-nf/readings/nope/revisions"))
                 .andExpect(status().isNotFound());
+        // 无待确认修订时见证查询 404
+        mockMvc.perform(get("/api/equipment/eq-nf/readings/nope/witness"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.code").value("WITNESS_NOT_FOUND"));
     }
 }
