@@ -1,10 +1,14 @@
 package com.example.starter.plan.web;
 
+import com.example.starter.plan.service.CrewService;
 import com.example.starter.plan.service.PlanService;
 import com.example.starter.plan.web.dto.CreatePlanRequest;
+import com.example.starter.plan.web.dto.CrewCheckRequest;
+import com.example.starter.plan.web.dto.CrewCheckResponse;
 import com.example.starter.plan.web.dto.PlanActionRequest;
 import com.example.starter.plan.web.dto.PlanResponse;
 import com.example.starter.plan.web.dto.PublishedSlotView;
+import com.example.starter.plan.web.dto.PublishWithCrewRequest;
 import com.example.starter.plan.web.dto.RescheduleChainResponse;
 import com.example.starter.plan.web.dto.RescheduleRequest;
 import com.example.starter.plan.web.dto.RescheduleResponse;
@@ -37,9 +41,11 @@ import org.springframework.web.bind.annotation.RestController;
 public class PlanController {
 
     private final PlanService service;
+    private final CrewService crewService;
 
-    public PlanController(PlanService service) {
+    public PlanController(PlanService service, CrewService crewService) {
         this.service = service;
+        this.crewService = crewService;
     }
 
     /**
@@ -67,6 +73,27 @@ public class PlanController {
     public PlanResponse publish(@PathVariable String scheduleKey,
                                 @Valid @RequestBody PlanActionRequest request) {
         return service.publish(scheduleKey, request.requestKey());
+    }
+
+    /**
+     * 登记乘务组并发布：按 UTC 校验每位成员的资格区间、线路等级与人员冲突；
+     * 任一不满足返回 422，整单不占时隙与乘务资源；成功后资格版本快照不可变。
+     */
+    @PostMapping("/plans/{scheduleKey}/publish-with-crew")
+    public PlanResponse publishWithCrew(@PathVariable String scheduleKey,
+                                        @Valid @RequestBody PublishWithCrewRequest request) {
+        return service.publishWithCrew(scheduleKey, request.requestKey(),
+                request.crew().stream().map(c -> c.memberKey()).toList());
+    }
+
+    /**
+     * 乘务门禁预检：逐人返回资格覆盖结果、占用窗口与冲突计划（不改状态、不占资源）。
+     */
+    @PostMapping("/plans/{scheduleKey}/crew-check")
+    public CrewCheckResponse crewCheck(@PathVariable String scheduleKey,
+                                       @Valid @RequestBody CrewCheckRequest request) {
+        return crewService.check(scheduleKey,
+                request.crew().stream().map(c -> c.memberKey()).toList());
     }
 
     /**

@@ -9,10 +9,12 @@ import com.example.starter.plan.repo.IdempotencyRepository;
 import com.example.starter.plan.repo.PlanRepository;
 import com.example.starter.plan.web.ApiException;
 import com.example.starter.plan.web.dto.CreatePlanRequest;
+import com.example.starter.plan.web.dto.CrewMemberItem;
 import com.example.starter.plan.web.dto.OccupancyRequest;
 import com.example.starter.plan.web.dto.OccupancyView;
 import com.example.starter.plan.web.dto.PlanResponse;
 import com.example.starter.plan.web.dto.PublishedSlotView;
+import com.example.starter.plan.web.dto.PublishWithCrewRequest;
 import com.example.starter.plan.web.dto.RescheduleChainItem;
 import com.example.starter.plan.web.dto.RescheduleChainResponse;
 import com.example.starter.plan.web.dto.RescheduleRequest;
@@ -60,13 +62,16 @@ public class PlanService {
 
     private final PlanRepository planRepo;
     private final IdempotencyRepository idemRepo;
+    private final CrewService crewService;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate tx;
 
     public PlanService(PlanRepository planRepo, IdempotencyRepository idemRepo,
-                       ObjectMapper objectMapper, PlatformTransactionManager txManager) {
+                       CrewService crewService, ObjectMapper objectMapper,
+                       PlatformTransactionManager txManager) {
         this.planRepo = planRepo;
         this.idemRepo = idemRepo;
+        this.crewService = crewService;
         this.objectMapper = objectMapper;
         this.tx = new TransactionTemplate(txManager);
     }
@@ -137,9 +142,28 @@ public class PlanService {
     /**
      * 发布计划：全局发布锁内原子校验本计划列车重叠与跨计划区段重叠，
      * 任一冲突则整张计划保持草稿并抛出 422（携带冲突区段与计划）。
+     *
+     * <p>不带乘务组的兼容路径：不经过乘务资格门禁，不写乘务快照。
      */
     public PlanResponse publish(String scheduleKey, String requestKey) {
-        String hash = hashAction(OP_PUBLISH, scheduleKey);
+        return publishInternal(scheduleKey, requestKey, hashAction(OP_PUBLISH, scheduleKey), null);
+    }
+
+    /**
+     * 带乘务组登记发布：时隙校验之外，按 UTC 对每位成员执行资格门禁
+     * （区间完整覆盖左闭右开行程、等级达标、无重叠计划占用）。
+     * 任一时隙或乘务校验失败均抛 422 并整体回滚，线路时隙与乘务资源都不占用；
+     * 成功后写入不可变乘务资格快照。requestKey 哈希包含乘务组名单，
+     * 同键换乘务组重放返回 409，同键同组重放返回首次成功快照。
+     */
+    public PlanResponse publishWithCrew(String scheduleKey, String requestKey,
+                                        List<String> crewKeys) {
+        return publishInternal(scheduleKey, requestKey,
+                hashPublishWithCrew(scheduleKey, crewKeys), crewKeys);
+    }
+
+    private PlanResponse publishInternal(String scheduleKey, String requestKey, String hash,
+                                         List<String> crewKeys) {
         Optional<PlanResponse> replay = replayIfPresent(OP_PUBLISH, requestKey, hash);
         if (replay.isPresent()) {
             return replay.get();
@@ -147,6 +171,12 @@ public class PlanService {
         try {
             return tx.execute(status -> {
                 planRepo.acquirePublishLock();
+                // 并发同键重放：首个事务可能已在本事务等待发布锁期间提交，
+                // 此时按幂等记录裁决（同参返回首次结果，异参 409），优先于计划状态冲突。
+                Optional<PlanResponse> committed = replayIfPresent(OP_PUBLISH, requestKey, hash);
+                if (committed.isPresent()) {
+                    return committed.get();
+                }
                 DayPlan plan = planRepo.findByKeyForUpdate(scheduleKey)
                         .orElseThrow(() -> notFound(scheduleKey));
                 if (plan.status() != PlanStatus.DRAFT) {
@@ -161,8 +191,17 @@ public class PlanService {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "存在时隙冲突，计划保持草稿", conflicts);
                 }
+                CrewService.GateResult gate = null;
+                if (crewKeys != null) {
+                    // 门禁内部对成员 ACTIVE 资格行加锁，与撤销/换发按事务提交顺序裁决
+                    gate = crewService.gateForPublish(plan, occupancies, crewKeys,
+                            List.of(plan.id()));
+                }
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(plan.id(), PlanStatus.PUBLISHED, now);
+                if (gate != null) {
+                    crewService.saveSnapshot(plan.id(), gate, now);
+                }
                 PlanResponse response = loadPlan(scheduleKey);
                 idemRepo.insert(OP_PUBLISH, requestKey, hash, toJson(response), now);
                 return response;
@@ -260,9 +299,21 @@ public class PlanService {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "新草稿存在时隙冲突，改签未生效", conflicts);
                 }
+                List<String> crewKeys = req.crew() == null || req.crew().isEmpty()
+                        ? null
+                        : req.crew().stream().map(CrewMemberItem::memberKey).toList();
+                CrewService.GateResult gate = null;
+                if (crewKeys != null) {
+                    // 乘务门禁同样排除新旧两张计划；旧计划取消后其乘务窗口自然释放
+                    gate = crewService.gateForPublish(newPlan, occupancies, crewKeys,
+                            List.of(newPlan.id(), oldPlan.id()));
+                }
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(oldPlan.id(), PlanStatus.CANCELLED, now);
                 planRepo.updateStatus(newPlan.id(), PlanStatus.PUBLISHED, now);
+                if (gate != null) {
+                    crewService.saveSnapshot(newPlan.id(), gate, now);
+                }
                 planRepo.insertRescheduleLink(oldPlan.id(), newPlan.id(), now);
                 RescheduleResponse response = new RescheduleResponse(
                         loadPlan(oldScheduleKey), loadPlan(req.newScheduleKey()));
@@ -342,7 +393,7 @@ public class PlanService {
                 .map(o -> new OccupancyView(o.trainNo(), o.sectionId(), o.startUtc(), o.endUtc()))
                 .toList();
         return new PlanResponse(plan.scheduleKey(), plan.opDate(), plan.version(),
-                plan.status().name(), views);
+                plan.status().name(), views, crewService.loadSnapshot(plan.id()));
     }
 
     private List<Occupancy> toOccupancies(long planId, List<OccupancyRequest> requests) {
@@ -499,9 +550,26 @@ public class PlanService {
         return sha256(opType + '\n' + scheduleKey);
     }
 
+    /**
+     * 带乘务组发布的请求哈希：乘务组名单（按工号排序归一化）参与摘要，
+     * 同一 requestKey 换乘务组判定 409。
+     */
+    private String hashPublishWithCrew(String scheduleKey, List<String> crewKeys) {
+        StringBuilder sb = new StringBuilder(OP_PUBLISH).append('\n').append(scheduleKey);
+        crewKeys.stream().sorted().forEach(k -> sb.append('\n').append(k));
+        return sha256(sb.toString());
+    }
+
     private String hashReschedule(String oldScheduleKey, RescheduleRequest req) {
-        return sha256(OP_RESCHEDULE + '\n' + oldScheduleKey + '\n' + req.newScheduleKey()
-                + '\n' + req.expectedOldVersion() + '\n' + req.expectedNewVersion());
+        StringBuilder sb = new StringBuilder(OP_RESCHEDULE).append('\n')
+                .append(oldScheduleKey).append('\n').append(req.newScheduleKey())
+                .append('\n').append(req.expectedOldVersion())
+                .append('\n').append(req.expectedNewVersion());
+        if (req.crew() != null) {
+            req.crew().stream().map(CrewMemberItem::memberKey).sorted()
+                    .forEach(k -> sb.append('\n').append(k));
+        }
+        return sha256(sb.toString());
     }
 
     private void appendOccupancies(StringBuilder sb, List<OccupancyRequest> occupancies) {

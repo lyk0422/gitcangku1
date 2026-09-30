@@ -4,8 +4,9 @@ import java.time.LocalDate;
 import java.util.List;
 
 /**
- * 日计划响应，含当前状态、版本与占用清单（取消后历史占用仍原样返回）。
+ * 日计划响应，含当前状态、版本、占用清单（取消后历史占用仍原样返回）
+ * 与发布时的乘务组快照（草稿为 null；发布后不可变，取消后保留）。
  */
 public record PlanResponse(String scheduleKey, LocalDate opDate, int version, String status,
-                           List<OccupancyView> occupancies) {
+                           List<OccupancyView> occupancies, CrewSnapshotView crew) {
 }
