@@ -7,9 +7,16 @@ import com.fasterxml.jackson.annotation.JsonInclude;
  *
  * @param bib          参赛号
  * @param finishTimeMs 原始完赛耗时毫秒；计时缺失为 null
+ * @param balance      当前可用余额（人民币元，非负整数，不含已冻结保证金）
  * @param createdAt    登记时间，Unix毫秒时间戳
  * @param updatedAt    最近计时修订时间，Unix毫秒时间戳
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
-public record RunnerResponse(String bib, Long finishTimeMs, long createdAt, long updatedAt) {
+public record RunnerResponse(
+        String bib,
+        Long finishTimeMs,
+        int balance,
+        long createdAt,
+        long updatedAt
+) {
 }

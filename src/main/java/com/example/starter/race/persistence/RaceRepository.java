@@ -2,7 +2,9 @@ package com.example.starter.race.persistence;
 
 import com.example.starter.race.domain.EntryStatus;
 import com.example.starter.race.domain.PenaltyType;
+import com.example.starter.race.domain.ProtestStatus;
 import com.example.starter.race.domain.RaceStatus;
+import com.example.starter.race.domain.WalletTransactionType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
@@ -30,6 +32,11 @@ public class RaceRepository {
             new CheckpointTimingRowMapper();
     private static final SnapshotCheckpointRowMapper SNAPSHOT_CHECKPOINT_ROW_MAPPER =
             new SnapshotCheckpointRowMapper();
+    private static final ProtestRowMapper PROTEST_ROW_MAPPER = new ProtestRowMapper();
+    private static final WalletTransactionRowMapper WALLET_ROW_MAPPER =
+            new WalletTransactionRowMapper();
+    private static final SnapshotProtestRowMapper SNAPSHOT_PROTEST_ROW_MAPPER =
+            new SnapshotProtestRowMapper();
 
     private final JdbcTemplate jdbcTemplate;
 
@@ -40,7 +47,7 @@ public class RaceRepository {
     /** 按ID查询赛事。 */
     public Optional<RaceRow> findRace(String raceId) {
         return jdbcTemplate
-                .query("SELECT race_id, version, status, created_at FROM race WHERE race_id = ?",
+                .query("SELECT race_id, version, status, deposit_amount, created_at FROM race WHERE race_id = ?",
                         RACE_ROW_MAPPER, raceId)
                 .stream()
                 .findFirst();
@@ -49,11 +56,11 @@ public class RaceRepository {
     /**
      * 行锁方式查询赛事：获取 race 行写锁并持有到事务提交/回滚。
      * 写操作据此与其它写者在读取任何依赖数据之前先串行化，避免 READ_COMMITTED 下
-     * “先读到旧版本、后读到他人已提交明细”造成的误判（如分段重复误报422）。
+     * “先读到旧版本、后读到他人已提交明细”造成的误判（如分段重复误报422、封榜漏看在途申诉）。
      */
     public Optional<RaceRow> findRaceForUpdate(String raceId) {
         return jdbcTemplate
-                .query("SELECT race_id, version, status, created_at FROM race WHERE race_id = ? FOR UPDATE",
+                .query("SELECT race_id, version, status, deposit_amount, created_at FROM race WHERE race_id = ? FOR UPDATE",
                         RACE_ROW_MAPPER, raceId)
                 .stream()
                 .findFirst();
@@ -62,7 +69,7 @@ public class RaceRepository {
     /** 查询赛事下全部选手，按参赛号字典序排列。 */
     public List<RunnerRow> findRunners(String raceId) {
         return jdbcTemplate.query(
-                "SELECT id, race_id, bib, finish_time_ms, created_at, updated_at "
+                "SELECT id, race_id, bib, finish_time_ms, balance, created_at, updated_at "
                         + "FROM runner WHERE race_id = ? ORDER BY bib",
                 RUNNER_ROW_MAPPER, raceId);
     }
@@ -70,8 +77,18 @@ public class RaceRepository {
     /** 按赛事与参赛号查询选手。 */
     public Optional<RunnerRow> findRunner(String raceId, String bib) {
         return jdbcTemplate
-                .query("SELECT id, race_id, bib, finish_time_ms, created_at, updated_at "
+                .query("SELECT id, race_id, bib, finish_time_ms, balance, created_at, updated_at "
                                 + "FROM runner WHERE race_id = ? AND bib = ?",
+                        RUNNER_ROW_MAPPER, raceId, bib)
+                .stream()
+                .findFirst();
+    }
+
+    /** 行锁方式查询选手：钱包扣减/退回时持有到事务结束，串行化同选手并发写。 */
+    public Optional<RunnerRow> findRunnerForUpdate(String raceId, String bib) {
+        return jdbcTemplate
+                .query("SELECT id, race_id, bib, finish_time_ms, balance, created_at, updated_at "
+                                + "FROM runner WHERE race_id = ? AND bib = ? FOR UPDATE",
                         RUNNER_ROW_MAPPER, raceId, bib)
                 .stream()
                 .findFirst();
@@ -196,6 +213,12 @@ public class RaceRepository {
                         + "FROM result_snapshot_checkpoint WHERE race_id = ? "
                         + "ORDER BY bib, position",
                 SNAPSHOT_CHECKPOINT_ROW_MAPPER, raceId);
+        List<SnapshotProtestRow> protests = jdbcTemplate.query(
+                "SELECT race_id, protest_id, bib, status, deposit_amount, reason, "
+                        + "decision_reason, created_at, decided_at, display_order "
+                        + "FROM result_snapshot_protest WHERE race_id = ? "
+                        + "ORDER BY display_order",
+                SNAPSHOT_PROTEST_ROW_MAPPER, raceId);
         // 缺失检查点由明细表中 elapsed_millis 为 NULL 的行派生，保持展示顺序稳定。
         java.util.Map<String, List<String>> missingByBib = new java.util.LinkedHashMap<>();
         for (SnapshotCheckpointRow detail : checkpoints) {
@@ -213,22 +236,144 @@ public class RaceRepository {
                         missingByBib.getOrDefault(entry.bib(), List.of())))
                 .toList();
         return Optional.of(new SnapshotRow(header.raceId(), header.version(), header.sealedAt(),
-                entries, checkpoints));
+                entries, checkpoints, protests));
     }
 
-    /** 新建赛事，初始版本1、状态OPEN。 */
+    /** 新建赛事，初始版本1、状态OPEN，保证金未配置（NULL）。 */
     public void insertRace(String raceId, long now) {
         jdbcTemplate.update(
-                "INSERT INTO race (race_id, version, status, created_at) VALUES (?, 1, 'OPEN', ?)",
+                "INSERT INTO race (race_id, version, status, deposit_amount, created_at) "
+                        + "VALUES (?, 1, 'OPEN', NULL, ?)",
                 raceId, now);
     }
 
-    /** 登记选手；finishTimeMs 为 null 表示计时缺失。 */
+    /** 配置赛事申诉保证金当前金额（人民币元正整数）。 */
+    public void updateDepositAmount(String raceId, int depositAmount) {
+        jdbcTemplate.update(
+                "UPDATE race SET deposit_amount = ? WHERE race_id = ?",
+                depositAmount, raceId);
+    }
+
+    /** 登记选手；finishTimeMs 为 null 表示计时缺失；初始可用余额为0。 */
     public void insertRunner(String raceId, String bib, Long finishTimeMs, long now) {
         jdbcTemplate.update(
-                "INSERT INTO runner (race_id, bib, finish_time_ms, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO runner (race_id, bib, finish_time_ms, balance, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, 0, ?, ?)",
                 raceId, bib, finishTimeMs, now, now);
+    }
+
+    /**
+     * 条件扣减选手可用余额：仅当当前余额不小于冻结金额时扣减。
+     *
+     * @return 受影响行数；0 表示选手不存在或余额不足
+     */
+    public int deductBalanceIfSufficient(String raceId, String bib, int amount) {
+        return jdbcTemplate.update(
+                "UPDATE runner SET balance = balance - ? WHERE race_id = ? AND bib = ? AND balance >= ?",
+                amount, raceId, bib, amount);
+    }
+
+    /**
+     * 增加选手可用余额（充值或退款入账）；调用方已通过赛事行锁串行化、
+     * 且退款仅在申诉条件终态化成功后执行，因此此处不再加条件。
+     */
+    public void increaseBalance(String raceId, String bib, int amount) {
+        jdbcTemplate.update(
+                "UPDATE runner SET balance = balance + ? WHERE race_id = ? AND bib = ?",
+                amount, raceId, bib);
+    }
+
+    /** 插入申诉；创建时状态固定 PENDING，裁决字段为 NULL。 */
+    public void insertProtest(ProtestRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO protest "
+                        + "(protest_id, race_id, bib, status, deposit_amount, reason, "
+                        + "decision_reason, created_at, decided_at) "
+                        + "VALUES (?, ?, ?, 'PENDING', ?, ?, NULL, ?, NULL)",
+                row.protestId(), row.raceId(), row.bib(), row.depositAmount(),
+                row.reason(), row.createdAt());
+    }
+
+    /** 按全局申诉ID查询申诉。 */
+    public Optional<ProtestRow> findProtest(String protestId) {
+        return jdbcTemplate
+                .query("SELECT protest_id, race_id, bib, status, deposit_amount, reason, "
+                                + "decision_reason, created_at, decided_at "
+                                + "FROM protest WHERE protest_id = ?",
+                        PROTEST_ROW_MAPPER, protestId)
+                .stream()
+                .findFirst();
+    }
+
+    /** 行锁方式查询申诉：裁决时持有到事务结束。 */
+    public Optional<ProtestRow> findProtestForUpdate(String protestId) {
+        return jdbcTemplate
+                .query("SELECT protest_id, race_id, bib, status, deposit_amount, reason, "
+                                + "decision_reason, created_at, decided_at "
+                                + "FROM protest WHERE protest_id = ? FOR UPDATE",
+                        PROTEST_ROW_MAPPER, protestId)
+                .stream()
+                .findFirst();
+    }
+
+    /** 查询赛事下全部申诉，按自增序号（即记账先后）稳定排列。 */
+    public List<ProtestRow> findProtests(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT protest_id, race_id, bib, status, deposit_amount, reason, "
+                        + "decision_reason, created_at, decided_at "
+                        + "FROM protest WHERE race_id = ? ORDER BY seq",
+                PROTEST_ROW_MAPPER, raceId);
+    }
+
+    /** 统计赛事下处于 PENDING（暂缓封榜）状态的申诉数量。 */
+    public int countPendingProtests(String raceId) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM protest WHERE race_id = ? AND status = 'PENDING'",
+                Integer.class, raceId);
+        return count == null ? 0 : count;
+    }
+
+    /**
+     * 条件终态裁决：仅当申诉仍为 PENDING 时转为 ACCEPTED/REJECTED。
+     *
+     * @return 受影响行数；0 表示申诉不存在、不属于该赛事或已被裁决
+     */
+    public int decideProtestIfPending(
+            String protestId, String raceId, ProtestStatus status, String reason, long now) {
+        return jdbcTemplate.update(
+                "UPDATE protest SET status = ?, decision_reason = ?, decided_at = ? "
+                        + "WHERE protest_id = ? AND race_id = ? AND status = 'PENDING'",
+                status.name(), reason, now, protestId, raceId);
+    }
+
+    /** 插入一条资金流水（冻结/退回/没收/充值），金额与记账后余额固定。 */
+    public void insertWalletTransaction(WalletTransactionRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO wallet_transaction "
+                        + "(transaction_id, race_id, bib, protest_id, type, amount, "
+                        + "balance_after, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                row.transactionId(), row.raceId(), row.bib(), row.protestId(),
+                row.type().name(), row.amount(), row.balanceAfter(), row.createdAt());
+    }
+
+    /** 按全局流水ID查询（充值第二层幂等重放）。 */
+    public Optional<WalletTransactionRow> findWalletTransaction(String transactionId) {
+        return jdbcTemplate
+                .query("SELECT transaction_id, race_id, bib, protest_id, type, amount, "
+                                + "balance_after, created_at FROM wallet_transaction WHERE transaction_id = ?",
+                        WALLET_ROW_MAPPER, transactionId)
+                .stream()
+                .findFirst();
+    }
+
+    /** 查询某选手全部资金流水，按自增序号（即记账先后，同毫秒也严格有序）稳定排列。 */
+    public List<WalletTransactionRow> findWalletTransactions(String raceId, String bib) {
+        return jdbcTemplate.query(
+                "SELECT transaction_id, race_id, bib, protest_id, type, amount, "
+                        + "balance_after, created_at FROM wallet_transaction "
+                        + "WHERE race_id = ? AND bib = ? ORDER BY seq",
+                WALLET_ROW_MAPPER, raceId, bib);
     }
 
     /** 修订选手原始完赛耗时；返回受影响行数（0 表示选手不存在）。 */
@@ -284,7 +429,7 @@ public class RaceRepository {
                 newVersion, raceId, expectedVersion);
     }
 
-    /** 原子写入封榜快照头表、全部条目以及每名选手的分段明细。 */
+    /** 原子写入封榜快照头表、全部条目、分段明细以及当时的申诉裁决依据。 */
     public void insertSnapshot(SnapshotRow snapshot) {
         jdbcTemplate.update(
                 "INSERT INTO result_snapshot (race_id, version, sealed_at) VALUES (?, ?, ?)",
@@ -321,6 +466,25 @@ public class RaceRepository {
                     ps.setInt(4, detail.position());
                     ps.setObject(5, detail.elapsedMillis());
                     ps.setString(6, detail.timingId());
+                });
+        jdbcTemplate.batchUpdate(
+                "INSERT INTO result_snapshot_protest "
+                        + "(race_id, protest_id, bib, status, deposit_amount, reason, "
+                        + "decision_reason, created_at, decided_at, display_order) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                snapshot.protests(),
+                snapshot.protests().size(),
+                (ps, protest) -> {
+                    ps.setString(1, protest.raceId());
+                    ps.setString(2, protest.protestId());
+                    ps.setString(3, protest.bib());
+                    ps.setString(4, protest.status().name());
+                    ps.setInt(5, protest.depositAmount());
+                    ps.setString(6, protest.reason());
+                    ps.setString(7, protest.decisionReason());
+                    ps.setLong(8, protest.createdAt());
+                    ps.setLong(9, protest.decidedAt());
+                    ps.setInt(10, protest.displayOrder());
                 });
     }
 
@@ -370,6 +534,9 @@ public class RaceRepository {
 
     /** 测试辅助：清空全部业务数据，按外键依赖顺序删除。 */
     public void deleteAllForTesting() {
+        jdbcTemplate.update("DELETE FROM result_snapshot_protest");
+        jdbcTemplate.update("DELETE FROM wallet_transaction");
+        jdbcTemplate.update("DELETE FROM protest");
         jdbcTemplate.update("DELETE FROM result_snapshot_checkpoint");
         jdbcTemplate.update("DELETE FROM result_snapshot_entry");
         jdbcTemplate.update("DELETE FROM result_snapshot");
@@ -388,6 +555,7 @@ public class RaceRepository {
                     rs.getString("race_id"),
                     rs.getInt("version"),
                     RaceStatus.valueOf(rs.getString("status")),
+                    (Integer) rs.getObject("deposit_amount"),
                     rs.getLong("created_at"));
         }
     }
@@ -401,6 +569,7 @@ public class RaceRepository {
                     rs.getString("race_id"),
                     rs.getString("bib"),
                     finishTimeMs,
+                    rs.getInt("balance"),
                     rs.getLong("created_at"),
                     rs.getLong("updated_at"));
         }
@@ -488,6 +657,55 @@ public class RaceRepository {
                     rs.getInt("response_status"),
                     rs.getString("response_body"),
                     rs.getLong("created_at"));
+        }
+    }
+
+    private static final class ProtestRowMapper implements RowMapper<ProtestRow> {
+        @Override
+        public ProtestRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new ProtestRow(
+                    rs.getString("protest_id"),
+                    rs.getString("race_id"),
+                    rs.getString("bib"),
+                    ProtestStatus.valueOf(rs.getString("status")),
+                    rs.getInt("deposit_amount"),
+                    rs.getString("reason"),
+                    rs.getString("decision_reason"),
+                    rs.getLong("created_at"),
+                    (Long) rs.getObject("decided_at"));
+        }
+    }
+
+    private static final class WalletTransactionRowMapper implements RowMapper<WalletTransactionRow> {
+        @Override
+        public WalletTransactionRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new WalletTransactionRow(
+                    rs.getString("transaction_id"),
+                    rs.getString("race_id"),
+                    rs.getString("bib"),
+                    rs.getString("protest_id"),
+                    WalletTransactionType.valueOf(rs.getString("type")),
+                    rs.getInt("amount"),
+                    rs.getInt("balance_after"),
+                    rs.getLong("created_at"));
+        }
+    }
+
+    private static final class SnapshotProtestRowMapper
+            implements RowMapper<SnapshotProtestRow> {
+        @Override
+        public SnapshotProtestRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new SnapshotProtestRow(
+                    rs.getString("protest_id"),
+                    rs.getString("race_id"),
+                    rs.getString("bib"),
+                    ProtestStatus.valueOf(rs.getString("status")),
+                    rs.getInt("deposit_amount"),
+                    rs.getString("reason"),
+                    rs.getString("decision_reason"),
+                    rs.getLong("created_at"),
+                    rs.getLong("decided_at"),
+                    rs.getInt("display_order"));
         }
     }
 }

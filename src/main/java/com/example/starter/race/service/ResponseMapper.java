@@ -3,21 +3,27 @@ package com.example.starter.race.service;
 import com.example.starter.race.api.CheckpointPassResponse;
 import com.example.starter.race.api.CheckpointTimingResponse;
 import com.example.starter.race.api.PenaltyResponse;
+import com.example.starter.race.api.ProtestResponse;
 import com.example.starter.race.api.ResultEntryResponse;
 import com.example.starter.race.api.RunnerResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
+import com.example.starter.race.api.SnapshotProtestResponse;
 import com.example.starter.race.api.StandingResponse;
+import com.example.starter.race.api.WalletTransactionResponse;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
 import com.example.starter.race.persistence.PenaltyRow;
+import com.example.starter.race.persistence.ProtestRow;
 import com.example.starter.race.persistence.RaceRow;
 import com.example.starter.race.persistence.RunnerRow;
 import com.example.starter.race.persistence.SnapshotCheckpointRow;
 import com.example.starter.race.persistence.SnapshotEntryRow;
+import com.example.starter.race.persistence.SnapshotProtestRow;
 import com.example.starter.race.persistence.SnapshotRow;
+import com.example.starter.race.persistence.WalletTransactionRow;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -32,7 +38,27 @@ final class ResponseMapper {
     }
 
     static RunnerResponse toRunnerResponse(RunnerRow row) {
-        return new RunnerResponse(row.bib(), row.finishTimeMs(), row.createdAt(), row.updatedAt());
+        return new RunnerResponse(row.bib(), row.finishTimeMs(), row.balance(),
+                row.createdAt(), row.updatedAt());
+    }
+
+    static ProtestResponse toProtestResponse(ProtestRow row) {
+        return new ProtestResponse(
+                row.protestId(), row.raceId(), row.bib(), row.status().name(),
+                row.depositAmount(), row.reason(), row.decisionReason(),
+                row.createdAt(), row.decidedAt());
+    }
+
+    static WalletTransactionResponse toWalletTransactionResponse(WalletTransactionRow row) {
+        return new WalletTransactionResponse(
+                row.transactionId(), row.raceId(), row.bib(), row.protestId(),
+                row.type().name(), row.amount(), row.balanceAfter(), row.createdAt());
+    }
+
+    static SnapshotProtestResponse toSnapshotProtestResponse(SnapshotProtestRow row) {
+        return new SnapshotProtestResponse(
+                row.protestId(), row.bib(), row.status().name(), row.depositAmount(),
+                row.reason(), row.decisionReason(), row.createdAt(), row.decidedAt());
     }
 
     static PenaltyResponse toPenaltyResponse(PenaltyRow row) {
@@ -68,7 +94,10 @@ final class ResponseMapper {
                 snapshot.version(),
                 RaceStatus.SEALED,
                 snapshot.sealedAt(),
-                snapshot.entries().stream().map(ResponseMapper::toEntryResponse).toList());
+                snapshot.entries().stream().map(ResponseMapper::toEntryResponse).toList(),
+                snapshot.protests().stream()
+                        .map(ResponseMapper::toSnapshotProtestResponse)
+                        .toList());
     }
 
     static ResultEntryResponse toEntryResponse(ResultEntry entry) {

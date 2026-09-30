@@ -10,6 +10,8 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+
+import java.util.List;
 /**
  * 赛事计时处罚与成绩封榜 HTTP 接口。
  */
@@ -111,6 +113,71 @@ public class RaceController {
     @GetMapping("/{raceId}/missing-checkpoints")
     public MissingCheckpointsResponse getMissingCheckpoints(@PathVariable String raceId) {
         return raceService.getMissingCheckpoints(raceId);
+    }
+
+    /** 配置申诉保证金（只影响之后新建申诉的冻结金额）。 */
+    @PostMapping("/{raceId}/deposit-config")
+    public ResponseEntity<Object> configureDeposit(
+            @PathVariable String raceId,
+            @Valid @RequestBody ConfigureDepositRequest request) {
+        return toResponse(raceService.configureDeposit(raceId, request));
+    }
+
+    /** 选手余额充值（合成数据入口）。 */
+    @PostMapping("/{raceId}/runners/{bib}/wallet-topups")
+    public ResponseEntity<Object> topUpWallet(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody TopUpWalletRequest request) {
+        return toResponse(raceService.topUpWallet(raceId, bib, request));
+    }
+
+    /** 查询选手钱包余额。 */
+    @GetMapping("/{raceId}/runners/{bib}/wallet")
+    public WalletResponse getWallet(
+            @PathVariable String raceId,
+            @PathVariable String bib) {
+        return raceService.getWallet(raceId, bib);
+    }
+
+    /** 查询选手冻结/退回/没收及充值流水。 */
+    @GetMapping("/{raceId}/runners/{bib}/wallet-transactions")
+    public List<WalletTransactionResponse> getWalletTransactions(
+            @PathVariable String raceId,
+            @PathVariable String bib) {
+        return raceService.getWalletTransactions(raceId, bib);
+    }
+
+    /** 创建成绩申诉并按赛事当前配置冻结保证金。 */
+    @PostMapping("/{raceId}/runners/{bib}/protests")
+    public ResponseEntity<Object> createProtest(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody CreateProtestRequest request) {
+        return toResponse(raceService.createProtest(raceId, bib, request));
+    }
+
+    /** 终态裁决申诉：ACCEPT 全额退回，REJECT 全部没收。 */
+    @PostMapping("/{raceId}/protests/{protestId}/decision")
+    public ResponseEntity<Object> decideProtest(
+            @PathVariable String raceId,
+            @PathVariable String protestId,
+            @Valid @RequestBody DecideProtestRequest request) {
+        return toResponse(raceService.decideProtest(raceId, protestId, request));
+    }
+
+    /** 查询单个申诉。 */
+    @GetMapping("/{raceId}/protests/{protestId}")
+    public ProtestResponse getProtest(
+            @PathVariable String raceId,
+            @PathVariable String protestId) {
+        return raceService.getProtest(raceId, protestId);
+    }
+
+    /** 查询赛事全部申诉（含当时的状态与保证金快照）。 */
+    @GetMapping("/{raceId}/protests")
+    public ProtestListResponse getProtests(@PathVariable String raceId) {
+        return raceService.getProtests(raceId);
     }
 
     private ResponseEntity<Object> toResponse(ServiceResult result) {

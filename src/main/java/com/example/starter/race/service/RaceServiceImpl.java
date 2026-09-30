@@ -4,8 +4,14 @@ import com.example.starter.race.api.AddPenaltyRequest;
 import com.example.starter.race.api.CheckpointResponse;
 import com.example.starter.race.api.CheckpointsConfigResponse;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
+import com.example.starter.race.api.ConfigureDepositRequest;
+import com.example.starter.race.api.CreateProtestRequest;
 import com.example.starter.race.api.CreateRaceRequest;
+import com.example.starter.race.api.DecideProtestRequest;
+import com.example.starter.race.api.DepositConfigResponse;
 import com.example.starter.race.api.MissingCheckpointsResponse;
+import com.example.starter.race.api.ProtestListResponse;
+import com.example.starter.race.api.ProtestResponse;
 import com.example.starter.race.api.RaceResponse;
 import com.example.starter.race.api.RegisterRunnerRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
@@ -15,21 +21,29 @@ import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.api.SubmitTimingRequest;
+import com.example.starter.race.api.TopUpWalletRequest;
+import com.example.starter.race.api.WalletResponse;
+import com.example.starter.race.api.WalletTransactionResponse;
 import com.example.starter.race.domain.CheckpointRules;
 import com.example.starter.race.domain.PenaltyType;
+import com.example.starter.race.domain.ProtestStatus;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
+import com.example.starter.race.domain.WalletTransactionType;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
 import com.example.starter.race.persistence.IdempotencyRow;
 import com.example.starter.race.persistence.PenaltyRow;
+import com.example.starter.race.persistence.ProtestRow;
 import com.example.starter.race.persistence.RaceRow;
 import com.example.starter.race.persistence.RunnerRow;
 import com.example.starter.race.persistence.SnapshotCheckpointRow;
 import com.example.starter.race.persistence.SnapshotEntryRow;
+import com.example.starter.race.persistence.SnapshotProtestRow;
 import com.example.starter.race.persistence.SnapshotRow;
 import com.example.starter.race.persistence.RaceRepository;
+import com.example.starter.race.persistence.WalletTransactionRow;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
@@ -95,7 +109,8 @@ public class RaceServiceImpl implements RaceService {
                     }
                     RaceRow race = repository.findRace(request.raceId()).orElseThrow();
                     return ServiceResult.created(new RaceResponse(
-                            race.raceId(), race.version(), race.status(), race.createdAt()));
+                            race.raceId(), race.version(), race.status(),
+                            race.depositAmount(), race.createdAt()));
                 });
     }
 
@@ -355,6 +370,12 @@ public class RaceServiceImpl implements RaceService {
                     if (race.status() == RaceStatus.SEALED) {
                         throw new ConflictException("赛事已封榜: " + raceId);
                     }
+                    // 申诉创建后相关成绩暂缓封榜：仍存在未裁决(PENDING)申诉时拒绝封榜。
+                    // 裁决与封榜都先取同一 race 行写锁，二者不可能并发交错，
+                    // 因此不会同时出现“未裁决申诉 + 已封榜成绩”。
+                    if (repository.countPendingProtests(raceId) > 0) {
+                        throw new ConflictException("赛事存在未裁决申诉，暂缓封榜: " + raceId);
+                    }
                     List<RunnerRow> runners = repository.findRunners(raceId);
                     List<PenaltyRow> penalties = repository.findPenalties(raceId);
                     List<CheckpointRow> checkpoints = repository.findCheckpoints(raceId);
@@ -388,11 +409,17 @@ public class RaceServiceImpl implements RaceService {
                     // 在同一封榜事务内固化每名选手 × 每个检查点的明细，缺失行耗时为 null。
                     List<SnapshotCheckpointRow> snapshotCheckpoints =
                             buildSnapshotCheckpoints(raceId, runners, checkpoints, timings);
+                    // 同时固化当时全部申诉与终态裁决依据（能走到这里说明不存在 PENDING 申诉）。
+                    List<SnapshotProtestRow> snapshotProtests =
+                            buildSnapshotProtests(raceId);
                     repository.insertSnapshot(new SnapshotRow(raceId, newVersion, now,
-                            snapshotEntries, snapshotCheckpoints));
+                            snapshotEntries, snapshotCheckpoints, snapshotProtests));
                     return ServiceResult.ok(new StandingResponse(
                             raceId, newVersion, RaceStatus.SEALED, now,
-                            snapshotEntries.stream().map(ResponseMapper::toEntryResponse).toList()));
+                            snapshotEntries.stream().map(ResponseMapper::toEntryResponse).toList(),
+                            snapshotProtests.stream()
+                                    .map(ResponseMapper::toSnapshotProtestResponse)
+                                    .toList()));
                 });
     }
 
@@ -496,6 +523,266 @@ public class RaceServiceImpl implements RaceService {
         SnapshotRow snapshot = repository.findSnapshot(raceId)
                 .orElseThrow(() -> new NotFoundException("赛事尚未封榜: " + raceId));
         return ResponseMapper.snapshotStanding(snapshot);
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult configureDeposit(String raceId, ConfigureDepositRequest request) {
+        return withIdempotency(request.requestId(), "CONFIGURE_DEPOSIT",
+                orderedParams(
+                        "raceId", raceId,
+                        "depositAmount", request.depositAmount(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    int amount = request.depositAmount();
+                    bumpVersion(race, request.expectedVersion());
+                    repository.updateDepositAmount(raceId, amount);
+                    return ServiceResult.ok(new DepositConfigResponse(
+                            raceId, request.expectedVersion() + 1, amount));
+                });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult topUpWallet(String raceId, String bib, TopUpWalletRequest request) {
+        return withIdempotency(request.requestId(), "TOP_UP_WALLET",
+                orderedParams(
+                        "raceId", raceId,
+                        "bib", bib,
+                        "transactionId", request.transactionId(),
+                        "amount", request.amount(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    // transactionId 为第二层全局幂等键：同参重放首次入账结果，异参409。
+                    WalletTransactionRow existing =
+                            repository.findWalletTransaction(request.transactionId()).orElse(null);
+                    if (existing != null) {
+                        return replayTopUpOrConflict(raceId, bib, request, existing);
+                    }
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    RunnerRow runner = requireRunner(raceId, bib);
+                    int amount = request.amount();
+                    bumpVersion(race, request.expectedVersion());
+                    long now = clock.millis();
+                    int balanceAfter = runner.balance() + amount;
+                    repository.increaseBalance(raceId, bib, amount);
+                    repository.insertWalletTransaction(new WalletTransactionRow(
+                            request.transactionId(), raceId, bib, null,
+                            WalletTransactionType.TOPUP, amount, balanceAfter, now));
+                    return ServiceResult.created(new WalletResponse(raceId, bib, balanceAfter));
+                });
+    }
+
+    private ServiceResult replayTopUpOrConflict(
+            String raceId, String bib, TopUpWalletRequest request, WalletTransactionRow existing) {
+        boolean sameParams = existing.type() == WalletTransactionType.TOPUP
+                && existing.raceId().equals(raceId)
+                && existing.bib().equals(bib)
+                && existing.amount() == request.amount();
+        if (!sameParams) {
+            throw new ConflictException(
+                    "transactionId 已用于不同参数的资金流水: " + request.transactionId());
+        }
+        // 重放首次账务结果：该笔充值入账后的当时余额（固定在流水 balance_after 中）。
+        return ServiceResult.created(new WalletResponse(
+                raceId, bib, existing.balanceAfter()));
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult createProtest(String raceId, String bib, CreateProtestRequest request) {
+        return withIdempotency(request.requestId(), "CREATE_PROTEST",
+                orderedParams(
+                        "raceId", raceId,
+                        "bib", bib,
+                        "protestId", request.protestId(),
+                        "reason", request.reason(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    // protestId 为第二层全局幂等键：同参重放首次结果，异参409。
+                    ProtestRow existingProtest =
+                            repository.findProtest(request.protestId()).orElse(null);
+                    if (existingProtest != null) {
+                        return replayProtestOrConflict(raceId, bib, request, existingProtest);
+                    }
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    if (race.depositAmount() == null) {
+                        throw new UnprocessableEntityException(
+                                "赛事尚未配置申诉保证金，不能创建申诉: " + raceId);
+                    }
+                    int deposit = race.depositAmount();
+                    RunnerRow runner = requireRunner(raceId, bib);
+                    if (runner.balance() < deposit) {
+                        // 余额不足：不推进版本、不建申诉、不扣余额、不锁成绩，整笔随事务回滚。
+                        throw new UnprocessableEntityException(String.format(
+                                "选手余额不足以冻结申诉保证金: bib=%s, balance=%d, deposit=%d",
+                                bib, runner.balance(), deposit));
+                    }
+                    bumpVersion(race, request.expectedVersion());
+                    long now = clock.millis();
+                    int deducted = repository.deductBalanceIfSufficient(
+                            raceId, bib, deposit);
+                    if (deducted == 0) {
+                        throw new ConflictException("余额冻结失败，请重试");
+                    }
+                    repository.insertProtest(new ProtestRow(
+                            request.protestId(), raceId, bib,
+                            ProtestStatus.PENDING, deposit, request.reason(), null, now, null));
+                    // 冻结流水固定记录快照金额与扣减后余额。
+                    repository.insertWalletTransaction(new WalletTransactionRow(
+                            freezeTransactionId(request.protestId()), raceId, bib,
+                            request.protestId(), WalletTransactionType.FREEZE, deposit,
+                            runner.balance() - deposit, now));
+                    ProtestRow saved =
+                            repository.findProtest(request.protestId()).orElseThrow();
+                    return ServiceResult.created(ResponseMapper.toProtestResponse(saved));
+                });
+    }
+
+    private ServiceResult replayProtestOrConflict(
+            String raceId, String bib, CreateProtestRequest request, ProtestRow existing) {
+        boolean sameParams = existing.raceId().equals(raceId)
+                && existing.bib().equals(bib)
+                && existing.reason().equals(request.reason());
+        if (!sameParams) {
+            throw new ConflictException(
+                    "protestId 已用于不同参数的申诉: " + request.protestId());
+        }
+        return ServiceResult.created(ResponseMapper.toProtestResponse(existing));
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult decideProtest(
+            String raceId, String protestId, DecideProtestRequest request) {
+        return withIdempotency(request.requestId(), "DECIDE_PROTEST",
+                orderedParams(
+                        "raceId", raceId,
+                        "protestId", protestId,
+                        "decision", request.decision(),
+                        "reason", request.reason(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    ProtestStatus decision = parseDecision(request.decision());
+                    ProtestRow protest = repository.findProtestForUpdate(protestId)
+                            .orElseThrow(() -> new NotFoundException("申诉不存在: " + protestId));
+                    if (!protest.raceId().equals(raceId)) {
+                        throw new NotFoundException("申诉不属于该赛事: " + protestId);
+                    }
+                    if (protest.status() != ProtestStatus.PENDING) {
+                        // 重复裁决或终态改判：直接409，且下面的条件 UPDATE 保证不会再次退款/没收。
+                        throw new ConflictException(
+                                "申诉已裁决，裁决为终态不可更改: " + protestId);
+                    }
+                    bumpVersion(race, request.expectedVersion());
+                    long now = clock.millis();
+                    int updated = repository.decideProtestIfPending(
+                            protestId, raceId, decision, request.reason(), now);
+                    if (updated == 0) {
+                        throw new ConflictException(
+                                "申诉已被并发裁决，裁决为终态不可更改: " + protestId);
+                    }
+                    int deposit = protest.depositAmount();
+                    WalletTransactionType type;
+                    if (decision == ProtestStatus.ACCEPTED) {
+                        // 裁决 ACCEPT：全额退回冻结保证金，余额恢复与申诉终态同事务提交。
+                        repository.increaseBalance(raceId, protest.bib(), deposit);
+                        type = WalletTransactionType.REFUND;
+                    } else {
+                        // 裁决 REJECT：全部没收；冻结时已扣减余额，此处不再改变可用余额。
+                        type = WalletTransactionType.FORFEIT;
+                    }
+                    int balanceAfter = requireRunner(raceId, protest.bib()).balance();
+                    repository.insertWalletTransaction(new WalletTransactionRow(
+                            settlementTransactionId(protestId, type), raceId, protest.bib(),
+                            protestId, type, deposit, balanceAfter, now));
+                    ProtestRow decided = repository.findProtest(protestId).orElseThrow();
+                    return ServiceResult.ok(ResponseMapper.toProtestResponse(decided));
+                });
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public ProtestResponse getProtest(String raceId, String protestId) {
+        repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        ProtestRow protest = repository.findProtest(protestId)
+                .orElseThrow(() -> new NotFoundException("申诉不存在: " + protestId));
+        if (!protest.raceId().equals(raceId)) {
+            throw new NotFoundException("申诉不属于该赛事: " + protestId);
+        }
+        return ResponseMapper.toProtestResponse(protest);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public ProtestListResponse getProtests(String raceId) {
+        RaceRow race = repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        List<ProtestResponse> protests = repository.findProtests(raceId).stream()
+                .map(ResponseMapper::toProtestResponse)
+                .toList();
+        return new ProtestListResponse(raceId, race.version(), protests);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<WalletTransactionResponse> getWalletTransactions(String raceId, String bib) {
+        repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        repository.findRunner(raceId, bib)
+                .orElseThrow(() -> new NotFoundException("选手不存在: " + bib));
+        return repository.findWalletTransactions(raceId, bib).stream()
+                .map(ResponseMapper::toWalletTransactionResponse)
+                .toList();
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public WalletResponse getWallet(String raceId, String bib) {
+        repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        RunnerRow runner = repository.findRunner(raceId, bib)
+                .orElseThrow(() -> new NotFoundException("选手不存在: " + bib));
+        return new WalletResponse(raceId, bib, runner.balance());
+    }
+
+    /** 封榜时把当时全部申诉与裁决依据固化为只读快照行（此时不存在 PENDING 申诉）。 */
+    private List<SnapshotProtestRow> buildSnapshotProtests(String raceId) {
+        List<ProtestRow> protests = repository.findProtests(raceId);
+        List<SnapshotProtestRow> rows = new ArrayList<>(protests.size());
+        for (int order = 0; order < protests.size(); order++) {
+            ProtestRow protest = protests.get(order);
+            if (protest.status() == ProtestStatus.PENDING || protest.decidedAt() == null) {
+                throw new IllegalStateException(
+                        "封榜时仍存在未裁决申诉: " + protest.protestId());
+            }
+            rows.add(new SnapshotProtestRow(
+                    protest.protestId(), raceId, protest.bib(), protest.status(),
+                    protest.depositAmount(), protest.reason(), protest.decisionReason(),
+                    protest.createdAt(), protest.decidedAt(), order));
+        }
+        return rows;
+    }
+
+    private static String freezeTransactionId(String protestId) {
+        return "FREEZE:" + protestId;
+    }
+
+    private static String settlementTransactionId(
+            String protestId, WalletTransactionType type) {
+        return type.name() + ":" + protestId;
+    }
+
+    private static ProtestStatus parseDecision(String decision) {
+        return switch (decision) {
+            case "ACCEPT" -> ProtestStatus.ACCEPTED;
+            case "REJECT" -> ProtestStatus.REJECTED;
+            default -> throw new BadRequestException(
+                    "裁决结果必须是 ACCEPT 或 REJECT: " + decision);
+        };
     }
 
     /**
