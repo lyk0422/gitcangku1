@@ -100,3 +100,59 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
 );
+
+CREATE TABLE IF NOT EXISTS ladder_versions (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    version_key VARCHAR(128) NOT NULL,
+    threshold_1 INT NOT NULL,
+    threshold_2 INT NOT NULL,
+    threshold_3 INT NOT NULL,
+    threshold_4 INT NOT NULL,
+    threshold_5 INT NOT NULL,
+    cooldown_minutes INT NOT NULL,
+    created_by VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_ladder_version_key UNIQUE (version_key)
+);
+
+CREATE TABLE IF NOT EXISTS incident_ladder_states (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    current_level INT NOT NULL,
+    last_score INT NOT NULL,
+    threshold_version_id BIGINT NOT NULL,
+    last_promoted_at TIMESTAMP(6) NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_ladder_state_incident UNIQUE (incident_id)
+);
+
+CREATE TABLE IF NOT EXISTS incident_ladder_scores (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    score INT NOT NULL,
+    threshold_version_id BIGINT NOT NULL,
+    evaluated_level INT NULL,
+    submitted_by VARCHAR(128) NOT NULL,
+    occurred_at TIMESTAMP(6) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS incident_ladder_history (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    change_type VARCHAR(16) NOT NULL,
+    from_level INT NULL,
+    to_level INT NOT NULL,
+    score INT NULL,
+    threshold_version_id BIGINT NULL,
+    operator VARCHAR(128) NOT NULL,
+    cooldown_since TIMESTAMP(6) NULL,
+    occurred_at TIMESTAMP(6) NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ladder_scores_incident
+    ON incident_ladder_scores (incident_id);
+
+CREATE INDEX IF NOT EXISTS idx_ladder_history_incident
+    ON incident_ladder_history (incident_id);

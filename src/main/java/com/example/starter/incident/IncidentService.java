@@ -35,8 +35,6 @@ import com.example.starter.incident.dto.Responses.TaskBlockerView;
 import com.example.starter.incident.dto.Responses.TaskView;
 import com.example.starter.incident.dto.Responses.TransferView;
 import com.example.starter.incident.dto.Responses.UnfinishedTaskView;
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -71,18 +69,15 @@ public class IncidentService {
     private final IncidentRepository incidents;
     private final EscalationRepository escalations;
     private final IncidentTaskRepository tasks;
-    private final CommandKeyRepository commandKeys;
-    private final ObjectMapper objectMapper;
+    private final IdempotencyRunner idempotency;
     private final Clock clock;
 
     public IncidentService(IncidentRepository incidents, EscalationRepository escalations,
-                           IncidentTaskRepository tasks, CommandKeyRepository commandKeys,
-                           ObjectMapper objectMapper, Clock clock) {
+                           IncidentTaskRepository tasks, IdempotencyRunner idempotency, Clock clock) {
         this.incidents = incidents;
         this.escalations = escalations;
         this.tasks = tasks;
-        this.commandKeys = commandKeys;
-        this.objectMapper = objectMapper;
+        this.idempotency = idempotency;
         this.clock = clock;
     }
 
@@ -572,42 +567,7 @@ public class IncidentService {
      */
     private <T> T runIdempotent(String commandKey, String operation, String requestHash,
                                 Class<T> type, Supplier<T> business) {
-        var existing = commandKeys.find(commandKey);
-        if (existing.isPresent()) {
-            return replay(existing.get(), operation, requestHash, type);
-        }
-        try {
-            commandKeys.insertPlaceholder(commandKey, operation, requestHash, now());
-        } catch (DuplicateKeyException e) {
-            var committed = commandKeys.findForUpdate(commandKey)
-                    .orElseThrow(() -> ApiException.conflict("commandKey 处理冲突: " + commandKey));
-            return replay(committed, operation, requestHash, type);
-        }
-        T result = business.get();
-        commandKeys.fillResponse(commandKey, 200, toJson(result));
-        return result;
-    }
-
-    private <T> T replay(CommandKeyRecord record, String operation, String requestHash, Class<T> type) {
-        if (!record.operation().equals(operation) || !record.requestHash().equals(requestHash)) {
-            throw ApiException.conflict("commandKey 已被不同参数的请求使用: " + record.commandKey());
-        }
-        if (record.responseBody() == null) {
-            throw ApiException.conflict("commandKey 正在处理中: " + record.commandKey());
-        }
-        try {
-            return objectMapper.readValue(record.responseBody(), type);
-        } catch (JsonProcessingException e) {
-            throw new IllegalStateException("幂等响应反序列化失败", e);
-        }
-    }
-
-    private String toJson(Object value) {
-        try {
-            return objectMapper.writeValueAsString(value);
-        } catch (JsonProcessingException e) {
-            throw new IllegalStateException("响应序列化失败", e);
-        }
+        return idempotency.run(commandKey, operation, requestHash, type, business);
     }
 
     private static String hash(String... parts) {

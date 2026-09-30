@@ -100,3 +100,57 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY COMMENT '固定为 1 的单行锁；创建任务时 SELECT ... FOR UPDATE 持有，串行化环检测与写入，保证并发反向依赖最终图无环'
 ) COMMENT='任务依赖图全局锁表';
+
+CREATE TABLE IF NOT EXISTS ladder_versions (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    version_key VARCHAR(128) NOT NULL COMMENT '阈值版本业务键，全局唯一；落库后不可变',
+    threshold_1 INT NOT NULL COMMENT '1 级入级阈值（含），区间左闭右开',
+    threshold_2 INT NOT NULL COMMENT '2 级入级阈值（含），必须大于 threshold_1',
+    threshold_3 INT NOT NULL COMMENT '3 级入级阈值（含），必须大于 threshold_2',
+    threshold_4 INT NOT NULL COMMENT '4 级入级阈值（含），必须大于 threshold_3',
+    threshold_5 INT NOT NULL COMMENT '5 级入级阈值（含），必须大于 threshold_4；[threshold_5,+∞) 为 5 级',
+    cooldown_minutes INT NOT NULL COMMENT '降级冷却分钟数，距最近一次升级须超过该值方可降级；范围 0~10080（含端点，0 表示立即可降级），单位分钟',
+    created_by VARCHAR(128) NOT NULL COMMENT '版本创建人（X-Actor-Id）',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间；后续修订只能新建版本，不回写本行',
+    CONSTRAINT uk_ladder_version_key UNIQUE (version_key)
+) COMMENT='升级阶梯阈值版本表（不可变）';
+
+CREATE TABLE IF NOT EXISTS incident_ladder_states (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    incident_id BIGINT NOT NULL COMMENT '所属事件 id，关联 incidents.id；进入阶梯的事件至多一行',
+    current_level INT NOT NULL COMMENT '当前生效等级 1~5；只随自动升级提高或人工逐级降级，分数下降不自动降低',
+    last_score INT NOT NULL COMMENT '最近一次分数更新提交的风险分数（无单位的整数分值）',
+    threshold_version_id BIGINT NOT NULL COMMENT '最近一次分数更新使用的阈值版本 id，关联 ladder_versions.id',
+    last_promoted_at TIMESTAMP(6) NULL COMMENT '冷却起点 UTC：最近一次自动升级时刻；降级不刷新，仅新升级刷新；首次进入为入级时刻',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '首次进入阶梯的 UTC 时间',
+    updated_at TIMESTAMP(6) NOT NULL COMMENT '最近状态变更 UTC 时间',
+    CONSTRAINT uk_ladder_state_incident UNIQUE (incident_id)
+) COMMENT='事件升级阶梯当前状态表';
+
+CREATE TABLE IF NOT EXISTS incident_ladder_scores (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    incident_id BIGINT NOT NULL COMMENT '所属事件 id，关联 incidents.id',
+    score INT NOT NULL COMMENT '本次提交的风险分数（无单位的整数分值），不可修改',
+    threshold_version_id BIGINT NOT NULL COMMENT '本次评估使用的阈值版本 id，关联 ladder_versions.id，不可修改',
+    evaluated_level INT NULL COMMENT '按当时版本与左闭右开区间算出的等级 1~5；低于一级阈值未进入阶梯时为空；不可修改',
+    submitted_by VARCHAR(128) NOT NULL COMMENT '分数提交人（X-Actor-Id），不可修改',
+    occurred_at TIMESTAMP(6) NOT NULL COMMENT '分数提交 UTC 时刻，不可修改',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '落库 UTC 时间'
+) COMMENT='风险分数不可变证据表（只追加）';
+
+CREATE TABLE IF NOT EXISTS incident_ladder_history (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    incident_id BIGINT NOT NULL COMMENT '所属事件 id，关联 incidents.id',
+    change_type VARCHAR(16) NOT NULL COMMENT '变更类型：PROMOTE 自动升级 / DEMOTE 人工降级',
+    from_level INT NULL COMMENT '变更前等级；首次进入阶梯（PROMOTE 自空）为空，其余非空',
+    to_level INT NOT NULL COMMENT '变更后等级 1~5；PROMOTE 可跨多级，DEMOTE 必须逐级',
+    score INT NULL COMMENT '触发本次变更时提交的风险分数；正常升级/降级非空',
+    threshold_version_id BIGINT NULL COMMENT '判定使用的阈值版本 id，关联 ladder_versions.id；正常变更非空',
+    operator VARCHAR(128) NOT NULL COMMENT '操作人；PROMOTE 为分数提交人，DEMOTE 为确认降级的、不同于当前指挥人的指挥员',
+    cooldown_since TIMESTAMP(6) NULL COMMENT '本次变更后的冷却起点 UTC；始终取最近一次升级时刻，降级不刷新；首次升级等于 occurred_at',
+    occurred_at TIMESTAMP(6) NOT NULL COMMENT '变更发生 UTC 时间，微秒精度，不可修改'
+) COMMENT='升级阶梯等级变更历史表（只追加，不可变）';
+
+-- 按事件查询不可变分数证据与等级变更历史的辅助索引
+CREATE INDEX idx_ladder_scores_incident ON incident_ladder_scores (incident_id);
+CREATE INDEX idx_ladder_history_incident ON incident_ladder_history (incident_id);

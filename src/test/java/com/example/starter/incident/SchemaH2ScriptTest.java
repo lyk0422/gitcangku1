@@ -108,6 +108,77 @@ class SchemaH2ScriptTest {
                     duplicateBlockerRejected = true;
                 }
                 assertThat(duplicateBlockerRejected).isTrue();
+
+                // 升级阶梯：阈值版本键唯一
+                st.execute("INSERT INTO ladder_versions (version_key, threshold_1, threshold_2,"
+                        + " threshold_3, threshold_4, threshold_5, cooldown_minutes, created_by,"
+                        + " created_at) VALUES ('V1',10,20,30,40,50,30,'admin','"
+                        + Timestamp.from(now) + "')");
+                boolean duplicateVersionRejected = false;
+                try {
+                    st.execute("INSERT INTO ladder_versions (version_key, threshold_1, threshold_2,"
+                            + " threshold_3, threshold_4, threshold_5, cooldown_minutes, created_by,"
+                            + " created_at) VALUES ('V1',1,2,3,4,5,0,'admin','"
+                            + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateVersionRejected = true;
+                }
+                assertThat(duplicateVersionRejected).isTrue();
+
+                // 阶梯状态：每事件至多一行
+                st.execute("INSERT INTO incident_ladder_states (incident_id, current_level, last_score,"
+                        + " threshold_version_id, last_promoted_at, created_at, updated_at) VALUES"
+                        + " (1,4,45,1,'" + Timestamp.from(now) + "','" + Timestamp.from(now) + "','"
+                        + Timestamp.from(now) + "')");
+                boolean duplicateStateRejected = false;
+                try {
+                    st.execute("INSERT INTO incident_ladder_states (incident_id, current_level,"
+                            + " last_score, threshold_version_id, last_promoted_at, created_at,"
+                            + " updated_at) VALUES (1,2,20,1,'" + Timestamp.from(now) + "','"
+                            + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateStateRejected = true;
+                }
+                assertThat(duplicateStateRejected).isTrue();
+
+                // 分数证据允许同事件多条，evaluated_level 可空（未进入阶梯）
+                st.execute("INSERT INTO incident_ladder_scores (incident_id, score,"
+                        + " threshold_version_id, evaluated_level, submitted_by, occurred_at,"
+                        + " created_at) VALUES (1,5,1,NULL,'alice','" + Timestamp.from(now)
+                        + "','" + Timestamp.from(now) + "')");
+                st.execute("INSERT INTO incident_ladder_scores (incident_id, score,"
+                        + " threshold_version_id, evaluated_level, submitted_by, occurred_at,"
+                        + " created_at) VALUES (1,45,1,4,'alice','" + Timestamp.from(now)
+                        + "','" + Timestamp.from(now) + "')");
+
+                // 条件降级：等级匹配时降一级（4→3），再次以 expected=4 调用更新 0 行
+                int firstDemote = st.executeUpdate("UPDATE incident_ladder_states s SET"
+                        + " s.current_level = s.current_level - 1 WHERE s.incident_id = 1"
+                        + " AND s.current_level = 4 AND EXISTS (SELECT 1 FROM incidents i"
+                        + " WHERE i.id = s.incident_id AND i.status <> 'CLOSED')");
+                assertThat(firstDemote).isEqualTo(1);
+                int secondDemoteSameSnapshot = st.executeUpdate("UPDATE incident_ladder_states s SET"
+                        + " s.current_level = s.current_level - 1 WHERE s.incident_id = 1"
+                        + " AND s.current_level = 4 AND EXISTS (SELECT 1 FROM incidents i"
+                        + " WHERE i.id = s.incident_id AND i.status <> 'CLOSED')");
+                assertThat(secondDemoteSameSnapshot).isZero();
+                try (ResultSet rs = st.executeQuery(
+                        "SELECT current_level, last_promoted_at FROM incident_ladder_states"
+                                + " WHERE incident_id = 1")) {
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getInt("current_level")).isEqualTo(3);
+                    assertThat(rs.getTimestamp("last_promoted_at").toInstant()).isEqualTo(now);
+                }
+
+                // 历史只追加：同事件可插入多条，from_level 首条可空
+                st.execute("INSERT INTO incident_ladder_history (incident_id, change_type, from_level,"
+                        + " to_level, score, threshold_version_id, operator, cooldown_since,"
+                        + " occurred_at) VALUES (1,'PROMOTE',NULL,4,45,1,'alice','"
+                        + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                st.execute("INSERT INTO incident_ladder_history (incident_id, change_type, from_level,"
+                        + " to_level, score, threshold_version_id, operator, cooldown_since,"
+                        + " occurred_at) VALUES (1,'DEMOTE',4,3,45,1,'bob','"
+                        + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
             }
         }
     }
