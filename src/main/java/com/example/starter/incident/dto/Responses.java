@@ -78,4 +78,35 @@ public final class Responses {
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
     }
+
+    /** 事件资源可用量视图：availableQuantity 为当前可征调数量（件）。 */
+    public record ResourceInventoryView(String incidentKey, String resourceCode,
+                                        int availableQuantity, Instant createdAt, Instant updatedAt) {
+    }
+
+    /**
+     * 互助征调租约视图：固定保留首次征调的来源与目标事件；
+     * quantity 征调总量、returnedQuantity 已还累计、outstandingQuantity 待还（件）；
+     * exclusive 是否排他占用；status 为 ACTIVE/CLOSED；expiresAt 为 UTC 到期时刻；
+     * closedAt 仅恰好还完关闭时有值。
+     */
+    public record AidLeaseView(String requestId, String sourceIncidentKey, String targetIncidentKey,
+                               String resourceCode, int quantity, int returnedQuantity,
+                               int outstandingQuantity, boolean exclusive, String status,
+                               Instant expiresAt, String createdBy, Instant createdAt,
+                               Instant closedAt) {
+    }
+
+    /** 分次归还流水视图：quantity 为本次实际归还数量（件），returnedAt 为 UTC 时刻。 */
+    public record AidReturnView(long id, int quantity, String returnedBy, Instant returnedAt,
+                                Instant createdAt) {
+    }
+
+    /**
+     * 租约关联账务视图：租约本体 + 来源事件当前资源扣减账（availableQuantity 为扣减/归还后的可用量）
+     * + 分次归还流水。
+     */
+    public record AidLeaseDetailView(AidLeaseView lease, ResourceInventoryView sourceInventory,
+                                     List<AidReturnView> returns) {
+    }
 }

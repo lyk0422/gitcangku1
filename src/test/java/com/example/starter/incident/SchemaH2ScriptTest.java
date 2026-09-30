@@ -111,4 +111,95 @@ class SchemaH2ScriptTest {
             }
         }
     }
+
+    /**
+     * 互助征调相关表约束与条件更新：库存可用量非负、租约归还量不超过征调量、
+     * requestId 全局唯一；扣减/累计的条件 UPDATE 在库存不足或超量时影响 0 行。
+     */
+    @Test
+    void h2Schema_enforcesMutualAidConstraints() throws Exception {
+        String url = "jdbc:h2:mem:schema_h2_aid;MODE=MySQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=0";
+        try (Connection con = DriverManager.getConnection(url, "sa", "")) {
+            ScriptUtils.executeSqlScript(con, new ClassPathResource("schema-h2.sql"));
+
+            Instant now = Instant.parse("2026-09-22T00:00:00Z");
+            Instant expiry = Instant.parse("2026-09-23T00:00:00Z");
+            try (Statement st = con.createStatement()) {
+                st.execute("INSERT INTO incident_resource_inventories (incident_id, resource_code,"
+                        + " available_quantity, created_at, updated_at) VALUES (1,'R',5,'"
+                        + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+
+                // 可用量不能为负：直接更新为 -1 被 CHECK 拒绝
+                boolean negativeInventoryRejected = false;
+                try {
+                    st.execute("UPDATE incident_resource_inventories SET available_quantity = -1"
+                            + " WHERE incident_id = 1 AND resource_code = 'R'");
+                } catch (Exception e) {
+                    negativeInventoryRejected = true;
+                }
+                assertThat(negativeInventoryRejected).isTrue();
+
+                // 条件扣减：库存充足扣 3 影响 1 行；剩余 2 再扣 3 影响 0 行
+                int deducted = st.executeUpdate("UPDATE incident_resource_inventories"
+                        + " SET available_quantity = available_quantity - 3"
+                        + " WHERE incident_id = 1 AND resource_code = 'R' AND available_quantity >= 3");
+                assertThat(deducted).isEqualTo(1);
+                int shortDeducted = st.executeUpdate("UPDATE incident_resource_inventories"
+                        + " SET available_quantity = available_quantity - 3"
+                        + " WHERE incident_id = 1 AND resource_code = 'R' AND available_quantity >= 3");
+                assertThat(shortDeducted).isZero();
+
+                st.execute("INSERT INTO resource_aid_leases (request_id, source_incident_id,"
+                        + " target_incident_id, resource_code, quantity, returned_quantity, exclusive,"
+                        + " status, expires_at, created_by, created_at, closed_at) VALUES"
+                        + " ('REQ-1',1,2,'R',3,0,0,'ACTIVE','" + Timestamp.from(expiry)
+                        + "','alice','" + Timestamp.from(now) + "',NULL)");
+
+                // requestId 全局唯一
+                boolean duplicateRequestRejected = false;
+                try {
+                    st.execute("INSERT INTO resource_aid_leases (request_id, source_incident_id,"
+                            + " target_incident_id, resource_code, quantity, returned_quantity,"
+                            + " exclusive, status, expires_at, created_by, created_at, closed_at)"
+                            + " VALUES ('REQ-1',2,1,'S',1,0,0,'ACTIVE','" + Timestamp.from(expiry)
+                            + "','bob','" + Timestamp.from(now) + "',NULL)");
+                } catch (Exception e) {
+                    duplicateRequestRejected = true;
+                }
+                assertThat(duplicateRequestRejected).isTrue();
+
+                // 累计归还：还 2（<=3）影响 1 行；再还 2（累计 4 > 3）影响 0 行
+                int firstReturn = st.executeUpdate("UPDATE resource_aid_leases"
+                        + " SET returned_quantity = returned_quantity + 2"
+                        + " WHERE id = 1 AND returned_quantity + 2 <= quantity");
+                assertThat(firstReturn).isEqualTo(1);
+                int overReturn = st.executeUpdate("UPDATE resource_aid_leases"
+                        + " SET returned_quantity = returned_quantity + 2"
+                        + " WHERE id = 1 AND returned_quantity + 2 <= quantity");
+                assertThat(overReturn).isZero();
+
+                // 直接把已还写成超过征调量被 CHECK 拒绝
+                boolean returnedExceedsQuantityRejected = false;
+                try {
+                    st.execute("UPDATE resource_aid_leases SET returned_quantity = 4 WHERE id = 1");
+                } catch (Exception e) {
+                    returnedExceedsQuantityRejected = true;
+                }
+                assertThat(returnedExceedsQuantityRejected).isTrue();
+
+                // 非正征调量被 CHECK 拒绝
+                boolean nonPositiveQuantityRejected = false;
+                try {
+                    st.execute("INSERT INTO resource_aid_leases (request_id, source_incident_id,"
+                            + " target_incident_id, resource_code, quantity, returned_quantity,"
+                            + " exclusive, status, expires_at, created_by, created_at, closed_at)"
+                            + " VALUES ('REQ-2',1,2,'R',0,0,0,'ACTIVE','" + Timestamp.from(expiry)
+                            + "','alice','" + Timestamp.from(now) + "',NULL)");
+                } catch (Exception e) {
+                    nonPositiveQuantityRejected = true;
+                }
+                assertThat(nonPositiveQuantityRejected).isTrue();
+            }
+        }
+    }
 }

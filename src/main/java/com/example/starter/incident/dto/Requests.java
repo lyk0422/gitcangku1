@@ -55,4 +55,30 @@ public final class Requests {
     /** 任务完成/取消请求，操作人由 X-Actor-Id 指定且须为当前指挥人。 */
     public record TaskActionRequest(String commandKey) {
     }
+
+    /**
+     * 事件资源可用量登记请求：resourceCode 事件内唯一；quantity 为初始可用数量（件，非负整数）。
+     * 同一事件同一资源重复登记相同数量幂等返回，登记不同数量返回 409。
+     */
+    public record ResourceRegisterRequest(String resourceCode, Integer quantity) {
+    }
+
+    /**
+     * 跨事件互助资源征调请求。
+     * requestId 为调用方征调幂等键，全局唯一：同键同内容重放首次双侧账务响应，
+     * 同键改数量或改目标事件（及其他任一参数）返回 409。
+     * quantity 为征调数量（件，正整数）；exclusive 为 true 时排他占用该资源；
+     * expiresAt 为租约 UTC 到期时刻，必须晚于提交时刻；到期不自动虚构归还。
+     */
+    public record AidRequestRequest(String requestId, String sourceIncidentKey,
+                                    String targetIncidentKey, String resourceCode, Integer quantity,
+                                    Boolean exclusive, Instant expiresAt) {
+    }
+
+    /**
+     * 租约归还请求：commandKey 为归还操作幂等键；quantity 为本次实际归还数量（件，正整数），
+     * 超过未归还量返回 422 且不留下部分变更。
+     */
+    public record AidReturnRequest(String commandKey, Integer quantity) {
+    }
 }
