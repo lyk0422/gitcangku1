@@ -35,8 +35,11 @@ class ArtifactControllerHttpTest {
 
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM lock_file_exception");
         jdbcTemplate.update("DELETE FROM lock_file_entry");
         jdbcTemplate.update("DELETE FROM lock_file");
+        jdbcTemplate.update("DELETE FROM risk_exception_approval");
+        jdbcTemplate.update("DELETE FROM risk_exception");
         jdbcTemplate.update("DELETE FROM artifact_dependency");
         jdbcTemplate.update("DELETE FROM artifact");
         jdbcTemplate.update("DELETE FROM idempotent_request");
@@ -217,5 +220,144 @@ class ArtifactControllerHttpTest {
                 new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
                 JsonNode.class);
         assertThat(lockOnWithdrawn.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+    }
+
+    @Test
+    void highRiskDependencyRequiresDualApprovedExactVersionException() {
+        // A:1 -> X@1.0（X 版本 1，区间 [1,1]）；登记 A、X 后把 X:1 标记为 HIGH。
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("A", 1, dependency("X", 1, 1)),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("X", 1),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        ResponseEntity<JsonNode> marked = restTemplate.exchange(
+                "/api/artifacts/X/versions/1/risk",
+                HttpMethod.POST,
+                new HttpEntity<>("{\"riskLevel\":\"HIGH\"}",
+                        jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(marked.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(marked.getBody().path("riskLevel").asText()).isEqualTo("HIGH");
+        assertThat(marked.getBody().path("repositoryVersion").asLong()).isEqualTo(3L);
+
+        // 未豁免锁定 → 422，且不产生锁文件。
+        String lockBody = "{\"rootName\":\"A\",\"rootVersion\":1,\"expectedRepositoryVersion\":3}";
+        ResponseEntity<JsonNode> blocked = restTemplate.postForEntity("/api/artifacts/locks",
+                new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(blocked.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+        assertThat(blocked.getBody().path("message").asText()).contains("X:1").contains("HIGH");
+
+        // 创建豁免申请：仅适用 X@1.0。
+        String createBody = "{\"dependencyName\":\"X\",\"dependencyVersion\":1,"
+                + "\"expiresAt\":\"2027-01-01T00:00:00Z\",\"reason\":\"大客户兼容性窗口\"}";
+        ResponseEntity<JsonNode> created = restTemplate.postForEntity(
+                "/api/dependency-exceptions",
+                new HttpEntity<>(createBody, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        long exceptionId = created.getBody().path("id").asLong();
+        assertThat(created.getBody().path("status").asText()).isEqualTo("PENDING");
+
+        // 甲批准后仍 422。
+        ResponseEntity<JsonNode> firstApproval = restTemplate.postForEntity(
+                "/api/dependency-exceptions/{id}/approvals",
+                new HttpEntity<>("{\"approver\":\"jia\",\"contentVersion\":1}",
+                        jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class, exceptionId);
+        assertThat(firstApproval.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(firstApproval.getBody().path("status").asText()).isEqualTo("PENDING");
+
+        String lockWithException = "{\"rootName\":\"A\",\"rootVersion\":1,"
+                + "\"expectedRepositoryVersion\":3,\"exceptions\":[" + exceptionId + "]}";
+        ResponseEntity<JsonNode> stillBlocked = restTemplate.postForEntity("/api/artifacts/locks",
+                new HttpEntity<>(lockWithException, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(stillBlocked.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+
+        // 同一审批人重复确认 → 422；乙批准另一人后生效。
+        ResponseEntity<JsonNode> duplicateApprover = restTemplate.postForEntity(
+                "/api/dependency-exceptions/{id}/approvals",
+                new HttpEntity<>("{\"approver\":\"jia\"}",
+                        jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class, exceptionId);
+        assertThat(duplicateApprover.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+
+        ResponseEntity<JsonNode> secondApproval = restTemplate.postForEntity(
+                "/api/dependency-exceptions/{id}/approvals",
+                new HttpEntity<>("{\"approver\":\"yi\"}",
+                        jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class, exceptionId);
+        assertThat(secondApproval.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(secondApproval.getBody().path("status").asText()).isEqualTo("APPROVED");
+        assertThat(secondApproval.getBody().path("approvers").get(0).asText()).isEqualTo("jia");
+        assertThat(secondApproval.getBody().path("approvers").get(1).asText()).isEqualTo("yi");
+
+        // 双人批准后锁定成功，条目固化 HIGH 与豁免 ID，响应携带豁免依据快照。
+        ResponseEntity<JsonNode> locked = restTemplate.postForEntity("/api/artifacts/locks",
+                new HttpEntity<>(lockWithException, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(locked.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(locked.getBody().path("entries")).hasSize(2);
+        JsonNode xEntry = locked.getBody().path("entries").get(1);
+        assertThat(xEntry.path("name").asText()).isEqualTo("X");
+        assertThat(xEntry.path("version").asInt()).isEqualTo(1);
+        assertThat(xEntry.path("riskLevel").asText()).isEqualTo("HIGH");
+        assertThat(xEntry.path("exceptionId").asLong()).isEqualTo(exceptionId);
+        JsonNode evidence = locked.getBody().path("exceptions").get(0);
+        assertThat(evidence.path("dependencyName").asText()).isEqualTo("X");
+        assertThat(evidence.path("dependencyVersion").asInt()).isEqualTo(1);
+        assertThat(evidence.path("status").asText()).isEqualTo("APPROVED");
+        assertThat(evidence.path("approvers").get(0).asText()).isEqualTo("jia");
+        assertThat(evidence.path("approvers").get(1).asText()).isEqualTo("yi");
+
+        // X@1.1（X 版本 2，HIGH）：用 X@1.0 的豁免 → 422 版本不符。
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("A", 2, dependency("X", 2, 2)),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("X", 2),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        restTemplate.exchange("/api/artifacts/X/versions/2/risk",
+                HttpMethod.POST,
+                new HttpEntity<>("{\"riskLevel\":\"HIGH\"}",
+                        jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        String lockA2 = "{\"rootName\":\"A\",\"rootVersion\":2,\"expectedRepositoryVersion\":6,"
+                + "\"exceptions\":[" + exceptionId + "]}";
+        ResponseEntity<JsonNode> wrongVersion = restTemplate.postForEntity("/api/artifacts/locks",
+                new HttpEntity<>(lockA2, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(wrongVersion.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+        assertThat(wrongVersion.getBody().path("message").asText()).contains("版本不符");
+
+        // 撤销豁免后新锁定 422，历史锁查询仍保留 APPROVED 依据。
+        ResponseEntity<JsonNode> revoked = restTemplate.postForEntity(
+                "/api/dependency-exceptions/{id}/revocation",
+                new HttpEntity<>("{\"revoker\":\"sec\"}",
+                        jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class, exceptionId);
+        assertThat(revoked.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(revoked.getBody().path("status").asText()).isEqualTo("REVOKED");
+        // 撤销后仓库版本已前进到 6：用当前版本号重新锁 A:1，命中的是豁免撤销门禁而非版本门禁。
+        String lockA1AtVersion6 = "{\"rootName\":\"A\",\"rootVersion\":1,\"expectedRepositoryVersion\":6,"
+                + "\"exceptions\":[" + exceptionId + "]}";
+        ResponseEntity<JsonNode> afterRevoke = restTemplate.postForEntity("/api/artifacts/locks",
+                new HttpEntity<>(lockA1AtVersion6, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(afterRevoke.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+        assertThat(afterRevoke.getBody().path("message").asText()).contains("撤销");
+
+        ResponseEntity<JsonNode> exceptionView = restTemplate.getForEntity(
+                "/api/dependency-exceptions/{id}", JsonNode.class, exceptionId);
+        assertThat(exceptionView.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(exceptionView.getBody().path("status").asText()).isEqualTo("REVOKED");
+
+        ResponseEntity<JsonNode> historyList = restTemplate.getForEntity(
+                "/api/artifacts/locks", JsonNode.class);
+        assertThat(historyList.getBody()).hasSize(1);
+        assertThat(historyList.getBody().get(0).path("exceptions").get(0).path("status").asText())
+                .isEqualTo("APPROVED");
     }
 }

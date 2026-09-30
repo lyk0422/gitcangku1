@@ -3,6 +3,7 @@ package com.example.starter.repo;
 import com.example.starter.domain.ArtifactVersion;
 import com.example.starter.domain.DependencyRange;
 import com.example.starter.domain.RepositorySnapshot;
+import com.example.starter.domain.RiskLevel;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.support.GeneratedKeyHolder;
 import org.springframework.jdbc.support.KeyHolder;
@@ -13,6 +14,7 @@ import java.sql.Statement;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -56,9 +58,11 @@ public class RepositoryDao {
      */
     public RepositorySnapshot loadSnapshot() {
         List<ArtifactRow> rows = jdbcTemplate.query(
-                "SELECT id, name, version, withdrawn FROM artifact ORDER BY name ASC, version DESC",
+                "SELECT id, name, version, withdrawn, risk_level FROM artifact "
+                        + "ORDER BY name ASC, version DESC",
                 (rs, n) -> new ArtifactRow(rs.getLong("id"), rs.getString("name"),
-                        rs.getInt("version"), rs.getInt("withdrawn") == 1));
+                        rs.getInt("version"), rs.getInt("withdrawn") == 1,
+                        RiskLevel.valueOf(rs.getString("risk_level"))));
 
         List<DepRow> depRows = jdbcTemplate.query(
                 "SELECT artifact_id, name, minimum_version, maximum_version FROM artifact_dependency",
@@ -73,7 +77,7 @@ public class RepositoryDao {
         for (ArtifactRow row : rows) {
             List<DependencyRange> deps = depsByArtifact.getOrDefault(row.id(), List.of());
             ArtifactVersion version = new ArtifactVersion(row.id(), row.name(), row.version(),
-                    row.withdrawn(), List.copyOf(deps));
+                    row.riskLevel(), row.withdrawn(), List.copyOf(deps));
             artifacts.computeIfAbsent(row.name(), k -> new ArrayList<>()).add(version);
         }
         return new RepositorySnapshot(getRepositoryVersion(), Map.copyOf(artifacts));
@@ -102,15 +106,17 @@ public class RepositoryDao {
     }
 
     /** 新增制品版本，返回自增主键。 */
-    public long insertArtifact(String name, int version, Instant createdAt) {
+    public long insertArtifact(String name, int version, RiskLevel riskLevel, Instant createdAt) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbcTemplate.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO artifact (name, version, withdrawn, created_at) VALUES (?, ?, 0, ?)",
+                    "INSERT INTO artifact (name, version, withdrawn, risk_level, created_at) "
+                            + "VALUES (?, ?, 0, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, name);
             ps.setInt(2, version);
-            ps.setTimestamp(3, Timestamp.from(createdAt));
+            ps.setString(3, riskLevel.name());
+            ps.setTimestamp(4, Timestamp.from(createdAt));
             return ps;
         }, keyHolder);
         Number key = keyHolder.getKey();
@@ -131,9 +137,11 @@ public class RepositoryDao {
     /** 读取单个制品版本（含依赖），不存在返回 null。 */
     public ArtifactVersion loadArtifact(String name, int version) {
         List<ArtifactRow> rows = jdbcTemplate.query(
-                "SELECT id, name, version, withdrawn FROM artifact WHERE name = ? AND version = ?",
+                "SELECT id, name, version, withdrawn, risk_level FROM artifact "
+                        + "WHERE name = ? AND version = ?",
                 (rs, n) -> new ArtifactRow(rs.getLong("id"), rs.getString("name"),
-                        rs.getInt("version"), rs.getInt("withdrawn") == 1),
+                        rs.getInt("version"), rs.getInt("withdrawn") == 1,
+                        RiskLevel.valueOf(rs.getString("risk_level"))),
                 name, version);
         if (rows.isEmpty()) {
             return null;
@@ -144,8 +152,31 @@ public class RepositoryDao {
                 (rs, n) -> new DependencyRange(rs.getString("name"),
                         rs.getInt("minimum_version"), rs.getInt("maximum_version")),
                 row.id());
-        return new ArtifactVersion(row.id(), row.name(), row.version(), row.withdrawn(),
-                List.copyOf(deps));
+        return new ArtifactVersion(row.id(), row.name(), row.version(),
+                row.riskLevel(), row.withdrawn(), List.copyOf(deps));
+    }
+
+    /** 按主键读取制品版本，不存在返回 null（锁定事务内按解决方案精确取风险级别）。 */
+    public ArtifactVersion loadArtifactById(long id) {
+        List<ArtifactRow> rows = jdbcTemplate.query(
+                "SELECT id, name, version, withdrawn, risk_level FROM artifact WHERE id = ?",
+                (rs, n) -> new ArtifactRow(rs.getLong("id"), rs.getString("name"),
+                        rs.getInt("version"), rs.getInt("withdrawn") == 1,
+                        RiskLevel.valueOf(rs.getString("risk_level"))),
+                id);
+        if (rows.isEmpty()) {
+            return null;
+        }
+        ArtifactRow row = rows.get(0);
+        return new ArtifactVersion(row.id(), row.name(), row.version(),
+                row.riskLevel(), row.withdrawn(), List.of());
+    }
+
+    /** 标记风险级别，返回受影响行数（制品版本不存在时为 0）。 */
+    public int updateRiskLevel(String name, int version, RiskLevel riskLevel) {
+        return jdbcTemplate.update(
+                "UPDATE artifact SET risk_level = ? WHERE name = ? AND version = ?",
+                riskLevel.name(), name, version);
     }
 
     /** 仓库版本号加一，返回加一后的版本号（须在持有行锁时调用）。 */
@@ -186,11 +217,13 @@ public class RepositoryDao {
         return key.longValue();
     }
 
-    /** 新增锁文件精确版本条目。 */
-    public void insertLockEntry(long lockFileId, String name, int version) {
+    /** 新增锁文件精确版本条目，固化锁定时风险级别与所用豁免 ID。 */
+    public void insertLockEntry(long lockFileId, String name, int version,
+                                RiskLevel riskLevel, Long exceptionId) {
         jdbcTemplate.update(
-                "INSERT INTO lock_file_entry (lock_file_id, name, version) VALUES (?, ?, ?)",
-                lockFileId, name, version);
+                "INSERT INTO lock_file_entry (lock_file_id, name, version, risk_level, exception_id) "
+                        + "VALUES (?, ?, ?, ?, ?)",
+                lockFileId, name, version, riskLevel.name(), exceptionId);
     }
 
     /** 幂等记录视图。 */
@@ -238,8 +271,9 @@ public class RepositoryDao {
                               long repositoryVersion, Instant createdAt) {
     }
 
-    /** 锁文件条目行。 */
-    public record LockEntryRow(long lockFileId, String name, int version) {
+    /** 锁文件条目行：含锁定时固化的风险级别与所用豁免 ID（可能为空）。 */
+    public record LockEntryRow(long lockFileId, String name, int version,
+                               RiskLevel riskLevel, Long exceptionId) {
     }
 
     /** 查询全部历史锁文件，按 ID 升序。 */
@@ -267,14 +301,200 @@ public class RepositoryDao {
     /** 查询某锁文件的全部条目，按名称升序。 */
     public List<LockEntryRow> listLockEntries(long lockFileId) {
         return jdbcTemplate.query(
-                "SELECT lock_file_id, name, version FROM lock_file_entry "
+                "SELECT lock_file_id, name, version, risk_level, exception_id FROM lock_file_entry "
                         + "WHERE lock_file_id = ? ORDER BY name ASC",
                 (rs, n) -> new LockEntryRow(rs.getLong("lock_file_id"),
-                        rs.getString("name"), rs.getInt("version")),
+                        rs.getString("name"), rs.getInt("version"),
+                        RiskLevel.valueOf(rs.getString("risk_level")),
+                        (Long) rs.getObject("exception_id")),
                 lockFileId);
     }
 
-    private record ArtifactRow(long id, String name, int version, boolean withdrawn) {
+    /** 豁免申请行。 */
+    public record ExceptionRow(
+            long id,
+            String dependencyName,
+            int dependencyVersion,
+            Instant expiresAt,
+            String reason,
+            String status,
+            int contentVersion,
+            Instant createdAt,
+            Instant approvedAt,
+            Instant revokedAt) {
+    }
+
+    /** 新增豁免申请（PENDING），返回自增主键。 */
+    public long insertException(String dependencyName, int dependencyVersion,
+                                Instant expiresAt, String reason, Instant createdAt) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbcTemplate.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO risk_exception (dependency_name, dependency_version, expires_at, "
+                            + "reason, status, content_version, created_at) "
+                            + "VALUES (?, ?, ?, ?, 'PENDING', 1, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, dependencyName);
+            ps.setInt(2, dependencyVersion);
+            ps.setTimestamp(3, Timestamp.from(expiresAt));
+            ps.setString(4, reason);
+            ps.setTimestamp(5, Timestamp.from(createdAt));
+            return ps;
+        }, keyHolder);
+        Number key = keyHolder.getKey();
+        if (key == null) {
+            throw new IllegalStateException("插入豁免申请未获取自增主键");
+        }
+        return key.longValue();
+    }
+
+    /** 按主键读取豁免申请（加行锁，审批/撤销/锁定事务内使用），不存在返回 null。 */
+    public ExceptionRow lockException(long id) {
+        List<ExceptionRow> rows = jdbcTemplate.query(
+                "SELECT id, dependency_name, dependency_version, expires_at, reason, status, "
+                        + "content_version, created_at, approved_at, revoked_at "
+                        + "FROM risk_exception WHERE id = ? FOR UPDATE",
+                (rs, n) -> mapExceptionRow(rs), id);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /** 按主键读取豁免申请（不加锁，查询使用），不存在返回 null。 */
+    public ExceptionRow getException(long id) {
+        List<ExceptionRow> rows = jdbcTemplate.query(
+                "SELECT id, dependency_name, dependency_version, expires_at, reason, status, "
+                        + "content_version, created_at, approved_at, revoked_at "
+                        + "FROM risk_exception WHERE id = ?",
+                (rs, n) -> mapExceptionRow(rs), id);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /** 按 ID 批量读取豁免申请（不加锁）。 */
+    public Map<Long, ExceptionRow> getExceptions(java.util.Collection<Long> ids) {
+        if (ids.isEmpty()) {
+            return Map.of();
+        }
+        String placeholders = ids.stream().map(x -> "?").collect(Collectors.joining(","));
+        List<ExceptionRow> rows = jdbcTemplate.query(
+                "SELECT id, dependency_name, dependency_version, expires_at, reason, status, "
+                        + "content_version, created_at, approved_at, revoked_at "
+                        + "FROM risk_exception WHERE id IN (" + placeholders + ")",
+                (rs, n) -> mapExceptionRow(rs), ids.toArray());
+        Map<Long, ExceptionRow> map = new LinkedHashMap<>();
+        for (ExceptionRow row : rows) {
+            map.put(row.id(), row);
+        }
+        return map;
+    }
+
+    /** 查询全部豁免申请，按 ID 升序。 */
+    public List<ExceptionRow> listExceptions() {
+        return jdbcTemplate.query(
+                "SELECT id, dependency_name, dependency_version, expires_at, reason, status, "
+                        + "content_version, created_at, approved_at, revoked_at "
+                        + "FROM risk_exception ORDER BY id ASC",
+                (rs, n) -> mapExceptionRow(rs));
+    }
+
+    private ExceptionRow mapExceptionRow(java.sql.ResultSet rs) throws java.sql.SQLException {
+        Timestamp approvedAt = rs.getTimestamp("approved_at");
+        Timestamp revokedAt = rs.getTimestamp("revoked_at");
+        return new ExceptionRow(rs.getLong("id"),
+                rs.getString("dependency_name"),
+                rs.getInt("dependency_version"),
+                rs.getTimestamp("expires_at").toInstant(),
+                rs.getString("reason"),
+                rs.getString("status"),
+                rs.getInt("content_version"),
+                rs.getTimestamp("created_at").toInstant(),
+                approvedAt == null ? null : approvedAt.toInstant(),
+                revokedAt == null ? null : revokedAt.toInstant());
+    }
+
+    /** 读取豁免的审批人列表（按确认先后），须在已锁定申请行的事务内调用。 */
+    public List<String> listApprovers(long exceptionId) {
+        return jdbcTemplate.query(
+                "SELECT approver FROM risk_exception_approval WHERE exception_id = ? ORDER BY id ASC",
+                (rs, n) -> rs.getString("approver"), exceptionId);
+    }
+
+    /**
+     * 写入一条审批确认；同一申请同一审批人重复确认由唯一索引拦截。
+     */
+    public void insertApproval(long exceptionId, String approver, int contentVersion, Instant approvedAt) {
+        jdbcTemplate.update(
+                "INSERT INTO risk_exception_approval (exception_id, approver, content_version, approved_at) "
+                        + "VALUES (?, ?, ?, ?)",
+                exceptionId, approver, contentVersion, Timestamp.from(approvedAt));
+    }
+
+    /** 将豁免申请置为生效（第二名审批人确认时调用）。 */
+    public int markExceptionApproved(long id, int contentVersion, Instant approvedAt) {
+        return jdbcTemplate.update(
+                "UPDATE risk_exception SET status = 'APPROVED', approved_at = ? "
+                        + "WHERE id = ? AND status = 'PENDING' AND content_version = ?",
+                Timestamp.from(approvedAt), id, contentVersion);
+    }
+
+    /** 撤销已生效豁免，返回受影响行数（非 APPROVED 状态为 0）。 */
+    public int markExceptionRevoked(long id, Instant revokedAt) {
+        return jdbcTemplate.update(
+                "UPDATE risk_exception SET status = 'REVOKED', revoked_at = ? "
+                        + "WHERE id = ? AND status = 'APPROVED'",
+                Timestamp.from(revokedAt), id);
+    }
+
+    /** 新增锁文件的豁免依据固化快照。 */
+    public void insertLockException(long lockFileId, long exceptionId,
+                                    String dependencyName, int dependencyVersion,
+                                    Instant expiresAt, String reason, String status,
+                                    String approversCsv, Instant lockedAt) {
+        jdbcTemplate.update(
+                "INSERT INTO lock_file_exception (lock_file_id, exception_id, dependency_name, "
+                        + "dependency_version, expires_at, reason, status, approvers, locked_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                lockFileId, exceptionId, dependencyName, dependencyVersion,
+                Timestamp.from(expiresAt), reason, status, approversCsv, Timestamp.from(lockedAt));
+    }
+
+    /** 锁文件豁免依据快照行。 */
+    public record LockExceptionRow(
+            long lockFileId,
+            long exceptionId,
+            String dependencyName,
+            int dependencyVersion,
+            Instant expiresAt,
+            String reason,
+            String status,
+            List<String> approvers,
+            Instant lockedAt) {
+    }
+
+    /** 查询某锁文件固化的豁免依据，按依赖名称升序。 */
+    public List<LockExceptionRow> listLockExceptions(long lockFileId) {
+        return jdbcTemplate.query(
+                "SELECT lock_file_id, exception_id, dependency_name, dependency_version, "
+                        + "expires_at, reason, status, approvers, locked_at "
+                        + "FROM lock_file_exception WHERE lock_file_id = ? "
+                        + "ORDER BY dependency_name ASC",
+                (rs, n) -> {
+                    String approversCsv = rs.getString("approvers");
+                    List<String> approvers = approversCsv.isBlank()
+                            ? List.of()
+                            : Arrays.stream(approversCsv.split(",")).toList();
+                    return new LockExceptionRow(rs.getLong("lock_file_id"),
+                            rs.getLong("exception_id"),
+                            rs.getString("dependency_name"),
+                            rs.getInt("dependency_version"),
+                            rs.getTimestamp("expires_at").toInstant(),
+                            rs.getString("reason"),
+                            rs.getString("status"),
+                            approvers,
+                            rs.getTimestamp("locked_at").toInstant());
+                }, lockFileId);
+    }
+
+    private record ArtifactRow(long id, String name, int version, boolean withdrawn,
+                               RiskLevel riskLevel) {
     }
 
     private record DepRow(long artifactId, String name, int minimumVersion, int maximumVersion) {
