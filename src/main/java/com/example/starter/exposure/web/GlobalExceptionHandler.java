@@ -18,7 +18,10 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(ApiException.class)
     public ResponseEntity<ErrorResponse> handleApi(ApiException ex) {
-        return build(ex.getStatus(), ex.getMessage(), null);
+        HttpStatus status = ex.getStatus();
+        return ResponseEntity.status(status)
+                .body(new ErrorResponse(status.value(), status.getReasonPhrase(), ex.getMessage(),
+                        null, ex.getNextAvailableHourStartUtc()));
     }
 
     @ExceptionHandler({
