@@ -113,6 +113,20 @@ public class PlayoutRepository {
                     rs.getString("cancel_request_id"),
                     (Long) rs.getObject("cancelled_at_ms"), rs.getLong("created_at_ms"));
 
+    private static final RowMapper<RegionRow> REGION_MAPPER = (rs, n) ->
+            new RegionRow(rs.getString("id"));
+
+    private static final RowMapper<RegionGrantRow> REGION_GRANT_MAPPER = (rs, n) ->
+            new RegionGrantRow(rs.getLong("id"), rs.getString("region_id"), rs.getString("asset_id"),
+                    rs.getLong("version"), rs.getLong("valid_from_ms"), rs.getLong("valid_to_ms"),
+                    rs.getBoolean("revoked"));
+
+    private static final RowMapper<RegionAllocationRow> REGION_ALLOCATION_MAPPER = (rs, n) ->
+            new RegionAllocationRow(rs.getLong("id"), rs.getString("request_id"),
+                    rs.getString("region_id"), rs.getString("asset_id"),
+                    rs.getLong("grant_id"), rs.getLong("grant_version"),
+                    rs.getLong("start_ms"), rs.getLong("end_ms"));
+
     // ---------- 素材 ----------
 
     public void insertAsset(String id, long durationMs, long createdAtMs) {
@@ -380,5 +394,150 @@ public class PlayoutRepository {
                         + " SET status = 'CANCELLED', cancel_request_id = ?, cancelled_at_ms = ?"
                         + " WHERE override_key = ? AND status = 'ACTIVE'",
                 cancelRequestId, cancelledAtMs, overrideKey);
+    }
+
+    // ---------- 区域切换（骨架，实现稍后补齐） ----------
+
+    /** 区域行。 */
+    public record RegionRow(String id) {
+    }
+
+    /** 区域授权行；version 为同 region+asset 下的授权版本，从 1 起递增。 */
+    public record RegionGrantRow(long id, String regionId, String assetId, long version,
+                                 long validFromMs, long validToMs, boolean revoked) {
+    }
+
+    /** 区域占位行；区间左闭右开，grantId/grantVersion 为提交时固化的授权。 */
+    public record RegionAllocationRow(long id, String requestId, String regionId, String assetId,
+                                      long grantId, long grantVersion,
+                                      long startMs, long endMs) {
+    }
+
+    /** 创建区域。 */
+    public void insertRegion(String id, long createdAtMs) {
+        jdbc.update("INSERT INTO playout_region (id, created_at_ms) VALUES (?, ?)",
+                id, createdAtMs);
+    }
+
+    /** 查询区域。 */
+    public Optional<RegionRow> findRegion(String id) {
+        return jdbc.query("SELECT id FROM playout_region WHERE id = ?",
+                REGION_MAPPER, id).stream().findFirst();
+    }
+
+    /** 当前 region+asset 最大授权版本，无记录时为 0；须在区域锁内调用以串行化版本分配。 */
+    public long currentRegionGrantVersion(String regionId, String assetId) {
+        Long version = jdbc.queryForObject(
+                "SELECT MAX(version) FROM playout_region_grant WHERE region_id = ? AND asset_id = ?",
+                Long.class, regionId, assetId);
+        return version == null ? 0L : version;
+    }
+
+    /** 创建区域授权（显式版本号，调用方在锁内取版本）。 */
+    public long insertRegionGrant(String regionId, String assetId, long version,
+                                  long validFromMs, long validToMs, long createdAtMs) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO playout_region_grant"
+                            + " (region_id, asset_id, version, valid_from_ms, valid_to_ms, created_at_ms)"
+                            + " VALUES (?, ?, ?, ?, ?, ?)", Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, regionId);
+            ps.setString(2, assetId);
+            ps.setLong(3, version);
+            ps.setLong(4, validFromMs);
+            ps.setLong(5, validToMs);
+            ps.setLong(6, createdAtMs);
+            return ps;
+        }, keyHolder);
+        return keyHolder.getKey().longValue();
+    }
+
+    /** 按 ID 查询区域授权。 */
+    public Optional<RegionGrantRow> findRegionGrant(long id) {
+        return jdbc.query("SELECT id, region_id, asset_id, version, valid_from_ms, valid_to_ms, revoked"
+                + " FROM playout_region_grant WHERE id = ?", REGION_GRANT_MAPPER, id)
+                .stream().findFirst();
+    }
+
+    /** 按 ID 查询区域授权并加行锁。 */
+    public Optional<RegionGrantRow> findRegionGrantForUpdate(long id) {
+        return jdbc.query("SELECT id, region_id, asset_id, version, valid_from_ms, valid_to_ms, revoked"
+                + " FROM playout_region_grant WHERE id = ? FOR UPDATE", REGION_GRANT_MAPPER, id)
+                .stream().findFirst();
+    }
+
+    /** 撤销区域授权；返回受影响行数，0 表示不存在或已撤销。 */
+    public int revokeRegionGrant(long id, String revokeRequestId, long revokedAtMs) {
+        return jdbc.update("UPDATE playout_region_grant"
+                        + " SET revoked = 1, revoke_request_id = ?, revoked_at_ms = ?"
+                        + " WHERE id = ? AND revoked = 0",
+                revokeRequestId, revokedAtMs, id);
+    }
+
+    /** 锁定区域行，串行化同区域的授权版本分配与编排提交（H2 无间隙锁，MySQL 下同样安全）。 */
+    public void lockRegionForUpdate(String regionId) {
+        jdbc.queryForList("SELECT id FROM playout_region WHERE id = ? FOR UPDATE", regionId);
+    }
+
+    /** 查找区域内完整覆盖 [startMs, endMs) 的未撤销授权并加行锁（区间左闭右开）。 */
+    public List<RegionGrantRow> findCoveringRegionGrantsForUpdate(String regionId, String assetId,
+                                                                  long startMs, long endMs) {
+        return jdbc.query("SELECT id, region_id, asset_id, version, valid_from_ms, valid_to_ms, revoked"
+                        + " FROM playout_region_grant"
+                        + " WHERE region_id = ? AND asset_id = ?"
+                        + " AND valid_from_ms <= ? AND valid_to_ms >= ?"
+                        + " ORDER BY version DESC, id FOR UPDATE",
+                REGION_GRANT_MAPPER, regionId, assetId, startMs, endMs);
+    }
+
+    /** 查找区域内与 [startMs, endMs) 相交的全部占位并加锁（start < end2 AND end > start，相邻不算相交）。 */
+    public List<RegionAllocationRow> findRegionOverlapsForUpdate(String regionId,
+                                                                 long startMs, long endMs) {
+        return jdbc.query("SELECT id, request_id, region_id, asset_id, grant_id, grant_version,"
+                        + " start_ms, end_ms FROM playout_region_allocation"
+                        + " WHERE region_id = ? AND start_ms < ? AND end_ms > ?"
+                        + " ORDER BY start_ms, id FOR UPDATE",
+                REGION_ALLOCATION_MAPPER, regionId, endMs, startMs);
+    }
+
+    /** 插入区域占位，返回自增 ID。 */
+    public long insertRegionAllocation(String requestId, String regionId, String assetId,
+                                       long grantId, long grantVersion,
+                                       long startMs, long endMs, long createdAtMs) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO playout_region_allocation"
+                            + " (request_id, region_id, asset_id, grant_id, grant_version,"
+                            + "  start_ms, end_ms, created_at_ms)"
+                            + " VALUES (?, ?, ?, ?, ?, ?, ?, ?)", Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, requestId);
+            ps.setString(2, regionId);
+            ps.setString(3, assetId);
+            ps.setLong(4, grantId);
+            ps.setLong(5, grantVersion);
+            ps.setLong(6, startMs);
+            ps.setLong(7, endMs);
+            ps.setLong(8, createdAtMs);
+            return ps;
+        }, keyHolder);
+        return keyHolder.getKey().longValue();
+    }
+
+    /** 查询某区域全部占位，按开始时刻排序。 */
+    public List<RegionAllocationRow> findRegionAllocations(String regionId) {
+        return jdbc.query("SELECT id, request_id, region_id, asset_id, grant_id, grant_version,"
+                        + " start_ms, end_ms FROM playout_region_allocation"
+                        + " WHERE region_id = ? ORDER BY start_ms, id",
+                REGION_ALLOCATION_MAPPER, regionId);
+    }
+
+    /** 查询全部区域占位（编排员视图），按区域与开始时刻排序。 */
+    public List<RegionAllocationRow> findAllRegionAllocations() {
+        return jdbc.query("SELECT id, request_id, region_id, asset_id, grant_id, grant_version,"
+                        + " start_ms, end_ms FROM playout_region_allocation"
+                        + " ORDER BY region_id, start_ms, id",
+                REGION_ALLOCATION_MAPPER);
     }
 }

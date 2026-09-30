@@ -91,3 +91,42 @@ CREATE TABLE IF NOT EXISTS playout_emergency_override (
 );
 CREATE INDEX IF NOT EXISTS idx_override_playout
     ON playout_emergency_override (channel_id, status, start_ms, end_ms, priority);
+
+-- 区域切换：区域 / 区域授权（带版本）/ 区域占位。时间均为 UTC 纪元毫秒，区间左闭右开。
+
+CREATE TABLE IF NOT EXISTS playout_region (
+    id            VARCHAR(64) NOT NULL PRIMARY KEY,
+    created_at_ms BIGINT      NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS playout_region_grant (
+    id                BIGINT      NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    region_id         VARCHAR(64) NOT NULL,
+    asset_id         VARCHAR(64) NOT NULL,
+    version           BIGINT      NOT NULL,
+    valid_from_ms     BIGINT      NOT NULL,
+    valid_to_ms       BIGINT      NOT NULL,
+    revoked           TINYINT(1)  NOT NULL DEFAULT 0,
+    revoke_request_id VARCHAR(64) NULL,
+    revoked_at_ms     BIGINT      NULL,
+    created_at_ms     BIGINT      NOT NULL,
+    UNIQUE (region_id, asset_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_region_grant_coverage
+    ON playout_region_grant (region_id, asset_id, revoked, valid_from_ms, valid_to_ms);
+
+CREATE TABLE IF NOT EXISTS playout_region_allocation (
+    id            BIGINT      NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    request_id    VARCHAR(64) NOT NULL,
+    region_id     VARCHAR(64) NOT NULL,
+    asset_id      VARCHAR(64) NOT NULL,
+    grant_id      BIGINT      NOT NULL,
+    grant_version BIGINT      NOT NULL,
+    start_ms      BIGINT      NOT NULL,
+    end_ms        BIGINT      NOT NULL,
+    created_at_ms BIGINT      NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_region_allocation_window
+    ON playout_region_allocation (region_id, start_ms, end_ms);
+CREATE UNIQUE INDEX IF NOT EXISTS uk_region_allocation_request
+    ON playout_region_allocation (request_id, region_id);

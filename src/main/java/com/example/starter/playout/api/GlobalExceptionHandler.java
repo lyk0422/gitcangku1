@@ -1,6 +1,7 @@
 package com.example.starter.playout.api;
 
 import com.example.starter.playout.api.Dtos.ErrorResponse;
+import com.example.starter.playout.api.Dtos.RegionalAllocationErrorResponse;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -25,6 +26,15 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorResponse> handleApi(ApiException ex) {
         return ResponseEntity.status(ex.status())
                 .body(new ErrorResponse(ex.code(), ex.getMessage()));
+    }
+
+    /** 区域编排整单 422：返回逐区域冲突原因，调用方可据此修正后整单重提。 */
+    @ExceptionHandler(RegionalAllocationException.class)
+    public ResponseEntity<RegionalAllocationErrorResponse> handleRegionalAllocation(
+            RegionalAllocationException ex) {
+        return ResponseEntity.status(ex.status())
+                .body(new RegionalAllocationErrorResponse(ex.code(), ex.getMessage(),
+                        ex.conflicts()));
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)

@@ -3,6 +3,7 @@ package com.example.starter.playout.api;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotEmpty;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.PositiveOrZero;
@@ -170,5 +171,107 @@ public final class Dtos {
 
     /** 统一错误响应体。 */
     public record ErrorResponse(String error, String message) {
+    }
+
+    // ---------- 区域切换 ----------
+
+    /** 创建区域请求；id 为空时由系统生成稳定 ID。 */
+    public record CreateRegionRequest(String id) {
+    }
+
+    /** 区域响应。 */
+    public record RegionResponse(String id) {
+    }
+
+    /** 创建区域授权请求，有效区间 [validFrom, validTo) 左闭右开，时间为 UTC 绝对时刻。 */
+    public record CreateRegionGrantRequest(
+            @NotBlank String assetId,
+            @NotNull OffsetDateTime validFrom,
+            @NotNull OffsetDateTime validTo) {
+    }
+
+    /** 区域授权响应；version 为同一 region+asset 下从 1 起递增的授权版本，撤销为终态。 */
+    public record RegionGrantResponse(
+            long id,
+            String regionId,
+            String assetId,
+            long version,
+            OffsetDateTime validFrom,
+            OffsetDateTime validTo,
+            boolean revoked) {
+    }
+
+    /** 撤销区域授权请求（幂等）。 */
+    public record RevokeRegionGrantRequest(@NotBlank String requestId) {
+    }
+
+    /** 区域时段输入：把素材安排到某区域的 [start, end)（UTC 绝对时刻，左闭右开）。 */
+    public record RegionSegmentInput(
+            @NotBlank String regionId,
+            @NotNull OffsetDateTime start,
+            @NotNull OffsetDateTime end) {
+    }
+
+    /**
+     * 区域编排整单提交：同一素材在多个区域的 UTC 播出时段一次提交，要么全部成功要么整单拒绝。
+     * requestId 用于幂等：重放首次区域清单，换素材、换区域或换时段均返回 409。
+     */
+    public record RegionalAllocationRequest(
+            @NotBlank String requestId,
+            @NotBlank String assetId,
+            @NotNull @NotEmpty List<@NotNull RegionSegmentInput> segments) {
+    }
+
+    /** 区域占位状态：SCHEDULED 未到结束时刻（含播出中），AIRED 已到结束时刻；按查询时钟派生。 */
+    public enum RegionAllocationStatus {
+        SCHEDULED, AIRED
+    }
+
+    /** 区域占位明细；grantId/grantVersion 为提交时固化的授权，授权之后变化不改写本行。 */
+    public record RegionAllocationItemResponse(
+            long allocationId,
+            String requestId,
+            String regionId,
+            String assetId,
+            OffsetDateTime start,
+            OffsetDateTime end,
+            long grantId,
+            long grantVersion,
+            RegionAllocationStatus status) {
+    }
+
+    /** 区域编排整单提交成功响应，段顺序与请求一致。 */
+    public record RegionalAllocationResponse(
+            String requestId,
+            String assetId,
+            List<RegionAllocationItemResponse> segments) {
+    }
+
+    /** 区域占位列表响应（编排员视图含全部区域，区域播控方视图仅含本区域）。 */
+    public record RegionAllocationListResponse(List<RegionAllocationItemResponse> segments) {
+    }
+
+    /**
+     * 整单 422 时的单条冲突原因：GRANT_NOT_COVERING 该区域无有效授权完整覆盖时段；
+     * REGION_WINDOW_OVERLAP 该区域已有占位（或同单内另一段）与请求时段重叠（左闭右开）。
+     * conflicting* 字段在与已提交占位冲突时给出对端占位信息。
+     */
+    public record RegionConflict(
+            String regionId,
+            String assetId,
+            OffsetDateTime start,
+            OffsetDateTime end,
+            String reason,
+            String conflictingRequestId,
+            String conflictingAssetId,
+            OffsetDateTime conflictingStart,
+            OffsetDateTime conflictingEnd) {
+    }
+
+    /** 区域编排整单拒绝响应体：任一区域冲突即整单 422，不产生任何占位。 */
+    public record RegionalAllocationErrorResponse(
+            String error,
+            String message,
+            List<RegionConflict> conflicts) {
     }
 }
