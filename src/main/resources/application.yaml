@@ -4,15 +4,22 @@ spring:
   config:
     import: "optional:configtree:/run/secrets/"
   datasource:
-    url: ${DB_URL}
-    username: ${DB_USER}
+    # 本地默认 H2 内存库（MODE=MySQL）；compose 等场景可用 DB_URL/DB_USER/DB_PASSWORD
+    # 覆盖为 MySQL，驱动由 Spring Boot 按 JDBC URL 自动推断
+    url: ${DB_URL:jdbc:h2:mem:obsdb;MODE=MySQL;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE;LOCK_TIMEOUT=30000}
+    username: ${DB_USER:sa}
+    password: ${DB_PASSWORD:}
     hikari:
       maximum-pool-size: 5
       minimum-idle: 1
       connection-timeout: 10000
       validation-timeout: 3000
+  sql:
+    # 仅嵌入式库（本地/测试 H2）自动建表；外部 MySQL 由环境预先建表
+    init:
+      mode: embedded
   jackson:
-    time-zone: Asia/Shanghai
+    time-zone: UTC
   lifecycle:
     timeout-per-shutdown-phase: 20s
 
@@ -20,7 +27,7 @@ server:
   port: 8080
   shutdown: graceful
   error:
-    include-message: never
+    include-message: always
     include-stacktrace: never
 
 management:
