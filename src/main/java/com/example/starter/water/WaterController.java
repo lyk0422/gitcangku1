@@ -7,6 +7,12 @@ import com.example.starter.water.dto.Dtos.CreateWindowRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.OutageListResponse;
+import com.example.starter.water.dto.Dtos.OutageResponse;
+import com.example.starter.water.dto.Dtos.RegisterOutageRequest;
+import com.example.starter.water.dto.Dtos.SettleUsageRequest;
+import com.example.starter.water.dto.Dtos.SettlementListResponse;
+import com.example.starter.water.dto.Dtos.SettlementResponse;
 import com.example.starter.water.dto.Dtos.SubmitAllocationRequest;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferRequest;
@@ -41,12 +47,13 @@ public class WaterController {
                 request.startUtc(), request.endUtc(), request.plannedVolume());
     }
 
-    /** 提交配水申请。 */
+    /** 提交配水申请（可携带 UTC 左闭右开排班时段）。 */
     @PostMapping("/allocations")
     public AllocationResponse submitAllocation(@RequestBody SubmitAllocationRequest request,
                                                @RequestHeader("X-Actor-Id") String actor) {
         return service.submitAllocation(request.commandKey(), request.allocationKey(), request.windowId(),
-                request.userId(), request.amount(), actor);
+                request.userId(), request.amount(), actor,
+                request.scheduledStartUtc(), request.scheduledEndUtc());
     }
 
     /** 批准配水申请。 */
@@ -102,5 +109,39 @@ public class WaterController {
     @GetMapping("/windows/{windowId}/history")
     public HistoryResponse getHistory(@PathVariable long windowId) {
         return service.getHistory(windowId);
+    }
+
+    /** 登记灌渠中断窗口并整批顺延受影响且未开始的排班。 */
+    @PostMapping("/outages")
+    public OutageResponse registerOutage(@RequestBody RegisterOutageRequest request) {
+        return service.registerOutage(request.commandKey(), request.requestId(), request.channelId(),
+                request.startUtc(), request.endUtc(), request.postponeMinutes(), request.reason());
+    }
+
+    /** 按 requestId 查询中断窗口及原排班→新窗口的顺延对应关系。 */
+    @GetMapping("/outages/{requestId}")
+    public OutageResponse getOutage(@PathVariable String requestId) {
+        return service.getOutage(requestId);
+    }
+
+    /** 查询灌渠全部已登记中断（含顺延对应关系与原因）。 */
+    @GetMapping("/channels/{channelId}/outages")
+    public OutageListResponse listOutages(@PathVariable String channelId) {
+        return service.listOutages(channelId);
+    }
+
+    /** 历史用水核销：快照当时的排班时段，随后顺延不改写已完成记录。 */
+    @PostMapping("/allocations/{allocationKey}/settlements")
+    public SettlementResponse settleUsage(@PathVariable String allocationKey,
+                                          @RequestBody SettleUsageRequest request,
+                                          @RequestHeader("X-Actor-Id") String actor) {
+        return service.settleUsage(request.commandKey(), request.usageKey(), allocationKey,
+                request.volume(), actor);
+    }
+
+    /** 查询申请的历史核销记录（不可变快照）。 */
+    @GetMapping("/allocations/{allocationKey}/settlements")
+    public SettlementListResponse listSettlements(@PathVariable String allocationKey) {
+        return service.listSettlements(allocationKey);
     }
 }
