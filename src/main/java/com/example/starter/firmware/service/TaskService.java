@@ -35,12 +35,14 @@ public class TaskService {
     private final PauseRecordRepository pauseRecordRepository;
     private final DeviceService deviceService;
     private final ReleaseService releaseService;
+    private final FreezeService freezeService;
     private final IdempotencyService idempotency;
     private final Clock clock;
 
     public TaskService(TaskRepository taskRepository, ReleaseRepository releaseRepository,
                        DeviceRepository deviceRepository, PauseRecordRepository pauseRecordRepository,
                        DeviceService deviceService, ReleaseService releaseService,
+                       FreezeService freezeService,
                        IdempotencyService idempotency, Clock clock) {
         this.taskRepository = taskRepository;
         this.releaseRepository = releaseRepository;
@@ -48,6 +50,7 @@ public class TaskService {
         this.pauseRecordRepository = pauseRecordRepository;
         this.deviceService = deviceService;
         this.releaseService = releaseService;
+        this.freezeService = freezeService;
         this.idempotency = idempotency;
         this.clock = clock;
     }
@@ -75,6 +78,9 @@ public class TaskService {
                     || device.bucketNo() >= order.ratio()) {
                 return new PullResponse(null);
             }
+            // 本次拉取本会新建正式任务：目标版本冻结则 409 且不插入（不消耗分桶容量）。
+            // 调用方持有发布单行锁，与冻结事务互斥，按提交顺序决定结果。
+            freezeService.verifyNewTaskAllowed(order);
             long taskId;
             try {
                 taskId = taskRepository.insert(order.id(), deviceId);

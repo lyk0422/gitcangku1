@@ -35,6 +35,8 @@ class FirmwareApiTest {
 
     @BeforeEach
     void cleanUp() {
+        jdbc.update("DELETE FROM version_freeze_restore");
+        jdbc.update("DELETE FROM version_freeze");
         jdbc.update("DELETE FROM rollout_task");
         jdbc.update("DELETE FROM release_pause_record");
         jdbc.update("DELETE FROM release_resume_record");
