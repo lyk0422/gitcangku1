@@ -68,4 +68,11 @@ public class ApiException extends RuntimeException {
     public static ApiException gone(String message) {
         return new ApiException(HttpStatus.GONE, message, null, null);
     }
+
+    /**
+     * 422：请求语义可解析但无法处理（如观测时刻没有可用规则，或同一时刻命中多条规则）；不入库。
+     */
+    public static ApiException unprocessableEntity(String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, message, null, null);
+    }
 }

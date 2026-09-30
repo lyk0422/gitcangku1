@@ -59,3 +59,46 @@ CREATE TABLE IF NOT EXISTS conflict_resolution (
     -- 且不可变解决历史必须在任何数据清理/归档场景下继续可查。
     UNIQUE (observation_id, request_id)
 );
+
+-- 坐标基准转换规则表：版本号唯一、发布后不可变；生效区间按 UTC 左闭右开，允许区间重叠
+-- （重叠时刻写入观测会因命中多条规则返回 422）。历史观测冻结规则版本与转换结果，规则调整不重新解释历史。
+CREATE TABLE IF NOT EXISTS coordinate_rule (
+    rule_version INT NOT NULL COMMENT '规则版本号，全局唯一，从 1 开始；发布后不可变、不可删除',
+    target_frame VARCHAR(64) NOT NULL COMMENT '目标坐标基准标识；转换后观测所属基准',
+    offset_x DECIMAL(18,9) NOT NULL COMMENT 'X 方向偏移量（目标基准长度单位），目标 X = 原 X + 该偏移',
+    offset_y DECIMAL(18,9) NOT NULL COMMENT 'Y 方向偏移量（目标基准长度单位），目标 Y = 原 Y + 该偏移',
+    effective_from_utc TIMESTAMP NOT NULL COMMENT '生效起点（UTC，含）；观测时刻等于该值时命中本规则',
+    effective_to_utc TIMESTAMP NULL COMMENT '生效终点（UTC，不含）；NULL 表示自起点起长期有效，观测时刻等于该值时不命中',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '规则发布落库时间（服务器时区 Asia/Shanghai）',
+    PRIMARY KEY (rule_version)
+);
+
+-- 坐标观测表：每条携带原基准/原坐标/观测时刻的观测一行，转换结果（六位小数）与命中规则版本冻结保存。
+-- review_status 为 PENDING_REVIEW 的行保留待人工复核，不参加自动合并。
+CREATE TABLE IF NOT EXISTS coordinate_observation (
+    observation_id VARCHAR(64) NOT NULL COMMENT '坐标观测业务唯一标识',
+    request_id VARCHAR(128) NOT NULL COMMENT '首次写入该观测的请求标识（requestId），用于同参重放/改参 409',
+    source_frame VARCHAR(64) NOT NULL COMMENT '原坐标基准标识（客户端上报告知，空值不允许）',
+    original_x DECIMAL(18,9) NOT NULL COMMENT '原坐标 X（原基准长度单位），以请求数值规范化后保存',
+    original_y DECIMAL(18,9) NOT NULL COMMENT '原坐标 Y（原基准长度单位），以请求数值规范化后保存',
+    observed_at_utc TIMESTAMP NOT NULL COMMENT '观测时刻（UTC）；规则选择与该时刻的生效区间为准，而非入库时刻',
+    target_frame VARCHAR(64) NOT NULL COMMENT '转换时命中规则的目标基准快照；规则调整后本行不随之改变',
+    target_x DECIMAL(18,6) NOT NULL COMMENT '转换后目标坐标 X（目标基准长度单位），原值加偏移后按六位小数 HALF_UP 保存',
+    target_y DECIMAL(18,6) NOT NULL COMMENT '转换后目标坐标 Y（目标基准长度单位），原值加偏移后按六位小数 HALF_UP 保存',
+    rule_version INT NOT NULL COMMENT '转换时命中的规则版本号；历史结果按此版本冻结，不设置外键以保证不可变规则语义',
+    review_status VARCHAR(20) NOT NULL COMMENT '复核状态：AUTO_MERGED 站内容许并已参加自动合并；PENDING_REVIEW 站外保留待复核、不自动合并',
+    auto_merged BOOLEAN NOT NULL COMMENT '是否已参加自动合并：TRUE 站内容许；FALSE 待复核（边界点 0/10、0/30 视为站内）',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '观测落库时间（服务器时区 Asia/Shanghai）',
+    PRIMARY KEY (observation_id),
+    UNIQUE (request_id)
+);
+
+-- 规则发布与观测写入的串行化守卫：固定单行，两类事务均先 SELECT ... FOR UPDATE 该行，
+-- 保证观测按自身提交时已生效的规则版本裁决，目标 X/Y 来自同一规则，不会出现半旧半新坐标。
+CREATE TABLE IF NOT EXISTS coordinate_rule_guard (
+    id INT NOT NULL COMMENT '固定为 1 的守卫行标识',
+    PRIMARY KEY (id)
+);
+INSERT INTO coordinate_rule_guard (id)
+SELECT * FROM (SELECT 1) AS guard_seed
+WHERE NOT EXISTS (SELECT 1 FROM coordinate_rule_guard WHERE id = 1);
