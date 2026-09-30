@@ -74,6 +74,55 @@ public final class Dtos {
                                   List<CurtailmentResponse> curtailments) {
     }
 
+    // ------------------------------------------------------------------
+    // 多来源水质混配
+    // ------------------------------------------------------------------
+
+    /** 创建水质来源命令；qualityIndex 省略或为 null 表示指标缺失（含该来源的混配申请将被 422 驳回）。 */
+    public record BlendSourceRequest(String commandKey, String sourceKey, String name,
+                                     String quotaVolume, String qualityIndex) {
+    }
+
+    /**
+     * 水质来源视图。qualityIndex 为 null 表示指标缺失；reservedVolume 为全部未取消混配申请
+     * 对该来源的预占体积之和；availableVolume = quotaVolume - reservedVolume。
+     */
+    public record BlendSourceResponse(String sourceKey, String name, String quotaVolume,
+                                      String qualityIndex, String reservedVolume,
+                                      String availableVolume, String createdUtc) {
+    }
+
+    /** 混配申请中的一个来源；volume 单位立方米，大于 0，最多 3 位小数。 */
+    public record BlendSourceInput(String sourceKey, String volume) {
+    }
+
+    /**
+     * 提交多来源水质混配申请命令。requestId 全局唯一且兼作幂等键；申请人由 X-Actor-Id 请求头提供。
+     * qualityThreshold 为用途水质阈值（无量纲，最多 6 位小数），加权值等于阈值时仍可受理。
+     */
+    public record BlendSubmitRequest(String requestId, String userId, String purpose,
+                                     String qualityThreshold, List<BlendSourceInput> sources) {
+    }
+
+    /**
+     * 申请中的来源明细视图（提交时快照）。qualityIndex 为提交时来源指标；weightedValue 为
+     * 体积×指标的加权贡献值；reserved 表示该体积当前是否仍预占来源配额（申请取消后为 false）。
+     */
+    public record BlendItemResponse(String sourceKey, String volume, String qualityIndex,
+                                    String weightedValue, boolean reserved) {
+    }
+
+    /**
+     * 混配申请视图。状态：RESERVED 已预占 / CANCELLED 已取消。totalVolume/weightedIndex 与各来源
+     * 明细均为受理时快照，取消后保留原计算依据不重算；cancelledUtc 未取消时为 null。
+     */
+    public record BlendApplicationResponse(String requestId, String userId, String purpose,
+                                           String qualityThreshold, String totalVolume,
+                                           String weightedIndex, String requester, String status,
+                                           String createdUtc, String cancelledUtc,
+                                           List<BlendItemResponse> sources) {
+    }
+
     /** 统一错误响应体。 */
     public record ErrorResponse(String code, String message) {
     }

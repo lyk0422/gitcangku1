@@ -1,7 +1,6 @@
 package com.example.starter.water;
 
 import com.example.starter.water.WaterRepository.AllocationRow;
-import com.example.starter.water.WaterRepository.CommandRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
 import com.example.starter.water.WaterRepository.TransferRow;
 import com.example.starter.water.WaterRepository.WindowRow;
@@ -12,24 +11,20 @@ import com.example.starter.water.dto.Dtos.HistoryResponse;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferResponse;
 import com.example.starter.water.dto.Dtos.WindowResponse;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.PlatformTransactionManager;
-import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
 import java.util.List;
-import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
 /**
  * 灌区配水业务服务。
  *
- * <p>幂等：每个写命令携带 commandKey，事务内先占位插入命令行再执行业务并写回响应；
- * 同键同参重放返回首次结果，同键改参返回 409。</p>
+ * <p>幂等：每个写命令携带 commandKey，由 {@link CommandTemplate} 在事务内先占位插入命令行再执行业务
+ * 并写回响应；同键同参重放返回首次结果，同键改参返回 409。</p>
  *
  * <p>并发：批准申请与创建/取消限供在同一事务内先对窗口行 SELECT ... FOR UPDATE，
  * 按事务提交顺序生效，保证已批准总量永不超过最终可用总量。</p>
@@ -46,14 +41,11 @@ public class WaterService {
     private static final Pattern KEY_PATTERN = Pattern.compile("[\\w.\\-:]{1,128}");
 
     private final WaterRepository repository;
-    private final TransactionTemplate tx;
-    private final ObjectMapper objectMapper;
+    private final CommandTemplate commands;
 
-    public WaterService(WaterRepository repository, PlatformTransactionManager transactionManager,
-                        ObjectMapper objectMapper) {
+    public WaterService(WaterRepository repository, CommandTemplate commands) {
         this.repository = repository;
-        this.tx = new TransactionTemplate(transactionManager);
-        this.objectMapper = objectMapper;
+        this.commands = commands;
     }
 
     // ------------------------------------------------------------------
@@ -74,7 +66,7 @@ public class WaterService {
         BigDecimal planned = parseAmount("plannedVolume", plannedVolume);
         String params = "WINDOW_CREATE|" + windowKey + "|" + channelId + "|" + startNanos + "|" + endNanos
                 + "|" + planned.toPlainString();
-        return runCommand("WINDOW_CREATE", commandKey, params, WindowResponse.class, () -> {
+        return commands.run("WINDOW_CREATE", commandKey, params, WindowResponse.class, () -> {
             if (repository.existsOverlappingWindow(channelId, startNanos, endNanos)) {
                 throw ApiException.conflict("WINDOW_OVERLAP", "同一渠道存在时间重叠的供水窗口");
             }
@@ -97,7 +89,7 @@ public class WaterService {
         BigDecimal qty = parseAmount("amount", amount);
         String params = "ALLOCATION_SUBMIT|" + allocationKey + "|" + windowId + "|" + userId + "|"
                 + qty.toPlainString() + "|" + actor;
-        return runCommand("ALLOCATION_SUBMIT", commandKey, params, AllocationResponse.class, () -> {
+        return commands.run("ALLOCATION_SUBMIT", commandKey, params, AllocationResponse.class, () -> {
             WindowRow window = repository.lockWindowById(windowId);
             if (window == null) {
                 throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + windowId);
@@ -112,7 +104,7 @@ public class WaterService {
         requireKey("commandKey", commandKey);
         requireKey("allocationKey", allocationKey);
         String params = "ALLOCATION_APPROVE|" + allocationKey;
-        return runCommand("ALLOCATION_APPROVE", commandKey, params, AllocationResponse.class, () -> {
+        return commands.run("ALLOCATION_APPROVE", commandKey, params, AllocationResponse.class, () -> {
             AllocationRow allocation = repository.findAllocationByKey(allocationKey);
             if (allocation == null) {
                 throw ApiException.notFound("ALLOCATION_NOT_FOUND", "配水申请不存在: " + allocationKey);
@@ -144,7 +136,7 @@ public class WaterService {
         requireKey("allocationKey", allocationKey);
         requireKey("X-Actor-Id", actor);
         String params = "ALLOCATION_CANCEL|" + allocationKey + "|" + actor;
-        return runCommand("ALLOCATION_CANCEL", commandKey, params, AllocationResponse.class, () -> {
+        return commands.run("ALLOCATION_CANCEL", commandKey, params, AllocationResponse.class, () -> {
             AllocationRow allocation = repository.findAllocationByKey(allocationKey);
             if (allocation == null) {
                 throw ApiException.notFound("ALLOCATION_NOT_FOUND", "配水申请不存在: " + allocationKey);
@@ -177,7 +169,7 @@ public class WaterService {
         requireKey("X-Actor-Id", actor);
         String params = "TRANSFER|" + transferKey + "|" + sourceAllocationKey + "|" + targetAllocationKey + "|"
                 + actor;
-        return runCommand("TRANSFER", commandKey, params, TransferResponse.class, () -> {
+        return commands.run("TRANSFER", commandKey, params, TransferResponse.class, () -> {
             if (repository.findTransferByKey(transferKey) != null) {
                 throw ApiException.conflict("TRANSFER_KEY_REUSED", "transferKey 已被使用: " + transferKey);
             }
@@ -246,7 +238,7 @@ public class WaterService {
         requireKey("commandKey", commandKey);
         BigDecimal qty = parseAmount("volume", volume);
         String params = "CURTAILMENT_CREATE|" + windowId + "|" + qty.toPlainString();
-        return runCommand("CURTAILMENT_CREATE", commandKey, params, CurtailmentResponse.class, () -> {
+        return commands.run("CURTAILMENT_CREATE", commandKey, params, CurtailmentResponse.class, () -> {
             WindowRow window = repository.lockWindowById(windowId);
             if (window == null) {
                 throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + windowId);
@@ -271,7 +263,7 @@ public class WaterService {
     public CurtailmentResponse cancelCurtailment(String commandKey, long windowId) {
         requireKey("commandKey", commandKey);
         String params = "CURTAILMENT_CANCEL|" + windowId;
-        return runCommand("CURTAILMENT_CANCEL", commandKey, params, CurtailmentResponse.class, () -> {
+        return commands.run("CURTAILMENT_CANCEL", commandKey, params, CurtailmentResponse.class, () -> {
             WindowRow window = repository.lockWindowById(windowId);
             if (window == null) {
                 throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + windowId);
@@ -313,43 +305,6 @@ public class WaterService {
         List<CurtailmentResponse> curtailments = repository.listCurtailments(windowId).stream()
                 .map(this::toCurtailmentResponse).toList();
         return new HistoryResponse(toWindowResponse(window, active), allocations, curtailments);
-    }
-
-    // ------------------------------------------------------------------
-    // 幂等命令框架
-    // ------------------------------------------------------------------
-
-    /**
-     * 在单事务内执行幂等命令：先占位插入命令行，再执行业务并写回响应。
-     * 并发同键时占位插入会因唯一约束失败，随后读取已提交的首次结果重放或报 409。
-     */
-    private <T> T runCommand(String operation, String commandKey, String params, Class<T> type,
-                             Supplier<T> business) {
-        try {
-            return tx.execute(status -> {
-                CommandRow existing = repository.findCommand(commandKey);
-                if (existing != null) {
-                    return replay(existing, operation, params, type);
-                }
-                repository.insertCommand(commandKey, operation, params, nowNanos());
-                T result = business.get();
-                repository.updateCommandResponse(commandKey, toJson(result));
-                return result;
-            });
-        } catch (DuplicateKeyException e) {
-            CommandRow committed = repository.findCommand(commandKey);
-            if (committed == null || committed.response() == null) {
-                throw ApiException.conflict("COMMAND_CONFLICT", "相同 commandKey 的命令正在处理，请重试");
-            }
-            return replay(committed, operation, params, type);
-        }
-    }
-
-    private <T> T replay(CommandRow existing, String operation, String params, Class<T> type) {
-        if (!existing.operation().equals(operation) || !existing.params().equals(params)) {
-            throw ApiException.conflict("COMMAND_KEY_REUSED", "相同 commandKey 但参数不同，拒绝重放");
-        }
-        return fromJson(existing.response(), type);
     }
 
     // ------------------------------------------------------------------
@@ -453,21 +408,5 @@ public class WaterService {
             return "0";
         }
         return stripped.toPlainString();
-    }
-
-    private String toJson(Object value) {
-        try {
-            return objectMapper.writeValueAsString(value);
-        } catch (Exception e) {
-            throw new IllegalStateException("响应序列化失败", e);
-        }
-    }
-
-    private <T> T fromJson(String json, Class<T> type) {
-        try {
-            return objectMapper.readValue(json, type);
-        } catch (Exception e) {
-            throw new IllegalStateException("响应反序列化失败", e);
-        }
     }
 }
