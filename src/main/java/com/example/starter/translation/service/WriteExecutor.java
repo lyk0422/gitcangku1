@@ -27,10 +27,19 @@ public class WriteExecutor {
         this.transactionalWrite = transactionalWrite;
     }
 
-    /** 执行幂等写操作：requestId 全局唯一，hash 为规范化请求参数摘要。 */
+    /** 执行幂等写操作：requestId 全局唯一，hash 为规范化请求参数摘要；无文档级前置校验。 */
     public WriteResult execute(String requestId, String requestHash, Supplier<WriteResult> action) {
+        return execute(requestId, requestHash, null, action);
+    }
+
+    /**
+     * 执行幂等写操作并在查重前运行文档级守卫（同一事务内、持文档行锁）。
+     * 守卫先于重放判定：冻结窗口进行中，即使是同键同参重放也返回 409；
+     * 非冻结状态下沿用同键同参重放、同键异参 409 的幂等语义。
+     */
+    public WriteResult execute(String requestId, String requestHash, Runnable guard, Supplier<WriteResult> action) {
         try {
-            return transactionalWrite.run(requestId, requestHash, action);
+            return transactionalWrite.run(requestId, requestHash, guard, action);
         } catch (WriteResult.ReplaySignal signal) {
             return replay(requestId, requestHash);
         }
@@ -59,7 +68,11 @@ public class WriteExecutor {
         }
 
         @Transactional
-        public WriteResult run(String requestId, String requestHash, Supplier<WriteResult> action) {
+        public WriteResult run(String requestId, String requestHash, Runnable guard,
+                               Supplier<WriteResult> action) {
+            if (guard != null) {
+                guard.run();
+            }
             Optional<RequestLogRow> existing = repository.findRequestLog(requestId);
             if (existing.isPresent()) {
                 RequestLogRow log = existing.get();

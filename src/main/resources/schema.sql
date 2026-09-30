@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS document (
     draft_version INT NOT NULL,
     published_version INT NOT NULL,
     term_version INT NOT NULL,
+    freeze_version INT NOT NULL DEFAULT 0,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 COMMENT ON TABLE document IS '文档：全局唯一 documentId，含 1~5 种目标语言及草稿/发布/术语版本';
@@ -15,6 +16,7 @@ COMMENT ON COLUMN document.target_languages IS '目标语言列表，逗号分�
 COMMENT ON COLUMN document.draft_version IS '文档草稿版本，从 1 开始；增段落或修改源文/译文/术语时加一';
 COMMENT ON COLUMN document.published_version IS '已发布版本号，从 0 开始，每次成功发布加一';
 COMMENT ON COLUMN document.term_version IS '当前术语版本，从 0 开始（0 表示尚未建立术语版本），每次新增术语版本加一';
+COMMENT ON COLUMN document.freeze_version IS '最近一次术语冻结窗口序号，从 0 开始，0 表示从未冻结；历史窗口见 term_freeze 表';
 COMMENT ON COLUMN document.created_at IS '创建时间，数据库默认时区';
 
 CREATE TABLE IF NOT EXISTS segment (
@@ -110,6 +112,23 @@ COMMENT ON COLUMN term_rule.term_version IS '所属术语版本号';
 COMMENT ON COLUMN term_rule.source_term IS '源文术语，Unicode 原文、区分大小写，按连续子串匹配';
 COMMENT ON COLUMN term_rule.language IS '目标语言码，小写';
 COMMENT ON COLUMN term_rule.required_translation IS '该术语在目标语言中的必译文本，非空';
+
+CREATE TABLE IF NOT EXISTS term_freeze (
+    document_id BIGINT NOT NULL,
+    freeze_version INT NOT NULL,
+    term_version INT NOT NULL,
+    freeze_start TIMESTAMP(3) NOT NULL,
+    freeze_end TIMESTAMP(3) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (document_id, freeze_version)
+);
+COMMENT ON TABLE term_freeze IS '术语冻结窗口：草稿在 UTC 左闭右开区间 [freeze_start, freeze_end) 内绑定指定术语版本，期间不得修改草稿或发布';
+COMMENT ON COLUMN term_freeze.document_id IS '所属文档 ID';
+COMMENT ON COLUMN term_freeze.freeze_version IS '冻结窗口序号，从 1 开始单调递增';
+COMMENT ON COLUMN term_freeze.term_version IS '窗口绑定冻结的术语版本号（如 V2），创建时须等于草稿当前术语版本';
+COMMENT ON COLUMN term_freeze.freeze_start IS '窗口起始时刻，UTC，左闭（含该时刻）';
+COMMENT ON COLUMN term_freeze.freeze_end IS '窗口结束时刻，UTC，右开（不含该时刻）';
+COMMENT ON COLUMN term_freeze.created_at IS '窗口创建时间，数据库默认时区';
 
 CREATE TABLE IF NOT EXISTS request_log (
     request_id VARCHAR(128) PRIMARY KEY,

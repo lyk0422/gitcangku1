@@ -2,6 +2,7 @@ package com.example.starter.translation.repo;
 
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
+import com.example.starter.translation.domain.Rows.FreezeRow;
 import com.example.starter.translation.domain.Rows.RequestLogRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
@@ -13,6 +14,7 @@ import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.stereotype.Repository;
 
 import java.sql.PreparedStatement;
+import java.sql.Timestamp;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
@@ -29,7 +31,12 @@ public class TranslationRepository {
             Arrays.stream(rs.getString("target_languages").split(",")).toList(),
             rs.getInt("draft_version"),
             rs.getInt("published_version"),
-            rs.getInt("term_version"));
+            rs.getInt("term_version"),
+            rs.getInt("freeze_version"));
+
+    private static final RowMapper<FreezeRow> FREEZE_MAPPER = (rs, n) -> new FreezeRow(
+            rs.getInt("freeze_version"), rs.getInt("term_version"),
+            rs.getTimestamp("freeze_start").toInstant(), rs.getTimestamp("freeze_end").toInstant());
 
     private static final RowMapper<SegmentRow> SEGMENT_MAPPER = (rs, n) -> new SegmentRow(
             rs.getString("segment_id"), rs.getString("source_text"), rs.getInt("source_version"));
@@ -52,13 +59,13 @@ public class TranslationRepository {
         this.jdbc = jdbc;
     }
 
-    /** 插入文档并返回自增 ID，初始草稿版本 1、发布版本 0、术语版本 0。 */
+    /** 插入文档并返回自增 ID，初始草稿版本 1、发布版本 0、术语版本 0、冻结窗口序号 0。 */
     public long insertDocument(List<String> targetLanguages) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO document (target_languages, draft_version, published_version, term_version) "
-                            + "VALUES (?, 1, 0, 0)",
+                    "INSERT INTO document (target_languages, draft_version, published_version, term_version, "
+                            + "freeze_version) VALUES (?, 1, 0, 0, 0)",
                     new String[]{"document_id"});
             ps.setString(1, String.join(",", targetLanguages));
             return ps;
@@ -73,7 +80,7 @@ public class TranslationRepository {
     /** 按 ID 查询文档并加行级写锁（FOR UPDATE），用于串行化同一文档的写操作。 */
     public Optional<DocumentRow> findDocumentForUpdate(long documentId) {
         List<DocumentRow> rows = jdbc.query(
-                "SELECT document_id, target_languages, draft_version, published_version, term_version "
+                "SELECT document_id, target_languages, draft_version, published_version, term_version, freeze_version "
                         + "FROM document WHERE document_id = ? FOR UPDATE",
                 DOCUMENT_MAPPER, documentId);
         return rows.stream().findFirst();
@@ -82,7 +89,7 @@ public class TranslationRepository {
     /** 只读查询文档（不加锁），用于快照查询。 */
     public Optional<DocumentRow> findDocument(long documentId) {
         List<DocumentRow> rows = jdbc.query(
-                "SELECT document_id, target_languages, draft_version, published_version, term_version "
+                "SELECT document_id, target_languages, draft_version, published_version, term_version, freeze_version "
                         + "FROM document WHERE document_id = ?",
                 DOCUMENT_MAPPER, documentId);
         return rows.stream().findFirst();
@@ -98,6 +105,35 @@ public class TranslationRepository {
 
     public void updateTermVersion(long documentId, int termVersion) {
         jdbc.update("UPDATE document SET term_version = ? WHERE document_id = ?", termVersion, documentId);
+    }
+
+    public void updateFreezeVersion(long documentId, int freezeVersion) {
+        jdbc.update("UPDATE document SET freeze_version = ? WHERE document_id = ?", freezeVersion, documentId);
+    }
+
+    /** 插入冻结窗口主记录（不可变，主键已存在时抛冲突）。 */
+    public void insertFreeze(long documentId, FreezeRow freeze) {
+        jdbc.update("INSERT INTO term_freeze (document_id, freeze_version, term_version, freeze_start, freeze_end) "
+                        + "VALUES (?, ?, ?, ?, ?)",
+                documentId, freeze.freezeVersion(), freeze.termVersion(),
+                Timestamp.from(freeze.freezeStart()), Timestamp.from(freeze.freezeEnd()));
+    }
+
+    /** 查询指定冻结窗口。 */
+    public Optional<FreezeRow> findFreeze(long documentId, int freezeVersion) {
+        List<FreezeRow> rows = jdbc.query(
+                "SELECT freeze_version, term_version, freeze_start, freeze_end FROM term_freeze "
+                        + "WHERE document_id = ? AND freeze_version = ?",
+                FREEZE_MAPPER, documentId, freezeVersion);
+        return rows.stream().findFirst();
+    }
+
+    /** 查询文档全部冻结窗口，按窗口序号升序。 */
+    public List<FreezeRow> listFreezes(long documentId) {
+        return jdbc.query(
+                "SELECT freeze_version, term_version, freeze_start, freeze_end FROM term_freeze "
+                        + "WHERE document_id = ? ORDER BY freeze_version",
+                FREEZE_MAPPER, documentId);
     }
 
     public void insertSegment(long documentId, String segmentId, String sourceText) {
@@ -155,6 +191,12 @@ public class TranslationRepository {
                     documentId, row.segmentId(), row.language(), row.content(), row.author(),
                     row.sourceVersion(), row.translationVersion(), row.termVersion());
         }
+    }
+
+    /** 解冻术语更新重校验通过后，把文档全部现有译文原子重绑到新术语版本。 */
+    public void rebaseTranslationsTermVersion(long documentId, int termVersion) {
+        jdbc.update("UPDATE translation SET term_version = ?, updated_at = CURRENT_TIMESTAMP WHERE document_id = ?",
+                termVersion, documentId);
     }
 
     public Optional<ApprovalRow> findApproval(long documentId, String segmentId, String language) {

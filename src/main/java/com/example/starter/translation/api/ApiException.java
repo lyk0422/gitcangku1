@@ -48,6 +48,11 @@ public class ApiException extends RuntimeException {
         return new ApiException(HttpStatus.CONFLICT, "CONFLICT", message);
     }
 
+    /** 409：术语冻结窗口进行中，草稿不得修改或发布。 */
+    public static ApiException frozen(String message) {
+        return new ApiException(HttpStatus.CONFLICT, "TERM_FROZEN", message);
+    }
+
     /** 422：业务规则不满足（缺译、审核失效、版本不匹配等）。 */
     public static ApiException unprocessable(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "UNPROCESSABLE", message);

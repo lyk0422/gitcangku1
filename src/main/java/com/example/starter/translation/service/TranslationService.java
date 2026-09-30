@@ -4,14 +4,17 @@ import com.example.starter.translation.api.ApiDtos;
 import com.example.starter.translation.api.ApiException;
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
+import com.example.starter.translation.domain.Rows.FreezeRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
 import com.example.starter.translation.domain.Rows.TranslationRow;
+import com.example.starter.translation.domain.FreezeStatus;
 import com.example.starter.translation.repo.TranslationRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -32,10 +35,12 @@ public class TranslationService {
 
     private final TranslationRepository repository;
     private final ObjectMapper objectMapper;
+    private final BusinessClock clock;
 
-    public TranslationService(TranslationRepository repository, ObjectMapper objectMapper) {
+    public TranslationService(TranslationRepository repository, ObjectMapper objectMapper, BusinessClock clock) {
         this.repository = repository;
         this.objectMapper = objectMapper;
+        this.clock = clock;
     }
 
     /** 建文档：1~5 种目标语言，可携带初始段落，初始草稿版本 1、发布版本 0。 */
@@ -54,10 +59,11 @@ public class TranslationService {
         return new ApiDtos.DocumentResponse(documentId, 1, 0, languages);
     }
 
-    /** 增加段落：segmentId 文档内唯一，草稿版本加一。 */
+    /** 增加段落：segmentId 文档内唯一，草稿版本加一；冻结窗口进行中返回 409 且原草稿不变。 */
     @Transactional
     public ApiDtos.SegmentResponse addSegment(long documentId, ApiDtos.AddSegmentRequest request) {
         DocumentRow document = lockDocument(documentId);
+        rejectIfFrozen(document);
         if (repository.findSegment(documentId, request.segmentId()).isPresent()) {
             throw ApiException.conflict("段落已存在: " + request.segmentId());
         }
@@ -66,11 +72,12 @@ public class TranslationService {
         return new ApiDtos.SegmentResponse(documentId, request.segmentId(), 1, draftVersion);
     }
 
-    /** 源文修订：源文版本加一、草稿版本加一；相关译文因源文版本落后而待更新。 */
+    /** 源文修订：源文版本加一、草稿版本加一；相关译文因源文版本落后而待更新；冻结窗口中 409。 */
     @Transactional
     public ApiDtos.SegmentResponse reviseSource(long documentId, String segmentId,
                                               ApiDtos.ReviseSourceRequest request) {
         DocumentRow document = lockDocument(documentId);
+        rejectIfFrozen(document);
         SegmentRow segment = findSegmentOrThrow(documentId, segmentId);
         int sourceVersion = segment.sourceVersion() + 1;
         repository.updateSegmentSource(documentId, segmentId, request.sourceText(), sourceVersion);
@@ -87,6 +94,7 @@ public class TranslationService {
     public ApiDtos.TranslationResponse submitTranslation(long documentId, String segmentId, String language,
                                                          String actorId, ApiDtos.SubmitTranslationRequest request) {
         DocumentRow document = lockDocument(documentId);
+        rejectIfFrozen(document);
         String normalizedLanguage = normalizeLanguage(language);
         if (!document.targetLanguages().contains(normalizedLanguage)) {
             throw ApiException.unprocessable("语言不在文档目标语言中: " + normalizedLanguage);
@@ -115,7 +123,8 @@ public class TranslationService {
     @Transactional
     public ApiDtos.ApprovalResponse approveTranslation(long documentId, String segmentId, String language,
                                                        String actorId, ApiDtos.ApproveTranslationRequest request) {
-        lockDocument(documentId);
+        DocumentRow document = lockDocument(documentId);
+        rejectIfFrozen(document);
         String normalizedLanguage = normalizeLanguage(language);
         SegmentRow segment = findSegmentOrThrow(documentId, segmentId);
         TranslationRow translation = repository.findTranslation(documentId, segmentId, normalizedLanguage)
@@ -140,12 +149,16 @@ public class TranslationService {
 
     /**
      * 新增术语版本：expectedTermVersion 必须等于当前术语版本（不符 409）；
-     * 规则 0~100 条、按 sourceTerm 与目标语言唯一、语言须在文档目标语言中（不符 422）。
-     * 成功后术语版本加一（已有版本不可覆盖），草稿版本加一；术语快照与草稿版本同一事务提交。
+     * 冻结窗口进行中不得换术语（409）；规则 0~100 条、按 sourceTerm 与目标语言唯一、
+     * 语言须在文档目标语言中（不符 422）。
+     * 若草稿当前术语版本由一个已结束的冻结窗口绑定（解冻后首次更新），须先按新规则重新校验全部受影响段落：
+     * 缺译或任一语言译文违规即整单 422 回滚，不产生术语版本、不留下部分术语替换；
+     * 成功后术语版本加一（已有版本不可覆盖），草稿版本加一，响应返回受影响段落。
      */
     @Transactional
     public ApiDtos.TermVersionResponse updateTerms(long documentId, ApiDtos.UpdateTermsRequest request) {
         DocumentRow document = lockDocument(documentId);
+        rejectIfFrozen(document);
         if (document.termVersion() != request.expectedTermVersion()) {
             throw ApiException.conflict("术语版本冲突：当前术语版本 " + document.termVersion()
                     + "，与期望的 " + request.expectedTermVersion() + " 不一致");
@@ -163,14 +176,83 @@ public class TranslationService {
             }
             rules.add(new TermRuleRow(input.sourceTerm(), language, input.requiredTranslation()));
         }
+        List<String> affectedSegments = List.of();
+        boolean unfreezeUpdate = isUnfreezeUpdate(document);
+        if (unfreezeUpdate) {
+            affectedSegments = revalidateAffectedSegments(document, rules);
+        }
         int termVersion = document.termVersion() + 1;
         repository.insertTermVersion(documentId, termVersion);
         for (TermRuleRow rule : rules) {
             repository.insertTermRule(documentId, termVersion, rule);
         }
+        if (unfreezeUpdate) {
+            repository.rebaseTranslationsTermVersion(documentId, termVersion);
+        }
         repository.updateTermVersion(documentId, termVersion);
         int draftVersion = bumpDraftVersion(document);
-        return new ApiDtos.TermVersionResponse(documentId, termVersion, rules.size(), draftVersion);
+        return new ApiDtos.TermVersionResponse(documentId, termVersion, rules.size(), draftVersion, affectedSegments);
+    }
+
+    /**
+     * 创建术语冻结窗口：绑定术语版本须等于草稿当前术语版本且已存在（不符 409/422），
+     * 区间为 UTC 左闭右开 [freezeStart, freezeEnd)（无效区间 422），进行中的窗口内不得再建（409）。
+     * 创建窗口本身不改变草稿与发布版本；响应返回源文命中绑定版本规则的受影响段落。
+     */
+    @Transactional
+    public ApiDtos.FreezeResponse createFreeze(long documentId, ApiDtos.CreateFreezeRequest request) {
+        DocumentRow document = lockDocument(documentId);
+        rejectIfFrozen(document);
+        if (!request.freezeEnd().isAfter(request.freezeStart())) {
+            throw ApiException.unprocessable("冻结区间无效：freezeEnd 必须晚于 freezeStart（UTC 左闭右开）");
+        }
+        if (request.termVersion() != document.termVersion()) {
+            throw ApiException.conflict("冻结绑定术语版本 V" + request.termVersion()
+                    + " 与草稿当前术语版本 V" + document.termVersion() + " 不一致");
+        }
+        if (!repository.termVersionExists(documentId, request.termVersion())) {
+            throw ApiException.unprocessable("术语版本不存在: V" + request.termVersion());
+        }
+        int freezeVersion = document.freezeVersion() + 1;
+        FreezeRow freeze = new FreezeRow(freezeVersion, request.termVersion(),
+                request.freezeStart(), request.freezeEnd());
+        repository.insertFreeze(documentId, freeze);
+        repository.updateFreezeVersion(documentId, freezeVersion);
+        List<String> affectedSegments = affectedSegments(documentId, request.termVersion());
+        return new ApiDtos.FreezeResponse(documentId, toFreezeView(freeze, clock.now()),
+                document.draftVersion(), document.publishedVersion(), affectedSegments);
+    }
+
+    /** 查询指定冻结窗口；文档或窗口不存在返回 404。 */
+    @Transactional(readOnly = true)
+    public ApiDtos.FreezeWindowView getFreeze(long documentId, int freezeVersion) {
+        repository.findDocument(documentId)
+                .orElseThrow(() -> ApiException.notFound("文档不存在: " + documentId));
+        if (freezeVersion < 1) {
+            throw ApiException.notFound("冻结窗口不存在: " + documentId + "/" + freezeVersion);
+        }
+        FreezeRow freeze = repository.findFreeze(documentId, freezeVersion)
+                .orElseThrow(() -> ApiException.notFound("冻结窗口不存在: " + documentId + "/" + freezeVersion));
+        return toFreezeView(freeze, clock.now());
+    }
+
+    /**
+     * 查询冻结状态：冻结起止、当前是否在窗口内、草稿术语版本与受影响段落（源文命中当前术语版本规则），
+     * 含全部历史窗口；从未冻结时 activeWindow 为 null、windows 为空。
+     */
+    @Transactional(readOnly = true)
+    public ApiDtos.FreezeStatusResponse getFreezeStatus(long documentId) {
+        DocumentRow document = repository.findDocument(documentId)
+                .orElseThrow(() -> ApiException.notFound("文档不存在: " + documentId));
+        Instant now = clock.now();
+        List<FreezeRow> freezes = repository.listFreezes(documentId);
+        List<ApiDtos.FreezeWindowView> views = freezes.stream()
+                .map(freeze -> toFreezeView(freeze, now)).toList();
+        ApiDtos.FreezeWindowView activeWindow = views.stream()
+                .filter(ApiDtos.FreezeWindowView::active).reduce((first, second) -> second).orElse(null);
+        List<String> affectedSegments = affectedSegments(documentId, document.termVersion());
+        return new ApiDtos.FreezeStatusResponse(documentId, document.termVersion(), document.draftVersion(),
+                document.publishedVersion(), activeWindow, views, affectedSegments);
     }
 
     /**
@@ -182,6 +264,8 @@ public class TranslationService {
     @Transactional
     public ApiDtos.PublishResponse publish(long documentId, ApiDtos.PublishRequest request) {
         DocumentRow document = lockDocument(documentId);
+        // 解冻与发布竞争时，发布只能引用已完整校验的草稿版本：窗口进行中一律拒绝。
+        rejectIfFrozen(document);
         if (document.draftVersion() != request.expectedDraftVersion()
                 || document.publishedVersion() != request.expectedPublishedVersion()) {
             throw ApiException.conflict("版本冲突：当前草稿版本 " + document.draftVersion()
@@ -291,9 +375,118 @@ public class TranslationService {
         return new ApiDtos.TermStatusResponse(documentId, document.termVersion(), statuses);
     }
 
+    /**
+     * 写操作前置守卫（加入调用方事务）：锁定文档行，冻结窗口进行中抛 409。
+     * 由幂等执行器在查重前调用，保证冻结期间连同键重放也被拦截；业务方法内部会再次加锁确认。
+     */
+    @Transactional
+    public void assertWritable(long documentId) {
+        rejectIfFrozen(lockDocument(documentId));
+    }
+
     private DocumentRow lockDocument(long documentId) {
         return repository.findDocumentForUpdate(documentId)
                 .orElseThrow(() -> ApiException.notFound("文档不存在: " + documentId));
+    }
+
+    /**
+     * 冻结守卫：最近窗口处于 UTC [start, end) 内时拒绝一切草稿修改与发布，返回 409 TERM_FROZEN。
+     * 调用方须已持有文档行锁，使解冻更新与发布在同一文档上串行，发布只能引用完整校验后的草稿。
+     */
+    private void rejectIfFrozen(DocumentRow document) {
+        if (document.freezeVersion() <= 0) {
+            return;
+        }
+        FreezeRow freeze = repository.findFreeze(document.documentId(), document.freezeVersion())
+                .orElseThrow(() -> new IllegalStateException(
+                        "冻结窗口记录缺失: " + document.documentId() + "/" + document.freezeVersion()));
+        if (FreezeStatus.isActive(freeze.freezeStart(), freeze.freezeEnd(), clock.now())) {
+            throw ApiException.frozen("术语冻结窗口进行中：窗口 V" + freeze.freezeVersion()
+                    + " 绑定术语 V" + freeze.termVersion() + "，UTC " + freeze.freezeStart() + " 至 "
+                    + freeze.freezeEnd() + "（左闭右开）期间不得修改草稿或发布");
+        }
+    }
+
+    /**
+     * 是否为解冻后的首次术语更新：存在冻结窗口、窗口已结束且草稿术语版本仍是窗口绑定版本。
+     * 一旦解冻更新成功，草稿术语版本加一，不再重复触发全量重校验。
+     */
+    private boolean isUnfreezeUpdate(DocumentRow document) {
+        if (document.freezeVersion() <= 0) {
+            return false;
+        }
+        FreezeRow freeze = repository.findFreeze(document.documentId(), document.freezeVersion())
+                .orElseThrow(() -> new IllegalStateException(
+                        "冻结窗口记录缺失: " + document.documentId() + "/" + document.freezeVersion()));
+        return freeze.termVersion() == document.termVersion()
+                && !clock.now().isBefore(freeze.freezeEnd());
+    }
+
+    /**
+     * 解冻后更新的全量重校验：受影响段落为源文命中旧绑定版本或新版本任一源术语的段落（并集）。
+     * 对每个受影响段落的全部目标语言，要求译文存在且满足新版本规则；汇总全部问题：
+     * 缺译抛 422，术语违规抛 422 并返回全部违规规则。任何问题都由调用方事务回滚，不留部分替换。
+     * 校验通过后由调用方把全部现有译文原子重绑到新术语版本：无术语命中的段落无适用规则，
+     * 重绑不改变其合规性，保证草稿各译文与当前术语版本一致、可被发布引用。
+     */
+    private List<String> revalidateAffectedSegments(DocumentRow document, List<TermRuleRow> newRules) {
+        long documentId = document.documentId();
+        Set<String> oldTerms = repository.listTermRules(documentId, document.termVersion()).stream()
+                .map(TermRuleRow::sourceTerm).collect(Collectors.toSet());
+        Set<String> newTerms = newRules.stream().map(TermRuleRow::sourceTerm).collect(Collectors.toSet());
+        List<SegmentRow> affected = repository.listSegments(documentId).stream()
+                .filter(segment -> containsAny(segment.sourceText(), oldTerms)
+                        || containsAny(segment.sourceText(), newTerms))
+                .toList();
+        Map<String, TranslationRow> translations = repository.listTranslations(documentId).stream()
+                .collect(Collectors.toMap(t -> key(t.segmentId(), t.language()), Function.identity()));
+        List<ApiDtos.TermRuleView> violations = new ArrayList<>();
+        List<String> missing = new ArrayList<>();
+        for (SegmentRow segment : affected) {
+            for (String language : document.targetLanguages()) {
+                TranslationRow translation = translations.get(key(segment.segmentId(), language));
+                if (translation == null) {
+                    missing.add(segment.segmentId() + "/" + language);
+                    continue;
+                }
+                violations.addAll(findViolations(segment.sourceText(), language, translation.content(), newRules));
+            }
+        }
+        if (!missing.isEmpty()) {
+            throw ApiException.unprocessable("受影响段落缺少译文，无法完成解冻术语更新: " + missing);
+        }
+        if (!violations.isEmpty()) {
+            throw ApiException.termViolation("解冻后重校验发现 " + violations.size() + " 条术语违规", violations);
+        }
+        return affected.stream().map(SegmentRow::segmentId).toList();
+    }
+
+    private static boolean containsAny(String text, Set<String> terms) {
+        for (String term : terms) {
+            if (text.contains(term)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 受影响段落：源文命中指定术语版本中任一源术语（不区分语言）的段落，按 segmentId 排序。 */
+    private List<String> affectedSegments(long documentId, int termVersion) {
+        Set<String> terms = repository.listTermRules(documentId, termVersion).stream()
+                .map(TermRuleRow::sourceTerm).collect(Collectors.toSet());
+        if (terms.isEmpty()) {
+            return List.of();
+        }
+        return repository.listSegments(documentId).stream()
+                .filter(segment -> containsAny(segment.sourceText(), terms))
+                .map(SegmentRow::segmentId)
+                .toList();
+    }
+
+    private static ApiDtos.FreezeWindowView toFreezeView(FreezeRow freeze, Instant now) {
+        return new ApiDtos.FreezeWindowView(freeze.freezeVersion(), freeze.termVersion(),
+                freeze.freezeStart(), freeze.freezeEnd(),
+                FreezeStatus.isActive(freeze.freezeStart(), freeze.freezeEnd(), now));
     }
 
     private SegmentRow findSegmentOrThrow(long documentId, String segmentId) {

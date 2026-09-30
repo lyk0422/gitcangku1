@@ -1,5 +1,6 @@
 package com.example.starter.translation.domain;
 
+import java.time.Instant;
 import java.util.List;
 
 /**
@@ -18,9 +19,21 @@ public final class Rows {
      * @param draftVersion     文档草稿版本，从 1 开始；增段落或修改源文/译文/术语时加一
      * @param publishedVersion 已发布版本号，从 0 开始，每次成功发布加一
      * @param termVersion      当前术语版本，从 0 开始（0 表示尚未建立术语版本）
+     * @param freezeVersion    最近一次冻结窗口序号，从 0 开始，0 表示从未冻结
      */
     public record DocumentRow(long documentId, List<String> targetLanguages,
-                              int draftVersion, int publishedVersion, int termVersion) {
+                              int draftVersion, int publishedVersion, int termVersion, int freezeVersion) {
+    }
+
+    /**
+     * 术语冻结窗口：草稿在 UTC 左闭右开区间 [freezeStart, freezeEnd) 内绑定指定术语版本。
+     *
+     * @param freezeVersion 窗口序号，从 1 开始单调递增
+     * @param termVersion   窗口绑定冻结的术语版本号（如 V2）
+     * @param freezeStart   窗口起始时刻，UTC，左闭
+     * @param freezeEnd     窗口结束时刻，UTC，右开
+     */
+    public record FreezeRow(int freezeVersion, int termVersion, Instant freezeStart, Instant freezeEnd) {
     }
 
     /**

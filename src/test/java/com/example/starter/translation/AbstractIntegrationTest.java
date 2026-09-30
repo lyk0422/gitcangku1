@@ -1,5 +1,6 @@
 package com.example.starter.translation;
 
+import com.example.starter.translation.service.BusinessClock;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
@@ -13,6 +14,9 @@ import org.springframework.test.web.servlet.MvcResult;
 import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
 import org.springframework.test.web.servlet.request.MockMvcRequestBuilders;
 
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.UUID;
 
 /**
@@ -33,16 +37,26 @@ public abstract class AbstractIntegrationTest {
     @Autowired
     protected ObjectMapper objectMapper;
 
+    @Autowired
+    protected BusinessClock businessClock;
+
     @BeforeEach
     void cleanTables() {
+        businessClock.setClock(Clock.systemUTC());
         jdbc.update("DELETE FROM approval");
         jdbc.update("DELETE FROM translation");
         jdbc.update("DELETE FROM segment");
         jdbc.update("DELETE FROM release_snapshot");
+        jdbc.update("DELETE FROM term_freeze");
         jdbc.update("DELETE FROM term_rule");
         jdbc.update("DELETE FROM term_version");
         jdbc.update("DELETE FROM request_log");
         jdbc.update("DELETE FROM document");
+    }
+
+    /** 将业务时钟固定到指定 UTC 时刻（ISO-8601，如 2026-10-01T10:30:00Z）。 */
+    protected void setClock(String isoUtc) {
+        businessClock.setClock(Clock.fixed(Instant.parse(isoUtc), ZoneOffset.UTC));
     }
 
     protected String newRequestId() {
@@ -128,6 +142,14 @@ public abstract class AbstractIntegrationTest {
         String body = "{\"requestId\":\"" + requestId + "\",\"expectedTermVersion\":" + expectedTermVersion
                 + ",\"rules\":" + rulesJson + "}";
         return putJson("/api/documents/" + documentId + "/terms", body);
+    }
+
+    /** 创建术语冻结窗口：起止为 UTC ISO-8601 时刻，区间左闭右开。 */
+    protected ApiResult createFreeze(long documentId, int termVersion, String freezeStart, String freezeEnd,
+                                     String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"termVersion\":" + termVersion
+                + ",\"freezeStart\":\"" + freezeStart + "\",\"freezeEnd\":\"" + freezeEnd + "\"}";
+        return postJson("/api/documents/" + documentId + "/terms/freeze", body);
     }
 
     /** HTTP 响应结果：状态码与 JSON 响应体。 */

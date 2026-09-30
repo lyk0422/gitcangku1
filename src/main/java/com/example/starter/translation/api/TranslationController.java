@@ -53,6 +53,7 @@ public class TranslationController {
                                              @Valid @RequestBody ApiDtos.AddSegmentRequest request) {
         String operation = "POST /api/documents/" + documentId + "/segments";
         return writeExecutor.execute(request.requestId(), hash(operation, request),
+                () -> translationService.assertWritable(documentId),
                 () -> WriteResult.of(201, translationService.addSegment(documentId, request))).toResponseEntity();
     }
 
@@ -62,6 +63,7 @@ public class TranslationController {
                                                @Valid @RequestBody ApiDtos.ReviseSourceRequest request) {
         String operation = "PUT /api/documents/" + documentId + "/segments/" + segmentId + "/source";
         return writeExecutor.execute(request.requestId(), hash(operation, request),
+                () -> translationService.assertWritable(documentId),
                 () -> WriteResult.of(200, translationService.reviseSource(documentId, segmentId, request)))
                 .toResponseEntity();
     }
@@ -75,6 +77,7 @@ public class TranslationController {
         String operation = "PUT /api/documents/" + documentId + "/segments/" + segmentId
                 + "/translations/" + language;
         return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> translationService.assertWritable(documentId),
                 () -> WriteResult.of(200, translationService.submitTranslation(
                         documentId, segmentId, language, actorId, request))).toResponseEntity();
     }
@@ -88,6 +91,7 @@ public class TranslationController {
         String operation = "POST /api/documents/" + documentId + "/segments/" + segmentId
                 + "/translations/" + language + "/approve";
         return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> translationService.assertWritable(documentId),
                 () -> WriteResult.of(200, translationService.approveTranslation(
                         documentId, segmentId, language, actorId, request))).toResponseEntity();
     }
@@ -98,6 +102,7 @@ public class TranslationController {
                                           @Valid @RequestBody ApiDtos.PublishRequest request) {
         String operation = "POST /api/documents/" + documentId + "/publish";
         return writeExecutor.execute(request.requestId(), hash(operation, request),
+                () -> translationService.assertWritable(documentId),
                 () -> WriteResult.of(201, translationService.publish(documentId, request))).toResponseEntity();
     }
 
@@ -107,6 +112,7 @@ public class TranslationController {
                                               @Valid @RequestBody ApiDtos.UpdateTermsRequest request) {
         String operation = "PUT /api/documents/" + documentId + "/terms";
         return writeExecutor.execute(request.requestId(), hash(operation, request),
+                () -> translationService.assertWritable(documentId),
                 () -> WriteResult.of(201, translationService.updateTerms(documentId, request))).toResponseEntity();
     }
 
@@ -114,6 +120,29 @@ public class TranslationController {
     @GetMapping("/{documentId}/terms")
     public ResponseEntity<ApiDtos.TermVersionView> getCurrentTerms(@PathVariable long documentId) {
         return ResponseEntity.ok(translationService.getCurrentTerms(documentId));
+    }
+
+    /** 创建术语冻结窗口：绑定术语版本与 UTC 左闭右开区间；窗口进行中再建返回 409。 */
+    @PostMapping("/{documentId}/terms/freeze")
+    public ResponseEntity<String> createFreeze(@PathVariable long documentId,
+                                               @Valid @RequestBody ApiDtos.CreateFreezeRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/terms/freeze";
+        return writeExecutor.execute(request.requestId(), hash(operation, request),
+                () -> translationService.assertWritable(documentId),
+                () -> WriteResult.of(201, translationService.createFreeze(documentId, request))).toResponseEntity();
+    }
+
+    /** 查询冻结状态：冻结起止、草稿术语版本、全部历史窗口及受影响段落。 */
+    @GetMapping("/{documentId}/terms/freeze")
+    public ResponseEntity<ApiDtos.FreezeStatusResponse> getFreezeStatus(@PathVariable long documentId) {
+        return ResponseEntity.ok(translationService.getFreezeStatus(documentId));
+    }
+
+    /** 查询指定冻结窗口。 */
+    @GetMapping("/{documentId}/terms/freeze/{freezeVersion}")
+    public ResponseEntity<ApiDtos.FreezeWindowView> getFreeze(@PathVariable long documentId,
+                                                              @PathVariable int freezeVersion) {
+        return ResponseEntity.ok(translationService.getFreeze(documentId, freezeVersion));
     }
 
     /** 查询指定术语版本的不可变规则集。 */

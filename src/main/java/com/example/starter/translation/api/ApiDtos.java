@@ -8,6 +8,7 @@ import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.PositiveOrZero;
 import jakarta.validation.constraints.Size;
 
+import java.time.Instant;
 import java.util.List;
 
 /**
@@ -108,8 +109,33 @@ public final class ApiDtos {
     public record TermRuleView(String sourceTerm, String language, String requiredTranslation) {
     }
 
-    /** 新增术语版本响应。 */
-    public record TermVersionResponse(long documentId, int termVersion, int ruleCount, int draftVersion) {
+    /** 新增术语版本响应；affectedSegments 为解冻后更新时按新规则重校验的受影响段落，其余场景为空。 */
+    public record TermVersionResponse(long documentId, int termVersion, int ruleCount, int draftVersion,
+                                      List<String> affectedSegments) {
+    }
+
+    /** 创建术语冻结窗口请求：绑定术语版本与 UTC 左闭右开区间 [freezeStart, freezeEnd)。 */
+    public record CreateFreezeRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @Positive(message = "termVersion 必须为正数") int termVersion,
+            @NotNull(message = "freezeStart 不能为空") Instant freezeStart,
+            @NotNull(message = "freezeEnd 不能为空") Instant freezeEnd) {
+    }
+
+    /** 冻结窗口视图：冻结起止（UTC）、绑定术语版本及当前时刻是否处于窗口内。 */
+    public record FreezeWindowView(int freezeVersion, int termVersion,
+                                   Instant freezeStart, Instant freezeEnd, boolean active) {
+    }
+
+    /** 创建冻结窗口响应：窗口信息、创建时草稿/发布版本及受影响段落（源文命中绑定版本规则的段落）。 */
+    public record FreezeResponse(long documentId, FreezeWindowView window, int draftVersion, int publishedVersion,
+                                 List<String> affectedSegments) {
+    }
+
+    /** 冻结状态查询：最近窗口（无则 null）、全部历史窗口、草稿当前术语版本与受影响段落。 */
+    public record FreezeStatusResponse(long documentId, int termVersion, int draftVersion, int publishedVersion,
+                                       FreezeWindowView activeWindow, List<FreezeWindowView> windows,
+                                       List<String> affectedSegments) {
     }
 
     /** 术语版本查询视图：版本号与完整规则集。 */
