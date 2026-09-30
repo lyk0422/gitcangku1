@@ -1,0 +1,14 @@
+spring:
+  datasource:
+    # 测试独立命名的 H2 内存库，MySQL 兼容模式；仅本 JVM、本上下文存活。
+    url: jdbc:h2:mem:passtestdb;MODE=MySQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=30000
+    username: sa
+    password:
+    hikari:
+      maximum-pool-size: 12
+      minimum-idle: 1
+      connection-timeout: 30000
+      validation-timeout: 3000
+  sql:
+    init:
+      mode: always
