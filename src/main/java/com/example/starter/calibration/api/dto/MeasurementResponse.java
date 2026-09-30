@@ -23,6 +23,7 @@ import java.util.List;
  * @param usable         当前是否可用（已放行且证书未撤销）
  * @param createdAt      提交时间（UTC）
  * @param releases       放行历史
+ * @param excluded       是否被离群 REJECT 裁决排除（true 时不参与批次统计与放行，status=EXCLUDED）
  */
 public record MeasurementResponse(
         long id,
@@ -40,5 +41,6 @@ public record MeasurementResponse(
         String status,
         boolean usable,
         Instant createdAt,
-        List<ReleaseRecordResponse> releases) {
+        List<ReleaseRecordResponse> releases,
+        boolean excluded) {
 }

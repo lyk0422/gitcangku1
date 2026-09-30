@@ -19,7 +19,8 @@ import com.example.starter.calibration.repo.MeasurementRepository;
 import com.example.starter.calibration.repo.ReleaseRepository;
 
 /**
- * 测量服务：提交（匹配唯一有效证书并固化计算结果）、历史明细、当前可用结果查询。
+ * 测量服务：独立测量提交（匹配唯一有效证书并固化计算结果）、历史明细、当前可用结果查询。
+ * 批次读数的提交流程见 {@link BatchService}。
  */
 @Service
 public class MeasurementService {
@@ -27,17 +28,20 @@ public class MeasurementService {
     private final MeasurementRepository measurements;
     private final CertificateRepository certificates;
     private final ReleaseRepository releases;
+    private final CalibrationClock clock;
 
     public MeasurementService(MeasurementRepository measurements,
                               CertificateRepository certificates,
-                              ReleaseRepository releases) {
+                              ReleaseRepository releases,
+                              CalibrationClock clock) {
         this.measurements = measurements;
         this.certificates = certificates;
         this.releases = releases;
+        this.clock = clock;
     }
 
     /**
-     * 提交测量。按测量时刻匹配唯一有效证书，无匹配返回 422；
+     * 提交独立测量。按测量时刻匹配唯一有效证书，无匹配返回 422；
      * 使用 BigDecimal 精确计算 a×读数+b，合格判断基于未舍入值且包含端点。
      * measurementKey 重复返回 409（幂等键冲突）。
      */
@@ -63,7 +67,8 @@ public class MeasurementService {
 
         Measurement measurement = new Measurement(
                 0L, key, instrumentId, measuredAt, reading, lower, upper, submittedBy,
-                cert.id(), computed, passed, MeasurementStatus.PENDING, Instant.now());
+                cert.id(), computed, passed, MeasurementStatus.PENDING,
+                null, null, false, null, null, clock.now());
         try {
             measurements.insert(measurement);
         } catch (DuplicateKeyException ex) {

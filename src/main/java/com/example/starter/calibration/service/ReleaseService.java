@@ -73,6 +73,10 @@ public class ReleaseService {
             } else if (measurement.status() != MeasurementStatus.PENDING) {
                 reasons.add("NOT_PENDING");
             }
+            if (measurement.batchId() != null) {
+                // 批次读数只能走批次放行（携带离群裁决的一致集合），禁止经通用放行旁路。
+                reasons.add("BATCH_READING_USE_BATCH_RELEASE");
+            }
             if (!measurement.passed()) {
                 reasons.add("NOT_PASSED");
             }
