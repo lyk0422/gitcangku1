@@ -63,6 +63,13 @@ public class ApiException extends RuntimeException {
     }
 
     /**
+     * 422：观测簇尚未经冲突裁决（未解决），不能以更正附录表达字段差异。
+     */
+    public static ApiException unprocessable(String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, message, null, null);
+    }
+
+    /**
      * 410：记录已删除，拒绝新的修改和删除。
      */
     public static ApiException gone(String message) {

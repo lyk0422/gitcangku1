@@ -84,6 +84,21 @@ public class ResolutionRepository {
                 RESOLUTION_MAPPER, observationId);
     }
 
+    /**
+     * 查询观测记录最新一条冲突裁决（按解决时刻与标识排序后的最后一条）；无裁决记录时返回空。
+     * 更正附录必须引用最新裁决：绕过原裁决或引用旧裁决均拒绝。
+     */
+    public Optional<ResolutionRecord> findLatestByObservationId(String observationId) {
+        return jdbcTemplate.query(
+                        "SELECT resolution_id, observation_id, request_id, base_version, previous_version, "
+                                + "new_version, candidate_location, candidate_reading, candidate_note, "
+                                + "conflict_fields, field_selections, operator, content_changed, resolved_at_utc "
+                                + "FROM conflict_resolution WHERE observation_id = ? "
+                                + "ORDER BY resolved_at_utc DESC, resolution_id DESC LIMIT 1",
+                        RESOLUTION_MAPPER, observationId)
+                .stream().findFirst();
+    }
+
     private String writeJson(Object value) {
         try {
             return objectMapper.writeValueAsString(value);

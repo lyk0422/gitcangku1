@@ -29,9 +29,9 @@ CREATE TABLE IF NOT EXISTS observation_version (
 CREATE TABLE IF NOT EXISTS request_log (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
     fingerprint VARCHAR(128) NOT NULL COMMENT '请求操作与参数的指纹，同键异参时判定 409',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：CREATE / MERGE / DELETE / RESOLVE',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：CREATE / MERGE / DELETE / RESOLVE / APPENDIX',
     response_status INT NULL COMMENT '成功响应的 HTTP 状态码；提交过程中暂为 NULL',
-    response_body VARCHAR(4000) NULL COMMENT '成功响应体（JSON 原文），用于同键同参重放；提交过程中暂为 NULL',
+    response_body VARCHAR(8000) NULL COMMENT '成功响应体（JSON 原文），用于同键同参重放；提交过程中暂为 NULL',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '请求记录创建时间（服务器时区）',
     PRIMARY KEY (request_id)
 );
@@ -57,5 +57,30 @@ CREATE TABLE IF NOT EXISTS conflict_resolution (
     -- 同一观测记录内 requestId 唯一，支撑解决请求的同参重放/异参 409。
     -- 不设置指向 observation_current 的外键：观测记录删除仅置墓碑（当前行保留），
     -- 且不可变解决历史必须在任何数据清理/归档场景下继续可查。
+    UNIQUE (observation_id, request_id)
+);
+
+-- 观测更正附录表：已解决观测簇的后续字段差异只能以新附录版本表达，不可变、永不更新或删除。
+-- 冲突裁决生效后指向的历史快照（conflict_resolution.new_version 对应 observation_version 行）
+-- 保持只读，构成更正链 V0；附录版本 V1..Vn 由此表串联，
+-- appendix_version=1 引用裁决记录与该裁决生效快照，之后每个附录引用前一附录版本。
+CREATE TABLE IF NOT EXISTS corrigendum_appendix (
+    appendix_id VARCHAR(128) NOT NULL COMMENT '全局唯一附录记录标识',
+    observation_id VARCHAR(64) NOT NULL COMMENT '观测记录唯一标识',
+    request_id VARCHAR(128) NOT NULL COMMENT '生成该附录的请求标识（requestId）',
+    appendix_version INT NOT NULL COMMENT '附录版本号，从 1 开始单调递增；原始快照恒为 V0',
+    previous_appendix_version INT NULL COMMENT '前一附录版本号；V1 为 NULL，V2 起为前一附录版本',
+    resolution_id VARCHAR(128) NOT NULL COMMENT '该观测簇冲突裁决记录标识；必须为该观测最新裁决，且裁决后观测版本未漂移',
+    snapshot_version INT NOT NULL COMMENT '更正链原始快照（V0）在 observation_version 中的版本号，即建链时裁决指向的 new_version，附录引用但不修改该历史快照',
+    field_name VARCHAR(16) NOT NULL COMMENT '本次更正字段名：location / reading / note，一次附录仅允许更正一个字段',
+    old_value VARCHAR(1024) NOT NULL COMMENT '更正前旧值完整原文：V1 为原始快照值，其后为前一附录生效值',
+    new_value VARCHAR(1024) NOT NULL COMMENT '更正后新值完整原文；禁止为空（不允许删除字段），读数为最多三位小数的十进制原文',
+    operator VARCHAR(128) NOT NULL COMMENT '提交更正附录的观测记录员标识',
+    corrected_at_utc TIMESTAMP NOT NULL COMMENT '更正完成时刻（UTC）',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录落库时间（服务器时区）',
+    PRIMARY KEY (appendix_id),
+    -- 同一观测记录内附录版本号唯一且单调，作为乐观并发裁决点：争用同一前置版本只允许一个插入。
+    UNIQUE (observation_id, appendix_version),
+    -- 同一观测记录内 requestId 唯一，支撑附录请求的同参重放/异参 409；request_log 主键提供全局幂等。
     UNIQUE (observation_id, request_id)
 );
