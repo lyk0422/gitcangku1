@@ -30,6 +30,9 @@ import com.example.starter.race.persistence.SnapshotCheckpointRow;
 import com.example.starter.race.persistence.SnapshotEntryRow;
 import com.example.starter.race.persistence.SnapshotRow;
 import com.example.starter.race.persistence.RaceRepository;
+import com.example.starter.race.persistence.RosterRepository;
+import com.example.starter.race.persistence.SnapshotTeamMemberRow;
+import com.example.starter.race.persistence.SnapshotTeamRow;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
@@ -72,11 +75,19 @@ public class RaceServiceImpl implements RaceService {
     private static final long INFLIGHT_WAIT_MAX_MS = 30_000L;
 
     private final RaceRepository repository;
+    private final RosterRepository rosterRepository;
+    private final TeamRosterServiceImpl teamRosterService;
     private final Clock clock;
     private final ObjectMapper objectMapper;
 
-    public RaceServiceImpl(RaceRepository repository, Clock clock, ObjectMapper objectMapper) {
+    public RaceServiceImpl(RaceRepository repository,
+                           RosterRepository rosterRepository,
+                           TeamRosterServiceImpl teamRosterService,
+                           Clock clock,
+                           ObjectMapper objectMapper) {
         this.repository = repository;
+        this.rosterRepository = rosterRepository;
+        this.teamRosterService = teamRosterService;
         this.clock = clock;
         this.objectMapper = objectMapper;
     }
@@ -390,6 +401,14 @@ public class RaceServiceImpl implements RaceService {
                             buildSnapshotCheckpoints(raceId, runners, checkpoints, timings);
                     repository.insertSnapshot(new SnapshotRow(raceId, newVersion, now,
                             snapshotEntries, snapshotCheckpoints));
+                    // 同一封榜事务内固化团队成绩：各队只引用封榜时刻的一个完整名单版本，
+                    // 成员封榜前已登记的退赛生效、之后退赛不重算本快照。
+                    List<SnapshotTeamMemberRow> teamMembers = new ArrayList<>();
+                    List<SnapshotTeamRow> teams =
+                            teamRosterService.buildTeamSnapshotRows(raceId, teamMembers);
+                    if (!teams.isEmpty()) {
+                        rosterRepository.insertTeamSnapshot(teams, teamMembers);
+                    }
                     return ServiceResult.ok(new StandingResponse(
                             raceId, newVersion, RaceStatus.SEALED, now,
                             snapshotEntries.stream().map(ResponseMapper::toEntryResponse).toList()));

@@ -97,10 +97,100 @@ CREATE TABLE IF NOT EXISTS result_snapshot_checkpoint (
 
 CREATE TABLE IF NOT EXISTS idempotency_record (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求ID（写操作幂等键）',
-    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE',
+    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE/LOCK_ROSTER/WITHDRAW_MEMBER',
     request_digest CHAR(64) NOT NULL COMMENT '请求参数（requestId除外，含expectedVersion）规范化JSON的SHA-256摘要',
     response_status INT NOT NULL COMMENT '原成功请求的HTTP状态码，重放时原样返回',
     response_body TEXT COMMENT '原成功响应体JSON，重放时原样返回',
     created_at BIGINT NOT NULL COMMENT '首次成功提交时间，Unix毫秒时间戳',
     CONSTRAINT pk_idempotency_record PRIMARY KEY (request_id)
+);
+
+-- 团队名单锁定领域表结构。
+-- 名单版本与成员锁定时刻成绩均为不可变历史；成员在同一赛事内至多归属一个团队。
+CREATE TABLE IF NOT EXISTS team (
+    id BIGINT NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    team_id VARCHAR(64) NOT NULL COMMENT '团队ID，同一赛事内唯一',
+    created_at BIGINT NOT NULL COMMENT '团队首次锁定名单时间，Unix毫秒时间戳',
+    CONSTRAINT pk_team PRIMARY KEY (id),
+    CONSTRAINT uk_team_race_team UNIQUE (race_id, team_id),
+    CONSTRAINT fk_team_race FOREIGN KEY (race_id) REFERENCES race (race_id)
+);
+
+CREATE TABLE IF NOT EXISTS roster_lock (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    team_id VARCHAR(64) NOT NULL COMMENT '团队ID',
+    roster_version INT NOT NULL COMMENT '名单版本号，同一团队内从1连续递增，创建后不可变',
+    race_version INT NOT NULL COMMENT '锁定该版本后推进到的赛事版本号',
+    locked_at BIGINT NOT NULL COMMENT '锁定时间，Unix毫秒时间戳',
+    CONSTRAINT pk_roster_lock PRIMARY KEY (race_id, team_id, roster_version),
+    CONSTRAINT fk_roster_lock_team FOREIGN KEY (race_id, team_id) REFERENCES team (race_id, team_id)
+);
+
+CREATE TABLE IF NOT EXISTS roster_lock_entry (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    team_id VARCHAR(64) NOT NULL COMMENT '团队ID',
+    roster_version INT NOT NULL COMMENT '所属名单版本号',
+    bib VARCHAR(64) NOT NULL COMMENT '成员参赛号',
+    entry_status VARCHAR(24) NOT NULL COMMENT '锁定时刻个人成绩状态：RANKED/UNTIMED/MISSING_CHECKPOINT/DISQUALIFIED',
+    finish_time_ms BIGINT COMMENT '锁定时刻原始完赛耗时（毫秒）；计时缺失为NULL',
+    penalty_ms BIGINT NOT NULL COMMENT '锁定时刻生效（未撤销）加时合计毫秒数，无加时为0',
+    total_time_ms BIGINT COMMENT '锁定时刻总耗时=原始完赛耗时+生效加时（毫秒）；未排名为NULL',
+    checkpoint_count INT NOT NULL DEFAULT 0 COMMENT '赛事检查点总数；未配置检查点为0',
+    covered_checkpoint_count INT NOT NULL DEFAULT 0 COMMENT '锁定时刻该成员已覆盖检查点数量',
+    CONSTRAINT pk_roster_lock_entry PRIMARY KEY (race_id, team_id, roster_version, bib),
+    CONSTRAINT fk_roster_entry_lock FOREIGN KEY (race_id, team_id, roster_version)
+        REFERENCES roster_lock (race_id, team_id, roster_version),
+    CONSTRAINT fk_roster_entry_runner FOREIGN KEY (race_id, bib) REFERENCES runner (race_id, bib)
+);
+
+CREATE TABLE IF NOT EXISTS roster_membership (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    bib VARCHAR(64) NOT NULL COMMENT '参赛号，同一赛事内至多归属一个团队',
+    team_id VARCHAR(64) NOT NULL COMMENT '当前归属团队ID，一经锁定不可更换',
+    roster_version INT NOT NULL COMMENT '首次锁定进队的名单版本号',
+    active BOOLEAN NOT NULL DEFAULT TRUE COMMENT '是否在队：TRUE-在队，FALSE-已登记退赛；退赛不删除归属',
+    CONSTRAINT pk_roster_membership PRIMARY KEY (race_id, bib),
+    CONSTRAINT fk_membership_team FOREIGN KEY (race_id, team_id) REFERENCES team (race_id, team_id)
+);
+
+CREATE TABLE IF NOT EXISTS roster_withdrawal (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    bib VARCHAR(64) NOT NULL COMMENT '退赛成员参赛号，同一赛事内至多一条退赛记录',
+    team_id VARCHAR(64) NOT NULL COMMENT '成员所属团队ID，退赛不变更归属',
+    effective_session INT NOT NULL COMMENT '退赛生效场次号（从1开始的正整数），该场次及之后的未封榜计分排除该成员',
+    reason VARCHAR(512) NOT NULL COMMENT '退赛原因，非空',
+    withdrawn_at BIGINT NOT NULL COMMENT '退赛登记时间，Unix毫秒时间戳',
+    CONSTRAINT pk_roster_withdrawal PRIMARY KEY (race_id, bib),
+    CONSTRAINT fk_withdrawal_membership FOREIGN KEY (race_id, bib)
+        REFERENCES roster_membership (race_id, bib),
+    INDEX idx_withdrawal_race_team (race_id, team_id)
+);
+
+CREATE TABLE IF NOT EXISTS result_snapshot_team (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属快照的赛事ID；每个已锁定名单的团队封榜时一行，只读',
+    team_id VARCHAR(64) NOT NULL COMMENT '团队ID',
+    roster_version INT NOT NULL COMMENT '封榜引用的唯一完整名单版本号',
+    total_time_ms BIGINT NOT NULL COMMENT '团队总耗时（毫秒）=版本内参与计分成员总耗时之和',
+    member_count INT NOT NULL COMMENT '名单版本固化成员数',
+    scoring_count INT NOT NULL COMMENT '实际参与团队计分的成员数（封榜时按退赛生效状态排除）',
+    display_order INT NOT NULL COMMENT '展示顺序，从0开始：团队总分升序，同分按团队ID字典序',
+    CONSTRAINT pk_snapshot_team PRIMARY KEY (race_id, team_id),
+    CONSTRAINT fk_snapshot_team_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
+);
+
+CREATE TABLE IF NOT EXISTS result_snapshot_team_member (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属快照的赛事ID',
+    team_id VARCHAR(64) NOT NULL COMMENT '团队ID',
+    bib VARCHAR(64) NOT NULL COMMENT '参赛号',
+    entry_status VARCHAR(24) NOT NULL COMMENT '名单版本固化的个人成绩状态',
+    finish_time_ms BIGINT COMMENT '名单版本固化的原始完赛耗时（毫秒）；计时缺失为NULL',
+    penalty_ms BIGINT NOT NULL COMMENT '名单版本固化的生效加时合计毫秒数',
+    total_time_ms BIGINT COMMENT '名单版本固化的总耗时（毫秒）；未排名为NULL',
+    scoring BOOLEAN NOT NULL COMMENT '是否计入团队总分：TRUE-计入，FALSE-未排名或封榜时退赛已生效',
+    withdrawn BOOLEAN NOT NULL COMMENT '封榜时刻是否已登记退赛：TRUE-已退赛，FALSE-未退赛',
+    effective_session INT COMMENT '退赛生效场次号（从1开始的正整数）；封榜时未退赛为NULL',
+    CONSTRAINT pk_snapshot_team_member PRIMARY KEY (race_id, team_id, bib),
+    CONSTRAINT fk_snapshot_team_member_team FOREIGN KEY (race_id, team_id)
+        REFERENCES result_snapshot_team (race_id, team_id)
 );
