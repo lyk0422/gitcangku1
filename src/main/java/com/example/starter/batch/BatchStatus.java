@@ -5,7 +5,9 @@ package com.example.starter.batch;
  * QUARANTINED 初始隔离；全部必做检验项 PASS 后进入 PENDING_RELEASE；
  * 首个有效批准进入 RELEASE_REVIEW；第二个不同角色批准进入 RELEASED；
  * 任一 FAIL 立即进入 REJECTED（终态）；已放行批次召回后进入 RECALLED（终态）；
- * RELEASED 批次拆分后进入 SPLIT（终态，父批不再可用，可整体召回）。
+ * RELEASED 批次拆分后进入 SPLIT（终态，父批不再可用，可整体召回）；
+ * RELEASED 批次参与合批后进入 MERGED（终态，父批不再可用，可整体召回），
+ * 合批子批初始 QUARANTINED 并固化父批过敏原集合与清洁代次依据。
  */
 public enum BatchStatus {
     QUARANTINED,
@@ -14,5 +16,6 @@ public enum BatchStatus {
     RELEASED,
     REJECTED,
     RECALLED,
-    SPLIT
+    SPLIT,
+    MERGED
 }

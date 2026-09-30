@@ -1,10 +1,12 @@
 package com.example.starter.batch;
 
+import com.example.starter.batch.dto.AdvanceCleaningRequest;
 import com.example.starter.batch.dto.ApproveRequest;
 import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
 import com.example.starter.batch.dto.LineageEntryResponse;
+import com.example.starter.batch.dto.MergeRequest;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
@@ -36,7 +38,7 @@ public class BatchController {
     }
 
     /**
-     * 创建批次，初始状态 QUARANTINED。
+     * 创建批次，初始状态 QUARANTINED；规范化过敏原集合与清洁代次随批次保存。
      */
     @PostMapping
     public ResponseEntity<String> create(@Valid @RequestBody CreateBatchRequest request) {
@@ -82,7 +84,8 @@ public class BatchController {
     }
 
     /**
-     * 批次完整历史明细：批次概要、全部检验、全部批准与召回记录。
+     * 批次完整历史明细：批次概要（含过敏原集合、清洁代次与合批冻结依据）、
+     * 全部检验、全部批准、召回记录与合批去向。
      */
     @GetMapping("/{batchKey}/history")
     public BatchHistoryResponse history(@PathVariable String batchKey) {
@@ -99,7 +102,26 @@ public class BatchController {
     }
 
     /**
-     * 祖先查询：从直接父批到根，含各批自身状态及导致不可用的召回祖先。
+     * 合批：2～5 个当前可用 RELEASED 父批合为一个全新子批。
+     * 全部父批规范化过敏原集合必须完全相同、当前清洁代次一致且等于请求代次，
+     * 任一父批已隔离（非 RELEASED/有召回祖先）或集合/代次不兼容均整单 422，不生成子批、不改父批数量。
+     */
+    @PostMapping("/merge")
+    public ResponseEntity<String> merge(@Valid @RequestBody MergeRequest request) {
+        return stored(service.merge(request));
+    }
+
+    /**
+     * 推进批次生产线清洁代次：只增不减；不影响已合批子批固化的历史代次依据。
+     */
+    @PostMapping("/{batchKey}/cleaning")
+    public ResponseEntity<String> advanceCleaning(@PathVariable String batchKey,
+                                                  @Valid @RequestBody AdvanceCleaningRequest request) {
+        return stored(service.advanceCleaning(batchKey, request));
+    }
+
+    /**
+     * 祖先查询：从直接父批到根，含各批自身状态、过敏原集合、清洁代次及导致不可用的召回祖先。
      */
     @GetMapping("/{batchKey}/ancestors")
     public List<LineageEntryResponse> ancestors(@PathVariable String batchKey) {
@@ -107,7 +129,7 @@ public class BatchController {
     }
 
     /**
-     * 后代查询：按拆分创建顺序展开，含各批自身状态及导致不可用的召回祖先。
+     * 后代查询：按血缘创建顺序展开（含拆分/合批），含各批自身状态、过敏原、清洁代次及召回祖先。
      */
     @GetMapping("/{batchKey}/descendants")
     public List<LineageEntryResponse> descendants(@PathVariable String batchKey) {

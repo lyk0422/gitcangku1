@@ -7,7 +7,8 @@ import java.util.List;
 
 /**
  * 拆分响应。父批状态落定 SPLIT；子批初始 QUARANTINED，继承父批产品编码、
- * 生产 UTC 时间与必做检验项，不继承检验或批准记录。splitAt 为 UTC instant。
+ * 生产 UTC 时间、必做检验项、规范化过敏原集合与当前清洁代次，不继承检验或批准记录。
+ * splitAt 为 UTC instant。
  */
 public record SplitResponse(
         String parentBatchKey,
@@ -17,7 +18,7 @@ public record SplitResponse(
 ) {
 
     /**
-     * 拆分产生的子批概要。
+     * 拆分产生的子批概要。allergens/cleanGeneration 继承自父批当前值。
      */
     public record SplitChild(
             String batchKey,
@@ -26,6 +27,8 @@ public record SplitResponse(
             Instant producedAt,
             BatchStatus status,
             List<String> requiredTests,
+            List<String> allergens,
+            int cleanGeneration,
             Instant createdAt
     ) {
     }

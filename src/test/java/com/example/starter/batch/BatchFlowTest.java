@@ -49,6 +49,9 @@ class BatchFlowTest {
         jdbc.update("DELETE FROM recall");
         jdbc.update("DELETE FROM test_result");
         jdbc.update("DELETE FROM batch_required_test");
+        jdbc.update("DELETE FROM batch_merge_parent");
+        jdbc.update("DELETE FROM batch_merge");
+        jdbc.update("DELETE FROM batch_allergen");
         jdbc.update("DELETE FROM batch_lineage");
         jdbc.update("DELETE FROM batch");
     }
