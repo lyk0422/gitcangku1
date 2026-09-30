@@ -112,3 +112,116 @@ COMMENT ON COLUMN idempotent_request.fingerprint IS '请求参数指纹（含路
 COMMENT ON COLUMN idempotent_request.response_status IS '首次成功响应的 HTTP 状态码，重放时原样返回';
 COMMENT ON COLUMN idempotent_request.response_body IS '首次成功响应体 JSON，重放时原样返回';
 COMMENT ON COLUMN idempotent_request.created_at IS '记录时间，Unix 毫秒，UTC';
+
+-- ========== 研究中心启用门禁 ==========
+
+CREATE TABLE IF NOT EXISTS site (
+    id             VARCHAR(64)  NOT NULL,
+    lead_actor_id  VARCHAR(64)  NOT NULL,
+    status         VARCHAR(16)  NOT NULL,
+    active_version INT,
+    created_at     BIGINT       NOT NULL,
+    activated_at   BIGINT,
+    CONSTRAINT pk_site PRIMARY KEY (id),
+    CONSTRAINT ck_site_status CHECK (status IN ('INACTIVE', 'ACTIVE')),
+    CONSTRAINT ck_site_active_version CHECK (active_version IS NULL OR active_version >= 1)
+);
+COMMENT ON TABLE  site IS '研究中心表；未启用（INACTIVE）时冻结一切分配，启用（ACTIVE）后分配只读当前版本冻结快照';
+COMMENT ON COLUMN site.id IS '研究中心编号，业务唯一，创建时由请求给定';
+COMMENT ON COLUMN site.lead_actor_id IS '中心负责人操作者编号；启用配置必须由此人提交并首先确认';
+COMMENT ON COLUMN site.status IS '中心状态：INACTIVE=未启用，拒绝分配；ACTIVE=已启用，按冻结快照分配';
+COMMENT ON COLUMN site.active_version IS '当前已启用配置版本号，从1开始递增；NULL=从未启用';
+COMMENT ON COLUMN site.created_at IS '创建时间，Unix 毫秒，UTC';
+COMMENT ON COLUMN site.activated_at IS '最近一次启用时间，Unix 毫秒，UTC；NULL=未启用';
+
+CREATE TABLE IF NOT EXISTS site_activation_request (
+    id                  VARCHAR(64) NOT NULL,
+    site_id             VARCHAR(64) NOT NULL,
+    version             INT         NOT NULL,
+    status              VARCHAR(16) NOT NULL,
+    lead_actor_id       VARCHAR(64) NOT NULL,
+    lead_confirmed      BOOLEAN     NOT NULL,
+    lead_confirmed_at   BIGINT,
+    reviewer_actor_id   VARCHAR(64),
+    reviewer_confirmed  BOOLEAN     NOT NULL,
+    reviewer_confirmed_at BIGINT,
+    created_at          BIGINT      NOT NULL,
+    activated_at        BIGINT,
+    CONSTRAINT pk_site_activation_request PRIMARY KEY (id),
+    CONSTRAINT uq_site_activation_version UNIQUE (site_id, version),
+    CONSTRAINT ck_site_activation_status CHECK (status IN ('PENDING', 'ACTIVATED')),
+    CONSTRAINT ck_site_activation_version CHECK (version >= 1)
+);
+COMMENT ON TABLE  site_activation_request IS '中心启用申请（一个配置版本一行）；负责人与独立复核人确认同一版本后一次性启用，历史记录稳定不可删除';
+COMMENT ON COLUMN site_activation_request.id IS '启用申请（配置版本）编号，全局唯一；同 requestId 重放返回该版本首次快照';
+COMMENT ON COLUMN site_activation_request.site_id IS '所属研究中心编号';
+COMMENT ON COLUMN site_activation_request.version IS '配置版本号，同一中心内从1开始递增';
+COMMENT ON COLUMN site_activation_request.status IS '申请状态：PENDING=待双人确认；ACTIVATED=已启用并冻结快照';
+COMMENT ON COLUMN site_activation_request.lead_actor_id IS '提交配置的中心负责人操作者编号';
+COMMENT ON COLUMN site_activation_request.lead_confirmed IS '负责人是否已确认本版本';
+COMMENT ON COLUMN site_activation_request.lead_confirmed_at IS '负责人确认时间，Unix 毫秒，UTC；NULL=未确认';
+COMMENT ON COLUMN site_activation_request.reviewer_actor_id IS '独立复核人操作者编号，必须不同于负责人；NULL=尚未确认';
+COMMENT ON COLUMN site_activation_request.reviewer_confirmed IS '独立复核人是否已确认本版本';
+COMMENT ON COLUMN site_activation_request.reviewer_confirmed_at IS '复核人确认时间，Unix 毫秒，UTC；NULL=未确认';
+COMMENT ON COLUMN site_activation_request.created_at IS '版本提交时间，Unix 毫秒，UTC';
+COMMENT ON COLUMN site_activation_request.activated_at IS '启用（快照冻结）时间，Unix 毫秒，UTC；NULL=未启用';
+
+CREATE TABLE IF NOT EXISTS site_block_quota (
+    request_id VARCHAR(64) NOT NULL,
+    site_id    VARCHAR(64) NOT NULL,
+    version    INT         NOT NULL,
+    block_no   INT         NOT NULL,
+    quota      INT         NOT NULL,
+    CONSTRAINT pk_site_block_quota PRIMARY KEY (request_id, block_no),
+    CONSTRAINT ck_site_block_quota_block_no CHECK (block_no >= 1),
+    CONSTRAINT ck_site_block_quota_quota CHECK (quota >= 0)
+);
+COMMENT ON TABLE  site_block_quota IS '启用申请版本的区组名额配置；提交时写入后不可修改，作为负责人核对与启用冻结的依据';
+COMMENT ON COLUMN site_block_quota.request_id IS '所属启用申请编号';
+COMMENT ON COLUMN site_block_quota.site_id IS '所属研究中心编号';
+COMMENT ON COLUMN site_block_quota.version IS '所属配置版本号';
+COMMENT ON COLUMN site_block_quota.block_no IS '区组号，从1开始，同版本内连续不重复';
+COMMENT ON COLUMN site_block_quota.quota IS '该区组申请可分配名额（拟冻结量），非负；0 表示该区组不接受分配';
+
+CREATE TABLE IF NOT EXISTS site_block_snapshot (
+    id           BIGINT      NOT NULL AUTO_INCREMENT,
+    site_id      VARCHAR(64) NOT NULL,
+    version      INT         NOT NULL,
+    block_no     INT         NOT NULL,
+    frozen_quota INT         NOT NULL,
+    created_at   BIGINT      NOT NULL,
+    CONSTRAINT pk_site_block_snapshot PRIMARY KEY (id),
+    CONSTRAINT uq_site_block_snapshot_version UNIQUE (site_id, version, block_no),
+    CONSTRAINT ck_site_snapshot_block_no CHECK (block_no >= 1),
+    CONSTRAINT ck_site_snapshot_quota CHECK (frozen_quota >= 0)
+);
+COMMENT ON TABLE  site_block_snapshot IS '启用时一次性冻结的区组名额快照；分配服务只读取已启用版本快照，历史版本快照保留不覆盖';
+COMMENT ON COLUMN site_block_snapshot.site_id IS '所属研究中心编号';
+COMMENT ON COLUMN site_block_snapshot.version IS '快照对应的已启用配置版本号';
+COMMENT ON COLUMN site_block_snapshot.block_no IS '区组号，从1开始';
+COMMENT ON COLUMN site_block_snapshot.frozen_quota IS '冻结可分配名额，单位：个；分配不得超出该值';
+COMMENT ON COLUMN site_block_snapshot.created_at IS '快照冻结时间，Unix 毫秒，UTC';
+
+CREATE TABLE IF NOT EXISTS site_allocation (
+    id             BIGINT       NOT NULL AUTO_INCREMENT,
+    site_id        VARCHAR(64)  NOT NULL,
+    version        INT          NOT NULL,
+    participant_id VARCHAR(64)  NOT NULL,
+    block_no       INT          NOT NULL,
+    blind_code     VARCHAR(32)  NOT NULL,
+    assigned_actor VARCHAR(64)  NOT NULL,
+    assigned_at    BIGINT       NOT NULL,
+    CONSTRAINT pk_site_allocation PRIMARY KEY (id),
+    CONSTRAINT uq_site_allocation_participant UNIQUE (site_id, participant_id),
+    CONSTRAINT uq_site_allocation_blind_code UNIQUE (blind_code),
+    CONSTRAINT ck_site_allocation_block_no CHECK (block_no >= 1)
+);
+COMMENT ON TABLE  site_allocation IS '研究中心分配记录；仅记录盲码与区组号，不保存也不暴露处理代码/席位号，盲法对应表不向中心侧开放';
+COMMENT ON COLUMN site_allocation.id IS '分配自增主键';
+COMMENT ON COLUMN site_allocation.site_id IS '所属研究中心编号';
+COMMENT ON COLUMN site_allocation.version IS '消耗名额时所依据的已启用快照版本号';
+COMMENT ON COLUMN site_allocation.participant_id IS '合成参与者编号，非真实医疗数据';
+COMMENT ON COLUMN site_allocation.block_no IS '分配到的区组号，普通接口可返回；不含区组内席位序号';
+COMMENT ON COLUMN site_allocation.blind_code IS '随机无含义盲码，全局唯一，与区组/处理组无对应规律';
+COMMENT ON COLUMN site_allocation.assigned_actor IS '执行分配的操作者编号（X-Actor-Id）';
+COMMENT ON COLUMN site_allocation.assigned_at IS '分配时间，Unix 毫秒，UTC';
