@@ -1,7 +1,10 @@
 package com.example.starter.race.persistence;
 
 import com.example.starter.race.domain.EntryStatus;
+import com.example.starter.race.domain.LedgerType;
 import com.example.starter.race.domain.PenaltyType;
+import com.example.starter.race.domain.ProtestDecision;
+import com.example.starter.race.domain.ProtestStatus;
 import com.example.starter.race.domain.RaceStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
@@ -30,6 +33,11 @@ public class RaceRepository {
             new CheckpointTimingRowMapper();
     private static final SnapshotCheckpointRowMapper SNAPSHOT_CHECKPOINT_ROW_MAPPER =
             new SnapshotCheckpointRowMapper();
+    private static final AccountRowMapper ACCOUNT_ROW_MAPPER = new AccountRowMapper();
+    private static final ProtestRowMapper PROTEST_ROW_MAPPER = new ProtestRowMapper();
+    private static final LedgerRowMapper LEDGER_ROW_MAPPER = new LedgerRowMapper();
+    private static final SnapshotProtestRowMapper SNAPSHOT_PROTEST_ROW_MAPPER =
+            new SnapshotProtestRowMapper();
 
     private final JdbcTemplate jdbcTemplate;
 
@@ -40,7 +48,7 @@ public class RaceRepository {
     /** 按ID查询赛事。 */
     public Optional<RaceRow> findRace(String raceId) {
         return jdbcTemplate
-                .query("SELECT race_id, version, status, created_at FROM race WHERE race_id = ?",
+                .query("SELECT race_id, version, status, deposit_fen, created_at FROM race WHERE race_id = ?",
                         RACE_ROW_MAPPER, raceId)
                 .stream()
                 .findFirst();
@@ -53,7 +61,7 @@ public class RaceRepository {
      */
     public Optional<RaceRow> findRaceForUpdate(String raceId) {
         return jdbcTemplate
-                .query("SELECT race_id, version, status, created_at FROM race WHERE race_id = ? FOR UPDATE",
+                .query("SELECT race_id, version, status, deposit_fen, created_at FROM race WHERE race_id = ? FOR UPDATE",
                         RACE_ROW_MAPPER, raceId)
                 .stream()
                 .findFirst();
@@ -212,14 +220,20 @@ public class RaceRepository {
                         entry.coveredCheckpointCount(),
                         missingByBib.getOrDefault(entry.bib(), List.of())))
                 .toList();
+        List<SnapshotProtestRow> protests = jdbcTemplate.query(
+                "SELECT race_id, protest_id, account_id, reason, deposit_fen, decision, "
+                        + "created_at, decided_at FROM result_snapshot_protest WHERE race_id = ? "
+                        + "ORDER BY created_at, protest_id",
+                SNAPSHOT_PROTEST_ROW_MAPPER, raceId);
         return Optional.of(new SnapshotRow(header.raceId(), header.version(), header.sealedAt(),
-                entries, checkpoints));
+                entries, checkpoints, protests));
     }
 
-    /** 新建赛事，初始版本1、状态OPEN。 */
+    /** 新建赛事，初始版本1、状态OPEN，保证金未配置（0分）。 */
     public void insertRace(String raceId, long now) {
         jdbcTemplate.update(
-                "INSERT INTO race (race_id, version, status, created_at) VALUES (?, 1, 'OPEN', ?)",
+                "INSERT INTO race (race_id, version, status, deposit_fen, created_at) "
+                        + "VALUES (?, 1, 'OPEN', 0, ?)",
                 raceId, now);
     }
 
@@ -273,6 +287,18 @@ public class RaceRepository {
     }
 
     /**
+     * 条件推进版本并同时写入新的申诉保证金配置（配置只影响之后创建的申诉）。
+     *
+     * @return 受影响行数；0 表示赛事不存在、已封榜或版本已被其他写操作推进
+     */
+    public int configureDepositIfOpen(String raceId, int expectedVersion, long depositFen) {
+        return jdbcTemplate.update(
+                "UPDATE race SET version = version + 1, deposit_fen = ? "
+                        + "WHERE race_id = ? AND version = ? AND status = 'OPEN'",
+                depositFen, raceId, expectedVersion);
+    }
+
+    /**
      * 条件封榜：仅当赛事仍为 OPEN 且版本等于 expectedVersion 时转为 SEALED 并推进版本。
      *
      * @return 受影响行数；0 表示不存在、已封榜或版本不匹配
@@ -284,7 +310,7 @@ public class RaceRepository {
                 newVersion, raceId, expectedVersion);
     }
 
-    /** 原子写入封榜快照头表、全部条目以及每名选手的分段明细。 */
+    /** 原子写入封榜快照头表、全部条目、分段明细与申诉裁决依据。 */
     public void insertSnapshot(SnapshotRow snapshot) {
         jdbcTemplate.update(
                 "INSERT INTO result_snapshot (race_id, version, sealed_at) VALUES (?, ?, ?)",
@@ -321,6 +347,22 @@ public class RaceRepository {
                     ps.setInt(4, detail.position());
                     ps.setObject(5, detail.elapsedMillis());
                     ps.setString(6, detail.timingId());
+                });
+        jdbcTemplate.batchUpdate(
+                "INSERT INTO result_snapshot_protest "
+                        + "(race_id, protest_id, account_id, reason, deposit_fen, decision, "
+                        + "created_at, decided_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                snapshot.protests(),
+                Math.max(snapshot.protests().size(), 1),
+                (ps, protest) -> {
+                    ps.setString(1, protest.raceId());
+                    ps.setString(2, protest.protestId());
+                    ps.setString(3, protest.accountId());
+                    ps.setString(4, protest.reason());
+                    ps.setLong(5, protest.depositFen());
+                    ps.setString(6, protest.decision().name());
+                    ps.setLong(7, protest.createdAt());
+                    ps.setLong(8, protest.decidedAt());
                 });
     }
 
@@ -368,12 +410,153 @@ public class RaceRepository {
                 responseStatus, responseBody, requestId);
     }
 
+    // ==================== 申诉保证金：账户 / 申诉 / 流水 ====================
+
+    /** 开立余额为0的保证金账户；accountId 唯一冲突由调用方处理。 */
+    public void insertAccount(String accountId, String holderName, long now) {
+        jdbcTemplate.update(
+                "INSERT INTO runner_account (account_id, holder_name, balance_fen, created_at, updated_at) "
+                        + "VALUES (?, ?, 0, ?, ?)",
+                accountId, holderName, now, now);
+    }
+
+    /** 按ID查询账户；不存在返回 empty。 */
+    public Optional<AccountRow> findAccount(String accountId) {
+        return jdbcTemplate
+                .query("SELECT account_id, holder_name, balance_fen, created_at, updated_at "
+                                + "FROM runner_account WHERE account_id = ?",
+                        ACCOUNT_ROW_MAPPER, accountId)
+                .stream()
+                .findFirst();
+    }
+
+    /** 行锁方式查询账户，持有到事务结束，串行化同一账户的并发冻结/退回/充值。 */
+    public Optional<AccountRow> findAccountForUpdate(String accountId) {
+        return jdbcTemplate
+                .query("SELECT account_id, holder_name, balance_fen, created_at, updated_at "
+                                + "FROM runner_account WHERE account_id = ? FOR UPDATE",
+                        ACCOUNT_ROW_MAPPER, accountId)
+                .stream()
+                .findFirst();
+    }
+
+    /**
+     * 条件入账：仅当账户存在时给余额增加 amountFen。
+     *
+     * @return 受影响行数；0 表示账户不存在
+     */
+    public int creditAccount(String accountId, long amountFen, long now) {
+        return jdbcTemplate.update(
+                "UPDATE runner_account SET balance_fen = balance_fen + ?, updated_at = ? "
+                        + "WHERE account_id = ?",
+                amountFen, now, accountId);
+    }
+
+    /**
+     * 条件冻结：仅当可用余额不少于 depositFen 时扣减。
+     *
+     * @return 受影响行数；0 表示账户不存在或余额不足（此时不写申诉、不写流水）
+     */
+    public int freezeIfSufficient(String accountId, long depositFen, long now) {
+        return jdbcTemplate.update(
+                "UPDATE runner_account SET balance_fen = balance_fen - ?, updated_at = ? "
+                        + "WHERE account_id = ? AND balance_fen >= ?",
+                depositFen, now, accountId, depositFen);
+    }
+
+    /** 新增一笔保证金流水（冻结/退回/没收/充值），balance_after 由调用方在锁内读取后给出。 */
+    public void insertLedger(
+            String accountId,
+            String protestId,
+            LedgerType type,
+            long amountFen,
+            long balanceAfterFen,
+            long now) {
+        jdbcTemplate.update(
+                "INSERT INTO protest_deposit_ledger "
+                        + "(account_id, protest_id, type, amount_fen, balance_after_fen, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?)",
+                accountId, protestId, type.name(), amountFen, balanceAfterFen, now);
+    }
+
+    /** 查询账户全部流水，按入账先后（自增主键）升序。 */
+    public List<LedgerRow> findLedgers(String accountId) {
+        return jdbcTemplate.query(
+                "SELECT ledger_id, account_id, protest_id, type, amount_fen, balance_after_fen, created_at "
+                        + "FROM protest_deposit_ledger WHERE account_id = ? ORDER BY ledger_id",
+                LEDGER_ROW_MAPPER, accountId);
+    }
+
+    /** 新增申诉（创建时即冻结保证金快照金额）。 */
+    public void insertProtest(ProtestRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO protest "
+                        + "(protest_id, race_id, account_id, reason, deposit_fen, status, decision, "
+                        + "decided_at, created_at) VALUES (?, ?, ?, ?, ?, 'PENDING', NULL, NULL, ?)",
+                row.protestId(), row.raceId(), row.accountId(), row.reason(),
+                row.depositFen(), row.createdAt());
+    }
+
+    /** 按ID查询申诉。 */
+    public Optional<ProtestRow> findProtest(String protestId) {
+        return jdbcTemplate
+                .query("SELECT protest_id, race_id, account_id, reason, deposit_fen, status, decision, "
+                                + "created_at, decided_at FROM protest WHERE protest_id = ?",
+                        PROTEST_ROW_MAPPER, protestId)
+                .stream()
+                .findFirst();
+    }
+
+    /** 行锁方式查询申诉，裁决据此与并发裁决/封榜串行化。 */
+    public Optional<ProtestRow> findProtestForUpdate(String protestId) {
+        return jdbcTemplate
+                .query("SELECT protest_id, race_id, account_id, reason, deposit_fen, status, decision, "
+                                + "created_at, decided_at FROM protest WHERE protest_id = ? FOR UPDATE",
+                        PROTEST_ROW_MAPPER, protestId)
+                .stream()
+                .findFirst();
+    }
+
+    /** 查询赛事下全部申诉，按创建时间与申诉ID排列。 */
+    public List<ProtestRow> findProtestsByRace(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT protest_id, race_id, account_id, reason, deposit_fen, status, decision, "
+                        + "created_at, decided_at FROM protest WHERE race_id = ? "
+                        + "ORDER BY created_at, protest_id",
+                PROTEST_ROW_MAPPER, raceId);
+    }
+
+    /** 统计赛事下处于 PENDING（未裁决）状态的申诉数量；持赛事行锁时读取。 */
+    public int countPendingProtests(String raceId) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM protest WHERE race_id = ? AND status = 'PENDING'",
+                Integer.class, raceId);
+        return count == null ? 0 : count;
+    }
+
+    /**
+     * 条件终态裁决：仅当申诉当前为 PENDING 时置为终态并写入裁决结果与时间。
+     *
+     * @return 受影响行数；0 表示申诉不存在或已是终态（重复裁决/改判）
+     */
+    public int decideIfPending(
+            String protestId, ProtestStatus status, ProtestDecision decision, long now) {
+        return jdbcTemplate.update(
+                "UPDATE protest SET status = ?, decision = ?, decided_at = ? "
+                        + "WHERE protest_id = ? AND status = 'PENDING'",
+                status.name(), decision.name(), now, protestId);
+    }
+
     /** 测试辅助：清空全部业务数据，按外键依赖顺序删除。 */
     public void deleteAllForTesting() {
+        jdbcTemplate.update("DELETE FROM result_snapshot_protest");
         jdbcTemplate.update("DELETE FROM result_snapshot_checkpoint");
         jdbcTemplate.update("DELETE FROM result_snapshot_entry");
         jdbcTemplate.update("DELETE FROM result_snapshot");
         jdbcTemplate.update("DELETE FROM idempotency_record");
+        jdbcTemplate.update("DELETE FROM protest_deposit_ledger");
+        jdbcTemplate.update("DELETE FROM protest");
+        jdbcTemplate.update("DELETE FROM runner_account");
         jdbcTemplate.update("DELETE FROM checkpoint_timing");
         jdbcTemplate.update("DELETE FROM checkpoint");
         jdbcTemplate.update("DELETE FROM penalty");
@@ -388,6 +571,7 @@ public class RaceRepository {
                     rs.getString("race_id"),
                     rs.getInt("version"),
                     RaceStatus.valueOf(rs.getString("status")),
+                    rs.getLong("deposit_fen"),
                     rs.getLong("created_at"));
         }
     }
@@ -488,6 +672,64 @@ public class RaceRepository {
                     rs.getInt("response_status"),
                     rs.getString("response_body"),
                     rs.getLong("created_at"));
+        }
+    }
+
+    private static final class AccountRowMapper implements RowMapper<AccountRow> {
+        @Override
+        public AccountRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new AccountRow(
+                    rs.getString("account_id"),
+                    rs.getString("holder_name"),
+                    rs.getLong("balance_fen"),
+                    rs.getLong("created_at"),
+                    rs.getLong("updated_at"));
+        }
+    }
+
+    private static final class ProtestRowMapper implements RowMapper<ProtestRow> {
+        @Override
+        public ProtestRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            String decision = rs.getString("decision");
+            return new ProtestRow(
+                    rs.getString("protest_id"),
+                    rs.getString("race_id"),
+                    rs.getString("account_id"),
+                    rs.getString("reason"),
+                    rs.getLong("deposit_fen"),
+                    ProtestStatus.valueOf(rs.getString("status")),
+                    decision == null ? null : ProtestDecision.valueOf(decision),
+                    rs.getLong("created_at"),
+                    (Long) rs.getObject("decided_at"));
+        }
+    }
+
+    private static final class LedgerRowMapper implements RowMapper<LedgerRow> {
+        @Override
+        public LedgerRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new LedgerRow(
+                    rs.getLong("ledger_id"),
+                    rs.getString("account_id"),
+                    rs.getString("protest_id"),
+                    LedgerType.valueOf(rs.getString("type")),
+                    rs.getLong("amount_fen"),
+                    rs.getLong("balance_after_fen"),
+                    rs.getLong("created_at"));
+        }
+    }
+
+    private static final class SnapshotProtestRowMapper implements RowMapper<SnapshotProtestRow> {
+        @Override
+        public SnapshotProtestRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new SnapshotProtestRow(
+                    rs.getString("race_id"),
+                    rs.getString("protest_id"),
+                    rs.getString("account_id"),
+                    rs.getString("reason"),
+                    rs.getLong("deposit_fen"),
+                    ProtestDecision.valueOf(rs.getString("decision")),
+                    rs.getLong("created_at"),
+                    rs.getLong("decided_at"));
         }
     }
 }

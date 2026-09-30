@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS race (
     race_id VARCHAR(64) NOT NULL COMMENT '赛事ID，全局唯一',
     version INT NOT NULL COMMENT '版本号，从1开始，每次写操作加一',
     status VARCHAR(16) NOT NULL COMMENT '赛事状态：OPEN-开放可写，SEALED-已封榜只读',
+    deposit_fen BIGINT NOT NULL DEFAULT 0 COMMENT '申诉保证金当前配置金额，单位：分（1元=100分）；0表示未配置，此时不允许创建申诉；配置变化不影响已创建申诉deposit_fen中的快照金额',
     created_at BIGINT NOT NULL COMMENT '创建时间，Unix毫秒时间戳',
     CONSTRAINT pk_race PRIMARY KEY (race_id)
 );
@@ -97,10 +98,62 @@ CREATE TABLE IF NOT EXISTS result_snapshot_checkpoint (
 
 CREATE TABLE IF NOT EXISTS idempotency_record (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求ID（写操作幂等键）',
-    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE',
+    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE/RECHARGE/CONFIGURE_DEPOSIT/CREATE_PROTEST/ADJUDICATE_PROTEST',
     request_digest CHAR(64) NOT NULL COMMENT '请求参数（requestId除外，含expectedVersion）规范化JSON的SHA-256摘要',
     response_status INT NOT NULL COMMENT '原成功请求的HTTP状态码，重放时原样返回',
     response_body TEXT COMMENT '原成功响应体JSON，重放时原样返回',
     created_at BIGINT NOT NULL COMMENT '首次成功提交时间，Unix毫秒时间戳',
     CONSTRAINT pk_idempotency_record PRIMARY KEY (request_id)
+);
+
+CREATE TABLE IF NOT EXISTS runner_account (
+    account_id VARCHAR(128) NOT NULL COMMENT '账户ID，全局唯一（测试合成场景直接指定）',
+    holder_name VARCHAR(128) COMMENT '账户持有人名称（展示用）；NULL表示未命名',
+    balance_fen BIGINT NOT NULL COMMENT '可用余额，单位：分（1元=100分）；不含已被申诉冻结的金额，永远非负',
+    created_at BIGINT NOT NULL COMMENT '账户创建时间，Unix毫秒时间戳',
+    updated_at BIGINT NOT NULL COMMENT '最近一次账务变动时间，Unix毫秒时间戳',
+    CONSTRAINT pk_runner_account PRIMARY KEY (account_id)
+);
+
+CREATE TABLE IF NOT EXISTS protest (
+    protest_id VARCHAR(64) NOT NULL COMMENT '申诉ID，全局唯一',
+    race_id VARCHAR(64) NOT NULL COMMENT '所申诉赛事ID',
+    account_id VARCHAR(128) NOT NULL COMMENT '提交申诉（并被冻结保证金）的账户ID',
+    reason VARCHAR(512) NOT NULL COMMENT '申诉理由原文，创建后不可修改',
+    deposit_fen BIGINT NOT NULL COMMENT '保证金快照金额，单位：分；取创建申诉时赛事当前deposit_fen并冻结，此后赛事配置变化不影响该金额',
+    status VARCHAR(16) NOT NULL COMMENT '申诉状态：PENDING-待裁决（相关成绩暂缓封榜），ACCEPTED-申诉成立（已全额退回），REJECTED-申诉驳回（已全部没收）；ACCEPTED/REJECTED均为终态',
+    decision VARCHAR(16) COMMENT '裁决结果：ACCEPT-全额退回，REJECT-全部没收；PENDING时为NULL',
+    decided_at BIGINT COMMENT '裁决时间，Unix毫秒时间戳；未裁决为NULL',
+    created_at BIGINT NOT NULL COMMENT '申诉创建（保证金冻结）时间，Unix毫秒时间戳',
+    CONSTRAINT pk_protest PRIMARY KEY (protest_id),
+    CONSTRAINT fk_protest_race FOREIGN KEY (race_id) REFERENCES race (race_id),
+    CONSTRAINT fk_protest_account FOREIGN KEY (account_id) REFERENCES runner_account (account_id),
+    INDEX idx_protest_race_status (race_id, status)
+);
+
+CREATE TABLE IF NOT EXISTS protest_deposit_ledger (
+    ledger_id BIGINT NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    account_id VARCHAR(128) NOT NULL COMMENT '账务账户ID',
+    protest_id VARCHAR(64) COMMENT '关联申诉ID；RECHARGE（充值）流水为NULL，FREEZE/REFUND/FORFEIT均非NULL',
+    type VARCHAR(16) NOT NULL COMMENT '流水类型：RECHARGE-充值入账，FREEZE-创建申诉冻结，REFUND-裁决ACCEPT全额退回，FORFEIT-裁决REJECT全部没收',
+    amount_fen BIGINT NOT NULL COMMENT '本笔流水固定金额，单位：分，恒为正数；退款/没收金额恒等于对应申诉deposit_fen快照',
+    balance_after_fen BIGINT NOT NULL COMMENT '本笔流水落账后的账户可用余额（不含冻结），单位：分，永远非负',
+    created_at BIGINT NOT NULL COMMENT '流水生成时间，Unix毫秒时间戳',
+    CONSTRAINT pk_protest_deposit_ledger PRIMARY KEY (ledger_id),
+    CONSTRAINT fk_ledger_account FOREIGN KEY (account_id) REFERENCES runner_account (account_id),
+    CONSTRAINT fk_ledger_protest FOREIGN KEY (protest_id) REFERENCES protest (protest_id),
+    INDEX idx_ledger_account (account_id, ledger_id)
+);
+
+CREATE TABLE IF NOT EXISTS result_snapshot_protest (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属封榜快照的赛事ID',
+    protest_id VARCHAR(64) NOT NULL COMMENT '申诉ID（封榜时已全部终态，保留当时的申诉与裁决依据）',
+    account_id VARCHAR(128) NOT NULL COMMENT '提交申诉的账户ID',
+    reason VARCHAR(512) NOT NULL COMMENT '申诉理由原文（历史依据，不随后续任何变化改变）',
+    deposit_fen BIGINT NOT NULL COMMENT '该申诉保证金快照金额，单位：分',
+    decision VARCHAR(16) NOT NULL COMMENT '封榜时的终态裁决：ACCEPT / REJECT',
+    created_at BIGINT NOT NULL COMMENT '申诉创建时间，Unix毫秒时间戳',
+    decided_at BIGINT NOT NULL COMMENT '裁决时间，Unix毫秒时间戳',
+    CONSTRAINT pk_snapshot_protest PRIMARY KEY (race_id, protest_id),
+    CONSTRAINT fk_snapshot_protest_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
 );

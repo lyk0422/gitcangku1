@@ -13,6 +13,7 @@ import java.util.List;
  * @param status   OPEN / SEALED
  * @param sealedAt 封榜时间，Unix毫秒时间戳；未封榜为 null
  * @param entries  按展示顺序排列的成绩条目
+ * @param protests 封榜快照中固化的申诉与裁决依据；OPEN 实时成绩或无申诉时为空列表
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public record StandingResponse(
@@ -20,6 +21,7 @@ public record StandingResponse(
         int version,
         RaceStatus status,
         Long sealedAt,
-        List<ResultEntryResponse> entries
+        List<ResultEntryResponse> entries,
+        List<SnapshotProtestResponse> protests
 ) {
 }
