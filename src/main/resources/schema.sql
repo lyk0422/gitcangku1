@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS observation_version (
 CREATE TABLE IF NOT EXISTS request_log (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
     fingerprint VARCHAR(128) NOT NULL COMMENT '请求操作与参数的指纹，同键异参时判定 409',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：CREATE / MERGE / DELETE / RESOLVE',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：CREATE / MERGE / DELETE / RESOLVE / PUBLISH_RULE / COORDINATE_OBSERVATION',
     response_status INT NULL COMMENT '成功响应的 HTTP 状态码；提交过程中暂为 NULL',
     response_body VARCHAR(4000) NULL COMMENT '成功响应体（JSON 原文），用于同键同参重放；提交过程中暂为 NULL',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '请求记录创建时间（服务器时区）',
@@ -59,3 +59,45 @@ CREATE TABLE IF NOT EXISTS conflict_resolution (
     -- 且不可变解决历史必须在任何数据清理/归档场景下继续可查。
     UNIQUE (observation_id, request_id)
 );
+
+-- 带版本的坐标基准转换规则表：同一 rule_id 的版本按生效时间左闭右开首尾相接。
+-- 不同 rule_id 的规则在同一 UTC 时刻同时生效属于配置冲突，观测写入按命中多条规则返回 422。
+CREATE TABLE IF NOT EXISTS coordinate_frame_rule (
+    rule_id VARCHAR(64) NOT NULL COMMENT '规则链标识，同一基准转换规则的各版本共用',
+    version INT NOT NULL COMMENT '规则链内版本号，从 1 开始单调递增，观测结果记录所用版本',
+    target_datum VARCHAR(64) NOT NULL COMMENT '转换目标基准名称',
+    offset_x DECIMAL(18,9) NOT NULL COMMENT 'X 方向偏移量（与原坐标同量纲），目标 X = 原 X + 该偏移',
+    offset_y DECIMAL(18,9) NOT NULL COMMENT 'Y 方向偏移量（与原坐标同量纲），目标 Y = 原 Y + 该偏移',
+    effective_from_utc TIMESTAMP NOT NULL COMMENT '生效起始时刻（UTC，含）',
+    effective_to_utc TIMESTAMP NULL COMMENT '生效结束时刻（UTC，不含）；NULL 表示开放区间，发布新版本时闭合',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '版本落库时间（服务器时区）',
+    PRIMARY KEY (rule_id, version)
+);
+
+-- 坐标观测结果表：接收时一次性固化原坐标、目标坐标、规则版本与复核状态，之后不再更新；
+-- 规则调整不得重新解释已有观测，故历史结果保持不变。
+CREATE TABLE IF NOT EXISTS coordinate_observation (
+    coordinate_observation_id VARCHAR(64) NOT NULL COMMENT '坐标观测业务标识',
+    source_datum VARCHAR(64) NOT NULL COMMENT '观测携带的原基准名称',
+    source_x VARCHAR(64) NOT NULL COMMENT '原 X 坐标（十进制原文），比较与转换按数值',
+    source_y VARCHAR(64) NOT NULL COMMENT '原 Y 坐标（十进制原文），比较与转换按数值',
+    observed_at_utc TIMESTAMP NOT NULL COMMENT '观测时刻（UTC），按此时刻选择生效规则',
+    target_datum VARCHAR(64) NOT NULL COMMENT '目标基准名称（取自命中规则版本）',
+    target_x DECIMAL(18,6) NOT NULL COMMENT '目标 X 坐标 = 原 X + 规则偏移，六位小数 HALF_UP',
+    target_y DECIMAL(18,6) NOT NULL COMMENT '目标 Y 坐标 = 原 Y + 规则偏移，六位小数 HALF_UP',
+    rule_id VARCHAR(64) NOT NULL COMMENT '计算时命中的规则链标识',
+    rule_version INT NOT NULL COMMENT '计算时命中的规则版本号（历史固化，规则调整不回溯）',
+    review_status VARCHAR(32) NOT NULL COMMENT '复核状态：AUTO_MERGED 站内（含边界）已自动合并；PENDING_REVIEW 站外待复核、不自动合并',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '观测落库时间（服务器时区）',
+    PRIMARY KEY (coordinate_observation_id)
+);
+
+-- 规则发布与观测写入的全局串行化锁：固定单行，写事务内 SELECT ... FOR UPDATE 抢占，
+-- 保证观测按提交时有效规则一次性计算 X、Y，不出现半旧半新坐标。
+CREATE TABLE IF NOT EXISTS coordinate_write_lock (
+    lock_key INT NOT NULL COMMENT '固定为 1 的单行锁主键',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '锁行初始化时间（服务器时区）',
+    PRIMARY KEY (lock_key)
+);
+INSERT INTO coordinate_write_lock (lock_key)
+SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM coordinate_write_lock WHERE lock_key = 1);

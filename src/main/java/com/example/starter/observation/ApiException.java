@@ -63,6 +63,13 @@ public class ApiException extends RuntimeException {
     }
 
     /**
+     * 422：请求语义可解析但无法处理（如观测时刻缺少生效规则或同时命中多条规则）；不写入业务数据。
+     */
+    public static ApiException unprocessableEntity(String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, message, null, null);
+    }
+
+    /**
      * 410：记录已删除，拒绝新的修改和删除。
      */
     public static ApiException gone(String message) {
