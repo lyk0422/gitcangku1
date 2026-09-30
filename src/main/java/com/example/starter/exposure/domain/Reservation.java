@@ -6,8 +6,12 @@ package com.example.starter.exposure.domain;
  *
  * @param reservationId 预占单编号
  * @param campaignId    所属公告编号
+ * @param activityId    申请时刻固化的活动编号；历史预占（未归入活动时申请）为 null，
+ *                      公告随后迁移活动不改变本字段
  * @param visitorId     合成访客编号
  * @param utcDate       额度所属 UTC 日（java.time.LocalDate 对应的 java.sql.Date）
+ * @param utcHour       申请时刻固化的 UTC 小时序号（0～23，区间左闭右开）；
+ *                      历史预占可能为 null
  * @param status        预占状态
  * @param createdAtUtc  创建（申请）时刻，epoch 毫秒，UTC
  * @param expiresAtUtc  到期时刻，创建时刻 + 60 秒，epoch 毫秒，UTC；当前时刻达到该值即过期
@@ -16,8 +20,10 @@ package com.example.starter.exposure.domain;
 public record Reservation(
         String reservationId,
         String campaignId,
+        String activityId,
         String visitorId,
         java.sql.Date utcDate,
+        Integer utcHour,
         ReservationStatus status,
         long createdAtUtc,
         long expiresAtUtc,
