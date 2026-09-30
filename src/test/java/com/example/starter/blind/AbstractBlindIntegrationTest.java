@@ -25,6 +25,14 @@ public abstract class AbstractBlindIntegrationTest {
         jdbc.update("DELETE FROM allocation");
         jdbc.update("DELETE FROM seat");
         jdbc.update("DELETE FROM experiment");
+        jdbc.update("DELETE FROM site_allocation");
+        jdbc.update("DELETE FROM site_block");
+        jdbc.update("DELETE FROM site_activation_confirmation");
+        jdbc.update("DELETE FROM site_activation_block");
+        jdbc.update("DELETE FROM site_activation");
+        jdbc.update("DELETE FROM site_config_block");
+        jdbc.update("DELETE FROM site_config_version");
+        jdbc.update("DELETE FROM site");
         clock.setTime(1_700_000_000_000L);
     }
 }

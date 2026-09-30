@@ -15,4 +15,14 @@ public record Actor(String actorId, Role role) {
     public boolean isReviewer() {
         return role == Role.REVIEWER;
     }
+
+    /** 中心负责人：中心配置与启用申请。 */
+    public boolean isLead() {
+        return role == Role.LEAD;
+    }
+
+    /** 独立确认人：核对区组及名额后确认启用。 */
+    public boolean isConfirmer() {
+        return role == Role.CONFIRMER;
+    }
 }
