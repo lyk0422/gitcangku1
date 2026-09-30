@@ -63,7 +63,8 @@ public class MeasurementService {
 
         Measurement measurement = new Measurement(
                 0L, key, instrumentId, measuredAt, reading, lower, upper, submittedBy,
-                cert.id(), computed, passed, MeasurementStatus.PENDING, Instant.now());
+                cert.id(), computed, passed, MeasurementStatus.PENDING,
+                null, null, null, null, null, null, Instant.now());
         try {
             measurements.insert(measurement);
         } catch (DuplicateKeyException ex) {

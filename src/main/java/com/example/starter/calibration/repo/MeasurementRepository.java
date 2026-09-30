@@ -1,7 +1,9 @@
 package com.example.starter.calibration.repo;
 
+import java.math.BigDecimal;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
+import java.time.Instant;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
@@ -16,7 +18,8 @@ import com.example.starter.calibration.model.Measurement;
 import com.example.starter.calibration.model.MeasurementStatus;
 
 /**
- * 测量记录持久化。measurement_key 全局唯一作为幂等键；状态流转由放行事务在行锁内完成。
+ * 测量记录持久化。measurement_key 全局唯一作为幂等键；状态流转与环境补偿快照
+ * 由放行事务在行锁内一次性完成。
  */
 @Repository
 public class MeasurementRepository {
@@ -34,6 +37,12 @@ public class MeasurementRepository {
             rs.getBigDecimal("computed_value"),
             rs.getBoolean("passed"),
             MeasurementStatus.valueOf(rs.getString("status")),
+            rs.getBigDecimal("temperature"),
+            rs.getBigDecimal("humidity"),
+            (Long) rs.getObject("coefficient_version_id", Long.class),
+            rs.getString("coefficient_version_tag"),
+            rs.getBigDecimal("compensation_value"),
+            rs.getBigDecimal("final_value"),
             JdbcTimes.fromDb(rs.getObject("created_at", LocalDateTime.class)));
 
     private final JdbcTemplate jdbc;
@@ -44,6 +53,7 @@ public class MeasurementRepository {
 
     /**
      * 插入测量记录并返回生成的 ID；measurement_key 冲突时抛出 DuplicateKeyException。
+     * 环境补偿相关列在提交时留空，由放行事务固化。
      */
     public long insert(Measurement measurement) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
@@ -88,11 +98,18 @@ public class MeasurementRepository {
     }
 
     /**
-     * 将测量记录置为已放行（须在持有行锁的事务内调用）。
+     * 将测量记录置为已放行并固化环境补偿快照（须在持有行锁的事务内调用）。
+     * 补偿值与最终值一经固化不再改变；后续系数调整不会重算历史证书。
      */
-    public void markReleased(long id) {
-        jdbc.update("UPDATE measurement SET status = ? WHERE id = ?",
-                MeasurementStatus.RELEASED.name(), id);
+    public void applyRelease(long id, BigDecimal temperature, BigDecimal humidity,
+                             long coefficientVersionId, String coefficientVersionTag,
+                             BigDecimal compensationValue, BigDecimal finalValue) {
+        jdbc.update("UPDATE measurement SET status = ?, temperature = ?, humidity = ?, "
+                        + "coefficient_version_id = ?, coefficient_version_tag = ?, "
+                        + "compensation_value = ?, final_value = ? WHERE id = ?",
+                MeasurementStatus.RELEASED.name(), temperature, humidity,
+                coefficientVersionId, coefficientVersionTag,
+                compensationValue, finalValue, id);
     }
 
     /**

@@ -29,6 +29,10 @@ public class CertificateRepository {
             JdbcTimes.fromDb(rs.getObject("valid_to", LocalDateTime.class)),
             rs.getBigDecimal("coeff_a"),
             rs.getBigDecimal("offset_b"),
+            rs.getBigDecimal("temp_min"),
+            rs.getBigDecimal("temp_max"),
+            rs.getBigDecimal("hum_min"),
+            rs.getBigDecimal("hum_max"),
             rs.getBoolean("revoked"),
             JdbcTimes.fromDb(rs.getObject("revoked_at", LocalDateTime.class)),
             JdbcTimes.fromDb(rs.getObject("created_at", LocalDateTime.class)));
@@ -57,20 +61,28 @@ public class CertificateRepository {
      * 插入证书并返回生成的证书 ID。
      */
     public long insert(String instrumentId, Instant validFrom, Instant validTo,
-                       java.math.BigDecimal a, java.math.BigDecimal b, Instant createdAt) {
+                       java.math.BigDecimal a, java.math.BigDecimal b,
+                       java.math.BigDecimal tempMin, java.math.BigDecimal tempMax,
+                       java.math.BigDecimal humMin, java.math.BigDecimal humMax,
+                       Instant createdAt) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
                     "INSERT INTO calibration_certificate "
-                            + "(instrument_id, valid_from, valid_to, coeff_a, offset_b, revoked, created_at) "
-                            + "VALUES (?, ?, ?, ?, ?, FALSE, ?)",
+                            + "(instrument_id, valid_from, valid_to, coeff_a, offset_b, "
+                            + "temp_min, temp_max, hum_min, hum_max, revoked, created_at) "
+                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, FALSE, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, instrumentId);
             ps.setObject(2, JdbcTimes.toDb(validFrom));
             ps.setObject(3, JdbcTimes.toDb(validTo));
             ps.setBigDecimal(4, a);
             ps.setBigDecimal(5, b);
-            ps.setObject(6, JdbcTimes.toDb(createdAt));
+            ps.setBigDecimal(6, tempMin);
+            ps.setBigDecimal(7, tempMax);
+            ps.setBigDecimal(8, humMin);
+            ps.setBigDecimal(9, humMax);
+            ps.setObject(10, JdbcTimes.toDb(createdAt));
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();

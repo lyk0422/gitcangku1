@@ -31,13 +31,17 @@ class MeasurementSubmitTest {
     void clean() {
         jdbc.update("DELETE FROM release_record");
         jdbc.update("DELETE FROM measurement");
+        jdbc.update("DELETE FROM release_snapshot");
+        jdbc.update("DELETE FROM coefficient_version");
         jdbc.update("DELETE FROM calibration_certificate");
         jdbc.update("DELETE FROM instrument_lock");
+        jdbc.update("DELETE FROM coefficient_lock");
     }
 
     private void createCert(String instrument, String from, String to, String a, String b) throws Exception {
         String json = """
-                {"instrumentId":"%s","validFrom":"%s","validTo":"%s","a":"%s","b":"%s"}
+                {"instrumentId":"%s","validFrom":"%s","validTo":"%s","a":"%s","b":"%s",
+                 "tempMin":"20","tempMax":"25","humMin":"30","humMax":"70"}
                 """.formatted(instrument, from, to, a, b);
         mvc.perform(post("/api/certificates").contentType(MediaType.APPLICATION_JSON).content(json))
                 .andExpect(status().isCreated());
@@ -124,7 +128,8 @@ class MeasurementSubmitTest {
         String body = mvc.perform(post("/api/certificates").contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {"instrumentId":"INS-1","validFrom":"2026-01-01T00:00:00Z",
-                                 "validTo":"2027-01-01T00:00:00Z","a":"1","b":"0"}"""))
+                                 "validTo":"2027-01-01T00:00:00Z","a":"1","b":"0",
+                                 "tempMin":"20","tempMax":"25","humMin":"30","humMax":"70"}"""))
                 .andExpect(status().isCreated()).andReturn().getResponse().getContentAsString();
         long certId = ((Number) com.jayway.jsonpath.JsonPath.read(body, "$.id")).longValue();
         mvc.perform(post("/api/certificates/{id}/revoke", certId)).andExpect(status().isOk());

@@ -45,8 +45,23 @@ class ConcurrencyApiTest {
     void clean() {
         jdbc.update("DELETE FROM release_record");
         jdbc.update("DELETE FROM measurement");
+        jdbc.update("DELETE FROM release_snapshot");
+        jdbc.update("DELETE FROM coefficient_version");
         jdbc.update("DELETE FROM calibration_certificate");
         jdbc.update("DELETE FROM instrument_lock");
+        jdbc.update("DELETE FROM coefficient_lock");
+    }
+
+    /** 创建一个在极大区间内持续生效的系数版本 v1，供放行命中。 */
+    private void createCoefficientVersion() throws Exception {
+        mvc.perform(post("/api/coefficient-versions")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"versionTag":"v1","referenceTemperature":"22.5","referenceHumidity":"50",
+                                 "temperatureCoefficient":"0.01","humidityCoefficient":"0.001",
+                                 "effectiveFrom":"2020-01-01T00:00:00Z",
+                                 "effectiveTo":"2100-01-01T00:00:00Z"}"""))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isCreated());
     }
 
     @Test
@@ -63,7 +78,8 @@ class ConcurrencyApiTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {"instrumentId":"INS-C","validFrom":"2026-01-01T00:00:00Z",
-                                 "validTo":"2027-01-01T00:00:00Z","a":"1","b":"0"}"""));
+                                 "validTo":"2027-01-01T00:00:00Z","a":"1","b":"0",
+                                 "tempMin":"20","tempMax":"25","humMin":"30","humMax":"70"}"""));
                 return action.andReturn().getResponse().getStatus();
             }));
         }
@@ -85,6 +101,7 @@ class ConcurrencyApiTest {
 
     @Test
     void revokeAndReleaseConcurrentFollowCommitOrder() throws Exception {
+        createCoefficientVersion();
         // 重复多轮，验证任意调度下都不出现“撤销后仍被放行”
         for (int round = 0; round < 15; round++) {
             final int r = round;
@@ -92,7 +109,8 @@ class ConcurrencyApiTest {
                             .contentType(MediaType.APPLICATION_JSON)
                             .content("""
                                     {"instrumentId":"INS-R%d","validFrom":"2026-01-01T00:00:00Z",
-                                     "validTo":"2028-01-01T00:00:00Z","a":"1","b":"0"}""".formatted(r)))
+                                     "validTo":"2028-01-01T00:00:00Z","a":"1","b":"0",
+                                     "tempMin":"20","tempMax":"25","humMin":"30","humMax":"70"}""".formatted(r)))
                     .andReturn().getResponse().getContentAsString();
             long certId = ((Number) com.jayway.jsonpath.JsonPath.read(certBody, "$.id")).longValue();
 
@@ -116,7 +134,8 @@ class ConcurrencyApiTest {
                 return mvc.perform(post("/api/measurements/release")
                                 .header("X-Actor-Id", "carol")
                                 .contentType(MediaType.APPLICATION_JSON)
-                                .content("{\"keys\":[\"M-" + r + "\"]}"))
+                                .content("{\"requestId\":\"REQ-R" + r + "\",\"keys\":[\"M-" + r
+                                        + "\"],\"temperature\":\"22.5\",\"humidity\":\"50\"}"))
                         .andReturn().getResponse().getStatus();
             });
             start.countDown();
@@ -152,11 +171,13 @@ class ConcurrencyApiTest {
 
     @Test
     void concurrentReleaseSameMeasurementExactlyOneWins() throws Exception {
+        createCoefficientVersion();
         String certBody = mvc.perform(post("/api/certificates")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {"instrumentId":"INS-D","validFrom":"2026-01-01T00:00:00Z",
-                                 "validTo":"2028-01-01T00:00:00Z","a":"1","b":"0"}"""))
+                                 "validTo":"2028-01-01T00:00:00Z","a":"1","b":"0",
+                                 "tempMin":"20","tempMax":"25","humMin":"30","humMax":"70"}"""))
                 .andReturn().getResponse().getContentAsString();
         mvc.perform(post("/api/measurements")
                 .contentType(MediaType.APPLICATION_JSON)
@@ -171,12 +192,15 @@ class ConcurrencyApiTest {
         CountDownLatch start = new CountDownLatch(1);
         List<Future<Integer>> results = new ArrayList<>();
         for (int i = 0; i < threads; i++) {
+            final int index = i;
             results.add(pool.submit(() -> {
                 start.await();
+                // 各请求使用不同 requestId：幂等快照不介入，竞争测量行锁
                 return mvc.perform(post("/api/measurements/release")
                                 .header("X-Actor-Id", "carol")
                                 .contentType(MediaType.APPLICATION_JSON)
-                                .content("{\"keys\":[\"M-D\"]}"))
+                                .content("{\"requestId\":\"REQ-D" + index
+                                        + "\",\"keys\":[\"M-D\"],\"temperature\":\"22.5\",\"humidity\":\"50\"}"))
                         .andReturn().getResponse().getStatus();
             }));
         }

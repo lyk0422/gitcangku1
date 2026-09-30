@@ -9,12 +9,21 @@ import com.fasterxml.jackson.annotation.JsonInclude;
  *
  * @param code     业务错误码
  * @param message  错误描述
- * @param failures 批量放行时各项失败原因；非批量场景为 null 不输出
+ * @param failures 批量放行 409 时各项失败原因；其他场景为 null 不输出
+ * @param details  放行环境 422 时的实际值与命中版本现场；其他场景为 null 不输出
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
-public record ErrorResponse(String code, String message, List<ItemFailure> failures) {
+public record ErrorResponse(String code, String message, List<ItemFailure> failures, Object details) {
 
     public ErrorResponse(String code, String message) {
-        this(code, message, null);
+        this(code, message, null, null);
+    }
+
+    public ErrorResponse(String code, String message, List<ItemFailure> failures) {
+        this(code, message, failures, null);
+    }
+
+    public ErrorResponse(String code, String message, Object details) {
+        this(code, message, null, details);
     }
 }

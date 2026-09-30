@@ -14,9 +14,6 @@ import com.example.starter.calibration.api.ApiException;
  */
 final class Inputs {
 
-    /** 十进制字符串：可选负号，整数最多 30 位，小数最多 6 位。 */
-    private static final Pattern DECIMAL = Pattern.compile("^-?\\d{1,30}(\\.\\d{1,6})?$");
-
     private Inputs() {
     }
 
@@ -27,9 +24,23 @@ final class Inputs {
         return value.trim();
     }
 
+    /**
+     * 解析最多 6 位小数的十进制字符串。
+     */
     static BigDecimal requireDecimal(String value, String field) {
-        if (value == null || !DECIMAL.matcher(value.trim()).matches()) {
-            throw ApiException.badRequest(field + " 必须为最多 6 位小数的十进制字符串");
+        return requireDecimal(value, field, 6);
+    }
+
+    /**
+     * 解析最多 maxScale 位小数的十进制字符串：可选负号，整数最多 30 位。
+     */
+    static BigDecimal requireDecimal(String value, String field, int maxScale) {
+        if (value == null) {
+            throw ApiException.badRequest(field + " 不能为空");
+        }
+        Pattern exact = Pattern.compile("^-?\\d{1,30}(\\.\\d{1," + maxScale + "})?$");
+        if (!exact.matcher(value.trim()).matches()) {
+            throw ApiException.badRequest(field + " 必须为最多 " + maxScale + " 位小数的十进制字符串");
         }
         return new BigDecimal(value.trim());
     }

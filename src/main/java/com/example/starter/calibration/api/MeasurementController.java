@@ -44,13 +44,15 @@ public class MeasurementController {
     }
 
     /**
-     * 批量放行（1～50 条，原子）：200；批次非法 400；任一项不满足条件整批拒绝 409 并返回各项原因。
+     * 批量放行（1～50 条，原子）：200；批次非法 400；状态类单项失败整批 409；
+     * 温湿度越界、系数未生效或多版本命中整批 422（均不产生放行记录）；
+     * requestId 重放返回首次快照，环境读数或测量键被修改 409。
      * 放行人通过 X-Actor-Id 请求头提供。
      */
     @PostMapping("/release")
     public ReleaseResponse release(@RequestBody ReleaseRequest request,
                                    @RequestHeader("X-Actor-Id") String actor) {
-        return releases.release(request.keys(), actor);
+        return releases.release(request, actor);
     }
 
     /**

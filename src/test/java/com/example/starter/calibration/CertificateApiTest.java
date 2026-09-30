@@ -31,14 +31,23 @@ class CertificateApiTest {
     void clean() {
         jdbc.update("DELETE FROM release_record");
         jdbc.update("DELETE FROM measurement");
+        jdbc.update("DELETE FROM release_snapshot");
+        jdbc.update("DELETE FROM coefficient_version");
         jdbc.update("DELETE FROM calibration_certificate");
         jdbc.update("DELETE FROM instrument_lock");
+        jdbc.update("DELETE FROM coefficient_lock");
     }
 
     private String certJson(String instrument, String from, String to, String a, String b) {
+        return certJson(instrument, from, to, a, b, "20", "25", "30", "70");
+    }
+
+    private String certJson(String instrument, String from, String to, String a, String b,
+                            String tempMin, String tempMax, String humMin, String humMax) {
         return """
-                {"instrumentId":"%s","validFrom":"%s","validTo":"%s","a":"%s","b":"%s"}
-                """.formatted(instrument, from, to, a, b);
+                {"instrumentId":"%s","validFrom":"%s","validTo":"%s","a":"%s","b":"%s",
+                 "tempMin":"%s","tempMax":"%s","humMin":"%s","humMax":"%s"}
+                """.formatted(instrument, from, to, a, b, tempMin, tempMax, humMin, humMax);
     }
 
     @Test
@@ -51,8 +60,23 @@ class CertificateApiTest {
                 .andExpect(jsonPath("$.instrumentId").value("INS-1"))
                 .andExpect(jsonPath("$.a").value("1.5"))
                 .andExpect(jsonPath("$.b").value("0.25"))
+                .andExpect(jsonPath("$.tempMin").value("20"))
+                .andExpect(jsonPath("$.tempMax").value("25"))
+                .andExpect(jsonPath("$.humMin").value("30"))
+                .andExpect(jsonPath("$.humMax").value("70"))
                 .andExpect(jsonPath("$.revoked").value(false))
                 .andExpect(jsonPath("$.revokedAt").doesNotExist());
+    }
+
+    @Test
+    void createCertificateRejectsInvalidTemperatureRange() throws Exception {
+        // 下限大于上限 → 400
+        mvc.perform(post("/api/certificates")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(certJson("INS-1", "2026-01-01T00:00:00Z", "2027-01-01T00:00:00Z",
+                                "1", "0", "25", "20", "30", "70")))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("BAD_REQUEST"));
     }
 
     @Test

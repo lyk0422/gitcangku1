@@ -14,6 +14,7 @@ import com.example.starter.calibration.repo.CertificateRepository;
 
 /**
  * 校准证书服务：创建（区间不重叠，并发安全）、撤销、查询。
+ * 证书同时声明放行允许的温湿度范围（含端点），范围必须下限不大于上限。
  */
 @Service
 public class CertificateService {
@@ -35,15 +36,26 @@ public class CertificateService {
         Instant validTo = Inputs.requireInstant(request.validTo(), "validTo");
         BigDecimal a = Inputs.requireDecimal(request.a(), "a");
         BigDecimal b = Inputs.requireDecimal(request.b(), "b");
+        BigDecimal tempMin = Inputs.requireDecimal(request.tempMin(), "tempMin");
+        BigDecimal tempMax = Inputs.requireDecimal(request.tempMax(), "tempMax");
+        BigDecimal humMin = Inputs.requireDecimal(request.humMin(), "humMin");
+        BigDecimal humMax = Inputs.requireDecimal(request.humMax(), "humMax");
         if (!validFrom.isBefore(validTo)) {
             throw ApiException.badRequest("validFrom 必须早于 validTo");
+        }
+        if (tempMin.compareTo(tempMax) > 0) {
+            throw ApiException.badRequest("tempMin 不能大于 tempMax");
+        }
+        if (humMin.compareTo(humMax) > 0) {
+            throw ApiException.badRequest("humMin 不能大于 humMax");
         }
 
         certificates.lockInstrument(instrumentId);
         if (certificates.countActiveOverlap(instrumentId, validFrom, validTo) > 0) {
             throw ApiException.conflict("CERTIFICATE_OVERLAP", "同一仪器存在区间重叠的未撤销证书");
         }
-        long id = certificates.insert(instrumentId, validFrom, validTo, a, b, Instant.now());
+        long id = certificates.insert(instrumentId, validFrom, validTo, a, b,
+                tempMin, tempMax, humMin, humMax, Instant.now());
         return DtoMapper.toResponse(certificates.findById(id).orElseThrow());
     }
 
