@@ -76,6 +76,16 @@ public class ReservationRepository {
     }
 
     /**
+     * 行锁查询某访客所有公告下仍为 RESERVED 的预占单（加入抑制名单时批量取消用）。
+     */
+    public List<Reservation> lockReservedByVisitor(String visitorId) {
+        return jdbc.query("SELECT " + COLUMNS + " FROM exposure_reservation "
+                        + "WHERE visitor_id = ? AND status = 'RESERVED' "
+                        + "ORDER BY reservation_id FOR UPDATE",
+                MAPPER, visitorId);
+    }
+
+    /**
      * 条件 CAS：仅当当前状态为 expect 时改为 target 并记录终态时刻。
      *
      * @return 是否更新成功（并发终态竞争时只有一个返回 true）

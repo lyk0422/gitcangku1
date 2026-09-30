@@ -84,6 +84,8 @@ class ExposureConcurrencyTest {
     @BeforeEach
     void clean() {
         jdbc.update("DELETE FROM idempotency_record");
+        jdbc.update("DELETE FROM suppression_cancellation");
+        jdbc.update("DELETE FROM visitor_suppression");
         jdbc.update("DELETE FROM exposure_reservation");
         jdbc.update("DELETE FROM quota_visitor_ledger");
         jdbc.update("DELETE FROM quota_total_ledger");

@@ -3,11 +3,13 @@ package com.example.starter.exposure.exposure;
 import com.example.starter.exposure.domain.Campaign;
 import com.example.starter.exposure.domain.Reservation;
 import com.example.starter.exposure.domain.ReservationStatus;
+import com.example.starter.exposure.domain.Suppression;
 import com.example.starter.exposure.repo.CampaignRepository;
 import com.example.starter.exposure.repo.IdempotencyRepository;
 import com.example.starter.exposure.repo.IdempotencyRepository.IdempotencyRecord;
 import com.example.starter.exposure.repo.LedgerRepository;
 import com.example.starter.exposure.repo.ReservationRepository;
+import com.example.starter.exposure.repo.SuppressionRepository;
 import com.example.starter.exposure.web.ApiException;
 import com.example.starter.exposure.web.ApplyExposureRequest;
 import com.example.starter.exposure.web.CampaignResponse;
@@ -47,6 +49,7 @@ public class ExposureServiceImpl implements ExposureService {
     private final ReservationRepository reservationRepository;
     private final LedgerRepository ledgerRepository;
     private final IdempotencyRepository idempotencyRepository;
+    private final SuppressionRepository suppressionRepository;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate txTemplate;
 
@@ -55,6 +58,7 @@ public class ExposureServiceImpl implements ExposureService {
                                ReservationRepository reservationRepository,
                                LedgerRepository ledgerRepository,
                                IdempotencyRepository idempotencyRepository,
+                               SuppressionRepository suppressionRepository,
                                ObjectMapper objectMapper,
                                TransactionTemplate txTemplate) {
         this.clock = clock;
@@ -62,6 +66,7 @@ public class ExposureServiceImpl implements ExposureService {
         this.reservationRepository = reservationRepository;
         this.ledgerRepository = ledgerRepository;
         this.idempotencyRepository = idempotencyRepository;
+        this.suppressionRepository = suppressionRepository;
         this.objectMapper = objectMapper;
         this.txTemplate = txTemplate;
     }
@@ -100,6 +105,16 @@ public class ExposureServiceImpl implements ExposureService {
                     long now = clock.millis();
                     LocalDate utcDate = LocalDate.now(clock);
                     Campaign campaign = requireCampaign(request.campaignId());
+
+                    // 抑制优先于公告与展示位的可投放规则：先锁访客抑制行，
+                    // 生效中一律 409 且不占额度；行锁同时串行化与加入名单的竞争
+                    suppressionRepository.ensureVisitorRow(request.visitorId());
+                    Suppression suppression =
+                            suppressionRepository.lockByVisitor(request.visitorId()).orElseThrow();
+                    if (suppression.active()) {
+                        throw new ApiException(HttpStatus.CONFLICT,
+                                "visitor is suppressed, exposure not allowed: " + request.visitorId());
+                    }
 
                     // 先结算该公告相关过期预占并释放额度
                     settleExpired(campaign.campaignId(), now);
