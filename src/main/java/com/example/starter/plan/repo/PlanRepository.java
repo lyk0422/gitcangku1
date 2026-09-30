@@ -3,6 +3,7 @@ package com.example.starter.plan.repo;
 import com.example.starter.plan.model.DayPlan;
 import com.example.starter.plan.model.Occupancy;
 import com.example.starter.plan.model.PlanStatus;
+import com.example.starter.plan.model.PlatformOccupancy;
 import com.example.starter.plan.model.PublishedSlot;
 import com.example.starter.plan.model.RescheduleLink;
 import java.sql.Date;
@@ -34,6 +35,11 @@ public class PlanRepository {
             rs.getInt("version"),
             PlanStatus.valueOf(rs.getString("status")));
 
+    private static final String OCCUPANCY_COLUMNS =
+            "id, plan_id, seq, train_no, section_id, start_utc, end_utc,"
+                    + " platform_id, consist_length_meters, power_system, accessible_required,"
+                    + " capability_version";
+
     private static final RowMapper<Occupancy> OCCUPANCY_MAPPER = (rs, n) -> new Occupancy(
             rs.getLong("id"),
             rs.getLong("plan_id"),
@@ -41,7 +47,12 @@ public class PlanRepository {
             rs.getString("train_no"),
             rs.getString("section_id"),
             Instant.ofEpochMilli(rs.getLong("start_utc")),
-            Instant.ofEpochMilli(rs.getLong("end_utc")));
+            Instant.ofEpochMilli(rs.getLong("end_utc")),
+            rs.getString("platform_id"),
+            (Integer) rs.getObject("consist_length_meters"),
+            rs.getString("power_system"),
+            (Boolean) rs.getObject("accessible_required"),
+            (Integer) rs.getObject("capability_version"));
 
     private static final RowMapper<RescheduleLink> LINK_MAPPER = (rs, n) -> new RescheduleLink(
             rs.getLong("id"),
@@ -111,12 +122,13 @@ public class PlanRepository {
     }
 
     /**
-     * 批量插入占用。
+     * 批量插入占用（含站台到发占用的编组三要素；capability_version 留空，发布成功时盖章）。
      */
     public void insertOccupancies(long planId, List<Occupancy> occupancies) {
         jdbc.batchUpdate(
-                "INSERT INTO rail_plan_occupancy (plan_id, seq, train_no, section_id, start_utc, end_utc)"
-                        + " VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO rail_plan_occupancy (plan_id, seq, train_no, section_id, start_utc, end_utc,"
+                        + " platform_id, consist_length_meters, power_system, accessible_required)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 occupancies, occupancies.size(),
                 (ps, o) -> {
                     ps.setLong(1, planId);
@@ -125,6 +137,17 @@ public class PlanRepository {
                     ps.setString(4, o.sectionId());
                     ps.setLong(5, o.startUtc().toEpochMilli());
                     ps.setLong(6, o.endUtc().toEpochMilli());
+                    if (o.platformId() == null) {
+                        ps.setNull(7, java.sql.Types.VARCHAR);
+                        ps.setNull(8, java.sql.Types.INTEGER);
+                        ps.setNull(9, java.sql.Types.VARCHAR);
+                        ps.setNull(10, java.sql.Types.BOOLEAN);
+                    } else {
+                        ps.setString(7, o.platformId());
+                        ps.setInt(8, o.consistLengthMeters());
+                        ps.setString(9, o.powerSystem());
+                        ps.setBoolean(10, o.accessibleRequired());
+                    }
                 });
     }
 
@@ -132,9 +155,79 @@ public class PlanRepository {
      * 查询计划占用，按计划内序号升序。
      */
     public List<Occupancy> findOccupancies(long planId) {
-        return jdbc.query("SELECT id, plan_id, seq, train_no, section_id, start_utc, end_utc"
+        return jdbc.query("SELECT " + OCCUPANCY_COLUMNS
                         + " FROM rail_plan_occupancy WHERE plan_id = ? ORDER BY seq",
                 OCCUPANCY_MAPPER, planId);
+    }
+
+    /**
+     * 发布/改签成功后为一条站台占用固化当时的站台能力版本（历史发布保留当时能力版本）。
+     */
+    public void stampCapabilityVersion(long occupancyId, int capabilityVersion) {
+        jdbc.update("UPDATE rail_plan_occupancy SET capability_version = ? WHERE id = ?",
+                capabilityVersion, occupancyId);
+    }
+
+    /**
+     * 查询指定站台上与 [startUtc, endUtc) 重叠的当前生效（已发布、未取消）站台占用，
+     * 排除给定计划集合（发布排除自身；改签排除新旧两计划）。左闭右开，相邻不重叠。
+     */
+    public List<PlatformOccupancy> findPlatformOccupancies(String platformId,
+                                                           Collection<Long> excludePlanIds,
+                                                           Instant startUtc, Instant endUtc) {
+        StringBuilder sql = new StringBuilder(
+                "SELECT o.platform_id, o.plan_id, p.schedule_key, o.train_no, o.section_id,"
+                        + " o.start_utc, o.end_utc, o.consist_length_meters, o.power_system,"
+                        + " o.accessible_required, o.capability_version"
+                        + " FROM rail_plan_occupancy o JOIN rail_day_plan p ON p.id = o.plan_id"
+                        + " WHERE p.status = 'PUBLISHED' AND o.platform_id = ?"
+                        + " AND o.start_utc < ? AND ? < o.end_utc");
+        List<Object> args = new ArrayList<>();
+        args.add(platformId);
+        args.add(endUtc.toEpochMilli());
+        args.add(startUtc.toEpochMilli());
+        if (!excludePlanIds.isEmpty()) {
+            StringJoiner excludePlaceholders = new StringJoiner(", ");
+            excludePlanIds.forEach(id -> excludePlaceholders.add("?"));
+            sql.append(" AND o.plan_id NOT IN (").append(excludePlaceholders).append(')');
+            args.addAll(excludePlanIds);
+        }
+        sql.append(" ORDER BY o.start_utc");
+        return jdbc.query(sql.toString(), (rs, n) -> new PlatformOccupancy(
+                rs.getString("platform_id"),
+                rs.getLong("plan_id"),
+                rs.getString("schedule_key"),
+                rs.getString("train_no"),
+                rs.getString("section_id"),
+                Instant.ofEpochMilli(rs.getLong("start_utc")),
+                Instant.ofEpochMilli(rs.getLong("end_utc")),
+                rs.getInt("consist_length_meters"),
+                rs.getString("power_system"),
+                rs.getBoolean("accessible_required"),
+                rs.getInt("capability_version")), args.toArray());
+    }
+
+    /**
+     * 查询指定站台全部当前生效（已发布）站台占用，按开始时刻升序，供站台管理方查看。
+     */
+    public List<PlatformOccupancy> findAllPlatformOccupancies(String platformId) {
+        String sql = "SELECT o.platform_id, o.plan_id, p.schedule_key, o.train_no, o.section_id,"
+                + " o.start_utc, o.end_utc, o.consist_length_meters, o.power_system,"
+                + " o.accessible_required, o.capability_version"
+                + " FROM rail_plan_occupancy o JOIN rail_day_plan p ON p.id = o.plan_id"
+                + " WHERE p.status = 'PUBLISHED' AND o.platform_id = ? ORDER BY o.start_utc";
+        return jdbc.query(sql, (rs, n) -> new PlatformOccupancy(
+                rs.getString("platform_id"),
+                rs.getLong("plan_id"),
+                rs.getString("schedule_key"),
+                rs.getString("train_no"),
+                rs.getString("section_id"),
+                Instant.ofEpochMilli(rs.getLong("start_utc")),
+                Instant.ofEpochMilli(rs.getLong("end_utc")),
+                rs.getInt("consist_length_meters"),
+                rs.getString("power_system"),
+                rs.getBoolean("accessible_required"),
+                rs.getInt("capability_version")), platformId);
     }
 
     /**
