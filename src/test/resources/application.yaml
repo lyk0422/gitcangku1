@@ -1,0 +1,14 @@
+spring:
+  datasource:
+    # 独立命名的 H2 内存库，仅测试使用；MODE=MySQL 兼容 MySQL 语法；DB_CLOSE_DELAY=-1 维持到测试 JVM 结束后释放
+    url: jdbc:h2:mem:archival_test;MODE=MySQL;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=10000
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 1
+      connection-timeout: 10000
+  sql:
+    init:
+      mode: always
