@@ -2,6 +2,9 @@ package com.example.starter.translation.repo;
 
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
+import com.example.starter.translation.domain.Rows.FreezeAffectedSegmentRow;
+import com.example.starter.translation.domain.Rows.FreezeRow;
+import com.example.starter.translation.domain.Rows.FreezeUpdateRow;
 import com.example.starter.translation.domain.Rows.RequestLogRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
@@ -45,6 +48,17 @@ public class TranslationRepository {
 
     private static final RowMapper<TermRuleRow> TERM_RULE_MAPPER = (rs, n) -> new TermRuleRow(
             rs.getString("source_term"), rs.getString("language"), rs.getString("required_translation"));
+
+    private static final RowMapper<FreezeRow> FREEZE_MAPPER = (rs, n) -> new FreezeRow(
+            rs.getInt("freeze_id"), rs.getInt("term_version"),
+            rs.getLong("start_at"), rs.getLong("end_at"));
+
+    private static final RowMapper<FreezeUpdateRow> FREEZE_UPDATE_MAPPER = (rs, n) -> new FreezeUpdateRow(
+            rs.getInt("freeze_id"), rs.getInt("term_version"), rs.getString("request_id"));
+
+    private static final RowMapper<FreezeAffectedSegmentRow> FREEZE_AFFECTED_MAPPER = (rs, n) ->
+            new FreezeAffectedSegmentRow(rs.getInt("freeze_id"),
+                    rs.getString("segment_id"), rs.getString("language"));
 
     private final JdbcTemplate jdbc;
 
@@ -240,5 +254,101 @@ public class TranslationRepository {
     public void insertRequestLog(String requestId, String requestHash, int responseStatus, String responseBody) {
         jdbc.update("INSERT INTO request_log (request_id, request_hash, response_status, response_body) "
                 + "VALUES (?, ?, ?, ?)", requestId, requestHash, responseStatus, responseBody);
+    }
+
+    /** 插入冻结窗口；窗口序号由调用方按文档当前最大值加一给出，主键冲突时抛异常。 */
+    public void insertFreeze(long documentId, FreezeRow freeze) {
+        jdbc.update("INSERT INTO term_freeze (document_id, freeze_id, term_version, start_at, end_at) "
+                        + "VALUES (?, ?, ?, ?, ?)",
+                documentId, freeze.freezeId(), freeze.termVersion(), freeze.startAt(), freeze.endAt());
+    }
+
+    /** 查询指定冻结窗口（不加锁），不存在返回空。 */
+    public Optional<FreezeRow> findFreeze(long documentId, int freezeId) {
+        List<FreezeRow> rows = jdbc.query(
+                "SELECT freeze_id, term_version, start_at, end_at FROM term_freeze "
+                        + "WHERE document_id = ? AND freeze_id = ?",
+                FREEZE_MAPPER, documentId, freezeId);
+        return rows.stream().findFirst();
+    }
+
+    /** 查询指定冻结窗口并加行级写锁（FOR UPDATE），用于解冻更新串行化。 */
+    public Optional<FreezeRow> findFreezeForUpdate(long documentId, int freezeId) {
+        List<FreezeRow> rows = jdbc.query(
+                "SELECT freeze_id, term_version, start_at, end_at FROM term_freeze "
+                        + "WHERE document_id = ? AND freeze_id = ? FOR UPDATE",
+                FREEZE_MAPPER, documentId, freezeId);
+        return rows.stream().findFirst();
+    }
+
+    /** 查询文档全部冻结窗口，按序号升序。 */
+    public List<FreezeRow> listFreezes(long documentId) {
+        return jdbc.query(
+                "SELECT freeze_id, term_version, start_at, end_at FROM term_freeze "
+                        + "WHERE document_id = ? ORDER BY freeze_id",
+                FREEZE_MAPPER, documentId);
+    }
+
+    /** 查询文档尚未完成解冻更新（freeze_term_update 无记录）的冻结窗口序号，按序号升序。 */
+    public List<Integer> listUnresolvedFreezeIds(long documentId) {
+        return jdbc.queryForList(
+                "SELECT f.freeze_id FROM term_freeze f "
+                        + "LEFT JOIN freeze_term_update u ON f.document_id = u.document_id AND f.freeze_id = u.freeze_id "
+                        + "WHERE f.document_id = ? AND u.freeze_id IS NULL ORDER BY f.freeze_id",
+                Integer.class, documentId);
+    }
+
+    /**
+     * 解冻更新整单校验通过后，将文档全部译文原子绑定到新术语版本（正文与译文版本不变，
+     * 受影响段落已按新规则逐段校验；非受影响段落不命中任何新规则，天然合规）。
+     */
+    public void rebindAllTranslationTermVersions(long documentId, int termVersion) {
+        jdbc.update("UPDATE translation SET term_version = ?, updated_at = CURRENT_TIMESTAMP "
+                + "WHERE document_id = ?", termVersion, documentId);
+    }
+
+    /** 查询文档当前生效（含给定时刻）的冻结窗口，按序号倒序取至多一条。 */
+    public Optional<FreezeRow> findActiveFreeze(long documentId, long nowEpochMilli) {
+        List<FreezeRow> rows = jdbc.query(
+                "SELECT freeze_id, term_version, start_at, end_at FROM term_freeze "
+                        + "WHERE document_id = ? AND start_at <= ? AND end_at > ? ORDER BY freeze_id DESC",
+                FREEZE_MAPPER, documentId, nowEpochMilli, nowEpochMilli);
+        return rows.stream().findFirst();
+    }
+
+    /** 写入解冻更新记录（每个冻结窗口至多一条，主键冲突时抛异常）。 */
+    public void insertFreezeUpdate(long documentId, FreezeUpdateRow update) {
+        jdbc.update("INSERT INTO freeze_term_update (document_id, freeze_id, term_version, request_id) "
+                        + "VALUES (?, ?, ?, ?)",
+                documentId, update.freezeId(), update.termVersion(), update.requestId());
+    }
+
+    /** 查询冻结窗口的解冻更新记录，不存在返回空。 */
+    public Optional<FreezeUpdateRow> findFreezeUpdate(long documentId, int freezeId) {
+        List<FreezeUpdateRow> rows = jdbc.query(
+                "SELECT freeze_id, term_version, request_id FROM freeze_term_update "
+                        + "WHERE document_id = ? AND freeze_id = ?",
+                FREEZE_UPDATE_MAPPER, documentId, freezeId);
+        return rows.stream().findFirst();
+    }
+
+    /** 批量写入解冻更新受影响段落，与解冻更新同一事务提交。 */
+    public void insertFreezeAffectedSegments(long documentId, List<FreezeAffectedSegmentRow> segments) {
+        jdbc.batchUpdate("INSERT INTO freeze_affected_segment (document_id, freeze_id, segment_id, language) "
+                        + "VALUES (?, ?, ?, ?)",
+                segments, segments.size(), (ps, row) -> {
+                    ps.setLong(1, documentId);
+                    ps.setInt(2, row.freezeId());
+                    ps.setString(3, row.segmentId());
+                    ps.setString(4, row.language());
+                });
+    }
+
+    /** 查询冻结窗口的全部受影响段落，按段落与语言排序保证稳定输出。 */
+    public List<FreezeAffectedSegmentRow> listFreezeAffectedSegments(long documentId, int freezeId) {
+        return jdbc.query(
+                "SELECT freeze_id, segment_id, language FROM freeze_affected_segment "
+                        + "WHERE document_id = ? AND freeze_id = ? ORDER BY segment_id, language",
+                FREEZE_AFFECTED_MAPPER, documentId, freezeId);
     }
 }

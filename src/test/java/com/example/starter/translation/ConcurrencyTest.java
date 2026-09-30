@@ -3,6 +3,7 @@ package com.example.starter.translation;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
@@ -237,5 +238,130 @@ class ConcurrencyTest extends AbstractIntegrationTest {
         Integer termVersion = jdbc.queryForObject(
                 "SELECT term_version FROM document WHERE document_id = ?", Integer.class, docId);
         assertThat(termVersion).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("解冻更新与发布竞争：发布只能引用整单校验完成后的草稿，未完成校验时为旧快照或 409，无混合快照")
+    void concurrentUnfreezeAndPublish() throws Exception {
+        Instant t1000 = Instant.parse("2026-10-01T10:00:00Z");
+        Instant t1100 = Instant.parse("2026-10-01T11:00:00Z");
+        String rulesV2 = "[{\"sourceTerm\":\"机器学习\",\"language\":\"en\","
+                + "\"requiredTranslation\":\"machine learning\"}]";
+
+        long docId = createDocument(newRequestId(), "[\"en\"]",
+                "[{\"segmentId\":\"s1\",\"sourceText\":\"机器学习\"}]");
+        updateTerms(docId, 0, "[]", newRequestId());
+        updateTerms(docId, 1, rulesV2, newRequestId());
+        submitTranslation(docId, "s1", "en", "alice", "machine learning", 1, newRequestId());
+        approve(docId, "s1", "en", "bob", 1, newRequestId());
+        // 草稿版本 4、发布版本 0；发布不递增草稿版本，发布后草稿仍 4、发布版本 1
+        publish(docId, 4, 0, newRequestId());
+        createFreeze(docId, t1000.toEpochMilli(), t1100.toEpochMilli(), newRequestId());
+        clock.set(t1100);
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        CountDownLatch gate = new CountDownLatch(1);
+        Future<ApiResult> unfreezeFuture = pool.submit(() -> {
+            gate.await();
+            // 解冻新术语版本规则与 V2 相同，整单校验必然通过
+            return updateTermsAfterFreeze(docId, 1, 2, rulesV2, newRequestId());
+        });
+        Future<ApiResult> publishFuture = pool.submit(() -> {
+            gate.await();
+            return publish(docId, 4, 1, newRequestId());
+        });
+        gate.countDown();
+        ApiResult unfreezeResult = unfreezeFuture.get(30, TimeUnit.SECONDS);
+        ApiResult publishResult = publishFuture.get(30, TimeUnit.SECONDS);
+        pool.shutdown();
+
+        // 解冻更新必然成功：术语版本 3、草稿版本 5
+        assertThat(unfreezeResult.status()).isEqualTo(201);
+        assertThat(unfreezeResult.body().get("termVersion").asInt()).isEqualTo(3);
+        assertThat(publishResult.status()).isIn(201, 409);
+
+        Integer termVersion = jdbc.queryForObject(
+                "SELECT term_version FROM document WHERE document_id = ?", Integer.class, docId);
+        Integer draftVersion = jdbc.queryForObject(
+                "SELECT draft_version FROM document WHERE document_id = ?", Integer.class, docId);
+        Integer publishedVersion = jdbc.queryForObject(
+                "SELECT published_version FROM document WHERE document_id = ?", Integer.class, docId);
+        Integer snapshots = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM release_snapshot WHERE document_id = ?", Integer.class, docId);
+
+        assertThat(termVersion).isEqualTo(3);
+        assertThat(draftVersion).isEqualTo(5);
+        // 快照数与发布版本严格一致：无部分快照
+        assertThat(snapshots).isEqualTo(publishedVersion);
+        if (publishResult.status() == 201) {
+            // 发布先于解冻：只能引用完整校验过的旧草稿，快照固化术语 V2，译文绑定 V2
+            assertThat(publishedVersion).isEqualTo(2);
+            ApiResult release2 = getJson("/api/documents/" + docId + "/releases/2");
+            assertThat(release2.body().get("termVersion").asInt()).isEqualTo(2);
+            assertThat(release2.body().get("segments").get(0).get("translations").get(0)
+                    .get("termVersion").asInt()).isEqualTo(2);
+        } else {
+            // 解冻先于发布：期望草稿版本 4 已失效，409 且无新快照
+            assertThat(publishedVersion).isEqualTo(1);
+        }
+        // 解冻完成后的新草稿完整绑定 V3，可继续发布
+        ApiResult after = publish(docId, 5, publishedVersion, newRequestId());
+        assertThat(after.status()).isEqualTo(201);
+        assertThat(getJson("/api/documents/" + docId + "/releases/" + (publishedVersion + 1))
+                .body().get("termVersion").asInt()).isEqualTo(3);
+    }
+
+    @Test
+    @DisplayName("解冻更新同 requestId 并发：仅整单执行一次，其余重放首次版本与受影响段落")
+    void concurrentUnfreezeSameRequestId() throws Exception {
+        Instant t1000 = Instant.parse("2026-10-01T10:00:00Z");
+        Instant t1100 = Instant.parse("2026-10-01T11:00:00Z");
+        String rules = "[{\"sourceTerm\":\"机器学习\",\"language\":\"en\","
+                + "\"requiredTranslation\":\"machine learning\"}]";
+
+        long docId = createDocument(newRequestId(), "[\"en\"]",
+                "[{\"segmentId\":\"s1\",\"sourceText\":\"机器学习\"}]");
+        updateTerms(docId, 0, rules, newRequestId());
+        submitTranslation(docId, "s1", "en", "alice", "machine learning", 1, newRequestId());
+        approve(docId, "s1", "en", "bob", 1, newRequestId());
+        createFreeze(docId, t1000.toEpochMilli(), t1100.toEpochMilli(), newRequestId());
+        clock.set(t1100);
+
+        String requestId = newRequestId();
+        int threads = 6;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch gate = new CountDownLatch(1);
+        List<Future<ApiResult>> futures = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            futures.add(pool.submit(() -> {
+                gate.await();
+                return updateTermsAfterFreeze(docId, 1, 1, rules, requestId);
+            }));
+        }
+        gate.countDown();
+        for (Future<ApiResult> future : futures) {
+            ApiResult result = future.get(30, TimeUnit.SECONDS);
+            assertThat(result.status()).isEqualTo(201);
+            assertThat(result.body().get("termVersion").asInt()).isEqualTo(2);
+            assertThat(result.body().get("affectedSegments")).hasSize(1);
+        }
+        pool.shutdown();
+
+        assertThat(jdbc.queryForObject(
+                "SELECT COUNT(*) FROM term_version WHERE document_id = ?", Integer.class, docId))
+                .isEqualTo(2);
+        assertThat(jdbc.queryForObject(
+                "SELECT COUNT(*) FROM freeze_term_update WHERE document_id = ?", Integer.class, docId))
+                .isEqualTo(1);
+        assertThat(jdbc.queryForObject(
+                "SELECT COUNT(*) FROM freeze_affected_segment WHERE document_id = ?", Integer.class, docId))
+                .isEqualTo(1);
+        assertThat(jdbc.queryForObject(
+                "SELECT COUNT(*) FROM request_log WHERE request_id = ?", Integer.class, requestId))
+                .isEqualTo(1);
+        // 全部译文随整单更新原子绑定到 V2
+        assertThat(jdbc.queryForObject(
+                "SELECT COUNT(*) FROM translation WHERE document_id = ? AND term_version = ?",
+                Integer.class, docId, 2)).isEqualTo(1);
     }
 }

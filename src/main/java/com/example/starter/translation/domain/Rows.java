@@ -72,6 +72,47 @@ public final class Rows {
     }
 
     /**
+     * 术语冻结窗口：文档内按 freezeId 递增，绑定创建时的当前术语版本，UTC 左闭右开区间。
+     *
+     * @param freezeId    文档内冻结窗口序号，从 1 开始单调递增
+     * @param termVersion 窗口绑定的术语版本，等于创建窗口时的当前术语版本
+     * @param startAt     窗口开始时间，UTC epoch 毫秒，左闭（含该时刻）
+     * @param endAt       窗口结束时间，UTC epoch 毫秒，右开（不含该时刻）；该时刻起为解冻状态
+     */
+    public record FreezeRow(int freezeId, int termVersion, long startAt, long endAt) {
+
+        /** 判断给定 UTC 时刻（epoch 毫秒）是否落在窗口内：左闭右开。 */
+        public boolean contains(long epochMilli) {
+            return epochMilli >= startAt && epochMilli < endAt;
+        }
+
+        /** 判断窗口是否已在给定 UTC 时刻（epoch 毫秒）结束（endAt 时刻视为已解冻）。 */
+        public boolean endedAt(long epochMilli) {
+            return epochMilli >= endAt;
+        }
+    }
+
+    /**
+     * 解冻更新记录：窗口结束后的首次术语更新整单校验通过后写入，每个冻结窗口至多一条。
+     *
+     * @param freezeId    所属冻结窗口序号
+     * @param termVersion 解冻更新生成的新术语版本
+     * @param requestId   触发解冻更新的请求 ID，用于幂等重放
+     */
+    public record FreezeUpdateRow(int freezeId, int termVersion, String requestId) {
+    }
+
+    /**
+     * 解冻更新受影响段落：新规则 sourceTerm 命中文档段落源文的段落与语言组合。
+     *
+     * @param freezeId  所属冻结窗口序号
+     * @param segmentId 受影响段落 ID
+     * @param language  受影响目标语言码，小写
+     */
+    public record FreezeAffectedSegmentRow(int freezeId, String segmentId, String language) {
+    }
+
+    /**
      * 写操作幂等去重记录：全局唯一 requestId，仅记录成功结果，与业务变更原子提交。
      *
      * @param requestId      全局唯一请求 ID

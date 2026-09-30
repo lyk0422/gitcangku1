@@ -1,5 +1,6 @@
 package com.example.starter.translation.api;
 
+import com.example.starter.translation.service.FreezeService;
 import com.example.starter.translation.service.TranslationService;
 import com.example.starter.translation.service.WriteExecutor;
 import com.example.starter.translation.service.WriteResult;
@@ -20,6 +21,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
+import java.util.List;
 
 /**
  * 多语种段落修订与发布快照 REST API。
@@ -30,12 +32,14 @@ import java.util.HexFormat;
 public class TranslationController {
 
     private final TranslationService translationService;
+    private final FreezeService freezeService;
     private final WriteExecutor writeExecutor;
     private final ObjectMapper objectMapper;
 
-    public TranslationController(TranslationService translationService, WriteExecutor writeExecutor,
-                                 ObjectMapper objectMapper) {
+    public TranslationController(TranslationService translationService, FreezeService freezeService,
+                                 WriteExecutor writeExecutor, ObjectMapper objectMapper) {
         this.translationService = translationService;
+        this.freezeService = freezeService;
         this.writeExecutor = writeExecutor;
         this.objectMapper = objectMapper;
     }
@@ -127,6 +131,46 @@ public class TranslationController {
     @GetMapping("/{documentId}/terms/status")
     public ResponseEntity<ApiDtos.TermStatusResponse> getTermStatus(@PathVariable long documentId) {
         return ResponseEntity.ok(translationService.getTermStatus(documentId));
+    }
+
+    /** 创建术语冻结窗口：绑定当前术语版本，UTC 左闭右开区间。 */
+    @PutMapping("/{documentId}/freezes")
+    public ResponseEntity<String> createFreeze(@PathVariable long documentId,
+                                               @Valid @RequestBody ApiDtos.CreateFreezeRequest request) {
+        String operation = "PUT /api/documents/" + documentId + "/freezes";
+        return writeExecutor.execute(request.requestId(), hash(operation, request),
+                () -> WriteResult.of(201, freezeService.createFreeze(documentId, request))).toResponseEntity();
+    }
+
+    /** 查询文档全部冻结窗口：冻结起止、状态、草稿术语版本及受影响段落。 */
+    @GetMapping("/{documentId}/freezes")
+    public ResponseEntity<List<ApiDtos.FreezeView>> listFreezes(@PathVariable long documentId) {
+        return ResponseEntity.ok(freezeService.listFreezes(documentId));
+    }
+
+    /** 查询指定冻结窗口。 */
+    @GetMapping("/{documentId}/freezes/{freezeId}")
+    public ResponseEntity<ApiDtos.FreezeView> getFreeze(@PathVariable long documentId,
+                                                        @PathVariable int freezeId) {
+        return ResponseEntity.ok(freezeService.getFreeze(documentId, freezeId));
+    }
+
+    /**
+     * 窗口结束后的首次术语更新：须全部受影响段落重新校验通过才原子提交新草稿版本；
+     * 窗口内调用返回 409，校验失败整单 422 回滚。
+     */
+    @PostMapping("/{documentId}/freezes/{freezeId}/terms")
+    public ResponseEntity<String> updateTermsAfterFreeze(@PathVariable long documentId,
+                                                         @PathVariable int freezeId,
+                                                         @Valid @RequestBody ApiDtos.UpdateTermsAfterFreezeRequest request) {
+        if (freezeId != request.freezeId()) {
+            throw ApiException.conflict("路径冻结窗口 " + freezeId + " 与请求体 freezeId "
+                    + request.freezeId() + " 不一致");
+        }
+        String operation = "POST /api/documents/" + documentId + "/freezes/" + freezeId + "/terms";
+        return writeExecutor.execute(request.requestId(), hash(operation, request),
+                () -> WriteResult.of(201, freezeService.updateTermsAfterFreeze(documentId, request)))
+                .toResponseEntity();
     }
 
     /** 查询指定发布版本的只读快照。 */

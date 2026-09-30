@@ -111,6 +111,51 @@ COMMENT ON COLUMN term_rule.source_term IS '源文术语，Unicode 原文、区�
 COMMENT ON COLUMN term_rule.language IS '目标语言码，小写';
 COMMENT ON COLUMN term_rule.required_translation IS '该术语在目标语言中的必译文本，非空';
 
+CREATE TABLE IF NOT EXISTS term_freeze (
+    document_id BIGINT NOT NULL,
+    freeze_id INT NOT NULL,
+    term_version INT NOT NULL,
+    start_at BIGINT NOT NULL,
+    end_at BIGINT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (document_id, freeze_id)
+);
+COMMENT ON TABLE term_freeze IS '术语冻结窗口：文档内按 freeze_id 递增，绑定创建时的当前术语版本，UTC 左闭右开区间[start_at,end_at)';
+COMMENT ON COLUMN term_freeze.document_id IS '所属文档 ID';
+COMMENT ON COLUMN term_freeze.freeze_id IS '文档内冻结窗口序号，从 1 开始单调递增';
+COMMENT ON COLUMN term_freeze.term_version IS '窗口绑定的术语版本，必须等于创建窗口时的当前术语版本';
+COMMENT ON COLUMN term_freeze.start_at IS '窗口开始时间，UTC epoch 毫秒，左闭（含该时刻）';
+COMMENT ON COLUMN term_freeze.end_at IS '窗口结束时间，UTC epoch 毫秒，右开（不含该时刻）；该时刻起为解冻状态';
+COMMENT ON COLUMN term_freeze.created_at IS '窗口创建时间，数据库默认时区';
+
+CREATE TABLE IF NOT EXISTS freeze_term_update (
+    document_id BIGINT NOT NULL,
+    freeze_id INT NOT NULL,
+    term_version INT NOT NULL,
+    request_id VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (document_id, freeze_id)
+);
+COMMENT ON TABLE freeze_term_update IS '解冻更新记录：窗口结束后的首次术语更新整单校验通过后写入，每个冻结窗口至多一条';
+COMMENT ON COLUMN freeze_term_update.document_id IS '所属文档 ID';
+COMMENT ON COLUMN freeze_term_update.freeze_id IS '所属冻结窗口序号';
+COMMENT ON COLUMN freeze_term_update.term_version IS '解冻更新生成的新术语版本';
+COMMENT ON COLUMN freeze_term_update.request_id IS '触发解冻更新的全局唯一请求 ID，用于幂等重放';
+COMMENT ON COLUMN freeze_term_update.created_at IS '解冻更新时间，数据库默认时区';
+
+CREATE TABLE IF NOT EXISTS freeze_affected_segment (
+    document_id BIGINT NOT NULL,
+    freeze_id INT NOT NULL,
+    segment_id VARCHAR(64) NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    PRIMARY KEY (document_id, freeze_id, segment_id, language)
+);
+COMMENT ON TABLE freeze_affected_segment IS '解冻更新受影响段落：新规则 sourceTerm 命中文档段落源文的段落与语言组合，整单校验通过后随更新原子写入';
+COMMENT ON COLUMN freeze_affected_segment.document_id IS '所属文档 ID';
+COMMENT ON COLUMN freeze_affected_segment.freeze_id IS '所属冻结窗口序号';
+COMMENT ON COLUMN freeze_affected_segment.segment_id IS '受影响段落 ID';
+COMMENT ON COLUMN freeze_affected_segment.language IS '受影响目标语言码，小写';
+
 CREATE TABLE IF NOT EXISTS request_log (
     request_id VARCHAR(128) PRIMARY KEY,
     request_hash VARCHAR(64) NOT NULL,

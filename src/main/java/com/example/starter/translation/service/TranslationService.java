@@ -4,6 +4,7 @@ import com.example.starter.translation.api.ApiDtos;
 import com.example.starter.translation.api.ApiException;
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
+import com.example.starter.translation.domain.Rows.FreezeRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
 import com.example.starter.translation.domain.Rows.TranslationRow;
@@ -12,13 +13,12 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Clock;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Set;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -26,16 +26,19 @@ import java.util.stream.Collectors;
  * 多语种段落修订与发布快照的核心业务服务。
  * 所有写操作先对文档行加 FOR UPDATE 行锁，保证同一文档的修改、审核与发布串行，
  * 并发下对应一个一致的文档状态；方法均加入调用方事务，与幂等记录原子提交。
+ * 术语冻结窗口内：换术语（updateTerms）、修改术语引用（submitTranslation）与发布一律 409 拒绝。
  */
 @Service
 public class TranslationService {
 
     private final TranslationRepository repository;
     private final ObjectMapper objectMapper;
+    private final Clock clock;
 
-    public TranslationService(TranslationRepository repository, ObjectMapper objectMapper) {
+    public TranslationService(TranslationRepository repository, ObjectMapper objectMapper, Clock clock) {
         this.repository = repository;
         this.objectMapper = objectMapper;
+        this.clock = clock;
     }
 
     /** 建文档：1~5 种目标语言，可携带初始段落，初始草稿版本 1、发布版本 0。 */
@@ -81,12 +84,13 @@ public class TranslationService {
     /**
      * 译文提交：所依据源文版本必须等于当前源文版本；绑定当前术语版本，
      * 当前源文命中的术语规则要求译文包含对应必译文本，否则 422 返回全部违规术语且不写译文；
-     * 译文版本递增，草稿版本加一。
+     * 译文版本递增，草稿版本加一。术语冻结窗口内修改术语引用一律 409 拒绝。
      */
     @Transactional
     public ApiDtos.TranslationResponse submitTranslation(long documentId, String segmentId, String language,
                                                          String actorId, ApiDtos.SubmitTranslationRequest request) {
         DocumentRow document = lockDocument(documentId);
+        rejectIfTermFrozen(documentId, "冻结窗口内不得修改译文术语引用");
         String normalizedLanguage = normalizeLanguage(language);
         if (!document.targetLanguages().contains(normalizedLanguage)) {
             throw ApiException.unprocessable("语言不在文档目标语言中: " + normalizedLanguage);
@@ -97,7 +101,7 @@ public class TranslationService {
                     + " 与当前源文版本 " + segment.sourceVersion() + " 不匹配");
         }
         List<TermRuleRow> termRules = repository.listTermRules(documentId, document.termVersion());
-        List<ApiDtos.TermRuleView> violations = findViolations(
+        List<ApiDtos.TermRuleView> violations = TermRules.findViolations(
                 segment.sourceText(), normalizedLanguage, request.content(), termRules);
         if (!violations.isEmpty()) {
             throw ApiException.termViolation("译文违反 " + violations.size() + " 条术语规则", violations);
@@ -142,27 +146,22 @@ public class TranslationService {
      * 新增术语版本：expectedTermVersion 必须等于当前术语版本（不符 409）；
      * 规则 0~100 条、按 sourceTerm 与目标语言唯一、语言须在文档目标语言中（不符 422）。
      * 成功后术语版本加一（已有版本不可覆盖），草稿版本加一；术语快照与草稿版本同一事务提交。
+     * 术语冻结窗口内换术语一律 409 拒绝；窗口结束后的更新走 freezes/{freezeId}/terms 整单校验。
      */
     @Transactional
     public ApiDtos.TermVersionResponse updateTerms(long documentId, ApiDtos.UpdateTermsRequest request) {
         DocumentRow document = lockDocument(documentId);
+        rejectIfTermFrozen(documentId, "冻结窗口内不得更换术语版本");
+        List<Integer> unresolved = repository.listUnresolvedFreezeIds(documentId);
+        if (!unresolved.isEmpty()) {
+            throw ApiException.conflict("文档存在未完成解冻更新的冻结窗口 #" + unresolved.get(0)
+                    + "，须在窗口结束后通过冻结窗口整单校验入口更新术语");
+        }
         if (document.termVersion() != request.expectedTermVersion()) {
             throw ApiException.conflict("术语版本冲突：当前术语版本 " + document.termVersion()
                     + "，与期望的 " + request.expectedTermVersion() + " 不一致");
         }
-        List<TermRuleRow> rules = new ArrayList<>();
-        Set<List<String>> seen = new HashSet<>();
-        for (ApiDtos.TermRuleInput input : request.rules()) {
-            String language = normalizeLanguage(input.language());
-            if (!document.targetLanguages().contains(language)) {
-                throw ApiException.unprocessable("术语规则语言不在文档目标语言中: " + language);
-            }
-            if (!seen.add(List.of(input.sourceTerm(), language))) {
-                throw ApiException.unprocessable(
-                        "术语规则重复: " + input.sourceTerm() + "/" + language);
-            }
-            rules.add(new TermRuleRow(input.sourceTerm(), language, input.requiredTranslation()));
-        }
+        List<TermRuleRow> rules = TermRules.normalize(request.rules(), document.targetLanguages());
         int termVersion = document.termVersion() + 1;
         repository.insertTermVersion(documentId, termVersion);
         for (TermRuleRow rule : rules) {
@@ -182,6 +181,7 @@ public class TranslationService {
     @Transactional
     public ApiDtos.PublishResponse publish(long documentId, ApiDtos.PublishRequest request) {
         DocumentRow document = lockDocument(documentId);
+        rejectIfTermFrozen(documentId, "冻结窗口内不得发布新版本");
         if (document.draftVersion() != request.expectedDraftVersion()
                 || document.publishedVersion() != request.expectedPublishedVersion()) {
             throw ApiException.conflict("版本冲突：当前草稿版本 " + document.draftVersion()
@@ -222,7 +222,7 @@ public class TranslationService {
                     throw ApiException.unprocessable("批准已失效: " + segment.segmentId() + "/" + language
                             + "，源文或译文版本已改变");
                 }
-                termViolations.addAll(findViolations(
+                termViolations.addAll(TermRules.findViolations(
                         segment.sourceText(), language, translation.content(), termRules));
             }
         }
@@ -282,7 +282,7 @@ public class TranslationService {
         for (TranslationRow translation : repository.listTranslations(documentId)) {
             SegmentRow segment = segments.get(translation.segmentId());
             List<ApiDtos.TermRuleView> violations = segment == null ? List.of()
-                    : findViolations(segment.sourceText(), translation.language(),
+                    : TermRules.findViolations(segment.sourceText(), translation.language(),
                             translation.content(), termRules);
             statuses.add(new ApiDtos.TranslationTermStatus(translation.segmentId(), translation.language(),
                     translation.translationVersion(), translation.termVersion(),
@@ -294,6 +294,17 @@ public class TranslationService {
     private DocumentRow lockDocument(long documentId) {
         return repository.findDocumentForUpdate(documentId)
                 .orElseThrow(() -> ApiException.notFound("文档不存在: " + documentId));
+    }
+
+    /**
+     * 冻结窗口拦截：调用方已持有文档行锁，此时刻存在 [start_at,end_at) 覆盖当前时刻的窗口即 409。
+     * 左闭右开：start_at 时刻起生效，end_at 时刻自动解冻；行锁串行保证与解冻更新不产生混合状态。
+     */
+    private void rejectIfTermFrozen(long documentId, String reason) {
+        long now = clock.instant().toEpochMilli();
+        if (repository.findActiveFreeze(documentId, now).isPresent()) {
+            throw ApiException.conflict(reason);
+        }
     }
 
     private SegmentRow findSegmentOrThrow(long documentId, String segmentId) {
@@ -323,28 +334,8 @@ public class TranslationService {
         return normalized;
     }
 
-    /**
-     * 术语违规判定：源文按 Unicode 原文、区分大小写做连续子串匹配；仅源文命中 sourceTerm 的规则参与校验，
-     * 译文正文（同样区分大小写）不含 requiredTranslation 即为违规。返回全部违规规则。
-     */
-    private static List<ApiDtos.TermRuleView> findViolations(String sourceText, String language, String content,
-                                                             List<TermRuleRow> rules) {
-        List<ApiDtos.TermRuleView> violations = new ArrayList<>();
-        for (TermRuleRow rule : rules) {
-            if (rule.language().equals(language) && sourceText.contains(rule.sourceTerm())
-                    && !content.contains(rule.requiredTranslation())) {
-                violations.add(toRuleView(rule));
-            }
-        }
-        return violations;
-    }
-
     private static List<ApiDtos.TermRuleView> toRuleViews(List<TermRuleRow> rules) {
-        return rules.stream().map(TranslationService::toRuleView).toList();
-    }
-
-    private static ApiDtos.TermRuleView toRuleView(TermRuleRow rule) {
-        return new ApiDtos.TermRuleView(rule.sourceTerm(), rule.language(), rule.requiredTranslation());
+        return rules.stream().map(TermRules::toView).toList();
     }
 
     /** 生成完整只读快照 JSON：全部段落源文及各语言译文、作者、审核人、版本号与固化的术语版本及规则集。 */

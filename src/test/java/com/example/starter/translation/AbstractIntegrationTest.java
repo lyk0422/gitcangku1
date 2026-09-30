@@ -6,6 +6,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.context.annotation.Import;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
@@ -13,15 +14,18 @@ import org.springframework.test.web.servlet.MvcResult;
 import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
 import org.springframework.test.web.servlet.request.MockMvcRequestBuilders;
 
+import java.time.Instant;
 import java.util.UUID;
 
 /**
  * 集成测试基类：独立 H2 内存库（translation_test），每个用例前清空全部业务表，
  * 避免用例间顺序依赖；测试上下文关闭时连接池关闭，内存库随之释放。
+ * 时钟使用可控时钟（{@link ControlledClock}），默认固定在基准 UTC 时刻。
  */
 @SpringBootTest
 @AutoConfigureMockMvc
 @ActiveProfiles("test")
+@Import(ControlledClock.Config.class)
 public abstract class AbstractIntegrationTest {
 
     @Autowired
@@ -33,14 +37,21 @@ public abstract class AbstractIntegrationTest {
     @Autowired
     protected ObjectMapper objectMapper;
 
+    @Autowired
+    protected ControlledClock clock;
+
     @BeforeEach
     void cleanTables() {
+        clock.reset();
         jdbc.update("DELETE FROM approval");
         jdbc.update("DELETE FROM translation");
         jdbc.update("DELETE FROM segment");
         jdbc.update("DELETE FROM release_snapshot");
         jdbc.update("DELETE FROM term_rule");
         jdbc.update("DELETE FROM term_version");
+        jdbc.update("DELETE FROM freeze_affected_segment");
+        jdbc.update("DELETE FROM freeze_term_update");
+        jdbc.update("DELETE FROM term_freeze");
         jdbc.update("DELETE FROM request_log");
         jdbc.update("DELETE FROM document");
     }
@@ -128,6 +139,29 @@ public abstract class AbstractIntegrationTest {
         String body = "{\"requestId\":\"" + requestId + "\",\"expectedTermVersion\":" + expectedTermVersion
                 + ",\"rules\":" + rulesJson + "}";
         return putJson("/api/documents/" + documentId + "/terms", body);
+    }
+
+    /** 创建冻结窗口：起止时间为 UTC epoch 毫秒，左闭右开。 */
+    protected ApiResult createFreeze(long documentId, long startAt, long endAt, String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"startAt\":" + startAt
+                + ",\"endAt\":" + endAt + "}";
+        return putJson("/api/documents/" + documentId + "/freezes", body);
+    }
+
+    /** 窗口结束后的首次术语更新：rulesJson 为规则数组 JSON。 */
+    protected ApiResult updateTermsAfterFreeze(long documentId, int freezeId, int expectedTermVersion,
+                                               String rulesJson, String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"freezeId\":" + freezeId
+                + ",\"expectedTermVersion\":" + expectedTermVersion + ",\"rules\":" + rulesJson + "}";
+        return postJson("/api/documents/" + documentId + "/freezes/" + freezeId + "/terms", body);
+    }
+
+    protected ApiResult getFreeze(long documentId, int freezeId) throws Exception {
+        return getJson("/api/documents/" + documentId + "/freezes/" + freezeId);
+    }
+
+    protected ApiResult listFreezes(long documentId) throws Exception {
+        return getJson("/api/documents/" + documentId + "/freezes");
     }
 
     /** HTTP 响应结果：状态码与 JSON 响应体。 */

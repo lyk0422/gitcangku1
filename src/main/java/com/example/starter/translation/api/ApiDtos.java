@@ -125,6 +125,48 @@ public final class ApiDtos {
     public record TermStatusResponse(long documentId, int termVersion, List<TranslationTermStatus> translations) {
     }
 
+    /**
+     * 创建术语冻结窗口请求：绑定当前术语版本，区间为 UTC epoch 毫秒、左闭右开。
+     * startAt 不早请求视为立即生效；endAt 必须严格晚于 startAt。
+     */
+    public record CreateFreezeRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @PositiveOrZero(message = "startAt 不能为负数") long startAt,
+            @Positive(message = "endAt 必须为正数") long endAt) {
+    }
+
+    /** 受影响段落视图：段落、语言及解冻更新时整单校验所依据的源文版本。 */
+    public record AffectedSegmentView(String segmentId, String language, int sourceVersion) {
+    }
+
+    /**
+     * 解冻后术语更新请求：指定要解冻的窗口，携带期望术语版本与完整规则集。
+     * 窗口结束后才允许执行；窗口内提交返回 409。
+     */
+    public record UpdateTermsAfterFreezeRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @Positive(message = "freezeId 必须为正数") int freezeId,
+            @PositiveOrZero(message = "expectedTermVersion 不能为负数") int expectedTermVersion,
+            @NotNull(message = "rules 不能为空") @Size(max = 100, message = "术语规则最多 100 条")
+            List<@Valid TermRuleInput> rules) {
+    }
+
+    /** 冻结窗口视图：窗口区间（UTC epoch 毫秒）、绑定术语版本、状态及草稿术语版本。 */
+    public record FreezeView(long documentId, int freezeId, int termVersion, long startAt, long endAt,
+                             String status, int draftTermVersion, Integer updatedTermVersion,
+                             List<AffectedSegmentView> affectedSegments) {
+    }
+
+    /** 创建冻结窗口响应。 */
+    public record FreezeResponse(long documentId, int freezeId, int termVersion, long startAt, long endAt,
+                                 String status, int draftVersion) {
+    }
+
+    /** 解冻更新响应：新术语版本、草稿版本及受影响段落。 */
+    public record FreezeUpdateResponse(long documentId, int freezeId, int termVersion, int ruleCount,
+                                       int draftVersion, List<AffectedSegmentView> affectedSegments) {
+    }
+
     /** 统一错误响应；violations 仅在术语违规 422 时返回，含全部违规术语。 */
     @JsonInclude(JsonInclude.Include.NON_NULL)
     public record ErrorResponse(String error, String message, List<TermRuleView> violations) {
