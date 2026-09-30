@@ -33,4 +33,14 @@ public class DeviceRepository {
     public void updateCurrentVersion(String deviceId, String newVersion) {
         jdbc.update("UPDATE device SET current_version = ? WHERE device_id = ?", newVersion, deviceId);
     }
+
+    /**
+     * 按 device_id 升序返回全部登记设备，供画像投放筛选目标。
+     */
+    public java.util.List<Device> findAll() {
+        return jdbc.query("SELECT device_id, model, current_version, bucket_no FROM device"
+                        + " ORDER BY device_id",
+                (rs, rowNum) -> new Device(rs.getString("device_id"), rs.getString("model"),
+                        rs.getString("current_version"), rs.getInt("bucket_no")));
+    }
 }

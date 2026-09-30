@@ -63,6 +63,60 @@ CREATE TABLE IF NOT EXISTS release_resume_record (
   PRIMARY KEY (id)
 ) COMMENT='发布单人工恢复记录，历史不可改';
 
+CREATE TABLE IF NOT EXISTS firmware_version (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '固件版本ID',
+  name VARCHAR(64) NOT NULL COMMENT '版本名，全局唯一',
+  models VARCHAR(512) NOT NULL COMMENT '兼容型号集合，逗号分隔，至少一个',
+  min_memory_mb INT NOT NULL COMMENT '最低内存要求，单位MB，取值>=0',
+  required_tags VARCHAR(512) NOT NULL COMMENT '必需能力标签，逗号分隔，空串表示无要求',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  PRIMARY KEY (id),
+  CONSTRAINT uk_firmware_version_name UNIQUE (name)
+) COMMENT='固件版本兼容声明：型号集合、最低内存与必需能力标签';
+
+CREATE TABLE IF NOT EXISTS device_profile (
+  device_id VARCHAR(64) NOT NULL COMMENT '设备ID，对应device表',
+  model VARCHAR(64) NULL COMMENT '画像型号，NULL表示缺少该字段，筛选时按不兼容处理',
+  memory_mb INT NULL COMMENT '画像内存，单位MB，NULL表示缺少该字段，筛选时按不兼容处理',
+  tags VARCHAR(512) NULL COMMENT '能力标签，逗号分隔，NULL表示缺少该字段，筛选时按不兼容处理',
+  profile_version INT NOT NULL COMMENT '画像版本，从1开始，每次更新加一；任务只引用一个完整画像版本',
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近更新时间',
+  PRIMARY KEY (device_id)
+) COMMENT='设备硬件画像，更新只影响后续新任务，不追改已下发任务';
+
+CREATE TABLE IF NOT EXISTS profile_launch (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '投放单ID',
+  request_id VARCHAR(64) NOT NULL COMMENT '投放请求ID，全局唯一；同键重放首次目标清单，异参返回409',
+  version_id BIGINT NOT NULL COMMENT '发布人选择的固件版本ID',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  PRIMARY KEY (id),
+  CONSTRAINT uk_launch_request UNIQUE (request_id)
+) COMMENT='硬件画像投放单：一次按当次冻结画像筛选目标的发布动作';
+
+CREATE TABLE IF NOT EXISTS profile_task (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '任务ID',
+  launch_id BIGINT NOT NULL COMMENT '所属投放单ID',
+  device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
+  profile_version INT NOT NULL COMMENT '筛选时冻结的画像版本，供失败率审计，下发后不可改',
+  status VARCHAR(16) NOT NULL COMMENT 'PENDING待回执；SUCCESS成功；FAILED失败',
+  first_result VARCHAR(16) NULL COMMENT '首次回执结果（SUCCESS/FAILED），未回执为NULL',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
+  PRIMARY KEY (id),
+  CONSTRAINT uk_ptask_launch_device UNIQUE (launch_id, device_id)
+) COMMENT='画像投放任务，仅兼容设备创建；同设备同投放单最多一条';
+
+CREATE TABLE IF NOT EXISTS profile_exclusion (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '排除记录ID',
+  launch_id BIGINT NOT NULL COMMENT '所属投放单ID',
+  device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
+  profile_version INT NULL COMMENT '评估时画像版本，设备无画像为NULL',
+  reason VARCHAR(256) NOT NULL COMMENT '排除原因（无画像、缺字段、型号不匹配、内存不足、缺必需标签）',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  PRIMARY KEY (id),
+  CONSTRAINT uk_pex_launch_device UNIQUE (launch_id, device_id)
+) COMMENT='投放排除记录：不兼容设备及原因，不计入失败率';
+
 CREATE TABLE IF NOT EXISTS idempotency_record (
   request_id VARCHAR(64) NOT NULL COMMENT '全局唯一请求ID',
   api VARCHAR(64) NOT NULL COMMENT '接口标识',
