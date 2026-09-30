@@ -4,10 +4,21 @@ CREATE TABLE IF NOT EXISTS batch (
     batch_key VARCHAR(64) NOT NULL COMMENT '批次业务键，全局唯一，创建后不可修改',
     product_code VARCHAR(64) NOT NULL COMMENT '产品编码，创建后不可修改',
     batch_no VARCHAR(64) NOT NULL COMMENT '批号，创建后不可修改',
-    produced_at VARCHAR(40) NOT NULL COMMENT '生产时间，ISO-8601 UTC  instant 字符串',
+    produced_at VARCHAR(40) NOT NULL COMMENT '生产时间，ISO-8601 UTC instant 字符串',
     status VARCHAR(32) NOT NULL COMMENT '批次状态：QUARANTINED/PENDING_RELEASE/RELEASE_REVIEW/RELEASED/REJECTED/RECALLED/SPLIT',
+    cleaning_generation INT NOT NULL COMMENT '生产线清洁代次，非负整数；批次保存时取请求值，后续仅可由清洁事件单调递增；合批子批固化合批时所用代次，不随后续清洁改写',
     created_at VARCHAR(40) NOT NULL COMMENT '创建时间，ISO-8601 UTC instant 字符串',
     CONSTRAINT uk_batch_key UNIQUE (batch_key)
+);
+
+-- 批次过敏原集合：保存时已规范化（去空白、去重、按 Unicode 代码点稳定排序），seq 从 1 开始即规范顺序；
+-- 无过敏原则该表无行。比较集合一律逐行比对，禁止未转义字符串拼接。
+CREATE TABLE IF NOT EXISTS batch_allergen (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    batch_key VARCHAR(64) NOT NULL COMMENT '所属批次业务键',
+    allergen VARCHAR(128) NOT NULL COMMENT '单个过敏原标识（如 milk/peanut），批次内唯一，已 trim',
+    seq INT NOT NULL COMMENT '规范化后的稳定顺序，从 1 开始，按 Unicode 代码点升序',
+    CONSTRAINT uk_batch_allergen UNIQUE (batch_key, allergen)
 );
 
 CREATE TABLE IF NOT EXISTS batch_required_test (
@@ -48,7 +59,7 @@ CREATE TABLE IF NOT EXISTS recall (
 );
 
 CREATE TABLE IF NOT EXISTS command_log (
-    command_type VARCHAR(32) NOT NULL COMMENT '命令类型：CREATE_BATCH/SUBMIT_TEST/APPROVE/RECALL/SPLIT',
+    command_type VARCHAR(32) NOT NULL COMMENT '命令类型：CREATE_BATCH/SUBMIT_TEST/APPROVE/RECALL/SPLIT/MERGE/UPDATE_CLEANING_GENERATION',
     command_key VARCHAR(64) NOT NULL COMMENT '命令幂等键；同类型同键同参重放返回首次结果，同键改参返回 409',
     fingerprint VARCHAR(64) NOT NULL COMMENT '业务参数（不含 commandKey）的 SHA-256 摘要，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行成功的 HTTP 状态码',
@@ -65,4 +76,22 @@ CREATE TABLE IF NOT EXISTS batch_lineage (
     seq INT NOT NULL COMMENT '子批在拆分请求中的顺序，从 1 开始',
     created_at VARCHAR(40) NOT NULL COMMENT '拆分时间，ISO-8601 UTC instant 字符串',
     CONSTRAINT uk_lineage_child UNIQUE (child_key)
+);
+
+-- 合批冻结依据：合批成功后写入，创建后不可改写；后续父批清洁或过敏原变更不影响本表与子批快照。
+CREATE TABLE IF NOT EXISTS batch_merge (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键，同时作为合批创建顺序依据',
+    child_key VARCHAR(64) NOT NULL COMMENT '合批子批业务键，全局唯一；子批过敏原与清洁代次以本表依据为准',
+    cleaning_generation INT NOT NULL COMMENT '合批时全部父批共同使用的有效清洁代次，子批固化该值，后续清洁不改写',
+    created_at VARCHAR(40) NOT NULL COMMENT '合批时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_merge_child UNIQUE (child_key)
+);
+
+-- 合批父子关系：仅记录哪些父批参与合批（按请求去重后排序，seq 从 1 开始），不涉及数量分摊；不可改写。
+CREATE TABLE IF NOT EXISTS batch_merge_parent (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    child_key VARCHAR(64) NOT NULL COMMENT '合批子批业务键',
+    parent_key VARCHAR(64) NOT NULL COMMENT '参与合批的父批业务键，合批时必须均为 RELEASED',
+    seq INT NOT NULL COMMENT '父批规范化（业务键排序）后的顺序，从 1 开始',
+    CONSTRAINT uk_merge_parent UNIQUE (child_key, parent_key)
 );

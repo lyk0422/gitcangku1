@@ -1,17 +1,22 @@
 package com.example.starter.batch;
 
+import com.example.starter.batch.dto.AllergenProfileResponse;
 import com.example.starter.batch.dto.ApprovalResponse;
 import com.example.starter.batch.dto.ApproveRequest;
 import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
+import com.example.starter.batch.dto.CleaningGenerationResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
 import com.example.starter.batch.dto.LineageEntryResponse;
+import com.example.starter.batch.dto.MergeRequest;
+import com.example.starter.batch.dto.MergeResponse;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.RecallResponse;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SplitResponse;
 import com.example.starter.batch.dto.SubmitTestRequest;
 import com.example.starter.batch.dto.TestResultResponse;
+import com.example.starter.batch.dto.UpdateCleaningGenerationRequest;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
@@ -33,13 +38,16 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.function.Supplier;
 
 /**
  * 批次隔离与放行核心服务。
  *
- * <p>并发策略：同一批次的检验/批准/召回在事务内对 batch 行 SELECT ... FOR UPDATE 串行化，
- * 按事务提交顺序生效；commandKey 幂等通过 command_log 主键 + 参数指纹实现，
+ * <p>并发策略：同一批次的检验/批准/召回/清洁在事务内对 batch 行 SELECT ... FOR UPDATE 串行化，
+ * 按事务提交顺序生效；合批对全部父批按业务键排序后依次加同样的行锁（锁顺序全局确定，避免死锁），
+ * 因此并发清洁更新只能在合批事务之前或之后整体生效，不会产生混合代次子批。
+ * commandKey 幂等通过 command_log 主键 + 参数指纹实现，
  * 同键同参重放返回首次响应快照，同键改参返回 409；仅成功命令写入 command_log。
  */
 @Service
@@ -50,6 +58,8 @@ public class BatchService {
     private static final String CMD_APPROVE = "APPROVE";
     private static final String CMD_RECALL = "RECALL";
     private static final String CMD_SPLIT = "SPLIT";
+    private static final String CMD_MERGE = "MERGE";
+    private static final String CMD_CLEANING = "UPDATE_CLEANING_GENERATION";
 
     /**
      * 指纹拼接分隔符（NUL）：业务参数不可能包含该字符，避免拼接碰撞。
@@ -72,26 +82,43 @@ public class BatchService {
 
     /**
      * 创建批次：初始状态 QUARANTINED；batchKey 全局唯一，重复返回 409。
+     * 过敏原集合保存时规范化（trim、去重、稳定排序）；cleaningGeneration 缺省为 0。
      */
     public StoredResponse createBatch(CreateBatchRequest req) {
         List<String> items = req.requiredTests().stream().map(String::trim).toList();
         if (new HashSet<>(items).size() != items.size()) {
             throw ApiException.badRequest("requiredTests 存在重复检验项");
         }
-        String fingerprint = fingerprint("create", req.batchKey(), req.productCode(), req.batchNo(),
-                req.producedAt().toString(), String.join(SEP, items));
+        List<String> allergens = Allergens.normalize(req.allergens());
+        int cleaningGeneration = req.cleaningGeneration() == null ? 0 : req.cleaningGeneration();
+        List<String> parts = new ArrayList<>();
+        parts.add("create");
+        parts.add(req.batchKey());
+        parts.add(req.productCode());
+        parts.add(req.batchNo());
+        parts.add(req.producedAt().toString());
+        parts.add("required-count=" + items.size());
+        parts.addAll(items);
+        parts.add("cleaning-generation=" + cleaningGeneration);
+        parts.addAll(Allergens.fingerprintParts(allergens));
+        String fingerprint = fingerprint(parts.toArray(new String[0]));
         return executeIdempotent(CMD_CREATE, req.commandKey(), fingerprint, () -> {
             repo.findBatch(req.batchKey()).ifPresent(b -> {
                 throw ApiException.conflict("batchKey 已存在: " + req.batchKey());
             });
             String now = now();
             repo.insertBatch(new BatchRepository.BatchRow(0L, req.batchKey(), req.productCode(),
-                    req.batchNo(), req.producedAt().toString(), BatchStatus.QUARANTINED.name(), now));
+                    req.batchNo(), req.producedAt().toString(), BatchStatus.QUARANTINED.name(),
+                    cleaningGeneration, now));
             for (int i = 0; i < items.size(); i++) {
                 repo.insertRequiredTest(req.batchKey(), items.get(i), i + 1);
             }
+            for (int i = 0; i < allergens.size(); i++) {
+                repo.insertAllergen(req.batchKey(), allergens.get(i), i + 1);
+            }
             BatchResponse body = new BatchResponse(req.batchKey(), req.productCode(), req.batchNo(),
-                    req.producedAt(), BatchStatus.QUARANTINED, items, Instant.parse(now));
+                    req.producedAt(), BatchStatus.QUARANTINED, items, Instant.parse(now),
+                    allergens, cleaningGeneration);
             return new StoredResponse(201, toJson(body));
         });
     }
@@ -290,6 +317,175 @@ public class BatchService {
     }
 
     /**
+     * 生产线清洁代次更新：新代次必须大于当前代次（单调递增，不允许回退或原地不变）。
+     * 行锁串行化与合批的竞争：合批持全部父批行锁期间清洁更新阻塞，代次不会在合批校验与
+     * 子批固化之间被改动；同键同参重放首次结果，同键改参 409。
+     */
+    public StoredResponse updateCleaningGeneration(String batchKey, UpdateCleaningGenerationRequest req) {
+        int target = req.cleaningGeneration();
+        String fingerprint = fingerprint("cleaning", batchKey, String.valueOf(target));
+        return executeIdempotent(CMD_CLEANING, req.commandKey(), fingerprint, () -> {
+            BatchRepository.BatchRow batch = repo.findBatchForUpdate(batchKey)
+                    .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+            // 行锁后重查命令快照：并发同键请求可能已由对方提交
+            var logged = loggedResponse(CMD_CLEANING, req.commandKey(), fingerprint);
+            if (logged.isPresent()) {
+                return logged.get();
+            }
+            int current = batch.cleaningGeneration();
+            if (target < current) {
+                throw ApiException.unprocessable("清洁代次只能单调递增：批次 " + batchKey
+                        + " 当前代次 " + current + "，请求代次 " + target + " 已过期");
+            }
+            if (target == current) {
+                throw ApiException.conflict("清洁代次未变化：批次 " + batchKey + " 当前代次 " + current);
+            }
+            String now = now();
+            repo.updateCleaningGeneration(batchKey, target);
+            CleaningGenerationResponse body = new CleaningGenerationResponse(
+                    batchKey, target, Instant.parse(now));
+            return new StoredResponse(200, toJson(body));
+        });
+    }
+
+    /**
+     * 合批：2～10 个已放行（RELEASED）父批合并为一个全新子批。
+     *
+     * <p>前置条件（任一不满足整单 422，不生成子批、不改变任何父批状态或数量）：
+     * ① 全部父批存在且均为 RELEASED（任一仍隔离/被拒/召回/已拆分即拒绝）；
+     * ② 全部父批规范化过敏原集合完全相同（逐元素比较，非字符串拼接）；
+     * ③ 全部父批当前清洁代次为同一有效值（任一不同即视为代次过期）。
+     * 通过后子批固化父批共有过敏原集合与所用代次（写入 batch_merge，不可改写），
+     * 必做检验项为全部父批必做项的去重并集（稳定排序），子批初始 QUARANTINED。
+     *
+     * <p>幂等：父批键集合先 trim、去重、按业务键排序后再参与指纹，因此父批换序视为同参，
+     * 重放返回首次子批及过敏原/代次快照；换父批集合或子批参数返回 409。
+     */
+    public StoredResponse merge(MergeRequest req) {
+        List<String> rawParents = req.parents().stream().map(String::trim).toList();
+        if (new HashSet<>(rawParents).size() != rawParents.size()) {
+            throw ApiException.badRequest("parents 存在重复父批 batchKey");
+        }
+        List<String> parents = new ArrayList<>(new TreeSet<>(rawParents));
+        if (req.childBatchKey().isBlank()) {
+            throw ApiException.badRequest("childBatchKey 不能为空");
+        }
+
+        List<String> parts = new ArrayList<>();
+        parts.add("merge");
+        parts.add(req.childBatchKey());
+        parts.add(req.childBatchNo());
+        parts.add(req.productCode());
+        parts.add("parent-count=" + parents.size());
+        parts.addAll(parents);
+        String fingerprint = fingerprint(parts.toArray(new String[0]));
+        return executeIdempotent(CMD_MERGE, req.commandKey(), fingerprint, () -> {
+            // 按业务键全局顺序依次锁定全部父批：与清洁更新、其他合批的锁顺序一致，避免死锁，
+            // 并保证所有父批的状态/过敏原/代次读取自同一串行化时点
+            List<BatchRepository.BatchRow> parentRows = new ArrayList<>(parents.size());
+            for (String parentKey : parents) {
+                BatchRepository.BatchRow row = repo.findBatchForUpdate(parentKey)
+                        .orElseThrow(() -> ApiException.notFound("父批不存在: " + parentKey));
+                parentRows.add(row);
+            }
+            // 全部父批行锁后重查命令快照：并发同键请求在锁等待期间可能已由对方提交
+            var logged = loggedResponse(CMD_MERGE, req.commandKey(), fingerprint);
+            if (logged.isPresent()) {
+                return logged.get();
+            }
+
+            List<String> reasons = new ArrayList<>();
+            // ① 状态：全部必须 RELEASED，且任一父批均无被召回的祖先（沿用拆分的可用性约定）
+            for (BatchRepository.BatchRow row : parentRows) {
+                if (!BatchStatus.RELEASED.name().equals(row.status())) {
+                    reasons.add("父批 " + row.batchKey() + " 当前状态 " + row.status()
+                            + "，未处于 RELEASED（仍隔离或不可合批）");
+                }
+            }
+            Map<String, String> parentOf = childToParent();
+            Set<String> recalledKeys = new HashSet<>(repo.findRecalledKeys());
+            for (String parentKey : parents) {
+                recalledAncestor(parentKey, parentOf, recalledKeys).ifPresent(ancestor ->
+                        reasons.add("父批 " + parentKey + " 的祖先批次 " + ancestor
+                                + " 已召回，该父批不可用于合批"));
+            }
+            // ② 过敏原集合完全相同（逐元素比较）
+            List<String> baselineAllergens = repo.findAllergens(parents.get(0));
+            for (int i = 1; i < parents.size(); i++) {
+                List<String> other = repo.findAllergens(parents.get(i));
+                if (!Allergens.same(baselineAllergens, other)) {
+                    reasons.add("父批 " + parents.get(i) + " 过敏原集合 " + other
+                            + " 与父批 " + parents.get(0) + " 的集合 " + baselineAllergens
+                            + " 不兼容");
+                }
+            }
+            // ③ 清洁代次同一有效值（任一不同即代次过期）
+            int baselineGeneration = parentRows.get(0).cleaningGeneration();
+            for (BatchRepository.BatchRow row : parentRows) {
+                if (row.cleaningGeneration() != baselineGeneration) {
+                    reasons.add("父批 " + row.batchKey() + " 清洁代次 " + row.cleaningGeneration()
+                            + " 与共同有效代次 " + baselineGeneration + " 不一致（代次过期）");
+                }
+            }
+            if (!reasons.isEmpty()) {
+                throw ApiException.unprocessable("合批前置条件不满足: " + String.join("; ", reasons));
+            }
+
+            if (repo.findBatch(req.childBatchKey()).isPresent()) {
+                throw ApiException.conflict("子批 batchKey 已存在: " + req.childBatchKey());
+            }
+
+            // 必做检验项：全部父批的去重并集，按代码点稳定排序
+            TreeSet<String> requiredUnion = new TreeSet<>(Allergens.codePointComparator());
+            for (String parentKey : parents) {
+                requiredUnion.addAll(repo.findRequiredTests(parentKey));
+            }
+            List<String> required = List.copyOf(requiredUnion);
+
+            String now = now();
+            // 子批固化父批共有过敏原集合与所用清洁代次；后续任何父批清洁都不改写该快照
+            repo.insertBatch(new BatchRepository.BatchRow(0L, req.childBatchKey(), req.productCode(),
+                    req.childBatchNo(), now, BatchStatus.QUARANTINED.name(),
+                    baselineGeneration, now));
+            for (int i = 0; i < required.size(); i++) {
+                repo.insertRequiredTest(req.childBatchKey(), required.get(i), i + 1);
+            }
+            for (int i = 0; i < baselineAllergens.size(); i++) {
+                repo.insertAllergen(req.childBatchKey(), baselineAllergens.get(i), i + 1);
+            }
+            repo.insertMerge(new BatchRepository.MergeRow(0L, req.childBatchKey(),
+                    baselineGeneration, now));
+            for (int i = 0; i < parents.size(); i++) {
+                repo.insertMergeParent(req.childBatchKey(), parents.get(i), i + 1);
+            }
+            MergeResponse body = new MergeResponse(req.childBatchKey(), req.childBatchNo(),
+                    req.productCode(), BatchStatus.QUARANTINED, required, List.copyOf(parents),
+                    List.copyOf(baselineAllergens), baselineGeneration, Instant.parse(now));
+            return new StoredResponse(201, toJson(body));
+        });
+    }
+
+    /**
+     * 过敏原/清洁代次档案：展示批次自身规范化过敏原集合、当前清洁代次；
+     * 合批子批额外返回冻结依据（合批时过敏原集合、所用代次、参与父批、合批时间）。
+     */
+    public AllergenProfileResponse allergenProfile(String batchKey) {
+        BatchRepository.BatchRow batch = repo.findBatch(batchKey)
+                .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+        List<String> allergens = repo.findAllergens(batchKey);
+        AllergenProfileResponse.FrozenMergeBasis frozen = repo.findMerge(batchKey)
+                .map(m -> new AllergenProfileResponse.FrozenMergeBasis(
+                        // 子批过敏原行即合批时固化的集合，创建后无任何改写路径
+                        List.copyOf(repo.findAllergens(batchKey)),
+                        m.cleaningGeneration(),
+                        List.copyOf(repo.findMergeParents(batchKey)),
+                        Instant.parse(m.createdAt())))
+                .orElse(null);
+        return new AllergenProfileResponse(batchKey, BatchStatus.valueOf(batch.status()),
+                allergens, batch.cleaningGeneration(), frozen);
+    }
+
+    /**
      * 幂等执行：同事务内先查 command_log，命中则按指纹返回快照或 409；
      * 未命中执行业务动作并写入快照。并发同键插入冲突时重试，读取已提交结果。
      */
@@ -343,7 +539,8 @@ public class BatchService {
     private BatchResponse toBatchResponse(BatchRepository.BatchRow row) {
         return new BatchResponse(row.batchKey(), row.productCode(), row.batchNo(),
                 Instant.parse(row.producedAt()), BatchStatus.valueOf(row.status()),
-                repo.findRequiredTests(row.batchKey()), Instant.parse(row.createdAt()));
+                repo.findRequiredTests(row.batchKey()), Instant.parse(row.createdAt()),
+                List.copyOf(repo.findAllergens(row.batchKey())), row.cleaningGeneration());
     }
 
     private TestResultResponse toTestResponse(BatchRepository.TestRow row, String batchStatus) {
@@ -399,7 +596,8 @@ public class BatchService {
         return Instant.now().toString();
     }
 
-    private String fingerprint(String... parts) {        String canonical = String.join(SEP, parts);
+    private String fingerprint(String... parts) {
+        String canonical = String.join(SEP, parts);
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             byte[] hash = digest.digest(canonical.getBytes(StandardCharsets.UTF_8));
@@ -416,8 +614,8 @@ public class BatchService {
 
     /**
      * 拆分：仅当前可用的 RELEASED 批次可一次拆成 2～5 个全新子批。
-     * 子批继承产品编码、生产 UTC 时间与必做检验项，初始 QUARANTINED，
-     * 不继承检验或批准记录；父批置为 SPLIT 不再可用。
+     * 子批继承产品编码、生产 UTC 时间、必做检验项、过敏原集合与当前清洁代次快照，
+     * 初始 QUARANTINED，不继承检验或批准记录；父批置为 SPLIT 不再可用。
      * 创建全部子批、血缘关系与父批状态在同一事务提交；任一子批键已存在或重复，整次 409 且父批不变。
      */
     public StoredResponse split(String parentKey, SplitRequest req) {
@@ -455,13 +653,19 @@ public class BatchService {
             }
             String now = now();
             List<String> required = repo.findRequiredTests(parentKey);
+            // 继承父批过敏原集合与当前清洁代次快照；父子此后各自独立，父批后续清洁不回写子批
+            List<String> allergens = repo.findAllergens(parentKey);
             List<SplitResponse.SplitChild> childBodies = new ArrayList<>(children.size());
             for (int i = 0; i < children.size(); i++) {
                 SplitRequest.ChildSpec spec = children.get(i);
                 repo.insertBatch(new BatchRepository.BatchRow(0L, spec.batchKey(), parent.productCode(),
-                        spec.batchNo(), parent.producedAt(), BatchStatus.QUARANTINED.name(), now));
+                        spec.batchNo(), parent.producedAt(), BatchStatus.QUARANTINED.name(),
+                        parent.cleaningGeneration(), now));
                 for (int j = 0; j < required.size(); j++) {
                     repo.insertRequiredTest(spec.batchKey(), required.get(j), j + 1);
+                }
+                for (int j = 0; j < allergens.size(); j++) {
+                    repo.insertAllergen(spec.batchKey(), allergens.get(j), j + 1);
                 }
                 repo.insertLineage(new BatchRepository.LineageRow(0L, parentKey, spec.batchKey(),
                         i + 1, now));

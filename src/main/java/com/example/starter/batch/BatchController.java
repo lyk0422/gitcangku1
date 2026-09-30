@@ -1,13 +1,16 @@
 package com.example.starter.batch;
 
+import com.example.starter.batch.dto.AllergenProfileResponse;
 import com.example.starter.batch.dto.ApproveRequest;
 import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
 import com.example.starter.batch.dto.LineageEntryResponse;
+import com.example.starter.batch.dto.MergeRequest;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
+import com.example.starter.batch.dto.UpdateCleaningGenerationRequest;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
@@ -112,6 +115,32 @@ public class BatchController {
     @GetMapping("/{batchKey}/descendants")
     public List<LineageEntryResponse> descendants(@PathVariable String batchKey) {
         return service.listDescendants(batchKey);
+    }
+
+    /**
+     * 合批：2～10 个已放行父批合并为一个全新子批；过敏原集合不兼容、代次过期或任一父批仍隔离时 422。
+     */
+    @PostMapping("/merges")
+    public ResponseEntity<String> merge(@Valid @RequestBody MergeRequest request) {
+        return stored(service.merge(request));
+    }
+
+    /**
+     * 清洁代次更新：单调递增；与合批事务互斥（行锁），不会产生混合版本子批。
+     */
+    @PostMapping("/{batchKey}/cleaning-generation")
+    public ResponseEntity<String> updateCleaningGeneration(
+            @PathVariable String batchKey,
+            @Valid @RequestBody UpdateCleaningGenerationRequest request) {
+        return stored(service.updateCleaningGeneration(batchKey, request));
+    }
+
+    /**
+     * 过敏原与冻结依据查询：父批展示自身集合与当前代次；合批子批展示固化集合、固化代次与参与父批。
+     */
+    @GetMapping("/{batchKey}/allergen-profile")
+    public AllergenProfileResponse allergenProfile(@PathVariable String batchKey) {
+        return service.allergenProfile(batchKey);
     }
 
     private ResponseEntity<String> stored(StoredResponse response) {

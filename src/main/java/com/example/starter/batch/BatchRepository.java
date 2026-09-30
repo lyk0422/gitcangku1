@@ -15,9 +15,10 @@ public class BatchRepository {
 
     /**
      * batch 表行记录；id 同时作为同批次事件的提交顺序依据。
+     * cleaningGeneration 为批次当前生产线清洁代次（合批子批为合批时固化值）。
      */
     public record BatchRow(long id, String batchKey, String productCode, String batchNo,
-                           String producedAt, String status, String createdAt) {
+                           String producedAt, String status, int cleaningGeneration, String createdAt) {
     }
 
     /**
@@ -54,10 +55,16 @@ public class BatchRepository {
     public record LineageRow(long id, String parentKey, String childKey, int seq, String createdAt) {
     }
 
+    /**
+     * batch_merge 表行记录：合批冻结依据，创建后不可改写。
+     */
+    public record MergeRow(long id, String childKey, int cleaningGeneration, String createdAt) {
+    }
+
     private static final RowMapper<BatchRow> BATCH_MAPPER = (rs, n) -> new BatchRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("product_code"),
             rs.getString("batch_no"), rs.getString("produced_at"),
-            rs.getString("status"), rs.getString("created_at"));
+            rs.getString("status"), rs.getInt("cleaning_generation"), rs.getString("created_at"));
 
     private static final RowMapper<TestRow> TEST_MAPPER = (rs, n) -> new TestRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("test_key"),
@@ -81,6 +88,10 @@ public class BatchRepository {
             rs.getLong("id"), rs.getString("parent_key"), rs.getString("child_key"),
             rs.getInt("seq"), rs.getString("created_at"));
 
+    private static final RowMapper<MergeRow> MERGE_MAPPER = (rs, n) -> new MergeRow(
+            rs.getLong("id"), rs.getString("child_key"), rs.getInt("cleaning_generation"),
+            rs.getString("created_at"));
+
     private final JdbcTemplate jdbc;
 
     public BatchRepository(JdbcTemplate jdbc) {
@@ -93,7 +104,7 @@ public class BatchRepository {
     }
 
     /**
-     * 行锁读取批次，串行化同一批次上的检验/批准/召回事务。
+     * 行锁读取批次，串行化同一批次上的检验/批准/召回/清洁/合批事务。
      */
     public Optional<BatchRow> findBatchForUpdate(String batchKey) {
         return jdbc.query("SELECT * FROM batch WHERE batch_key = ? FOR UPDATE", BATCH_MAPPER, batchKey)
@@ -101,10 +112,10 @@ public class BatchRepository {
     }
 
     public void insertBatch(BatchRow row) {
-        jdbc.update("INSERT INTO batch (batch_key, product_code, batch_no, produced_at, status, created_at)"
-                        + " VALUES (?, ?, ?, ?, ?, ?)",
+        jdbc.update("INSERT INTO batch (batch_key, product_code, batch_no, produced_at, status,"
+                        + " cleaning_generation, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 row.batchKey(), row.productCode(), row.batchNo(), row.producedAt(),
-                row.status(), row.createdAt());
+                row.status(), row.cleaningGeneration(), row.createdAt());
     }
 
     public void insertRequiredTest(String batchKey, String testItem, int seq) {
@@ -118,8 +129,30 @@ public class BatchRepository {
                 String.class, batchKey);
     }
 
+    public void insertAllergen(String batchKey, String allergen, int seq) {
+        jdbc.update("INSERT INTO batch_allergen (batch_key, allergen, seq) VALUES (?, ?, ?)",
+                batchKey, allergen, seq);
+    }
+
+    /**
+     * 批次的规范化过敏原集合，按稳定顺序（seq）返回；无过敏原为空列表。
+     */
+    public List<String> findAllergens(String batchKey) {
+        return jdbc.queryForList(
+                "SELECT allergen FROM batch_allergen WHERE batch_key = ? ORDER BY seq",
+                String.class, batchKey);
+    }
+
     public void updateStatus(String batchKey, String status) {
         jdbc.update("UPDATE batch SET status = ? WHERE batch_key = ?", status, batchKey);
+    }
+
+    /**
+     * 单调更新清洁代次；调用方须在事务内持批次行锁并已校验新值大于现值。
+     */
+    public void updateCleaningGeneration(String batchKey, int cleaningGeneration) {
+        jdbc.update("UPDATE batch SET cleaning_generation = ? WHERE batch_key = ?",
+                cleaningGeneration, batchKey);
     }
 
     public List<BatchRow> findAvailableBatches() {
@@ -208,5 +241,33 @@ public class BatchRepository {
     public List<String> findRecalledKeys() {
         return jdbc.queryForList("SELECT batch_key FROM batch WHERE status = 'RECALLED'",
                 String.class);
+    }
+
+    public void insertMerge(MergeRow row) {
+        jdbc.update("INSERT INTO batch_merge (child_key, cleaning_generation, created_at)"
+                        + " VALUES (?, ?, ?)",
+                row.childKey(), row.cleaningGeneration(), row.createdAt());
+    }
+
+    /**
+     * 合批冻结依据；非合批子批返回空。
+     */
+    public Optional<MergeRow> findMerge(String childKey) {
+        return jdbc.query("SELECT * FROM batch_merge WHERE child_key = ?", MERGE_MAPPER, childKey)
+                .stream().findFirst();
+    }
+
+    public void insertMergeParent(String childKey, String parentKey, int seq) {
+        jdbc.update("INSERT INTO batch_merge_parent (child_key, parent_key, seq) VALUES (?, ?, ?)",
+                childKey, parentKey, seq);
+    }
+
+    /**
+     * 参与合批的父批业务键，按规范化顺序（seq）返回。
+     */
+    public List<String> findMergeParents(String childKey) {
+        return jdbc.queryForList(
+                "SELECT parent_key FROM batch_merge_parent WHERE child_key = ? ORDER BY seq",
+                String.class, childKey);
     }
 }

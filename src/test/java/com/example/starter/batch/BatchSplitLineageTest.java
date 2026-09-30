@@ -51,6 +51,9 @@ class BatchSplitLineageTest {
         jdbc.update("DELETE FROM test_result");
         jdbc.update("DELETE FROM batch_required_test");
         jdbc.update("DELETE FROM batch_lineage");
+        jdbc.update("DELETE FROM batch_merge_parent");
+        jdbc.update("DELETE FROM batch_merge");
+        jdbc.update("DELETE FROM batch_allergen");
         jdbc.update("DELETE FROM batch");
     }
 
@@ -549,11 +552,12 @@ class BatchSplitLineageTest {
 
     private String createBody(String batchKey, List<String> items) throws Exception {
         return objectMapper.writeValueAsString(new CreateCmd("CK-C-" + unique(), batchKey, "PROD-1",
-                "LOT-1", Instant.parse("2026-01-02T03:04:05Z"), items));
+                "LOT-1", Instant.parse("2026-01-02T03:04:05Z"), items, List.of(), 0));
     }
 
     private record CreateCmd(String commandKey, String batchKey, String productCode, String batchNo,
-                             Instant producedAt, List<String> requiredTests) {
+                             Instant producedAt, List<String> requiredTests,
+                             List<String> allergens, Integer cleaningGeneration) {
     }
 
     private void createBatch(String batchKey, List<String> items, int expected) throws Exception {

@@ -50,6 +50,9 @@ class BatchFlowTest {
         jdbc.update("DELETE FROM test_result");
         jdbc.update("DELETE FROM batch_required_test");
         jdbc.update("DELETE FROM batch_lineage");
+        jdbc.update("DELETE FROM batch_merge_parent");
+        jdbc.update("DELETE FROM batch_merge");
+        jdbc.update("DELETE FROM batch_allergen");
         jdbc.update("DELETE FROM batch");
     }
 
@@ -231,7 +234,8 @@ class BatchFlowTest {
 
         // 同 commandKey 改参（批号不同）→ 409
         String changed = objectMapper.writeValueAsString(new CreateCmd("CK-1", batchKey + "-X",
-                "p", "n-changed", Instant.parse("2026-03-01T00:00:00Z"), List.of("t1")));
+                "p", "n-changed", Instant.parse("2026-03-01T00:00:00Z"), List.of("t1"),
+                List.of(), 0));
         mockMvc.perform(post("/api/batches")
                         .contentType(MediaType.APPLICATION_JSON).content(changed))
                 .andExpect(status().isConflict());
@@ -496,7 +500,8 @@ class BatchFlowTest {
     // ---------- helpers ----------
 
     private record CreateCmd(String commandKey, String batchKey, String productCode, String batchNo,
-                             Instant producedAt, List<String> requiredTests) {
+                             Instant producedAt, List<String> requiredTests,
+                             List<String> allergens, Integer cleaningGeneration) {
     }
 
     private String unique() {
@@ -505,7 +510,7 @@ class BatchFlowTest {
 
     private String createBody(String batchKey, List<String> items) throws Exception {
         return objectMapper.writeValueAsString(new CreateCmd("CK-1", batchKey, "PROD-1", "LOT-1",
-                Instant.parse("2026-01-02T03:04:05Z"), items));
+                Instant.parse("2026-01-02T03:04:05Z"), items, List.of(), 0));
     }
 
     private void createBatch(String batchKey, List<String> items, int expectedStatus) throws Exception {
