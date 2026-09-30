@@ -63,12 +63,39 @@ public final class Responses {
     }
 
     /**
-     * 处置任务视图：blockers 按阻塞事件键排序；doneBy/doneAt 仅 DONE 有值，
-     * cancelledBy/cancelledAt 仅 CANCELLED 有值。
+     * 任务派发记录视图：冻结派发当时的凭据版本快照（credentialVersion/type/region/expiresAt），
+     * 历史执行依据不随后续凭据更新而改变。status 为 DISPATCHED/BLOCKED/SUPERSEDED；
+     * blockReason 仅 BLOCKED 有值（CREDENTIAL_EXPIRED/CREDENTIAL_REVOKED）；
+     * blockedAt 仅 BLOCKED 有值，supersededAt 仅 SUPERSEDED 有值。
+     */
+    public record DispatchView(long id, String requestId, String resourceKey, int credentialVersion,
+                               String credentialType, String region, Instant credentialExpiresAt,
+                               String status, String blockReason, String dispatchedBy,
+                               Instant dispatchedAt, Instant blockedAt, Instant supersededAt) {
+    }
+
+    /**
+     * 资源凭据视图：version 为资源内递增版本号；status 为 ACTIVE/REVOKED；
+     * expiresAt 为 UTC 失效时刻（当前时刻 ≥ expiresAt 即视为过期）；revokedAt 仅 REVOKED 有值。
+     */
+    public record CredentialView(String resourceKey, int version, String credentialType, String region,
+                                 Instant expiresAt, String status, String createdBy,
+                                 Instant revokedAt, Instant createdAt) {
+    }
+
+    /**
+     * 处置任务视图：blockers 按阻塞事件键排序；
+     * credentialVersion 为最近一次成功派发绑定的凭据版本，未派发为 null，BLOCKED 时保留阻断所依据版本；
+     * blockReason 仅 BLOCKED 有值（CREDENTIAL_EXPIRED/CREDENTIAL_REVOKED）；
+     * executingBy/executingAt 进入 EXECUTING 后有值；doneBy/doneAt 仅 DONE 有值，
+     * cancelledBy/cancelledAt 仅 CANCELLED 有值；dispatches 为按派发顺序返回的全部派发记录。
      */
     public record TaskView(String taskKey, String groupCode, String title, String status,
-                           List<TaskBlockerView> blockers, String createdBy, Instant createdAt,
-                           String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt) {
+                           String resourceKey, String region, Integer credentialVersion,
+                           String blockReason, List<TaskBlockerView> blockers,
+                           String createdBy, String executingBy, Instant executingAt,
+                           String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt,
+                           List<DispatchView> dispatches) {
     }
 
     /** 按事件分组的任务列表视图：tasks 按创建顺序返回。 */

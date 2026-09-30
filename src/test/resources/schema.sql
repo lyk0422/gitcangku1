@@ -77,12 +77,18 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     task_key VARCHAR(128) NOT NULL,
     group_code VARCHAR(64) NOT NULL,
     title VARCHAR(512) NOT NULL,
+    resource_key VARCHAR(128) NOT NULL,
+    region VARCHAR(64) NOT NULL,
     status VARCHAR(16) NOT NULL,
     created_by VARCHAR(128) NOT NULL,
+    executing_by VARCHAR(128) NULL,
+    executing_at TIMESTAMP(6) NULL,
     done_by VARCHAR(128) NULL,
     done_at TIMESTAMP(6) NULL,
     cancelled_by VARCHAR(128) NULL,
     cancelled_at TIMESTAMP(6) NULL,
+    credential_version INT NULL,
+    block_reason VARCHAR(32) NULL,
     created_at TIMESTAMP(6) NOT NULL,
     updated_at TIMESTAMP(6) NOT NULL,
     CONSTRAINT uk_task_key UNIQUE (incident_id, task_key)
@@ -98,4 +104,45 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS resource_credentials (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    resource_key VARCHAR(128) NOT NULL,
+    version INT NOT NULL,
+    credential_type VARCHAR(64) NOT NULL,
+    region VARCHAR(64) NOT NULL,
+    expires_at TIMESTAMP(6) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    created_by VARCHAR(128) NOT NULL,
+    revoked_at TIMESTAMP(6) NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_credential_version UNIQUE (resource_key, version)
+);
+
+CREATE TABLE IF NOT EXISTS resource_credential_lock (
+    id TINYINT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS task_dispatches (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    task_id BIGINT NOT NULL,
+    request_id VARCHAR(128) NOT NULL,
+    resource_key VARCHAR(128) NOT NULL,
+    credential_id BIGINT NOT NULL,
+    credential_version INT NOT NULL,
+    credential_type VARCHAR(64) NOT NULL,
+    region VARCHAR(64) NOT NULL,
+    credential_expires_at TIMESTAMP(6) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    block_reason VARCHAR(32) NULL,
+    dispatched_by VARCHAR(128) NOT NULL,
+    dispatched_at TIMESTAMP(6) NOT NULL,
+    blocked_at TIMESTAMP(6) NULL,
+    superseded_at TIMESTAMP(6) NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_dispatch_request UNIQUE (task_id, request_id)
 );

@@ -1,6 +1,10 @@
 package com.example.starter.incident;
 
+import java.util.List;
+
 import com.example.starter.incident.dto.Requests.ActionRequest;
+import com.example.starter.incident.dto.Requests.CredentialRegisterRequest;
+import com.example.starter.incident.dto.Requests.CredentialRevokeRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
 import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
@@ -8,9 +12,11 @@ import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
 import com.example.starter.incident.dto.Requests.TaskActionRequest;
 import com.example.starter.incident.dto.Requests.TaskCreateRequest;
+import com.example.starter.incident.dto.Requests.TaskDispatchRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
+import com.example.starter.incident.dto.Responses.CredentialView;
 import com.example.starter.incident.dto.Responses.EscalationHistoryView;
 import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
@@ -144,13 +150,36 @@ public class IncidentController {
     }
 
     /**
-     * 创建处置任务（仅当前指挥人；阻塞事件 0~5 个，拒绝环依赖）。
+     * 创建处置任务（仅当前指挥人；须声明执行资源 resourceKey 与区域 region；
+     * 阻塞事件 0~5 个，拒绝环依赖）。
      */
     @PostMapping("/{incidentKey}/tasks")
     public TaskView createTask(@PathVariable String incidentKey,
                                @RequestHeader("X-Actor-Id") String actor,
                                @RequestBody TaskCreateRequest req) {
         return service.createTask(incidentKey, actor, req);
+    }
+
+    /**
+     * 派发任务（仅当前指挥人）：校验凭据类型、覆盖区域与 UTC 有效期，
+     * 记录派发当时的凭据版本；requestId 同键重放首次任务与凭据版本。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/dispatch")
+    public TaskView dispatchTask(@PathVariable String incidentKey, @PathVariable String taskKey,
+                                 @RequestHeader("X-Actor-Id") String actor,
+                                 @RequestBody TaskDispatchRequest req) {
+        return service.dispatchTask(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 执行前检查并进入执行状态（仅当前指挥人）：针对派发冻结的凭据版本复检，
+     * 通过则 DISPATCHED→EXECUTING，过期/撤销则转 BLOCKED。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/execute")
+    public TaskView executeTask(@PathVariable String incidentKey, @PathVariable String taskKey,
+                                @RequestHeader("X-Actor-Id") String actor,
+                                @RequestBody TaskActionRequest req) {
+        return service.startTask(incidentKey, taskKey, actor, req);
     }
 
     /**
@@ -170,7 +199,8 @@ public class IncidentController {
     }
 
     /**
-     * 完成任务（仅当前指挥人；全部阻塞解除后才可完成）。
+     * 完成任务（仅当前指挥人；须先派发并通过执行前检查处于 EXECUTING；
+     * BLOCKED 不能直接完成；全部阻塞解除后才可完成）。
      */
     @PostMapping("/{incidentKey}/tasks/{taskKey}/complete")
     public TaskView completeTask(@PathVariable String incidentKey, @PathVariable String taskKey,
@@ -180,12 +210,39 @@ public class IncidentController {
     }
 
     /**
-     * 取消任务（仅当前指挥人；仅 OPEN 可取消）。
+     * 取消任务（仅当前指挥人；非终态 OPEN/DISPATCHED/EXECUTING/BLOCKED 均可取消）。
      */
     @PostMapping("/{incidentKey}/tasks/{taskKey}/cancel")
     public TaskView cancelTask(@PathVariable String incidentKey, @PathVariable String taskKey,
                                @RequestHeader("X-Actor-Id") String actor,
                                @RequestBody TaskActionRequest req) {
         return service.cancelTask(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 登记资源凭据新版本（X-Actor-Id 为登记人）：同资源版本号自增，初始 ACTIVE。
+     */
+    @PostMapping("/credentials")
+    public ResponseEntity<CredentialView> registerCredential(
+            @RequestHeader("X-Actor-Id") String actor,
+            @RequestBody CredentialRegisterRequest req) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(service.registerCredential(actor, req));
+    }
+
+    /**
+     * 查询资源全部凭据版本（按版本号升序）。
+     */
+    @GetMapping("/credentials/{resourceKey}")
+    public List<CredentialView> listCredentials(@PathVariable String resourceKey) {
+        return service.listCredentials(resourceKey);
+    }
+
+    /**
+     * 撤销指定资源的指定版本凭据（撤销不可逆）。
+     */
+    @PostMapping("/credentials/revoke")
+    public CredentialView revokeCredential(@RequestHeader("X-Actor-Id") String actor,
+                                           @RequestBody CredentialRevokeRequest req) {
+        return service.revokeCredential(actor, req);
     }
 }

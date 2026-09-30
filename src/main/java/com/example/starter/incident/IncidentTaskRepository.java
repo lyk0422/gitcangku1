@@ -26,6 +26,7 @@ import org.springframework.stereotype.Repository;
  * 处置任务及跨事件阻塞关系的 JDBC 仓储。
  * 所有写路径均处于先锁定事件行的写事务内；创建任务额外持有 task_graph_lock 单行锁，
  * 使环检测与边写入相对其他创建串行化，保证并发反向依赖下最终图无环。
+ * 任务状态转移使用带当前状态条件的 UPDATE，受影响行数 0 表示已被并发事务抢先转移。
  */
 @Repository
 public class IncidentTaskRepository {
@@ -42,16 +43,25 @@ public class IncidentTaskRepository {
     private static final RowMapper<IncidentTask> TASK_MAPPER = (rs, n) -> mapTask(rs);
 
     private static IncidentTask mapTask(ResultSet rs) throws SQLException {
+        Timestamp executingAt = rs.getTimestamp("executing_at");
         Timestamp doneAt = rs.getTimestamp("done_at");
         Timestamp cancelledAt = rs.getTimestamp("cancelled_at");
+        int credentialVersionValue = rs.getInt("credential_version");
+        boolean credentialVersionNull = rs.wasNull();
         return new IncidentTask(
                 rs.getLong("id"), rs.getLong("incident_id"), rs.getString("task_key"),
                 rs.getString("group_code"), rs.getString("title"),
+                rs.getString("resource_key"), rs.getString("region"),
                 TaskStatus.valueOf(rs.getString("status")),
-                rs.getString("created_by"), rs.getString("done_by"),
+                rs.getString("created_by"),
+                rs.getString("executing_by"),
+                executingAt == null ? null : executingAt.toInstant(),
+                rs.getString("done_by"),
                 doneAt == null ? null : doneAt.toInstant(),
                 rs.getString("cancelled_by"),
                 cancelledAt == null ? null : cancelledAt.toInstant(),
+                credentialVersionNull ? null : credentialVersionValue,
+                rs.getString("block_reason"),
                 rs.getTimestamp("created_at").toInstant(),
                 rs.getTimestamp("updated_at").toInstant());
     }
@@ -69,22 +79,36 @@ public class IncidentTaskRepository {
         KeyHolder keys = new GeneratedKeyHolder();
         jdbc.update(con -> {
             var ps = con.prepareStatement(
-                    "INSERT INTO incident_tasks (incident_id, task_key, group_code, title, status,"
-                            + " created_by, done_by, done_at, cancelled_by, cancelled_at,"
-                            + " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO incident_tasks (incident_id, task_key, group_code, title,"
+                            + " resource_key, region, status, created_by, executing_by, executing_at,"
+                            + " done_by, done_at, cancelled_by, cancelled_at, credential_version,"
+                            + " block_reason, created_at, updated_at)"
+                            + " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setLong(1, task.incidentId());
             ps.setString(2, task.taskKey());
             ps.setString(3, task.groupCode());
             ps.setString(4, task.title());
-            ps.setString(5, task.status().name());
-            ps.setString(6, task.createdBy());
-            ps.setString(7, task.doneBy());
-            ps.setTimestamp(8, task.doneAt() == null ? null : Timestamp.from(task.doneAt()));
-            ps.setString(9, task.cancelledBy());
-            ps.setTimestamp(10, task.cancelledAt() == null ? null : Timestamp.from(task.cancelledAt()));
-            ps.setTimestamp(11, Timestamp.from(task.createdAt()));
-            ps.setTimestamp(12, Timestamp.from(task.updatedAt()));
+            ps.setString(5, task.resourceKey());
+            ps.setString(6, task.region());
+            ps.setString(7, task.status().name());
+            ps.setString(8, task.createdBy());
+            ps.setString(9, task.executingBy());
+            ps.setTimestamp(10, task.executingAt() == null ? null
+                    : Timestamp.from(task.executingAt()));
+            ps.setString(11, task.doneBy());
+            ps.setTimestamp(12, task.doneAt() == null ? null : Timestamp.from(task.doneAt()));
+            ps.setString(13, task.cancelledBy());
+            ps.setTimestamp(14, task.cancelledAt() == null ? null
+                    : Timestamp.from(task.cancelledAt()));
+            if (task.credentialVersion() == null) {
+                ps.setObject(15, null);
+            } else {
+                ps.setInt(15, task.credentialVersion());
+            }
+            ps.setString(16, task.blockReason());
+            ps.setTimestamp(17, Timestamp.from(task.createdAt()));
+            ps.setTimestamp(18, Timestamp.from(task.updatedAt()));
             return ps;
         }, keys);
         return keys.getKey().longValue();
@@ -109,11 +133,13 @@ public class IncidentTaskRepository {
     }
 
     /**
-     * 查询事件仍 OPEN 的任务（解决门禁用），按创建顺序返回。
+     * 查询事件未进入终态（DONE/CANCELLED）的任务（解决门禁用），按创建顺序返回。
+     * BLOCKED 任务同样视为未完成，仍会阻止事件进入 RESOLVED。
      */
     public List<IncidentTask> listOpenByIncident(long incidentId) {
-        return jdbc.query("SELECT * FROM incident_tasks WHERE incident_id = ? AND status = 'OPEN'"
-                + " ORDER BY id", TASK_MAPPER, incidentId);
+        return jdbc.query("SELECT * FROM incident_tasks WHERE incident_id = ?"
+                        + " AND status NOT IN ('DONE','CANCELLED') ORDER BY id",
+                TASK_MAPPER, incidentId);
     }
 
     /**
@@ -126,20 +152,55 @@ public class IncidentTaskRepository {
     }
 
     /**
-     * 将 OPEN 任务置为 DONE，记录完成人与 UTC 时刻。
+     * 派发转移：OPEN 或 BLOCKED → DISPATCHED，记录派发所依据的凭据版本并清除阻断原因。
+     * 返回受影响行数；0 表示任务当前状态不允许派发（终态或已 DISPATCHED/EXECUTING）。
      */
-    public void markDone(long id, String actor, Instant at) {
-        jdbc.update("UPDATE incident_tasks SET status = 'DONE', done_by = ?, done_at = ?,"
-                        + " updated_at = ? WHERE id = ?",
+    public int transitionToDispatched(long id, int credentialVersion, Instant at) {
+        return jdbc.update("UPDATE incident_tasks SET status = 'DISPATCHED', credential_version = ?,"
+                        + " block_reason = NULL, updated_at = ? WHERE id = ?"
+                        + " AND status IN ('OPEN','BLOCKED')",
+                credentialVersion, Timestamp.from(at), id);
+    }
+
+    /**
+     * 执行启动转移：DISPATCHED → EXECUTING，记录启动人与 UTC 时刻。
+     * 返回受影响行数；0 表示任务已被并发转移（如已阻断或已完成）。
+     */
+    public int transitionToExecuting(long id, String actor, Instant at) {
+        return jdbc.update("UPDATE incident_tasks SET status = 'EXECUTING', executing_by = ?,"
+                        + " executing_at = ?, updated_at = ? WHERE id = ? AND status = 'DISPATCHED'",
                 actor, Timestamp.from(at), Timestamp.from(at), id);
     }
 
     /**
-     * 将 OPEN 任务置为 CANCELLED，记录取消人与 UTC 时刻。
+     * 阻断转移：DISPATCHED 或 EXECUTING → BLOCKED，记录阻断原因与所依据的凭据版本。
+     * 返回受影响行数；0 表示任务已不在可阻断状态（如已完成）。
      */
-    public void markCancelled(long id, String actor, Instant at) {
-        jdbc.update("UPDATE incident_tasks SET status = 'CANCELLED', cancelled_by = ?,"
-                        + " cancelled_at = ?, updated_at = ? WHERE id = ?",
+    public int transitionToBlocked(long id, int credentialVersion, String reason, Instant at) {
+        return jdbc.update("UPDATE incident_tasks SET status = 'BLOCKED', credential_version = ?,"
+                        + " block_reason = ?, updated_at = ? WHERE id = ?"
+                        + " AND status IN ('DISPATCHED','EXECUTING')",
+                credentialVersion, reason, Timestamp.from(at), id);
+    }
+
+    /**
+     * 完成转移：EXECUTING → DONE，记录完成人与 UTC 时刻。
+     * 返回受影响行数；0 表示任务未处于执行状态。
+     */
+    public int transitionToDone(long id, String actor, Instant at) {
+        return jdbc.update("UPDATE incident_tasks SET status = 'DONE', done_by = ?, done_at = ?,"
+                        + " updated_at = ? WHERE id = ? AND status = 'EXECUTING'",
+                actor, Timestamp.from(at), Timestamp.from(at), id);
+    }
+
+    /**
+     * 取消转移：任何非终态 → CANCELLED，记录取消人与 UTC 时刻。
+     * 返回受影响行数；0 表示任务已为 DONE/CANCELLED。
+     */
+    public int transitionToCancelled(long id, String actor, Instant at) {
+        return jdbc.update("UPDATE incident_tasks SET status = 'CANCELLED', cancelled_by = ?,"
+                        + " cancelled_at = ?, updated_at = ? WHERE id = ?"
+                        + " AND status NOT IN ('DONE','CANCELLED')",
                 actor, Timestamp.from(at), Timestamp.from(at), id);
     }
 

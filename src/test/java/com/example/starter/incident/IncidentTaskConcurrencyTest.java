@@ -2,6 +2,8 @@ package com.example.starter.incident;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -12,11 +14,13 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
+import com.example.starter.incident.dto.Requests.CredentialRegisterRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
 import com.example.starter.incident.dto.Requests.TaskActionRequest;
 import com.example.starter.incident.dto.Requests.TaskCreateRequest;
+import com.example.starter.incident.dto.Requests.TaskDispatchRequest;
 import com.example.starter.incident.dto.Responses.IncidentView;
 import com.example.starter.incident.dto.Responses.TaskView;
 import org.junit.jupiter.api.BeforeEach;
@@ -30,9 +34,14 @@ import org.springframework.jdbc.core.JdbcTemplate;
  * 处置任务并发边界测试：验证依赖图全局锁下并发反向依赖不成环、
  * 任务完成与目标事件遏制/当前事件解决按事务提交顺序形成合法结果、
  * 同 commandKey 并发单次生效及每事件 20 个任务上限的并发兜底。
+ * 完成路径要求任务先派发并通过执行前检查进入 EXECUTING。
  */
 @SpringBootTest
 class IncidentTaskConcurrencyTest {
+
+    private static final String RESOURCE = "RES-R";
+    private static final String REGION = "A";
+    private static final String CRED_TYPE = "TOKEN";
 
     @Autowired
     private IncidentService service;
@@ -46,8 +55,10 @@ class IncidentTaskConcurrencyTest {
         jdbc.update("DELETE FROM incident_status_history");
         jdbc.update("DELETE FROM incident_transfers");
         jdbc.update("DELETE FROM incident_actions");
+        jdbc.update("DELETE FROM task_dispatches");
         jdbc.update("DELETE FROM incident_task_blockers");
         jdbc.update("DELETE FROM incident_tasks");
+        jdbc.update("DELETE FROM resource_credentials");
         jdbc.update("DELETE FROM incidents");
     }
 
@@ -55,9 +66,30 @@ class IncidentTaskConcurrencyTest {
         return "CMD-" + UUID.randomUUID();
     }
 
+    private static String reqId() {
+        return "REQ-" + UUID.randomUUID();
+    }
+
     private void commanding(String incidentKey, String commander) {
         service.report(new ReportRequest(incidentKey, "S2", "并发场景", "reporter-1"));
         service.takeover(incidentKey, commander, new TakeoverRequest(key()));
+    }
+
+    private void registerValidCredential(String actor) {
+        service.registerCredential(actor, new CredentialRegisterRequest(key(), RESOURCE,
+                CRED_TYPE, REGION, Instant.now().plus(1, ChronoUnit.HOURS)));
+    }
+
+    private TaskView readyToExecute(String incidentKey, String actor, String taskKey,
+                                    List<String> blockers) {
+        TaskView created = service.createTask(incidentKey, actor, new TaskCreateRequest(key(),
+                taskKey, "G", "t", RESOURCE, REGION, blockers));
+        service.dispatchTask(incidentKey, taskKey, actor,
+                new TaskDispatchRequest(reqId(), RESOURCE, CRED_TYPE));
+        TaskView executing = service.startTask(incidentKey, taskKey, actor,
+                new TaskActionRequest(key()));
+        assertThat(executing.status()).isEqualTo("EXECUTING");
+        return created;
     }
 
     /**
@@ -104,10 +136,10 @@ class IncidentTaskConcurrencyTest {
         commanding("INC-B", "bob");
         // 并发创建 A→B 与 B→A 反向依赖：环检测与写入串行一致，恰好一个成功
         List<Object> results = runConcurrently(List.of(
-                () -> service.createTask("INC-A", "alice",
-                        new TaskCreateRequest(key(), "T-1", "G", "t", List.of("INC-B"))),
-                () -> service.createTask("INC-B", "bob",
-                        new TaskCreateRequest(key(), "T-1", "G", "t", List.of("INC-A")))));
+                () -> service.createTask("INC-A", "alice", new TaskCreateRequest(key(), "T-1",
+                        "G", "t", RESOURCE, REGION, List.of("INC-B"))),
+                () -> service.createTask("INC-B", "bob", new TaskCreateRequest(key(), "T-1",
+                        "G", "t", RESOURCE, REGION, List.of("INC-A")))));
 
         long successes = results.stream().filter(TaskView.class::isInstance).count();
         assertThat(successes).isEqualTo(1);
@@ -125,8 +157,8 @@ class IncidentTaskConcurrencyTest {
     void concurrentCompleteAndBlockerContain_commitOrderWins() throws Exception {
         commanding("INC-A", "alice");
         commanding("INC-B", "bob");
-        service.createTask("INC-A", "alice",
-                new TaskCreateRequest(key(), "T-1", "G", "t", List.of("INC-B")));
+        registerValidCredential("alice");
+        readyToExecute("INC-A", "alice", "T-1", List.of("INC-B"));
 
         // 并发：完成 A 的任务（依赖 B）与遏制 B
         List<Object> results = runConcurrently(List.of(
@@ -142,8 +174,8 @@ class IncidentTaskConcurrencyTest {
             // 完成先看到已遏制的 B：成功，且阻塞确已解除
             assertThat(completeResult).isInstanceOf(TaskView.class);
         } else {
-            // 完成先提交：B 尚未遏制，409 拒绝，任务仍 OPEN
-            assertThat(task.status()).isEqualTo("OPEN");
+            // 完成先提交：B 尚未遏制，409 拒绝，任务仍 EXECUTING
+            assertThat(task.status()).isEqualTo("EXECUTING");
             assertThat(completeResult).isInstanceOfSatisfying(ApiException.class,
                     e -> assertThat(e.status()).isEqualTo(HttpStatus.CONFLICT));
         }
@@ -152,11 +184,11 @@ class IncidentTaskConcurrencyTest {
     @Test
     void concurrentCompleteAndResolve_gateConsistent() throws Exception {
         commanding("INC-A", "alice");
-        service.createTask("INC-A", "alice",
-                new TaskCreateRequest(key(), "T-1", "G", "t", List.of()));
+        registerValidCredential("alice");
+        readyToExecute("INC-A", "alice", "T-1", List.of());
         service.changeStatus("INC-A", "alice", new StatusRequest(key(), "CONTAINED"));
 
-        // 并发：完成唯一 OPEN 任务与推进 RESOLVED（解决门禁要求无 OPEN 任务）
+        // 并发：完成唯一未终态任务与推进 RESOLVED（解决门禁要求无未终态任务）
         List<Object> results = runConcurrently(List.of(
                 () -> service.completeTask("INC-A", "T-1", "alice", new TaskActionRequest(key())),
                 () -> service.changeStatus("INC-A", "alice", new StatusRequest(key(), "RESOLVED"))));
@@ -169,7 +201,7 @@ class IncidentTaskConcurrencyTest {
         if ("RESOLVED".equals(end.status())) {
             assertThat(resolveResult).isInstanceOf(IncidentView.class);
         } else {
-            // 解决先评估：仍有 OPEN 任务，门禁 409
+            // 解决先评估：任务仍 EXECUTING，门禁 409
             assertThat(end.status()).isEqualTo("CONTAINED");
             assertThat(resolveResult).isInstanceOfSatisfying(ApiException.class,
                     e -> assertThat(e.status()).isEqualTo(HttpStatus.CONFLICT));
@@ -182,8 +214,8 @@ class IncidentTaskConcurrencyTest {
         String commandKey = key();
         List<Callable<TaskView>> tasks = new ArrayList<>();
         for (int i = 0; i < 3; i++) {
-            tasks.add(() -> service.createTask("INC-A", "alice",
-                    new TaskCreateRequest(commandKey, "T-1", "G", "t", List.of())));
+            tasks.add(() -> service.createTask("INC-A", "alice", new TaskCreateRequest(commandKey,
+                    "T-1", "G", "t", RESOURCE, REGION, List.of())));
         }
         List<Object> results = runConcurrently(tasks);
 
@@ -205,8 +237,8 @@ class IncidentTaskConcurrencyTest {
         List<Callable<TaskView>> tasks = new ArrayList<>();
         for (int i = 1; i <= 25; i++) {
             String taskKey = "T-" + i;
-            tasks.add(() -> service.createTask("INC-A", "alice",
-                    new TaskCreateRequest(key(), taskKey, "G", "任务" + taskKey, List.of())));
+            tasks.add(() -> service.createTask("INC-A", "alice", new TaskCreateRequest(key(),
+                    taskKey, "G", "任务" + taskKey, RESOURCE, REGION, List.of())));
         }
         List<Object> results = runConcurrently(tasks);
 
