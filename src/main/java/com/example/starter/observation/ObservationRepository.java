@@ -102,4 +102,15 @@ public class ObservationRepository {
                 snapshot.observationId(), snapshot.version(), snapshot.location(),
                 snapshot.reading(), snapshot.note(), snapshot.deleted());
     }
+
+    /**
+     * 读取指定历史版本快照的落库时刻；版本不存在时返回空。供更正附录版本 0（原始快照）视图使用。
+     */
+    public Optional<java.time.Instant> findVersionCreatedAt(String observationId, int version) {
+        return jdbcTemplate.query(
+                        "SELECT created_at FROM observation_version WHERE observation_id = ? AND version = ?",
+                        (rs, rowNum) -> rs.getTimestamp("created_at").toInstant(),
+                        observationId, version)
+                .stream().findFirst();
+    }
 }

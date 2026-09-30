@@ -63,6 +63,13 @@ public class ApiException extends RuntimeException {
     }
 
     /**
+     * 422：簇尚未经冲突裁决解决，或更正旧值与裁决后的当前有效值不一致（试图绕过原有裁决）。
+     */
+    public static ApiException unprocessableEntity(String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, message, null, null);
+    }
+
+    /**
      * 410：记录已删除，拒绝新的修改和删除。
      */
     public static ApiException gone(String message) {

@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS observation_version (
 CREATE TABLE IF NOT EXISTS request_log (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
     fingerprint VARCHAR(128) NOT NULL COMMENT '请求操作与参数的指纹，同键异参时判定 409',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：CREATE / MERGE / DELETE / RESOLVE',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：CREATE / MERGE / DELETE / RESOLVE / CORRIGENDUM',
     response_status INT NULL COMMENT '成功响应的 HTTP 状态码；提交过程中暂为 NULL',
     response_body VARCHAR(4000) NULL COMMENT '成功响应体（JSON 原文），用于同键同参重放；提交过程中暂为 NULL',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '请求记录创建时间（服务器时区）',
@@ -57,5 +57,27 @@ CREATE TABLE IF NOT EXISTS conflict_resolution (
     -- 同一观测记录内 requestId 唯一，支撑解决请求的同参重放/异参 409。
     -- 不设置指向 observation_current 的外键：观测记录删除仅置墓碑（当前行保留），
     -- 且不可变解决历史必须在任何数据清理/归档场景下继续可查。
+    UNIQUE (observation_id, request_id)
+);
+
+-- 更正附录表：只追加、不可变，成功提交的附录永不更新或删除。
+-- 附录版本独立于观测快照版本：首份附录 corrigendum_version = 1、previous_version = 0；
+-- 历史观测快照（observation_version）与当前行始终只读，字段差异只能以新附录版本表达。
+CREATE TABLE IF NOT EXISTS observation_corrigendum (
+    corrigendum_id VARCHAR(128) NOT NULL COMMENT '全局唯一附录标识',
+    observation_id VARCHAR(64) NOT NULL COMMENT '观测记录唯一标识',
+    request_id VARCHAR(128) NOT NULL COMMENT '生成该附录的请求标识（requestId）',
+    corrigendum_version INT NOT NULL COMMENT '附录版本号，从 1 开始单调递增',
+    previous_version INT NOT NULL COMMENT '前一附录版本号；首份附录为 0（引用原始快照）',
+    snapshot_version INT NOT NULL COMMENT '引用的原始快照版本号（簇裁决生效后的观测版本）',
+    changes TEXT NOT NULL COMMENT '字段差异列表（JSON 数组原文，固定顺序 location/reading/note），每项含字段名及旧值、新值',
+    operator VARCHAR(128) NOT NULL COMMENT '提交附录的观测记录员标识',
+    submitted_at_utc TIMESTAMP NOT NULL COMMENT '附录提交完成时刻（UTC）',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录落库时间（服务器时区）',
+    PRIMARY KEY (corrigendum_id),
+    -- 同一观测记录内附录版本号唯一，支撑乐观并发：两个争用同一前置版本的更正只能一个提交
+    UNIQUE (observation_id, corrigendum_version),
+    -- 同一观测记录内 requestId 唯一，支撑附录请求的同参重放/换字段 409；
+    -- 不设指向 observation_current 的外键，理由同 conflict_resolution：墓碑与归档场景下不可变历史仍须可查。
     UNIQUE (observation_id, request_id)
 );
