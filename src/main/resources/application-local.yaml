@@ -1,0 +1,12 @@
+# 本地免外部依赖运行入口：H2 内存库（MODE=MySQL），随 JVM 退出数据丢失
+spring:
+  datasource:
+    url: jdbc:h2:mem:consent-local;MODE=MySQL;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema-h2.sql
+      data-locations: classpath:data-h2.sql
