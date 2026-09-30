@@ -19,6 +19,7 @@ import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
+import java.time.Clock;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
 import java.util.List;
@@ -46,14 +47,19 @@ public class WaterService {
     private static final Pattern KEY_PATTERN = Pattern.compile("[\\w.\\-:]{1,128}");
 
     private final WaterRepository repository;
+    private final EmergencyRepository emergencyRepository;
     private final TransactionTemplate tx;
     private final ObjectMapper objectMapper;
+    private final Clock clock;
 
-    public WaterService(WaterRepository repository, PlatformTransactionManager transactionManager,
-                        ObjectMapper objectMapper) {
+    public WaterService(WaterRepository repository, EmergencyRepository emergencyRepository,
+                        PlatformTransactionManager transactionManager, ObjectMapper objectMapper,
+                        Clock clock) {
         this.repository = repository;
+        this.emergencyRepository = emergencyRepository;
         this.tx = new TransactionTemplate(transactionManager);
         this.objectMapper = objectMapper;
+        this.clock = clock;
     }
 
     // ------------------------------------------------------------------
@@ -130,8 +136,10 @@ public class WaterService {
             }
             BigDecimal available = availableTotal(window);
             BigDecimal approved = repository.sumApprovedAmount(window.id());
-            if (approved.add(allocation.amount()).compareTo(available) > 0) {
-                throw ApiException.quotaExceeded("批准后将超过当前可用总量 " + fmt(available));
+            BigDecimal emergencyOutstanding = emergencyRepository.sumOutstandingByWindow(window.id());
+            if (approved.add(emergencyOutstanding).add(allocation.amount()).compareTo(available) > 0) {
+                throw ApiException.quotaExceeded("批准后普通分配与紧急预占之和将超过当前可用总量 "
+                        + fmt(available));
             }
             repository.updateAllocationStatus(allocation.id(), STATUS_APPROVED, nowNanos());
             return toAllocationResponse(repository.findAllocationByKey(allocationKey));
@@ -258,9 +266,11 @@ public class WaterService {
                 throw ApiException.conflict("CURTAILMENT_EXISTS", "窗口已存在生效中的限供");
             }
             BigDecimal approved = repository.sumApprovedAmount(windowId);
-            if (approved.compareTo(qty) > 0) {
-                throw ApiException.conflict("CURTAILMENT_BELOW_APPROVED",
-                        "当前已批准总量 " + fmt(approved) + " 超过拟定限供水量 " + fmt(qty));
+            BigDecimal emergencyOutstanding = emergencyRepository.sumOutstandingByWindow(windowId);
+            if (approved.add(emergencyOutstanding).compareTo(qty) > 0) {
+                throw ApiException.conflict("CURTAILMENT_BELOW_OCCUPIED",
+                        "当前普通已批准 " + fmt(approved) + " 与紧急预占 " + fmt(emergencyOutstanding)
+                                + " 之和超过拟定限供水量 " + fmt(qty));
             }
             long id = repository.insertCurtailment(windowId, qty, nowNanos());
             return toCurtailmentResponse(repository.findActiveCurtailment(windowId));
@@ -296,9 +306,11 @@ public class WaterService {
         CurtailmentRow active = repository.findActiveCurtailment(windowId);
         BigDecimal available = active != null ? active.volume() : window.plannedVolume();
         BigDecimal approved = repository.sumApprovedAmount(windowId);
+        BigDecimal emergencyOutstanding = emergencyRepository.sumOutstandingByWindow(windowId);
         return new CapacityResponse(window.id(), fmt(window.plannedVolume()),
                 active != null ? fmt(active.volume()) : null, fmt(available), fmt(approved),
-                fmt(available.subtract(approved)));
+                fmt(emergencyOutstanding),
+                fmt(available.subtract(approved).subtract(emergencyOutstanding)));
     }
 
     /** 查询窗口历史明细：窗口 + 全部申请 + 全部限供。 */
@@ -392,8 +404,13 @@ public class WaterService {
                 toIso(row.createdNanos()), row.cancelledNanos() == null ? null : toIso(row.cancelledNanos()));
     }
 
-    static long nowNanos() {
-        return toNanos(Instant.now());
+    long nowNanos() {
+        return nowNanos(clock);
+    }
+
+    /** 按给定时钟取 UTC 纳秒时间戳（测试可注入固定/可控时钟）。 */
+    static long nowNanos(Clock clock) {
+        return toNanos(Instant.now(clock));
     }
 
     /** Instant -> UTC 纳秒时间戳。 */
