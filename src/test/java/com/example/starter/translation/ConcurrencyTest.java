@@ -201,8 +201,7 @@ class ConcurrencyTest extends AbstractIntegrationTest {
 
     @Test
     @DisplayName("并发术语更新：同一期望版本仅一个成功，术语版本无丢失更新")
-    void concurrentTermUpdates() throws Exception {
-        long docId = createDocument(newRequestId(), "[\"en\"]", "[]");
+    void concurrentTermUpdates() throws Exception {        long docId = createDocument(newRequestId(), "[\"en\"]", "[]");
         int threads = 4;
         ExecutorService pool = Executors.newFixedThreadPool(threads);
         CountDownLatch gate = new CountDownLatch(1);
@@ -237,5 +236,111 @@ class ConcurrencyTest extends AbstractIntegrationTest {
         Integer termVersion = jdbc.queryForObject(
                 "SELECT term_version FROM document WHERE document_id = ?", Integer.class, docId);
         assertThat(termVersion).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("BINDING 签署并发：同一签署人并发重复签仅一条落库，另一请求 422；两名签署人各一条")
+    void concurrentDuplicateSignatures() throws Exception {
+        long docId = createDocument(newRequestId(), "[\"en\"]",
+                "[{\"segmentId\":\"s1\",\"sourceText\":\"原文\"}]");
+        updateLegalStatus(docId, "en", "BINDING", newRequestId());
+        submitTranslation(docId, "s1", "en", "alice", "v1", 1, newRequestId());
+        // 当前草稿版本 3
+
+        int threads = 4;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch gate = new CountDownLatch(1);
+        List<Future<ApiResult>> futures = new ArrayList<>();
+        // jia 并发两次（唯一约束只能成功一条），yi、bing 各一次
+        for (int i = 0; i < 2; i++) {
+            futures.add(pool.submit(() -> {
+                gate.await();
+                return sign(docId, "s1", "en", "jia", 1, newRequestId());
+            }));
+        }
+        futures.add(pool.submit(() -> {
+            gate.await();
+            return sign(docId, "s1", "en", "yi", 1, newRequestId());
+        }));
+        futures.add(pool.submit(() -> {
+            gate.await();
+            return sign(docId, "s1", "en", "bing", 1, newRequestId());
+        }));
+        gate.countDown();
+        int success = 0;
+        int unprocessable = 0;
+        for (Future<ApiResult> future : futures) {
+            int status = future.get(30, TimeUnit.SECONDS).status();
+            if (status == 201) {
+                success++;
+            } else if (status == 422) {
+                unprocessable++;
+            }
+        }
+        pool.shutdown();
+
+        assertThat(success).isEqualTo(3);
+        assertThat(unprocessable).isEqualTo(1);
+        assertThat(jdbc.queryForObject(
+                "SELECT COUNT(*) FROM translation_signature WHERE document_id = ?", Integer.class, docId))
+                .isEqualTo(3);
+        Integer distinctSigners = jdbc.queryForObject(
+                "SELECT COUNT(DISTINCT signer) FROM translation_signature WHERE document_id = ?",
+                Integer.class, docId);
+        assertThat(distinctSigners).isEqualTo(3);
+
+        // 三名不同签署人，BINDING 发布成功
+        assertThat(publish(docId, 3, 0, newRequestId()).status()).isEqualTo(201);
+    }
+
+    @Test
+    @DisplayName("BINDING 发布与译文修订并发：只提交一个一致的译文及签署版本，不产生混合快照")
+    void concurrentBindingPublishAndResubmit() throws Exception {
+        long docId = createDocument(newRequestId(), "[\"en\"]",
+                "[{\"segmentId\":\"s1\",\"sourceText\":\"原文\"}]");
+        updateLegalStatus(docId, "en", "BINDING", newRequestId());
+        submitTranslation(docId, "s1", "en", "alice", "v1", 1, newRequestId());
+        sign(docId, "s1", "en", "jia", 1, newRequestId());
+        sign(docId, "s1", "en", "yi", 1, newRequestId());
+        // 建文档 1 + 切状态 1 + 提交 1 = 3；签署不递增草稿版本
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        CountDownLatch gate = new CountDownLatch(1);
+        Future<ApiResult> publishFuture = pool.submit(() -> {
+            gate.await();
+            return publish(docId, 3, 0, newRequestId());
+        });
+        Future<ApiResult> resubmitFuture = pool.submit(() -> {
+            gate.await();
+            return submitTranslation(docId, "s1", "en", "alice", "v2", 1, newRequestId());
+        });
+        gate.countDown();
+        ApiResult publishResult = publishFuture.get(30, TimeUnit.SECONDS);
+        ApiResult resubmitResult = resubmitFuture.get(30, TimeUnit.SECONDS);
+        pool.shutdown();
+
+        assertThat(resubmitResult.status()).isEqualTo(200);
+        assertThat(publishResult.status()).isIn(201, 409);
+
+        Integer draftVersion = jdbc.queryForObject(
+                "SELECT draft_version FROM document WHERE document_id = ?", Integer.class, docId);
+        Integer publishedVersion = jdbc.queryForObject(
+                "SELECT published_version FROM document WHERE document_id = ?", Integer.class, docId);
+        Integer snapshots = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM release_snapshot WHERE document_id = ?", Integer.class, docId);
+        assertThat(draftVersion).isEqualTo(4);
+        assertThat(snapshots).isEqualTo(publishedVersion);
+        if (publishResult.status() == 201) {
+            // 发布先于修订：快照固化 V1 与 jia/yi
+            assertThat(publishedVersion).isEqualTo(1);
+            ApiResult release = getJson("/api/documents/" + docId + "/releases/1");
+            var translation = release.body().get("segments").get(0).get("translations").get(0);
+            assertThat(translation.get("translationVersion").asInt()).isEqualTo(1);
+            assertThat(translation.get("signers")).hasSize(2);
+        } else {
+            // 修订先于发布：期望草稿版本不符 409，V3 两份签署不能用于 V4，无快照
+            assertThat(publishedVersion).isZero();
+            assertThat(publish(docId, 4, 0, newRequestId()).status()).isEqualTo(422);
+        }
     }
 }

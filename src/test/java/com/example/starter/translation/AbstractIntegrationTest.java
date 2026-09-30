@@ -35,6 +35,8 @@ public abstract class AbstractIntegrationTest {
 
     @BeforeEach
     void cleanTables() {
+        jdbc.update("DELETE FROM translation_signature");
+        jdbc.update("DELETE FROM language_legal_status");
         jdbc.update("DELETE FROM approval");
         jdbc.update("DELETE FROM translation");
         jdbc.update("DELETE FROM segment");
@@ -120,6 +122,19 @@ public abstract class AbstractIntegrationTest {
         String body = "{\"requestId\":\"" + requestId + "\",\"expectedDraftVersion\":" + expectedDraftVersion
                 + ",\"expectedPublishedVersion\":" + expectedPublishedVersion + "}";
         return postJson("/api/documents/" + documentId + "/publish", body);
+    }
+
+    protected ApiResult sign(long documentId, String segmentId, String language, String actorId,
+                             int translationVersion, String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"translationVersion\":" + translationVersion + "}";
+        return postJson("/api/documents/" + documentId + "/segments/" + segmentId + "/translations/" + language
+                + "/sign", body, actorId);
+    }
+
+    protected ApiResult updateLegalStatus(long documentId, String language, String legalStatus,
+                                          String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"legalStatus\":\"" + legalStatus + "\"}";
+        return putJson("/api/documents/" + documentId + "/languages/" + language + "/legal-status", body);
     }
 
     /** 新增术语版本：rulesJson 为规则数组 JSON。 */

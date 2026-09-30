@@ -92,13 +92,44 @@ public class TranslationController {
                         documentId, segmentId, language, actorId, request))).toResponseEntity();
     }
 
-    /** 发布：全部段落全部目标语言均有有效批准且术语校验通过时原子生成只读快照并递增发布版本。 */
+    /** 发布：全部段落全部目标语言按其法律效力状态满足签署/批准条件且术语校验通过时原子生成只读快照。 */
     @PostMapping("/{documentId}/publish")
     public ResponseEntity<String> publish(@PathVariable long documentId,
                                           @Valid @RequestBody ApiDtos.PublishRequest request) {
         String operation = "POST /api/documents/" + documentId + "/publish";
         return writeExecutor.execute(request.requestId(), hash(operation, request),
                 () -> WriteResult.of(201, translationService.publish(documentId, request))).toResponseEntity();
+    }
+
+    /** 切换语种法律效力：默认 INFORMATIONAL；切换为 BINDING 后该语种发布须两名不同签署人。 */
+    @PutMapping("/{documentId}/languages/{language}/legal-status")
+    public ResponseEntity<String> updateLegalStatus(@PathVariable long documentId,
+                                                    @PathVariable String language,
+                                                    @Valid @RequestBody ApiDtos.UpdateLegalStatusRequest request) {
+        String operation = "PUT /api/documents/" + documentId + "/languages/" + language + "/legal-status";
+        return writeExecutor.execute(request.requestId(), hash(operation, request),
+                () -> WriteResult.of(200, translationService.updateLegalStatus(documentId, language, request)))
+                .toResponseEntity();
+    }
+
+    /** BINDING 译文签署：X-Actor-Id 为签署人，固化语种、译文版本与签署时间，同人同版本不可重复签。 */
+    @PostMapping("/{documentId}/segments/{segmentId}/translations/{language}/sign")
+    public ResponseEntity<String> signTranslation(@PathVariable long documentId,
+                                                  @PathVariable String segmentId,
+                                                  @PathVariable String language,
+                                                  @RequestHeader("X-Actor-Id") String actorId,
+                                                  @Valid @RequestBody ApiDtos.SignTranslationRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/segments/" + segmentId
+                + "/translations/" + language + "/sign";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(201, translationService.signTranslation(
+                        documentId, segmentId, language, actorId, request))).toResponseEntity();
+    }
+
+    /** 查询法律效力：分栏展示草稿签署、当前已发布版本固化的法律效力及版本信息。 */
+    @GetMapping("/{documentId}/legal-status")
+    public ResponseEntity<ApiDtos.LegalStatusResponse> getLegalStatus(@PathVariable long documentId) {
+        return ResponseEntity.ok(translationService.getLegalStatus(documentId));
     }
 
     /** 新增术语版本：不可变快照，术语版本与草稿版本各加一；已有版本不可覆盖。 */

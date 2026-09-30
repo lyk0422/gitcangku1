@@ -2,8 +2,10 @@ package com.example.starter.translation.repo;
 
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
+import com.example.starter.translation.domain.Rows.LanguageLegalStatusRow;
 import com.example.starter.translation.domain.Rows.RequestLogRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
+import com.example.starter.translation.domain.Rows.SignatureRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
 import com.example.starter.translation.domain.Rows.TranslationRow;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -13,6 +15,8 @@ import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.stereotype.Repository;
 
 import java.sql.PreparedStatement;
+import java.sql.Timestamp;
+import java.time.OffsetDateTime;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
@@ -45,6 +49,19 @@ public class TranslationRepository {
 
     private static final RowMapper<TermRuleRow> TERM_RULE_MAPPER = (rs, n) -> new TermRuleRow(
             rs.getString("source_term"), rs.getString("language"), rs.getString("required_translation"));
+
+    private static final RowMapper<LanguageLegalStatusRow> LANGUAGE_LEGAL_STATUS_MAPPER = (rs, n) -> {
+        Timestamp updatedAt = rs.getTimestamp("updated_at");
+        return new LanguageLegalStatusRow(rs.getLong("document_id"), rs.getString("language"),
+                rs.getString("legal_status"),
+                updatedAt == null ? null
+                        : updatedAt.toLocalDateTime().atZone(java.time.ZoneId.systemDefault()).toOffsetDateTime());
+    };
+
+    private static final RowMapper<SignatureRow> SIGNATURE_MAPPER = (rs, n) -> new SignatureRow(
+            rs.getLong("document_id"), rs.getString("segment_id"), rs.getString("language"),
+            rs.getString("signer"), rs.getInt("translation_version"),
+            rs.getObject("signed_at", OffsetDateTime.class));
 
     private final JdbcTemplate jdbc;
 
@@ -240,5 +257,44 @@ public class TranslationRepository {
     public void insertRequestLog(String requestId, String requestHash, int responseStatus, String responseBody) {
         jdbc.update("INSERT INTO request_log (request_id, request_hash, response_status, response_body) "
                 + "VALUES (?, ?, ?, ?)", requestId, requestHash, responseStatus, responseBody);
+    }
+
+    /** 建文档时为每个目标语种插入默认 INFORMATIONAL 法律效力状态。 */
+    public void insertDefaultLegalStatuses(long documentId, List<String> targetLanguages) {
+        for (String language : targetLanguages) {
+            jdbc.update("INSERT INTO language_legal_status (document_id, language, legal_status) VALUES (?, ?, 'INFORMATIONAL')",
+                    documentId, language);
+        }
+    }
+
+    public List<LanguageLegalStatusRow> listLegalStatuses(long documentId) {
+        return jdbc.query(
+                "SELECT document_id, language, legal_status, updated_at FROM language_legal_status "
+                        + "WHERE document_id = ? ORDER BY language",
+                LANGUAGE_LEGAL_STATUS_MAPPER, documentId);
+    }
+
+    /** 切换语种法律效力状态；语种不存在时更新行数为 0。 */
+    public int updateLegalStatus(long documentId, String language, String legalStatus) {
+        return jdbc.update(
+                "UPDATE language_legal_status SET legal_status = ?, updated_at = CURRENT_TIMESTAMP "
+                        + "WHERE document_id = ? AND language = ?",
+                legalStatus, documentId, language);
+    }
+
+    /** 新增一条 BINDING 签署；同一签署人对同一译文版本重复签时主键冲突（不做更新）。 */
+    public void insertSignature(SignatureRow row) {
+        jdbc.update("INSERT INTO translation_signature (document_id, segment_id, language, signer, "
+                        + "translation_version, signed_at) VALUES (?, ?, ?, ?, ?, ?)",
+                row.documentId(), row.segmentId(), row.language(), row.signer(),
+                row.translationVersion(), Timestamp.from(row.signedAt().toInstant()));
+    }
+
+    public List<SignatureRow> listSignatures(long documentId) {
+        return jdbc.query(
+                "SELECT document_id, segment_id, language, signer, translation_version, signed_at "
+                        + "FROM translation_signature WHERE document_id = ? "
+                        + "ORDER BY segment_id, language, translation_version, signed_at, signer",
+                SIGNATURE_MAPPER, documentId);
     }
 }

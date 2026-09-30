@@ -111,6 +111,36 @@ COMMENT ON COLUMN term_rule.source_term IS '源文术语，Unicode 原文、区�
 COMMENT ON COLUMN term_rule.language IS '目标语言码，小写';
 COMMENT ON COLUMN term_rule.required_translation IS '该术语在目标语言中的必译文本，非空';
 
+CREATE TABLE IF NOT EXISTS language_legal_status (
+    document_id BIGINT NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    legal_status VARCHAR(16) NOT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (document_id, language)
+);
+COMMENT ON TABLE language_legal_status IS '目标语种法律效力状态：建文档时默认 INFORMATIONAL，可切换为 BINDING；BINDING 发布须两名不同签署人';
+COMMENT ON COLUMN language_legal_status.document_id IS '所属文档 ID';
+COMMENT ON COLUMN language_legal_status.language IS '目标语言码，小写';
+COMMENT ON COLUMN language_legal_status.legal_status IS '法律效力状态：INFORMATIONAL（参考效力，沿用单审核人批准条件）或 BINDING（法律约束力，须两名不同签署人签署同一译文版本）';
+COMMENT ON COLUMN language_legal_status.updated_at IS '最近切换时间，数据库默认时区';
+
+CREATE TABLE IF NOT EXISTS translation_signature (
+    document_id BIGINT NOT NULL,
+    segment_id VARCHAR(64) NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    signer VARCHAR(128) NOT NULL,
+    translation_version INT NOT NULL,
+    signed_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    PRIMARY KEY (document_id, segment_id, language, signer, translation_version)
+);
+COMMENT ON TABLE translation_signature IS 'BINDING 译文签署：同一签署人对同一译文版本仅一条；译文修订产生新版本后旧版本签署保留但不能用于发布';
+COMMENT ON COLUMN translation_signature.document_id IS '所属文档 ID';
+COMMENT ON COLUMN translation_signature.segment_id IS '所属段落 ID';
+COMMENT ON COLUMN translation_signature.language IS '签署时固化的目标语言码，小写';
+COMMENT ON COLUMN translation_signature.signer IS '签署人，取签署时 X-Actor-Id；两名签署人必须互不相同，可为译文作者';
+COMMENT ON COLUMN translation_signature.translation_version IS '签署时固化的译文版本；不等于当前译文版本时签署失效，BINDING 发布返回 422';
+COMMENT ON COLUMN translation_signature.signed_at IS '签署时间，应用层按 Asia/Shanghai 写入并固化，发布时原样进入快照';
+
 CREATE TABLE IF NOT EXISTS request_log (
     request_id VARCHAR(128) PRIMARY KEY,
     request_hash VARCHAR(64) NOT NULL,

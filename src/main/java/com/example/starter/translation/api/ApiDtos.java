@@ -4,6 +4,7 @@ import com.fasterxml.jackson.annotation.JsonInclude;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.PositiveOrZero;
 import jakarta.validation.constraints.Size;
@@ -65,6 +66,19 @@ public final class ApiDtos {
             @PositiveOrZero(message = "expectedPublishedVersion 不能为负数") int expectedPublishedVersion) {
     }
 
+    /** 语种法律效力切换请求；legalStatus 仅允许 INFORMATIONAL 或 BINDING。 */
+    public record UpdateLegalStatusRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @NotBlank(message = "legalStatus 不能为空") @Pattern(regexp = "INFORMATIONAL|BINDING",
+                    message = "legalStatus 仅支持 INFORMATIONAL 或 BINDING") String legalStatus) {
+    }
+
+    /** BINDING 译文签署请求；签署人取 X-Actor-Id，签署时固化语种、译文版本与签署时间。 */
+    public record SignTranslationRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @Positive(message = "translationVersion 必须为正数") int translationVersion) {
+    }
+
     /** 术语规则输入：sourceTerm 区分大小写，requiredTranslation 非空。 */
     public record TermRuleInput(
             @NotBlank(message = "sourceTerm 不能为空") @Size(max = 512) String sourceTerm,
@@ -102,6 +116,36 @@ public final class ApiDtos {
 
     /** 发布响应。 */
     public record PublishResponse(long documentId, int publishedVersion) {
+    }
+
+    /** 签署响应：回显固化的语种、译文版本与签署时间（ISO-8601，Asia/Shanghai 偏移）。 */
+    public record SignResponse(long documentId, String segmentId, String language, String signer,
+                               int translationVersion, String signedAt) {
+    }
+
+    /** 语种法律效力切换响应；draftVersion 为切换后的文档草稿版本（未变化时不递增）。 */
+    public record LegalStatusUpdateResponse(long documentId, String language, String legalStatus,
+                                            int draftVersion) {
+    }
+
+    /** 单条签署视图：签署人、所签译文版本、签署时间及是否仍对应当前草稿译文版本。 */
+    public record SignatureView(String signer, int translationVersion, String signedAt, boolean current) {
+    }
+
+    /** 单个段落-语种的草稿签署集合：当前译文版本及该语种全部历史签署（含失效签署）。 */
+    public record DraftSignatureView(String segmentId, String language, int currentTranslationVersion,
+                                     List<SignatureView> signatures) {
+    }
+
+    /** 语种法律效力视图：当前草稿状态与当前已发布版本固化的状态（尚未发布时为 null）。 */
+    public record LanguageLegalStatusView(String language, String draftLegalStatus,
+                                          String publishedLegalStatus) {
+    }
+
+    /** 法律效力查询响应：版本信息、各语种状态与全部草稿签署。 */
+    public record LegalStatusResponse(long documentId, int draftVersion, int publishedVersion,
+                                      List<LanguageLegalStatusView> languages,
+                                      List<DraftSignatureView> draftSignatures) {
     }
 
     /** 术语规则视图。 */

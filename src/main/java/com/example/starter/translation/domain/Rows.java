@@ -1,5 +1,6 @@
 package com.example.starter.translation.domain;
 
+import java.time.OffsetDateTime;
 import java.util.List;
 
 /**
@@ -69,6 +70,32 @@ public final class Rows {
      */
     public record ApprovalRow(String segmentId, String language, String reviewer,
                               int sourceVersion, int translationVersion) {
+    }
+
+    /**
+     * 目标语种法律效力状态：建文档时默认 INFORMATIONAL。
+     *
+     * @param documentId   所属文档 ID
+     * @param language     目标语言码，小写
+     * @param legalStatus  法律效力状态，INFORMATIONAL 或 BINDING
+     * @param updatedAt    最近切换时间，数据库默认时区时间戳
+     */
+    public record LanguageLegalStatusRow(long documentId, String language, String legalStatus,
+                                         OffsetDateTime updatedAt) {
+    }
+
+    /**
+     * BINDING 译文签署记录：签署时固化语种与译文版本；同人同版本重复签靠唯一约束拒绝。
+     *
+     * @param documentId          所属文档 ID
+     * @param segmentId           所属段落 ID
+     * @param language            签署时固化的目标语言码，小写
+     * @param signer              签署人，取签署时 X-Actor-Id
+     * @param translationVersion  签署时固化的译文版本
+     * @param signedAt           签署时间（Asia/Shanghai，带时区）
+     */
+    public record SignatureRow(long documentId, String segmentId, String language, String signer,
+                               int translationVersion, OffsetDateTime signedAt) {
     }
 
     /**
