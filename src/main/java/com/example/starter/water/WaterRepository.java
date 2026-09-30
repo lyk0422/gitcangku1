@@ -1,5 +1,6 @@
 package com.example.starter.water;
 
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
@@ -46,6 +47,30 @@ public class WaterRepository {
                              long createdNanos) {
     }
 
+    /** 灌渠中断行；中断窗口与顺延分钟数登记后不可变。 */
+    public record OutageRow(long id, String outageKey, String channelId, long startNanos, long endNanos,
+                            String reason, int postponeMinutes, String status, long createdNanos) {
+    }
+
+    /** 排班行；original* 为发布时原始窗口，start/end 为当前窗口，顺延只改当前窗口。 */
+    public record ScheduleRow(long id, String scheduleKey, long windowId, String channelId,
+                              long originalStartNanos, long originalEndNanos, long startNanos, long endNanos,
+                              String status, long createdNanos, long updatedNanos) {
+    }
+
+    /** 顺延对应关系行，插入后不可变。 */
+    public record PostponementRow(long id, long scheduleId, long outageId, String outageKey, String reason,
+                                  int postponeMinutes, long originalStartNanos, long originalEndNanos,
+                                  long fromStartNanos, long fromEndNanos, long toStartNanos, long toEndNanos,
+                                  long createdNanos) {
+    }
+
+    /** 历史用水核销行，窗口字段为核销当时排班快照。 */
+    public record SettlementRow(long id, String settlementKey, long scheduleId, String scheduleKey,
+                                long scheduledStartNanos, long scheduledEndNanos, BigDecimal volume,
+                                String status, long createdNanos) {
+    }
+
     private static final RowMapper<WindowRow> WINDOW_MAPPER = (rs, n) -> new WindowRow(
             rs.getLong("id"), rs.getString("window_key"), rs.getString("channel_id"),
             rs.getLong("start_nanos"), rs.getLong("end_nanos"),
@@ -74,6 +99,37 @@ public class WaterRepository {
     private static final RowMapper<CommandRow> COMMAND_MAPPER = (rs, n) -> new CommandRow(
             rs.getString("command_key"), rs.getString("operation"), rs.getString("params"),
             rs.getString("response"), rs.getLong("created_nanos"));
+
+    private static final RowMapper<OutageRow> OUTAGE_MAPPER = (rs, n) -> new OutageRow(
+            rs.getLong("id"), rs.getString("outage_key"), rs.getString("channel_id"),
+            rs.getLong("start_nanos"), rs.getLong("end_nanos"), rs.getString("reason"),
+            rs.getInt("postpone_minutes"), rs.getString("status"), rs.getLong("created_nanos"));
+
+    private static final String OUTAGE_SELECT =
+            "SELECT id, outage_key, channel_id, start_nanos, end_nanos, reason, postpone_minutes, status,"
+                    + " created_nanos";
+
+    private static final RowMapper<ScheduleRow> SCHEDULE_MAPPER = (rs, n) -> new ScheduleRow(
+            rs.getLong("id"), rs.getString("schedule_key"), rs.getLong("window_id"),
+            rs.getString("channel_id"), rs.getLong("original_start_nanos"), rs.getLong("original_end_nanos"),
+            rs.getLong("start_nanos"), rs.getLong("end_nanos"), rs.getString("status"),
+            rs.getLong("created_nanos"), rs.getLong("updated_nanos"));
+
+    private static final String SCHEDULE_SELECT =
+            "SELECT id, schedule_key, window_id, channel_id, original_start_nanos, original_end_nanos,"
+                    + " start_nanos, end_nanos, status, created_nanos, updated_nanos";
+
+    private static final RowMapper<PostponementRow> POSTPONEMENT_MAPPER = (rs, n) -> new PostponementRow(
+            rs.getLong("id"), rs.getLong("schedule_id"), rs.getLong("outage_id"),
+            rs.getString("outage_key"), rs.getString("reason"), rs.getInt("postpone_minutes"),
+            rs.getLong("original_start_nanos"), rs.getLong("original_end_nanos"),
+            rs.getLong("from_start_nanos"), rs.getLong("from_end_nanos"),
+            rs.getLong("to_start_nanos"), rs.getLong("to_end_nanos"), rs.getLong("created_nanos"));
+
+    private static final RowMapper<SettlementRow> SETTLEMENT_MAPPER = (rs, n) -> new SettlementRow(
+            rs.getLong("id"), rs.getString("settlement_key"), rs.getLong("schedule_id"),
+            rs.getString("schedule_key"), rs.getLong("scheduled_start_nanos"), rs.getLong("scheduled_end_nanos"),
+            rs.getBigDecimal("volume"), rs.getString("status"), rs.getLong("created_nanos"));
 
     private final JdbcTemplate jdbc;
 
@@ -303,5 +359,261 @@ public class WaterRepository {
     /** 写回命令首次成功响应。 */
     public void updateCommandResponse(String commandKey, String response) {
         jdbc.update("UPDATE command_log SET response = ? WHERE command_key = ?", response, commandKey);
+    }
+
+    // ------------------------------------------------------------------
+    // 灌渠中断与排班顺延
+    // ------------------------------------------------------------------
+
+    /**
+     * 获取渠道行锁：锁行不存在时先幂等插入（不同事务并发插入靠主键冲突，败者重读加锁），
+     * 再 SELECT ... FOR UPDATE，使同一渠道的中断登记与排班发布按事务提交顺序串行。
+     */
+    public void lockChannel(String channelId, long nowNanos) {
+        Integer exists = jdbc.queryForObject("SELECT COUNT(*) FROM channel_mutex WHERE channel_id = ?",
+                Integer.class, channelId);
+        if (exists == null || exists == 0) {
+            try {
+                jdbc.update("INSERT INTO channel_mutex (channel_id, created_nanos) VALUES (?, ?)",
+                        channelId, nowNanos);
+            } catch (DuplicateKeyException ignored) {
+                // 并发事务已插入锁行，下面加锁即可
+            }
+        }
+        jdbc.queryForObject("SELECT channel_id FROM channel_mutex WHERE channel_id = ? FOR UPDATE",
+                String.class, channelId);
+    }
+
+    /** 插入灌渠中断（REGISTERED）并返回主键。 */
+    public long insertOutage(String outageKey, String channelId, long startNanos, long endNanos,
+                             String reason, int postponeMinutes, long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO canal_outage (outage_key, channel_id, start_nanos, end_nanos, reason,"
+                            + " postpone_minutes, status, created_nanos)"
+                            + " VALUES (?, ?, ?, ?, ?, ?, 'REGISTERED', ?)", Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, outageKey);
+            ps.setString(2, channelId);
+            ps.setLong(3, startNanos);
+            ps.setLong(4, endNanos);
+            ps.setString(5, reason);
+            ps.setInt(6, postponeMinutes);
+            ps.setLong(7, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 按业务键查询中断，不存在返回 null。 */
+    public OutageRow findOutageByKey(String outageKey) {
+        try {
+            return jdbc.queryForObject(OUTAGE_SELECT + " FROM canal_outage WHERE outage_key = ?",
+                    OUTAGE_MAPPER, outageKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 按主键查询中断，不存在返回 null。 */
+    public OutageRow findOutageById(long id) {
+        try {
+            return jdbc.queryForObject(OUTAGE_SELECT + " FROM canal_outage WHERE id = ?", OUTAGE_MAPPER, id);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /**
+     * 列出某渠道与 [startNanos, endNanos) 按 UTC 左闭右开交叉的已登记中断，
+     * 在渠道行锁内调用，用于拒绝向中断窗口内发布排班；按起始时刻升序。
+     */
+    public List<OutageRow> listOverlappingOutages(String channelId, long startNanos, long endNanos) {
+        return jdbc.query(
+                OUTAGE_SELECT + " FROM canal_outage WHERE channel_id = ? AND start_nanos < ? AND ? < end_nanos"
+                        + " ORDER BY start_nanos, id",
+                OUTAGE_MAPPER, channelId, endNanos, startNanos);
+    }
+
+    /** 渠道全部已登记中断，按主键升序。 */
+    public List<OutageRow> listOutagesByChannel(String channelId) {
+        return jdbc.query(OUTAGE_SELECT + " FROM canal_outage WHERE channel_id = ? ORDER BY id",
+                OUTAGE_MAPPER, channelId);
+    }
+
+    /** 插入排班（SCHEDULED，当前窗口等于原始窗口）并返回主键。 */
+    public long insertSchedule(String scheduleKey, long windowId, String channelId,
+                               long startNanos, long endNanos, long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO schedule_slot (schedule_key, window_id, channel_id, original_start_nanos,"
+                            + " original_end_nanos, start_nanos, end_nanos, status, created_nanos, updated_nanos)"
+                            + " VALUES (?, ?, ?, ?, ?, ?, ?, 'SCHEDULED', ?, ?)", Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, scheduleKey);
+            ps.setLong(2, windowId);
+            ps.setString(3, channelId);
+            ps.setLong(4, startNanos);
+            ps.setLong(5, endNanos);
+            ps.setLong(6, startNanos);
+            ps.setLong(7, endNanos);
+            ps.setLong(8, createdNanos);
+            ps.setLong(9, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 按业务键查询排班，不存在返回 null。 */
+    public ScheduleRow findScheduleByKey(String scheduleKey) {
+        try {
+            return jdbc.queryForObject(SCHEDULE_SELECT + " FROM schedule_slot WHERE schedule_key = ?",
+                    SCHEDULE_MAPPER, scheduleKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 按主键查询排班，不存在返回 null。 */
+    public ScheduleRow findScheduleById(long id) {
+        try {
+            return jdbc.queryForObject(SCHEDULE_SELECT + " FROM schedule_slot WHERE id = ?", SCHEDULE_MAPPER, id);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 按业务键锁定排班行（FOR UPDATE），不存在返回 null。 */
+    public ScheduleRow lockScheduleByKey(String scheduleKey) {
+        try {
+            return jdbc.queryForObject(SCHEDULE_SELECT + " FROM schedule_slot WHERE schedule_key = ? FOR UPDATE",
+                    SCHEDULE_MAPPER, scheduleKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /**
+     * 列出某渠道与 [startNanos, endNanos) 按 UTC 左闭右开交叉的排班（含各状态），
+     * 在渠道行锁内调用，保证与并发发布/中断互不漏判；按当前起始时刻升序。
+     */
+    public List<ScheduleRow> listOverlappingSchedules(String channelId, long startNanos, long endNanos) {
+        return jdbc.query(
+                SCHEDULE_SELECT + " FROM schedule_slot WHERE channel_id = ? AND start_nanos < ? AND ? < end_nanos"
+                        + " ORDER BY start_nanos, id",
+                SCHEDULE_MAPPER, channelId, endNanos, startNanos);
+    }
+
+    /**
+     * 列出某渠道与 [startNanos, endNanos) 按 UTC 左闭右开交叉的排班（含各状态）并对行加 FOR UPDATE 锁，
+     * 在渠道行锁内调用，保证与并发用水核销互斥；按当前起始时刻升序。
+     */
+    public List<ScheduleRow> lockOverlappingSchedules(String channelId, long startNanos, long endNanos) {
+        return jdbc.query(
+                SCHEDULE_SELECT + " FROM schedule_slot WHERE channel_id = ? AND start_nanos < ? AND ? < end_nanos"
+                        + " ORDER BY start_nanos, id FOR UPDATE",
+                SCHEDULE_MAPPER, channelId, endNanos, startNanos);
+    }
+
+    /** 渠道全部排班，按主键升序。 */
+    public List<ScheduleRow> listSchedulesByChannel(String channelId) {
+        return jdbc.query(SCHEDULE_SELECT + " FROM schedule_slot WHERE channel_id = ? ORDER BY id",
+                SCHEDULE_MAPPER, channelId);
+    }
+
+    /** 配水窗口内全部排班，按主键升序。 */
+    public List<ScheduleRow> listSchedulesByWindow(long windowId) {
+        return jdbc.query(SCHEDULE_SELECT + " FROM schedule_slot WHERE window_id = ? ORDER BY id",
+                SCHEDULE_MAPPER, windowId);
+    }
+
+    /** 整批顺延：更新排班当前窗口与变更时间。 */
+    public void moveSchedule(long scheduleId, long newStartNanos, long newEndNanos, long updatedNanos) {
+        jdbc.update("UPDATE schedule_slot SET start_nanos = ?, end_nanos = ?, updated_nanos = ? WHERE id = ?",
+                newStartNanos, newEndNanos, updatedNanos, scheduleId);
+    }
+
+    /** 插入不可变顺延对应关系。 */
+    public void insertPostponement(long scheduleId, long outageId, String outageKey, String reason,
+                                   int postponeMinutes, long originalStartNanos, long originalEndNanos,
+                                   long fromStartNanos, long fromEndNanos, long toStartNanos, long toEndNanos,
+                                   long createdNanos) {
+        jdbc.update("INSERT INTO schedule_postponement (schedule_id, outage_id, outage_key, reason,"
+                + " postpone_minutes, original_start_nanos, original_end_nanos, from_start_nanos, from_end_nanos,"
+                + " to_start_nanos, to_end_nanos, created_nanos)"
+                + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                scheduleId, outageId, outageKey, reason, postponeMinutes,
+                originalStartNanos, originalEndNanos, fromStartNanos, fromEndNanos,
+                toStartNanos, toEndNanos, createdNanos);
+    }
+
+    /** 排班的全部顺延记录（顺延链），按发生顺序（主键）升序。 */
+    public List<PostponementRow> listPostponements(long scheduleId) {
+        return jdbc.query(
+                "SELECT id, schedule_id, outage_id, outage_key, reason, postpone_minutes, original_start_nanos,"
+                        + " original_end_nanos, from_start_nanos, from_end_nanos, to_start_nanos, to_end_nanos,"
+                        + " created_nanos FROM schedule_postponement WHERE schedule_id = ? ORDER BY id",
+                POSTPONEMENT_MAPPER, scheduleId);
+    }
+
+    /** 某中断首次登记时产生的全部顺延记录，按排班当前起始时刻、主键升序。 */
+    public List<PostponementRow> listPostponementsByOutage(long outageId) {
+        return jdbc.query(
+                "SELECT p.id, p.schedule_id, p.outage_id, p.outage_key, p.reason, p.postpone_minutes,"
+                        + " p.original_start_nanos, p.original_end_nanos, p.from_start_nanos, p.from_end_nanos,"
+                        + " p.to_start_nanos, p.to_end_nanos, p.created_nanos"
+                        + " FROM schedule_postponement p JOIN schedule_slot s ON s.id = p.schedule_id"
+                        + " WHERE p.outage_id = ? ORDER BY s.start_nanos, p.id",
+                POSTPONEMENT_MAPPER, outageId);
+    }
+
+    /** 插入历史用水核销（SETTLED）并返回主键。 */
+    public long insertSettlement(String settlementKey, long scheduleId, String scheduleKey,
+                                 long scheduledStartNanos, long scheduledEndNanos, BigDecimal volume,
+                                 long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO usage_settlement (settlement_key, schedule_id, schedule_key, scheduled_start_nanos,"
+                            + " scheduled_end_nanos, volume, status, created_nanos)"
+                            + " VALUES (?, ?, ?, ?, ?, ?, 'SETTLED', ?)", Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, settlementKey);
+            ps.setLong(2, scheduleId);
+            ps.setString(3, scheduleKey);
+            ps.setLong(4, scheduledStartNanos);
+            ps.setLong(5, scheduledEndNanos);
+            ps.setBigDecimal(6, volume);
+            ps.setLong(7, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 按业务键查询核销记录，不存在返回 null。 */
+    public SettlementRow findSettlementByKey(String settlementKey) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT id, settlement_key, schedule_id, schedule_key, scheduled_start_nanos,"
+                            + " scheduled_end_nanos, volume, status, created_nanos"
+                            + " FROM usage_settlement WHERE settlement_key = ?",
+                    SETTLEMENT_MAPPER, settlementKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 排班全部核销记录，按主键升序。 */
+    public List<SettlementRow> listSettlementsBySchedule(long scheduleId) {
+        return jdbc.query(
+                "SELECT id, settlement_key, schedule_id, schedule_key, scheduled_start_nanos,"
+                        + " scheduled_end_nanos, volume, status, created_nanos"
+                        + " FROM usage_settlement WHERE schedule_id = ? ORDER BY id",
+                SETTLEMENT_MAPPER, scheduleId);
+    }
+
+    /** 将排班置为已核销（COMPLETED）。 */
+    public void markScheduleCompleted(long scheduleId, long updatedNanos) {
+        jdbc.update("UPDATE schedule_slot SET status = 'COMPLETED', updated_nanos = ? WHERE id = ?",
+                updatedNanos, scheduleId);
     }
 }

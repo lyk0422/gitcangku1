@@ -7,6 +7,12 @@ import com.example.starter.water.dto.Dtos.CreateWindowRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.OutageResponse;
+import com.example.starter.water.dto.Dtos.PublishScheduleRequest;
+import com.example.starter.water.dto.Dtos.RegisterOutageRequest;
+import com.example.starter.water.dto.Dtos.ScheduleResponse;
+import com.example.starter.water.dto.Dtos.SettleUsageRequest;
+import com.example.starter.water.dto.Dtos.SettlementResponse;
 import com.example.starter.water.dto.Dtos.SubmitAllocationRequest;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferRequest;
@@ -29,9 +35,11 @@ import org.springframework.web.bind.annotation.RestController;
 public class WaterController {
 
     private final WaterService service;
+    private final OutageService outageService;
 
-    public WaterController(WaterService service) {
+    public WaterController(WaterService service, OutageService outageService) {
         this.service = service;
+        this.outageService = outageService;
     }
 
     /** 创建供水窗口。 */
@@ -102,5 +110,45 @@ public class WaterController {
     @GetMapping("/windows/{windowId}/history")
     public HistoryResponse getHistory(@PathVariable long windowId) {
         return service.getHistory(windowId);
+    }
+
+    /** 发布灌渠排班（渠道取自所属配水窗口）。 */
+    @PostMapping("/schedules")
+    public ScheduleResponse publishSchedule(@RequestBody PublishScheduleRequest request) {
+        return outageService.publishSchedule(request.commandKey(), request.scheduleKey(), request.windowId(),
+                request.startUtc(), request.endUtc());
+    }
+
+    /** 查询排班：原排班、当前窗口、中断原因及历次顺延对应关系。 */
+    @GetMapping("/schedules/{scheduleKey}")
+    public ScheduleResponse getSchedule(@PathVariable String scheduleKey) {
+        return outageService.getSchedule(scheduleKey);
+    }
+
+    /** 登记灌渠中断并整批顺延受影响且未开始的排班；requestId 即 commandKey。 */
+    @PostMapping("/outages")
+    public OutageResponse registerOutage(@RequestBody RegisterOutageRequest request) {
+        return outageService.registerOutage(request.commandKey(), request.outageKey(), request.channelId(),
+                request.startUtc(), request.endUtc(), request.reason(), request.postponeMinutes());
+    }
+
+    /** 查询中断及首次登记时受影响排班的原排班、新窗口与顺延对应关系。 */
+    @GetMapping("/outages/{outageKey}")
+    public OutageResponse getOutage(@PathVariable String outageKey) {
+        return outageService.getOutage(outageKey);
+    }
+
+    /** 历史用水核销：快照核销当时的排班窗口，后续顺延不改写。 */
+    @PostMapping("/schedules/{scheduleKey}/settlements")
+    public SettlementResponse settleUsage(@PathVariable String scheduleKey,
+                                          @RequestBody SettleUsageRequest request) {
+        return outageService.settleUsage(request.commandKey(), request.settlementKey(), scheduleKey,
+                request.volume());
+    }
+
+    /** 查询历史用水核销（当时排班窗口快照）。 */
+    @GetMapping("/settlements/{settlementKey}")
+    public SettlementResponse getSettlement(@PathVariable String settlementKey) {
+        return outageService.getSettlement(settlementKey);
     }
 }

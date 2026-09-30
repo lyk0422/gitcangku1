@@ -74,6 +74,58 @@ public final class Dtos {
                                   List<CurtailmentResponse> curtailments) {
     }
 
+    /** 发布排班命令；排班渠道取自所属供水窗口，时间按 UTC 左闭右开。 */
+    public record PublishScheduleRequest(String commandKey, String scheduleKey, Long windowId,
+                                         String startUtc, String endUtc) {
+    }
+
+    /** 登记灌渠中断命令；postponeMinutes 对所有受影响且未开始的排班统一顺延。requestId 即 commandKey。 */
+    public record RegisterOutageRequest(String commandKey, String outageKey, String channelId,
+                                        String startUtc, String endUtc, String reason, Integer postponeMinutes) {
+    }
+
+    /** 历史用水核销命令；核销时对排班当时窗口做不可变快照。 */
+    public record SettleUsageRequest(String commandKey, String settlementKey, String volume) {
+    }
+
+    /**
+     * 单次顺延对应关系：from 为本次中断前排班窗口，to 为顺延后窗口；
+     * original 为排班发布时的原始窗口（多次顺延时保持不变）。
+     */
+    public record PostponementItem(String outageKey, String reason, int postponeMinutes,
+                                   String originalStartUtc, String originalEndUtc,
+                                   String fromStartUtc, String fromEndUtc,
+                                   String toStartUtc, String toEndUtc, String createdUtc) {
+    }
+
+    /**
+     * 排班视图。status：SCHEDULED 未开始或进行中 / COMPLETED 已核销；
+     * started 按可控当前时刻与当前窗口起点判断；startUtc/endUtc 为当前生效窗口，
+     * originalStartUtc/originalEndUtc 为发布时原始窗口，postponements 为历次顺延链。
+     */
+    public record ScheduleResponse(String scheduleKey, long windowId, String channelId,
+                                   String originalStartUtc, String originalEndUtc,
+                                   String startUtc, String endUtc, String status, boolean started,
+                                   String createdUtc, String updatedUtc, List<PostponementItem> postponements) {
+    }
+
+    /** 中断视图；affected 为首次登记时受影响且顺延的排班及顺延对应关系，重放返回首次结果。 */
+    public record OutageResponse(String outageKey, String channelId, String startUtc, String endUtc,
+                                 String reason, int postponeMinutes, String status, String createdUtc,
+                                 List<AffectedSchedule> affected) {
+    }
+
+    /** 受中断影响的排班：原排班窗口、本次顺延前后窗口与顺延分钟数。 */
+    public record AffectedSchedule(String scheduleKey, String originalStartUtc, String originalEndUtc,
+                                   String previousStartUtc, String previousEndUtc,
+                                   String newStartUtc, String newEndUtc, int postponeMinutes) {
+    }
+
+    /** 用水核销视图；scheduled* 为核销当时排班窗口快照，之后排班再顺延也不改写。 */
+    public record SettlementResponse(String settlementKey, String scheduleKey, String scheduledStartUtc,
+                                     String scheduledEndUtc, String volume, String status, String createdUtc) {
+    }
+
     /** 统一错误响应体。 */
     public record ErrorResponse(String code, String message) {
     }
