@@ -9,7 +9,8 @@ import org.springframework.http.ResponseEntity;
  */
 public record WriteResult(int status, String body) {
 
-    private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final ObjectMapper MAPPER = new ObjectMapper().findAndRegisterModules()
+            .disable(com.fasterxml.jackson.databind.SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
 
     /** 以给定状态码序列化响应体。 */
     public static WriteResult of(int status, Object body) {

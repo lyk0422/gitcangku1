@@ -75,15 +75,38 @@ COMMENT ON COLUMN approval.approved_at IS '批准时间，数据库默认时区'
 CREATE TABLE IF NOT EXISTS release_snapshot (
     document_id BIGINT NOT NULL,
     published_version INT NOT NULL,
+    legal_status VARCHAR(16) NOT NULL,
+    target_languages VARCHAR(255) NOT NULL,
     snapshot_json LONGTEXT NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (document_id, published_version)
 );
-COMMENT ON TABLE release_snapshot IS '发布快照：发布时原子生成的完整只读快照，JSON 序列化，不可修改';
+COMMENT ON TABLE release_snapshot IS '发布快照：发布时原子生成的完整只读快照，JSON 序列化，不可修改；INFORMATIONAL 覆盖全部目标语种，BINDING 仅覆盖签署语种';
 COMMENT ON COLUMN release_snapshot.document_id IS '所属文档 ID';
 COMMENT ON COLUMN release_snapshot.published_version IS '发布版本号，从 1 开始';
-COMMENT ON COLUMN release_snapshot.snapshot_json IS '快照内容 JSON：全部段落源文及各语言译文、作者、审核人与版本号';
-COMMENT ON COLUMN release_snapshot.created_at IS '发布时间，数据库默认时区';
+COMMENT ON COLUMN release_snapshot.legal_status IS '本次发布的法律效力：INFORMATIONAL（参考效力，沿用批准条件）或 BINDING（约束效力，须两名不同签署人确认同一译文版本）';
+COMMENT ON COLUMN release_snapshot.target_languages IS '本次发布覆盖的目标语言码，逗号分隔小写；INFORMATIONAL 为全部目标语种，BINDING 为单一签署语种';
+COMMENT ON COLUMN release_snapshot.snapshot_json IS '快照内容 JSON：全部段落源文及译文、作者、审核人或签署人、版本号与固化时间';
+COMMENT ON COLUMN release_snapshot.created_at IS '发布时间，UTC';
+
+CREATE TABLE IF NOT EXISTS binding_signature (
+    document_id BIGINT NOT NULL,
+    segment_id VARCHAR(64) NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    signer VARCHAR(128) NOT NULL,
+    translation_version INT NOT NULL,
+    source_version INT NOT NULL,
+    signed_at TIMESTAMP NOT NULL,
+    PRIMARY KEY (document_id, segment_id, language, signer, translation_version)
+);
+COMMENT ON TABLE binding_signature IS 'BINDING 草稿签署：签署人对某段落、某语种、某译文版本的不可变确认；源文/译文修订后旧版本签署仍保留但不再有效，不能用于发布，已发布快照也不回写';
+COMMENT ON COLUMN binding_signature.document_id IS '所属文档 ID';
+COMMENT ON COLUMN binding_signature.segment_id IS '所属段落 ID';
+COMMENT ON COLUMN binding_signature.language IS '被签署译文的目标语言码，小写，签署时固化';
+COMMENT ON COLUMN binding_signature.signer IS '签署人，取签署时 X-Actor-Id；同一译文版本须由两名不同签署人确认';
+COMMENT ON COLUMN binding_signature.translation_version IS '签署确认的译文版本，签署时固化；不等于当前译文版本时签署失效';
+COMMENT ON COLUMN binding_signature.source_version IS '签署时译文所依据的源文版本，签署时固化；不等于当前源文版本时签署失效';
+COMMENT ON COLUMN binding_signature.signed_at IS '签署时间，UTC，由应用时钟写入并固化';
 
 CREATE TABLE IF NOT EXISTS term_version (
     document_id BIGINT NOT NULL,

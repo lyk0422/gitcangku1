@@ -4,10 +4,12 @@ import com.fasterxml.jackson.annotation.JsonInclude;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.PositiveOrZero;
 import jakarta.validation.constraints.Size;
 
+import java.time.Instant;
 import java.util.List;
 
 /**
@@ -58,11 +60,23 @@ public final class ApiDtos {
             @Positive(message = "translationVersion 必须为正数") int translationVersion) {
     }
 
-    /** 发布请求：携带期望的草稿与发布版本做乐观校验。 */
+    /**
+     * 发布请求：携带期望的草稿与发布版本做乐观校验。
+     * legalStatus 缺省为 INFORMATIONAL；BINDING 时必须携带 language，仅发布该签署语种。
+     */
     public record PublishRequest(
             @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
             @Positive(message = "expectedDraftVersion 必须为正数") int expectedDraftVersion,
-            @PositiveOrZero(message = "expectedPublishedVersion 不能为负数") int expectedPublishedVersion) {
+            @PositiveOrZero(message = "expectedPublishedVersion 不能为负数") int expectedPublishedVersion,
+            @Pattern(regexp = "INFORMATIONAL|BINDING", message = "legalStatus 只能为 INFORMATIONAL 或 BINDING")
+            String legalStatus,
+            @Size(max = 16, message = "language 长度非法") String language) {
+    }
+
+    /** BINDING 签署请求：签署人取 X-Actor-Id，确认指定语种的指定译文版本；语种在路径中。 */
+    public record SignTranslationRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @Positive(message = "translationVersion 必须为正数") int translationVersion) {
     }
 
     /** 术语规则输入：sourceTerm 区分大小写，requiredTranslation 非空。 */
@@ -100,8 +114,40 @@ public final class ApiDtos {
                                    int translationVersion, int sourceVersion) {
     }
 
+    /** BINDING 签署响应：固化语种、译文版本、源文版本与 UTC 签署时间。 */
+    public record SignatureResponse(long documentId, String segmentId, String language, String signer,
+                                    int translationVersion, int sourceVersion, Instant signedAt) {
+    }
+
     /** 发布响应。 */
-    public record PublishResponse(long documentId, int publishedVersion) {
+    public record PublishResponse(long documentId, int publishedVersion, String legalStatus, String language) {
+        public PublishResponse(long documentId, int publishedVersion) {
+            this(documentId, publishedVersion, "INFORMATIONAL", null);
+        }
+    }
+
+    /** 单条草稿签署视图：valid=false 表示其译文版本或源文版本已被修订，仅供追溯不能用于发布。 */
+    public record SignatureView(String signer, int translationVersion, int sourceVersion,
+                                Instant signedAt, boolean valid) {
+    }
+
+    /** 单个语种的法律效力视图：当前 BINDING 发布版本为 0 表示该语种尚无约束效力发布。 */
+    public record LanguageLegalEffect(String language, int bindingPublishedVersion,
+                                      List<SignatureView> draftSignatures) {
+    }
+
+    /** 段落维度的法律效力视图：各目标语种分开呈现。 */
+    public record SegmentLegalEffect(String segmentId, List<LanguageLegalEffect> languages) {
+    }
+
+    /** 法律效力查询响应：草稿签署、当前法律效力与历史发布分区呈现。 */
+    public record LegalEffectResponse(long documentId, int currentPublishedVersion,
+                                      String currentLegalStatus, String currentLanguage,
+                                      List<SegmentLegalEffect> segments, List<ReleaseSummary> releases) {
+    }
+
+    /** 历史发布摘要：版本、法律效力与覆盖语种；正文以 release 快照接口查询。 */
+    public record ReleaseSummary(int publishedVersion, String legalStatus, String language, Instant publishedAt) {
     }
 
     /** 术语规则视图。 */

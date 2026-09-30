@@ -3,15 +3,20 @@ package com.example.starter.translation.service;
 import com.example.starter.translation.api.ApiDtos;
 import com.example.starter.translation.api.ApiException;
 import com.example.starter.translation.domain.Rows.ApprovalRow;
+import com.example.starter.translation.domain.Rows.BindingSignatureRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
 import com.example.starter.translation.domain.Rows.TranslationRow;
 import com.example.starter.translation.repo.TranslationRepository;
+import com.example.starter.translation.repo.TranslationRepository.ReleaseMetaRow;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Clock;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -32,10 +37,12 @@ public class TranslationService {
 
     private final TranslationRepository repository;
     private final ObjectMapper objectMapper;
+    private final Clock clock;
 
-    public TranslationService(TranslationRepository repository, ObjectMapper objectMapper) {
+    public TranslationService(TranslationRepository repository, ObjectMapper objectMapper, Clock clock) {
         this.repository = repository;
         this.objectMapper = objectMapper;
+        this.clock = clock;
     }
 
     /** 建文档：1~5 种目标语言，可携带初始段落，初始草稿版本 1、发布版本 0。 */
@@ -174,10 +181,11 @@ public class TranslationService {
     }
 
     /**
-     * 发布：校验期望版本（不符 409），再校验全部段落在全部目标语言均有有效批准（缺译或审核失效 422）、
-     * 译文绑定当前术语版本（过期 422）且满足当前术语规则（违规 422 并返回全部违规术语），
-     * 全部通过后原子生成完整只读快照（固化术语版本与实际规则集）并递增发布版本；
-     * 任何失败回滚，不产生部分快照。
+     * 发布：校验期望版本（不符 409），按法律效力分流——
+     * INFORMATIONAL 沿用原条件：全部段落全部目标语言均有有效批准、译文绑定当前术语版本且满足当前术语规则；
+     * BINDING 仅发布单个签署语种：每个段落该语种译文当前未被修订，且有两名不同签署人对当前译文版本的有效签署
+     * （缺签、同人重复签、签署版本已被修订均 422，且不改变当前已发布版本）。
+     * 全部通过后原子生成完整只读快照并递增发布版本；任何失败回滚，不产生部分快照。
      */
     @Transactional
     public ApiDtos.PublishResponse publish(long documentId, ApiDtos.PublishRequest request) {
@@ -188,6 +196,19 @@ public class TranslationService {
                     + "、发布版本 " + document.publishedVersion() + "，与期望的 "
                     + request.expectedDraftVersion() + "/" + request.expectedPublishedVersion() + " 不一致");
         }
+        boolean binding = "BINDING".equals(request.legalStatus());
+        if (binding) {
+            if (request.language() == null || request.language().isBlank()) {
+                throw ApiException.unprocessable("BINDING 发布必须指定 language");
+            }
+            return publishBinding(document, normalizeLanguage(request.language()));
+        }
+        return publishInformational(document);
+    }
+
+    /** INFORMATIONAL 发布：沿用原批准与术语条件，覆盖全部目标语种。 */
+    private ApiDtos.PublishResponse publishInformational(DocumentRow document) {
+        long documentId = document.documentId();
         List<SegmentRow> segments = repository.listSegments(documentId);
         Map<String, TranslationRow> translations = repository.listTranslations(documentId).stream()
                 .collect(Collectors.toMap(t -> key(t.segmentId(), t.language()), Function.identity()));
@@ -197,16 +218,7 @@ public class TranslationService {
         List<ApiDtos.TermRuleView> termViolations = new ArrayList<>();
         for (SegmentRow segment : segments) {
             for (String language : document.targetLanguages()) {
-                TranslationRow translation = translations.get(key(segment.segmentId(), language));
-                if (translation == null) {
-                    throw ApiException.unprocessable(
-                            "缺少译文: " + segment.segmentId() + "/" + language);
-                }
-                if (translation.sourceVersion() != segment.sourceVersion()) {
-                    throw ApiException.unprocessable("译文待更新: " + segment.segmentId() + "/" + language
-                            + " 基于源文版本 " + translation.sourceVersion()
-                            + "，当前源文版本 " + segment.sourceVersion());
-                }
+                TranslationRow translation = requireCurrentTranslation(document, segment, language, translations);
                 if (translation.termVersion() != document.termVersion()) {
                     throw ApiException.unprocessable("译文术语版本过期: " + segment.segmentId() + "/" + language
                             + " 绑定术语版本 " + translation.termVersion()
@@ -230,10 +242,99 @@ public class TranslationService {
             throw ApiException.termViolation("译文违反 " + termViolations.size() + " 条术语规则", termViolations);
         }
         int publishedVersion = document.publishedVersion() + 1;
-        repository.insertSnapshot(documentId, publishedVersion,
-                buildSnapshotJson(document, publishedVersion, segments, translations, approvals, termRules));
+        repository.insertSnapshot(documentId, publishedVersion, "INFORMATIONAL",
+                String.join(",", document.targetLanguages()),
+                buildInformationalSnapshotJson(document, publishedVersion, segments, translations,
+                        approvals, termRules));
         repository.updatePublishedVersion(documentId, publishedVersion);
-        return new ApiDtos.PublishResponse(documentId, publishedVersion);
+        return new ApiDtos.PublishResponse(documentId, publishedVersion, "INFORMATIONAL", null);
+    }
+
+    /**
+     * BINDING 发布：每个段落的指定语种译文必须存在且未被源文/译文修订，
+     * 并有两名不同签署人对当前译文版本、当前源文版本的有效签署；签署时间一并固化进快照。
+     */
+    private ApiDtos.PublishResponse publishBinding(DocumentRow document, String language) {
+        long documentId = document.documentId();
+        if (!document.targetLanguages().contains(language)) {
+            throw ApiException.unprocessable("语言不在文档目标语言中: " + language);
+        }
+        List<SegmentRow> segments = repository.listSegments(documentId);
+        Map<String, TranslationRow> translations = repository.listTranslations(documentId).stream()
+                .collect(Collectors.toMap(t -> key(t.segmentId(), t.language()), Function.identity()));
+        Map<String, List<BindingSignatureRow>> signatures = repository.listSignatures(documentId).stream()
+                .filter(s -> s.language().equals(language))
+                .collect(Collectors.groupingBy(s -> key(s.segmentId(), s.language())));
+        List<Map<String, Object>> segmentSnapshot = new ArrayList<>();
+        for (SegmentRow segment : segments) {
+            TranslationRow translation = requireCurrentTranslation(document, segment, language, translations);
+            List<BindingSignatureRow> onVersion = signatures.getOrDefault(key(segment.segmentId(), language),
+                    List.of()).stream()
+                    .filter(s -> s.translationVersion() == translation.translationVersion()
+                            && s.sourceVersion() == segment.sourceVersion())
+                    .toList();
+            long distinctSigners = onVersion.stream().map(BindingSignatureRow::signer).distinct().count();
+            if (onVersion.size() < 2 || distinctSigners < 2) {
+                throw ApiException.unprocessable("BINDING 签署不满足: " + segment.segmentId() + "/" + language
+                        + " 需要两名不同签署人确认译文版本 " + translation.translationVersion()
+                        + "，当前有效签署人数 " + distinctSigners);
+            }
+            if (onVersion.size() > 2) {
+                // 多于两个签署人时取签署时间最早的两名，保证发布结果确定
+                onVersion = onVersion.stream().sorted(java.util.Comparator
+                        .comparing(BindingSignatureRow::signedAt).thenComparing(BindingSignatureRow::signer))
+                        .limit(2).toList();
+            }
+            Map<String, Object> segmentJson = new LinkedHashMap<>();
+            segmentJson.put("segmentId", segment.segmentId());
+            segmentJson.put("sourceText", segment.sourceText());
+            segmentJson.put("sourceVersion", segment.sourceVersion());
+            Map<String, Object> translationJson = new LinkedHashMap<>();
+            translationJson.put("language", language);
+            translationJson.put("content", translation.content());
+            translationJson.put("author", translation.author());
+            translationJson.put("translationVersion", translation.translationVersion());
+            translationJson.put("sourceVersion", translation.sourceVersion());
+            translationJson.put("termVersion", translation.termVersion());
+            List<Map<String, Object>> signerList = new ArrayList<>();
+            for (BindingSignatureRow signature : onVersion) {
+                Map<String, Object> signerJson = new LinkedHashMap<>();
+                signerJson.put("signer", signature.signer());
+                signerJson.put("signedAt", signature.signedAt());
+                signerList.add(signerJson);
+            }
+            translationJson.put("signers", signerList);
+            segmentJson.put("translation", translationJson);
+            segmentSnapshot.add(segmentJson);
+        }
+        int publishedVersion = document.publishedVersion() + 1;
+        Map<String, Object> snapshot = new LinkedHashMap<>();
+        snapshot.put("documentId", documentId);
+        snapshot.put("publishedVersion", publishedVersion);
+        snapshot.put("legalStatus", "BINDING");
+        snapshot.put("language", language);
+        snapshot.put("draftVersion", document.draftVersion());
+        snapshot.put("releasedAt", Instant.now(clock));
+        snapshot.put("segments", segmentSnapshot);
+        repository.insertSnapshot(documentId, publishedVersion, "BINDING", language,
+                writeJson(snapshot));
+        repository.updatePublishedVersion(documentId, publishedVersion);
+        return new ApiDtos.PublishResponse(documentId, publishedVersion, "BINDING", language);
+    }
+
+    /** 取指定段落语种的当前译文；不存在或已被源文修订抛 422。 */
+    private TranslationRow requireCurrentTranslation(DocumentRow document, SegmentRow segment, String language,
+                                                     Map<String, TranslationRow> translations) {
+        TranslationRow translation = translations.get(key(segment.segmentId(), language));
+        if (translation == null) {
+            throw ApiException.unprocessable("缺少译文: " + segment.segmentId() + "/" + language);
+        }
+        if (translation.sourceVersion() != segment.sourceVersion()) {
+            throw ApiException.unprocessable("译文待更新: " + segment.segmentId() + "/" + language
+                    + " 基于源文版本 " + translation.sourceVersion()
+                    + "，当前源文版本 " + segment.sourceVersion());
+        }
+        return translation;
     }
 
     /** 查询指定发布版本的只读快照 JSON；不存在返回 404。 */
@@ -347,14 +448,112 @@ public class TranslationService {
         return new ApiDtos.TermRuleView(rule.sourceTerm(), rule.language(), rule.requiredTranslation());
     }
 
+    /**
+     * BINDING 签署：签署人确认指定语种的指定译文版本；签署时固化语种、译文版本、源文版本与 UTC 签署时间。
+     * 译文不存在 404；签署版本与当前译文版本不符（版本已被修订）422；译文基于旧源文版本 422；
+     * 同一签署人对同一译文版本重复签署 422（同人重复签不能充当第二名签署人）。
+     */
+    @Transactional
+    public ApiDtos.SignatureResponse signTranslation(long documentId, String segmentId, String language,
+                                                     String actorId, ApiDtos.SignTranslationRequest request) {
+        lockDocument(documentId);
+        String normalizedLanguage = normalizeLanguage(language);
+        SegmentRow segment = findSegmentOrThrow(documentId, segmentId);
+        TranslationRow translation = repository.findTranslation(documentId, segmentId, normalizedLanguage)
+                .orElseThrow(() -> ApiException.notFound(
+                        "译文不存在: " + segmentId + "/" + normalizedLanguage));
+        if (translation.translationVersion() != request.translationVersion()) {
+            throw ApiException.unprocessable("签署所针对的译文版本 " + request.translationVersion()
+                    + " 与当前译文版本 " + translation.translationVersion() + " 不匹配，该版本已被修订");
+        }
+        if (translation.sourceVersion() != segment.sourceVersion()) {
+            throw ApiException.unprocessable("译文基于源文版本 " + translation.sourceVersion()
+                    + "，当前源文版本 " + segment.sourceVersion() + "，译文待更新，不能签署");
+        }
+        BindingSignatureRow row = new BindingSignatureRow(segmentId, normalizedLanguage, actorId,
+                translation.translationVersion(), segment.sourceVersion(), Instant.now(clock));
+        try {
+            repository.insertSignature(documentId, row);
+        } catch (DuplicateKeyException e) {
+            throw ApiException.unprocessable("同一签署人不能对同一译文版本重复签署: " + actorId
+                    + " 已确认 " + segmentId + "/" + normalizedLanguage + " 译文版本 "
+                    + request.translationVersion());
+        }
+        return new ApiDtos.SignatureResponse(documentId, segmentId, normalizedLanguage, actorId,
+                translation.translationVersion(), segment.sourceVersion(), row.signedAt());
+    }
+
+    /**
+     * 法律效力查询：分区返回草稿签署（含是否仍有效）、当前法律效力（最新发布版本的状态与覆盖语种）
+     * 以及历史发布摘要；不返回已发布正文快照（以 release 接口查询），后续修订不影响本视图中的历史数据。
+     */
+    @Transactional(readOnly = true)
+    public ApiDtos.LegalEffectResponse getLegalEffect(long documentId) {
+        DocumentRow document = repository.findDocument(documentId)
+                .orElseThrow(() -> ApiException.notFound("文档不存在: " + documentId));
+        Map<String, SegmentRow> segments = repository.listSegments(documentId).stream()
+                .collect(Collectors.toMap(SegmentRow::segmentId, Function.identity()));
+        Map<String, TranslationRow> translations = repository.listTranslations(documentId).stream()
+                .collect(Collectors.toMap(t -> key(t.segmentId(), t.language()), Function.identity()));
+        Map<String, List<BindingSignatureRow>> signatures = repository.listSignatures(documentId).stream()
+                .collect(Collectors.groupingBy(s -> key(s.segmentId(), s.language())));
+
+        ReleaseMetaRow currentMeta = document.publishedVersion() == 0 ? null
+                : repository.findReleaseMeta(documentId, document.publishedVersion()).orElse(null);
+        List<ReleaseMetaRow> releaseMetas = repository.listReleaseMeta(documentId);
+        List<ApiDtos.SegmentLegalEffect> segmentViews = new ArrayList<>();
+        for (String segmentId : segments.keySet().stream().sorted().toList()) {
+            SegmentRow segment = segments.get(segmentId);
+            List<ApiDtos.LanguageLegalEffect> languageViews = new ArrayList<>();
+            for (String language : document.targetLanguages()) {
+                TranslationRow translation = translations.get(key(segmentId, language));
+                List<ApiDtos.SignatureView> signatureViews = new ArrayList<>();
+                for (BindingSignatureRow signature : signatures.getOrDefault(key(segmentId, language), List.of())) {
+                    boolean valid = translation != null
+                            && signature.translationVersion() == translation.translationVersion()
+                            && signature.sourceVersion() == segment.sourceVersion();
+                    signatureViews.add(new ApiDtos.SignatureView(signature.signer(),
+                            signature.translationVersion(), signature.sourceVersion(),
+                            signature.signedAt(), valid));
+                }
+                int bindingPublishedVersion = bindingPublishedVersionFor(releaseMetas, language);
+                languageViews.add(new ApiDtos.LanguageLegalEffect(language, bindingPublishedVersion, signatureViews));
+            }
+            segmentViews.add(new ApiDtos.SegmentLegalEffect(segmentId, languageViews));
+        }
+        List<ApiDtos.ReleaseSummary> releases = releaseMetas.stream()
+                .map(meta -> new ApiDtos.ReleaseSummary(meta.publishedVersion(), meta.legalStatus(),
+                        "BINDING".equals(meta.legalStatus()) ? meta.targetLanguages() : null,
+                        meta.publishedAt()))
+                .toList();
+        return new ApiDtos.LegalEffectResponse(documentId, document.publishedVersion(),
+                currentMeta == null ? "NONE" : currentMeta.legalStatus(),
+                currentMeta == null ? null
+                        : ("BINDING".equals(currentMeta.legalStatus()) ? currentMeta.targetLanguages() : null),
+                segmentViews, releases);
+    }
+
+    /** 某语种当前约束效力对应的最新 BINDING 发布版本；无则 0。 */
+    private static int bindingPublishedVersionFor(List<ReleaseMetaRow> metas, String language) {
+        int version = 0;
+        for (ReleaseMetaRow meta : metas) {
+            if ("BINDING".equals(meta.legalStatus()) && language.equals(meta.targetLanguages())) {
+                version = Math.max(version, meta.publishedVersion());
+            }
+        }
+        return version;
+    }
+
     /** 生成完整只读快照 JSON：全部段落源文及各语言译文、作者、审核人、版本号与固化的术语版本及规则集。 */
-    private String buildSnapshotJson(DocumentRow document, int publishedVersion, List<SegmentRow> segments,
+    private String buildInformationalSnapshotJson(DocumentRow document, int publishedVersion, List<SegmentRow> segments,
                                      Map<String, TranslationRow> translations,
                                      Map<String, ApprovalRow> approvals, List<TermRuleRow> termRules) {
         Map<String, Object> snapshot = new LinkedHashMap<>();
         snapshot.put("documentId", document.documentId());
         snapshot.put("publishedVersion", publishedVersion);
+        snapshot.put("legalStatus", "INFORMATIONAL");
         snapshot.put("draftVersion", document.draftVersion());
+        snapshot.put("releasedAt", Instant.now(clock));
         snapshot.put("termVersion", document.termVersion());
         snapshot.put("targetLanguages", document.targetLanguages());
         List<Map<String, Object>> termList = new ArrayList<>();
@@ -390,8 +589,12 @@ public class TranslationService {
             segmentList.add(segmentJson);
         }
         snapshot.put("segments", segmentList);
+        return writeJson(snapshot);
+    }
+
+    private String writeJson(Object value) {
         try {
-            return objectMapper.writeValueAsString(snapshot);
+            return objectMapper.writeValueAsString(value);
         } catch (Exception e) {
             throw new IllegalStateException("快照序列化失败", e);
         }

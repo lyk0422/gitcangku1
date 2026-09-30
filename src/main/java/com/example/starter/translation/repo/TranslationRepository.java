@@ -1,6 +1,7 @@
 package com.example.starter.translation.repo;
 
 import com.example.starter.translation.domain.Rows.ApprovalRow;
+import com.example.starter.translation.domain.Rows.BindingSignatureRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
 import com.example.starter.translation.domain.Rows.RequestLogRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
@@ -13,6 +14,8 @@ import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.stereotype.Repository;
 
 import java.sql.PreparedStatement;
+import java.sql.Timestamp;
+import java.time.Instant;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
@@ -45,6 +48,11 @@ public class TranslationRepository {
 
     private static final RowMapper<TermRuleRow> TERM_RULE_MAPPER = (rs, n) -> new TermRuleRow(
             rs.getString("source_term"), rs.getString("language"), rs.getString("required_translation"));
+
+    private static final RowMapper<BindingSignatureRow> SIGNATURE_MAPPER = (rs, n) -> new BindingSignatureRow(
+            rs.getString("segment_id"), rs.getString("language"), rs.getString("signer"),
+            rs.getInt("translation_version"), rs.getInt("source_version"),
+            rs.getTimestamp("signed_at").toInstant());
 
     private final JdbcTemplate jdbc;
 
@@ -188,9 +196,65 @@ public class TranslationRepository {
         }
     }
 
-    public void insertSnapshot(long documentId, int publishedVersion, String snapshotJson) {
-        jdbc.update("INSERT INTO release_snapshot (document_id, published_version, snapshot_json) VALUES (?, ?, ?)",
-                documentId, publishedVersion, snapshotJson);
+    /**
+     * 插入发布快照（不可变，主键已存在时抛冲突）。
+     *
+     * @param legalStatus     本次发布法律效力：INFORMATIONAL 或 BINDING
+     * @param targetLanguages 本次发布覆盖的目标语种，逗号分隔小写语言码
+     * @param snapshotJson    固化的完整快照 JSON
+     */
+    public void insertSnapshot(long documentId, int publishedVersion, String legalStatus,
+                               String targetLanguages, String snapshotJson) {
+        jdbc.update("INSERT INTO release_snapshot (document_id, published_version, legal_status, "
+                        + "target_languages, snapshot_json) VALUES (?, ?, ?, ?, ?)",
+                documentId, publishedVersion, legalStatus, targetLanguages, snapshotJson);
+    }
+
+    /** 查询某文档全部发布版本的元数据，按版本升序；快照 JSON 不含在内。 */
+    public List<ReleaseMetaRow> listReleaseMeta(long documentId) {
+        return jdbc.query(
+                "SELECT published_version, legal_status, target_languages, created_at "
+                        + "FROM release_snapshot WHERE document_id = ? ORDER BY published_version",
+                (rs, n) -> new ReleaseMetaRow(rs.getInt("published_version"), rs.getString("legal_status"),
+                        rs.getString("target_languages"),
+                        rs.getTimestamp("created_at") == null ? null : rs.getTimestamp("created_at").toInstant()),
+                documentId);
+    }
+
+    /** 查询指定发布版本的元数据。 */
+    public Optional<ReleaseMetaRow> findReleaseMeta(long documentId, int publishedVersion) {
+        List<ReleaseMetaRow> rows = jdbc.query(
+                "SELECT published_version, legal_status, target_languages, created_at "
+                        + "FROM release_snapshot WHERE document_id = ? AND published_version = ?",
+                (rs, n) -> new ReleaseMetaRow(rs.getInt("published_version"), rs.getString("legal_status"),
+                        rs.getString("target_languages"),
+                        rs.getTimestamp("created_at") == null ? null : rs.getTimestamp("created_at").toInstant()),
+                documentId, publishedVersion);
+        return rows.stream().findFirst();
+    }
+
+    /**
+     * 插入 BINDING 草稿签署；同段落、同语种、同签署人、同译文版本已存在时返回 false（重复签署幂等重放前的兜底）。
+     */
+    public boolean insertSignature(long documentId, BindingSignatureRow row) {
+        int inserted = jdbc.update("INSERT INTO binding_signature (document_id, segment_id, language, signer, "
+                        + "translation_version, source_version, signed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                documentId, row.segmentId(), row.language(), row.signer(),
+                row.translationVersion(), row.sourceVersion(), Timestamp.from(row.signedAt()));
+        return inserted > 0;
+    }
+
+    public List<BindingSignatureRow> listSignatures(long documentId) {
+        return jdbc.query(
+                "SELECT segment_id, language, signer, translation_version, source_version, signed_at "
+                        + "FROM binding_signature WHERE document_id = ? "
+                        + "ORDER BY segment_id, language, translation_version, signed_at, signer",
+                SIGNATURE_MAPPER, documentId);
+    }
+
+    /** 发布元数据行：版本号、法律效力、覆盖语种与发布时间（UTC）。 */
+    public record ReleaseMetaRow(int publishedVersion, String legalStatus,
+                                 String targetLanguages, Instant publishedAt) {
     }
 
     /** 插入术语版本主记录（不可变，主键已存在时抛冲突）。 */

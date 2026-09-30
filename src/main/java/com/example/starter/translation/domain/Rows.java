@@ -1,5 +1,6 @@
 package com.example.starter.translation.domain;
 
+import java.time.Instant;
 import java.util.List;
 
 /**
@@ -69,6 +70,21 @@ public final class Rows {
      */
     public record ApprovalRow(String segmentId, String language, String reviewer,
                               int sourceVersion, int translationVersion) {
+    }
+
+    /**
+     * BINDING 草稿签署：签署人对特定段落、语种与译文版本的不可变确认；
+     * 仅当语种、译文版本、源文版本均与当前草稿一致时有效。
+     *
+     * @param segmentId          所属段落 ID
+     * @param language           被签署译文的目标语言码，小写；签署时固化
+     * @param signer             签署人，取签署时 X-Actor-Id；同一版本须两名不同签署人
+     * @param translationVersion 签署确认的译文版本，签署时固化
+     * @param sourceVersion      签署时译文所依据的源文版本，签署时固化
+     * @param signedAt           签署时间，UTC；null 表示该行尚未写入
+     */
+    public record BindingSignatureRow(String segmentId, String language, String signer,
+                                      int translationVersion, int sourceVersion, Instant signedAt) {
     }
 
     /**

@@ -92,7 +92,23 @@ public class TranslationController {
                         documentId, segmentId, language, actorId, request))).toResponseEntity();
     }
 
-    /** 发布：全部段落全部目标语言均有有效批准且术语校验通过时原子生成只读快照并递增发布版本。 */
+    /** BINDING 签署：签署人取 X-Actor-Id，固化语种、译文版本、源文版本与签署时间。 */
+    @PostMapping("/{documentId}/segments/{segmentId}/translations/{language}/sign")
+    public ResponseEntity<String> signTranslation(@PathVariable long documentId, @PathVariable String segmentId,
+                                                  @PathVariable String language,
+                                                  @RequestHeader("X-Actor-Id") String actorId,
+                                                  @Valid @RequestBody ApiDtos.SignTranslationRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/segments/" + segmentId
+                + "/translations/" + language + "/sign";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(201, translationService.signTranslation(
+                        documentId, segmentId, language, actorId, request))).toResponseEntity();
+    }
+
+    /**
+     * 发布：INFORMATIONAL（缺省）沿用全部语种有效批准条件；BINDING 仅发布指定 language，
+     * 须每个段落该语种有两名不同签署人对当前译文版本的有效签署。成功原子生成只读快照并递增发布版本。
+     */
     @PostMapping("/{documentId}/publish")
     public ResponseEntity<String> publish(@PathVariable long documentId,
                                           @Valid @RequestBody ApiDtos.PublishRequest request) {
@@ -134,6 +150,12 @@ public class TranslationController {
     public ResponseEntity<String> getRelease(@PathVariable long documentId, @PathVariable int publishedVersion) {
         return ResponseEntity.ok().contentType(MediaType.APPLICATION_JSON)
                 .body(translationService.getRelease(documentId, publishedVersion));
+    }
+
+    /** 查询法律效力视图：草稿签署及有效性、当前法律效力、历史发布摘要分区呈现。 */
+    @GetMapping("/{documentId}/legal-effect")
+    public ResponseEntity<ApiDtos.LegalEffectResponse> getLegalEffect(@PathVariable long documentId) {
+        return ResponseEntity.ok(translationService.getLegalEffect(documentId));
     }
 
     /** 计算请求摘要：操作（含路径变量）+ 操作者 + 规范化请求体的 SHA-256。 */

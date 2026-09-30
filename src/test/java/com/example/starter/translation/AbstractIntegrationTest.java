@@ -35,6 +35,7 @@ public abstract class AbstractIntegrationTest {
 
     @BeforeEach
     void cleanTables() {
+        jdbc.update("DELETE FROM binding_signature");
         jdbc.update("DELETE FROM approval");
         jdbc.update("DELETE FROM translation");
         jdbc.update("DELETE FROM segment");
@@ -120,6 +121,27 @@ public abstract class AbstractIntegrationTest {
         String body = "{\"requestId\":\"" + requestId + "\",\"expectedDraftVersion\":" + expectedDraftVersion
                 + ",\"expectedPublishedVersion\":" + expectedPublishedVersion + "}";
         return postJson("/api/documents/" + documentId + "/publish", body);
+    }
+
+    /** 指定法律效力发布：legalStatus 为 INFORMATIONAL 或 BINDING，BINDING 时携带 language。 */
+    protected ApiResult publishLegal(long documentId, int expectedDraftVersion, int expectedPublishedVersion,
+                                     String legalStatus, String language, String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"expectedDraftVersion\":" + expectedDraftVersion
+                + ",\"expectedPublishedVersion\":" + expectedPublishedVersion
+                + ",\"legalStatus\":\"" + legalStatus + "\""
+                + (language == null ? "" : ",\"language\":\"" + language + "\"") + "}";
+        return postJson("/api/documents/" + documentId + "/publish", body);
+    }
+
+    protected ApiResult sign(long documentId, String segmentId, String language, String actorId,
+                             int translationVersion, String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"translationVersion\":" + translationVersion + "}";
+        return postJson("/api/documents/" + documentId + "/segments/" + segmentId + "/translations/" + language
+                + "/sign", body, actorId);
+    }
+
+    protected ApiResult legalEffect(long documentId) throws Exception {
+        return getJson("/api/documents/" + documentId + "/legal-effect");
     }
 
     /** 新增术语版本：rulesJson 为规则数组 JSON。 */
