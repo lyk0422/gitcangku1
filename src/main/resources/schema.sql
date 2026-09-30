@@ -97,3 +97,41 @@ CREATE TABLE IF NOT EXISTS playout_emergency_override (
     PRIMARY KEY (override_key),
     KEY idx_override_playout (channel_id, status, start_ms, end_ms, priority)
 ) COMMENT = '限时紧急插播表；不改写日草稿与发布快照，同频道同优先级 ACTIVE 区间不得重叠';
+
+-- 区域切换：同一素材可分配给多个区域的不同 UTC 播出时段，占位校验与历史固化均以区域为边界。
+
+CREATE TABLE IF NOT EXISTS playout_region (
+    id            VARCHAR(64) NOT NULL COMMENT '播控区域 ID，客户端指定，创建后不变',
+    created_at_ms BIGINT      NOT NULL COMMENT '创建时间，UTC 纪元毫秒',
+    PRIMARY KEY (id)
+) COMMENT = '播控区域表';
+
+CREATE TABLE IF NOT EXISTS playout_region_grant (
+    id                BIGINT      NOT NULL AUTO_INCREMENT COMMENT '区域授权自增 ID',
+    region_id         VARCHAR(64) NOT NULL COMMENT '授权区域 ID',
+    asset_id          VARCHAR(64) NOT NULL COMMENT '授权素材 ID',
+    valid_from_ms     BIGINT      NOT NULL COMMENT '授权生效起点（含），UTC 纪元毫秒',
+    valid_to_ms       BIGINT      NOT NULL COMMENT '授权生效终点（不含），UTC 纪元毫秒，区间左闭右开',
+    revoked           TINYINT(1)  NOT NULL DEFAULT 0 COMMENT '是否已撤销：0 未撤销，1 已撤销；撤销为终态，只影响之后的编排',
+    revoke_request_id VARCHAR(64) NULL COMMENT '撤销操作的幂等请求 ID；未撤销时为 NULL',
+    revoked_at_ms     BIGINT      NULL COMMENT '撤销时间，UTC 纪元毫秒；未撤销时为 NULL',
+    created_at_ms     BIGINT      NOT NULL COMMENT '创建时间，UTC 纪元毫秒',
+    PRIMARY KEY (id),
+    KEY idx_region_grant_coverage (region_id, asset_id, revoked, valid_from_ms, valid_to_ms)
+) COMMENT = '区域素材授权表，授权创建后只能撤销；历史占位固化授权版本，不随撤销追改';
+
+CREATE TABLE IF NOT EXISTS playout_region_allocation (
+    id                  BIGINT      NOT NULL AUTO_INCREMENT COMMENT '区域占位自增 ID',
+    request_id          VARCHAR(64) NOT NULL COMMENT '编排提交的幂等请求 ID；同一编排整单共用，成功后唯一',
+    region_id           VARCHAR(64) NOT NULL COMMENT '占位所属播控区域 ID',
+    asset_id            VARCHAR(64) NOT NULL COMMENT '占位素材 ID，编排提交时固化',
+    grant_id            BIGINT      NOT NULL COMMENT '提交时确认覆盖该时段的区域授权 ID，固化授权版本',
+    grant_valid_from_ms BIGINT      NOT NULL COMMENT '提交时授权窗口起点（含）快照，UTC 纪元毫秒；授权之后变化不改写此值',
+    grant_valid_to_ms   BIGINT      NOT NULL COMMENT '提交时授权窗口终点（不含）快照，UTC 纪元毫秒；授权之后变化不改写此值',
+    start_ms            BIGINT      NOT NULL COMMENT 'UTC 播出开始（含），UTC 纪元毫秒',
+    end_ms              BIGINT      NOT NULL COMMENT 'UTC 播出结束（不含），UTC 纪元毫秒；同区域占位按左闭右开判重，相邻端点可接续',
+    created_at_ms       BIGINT      NOT NULL COMMENT '提交时间，UTC 纪元毫秒',
+    PRIMARY KEY (id),
+    KEY idx_region_allocation_request (request_id),
+    KEY idx_region_allocation_window (region_id, start_ms, end_ms)
+) COMMENT = '区域占位表；任一区域授权失效或时段重叠则整单 422 回滚，不留下部分区域占位';

@@ -15,6 +15,7 @@ import org.springframework.context.annotation.Configuration;
 
 import java.io.IOException;
 import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
 
@@ -52,5 +53,22 @@ public class JacksonConfig {
                 .modules(module)
                 .featuresToDisable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
                 .featuresToDisable(DeserializationFeature.ADJUST_DATES_TO_CONTEXT_TIME_ZONE);
+    }
+
+    /**
+     * 区域切换专用序列化器：区域授权窗口与播出时段均为 UTC 语义，固定以 +00:00 输出，
+     * 与 Asia/Shanghai 频道编排的时间字段区分。反序列化仍接受任意合法 ISO 8601 偏移。
+     */
+    public static class UtcOffsetSerializer extends JsonSerializer<OffsetDateTime> {
+        private static final DateTimeFormatter UTC_FORMAT = new DateTimeFormatterBuilder()
+                .appendPattern("yyyy-MM-dd'T'HH:mm:ss.SSS")
+                .appendOffset("+HH:MM", "+00:00")
+                .toFormatter();
+
+        @Override
+        public void serialize(OffsetDateTime value, JsonGenerator gen, SerializerProvider serializers)
+                throws IOException {
+            gen.writeString(UTC_FORMAT.format(value.withOffsetSameInstant(ZoneOffset.UTC)));
+        }
     }
 }

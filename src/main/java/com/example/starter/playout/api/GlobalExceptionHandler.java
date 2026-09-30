@@ -1,5 +1,6 @@
 package com.example.starter.playout.api;
 
+import com.example.starter.playout.RegionScheduleException;
 import com.example.starter.playout.api.Dtos.ErrorResponse;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -13,6 +14,8 @@ import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
+import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 /**
@@ -20,6 +23,14 @@ import java.util.stream.Collectors;
  */
 @RestControllerAdvice
 public class GlobalExceptionHandler {
+
+    @ExceptionHandler(RegionScheduleException.class)
+    public ResponseEntity<Map<String, Object>> handleRegionSchedule(RegionScheduleException ex) {
+        return ResponseEntity.status(ex.status()).body(Map.of(
+                "error", ex.code(),
+                "message", ex.getMessage(),
+                "conflicts", ex.conflicts()));
+    }
 
     @ExceptionHandler(ApiException.class)
     public ResponseEntity<ErrorResponse> handleApi(ApiException ex) {

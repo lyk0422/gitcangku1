@@ -1,11 +1,15 @@
 package com.example.starter.playout.api;
 
 import jakarta.validation.constraints.Max;
+import jakarta.validation.Valid;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.PositiveOrZero;
+import jakarta.validation.constraints.Size;
+
+import com.fasterxml.jackson.databind.annotation.JsonSerialize;
 
 import java.time.OffsetDateTime;
 import java.util.List;
@@ -166,6 +170,107 @@ public final class Dtos {
             String cancelRequestId,
             OffsetDateTime cancelledAt,
             OffsetDateTime createdAt) {
+    }
+
+    // ---------- 区域切换 ----------
+
+    /** 创建区域请求；id 为空时由系统生成稳定 ID。 */
+    public record CreateRegionRequest(String id) {
+    }
+
+    /** 区域响应；createdAt 为 UTC。 */
+    public record RegionResponse(
+            String id,
+            @JsonSerialize(using = JacksonConfig.UtcOffsetSerializer.class)
+            OffsetDateTime createdAt) {
+    }
+
+    /**
+     * 创建区域授权请求，授权窗口 [validFrom, validTo) 左闭右开，时间为 UTC（偏移 +00:00 表达）。
+     * 授权撤销为终态，只影响之后的编排，不追改历史占位。
+     */
+    public record CreateRegionGrantRequest(
+            @NotBlank String regionId,
+            @NotBlank String assetId,
+            @NotNull OffsetDateTime validFrom,
+            @NotNull OffsetDateTime validTo) {
+    }
+
+    /** 区域授权响应；revoked 为当前状态，授权窗口为 UTC。 */
+    public record RegionGrantResponse(
+            long id,
+            String regionId,
+            String assetId,
+            @JsonSerialize(using = JacksonConfig.UtcOffsetSerializer.class) OffsetDateTime validFrom,
+            @JsonSerialize(using = JacksonConfig.UtcOffsetSerializer.class) OffsetDateTime validTo,
+            boolean revoked) {
+    }
+
+    /** 撤销区域授权请求（幂等）。 */
+    public record RevokeRegionGrantRequest(@NotBlank String requestId) {
+    }
+
+    /**
+     * 区域时段输入：编排员把素材分配给某区域的 UTC 播出时段 [start, end)。
+     * 时段按 UTC 纪元毫秒判重，与表达偏移无关。
+     */
+    public record RegionSegmentInput(
+            @NotBlank String regionId,
+            @NotBlank String assetId,
+            @NotNull OffsetDateTime start,
+            @NotNull OffsetDateTime end) {
+    }
+
+    /**
+     * 区域编排提交请求。同一 requestId 重放首次区域清单；换素材或时段返回 409。
+     * 一次提交可包含多个区域，每个区域可有多个不重叠（相邻可接续）时段。
+     */
+    public record SubmitRegionScheduleRequest(
+            @NotBlank String requestId,
+            @NotNull @Size(min = 1) List<@NotNull @Valid RegionSegmentInput> segments) {
+    }
+
+    /** 单条占位的提交结果明细，固化素材与授权版本，所有时间为 UTC。 */
+    public record RegionAllocationResponse(
+            long id,
+            String requestId,
+            String regionId,
+            String assetId,
+            long grantId,
+            @JsonSerialize(using = JacksonConfig.UtcOffsetSerializer.class) OffsetDateTime grantValidFrom,
+            @JsonSerialize(using = JacksonConfig.UtcOffsetSerializer.class) OffsetDateTime grantValidTo,
+            @JsonSerialize(using = JacksonConfig.UtcOffsetSerializer.class) OffsetDateTime start,
+            @JsonSerialize(using = JacksonConfig.UtcOffsetSerializer.class) OffsetDateTime end,
+            @JsonSerialize(using = JacksonConfig.UtcOffsetSerializer.class) OffsetDateTime createdAt) {
+    }
+
+    /** 整次编排提交结果；按请求提交顺序返回各区域占位。 */
+    public record RegionScheduleResponse(
+            String requestId,
+            List<RegionAllocationResponse> allocations) {
+    }
+
+    /** 区域占位查询项（编排员视角，含固化的授权版本），所有时间为 UTC。 */
+    public record RegionOccupancyResponse(
+            long id,
+            String requestId,
+            String regionId,
+            String assetId,
+            long grantId,
+            @JsonSerialize(using = JacksonConfig.UtcOffsetSerializer.class) OffsetDateTime grantValidFrom,
+            @JsonSerialize(using = JacksonConfig.UtcOffsetSerializer.class) OffsetDateTime grantValidTo,
+            @JsonSerialize(using = JacksonConfig.UtcOffsetSerializer.class) OffsetDateTime start,
+            @JsonSerialize(using = JacksonConfig.UtcOffsetSerializer.class) OffsetDateTime end) {
+    }
+
+    /** 整单 422 时单个区域时段的冲突原因，时段为 UTC。 */
+    public record RegionConflictResponse(
+            String regionId,
+            String assetId,
+            @JsonSerialize(using = JacksonConfig.UtcOffsetSerializer.class) OffsetDateTime start,
+            @JsonSerialize(using = JacksonConfig.UtcOffsetSerializer.class) OffsetDateTime end,
+            String reason,
+            String detail) {
     }
 
     /** 统一错误响应体。 */
