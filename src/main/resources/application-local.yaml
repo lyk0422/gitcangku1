@@ -1,0 +1,15 @@
+# 本地运行 profile：H2 内存库（MODE=MySQL），无需外部 MySQL / Docker。
+# 状态仅在同一 JVM 生命周期内保留（DB_CLOSE_DELAY=-1 仅保证应用运行期间连接不断开时库不被释放），
+# 进程退出后内存数据全部丢失。
+spring:
+  datasource:
+    url: jdbc:h2:mem:consent-local;MODE=MySQL;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+  sql:
+    init:
+      mode: always
+      # H2 MySQL 兼容模式不使用带 MySQL 行内 COMMENT 的主脚本
+      schema-locations: classpath:schema-local.sql
+      data-locations: classpath:data-local.sql

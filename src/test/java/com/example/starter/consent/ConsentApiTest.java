@@ -45,6 +45,8 @@ class ConsentApiTest {
 
     @BeforeEach
     void cleanTables() {
+        jdbc.update("DELETE FROM read_audit");
+        jdbc.update("DELETE FROM recipient_attestation");
         jdbc.update("DELETE FROM consent_record");
         jdbc.update("DELETE FROM consent_grant");
         jdbc.update("DELETE FROM idempotency_request");
@@ -291,7 +293,7 @@ class ConsentApiTest {
     void invalidPurposeReturns400() throws Exception {
         mockMvc.perform(post("/api/v1/consents/grants")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"requestId\":\"g-1\",\"subjectKey\":\"subj-a\",\"purpose\":\"MARKETING\"}"))
+                        .content("{\"requestId\":\"g-1\",\"subjectKey\":\"subj-a\",\"purpose\":\"UNKNOWN_USE\"}"))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.code").value("INVALID_ARGUMENT"));
     }

@@ -29,3 +29,29 @@ CREATE TABLE IF NOT EXISTS idempotency_request (
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (request_id)
 );
+
+CREATE TABLE IF NOT EXISTS recipient_attestation (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    recipient_key VARCHAR(128) NOT NULL,
+    subject_key VARCHAR(128) NOT NULL,
+    purpose VARCHAR(32) NOT NULL,
+    epoch INT NOT NULL,
+    expires_at BIGINT NOT NULL,
+    created_at TIMESTAMP NOT NULL,
+    request_id VARCHAR(128) NOT NULL,
+    PRIMARY KEY (id),
+    UNIQUE (recipient_key, subject_key, purpose, epoch)
+);
+
+CREATE TABLE IF NOT EXISTS read_audit (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    subject_key VARCHAR(128) NOT NULL,
+    recipient_key VARCHAR(128) NOT NULL,
+    purpose VARCHAR(32) NOT NULL,
+    epoch INT NOT NULL,
+    record_key VARCHAR(128) NOT NULL,
+    read_at TIMESTAMP NOT NULL,
+    PRIMARY KEY (id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_read_audit_subject ON read_audit (subject_key);
