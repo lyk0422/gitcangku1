@@ -2,6 +2,7 @@ package com.example.starter.evidence;
 
 import com.example.starter.evidence.dto.CommandRequest;
 import com.example.starter.evidence.dto.CustodyChainView;
+import com.example.starter.evidence.dto.DestructionCreateRequest;
 import com.example.starter.evidence.dto.EvidenceView;
 import com.example.starter.evidence.dto.IntakeRequest;
 import com.example.starter.evidence.dto.LoanCreateRequest;
@@ -147,6 +148,21 @@ public class EvidenceController {
     @GetMapping("/loans/by-borrower/{borrowerId}")
     public List<LoanView> listActiveLoans(@PathVariable String borrowerId) {
         return evidenceService.listActiveLoansByBorrower(borrowerId);
+    }
+
+    /**
+     * 销毁申请：仅当前保管人且证物 SEALED；存在证物自身或所属案件有效冻结时返回 409，状态不变。
+     * 无有效冻结时证物进入 DESTROYED 终态；同 requestId 重放返回首次结论（含历史 DENIED）。
+     */
+    @PostMapping("/{evidenceKey}/destruction")
+    public ResponseEntity<String> destroy(@RequestHeader(ACTOR_HEADER) @NotBlank String actorId,
+                                          @PathVariable String evidenceKey,
+                                          @Valid @RequestBody DestructionCreateRequest request) {
+        String hash = idempotencyAdvisor.hash(EvidenceService.OP_DESTROY, actorId,
+                evidenceKey, request);
+        StoredResponse response = idempotencyAdvisor.guard(request.commandKey(), hash,
+                () -> evidenceService.destroy(actorId, evidenceKey, request, hash));
+        return toEntity(response);
     }
 
     /**

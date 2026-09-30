@@ -58,6 +58,30 @@ public class EvidenceRepository {
     }
 
     /**
+     * 锁定案件下全部证物行并按主键排序返回。
+     * 创建案件级冻结时使用：与销毁事务在同一组证物行锁上串行，
+     * 保证案件冻结与其下证物销毁并发时不会留下“冻结已生效而证物已销毁”。
+     * 案件尚无入库证物时返回空列表（此时没有可销毁对象，无需加锁）。
+     */
+    public List<Evidence> findByCaseKeyForUpdate(String caseKey) {
+        return jdbc.query(
+                "SELECT * FROM evidence WHERE case_key = ? ORDER BY id FOR UPDATE",
+                ROW_MAPPER, caseKey);
+    }
+
+    /**
+     * 条件更新为 DESTROYED：仅当证物仍处于给定当前状态时生效，兜底并发状态变更。
+     *
+     * @return 是否更新成功（false 表示证物状态已被并发改变）
+     */
+    public boolean markDestroyed(String evidenceKey, EvidenceStatus expectedStatus, LocalDateTime now) {
+        int updated = jdbc.update(
+                "UPDATE evidence SET status = ?, updated_at = ? WHERE evidence_key = ? AND status = ?",
+                EvidenceStatus.DESTROYED.name(), now, evidenceKey, expectedStatus.name());
+        return updated == 1;
+    }
+
+    /**
      * 更新证物状态与保管人（交接接受时原子切换保管人）。
      */
     public void updateCustody(String evidenceKey, String custodianId, EvidenceStatus status,
