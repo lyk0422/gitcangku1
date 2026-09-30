@@ -43,6 +43,33 @@ public class ReleaseController {
         return releaseService.cancel(releaseId, request.requestId());
     }
 
+    /**
+     * 发布人按候选设备当次冻结画像批量筛选投放：兼容设备建任务，不兼容设备返回原因。
+     */
+    @PostMapping("/{releaseId}/dispatch")
+    public DispatchResponse dispatch(@PathVariable long releaseId,
+                                     @Valid @RequestBody DispatchReleaseRequest request) {
+        return taskService.dispatch(releaseId, request);
+    }
+
+    /**
+     * 发布人查看硬件不兼容排除设备及原因（含判定时画像版本）。
+     */
+    @GetMapping("/{releaseId}/exclusions")
+    public ExclusionListResponse exclusions(@PathVariable long releaseId) {
+        return new ExclusionListResponse(taskService.listExclusions(releaseId).stream()
+                .map(ExclusionView::of).toList());
+    }
+
+    /**
+     * 失败率审计：查询任务创建时冻结的完整画像版本。
+     */
+    @GetMapping("/{releaseId}/tasks/{taskId}/profile-snapshot")
+    public TaskProfileSnapshotView taskProfileSnapshot(@PathVariable long releaseId,
+                                                       @PathVariable long taskId) {
+        return taskService.getTaskSnapshotView(releaseId, taskId);
+    }
+
     @PostMapping("/{releaseId}/resume")
     public ReleaseView resume(@PathVariable long releaseId, @Valid @RequestBody ResumeReleaseRequest request) {
         return releaseService.resume(releaseId, request);

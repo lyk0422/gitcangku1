@@ -30,10 +30,18 @@ class FirmwarePauseResumeTest {
 
     @BeforeEach
     void cleanUp() {
+        jdbc.update("DELETE FROM rollout_task_profile_snapshot");
+        jdbc.update("DELETE FROM rollout_exclusion");
         jdbc.update("DELETE FROM rollout_task");
         jdbc.update("DELETE FROM release_pause_record");
         jdbc.update("DELETE FROM release_resume_record");
         jdbc.update("DELETE FROM release_order");
+        jdbc.update("DELETE FROM device_profile_tag");
+        jdbc.update("DELETE FROM device_hardware_profile");
+        jdbc.update("DELETE FROM device_profile_head");
+        jdbc.update("DELETE FROM hardware_requirement_tag");
+        jdbc.update("DELETE FROM hardware_requirement_model");
+        jdbc.update("DELETE FROM hardware_requirement");
         jdbc.update("DELETE FROM device");
         jdbc.update("DELETE FROM idempotency_record");
     }

@@ -15,6 +15,7 @@ import java.util.Optional;
 
 /**
  * 投放任务数据访问。同设备同发布单由唯一约束 uk_task_release_device 保证最多一条。
+ * 启用画像门禁时，任务行与其画像冻结快照在同一事务写入，profile_version 永不再改。
  */
 @Repository
 public class TaskRepository {
@@ -23,10 +24,11 @@ public class TaskRepository {
         String firstResult = rs.getString("first_result");
         return new RolloutTask(rs.getLong("id"), rs.getLong("release_id"), rs.getString("device_id"),
                 TaskStatus.valueOf(rs.getString("status")),
-                firstResult == null ? null : ReceiptResult.valueOf(firstResult));
+                firstResult == null ? null : ReceiptResult.valueOf(firstResult),
+                (Integer) rs.getObject("profile_version"));
     };
 
-    private static final String COLUMNS = "id, release_id, device_id, status, first_result";
+    private static final String COLUMNS = "id, release_id, device_id, status, first_result, profile_version";
 
     private final JdbcTemplate jdbc;
 
@@ -34,17 +36,36 @@ public class TaskRepository {
         this.jdbc = jdbc;
     }
 
-    public long insert(long releaseId, String deviceId) {
+    /**
+     * @param profileVersion 创建时冻结的画像版本；未启用画像门禁时为 null
+     */
+    public long insert(long releaseId, String deviceId, Integer profileVersion) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO rollout_task (release_id, device_id, status) VALUES (?, ?, 'PENDING')",
+                    "INSERT INTO rollout_task (release_id, device_id, status, profile_version)"
+                            + " VALUES (?, ?, 'PENDING', ?)",
                     new String[]{"id"});
             ps.setLong(1, releaseId);
             ps.setString(2, deviceId);
+            if (profileVersion == null) {
+                ps.setNull(3, java.sql.Types.INTEGER);
+            } else {
+                ps.setInt(3, profileVersion);
+            }
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();
+    }
+
+    /**
+     * 写入任务创建时的完整画像冻结快照（型号、内存、标签JSON），与任务行同事务提交。
+     */
+    public void insertProfileSnapshot(long taskId, int profileVersion, String model, Integer memoryMb,
+                                      String tagsJson) {
+        jdbc.update("INSERT INTO rollout_task_profile_snapshot"
+                + " (task_id, profile_version, model, memory_mb, capability_tags)"
+                + " VALUES (?, ?, ?, ?, ?)", taskId, profileVersion, model, memoryMb, tagsJson);
     }
 
     public Optional<RolloutTask> findById(long id) {
@@ -79,6 +100,14 @@ public class TaskRepository {
         }
         return jdbc.query("SELECT " + COLUMNS + " FROM rollout_task WHERE release_id = ? AND status = ? ORDER BY id",
                 MAPPER, releaseId, statusFilter.name());
+    }
+
+    /**
+     * 设备端只查自己的任务。
+     */
+    public List<RolloutTask> findByDevice(String deviceId) {
+        return jdbc.query("SELECT " + COLUMNS + " FROM rollout_task WHERE device_id = ? ORDER BY id",
+                MAPPER, deviceId);
     }
 
     public long countByReleaseAndDevice(long releaseId, String deviceId) {

@@ -39,4 +39,12 @@ public class DeviceController {
     public PullResponse pull(@PathVariable String deviceId, @Valid @RequestBody RequestIdBody request) {
         return taskService.pull(deviceId, request.requestId());
     }
+
+    /**
+     * 设备端只看自己的任务。
+     */
+    @GetMapping("/{deviceId}/tasks")
+    public TaskListResponse tasks(@PathVariable String deviceId) {
+        return taskService.listByDevice(deviceId);
+    }
 }
