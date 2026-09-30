@@ -30,6 +30,17 @@ public class DeviceRepository {
                 deviceId).stream().findFirst();
     }
 
+    /**
+     * 设备行锁：拉取与回执的隔离判定/计数在同一设备行锁内串行，避免隔离与领取竞争。
+     */
+    public Optional<Device> findByIdForUpdate(String deviceId) {
+        return jdbc.query(
+                "SELECT device_id, model, current_version, bucket_no FROM device WHERE device_id = ? FOR UPDATE",
+                (rs, rowNum) -> new Device(rs.getString("device_id"), rs.getString("model"),
+                        rs.getString("current_version"), rs.getInt("bucket_no")),
+                deviceId).stream().findFirst();
+    }
+
     public void updateCurrentVersion(String deviceId, String newVersion) {
         jdbc.update("UPDATE device SET current_version = ? WHERE device_id = ?", newVersion, deviceId);
     }

@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS rollout_task (
   device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
   status VARCHAR(16) NOT NULL COMMENT 'PENDING待回执；SUCCESS成功；FAILED失败；CANCELLED已取消',
   first_result VARCHAR(16) NULL COMMENT '首次回执结果（SUCCESS/FAILED），未回执为NULL',
+  failure_reason VARCHAR(512) NULL COMMENT '失败原因，FAILED首次回执原样记录；SUCCESS或未回执为NULL',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
   PRIMARY KEY (id),
@@ -71,3 +72,33 @@ CREATE TABLE IF NOT EXISTS idempotency_record (
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   PRIMARY KEY (request_id)
 ) COMMENT='写操作幂等去重记录，失败不占键';
+
+CREATE TABLE IF NOT EXISTS device_quarantine_round (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '隔离轮次ID',
+  device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
+  target_version VARCHAR(64) NOT NULL COMMENT '本轮目标固件版本，即失败发布单的to_version',
+  round_no INT NOT NULL COMMENT '同一设备同一目标版本的投放轮次序号，从1开始；解除隔离开新一轮',
+  consecutive_failures INT NOT NULL COMMENT '本轮连续失败次数，取值0~2；失败重置为0，成功后不再参与计数',
+  status VARCHAR(16) NOT NULL COMMENT 'TRACKING计数中；QUARANTINED已隔离（终态前不可拉取）；RELEASED已解除并开启新一轮',
+  first_task_id BIGINT NULL COMMENT '本轮第一次失败任务ID，首次失败时固化',
+  first_release_id BIGINT NULL COMMENT '本轮第一次失败所属发布单ID',
+  first_reason VARCHAR(512) NULL COMMENT '本轮第一次失败原因，首次失败回执原样记录；回执未填为NULL',
+  first_failed_at_utc VARCHAR(40) NULL COMMENT '本轮第一次失败时刻，UTC，ISO-8601；未失败为NULL',
+  second_task_id BIGINT NULL COMMENT '本轮第二次失败任务ID，隔离提交时固化',
+  second_release_id BIGINT NULL COMMENT '本轮第二次失败所属发布单ID',
+  second_reason VARCHAR(512) NULL COMMENT '本轮第二次失败原因，隔离提交时固化；回执未填为NULL',
+  second_failed_at_utc VARCHAR(40) NULL COMMENT '本轮第二次失败时刻，UTC，ISO-8601；未隔离为NULL',
+  confirmed_by VARCHAR(64) NULL COMMENT '隔离确认人，取第二次失败回执提交操作人；未隔离为NULL',
+  quarantined_at_utc VARCHAR(40) NULL COMMENT '隔离生效时刻，UTC，ISO-8601；未隔离为NULL',
+  released_by VARCHAR(64) NULL COMMENT '解除隔离审核人，必须不同于confirmed_by；未解除为NULL',
+  released_at_utc VARCHAR(40) NULL COMMENT '解除隔离时刻，UTC，ISO-8601；未解除为NULL',
+  release_reason VARCHAR(256) NULL COMMENT '解除隔离审核原因；未解除为NULL',
+  next_round_id BIGINT NULL COMMENT '解除时开启的下一轮记录ID；未解除为NULL',
+  active_slot VARCHAR(129) NULL COMMENT '活跃槽位=设备ID|目标版本，仅TRACKING/QUARANTINED行有值；RELEASED置NULL。唯一索引保证同设备同版本至多一条活跃轮次，NULL多行不冲突',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '本轮记录创建时间',
+  PRIMARY KEY (id),
+  CONSTRAINT uk_quarantine_device_version_round UNIQUE (device_id, target_version, round_no)
+) COMMENT='设备按目标固件版本维度的连续失败与隔离轮次；版本变化轮次独立，历史不重算、不删除';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_quarantine_active_slot ON device_quarantine_round (active_slot);
+

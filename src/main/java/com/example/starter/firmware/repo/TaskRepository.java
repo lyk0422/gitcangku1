@@ -23,10 +23,11 @@ public class TaskRepository {
         String firstResult = rs.getString("first_result");
         return new RolloutTask(rs.getLong("id"), rs.getLong("release_id"), rs.getString("device_id"),
                 TaskStatus.valueOf(rs.getString("status")),
-                firstResult == null ? null : ReceiptResult.valueOf(firstResult));
+                firstResult == null ? null : ReceiptResult.valueOf(firstResult),
+                rs.getString("failure_reason"));
     };
 
-    private static final String COLUMNS = "id, release_id, device_id, status, first_result";
+    private static final String COLUMNS = "id, release_id, device_id, status, first_result, failure_reason";
 
     private final JdbcTemplate jdbc;
 
@@ -62,9 +63,10 @@ public class TaskRepository {
                 MAPPER, releaseId, deviceId).stream().findFirst();
     }
 
-    public void complete(long id, ReceiptResult result) {
-        jdbc.update("UPDATE rollout_task SET status = ?, first_result = ?, updated_at = CURRENT_TIMESTAMP"
-                + " WHERE id = ?", result.name(), result.name(), id);
+    public void complete(long id, ReceiptResult result, String failureReason) {
+        jdbc.update("UPDATE rollout_task SET status = ?, first_result = ?, failure_reason = ?,"
+                + " updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                result.name(), result.name(), result == ReceiptResult.FAILED ? failureReason : null, id);
     }
 
     public int cancelPendingByRelease(long releaseId) {
