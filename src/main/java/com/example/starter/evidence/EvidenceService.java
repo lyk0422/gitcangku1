@@ -3,7 +3,9 @@ package com.example.starter.evidence;
 import com.example.starter.error.ApiException;
 import com.example.starter.evidence.dto.CommandRequest;
 import com.example.starter.evidence.dto.CustodyChainView;
+import com.example.starter.evidence.dto.DestructionView;
 import com.example.starter.evidence.dto.EvidenceView;
+import com.example.starter.evidence.dto.HoldView;
 import com.example.starter.evidence.dto.InspectionView;
 import com.example.starter.evidence.dto.IntakeRequest;
 import com.example.starter.evidence.dto.LoanCreateRequest;
@@ -46,6 +48,8 @@ public class EvidenceService {
     private final SealInspectionRepository inspectionRepository;
     private final LoanRecordRepository loanRepository;
     private final CommandLogRepository commandLogRepository;
+    private final RetentionHoldRepository holdRepository;
+    private final DestructionRequestRepository destructionRepository;
     private final ObjectMapper objectMapper;
     private final EvidenceClock clock;
 
@@ -54,6 +58,8 @@ public class EvidenceService {
                            SealInspectionRepository inspectionRepository,
                            LoanRecordRepository loanRepository,
                            CommandLogRepository commandLogRepository,
+                           RetentionHoldRepository holdRepository,
+                           DestructionRequestRepository destructionRepository,
                            ObjectMapper objectMapper,
                            EvidenceClock clock) {
         this.evidenceRepository = evidenceRepository;
@@ -61,6 +67,8 @@ public class EvidenceService {
         this.inspectionRepository = inspectionRepository;
         this.loanRepository = loanRepository;
         this.commandLogRepository = commandLogRepository;
+        this.holdRepository = holdRepository;
+        this.destructionRepository = destructionRepository;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -103,6 +111,7 @@ public class EvidenceService {
         if (request.toCustodian().equals(actorId)) {
             throw ApiException.badRequest("接收人不能与发起保管人相同");
         }
+        requireNotDestroyed(evidence);
         requireSealIntact(evidence);
         requireCustodian(evidence, actorId);
         if (evidence.status() == EvidenceStatus.TRANSFER_PENDING) {
@@ -135,6 +144,7 @@ public class EvidenceService {
         if (replay.isPresent()) {
             return replay.get();
         }
+        requireNotDestroyed(evidence);
         requireSealIntact(evidence);
         TransferRecord pending = requirePending(evidence, evidenceKey);
         if (!pending.toCustodian().equals(actorId)) {
@@ -166,6 +176,7 @@ public class EvidenceService {
         if (replay.isPresent()) {
             return replay.get();
         }
+        requireNotDestroyed(evidence);
         requireSealIntact(evidence);
         TransferRecord pending = requirePending(evidence, evidenceKey);
         if (!pending.fromCustodian().equals(actorId)) {
@@ -199,6 +210,7 @@ public class EvidenceService {
             return replay.get();
         }
         requireCustodian(evidence, actorId);
+        requireNotDestroyed(evidence);
         if (evidence.status() == EvidenceStatus.TRANSFER_PENDING) {
             throw ApiException.conflict("待接收期间禁止封条核验: " + evidenceKey);
         }
@@ -238,6 +250,7 @@ public class EvidenceService {
             throw ApiException.badRequest("借用人不能与当前保管人相同");
         }
         requireCustodian(evidence, actorId);
+        requireNotDestroyed(evidence);
         if (evidence.status() == EvidenceStatus.SEAL_BROKEN) {
             throw ApiException.unprocessable("封条已异常，禁止借出: " + evidenceKey);
         }
@@ -285,6 +298,7 @@ public class EvidenceService {
         }
         LoanRecord loan = loanRepository.findByLoanKey(request.loanKey())
                 .orElseThrow(() -> ApiException.notFound("借出记录不存在: " + request.loanKey()));
+        requireNotDestroyed(evidence);
         if (!loan.evidenceKey().equals(evidenceKey)) {
             throw ApiException.notFound("借出记录不属于该证物: " + request.loanKey());
         }
@@ -336,7 +350,8 @@ public class EvidenceService {
     }
 
     /**
-     * 查询完整保管链：证物当前状态 + 全部交接记录 + 全部借出记录 + 全部核验记录。
+     * 查询完整保管链：证物当前状态 + 全部交接/借出/核验记录
+     * + 与本证物相关的案件级、证物级冻结（含解除链）+ 全部销毁申请历史。
      */
     @Transactional(readOnly = true)
     public CustodyChainView custodyChain(String evidenceKey) {
@@ -348,12 +363,24 @@ public class EvidenceService {
                 .stream().map(this::toView).toList();
         List<InspectionView> inspections = inspectionRepository.findByEvidenceKey(evidenceKey)
                 .stream().map(this::toView).toList();
-        return new CustodyChainView(toView(evidence), transfers, loans, inspections);
+        LocalDateTime nowUtc = clock.nowUtc();
+        List<HoldView> holds = holdRepository.findForEvidence(evidence.caseKey(), evidenceKey)
+                .stream().map(hold -> toHoldView(hold, nowUtc)).toList();
+        List<DestructionView> destructions = destructionRepository.findByEvidenceKey(evidenceKey)
+                .stream().map(this::toDestructionView).toList();
+        return new CustodyChainView(toView(evidence), transfers, loans, inspections,
+                holds, destructions);
     }
 
     private Evidence lockEvidence(String evidenceKey) {
         return evidenceRepository.findByKeyForUpdate(evidenceKey)
                 .orElseThrow(() -> ApiException.notFound("证物不存在: " + evidenceKey));
+    }
+
+    private void requireNotDestroyed(Evidence evidence) {
+        if (evidence.status() == EvidenceStatus.DESTROYED) {
+            throw ApiException.conflict("证物已销毁，禁止该操作: " + evidence.evidenceKey());
+        }
     }
 
     private void requireSealIntact(Evidence evidence) {
@@ -424,5 +451,20 @@ public class EvidenceService {
         return new LoanView(loan.loanKey(), loan.evidenceKey(), loan.custodianId(),
                 loan.borrowerId(), loan.purpose(), loan.loanAt(), loan.dueAt(), loan.status(),
                 overdue, loan.sealPassed(), loan.returnNote(), loan.returnedAt());
+    }
+
+    private HoldView toHoldView(RetentionHold hold, LocalDateTime nowUtc) {
+        boolean effective = HoldWindow.isEffective(hold.status(), hold.createdUtc(),
+                hold.expiresUtc(), nowUtc);
+        return new HoldView(hold.id(), hold.requestId(), hold.scope(), hold.caseKey(),
+                hold.evidenceKey(), hold.expiresUtc(), hold.reason(), hold.createdBy(),
+                hold.createdUtc(), hold.status(), effective, hold.releasedBy(),
+                hold.releaseReason(), hold.releasedUtc());
+    }
+
+    private DestructionView toDestructionView(DestructionRequestRecord saved) {
+        return new DestructionView(saved.requestId(), saved.evidenceKey(), saved.caseKey(),
+                saved.reason(), saved.requestedBy(), saved.status(), saved.blockingHoldId(),
+                saved.requestedUtc());
     }
 }

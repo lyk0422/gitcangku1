@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS evidence (
     category VARCHAR(64) NOT NULL COMMENT '证物类别，入库后不可修改',
     seal_no VARCHAR(64) NOT NULL COMMENT '封条编号，入库后不可修改',
     custodian_id VARCHAR(64) NOT NULL COMMENT '当前保管人（操作人标识），交接接受后原子切换；借出期间不变',
-    status VARCHAR(20) NOT NULL COMMENT '证物状态：SEALED 已封存 / TRANSFER_PENDING 待接收 / BORROWED 借出未归还 / SEAL_BROKEN 封条异常（终态）',
+    status VARCHAR(20) NOT NULL COMMENT '证物状态：SEALED 已封存 / TRANSFER_PENDING 待接收 / BORROWED 借出未归还 / SEAL_BROKEN 封条异常（终态） / DESTROYED 已销毁（终态）',
     created_at DATETIME(6) NOT NULL COMMENT '入库时间，Asia/Shanghai',
     updated_at DATETIME(6) NOT NULL COMMENT '最近一次状态或保管人变更时间，Asia/Shanghai',
     CONSTRAINT uk_evidence_key UNIQUE (evidence_key)
@@ -65,10 +65,55 @@ CREATE TABLE IF NOT EXISTS command_log (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     command_key VARCHAR(64) NOT NULL COMMENT '幂等命令键，全局唯一',
     actor_id VARCHAR(64) NOT NULL COMMENT '发起操作人',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN/HOLD_PLACE/HOLD_RELEASE/DESTRUCTION_REQUEST',
     request_hash VARCHAR(64) NOT NULL COMMENT '请求参数规范化后的 SHA-256，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行的 HTTP 状态码',
     response_body TEXT NOT NULL COMMENT '首次执行的响应体 JSON，重放时原样返回',
     created_at DATETIME(6) NOT NULL COMMENT '首次执行时间，Asia/Shanghai',
     CONSTRAINT uk_command_key UNIQUE (command_key)
+);
+
+-- 保留冻结：可挂在案件（scope=CASE，evidence_key 为 NULL）或单件证物（scope=EVIDENCE）两级；只追加。
+-- 有效期左闭右开 [created_utc, expires_utc)：now < expires_utc 且未解除时阻断销毁；恰好到期不再阻断。
+-- request_id 全局唯一：同键同参重放首次结果（含首次 409），同键换对象或到期时间返回 409。
+CREATE TABLE IF NOT EXISTS retention_hold (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    request_id VARCHAR(64) NOT NULL COMMENT '冻结/解除请求幂等键，全局唯一，重放返回首次结果',
+    request_hash VARCHAR(64) NOT NULL COMMENT '冻结请求参数规范化后的 SHA-256，用于识别同键换对象或到期时间',
+    scope VARCHAR(10) NOT NULL COMMENT '冻结层级：CASE 案件级（覆盖案件下全部证物）/ EVIDENCE 单件证物级',
+    case_key VARCHAR(64) NOT NULL COMMENT '案件级为冻结案件键；证物级为该证物所属案件键',
+    evidence_key VARCHAR(64) NULL COMMENT '证物级冻结的证物业务键；案件级为 NULL',
+    expires_utc DATETIME(6) NOT NULL COMMENT 'UTC 到期时刻（不含）：达到该时刻后冻结自动失效，不阻断新销毁申请',
+    reason VARCHAR(512) NOT NULL COMMENT '冻结创建原因，非空',
+    created_by VARCHAR(64) NOT NULL COMMENT '冻结创建保管人；解除人必须与此人不同',
+    created_utc DATETIME(6) NOT NULL COMMENT '冻结生效时刻，UTC，有效期起点（含）',
+    status VARCHAR(10) NOT NULL COMMENT '冻结状态：ACTIVE 有效（未解除且未到期）/ RELEASED 已由他人解除 / EXPIRED 已到期（查询时刻判定，不回写）',
+    release_request_id VARCHAR(64) NULL COMMENT '解除请求幂等键，全局唯一；NULL 表示未解除。同键重放首次解除结果，换冻结或原因返回 409',
+    release_request_hash VARCHAR(64) NULL COMMENT '解除请求参数规范化后的 SHA-256，用于识别同键换冻结或原因',
+    released_by VARCHAR(64) NULL COMMENT '解除签明保管人，必须不同于 created_by；NULL 表示未解除',
+    release_reason VARCHAR(512) NULL COMMENT '解除原因，非空签明；NULL 表示未解除',
+    released_utc DATETIME(6) NULL COMMENT '解除时刻，UTC；NULL 表示未解除。解除只影响后续销毁申请，不改写历史',
+    created_at DATETIME(6) NOT NULL COMMENT '记录创建时间，Asia/Shanghai',
+    CONSTRAINT uk_retention_hold_request UNIQUE (request_id),
+    CONSTRAINT uk_retention_hold_release UNIQUE (release_request_id),
+    KEY idx_hold_case_scope (case_key, scope, status),
+    KEY idx_hold_evidence (evidence_key, scope, status)
+);
+
+-- 销毁申请：只追加，被冻结拒绝的申请同样落库（APPROVED/REJECTED 均不可改写）。
+-- 重新申请必须使用新 request_id；到期或解除不改写过去被拒记录。request_id 全局唯一保证重放。
+CREATE TABLE IF NOT EXISTS destruction_request (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    request_id VARCHAR(64) NOT NULL COMMENT '销毁申请幂等键，全局唯一，重放返回首次结果',
+    request_hash VARCHAR(64) NOT NULL COMMENT '销毁申请参数规范化后的 SHA-256，用于识别同键换证物或原因',
+    evidence_key VARCHAR(64) NOT NULL COMMENT '被申请销毁的证物业务键',
+    case_key VARCHAR(64) NOT NULL COMMENT '申请时证物所属案件键，用于核对案件级冻结',
+    reason VARCHAR(512) NOT NULL COMMENT '销毁原因，非空',
+    requested_by VARCHAR(64) NOT NULL COMMENT '申请保管人',
+    status VARCHAR(10) NOT NULL COMMENT '申请结果：APPROVED 已批准并销毁 / REJECTED 因有效冻结被拒（409）',
+    blocking_hold_id BIGINT NULL COMMENT '阻断销毁的冻结记录 id；NULL 表示未被冻结阻断',
+    requested_utc DATETIME(6) NOT NULL COMMENT '申请裁决时刻，UTC，冻结有效期按该时刻左闭右开判定',
+    created_at DATETIME(6) NOT NULL COMMENT '记录创建时间，Asia/Shanghai',
+    CONSTRAINT uk_destruction_request UNIQUE (request_id),
+    KEY idx_destruction_evidence (evidence_key)
 );

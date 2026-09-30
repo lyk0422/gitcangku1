@@ -85,6 +85,24 @@ public class EvidenceRepository {
                 ROW_MAPPER, custodianId, EvidenceStatus.SEALED.name());
     }
 
+    /**
+     * 按案件键查询（不加锁）全部证物，用于只读存在性校验。
+     */
+    public List<Evidence> findByCaseKey(String caseKey) {
+        return jdbc.query(
+                "SELECT * FROM evidence WHERE case_key = ? ORDER BY id", ROW_MAPPER, caseKey);
+    }
+
+    /**
+     * 按 id 顺序锁定案件下全部证物行。创建案件级冻结时使用：
+     * 与销毁（锁单件证物行）通过同一组行锁互斥，保证不会出现冻结已生效而证物同时被销毁。
+     */
+    public List<Evidence> findByCaseKeyForUpdate(String caseKey) {
+        return jdbc.query(
+                "SELECT * FROM evidence WHERE case_key = ? ORDER BY id FOR UPDATE",
+                ROW_MAPPER, caseKey);
+    }
+
     private static final class EvidenceRowMapper implements RowMapper<Evidence> {
         @Override
         public Evidence mapRow(ResultSet rs, int rowNum) throws SQLException {
