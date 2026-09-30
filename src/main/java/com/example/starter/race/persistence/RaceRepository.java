@@ -3,6 +3,8 @@ package com.example.starter.race.persistence;
 import com.example.starter.race.domain.EntryStatus;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
+import com.example.starter.race.domain.ReclassStatus;
+import com.example.starter.race.domain.RunnerStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
@@ -30,6 +32,13 @@ public class RaceRepository {
             new CheckpointTimingRowMapper();
     private static final SnapshotCheckpointRowMapper SNAPSHOT_CHECKPOINT_ROW_MAPPER =
             new SnapshotCheckpointRowMapper();
+    private static final CategoryRowMapper CATEGORY_ROW_MAPPER = new CategoryRowMapper();
+    private static final ReclassRequestRowMapper RECLASS_REQUEST_ROW_MAPPER =
+            new ReclassRequestRowMapper();
+    private static final ReclassRecordRowMapper RECLASS_RECORD_ROW_MAPPER =
+            new ReclassRecordRowMapper();
+    private static final CategorySnapshotEntryRowMapper CATEGORY_SNAPSHOT_ENTRY_ROW_MAPPER =
+            new CategorySnapshotEntryRowMapper();
 
     private final JdbcTemplate jdbcTemplate;
 
@@ -62,7 +71,7 @@ public class RaceRepository {
     /** 查询赛事下全部选手，按参赛号字典序排列。 */
     public List<RunnerRow> findRunners(String raceId) {
         return jdbcTemplate.query(
-                "SELECT id, race_id, bib, finish_time_ms, created_at, updated_at "
+                "SELECT id, race_id, bib, finish_time_ms, status, category_code, created_at, updated_at "
                         + "FROM runner WHERE race_id = ? ORDER BY bib",
                 RUNNER_ROW_MAPPER, raceId);
     }
@@ -70,7 +79,7 @@ public class RaceRepository {
     /** 按赛事与参赛号查询选手。 */
     public Optional<RunnerRow> findRunner(String raceId, String bib) {
         return jdbcTemplate
-                .query("SELECT id, race_id, bib, finish_time_ms, created_at, updated_at "
+                .query("SELECT id, race_id, bib, finish_time_ms, status, category_code, created_at, updated_at "
                                 + "FROM runner WHERE race_id = ? AND bib = ?",
                         RUNNER_ROW_MAPPER, raceId, bib)
                 .stream()
@@ -80,7 +89,7 @@ public class RaceRepository {
     /** 查询赛事下全部处罚（含已撤销），按新增时间与处罚ID排列。 */
     public List<PenaltyRow> findPenalties(String raceId) {
         return jdbcTemplate.query(
-                "SELECT penalty_id, race_id, bib, type, amount_ms, revoked, created_at, revoked_at "
+                "SELECT penalty_id, race_id, bib, type, amount_ms, category_code, revoked, created_at, revoked_at "
                         + "FROM penalty WHERE race_id = ? ORDER BY created_at, penalty_id",
                 PENALTY_ROW_MAPPER, raceId);
     }
@@ -88,7 +97,7 @@ public class RaceRepository {
     /** 按全局处罚ID查询处罚。 */
     public Optional<PenaltyRow> findPenalty(String penaltyId) {
         return jdbcTemplate
-                .query("SELECT penalty_id, race_id, bib, type, amount_ms, revoked, created_at, revoked_at "
+                .query("SELECT penalty_id, race_id, bib, type, amount_ms, category_code, revoked, created_at, revoked_at "
                                 + "FROM penalty WHERE penalty_id = ?",
                         PENALTY_ROW_MAPPER, penaltyId)
                 .stream()
@@ -124,7 +133,7 @@ public class RaceRepository {
     /** 查询某选手的全部分段记录，按 position 升序排列。 */
     public List<CheckpointTimingRow> findTimingsForRunner(String raceId, String bib) {
         return jdbcTemplate.query(
-                "SELECT timing_id, race_id, bib, checkpoint_code, position, elapsed_millis, created_at "
+                "SELECT timing_id, race_id, bib, checkpoint_code, position, elapsed_millis, category_code, created_at "
                         + "FROM checkpoint_timing WHERE race_id = ? AND bib = ? ORDER BY position",
                 CHECKPOINT_TIMING_ROW_MAPPER, raceId, bib);
     }
@@ -132,7 +141,7 @@ public class RaceRepository {
     /** 查询赛事下全部分段记录（用于实时成绩与封榜计算）。 */
     public List<CheckpointTimingRow> findAllTimings(String raceId) {
         return jdbcTemplate.query(
-                "SELECT timing_id, race_id, bib, checkpoint_code, position, elapsed_millis, created_at "
+                "SELECT timing_id, race_id, bib, checkpoint_code, position, elapsed_millis, category_code, created_at "
                         + "FROM checkpoint_timing WHERE race_id = ? ORDER BY bib, position",
                 CHECKPOINT_TIMING_ROW_MAPPER, raceId);
     }
@@ -140,7 +149,7 @@ public class RaceRepository {
     /** 按全局分段ID查询记录（用于 timingId 幂等重放）。 */
     public Optional<CheckpointTimingRow> findTiming(String timingId) {
         return jdbcTemplate
-                .query("SELECT timing_id, race_id, bib, checkpoint_code, position, elapsed_millis, created_at "
+                .query("SELECT timing_id, race_id, bib, checkpoint_code, position, elapsed_millis, category_code, created_at "
                                 + "FROM checkpoint_timing WHERE timing_id = ?",
                         CHECKPOINT_TIMING_ROW_MAPPER, timingId)
                 .stream()
@@ -151,10 +160,10 @@ public class RaceRepository {
     public void insertTiming(CheckpointTimingRow row) {
         jdbcTemplate.update(
                 "INSERT INTO checkpoint_timing "
-                        + "(timing_id, race_id, bib, checkpoint_code, position, elapsed_millis, created_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        + "(timing_id, race_id, bib, checkpoint_code, position, elapsed_millis, category_code, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 row.timingId(), row.raceId(), row.bib(), row.checkpointCode(),
-                row.position(), row.elapsedMillis(), row.createdAt());
+                row.position(), row.elapsedMillis(), row.categoryCode(), row.createdAt());
     }
 
     /** 一次性写入赛事检查点配置（配置后不可修改）。 */
@@ -224,11 +233,11 @@ public class RaceRepository {
     }
 
     /** 登记选手；finishTimeMs 为 null 表示计时缺失。 */
-    public void insertRunner(String raceId, String bib, Long finishTimeMs, long now) {
+    public void insertRunner(String raceId, String bib, String categoryCode, Long finishTimeMs, long now) {
         jdbcTemplate.update(
-                "INSERT INTO runner (race_id, bib, finish_time_ms, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, ?, ?)",
-                raceId, bib, finishTimeMs, now, now);
+                "INSERT INTO runner (race_id, bib, finish_time_ms, category_code, status, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, 'ACTIVE', ?, ?)",
+                raceId, bib, finishTimeMs, categoryCode, now, now);
     }
 
     /** 修订选手原始完赛耗时；返回受影响行数（0 表示选手不存在）。 */
@@ -238,19 +247,20 @@ public class RaceRepository {
                 finishTimeMs, now, raceId, bib);
     }
 
-    /** 新增处罚（不可覆盖历史）。 */
+    /** 新增处罚（不可覆盖历史）；categoryCode 为登记时选手所在组别。 */
     public void insertPenalty(
             String penaltyId,
             String raceId,
             String bib,
             PenaltyType type,
             Long amountMs,
+            String categoryCode,
             long now) {
         jdbcTemplate.update(
                 "INSERT INTO penalty "
-                        + "(penalty_id, race_id, bib, type, amount_ms, revoked, created_at, revoked_at) "
-                        + "VALUES (?, ?, ?, ?, ?, FALSE, ?, NULL)",
-                penaltyId, raceId, bib, type.name(), amountMs, now);
+                        + "(penalty_id, race_id, bib, type, amount_ms, category_code, revoked, created_at, revoked_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, FALSE, ?, NULL)",
+                penaltyId, raceId, bib, type.name(), amountMs, categoryCode, now);
     }
 
     /** 撤销处罚，仅对当前未撤销的处罚生效；返回受影响行数。 */

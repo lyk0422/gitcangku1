@@ -11,6 +11,7 @@ import com.example.starter.race.domain.TimingView;
  * @param checkpointCode 检查点代码
  * @param position       检查点顺序（配置时固化）
  * @param elapsedMillis  通过该检查点的累计耗时（毫秒，1~86400000）
+ * @param categoryCode   分段归属组别（提交时选手所在组别，随组别重分整体迁移）
  * @param createdAt      提交时间，Unix毫秒时间戳
  */
 public record CheckpointTimingRow(
@@ -20,6 +21,7 @@ public record CheckpointTimingRow(
         String checkpointCode,
         int position,
         long elapsedMillis,
+        String categoryCode,
         long createdAt
 ) implements TimingView {
 }
