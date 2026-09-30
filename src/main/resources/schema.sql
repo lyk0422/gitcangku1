@@ -71,3 +71,27 @@ CREATE TABLE IF NOT EXISTS idempotency_record (
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   PRIMARY KEY (request_id)
 ) COMMENT='写操作幂等去重记录，失败不占键';
+
+CREATE TABLE IF NOT EXISTS device_failure_round (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '轮次ID',
+  device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
+  to_version VARCHAR(64) NOT NULL COMMENT '目标固件版本；连续失败计数按设备+目标版本独立，版本变化另开计数，历史不重算',
+  round_no INT NOT NULL COMMENT '该设备该目标版本的失败轮次序号，从1开始；隔离解除后再次失败开启新一轮',
+  consecutive_failed INT NOT NULL COMMENT '本轮连续失败次数：1第一次失败；2第二次失败并触发隔离；解除开启的新一轮重新从0计',
+  status VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE计数中（1次失败，仍可投放）；QUARANTINED连续2次失败已隔离（拉取409）；RELEASED已人工解除（轮次关闭，历史保留）',
+  first_task_id BIGINT NULL COMMENT '第一次失败的任务ID',
+  second_task_id BIGINT NULL COMMENT '第二次失败的任务ID，第二次失败提交时与第一次任务一并固化为隔离依据',
+  first_failure_reason VARCHAR(256) NULL COMMENT '第一次失败原因，取回执上报内容，设备未上报为NULL',
+  second_failure_reason VARCHAR(256) NULL COMMENT '第二次失败原因，取回执上报内容，设备未上报为NULL',
+  confirmed_by VARCHAR(64) NULL COMMENT '隔离确认人，即第二次失败回执的操作人标识，未携带为NULL；解除操作人必须与此不同',
+  quarantined_at_utc VARCHAR(40) NULL COMMENT '隔离生效时刻，UTC，ISO-8601格式；未隔离为NULL',
+  released_by VARCHAR(64) NULL COMMENT '解除审核操作人，必须与隔离确认人不同；未解除为NULL',
+  release_reason VARCHAR(256) NULL COMMENT '解除审核原因；未解除为NULL',
+  released_at_utc VARCHAR(40) NULL COMMENT '解除时刻，UTC，ISO-8601格式；未解除为NULL',
+  active_key VARCHAR(161) NULL COMMENT 'ACTIVE或QUARANTINED时为 设备ID:目标版本，解除后置NULL；用于同设备同版本至多一个活动轮次的唯一约束',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
+  PRIMARY KEY (id)
+) COMMENT='设备版本连续失败轮次：同设备同目标版本连续2次失败触发隔离，解除只开启新一轮投放，历史失败不清除';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_failure_round_active ON device_failure_round (active_key);
