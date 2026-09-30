@@ -78,4 +78,42 @@ public final class Responses {
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
     }
+
+    /**
+     * 资源台账视图：totalQty 登记总量（件，非负），availableQty 当前可用量
+     * （征调扣减、归还返还）。时间均为 UTC。
+     */
+    public record ResourceInventoryView(String incidentKey, String resourceCode, long totalQty,
+                                        long availableQty, Instant createdAt, Instant updatedAt) {
+    }
+
+    /** 分次归还流水视图。 */
+    public record ResourceReturnView(long id, long quantity, String returnedBy,
+                                     Instant returnedAt, Instant createdAt) {
+    }
+
+    /**
+     * 互助租约视图：sourceIncidentKey/targetIncidentKey 为首次征调的两端事件，
+     * 历史租约保持不变；quantity 征调总量、returnedQty 已累计归还、
+     * outstandingQty 待归还（件）；expiresAt 为 UTC 到期时刻，到期不自动虚构归还；
+     * closedAt 仅 CLOSED 有值。
+     */
+    public record LeaseView(long id, String requestId, String sourceIncidentKey,
+                            String targetIncidentKey, String resourceCode, long quantity,
+                            long returnedQty, long outstandingQty, String status,
+                            Instant expiresAt, Instant closedAt, Instant createdAt,
+                            Instant updatedAt) {
+    }
+
+    /**
+     * 租约关联查询视图：租约本体 + 来源扣减台账（当前可用量）+ 分次归还流水。
+     * sourceInventory 为来源事件侧该资源台账；returns 按归还顺序返回。
+     */
+    public record LeaseDetailView(LeaseView lease, ResourceInventoryView sourceInventory,
+                                  List<ResourceReturnView> returns) {
+    }
+
+    /** 按事件分组的租约列表视图：leases 按征调落库顺序返回。 */
+    public record IncidentLeasesView(String incidentKey, List<LeaseView> leases) {
+    }
 }

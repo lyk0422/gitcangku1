@@ -100,3 +100,44 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
 );
+
+CREATE TABLE IF NOT EXISTS incident_resource_inventories (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    resource_code VARCHAR(64) NOT NULL,
+    total_qty BIGINT NOT NULL,
+    available_qty BIGINT NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_resource_inventory UNIQUE (incident_id, resource_code),
+    CONSTRAINT chk_inventory_qty_nonneg CHECK (available_qty >= 0),
+    CONSTRAINT chk_inventory_within_total CHECK (available_qty <= total_qty AND total_qty >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS incident_resource_leases (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    request_id VARCHAR(128) NOT NULL,
+    source_incident_id BIGINT NOT NULL,
+    target_incident_id BIGINT NOT NULL,
+    resource_code VARCHAR(64) NOT NULL,
+    quantity BIGINT NOT NULL,
+    returned_qty BIGINT NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    expires_at TIMESTAMP(6) NOT NULL,
+    closed_at TIMESTAMP(6) NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_lease_request UNIQUE (request_id),
+    CONSTRAINT chk_lease_qty_positive CHECK (quantity > 0),
+    CONSTRAINT chk_lease_returned_range CHECK (returned_qty >= 0 AND returned_qty <= quantity),
+    CONSTRAINT chk_lease_distinct_incidents CHECK (source_incident_id <> target_incident_id)
+);
+
+CREATE TABLE IF NOT EXISTS incident_resource_returns (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    lease_id BIGINT NOT NULL,
+    quantity BIGINT NOT NULL,
+    returned_by VARCHAR(128) NOT NULL,
+    returned_at TIMESTAMP(6) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL
+);

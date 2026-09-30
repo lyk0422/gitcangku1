@@ -63,6 +63,25 @@ public class IncidentRepository {
     }
 
     /**
+     * 按主键查询事件（不加锁），用于跨表 id 解析事件键。
+     */
+    public Optional<Incident> findById(long id) {
+        List<Incident> rows = jdbc.query("SELECT * FROM incidents WHERE id = ?",
+                INCIDENT_MAPPER, id);
+        return rows.stream().findFirst();
+    }
+
+    /**
+     * 按主键查询并锁定事件行（SELECT ... FOR UPDATE）。
+     * 跨事件事务按 incidents.id 升序调用本方法加锁，消除相向征调的死锁。
+     */
+    public Optional<Incident> lockById(long id) {
+        List<Incident> rows = jdbc.query("SELECT * FROM incidents WHERE id = ? FOR UPDATE",
+                INCIDENT_MAPPER, id);
+        return rows.stream().findFirst();
+    }
+
+    /**
      * 按业务键查询并锁定事件行（SELECT ... FOR UPDATE），用于写路径串行化。
      */
     public Optional<Incident> lockByKey(String incidentKey) {

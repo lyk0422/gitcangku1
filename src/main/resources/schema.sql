@@ -100,3 +100,44 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY COMMENT '固定为 1 的单行锁；创建任务时 SELECT ... FOR UPDATE 持有，串行化环检测与写入，保证并发反向依赖最终图无环'
 ) COMMENT='任务依赖图全局锁表';
+
+CREATE TABLE IF NOT EXISTS incident_resource_inventories (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    incident_id BIGINT NOT NULL COMMENT '持有资源的来源事件 id，关联 incidents.id',
+    resource_code VARCHAR(64) NOT NULL COMMENT '资源编码，事件内唯一；征调与归还均以此标识资源',
+    total_qty BIGINT NOT NULL COMMENT '登记总量（单位：件，非负整数），登记后不变',
+    available_qty BIGINT NOT NULL COMMENT '当前可用量（单位：件，非负整数）；征调扣减、归还返还，满足 0≤可用量≤总量',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
+    updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间',
+    CONSTRAINT uk_resource_inventory UNIQUE (incident_id, resource_code),
+    CONSTRAINT chk_inventory_qty_nonneg CHECK (available_qty >= 0),
+    CONSTRAINT chk_inventory_within_total CHECK (available_qty <= total_qty AND total_qty >= 0)
+) COMMENT='事件互助资源台账表（来源事件记录可用量）';
+
+CREATE TABLE IF NOT EXISTS incident_resource_leases (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    request_id VARCHAR(128) NOT NULL COMMENT '征调请求幂等键（requestId），全局唯一；同键同参重放首次双侧账务结果，同键改数量或目标冲突',
+    source_incident_id BIGINT NOT NULL COMMENT '来源事件 id（资源让出方），关联 incidents.id；租约创建后永不改变',
+    target_incident_id BIGINT NOT NULL COMMENT '目标事件 id（资源借入方），关联 incidents.id；租约创建后永不改变',
+    resource_code VARCHAR(64) NOT NULL COMMENT '征调资源编码，与来源台账资源编码一致',
+    quantity BIGINT NOT NULL COMMENT '征调总数量（单位：件，正整数），创建后不变',
+    returned_qty BIGINT NOT NULL COMMENT '已归还累计数量（单位：件，非负）；分次归还累加，满足 0≤已还≤征调总量',
+    status VARCHAR(16) NOT NULL COMMENT '租约状态：OPEN 未结清（含已到期未还完）/ CLOSED 已恰好还完并关闭，终态；到期不自动虚构归还、不自动关闭',
+    expires_at TIMESTAMP(6) NOT NULL COMMENT '租约到期 UTC 时刻，按征调落库时刻加租约时长确定；到期仅为元数据，不产生自动归还',
+    closed_at TIMESTAMP(6) NULL COMMENT '租约关闭 UTC 时刻；仅最后一次归还使累计已还恰等于征调总量时有值，否则为空',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '征调落库 UTC 时间',
+    updated_at TIMESTAMP(6) NOT NULL COMMENT '最近归还或状态变更 UTC 时间',
+    CONSTRAINT uk_lease_request UNIQUE (request_id),
+    CONSTRAINT chk_lease_qty_positive CHECK (quantity > 0),
+    CONSTRAINT chk_lease_returned_range CHECK (returned_qty >= 0 AND returned_qty <= quantity),
+    CONSTRAINT chk_lease_distinct_incidents CHECK (source_incident_id <> target_incident_id)
+) COMMENT='跨事件互助资源租约表（目标事件记录资源、数量与到期时刻）';
+
+CREATE TABLE IF NOT EXISTS incident_resource_returns (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    lease_id BIGINT NOT NULL COMMENT '所属租约 id，关联 incident_resource_leases.id',
+    quantity BIGINT NOT NULL COMMENT '本次实际归还数量（单位：件，正整数）；各次累加不超过租约征调总量',
+    returned_by VARCHAR(128) NOT NULL COMMENT '归还人（提交归还时目标事件的当前指挥人，X-Actor-Id）',
+    returned_at TIMESTAMP(6) NOT NULL COMMENT '归还发生 UTC 时间（服务端按注入 Clock 落库）',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '流水落库 UTC 时间'
+) COMMENT='互助租约分次归还流水表';

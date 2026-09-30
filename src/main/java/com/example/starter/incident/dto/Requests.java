@@ -55,4 +55,27 @@ public final class Requests {
     /** 任务完成/取消请求，操作人由 X-Actor-Id 指定且须为当前指挥人。 */
     public record TaskActionRequest(String commandKey) {
     }
+
+    /**
+     * 资源台账登记请求：由事件当前指挥人为本事件登记可用资源；
+     * (incidentKey, resourceCode) 唯一，重复登记不同总量返回 409。
+     */
+    public record ResourceRegisterRequest(String commandKey, String resourceCode, long quantity) {
+    }
+
+    /**
+     * 跨事件互助资源征调请求：从 sourceIncidentKey 向目标事件（路径事件）征调 resourceCode
+     * 共 quantity 件，租约时长 leaseMinutes 分钟（UTC 到期时刻 = 落库时刻 + 时长）。
+     * requestId 为全局幂等键：同键同参重放首次双侧账务结果，同键改数量或目标返回 409。
+     */
+    public record MutualAidRequest(String requestId, String sourceIncidentKey,
+                                   String resourceCode, long quantity, long leaseMinutes) {
+    }
+
+    /**
+     * 租约归还请求：按实际数量 quantity 分次归还，归还人由 X-Actor-Id 指定
+     * 且须为目标事件当前指挥人；累计归还超过未归还量返回 422。
+     */
+    public record LeaseReturnRequest(long quantity) {
+    }
 }

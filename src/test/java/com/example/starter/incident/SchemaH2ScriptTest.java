@@ -108,6 +108,82 @@ class SchemaH2ScriptTest {
                     duplicateBlockerRejected = true;
                 }
                 assertThat(duplicateBlockerRejected).isTrue();
+
+                // 互助资源：第二个事件作为征调目标
+                st.execute("INSERT INTO incidents (incident_key, severity, summary, reporter, status,"
+                        + " commander, created_at, updated_at) VALUES"
+                        + " ('IK-2','S1','s','r','COMMANDING','bob','" + Timestamp.from(now) + "',"
+                        + "'" + Timestamp.from(now) + "')");
+                st.execute("INSERT INTO incident_resource_inventories (incident_id, resource_code,"
+                        + " total_qty, available_qty, created_at, updated_at) VALUES"
+                        + " (1,'R',5,5,'" + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+
+                // 台账可用量非负 CHECK
+                boolean negativeInventoryRejected = false;
+                try {
+                    st.execute("INSERT INTO incident_resource_inventories (incident_id, resource_code,"
+                            + " total_qty, available_qty, created_at, updated_at) VALUES"
+                            + " (1,'R2',5,-1,'" + Timestamp.from(now) + "','" + Timestamp.from(now)
+                            + "')");
+                } catch (Exception e) {
+                    negativeInventoryRejected = true;
+                }
+                assertThat(negativeInventoryRejected).isTrue();
+
+                // 来源不足时条件扣减 0 行；充足时扣减成功且可用量不为负
+                int overDeduct = st.executeUpdate("UPDATE incident_resource_inventories"
+                        + " SET available_qty = available_qty - 6 WHERE id = 1 AND available_qty >= 6");
+                assertThat(overDeduct).isZero();
+                int deduct = st.executeUpdate("UPDATE incident_resource_inventories"
+                        + " SET available_qty = available_qty - 3 WHERE id = 1 AND available_qty >= 3");
+                assertThat(deduct).isEqualTo(1);
+                try (ResultSet rs = st.executeQuery("SELECT available_qty FROM"
+                        + " incident_resource_inventories WHERE id = 1")) {
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getLong(1)).isEqualTo(2L);
+                }
+
+                st.execute("INSERT INTO incident_resource_leases (request_id, source_incident_id,"
+                        + " target_incident_id, resource_code, quantity, returned_qty, status,"
+                        + " expires_at, closed_at, created_at, updated_at) VALUES"
+                        + " ('LR-1',1,2,'R',3,0,'OPEN','" + Timestamp.from(now.plusSeconds(3600))
+                        + "',NULL,'" + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+
+                // request_id 全局唯一
+                boolean duplicateLeaseRejected = false;
+                try {
+                    st.execute("INSERT INTO incident_resource_leases (request_id, source_incident_id,"
+                            + " target_incident_id, resource_code, quantity, returned_qty, status,"
+                            + " expires_at, closed_at, created_at, updated_at) VALUES"
+                            + " ('LR-1',1,2,'R',1,0,'OPEN','" + Timestamp.from(now.plusSeconds(3600))
+                            + "',NULL,'" + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateLeaseRejected = true;
+                }
+                assertThat(duplicateLeaseRejected).isTrue();
+
+                // 归还累计不得超过征调总量：条件更新超额 0 行，恰好结清 1 行
+                int overReturn = st.executeUpdate("UPDATE incident_resource_leases"
+                        + " SET returned_qty = returned_qty + 4 WHERE id = 1"
+                        + " AND status = 'OPEN' AND returned_qty + 4 <= quantity");
+                assertThat(overReturn).isZero();
+                int settle = st.executeUpdate("UPDATE incident_resource_leases"
+                        + " SET returned_qty = returned_qty + 3 WHERE id = 1"
+                        + " AND status = 'OPEN' AND returned_qty + 3 <= quantity");
+                assertThat(settle).isEqualTo(1);
+
+                // CHECK 兜底：直接写入超额已还量被拒绝
+                boolean checkOverReturnRejected = false;
+                try {
+                    st.execute("INSERT INTO incident_resource_leases (request_id, source_incident_id,"
+                            + " target_incident_id, resource_code, quantity, returned_qty, status,"
+                            + " expires_at, closed_at, created_at, updated_at) VALUES"
+                            + " ('LR-2',1,2,'R',3,4,'OPEN','" + Timestamp.from(now.plusSeconds(3600))
+                            + "',NULL,'" + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    checkOverReturnRejected = true;
+                }
+                assertThat(checkOverReturnRejected).isTrue();
             }
         }
     }
