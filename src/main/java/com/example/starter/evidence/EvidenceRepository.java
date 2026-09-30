@@ -58,6 +58,24 @@ public class EvidenceRepository {
     }
 
     /**
+     * 锁定指定案件下的全部证物行（按 id 稳定顺序加锁，避免案件级冻结与销毁并发时跨事务死锁）。
+     * 案件级冻结创建、销毁申请的案件冻结检查均通过该方法串行化。
+     */
+    public List<Evidence> findByCaseKeyForUpdate(String caseKey) {
+        return jdbc.query(
+                "SELECT * FROM evidence WHERE case_key = ? ORDER BY id FOR UPDATE",
+                ROW_MAPPER, caseKey);
+    }
+
+    /**
+     * 按案件键查询全部证物（不加锁），用于只读展示。
+     */
+    public List<Evidence> findByCaseKey(String caseKey) {
+        return jdbc.query(
+                "SELECT * FROM evidence WHERE case_key = ? ORDER BY id", ROW_MAPPER, caseKey);
+    }
+
+    /**
      * 更新证物状态与保管人（交接接受时原子切换保管人）。
      */
     public void updateCustody(String evidenceKey, String custodianId, EvidenceStatus status,

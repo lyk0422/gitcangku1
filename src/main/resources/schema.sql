@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS evidence (
     category VARCHAR(64) NOT NULL COMMENT '证物类别，入库后不可修改',
     seal_no VARCHAR(64) NOT NULL COMMENT '封条编号，入库后不可修改',
     custodian_id VARCHAR(64) NOT NULL COMMENT '当前保管人（操作人标识），交接接受后原子切换；借出期间不变',
-    status VARCHAR(20) NOT NULL COMMENT '证物状态：SEALED 已封存 / TRANSFER_PENDING 待接收 / BORROWED 借出未归还 / SEAL_BROKEN 封条异常（终态）',
+    status VARCHAR(20) NOT NULL COMMENT '证物状态：SEALED 已封存 / TRANSFER_PENDING 待接收 / BORROWED 借出未归还 / SEAL_BROKEN 封条异常（终态）/ DESTROYED 已销毁（终态）',
     created_at DATETIME(6) NOT NULL COMMENT '入库时间，Asia/Shanghai',
     updated_at DATETIME(6) NOT NULL COMMENT '最近一次状态或保管人变更时间，Asia/Shanghai',
     CONSTRAINT uk_evidence_key UNIQUE (evidence_key)
@@ -60,12 +60,47 @@ CREATE TABLE IF NOT EXISTS loan_record (
     KEY idx_loan_borrower_status (borrower_id, status)
 );
 
+-- 保留冻结记录：案件级与单件证物级两级，记录只追加；解除仅写一次解除链字段。
+-- 冻结窗口为 UTC 左闭右开 [created_at, expire_at)：未解除且 created_at <= now < expire_at 时阻断销毁；
+-- 恰好到达 expire_at 即到期，不再阻断新销毁申请。解除只影响后续申请，不改写已被拒记录。
+CREATE TABLE IF NOT EXISTS retention_hold (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    hold_key VARCHAR(64) NOT NULL COMMENT '冻结业务键，全局唯一',
+    scope VARCHAR(20) NOT NULL COMMENT '冻结级别：CASE 案件级（作用案件下全部证物）/ EVIDENCE 证物级（仅作用该证物）',
+    case_key VARCHAR(64) NOT NULL COMMENT '所属案件键；证物级取证件所属案件',
+    evidence_key VARCHAR(64) NULL COMMENT '证物业务键；NULL 表示案件级冻结',
+    created_by VARCHAR(64) NOT NULL COMMENT '冻结创建操作人',
+    reason VARCHAR(512) NOT NULL COMMENT '冻结创建原因，非空',
+    expire_at DATETIME(6) NOT NULL COMMENT 'UTC 到期时刻（窗口右端，开区间）；恰好到期后不再阻断新销毁申请',
+    released_by VARCHAR(64) NULL COMMENT '解除操作人，必须是不同于创建人的保管人；NULL 表示未解除',
+    release_reason VARCHAR(512) NULL COMMENT '解除签明原因；NULL 表示未解除',
+    released_at DATETIME(6) NULL COMMENT 'UTC 解除时刻；NULL 表示未解除，解除只影响后续销毁申请',
+    created_at DATETIME(6) NOT NULL COMMENT 'UTC 冻结窗口起点（创建生效时刻，闭区间起点）',
+    CONSTRAINT uk_hold_key UNIQUE (hold_key),
+    KEY idx_hold_case (case_key),
+    KEY idx_hold_evidence (evidence_key)
+);
+
+-- 销毁申请记录：只追加；被有效冻结阻断时以 REJECTED 保留，冻结到期或解除均不改写历史。
+CREATE TABLE IF NOT EXISTS destruction_record (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    evidence_key VARCHAR(64) NOT NULL COMMENT '关联证物业务键',
+    requested_by VARCHAR(64) NOT NULL COMMENT '申请操作人（申请时的当前保管人）',
+    reason VARCHAR(512) NOT NULL COMMENT '销毁原因，非空',
+    status VARCHAR(20) NOT NULL COMMENT '审批结果：APPROVED 已销毁（证物进入 DESTROYED）/ REJECTED 被有效冻结阻断（409，状态不变）',
+    reject_reason VARCHAR(512) NULL COMMENT '阻断说明；NULL 表示申请通过',
+    blocking_hold_key VARCHAR(64) NULL COMMENT '阻断销毁的冻结业务键；NULL 表示申请通过',
+    decided_at DATETIME(6) NOT NULL COMMENT 'UTC 申请判定时刻',
+    created_at DATETIME(6) NOT NULL COMMENT '记录创建时间，Asia/Shanghai',
+    KEY idx_destruction_evidence (evidence_key)
+);
+
 -- 幂等命令日志：command_key 全局唯一；同键同参重放返回首次结果，同键改参返回 409。
 CREATE TABLE IF NOT EXISTS command_log (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     command_key VARCHAR(64) NOT NULL COMMENT '幂等命令键，全局唯一',
     actor_id VARCHAR(64) NOT NULL COMMENT '发起操作人',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN/HOLD_CASE/HOLD_EVIDENCE/HOLD_RELEASE/DESTROY',
     request_hash VARCHAR(64) NOT NULL COMMENT '请求参数规范化后的 SHA-256，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行的 HTTP 状态码',
     response_body TEXT NOT NULL COMMENT '首次执行的响应体 JSON，重放时原样返回',

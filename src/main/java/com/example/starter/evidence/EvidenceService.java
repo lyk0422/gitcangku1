@@ -3,7 +3,9 @@ package com.example.starter.evidence;
 import com.example.starter.error.ApiException;
 import com.example.starter.evidence.dto.CommandRequest;
 import com.example.starter.evidence.dto.CustodyChainView;
+import com.example.starter.evidence.dto.DestructionView;
 import com.example.starter.evidence.dto.EvidenceView;
+import com.example.starter.evidence.dto.HoldView;
 import com.example.starter.evidence.dto.InspectionView;
 import com.example.starter.evidence.dto.IntakeRequest;
 import com.example.starter.evidence.dto.LoanCreateRequest;
@@ -45,6 +47,9 @@ public class EvidenceService {
     private final TransferRecordRepository transferRepository;
     private final SealInspectionRepository inspectionRepository;
     private final LoanRecordRepository loanRepository;
+    private final RetentionHoldRepository holdRepository;
+    private final DestructionRecordRepository destructionRepository;
+    private final RetentionHoldService retentionHoldService;
     private final CommandLogRepository commandLogRepository;
     private final ObjectMapper objectMapper;
     private final EvidenceClock clock;
@@ -53,6 +58,9 @@ public class EvidenceService {
                            TransferRecordRepository transferRepository,
                            SealInspectionRepository inspectionRepository,
                            LoanRecordRepository loanRepository,
+                           RetentionHoldRepository holdRepository,
+                           DestructionRecordRepository destructionRepository,
+                           RetentionHoldService retentionHoldService,
                            CommandLogRepository commandLogRepository,
                            ObjectMapper objectMapper,
                            EvidenceClock clock) {
@@ -60,6 +68,9 @@ public class EvidenceService {
         this.transferRepository = transferRepository;
         this.inspectionRepository = inspectionRepository;
         this.loanRepository = loanRepository;
+        this.holdRepository = holdRepository;
+        this.destructionRepository = destructionRepository;
+        this.retentionHoldService = retentionHoldService;
         this.commandLogRepository = commandLogRepository;
         this.objectMapper = objectMapper;
         this.clock = clock;
@@ -348,7 +359,14 @@ public class EvidenceService {
                 .stream().map(this::toView).toList();
         List<InspectionView> inspections = inspectionRepository.findByEvidenceKey(evidenceKey)
                 .stream().map(this::toView).toList();
-        return new CustodyChainView(toView(evidence), transfers, loans, inspections);
+        List<HoldView> caseHolds = holdRepository.findCaseHolds(evidence.caseKey()).stream()
+                .map(retentionHoldService::viewHold).toList();
+        List<HoldView> evidenceHolds = holdRepository.findEvidenceHolds(evidenceKey).stream()
+                .map(retentionHoldService::viewHold).toList();
+        List<DestructionView> destructions = destructionRepository.findByEvidenceKey(evidenceKey)
+                .stream().map(retentionHoldService::viewDestruction).toList();
+        return new CustodyChainView(toView(evidence), transfers, loans, inspections,
+                caseHolds, evidenceHolds, destructions);
     }
 
     private Evidence lockEvidence(String evidenceKey) {
