@@ -78,4 +78,55 @@ public final class Responses {
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
     }
+
+    /**
+     * 升级阶梯阈值配置视图：thresholds 为 1~5 级进入阈值（含），等级区间左闭右开；
+     * cooldownMinutes 为降级冷却分钟数。
+     */
+    public record LadderConfigView(int configVersion, List<Integer> thresholds, int cooldownMinutes,
+                                   String createdBy, Instant createdAt) {
+    }
+
+    /**
+     * 阶梯当前状态视图（含冷却诊断）：事件尚无分数时 riskScore/currentLevel/configVersion/
+     * cooldownStartAt/cooldownRemainingMinutes/lastOperator/updatedAt 为 null；
+     * 无配置时 cooldownMinutes 为 null。cooldownRemainingMinutes 为查询时刻的剩余冷却分钟数（0 表示已过）。
+     */
+    public record LadderStateView(String incidentKey, Integer riskScore, Integer currentLevel,
+                                  Integer configVersion, Instant cooldownStartAt,
+                                  Integer cooldownMinutes, Long cooldownRemainingMinutes,
+                                  String lastOperator, Instant updatedAt) {
+    }
+
+    /**
+     * 阶梯等级变更历史视图：各字段为变更时快照，不回写；按发生顺序返回。
+     */
+    public record LadderHistoryEntryView(long id, String changeType, int fromLevel, int toLevel,
+                                         int riskScore, int configVersion, String actor,
+                                         Instant occurredAt) {
+    }
+
+    /** 阶梯历史列表视图：entries 按发生顺序（落库顺序）返回，排序稳定。 */
+    public record LadderHistoryView(String incidentKey, List<LadderHistoryEntryView> entries) {
+    }
+
+    /**
+     * 单事件分数更新结果：score 为实际值；nextLevelThreshold 为进入下一级所需阈值（要求值），
+     * gapToNextLevel 为差额（nextLevelThreshold - score）；已在最高级时两者为 null。
+     */
+    public record LadderScoreResultView(String incidentKey, int score, int previousLevel,
+                                        int currentLevel, boolean escalated,
+                                        Integer nextLevelThreshold, Integer gapToNextLevel) {
+    }
+
+    /** 批量分数更新结果：configVersion 为本批定级使用的配置版本；results 按事件键排序。 */
+    public record LadderScoreBatchView(int configVersion, List<LadderScoreResultView> results) {
+    }
+
+    /**
+     * 降级冷却明细：requiredMinutes 为要求值（冷却分钟数）、elapsedMinutes 为实际值
+     * （距冷却起点已过分钟数）、remainingMinutes 为差额（剩余分钟数）。
+     */
+    public record CooldownDetail(long requiredMinutes, long elapsedMinutes, long remainingMinutes) {
+    }
 }

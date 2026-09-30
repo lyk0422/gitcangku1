@@ -55,4 +55,29 @@ public final class Requests {
     /** 任务完成/取消请求，操作人由 X-Actor-Id 指定且须为当前指挥人。 */
     public record TaskActionRequest(String commandKey) {
     }
+
+    /**
+     * 升级阶梯阈值配置创建请求：thresholds 为 1~5 级进入阈值（含，需严格递增）；
+     * cooldownMinutes 为降级冷却分钟数（1~10080）。每次成功创建生成一个新版本。
+     */
+    public record LadderConfigRequest(String commandKey, List<Integer> thresholds,
+                                      Integer cooldownMinutes) {
+    }
+
+    /** 批量分数更新项：score 为风险分数（0~1000000），null 视为分数缺失（422）。 */
+    public record LadderScoreItem(String incidentKey, Integer score) {
+    }
+
+    /**
+     * 批量分数更新请求：先校验全部事件最终等级，任一失败整批回滚，不留部分结果。
+     */
+    public record LadderScoreBatchRequest(String commandKey, List<LadderScoreItem> updates) {
+    }
+
+    /**
+     * 降级请求：targetLevel 可选，提供时必须等于当前等级-1（降级不得跳过层级）；
+     * 操作人由 X-Actor-Id 指定，必须与最近一次等级变更操作人不同。
+     */
+    public record LadderDemoteRequest(String commandKey, Integer targetLevel) {
+    }
 }

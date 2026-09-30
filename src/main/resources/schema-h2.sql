@@ -100,3 +100,43 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
 );
+
+CREATE TABLE IF NOT EXISTS incident_ladder_configs (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    config_version INT NOT NULL,
+    level1_threshold INT NOT NULL,
+    level2_threshold INT NOT NULL,
+    level3_threshold INT NOT NULL,
+    level4_threshold INT NOT NULL,
+    level5_threshold INT NOT NULL,
+    cooldown_minutes INT NOT NULL,
+    created_by VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_ladder_config_version UNIQUE (config_version)
+);
+
+CREATE TABLE IF NOT EXISTS incident_ladder_states (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    risk_score INT NOT NULL,
+    current_level INT NOT NULL,
+    config_version INT NOT NULL,
+    cooldown_start_at TIMESTAMP(6) NOT NULL,
+    last_operator VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_ladder_state_incident UNIQUE (incident_id)
+);
+
+CREATE TABLE IF NOT EXISTS incident_ladder_history (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    change_type VARCHAR(16) NOT NULL,
+    from_level INT NOT NULL,
+    to_level INT NOT NULL,
+    risk_score INT NOT NULL,
+    config_version INT NOT NULL,
+    actor VARCHAR(128) NOT NULL,
+    occurred_at TIMESTAMP(6) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL
+);

@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS incident_status_history (
 CREATE TABLE IF NOT EXISTS command_keys (
     id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
     command_key VARCHAR(128) NOT NULL COMMENT '调用方幂等键，全局唯一',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：takeover/transfer_initiate/transfer_accept/action/status/escalation_check/escalation_ack/task_create/task_complete/task_cancel',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：takeover/transfer_initiate/transfer_accept/action/status/escalation_check/escalation_ack/task_create/task_complete/task_cancel/ladder_config/ladder_scores/ladder_demote',
     request_hash VARCHAR(64) NOT NULL COMMENT '规范化请求参数的 SHA-256 摘要，用于同键改参检测',
     response_status INT NULL COMMENT '首次成功的 HTTP 状态码；事务提交前必写入',
     response_body MEDIUMTEXT NULL COMMENT '首次成功响应 JSON，用于同键同参重放',
@@ -100,3 +100,43 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY COMMENT '固定为 1 的单行锁；创建任务时 SELECT ... FOR UPDATE 持有，串行化环检测与写入，保证并发反向依赖最终图无环'
 ) COMMENT='任务依赖图全局锁表';
+
+CREATE TABLE IF NOT EXISTS incident_ladder_configs (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    config_version INT NOT NULL COMMENT '配置版本号，从 1 开始递增，全局唯一；旧版本保留不回写',
+    level1_threshold INT NOT NULL COMMENT '进入 1 级所需最低风险分数（含），等级区间左闭右开 [t1,t2)',
+    level2_threshold INT NOT NULL COMMENT '进入 2 级所需最低风险分数（含），必须严格大于 1 级阈值',
+    level3_threshold INT NOT NULL COMMENT '进入 3 级所需最低风险分数（含），必须严格大于 2 级阈值',
+    level4_threshold INT NOT NULL COMMENT '进入 4 级所需最低风险分数（含），必须严格大于 3 级阈值',
+    level5_threshold INT NOT NULL COMMENT '进入 5 级所需最低风险分数（含），必须严格大于 4 级阈值',
+    cooldown_minutes INT NOT NULL COMMENT '降级冷却分钟数，合法范围 1~10080；冷却区间为 [冷却起点, 起点+冷却分钟数) 左闭右开',
+    created_by VARCHAR(128) NOT NULL COMMENT '创建人（X-Actor-Id）',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
+    CONSTRAINT uk_ladder_config_version UNIQUE (config_version)
+) COMMENT='事件升级阶梯阈值配置表（版本化，后续修订不回写历史）';
+
+CREATE TABLE IF NOT EXISTS incident_ladder_states (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    incident_id BIGINT NOT NULL COMMENT '所属事件 id，关联 incidents.id；每事件至多一条',
+    risk_score INT NOT NULL COMMENT '当前风险分数，范围 0~1000000',
+    current_level INT NOT NULL COMMENT '当前阶梯等级 0~5；0 表示未达 1 级阈值',
+    config_version INT NOT NULL COMMENT '最近一次定级使用的配置版本，关联 incident_ladder_configs.config_version',
+    cooldown_start_at TIMESTAMP(6) NOT NULL COMMENT '冷却起点 UTC：最近一次等级变更（升级或降级）时刻；尚无变更时为首次评分时刻',
+    last_operator VARCHAR(128) NOT NULL COMMENT '最近一次等级变更操作人；降级必须由与其不同的指挥员确认',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
+    updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间',
+    CONSTRAINT uk_ladder_state_incident UNIQUE (incident_id)
+) COMMENT='事件升级阶梯当前状态表';
+
+CREATE TABLE IF NOT EXISTS incident_ladder_history (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    incident_id BIGINT NOT NULL COMMENT '所属事件 id，关联 incidents.id',
+    change_type VARCHAR(16) NOT NULL COMMENT '变更类型：ESCALATE 升级（分数达阈值自动提升，可跨级）/ DEESCALATE 降级（逐级，需不同指挥员确认且冷却已过）',
+    from_level INT NOT NULL COMMENT '变更前等级 0~5',
+    to_level INT NOT NULL COMMENT '变更后等级 0~5；降级时恒等于 from_level-1',
+    risk_score INT NOT NULL COMMENT '变更时风险分数快照，不回写',
+    config_version INT NOT NULL COMMENT '变更时配置版本快照，不回写',
+    actor VARCHAR(128) NOT NULL COMMENT '操作人：升级为分数更新提交者，降级为确认的指挥员',
+    occurred_at TIMESTAMP(6) NOT NULL COMMENT '变更发生 UTC 时间',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '落库 UTC 时间'
+) COMMENT='事件升级阶梯等级变更历史表（只追加，不回写）';
