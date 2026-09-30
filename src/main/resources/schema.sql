@@ -48,8 +48,8 @@ CREATE TABLE IF NOT EXISTS recall (
 );
 
 CREATE TABLE IF NOT EXISTS command_log (
-    command_type VARCHAR(32) NOT NULL COMMENT '命令类型：CREATE_BATCH/SUBMIT_TEST/APPROVE/RECALL/SPLIT',
-    command_key VARCHAR(64) NOT NULL COMMENT '命令幂等键；同类型同键同参重放返回首次结果，同键改参返回 409',
+    command_type VARCHAR(32) NOT NULL COMMENT '命令类型：CREATE_BATCH/SUBMIT_TEST/APPROVE/RECALL/SPLIT/MERGE/REGISTER_SEGMENT/UPDATE_LIMITS/RECORD_READING/CONFIRM_EXCURSION',
+    command_key VARCHAR(64) NOT NULL COMMENT '命令幂等键；同类型同键同参重放返回首次结果，同键改参返回 409（温度读数以 request_id 为幂等键，不写命令日志）',
     fingerprint VARCHAR(64) NOT NULL COMMENT '业务参数（不含 commandKey）的 SHA-256 摘要，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行成功的 HTTP 状态码',
     response_body TEXT NOT NULL COMMENT '首次执行成功的响应 JSON 快照',
@@ -65,4 +65,93 @@ CREATE TABLE IF NOT EXISTS batch_lineage (
     seq INT NOT NULL COMMENT '子批在拆分请求中的顺序，从 1 开始',
     created_at VARCHAR(40) NOT NULL COMMENT '拆分时间，ISO-8601 UTC instant 字符串',
     CONSTRAINT uk_lineage_child UNIQUE (child_key)
+);
+
+-- 仓储温度偏差：时间均以 ISO-8601 UTC instant 字符串存储，温度单位摄氏度(℃)。
+CREATE TABLE IF NOT EXISTS storage_segment (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    batch_key VARCHAR(64) NOT NULL COMMENT '所属批次业务键',
+    segment_key VARCHAR(64) NOT NULL COMMENT '仓储段业务键，同一批次内唯一；创建后不可修改',
+    lower_limit DECIMAL(6,2) NOT NULL COMMENT '登记时刻下限温度，单位℃；偏差判定后不随后续改版回写',
+    upper_limit DECIMAL(6,2) NOT NULL COMMENT '登记时刻上限温度，单位℃；偏差判定后不随后续改版回写',
+    version INT NOT NULL COMMENT '限值版本号，从 1 开始；每次改版 +1',
+    created_at VARCHAR(40) NOT NULL COMMENT '仓储段登记时间，ISO-8601 UTC instant 字符串',
+    updated_at VARCHAR(40) NOT NULL COMMENT '限值最近改版时间，未改版时等于 created_at，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_segment_key UNIQUE (batch_key, segment_key)
+);
+
+-- 限值改版审计：仅新版本生效，历史偏差按读数时生效版本判定，不回写。
+CREATE TABLE IF NOT EXISTS storage_segment_limit (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键，同时作为版本先后依据',
+    segment_id BIGINT NOT NULL COMMENT '所属仓储段主键',
+    version INT NOT NULL COMMENT '限值版本号，从 1 开始',
+    lower_limit DECIMAL(6,2) NOT NULL COMMENT '该版本下限温度，单位℃',
+    upper_limit DECIMAL(6,2) NOT NULL COMMENT '该版本上限温度，单位℃',
+    created_at VARCHAR(40) NOT NULL COMMENT '版本生效时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_segment_version UNIQUE (segment_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS temperature_reading (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键，同时作为同段读数先后依据',
+    batch_key VARCHAR(64) NOT NULL COMMENT '所属批次业务键（冗余自仓储段，便于门禁查询）',
+    segment_id BIGINT NOT NULL COMMENT '所属仓储段主键',
+    request_id VARCHAR(64) NOT NULL COMMENT '读数请求幂等键，全局唯一；同键重放首次结果，换温度返回 409',
+    read_at VARCHAR(40) NOT NULL COMMENT '采集时刻，ISO-8601 UTC instant 字符串',
+    temperature DECIMAL(6,2) NOT NULL COMMENT '读数温度，单位℃',
+    lower_limit DECIMAL(6,2) NOT NULL COMMENT '入库时生效下限快照，单位℃，不随后续改版回写',
+    upper_limit DECIMAL(6,2) NOT NULL COMMENT '入库时生效上限快照，单位℃，不随后续改版回写',
+    created_at VARCHAR(40) NOT NULL COMMENT '入库时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_reading_request UNIQUE (request_id)
+);
+
+-- 偏差事件：读数越界（OUT_OF_RANGE）或与同段前一读数采集间隔超过 30 分钟（MISSING_INTERVAL）。
+-- 恰好 30 分钟不算间断。偏差一经生成不可删除；双人不同角色确认同一版本后解除。
+CREATE TABLE IF NOT EXISTS storage_excursion (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    batch_key VARCHAR(64) NOT NULL COMMENT '所属批次业务键',
+    segment_id BIGINT NOT NULL COMMENT '所在仓储段主键',
+    excursion_key VARCHAR(64) NOT NULL COMMENT '偏差业务键，全局唯一，创建后不可修改',
+    event_type VARCHAR(16) NOT NULL COMMENT '偏差类型：OUT_OF_RANGE 越界 / MISSING_INTERVAL 缺测',
+    limit_version INT NOT NULL COMMENT '生成偏差时生效的限值版本；处置确认必须针对该版本',
+    reading_id BIGINT COMMENT '触发偏差的读数主键；越界为越界读数本身，缺测为后一读数；非空',
+    prev_reading_id BIGINT COMMENT '缺测区间前一读数主键；越界偏差为 NULL',
+    interval_from VARCHAR(40) COMMENT '缺测区间起点（前一读数采集时刻），UTC instant；越界偏差为 NULL',
+    interval_to VARCHAR(40) COMMENT '缺测区间终点（后一读数采集时刻），UTC instant；越界偏差为 NULL',
+    detail VARCHAR(256) NOT NULL COMMENT '偏差说明：越界温度或缺测分钟数，单位随字段说明',
+    status VARCHAR(16) NOT NULL COMMENT '处置状态：OPEN 未处置 / RESOLVED 已双人确认解除',
+    created_at VARCHAR(40) NOT NULL COMMENT '偏差生成时间，ISO-8601 UTC instant 字符串',
+    resolved_at VARCHAR(40) COMMENT '解除时间（第二次有效确认落定），UTC instant；未解除为 NULL',
+    CONSTRAINT uk_excursion_key UNIQUE (excursion_key)
+);
+
+-- 偏差处置确认：须两名不同 actorId、不同角色（WAREHOUSE 仓储员 / QUALITY 质量负责人）
+-- 且确认的限值版本与偏差版本一致，第二次确认落定后偏差 RESOLVED。
+CREATE TABLE IF NOT EXISTS excursion_confirmation (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    excursion_id BIGINT NOT NULL COMMENT '所属偏差主键',
+    command_key VARCHAR(64) NOT NULL COMMENT '确认命令幂等键',
+    actor_id VARCHAR(64) NOT NULL COMMENT '确认人标识，两名确认人必须不同',
+    role VARCHAR(16) NOT NULL COMMENT '确认角色：WAREHOUSE 仓储员 / QUALITY 质量负责人，两次必须不同',
+    limit_version INT NOT NULL COMMENT '确认时针对的限值版本，必须等于偏差版本，否则 409',
+    seq INT NOT NULL COMMENT '确认序号：1 首次确认，2 解除偏差',
+    created_at VARCHAR(40) NOT NULL COMMENT '确认时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_confirmation_excursion_actor UNIQUE (excursion_id, actor_id)
+);
+
+-- 合批单：两个当前可用的 RELEASED 父批合并为一个新批次；任一父批存在未处置偏差时整单失败。
+CREATE TABLE IF NOT EXISTS batch_merge (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    merge_key VARCHAR(64) NOT NULL COMMENT '合批单业务键，全局唯一，与命令幂等键一致',
+    child_key VARCHAR(64) NOT NULL COMMENT '合批产生的新批次业务键，全局唯一',
+    created_at VARCHAR(40) NOT NULL COMMENT '合批时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_merge_key UNIQUE (merge_key),
+    CONSTRAINT uk_merge_child UNIQUE (child_key)
+);
+
+CREATE TABLE IF NOT EXISTS batch_merge_parent (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    merge_id BIGINT NOT NULL COMMENT '所属合批单主键',
+    parent_key VARCHAR(64) NOT NULL COMMENT '父批业务键，合批时必须为当前可用的 RELEASED',
+    seq INT NOT NULL COMMENT '父批在合批请求中的顺序，从 1 开始',
+    created_at VARCHAR(40) NOT NULL COMMENT '合批关系创建时间，ISO-8601 UTC instant 字符串'
 );
