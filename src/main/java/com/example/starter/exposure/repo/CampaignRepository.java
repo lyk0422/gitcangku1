@@ -45,6 +45,15 @@ public class CampaignRepository {
     /**
      * 插入公告；编号冲突由调用方依据唯一约束处理。
      */
+    /**
+     * 行锁读取公告，用于活动迁移按提交顺序裁决。
+     */
+    public Optional<Campaign> lockById(String campaignId) {
+        return jdbc.query("SELECT campaign_id, daily_total_cap, per_visitor_daily_cap, created_at_utc "
+                        + "FROM campaign WHERE campaign_id = ? FOR UPDATE", MAPPER, campaignId)
+                .stream()
+                .findFirst();
+    }
     public void insert(Campaign campaign) {
         jdbc.update("INSERT INTO campaign (campaign_id, daily_total_cap, per_visitor_daily_cap, created_at_utc) "
                         + "VALUES (?, ?, ?, ?)",

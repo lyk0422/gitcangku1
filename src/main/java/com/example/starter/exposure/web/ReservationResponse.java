@@ -16,6 +16,8 @@ import java.time.LocalDate;
  * @param createdAtUtc  创建时刻，epoch 毫秒，UTC
  * @param expiresAtUtc  到期时刻（创建 + 60 秒），epoch 毫秒，UTC
  * @param terminalAtUtc 终态时刻，未进入终态为 null
+ * @param activityId    申请时公告所属活动编号；未归入活动为 null，固化不随迁移改变
+ * @param hourOfDay     申请时刻的 UTC 小时（0~23）；无活动时为 null
  */
 public record ReservationResponse(
         String reservationId,
@@ -25,7 +27,9 @@ public record ReservationResponse(
         ReservationStatus status,
         long createdAtUtc,
         long expiresAtUtc,
-        Long terminalAtUtc
+        Long terminalAtUtc,
+        String activityId,
+        Integer hourOfDay
 ) {
     public static ReservationResponse from(Reservation r) {
         return new ReservationResponse(
@@ -36,6 +40,8 @@ public record ReservationResponse(
                 r.status(),
                 r.createdAtUtc(),
                 r.expiresAtUtc(),
-                r.terminalAtUtc());
+                r.terminalAtUtc(),
+                r.activityId(),
+                r.hourOfDay());
     }
 }
