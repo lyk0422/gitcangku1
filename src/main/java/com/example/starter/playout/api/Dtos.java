@@ -18,14 +18,15 @@ public final class Dtos {
     private Dtos() {
     }
 
-    /** 创建素材请求；id 为空时由系统生成稳定 ID。 */
+    /** 创建素材请求；id 为空时由系统生成稳定 ID；sponsorKey 可空，空表示不归属任何赞助商。 */
     public record CreateAssetRequest(
             String id,
-            @NotNull @Positive Long durationMs) {
+            @NotNull @Positive Long durationMs,
+            String sponsorKey) {
     }
 
-    /** 素材响应。 */
-    public record AssetResponse(String id, long durationMs) {
+    /** 素材响应；sponsorKey 为素材归属赞助商键，未归属时为 null。 */
+    public record AssetResponse(String id, long durationMs, String sponsorKey) {
     }
 
     /** 创建频道请求；fallbackAssetId 为不会被撤销的保底素材。 */
@@ -170,5 +171,141 @@ public final class Dtos {
 
     /** 统一错误响应体。 */
     public record ErrorResponse(String error, String message) {
+    }
+
+    // ---------- 赞助排他窗 ----------
+
+    /** 赞助排他窗状态：ACTIVE 生效中；SUPERSEDED 已被新版本替代；DELETED 已删除。历史版本均可查询。 */
+    public enum SponsorWindowStatus {
+        ACTIVE, SUPERSEDED, DELETED
+    }
+
+    /**
+     * 登记赞助排他窗请求。windowKey 为空时由系统生成；channelIds 不得为空；
+     * [start, end) 为 UTC 左闭右开区间且须完整落在 businessDay（Asia/Shanghai 日历日）内。
+     */
+    public record RegisterSponsorWindowRequest(
+            @NotBlank String requestId,
+            String windowKey,
+            @NotBlank String sponsorKey,
+            @NotBlank String businessDay,
+            @NotNull List<@NotBlank String> channelIds,
+            @NotNull OffsetDateTime start,
+            @NotNull OffsetDateTime end) {
+    }
+
+    /** 修订赞助排他窗请求：整体替换时间区间与频道集合，版本 +1；expectedVersion 不符返回 409。 */
+    public record ReviseSponsorWindowRequest(
+            @NotBlank String requestId,
+            @NotNull @Positive Long expectedVersion,
+            @NotNull List<@NotBlank String> channelIds,
+            @NotNull OffsetDateTime start,
+            @NotNull OffsetDateTime end) {
+    }
+
+    /** 删除赞助排他窗请求（幂等）；删除不影响已发布快照中的窗口命中记录。 */
+    public record DeleteSponsorWindowRequest(@NotBlank String requestId) {
+    }
+
+    /** 赞助排他窗响应；channelIds 按字典序返回。 */
+    public record SponsorWindowResponse(
+            String windowKey,
+            String sponsorKey,
+            String businessDay,
+            List<String> channelIds,
+            OffsetDateTime start,
+            OffsetDateTime end,
+            long version,
+            SponsorWindowStatus status,
+            OffsetDateTime createdAt) {
+    }
+
+    // ---------- 批量发布 ----------
+
+    /** 批量发布项：一个频道一个业务日的草稿发布；businessDay 格式 yyyy-MM-dd。 */
+    public record BatchPublishItem(
+            @NotBlank String channelId,
+            @NotBlank String businessDay,
+            @NotNull @Positive Long draftVersion,
+            @NotNull @PositiveOrZero Long expectedPublishedVersion) {
+    }
+
+    /** 批量发布请求：先在完整最终编排上校验全部频道，再在一个事务内提交；任一失败整体回滚。 */
+    public record BatchPublishRequest(
+            @NotBlank String requestId,
+            @NotNull List<@NotNull BatchPublishItem> items) {
+    }
+
+    /** 批量发布响应，顺序与请求 items 一致。 */
+    public record BatchPublishResponse(List<PublishResponse> items) {
+    }
+
+    // ---------- 发布撤销与明细 ----------
+
+    /** 撤销发布请求（幂等）；仅尚未开始的发布可撤销。 */
+    public record RevokePublicationRequest(@NotBlank String requestId) {
+    }
+
+    /** 撤销发布响应。 */
+    public record RevokePublicationResponse(
+            long publicationId,
+            String channelId,
+            String businessDay,
+            long publishedVersion,
+            boolean revoked,
+            OffsetDateTime revokedAt) {
+    }
+
+    /**
+     * 发布快照片段明细：固化发布时的素材 sponsorKey 与命中的赞助窗口版本；
+     * sponsorKey / sponsorWindowKey / sponsorWindowVersion 未归属或未命中时为 null。
+     */
+    public record PublicationSegmentDetail(
+            String segmentId,
+            String assetId,
+            String sponsorKey,
+            long grantId,
+            OffsetDateTime start,
+            OffsetDateTime end,
+            String sponsorWindowKey,
+            Long sponsorWindowVersion) {
+    }
+
+    /** 发布快照明细（历史查询，只读，不修改任何状态）。 */
+    public record PublicationDetailResponse(
+            long publicationId,
+            String channelId,
+            String businessDay,
+            long publishedVersion,
+            long draftVersion,
+            boolean revoked,
+            OffsetDateTime createdAt,
+            List<PublicationSegmentDetail> segments) {
+    }
+
+    // ---------- 赞助排他冲突 ----------
+
+    /**
+     * 赞助排他冲突明细：conflictStart/conflictEnd 为实际冲突交集（UTC 左闭右开），
+     * overlapMs 为交集时长（实际值）；segmentId 在紧急插播冲突时为 null。
+     */
+    public record SponsorConflictDetail(
+            String channelId,
+            String segmentId,
+            String assetId,
+            String assetSponsorKey,
+            String windowKey,
+            String windowSponsorKey,
+            long windowVersion,
+            OffsetDateTime conflictStart,
+            OffsetDateTime conflictEnd,
+            long overlapMs) {
+    }
+
+    /** 赞助排他冲突错误响应：409，携带本次校验发现的全部冲突明细。 */
+    public record SponsorConflictErrorResponse(
+            String error,
+            String message,
+            List<SponsorConflictDetail> conflicts) {
     }
 }

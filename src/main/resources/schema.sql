@@ -5,6 +5,7 @@
 CREATE TABLE IF NOT EXISTS playout_asset (
     id           VARCHAR(64)  NOT NULL COMMENT '素材稳定 ID，客户端指定或系统生成，创建后不变',
     duration_ms  BIGINT       NOT NULL COMMENT '素材时长，单位毫秒，正整数',
+    sponsor_key  VARCHAR(64)  NULL COMMENT '素材归属赞助商键；NULL 表示不归属任何赞助商，创建后不变',
     created_at_ms BIGINT      NOT NULL COMMENT '创建时间，UTC 纪元毫秒',
     PRIMARY KEY (id)
 ) COMMENT = '素材表';
@@ -53,28 +54,34 @@ CREATE TABLE IF NOT EXISTS playout_publication (
     id                BIGINT      NOT NULL AUTO_INCREMENT COMMENT '发布快照自增 ID',
     channel_id        VARCHAR(64) NOT NULL COMMENT '频道 ID',
     business_day      DATE        NOT NULL COMMENT '业务日，Asia/Shanghai 日历日',
-    published_version BIGINT      NOT NULL COMMENT '发布版本，每频道+业务日从 1 起递增',
+    published_version BIGINT      NOT NULL COMMENT '发布版本，每频道+业务日从 1 起递增，撤销后不复用',
     draft_version     BIGINT      NOT NULL COMMENT '发布时对应的草稿版本',
+    revoked           TINYINT(1)  NOT NULL DEFAULT 0 COMMENT '是否已撤销：0 未撤销，1 已撤销；仅尚未开始的发布可撤销',
+    revoke_request_id VARCHAR(64) NULL COMMENT '撤销操作的幂等请求 ID；未撤销时为 NULL',
+    revoked_at_ms     BIGINT      NULL COMMENT '撤销时间，UTC 纪元毫秒；未撤销时为 NULL',
     created_at_ms     BIGINT      NOT NULL COMMENT '发布时间，UTC 纪元毫秒',
     PRIMARY KEY (id),
     UNIQUE KEY uk_publication_version (channel_id, business_day, published_version)
 ) COMMENT = '发布快照表，快照只读，授权撤销不改写历史快照';
 
 CREATE TABLE IF NOT EXISTS playout_publication_segment (
-    id             BIGINT      NOT NULL AUTO_INCREMENT COMMENT '快照片段自增 ID',
-    publication_id BIGINT      NOT NULL COMMENT '所属发布快照 ID',
-    segment_id     VARCHAR(64) NOT NULL COMMENT '来源草稿片段 ID',
-    asset_id       VARCHAR(64) NOT NULL COMMENT '播出素材 ID',
-    grant_id       BIGINT      NOT NULL COMMENT '发布时完整覆盖该片段的授权 ID，播出查询据此实时判定撤销状态',
-    start_ms       BIGINT      NOT NULL COMMENT '播出开始（含），UTC 纪元毫秒',
-    end_ms         BIGINT      NOT NULL COMMENT '播出结束（不含），UTC 纪元毫秒',
+    id                     BIGINT      NOT NULL AUTO_INCREMENT COMMENT '快照片段自增 ID',
+    publication_id         BIGINT      NOT NULL COMMENT '所属发布快照 ID',
+    segment_id             VARCHAR(64) NOT NULL COMMENT '来源草稿片段 ID',
+    asset_id               VARCHAR(64) NOT NULL COMMENT '播出素材 ID',
+    grant_id               BIGINT      NOT NULL COMMENT '发布时完整覆盖该片段的授权 ID，播出查询据此实时判定撤销状态',
+    start_ms               BIGINT      NOT NULL COMMENT '播出开始（含），UTC 纪元毫秒',
+    end_ms                 BIGINT      NOT NULL COMMENT '播出结束（不含），UTC 纪元毫秒',
+    sponsor_key            VARCHAR(64) NULL COMMENT '发布时素材归属赞助商键快照；素材无赞助商时为 NULL',
+    sponsor_window_key     VARCHAR(64) NULL COMMENT '发布时命中的同赞助商标排他窗键；未命中时为 NULL',
+    sponsor_window_version BIGINT      NULL COMMENT '发布时命中排他窗的版本号；未命中时为 NULL',
     PRIMARY KEY (id),
     KEY idx_pub_segment (publication_id)
-) COMMENT = '发布快照片段表，只读';
+) COMMENT = '发布快照片段表，只读；赞助快照在发布时固化，窗口后续删除或修订不改写';
 
 CREATE TABLE IF NOT EXISTS playout_request (
     request_id    VARCHAR(64)  NOT NULL COMMENT '幂等请求 ID，客户端生成',
-    operation     VARCHAR(32)  NOT NULL COMMENT '操作类型：REPLACE_DRAFT / PUBLISH / REVOKE_GRANT / CREATE_OVERRIDE / CANCEL_OVERRIDE',
+    operation     VARCHAR(32)  NOT NULL COMMENT '操作类型：REPLACE_DRAFT / PUBLISH / BATCH_PUBLISH / REVOKE_GRANT / CREATE_OVERRIDE / CANCEL_OVERRIDE / REGISTER_WINDOW / REVISE_WINDOW / DELETE_WINDOW / REVOKE_PUBLICATION',
     params_hash   VARCHAR(64)  NOT NULL COMMENT '业务参数（不含 requestId）的 SHA-256，十六进制',
     response_body TEXT         NULL COMMENT '成功时的响应 JSON；失败请求回滚不占用 requestId',
     created_at_ms BIGINT       NOT NULL COMMENT '记录创建时间，UTC 纪元毫秒',
@@ -97,3 +104,24 @@ CREATE TABLE IF NOT EXISTS playout_emergency_override (
     PRIMARY KEY (override_key),
     KEY idx_override_playout (channel_id, status, start_ms, end_ms, priority)
 ) COMMENT = '限时紧急插播表；不改写日草稿与发布快照，同频道同优先级 ACTIVE 区间不得重叠';
+
+CREATE TABLE IF NOT EXISTS playout_sponsor_window (
+    id            BIGINT      NOT NULL AUTO_INCREMENT COMMENT '排他窗版本行自增 ID',
+    window_key    VARCHAR(64) NOT NULL COMMENT '排他窗逻辑键，客户端指定或系统生成，修订时不变',
+    sponsor_key   VARCHAR(64) NOT NULL COMMENT '排他窗所属赞助商键',
+    business_day  DATE        NOT NULL COMMENT '运营日，Asia/Shanghai 日历日',
+    start_ms      BIGINT      NOT NULL COMMENT '排他起点（含），UTC 纪元毫秒，须落在运营日内',
+    end_ms        BIGINT      NOT NULL COMMENT '排他终点（不含），UTC 纪元毫秒，区间左闭右开',
+    version       BIGINT      NOT NULL COMMENT '窗口版本，从 1 起每次修订递增；发布快照固化命中版本',
+    status        VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE 生效中 / SUPERSEDED 已被新版本替代 / DELETED 已删除',
+    created_at_ms BIGINT      NOT NULL COMMENT '本版本创建时间，UTC 纪元毫秒',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_sponsor_window_version (window_key, version),
+    KEY idx_sponsor_window_scope (sponsor_key, business_day, status, start_ms, end_ms)
+) COMMENT = '赞助排他窗表；每个 window_key 同一时刻至多一个 ACTIVE 版本，历史版本保留供快照核对';
+
+CREATE TABLE IF NOT EXISTS playout_sponsor_window_channel (
+    window_id  BIGINT      NOT NULL COMMENT '排他窗版本行 ID',
+    channel_id VARCHAR(64) NOT NULL COMMENT '排他生效频道 ID；每个窗口版本至少一个频道',
+    PRIMARY KEY (window_id, channel_id)
+) COMMENT = '赞助排他窗频道范围表，随窗口版本整体重建';

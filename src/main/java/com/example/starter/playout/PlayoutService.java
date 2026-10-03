@@ -1,5 +1,6 @@
 package com.example.starter.playout;
 
+import com.example.starter.playout.PlayoutRepository.AssetRow;
 import com.example.starter.playout.PlayoutRepository.DraftRow;
 import com.example.starter.playout.PlayoutRepository.GrantRow;
 import com.example.starter.playout.PlayoutRepository.OverrideRow;
@@ -7,8 +8,13 @@ import com.example.starter.playout.PlayoutRepository.PublicationRow;
 import com.example.starter.playout.PlayoutRepository.PublicationSegmentRow;
 import com.example.starter.playout.PlayoutRepository.RequestRow;
 import com.example.starter.playout.PlayoutRepository.SegmentRow;
+import com.example.starter.playout.PlayoutRepository.SponsorWindowRow;
 import com.example.starter.playout.api.ApiException;
+import com.example.starter.playout.api.SponsorConflictException;
 import com.example.starter.playout.api.Dtos.AssetResponse;
+import com.example.starter.playout.api.Dtos.BatchPublishItem;
+import com.example.starter.playout.api.Dtos.BatchPublishRequest;
+import com.example.starter.playout.api.Dtos.BatchPublishResponse;
 import com.example.starter.playout.api.Dtos.ChannelResponse;
 import com.example.starter.playout.api.Dtos.CreateAssetRequest;
 import com.example.starter.playout.api.Dtos.CreateChannelRequest;
@@ -22,7 +28,15 @@ import com.example.starter.playout.api.Dtos.GrantResponse;
 import com.example.starter.playout.api.Dtos.OverrideStatus;
 import com.example.starter.playout.api.Dtos.PlayoutDecisionResponse;
 import com.example.starter.playout.api.Dtos.PublishRequest;
+import com.example.starter.playout.api.Dtos.PublicationDetailResponse;
+import com.example.starter.playout.api.Dtos.PublicationSegmentDetail;
 import com.example.starter.playout.api.Dtos.PublishResponse;
+import com.example.starter.playout.api.Dtos.RegisterSponsorWindowRequest;
+import com.example.starter.playout.api.Dtos.ReviseSponsorWindowRequest;
+import com.example.starter.playout.api.Dtos.RevokePublicationResponse;
+import com.example.starter.playout.api.Dtos.SponsorConflictDetail;
+import com.example.starter.playout.api.Dtos.SponsorWindowResponse;
+import com.example.starter.playout.api.Dtos.SponsorWindowStatus;
 import com.example.starter.playout.api.Dtos.ReplaceDraftRequest;
 import com.example.starter.playout.api.Dtos.SegmentInput;
 import com.example.starter.playout.api.Dtos.SegmentResponse;
@@ -41,7 +55,10 @@ import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.HashSet;
 import java.util.Optional;
+import java.util.OptionalLong;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Supplier;
 
@@ -63,6 +80,11 @@ public class PlayoutService {
     private static final String OP_REVOKE_GRANT = "REVOKE_GRANT";
     private static final String OP_CREATE_OVERRIDE = "CREATE_OVERRIDE";
     private static final String OP_CANCEL_OVERRIDE = "CANCEL_OVERRIDE";
+    private static final String OP_REGISTER_WINDOW = "REGISTER_WINDOW";
+    private static final String OP_REVISE_WINDOW = "REVISE_WINDOW";
+    private static final String OP_DELETE_WINDOW = "DELETE_WINDOW";
+    private static final String OP_BATCH_PUBLISH = "BATCH_PUBLISH";
+    private static final String OP_REVOKE_PUBLICATION = "REVOKE_PUBLICATION";
 
     /** 紧急插播时长上限（含）：30 分钟，单位毫秒。 */
     private static final long OVERRIDE_MAX_DURATION_MS = 30L * 60L * 1000L;
@@ -82,12 +104,13 @@ public class PlayoutService {
     public AssetResponse createAsset(CreateAssetRequest request) {
         String id = request.id() == null || request.id().isBlank()
                 ? UUID.randomUUID().toString() : request.id();
+        String sponsorKey = normalizeSponsorKey(request.sponsorKey());
         try {
-            repo.insertAsset(id, request.durationMs(), nowMs());
+            repo.insertAsset(id, request.durationMs(), sponsorKey, nowMs());
         } catch (DuplicateKeyException e) {
             throw ApiException.conflict("DUPLICATE_ID", "素材 ID 已存在: " + id);
         }
-        return new AssetResponse(id, request.durationMs());
+        return new AssetResponse(id, request.durationMs(), sponsorKey);
     }
 
     // ---------- 频道 ----------
@@ -192,8 +215,9 @@ public class PlayoutService {
     // ---------- 发布 ----------
 
     /**
-     * 发布草稿：校验草稿版本与发布版本，逐片段加锁校验授权仍有效后原子生成只读快照。
-     * 与授权撤销并发时按数据库提交顺序生效：撤销先提交则本方法因授权失效而 422 拒绝。
+     * 发布草稿：持频道锁校验草稿版本与发布版本，逐片段加锁校验授权仍有效，
+     * 并校验所有命中的赞助排他窗（异赞助冲突整体 409），最后原子生成只读快照，
+     * 固化素材 sponsorKey 与命中窗口版本。与授权撤销并发时按数据库提交顺序生效。
      */
     @Transactional
     public PublishResponse publish(String channelId, LocalDate businessDay, PublishRequest request) {
@@ -203,39 +227,10 @@ public class PlayoutService {
         String hash = sha256(OP_PUBLISH + "|" + channelId + "|" + businessDay
                 + "|" + request.draftVersion() + "|" + request.expectedPublishedVersion());
         return idempotent(request.requestId(), OP_PUBLISH, hash, PublishResponse.class, () -> {
-            DraftRow draft = repo.findDraft(channelId, businessDay)
-                    .orElseThrow(() -> ApiException.notFound("草稿不存在: " + channelId + " " + businessDay));
-            List<SegmentRow> segments = repo.findDraftSegments(channelId, businessDay);
-            if (draft.version() != request.draftVersion()) {
-                throw ApiException.conflict("DRAFT_VERSION_CONFLICT",
-                        "草稿版本不符，当前 " + draft.version());
-            }
-            long currentPublished = repo.currentPublishedVersion(channelId, businessDay);
-            if (currentPublished != request.expectedPublishedVersion()) {
-                throw ApiException.conflict("PUBLISHED_VERSION_CONFLICT",
-                        "发布版本冲突，当前 " + currentPublished);
-            }
-            List<Long> grantIds = new ArrayList<>();
-            for (SegmentRow segment : segments) {
-                GrantRow grant = selectCoveringGrantForUpdate(channelId, segment);
-                grantIds.add(grant.id());
-            }
-            long newVersion = currentPublished + 1;
-            long publicationId;
-            try {
-                publicationId = repo.insertPublication(channelId, businessDay,
-                        newVersion, draft.version(), nowMs());
-            } catch (DuplicateKeyException e) {
-                throw ApiException.conflict("PUBLISHED_VERSION_CONFLICT",
-                        "发布版本冲突，版本 " + newVersion + " 已存在");
-            }
-            for (int i = 0; i < segments.size(); i++) {
-                SegmentRow segment = segments.get(i);
-                repo.insertPublicationSegment(publicationId, segment.id(), segment.assetId(),
-                        grantIds.get(i), segment.startMs(), segment.endMs());
-            }
-            return new PublishResponse(publicationId, channelId, businessDay.toString(),
-                    newVersion, draft.version());
+            repo.lockChannelForUpdate(channelId);
+            PreparedPublication prepared = preparePublication(channelId, businessDay,
+                    request.draftVersion(), request.expectedPublishedVersion());
+            return commitPublication(prepared);
         });
     }
 
@@ -374,6 +369,8 @@ public class PlayoutService {
             throw ApiException.conflict("OVERRIDE_INTERVAL_CONFLICT",
                     "同频道同优先级 ACTIVE 插播区间重叠: " + overlapping.get(0).overrideKey());
         }
+
+        validateOverrideSponsor(request.channelId(), request.assetId(), startMs, endMs, startDay);
 
         long createdAtMs = nowMs();
         try {
@@ -583,6 +580,493 @@ public class PlayoutService {
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException(e);
         }
+    }
+
+    // ---------- 赞助排他窗 ----------
+
+    /**
+     * 登记赞助排他窗：频道集合非空、区间合法且完整落在运营日内、同赞助商同频道 ACTIVE 窗口
+     * 不重叠（均 422）；与既有占位（最新未撤销发布片段、ACTIVE 插播）异赞助冲突时 409。
+     * 携带 requestId 幂等：同键同参重放首次结果，异参 409，失败不占键。
+     */
+    @Transactional
+    public SponsorWindowResponse registerSponsorWindow(RegisterSponsorWindowRequest request) {
+        String windowKey = request.windowKey() == null || request.windowKey().isBlank()
+                ? UUID.randomUUID().toString() : request.windowKey();
+        LocalDate businessDay = parseDay(request.businessDay());
+        long startMs = toMs(request.start());
+        long endMs = toMs(request.end());
+        List<String> channels = validateWindowScope(businessDay, request.channelIds(),
+                startMs, endMs);
+        String hash = sha256(OP_REGISTER_WINDOW + "|" + windowKey + "|" + request.sponsorKey() + "|"
+                + businessDay + "|" + String.join(",", channels) + "|" + startMs + "|" + endMs);
+        return idempotent(request.requestId(), OP_REGISTER_WINDOW, hash, SponsorWindowResponse.class, () -> {
+            lockChannels(channels);
+            if (repo.findLatestWindowByKey(windowKey).isPresent()) {
+                throw ApiException.conflict("DUPLICATE_WINDOW_KEY", "排他窗键已存在: " + windowKey);
+            }
+            checkWindowOverlap(request.sponsorKey(), businessDay, channels,
+                    startMs, endMs, null);
+            checkWindowOccupancy(request.sponsorKey(), channels, businessDay,
+                    startMs, endMs, windowKey, 1L);
+            long now = nowMs();
+            long id = repo.insertSponsorWindow(windowKey, request.sponsorKey(), businessDay,
+                    startMs, endMs, 1L, "ACTIVE", now);
+            for (String channelId : channels) {
+                repo.insertSponsorWindowChannel(id, channelId);
+            }
+            return new SponsorWindowResponse(windowKey, request.sponsorKey(),
+                    businessDay.toString(), channels, atMs(startMs), atMs(endMs),
+                    1L, SponsorWindowStatus.ACTIVE, atMs(now));
+        });
+    }
+
+    /**
+     * 修订赞助排他窗：整体替换区间与频道集合，版本 +1，旧版本置 SUPERSEDED 保留历史；
+     * 重叠与占位校验同登记（重叠判定排除自身）；expectedVersion 不符 409；已删除窗口 409。
+     */
+    @Transactional
+    public SponsorWindowResponse reviseSponsorWindow(String windowKey, ReviseSponsorWindowRequest request) {
+        long startMs = toMs(request.start());
+        long endMs = toMs(request.end());
+        String hash = sha256(OP_REVISE_WINDOW + "|" + windowKey + "|" + request.expectedVersion() + "|"
+                + String.join(",", canonicalChannels(request.channelIds())) + "|" + startMs + "|" + endMs);
+        return idempotent(request.requestId(), OP_REVISE_WINDOW, hash, SponsorWindowResponse.class, () -> {
+            SponsorWindowRow current = requireActiveWindow(windowKey);
+            if (current.version() != request.expectedVersion()) {
+                throw ApiException.conflict("WINDOW_VERSION_CONFLICT",
+                        "排他窗版本不符，当前 " + current.version());
+            }
+            List<String> channels = validateWindowScope(current.businessDay(), request.channelIds(),
+                    startMs, endMs);
+            lockChannels(unionSorted(channels, repo.findWindowChannels(current.id())));
+            checkWindowOverlap(current.sponsorKey(), current.businessDay(), channels,
+                    startMs, endMs, windowKey);
+            long newVersion = current.version() + 1;
+            checkWindowOccupancy(current.sponsorKey(), channels, current.businessDay(),
+                    startMs, endMs, windowKey, newVersion);
+            repo.updateWindowStatus(current.id(), "SUPERSEDED");
+            long now = nowMs();
+            long id = repo.insertSponsorWindow(windowKey, current.sponsorKey(), current.businessDay(),
+                    startMs, endMs, newVersion, "ACTIVE", now);
+            for (String channelId : channels) {
+                repo.insertSponsorWindowChannel(id, channelId);
+            }
+            return new SponsorWindowResponse(windowKey, current.sponsorKey(),
+                    current.businessDay().toString(), channels, atMs(startMs), atMs(endMs),
+                    newVersion, SponsorWindowStatus.ACTIVE, atMs(now));
+        });
+    }
+
+    /**
+     * 删除赞助排他窗：ACTIVE -> DELETED，版本行保留供快照核对，不改写已发布快照；
+     * 已删除再删 409；携带 requestId 幂等。
+     */
+    @Transactional
+    public SponsorWindowResponse deleteSponsorWindow(String windowKey, String requestId) {
+        String hash = sha256(OP_DELETE_WINDOW + "|" + windowKey);
+        return idempotent(requestId, OP_DELETE_WINDOW, hash, SponsorWindowResponse.class, () -> {
+            SponsorWindowRow current = requireActiveWindow(windowKey);
+            lockChannels(repo.findWindowChannels(current.id()));
+            repo.updateWindowStatus(current.id(), "DELETED");
+            return toWindowResponse(current, "DELETED");
+        });
+    }
+
+    /** 查询赞助排他窗最新版本详情（含 SUPERSEDED / DELETED 终态），只读。 */
+    @Transactional(readOnly = true)
+    public SponsorWindowResponse getSponsorWindow(String windowKey) {
+        SponsorWindowRow row = repo.findLatestWindowByKey(windowKey)
+                .orElseThrow(() -> ApiException.notFound("排他窗不存在: " + windowKey));
+        return toWindowResponse(row, row.status());
+    }
+
+    /** 按赞助商与运营日查询 ACTIVE 排他窗（诊断查询），channelId 可空表示不过滤；只读。 */
+    @Transactional(readOnly = true)
+    public List<SponsorWindowResponse> listSponsorWindows(String sponsorKey, LocalDate businessDay,
+                                                          String channelId) {
+        List<SponsorWindowRow> rows = channelId == null || channelId.isBlank()
+                ? repo.findActiveWindows(sponsorKey, businessDay)
+                : repo.findActiveWindowsForChannelDay(channelId, businessDay).stream()
+                        .filter(row -> row.sponsorKey().equals(sponsorKey))
+                        .toList();
+        return rows.stream().map(row -> toWindowResponse(row, row.status())).toList();
+    }
+
+    /** 取当前 ACTIVE 窗口；已删除（或已被取代且无 ACTIVE）409，从未存在 404。 */
+    private SponsorWindowRow requireActiveWindow(String windowKey) {
+        Optional<SponsorWindowRow> active = repo.findActiveWindowByKey(windowKey);
+        if (active.isPresent()) {
+            return active.get();
+        }
+        if (repo.findLatestWindowByKey(windowKey).isPresent()) {
+            throw ApiException.conflict("WINDOW_NOT_ACTIVE", "排他窗已删除，不能执行该操作: " + windowKey);
+        }
+        throw ApiException.notFound("排他窗不存在: " + windowKey);
+    }
+
+    /**
+     * 校验排他窗范围：频道集合非空且频道存在、区间合法且完整落在运营日内（UTC 左闭右开）。
+     * 返回去重排序后的频道列表。
+     */
+    private List<String> validateWindowScope(LocalDate businessDay, List<String> channelIds,
+                                             long startMs, long endMs) {
+        if (channelIds == null || channelIds.isEmpty()) {
+            throw ApiException.unprocessable("WINDOW_CHANNELS_EMPTY", "排他窗频道集合不得为空");
+        }
+        if (endMs <= startMs) {
+            throw ApiException.unprocessable("WINDOW_TIME_INVALID",
+                    "排他窗终点必须大于起点，实际时长 " + (endMs - startMs) + " 毫秒");
+        }
+        long dayStartMs = businessDay.atStartOfDay(ZONE).toInstant().toEpochMilli();
+        long dayEndMs = businessDay.plusDays(1).atStartOfDay(ZONE).toInstant().toEpochMilli();
+        if (startMs < dayStartMs || endMs > dayEndMs) {
+            throw ApiException.unprocessable("WINDOW_CROSSES_DAY",
+                    "排他窗须完整落在运营日内: " + businessDay);
+        }
+        List<String> channels = channelIds.stream().distinct().sorted().toList();
+        for (String channelId : channels) {
+            if (repo.findChannel(channelId).isEmpty()) {
+                throw ApiException.notFound("频道不存在: " + channelId);
+            }
+        }
+        return channels;
+    }
+
+    /** 同赞助商同频道 ACTIVE 窗口重叠判定（左闭右开：相邻不算重叠），命中即 422。 */
+    private void checkWindowOverlap(String sponsorKey, LocalDate businessDay, List<String> channels,
+                                    long startMs, long endMs, String excludeWindowKey) {
+        for (String channelId : channels) {
+            List<SponsorWindowRow> overlapping = repo.findActiveWindowsOverlapping(
+                    sponsorKey, channelId, businessDay, startMs, endMs, excludeWindowKey);
+            if (!overlapping.isEmpty()) {
+                throw ApiException.unprocessable("WINDOW_OVERLAP",
+                        "同赞助商在同频道的排他窗重叠: " + overlapping.get(0).windowKey()
+                                + " 频道 " + channelId);
+            }
+        }
+    }
+
+    /**
+     * 既有占位判定：窗口频道范围内，最新未撤销发布片段或 ACTIVE 插播若与窗口相交且赞助不同
+     * （含无赞助素材），则整体 409 并返回全部冲突明细（频道、时段、冲突素材、交集时长）。
+     */
+    private void checkWindowOccupancy(String sponsorKey, List<String> channels, LocalDate businessDay,
+                                      long startMs, long endMs, String windowKey, long windowVersion) {
+        List<SponsorConflictDetail> conflicts = new ArrayList<>();
+        for (String channelId : channels) {
+            Optional<PublicationRow> publication = repo.findLatestPublication(channelId, businessDay);
+            if (publication.isPresent()) {
+                for (PublicationSegmentRow segment
+                        : repo.findPublicationSegments(publication.get().id())) {
+                    if (segment.startMs() < endMs && segment.endMs() > startMs
+                            && !sponsorKey.equals(segment.sponsorKey())) {
+                        conflicts.add(occupancyConflict(channelId, segment.segmentId(),
+                                segment.assetId(), segment.sponsorKey(), windowKey, sponsorKey,
+                                windowVersion, segment.startMs(), segment.endMs(), startMs, endMs));
+                    }
+                }
+            }
+            for (OverrideRow override : repo.findActiveOverridesOverlapping(channelId, startMs, endMs)) {
+                String assetSponsor = repo.findAsset(override.assetId())
+                        .map(AssetRow::sponsorKey).orElse(null);
+                if (!sponsorKey.equals(assetSponsor)) {
+                    conflicts.add(occupancyConflict(channelId, null, override.assetId(), assetSponsor,
+                            windowKey, sponsorKey, windowVersion,
+                            override.startMs(), override.endMs(), startMs, endMs));
+                }
+            }
+        }
+        if (!conflicts.isEmpty()) {
+            throw new SponsorConflictException("排他窗与既有占位冲突，共 " + conflicts.size() + " 处",
+                    conflicts);
+        }
+    }
+
+    private static SponsorConflictDetail occupancyConflict(String channelId, String segmentId,
+                                                           String assetId, String assetSponsor,
+                                                           String windowKey, String windowSponsor,
+                                                           long windowVersion,
+                                                           long occStartMs, long occEndMs,
+                                                           long winStartMs, long winEndMs) {
+        long conflictStart = Math.max(occStartMs, winStartMs);
+        long conflictEnd = Math.min(occEndMs, winEndMs);
+        return new SponsorConflictDetail(channelId, segmentId, assetId, assetSponsor,
+                windowKey, windowSponsor, windowVersion,
+                atMs(conflictStart), atMs(conflictEnd), conflictEnd - conflictStart);
+    }
+
+    private SponsorWindowResponse toWindowResponse(SponsorWindowRow row, String status) {
+        return new SponsorWindowResponse(row.windowKey(), row.sponsorKey(),
+                row.businessDay().toString(), repo.findWindowChannels(row.id()),
+                atMs(row.startMs()), atMs(row.endMs()), row.version(),
+                SponsorWindowStatus.valueOf(status), atMs(row.createdAtMs()));
+    }
+
+    /** 按字典序依次锁定频道行，串行化窗口登记/修订/删除与发布、插播，避免死锁。 */
+    private void lockChannels(List<String> channelIds) {
+        for (String channelId : channelIds) {
+            repo.lockChannelForUpdate(channelId);
+        }
+    }
+
+    private static List<String> unionSorted(List<String> first, List<String> second) {
+        List<String> union = new ArrayList<>(first);
+        union.addAll(second);
+        return union.stream().distinct().sorted().toList();
+    }
+
+    private static List<String> canonicalChannels(List<String> channelIds) {
+        return channelIds == null ? List.of() : channelIds.stream().distinct().sorted().toList();
+    }
+
+    // ---------- 批量发布 / 发布撤销 / 发布明细 ----------
+
+    /**
+     * 跨频道批量发布：先在完整最终编排上校验全部频道（版本、授权、赞助排他），
+     * 再在一个事务内提交；任一频道异赞助冲突整体 409 并返回全部冲突明细，不留下部分频道更新。
+     */
+    @Transactional
+    public BatchPublishResponse publishBatch(BatchPublishRequest request) {
+        List<BatchPublishItem> items = request.items();
+        if (items.isEmpty()) {
+            throw ApiException.badRequest("批量发布项不能为空");
+        }
+        Set<String> seen = new HashSet<>();
+        for (BatchPublishItem item : items) {
+            if (!seen.add(item.channelId() + "|" + item.businessDay())) {
+                throw ApiException.badRequest("批量发布项重复: " + item.channelId()
+                        + " " + item.businessDay());
+            }
+        }
+        StringBuilder canonical = new StringBuilder();
+        for (BatchPublishItem item : items) {
+            canonical.append(item.channelId()).append('|').append(item.businessDay()).append('|')
+                    .append(item.draftVersion()).append('|').append(item.expectedPublishedVersion())
+                    .append(';');
+        }
+        String hash = sha256(OP_BATCH_PUBLISH + "|" + canonical);
+        return idempotent(request.requestId(), OP_BATCH_PUBLISH, hash, BatchPublishResponse.class, () -> {
+            items.stream()
+                    .sorted(Comparator.comparing(BatchPublishItem::channelId)
+                            .thenComparing(BatchPublishItem::businessDay))
+                    .forEach(item -> repo.lockChannelForUpdate(item.channelId()));
+            List<PreparedPublication> prepared = new ArrayList<>();
+            List<SponsorConflictDetail> conflicts = new ArrayList<>();
+            for (BatchPublishItem item : items) {
+                try {
+                    prepared.add(preparePublication(item.channelId(), parseDay(item.businessDay()),
+                            item.draftVersion(), item.expectedPublishedVersion()));
+                } catch (SponsorConflictException e) {
+                    conflicts.addAll(e.conflicts());
+                    prepared.add(null);
+                }
+            }
+            if (!conflicts.isEmpty()) {
+                throw new SponsorConflictException("批量发布存在赞助排他冲突，共 "
+                        + conflicts.size() + " 处", conflicts);
+            }
+            List<PublishResponse> responses = new ArrayList<>();
+            for (PreparedPublication publication : prepared) {
+                responses.add(commitPublication(publication));
+            }
+            return new BatchPublishResponse(responses);
+        });
+    }
+
+    /**
+     * 撤销尚未开始的发布：释放占位（不再参与播出决定与窗口占位判定），保留窗口命中历史；
+     * 最早片段已开始则 409，只能按既有紧急插播流程处理。携带 requestId 幂等。
+     */
+    @Transactional
+    public RevokePublicationResponse revokePublication(long publicationId, String requestId) {
+        String hash = sha256(OP_REVOKE_PUBLICATION + "|" + publicationId);
+        return idempotent(requestId, OP_REVOKE_PUBLICATION, hash, RevokePublicationResponse.class, () -> {
+            PublicationRow publication = repo.findPublicationById(publicationId)
+                    .orElseThrow(() -> ApiException.notFound("发布快照不存在: " + publicationId));
+            repo.lockChannelForUpdate(publication.channelId());
+            if (publication.revoked()) {
+                throw ApiException.conflict("PUBLICATION_ALREADY_REVOKED",
+                        "发布已撤销: " + publicationId);
+            }
+            List<PublicationSegmentRow> segments = repo.findPublicationSegments(publicationId);
+            long now = nowMs();
+            OptionalLong earliestStart = segments.stream()
+                    .mapToLong(PublicationSegmentRow::startMs).min();
+            if (earliestStart.isPresent() && earliestStart.getAsLong() <= now) {
+                throw ApiException.conflict("PUBLICATION_ALREADY_STARTED",
+                        "发布已开始播出，只能按既有紧急插播流程处理: " + publicationId);
+            }
+            int updated = repo.revokePublication(publicationId, requestId, now);
+            if (updated == 0) {
+                throw ApiException.conflict("PUBLICATION_ALREADY_REVOKED",
+                        "发布已撤销: " + publicationId);
+            }
+            return new RevokePublicationResponse(publication.id(), publication.channelId(),
+                    publication.businessDay().toString(), publication.publishedVersion(),
+                    true, atMs(now));
+        });
+    }
+
+    /** 查询发布快照明细：含固化的素材 sponsorKey 与窗口命中历史；只读，不修改状态。 */
+    @Transactional(readOnly = true)
+    public PublicationDetailResponse getPublication(long publicationId) {
+        PublicationRow publication = repo.findPublicationById(publicationId)
+                .orElseThrow(() -> ApiException.notFound("发布快照不存在: " + publicationId));
+        List<PublicationSegmentDetail> segments = repo.findPublicationSegments(publicationId).stream()
+                .map(row -> new PublicationSegmentDetail(row.segmentId(), row.assetId(),
+                        row.sponsorKey(), row.grantId(), atMs(row.startMs()), atMs(row.endMs()),
+                        row.sponsorWindowKey(), row.sponsorWindowVersion()))
+                .toList();
+        return new PublicationDetailResponse(publication.id(), publication.channelId(),
+                publication.businessDay().toString(), publication.publishedVersion(),
+                publication.draftVersion(), publication.revoked(), atMs(publication.createdAtMs()),
+                segments);
+    }
+
+    /**
+     * 校验并准备一次发布：草稿/发布版本检查、授权加锁选取、赞助排他校验与命中窗口固化。
+     * 不落库；由 commitPublication 在同一事务内提交。
+     */
+    private PreparedPublication preparePublication(String channelId, LocalDate businessDay,
+                                                   long draftVersion, long expectedPublishedVersion) {
+        repo.findChannel(channelId)
+                .orElseThrow(() -> ApiException.notFound("频道不存在: " + channelId));
+        DraftRow draft = repo.findDraft(channelId, businessDay)
+                .orElseThrow(() -> ApiException.notFound("草稿不存在: " + channelId + " " + businessDay));
+        List<SegmentRow> segments = repo.findDraftSegments(channelId, businessDay);
+        if (draft.version() != draftVersion) {
+            throw ApiException.conflict("DRAFT_VERSION_CONFLICT", "草稿版本不符，当前 " + draft.version());
+        }
+        long currentPublished = repo.currentPublishedVersion(channelId, businessDay);
+        if (currentPublished != expectedPublishedVersion) {
+            throw ApiException.conflict("PUBLISHED_VERSION_CONFLICT",
+                    "发布版本冲突，当前 " + currentPublished);
+        }
+        List<Long> grantIds = new ArrayList<>();
+        for (SegmentRow segment : segments) {
+            grantIds.add(selectCoveringGrantForUpdate(channelId, segment).id());
+        }
+        List<SponsorSnapshot> sponsors = resolveSponsorSnapshots(channelId, businessDay, segments);
+        return new PreparedPublication(channelId, businessDay, draft.version(), currentPublished,
+                segments, grantIds, sponsors);
+    }
+
+    /** 提交已校验的发布：生成只读快照并固化赞助快照（素材 sponsorKey 与命中窗口版本）。 */
+    private PublishResponse commitPublication(PreparedPublication prepared) {
+        long newVersion = prepared.currentPublishedVersion() + 1;
+        long publicationId;
+        try {
+            publicationId = repo.insertPublication(prepared.channelId(), prepared.businessDay(),
+                    newVersion, prepared.draftVersion(), nowMs());
+        } catch (DuplicateKeyException e) {
+            throw ApiException.conflict("PUBLISHED_VERSION_CONFLICT",
+                    "发布版本冲突，版本 " + newVersion + " 已存在");
+        }
+        for (int i = 0; i < prepared.segments().size(); i++) {
+            SegmentRow segment = prepared.segments().get(i);
+            SponsorSnapshot sponsor = prepared.sponsors().get(i);
+            repo.insertPublicationSegment(publicationId, segment.id(), segment.assetId(),
+                    prepared.grantIds().get(i), segment.startMs(), segment.endMs(),
+                    sponsor.sponsorKey(), sponsor.windowKey(), sponsor.windowVersion());
+        }
+        return new PublishResponse(publicationId, prepared.channelId(),
+                prepared.businessDay().toString(), newVersion, prepared.draftVersion());
+    }
+
+    /**
+     * 赞助排他校验：逐片段核对命中的 ACTIVE 排他窗，异赞助（含无赞助素材）冲突收集后整体 409；
+     * 同赞助商窗口记录为命中快照。返回与片段一一对应的赞助快照。
+     */
+    private List<SponsorSnapshot> resolveSponsorSnapshots(String channelId, LocalDate businessDay,
+                                                          List<SegmentRow> segments) {
+        List<SponsorWindowRow> windows = repo.findActiveWindowsForChannelDay(channelId, businessDay);
+        List<SponsorSnapshot> snapshots = new ArrayList<>();
+        List<SponsorConflictDetail> conflicts = new ArrayList<>();
+        for (SegmentRow segment : segments) {
+            String sponsorKey = repo.findAsset(segment.assetId())
+                    .map(AssetRow::sponsorKey).orElse(null);
+            SponsorWindowRow hit = null;
+            for (SponsorWindowRow window : windows) {
+                if (window.startMs() < segment.endMs() && window.endMs() > segment.startMs()) {
+                    if (window.sponsorKey().equals(sponsorKey)) {
+                        if (hit == null) {
+                            hit = window;
+                        }
+                    } else {
+                        conflicts.add(segmentConflict(channelId, segment, sponsorKey, window));
+                    }
+                }
+            }
+            snapshots.add(new SponsorSnapshot(sponsorKey,
+                    hit == null ? null : hit.windowKey(),
+                    hit == null ? null : hit.version()));
+        }
+        if (!conflicts.isEmpty()) {
+            throw new SponsorConflictException("频道 " + channelId + " 存在赞助排他冲突，共 "
+                    + conflicts.size() + " 处", conflicts);
+        }
+        return snapshots;
+    }
+
+    private static SponsorConflictDetail segmentConflict(String channelId, SegmentRow segment,
+                                                         String sponsorKey, SponsorWindowRow window) {
+        long conflictStart = Math.max(segment.startMs(), window.startMs());
+        long conflictEnd = Math.min(segment.endMs(), window.endMs());
+        return new SponsorConflictDetail(channelId, segment.id(), segment.assetId(), sponsorKey,
+                window.windowKey(), window.sponsorKey(), window.version(),
+                atMs(conflictStart), atMs(conflictEnd), conflictEnd - conflictStart);
+    }
+
+    /**
+     * 紧急插播赞助排他校验：插播区间命中 ACTIVE 排他窗时，插播素材赞助商必须与窗口一致，
+     * 否则 409 并返回冲突明细（segmentId 为 null）。
+     */
+    private void validateOverrideSponsor(String channelId, String assetId, long startMs, long endMs,
+                                         LocalDate businessDay) {
+        List<SponsorWindowRow> windows = repo.findActiveWindowsForChannelDay(channelId, businessDay);
+        if (windows.isEmpty()) {
+            return;
+        }
+        String sponsorKey = repo.findAsset(assetId).map(AssetRow::sponsorKey).orElse(null);
+        List<SponsorConflictDetail> conflicts = new ArrayList<>();
+        for (SponsorWindowRow window : windows) {
+            if (window.startMs() < endMs && window.endMs() > startMs
+                    && !window.sponsorKey().equals(sponsorKey)) {
+                long conflictStart = Math.max(startMs, window.startMs());
+                long conflictEnd = Math.min(endMs, window.endMs());
+                conflicts.add(new SponsorConflictDetail(channelId, null, assetId, sponsorKey,
+                        window.windowKey(), window.sponsorKey(), window.version(),
+                        atMs(conflictStart), atMs(conflictEnd), conflictEnd - conflictStart));
+            }
+        }
+        if (!conflicts.isEmpty()) {
+            throw new SponsorConflictException("紧急插播与赞助排他窗冲突，共 " + conflicts.size() + " 处",
+                    conflicts);
+        }
+    }
+
+    private static String normalizeSponsorKey(String sponsorKey) {
+        return sponsorKey == null || sponsorKey.isBlank() ? null : sponsorKey;
+    }
+
+    /** 解析业务日字符串（yyyy-MM-dd），非法时 400。 */
+    private static LocalDate parseDay(String businessDay) {
+        try {
+            return LocalDate.parse(businessDay);
+        } catch (RuntimeException e) {
+            throw ApiException.badRequest("业务日格式应为 yyyy-MM-dd: " + businessDay);
+        }
+    }
+
+    /** 一次已校验待提交的发布。 */
+    private record PreparedPublication(String channelId, LocalDate businessDay, long draftVersion,
+                                       long currentPublishedVersion, List<SegmentRow> segments,
+                                       List<Long> grantIds, List<SponsorSnapshot> sponsors) {
+    }
+
+    /** 片段的赞助快照：素材 sponsorKey 与命中的同赞助商窗口（未命中为 null）。 */
+    private record SponsorSnapshot(String sponsorKey, String windowKey, Long windowVersion) {
     }
 
     /** 校验后的片段。 */

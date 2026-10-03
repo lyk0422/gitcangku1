@@ -4,6 +4,7 @@
 CREATE TABLE IF NOT EXISTS playout_asset (
     id            VARCHAR(64) NOT NULL PRIMARY KEY,
     duration_ms   BIGINT      NOT NULL,
+    sponsor_key   VARCHAR(64) NULL,
     created_at_ms BIGINT      NOT NULL
 );
 
@@ -51,19 +52,25 @@ CREATE TABLE IF NOT EXISTS playout_publication (
     business_day      DATE        NOT NULL,
     published_version BIGINT      NOT NULL,
     draft_version     BIGINT      NOT NULL,
+    revoked           TINYINT(1)  NOT NULL DEFAULT 0,
+    revoke_request_id VARCHAR(64) NULL,
+    revoked_at_ms     BIGINT      NULL,
     created_at_ms     BIGINT      NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uk_publication_version
     ON playout_publication (channel_id, business_day, published_version);
 
 CREATE TABLE IF NOT EXISTS playout_publication_segment (
-    id             BIGINT      NOT NULL AUTO_INCREMENT PRIMARY KEY,
-    publication_id BIGINT      NOT NULL,
-    segment_id     VARCHAR(64) NOT NULL,
-    asset_id       VARCHAR(64) NOT NULL,
-    grant_id       BIGINT      NOT NULL,
-    start_ms       BIGINT      NOT NULL,
-    end_ms         BIGINT      NOT NULL
+    id                     BIGINT      NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    publication_id         BIGINT      NOT NULL,
+    segment_id             VARCHAR(64) NOT NULL,
+    asset_id               VARCHAR(64) NOT NULL,
+    grant_id               BIGINT      NOT NULL,
+    start_ms               BIGINT      NOT NULL,
+    end_ms                 BIGINT      NOT NULL,
+    sponsor_key            VARCHAR(64) NULL,
+    sponsor_window_key     VARCHAR(64) NULL,
+    sponsor_window_version BIGINT      NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pub_segment ON playout_publication_segment (publication_id);
 
@@ -91,3 +98,25 @@ CREATE TABLE IF NOT EXISTS playout_emergency_override (
 );
 CREATE INDEX IF NOT EXISTS idx_override_playout
     ON playout_emergency_override (channel_id, status, start_ms, end_ms, priority);
+
+CREATE TABLE IF NOT EXISTS playout_sponsor_window (
+    id           BIGINT      NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    window_key   VARCHAR(64) NOT NULL,
+    sponsor_key  VARCHAR(64) NOT NULL,
+    business_day DATE        NOT NULL,
+    start_ms     BIGINT      NOT NULL,
+    end_ms       BIGINT      NOT NULL,
+    version      BIGINT      NOT NULL,
+    status       VARCHAR(16) NOT NULL,
+    created_at_ms BIGINT     NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uk_sponsor_window_version
+    ON playout_sponsor_window (window_key, version);
+CREATE INDEX IF NOT EXISTS idx_sponsor_window_scope
+    ON playout_sponsor_window (sponsor_key, business_day, status, start_ms, end_ms);
+
+CREATE TABLE IF NOT EXISTS playout_sponsor_window_channel (
+    window_id  BIGINT      NOT NULL,
+    channel_id VARCHAR(64) NOT NULL,
+    PRIMARY KEY (window_id, channel_id)
+);

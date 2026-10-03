@@ -26,8 +26,8 @@ public class PlayoutRepository {
         this.jdbc = jdbc;
     }
 
-    /** 素材行。 */
-    public record AssetRow(String id, long durationMs) {
+    /** 素材行；sponsorKey 为素材归属赞助商键，NULL 表示不归属任何赞助商。 */
+    public record AssetRow(String id, long durationMs, String sponsorKey) {
     }
 
     /** 频道行。 */
@@ -47,15 +47,30 @@ public class PlayoutRepository {
     public record SegmentRow(String id, String assetId, long startMs, long endMs) {
     }
 
-    /** 发布快照行。 */
+    /** 发布快照行；revoked 表示该发布已被撤销（仅尚未开始的发布可撤销）。 */
     public record PublicationRow(long id, String channelId, LocalDate businessDay,
-                                 long publishedVersion, long draftVersion) {
+                                 long publishedVersion, long draftVersion,
+                                 boolean revoked, long createdAtMs) {
     }
 
-    /** 发布快照片段行，grantId 为发布时选定的覆盖授权。 */
+    /**
+     * 发布快照片段行，grantId 为发布时选定的覆盖授权；
+     * sponsorKey / sponsorWindowKey / sponsorWindowVersion 为发布时固化的赞助快照，未归属或未命中时为 null。
+     */
     public record PublicationSegmentRow(long id, long publicationId, String segmentId,
                                         String assetId, long grantId,
-                                        long startMs, long endMs) {
+                                        long startMs, long endMs,
+                                        String sponsorKey, String sponsorWindowKey,
+                                        Long sponsorWindowVersion) {
+    }
+
+    /** 赞助排他窗版本行；status 为 ACTIVE / SUPERSEDED / DELETED。 */
+    public record SponsorWindowRow(long id, String windowKey, String sponsorKey,
+                                   LocalDate businessDay, long startMs, long endMs,
+                                   long version, String status, long createdAtMs) {
+        public boolean active() {
+            return "ACTIVE".equals(status);
+        }
     }
 
     /** 幂等请求记录行；responseBody 为 NULL 表示尚未成功完成（同事务回滚后记录不保留）。 */
@@ -74,7 +89,7 @@ public class PlayoutRepository {
     }
 
     private static final RowMapper<AssetRow> ASSET_MAPPER = (rs, n) ->
-            new AssetRow(rs.getString("id"), rs.getLong("duration_ms"));
+            new AssetRow(rs.getString("id"), rs.getLong("duration_ms"), rs.getString("sponsor_key"));
 
     private static final RowMapper<ChannelRow> CHANNEL_MAPPER = (rs, n) ->
             new ChannelRow(rs.getString("id"), rs.getString("fallback_asset_id"));
@@ -94,12 +109,15 @@ public class PlayoutRepository {
     private static final RowMapper<PublicationRow> PUBLICATION_MAPPER = (rs, n) ->
             new PublicationRow(rs.getLong("id"), rs.getString("channel_id"),
                     rs.getDate("business_day").toLocalDate(),
-                    rs.getLong("published_version"), rs.getLong("draft_version"));
+                    rs.getLong("published_version"), rs.getLong("draft_version"),
+                    rs.getBoolean("revoked"), rs.getLong("created_at_ms"));
 
     private static final RowMapper<PublicationSegmentRow> PUBLICATION_SEGMENT_MAPPER = (rs, n) ->
             new PublicationSegmentRow(rs.getLong("id"), rs.getLong("publication_id"),
                     rs.getString("segment_id"), rs.getString("asset_id"), rs.getLong("grant_id"),
-                    rs.getLong("start_ms"), rs.getLong("end_ms"));
+                    rs.getLong("start_ms"), rs.getLong("end_ms"),
+                    rs.getString("sponsor_key"), rs.getString("sponsor_window_key"),
+                    (Long) rs.getObject("sponsor_window_version"));
 
     private static final RowMapper<RequestRow> REQUEST_MAPPER = (rs, n) ->
             new RequestRow(rs.getString("request_id"), rs.getString("operation"),
@@ -115,13 +133,14 @@ public class PlayoutRepository {
 
     // ---------- 素材 ----------
 
-    public void insertAsset(String id, long durationMs, long createdAtMs) {
-        jdbc.update("INSERT INTO playout_asset (id, duration_ms, created_at_ms) VALUES (?, ?, ?)",
-                id, durationMs, createdAtMs);
+    public void insertAsset(String id, long durationMs, String sponsorKey, long createdAtMs) {
+        jdbc.update("INSERT INTO playout_asset (id, duration_ms, sponsor_key, created_at_ms)"
+                        + " VALUES (?, ?, ?, ?)",
+                id, durationMs, sponsorKey, createdAtMs);
     }
 
     public Optional<AssetRow> findAsset(String id) {
-        return jdbc.query("SELECT id, duration_ms FROM playout_asset WHERE id = ?",
+        return jdbc.query("SELECT id, duration_ms, sponsor_key FROM playout_asset WHERE id = ?",
                 ASSET_MAPPER, id).stream().findFirst();
     }
 
@@ -266,25 +285,31 @@ public class PlayoutRepository {
     }
 
     public void insertPublicationSegment(long publicationId, String segmentId, String assetId,
-                                         long grantId, long startMs, long endMs) {
+                                         long grantId, long startMs, long endMs,
+                                         String sponsorKey, String sponsorWindowKey,
+                                         Long sponsorWindowVersion) {
         jdbc.update("INSERT INTO playout_publication_segment"
-                        + " (publication_id, segment_id, asset_id, grant_id, start_ms, end_ms)"
-                        + " VALUES (?, ?, ?, ?, ?, ?)",
-                publicationId, segmentId, assetId, grantId, startMs, endMs);
+                        + " (publication_id, segment_id, asset_id, grant_id, start_ms, end_ms,"
+                        + "  sponsor_key, sponsor_window_key, sponsor_window_version)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                publicationId, segmentId, assetId, grantId, startMs, endMs,
+                sponsorKey, sponsorWindowKey, sponsorWindowVersion);
     }
 
-    /** 最新一次发布快照。 */
+    /** 最新一次未撤销的发布快照；已撤销发布不参与播出决定与占位判定。 */
     public Optional<PublicationRow> findLatestPublication(String channelId, LocalDate businessDay) {
-        return jdbc.query("SELECT id, channel_id, business_day, published_version, draft_version"
+        return jdbc.query("SELECT id, channel_id, business_day, published_version, draft_version,"
+                        + " revoked, created_at_ms"
                         + " FROM playout_publication"
-                        + " WHERE channel_id = ? AND business_day = ?"
+                        + " WHERE channel_id = ? AND business_day = ? AND revoked = 0"
                         + " ORDER BY published_version DESC LIMIT 1",
                 PUBLICATION_MAPPER, channelId, Date.valueOf(businessDay)).stream().findFirst();
     }
 
     /** 快照中覆盖指定时刻的片段（start <= at < end）。 */
     public Optional<PublicationSegmentRow> findPublicationSegmentAt(long publicationId, long atMs) {
-        return jdbc.query("SELECT id, publication_id, segment_id, asset_id, grant_id, start_ms, end_ms"
+        return jdbc.query("SELECT id, publication_id, segment_id, asset_id, grant_id, start_ms, end_ms,"
+                        + " sponsor_key, sponsor_window_key, sponsor_window_version"
                         + " FROM playout_publication_segment"
                         + " WHERE publication_id = ? AND start_ms <= ? AND end_ms > ?"
                         + " ORDER BY start_ms LIMIT 1",
@@ -380,5 +405,146 @@ public class PlayoutRepository {
                         + " SET status = 'CANCELLED', cancel_request_id = ?, cancelled_at_ms = ?"
                         + " WHERE override_key = ? AND status = 'ACTIVE'",
                 cancelRequestId, cancelledAtMs, overrideKey);
+    }
+
+    // ---------- 发布撤销与明细 ----------
+
+    /** 按 ID 查询发布快照（含已撤销，用于历史明细查询与撤销判定）。 */
+    public Optional<PublicationRow> findPublicationById(long id) {
+        return jdbc.query("SELECT id, channel_id, business_day, published_version, draft_version,"
+                        + " revoked, created_at_ms"
+                        + " FROM playout_publication WHERE id = ?",
+                PUBLICATION_MAPPER, id).stream().findFirst();
+    }
+
+    /** 撤销发布；返回受影响行数，0 表示不存在或已撤销。 */
+    public int revokePublication(long id, String revokeRequestId, long revokedAtMs) {
+        return jdbc.update("UPDATE playout_publication"
+                        + " SET revoked = 1, revoke_request_id = ?, revoked_at_ms = ?"
+                        + " WHERE id = ? AND revoked = 0",
+                revokeRequestId, revokedAtMs, id);
+    }
+
+    /** 快照全部片段，按开始时间与片段 ID 排序（历史查询稳定排序）。 */
+    public List<PublicationSegmentRow> findPublicationSegments(long publicationId) {
+        return jdbc.query("SELECT id, publication_id, segment_id, asset_id, grant_id, start_ms, end_ms,"
+                        + " sponsor_key, sponsor_window_key, sponsor_window_version"
+                        + " FROM playout_publication_segment"
+                        + " WHERE publication_id = ? ORDER BY start_ms, segment_id",
+                PUBLICATION_SEGMENT_MAPPER, publicationId);
+    }
+
+    /** 与 [startMs, endMs) 相交的全部 ACTIVE 插播（不限优先级），用于排他窗占位判定。 */
+    public List<OverrideRow> findActiveOverridesOverlapping(String channelId, long startMs, long endMs) {
+        return jdbc.query("SELECT override_key, channel_id, asset_id, grant_id, priority, start_ms,"
+                        + " end_ms, business_day, status, cancel_request_id, cancelled_at_ms, created_at_ms"
+                        + " FROM playout_emergency_override"
+                        + " WHERE channel_id = ? AND status = 'ACTIVE'"
+                        + " AND start_ms < ? AND end_ms > ?"
+                        + " ORDER BY start_ms, override_key",
+                OVERRIDE_MAPPER, channelId, endMs, startMs);
+    }
+
+    // ---------- 赞助排他窗 ----------
+
+    private static final RowMapper<SponsorWindowRow> SPONSOR_WINDOW_MAPPER = (rs, n) ->
+            new SponsorWindowRow(rs.getLong("id"), rs.getString("window_key"),
+                    rs.getString("sponsor_key"), rs.getDate("business_day").toLocalDate(),
+                    rs.getLong("start_ms"), rs.getLong("end_ms"),
+                    rs.getLong("version"), rs.getString("status"), rs.getLong("created_at_ms"));
+
+    private static final String WINDOW_COLUMNS =
+            "id, window_key, sponsor_key, business_day, start_ms, end_ms, version, status, created_at_ms";
+
+    /** 插入新窗口版本行（初始或修订后的 ACTIVE 行），返回自增 ID。 */
+    public long insertSponsorWindow(String windowKey, String sponsorKey, LocalDate businessDay,
+                                    long startMs, long endMs, long version, String status,
+                                    long createdAtMs) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO playout_sponsor_window"
+                            + " (window_key, sponsor_key, business_day, start_ms, end_ms, version, status,"
+                            + "  created_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, windowKey);
+            ps.setString(2, sponsorKey);
+            ps.setDate(3, Date.valueOf(businessDay));
+            ps.setLong(4, startMs);
+            ps.setLong(5, endMs);
+            ps.setLong(6, version);
+            ps.setString(7, status);
+            ps.setLong(8, createdAtMs);
+            return ps;
+        }, keyHolder);
+        return keyHolder.getKey().longValue();
+    }
+
+    public void insertSponsorWindowChannel(long windowId, String channelId) {
+        jdbc.update("INSERT INTO playout_sponsor_window_channel (window_id, channel_id) VALUES (?, ?)",
+                windowId, channelId);
+    }
+
+    /** 窗口版本行的频道集合，按字典序返回。 */
+    public List<String> findWindowChannels(long windowId) {
+        return jdbc.queryForList("SELECT channel_id FROM playout_sponsor_window_channel"
+                + " WHERE window_id = ? ORDER BY channel_id", String.class, windowId);
+    }
+
+    /** 按逻辑键查询最新版本行（任意状态），用于详情查询与键唯一判定。 */
+    public Optional<SponsorWindowRow> findLatestWindowByKey(String windowKey) {
+        return jdbc.query("SELECT " + WINDOW_COLUMNS + " FROM playout_sponsor_window"
+                        + " WHERE window_key = ? ORDER BY version DESC LIMIT 1",
+                SPONSOR_WINDOW_MAPPER, windowKey).stream().findFirst();
+    }
+
+    /** 按逻辑键查询当前 ACTIVE 版本行。 */
+    public Optional<SponsorWindowRow> findActiveWindowByKey(String windowKey) {
+        return jdbc.query("SELECT " + WINDOW_COLUMNS + " FROM playout_sponsor_window"
+                        + " WHERE window_key = ? AND status = 'ACTIVE'",
+                SPONSOR_WINDOW_MAPPER, windowKey).stream().findFirst();
+    }
+
+    /** 更新窗口版本行状态（ACTIVE -> SUPERSEDED / DELETED）。 */
+    public void updateWindowStatus(long windowId, String status) {
+        jdbc.update("UPDATE playout_sponsor_window SET status = ? WHERE id = ?", status, windowId);
+    }
+
+    /**
+     * 某频道某运营日与 [startMs, endMs) 相交的同赞助商 ACTIVE 窗口（经频道关联表），
+     * 用于同赞助商同频道重叠判定；excludeWindowKey 为修订时排除自身。
+     */
+    public List<SponsorWindowRow> findActiveWindowsOverlapping(String sponsorKey, String channelId,
+                                                               LocalDate businessDay,
+                                                               long startMs, long endMs,
+                                                               String excludeWindowKey) {
+        return jdbc.query("SELECT w." + WINDOW_COLUMNS.replace(", ", ", w.")
+                        + " FROM playout_sponsor_window w"
+                        + " JOIN playout_sponsor_window_channel c ON c.window_id = w.id"
+                        + " WHERE w.sponsor_key = ? AND c.channel_id = ? AND w.business_day = ?"
+                        + " AND w.status = 'ACTIVE' AND w.start_ms < ? AND w.end_ms > ?"
+                        + " AND (? IS NULL OR w.window_key <> ?)"
+                        + " ORDER BY w.start_ms, w.window_key",
+                SPONSOR_WINDOW_MAPPER, sponsorKey, channelId, Date.valueOf(businessDay),
+                endMs, startMs, excludeWindowKey, excludeWindowKey);
+    }
+
+    /** 某频道某运营日全部 ACTIVE 排他窗，按开始时间与窗口键排序，用于发布/插播排他校验。 */
+    public List<SponsorWindowRow> findActiveWindowsForChannelDay(String channelId,
+                                                                 LocalDate businessDay) {
+        return jdbc.query("SELECT w." + WINDOW_COLUMNS.replace(", ", ", w.")
+                        + " FROM playout_sponsor_window w"
+                        + " JOIN playout_sponsor_window_channel c ON c.window_id = w.id"
+                        + " WHERE c.channel_id = ? AND w.business_day = ? AND w.status = 'ACTIVE'"
+                        + " ORDER BY w.start_ms, w.window_key",
+                SPONSOR_WINDOW_MAPPER, channelId, Date.valueOf(businessDay));
+    }
+
+    /** 按赞助商与运营日列出 ACTIVE 排他窗（诊断查询），按业务日、开始时间、窗口键排序。 */
+    public List<SponsorWindowRow> findActiveWindows(String sponsorKey, LocalDate businessDay) {
+        return jdbc.query("SELECT " + WINDOW_COLUMNS + " FROM playout_sponsor_window"
+                        + " WHERE sponsor_key = ? AND business_day = ? AND status = 'ACTIVE'"
+                        + " ORDER BY business_day, start_ms, window_key",
+                SPONSOR_WINDOW_MAPPER, sponsorKey, Date.valueOf(businessDay));
     }
 }

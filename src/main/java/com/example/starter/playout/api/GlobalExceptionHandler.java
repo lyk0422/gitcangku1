@@ -1,6 +1,7 @@
 package com.example.starter.playout.api;
 
 import com.example.starter.playout.api.Dtos.ErrorResponse;
+import com.example.starter.playout.api.Dtos.SponsorConflictErrorResponse;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -25,6 +26,14 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorResponse> handleApi(ApiException ex) {
         return ResponseEntity.status(ex.status())
                 .body(new ErrorResponse(ex.code(), ex.getMessage()));
+    }
+
+    /** 赞助排他冲突：409，返回全部冲突明细（频道、时段、冲突素材、交集时长）。 */
+    @ExceptionHandler(SponsorConflictException.class)
+    public ResponseEntity<SponsorConflictErrorResponse> handleSponsorConflict(SponsorConflictException ex) {
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(new SponsorConflictErrorResponse("SPONSOR_EXCLUSIVITY_CONFLICT",
+                        ex.getMessage(), ex.conflicts()));
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
