@@ -32,7 +32,8 @@ final class ResponseMapper {
     }
 
     static RunnerResponse toRunnerResponse(RunnerRow row) {
-        return new RunnerResponse(row.bib(), row.finishTimeMs(), row.createdAt(), row.updatedAt());
+        return new RunnerResponse(
+                row.bib(), row.finishTimeMs(), row.status(), row.createdAt(), row.updatedAt());
     }
 
     static PenaltyResponse toPenaltyResponse(PenaltyRow row) {
@@ -43,7 +44,7 @@ final class ResponseMapper {
     static CheckpointTimingResponse toTimingResponse(CheckpointTimingRow row) {
         return new CheckpointTimingResponse(
                 row.timingId(), row.bib(), row.checkpointCode(), row.position(),
-                row.elapsedMillis(), row.createdAt());
+                row.elapsedMillis(), row.createdAt(), row.chipId());
     }
 
     static StandingResponse liveStanding(
@@ -117,7 +118,8 @@ final class ResponseMapper {
                             checkpoint.checkpointCode(),
                             checkpoint.position(),
                             timing == null ? null : timing.elapsedMillis(),
-                            timing == null ? null : timing.timingId());
+                            timing == null ? null : timing.timingId(),
+                            timing == null ? null : timing.chipId());
                 })
                 .toList();
         return new RunnerTimingResponse(
@@ -141,11 +143,12 @@ final class ResponseMapper {
                     SnapshotCheckpointRow detail = byCode.get(checkpoint.checkpointCode());
                     if (detail == null) {
                         return new CheckpointPassResponse(
-                                checkpoint.checkpointCode(), checkpoint.position(), null, null);
+                                checkpoint.checkpointCode(), checkpoint.position(),
+                                null, null, null);
                     }
                     return new CheckpointPassResponse(
                             detail.checkpointCode(), detail.position(),
-                            detail.elapsedMillis(), detail.timingId());
+                            detail.elapsedMillis(), detail.timingId(), detail.chipId());
                 })
                 .toList();
         return new RunnerTimingResponse(

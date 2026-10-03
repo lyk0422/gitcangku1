@@ -2,12 +2,21 @@ package com.example.starter.race.service;
 
 import com.example.starter.race.api.AddPenaltyRequest;
 import com.example.starter.race.api.CheckpointResponse;
+import com.example.starter.race.api.ChipAttributionEntry;
+import com.example.starter.race.api.ChipAttributionResponse;
+import com.example.starter.race.api.ChipIntervalResponse;
+import com.example.starter.race.api.ChipReadingResponse;
+import com.example.starter.race.api.ChipReassignmentResponse;
+import com.example.starter.race.api.ChipReplacementHistoryResponse;
+import com.example.starter.race.api.ChipReplacementRecordResponse;
+import com.example.starter.race.api.ChipReplacementResponse;
 import com.example.starter.race.api.CheckpointsConfigResponse;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
 import com.example.starter.race.api.CreateRaceRequest;
 import com.example.starter.race.api.MissingCheckpointsResponse;
 import com.example.starter.race.api.RaceResponse;
 import com.example.starter.race.api.RegisterRunnerRequest;
+import com.example.starter.race.api.ReplaceChipRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
 import com.example.starter.race.api.RunnerMissingCheckpointsResponse;
@@ -15,13 +24,17 @@ import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.api.SubmitTimingRequest;
+import com.example.starter.race.api.WithdrawRunnerRequest;
 import com.example.starter.race.domain.CheckpointRules;
+import com.example.starter.race.domain.ChipTimeline;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
+import com.example.starter.race.domain.RunnerStatus;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
+import com.example.starter.race.persistence.ChipReplacementRow;
 import com.example.starter.race.persistence.IdempotencyRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
@@ -290,6 +303,10 @@ public class RaceServiceImpl implements RaceService {
 
                     RaceRow race = requireOpenRace(raceId, request.expectedVersion());
                     RunnerRow runner = requireRunner(raceId, bib);
+                    if (runner.status() == RunnerStatus.WITHDRAWN) {
+                        throw new UnprocessableEntityException(
+                                "选手已退赛，不能提交分段记录: " + bib);
+                    }
                     CheckpointRow checkpoint = repository
                             .findCheckpoint(raceId, request.checkpointCode())
                             .orElseThrow(() -> new NotFoundException(
@@ -305,9 +322,14 @@ public class RaceServiceImpl implements RaceService {
                     }
                     bumpVersion(race, request.expectedVersion());
                     long now = clock.millis();
+                    // 读数按提交时刻所处芯片区间归属（左闭右开）；无更换记录时归属为 null。
+                    List<ChipReplacementRow> chipChain =
+                            repository.findChipReplacementChain(raceId, bib);
+                    String chipId = chipChain.isEmpty() ? null
+                            : ChipTimeline.chipAt(ChipTimeline.buildIntervals(chipChain), now);
                     CheckpointTimingRow row = new CheckpointTimingRow(
                             request.timingId(), raceId, bib, request.checkpointCode(),
-                            checkpoint.position(), elapsedMillis, now);
+                            checkpoint.position(), elapsedMillis, now, chipId);
                     try {
                         repository.insertTiming(row);
                     } catch (DuplicateKeyException ex) {
@@ -496,6 +518,170 @@ public class RaceServiceImpl implements RaceService {
         SnapshotRow snapshot = repository.findSnapshot(raceId)
                 .orElseThrow(() -> new NotFoundException("赛事尚未封榜: " + raceId));
         return ResponseMapper.snapshotStanding(snapshot);
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult withdrawRunner(String raceId, String bib, WithdrawRunnerRequest request) {
+        return withIdempotency(request.requestId(), "WITHDRAW_RUNNER",
+                orderedParams(
+                        "raceId", raceId,
+                        "bib", bib,
+                        "expectedVersion", request.expectedVersion(),
+                        "reason", request.reason()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    requireRunner(raceId, bib);
+                    long now = clock.millis();
+                    bumpVersion(race, request.expectedVersion());
+                    int updated = repository.withdrawRunnerIfActive(raceId, bib, now);
+                    if (updated == 0) {
+                        throw new ConflictException("选手已退赛: " + bib);
+                    }
+                    RunnerRow refreshed = repository.findRunner(raceId, bib).orElseThrow();
+                    return ServiceResult.ok(ResponseMapper.toRunnerResponse(refreshed));
+                });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult replaceChip(String raceId, String bib, ReplaceChipRequest request) {
+        // 幂等指纹覆盖操作者（裁判）、操作类型、目标对象与全部结果相关字段，
+        // 经 Jackson 规范化 JSON 序列化，不使用未转义分隔符拼接。
+        return withIdempotency(request.requestId(), "REPLACE_CHIP",
+                orderedParams(
+                        "raceId", raceId,
+                        "bib", bib,
+                        "replacementId", request.replacementId(),
+                        "oldChip", request.oldChip(),
+                        "newChip", request.newChip(),
+                        "effectiveAt", request.effectiveAt(),
+                        "referee", request.referee(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    RunnerRow runner = requireRunner(raceId, bib);
+                    if (runner.status() == RunnerStatus.WITHDRAWN) {
+                        throw new ConflictException("选手已退赛，不能更换芯片: " + bib);
+                    }
+                    List<PenaltyRow> penalties = repository.findPenalties(raceId);
+                    ensureNotDisqualified(penalties, bib);
+                    List<ChipReplacementRow> chain =
+                            repository.findChipReplacementChain(raceId, bib);
+                    String violation = ChipTimeline.validateReplacement(
+                            chain, request.oldChip(), request.newChip(), request.effectiveAt());
+                    if (violation != null) {
+                        throw new UnprocessableEntityException(violation);
+                    }
+                    ensureChipAvailable(raceId, bib, request.newChip(), penalties);
+                    List<CheckpointTimingRow> timings =
+                            repository.findTimingsForRunner(raceId, bib);
+                    for (CheckpointTimingRow timing : timings) {
+                        if (timing.createdAt() > request.effectiveAt()) {
+                            throw new UnprocessableEntityException(
+                                    "生效时刻不得早于已接收分段读数: timingId=" + timing.timingId()
+                                            + ", 读数提交时刻=" + timing.createdAt()
+                                            + ", 生效时刻=" + request.effectiveAt());
+                        }
+                    }
+                    // 先核对整批最终归属：任一读数无法唯一归属则抛错，整次事务回滚，不留半成品。
+                    List<ChipReplacementRow> newChain = new ArrayList<>(chain);
+                    newChain.add(new ChipReplacementRow(
+                            request.replacementId(), raceId, bib,
+                            request.oldChip(), request.newChip(), request.effectiveAt(),
+                            request.referee(), "[]", "[]", 0L));
+                    List<ChipTimeline.ChipInterval> intervals =
+                            ChipTimeline.buildIntervals(newChain);
+                    List<ChipAttributionEntry> before = new ArrayList<>(timings.size());
+                    List<ChipAttributionEntry> after = new ArrayList<>(timings.size());
+                    List<ChipReassignmentResponse> reassignments = new ArrayList<>();
+                    for (CheckpointTimingRow timing : timings) {
+                        before.add(new ChipAttributionEntry(
+                                timing.timingId(), timing.checkpointCode(), timing.chipId()));
+                        String assigned = ChipTimeline.chipAt(intervals, timing.createdAt());
+                        if (assigned == null) {
+                            throw new UnprocessableEntityException(
+                                    "分段读数无法唯一归属芯片区间: " + timing.timingId());
+                        }
+                        after.add(new ChipAttributionEntry(
+                                timing.timingId(), timing.checkpointCode(), assigned));
+                        if (!assigned.equals(timing.chipId())) {
+                            reassignments.add(new ChipReassignmentResponse(
+                                    timing.timingId(), timing.checkpointCode(),
+                                    timing.chipId(), assigned));
+                        }
+                    }
+                    long now = clock.millis();
+                    bumpVersion(race, request.expectedVersion());
+                    ChipReplacementRow record = new ChipReplacementRow(
+                            request.replacementId(), raceId, bib,
+                            request.oldChip(), request.newChip(), request.effectiveAt(),
+                            request.referee(), writeJson(before), writeJson(after), now);
+                    try {
+                        repository.insertChipReplacement(record);
+                    } catch (DuplicateKeyException ex) {
+                        throw new ConflictException("更换记录ID已存在: " + request.replacementId());
+                    }
+                    for (int i = 0; i < timings.size(); i++) {
+                        String assigned = after.get(i).chipId();
+                        if (!assigned.equals(timings.get(i).chipId())) {
+                            repository.updateTimingChip(timings.get(i).timingId(), assigned);
+                        }
+                    }
+                    return ServiceResult.created(new ChipReplacementResponse(
+                            record.replacementId(), raceId, bib,
+                            record.oldChip(), record.newChip(), record.effectiveAt(),
+                            record.referee(), now, request.expectedVersion() + 1,
+                            timings.size(), reassignments.size(), reassignments));
+                });
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public ChipReplacementHistoryResponse getChipReplacements(String raceId) {
+        RaceRow race = repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        List<ChipReplacementRecordResponse> records = repository.findChipReplacements(raceId)
+                .stream()
+                .map(this::toChipReplacementRecord)
+                .toList();
+        return new ChipReplacementHistoryResponse(raceId, race.version(), records);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public ChipReplacementHistoryResponse getRunnerChipReplacements(String raceId, String bib) {
+        RaceRow race = repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        requireRunner(raceId, bib);
+        List<ChipReplacementRecordResponse> records = repository
+                .findChipReplacementChain(raceId, bib)
+                .stream()
+                .map(this::toChipReplacementRecord)
+                .toList();
+        return new ChipReplacementHistoryResponse(raceId, race.version(), records);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public ChipAttributionResponse getChipAttribution(String raceId, String bib) {
+        RaceRow race = repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        requireRunner(raceId, bib);
+        List<ChipReplacementRow> chain = repository.findChipReplacementChain(raceId, bib);
+        List<ChipIntervalResponse> intervals = ChipTimeline.buildIntervals(chain).stream()
+                .map(interval -> new ChipIntervalResponse(
+                        interval.chipId(), interval.effectiveFrom(), interval.effectiveTo()))
+                .toList();
+        List<ChipReadingResponse> readings = repository.findTimingsForRunner(raceId, bib)
+                .stream()
+                .map(timing -> new ChipReadingResponse(
+                        timing.timingId(), timing.checkpointCode(), timing.position(),
+                        timing.elapsedMillis(), timing.createdAt(), timing.chipId()))
+                .toList();
+        return new ChipAttributionResponse(
+                raceId, bib, race.version(), ChipTimeline.currentChip(chain),
+                intervals, readings);
     }
 
     /**
@@ -708,12 +894,70 @@ public class RaceServiceImpl implements RaceService {
             if (timing == null) {
                 rows.add(new SnapshotCheckpointRow(
                         raceId, bib, checkpoint.checkpointCode(),
-                        checkpoint.position(), null, null));
+                        checkpoint.position(), null, null, null));
             } else {
                 rows.add(new SnapshotCheckpointRow(
                         raceId, bib, checkpoint.checkpointCode(),
-                        checkpoint.position(), timing.elapsedMillis(), timing.timingId()));
+                        checkpoint.position(), timing.elapsedMillis(), timing.timingId(),
+                        timing.chipId()));
             }
+        }
+    }
+
+
+    /** 选手存在生效取消资格处罚时拒绝更换芯片（422）。 */
+    private static void ensureNotDisqualified(List<PenaltyRow> penalties, String bib) {
+        for (PenaltyRow penalty : penalties) {
+            if (penalty.bib().equals(bib) && !penalty.revoked()
+                    && penalty.type() == PenaltyType.DISQUALIFY) {
+                throw new UnprocessableEntityException(
+                        "选手已被取消资格，不能更换芯片: " + bib);
+            }
+        }
+    }
+
+    /**
+     * 新芯片不得与赛事内其他在赛（未退赛且未取消资格）选手的当前芯片重复；
+     * 同赛事写操作均由 race 行锁串行化，因此该检查与并发更换互斥。
+     */
+    private void ensureChipAvailable(
+            String raceId, String bib, String newChip, List<PenaltyRow> penalties) {
+        java.util.Set<String> disqualifiedBibs = new java.util.HashSet<>();
+        for (PenaltyRow penalty : penalties) {
+            if (!penalty.revoked() && penalty.type() == PenaltyType.DISQUALIFY) {
+                disqualifiedBibs.add(penalty.bib());
+            }
+        }
+        for (RunnerRow other : repository.findRunners(raceId)) {
+            if (other.bib().equals(bib)
+                    || other.status() != RunnerStatus.ACTIVE
+                    || disqualifiedBibs.contains(other.bib())) {
+                continue;
+            }
+            String current = ChipTimeline.currentChip(
+                    repository.findChipReplacementChain(raceId, other.bib()));
+            if (newChip.equals(current)) {
+                throw new ConflictException(
+                        "新芯片已绑定到在赛选手: chip=" + newChip + ", bib=" + other.bib());
+            }
+        }
+    }
+
+    private ChipReplacementRecordResponse toChipReplacementRecord(ChipReplacementRow row) {
+        return new ChipReplacementRecordResponse(
+                row.replacementId(), row.bib(), row.oldChip(), row.newChip(),
+                row.effectiveAt(), row.referee(), row.createdAt(),
+                readAttribution(row.attributionBefore()),
+                readAttribution(row.attributionAfter()));
+    }
+
+    private List<ChipAttributionEntry> readAttribution(String json) {
+        try {
+            return objectMapper.readValue(json,
+                    new com.fasterxml.jackson.core.type.TypeReference<>() {
+                    });
+        } catch (com.fasterxml.jackson.core.JsonProcessingException ex) {
+            throw new IllegalStateException("解析芯片归属证据失败", ex);
         }
     }
 

@@ -1,6 +1,6 @@
 -- 赛事成绩封榜领域表结构。
 -- 本地默认以 H2 内存库运行：jdbc:h2:mem:race_demo;MODE=MySQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1
--- 标识符统一小写；时间字段均为 Unix 毫秒时间戳（BIGINT），不涉及时区换算。
+-- 标识符统一小写；时间字段均为 Unix 毫秒时间戳（BIGINT，UTC），不涉及时区换算。
 
 CREATE TABLE IF NOT EXISTS race (
     race_id VARCHAR(64) NOT NULL COMMENT '赛事ID，全局唯一',
@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS runner (
     race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
     bib VARCHAR(64) NOT NULL COMMENT '参赛号，同一赛事内唯一',
     finish_time_ms BIGINT COMMENT '原始完赛耗时（毫秒，取值1~86400000）；NULL表示计时缺失，状态UNTIMED',
+    status VARCHAR(16) NOT NULL DEFAULT 'ACTIVE' COMMENT '选手状态：ACTIVE-在赛，WITHDRAWN-已退赛（不再接收分段读数与芯片更换）',
     created_at BIGINT NOT NULL COMMENT '登记时间，Unix毫秒时间戳',
     updated_at BIGINT NOT NULL COMMENT '最近一次计时修订时间，Unix毫秒时间戳',
     CONSTRAINT pk_runner PRIMARY KEY (id),
@@ -47,8 +48,8 @@ CREATE TABLE IF NOT EXISTS result_snapshot (
 CREATE TABLE IF NOT EXISTS result_snapshot_entry (
     race_id VARCHAR(64) NOT NULL COMMENT '所属快照的赛事ID',
     bib VARCHAR(64) NOT NULL COMMENT '参赛号',
-    rank_no INT COMMENT '名次（从1开始，并列同名次并跳号，如1、1、3）；未计时/漏点/取消资格为NULL',
-    status VARCHAR(24) NOT NULL COMMENT '成绩状态：RANKED-参与排名，UNTIMED-计时缺失，MISSING_CHECKPOINT-有完赛但未覆盖全部检查点，DISQUALIFIED-取消资格',
+    rank_no INT COMMENT '名次（从1开始，并列同名次并跳号，如1、1、3）；未计时/漏点/取消资格/已退赛为NULL',
+    status VARCHAR(24) NOT NULL COMMENT '成绩状态：RANKED-参与排名，UNTIMED-计时缺失，MISSING_CHECKPOINT-有完赛但未覆盖全部检查点，DISQUALIFIED-取消资格，WITHDRAWN-已退赛',
     finish_time_ms BIGINT COMMENT '原始完赛耗时（毫秒）；计时缺失为NULL',
     penalty_ms BIGINT NOT NULL COMMENT '生效（未撤销）加时处罚合计毫秒数，无加时为0',
     total_time_ms BIGINT COMMENT '总耗时=原始完赛耗时+生效加时（毫秒）；未排名时为NULL',
@@ -76,12 +77,29 @@ CREATE TABLE IF NOT EXISTS checkpoint_timing (
     checkpoint_code VARCHAR(64) NOT NULL COMMENT '通过的检查点代码',
     position INT NOT NULL COMMENT '检查点顺序（配置时固化），用于严格递增校验',
     elapsed_millis BIGINT NOT NULL COMMENT '通过该检查点的累计耗时（毫秒，1~86400000），必须小于该选手原始完赛耗时',
-    created_at BIGINT NOT NULL COMMENT '记录提交时间，Unix毫秒时间戳',
+    created_at BIGINT NOT NULL COMMENT '记录提交时间，Unix毫秒时间戳（UTC），芯片归属按该时刻所处区间判定',
+    chip_id VARCHAR(64) COMMENT '该读数归属的计时芯片ID；该选手尚无任何芯片更换记录时为NULL',
     CONSTRAINT pk_checkpoint_timing PRIMARY KEY (timing_id),
     CONSTRAINT uk_timing_runner_checkpoint UNIQUE (race_id, bib, checkpoint_code),
     CONSTRAINT fk_timing_checkpoint FOREIGN KEY (race_id, checkpoint_code) REFERENCES checkpoint (race_id, checkpoint_code),
     CONSTRAINT fk_timing_runner FOREIGN KEY (race_id, bib) REFERENCES runner (race_id, bib),
     INDEX idx_timing_race_bib (race_id, bib)
+);
+
+CREATE TABLE IF NOT EXISTS chip_replacement (
+    replacement_id VARCHAR(64) NOT NULL COMMENT '芯片更换记录ID，全局唯一',
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    bib VARCHAR(64) NOT NULL COMMENT '选手参赛号',
+    old_chip VARCHAR(64) NOT NULL COMMENT '旧芯片ID；首次更换时同时固化该选手的初始芯片',
+    new_chip VARCHAR(64) NOT NULL COMMENT '新芯片ID，生效时刻起（含）归属新芯片',
+    effective_at BIGINT NOT NULL COMMENT '新芯片生效时刻，Unix毫秒时间戳（UTC）；区间左闭右开：[生效时刻, 下一次更换生效时刻)',
+    referee VARCHAR(64) NOT NULL COMMENT '确认本次更换的裁判',
+    attribution_before TEXT NOT NULL COMMENT '重算前该选手全部分段读数的芯片归属JSON（只读证据，不随后续操作改写）',
+    attribution_after TEXT NOT NULL COMMENT '重算后该选手全部分段读数的芯片归属JSON',
+    created_at BIGINT NOT NULL COMMENT '更换登记时间，Unix毫秒时间戳',
+    CONSTRAINT pk_chip_replacement PRIMARY KEY (replacement_id),
+    CONSTRAINT fk_chip_replacement_runner FOREIGN KEY (race_id, bib) REFERENCES runner (race_id, bib),
+    INDEX idx_chip_replacement_race_bib (race_id, bib)
 );
 
 CREATE TABLE IF NOT EXISTS result_snapshot_checkpoint (
@@ -91,16 +109,17 @@ CREATE TABLE IF NOT EXISTS result_snapshot_checkpoint (
     position INT NOT NULL COMMENT '检查点顺序，从1递增',
     elapsed_millis BIGINT COMMENT '封榜时该选手通过该检查点的累计耗时（毫秒）；缺失检查点为NULL',
     timing_id VARCHAR(128) COMMENT '分段记录ID；缺失检查点为NULL',
+    chip_id VARCHAR(64) COMMENT '封榜时该分段读数归属的芯片ID；缺失检查点或未归属为NULL，固化后不随后续操作改写',
     CONSTRAINT pk_snapshot_checkpoint PRIMARY KEY (race_id, bib, checkpoint_code),
     CONSTRAINT fk_snapshot_checkpoint_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
 );
 
 CREATE TABLE IF NOT EXISTS idempotency_record (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求ID（写操作幂等键）',
-    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE',
+    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE/WITHDRAW_RUNNER/REPLACE_CHIP',
     request_digest CHAR(64) NOT NULL COMMENT '请求参数（requestId除外，含expectedVersion）规范化JSON的SHA-256摘要',
     response_status INT NOT NULL COMMENT '原成功请求的HTTP状态码，重放时原样返回',
     response_body TEXT COMMENT '原成功响应体JSON，重放时原样返回',
     created_at BIGINT NOT NULL COMMENT '首次成功提交时间，Unix毫秒时间戳',
     CONSTRAINT pk_idempotency_record PRIMARY KEY (request_id)
-);
+);

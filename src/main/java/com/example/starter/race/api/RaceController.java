@@ -113,6 +113,46 @@ public class RaceController {
         return raceService.getMissingCheckpoints(raceId);
     }
 
+    /** 选手退赛。 */
+    @PostMapping("/{raceId}/runners/{bib}/withdrawal")
+    public ResponseEntity<Object> withdrawRunner(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody WithdrawRunnerRequest request) {
+        return toResponse(raceService.withdrawRunner(raceId, bib, request));
+    }
+
+    /** 更换选手计时芯片：登记旧新芯片、UTC生效时刻与裁判，并重算分段归属。 */
+    @PostMapping("/{raceId}/runners/{bib}/chip-replacements")
+    public ResponseEntity<Object> replaceChip(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody ReplaceChipRequest request) {
+        return toResponse(raceService.replaceChip(raceId, bib, request));
+    }
+
+    /** 查询赛事全部芯片更换历史（只读，按登记时间与记录ID稳定排序）。 */
+    @GetMapping("/{raceId}/chip-replacements")
+    public ChipReplacementHistoryResponse getChipReplacements(@PathVariable String raceId) {
+        return raceService.getChipReplacements(raceId);
+    }
+
+    /** 查询单个选手的芯片更换历史（只读，按生效时刻稳定排序）。 */
+    @GetMapping("/{raceId}/runners/{bib}/chip-replacements")
+    public ChipReplacementHistoryResponse getRunnerChipReplacements(
+            @PathVariable String raceId,
+            @PathVariable String bib) {
+        return raceService.getRunnerChipReplacements(raceId, bib);
+    }
+
+    /** 查询单个选手的芯片归属诊断视图（只读）：当前芯片、区间链与每条读数归属。 */
+    @GetMapping("/{raceId}/runners/{bib}/chip-attribution")
+    public ChipAttributionResponse getChipAttribution(
+            @PathVariable String raceId,
+            @PathVariable String bib) {
+        return raceService.getChipAttribution(raceId, bib);
+    }
+
     private ResponseEntity<Object> toResponse(ServiceResult result) {
         return ResponseEntity.status(result.status()).body(result.body());
     }

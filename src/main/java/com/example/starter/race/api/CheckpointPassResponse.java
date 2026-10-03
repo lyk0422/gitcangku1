@@ -9,12 +9,14 @@ import com.fasterxml.jackson.annotation.JsonInclude;
  * @param position       检查点顺序，从1连续递增
  * @param elapsedMillis  通过累计耗时（毫秒）；尚未通过（缺失检查点）为 null
  * @param timingId       分段记录ID；尚未通过为 null
+ * @param chipId         该读数归属的计时芯片ID；尚未通过或未归属为 null
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public record CheckpointPassResponse(
         String checkpointCode,
         int position,
         Long elapsedMillis,
-        String timingId
+        String timingId,
+        String chipId
 ) {
 }
