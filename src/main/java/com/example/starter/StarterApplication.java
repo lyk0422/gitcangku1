@@ -4,13 +4,13 @@ import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 
 /**
- * 业务题目工程入口；当前仅提供 Web 服务及数据库健康检查，不包含题目业务实现。
+ * 野生动物标签业务工程入口：标签登记、附着、摘除、站点间交接与历史时间线查询。
  */
 @SpringBootApplication
 public class StarterApplication {
 
     /**
-     * 使用外部提供的数据库连接配置启动服务。
+     * 启动服务；默认使用 H2 内存库（MODE=MySQL），可通过 DB_URL 等环境变量覆盖。
      */
     public static void main(String[] args) {
         SpringApplication.run(StarterApplication.class, args);
