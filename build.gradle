@@ -23,6 +23,8 @@ dependencies {
     implementation 'org.springframework.boot:spring-boot-starter-jdbc'
     implementation 'org.springframework.boot:spring-boot-starter-actuator'
     runtimeOnly 'com.mysql:mysql-connector-j'
+    runtimeOnly 'com.h2database:h2'
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
 }
 
 tasks.withType(JavaCompile).configureEach {
@@ -35,4 +37,8 @@ tasks.named('bootJar') {
 
 tasks.named('jar') {
     enabled = false
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
 }
