@@ -1,0 +1,16 @@
+spring:
+  datasource:
+    url: jdbc:h2:mem:kilntest;MODE=MySQL;DB_CLOSE_DELAY=-1
+    username: sa
+    password:
+    driver-class-name: org.h2.Driver
+  sql:
+    init:
+      mode: always
+      encoding: UTF-8
+  jackson:
+    time-zone: UTC
+
+server:
+  error:
+    include-message: always
