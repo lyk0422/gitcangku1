@@ -1,20 +1,28 @@
 spring:
   application:
     name: gitcangku1
-  config:
-    import: "optional:configtree:/run/secrets/"
   datasource:
-    url: ${DB_URL}
-    username: ${DB_USER}
+    url: jdbc:h2:mem:dyedb;MODE=MySQL;DB_CLOSE_DELAY=-1;DATABASE_TO_LOWER=TRUE
+    username: sa
+    password: ""
+    driver-class-name: org.h2.Driver
     hikari:
       maximum-pool-size: 5
       minimum-idle: 1
       connection-timeout: 10000
       validation-timeout: 3000
+  sql:
+    init:
+      mode: always
+      encoding: UTF-8
   jackson:
     time-zone: Asia/Shanghai
   lifecycle:
     timeout-per-shutdown-phase: 20s
+
+app:
+  demo-data:
+    enabled: true
 
 server:
   port: 8080
