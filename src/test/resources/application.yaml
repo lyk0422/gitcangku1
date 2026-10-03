@@ -1,0 +1,19 @@
+spring:
+  datasource:
+    url: jdbc:h2:mem:hydro-test-${random.uuid};MODE=MySQL;LOCK_TIMEOUT=10000
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 1
+      connection-timeout: 10000
+  sql:
+    init:
+      mode: always
+      encoding: UTF-8
+  jackson:
+    time-zone: Asia/Shanghai
+
+server:
+  port: 0
