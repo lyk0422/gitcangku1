@@ -4,13 +4,19 @@ spring:
   config:
     import: "optional:configtree:/run/secrets/"
   datasource:
-    url: ${DB_URL}
-    username: ${DB_USER}
+    # 默认使用H2内存库(MySQL兼容模式),可通过DB_URL/DB_USER/DB_DRIVER覆盖为外部MySQL
+    url: ${DB_URL:jdbc:h2:mem:timber;MODE=MySQL;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=10000}
+    username: ${DB_USER:sa}
+    driver-class-name: ${DB_DRIVER:org.h2.Driver}
     hikari:
       maximum-pool-size: 5
       minimum-idle: 1
       connection-timeout: 10000
       validation-timeout: 3000
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema.sql
   jackson:
     time-zone: Asia/Shanghai
   lifecycle:
