@@ -1,0 +1,8 @@
+spring:
+  datasource:
+    # 标准 test 使用独立命名的 H2 内存库（MySQL 兼容模式）；
+    # 不使用 DB_CLOSE_DELAY=-1，测试上下文关闭、连接池释放后数据库即销毁。
+    url: jdbc:h2:mem:deacid_test;MODE=MySQL
+    username: sa
+    password: ""
+    driver-class-name: org.h2.Driver
