@@ -1,5 +1,6 @@
 package com.example.starter.playout.api;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
@@ -7,6 +8,7 @@ import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.PositiveOrZero;
 
+import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.util.List;
 
@@ -18,14 +20,15 @@ public final class Dtos {
     private Dtos() {
     }
 
-    /** 创建素材请求；id 为空时由系统生成稳定 ID。 */
+    /** 创建素材请求；id 为空时由系统生成稳定 ID；sponsorKey 为空表示无赞助素材。 */
     public record CreateAssetRequest(
             String id,
+            String sponsorKey,
             @NotNull @Positive Long durationMs) {
     }
 
-    /** 素材响应。 */
-    public record AssetResponse(String id, long durationMs) {
+    /** 素材响应；sponsorKey 为 null 表示无赞助素材，不参与排他冲突。 */
+    public record AssetResponse(String id, String sponsorKey, long durationMs) {
     }
 
     /** 创建频道请求；fallbackAssetId 为不会被撤销的保底素材。 */
@@ -168,7 +171,137 @@ public final class Dtos {
             OffsetDateTime createdAt) {
     }
 
-    /** 统一错误响应体。 */
-    public record ErrorResponse(String error, String message) {
+    /**
+     * 统一错误响应体。details 仅在排他冲突等需要结构化明细时出现，为 null 时不序列化，
+     * 保持既有错误响应字段与 null 语义不变。
+     */
+    public record ErrorResponse(String error, String message,
+                                @JsonInclude(JsonInclude.Include.NON_NULL)
+                                List<SponsorConflictDetail> details) {
+        public ErrorResponse(String error, String message) {
+            this(error, message, null);
+        }
+    }
+
+    /** 赞助排他冲突明细：频道、时段（左闭右开）、冲突素材与命中窗口。 */
+    public record SponsorConflictDetail(
+            String channelId,
+            OffsetDateTime start,
+            OffsetDateTime end,
+            String assetId,
+            String assetSponsorKey,
+            String windowKey,
+            String windowSponsorKey) {
+    }
+
+    /** 排他窗状态：ACTIVE 生效；SUPERSEDED 已被修订取代；DELETED 已删除。仅 ACTIVE 参与校验。 */
+    public enum WindowStatus {
+        ACTIVE, SUPERSEDED, DELETED
+    }
+
+    /**
+     * 登记赞助排他窗请求。windowKey 为空时由系统生成；channels 为频道范围，不得为空；
+     * 区间 [start, end) 为 UTC 左闭右开（API 边界为 Asia/Shanghai 毫秒精度），不得跨 businessDay。
+     */
+    public record CreateSponsorWindowRequest(
+            @NotBlank String requestId,
+            String windowKey,
+            @NotBlank String sponsorKey,
+            @NotNull LocalDate businessDay,
+            @NotNull List<@NotBlank String> channels,
+            @NotNull OffsetDateTime start,
+            @NotNull OffsetDateTime end) {
+    }
+
+    /** 修订排他窗请求：对同一 windowKey 生成新版本，旧版本转为 SUPERSEDED。 */
+    public record ReviseSponsorWindowRequest(
+            @NotBlank String requestId,
+            @NotBlank String sponsorKey,
+            @NotNull LocalDate businessDay,
+            @NotNull List<@NotBlank String> channels,
+            @NotNull OffsetDateTime start,
+            @NotNull OffsetDateTime end) {
+    }
+
+    /** 删除排他窗请求（幂等）。 */
+    public record DeleteSponsorWindowRequest(@NotBlank String requestId) {
+    }
+
+    /** 排他窗响应；channels 按字典序排序，时间为 Asia/Shanghai 毫秒精度。 */
+    public record SponsorWindowResponse(
+            String windowKey,
+            long version,
+            String sponsorKey,
+            String businessDay,
+            List<String> channels,
+            OffsetDateTime start,
+            OffsetDateTime end,
+            WindowStatus status,
+            OffsetDateTime createdAt) {
+    }
+
+    /** 跨频道批量发布请求：先验证完整后态，再在一个事务内提交，任一频道冲突则整次失败。 */
+    public record BatchPublishRequest(
+            @NotBlank String requestId,
+            @NotNull List<@NotNull BatchPublishItem> items) {
+    }
+
+    /** 批量发布单项：一个频道一个业务日的草稿发布。 */
+    public record BatchPublishItem(
+            @NotBlank String channelId,
+            @NotNull LocalDate businessDay,
+            @NotNull @Positive Long draftVersion,
+            @NotNull @PositiveOrZero Long expectedPublishedVersion) {
+    }
+
+    /** 批量发布响应；publications 顺序与请求 items 一致。 */
+    public record BatchPublishResponse(List<PublishResponse> publications) {
+    }
+
+    /** 撤销发布请求（幂等）；仅尚未开始的发布可撤销。 */
+    public record RevokePublicationRequest(@NotBlank String requestId) {
+    }
+
+    /** 发布状态：ACTIVE 生效；REVOKED 已撤销（仅未开始的发布可撤销，撤销为终态）。 */
+    public enum PublicationStatus {
+        ACTIVE, REVOKED
+    }
+
+    /** 发布快照片段视图；sponsorKey 为发布时固化快照，null 表示无赞助素材。 */
+    public record PublicationSegmentView(
+            String segmentId,
+            String assetId,
+            String sponsorKey,
+            long grantId,
+            OffsetDateTime start,
+            OffsetDateTime end) {
+    }
+
+    /** 发布命中排他窗历史视图；windowVersion 为发布时固化的窗口版本，不随窗口修订或删除改写。 */
+    public record WindowHitView(
+            String windowKey,
+            long windowVersion,
+            String sponsorKey,
+            String channelId,
+            OffsetDateTime start,
+            OffsetDateTime end) {
+    }
+
+    /**
+     * 发布明细响应：快照片段（含固化 sponsorKey）与命中窗口历史。
+     * 撤销后保留可查，revokeRequestId/revokedAt 未撤销时为 null。
+     */
+    public record PublicationDetailResponse(
+            long publicationId,
+            String channelId,
+            String businessDay,
+            long publishedVersion,
+            long draftVersion,
+            PublicationStatus status,
+            List<PublicationSegmentView> segments,
+            List<WindowHitView> windowHits,
+            OffsetDateTime createdAt,
+            String revokeRequestId,
+            OffsetDateTime revokedAt) {
     }
 }

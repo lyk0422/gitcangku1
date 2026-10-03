@@ -11,11 +11,19 @@ import com.example.starter.playout.api.Dtos.DraftResponse;
 import com.example.starter.playout.api.Dtos.EmergencyOverrideResponse;
 import com.example.starter.playout.api.Dtos.GrantResponse;
 import com.example.starter.playout.api.Dtos.CancelEmergencyOverrideRequest;
+import com.example.starter.playout.api.Dtos.BatchPublishRequest;
+import com.example.starter.playout.api.Dtos.BatchPublishResponse;
+import com.example.starter.playout.api.Dtos.CreateSponsorWindowRequest;
+import com.example.starter.playout.api.Dtos.DeleteSponsorWindowRequest;
 import com.example.starter.playout.api.Dtos.PlayoutDecisionResponse;
+import com.example.starter.playout.api.Dtos.PublicationDetailResponse;
 import com.example.starter.playout.api.Dtos.PublishRequest;
 import com.example.starter.playout.api.Dtos.PublishResponse;
 import com.example.starter.playout.api.Dtos.ReplaceDraftRequest;
+import com.example.starter.playout.api.Dtos.ReviseSponsorWindowRequest;
 import com.example.starter.playout.api.Dtos.RevokeGrantRequest;
+import com.example.starter.playout.api.Dtos.RevokePublicationRequest;
+import com.example.starter.playout.api.Dtos.SponsorWindowResponse;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import org.springframework.format.annotation.DateTimeFormat;
@@ -32,6 +40,7 @@ import org.springframework.web.bind.annotation.RestController;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeParseException;
+import java.util.List;
 
 /**
  * 播出编排 REST API。成功响应统一 200；错误区分 400 参数错误、404 资源不存在、
@@ -117,6 +126,65 @@ public class PlayoutController {
     @GetMapping("/emergency-overrides/{overrideKey}")
     public EmergencyOverrideResponse emergencyOverride(@PathVariable @NotBlank String overrideKey) {
         return service.getEmergencyOverride(overrideKey);
+    }
+
+    /** 跨频道批量发布：完整校验最终编排后一个事务提交，任一频道异赞助冲突整次 409。 */
+    @PostMapping("/publications/batch")
+    public BatchPublishResponse batchPublish(@Valid @RequestBody BatchPublishRequest request) {
+        return service.batchPublish(request);
+    }
+
+    /** 查询发布明细：快照片段（含固化 sponsorKey）与命中窗口历史；撤销后仍可查。 */
+    @GetMapping("/channels/{channelId}/publications/{publicationId}")
+    public PublicationDetailResponse publication(@PathVariable @NotBlank String channelId,
+                                                 @PathVariable long publicationId) {
+        return service.getPublication(channelId, publicationId);
+    }
+
+    /** 撤销尚未开始的发布（幂等）；释放占位但保留窗口命中历史。 */
+    @PostMapping("/channels/{channelId}/publications/{publicationId}/revoke")
+    public PublicationDetailResponse revokePublication(
+            @PathVariable @NotBlank String channelId,
+            @PathVariable long publicationId,
+            @Valid @RequestBody RevokePublicationRequest request) {
+        return service.revokePublication(channelId, publicationId, request.requestId());
+    }
+
+    /** 登记赞助排他窗（幂等）；频道集合为空、时间非法或同赞助商同频道重叠返回 422。 */
+    @PostMapping("/sponsor-windows")
+    public SponsorWindowResponse createSponsorWindow(
+            @Valid @RequestBody CreateSponsorWindowRequest request) {
+        return service.createSponsorWindow(request);
+    }
+
+    /** 修订排他窗：生成新版本，旧版本转为 SUPERSEDED，不改写已发布快照。 */
+    @PostMapping("/sponsor-windows/{windowKey}/revise")
+    public SponsorWindowResponse reviseSponsorWindow(
+            @PathVariable @NotBlank String windowKey,
+            @Valid @RequestBody ReviseSponsorWindowRequest request) {
+        return service.reviseSponsorWindow(windowKey, request);
+    }
+
+    /** 删除排他窗（幂等）；仅 ACTIVE 可删除，不改写已发布快照命中历史。 */
+    @PostMapping("/sponsor-windows/{windowKey}/delete")
+    public SponsorWindowResponse deleteSponsorWindow(
+            @PathVariable @NotBlank String windowKey,
+            @Valid @RequestBody DeleteSponsorWindowRequest request) {
+        return service.deleteSponsorWindow(windowKey, request);
+    }
+
+    /** 查询排他窗最新版本明细（含已删除）。 */
+    @GetMapping("/sponsor-windows/{windowKey}")
+    public SponsorWindowResponse sponsorWindow(@PathVariable @NotBlank String windowKey) {
+        return service.getSponsorWindow(windowKey);
+    }
+
+    /** 查询频道某运营日命中的 ACTIVE 排他窗列表（只读诊断）。 */
+    @GetMapping("/sponsor-windows")
+    public List<SponsorWindowResponse> sponsorWindows(
+            @RequestParam @NotBlank String channelId,
+            @RequestParam String businessDay) {
+        return service.listSponsorWindows(channelId, parseBusinessDay(businessDay));
     }
 
     private static LocalDate parseBusinessDay(String businessDay) {
