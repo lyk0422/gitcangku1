@@ -1,5 +1,6 @@
 package com.example.starter.plan.service;
 
+import com.example.starter.plan.model.CrewAssignment;
 import com.example.starter.plan.model.DayPlan;
 import com.example.starter.plan.model.Occupancy;
 import com.example.starter.plan.model.PlanStatus;
@@ -62,13 +63,16 @@ public class PlanService {
     private final IdempotencyRepository idemRepo;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate tx;
+    private final CrewService crewService;
 
     public PlanService(PlanRepository planRepo, IdempotencyRepository idemRepo,
-                       ObjectMapper objectMapper, PlatformTransactionManager txManager) {
+                       ObjectMapper objectMapper, PlatformTransactionManager txManager,
+                       CrewService crewService) {
         this.planRepo = planRepo;
         this.idemRepo = idemRepo;
         this.objectMapper = objectMapper;
         this.tx = new TransactionTemplate(txManager);
+        this.crewService = crewService;
     }
 
     /**
@@ -139,7 +143,16 @@ public class PlanService {
      * 任一冲突则整张计划保持草稿并抛出 422（携带冲突区段与计划）。
      */
     public PlanResponse publish(String scheduleKey, String requestKey) {
-        String hash = hashAction(OP_PUBLISH, scheduleKey);
+        return publish(scheduleKey, requestKey, null);
+    }
+
+    /**
+     * 发布计划：全局发布锁内原子校验时隙冲突；登记乘务组时同步校验逐人资格区间（UTC）、
+     * 线路等级与人员占用冲突，任一失败整单保持草稿并抛出 422，不占线路时隙或乘务资源；
+     * 成功时写入不可变乘务快照，保留发布当时的资格版本与人员名单。
+     */
+    public PlanResponse publish(String scheduleKey, String requestKey, String crewGroup) {
+        String hash = hashPublish(scheduleKey, crewGroup);
         Optional<PlanResponse> replay = replayIfPresent(OP_PUBLISH, requestKey, hash);
         if (replay.isPresent()) {
             return replay.get();
@@ -161,8 +174,23 @@ public class PlanService {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "存在时隙冲突，计划保持草稿", conflicts);
                 }
+                boolean crewGated = crewGroup != null && !crewGroup.isBlank();
+                List<CrewAssignment> crewAssignments = List.of();
+                if (crewGated) {
+                    List<Map<String, Object>> crewConflicts =
+                            crewService.validateCrewForPublish(plan, occupancies, crewGroup);
+                    if (!crewConflicts.isEmpty()) {
+                        throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY,
+                                "CREW_QUALIFICATION_CONFLICT",
+                                "乘务资格核查未通过，计划保持草稿", crewConflicts);
+                    }
+                    crewAssignments = crewService.buildAssignments(plan, occupancies, crewGroup);
+                }
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(plan.id(), PlanStatus.PUBLISHED, now);
+                if (crewGated) {
+                    crewService.saveAssignments(crewAssignments, now);
+                }
                 PlanResponse response = loadPlan(scheduleKey);
                 idemRepo.insert(OP_PUBLISH, requestKey, hash, toJson(response), now);
                 return response;
@@ -497,6 +525,15 @@ public class PlanService {
 
     private String hashAction(String opType, String scheduleKey) {
         return sha256(opType + '\n' + scheduleKey);
+    }
+
+    /**
+     * 发布幂等哈希：纳入乘务组，同一 requestKey 重放返回首次人员与时隙分配，
+     * 更换乘务组判定为参数不一致（409）。
+     */
+    private String hashPublish(String scheduleKey, String crewGroup) {
+        return sha256(OP_PUBLISH + '\n' + scheduleKey + '\n'
+                + (crewGroup == null ? "" : crewGroup));
     }
 
     private String hashReschedule(String oldScheduleKey, RescheduleRequest req) {

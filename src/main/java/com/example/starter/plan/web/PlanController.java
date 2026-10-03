@@ -3,6 +3,7 @@ package com.example.starter.plan.web;
 import com.example.starter.plan.service.PlanService;
 import com.example.starter.plan.web.dto.CreatePlanRequest;
 import com.example.starter.plan.web.dto.PlanActionRequest;
+import com.example.starter.plan.web.dto.PublishRequest;
 import com.example.starter.plan.web.dto.PlanResponse;
 import com.example.starter.plan.web.dto.PublishedSlotView;
 import com.example.starter.plan.web.dto.RescheduleChainResponse;
@@ -61,12 +62,13 @@ public class PlanController {
     }
 
     /**
-     * 发布计划，原子校验时隙冲突。
+     * 发布计划，原子校验时隙冲突；登记乘务组时同步校验逐人资格与人员占用，
+     * 任一失败整单 422，不占线路时隙或乘务资源。
      */
     @PostMapping("/plans/{scheduleKey}/publish")
     public PlanResponse publish(@PathVariable String scheduleKey,
-                                @Valid @RequestBody PlanActionRequest request) {
-        return service.publish(scheduleKey, request.requestKey());
+                                @Valid @RequestBody PublishRequest request) {
+        return service.publish(scheduleKey, request.requestKey(), request.crewGroup());
     }
 
     /**
