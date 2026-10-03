@@ -1,0 +1,11 @@
+spring:
+  datasource:
+    # 测试专用命名内存库，与本地运行库隔离，随 JVM 退出释放
+    url: jdbc:h2:mem:reagenttest;MODE=MySQL;DB_CLOSE_DELAY=-1
+    username: sa
+  sql:
+    init:
+      mode: always
+      encoding: UTF-8
+      # 测试不加载合成演示数据，场景数据由用例自行准备并清理
+      data-locations: optional:classpath:data-test.sql
