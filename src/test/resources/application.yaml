@@ -1,0 +1,9 @@
+spring:
+  datasource:
+    url: jdbc:h2:mem:dyetest;MODE=MySQL;DB_CLOSE_DELAY=-1;DATABASE_TO_LOWER=TRUE
+    username: sa
+    password:
+  sql:
+    init:
+      mode: always
+      encoding: UTF-8
