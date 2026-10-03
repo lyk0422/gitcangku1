@@ -11,6 +11,7 @@ import java.time.Instant;
  * @param validTo      有效期终点（UTC，不含）
  * @param a            校准系数 a（十进制字符串）
  * @param b            校准偏移 b（十进制字符串）
+ * @param version      证书版本，初始 1，撤销时递增
  * @param revoked      是否已撤销
  * @param revokedAt    撤销时间（UTC），未撤销为 null
  * @param createdAt    创建时间（UTC）
@@ -22,6 +23,7 @@ public record CertificateResponse(
         Instant validTo,
         String a,
         String b,
+        int version,
         boolean revoked,
         Instant revokedAt,
         Instant createdAt) {

@@ -29,6 +29,7 @@ public class CertificateRepository {
             JdbcTimes.fromDb(rs.getObject("valid_to", LocalDateTime.class)),
             rs.getBigDecimal("coeff_a"),
             rs.getBigDecimal("offset_b"),
+            rs.getInt("version"),
             rs.getBoolean("revoked"),
             JdbcTimes.fromDb(rs.getObject("revoked_at", LocalDateTime.class)),
             JdbcTimes.fromDb(rs.getObject("created_at", LocalDateTime.class)));
@@ -118,7 +119,7 @@ public class CertificateRepository {
      * 撤销证书（须在持有行锁的事务内调用）。
      */
     public void markRevoked(long id, Instant revokedAt) {
-        jdbc.update("UPDATE calibration_certificate SET revoked = TRUE, revoked_at = ? WHERE id = ?",
+        jdbc.update("UPDATE calibration_certificate SET revoked = TRUE, revoked_at = ?, version = version + 1 WHERE id = ?",
                 JdbcTimes.toDb(revokedAt), id);
     }
 }
