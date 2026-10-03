@@ -1,0 +1,31 @@
+spring:
+  datasource:
+    # 独立命名内存库；不加 DB_CLOSE_DELAY，测试上下文关闭连接池后即释放
+    url: jdbc:h2:mem:geothermal_test;MODE=MySQL
+    username: sa
+    password: ""
+    driver-class-name: org.h2.Driver
+    hikari:
+      maximum-pool-size: 5
+      minimum-idle: 1
+      connection-timeout: 10000
+      validation-timeout: 3000
+  sql:
+    init:
+      mode: always
+      encoding: UTF-8
+  jackson:
+    time-zone: UTC
+
+server:
+  port: 0
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+
+app:
+  seed-enabled: false
