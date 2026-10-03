@@ -4,9 +4,11 @@ import com.example.starter.plan.service.PlanService;
 import com.example.starter.plan.web.dto.CreatePlanRequest;
 import com.example.starter.plan.web.dto.PlanActionRequest;
 import com.example.starter.plan.web.dto.PlanResponse;
+import com.example.starter.plan.web.dto.RearrangeRecordView;
 import com.example.starter.plan.web.dto.PublishedSlotView;
 import com.example.starter.plan.web.dto.RescheduleChainResponse;
 import com.example.starter.plan.web.dto.RescheduleRequest;
+import com.example.starter.plan.web.dto.RestrictionImpactView;
 import com.example.starter.plan.web.dto.RescheduleResponse;
 import com.example.starter.plan.web.dto.UpdateOccupanciesRequest;
 import jakarta.validation.Valid;
@@ -66,7 +68,7 @@ public class PlanController {
     @PostMapping("/plans/{scheduleKey}/publish")
     public PlanResponse publish(@PathVariable String scheduleKey,
                                 @Valid @RequestBody PlanActionRequest request) {
-        return service.publish(scheduleKey, request.requestKey());
+        return service.publish(scheduleKey, request.requestKey(), request.operator());
     }
 
     /**
@@ -94,6 +96,22 @@ public class PlanController {
     @GetMapping("/plans/{scheduleKey}/reschedule-chain")
     public RescheduleChainResponse getRescheduleChain(@PathVariable String scheduleKey) {
         return service.getRescheduleChain(scheduleKey);
+    }
+
+    /**
+     * 计划重排历史（只读）：限速导致的整体顺延记录，含限速令版本快照、原时刻与新时刻。
+     */
+    @GetMapping("/plans/{scheduleKey}/rearranges")
+    public List<RearrangeRecordView> getRearranges(@PathVariable String scheduleKey) {
+        return service.getRearranges(scheduleKey);
+    }
+
+    /**
+     * 计划受当前生效限速令影响的诊断（只读，不改变状态）。
+     */
+    @GetMapping("/plans/{scheduleKey}/restriction-impact")
+    public RestrictionImpactView getRestrictionImpact(@PathVariable String scheduleKey) {
+        return service.getRestrictionImpact(scheduleKey);
     }
 
     /**

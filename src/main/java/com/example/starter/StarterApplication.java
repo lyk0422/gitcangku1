@@ -1,7 +1,9 @@
 package com.example.starter;
 
+import java.time.Clock;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.context.annotation.Bean;
 
 /**
  * 业务题目工程入口；当前仅提供 Web 服务及数据库健康检查，不包含题目业务实现。
@@ -14,5 +16,13 @@ public class StarterApplication {
      */
     public static void main(String[] args) {
         SpringApplication.run(StarterApplication.class, args);
+    }
+
+    /**
+     * 统一时钟（UTC），业务时间判断均基于该时钟，测试可替换为可控时钟。
+     */
+    @Bean
+    public Clock clock() {
+        return Clock.systemUTC();
     }
 }
