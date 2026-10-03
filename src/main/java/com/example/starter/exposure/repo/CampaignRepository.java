@@ -28,6 +28,7 @@ public class CampaignRepository {
                     rs.getString("campaign_id"),
                     rs.getInt("daily_total_cap"),
                     rs.getInt("per_visitor_daily_cap"),
+                    rs.getString("activity_id"),
                     rs.getLong("created_at_utc"));
         }
     };
@@ -36,21 +37,33 @@ public class CampaignRepository {
      * 按编号查询公告。
      */
     public Optional<Campaign> findById(String campaignId) {
-        return jdbc.query("SELECT campaign_id, daily_total_cap, per_visitor_daily_cap, created_at_utc "
-                        + "FROM campaign WHERE campaign_id = ?", MAPPER, campaignId)
+        return jdbc.query("SELECT campaign_id, daily_total_cap, per_visitor_daily_cap, activity_id, "
+                        + "created_at_utc FROM campaign WHERE campaign_id = ?", MAPPER, campaignId)
                 .stream()
                 .findFirst();
     }
 
     /**
-     * 插入公告；编号冲突由调用方依据唯一约束处理。
+     * 插入公告；编号冲突由调用方依据唯一约束处理。新建公告不归入活动。
      */
     public void insert(Campaign campaign) {
-        jdbc.update("INSERT INTO campaign (campaign_id, daily_total_cap, per_visitor_daily_cap, created_at_utc) "
-                        + "VALUES (?, ?, ?, ?)",
+        jdbc.update("INSERT INTO campaign (campaign_id, daily_total_cap, per_visitor_daily_cap, "
+                        + "activity_id, created_at_utc) VALUES (?, ?, ?, ?, ?)",
                 campaign.campaignId(),
                 campaign.dailyTotalCap(),
                 campaign.perVisitorDailyCap(),
+                campaign.activityId(),
                 campaign.createdAtUtc());
+    }
+
+    /**
+     * 迁移公告所属活动（activityId 为 null 表示移出活动）；只影响迁移后的新预占。
+     */
+    public void updateActivityId(String campaignId, String activityId) {
+        int rows = jdbc.update("UPDATE campaign SET activity_id = ? WHERE campaign_id = ?",
+                activityId, campaignId);
+        if (rows != 1) {
+            throw new IllegalStateException("campaign row missing for " + campaignId);
+        }
     }
 }
