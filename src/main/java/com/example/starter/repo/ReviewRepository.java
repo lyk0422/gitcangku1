@@ -11,10 +11,16 @@ import java.util.List;
 
 /**
  * 审核结果与幂等去重数据访问。
- * 点快照以 "x,y;x,y" 文本保存，命中 zoneId 以逗号拼接，均为不可变内容。
+ * 点快照以 "x,y;x,y" 文本保存，命中 zoneId 以逗号拼接，气象快照以 JSON 文本保存，
+ * 均为不可变内容。
  */
 @Repository
 public class ReviewRepository {
+
+    private static final String REVIEW_COLUMNS =
+            "review_id, route_id, route_version, airspace_version, conclusion, "
+                    + "hit_zone_ids, points_snapshot, duty_version, forecast_version, "
+                    + "weather_snapshot, request_id, created_at";
 
     private final JdbcTemplate jdbc;
 
@@ -30,36 +36,45 @@ public class ReviewRepository {
             rs.getString("conclusion"),
             decodeZoneIds(rs.getString("hit_zone_ids")),
             decodePoints(rs.getString("points_snapshot")),
+            rs.getLong("duty_version"),
+            (Long) rs.getObject("forecast_version"),
+            rs.getString("weather_snapshot"),
             rs.getString("request_id"),
             rs.getLong("created_at"));
 
     /** 按 reviewId 查询不可变审核记录，不存在返回 null。 */
     public ReviewPo findReview(String reviewId) {
         return jdbc.query(
-                "SELECT review_id, route_id, route_version, airspace_version, conclusion, "
-                        + "hit_zone_ids, points_snapshot, request_id, created_at "
-                        + "FROM review WHERE review_id = ?",
+                "SELECT " + REVIEW_COLUMNS + " FROM review WHERE review_id = ?",
                 REVIEW_MAPPER, reviewId).stream().findFirst().orElse(null);
     }
 
-    /** 查询某航线最新的一条审核记录（按创建时间、reviewId 倒序），没有返回 null。 */
+    /** 查询某航线最新的一条审核记录（按创建时间、单调序号倒序），没有返回 null。 */
     public ReviewPo findLatestReview(String routeId) {
         return jdbc.query(
-                "SELECT review_id, route_id, route_version, airspace_version, conclusion, "
-                        + "hit_zone_ids, points_snapshot, request_id, created_at "
-                        + "FROM review WHERE route_id = ? "
-                        + "ORDER BY created_at DESC, review_id DESC LIMIT 1",
+                "SELECT " + REVIEW_COLUMNS + " FROM review WHERE route_id = ? "
+                        + "ORDER BY created_at DESC, seq DESC LIMIT 1",
                 REVIEW_MAPPER, routeId).stream().findFirst().orElse(null);
+    }
+
+    /** 查询某航线全部审核历史（按创建时间、单调序号倒序，排序稳定）。 */
+    public List<ReviewPo> findReviewsByRoute(String routeId) {
+        return jdbc.query(
+                "SELECT " + REVIEW_COLUMNS + " FROM review WHERE route_id = ? "
+                        + "ORDER BY created_at DESC, seq DESC",
+                REVIEW_MAPPER, routeId);
     }
 
     /** 插入不可变审核结果（调用方负责事务）。 */
     public void insertReview(ReviewPo po) {
         jdbc.update("INSERT INTO review "
                         + "(review_id, route_id, route_version, airspace_version, conclusion, "
-                        + "hit_zone_ids, points_snapshot, request_id, created_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        + "hit_zone_ids, points_snapshot, duty_version, forecast_version, "
+                        + "weather_snapshot, request_id, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 po.reviewId(), po.routeId(), po.routeVersion(), po.airspaceVersion(),
                 po.conclusion(), encodeZoneIds(po.hitZoneIds()), encodePoints(po.pointsSnapshot()),
+                po.dutyVersion(), po.forecastVersion(), po.weatherSnapshot(),
                 po.requestId(), po.createdAt());
     }
 

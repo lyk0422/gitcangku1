@@ -7,7 +7,7 @@ import org.springframework.core.annotation.Order;
 import org.springframework.jdbc.core.JdbcTemplate;
 
 /**
- * 初始化全局空域版本单行（初始版本 0）与事务协调锁单行。
+ * 初始化全局空域版本单行（初始版本 0）、事务协调锁单行与气象版本单行（初始 0/0）。
  * 建表由 schema.sql 完成；启动时先查后插，保证同一内存库内
  * 多个 Spring 上下文（如测试）重复初始化时仍然幂等。
  */
@@ -22,6 +22,8 @@ public class DataInitializer {
                     "INSERT INTO airspace_meta (id, global_version) VALUES (1, 0)");
             insertIfMissing(jdbc, "coord_lock",
                     "INSERT INTO coord_lock (id, touched) VALUES (1, 0)");
+            insertIfMissing(jdbc, "weather_meta",
+                    "INSERT INTO weather_meta (id, duty_version, forecast_version) VALUES (1, 0, 0)");
         };
     }
 
