@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS runner (
     race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
     bib VARCHAR(64) NOT NULL COMMENT '参赛号，同一赛事内唯一',
     finish_time_ms BIGINT COMMENT '原始完赛耗时（毫秒，取值1~86400000）；NULL表示计时缺失，状态UNTIMED',
+    withdrawn_at BIGINT COMMENT '退赛时间，Unix毫秒时间戳；NULL表示未退赛，退赛后禁止提交分段与更换芯片',
     created_at BIGINT NOT NULL COMMENT '登记时间，Unix毫秒时间戳',
     updated_at BIGINT NOT NULL COMMENT '最近一次计时修订时间，Unix毫秒时间戳',
     CONSTRAINT pk_runner PRIMARY KEY (id),
@@ -76,6 +77,7 @@ CREATE TABLE IF NOT EXISTS checkpoint_timing (
     checkpoint_code VARCHAR(64) NOT NULL COMMENT '通过的检查点代码',
     position INT NOT NULL COMMENT '检查点顺序（配置时固化），用于严格递增校验',
     elapsed_millis BIGINT NOT NULL COMMENT '通过该检查点的累计耗时（毫秒，1~86400000），必须小于该选手原始完赛耗时',
+    chip_code VARCHAR(64) COMMENT '接收该读数时生效的计时芯片代码；选手未绑定芯片为NULL',
     created_at BIGINT NOT NULL COMMENT '记录提交时间，Unix毫秒时间戳',
     CONSTRAINT pk_checkpoint_timing PRIMARY KEY (timing_id),
     CONSTRAINT uk_timing_runner_checkpoint UNIQUE (race_id, bib, checkpoint_code),
@@ -91,16 +93,69 @@ CREATE TABLE IF NOT EXISTS result_snapshot_checkpoint (
     position INT NOT NULL COMMENT '检查点顺序，从1递增',
     elapsed_millis BIGINT COMMENT '封榜时该选手通过该检查点的累计耗时（毫秒）；缺失检查点为NULL',
     timing_id VARCHAR(128) COMMENT '分段记录ID；缺失检查点为NULL',
+    chip_code VARCHAR(64) COMMENT '封榜时该分段归属的计时芯片代码；缺失检查点或未绑定芯片为NULL，封榜后不随后续更换改写',
     CONSTRAINT pk_snapshot_checkpoint PRIMARY KEY (race_id, bib, checkpoint_code),
     CONSTRAINT fk_snapshot_checkpoint_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
 );
 
 CREATE TABLE IF NOT EXISTS idempotency_record (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求ID（写操作幂等键）',
-    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE',
+    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE/WITHDRAW_RUNNER/REPLACE_CHIP',
     request_digest CHAR(64) NOT NULL COMMENT '请求参数（requestId除外，含expectedVersion）规范化JSON的SHA-256摘要',
     response_status INT NOT NULL COMMENT '原成功请求的HTTP状态码，重放时原样返回',
     response_body TEXT COMMENT '原成功响应体JSON，重放时原样返回',
     created_at BIGINT NOT NULL COMMENT '首次成功提交时间，Unix毫秒时间戳',
     CONSTRAINT pk_idempotency_record PRIMARY KEY (request_id)
+);
+
+CREATE TABLE IF NOT EXISTS runner_chip (
+    id BIGINT NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    bib VARCHAR(64) NOT NULL COMMENT '选手参赛号',
+    chip_code VARCHAR(64) NOT NULL COMMENT '计时芯片代码',
+    effective_from BIGINT NOT NULL COMMENT '芯片生效时刻（Unix毫秒时间戳，UTC，左闭区间起点）',
+    effective_to BIGINT COMMENT '芯片失效时刻（Unix毫秒时间戳，UTC，右开区间终点）；NULL表示当前生效中',
+    created_at BIGINT NOT NULL COMMENT '绑定登记时间，Unix毫秒时间戳',
+    CONSTRAINT pk_runner_chip PRIMARY KEY (id),
+    CONSTRAINT fk_runner_chip_runner FOREIGN KEY (race_id, bib) REFERENCES runner (race_id, bib),
+    INDEX idx_runner_chip_runner (race_id, bib),
+    INDEX idx_runner_chip_chip (chip_code)
+);
+
+CREATE TABLE IF NOT EXISTS chip_active (
+    chip_code VARCHAR(64) NOT NULL COMMENT '计时芯片代码，全局最多一条生效绑定（并发兜底唯一键）',
+    race_id VARCHAR(64) NOT NULL COMMENT '当前绑定选手所属赛事ID',
+    bib VARCHAR(64) NOT NULL COMMENT '当前绑定选手参赛号',
+    bound_at BIGINT NOT NULL COMMENT '本次绑定生效时刻，Unix毫秒时间戳',
+    CONSTRAINT pk_chip_active PRIMARY KEY (chip_code)
+);
+
+CREATE TABLE IF NOT EXISTS chip_replacement (
+    replacement_id VARCHAR(128) NOT NULL COMMENT '芯片更换记录ID，全局唯一（第二层幂等键）',
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    bib VARCHAR(64) NOT NULL COMMENT '更换芯片的选手参赛号',
+    old_chip_code VARCHAR(64) NOT NULL COMMENT '旧芯片代码',
+    new_chip_code VARCHAR(64) NOT NULL COMMENT '新芯片代码',
+    effective_at BIGINT NOT NULL COMMENT '更换生效时刻（Unix毫秒时间戳，UTC）；生效前读数归旧芯片，生效时刻起归新芯片（左闭右开）',
+    referee VARCHAR(64) NOT NULL COMMENT '确认更换的裁判',
+    operator VARCHAR(64) NOT NULL COMMENT '提交更换的操作者',
+    reassigned_count INT NOT NULL COMMENT '本次重算后归属发生变化的分段读数数量',
+    race_version INT NOT NULL COMMENT '更换完成后的赛事版本号，用于同键重放原响应',
+    created_at BIGINT NOT NULL COMMENT '更换登记时间，Unix毫秒时间戳',
+    CONSTRAINT pk_chip_replacement PRIMARY KEY (replacement_id),
+    CONSTRAINT fk_chip_replacement_runner FOREIGN KEY (race_id, bib) REFERENCES runner (race_id, bib),
+    INDEX idx_chip_replacement_runner (race_id, bib)
+);
+
+CREATE TABLE IF NOT EXISTS chip_replacement_detail (
+    id BIGINT NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    replacement_id VARCHAR(128) NOT NULL COMMENT '所属更换记录ID',
+    timing_id VARCHAR(128) NOT NULL COMMENT '被重算归属的分段记录ID',
+    checkpoint_code VARCHAR(64) NOT NULL COMMENT '分段对应检查点代码',
+    position INT NOT NULL COMMENT '检查点顺序，用于稳定排序',
+    chip_before VARCHAR(64) COMMENT '重算前归属芯片；此前未归属为NULL',
+    chip_after VARCHAR(64) NOT NULL COMMENT '重算后归属芯片',
+    CONSTRAINT pk_chip_replacement_detail PRIMARY KEY (id),
+    CONSTRAINT fk_chip_replacement_detail FOREIGN KEY (replacement_id) REFERENCES chip_replacement (replacement_id),
+    INDEX idx_chip_replacement_detail_repl (replacement_id, position)
 );

@@ -87,6 +87,40 @@ public class RaceController {
         return toResponse(raceService.sealRace(raceId, request));
     }
 
+    /** 选手退赛。 */
+    @PostMapping("/{raceId}/runners/{bib}/withdrawal")
+    public ResponseEntity<Object> withdrawRunner(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody WithdrawRunnerRequest request) {
+        return toResponse(raceService.withdrawRunner(raceId, bib, request));
+    }
+
+    /** 更换选手计时芯片。 */
+    @PostMapping("/{raceId}/runners/{bib}/chip-replacements")
+    public ResponseEntity<Object> replaceChip(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody ReplaceChipRequest request) {
+        return toResponse(raceService.replaceChip(raceId, bib, request));
+    }
+
+    /** 查询选手芯片更换历史（只读）。 */
+    @GetMapping("/{raceId}/runners/{bib}/chip-replacements")
+    public ChipReplacementHistoryResponse getChipReplacements(
+            @PathVariable String raceId,
+            @PathVariable String bib) {
+        return raceService.getChipReplacements(raceId, bib);
+    }
+
+    /** 查询单次芯片更换明细（只读，含重算前后归属）。 */
+    @GetMapping("/{raceId}/chip-replacements/{replacementId}")
+    public ChipReplacementDetailResponse getChipReplacement(
+            @PathVariable String raceId,
+            @PathVariable String replacementId) {
+        return raceService.getChipReplacement(raceId, replacementId);
+    }
+
     /** 查询即时成绩（封榜后返回只读快照内容）。 */
     @GetMapping("/{raceId}/results")
     public StandingResponse getResults(@PathVariable String raceId) {

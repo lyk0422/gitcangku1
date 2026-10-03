@@ -1,9 +1,12 @@
 package com.example.starter.race.service;
 
 import com.example.starter.race.api.AddPenaltyRequest;
+import com.example.starter.race.api.ChipReplacementDetailResponse;
+import com.example.starter.race.api.ChipReplacementHistoryResponse;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
 import com.example.starter.race.api.CreateRaceRequest;
 import com.example.starter.race.api.RegisterRunnerRequest;
+import com.example.starter.race.api.ReplaceChipRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
 import com.example.starter.race.api.MissingCheckpointsResponse;
@@ -11,6 +14,7 @@ import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.api.SubmitTimingRequest;
+import com.example.starter.race.api.WithdrawRunnerRequest;
 
 /**
  * 赛事成绩封榜应用服务；每个写方法在单个数据库事务内完成
@@ -47,6 +51,26 @@ public interface RaceService {
 
     /** 封榜：校验版本并原子保存只读成绩快照（含每名选手分段明细与缺失检查点）。 */
     ServiceResult sealRace(String raceId, SealRaceRequest request);
+
+    /**
+     * 选手退赛：释放当前生效芯片，之后禁止提交分段与更换芯片；
+     * 已退赛重复退赛返回409。
+     */
+    ServiceResult withdrawRunner(String raceId, String bib, WithdrawRunnerRequest request);
+
+    /**
+     * 芯片更换：登记旧新芯片、UTC生效时刻与裁判确认，生效前读数归旧芯片、
+     * 生效时刻起归新芯片（左闭右开）；更换时重算该选手分段归属，
+     * 任一读数无法唯一归属则整次回滚；新芯片已绑定、替换时刻早于已接收
+     * 分段读数、选手已退赛/取消资格/赛事封榜返回409或422。
+     */
+    ServiceResult replaceChip(String raceId, String bib, ReplaceChipRequest request);
+
+    /** 查询选手芯片更换历史，按生效时刻与登记时间稳定排序；只读，不修改版本。 */
+    ChipReplacementHistoryResponse getChipReplacements(String raceId, String bib);
+
+    /** 查询单次芯片更换明细（含每条分段重算前后归属）；只读。 */
+    ChipReplacementDetailResponse getChipReplacement(String raceId, String replacementId);
 
     /** 查询即时成绩（OPEN 实时计算；SEALED 返回封榜快照）。 */
     StandingResponse getResults(String raceId);

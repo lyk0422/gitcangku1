@@ -57,8 +57,10 @@ public final class ResultCalculator {
 
         Map<String, Aggregate> aggregates = new LinkedHashMap<>();
         for (RunnerView runner : runnerView) {
-            aggregates.put(runner.bib(),
-                    new Aggregate(runner.bib(), runner.finishTimeMs(), orderedCheckpoints));
+            Aggregate aggregate =
+                    new Aggregate(runner.bib(), runner.finishTimeMs(), orderedCheckpoints);
+            aggregate.withdrawn = runner.withdrawn();
+            aggregates.put(runner.bib(), aggregate);
         }
 
         // 仅统计属于已配置检查点的分段（数据库外键已保证，这里做防御性过滤）。
@@ -91,6 +93,9 @@ public final class ResultCalculator {
         for (Aggregate aggregate : aggregates.values()) {
             if (aggregate.disqualified) {
                 aggregate.status = EntryStatus.DISQUALIFIED;
+                others.add(aggregate);
+            } else if (aggregate.withdrawn) {
+                aggregate.status = EntryStatus.WITHDRAWN;
                 others.add(aggregate);
             } else if (aggregate.finishTimeMs == null) {
                 aggregate.status = EntryStatus.UNTIMED;
@@ -139,6 +144,11 @@ public final class ResultCalculator {
         String bib();
 
         Long finishTimeMs();
+
+        /** 是否已退赛；历史实现默认未退赛。 */
+        default boolean withdrawn() {
+            return false;
+        }
     }
 
     /** 处罚视图。 */
@@ -160,6 +170,7 @@ public final class ResultCalculator {
         private final Set<String> coveredCodes = new HashSet<>();
         private long penaltyMs;
         private boolean disqualified;
+        private boolean withdrawn;
         private EntryStatus status;
         private int rank;
         private long totalTimeMs;

@@ -9,6 +9,7 @@ package com.example.starter.race.persistence;
  * @param position       检查点顺序，从1递增
  * @param elapsedMillis  封榜时通过耗时（毫秒）；缺失检查点为 null
  * @param timingId       分段记录ID；缺失检查点为 null
+ * @param chipCode       封榜时该分段归属的芯片代码；缺失检查点或未绑定芯片为 null，封榜后不改写
  */
 public record SnapshotCheckpointRow(
         String raceId,
@@ -16,6 +17,7 @@ public record SnapshotCheckpointRow(
         String checkpointCode,
         int position,
         Long elapsedMillis,
-        String timingId
+        String timingId,
+        String chipCode
 ) {
 }

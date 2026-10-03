@@ -43,7 +43,7 @@ final class ResponseMapper {
     static CheckpointTimingResponse toTimingResponse(CheckpointTimingRow row) {
         return new CheckpointTimingResponse(
                 row.timingId(), row.bib(), row.checkpointCode(), row.position(),
-                row.elapsedMillis(), row.createdAt());
+                row.elapsedMillis(), row.chipCode(), row.createdAt());
     }
 
     static StandingResponse liveStanding(
@@ -117,7 +117,8 @@ final class ResponseMapper {
                             checkpoint.checkpointCode(),
                             checkpoint.position(),
                             timing == null ? null : timing.elapsedMillis(),
-                            timing == null ? null : timing.timingId());
+                            timing == null ? null : timing.timingId(),
+                            timing == null ? null : timing.chipCode());
                 })
                 .toList();
         return new RunnerTimingResponse(
@@ -141,11 +142,12 @@ final class ResponseMapper {
                     SnapshotCheckpointRow detail = byCode.get(checkpoint.checkpointCode());
                     if (detail == null) {
                         return new CheckpointPassResponse(
-                                checkpoint.checkpointCode(), checkpoint.position(), null, null);
+                                checkpoint.checkpointCode(), checkpoint.position(),
+                                null, null, null);
                     }
                     return new CheckpointPassResponse(
                             detail.checkpointCode(), detail.position(),
-                            detail.elapsedMillis(), detail.timingId());
+                            detail.elapsedMillis(), detail.timingId(), detail.chipCode());
                 })
                 .toList();
         return new RunnerTimingResponse(
