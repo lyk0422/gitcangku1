@@ -12,6 +12,7 @@ import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SplitResponse;
 import com.example.starter.batch.dto.SubmitTestRequest;
 import com.example.starter.batch.dto.TestResultResponse;
+import com.example.starter.certificate.CertificateService;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
@@ -61,13 +62,16 @@ public class BatchService {
     private final BatchRepository repo;
     private final TransactionTemplate tx;
     private final ObjectMapper objectMapper;
+    private final CertificateService certificateService;
 
     public BatchService(BatchRepository repo,
                         PlatformTransactionManager transactionManager,
-                        ObjectMapper objectMapper) {
+                        ObjectMapper objectMapper,
+                        CertificateService certificateService) {
         this.repo = repo;
         this.tx = new TransactionTemplate(transactionManager);
         this.objectMapper = objectMapper;
+        this.certificateService = certificateService;
     }
 
     /**
@@ -200,9 +204,19 @@ public class BatchService {
                 seq = 2;
                 newStatus = BatchStatus.RELEASED;
             }
+            CertificateService.ReleaseDecision releaseDecision = null;
+            if (newStatus == BatchStatus.RELEASED) {
+                // 放行门禁：批次必须绑定放行时点有效的声明版本；校验失败整笔批准回滚
+                releaseDecision = certificateService.validateRelease(batchKey,
+                        Instant.parse(now));
+            }
             repo.insertApproval(new BatchRepository.ApprovalRow(0L, batchKey, req.commandKey(),
                     actor, role.name(), seq, now));
             repo.updateStatus(batchKey, newStatus.name());
+            if (releaseDecision != null) {
+                // 放行快照固化声明版本、匹配前缀与时点，随后续操作不改写
+                certificateService.recordReleaseSnapshot(batchKey, releaseDecision, now);
+            }
             ApprovalResponse body = new ApprovalResponse(batchKey, actor, role, seq, newStatus,
                     Instant.parse(now));
             return new StoredResponse(201, toJson(body));
@@ -253,6 +267,7 @@ public class BatchService {
         Set<String> recalled = new HashSet<>(repo.findRecalledKeys());
         return repo.findAvailableBatches().stream()
                 .filter(b -> !BatchStatus.SPLIT.name().equals(b.status()))
+                .filter(b -> !BatchStatus.MERGED.name().equals(b.status()))
                 .filter(b -> recalledAncestor(b.batchKey(), parentOf, recalled).isEmpty())
                 .map(this::toBatchResponse)
                 .toList();
@@ -286,7 +301,9 @@ public class BatchService {
                 .map(r -> new RecallResponse(r.batchKey(), r.actorId(), r.reason(),
                         BatchStatus.RECALLED, Instant.parse(r.createdAt())))
                 .orElse(null);
-        return new BatchHistoryResponse(toBatchResponse(batch), tests, approvals, recall);
+        return new BatchHistoryResponse(toBatchResponse(batch), tests, approvals, recall,
+                certificateService.certificateInfo(batchKey),
+                certificateService.releaseSnapshotInfo(batchKey));
     }
 
     /**
@@ -465,6 +482,9 @@ public class BatchService {
                 }
                 repo.insertLineage(new BatchRepository.LineageRow(0L, parentKey, spec.batchKey(),
                         i + 1, now));
+                // 拆分产物继承父批合格证声明引用；匹配前缀按子批批号重新计算
+                certificateService.inheritBinding(parentKey, spec.batchKey(), spec.batchNo(),
+                        now, req.commandKey());
                 childBodies.add(new SplitResponse.SplitChild(spec.batchKey(), spec.batchNo(),
                         parent.productCode(), Instant.parse(parent.producedAt()),
                         BatchStatus.QUARANTINED, required, Instant.parse(now)));

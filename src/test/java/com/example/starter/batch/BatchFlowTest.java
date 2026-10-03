@@ -45,6 +45,11 @@ class BatchFlowTest {
     @BeforeEach
     void cleanTables() {
         jdbc.update("DELETE FROM command_log");
+        jdbc.update("DELETE FROM release_snapshot");
+        jdbc.update("DELETE FROM batch_certificate_binding");
+        jdbc.update("DELETE FROM certificate_declaration_prefix");
+        jdbc.update("DELETE FROM certificate_declaration");
+        jdbc.update("DELETE FROM batch_merge");
         jdbc.update("DELETE FROM approval");
         jdbc.update("DELETE FROM recall");
         jdbc.update("DELETE FROM test_result");
@@ -71,6 +76,7 @@ class BatchFlowTest {
         submitTest(batchKey, testReq("TK-3", "无菌", "PASS", "inspect-c"), null, null, 201);
         assertEquals("PENDING_RELEASE", currentStatus(batchKey));
 
+        bindCertificate(batchKey);
         approve(batchKey, "qa-1", "QUALITY", "CK-AP-1", 201);
         assertEquals("RELEASE_REVIEW", currentStatus(batchKey));
         approve(batchKey, "ops-1", "OPERATIONS", "CK-AP-2", 201);
@@ -135,6 +141,7 @@ class BatchFlowTest {
         approve(batchKey, "inspector-1", "QUALITY", "CK-A0", 422);
         assertEquals("PENDING_RELEASE", currentStatus(batchKey));
 
+        bindCertificate(batchKey);
         approve(batchKey, "qa-1", "QUALITY", "CK-A1", 201);
         // 重复角色
         approve(batchKey, "ops-1", "QUALITY", "CK-A2", 409);
@@ -285,6 +292,7 @@ class BatchFlowTest {
         createBatch(batchKey, List.of("t1"), 201);
         submitTest(batchKey, testReq("TK-1", "t1", "PASS", "insp"), null, null, 201);
 
+        bindCertificate(batchKey);
         String body = "{\"commandKey\":\"CK-A1\"}";
         MvcResult first = mockMvc.perform(post("/api/batches/" + batchKey + "/approvals")
                         .header("X-Actor-Id", "qa").header("X-Approval-Role", "QUALITY")
@@ -404,6 +412,7 @@ class BatchFlowTest {
         createBatch(batchKey, List.of("t1"), 201);
         submitTest(batchKey, testReq("TK-1", "t1", "PASS", "insp"), null, null, 201);
         approve(batchKey, "qa", "QUALITY", "CK-Q", 201);
+        bindCertificate(batchKey);
 
         List<Future<Integer>> results = runConcurrent(
                 () -> callStatus(post("/api/batches/" + batchKey + "/approvals")
@@ -444,6 +453,7 @@ class BatchFlowTest {
         String batchKey = "BK-PERSIST-" + unique();
         createBatch(batchKey, List.of("t1"), 201);
         submitTest(batchKey, testReq("TK-1", "t1", "PASS", "insp"), null, null, 201);
+        bindCertificate(batchKey);
         approve(batchKey, "qa", "QUALITY", "CK-A1", 201);
         approve(batchKey, "ops", "OPERATIONS", "CK-A2", 201);
         recall(batchKey, "u", "原因", "CK-R1", 201);
@@ -494,6 +504,28 @@ class BatchFlowTest {
     }
 
     // ---------- helpers ----------
+
+    private int declarationPriority;
+
+    /**
+     * 发布一条覆盖 LOT 前缀的声明并绑定到批次；批次物料 PROD-1、批号 LOT-1。
+     */
+    private void bindCertificate(String batchKey) throws Exception {
+        String declKey = "DECL-" + unique();
+        String pub = "{\"commandKey\":\"CK-PUB-" + unique() + "\",\"declarationKey\":\"" + declKey
+                + "\",\"version\":1,\"supplierId\":\"SUP-1\",\"materialCode\":\"PROD-1\","
+                + "\"prefixes\":[\"LOT\"],\"priority\":" + (++declarationPriority)
+                + ",\"validFrom\":\"2020-01-01T00:00:00Z\",\"validTo\":\"2099-01-01T00:00:00Z\"}";
+        mockMvc.perform(post("/api/declarations").header("X-Actor-Id", "sup-1")
+                        .contentType(MediaType.APPLICATION_JSON).content(pub))
+                .andExpect(status().isCreated());
+        mockMvc.perform(post("/api/batches/" + batchKey + "/certificate-binding")
+                        .header("X-Actor-Id", "sup-1")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"commandKey\":\"CK-BIND-" + unique()
+                                + "\",\"declarationKey\":\"" + declKey + "\",\"version\":1}"))
+                .andExpect(status().isCreated());
+    }
 
     private record CreateCmd(String commandKey, String batchKey, String productCode, String batchNo,
                              Instant producedAt, List<String> requiredTests) {

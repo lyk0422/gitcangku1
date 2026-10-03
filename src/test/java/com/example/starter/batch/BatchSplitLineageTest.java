@@ -46,6 +46,11 @@ class BatchSplitLineageTest {
     @BeforeEach
     void cleanTables() {
         jdbc.update("DELETE FROM command_log");
+        jdbc.update("DELETE FROM release_snapshot");
+        jdbc.update("DELETE FROM batch_certificate_binding");
+        jdbc.update("DELETE FROM certificate_declaration_prefix");
+        jdbc.update("DELETE FROM certificate_declaration");
+        jdbc.update("DELETE FROM batch_merge");
         jdbc.update("DELETE FROM approval");
         jdbc.update("DELETE FROM recall");
         jdbc.update("DELETE FROM test_result");
@@ -377,6 +382,7 @@ class BatchSplitLineageTest {
         assertFalse(available.contains(childA));
         assertTrue(available.contains(childB));
         submitTest(childB, "t1", "PASS", "insp-b2", 201);
+        bindCertificate(childB, "L1");
         approve(childB, "qa-b", "QUALITY", "CK-UT-AB1", 201);
         approve(childB, "ops-b", "OPERATIONS", "CK-UT-AB2", 201);
         assertEquals("RELEASED", currentStatus(childB));
@@ -415,6 +421,7 @@ class BatchSplitLineageTest {
         split(root, "CK-CRA-S", List.of(new String[]{child, "L1"},
                 new String[]{"BK-CRA-C2-" + unique(), "L2"}), 201);
         submitTest(child, "t1", "PASS", "insp-2", 201);
+        bindCertificate(child, "L1");
         approve(child, "qa-1", "QUALITY", "CK-CRA-A1", 201);
 
         List<Future<Integer>> results = runConcurrent(
@@ -543,6 +550,30 @@ class BatchSplitLineageTest {
 
     // ---------- helpers ----------
 
+    private int declarationPriority;
+
+    /**
+     * 发布一条以批次批号为前缀的声明并绑定到批次；拆分继承的绑定在放行前可被替换（200）。
+     */
+    private void bindCertificate(String batchKey, String batchNo) throws Exception {
+        String declKey = "DECL-" + unique();
+        String pub = "{\"commandKey\":\"CK-PUB-" + unique() + "\",\"declarationKey\":\"" + declKey
+                + "\",\"version\":1,\"supplierId\":\"SUP-1\",\"materialCode\":\"PROD-1\","
+                + "\"prefixes\":[\"" + batchNo + "\"],\"priority\":" + (++declarationPriority)
+                + ",\"validFrom\":\"2020-01-01T00:00:00Z\",\"validTo\":\"2099-01-01T00:00:00Z\"}";
+        mockMvc.perform(post("/api/declarations").header("X-Actor-Id", "sup-1")
+                        .contentType(MediaType.APPLICATION_JSON).content(pub))
+                .andExpect(status().isCreated());
+        MvcResult bind = mockMvc.perform(post("/api/batches/" + batchKey + "/certificate-binding")
+                        .header("X-Actor-Id", "sup-1")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"commandKey\":\"CK-BIND-" + unique()
+                                + "\",\"declarationKey\":\"" + declKey + "\",\"version\":1}"))
+                .andReturn();
+        int bindStatus = bind.getResponse().getStatus();
+        assertTrue(bindStatus == 200 || bindStatus == 201, "绑定应成功: " + bindStatus);
+    }
+
     private String unique() {
         return UUID.randomUUID().toString().substring(0, 8);
     }
@@ -572,6 +603,7 @@ class BatchSplitLineageTest {
         for (JsonNode item : node.path("batch").path("requiredTests")) {
             submitTest(batchKey, item.asText(), "PASS", inspector, 201);
         }
+        bindCertificate(batchKey, node.path("batch").path("batchNo").asText());
         approve(batchKey, "qa-" + unique(), "QUALITY", "CK-AQ-" + unique(), 201);
         approve(batchKey, "ops-" + unique(), "OPERATIONS", "CK-AO-" + unique(), 201);
     }
