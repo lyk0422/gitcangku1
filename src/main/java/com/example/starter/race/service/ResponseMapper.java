@@ -1,6 +1,10 @@
 package com.example.starter.race.service;
 
+import com.example.starter.race.api.CategoryResponse;
+import com.example.starter.race.api.CategoryStandingResponse;
 import com.example.starter.race.api.CheckpointPassResponse;
+import com.example.starter.race.api.ReclassApplicationResponse;
+import com.example.starter.race.api.ReclassRecordResponse;
 import com.example.starter.race.api.CheckpointTimingResponse;
 import com.example.starter.race.api.PenaltyResponse;
 import com.example.starter.race.api.ResultEntryResponse;
@@ -10,7 +14,12 @@ import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
+import com.example.starter.race.persistence.CategoryRow;
+import com.example.starter.race.persistence.CategorySnapshotEntryRow;
+import com.example.starter.race.persistence.CategorySnapshotRow;
 import com.example.starter.race.persistence.CheckpointRow;
+import com.example.starter.race.persistence.ReclassApplicationRow;
+import com.example.starter.race.persistence.ReclassRecordRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
@@ -32,7 +41,8 @@ final class ResponseMapper {
     }
 
     static RunnerResponse toRunnerResponse(RunnerRow row) {
-        return new RunnerResponse(row.bib(), row.finishTimeMs(), row.createdAt(), row.updatedAt());
+        return new RunnerResponse(row.bib(), row.categoryCode(), row.finishTimeMs(),
+                row.withdrawn(), row.createdAt(), row.updatedAt());
     }
 
     static PenaltyResponse toPenaltyResponse(PenaltyRow row) {
@@ -150,5 +160,54 @@ final class ResponseMapper {
                 .toList();
         return new RunnerTimingResponse(
                 snapshot.raceId(), bib, snapshot.version(), finishTimeMs, passes);
+    }
+    static CategoryResponse toCategoryResponse(CategoryRow row) {
+        return new CategoryResponse(row.categoryCode(), row.capacity(), row.sealed(),
+                row.createdAt(), row.sealedAt());
+    }
+
+    static ReclassApplicationResponse toApplicationResponse(ReclassApplicationRow row) {
+        return new ReclassApplicationResponse(row.applicationId(), row.raceId(), row.bib(),
+                row.targetCategory(), row.reason(), row.status(), row.createdAt(), row.decidedAt());
+    }
+
+    static ReclassRecordResponse toRecordResponse(ReclassRecordRow row) {
+        return new ReclassRecordResponse(row.recordId(), row.raceId(), row.bib(), row.applicationId(),
+                row.operator(), row.fromCategory(), row.toCategory(), row.preRank(), row.preStatus(),
+                row.preFinishTimeMs(), row.prePenaltyMs(), row.preTotalTimeMs(), row.createdAt());
+    }
+
+    /** 组别实时成绩榜响应。 */
+    static CategoryStandingResponse liveCategoryStanding(
+            String raceId,
+            String categoryCode,
+            int version,
+            List<ResultEntry> entries) {
+        return new CategoryStandingResponse(raceId, categoryCode, version, false, null,
+                entries.stream().map(ResponseMapper::toEntryResponse).toList());
+    }
+
+    /** 组别封榜快照响应。 */
+    static CategoryStandingResponse categorySnapshotStanding(CategorySnapshotRow snapshot) {
+        return new CategoryStandingResponse(
+                snapshot.raceId(),
+                snapshot.categoryCode(),
+                snapshot.version(),
+                true,
+                snapshot.sealedAt(),
+                snapshot.entries().stream().map(ResponseMapper::toEntryResponse).toList());
+    }
+
+    static ResultEntryResponse toEntryResponse(CategorySnapshotEntryRow entry) {
+        return new ResultEntryResponse(
+                entry.bib(),
+                entry.rank(),
+                entry.status(),
+                entry.finishTimeMs(),
+                entry.penaltyMs(),
+                entry.totalTimeMs(),
+                0,
+                0,
+                List.of());
     }
 }
