@@ -1,0 +1,6 @@
+spring:
+  datasource:
+    # 独立命名的 H2 内存库（MODE=MySQL），不依赖外部数据库；
+    # 不设置 DB_CLOSE_DELAY=-1，连接池随测试上下文关闭后数据库自动释放。
+    url: jdbc:h2:mem:blasttest;MODE=MySQL
+    username: sa
