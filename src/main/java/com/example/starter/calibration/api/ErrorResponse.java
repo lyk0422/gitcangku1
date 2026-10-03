@@ -1,6 +1,7 @@
 package com.example.starter.calibration.api;
 
 import java.util.List;
+import java.util.Map;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
 
@@ -10,11 +11,17 @@ import com.fasterxml.jackson.annotation.JsonInclude;
  * @param code     业务错误码
  * @param message  错误描述
  * @param failures 批量放行时各项失败原因；非批量场景为 null 不输出
+ * @param details  附加诊断（如数量类错误的实际值 actual、要求值 required、差额 shortfall）；无则 null 不输出
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
-public record ErrorResponse(String code, String message, List<ItemFailure> failures) {
+public record ErrorResponse(String code, String message, List<ItemFailure> failures,
+                            Map<String, Object> details) {
 
     public ErrorResponse(String code, String message) {
-        this(code, message, null);
+        this(code, message, null, null);
+    }
+
+    public ErrorResponse(String code, String message, List<ItemFailure> failures) {
+        this(code, message, failures, null);
     }
 }

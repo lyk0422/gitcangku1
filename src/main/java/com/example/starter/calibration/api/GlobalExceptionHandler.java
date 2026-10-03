@@ -1,6 +1,7 @@
 package com.example.starter.calibration.api;
 
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.MissingRequestHeaderException;
@@ -20,6 +21,19 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorResponse> handleBatchRejected(BatchRejectedException ex) {
         return ResponseEntity.status(ex.getStatus())
                 .body(new ErrorResponse(ex.getCode(), ex.getMessage(), ex.getFailures()));
+    }
+
+    @ExceptionHandler(IdempotentReplayException.class)
+    public ResponseEntity<String> handleReplay(IdempotentReplayException ex) {
+        return ResponseEntity.status(ex.getStatus())
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(ex.getBody());
+    }
+
+    @ExceptionHandler(OutliersPendingException.class)
+    public ResponseEntity<ErrorResponse> handleOutliersPending(OutliersPendingException ex) {
+        return ResponseEntity.status(ex.getStatus())
+                .body(new ErrorResponse(ex.getCode(), ex.getMessage(), null, ex.getDetails()));
     }
 
     @ExceptionHandler(ApiException.class)

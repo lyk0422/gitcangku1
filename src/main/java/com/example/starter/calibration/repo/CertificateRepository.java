@@ -29,6 +29,7 @@ public class CertificateRepository {
             JdbcTimes.fromDb(rs.getObject("valid_to", LocalDateTime.class)),
             rs.getBigDecimal("coeff_a"),
             rs.getBigDecimal("offset_b"),
+            rs.getInt("version"),
             rs.getBoolean("revoked"),
             JdbcTimes.fromDb(rs.getObject("revoked_at", LocalDateTime.class)),
             JdbcTimes.fromDb(rs.getObject("created_at", LocalDateTime.class)));

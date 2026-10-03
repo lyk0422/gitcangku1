@@ -36,6 +36,7 @@ final class DtoMapper {
                 cert.validTo(),
                 format(cert.a()),
                 format(cert.b()),
+                cert.version(),
                 cert.revoked(),
                 cert.revokedAt(),
                 cert.createdAt());
