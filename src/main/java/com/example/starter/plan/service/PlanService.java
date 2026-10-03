@@ -3,8 +3,10 @@ package com.example.starter.plan.service;
 import com.example.starter.plan.model.DayPlan;
 import com.example.starter.plan.model.Occupancy;
 import com.example.starter.plan.model.PlanStatus;
+import com.example.starter.plan.model.PublishedCrewAssignment;
 import com.example.starter.plan.model.PublishedSlot;
 import com.example.starter.plan.model.RescheduleLink;
+import com.example.starter.plan.repo.CrewRepository;
 import com.example.starter.plan.repo.IdempotencyRepository;
 import com.example.starter.plan.repo.PlanRepository;
 import com.example.starter.plan.web.ApiException;
@@ -59,13 +61,18 @@ public class PlanService {
     private static final String OP_RESCHEDULE = "RESCHEDULE";
 
     private final PlanRepository planRepo;
+    private final CrewRepository crewRepo;
+    private final CrewService crewService;
     private final IdempotencyRepository idemRepo;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate tx;
 
-    public PlanService(PlanRepository planRepo, IdempotencyRepository idemRepo,
-                       ObjectMapper objectMapper, PlatformTransactionManager txManager) {
+    public PlanService(PlanRepository planRepo, CrewRepository crewRepo, CrewService crewService,
+                       IdempotencyRepository idemRepo, ObjectMapper objectMapper,
+                       PlatformTransactionManager txManager) {
         this.planRepo = planRepo;
+        this.crewRepo = crewRepo;
+        this.crewService = crewService;
         this.idemRepo = idemRepo;
         this.objectMapper = objectMapper;
         this.tx = new TransactionTemplate(txManager);
@@ -139,7 +146,18 @@ public class PlanService {
      * 任一冲突则整张计划保持草稿并抛出 422（携带冲突区段与计划）。
      */
     public PlanResponse publish(String scheduleKey, String requestKey) {
-        String hash = hashAction(OP_PUBLISH, scheduleKey);
+        return publish(scheduleKey, requestKey, List.of());
+    }
+
+    /**
+     * 发布计划（登记乘务组）：全局发布锁内原子核验本计划列车重叠、跨计划区段重叠
+     * 与逐人乘务资格（区间覆盖、线路等级、人员冲突），任一冲突则整张计划保持草稿
+     * 并抛出 422，整单不占线路时隙或乘务资源；成功时写入不可变乘务资格快照。
+     * 同一 requestKey 重放返回首次人员与时隙分配，同键换乘务组判定 409。
+     */
+    public PlanResponse publish(String scheduleKey, String requestKey, List<String> crewMembers) {
+        List<String> crew = normalizeCrew(crewMembers);
+        String hash = hashPublish(scheduleKey, crew);
         Optional<PlanResponse> replay = replayIfPresent(OP_PUBLISH, requestKey, hash);
         if (replay.isPresent()) {
             return replay.get();
@@ -147,6 +165,11 @@ public class PlanService {
         try {
             return tx.execute(status -> {
                 planRepo.acquirePublishLock();
+                // 锁内重查：并发下同 requestKey 的后到事务直接重放首次人员与时隙分配
+                Optional<PlanResponse> lockedReplay = replayIfPresent(OP_PUBLISH, requestKey, hash);
+                if (lockedReplay.isPresent()) {
+                    return lockedReplay.get();
+                }
                 DayPlan plan = planRepo.findByKeyForUpdate(scheduleKey)
                         .orElseThrow(() -> notFound(scheduleKey));
                 if (plan.status() != PlanStatus.DRAFT) {
@@ -161,7 +184,12 @@ public class PlanService {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "存在时隙冲突，计划保持草稿", conflicts);
                 }
+                List<PublishedCrewAssignment> crewSnapshot =
+                        crewService.validateCrewForPublish(plan, occupancies, crew);
                 long now = System.currentTimeMillis();
+                if (!crewSnapshot.isEmpty()) {
+                    crewRepo.insertCrewAssignments(crewSnapshot);
+                }
                 planRepo.updateStatus(plan.id(), PlanStatus.PUBLISHED, now);
                 PlanResponse response = loadPlan(scheduleKey);
                 idemRepo.insert(OP_PUBLISH, requestKey, hash, toJson(response), now);
@@ -341,8 +369,11 @@ public class PlanService {
         List<OccupancyView> views = planRepo.findOccupancies(plan.id()).stream()
                 .map(o -> new OccupancyView(o.trainNo(), o.sectionId(), o.startUtc(), o.endUtc()))
                 .toList();
+        List<String> crewMembers = crewRepo.findCrewAssignments(plan.id()).stream()
+                .map(PublishedCrewAssignment::crewMemberId)
+                .toList();
         return new PlanResponse(plan.scheduleKey(), plan.opDate(), plan.version(),
-                plan.status().name(), views);
+                plan.status().name(), views, crewMembers);
     }
 
     private List<Occupancy> toOccupancies(long planId, List<OccupancyRequest> requests) {
@@ -553,5 +584,35 @@ public class PlanService {
 
     private ApiException conflict(String code, String message) {
         return new ApiException(HttpStatus.CONFLICT, code, message);
+    }
+
+    /**
+     * 规范化乘务组：空引用按空名单处理，去除重复成员并保持提交顺序；空白成员拒绝。
+     */
+    private List<String> normalizeCrew(List<String> crewMembers) {
+        if (crewMembers == null || crewMembers.isEmpty()) {
+            return List.of();
+        }
+        List<String> crew = new ArrayList<>();
+        for (String member : crewMembers) {
+            if (member == null || member.isBlank()) {
+                throw badRequest("乘务组成员 ID 不能为空");
+            }
+            if (!crew.contains(member)) {
+                crew.add(member);
+            }
+        }
+        return List.copyOf(crew);
+    }
+
+    /**
+     * 发布幂等哈希：包含计划业务键与乘务组名单，同键换乘务组判定 409。
+     */
+    private String hashPublish(String scheduleKey, List<String> crew) {
+        StringBuilder sb = new StringBuilder(OP_PUBLISH).append('\n').append(scheduleKey);
+        for (String member : crew) {
+            sb.append('\n').append(member);
+        }
+        return sha256(sb.toString());
     }
 }
