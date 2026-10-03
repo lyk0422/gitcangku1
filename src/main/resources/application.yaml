@@ -36,3 +36,7 @@ management:
   endpoint:
     health:
       show-details: never
+
+# 授权证据查询密钥（本地合成默认值，非真实凭据；可用 EVIDENCE_KEY 覆盖）
+observation:
+  evidence-key: ${EVIDENCE_KEY:local-evidence-key}

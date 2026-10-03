@@ -50,17 +50,20 @@ public class ObservationService {
     private final ObservationRepository observationRepository;
     private final RequestLogRepository requestLogRepository;
     private final ResolutionRepository resolutionRepository;
+    private final EmbargoService embargoService;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public ObservationService(ObservationRepository observationRepository,
                               RequestLogRepository requestLogRepository,
                               ResolutionRepository resolutionRepository,
+                              EmbargoService embargoService,
                               ObjectMapper objectMapper,
                               Clock clock) {
         this.observationRepository = observationRepository;
         this.requestLogRepository = requestLogRepository;
         this.resolutionRepository = resolutionRepository;
+        this.embargoService = embargoService;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -128,6 +131,9 @@ public class ObservationService {
                 request.reading(), conflictFields);
         String mergedNote = mergeField("note", base.note(), current.note(), request.note(), conflictFields);
         if (!conflictFields.isEmpty()) {
+            // 独立事务落未解决冲突标记：本次 409 回滚后仍可据此拒绝禁运设置
+            embargoService.recordPendingConflict(observationId, conflictFields,
+                    request.baseVersion(), current.version());
             throw ApiException.mergeConflict(conflictFields, current.version());
         }
 
@@ -171,6 +177,7 @@ public class ObservationService {
                 null, null, null, true);
         observationRepository.markDeleted(observationId, tombstone.version());
         observationRepository.insertVersion(tombstone);
+        embargoService.clearPendingConflict(observationId);
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(tombstone));
     }
 
@@ -283,6 +290,9 @@ public class ObservationService {
             }
             return completeResolve(request.requestId(), HttpStatus.OK, resolutionResponseOf(winner));
         }
+
+        // 显式解决成功：与解决记录同事务清除未解决冲突标记
+        embargoService.clearPendingConflict(observationId);
 
         ObservationSnapshot pointed = contentChanged
                 ? new ObservationSnapshot(observationId, newVersion, resolvedLocation, resolvedReading, resolvedNote, false)
