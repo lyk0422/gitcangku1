@@ -1,16 +1,27 @@
 package com.example.starter.race.service;
 
 import com.example.starter.race.api.AddPenaltyRequest;
+import com.example.starter.race.api.ApproveReclassRequest;
+import com.example.starter.race.api.CategoryResponse;
+import com.example.starter.race.api.CategoryStandingResponse;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
+import com.example.starter.race.api.CreateCategoryRequest;
 import com.example.starter.race.api.CreateRaceRequest;
 import com.example.starter.race.api.RegisterRunnerRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
 import com.example.starter.race.api.MissingCheckpointsResponse;
+import com.example.starter.race.api.ReclassApplicationResponse;
+import com.example.starter.race.api.RejectReclassRequest;
+import com.example.starter.race.api.ReclassRecordResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
+import com.example.starter.race.api.SubmitReclassApplicationRequest;
 import com.example.starter.race.api.SubmitTimingRequest;
+import com.example.starter.race.api.WithdrawRunnerRequest;
+
+import java.util.List;
 
 /**
  * 赛事成绩封榜应用服务；每个写方法在单个数据库事务内完成
@@ -59,4 +70,49 @@ public interface RaceService {
 
     /** 查询赛事全部选手缺失检查点汇总，按参赛号与检查点顺序稳定返回；只读。 */
     MissingCheckpointsResponse getMissingCheckpoints(String raceId);
+
+    /** 新建组别（容量>=1）；版本不匹配或赛事已封榜返回409，组别代码重复返回409。 */
+    ServiceResult createCategory(String raceId, CreateCategoryRequest request);
+
+    /** 查询赛事全部组别，按组别代码字典序排列；只读。 */
+    List<CategoryResponse> listCategories(String raceId);
+
+    /**
+     * 组别封榜：冻结该组别当前在赛选手的排名为只读快照；
+     * 已封榜组别不能再作为重分来源或目标。
+     */
+    ServiceResult sealCategory(String raceId, String categoryCode, SealRaceRequest request);
+
+    /** 查询组别成绩（OPEN 实时计算；SEALED 返回组别封榜快照）。 */
+    CategoryStandingResponse getCategoryResults(String raceId, String categoryCode);
+
+    /** 查询组别封榜只读快照；未封榜为404。 */
+    CategoryStandingResponse getCategorySnapshot(String raceId, String categoryCode);
+
+    /** 选手退赛：不再参与排名、不占组别容量；重复退赛返回409。 */
+    ServiceResult withdrawRunner(String raceId, String bib, WithdrawRunnerRequest request);
+
+    /**
+     * 提交组别重分申请：目标组别必须存在且未封榜，申请人未退赛、
+     * 当前不在目标组别且无其它待审批申请。
+     */
+    ServiceResult submitReclassApplication(String raceId, SubmitReclassApplicationRequest request);
+
+    /** 拒绝重分申请：仅状态流转，不改变任何成绩；非待审批申请返回409。 */
+    ServiceResult rejectReclassApplication(
+            String raceId, String applicationId, RejectReclassRequest request);
+
+    /**
+     * 批量批准重分申请：先校验每个参赛者仅一次、目标组别容量未超、
+     * 无申请涉及已封榜组别，任一不合法整批422；成功后在同一事务迁移全部选手、
+     * 写入不可变重分记录（含迁移前名次与计时快照）并重算来源与目标组别排名。
+     * 组别已封榜或选手已退赛返回409。
+     */
+    ServiceResult approveReclass(String raceId, ApproveReclassRequest request);
+
+    /** 查询赛事全部重分申请，按提交时间稳定排列；只读。 */
+    List<ReclassApplicationResponse> listReclassApplications(String raceId);
+
+    /** 查询赛事全部不可变重分记录，按写入时间稳定排列；只读。 */
+    List<ReclassRecordResponse> listReclassRecords(String raceId);
 }

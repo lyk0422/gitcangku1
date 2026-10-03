@@ -1,8 +1,12 @@
 package com.example.starter.race.service;
 
+import com.example.starter.race.api.CategoryResponse;
+import com.example.starter.race.api.CategoryStandingResponse;
 import com.example.starter.race.api.CheckpointPassResponse;
 import com.example.starter.race.api.CheckpointTimingResponse;
 import com.example.starter.race.api.PenaltyResponse;
+import com.example.starter.race.api.ReclassApplicationResponse;
+import com.example.starter.race.api.ReclassRecordResponse;
 import com.example.starter.race.api.ResultEntryResponse;
 import com.example.starter.race.api.RunnerResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
@@ -10,8 +14,13 @@ import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
+import com.example.starter.race.persistence.CategoryRow;
+import com.example.starter.race.persistence.CategorySnapshotEntryRow;
+import com.example.starter.race.persistence.CategorySnapshotRow;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
+import com.example.starter.race.persistence.ReclassRecordRow;
+import com.example.starter.race.persistence.ReclassRequestRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
 import com.example.starter.race.persistence.RunnerRow;
@@ -32,7 +41,8 @@ final class ResponseMapper {
     }
 
     static RunnerResponse toRunnerResponse(RunnerRow row) {
-        return new RunnerResponse(row.bib(), row.finishTimeMs(), row.createdAt(), row.updatedAt());
+        return new RunnerResponse(row.bib(), row.finishTimeMs(), row.categoryCode(),
+                row.withdrawn(), row.createdAt(), row.updatedAt());
     }
 
     static PenaltyResponse toPenaltyResponse(PenaltyRow row) {
@@ -74,6 +84,7 @@ final class ResponseMapper {
     static ResultEntryResponse toEntryResponse(ResultEntry entry) {
         return new ResultEntryResponse(
                 entry.bib(),
+                entry.categoryCode(),
                 entry.rank(),
                 entry.status(),
                 entry.finishTimeMs(),
@@ -87,6 +98,7 @@ final class ResponseMapper {
     static ResultEntryResponse toEntryResponse(SnapshotEntryRow entry) {
         return new ResultEntryResponse(
                 entry.bib(),
+                entry.categoryCode(),
                 entry.rank(),
                 entry.status(),
                 entry.finishTimeMs(),
@@ -150,5 +162,70 @@ final class ResponseMapper {
                 .toList();
         return new RunnerTimingResponse(
                 snapshot.raceId(), bib, snapshot.version(), finishTimeMs, passes);
+    }
+    static CategoryResponse toCategoryResponse(CategoryRow row) {
+        return new CategoryResponse(row.raceId(), row.categoryCode(), row.capacity(),
+                row.status(), row.createdAt(), row.sealedAt());
+    }
+
+    static ReclassApplicationResponse toApplicationResponse(ReclassRequestRow row) {
+        return new ReclassApplicationResponse(
+                row.applicationId(), row.raceId(), row.bib(), row.sourceCategoryCode(),
+                row.targetCategoryCode(), row.reason(), row.status(),
+                row.createdAt(), row.decidedAt());
+    }
+
+    static ReclassRecordResponse toRecordResponse(ReclassRecordRow row) {
+        return new ReclassRecordResponse(
+                row.recordId(), row.reclassKey(), row.applicationId(), row.bib(),
+                row.fromCategoryCode(), row.toCategoryCode(), row.rankBefore(),
+                row.finishTimeMs(), row.penaltyMs(), row.totalTimeMs(),
+                row.operator(), row.raceVersion(), row.createdAt());
+    }
+
+    /** 组别实时成绩榜：由组内在赛选手计算排名。 */
+    static CategoryStandingResponse liveCategoryStanding(
+            RaceRow race,
+            CategoryRow category,
+            List<RunnerRow> runners,
+            List<PenaltyRow> penalties,
+            List<CheckpointRow> checkpoints,
+            List<CheckpointTimingRow> timings) {
+        List<ResultEntry> entries = ResultCalculator.compute(
+                runners, penalties, checkpoints, timings);
+        return new CategoryStandingResponse(
+                race.raceId(),
+                category.categoryCode(),
+                race.version(),
+                category.status(),
+                null,
+                entries.stream().map(ResponseMapper::toEntryResponse).toList());
+    }
+
+    /** 组别封榜快照成绩榜。 */
+    static CategoryStandingResponse snapshotCategoryStanding(CategorySnapshotRow snapshot) {
+        return new CategoryStandingResponse(
+                snapshot.raceId(),
+                snapshot.categoryCode(),
+                snapshot.version(),
+                RaceStatus.SEALED,
+                snapshot.sealedAt(),
+                snapshot.entries().stream()
+                        .map(ResponseMapper::toEntryResponse)
+                        .toList());
+    }
+
+    static ResultEntryResponse toEntryResponse(CategorySnapshotEntryRow entry) {
+        return new ResultEntryResponse(
+                entry.bib(),
+                entry.categoryCode(),
+                entry.rank(),
+                entry.status(),
+                entry.finishTimeMs(),
+                entry.penaltyMs(),
+                entry.totalTimeMs(),
+                0,
+                0,
+                List.of());
     }
 }

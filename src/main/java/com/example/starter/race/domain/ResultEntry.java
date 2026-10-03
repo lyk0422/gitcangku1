@@ -6,6 +6,7 @@ import java.util.List;
  * 单个选手的成绩条目。
  *
  * @param bib                     参赛号
+ * @param categoryCode          所属组别代码；未分组为 null
  * @param rank                    名次，从1开始；并列同名次且跳号（1、1、3）；非 RANKED 为 null
  * @param status                  成绩状态
  * @param finishTimeMs            原始完赛耗时（毫秒）；计时缺失为 null
@@ -17,6 +18,7 @@ import java.util.List;
  */
 public record ResultEntry(
         String bib,
+        String categoryCode,
         Integer rank,
         EntryStatus status,
         Long finishTimeMs,
@@ -35,6 +37,21 @@ public record ResultEntry(
             Long finishTimeMs,
             long penaltyMs,
             Long totalTimeMs) {
-        this(bib, rank, status, finishTimeMs, penaltyMs, totalTimeMs, 0, 0, List.of());
+        this(bib, null, rank, status, finishTimeMs, penaltyMs, totalTimeMs, 0, 0, List.of());
+    }
+
+    /** 无组别信息的完整构造兼容入口。 */
+    public ResultEntry(
+            String bib,
+            Integer rank,
+            EntryStatus status,
+            Long finishTimeMs,
+            long penaltyMs,
+            Long totalTimeMs,
+            int checkpointCount,
+            int coveredCheckpointCount,
+            List<String> missingCheckpoints) {
+        this(bib, null, rank, status, finishTimeMs, penaltyMs, totalTimeMs,
+                checkpointCount, coveredCheckpointCount, missingCheckpoints);
     }
 }

@@ -58,7 +58,8 @@ public final class ResultCalculator {
         Map<String, Aggregate> aggregates = new LinkedHashMap<>();
         for (RunnerView runner : runnerView) {
             aggregates.put(runner.bib(),
-                    new Aggregate(runner.bib(), runner.finishTimeMs(), orderedCheckpoints));
+                    new Aggregate(runner.bib(), runner.categoryCode(),
+                            runner.finishTimeMs(), orderedCheckpoints));
         }
 
         // 仅统计属于已配置检查点的分段（数据库外键已保证，这里做防御性过滤）。
@@ -139,6 +140,11 @@ public final class ResultCalculator {
         String bib();
 
         Long finishTimeMs();
+
+        /** 所属组别代码；未分组为 null。默认 null 以兼容无组别的视图实现。 */
+        default String categoryCode() {
+            return null;
+        }
     }
 
     /** 处罚视图。 */
@@ -155,6 +161,7 @@ public final class ResultCalculator {
     /** 单选手聚合中间态。 */
     private static final class Aggregate {
         private final String bib;
+        private final String categoryCode;
         private final Long finishTimeMs;
         private final List<CheckpointView> checkpoints;
         private final Set<String> coveredCodes = new HashSet<>();
@@ -164,8 +171,13 @@ public final class ResultCalculator {
         private int rank;
         private long totalTimeMs;
 
-        private Aggregate(String bib, Long finishTimeMs, List<CheckpointView> checkpoints) {
+        private Aggregate(
+                String bib,
+                String categoryCode,
+                Long finishTimeMs,
+                List<CheckpointView> checkpoints) {
             this.bib = bib;
+            this.categoryCode = categoryCode;
             this.finishTimeMs = finishTimeMs;
             this.checkpoints = checkpoints;
         }
@@ -183,6 +195,7 @@ public final class ResultCalculator {
         private ResultEntry toEntry() {
             return new ResultEntry(
                     bib,
+                    categoryCode,
                     status == EntryStatus.RANKED ? rank : null,
                     status,
                     finishTimeMs,

@@ -9,6 +9,7 @@ import java.util.List;
  * 成绩榜中的单个条目。
  *
  * @param bib                    参赛号
+ * @param categoryCode           所属组别代码；未分组为 null
  * @param rank                   名次（并列同名次并跳号）；非 RANKED 为 null
  * @param status                RANKED / UNTIMED / MISSING_CHECKPOINT / DISQUALIFIED
  * @param finishTimeMs          原始完赛耗时毫秒；计时缺失为 null
@@ -21,6 +22,7 @@ import java.util.List;
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public record ResultEntryResponse(
         String bib,
+        String categoryCode,
         Integer rank,
         EntryStatus status,
         Long finishTimeMs,
