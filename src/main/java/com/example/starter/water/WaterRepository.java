@@ -45,6 +45,20 @@ public class WaterRepository {
     public record CommandRow(String commandKey, String operation, String params, String response,
                              long createdNanos) {
     }
+    /** 结算版本行；费率在创建时冻结，行创建后不可变。 */
+    public record SettlementRow(long id, long windowId, int version, BigDecimal totalAmount,
+                                BigDecimal diffAmount, BigDecimal firstTierLimit, BigDecimal firstTierRate,
+                                BigDecimal secondTierRate, long createdNanos) {
+    }
+
+    /** 结算版本农户明细行，创建后不可变。 */
+    public record SettlementLineRow(long id, long settlementId, String userId, BigDecimal volume,
+                                    BigDecimal amount) {
+    }
+
+    /** 农户当前批准水量合计视图（APPROVED 申请的持有额度之和）。 */
+    public record UserVolumeRow(String userId, BigDecimal volume) {
+    }
 
     private static final RowMapper<WindowRow> WINDOW_MAPPER = (rs, n) -> new WindowRow(
             rs.getLong("id"), rs.getString("window_key"), rs.getString("channel_id"),
@@ -74,6 +88,22 @@ public class WaterRepository {
     private static final RowMapper<CommandRow> COMMAND_MAPPER = (rs, n) -> new CommandRow(
             rs.getString("command_key"), rs.getString("operation"), rs.getString("params"),
             rs.getString("response"), rs.getLong("created_nanos"));
+    private static final RowMapper<SettlementRow> SETTLEMENT_MAPPER = (rs, n) -> new SettlementRow(
+            rs.getLong("id"), rs.getLong("window_id"), rs.getInt("version"),
+            rs.getBigDecimal("total_amount"), rs.getBigDecimal("diff_amount"),
+            rs.getBigDecimal("first_tier_limit"), rs.getBigDecimal("first_tier_rate"),
+            rs.getBigDecimal("second_tier_rate"), rs.getLong("created_nanos"));
+
+    private static final String SETTLEMENT_SELECT =
+            "SELECT id, window_id, version, total_amount, diff_amount, first_tier_limit, first_tier_rate,"
+                    + " second_tier_rate, created_nanos";
+
+    private static final RowMapper<SettlementLineRow> SETTLEMENT_LINE_MAPPER = (rs, n) -> new SettlementLineRow(
+            rs.getLong("id"), rs.getLong("settlement_id"), rs.getString("user_id"),
+            rs.getBigDecimal("volume"), rs.getBigDecimal("amount"));
+
+    private static final RowMapper<UserVolumeRow> USER_VOLUME_MAPPER = (rs, n) -> new UserVolumeRow(
+            rs.getString("user_id"), rs.getBigDecimal("volume"));
 
     private final JdbcTemplate jdbc;
 
@@ -303,5 +333,63 @@ public class WaterRepository {
     /** 写回命令首次成功响应。 */
     public void updateCommandResponse(String commandKey, String response) {
         jdbc.update("UPDATE command_log SET response = ? WHERE command_key = ?", response, commandKey);
+    }
+    /** 查询窗口最新结算版本，无则 null。 */
+    public SettlementRow findLatestSettlement(long windowId) {
+        List<SettlementRow> rows = jdbc.query(
+                SETTLEMENT_SELECT + " FROM settlement WHERE window_id = ? ORDER BY version DESC LIMIT 1",
+                SETTLEMENT_MAPPER, windowId);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /** 窗口全部结算版本，按版本号升序。 */
+    public List<SettlementRow> listSettlements(long windowId) {
+        return jdbc.query(SETTLEMENT_SELECT + " FROM settlement WHERE window_id = ? ORDER BY version",
+                SETTLEMENT_MAPPER, windowId);
+    }
+
+    /** 插入结算版本并返回主键。 */
+    public long insertSettlement(long windowId, int version, BigDecimal totalAmount, BigDecimal diffAmount,
+                                 BigDecimal firstTierLimit, BigDecimal firstTierRate,
+                                 BigDecimal secondTierRate, long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO settlement (window_id, version, total_amount, diff_amount, first_tier_limit,"
+                            + " first_tier_rate, second_tier_rate, created_nanos)"
+                            + " VALUES (?, ?, ?, ?, ?, ?, ?, ?)", Statement.RETURN_GENERATED_KEYS);
+            ps.setLong(1, windowId);
+            ps.setInt(2, version);
+            ps.setBigDecimal(3, totalAmount);
+            ps.setBigDecimal(4, diffAmount);
+            ps.setBigDecimal(5, firstTierLimit);
+            ps.setBigDecimal(6, firstTierRate);
+            ps.setBigDecimal(7, secondTierRate);
+            ps.setLong(8, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 插入结算版本农户明细。 */
+    public void insertSettlementLine(long settlementId, String userId, BigDecimal volume, BigDecimal amount) {
+        jdbc.update("INSERT INTO settlement_line (settlement_id, user_id, volume, amount) VALUES (?, ?, ?, ?)",
+                settlementId, userId, volume, amount);
+    }
+
+    /** 查询结算版本全部农户明细，按用水户 ID 升序。 */
+    public List<SettlementLineRow> listSettlementLines(long settlementId) {
+        return jdbc.query(
+                "SELECT id, settlement_id, user_id, volume, amount FROM settlement_line"
+                        + " WHERE settlement_id = ? ORDER BY user_id",
+                SETTLEMENT_LINE_MAPPER, settlementId);
+    }
+
+    /** 窗口当前 APPROVED 申请按用水户分组的持有额度合计，按用水户 ID 升序。 */
+    public List<UserVolumeRow> listApprovedVolumeByUser(long windowId) {
+        return jdbc.query(
+                "SELECT user_id, COALESCE(SUM(held_amount), 0) AS volume FROM allocation"
+                        + " WHERE window_id = ? AND status = 'APPROVED' GROUP BY user_id ORDER BY user_id",
+                USER_VOLUME_MAPPER, windowId);
     }
 }

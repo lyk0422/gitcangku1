@@ -74,6 +74,33 @@ public final class Dtos {
                                   List<CurtailmentResponse> curtailments) {
     }
 
+    /** 创建窗口结算命令；requestId 为幂等键，同键同参重放首次结果，同键改参返回 409。 */
+    public record SettlementRequest(String requestId) {
+    }
+
+    /** 窗口对账命令；expectedSettlementVersion 必须等于当前最新结算版本，否则 409。 */
+    public record ReconcileRequest(String requestId, Long expectedSettlementVersion) {
+    }
+
+    /** 结算版本农户明细视图；volume 单位立方米（3 位小数），amount 单位元（精确到分）。 */
+    public record SettlementLineResponse(String userId, String volume, String amount) {
+    }
+
+    /**
+     * 结算版本视图。版本从 1 起；diffAmount 为与最近有效版本的差额（版本 1 等于应收总额），
+     * 取消与转出产生负差额；费率与农户明细在创建时冻结，旧版本永不改写。
+     */
+    public record SettlementResponse(long id, long windowId, int version, String totalAmount,
+                                     String diffAmount, String firstTierLimit, String firstTierRate,
+                                     String secondTierRate, List<SettlementLineResponse> lines,
+                                     String createdUtc) {
+    }
+
+    /** 窗口结算列表视图；currentVersion 与 currentNetReceivable 在无结算时为 null。 */
+    public record SettlementListResponse(long windowId, Integer currentVersion,
+                                         String currentNetReceivable,
+                                         List<SettlementResponse> settlements) {
+    }
     /** 统一错误响应体。 */
     public record ErrorResponse(String code, String message) {
     }

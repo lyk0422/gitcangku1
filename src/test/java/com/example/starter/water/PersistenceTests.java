@@ -2,7 +2,10 @@ package com.example.starter.water;
 
 import com.example.starter.water.WaterRepository.AllocationRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
+import com.example.starter.water.WaterRepository.SettlementLineRow;
+import com.example.starter.water.WaterRepository.SettlementRow;
 import com.example.starter.water.WaterRepository.TransferRow;
+import com.example.starter.water.WaterRepository.UserVolumeRow;
 import com.example.starter.water.WaterRepository.WindowRow;
 import org.junit.jupiter.api.Test;
 import org.springframework.core.io.ClassPathResource;
@@ -12,6 +15,7 @@ import org.springframework.jdbc.datasource.init.ScriptUtils;
 
 import java.math.BigDecimal;
 import java.sql.Connection;
+import java.util.List;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -94,6 +98,54 @@ class PersistenceTests {
         assertEquals("{\"transferKey\":\"tk-persist\"}", repo2.findCommand("cmd-persist").response());
     }
 
+    @Test
+    void settlementVersionsAndLinesAreReadableFromNewConnection() throws Exception {
+        String url = String.format(URL_TEMPLATE, UUID.randomUUID().toString().substring(0, 8));
+        SimpleDriverDataSource first = new SimpleDriverDataSource(new org.h2.Driver(), url, "sa", "");
+        try (Connection connection = first.getConnection()) {
+            ScriptUtils.executeSqlScript(connection, new ClassPathResource("schema.sql"));
+        }
+        WaterRepository repo1 = new WaterRepository(new JdbcTemplate(first));
+        long windowId = repo1.insertWindow("wk-settle", "ch-settle", 1_000L, 2_000L,
+                new BigDecimal("1000.000"), 1L);
+        repo1.insertAllocation("ak-s1", windowId, "user-a", new BigDecimal("150.000"), "alice", 2L);
+        repo1.updateAllocationStatus(repo1.findAllocationByKey("ak-s1").id(), "APPROVED", 3L);
+
+        // 版本 1：应收 350.00，差额等于应收总额；冻结费率与农户明细
+        List<UserVolumeRow> volumes = repo1.listApprovedVolumeByUser(windowId);
+        assertEquals(1, volumes.size());
+        assertEquals("user-a", volumes.get(0).userId());
+        assertEquals(new BigDecimal("150.000"), volumes.get(0).volume());
+        long v1Id = repo1.insertSettlement(windowId, 1, new BigDecimal("350.00"), new BigDecimal("350.00"),
+                new BigDecimal("100.000"), new BigDecimal("2"), new BigDecimal("3"), 4L);
+        repo1.insertSettlementLine(v1Id, "user-a", new BigDecimal("150.000"), new BigDecimal("350.00"));
+        // 版本 2：应收 290.00，差额 -60.00
+        long v2Id = repo1.insertSettlement(windowId, 2, new BigDecimal("290.00"), new BigDecimal("-60.00"),
+                new BigDecimal("100.000"), new BigDecimal("2"), new BigDecimal("3"), 5L);
+        repo1.insertSettlementLine(v2Id, "user-a", new BigDecimal("130.000"), new BigDecimal("290.00"));
+
+        // 全新连接与仓储实例回读：版本按序、差额与冻结明细一致
+        WaterRepository repo2 = new WaterRepository(
+                new JdbcTemplate(new SimpleDriverDataSource(new org.h2.Driver(), url, "sa", "")));
+        List<SettlementRow> settlements = repo2.listSettlements(windowId);
+        assertEquals(2, settlements.size());
+        assertEquals(1, settlements.get(0).version());
+        assertEquals(new BigDecimal("350.00"), settlements.get(0).totalAmount());
+        assertEquals(new BigDecimal("350.00"), settlements.get(0).diffAmount());
+        assertEquals(new BigDecimal("100.000"), settlements.get(0).firstTierLimit());
+        assertEquals(new BigDecimal("2.00"), settlements.get(0).firstTierRate());
+        assertEquals(new BigDecimal("3.00"), settlements.get(0).secondTierRate());
+        SettlementRow latest = repo2.findLatestSettlement(windowId);
+        assertNotNull(latest);
+        assertEquals(2, latest.version());
+        assertEquals(new BigDecimal("290.00"), latest.totalAmount());
+        assertEquals(new BigDecimal("-60.00"), latest.diffAmount());
+        List<SettlementLineRow> lines = repo2.listSettlementLines(v2Id);
+        assertEquals(1, lines.size());
+        assertEquals("user-a", lines.get(0).userId());
+        assertEquals(new BigDecimal("130.000"), lines.get(0).volume());
+        assertEquals(new BigDecimal("290.00"), lines.get(0).amount());
+    }
     @Test
     void cancelledAllocationHeldAmountIsZero() throws Exception {
         String url = String.format(URL_TEMPLATE, UUID.randomUUID().toString().substring(0, 8));

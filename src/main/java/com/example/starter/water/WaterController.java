@@ -7,6 +7,10 @@ import com.example.starter.water.dto.Dtos.CreateWindowRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.ReconcileRequest;
+import com.example.starter.water.dto.Dtos.SettlementListResponse;
+import com.example.starter.water.dto.Dtos.SettlementRequest;
+import com.example.starter.water.dto.Dtos.SettlementResponse;
 import com.example.starter.water.dto.Dtos.SubmitAllocationRequest;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferRequest;
@@ -102,5 +106,30 @@ public class WaterController {
     @GetMapping("/windows/{windowId}/history")
     public HistoryResponse getHistory(@PathVariable long windowId) {
         return service.getHistory(windowId);
+    }
+    /** 创建窗口结算（版本 1），冻结申请集合、农户分组、精确水量与费率。 */
+    @PostMapping("/windows/{windowId}/settlements")
+    public SettlementResponse createSettlement(@PathVariable long windowId,
+                                               @RequestBody SettlementRequest request) {
+        return service.createSettlement(request.requestId(), windowId);
+    }
+
+    /** 窗口对账：按期望版本推进新版本，记录与最近有效版本的差额。 */
+    @PostMapping("/windows/{windowId}/reconciliations")
+    public SettlementResponse reconcile(@PathVariable long windowId,
+                                        @RequestBody ReconcileRequest request) {
+        return service.reconcile(request.requestId(), windowId, request.expectedSettlementVersion());
+    }
+
+    /** 查询窗口全部结算版本、差额与当前净应收。 */
+    @GetMapping("/windows/{windowId}/settlements")
+    public SettlementListResponse getSettlements(@PathVariable long windowId) {
+        return service.getSettlements(windowId);
+    }
+
+    /** 查询窗口当前最新结算版本（当前净应收）。 */
+    @GetMapping("/windows/{windowId}/settlements/current")
+    public SettlementResponse getCurrentSettlement(@PathVariable long windowId) {
+        return service.getCurrentSettlement(windowId);
     }
 }
