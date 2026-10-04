@@ -12,6 +12,7 @@ import java.util.Optional;
 
 /**
  * 交接记录表访问。记录只追加；进行中的交接通过证物行锁保证同一证物最多一条 PENDING。
+ * 受监管交接在途异常时冻结（frozen=1），冻结后仅可取消，历史检查点/签到/异常不修改。
  */
 @Repository
 public class TransferRecordRepository {
@@ -28,14 +29,15 @@ public class TransferRecordRepository {
      * 追加一条待接收交接记录。
      */
     public void insert(String evidenceKey, String fromCustodian, String toCustodian,
-                       LocalDateTime now) {
+                       TransferType transferType, LocalDateTime now) {
         jdbc.update("""
                         INSERT INTO transfer_record
-                            (evidence_key, from_custodian, to_custodian, status, initiated_by, created_at, decided_at)
-                        VALUES (?, ?, ?, ?, ?, ?, NULL)
+                            (evidence_key, from_custodian, to_custodian, status, transfer_type, frozen,
+                             initiated_by, created_at, decided_at)
+                        VALUES (?, ?, ?, ?, ?, 0, ?, ?, NULL)
                         """,
                 evidenceKey, fromCustodian, toCustodian,
-                TransferStatus.PENDING.name(), fromCustodian, now);
+                TransferStatus.PENDING.name(), transferType.name(), fromCustodian, now);
     }
 
     /**
@@ -61,6 +63,18 @@ public class TransferRecordRepository {
     }
 
     /**
+     * 冻结待接收交接（在途签到出现超时或封条异常）；仅当仍为 PENDING 时生效。
+     *
+     * @return 是否成功冻结（false 表示已被并发事务先行决定）
+     */
+    public boolean freeze(long id) {
+        int updated = jdbc.update(
+                "UPDATE transfer_record SET frozen = 1 WHERE id = ? AND status = ?",
+                id, TransferStatus.PENDING.name());
+        return updated == 1;
+    }
+
+    /**
      * 按发生顺序查询证物全部交接记录。
      */
     public List<TransferRecord> findByEvidenceKey(String evidenceKey) {
@@ -78,6 +92,8 @@ public class TransferRecordRepository {
                     rs.getString("from_custodian"),
                     rs.getString("to_custodian"),
                     TransferStatus.valueOf(rs.getString("status")),
+                    TransferType.valueOf(rs.getString("transfer_type")),
+                    rs.getInt("frozen") == 1,
                     rs.getString("initiated_by"),
                     rs.getObject("created_at", LocalDateTime.class),
                     rs.getObject("decided_at", LocalDateTime.class));

@@ -1,5 +1,6 @@
 package com.example.starter.evidence;
 
+import com.example.starter.evidence.dto.CheckpointSigninRequest;
 import com.example.starter.evidence.dto.CommandRequest;
 import com.example.starter.evidence.dto.CustodyChainView;
 import com.example.starter.evidence.dto.EvidenceView;
@@ -7,6 +8,7 @@ import com.example.starter.evidence.dto.IntakeRequest;
 import com.example.starter.evidence.dto.LoanCreateRequest;
 import com.example.starter.evidence.dto.LoanReturnRequest;
 import com.example.starter.evidence.dto.LoanView;
+import com.example.starter.evidence.dto.RegulatedTransferInitiateRequest;
 import com.example.starter.evidence.dto.SealInspectionRequest;
 import com.example.starter.evidence.dto.TransferInitiateRequest;
 import jakarta.validation.Valid;
@@ -138,6 +140,36 @@ public class EvidenceController {
                 evidenceKey, request);
         StoredResponse response = idempotencyAdvisor.guard(request.commandKey(), hash,
                 () -> evidenceService.returnLoan(actorId, evidenceKey, request, hash));
+        return toEntity(response);
+    }
+
+    /**
+     * 发起受监管交接：仅当前保管人（越权 403 且先于重放）；声明 2 至 8 个有序检查点，
+     * 每段 UTC 截止时刻严格递增，名单创建后不改；进入 TRANSFER_PENDING。
+     */
+    @PostMapping("/{evidenceKey}/regulated-transfers")
+    public ResponseEntity<String> initiateRegulatedTransfer(@RequestHeader(ACTOR_HEADER) @NotBlank String actorId,
+                                                            @PathVariable String evidenceKey,
+                                                            @Valid @RequestBody RegulatedTransferInitiateRequest request) {
+        String hash = idempotencyAdvisor.hashStructured(EvidenceService.OP_REGULATED_TRANSFER_INITIATE,
+                actorId, evidenceKey, request);
+        StoredResponse response = idempotencyAdvisor.guard(request.requestId(), hash,
+                () -> evidenceService.initiateRegulatedTransfer(actorId, evidenceKey, request, hash));
+        return toEntity(response);
+    }
+
+    /**
+     * 检查点签到：仅运送人（指定接收人，越权 403 且先于重放）；依次签到不跳点，
+     * 到达时刻不倒退、等于截止仍合法；超时或封条不一致记录异常并冻结交接。
+     */
+    @PostMapping("/{evidenceKey}/checkpoint-signins")
+    public ResponseEntity<String> signinCheckpoint(@RequestHeader(ACTOR_HEADER) @NotBlank String actorId,
+                                                   @PathVariable String evidenceKey,
+                                                   @Valid @RequestBody CheckpointSigninRequest request) {
+        String hash = idempotencyAdvisor.hashStructured(EvidenceService.OP_CHECKPOINT_SIGNIN,
+                actorId, evidenceKey, request);
+        StoredResponse response = idempotencyAdvisor.guard(request.requestId(), hash,
+                () -> evidenceService.signinCheckpoint(actorId, evidenceKey, request, hash));
         return toEntity(response);
     }
 

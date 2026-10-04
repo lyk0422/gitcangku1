@@ -47,6 +47,27 @@ public class IdempotencyAdvisor {
     }
 
     /**
+     * 计算请求指纹（结构化）：操作类型 + 操作人 + 资源键 + 请求体参数组装为 JSON 树后取 SHA-256。
+     * 字段边界由 JSON 结构保证，避免分隔符拼接造成的碰撞（如参数内容含分隔符）。
+     */
+    public String hashStructured(String operation, String actorId, String evidenceKey, Object request) {
+        try {
+            com.fasterxml.jackson.databind.node.ObjectNode node = objectMapper.createObjectNode();
+            node.put("operation", operation);
+            node.put("actorId", actorId == null ? "" : actorId);
+            node.put("resource", evidenceKey == null ? "" : evidenceKey);
+            node.set("params", objectMapper.valueToTree(request));
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            return HexFormat.of().formatHex(
+                    digest.digest(objectMapper.writeValueAsString(node).getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 不可用", e);
+        } catch (Exception e) {
+            throw new IllegalStateException("请求序列化失败", e);
+        }
+    }
+
+    /**
      * 在事务边界外执行命令；捕获并发导致的 command_key 唯一冲突并重放/报 409。
      */
     public StoredResponse guard(String commandKey, String requestHash,

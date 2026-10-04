@@ -1,6 +1,9 @@
 package com.example.starter.evidence;
 
 import com.example.starter.error.ApiException;
+import com.example.starter.evidence.dto.AnomalyView;
+import com.example.starter.evidence.dto.CheckpointSigninRequest;
+import com.example.starter.evidence.dto.CheckpointView;
 import com.example.starter.evidence.dto.CommandRequest;
 import com.example.starter.evidence.dto.CustodyChainView;
 import com.example.starter.evidence.dto.EvidenceView;
@@ -9,7 +12,9 @@ import com.example.starter.evidence.dto.IntakeRequest;
 import com.example.starter.evidence.dto.LoanCreateRequest;
 import com.example.starter.evidence.dto.LoanReturnRequest;
 import com.example.starter.evidence.dto.LoanView;
+import com.example.starter.evidence.dto.RegulatedTransferInitiateRequest;
 import com.example.starter.evidence.dto.SealInspectionRequest;
+import com.example.starter.evidence.dto.SigninView;
 import com.example.starter.evidence.dto.TransferInitiateRequest;
 import com.example.starter.evidence.dto.TransferView;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -35,6 +40,8 @@ public class EvidenceService {
     static final String OP_SEAL_INSPECTION = "SEAL_INSPECTION";
     static final String OP_LOAN_BORROW = "LOAN_BORROW";
     static final String OP_LOAN_RETURN = "LOAN_RETURN";
+    static final String OP_REGULATED_TRANSFER_INITIATE = "REGULATED_TRANSFER_INITIATE";
+    static final String OP_CHECKPOINT_SIGNIN = "CHECKPOINT_SIGNIN";
 
     /**
      * 借出最长期限：72 小时。
@@ -46,6 +53,9 @@ public class EvidenceService {
     private final SealInspectionRepository inspectionRepository;
     private final LoanRecordRepository loanRepository;
     private final CommandLogRepository commandLogRepository;
+    private final TransferCheckpointRepository checkpointRepository;
+    private final TransferSigninRepository signinRepository;
+    private final TransferAnomalyRepository anomalyRepository;
     private final ObjectMapper objectMapper;
     private final EvidenceClock clock;
 
@@ -54,6 +64,9 @@ public class EvidenceService {
                            SealInspectionRepository inspectionRepository,
                            LoanRecordRepository loanRepository,
                            CommandLogRepository commandLogRepository,
+                           TransferCheckpointRepository checkpointRepository,
+                           TransferSigninRepository signinRepository,
+                           TransferAnomalyRepository anomalyRepository,
                            ObjectMapper objectMapper,
                            EvidenceClock clock) {
         this.evidenceRepository = evidenceRepository;
@@ -61,6 +74,9 @@ public class EvidenceService {
         this.inspectionRepository = inspectionRepository;
         this.loanRepository = loanRepository;
         this.commandLogRepository = commandLogRepository;
+        this.checkpointRepository = checkpointRepository;
+        this.signinRepository = signinRepository;
+        this.anomalyRepository = anomalyRepository;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -112,7 +128,7 @@ public class EvidenceService {
             throw ApiException.conflict("借出期间禁止发起交接: " + evidenceKey);
         }
         LocalDateTime now = LocalDateTime.now();
-        transferRepository.insert(evidenceKey, actorId, request.toCustodian(), now);
+        transferRepository.insert(evidenceKey, actorId, request.toCustodian(), TransferType.REGULAR, now);
         evidenceRepository.updateStatus(evidenceKey, EvidenceStatus.TRANSFER_PENDING, now);
         TransferRecord pending = transferRepository.findPendingByEvidenceKey(evidenceKey).orElseThrow();
         return record(request.commandKey(), OP_TRANSFER_INITIATE, actorId, requestHash,
@@ -140,6 +156,7 @@ public class EvidenceService {
         if (!pending.toCustodian().equals(actorId)) {
             throw ApiException.conflict("操作人不是指定接收人: " + actorId);
         }
+        requireRouteComplete(pending);
         LocalDateTime now = LocalDateTime.now();
         if (!transferRepository.decide(pending.id(), TransferStatus.ACCEPTED, now)) {
             throw ApiException.conflict("交接已被处理: " + evidenceKey);
@@ -348,7 +365,14 @@ public class EvidenceService {
                 .stream().map(this::toView).toList();
         List<InspectionView> inspections = inspectionRepository.findByEvidenceKey(evidenceKey)
                 .stream().map(this::toView).toList();
-        return new CustodyChainView(toView(evidence), transfers, loans, inspections);
+        List<CheckpointView> checkpoints = checkpointRepository.findByEvidenceKey(evidenceKey)
+                .stream().map(this::toView).toList();
+        List<SigninView> signins = signinRepository.findByEvidenceKey(evidenceKey)
+                .stream().map(this::toView).toList();
+        List<AnomalyView> anomalies = anomalyRepository.findByEvidenceKey(evidenceKey)
+                .stream().map(this::toView).toList();
+        return new CustodyChainView(toView(evidence), transfers, loans, inspections,
+                checkpoints, signins, anomalies);
     }
 
     private Evidence lockEvidence(String evidenceKey) {
@@ -409,7 +433,8 @@ public class EvidenceService {
 
     private TransferView toView(TransferRecord record) {
         return new TransferView(record.evidenceKey(), record.fromCustodian(), record.toCustodian(),
-                record.status(), record.initiatedBy(), record.createdAt(), record.decidedAt());
+                record.status(), record.transferType(), record.frozen(), record.initiatedBy(),
+                record.createdAt(), record.decidedAt());
     }
 
     private InspectionView toView(SealInspection inspection) {
@@ -424,5 +449,197 @@ public class EvidenceService {
         return new LoanView(loan.loanKey(), loan.evidenceKey(), loan.custodianId(),
                 loan.borrowerId(), loan.purpose(), loan.loanAt(), loan.dueAt(), loan.status(),
                 overdue, loan.sealPassed(), loan.returnNote(), loan.returnedAt());
+    }
+
+    /**
+     * 发起受监管交接：仅当前保管人（越权 403 且先于幂等重放）；声明 2 至 8 个有序检查点，
+     * 每段 UTC 截止时刻必须严格递增，名单创建后不可修改。成功后证物进入 TRANSFER_PENDING，
+     * 同一证物仅一条在途交接，借出仍被阻断。
+     */
+    @Transactional
+    public StoredResponse initiateRegulatedTransfer(String actorId, String evidenceKey,
+                                                    RegulatedTransferInitiateRequest request,
+                                                    String requestHash) {
+        Evidence evidence = evidenceRepository.findByKey(evidenceKey)
+                .orElseThrow(() -> ApiException.notFound("证物不存在: " + evidenceKey));
+        requireCustodianForbidden(evidence, actorId);
+        Optional<StoredResponse> replay = checkReplay(request.requestId(), requestHash);
+        if (replay.isPresent()) {
+            return replay.get();
+        }
+        evidence = lockEvidence(evidenceKey);
+        // 持锁后复查权限与幂等日志，重放先提交事务的首次结果
+        requireCustodianForbidden(evidence, actorId);
+        replay = checkReplay(request.requestId(), requestHash);
+        if (replay.isPresent()) {
+            return replay.get();
+        }
+        requireIncreasingDeadlines(request.deadlines());
+        if (request.toCustodian().equals(actorId)) {
+            throw ApiException.badRequest("接收人不能与发起保管人相同");
+        }
+        requireSealIntact(evidence);
+        if (evidence.status() == EvidenceStatus.TRANSFER_PENDING) {
+            throw ApiException.conflict("证物已存在待接收交接: " + evidenceKey);
+        }
+        if (evidence.status() == EvidenceStatus.BORROWED) {
+            throw ApiException.conflict("借出期间禁止发起交接: " + evidenceKey);
+        }
+        LocalDateTime now = LocalDateTime.now();
+        transferRepository.insert(evidenceKey, actorId, request.toCustodian(),
+                TransferType.REGULATED, now);
+        evidenceRepository.updateStatus(evidenceKey, EvidenceStatus.TRANSFER_PENDING, now);
+        TransferRecord pending = transferRepository.findPendingByEvidenceKey(evidenceKey).orElseThrow();
+        for (int i = 0; i < request.deadlines().size(); i++) {
+            checkpointRepository.insert(pending.id(), evidenceKey, i + 1,
+                    request.deadlines().get(i), now);
+        }
+        return record(request.requestId(), OP_REGULATED_TRANSFER_INITIATE, actorId, requestHash,
+                200, toView(pending));
+    }
+
+    /**
+     * 检查点签到：仅运送人（指定接收人，越权 403 且先于幂等重放）；按点号依次签到，不允许跳点，
+     * 到达时刻不得倒退，等于截止仍合法。超时或封条不一致时记录异常并冻结交接（返回 200 异常视图），
+     * 冻结后普通签到不能继续、收件人不能接收；原保管人可取消并重新发起，旧链记录保留。
+     */
+    @Transactional
+    public StoredResponse signinCheckpoint(String actorId, String evidenceKey,
+                                           CheckpointSigninRequest request, String requestHash) {
+        Evidence evidence = evidenceRepository.findByKey(evidenceKey)
+                .orElseThrow(() -> ApiException.notFound("证物不存在: " + evidenceKey));
+        transferRepository.findPendingByEvidenceKey(evidenceKey)
+                .filter(t -> t.transferType() == TransferType.REGULATED)
+                .ifPresent(t -> requireTransporterForbidden(t, actorId));
+        Optional<StoredResponse> replay = checkReplay(request.requestId(), requestHash);
+        if (replay.isPresent()) {
+            return replay.get();
+        }
+        evidence = lockEvidence(evidenceKey);
+        TransferRecord pending = transferRepository.findPendingByEvidenceKey(evidenceKey).orElse(null);
+        // 持锁后复查权限与幂等日志，重放先提交事务的首次结果
+        if (pending != null && pending.transferType() == TransferType.REGULATED) {
+            requireTransporterForbidden(pending, actorId);
+        }
+        replay = checkReplay(request.requestId(), requestHash);
+        if (replay.isPresent()) {
+            return replay.get();
+        }
+        if (pending == null || pending.transferType() != TransferType.REGULATED) {
+            throw ApiException.conflict("证物不存在在途受监管交接: " + evidenceKey);
+        }
+        if (pending.frozen()) {
+            throw ApiException.conflict("交接已因在途异常冻结，禁止继续签到: " + evidenceKey);
+        }
+        List<TransferCheckpoint> checkpoints = checkpointRepository.findByTransferId(pending.id());
+        List<TransferSignin> signins = signinRepository.findByTransferId(pending.id());
+        int nextSeq = signins.size() + 1;
+        if (nextSeq > checkpoints.size()) {
+            throw ApiException.conflict("全部检查点已签到完成，等待接收: " + evidenceKey);
+        }
+        if (request.checkpointSeq() != nextSeq) {
+            throw ApiException.conflict("必须按顺序签到，不允许跳点，下一检查点为 " + nextSeq);
+        }
+        if (!signins.isEmpty()
+                && request.arrivedAt().isBefore(signins.get(signins.size() - 1).arrivedAtUtc())) {
+            throw ApiException.conflict("到达时刻不得早于上一检查点到达时刻");
+        }
+        TransferCheckpoint checkpoint = checkpoints.get(nextSeq - 1);
+        LocalDateTime now = LocalDateTime.now();
+        if (request.arrivedAt().isAfter(checkpoint.deadlineUtc())) {
+            return recordAnomaly(request, pending, checkpoint, evidence, AnomalyReason.LATE,
+                    actorId, requestHash, now);
+        }
+        if (!request.sealNo().equals(evidence.sealNo())) {
+            return recordAnomaly(request, pending, checkpoint, evidence, AnomalyReason.SEAL_MISMATCH,
+                    actorId, requestHash, now);
+        }
+        signinRepository.insert(pending.id(), evidenceKey, nextSeq, request.sealNo(),
+                request.arrivedAt(), now);
+        List<TransferSignin> after = signinRepository.findByTransferId(pending.id());
+        return record(request.requestId(), OP_CHECKPOINT_SIGNIN, actorId, requestHash,
+                200, toView(after.get(after.size() - 1)));
+    }
+
+    /**
+     * 记录一次在途异常并冻结交接：异常记录与冻结在同一事务落库，返回 200 异常视图。
+     */
+    private StoredResponse recordAnomaly(CheckpointSigninRequest request, TransferRecord pending,
+                                         TransferCheckpoint checkpoint, Evidence evidence,
+                                         AnomalyReason reason, String actorId,
+                                         String requestHash, LocalDateTime now) {
+        anomalyRepository.insert(pending.id(), evidence.evidenceKey(), checkpoint.seq(), reason,
+                evidence.sealNo(), request.sealNo(), request.arrivedAt(),
+                checkpoint.deadlineUtc(), now);
+        if (!transferRepository.freeze(pending.id())) {
+            throw ApiException.conflict("交接已被并发处理: " + evidence.evidenceKey());
+        }
+        List<TransferAnomaly> anomalies = anomalyRepository.findByTransferId(pending.id());
+        return record(request.requestId(), OP_CHECKPOINT_SIGNIN, actorId, requestHash,
+                200, toView(anomalies.get(anomalies.size() - 1)));
+    }
+
+    /**
+     * 受监管交接接收前置：未冻结且全部检查点已正常签到；签到缺失或已冻结返回 422。
+     */
+    private void requireRouteComplete(TransferRecord pending) {
+        if (pending.transferType() != TransferType.REGULATED) {
+            return;
+        }
+        if (pending.frozen()) {
+            throw ApiException.unprocessable("交接已因在途异常冻结，收件人不能接收: "
+                    + pending.evidenceKey());
+        }
+        int checkpoints = checkpointRepository.findByTransferId(pending.id()).size();
+        int signins = signinRepository.findByTransferId(pending.id()).size();
+        if (signins < checkpoints) {
+            throw ApiException.unprocessable("检查点签到缺失，收件人不能接收: "
+                    + pending.evidenceKey());
+        }
+    }
+
+    /**
+     * 检查点截止时刻必须严格递增（每段晚于上一段）。
+     */
+    private void requireIncreasingDeadlines(List<LocalDateTime> deadlines) {
+        for (int i = 1; i < deadlines.size(); i++) {
+            if (!deadlines.get(i).isAfter(deadlines.get(i - 1))) {
+                throw ApiException.badRequest("检查点截止时刻必须严格递增");
+            }
+        }
+    }
+
+    /**
+     * 受监管交接发起权限：仅当前保管人，越权 403（先于幂等重放检查）。
+     */
+    private void requireCustodianForbidden(Evidence evidence, String actorId) {
+        if (!evidence.custodianId().equals(actorId)) {
+            throw ApiException.forbidden("操作人不是当前保管人: " + actorId);
+        }
+    }
+
+    /**
+     * 签到权限：仅运送人（指定接收人），越权 403（先于幂等重放检查）。
+     */
+    private void requireTransporterForbidden(TransferRecord pending, String actorId) {
+        if (!pending.toCustodian().equals(actorId)) {
+            throw ApiException.forbidden("仅运送人（指定接收人）可签到: " + actorId);
+        }
+    }
+
+    private CheckpointView toView(TransferCheckpoint checkpoint) {
+        return new CheckpointView(checkpoint.transferId(), checkpoint.evidenceKey(),
+                checkpoint.seq(), checkpoint.deadlineUtc(), checkpoint.createdAt());
+    }
+
+    private SigninView toView(TransferSignin signin) {
+        return new SigninView(signin.transferId(), signin.evidenceKey(), signin.checkpointSeq(),
+                signin.sealNo(), signin.arrivedAtUtc(), signin.createdAt());
+    }
+
+    private AnomalyView toView(TransferAnomaly anomaly) {
+        return new AnomalyView(anomaly.transferId(), anomaly.evidenceKey(), anomaly.checkpointSeq(),
+                anomaly.reason(), anomaly.expectedSealNo(), anomaly.submittedSealNo(),
+                anomaly.arrivedAtUtc(), anomaly.deadlineUtc(), anomaly.createdAt());
     }
 }

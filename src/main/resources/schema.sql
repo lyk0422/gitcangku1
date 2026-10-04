@@ -20,8 +20,10 @@ CREATE TABLE IF NOT EXISTS transfer_record (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     evidence_key VARCHAR(64) NOT NULL COMMENT '关联证物业务键',
     from_custodian VARCHAR(64) NOT NULL COMMENT '发起交接时的保管人',
-    to_custodian VARCHAR(64) NOT NULL COMMENT '指定接收人，必须与发起人不同',
+    to_custodian VARCHAR(64) NOT NULL COMMENT '指定接收人（受监管交接中同时为运送人），必须与发起人不同',
     status VARCHAR(20) NOT NULL COMMENT '交接状态：PENDING 待接收 / ACCEPTED 已接受 / CANCELLED 已取消',
+    transfer_type VARCHAR(20) NOT NULL DEFAULT 'REGULAR' COMMENT '交接类型：REGULAR 普通 / REGULATED 受监管（含检查点路由）',
+    frozen TINYINT NOT NULL DEFAULT 0 COMMENT '是否冻结：1 表示在途签到出现超时或封条异常，禁止接收与继续签到，仅可取消',
     initiated_by VARCHAR(64) NOT NULL COMMENT '发起操作人（与 from_custodian 相同）',
     created_at DATETIME(6) NOT NULL COMMENT '交接发起时间，Asia/Shanghai',
     decided_at DATETIME(6) NULL COMMENT '接受或取消时间；NULL 表示仍待接收',
@@ -65,10 +67,50 @@ CREATE TABLE IF NOT EXISTS command_log (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     command_key VARCHAR(64) NOT NULL COMMENT '幂等命令键，全局唯一',
     actor_id VARCHAR(64) NOT NULL COMMENT '发起操作人',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN/REGULATED_TRANSFER_INITIATE/CHECKPOINT_SIGNIN',
     request_hash VARCHAR(64) NOT NULL COMMENT '请求参数规范化后的 SHA-256，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行的 HTTP 状态码',
     response_body TEXT NOT NULL COMMENT '首次执行的响应体 JSON，重放时原样返回',
     created_at DATETIME(6) NOT NULL COMMENT '首次执行时间，Asia/Shanghai',
     CONSTRAINT uk_command_key UNIQUE (command_key)
+);
+
+-- 受监管交接检查点：发起时声明 2 至 8 个有序检查点，创建后名单不可修改。
+CREATE TABLE IF NOT EXISTS transfer_checkpoint (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    transfer_id BIGINT NOT NULL COMMENT '所属交接记录 id（transfer_record.id）',
+    evidence_key VARCHAR(64) NOT NULL COMMENT '关联证物业务键（冗余，便于按证物查询）',
+    seq INT NOT NULL COMMENT '检查点序号，从 1 开始连续递增',
+    deadline_utc DATETIME(6) NOT NULL COMMENT '该点 UTC 截止时刻；到达时刻等于截止仍合法，晚于截止记异常',
+    created_at DATETIME(6) NOT NULL COMMENT '记录创建时间，Asia/Shanghai',
+    CONSTRAINT uk_checkpoint_transfer_seq UNIQUE (transfer_id, seq),
+    KEY idx_checkpoint_evidence (evidence_key)
+);
+
+-- 检查点签到记录：只追加、不可变；仅记录核对通过的正常签到，每个检查点至多一条。
+CREATE TABLE IF NOT EXISTS transfer_signin (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    transfer_id BIGINT NOT NULL COMMENT '所属交接记录 id（transfer_record.id）',
+    evidence_key VARCHAR(64) NOT NULL COMMENT '关联证物业务键（冗余，便于按证物查询）',
+    checkpoint_seq INT NOT NULL COMMENT '签到的检查点序号，必须按顺序逐个签到',
+    seal_no VARCHAR(64) NOT NULL COMMENT '签到时提交并核对一致的封条编号',
+    arrived_at_utc DATETIME(6) NOT NULL COMMENT '到达时刻（UTC），不得早于上一签到点的到达时刻',
+    created_at DATETIME(6) NOT NULL COMMENT '记录创建时间，Asia/Shanghai',
+    CONSTRAINT uk_signin_transfer_seq UNIQUE (transfer_id, checkpoint_seq),
+    KEY idx_signin_evidence (evidence_key)
+);
+
+-- 在途异常记录：只追加、不可变；记录后交接立即冻结，仅可由原保管人取消。
+CREATE TABLE IF NOT EXISTS transfer_anomaly (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    transfer_id BIGINT NOT NULL COMMENT '所属交接记录 id（transfer_record.id）',
+    evidence_key VARCHAR(64) NOT NULL COMMENT '关联证物业务键（冗余，便于按证物查询）',
+    checkpoint_seq INT NOT NULL COMMENT '发生异常时的检查点序号',
+    reason VARCHAR(20) NOT NULL COMMENT '异常原因：LATE 超过截止时刻 / SEAL_MISMATCH 封条不一致',
+    expected_seal_no VARCHAR(64) NOT NULL COMMENT '期望封条编号（证物当前封条）',
+    submitted_seal_no VARCHAR(64) NOT NULL COMMENT '签到提交的封条编号',
+    arrived_at_utc DATETIME(6) NOT NULL COMMENT '签到提交的到达时刻（UTC）',
+    deadline_utc DATETIME(6) NOT NULL COMMENT '该检查点 UTC 截止时刻',
+    created_at DATETIME(6) NOT NULL COMMENT '记录创建时间，Asia/Shanghai',
+    KEY idx_anomaly_evidence (evidence_key)
 );
