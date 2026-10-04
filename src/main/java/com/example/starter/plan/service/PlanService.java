@@ -27,12 +27,9 @@ import java.time.LocalDate;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Comparator;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.TreeSet;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
@@ -61,13 +58,19 @@ public class PlanService {
     private final PlanRepository planRepo;
     private final IdempotencyRepository idemRepo;
     private final ObjectMapper objectMapper;
+    private final SlotChecker slotChecker;
+    private final ConnectionService connectionService;
     private final TransactionTemplate tx;
 
     public PlanService(PlanRepository planRepo, IdempotencyRepository idemRepo,
-                       ObjectMapper objectMapper, PlatformTransactionManager txManager) {
+                       ObjectMapper objectMapper, SlotChecker slotChecker,
+                       ConnectionService connectionService,
+                       PlatformTransactionManager txManager) {
         this.planRepo = planRepo;
         this.idemRepo = idemRepo;
         this.objectMapper = objectMapper;
+        this.slotChecker = slotChecker;
+        this.connectionService = connectionService;
         this.tx = new TransactionTemplate(txManager);
     }
 
@@ -155,8 +158,8 @@ public class PlanService {
                 }
                 List<Occupancy> occupancies = planRepo.findOccupancies(plan.id());
                 List<Map<String, Object>> conflicts = new ArrayList<>();
-                conflicts.addAll(findTrainOverlaps(scheduleKey, occupancies));
-                conflicts.addAll(findSectionConflicts(plan, occupancies, List.of(plan.id())));
+                conflicts.addAll(slotChecker.findTrainOverlaps(scheduleKey, occupancies));
+                conflicts.addAll(slotChecker.findSectionConflicts(plan, occupancies, List.of(plan.id())));
                 if (!conflicts.isEmpty()) {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "存在时隙冲突，计划保持草稿", conflicts);
@@ -252,9 +255,9 @@ public class PlanService {
                 }
                 List<Occupancy> occupancies = planRepo.findOccupancies(newPlan.id());
                 List<Map<String, Object>> conflicts = new ArrayList<>();
-                conflicts.addAll(findTrainOverlaps(req.newScheduleKey(), occupancies));
+                conflicts.addAll(slotChecker.findTrainOverlaps(req.newScheduleKey(), occupancies));
                 // 仅排除旧计划与自身占用，第三方已发布计划照常参与冲突裁决
-                conflicts.addAll(findSectionConflicts(newPlan, occupancies,
+                conflicts.addAll(slotChecker.findSectionConflicts(newPlan, occupancies,
                         List.of(newPlan.id(), oldPlan.id())));
                 if (!conflicts.isEmpty()) {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
@@ -264,6 +267,9 @@ public class PlanService {
                 planRepo.updateStatus(oldPlan.id(), PlanStatus.CANCELLED, now);
                 planRepo.updateStatus(newPlan.id(), PlanStatus.PUBLISHED, now);
                 planRepo.insertRescheduleLink(oldPlan.id(), newPlan.id(), now);
+                // 同一事务内重算该计划作为前车/后车的全部直接接续，
+                // 保障不足的后车标记 CONNECTION_AT_RISK 并追加风险历史，不自动修改后车
+                connectionService.recomputeAfterReschedule(oldPlan, newPlan);
                 RescheduleResponse response = new RescheduleResponse(
                         loadPlan(oldScheduleKey), loadPlan(req.newScheduleKey()));
                 idemRepo.insert(OP_RESCHEDULE, req.requestKey(), hash, toJson(response), now);
@@ -383,73 +389,6 @@ public class PlanService {
                 throw badRequest("第 " + i + " 条占用不在运营日 " + opDate + "（Asia/Shanghai）内");
             }
         }
-    }
-
-    /**
-     * 本计划内同一列车的重叠占用检测（左闭右开，相邻合法）。
-     */
-    private List<Map<String, Object>> findTrainOverlaps(String scheduleKey, List<Occupancy> occupancies) {
-        List<Map<String, Object>> conflicts = new ArrayList<>();
-        Map<String, List<Occupancy>> byTrain = new LinkedHashMap<>();
-        for (Occupancy o : occupancies) {
-            byTrain.computeIfAbsent(o.trainNo(), k -> new ArrayList<>()).add(o);
-        }
-        byTrain.forEach((trainNo, list) -> {
-            List<Occupancy> sorted = list.stream()
-                    .sorted(Comparator.comparing(Occupancy::startUtc)).toList();
-            for (int i = 1; i < sorted.size(); i++) {
-                Occupancy prev = sorted.get(i - 1);
-                Occupancy cur = sorted.get(i);
-                if (cur.startUtc().isBefore(prev.endUtc())) {
-                    Map<String, Object> detail = new LinkedHashMap<>();
-                    detail.put("type", "TRAIN_OVERLAP");
-                    detail.put("scheduleKey", scheduleKey);
-                    detail.put("trainNo", trainNo);
-                    detail.put("sectionId", cur.sectionId());
-                    detail.put("startUtc", cur.startUtc().toString());
-                    detail.put("endUtc", cur.endUtc().toString());
-                    conflicts.add(detail);
-                }
-            }
-        });
-        return conflicts;
-    }
-
-    /**
-     * 与其他已发布计划在同日期、同区段上的重叠检测（左闭右开，相邻合法）。
-     *
-     * @param excludePlanIds 检测时排除的计划 id（发布为自身；改签为新旧两个计划）
-     */
-    private List<Map<String, Object>> findSectionConflicts(DayPlan plan, List<Occupancy> occupancies,
-                                                           List<Long> excludePlanIds) {
-        List<String> sectionIds = occupancies.stream()
-                .map(Occupancy::sectionId)
-                .collect(java.util.stream.Collectors.toCollection(TreeSet::new))
-                .stream().toList();
-        List<PublishedSlot> published = planRepo.findPublishedSlots(plan.opDate(), sectionIds,
-                excludePlanIds);
-        List<Map<String, Object>> conflicts = new ArrayList<>();
-        for (Occupancy o : occupancies) {
-            for (PublishedSlot slot : published) {
-                if (!o.sectionId().equals(slot.sectionId())) {
-                    continue;
-                }
-                boolean overlap = o.startUtc().isBefore(slot.endUtc())
-                        && slot.startUtc().isBefore(o.endUtc());
-                if (overlap) {
-                    Map<String, Object> detail = new LinkedHashMap<>();
-                    detail.put("type", "SECTION_CONFLICT");
-                    detail.put("sectionId", o.sectionId());
-                    detail.put("scheduleKey", plan.scheduleKey());
-                    detail.put("conflictingScheduleKey", slot.scheduleKey());
-                    detail.put("trainNo", o.trainNo());
-                    detail.put("startUtc", o.startUtc().toString());
-                    detail.put("endUtc", o.endUtc().toString());
-                    conflicts.add(detail);
-                }
-            }
-        }
-        return conflicts;
     }
 
     /**
