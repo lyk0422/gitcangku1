@@ -8,9 +8,11 @@ import com.example.starter.firmware.api.ReleaseHistoryResponse;
 import com.example.starter.firmware.api.ReleaseView;
 import com.example.starter.firmware.api.ResumeRecordView;
 import com.example.starter.firmware.api.ResumeReleaseRequest;
+import com.example.starter.firmware.domain.ReleaseKind;
 import com.example.starter.firmware.domain.ReleaseOrder;
 import com.example.starter.firmware.domain.ReleaseStatus;
 import com.example.starter.firmware.error.ApiException;
+import com.example.starter.firmware.repo.DualBootTaskRepository;
 import com.example.starter.firmware.repo.PauseRecordRepository;
 import com.example.starter.firmware.repo.ReleaseRepository;
 import com.example.starter.firmware.repo.ResumeRecordRepository;
@@ -24,23 +26,27 @@ import java.time.Instant;
 /**
  * 发布单生命周期：创建（版本从1开始）、扩量（版本校验+只增不减）、失败率自动暂停、
  * 人工恢复（版本加一并开启新监控轮次）、取消（未终结任务转 CANCELLED）。
+ * 双分区发布与普通发布共用发布单与监控统计，仅任务状态机不同。
  */
 @Service
 public class ReleaseService {
 
     private final ReleaseRepository releaseRepository;
     private final TaskRepository taskRepository;
+    private final DualBootTaskRepository dualBootTaskRepository;
     private final PauseRecordRepository pauseRecordRepository;
     private final ResumeRecordRepository resumeRecordRepository;
     private final IdempotencyService idempotency;
     private final Clock clock;
 
     public ReleaseService(ReleaseRepository releaseRepository, TaskRepository taskRepository,
+                          DualBootTaskRepository dualBootTaskRepository,
                           PauseRecordRepository pauseRecordRepository,
                           ResumeRecordRepository resumeRecordRepository,
                           IdempotencyService idempotency, Clock clock) {
         this.releaseRepository = releaseRepository;
         this.taskRepository = taskRepository;
+        this.dualBootTaskRepository = dualBootTaskRepository;
         this.pauseRecordRepository = pauseRecordRepository;
         this.resumeRecordRepository = resumeRecordRepository;
         this.idempotency = idempotency;
@@ -48,19 +54,29 @@ public class ReleaseService {
     }
 
     public ReleaseView create(CreateReleaseRequest request) {
+        return createWithKind(request, ReleaseKind.NORMAL, "release.create");
+    }
+
+    /**
+     * 创建双分区试启动发布：仅本题新建发布使用 PENDING/TRIAL/COMMITTED/ROLLED_BACK 任务状态机。
+     */
+    public ReleaseView createDualBoot(CreateReleaseRequest request) {
+        return createWithKind(request, ReleaseKind.DUAL_BOOT, "dualBoot.release.create");
+    }
+
+    private ReleaseView createWithKind(CreateReleaseRequest request, ReleaseKind kind, String api) {
         if (request.fromVersion().equals(request.toVersion())) {
             throw ApiException.badRequest("SAME_VERSION", "目标版本必须与来源版本不同");
         }
         int sampleFloor = request.effectiveSampleFloor();
         int threshold = request.effectiveFailureThresholdPercent();
-        String fingerprint = String.join("|", "release.create", request.model(), request.fromVersion(),
-                request.toVersion(), String.valueOf(request.ratio()), String.valueOf(sampleFloor),
-                String.valueOf(threshold));
-        return idempotency.execute(request.requestId(), "release.create", fingerprint, () -> {
+        String fingerprint = Fingerprint.of(api, request.model(), request.fromVersion(),
+                request.toVersion(), request.ratio(), sampleFloor, threshold, kind.name());
+        return idempotency.execute(request.requestId(), api, fingerprint, () -> {
             long id;
             try {
-                id = releaseRepository.insert(request.model(), request.fromVersion(), request.toVersion(),
-                        request.ratio(), sampleFloor, threshold);
+                id = releaseRepository.insert(kind, request.model(), request.fromVersion(),
+                        request.toVersion(), request.ratio(), sampleFloor, threshold);
             } catch (DuplicateKeyException e) {
                 throw ApiException.conflict("ACTIVE_RELEASE_EXISTS", "型号已存在未终结发布单: " + request.model());
             }
@@ -119,6 +135,9 @@ public class ReleaseService {
         }, ReleaseView.class);
     }
 
+    /**
+     * 取消：未终结的普通任务与双分区任务一并转 CANCELLED。
+     */
     public ReleaseView cancel(long releaseId, String requestId) {
         String fingerprint = String.join("|", "release.cancel", String.valueOf(releaseId));
         return idempotency.execute(requestId, "release.cancel", fingerprint, () -> {
@@ -127,9 +146,32 @@ public class ReleaseService {
             if (order.status() == ReleaseStatus.ACTIVE || order.status() == ReleaseStatus.PAUSED) {
                 releaseRepository.cancel(releaseId);
                 taskRepository.cancelPendingByRelease(releaseId);
+                dualBootTaskRepository.cancelOpenByRelease(releaseId);
             }
             return ReleaseView.of(findOrder(releaseId));
         }, ReleaseView.class);
+    }
+
+    /**
+     * 样本数达到下限且 FAILED×100 >= 样本数×阈值 时，将仍为 ACTIVE 的发布单原子转为 PAUSED。
+     * 调用方持有发布单行锁，并发回执串行通过，每轮至多生成一条暂停记录。
+     * 普通任务与双分区任务（COMMITTED 计成功、ROLLED_BACK 计失败）共用本判定。
+     */
+    public void pauseIfThresholdReached(ReleaseOrder order, long triggerTaskId) {
+        if (order.status() != ReleaseStatus.ACTIVE) {
+            return;
+        }
+        int samples = order.roundSuccess() + order.roundFailed();
+        if (samples < order.sampleFloor()) {
+            return;
+        }
+        if ((long) order.roundFailed() * 100 < (long) samples * order.failureThresholdPercent()) {
+            return;
+        }
+        if (releaseRepository.pauseIfActive(order.id()) == 1) {
+            pauseRecordRepository.insert(order.id(), order.monitorRound(), triggerTaskId,
+                    order.roundSuccess(), order.roundFailed(), Instant.now(clock).toString());
+        }
     }
 
     /**

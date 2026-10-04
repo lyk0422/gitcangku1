@@ -28,12 +28,12 @@ public class DeviceService {
         return idempotency.execute(request.requestId(), "device.register", fingerprint, () -> {
             try {
                 deviceRepository.insert(new Device(request.deviceId(), request.model(),
-                        request.currentVersion(), request.bucketNo()));
+                        request.currentVersion(), request.bucketNo(), request.effectiveActivePartition()));
             } catch (DuplicateKeyException e) {
                 throw ApiException.conflict("DEVICE_EXISTS", "设备已登记: " + request.deviceId());
             }
-            return new DeviceView(request.deviceId(), request.model(), request.currentVersion(),
-                    request.bucketNo());
+            return DeviceView.of(new Device(request.deviceId(), request.model(), request.currentVersion(),
+                    request.bucketNo(), request.effectiveActivePartition()));
         }, DeviceView.class);
     }
 
