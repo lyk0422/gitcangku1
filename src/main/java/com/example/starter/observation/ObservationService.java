@@ -7,7 +7,6 @@ import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -31,16 +30,19 @@ import java.util.Set;
  *
  * <p>合并规则（按字段比较基线 base、当前 current、候选 candidate）：
  * 候选未改（等于基线）保留当前；当前未改接受候选；两边改为相同值也接受；
- * 否则整次 409，不写入任何部分结果。读数按数值比较，其余字段按原文比较。
+ * 否则整批 409，不写入任何部分结果。读数按（限定符+数值）不可拆分的一组比较：
+ * 数值相等且限定符相同才是等价；一侧改限定符、另一侧改数值且两组不同时返回 422，
+ * 不拼成无人提交过的组合。其余字段按原文比较。
  *
  * <p>显式冲突解决（RESOLVE）在同一套占位与行锁机制内执行：事务内重读基线与最新当前版本重算冲突，
  * 人工选择必须恰好覆盖重算后的冲突字段；成功后原子写入新观测版本（内容无变化则不加版本）、
  * 不可变 conflict_resolution 记录与 request_log 响应。resolutionId 全局唯一，同参重放、改参 409。
+ *
+ * <p>幂等身份为结构化 JSON（操作、操作者、资源及全部参数和期望版本）的 SHA-256，
+ * 不按分隔符拼接，避免分隔符碰撞。
  */
 @Service
 public class ObservationService {
-
-    private static final String SEPARATOR = "\u0001";
 
     /**
      * 三个可编辑字段的固定顺序：冲突重算、选择校验与指纹均以此顺序处理，保证结果稳定。
@@ -70,8 +72,13 @@ public class ObservationService {
      */
     @Transactional
     public WriteOutcome create(CreateObservationRequest request) {
-        String fingerprint = fingerprint("CREATE", request.observationId(), request.location(),
-                request.reading(), request.note());
+        String qualifier = requireQualifier(request.readingQualifier());
+        String fingerprint = fingerprint("CREATE", params(
+                "observationId", request.observationId(),
+                "location", request.location(),
+                "reading", request.reading(),
+                "readingQualifier", qualifier,
+                "note", request.note()));
         WriteOutcome replayed = checkReplay(request.requestId(), fingerprint);
         if (replayed != null) {
             return replayed;
@@ -85,7 +92,7 @@ public class ObservationService {
             throw ApiException.conflict("observation already exists: " + request.observationId(), null);
         }
         ObservationSnapshot snapshot = new ObservationSnapshot(request.observationId(), 1,
-                request.location(), request.reading(), request.note(), false);
+                request.location(), request.reading(), qualifier, request.note(), false);
         try {
             observationRepository.insertCurrent(snapshot);
         } catch (DuplicateKeyException e) {
@@ -98,11 +105,18 @@ public class ObservationService {
 
     /**
      * 离线提交：基于 baseVersion 的三方合并。合并结果与当前完全相同则不加版本，否则版本加一。
+     * 读数按（限定符+数值）整组比较；限定符与数值被拆分变更且两组不同时返回 422。
      */
     @Transactional
     public WriteOutcome merge(String observationId, MergeObservationRequest request) {
-        String fingerprint = fingerprint("MERGE", observationId, String.valueOf(request.baseVersion()),
-                request.location(), request.reading(), request.note());
+        String qualifier = requireQualifier(request.readingQualifier());
+        String fingerprint = fingerprint("MERGE", params(
+                "observationId", observationId,
+                "baseVersion", String.valueOf(request.baseVersion()),
+                "location", request.location(),
+                "reading", request.reading(),
+                "readingQualifier", qualifier,
+                "note", request.note()));
         WriteOutcome replayed = checkReplay(request.requestId(), fingerprint);
         if (replayed != null) {
             return replayed;
@@ -124,32 +138,35 @@ public class ObservationService {
         List<String> conflictFields = new ArrayList<>();
         String mergedLocation = mergeField("location", base.location(), current.location(),
                 request.location(), conflictFields);
-        String mergedReading = mergeReadingField(base.reading(), current.reading(),
-                request.reading(), conflictFields);
+        ReadingGroup mergedReading = mergeReadingGroup(readingGroupOf(base), readingGroupOf(current),
+                new ReadingGroup(qualifier, request.reading()), conflictFields, current.version());
         String mergedNote = mergeField("note", base.note(), current.note(), request.note(), conflictFields);
         if (!conflictFields.isEmpty()) {
             throw ApiException.mergeConflict(conflictFields, current.version());
         }
 
         ObservationSnapshot merged = new ObservationSnapshot(observationId, current.version(),
-                mergedLocation, mergedReading, mergedNote, false);
+                mergedLocation, mergedReading.value(), mergedReading.qualifier(), mergedNote, false);
         if (sameContent(merged, current)) {
             // 合并结果与当前完全相同：返回当前版本，不加版本
             return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(current));
         }
         ObservationSnapshot next = new ObservationSnapshot(observationId, current.version() + 1,
-                mergedLocation, mergedReading, mergedNote, false);
+                mergedLocation, mergedReading.value(), mergedReading.qualifier(), mergedNote, false);
         observationRepository.updateCurrent(next);
         observationRepository.insertVersion(next);
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(next));
     }
 
     /**
-     * 删除观测记录：expectedVersion 匹配当前版本时生成新版本墓碑；已删除记录返回 410。
+     * 删除观测记录：expectedVersion 匹配当前版本时生成新版本墓碑（不含读数等任何业务字段）；
+     * 已删除记录返回 410。
      */
     @Transactional
     public WriteOutcome delete(String observationId, DeleteObservationRequest request) {
-        String fingerprint = fingerprint("DELETE", observationId, String.valueOf(request.expectedVersion()));
+        String fingerprint = fingerprint("DELETE", params(
+                "observationId", observationId,
+                "expectedVersion", String.valueOf(request.expectedVersion())));
         WriteOutcome replayed = checkReplay(request.requestId(), fingerprint);
         if (replayed != null) {
             return replayed;
@@ -168,14 +185,13 @@ public class ObservationService {
             throw ApiException.conflict("expectedVersion mismatch", current.version());
         }
         ObservationSnapshot tombstone = new ObservationSnapshot(observationId, current.version() + 1,
-                null, null, null, true);
+                null, null, null, null, true);
         observationRepository.markDeleted(observationId, tombstone.version());
         observationRepository.insertVersion(tombstone);
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(tombstone));
     }
-
     /**
-     * 查询当前内容；墓碑只返回删除状态和版本。
+     * 查询当前内容（含读数限定符与读数值）；墓碑只返回删除状态和版本。
      */
     @Transactional(readOnly = true)
     public ObservationResponse getCurrent(String observationId) {
@@ -186,15 +202,25 @@ public class ObservationService {
 
     /**
      * 显式冲突解决：事务内重读基线与最新当前版本并按原三方规则重算冲突，不信任客户端上次看到的冲突列表。
+     * 读数限定符与数值作为不可拆分的一组：人工选择必须选择完整一侧，或以候选形式提交完整新组。
      * 选择恰好覆盖本次仍冲突字段时生成新版本（内容无变化则不加版本）并原子写入不可变解决记录。
      */
     @Transactional
     public ResolveOutcome resolveConflict(String observationId, ResolveConflictRequest request) {
+        String qualifier = requireQualifier(request.readingQualifier());
         Map<String, FieldSelection> selections = parseSelections(request.selections());
         String normalizedSelections = writeSelectionsJson(selections);
-        String fingerprint = fingerprint("RESOLVE", observationId, request.resolutionId(),
-                String.valueOf(request.baseVersion()), String.valueOf(request.expectedCurrentVersion()),
-                request.location(), request.reading(), request.note(), normalizedSelections, request.operator());
+        String fingerprint = fingerprint("RESOLVE", params(
+                "observationId", observationId,
+                "resolutionId", request.resolutionId(),
+                "baseVersion", String.valueOf(request.baseVersion()),
+                "expectedCurrentVersion", String.valueOf(request.expectedCurrentVersion()),
+                "location", request.location(),
+                "reading", request.reading(),
+                "readingQualifier", qualifier,
+                "note", request.note(),
+                "selections", normalizedSelections,
+                "operator", request.operator()));
         ResolveOutcome replayed = checkResolveReplay(request.requestId(), fingerprint);
         if (replayed != null) {
             return replayed;
@@ -211,7 +237,7 @@ public class ObservationService {
         // 改参或跨记录复用一律 409。
         ResolutionRecord existing = resolutionRepository.findByResolutionId(request.resolutionId()).orElse(null);
         if (existing != null) {
-            if (!sameResolutionParams(existing, observationId, request, normalizedSelections)) {
+            if (!sameResolutionParams(existing, observationId, request, qualifier, normalizedSelections)) {
                 throw ApiException.conflict(
                         "resolutionId reused with different parameters: " + request.resolutionId(),
                         current.version());
@@ -230,35 +256,39 @@ public class ObservationService {
                 .orElseThrow(() -> ApiException.notFound(
                         "base version not found: " + observationId + "@" + request.baseVersion()));
 
+        ReadingGroup baseReading = readingGroupOf(base);
+        ReadingGroup currentReading = readingGroupOf(current);
+        ReadingGroup candidateReading = new ReadingGroup(qualifier, request.reading());
+
         List<String> conflictFields = new ArrayList<>();
-        boolean locationConflict = fieldConflicts(base.location(), current.location(), request.location(), false);
+        boolean locationConflict = fieldConflicts(base.location(), current.location(), request.location());
         if (locationConflict) {
             conflictFields.add("location");
         }
-        boolean readingConflict = fieldConflicts(base.reading(), current.reading(), request.reading(), true);
+        boolean readingConflict = readingGroupConflicts(baseReading, currentReading, candidateReading);
         if (readingConflict) {
             conflictFields.add("reading");
         }
-        boolean noteConflict = fieldConflicts(base.note(), current.note(), request.note(), false);
+        boolean noteConflict = fieldConflicts(base.note(), current.note(), request.note());
         if (noteConflict) {
             conflictFields.add("note");
         }
         validateSelectionCoverage(selections.keySet(), conflictFields);
 
         String resolvedLocation = resolveFieldValue(locationConflict, selections.get("location"),
-                base.location(), current.location(), request.location(), false);
-        String resolvedReading = resolveFieldValue(readingConflict, selections.get("reading"),
-                base.reading(), current.reading(), request.reading(), true);
+                base.location(), current.location(), request.location());
+        ReadingGroup resolvedReading = resolveReadingGroup(readingConflict, selections.get("reading"),
+                baseReading, currentReading, candidateReading);
         String resolvedNote = resolveFieldValue(noteConflict, selections.get("note"),
-                base.note(), current.note(), request.note(), false);
+                base.note(), current.note(), request.note());
 
         ObservationSnapshot merged = new ObservationSnapshot(observationId, current.version(),
-                resolvedLocation, resolvedReading, resolvedNote, false);
+                resolvedLocation, resolvedReading.value(), resolvedReading.qualifier(), resolvedNote, false);
         boolean contentChanged = !sameContent(merged, current);
         int newVersion = contentChanged ? current.version() + 1 : current.version();
         if (contentChanged) {
             ObservationSnapshot next = new ObservationSnapshot(observationId, newVersion,
-                    resolvedLocation, resolvedReading, resolvedNote, false);
+                    resolvedLocation, resolvedReading.value(), resolvedReading.qualifier(), resolvedNote, false);
             observationRepository.updateCurrent(next);
             observationRepository.insertVersion(next);
         }
@@ -266,7 +296,7 @@ public class ObservationService {
         ResolutionRecord record = new ResolutionRecord(
                 request.resolutionId(), observationId, request.requestId(),
                 request.baseVersion(), current.version(), newVersion,
-                request.location(), request.reading(), request.note(),
+                request.location(), request.reading(), qualifier, request.note(),
                 List.copyOf(conflictFields), normalizedSelections, request.operator(),
                 Instant.now(clock), contentChanged);
         try {
@@ -276,7 +306,7 @@ public class ObservationService {
             ResolutionRecord winner = resolutionRepository.findByResolutionId(request.resolutionId())
                     .orElseThrow(() -> ApiException.conflict(
                             "resolutionId conflict: " + request.resolutionId(), current.version()));
-            if (!sameResolutionParams(winner, observationId, request, normalizedSelections)) {
+            if (!sameResolutionParams(winner, observationId, request, qualifier, normalizedSelections)) {
                 throw ApiException.conflict(
                         "resolutionId reused with different parameters: " + request.resolutionId(),
                         current.version());
@@ -285,7 +315,8 @@ public class ObservationService {
         }
 
         ObservationSnapshot pointed = contentChanged
-                ? new ObservationSnapshot(observationId, newVersion, resolvedLocation, resolvedReading, resolvedNote, false)
+                ? new ObservationSnapshot(observationId, newVersion, resolvedLocation,
+                        resolvedReading.value(), resolvedReading.qualifier(), resolvedNote, false)
                 : current;
         return completeResolve(request.requestId(), HttpStatus.OK,
                 ResolutionResponse.of(record, pointed, objectMapper));
@@ -321,7 +352,7 @@ public class ObservationService {
     }
 
     /**
-     * 查询指定历史版本；墓碑版本只返回删除状态和版本。
+     * 查询指定历史版本（含读数限定符与读数值）；墓碑版本只返回删除状态和版本。
      */
     @Transactional(readOnly = true)
     public ObservationResponse getVersion(String observationId, int version) {
@@ -330,7 +361,6 @@ public class ObservationService {
                         "version not found: " + observationId + "@" + version));
         return ObservationResponse.of(snapshot);
     }
-
     /**
      * 普通字段三方合并：候选未改保留当前；当前未改接受候选；两边改为相同值接受；否则记录冲突。
      */
@@ -347,34 +377,69 @@ public class ObservationService {
     }
 
     /**
-     * 读数字段三方合并：按数值比较（BigDecimal），其余规则与普通字段一致。
+     * 读数组三方合并：限定符与数值作为不可拆分的一组比较。
+     * 一侧仅改限定符、另一侧仅改数值且两组不同时返回 422，不拼成无人提交过的组合；
+     * 其余整组不一致按普通字段冲突处理（409，字段名 reading）。
      */
-    private String mergeReadingField(String base, String current, String candidate,
-                                     List<String> conflictFields) {
-        if (readingEquals(candidate, base)) {
+    private ReadingGroup mergeReadingGroup(ReadingGroup base, ReadingGroup current, ReadingGroup candidate,
+                                           List<String> conflictFields, int currentVersion) {
+        if (candidate.sameAs(base)) {
             return current;
         }
-        if (readingEquals(current, base) || readingEquals(candidate, current)) {
+        if (current.sameAs(base) || candidate.sameAs(current)) {
             return candidate;
+        }
+        if (isSplitQualifierValueChange(base, current, candidate)) {
+            throw ApiException.readingGroupConflict(currentVersion);
         }
         conflictFields.add("reading");
         return current;
     }
 
     /**
-     * 判断合并结果与当前版本内容是否完全相同（读数按数值，其余按原文）。
+     * 拆分变更识别：一侧仅改限定符（数值与基线相同）、另一侧仅改数值（限定符与基线相同）。
+     */
+    private boolean isSplitQualifierValueChange(ReadingGroup base, ReadingGroup current, ReadingGroup candidate) {
+        return splitsQualifierOnly(base, current) && splitsValueOnly(base, candidate)
+                || splitsQualifierOnly(base, candidate) && splitsValueOnly(base, current);
+    }
+
+    private boolean splitsQualifierOnly(ReadingGroup base, ReadingGroup side) {
+        return !side.qualifier().equals(base.qualifier())
+                && ReadingQualifiers.valueEquals(side.value(), base.value());
+    }
+
+    private boolean splitsValueOnly(ReadingGroup base, ReadingGroup side) {
+        return side.qualifier().equals(base.qualifier())
+                && !ReadingQualifiers.valueEquals(side.value(), base.value());
+    }
+
+    /**
+     * 判断合并结果与当前版本内容是否完全相同（读数按整组数值比较，其余按原文），
+     * 不因浮点或字符串格式差异制造版本变化。
      */
     private boolean sameContent(ObservationSnapshot merged, ObservationSnapshot current) {
         return Objects.equals(merged.location(), current.location())
                 && Objects.equals(merged.note(), current.note())
-                && readingEquals(merged.reading(), current.reading());
+                && readingGroupOf(merged).sameAs(readingGroupOf(current));
     }
 
-    private boolean readingEquals(String left, String right) {
-        if (left == null || right == null) {
-            return Objects.equals(left, right);
+    /**
+     * 由快照构造读数组；墓碑版本读数为 null，整组为 null 组。
+     */
+    private ReadingGroup readingGroupOf(ObservationSnapshot snapshot) {
+        return new ReadingGroup(snapshot.readingQualifier(), snapshot.reading());
+    }
+
+    /**
+     * 规范化并校验请求中的读数限定符：缺省为 EXACT；非法值返回 400。
+     */
+    private String requireQualifier(String raw) {
+        String qualifier = ReadingQualifiers.normalize(raw);
+        if (qualifier == null) {
+            throw ApiException.badRequest("readingQualifier must be one of EXACT/LT/GT: " + raw);
         }
-        return new BigDecimal(left).compareTo(new BigDecimal(right)) == 0;
+        return qualifier;
     }
 
     /**
@@ -418,14 +483,31 @@ public class ObservationService {
         return new WriteOutcome(status.value(), body);
     }
 
-    private String fingerprint(String operation, String... parts) {
-        StringBuilder raw = new StringBuilder(operation);
-        for (String part : parts) {
-            raw.append(SEPARATOR).append(part == null ? "<null>" : part);
+    /**
+     * 构造有序参数映射（键固定顺序），供结构化指纹使用；null 值显式保留，避免参数错位。
+     */
+    private Map<String, String> params(String... keyValues) {
+        Map<String, String> params = new LinkedHashMap<>();
+        for (int i = 0; i < keyValues.length; i += 2) {
+            params.put(keyValues[i], keyValues[i + 1]);
         }
+        return params;
+    }
+
+    /**
+     * 结构化幂等指纹：操作名与全部参数（含操作者、资源、期望版本）序列化为 JSON 后取 SHA-256，
+     * 不按分隔符拼接，避免分隔符碰撞。
+     */
+    private String fingerprint(String operation, Map<String, String> params) {
+        Map<String, String> identity = new LinkedHashMap<>();
+        identity.put("operation", operation);
+        identity.putAll(params);
         try {
+            String json = objectMapper.writeValueAsString(identity);
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            return HexFormat.of().formatHex(digest.digest(raw.toString().getBytes(StandardCharsets.UTF_8)));
+            return HexFormat.of().formatHex(digest.digest(json.getBytes(StandardCharsets.UTF_8)));
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("failed to serialize request identity", e);
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException("SHA-256 not available", e);
         }
@@ -446,7 +528,6 @@ public class ObservationService {
             throw new IllegalStateException("failed to deserialize stored response", e);
         }
     }
-
     // ---------- 冲突解决辅助逻辑 ----------
 
     /**
@@ -491,20 +572,23 @@ public class ObservationService {
     }
 
     /**
-     * 按原三方规则判断单字段是否冲突：候选未改或任一侧未改或两边改为相同值均不冲突，否则冲突。
+     * 按原三方规则判断普通字段是否冲突：候选未改或任一侧未改或两边改为相同值均不冲突，否则冲突。
      */
-    private boolean fieldConflicts(String base, String current, String candidate, boolean numeric) {
-        if (valueEquals(candidate, base, numeric)) {
+    private boolean fieldConflicts(String base, String current, String candidate) {
+        if (Objects.equals(candidate, base)) {
             return false;
         }
-        if (valueEquals(current, base, numeric) || valueEquals(candidate, current, numeric)) {
-            return false;
-        }
-        return true;
+        return !Objects.equals(current, base) && !Objects.equals(candidate, current);
     }
 
-    private boolean valueEquals(String left, String right, boolean numeric) {
-        return numeric ? readingEquals(left, right) : Objects.equals(left, right);
+    /**
+     * 按原三方规则判断读数组是否冲突：限定符与数值作为不可拆分的一组整体比较。
+     */
+    private boolean readingGroupConflicts(ReadingGroup base, ReadingGroup current, ReadingGroup candidate) {
+        if (candidate.sameAs(base)) {
+            return false;
+        }
+        return !current.sameAs(base) && !candidate.sameAs(current);
     }
 
     /**
@@ -532,14 +616,29 @@ public class ObservationService {
     }
 
     /**
-     * 计算单字段解决结果：冲突字段按人工选择取当前或候选；非冲突字段继续按原三方规则自动合并。
+     * 计算普通字段解决结果：冲突字段按人工选择取当前或候选；非冲突字段继续按原三方规则自动合并。
      */
     private String resolveFieldValue(boolean conflict, FieldSelection selection,
-                                     String base, String current, String candidate, boolean numeric) {
+                                     String base, String current, String candidate) {
         if (conflict) {
             return selection == FieldSelection.CANDIDATE ? candidate : current;
         }
-        if (valueEquals(candidate, base, numeric)) {
+        if (Objects.equals(candidate, base)) {
+            return current;
+        }
+        return candidate;
+    }
+
+    /**
+     * 计算读数组解决结果：冲突时按人工选择取完整一侧（限定符与数值整组），
+     * 不拼接两侧；非冲突时按原三方规则自动合并整组。
+     */
+    private ReadingGroup resolveReadingGroup(boolean conflict, FieldSelection selection,
+                                             ReadingGroup base, ReadingGroup current, ReadingGroup candidate) {
+        if (conflict) {
+            return selection == FieldSelection.CANDIDATE ? candidate : current;
+        }
+        if (candidate.sameAs(base)) {
             return current;
         }
         return candidate;
@@ -599,15 +698,18 @@ public class ObservationService {
 
     /**
      * 判断本次请求参数与已存在解决记录是否完全一致（用于 resolutionId 同参重放）。
-     * expectedCurrentVersion 必须等于记录中的解决前当前版本：任何参数（含乐观锁版本）变化均按改参 409 处理。
+     * expectedCurrentVersion 必须等于记录中的解决前当前版本：任何参数（含乐观锁版本与读数限定符）
+     * 变化均按改参 409 处理。
      */
     private boolean sameResolutionParams(ResolutionRecord record, String observationId,
-                                         ResolveConflictRequest request, String normalizedSelections) {
+                                         ResolveConflictRequest request, String qualifier,
+                                         String normalizedSelections) {
         return Objects.equals(record.observationId(), observationId)
                 && record.baseVersion() == request.baseVersion()
                 && record.previousVersion() == request.expectedCurrentVersion()
                 && Objects.equals(record.candidateLocation(), request.location())
                 && Objects.equals(record.candidateReading(), request.reading())
+                && Objects.equals(ReadingQualifiers.orDefault(record.candidateReadingQualifier()), qualifier)
                 && Objects.equals(record.candidateNote(), request.note())
                 && Objects.equals(record.fieldSelections(), normalizedSelections)
                 && Objects.equals(record.operator(), request.operator());
@@ -622,6 +724,17 @@ public class ObservationService {
                 .orElseThrow(() -> new IllegalStateException(
                         "pointed version missing for resolution: " + record.resolutionId()));
         return ResolutionResponse.of(record, pointed, objectMapper);
+    }
+
+    /**
+     * 读数不可拆分的一组：限定符与数值。等价判定为数值相等（按 BigDecimal）且限定符相同，
+     * 与字符串书写格式无关（5.0 与 5.000 等价，EXACT 5 与 LT 5 不同）。
+     */
+    private record ReadingGroup(String qualifier, String value) {
+
+        private boolean sameAs(ReadingGroup other) {
+            return ReadingQualifiers.groupEquals(qualifier, value, other.qualifier, other.value);
+        }
     }
 
     /**
