@@ -7,5 +7,7 @@ public enum Role {
     /** 协调员：实验管理、登记、退组、揭盲申请。 */
     COORDINATOR,
     /** 审阅员：仅可普通查询、批准揭盲申请。 */
-    REVIEWER
+    REVIEWER,
+    /** 分析人：仅可查询已锁定的匿名配对（配对码与两份冻结摘要）。 */
+    ANALYST
 }

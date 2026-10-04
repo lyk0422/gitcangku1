@@ -4,7 +4,7 @@ package com.example.starter.blind;
  * 操作者身份，来源于受信任的本地测试头 X-Actor-Id / X-Role。
  *
  * @param actorId 操作者编号
- * @param role    角色（COORDINATOR / REVIEWER）
+ * @param role    角色（COORDINATOR / REVIEWER / ANALYST）
  */
 public record Actor(String actorId, Role role) {
 
@@ -14,5 +14,9 @@ public record Actor(String actorId, Role role) {
 
     public boolean isReviewer() {
         return role == Role.REVIEWER;
+    }
+
+    public boolean isAnalyst() {
+        return role == Role.ANALYST;
     }
 }

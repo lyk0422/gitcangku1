@@ -112,3 +112,71 @@ COMMENT ON COLUMN idempotent_request.fingerprint IS '请求参数指纹（含路
 COMMENT ON COLUMN idempotent_request.response_status IS '首次成功响应的 HTTP 状态码，重放时原样返回';
 COMMENT ON COLUMN idempotent_request.response_body IS '首次成功响应体 JSON，重放时原样返回';
 COMMENT ON COLUMN idempotent_request.created_at IS '记录时间，Unix 毫秒，UTC';
+
+-- 盲态样本链：同一参与者 PRE/POST 合成样本与锁定配对；只保存摘要与采集 UTC 时刻，不保存真实样本
+CREATE TABLE IF NOT EXISTS sample_record (
+    id              BIGINT       NOT NULL AUTO_INCREMENT,
+    experiment_id   VARCHAR(64)  NOT NULL,
+    participant_id  VARCHAR(64)  NOT NULL,
+    phase           VARCHAR(4)   NOT NULL,
+    sample_code     VARCHAR(64)  NOT NULL,
+    digest          VARCHAR(128) NOT NULL,
+    collected_at    BIGINT       NOT NULL,
+    chain_version   INT          NOT NULL,
+    supersedes_id   BIGINT,
+    status          VARCHAR(16)  NOT NULL,
+    active_slot     VARCHAR(160),
+    submitted_actor VARCHAR(64)  NOT NULL,
+    created_at      BIGINT       NOT NULL,
+    CONSTRAINT pk_sample_record PRIMARY KEY (id),
+    CONSTRAINT uq_sample_code UNIQUE (sample_code),
+    CONSTRAINT uq_sample_active UNIQUE (active_slot),
+    CONSTRAINT ck_sample_phase CHECK (phase IN ('PRE', 'POST')),
+    CONSTRAINT ck_sample_status CHECK (status IN ('ACTIVE', 'SUPERSEDED')),
+    CONSTRAINT ck_sample_chain_version CHECK (chain_version >= 1)
+);
+COMMENT ON TABLE  sample_record IS '盲态样本记录表；只保存摘要与采集 UTC 时刻，不保存真实样本；更正追加替代记录并引用最近有效样本';
+COMMENT ON COLUMN sample_record.id IS '样本记录自增主键';
+COMMENT ON COLUMN sample_record.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN sample_record.participant_id IS '合成参与者编号，非真实医疗数据';
+COMMENT ON COLUMN sample_record.phase IS '样本阶段：PRE=处理前；POST=处理后；同一编号不得跨阶段复用';
+COMMENT ON COLUMN sample_record.sample_code IS '样本编号，全实验唯一，不得同时用于不同参与者或不同阶段';
+COMMENT ON COLUMN sample_record.digest IS '合成样本摘要，非真实样本内容';
+COMMENT ON COLUMN sample_record.collected_at IS '采集时刻，Unix 毫秒，UTC；锁定时要求 POST 晚于 PRE';
+COMMENT ON COLUMN sample_record.chain_version IS '链内版本号：首次登记为 1，每次更正加 1';
+COMMENT ON COLUMN sample_record.supersedes_id IS '被替代的最近有效样本记录主键；首次登记为 NULL';
+COMMENT ON COLUMN sample_record.status IS '记录状态：ACTIVE=当前有效；SUPERSEDED=已被更正替代';
+COMMENT ON COLUMN sample_record.active_slot IS '有效占位键：ACTIVE 时为 实验/参与者/阶段 的长度前缀编码，SUPERSEDED 置 NULL；唯一索引保证同一参与者同一阶段至多一条有效记录';
+COMMENT ON COLUMN sample_record.submitted_actor IS '提交该记录的操作者编号（X-Actor-Id）';
+COMMENT ON COLUMN sample_record.created_at IS '记录创建时间，Unix 毫秒，UTC';
+
+CREATE TABLE IF NOT EXISTS sample_pair (
+    id                BIGINT       NOT NULL AUTO_INCREMENT,
+    pair_code         VARCHAR(32)  NOT NULL,
+    experiment_id     VARCHAR(64)  NOT NULL,
+    participant_id    VARCHAR(64)  NOT NULL,
+    pre_sample_id     BIGINT       NOT NULL,
+    post_sample_id    BIGINT       NOT NULL,
+    pre_digest        VARCHAR(128) NOT NULL,
+    post_digest       VARCHAR(128) NOT NULL,
+    pre_collected_at  BIGINT       NOT NULL,
+    post_collected_at BIGINT       NOT NULL,
+    locked_actor      VARCHAR(64)  NOT NULL,
+    locked_at         BIGINT       NOT NULL,
+    CONSTRAINT pk_sample_pair PRIMARY KEY (id),
+    CONSTRAINT uq_pair_code UNIQUE (pair_code),
+    CONSTRAINT uq_pair_participant UNIQUE (experiment_id, participant_id)
+);
+COMMENT ON TABLE  sample_pair IS '样本配对锁定表；锁定后禁止更正，冻结当时摘要；试验关闭不撤销已锁定对';
+COMMENT ON COLUMN sample_pair.id IS '配对自增主键';
+COMMENT ON COLUMN sample_pair.pair_code IS '随机无含义配对码，全局唯一，与参与者编号、盲码、处理代码无对应规律';
+COMMENT ON COLUMN sample_pair.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN sample_pair.participant_id IS '合成参与者编号；不向分析人透出';
+COMMENT ON COLUMN sample_pair.pre_sample_id IS '锁定时有效 PRE 样本记录主键';
+COMMENT ON COLUMN sample_pair.post_sample_id IS '锁定时有效 POST 样本记录主键';
+COMMENT ON COLUMN sample_pair.pre_digest IS '锁定时冻结的 PRE 摘要，之后更正不影响';
+COMMENT ON COLUMN sample_pair.post_digest IS '锁定时冻结的 POST 摘要，之后更正不影响';
+COMMENT ON COLUMN sample_pair.pre_collected_at IS 'PRE 采集时刻，Unix 毫秒，UTC';
+COMMENT ON COLUMN sample_pair.post_collected_at IS 'POST 采集时刻，Unix 毫秒，UTC；锁定时必须晚于 PRE';
+COMMENT ON COLUMN sample_pair.locked_actor IS '执行锁定的操作者编号（X-Actor-Id）';
+COMMENT ON COLUMN sample_pair.locked_at IS '锁定时间，Unix 毫秒，UTC';

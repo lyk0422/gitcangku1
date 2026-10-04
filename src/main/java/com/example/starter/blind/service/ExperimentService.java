@@ -138,7 +138,13 @@ public class ExperimentService {
      */
     @Transactional
     public AllocationView withdraw(String experimentId, String participantId) {
-        AllocationRow allocation = mustFindAllocation(experimentId, participantId);
+        mustFindExperiment(experimentId);
+        // 行级锁定分配行，与样本配对锁定串行化：退组后不能再形成新锁定
+        AllocationRow allocation =
+                allocationRepository.lockByExperimentAndParticipant(experimentId, participantId);
+        if (allocation == null) {
+            throw ApiException.notFound("参与者尚未在该实验登记");
+        }
         if ("WITHDRAWN".equals(allocation.status())) {
             throw ApiException.conflict("参与者已退组");
         }

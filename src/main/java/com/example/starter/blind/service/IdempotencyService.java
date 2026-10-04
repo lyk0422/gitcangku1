@@ -63,16 +63,19 @@ public class IdempotencyService {
      * 计算请求参数指纹；操作标识、路径参数与请求体均参与。
      */
     public String fingerprint(String operation, Object params) {
+        // 结构化身份：操作标识与参数分字段放入有序 Map 再序列化，避免字符串拼接的分隔符碰撞
+        java.util.Map<String, Object> identity = new java.util.LinkedHashMap<>();
+        identity.put("operation", operation);
+        identity.put("params", params);
         String json;
         try {
-            json = fingerprintMapper.writeValueAsString(params);
+            json = fingerprintMapper.writeValueAsString(identity);
         } catch (JsonProcessingException e) {
             throw ApiException.badRequest("请求参数无法序列化");
         }
-        String raw = operation + "|" + json;
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            return HexFormat.of().formatHex(digest.digest(raw.getBytes(StandardCharsets.UTF_8)));
+            return HexFormat.of().formatHex(digest.digest(json.getBytes(StandardCharsets.UTF_8)));
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException("SHA-256 不可用", e);
         }

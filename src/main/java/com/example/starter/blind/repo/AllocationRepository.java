@@ -94,6 +94,17 @@ public class AllocationRepository {
     }
 
     /**
+     * 行级锁定分配行，用于退组与样本锁定等需要串行化的并发场景；事务结束时释放。
+     */
+    public AllocationRow lockByExperimentAndParticipant(String experimentId, String participantId) {
+        List<AllocationRow> rows = jdbc.query(
+                "SELECT id, experiment_id, participant_id, block_no, seat_no, blind_code, status, "
+                        + "assigned_actor, assigned_at, withdrawn_at "
+                        + "FROM allocation WHERE experiment_id = ? AND participant_id = ? FOR UPDATE",
+                ALLOCATION_MAPPER, experimentId, participantId);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+    /**
      * 退组：仅 ASSIGNED -> WITHDRAWN，不释放席位。
      *
      * @return 受影响行数；0 表示不存在或已退组

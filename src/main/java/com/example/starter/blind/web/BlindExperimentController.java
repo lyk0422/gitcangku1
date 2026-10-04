@@ -77,7 +77,7 @@ public class BlindExperimentController {
     /** 查询实验信息（COORDINATOR / REVIEWER 均可）。 */
     @GetMapping("/experiments/{experimentId}")
     public ExperimentView getExperiment(@PathVariable String experimentId) {
-        requireActor();
+        requireCoordinatorOrReviewer();
         return experimentService.getExperiment(RequestTokens.requireId("experimentId", experimentId));
     }
 
@@ -136,7 +136,7 @@ public class BlindExperimentController {
     @GetMapping("/experiments/{experimentId}/participants/{participantId}")
     public AllocationView getAllocation(@PathVariable String experimentId,
                                         @PathVariable String participantId) {
-        requireActor();
+        requireCoordinatorOrReviewer();
         return experimentService.getAllocation(
                 RequestTokens.requireId("experimentId", experimentId),
                 RequestTokens.requireId("participantId", participantId));
@@ -182,7 +182,7 @@ public class BlindExperimentController {
     /** 查询揭盲申请状态（不含处理代码）；申请人或批准人可查。 */
     @GetMapping("/unblind-requests/{unblindRequestId}")
     public UnblindRequestView getUnblindRequest(@PathVariable String unblindRequestId) {
-        Actor actor = requireActor();
+        Actor actor = requireCoordinatorOrReviewer();
         return unblindService.getRequest(
                 RequestTokens.requireId("unblindRequestId", unblindRequestId), actor.actorId());
     }
@@ -190,7 +190,7 @@ public class BlindExperimentController {
     /** 查询揭盲结果：仅申请人本人、已批准后可获得处理代码；其他人 403，未批准 409。 */
     @GetMapping("/unblind-requests/{unblindRequestId}/result")
     public UnblindResultView getUnblindResult(@PathVariable String unblindRequestId) {
-        Actor actor = requireActor();
+        Actor actor = requireCoordinatorOrReviewer();
         return unblindService.getResult(
                 RequestTokens.requireId("unblindRequestId", unblindRequestId), actor.actorId());
     }
@@ -220,4 +220,12 @@ public class BlindExperimentController {
         }
         return actor;
     }
-}
+
+    /** 普通查询与揭盲查询仅 COORDINATOR / REVIEWER；ANALYST 只能读取匿名配对。 */
+    private Actor requireCoordinatorOrReviewer() {
+        Actor actor = requireActor();
+        if (actor.isAnalyst()) {
+            throw ApiException.forbidden("ANALYST 仅可查询匿名配对");
+        }
+        return actor;
+    }}
