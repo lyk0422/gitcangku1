@@ -1,12 +1,14 @@
 package com.example.starter.race.service;
 
 import com.example.starter.race.api.AddPenaltyRequest;
+import com.example.starter.race.api.ConfirmPenaltyCreditRequest;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
 import com.example.starter.race.api.CreateRaceRequest;
 import com.example.starter.race.api.RegisterRunnerRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
 import com.example.starter.race.api.MissingCheckpointsResponse;
+import com.example.starter.race.api.RegisterPenaltyCreditRequest;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
@@ -32,6 +34,19 @@ public interface RaceService {
 
     /** 撤销处罚。 */
     ServiceResult revokePenalty(String raceId, String penaltyId, RevokePenaltyRequest request);
+
+    /**
+     * 登记罚时执行凭证（仅针对 ADD_TIME 处罚）；停留区间左闭右开、长度为整数毫秒。
+     * 跨选手引用、取消资格处罚或无效区间返回422，且不写入任何数据。
+     */
+    ServiceResult registerPenaltyCredit(String raceId, RegisterPenaltyCreditRequest request);
+
+    /**
+     * 由另一名裁判确认执行凭证：按该处罚剩余未执行量抵扣，超出部分不产生负处罚；
+     * 同选手已确认停留区间不得重叠（相邻合法）；处罚已撤销或赛事已封榜时禁止确认。
+     */
+    ServiceResult confirmPenaltyCredit(
+            String raceId, String creditId, ConfirmPenaltyCreditRequest request);
 
     /**
      * 一次性配置检查点（1~20个、代码赛事内唯一、顺序从1连续递增）；

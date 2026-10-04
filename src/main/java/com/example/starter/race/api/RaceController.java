@@ -62,6 +62,23 @@ public class RaceController {
         return toResponse(raceService.revokePenalty(raceId, penaltyId, request));
     }
 
+    /** 登记罚时执行凭证。 */
+    @PostMapping("/{raceId}/penalty-credits")
+    public ResponseEntity<Object> registerPenaltyCredit(
+            @PathVariable String raceId,
+            @Valid @RequestBody RegisterPenaltyCreditRequest request) {
+        return toResponse(raceService.registerPenaltyCredit(raceId, request));
+    }
+
+    /** 确认罚时执行凭证。 */
+    @PostMapping("/{raceId}/penalty-credits/{creditId}/confirmation")
+    public ResponseEntity<Object> confirmPenaltyCredit(
+            @PathVariable String raceId,
+            @PathVariable String creditId,
+            @Valid @RequestBody ConfirmPenaltyCreditRequest request) {
+        return toResponse(raceService.confirmPenaltyCredit(raceId, creditId, request));
+    }
+
     /** 一次性配置赛事检查点。 */
     @PostMapping("/{raceId}/checkpoints")
     public ResponseEntity<Object> configureCheckpoints(

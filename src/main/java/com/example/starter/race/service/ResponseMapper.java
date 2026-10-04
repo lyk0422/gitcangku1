@@ -2,6 +2,7 @@ package com.example.starter.race.service;
 
 import com.example.starter.race.api.CheckpointPassResponse;
 import com.example.starter.race.api.CheckpointTimingResponse;
+import com.example.starter.race.api.PenaltyCreditResponse;
 import com.example.starter.race.api.PenaltyResponse;
 import com.example.starter.race.api.ResultEntryResponse;
 import com.example.starter.race.api.RunnerResponse;
@@ -12,6 +13,7 @@ import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
+import com.example.starter.race.persistence.PenaltyCreditRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
 import com.example.starter.race.persistence.RunnerRow;
@@ -78,6 +80,7 @@ final class ResponseMapper {
                 entry.status(),
                 entry.finishTimeMs(),
                 entry.penaltyMs(),
+                entry.servedMs(),
                 entry.totalTimeMs(),
                 entry.checkpointCount(),
                 entry.coveredCheckpointCount(),
@@ -91,10 +94,19 @@ final class ResponseMapper {
                 entry.status(),
                 entry.finishTimeMs(),
                 entry.penaltyMs(),
+                entry.servedMs(),
                 entry.totalTimeMs(),
                 entry.checkpointCount(),
                 entry.coveredCheckpointCount(),
                 entry.missingCheckpoints());
+    }
+
+    static PenaltyCreditResponse toCreditResponse(PenaltyCreditRow row) {
+        return new PenaltyCreditResponse(
+                row.creditId(), row.penaltyId(), row.bib(),
+                row.startUtcMs(), row.endUtcMs(), row.durationMs(),
+                row.registeredBy(), row.status(), row.creditedMs(),
+                row.confirmedBy(), row.createdAt(), row.confirmedAt());
     }
 
     /**

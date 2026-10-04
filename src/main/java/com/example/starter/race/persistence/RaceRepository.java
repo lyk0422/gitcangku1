@@ -1,6 +1,7 @@
 package com.example.starter.race.persistence;
 
 import com.example.starter.race.domain.EntryStatus;
+import com.example.starter.race.domain.PenaltyCreditStatus;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -26,6 +27,8 @@ public class RaceRepository {
             new SnapshotEntryRowMapper();
     private static final IdempotencyRowMapper IDEMPOTENCY_ROW_MAPPER = new IdempotencyRowMapper();
     private static final CheckpointRowMapper CHECKPOINT_ROW_MAPPER = new CheckpointRowMapper();
+    private static final PenaltyCreditRowMapper PENALTY_CREDIT_ROW_MAPPER =
+            new PenaltyCreditRowMapper();
     private static final CheckpointTimingRowMapper CHECKPOINT_TIMING_ROW_MAPPER =
             new CheckpointTimingRowMapper();
     private static final SnapshotCheckpointRowMapper SNAPSHOT_CHECKPOINT_ROW_MAPPER =
@@ -77,19 +80,26 @@ public class RaceRepository {
                 .findFirst();
     }
 
-    /** 查询赛事下全部处罚（含已撤销），按新增时间与处罚ID排列。 */
+    /** 处罚查询公共列：served_ms 为该处罚已确认执行凭证的抵扣合计（无凭证为0）。 */
+    private static final String PENALTY_COLUMNS =
+            "penalty_id, race_id, bib, type, amount_ms, revoked, created_at, revoked_at, "
+                    + "COALESCE((SELECT SUM(c.credited_ms) FROM penalty_credit c "
+                    + "WHERE c.penalty_id = penalty.penalty_id AND c.status = 'CONFIRMED'), 0) "
+                    + "AS served_ms";
+
+    /** 查询赛事下全部处罚（含已撤销与已确认抵扣汇总），按新增时间与处罚ID排列。 */
     public List<PenaltyRow> findPenalties(String raceId) {
         return jdbcTemplate.query(
-                "SELECT penalty_id, race_id, bib, type, amount_ms, revoked, created_at, revoked_at "
-                        + "FROM penalty WHERE race_id = ? ORDER BY created_at, penalty_id",
+                "SELECT " + PENALTY_COLUMNS
+                        + " FROM penalty WHERE race_id = ? ORDER BY created_at, penalty_id",
                 PENALTY_ROW_MAPPER, raceId);
     }
 
-    /** 按全局处罚ID查询处罚。 */
+    /** 按全局处罚ID查询处罚（含已确认抵扣汇总）。 */
     public Optional<PenaltyRow> findPenalty(String penaltyId) {
         return jdbcTemplate
-                .query("SELECT penalty_id, race_id, bib, type, amount_ms, revoked, created_at, revoked_at "
-                                + "FROM penalty WHERE penalty_id = ?",
+                .query("SELECT " + PENALTY_COLUMNS
+                                + " FROM penalty WHERE penalty_id = ?",
                         PENALTY_ROW_MAPPER, penaltyId)
                 .stream()
                 .findFirst();
@@ -187,8 +197,8 @@ public class RaceRepository {
         }
         SnapshotRow header = headers.getFirst();
         List<SnapshotEntryRow> entryRows = jdbcTemplate.query(
-                "SELECT race_id, bib, rank_no, status, finish_time_ms, penalty_ms, total_time_ms, "
-                        + "display_order, checkpoint_count, covered_checkpoint_count "
+                "SELECT race_id, bib, rank_no, status, finish_time_ms, penalty_ms, served_ms, "
+                        + "total_time_ms, display_order, checkpoint_count, covered_checkpoint_count "
                         + "FROM result_snapshot_entry WHERE race_id = ? ORDER BY display_order",
                 SNAPSHOT_ENTRY_ROW_MAPPER, raceId);
         List<SnapshotCheckpointRow> checkpoints = jdbcTemplate.query(
@@ -207,8 +217,8 @@ public class RaceRepository {
         List<SnapshotEntryRow> entries = entryRows.stream()
                 .map(entry -> new SnapshotEntryRow(
                         entry.raceId(), entry.bib(), entry.rank(), entry.status(),
-                        entry.finishTimeMs(), entry.penaltyMs(), entry.totalTimeMs(),
-                        entry.displayOrder(), entry.checkpointCount(),
+                        entry.finishTimeMs(), entry.penaltyMs(), entry.servedMs(),
+                        entry.totalTimeMs(), entry.displayOrder(), entry.checkpointCount(),
                         entry.coveredCheckpointCount(),
                         missingByBib.getOrDefault(entry.bib(), List.of())))
                 .toList();
@@ -260,6 +270,71 @@ public class RaceRepository {
                 now, penaltyId);
     }
 
+    /** 凭证查询公共列。 */
+    private static final String CREDIT_COLUMNS =
+            "credit_id, race_id, penalty_id, bib, start_utc_ms, end_utc_ms, duration_ms, "
+                    + "registered_by, status, credited_ms, confirmed_by, created_at, confirmed_at";
+
+    /** 新增执行凭证（初始状态 PENDING，未确认字段为 NULL）。 */
+    public void insertCredit(PenaltyCreditRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO penalty_credit "
+                        + "(credit_id, race_id, penalty_id, bib, start_utc_ms, end_utc_ms, "
+                        + "duration_ms, registered_by, status, credited_ms, confirmed_by, "
+                        + "created_at, confirmed_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', NULL, NULL, ?, NULL)",
+                row.creditId(), row.raceId(), row.penaltyId(), row.bib(),
+                row.startUtcMs(), row.endUtcMs(), row.durationMs(),
+                row.registeredBy(), row.createdAt());
+    }
+
+    /** 按全局凭证ID查询执行凭证。 */
+    public Optional<PenaltyCreditRow> findCredit(String creditId) {
+        return jdbcTemplate
+                .query("SELECT " + CREDIT_COLUMNS + " FROM penalty_credit WHERE credit_id = ?",
+                        PENALTY_CREDIT_ROW_MAPPER, creditId)
+                .stream()
+                .findFirst();
+    }
+
+    /** 查询赛事下全部执行凭证（含未确认），按登记时间与凭证ID排列。 */
+    public List<PenaltyCreditRow> findCredits(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT " + CREDIT_COLUMNS
+                        + " FROM penalty_credit WHERE race_id = ? ORDER BY created_at, credit_id",
+                PENALTY_CREDIT_ROW_MAPPER, raceId);
+    }
+
+    /** 查询某选手全部已确认执行凭证（用于同选手停留区间重叠校验）。 */
+    public List<PenaltyCreditRow> findConfirmedCreditsForRunner(String raceId, String bib) {
+        return jdbcTemplate.query(
+                "SELECT " + CREDIT_COLUMNS
+                        + " FROM penalty_credit WHERE race_id = ? AND bib = ? AND status = 'CONFIRMED' "
+                        + "ORDER BY start_utc_ms",
+                PENALTY_CREDIT_ROW_MAPPER, raceId, bib);
+    }
+
+    /** 查询某处罚已确认凭证的抵扣合计毫秒数（无已确认凭证为0）。 */
+    public long sumCreditedMsForPenalty(String penaltyId) {
+        Long sum = jdbcTemplate.queryForObject(
+                "SELECT COALESCE(SUM(credited_ms), 0) FROM penalty_credit "
+                        + "WHERE penalty_id = ? AND status = 'CONFIRMED'",
+                Long.class, penaltyId);
+        return sum == null ? 0L : sum;
+    }
+
+    /**
+     * 确认执行凭证：仅对当前 PENDING 的凭证生效，同事务写入确认裁判、
+     * 确认时间与实际抵扣毫秒数；返回受影响行数（0 表示已确认或不存在）。
+     */
+    public int confirmCredit(String creditId, String confirmedBy, long creditedMs, long now) {
+        return jdbcTemplate.update(
+                "UPDATE penalty_credit SET status = 'CONFIRMED', credited_ms = ?, "
+                        + "confirmed_by = ?, confirmed_at = ? "
+                        + "WHERE credit_id = ? AND status = 'PENDING'",
+                creditedMs, confirmedBy, now, creditId);
+    }
+
     /**
      * 条件推进版本：仅当赛事仍为 OPEN 且版本等于 expectedVersion 时加一。
      *
@@ -291,9 +366,9 @@ public class RaceRepository {
                 snapshot.raceId(), snapshot.version(), snapshot.sealedAt());
         jdbcTemplate.batchUpdate(
                 "INSERT INTO result_snapshot_entry "
-                        + "(race_id, bib, rank_no, status, finish_time_ms, penalty_ms, total_time_ms, "
-                        + "display_order, checkpoint_count, covered_checkpoint_count) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        + "(race_id, bib, rank_no, status, finish_time_ms, penalty_ms, served_ms, "
+                        + "total_time_ms, display_order, checkpoint_count, covered_checkpoint_count) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 snapshot.entries(),
                 snapshot.entries().size(),
                 (ps, entry) -> {
@@ -303,10 +378,11 @@ public class RaceRepository {
                     ps.setString(4, entry.status().name());
                     ps.setObject(5, entry.finishTimeMs());
                     ps.setLong(6, entry.penaltyMs());
-                    ps.setObject(7, entry.totalTimeMs());
-                    ps.setInt(8, entry.displayOrder());
-                    ps.setInt(9, entry.checkpointCount());
-                    ps.setInt(10, entry.coveredCheckpointCount());
+                    ps.setLong(7, entry.servedMs());
+                    ps.setObject(8, entry.totalTimeMs());
+                    ps.setInt(9, entry.displayOrder());
+                    ps.setInt(10, entry.checkpointCount());
+                    ps.setInt(11, entry.coveredCheckpointCount());
                 });
         jdbcTemplate.batchUpdate(
                 "INSERT INTO result_snapshot_checkpoint "
@@ -376,6 +452,7 @@ public class RaceRepository {
         jdbcTemplate.update("DELETE FROM idempotency_record");
         jdbcTemplate.update("DELETE FROM checkpoint_timing");
         jdbcTemplate.update("DELETE FROM checkpoint");
+        jdbcTemplate.update("DELETE FROM penalty_credit");
         jdbcTemplate.update("DELETE FROM penalty");
         jdbcTemplate.update("DELETE FROM runner");
         jdbcTemplate.update("DELETE FROM race");
@@ -417,7 +494,8 @@ public class RaceRepository {
                     (Long) rs.getObject("amount_ms"),
                     rs.getBoolean("revoked"),
                     rs.getLong("created_at"),
-                    (Long) rs.getObject("revoked_at"));
+                    (Long) rs.getObject("revoked_at"),
+                    rs.getLong("served_ms"));
         }
     }
 
@@ -431,6 +509,7 @@ public class RaceRepository {
                     EntryStatus.valueOf(rs.getString("status")),
                     (Long) rs.getObject("finish_time_ms"),
                     rs.getLong("penalty_ms"),
+                    rs.getLong("served_ms"),
                     (Long) rs.getObject("total_time_ms"),
                     rs.getInt("display_order"),
                     rs.getInt("checkpoint_count"),
@@ -475,6 +554,26 @@ public class RaceRepository {
                     rs.getInt("position"),
                     (Long) rs.getObject("elapsed_millis"),
                     rs.getString("timing_id"));
+        }
+    }
+
+    private static final class PenaltyCreditRowMapper implements RowMapper<PenaltyCreditRow> {
+        @Override
+        public PenaltyCreditRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new PenaltyCreditRow(
+                    rs.getString("credit_id"),
+                    rs.getString("race_id"),
+                    rs.getString("penalty_id"),
+                    rs.getString("bib"),
+                    rs.getLong("start_utc_ms"),
+                    rs.getLong("end_utc_ms"),
+                    rs.getLong("duration_ms"),
+                    rs.getString("registered_by"),
+                    PenaltyCreditStatus.valueOf(rs.getString("status")),
+                    (Long) rs.getObject("credited_ms"),
+                    rs.getString("confirmed_by"),
+                    rs.getLong("created_at"),
+                    (Long) rs.getObject("confirmed_at"));
         }
     }
 

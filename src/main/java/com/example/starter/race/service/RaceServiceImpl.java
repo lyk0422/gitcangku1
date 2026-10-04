@@ -4,9 +4,11 @@ import com.example.starter.race.api.AddPenaltyRequest;
 import com.example.starter.race.api.CheckpointResponse;
 import com.example.starter.race.api.CheckpointsConfigResponse;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
+import com.example.starter.race.api.ConfirmPenaltyCreditRequest;
 import com.example.starter.race.api.CreateRaceRequest;
 import com.example.starter.race.api.MissingCheckpointsResponse;
 import com.example.starter.race.api.RaceResponse;
+import com.example.starter.race.api.RegisterPenaltyCreditRequest;
 import com.example.starter.race.api.RegisterRunnerRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
@@ -16,6 +18,7 @@ import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.api.SubmitTimingRequest;
 import com.example.starter.race.domain.CheckpointRules;
+import com.example.starter.race.domain.PenaltyCreditStatus;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
@@ -23,6 +26,7 @@ import com.example.starter.race.domain.ResultEntry;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
 import com.example.starter.race.persistence.IdempotencyRow;
+import com.example.starter.race.persistence.PenaltyCreditRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
 import com.example.starter.race.persistence.RunnerRow;
@@ -231,6 +235,116 @@ public class RaceServiceImpl implements RaceService {
 
     @Override
     @Transactional
+    public ServiceResult registerPenaltyCredit(
+            String raceId, RegisterPenaltyCreditRequest request) {
+        return withIdempotency(request.requestId(), "REGISTER_PENALTY_CREDIT",
+                orderedParams(
+                        "raceId", raceId,
+                        "creditId", request.creditId(),
+                        "penaltyId", request.penaltyId(),
+                        "bib", request.bib(),
+                        "startUtcMs", request.startUtcMs(),
+                        "endUtcMs", request.endUtcMs(),
+                        "registeredBy", request.registeredBy(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    PenaltyRow penalty = repository.findPenalty(request.penaltyId())
+                            .orElseThrow(() -> new NotFoundException(
+                                    "处罚不存在: " + request.penaltyId()));
+                    if (!penalty.raceId().equals(raceId)) {
+                        throw new NotFoundException("处罚不属于该赛事: " + request.penaltyId());
+                    }
+                    if (penalty.type() != PenaltyType.ADD_TIME) {
+                        throw new UnprocessableEntityException(
+                                "执行凭证仅适用于加时处罚: " + request.penaltyId());
+                    }
+                    if (!penalty.bib().equals(request.bib())) {
+                        throw new UnprocessableEntityException(
+                                "凭证选手与处罚选手不一致（禁止跨选手引用）: " + request.bib());
+                    }
+                    requireRunner(raceId, request.bib());
+                    long startUtcMs = request.startUtcMs();
+                    long endUtcMs = request.endUtcMs();
+                    if (endUtcMs <= startUtcMs) {
+                        throw new UnprocessableEntityException(
+                                "无效停留区间：结束时刻必须大于开始时刻");
+                    }
+                    long durationMs = endUtcMs - startUtcMs;
+                    long now = clock.millis();
+                    bumpVersion(race, request.expectedVersion());
+                    PenaltyCreditRow row = new PenaltyCreditRow(
+                            request.creditId(), raceId, request.penaltyId(), request.bib(),
+                            startUtcMs, endUtcMs, durationMs, request.registeredBy(),
+                            PenaltyCreditStatus.PENDING, null, null, now, null);
+                    try {
+                        repository.insertCredit(row);
+                    } catch (DuplicateKeyException ex) {
+                        throw new ConflictException("凭证ID已存在: " + request.creditId());
+                    }
+                    PenaltyCreditRow saved =
+                            repository.findCredit(request.creditId()).orElseThrow();
+                    return ServiceResult.created(ResponseMapper.toCreditResponse(saved));
+                });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult confirmPenaltyCredit(
+            String raceId, String creditId, ConfirmPenaltyCreditRequest request) {
+        return withIdempotency(request.requestId(), "CONFIRM_PENALTY_CREDIT",
+                orderedParams(
+                        "raceId", raceId,
+                        "creditId", creditId,
+                        "confirmedBy", request.confirmedBy(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    PenaltyCreditRow credit = repository.findCredit(creditId)
+                            .orElseThrow(() -> new NotFoundException(
+                                    "执行凭证不存在: " + creditId));
+                    if (!credit.raceId().equals(raceId)) {
+                        throw new NotFoundException("执行凭证不属于该赛事: " + creditId);
+                    }
+                    if (credit.status() == PenaltyCreditStatus.CONFIRMED) {
+                        throw new ConflictException("执行凭证已确认: " + creditId);
+                    }
+                    if (credit.registeredBy().equals(request.confirmedBy())) {
+                        throw new UnprocessableEntityException(
+                                "确认裁判必须与登记裁判不同: " + request.confirmedBy());
+                    }
+                    PenaltyRow penalty = repository.findPenalty(credit.penaltyId())
+                            .orElseThrow();
+                    if (penalty.revoked()) {
+                        throw new ConflictException(
+                                "处罚已撤销，未确认凭证不能确认: " + creditId);
+                    }
+                    // 同选手已确认停留区间（左闭右开）不得重叠，相邻合法。
+                    for (PenaltyCreditRow confirmed :
+                            repository.findConfirmedCreditsForRunner(raceId, credit.bib())) {
+                        if (credit.startUtcMs() < confirmed.endUtcMs()
+                                && confirmed.startUtcMs() < credit.endUtcMs()) {
+                            throw new ConflictException(
+                                    "同选手已确认停留区间重叠: " + confirmed.creditId());
+                        }
+                    }
+                    // 抵扣以该处罚剩余未执行量为上限，超出部分不产生负处罚。
+                    long remainingMs = penalty.amountMs() - penalty.servedMs();
+                    long creditedMs = Math.min(credit.durationMs(), Math.max(remainingMs, 0L));
+                    long now = clock.millis();
+                    bumpVersion(race, request.expectedVersion());
+                    int updated = repository.confirmCredit(
+                            creditId, request.confirmedBy(), creditedMs, now);
+                    if (updated == 0) {
+                        throw new ConflictException("执行凭证已确认: " + creditId);
+                    }
+                    PenaltyCreditRow saved = repository.findCredit(creditId).orElseThrow();
+                    return ServiceResult.ok(ResponseMapper.toCreditResponse(saved));
+                });
+    }
+
+    @Override
+    @Transactional
     public ServiceResult configureCheckpoints(String raceId, ConfigureCheckpointsRequest request) {
         List<ConfigureCheckpointsRequest.CheckpointDefinition> definitions =
                 request.checkpoints().stream()
@@ -379,6 +493,7 @@ public class RaceServiceImpl implements RaceService {
                                 entry.status(),
                                 entry.finishTimeMs(),
                                 entry.penaltyMs(),
+                                entry.servedMs(),
                                 entry.totalTimeMs(),
                                 order,
                                 entry.checkpointCount(),
