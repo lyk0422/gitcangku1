@@ -61,7 +61,7 @@ public class RouteRepository {
     private List<Point> findPoints(String routeId) {
         return jdbc.query(
                 "SELECT x, y FROM route_point WHERE route_id = ? ORDER BY seq",
-                (rs, n) -> new Point(rs.getInt("x"), rs.getInt("y")), routeId);
+                (rs, n) -> new Point(rs.getBigDecimal("x"), rs.getBigDecimal("y")), routeId);
     }
 
     /** 创建航线（初始版本 1）并写入点列（调用方负责事务）。 */

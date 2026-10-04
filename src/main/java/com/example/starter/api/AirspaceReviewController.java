@@ -5,6 +5,8 @@ import com.example.starter.api.dto.ReviewRequest;
 import com.example.starter.api.dto.ReviewResultDto;
 import com.example.starter.api.dto.RouteCreateRequest;
 import com.example.starter.api.dto.RouteReplaceRequest;
+import com.example.starter.api.dto.TimedReviewRequest;
+import com.example.starter.api.dto.TimedReviewResultDto;
 import com.example.starter.api.dto.ZoneCreateRequest;
 import com.example.starter.api.dto.ZoneRevokeRequest;
 import com.example.starter.service.AirspaceReviewService;
@@ -71,5 +73,24 @@ public class AirspaceReviewController {
     @GetMapping("/routes/{routeId}/current-review")
     public ReviewResultDto getCurrentReview(@PathVariable String routeId) {
         return service.getCurrentReview(routeId);
+    }
+
+    /** 提交定时航线可行性审查（航点时刻 + 速度区间 + 原静态禁飞检查）。 */
+    @PostMapping("/timed-reviews")
+    public ResponseEntity<MutationResponse> submitTimedReview(
+            @Valid @RequestBody TimedReviewRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(service.submitTimedReview(request));
+    }
+
+    /** 按 reviewId 查询历史定时审查结果（冻结坐标、时刻与原空域版本）。 */
+    @GetMapping("/timed-reviews/{reviewId}")
+    public TimedReviewResultDto getTimedReview(@PathVariable String reviewId) {
+        return service.getTimedReview(reviewId);
+    }
+
+    /** 查询某航线当前可用定时审查结论（版本不匹配返回 STALE）。 */
+    @GetMapping("/routes/{routeId}/current-timed-review")
+    public TimedReviewResultDto getCurrentTimedReview(@PathVariable String routeId) {
+        return service.getCurrentTimedReview(routeId);
     }
 }

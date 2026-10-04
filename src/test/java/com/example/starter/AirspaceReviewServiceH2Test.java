@@ -18,6 +18,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.http.HttpStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
 
+import java.math.BigDecimal;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CyclicBarrier;
@@ -512,7 +513,7 @@ class AirspaceReviewServiceH2Test {
                     // 审核先拿锁：点列快照必须是版本 1 的旧点 y=10
                     ReviewResultDto dto = dataOf(mr);
                     assertEquals(1, dto.routeVersion());
-                    assertEquals(10, dto.pointsSnapshot().get(0).y());
+                    assertEquals(0, BigDecimal.TEN.compareTo(dto.pointsSnapshot().get(0).y()));
                 } else {
                     // 替换先提交：航线版本已是 2，旧版本审核必须 409
                     assertEquals(HttpStatus.CONFLICT, ((ApiException) reviewResult).status());

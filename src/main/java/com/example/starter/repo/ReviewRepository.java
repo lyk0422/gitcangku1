@@ -5,6 +5,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
 
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -89,7 +90,7 @@ public class ReviewRepository {
             if (i > 0) {
                 sb.append(';');
             }
-            sb.append(points.get(i).x()).append(',').append(points.get(i).y());
+            sb.append(points.get(i).x().toPlainString()).append(',').append(points.get(i).y().toPlainString());
         }
         return sb.toString();
     }
@@ -100,7 +101,7 @@ public class ReviewRepository {
         if (text != null && !text.isEmpty()) {
             for (String pair : text.split(";")) {
                 String[] xy = pair.split(",");
-                points.add(new Point(Integer.parseInt(xy[0]), Integer.parseInt(xy[1])));
+                points.add(new Point(new BigDecimal(xy[0]), new BigDecimal(xy[1])));
             }
         }
         return points;

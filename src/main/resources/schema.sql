@@ -39,8 +39,8 @@ CREATE TABLE IF NOT EXISTS route (
 CREATE TABLE IF NOT EXISTS route_point (
     route_id  VARCHAR(64) NOT NULL COMMENT '所属航线标识',
     seq       INT NOT NULL COMMENT '点序号，从 0 开始按顺序连接',
-    x         INT NOT NULL COMMENT '航点 X 坐标，单位米，范围 [-100000,100000]',
-    y         INT NOT NULL COMMENT '航点 Y 坐标，单位米，范围 [-100000,100000]',
+    x         DECIMAL(9,3) NOT NULL COMMENT '航点 X 坐标，单位米，范围 [-100000,100000]，最多 3 位小数',
+    y         DECIMAL(9,3) NOT NULL COMMENT '航点 Y 坐标，单位米，范围 [-100000,100000]，最多 3 位小数',
     PRIMARY KEY (route_id, seq)
 ) COMMENT = '航线当前版本有序航点';
 
@@ -67,3 +67,20 @@ CREATE TABLE IF NOT EXISTS request_dedup (
     response_json  CLOB NOT NULL COMMENT '首次成功响应 JSON，重放时原样返回',
     created_at     BIGINT NOT NULL COMMENT '首次成功时间，epoch 毫秒（UTC）'
 ) COMMENT = '写操作幂等去重记录（与业务变更同事务原子提交）';
+
+-- 定时航线审查不可变结果：冻结坐标、时刻与审查时的空域版本；提交后不得重绑新坐标
+CREATE TABLE IF NOT EXISTS timed_review (
+    review_id         VARCHAR(64) PRIMARY KEY COMMENT '定时审查记录唯一标识（不可变）',
+    route_id          VARCHAR(64) NOT NULL COMMENT '被审查航线标识',
+    route_version     INT NOT NULL COMMENT '审查明确指定的航线版本',
+    airspace_version  BIGINT NOT NULL COMMENT '审查明确指定的空域版本（原禁飞区域版本）',
+    operator          VARCHAR(64) NOT NULL COMMENT '提交定时计划的操作者',
+    conclusion        VARCHAR(16) NOT NULL COMMENT '保存时的原结论：FEASIBLE 可行或 BLOCKED 命中禁飞区，永不改变',
+    hit_zone_ids      CLOB NOT NULL COMMENT '命中的全部 zoneId，字典序去重后逗号拼接；未命中为空串',
+    points_snapshot   VARCHAR(4000) NOT NULL COMMENT '审查时冻结的航点坐标快照，格式 x,y;x,y，单位米，最多 3 位小数',
+    times_snapshot    VARCHAR(1000) NOT NULL COMMENT '审查时冻结的各航点到达时刻，UTC epoch 整秒逗号拼接，严格递增',
+    request_id        VARCHAR(64) NOT NULL COMMENT '提交定时审查的写操作请求标识',
+    created_at        BIGINT NOT NULL COMMENT '创建时间，epoch 毫秒（UTC）'
+) COMMENT = '定时航线审查不可变结果';
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_timed_review_request ON timed_review (request_id);

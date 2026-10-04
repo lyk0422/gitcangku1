@@ -4,7 +4,8 @@ import java.util.List;
 
 /**
  * 二维平面几何判定。本题只模拟二维平面，不用于真实飞行。
- * 禁飞区为非退化轴对齐闭矩形，边界接触也算命中。
+ * 禁飞区为非退化轴对齐闭矩形（整数米边界），边界接触也算命中；
+ * 航点坐标单位米、最多 3 位小数，参与几何以 double 计算。
  */
 public final class Geometry {
 
@@ -25,7 +26,7 @@ public final class Geometry {
      * @param yMax 矩形上边界（含）
      * @return true 表示线段有点位于矩形内或边界上
      */
-    public static boolean segmentHitsRectangle(long ax, long ay, long bx, long by,
+    public static boolean segmentHitsRectangle(double ax, double ay, double bx, double by,
                                                int xMin, int yMin, int xMax, int yMax) {
         // 1. 任一端点在闭矩形内（含边界）即命中
         if (inRectangle(ax, ay, xMin, yMin, xMax, yMax)
@@ -36,22 +37,22 @@ public final class Geometry {
         //    判断线段参数区间 t∈[0,1] 是否与矩形的四个半空间交集非空。
         //    端点已在矩形外，交集非空即意味着线段穿过矩形内部或边界，
         //    包括仅擦过边界（接触边界）的情况。
-        long dx = bx - ax;
-        long dy = by - ay;
+        double dx = bx - ax;
+        double dy = by - ay;
         double t0 = 0.0d;
         double t1 = 1.0d;
         // p*x <= q 形式：左 x>=xMin、右 x<=xMax、下 y>=yMin、上 y<=yMax
-        long[] p = {-dx, dx, -dy, dy};
+        double[] p = {-dx, dx, -dy, dy};
         double[] q = {ax - xMin, xMax - ax, ay - yMin, yMax - ay};
         for (int i = 0; i < 4; i++) {
-            if (p[i] == 0L) {
+            if (p[i] == 0.0d) {
                 // 线段与该边界平行且在外侧，则不可能相交
                 if (q[i] < 0.0d) {
                     return false;
                 }
             } else {
                 double r = q[i] / p[i];
-                if (p[i] < 0L) {
+                if (p[i] < 0.0d) {
                     if (r > t1) {
                         return false;
                     }
@@ -86,7 +87,8 @@ public final class Geometry {
         for (int i = 0; i + 1 < points.size(); i++) {
             Point a = points.get(i);
             Point b = points.get(i + 1);
-            if (segmentHitsRectangle(a.x(), a.y(), b.x(), b.y(), xMin, yMin, xMax, yMax)) {
+            if (segmentHitsRectangle(a.x().doubleValue(), a.y().doubleValue(),
+                    b.x().doubleValue(), b.y().doubleValue(), xMin, yMin, xMax, yMax)) {
                 return true;
             }
         }
@@ -96,7 +98,7 @@ public final class Geometry {
     /**
      * 判断点是否位于闭矩形内（含边界）。
      */
-    public static boolean inRectangle(long x, long y,
+    public static boolean inRectangle(double x, double y,
                                       int xMin, int yMin, int xMax, int yMax) {
         return x >= xMin && x <= xMax && y >= yMin && y <= yMax;
     }
