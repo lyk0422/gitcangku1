@@ -50,6 +50,10 @@ class BatchFlowTest {
         jdbc.update("DELETE FROM test_result");
         jdbc.update("DELETE FROM batch_required_test");
         jdbc.update("DELETE FROM batch_lineage");
+        jdbc.update("DELETE FROM release_snapshot");
+        jdbc.update("DELETE FROM batch_certificate_binding");
+        jdbc.update("DELETE FROM batch_merge");
+        jdbc.update("DELETE FROM certificate_declaration");
         jdbc.update("DELETE FROM batch");
     }
 
@@ -71,6 +75,7 @@ class BatchFlowTest {
         submitTest(batchKey, testReq("TK-3", "无菌", "PASS", "inspect-c"), null, null, 201);
         assertEquals("PENDING_RELEASE", currentStatus(batchKey));
 
+        bindValidCertificate(batchKey);
         approve(batchKey, "qa-1", "QUALITY", "CK-AP-1", 201);
         assertEquals("RELEASE_REVIEW", currentStatus(batchKey));
         approve(batchKey, "ops-1", "OPERATIONS", "CK-AP-2", 201);
@@ -130,6 +135,7 @@ class BatchFlowTest {
         String batchKey = "BK-CONSTRAINT-" + unique();
         createBatch(batchKey, List.of("t1"), 201);
         submitTest(batchKey, testReq("TK-1", "t1", "PASS", "inspector-1"), null, null, 201);
+        bindValidCertificate(batchKey);
 
         // 检验人不能批准
         approve(batchKey, "inspector-1", "QUALITY", "CK-A0", 422);
@@ -284,6 +290,7 @@ class BatchFlowTest {
         String batchKey = "BK-CMD-" + unique();
         createBatch(batchKey, List.of("t1"), 201);
         submitTest(batchKey, testReq("TK-1", "t1", "PASS", "insp"), null, null, 201);
+        bindValidCertificate(batchKey);
 
         String body = "{\"commandKey\":\"CK-A1\"}";
         MvcResult first = mockMvc.perform(post("/api/batches/" + batchKey + "/approvals")
@@ -403,6 +410,7 @@ class BatchFlowTest {
         String batchKey = "BK-RACE-RC-" + unique();
         createBatch(batchKey, List.of("t1"), 201);
         submitTest(batchKey, testReq("TK-1", "t1", "PASS", "insp"), null, null, 201);
+        bindValidCertificate(batchKey);
         approve(batchKey, "qa", "QUALITY", "CK-Q", 201);
 
         List<Future<Integer>> results = runConcurrent(
@@ -444,6 +452,7 @@ class BatchFlowTest {
         String batchKey = "BK-PERSIST-" + unique();
         createBatch(batchKey, List.of("t1"), 201);
         submitTest(batchKey, testReq("TK-1", "t1", "PASS", "insp"), null, null, 201);
+        bindValidCertificate(batchKey);
         approve(batchKey, "qa", "QUALITY", "CK-A1", 201);
         approve(batchKey, "ops", "OPERATIONS", "CK-A2", 201);
         recall(batchKey, "u", "原因", "CK-R1", 201);
@@ -491,6 +500,33 @@ class BatchFlowTest {
         JsonNode node = objectMapper.readTree(result.getResponse().getContentAsString());
         assertEquals("REJECTED", node.path("tests").get(0).path("batchStatus").asText());
         assertEquals("REJECTED", node.path("batch").path("status").asText());
+    }
+
+    // ---------- 合格证前置 ----------
+
+    private int declSeq = 0;
+
+    /**
+     * 发布一个对 PROD-1、批号前缀 L 长期有效的声明并绑定到指定批次（放行门禁前置）。
+     */
+    private void bindValidCertificate(String batchKey) throws Exception {
+        declSeq++;
+        String declKey = "DECL-" + unique();
+        String publish = "{\"commandKey\":\"CK-PUB-" + unique() + "\",\"declarationKey\":\""
+                + declKey + "\",\"version\":1,\"materialCode\":\"PROD-1\","
+                + "\"batchNoPrefix\":\"L\",\"priority\":" + declSeq
+                + ",\"validFrom\":\"2020-01-01T00:00:00Z\",\"validTo\":\"2030-01-01T00:00:00Z\"}";
+        mockMvc.perform(post("/api/certificates/declarations")
+                        .header("X-Actor-Id", "supplier-1")
+                        .contentType(MediaType.APPLICATION_JSON).content(publish))
+                .andExpect(status().isCreated());
+        mockMvc.perform(post("/api/certificates/bindings")
+                        .header("X-Actor-Id", "binder-1")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"commandKey\":\"CK-BIND-" + unique() + "\",\"batchKey\":\""
+                                + batchKey + "\",\"declarationKey\":\"" + declKey
+                                + "\",\"declarationVersion\":1}"))
+                .andExpect(status().is2xxSuccessful());
     }
 
     // ---------- helpers ----------

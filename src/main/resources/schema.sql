@@ -66,3 +66,54 @@ CREATE TABLE IF NOT EXISTS batch_lineage (
     created_at VARCHAR(40) NOT NULL COMMENT '拆分时间，ISO-8601 UTC instant 字符串',
     CONSTRAINT uk_lineage_child UNIQUE (child_key)
 );
+
+-- 供应商合格证声明（版本化）：时间均为 ISO-8601 UTC 字符串，有效区间左闭右开 [valid_from, valid_to)。
+CREATE TABLE IF NOT EXISTS certificate_declaration (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键，同时作为发布顺序依据',
+    declaration_key VARCHAR(64) NOT NULL COMMENT '声明业务键，与 version 共同唯一标识一个声明版本',
+    version INT NOT NULL COMMENT '声明版本号，从 1 开始，同一 declaration_key 内唯一',
+    material_code VARCHAR(64) NOT NULL COMMENT '物料代码，须与批次产品编码一致才允许绑定',
+    batch_no_prefix VARCHAR(64) NOT NULL COMMENT '允许的批号前缀，批次批号须以该前缀开头',
+    priority INT NOT NULL COMMENT '匹配优先级，数值大者优先；同物料下有效声明前缀重叠且优先级相同禁止发布',
+    valid_from VARCHAR(40) NOT NULL COMMENT '有效区间起点（含），ISO-8601 UTC instant 字符串',
+    valid_to VARCHAR(40) NOT NULL COMMENT '有效区间终点（不含），ISO-8601 UTC instant 字符串，必须晚于 valid_from',
+    status VARCHAR(16) NOT NULL COMMENT '声明状态：ACTIVE 有效 / WITHDRAWN 已撤回；撤回只影响后续放行，不改写历史快照',
+    published_by VARCHAR(64) NOT NULL COMMENT '发布操作人标识',
+    published_at VARCHAR(40) NOT NULL COMMENT '发布时间，ISO-8601 UTC instant 字符串',
+    withdrawn_by VARCHAR(64) NULL COMMENT '撤回操作人标识；未撤回为 NULL',
+    withdrawn_at VARCHAR(40) NULL COMMENT '撤回时间，ISO-8601 UTC instant 字符串；未撤回为 NULL',
+    CONSTRAINT uk_declaration_version UNIQUE (declaration_key, version)
+);
+
+-- 批次合格证绑定：每个批次至多一条当前绑定；放行前可换绑，放行后不再变更。
+CREATE TABLE IF NOT EXISTS batch_certificate_binding (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    batch_key VARCHAR(64) NOT NULL COMMENT '批次业务键，全局唯一一条当前绑定',
+    declaration_key VARCHAR(64) NOT NULL COMMENT '绑定的声明业务键',
+    declaration_version INT NOT NULL COMMENT '绑定的声明版本号',
+    matched_prefix VARCHAR(64) NOT NULL COMMENT '绑定时匹配成功的批号前缀快照',
+    bound_by VARCHAR(64) NOT NULL COMMENT '绑定操作人标识',
+    bound_at VARCHAR(40) NOT NULL COMMENT '绑定时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_binding_batch UNIQUE (batch_key)
+);
+
+-- 放行快照：放行时点固化声明版本、匹配前缀与放行时间，创建后不可改写。
+CREATE TABLE IF NOT EXISTS release_snapshot (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    batch_key VARCHAR(64) NOT NULL COMMENT '批次业务键，每个批次至多一条放行快照',
+    declaration_key VARCHAR(64) NOT NULL COMMENT '放行时有效的声明业务键',
+    declaration_version INT NOT NULL COMMENT '放行时固化的声明版本号',
+    matched_prefix VARCHAR(64) NOT NULL COMMENT '放行时固化的匹配批号前缀',
+    released_at VARCHAR(40) NOT NULL COMMENT '放行时点，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_release_snapshot_batch UNIQUE (batch_key)
+);
+
+-- 合批关系：记录新批次由哪些父批合并而来；关系创建后不可改写。
+CREATE TABLE IF NOT EXISTS batch_merge (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键，同时作为合批关系创建顺序依据',
+    target_batch_key VARCHAR(64) NOT NULL COMMENT '合批产生的新批次业务键',
+    parent_batch_key VARCHAR(64) NOT NULL COMMENT '被合并的父批业务键；每个父批至多被合并一次，全局唯一',
+    seq INT NOT NULL COMMENT '父批在合批请求中的顺序，从 1 开始',
+    created_at VARCHAR(40) NOT NULL COMMENT '合批时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_merge_parent UNIQUE (parent_batch_key)
+);

@@ -1,10 +1,12 @@
 package com.example.starter.batch;
 
 import com.example.starter.batch.dto.ApproveRequest;
+import com.example.starter.batch.dto.BatchCertificateResponse;
 import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
 import com.example.starter.batch.dto.LineageEntryResponse;
+import com.example.starter.batch.dto.MergeRequest;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
@@ -30,9 +32,11 @@ import java.util.List;
 public class BatchController {
 
     private final BatchService service;
+    private final CertificateService certificateService;
 
-    public BatchController(BatchService service) {
+    public BatchController(BatchService service, CertificateService certificateService) {
         this.service = service;
+        this.certificateService = certificateService;
     }
 
     /**
@@ -114,6 +118,25 @@ public class BatchController {
         return service.listDescendants(batchKey);
     }
 
+
+    /**
+     * 合批：将 2～5 个当前可用的 RELEASED 父批合并为一个全新批次，
+     * 重新校验所有父物料与目标声明一致；操作人经 X-Actor-Id 请求头提供。
+     */
+    @PostMapping("/merge")
+    public ResponseEntity<String> merge(
+            @RequestHeader(name = "X-Actor-Id", required = false) String actorId,
+            @Valid @RequestBody MergeRequest request) {
+        return stored(service.merge(actorId, request));
+    }
+
+    /**
+     * 批次合格证明细：当前绑定与放行快照；未绑定/未放行对应字段为 null。
+     */
+    @GetMapping("/{batchKey}/certificate")
+    public BatchCertificateResponse certificate(@PathVariable String batchKey) {
+        return certificateService.batchCertificate(batchKey);
+    }
     private ResponseEntity<String> stored(StoredResponse response) {
         return ResponseEntity.status(response.status())
                 .header(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)

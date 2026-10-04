@@ -51,6 +51,10 @@ class BatchSplitLineageTest {
         jdbc.update("DELETE FROM test_result");
         jdbc.update("DELETE FROM batch_required_test");
         jdbc.update("DELETE FROM batch_lineage");
+        jdbc.update("DELETE FROM release_snapshot");
+        jdbc.update("DELETE FROM batch_certificate_binding");
+        jdbc.update("DELETE FROM batch_merge");
+        jdbc.update("DELETE FROM certificate_declaration");
         jdbc.update("DELETE FROM batch");
     }
 
@@ -572,8 +576,35 @@ class BatchSplitLineageTest {
         for (JsonNode item : node.path("batch").path("requiredTests")) {
             submitTest(batchKey, item.asText(), "PASS", inspector, 201);
         }
+        bindValidCertificate(batchKey);
         approve(batchKey, "qa-" + unique(), "QUALITY", "CK-AQ-" + unique(), 201);
         approve(batchKey, "ops-" + unique(), "OPERATIONS", "CK-AO-" + unique(), 201);
+    }
+
+    private int declSeq = 0;
+
+    /**
+     * 发布一个对 PROD-1、批号前缀 L 长期有效的声明并绑定到指定批次（放行门禁前置）。
+     * 拆分子批继承父批绑定，此处换绑返回 200 同样接受。
+     */
+    private void bindValidCertificate(String batchKey) throws Exception {
+        declSeq++;
+        String declKey = "DECL-" + unique();
+        String publish = "{\"commandKey\":\"CK-PUB-" + unique() + "\",\"declarationKey\":\""
+                + declKey + "\",\"version\":1,\"materialCode\":\"PROD-1\","
+                + "\"batchNoPrefix\":\"L\",\"priority\":" + declSeq
+                + ",\"validFrom\":\"2020-01-01T00:00:00Z\",\"validTo\":\"2030-01-01T00:00:00Z\"}";
+        mockMvc.perform(post("/api/certificates/declarations")
+                        .header("X-Actor-Id", "supplier-1")
+                        .contentType(MediaType.APPLICATION_JSON).content(publish))
+                .andExpect(status().isCreated());
+        mockMvc.perform(post("/api/certificates/bindings")
+                        .header("X-Actor-Id", "binder-1")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"commandKey\":\"CK-BIND-" + unique() + "\",\"batchKey\":\""
+                                + batchKey + "\",\"declarationKey\":\"" + declKey
+                                + "\",\"declarationVersion\":1}"))
+                .andExpect(status().is2xxSuccessful());
     }
 
     private void submitTest(String batchKey, String item, String result, String inspector,
