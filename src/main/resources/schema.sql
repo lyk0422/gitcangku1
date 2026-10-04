@@ -66,3 +66,45 @@ CREATE TABLE IF NOT EXISTS batch_lineage (
     created_at VARCHAR(40) NOT NULL COMMENT '拆分时间，ISO-8601 UTC instant 字符串',
     CONSTRAINT uk_lineage_child UNIQUE (child_key)
 );
+
+-- 配方版本：声明 2～6 种成分的质量百分比，创建后不可修改。
+CREATE TABLE IF NOT EXISTS recipe (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    recipe_key VARCHAR(64) NOT NULL COMMENT '配方业务键，全局唯一，创建后不可修改',
+    created_at VARCHAR(40) NOT NULL COMMENT '创建时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_recipe_key UNIQUE (recipe_key)
+);
+
+-- 配方成分：百分比为十进制字符串，最多 4 位小数，正值，同配方合计恰为 100。
+CREATE TABLE IF NOT EXISTS recipe_ingredient (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    recipe_key VARCHAR(64) NOT NULL COMMENT '所属配方业务键',
+    ingredient VARCHAR(128) NOT NULL COMMENT '成分名称，同一配方内唯一',
+    percentage VARCHAR(32) NOT NULL COMMENT '质量百分比，十进制字符串，最多 4 位小数，正值',
+    seq INT NOT NULL COMMENT '成分在创建请求中的顺序，从 1 开始'
+);
+
+-- 批次配方绑定：一批一绑定，绑定后不可改；目标总质量单位克，最多 6 位小数。
+CREATE TABLE IF NOT EXISTS batch_recipe_binding (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    batch_key VARCHAR(64) NOT NULL COMMENT '批次业务键，一批仅一条绑定',
+    recipe_key VARCHAR(64) NOT NULL COMMENT '绑定的不可变配方业务键',
+    target_mass VARCHAR(40) NOT NULL COMMENT '目标总质量，单位克，十进制字符串，最多 6 位小数，正值',
+    bound_by VARCHAR(64) NOT NULL COMMENT '绑定操作人标识',
+    created_at VARCHAR(40) NOT NULL COMMENT '绑定时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_binding_batch UNIQUE (batch_key)
+);
+
+-- 配方称量记录：同成分多次称量累加；更正以替代量重算并作废旧记录；拆分继承生成 INHERIT 记录。
+CREATE TABLE IF NOT EXISTS weighing (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键，即称量ID',
+    batch_key VARCHAR(64) NOT NULL COMMENT '所属批次业务键',
+    ingredient VARCHAR(128) NOT NULL COMMENT '成分名称，必须属于绑定配方的成分',
+    mass VARCHAR(40) NOT NULL COMMENT '称量值，单位克，十进制字符串，最多 6 位小数；更正记录存替代量',
+    kind VARCHAR(16) NOT NULL COMMENT '记录类型：WEIGH 称量/CORRECTION 更正/INHERIT 拆分继承',
+    replaces_id BIGINT NULL COMMENT '更正替代的称量ID；非更正记录为 NULL',
+    superseded_by BIGINT NULL COMMENT '作废本记录的更正称量ID；有效记录为 NULL',
+    actor_id VARCHAR(64) NOT NULL COMMENT '操作人标识；拆分继承记录为 SYSTEM',
+    chain_version INT NOT NULL COMMENT '提交后的称量链版本，每批次从 1 递增',
+    created_at VARCHAR(40) NOT NULL COMMENT '记录时间，ISO-8601 UTC instant 字符串'
+);

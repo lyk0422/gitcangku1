@@ -22,6 +22,12 @@ public class GlobalExceptionHandler {
                 .body(new ErrorResponse(ex.code(), ex.getMessage()));
     }
 
+    @ExceptionHandler(RecipeNotMetException.class)
+    public ResponseEntity<RecipeErrorResponse> handleRecipeNotMet(RecipeNotMetException ex) {
+        return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
+                .body(new RecipeErrorResponse("PRECONDITION_FAILED", ex.getMessage(), ex.deviations()));
+    }
+
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ResponseEntity<ErrorResponse> handleValidation(MethodArgumentNotValidException ex) {
         String message = ex.getBindingResult().getFieldErrors().stream()

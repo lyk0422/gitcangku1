@@ -61,13 +61,16 @@ public class BatchService {
     private final BatchRepository repo;
     private final TransactionTemplate tx;
     private final ObjectMapper objectMapper;
+    private final RecipeService recipeService;
 
     public BatchService(BatchRepository repo,
                         PlatformTransactionManager transactionManager,
-                        ObjectMapper objectMapper) {
+                        ObjectMapper objectMapper,
+                        RecipeService recipeService) {
         this.repo = repo;
         this.tx = new TransactionTemplate(transactionManager);
         this.objectMapper = objectMapper;
+        this.recipeService = recipeService;
     }
 
     /**
@@ -176,6 +179,8 @@ public class BatchService {
             if (status != BatchStatus.PENDING_RELEASE && status != BatchStatus.RELEASE_REVIEW) {
                 throw ApiException.conflict("批次状态 " + status + " 不允许批准");
             }
+            // 配方门禁：已绑定配方的批次投料不达配方时 422 并给出各成分差额，不允许只批准合格成分
+            recipeService.assertRecipeSatisfied(batchKey);
             boolean actorInspected = repo.findTests(batchKey).stream()
                     .anyMatch(t -> t.inspector().equals(actor));
             if (actorInspected) {
@@ -286,7 +291,9 @@ public class BatchService {
                 .map(r -> new RecallResponse(r.batchKey(), r.actorId(), r.reason(),
                         BatchStatus.RECALLED, Instant.parse(r.createdAt())))
                 .orElse(null);
-        return new BatchHistoryResponse(toBatchResponse(batch), tests, approvals, recall);
+        return new BatchHistoryResponse(toBatchResponse(batch), tests, approvals, recall,
+                recipeService.bindingView(batchKey).orElse(null),
+                recipeService.weighingViews(batchKey));
     }
 
     /**
@@ -432,6 +439,7 @@ public class BatchService {
         for (SplitRequest.ChildSpec child : children) {
             parts.add(child.batchKey());
             parts.add(child.batchNo());
+            parts.add(child.targetMassGrams() == null ? "" : child.targetMassGrams().toString());
         }
         String fingerprint = fingerprint(parts.toArray(new String[0]));
         return executeIdempotent(CMD_SPLIT, req.commandKey(), fingerprint, () -> {
@@ -453,6 +461,9 @@ public class BatchService {
                     throw ApiException.conflict("子批 batchKey 已存在: " + childKey);
                 }
             }
+            // 父批已绑定配方时，先校验子批质量守恒并计算各成分分摊量，无法在 6 位小数内守恒则 422
+            Optional<RecipeService.SplitInheritancePlan> inheritancePlan =
+                    recipeService.prepareSplitInheritance(parentKey, children);
             String now = now();
             List<String> required = repo.findRequiredTests(parentKey);
             List<SplitResponse.SplitChild> childBodies = new ArrayList<>(children.size());
@@ -465,10 +476,14 @@ public class BatchService {
                 }
                 repo.insertLineage(new BatchRepository.LineageRow(0L, parentKey, spec.batchKey(),
                         i + 1, now));
+                inheritancePlan.ifPresent(plan ->
+                        recipeService.applyChildInheritance(plan, spec.batchKey(), now));
                 childBodies.add(new SplitResponse.SplitChild(spec.batchKey(), spec.batchNo(),
                         parent.productCode(), Instant.parse(parent.producedAt()),
-                        BatchStatus.QUARANTINED, required, Instant.parse(now)));
+                        BatchStatus.QUARANTINED, required, Instant.parse(now),
+                        inheritancePlan.map(p -> spec.targetMassGrams()).orElse(null)));
             }
+            inheritancePlan.ifPresent(plan -> recipeService.applySplitInheritance(plan, now));
             repo.updateStatus(parentKey, BatchStatus.SPLIT.name());
             SplitResponse body = new SplitResponse(parentKey, BatchStatus.SPLIT, childBodies,
                     Instant.parse(now));
