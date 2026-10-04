@@ -5,8 +5,10 @@ import com.example.starter.plan.model.Occupancy;
 import com.example.starter.plan.model.PlanStatus;
 import com.example.starter.plan.model.PublishedSlot;
 import com.example.starter.plan.model.RescheduleLink;
+import com.example.starter.plan.model.RoutePair;
 import com.example.starter.plan.repo.IdempotencyRepository;
 import com.example.starter.plan.repo.PlanRepository;
+import com.example.starter.plan.repo.RouteRepository;
 import com.example.starter.plan.web.ApiException;
 import com.example.starter.plan.web.dto.CreatePlanRequest;
 import com.example.starter.plan.web.dto.OccupancyRequest;
@@ -28,10 +30,13 @@ import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.TreeSet;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.http.HttpStatus;
@@ -59,13 +64,16 @@ public class PlanService {
     private static final String OP_RESCHEDULE = "RESCHEDULE";
 
     private final PlanRepository planRepo;
+    private final RouteRepository routeRepo;
     private final IdempotencyRepository idemRepo;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate tx;
 
-    public PlanService(PlanRepository planRepo, IdempotencyRepository idemRepo,
+    public PlanService(PlanRepository planRepo, RouteRepository routeRepo,
+                       IdempotencyRepository idemRepo,
                        ObjectMapper objectMapper, PlatformTransactionManager txManager) {
         this.planRepo = planRepo;
+        this.routeRepo = routeRepo;
         this.idemRepo = idemRepo;
         this.objectMapper = objectMapper;
         this.tx = new TransactionTemplate(txManager);
@@ -154,6 +162,7 @@ public class PlanService {
                             "仅草稿可发布，当前状态: " + plan.status());
                 }
                 List<Occupancy> occupancies = planRepo.findOccupancies(plan.id());
+                validateRoutesExist(scheduleKey, occupancies);
                 List<Map<String, Object>> conflicts = new ArrayList<>();
                 conflicts.addAll(findTrainOverlaps(scheduleKey, occupancies));
                 conflicts.addAll(findSectionConflicts(plan, occupancies, List.of(plan.id())));
@@ -161,8 +170,15 @@ public class PlanService {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "存在时隙冲突，计划保持草稿", conflicts);
                 }
+                List<Map<String, Object>> routeConflicts =
+                        findRouteConflicts(plan, occupancies, List.of(plan.id()));
+                if (!routeConflicts.isEmpty()) {
+                    throw new ApiException(HttpStatus.CONFLICT, "ROUTE_CONFLICT",
+                            "存在进路冲突，计划保持草稿", routeConflicts);
+                }
                 long now = System.currentTimeMillis();
-                planRepo.updateStatus(plan.id(), PlanStatus.PUBLISHED, now);
+                planRepo.updateStatusAndMatrixVersion(plan.id(), PlanStatus.PUBLISHED,
+                        routeRepo.matrixVersion(), now);
                 PlanResponse response = loadPlan(scheduleKey);
                 idemRepo.insert(OP_PUBLISH, requestKey, hash, toJson(response), now);
                 return response;
@@ -251,6 +267,7 @@ public class PlanService {
                     throw conflict("LINK_CONFLICT", "新计划已存在直接前驱: " + req.newScheduleKey());
                 }
                 List<Occupancy> occupancies = planRepo.findOccupancies(newPlan.id());
+                validateRoutesExist(req.newScheduleKey(), occupancies);
                 List<Map<String, Object>> conflicts = new ArrayList<>();
                 conflicts.addAll(findTrainOverlaps(req.newScheduleKey(), occupancies));
                 // 仅排除旧计划与自身占用，第三方已发布计划照常参与冲突裁决
@@ -260,9 +277,16 @@ public class PlanService {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "新草稿存在时隙冲突，改签未生效", conflicts);
                 }
+                List<Map<String, Object>> routeConflicts = findRouteConflicts(newPlan, occupancies,
+                        List.of(newPlan.id(), oldPlan.id()));
+                if (!routeConflicts.isEmpty()) {
+                    throw new ApiException(HttpStatus.CONFLICT, "ROUTE_CONFLICT",
+                            "新草稿存在进路冲突，改签未生效", routeConflicts);
+                }
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(oldPlan.id(), PlanStatus.CANCELLED, now);
-                planRepo.updateStatus(newPlan.id(), PlanStatus.PUBLISHED, now);
+                planRepo.updateStatusAndMatrixVersion(newPlan.id(), PlanStatus.PUBLISHED,
+                        routeRepo.matrixVersion(), now);
                 planRepo.insertRescheduleLink(oldPlan.id(), newPlan.id(), now);
                 RescheduleResponse response = new RescheduleResponse(
                         loadPlan(oldScheduleKey), loadPlan(req.newScheduleKey()));
@@ -329,7 +353,7 @@ public class PlanService {
     public List<PublishedSlotView> getPublishedSlots(LocalDate opDate, String sectionId) {
         return planRepo.findPublishedSlots(opDate, List.of(sectionId), List.of(-1L)).stream()
                 .map(s -> new PublishedSlotView(s.scheduleKey(), s.trainNo(), s.sectionId(),
-                        s.startUtc(), s.endUtc()))
+                        s.routeId(), s.startUtc(), s.endUtc()))
                 .toList();
     }
 
@@ -339,17 +363,18 @@ public class PlanService {
         DayPlan plan = planRepo.findByKey(scheduleKey)
                 .orElseThrow(() -> notFound(scheduleKey));
         List<OccupancyView> views = planRepo.findOccupancies(plan.id()).stream()
-                .map(o -> new OccupancyView(o.trainNo(), o.sectionId(), o.startUtc(), o.endUtc()))
+                .map(o -> new OccupancyView(o.trainNo(), o.sectionId(), o.routeId(),
+                        o.startUtc(), o.endUtc()))
                 .toList();
         return new PlanResponse(plan.scheduleKey(), plan.opDate(), plan.version(),
-                plan.status().name(), views);
+                plan.status().name(), plan.matrixVersion(), views);
     }
 
     private List<Occupancy> toOccupancies(long planId, List<OccupancyRequest> requests) {
         List<Occupancy> result = new ArrayList<>(requests.size());
         for (int i = 0; i < requests.size(); i++) {
             OccupancyRequest r = requests.get(i);
-            result.add(new Occupancy(0L, planId, i, r.trainNo(), r.sectionId(), r.startUtc(), r.endUtc()));
+            result.add(new Occupancy(0L, planId, i, r.trainNo(), r.sectionId(), r.routeId(), r.startUtc(), r.endUtc()));
         }
         return result;
     }
@@ -506,8 +531,7 @@ public class PlanService {
 
     private void appendOccupancies(StringBuilder sb, List<OccupancyRequest> occupancies) {
         for (OccupancyRequest o : occupancies) {
-            sb.append('\n').append(o.trainNo()).append('|').append(o.sectionId()).append('|')
-                    .append(o.startUtc().toEpochMilli()).append('|').append(o.endUtc().toEpochMilli());
+            sb.append('\n').append(toJson(o));
         }
     }
 
@@ -540,6 +564,75 @@ public class PlanService {
         } catch (Exception e) {
             throw new IllegalStateException("幂等响应反序列化失败", e);
         }
+    }
+
+    /**
+     * 进路存在性校验：占用引用的进路必须已注册，否则 422，整个计划不占任何新时隙。
+     */
+    private void validateRoutesExist(String scheduleKey, List<Occupancy> occupancies) {
+        Set<String> routeIds = occupancies.stream()
+                .map(Occupancy::routeId)
+                .filter(Objects::nonNull)
+                .collect(java.util.stream.Collectors.toCollection(TreeSet::new));
+        if (routeIds.isEmpty()) {
+            return;
+        }
+        Set<String> existing = routeRepo.findExistingRouteIds(routeIds);
+        List<Map<String, Object>> missing = new ArrayList<>();
+        for (String routeId : routeIds) {
+            if (!existing.contains(routeId)) {
+                Map<String, Object> detail = new LinkedHashMap<>();
+                detail.put("type", "ROUTE_NOT_FOUND");
+                detail.put("scheduleKey", scheduleKey);
+                detail.put("routeId", routeId);
+                missing.add(detail);
+            }
+        }
+        if (!missing.isEmpty()) {
+            throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "ROUTE_NOT_FOUND",
+                    "占用引用了未注册的进路", missing);
+        }
+    }
+
+    /**
+     * 与其他已发布计划的进路互斥检测：相冲突进路（同一路径默认冲突，其余以冲突对为准）
+     * 的 UTC 左闭右开区间不得重叠，端点相接合法；未声明冲突对的不同进路可同时使用。
+     *
+     * @param excludePlanIds 检测时排除的计划 id（发布为自身；改签为新、旧两个计划，
+     *                       旧计划占用先从最终状态移除，避免误阻断新计划）
+     */
+    private List<Map<String, Object>> findRouteConflicts(DayPlan plan, List<Occupancy> occupancies,
+                                                         List<Long> excludePlanIds) {
+        List<Occupancy> routed = occupancies.stream()
+                .filter(o -> o.routeId() != null)
+                .toList();
+        if (routed.isEmpty()) {
+            return List.of();
+        }
+        Set<RoutePair> declaredPairs = new HashSet<>(routeRepo.findAllPairs());
+        List<PublishedSlot> published =
+                planRepo.findPublishedRouteSlots(plan.opDate(), excludePlanIds);
+        List<Map<String, Object>> conflicts = new ArrayList<>();
+        for (Occupancy o : routed) {
+            for (PublishedSlot slot : published) {
+                boolean routeConflict = o.routeId().equals(slot.routeId())
+                        || declaredPairs.contains(RoutePair.of(o.routeId(), slot.routeId()));
+                boolean overlap = o.startUtc().isBefore(slot.endUtc())
+                        && slot.startUtc().isBefore(o.endUtc());
+                if (routeConflict && overlap) {
+                    Map<String, Object> detail = new LinkedHashMap<>();
+                    detail.put("type", "ROUTE_CONFLICT");
+                    detail.put("routeId", o.routeId());
+                    detail.put("conflictingRouteId", slot.routeId());
+                    detail.put("scheduleKey", plan.scheduleKey());
+                    detail.put("conflictingScheduleKey", slot.scheduleKey());
+                    detail.put("startUtc", o.startUtc().toString());
+                    detail.put("endUtc", o.endUtc().toString());
+                    conflicts.add(detail);
+                }
+            }
+        }
+        return conflicts;
     }
 
     private ApiException badRequest(String message) {

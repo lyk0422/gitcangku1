@@ -5,7 +5,8 @@ import java.util.List;
 
 /**
  * 日计划响应，含当前状态、版本与占用清单（取消后历史占用仍原样返回）。
+ * matrixVersion 为发布时冻结的进路冲突矩阵版本，未发布为 null。
  */
 public record PlanResponse(String scheduleKey, LocalDate opDate, int version, String status,
-                           List<OccupancyView> occupancies) {
+                           Long matrixVersion, List<OccupancyView> occupancies) {
 }

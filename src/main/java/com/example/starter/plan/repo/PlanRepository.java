@@ -32,7 +32,8 @@ public class PlanRepository {
             rs.getString("schedule_key"),
             rs.getObject("op_date", LocalDate.class),
             rs.getInt("version"),
-            PlanStatus.valueOf(rs.getString("status")));
+            PlanStatus.valueOf(rs.getString("status")),
+            rs.getObject("matrix_version", Long.class));
 
     private static final RowMapper<Occupancy> OCCUPANCY_MAPPER = (rs, n) -> new Occupancy(
             rs.getLong("id"),
@@ -40,6 +41,7 @@ public class PlanRepository {
             rs.getInt("seq"),
             rs.getString("train_no"),
             rs.getString("section_id"),
+            rs.getString("route_id"),
             Instant.ofEpochMilli(rs.getLong("start_utc")),
             Instant.ofEpochMilli(rs.getLong("end_utc")));
 
@@ -79,7 +81,7 @@ public class PlanRepository {
      * 按业务键查询计划（不加锁）。
      */
     public Optional<DayPlan> findByKey(String scheduleKey) {
-        return jdbc.query("SELECT id, schedule_key, op_date, version, status FROM rail_day_plan"
+        return jdbc.query("SELECT id, schedule_key, op_date, version, status, matrix_version FROM rail_day_plan"
                         + " WHERE schedule_key = ?",
                 PLAN_MAPPER, scheduleKey).stream().findFirst();
     }
@@ -88,7 +90,7 @@ public class PlanRepository {
      * 按主键查询计划（不加锁），用于改签链遍历。
      */
     public Optional<DayPlan> findById(long planId) {
-        return jdbc.query("SELECT id, schedule_key, op_date, version, status FROM rail_day_plan"
+        return jdbc.query("SELECT id, schedule_key, op_date, version, status, matrix_version FROM rail_day_plan"
                         + " WHERE id = ?",
                 PLAN_MAPPER, planId).stream().findFirst();
     }
@@ -97,7 +99,7 @@ public class PlanRepository {
      * 按业务键查询计划并加行级写锁，须在事务内调用，用于串行化同一计划的更新/发布/取消。
      */
     public Optional<DayPlan> findByKeyForUpdate(String scheduleKey) {
-        return jdbc.query("SELECT id, schedule_key, op_date, version, status FROM rail_day_plan"
+        return jdbc.query("SELECT id, schedule_key, op_date, version, status, matrix_version FROM rail_day_plan"
                         + " WHERE schedule_key = ? FOR UPDATE",
                 PLAN_MAPPER, scheduleKey).stream().findFirst();
     }
@@ -115,16 +117,17 @@ public class PlanRepository {
      */
     public void insertOccupancies(long planId, List<Occupancy> occupancies) {
         jdbc.batchUpdate(
-                "INSERT INTO rail_plan_occupancy (plan_id, seq, train_no, section_id, start_utc, end_utc)"
-                        + " VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO rail_plan_occupancy (plan_id, seq, train_no, section_id, route_id, start_utc, end_utc)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?)",
                 occupancies, occupancies.size(),
                 (ps, o) -> {
                     ps.setLong(1, planId);
                     ps.setInt(2, o.seq());
                     ps.setString(3, o.trainNo());
                     ps.setString(4, o.sectionId());
-                    ps.setLong(5, o.startUtc().toEpochMilli());
-                    ps.setLong(6, o.endUtc().toEpochMilli());
+                    ps.setString(5, o.routeId());
+                    ps.setLong(6, o.startUtc().toEpochMilli());
+                    ps.setLong(7, o.endUtc().toEpochMilli());
                 });
     }
 
@@ -132,7 +135,7 @@ public class PlanRepository {
      * 查询计划占用，按计划内序号升序。
      */
     public List<Occupancy> findOccupancies(long planId) {
-        return jdbc.query("SELECT id, plan_id, seq, train_no, section_id, start_utc, end_utc"
+        return jdbc.query("SELECT id, plan_id, seq, train_no, section_id, route_id, start_utc, end_utc"
                         + " FROM rail_plan_occupancy WHERE plan_id = ? ORDER BY seq",
                 OCCUPANCY_MAPPER, planId);
     }
@@ -164,7 +167,7 @@ public class PlanRepository {
         StringJoiner sectionPlaceholders = new StringJoiner(", ");
         sectionIds.forEach(s -> sectionPlaceholders.add("?"));
         StringBuilder sql = new StringBuilder(
-                "SELECT p.schedule_key, o.train_no, o.section_id, o.start_utc, o.end_utc"
+                "SELECT p.schedule_key, o.train_no, o.section_id, o.route_id, o.start_utc, o.end_utc"
                         + " FROM rail_plan_occupancy o JOIN rail_day_plan p ON p.id = o.plan_id"
                         + " WHERE p.status = 'PUBLISHED' AND p.op_date = ?");
         List<Object> args = new ArrayList<>();
@@ -182,6 +185,7 @@ public class PlanRepository {
                 rs.getString("schedule_key"),
                 rs.getString("train_no"),
                 rs.getString("section_id"),
+                rs.getString("route_id"),
                 Instant.ofEpochMilli(rs.getLong("start_utc")),
                 Instant.ofEpochMilli(rs.getLong("end_utc"))), args.toArray());
     }
@@ -218,5 +222,62 @@ public class PlanRepository {
      */
     public void acquirePublishLock() {
         jdbc.queryForObject("SELECT id FROM publish_lock WHERE id = 1 FOR UPDATE", Integer.class);
+    }
+
+    /**
+     * 仅更新状态并冻结发布时的进路冲突矩阵版本（发布/改签发布新计划时调用）。
+     */
+    public void updateStatusAndMatrixVersion(long planId, PlanStatus status, long matrixVersion,
+                                             long nowMillis) {
+        jdbc.update("UPDATE rail_day_plan SET status = ?, matrix_version = ?, updated_at = ?"
+                        + " WHERE id = ?",
+                status.name(), matrixVersion, nowMillis, planId);
+    }
+
+    /**
+     * 查询指定运营日全部已发布计划中带进路编号的生效时隙（跨区段，排除给定计划集合），
+     * 用于进路互斥检测与冲突矩阵变更前校验。
+     */
+    public List<PublishedSlot> findPublishedRouteSlots(LocalDate opDate,
+                                                       Collection<Long> excludePlanIds) {
+        StringBuilder sql = new StringBuilder(
+                "SELECT p.schedule_key, o.train_no, o.section_id, o.route_id, o.start_utc, o.end_utc"
+                        + " FROM rail_plan_occupancy o JOIN rail_day_plan p ON p.id = o.plan_id"
+                        + " WHERE p.status = 'PUBLISHED' AND p.op_date = ?"
+                        + " AND o.route_id IS NOT NULL");
+        List<Object> args = new ArrayList<>();
+        args.add(Date.valueOf(opDate));
+        if (!excludePlanIds.isEmpty()) {
+            StringJoiner excludePlaceholders = new StringJoiner(", ");
+            excludePlanIds.forEach(id -> excludePlaceholders.add("?"));
+            sql.append(" AND p.id NOT IN (").append(excludePlaceholders).append(')');
+            args.addAll(excludePlanIds);
+        }
+        sql.append(" ORDER BY o.route_id, o.start_utc");
+        return jdbc.query(sql.toString(), (rs, n) -> new PublishedSlot(
+                rs.getString("schedule_key"),
+                rs.getString("train_no"),
+                rs.getString("section_id"),
+                rs.getString("route_id"),
+                Instant.ofEpochMilli(rs.getLong("start_utc")),
+                Instant.ofEpochMilli(rs.getLong("end_utc"))), args.toArray());
+    }
+
+    /**
+     * 查询全部运营日已发布计划中带进路编号的生效时隙，用于冲突矩阵变更前校验。
+     */
+    public List<PublishedSlot> findAllPublishedRouteSlots() {
+        return jdbc.query(
+                "SELECT p.schedule_key, o.train_no, o.section_id, o.route_id, o.start_utc, o.end_utc"
+                        + " FROM rail_plan_occupancy o JOIN rail_day_plan p ON p.id = o.plan_id"
+                        + " WHERE p.status = 'PUBLISHED' AND o.route_id IS NOT NULL"
+                        + " ORDER BY o.route_id, o.start_utc",
+                (rs, n) -> new PublishedSlot(
+                        rs.getString("schedule_key"),
+                        rs.getString("train_no"),
+                        rs.getString("section_id"),
+                        rs.getString("route_id"),
+                        Instant.ofEpochMilli(rs.getLong("start_utc")),
+                        Instant.ofEpochMilli(rs.getLong("end_utc"))));
     }
 }
