@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS observation_version (
 CREATE TABLE IF NOT EXISTS request_log (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
     fingerprint VARCHAR(128) NOT NULL COMMENT '请求操作与参数的指纹，同键异参时判定 409',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：CREATE / MERGE / DELETE / RESOLVE',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：CREATE / MERGE / DELETE / RESOLVE / UPLOAD_BATCH / CLOSE_SESSION',
     response_status INT NULL COMMENT '成功响应的 HTTP 状态码；提交过程中暂为 NULL',
     response_body VARCHAR(4000) NULL COMMENT '成功响应体（JSON 原文），用于同键同参重放；提交过程中暂为 NULL',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '请求记录创建时间（服务器时区）',
@@ -58,4 +58,28 @@ CREATE TABLE IF NOT EXISTS conflict_resolution (
     -- 不设置指向 observation_current 的外键：观测记录删除仅置墓碑（当前行保留），
     -- 且不可变解决历史必须在任何数据清理/归档场景下继续可查。
     UNIQUE (observation_id, request_id)
+);
+
+-- 设备会话序列表：每个（设备，会话）一行，水位从 seq=1 起连续推进，洞不能跳过。
+CREATE TABLE IF NOT EXISTS device_session (
+    device_id VARCHAR(64) NOT NULL COMMENT '设备标识（合成会话，不接真实终端）',
+    session_id VARCHAR(64) NOT NULL COMMENT '会话标识，按设备内唯一',
+    watermark INT NOT NULL DEFAULT 0 COMMENT '确认水位：从 seq=1 起连续收到的最大序号，初值 0，洞不能跳过',
+    closed BOOLEAN NOT NULL DEFAULT FALSE COMMENT '是否已关闭：TRUE 后新消息一律 409，已成功旧键仍重放最初响应',
+    declared_last_seq INT NULL COMMENT '关闭时设备声明的末序号，仅当水位等于该值才允许关闭；未关闭为 NULL',
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近一次变更时间（服务器时区 Asia/Shanghai）',
+    PRIMARY KEY (device_id, session_id)
+);
+
+-- 会话消息收件记录表：仅记录成功接收的消息，失败不留记录、不推进水位；每会话最多 100 条（seq 1..100）。
+CREATE TABLE IF NOT EXISTS session_message (
+    device_id VARCHAR(64) NOT NULL COMMENT '设备标识',
+    session_id VARCHAR(64) NOT NULL COMMENT '会话标识',
+    seq INT NOT NULL COMMENT '会话内消息序号，1..100，按（设备，会话）唯一，可乱序抵达',
+    content_fingerprint VARCHAR(128) NOT NULL COMMENT '消息内容结构化指纹（JSON 序列化后 SHA-256），同 seq 异内容判定 409',
+    observation_request_id VARCHAR(128) NOT NULL COMMENT '消息内观测创建/合并请求的 requestId',
+    response_status INT NOT NULL COMMENT '观测业务成功的 HTTP 状态码',
+    response_body VARCHAR(4000) NOT NULL COMMENT '观测业务成功响应体（JSON 原文），用于同 seq 同内容重放',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '收件记录创建时间（服务器时区）',
+    PRIMARY KEY (device_id, session_id, seq)
 );
