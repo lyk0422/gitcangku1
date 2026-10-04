@@ -59,3 +59,40 @@ CREATE TABLE IF NOT EXISTS conflict_resolution (
     -- 且不可变解决历史必须在任何数据清理/归档场景下继续可查。
     UNIQUE (observation_id, request_id)
 );
+
+-- 设备会话表：仅管理合成会话（不接真实终端）；水位从 seq=1 起连续推进，洞不能跳过。
+CREATE TABLE IF NOT EXISTS device_session (
+    device_id VARCHAR(64) NOT NULL COMMENT '设备标识（合成设备）',
+    session_id VARCHAR(64) NOT NULL COMMENT '会话标识，设备内唯一',
+    watermark INT NOT NULL DEFAULT 0 COMMENT '确认水位：从 seq=1 起连续收到的最大序号，初值 0',
+    message_count INT NOT NULL DEFAULT 0 COMMENT '已收件消息条数，上限 100 条',
+    closed BOOLEAN NOT NULL DEFAULT FALSE COMMENT '是否已由设备显式关闭：TRUE 后拒绝新消息',
+    final_seq INT NULL COMMENT '设备关闭时声明的末序号；未关闭时为 NULL',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '会话创建时间（服务器时区）',
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近一次水位推进或关闭时间（服务器时区）',
+    PRIMARY KEY (device_id, session_id)
+);
+
+-- 会话消息收件记录表：按（设备、会话、序号）唯一；仅成功批次落库，失败不留收件记录。
+CREATE TABLE IF NOT EXISTS session_message (
+    device_id VARCHAR(64) NOT NULL COMMENT '设备标识（合成设备）',
+    session_id VARCHAR(64) NOT NULL COMMENT '会话标识',
+    seq INT NOT NULL COMMENT '消息序号，正整数，会话内唯一',
+    content_fingerprint VARCHAR(128) NOT NULL COMMENT '消息内容（操作+全部参数）结构化指纹，同序号异内容判定 409',
+    request_id VARCHAR(128) NOT NULL COMMENT '首次送达该消息的批次请求标识',
+    response_status INT NOT NULL COMMENT '该消息观测业务响应的 HTTP 状态码',
+    response_body VARCHAR(4000) NOT NULL COMMENT '该消息观测业务响应（JSON 原文），用于同序号同内容重放',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '收件时间（服务器时区）',
+    PRIMARY KEY (device_id, session_id, seq)
+);
+
+-- 会话写操作幂等去重表：仅记录成功结果，失败不占键；与业务变更同事务原子提交。
+CREATE TABLE IF NOT EXISTS session_request_log (
+    request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
+    fingerprint VARCHAR(128) NOT NULL COMMENT '请求身份（操作、操作者、资源、全部参数与期望版本）结构化指纹',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：BATCH_UPLOAD / SESSION_CLOSE',
+    response_status INT NULL COMMENT '成功响应的 HTTP 状态码；提交过程中暂为 NULL',
+    response_body VARCHAR(16000) NULL COMMENT '成功响应体（JSON 原文），用于同键同参重放；提交过程中暂为 NULL',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '请求记录创建时间（服务器时区）',
+    PRIMARY KEY (request_id)
+);

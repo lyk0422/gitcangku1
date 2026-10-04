@@ -81,19 +81,9 @@ public class ObservationService {
             return concurrent;
         }
 
-        if (observationRepository.findCurrentForUpdate(request.observationId()).isPresent()) {
-            throw ApiException.conflict("observation already exists: " + request.observationId(), null);
-        }
-        ObservationSnapshot snapshot = new ObservationSnapshot(request.observationId(), 1,
-                request.location(), request.reading(), request.note(), false);
-        try {
-            observationRepository.insertCurrent(snapshot);
-        } catch (DuplicateKeyException e) {
-            // 并发创建同一 observationId：由主键串行化，后到者按冲突处理
-            throw ApiException.conflict("observation already exists: " + request.observationId(), null);
-        }
-        observationRepository.insertVersion(snapshot);
-        return complete(request.requestId(), HttpStatus.CREATED, ObservationResponse.of(snapshot));
+        ObservationResponse created = applyCreate(request.observationId(), request.location(),
+                request.reading(), request.note());
+        return complete(request.requestId(), HttpStatus.CREATED, created);
     }
 
     /**
@@ -112,36 +102,9 @@ public class ObservationService {
             return concurrent;
         }
 
-        ObservationSnapshot current = observationRepository.findCurrentForUpdate(observationId)
-                .orElseThrow(() -> ApiException.notFound("observation not found: " + observationId));
-        if (current.deleted()) {
-            throw ApiException.gone("observation already deleted: " + observationId);
-        }
-        ObservationSnapshot base = observationRepository.findVersion(observationId, request.baseVersion())
-                .orElseThrow(() -> ApiException.notFound(
-                        "base version not found: " + observationId + "@" + request.baseVersion()));
-
-        List<String> conflictFields = new ArrayList<>();
-        String mergedLocation = mergeField("location", base.location(), current.location(),
-                request.location(), conflictFields);
-        String mergedReading = mergeReadingField(base.reading(), current.reading(),
-                request.reading(), conflictFields);
-        String mergedNote = mergeField("note", base.note(), current.note(), request.note(), conflictFields);
-        if (!conflictFields.isEmpty()) {
-            throw ApiException.mergeConflict(conflictFields, current.version());
-        }
-
-        ObservationSnapshot merged = new ObservationSnapshot(observationId, current.version(),
-                mergedLocation, mergedReading, mergedNote, false);
-        if (sameContent(merged, current)) {
-            // 合并结果与当前完全相同：返回当前版本，不加版本
-            return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(current));
-        }
-        ObservationSnapshot next = new ObservationSnapshot(observationId, current.version() + 1,
-                mergedLocation, mergedReading, mergedNote, false);
-        observationRepository.updateCurrent(next);
-        observationRepository.insertVersion(next);
-        return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(next));
+        ObservationResponse merged = applyMerge(observationId, request.baseVersion(),
+                request.location(), request.reading(), request.note());
+        return complete(request.requestId(), HttpStatus.OK, merged);
     }
 
     /**
@@ -634,5 +597,62 @@ public class ObservationService {
      * 冲突解决结果：HTTP 状态码与解决响应体。
      */
     public record ResolveOutcome(int status, ResolutionResponse body) {
+    }
+
+    /**
+     * 应用创建业务（不含幂等去重）：记录已存在返回 409。
+     * 供设备会话批次上传等内部调用复用同一套业务规则，由外层事务统一提交或回滚。
+     */
+    ObservationResponse applyCreate(String observationId, String location, String reading, String note) {
+        if (observationRepository.findCurrentForUpdate(observationId).isPresent()) {
+            throw ApiException.conflict("observation already exists: " + observationId, null);
+        }
+        ObservationSnapshot snapshot = new ObservationSnapshot(observationId, 1, location, reading, note, false);
+        try {
+            observationRepository.insertCurrent(snapshot);
+        } catch (DuplicateKeyException e) {
+            // 并发创建同一 observationId：由主键串行化，后到者按冲突处理
+            throw ApiException.conflict("observation already exists: " + observationId, null);
+        }
+        observationRepository.insertVersion(snapshot);
+        return ObservationResponse.of(snapshot);
+    }
+
+    /**
+     * 应用离线提交三方合并业务（不含幂等去重）：合并结果与当前完全相同则不加版本，否则版本加一。
+     * 供设备会话批次上传等内部调用复用同一套业务规则，由外层事务统一提交或回滚。
+     */
+    ObservationResponse applyMerge(String observationId, int baseVersion,
+                                   String location, String reading, String note) {
+        ObservationSnapshot current = observationRepository.findCurrentForUpdate(observationId)
+                .orElseThrow(() -> ApiException.notFound("observation not found: " + observationId));
+        if (current.deleted()) {
+            throw ApiException.gone("observation already deleted: " + observationId);
+        }
+        ObservationSnapshot base = observationRepository.findVersion(observationId, baseVersion)
+                .orElseThrow(() -> ApiException.notFound(
+                        "base version not found: " + observationId + "@" + baseVersion));
+
+        List<String> conflictFields = new ArrayList<>();
+        String mergedLocation = mergeField("location", base.location(), current.location(),
+                location, conflictFields);
+        String mergedReading = mergeReadingField(base.reading(), current.reading(),
+                reading, conflictFields);
+        String mergedNote = mergeField("note", base.note(), current.note(), note, conflictFields);
+        if (!conflictFields.isEmpty()) {
+            throw ApiException.mergeConflict(conflictFields, current.version());
+        }
+
+        ObservationSnapshot merged = new ObservationSnapshot(observationId, current.version(),
+                mergedLocation, mergedReading, mergedNote, false);
+        if (sameContent(merged, current)) {
+            // 合并结果与当前完全相同：返回当前版本，不加版本
+            return ObservationResponse.of(current);
+        }
+        ObservationSnapshot next = new ObservationSnapshot(observationId, current.version() + 1,
+                mergedLocation, mergedReading, mergedNote, false);
+        observationRepository.updateCurrent(next);
+        observationRepository.insertVersion(next);
+        return ObservationResponse.of(next);
     }
 }
