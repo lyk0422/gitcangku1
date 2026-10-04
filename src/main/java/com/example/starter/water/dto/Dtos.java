@@ -74,6 +74,33 @@ public final class Dtos {
                                   List<CurtailmentResponse> curtailments) {
     }
 
+    /** 首次结算命令；操作者由 X-Actor-Id 请求头提供。 */
+    public record SettleRequest(String requestId) {
+    }
+
+    /** 重新对账命令；expectedSettlementVersion 必须等于当前最新结算版本，否则 409。 */
+    public record ReconcileRequest(String requestId, Integer expectedSettlementVersion) {
+    }
+
+    /**
+     * 结算单农户明细行。approvedAmount 为该农户当前批准水量合计（立方米）；
+     * amount 为应收（元，到分）；diffAmount 为与上一有效版本的差额（可负，首版等于应收）。
+     */
+    public record SettlementLineResponse(String userId, String approvedAmount, String amount,
+                                         String diffAmount) {
+    }
+
+    /** 结算单视图；版本内冻结农户分组、精确水量与费率，创建后不可变。 */
+    public record SettlementResponse(long windowId, int version, String tier1Limit, String tier1Rate,
+                                     String tier2Rate, String totalAmount,
+                                     List<SettlementLineResponse> lines, String createdUtc) {
+    }
+
+    /** 窗口结算历史视图：全部版本（含每次差额）与当前净应收；未结算时列表为空、净应收为 null。 */
+    public record SettlementListResponse(long windowId, int currentVersion, String currentNetReceivable,
+                                         List<SettlementResponse> settlements) {
+    }
+
     /** 统一错误响应体。 */
     public record ErrorResponse(String code, String message) {
     }

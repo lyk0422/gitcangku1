@@ -56,3 +56,36 @@ CREATE TABLE IF NOT EXISTS command_log (
     response MEDIUMTEXT NULL COMMENT '首次成功响应 JSON；命令事务提交前写入',
     created_nanos BIGINT NOT NULL COMMENT '创建时间，UTC 纳秒时间戳'
 ) COMMENT='命令幂等日志，同键同参重放返回首次结果，同键改参返回 409';
+
+CREATE TABLE IF NOT EXISTS settlement (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '结算单主键',
+    window_id BIGINT NOT NULL COMMENT '所属供水窗口 ID',
+    version INT NOT NULL COMMENT '结算版本，窗口内从 1 起单调递增，每次对账推进一格',
+    tier1_limit DECIMAL(19,3) NOT NULL COMMENT '第一阶梯水量上限（立方米），结算时刻冻结',
+    tier1_rate DECIMAL(19,2) NOT NULL COMMENT '第一阶梯费率（元/立方米），结算时刻冻结',
+    tier2_rate DECIMAL(19,2) NOT NULL COMMENT '超出第一阶梯部分费率（元/立方米），结算时刻冻结',
+    total_amount DECIMAL(19,2) NOT NULL COMMENT '窗口合计应收（元，HALF_UP 到分）',
+    created_nanos BIGINT NOT NULL COMMENT '创建时间，UTC 纳秒时间戳',
+    CONSTRAINT uk_settlement_window_version UNIQUE (window_id, version),
+    CONSTRAINT fk_settlement_window FOREIGN KEY (window_id) REFERENCES supply_window (id)
+) COMMENT='窗口水费结算单，版本不可变，旧结算单不被后续转让或对账改写';
+
+CREATE TABLE IF NOT EXISTS settlement_line (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '结算明细主键',
+    settlement_id BIGINT NOT NULL COMMENT '所属结算单 ID',
+    user_id VARCHAR(128) NOT NULL COMMENT '用水户 ID（农户分组键）',
+    approved_amount DECIMAL(19,3) NOT NULL COMMENT '该农户当前批准水量合计（立方米，3 位小数），无当前批准时为 0',
+    amount DECIMAL(19,2) NOT NULL COMMENT '该农户应收金额（元，HALF_UP 到分）',
+    diff_amount DECIMAL(19,2) NOT NULL COMMENT '与上一有效版本同农户应收的差额（元，可负；首版等于应收本身）',
+    CONSTRAINT fk_settlement_line FOREIGN KEY (settlement_id) REFERENCES settlement (id)
+) COMMENT='结算单农户明细与差额账本，创建后不可变；取消产生负差额而非删除原账';
+
+CREATE TABLE IF NOT EXISTS request_log (
+    request_id VARCHAR(128) PRIMARY KEY COMMENT '幂等请求键',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：SETTLE / SETTLE_RECONCILE',
+    actor VARCHAR(128) NOT NULL COMMENT '操作者（X-Actor-Id）',
+    resource VARCHAR(128) NOT NULL COMMENT '操作资源（供水窗口 ID）',
+    params VARCHAR(2048) NOT NULL COMMENT '规范化 JSON 参数串（含期望版本），结构化比较避免分隔符碰撞',
+    response MEDIUMTEXT NULL COMMENT '首次成功响应 JSON；业务事务提交前写入',
+    created_nanos BIGINT NOT NULL COMMENT '创建时间，UTC 纳秒时间戳'
+) COMMENT='结算类写命令幂等日志：同键同参重放首次完整响应，同键异参 409，失败不占键';

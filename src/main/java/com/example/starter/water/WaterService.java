@@ -3,12 +3,19 @@ package com.example.starter.water;
 import com.example.starter.water.WaterRepository.AllocationRow;
 import com.example.starter.water.WaterRepository.CommandRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
+import com.example.starter.water.WaterRepository.FarmerTotalRow;
+import com.example.starter.water.WaterRepository.RequestRow;
+import com.example.starter.water.WaterRepository.SettlementLineRow;
+import com.example.starter.water.WaterRepository.SettlementRow;
 import com.example.starter.water.WaterRepository.TransferRow;
 import com.example.starter.water.WaterRepository.WindowRow;
 import com.example.starter.water.dto.Dtos.AllocationResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.SettlementLineResponse;
+import com.example.starter.water.dto.Dtos.SettlementListResponse;
+import com.example.starter.water.dto.Dtos.SettlementResponse;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferResponse;
 import com.example.starter.water.dto.Dtos.WindowResponse;
@@ -19,9 +26,17 @@ import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
@@ -469,5 +484,202 @@ public class WaterService {
         } catch (Exception e) {
             throw new IllegalStateException("响应反序列化失败", e);
         }
+    }
+    // ------------------------------------------------------------------
+    // 结算与对账
+    // ------------------------------------------------------------------
+
+    /** 第一阶梯水量上限（立方米）。 */
+    static final BigDecimal TIER1_LIMIT = new BigDecimal("100");
+    /** 第一阶梯费率（元/立方米）。 */
+    static final BigDecimal TIER1_RATE = new BigDecimal("2");
+    /** 超出第一阶梯部分费率（元/立方米）。 */
+    static final BigDecimal TIER2_RATE = new BigDecimal("3");
+
+    /** 首次结算：仅同一窗口内当前 APPROVED 申请参与，按农户分组合计后阶梯计费，生成版本 1。 */
+    public SettlementResponse settle(String requestId, long windowId, String actor) {
+        requireKey("requestId", requestId);
+        requireKey("X-Actor-Id", actor);
+        Map<String, Object> paramsMap = new LinkedHashMap<>();
+        paramsMap.put("windowId", windowId);
+        return runRequest("SETTLE", requestId, actor, String.valueOf(windowId), toJson(paramsMap),
+                SettlementResponse.class, () -> {
+                    WindowRow window = repository.lockWindowById(windowId);
+                    if (window == null) {
+                        throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + windowId);
+                    }
+                    if (repository.findLatestSettlement(windowId) != null) {
+                        throw ApiException.conflict("SETTLEMENT_EXISTS",
+                                "窗口已存在结算单，后续请使用对账接口: " + windowId);
+                    }
+                    return createSettlement(window, 1, List.of());
+                });
+    }
+
+    /**
+     * 重新对账：expectedSettlementVersion 必须等于当前最新版本，否则 409；
+     * 对所有当前批准申请重新计费，差额等于新应收减最近有效应收；无变化也保存零差额的新版本。
+     */
+    public SettlementResponse reconcile(String requestId, long windowId, Integer expectedSettlementVersion,
+                                        String actor) {
+        requireKey("requestId", requestId);
+        requireKey("X-Actor-Id", actor);
+        if (expectedSettlementVersion == null) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "expectedSettlementVersion 不能为空");
+        }
+        Map<String, Object> paramsMap = new LinkedHashMap<>();
+        paramsMap.put("windowId", windowId);
+        paramsMap.put("expectedSettlementVersion", expectedSettlementVersion);
+        return runRequest("SETTLE_RECONCILE", requestId, actor, String.valueOf(windowId), toJson(paramsMap),
+                SettlementResponse.class, () -> {
+                    WindowRow window = repository.lockWindowById(windowId);
+                    if (window == null) {
+                        throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + windowId);
+                    }
+                    SettlementRow latest = repository.findLatestSettlement(windowId);
+                    if (latest == null) {
+                        throw ApiException.conflict("SETTLEMENT_NOT_FOUND",
+                                "窗口尚未结算，请先创建结算单: " + windowId);
+                    }
+                    if (latest.version() != expectedSettlementVersion) {
+                        throw ApiException.conflict("SETTLEMENT_VERSION_MISMATCH",
+                                "期望结算版本 " + expectedSettlementVersion + " 与当前最新版本 "
+                                        + latest.version() + " 不一致");
+                    }
+                    return createSettlement(window, latest.version() + 1,
+                            repository.listSettlementLines(latest.id()));
+                });
+    }
+
+    /** 查询窗口全部结算版本（含每次差额）与当前净应收；旧结算单不被改写。 */
+    public SettlementListResponse getSettlements(long windowId) {
+        WindowRow window = repository.findWindowById(windowId);
+        if (window == null) {
+            throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + windowId);
+        }
+        List<SettlementRow> rows = repository.listSettlements(windowId);
+        List<SettlementResponse> settlements = new ArrayList<>();
+        for (SettlementRow row : rows) {
+            settlements.add(toSettlementResponse(row, repository.listSettlementLines(row.id())));
+        }
+        SettlementRow latest = rows.isEmpty() ? null : rows.get(rows.size() - 1);
+        return new SettlementListResponse(windowId, latest == null ? 0 : latest.version(),
+                latest == null ? null : fmtMoney(latest.totalAmount()), settlements);
+    }
+
+    /**
+     * 在窗口行锁内生成下一版本结算单：冻结当前批准申请集合、农户分组、精确水量与费率。
+     * 明细行为当前批准农户与上一版本农户的并集，全部取消的农户以 0 应收产生负差额而非删除原账。
+     * 任一农户合计水量非法则抛 422，事务回滚整张对账不写。
+     */
+    private SettlementResponse createSettlement(WindowRow window, int version,
+                                                List<SettlementLineRow> previousLines) {
+        Map<String, BigDecimal> current = new TreeMap<>();
+        for (FarmerTotalRow row : repository.sumApprovedByUser(window.id())) {
+            validateFarmerTotal(row.userId(), row.approvedAmount());
+            current.put(row.userId(), row.approvedAmount());
+        }
+        Map<String, BigDecimal> previous = new HashMap<>();
+        for (SettlementLineRow line : previousLines) {
+            previous.put(line.userId(), line.amount());
+        }
+        Set<String> farmers = new TreeSet<>(current.keySet());
+        farmers.addAll(previous.keySet());
+        Map<String, BigDecimal> amountByFarmer = new TreeMap<>();
+        Map<String, BigDecimal> diffByFarmer = new TreeMap<>();
+        BigDecimal total = BigDecimal.ZERO;
+        for (String farmer : farmers) {
+            BigDecimal approved = current.getOrDefault(farmer, BigDecimal.ZERO);
+            BigDecimal amount = tieredFee(approved);
+            BigDecimal diff = amount.subtract(previous.getOrDefault(farmer, BigDecimal.ZERO));
+            amountByFarmer.put(farmer, amount);
+            diffByFarmer.put(farmer, diff);
+            total = total.add(amount);
+        }
+        long now = nowNanos();
+        long settlementId = repository.insertSettlement(window.id(), version, TIER1_LIMIT, TIER1_RATE,
+                TIER2_RATE, total, now);
+        List<SettlementLineResponse> lines = new ArrayList<>();
+        for (String farmer : farmers) {
+            BigDecimal approved = current.getOrDefault(farmer, BigDecimal.ZERO);
+            BigDecimal amount = amountByFarmer.get(farmer);
+            BigDecimal diff = diffByFarmer.get(farmer);
+            repository.insertSettlementLine(settlementId, farmer, approved, amount, diff);
+            lines.add(new SettlementLineResponse(farmer, fmt(approved), fmtMoney(amount), fmtMoney(diff)));
+        }
+        return new SettlementResponse(window.id(), version, fmt(TIER1_LIMIT), fmtMoney(TIER1_RATE),
+                fmtMoney(TIER2_RATE), fmtMoney(total), lines, toIso(now));
+    }
+
+    /** 阶梯计费：前 100 立方米每立方米 2 元，超出部分每立方米 3 元；金额 HALF_UP 到分。 */
+    static BigDecimal tieredFee(BigDecimal approvedAmount) {
+        BigDecimal tier1 = approvedAmount.min(TIER1_LIMIT);
+        BigDecimal tier2 = approvedAmount.subtract(tier1);
+        return tier1.multiply(TIER1_RATE).add(tier2.multiply(TIER2_RATE))
+                .setScale(2, RoundingMode.HALF_UP);
+    }
+
+    /** 农户合计水量必须非负且最多 3 位小数，否则 422。 */
+    static void validateFarmerTotal(String userId, BigDecimal total) {
+        if (total == null || total.signum() < 0 || total.stripTrailingZeros().scale() > 3) {
+            throw ApiException.unprocessable("INVALID_FARMER_TOTAL",
+                    "农户 " + userId + " 的批准水量合计非法: " + total);
+        }
+    }
+
+    private SettlementResponse toSettlementResponse(SettlementRow row, List<SettlementLineRow> lines) {
+        List<SettlementLineResponse> lineResponses = new ArrayList<>();
+        for (SettlementLineRow line : lines) {
+            lineResponses.add(new SettlementLineResponse(line.userId(), fmt(line.approvedAmount()),
+                    fmtMoney(line.amount()), fmtMoney(line.diffAmount())));
+        }
+        return new SettlementResponse(row.windowId(), row.version(), fmt(row.tier1Limit()),
+                fmtMoney(row.tier1Rate()), fmtMoney(row.tier2Rate()), fmtMoney(row.totalAmount()),
+                lineResponses, toIso(row.createdNanos()));
+    }
+
+    // ------------------------------------------------------------------
+    // 结算写命令幂等框架
+    // ------------------------------------------------------------------
+
+    /**
+     * 在单事务内执行幂等请求：先占位插入请求行，再执行业务并写回响应，业务与去重原子提交。
+     * 身份为操作 + 操作者 + 资源 + 结构化 JSON 参数（含期望版本），避免分隔符碰撞；
+     * 同键同参重放首次完整响应，同键异参 409，失败回滚不占键。
+     */
+    private <T> T runRequest(String operation, String requestId, String actor, String resource,
+                             String params, Class<T> type, Supplier<T> business) {
+        try {
+            return tx.execute(status -> {
+                RequestRow existing = repository.findRequest(requestId);
+                if (existing != null) {
+                    return replayRequest(existing, operation, actor, resource, params, type);
+                }
+                repository.insertRequest(requestId, operation, actor, resource, params, nowNanos());
+                T result = business.get();
+                repository.updateRequestResponse(requestId, toJson(result));
+                return result;
+            });
+        } catch (DuplicateKeyException e) {
+            RequestRow committed = repository.findRequest(requestId);
+            if (committed == null || committed.response() == null) {
+                throw ApiException.conflict("REQUEST_CONFLICT", "相同 requestId 的请求正在处理，请重试");
+            }
+            return replayRequest(committed, operation, actor, resource, params, type);
+        }
+    }
+
+    private <T> T replayRequest(RequestRow existing, String operation, String actor, String resource,
+                                String params, Class<T> type) {
+        if (!existing.operation().equals(operation) || !existing.actor().equals(actor)
+                || !existing.resource().equals(resource) || !existing.params().equals(params)) {
+            throw ApiException.conflict("REQUEST_KEY_REUSED", "相同 requestId 但请求内容不同，拒绝重放");
+        }
+        return fromJson(existing.response(), type);
+    }
+
+    /** 金额格式化为元的十进制字符串（固定 2 位小数，到分）。 */
+    static String fmtMoney(BigDecimal value) {
+        return value.setScale(2, RoundingMode.HALF_UP).toPlainString();
     }
 }

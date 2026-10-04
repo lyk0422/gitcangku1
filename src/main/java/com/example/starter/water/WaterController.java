@@ -7,6 +7,10 @@ import com.example.starter.water.dto.Dtos.CreateWindowRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.ReconcileRequest;
+import com.example.starter.water.dto.Dtos.SettleRequest;
+import com.example.starter.water.dto.Dtos.SettlementListResponse;
+import com.example.starter.water.dto.Dtos.SettlementResponse;
 import com.example.starter.water.dto.Dtos.SubmitAllocationRequest;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferRequest;
@@ -102,5 +106,24 @@ public class WaterController {
     @GetMapping("/windows/{windowId}/history")
     public HistoryResponse getHistory(@PathVariable long windowId) {
         return service.getHistory(windowId);
+    }
+    /** 首次结算：按已批准配水量生成版本 1 结算单。 */
+    @PostMapping("/windows/{windowId}/settlement")
+    public SettlementResponse settle(@PathVariable long windowId, @RequestBody SettleRequest request,
+                                     @RequestHeader("X-Actor-Id") String actor) {
+        return service.settle(request.requestId(), windowId, actor);
+    }
+
+    /** 重新对账：提交 expectedSettlementVersion，对所有当前批准申请重新计费并记录差额。 */
+    @PostMapping("/windows/{windowId}/settlement/reconcile")
+    public SettlementResponse reconcile(@PathVariable long windowId, @RequestBody ReconcileRequest request,
+                                        @RequestHeader("X-Actor-Id") String actor) {
+        return service.reconcile(request.requestId(), windowId, request.expectedSettlementVersion(), actor);
+    }
+
+    /** 查询窗口全部结算版本、差额账本与当前净应收。 */
+    @GetMapping("/windows/{windowId}/settlement")
+    public SettlementListResponse getSettlements(@PathVariable long windowId) {
+        return service.getSettlements(windowId);
     }
 }

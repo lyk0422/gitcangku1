@@ -304,4 +304,135 @@ public class WaterRepository {
     public void updateCommandResponse(String commandKey, String response) {
         jdbc.update("UPDATE command_log SET response = ? WHERE command_key = ?", response, commandKey);
     }
+    // ------------------------------------------------------------------
+    // 结算与差额账本
+    // ------------------------------------------------------------------
+
+    /** 结算单行；版本内冻结费率与合计应收，创建后不可变。 */
+    public record SettlementRow(long id, long windowId, int version, BigDecimal tier1Limit,
+                                BigDecimal tier1Rate, BigDecimal tier2Rate, BigDecimal totalAmount,
+                                long createdNanos) {
+    }
+
+    /** 结算明细行：农户分组、精确水量、应收与差额。 */
+    public record SettlementLineRow(long id, long settlementId, String userId, BigDecimal approvedAmount,
+                                    BigDecimal amount, BigDecimal diffAmount) {
+    }
+
+    /** 农户当前批准水量合计行（APPROVED 申请持有额度按用水户汇总）。 */
+    public record FarmerTotalRow(String userId, BigDecimal approvedAmount) {
+    }
+
+    /** 幂等请求行；response 为 null 表示响应尚未写回（同事务内）。 */
+    public record RequestRow(String requestId, String operation, String actor, String resource,
+                             String params, String response, long createdNanos) {
+    }
+
+    private static final RowMapper<SettlementRow> SETTLEMENT_MAPPER = (rs, n) -> new SettlementRow(
+            rs.getLong("id"), rs.getLong("window_id"), rs.getInt("version"),
+            rs.getBigDecimal("tier1_limit"), rs.getBigDecimal("tier1_rate"),
+            rs.getBigDecimal("tier2_rate"), rs.getBigDecimal("total_amount"),
+            rs.getLong("created_nanos"));
+
+    private static final String SETTLEMENT_SELECT =
+            "SELECT id, window_id, version, tier1_limit, tier1_rate, tier2_rate, total_amount, created_nanos";
+
+    private static final RowMapper<SettlementLineRow> SETTLEMENT_LINE_MAPPER = (rs, n) -> new SettlementLineRow(
+            rs.getLong("id"), rs.getLong("settlement_id"), rs.getString("user_id"),
+            rs.getBigDecimal("approved_amount"), rs.getBigDecimal("amount"),
+            rs.getBigDecimal("diff_amount"));
+
+    private static final RowMapper<FarmerTotalRow> FARMER_TOTAL_MAPPER = (rs, n) -> new FarmerTotalRow(
+            rs.getString("user_id"), rs.getBigDecimal("total"));
+
+    private static final RowMapper<RequestRow> REQUEST_MAPPER = (rs, n) -> new RequestRow(
+            rs.getString("request_id"), rs.getString("operation"), rs.getString("actor"),
+            rs.getString("resource"), rs.getString("params"), rs.getString("response"),
+            rs.getLong("created_nanos"));
+
+    /** 插入结算单并返回自增主键。 */
+    public long insertSettlement(long windowId, int version, BigDecimal tier1Limit, BigDecimal tier1Rate,
+                                 BigDecimal tier2Rate, BigDecimal totalAmount, long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO settlement (window_id, version, tier1_limit, tier1_rate, tier2_rate,"
+                            + " total_amount, created_nanos) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setLong(1, windowId);
+            ps.setInt(2, version);
+            ps.setBigDecimal(3, tier1Limit);
+            ps.setBigDecimal(4, tier1Rate);
+            ps.setBigDecimal(5, tier2Rate);
+            ps.setBigDecimal(6, totalAmount);
+            ps.setLong(7, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 插入结算明细行（不可变）。 */
+    public void insertSettlementLine(long settlementId, String userId, BigDecimal approvedAmount,
+                                     BigDecimal amount, BigDecimal diffAmount) {
+        jdbc.update("INSERT INTO settlement_line (settlement_id, user_id, approved_amount, amount, diff_amount)"
+                        + " VALUES (?, ?, ?, ?, ?)",
+                settlementId, userId, approvedAmount, amount, diffAmount);
+    }
+
+    /** 查询窗口最新版本结算单，无则 null。 */
+    public SettlementRow findLatestSettlement(long windowId) {
+        try {
+            return jdbc.queryForObject(SETTLEMENT_SELECT
+                            + " FROM settlement WHERE window_id = ? ORDER BY version DESC LIMIT 1",
+                    SETTLEMENT_MAPPER, windowId);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 窗口全部结算单，按版本升序。 */
+    public List<SettlementRow> listSettlements(long windowId) {
+        return jdbc.query(SETTLEMENT_SELECT + " FROM settlement WHERE window_id = ? ORDER BY version",
+                SETTLEMENT_MAPPER, windowId);
+    }
+
+    /** 结算单全部明细行，按用水户排序。 */
+    public List<SettlementLineRow> listSettlementLines(long settlementId) {
+        return jdbc.query(
+                "SELECT id, settlement_id, user_id, approved_amount, amount, diff_amount"
+                        + " FROM settlement_line WHERE settlement_id = ? ORDER BY user_id",
+                SETTLEMENT_LINE_MAPPER, settlementId);
+    }
+
+    /** 窗口内 APPROVED 申请当前持有额度按用水户分组汇总（BigDecimal 精确求和），按用水户排序。 */
+    public List<FarmerTotalRow> sumApprovedByUser(long windowId) {
+        return jdbc.query(
+                "SELECT user_id, COALESCE(SUM(held_amount), 0) AS total FROM allocation"
+                        + " WHERE window_id = ? AND status = 'APPROVED' GROUP BY user_id ORDER BY user_id",
+                FARMER_TOTAL_MAPPER, windowId);
+    }
+
+    /** 按幂等键查询请求，不存在返回 null。 */
+    public RequestRow findRequest(String requestId) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT request_id, operation, actor, resource, params, response, created_nanos"
+                            + " FROM request_log WHERE request_id = ?", REQUEST_MAPPER, requestId);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 先占位插入请求（响应为空），同事务内业务成功后写回响应。 */
+    public void insertRequest(String requestId, String operation, String actor, String resource,
+                              String params, long createdNanos) {
+        jdbc.update("INSERT INTO request_log (request_id, operation, actor, resource, params, response,"
+                        + " created_nanos) VALUES (?, ?, ?, ?, ?, NULL, ?)",
+                requestId, operation, actor, resource, params, createdNanos);
+    }
+
+    /** 写回请求首次成功响应。 */
+    public void updateRequestResponse(String requestId, String response) {
+        jdbc.update("UPDATE request_log SET response = ? WHERE request_id = ?", response, requestId);
+    }
 }
