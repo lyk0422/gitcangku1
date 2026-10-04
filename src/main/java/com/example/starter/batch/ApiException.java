@@ -39,4 +39,11 @@ public class ApiException extends RuntimeException {
     public static ApiException unprocessable(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "PRECONDITION_FAILED", message);
     }
+
+    /**
+     * 422 前置条件未满足，携带可区分的业务原因码（如 PREFIX_OVERLAP、MATERIAL_MISMATCH）。
+     */
+    public static ApiException unprocessable(String code, String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, code, message);
+    }
 }
