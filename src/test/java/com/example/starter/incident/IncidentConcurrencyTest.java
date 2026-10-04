@@ -18,6 +18,7 @@ import com.example.starter.incident.dto.Requests.ReportRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
+import com.example.starter.incident.dto.Requests.TransferReadbackRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.IncidentView;
 import org.junit.jupiter.api.BeforeEach;
@@ -43,6 +44,7 @@ class IncidentConcurrencyTest {
     void clean() {
         jdbc.update("DELETE FROM command_keys");
         jdbc.update("DELETE FROM incident_status_history");
+        jdbc.update("DELETE FROM transfer_briefings");
         jdbc.update("DELETE FROM incident_transfers");
         jdbc.update("DELETE FROM incident_actions");
         jdbc.update("DELETE FROM incident_task_blockers");
@@ -114,9 +116,13 @@ class IncidentConcurrencyTest {
         service.takeover(ik, "alice", new TakeoverRequest(key()));
         service.changeStatus(ik, "alice", new StatusRequest(key(), "CONTAINED"));
         service.initiateTransfer(ik, "alice", new TransferRequest(key(), "bob"));
+        var briefing = service.currentBriefing(ik, "bob");
+        service.readbackBriefing(ik, "bob",
+                new TransferReadbackRequest(key(), briefing.id(), briefing.digest()));
+        long briefingId = briefing.id();
 
         List<Object> results = runConcurrently(List.of(
-                () -> service.acceptTransfer(ik, "bob", new TransferAcceptRequest(key())),
+                () -> service.acceptTransfer(ik, "bob", new TransferAcceptRequest(key(), briefingId)),
                 () -> service.changeStatus(ik, "alice", new StatusRequest(key(), "RESOLVED"))));
 
         long successes = results.stream().filter(IncidentView.class::isInstance).count();

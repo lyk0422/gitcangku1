@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS incidents (
     status VARCHAR(16) NOT NULL,
     commander VARCHAR(128) NULL,
     deadline_at TIMESTAMP(6) NULL,
+    version BIGINT NOT NULL DEFAULT 0,
     created_at TIMESTAMP(6) NOT NULL,
     updated_at TIMESTAMP(6) NOT NULL,
     CONSTRAINT uk_incidents_key UNIQUE (incident_key)
@@ -98,4 +99,22 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
+);
+CREATE TABLE IF NOT EXISTS transfer_briefings (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    transfer_id BIGINT NOT NULL,
+    incident_id BIGINT NOT NULL,
+    version INT NOT NULL,
+    incident_version BIGINT NOT NULL,
+    incident_status VARCHAR(16) NOT NULL,
+    note VARCHAR(1024) NOT NULL,
+    payload_json CLOB NOT NULL,
+    digest VARCHAR(64) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    readback_by VARCHAR(128) NULL,
+    readback_at TIMESTAMP(6) NULL,
+    created_by VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    frozen_at TIMESTAMP(6) NULL,
+    CONSTRAINT uk_transfer_briefing_version UNIQUE (transfer_id, version)
 );

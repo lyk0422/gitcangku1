@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS incidents (
     status VARCHAR(16) NOT NULL COMMENT '状态：REPORTED/COMMANDING/CONTAINED/RESOLVED/CLOSED，仅允许单向逐级流转',
     commander VARCHAR(128) NULL COMMENT '当前指挥人（X-Actor-Id）；REPORTED 状态为空表示尚未接管',
     deadline_at TIMESTAMP(6) NULL COMMENT '遏制期限 UTC；首次进入 COMMANDING 时按接管时刻加等级时限确定，S1=5分钟/S2=15分钟/S3=60分钟/S4=240分钟，交接不重置；REPORTED 为空',
+    version BIGINT NOT NULL DEFAULT 0 COMMENT '事件版本：新增/完成/取消任务、新增或确认升级记录、状态变更时递增；交接简报冻结该版本，接收时不一致则简报失效',
     created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
     updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间',
     CONSTRAINT uk_incidents_key UNIQUE (incident_key)
@@ -49,7 +50,7 @@ CREATE TABLE IF NOT EXISTS incident_status_history (
 CREATE TABLE IF NOT EXISTS command_keys (
     id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
     command_key VARCHAR(128) NOT NULL COMMENT '调用方幂等键，全局唯一',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：takeover/transfer_initiate/transfer_accept/action/status/escalation_check/escalation_ack/task_create/task_complete/task_cancel',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：takeover/transfer_initiate/transfer_accept/transfer_readback/transfer_refresh/action/status/escalation_check/escalation_ack/task_create/task_complete/task_cancel',
     request_hash VARCHAR(64) NOT NULL COMMENT '规范化请求参数的 SHA-256 摘要，用于同键改参检测',
     response_status INT NULL COMMENT '首次成功的 HTTP 状态码；事务提交前必写入',
     response_body MEDIUMTEXT NULL COMMENT '首次成功响应 JSON，用于同键同参重放',
@@ -100,3 +101,21 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY COMMENT '固定为 1 的单行锁；创建任务时 SELECT ... FOR UPDATE 持有，串行化环检测与写入，保证并发反向依赖最终图无环'
 ) COMMENT='任务依赖图全局锁表';
+CREATE TABLE IF NOT EXISTS transfer_briefings (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    transfer_id BIGINT NOT NULL COMMENT '所属交接单 id，关联 incident_transfers.id；同一交接单内可多次刷新简报',
+    incident_id BIGINT NOT NULL COMMENT '所属事件 id，关联 incidents.id',
+    version INT NOT NULL COMMENT '简报版本：同一交接单内从 1 开始，每次刷新加一；旧版本保留为 SUPERSEDED',
+    incident_version BIGINT NOT NULL COMMENT '冻结的事件版本（incidents.version）；接收时与当前值不一致则简报失效',
+    incident_status VARCHAR(16) NOT NULL COMMENT '冻结时的事件状态快照',
+    note VARCHAR(1024) NOT NULL COMMENT '交出人补充说明；未提供为空串',
+    payload_json MEDIUMTEXT NOT NULL COMMENT '完整结构化简报 JSON（未完成任务编号及状态、未确认升级记录、补充说明等），为 digest 的计算输入，字段边界由 JSON 结构保证不可碰撞',
+    digest VARCHAR(64) NOT NULL COMMENT 'payload_json 的 SHA-256 摘要（十六进制）；回读时提交的摘要必须与之完全一致',
+    status VARCHAR(16) NOT NULL COMMENT '状态：CURRENT 当前有效 / SUPERSEDED 已被刷新取代 / FROZEN 交接完成时冻结；同一交接单至多一条 CURRENT',
+    readback_by VARCHAR(128) NULL COMMENT '回读确认人（指定接班人）；仅已回读的简报有值，否则为空',
+    readback_at TIMESTAMP(6) NULL COMMENT '回读确认 UTC 时刻；仅已回读的简报有值，否则为空',
+    created_by VARCHAR(128) NOT NULL COMMENT '简报创建人（交出人，即发起或刷新时的当前指挥人）',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
+    frozen_at TIMESTAMP(6) NULL COMMENT '交接成功时冻结 UTC 时刻；仅 FROZEN 有值，否则为空',
+    CONSTRAINT uk_transfer_briefing_version UNIQUE (transfer_id, version)
+) COMMENT='指挥交接未结事项简报表';

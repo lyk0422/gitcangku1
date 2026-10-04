@@ -12,6 +12,7 @@ import com.example.starter.incident.dto.Requests.TakeoverRequest;
 import com.example.starter.incident.dto.Requests.TaskActionRequest;
 import com.example.starter.incident.dto.Requests.TaskCreateRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
+import com.example.starter.incident.dto.Requests.TransferReadbackRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.IncidentTasksView;
 import com.example.starter.incident.dto.Responses.IncidentView;
@@ -42,6 +43,7 @@ class IncidentTaskServiceTest {
     void clean() {
         jdbc.update("DELETE FROM command_keys");
         jdbc.update("DELETE FROM incident_status_history");
+        jdbc.update("DELETE FROM transfer_briefings");
         jdbc.update("DELETE FROM incident_transfers");
         jdbc.update("DELETE FROM incident_actions");
         jdbc.update("DELETE FROM incident_task_blockers");
@@ -58,6 +60,16 @@ class IncidentTaskServiceTest {
         return service.takeover(incidentKey, commander, new TakeoverRequest(key()));
     }
 
+    /**
+     * 目标人回读当前简报后接受交接（简报机制适配的公共步骤）。
+     */
+    private void acceptWithReadback(String incidentKey, String toCommander) {
+        var briefing = service.currentBriefing(incidentKey, toCommander);
+        service.readbackBriefing(incidentKey, toCommander,
+                new TransferReadbackRequest(key(), briefing.id(), briefing.digest()));
+        service.acceptTransfer(incidentKey, toCommander,
+                new TransferAcceptRequest(key(), briefing.id()));
+    }
     private static void assertApiStatus(ThrowingCallable call, HttpStatus status) {
         assertThatThrownBy(call).isInstanceOfSatisfying(ApiException.class,
                 e -> assertThat(e.status()).isEqualTo(status));
@@ -151,7 +163,7 @@ class IncidentTaskServiceTest {
                 new TaskCreateRequest(key(), "T-1", "G", "t", List.of())), HttpStatus.CONFLICT);
         // 指挥权变更：交接后旧指挥人失去权限，新指挥人可创建
         service.initiateTransfer("INC-C1", "alice", new TransferRequest(key(), "bob"));
-        service.acceptTransfer("INC-C1", "bob", new TransferAcceptRequest(key()));
+        acceptWithReadback("INC-C1", "bob");
         assertApiStatus(() -> service.createTask("INC-C1", "alice",
                 new TaskCreateRequest(key(), "T-1", "G", "t", List.of())), HttpStatus.CONFLICT);
         TaskView byNew = service.createTask("INC-C1", "bob",
@@ -311,7 +323,7 @@ class IncidentTaskServiceTest {
                 new TaskActionRequest(key())), HttpStatus.CONFLICT);
         // 交接后旧指挥人失去权限，新指挥人可完成
         service.initiateTransfer("INC-W1", "alice", new TransferRequest(key(), "bob"));
-        service.acceptTransfer("INC-W1", "bob", new TransferAcceptRequest(key()));
+        acceptWithReadback("INC-W1", "bob");
         assertApiStatus(() -> service.completeTask("INC-W1", "T-1", "alice",
                 new TaskActionRequest(key())), HttpStatus.CONFLICT);
         TaskView done = service.completeTask("INC-W1", "T-1", "bob",

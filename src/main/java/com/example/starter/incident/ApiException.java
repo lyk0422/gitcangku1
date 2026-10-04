@@ -41,6 +41,10 @@ public class ApiException extends RuntimeException {
     public static ApiException notFound(String message) {
         return new ApiException(HttpStatus.NOT_FOUND, "NOT_FOUND", message, null);
     }
+    /** 403：已识别操作人但无权访问该资源（如非交出人/接班人读取简报）。 */
+    public static ApiException forbidden(String message) {
+        return new ApiException(HttpStatus.FORBIDDEN, "FORBIDDEN", message, null);
+    }
 
     /** 409：权限冲突、状态冲突或幂等键冲突。 */
     public static ApiException conflict(String message) {

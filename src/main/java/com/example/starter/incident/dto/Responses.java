@@ -74,6 +74,28 @@ public final class Responses {
     /** 按事件分组的任务列表视图：tasks 按创建顺序返回。 */
     public record IncidentTasksView(String incidentKey, List<TaskView> tasks) {
     }
+    /** 简报中冻结的未完成任务项：任务编号、分组与冻结时状态。 */
+    public record BriefingTaskView(String taskKey, String groupCode, String status) {
+    }
+
+    /** 简报中冻结的未确认升级记录项：记录 id、遏制期限、触发时刻与触发时指挥人（UTC）。 */
+    public record BriefingEscalationView(Long id, Instant deadlineAt, Instant triggeredAt,
+                                         String triggeredCommander) {
+    }
+
+    /**
+     * 交接简报视图：version 为简报版本（同一交接单内从 1 递增）；
+     * incidentVersion 为冻结的事件版本；unfinishedTasks 为冻结时未完成任务编号及状态；
+     * openEscalations 为冻结时未确认升级记录；digest 为完整结构化简报的 SHA-256；
+     * readbackBy/readbackAt 仅已回读有值；frozenAt 仅 FROZEN 有值。
+     */
+    public record BriefingView(long id, long transferId, String incidentKey, int version,
+                               long incidentVersion, String incidentStatus, String note,
+                               List<BriefingTaskView> unfinishedTasks,
+                               List<BriefingEscalationView> openEscalations,
+                               String digest, String status, String readbackBy, Instant readbackAt,
+                               String createdBy, Instant createdAt, Instant frozenAt) {
+    }
 
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {

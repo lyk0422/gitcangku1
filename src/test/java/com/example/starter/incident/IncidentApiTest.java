@@ -33,6 +33,7 @@ class IncidentApiTest {
     void clean() {
         jdbc.update("DELETE FROM command_keys");
         jdbc.update("DELETE FROM incident_status_history");
+        jdbc.update("DELETE FROM transfer_briefings");
         jdbc.update("DELETE FROM incident_transfers");
         jdbc.update("DELETE FROM incident_actions");
         jdbc.update("DELETE FROM incident_task_blockers");
@@ -88,10 +89,30 @@ class IncidentApiTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.pendingTransferTo").value("bob"));
 
+        // 接班人读取当前简报并回读确认后才能接受交接
+        String briefingBody = mvc.perform(get("/api/incidents/{k}/transfers/current/briefing",
+                        "INC-300").header("X-Actor-Id", "bob"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.version").value(1))
+                .andExpect(jsonPath("$.status").value("CURRENT"))
+                .andReturn().getResponse().getContentAsString();
+        long briefingId = ((Number) com.jayway.jsonpath.JsonPath.read(briefingBody, "$.id"))
+                .longValue();
+        String digest = com.jayway.jsonpath.JsonPath.read(briefingBody, "$.digest");
+
+        mvc.perform(post("/api/incidents/{k}/transfers/readback", "INC-300")
+                        .header("X-Actor-Id", "bob")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"requestId\":\"" + key() + "\",\"briefingId\":" + briefingId
+                                + ",\"digest\":\"" + digest + "\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.readbackBy").value("bob"));
+
         mvc.perform(post("/api/incidents/{k}/transfers/accept", "INC-300")
                         .header("X-Actor-Id", "bob")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"commandKey\":\"" + key() + "\"}"))
+                        .content("{\"commandKey\":\"" + key() + "\",\"briefingId\":" + briefingId
+                                + "}"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.commander").value("bob"));
 
@@ -143,6 +164,54 @@ class IncidentApiTest {
                 .andExpect(jsonPath("$.code").value("ILLEGAL_TRANSITION"));
     }
 
+    @Test
+    void apiBriefingPermissionAndReadbackErrors() throws Exception {
+        report("INC-320");
+        takeover("INC-320", "alice");
+        mvc.perform(post("/api/incidents/{k}/transfers", "INC-320")
+                        .header("X-Actor-Id", "alice")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"commandKey\":\"" + key() + "\",\"toCommander\":\"bob\","
+                                + "\"note\":\"注意未结任务\"}"))
+                .andExpect(status().isOk());
+
+        // 交出人与接班人之外读取简报：403
+        mvc.perform(get("/api/incidents/{k}/transfers/current/briefing", "INC-320")
+                        .header("X-Actor-Id", "mallory"))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.code").value("FORBIDDEN"));
+        // 接班人可读
+        String briefingBody = mvc.perform(get("/api/incidents/{k}/transfers/current/briefing",
+                        "INC-320").header("X-Actor-Id", "bob"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.note").value("注意未结任务"))
+                .andReturn().getResponse().getContentAsString();
+        long briefingId = ((Number) com.jayway.jsonpath.JsonPath.read(briefingBody, "$.id"))
+                .longValue();
+
+        // 错误摘要回读：409，不产生确认
+        mvc.perform(post("/api/incidents/{k}/transfers/readback", "INC-320")
+                        .header("X-Actor-Id", "bob")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"requestId\":\"" + key() + "\",\"briefingId\":" + briefingId
+                                + ",\"digest\":\"" + "0".repeat(64) + "\"}"))
+                .andExpect(status().isConflict());
+        // 未回读直接接收：409
+        mvc.perform(post("/api/incidents/{k}/transfers/accept", "INC-320")
+                        .header("X-Actor-Id", "bob")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"commandKey\":\"" + key() + "\",\"briefingId\":" + briefingId
+                                + "}"))
+                .andExpect(status().isConflict());
+        // 交出人回读：403（仅指定接班人）
+        String digest = com.jayway.jsonpath.JsonPath.read(briefingBody, "$.digest");
+        mvc.perform(post("/api/incidents/{k}/transfers/readback", "INC-320")
+                        .header("X-Actor-Id", "alice")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"requestId\":\"" + key() + "\",\"briefingId\":" + briefingId
+                                + ",\"digest\":\"" + digest + "\"}"))
+                .andExpect(status().isForbidden());
+    }
     @Test
     void apiIdempotentReplay() throws Exception {
         report("INC-310");

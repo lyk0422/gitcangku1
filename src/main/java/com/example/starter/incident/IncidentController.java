@@ -9,8 +9,11 @@ import com.example.starter.incident.dto.Requests.TakeoverRequest;
 import com.example.starter.incident.dto.Requests.TaskActionRequest;
 import com.example.starter.incident.dto.Requests.TaskCreateRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
+import com.example.starter.incident.dto.Requests.TransferReadbackRequest;
+import com.example.starter.incident.dto.Requests.TransferRefreshRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
+import com.example.starter.incident.dto.Responses.BriefingView;
 import com.example.starter.incident.dto.Responses.EscalationHistoryView;
 import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
@@ -121,6 +124,45 @@ public class IncidentController {
                                        @RequestHeader("X-Actor-Id") String actor,
                                        @RequestBody TransferAcceptRequest req) {
         return service.acceptTransfer(incidentKey, actor, req);
+    }
+    /**
+     * 查询当前待交接的有效简报（仅交出人或指定接班人，其他人 403）。
+     */
+    @GetMapping("/{incidentKey}/transfers/current/briefing")
+    public BriefingView currentBriefing(@PathVariable String incidentKey,
+                                        @RequestHeader("X-Actor-Id") String actor) {
+        return service.currentBriefing(incidentKey, actor);
+    }
+
+    /**
+     * 按 id 查询简报（含历史简报；仅该简报的交出人或接班人，其他人 403）。
+     */
+    @GetMapping("/{incidentKey}/transfers/briefings/{briefingId}")
+    public BriefingView getBriefing(@PathVariable String incidentKey,
+                                    @PathVariable long briefingId,
+                                    @RequestHeader("X-Actor-Id") String actor) {
+        return service.getBriefing(incidentKey, briefingId, actor);
+    }
+
+    /**
+     * 接班人回读简报：提交简报 id 与由完整结构化简报计算的摘要，
+     * 摘要一致才记录确认；requestId 为幂等键。
+     */
+    @PostMapping("/{incidentKey}/transfers/readback")
+    public BriefingView readbackBriefing(@PathVariable String incidentKey,
+                                         @RequestHeader("X-Actor-Id") String actor,
+                                         @RequestBody TransferReadbackRequest req) {
+        return service.readbackBriefing(incidentKey, actor, req);
+    }
+
+    /**
+     * 交出人刷新简报：在原待交接记录内生成新版本（版本加一），旧简报保留。
+     */
+    @PostMapping("/{incidentKey}/transfers/refresh")
+    public BriefingView refreshBriefing(@PathVariable String incidentKey,
+                                        @RequestHeader("X-Actor-Id") String actor,
+                                        @RequestBody TransferRefreshRequest req) {
+        return service.refreshBriefing(incidentKey, actor, req);
     }
 
     /**

@@ -11,6 +11,7 @@ import com.example.starter.incident.dto.Requests.ReportRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
+import com.example.starter.incident.dto.Requests.TransferReadbackRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
 import com.example.starter.incident.dto.Responses.HistoryView;
@@ -40,6 +41,7 @@ class IncidentServiceTest {
     void clean() {
         jdbc.update("DELETE FROM command_keys");
         jdbc.update("DELETE FROM incident_status_history");
+        jdbc.update("DELETE FROM transfer_briefings");
         jdbc.update("DELETE FROM incident_transfers");
         jdbc.update("DELETE FROM incident_actions");
         jdbc.update("DELETE FROM incident_task_blockers");
@@ -235,8 +237,12 @@ class IncidentServiceTest {
         assertApiStatus(() -> service.initiateTransfer("INC-140", "alice",
                 new TransferRequest(key(), "carol")), HttpStatus.CONFLICT);
 
-        // 目标人接受后原子切换
-        IncidentView after = service.acceptTransfer("INC-140", "bob", new TransferAcceptRequest(key()));
+        // 目标人回读简报后接受，原子切换
+        var briefing = service.currentBriefing("INC-140", "bob");
+        service.readbackBriefing("INC-140", "bob",
+                new TransferReadbackRequest(key(), briefing.id(), briefing.digest()));
+        IncidentView after = service.acceptTransfer("INC-140", "bob",
+                new TransferAcceptRequest(key(), briefing.id()));
         assertThat(after.commander()).isEqualTo("bob");
         assertThat(service.get("INC-140").pendingTransferTo()).isNull();
 

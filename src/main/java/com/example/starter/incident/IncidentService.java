@@ -23,8 +23,13 @@ import com.example.starter.incident.dto.Requests.TakeoverRequest;
 import com.example.starter.incident.dto.Requests.TaskActionRequest;
 import com.example.starter.incident.dto.Requests.TaskCreateRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
+import com.example.starter.incident.dto.Requests.TransferReadbackRequest;
+import com.example.starter.incident.dto.Requests.TransferRefreshRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
+import com.example.starter.incident.dto.Responses.BriefingEscalationView;
+import com.example.starter.incident.dto.Responses.BriefingTaskView;
+import com.example.starter.incident.dto.Responses.BriefingView;
 import com.example.starter.incident.dto.Responses.EscalationHistoryView;
 import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
@@ -72,16 +77,19 @@ public class IncidentService {
     private final EscalationRepository escalations;
     private final IncidentTaskRepository tasks;
     private final CommandKeyRepository commandKeys;
+    private final TransferBriefingRepository briefings;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public IncidentService(IncidentRepository incidents, EscalationRepository escalations,
                            IncidentTaskRepository tasks, CommandKeyRepository commandKeys,
+                           TransferBriefingRepository briefings,
                            ObjectMapper objectMapper, Clock clock) {
         this.incidents = incidents;
         this.escalations = escalations;
         this.tasks = tasks;
         this.commandKeys = commandKeys;
+        this.briefings = briefings;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -107,7 +115,7 @@ public class IncidentService {
         }
         Instant now = now();
         Incident incident = new Incident(0L, incidentKey, severity, summary, reporter,
-                IncidentStatus.REPORTED, null, now, now, null);
+                IncidentStatus.REPORTED, null, now, now, null, 0L);
         long id;
         try {
             id = incidents.insert(incident);
@@ -145,13 +153,17 @@ public class IncidentService {
 
     /**
      * 发起交接：仅当前指挥人可发起，目标人必须不同；RESOLVED/CLOSED 禁止发起。
+     * 同事务创建 v1 未结事项简报：冻结事件版本、未完成任务编号及状态、
+     * 未确认升级记录与交出人补充说明，供指定接班人回读。
      */
     @Transactional
     public TransferView initiateTransfer(String incidentKey, String actor, TransferRequest req) {
         String commandKey = requireText(req.commandKey(), "commandKey");
         String toCommander = requireText(req.toCommander(), "toCommander");
+        String note = req.note() == null ? "" : req.note().strip();
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "transfer_initiate", hash(incidentKey, actor, toCommander),
+        return runIdempotent(commandKey, "transfer_initiate",
+                structuredHash("transfer_initiate", actor, incidentKey, toCommander, note),
                 TransferView.class, () -> {
                     requireCommander(incident, actor);
                     if (incident.status() == IncidentStatus.RESOLVED
@@ -169,22 +181,26 @@ public class IncidentService {
                         throw ApiException.conflict("已存在待接受的交接，不能重复发起");
                     }
                     Instant now = now();
-                    incidents.insertTransfer(new IncidentTransfer(0L, incident.id(),
+                    long transferId = incidents.insertTransfer(new IncidentTransfer(0L, incident.id(),
                             incident.commander(), toCommander, TransferStatus.PENDING, now, null));
+                    createBriefing(transferId, incident, 1, note, incident.commander(), now);
                     return toTransferView(incidents.findPendingTransfer(incident.id()).orElseThrow());
                 });
     }
 
     /**
-     * 接受交接：仅待接受目标人可接受；接受后原子切换当前指挥人。
+     * 接受交接：仅待接受目标人可接受，且必须引用本人已回读的当前简报（briefingId）。
+     * 简报冻结的事件版本与当前不一致（发起后新增/完成/取消任务、确认升级或状态变更）返回 409；
+     * 接受成功在同一事务内切换指挥人并冻结简报与回读人，不会先换指挥再保存证据。
      * RESOLVED/CLOSED 禁止接受；待接受期间目标人无其他操作权限。
      */
     @Transactional
     public IncidentView acceptTransfer(String incidentKey, String actor, TransferAcceptRequest req) {
         String commandKey = requireText(req.commandKey(), "commandKey");
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "transfer_accept", hash(incidentKey, actor), IncidentView.class,
-                () -> {
+        return runIdempotent(commandKey, "transfer_accept",
+                structuredHash("transfer_accept", actor, incidentKey, req.briefingId()),
+                IncidentView.class, () -> {
                     if (incident.status() == IncidentStatus.RESOLVED
                             || incident.status() == IncidentStatus.CLOSED) {
                         throw ApiException.illegalTransition(
@@ -195,10 +211,141 @@ public class IncidentService {
                     if (!pending.toCommander().equals(actor)) {
                         throw ApiException.conflict("只有交接目标人 " + pending.toCommander() + " 能接受交接");
                     }
+                    if (req.briefingId() == null) {
+                        throw ApiException.badRequest("briefingId 不能为空，必须引用已回读的简报");
+                    }
+                    TransferBriefing current = briefings.findCurrentByTransfer(pending.id())
+                            .orElseThrow(() -> ApiException.conflict("当前交接没有有效简报"));
+                    if (current.id() != req.briefingId()) {
+                        throw ApiException.conflict("简报 " + req.briefingId()
+                                + " 不是当前有效简报，可能已被刷新，请回读最新简报");
+                    }
+                    if (current.readbackBy() == null) {
+                        throw ApiException.conflict("简报尚未回读确认，不能接受交接");
+                    }
+                    if (current.incidentVersion() != incident.version()) {
+                        throw ApiException.conflict("简报已失效：发起后未结事项或事件状态已变化，"
+                                + "请由交出人刷新简报后重新回读");
+                    }
                     Instant now = now();
                     incidents.acceptTransfer(pending.id(), now);
                     incidents.updateState(incident.id(), incident.status(), pending.toCommander(), now);
+                    briefings.freeze(current.id(), now);
                     return toView(incidents.findByKey(incidentKey).orElseThrow(), null);
+                });
+    }
+    /**
+     * 查询当前待交接的有效简报：仅交出人或指定接班人可读，其他人 403；
+     * 无待交接或简报时 404。只读，不隐式写入。
+     */
+    @Transactional(readOnly = true)
+    public BriefingView currentBriefing(String incidentKey, String actor) {
+        Incident incident = incidents.findByKey(incidentKey)
+                .orElseThrow(() -> ApiException.notFound("事件不存在: " + incidentKey));
+        IncidentTransfer pending = incidents.findPendingTransfer(incident.id())
+                .orElseThrow(() -> ApiException.notFound("当前没有待交接的简报"));
+        requireTransferParty(pending, actor);
+        TransferBriefing current = briefings.findCurrentByTransfer(pending.id())
+                .orElseThrow(() -> ApiException.notFound("当前交接没有有效简报"));
+        return toBriefingView(current, incident.incidentKey());
+    }
+
+    /**
+     * 按简报 id 查询（含 SUPERSEDED/FROZEN 历史简报，旧简报保留可查）：
+     * 仅该简报所属交接的交出人或接班人可读，其他人 403；权限校验先于任何重放。
+     */
+    @Transactional(readOnly = true)
+    public BriefingView getBriefing(String incidentKey, long briefingId, String actor) {
+        Incident incident = incidents.findByKey(incidentKey)
+                .orElseThrow(() -> ApiException.notFound("事件不存在: " + incidentKey));
+        TransferBriefing briefing = briefings.findById(briefingId)
+                .filter(b -> b.incidentId() == incident.id())
+                .orElseThrow(() -> ApiException.notFound("简报不存在: " + briefingId));
+        IncidentTransfer transfer = incidents.listTransfers(incident.id()).stream()
+                .filter(t -> t.id() == briefing.transferId())
+                .findFirst()
+                .orElseThrow(() -> ApiException.notFound("简报所属交接不存在: " + briefingId));
+        requireTransferParty(transfer, actor);
+        return toBriefingView(briefing, incident.incidentKey());
+    }
+
+    /**
+     * 简报回读：仅指定接班人（权限校验先于幂等重放，其他人 403）。
+     * 提交简报 id 与由完整结构化简报计算的摘要；摘要与服务端不一致或简报已被刷新/冻结
+     * 时不产生确认并返回 409。同一简报至多确认一次；requestId 同键同参重放首次响应。
+     */
+    @Transactional
+    public BriefingView readbackBriefing(String incidentKey, String actor,
+                                         TransferReadbackRequest req) {
+        String requestId = requireText(req.requestId(), "requestId");
+        if (req.briefingId() == null) {
+            throw ApiException.badRequest("briefingId 不能为空");
+        }
+        String digest = requireText(req.digest(), "digest");
+        Incident incident = lockIncident(incidentKey);
+        IncidentTransfer pending = incidents.findPendingTransfer(incident.id())
+                .orElseThrow(() -> ApiException.conflict("当前没有待接受的交接"));
+        if (!pending.toCommander().equals(actor)) {
+            throw ApiException.forbidden("只有指定接班人 " + pending.toCommander() + " 能回读简报");
+        }
+        return runIdempotent(requestId, "transfer_readback",
+                structuredHash("transfer_readback", actor, incidentKey, req.briefingId(), digest),
+                BriefingView.class, () -> {
+                    TransferBriefing briefing = briefings.findById(req.briefingId())
+                            .filter(b -> b.transferId() == pending.id())
+                            .orElseThrow(() -> ApiException.notFound(
+                                    "简报不存在: " + req.briefingId()));
+                    if (briefing.status() != BriefingStatus.CURRENT) {
+                        throw ApiException.conflict("简报 " + briefing.id()
+                                + " 已不再是当前有效简报（状态 " + briefing.status() + "），不能回读");
+                    }
+                    if (!briefing.digest().equals(digest)) {
+                        throw ApiException.conflict("回读摘要与简报摘要不一致，不产生确认");
+                    }
+                    if (briefing.readbackBy() != null) {
+                        throw ApiException.conflict("简报已被回读确认，不能重复回读");
+                    }
+                    briefings.confirmReadback(briefing.id(), actor, now());
+                    return toBriefingView(briefings.findById(briefing.id()).orElseThrow(),
+                            incident.incidentKey());
+                });
+    }
+
+    /**
+     * 刷新简报：仅交出人（发起时的当前指挥人，权限校验先于幂等重放，其他人 403）。
+     * 在原待交接记录内生成新版本简报（版本加一），重新冻结当前事件版本与未结事项；
+     * 旧简报保留为 SUPERSEDED，旧回读不能复用。expectedVersion 必须等于当前简报版本。
+     */
+    @Transactional
+    public BriefingView refreshBriefing(String incidentKey, String actor,
+                                        TransferRefreshRequest req) {
+        String requestId = requireText(req.requestId(), "requestId");
+        if (req.expectedVersion() == null) {
+            throw ApiException.badRequest("expectedVersion 不能为空");
+        }
+        String note = req.note() == null ? null : req.note().strip();
+        Incident incident = lockIncident(incidentKey);
+        IncidentTransfer pending = incidents.findPendingTransfer(incident.id())
+                .orElseThrow(() -> ApiException.conflict("当前没有待接受的交接"));
+        if (!pending.fromCommander().equals(actor)
+                || !actor.equals(incident.commander())) {
+            throw ApiException.forbidden("只有交出人 " + pending.fromCommander() + " 能刷新简报");
+        }
+        return runIdempotent(requestId, "transfer_refresh",
+                structuredHash("transfer_refresh", actor, incidentKey, req.expectedVersion(), note),
+                BriefingView.class, () -> {
+                    TransferBriefing current = briefings.findCurrentByTransfer(pending.id())
+                            .orElseThrow(() -> ApiException.conflict("当前交接没有有效简报"));
+                    if (current.version() != req.expectedVersion()) {
+                        throw ApiException.conflict("期望简报版本 " + req.expectedVersion()
+                                + " 与当前版本 " + current.version() + " 不一致");
+                    }
+                    Instant now = now();
+                    briefings.supersedeCurrent(pending.id());
+                    TransferBriefing refreshed = createBriefing(pending.id(), incident,
+                            current.version() + 1, note == null ? current.note() : note,
+                            actor, now);
+                    return toBriefingView(refreshed, incident.incidentKey());
                 });
     }
 
@@ -308,6 +455,8 @@ public class IncidentService {
                         escalations.insert(new Escalation(0L, incident.id(), incident.deadlineAt(),
                                 currentTime, incident.commander(), EscalationStatus.OPEN,
                                 null, null, null, currentTime, currentTime));
+                        // 新增未确认升级记录会改变简报内容，递增事件版本使已冻结简报失效
+                        incidents.bumpVersion(incident.id(), currentTime);
                     }
                     return toEscalationHistory(incident,
                             escalations.listByIncident(incident.id()));
@@ -339,6 +488,8 @@ public class IncidentService {
                     if (updated == 0) {
                         throw ApiException.conflict("升级记录已被并发处理，不能确认");
                     }
+                    // 确认升级会改变简报的未确认升级清单，递增事件版本使已冻结简报失效
+                    incidents.bumpVersion(incident.id(), ackedAt);
                     return toEscalationView(
                             escalations.findByIncident(incident.id()).orElseThrow());
                 });
@@ -457,6 +608,7 @@ public class IncidentService {
                     for (Incident blocker : blockers) {
                         tasks.insertBlocker(taskId, blocker.id(), now);
                     }
+                    incidents.bumpVersion(incident.id(), now);
                     return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
                 });
     }
@@ -485,7 +637,9 @@ public class IncidentService {
                         throw ApiException.conflict("存在未解除阻塞的事件: "
                                 + String.join(",", unresolved), List.copyOf(unresolved));
                     }
-                    tasks.markDone(task.id(), actor, now());
+                    Instant doneAt = now();
+                    tasks.markDone(task.id(), actor, doneAt);
+                    incidents.bumpVersion(incident.id(), doneAt);
                     return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
                 });
     }
@@ -508,7 +662,9 @@ public class IncidentService {
                         throw ApiException.conflict(
                                 "任务已处于终态 " + task.status() + "，不能取消");
                     }
-                    tasks.markCancelled(task.id(), actor, now());
+                    Instant cancelledAt = now();
+                    tasks.markCancelled(task.id(), actor, cancelledAt);
+                    incidents.bumpVersion(incident.id(), cancelledAt);
                     return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
                 });
     }
@@ -553,6 +709,15 @@ public class IncidentService {
                 .orElseThrow(() -> ApiException.notFound("事件不存在: " + incidentKey));
     }
 
+    /**
+     * 校验操作人是交接的交出人或指定接班人，否则 403（权限校验先于幂等重放）。
+     */
+    private static void requireTransferParty(IncidentTransfer transfer, String actor) {
+        if (!transfer.fromCommander().equals(actor) && !transfer.toCommander().equals(actor)) {
+            throw ApiException.forbidden("只有交出人 " + transfer.fromCommander()
+                    + " 或接班人 " + transfer.toCommander() + " 能查看该简报");
+        }
+    }
     private static void requireCommander(Incident incident, String actor) {
         if (incident.commander() == null || !incident.commander().equals(actor)) {
             throw ApiException.conflict("只有当前指挥人 "
@@ -619,6 +784,27 @@ public class IncidentService {
             throw new IllegalStateException(e);
         }
     }
+    /**
+     * 结构化参数摘要：将操作、操作者、资源与全部参数（含期望版本）序列化为 JSON 数组后取 SHA-256，
+     * 字段边界由 JSON 结构保证，避免分隔符碰撞；供新增写接口的幂等身份使用。
+     */
+    private String structuredHash(Object... parts) {
+        try {
+            return sha256Hex(objectMapper.writeValueAsString(java.util.Arrays.asList(parts))
+                    .getBytes(StandardCharsets.UTF_8));
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("请求参数序列化失败", e);
+        }
+    }
+
+    private static String sha256Hex(byte[] bytes) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            return HexFormat.of().formatHex(digest.digest(bytes));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
+    }
 
     private IncidentView toView(Incident incident, String pendingTransferTo) {
         return new IncidentView(incident.incidentKey(), incident.severity(), incident.summary(),
@@ -662,5 +848,60 @@ public class IncidentService {
         List<EscalationView> views = list.stream().map(this::toEscalationView).toList();
         EscalationView current = views.isEmpty() ? null : views.get(views.size() - 1);
         return new EscalationHistoryView(incident.deadlineAt(), current, views);
+    }
+
+    /**
+     * 简报结构化内容：冻结事件版本、事件状态、未完成任务编号及状态、未确认升级记录
+     * 与交出人补充说明。整体序列化为 JSON 作为摘要输入，字段边界由 JSON 结构保证不可碰撞。
+     */
+    public record BriefingContent(String incidentKey, int version, long incidentVersion,
+                                  String incidentStatus, String note,
+                                  List<BriefingTaskView> unfinishedTasks,
+                                  List<BriefingEscalationView> openEscalations) {
+    }
+
+    /**
+     * 收集当前未结事项并创建一版 CURRENT 简报：冻结事件版本与状态，
+     * 摘要为完整结构化内容 JSON 的 SHA-256。调用方须已持有事件行锁。
+     */
+    private TransferBriefing createBriefing(long transferId, Incident incident, int version,
+                                            String note, String createdBy, Instant now) {
+        String normalizedNote = note == null ? "" : note.strip();
+        List<BriefingTaskView> unfinished = tasks.listOpenByIncident(incident.id()).stream()
+                .map(t -> new BriefingTaskView(t.taskKey(), t.groupCode(), t.status().name()))
+                .toList();
+        List<BriefingEscalationView> openEscalations = escalations.listByIncident(incident.id())
+                .stream()
+                .filter(e -> e.status() == EscalationStatus.OPEN)
+                .map(e -> new BriefingEscalationView(e.id(), e.deadlineAt(), e.triggeredAt(),
+                        e.triggeredCommander()))
+                .toList();
+        BriefingContent content = new BriefingContent(incident.incidentKey(), version,
+                incident.version(), incident.status().name(), normalizedNote, unfinished,
+                openEscalations);
+        String payloadJson = toJson(content);
+        String digest = sha256Hex(payloadJson.getBytes(StandardCharsets.UTF_8));
+        long id = briefings.insert(new TransferBriefing(0L, transferId, incident.id(), version,
+                incident.version(), incident.status().name(), normalizedNote, payloadJson, digest,
+                BriefingStatus.CURRENT, null, null, createdBy, now, null));
+        return briefings.findById(id).orElseThrow();
+    }
+
+    /**
+     * 组装简报视图：未结事项清单从冻结的结构化内容还原，不重新计算。
+     */
+    private BriefingView toBriefingView(TransferBriefing briefing, String incidentKey) {
+        BriefingContent content;
+        try {
+            content = objectMapper.readValue(briefing.payloadJson(), BriefingContent.class);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("简报内容反序列化失败", e);
+        }
+        return new BriefingView(briefing.id(), briefing.transferId(), incidentKey,
+                briefing.version(), briefing.incidentVersion(), briefing.incidentStatus(),
+                briefing.note(), content.unfinishedTasks(), content.openEscalations(),
+                briefing.digest(), briefing.status().name(), briefing.readbackBy(),
+                briefing.readbackAt(), briefing.createdBy(), briefing.createdAt(),
+                briefing.frozenAt());
     }
 }

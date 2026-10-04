@@ -15,6 +15,7 @@ import com.example.starter.incident.dto.Requests.ReportRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
+import com.example.starter.incident.dto.Requests.TransferReadbackRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.EscalationHistoryView;
 import com.example.starter.incident.dto.Responses.EscalationView;
@@ -53,6 +54,7 @@ class EscalationServiceTest {
         jdbc.update("DELETE FROM command_keys");
         jdbc.update("DELETE FROM incident_escalations");
         jdbc.update("DELETE FROM incident_status_history");
+        jdbc.update("DELETE FROM transfer_briefings");
         jdbc.update("DELETE FROM incident_transfers");
         jdbc.update("DELETE FROM incident_actions");
         jdbc.update("DELETE FROM incident_task_blockers");
@@ -70,6 +72,16 @@ class EscalationServiceTest {
         return service.takeover(incidentKey, commander, new TakeoverRequest(key()));
     }
 
+    /**
+     * 目标人回读当前简报后接受交接（简报机制适配的公共步骤）。
+     */
+    private void acceptWithReadback(String incidentKey, String toCommander) {
+        var briefing = service.currentBriefing(incidentKey, toCommander);
+        service.readbackBriefing(incidentKey, toCommander,
+                new TransferReadbackRequest(key(), briefing.id(), briefing.digest()));
+        service.acceptTransfer(incidentKey, toCommander,
+                new TransferAcceptRequest(key(), briefing.id()));
+    }
     private static void assertApiStatus(ThrowingCallable call, HttpStatus status) {
         assertThatThrownBy(call).isInstanceOfSatisfying(ApiException.class,
                 e -> assertThat(e.status()).isEqualTo(status));
@@ -90,7 +102,7 @@ class EscalationServiceTest {
 
             // 交接不重置期限
             service.initiateTransfer(ik, "alice", new TransferRequest(key(), "bob"));
-            service.acceptTransfer(ik, "bob", new TransferAcceptRequest(key()));
+            acceptWithReadback(ik, "bob");
             assertThat(service.get(ik).deadlineAt()).isEqualTo(expected);
         }
     }
@@ -230,7 +242,7 @@ class EscalationServiceTest {
         ((ControllableClock) clock).setInstant(T0.plus(36, ChronoUnit.MINUTES));
         service.checkEscalation("INC-E-021", new EscalationCheckRequest(key()));
         service.initiateTransfer("INC-E-021", "alice", new TransferRequest(key(), "bob"));
-        service.acceptTransfer("INC-E-021", "bob", new TransferAcceptRequest(key()));
+        acceptWithReadback("INC-E-021", "bob");
         assertApiStatus(() -> service.acknowledgeEscalation("INC-E-021", "alice",
                 new EscalationAckRequest(key(), "旧指挥人说明")), HttpStatus.CONFLICT);
         EscalationView byBob = service.acknowledgeEscalation("INC-E-021", "bob",

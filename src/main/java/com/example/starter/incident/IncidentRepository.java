@@ -50,7 +50,7 @@ public class IncidentRepository {
                 rs.getString("summary"), rs.getString("reporter"),
                 IncidentStatus.valueOf(rs.getString("status")), rs.getString("commander"),
                 rs.getTimestamp("created_at").toInstant(), rs.getTimestamp("updated_at").toInstant(),
-                deadline == null ? null : deadline.toInstant());
+                deadline == null ? null : deadline.toInstant(), rs.getLong("version"));
     }
 
     /**
@@ -104,11 +104,22 @@ public class IncidentRepository {
     }
 
     /**
-     * 更新事件状态与指挥人（commander 可为 null 表示不变更时传入原值）。
+     * 更新事件状态与指挥人（commander 可为 null 表示不变更时传入原值），
+     * 同事务内将事件版本加一（状态变更会使已冻结的简报失效）。
      */
     public void updateState(long id, IncidentStatus status, String commander, Instant updatedAt) {
-        jdbc.update("UPDATE incidents SET status = ?, commander = ?, updated_at = ? WHERE id = ?",
+        jdbc.update("UPDATE incidents SET status = ?, commander = ?, version = version + 1,"
+                        + " updated_at = ? WHERE id = ?",
                 status.name(), commander, Timestamp.from(updatedAt), id);
+    }
+
+    /**
+     * 仅递增事件版本（新增/完成/取消任务、新增或确认升级记录时调用），
+     * 使此前冻结的交接简报在接收校验时失效。
+     */
+    public void bumpVersion(long id, Instant updatedAt) {
+        jdbc.update("UPDATE incidents SET version = version + 1, updated_at = ? WHERE id = ?",
+                Timestamp.from(updatedAt), id);
     }
 
     /**
