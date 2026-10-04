@@ -3,6 +3,7 @@ package com.example.starter.firmware.repo;
 import com.example.starter.firmware.domain.ReceiptResult;
 import com.example.starter.firmware.domain.ReleaseOrder;
 import com.example.starter.firmware.domain.ReleaseStatus;
+import com.example.starter.firmware.domain.ReleaseType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.jdbc.support.GeneratedKeyHolder;
@@ -24,10 +25,13 @@ public class ReleaseRepository {
             rs.getString("from_version"), rs.getString("to_version"),
             rs.getInt("ratio"), ReleaseStatus.valueOf(rs.getString("status")),
             rs.getInt("sample_floor"), rs.getInt("failure_threshold_percent"),
-            rs.getInt("monitor_round"), rs.getInt("round_success"), rs.getInt("round_failed"));
+            rs.getInt("monitor_round"), rs.getInt("round_success"), rs.getInt("round_failed"),
+            ReleaseType.valueOf(rs.getString("release_type")), rs.getString("base_digest"),
+            rs.getString("patch_digest"), rs.getString("target_digest"));
 
     private static final String COLUMNS = "id, version, model, from_version, to_version, ratio, status,"
-            + " sample_floor, failure_threshold_percent, monitor_round, round_success, round_failed";
+            + " sample_floor, failure_threshold_percent, monitor_round, round_success, round_failed,"
+            + " release_type, base_digest, patch_digest, target_digest";
 
     private final JdbcTemplate jdbc;
 
@@ -116,5 +120,34 @@ public class ReleaseRepository {
                 + " monitor_round = monitor_round + 1, round_success = 0, round_failed = 0,"
                 + " updated_at = CURRENT_TIMESTAMP"
                 + " WHERE id = ? AND version = ? AND status = 'PAUSED'", id, expectedVersion);
+    }
+
+    /**
+     * 新增增量发布单：声明基底、补丁、目标摘要（仅管理元数据，不下载二进制）。
+     */
+    public long insertDelta(String model, String fromVersion, String toVersion, int ratio,
+                            int sampleFloor, int failureThresholdPercent,
+                            String baseDigest, String patchDigest, String targetDigest) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO release_order (version, model, from_version, to_version, ratio, status,"
+                            + " sample_floor, failure_threshold_percent, monitor_round, active_model,"
+                            + " release_type, base_digest, patch_digest, target_digest)"
+                            + " VALUES (1, ?, ?, ?, ?, 'ACTIVE', ?, ?, 1, ?, 'DELTA', ?, ?, ?)",
+                    new String[]{"id"});
+            ps.setString(1, model);
+            ps.setString(2, fromVersion);
+            ps.setString(3, toVersion);
+            ps.setInt(4, ratio);
+            ps.setInt(5, sampleFloor);
+            ps.setInt(6, failureThresholdPercent);
+            ps.setString(7, model);
+            ps.setString(8, baseDigest);
+            ps.setString(9, patchDigest);
+            ps.setString(10, targetDigest);
+            return ps;
+        }, keyHolder);
+        return keyHolder.getKey().longValue();
     }
 }

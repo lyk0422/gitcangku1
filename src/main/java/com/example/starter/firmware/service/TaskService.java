@@ -8,6 +8,7 @@ import com.example.starter.firmware.domain.Device;
 import com.example.starter.firmware.domain.ReceiptResult;
 import com.example.starter.firmware.domain.ReleaseOrder;
 import com.example.starter.firmware.domain.ReleaseStatus;
+import com.example.starter.firmware.domain.ReleaseType;
 import com.example.starter.firmware.domain.RolloutTask;
 import com.example.starter.firmware.domain.TaskStatus;
 import com.example.starter.firmware.error.ApiException;
@@ -70,8 +71,13 @@ public class TaskService {
             if (existing.isPresent()) {
                 return new PullResponse(TaskView.of(existing.get(), order));
             }
-            if (order.status() != ReleaseStatus.ACTIVE
-                    || !device.currentVersion().equals(order.fromVersion())
+            if (order.status() != ReleaseStatus.ACTIVE) {
+                return new PullResponse(null);
+            }
+            if (order.releaseType() == ReleaseType.DELTA) {
+                return pullDelta(order, deviceId);
+            }
+            if (!device.currentVersion().equals(order.fromVersion())
                     || device.bucketNo() >= order.ratio()) {
                 return new PullResponse(null);
             }
@@ -90,12 +96,45 @@ public class TaskService {
     }
 
     /**
+     * 增量拉取：设备行锁内重新读取设备，当前版本与摘要均须匹配基底，否则 422 且不生成任务；
+     * 命中后冻结三个摘要与设备镜像代次。与本地维护更新串行，不会基于旧镜像生成任务。
+     */
+    private PullResponse pullDelta(ReleaseOrder order, String deviceId) {
+        Device device = deviceRepository.findByIdForUpdate(deviceId)
+                .orElseThrow(() -> ApiException.notFound("DEVICE_NOT_FOUND", "设备不存在: " + deviceId));
+        if (!device.currentVersion().equals(order.fromVersion())) {
+            throw ApiException.unprocessable("VERSION_MISMATCH",
+                    "设备当前版本与增量基底版本不一致: " + device.currentVersion());
+        }
+        if (!device.currentDigest().equals(order.baseDigest())) {
+            throw ApiException.unprocessable("DIGEST_MISMATCH", "设备当前镜像摘要与增量基底摘要不一致");
+        }
+        if (device.bucketNo() >= order.ratio()) {
+            return new PullResponse(null);
+        }
+        long taskId;
+        try {
+            taskId = taskRepository.insertDelta(order.id(), deviceId, order.baseDigest(),
+                    order.patchDigest(), order.targetDigest(), device.imageGeneration());
+        } catch (DuplicateKeyException e) {
+            RolloutTask task = taskRepository.findByReleaseAndDevice(order.id(), deviceId)
+                    .orElseThrow(() -> new IllegalStateException("任务唯一约束冲突后未找到任务"));
+            return new PullResponse(TaskView.of(task, order));
+        }
+        RolloutTask task = taskRepository.findById(taskId)
+                .orElseThrow(() -> new IllegalStateException("任务创建后读取失败"));
+        return new PullResponse(TaskView.of(task, order));
+    }
+
+    /**
      * 回执：首次回执终结任务并计入完成时所在监控轮次，仅 SUCCESS 更新设备当前版本；
      * 同结果重复成功（不重复计数），改结果 409；已取消任务的后到回执 409 且不更新设备版本。
      * 样本达到下限且失败率越限时，同事务将仍为 ACTIVE 的发布单原子转为 PAUSED 并落暂停记录。
      */
     public TaskView receipt(long taskId, ReceiptRequest request) {
-        String fingerprint = String.join("|", "task.receipt", String.valueOf(taskId), request.result().name());
+        String fingerprint = idempotency.structuredFingerprint("task.receipt", taskId,
+                request.result().name(), request.taskGeneration(), request.actualBaseDigest(),
+                request.actualTargetDigest());
         return idempotency.execute(request.requestId(), "task.receipt", fingerprint, () -> {
             RolloutTask snapshot = taskRepository.findById(taskId)
                     .orElseThrow(() -> ApiException.notFound("TASK_NOT_FOUND", "任务不存在: " + taskId));
@@ -105,10 +144,14 @@ public class TaskService {
                     .orElseThrow(() -> ApiException.notFound("TASK_NOT_FOUND", "任务不存在: " + taskId));
             return switch (task.status()) {
                 case PENDING -> {
-                    taskRepository.complete(taskId, request.result());
-                    releaseRepository.incrementRoundStats(snapshot.releaseId(), request.result());
-                    if (request.result() == ReceiptResult.SUCCESS) {
-                        deviceRepository.updateCurrentVersion(task.deviceId(), lockedOrder.toVersion());
+                    if (request.result() == ReceiptResult.SUCCESS && task.targetDigest() != null) {
+                        applyDeltaReceipt(task, request, lockedOrder);
+                    } else {
+                        taskRepository.complete(taskId, request.result());
+                        releaseRepository.incrementRoundStats(snapshot.releaseId(), request.result());
+                        if (request.result() == ReceiptResult.SUCCESS) {
+                            deviceRepository.updateCurrentVersion(task.deviceId(), lockedOrder.toVersion());
+                        }
                     }
                     ReleaseOrder updated = releaseRepository.findById(snapshot.releaseId()).orElseThrow();
                     pauseIfThresholdReached(updated, taskId);
@@ -145,6 +188,33 @@ public class TaskService {
             pauseRecordRepository.insert(order.id(), order.monitorRound(), triggerTaskId,
                     order.roundSuccess(), order.roundFailed(), Instant.now(clock).toString());
         }
+    }
+
+    /**
+     * 增量任务 SUCCESS：回执必须携带任务代次、实际基底与实际目标摘要且与任务冻结值一致，
+     * 任一不符 409，不更新设备、不统计成功；设备当前镜像代次须仍等于任务冻结代次，
+     * 防止本地维护后的新镜像装上基于旧镜像的补丁。合法时同一事务写任务终态、统计与设备镜像。
+     */
+    private void applyDeltaReceipt(RolloutTask task, ReceiptRequest request, ReleaseOrder lockedOrder) {
+        if (request.taskGeneration() == null || !request.taskGeneration().equals(task.imageGeneration())) {
+            throw ApiException.conflict("RECEIPT_GENERATION_MISMATCH",
+                    "回执任务代次与任务冻结代次不一致: " + task.imageGeneration());
+        }
+        if (!task.baseDigest().equals(request.actualBaseDigest())) {
+            throw ApiException.conflict("RECEIPT_BASE_MISMATCH", "回执实际基底摘要与任务冻结基底摘要不一致");
+        }
+        if (!task.targetDigest().equals(request.actualTargetDigest())) {
+            throw ApiException.conflict("RECEIPT_TARGET_MISMATCH", "回执实际目标摘要与任务冻结目标摘要不一致");
+        }
+        Device device = deviceRepository.findByIdForUpdate(task.deviceId())
+                .orElseThrow(() -> ApiException.notFound("DEVICE_NOT_FOUND", "设备不存在: " + task.deviceId()));
+        if (device.imageGeneration() != task.imageGeneration()) {
+            throw ApiException.conflict("DEVICE_IMAGE_CHANGED",
+                    "设备镜像代次已变更为 " + device.imageGeneration() + "，基于旧镜像的回执不再受理");
+        }
+        taskRepository.complete(task.id(), request.result());
+        releaseRepository.incrementRoundStats(task.releaseId(), request.result());
+        deviceRepository.applyDelta(task.deviceId(), lockedOrder.toVersion(), task.targetDigest());
     }
 
     public TaskListResponse listByRelease(long releaseId, TaskStatus statusFilter) {

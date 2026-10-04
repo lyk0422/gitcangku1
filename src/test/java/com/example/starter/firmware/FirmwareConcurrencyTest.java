@@ -62,6 +62,8 @@ class FirmwareConcurrencyTest {
     @Autowired
     private JdbcTemplate jdbc;
 
+    private static final String DIGEST_A = "a".repeat(64);
+
     private ExecutorService executor;
 
     @BeforeEach
@@ -110,7 +112,7 @@ class FirmwareConcurrencyTest {
 
     @Test
     void 并发拉取_同设备同发布单最多一条任务() throws Exception {
-        deviceService.register(new RegisterDeviceRequest("req-d", "d1", "m1", "1.0.0", 5));
+        deviceService.register(new RegisterDeviceRequest("req-d", "d1", "m1", "1.0.0", DIGEST_A, 5));
         long releaseId = releaseService.create(new CreateReleaseRequest("req-r", "m1", "1.0.0", "2.0.0", 100))
                 .releaseId();
 
@@ -159,7 +161,7 @@ class FirmwareConcurrencyTest {
         for (int round = 0; round < 10; round++) {
             String deviceId = "d" + round;
             String model = "m" + round;
-            deviceService.register(new RegisterDeviceRequest("req-d" + round, deviceId, model, "1.0.0", 5));
+            deviceService.register(new RegisterDeviceRequest("req-d" + round, deviceId, model, "1.0.0", DIGEST_A, 5));
             long releaseId = releaseService.create(
                     new CreateReleaseRequest("req-r" + round, model, "1.0.0", "2.0.0", 100)).releaseId();
             final int seq = round;
@@ -184,7 +186,7 @@ class FirmwareConcurrencyTest {
         for (int round = 0; round < 10; round++) {
             String deviceId = "d" + round;
             String model = "m" + round;
-            deviceService.register(new RegisterDeviceRequest("req-d" + round, deviceId, model, "1.0.0", 5));
+            deviceService.register(new RegisterDeviceRequest("req-d" + round, deviceId, model, "1.0.0", DIGEST_A, 5));
             long releaseId = releaseService.create(
                     new CreateReleaseRequest("req-r" + round, model, "1.0.0", "2.0.0", 100)).releaseId();
             long taskId = taskService.pull(deviceId, "req-p" + round).task().taskId();
@@ -217,7 +219,7 @@ class FirmwareConcurrencyTest {
 
     @Test
     void 并发同requestId_重放一致且副作用只发生一次() throws Exception {
-        deviceService.register(new RegisterDeviceRequest("req-d", "d1", "m1", "1.0.0", 5));
+        deviceService.register(new RegisterDeviceRequest("req-d", "d1", "m1", "1.0.0", DIGEST_A, 5));
         long releaseId = releaseService.create(new CreateReleaseRequest("req-r", "m1", "1.0.0", "2.0.0", 10))
                 .releaseId();
 
@@ -241,7 +243,7 @@ class FirmwareConcurrencyTest {
     void 并发失败回执_统计不丢失且每轮至多一条暂停记录() throws Exception {
         int devices = 8;
         for (int i = 0; i < devices; i++) {
-            deviceService.register(new RegisterDeviceRequest("req-d" + i, "d" + i, "m1", "1.0.0", i));
+            deviceService.register(new RegisterDeviceRequest("req-d" + i, "d" + i, "m1", "1.0.0", DIGEST_A, i));
         }
         long releaseId = releaseService.create(
                 new CreateReleaseRequest("req-r", "m1", "1.0.0", "2.0.0", 100, 2, 50)).releaseId();
@@ -273,8 +275,8 @@ class FirmwareConcurrencyTest {
         int resumeFirst = 0;
         for (int round = 0; round < 10; round++) {
             String model = "m" + round;
-            deviceService.register(new RegisterDeviceRequest("req-d" + round, "d" + round, model, "1.0.0", 1));
-            deviceService.register(new RegisterDeviceRequest("req-e" + round, "e" + round, model, "1.0.0", 2));
+            deviceService.register(new RegisterDeviceRequest("req-d" + round, "d" + round, model, "1.0.0", DIGEST_A, 1));
+            deviceService.register(new RegisterDeviceRequest("req-e" + round, "e" + round, model, "1.0.0", DIGEST_A, 2));
             long releaseId = releaseService.create(
                     new CreateReleaseRequest("req-r" + round, model, "1.0.0", "2.0.0", 100, 2, 50)).releaseId();
             long t1 = taskService.pull("d" + round, "req-p1-" + round).task().taskId();
@@ -315,8 +317,8 @@ class FirmwareConcurrencyTest {
 
     @Test
     void 并发同requestId恢复_重放一致且版本只加一次() throws Exception {
-        deviceService.register(new RegisterDeviceRequest("req-d1", "d1", "m1", "1.0.0", 1));
-        deviceService.register(new RegisterDeviceRequest("req-d2", "d2", "m1", "1.0.0", 2));
+        deviceService.register(new RegisterDeviceRequest("req-d1", "d1", "m1", "1.0.0", DIGEST_A, 1));
+        deviceService.register(new RegisterDeviceRequest("req-d2", "d2", "m1", "1.0.0", DIGEST_A, 2));
         long releaseId = releaseService.create(
                 new CreateReleaseRequest("req-r", "m1", "1.0.0", "2.0.0", 100, 2, 50)).releaseId();
         long t1 = taskService.pull("d1", "req-p1").task().taskId();

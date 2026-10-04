@@ -21,12 +21,16 @@ public class TaskRepository {
 
     private static final RowMapper<RolloutTask> MAPPER = (rs, rowNum) -> {
         String firstResult = rs.getString("first_result");
+        int generation = rs.getInt("image_generation");
         return new RolloutTask(rs.getLong("id"), rs.getLong("release_id"), rs.getString("device_id"),
                 TaskStatus.valueOf(rs.getString("status")),
-                firstResult == null ? null : ReceiptResult.valueOf(firstResult));
+                firstResult == null ? null : ReceiptResult.valueOf(firstResult),
+                rs.getString("base_digest"), rs.getString("patch_digest"), rs.getString("target_digest"),
+                rs.wasNull() ? null : generation);
     };
 
-    private static final String COLUMNS = "id, release_id, device_id, status, first_result";
+    private static final String COLUMNS = "id, release_id, device_id, status, first_result,"
+            + " base_digest, patch_digest, target_digest, image_generation";
 
     private final JdbcTemplate jdbc;
 
@@ -42,6 +46,28 @@ public class TaskRepository {
                     new String[]{"id"});
             ps.setLong(1, releaseId);
             ps.setString(2, deviceId);
+            return ps;
+        }, keyHolder);
+        return keyHolder.getKey().longValue();
+    }
+
+    /**
+     * 新增增量任务：冻结发布单三个摘要与设备镜像代次。
+     */
+    public long insertDelta(long releaseId, String deviceId, String baseDigest, String patchDigest,
+                            String targetDigest, int imageGeneration) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO rollout_task (release_id, device_id, status, base_digest, patch_digest,"
+                            + " target_digest, image_generation) VALUES (?, ?, 'PENDING', ?, ?, ?, ?)",
+                    new String[]{"id"});
+            ps.setLong(1, releaseId);
+            ps.setString(2, deviceId);
+            ps.setString(3, baseDigest);
+            ps.setString(4, patchDigest);
+            ps.setString(5, targetDigest);
+            ps.setInt(6, imageGeneration);
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();

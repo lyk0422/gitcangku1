@@ -28,6 +28,8 @@ class FirmwareApiTest {
     @Autowired
     private JdbcTemplate jdbc;
 
+    private static final String DIGEST_A = "a".repeat(64);
+
     private static long idOf(MvcResult result, String path) throws Exception {
         Number value = com.jayway.jsonpath.JsonPath.read(result.getResponse().getContentAsString(), path);
         return value.longValue();
@@ -48,8 +50,8 @@ class FirmwareApiTest {
         MvcResult result = mockMvc.perform(post("/api/devices")
                         .contentType("application/json")
                         .content("""
-                                {"requestId":"%s","deviceId":"%s","model":"%s","currentVersion":"%s","bucketNo":%d}
-                                """.formatted(requestId, deviceId, model, version, bucket)))
+                                {"requestId":"%s","deviceId":"%s","model":"%s","currentVersion":"%s","currentDigest":"%s","bucketNo":%d}
+                                """.formatted(requestId, deviceId, model, version, DIGEST_A, bucket)))
                 .andReturn();
         return result.getResponse().getContentAsString();
     }
@@ -73,7 +75,7 @@ class FirmwareApiTest {
     @Test
     void 主流程_登记发布拉取回执成功并更新设备版本() throws Exception {
         mockMvc.perform(post("/api/devices").contentType("application/json").content("""
-                        {"requestId":"r1","deviceId":"d1","model":"m1","currentVersion":"1.0.0","bucketNo":5}
+                        {"requestId":"r1","deviceId":"d1","model":"m1","currentVersion":"1.0.0","currentDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bucketNo":5}
                         """))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.deviceId").value("d1"))
@@ -117,18 +119,18 @@ class FirmwareApiTest {
         registerDevice("r1", "d1", "m1", "1.0.0", 5);
 
         mockMvc.perform(post("/api/devices").contentType("application/json").content("""
-                        {"requestId":"r2","deviceId":"d1","model":"m1","currentVersion":"1.0.0","bucketNo":5}
+                        {"requestId":"r2","deviceId":"d1","model":"m1","currentVersion":"1.0.0","currentDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bucketNo":5}
                         """))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("DEVICE_EXISTS"));
 
         mockMvc.perform(post("/api/devices").contentType("application/json").content("""
-                        {"requestId":"r3","deviceId":"d2","model":"m1","currentVersion":"1.0.0","bucketNo":100}
+                        {"requestId":"r3","deviceId":"d2","model":"m1","currentVersion":"1.0.0","currentDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bucketNo":100}
                         """))
                 .andExpect(status().isBadRequest());
 
         mockMvc.perform(post("/api/devices").contentType("application/json").content("""
-                        {"deviceId":"d3","model":"m1","currentVersion":"1.0.0","bucketNo":1}
+                        {"deviceId":"d3","model":"m1","currentVersion":"1.0.0","currentDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bucketNo":1}
                         """))
                 .andExpect(status().isBadRequest());
     }
@@ -143,7 +145,7 @@ class FirmwareApiTest {
         assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM device", Long.class)).isEqualTo(1);
 
         mockMvc.perform(post("/api/devices").contentType("application/json").content("""
-                        {"requestId":"rid-1","deviceId":"d9","model":"m1","currentVersion":"1.0.0","bucketNo":5}
+                        {"requestId":"rid-1","deviceId":"d9","model":"m1","currentVersion":"1.0.0","currentDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bucketNo":5}
                         """))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("REQUEST_ID_CONFLICT"));

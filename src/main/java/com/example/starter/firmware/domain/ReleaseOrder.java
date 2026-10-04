@@ -15,8 +15,14 @@ package com.example.starter.firmware.domain;
  * @param monitorRound            当前监控轮次，从1开始，人工恢复后加一
  * @param roundSuccess            当前监控轮次内首次进入 SUCCESS 的任务数
  * @param roundFailed             当前监控轮次内首次进入 FAILED 的任务数
+ * @param releaseType             发布类型：FULL 普通全量，DELTA 增量补丁
+ * @param baseDigest              增量发布基底摘要，64位小写十六进制；FULL 为 null
+ * @param patchDigest             增量补丁包摘要，64位小写十六进制；FULL 为 null
+ * @param targetDigest            增量安装完成后的目标镜像摘要，64位小写十六进制；FULL 为 null
  */
 public record ReleaseOrder(long id, int version, String model, String fromVersion, String toVersion,
                            int ratio, ReleaseStatus status, int sampleFloor, int failureThresholdPercent,
-                           int monitorRound, int roundSuccess, int roundFailed) {
+                           int monitorRound, int roundSuccess, int roundFailed,
+                           ReleaseType releaseType, String baseDigest, String patchDigest,
+                           String targetDigest) {
 }

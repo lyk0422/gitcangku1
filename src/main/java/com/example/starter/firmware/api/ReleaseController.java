@@ -33,6 +33,14 @@ public class ReleaseController {
         return releaseService.create(request);
     }
 
+    /**
+     * 创建增量发布单：声明基底、补丁、目标摘要，仅管理元数据。
+     */
+    @PostMapping("/delta")
+    public ReleaseView createDelta(@Valid @RequestBody CreateDeltaReleaseRequest request) {
+        return releaseService.createDelta(request);
+    }
+
     @PostMapping("/{releaseId}/expand")
     public ReleaseView expand(@PathVariable long releaseId, @Valid @RequestBody ExpandReleaseRequest request) {
         return releaseService.expand(releaseId, request);

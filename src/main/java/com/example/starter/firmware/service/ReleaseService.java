@@ -1,5 +1,6 @@
 package com.example.starter.firmware.service;
 
+import com.example.starter.firmware.api.CreateDeltaReleaseRequest;
 import com.example.starter.firmware.api.CreateReleaseRequest;
 import com.example.starter.firmware.api.ExpandReleaseRequest;
 import com.example.starter.firmware.api.MonitorView;
@@ -61,6 +62,32 @@ public class ReleaseService {
             try {
                 id = releaseRepository.insert(request.model(), request.fromVersion(), request.toVersion(),
                         request.ratio(), sampleFloor, threshold);
+            } catch (DuplicateKeyException e) {
+                throw ApiException.conflict("ACTIVE_RELEASE_EXISTS", "型号已存在未终结发布单: " + request.model());
+            }
+            return ReleaseView.of(findOrder(id));
+        }, ReleaseView.class);
+    }
+
+    /**
+     * 创建增量发布单：声明基底、补丁、目标摘要（仅管理元数据，不下载二进制）。
+     * 同型号至多一张未终结发布单，与普通发布共用同一唯一约束。
+     */
+    public ReleaseView createDelta(CreateDeltaReleaseRequest request) {
+        if (request.fromVersion().equals(request.toVersion())) {
+            throw ApiException.badRequest("SAME_VERSION", "目标版本必须与来源版本不同");
+        }
+        int sampleFloor = request.effectiveSampleFloor();
+        int threshold = request.effectiveFailureThresholdPercent();
+        String fingerprint = idempotency.structuredFingerprint("release.createDelta", request.model(),
+                request.fromVersion(), request.toVersion(), request.ratio(), request.baseDigest(),
+                request.patchDigest(), request.targetDigest(), sampleFloor, threshold);
+        return idempotency.execute(request.requestId(), "release.createDelta", fingerprint, () -> {
+            long id;
+            try {
+                id = releaseRepository.insertDelta(request.model(), request.fromVersion(),
+                        request.toVersion(), request.ratio(), sampleFloor, threshold,
+                        request.baseDigest(), request.patchDigest(), request.targetDigest());
             } catch (DuplicateKeyException e) {
                 throw ApiException.conflict("ACTIVE_RELEASE_EXISTS", "型号已存在未终结发布单: " + request.model());
             }

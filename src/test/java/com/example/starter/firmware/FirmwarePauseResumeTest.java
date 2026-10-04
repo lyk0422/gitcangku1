@@ -45,7 +45,7 @@ class FirmwarePauseResumeTest {
 
     private void registerDevice(String requestId, String deviceId, String model, int bucket) throws Exception {
         mockMvc.perform(post("/api/devices").contentType("application/json").content("""
-                {"requestId":"%s","deviceId":"%s","model":"%s","currentVersion":"1.0.0","bucketNo":%d}
+                {"requestId":"%s","deviceId":"%s","model":"%s","currentVersion":"1.0.0","currentDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bucketNo":%d}
                 """.formatted(requestId, deviceId, model, bucket)))
                 .andExpect(status().isOk());
     }
