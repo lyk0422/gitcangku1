@@ -7,6 +7,9 @@ import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import java.util.function.Supplier;
 
 /**
@@ -39,6 +42,21 @@ public class IdempotencyService {
         this.objectMapper = objectMapper;
         for (int i = 0; i < LOCK_STRIPES; i++) {
             locks[i] = new Object();
+        }
+    }
+
+    /**
+     * 结构化请求指纹：接口标识与全部参数（含操作者、资源、期望版本）序列化为 JSON 数组，
+     * 按结构比较而非字符串拼接，参数中含分隔符也不会发生碰撞。
+     */
+    public String fingerprint(String api, Object... params) {
+        try {
+            List<Object> parts = new ArrayList<>();
+            parts.add(api);
+            parts.addAll(Arrays.asList(params));
+            return objectMapper.writeValueAsString(parts);
+        } catch (Exception e) {
+            throw new IllegalStateException("请求指纹序列化失败", e);
         }
     }
 

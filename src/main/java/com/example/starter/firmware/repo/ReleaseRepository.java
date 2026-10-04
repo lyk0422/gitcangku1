@@ -3,6 +3,7 @@ package com.example.starter.firmware.repo;
 import com.example.starter.firmware.domain.ReceiptResult;
 import com.example.starter.firmware.domain.ReleaseOrder;
 import com.example.starter.firmware.domain.ReleaseStatus;
+import com.example.starter.firmware.domain.ReleaseType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.jdbc.support.GeneratedKeyHolder;
@@ -22,11 +23,14 @@ public class ReleaseRepository {
     private static final RowMapper<ReleaseOrder> MAPPER = (rs, rowNum) -> new ReleaseOrder(
             rs.getLong("id"), rs.getInt("version"), rs.getString("model"),
             rs.getString("from_version"), rs.getString("to_version"),
+            ReleaseType.valueOf(rs.getString("release_type")),
+            rs.getString("base_digest"), rs.getString("patch_digest"), rs.getString("target_digest"),
             rs.getInt("ratio"), ReleaseStatus.valueOf(rs.getString("status")),
             rs.getInt("sample_floor"), rs.getInt("failure_threshold_percent"),
             rs.getInt("monitor_round"), rs.getInt("round_success"), rs.getInt("round_failed"));
 
-    private static final String COLUMNS = "id, version, model, from_version, to_version, ratio, status,"
+    private static final String COLUMNS = "id, version, model, from_version, to_version, release_type,"
+            + " base_digest, patch_digest, target_digest, ratio, status,"
             + " sample_floor, failure_threshold_percent, monitor_round, round_success, round_failed";
 
     private final JdbcTemplate jdbc;
@@ -35,22 +39,28 @@ public class ReleaseRepository {
         this.jdbc = jdbc;
     }
 
-    public long insert(String model, String fromVersion, String toVersion, int ratio,
+    public long insert(String model, String fromVersion, String toVersion, ReleaseType releaseType,
+                       String baseDigest, String patchDigest, String targetDigest, int ratio,
                        int sampleFloor, int failureThresholdPercent) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO release_order (version, model, from_version, to_version, ratio, status,"
+                    "INSERT INTO release_order (version, model, from_version, to_version, release_type,"
+                            + " base_digest, patch_digest, target_digest, ratio, status,"
                             + " sample_floor, failure_threshold_percent, monitor_round, active_model)"
-                            + " VALUES (1, ?, ?, ?, ?, 'ACTIVE', ?, ?, 1, ?)",
+                            + " VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, 1, ?)",
                     new String[]{"id"});
             ps.setString(1, model);
             ps.setString(2, fromVersion);
             ps.setString(3, toVersion);
-            ps.setInt(4, ratio);
-            ps.setInt(5, sampleFloor);
-            ps.setInt(6, failureThresholdPercent);
-            ps.setString(7, model);
+            ps.setString(4, releaseType.name());
+            ps.setString(5, baseDigest);
+            ps.setString(6, patchDigest);
+            ps.setString(7, targetDigest);
+            ps.setInt(8, ratio);
+            ps.setInt(9, sampleFloor);
+            ps.setInt(10, failureThresholdPercent);
+            ps.setString(11, model);
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();

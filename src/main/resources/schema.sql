@@ -1,9 +1,10 @@
 -- 固件灰度投放 schema（H2，MODE=MySQL）。时间均为服务器本地时区（Asia/Shanghai）。
-
 CREATE TABLE IF NOT EXISTS device (
   device_id VARCHAR(64) NOT NULL COMMENT '设备唯一标识',
   model VARCHAR(64) NOT NULL COMMENT '设备型号，登记后不可修改',
   current_version VARCHAR(64) NOT NULL COMMENT '设备当前固件版本',
+  current_digest CHAR(64) NOT NULL COMMENT '设备当前镜像SHA-256摘要，64位小写十六进制',
+  image_generation INT NOT NULL DEFAULT 1 COMMENT '设备镜像代次，登记为1，维护更新或增量安装成功加一',
   bucket_no INT NOT NULL COMMENT '灰度分桶号，取值0~99，登记后不可修改',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '登记时间',
   PRIMARY KEY (device_id)
@@ -15,6 +16,10 @@ CREATE TABLE IF NOT EXISTS release_order (
   model VARCHAR(64) NOT NULL COMMENT '目标设备型号',
   from_version VARCHAR(64) NOT NULL COMMENT '来源固件版本',
   to_version VARCHAR(64) NOT NULL COMMENT '目标固件版本，必须与来源版本不同',
+  release_type VARCHAR(16) NOT NULL DEFAULT 'FULL' COMMENT '发布类型：FULL普通全量，DELTA增量补丁',
+  base_digest CHAR(64) NULL COMMENT '增量基底摘要，64位小写十六进制；FULL为NULL',
+  patch_digest CHAR(64) NULL COMMENT '增量补丁摘要，64位小写十六进制；FULL为NULL',
+  target_digest CHAR(64) NULL COMMENT '增量目标摘要，64位小写十六进制；FULL为NULL',
   ratio INT NOT NULL COMMENT '投放比例，取值0~100，只增不减',
   status VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE投放中，PAUSED失败率自动暂停，CANCELLED已取消（终态）',
   sample_floor INT NOT NULL COMMENT '失败率统计样本下限，取值2~100；本轮样本数达到下限才评估暂停',
@@ -36,6 +41,10 @@ CREATE TABLE IF NOT EXISTS rollout_task (
   device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
   status VARCHAR(16) NOT NULL COMMENT 'PENDING待回执；SUCCESS成功；FAILED失败；CANCELLED已取消',
   first_result VARCHAR(16) NULL COMMENT '首次回执结果（SUCCESS/FAILED），未回执为NULL',
+  base_digest CHAR(64) NULL COMMENT '拉取时冻结的基底摘要；普通发布任务为NULL',
+  patch_digest CHAR(64) NULL COMMENT '拉取时冻结的补丁摘要；普通发布任务为NULL',
+  target_digest CHAR(64) NULL COMMENT '拉取时冻结的目标摘要；普通发布任务为NULL',
+  image_generation INT NULL COMMENT '拉取时冻结的设备镜像代次；普通发布任务为NULL',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
   PRIMARY KEY (id),
@@ -66,7 +75,7 @@ CREATE TABLE IF NOT EXISTS release_resume_record (
 CREATE TABLE IF NOT EXISTS idempotency_record (
   request_id VARCHAR(64) NOT NULL COMMENT '全局唯一请求ID',
   api VARCHAR(64) NOT NULL COMMENT '接口标识',
-  fingerprint VARCHAR(256) NOT NULL COMMENT '请求参数指纹，同键异参返回409',
+  fingerprint VARCHAR(512) NOT NULL COMMENT '请求参数结构化指纹（JSON），同键异参返回409',
   response_body CLOB NOT NULL COMMENT '成功响应快照（JSON），用于同键同参重放',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   PRIMARY KEY (request_id)

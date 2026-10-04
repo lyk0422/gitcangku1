@@ -30,6 +30,14 @@ public class DeviceController {
         return deviceService.register(request);
     }
 
+    /**
+     * 设备本地维护更新：更新当前版本与当前摘要并使镜像代次加一，不能改型号和灰度桶。
+     */
+    @PostMapping("/{deviceId}/maintenance")
+    public DeviceView maintain(@PathVariable String deviceId, @Valid @RequestBody MaintenanceRequest request) {
+        return deviceService.maintain(deviceId, request);
+    }
+
     @GetMapping("/{deviceId}")
     public DeviceView get(@PathVariable String deviceId) {
         return deviceService.get(deviceId);
