@@ -66,3 +66,40 @@ CREATE TABLE IF NOT EXISTS batch_lineage (
     created_at VARCHAR(40) NOT NULL COMMENT '拆分时间，ISO-8601 UTC instant 字符串',
     CONSTRAINT uk_lineage_child UNIQUE (child_key)
 );
+
+-- 生产线加工顺序与清洗验证 schema；时间均以 ISO-8601 UTC 字符串存储，空值含义见各列 COMMENT。
+CREATE TABLE IF NOT EXISTS production_line (
+    line_id VARCHAR(64) NOT NULL COMMENT '生产线标识，首次登记或提交清洗时自动建立',
+    next_seq INT NOT NULL COMMENT '下一个可登记的加工顺序号，从 1 开始连续递增；同时作为该线乐观版本号',
+    created_at VARCHAR(40) NOT NULL COMMENT '生产线建立时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT pk_production_line PRIMARY KEY (line_id)
+);
+
+CREATE TABLE IF NOT EXISTS line_sequence (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    line_id VARCHAR(64) NOT NULL COMMENT '所属生产线标识',
+    seq INT NOT NULL COMMENT '加工顺序号，从 1 开始连续递增，禁止插队',
+    batch_key VARCHAR(64) NOT NULL COMMENT '本批批次业务键；一个批次全局仅可登记一次，禁止一批挂多线',
+    prev_batch_key VARCHAR(64) NULL COMMENT '前一批次业务键；首批为 NULL',
+    request_id VARCHAR(64) NOT NULL COMMENT '登记请求幂等键（requestId）',
+    operator_id VARCHAR(64) NOT NULL COMMENT '登记操作人标识',
+    created_at VARCHAR(40) NOT NULL COMMENT '登记时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_line_seq UNIQUE (line_id, seq),
+    CONSTRAINT uk_line_batch UNIQUE (batch_key)
+);
+
+CREATE TABLE IF NOT EXISTS cleaning_record (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    cleaning_id VARCHAR(64) NOT NULL COMMENT '清洗记录业务键，全局唯一；确认须明确引用该键',
+    line_id VARCHAR(64) NOT NULL COMMENT '所属生产线标识',
+    from_batch_key VARCHAR(64) NOT NULL COMMENT '前批（先加工）批次业务键',
+    to_batch_key VARCHAR(64) NOT NULL COMMENT '后批（后加工）批次业务键',
+    residual_amount VARCHAR(32) NOT NULL COMMENT '残留量十进制字符串，单位毫克，0~100、最多 6 位小数；判定使用未舍入原值',
+    status VARCHAR(16) NOT NULL COMMENT '清洗状态：PENDING 待确认 / CONFIRMED 已确认有效；记录只增不改，旧记录不可翻转为合格',
+    submitted_by VARCHAR(64) NOT NULL COMMENT '清洗提交人标识',
+    submitted_at VARCHAR(40) NOT NULL COMMENT '提交时间，ISO-8601 UTC instant 字符串',
+    confirmed_by VARCHAR(64) NULL COMMENT '确认人标识，须为 QUALITY 角色且不同于提交人；未确认为 NULL',
+    confirmed_at VARCHAR(40) NULL COMMENT '确认时间，ISO-8601 UTC instant 字符串；未确认为 NULL',
+    version INT NOT NULL COMMENT '记录版本：0 待确认，1 已确认；确认请求须携带期望版本',
+    CONSTRAINT uk_cleaning_id UNIQUE (cleaning_id)
+);

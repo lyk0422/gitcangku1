@@ -59,13 +59,16 @@ public class BatchService {
     private static final int IDEMPOTENCY_MAX_ATTEMPTS = 3;
 
     private final BatchRepository repo;
+    private final LineService lineService;
     private final TransactionTemplate tx;
     private final ObjectMapper objectMapper;
 
     public BatchService(BatchRepository repo,
+                        LineService lineService,
                         PlatformTransactionManager transactionManager,
                         ObjectMapper objectMapper) {
         this.repo = repo;
+        this.lineService = lineService;
         this.tx = new TransactionTemplate(transactionManager);
         this.objectMapper = objectMapper;
     }
@@ -199,6 +202,11 @@ public class BatchService {
                 }
                 seq = 2;
                 newStatus = BatchStatus.RELEASED;
+            }
+            if (newStatus == BatchStatus.RELEASED) {
+                // 已上机登记的不同产品后批：放行前冻结相邻批次与合格清洗，
+                // 任一前批处于召回血缘中不得放行；不改变原双角色放行规则
+                lineService.assertReleasable(batchKey);
             }
             repo.insertApproval(new BatchRepository.ApprovalRow(0L, batchKey, req.commandKey(),
                     actor, role.name(), seq, now));
