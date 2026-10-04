@@ -8,12 +8,17 @@ import com.example.starter.api.dto.RouteCreateRequest;
 import com.example.starter.api.dto.RoutePointDto;
 import com.example.starter.api.dto.RouteReplaceRequest;
 import com.example.starter.api.dto.RouteResult;
+import com.example.starter.api.dto.TimedPointDto;
+import com.example.starter.api.dto.TimedReviewRequest;
+import com.example.starter.api.dto.TimedReviewResultDto;
 import com.example.starter.api.dto.ZoneCreateRequest;
 import com.example.starter.api.dto.ZoneResult;
 import com.example.starter.api.dto.ZoneRevokeRequest;
 import com.example.starter.domain.Geometry;
 import com.example.starter.domain.Point;
 import com.example.starter.domain.ReviewConclusion;
+import com.example.starter.domain.SegmentSpeed;
+import com.example.starter.domain.TimedPoint;
 import com.example.starter.domain.ZoneStatus;
 import com.example.starter.repo.AirspaceRepository;
 import com.example.starter.repo.DedupPo;
@@ -21,6 +26,8 @@ import com.example.starter.repo.ReviewPo;
 import com.example.starter.repo.ReviewRepository;
 import com.example.starter.repo.RoutePo;
 import com.example.starter.repo.RouteRepository;
+import com.example.starter.repo.TimedReviewPo;
+import com.example.starter.repo.TimedReviewRepository;
 import com.example.starter.repo.ZonePo;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -38,9 +45,12 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HexFormat;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.UUID;
@@ -64,10 +74,12 @@ public class AirspaceReviewService {
     static final String KIND_ROUTE_CREATE = "ROUTE_CREATE";
     static final String KIND_ROUTE_REPLACE = "ROUTE_REPLACE";
     static final String KIND_REVIEW = "REVIEW";
+    static final String KIND_TIMED_REVIEW = "TIMED_REVIEW";
 
     private final AirspaceRepository airspaceRepo;
     private final RouteRepository routeRepo;
     private final ReviewRepository reviewRepo;
+    private final TimedReviewRepository timedReviewRepo;
     private final ObjectMapper objectMapper;
     private final Clock clock;
     private final TransactionTemplate txTemplate;
@@ -75,12 +87,14 @@ public class AirspaceReviewService {
     public AirspaceReviewService(AirspaceRepository airspaceRepo,
                                  RouteRepository routeRepo,
                                  ReviewRepository reviewRepo,
+                                 TimedReviewRepository timedReviewRepo,
                                  ObjectMapper objectMapper,
                                  Clock clock,
                                  PlatformTransactionManager transactionManager) {
         this.airspaceRepo = airspaceRepo;
         this.routeRepo = routeRepo;
         this.reviewRepo = reviewRepo;
+        this.timedReviewRepo = timedReviewRepo;
         this.objectMapper = objectMapper;
         this.clock = clock;
         this.txTemplate = new TransactionTemplate(transactionManager);
@@ -246,6 +260,93 @@ public class AirspaceReviewService {
         });
     }
 
+    // ============================ 定时航线审查 ============================
+
+    /**
+     * 提交定时航线可行性审查：引用现有航线版本并核对 expectedRouteVersion 与
+     * expectedAirspaceVersion（不符 409）；航点数与航线当前版本航点数不一致 400；
+     * 到达时刻非 UTC 整秒或非严格递增 400；任一航段速度越出闭区间 [1,50] 米每秒
+     * 返回 422 并携带航段号与未舍入速度，不保存审查；原静态禁飞检查同步执行，
+     * 命中则结论 BLOCKED。审查结果不可变，冻结坐标、时刻与空域版本；
+     * 提交后不得重绑新坐标，变更须提交新的计划。
+     */
+    public MutationResponse timedReview(TimedReviewRequest request) {
+        return withIdempotency(request.requestId(), KIND_TIMED_REVIEW, canonicalHash(request), () -> {
+            List<TimedPoint> points = toTimedPoints(request.points());
+            validateStrictlyIncreasing(points);
+            // 与静态审查相同的加锁顺序：先空域版本行、再航线行，保证读取一致版本
+            long globalVersion = airspaceRepo.getGlobalVersionForUpdate();
+            RoutePo route = routeRepo.findRouteForUpdate(request.routeId());
+            if (route == null) {
+                throw new ApiException(HttpStatus.NOT_FOUND, "ROUTE_NOT_FOUND",
+                        "航线不存在: " + request.routeId());
+            }
+            if (route.version() != request.expectedRouteVersion()) {
+                throw new ApiException(HttpStatus.CONFLICT, "VERSION_CONFLICT",
+                        "航线版本不是当前版本：expected=" + request.expectedRouteVersion()
+                                + ", current=" + route.version());
+            }
+            if (globalVersion != request.expectedAirspaceVersion()) {
+                throw new ApiException(HttpStatus.CONFLICT, "VERSION_CONFLICT",
+                        "空域版本不是当前版本：expected=" + request.expectedAirspaceVersion()
+                                + ", current=" + globalVersion);
+            }
+            if (route.points().size() != points.size()) {
+                throw new ApiException(HttpStatus.BAD_REQUEST, "POINT_COUNT_MISMATCH",
+                        "航点数与航线当前版本航点数不一致：submitted=" + points.size()
+                                + ", route=" + route.points().size());
+            }
+            validateSegmentSpeeds(points);
+            // 持锁状态下读取全部有效禁飞区，执行原静态禁飞检查
+            List<ZonePo> activeZones = airspaceRepo.findActiveZones();
+            Set<String> hits = new TreeSet<>();
+            for (ZonePo zone : activeZones) {
+                if (Geometry.timedPolylineHitsRectangle(points,
+                        zone.xMin(), zone.yMin(), zone.xMax(), zone.yMax())) {
+                    hits.add(zone.zoneId());
+                }
+            }
+            String conclusion = hits.isEmpty()
+                    ? ReviewConclusion.CLEAR.name()
+                    : ReviewConclusion.BLOCKED.name();
+            String reviewId = "tr_" + UUID.randomUUID();
+            TimedReviewPo po = new TimedReviewPo(reviewId, request.routeId(), route.version(),
+                    globalVersion, request.operator(), conclusion, new ArrayList<>(hits),
+                    points, request.requestId(), nowMillis());
+            timedReviewRepo.insertReview(po);
+            return new MutationResponse(request.requestId(), false, toTimedDto(po, conclusion, true));
+        });
+    }
+
+    /** 按 reviewId 查询历史定时审查，保留冻结的坐标、时刻与原结论。 */
+    public TimedReviewResultDto getTimedReview(String reviewId) {
+        TimedReviewPo po = timedReviewRepo.findReview(reviewId);
+        if (po == null) {
+            throw new ApiException(HttpStatus.NOT_FOUND, "REVIEW_NOT_FOUND",
+                    "定时审查记录不存在: " + reviewId);
+        }
+        // 历史查询永远返回保存时的原结论与冻结快照，不重新计算
+        return toTimedDto(po, po.conclusion(), null);
+    }
+
+    /** 查询某航线当前可用的定时审查结论；航线或空域版本不再匹配返回 STALE。 */
+    public TimedReviewResultDto getCurrentTimedReview(String routeId) {
+        return txTemplate.execute(status -> {
+            TimedReviewPo latest = timedReviewRepo.findLatestReview(routeId);
+            if (latest == null) {
+                throw new ApiException(HttpStatus.NOT_FOUND, "REVIEW_NOT_FOUND",
+                        "该航线尚无定时审查记录: " + routeId);
+            }
+            RoutePo currentRoute = routeRepo.findRoute(routeId);
+            long globalVersion = airspaceRepo.getGlobalVersion();
+            boolean current = currentRoute != null
+                    && currentRoute.version() == latest.routeVersion()
+                    && globalVersion == latest.airspaceVersion();
+            // 不匹配时绝不能把旧 CLEAR/BLOCKED 当成当前结论，统一返回 STALE
+            String conclusion = current ? latest.conclusion() : "STALE";
+            return toTimedDto(latest, conclusion, current);
+        });
+    }
     // ============================ 幂等与事务 ============================
 
     /**
@@ -394,5 +495,75 @@ public class AirspaceReviewService {
             return array;
         }
         return node;
+    }
+
+    /**
+     * 转换并校验定时航点：坐标最多 3 位小数（超出 400），到达时刻必须为 UTC 整秒（超出 400）。
+     */
+    private static List<TimedPoint> toTimedPoints(List<TimedPointDto> dtos) {
+        List<TimedPoint> points = new ArrayList<>(dtos.size());
+        for (TimedPointDto dto : dtos) {
+            if (dto.x().scale() > 3 || dto.y().scale() > 3) {
+                throw new ApiException(HttpStatus.BAD_REQUEST, "INVALID_COORDINATE_PRECISION",
+                        "坐标最多 3 位小数: (" + dto.x().toPlainString() + ", "
+                                + dto.y().toPlainString() + ")");
+            }
+            if (dto.arrivalTime().getNano() != 0) {
+                throw new ApiException(HttpStatus.BAD_REQUEST, "ARRIVAL_TIME_NOT_WHOLE_SECONDS",
+                        "到达时刻必须为 UTC 整秒: " + dto.arrivalTime());
+            }
+            points.add(new TimedPoint(dto.x(), dto.y(), dto.arrivalTime().getEpochSecond()));
+        }
+        return points;
+    }
+
+    /** 校验到达时刻严格递增：重复或倒退均返回 400。 */
+    private static void validateStrictlyIncreasing(List<TimedPoint> points) {
+        for (int i = 1; i < points.size(); i++) {
+            long prev = points.get(i - 1).arrivalEpochSecond();
+            long curr = points.get(i).arrivalEpochSecond();
+            if (curr == prev) {
+                throw new ApiException(HttpStatus.BAD_REQUEST, "DUPLICATE_ARRIVAL_TIME",
+                        "到达时刻重复：第 " + i + " 与第 " + (i + 1) + " 个航点时刻相同");
+            }
+            if (curr < prev) {
+                throw new ApiException(HttpStatus.BAD_REQUEST, "ARRIVAL_TIME_NOT_INCREASING",
+                        "到达时刻必须严格递增：第 " + (i + 1) + " 个航点早于前一航点");
+            }
+        }
+    }
+
+    /**
+     * 逐航段校验速度落在闭区间 [1,50] 米每秒；越界抛 422，
+     * 明细携带 1 起始的航段号与未舍入速度（米每秒）。
+     */
+    private static void validateSegmentSpeeds(List<TimedPoint> points) {
+        for (int i = 0; i + 1 < points.size(); i++) {
+            TimedPoint a = points.get(i);
+            TimedPoint b = points.get(i + 1);
+            long dx = b.xMilli() - a.xMilli();
+            long dy = b.yMilli() - a.yMilli();
+            long seconds = b.arrivalEpochSecond() - a.arrivalEpochSecond();
+            if (!SegmentSpeed.withinLimits(dx, dy, seconds)) {
+                double speed = SegmentSpeed.speedMetersPerSecond(dx, dy, seconds);
+                Map<String, Object> details = new LinkedHashMap<>();
+                details.put("segmentIndex", i + 1);
+                details.put("speedMetersPerSecond", speed);
+                throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SEGMENT_SPEED_OUT_OF_RANGE",
+                        "第 " + (i + 1) + " 航段速度越界：" + speed + " 米每秒，允许闭区间 [1, 50]",
+                        details);
+            }
+        }
+    }
+
+    private static TimedReviewResultDto toTimedDto(TimedReviewPo po, String conclusion, Boolean current) {
+        List<TimedPointDto> snapshot = new ArrayList<>(po.pointsSnapshot().size());
+        for (TimedPoint p : po.pointsSnapshot()) {
+            snapshot.add(new TimedPointDto(p.x(), p.y(),
+                    Instant.ofEpochSecond(p.arrivalEpochSecond())));
+        }
+        return new TimedReviewResultDto(po.reviewId(), po.routeId(), po.routeVersion(),
+                po.airspaceVersion(), po.operator(), conclusion, List.copyOf(po.hitZoneIds()),
+                snapshot, current);
     }
 }

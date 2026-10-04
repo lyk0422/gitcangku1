@@ -62,8 +62,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_review_request ON review (request_id);
 -- 写操作幂等去重：同键同参重放原结果，异参冲突；失败不占键
 CREATE TABLE IF NOT EXISTS request_dedup (
     request_id     VARCHAR(64) PRIMARY KEY COMMENT '写操作全局唯一请求标识',
-    request_kind   VARCHAR(32) NOT NULL COMMENT '请求类型：ZONE_CREATE/ZONE_REVOKE/ROUTE_CREATE/ROUTE_REPLACE/REVIEW',
+    request_kind   VARCHAR(32) NOT NULL COMMENT '请求类型：ZONE_CREATE/ZONE_REVOKE/ROUTE_CREATE/ROUTE_REPLACE/REVIEW/TIMED_REVIEW',
     request_hash   VARCHAR(64) NOT NULL COMMENT '规范化参数的 SHA-256 十六进制摘要，用于同键异参冲突判定',
     response_json  CLOB NOT NULL COMMENT '首次成功响应 JSON，重放时原样返回',
     created_at     BIGINT NOT NULL COMMENT '首次成功时间，epoch 毫秒（UTC）'
 ) COMMENT = '写操作幂等去重记录（与业务变更同事务原子提交）';
+
+-- 定时航线可行性审查不可变结果：冻结坐标、时刻与审查时的空域版本，提交后不得重绑
+CREATE TABLE IF NOT EXISTS timed_review (
+    review_id         VARCHAR(64) PRIMARY KEY COMMENT '定时审查记录唯一标识（不可变）',
+    route_id          VARCHAR(64) NOT NULL COMMENT '引用的航线标识',
+    route_version     INT NOT NULL COMMENT '审查时核对一致的航线版本',
+    airspace_version  BIGINT NOT NULL COMMENT '审查时冻结的全局空域版本',
+    operator          VARCHAR(64) NOT NULL COMMENT '操作者标识',
+    conclusion        VARCHAR(16) NOT NULL COMMENT '保存时的原结论：CLEAR 通过或 BLOCKED 命中禁飞区，永不改变',
+    hit_zone_ids      CLOB NOT NULL COMMENT '命中的全部 zoneId，字典序去重后逗号拼接；未命中为空串',
+    points_snapshot   CLOB NOT NULL COMMENT '审查时冻结的航点与到达时刻快照（JSON 数组；坐标单位米、最多 3 位小数字符串，时刻为 UTC 整秒 epoch）',
+    request_id        VARCHAR(64) NOT NULL COMMENT '提交定时审查的写操作请求标识',
+    created_at        BIGINT NOT NULL COMMENT '创建时间，epoch 毫秒（UTC）'
+) COMMENT = '定时航线可行性审查不可变结果';
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_timed_review_request ON timed_review (request_id);

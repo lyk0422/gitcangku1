@@ -2,6 +2,8 @@ package com.example.starter.api;
 
 import org.springframework.http.HttpStatus;
 
+import java.util.Map;
+
 /**
  * 业务错误，携带返回给客户端的 HTTP 状态码与错误码。
  */
@@ -11,11 +13,18 @@ public class ApiException extends RuntimeException {
     private final String code;
     /** 映射的 HTTP 状态。 */
     private final HttpStatus status;
+    /** 结构化错误明细（如越界航段号与未舍入速度），无明细为 null。 */
+    private final Map<String, Object> details;
 
     public ApiException(HttpStatus status, String code, String message) {
+        this(status, code, message, null);
+    }
+
+    public ApiException(HttpStatus status, String code, String message, Map<String, Object> details) {
         super(message);
         this.status = status;
         this.code = code;
+        this.details = details;
     }
 
     public String code() {
@@ -24,5 +33,9 @@ public class ApiException extends RuntimeException {
 
     public HttpStatus status() {
         return status;
+    }
+
+    public Map<String, Object> details() {
+        return details;
     }
 }
