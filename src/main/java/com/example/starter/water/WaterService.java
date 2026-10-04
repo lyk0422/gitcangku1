@@ -4,7 +4,9 @@ import com.example.starter.water.WaterRepository.AllocationRow;
 import com.example.starter.water.WaterRepository.CommandRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
 import com.example.starter.water.WaterRepository.TransferRow;
+import com.example.starter.water.PumpStationRepository.StationRow;
 import com.example.starter.water.WaterRepository.WindowRow;
+import com.example.starter.water.dto.Dtos.CurveNode;
 import com.example.starter.water.dto.Dtos.AllocationResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
@@ -45,13 +47,17 @@ public class WaterService {
     private static final Pattern AMOUNT_PATTERN = Pattern.compile("\\d{1,16}(\\.\\d{1,3})?");
     private static final Pattern KEY_PATTERN = Pattern.compile("[\\w.\\-:]{1,128}");
 
+    private static final long NANOS_PER_MINUTE = 60_000_000_000L;
+
     private final WaterRepository repository;
+    private final PumpStationRepository pumpStationRepository;
     private final TransactionTemplate tx;
     private final ObjectMapper objectMapper;
 
-    public WaterService(WaterRepository repository, PlatformTransactionManager transactionManager,
-                        ObjectMapper objectMapper) {
+    public WaterService(WaterRepository repository, PumpStationRepository pumpStationRepository,
+                        PlatformTransactionManager transactionManager, ObjectMapper objectMapper) {
         this.repository = repository;
+        this.pumpStationRepository = pumpStationRepository;
         this.tx = new TransactionTemplate(transactionManager);
         this.objectMapper = objectMapper;
     }
@@ -62,10 +68,15 @@ public class WaterService {
 
     /** 创建供水窗口。 */
     public WindowResponse createWindow(String commandKey, String windowKey, String channelId,
-                                       String startUtc, String endUtc, String plannedVolume) {
+                                       String startUtc, String endUtc, String plannedVolume,
+                                       String pumpStationKey) {
         requireKey("commandKey", commandKey);
         requireKey("windowKey", windowKey);
         requireKey("channelId", channelId);
+        String stationKey = pumpStationKey == null || pumpStationKey.isBlank() ? null : pumpStationKey.trim();
+        if (stationKey != null) {
+            requireKey("pumpStationKey", stationKey);
+        }
         long startNanos = parseInstant("startUtc", startUtc);
         long endNanos = parseInstant("endUtc", endUtc);
         if (startNanos >= endNanos) {
@@ -73,12 +84,16 @@ public class WaterService {
         }
         BigDecimal planned = parseAmount("plannedVolume", plannedVolume);
         String params = "WINDOW_CREATE|" + windowKey + "|" + channelId + "|" + startNanos + "|" + endNanos
-                + "|" + planned.toPlainString();
+                + "|" + planned.toPlainString() + "|" + (stationKey == null ? "" : stationKey);
         return runCommand("WINDOW_CREATE", commandKey, params, WindowResponse.class, () -> {
             if (repository.existsOverlappingWindow(channelId, startNanos, endNanos)) {
                 throw ApiException.conflict("WINDOW_OVERLAP", "同一渠道存在时间重叠的供水窗口");
             }
-            long id = repository.insertWindow(windowKey, channelId, startNanos, endNanos, planned, nowNanos());
+            if (stationKey != null && pumpStationRepository.findByKey(stationKey) == null) {
+                throw ApiException.notFound("STATION_NOT_FOUND", "泵站不存在: " + stationKey);
+            }
+            long id = repository.insertWindow(windowKey, channelId, startNanos, endNanos, planned, nowNanos(),
+                    stationKey);
             WindowRow row = repository.findWindowById(id);
             return toWindowResponse(row, null);
         });
@@ -117,6 +132,8 @@ public class WaterService {
             if (allocation == null) {
                 throw ApiException.notFound("ALLOCATION_NOT_FOUND", "配水申请不存在: " + allocationKey);
             }
+            // 先锁泵站行再锁窗口行，与配置调整、限供、取消按同一顺序共同判定
+            StationRow station = lockStationOfWindow(allocation.windowId());
             WindowRow window = lockWindowOf(allocation);
             // 窗口锁内重读申请，避免与转让/取消并发时使用过期状态与持有额度
             allocation = repository.lockAllocationByKey(allocationKey);
@@ -132,6 +149,26 @@ public class WaterService {
             BigDecimal approved = repository.sumApprovedAmount(window.id());
             if (approved.add(allocation.amount()).compareTo(available) > 0) {
                 throw ApiException.quotaExceeded("批准后将超过当前可用总量 " + fmt(available));
+            }
+            List<FlowCurve.Node> curve = curveNodesOf(allocation.id());
+            if (!curve.isEmpty()) {
+                if (station == null) {
+                    throw ApiException.conflict("CURVE_REQUIRES_STATION", "窗口未关联泵站，曲线申请不能批准");
+                }
+                // 梯形积分必须等于申请水量，否则 422，申请仍待审且配额不扣
+                BigDecimal integral = FlowCurve.integrate(curve);
+                if (integral.compareTo(allocation.amount()) != 0) {
+                    throw ApiException.unprocessable("CURVE_INTEGRAL_MISMATCH",
+                            "曲线梯形积分 " + fmt(integral) + " 不等于申请水量 " + fmt(allocation.amount()));
+                }
+                // 与全部已批准曲线叠加，在各节点检查流量与斜率上限；判断前不舍入
+                List<List<FlowCurve.Node>> curves = pumpStationRepository.listApprovedCurves(
+                        station.stationKey(), allocation.id());
+                curves.add(curve);
+                FlowCurve.assertWithinLimits(curves, station.maxFlow(), station.maxRamp());
+                // 批准冻结曲线和泵站参数，不因后来合法配置变化改旧结果
+                repository.freezeStationParams(allocation.id(), station.version(), station.maxFlow(),
+                        station.maxRamp());
             }
             repository.updateAllocationStatus(allocation.id(), STATUS_APPROVED, nowNanos());
             return toAllocationResponse(repository.findAllocationByKey(allocationKey));
@@ -149,6 +186,8 @@ public class WaterService {
             if (allocation == null) {
                 throw ApiException.notFound("ALLOCATION_NOT_FOUND", "配水申请不存在: " + allocationKey);
             }
+            // 曲线申请取消只去除该申请贡献，与批准、参数调整共同判定
+            lockStationOfWindow(allocation.windowId());
             lockWindowOf(allocation);
             // 窗口锁内重读申请，避免与转让/并发取消使用过期状态
             allocation = repository.lockAllocationByKey(allocationKey);
@@ -211,6 +250,10 @@ public class WaterService {
             if (lockedSource.userId().equals(lockedTarget.userId())) {
                 throw ApiException.conflict("SAME_USER", "转让双方必须属于不同用水户");
             }
+            if (pumpStationRepository.hasCurve(lockedSource.id())
+                    || pumpStationRepository.hasCurve(lockedTarget.id())) {
+                throw ApiException.conflict("CURVE_TRANSFER_UNSUPPORTED", "带流量曲线的申请不支持额度转让");
+            }
             BigDecimal amount = lockedTarget.amount();
             if (lockedSource.heldAmount().compareTo(amount) < 0) {
                 throw ApiException.quotaExceeded("源申请当前持有额度 " + fmt(lockedSource.heldAmount())
@@ -247,6 +290,7 @@ public class WaterService {
         BigDecimal qty = parseAmount("volume", volume);
         String params = "CURTAILMENT_CREATE|" + windowId + "|" + qty.toPlainString();
         return runCommand("CURTAILMENT_CREATE", commandKey, params, CurtailmentResponse.class, () -> {
+            lockStationOfWindow(windowId);
             WindowRow window = repository.lockWindowById(windowId);
             if (window == null) {
                 throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + windowId);
@@ -272,6 +316,7 @@ public class WaterService {
         requireKey("commandKey", commandKey);
         String params = "CURTAILMENT_CANCEL|" + windowId;
         return runCommand("CURTAILMENT_CANCEL", commandKey, params, CurtailmentResponse.class, () -> {
+            lockStationOfWindow(windowId);
             WindowRow window = repository.lockWindowById(windowId);
             if (window == null) {
                 throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + windowId);
@@ -356,6 +401,22 @@ public class WaterService {
     // 内部工具
     // ------------------------------------------------------------------
 
+    /** 窗口关联泵站时锁定泵站行（FOR UPDATE）并返回，无关联返回 null；须先于窗口锁调用。 */
+    private StationRow lockStationOfWindow(long windowId) {
+        WindowRow routing = repository.findWindowById(windowId);
+        if (routing == null || routing.stationKey() == null) {
+            return null;
+        }
+        return pumpStationRepository.lockByKey(routing.stationKey());
+    }
+
+    /** 申请的流量曲线节点（无曲线返回空列表）。 */
+    private List<FlowCurve.Node> curveNodesOf(long allocationId) {
+        return pumpStationRepository.listCurveNodes(allocationId).stream()
+                .map(n -> new FlowCurve.Node(n.minuteUtc(), n.flow()))
+                .toList();
+    }
+
     private WindowRow lockWindowOf(AllocationRow allocation) {
         WindowRow window = repository.lockWindowById(allocation.windowId());
         if (window == null) {
@@ -371,15 +432,19 @@ public class WaterService {
 
     private WindowResponse toWindowResponse(WindowRow row, CurtailmentRow active) {
         BigDecimal available = active != null ? active.volume() : row.plannedVolume();
-        return new WindowResponse(row.id(), row.windowKey(), row.channelId(), toIso(row.startNanos()),
-                toIso(row.endNanos()), fmt(row.plannedVolume()),
+        return new WindowResponse(row.id(), row.windowKey(), row.channelId(), row.stationKey(),
+                toIso(row.startNanos()), toIso(row.endNanos()), fmt(row.plannedVolume()),
                 active != null ? fmt(active.volume()) : null, fmt(available), toIso(row.createdNanos()));
     }
 
     private AllocationResponse toAllocationResponse(AllocationRow row) {
+        List<CurveNode> curve = pumpStationRepository.listCurveNodes(row.id()).stream()
+                .map(n -> new CurveNode(toIso(n.minuteUtc() * NANOS_PER_MINUTE), fmt(n.flow())))
+                .toList();
         return new AllocationResponse(row.allocationKey(), row.windowId(), row.userId(), fmt(row.amount()),
                 fmt(row.heldAmount()), row.requester(), row.status(),
-                toIso(row.createdNanos()), toIso(row.updatedNanos()));
+                toIso(row.createdNanos()), toIso(row.updatedNanos()),
+                curve.isEmpty() ? null : curve, row.stationVersion());
     }
 
     private TransferResponse toTransferResponse(TransferRow row) {

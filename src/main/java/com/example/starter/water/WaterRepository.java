@@ -22,13 +22,14 @@ public class WaterRepository {
 
     /** 供水窗口行。 */
     public record WindowRow(long id, String windowKey, String channelId, long startNanos, long endNanos,
-                            BigDecimal plannedVolume, long createdNanos) {
+                            BigDecimal plannedVolume, long createdNanos, String stationKey) {
     }
 
     /** 配水申请行；amount 为不可改写的原申请水量，heldAmount 为当前持有额度。 */
     public record AllocationRow(long id, String allocationKey, long windowId, String userId, BigDecimal amount,
                                 BigDecimal heldAmount, String requester, String status,
-                                long createdNanos, long updatedNanos) {
+                                long createdNanos, long updatedNanos, Long stationVersion,
+                                BigDecimal frozenMaxFlow, BigDecimal frozenMaxRamp) {
     }
 
     /** 转让流水行，创建后不可变。 */
@@ -49,17 +50,19 @@ public class WaterRepository {
     private static final RowMapper<WindowRow> WINDOW_MAPPER = (rs, n) -> new WindowRow(
             rs.getLong("id"), rs.getString("window_key"), rs.getString("channel_id"),
             rs.getLong("start_nanos"), rs.getLong("end_nanos"),
-            rs.getBigDecimal("planned_volume"), rs.getLong("created_nanos"));
+            rs.getBigDecimal("planned_volume"), rs.getLong("created_nanos"), rs.getString("station_key"));
 
     private static final RowMapper<AllocationRow> ALLOCATION_MAPPER = (rs, n) -> new AllocationRow(
             rs.getLong("id"), rs.getString("allocation_key"), rs.getLong("window_id"),
             rs.getString("user_id"), rs.getBigDecimal("amount"), rs.getBigDecimal("held_amount"),
             rs.getString("requester"), rs.getString("status"),
-            rs.getLong("created_nanos"), rs.getLong("updated_nanos"));
+            rs.getLong("created_nanos"), rs.getLong("updated_nanos"),
+            rs.getObject("station_version") == null ? null : rs.getLong("station_version"),
+            rs.getBigDecimal("frozen_max_flow"), rs.getBigDecimal("frozen_max_ramp"));
 
     private static final String ALLOCATION_SELECT =
             "SELECT id, allocation_key, window_id, user_id, amount, held_amount, requester, status,"
-                    + " created_nanos, updated_nanos";
+                    + " created_nanos, updated_nanos, station_version, frozen_max_flow, frozen_max_ramp";
 
     private static final RowMapper<TransferRow> TRANSFER_MAPPER = (rs, n) -> new TransferRow(
             rs.getLong("id"), rs.getString("transfer_key"), rs.getLong("window_id"),
@@ -81,20 +84,27 @@ public class WaterRepository {
         this.jdbc = jdbc;
     }
 
-    /** 插入窗口并返回自增主键。 */
+    /** 插入窗口（不关联泵站）并返回自增主键。 */
     public long insertWindow(String windowKey, String channelId, long startNanos, long endNanos,
                              BigDecimal plannedVolume, long createdNanos) {
+        return insertWindow(windowKey, channelId, startNanos, endNanos, plannedVolume, createdNanos, null);
+    }
+
+    /** 插入窗口并返回自增主键；stationKey 为 null 表示不接入泵站瞬时流量约束。 */
+    public long insertWindow(String windowKey, String channelId, long startNanos, long endNanos,
+                             BigDecimal plannedVolume, long createdNanos, String stationKey) {
         KeyHolder keys = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO supply_window (window_key, channel_id, start_nanos, end_nanos, planned_volume, created_nanos)"
-                            + " VALUES (?, ?, ?, ?, ?, ?)", Statement.RETURN_GENERATED_KEYS);
+                    "INSERT INTO supply_window (window_key, channel_id, start_nanos, end_nanos, planned_volume, created_nanos, station_key)"
+                            + " VALUES (?, ?, ?, ?, ?, ?, ?)", Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, windowKey);
             ps.setString(2, channelId);
             ps.setLong(3, startNanos);
             ps.setLong(4, endNanos);
             ps.setBigDecimal(5, plannedVolume);
             ps.setLong(6, createdNanos);
+            ps.setString(7, stationKey);
             return ps;
         }, keys);
         return Objects.requireNonNull(keys.getKey()).longValue();
@@ -104,7 +114,7 @@ public class WaterRepository {
     public WindowRow findWindowById(long id) {
         try {
             return jdbc.queryForObject(
-                    "SELECT id, window_key, channel_id, start_nanos, end_nanos, planned_volume, created_nanos"
+                    "SELECT id, window_key, channel_id, start_nanos, end_nanos, planned_volume, created_nanos, station_key"
                             + " FROM supply_window WHERE id = ?", WINDOW_MAPPER, id);
         } catch (EmptyResultDataAccessException e) {
             return null;
@@ -115,7 +125,7 @@ public class WaterRepository {
     public WindowRow lockWindowById(long id) {
         try {
             return jdbc.queryForObject(
-                    "SELECT id, window_key, channel_id, start_nanos, end_nanos, planned_volume, created_nanos"
+                    "SELECT id, window_key, channel_id, start_nanos, end_nanos, planned_volume, created_nanos, station_key"
                             + " FROM supply_window WHERE id = ? FOR UPDATE", WINDOW_MAPPER, id);
         } catch (EmptyResultDataAccessException e) {
             return null;
@@ -303,5 +313,13 @@ public class WaterRepository {
     /** 写回命令首次成功响应。 */
     public void updateCommandResponse(String commandKey, String response) {
         jdbc.update("UPDATE command_log SET response = ? WHERE command_key = ?", response, commandKey);
+    }
+
+    /** 曲线批准时冻结泵站配置：记录配置版本与判定用参数，之后合法配置变化不改旧结果。 */
+    public void freezeStationParams(long allocationId, long stationVersion, BigDecimal maxFlow,
+                                    BigDecimal maxRamp) {
+        jdbc.update("UPDATE allocation SET station_version = ?, frozen_max_flow = ?, frozen_max_ramp = ?"
+                        + " WHERE id = ?",
+                stationVersion, maxFlow, maxRamp, allocationId);
     }
 }

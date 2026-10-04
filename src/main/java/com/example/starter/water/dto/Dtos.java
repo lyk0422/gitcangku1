@@ -11,13 +11,15 @@ public final class Dtos {
     private Dtos() {
     }
 
-    /** 创建供水窗口命令。 */
+    /** 创建供水窗口命令；pumpStationKey 可空，非空时窗口接入该泵站瞬时流量约束。 */
     public record CreateWindowRequest(String commandKey, String windowKey, String channelId,
-                                      String startUtc, String endUtc, String plannedVolume) {
+                                      String startUtc, String endUtc, String plannedVolume,
+                                      String pumpStationKey) {
     }
 
     /** 供水窗口视图；activeCurtailmentVolume 为 null 表示无生效限供。 */
-    public record WindowResponse(long id, String windowKey, String channelId, String startUtc, String endUtc,
+    public record WindowResponse(long id, String windowKey, String channelId, String pumpStationKey,
+                                 String startUtc, String endUtc,
                                  String plannedVolume, String activeCurtailmentVolume, String availableTotal,
                                  String createdUtc) {
     }
@@ -34,7 +36,8 @@ public final class Dtos {
      */
     public record AllocationResponse(String allocationKey, long windowId, String userId, String amount,
                                      String heldAmount, String requester, String status,
-                                     String createdUtc, String updatedUtc) {
+                                     String createdUtc, String updatedUtc, List<CurveNode> curve,
+                                     Long stationVersion) {
     }
 
     /** 仅含幂等键的命令（批准/取消申请、取消限供）。 */
@@ -72,6 +75,25 @@ public final class Dtos {
     /** 窗口历史明细：窗口本身 + 全部申请 + 全部限供记录。 */
     public record HistoryResponse(WindowResponse window, List<AllocationResponse> allocations,
                                   List<CurtailmentResponse> curtailments) {
+    }
+
+    /** 流量曲线节点：timeUtc 为 UTC 整分钟 ISO-8601 字符串，flow 单位立方米每分钟，非负、最多 3 位小数。 */
+    public record CurveNode(String timeUtc, String flow) {
+    }
+
+    /** 带流量曲线的配水申请命令；curve 为 2 至 20 个节点，首末等于窗口边界，时刻递增。 */
+    public record CurveAllocationRequest(String requestId, String allocationKey, Long windowId, String userId,
+                                         String amount, List<CurveNode> curve) {
+    }
+
+    /** 泵站配置写入命令；expectedVersion 为 0 表示新建泵站，否则须等于当前版本。 */
+    public record StationConfigRequest(String requestId, String maxFlow, String maxRampPerMinute,
+                                       Long expectedVersion) {
+    }
+
+    /** 泵站配置视图；version 随每次成功调整递增。 */
+    public record StationResponse(String stationKey, String maxFlow, String maxRampPerMinute, long version,
+                                  String createdUtc, String updatedUtc) {
     }
 
     /** 统一错误响应体。 */

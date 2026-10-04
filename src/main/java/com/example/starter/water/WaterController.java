@@ -38,7 +38,7 @@ public class WaterController {
     @PostMapping("/windows")
     public WindowResponse createWindow(@RequestBody CreateWindowRequest request) {
         return service.createWindow(request.commandKey(), request.windowKey(), request.channelId(),
-                request.startUtc(), request.endUtc(), request.plannedVolume());
+                request.startUtc(), request.endUtc(), request.plannedVolume(), request.pumpStationKey());
     }
 
     /** 提交配水申请。 */
