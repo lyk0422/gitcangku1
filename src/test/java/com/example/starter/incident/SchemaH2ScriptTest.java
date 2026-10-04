@@ -108,6 +108,41 @@ class SchemaH2ScriptTest {
                     duplicateBlockerRejected = true;
                 }
                 assertThat(duplicateBlockerRejected).isTrue();
+
+                // 必需证据类别：(task_id, category) 唯一
+                st.execute("INSERT INTO task_required_categories (task_id, category, created_at)"
+                        + " VALUES (1,'PHOTO','" + Timestamp.from(now) + "')");
+                boolean duplicateCategoryRejected = false;
+                try {
+                    st.execute("INSERT INTO task_required_categories (task_id, category, created_at)"
+                            + " VALUES (1,'PHOTO','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateCategoryRejected = true;
+                }
+                assertThat(duplicateCategoryRejected).isTrue();
+
+                // 验收证据：(task_id, evidence_no) 唯一；确认条件更新仅作用于 PENDING
+                st.execute("INSERT INTO task_evidence (task_id, evidence_no, category, description,"
+                        + " status, uploaded_by, uploaded_at, created_at) VALUES (1,'EV-1','PHOTO',"
+                        + "'d','PENDING','exec-1','" + Timestamp.from(now) + "','"
+                        + Timestamp.from(now) + "')");
+                boolean duplicateEvidenceRejected = false;
+                try {
+                    st.execute("INSERT INTO task_evidence (task_id, evidence_no, category,"
+                            + " description, status, uploaded_by, uploaded_at, created_at) VALUES"
+                            + " (1,'EV-1','PHOTO','d2','PENDING','exec-1','" + Timestamp.from(now)
+                            + "','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateEvidenceRejected = true;
+                }
+                assertThat(duplicateEvidenceRejected).isTrue();
+                int confirmed = st.executeUpdate("UPDATE task_evidence SET status='CONFIRMED',"
+                        + " confirmed_by='rev-1', confirmed_at='" + Timestamp.from(now) + "'"
+                        + " WHERE id = 1 AND status = 'PENDING'");
+                assertThat(confirmed).isEqualTo(1);
+                int reconfirm = st.executeUpdate("UPDATE task_evidence SET status='CONFIRMED'"
+                        + " WHERE id = 1 AND status = 'PENDING'");
+                assertThat(reconfirm).isZero();
             }
         }
     }

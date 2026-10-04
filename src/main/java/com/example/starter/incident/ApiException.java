@@ -56,4 +56,11 @@ public class ApiException extends RuntimeException {
     public static ApiException illegalTransition(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "ILLEGAL_TRANSITION", message, null);
     }
+    /**
+     * 422：证据不足或证据失效（如完成时缺少已确认且未作废的证据类别），携带结构化明细。
+     */
+    public static ApiException unprocessable(String message, Object details) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "EVIDENCE_INSUFFICIENT",
+                message, details);
+    }
 }

@@ -3,6 +3,9 @@ package com.example.starter.incident;
 import com.example.starter.incident.dto.Requests.ActionRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
 import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
+import com.example.starter.incident.dto.Requests.EvidenceActionRequest;
+import com.example.starter.incident.dto.Requests.EvidenceConfigRequest;
+import com.example.starter.incident.dto.Requests.EvidenceUploadRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
@@ -12,6 +15,9 @@ import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
 import com.example.starter.incident.dto.Responses.EscalationHistoryView;
+import com.example.starter.incident.dto.Responses.EvidenceChainView;
+import com.example.starter.incident.dto.Responses.EvidenceRequirementsView;
+import com.example.starter.incident.dto.Responses.EvidenceView;
 import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
 import com.example.starter.incident.dto.Responses.IncidentTasksView;
@@ -187,5 +193,59 @@ public class IncidentController {
                                @RequestHeader("X-Actor-Id") String actor,
                                @RequestBody TaskActionRequest req) {
         return service.cancelTask(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 配置任务必需证据类别（仅当前指挥人，1~5 个类别，提交 expectedTaskVersion）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/evidence-requirements")
+    public EvidenceRequirementsView configureEvidenceRequirements(
+            @PathVariable String incidentKey, @PathVariable String taskKey,
+            @RequestHeader("X-Actor-Id") String actor, @RequestBody EvidenceConfigRequest req) {
+        return service.configureEvidenceRequirements(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 查询任务证据链（必需类别与全部证据，只读）。
+     */
+    @GetMapping("/{incidentKey}/tasks/{taskKey}/evidence")
+    public EvidenceChainView evidenceChain(@PathVariable String incidentKey,
+                                           @PathVariable String taskKey) {
+        return service.evidenceChain(incidentKey, taskKey);
+    }
+
+    /**
+     * 上传证据（执行者提交证据编号、类别和说明）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/evidence")
+    public EvidenceView uploadEvidence(@PathVariable String incidentKey,
+                                       @PathVariable String taskKey,
+                                       @RequestHeader("X-Actor-Id") String actor,
+                                       @RequestBody EvidenceUploadRequest req) {
+        return service.uploadEvidence(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 确认证据（验收人逐条确认，验收人与上传人必须不同）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/evidence/{evidenceNo}/confirm")
+    public EvidenceView confirmEvidence(@PathVariable String incidentKey,
+                                        @PathVariable String taskKey,
+                                        @PathVariable String evidenceNo,
+                                        @RequestHeader("X-Actor-Id") String actor,
+                                        @RequestBody EvidenceActionRequest req) {
+        return service.confirmEvidence(incidentKey, taskKey, evidenceNo, actor, req);
+    }
+
+    /**
+     * 作废证据（仅任务完成前；作废使该证据确认失效）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/evidence/{evidenceNo}/void")
+    public EvidenceView voidEvidence(@PathVariable String incidentKey,
+                                     @PathVariable String taskKey,
+                                     @PathVariable String evidenceNo,
+                                     @RequestHeader("X-Actor-Id") String actor,
+                                     @RequestBody EvidenceActionRequest req) {
+        return service.voidEvidence(incidentKey, taskKey, evidenceNo, actor, req);
     }
 }

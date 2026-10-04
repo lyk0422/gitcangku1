@@ -52,6 +52,7 @@ public class IncidentTaskRepository {
                 doneAt == null ? null : doneAt.toInstant(),
                 rs.getString("cancelled_by"),
                 cancelledAt == null ? null : cancelledAt.toInstant(),
+                rs.getLong("version"),
                 rs.getTimestamp("created_at").toInstant(),
                 rs.getTimestamp("updated_at").toInstant());
     }
@@ -70,8 +71,8 @@ public class IncidentTaskRepository {
         jdbc.update(con -> {
             var ps = con.prepareStatement(
                     "INSERT INTO incident_tasks (incident_id, task_key, group_code, title, status,"
-                            + " created_by, done_by, done_at, cancelled_by, cancelled_at,"
-                            + " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                            + " created_by, done_by, done_at, cancelled_by, cancelled_at, version,"
+                            + " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setLong(1, task.incidentId());
             ps.setString(2, task.taskKey());
@@ -83,8 +84,9 @@ public class IncidentTaskRepository {
             ps.setTimestamp(8, task.doneAt() == null ? null : Timestamp.from(task.doneAt()));
             ps.setString(9, task.cancelledBy());
             ps.setTimestamp(10, task.cancelledAt() == null ? null : Timestamp.from(task.cancelledAt()));
-            ps.setTimestamp(11, Timestamp.from(task.createdAt()));
-            ps.setTimestamp(12, Timestamp.from(task.updatedAt()));
+            ps.setLong(11, task.version());
+            ps.setTimestamp(12, Timestamp.from(task.createdAt()));
+            ps.setTimestamp(13, Timestamp.from(task.updatedAt()));
             return ps;
         }, keys);
         return keys.getKey().longValue();
@@ -143,6 +145,13 @@ public class IncidentTaskRepository {
                 actor, Timestamp.from(at), Timestamp.from(at), id);
     }
 
+    /**
+     * 任务版本加 1（必需证据类别变更时调用），并刷新 updated_at。
+     */
+    public void bumpVersion(long id, Instant at) {
+        jdbc.update("UPDATE incident_tasks SET version = version + 1, updated_at = ? WHERE id = ?",
+                Timestamp.from(at), id);
+    }
     /**
      * 追加一条阻塞边（任务 → 阻塞事件）。(task_id, blocker_incident_id) 唯一。
      */

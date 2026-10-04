@@ -86,6 +86,7 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     cancelled_at TIMESTAMP(6) NULL COMMENT '取消 UTC 时间；仅 CANCELLED 有值，否则为空',
     created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
     updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间',
+    version INT NOT NULL DEFAULT 1 COMMENT '任务版本，从1开始；每次必需证据类别变更加1，用于expectedTaskVersion乐观校验',
     CONSTRAINT uk_task_key UNIQUE (incident_id, task_key)
 ) COMMENT='事件处置任务表';
 
@@ -100,3 +101,29 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY COMMENT '固定为 1 的单行锁；创建任务时 SELECT ... FOR UPDATE 持有，串行化环检测与写入，保证并发反向依赖最终图无环'
 ) COMMENT='任务依赖图全局锁表';
+
+CREATE TABLE IF NOT EXISTS task_required_categories (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    task_id BIGINT NOT NULL COMMENT '所属任务id，关联incident_tasks.id',
+    category VARCHAR(64) NOT NULL COMMENT '必需证据类别（如PHOTO/READING），任务内唯一；每任务1~5个，仅当前指挥人可配置，配置变更整体替换',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
+    CONSTRAINT uk_task_required_category UNIQUE (task_id, category)
+) COMMENT='任务必需证据类别表';
+
+CREATE TABLE IF NOT EXISTS task_evidence (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    task_id BIGINT NOT NULL COMMENT '所属任务id，关联incident_tasks.id',
+    evidence_no VARCHAR(128) NOT NULL COMMENT '证据业务编号，任务内唯一；同号同内容幂等返回，同号不同内容冲突',
+    category VARCHAR(64) NOT NULL COMMENT '证据类别（如PHOTO/READING），完成门禁按类别核对',
+    description VARCHAR(1024) NOT NULL COMMENT '证据说明，非空',
+    status VARCHAR(16) NOT NULL COMMENT '状态：PENDING 待确认 / CONFIRMED 已确认 / VOIDED 已作废；VOIDED 为终态且确认失效',
+    uploaded_by VARCHAR(128) NOT NULL COMMENT '上传人（X-Actor-Id）',
+    uploaded_at TIMESTAMP(6) NOT NULL COMMENT '上传 UTC 时间',
+    confirmed_by VARCHAR(128) NULL COMMENT '确认人（验收人），必须与上传人不同；仅 CONFIRMED 有值，否则为空',
+    confirmed_at TIMESTAMP(6) NULL COMMENT '确认 UTC 时间；仅 CONFIRMED 有值，否则为空',
+    voided_by VARCHAR(128) NULL COMMENT '作废人（上传人或当前指挥人）；仅 VOIDED 有值，否则为空',
+    voided_at TIMESTAMP(6) NULL COMMENT '作废 UTC 时间；仅 VOIDED 有值，否则为空',
+    frozen_at TIMESTAMP(6) NULL COMMENT '冻结 UTC 时间；任务完成时冻结该任务全部证据，此后禁止作废或覆盖；未完成为空',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
+    CONSTRAINT uk_task_evidence_no UNIQUE (task_id, evidence_no)
+) COMMENT='任务验收证据表';

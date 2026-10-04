@@ -78,4 +78,28 @@ public final class Responses {
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
     }
+
+    /**
+     * 必需证据类别视图：version 为本次配置生效后的任务版本；categories 按类别名排序。
+     */
+    public record EvidenceRequirementsView(String taskKey, long version, List<String> categories) {
+    }
+
+    /**
+     * 证据视图：status 为 PENDING/CONFIRMED/VOIDED；confirmedBy/confirmedAt 仅 CONFIRMED 有值，
+     * voidedBy/voidedAt 仅 VOIDED 有值，frozenAt 在任务完成冻结后有值。
+     */
+    public record EvidenceView(String evidenceNo, String category, String description,
+                               String status, String uploadedBy, Instant uploadedAt,
+                               String confirmedBy, Instant confirmedAt, String voidedBy,
+                               Instant voidedAt, Instant frozenAt) {
+    }
+
+    /**
+     * 任务证据链视图：taskVersion 为当前任务版本；requiredCategories 为当前必需类别（排序）；
+     * evidence 按上传顺序返回。
+     */
+    public record EvidenceChainView(String taskKey, long taskVersion,
+                                    List<String> requiredCategories, List<EvidenceView> evidence) {
+    }
 }

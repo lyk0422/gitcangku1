@@ -12,11 +12,15 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.function.Supplier;
 
 import com.example.starter.incident.dto.Requests.ActionRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
 import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
+import com.example.starter.incident.dto.Requests.EvidenceActionRequest;
+import com.example.starter.incident.dto.Requests.EvidenceConfigRequest;
+import com.example.starter.incident.dto.Requests.EvidenceUploadRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
@@ -26,6 +30,9 @@ import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
 import com.example.starter.incident.dto.Responses.EscalationHistoryView;
+import com.example.starter.incident.dto.Responses.EvidenceChainView;
+import com.example.starter.incident.dto.Responses.EvidenceRequirementsView;
+import com.example.starter.incident.dto.Responses.EvidenceView;
 import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
 import com.example.starter.incident.dto.Responses.IncidentTasksView;
@@ -71,16 +78,19 @@ public class IncidentService {
     private final IncidentRepository incidents;
     private final EscalationRepository escalations;
     private final IncidentTaskRepository tasks;
+    private final TaskEvidenceRepository evidence;
     private final CommandKeyRepository commandKeys;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public IncidentService(IncidentRepository incidents, EscalationRepository escalations,
-                           IncidentTaskRepository tasks, CommandKeyRepository commandKeys,
+                           IncidentTaskRepository tasks, TaskEvidenceRepository evidence,
+                           CommandKeyRepository commandKeys,
                            ObjectMapper objectMapper, Clock clock) {
         this.incidents = incidents;
         this.escalations = escalations;
         this.tasks = tasks;
+        this.evidence = evidence;
         this.commandKeys = commandKeys;
         this.objectMapper = objectMapper;
         this.clock = clock;
@@ -453,7 +463,7 @@ public class IncidentService {
                     Instant now = now();
                     long taskId = tasks.insert(new IncidentTask(0L, incident.id(), taskKey,
                             groupCode, title, TaskStatus.OPEN, actor, null, null, null, null,
-                            now, now));
+                            1L, now, now));
                     for (Incident blocker : blockers) {
                         tasks.insertBlocker(taskId, blocker.id(), now);
                     }
@@ -485,7 +495,17 @@ public class IncidentService {
                         throw ApiException.conflict("存在未解除阻塞的事件: "
                                 + String.join(",", unresolved), List.copyOf(unresolved));
                     }
-                    tasks.markDone(task.id(), actor, now());
+                    // 证据门禁：每个必需类别至少一条当前确认且未作废的证据，缺失返回 422，
+                    // 不改变任务状态，也不解除下游阻塞
+                    List<String> missingEvidence = evidence.listCategoriesMissingConfirmed(task.id());
+                    if (!missingEvidence.isEmpty()) {
+                        throw ApiException.unprocessable("缺少已确认且未作废的证据类别: "
+                                + String.join(",", missingEvidence), List.copyOf(missingEvidence));
+                    }
+                    Instant doneAt = now();
+                    tasks.markDone(task.id(), actor, doneAt);
+                    // 完成即冻结当时证据内容和确认人，此后禁止作废或覆盖
+                    evidence.freezeForTask(task.id(), doneAt);
                     return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
                 });
     }
@@ -662,5 +682,229 @@ public class IncidentService {
         List<EscalationView> views = list.stream().map(this::toEscalationView).toList();
         EscalationView current = views.isEmpty() ? null : views.get(views.size() - 1);
         return new EscalationHistoryView(incident.deadlineAt(), current, views);
+    }
+
+    /**
+     * 配置必需证据类别：仅当前指挥人，且任务未完成；提交 expectedTaskVersion 乐观校验，
+     * 每次变更整体替换类别集合并将任务版本加 1。待交接期间仍按原指挥权限，交接后旧指挥不能配置；
+     * 权限校验先于幂等重放。requestId 幂等：同键同参重放首次响应，异参 409，失败不占键。
+     */
+    @Transactional
+    public EvidenceRequirementsView configureEvidenceRequirements(String incidentKey, String taskKey,
+                                                                  String actor,
+                                                                  EvidenceConfigRequest req) {
+        String requestId = requireText(req.requestId(), "requestId");
+        if (req.expectedTaskVersion() == null) {
+            throw ApiException.badRequest("expectedTaskVersion 不能为空");
+        }
+        long expectedVersion = req.expectedTaskVersion();
+        List<String> categories = normalizeCategories(req.categories());
+        Incident incident = lockIncident(incidentKey);
+        IncidentTask task = tasks.findByKey(incident.id(), taskKey)
+                .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
+        // 权限校验先于幂等重放：交接后旧指挥重放历史 requestId 也直接 409
+        requireCommander(incident, actor);
+        Map<String, Object> identity = new TreeMap<>();
+        identity.put("operation", "evidence_config");
+        identity.put("actor", actor);
+        identity.put("incidentKey", incidentKey);
+        identity.put("taskKey", taskKey);
+        identity.put("expectedTaskVersion", expectedVersion);
+        identity.put("categories", categories);
+        return runIdempotent(requestId, "evidence_config", structuredHash(identity),
+                EvidenceRequirementsView.class, () -> {
+                    requireOpenTask(task);
+                    if (task.version() != expectedVersion) {
+                        throw ApiException.conflict("任务版本不匹配: 期望 " + expectedVersion
+                                + "，当前 " + task.version());
+                    }
+                    Instant now = now();
+                    evidence.replaceCategories(task.id(), categories, now);
+                    tasks.bumpVersion(task.id(), now);
+                    IncidentTask updated = tasks.findByKey(incident.id(), taskKey).orElseThrow();
+                    return new EvidenceRequirementsView(taskKey, updated.version(), categories);
+                });
+    }
+
+    /**
+     * 上传证据：执行者提交合成证据编号、类别和说明；任务完成后禁止上传（覆盖已冻结证据）。
+     * evidenceNo 任务内唯一：同号同内容幂等返回首次记录，同号不同内容 409。
+     */
+    @Transactional
+    public EvidenceView uploadEvidence(String incidentKey, String taskKey, String actor,
+                                       EvidenceUploadRequest req) {
+        String requestId = requireText(req.requestId(), "requestId");
+        String evidenceNo = requireText(req.evidenceNo(), "evidenceNo");
+        String category = requireText(req.category(), "category");
+        String description = requireText(req.description(), "description");
+        requireText(actor, "actor");
+        Incident incident = lockIncident(incidentKey);
+        IncidentTask task = tasks.findByKey(incident.id(), taskKey)
+                .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
+        Map<String, Object> identity = new TreeMap<>();
+        identity.put("operation", "evidence_upload");
+        identity.put("actor", actor);
+        identity.put("incidentKey", incidentKey);
+        identity.put("taskKey", taskKey);
+        identity.put("evidenceNo", evidenceNo);
+        identity.put("category", category);
+        identity.put("description", description);
+        return runIdempotent(requestId, "evidence_upload", structuredHash(identity),
+                EvidenceView.class, () -> {
+                    requireOpenTask(task);
+                    var existing = evidence.findEvidence(task.id(), evidenceNo);
+                    if (existing.isPresent()) {
+                        TaskEvidence found = existing.get();
+                        if (!found.sameContent(category, description)) {
+                            throw ApiException.conflict("evidenceNo 已被不同内容使用: " + evidenceNo);
+                        }
+                        return toEvidenceView(found);
+                    }
+                    Instant now = now();
+                    evidence.insertEvidence(new TaskEvidence(0L, task.id(), evidenceNo, category,
+                            description, EvidenceStatus.PENDING, actor, now, null, null, null,
+                            null, null, now));
+                    return toEvidenceView(evidence.findEvidence(task.id(), evidenceNo).orElseThrow());
+                });
+    }
+
+    /**
+     * 规范化必需证据类别：去空白、去重、排序；要求 1~5 个非空类别。
+     */
+    private static List<String> normalizeCategories(List<String> raw) {
+        if (raw == null || raw.isEmpty()) {
+            throw ApiException.badRequest("categories 不能为空，需 1~5 个证据类别");
+        }
+        List<String> categories = raw.stream()
+                .map(c -> requireText(c, "category"))
+                .distinct()
+                .sorted()
+                .toList();
+        if (categories.size() > 5) {
+            throw ApiException.badRequest("必需证据类别最多 5 个");
+        }
+        return categories;
+    }
+
+    /**
+     * 要求任务处于 OPEN（未完成）状态，否则 409；证据配置、上传、确认、作废共用。
+     */
+    private static void requireOpenTask(IncidentTask task) {
+        if (task.status() != TaskStatus.OPEN) {
+            throw ApiException.conflict("任务已处于终态 " + task.status() + "，证据已冻结，禁止变更");
+        }
+    }
+
+    /**
+     * 结构化幂等身份摘要：将操作、操作者、资源与全部参数（含期望版本）组装为有序结构后
+     * 序列化为 JSON 再做 SHA-256，避免分隔符拼接造成的碰撞。
+     */
+    private String structuredHash(Map<String, ?> identity) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] out = digest.digest(toJson(identity).getBytes(StandardCharsets.UTF_8));
+            return HexFormat.of().formatHex(out);
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /**
+     * 组装证据视图。
+     */
+    private EvidenceView toEvidenceView(TaskEvidence e) {
+        return new EvidenceView(e.evidenceNo(), e.category(), e.description(), e.status().name(),
+                e.uploadedBy(), e.uploadedAt(), e.confirmedBy(), e.confirmedAt(), e.voidedBy(),
+                e.voidedAt(), e.frozenAt());
+    }
+
+    /**
+     * 确认证据：验收人逐条确认，验收人必须与上传人不同（权限校验先于幂等重放）；
+     * 仅 PENDING 可确认，已确认或已作废（异键重复）409；任务完成后证据冻结，禁止确认。
+     */
+    @Transactional
+    public EvidenceView confirmEvidence(String incidentKey, String taskKey, String evidenceNo,
+                                        String actor, EvidenceActionRequest req) {
+        String requestId = requireText(req.requestId(), "requestId");
+        Incident incident = lockIncident(incidentKey);
+        IncidentTask task = tasks.findByKey(incident.id(), taskKey)
+                .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
+        TaskEvidence found = evidence.findEvidence(task.id(), evidenceNo)
+                .orElseThrow(() -> ApiException.notFound("证据不存在: " + evidenceNo));
+        // 权限校验先于幂等重放：验收人必须与上传人不同
+        if (found.uploadedBy().equals(actor)) {
+            throw ApiException.conflict("验收人必须与上传人不同: " + actor);
+        }
+        Map<String, Object> identity = new TreeMap<>();
+        identity.put("operation", "evidence_confirm");
+        identity.put("actor", actor);
+        identity.put("incidentKey", incidentKey);
+        identity.put("taskKey", taskKey);
+        identity.put("evidenceNo", evidenceNo);
+        return runIdempotent(requestId, "evidence_confirm", structuredHash(identity),
+                EvidenceView.class, () -> {
+                    requireOpenTask(task);
+                    if (found.status() != EvidenceStatus.PENDING) {
+                        throw ApiException.conflict("证据状态为 " + found.status() + "，不能确认");
+                    }
+                    int updated = evidence.confirmEvidence(found.id(), actor, now());
+                    if (updated == 0) {
+                        throw ApiException.conflict("证据已被并发处理，不能确认");
+                    }
+                    return toEvidenceView(evidence.findEvidence(task.id(), evidenceNo).orElseThrow());
+                });
+    }
+
+    /**
+     * 作废证据：仅上传人或当前指挥人可作废（权限校验先于幂等重放）；作废使该证据确认失效；
+     * 仅任务完成前可作废，完成后证据已冻结，禁止作废。已作废（异键重复）409。
+     */
+    @Transactional
+    public EvidenceView voidEvidence(String incidentKey, String taskKey, String evidenceNo,
+                                     String actor, EvidenceActionRequest req) {
+        String requestId = requireText(req.requestId(), "requestId");
+        Incident incident = lockIncident(incidentKey);
+        IncidentTask task = tasks.findByKey(incident.id(), taskKey)
+                .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
+        TaskEvidence found = evidence.findEvidence(task.id(), evidenceNo)
+                .orElseThrow(() -> ApiException.notFound("证据不存在: " + evidenceNo));
+        // 权限校验先于幂等重放：仅上传人或当前指挥人可作废
+        boolean commander = incident.commander() != null && incident.commander().equals(actor);
+        if (!found.uploadedBy().equals(actor) && !commander) {
+            throw ApiException.conflict("只有上传人或当前指挥人能作废证据");
+        }
+        Map<String, Object> identity = new TreeMap<>();
+        identity.put("operation", "evidence_void");
+        identity.put("actor", actor);
+        identity.put("incidentKey", incidentKey);
+        identity.put("taskKey", taskKey);
+        identity.put("evidenceNo", evidenceNo);
+        return runIdempotent(requestId, "evidence_void", structuredHash(identity),
+                EvidenceView.class, () -> {
+                    requireOpenTask(task);
+                    if (found.status() == EvidenceStatus.VOIDED) {
+                        throw ApiException.conflict("证据已作废，不能重复作废");
+                    }
+                    int updated = evidence.voidEvidence(found.id(), actor, now());
+                    if (updated == 0) {
+                        throw ApiException.conflict("证据已被并发处理，不能作废");
+                    }
+                    return toEvidenceView(evidence.findEvidence(task.id(), evidenceNo).orElseThrow());
+                });
+    }
+
+    /**
+     * 查询任务证据链：当前任务版本、必需类别与全部证据。只读，不隐式写入。
+     */
+    @Transactional(readOnly = true)
+    public EvidenceChainView evidenceChain(String incidentKey, String taskKey) {
+        Incident incident = incidents.findByKey(incidentKey)
+                .orElseThrow(() -> ApiException.notFound("事件不存在: " + incidentKey));
+        IncidentTask task = tasks.findByKey(incident.id(), taskKey)
+                .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
+        List<EvidenceView> views = evidence.listEvidence(task.id()).stream()
+                .map(this::toEvidenceView).toList();
+        return new EvidenceChainView(taskKey, task.version(), evidence.listCategories(task.id()),
+                views);
     }
 }
