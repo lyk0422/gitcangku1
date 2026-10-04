@@ -2,6 +2,7 @@ package com.example.starter.race.service;
 
 import com.example.starter.race.api.CheckpointPassResponse;
 import com.example.starter.race.api.CheckpointTimingResponse;
+import com.example.starter.race.api.ExecutionResponse;
 import com.example.starter.race.api.PenaltyResponse;
 import com.example.starter.race.api.ResultEntryResponse;
 import com.example.starter.race.api.RunnerResponse;
@@ -12,6 +13,7 @@ import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
+import com.example.starter.race.persistence.ExecutionRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
 import com.example.starter.race.persistence.RunnerRow;
@@ -37,7 +39,14 @@ final class ResponseMapper {
 
     static PenaltyResponse toPenaltyResponse(PenaltyRow row) {
         return new PenaltyResponse(row.penaltyId(), row.bib(), row.type(), row.amountMs(),
-                row.revoked(), row.createdAt(), row.revokedAt());
+                row.executedMs(), row.revoked(), row.createdAt(), row.revokedAt());
+    }
+
+    static ExecutionResponse toExecutionResponse(ExecutionRow row) {
+        return new ExecutionResponse(
+                row.executionId(), row.bib(), row.penaltyId(), row.startMs(), row.endMs(),
+                row.judge(), row.status(), row.creditedMs(), row.confirmedBy(),
+                row.confirmedAt(), row.createdAt());
     }
 
     static CheckpointTimingResponse toTimingResponse(CheckpointTimingRow row) {
@@ -78,6 +87,7 @@ final class ResponseMapper {
                 entry.status(),
                 entry.finishTimeMs(),
                 entry.penaltyMs(),
+                entry.executedMs(),
                 entry.totalTimeMs(),
                 entry.checkpointCount(),
                 entry.coveredCheckpointCount(),
@@ -91,6 +101,7 @@ final class ResponseMapper {
                 entry.status(),
                 entry.finishTimeMs(),
                 entry.penaltyMs(),
+                entry.executedMs(),
                 entry.totalTimeMs(),
                 entry.checkpointCount(),
                 entry.coveredCheckpointCount(),

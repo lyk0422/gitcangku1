@@ -119,4 +119,47 @@ class ResultCalculatorTest {
         assertThat(entries.get(1).penaltyMs()).isEqualTo(50L);
         assertThat(entries.get(1).totalTimeMs()).isEqualTo(250L);
     }
+
+    private record ExecutedPenalty(
+            String bib,
+            PenaltyType type,
+            Long amountMs,
+            boolean revoked,
+            long executedMs
+    ) implements ResultCalculator.PenaltyView {
+    }
+
+    @Test
+    void 已确认执行抵扣净罚时且净处罚不为负() {
+        List<Runner> runners = List.of(
+                new Runner("a", 100_000L),
+                new Runner("b", 100_000L));
+        List<ExecutedPenalty> penalties = List.of(
+                new ExecutedPenalty("a", PenaltyType.ADD_TIME, 10_000L, false, 6_000L),
+                // 抵扣超过罚时：防御性封顶，净处罚为0
+                new ExecutedPenalty("b", PenaltyType.ADD_TIME, 10_000L, false, 15_000L));
+
+        List<ResultEntry> entries = ResultCalculator.compute(runners, penalties);
+
+        assertThat(entries).extracting(ResultEntry::bib).containsExactly("b", "a");
+        assertThat(entries.get(0).penaltyMs()).isEqualTo(10_000L);
+        assertThat(entries.get(0).executedMs()).isEqualTo(10_000L);
+        assertThat(entries.get(0).totalTimeMs()).isEqualTo(100_000L);
+        assertThat(entries.get(1).penaltyMs()).isEqualTo(10_000L);
+        assertThat(entries.get(1).executedMs()).isEqualTo(6_000L);
+        assertThat(entries.get(1).totalTimeMs()).isEqualTo(104_000L);
+    }
+
+    @Test
+    void 已撤销处罚的原罚时与抵扣均不计入净成绩() {
+        List<Runner> runners = List.of(new Runner("a", 100_000L));
+        List<ExecutedPenalty> penalties = List.of(
+                new ExecutedPenalty("a", PenaltyType.ADD_TIME, 10_000L, true, 6_000L));
+
+        List<ResultEntry> entries = ResultCalculator.compute(runners, penalties);
+
+        assertThat(entries.get(0).penaltyMs()).isZero();
+        assertThat(entries.get(0).executedMs()).isZero();
+        assertThat(entries.get(0).totalTimeMs()).isEqualTo(100_000L);
+    }
 }

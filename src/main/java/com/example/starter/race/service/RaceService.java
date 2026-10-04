@@ -1,7 +1,9 @@
 package com.example.starter.race.service;
 
+import com.example.starter.race.api.AddExecutionRequest;
 import com.example.starter.race.api.AddPenaltyRequest;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
+import com.example.starter.race.api.ConfirmExecutionRequest;
 import com.example.starter.race.api.CreateRaceRequest;
 import com.example.starter.race.api.RegisterRunnerRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
@@ -32,6 +34,19 @@ public interface RaceService {
 
     /** 撤销处罚。 */
     ServiceResult revokePenalty(String raceId, String penaltyId, RevokePenaltyRequest request);
+
+    /**
+     * 登记罚时执行凭证（仅加时处罚；区间[startMs,endMs)左闭右开、长度为正整数毫秒）。
+     * 跨选手引用、取消资格处罚或无效区间返回422且不写入。
+     */
+    ServiceResult addExecution(String raceId, AddExecutionRequest request);
+
+    /**
+     * 由另一名裁判确认执行凭证：按该处罚剩余量封顶抵扣，不产生负处罚；
+     * 同选手已确认停留区间不得重叠（相邻合法）；处罚已撤销或赛事已封榜后禁止确认。
+     */
+    ServiceResult confirmExecution(
+            String raceId, String executionId, ConfirmExecutionRequest request);
 
     /**
      * 一次性配置检查点（1~20个、代码赛事内唯一、顺序从1连续递增）；

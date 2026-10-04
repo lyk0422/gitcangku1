@@ -1,9 +1,11 @@
 package com.example.starter.race.service;
 
+import com.example.starter.race.api.AddExecutionRequest;
 import com.example.starter.race.api.AddPenaltyRequest;
 import com.example.starter.race.api.CheckpointResponse;
 import com.example.starter.race.api.CheckpointsConfigResponse;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
+import com.example.starter.race.api.ConfirmExecutionRequest;
 import com.example.starter.race.api.CreateRaceRequest;
 import com.example.starter.race.api.MissingCheckpointsResponse;
 import com.example.starter.race.api.RaceResponse;
@@ -16,12 +18,14 @@ import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.api.SubmitTimingRequest;
 import com.example.starter.race.domain.CheckpointRules;
+import com.example.starter.race.domain.ExecutionStatus;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
+import com.example.starter.race.persistence.ExecutionRow;
 import com.example.starter.race.persistence.IdempotencyRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
@@ -379,6 +383,7 @@ public class RaceServiceImpl implements RaceService {
                                 entry.status(),
                                 entry.finishTimeMs(),
                                 entry.penaltyMs(),
+                                entry.executedMs(),
                                 entry.totalTimeMs(),
                                 order,
                                 entry.checkpointCount(),
@@ -496,6 +501,118 @@ public class RaceServiceImpl implements RaceService {
         SnapshotRow snapshot = repository.findSnapshot(raceId)
                 .orElseThrow(() -> new NotFoundException("赛事尚未封榜: " + raceId));
         return ResponseMapper.snapshotStanding(snapshot);
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult addExecution(String raceId, AddExecutionRequest request) {
+        return withIdempotency(request.requestId(), "ADD_EXECUTION",
+                orderedParams(
+                        "raceId", raceId,
+                        "executionId", request.executionId(),
+                        "bib", request.bib(),
+                        "penaltyId", request.penaltyId(),
+                        "startMs", request.startMs(),
+                        "endMs", request.endMs(),
+                        "judge", request.judge(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    requireRunner(raceId, request.bib());
+                    PenaltyRow penalty = repository.findPenalty(request.penaltyId())
+                            .orElseThrow(() -> new NotFoundException(
+                                    "处罚不存在: " + request.penaltyId()));
+                    if (!penalty.raceId().equals(raceId)) {
+                        throw new NotFoundException("处罚不属于该赛事: " + request.penaltyId());
+                    }
+                    if (!penalty.bib().equals(request.bib())) {
+                        throw new UnprocessableEntityException(
+                                "执行凭证不得跨选手引用他人处罚: " + request.penaltyId());
+                    }
+                    if (penalty.type() != PenaltyType.ADD_TIME) {
+                        throw new UnprocessableEntityException(
+                                "仅加时处罚可登记执行凭证: " + request.penaltyId());
+                    }
+                    if (request.endMs() <= request.startMs()) {
+                        throw new UnprocessableEntityException(
+                                "停留区间无效：endMs 必须大于 startMs（左闭右开，长度为正整数毫秒）");
+                    }
+                    long now = clock.millis();
+                    bumpVersion(race, request.expectedVersion());
+                    ExecutionRow row = new ExecutionRow(
+                            request.executionId(), raceId, request.bib(), request.penaltyId(),
+                            request.startMs(), request.endMs(), request.judge(),
+                            ExecutionStatus.PENDING, null, null, null, now);
+                    try {
+                        repository.insertExecution(row);
+                    } catch (DuplicateKeyException ex) {
+                        throw new ConflictException("执行凭证ID已存在: " + request.executionId());
+                    }
+                    ExecutionRow saved = repository.findExecution(request.executionId())
+                            .orElseThrow();
+                    return ServiceResult.created(ResponseMapper.toExecutionResponse(saved));
+                });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult confirmExecution(
+            String raceId, String executionId, ConfirmExecutionRequest request) {
+        return withIdempotency(request.requestId(), "CONFIRM_EXECUTION",
+                orderedParams(
+                        "raceId", raceId,
+                        "executionId", executionId,
+                        "judge", request.judge(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    // 与处罚撤销、封榜共用同一赛事状态裁决：行锁+版本+OPEN 校验。
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    ExecutionRow execution = repository.findExecution(executionId)
+                            .orElseThrow(() -> new NotFoundException("执行凭证不存在: " + executionId));
+                    if (!execution.raceId().equals(raceId)) {
+                        throw new NotFoundException("执行凭证不属于该赛事: " + executionId);
+                    }
+                    if (execution.status() == ExecutionStatus.CONFIRMED) {
+                        throw new ConflictException("执行凭证已确认: " + executionId);
+                    }
+                    PenaltyRow penalty = repository.findPenalty(execution.penaltyId())
+                            .orElseThrow(() -> new IllegalStateException(
+                                    "执行凭证绑定的处罚缺失: " + execution.penaltyId()));
+                    if (penalty.revoked()) {
+                        throw new UnprocessableEntityException(
+                                "处罚已撤销，未确认凭证不能确认: " + execution.penaltyId());
+                    }
+                    if (request.judge().equals(execution.judge())) {
+                        throw new UnprocessableEntityException(
+                                "确认裁判必须与登记裁判不同: " + request.judge());
+                    }
+                    // 左闭右开区间重叠判定：start < other.end 且 other.start < end；端点相接合法。
+                    for (ExecutionRow other : repository.findConfirmedExecutionsForRunner(
+                            raceId, execution.bib())) {
+                        if (other.executionId().equals(executionId)) {
+                            continue;
+                        }
+                        if (execution.startMs() < other.endMs()
+                                && other.startMs() < execution.endMs()) {
+                            throw new UnprocessableEntityException(
+                                    "同选手已确认停留区间不得重叠: " + other.executionId());
+                        }
+                    }
+                    // 抵扣按该处罚剩余量封顶，超出部分不产生负处罚。
+                    long intervalMs = execution.endMs() - execution.startMs();
+                    long remainingMs = penalty.amountMs()
+                            - repository.sumCreditedForPenalty(execution.penaltyId());
+                    long creditedMs = Math.min(intervalMs, Math.max(remainingMs, 0L));
+                    long now = clock.millis();
+                    bumpVersion(race, request.expectedVersion());
+                    int updated = repository.confirmExecution(
+                            executionId, creditedMs, request.judge(), now);
+                    if (updated == 0) {
+                        throw new ConflictException("执行凭证已确认: " + executionId);
+                    }
+                    ExecutionRow saved = repository.findExecution(executionId).orElseThrow();
+                    return ServiceResult.ok(ResponseMapper.toExecutionResponse(saved));
+                });
     }
 
     /**

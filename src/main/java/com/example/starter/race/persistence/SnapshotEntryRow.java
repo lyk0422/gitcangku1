@@ -12,7 +12,8 @@ import java.util.List;
  * @param rank                      名次；非 RANKED 为 null
  * @param status                    成绩状态
  * @param finishTimeMs              原始完赛耗时（毫秒）；计时缺失为 null
- * @param penaltyMs                 生效加时合计毫秒数
+ * @param penaltyMs                 生效加时合计毫秒数（原罚时，不抵扣）
+ * @param executedMs                封榜时已确认执行凭证的抵扣毫秒数合计
  * @param totalTimeMs               总耗时毫秒数；未排名为 null
  * @param displayOrder              展示顺序，从0开始
  * @param checkpointCount           赛事检查点总数；未配置检查点为 0
@@ -26,6 +27,7 @@ public record SnapshotEntryRow(
         EntryStatus status,
         Long finishTimeMs,
         long penaltyMs,
+        long executedMs,
         Long totalTimeMs,
         int displayOrder,
         int checkpointCount,
@@ -33,7 +35,7 @@ public record SnapshotEntryRow(
         List<String> missingCheckpoints
 ) {
 
-    /** 兼容旧调用的构造器：检查点计数为 0、缺失列表为空。 */
+    /** 兼容旧调用的构造器：无执行抵扣、检查点计数为 0、缺失列表为空。 */
     public SnapshotEntryRow(
             String raceId,
             String bib,
@@ -43,7 +45,7 @@ public record SnapshotEntryRow(
             long penaltyMs,
             Long totalTimeMs,
             int displayOrder) {
-        this(raceId, bib, rank, status, finishTimeMs, penaltyMs, totalTimeMs, displayOrder,
+        this(raceId, bib, rank, status, finishTimeMs, penaltyMs, 0L, totalTimeMs, displayOrder,
                 0, 0, List.of());
     }
 }

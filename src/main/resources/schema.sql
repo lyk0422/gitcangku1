@@ -50,8 +50,9 @@ CREATE TABLE IF NOT EXISTS result_snapshot_entry (
     rank_no INT COMMENT '名次（从1开始，并列同名次并跳号，如1、1、3）；未计时/漏点/取消资格为NULL',
     status VARCHAR(24) NOT NULL COMMENT '成绩状态：RANKED-参与排名，UNTIMED-计时缺失，MISSING_CHECKPOINT-有完赛但未覆盖全部检查点，DISQUALIFIED-取消资格',
     finish_time_ms BIGINT COMMENT '原始完赛耗时（毫秒）；计时缺失为NULL',
-    penalty_ms BIGINT NOT NULL COMMENT '生效（未撤销）加时处罚合计毫秒数，无加时为0',
-    total_time_ms BIGINT COMMENT '总耗时=原始完赛耗时+生效加时（毫秒）；未排名时为NULL',
+    penalty_ms BIGINT NOT NULL COMMENT '生效（未撤销）加时处罚合计毫秒数（原罚时，不抵扣），无加时为0',
+    executed_ms BIGINT NOT NULL DEFAULT 0 COMMENT '封榜时已确认执行凭证的抵扣毫秒数合计（仅统计生效加时处罚）；无执行为0',
+    total_time_ms BIGINT COMMENT '总耗时=原始完赛耗时+生效加时剩余量（原罚时-已执行抵扣）（毫秒）；未排名时为NULL',
     checkpoint_count INT NOT NULL DEFAULT 0 COMMENT '赛事检查点总数；未配置检查点为0',
     covered_checkpoint_count INT NOT NULL DEFAULT 0 COMMENT '封榜时该选手已覆盖检查点数量；缺失检查点由result_snapshot_checkpoint中elapsed_millis为NULL的行固化',
     display_order INT NOT NULL COMMENT '展示顺序，从0开始：先名次顺序，并列者按参赛号字典序，其余按参赛号字典序',
@@ -103,4 +104,26 @@ CREATE TABLE IF NOT EXISTS idempotency_record (
     response_body TEXT COMMENT '原成功响应体JSON，重放时原样返回',
     created_at BIGINT NOT NULL COMMENT '首次成功提交时间，Unix毫秒时间戳',
     CONSTRAINT pk_idempotency_record PRIMARY KEY (request_id)
+);
+
+-- 罚时执行凭证：仅绑定加时（ADD_TIME）处罚的赛中停留执行记录。
+-- 区间[start_ms, end_ms)左闭右开，长度为整数毫秒；确认时按处罚剩余量封顶抵扣，不产生负处罚。
+CREATE TABLE IF NOT EXISTS penalty_execution (
+    execution_id VARCHAR(64) NOT NULL COMMENT '执行凭证ID，全局唯一',
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    bib VARCHAR(64) NOT NULL COMMENT '停留选手参赛号',
+    penalty_id VARCHAR(64) NOT NULL COMMENT '绑定的加时处罚ID；处罚撤销后凭证保留但不复活',
+    start_ms BIGINT NOT NULL COMMENT '停留开始时刻，Unix毫秒时间戳（UTC），区间左闭',
+    end_ms BIGINT NOT NULL COMMENT '停留结束时刻，Unix毫秒时间戳（UTC），区间右开；长度=end_ms-start_ms，必须为正整数毫秒',
+    judge VARCHAR(64) NOT NULL COMMENT '登记裁判标识',
+    status VARCHAR(16) NOT NULL COMMENT '凭证状态：PENDING-待确认，CONFIRMED-已确认',
+    credited_ms BIGINT COMMENT '确认时实际抵扣毫秒数（不超过该处罚剩余量，冻结后不再变化）；未确认为NULL',
+    confirmed_by VARCHAR(64) COMMENT '确认裁判标识，必须与登记裁判不同；未确认为NULL',
+    confirmed_at BIGINT COMMENT '确认时间，Unix毫秒时间戳；未确认为NULL',
+    created_at BIGINT NOT NULL COMMENT '登记时间，Unix毫秒时间戳',
+    CONSTRAINT pk_penalty_execution PRIMARY KEY (execution_id),
+    CONSTRAINT fk_execution_penalty FOREIGN KEY (penalty_id) REFERENCES penalty (penalty_id),
+    CONSTRAINT fk_execution_runner FOREIGN KEY (race_id, bib) REFERENCES runner (race_id, bib),
+    INDEX idx_execution_race_bib (race_id, bib),
+    INDEX idx_execution_penalty (penalty_id)
 );
