@@ -41,6 +41,17 @@ public class WaterRepository {
                                  Long cancelledNanos) {
     }
 
+    /** 结算版本行；deltaAmount 为与最近有效版本应收的差额（首版等于应收总额）。 */
+    public record SettlementRow(long id, long windowId, int version, BigDecimal totalAmount,
+                                BigDecimal deltaAmount, BigDecimal baseThreshold, BigDecimal baseRate,
+                                BigDecimal excessRate, String allocationsSnapshot, long createdNanos) {
+    }
+
+    /** 结算农户分组明细行。 */
+    public record SettlementLineRow(long id, long settlementId, String userId, BigDecimal volume,
+                                    BigDecimal baseVolume, BigDecimal excessVolume, BigDecimal amount) {
+    }
+
     /** 幂等命令行；response 为 null 表示响应尚未写回（同事务内）。 */
     public record CommandRow(String commandKey, String operation, String params, String response,
                              long createdNanos) {
@@ -70,6 +81,23 @@ public class WaterRepository {
             rs.getLong("id"), rs.getLong("window_id"), rs.getBigDecimal("volume"), rs.getString("status"),
             rs.getLong("created_nanos"),
             rs.getObject("cancelled_nanos") == null ? null : rs.getLong("cancelled_nanos"));
+
+    private static final RowMapper<SettlementRow> SETTLEMENT_MAPPER = (rs, n) -> new SettlementRow(
+            rs.getLong("id"), rs.getLong("window_id"), rs.getInt("version"),
+            rs.getBigDecimal("total_amount"), rs.getBigDecimal("delta_amount"),
+            rs.getBigDecimal("base_threshold"), rs.getBigDecimal("base_rate"),
+            rs.getBigDecimal("excess_rate"), rs.getString("allocations_snapshot"),
+            rs.getLong("created_nanos"));
+
+    private static final String SETTLEMENT_SELECT =
+            "SELECT id, window_id, version, total_amount, delta_amount, base_threshold, base_rate,"
+                    + " excess_rate, allocations_snapshot, created_nanos";
+
+    private static final RowMapper<SettlementLineRow> SETTLEMENT_LINE_MAPPER =
+            (rs, n) -> new SettlementLineRow(rs.getLong("id"), rs.getLong("settlement_id"),
+                    rs.getString("user_id"), rs.getBigDecimal("volume"),
+                    rs.getBigDecimal("base_volume"), rs.getBigDecimal("excess_volume"),
+                    rs.getBigDecimal("amount"));
 
     private static final RowMapper<CommandRow> COMMAND_MAPPER = (rs, n) -> new CommandRow(
             rs.getString("command_key"), rs.getString("operation"), rs.getString("params"),
@@ -303,5 +331,70 @@ public class WaterRepository {
     /** 写回命令首次成功响应。 */
     public void updateCommandResponse(String commandKey, String response) {
         jdbc.update("UPDATE command_log SET response = ? WHERE command_key = ?", response, commandKey);
+    }
+
+    /** 插入结算版本并返回主键；版本号由调用方在窗口锁内计算，唯一约束兜底并发。 */
+    public long insertSettlement(long windowId, int version, BigDecimal totalAmount, BigDecimal deltaAmount,
+                                 BigDecimal baseThreshold, BigDecimal baseRate, BigDecimal excessRate,
+                                 String allocationsSnapshot, long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO settlement (window_id, version, total_amount, delta_amount, base_threshold,"
+                            + " base_rate, excess_rate, allocations_snapshot, created_nanos)"
+                            + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", Statement.RETURN_GENERATED_KEYS);
+            ps.setLong(1, windowId);
+            ps.setInt(2, version);
+            ps.setBigDecimal(3, totalAmount);
+            ps.setBigDecimal(4, deltaAmount);
+            ps.setBigDecimal(5, baseThreshold);
+            ps.setBigDecimal(6, baseRate);
+            ps.setBigDecimal(7, excessRate);
+            ps.setString(8, allocationsSnapshot);
+            ps.setLong(9, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 插入结算农户分组明细。 */
+    public void insertSettlementLine(long settlementId, String userId, BigDecimal volume,
+                                     BigDecimal baseVolume, BigDecimal excessVolume, BigDecimal amount) {
+        jdbc.update("INSERT INTO settlement_line (settlement_id, user_id, volume, base_volume,"
+                        + " excess_volume, amount) VALUES (?, ?, ?, ?, ?, ?)",
+                settlementId, userId, volume, baseVolume, excessVolume, amount);
+    }
+
+    /** 查询窗口最新结算版本，无则 null。 */
+    public SettlementRow findLatestSettlement(long windowId) {
+        List<SettlementRow> rows = jdbc.query(
+                SETTLEMENT_SELECT + " FROM settlement WHERE window_id = ? ORDER BY version DESC LIMIT 1",
+                SETTLEMENT_MAPPER, windowId);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /** 按窗口与版本号查询结算版本，不存在返回 null。 */
+    public SettlementRow findSettlementByVersion(long windowId, int version) {
+        try {
+            return jdbc.queryForObject(
+                    SETTLEMENT_SELECT + " FROM settlement WHERE window_id = ? AND version = ?",
+                    SETTLEMENT_MAPPER, windowId, version);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 窗口全部结算版本（差额账本），按版本升序。 */
+    public List<SettlementRow> listSettlements(long windowId) {
+        return jdbc.query(SETTLEMENT_SELECT + " FROM settlement WHERE window_id = ? ORDER BY version",
+                SETTLEMENT_MAPPER, windowId);
+    }
+
+    /** 结算版本的农户分组明细，按用水户排序。 */
+    public List<SettlementLineRow> listSettlementLines(long settlementId) {
+        return jdbc.query(
+                "SELECT id, settlement_id, user_id, volume, base_volume, excess_volume, amount"
+                        + " FROM settlement_line WHERE settlement_id = ? ORDER BY user_id",
+                SETTLEMENT_LINE_MAPPER, settlementId);
     }
 }

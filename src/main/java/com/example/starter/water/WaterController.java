@@ -7,6 +7,9 @@ import com.example.starter.water.dto.Dtos.CreateWindowRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.SettleRequest;
+import com.example.starter.water.dto.Dtos.SettlementListResponse;
+import com.example.starter.water.dto.Dtos.SettlementResponse;
 import com.example.starter.water.dto.Dtos.SubmitAllocationRequest;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferRequest;
@@ -90,6 +93,31 @@ public class WaterController {
     @GetMapping("/windows/{windowId}/transfers")
     public TransferListResponse getTransfers(@PathVariable long windowId) {
         return service.getTransfers(windowId);
+    }
+
+    /** 结算/对账：按当前已批准申请生成窗口下一结算版本（首版无需 expectedSettlementVersion）。 */
+    @PostMapping("/windows/{windowId}/settlements")
+    public SettlementResponse settle(@PathVariable long windowId, @RequestBody SettleRequest request,
+                                     @RequestHeader("X-Actor-Id") String actor) {
+        return service.settle(request.requestId(), windowId, request.expectedSettlementVersion(), actor);
+    }
+
+    /** 查询窗口全部结算版本（差额账本），旧版本不变。 */
+    @GetMapping("/windows/{windowId}/settlements")
+    public SettlementListResponse getSettlements(@PathVariable long windowId) {
+        return service.getSettlements(windowId);
+    }
+
+    /** 查询窗口当前净应收（最新有效结算版本）。 */
+    @GetMapping("/windows/{windowId}/settlements/current")
+    public SettlementResponse getCurrentSettlement(@PathVariable long windowId) {
+        return service.getCurrentSettlement(windowId);
+    }
+
+    /** 查询窗口指定版本结算单（含农户分组明细）。 */
+    @GetMapping("/windows/{windowId}/settlements/{version}")
+    public SettlementResponse getSettlement(@PathVariable long windowId, @PathVariable int version) {
+        return service.getSettlement(windowId, version);
     }
 
     /** 查询窗口当前可用容量。 */

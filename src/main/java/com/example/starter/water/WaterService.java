@@ -3,12 +3,18 @@ package com.example.starter.water;
 import com.example.starter.water.WaterRepository.AllocationRow;
 import com.example.starter.water.WaterRepository.CommandRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
+import com.example.starter.water.WaterRepository.SettlementLineRow;
+import com.example.starter.water.WaterRepository.SettlementRow;
 import com.example.starter.water.WaterRepository.TransferRow;
 import com.example.starter.water.WaterRepository.WindowRow;
 import com.example.starter.water.dto.Dtos.AllocationResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.SettlementLineResponse;
+import com.example.starter.water.dto.Dtos.SettlementListResponse;
+import com.example.starter.water.dto.Dtos.SettlementResponse;
+import com.example.starter.water.dto.Dtos.SettlementSummaryResponse;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferResponse;
 import com.example.starter.water.dto.Dtos.WindowResponse;
@@ -19,9 +25,14 @@ import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
@@ -43,6 +54,12 @@ public class WaterService {
 
     private static final long NANOS_PER_SECOND = 1_000_000_000L;
     private static final Pattern AMOUNT_PATTERN = Pattern.compile("\\d{1,16}(\\.\\d{1,3})?");
+    /** 阶梯阈值：每农户每窗口前 100 立方米按 base 费率，超出部分按 excess 费率。 */
+    static final BigDecimal BASE_THRESHOLD = new BigDecimal("100");
+    static final BigDecimal BASE_RATE = new BigDecimal("2");
+    static final BigDecimal EXCESS_RATE = new BigDecimal("3");
+    private static final int MONEY_SCALE = 2;
+
     private static final Pattern KEY_PATTERN = Pattern.compile("[\\w.\\-:]{1,128}");
 
     private final WaterRepository repository;
@@ -316,6 +333,150 @@ public class WaterService {
     }
 
     // ------------------------------------------------------------------
+    // 阶梯计费结算与对账
+    // ------------------------------------------------------------------
+
+    /**
+     * 结算/对账：在窗口锁内读取完整窗口状态，仅当前 APPROVED 申请参与，按农户合计当前持有额度，
+     * 前 100 立方米 2 元/立方米、超出部分 3 元/立方米，金额 HALF_UP 到分。
+     * 首版 version=1（不得提交 expectedSettlementVersion）；后续对账必须提交等于最新版本的
+     * expectedSettlementVersion，否则 409。差额 = 新应收 - 最近有效应收，无变化也落零差额新版本。
+     * 任一农户总量非法（负值、超过 3 位小数或持有额度超过原申请量）则 422 且整张对账不写。
+     */
+    public SettlementResponse settle(String requestId, long windowId, Long expectedSettlementVersion,
+                                     String actor) {
+        requireKey("requestId", requestId);
+        requireKey("X-Actor-Id", actor);
+        Map<String, Object> identity = new LinkedHashMap<>();
+        identity.put("operation", "SETTLEMENT_SETTLE");
+        identity.put("actor", actor);
+        identity.put("windowId", windowId);
+        identity.put("expectedSettlementVersion", expectedSettlementVersion);
+        return runCommand("SETTLEMENT_SETTLE", requestId, toJson(identity), SettlementResponse.class, () -> {
+            WindowRow window = repository.lockWindowById(windowId);
+            if (window == null) {
+                throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + windowId);
+            }
+            SettlementRow latest = repository.findLatestSettlement(windowId);
+            int version;
+            if (latest == null) {
+                if (expectedSettlementVersion != null) {
+                    throw ApiException.conflict("SETTLEMENT_VERSION_CONFLICT",
+                            "窗口尚无结算版本，首次结算不应提交 expectedSettlementVersion");
+                }
+                version = 1;
+            } else {
+                if (expectedSettlementVersion == null) {
+                    throw ApiException.badRequest("INVALID_ARGUMENT",
+                            "对账必须提交 expectedSettlementVersion，当前最新版本为 " + latest.version());
+                }
+                if (expectedSettlementVersion != latest.version()) {
+                    throw ApiException.conflict("SETTLEMENT_VERSION_CONFLICT",
+                            "expectedSettlementVersion " + expectedSettlementVersion
+                                    + " 与当前最新版本 " + latest.version() + " 不一致");
+                }
+                version = latest.version() + 1;
+            }
+            List<AllocationRow> approved = repository.listAllocations(windowId).stream()
+                    .filter(a -> STATUS_APPROVED.equals(a.status())).toList();
+            Map<String, BigDecimal> totalsByUser = new TreeMap<>();
+            for (AllocationRow allocation : approved) {
+                validateVolume("申请 " + allocation.allocationKey() + " 持有额度", allocation.heldAmount(),
+                        allocation.amount());
+                totalsByUser.merge(allocation.userId(), allocation.heldAmount(), BigDecimal::add);
+            }
+            List<SettlementLineRow> lines = new ArrayList<>();
+            BigDecimal total = BigDecimal.ZERO;
+            for (Map.Entry<String, BigDecimal> entry : totalsByUser.entrySet()) {
+                BigDecimal volume = entry.getValue();
+                validateVolume("用水户 " + entry.getKey() + " 合计水量", volume, null);
+                BigDecimal baseVolume = volume.min(BASE_THRESHOLD);
+                BigDecimal excessVolume = volume.subtract(baseVolume);
+                BigDecimal amount = baseVolume.multiply(BASE_RATE)
+                        .add(excessVolume.multiply(EXCESS_RATE))
+                        .setScale(MONEY_SCALE, RoundingMode.HALF_UP);
+                lines.add(new SettlementLineRow(0, 0, entry.getKey(), volume, baseVolume, excessVolume, amount));
+                total = total.add(amount);
+            }
+            BigDecimal previous = latest != null ? latest.totalAmount() : BigDecimal.ZERO;
+            BigDecimal delta = total.subtract(previous).setScale(MONEY_SCALE, RoundingMode.HALF_UP);
+            List<Map<String, Object>> snapshot = new ArrayList<>();
+            for (AllocationRow allocation : approved) {
+                Map<String, Object> item = new LinkedHashMap<>();
+                item.put("allocationKey", allocation.allocationKey());
+                item.put("userId", allocation.userId());
+                item.put("heldAmount", fmt(allocation.heldAmount()));
+                snapshot.add(item);
+            }
+            long id = repository.insertSettlement(windowId, version, total, delta, BASE_THRESHOLD,
+                    BASE_RATE, EXCESS_RATE, toJson(snapshot), nowNanos());
+            for (SettlementLineRow line : lines) {
+                repository.insertSettlementLine(id, line.userId(), line.volume(), line.baseVolume(),
+                        line.excessVolume(), line.amount());
+            }
+            return toSettlementResponse(repository.findSettlementByVersion(windowId, version));
+        });
+    }
+
+    /** 校验参与计费的精确水量：非空、非负、最多 3 位小数，且不超过原申请量（传入上限时）。 */
+    private void validateVolume(String label, BigDecimal volume, BigDecimal limit) {
+        if (volume == null || volume.signum() < 0 || volume.stripTrailingZeros().scale() > 3
+                || (limit != null && volume.compareTo(limit) > 0)) {
+            throw ApiException.unprocessable("SETTLEMENT_INVALID_STATE",
+                    label + "非法，整张对账不写入: " + volume);
+        }
+    }
+
+    /** 查询窗口全部结算版本（差额账本），按版本升序，旧版本不变。 */
+    public SettlementListResponse getSettlements(long windowId) {
+        requireWindow(windowId);
+        List<SettlementSummaryResponse> settlements = repository.listSettlements(windowId).stream()
+                .map(row -> new SettlementSummaryResponse(row.windowId(), row.version(),
+                        fmtMoney(row.totalAmount()), fmtMoney(row.deltaAmount()), toIso(row.createdNanos())))
+                .toList();
+        return new SettlementListResponse(windowId, settlements);
+    }
+
+    /** 查询窗口指定版本结算单（含农户分组明细）。 */
+    public SettlementResponse getSettlement(long windowId, int version) {
+        requireWindow(windowId);
+        SettlementRow row = repository.findSettlementByVersion(windowId, version);
+        if (row == null) {
+            throw ApiException.notFound("SETTLEMENT_NOT_FOUND",
+                    "结算版本不存在: windowId=" + windowId + ", version=" + version);
+        }
+        return toSettlementResponse(row);
+    }
+
+    /** 查询窗口当前净应收（最新有效结算版本）。 */
+    public SettlementResponse getCurrentSettlement(long windowId) {
+        requireWindow(windowId);
+        SettlementRow row = repository.findLatestSettlement(windowId);
+        if (row == null) {
+            throw ApiException.notFound("SETTLEMENT_NOT_FOUND", "窗口尚无结算版本: " + windowId);
+        }
+        return toSettlementResponse(row);
+    }
+
+    private WindowRow requireWindow(long windowId) {
+        WindowRow window = repository.findWindowById(windowId);
+        if (window == null) {
+            throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + windowId);
+        }
+        return window;
+    }
+
+    private SettlementResponse toSettlementResponse(SettlementRow row) {
+        List<SettlementLineResponse> lines = repository.listSettlementLines(row.id()).stream()
+                .map(line -> new SettlementLineResponse(line.userId(), fmt(line.volume()),
+                        fmt(line.baseVolume()), fmt(line.excessVolume()), fmtMoney(line.amount())))
+                .toList();
+        return new SettlementResponse(row.windowId(), row.version(), fmtMoney(row.totalAmount()),
+                fmtMoney(row.deltaAmount()), fmt(row.baseThreshold()), fmt(row.baseRate()),
+                fmt(row.excessRate()), lines, toIso(row.createdNanos()));
+    }
+
+    // ------------------------------------------------------------------
     // 幂等命令框架
     // ------------------------------------------------------------------
 
@@ -444,6 +605,11 @@ public class WaterService {
             throw ApiException.badRequest("INVALID_ARGUMENT",
                     field + " 不能为空，且仅允许字母数字及 . - _ :，最长 128 字符");
         }
+    }
+
+    /** 金额格式化为元，固定 2 位小数（分）。 */
+    static String fmtMoney(BigDecimal value) {
+        return value.setScale(MONEY_SCALE, RoundingMode.HALF_UP).toPlainString();
     }
 
     /** 水量格式化为十进制字符串（去掉多余尾零）。 */

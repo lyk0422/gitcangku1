@@ -74,6 +74,33 @@ public final class Dtos {
                                   List<CurtailmentResponse> curtailments) {
     }
 
+    /** 结算/对账命令；requestId 为幂等键，expectedSettlementVersion 仅在已有结算版本时必填。 */
+    public record SettleRequest(String requestId, Long expectedSettlementVersion) {
+    }
+
+    /** 结算农户分组明细视图；金额单位元（精确到分），水量单位立方米（最多 3 位小数）。 */
+    public record SettlementLineResponse(String userId, String volume, String baseVolume,
+                                         String excessVolume, String amount) {
+    }
+
+    /**
+     * 结算版本视图。version 从 1 起；deltaAmount 为本版本应收减最近有效版本应收的差额，
+     * 首版等于应收总额；baseThreshold/baseRate/excessRate 为冻结的阶梯阈值与费率（元/立方米）。
+     */
+    public record SettlementResponse(long windowId, int version, String totalAmount, String deltaAmount,
+                                     String baseThreshold, String baseRate, String excessRate,
+                                     List<SettlementLineResponse> lines, String createdUtc) {
+    }
+
+    /** 结算版本摘要，即差额账本条目。 */
+    public record SettlementSummaryResponse(long windowId, int version, String totalAmount,
+                                            String deltaAmount, String createdUtc) {
+    }
+
+    /** 窗口结算版本列表视图，按版本升序，旧版本永不改写。 */
+    public record SettlementListResponse(long windowId, List<SettlementSummaryResponse> settlements) {
+    }
+
     /** 统一错误响应体。 */
     public record ErrorResponse(String code, String message) {
     }
