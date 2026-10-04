@@ -8,6 +8,7 @@ import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.PositiveOrZero;
 import jakarta.validation.constraints.Size;
 
+import java.util.Comparator;
 import java.util.List;
 
 /**
@@ -18,10 +19,11 @@ public final class ApiDtos {
     private ApiDtos() {
     }
 
-    /** 初始段落输入。 */
+    /** 初始段落输入；plural 为 true 时声明为复数段落（缺省为普通段落）。 */
     public record SegmentInput(
             @NotBlank(message = "segmentId 不能为空") @Size(max = 64) String segmentId,
-            @NotBlank(message = "sourceText 不能为空") String sourceText) {
+            @NotBlank(message = "sourceText 不能为空") String sourceText,
+            Boolean plural) {
     }
 
     /** 建文档请求：1~5 种目标语言，可携带初始段落。 */
@@ -32,11 +34,12 @@ public final class ApiDtos {
             @NotNull(message = "segments 不能为空") List<@Valid SegmentInput> segments) {
     }
 
-    /** 增加段落请求。 */
+    /** 增加段落请求；plural 为 true 时声明为复数段落（缺省为普通段落）。 */
     public record AddSegmentRequest(
             @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
             @NotBlank(message = "segmentId 不能为空") @Size(max = 64) String segmentId,
-            @NotBlank(message = "sourceText 不能为空") String sourceText) {
+            @NotBlank(message = "sourceText 不能为空") String sourceText,
+            Boolean plural) {
     }
 
     /** 源文修订请求。 */
@@ -52,6 +55,52 @@ public final class ApiDtos {
             @Positive(message = "sourceVersion 必须为正数") int sourceVersion) {
     }
 
+    /** 单个复数类别译文输入：类别名与正文。 */
+    public record PluralCategoryInput(
+            @NotBlank(message = "category 不能为空") @Size(max = 32) String category,
+            @NotBlank(message = "content 不能为空") String content) {
+    }
+
+    /**
+     * 复数类别译文提交请求：一次提交一个语言下的 1 个或多个类别，各类别独立保存文本与作者；
+     * 作者取 X-Actor-Id 请求头。构造时按类别名排序，集合换序视为同一请求参数。
+     */
+    public record SubmitPluralTranslationsRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @Positive(message = "sourceVersion 必须为正数") int sourceVersion,
+            @NotNull(message = "categories 不能为空") @Size(min = 1, message = "categories 至少 1 个")
+            List<@Valid PluralCategoryInput> categories) {
+        public SubmitPluralTranslationsRequest {
+            if (categories != null) {
+                categories = categories.stream()
+                        .sorted(Comparator.comparing(PluralCategoryInput::category,
+                                Comparator.nullsFirst(Comparator.naturalOrder())))
+                        .toList();
+            }
+        }
+    }
+
+    /** 复数类别批准请求；审核人取 X-Actor-Id 请求头，不得是该类别作者。 */
+    public record ApprovePluralCategoryRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @NotBlank(message = "category 不能为空") @Size(max = 32) String category,
+            @Positive(message = "translationVersion 必须为正数") int translationVersion) {
+    }
+
+    /** 复数类别译文版本视图。 */
+    public record PluralCategoryVersionView(String category, int translationVersion) {
+    }
+
+    /** 复数类别译文提交响应：本次提交的各类别及其译文版本。 */
+    public record PluralSubmitResponse(long documentId, String segmentId, String language,
+                                       int sourceVersion, int termVersion, int draftVersion,
+                                       List<PluralCategoryVersionView> categories) {
+    }
+
+    /** 复数类别批准响应。 */
+    public record PluralApprovalResponse(long documentId, String segmentId, String language, String category,
+                                         String reviewer, int translationVersion, int sourceVersion) {
+    }
     /** 译文批准请求；审核人取 X-Actor-Id 请求头。 */
     public record ApproveTranslationRequest(
             @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,

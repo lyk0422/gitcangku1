@@ -29,8 +29,13 @@ public final class Rows {
      * @param segmentId     文档内唯一段落 ID
      * @param sourceText    源文正文，UTF-8
      * @param sourceVersion 源文版本，从 1 开始，每次源文修订加一
+     * @param segmentType   段落类型：plain 普通段落，plural 复数段落（按复数类别提交译文）
      */
-    public record SegmentRow(String segmentId, String sourceText, int sourceVersion) {
+    public record SegmentRow(String segmentId, String sourceText, int sourceVersion, String segmentType) {
+        /** 是否为复数段落。 */
+        public boolean isPlural() {
+            return "plural".equals(segmentType);
+        }
     }
 
     /**
@@ -48,6 +53,38 @@ public final class Rows {
                                  int sourceVersion, int translationVersion, int termVersion) {
     }
 
+    /**
+     * 复数类别译文：按段落、语言与类别唯一，各类别独立保存正文、作者、所依据源文版本、
+     * 绑定术语版本及递增译文版本。
+     *
+     * @param segmentId          所属段落 ID（plural 类型段落）
+     * @param language           目标语言码，小写；复数流程仅允许 zh 与 en
+     * @param category           复数类别名，小写；zh 要求 other，en 要求 one 与 other
+     * @param content            该类别译文正文，UTF-8
+     * @param author             该类别译文作者，取提交时 X-Actor-Id
+     * @param sourceVersion      译文所依据的源文版本；提交时必须等于当前源文版本
+     * @param translationVersion 该类别译文版本，从 1 开始，每次重新提交该类别加一
+     * @param termVersion        提交时绑定的术语版本；不等于当前术语版本时视为术语过期
+     */
+    public record PluralTranslationRow(String segmentId, String language, String category, String content,
+                                       String author, int sourceVersion, int translationVersion,
+                                       int termVersion) {
+    }
+
+    /**
+     * 复数类别批准：按段落、语言与类别唯一；源文修订使该段全部类别批准失效，
+     * 类别修订仅使该类别批准失效。
+     *
+     * @param segmentId          所属段落 ID
+     * @param language           目标语言码，小写
+     * @param category           复数类别名，小写
+     * @param reviewer           审核人，取批准时 X-Actor-Id，不得是该类别译文作者
+     * @param sourceVersion      批准时的源文版本，发布校验须等于当前源文版本
+     * @param translationVersion 批准时该类别的译文版本，发布校验须等于该类别当前译文版本
+     */
+    public record PluralApprovalRow(String segmentId, String language, String category, String reviewer,
+                                    int sourceVersion, int translationVersion) {
+    }
     /**
      * 术语规则：属于某术语版本的不可变规则，按 sourceTerm 与目标语言唯一。
      *

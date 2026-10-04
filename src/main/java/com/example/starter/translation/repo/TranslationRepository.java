@@ -2,6 +2,8 @@ package com.example.starter.translation.repo;
 
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
+import com.example.starter.translation.domain.Rows.PluralApprovalRow;
+import com.example.starter.translation.domain.Rows.PluralTranslationRow;
 import com.example.starter.translation.domain.Rows.RequestLogRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
@@ -32,7 +34,19 @@ public class TranslationRepository {
             rs.getInt("term_version"));
 
     private static final RowMapper<SegmentRow> SEGMENT_MAPPER = (rs, n) -> new SegmentRow(
-            rs.getString("segment_id"), rs.getString("source_text"), rs.getInt("source_version"));
+            rs.getString("segment_id"), rs.getString("source_text"), rs.getInt("source_version"),
+            rs.getString("segment_type"));
+
+    private static final RowMapper<PluralTranslationRow> PLURAL_TRANSLATION_MAPPER = (rs, n) ->
+            new PluralTranslationRow(rs.getString("segment_id"), rs.getString("language"),
+                    rs.getString("category"), rs.getString("content"), rs.getString("author"),
+                    rs.getInt("source_version"), rs.getInt("translation_version"),
+                    rs.getInt("term_version"));
+
+    private static final RowMapper<PluralApprovalRow> PLURAL_APPROVAL_MAPPER = (rs, n) ->
+            new PluralApprovalRow(rs.getString("segment_id"), rs.getString("language"),
+                    rs.getString("category"), rs.getString("reviewer"),
+                    rs.getInt("source_version"), rs.getInt("translation_version"));
 
     private static final RowMapper<TranslationRow> TRANSLATION_MAPPER = (rs, n) -> new TranslationRow(
             rs.getString("segment_id"), rs.getString("language"), rs.getString("content"),
@@ -100,14 +114,16 @@ public class TranslationRepository {
         jdbc.update("UPDATE document SET term_version = ? WHERE document_id = ?", termVersion, documentId);
     }
 
-    public void insertSegment(long documentId, String segmentId, String sourceText) {
-        jdbc.update("INSERT INTO segment (document_id, segment_id, source_text, source_version) VALUES (?, ?, ?, 1)",
-                documentId, segmentId, sourceText);
+    /** 插入段落，初始源文版本 1；segmentType 为 plain 或 plural。 */
+    public void insertSegment(long documentId, String segmentId, String sourceText, String segmentType) {
+        jdbc.update("INSERT INTO segment (document_id, segment_id, source_text, source_version, segment_type) "
+                        + "VALUES (?, ?, ?, 1, ?)",
+                documentId, segmentId, sourceText, segmentType);
     }
 
     public Optional<SegmentRow> findSegment(long documentId, String segmentId) {
         List<SegmentRow> rows = jdbc.query(
-                "SELECT segment_id, source_text, source_version FROM segment "
+                "SELECT segment_id, source_text, source_version, segment_type FROM segment "
                         + "WHERE document_id = ? AND segment_id = ?",
                 SEGMENT_MAPPER, documentId, segmentId);
         return rows.stream().findFirst();
@@ -115,7 +131,7 @@ public class TranslationRepository {
 
     public List<SegmentRow> listSegments(long documentId) {
         return jdbc.query(
-                "SELECT segment_id, source_text, source_version FROM segment "
+                "SELECT segment_id, source_text, source_version, segment_type FROM segment "
                         + "WHERE document_id = ? ORDER BY segment_id",
                 SEGMENT_MAPPER, documentId);
     }
@@ -188,6 +204,86 @@ public class TranslationRepository {
         }
     }
 
+    /** 按段落与语言查询某类别的复数译文。 */
+    public Optional<PluralTranslationRow> findPluralTranslation(long documentId, String segmentId,
+                                                                String language, String category) {
+        List<PluralTranslationRow> rows = jdbc.query(
+                "SELECT segment_id, language, category, content, author, source_version, translation_version, "
+                        + "term_version FROM plural_translation "
+                        + "WHERE document_id = ? AND segment_id = ? AND language = ? AND category = ?",
+                PLURAL_TRANSLATION_MAPPER, documentId, segmentId, language, category);
+        return rows.stream().findFirst();
+    }
+
+    /** 查询文档某段落某语言的全部复数类别译文，按类别名排序。 */
+    public List<PluralTranslationRow> listPluralTranslations(long documentId, String segmentId, String language) {
+        return jdbc.query(
+                "SELECT segment_id, language, category, content, author, source_version, translation_version, "
+                        + "term_version FROM plural_translation "
+                        + "WHERE document_id = ? AND segment_id = ? AND language = ? ORDER BY category",
+                PLURAL_TRANSLATION_MAPPER, documentId, segmentId, language);
+    }
+
+    /** 查询文档全部复数类别译文，按段落、语言、类别排序。 */
+    public List<PluralTranslationRow> listAllPluralTranslations(long documentId) {
+        return jdbc.query(
+                "SELECT segment_id, language, category, content, author, source_version, translation_version, "
+                        + "term_version FROM plural_translation "
+                        + "WHERE document_id = ? ORDER BY segment_id, language, category",
+                PLURAL_TRANSLATION_MAPPER, documentId);
+    }
+
+    /** 插入或覆盖某类别的复数译文（按主键段落+语言+类别唯一），不影响其他类别。 */
+    public void upsertPluralTranslation(long documentId, PluralTranslationRow row) {
+        int updated = jdbc.update(
+                "UPDATE plural_translation SET content = ?, author = ?, source_version = ?, "
+                        + "translation_version = ?, term_version = ?, updated_at = CURRENT_TIMESTAMP "
+                        + "WHERE document_id = ? AND segment_id = ? AND language = ? AND category = ?",
+                row.content(), row.author(), row.sourceVersion(), row.translationVersion(), row.termVersion(),
+                documentId, row.segmentId(), row.language(), row.category());
+        if (updated == 0) {
+            jdbc.update("INSERT INTO plural_translation (document_id, segment_id, language, category, content, "
+                            + "author, source_version, translation_version, term_version) "
+                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    documentId, row.segmentId(), row.language(), row.category(), row.content(), row.author(),
+                    row.sourceVersion(), row.translationVersion(), row.termVersion());
+        }
+    }
+
+    /** 按段落、语言与类别查询复数批准。 */
+    public Optional<PluralApprovalRow> findPluralApproval(long documentId, String segmentId,
+                                                          String language, String category) {
+        List<PluralApprovalRow> rows = jdbc.query(
+                "SELECT segment_id, language, category, reviewer, source_version, translation_version "
+                        + "FROM plural_approval "
+                        + "WHERE document_id = ? AND segment_id = ? AND language = ? AND category = ?",
+                PLURAL_APPROVAL_MAPPER, documentId, segmentId, language, category);
+        return rows.stream().findFirst();
+    }
+
+    /** 查询文档全部复数类别批准，按段落、语言、类别排序。 */
+    public List<PluralApprovalRow> listAllPluralApprovals(long documentId) {
+        return jdbc.query(
+                "SELECT segment_id, language, category, reviewer, source_version, translation_version "
+                        + "FROM plural_approval WHERE document_id = ? ORDER BY segment_id, language, category",
+                PLURAL_APPROVAL_MAPPER, documentId);
+    }
+
+    /** 插入或覆盖某类别的复数批准（按主键段落+语言+类别唯一）。 */
+    public void upsertPluralApproval(long documentId, PluralApprovalRow row) {
+        int updated = jdbc.update(
+                "UPDATE plural_approval SET reviewer = ?, source_version = ?, translation_version = ?, "
+                        + "approved_at = CURRENT_TIMESTAMP "
+                        + "WHERE document_id = ? AND segment_id = ? AND language = ? AND category = ?",
+                row.reviewer(), row.sourceVersion(), row.translationVersion(),
+                documentId, row.segmentId(), row.language(), row.category());
+        if (updated == 0) {
+            jdbc.update("INSERT INTO plural_approval (document_id, segment_id, language, category, reviewer, "
+                            + "source_version, translation_version) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    documentId, row.segmentId(), row.language(), row.category(), row.reviewer(),
+                    row.sourceVersion(), row.translationVersion());
+        }
+    }
     public void insertSnapshot(long documentId, int publishedVersion, String snapshotJson) {
         jdbc.update("INSERT INTO release_snapshot (document_id, published_version, snapshot_json) VALUES (?, ?, ?)",
                 documentId, publishedVersion, snapshotJson);

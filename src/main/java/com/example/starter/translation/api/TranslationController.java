@@ -92,6 +92,33 @@ public class TranslationController {
                         documentId, segmentId, language, actorId, request))).toResponseEntity();
     }
 
+    /** 复数类别译文提交：作者取 X-Actor-Id，一次提交 1~n 个类别，各类别独立保存文本与作者。 */
+    @PutMapping("/{documentId}/segments/{segmentId}/plural-translations/{language}")
+    public ResponseEntity<String> submitPluralTranslations(@PathVariable long documentId,
+                                                           @PathVariable String segmentId,
+                                                           @PathVariable String language,
+                                                           @RequestHeader("X-Actor-Id") String actorId,
+                                                           @Valid @RequestBody ApiDtos.SubmitPluralTranslationsRequest request) {
+        String operation = "PUT /api/documents/" + documentId + "/segments/" + segmentId
+                + "/plural-translations/" + language;
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(200, translationService.submitPluralTranslations(
+                        documentId, segmentId, language, actorId, request))).toResponseEntity();
+    }
+
+    /** 复数类别批准：审核人取 X-Actor-Id，不得是该类别作者，须匹配当前源文与该类别译文版本。 */
+    @PostMapping("/{documentId}/segments/{segmentId}/plural-translations/{language}/approve")
+    public ResponseEntity<String> approvePluralCategory(@PathVariable long documentId,
+                                                        @PathVariable String segmentId,
+                                                        @PathVariable String language,
+                                                        @RequestHeader("X-Actor-Id") String actorId,
+                                                        @Valid @RequestBody ApiDtos.ApprovePluralCategoryRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/segments/" + segmentId
+                + "/plural-translations/" + language + "/approve";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(200, translationService.approvePluralCategory(
+                        documentId, segmentId, language, actorId, request))).toResponseEntity();
+    }
     /** 发布：全部段落全部目标语言均有有效批准且术语校验通过时原子生成只读快照并递增发布版本。 */
     @PostMapping("/{documentId}/publish")
     public ResponseEntity<String> publish(@PathVariable long documentId,

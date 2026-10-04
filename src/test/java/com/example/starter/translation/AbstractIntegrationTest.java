@@ -35,6 +35,8 @@ public abstract class AbstractIntegrationTest {
 
     @BeforeEach
     void cleanTables() {
+        jdbc.update("DELETE FROM plural_approval");
+        jdbc.update("DELETE FROM plural_translation");
         jdbc.update("DELETE FROM approval");
         jdbc.update("DELETE FROM translation");
         jdbc.update("DELETE FROM segment");
@@ -122,6 +124,25 @@ public abstract class AbstractIntegrationTest {
         return postJson("/api/documents/" + documentId + "/publish", body);
     }
 
+    /** 提交复数类别译文：categoriesJson 为 [{\"category\":\"one\",\"content\":\"...\"}] 数组。 */
+    protected ApiResult submitPlural(long documentId, String segmentId, String language, String actorId,
+                                     int sourceVersion, String categoriesJson, String requestId)
+            throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"sourceVersion\":" + sourceVersion
+                + ",\"categories\":" + categoriesJson + "}";
+        return putJson("/api/documents/" + documentId + "/segments/" + segmentId
+                + "/plural-translations/" + language, body, actorId);
+    }
+
+    /** 批准单个复数类别。 */
+    protected ApiResult approvePlural(long documentId, String segmentId, String language, String actorId,
+                                      String category, int translationVersion, String requestId)
+            throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"category\":\"" + category
+                + "\",\"translationVersion\":" + translationVersion + "}";
+        return postJson("/api/documents/" + documentId + "/segments/" + segmentId
+                + "/plural-translations/" + language + "/approve", body, actorId);
+    }
     /** 新增术语版本：rulesJson 为规则数组 JSON。 */
     protected ApiResult updateTerms(long documentId, int expectedTermVersion, String rulesJson,
                                     String requestId) throws Exception {
