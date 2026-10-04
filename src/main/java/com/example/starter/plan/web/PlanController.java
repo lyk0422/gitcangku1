@@ -5,6 +5,7 @@ import com.example.starter.plan.web.dto.CreatePlanRequest;
 import com.example.starter.plan.web.dto.PlanActionRequest;
 import com.example.starter.plan.web.dto.PlanResponse;
 import com.example.starter.plan.web.dto.PublishedSlotView;
+import com.example.starter.plan.web.dto.RearrangeRecordView;
 import com.example.starter.plan.web.dto.RescheduleChainResponse;
 import com.example.starter.plan.web.dto.RescheduleRequest;
 import com.example.starter.plan.web.dto.RescheduleResponse;
@@ -66,7 +67,7 @@ public class PlanController {
     @PostMapping("/plans/{scheduleKey}/publish")
     public PlanResponse publish(@PathVariable String scheduleKey,
                                 @Valid @RequestBody PlanActionRequest request) {
-        return service.publish(scheduleKey, request.requestKey());
+        return service.publish(scheduleKey, request.requestKey(), request.operator());
     }
 
     /**
@@ -75,7 +76,7 @@ public class PlanController {
     @PostMapping("/plans/{scheduleKey}/cancel")
     public PlanResponse cancel(@PathVariable String scheduleKey,
                                @Valid @RequestBody PlanActionRequest request) {
-        return service.cancel(scheduleKey, request.requestKey());
+        return service.cancel(scheduleKey, request.requestKey(), request.operator());
     }
 
     /**
@@ -102,6 +103,14 @@ public class PlanController {
     @GetMapping("/plans/{scheduleKey}")
     public PlanResponse getPlan(@PathVariable String scheduleKey) {
         return service.getPlan(scheduleKey);
+    }
+
+    /**
+     * 查询指定计划的限速重排记录（不可变历史证据，按追加顺序升序）。
+     */
+    @GetMapping("/plans/{scheduleKey}/rearrange-records")
+    public List<RearrangeRecordView> getRearrangeRecords(@PathVariable String scheduleKey) {
+        return service.getRearrangeRecords(scheduleKey);
     }
 
     /**

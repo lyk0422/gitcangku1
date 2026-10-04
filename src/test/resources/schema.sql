@@ -83,3 +83,76 @@ COMMENT ON TABLE publish_lock IS '发布/改签全局互斥锁，保证并发发
 COMMENT ON COLUMN publish_lock.id IS '锁行 id，固定为 1，发布与改签时 SELECT ... FOR UPDATE 串行化';
 
 MERGE INTO publish_lock KEY(id) VALUES (1);
+
+CREATE TABLE IF NOT EXISTS rail_speed_restriction (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    restriction_key VARCHAR(64) NOT NULL,
+    version INT NOT NULL,
+    section_id VARCHAR(64) NOT NULL,
+    start_utc BIGINT NOT NULL,
+    end_utc BIGINT NOT NULL,
+    max_speed_kmh INT NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    operator VARCHAR(64) NOT NULL,
+    created_at BIGINT NOT NULL,
+    updated_at BIGINT NOT NULL,
+    revoked_at BIGINT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT uk_speed_restriction_key UNIQUE (restriction_key)
+);
+COMMENT ON TABLE rail_speed_restriction IS '铁路气象限速令，按区段与 UTC 左闭右开时段登记最高速度；同时刻多条叠加以最低速度为准';
+COMMENT ON COLUMN rail_speed_restriction.id IS '主键';
+COMMENT ON COLUMN rail_speed_restriction.restriction_key IS '限速令业务键，全局唯一，撤销后仍保留历史';
+COMMENT ON COLUMN rail_speed_restriction.version IS '限速令版本，登记为 1，每次修订成功加一';
+COMMENT ON COLUMN rail_speed_restriction.section_id IS '区段 ID';
+COMMENT ON COLUMN rail_speed_restriction.start_utc IS '限速开始时刻（含），UTC 毫秒';
+COMMENT ON COLUMN rail_speed_restriction.end_utc IS '限速结束时刻（不含），UTC 毫秒，必须大于 start_utc';
+COMMENT ON COLUMN rail_speed_restriction.max_speed_kmh IS '最高速度，单位 km/h，取值 10～300';
+COMMENT ON COLUMN rail_speed_restriction.status IS '限速令状态：ACTIVE 生效中 / REVOKED 已撤销';
+COMMENT ON COLUMN rail_speed_restriction.operator IS '最近一次操作的操作者标识';
+COMMENT ON COLUMN rail_speed_restriction.created_at IS '登记时刻，UTC 毫秒';
+COMMENT ON COLUMN rail_speed_restriction.updated_at IS '最近变更时刻，UTC 毫秒';
+COMMENT ON COLUMN rail_speed_restriction.revoked_at IS '撤销时刻，UTC 毫秒；未撤销为 NULL';
+CREATE INDEX IF NOT EXISTS idx_speed_restriction_section ON rail_speed_restriction (section_id, start_utc, end_utc);
+
+CREATE TABLE IF NOT EXISTS rail_plan_rearrange_record (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    plan_id BIGINT NOT NULL,
+    schedule_key VARCHAR(64) NOT NULL,
+    restriction_key VARCHAR(64) NOT NULL,
+    restriction_version INT NOT NULL,
+    section_id VARCHAR(64) NOT NULL,
+    max_speed_kmh INT NOT NULL,
+    restriction_start_utc BIGINT NOT NULL,
+    restriction_end_utc BIGINT NOT NULL,
+    seq INT NOT NULL,
+    train_no VARCHAR(64) NOT NULL,
+    original_start_utc BIGINT NOT NULL,
+    original_end_utc BIGINT NOT NULL,
+    shifted_start_utc BIGINT NOT NULL,
+    shifted_end_utc BIGINT NOT NULL,
+    shift_minutes INT NOT NULL,
+    affected_minutes INT NOT NULL,
+    created_at BIGINT NOT NULL,
+    PRIMARY KEY (id)
+);
+COMMENT ON TABLE rail_plan_rearrange_record IS '限速重排记录（不可变历史证据），固化限速令版本快照与原/新计划时刻，撤销或修订限速令不回写';
+COMMENT ON COLUMN rail_plan_rearrange_record.id IS '主键';
+COMMENT ON COLUMN rail_plan_rearrange_record.plan_id IS '被重排计划 id，关联 rail_day_plan.id';
+COMMENT ON COLUMN rail_plan_rearrange_record.schedule_key IS '被重排计划业务键';
+COMMENT ON COLUMN rail_plan_rearrange_record.restriction_key IS '触发重排的限速令业务键';
+COMMENT ON COLUMN rail_plan_rearrange_record.restriction_version IS '重排时限速令的版本快照';
+COMMENT ON COLUMN rail_plan_rearrange_record.section_id IS '受限区段 ID';
+COMMENT ON COLUMN rail_plan_rearrange_record.max_speed_kmh IS '重排时限速令的最高速度快照，单位 km/h';
+COMMENT ON COLUMN rail_plan_rearrange_record.restriction_start_utc IS '重排时限速时段开始快照（含），UTC 毫秒';
+COMMENT ON COLUMN rail_plan_rearrange_record.restriction_end_utc IS '重排时限速时段结束快照（不含），UTC 毫秒';
+COMMENT ON COLUMN rail_plan_rearrange_record.seq IS '被顺延占用在计划内的序号';
+COMMENT ON COLUMN rail_plan_rearrange_record.train_no IS '列车编号';
+COMMENT ON COLUMN rail_plan_rearrange_record.original_start_utc IS '原计划占用开始（含），UTC 毫秒';
+COMMENT ON COLUMN rail_plan_rearrange_record.original_end_utc IS '原计划占用结束（不含），UTC 毫秒';
+COMMENT ON COLUMN rail_plan_rearrange_record.shifted_start_utc IS '新计划占用开始（含），UTC 毫秒';
+COMMENT ON COLUMN rail_plan_rearrange_record.shifted_end_utc IS '新计划占用结束（不含），UTC 毫秒';
+COMMENT ON COLUMN rail_plan_rearrange_record.shift_minutes IS '整体顺延分钟数（线路既有最小间隔的整数倍）';
+COMMENT ON COLUMN rail_plan_rearrange_record.affected_minutes IS '原运行时刻在限速时段内受影响的运行分钟数';
+COMMENT ON COLUMN rail_plan_rearrange_record.created_at IS '记录创建时刻，UTC 毫秒';
+CREATE INDEX IF NOT EXISTS idx_rearrange_record_plan ON rail_plan_rearrange_record (plan_id);
