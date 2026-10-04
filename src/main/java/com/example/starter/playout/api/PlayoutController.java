@@ -1,6 +1,7 @@
 package com.example.starter.playout.api;
 
 import com.example.starter.playout.PlayoutService;
+import com.example.starter.playout.api.Dtos.AssetEnergyResponse;
 import com.example.starter.playout.api.Dtos.AssetResponse;
 import com.example.starter.playout.api.Dtos.ChannelResponse;
 import com.example.starter.playout.api.Dtos.CreateAssetRequest;
@@ -8,11 +9,13 @@ import com.example.starter.playout.api.Dtos.CreateChannelRequest;
 import com.example.starter.playout.api.Dtos.CreateEmergencyOverrideRequest;
 import com.example.starter.playout.api.Dtos.CreateGrantRequest;
 import com.example.starter.playout.api.Dtos.DraftResponse;
+import com.example.starter.playout.api.Dtos.EnergyBudgetResponse;
 import com.example.starter.playout.api.Dtos.EmergencyOverrideResponse;
 import com.example.starter.playout.api.Dtos.GrantResponse;
 import com.example.starter.playout.api.Dtos.CancelEmergencyOverrideRequest;
 import com.example.starter.playout.api.Dtos.PlayoutDecisionResponse;
 import com.example.starter.playout.api.Dtos.PublishRequest;
+import com.example.starter.playout.api.Dtos.RegisterEnergyDensityRequest;
 import com.example.starter.playout.api.Dtos.PublishResponse;
 import com.example.starter.playout.api.Dtos.ReplaceDraftRequest;
 import com.example.starter.playout.api.Dtos.RevokeGrantRequest;
@@ -54,6 +57,13 @@ public class PlayoutController {
         return service.createAsset(request);
     }
 
+    /** 登记素材能量密度（0~10、最多 3 位小数，登记后不可修改，幂等）。 */
+    @PostMapping("/assets/{assetId}/energy-density")
+    public AssetEnergyResponse registerEnergyDensity(@PathVariable @NotBlank String assetId,
+                                                     @Valid @RequestBody RegisterEnergyDensityRequest request) {
+        return service.registerEnergyDensity(assetId, request);
+    }
+
     /** 创建频道。 */
     @PostMapping("/channels")
     public ChannelResponse createChannel(@Valid @RequestBody CreateChannelRequest request) {
@@ -87,6 +97,13 @@ public class PlayoutController {
                                    @PathVariable String businessDay,
                                    @Valid @RequestBody PublishRequest request) {
         return service.publish(channelId, parseBusinessDay(businessDay), request);
+    }
+
+    /** 查询频道业务日滚动能量预算证据（最大窗口与各片段贡献；紧急插播不计入）。 */
+    @GetMapping("/channels/{channelId}/energy-budget")
+    public EnergyBudgetResponse energyBudget(@PathVariable @NotBlank String channelId,
+                                             @RequestParam String businessDay) {
+        return service.energyBudget(channelId, parseBusinessDay(businessDay));
     }
 
     /** 按频道与时刻查询播出决定。 */

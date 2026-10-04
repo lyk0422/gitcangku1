@@ -1,5 +1,8 @@
 package com.example.starter.playout.api;
 
+import jakarta.validation.constraints.DecimalMax;
+import jakarta.validation.constraints.DecimalMin;
+import jakarta.validation.constraints.Digits;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
@@ -7,6 +10,7 @@ import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.PositiveOrZero;
 
+import java.math.BigDecimal;
 import java.time.OffsetDateTime;
 import java.util.List;
 
@@ -166,6 +170,50 @@ public final class Dtos {
             String cancelRequestId,
             OffsetDateTime cancelledAt,
             OffsetDateTime createdAt) {
+    }
+
+
+    /** 登记素材能量密度请求（幂等）；energyDensity 取值 0~10、最多 3 位小数，登记后不可修改。 */
+    public record RegisterEnergyDensityRequest(
+            @NotBlank String requestId,
+            @NotNull @DecimalMin("0.000") @DecimalMax("10.000")
+            @Digits(integer = 2, fraction = 3) BigDecimal energyDensity) {
+    }
+
+    /** 素材能量密度响应。 */
+    public record AssetEnergyResponse(String assetId, BigDecimal energyDensity) {
+    }
+
+    /** 单个已发布片段对最大滚动窗口的能量贡献；energyDensity 为发布时冻结值，energy 单位与预算一致。 */
+    public record SegmentEnergyContribution(
+            String segmentId,
+            String assetId,
+            BigDecimal energyDensity,
+            long overlapMs,
+            BigDecimal energy) {
+    }
+
+    /** 最大滚动窗口证据：窗口区间 [start, end) 固定 60 秒，energy 为窗口能量积分，contributions 为各片段贡献。 */
+    public record EnergyWindowEvidence(
+            OffsetDateTime start,
+            OffsetDateTime end,
+            BigDecimal energy,
+            List<SegmentEnergyContribution> contributions) {
+    }
+
+    /**
+     * 频道业务日能量预算查询响应。基于最新已发布编排与发布时冻结的密度计算；
+     * maxWindow 为 null 表示当日无已发布编排或编排无片段；note 说明紧急插播不计入本预算。
+     */
+    public record EnergyBudgetResponse(
+            String channelId,
+            String businessDay,
+            Long publicationId,
+            Long publishedVersion,
+            long windowSeconds,
+            BigDecimal budgetLimit,
+            EnergyWindowEvidence maxWindow,
+            String note) {
     }
 
     /** 统一错误响应体。 */

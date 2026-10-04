@@ -4,6 +4,7 @@
 CREATE TABLE IF NOT EXISTS playout_asset (
     id            VARCHAR(64) NOT NULL PRIMARY KEY,
     duration_ms   BIGINT      NOT NULL,
+    energy_density_milli INT NULL,
     created_at_ms BIGINT      NOT NULL
 );
 
@@ -51,6 +52,9 @@ CREATE TABLE IF NOT EXISTS playout_publication (
     business_day      DATE        NOT NULL,
     published_version BIGINT      NOT NULL,
     draft_version     BIGINT      NOT NULL,
+    max_window_start_ms BIGINT   NULL,
+    max_window_end_ms   BIGINT   NULL,
+    max_window_energy_micro BIGINT NULL,
     created_at_ms     BIGINT      NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uk_publication_version
@@ -62,6 +66,7 @@ CREATE TABLE IF NOT EXISTS playout_publication_segment (
     segment_id     VARCHAR(64) NOT NULL,
     asset_id       VARCHAR(64) NOT NULL,
     grant_id       BIGINT      NOT NULL,
+    energy_density_milli INT NOT NULL,
     start_ms       BIGINT      NOT NULL,
     end_ms         BIGINT      NOT NULL
 );

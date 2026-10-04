@@ -5,6 +5,7 @@
 CREATE TABLE IF NOT EXISTS playout_asset (
     id           VARCHAR(64)  NOT NULL COMMENT '素材稳定 ID，客户端指定或系统生成，创建后不变',
     duration_ms  BIGINT       NOT NULL COMMENT '素材时长，单位毫秒，正整数',
+    energy_density_milli INT NULL COMMENT '合成音频能量密度×1000，取值 0~10000（即密度 0~10、最多 3 位小数）；NULL 表示未登记，按 0 计；登记后不可修改',
     created_at_ms BIGINT      NOT NULL COMMENT '创建时间，UTC 纪元毫秒',
     PRIMARY KEY (id)
 ) COMMENT = '素材表';
@@ -55,6 +56,9 @@ CREATE TABLE IF NOT EXISTS playout_publication (
     business_day      DATE        NOT NULL COMMENT '业务日，Asia/Shanghai 日历日',
     published_version BIGINT      NOT NULL COMMENT '发布版本，每频道+业务日从 1 起递增',
     draft_version     BIGINT      NOT NULL COMMENT '发布时对应的草稿版本',
+    max_window_start_ms BIGINT   NULL COMMENT '发布时能量预算最大滚动窗口起点（含），UTC 纪元毫秒；无片段时为 NULL',
+    max_window_end_ms   BIGINT   NULL COMMENT '发布时能量预算最大滚动窗口终点（不含），起点+60000；无片段时为 NULL',
+    max_window_energy_micro BIGINT NULL COMMENT '最大窗口能量积分×10^6（密度×秒），预算上限 300 即 300000000；无片段时为 NULL',
     created_at_ms     BIGINT      NOT NULL COMMENT '发布时间，UTC 纪元毫秒',
     PRIMARY KEY (id),
     UNIQUE KEY uk_publication_version (channel_id, business_day, published_version)
@@ -66,6 +70,7 @@ CREATE TABLE IF NOT EXISTS playout_publication_segment (
     segment_id     VARCHAR(64) NOT NULL COMMENT '来源草稿片段 ID',
     asset_id       VARCHAR(64) NOT NULL COMMENT '播出素材 ID',
     grant_id       BIGINT      NOT NULL COMMENT '发布时完整覆盖该片段的授权 ID，播出查询据此实时判定撤销状态',
+    energy_density_milli INT NOT NULL COMMENT '发布时冻结的素材能量密度×1000；未登记按 0，发布后不随素材表变化',
     start_ms       BIGINT      NOT NULL COMMENT '播出开始（含），UTC 纪元毫秒',
     end_ms         BIGINT      NOT NULL COMMENT '播出结束（不含），UTC 纪元毫秒',
     PRIMARY KEY (id),

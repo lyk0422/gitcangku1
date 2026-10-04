@@ -8,6 +8,8 @@ import com.example.starter.playout.PlayoutRepository.PublicationSegmentRow;
 import com.example.starter.playout.PlayoutRepository.RequestRow;
 import com.example.starter.playout.PlayoutRepository.SegmentRow;
 import com.example.starter.playout.api.ApiException;
+import com.example.starter.playout.api.JacksonConfig;
+import com.example.starter.playout.api.Dtos.AssetEnergyResponse;
 import com.example.starter.playout.api.Dtos.AssetResponse;
 import com.example.starter.playout.api.Dtos.ChannelResponse;
 import com.example.starter.playout.api.Dtos.CreateAssetRequest;
@@ -17,20 +19,26 @@ import com.example.starter.playout.api.Dtos.CreateGrantRequest;
 import com.example.starter.playout.api.Dtos.DecisionSource;
 import com.example.starter.playout.api.Dtos.DraftResponse;
 import com.example.starter.playout.api.Dtos.EmergencyOverrideResponse;
+import com.example.starter.playout.api.Dtos.EnergyBudgetResponse;
+import com.example.starter.playout.api.Dtos.EnergyWindowEvidence;
 import com.example.starter.playout.api.Dtos.FallbackReason;
 import com.example.starter.playout.api.Dtos.GrantResponse;
 import com.example.starter.playout.api.Dtos.OverrideStatus;
 import com.example.starter.playout.api.Dtos.PlayoutDecisionResponse;
 import com.example.starter.playout.api.Dtos.PublishRequest;
+import com.example.starter.playout.api.Dtos.RegisterEnergyDensityRequest;
 import com.example.starter.playout.api.Dtos.PublishResponse;
 import com.example.starter.playout.api.Dtos.ReplaceDraftRequest;
+import com.example.starter.playout.api.Dtos.SegmentEnergyContribution;
 import com.example.starter.playout.api.Dtos.SegmentInput;
 import com.example.starter.playout.api.Dtos.SegmentResponse;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -39,9 +47,11 @@ import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
+import java.util.TreeSet;
 import java.util.UUID;
 import java.util.function.Supplier;
 
@@ -63,9 +73,22 @@ public class PlayoutService {
     private static final String OP_REVOKE_GRANT = "REVOKE_GRANT";
     private static final String OP_CREATE_OVERRIDE = "CREATE_OVERRIDE";
     private static final String OP_CANCEL_OVERRIDE = "CANCEL_OVERRIDE";
+    private static final String OP_REGISTER_ENERGY = "REGISTER_ENERGY";
 
     /** 紧急插播时长上限（含）：30 分钟，单位毫秒。 */
     private static final long OVERRIDE_MAX_DURATION_MS = 30L * 60L * 1000L;
+
+    /** 能量预算滚动窗口长度，单位毫秒（60 秒）。 */
+    private static final long ENERGY_WINDOW_MS = 60_000L;
+    /** 能量预算滚动窗口长度，单位秒。 */
+    private static final long ENERGY_WINDOW_SECONDS = 60L;
+    /** 能量预算上限 ×10^6：任意连续 60 秒能量积分不超过 300（恰好 300 合法）。 */
+    private static final long ENERGY_BUDGET_LIMIT_MICRO = 300_000_000L;
+    /** 能量预算上限（查询响应展示用）。 */
+    private static final BigDecimal ENERGY_BUDGET_LIMIT = new BigDecimal("300");
+    /** 能量预算查询的口径说明。 */
+    private static final String ENERGY_BUDGET_NOTE =
+            "紧急插播不计入本能量预算；空档与保底素材能量密度按 0 计";
 
     private final PlayoutRepository repo;
     private final ObjectMapper objectMapper;
@@ -88,6 +111,29 @@ public class PlayoutService {
             throw ApiException.conflict("DUPLICATE_ID", "素材 ID 已存在: " + id);
         }
         return new AssetResponse(id, request.durationMs());
+    }
+
+    /**
+     * 登记素材合成能量密度（0~10、最多 3 位小数），登记后不可修改；未登记的旧素材按 0 计。
+     * 幂等：同 requestId 同参数重放首次响应，异参 409，失败不占键。
+     */
+    @Transactional
+    public AssetEnergyResponse registerEnergyDensity(String assetId,
+                                                     RegisterEnergyDensityRequest request) {
+        String hash = paramsHash(OP_REGISTER_ENERGY, assetId,
+                request.energyDensity().toPlainString());
+        return idempotent(request.requestId(), OP_REGISTER_ENERGY, hash,
+                AssetEnergyResponse.class, () -> {
+                    repo.findAsset(assetId)
+                            .orElseThrow(() -> ApiException.notFound("素材不存在: " + assetId));
+                    int updated = repo.registerEnergyDensity(assetId,
+                            toDensityMilli(request.energyDensity()));
+                    if (updated == 0) {
+                        throw ApiException.conflict("ENERGY_DENSITY_ALREADY_REGISTERED",
+                                "素材能量密度已登记，不可修改: " + assetId);
+                    }
+                    return new AssetEnergyResponse(assetId, request.energyDensity());
+                });
     }
 
     // ---------- 频道 ----------
@@ -135,7 +181,7 @@ public class PlayoutService {
     /** 撤销授权；幂等：同 requestId 同参数返回原结果，改参数返回 409。 */
     @Transactional
     public GrantResponse revokeGrant(long grantId, String requestId) {
-        String hash = sha256(OP_REVOKE_GRANT + "|" + grantId);
+        String hash = paramsHash(OP_REVOKE_GRANT, grantId);
         return idempotent(requestId, OP_REVOKE_GRANT, hash, GrantResponse.class, () -> {
             GrantRow grant = repo.findGrant(grantId)
                     .orElseThrow(() -> ApiException.notFound("授权不存在: " + grantId));
@@ -157,8 +203,8 @@ public class PlayoutService {
         repo.findChannel(channelId)
                 .orElseThrow(() -> ApiException.notFound("频道不存在: " + channelId));
 
-        String hash = sha256(OP_REPLACE_DRAFT + "|" + channelId + "|" + businessDay
-                + "|" + request.expectedDraftVersion() + "|" + canonicalSegments(request.segments()));
+        String hash = paramsHash(OP_REPLACE_DRAFT, channelId, businessDay.toString(),
+                request.expectedDraftVersion(), canonicalSegments(request.segments()));
         return idempotent(request.requestId(), OP_REPLACE_DRAFT, hash, DraftResponse.class, () -> {
             List<ValidatedSegment> segments = validateSegments(channelId, businessDay, request.segments());
             long newVersion;
@@ -200,8 +246,8 @@ public class PlayoutService {
         repo.findChannel(channelId)
                 .orElseThrow(() -> ApiException.notFound("频道不存在: " + channelId));
 
-        String hash = sha256(OP_PUBLISH + "|" + channelId + "|" + businessDay
-                + "|" + request.draftVersion() + "|" + request.expectedPublishedVersion());
+        String hash = paramsHash(OP_PUBLISH, channelId, businessDay.toString(),
+                request.draftVersion(), request.expectedPublishedVersion());
         return idempotent(request.requestId(), OP_PUBLISH, hash, PublishResponse.class, () -> {
             DraftRow draft = repo.findDraft(channelId, businessDay)
                     .orElseThrow(() -> ApiException.notFound("草稿不存在: " + channelId + " " + businessDay));
@@ -220,11 +266,29 @@ public class PlayoutService {
                 GrantRow grant = selectCoveringGrantForUpdate(channelId, segment);
                 grantIds.add(grant.id());
             }
+            // 滚动能量预算：对全部 60 秒滚动窗口求最大能量积分，超过 300 则整份不发布（不预先舍入）。
+            List<EnergySegment> energySegments = new ArrayList<>();
+            for (SegmentRow segment : segments) {
+                energySegments.add(new EnergySegment(segment.id(), segment.assetId(),
+                        densityMilliOf(segment.assetId()), segment.startMs(), segment.endMs()));
+            }
+            WindowEvaluation maxWindow = evaluateMaxWindow(energySegments);
+            if (maxWindow != null && maxWindow.energyMicro() > ENERGY_BUDGET_LIMIT_MICRO) {
+                throw ApiException.unprocessable("ENERGY_BUDGET_EXCEEDED",
+                        "滚动 60 秒能量预算超限: 最大窗口能量 "
+                                + energyOf(maxWindow.energyMicro()).toPlainString()
+                                + "，上限 300，窗口起点 "
+                                + JacksonConfig.OUTPUT_FORMAT.format(atMs(maxWindow.startMs())));
+            }
             long newVersion = currentPublished + 1;
             long publicationId;
             try {
                 publicationId = repo.insertPublication(channelId, businessDay,
-                        newVersion, draft.version(), nowMs());
+                        newVersion, draft.version(),
+                        maxWindow == null ? null : maxWindow.startMs(),
+                        maxWindow == null ? null : maxWindow.endMs(),
+                        maxWindow == null ? null : maxWindow.energyMicro(),
+                        nowMs());
             } catch (DuplicateKeyException e) {
                 throw ApiException.conflict("PUBLISHED_VERSION_CONFLICT",
                         "发布版本冲突，版本 " + newVersion + " 已存在");
@@ -232,7 +296,8 @@ public class PlayoutService {
             for (int i = 0; i < segments.size(); i++) {
                 SegmentRow segment = segments.get(i);
                 repo.insertPublicationSegment(publicationId, segment.id(), segment.assetId(),
-                        grantIds.get(i), segment.startMs(), segment.endMs());
+                        grantIds.get(i), energySegments.get(i).densityMilli(),
+                        segment.startMs(), segment.endMs());
             }
             return new PublishResponse(publicationId, channelId, businessDay.toString(),
                     newVersion, draft.version());
@@ -312,9 +377,9 @@ public class PlayoutService {
      */
     @Transactional
     public EmergencyOverrideResponse createEmergencyOverride(CreateEmergencyOverrideRequest request) {
-        String hash = sha256(OP_CREATE_OVERRIDE + "|" + request.overrideKey() + "|"
-                + request.channelId() + "|" + request.assetId() + "|" + request.grantId() + "|"
-                + request.priority() + "|" + toMs(request.start()) + "|" + toMs(request.end()));
+        String hash = paramsHash(OP_CREATE_OVERRIDE, request.overrideKey(), request.channelId(),
+                request.assetId(), request.grantId(), request.priority(),
+                toMs(request.start()), toMs(request.end()));
         return idempotent(request.requestId(), OP_CREATE_OVERRIDE, hash,
                 EmergencyOverrideResponse.class, () -> doCreateOverride(request));
     }
@@ -396,7 +461,7 @@ public class PlayoutService {
      */
     @Transactional
     public EmergencyOverrideResponse cancelEmergencyOverride(String overrideKey, String requestId) {
-        String hash = sha256(OP_CANCEL_OVERRIDE + "|" + overrideKey);
+        String hash = paramsHash(OP_CANCEL_OVERRIDE, overrideKey);
         return idempotent(requestId, OP_CANCEL_OVERRIDE, hash, EmergencyOverrideResponse.class, () -> {
             // 先在频道锁上与同频道创建/取消串行，取消提交后并发创建即可复用该区间。
             OverrideRow existing = repo.findOverride(overrideKey)
@@ -541,15 +606,29 @@ public class PlayoutService {
         }
     }
 
-    private static String canonicalSegments(List<SegmentInput> segments) {
-        StringBuilder sb = new StringBuilder();
+    /** 草稿片段的结构化规范形式：每片段为 [id, assetId, startMs, endMs] 列表，供幂等身份 JSON 序列化。 */
+    private static List<List<Object>> canonicalSegments(List<SegmentInput> segments) {
+        List<List<Object>> canonical = new ArrayList<>();
         for (SegmentInput s : segments) {
-            sb.append(s.id() == null ? "" : s.id()).append(',')
-                    .append(s.assetId()).append(',')
-                    .append(s.start() == null ? "" : toMs(s.start())).append(',')
-                    .append(s.end() == null ? "" : toMs(s.end())).append(';');
+            canonical.add(Arrays.asList(
+                    s.id() == null ? "" : s.id(),
+                    (Object) s.assetId(),
+                    s.start() == null ? "" : toMs(s.start()),
+                    s.end() == null ? "" : toMs(s.end())));
         }
-        return sb.toString();
+        return canonical;
+    }
+
+    /**
+     * 幂等参数身份：操作类型 + 资源定位 + 全部参数与期望版本组成结构化列表，
+     * 序列化为规范 JSON 后取 SHA-256，避免字符串拼接的分隔符碰撞。
+     */
+    private String paramsHash(String operation, Object... params) {
+        try {
+            return sha256(operation + "\n" + objectMapper.writeValueAsString(Arrays.asList(params)));
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("幂等参数序列化失败", e);
+        }
     }
 
     private PlayoutDecisionResponse fallback(String channelId, OffsetDateTime at, String assetId,
@@ -590,5 +669,116 @@ public class PlayoutService {
         SegmentResponse toResponse() {
             return new SegmentResponse(id, assetId, atMs(startMs), atMs(endMs));
         }
+    }
+
+    // ---------- 滚动能量预算 ----------
+
+    /**
+     * 查询频道业务日能量预算证据：基于最新已发布编排与发布时冻结的片段密度，
+     * 定位能量积分最大的 60 秒滚动窗口并列出各片段贡献。紧急插播不计入本预算（见 note）。
+     */
+    @Transactional(readOnly = true)
+    public EnergyBudgetResponse energyBudget(String channelId, LocalDate businessDay) {
+        repo.findChannel(channelId)
+                .orElseThrow(() -> ApiException.notFound("频道不存在: " + channelId));
+        Optional<PublicationRow> publication = repo.findLatestPublication(channelId, businessDay);
+        if (publication.isEmpty()) {
+            return new EnergyBudgetResponse(channelId, businessDay.toString(), null, null,
+                    ENERGY_WINDOW_SECONDS, ENERGY_BUDGET_LIMIT, null, ENERGY_BUDGET_NOTE);
+        }
+        List<EnergySegment> segments = repo.findPublicationSegments(publication.get().id())
+                .stream()
+                .map(s -> new EnergySegment(s.segmentId(), s.assetId(), s.energyDensityMilli(),
+                        s.startMs(), s.endMs()))
+                .toList();
+        WindowEvaluation max = evaluateMaxWindow(segments);
+        EnergyWindowEvidence evidence = max == null ? null : new EnergyWindowEvidence(
+                atMs(max.startMs()), atMs(max.endMs()), energyOf(max.energyMicro()),
+                max.contributions().stream()
+                        .map(c -> new SegmentEnergyContribution(c.segmentId(), c.assetId(),
+                                densityOf(c.densityMilli()), c.overlapMs(),
+                                energyOf(c.energyMicro())))
+                        .toList());
+        return new EnergyBudgetResponse(channelId, businessDay.toString(),
+                publication.get().id(), publication.get().publishedVersion(),
+                ENERGY_WINDOW_SECONDS, ENERGY_BUDGET_LIMIT, evidence, ENERGY_BUDGET_NOTE);
+    }
+
+    /** 素材当前能量密度（×1000）；未登记按 0。 */
+    private int densityMilliOf(String assetId) {
+        return repo.findAsset(assetId)
+                .map(asset -> asset.energyDensityMilli() == null ? 0 : asset.energyDensityMilli())
+                .orElse(0);
+    }
+
+    /**
+     * 求全部连续 60 秒滚动窗口的最大能量积分。窗口能量是关于窗口起点的分段线性连续函数，
+     * 斜率只在窗口端点扫过片段端点时变化，因此最大值必在某个候选起点取得：
+     * 片段端点或端点减 60 秒（即窗口终点对齐片段端点）。空档与未登记素材密度按 0。
+     */
+    private static WindowEvaluation evaluateMaxWindow(List<EnergySegment> segments) {
+        if (segments.isEmpty()) {
+            return null;
+        }
+        TreeSet<Long> candidates = new TreeSet<>();
+        for (EnergySegment segment : segments) {
+            candidates.add(segment.startMs());
+            candidates.add(segment.endMs());
+            candidates.add(segment.startMs() - ENERGY_WINDOW_MS);
+            candidates.add(segment.endMs() - ENERGY_WINDOW_MS);
+        }
+        WindowEvaluation best = null;
+        for (long windowStart : candidates) {
+            long windowEnd = windowStart + ENERGY_WINDOW_MS;
+            long energyMicro = 0;
+            List<WindowContribution> contributions = new ArrayList<>();
+            for (EnergySegment segment : segments) {
+                long overlapMs = Math.min(segment.endMs(), windowEnd)
+                        - Math.max(segment.startMs(), windowStart);
+                if (overlapMs > 0) {
+                    long micro = (long) segment.densityMilli() * overlapMs;
+                    energyMicro += micro;
+                    contributions.add(new WindowContribution(segment.segmentId(),
+                            segment.assetId(), segment.densityMilli(), overlapMs, micro));
+                }
+            }
+            // 能量相同优先取与片段有重叠的窗口，保证证据能定位到片段贡献。
+            if (best == null || energyMicro > best.energyMicro()
+                    || (energyMicro == best.energyMicro()
+                        && best.contributions().isEmpty() && !contributions.isEmpty())) {
+                best = new WindowEvaluation(windowStart, windowEnd, energyMicro, contributions);
+            }
+        }
+        return best;
+    }
+
+    /** 密度 ×1000 的整数值（0~10000）；BigDecimal 已校验最多 3 位小数。 */
+    private static int toDensityMilli(BigDecimal energyDensity) {
+        return energyDensity.movePointRight(3).intValueExact();
+    }
+
+    /** 密度 ×1000 转回 3 位小数表示。 */
+    private static BigDecimal densityOf(int densityMilli) {
+        return BigDecimal.valueOf(densityMilli, 3);
+    }
+
+    /** 能量 ×10^6（密度×1000 与毫秒之积）转回能量值（密度×秒），保留 6 位小数不预先舍入。 */
+    private static BigDecimal energyOf(long energyMicro) {
+        return BigDecimal.valueOf(energyMicro, 6);
+    }
+
+    /** 参与能量计算的片段：密度为发布时冻结值（×1000），区间为左闭右开毫秒。 */
+    private record EnergySegment(String segmentId, String assetId, int densityMilli,
+                                 long startMs, long endMs) {
+    }
+
+    /** 单片段对窗口的能量贡献。 */
+    private record WindowContribution(String segmentId, String assetId, int densityMilli,
+                                      long overlapMs, long energyMicro) {
+    }
+
+    /** 一次窗口求值结果：区间 [startMs, endMs) 固定 60 秒。 */
+    private record WindowEvaluation(long startMs, long endMs, long energyMicro,
+                                    List<WindowContribution> contributions) {
     }
 }

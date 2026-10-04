@@ -27,7 +27,7 @@ public class PlayoutRepository {
     }
 
     /** 素材行。 */
-    public record AssetRow(String id, long durationMs) {
+    public record AssetRow(String id, long durationMs, Integer energyDensityMilli) {
     }
 
     /** 频道行。 */
@@ -49,12 +49,13 @@ public class PlayoutRepository {
 
     /** 发布快照行。 */
     public record PublicationRow(long id, String channelId, LocalDate businessDay,
-                                 long publishedVersion, long draftVersion) {
+                                 long publishedVersion, long draftVersion,
+                                 Long maxWindowStartMs, Long maxWindowEndMs, Long maxWindowEnergyMicro) {
     }
 
     /** 发布快照片段行，grantId 为发布时选定的覆盖授权。 */
     public record PublicationSegmentRow(long id, long publicationId, String segmentId,
-                                        String assetId, long grantId,
+                                        String assetId, long grantId, int energyDensityMilli,
                                         long startMs, long endMs) {
     }
 
@@ -74,7 +75,8 @@ public class PlayoutRepository {
     }
 
     private static final RowMapper<AssetRow> ASSET_MAPPER = (rs, n) ->
-            new AssetRow(rs.getString("id"), rs.getLong("duration_ms"));
+            new AssetRow(rs.getString("id"), rs.getLong("duration_ms"),
+                    (Integer) rs.getObject("energy_density_milli"));
 
     private static final RowMapper<ChannelRow> CHANNEL_MAPPER = (rs, n) ->
             new ChannelRow(rs.getString("id"), rs.getString("fallback_asset_id"));
@@ -94,11 +96,14 @@ public class PlayoutRepository {
     private static final RowMapper<PublicationRow> PUBLICATION_MAPPER = (rs, n) ->
             new PublicationRow(rs.getLong("id"), rs.getString("channel_id"),
                     rs.getDate("business_day").toLocalDate(),
-                    rs.getLong("published_version"), rs.getLong("draft_version"));
+                    rs.getLong("published_version"), rs.getLong("draft_version"),
+                    (Long) rs.getObject("max_window_start_ms"), (Long) rs.getObject("max_window_end_ms"),
+                    (Long) rs.getObject("max_window_energy_micro"));
 
     private static final RowMapper<PublicationSegmentRow> PUBLICATION_SEGMENT_MAPPER = (rs, n) ->
             new PublicationSegmentRow(rs.getLong("id"), rs.getLong("publication_id"),
                     rs.getString("segment_id"), rs.getString("asset_id"), rs.getLong("grant_id"),
+                    rs.getInt("energy_density_milli"),
                     rs.getLong("start_ms"), rs.getLong("end_ms"));
 
     private static final RowMapper<RequestRow> REQUEST_MAPPER = (rs, n) ->
@@ -121,8 +126,14 @@ public class PlayoutRepository {
     }
 
     public Optional<AssetRow> findAsset(String id) {
-        return jdbc.query("SELECT id, duration_ms FROM playout_asset WHERE id = ?",
+        return jdbc.query("SELECT id, duration_ms, energy_density_milli FROM playout_asset WHERE id = ?",
                 ASSET_MAPPER, id).stream().findFirst();
+    }
+
+    /** 登记素材能量密度（×1000）；仅未登记时生效，返回受影响行数，0 表示已登记不可修改。 */
+    public int registerEnergyDensity(String assetId, int energyDensityMilli) {
+        return jdbc.update("UPDATE playout_asset SET energy_density_milli = ?"
+                + " WHERE id = ? AND energy_density_milli IS NULL", energyDensityMilli, assetId);
     }
 
     // ---------- 频道 ----------
@@ -248,34 +259,48 @@ public class PlayoutRepository {
     }
 
     public long insertPublication(String channelId, LocalDate businessDay, long publishedVersion,
-                                  long draftVersion, long createdAtMs) {
+                                  long draftVersion, Long maxWindowStartMs, Long maxWindowEndMs,
+                                  Long maxWindowEnergyMicro, long createdAtMs) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
                     "INSERT INTO playout_publication"
-                            + " (channel_id, business_day, published_version, draft_version, created_at_ms)"
-                            + " VALUES (?, ?, ?, ?, ?)", Statement.RETURN_GENERATED_KEYS);
+                            + " (channel_id, business_day, published_version, draft_version,"
+                            + "  max_window_start_ms, max_window_end_ms, max_window_energy_micro, created_at_ms)"
+                            + " VALUES (?, ?, ?, ?, ?, ?, ?, ?)", Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, channelId);
             ps.setDate(2, Date.valueOf(businessDay));
             ps.setLong(3, publishedVersion);
             ps.setLong(4, draftVersion);
-            ps.setLong(5, createdAtMs);
+            if (maxWindowStartMs == null) {
+                ps.setNull(5, java.sql.Types.BIGINT);
+                ps.setNull(6, java.sql.Types.BIGINT);
+                ps.setNull(7, java.sql.Types.BIGINT);
+            } else {
+                ps.setLong(5, maxWindowStartMs);
+                ps.setLong(6, maxWindowEndMs);
+                ps.setLong(7, maxWindowEnergyMicro);
+            }
+            ps.setLong(8, createdAtMs);
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();
     }
 
     public void insertPublicationSegment(long publicationId, String segmentId, String assetId,
-                                         long grantId, long startMs, long endMs) {
+                                         long grantId, int energyDensityMilli,
+                                         long startMs, long endMs) {
         jdbc.update("INSERT INTO playout_publication_segment"
-                        + " (publication_id, segment_id, asset_id, grant_id, start_ms, end_ms)"
-                        + " VALUES (?, ?, ?, ?, ?, ?)",
-                publicationId, segmentId, assetId, grantId, startMs, endMs);
+                        + " (publication_id, segment_id, asset_id, grant_id, energy_density_milli,"
+                        + "  start_ms, end_ms)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                publicationId, segmentId, assetId, grantId, energyDensityMilli, startMs, endMs);
     }
 
     /** 最新一次发布快照。 */
     public Optional<PublicationRow> findLatestPublication(String channelId, LocalDate businessDay) {
-        return jdbc.query("SELECT id, channel_id, business_day, published_version, draft_version"
+        return jdbc.query("SELECT id, channel_id, business_day, published_version, draft_version,"
+                        + " max_window_start_ms, max_window_end_ms, max_window_energy_micro"
                         + " FROM playout_publication"
                         + " WHERE channel_id = ? AND business_day = ?"
                         + " ORDER BY published_version DESC LIMIT 1",
@@ -284,11 +309,21 @@ public class PlayoutRepository {
 
     /** 快照中覆盖指定时刻的片段（start <= at < end）。 */
     public Optional<PublicationSegmentRow> findPublicationSegmentAt(long publicationId, long atMs) {
-        return jdbc.query("SELECT id, publication_id, segment_id, asset_id, grant_id, start_ms, end_ms"
+        return jdbc.query("SELECT id, publication_id, segment_id, asset_id, grant_id,"
+                        + " energy_density_milli, start_ms, end_ms"
                         + " FROM playout_publication_segment"
                         + " WHERE publication_id = ? AND start_ms <= ? AND end_ms > ?"
                         + " ORDER BY start_ms LIMIT 1",
                 PUBLICATION_SEGMENT_MAPPER, publicationId, atMs, atMs).stream().findFirst();
+    }
+
+    /** 快照全部片段，按播出开始时间排序。 */
+    public List<PublicationSegmentRow> findPublicationSegments(long publicationId) {
+        return jdbc.query("SELECT id, publication_id, segment_id, asset_id, grant_id,"
+                        + " energy_density_milli, start_ms, end_ms"
+                        + " FROM playout_publication_segment"
+                        + " WHERE publication_id = ? ORDER BY start_ms, segment_id",
+                PUBLICATION_SEGMENT_MAPPER, publicationId);
     }
 
     // ---------- 幂等请求记录 ----------
