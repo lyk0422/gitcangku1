@@ -2,6 +2,7 @@ package com.example.starter.evidence;
 
 import com.example.starter.error.ApiException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Component;
 
@@ -39,6 +40,27 @@ public class IdempotencyAdvisor {
                     objectMapper.writeValueAsString(request));
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             return HexFormat.of().formatHex(digest.digest(canonical.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 不可用", e);
+        } catch (Exception e) {
+            throw new IllegalStateException("请求序列化失败", e);
+        }
+    }
+
+    /**
+     * 计算结构化请求指纹：操作类型、操作者、资源键与请求体作为 JSON 结构序列化后取 SHA-256。
+     * 不做字符串拼接，避免分隔符碰撞（如参数值本身包含分隔符）。
+     */
+    public String hashStructured(String operation, String actorId, String resourceKey, Object request) {
+        try {
+            ObjectNode node = objectMapper.createObjectNode();
+            node.put("operation", operation);
+            node.put("actor", actorId == null ? "" : actorId);
+            node.put("resource", resourceKey == null ? "" : resourceKey);
+            node.set("request", objectMapper.valueToTree(request));
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            return HexFormat.of().formatHex(digest.digest(
+                    objectMapper.writeValueAsString(node).getBytes(StandardCharsets.UTF_8)));
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException("SHA-256 不可用", e);
         } catch (Exception e) {

@@ -72,3 +72,54 @@ CREATE TABLE IF NOT EXISTS command_log (
     created_at DATETIME(6) NOT NULL COMMENT '首次执行时间，Asia/Shanghai',
     CONSTRAINT uk_command_key UNIQUE (command_key)
 );
+
+-- 受监管交接：当前保管人发起时声明 2-8 个有序检查点及每段 UTC 截止时刻，名单创建后不改。
+-- 同一证物最多一条在途（IN_TRANSIT）或冻结（FROZEN）受监管交接，由证物行锁与状态机保证。
+CREATE TABLE IF NOT EXISTS regulated_transfer (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    transfer_key VARCHAR(64) NOT NULL COMMENT '受监管交接业务键，全局唯一，由服务端生成',
+    evidence_key VARCHAR(64) NOT NULL COMMENT '关联证物业务键',
+    from_custodian VARCHAR(64) NOT NULL COMMENT '发起时的保管人（原保管人），仅其可取消',
+    to_custodian VARCHAR(64) NOT NULL COMMENT '指定收件人，仅其可接收，必须与发起人不同',
+    transporter_id VARCHAR(64) NOT NULL COMMENT '指定运送人，仅其可逐点签到',
+    seal_no VARCHAR(64) NOT NULL COMMENT '发起时冻结的封条编号，签到逐点比对，后续交接不改旧值',
+    checkpoint_count INT NOT NULL COMMENT '检查点总数，2-8，创建后不变',
+    version BIGINT NOT NULL COMMENT '乐观锁版本，自 0 起每次状态变更递增；签到/接收/取消须携带期望值',
+    status VARCHAR(20) NOT NULL COMMENT '交接状态：IN_TRANSIT 在途 / FROZEN 异常冻结 / COMPLETED 已接收 / CANCELLED 已取消',
+    created_at DATETIME(6) NOT NULL COMMENT '发起时间，UTC',
+    decided_at DATETIME(6) NULL COMMENT '接收或取消时间，UTC；NULL 表示仍在途或冻结未决',
+    CONSTRAINT uk_regulated_transfer_key UNIQUE (transfer_key),
+    KEY idx_regulated_evidence (evidence_key)
+);
+
+-- 受监管交接检查点名单：创建时一次性写入，之后不改不删；截止时刻按点号严格递增。
+CREATE TABLE IF NOT EXISTS regulated_checkpoint (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    transfer_key VARCHAR(64) NOT NULL COMMENT '关联受监管交接业务键',
+    checkpoint_no INT NOT NULL COMMENT '检查点号，自 1 起连续编号，签到须按号顺序进行',
+    deadline_at DATETIME(6) NOT NULL COMMENT '该点 UTC 截止时刻；到达时刻等于截止仍合法，晚于则超时',
+    CONSTRAINT uk_regulated_checkpoint UNIQUE (transfer_key, checkpoint_no)
+);
+
+-- 签到记录：只追加、不可变；异常签到（超时/封条不一致）同样留痕。
+CREATE TABLE IF NOT EXISTS regulated_checkin (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    transfer_key VARCHAR(64) NOT NULL COMMENT '关联受监管交接业务键',
+    checkpoint_no INT NOT NULL COMMENT '签到检查点号，须等于当前期望点号，不允许跳点',
+    transporter_id VARCHAR(64) NOT NULL COMMENT '提交签到的运送人',
+    seal_no VARCHAR(64) NOT NULL COMMENT '签到时提交的封条编号，与交接冻结封条比对',
+    arrived_at DATETIME(6) NOT NULL COMMENT '到达时刻，UTC；不得早于上一点到达时刻',
+    created_at DATETIME(6) NOT NULL COMMENT '签到记录写入时间，UTC',
+    CONSTRAINT uk_regulated_checkin UNIQUE (transfer_key, checkpoint_no)
+);
+
+-- 交接异常记录：只追加；记录后交接进入 FROZEN，收件人不能接收，新签到不能继续。
+CREATE TABLE IF NOT EXISTS regulated_exception (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    transfer_key VARCHAR(64) NOT NULL COMMENT '关联受监管交接业务键',
+    checkpoint_no INT NOT NULL COMMENT '发生异常的检查点号',
+    reason VARCHAR(20) NOT NULL COMMENT '异常原因：TIMEOUT 超过截止时刻 / SEAL_MISMATCH 封条不一致',
+    detail VARCHAR(512) NOT NULL COMMENT '异常说明，含提交值与期望值',
+    created_at DATETIME(6) NOT NULL COMMENT '异常记录时间，UTC',
+    KEY idx_regulated_exception_transfer (transfer_key)
+);
