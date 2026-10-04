@@ -8,6 +8,7 @@ import java.util.Optional;
 
 /**
  * 观测记录持久化：维护 observation_current 当前状态与 observation_version 完整历史快照。
+ * 读数限定符与读数值作为不可拆分的一组随快照整体存取；历史版本只插入、永不更新或回填。
  * 所有 SQL 使用参数化查询。
  */
 @Repository
@@ -18,6 +19,7 @@ public class ObservationRepository {
             rs.getInt("version"),
             rs.getString("location"),
             rs.getString("reading"),
+            rs.getString("reading_qualifier"),
             rs.getString("note"),
             rs.getBoolean("deleted"));
 
@@ -32,7 +34,7 @@ public class ObservationRepository {
      */
     public Optional<ObservationSnapshot> findCurrent(String observationId) {
         return jdbcTemplate.query(
-                        "SELECT observation_id, version, location, reading, note, deleted "
+                        "SELECT observation_id, version, location, reading, reading_qualifier, note, deleted "
                                 + "FROM observation_current WHERE observation_id = ?",
                         SNAPSHOT_MAPPER, observationId)
                 .stream().findFirst();
@@ -43,7 +45,7 @@ public class ObservationRepository {
      */
     public Optional<ObservationSnapshot> findCurrentForUpdate(String observationId) {
         return jdbcTemplate.query(
-                        "SELECT observation_id, version, location, reading, note, deleted "
+                        "SELECT observation_id, version, location, reading, reading_qualifier, note, deleted "
                                 + "FROM observation_current WHERE observation_id = ? FOR UPDATE",
                         SNAPSHOT_MAPPER, observationId)
                 .stream().findFirst();
@@ -54,7 +56,7 @@ public class ObservationRepository {
      */
     public Optional<ObservationSnapshot> findVersion(String observationId, int version) {
         return jdbcTemplate.query(
-                        "SELECT observation_id, version, location, reading, note, deleted "
+                        "SELECT observation_id, version, location, reading, reading_qualifier, note, deleted "
                                 + "FROM observation_version WHERE observation_id = ? AND version = ?",
                         SNAPSHOT_MAPPER, observationId, version)
                 .stream().findFirst();
@@ -65,10 +67,10 @@ public class ObservationRepository {
      */
     public void insertCurrent(ObservationSnapshot snapshot) {
         jdbcTemplate.update(
-                "INSERT INTO observation_current (observation_id, location, reading, note, version, deleted, updated_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
-                snapshot.observationId(), snapshot.location(), snapshot.reading(), snapshot.note(),
-                snapshot.version(), snapshot.deleted());
+                "INSERT INTO observation_current (observation_id, location, reading, reading_qualifier, note, "
+                        + "version, deleted, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                snapshot.observationId(), snapshot.location(), snapshot.reading(), snapshot.readingQualifier(),
+                snapshot.note(), snapshot.version(), snapshot.deleted());
     }
 
     /**
@@ -76,9 +78,9 @@ public class ObservationRepository {
      */
     public void updateCurrent(ObservationSnapshot snapshot) {
         jdbcTemplate.update(
-                "UPDATE observation_current SET location = ?, reading = ?, note = ?, version = ?, deleted = ?, "
-                        + "updated_at = CURRENT_TIMESTAMP WHERE observation_id = ?",
-                snapshot.location(), snapshot.reading(), snapshot.note(),
+                "UPDATE observation_current SET location = ?, reading = ?, reading_qualifier = ?, note = ?, "
+                        + "version = ?, deleted = ?, updated_at = CURRENT_TIMESTAMP WHERE observation_id = ?",
+                snapshot.location(), snapshot.reading(), snapshot.readingQualifier(), snapshot.note(),
                 snapshot.version(), snapshot.deleted(), snapshot.observationId());
     }
 
@@ -93,13 +95,13 @@ public class ObservationRepository {
     }
 
     /**
-     * 追加一条完整版本快照，历史永不删除。
+     * 追加一条完整版本快照，历史永不删除、不回填。
      */
     public void insertVersion(ObservationSnapshot snapshot) {
         jdbcTemplate.update(
-                "INSERT INTO observation_version (observation_id, version, location, reading, note, deleted, created_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                "INSERT INTO observation_version (observation_id, version, location, reading, reading_qualifier, "
+                        + "note, deleted, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                 snapshot.observationId(), snapshot.version(), snapshot.location(),
-                snapshot.reading(), snapshot.note(), snapshot.deleted());
+                snapshot.reading(), snapshot.readingQualifier(), snapshot.note(), snapshot.deleted());
     }
 }

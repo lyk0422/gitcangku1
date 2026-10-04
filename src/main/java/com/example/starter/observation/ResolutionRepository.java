@@ -13,11 +13,15 @@ import java.util.List;
 import java.util.Optional;
 
 /**
- * 冲突解决记录持久化：conflict_resolution 记录成功解决的完整上下文，不可变、永不更新。
- * 所有 SQL 使用参数化查询；冲突字段列表与选择映射以 JSON 原文存储。
+ * 冲突解决记录持久化：conflict_resolution 记录成功解决的完整上下文（含候选读数限定符与来源侧选择），
+ * 不可变、永不更新。所有 SQL 使用参数化查询；冲突字段列表与选择映射以 JSON 原文存储。
  */
 @Repository
 public class ResolutionRepository {
+
+    private static final String COLUMNS = "resolution_id, observation_id, request_id, base_version, "
+            + "previous_version, new_version, candidate_location, candidate_reading, candidate_reading_qualifier, "
+            + "candidate_note, conflict_fields, field_selections, operator, content_changed, resolved_at_utc";
 
     private static final TypeReference<List<String>> FIELD_LIST_TYPE = new TypeReference<>() {
     };
@@ -37,11 +41,8 @@ public class ResolutionRepository {
      */
     public void insert(ResolutionRecord record) {
         jdbcTemplate.update(
-                "INSERT INTO conflict_resolution (resolution_id, observation_id, request_id, "
-                        + "base_version, previous_version, new_version, candidate_location, candidate_reading, "
-                        + "candidate_note, conflict_fields, field_selections, operator, content_changed, "
-                        + "resolved_at_utc, created_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                "INSERT INTO conflict_resolution (" + COLUMNS + ", created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                 record.resolutionId(),
                 record.observationId(),
                 record.requestId(),
@@ -50,6 +51,7 @@ public class ResolutionRepository {
                 record.newVersion(),
                 record.candidateLocation(),
                 record.candidateReading(),
+                record.candidateReadingQualifier(),
                 record.candidateNote(),
                 writeJson(record.conflictFields()),
                 record.fieldSelections(),
@@ -63,10 +65,7 @@ public class ResolutionRepository {
      */
     public Optional<ResolutionRecord> findByResolutionId(String resolutionId) {
         return jdbcTemplate.query(
-                        "SELECT resolution_id, observation_id, request_id, base_version, previous_version, "
-                                + "new_version, candidate_location, candidate_reading, candidate_note, "
-                                + "conflict_fields, field_selections, operator, content_changed, resolved_at_utc "
-                                + "FROM conflict_resolution WHERE resolution_id = ?",
+                        "SELECT " + COLUMNS + " FROM conflict_resolution WHERE resolution_id = ?",
                         RESOLUTION_MAPPER, resolutionId)
                 .stream().findFirst();
     }
@@ -76,10 +75,7 @@ public class ResolutionRepository {
      */
     public List<ResolutionRecord> findByObservationId(String observationId) {
         return jdbcTemplate.query(
-                "SELECT resolution_id, observation_id, request_id, base_version, previous_version, "
-                        + "new_version, candidate_location, candidate_reading, candidate_note, "
-                        + "conflict_fields, field_selections, operator, content_changed, resolved_at_utc "
-                        + "FROM conflict_resolution WHERE observation_id = ? "
+                "SELECT " + COLUMNS + " FROM conflict_resolution WHERE observation_id = ? "
                         + "ORDER BY resolved_at_utc ASC, resolution_id ASC",
                 RESOLUTION_MAPPER, observationId);
     }
@@ -120,6 +116,7 @@ public class ResolutionRepository {
             rs.getInt("new_version"),
             rs.getString("candidate_location"),
             rs.getString("candidate_reading"),
+            rs.getString("candidate_reading_qualifier"),
             rs.getString("candidate_note"),
             readFieldList(rs.getString("conflict_fields")),
             rs.getString("field_selections"),

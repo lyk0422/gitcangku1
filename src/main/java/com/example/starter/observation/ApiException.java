@@ -63,6 +63,17 @@ public class ApiException extends RuntimeException {
     }
 
     /**
+     * 422：读数组（限定符+数值）被两侧拆分修改且两组不同——一侧改限定符、另一侧改数值，
+     * 无法自动合并且不拼接任何一侧未提交过的组合，必须人工裁决完整一组。
+     */
+    public static ApiException readingGroupConflict(List<String> conflictFields, int currentVersion) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY,
+                "reading qualifier and value were changed by different sides and cannot be merged; "
+                        + "conflict on fields: " + String.join(", ", conflictFields),
+                List.copyOf(conflictFields), currentVersion);
+    }
+
+    /**
      * 410：记录已删除，拒绝新的修改和删除。
      */
     public static ApiException gone(String message) {

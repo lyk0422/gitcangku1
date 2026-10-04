@@ -5,7 +5,8 @@
 CREATE TABLE IF NOT EXISTS observation_current (
     observation_id VARCHAR(64) NOT NULL COMMENT '观测记录唯一标识',
     location VARCHAR(512) NOT NULL COMMENT '观测地点（可编辑字段）',
-    reading VARCHAR(64) NOT NULL COMMENT '观测读数，十进制字符串，最多三位小数，比较按数值（可编辑字段）',
+    reading VARCHAR(64) NOT NULL COMMENT '观测读数，非负十进制字符串，最多三位小数，比较按数值；与 reading_qualifier 为不可拆分的一组（可编辑字段）',
+    reading_qualifier VARCHAR(8) NOT NULL DEFAULT 'EXACT' COMMENT '读数限定符：EXACT 单值 / LT 小于阈值 / GT 大于阈值；旧普通读数默认 EXACT；与 reading 为不可拆分的一组',
     note VARCHAR(1024) NOT NULL COMMENT '观测备注（可编辑字段）',
     version INT NOT NULL COMMENT '当前版本号，从 1 开始',
     deleted BOOLEAN NOT NULL DEFAULT FALSE COMMENT '是否已删除：TRUE 表示当前状态为删除墓碑',
@@ -13,12 +14,13 @@ CREATE TABLE IF NOT EXISTS observation_current (
     PRIMARY KEY (observation_id)
 );
 
--- 观测记录版本快照表：每次成功变更（创建/合并/删除）追加一行完整快照，历史永不删除。
+-- 观测记录版本快照表：每次成功变更（创建/合并/删除）追加一行完整快照，历史永不删除、不回填。
 CREATE TABLE IF NOT EXISTS observation_version (
     observation_id VARCHAR(64) NOT NULL COMMENT '观测记录唯一标识',
     version INT NOT NULL COMMENT '版本号，从 1 开始，与 observation_current.version 对应',
     location VARCHAR(512) NULL COMMENT '该版本观测地点快照；删除墓碑版本为 NULL',
-    reading VARCHAR(64) NULL COMMENT '该版本观测读数快照（十进制字符串原文）；删除墓碑版本为 NULL',
+    reading VARCHAR(64) NULL COMMENT '该版本观测读数快照（非负十进制字符串原文，最多三位小数）；删除墓碑版本为 NULL',
+    reading_qualifier VARCHAR(8) NULL COMMENT '该版本读数限定符快照（EXACT/LT/GT），写入时冻结，历史版本不以默认值补写；删除墓碑版本为 NULL',
     note VARCHAR(1024) NULL COMMENT '该版本观测备注快照；删除墓碑版本为 NULL',
     deleted BOOLEAN NOT NULL COMMENT '该版本是否为删除墓碑：TRUE 时业务字段无意义',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '该版本生成时间（服务器时区）',
@@ -28,7 +30,7 @@ CREATE TABLE IF NOT EXISTS observation_version (
 -- 幂等去重表：仅记录成功结果，失败不占键；与业务变更同事务原子提交。
 CREATE TABLE IF NOT EXISTS request_log (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
-    fingerprint VARCHAR(128) NOT NULL COMMENT '请求操作与参数的指纹，同键异参时判定 409',
+    fingerprint VARCHAR(128) NOT NULL COMMENT '请求身份指纹：操作、操作者、资源及全部参数和期望版本的结构化（JSON）序列化摘要，同键异参时判定 409',
     operation VARCHAR(32) NOT NULL COMMENT '操作类型：CREATE / MERGE / DELETE / RESOLVE',
     response_status INT NULL COMMENT '成功响应的 HTTP 状态码；提交过程中暂为 NULL',
     response_body VARCHAR(4000) NULL COMMENT '成功响应体（JSON 原文），用于同键同参重放；提交过程中暂为 NULL',
@@ -45,10 +47,11 @@ CREATE TABLE IF NOT EXISTS conflict_resolution (
     previous_version INT NOT NULL COMMENT '解决前当前版本号',
     new_version INT NOT NULL COMMENT '解决后指向的版本号；无变化解决时等于 previous_version',
     candidate_location VARCHAR(512) NOT NULL COMMENT '客户端提交的候选地点完整值',
-    candidate_reading VARCHAR(64) NOT NULL COMMENT '客户端提交的候选读数完整值（十进制原文，最多三位小数）',
+    candidate_reading VARCHAR(64) NOT NULL COMMENT '客户端提交的候选读数完整值（非负十进制原文，最多三位小数）',
+    candidate_reading_qualifier VARCHAR(8) NOT NULL COMMENT '客户端提交的候选读数限定符（EXACT/LT/GT），与候选读数为不可拆分的一组，解决成功时冻结',
     candidate_note VARCHAR(1024) NOT NULL COMMENT '客户端提交的候选备注完整值',
     conflict_fields VARCHAR(256) NOT NULL COMMENT '服务端重算出的冲突字段名列表（JSON 数组原文，固定顺序 location/reading/note）',
-    field_selections VARCHAR(512) NOT NULL COMMENT '各冲突字段的人工选择（JSON 对象原文，值为 CURRENT/CANDIDATE）',
+    field_selections VARCHAR(512) NOT NULL COMMENT '各冲突字段的人工选择（JSON 对象原文，值为 CURRENT/CANDIDATE），即解决结果来源侧',
     operator VARCHAR(128) NOT NULL COMMENT '执行冲突解决的操作者标识',
     content_changed BOOLEAN NOT NULL COMMENT '解决后内容是否变化：FALSE 表示未生成新观测版本，仅保存指向当前版本的记录',
     resolved_at_utc TIMESTAMP NOT NULL COMMENT '解决完成时刻（UTC）',

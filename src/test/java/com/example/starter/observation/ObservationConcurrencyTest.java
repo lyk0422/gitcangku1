@@ -65,7 +65,7 @@ class ObservationConcurrencyTest {
     }
 
     private void createObservation(String id, String requestId) {
-        observationService.create(new CreateObservationRequest(requestId, id, "站点A", "1.0", "初始备注"));
+        observationService.create(new CreateObservationRequest(requestId, id, "站点A", "1.0", null, "初始备注"));
     }
 
     @Test
@@ -75,9 +75,9 @@ class ObservationConcurrencyTest {
         // 两个离线端都基于版本 1：一个改地点，一个改备注；互不冲突，应都生效
         List<Callable<ObservationService.WriteOutcome>> tasks = List.of(
                 () -> observationService.merge("obs-c1",
-                        new MergeObservationRequest("req-cc1", 1, "站点B", "1.0", "初始备注")),
+                        new MergeObservationRequest("req-cc1", 1, "站点B", "1.0", null, "初始备注")),
                 () -> observationService.merge("obs-c1",
-                        new MergeObservationRequest("req-cc2", 1, "站点A", "1.0", "并发备注")));
+                        new MergeObservationRequest("req-cc2", 1, "站点A", "1.0", null, "并发备注")));
         List<ObservationService.WriteOutcome> outcomes = runConcurrently(tasks);
 
         assertThat(outcomes).allMatch(outcome -> outcome.status() == 200);
@@ -99,7 +99,7 @@ class ObservationConcurrencyTest {
                 () -> {
                     try {
                         observationService.merge("obs-c2",
-                                new MergeObservationRequest("req-cd1", 1, "站点B", "2.0", "合并备注"));
+                                new MergeObservationRequest("req-cd1", 1, "站点B", "2.0", null, "合并备注"));
                         return "merge-ok";
                     } catch (ApiException e) {
                         return "merge-" + e.status().value();
@@ -144,7 +144,7 @@ class ObservationConcurrencyTest {
         List<Callable<ObservationService.WriteOutcome>> tasks = new ArrayList<>();
         for (int i = 0; i < 4; i++) {
             tasks.add(() -> observationService.merge("obs-c3",
-                    new MergeObservationRequest("req-ci1", 1, "站点B", "2.0", "并发重放")));
+                    new MergeObservationRequest("req-ci1", 1, "站点B", "2.0", null, "并发重放")));
         }
         List<ObservationService.WriteOutcome> outcomes = runConcurrently(tasks);
 
@@ -169,7 +169,7 @@ class ObservationConcurrencyTest {
             tasks.add(() -> {
                 try {
                     observationService.create(new CreateObservationRequest(
-                            "req-ck" + index, "obs-c4", "站点" + index, "1.0", "备注"));
+                            "req-ck" + index, "obs-c4", "站点" + index, "1.0", null, "备注"));
                     return "ok";
                 } catch (ApiException e) {
                     return String.valueOf(e.status().value());
