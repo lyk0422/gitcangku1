@@ -62,8 +62,30 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_review_request ON review (request_id);
 -- 写操作幂等去重：同键同参重放原结果，异参冲突；失败不占键
 CREATE TABLE IF NOT EXISTS request_dedup (
     request_id     VARCHAR(64) PRIMARY KEY COMMENT '写操作全局唯一请求标识',
-    request_kind   VARCHAR(32) NOT NULL COMMENT '请求类型：ZONE_CREATE/ZONE_REVOKE/ROUTE_CREATE/ROUTE_REPLACE/REVIEW',
+    request_kind   VARCHAR(32) NOT NULL COMMENT '请求类型：ZONE_CREATE/ZONE_REVOKE/ROUTE_CREATE/ROUTE_REPLACE/REVIEW/PERMIT_CREATE/PERMIT_REVOKE',
     request_hash   VARCHAR(64) NOT NULL COMMENT '规范化参数的 SHA-256 十六进制摘要，用于同键异参冲突判定',
     response_json  CLOB NOT NULL COMMENT '首次成功响应 JSON，重放时原样返回',
     created_at     BIGINT NOT NULL COMMENT '首次成功时间，epoch 毫秒（UTC）'
 ) COMMENT = '写操作幂等去重记录（与业务变更同事务原子提交）';
+
+-- 两点匀速航线运动间隔许可：引用两点航线的明确版本与 UTC 整秒起止时刻，
+-- 期间沿两航点连线匀速运动；有效区间左闭右开 [start_second, end_second)。
+-- 轨迹端点以毫米（米×1000）整数快照保存，精确保留最多 3 位小数；
+-- 航线后续更新不改写已许可轨迹，新申请必须引用新的航线版本。
+CREATE TABLE IF NOT EXISTS flight_permit (
+    permit_id      VARCHAR(64) PRIMARY KEY COMMENT '许可唯一标识（不可变）',
+    route_id       VARCHAR(64) NOT NULL COMMENT '引用的两点航线标识',
+    route_version  INT NOT NULL COMMENT '申请时引用并快照的航线版本；航线后续更新不影响本许可轨迹',
+    start_second   BIGINT NOT NULL COMMENT '有效起点（含），UTC epoch 整秒',
+    end_second     BIGINT NOT NULL COMMENT '有效终点（不含），UTC epoch 整秒，必须大于 start_second',
+    ax_milli       BIGINT NOT NULL COMMENT '起点X快照，单位毫米（米×1000，最多3位小数）',
+    ay_milli       BIGINT NOT NULL COMMENT '起点Y快照，单位毫米（米×1000，最多3位小数）',
+    bx_milli       BIGINT NOT NULL COMMENT '终点X快照，单位毫米（米×1000，最多3位小数）',
+    by_milli       BIGINT NOT NULL COMMENT '终点Y快照，单位毫米（米×1000，最多3位小数）',
+    status         VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE 有效参与间隔校验；REVOKED 已撤销，释放未来占用、历史轨迹保留',
+    request_id     VARCHAR(64) NOT NULL COMMENT '创建许可的写操作请求标识',
+    created_at     BIGINT NOT NULL COMMENT '创建时间，epoch 毫秒（UTC）',
+    revoked_at     BIGINT NULL COMMENT '撤销时间，epoch 毫秒（UTC）；NULL 表示仍有效'
+) COMMENT = '两点匀速航线运动间隔许可（最多 20 条活动许可，两两共同区间最小距离至少 10 米）';
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_flight_permit_request ON flight_permit (request_id);
