@@ -10,6 +10,9 @@ CREATE TABLE IF NOT EXISTS evidence (
     seal_no VARCHAR(64) NOT NULL COMMENT '封条编号，入库后不可修改',
     custodian_id VARCHAR(64) NOT NULL COMMENT '当前保管人（操作人标识），交接接受后原子切换；借出期间不变',
     status VARCHAR(20) NOT NULL COMMENT '证物状态：SEALED 已封存 / TRANSFER_PENDING 待接收 / BORROWED 借出未归还 / SEAL_BROKEN 封条异常（终态）',
+    digest VARCHAR(128) NULL COMMENT '原件数字摘要（如 SHA-256 十六进制），入库后不可修改；NULL 表示未登记，未登记不得签发阅检副本',
+    synthetic_text TEXT NULL COMMENT '原件合成文本元数据，入库后不可修改；NULL 表示未登记',
+    version BIGINT NOT NULL DEFAULT 0 COMMENT '乐观锁版本号，状态或保管人每次变更递增，签发/回收副本时可校验期望版本',
     created_at DATETIME(6) NOT NULL COMMENT '入库时间，Asia/Shanghai',
     updated_at DATETIME(6) NOT NULL COMMENT '最近一次状态或保管人变更时间，Asia/Shanghai',
     CONSTRAINT uk_evidence_key UNIQUE (evidence_key)
@@ -65,10 +68,31 @@ CREATE TABLE IF NOT EXISTS command_log (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     command_key VARCHAR(64) NOT NULL COMMENT '幂等命令键，全局唯一',
     actor_id VARCHAR(64) NOT NULL COMMENT '发起操作人',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN/COPY_ISSUE/COPY_REVOKE',
     request_hash VARCHAR(64) NOT NULL COMMENT '请求参数规范化后的 SHA-256，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行的 HTTP 状态码',
     response_body TEXT NOT NULL COMMENT '首次执行的响应体 JSON，重放时原样返回',
     created_at DATETIME(6) NOT NULL COMMENT '首次执行时间，Asia/Shanghai',
     CONSTRAINT uk_command_key UNIQUE (command_key)
+);
+
+
+-- 阅检副本：签发时冻结摘要、水印、合成文本与 UTC 有效区间（左闭右开，最长 1 小时）。
+-- 回收仅置状态不删历史；自然到期（valid_to 不晚于当前 UTC 时刻）即视为失效，不再拦截交接/借出。
+CREATE TABLE IF NOT EXISTS inspection_copy (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    copy_id VARCHAR(64) NOT NULL COMMENT '不可重复副本ID，全局唯一，水印组成部分',
+    evidence_key VARCHAR(64) NOT NULL COMMENT '关联证物业务键',
+    reviewer_id VARCHAR(64) NOT NULL COMMENT '阅检人，仅本人可在有效期内读取副本',
+    digest VARCHAR(128) NOT NULL COMMENT '签发时冻结的原件数字摘要',
+    watermark VARCHAR(256) NOT NULL COMMENT '签发时冻结的水印，包含副本ID与阅检人',
+    synthetic_text TEXT NOT NULL COMMENT '签发时冻结的合成文本',
+    valid_from DATETIME(6) NOT NULL COMMENT 'UTC 有效期起点（左闭，含该时刻）',
+    valid_to DATETIME(6) NOT NULL COMMENT 'UTC 有效期终点（右开，不含该时刻），区间最长 1 小时',
+    status VARCHAR(20) NOT NULL COMMENT '副本状态：ACTIVE 已签发 / REVOKED 已回收（历史保留不删除）',
+    issued_at DATETIME(6) NOT NULL COMMENT '签发时刻，UTC',
+    revoked_at DATETIME(6) NULL COMMENT '回收时刻（UTC）；NULL 表示未回收',
+    created_at DATETIME(6) NOT NULL COMMENT '记录创建时间，Asia/Shanghai',
+    CONSTRAINT uk_copy_id UNIQUE (copy_id),
+    KEY idx_copy_evidence (evidence_key)
 );

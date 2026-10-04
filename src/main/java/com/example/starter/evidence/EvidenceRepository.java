@@ -29,14 +29,15 @@ public class EvidenceRepository {
      * 插入新证物，初始状态 SEALED，保管人为入库操作人。
      */
     public void insert(String evidenceKey, String caseKey, String category, String sealNo,
-                       String custodianId, LocalDateTime now) {
+                       String custodianId, String digest, String syntheticText, LocalDateTime now) {
         jdbc.update("""
                         INSERT INTO evidence
-                            (evidence_key, case_key, category, seal_no, custodian_id, status, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            (evidence_key, case_key, category, seal_no, custodian_id, status,
+                             digest, synthetic_text, version, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
                         """,
                 evidenceKey, caseKey, category, sealNo, custodianId,
-                EvidenceStatus.SEALED.name(), now, now);
+                EvidenceStatus.SEALED.name(), digest, syntheticText, now, now);
     }
 
     /**
@@ -63,7 +64,7 @@ public class EvidenceRepository {
     public void updateCustody(String evidenceKey, String custodianId, EvidenceStatus status,
                               LocalDateTime now) {
         jdbc.update(
-                "UPDATE evidence SET custodian_id = ?, status = ?, updated_at = ? WHERE evidence_key = ?",
+                "UPDATE evidence SET custodian_id = ?, status = ?, version = version + 1, updated_at = ? WHERE evidence_key = ?",
                 custodianId, status.name(), now, evidenceKey);
     }
 
@@ -72,7 +73,7 @@ public class EvidenceRepository {
      */
     public void updateStatus(String evidenceKey, EvidenceStatus status, LocalDateTime now) {
         jdbc.update(
-                "UPDATE evidence SET status = ?, updated_at = ? WHERE evidence_key = ?",
+                "UPDATE evidence SET status = ?, version = version + 1, updated_at = ? WHERE evidence_key = ?",
                 status.name(), now, evidenceKey);
     }
 
@@ -96,6 +97,9 @@ public class EvidenceRepository {
                     rs.getString("seal_no"),
                     rs.getString("custodian_id"),
                     EvidenceStatus.valueOf(rs.getString("status")),
+                    rs.getString("digest"),
+                    rs.getString("synthetic_text"),
+                    rs.getLong("version"),
                     rs.getObject("created_at", LocalDateTime.class),
                     rs.getObject("updated_at", LocalDateTime.class));
         }
