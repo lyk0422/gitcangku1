@@ -125,6 +125,39 @@ public final class ApiDtos {
     public record TermStatusResponse(long documentId, int termVersion, List<TranslationTermStatus> translations) {
     }
 
+    /** 新增批注请求：区间按 Unicode 码点从 0 计数、左闭右开且非空。 */
+    public record CreateAnnotationRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @PositiveOrZero(message = "start 不能为负数") int start,
+            @PositiveOrZero(message = "end 不能为负数") int end,
+            @NotBlank(message = "批注内容不能为空") @Size(max = 2048) String body) {
+    }
+
+    /** 定点编辑请求：携带期望译文版本、替换区间（码点，左闭右开）与新文本；新文本可为空串表示纯删除。 */
+    public record AnchoredEditRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @Positive(message = "expectedTranslationVersion 必须为正数") int expectedTranslationVersion,
+            @PositiveOrZero(message = "start 不能为负数") int start,
+            @PositiveOrZero(message = "end 不能为负数") int end,
+            @NotNull(message = "newText 不能为 null") String newText) {
+    }
+
+    /** 批注解决请求：携带期望译文版本，与编辑、批准同版本原子裁决。 */
+    public record ResolveAnnotationRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @Positive(message = "expectedTranslationVersion 必须为正数") int expectedTranslationVersion) {
+    }
+
+    /** 批注视图：ORPHAN 时 start/end 为 null，仅保留原引用 quote。 */
+    public record AnnotationView(long annotationId, String segmentId, String language,
+                                 int translationVersion, Integer start, Integer end,
+                                 String quote, String body, String creator, String status) {
+    }
+
+    /** 批注列表查询响应。 */
+    public record AnnotationListResponse(long documentId, String segmentId, String language,
+                                         List<AnnotationView> annotations) {
+    }
     /** 统一错误响应；violations 仅在术语违规 422 时返回，含全部违规术语。 */
     @JsonInclude(JsonInclude.Include.NON_NULL)
     public record ErrorResponse(String error, String message, List<TermRuleView> violations) {

@@ -1,5 +1,6 @@
 package com.example.starter.translation.repo;
 
+import com.example.starter.translation.domain.Rows.AnnotationRow;
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
 import com.example.starter.translation.domain.Rows.RequestLogRow;
@@ -240,5 +241,111 @@ public class TranslationRepository {
     public void insertRequestLog(String requestId, String requestHash, int responseStatus, String responseBody) {
         jdbc.update("INSERT INTO request_log (request_id, request_hash, response_status, response_body) "
                 + "VALUES (?, ?, ?, ?)", requestId, requestHash, responseStatus, responseBody);
+    }
+
+    private static final RowMapper<AnnotationRow> ANNOTATION_MAPPER = (rs, n) -> new AnnotationRow(
+            rs.getLong("annotation_id"), rs.getString("segment_id"), rs.getString("language"),
+            rs.getInt("translation_version"),
+            (Integer) rs.getObject("start_offset"), (Integer) rs.getObject("end_offset"),
+            rs.getString("quote_text"), rs.getString("body"), rs.getString("creator"),
+            rs.getString("status"));
+
+    /** 插入批注并返回自增 ID，初始状态 OPEN。 */
+    public long insertAnnotation(long documentId, AnnotationRow row) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO annotation (document_id, segment_id, language, translation_version, "
+                            + "start_offset, end_offset, quote_text, body, creator, status) "
+                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    new String[]{"annotation_id"});
+            ps.setLong(1, documentId);
+            ps.setString(2, row.segmentId());
+            ps.setString(3, row.language());
+            ps.setInt(4, row.translationVersion());
+            ps.setInt(5, row.startOffset());
+            ps.setInt(6, row.endOffset());
+            ps.setString(7, row.quote());
+            ps.setString(8, row.body());
+            ps.setString(9, row.creator());
+            ps.setString(10, row.status());
+            return ps;
+        }, keyHolder);
+        Number key = keyHolder.getKey();
+        if (key == null) {
+            throw new IllegalStateException("批注创建后未返回自增主键");
+        }
+        return key.longValue();
+    }
+
+    /** 按 ID 与所属路径查询批注。 */
+    public Optional<AnnotationRow> findAnnotation(long documentId, String segmentId, String language,
+                                                  long annotationId) {
+        List<AnnotationRow> rows = jdbc.query(
+                "SELECT annotation_id, segment_id, language, translation_version, start_offset, end_offset, "
+                        + "quote_text, body, creator, status FROM annotation "
+                        + "WHERE document_id = ? AND segment_id = ? AND language = ? AND annotation_id = ?",
+                ANNOTATION_MAPPER, documentId, segmentId, language, annotationId);
+        return rows.stream().findFirst();
+    }
+
+    /** 查询段落某语言下全部批注（含已解决），按 ID 升序保证稳定输出。 */
+    public List<AnnotationRow> listAnnotations(long documentId, String segmentId, String language) {
+        return jdbc.query(
+                "SELECT annotation_id, segment_id, language, translation_version, start_offset, end_offset, "
+                        + "quote_text, body, creator, status FROM annotation "
+                        + "WHERE document_id = ? AND segment_id = ? AND language = ? ORDER BY annotation_id",
+                ANNOTATION_MAPPER, documentId, segmentId, language);
+    }
+
+    /** 查询段落某语言下状态为 OPEN 的批注（仅这些持有有效锚点，参与定点编辑平移）。 */
+    public List<AnnotationRow> listOpenAnnotations(long documentId, String segmentId, String language) {
+        return jdbc.query(
+                "SELECT annotation_id, segment_id, language, translation_version, start_offset, end_offset, "
+                        + "quote_text, body, creator, status FROM annotation "
+                        + "WHERE document_id = ? AND segment_id = ? AND language = ? AND status = 'OPEN' "
+                        + "ORDER BY annotation_id",
+                ANNOTATION_MAPPER, documentId, segmentId, language);
+    }
+
+    /** 统计段落某语言下未解决（OPEN 或 ORPHAN）批注数。 */
+    public int countUnresolvedAnnotations(long documentId, String segmentId, String language) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM annotation WHERE document_id = ? AND segment_id = ? AND language = ? "
+                        + "AND status IN ('OPEN', 'ORPHAN')",
+                Integer.class, documentId, segmentId, language);
+        return count == null ? 0 : count;
+    }
+
+    /** 统计文档全部未解决（OPEN 或 ORPHAN）批注数，用于发布校验。 */
+    public int countUnresolvedAnnotations(long documentId) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM annotation WHERE document_id = ? AND status IN ('OPEN', 'ORPHAN')",
+                Integer.class, documentId);
+        return count == null ? 0 : count;
+    }
+
+    /** 定点编辑后整体平移批注锚点。 */
+    public void shiftAnnotation(long annotationId, int startOffset, int endOffset) {
+        jdbc.update("UPDATE annotation SET start_offset = ?, end_offset = ? WHERE annotation_id = ?",
+                startOffset, endOffset, annotationId);
+    }
+
+    /** 批注孤立：状态置 ORPHAN 并清空锚点，仅保留原引用。 */
+    public void markAnnotationOrphan(long annotationId) {
+        jdbc.update("UPDATE annotation SET status = 'ORPHAN', start_offset = NULL, end_offset = NULL "
+                + "WHERE annotation_id = ?", annotationId);
+    }
+
+    /** 确认解决：状态置 RESOLVED 并记录解决时间。 */
+    public void resolveAnnotation(long annotationId) {
+        jdbc.update("UPDATE annotation SET status = 'RESOLVED', resolved_at = CURRENT_TIMESTAMP "
+                + "WHERE annotation_id = ?", annotationId);
+    }
+
+    /** 删除段落某语言下的批准（新增批注使当前批准失效）。 */
+    public void deleteApproval(long documentId, String segmentId, String language) {
+        jdbc.update("DELETE FROM approval WHERE document_id = ? AND segment_id = ? AND language = ?",
+                documentId, segmentId, language);
     }
 }

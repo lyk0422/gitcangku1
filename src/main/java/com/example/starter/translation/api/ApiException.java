@@ -38,6 +38,10 @@ public class ApiException extends RuntimeException {
         return violations;
     }
 
+    /** 400：请求参数违反业务约束（如批注或编辑区间越界）。 */
+    public static ApiException badRequest(String message) {
+        return new ApiException(HttpStatus.BAD_REQUEST, "BAD_REQUEST", message);
+    }
     /** 404：资源不存在。 */
     public static ApiException notFound(String message) {
         return new ApiException(HttpStatus.NOT_FOUND, "NOT_FOUND", message);

@@ -17,6 +17,9 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
@@ -136,15 +139,64 @@ public class TranslationController {
                 .body(translationService.getRelease(documentId, publishedVersion));
     }
 
-    /** 计算请求摘要：操作（含路径变量）+ 操作者 + 规范化请求体的 SHA-256。 */
+    /** 新增批注：绑定当前译文版本与非空码点区间；新增批注使当前批准失效。 */
+    @PostMapping("/{documentId}/segments/{segmentId}/translations/{language}/annotations")
+    public ResponseEntity<String> createAnnotation(@PathVariable long documentId, @PathVariable String segmentId,
+                                                   @PathVariable String language,
+                                                   @RequestHeader("X-Actor-Id") String actorId,
+                                                   @Valid @RequestBody ApiDtos.CreateAnnotationRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/segments/" + segmentId
+                + "/translations/" + language + "/annotations";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(201, translationService.createAnnotation(
+                        documentId, segmentId, language, actorId, request))).toResponseEntity();
+    }
+
+    /** 定点编辑：提交期望译文版本、替换区间与新文本；编辑使原批准失效并平移或孤立批注。 */
+    @PutMapping("/{documentId}/segments/{segmentId}/translations/{language}/edit")
+    public ResponseEntity<String> anchoredEdit(@PathVariable long documentId, @PathVariable String segmentId,
+                                               @PathVariable String language,
+                                               @RequestHeader("X-Actor-Id") String actorId,
+                                               @Valid @RequestBody ApiDtos.AnchoredEditRequest request) {
+        String operation = "PUT /api/documents/" + documentId + "/segments/" + segmentId
+                + "/translations/" + language + "/edit";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(200, translationService.anchoredEdit(
+                        documentId, segmentId, language, actorId, request))).toResponseEntity();
+    }
+
+    /** 批注解决：仅批注创建人可将 OPEN 或 ORPHAN 确认为 RESOLVED，携带期望译文版本原子裁决。 */
+    @PostMapping("/{documentId}/segments/{segmentId}/translations/{language}/annotations/{annotationId}/resolve")
+    public ResponseEntity<String> resolveAnnotation(@PathVariable long documentId, @PathVariable String segmentId,
+                                                    @PathVariable String language, @PathVariable long annotationId,
+                                                    @RequestHeader("X-Actor-Id") String actorId,
+                                                    @Valid @RequestBody ApiDtos.ResolveAnnotationRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/segments/" + segmentId
+                + "/translations/" + language + "/annotations/" + annotationId + "/resolve";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(200, translationService.resolveAnnotation(
+                        documentId, segmentId, language, annotationId, actorId, request))).toResponseEntity();
+    }
+
+    /** 查询段落某语言下全部批注：OPEN 携带当前锚点，ORPHAN 仅保留原引用。 */
+    @GetMapping("/{documentId}/segments/{segmentId}/translations/{language}/annotations")
+    public ResponseEntity<ApiDtos.AnnotationListResponse> listAnnotations(@PathVariable long documentId,
+                                                                          @PathVariable String segmentId,
+                                                                          @PathVariable String language) {
+        return ResponseEntity.ok(translationService.listAnnotations(documentId, segmentId, language));
+    }
+    /**
+     * 计算请求摘要：操作（含路径变量定位资源）、操作者与全部请求参数（含期望版本）
+     * 组成结构化 JSON 数组后取 SHA-256，避免分隔符拼接造成的身份碰撞。
+     */
     private String hash(String operation, Object... parts) {
         try {
-            StringBuilder canonical = new StringBuilder(operation);
-            for (Object part : parts) {
-                canonical.append('\n').append(objectMapper.writeValueAsString(part));
-            }
+            List<Object> identity = new ArrayList<>(parts.length + 1);
+            identity.add(operation);
+            identity.addAll(Arrays.asList(parts));
+            String canonical = objectMapper.writeValueAsString(identity);
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            return HexFormat.of().formatHex(digest.digest(canonical.toString().getBytes(StandardCharsets.UTF_8)));
+            return HexFormat.of().formatHex(digest.digest(canonical.getBytes(StandardCharsets.UTF_8)));
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException("SHA-256 不可用", e);
         } catch (Exception e) {

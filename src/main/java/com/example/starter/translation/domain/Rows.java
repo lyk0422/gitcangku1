@@ -82,4 +82,23 @@ public final class Rows {
     public record RequestLogRow(String requestId, String requestHash,
                                 int responseStatus, String responseBody) {
     }
+
+    /**
+     * 批注：绑定段落、语言与创建时译文版本的非空区间意见，区间按 Unicode 码点从 0 计数、左闭右开。
+     *
+     * @param annotationId       全局唯一批注 ID，自增
+     * @param segmentId          所属段落 ID
+     * @param language           目标语言码，小写
+     * @param translationVersion 批注创建时绑定的译文版本，后续编辑不改写
+     * @param startOffset        当前锚点起点（码点，从 0）；ORPHAN 后为 null 表示不再显示锚点
+     * @param endOffset          当前锚点终点（码点，左闭右开）；ORPHAN 后为 null
+     * @param quote              创建时锚定的原文引用，ORPHAN 后仅保留该引用
+     * @param body               批注内容，非空
+     * @param creator            批注创建人，取创建时 X-Actor-Id；仅创建人可确认解决
+     * @param status             状态：OPEN 未解决 / ORPHAN 已孤立 / RESOLVED 已解决
+     */
+    public record AnnotationRow(long annotationId, String segmentId, String language,
+                                int translationVersion, Integer startOffset, Integer endOffset,
+                                String quote, String body, String creator, String status) {
+    }
 }

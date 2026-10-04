@@ -35,6 +35,7 @@ public abstract class AbstractIntegrationTest {
 
     @BeforeEach
     void cleanTables() {
+        jdbc.update("DELETE FROM annotation");
         jdbc.update("DELETE FROM approval");
         jdbc.update("DELETE FROM translation");
         jdbc.update("DELETE FROM segment");
@@ -130,6 +131,41 @@ public abstract class AbstractIntegrationTest {
         return putJson("/api/documents/" + documentId + "/terms", body);
     }
 
+
+    /** 新增批注。 */
+    protected ApiResult createAnnotation(long documentId, String segmentId, String language, String actorId,
+                                         int start, int end, String body, String requestId) throws Exception {
+        String json = "{\"requestId\":\"" + requestId + "\",\"start\":" + start + ",\"end\":" + end
+                + ",\"body\":\"" + body + "\"}";
+        return postJson("/api/documents/" + documentId + "/segments/" + segmentId + "/translations/"
+                + language + "/annotations", json, actorId);
+    }
+
+    /** 定点编辑：expectedVersion 为期望译文版本，[start, end) 为替换区间，newText 可为空串。 */
+    protected ApiResult anchoredEdit(long documentId, String segmentId, String language, String actorId,
+                                     int expectedVersion, int start, int end, String newText,
+                                     String requestId) throws Exception {
+        String json = "{\"requestId\":\"" + requestId + "\",\"expectedTranslationVersion\":" + expectedVersion
+                + ",\"start\":" + start + ",\"end\":" + end + ",\"newText\":\"" + newText + "\"}";
+        return putJson("/api/documents/" + documentId + "/segments/" + segmentId + "/translations/"
+                + language + "/edit", json, actorId);
+    }
+
+    /** 解决批注。 */
+    protected ApiResult resolveAnnotation(long documentId, String segmentId, String language, long annotationId,
+                                          String actorId, int expectedVersion, String requestId)
+            throws Exception {
+        String json = "{\"requestId\":\"" + requestId + "\",\"expectedTranslationVersion\":" + expectedVersion
+                + "}";
+        return postJson("/api/documents/" + documentId + "/segments/" + segmentId + "/translations/"
+                + language + "/annotations/" + annotationId + "/resolve", json, actorId);
+    }
+
+    /** 查询批注列表。 */
+    protected ApiResult listAnnotations(long documentId, String segmentId, String language) throws Exception {
+        return getJson("/api/documents/" + documentId + "/segments/" + segmentId + "/translations/"
+                + language + "/annotations");
+    }
     /** HTTP 响应结果：状态码与 JSON 响应体。 */
     protected record ApiResult(int status, JsonNode body) {
     }
