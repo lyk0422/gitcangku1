@@ -24,7 +24,22 @@ public final class Dtos {
 
     /** 提交配水申请命令；申请人由 X-Actor-Id 请求头提供。 */
     public record SubmitAllocationRequest(String commandKey, String allocationKey, Long windowId,
-                                          String userId, String amount) {
+                                          String userId, String amount, String pumpStationKey,
+                                          List<CurveNode> curve) {
+    }
+
+    /** 流量曲线节点：UTC 整分钟时刻 + 瞬时流量（立方米每分钟，非负，最多 3 位小数）。 */
+    public record CurveNode(String timeUtc, String flow) {
+    }
+
+    /** 泵站配置写入命令；expectedVersion 创建时为 0，更新时必须等于当前版本。 */
+    public record PumpStationRequest(String requestId, String stationKey, String maxFlow,
+                                     String maxRampPerMinute, Long expectedVersion) {
+    }
+
+    /** 泵站配置视图；version 随每次成功更新递增。 */
+    public record PumpStationResponse(String stationKey, String maxFlow, String maxRampPerMinute,
+                                      long version, String createdUtc, String updatedUtc) {
     }
 
     /**
@@ -34,7 +49,8 @@ public final class Dtos {
      */
     public record AllocationResponse(String allocationKey, long windowId, String userId, String amount,
                                      String heldAmount, String requester, String status,
-                                     String createdUtc, String updatedUtc) {
+                                     String createdUtc, String updatedUtc, String pumpStationKey,
+                                     List<CurveNode> curve, Long approvedStationVersion) {
     }
 
     /** 仅含幂等键的命令（批准/取消申请、取消限供）。 */

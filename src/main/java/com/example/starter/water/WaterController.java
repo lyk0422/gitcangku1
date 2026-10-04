@@ -7,6 +7,8 @@ import com.example.starter.water.dto.Dtos.CreateWindowRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.PumpStationRequest;
+import com.example.starter.water.dto.Dtos.PumpStationResponse;
 import com.example.starter.water.dto.Dtos.SubmitAllocationRequest;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferRequest;
@@ -41,12 +43,26 @@ public class WaterController {
                 request.startUtc(), request.endUtc(), request.plannedVolume());
     }
 
-    /** 提交配水申请。 */
+    /** 提交配水申请（可附泵站流量曲线）。 */
     @PostMapping("/allocations")
     public AllocationResponse submitAllocation(@RequestBody SubmitAllocationRequest request,
                                                @RequestHeader("X-Actor-Id") String actor) {
         return service.submitAllocation(request.commandKey(), request.allocationKey(), request.windowId(),
-                request.userId(), request.amount(), actor);
+                request.userId(), request.amount(), actor, request.pumpStationKey(), request.curve());
+    }
+
+    /** 写入泵站配置（创建或更新，携带 expectedVersion）。 */
+    @PostMapping("/pump-stations")
+    public PumpStationResponse upsertPumpStation(@RequestBody PumpStationRequest request,
+                                                 @RequestHeader("X-Actor-Id") String actor) {
+        return service.upsertPumpStation(request.requestId(), request.stationKey(), request.maxFlow(),
+                request.maxRampPerMinute(), request.expectedVersion(), actor);
+    }
+
+    /** 查询泵站当前配置。 */
+    @GetMapping("/pump-stations/{stationKey}")
+    public PumpStationResponse getPumpStation(@PathVariable String stationKey) {
+        return service.getPumpStation(stationKey);
     }
 
     /** 批准配水申请。 */

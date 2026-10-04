@@ -3,9 +3,15 @@ package com.example.starter.water;
 import com.example.starter.water.WaterRepository.AllocationRow;
 import com.example.starter.water.WaterRepository.CommandRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
+import com.example.starter.water.WaterRepository.CurveNodeRow;
+import com.example.starter.water.WaterRepository.CurveRow;
+import com.example.starter.water.WaterRepository.PumpStationRow;
+import com.example.starter.water.WaterRepository.RequestRow;
 import com.example.starter.water.WaterRepository.TransferRow;
 import com.example.starter.water.WaterRepository.WindowRow;
 import com.example.starter.water.dto.Dtos.AllocationResponse;
+import com.example.starter.water.dto.Dtos.CurveNode;
+import com.example.starter.water.dto.Dtos.PumpStationResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
@@ -13,15 +19,19 @@ import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferResponse;
 import com.example.starter.water.dto.Dtos.WindowResponse;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
+import java.math.MathContext;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.TreeSet;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
@@ -42,6 +52,8 @@ public class WaterService {
     static final String STATUS_CANCELLED = "CANCELLED";
 
     private static final long NANOS_PER_SECOND = 1_000_000_000L;
+    private static final long NANOS_PER_MINUTE = 60_000_000_000L;
+    private static final MathContext MC = MathContext.DECIMAL128;
     private static final Pattern AMOUNT_PATTERN = Pattern.compile("\\d{1,16}(\\.\\d{1,3})?");
     private static final Pattern KEY_PATTERN = Pattern.compile("[\\w.\\-:]{1,128}");
 
@@ -84,9 +96,13 @@ public class WaterService {
         });
     }
 
-    /** 提交配水申请，申请人为 actor。 */
+    /**
+     * 提交配水申请，申请人为 actor。可附泵站流量曲线（2 至 20 个 UTC 整分钟节点，
+     * 首末节点等于窗口边界，梯形积分必须等于申请水量）；无曲线申请按原流程，不占用泵站容量。
+     */
     public AllocationResponse submitAllocation(String commandKey, String allocationKey, Long windowId,
-                                               String userId, String amount, String actor) {
+                                               String userId, String amount, String actor,
+                                               String pumpStationKey, List<CurveNode> curve) {
         requireKey("commandKey", commandKey);
         requireKey("allocationKey", allocationKey);
         requireKey("userId", userId);
@@ -95,14 +111,39 @@ public class WaterService {
             throw ApiException.badRequest("INVALID_ARGUMENT", "windowId 不能为空");
         }
         BigDecimal qty = parseAmount("amount", amount);
+        if (curve != null && !curve.isEmpty()) {
+            requireKey("pumpStationKey", pumpStationKey);
+        }
+        List<ParsedNode> nodes = parseCurve(curve, qty);
         String params = "ALLOCATION_SUBMIT|" + allocationKey + "|" + windowId + "|" + userId + "|"
-                + qty.toPlainString() + "|" + actor;
+                + qty.toPlainString() + "|" + actor + "|"
+                + (pumpStationKey == null ? "" : pumpStationKey) + "|" + curveParams(nodes);
         return runCommand("ALLOCATION_SUBMIT", commandKey, params, AllocationResponse.class, () -> {
             WindowRow window = repository.lockWindowById(windowId);
             if (window == null) {
                 throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + windowId);
             }
+            PumpStationRow station = null;
+            if (nodes != null) {
+                // 与曲线批准、取消、参数调整共用泵站行锁，按同一顺序串行判定
+                station = repository.lockPumpStationByKey(pumpStationKey);
+                if (station == null) {
+                    throw ApiException.notFound("STATION_NOT_FOUND", "泵站不存在: " + pumpStationKey);
+                }
+                if (nodes.get(0).minuteNanos() != window.startNanos()
+                        || nodes.get(nodes.size() - 1).minuteNanos() != window.endNanos()) {
+                    throw ApiException.badRequest("CURVE_WINDOW_MISMATCH",
+                            "曲线首末节点必须等于供水窗口边界");
+                }
+            }
             long id = repository.insertAllocation(allocationKey, windowId, userId, qty, actor, nowNanos());
+            if (nodes != null) {
+                long curveId = repository.insertCurve(id, station.id(), nodes.size(), nowNanos());
+                for (int i = 0; i < nodes.size(); i++) {
+                    ParsedNode node = nodes.get(i);
+                    repository.insertCurveNode(curveId, i, node.minuteNanos(), node.flow());
+                }
+            }
             return toAllocationResponse(repository.findAllocationByKey(allocationKey));
         });
     }
@@ -128,12 +169,31 @@ public class WaterService {
                 default -> {
                 }
             }
+            CurveRow curve = repository.findCurveByAllocationId(allocation.id());
+            PumpStationRow station = null;
+            if (curve != null) {
+                // 与曲线取消、参数调整共用泵站行锁，按提交顺序串行判定
+                station = repository.lockPumpStationById(curve.stationId());
+                if (station == null) {
+                    throw ApiException.notFound("STATION_NOT_FOUND", "泵站不存在: " + curve.stationId());
+                }
+                LimitViolation violation = findLimitViolation(station.maxFlow(), station.maxRamp(),
+                        station.id(), repository.listCurveNodes(curve.id()));
+                if (violation != null) {
+                    // 越限：申请仍待审且配额不扣
+                    throw ApiException.unprocessable(violation.code(), violation.message());
+                }
+            }
             BigDecimal available = availableTotal(window);
             BigDecimal approved = repository.sumApprovedAmount(window.id());
             if (approved.add(allocation.amount()).compareTo(available) > 0) {
                 throw ApiException.quotaExceeded("批准后将超过当前可用总量 " + fmt(available));
             }
             repository.updateAllocationStatus(allocation.id(), STATUS_APPROVED, nowNanos());
+            if (curve != null) {
+                // 批准冻结泵站配置版本，后续合法参数调整不改写本次判定
+                repository.setCurveApprovedVersion(curve.id(), station.version());
+            }
             return toAllocationResponse(repository.findAllocationByKey(allocationKey));
         });
     }
@@ -152,6 +212,11 @@ public class WaterService {
             lockWindowOf(allocation);
             // 窗口锁内重读申请，避免与转让/并发取消使用过期状态
             allocation = repository.lockAllocationByKey(allocationKey);
+            CurveRow curve = repository.findCurveByAllocationId(allocation.id());
+            if (curve != null) {
+                // 与曲线批准、参数调整共用泵站行锁；取消只去除该申请贡献
+                repository.lockPumpStationById(curve.stationId());
+            }
             if (!allocation.requester().equals(actor)) {
                 throw ApiException.conflict("NOT_OWNER", "只有申请人本人可以取消该申请");
             }
@@ -196,6 +261,11 @@ public class WaterService {
             // 窗口锁内再锁定源/目标申请行，得到最新状态与持有额度
             AllocationRow lockedSource = repository.lockAllocationByKey(sourceAllocationKey);
             AllocationRow lockedTarget = repository.lockAllocationByKey(targetAllocationKey);
+            if (repository.findCurveByAllocationId(lockedSource.id()) != null
+                    || repository.findCurveByAllocationId(lockedTarget.id()) != null) {
+                throw ApiException.conflict("CURVE_TRANSFER_UNSUPPORTED",
+                        "附流量曲线的申请不参与额度转让");
+            }
             if (!lockedSource.requester().equals(actor)) {
                 throw ApiException.conflict("NOT_OWNER", "只有转出申请人本人可以发起转让");
             }
@@ -377,9 +447,22 @@ public class WaterService {
     }
 
     private AllocationResponse toAllocationResponse(AllocationRow row) {
+        String stationKey = null;
+        List<CurveNode> curveNodes = null;
+        Long approvedVersion = null;
+        CurveRow curve = repository.findCurveByAllocationId(row.id());
+        if (curve != null) {
+            PumpStationRow station = repository.findPumpStationById(curve.stationId());
+            stationKey = station == null ? null : station.stationKey();
+            approvedVersion = curve.approvedVersion();
+            curveNodes = repository.listCurveNodes(curve.id()).stream()
+                    .map(n -> new CurveNode(toIso(n.minuteNanos()), fmt(n.flow())))
+                    .toList();
+        }
         return new AllocationResponse(row.allocationKey(), row.windowId(), row.userId(), fmt(row.amount()),
                 fmt(row.heldAmount()), row.requester(), row.status(),
-                toIso(row.createdNanos()), toIso(row.updatedNanos()));
+                toIso(row.createdNanos()), toIso(row.updatedNanos()),
+                stationKey, curveNodes, approvedVersion);
     }
 
     private TransferResponse toTransferResponse(TransferRow row) {
@@ -469,5 +552,253 @@ public class WaterService {
         } catch (Exception e) {
             throw new IllegalStateException("响应反序列化失败", e);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // 泵站配置与流量曲线
+    // ------------------------------------------------------------------
+
+    /** 解析后的曲线节点：UTC 整分钟纳秒时间戳 + 非负流量（立方米每分钟）。 */
+    private record ParsedNode(long minuteNanos, BigDecimal flow) {
+    }
+
+    /** 叠加越限结果：code 为 FLOW_LIMIT_EXCEEDED / RAMP_LIMIT_EXCEEDED。 */
+    private record LimitViolation(String code, String message) {
+    }
+
+    /**
+     * 写入泵站配置（创建或更新）。创建要求 expectedVersion 为 0，更新要求等于当前版本；
+     * 参数调整后已有已批准曲线叠加若越限则 409。判定前不舍入。
+     */
+    public PumpStationResponse upsertPumpStation(String requestId, String stationKey, String maxFlow,
+                                                 String maxRampPerMinute, Long expectedVersion, String actor) {
+        requireKey("requestId", requestId);
+        requireKey("stationKey", stationKey);
+        requireKey("X-Actor-Id", actor);
+        BigDecimal flow = parseAmount("maxFlow", maxFlow);
+        BigDecimal ramp = parseAmount("maxRampPerMinute", maxRampPerMinute);
+        if (expectedVersion == null || expectedVersion < 0) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "expectedVersion 必须为不小于 0 的整数");
+        }
+        ObjectNode identity = objectMapper.createObjectNode();
+        identity.put("operation", "PUMP_STATION_UPSERT");
+        identity.put("actor", actor);
+        identity.put("resource", stationKey);
+        ObjectNode paramsNode = identity.putObject("params");
+        paramsNode.put("maxFlow", flow.toPlainString());
+        paramsNode.put("maxRampPerMinute", ramp.toPlainString());
+        paramsNode.put("expectedVersion", expectedVersion);
+        return runRequest(requestId, identity.toString(), PumpStationResponse.class, () -> {
+            PumpStationRow station = repository.lockPumpStationByKey(stationKey);
+            if (station == null) {
+                if (expectedVersion != 0) {
+                    throw ApiException.conflict("VERSION_CONFLICT",
+                            "泵站不存在，创建时 expectedVersion 必须为 0");
+                }
+                long id = repository.insertPumpStation(stationKey, flow, ramp, nowNanos());
+                return toStationResponse(repository.findPumpStationById(id));
+            }
+            if (expectedVersion != station.version()) {
+                throw ApiException.conflict("VERSION_CONFLICT",
+                        "expectedVersion " + expectedVersion + " 与当前版本 " + station.version() + " 不一致");
+            }
+            LimitViolation violation = findLimitViolation(flow, ramp, station.id(), null);
+            if (violation != null) {
+                throw ApiException.conflict("STATION_PARAMS_CONFLICT",
+                        "参数调整后已有已批准曲线叠加越限: " + violation.message());
+            }
+            repository.updatePumpStation(station.id(), flow, ramp, station.version() + 1, nowNanos());
+            return toStationResponse(repository.findPumpStationById(station.id()));
+        });
+    }
+
+    /** 查询泵站当前配置。 */
+    public PumpStationResponse getPumpStation(String stationKey) {
+        PumpStationRow station = repository.findPumpStationByKey(stationKey);
+        if (station == null) {
+            throw ApiException.notFound("STATION_NOT_FOUND", "泵站不存在: " + stationKey);
+        }
+        return toStationResponse(station);
+    }
+
+    private PumpStationResponse toStationResponse(PumpStationRow row) {
+        return new PumpStationResponse(row.stationKey(), fmt(row.maxFlow()), fmt(row.maxRamp()),
+                row.version(), toIso(row.createdNanos()), toIso(row.updatedNanos()));
+    }
+
+    /**
+     * 解析并校验曲线结构：2 至 20 个 UTC 整分钟节点、时刻严格递增、流量非负且最多 3 位小数、
+     * 梯形积分等于申请水量（不等返回 422）。无曲线返回 null。
+     */
+    private List<ParsedNode> parseCurve(List<CurveNode> curve, BigDecimal amount) {
+        if (curve == null || curve.isEmpty()) {
+            return null;
+        }
+        if (curve.size() < 2 || curve.size() > 20) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "曲线节点数必须为 2 至 20 个");
+        }
+        List<ParsedNode> nodes = new ArrayList<>(curve.size());
+        long previous = Long.MIN_VALUE;
+        for (CurveNode node : curve) {
+            if (node == null) {
+                throw ApiException.badRequest("INVALID_ARGUMENT", "曲线节点不能为空");
+            }
+            long nanos = parseInstant("curve.timeUtc", node.timeUtc());
+            if (nanos % NANOS_PER_MINUTE != 0) {
+                throw ApiException.badRequest("INVALID_ARGUMENT",
+                        "曲线节点时刻必须为 UTC 整分钟: " + node.timeUtc());
+            }
+            if (nanos <= previous) {
+                throw ApiException.badRequest("INVALID_ARGUMENT", "曲线节点时刻必须严格递增");
+            }
+            previous = nanos;
+            nodes.add(new ParsedNode(nanos, parseFlow(node.flow())));
+        }
+        // 梯形积分（整分钟间隔，精确计算）：Σ (f_i + f_{i+1}) / 2 × Δt
+        BigDecimal integral = BigDecimal.ZERO;
+        for (int i = 0; i + 1 < nodes.size(); i++) {
+            long minutes = (nodes.get(i + 1).minuteNanos() - nodes.get(i).minuteNanos()) / NANOS_PER_MINUTE;
+            integral = integral.add(nodes.get(i).flow().add(nodes.get(i + 1).flow())
+                    .multiply(BigDecimal.valueOf(minutes))
+                    .divide(BigDecimal.valueOf(2)));
+        }
+        if (integral.compareTo(amount) != 0) {
+            throw ApiException.unprocessable("CURVE_INTEGRAL_MISMATCH",
+                    "曲线梯形积分 " + fmt(integral) + " 与申请水量 " + fmt(amount) + " 不一致");
+        }
+        return nodes;
+    }
+
+    /** 解析流量：十进制字符串，非负，最多 3 位小数。 */
+    private static BigDecimal parseFlow(String value) {
+        if (value == null || value.isBlank() || !AMOUNT_PATTERN.matcher(value.trim()).matches()) {
+            throw ApiException.badRequest("INVALID_ARGUMENT",
+                    "曲线流量必须为非负十进制字符串，最多 3 位小数: " + value);
+        }
+        return new BigDecimal(value.trim());
+    }
+
+    /** 曲线参数规范化串（纳秒:流量），用于幂等参数比较。 */
+    private static String curveParams(List<ParsedNode> nodes) {
+        if (nodes == null) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder();
+        for (ParsedNode node : nodes) {
+            sb.append(node.minuteNanos()).append(':').append(node.flow().toPlainString()).append(',');
+        }
+        return sb.toString();
+    }
+
+    /**
+     * 在泵站全部已批准曲线（可选叠加候选曲线）上检查流量与斜率上限。
+     * 叠加曲线为分段线性，在所有节点时刻并集处取得极值；斜率按相邻并集时刻精确比较
+     * |ΔF| ≤ maxRamp × Δt，判定前不舍入。越限返回违规信息，否则 null。
+     */
+    private LimitViolation findLimitViolation(BigDecimal maxFlow, BigDecimal maxRamp, long stationId,
+                                              List<CurveNodeRow> candidate) {
+        List<List<CurveNodeRow>> curves = new ArrayList<>();
+        for (CurveRow approved : repository.listApprovedCurves(stationId)) {
+            curves.add(repository.listCurveNodes(approved.id()));
+        }
+        if (candidate != null) {
+            curves.add(candidate);
+        }
+        TreeSet<Long> union = new TreeSet<>();
+        for (List<CurveNodeRow> nodes : curves) {
+            for (CurveNodeRow node : nodes) {
+                union.add(node.minuteNanos());
+            }
+        }
+        if (union.isEmpty()) {
+            return null;
+        }
+        List<Long> times = new ArrayList<>(union);
+        List<BigDecimal> totals = new ArrayList<>(times.size());
+        for (int i = 0; i < times.size(); i++) {
+            totals.add(BigDecimal.ZERO);
+        }
+        for (List<CurveNodeRow> nodes : curves) {
+            for (int i = 0; i < times.size(); i++) {
+                totals.set(i, totals.get(i).add(evalCurve(nodes, times.get(i))));
+            }
+        }
+        for (int i = 0; i < times.size(); i++) {
+            if (totals.get(i).compareTo(maxFlow) > 0) {
+                return new LimitViolation("FLOW_LIMIT_EXCEEDED",
+                        "时刻 " + toIso(times.get(i)) + " 叠加流量 " + fmt(totals.get(i))
+                                + " 超过最大流量 " + fmt(maxFlow));
+            }
+        }
+        for (int i = 0; i + 1 < times.size(); i++) {
+            long minutes = (times.get(i + 1) - times.get(i)) / NANOS_PER_MINUTE;
+            BigDecimal delta = totals.get(i + 1).subtract(totals.get(i)).abs();
+            BigDecimal limit = maxRamp.multiply(BigDecimal.valueOf(minutes));
+            if (delta.compareTo(limit) > 0) {
+                return new LimitViolation("RAMP_LIMIT_EXCEEDED",
+                        "时刻 " + toIso(times.get(i)) + " 至 " + toIso(times.get(i + 1))
+                                + " 叠加变化量 " + fmt(delta) + " 超过每分钟最大变化量 " + fmt(maxRamp)
+                                + " × " + minutes + " 分钟");
+            }
+        }
+        return null;
+    }
+
+    /** 曲线在指定时刻的取值：范围外为 0，节点处精确取值，节点间线性插值。 */
+    private static BigDecimal evalCurve(List<CurveNodeRow> nodes, long nanos) {
+        if (nanos < nodes.get(0).minuteNanos() || nanos > nodes.get(nodes.size() - 1).minuteNanos()) {
+            return BigDecimal.ZERO;
+        }
+        for (int i = 0; i < nodes.size(); i++) {
+            CurveNodeRow node = nodes.get(i);
+            if (node.minuteNanos() == nanos) {
+                return node.flow();
+            }
+            if (node.minuteNanos() > nanos) {
+                CurveNodeRow prev = nodes.get(i - 1);
+                BigDecimal span = BigDecimal.valueOf(node.minuteNanos() - prev.minuteNanos());
+                BigDecimal offset = BigDecimal.valueOf(nanos - prev.minuteNanos());
+                return prev.flow().add(node.flow().subtract(prev.flow()).multiply(offset)
+                        .divide(span, MC));
+            }
+        }
+        return BigDecimal.ZERO;
+    }
+
+    // ------------------------------------------------------------------
+    // 请求幂等框架（requestId，结构化身份）
+    // ------------------------------------------------------------------
+
+    /**
+     * 在单事务内执行幂等请求：先占位插入请求行，再执行业务并写回响应，业务与去重原子提交。
+     * 身份为结构化 JSON（操作、操作者、资源、全部参数与期望版本），同键同身份重放首次完整响应，
+     * 异参 409，失败回滚不占键；并发同键不泄露唯一键异常。
+     */
+    private <T> T runRequest(String requestKey, String identity, Class<T> type, Supplier<T> business) {
+        try {
+            return tx.execute(status -> {
+                RequestRow existing = repository.findRequest(requestKey);
+                if (existing != null) {
+                    return replayRequest(existing, identity, type);
+                }
+                repository.insertRequest(requestKey, identity, nowNanos());
+                T result = business.get();
+                repository.updateRequestResponse(requestKey, toJson(result));
+                return result;
+            });
+        } catch (DuplicateKeyException e) {
+            RequestRow committed = repository.findRequest(requestKey);
+            if (committed == null || committed.response() == null) {
+                throw ApiException.conflict("REQUEST_CONFLICT", "相同 requestId 的请求正在处理，请重试");
+            }
+            return replayRequest(committed, identity, type);
+        }
+    }
+
+    private <T> T replayRequest(RequestRow existing, String identity, Class<T> type) {
+        if (!existing.identity().equals(identity)) {
+            throw ApiException.conflict("REQUEST_KEY_REUSED", "相同 requestId 但身份或参数不同，拒绝重放");
+        }
+        return fromJson(existing.response(), type);
     }
 }

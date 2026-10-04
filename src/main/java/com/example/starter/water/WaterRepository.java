@@ -304,4 +304,189 @@ public class WaterRepository {
     public void updateCommandResponse(String commandKey, String response) {
         jdbc.update("UPDATE command_log SET response = ? WHERE command_key = ?", response, commandKey);
     }
+
+    // ------------------------------------------------------------------
+    // 泵站与流量曲线
+    // ------------------------------------------------------------------
+
+    /** 泵站配置行；version 随每次成功更新递增。 */
+    public record PumpStationRow(long id, String stationKey, BigDecimal maxFlow, BigDecimal maxRamp,
+                                 long version, long createdNanos, long updatedNanos) {
+    }
+
+    /** 流量曲线行；approvedVersion 为批准时冻结的泵站配置版本，未批准为 null。 */
+    public record CurveRow(long id, long allocationId, long stationId, int nodeCount,
+                           Long approvedVersion, long createdNanos) {
+    }
+
+    /** 曲线节点行；minuteNanos 为 UTC 整分钟纳秒时间戳，flow 单位立方米每分钟。 */
+    public record CurveNodeRow(long id, long curveId, int nodeIndex, long minuteNanos, BigDecimal flow) {
+    }
+
+    /** 请求幂等行；response 为 null 表示响应尚未写回（同事务内）。 */
+    public record RequestRow(String requestKey, String identity, String response, long createdNanos) {
+    }
+
+    private static final RowMapper<PumpStationRow> STATION_MAPPER = (rs, n) -> new PumpStationRow(
+            rs.getLong("id"), rs.getString("station_key"), rs.getBigDecimal("max_flow"),
+            rs.getBigDecimal("max_ramp"), rs.getLong("version"),
+            rs.getLong("created_nanos"), rs.getLong("updated_nanos"));
+
+    private static final String STATION_SELECT =
+            "SELECT id, station_key, max_flow, max_ramp, version, created_nanos, updated_nanos";
+
+    private static final RowMapper<CurveRow> CURVE_MAPPER = (rs, n) -> new CurveRow(
+            rs.getLong("id"), rs.getLong("allocation_id"), rs.getLong("station_id"),
+            rs.getInt("node_count"),
+            rs.getObject("approved_version") == null ? null : rs.getLong("approved_version"),
+            rs.getLong("created_nanos"));
+
+    private static final RowMapper<CurveNodeRow> CURVE_NODE_MAPPER = (rs, n) -> new CurveNodeRow(
+            rs.getLong("id"), rs.getLong("curve_id"), rs.getInt("node_index"),
+            rs.getLong("minute_nanos"), rs.getBigDecimal("flow"));
+
+    private static final RowMapper<RequestRow> REQUEST_MAPPER = (rs, n) -> new RequestRow(
+            rs.getString("request_key"), rs.getString("identity"), rs.getString("response"),
+            rs.getLong("created_nanos"));
+
+    /** 插入泵站配置（初始版本 1）并返回主键。 */
+    public long insertPumpStation(String stationKey, BigDecimal maxFlow, BigDecimal maxRamp, long nowNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO pump_station (station_key, max_flow, max_ramp, version, created_nanos, updated_nanos)"
+                            + " VALUES (?, ?, ?, 1, ?, ?)", Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, stationKey);
+            ps.setBigDecimal(2, maxFlow);
+            ps.setBigDecimal(3, maxRamp);
+            ps.setLong(4, nowNanos);
+            ps.setLong(5, nowNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 按业务键查询泵站，不存在返回 null。 */
+    public PumpStationRow findPumpStationByKey(String stationKey) {
+        try {
+            return jdbc.queryForObject(STATION_SELECT + " FROM pump_station WHERE station_key = ?",
+                    STATION_MAPPER, stationKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 按主键查询泵站，不存在返回 null。 */
+    public PumpStationRow findPumpStationById(long id) {
+        try {
+            return jdbc.queryForObject(STATION_SELECT + " FROM pump_station WHERE id = ?",
+                    STATION_MAPPER, id);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 按业务键锁定泵站行（FOR UPDATE），串行化同泵站的曲线批准、取消与参数调整。 */
+    public PumpStationRow lockPumpStationByKey(String stationKey) {
+        try {
+            return jdbc.queryForObject(STATION_SELECT + " FROM pump_station WHERE station_key = ? FOR UPDATE",
+                    STATION_MAPPER, stationKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 按主键锁定泵站行（FOR UPDATE），不存在返回 null。 */
+    public PumpStationRow lockPumpStationById(long id) {
+        try {
+            return jdbc.queryForObject(STATION_SELECT + " FROM pump_station WHERE id = ? FOR UPDATE",
+                    STATION_MAPPER, id);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 更新泵站参数并递增版本。 */
+    public void updatePumpStation(long id, BigDecimal maxFlow, BigDecimal maxRamp, long newVersion,
+                                  long updatedNanos) {
+        jdbc.update("UPDATE pump_station SET max_flow = ?, max_ramp = ?, version = ?, updated_nanos = ?"
+                + " WHERE id = ?", maxFlow, maxRamp, newVersion, updatedNanos, id);
+    }
+
+    /** 插入流量曲线（未批准）并返回主键。 */
+    public long insertCurve(long allocationId, long stationId, int nodeCount, long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO allocation_curve (allocation_id, station_id, node_count, approved_version, created_nanos)"
+                            + " VALUES (?, ?, ?, NULL, ?)", Statement.RETURN_GENERATED_KEYS);
+            ps.setLong(1, allocationId);
+            ps.setLong(2, stationId);
+            ps.setInt(3, nodeCount);
+            ps.setLong(4, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 插入曲线节点。 */
+    public void insertCurveNode(long curveId, int nodeIndex, long minuteNanos, BigDecimal flow) {
+        jdbc.update("INSERT INTO allocation_curve_node (curve_id, node_index, minute_nanos, flow)"
+                + " VALUES (?, ?, ?, ?)", curveId, nodeIndex, minuteNanos, flow);
+    }
+
+    /** 按申请 ID 查询曲线，无曲线返回 null。 */
+    public CurveRow findCurveByAllocationId(long allocationId) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT id, allocation_id, station_id, node_count, approved_version, created_nanos"
+                            + " FROM allocation_curve WHERE allocation_id = ?", CURVE_MAPPER, allocationId);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 曲线全部节点，按序号升序（时刻严格递增）。 */
+    public List<CurveNodeRow> listCurveNodes(long curveId) {
+        return jdbc.query(
+                "SELECT id, curve_id, node_index, minute_nanos, flow FROM allocation_curve_node"
+                        + " WHERE curve_id = ? ORDER BY node_index", CURVE_NODE_MAPPER, curveId);
+    }
+
+    /** 泵站当前所有已批准申请的曲线，按主键升序。 */
+    public List<CurveRow> listApprovedCurves(long stationId) {
+        return jdbc.query(
+                "SELECT c.id, c.allocation_id, c.station_id, c.node_count, c.approved_version, c.created_nanos"
+                        + " FROM allocation_curve c JOIN allocation a ON a.id = c.allocation_id"
+                        + " WHERE c.station_id = ? AND a.status = 'APPROVED' ORDER BY c.id",
+                CURVE_MAPPER, stationId);
+    }
+
+    /** 批准时冻结泵站配置版本。 */
+    public void setCurveApprovedVersion(long curveId, long approvedVersion) {
+        jdbc.update("UPDATE allocation_curve SET approved_version = ? WHERE id = ?",
+                approvedVersion, curveId);
+    }
+
+    /** 按幂等键查询请求，不存在返回 null。 */
+    public RequestRow findRequest(String requestKey) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT request_key, identity, response, created_nanos FROM request_log WHERE request_key = ?",
+                    REQUEST_MAPPER, requestKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 先占位插入请求（响应为空），同事务内业务成功后写回响应。 */
+    public void insertRequest(String requestKey, String identity, long createdNanos) {
+        jdbc.update("INSERT INTO request_log (request_key, identity, response, created_nanos)"
+                + " VALUES (?, ?, NULL, ?)", requestKey, identity, createdNanos);
+    }
+
+    /** 写回请求首次成功响应。 */
+    public void updateRequestResponse(String requestKey, String response) {
+        jdbc.update("UPDATE request_log SET response = ? WHERE request_key = ?", response, requestKey);
+    }
 }

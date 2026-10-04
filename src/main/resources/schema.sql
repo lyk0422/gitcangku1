@@ -56,3 +56,44 @@ CREATE TABLE IF NOT EXISTS command_log (
     response MEDIUMTEXT NULL COMMENT '首次成功响应 JSON；命令事务提交前写入',
     created_nanos BIGINT NOT NULL COMMENT '创建时间，UTC 纳秒时间戳'
 ) COMMENT='命令幂等日志，同键同参重放返回首次结果，同键改参返回 409';
+
+-- 泵站瞬时流量与变化速度约束 schema。流量单位立方米每分钟，DECIMAL(19,3) 精确到 0.001；曲线节点时刻为 UTC 整分钟纳秒时间戳。
+CREATE TABLE IF NOT EXISTS pump_station (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '泵站主键',
+    station_key VARCHAR(128) NOT NULL COMMENT '泵站业务键，全局唯一',
+    max_flow DECIMAL(19,3) NOT NULL COMMENT '最大瞬时流量，单位立方米每分钟，大于 0，最多 3 位小数',
+    max_ramp DECIMAL(19,3) NOT NULL COMMENT '每分钟最大变化量，单位立方米每分钟，大于 0，最多 3 位小数',
+    version BIGINT NOT NULL COMMENT '配置版本，创建为 1，每次成功更新递增；写入须携带 expectedVersion',
+    created_nanos BIGINT NOT NULL COMMENT '创建时间，UTC 纳秒时间戳',
+    updated_nanos BIGINT NOT NULL COMMENT '最近配置变更时间，UTC 纳秒时间戳',
+    CONSTRAINT uk_pump_station_key UNIQUE (station_key)
+) COMMENT='泵站容量配置，参数判定前不舍入，批准时冻结当时版本';
+
+CREATE TABLE IF NOT EXISTS allocation_curve (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '流量曲线主键',
+    allocation_id BIGINT NOT NULL COMMENT '所属配水申请 ID，一申请至多一条曲线',
+    station_id BIGINT NOT NULL COMMENT '所属泵站 ID',
+    node_count INT NOT NULL COMMENT '节点数，2 至 20',
+    approved_version BIGINT NULL COMMENT '批准时冻结的泵站配置版本；未批准为 NULL',
+    created_nanos BIGINT NOT NULL COMMENT '创建时间，UTC 纳秒时间戳',
+    CONSTRAINT uk_curve_allocation UNIQUE (allocation_id),
+    CONSTRAINT fk_curve_allocation FOREIGN KEY (allocation_id) REFERENCES allocation (id),
+    CONSTRAINT fk_curve_station FOREIGN KEY (station_id) REFERENCES pump_station (id)
+) COMMENT='配水申请流量曲线，随申请创建不可改，取消仅去除该申请贡献';
+
+CREATE TABLE IF NOT EXISTS allocation_curve_node (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '曲线节点主键',
+    curve_id BIGINT NOT NULL COMMENT '所属曲线 ID',
+    node_index INT NOT NULL COMMENT '节点序号，从 0 递增，时刻严格递增',
+    minute_nanos BIGINT NOT NULL COMMENT '节点时刻，UTC 整分钟纳秒时间戳；首末节点等于供水窗口边界',
+    flow DECIMAL(19,3) NOT NULL COMMENT '瞬时流量，单位立方米每分钟，非负，最多 3 位小数',
+    CONSTRAINT uk_curve_node UNIQUE (curve_id, node_index),
+    CONSTRAINT fk_node_curve FOREIGN KEY (curve_id) REFERENCES allocation_curve (id)
+) COMMENT='曲线节点，相邻节点线性变化，梯形积分等于申请水量';
+
+CREATE TABLE IF NOT EXISTS request_log (
+    request_key VARCHAR(128) PRIMARY KEY COMMENT '请求幂等键（requestId）',
+    identity MEDIUMTEXT NOT NULL COMMENT '结构化身份 JSON：操作、操作者、资源、全部参数与期望版本，避免分隔符碰撞',
+    response MEDIUMTEXT NULL COMMENT '首次成功响应 JSON；请求事务提交前写入',
+    created_nanos BIGINT NOT NULL COMMENT '创建时间，UTC 纳秒时间戳'
+) COMMENT='请求幂等日志，同键同身份重放返回首次完整响应，异参 409，失败不占键';
