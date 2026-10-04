@@ -119,4 +119,56 @@ class ResultCalculatorTest {
         assertThat(entries.get(1).penaltyMs()).isEqualTo(50L);
         assertThat(entries.get(1).totalTimeMs()).isEqualTo(250L);
     }
+
+    /** 带已执行抵扣量的处罚视图。 */
+    private record ServedPenalty(
+            String bib,
+            PenaltyType type,
+            Long amountMs,
+            boolean revoked,
+            long servedMs
+    ) implements ResultCalculator.PenaltyView {
+    }
+
+    @Test
+    void 已确认执行抵扣从生效加时中扣减() {
+        List<Runner> runners = List.of(new Runner("a", 100_000L));
+        List<ServedPenalty> penalties = List.of(
+                new ServedPenalty("a", PenaltyType.ADD_TIME, 10_000L, false, 6_000L));
+
+        List<ResultEntry> entries = ResultCalculator.compute(runners, penalties);
+
+        ResultEntry entry = entries.get(0);
+        // 原罚时保持10000，抵扣6000，净成绩104000
+        assertThat(entry.penaltyMs()).isEqualTo(10_000L);
+        assertThat(entry.servedMs()).isEqualTo(6_000L);
+        assertThat(entry.totalTimeMs()).isEqualTo(104_000L);
+    }
+
+    @Test
+    void 抵扣超过处罚量时净处罚不为负() {
+        List<Runner> runners = List.of(new Runner("a", 100_000L));
+        List<ServedPenalty> penalties = List.of(
+                new ServedPenalty("a", PenaltyType.ADD_TIME, 10_000L, false, 12_000L));
+
+        List<ResultEntry> entries = ResultCalculator.compute(runners, penalties);
+
+        ResultEntry entry = entries.get(0);
+        assertThat(entry.servedMs()).isEqualTo(10_000L);
+        assertThat(entry.totalTimeMs()).isEqualTo(100_000L);
+    }
+
+    @Test
+    void 已撤销处罚的抵扣随处罚一并失效() {
+        List<Runner> runners = List.of(new Runner("a", 100_000L));
+        List<ServedPenalty> penalties = List.of(
+                new ServedPenalty("a", PenaltyType.ADD_TIME, 10_000L, true, 6_000L));
+
+        List<ResultEntry> entries = ResultCalculator.compute(runners, penalties);
+
+        ResultEntry entry = entries.get(0);
+        assertThat(entry.penaltyMs()).isZero();
+        assertThat(entry.servedMs()).isZero();
+        assertThat(entry.totalTimeMs()).isEqualTo(100_000L);
+    }
 }

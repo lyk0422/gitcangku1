@@ -62,6 +62,31 @@ public class RaceController {
         return toResponse(raceService.revokePenalty(raceId, penaltyId, request));
     }
 
+    /** 登记时间处罚的赛中停留执行凭证。 */
+    @PostMapping("/{raceId}/penalties/{penaltyId}/executions")
+    public ResponseEntity<Object> registerExecution(
+            @PathVariable String raceId,
+            @PathVariable String penaltyId,
+            @Valid @RequestBody RegisterExecutionRequest request) {
+        return toResponse(raceService.registerExecution(raceId, penaltyId, request));
+    }
+
+    /** 由另一名裁判确认执行凭证并产生抵扣。 */
+    @PostMapping("/{raceId}/penalties/{penaltyId}/executions/{voucherId}/confirmation")
+    public ResponseEntity<Object> confirmExecution(
+            @PathVariable String raceId,
+            @PathVariable String penaltyId,
+            @PathVariable String voucherId,
+            @Valid @RequestBody ConfirmExecutionRequest request) {
+        return toResponse(raceService.confirmExecution(raceId, penaltyId, voucherId, request));
+    }
+
+    /** 查询赛事全部处罚（含原罚时与已执行抵扣量）。 */
+    @GetMapping("/{raceId}/penalties")
+    public java.util.List<PenaltyResponse> getPenalties(@PathVariable String raceId) {
+        return raceService.getPenalties(raceId);
+    }
+
     /** 一次性配置赛事检查点。 */
     @PostMapping("/{raceId}/checkpoints")
     public ResponseEntity<Object> configureCheckpoints(

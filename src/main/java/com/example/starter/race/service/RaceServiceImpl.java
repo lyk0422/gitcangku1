@@ -4,9 +4,12 @@ import com.example.starter.race.api.AddPenaltyRequest;
 import com.example.starter.race.api.CheckpointResponse;
 import com.example.starter.race.api.CheckpointsConfigResponse;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
+import com.example.starter.race.api.ConfirmExecutionRequest;
 import com.example.starter.race.api.CreateRaceRequest;
 import com.example.starter.race.api.MissingCheckpointsResponse;
+import com.example.starter.race.api.PenaltyResponse;
 import com.example.starter.race.api.RaceResponse;
+import com.example.starter.race.api.RegisterExecutionRequest;
 import com.example.starter.race.api.RegisterRunnerRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
@@ -16,12 +19,14 @@ import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.api.SubmitTimingRequest;
 import com.example.starter.race.domain.CheckpointRules;
+import com.example.starter.race.domain.ExecutionStatus;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
+import com.example.starter.race.persistence.ExecutionRow;
 import com.example.starter.race.persistence.IdempotencyRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
@@ -195,7 +200,7 @@ public class RaceServiceImpl implements RaceService {
                         throw new ConflictException("处罚ID已存在: " + request.penaltyId());
                     }
                     PenaltyRow penalty = repository.findPenalty(request.penaltyId()).orElseThrow();
-                    return ServiceResult.created(ResponseMapper.toPenaltyResponse(penalty));
+                    return ServiceResult.created(ResponseMapper.toPenaltyResponse(penalty, 0L));
                 });
     }
 
@@ -225,7 +230,9 @@ public class RaceServiceImpl implements RaceService {
                         throw new ConflictException("处罚已撤销: " + penaltyId);
                     }
                     PenaltyRow refreshed = repository.findPenalty(penaltyId).orElseThrow();
-                    return ServiceResult.ok(ResponseMapper.toPenaltyResponse(refreshed));
+                    long servedMs = confirmedCreditsByPenalty(raceId)
+                            .getOrDefault(penaltyId, 0L);
+                    return ServiceResult.ok(ResponseMapper.toPenaltyResponse(refreshed, servedMs));
                 });
     }
 
@@ -359,8 +366,11 @@ public class RaceServiceImpl implements RaceService {
                     List<PenaltyRow> penalties = repository.findPenalties(raceId);
                     List<CheckpointRow> checkpoints = repository.findCheckpoints(raceId);
                     List<CheckpointTimingRow> timings = repository.findAllTimings(raceId);
+                    // 封榜冻结处罚、已确认执行时长与抵扣值：净成绩=原计时+各有效罚时的剩余量。
+                    List<ResultCalculator.PenaltyView> penaltyViews = withServedAmounts(
+                            penalties, confirmedCreditsByPenalty(raceId));
                     List<ResultEntry> entries =
-                            ResultCalculator.compute(runners, penalties, checkpoints, timings);
+                            ResultCalculator.compute(runners, penaltyViews, checkpoints, timings);
 
                     int newVersion = request.expectedVersion() + 1;
                     int updated = repository.sealIfOpenAtVersion(
@@ -379,6 +389,7 @@ public class RaceServiceImpl implements RaceService {
                                 entry.status(),
                                 entry.finishTimeMs(),
                                 entry.penaltyMs(),
+                                entry.servedMs(),
                                 entry.totalTimeMs(),
                                 order,
                                 entry.checkpointCount(),
@@ -407,10 +418,11 @@ public class RaceServiceImpl implements RaceService {
                             "赛事已封榜但缺少快照: " + raceId));
             return ResponseMapper.snapshotStanding(snapshot);
         }
+        List<PenaltyRow> penalties = repository.findPenalties(raceId);
         return ResponseMapper.liveStanding(
                 race,
                 repository.findRunners(raceId),
-                repository.findPenalties(raceId),
+                withServedAmounts(penalties, confirmedCreditsByPenalty(raceId)),
                 repository.findCheckpoints(raceId),
                 repository.findAllTimings(raceId));
     }
@@ -496,6 +508,118 @@ public class RaceServiceImpl implements RaceService {
         SnapshotRow snapshot = repository.findSnapshot(raceId)
                 .orElseThrow(() -> new NotFoundException("赛事尚未封榜: " + raceId));
         return ResponseMapper.snapshotStanding(snapshot);
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult registerExecution(
+            String raceId, String penaltyId, RegisterExecutionRequest request) {
+        return withIdempotency(request.requestId(), "REGISTER_EXECUTION",
+                orderedParams(
+                        "raceId", raceId,
+                        "penaltyId", penaltyId,
+                        "voucherId", request.voucherId(),
+                        "bib", request.bib(),
+                        "startUtcMs", request.startUtcMs(),
+                        "endUtcMs", request.endUtcMs(),
+                        "referee", request.referee(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    PenaltyRow penalty = requireRacePenalty(raceId, penaltyId);
+                    if (penalty.type() != PenaltyType.ADD_TIME) {
+                        throw new UnprocessableEntityException(
+                                "取消资格处罚不能登记执行凭证: " + penaltyId);
+                    }
+                    if (!penalty.bib().equals(request.bib())) {
+                        throw new UnprocessableEntityException(
+                                "凭证选手与处罚对象不一致: " + request.bib());
+                    }
+                    validateExecutionInterval(request.startUtcMs(), request.endUtcMs());
+                    long now = clock.millis();
+                    bumpVersion(race, request.expectedVersion());
+                    ExecutionRow row = new ExecutionRow(
+                            request.voucherId(), raceId, request.bib(), penaltyId,
+                            request.startUtcMs(), request.endUtcMs(), request.referee(),
+                            ExecutionStatus.PENDING, null, null, 0L, now);
+                    try {
+                        repository.insertExecution(row);
+                    } catch (DuplicateKeyException ex) {
+                        throw new ConflictException("凭证ID已存在: " + request.voucherId());
+                    }
+                    ExecutionRow saved =
+                            repository.findExecution(request.voucherId()).orElseThrow();
+                    return ServiceResult.created(ResponseMapper.toExecutionResponse(saved));
+                });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult confirmExecution(
+            String raceId, String penaltyId, String voucherId, ConfirmExecutionRequest request) {
+        return withIdempotency(request.requestId(), "CONFIRM_EXECUTION",
+                orderedParams(
+                        "raceId", raceId,
+                        "penaltyId", penaltyId,
+                        "voucherId", voucherId,
+                        "confirmedBy", request.confirmedBy(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    PenaltyRow penalty = requireRacePenalty(raceId, penaltyId);
+                    ExecutionRow voucher = repository.findExecution(voucherId)
+                            .orElseThrow(() -> new NotFoundException("执行凭证不存在: " + voucherId));
+                    if (!voucher.penaltyId().equals(penaltyId)) {
+                        throw new NotFoundException("凭证不属于该处罚: " + voucherId);
+                    }
+                    if (penalty.revoked()) {
+                        throw new ConflictException(
+                                "处罚已撤销，未确认凭证不能确认: " + penaltyId);
+                    }
+                    if (voucher.status() == ExecutionStatus.CONFIRMED) {
+                        throw new ConflictException("凭证已确认: " + voucherId);
+                    }
+                    if (request.confirmedBy().equals(voucher.referee())) {
+                        throw new UnprocessableEntityException(
+                                "确认裁判必须与登记裁判不同: " + request.confirmedBy());
+                    }
+                    // 同选手已确认停留区间不得重叠（左闭右开，相邻合法）。
+                    List<ExecutionRow> confirmed =
+                            repository.findConfirmedExecutionsForRace(raceId);
+                    for (ExecutionRow other : confirmed) {
+                        if (!other.bib().equals(voucher.bib())
+                                || other.voucherId().equals(voucherId)) {
+                            continue;
+                        }
+                        if (other.startUtcMs() < voucher.endUtcMs()
+                                && voucher.startUtcMs() < other.endUtcMs()) {
+                            throw new ConflictException(
+                                    "停留区间与已确认凭证重叠: " + other.voucherId());
+                        }
+                    }
+                    long credited = creditedForConfirmation(penalty, voucher, confirmed);
+                    long now = clock.millis();
+                    bumpVersion(race, request.expectedVersion());
+                    int updated = repository.confirmExecutionIfPending(
+                            voucherId, request.confirmedBy(), now, credited);
+                    if (updated == 0) {
+                        throw new ConflictException("凭证已确认: " + voucherId);
+                    }
+                    ExecutionRow refreshed = repository.findExecution(voucherId).orElseThrow();
+                    return ServiceResult.ok(ResponseMapper.toExecutionResponse(refreshed));
+                });
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<PenaltyResponse> getPenalties(String raceId) {
+        repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        Map<String, Long> servedByPenalty = confirmedCreditsByPenalty(raceId);
+        return repository.findPenalties(raceId).stream()
+                .map(penalty -> ResponseMapper.toPenaltyResponse(
+                        penalty, servedByPenalty.getOrDefault(penalty.penaltyId(), 0L)))
+                .toList();
     }
 
     /**
@@ -723,5 +847,80 @@ public class RaceServiceImpl implements RaceService {
         String message = cause.getMessage();
         return message != null
                 && message.toUpperCase(java.util.Locale.ROOT).contains(constraintName.toUpperCase(java.util.Locale.ROOT));
+    }
+
+    /** 按全局处罚ID定位处罚并要求属于该赛事，否则404。 */
+    private PenaltyRow requireRacePenalty(String raceId, String penaltyId) {
+        PenaltyRow penalty = repository.findPenalty(penaltyId)
+                .orElseThrow(() -> new NotFoundException("处罚不存在: " + penaltyId));
+        if (!penalty.raceId().equals(raceId)) {
+            throw new NotFoundException("处罚不属于该赛事: " + penaltyId);
+        }
+        return penalty;
+    }
+
+    /** 校验停留区间：左闭右开，长度=endUtcMs-startUtcMs 为正的整数毫秒。 */
+    private static void validateExecutionInterval(long startUtcMs, long endUtcMs) {
+        if (startUtcMs < 0 || endUtcMs <= startUtcMs) {
+            throw new UnprocessableEntityException(
+                    "无效停留区间: 必须满足 0 <= startUtcMs < endUtcMs");
+        }
+    }
+
+    /** 汇总赛事内每条处罚已确认凭证的抵扣毫秒数（penaltyId -> creditedMs 合计）。 */
+    private Map<String, Long> confirmedCreditsByPenalty(String raceId) {
+        Map<String, Long> servedByPenalty = new java.util.HashMap<>();
+        for (ExecutionRow row : repository.findConfirmedExecutionsForRace(raceId)) {
+            servedByPenalty.merge(row.penaltyId(), row.creditedMs(), Long::sum);
+        }
+        return servedByPenalty;
+    }
+
+    /** 把持久层处罚包装为带已执行抵扣量的计算视图。 */
+    private static List<ResultCalculator.PenaltyView> withServedAmounts(
+            List<PenaltyRow> penalties, Map<String, Long> servedByPenalty) {
+        return penalties.stream()
+                .map(penalty -> (ResultCalculator.PenaltyView) new PenaltyWithServed(
+                        penalty, servedByPenalty.getOrDefault(penalty.penaltyId(), 0L)))
+                .toList();
+    }
+
+    /**
+     * 计算本次确认实际抵扣的毫秒数：区间长度与该处罚剩余未执行量的较小值，
+     * 剩余量为0时抵扣为0，不产生负处罚。
+     */
+    private static long creditedForConfirmation(
+            PenaltyRow penalty, ExecutionRow voucher, List<ExecutionRow> confirmed) {
+        long alreadyCredited = confirmed.stream()
+                .filter(row -> row.penaltyId().equals(penalty.penaltyId()))
+                .mapToLong(ExecutionRow::creditedMs)
+                .sum();
+        long remaining = penalty.amountMs() - alreadyCredited;
+        long length = voucher.endUtcMs() - voucher.startUtcMs();
+        return Math.max(0L, Math.min(length, remaining));
+    }
+
+    /** 带已执行抵扣量的处罚视图：委托持久层行记录并附加该处罚已确认抵扣合计。 */
+    private record PenaltyWithServed(PenaltyRow row, long servedMs)
+            implements ResultCalculator.PenaltyView {
+        @Override
+        public String bib() {
+            return row.bib();
+        }
+
+        @Override
+        public PenaltyType type() {
+            return row.type();
+        }
+
+        @Override
+        public Long amountMs() {
+            return row.amountMs();
+        }
+
+        @Override
+        public boolean revoked() {
+            return row.revoked();
+        }
     }
 }

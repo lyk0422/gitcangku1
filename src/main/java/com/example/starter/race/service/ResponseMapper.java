@@ -2,6 +2,7 @@ package com.example.starter.race.service;
 
 import com.example.starter.race.api.CheckpointPassResponse;
 import com.example.starter.race.api.CheckpointTimingResponse;
+import com.example.starter.race.api.ExecutionResponse;
 import com.example.starter.race.api.PenaltyResponse;
 import com.example.starter.race.api.ResultEntryResponse;
 import com.example.starter.race.api.RunnerResponse;
@@ -12,6 +13,7 @@ import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
+import com.example.starter.race.persistence.ExecutionRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
 import com.example.starter.race.persistence.RunnerRow;
@@ -35,9 +37,17 @@ final class ResponseMapper {
         return new RunnerResponse(row.bib(), row.finishTimeMs(), row.createdAt(), row.updatedAt());
     }
 
-    static PenaltyResponse toPenaltyResponse(PenaltyRow row) {
+    static PenaltyResponse toPenaltyResponse(PenaltyRow row, long servedMs) {
         return new PenaltyResponse(row.penaltyId(), row.bib(), row.type(), row.amountMs(),
-                row.revoked(), row.createdAt(), row.revokedAt());
+                servedMs, row.revoked(), row.createdAt(), row.revokedAt());
+    }
+
+    static ExecutionResponse toExecutionResponse(ExecutionRow row) {
+        return new ExecutionResponse(
+                row.voucherId(), row.penaltyId(), row.bib(),
+                row.startUtcMs(), row.endUtcMs(), row.referee(),
+                row.status(), row.confirmedBy(), row.confirmedAt(),
+                row.creditedMs(), row.createdAt());
     }
 
     static CheckpointTimingResponse toTimingResponse(CheckpointTimingRow row) {
@@ -49,7 +59,7 @@ final class ResponseMapper {
     static StandingResponse liveStanding(
             RaceRow race,
             List<RunnerRow> runners,
-            List<PenaltyRow> penalties,
+            List<? extends ResultCalculator.PenaltyView> penalties,
             List<CheckpointRow> checkpoints,
             List<CheckpointTimingRow> timings) {
         List<ResultEntry> entries = ResultCalculator.compute(
@@ -78,6 +88,7 @@ final class ResponseMapper {
                 entry.status(),
                 entry.finishTimeMs(),
                 entry.penaltyMs(),
+                entry.servedMs(),
                 entry.totalTimeMs(),
                 entry.checkpointCount(),
                 entry.coveredCheckpointCount(),
@@ -91,6 +102,7 @@ final class ResponseMapper {
                 entry.status(),
                 entry.finishTimeMs(),
                 entry.penaltyMs(),
+                entry.servedMs(),
                 entry.totalTimeMs(),
                 entry.checkpointCount(),
                 entry.coveredCheckpointCount(),

@@ -14,7 +14,8 @@ import java.util.Set;
  *
  * <p>规则：
  * <ul>
- *   <li>总耗时=原始完赛耗时+全部未撤销 ADD_TIME 加时之和；</li>
+ *   <li>总耗时=原始完赛耗时+全部未撤销 ADD_TIME 加时之和-已确认执行凭证抵扣之和；
+ *       每条处罚的抵扣不超过其加时量，净处罚不为负；已撤销处罚的抵扣随处罚一并失效；</li>
  *   <li>存在未撤销 DISQUALIFY 处罚时状态 DISQUALIFIED，不排名，全部撤销后恢复计算；</li>
  *   <li>原始耗时缺失（null）时状态 UNTIMED，不排名；</li>
  *   <li>赛事配置了检查点时：已有完赛耗时但未覆盖全部检查点的选手状态
@@ -83,6 +84,8 @@ public final class ResultCalculator {
                 aggregate.disqualified = true;
             } else if (penalty.type() == PenaltyType.ADD_TIME && penalty.amountMs() != null) {
                 aggregate.penaltyMs += penalty.amountMs();
+                // 抵扣不超过该处罚的加时量：超出部分不产生负处罚。
+                aggregate.servedMs += Math.min(penalty.servedMs(), penalty.amountMs());
             }
         }
 
@@ -100,7 +103,8 @@ public final class ResultCalculator {
                 others.add(aggregate);
             } else {
                 aggregate.status = EntryStatus.RANKED;
-                aggregate.totalTimeMs = aggregate.finishTimeMs + aggregate.penaltyMs;
+                aggregate.totalTimeMs =
+                        aggregate.finishTimeMs + aggregate.penaltyMs - aggregate.servedMs;
                 ranked.add(aggregate);
             }
         }
@@ -150,6 +154,11 @@ public final class ResultCalculator {
         Long amountMs();
 
         boolean revoked();
+
+        /** 该处罚已确认执行凭证的抵扣合计毫秒数；无执行凭证为 0。 */
+        default long servedMs() {
+            return 0L;
+        }
     }
 
     /** 单选手聚合中间态。 */
@@ -159,6 +168,7 @@ public final class ResultCalculator {
         private final List<CheckpointView> checkpoints;
         private final Set<String> coveredCodes = new HashSet<>();
         private long penaltyMs;
+        private long servedMs;
         private boolean disqualified;
         private EntryStatus status;
         private int rank;
@@ -187,6 +197,7 @@ public final class ResultCalculator {
                     status,
                     finishTimeMs,
                     penaltyMs,
+                    servedMs,
                     status == EntryStatus.RANKED ? totalTimeMs : null,
                     checkpoints.size(),
                     coveredCodes.size(),

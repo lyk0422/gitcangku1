@@ -50,7 +50,8 @@ CREATE TABLE IF NOT EXISTS result_snapshot_entry (
     rank_no INT COMMENT '名次（从1开始，并列同名次并跳号，如1、1、3）；未计时/漏点/取消资格为NULL',
     status VARCHAR(24) NOT NULL COMMENT '成绩状态：RANKED-参与排名，UNTIMED-计时缺失，MISSING_CHECKPOINT-有完赛但未覆盖全部检查点，DISQUALIFIED-取消资格',
     finish_time_ms BIGINT COMMENT '原始完赛耗时（毫秒）；计时缺失为NULL',
-    penalty_ms BIGINT NOT NULL COMMENT '生效（未撤销）加时处罚合计毫秒数，无加时为0',
+    penalty_ms BIGINT NOT NULL COMMENT '生效（未撤销）加时处罚合计毫秒数（原罚时，不扣减执行量），无加时为0',
+    served_ms BIGINT NOT NULL DEFAULT 0 COMMENT '封榜时已确认执行凭证抵扣合计毫秒数；无执行为0',
     total_time_ms BIGINT COMMENT '总耗时=原始完赛耗时+生效加时（毫秒）；未排名时为NULL',
     checkpoint_count INT NOT NULL DEFAULT 0 COMMENT '赛事检查点总数；未配置检查点为0',
     covered_checkpoint_count INT NOT NULL DEFAULT 0 COMMENT '封榜时该选手已覆盖检查点数量；缺失检查点由result_snapshot_checkpoint中elapsed_millis为NULL的行固化',
@@ -97,10 +98,32 @@ CREATE TABLE IF NOT EXISTS result_snapshot_checkpoint (
 
 CREATE TABLE IF NOT EXISTS idempotency_record (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求ID（写操作幂等键）',
-    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE',
+    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE/REGISTER_EXECUTION/CONFIRM_EXECUTION',
     request_digest CHAR(64) NOT NULL COMMENT '请求参数（requestId除外，含expectedVersion）规范化JSON的SHA-256摘要',
     response_status INT NOT NULL COMMENT '原成功请求的HTTP状态码，重放时原样返回',
     response_body TEXT COMMENT '原成功响应体JSON，重放时原样返回',
     created_at BIGINT NOT NULL COMMENT '首次成功提交时间，Unix毫秒时间戳',
     CONSTRAINT pk_idempotency_record PRIMARY KEY (request_id)
+);
+
+-- 时间处罚的赛中停留执行凭证：仅针对 ADD_TIME 处罚，确认后抵扣该处罚尚未执行的毫秒数。
+-- 起止为 UTC Unix 毫秒时间戳，区间左闭右开，长度=end_utc_ms-start_utc_ms 为整数毫秒。
+CREATE TABLE IF NOT EXISTS penalty_execution (
+    voucher_id VARCHAR(64) NOT NULL COMMENT '执行凭证ID，全局唯一',
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    bib VARCHAR(64) NOT NULL COMMENT '被执行选手参赛号，必须与处罚对象一致',
+    penalty_id VARCHAR(64) NOT NULL COMMENT '关联的加时处罚ID',
+    start_utc_ms BIGINT NOT NULL COMMENT '停留开始时刻，Unix毫秒时间戳（UTC），区间左闭',
+    end_utc_ms BIGINT NOT NULL COMMENT '停留结束时刻，Unix毫秒时间戳（UTC），区间右开；长度=end_utc_ms-start_utc_ms',
+    referee VARCHAR(64) NOT NULL COMMENT '登记凭证的裁判',
+    status VARCHAR(16) NOT NULL COMMENT '凭证状态：PENDING-待确认，CONFIRMED-已确认',
+    confirmed_by VARCHAR(64) COMMENT '确认裁判，必须与登记裁判不同；未确认为NULL',
+    confirmed_at BIGINT COMMENT '确认时间，Unix毫秒时间戳；未确认为NULL',
+    credited_ms BIGINT NOT NULL DEFAULT 0 COMMENT '确认时实际抵扣毫秒数（不超过该处罚剩余未执行量）；未确认为0',
+    created_at BIGINT NOT NULL COMMENT '登记时间，Unix毫秒时间戳',
+    CONSTRAINT pk_penalty_execution PRIMARY KEY (voucher_id),
+    CONSTRAINT fk_execution_penalty FOREIGN KEY (penalty_id) REFERENCES penalty (penalty_id),
+    CONSTRAINT fk_execution_runner FOREIGN KEY (race_id, bib) REFERENCES runner (race_id, bib),
+    INDEX idx_execution_race_bib (race_id, bib),
+    INDEX idx_execution_penalty (penalty_id)
 );

@@ -2,7 +2,10 @@ package com.example.starter.race.service;
 
 import com.example.starter.race.api.AddPenaltyRequest;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
+import com.example.starter.race.api.ConfirmExecutionRequest;
 import com.example.starter.race.api.CreateRaceRequest;
+import com.example.starter.race.api.PenaltyResponse;
+import com.example.starter.race.api.RegisterExecutionRequest;
 import com.example.starter.race.api.RegisterRunnerRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
@@ -11,6 +14,8 @@ import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.api.SubmitTimingRequest;
+
+import java.util.List;
 
 /**
  * 赛事成绩封榜应用服务；每个写方法在单个数据库事务内完成
@@ -32,6 +37,27 @@ public interface RaceService {
 
     /** 撤销处罚。 */
     ServiceResult revokePenalty(String raceId, String penaltyId, RevokePenaltyRequest request);
+
+    /**
+     * 登记时间处罚的赛中停留执行凭证：仅针对 ADD_TIME 处罚，绑定选手、处罚、
+     * UTC 起止时刻（左闭右开，长度为整数毫秒）与登记裁判；
+     * 跨选手引用、取消资格处罚或无效区间返回422，且不写入任何数据。
+     */
+    ServiceResult registerExecution(
+            String raceId, String penaltyId, RegisterExecutionRequest request);
+
+    /**
+     * 由另一名裁判确认执行凭证：按该处罚尚未执行的毫秒数产生抵扣（超出不产生负处罚）；
+     * 同选手已确认停留区间不得重叠（相邻合法）；处罚已撤销或赛事已封榜时禁止确认。
+     */
+    ServiceResult confirmExecution(
+            String raceId, String penaltyId, String voucherId, ConfirmExecutionRequest request);
+
+    /**
+     * 查询赛事全部处罚（含已撤销），每条同时返回原罚时 amountMs 与
+     * 已确认执行抵扣量 servedMs；只读，封榜后返回封榜时冻结的值。
+     */
+    List<PenaltyResponse> getPenalties(String raceId);
 
     /**
      * 一次性配置检查点（1~20个、代码赛事内唯一、顺序从1连续递增）；

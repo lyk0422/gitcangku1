@@ -1,6 +1,7 @@
 package com.example.starter.race.persistence;
 
 import com.example.starter.race.domain.EntryStatus;
+import com.example.starter.race.domain.ExecutionStatus;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -30,6 +31,7 @@ public class RaceRepository {
             new CheckpointTimingRowMapper();
     private static final SnapshotCheckpointRowMapper SNAPSHOT_CHECKPOINT_ROW_MAPPER =
             new SnapshotCheckpointRowMapper();
+    private static final ExecutionRowMapper EXECUTION_ROW_MAPPER = new ExecutionRowMapper();
 
     private final JdbcTemplate jdbcTemplate;
 
@@ -187,7 +189,7 @@ public class RaceRepository {
         }
         SnapshotRow header = headers.getFirst();
         List<SnapshotEntryRow> entryRows = jdbcTemplate.query(
-                "SELECT race_id, bib, rank_no, status, finish_time_ms, penalty_ms, total_time_ms, "
+                "SELECT race_id, bib, rank_no, status, finish_time_ms, penalty_ms, served_ms, total_time_ms, "
                         + "display_order, checkpoint_count, covered_checkpoint_count "
                         + "FROM result_snapshot_entry WHERE race_id = ? ORDER BY display_order",
                 SNAPSHOT_ENTRY_ROW_MAPPER, raceId);
@@ -207,7 +209,8 @@ public class RaceRepository {
         List<SnapshotEntryRow> entries = entryRows.stream()
                 .map(entry -> new SnapshotEntryRow(
                         entry.raceId(), entry.bib(), entry.rank(), entry.status(),
-                        entry.finishTimeMs(), entry.penaltyMs(), entry.totalTimeMs(),
+                        entry.finishTimeMs(), entry.penaltyMs(), entry.servedMs(),
+                        entry.totalTimeMs(),
                         entry.displayOrder(), entry.checkpointCount(),
                         entry.coveredCheckpointCount(),
                         missingByBib.getOrDefault(entry.bib(), List.of())))
@@ -291,9 +294,9 @@ public class RaceRepository {
                 snapshot.raceId(), snapshot.version(), snapshot.sealedAt());
         jdbcTemplate.batchUpdate(
                 "INSERT INTO result_snapshot_entry "
-                        + "(race_id, bib, rank_no, status, finish_time_ms, penalty_ms, total_time_ms, "
-                        + "display_order, checkpoint_count, covered_checkpoint_count) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        + "(race_id, bib, rank_no, status, finish_time_ms, penalty_ms, served_ms, "
+                        + "total_time_ms, display_order, checkpoint_count, covered_checkpoint_count) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 snapshot.entries(),
                 snapshot.entries().size(),
                 (ps, entry) -> {
@@ -303,10 +306,11 @@ public class RaceRepository {
                     ps.setString(4, entry.status().name());
                     ps.setObject(5, entry.finishTimeMs());
                     ps.setLong(6, entry.penaltyMs());
-                    ps.setObject(7, entry.totalTimeMs());
-                    ps.setInt(8, entry.displayOrder());
-                    ps.setInt(9, entry.checkpointCount());
-                    ps.setInt(10, entry.coveredCheckpointCount());
+                    ps.setLong(7, entry.servedMs());
+                    ps.setObject(8, entry.totalTimeMs());
+                    ps.setInt(9, entry.displayOrder());
+                    ps.setInt(10, entry.checkpointCount());
+                    ps.setInt(11, entry.coveredCheckpointCount());
                 });
         jdbcTemplate.batchUpdate(
                 "INSERT INTO result_snapshot_checkpoint "
@@ -368,6 +372,53 @@ public class RaceRepository {
                 responseStatus, responseBody, requestId);
     }
 
+    /** 按全局凭证ID查询执行凭证。 */
+    public Optional<ExecutionRow> findExecution(String voucherId) {
+        return jdbcTemplate
+                .query("SELECT voucher_id, race_id, bib, penalty_id, start_utc_ms, end_utc_ms, "
+                                + "referee, status, confirmed_by, confirmed_at, credited_ms, created_at "
+                                + "FROM penalty_execution WHERE voucher_id = ?",
+                        EXECUTION_ROW_MAPPER, voucherId)
+                .stream()
+                .findFirst();
+    }
+
+
+    /** 查询赛事下全部已确认执行凭证（用于抵扣汇总与同选手区间重叠校验）。 */
+    public List<ExecutionRow> findConfirmedExecutionsForRace(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT voucher_id, race_id, bib, penalty_id, start_utc_ms, end_utc_ms, "
+                        + "referee, status, confirmed_by, confirmed_at, credited_ms, created_at "
+                        + "FROM penalty_execution WHERE race_id = ? AND status = 'CONFIRMED' "
+                        + "ORDER BY bib, start_utc_ms, voucher_id",
+                EXECUTION_ROW_MAPPER, raceId);
+    }
+
+    /** 登记执行凭证（初始 PENDING、抵扣为0）；voucherId 全局唯一由主键保证。 */
+    public void insertExecution(ExecutionRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO penalty_execution "
+                        + "(voucher_id, race_id, bib, penalty_id, start_utc_ms, end_utc_ms, "
+                        + "referee, status, confirmed_by, confirmed_at, credited_ms, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', NULL, NULL, 0, ?)",
+                row.voucherId(), row.raceId(), row.bib(), row.penaltyId(),
+                row.startUtcMs(), row.endUtcMs(), row.referee(), row.createdAt());
+    }
+
+    /**
+     * 条件确认执行凭证：仅当仍为 PENDING 时写入确认裁判、确认时间与抵扣毫秒数。
+     *
+     * @return 受影响行数；0 表示凭证不存在或已被确认
+     */
+    public int confirmExecutionIfPending(
+            String voucherId, String confirmedBy, long confirmedAt, long creditedMs) {
+        return jdbcTemplate.update(
+                "UPDATE penalty_execution "
+                        + "SET status = 'CONFIRMED', confirmed_by = ?, confirmed_at = ?, credited_ms = ? "
+                        + "WHERE voucher_id = ? AND status = 'PENDING'",
+                confirmedBy, confirmedAt, creditedMs, voucherId);
+    }
+
     /** 测试辅助：清空全部业务数据，按外键依赖顺序删除。 */
     public void deleteAllForTesting() {
         jdbcTemplate.update("DELETE FROM result_snapshot_checkpoint");
@@ -376,6 +427,7 @@ public class RaceRepository {
         jdbcTemplate.update("DELETE FROM idempotency_record");
         jdbcTemplate.update("DELETE FROM checkpoint_timing");
         jdbcTemplate.update("DELETE FROM checkpoint");
+        jdbcTemplate.update("DELETE FROM penalty_execution");
         jdbcTemplate.update("DELETE FROM penalty");
         jdbcTemplate.update("DELETE FROM runner");
         jdbcTemplate.update("DELETE FROM race");
@@ -431,6 +483,7 @@ public class RaceRepository {
                     EntryStatus.valueOf(rs.getString("status")),
                     (Long) rs.getObject("finish_time_ms"),
                     rs.getLong("penalty_ms"),
+                    rs.getLong("served_ms"),
                     (Long) rs.getObject("total_time_ms"),
                     rs.getInt("display_order"),
                     rs.getInt("checkpoint_count"),
@@ -487,6 +540,25 @@ public class RaceRepository {
                     rs.getString("request_digest"),
                     rs.getInt("response_status"),
                     rs.getString("response_body"),
+                    rs.getLong("created_at"));
+        }
+    }
+
+    private static final class ExecutionRowMapper implements RowMapper<ExecutionRow> {
+        @Override
+        public ExecutionRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new ExecutionRow(
+                    rs.getString("voucher_id"),
+                    rs.getString("race_id"),
+                    rs.getString("bib"),
+                    rs.getString("penalty_id"),
+                    rs.getLong("start_utc_ms"),
+                    rs.getLong("end_utc_ms"),
+                    rs.getString("referee"),
+                    ExecutionStatus.valueOf(rs.getString("status")),
+                    rs.getString("confirmed_by"),
+                    (Long) rs.getObject("confirmed_at"),
+                    rs.getLong("credited_ms"),
                     rs.getLong("created_at"));
         }
     }
