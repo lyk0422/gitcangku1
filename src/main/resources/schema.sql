@@ -106,9 +106,61 @@ CREATE TABLE IF NOT EXISTS idempotent_request (
 COMMENT ON TABLE  idempotent_request IS '写操作幂等记录表；仅记录成功请求，失败不占键，与业务变更同一事务原子提交';
 COMMENT ON COLUMN idempotent_request.request_id IS '全局唯一 requestId（X-Request-Id）';
 COMMENT ON COLUMN idempotent_request.actor_id IS '首次成功调用的操作者编号，属于幂等参数的一部分';
-COMMENT ON COLUMN idempotent_request.role IS '首次成功调用的角色 COORDINATOR/REVIEWER，属于幂等参数的一部分';
-COMMENT ON COLUMN idempotent_request.operation IS '写操作标识，如 experiment.create/allocation.create';
+COMMENT ON COLUMN idempotent_request.role IS '首次成功调用的角色 COORDINATOR/REVIEWER/SUPPLY，属于幂等参数的一部分';
+COMMENT ON COLUMN idempotent_request.operation IS '写操作标识，如 experiment.create/allocation.create/kit.register/kit.pickup';
 COMMENT ON COLUMN idempotent_request.fingerprint IS '请求参数指纹（含路径参数与请求体），与 actor/role 共同判定同参/异参';
 COMMENT ON COLUMN idempotent_request.response_status IS '首次成功响应的 HTTP 状态码，重放时原样返回';
 COMMENT ON COLUMN idempotent_request.response_body IS '首次成功响应体 JSON，重放时原样返回';
 COMMENT ON COLUMN idempotent_request.created_at IS '记录时间，Unix 毫秒，UTC';
+
+-- 处理包库存表：SUPPLY 角色登记，treatment 为盲底，仅库内使用，不进入任何响应与日志。
+CREATE TABLE IF NOT EXISTS treatment_kit (
+    id               BIGINT      NOT NULL AUTO_INCREMENT,
+    experiment_id    VARCHAR(64) NOT NULL,
+    package_no       VARCHAR(64) NOT NULL,
+    treatment        VARCHAR(1)  NOT NULL,
+    status           VARCHAR(16) NOT NULL,
+    registered_actor VARCHAR(64) NOT NULL,
+    registered_at    BIGINT      NOT NULL,
+    issued_at        BIGINT,
+    allocation_id    BIGINT,
+    CONSTRAINT pk_treatment_kit PRIMARY KEY (id),
+    CONSTRAINT uq_kit_package UNIQUE (experiment_id, package_no),
+    CONSTRAINT ck_kit_treatment CHECK (treatment IN ('A', 'B')),
+    CONSTRAINT ck_kit_status CHECK (status IN ('STOCK', 'ISSUED'))
+);
+COMMENT ON TABLE  treatment_kit IS '处理包库存表；每包固定一个处理代码，最多发给一个有效分配，发出后不回库不转让';
+COMMENT ON COLUMN treatment_kit.id IS '处理包自增主键，仅库内使用';
+COMMENT ON COLUMN treatment_kit.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN treatment_kit.package_no IS '处理包编号，实验内唯一，按字典序选择发放顺序';
+COMMENT ON COLUMN treatment_kit.treatment IS '处理代码 A/B，盲底，禁止出现在普通响应与日志';
+COMMENT ON COLUMN treatment_kit.status IS '包状态：STOCK=在库未发；ISSUED=已发放，终态不回库';
+COMMENT ON COLUMN treatment_kit.registered_actor IS '登记包的 SUPPLY 操作者编号';
+COMMENT ON COLUMN treatment_kit.registered_at IS '登记时间，Unix 毫秒，UTC';
+COMMENT ON COLUMN treatment_kit.issued_at IS '发放时间，Unix 毫秒，UTC；NULL 表示未发放';
+COMMENT ON COLUMN treatment_kit.allocation_id IS '发给的分配主键；NULL 表示未发放，发放后不再变更';
+
+-- 处理包领取记录表：协调员只能看到本表暴露的随机包装码与领取编号。
+CREATE TABLE IF NOT EXISTS kit_pickup (
+    id             VARCHAR(64)  NOT NULL,
+    experiment_id  VARCHAR(64)  NOT NULL,
+    participant_id VARCHAR(64)  NOT NULL,
+    allocation_id  BIGINT       NOT NULL,
+    kit_id         BIGINT       NOT NULL,
+    wrapper_code   VARCHAR(32)  NOT NULL,
+    actor_id       VARCHAR(64)  NOT NULL,
+    created_at     BIGINT       NOT NULL,
+    CONSTRAINT pk_kit_pickup PRIMARY KEY (id),
+    CONSTRAINT uq_pickup_allocation UNIQUE (allocation_id),
+    CONSTRAINT uq_pickup_kit UNIQUE (kit_id),
+    CONSTRAINT uq_pickup_wrapper UNIQUE (wrapper_code)
+);
+COMMENT ON TABLE  kit_pickup IS '处理包领取记录；同一分配至多领取一次，同一包至多被领取一次，与包状态更新同事务提交';
+COMMENT ON COLUMN kit_pickup.id IS '领取编号，全局唯一，领取响应可返回';
+COMMENT ON COLUMN kit_pickup.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN kit_pickup.participant_id IS '领取的合成参与者编号';
+COMMENT ON COLUMN kit_pickup.allocation_id IS '对应分配主键；唯一索引保证同次分配只能领取一次';
+COMMENT ON COLUMN kit_pickup.kit_id IS '发出的处理包主键；唯一索引保证一包只发一次';
+COMMENT ON COLUMN kit_pickup.wrapper_code IS '随机无含义包装码，全局唯一，与处理代码无对应规律';
+COMMENT ON COLUMN kit_pickup.actor_id IS '执行领取的协调员操作者编号';
+COMMENT ON COLUMN kit_pickup.created_at IS '领取时间，Unix 毫秒，UTC';

@@ -132,11 +132,11 @@ public class BlindExperimentController {
                         experimentService.withdraw(expId, pid)));
     }
 
-    /** 普通查询（两种角色均可）：只返回盲码、区组号、参与者编号与退组状态。 */
+    /** 普通查询（COORDINATOR / REVIEWER；SUPPLY 不可读分配映射）：只返回盲码、区组号、参与者编号与退组状态。 */
     @GetMapping("/experiments/{experimentId}/participants/{participantId}")
     public AllocationView getAllocation(@PathVariable String experimentId,
                                         @PathVariable String participantId) {
-        requireActor();
+        requireNonSupply();
         return experimentService.getAllocation(
                 RequestTokens.requireId("experimentId", experimentId),
                 RequestTokens.requireId("participantId", participantId));
@@ -217,6 +217,14 @@ public class BlindExperimentController {
         Actor actor = requireActor();
         if (!actor.isReviewer()) {
             throw ApiException.forbidden("仅 REVIEWER 可执行该操作");
+        }
+        return actor;
+    }
+
+    private Actor requireNonSupply() {
+        Actor actor = requireActor();
+        if (actor.isSupply()) {
+            throw ApiException.forbidden("SUPPLY 不可查询参与者分配信息");
         }
         return actor;
     }
