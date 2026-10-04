@@ -59,3 +59,39 @@ CREATE TABLE IF NOT EXISTS conflict_resolution (
     -- 且不可变解决历史必须在任何数据清理/归档场景下继续可查。
     UNIQUE (observation_id, request_id)
 );
+
+-- 设备会话状态表：每个设备会话一行，维护确认水位、收件计数与关闭标记。
+CREATE TABLE IF NOT EXISTS device_session (
+    device_id VARCHAR(64) NOT NULL COMMENT '设备标识',
+    session_id VARCHAR(64) NOT NULL COMMENT '会话标识',
+    watermark INT NOT NULL DEFAULT 0 COMMENT '确认水位：从 seq=1 起连续收到的最大序号，初值 0，洞不能跳过',
+    message_count INT NOT NULL DEFAULT 0 COMMENT '已收件消息条数，上限 100',
+    closed BOOLEAN NOT NULL DEFAULT FALSE COMMENT '是否已由设备显式关闭：TRUE 后拒绝新消息',
+    closed_seq INT NULL COMMENT '关闭时设备声明的末序号（须等于当时水位）；未关闭为 NULL',
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近一次变更时间（服务器时区）',
+    PRIMARY KEY (device_id, session_id)
+);
+
+-- 会话收件记录表：按设备会话内序号唯一，仅成功接收的消息落库，失败不留记录。
+CREATE TABLE IF NOT EXISTS session_inbox (
+    device_id VARCHAR(64) NOT NULL COMMENT '设备标识',
+    session_id VARCHAR(64) NOT NULL COMMENT '会话标识',
+    seq INT NOT NULL COMMENT '会话内消息序号，正整数',
+    content_fingerprint VARCHAR(128) NOT NULL COMMENT '消息内容结构化指纹（SHA-256），同序号异内容判定 409',
+    batch_request_id VARCHAR(128) NOT NULL COMMENT '接收该消息的批次请求标识',
+    message_status INT NOT NULL COMMENT '该消息观测业务响应的 HTTP 状态码',
+    message_body VARCHAR(2000) NOT NULL COMMENT '该消息观测业务响应体（JSON 原文），用于同序号同内容重放',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '收件记录创建时间（服务器时区）',
+    PRIMARY KEY (device_id, session_id, seq)
+);
+
+-- 会话批次/关闭请求幂等回执表：仅成功结果落库，与业务变更同事务原子提交，失败不占键。
+CREATE TABLE IF NOT EXISTS session_receipt (
+    request_id VARCHAR(128) NOT NULL COMMENT '批次/关闭请求标识（幂等去重键）',
+    fingerprint VARCHAR(128) NOT NULL COMMENT '操作、操作者、资源及全部参数的结构化指纹（SHA-256），同键异参判定 409',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：BATCH_UPLOAD / SESSION_CLOSE',
+    response_status INT NULL COMMENT '成功响应的 HTTP 状态码；提交过程中暂为 NULL',
+    response_body VARCHAR(16000) NULL COMMENT '成功响应体（JSON 原文），用于同键同参重放；提交过程中暂为 NULL',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '回执创建时间（服务器时区）',
+    PRIMARY KEY (request_id)
+);
