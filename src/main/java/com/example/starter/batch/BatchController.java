@@ -1,6 +1,7 @@
 package com.example.starter.batch;
 
 import com.example.starter.batch.dto.ApproveRequest;
+import com.example.starter.batch.dto.CorrectWeighingRequest;
 import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
@@ -8,6 +9,8 @@ import com.example.starter.batch.dto.LineageEntryResponse;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
+import com.example.starter.batch.dto.WeighingChainResponse;
+import com.example.starter.batch.dto.WeighingRequest;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
@@ -112,6 +115,35 @@ public class BatchController {
     @GetMapping("/{batchKey}/descendants")
     public List<LineageEntryResponse> descendants(@PathVariable String batchKey) {
         return service.listDescendants(batchKey);
+    }
+
+    /**
+     * 追加称量：同成分累加；X-Actor-Id 为操作人，请求体含 requestId 与 expectedVersion。
+     */
+    @PostMapping("/{batchKey}/weighings")
+    public ResponseEntity<String> weigh(@PathVariable String batchKey,
+                                        @RequestHeader(name = "X-Actor-Id", required = false) String actorId,
+                                        @Valid @RequestBody WeighingRequest request) {
+        return stored(service.weigh(batchKey, actorId, request));
+    }
+
+    /**
+     * 称量更正：指定最近有效称量ID，以替代量重算；与拆分、放行互斥。
+     */
+    @PostMapping("/{batchKey}/weighings/corrections")
+    public ResponseEntity<String> correctWeighing(
+            @PathVariable String batchKey,
+            @RequestHeader(name = "X-Actor-Id", required = false) String actorId,
+            @Valid @RequestBody CorrectWeighingRequest request) {
+        return stored(service.correctWeighing(batchKey, actorId, request));
+    }
+
+    /**
+     * 查询批次当前有效称量链：有效称量行、按成分汇总与称量链版本。
+     */
+    @GetMapping("/{batchKey}/weighings")
+    public WeighingChainResponse weighingChain(@PathVariable String batchKey) {
+        return service.weighingChain(batchKey);
     }
 
     private ResponseEntity<String> stored(StoredResponse response) {

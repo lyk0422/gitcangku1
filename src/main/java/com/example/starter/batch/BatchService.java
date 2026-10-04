@@ -11,7 +11,14 @@ import com.example.starter.batch.dto.RecallResponse;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SplitResponse;
 import com.example.starter.batch.dto.SubmitTestRequest;
+import com.example.starter.batch.dto.CorrectWeighingRequest;
+import com.example.starter.batch.dto.CreateRecipeRequest;
+import com.example.starter.batch.dto.IngredientDifference;
+import com.example.starter.batch.dto.RecipeResponse;
 import com.example.starter.batch.dto.TestResultResponse;
+import com.example.starter.batch.dto.WeighingChainResponse;
+import com.example.starter.batch.dto.WeighingRequest;
+import com.example.starter.batch.dto.WeighingResponse;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
@@ -22,6 +29,9 @@ import org.springframework.transaction.support.TransactionTemplate;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.math.BigDecimal;
+import java.math.MathContext;
+import java.math.RoundingMode;
 import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -29,6 +39,7 @@ import java.util.Collections;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -38,9 +49,9 @@ import java.util.function.Supplier;
 /**
  * 批次隔离与放行核心服务。
  *
- * <p>并发策略：同一批次的检验/批准/召回在事务内对 batch 行 SELECT ... FOR UPDATE 串行化，
- * 按事务提交顺序生效；commandKey 幂等通过 command_log 主键 + 参数指纹实现，
- * 同键同参重放返回首次响应快照，同键改参返回 409；仅成功命令写入 command_log。
+ * <p>并发策略：同一批次的检验/批准/召回/拆分/称量/更正在事务内对 batch 行 SELECT ... FOR UPDATE
+ * 串行化，按事务提交顺序生效；commandKey/requestId 幂等通过 command_log 主键 + 结构化参数指纹实现，
+ * 同键同参重放返回首次响应快照，同键改参返回 409；仅成功命令写入 command_log，失败不占键。
  */
 @Service
 public class BatchService {
@@ -50,11 +61,29 @@ public class BatchService {
     private static final String CMD_APPROVE = "APPROVE";
     private static final String CMD_RECALL = "RECALL";
     private static final String CMD_SPLIT = "SPLIT";
+    private static final String CMD_CREATE_RECIPE = "CREATE_RECIPE";
+    private static final String CMD_WEIGH = "WEIGH";
+    private static final String CMD_CORRECT = "CORRECT_WEIGHING";
 
     /**
-     * 指纹拼接分隔符（NUL）：业务参数不可能包含该字符，避免拼接碰撞。
+     * 配方占比合计基准值 100。
      */
-    private static final String SEP = "\u0000";
+    private static final BigDecimal HUNDRED = new BigDecimal("100");
+
+    /**
+     * 放行占比偏差上限：0.1 个百分点。
+     */
+    private static final BigDecimal MAX_DEVIATION = new BigDecimal("0.1");
+
+    /**
+     * 质量上限：DECIMAL(19,6) 可表示的最大值。
+     */
+    private static final BigDecimal MAX_MASS = new BigDecimal("9999999999999.999999");
+
+    /**
+     * 拆分继承称量行的操作人标识。
+     */
+    private static final String SPLIT_ACTOR = "system:split";
 
     private static final int IDEMPOTENCY_MAX_ATTEMPTS = 3;
 
@@ -78,20 +107,41 @@ public class BatchService {
         if (new HashSet<>(items).size() != items.size()) {
             throw ApiException.badRequest("requiredTests 存在重复检验项");
         }
-        String fingerprint = fingerprint("create", req.batchKey(), req.productCode(), req.batchNo(),
-                req.producedAt().toString(), String.join(SEP, items));
+        boolean bindRecipe = req.recipeKey() != null || req.targetMassGrams() != null;
+        if (bindRecipe && (req.recipeKey() == null || req.recipeKey().isBlank()
+                || req.targetMassGrams() == null)) {
+            throw ApiException.badRequest("绑定配方时 recipeKey 与 targetMassGrams 必须同时提供");
+        }
+        if (bindRecipe) {
+            requireMass(req.targetMassGrams(), "targetMassGrams");
+        }
+        List<String> parts = new ArrayList<>(List.of("create", req.batchKey(), req.productCode(),
+                req.batchNo(), req.producedAt().toString(),
+                req.recipeKey() == null ? "" : req.recipeKey().trim(),
+                req.targetMassGrams() == null ? "" : req.targetMassGrams().toPlainString()));
+        parts.addAll(items);
+        String fingerprint = fingerprint(parts.toArray(new String[0]));
         return executeIdempotent(CMD_CREATE, req.commandKey(), fingerprint, () -> {
             repo.findBatch(req.batchKey()).ifPresent(b -> {
                 throw ApiException.conflict("batchKey 已存在: " + req.batchKey());
             });
+            String recipeKey = null;
+            if (bindRecipe) {
+                recipeKey = req.recipeKey().trim();
+                if (repo.findRecipe(recipeKey).isEmpty()) {
+                    throw ApiException.unprocessable("配方版本不存在: " + recipeKey);
+                }
+            }
             String now = now();
             repo.insertBatch(new BatchRepository.BatchRow(0L, req.batchKey(), req.productCode(),
-                    req.batchNo(), req.producedAt().toString(), BatchStatus.QUARANTINED.name(), now));
+                    req.batchNo(), req.producedAt().toString(), BatchStatus.QUARANTINED.name(), now,
+                    recipeKey, req.targetMassGrams(), 0));
             for (int i = 0; i < items.size(); i++) {
                 repo.insertRequiredTest(req.batchKey(), items.get(i), i + 1);
             }
             BatchResponse body = new BatchResponse(req.batchKey(), req.productCode(), req.batchNo(),
-                    req.producedAt(), BatchStatus.QUARANTINED, items, Instant.parse(now));
+                    req.producedAt(), BatchStatus.QUARANTINED, items, Instant.parse(now),
+                    recipeKey, req.targetMassGrams());
             return new StoredResponse(201, toJson(body));
         });
     }
@@ -199,6 +249,9 @@ public class BatchService {
                 }
                 seq = 2;
                 newStatus = BatchStatus.RELEASED;
+            }
+            if (newStatus == BatchStatus.RELEASED && batch.recipeKey() != null) {
+                assertRecipeMetForRelease(batch);
             }
             repo.insertApproval(new BatchRepository.ApprovalRow(0L, batchKey, req.commandKey(),
                     actor, role.name(), seq, now));
@@ -343,7 +396,8 @@ public class BatchService {
     private BatchResponse toBatchResponse(BatchRepository.BatchRow row) {
         return new BatchResponse(row.batchKey(), row.productCode(), row.batchNo(),
                 Instant.parse(row.producedAt()), BatchStatus.valueOf(row.status()),
-                repo.findRequiredTests(row.batchKey()), Instant.parse(row.createdAt()));
+                repo.findRequiredTests(row.batchKey()), Instant.parse(row.createdAt()),
+                row.recipeKey(), row.targetMass());
     }
 
     private TestResultResponse toTestResponse(BatchRepository.TestRow row, String batchStatus) {
@@ -399,10 +453,16 @@ public class BatchService {
         return Instant.now().toString();
     }
 
-    private String fingerprint(String... parts) {        String canonical = String.join(SEP, parts);
+    private String fingerprint(String... parts) {
+        // 结构化拼接：每段带长度前缀，避免分隔符碰撞；null 归一为空串
+        StringBuilder canonical = new StringBuilder();
+        for (String part : parts) {
+            String value = part == null ? "" : part;
+            canonical.append(value.length()).append(':').append(value);
+        }
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] hash = digest.digest(canonical.getBytes(StandardCharsets.UTF_8));
+            byte[] hash = digest.digest(canonical.toString().getBytes(StandardCharsets.UTF_8));
             StringBuilder hex = new StringBuilder(hash.length * 2);
             for (byte b : hash) {
                 hex.append(Character.forDigit((b >> 4) & 0xF, 16));
@@ -432,6 +492,7 @@ public class BatchService {
         for (SplitRequest.ChildSpec child : children) {
             parts.add(child.batchKey());
             parts.add(child.batchNo());
+            parts.add(child.targetMassGrams() == null ? "" : child.targetMassGrams().toPlainString());
         }
         String fingerprint = fingerprint(parts.toArray(new String[0]));
         return executeIdempotent(CMD_SPLIT, req.commandKey(), fingerprint, () -> {
@@ -453,21 +514,40 @@ public class BatchService {
                     throw ApiException.conflict("子批 batchKey 已存在: " + childKey);
                 }
             }
+            // 配方继承：父批绑定配方时，子批按目标质量比例精确继承各成分有效称量合计，
+            // 无法在6位小数内守恒则整次 422，父批不变
+            Map<String, Map<String, BigDecimal>> inheritedByChild = null;
+            if (parent.recipeKey() != null) {
+                inheritedByChild = planSplitInheritance(parent, children, effectiveTotals(parentKey));
+            }
             String now = now();
             List<String> required = repo.findRequiredTests(parentKey);
             List<SplitResponse.SplitChild> childBodies = new ArrayList<>(children.size());
             for (int i = 0; i < children.size(); i++) {
                 SplitRequest.ChildSpec spec = children.get(i);
+                BigDecimal childTarget = parent.recipeKey() == null ? null : spec.targetMassGrams();
                 repo.insertBatch(new BatchRepository.BatchRow(0L, spec.batchKey(), parent.productCode(),
-                        spec.batchNo(), parent.producedAt(), BatchStatus.QUARANTINED.name(), now));
+                        spec.batchNo(), parent.producedAt(), BatchStatus.QUARANTINED.name(), now,
+                        parent.recipeKey(), childTarget, 0));
                 for (int j = 0; j < required.size(); j++) {
                     repo.insertRequiredTest(spec.batchKey(), required.get(j), j + 1);
                 }
                 repo.insertLineage(new BatchRepository.LineageRow(0L, parentKey, spec.batchKey(),
                         i + 1, now));
+                if (inheritedByChild != null) {
+                    int childVersion = 0;
+                    for (Map.Entry<String, BigDecimal> inherited
+                            : inheritedByChild.get(spec.batchKey()).entrySet()) {
+                        repo.insertWeighing(new BatchRepository.WeighingRow(0L, spec.batchKey(),
+                                inherited.getKey(), inherited.getValue(), null, null,
+                                SPLIT_ACTOR, now));
+                        childVersion++;
+                    }
+                    repo.updateWeighingVersion(spec.batchKey(), childVersion);
+                }
                 childBodies.add(new SplitResponse.SplitChild(spec.batchKey(), spec.batchNo(),
                         parent.productCode(), Instant.parse(parent.producedAt()),
-                        BatchStatus.QUARANTINED, required, Instant.parse(now)));
+                        BatchStatus.QUARANTINED, required, Instant.parse(now), childTarget));
             }
             repo.updateStatus(parentKey, BatchStatus.SPLIT.name());
             SplitResponse body = new SplitResponse(parentKey, BatchStatus.SPLIT, childBodies,
@@ -574,5 +654,284 @@ public class BatchService {
         return new LineageEntryResponse(row.batchKey(), row.batchNo(),
                 BatchStatus.valueOf(row.status()),
                 recalledAncestor(batchKey, parentOf, recalled).orElse(null));
+    }
+
+    /**
+     * 创建不可变配方版本：2至6种成分，质量百分比每项正值、最多4位小数，合计精确等于100。
+     * requestId 幂等：同键同参重放首次响应，同键异参 409，失败不占键。
+     */
+    public StoredResponse createRecipe(String actorId, CreateRecipeRequest req) {
+        String actor = requireActor(actorId);
+        List<CreateRecipeRequest.IngredientSpec> specs = req.ingredients();
+        List<String> names = specs.stream().map(s -> s.name().trim()).toList();
+        if (new HashSet<>(names).size() != names.size()) {
+            throw ApiException.badRequest("ingredients 存在重复成分");
+        }
+        BigDecimal sum = BigDecimal.ZERO;
+        for (int i = 0; i < specs.size(); i++) {
+            BigDecimal pct = specs.get(i).percentage();
+            if (pct.signum() <= 0) {
+                throw ApiException.badRequest("percentage 必须为正值: " + names.get(i));
+            }
+            if (pct.stripTrailingZeros().scale() > 4) {
+                throw ApiException.badRequest("percentage 最多4位小数: " + names.get(i));
+            }
+            sum = sum.add(pct);
+        }
+        if (sum.compareTo(HUNDRED) != 0) {
+            throw ApiException.badRequest("各成分 percentage 合计必须精确等于100，当前为 "
+                    + sum.stripTrailingZeros().toPlainString());
+        }
+        List<String> parts = new ArrayList<>(List.of("recipe", actor, req.recipeKey().trim()));
+        for (int i = 0; i < specs.size(); i++) {
+            parts.add(names.get(i));
+            parts.add(specs.get(i).percentage().toPlainString());
+        }
+        String fingerprint = fingerprint(parts.toArray(new String[0]));
+        return executeIdempotent(CMD_CREATE_RECIPE, req.requestId(), fingerprint, () -> {
+            String recipeKey = req.recipeKey().trim();
+            repo.findRecipe(recipeKey).ifPresent(r -> {
+                throw ApiException.conflict("recipeKey 已存在: " + recipeKey);
+            });
+            String now = now();
+            repo.insertRecipe(recipeKey, now);
+            List<RecipeResponse.Ingredient> ingredients = new ArrayList<>(specs.size());
+            for (int i = 0; i < specs.size(); i++) {
+                repo.insertRecipeIngredient(recipeKey, names.get(i), specs.get(i).percentage(), i + 1);
+                ingredients.add(new RecipeResponse.Ingredient(names.get(i),
+                        specs.get(i).percentage()));
+            }
+            RecipeResponse body = new RecipeResponse(recipeKey, ingredients, Instant.parse(now));
+            return new StoredResponse(201, toJson(body));
+        });
+    }
+
+    /**
+     * 追加称量：同成分多次称量累加；负量、未知成分或超精度输入 400；
+     * expectedVersion 与称量链版本不一致 409；批次状态不允许时 409。
+     */
+    public StoredResponse weigh(String batchKey, String actorId, WeighingRequest req) {
+        String actor = requireActor(actorId);
+        requireMass(req.amountGrams(), "amountGrams");
+        String fingerprint = fingerprint("weigh", actor, batchKey, req.ingredient().trim(),
+                req.amountGrams().toPlainString(), req.expectedVersion().toString());
+        return executeIdempotent(CMD_WEIGH, req.requestId(), fingerprint, () -> {
+            BatchRepository.BatchRow batch = repo.findBatchForUpdate(batchKey)
+                    .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+            // 行锁后重查命令快照：并发同键请求在锁等待期间可能已由对方提交
+            var logged = loggedResponse(CMD_WEIGH, req.requestId(), fingerprint);
+            if (logged.isPresent()) {
+                return logged.get();
+            }
+            assertWeighingAllowed(batch);
+            String ingredient = req.ingredient().trim();
+            boolean known = repo.findRecipeIngredients(batch.recipeKey()).stream()
+                    .anyMatch(i -> i.ingredient().equals(ingredient));
+            if (!known) {
+                throw ApiException.badRequest("成分不属于批次绑定配方: " + ingredient);
+            }
+            if (req.expectedVersion() != batch.weighingVersion()) {
+                throw ApiException.conflict("称量链版本不匹配: 期望 " + req.expectedVersion()
+                        + "，当前 " + batch.weighingVersion());
+            }
+            String now = now();
+            long weighingId = repo.insertWeighing(new BatchRepository.WeighingRow(0L, batchKey,
+                    ingredient, req.amountGrams(), null, null, actor, now));
+            int newVersion = batch.weighingVersion() + 1;
+            repo.updateWeighingVersion(batchKey, newVersion);
+            WeighingResponse body = new WeighingResponse(weighingId, batchKey, ingredient,
+                    req.amountGrams(), null, newVersion, Instant.parse(now));
+            return new StoredResponse(201, toJson(body));
+        });
+    }
+
+    /**
+     * 称量更正：指定最近有效称量ID，追加替代行重算而不是重复累加；被更正行失效。
+     * 已失效或非本批次的称量 409；批次已放行/已拆分等状态 409（与拆分、放行互斥）。
+     */
+    public StoredResponse correctWeighing(String batchKey, String actorId,
+                                          CorrectWeighingRequest req) {
+        String actor = requireActor(actorId);
+        requireMass(req.amountGrams(), "amountGrams");
+        String fingerprint = fingerprint("correct", actor, batchKey, req.weighingId().toString(),
+                req.amountGrams().toPlainString(), req.expectedVersion().toString());
+        return executeIdempotent(CMD_CORRECT, req.requestId(), fingerprint, () -> {
+            BatchRepository.BatchRow batch = repo.findBatchForUpdate(batchKey)
+                    .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+            var logged = loggedResponse(CMD_CORRECT, req.requestId(), fingerprint);
+            if (logged.isPresent()) {
+                return logged.get();
+            }
+            assertWeighingAllowed(batch);
+            BatchRepository.WeighingRow target = repo.findWeighing(req.weighingId())
+                    .orElseThrow(() -> ApiException.notFound("称量记录不存在: " + req.weighingId()));
+            if (!target.batchKey().equals(batchKey)) {
+                throw ApiException.conflict("称量记录不属于该批次: " + req.weighingId());
+            }
+            if (target.supersededBy() != null) {
+                throw ApiException.conflict("只能更正最近有效称量，该记录已被替代: "
+                        + req.weighingId());
+            }
+            if (req.expectedVersion() != batch.weighingVersion()) {
+                throw ApiException.conflict("称量链版本不匹配: 期望 " + req.expectedVersion()
+                        + "，当前 " + batch.weighingVersion());
+            }
+            String now = now();
+            long newId = repo.insertWeighing(new BatchRepository.WeighingRow(0L, batchKey,
+                    target.ingredient(), req.amountGrams(), target.id(), null, actor, now));
+            repo.markWeighingSuperseded(target.id(), newId);
+            int newVersion = batch.weighingVersion() + 1;
+            repo.updateWeighingVersion(batchKey, newVersion);
+            WeighingResponse body = new WeighingResponse(newId, batchKey, target.ingredient(),
+                    req.amountGrams(), target.id(), newVersion, Instant.parse(now));
+            return new StoredResponse(201, toJson(body));
+        });
+    }
+
+    /**
+     * 批次当前有效称量链：有效称量行、按成分汇总（单位克）与称量链版本。
+     */
+    public WeighingChainResponse weighingChain(String batchKey) {
+        BatchRepository.BatchRow batch = repo.findBatch(batchKey)
+                .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+        List<WeighingChainResponse.Entry> entries = repo.findEffectiveWeighings(batchKey).stream()
+                .map(w -> new WeighingChainResponse.Entry(w.id(), w.ingredient(), w.amount(),
+                        w.replacesId(), Instant.parse(w.createdAt())))
+                .toList();
+        Map<String, BigDecimal> totals = effectiveTotals(batchKey);
+        List<WeighingChainResponse.Total> totalList = new ArrayList<>();
+        if (batch.recipeKey() != null) {
+            for (BatchRepository.IngredientRow row : repo.findRecipeIngredients(batch.recipeKey())) {
+                totalList.add(new WeighingChainResponse.Total(row.ingredient(),
+                        totals.getOrDefault(row.ingredient(), BigDecimal.ZERO), row.percentage()));
+            }
+        }
+        return new WeighingChainResponse(batchKey, batch.recipeKey(), batch.targetMass(),
+                batch.weighingVersion(), entries, totalList);
+    }
+
+    /**
+     * 拆分继承规划：各成分有效称量合计按子批目标质量比例精确折算，
+     * 全部子批目标质量之和须等于父批目标质量，任一成分无法在6位小数内精确继承则 422。
+     */
+    private Map<String, Map<String, BigDecimal>> planSplitInheritance(
+            BatchRepository.BatchRow parent, List<SplitRequest.ChildSpec> children,
+            Map<String, BigDecimal> parentTotals) {
+        BigDecimal parentTarget = parent.targetMass();
+        BigDecimal sum = BigDecimal.ZERO;
+        for (SplitRequest.ChildSpec child : children) {
+            if (child.targetMassGrams() == null) {
+                throw ApiException.badRequest("父批绑定配方时每个子批必须提供 targetMassGrams");
+            }
+            requireMass(child.targetMassGrams(), "targetMassGrams");
+            sum = sum.add(child.targetMassGrams());
+        }
+        if (sum.compareTo(parentTarget) != 0) {
+            throw ApiException.unprocessable("子批目标质量之和 "
+                    + sum.stripTrailingZeros().toPlainString() + " 不等于父批目标质量 "
+                    + parentTarget.stripTrailingZeros().toPlainString() + "，无法守恒拆分");
+        }
+        Map<String, Map<String, BigDecimal>> result = new LinkedHashMap<>();
+        for (SplitRequest.ChildSpec child : children) {
+            Map<String, BigDecimal> inherited = new LinkedHashMap<>();
+            for (Map.Entry<String, BigDecimal> entry : parentTotals.entrySet()) {
+                BigDecimal share;
+                try {
+                    share = entry.getValue().multiply(child.targetMassGrams())
+                            .divide(parentTarget, 6, RoundingMode.UNNECESSARY);
+                } catch (ArithmeticException ex) {
+                    throw ApiException.unprocessable("成分 " + entry.getKey()
+                            + " 按子批质量比例无法在6位小数内精确继承，拆分不守恒");
+                }
+                inherited.put(entry.getKey(), share);
+            }
+            result.put(child.batchKey(), inherited);
+        }
+        return result;
+    }
+
+    /**
+     * 放行配方门禁：每种成分齐全、有效称量总量精确等于目标总质量、
+     * 每项实际占比与声明占比偏差不超过0.1个百分点（判定不提前舍入）。
+     * 不达标抛 422 并携带全部成分差额，不允许只批准合格成分。
+     */
+    private void assertRecipeMetForRelease(BatchRepository.BatchRow batch) {
+        List<BatchRepository.IngredientRow> ingredients =
+                repo.findRecipeIngredients(batch.recipeKey());
+        Map<String, BigDecimal> totals = effectiveTotals(batch.batchKey());
+        BigDecimal target = batch.targetMass();
+        BigDecimal weighed = totals.values().stream().reduce(BigDecimal.ZERO, BigDecimal::add);
+        boolean met = weighed.compareTo(target) == 0;
+        List<IngredientDifference> diffs = new ArrayList<>(ingredients.size());
+        for (BatchRepository.IngredientRow ingredient : ingredients) {
+            BigDecimal actual = totals.get(ingredient.ingredient());
+            BigDecimal actualMass = actual == null ? BigDecimal.ZERO : actual;
+            BigDecimal expected = ingredient.percentage().multiply(target).movePointLeft(2);
+            BigDecimal actualPct = weighed.signum() == 0 ? BigDecimal.ZERO
+                    : actualMass.movePointRight(2).divide(weighed, MathContext.DECIMAL128);
+            BigDecimal deviation = actualPct.subtract(ingredient.percentage()).abs();
+            if (actual == null || deviation.compareTo(MAX_DEVIATION) > 0) {
+                met = false;
+            }
+            diffs.add(new IngredientDifference(ingredient.ingredient(), ingredient.percentage(),
+                    expected, actualMass, actualMass.subtract(expected),
+                    actualPct.setScale(6, RoundingMode.HALF_UP)));
+        }
+        if (!met) {
+            throw new RecipeDeviationException("批次 " + batch.batchKey() + " 称量不满足配方 "
+                    + batch.recipeKey() + "，禁止放行", diffs);
+        }
+    }
+
+    /**
+     * 批次当前有效称量按成分汇总（单位克）。
+     */
+    private Map<String, BigDecimal> effectiveTotals(String batchKey) {
+        Map<String, BigDecimal> totals = new LinkedHashMap<>();
+        for (BatchRepository.WeighingRow w : repo.findEffectiveWeighings(batchKey)) {
+            totals.merge(w.ingredient(), w.amount(), BigDecimal::add);
+        }
+        return totals;
+    }
+
+    /**
+     * 称量/更正前置条件：批次已绑定配方、无召回祖先、状态允许变更称量链
+     * （放行后冻结，已拆分父批不能再更正）。
+     */
+    private void assertWeighingAllowed(BatchRepository.BatchRow batch) {
+        if (batch.recipeKey() == null) {
+            throw ApiException.unprocessable("批次未绑定配方，不能称量: " + batch.batchKey());
+        }
+        assertNoRecalledAncestor(batch.batchKey());
+        BatchStatus status = BatchStatus.valueOf(batch.status());
+        if (status != BatchStatus.QUARANTINED && status != BatchStatus.PENDING_RELEASE
+                && status != BatchStatus.RELEASE_REVIEW) {
+            throw ApiException.conflict("批次状态 " + status + " 不允许称量或更正");
+        }
+    }
+
+    /**
+     * 质量输入校验：正值、最多6位小数、不超出 DECIMAL(19,6) 可表示范围，违反返回 400。
+     */
+    private void requireMass(BigDecimal value, String field) {
+        if (value.signum() <= 0) {
+            throw ApiException.badRequest(field + " 必须为正值");
+        }
+        if (value.stripTrailingZeros().scale() > 6) {
+            throw ApiException.badRequest(field + " 最多6位小数");
+        }
+        if (value.compareTo(MAX_MASS) > 0) {
+            throw ApiException.badRequest(field + " 超出可表示范围");
+        }
+    }
+
+    /**
+     * 操作人校验：X-Actor-Id 必填，缺失返回 400。
+     */
+    private String requireActor(String actorId) {
+        if (actorId == null || actorId.isBlank()) {
+            throw ApiException.badRequest("X-Actor-Id 不能为空");
+        }
+        return actorId.trim();
     }
 }

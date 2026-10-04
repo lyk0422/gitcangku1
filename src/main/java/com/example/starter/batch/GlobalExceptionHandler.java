@@ -1,5 +1,6 @@
 package com.example.starter.batch;
 
+import com.example.starter.batch.dto.RecipeDeviationErrorResponse;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -42,6 +43,15 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorResponse> handleMissingHeader(MissingRequestHeaderException ex) {
         return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                 .body(new ErrorResponse("INVALID_ARGUMENT", "缺少必需请求头: " + ex.getHeaderName()));
+    }
+
+    /**
+     * 配方不达标：422 并携带各成分差额明细。
+     */
+    @ExceptionHandler(RecipeDeviationException.class)
+    public ResponseEntity<RecipeDeviationErrorResponse> handleRecipeDeviation(RecipeDeviationException ex) {
+        return ResponseEntity.status(ex.status())
+                .body(new RecipeDeviationErrorResponse(ex.code(), ex.getMessage(), ex.differences()));
     }
 
     @ExceptionHandler(NoResourceFoundException.class)

@@ -7,6 +7,9 @@ CREATE TABLE IF NOT EXISTS batch (
     produced_at VARCHAR(40) NOT NULL COMMENT '生产时间，ISO-8601 UTC  instant 字符串',
     status VARCHAR(32) NOT NULL COMMENT '批次状态：QUARANTINED/PENDING_RELEASE/RELEASE_REVIEW/RELEASED/REJECTED/RECALLED/SPLIT',
     created_at VARCHAR(40) NOT NULL COMMENT '创建时间，ISO-8601 UTC instant 字符串',
+    recipe_key VARCHAR(64) NULL COMMENT '绑定的不可变配方版本业务键；NULL 表示未绑定配方，放行不做配方校验',
+    target_mass DECIMAL(19,6) NULL COMMENT '目标总质量，单位克，最多6位小数，正值；绑定配方时必填，未绑定为 NULL',
+    weighing_version INT NOT NULL DEFAULT 0 COMMENT '称量链版本号，从0开始，每次有效称量/更正/拆分继承递增，用于乐观并发与幂等身份',
     CONSTRAINT uk_batch_key UNIQUE (batch_key)
 );
 
@@ -65,4 +68,32 @@ CREATE TABLE IF NOT EXISTS batch_lineage (
     seq INT NOT NULL COMMENT '子批在拆分请求中的顺序，从 1 开始',
     created_at VARCHAR(40) NOT NULL COMMENT '拆分时间，ISO-8601 UTC instant 字符串',
     CONSTRAINT uk_lineage_child UNIQUE (child_key)
+);
+
+-- 配方称量：配方版本不可变，成分占比合计精确等于100；称量链只增不改，更正通过替代行实现。
+CREATE TABLE IF NOT EXISTS recipe_version (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    recipe_key VARCHAR(64) NOT NULL COMMENT '配方版本业务键，全局唯一，创建后不可变',
+    created_at VARCHAR(40) NOT NULL COMMENT '创建时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_recipe_key UNIQUE (recipe_key)
+);
+
+CREATE TABLE IF NOT EXISTS recipe_ingredient (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    recipe_key VARCHAR(64) NOT NULL COMMENT '所属配方版本业务键',
+    ingredient VARCHAR(128) NOT NULL COMMENT '成分名称，同一配方内唯一，创建后不可变',
+    percentage DECIMAL(7,4) NOT NULL COMMENT '质量百分比，最多4位小数，正值；同一配方全部成分合计精确等于100',
+    seq INT NOT NULL COMMENT '成分在创建请求中的顺序，从1开始'
+);
+
+-- 称量记录：只增不改；更正追加新行并把被替代行标记为失效，有效链为 superseded_by IS NULL 的行。
+CREATE TABLE IF NOT EXISTS weighing (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键，即称量ID，同时作为同批次称量顺序依据',
+    batch_key VARCHAR(64) NOT NULL COMMENT '所属批次业务键',
+    ingredient VARCHAR(128) NOT NULL COMMENT '成分名称，必须属于批次绑定的配方',
+    amount DECIMAL(19,6) NOT NULL COMMENT '称量值，单位克，最多6位小数，正值；更正行以替代量参与重算',
+    replaces_id BIGINT NULL COMMENT '更正时指向被替代的称量ID；NULL 表示原始称量或拆分继承',
+    superseded_by BIGINT NULL COMMENT '被更正时指向替代它的称量ID；NULL 表示当前有效',
+    actor_id VARCHAR(64) NOT NULL COMMENT '操作人标识；拆分继承行为 system:split',
+    created_at VARCHAR(40) NOT NULL COMMENT '称量时间，ISO-8601 UTC instant 字符串'
 );
