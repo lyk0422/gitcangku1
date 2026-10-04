@@ -21,6 +21,8 @@ import com.example.starter.baggage.BaggageDtos.LegResponse;
 import com.example.starter.baggage.BaggageDtos.LoadRequest;
 import com.example.starter.baggage.BaggageDtos.LoadResponse;
 import com.example.starter.baggage.BaggageDtos.ManifestResponse;
+import com.example.starter.baggage.BaggageDtos.PassengerListResponse;
+import com.example.starter.baggage.BaggageDtos.PassengerUpdateResponse;
 import com.example.starter.baggage.BaggageDtos.RecoverRequest;
 import com.example.starter.baggage.BaggageDtos.RecoverResponse;
 import com.example.starter.baggage.BaggageDtos.RegisterBagRequest;
@@ -28,6 +30,7 @@ import com.example.starter.baggage.BaggageDtos.RegisterLegRequest;
 import com.example.starter.baggage.BaggageDtos.SealRequest;
 import com.example.starter.baggage.BaggageDtos.SealResponse;
 import com.example.starter.baggage.BaggageDtos.ShortListResponse;
+import com.example.starter.baggage.BaggageDtos.UpdatePassengersRequest;
 
 /**
  * 联程行李装载交接 REST 入口。
@@ -101,6 +104,22 @@ public class BaggageController {
     @GetMapping("/legs/{legId}/difference")
     public LegDifferenceResponse getDifference(@PathVariable String legId) {
         return baggageService.getDifference(legId);
+    }
+
+    /**
+     * 登机名单更新：按航段当前版本裁决；新增旅客与安全卸载可同次原子完成；
+     * 移除已装载行李的旅客必须同次提交其全部行李卸载集合，任何漏项 422 且名单与装载都不变。
+     */
+    @PostMapping("/legs/{legId}/passengers")
+    public PassengerUpdateResponse updatePassengers(@PathVariable String legId,
+                                                    @Valid @RequestBody UpdatePassengersRequest request) {
+        return baggageService.updatePassengers(legId, request);
+    }
+
+    /** 登机名单查询：含封舱时冻结的名单版本、名单与旅客-行李关系快照。 */
+    @GetMapping("/legs/{legId}/passengers")
+    public PassengerListResponse getPassengers(@PathVariable String legId) {
+        return baggageService.getPassengers(legId);
     }
 
     /** 未补到短卸行李清单查询。 */

@@ -5,8 +5,11 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.function.Supplier;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -25,6 +28,8 @@ import com.example.starter.baggage.BaggageDtos.LegResponse;
 import com.example.starter.baggage.BaggageDtos.LoadRequest;
 import com.example.starter.baggage.BaggageDtos.LoadResponse;
 import com.example.starter.baggage.BaggageDtos.ManifestResponse;
+import com.example.starter.baggage.BaggageDtos.PassengerListResponse;
+import com.example.starter.baggage.BaggageDtos.PassengerUpdateResponse;
 import com.example.starter.baggage.BaggageDtos.RecoverRequest;
 import com.example.starter.baggage.BaggageDtos.RecoverResponse;
 import com.example.starter.baggage.BaggageDtos.RegisterBagRequest;
@@ -34,6 +39,7 @@ import com.example.starter.baggage.BaggageDtos.SealResponse;
 import com.example.starter.baggage.BaggageDtos.ShortItem;
 import com.example.starter.baggage.BaggageDtos.ShortListResponse;
 import com.example.starter.baggage.BaggageDtos.TraceEvent;
+import com.example.starter.baggage.BaggageDtos.UpdatePassengersRequest;
 
 /**
  * 联程行李装载交接核心业务：航段/行李登记、批量装载、封舱、精确/差异到达、补到与查询。
@@ -59,6 +65,7 @@ public class BaggageService {
     private static final String EVT_REGISTERED = "REGISTERED";
     private static final String EVT_LOADED = "LOADED";
     private static final String EVT_UNLOADED = "UNLOADED";
+    private static final String EVT_OFFLOAD = "OFFLOAD";
     private static final String EVT_SHORT = "SHORT_UNLOADED";
     private static final String EVT_RECOVERED = "RECOVERED";
     private static final String EVT_DELIVERED = "DELIVERED";
@@ -66,11 +73,16 @@ public class BaggageService {
     private static final RowMapper<LegRow> LEG_MAPPER = (rs, rowNum) -> new LegRow(
             rs.getString("leg_id"), rs.getString("origin"), rs.getString("destination"),
             rs.getString("status"), rs.getInt("version"), rs.getString("sealed_manifest"),
-            rs.getString("arrival_type"), rs.getString("arrival_actual"));
+            rs.getString("arrival_type"), rs.getString("arrival_actual"),
+            rs.getString("sealed_passengers"),
+            rs.getObject("sealed_passenger_version") == null ? null
+                    : ((Number) rs.getObject("sealed_passenger_version")).intValue(),
+            rs.getString("sealed_passenger_bags"));
 
     private static final RowMapper<BagRow> BAG_MAPPER = (rs, rowNum) -> new BagRow(
             rs.getString("bag_tag"), rs.getString("current_location"),
             rs.getInt("next_leg_index"), rs.getString("status"), rs.getString("loaded_leg_id"),
+            rs.getString("passenger_id"),
             rs.getString("short_leg_id"), rs.getString("short_destination"),
             getInstant(rs, "short_registered_at"));
 
@@ -195,6 +207,32 @@ public class BaggageService {
                 manifest, leg.arrivalType(), actual);
     }
 
+    /**
+     * 登机名单更新：按航段当前版本裁决（expectedLegVersion），仅 OPEN 航段可改；
+     * 新增旅客与安全卸载同次原子完成，移除已装载行李的旅客必须同次提交其全部行李卸载集合。
+     */
+    public PassengerUpdateResponse updatePassengers(String legId, UpdatePassengersRequest request) {
+        PassengerUpdatePayload payload = new PassengerUpdatePayload(legId, request.operator(),
+                request.expectedLegVersion(), sortedCopy(request.add()), sortedCopy(request.remove()),
+                sortedCopy(request.unloadBagTags()));
+        return idempotencyService.execute(request.requestId(), "UPDATE_PASSENGERS", 200,
+                payload, PassengerUpdateResponse.class, () -> doUpdatePassengers(legId, request));
+    }
+
+    /** 登机名单查询：含封舱时冻结的名单版本、名单与旅客-行李关系快照。 */
+    public PassengerListResponse getPassengers(String legId) {
+        LegRow leg = findLeg(legId);
+        if (leg == null) {
+            throw ApiException.notFound("航段不存在: " + legId);
+        }
+        List<String> sealedPassengers = leg.sealedPassengers() == null ? null
+                : readJsonList(leg.sealedPassengers());
+        Map<String, List<String>> sealedBags = leg.sealedPassengerBags() == null ? null
+                : readJsonMap(leg.sealedPassengerBags());
+        return new PassengerListResponse(leg.legId(), leg.status(), leg.version(),
+                boardedPassengers(legId), leg.sealedPassengerVersion(), sealedPassengers, sealedBags);
+    }
+
     /** 未补到短卸行李清单查询：仅含当前仍为 SHORT_UNLOADED 的行李。 */
     public ShortListResponse listShortUnloaded() {
         List<ShortItem> items = jdbcTemplate.query(
@@ -239,8 +277,9 @@ public class BaggageService {
         }
         String startStation = legs.get(0).origin();
         jdbcTemplate.update(
-                "INSERT INTO bag (bag_tag, current_location, next_leg_index, status) VALUES (?, ?, 0, ?)",
-                request.bagTag(), startStation, BAG_IN_TRANSIT);
+                "INSERT INTO bag (bag_tag, current_location, next_leg_index, status, passenger_id)"
+                        + " VALUES (?, ?, 0, ?, ?)",
+                request.bagTag(), startStation, BAG_IN_TRANSIT, request.passengerId());
         for (int i = 0; i < legs.size(); i++) {
             LegRow leg = legs.get(i);
             jdbcTemplate.update(
@@ -289,10 +328,36 @@ public class BaggageService {
         }
         List<String> manifest = jdbcTemplate.queryForList(
                 "SELECT bag_tag FROM load_record WHERE leg_id = ? ORDER BY bag_tag", String.class, legId);
+        List<String> boarded = boardedPassengers(legId);
+        // 绑定旅客的行李仅旅客已登机时可封舱；无旅客绑定的旧行李沿用原规则
+        Set<String> boardedSet = new HashSet<>(boarded);
+        List<String> notBoarded = jdbcTemplate.queryForList(
+                "SELECT DISTINCT b.passenger_id FROM load_record lr"
+                        + " JOIN bag b ON b.bag_tag = lr.bag_tag"
+                        + " WHERE lr.leg_id = ? AND b.passenger_id IS NOT NULL ORDER BY b.passenger_id",
+                String.class, legId).stream().filter(pid -> !boardedSet.contains(pid)).toList();
+        if (!notBoarded.isEmpty()) {
+            throw ApiException.unprocessable("旅客未登机，禁止封舱: " + String.join(", ", notBoarded));
+        }
+        // 封舱冻结旅客版本、登机名单与旅客-行李关系快照
+        Map<String, List<String>> passengerBags = new LinkedHashMap<>();
+        jdbcTemplate.query(
+                "SELECT b.passenger_id, b.bag_tag FROM load_record lr"
+                        + " JOIN bag b ON b.bag_tag = lr.bag_tag"
+                        + " WHERE lr.leg_id = ? AND b.passenger_id IS NOT NULL"
+                        + " ORDER BY b.passenger_id, b.bag_tag",
+                rs -> {
+                    passengerBags.computeIfAbsent(rs.getString(1), key -> new ArrayList<>())
+                            .add(rs.getString(2));
+                }, legId);
         int newVersion = leg.version() + 1;
-        jdbcTemplate.update("UPDATE leg SET status = ?, version = ?, sealed_manifest = ? WHERE leg_id = ?",
-                LEG_SEALED, newVersion, writeJson(manifest), legId);
-        return new SealResponse(legId, LEG_SEALED, newVersion, manifest);
+        jdbcTemplate.update(
+                "UPDATE leg SET status = ?, version = ?, sealed_manifest = ?,"
+                        + " sealed_passengers = ?, sealed_passenger_version = ?, sealed_passenger_bags = ?"
+                        + " WHERE leg_id = ?",
+                LEG_SEALED, newVersion, writeJson(manifest), writeJson(boarded), leg.version(),
+                writeJsonMap(passengerBags), legId);
+        return new SealResponse(legId, LEG_SEALED, newVersion, manifest, boarded);
     }
 
     private ArriveResponse doArrive(String legId, ArriveRequest request) {
@@ -458,7 +523,8 @@ public class BaggageService {
 
     private static String legSelect(boolean forUpdate) {
         return "SELECT leg_id, origin, destination, status, version, sealed_manifest,"
-                + " arrival_type, arrival_actual FROM leg WHERE leg_id = ?"
+                + " arrival_type, arrival_actual, sealed_passengers, sealed_passenger_version,"
+                + " sealed_passenger_bags FROM leg WHERE leg_id = ?"
                 + (forUpdate ? " FOR UPDATE" : "");
     }
 
@@ -474,7 +540,8 @@ public class BaggageService {
 
     private static String bagSelect(boolean forUpdate) {
         return "SELECT bag_tag, current_location, next_leg_index, status, loaded_leg_id,"
-                + " short_leg_id, short_destination, short_registered_at FROM bag WHERE bag_tag = ?"
+                + " passenger_id, short_leg_id, short_destination, short_registered_at"
+                + " FROM bag WHERE bag_tag = ?"
                 + (forUpdate ? " FOR UPDATE" : "");
     }
 
@@ -518,7 +585,7 @@ public class BaggageService {
 
     private BagResponse toBagResponse(BagRow bag) {
         return new BagResponse(bag.bagTag(), bag.currentLocation(), bag.nextLegIndex(),
-                bag.status(), bag.loadedLegId(), toItinerary(bag.bagTag()),
+                bag.status(), bag.loadedLegId(), bag.passengerId(), toItinerary(bag.bagTag()),
                 bag.shortLegId(), bag.shortDestination(),
                 bag.shortRegisteredAt() == null ? null : bag.shortRegisteredAt().toString(),
                 toEvents(bag.bagTag()));
@@ -541,6 +608,23 @@ public class BaggageService {
         }
     }
 
+    private String writeJsonMap(Map<String, List<String>> values) {
+        try {
+            return objectMapper.writeValueAsString(values);
+        } catch (Exception ex) {
+            throw new IllegalStateException("快照序列化失败", ex);
+        }
+    }
+
+    private Map<String, List<String>> readJsonMap(String json) {
+        try {
+            return objectMapper.readValue(json, objectMapper.getTypeFactory()
+                    .constructMapType(LinkedHashMap.class, String.class, List.class));
+        } catch (Exception ex) {
+            throw new IllegalStateException("快照反序列化失败", ex);
+        }
+    }
+
     private List<String> readJsonList(String json) {
         try {
             return objectMapper.readValue(json,
@@ -552,12 +636,112 @@ public class BaggageService {
 
     private record LegRow(String legId, String origin, String destination,
                           String status, int version, String sealedManifest,
-                          String arrivalType, String arrivalActual) {
+                          String arrivalType, String arrivalActual,
+                          String sealedPassengers, Integer sealedPassengerVersion,
+                          String sealedPassengerBags) {
     }
 
     private record BagRow(String bagTag, String currentLocation, int nextLegIndex,
-                          String status, String loadedLegId, String shortLegId,
-                          String shortDestination, Instant shortRegisteredAt) {
+                          String status, String loadedLegId, String passengerId,
+                          String shortLegId, String shortDestination, Instant shortRegisteredAt) {
+    }
+
+    private PassengerUpdateResponse doUpdatePassengers(String legId, UpdatePassengersRequest request) {
+        LegRow leg = lockLeg(legId);
+        checkVersion(leg, request.expectedLegVersion());
+        if (!LEG_OPEN.equals(leg.status())) {
+            throw ApiException.unprocessable("航段状态为 " + leg.status() + "，登机名单已冻结，禁止修改");
+        }
+        List<String> add = request.add();
+        List<String> remove = request.remove();
+        List<String> unload = request.unloadBagTags();
+        if (hasDuplicate(add) || hasDuplicate(remove)) {
+            throw ApiException.badRequest("名单作为集合，旅客编号不得重复");
+        }
+        if (hasDuplicate(unload)) {
+            throw ApiException.badRequest("卸载集合作为集合，bagTag 不得重复");
+        }
+        Set<String> addSet = new HashSet<>(add);
+        Set<String> removeSet = new HashSet<>(remove);
+        Set<String> overlap = new TreeSet<>(addSet);
+        overlap.retainAll(removeSet);
+        if (!overlap.isEmpty()) {
+            throw ApiException.badRequest("同一旅客不能同时出现在新增与移除集合: "
+                    + String.join(", ", overlap));
+        }
+        // 移除旅客在本航段的全部已装载行李必须同次提交卸载集合，漏项或夹带均整单拒绝
+        List<String> required = requiredUnloads(legId, removeSet);
+        Set<String> requiredSet = new HashSet<>(required);
+        Set<String> unloadSet = new HashSet<>(unload);
+        if (!unloadSet.equals(requiredSet)) {
+            Set<String> missing = new TreeSet<>(requiredSet);
+            missing.removeAll(unloadSet);
+            Set<String> extra = new TreeSet<>(unloadSet);
+            extra.removeAll(requiredSet);
+            StringBuilder message = new StringBuilder("卸载集合与移除旅客的已装载行李不一致:");
+            if (!missing.isEmpty()) {
+                message.append(" 漏项 ").append(String.join(", ", missing)).append(";");
+            }
+            if (!extra.isEmpty()) {
+                message.append(" 夹带 ").append(String.join(", ", extra)).append(";");
+            }
+            throw ApiException.unprocessable(message.toString());
+        }
+        Set<String> boardedBefore = new HashSet<>(boardedPassengers(legId));
+        for (String passengerId : sortedCopy(remove)) {
+            jdbcTemplate.update("DELETE FROM leg_passenger WHERE leg_id = ? AND passenger_id = ?",
+                    legId, passengerId);
+        }
+        for (String passengerId : sortedCopy(add)) {
+            if (!boardedBefore.contains(passengerId)) {
+                jdbcTemplate.update("INSERT INTO leg_passenger (leg_id, passenger_id) VALUES (?, ?)",
+                        legId, passengerId);
+            }
+        }
+        // 安全卸载：仅当前航段未封舱行李，原行程保留以供后续重新装载
+        for (String bagTag : required) {
+            jdbcTemplate.update("DELETE FROM load_record WHERE bag_tag = ?", bagTag);
+            jdbcTemplate.update("UPDATE bag SET loaded_leg_id = NULL WHERE bag_tag = ?", bagTag);
+            insertEvent(bagTag, EVT_OFFLOAD, legId, leg.origin());
+        }
+        int newVersion = leg.version() + 1;
+        jdbcTemplate.update("UPDATE leg SET version = ? WHERE leg_id = ?", newVersion, legId);
+        return new PassengerUpdateResponse(legId, LEG_OPEN, newVersion,
+                boardedPassengers(legId), required);
+    }
+
+    /** 移除旅客集合在本航段的全部已装载袋号（升序），无移除旅客时为空集。 */
+    private List<String> requiredUnloads(String legId, Set<String> removeSet) {
+        if (removeSet.isEmpty()) {
+            return List.of();
+        }
+        List<String> passengers = removeSet.stream().sorted().toList();
+        String placeholders = String.join(", ", passengers.stream().map(pid -> "?").toList());
+        List<Object> args = new ArrayList<>();
+        args.add(legId);
+        args.addAll(passengers);
+        return jdbcTemplate.queryForList(
+                "SELECT lr.bag_tag FROM load_record lr JOIN bag b ON b.bag_tag = lr.bag_tag"
+                        + " WHERE lr.leg_id = ? AND b.passenger_id IN (" + placeholders + ")"
+                        + " ORDER BY lr.bag_tag",
+                String.class, args.toArray());
+    }
+
+    /** 当前登机名单（升序）。 */
+    private List<String> boardedPassengers(String legId) {
+        return jdbcTemplate.queryForList(
+                "SELECT passenger_id FROM leg_passenger WHERE leg_id = ? ORDER BY passenger_id",
+                String.class, legId);
+    }
+
+    private static boolean hasDuplicate(List<String> values) {
+        return new HashSet<>(values).size() != values.size();
+    }
+
+    /** 登机名单更新幂等摘要参数：集合已排序，顺序差异不视为异参；expectedLegVersion 改变属于异参。 */
+    private record PassengerUpdatePayload(String legId, String operator, int expectedLegVersion,
+                                          List<String> add, List<String> remove,
+                                          List<String> unloadBagTags) {
     }
 
     /** 装载幂等摘要参数：bagTags 已排序，顺序差异不视为异参。 */

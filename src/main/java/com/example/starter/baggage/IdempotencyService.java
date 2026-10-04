@@ -17,8 +17,10 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 /**
  * 幂等去重服务：所有写操作携带全局唯一 requestId。
- * 同键同参重放原成功结果，同键异参返回 409；失败请求不占键，
- * 业务变更与去重记录在同一事务中原子提交。
+ * 请求身份为结构化指纹（操作类型 + 规范化参数，含操作者、资源与期望版本），
+ * 以 JSON 序列化后取 SHA-256，避免分隔符拼接碰撞；
+ * 同键同参重放首次完整响应，同键异参返回 409；失败请求不占键，
+ * 业务变更与去重记录在同一事务中原子提交，并发竞争不泄露唯一键异常。
  */
 @Service
 public class IdempotencyService {
@@ -50,7 +52,7 @@ public class IdempotencyService {
      */
     public <T> T execute(String requestId, String operation, int successStatus,
                          Object payload, Class<T> resultType, Supplier<T> action) {
-        String hash = sha256(writeJson(payload));
+        String hash = sha256(writeJson(new RequestFingerprint(operation, payload)));
         Object lock = locks.computeIfAbsent(requestId, key -> new Object());
         synchronized (lock) {
             try {
@@ -118,5 +120,9 @@ public class IdempotencyService {
     }
 
     private record StoredRequest(String requestHash, String responseBody) {
+    }
+
+    /** 请求身份指纹：操作类型与规范化参数的结构化组合，JSON 序列化后取摘要。 */
+    private record RequestFingerprint(String operation, Object payload) {
     }
 }

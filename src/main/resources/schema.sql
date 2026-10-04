@@ -12,6 +12,9 @@ CREATE TABLE IF NOT EXISTS leg (
     sealed_manifest CLOB         NULL COMMENT '封舱时的只读装载清单（JSON 数组），未封舱为 NULL',
     arrival_type    VARCHAR(16)  NULL COMMENT '到达确认类型：NULL 未到达，EXACT 精确到达，DIFF 差异到达',
     arrival_actual  CLOB         NULL COMMENT '差异到达实际到达袋号只读快照（JSON 数组），未差异到达为 NULL',
+    sealed_passengers         CLOB NULL COMMENT '封舱时登机名单只读快照（JSON 数组），未封舱为 NULL',
+    sealed_passenger_version  INT  NULL COMMENT '封舱时冻结的登机名单版本（封舱前航段版本），未封舱为 NULL',
+    sealed_passenger_bags     CLOB NULL COMMENT '封舱时旅客与已装载行李关系只读快照（JSON 对象：旅客编号 -> 袋号数组），未封舱为 NULL',
     created_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     PRIMARY KEY (leg_id)
 );
@@ -23,6 +26,7 @@ CREATE TABLE IF NOT EXISTS bag (
     next_leg_index      INT          NOT NULL DEFAULT 0 COMMENT '待乘航段在行程中的下标（0 起），等于行程长度表示已完成；短卸不推进',
     status              VARCHAR(16)  NOT NULL DEFAULT 'IN_TRANSIT' COMMENT '行李状态：IN_TRANSIT 在途/SHORT_UNLOADED 短卸待补/RECOVERED 已补到在途/DELIVERED 已交付',
     loaded_leg_id       VARCHAR(64)  NULL COMMENT '当前已装载到的航段，未装载为 NULL',
+    passenger_id        VARCHAR(64)  NULL COMMENT '绑定的合成旅客编号，未绑定为 NULL；绑定旅客的行李仅旅客已登机时可封舱',
     short_leg_id        VARCHAR(64)  NULL COMMENT '短卸缺失航段标识，仅 SHORT_UNLOADED 状态非 NULL',
     short_destination   VARCHAR(64)  NULL COMMENT '短卸应到站点代码，仅 SHORT_UNLOADED 状态非 NULL',
     short_registered_at TIMESTAMP WITH TIME ZONE NULL COMMENT '短卸登记时刻（UTC），仅 SHORT_UNLOADED 状态非 NULL',
@@ -48,12 +52,20 @@ CREATE TABLE IF NOT EXISTS load_record (
     PRIMARY KEY (bag_tag)
 );
 
+-- 航段登机名单：按航段维护的旅客集合，(leg_id, passenger_id) 唯一；封舱后冻结不得修改
+CREATE TABLE IF NOT EXISTS leg_passenger (
+    leg_id       VARCHAR(64) NOT NULL COMMENT '航段标识',
+    passenger_id VARCHAR(64) NOT NULL COMMENT '合成旅客编号',
+    boarded_at   TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '加入登机名单时间（数据库会话时区，默认 JVM 时区 Asia/Shanghai）',
+    PRIMARY KEY (leg_id, passenger_id)
+);
+
 -- 行李实际事件流：支撑完整轨迹查询，(bag_tag, seq) 唯一保证每件行李事件顺序不重复
 CREATE TABLE IF NOT EXISTS bag_event (
     id         BIGINT AUTO_INCREMENT NOT NULL COMMENT '事件自增主键',
     bag_tag    VARCHAR(64)  NOT NULL COMMENT '行李牌号',
     seq        INT          NOT NULL COMMENT '该行李内事件顺序，0 起递增',
-    event_type VARCHAR(32)  NOT NULL COMMENT '事件类型：REGISTERED 登记/LOADED 装载/UNLOADED 到达卸下/SHORT_UNLOADED 短卸/RECOVERED 补到/DELIVERED 交付',
+    event_type VARCHAR(32)  NOT NULL COMMENT '事件类型：REGISTERED 登记/LOADED 装载/UNLOADED 到达卸下/OFFLOAD 安全卸载（旅客名单核对卸下，原行程保留）/SHORT_UNLOADED 短卸/RECOVERED 补到/DELIVERED 交付',
     leg_id     VARCHAR(64)  NULL COMMENT '关联航段标识，与航段无关的事件为 NULL',
     location   VARCHAR(64)  NULL COMMENT '事件发生后行李所在站点代码',
     event_time TIMESTAMP WITH TIME ZONE NOT NULL COMMENT '事件发生时刻（UTC）',
@@ -64,7 +76,7 @@ CREATE TABLE IF NOT EXISTS bag_event (
 -- 幂等去重：仅记录成功请求；同 requestId 同参数重放原结果，异参数返回 409
 CREATE TABLE IF NOT EXISTS request_log (
     request_id      VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
-    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER',
+    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER/UPDATE_PASSENGERS',
     request_hash    VARCHAR(64)  NOT NULL COMMENT '请求参数（不含 requestId）的 SHA-256 摘要',
     response_status INT          NOT NULL COMMENT '原成功响应的 HTTP 状态码',
     response_body   CLOB         NOT NULL COMMENT '原成功响应体（JSON）',
