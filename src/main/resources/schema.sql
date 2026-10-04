@@ -83,3 +83,66 @@ COMMENT ON TABLE publish_lock IS '发布/改签全局互斥锁，保证并发发
 COMMENT ON COLUMN publish_lock.id IS '锁行 id，固定为 1，发布与改签时 SELECT ... FOR UPDATE 串行化';
 
 MERGE INTO publish_lock KEY(id) VALUES (1);
+
+CREATE TABLE IF NOT EXISTS rail_train_profile (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    train_no VARCHAR(64) NOT NULL,
+    traction_mode VARCHAR(16) NOT NULL,
+    version INT NOT NULL,
+    created_at BIGINT NOT NULL,
+    updated_at BIGINT NOT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT uk_rail_train_profile_train_no UNIQUE (train_no)
+);
+COMMENT ON TABLE rail_train_profile IS '列车牵引档案，每列车一条；发布与改签按占用列车逐一核对';
+COMMENT ON COLUMN rail_train_profile.id IS '主键';
+COMMENT ON COLUMN rail_train_profile.train_no IS '列车编号，全局唯一';
+COMMENT ON COLUMN rail_train_profile.traction_mode IS '牵引方式：ELECTRIC 电力（要求全程供电）/ DIESEL 柴油（要求全程允许柴油）';
+COMMENT ON COLUMN rail_train_profile.version IS '档案版本，从 1 开始，每次变更携带 expectedVersion 成功加一';
+COMMENT ON COLUMN rail_train_profile.created_at IS '创建时刻，UTC 毫秒';
+COMMENT ON COLUMN rail_train_profile.updated_at IS '最近变更时刻，UTC 毫秒';
+
+CREATE TABLE IF NOT EXISTS rail_section_profile (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    section_id VARCHAR(64) NOT NULL,
+    electrified BOOLEAN NOT NULL,
+    diesel_allowed BOOLEAN NOT NULL,
+    version INT NOT NULL,
+    created_at BIGINT NOT NULL,
+    updated_at BIGINT NOT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT uk_rail_section_profile_section_id UNIQUE (section_id)
+);
+COMMENT ON TABLE rail_section_profile IS '区段牵引档案，声明是否供电与是否允许柴油车通行';
+COMMENT ON COLUMN rail_section_profile.id IS '主键';
+COMMENT ON COLUMN rail_section_profile.section_id IS '区段 ID，全局唯一';
+COMMENT ON COLUMN rail_section_profile.electrified IS '是否供电；电力车要求占用全程为 true';
+COMMENT ON COLUMN rail_section_profile.diesel_allowed IS '是否允许柴油车通行；柴油车要求占用全程为 true';
+COMMENT ON COLUMN rail_section_profile.version IS '档案版本，从 1 开始，每次变更携带 expectedVersion 成功加一';
+COMMENT ON COLUMN rail_section_profile.created_at IS '创建时刻，UTC 毫秒';
+COMMENT ON COLUMN rail_section_profile.updated_at IS '最近变更时刻，UTC 毫秒';
+
+CREATE TABLE IF NOT EXISTS rail_plan_traction_snapshot (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    plan_id BIGINT NOT NULL,
+    train_no VARCHAR(64) NOT NULL,
+    traction_mode VARCHAR(16) NOT NULL,
+    section_id VARCHAR(64) NOT NULL,
+    electrified BOOLEAN NOT NULL,
+    diesel_allowed BOOLEAN NOT NULL,
+    section_version INT NOT NULL,
+    created_at BIGINT NOT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT uk_plan_traction_snapshot UNIQUE (plan_id, train_no, section_id)
+);
+COMMENT ON TABLE rail_plan_traction_snapshot IS '发布/改签成功时冻结的牵引快照：牵引方式与每段档案值、版本；后续档案合法变更不改历史';
+COMMENT ON COLUMN rail_plan_traction_snapshot.id IS '主键';
+COMMENT ON COLUMN rail_plan_traction_snapshot.plan_id IS '所属计划 id，关联 rail_day_plan.id';
+COMMENT ON COLUMN rail_plan_traction_snapshot.train_no IS '列车编号（发布时刻占用涉及的列车）';
+COMMENT ON COLUMN rail_plan_traction_snapshot.traction_mode IS '发布时刻冻结的牵引方式：ELECTRIC / DIESEL';
+COMMENT ON COLUMN rail_plan_traction_snapshot.section_id IS '区段 ID（发布时刻占用涉及的区段）';
+COMMENT ON COLUMN rail_plan_traction_snapshot.electrified IS '发布时刻冻结的是否供电';
+COMMENT ON COLUMN rail_plan_traction_snapshot.diesel_allowed IS '发布时刻冻结的是否允许柴油';
+COMMENT ON COLUMN rail_plan_traction_snapshot.section_version IS '发布时刻冻结的区段档案版本';
+COMMENT ON COLUMN rail_plan_traction_snapshot.created_at IS '快照创建时刻，UTC 毫秒';
+CREATE INDEX IF NOT EXISTS idx_plan_traction_snapshot_plan ON rail_plan_traction_snapshot (plan_id);

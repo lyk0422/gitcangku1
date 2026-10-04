@@ -2,12 +2,16 @@ package com.example.starter.plan;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.example.starter.plan.model.TractionMode;
 import com.example.starter.plan.service.PlanService;
+import com.example.starter.plan.service.TractionService;
 import com.example.starter.plan.web.ApiException;
 import com.example.starter.plan.web.dto.CreatePlanRequest;
 import com.example.starter.plan.web.dto.OccupancyRequest;
 import com.example.starter.plan.web.dto.RescheduleChainResponse;
 import com.example.starter.plan.web.dto.RescheduleRequest;
+import com.example.starter.plan.web.dto.SectionProfileRequest;
+import com.example.starter.plan.web.dto.TrainProfileRequest;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
@@ -38,6 +42,9 @@ class PlanRescheduleConcurrencyTest {
 
     @Autowired
     private PlanService service;
+
+    @Autowired
+    private TractionService tractionService;
 
     @Autowired
     private JdbcTemplate jdbc;
@@ -161,9 +168,22 @@ class PlanRescheduleConcurrencyTest {
     }
 
     private void createDraft(String scheduleKey, String section, int startHour, int endHour) {
+        String trainNo = "G-" + UUID.randomUUID();
+        ensureTractionProfiles(trainNo, section);
         service.createDraft(new CreatePlanRequest(key("REQ"), scheduleKey, DAY,
-                List.of(new OccupancyRequest("G-" + UUID.randomUUID(), section,
-                        at(startHour), at(endHour)))));
+                List.of(new OccupancyRequest(trainNo, section, at(startHour), at(endHour)))));
+    }
+
+    /** 准备牵引档案（电力车 + 区段供电且允许柴油），不存在才创建。 */
+    private void ensureTractionProfiles(String trainNo, String sectionId) {
+        if (tractionService.findTrainProfile(trainNo).isEmpty()) {
+            tractionService.upsertTrainProfile(trainNo, new TrainProfileRequest(
+                    key("REQ"), "tester", TractionMode.ELECTRIC, 0));
+        }
+        if (tractionService.findSectionProfile(sectionId).isEmpty()) {
+            tractionService.upsertSectionProfile(sectionId, new SectionProfileRequest(
+                    key("REQ"), "tester", true, true, 0));
+        }
     }
 
     private List<Outcome> runConcurrently(List<Callable<Outcome>> tasks) throws Exception {

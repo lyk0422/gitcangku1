@@ -413,9 +413,37 @@ class PlanRescheduleApiTest {
     }
 
     private void createPlan(String scheduleKey, String... occupancies) throws Exception {
+        ensureTractionProfiles(occupancies);
         mvc.perform(post("/api/v1/plans").contentType(MediaType.APPLICATION_JSON)
                         .content(createBody(key("REQ"), scheduleKey, occupancies)))
                 .andExpect(status().isCreated());
+    }
+
+    /** 为占用涉及的列车与区段准备牵引档案（电力车 + 区段供电且允许柴油），不存在才创建。 */
+    private void ensureTractionProfiles(String... occupancies) throws Exception {
+        for (String occJson : occupancies) {
+            JsonNode occ = objectMapper.readTree(occJson);
+            String trainNo = occ.get("trainNo").asText();
+            String sectionId = occ.get("sectionId").asText();
+            if (mvc.perform(get("/api/v1/train-profiles/{trainNo}", trainNo)).andReturn()
+                    .getResponse().getStatus() == 404) {
+                mvc.perform(put("/api/v1/train-profiles/{trainNo}", trainNo)
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .content("{\"requestId\":\"" + key("REQ")
+                                        + "\",\"operator\":\"tester\",\"tractionMode\":\"ELECTRIC\""
+                                        + ",\"expectedVersion\":0}"))
+                        .andExpect(status().isOk());
+            }
+            if (mvc.perform(get("/api/v1/section-profiles/{sectionId}", sectionId)).andReturn()
+                    .getResponse().getStatus() == 404) {
+                mvc.perform(put("/api/v1/section-profiles/{sectionId}", sectionId)
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .content("{\"requestId\":\"" + key("REQ")
+                                        + "\",\"operator\":\"tester\",\"electrified\":true"
+                                        + ",\"dieselAllowed\":true,\"expectedVersion\":0}"))
+                        .andExpect(status().isOk());
+            }
+        }
     }
 
     private void publishPlan(String scheduleKey, String requestKey) throws Exception {

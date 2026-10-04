@@ -219,4 +219,24 @@ public class PlanRepository {
     public void acquirePublishLock() {
         jdbc.queryForObject("SELECT id FROM publish_lock WHERE id = 1 FOR UPDATE", Integer.class);
     }
+
+    /**
+     * 查询占用涉及指定列车的全部已发布计划（牵引档案变更守卫用）。
+     */
+    public List<DayPlan> findPublishedPlansByTrain(String trainNo) {
+        return jdbc.query("SELECT DISTINCT p.id, p.schedule_key, p.op_date, p.version, p.status"
+                        + " FROM rail_day_plan p JOIN rail_plan_occupancy o ON o.plan_id = p.id"
+                        + " WHERE p.status = 'PUBLISHED' AND o.train_no = ? ORDER BY p.id",
+                PLAN_MAPPER, trainNo);
+    }
+
+    /**
+     * 查询占用涉及指定区段的全部已发布计划（区段档案变更守卫用）。
+     */
+    public List<DayPlan> findPublishedPlansBySection(String sectionId) {
+        return jdbc.query("SELECT DISTINCT p.id, p.schedule_key, p.op_date, p.version, p.status"
+                        + " FROM rail_day_plan p JOIN rail_plan_occupancy o ON o.plan_id = p.id"
+                        + " WHERE p.status = 'PUBLISHED' AND o.section_id = ? ORDER BY p.id",
+                PLAN_MAPPER, sectionId);
+    }
 }

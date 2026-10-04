@@ -19,9 +19,6 @@ import com.example.starter.plan.web.dto.RescheduleRequest;
 import com.example.starter.plan.web.dto.RescheduleResponse;
 import com.example.starter.plan.web.dto.UpdateOccupanciesRequest;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
@@ -60,13 +57,18 @@ public class PlanService {
 
     private final PlanRepository planRepo;
     private final IdempotencyRepository idemRepo;
+    private final TractionService tractionService;
+    private final RequestFingerprint fingerprint;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate tx;
 
     public PlanService(PlanRepository planRepo, IdempotencyRepository idemRepo,
+                       TractionService tractionService, RequestFingerprint fingerprint,
                        ObjectMapper objectMapper, PlatformTransactionManager txManager) {
         this.planRepo = planRepo;
         this.idemRepo = idemRepo;
+        this.tractionService = tractionService;
+        this.fingerprint = fingerprint;
         this.objectMapper = objectMapper;
         this.tx = new TransactionTemplate(txManager);
     }
@@ -161,8 +163,10 @@ public class PlanService {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "存在时隙冲突，计划保持草稿", conflicts);
                 }
+                tractionService.assertCompatible(occupancies);
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(plan.id(), PlanStatus.PUBLISHED, now);
+                tractionService.freezeSnapshot(plan.id(), occupancies, now);
                 PlanResponse response = loadPlan(scheduleKey);
                 idemRepo.insert(OP_PUBLISH, requestKey, hash, toJson(response), now);
                 return response;
@@ -260,10 +264,12 @@ public class PlanService {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "新草稿存在时隙冲突，改签未生效", conflicts);
                 }
+                tractionService.assertCompatible(occupancies);
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(oldPlan.id(), PlanStatus.CANCELLED, now);
                 planRepo.updateStatus(newPlan.id(), PlanStatus.PUBLISHED, now);
                 planRepo.insertRescheduleLink(oldPlan.id(), newPlan.id(), now);
+                tractionService.freezeSnapshot(newPlan.id(), occupancies, now);
                 RescheduleResponse response = new RescheduleResponse(
                         loadPlan(oldScheduleKey), loadPlan(req.newScheduleKey()));
                 idemRepo.insert(OP_RESCHEDULE, req.requestKey(), hash, toJson(response), now);
@@ -481,50 +487,58 @@ public class PlanService {
                 .orElseThrow(() -> conflict("SCHEDULE_KEY_EXISTS", "scheduleKey 已存在"));
     }
 
+    /**
+     * 结构化身份指纹：操作、资源与全部参数（含期望版本）按有序键值序列化，
+     * 避免字符串拼接分隔符与参数内容碰撞。
+     */
     private String hashCreate(CreatePlanRequest req) {
-        StringBuilder sb = new StringBuilder(OP_CREATE).append('\n')
-                .append(req.scheduleKey()).append('\n').append(req.opDate());
-        appendOccupancies(sb, req.occupancies());
-        return sha256(sb.toString());
+        Map<String, Object> identity = new LinkedHashMap<>();
+        identity.put("op", OP_CREATE);
+        identity.put("scheduleKey", req.scheduleKey());
+        identity.put("opDate", req.opDate().toString());
+        identity.put("occupancies", occupancyParams(req.occupancies()));
+        return fingerprint.of(identity);
     }
 
     private String hashUpdate(String scheduleKey, UpdateOccupanciesRequest req) {
-        StringBuilder sb = new StringBuilder(OP_UPDATE).append('\n')
-                .append(scheduleKey).append('\n').append(req.expectedVersion());
-        appendOccupancies(sb, req.occupancies());
-        return sha256(sb.toString());
+        Map<String, Object> identity = new LinkedHashMap<>();
+        identity.put("op", OP_UPDATE);
+        identity.put("scheduleKey", scheduleKey);
+        identity.put("expectedVersion", req.expectedVersion());
+        identity.put("occupancies", occupancyParams(req.occupancies()));
+        return fingerprint.of(identity);
     }
 
     private String hashAction(String opType, String scheduleKey) {
-        return sha256(opType + '\n' + scheduleKey);
+        Map<String, Object> identity = new LinkedHashMap<>();
+        identity.put("op", opType);
+        identity.put("scheduleKey", scheduleKey);
+        return fingerprint.of(identity);
     }
 
     private String hashReschedule(String oldScheduleKey, RescheduleRequest req) {
-        return sha256(OP_RESCHEDULE + '\n' + oldScheduleKey + '\n' + req.newScheduleKey()
-                + '\n' + req.expectedOldVersion() + '\n' + req.expectedNewVersion());
+        Map<String, Object> identity = new LinkedHashMap<>();
+        identity.put("op", OP_RESCHEDULE);
+        identity.put("oldScheduleKey", oldScheduleKey);
+        identity.put("newScheduleKey", req.newScheduleKey());
+        identity.put("expectedOldVersion", req.expectedOldVersion());
+        identity.put("expectedNewVersion", req.expectedNewVersion());
+        return fingerprint.of(identity);
     }
 
-    private void appendOccupancies(StringBuilder sb, List<OccupancyRequest> occupancies) {
+    private List<Map<String, Object>> occupancyParams(List<OccupancyRequest> occupancies) {
+        List<Map<String, Object>> params = new ArrayList<>(occupancies.size());
         for (OccupancyRequest o : occupancies) {
-            sb.append('\n').append(o.trainNo()).append('|').append(o.sectionId()).append('|')
-                    .append(o.startUtc().toEpochMilli()).append('|').append(o.endUtc().toEpochMilli());
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.put("trainNo", o.trainNo());
+            item.put("sectionId", o.sectionId());
+            item.put("startUtc", o.startUtc().toEpochMilli());
+            item.put("endUtc", o.endUtc().toEpochMilli());
+            params.add(item);
         }
+        return params;
     }
 
-    private String sha256(String text) {
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] hashed = digest.digest(text.getBytes(StandardCharsets.UTF_8));
-            StringBuilder hex = new StringBuilder(hashed.length * 2);
-            for (byte b : hashed) {
-                hex.append(Character.forDigit((b >> 4) & 0xF, 16));
-                hex.append(Character.forDigit(b & 0xF, 16));
-            }
-            return hex.toString();
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException(e);
-        }
-    }
 
     private String toJson(Object response) {
         try {

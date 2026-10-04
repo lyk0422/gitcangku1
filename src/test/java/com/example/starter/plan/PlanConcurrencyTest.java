@@ -2,12 +2,16 @@ package com.example.starter.plan;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.example.starter.plan.model.TractionMode;
 import com.example.starter.plan.service.PlanService;
+import com.example.starter.plan.service.TractionService;
 import com.example.starter.plan.web.ApiException;
 import com.example.starter.plan.web.dto.CreatePlanRequest;
 import com.example.starter.plan.web.dto.OccupancyRequest;
 import com.example.starter.plan.web.dto.PlanResponse;
 import com.example.starter.plan.web.dto.PublishedSlotView;
+import com.example.starter.plan.web.dto.SectionProfileRequest;
+import com.example.starter.plan.web.dto.TrainProfileRequest;
 import com.example.starter.plan.web.dto.UpdateOccupanciesRequest;
 import java.time.Instant;
 import java.time.LocalDate;
@@ -39,6 +43,9 @@ class PlanConcurrencyTest {
 
     @Autowired
     private PlanService service;
+
+    @Autowired
+    private TractionService tractionService;
 
     @Autowired
     private JdbcTemplate jdbc;
@@ -117,12 +124,15 @@ class PlanConcurrencyTest {
         String section = key("SEC");
         String scheduleKey = key("SCH");
         createDraft(scheduleKey, section, 8, 9);
+        // 替换后的占用涉及新列车，提前准备其牵引档案
+        OccupancyRequest updated = occ(section, 10, 11);
+        ensureTractionProfiles(updated.trainNo(), section);
 
         List<Outcome> outcomes = runConcurrently(List.of(
                 () -> {
                     try {
                         service.replaceOccupancies(scheduleKey, new UpdateOccupanciesRequest(
-                                key("REQ"), 1, List.of(occ(section, 10, 11))));
+                                key("REQ"), 1, List.of(updated)));
                         return Outcome.OK;
                     } catch (ApiException e) {
                         // 发布先提交时更新应得 409 状态冲突
@@ -185,8 +195,22 @@ class PlanConcurrencyTest {
     }
 
     private void createDraft(String scheduleKey, String section, int startHour, int endHour) {
+        OccupancyRequest occupancy = occ(section, startHour, endHour);
+        ensureTractionProfiles(occupancy.trainNo(), section);
         service.createDraft(new CreatePlanRequest(key("REQ"), scheduleKey, DAY,
-                List.of(occ(section, startHour, endHour))));
+                List.of(occupancy)));
+    }
+
+    /** 准备牵引档案（电力车 + 区段供电且允许柴油），不存在才创建。 */
+    private void ensureTractionProfiles(String trainNo, String sectionId) {
+        if (tractionService.findTrainProfile(trainNo).isEmpty()) {
+            tractionService.upsertTrainProfile(trainNo, new TrainProfileRequest(
+                    key("REQ"), "tester", TractionMode.ELECTRIC, 0));
+        }
+        if (tractionService.findSectionProfile(sectionId).isEmpty()) {
+            tractionService.upsertSectionProfile(sectionId, new SectionProfileRequest(
+                    key("REQ"), "tester", true, true, 0));
+        }
     }
 
     private List<Outcome> runConcurrently(List<Callable<Outcome>> tasks) throws Exception {
