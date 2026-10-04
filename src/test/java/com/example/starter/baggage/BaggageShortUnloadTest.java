@@ -444,7 +444,7 @@ class BaggageShortUnloadTest {
     }
 
     private void registerBag(String bagTag, List<String> legIds) {
-        baggageService.registerBag(new RegisterBagRequest(UUID.randomUUID().toString(), bagTag, legIds));
+        baggageService.registerBag(new RegisterBagRequest(UUID.randomUUID().toString(), bagTag, legIds, null));
     }
 
     private ResultActions load(String legId, int expectedVersion, List<String> bagTags) throws Exception {

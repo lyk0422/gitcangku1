@@ -163,7 +163,7 @@ class BaggageConcurrencyTest {
     }
 
     private void registerBag(String bagTag, List<String> legIds) {
-        baggageService.registerBag(new RegisterBagRequest(UUID.randomUUID().toString(), bagTag, legIds));
+        baggageService.registerBag(new RegisterBagRequest(UUID.randomUUID().toString(), bagTag, legIds, null));
     }
 
     /** 同步起跑并发执行任务，结果按提交顺序返回（异常包装为返回值）。 */

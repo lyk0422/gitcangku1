@@ -21,6 +21,8 @@ import com.example.starter.baggage.BaggageDtos.LegResponse;
 import com.example.starter.baggage.BaggageDtos.LoadRequest;
 import com.example.starter.baggage.BaggageDtos.LoadResponse;
 import com.example.starter.baggage.BaggageDtos.ManifestResponse;
+import com.example.starter.baggage.BaggageDtos.PassengerRosterResponse;
+import com.example.starter.baggage.BaggageDtos.PassengerUpdateResponse;
 import com.example.starter.baggage.BaggageDtos.RecoverRequest;
 import com.example.starter.baggage.BaggageDtos.RecoverResponse;
 import com.example.starter.baggage.BaggageDtos.RegisterBagRequest;
@@ -28,6 +30,7 @@ import com.example.starter.baggage.BaggageDtos.RegisterLegRequest;
 import com.example.starter.baggage.BaggageDtos.SealRequest;
 import com.example.starter.baggage.BaggageDtos.SealResponse;
 import com.example.starter.baggage.BaggageDtos.ShortListResponse;
+import com.example.starter.baggage.BaggageDtos.UpdatePassengersRequest;
 
 /**
  * 联程行李装载交接 REST 入口。
@@ -89,6 +92,19 @@ public class BaggageController {
     @GetMapping("/bags/{bagTag}/trace")
     public BagResponse getBagTrace(@PathVariable String bagTag) {
         return baggageService.getBagTrace(bagTag);
+    }
+
+    /** 登机名单更新：移除已装载行李的旅客须同次提交其全部行李卸载集合。 */
+    @PostMapping("/legs/{legId}/passengers")
+    public PassengerUpdateResponse updatePassengers(@PathVariable String legId,
+                                                    @Valid @RequestBody UpdatePassengersRequest request) {
+        return baggageService.updatePassengers(legId, request);
+    }
+
+    /** 登机名单查询：封舱后返回冻结名单。 */
+    @GetMapping("/legs/{legId}/passengers")
+    public PassengerRosterResponse getPassengers(@PathVariable String legId) {
+        return baggageService.getPassengers(legId);
     }
 
     /** 封舱清单查询。 */

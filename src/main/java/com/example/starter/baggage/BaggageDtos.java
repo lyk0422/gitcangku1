@@ -22,12 +22,13 @@ public final class BaggageDtos {
             @NotBlank(message = "destination 不能为空") String destination) {
     }
 
-    /** 登记行李请求：legIds 为 1~5 个有序航段。 */
+    /** 登记行李请求：legIds 为 1~5 个有序航段；passengerId 可空，绑定合成旅客编号。 */
     public record RegisterBagRequest(
             @NotBlank(message = "requestId 不能为空") String requestId,
             @NotBlank(message = "bagTag 不能为空") String bagTag,
             @NotNull(message = "legIds 不能为空")
-            @Size(min = 1, max = 5, message = "行程航段数必须为 1~5") List<@NotBlank(message = "航段不能为空") String> legIds) {
+            @Size(min = 1, max = 5, message = "行程航段数必须为 1~5") List<@NotBlank(message = "航段不能为空") String> legIds,
+            String passengerId) {
     }
 
     /** 批量装载请求：1~20 个不重复 bagTag。 */
@@ -79,10 +80,10 @@ public final class BaggageDtos {
                              String location, String eventTime) {
     }
 
-    /** 行李响应：含完整事件轨迹。 */
+    /** 行李响应：含完整事件轨迹；passengerId 为绑定的合成旅客编号，未绑定为 null。 */
     public record BagResponse(String bagTag, String currentLocation, int nextLegIndex,
                               String status, String loadedLegId, List<ItineraryItem> itinerary,
-                              String shortLegId, String shortDestination, String shortRegisteredAt,
+                              String shortLegId, String shortDestination, String shortRegisteredAt, String passengerId,
                               List<TraceEvent> events) {
     }
 
@@ -124,5 +125,30 @@ public final class BaggageDtos {
 
     /** 未补到清单响应。 */
     public record ShortListResponse(List<ShortItem> shortUnloaded) {
+    }
+
+    /**
+     * 登机名单更新请求：boardedPassengers 为更新后的完整登机旅客集合（重复编号 400）；
+     * 若更新移除了已装载行李的旅客，unloadBagTags 必须同次提交其全部已装载行李，漏项 422；
+     * expectedLegVersion 按航段当前版本裁决，异参（含版本变化）重放返回 409。
+     */
+    public record UpdatePassengersRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotBlank(message = "operator 不能为空") String operator,
+            @NotNull(message = "expectedLegVersion 不能为空") Integer expectedLegVersion,
+            @NotNull(message = "boardedPassengers 不能为空")
+            List<@NotBlank(message = "旅客编号不能为空") String> boardedPassengers,
+            @NotNull(message = "unloadBagTags 不能为空")
+            List<@NotBlank(message = "bagTag 不能为空") String> unloadBagTags) {
+    }
+
+    /** 登机名单更新响应：boardedPassengers 为更新后的完整集合，unloaded 为同次安全卸载的袋号。 */
+    public record PassengerUpdateResponse(String legId, String status, int version, int rosterVersion,
+                                          List<String> boardedPassengers, List<String> unloaded) {
+    }
+
+    /** 登机名单查询响应：封舱后返回冻结的名单版本与旅客集合。 */
+    public record PassengerRosterResponse(String legId, String status, int rosterVersion,
+                                          List<String> boardedPassengers) {
     }
 }

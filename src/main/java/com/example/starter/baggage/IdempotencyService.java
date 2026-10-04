@@ -50,7 +50,7 @@ public class IdempotencyService {
      */
     public <T> T execute(String requestId, String operation, int successStatus,
                          Object payload, Class<T> resultType, Supplier<T> action) {
-        String hash = sha256(writeJson(payload));
+        String hash = sha256(writeJson(new RequestFingerprint(operation, payload)));
         Object lock = locks.computeIfAbsent(requestId, key -> new Object());
         synchronized (lock) {
             try {
@@ -115,6 +115,10 @@ public class IdempotencyService {
         } catch (NoSuchAlgorithmException ex) {
             throw new IllegalStateException("SHA-256 不可用", ex);
         }
+    }
+
+    /** 结构化请求指纹：操作名与参数分别作为 JSON 字段，避免字符串拼接的分隔符碰撞。 */
+    private record RequestFingerprint(String operation, Object payload) {
     }
 
     private record StoredRequest(String requestHash, String responseBody) {
