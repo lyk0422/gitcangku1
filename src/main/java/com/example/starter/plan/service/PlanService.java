@@ -62,13 +62,16 @@ public class PlanService {
     private final IdempotencyRepository idemRepo;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate tx;
+    private final ConnectionService connectionService;
 
     public PlanService(PlanRepository planRepo, IdempotencyRepository idemRepo,
-                       ObjectMapper objectMapper, PlatformTransactionManager txManager) {
+                       ObjectMapper objectMapper, PlatformTransactionManager txManager,
+                       ConnectionService connectionService) {
         this.planRepo = planRepo;
         this.idemRepo = idemRepo;
         this.objectMapper = objectMapper;
         this.tx = new TransactionTemplate(txManager);
+        this.connectionService = connectionService;
     }
 
     /**
@@ -264,6 +267,8 @@ public class PlanService {
                 planRepo.updateStatus(oldPlan.id(), PlanStatus.CANCELLED, now);
                 planRepo.updateStatus(newPlan.id(), PlanStatus.PUBLISHED, now);
                 planRepo.insertRescheduleLink(oldPlan.id(), newPlan.id(), now);
+                // 同一事务内重算所有直接接续：保障不足的后车标记风险，不自动改时刻
+                connectionService.recomputeAfterReschedule(oldPlan, newPlan);
                 RescheduleResponse response = new RescheduleResponse(
                         loadPlan(oldScheduleKey), loadPlan(req.newScheduleKey()));
                 idemRepo.insert(OP_RESCHEDULE, req.requestKey(), hash, toJson(response), now);

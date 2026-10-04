@@ -219,4 +219,38 @@ public class PlanRepository {
     public void acquirePublishLock() {
         jdbc.queryForObject("SELECT id FROM publish_lock WHERE id = 1 FOR UPDATE", Integer.class);
     }
+
+    /**
+     * 更新计划的接续风险标记（NONE / CONNECTION_AT_RISK），仅标记不改时刻。
+     */
+    public void updateConnectionRisk(long planId, String connectionRisk, long nowMillis) {
+        jdbc.update("UPDATE rail_day_plan SET connection_risk = ?, updated_at = ? WHERE id = ?",
+                connectionRisk, nowMillis, planId);
+    }
+
+    /**
+     * 查询计划的接续风险标记。
+     */
+    public String findConnectionRisk(long planId) {
+        return jdbc.queryForObject("SELECT connection_risk FROM rail_day_plan WHERE id = ?",
+                String.class, planId);
+    }
+
+    /**
+     * 查询当前标记为 CONNECTION_AT_RISK 的计划，按 id 升序（诊断查询用）。
+     */
+    public List<DayPlan> findAtRiskPlans() {
+        return jdbc.query("SELECT id, schedule_key, op_date, version, status FROM rail_day_plan"
+                        + " WHERE connection_risk = 'CONNECTION_AT_RISK' ORDER BY id",
+                PLAN_MAPPER);
+    }
+
+    /**
+     * 整体平移计划占用（批量保障改签用）：所有占用起止时刻加上 deltaMillis，保持区间长度与顺序。
+     */
+    public void shiftOccupancies(long planId, long deltaMillis) {
+        jdbc.update("UPDATE rail_plan_occupancy SET start_utc = start_utc + ?,"
+                        + " end_utc = end_utc + ? WHERE plan_id = ?",
+                deltaMillis, deltaMillis, planId);
+    }
 }
