@@ -64,11 +64,13 @@ public final class Responses {
 
     /**
      * 处置任务视图：blockers 按阻塞事件键排序；doneBy/doneAt 仅 DONE 有值，
-     * cancelledBy/cancelledAt 仅 CANCELLED 有值。
+     * cancelledBy/cancelledAt 仅 CANCELLED 有值；requirementVersion 为必需证据类别
+     * 配置版本（初始 0），requiredCategories 为当前必需证据类别（按设置顺序）。
      */
     public record TaskView(String taskKey, String groupCode, String title, String status,
                            List<TaskBlockerView> blockers, String createdBy, Instant createdAt,
-                           String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt) {
+                           String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt,
+                           int requirementVersion, List<String> requiredCategories) {
     }
 
     /** 按事件分组的任务列表视图：tasks 按创建顺序返回。 */
@@ -77,5 +79,24 @@ public final class Responses {
 
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
+    }
+
+    /**
+     * 任务验收证据视图：status 为 PENDING/CONFIRMED/VOIDED；
+     * confirmedBy/confirmedAt 仅 CONFIRMED 有值，voidedBy/voidedAt 仅 VOIDED 有值；
+     * frozen 表示任务完成时证据内容与确认人已冻结，禁止作废或覆盖。
+     */
+    public record TaskEvidenceView(String evidenceKey, String category, String note, String status,
+                                   String uploadedBy, Instant uploadedAt, String confirmedBy,
+                                   Instant confirmedAt, String voidedBy, Instant voidedAt,
+                                   boolean frozen) {
+    }
+
+    /**
+     * 任务验收证据链视图：当前必需类别版本与类别集合，以及全部证据（按创建顺序）。
+     */
+    public record EvidenceChainView(String taskKey, int requirementVersion,
+                                    List<String> requiredCategories,
+                                    List<TaskEvidenceView> evidences) {
     }
 }

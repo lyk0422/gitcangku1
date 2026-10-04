@@ -3,6 +3,9 @@ package com.example.starter.incident;
 import com.example.starter.incident.dto.Requests.ActionRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
 import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
+import com.example.starter.incident.dto.Requests.EvidenceActionRequest;
+import com.example.starter.incident.dto.Requests.EvidenceRequirementsRequest;
+import com.example.starter.incident.dto.Requests.EvidenceUploadRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
@@ -13,9 +16,11 @@ import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
 import com.example.starter.incident.dto.Responses.EscalationHistoryView;
 import com.example.starter.incident.dto.Responses.EscalationView;
+import com.example.starter.incident.dto.Responses.EvidenceChainView;
 import com.example.starter.incident.dto.Responses.HistoryView;
 import com.example.starter.incident.dto.Responses.IncidentTasksView;
 import com.example.starter.incident.dto.Responses.IncidentView;
+import com.example.starter.incident.dto.Responses.TaskEvidenceView;
 import com.example.starter.incident.dto.Responses.TaskView;
 import com.example.starter.incident.dto.Responses.TransferView;
 import org.springframework.http.HttpStatus;
@@ -187,5 +192,60 @@ public class IncidentController {
                                @RequestHeader("X-Actor-Id") String actor,
                                @RequestBody TaskActionRequest req) {
         return service.cancelTask(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 设置任务必需证据类别（仅当前指挥人；1~5 个类别，提交 expectedTaskVersion）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/evidence-requirements")
+    public TaskView setEvidenceRequirements(@PathVariable String incidentKey,
+                                            @PathVariable String taskKey,
+                                            @RequestHeader("X-Actor-Id") String actor,
+                                            @RequestBody EvidenceRequirementsRequest req) {
+        return service.setEvidenceRequirements(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 查询任务验收证据链（必需类别与全部证据，只读）。
+     */
+    @GetMapping("/{incidentKey}/tasks/{taskKey}/evidences")
+    public EvidenceChainView evidenceChain(@PathVariable String incidentKey,
+                                           @PathVariable String taskKey) {
+        return service.evidenceChain(incidentKey, taskKey);
+    }
+
+    /**
+     * 上传任务证据（执行者；evidenceKey 任务内唯一）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/evidences")
+    public TaskEvidenceView uploadEvidence(@PathVariable String incidentKey,
+                                           @PathVariable String taskKey,
+                                           @RequestHeader("X-Actor-Id") String actor,
+                                           @RequestBody EvidenceUploadRequest req) {
+        return service.uploadEvidence(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 确认任务证据（验收人，必须与上传人不同）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/evidences/{evidenceKey}/confirm")
+    public TaskEvidenceView confirmEvidence(@PathVariable String incidentKey,
+                                            @PathVariable String taskKey,
+                                            @PathVariable String evidenceKey,
+                                            @RequestHeader("X-Actor-Id") String actor,
+                                            @RequestBody EvidenceActionRequest req) {
+        return service.confirmEvidence(incidentKey, taskKey, evidenceKey, actor, req);
+    }
+
+    /**
+     * 作废任务证据（仅当前指挥人；任务完成前可作废，作废使确认失效）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/evidences/{evidenceKey}/void")
+    public TaskEvidenceView voidEvidence(@PathVariable String incidentKey,
+                                         @PathVariable String taskKey,
+                                         @PathVariable String evidenceKey,
+                                         @RequestHeader("X-Actor-Id") String actor,
+                                         @RequestBody EvidenceActionRequest req) {
+        return service.voidEvidence(incidentKey, taskKey, evidenceKey, actor, req);
     }
 }

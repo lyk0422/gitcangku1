@@ -84,10 +84,38 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     done_at TIMESTAMP(6) NULL COMMENT '完成 UTC 时间；仅 DONE 有值，否则为空',
     cancelled_by VARCHAR(128) NULL COMMENT '取消人（操作时的当前指挥人）；仅 CANCELLED 有值，否则为空',
     cancelled_at TIMESTAMP(6) NULL COMMENT '取消 UTC 时间；仅 CANCELLED 有值，否则为空',
+    requirement_version INT NOT NULL DEFAULT 0 COMMENT '必需证据类别配置版本，初始 0，每次变更 +1；设置时需提交 expectedTaskVersion 等于当前值',
     created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
     updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间',
     CONSTRAINT uk_task_key UNIQUE (incident_id, task_key)
 ) COMMENT='事件处置任务表';
+
+CREATE TABLE IF NOT EXISTS incident_task_required_categories (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    task_id BIGINT NOT NULL COMMENT '所属任务 id，关联 incident_tasks.id',
+    category VARCHAR(64) NOT NULL COMMENT '必需证据类别（如 PHOTO、READING），任务内唯一；每任务 1~5 个',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
+    CONSTRAINT uk_task_required_category UNIQUE (task_id, category)
+) COMMENT='任务必需证据类别表（整体替换式配置，版本见 incident_tasks.requirement_version）';
+
+CREATE TABLE IF NOT EXISTS incident_task_evidences (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    task_id BIGINT NOT NULL COMMENT '所属任务 id，关联 incident_tasks.id',
+    evidence_key VARCHAR(128) NOT NULL COMMENT '证据业务键，任务内唯一；同键同内容幂等，同键不同内容冲突；VOIDED 后不可复用',
+    category VARCHAR(64) NOT NULL COMMENT '证据类别，对应必需证据类别',
+    note VARCHAR(1024) NOT NULL COMMENT '证据说明，非空',
+    status VARCHAR(16) NOT NULL COMMENT '状态：PENDING 待确认 / CONFIRMED 已确认 / VOIDED 已作废；VOIDED 为终态',
+    uploaded_by VARCHAR(128) NOT NULL COMMENT '上传人（执行者，X-Actor-Id）',
+    uploaded_at TIMESTAMP(6) NOT NULL COMMENT '上传 UTC 时间',
+    confirmed_by VARCHAR(128) NULL COMMENT '确认人（验收人，必须与上传人不同）；仅 CONFIRMED 有值，否则为空',
+    confirmed_at TIMESTAMP(6) NULL COMMENT '确认 UTC 时间；仅 CONFIRMED 有值，否则为空',
+    voided_by VARCHAR(128) NULL COMMENT '作废人（操作时的当前指挥人）；仅 VOIDED 有值，否则为空',
+    voided_at TIMESTAMP(6) NULL COMMENT '作废 UTC 时间；仅 VOIDED 有值，否则为空',
+    frozen_at TIMESTAMP(6) NULL COMMENT '冻结 UTC 时间；任务完成时统一写入，此后证据内容与确认人不可改；未完成为空',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
+    updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间',
+    CONSTRAINT uk_task_evidence_key UNIQUE (task_id, evidence_key)
+) COMMENT='任务验收证据表';
 
 CREATE TABLE IF NOT EXISTS incident_task_blockers (
     id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',

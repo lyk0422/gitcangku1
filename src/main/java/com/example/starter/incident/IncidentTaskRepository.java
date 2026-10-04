@@ -52,6 +52,7 @@ public class IncidentTaskRepository {
                 doneAt == null ? null : doneAt.toInstant(),
                 rs.getString("cancelled_by"),
                 cancelledAt == null ? null : cancelledAt.toInstant(),
+                rs.getInt("requirement_version"),
                 rs.getTimestamp("created_at").toInstant(),
                 rs.getTimestamp("updated_at").toInstant());
     }
@@ -71,7 +72,8 @@ public class IncidentTaskRepository {
             var ps = con.prepareStatement(
                     "INSERT INTO incident_tasks (incident_id, task_key, group_code, title, status,"
                             + " created_by, done_by, done_at, cancelled_by, cancelled_at,"
-                            + " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                            + " requirement_version, created_at, updated_at)"
+                            + " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setLong(1, task.incidentId());
             ps.setString(2, task.taskKey());
@@ -83,8 +85,9 @@ public class IncidentTaskRepository {
             ps.setTimestamp(8, task.doneAt() == null ? null : Timestamp.from(task.doneAt()));
             ps.setString(9, task.cancelledBy());
             ps.setTimestamp(10, task.cancelledAt() == null ? null : Timestamp.from(task.cancelledAt()));
-            ps.setTimestamp(11, Timestamp.from(task.createdAt()));
-            ps.setTimestamp(12, Timestamp.from(task.updatedAt()));
+            ps.setInt(11, task.requirementVersion());
+            ps.setTimestamp(12, Timestamp.from(task.createdAt()));
+            ps.setTimestamp(13, Timestamp.from(task.updatedAt()));
             return ps;
         }, keys);
         return keys.getKey().longValue();
@@ -141,6 +144,17 @@ public class IncidentTaskRepository {
         jdbc.update("UPDATE incident_tasks SET status = 'CANCELLED', cancelled_by = ?,"
                         + " cancelled_at = ?, updated_at = ? WHERE id = ?",
                 actor, Timestamp.from(at), Timestamp.from(at), id);
+    }
+
+    /**
+     * 必需证据类别版本 +1：仅当当前版本等于 expectedVersion 时生效（乐观并发控制），
+     * 返回受影响行数，0 表示版本已被并发变更。
+     */
+    public int incrementRequirementVersion(long taskId, int expectedVersion, Instant at) {
+        return jdbc.update("UPDATE incident_tasks"
+                        + " SET requirement_version = requirement_version + 1, updated_at = ?"
+                        + " WHERE id = ? AND requirement_version = ?",
+                Timestamp.from(at), taskId, expectedVersion);
     }
 
     /**

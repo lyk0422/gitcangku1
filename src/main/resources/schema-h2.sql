@@ -84,9 +84,37 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     done_at TIMESTAMP(6) NULL,
     cancelled_by VARCHAR(128) NULL,
     cancelled_at TIMESTAMP(6) NULL,
+    requirement_version INT NOT NULL DEFAULT 0,
     created_at TIMESTAMP(6) NOT NULL,
     updated_at TIMESTAMP(6) NOT NULL,
     CONSTRAINT uk_task_key UNIQUE (incident_id, task_key)
+);
+
+CREATE TABLE IF NOT EXISTS incident_task_required_categories (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    task_id BIGINT NOT NULL,
+    category VARCHAR(64) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_task_required_category UNIQUE (task_id, category)
+);
+
+CREATE TABLE IF NOT EXISTS incident_task_evidences (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    task_id BIGINT NOT NULL,
+    evidence_key VARCHAR(128) NOT NULL,
+    category VARCHAR(64) NOT NULL,
+    note VARCHAR(1024) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    uploaded_by VARCHAR(128) NOT NULL,
+    uploaded_at TIMESTAMP(6) NOT NULL,
+    confirmed_by VARCHAR(128) NULL,
+    confirmed_at TIMESTAMP(6) NULL,
+    voided_by VARCHAR(128) NULL,
+    voided_at TIMESTAMP(6) NULL,
+    frozen_at TIMESTAMP(6) NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_task_evidence_key UNIQUE (task_id, evidence_key)
 );
 
 CREATE TABLE IF NOT EXISTS incident_task_blockers (
