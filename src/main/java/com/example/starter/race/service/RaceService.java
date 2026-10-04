@@ -2,9 +2,13 @@ package com.example.starter.race.service;
 
 import com.example.starter.race.api.AddPenaltyRequest;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
+import com.example.starter.race.api.CorrectLapRequest;
 import com.example.starter.race.api.CreateRaceRequest;
+import com.example.starter.race.api.LapHistoryResponse;
 import com.example.starter.race.api.RegisterRunnerRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
+import com.example.starter.race.api.RunnerLapsResponse;
+import com.example.starter.race.api.SubmitLapRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
 import com.example.starter.race.api.MissingCheckpointsResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
@@ -57,6 +61,24 @@ public interface RaceService {
     /** 查询单个选手的分段明细，按检查点顺序稳定返回；只读，不修改版本。 */
     RunnerTimingResponse getRunnerTimings(String raceId, String bib);
 
+    /**
+     * 提交绕圈赛事选手某圈某点通过记录（仅LOOP赛事）；允许乱序收件，
+     * 但全赛程序列上耗时须严格递增（同圈A<B<FINISH，下一圈A严格大于上一圈FINISH），
+     * 违反返回422；圈号越界返回400；每点只保留一条当前记录，重复提交返回409并应改用更正。
+     */
+    ServiceResult submitLap(String raceId, String bib, SubmitLapRequest request);
+
+    /**
+     * 更正圈次点读数（仅LOOP赛事）：必须引用最近有效记录ID，
+     * 原读数追加更正历史不覆盖；引用已被更正的记录返回409，不存在返回404。
+     */
+    ServiceResult correctLap(String raceId, String bib, CorrectLapRequest request);
+
+    /** 查询选手圈次总览：按圈号与点序展开全部点，缺失点为null并标记是否完整；只读。 */
+    RunnerLapsResponse getRunnerLaps(String raceId, String bib);
+
+    /** 查询选手圈次更正历史，按圈号、点序、更正时间升序；只读。 */
+    LapHistoryResponse getLapHistory(String raceId, String bib);
     /** 查询赛事全部选手缺失检查点汇总，按参赛号与检查点顺序稳定返回；只读。 */
     MissingCheckpointsResponse getMissingCheckpoints(String raceId);
 }

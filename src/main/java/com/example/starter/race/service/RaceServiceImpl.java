@@ -4,25 +4,35 @@ import com.example.starter.race.api.AddPenaltyRequest;
 import com.example.starter.race.api.CheckpointResponse;
 import com.example.starter.race.api.CheckpointsConfigResponse;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
+import com.example.starter.race.api.CorrectLapRequest;
 import com.example.starter.race.api.CreateRaceRequest;
+import com.example.starter.race.api.LapHistoryResponse;
 import com.example.starter.race.api.MissingCheckpointsResponse;
 import com.example.starter.race.api.RaceResponse;
 import com.example.starter.race.api.RegisterRunnerRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
+import com.example.starter.race.api.RunnerLapsResponse;
 import com.example.starter.race.api.RevokePenaltyRequest;
 import com.example.starter.race.api.RunnerMissingCheckpointsResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
+import com.example.starter.race.api.SubmitLapRequest;
 import com.example.starter.race.api.SubmitTimingRequest;
 import com.example.starter.race.domain.CheckpointRules;
+import com.example.starter.race.domain.EntryStatus;
+import com.example.starter.race.domain.LapPoint;
+import com.example.starter.race.domain.LapRules;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
+import com.example.starter.race.domain.RaceType;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
 import com.example.starter.race.persistence.IdempotencyRow;
+import com.example.starter.race.persistence.LapPassHistoryRow;
+import com.example.starter.race.persistence.LapPassRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
 import com.example.starter.race.persistence.RunnerRow;
@@ -85,17 +95,32 @@ public class RaceServiceImpl implements RaceService {
     @Transactional
     public ServiceResult createRace(CreateRaceRequest request) {
         return withIdempotency(request.requestId(), "CREATE_RACE",
-                orderedParams("raceId", request.raceId()),
+                orderedParams(
+                        "raceId", request.raceId(),
+                        "raceType", request.raceType(),
+                        "totalLaps", request.totalLaps()),
                 () -> {
+                    RaceType raceType = parseRaceType(request.raceType());
+                    Integer totalLaps = request.totalLaps();
+                    if (raceType == RaceType.LOOP) {
+                        if (totalLaps == null
+                                || totalLaps < LapRules.MIN_TOTAL_LAPS
+                                || totalLaps > LapRules.MAX_TOTAL_LAPS) {
+                            throw new BadRequestException("绕圈赛事总圈数必须在 2~10 之间");
+                        }
+                    } else if (totalLaps != null) {
+                        throw new BadRequestException("标准赛事不得携带 totalLaps");
+                    }
                     long now = clock.millis();
                     try {
-                        repository.insertRace(request.raceId(), now);
+                        repository.insertRace(request.raceId(), raceType, totalLaps, now);
                     } catch (DuplicateKeyException ex) {
                         throw new ConflictException("赛事已存在: " + request.raceId());
                     }
                     RaceRow race = repository.findRace(request.raceId()).orElseThrow();
                     return ServiceResult.created(new RaceResponse(
-                            race.raceId(), race.version(), race.status(), race.createdAt()));
+                            race.raceId(), race.version(), race.status(), race.raceType(),
+                            race.totalLaps(), race.createdAt()));
                 });
     }
 
@@ -344,6 +369,197 @@ public class RaceServiceImpl implements RaceService {
 
     @Override
     @Transactional
+    public ServiceResult submitLap(String raceId, String bib, SubmitLapRequest request) {
+        return withIdempotency(request.requestId(), "SUBMIT_LAP",
+                orderedParams(
+                        "raceId", raceId,
+                        "bib", bib,
+                        "lapPassId", request.lapPassId(),
+                        "lapNo", request.lapNo(),
+                        "point", request.point(),
+                        "elapsedMillis", request.elapsedMillis(),
+                        "operator", request.operator(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    // lapPassId 是第二层全局幂等键：同参重放原结果，异参409。
+                    LapPassRow existingPass = repository.findLapPass(request.lapPassId()).orElse(null);
+                    if (existingPass != null) {
+                        return replayLapOrConflict(raceId, bib, request, existingPass);
+                    }
+                    if (repository.lapPassIdUsed(request.lapPassId())) {
+                        throw new ConflictException(
+                                "lapPassId 已被更正历史占用: " + request.lapPassId());
+                    }
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    requireLoopRace(race);
+                    requireRunner(raceId, bib);
+                    LapPoint point = parseLapPoint(request.point());
+                    int lapNo = request.lapNo();
+                    if (lapNo < 1 || lapNo > race.totalLaps()) {
+                        throw new BadRequestException("圈号越界: lapNo=" + lapNo
+                                + ", 有效范围 1~" + race.totalLaps());
+                    }
+                    long elapsedMillis = request.elapsedMillis();
+                    List<LapPassRow> runnerPasses = repository.findLapPassesForRunner(raceId, bib);
+                    // 每点只保留一条当前记录：重复提交须改用更正接口。
+                    for (LapPassRow pass : runnerPasses) {
+                        if (pass.lapNo() == lapNo && pass.point() == point) {
+                            throw new ConflictException(
+                                    "该圈该点已存在当前记录，请使用更正接口: lap=" + lapNo
+                                            + ", point=" + point);
+                        }
+                    }
+                    String violation = LapRules.validate(runnerPasses, lapNo, point, elapsedMillis);
+                    if (violation != null) {
+                        throw new UnprocessableEntityException(violation);
+                    }
+                    bumpVersion(race, request.expectedVersion());
+                    long now = clock.millis();
+                    LapPassRow row = new LapPassRow(request.lapPassId(), raceId, bib, lapNo, point,
+                            elapsedMillis, request.operator(), now);
+                    try {
+                        repository.insertLapPass(row);
+                    } catch (DuplicateKeyException ex) {
+                        // 并发下唯一约束兜底：同 lapPassId 走重放/异参冲突，其余为同点重复。
+                        if (constraintMatches(ex, "pk_lap_pass")) {
+                            LapPassRow concurrent =
+                                    repository.findLapPass(request.lapPassId()).orElseThrow();
+                            return replayLapOrConflict(raceId, bib, request, concurrent);
+                        }
+                        throw new ConflictException("该圈该点已存在当前记录，请使用更正接口");
+                    }
+                    LapPassRow saved = repository.findLapPass(request.lapPassId()).orElseThrow();
+                    return ServiceResult.created(ResponseMapper.toLapPassResponse(saved));
+                });
+    }
+
+    private ServiceResult replayLapOrConflict(
+            String raceId,
+            String bib,
+            SubmitLapRequest request,
+            LapPassRow existing) {
+        boolean sameParams = existing.raceId().equals(raceId)
+                && existing.bib().equals(bib)
+                && existing.lapNo() == request.lapNo()
+                && existing.point() == parseLapPoint(request.point())
+                && existing.elapsedMillis() == request.elapsedMillis();
+        if (!sameParams) {
+            throw new ConflictException(
+                    "lapPassId 已用于不同参数的圈次记录: " + request.lapPassId());
+        }
+        return ServiceResult.created(ResponseMapper.toLapPassResponse(existing));
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult correctLap(String raceId, String bib, CorrectLapRequest request) {
+        return withIdempotency(request.requestId(), "CORRECT_LAP",
+                orderedParams(
+                        "raceId", raceId,
+                        "bib", bib,
+                        "referenceLapPassId", request.referenceLapPassId(),
+                        "lapPassId", request.lapPassId(),
+                        "elapsedMillis", request.elapsedMillis(),
+                        "operator", request.operator(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    // 新记录ID已存在：同一次更正的重放（引用已入历史且指向该新ID），否则异参409。
+                    LapPassRow existingNew = repository.findLapPass(request.lapPassId()).orElse(null);
+                    if (existingNew != null) {
+                        boolean replay = existingNew.raceId().equals(raceId)
+                                && existingNew.bib().equals(bib)
+                                && existingNew.elapsedMillis() == request.elapsedMillis()
+                                && repository.findLapPassHistory(request.referenceLapPassId())
+                                        .map(history -> history.replacedBy()
+                                                .equals(request.lapPassId()))
+                                        .orElse(false);
+                        if (!replay) {
+                            throw new ConflictException(
+                                    "lapPassId 已用于不同参数的圈次记录: " + request.lapPassId());
+                        }
+                        return ServiceResult.created(ResponseMapper.toLapPassResponse(existingNew));
+                    }
+                    if (repository.lapPassIdUsed(request.lapPassId())) {
+                        throw new ConflictException("lapPassId 已被使用: " + request.lapPassId());
+                    }
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    requireLoopRace(race);
+                    requireRunner(raceId, bib);
+                    LapPassRow current = repository.findLapPass(request.referenceLapPassId())
+                            .orElse(null);
+                    if (current == null) {
+                        if (repository.findLapPassHistory(request.referenceLapPassId()).isPresent()) {
+                            throw new ConflictException(
+                                    "被引用记录已被更正，须引用最近有效记录: "
+                                            + request.referenceLapPassId());
+                        }
+                        throw new NotFoundException(
+                                "被引用的圈次记录不存在: " + request.referenceLapPassId());
+                    }
+                    if (!current.raceId().equals(raceId) || !current.bib().equals(bib)) {
+                        throw new NotFoundException(
+                                "被引用记录不属于该赛事选手: " + request.referenceLapPassId());
+                    }
+                    // 新读数与其余当前记录仍须满足全赛程严格递增。
+                    List<LapPassRow> others = repository.findLapPassesForRunner(raceId, bib).stream()
+                            .filter(pass -> !pass.lapPassId().equals(request.referenceLapPassId()))
+                            .toList();
+                    String violation = LapRules.validate(
+                            others, current.lapNo(), current.point(), request.elapsedMillis());
+                    if (violation != null) {
+                        throw new UnprocessableEntityException(violation);
+                    }
+                    bumpVersion(race, request.expectedVersion());
+                    long now = clock.millis();
+                    LapPassRow replacement = new LapPassRow(request.lapPassId(), raceId, bib,
+                            current.lapNo(), current.point(), request.elapsedMillis(),
+                            request.operator(), now);
+                    int updated;
+                    try {
+                        updated = repository.replaceLapPass(request.referenceLapPassId(), replacement);
+                    } catch (DuplicateKeyException ex) {
+                        throw new ConflictException("lapPassId 已被使用: " + request.lapPassId());
+                    }
+                    if (updated == 0) {
+                        throw new ConflictException(
+                                "被引用记录已被并发更正，须引用最近有效记录: "
+                                        + request.referenceLapPassId());
+                    }
+                    // 原读数追加历史，不覆盖；与当前记录替换同事务原子提交。
+                    repository.insertLapPassHistory(new LapPassHistoryRow(
+                            current.lapPassId(), replacement.lapPassId(), raceId, bib,
+                            current.lapNo(), current.point(), current.elapsedMillis(),
+                            current.createdBy(), current.createdAt(), request.operator(), now));
+                    LapPassRow saved = repository.findLapPass(request.lapPassId()).orElseThrow();
+                    return ServiceResult.created(ResponseMapper.toLapPassResponse(saved));
+                });
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public RunnerLapsResponse getRunnerLaps(String raceId, String bib) {
+        RaceRow race = repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        requireLoopRace(race);
+        repository.findRunner(raceId, bib)
+                .orElseThrow(() -> new NotFoundException("选手不存在: " + bib));
+        return ResponseMapper.runnerLaps(
+                race, bib, repository.findLapPassesForRunner(raceId, bib));
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public LapHistoryResponse getLapHistory(String raceId, String bib) {
+        RaceRow race = repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        requireLoopRace(race);
+        repository.findRunner(raceId, bib)
+                .orElseThrow(() -> new NotFoundException("选手不存在: " + bib));
+        return ResponseMapper.lapHistory(
+                raceId, bib, repository.findLapHistoryForRunner(raceId, bib));
+    }
+    @Override
+    @Transactional
     public ServiceResult sealRace(String raceId, SealRaceRequest request) {
         return withIdempotency(request.requestId(), "SEAL_RACE",
                 orderedParams(
@@ -359,8 +575,21 @@ public class RaceServiceImpl implements RaceService {
                     List<PenaltyRow> penalties = repository.findPenalties(raceId);
                     List<CheckpointRow> checkpoints = repository.findCheckpoints(raceId);
                     List<CheckpointTimingRow> timings = repository.findAllTimings(raceId);
-                    List<ResultEntry> entries =
-                            ResultCalculator.compute(runners, penalties, checkpoints, timings);
+                    List<ResultEntry> entries;
+                    if (race.raceType() == RaceType.LOOP) {
+                        // 绕圈赛事：选手所有圈完整才按末圈FINISH加生效处罚排名；
+                        // 漏圈或逆序（LAP_INCOMPLETE）时完整性失败，整场不封榜。
+                        entries = ResultCalculator.computeLoop(runners, penalties,
+                                race.totalLaps(), repository.findAllLapPasses(raceId));
+                        boolean incomplete = entries.stream()
+                                .anyMatch(entry -> entry.status() == EntryStatus.LAP_INCOMPLETE);
+                        if (incomplete) {
+                            throw new UnprocessableEntityException(
+                                    "存在选手圈次不完整或逆序，整场不能封榜");
+                        }
+                    } else {
+                        entries = ResultCalculator.compute(runners, penalties, checkpoints, timings);
+                    }
 
                     int newVersion = request.expectedVersion() + 1;
                     int updated = repository.sealIfOpenAtVersion(
@@ -406,6 +635,13 @@ public class RaceServiceImpl implements RaceService {
                     .orElseThrow(() -> new IllegalStateException(
                             "赛事已封榜但缺少快照: " + raceId));
             return ResponseMapper.snapshotStanding(snapshot);
+        }
+        if (race.raceType() == RaceType.LOOP) {
+            return ResponseMapper.liveLoopStanding(
+                    race,
+                    repository.findRunners(raceId),
+                    repository.findPenalties(raceId),
+                    repository.findAllLapPasses(raceId));
         }
         return ResponseMapper.liveStanding(
                 race,
@@ -573,6 +809,30 @@ public class RaceServiceImpl implements RaceService {
         }
     }
 
+    private static void requireLoopRace(RaceRow race) {
+        if (race.raceType() != RaceType.LOOP) {
+            throw new BadRequestException("非绕圈赛事，不支持圈次操作: " + race.raceId());
+        }
+    }
+
+    private static LapPoint parseLapPoint(String point) {
+        try {
+            return LapPoint.valueOf(point);
+        } catch (IllegalArgumentException | NullPointerException ex) {
+            throw new BadRequestException("未知圈内点: " + point + "，仅支持 A/B/FINISH");
+        }
+    }
+
+    private static RaceType parseRaceType(String raceType) {
+        if (raceType == null || raceType.isBlank()) {
+            return RaceType.STANDARD;
+        }
+        try {
+            return RaceType.valueOf(raceType);
+        } catch (IllegalArgumentException ex) {
+            throw new BadRequestException("未知赛事类型: " + raceType);
+        }
+    }
     private RunnerRow requireRunner(String raceId, String bib) {
         return repository.findRunner(raceId, bib)
                 .orElseThrow(() -> new NotFoundException("选手不存在: " + bib));

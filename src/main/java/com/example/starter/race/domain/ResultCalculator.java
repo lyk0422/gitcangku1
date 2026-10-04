@@ -193,4 +193,173 @@ public final class ResultCalculator {
                     missingCheckpoints());
         }
     }
+
+    /**
+     * 计算绕圈赛事即时成绩。
+     *
+     * <p>规则：
+     * <ul>
+     *   <li>每名选手须覆盖 总圈数×3 个点（每圈A、B、FINISH）且全赛程耗时严格递增，
+     *       才按末圈FINISH耗时+生效加时排名；</li>
+     *   <li>尚无任何圈次记录的选手状态 UNTIMED；有部分记录但漏圈或逆序的状态
+     *       LAP_INCOMPLETE，不排名且阻止整场封榜；</li>
+     *   <li>取消资格与并列排名规则与标准赛事一致；</li>
+     *   <li>条目的 checkpointCount 为总点数（总圈数×3），coveredCheckpointCount
+     *       为已覆盖点数，missingCheckpoints 为缺失点标签（形如 "1:B"），按圈号与点序排列。</li>
+     * </ul>
+     *
+     * @param runnerView 全部选手视图（绕圈赛事不使用其原始完赛耗时）
+     * @param penalties  全部处罚（含已撤销）
+     * @param totalLaps  赛事总圈数（2~10）
+     * @param lapPasses  全部选手的当前圈次通过记录
+     * @return 按展示顺序排列的成绩条目
+     */
+    public static List<ResultEntry> computeLoop(
+            List<? extends RunnerView> runnerView,
+            List<? extends PenaltyView> penalties,
+            int totalLaps,
+            List<? extends LapPassView> lapPasses) {
+        Map<String, LoopAggregate> aggregates = new LinkedHashMap<>();
+        for (RunnerView runner : runnerView) {
+            aggregates.put(runner.bib(), new LoopAggregate(runner.bib(), totalLaps));
+        }
+        for (LapPassView pass : lapPasses) {
+            LoopAggregate aggregate = aggregates.get(pass.bib());
+            if (aggregate != null) {
+                aggregate.add(pass);
+            }
+        }
+        for (PenaltyView penalty : penalties) {
+            LoopAggregate aggregate = aggregates.get(penalty.bib());
+            if (aggregate == null || penalty.revoked()) {
+                continue;
+            }
+            if (penalty.type() == PenaltyType.DISQUALIFY) {
+                aggregate.disqualified = true;
+            } else if (penalty.type() == PenaltyType.ADD_TIME && penalty.amountMs() != null) {
+                aggregate.penaltyMs += penalty.amountMs();
+            }
+        }
+
+        List<LoopAggregate> ranked = new ArrayList<>();
+        List<LoopAggregate> others = new ArrayList<>();
+        for (LoopAggregate aggregate : aggregates.values()) {
+            aggregate.classify();
+            if (aggregate.status == EntryStatus.RANKED) {
+                ranked.add(aggregate);
+            } else {
+                others.add(aggregate);
+            }
+        }
+        ranked.sort(Comparator
+                .comparingLong((LoopAggregate a) -> a.totalTimeMs)
+                .thenComparing(a -> a.bib));
+        others.sort(Comparator.comparing(a -> a.bib));
+
+        int index = 0;
+        while (index < ranked.size()) {
+            int groupEnd = index + 1;
+            while (groupEnd < ranked.size()
+                    && ranked.get(groupEnd).totalTimeMs == ranked.get(index).totalTimeMs) {
+                groupEnd++;
+            }
+            int rank = index + 1;
+            for (int groupIndex = index; groupIndex < groupEnd; groupIndex++) {
+                ranked.get(groupIndex).rank = rank;
+            }
+            index = groupEnd;
+        }
+
+        List<ResultEntry> entries = new ArrayList<>(aggregates.size());
+        for (LoopAggregate aggregate : ranked) {
+            entries.add(aggregate.toEntry());
+        }
+        for (LoopAggregate aggregate : others) {
+            entries.add(aggregate.toEntry());
+        }
+        return entries;
+    }
+
+    /** 绕圈赛事单选手聚合中间态。 */
+    private static final class LoopAggregate {
+        private final String bib;
+        private final int totalLaps;
+        /** 全赛程序列位置 -> 累计耗时；按序列位置升序。 */
+        private final Map<Integer, Long> elapsedBySequence = new java.util.TreeMap<>();
+        private long penaltyMs;
+        private boolean disqualified;
+        private EntryStatus status;
+        private int rank;
+        private long totalTimeMs;
+        private Long lastLapFinishMs;
+
+        private LoopAggregate(String bib, int totalLaps) {
+            this.bib = bib;
+            this.totalLaps = totalLaps;
+        }
+
+        private void add(LapPassView pass) {
+            elapsedBySequence.put(LapPoint.sequence(pass.lapNo(), pass.point()),
+                    pass.elapsedMillis());
+        }
+
+        private int requiredPoints() {
+            return totalLaps * LapPoint.POINTS_PER_LAP;
+        }
+
+        /** 全赛程序列上耗时是否严格递增（同圈A<B<FINISH，下一圈A大于上一圈FINISH）。 */
+        private boolean strictlyIncreasing() {
+            long previous = -1L;
+            for (long elapsed : elapsedBySequence.values()) {
+                if (elapsed <= previous) {
+                    return false;
+                }
+                previous = elapsed;
+            }
+            return true;
+        }
+
+        private void classify() {
+            if (disqualified) {
+                status = EntryStatus.DISQUALIFIED;
+                return;
+            }
+            if (elapsedBySequence.isEmpty()) {
+                status = EntryStatus.UNTIMED;
+                return;
+            }
+            if (elapsedBySequence.size() < requiredPoints() || !strictlyIncreasing()) {
+                status = EntryStatus.LAP_INCOMPLETE;
+                return;
+            }
+            status = EntryStatus.RANKED;
+            lastLapFinishMs = elapsedBySequence.get(LapPoint.sequence(totalLaps, LapPoint.FINISH));
+            totalTimeMs = lastLapFinishMs + penaltyMs;
+        }
+
+        private List<String> missingPoints() {
+            List<String> missing = new ArrayList<>();
+            for (int lap = 1; lap <= totalLaps; lap++) {
+                for (LapPoint point : LapPoint.values()) {
+                    if (!elapsedBySequence.containsKey(LapPoint.sequence(lap, point))) {
+                        missing.add(lap + ":" + point.name());
+                    }
+                }
+            }
+            return missing;
+        }
+
+        private ResultEntry toEntry() {
+            return new ResultEntry(
+                    bib,
+                    status == EntryStatus.RANKED ? rank : null,
+                    status,
+                    status == EntryStatus.RANKED ? lastLapFinishMs : null,
+                    penaltyMs,
+                    status == EntryStatus.RANKED ? totalTimeMs : null,
+                    requiredPoints(),
+                    elapsedBySequence.size(),
+                    missingPoints());
+        }
+    }
 }

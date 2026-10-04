@@ -3,6 +3,8 @@ package com.example.starter.race.persistence;
 import com.example.starter.race.domain.EntryStatus;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
+import com.example.starter.race.domain.LapPoint;
+import com.example.starter.race.domain.RaceType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
@@ -26,6 +28,9 @@ public class RaceRepository {
             new SnapshotEntryRowMapper();
     private static final IdempotencyRowMapper IDEMPOTENCY_ROW_MAPPER = new IdempotencyRowMapper();
     private static final CheckpointRowMapper CHECKPOINT_ROW_MAPPER = new CheckpointRowMapper();
+    private static final LapPassRowMapper LAP_PASS_ROW_MAPPER = new LapPassRowMapper();
+    private static final LapPassHistoryRowMapper LAP_PASS_HISTORY_ROW_MAPPER =
+            new LapPassHistoryRowMapper();
     private static final CheckpointTimingRowMapper CHECKPOINT_TIMING_ROW_MAPPER =
             new CheckpointTimingRowMapper();
     private static final SnapshotCheckpointRowMapper SNAPSHOT_CHECKPOINT_ROW_MAPPER =
@@ -40,7 +45,7 @@ public class RaceRepository {
     /** 按ID查询赛事。 */
     public Optional<RaceRow> findRace(String raceId) {
         return jdbcTemplate
-                .query("SELECT race_id, version, status, created_at FROM race WHERE race_id = ?",
+                .query("SELECT race_id, version, status, race_type, total_laps, created_at FROM race WHERE race_id = ?",
                         RACE_ROW_MAPPER, raceId)
                 .stream()
                 .findFirst();
@@ -53,7 +58,7 @@ public class RaceRepository {
      */
     public Optional<RaceRow> findRaceForUpdate(String raceId) {
         return jdbcTemplate
-                .query("SELECT race_id, version, status, created_at FROM race WHERE race_id = ? FOR UPDATE",
+                .query("SELECT race_id, version, status, race_type, total_laps, created_at FROM race WHERE race_id = ? FOR UPDATE",
                         RACE_ROW_MAPPER, raceId)
                 .stream()
                 .findFirst();
@@ -216,11 +221,12 @@ public class RaceRepository {
                 entries, checkpoints));
     }
 
-    /** 新建赛事，初始版本1、状态OPEN。 */
-    public void insertRace(String raceId, long now) {
+    /** 新建赛事，初始版本1、状态OPEN；绕圈赛事携带总圈数，标准赛事 totalLaps 为 null。 */
+    public void insertRace(String raceId, RaceType raceType, Integer totalLaps, long now) {
         jdbcTemplate.update(
-                "INSERT INTO race (race_id, version, status, created_at) VALUES (?, 1, 'OPEN', ?)",
-                raceId, now);
+                "INSERT INTO race (race_id, version, status, race_type, total_laps, created_at) "
+                        + "VALUES (?, 1, 'OPEN', ?, ?, ?)",
+                raceId, raceType.name(), totalLaps, now);
     }
 
     /** 登记选手；finishTimeMs 为 null 表示计时缺失。 */
@@ -368,12 +374,108 @@ public class RaceRepository {
                 responseStatus, responseBody, requestId);
     }
 
+    /** 查询某选手的全部当前圈次记录，按圈号与点序（A、B、FINISH）升序排列。 */
+    public List<LapPassRow> findLapPassesForRunner(String raceId, String bib) {
+        return jdbcTemplate.query(
+                "SELECT lap_pass_id, race_id, bib, lap_no, point, elapsed_millis, created_by, created_at "
+                        + "FROM lap_pass WHERE race_id = ? AND bib = ? "
+                        + "ORDER BY lap_no, CASE point WHEN 'A' THEN 1 WHEN 'B' THEN 2 ELSE 3 END",
+                LAP_PASS_ROW_MAPPER, raceId, bib);
+    }
+
+    /** 查询赛事下全部当前圈次记录（用于绕圈赛事成绩与封榜计算），按参赛号、圈号、点序排列。 */
+    public List<LapPassRow> findAllLapPasses(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT lap_pass_id, race_id, bib, lap_no, point, elapsed_millis, created_by, created_at "
+                        + "FROM lap_pass WHERE race_id = ? "
+                        + "ORDER BY bib, lap_no, CASE point WHEN 'A' THEN 1 WHEN 'B' THEN 2 ELSE 3 END",
+                LAP_PASS_ROW_MAPPER, raceId);
+    }
+
+    /** 按全局记录ID查询当前圈次记录（用于 lapPassId 幂等重放与更正引用校验）。 */
+    public Optional<LapPassRow> findLapPass(String lapPassId) {
+        return jdbcTemplate
+                .query("SELECT lap_pass_id, race_id, bib, lap_no, point, elapsed_millis, created_by, created_at "
+                                + "FROM lap_pass WHERE lap_pass_id = ?",
+                        LAP_PASS_ROW_MAPPER, lapPassId)
+                .stream()
+                .findFirst();
+    }
+
+    /** 判断记录ID是否已被使用（当前记录或更正历史均占用，保证ID全局不复用）。 */
+    public boolean lapPassIdUsed(String lapPassId) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT (SELECT COUNT(*) FROM lap_pass WHERE lap_pass_id = ?) "
+                        + "+ (SELECT COUNT(*) FROM lap_pass_history WHERE history_id = ?)",
+                Integer.class, lapPassId, lapPassId);
+        return count != null && count > 0;
+    }
+
+    /** 新增圈次通过记录（全局唯一 lapPassId 与选手+圈+点唯一键由数据库约束保证）。 */
+    public void insertLapPass(LapPassRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO lap_pass "
+                        + "(lap_pass_id, race_id, bib, lap_no, point, elapsed_millis, created_by, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                row.lapPassId(), row.raceId(), row.bib(), row.lapNo(),
+                row.point().name(), row.elapsedMillis(), row.createdBy(), row.createdAt());
+    }
+
+    /**
+     * 更正当前记录：仅当 referenceId 仍是当前记录时，将其替换为新记录（新ID、新读数）。
+     *
+     * @return 受影响行数；0 表示被引用记录已不存在（并发更正下已被替换）
+     */
+    public int replaceLapPass(String referenceId, LapPassRow replacement) {
+        return jdbcTemplate.update(
+                "UPDATE lap_pass SET lap_pass_id = ?, elapsed_millis = ?, created_by = ?, created_at = ? "
+                        + "WHERE lap_pass_id = ?",
+                replacement.lapPassId(), replacement.elapsedMillis(), replacement.createdBy(),
+                replacement.createdAt(), referenceId);
+    }
+
+    /** 追加更正历史（原读数），与当前记录替换同事务提交。 */
+    public void insertLapPassHistory(LapPassHistoryRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO lap_pass_history "
+                        + "(history_id, replaced_by, race_id, bib, lap_no, point, elapsed_millis, "
+                        + "created_by, created_at, corrected_by, corrected_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                row.historyId(), row.replacedBy(), row.raceId(), row.bib(), row.lapNo(),
+                row.point().name(), row.elapsedMillis(), row.createdBy(), row.createdAt(),
+                row.correctedBy(), row.correctedAt());
+    }
+
+    /** 按历史ID查询更正历史（用于区分“记录不存在”与“记录已被更正”）。 */
+    public Optional<LapPassHistoryRow> findLapPassHistory(String historyId) {
+        return jdbcTemplate
+                .query("SELECT history_id, replaced_by, race_id, bib, lap_no, point, elapsed_millis, "
+                                + "created_by, created_at, corrected_by, corrected_at "
+                                + "FROM lap_pass_history WHERE history_id = ?",
+                        LAP_PASS_HISTORY_ROW_MAPPER, historyId)
+                .stream()
+                .findFirst();
+    }
+
+    /** 查询某选手的全部更正历史，按圈号、点序、更正时间升序排列。 */
+    public List<LapPassHistoryRow> findLapHistoryForRunner(String raceId, String bib) {
+        return jdbcTemplate.query(
+                "SELECT history_id, replaced_by, race_id, bib, lap_no, point, elapsed_millis, "
+                        + "created_by, created_at, corrected_by, corrected_at "
+                        + "FROM lap_pass_history WHERE race_id = ? AND bib = ? "
+                        + "ORDER BY lap_no, CASE point WHEN 'A' THEN 1 WHEN 'B' THEN 2 ELSE 3 END, "
+                        + "corrected_at, history_id",
+                LAP_PASS_HISTORY_ROW_MAPPER, raceId, bib);
+    }
+
     /** 测试辅助：清空全部业务数据，按外键依赖顺序删除。 */
     public void deleteAllForTesting() {
         jdbcTemplate.update("DELETE FROM result_snapshot_checkpoint");
         jdbcTemplate.update("DELETE FROM result_snapshot_entry");
         jdbcTemplate.update("DELETE FROM result_snapshot");
         jdbcTemplate.update("DELETE FROM idempotency_record");
+        jdbcTemplate.update("DELETE FROM lap_pass_history");
+        jdbcTemplate.update("DELETE FROM lap_pass");
         jdbcTemplate.update("DELETE FROM checkpoint_timing");
         jdbcTemplate.update("DELETE FROM checkpoint");
         jdbcTemplate.update("DELETE FROM penalty");
@@ -388,6 +490,8 @@ public class RaceRepository {
                     rs.getString("race_id"),
                     rs.getInt("version"),
                     RaceStatus.valueOf(rs.getString("status")),
+                    RaceType.valueOf(rs.getString("race_type")),
+                    (Integer) rs.getObject("total_laps"),
                     rs.getLong("created_at"));
         }
     }
@@ -475,6 +579,39 @@ public class RaceRepository {
                     rs.getInt("position"),
                     (Long) rs.getObject("elapsed_millis"),
                     rs.getString("timing_id"));
+        }
+    }
+
+    private static final class LapPassRowMapper implements RowMapper<LapPassRow> {
+        @Override
+        public LapPassRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new LapPassRow(
+                    rs.getString("lap_pass_id"),
+                    rs.getString("race_id"),
+                    rs.getString("bib"),
+                    rs.getInt("lap_no"),
+                    LapPoint.valueOf(rs.getString("point")),
+                    rs.getLong("elapsed_millis"),
+                    rs.getString("created_by"),
+                    rs.getLong("created_at"));
+        }
+    }
+
+    private static final class LapPassHistoryRowMapper implements RowMapper<LapPassHistoryRow> {
+        @Override
+        public LapPassHistoryRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new LapPassHistoryRow(
+                    rs.getString("history_id"),
+                    rs.getString("replaced_by"),
+                    rs.getString("race_id"),
+                    rs.getString("bib"),
+                    rs.getInt("lap_no"),
+                    LapPoint.valueOf(rs.getString("point")),
+                    rs.getLong("elapsed_millis"),
+                    rs.getString("created_by"),
+                    rs.getLong("created_at"),
+                    rs.getString("corrected_by"),
+                    rs.getLong("corrected_at"));
         }
     }
 

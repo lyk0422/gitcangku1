@@ -79,6 +79,39 @@ public class RaceController {
         return toResponse(raceService.submitTiming(raceId, bib, request));
     }
 
+    /** 提交绕圈赛事选手某圈某点通过记录。 */
+    @PostMapping("/{raceId}/runners/{bib}/laps")
+    public ResponseEntity<Object> submitLap(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody SubmitLapRequest request) {
+        return toResponse(raceService.submitLap(raceId, bib, request));
+    }
+
+    /** 更正圈次点读数：引用最近有效记录ID，原读数追加历史。 */
+    @PostMapping("/{raceId}/runners/{bib}/lap-corrections")
+    public ResponseEntity<Object> correctLap(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody CorrectLapRequest request) {
+        return toResponse(raceService.correctLap(raceId, bib, request));
+    }
+
+    /** 查询选手圈次总览（按圈号与点序展开，缺失点为null）。 */
+    @GetMapping("/{raceId}/runners/{bib}/laps")
+    public RunnerLapsResponse getRunnerLaps(
+            @PathVariable String raceId,
+            @PathVariable String bib) {
+        return raceService.getRunnerLaps(raceId, bib);
+    }
+
+    /** 查询选手圈次更正历史（按圈号、点序、更正时间）。 */
+    @GetMapping("/{raceId}/runners/{bib}/lap-history")
+    public LapHistoryResponse getLapHistory(
+            @PathVariable String raceId,
+            @PathVariable String bib) {
+        return raceService.getLapHistory(raceId, bib);
+    }
     /** 封榜。 */
     @PostMapping("/{raceId}/seal")
     public ResponseEntity<Object> sealRace(

@@ -6,6 +6,8 @@ CREATE TABLE IF NOT EXISTS race (
     race_id VARCHAR(64) NOT NULL COMMENT '赛事ID，全局唯一',
     version INT NOT NULL COMMENT '版本号，从1开始，每次写操作加一',
     status VARCHAR(16) NOT NULL COMMENT '赛事状态：OPEN-开放可写，SEALED-已封榜只读',
+    race_type VARCHAR(16) NOT NULL DEFAULT 'STANDARD' COMMENT '赛事类型：STANDARD-标准赛事，LOOP-绕圈赛事（终点多次经过，按圈核验）',
+    total_laps INT COMMENT '绕圈赛事总圈数（取值2~10）；标准赛事为NULL',
     created_at BIGINT NOT NULL COMMENT '创建时间，Unix毫秒时间戳',
     CONSTRAINT pk_race PRIMARY KEY (race_id)
 );
@@ -95,9 +97,41 @@ CREATE TABLE IF NOT EXISTS result_snapshot_checkpoint (
     CONSTRAINT fk_snapshot_checkpoint_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
 );
 
+CREATE TABLE IF NOT EXISTS lap_pass (
+    lap_pass_id VARCHAR(128) NOT NULL COMMENT '圈次通过记录ID，全局唯一（第二层幂等键）；更正后旧ID迁入lap_pass_history',
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID（仅LOOP绕圈赛事有行）',
+    bib VARCHAR(64) NOT NULL COMMENT '选手参赛号',
+    lap_no INT NOT NULL COMMENT '圈号，从1开始，不超过赛事总圈数',
+    point VARCHAR(8) NOT NULL COMMENT '圈内点：A/B/FINISH，每圈按此顺序依次经过',
+    elapsed_millis BIGINT NOT NULL COMMENT '自起跑开始的累计耗时（毫秒，非负整数，0~86400000）；同圈A<B<FINISH，下一圈A严格大于上一圈FINISH',
+    created_by VARCHAR(64) NOT NULL COMMENT '提交人（操作者标识）',
+    created_at BIGINT NOT NULL COMMENT '记录提交时间，Unix毫秒时间戳',
+    CONSTRAINT pk_lap_pass PRIMARY KEY (lap_pass_id),
+    CONSTRAINT uk_lap_pass_point UNIQUE (race_id, bib, lap_no, point),
+    CONSTRAINT fk_lap_pass_runner FOREIGN KEY (race_id, bib) REFERENCES runner (race_id, bib),
+    INDEX idx_lap_pass_race_bib (race_id, bib)
+);
+
+CREATE TABLE IF NOT EXISTS lap_pass_history (
+    history_id VARCHAR(128) NOT NULL COMMENT '被更正替换的原记录ID（即原lap_pass_id），全局唯一',
+    replaced_by VARCHAR(128) NOT NULL COMMENT '替换后的当前记录ID（lap_pass.lap_pass_id）',
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    bib VARCHAR(64) NOT NULL COMMENT '选手参赛号',
+    lap_no INT NOT NULL COMMENT '圈号，从1开始',
+    point VARCHAR(8) NOT NULL COMMENT '圈内点：A/B/FINISH',
+    elapsed_millis BIGINT NOT NULL COMMENT '被替换前的原始读数（毫秒，非负）；更正只追加历史，不覆盖原读数',
+    created_by VARCHAR(64) NOT NULL COMMENT '原记录提交人',
+    created_at BIGINT NOT NULL COMMENT '原记录提交时间，Unix毫秒时间戳',
+    corrected_by VARCHAR(64) NOT NULL COMMENT '更正操作人',
+    corrected_at BIGINT NOT NULL COMMENT '更正时间，Unix毫秒时间戳',
+    CONSTRAINT pk_lap_pass_history PRIMARY KEY (history_id),
+    CONSTRAINT fk_lap_history_runner FOREIGN KEY (race_id, bib) REFERENCES runner (race_id, bib),
+    INDEX idx_lap_history_race_bib (race_id, bib, lap_no)
+);
+
 CREATE TABLE IF NOT EXISTS idempotency_record (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求ID（写操作幂等键）',
-    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE',
+    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE/SUBMIT_LAP/CORRECT_LAP',
     request_digest CHAR(64) NOT NULL COMMENT '请求参数（requestId除外，含expectedVersion）规范化JSON的SHA-256摘要',
     response_status INT NOT NULL COMMENT '原成功请求的HTTP状态码，重放时原样返回',
     response_body TEXT COMMENT '原成功响应体JSON，重放时原样返回',
