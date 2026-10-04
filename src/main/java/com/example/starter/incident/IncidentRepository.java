@@ -173,6 +173,15 @@ public class IncidentRepository {
     }
 
     /**
+     * 按主键查询交接单。
+     */
+    public Optional<IncidentTransfer> findTransferById(long transferId) {
+        List<IncidentTransfer> rows = jdbc.query(
+                "SELECT * FROM incident_transfers WHERE id = ?", TRANSFER_MAPPER, transferId);
+        return rows.stream().findFirst();
+    }
+
+    /**
      * 查询事件当前待接受的交接单。
      */
     public Optional<IncidentTransfer> findPendingTransfer(long incidentId) {

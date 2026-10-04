@@ -88,10 +88,28 @@ class IncidentApiTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.pendingTransferTo").value("bob"));
 
+        // 接班人读取简报并完成回读
+        String briefingBody = mvc.perform(get("/api/incidents/{k}/transfers/briefing", "INC-300")
+                        .header("X-Actor-Id", "bob"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.version").value(1))
+                .andReturn().getResponse().getContentAsString();
+        long briefingId = ((Number) com.jayway.jsonpath.JsonPath.read(briefingBody, "$.id"))
+                .longValue();
+        String digest = com.jayway.jsonpath.JsonPath.read(briefingBody, "$.digest");
+        mvc.perform(post("/api/incidents/{k}/transfers/readback", "INC-300")
+                        .header("X-Actor-Id", "bob")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"requestId\":\"" + key() + "\",\"briefingId\":" + briefingId
+                                + ",\"digest\":\"" + digest + "\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.reader").value("bob"));
+
         mvc.perform(post("/api/incidents/{k}/transfers/accept", "INC-300")
                         .header("X-Actor-Id", "bob")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"commandKey\":\"" + key() + "\"}"))
+                        .content("{\"commandKey\":\"" + key() + "\",\"briefingId\":"
+                                + briefingId + "}"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.commander").value("bob"));
 

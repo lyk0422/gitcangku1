@@ -78,4 +78,38 @@ public final class Responses {
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
     }
+
+    /** 简报内冻结的未完成任务项：任务编号、分组与冻结时状态。 */
+    public record BriefingTaskItem(String taskKey, String groupCode, String status) {
+    }
+
+    /** 简报内冻结的未确认升级记录项：记录 id、状态、触发时刻与遏制期限（UTC）。 */
+    public record BriefingEscalationItem(long id, String status, Instant triggeredAt,
+                                         Instant deadlineAt) {
+    }
+
+    /**
+     * 结构化简报内容：冻结事件状态、未完成任务编号及状态、未确认升级记录与
+     * 交出人补充说明（note 为空表示无补充）。摘要 digest 由本结构的规范化 JSON
+     * 计算，字段边界由 JSON 结构保证，不可碰撞。
+     */
+    public record BriefingContent(String incidentKey, String incidentStatus,
+                                  String fromCommander, String toCommander, String note,
+                                  List<BriefingTaskItem> unfinishedTasks,
+                                  List<BriefingEscalationItem> unacknowledgedEscalations) {
+    }
+
+    /**
+     * 简报视图：version 在同一交接单内从 1 递增；digest 为内容摘要；
+     * status 为 ACTIVE/FROZEN；readbackBy/readbackAt 为接班人回读确认信息，未回读为空。
+     */
+    public record BriefingView(long id, long transferId, int version, String status,
+                               String digest, BriefingContent content, String createdBy,
+                               Instant createdAt, String readbackBy, Instant readbackAt) {
+    }
+
+    /** 回读确认视图：确认绑定具体简报版本，刷新后旧确认不能复用。 */
+    public record ReadbackView(long briefingId, int version, String reader, String digest,
+                               Instant confirmedAt) {
+    }
 }

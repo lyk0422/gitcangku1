@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS incident_status_history (
 CREATE TABLE IF NOT EXISTS command_keys (
     id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
     command_key VARCHAR(128) NOT NULL COMMENT '调用方幂等键，全局唯一',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：takeover/transfer_initiate/transfer_accept/action/status/escalation_check/escalation_ack/task_create/task_complete/task_cancel',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：takeover/transfer_initiate/transfer_accept/transfer_readback/transfer_briefing_refresh/action/status/escalation_check/escalation_ack/task_create/task_complete/task_cancel',
     request_hash VARCHAR(64) NOT NULL COMMENT '规范化请求参数的 SHA-256 摘要，用于同键改参检测',
     response_status INT NULL COMMENT '首次成功的 HTTP 状态码；事务提交前必写入',
     response_body MEDIUMTEXT NULL COMMENT '首次成功响应 JSON，用于同键同参重放',
@@ -96,6 +96,29 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
     created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
     CONSTRAINT uk_task_blocker UNIQUE (task_id, blocker_incident_id)
 ) COMMENT='处置任务跨事件阻塞关系表（有向图边：所属任务事件 → 阻塞事件）';
+
+CREATE TABLE IF NOT EXISTS transfer_briefings (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    transfer_id BIGINT NOT NULL COMMENT '所属交接单 id，关联 incident_transfers.id；刷新在同一交接单内递增版本，旧版本保留',
+    incident_id BIGINT NOT NULL COMMENT '所属事件 id，关联 incidents.id',
+    version INT NOT NULL COMMENT '简报版本号，同一交接单内从 1 开始递增，刷新加一',
+    content MEDIUMTEXT NOT NULL COMMENT '结构化简报 JSON：冻结事件状态、未完成任务编号及状态、未确认升级记录、交出人补充说明；字段边界由 JSON 结构保证',
+    digest VARCHAR(64) NOT NULL COMMENT '内容摘要，完整结构化简报的 SHA-256 十六进制；接收时重算比对，不一致即失效（409）',
+    note VARCHAR(1024) NULL COMMENT '交出人补充说明，同时包含在 content 内参与摘要；为空表示无补充',
+    status VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE 可回读可刷新 / FROZEN 交接成功后冻结，冻结后简报与回读人不再变更',
+    created_by VARCHAR(128) NOT NULL COMMENT '创建人（交出人，即发起或刷新时的当前指挥人）',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
+    CONSTRAINT uk_briefing_version UNIQUE (transfer_id, version)
+) COMMENT='交接简报表';
+
+CREATE TABLE IF NOT EXISTS transfer_readbacks (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    briefing_id BIGINT NOT NULL COMMENT '已回读的简报 id，关联 transfer_briefings.id；回读绑定具体版本，刷新后旧回读不能复用',
+    reader VARCHAR(128) NOT NULL COMMENT '回读人，必须为交接目标人（指定接班人）',
+    digest VARCHAR(64) NOT NULL COMMENT '回读时提交并校验通过的摘要，须与简报 digest 一致，错误摘要不产生确认',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '回读确认 UTC 时间',
+    CONSTRAINT uk_briefing_reader UNIQUE (briefing_id, reader)
+) COMMENT='交接简报回读确认表';
 
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY COMMENT '固定为 1 的单行锁；创建任务时 SELECT ... FOR UPDATE 持有，串行化环检测与写入，保证并发反向依赖最终图无环'

@@ -97,6 +97,29 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
     CONSTRAINT uk_task_blocker UNIQUE (task_id, blocker_incident_id)
 );
 
+CREATE TABLE IF NOT EXISTS transfer_briefings (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    transfer_id BIGINT NOT NULL,
+    incident_id BIGINT NOT NULL,
+    version INT NOT NULL,
+    content CLOB NOT NULL,
+    digest VARCHAR(64) NOT NULL,
+    note VARCHAR(1024) NULL,
+    status VARCHAR(16) NOT NULL,
+    created_by VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_briefing_version UNIQUE (transfer_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS transfer_readbacks (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    briefing_id BIGINT NOT NULL,
+    reader VARCHAR(128) NOT NULL,
+    digest VARCHAR(64) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_briefing_reader UNIQUE (briefing_id, reader)
+);
+
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
 );

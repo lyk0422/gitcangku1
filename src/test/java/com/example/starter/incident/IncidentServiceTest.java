@@ -7,6 +7,7 @@ import java.time.Instant;
 import java.util.UUID;
 
 import com.example.starter.incident.dto.Requests.ActionRequest;
+import com.example.starter.incident.dto.Requests.ReadbackRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
@@ -58,6 +59,16 @@ class IncidentServiceTest {
     private IncidentView commandingIncident(String incidentKey, String commander) {
         reportIncident(incidentKey);
         return service.takeover(incidentKey, commander, new TakeoverRequest(key()));
+    }
+
+    /**
+     * 接班人读取当前简报并完成回读，返回简报 id 供接受交接时引用。
+     */
+    private long readbackCurrent(String incidentKey, String reader) {
+        var briefing = service.currentBriefing(incidentKey, reader);
+        service.readbackBriefing(incidentKey, reader,
+                new ReadbackRequest(key(), briefing.id(), briefing.digest()));
+        return briefing.id();
     }
 
     private static void assertApiStatus(ThrowingCallable call, HttpStatus status) {
@@ -230,13 +241,15 @@ class IncidentServiceTest {
                 "NOTE", "n", Instant.parse("2026-09-21T08:00:00Z"))), HttpStatus.CONFLICT);
         // 非目标人不能接受
         assertApiStatus(() -> service.acceptTransfer("INC-140", "carol",
-                new TransferAcceptRequest(key())), HttpStatus.CONFLICT);
+                new TransferAcceptRequest(key(), 1L)), HttpStatus.CONFLICT);
         // 已有待接受交接时不能重复发起
         assertApiStatus(() -> service.initiateTransfer("INC-140", "alice",
                 new TransferRequest(key(), "carol")), HttpStatus.CONFLICT);
 
-        // 目标人接受后原子切换
-        IncidentView after = service.acceptTransfer("INC-140", "bob", new TransferAcceptRequest(key()));
+        // 目标人回读简报后接受，原子切换
+        long briefingId = readbackCurrent("INC-140", "bob");
+        IncidentView after = service.acceptTransfer("INC-140", "bob",
+                new TransferAcceptRequest(key(), briefingId));
         assertThat(after.commander()).isEqualTo("bob");
         assertThat(service.get("INC-140").pendingTransferTo()).isNull();
 
@@ -259,9 +272,10 @@ class IncidentServiceTest {
         service.changeStatus("INC-141", "alice", new StatusRequest(key(), "CONTAINED"));
         // CONTAINED 下可发起，随后 RESOLVED 后不能接受
         service.initiateTransfer("INC-141", "alice", new TransferRequest(key(), "bob"));
+        long briefingId = readbackCurrent("INC-141", "bob");
         service.changeStatus("INC-141", "alice", new StatusRequest(key(), "RESOLVED"));
         assertApiStatus(() -> service.acceptTransfer("INC-141", "bob",
-                new TransferAcceptRequest(key())), HttpStatus.UNPROCESSABLE_ENTITY);
+                new TransferAcceptRequest(key(), briefingId)), HttpStatus.UNPROCESSABLE_ENTITY);
         assertApiStatus(() -> service.initiateTransfer("INC-141", "alice",
                 new TransferRequest(key(), "carol")), HttpStatus.UNPROCESSABLE_ENTITY);
         service.changeStatus("INC-141", "alice", new StatusRequest(key(), "CLOSED"));
@@ -273,7 +287,7 @@ class IncidentServiceTest {
     void accept_withoutPending_conflict() {
         commandingIncident("INC-142", "alice");
         assertApiStatus(() -> service.acceptTransfer("INC-142", "bob",
-                new TransferAcceptRequest(key())), HttpStatus.CONFLICT);
+                new TransferAcceptRequest(key(), 1L)), HttpStatus.CONFLICT);
     }
 
     @Test

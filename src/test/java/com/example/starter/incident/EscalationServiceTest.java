@@ -14,6 +14,7 @@ import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
+import com.example.starter.incident.dto.Requests.ReadbackRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.EscalationHistoryView;
@@ -90,7 +91,7 @@ class EscalationServiceTest {
 
             // 交接不重置期限
             service.initiateTransfer(ik, "alice", new TransferRequest(key(), "bob"));
-            service.acceptTransfer(ik, "bob", new TransferAcceptRequest(key()));
+            acceptAfterReadback(ik, "bob");
             assertThat(service.get(ik).deadlineAt()).isEqualTo(expected);
         }
     }
@@ -230,7 +231,7 @@ class EscalationServiceTest {
         ((ControllableClock) clock).setInstant(T0.plus(36, ChronoUnit.MINUTES));
         service.checkEscalation("INC-E-021", new EscalationCheckRequest(key()));
         service.initiateTransfer("INC-E-021", "alice", new TransferRequest(key(), "bob"));
-        service.acceptTransfer("INC-E-021", "bob", new TransferAcceptRequest(key()));
+        acceptAfterReadback("INC-E-021", "bob");
         assertApiStatus(() -> service.acknowledgeEscalation("INC-E-021", "alice",
                 new EscalationAckRequest(key(), "旧指挥人说明")), HttpStatus.CONFLICT);
         EscalationView byBob = service.acknowledgeEscalation("INC-E-021", "bob",
@@ -306,4 +307,15 @@ class EscalationServiceTest {
         assertApiStatus(() -> service.acknowledgeEscalation("INC-404", "alice",
                 new EscalationAckRequest(key(), "x")), HttpStatus.NOT_FOUND);
     }
+    /**
+     * 接班人读取当前简报并完成回读，再引用该简报接受交接。
+     */
+    private void acceptAfterReadback(String incidentKey, String reader) {
+        var briefing = service.currentBriefing(incidentKey, reader);
+        service.readbackBriefing(incidentKey, reader,
+                new ReadbackRequest(key(), briefing.id(), briefing.digest()));
+        service.acceptTransfer(incidentKey, reader,
+                new TransferAcceptRequest(key(), briefing.id()));
+    }
 }
+

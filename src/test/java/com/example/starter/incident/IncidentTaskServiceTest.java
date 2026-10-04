@@ -11,6 +11,7 @@ import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
 import com.example.starter.incident.dto.Requests.TaskActionRequest;
 import com.example.starter.incident.dto.Requests.TaskCreateRequest;
+import com.example.starter.incident.dto.Requests.ReadbackRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.IncidentTasksView;
@@ -151,7 +152,7 @@ class IncidentTaskServiceTest {
                 new TaskCreateRequest(key(), "T-1", "G", "t", List.of())), HttpStatus.CONFLICT);
         // 指挥权变更：交接后旧指挥人失去权限，新指挥人可创建
         service.initiateTransfer("INC-C1", "alice", new TransferRequest(key(), "bob"));
-        service.acceptTransfer("INC-C1", "bob", new TransferAcceptRequest(key()));
+        acceptAfterReadback("INC-C1", "bob");
         assertApiStatus(() -> service.createTask("INC-C1", "alice",
                 new TaskCreateRequest(key(), "T-1", "G", "t", List.of())), HttpStatus.CONFLICT);
         TaskView byNew = service.createTask("INC-C1", "bob",
@@ -311,7 +312,7 @@ class IncidentTaskServiceTest {
                 new TaskActionRequest(key())), HttpStatus.CONFLICT);
         // 交接后旧指挥人失去权限，新指挥人可完成
         service.initiateTransfer("INC-W1", "alice", new TransferRequest(key(), "bob"));
-        service.acceptTransfer("INC-W1", "bob", new TransferAcceptRequest(key()));
+        acceptAfterReadback("INC-W1", "bob");
         assertApiStatus(() -> service.completeTask("INC-W1", "T-1", "alice",
                 new TaskActionRequest(key())), HttpStatus.CONFLICT);
         TaskView done = service.completeTask("INC-W1", "T-1", "bob",
@@ -399,4 +400,15 @@ class IncidentTaskServiceTest {
         assertApiStatus(() -> service.getTask("INC-Q1", "T-9"), HttpStatus.NOT_FOUND);
         assertThat(service.listTasks("INC-Q1").tasks()).isEmpty();
     }
+    /**
+     * 接班人读取当前简报并完成回读，再引用该简报接受交接。
+     */
+    private void acceptAfterReadback(String incidentKey, String reader) {
+        var briefing = service.currentBriefing(incidentKey, reader);
+        service.readbackBriefing(incidentKey, reader,
+                new ReadbackRequest(key(), briefing.id(), briefing.digest()));
+        service.acceptTransfer(incidentKey, reader,
+                new TransferAcceptRequest(key(), briefing.id()));
+    }
 }
+

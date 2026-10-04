@@ -4,7 +4,7 @@ import org.springframework.http.HttpStatus;
 
 /**
  * 业务异常：携带可区分的 HTTP 状态码与错误码。
- * 400 参数非法，404 资源不存在，409 权限/状态/幂等冲突，422 非法状态流转。
+ * 400 参数非法，403 无权访问，404 资源不存在，409 权限/状态/幂等冲突，422 非法状态流转。
  */
 public class ApiException extends RuntimeException {
 
@@ -35,6 +35,11 @@ public class ApiException extends RuntimeException {
     /** 400：请求参数缺失或非法。 */
     public static ApiException badRequest(String message) {
         return new ApiException(HttpStatus.BAD_REQUEST, "BAD_REQUEST", message, null);
+    }
+
+    /** 403：已认证但无权访问该资源（如非交出人/接班人读取简报）。 */
+    public static ApiException forbidden(String message) {
+        return new ApiException(HttpStatus.FORBIDDEN, "FORBIDDEN", message, null);
     }
 
     /** 404：事件不存在。 */

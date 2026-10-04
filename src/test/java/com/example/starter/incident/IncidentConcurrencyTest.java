@@ -14,6 +14,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
 import com.example.starter.incident.dto.Requests.ActionRequest;
+import com.example.starter.incident.dto.Requests.ReadbackRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
@@ -114,9 +115,13 @@ class IncidentConcurrencyTest {
         service.takeover(ik, "alice", new TakeoverRequest(key()));
         service.changeStatus(ik, "alice", new StatusRequest(key(), "CONTAINED"));
         service.initiateTransfer(ik, "alice", new TransferRequest(key(), "bob"));
+        var briefing = service.currentBriefing(ik, "bob");
+        service.readbackBriefing(ik, "bob", new ReadbackRequest(key(), briefing.id(),
+                briefing.digest()));
+        long briefingId = briefing.id();
 
         List<Object> results = runConcurrently(List.of(
-                () -> service.acceptTransfer(ik, "bob", new TransferAcceptRequest(key())),
+                () -> service.acceptTransfer(ik, "bob", new TransferAcceptRequest(key(), briefingId)),
                 () -> service.changeStatus(ik, "alice", new StatusRequest(key(), "RESOLVED"))));
 
         long successes = results.stream().filter(IncidentView.class::isInstance).count();
