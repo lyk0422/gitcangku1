@@ -13,6 +13,7 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
@@ -50,17 +51,26 @@ public class ObservationService {
     private final ObservationRepository observationRepository;
     private final RequestLogRepository requestLogRepository;
     private final ResolutionRepository resolutionRepository;
+    private final ConflictRepository conflictRepository;
+    private final ConflictRecorder conflictRecorder;
+    private final DisclosureRepository disclosureRepository;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public ObservationService(ObservationRepository observationRepository,
                               RequestLogRepository requestLogRepository,
                               ResolutionRepository resolutionRepository,
+                              ConflictRepository conflictRepository,
+                              ConflictRecorder conflictRecorder,
+                              DisclosureRepository disclosureRepository,
                               ObjectMapper objectMapper,
                               Clock clock) {
         this.observationRepository = observationRepository;
         this.requestLogRepository = requestLogRepository;
         this.resolutionRepository = resolutionRepository;
+        this.conflictRepository = conflictRepository;
+        this.conflictRecorder = conflictRecorder;
+        this.disclosureRepository = disclosureRepository;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -128,6 +138,7 @@ public class ObservationService {
                 request.reading(), conflictFields);
         String mergedNote = mergeField("note", base.note(), current.note(), request.note(), conflictFields);
         if (!conflictFields.isEmpty()) {
+            conflictRecorder.recordOpenConflict(observationId, request.requestId(), conflictFields);
             throw ApiException.mergeConflict(conflictFields, current.version());
         }
 
@@ -141,6 +152,7 @@ public class ObservationService {
                 mergedLocation, mergedReading, mergedNote, false);
         observationRepository.updateCurrent(next);
         observationRepository.insertVersion(next);
+        recordAppendix(observationId, next.version(), "MERGE", request.requestId());
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(next));
     }
 
@@ -171,6 +183,7 @@ public class ObservationService {
                 null, null, null, true);
         observationRepository.markDeleted(observationId, tombstone.version());
         observationRepository.insertVersion(tombstone);
+        recordAppendix(observationId, tombstone.version(), "DELETE", request.requestId());
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(tombstone));
     }
 
@@ -261,6 +274,7 @@ public class ObservationService {
                     resolvedLocation, resolvedReading, resolvedNote, false);
             observationRepository.updateCurrent(next);
             observationRepository.insertVersion(next);
+            recordAppendix(observationId, newVersion, "RESOLVE", request.requestId());
         }
 
         ResolutionRecord record = new ResolutionRecord(
@@ -283,6 +297,8 @@ public class ObservationService {
             }
             return completeResolve(request.requestId(), HttpStatus.OK, resolutionResponseOf(winner));
         }
+
+        conflictRepository.closeOpen(observationId, request.resolutionId(), record.resolvedAtUtc());
 
         ObservationSnapshot pointed = contentChanged
                 ? new ObservationSnapshot(observationId, newVersion, resolvedLocation, resolvedReading, resolvedNote, false)
@@ -634,5 +650,18 @@ public class ObservationService {
      * 冲突解决结果：HTTP 状态码与解决响应体。
      */
     public record ResolveOutcome(int status, ResolutionResponse body) {
+    }
+
+    /**
+     * 首次披露快照发布后，新更正只登记附页（不改写首次快照）；未发布时不登记。
+     * 调用方持有观测记录行锁，附页序号在同事务内分配，与业务变更原子提交。
+     */
+    private void recordAppendix(String observationId, int version, String operation, String requestId) {
+        if (disclosureRepository.findSnapshot(observationId).isEmpty()) {
+            return;
+        }
+        disclosureRepository.insertAppendix(new AppendixRecord(observationId,
+                disclosureRepository.nextAppendixSeq(observationId), version, operation, requestId,
+                Instant.now(clock).truncatedTo(ChronoUnit.MILLIS)));
     }
 }
