@@ -234,6 +234,16 @@ public class EquipmentRepository {
         return count != null && count > 0;
     }
 
+    // ---------- 部件装拆账引用 ----------
+
+    /** 该读数是否已被任意部件装拆账引用（安装或拆卸快照）；引用后不可修订。 */
+    public boolean existsComponentInstallReferencingReading(String equipmentId, String readingId) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM component_install WHERE equipment_id = ?"
+                        + " AND (install_reading_id = ? OR remove_reading_id = ?)",
+                Integer.class, equipmentId, readingId, readingId);
+        return count != null && count > 0;
+    }
     // ---------- 幂等去重 ----------
 
     public Optional<IdempotencyRow> findIdempotency(String requestId) {

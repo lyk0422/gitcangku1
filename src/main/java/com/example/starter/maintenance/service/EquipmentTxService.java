@@ -99,7 +99,10 @@ public class EquipmentTxService {
                     Reading reading = repository.findReading(equipmentId, readingId)
                             .orElseThrow(() -> ApiException.notFound("READING_NOT_FOUND",
                                     "读数不存在：" + readingId));
-                    if (repository.existsMaintenanceAnchoringReading(equipmentId, readingId)) {
+                    if (repository.existsComponentInstallReferencingReading(equipmentId, readingId)) {
+                        throw ApiException.conflict("READING_ANCHORED",
+                                "读数已被部件装拆账引用，不可修订：" + readingId);
+                    }                    if (repository.existsMaintenanceAnchoringReading(equipmentId, readingId)) {
                         throw ApiException.conflict("READING_ANCHORED",
                                 "读数已作为历史保养锚点，不可修订：" + readingId);
                     }
