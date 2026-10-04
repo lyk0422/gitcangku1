@@ -9,6 +9,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
+import java.util.List;
 import java.util.Optional;
 import java.util.function.Supplier;
 
@@ -28,15 +29,16 @@ public class IdempotencyAdvisor {
     }
 
     /**
-     * 计算请求指纹：操作类型 + 操作人 + 证物键 + 请求体规范化 JSON 的 SHA-256。
+     * 计算请求指纹：操作类型、操作人、资源键与请求体作为结构化 JSON 数组序列化后取 SHA-256。
+     * 结构化比较避免分隔符碰撞：任一字段含换行或分隔符都不会与其他组合产生相同指纹。
      */
     public String hash(String operation, String actorId, String evidenceKey, Object request) {
         try {
-            String canonical = String.join("\n",
+            String canonical = objectMapper.writeValueAsString(List.of(
                     operation,
                     actorId == null ? "" : actorId,
                     evidenceKey == null ? "" : evidenceKey,
-                    objectMapper.writeValueAsString(request));
+                    objectMapper.writeValueAsString(request)));
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             return HexFormat.of().formatHex(digest.digest(canonical.getBytes(StandardCharsets.UTF_8)));
         } catch (NoSuchAlgorithmException e) {
@@ -47,7 +49,8 @@ public class IdempotencyAdvisor {
     }
 
     /**
-     * 在事务边界外执行命令；捕获并发导致的 command_key 唯一冲突并重放/报 409。
+     * 在事务边界外执行命令；捕获并发导致的 command_key 唯一冲突并重放/报 409，
+     * 唯一键异常不向调用方泄露。
      */
     public StoredResponse guard(String commandKey, String requestHash,
                                 Supplier<StoredResponse> transactionalCall) {

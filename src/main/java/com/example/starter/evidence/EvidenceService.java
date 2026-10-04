@@ -45,6 +45,7 @@ public class EvidenceService {
     private final TransferRecordRepository transferRepository;
     private final SealInspectionRepository inspectionRepository;
     private final LoanRecordRepository loanRepository;
+    private final InspectionCopyRepository copyRepository;
     private final CommandLogRepository commandLogRepository;
     private final ObjectMapper objectMapper;
     private final EvidenceClock clock;
@@ -53,6 +54,7 @@ public class EvidenceService {
                            TransferRecordRepository transferRepository,
                            SealInspectionRepository inspectionRepository,
                            LoanRecordRepository loanRepository,
+                           InspectionCopyRepository copyRepository,
                            CommandLogRepository commandLogRepository,
                            ObjectMapper objectMapper,
                            EvidenceClock clock) {
@@ -60,6 +62,7 @@ public class EvidenceService {
         this.transferRepository = transferRepository;
         this.inspectionRepository = inspectionRepository;
         this.loanRepository = loanRepository;
+        this.copyRepository = copyRepository;
         this.commandLogRepository = commandLogRepository;
         this.objectMapper = objectMapper;
         this.clock = clock;
@@ -79,7 +82,7 @@ public class EvidenceService {
         }
         LocalDateTime now = LocalDateTime.now();
         evidenceRepository.insert(request.evidenceKey(), request.caseKey(), request.category(),
-                request.sealNo(), actorId, now);
+                request.sealNo(), request.digest(), request.syntheticText(), actorId, now);
         Evidence evidence = evidenceRepository.findByKey(request.evidenceKey()).orElseThrow();
         return record(request.commandKey(), OP_INTAKE, actorId, requestHash, 201, toView(evidence));
     }
@@ -111,6 +114,7 @@ public class EvidenceService {
         if (evidence.status() == EvidenceStatus.BORROWED) {
             throw ApiException.conflict("借出期间禁止发起交接: " + evidenceKey);
         }
+        requireNoEffectiveCopies(evidenceKey);
         LocalDateTime now = LocalDateTime.now();
         transferRepository.insert(evidenceKey, actorId, request.toCustodian(), now);
         evidenceRepository.updateStatus(evidenceKey, EvidenceStatus.TRANSFER_PENDING, now);
@@ -247,6 +251,7 @@ public class EvidenceService {
         if (evidence.status() == EvidenceStatus.BORROWED) {
             throw ApiException.conflict("证物已存在未归还借出: " + evidenceKey);
         }
+        requireNoEffectiveCopies(evidenceKey);
         LocalDateTime nowUtc = clock.nowUtc();
         if (!request.dueAt().isAfter(nowUtc)) {
             throw ApiException.badRequest("应还时刻须晚于服务端当前时刻");
@@ -368,6 +373,16 @@ public class EvidenceService {
         }
     }
 
+    /**
+     * 交接或借出前必须回收全部有效副本：存在未回收且未自然到期的副本时返回 409。
+     * 调用前必须已锁定证物行，与副本签发互斥。
+     */
+    private void requireNoEffectiveCopies(String evidenceKey) {
+        if (!copyRepository.findEffectiveByEvidenceKey(evidenceKey, clock.nowUtc()).isEmpty()) {
+            throw ApiException.conflict("存在未回收的有效阅检副本，禁止交接或借出: " + evidenceKey);
+        }
+    }
+
     private TransferRecord requirePending(Evidence evidence, String evidenceKey) {
         if (evidence.status() != EvidenceStatus.TRANSFER_PENDING) {
             throw ApiException.conflict("证物不存在待接收交接: " + evidenceKey);
@@ -403,7 +418,7 @@ public class EvidenceService {
 
     private EvidenceView toView(Evidence evidence) {
         return new EvidenceView(evidence.evidenceKey(), evidence.caseKey(), evidence.category(),
-                evidence.sealNo(), evidence.custodianId(), evidence.status(),
+                evidence.sealNo(), evidence.digest(), evidence.custodianId(), evidence.status(),
                 evidence.createdAt(), evidence.updatedAt());
     }
 

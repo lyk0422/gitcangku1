@@ -1,13 +1,15 @@
 -- 证物封存交接 schema；默认本地运行与测试使用 H2(MySQL 兼容模式)，生产可使用 MySQL。
 -- 全部使用 IF NOT EXISTS，保证重启后数据与结构保持不变。
 
--- 证物主表：入库后业务字段（case_key/category/seal_no）不可修改，仅保管人与状态随交接流转。
+-- 证物主表：入库后业务字段（case_key/category/seal_no/digest/synthetic_text）不可修改，仅保管人与状态随交接流转。
 CREATE TABLE IF NOT EXISTS evidence (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     evidence_key VARCHAR(64) NOT NULL COMMENT '证物业务键，全局唯一，入库后不可修改',
     case_key VARCHAR(64) NOT NULL COMMENT '所属案件键，入库后不可修改',
     category VARCHAR(64) NOT NULL COMMENT '证物类别，入库后不可修改',
     seal_no VARCHAR(64) NOT NULL COMMENT '封条编号，入库后不可修改',
+    digest VARCHAR(128) NOT NULL COMMENT '原件数字摘要（如 SHA-256 十六进制），入库后不可修改；签发阅检副本时冻结到副本',
+    synthetic_text TEXT NOT NULL COMMENT '原件合成文本元数据，入库后不可修改；仅通过授权阅检副本读取，不随证物视图对外返回',
     custodian_id VARCHAR(64) NOT NULL COMMENT '当前保管人（操作人标识），交接接受后原子切换；借出期间不变',
     status VARCHAR(20) NOT NULL COMMENT '证物状态：SEALED 已封存 / TRANSFER_PENDING 待接收 / BORROWED 借出未归还 / SEAL_BROKEN 封条异常（终态）',
     created_at DATETIME(6) NOT NULL COMMENT '入库时间，Asia/Shanghai',
@@ -60,12 +62,31 @@ CREATE TABLE IF NOT EXISTS loan_record (
     KEY idx_loan_borrower_status (borrower_id, status)
 );
 
+-- 阅检副本：证物合成数字副本的签发记录，只追加、回收不删除历史。
+-- 有效区间为 UTC 左闭右开 [valid_from, valid_until)，最长一小时；自然到期无需状态变更即视为失效。
+CREATE TABLE IF NOT EXISTS inspection_copy (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    copy_key VARCHAR(64) NOT NULL COMMENT '副本业务键（不可重复副本 ID），全局唯一，签发后不可修改，水印组成部分',
+    evidence_key VARCHAR(64) NOT NULL COMMENT '关联证物业务键，签发后不可修改',
+    reviewer_id VARCHAR(64) NOT NULL COMMENT '阅检人（操作人标识），仅本人可在有效期内读取副本，签发后不可修改',
+    digest VARCHAR(128) NOT NULL COMMENT '签发时冻结的原件数字摘要，此后不随任何操作变化',
+    watermark VARCHAR(256) NOT NULL COMMENT '签发时冻结的水印，含不可重复副本 ID 与阅检人，此后不随任何操作变化',
+    valid_from DATETIME(6) NOT NULL COMMENT 'UTC 生效时刻（含），等于签发时刻',
+    valid_until DATETIME(6) NOT NULL COMMENT 'UTC 失效时刻（不含），距签发时刻不超过一小时',
+    status VARCHAR(20) NOT NULL COMMENT '副本状态：ACTIVE 未回收 / REVOKED 已回收；自然到期不修改该状态，按 valid_until 判定失效',
+    revoked_at DATETIME(6) NULL COMMENT '回收时刻（UTC）；NULL 表示未回收',
+    created_at DATETIME(6) NOT NULL COMMENT '签发时间，Asia/Shanghai',
+    CONSTRAINT uk_copy_key UNIQUE (copy_key),
+    KEY idx_copy_evidence (evidence_key),
+    KEY idx_copy_reviewer (reviewer_id)
+);
+
 -- 幂等命令日志：command_key 全局唯一；同键同参重放返回首次结果，同键改参返回 409。
 CREATE TABLE IF NOT EXISTS command_log (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     command_key VARCHAR(64) NOT NULL COMMENT '幂等命令键，全局唯一',
     actor_id VARCHAR(64) NOT NULL COMMENT '发起操作人',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN/COPY_ISSUE/COPY_REVOKE',
     request_hash VARCHAR(64) NOT NULL COMMENT '请求参数规范化后的 SHA-256，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行的 HTTP 状态码',
     response_body TEXT NOT NULL COMMENT '首次执行的响应体 JSON，重放时原样返回',

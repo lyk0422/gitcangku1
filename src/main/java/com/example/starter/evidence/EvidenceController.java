@@ -3,6 +3,8 @@ package com.example.starter.evidence;
 import com.example.starter.evidence.dto.CommandRequest;
 import com.example.starter.evidence.dto.CustodyChainView;
 import com.example.starter.evidence.dto.EvidenceView;
+import com.example.starter.evidence.dto.InspectionCopyContentView;
+import com.example.starter.evidence.dto.InspectionCopyIssueRequest;
 import com.example.starter.evidence.dto.IntakeRequest;
 import com.example.starter.evidence.dto.LoanCreateRequest;
 import com.example.starter.evidence.dto.LoanReturnRequest;
@@ -37,10 +39,13 @@ public class EvidenceController {
     static final String ACTOR_HEADER = "X-Actor-Id";
 
     private final EvidenceService evidenceService;
+    private final InspectionCopyService copyService;
     private final IdempotencyAdvisor idempotencyAdvisor;
 
-    public EvidenceController(EvidenceService evidenceService, IdempotencyAdvisor idempotencyAdvisor) {
+    public EvidenceController(EvidenceService evidenceService, InspectionCopyService copyService,
+                              IdempotencyAdvisor idempotencyAdvisor) {
         this.evidenceService = evidenceService;
+        this.copyService = copyService;
         this.idempotencyAdvisor = idempotencyAdvisor;
     }
 
@@ -138,6 +143,47 @@ public class EvidenceController {
                 evidenceKey, request);
         StoredResponse response = idempotencyAdvisor.guard(request.commandKey(), hash,
                 () -> evidenceService.returnLoan(actorId, evidenceKey, request, hash));
+        return toEntity(response);
+    }
+
+    /**
+     * 签发阅检副本：仅当前保管人，原件须已封存且封条正常、没有借出或待交接，否则 422。
+     * 有效区间 UTC 左闭右开、最长一小时；响应只含冻结元数据，不返回合成文本。
+     */
+    @PostMapping("/{evidenceKey}/inspection-copies")
+    public ResponseEntity<String> issueCopy(@RequestHeader(ACTOR_HEADER) @NotBlank String actorId,
+                                            @PathVariable String evidenceKey,
+                                            @Valid @RequestBody InspectionCopyIssueRequest request) {
+        String hash = idempotencyAdvisor.hash(InspectionCopyService.OP_COPY_ISSUE, actorId,
+                evidenceKey, request);
+        StoredResponse response = idempotencyAdvisor.guard(request.commandKey(), hash,
+                () -> copyService.issue(actorId, evidenceKey, request, hash));
+        return toEntity(response);
+    }
+
+    /**
+     * 读取副本内容：仅阅检人本人在有效期内可读，每次读取重新鉴权；
+     * 越权 403，已回收或自然到期 410，封条异常后 422。
+     */
+    @GetMapping("/{evidenceKey}/inspection-copies/{copyKey}")
+    public InspectionCopyContentView readCopy(@RequestHeader(ACTOR_HEADER) @NotBlank String actorId,
+                                              @PathVariable String evidenceKey,
+                                              @PathVariable String copyKey) {
+        return copyService.read(actorId, evidenceKey, copyKey);
+    }
+
+    /**
+     * 回收阅检副本：仅当前保管人；回收不删除签发历史。
+     */
+    @PostMapping("/{evidenceKey}/inspection-copies/{copyKey}/revoke")
+    public ResponseEntity<String> revokeCopy(@RequestHeader(ACTOR_HEADER) @NotBlank String actorId,
+                                             @PathVariable String evidenceKey,
+                                             @PathVariable String copyKey,
+                                             @Valid @RequestBody CommandRequest request) {
+        String hash = idempotencyAdvisor.hash(InspectionCopyService.OP_COPY_REVOKE, actorId,
+                evidenceKey + "/" + copyKey, request);
+        StoredResponse response = idempotencyAdvisor.guard(request.commandKey(), hash,
+                () -> copyService.revoke(actorId, evidenceKey, copyKey, request, hash));
         return toEntity(response);
     }
 

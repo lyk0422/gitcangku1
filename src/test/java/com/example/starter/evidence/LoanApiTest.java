@@ -68,6 +68,8 @@ class LoanApiTest {
         body.put("caseKey", "CASE-1");
         body.put("category", "DOCUMENT");
         body.put("sealNo", "SEAL-1");
+        body.put("digest", "sha256:evidence-digest");
+        body.put("syntheticText", "合成文本-证物");
         return mockMvc.perform(post("/api/evidence")
                         .header(ACTOR_HEADER, actor)
                         .contentType(MediaType.APPLICATION_JSON)

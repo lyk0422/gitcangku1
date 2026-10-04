@@ -44,6 +44,8 @@ class EvidenceApiTest {
         body.put("caseKey", "CASE-1");
         body.put("category", "DOCUMENT");
         body.put("sealNo", "SEAL-1");
+        body.put("digest", "sha256:evidence-digest");
+        body.put("syntheticText", "合成文本-证物");
         return body;
     }
 

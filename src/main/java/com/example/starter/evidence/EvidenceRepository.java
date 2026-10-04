@@ -12,7 +12,7 @@ import java.util.Optional;
 
 /**
  * 证物表访问。状态与保管人变更必须先通过 {@link #findByKeyForUpdate} 锁定证物行，
- * 保证并发交接/取消/核验按事务提交顺序生效。
+ * 保证并发交接/取消/核验/副本签发按事务提交顺序生效。
  */
 @Repository
 public class EvidenceRepository {
@@ -26,16 +26,17 @@ public class EvidenceRepository {
     }
 
     /**
-     * 插入新证物，初始状态 SEALED，保管人为入库操作人。
+     * 插入新证物，初始状态 SEALED，保管人为入库操作人；数字摘要与合成文本随入库冻结。
      */
     public void insert(String evidenceKey, String caseKey, String category, String sealNo,
-                       String custodianId, LocalDateTime now) {
+                       String digest, String syntheticText, String custodianId, LocalDateTime now) {
         jdbc.update("""
                         INSERT INTO evidence
-                            (evidence_key, case_key, category, seal_no, custodian_id, status, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            (evidence_key, case_key, category, seal_no, digest, synthetic_text,
+                             custodian_id, status, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
-                evidenceKey, caseKey, category, sealNo, custodianId,
+                evidenceKey, caseKey, category, sealNo, digest, syntheticText, custodianId,
                 EvidenceStatus.SEALED.name(), now, now);
     }
 
@@ -49,7 +50,7 @@ public class EvidenceRepository {
     }
 
     /**
-     * 按业务键查询并锁定证物行（SELECT ... FOR UPDATE），用于一切状态/保管人变更。
+     * 按业务键查询并锁定证物行（SELECT ... FOR UPDATE），用于一切状态/保管人变更及副本签发互斥。
      */
     public Optional<Evidence> findByKeyForUpdate(String evidenceKey) {
         List<Evidence> rows = jdbc.query(
@@ -94,6 +95,8 @@ public class EvidenceRepository {
                     rs.getString("case_key"),
                     rs.getString("category"),
                     rs.getString("seal_no"),
+                    rs.getString("digest"),
+                    rs.getString("synthetic_text"),
                     rs.getString("custodian_id"),
                     EvidenceStatus.valueOf(rs.getString("status")),
                     rs.getObject("created_at", LocalDateTime.class),
