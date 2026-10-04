@@ -4,6 +4,8 @@ import com.example.starter.translation.api.ApiDtos;
 import com.example.starter.translation.api.ApiException;
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
+import com.example.starter.translation.domain.Rows.PluralApprovalRow;
+import com.example.starter.translation.domain.Rows.PluralTranslationRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
 import com.example.starter.translation.domain.Rows.TranslationRow;
@@ -30,6 +32,11 @@ import java.util.stream.Collectors;
 @Service
 public class TranslationService {
 
+    /** 各语言要求的复数类别集合（按类别名排序）：zh 要求 other，en 要求 one 和 other。 */
+    private static final Map<String, List<String>> PLURAL_CATEGORIES = Map.of(
+            "zh", List.of("other"),
+            "en", List.of("one", "other"));
+
     private final TranslationRepository repository;
     private final ObjectMapper objectMapper;
 
@@ -49,7 +56,7 @@ public class TranslationService {
         }
         long documentId = repository.insertDocument(languages);
         for (ApiDtos.SegmentInput segment : segments) {
-            repository.insertSegment(documentId, segment.segmentId(), segment.sourceText());
+            repository.insertSegment(documentId, segment.segmentId(), segment.sourceText(), segment.plural());
         }
         return new ApiDtos.DocumentResponse(documentId, 1, 0, languages);
     }
@@ -61,7 +68,7 @@ public class TranslationService {
         if (repository.findSegment(documentId, request.segmentId()).isPresent()) {
             throw ApiException.conflict("段落已存在: " + request.segmentId());
         }
-        repository.insertSegment(documentId, request.segmentId(), request.sourceText());
+        repository.insertSegment(documentId, request.segmentId(), request.sourceText(), request.plural());
         int draftVersion = bumpDraftVersion(document);
         return new ApiDtos.SegmentResponse(documentId, request.segmentId(), 1, draftVersion);
     }
@@ -92,6 +99,9 @@ public class TranslationService {
             throw ApiException.unprocessable("语言不在文档目标语言中: " + normalizedLanguage);
         }
         SegmentRow segment = findSegmentOrThrow(documentId, segmentId);
+        if (segment.plural()) {
+            throw ApiException.unprocessable("段落为复数类型，须按复数类别提交: " + segmentId);
+        }
         if (request.sourceVersion() != segment.sourceVersion()) {
             throw ApiException.unprocessable("译文所依据的源文版本 " + request.sourceVersion()
                     + " 与当前源文版本 " + segment.sourceVersion() + " 不匹配");
@@ -138,6 +148,125 @@ public class TranslationService {
                 translation.translationVersion(), segment.sourceVersion());
     }
 
+    /** 单个复数类别译文提交：作者取 X-Actor-Id，类别须属于该语言的合法类别集合。 */
+    @Transactional
+    public ApiDtos.PluralTranslationResponse submitPluralCategory(long documentId, String segmentId,
+                                                                  String language, String category, String actorId,
+                                                                  ApiDtos.SubmitPluralCategoryRequest request) {
+        ApiDtos.PluralCategoriesResponse response = submitPluralCategoriesInternal(documentId, segmentId, language,
+                actorId, request.sourceVersion(),
+                List.of(new ApiDtos.PluralCategoryInput(category, request.content())));
+        ApiDtos.PluralCategoryView view = response.categories().get(0);
+        return new ApiDtos.PluralTranslationResponse(response.documentId(), response.segmentId(),
+                response.language(), view.category(), view.translationVersion(), response.sourceVersion(),
+                response.termVersion(), response.draftVersion());
+    }
+
+    /**
+     * 复数类别集合提交：一次提交同一语言下若干类别（允许部分集合，仅更新提及的类别，不清空其他类别文本）；
+     * 全部类别同一事务提交，任一类别校验失败则整体回滚。
+     */
+    @Transactional
+    public ApiDtos.PluralCategoriesResponse submitPluralCategories(long documentId, String segmentId,
+                                                                   String language, String actorId,
+                                                                   ApiDtos.SubmitPluralCategoriesRequest request) {
+        return submitPluralCategoriesInternal(documentId, segmentId, language, actorId, request.sourceVersion(),
+                request.categories());
+    }
+
+    /**
+     * 复数类别提交公共逻辑：段落须为复数类型，语言须定义了类别集合（zh/en），类别合法且集合内不重复，
+     * 所依据源文版本必须等于当前源文版本；绑定当前术语版本并通过术语校验；类别译文版本递增，草稿版本加一。
+     */
+    private ApiDtos.PluralCategoriesResponse submitPluralCategoriesInternal(
+            long documentId, String segmentId, String language, String actorId, int sourceVersion,
+            List<ApiDtos.PluralCategoryInput> categories) {
+        DocumentRow document = lockDocument(documentId);
+        String normalizedLanguage = normalizeLanguage(language);
+        if (!document.targetLanguages().contains(normalizedLanguage)) {
+            throw ApiException.unprocessable("语言不在文档目标语言中: " + normalizedLanguage);
+        }
+        SegmentRow segment = findSegmentOrThrow(documentId, segmentId);
+        if (!segment.plural()) {
+            throw ApiException.unprocessable("段落不是复数类型: " + segmentId);
+        }
+        List<String> required = PLURAL_CATEGORIES.get(normalizedLanguage);
+        if (required == null) {
+            throw ApiException.unprocessable("复数段落不支持语言: " + normalizedLanguage);
+        }
+        if (sourceVersion != segment.sourceVersion()) {
+            throw ApiException.unprocessable("译文所依据的源文版本 " + sourceVersion
+                    + " 与当前源文版本 " + segment.sourceVersion() + " 不匹配");
+        }
+        List<String> normalizedCategories = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        for (ApiDtos.PluralCategoryInput input : categories) {
+            String category = normalizeLanguage(input.category());
+            if (!required.contains(category)) {
+                throw ApiException.unprocessable(
+                        "语言 " + normalizedLanguage + " 不允许的复数类别: " + category);
+            }
+            if (!seen.add(category)) {
+                throw ApiException.unprocessable("复数类别重复: " + category);
+            }
+            normalizedCategories.add(category);
+        }
+        List<TermRuleRow> termRules = repository.listTermRules(documentId, document.termVersion());
+        for (ApiDtos.PluralCategoryInput input : categories) {
+            List<ApiDtos.TermRuleView> violations = findViolations(
+                    segment.sourceText(), normalizedLanguage, input.content(), termRules);
+            if (!violations.isEmpty()) {
+                throw ApiException.termViolation("译文违反 " + violations.size() + " 条术语规则", violations);
+            }
+        }
+        List<ApiDtos.PluralCategoryView> views = new ArrayList<>();
+        for (int i = 0; i < categories.size(); i++) {
+            String category = normalizedCategories.get(i);
+            int translationVersion = repository
+                    .findPluralTranslation(documentId, segmentId, normalizedLanguage, category)
+                    .map(PluralTranslationRow::translationVersion).orElse(0) + 1;
+            repository.upsertPluralTranslation(documentId, new PluralTranslationRow(segmentId, normalizedLanguage,
+                    category, categories.get(i).content(), actorId, segment.sourceVersion(), translationVersion,
+                    document.termVersion()));
+            views.add(new ApiDtos.PluralCategoryView(category, translationVersion));
+        }
+        int draftVersion = bumpDraftVersion(document);
+        return new ApiDtos.PluralCategoriesResponse(documentId, segmentId, normalizedLanguage, views,
+                segment.sourceVersion(), document.termVersion(), draftVersion);
+    }
+
+    /** 复数类别批准：审核人不得是该类别作者，且须同时匹配当前源文版本与类别译文版本。 */
+    @Transactional
+    public ApiDtos.PluralApprovalResponse approvePluralCategory(long documentId, String segmentId, String language,
+                                                                String category, String actorId,
+                                                                ApiDtos.ApprovePluralCategoryRequest request) {
+        lockDocument(documentId);
+        String normalizedLanguage = normalizeLanguage(language);
+        String normalizedCategory = normalizeLanguage(category);
+        SegmentRow segment = findSegmentOrThrow(documentId, segmentId);
+        if (!segment.plural()) {
+            throw ApiException.unprocessable("段落不是复数类型: " + segmentId);
+        }
+        PluralTranslationRow translation = repository
+                .findPluralTranslation(documentId, segmentId, normalizedLanguage, normalizedCategory)
+                .orElseThrow(() -> ApiException.notFound("复数类别译文不存在: " + segmentId + "/"
+                        + normalizedLanguage + "/" + normalizedCategory));
+        if (translation.author().equals(actorId)) {
+            throw ApiException.unprocessable("审核人不得是该类别译文作者");
+        }
+        if (translation.translationVersion() != request.translationVersion()) {
+            throw ApiException.unprocessable("批准所针对的类别译文版本 " + request.translationVersion()
+                    + " 与当前类别译文版本 " + translation.translationVersion() + " 不匹配");
+        }
+        if (translation.sourceVersion() != segment.sourceVersion()) {
+            throw ApiException.unprocessable("类别译文基于源文版本 " + translation.sourceVersion()
+                    + "，当前源文版本 " + segment.sourceVersion() + "，译文待更新，不能批准");
+        }
+        repository.upsertPluralApproval(documentId, new PluralApprovalRow(segmentId, normalizedLanguage,
+                normalizedCategory, actorId, segment.sourceVersion(), translation.translationVersion()));
+        return new ApiDtos.PluralApprovalResponse(documentId, segmentId, normalizedLanguage, normalizedCategory,
+                actorId, translation.translationVersion(), segment.sourceVersion());
+    }
     /**
      * 新增术语版本：expectedTermVersion 必须等于当前术语版本（不符 409）；
      * 规则 0~100 条、按 sourceTerm 与目标语言唯一、语言须在文档目标语言中（不符 422）。
@@ -194,8 +323,19 @@ public class TranslationService {
         Map<String, ApprovalRow> approvals = repository.listApprovals(documentId).stream()
                 .collect(Collectors.toMap(a -> key(a.segmentId(), a.language()), Function.identity()));
         List<TermRuleRow> termRules = repository.listTermRules(documentId, document.termVersion());
+        Map<List<String>, PluralTranslationRow> pluralTranslations = repository.listPluralTranslations(documentId)
+                .stream().collect(Collectors.toMap(
+                        t -> List.of(t.segmentId(), t.language(), t.category()), Function.identity()));
+        Map<List<String>, PluralApprovalRow> pluralApprovals = repository.listPluralApprovals(documentId)
+                .stream().collect(Collectors.toMap(
+                        a -> List.of(a.segmentId(), a.language(), a.category()), Function.identity()));
         List<ApiDtos.TermRuleView> termViolations = new ArrayList<>();
         for (SegmentRow segment : segments) {
+            if (segment.plural()) {
+                validatePluralSegment(document, segment, pluralTranslations, pluralApprovals, termRules,
+                        termViolations);
+                continue;
+            }
             for (String language : document.targetLanguages()) {
                 TranslationRow translation = translations.get(key(segment.segmentId(), language));
                 if (translation == null) {
@@ -231,7 +371,8 @@ public class TranslationService {
         }
         int publishedVersion = document.publishedVersion() + 1;
         repository.insertSnapshot(documentId, publishedVersion,
-                buildSnapshotJson(document, publishedVersion, segments, translations, approvals, termRules));
+                buildSnapshotJson(document, publishedVersion, segments, translations, approvals,
+                        pluralTranslations, pluralApprovals, termRules));
         repository.updatePublishedVersion(documentId, publishedVersion);
         return new ApiDtos.PublishResponse(documentId, publishedVersion);
     }
@@ -347,10 +488,68 @@ public class TranslationService {
         return new ApiDtos.TermRuleView(rule.sourceTerm(), rule.language(), rule.requiredTranslation());
     }
 
+    /**
+     * 校验复数段落在每种目标语言下的完整类别集合：缺类别、额外类别、类别译文源文/术语版本过期、
+     * 类别未批准或批准失效均抛 422；术语违规收集到 termViolations 统一返回。
+     */
+    private void validatePluralSegment(DocumentRow document, SegmentRow segment,
+                                       Map<List<String>, PluralTranslationRow> pluralTranslations,
+                                       Map<List<String>, PluralApprovalRow> pluralApprovals,
+                                       List<TermRuleRow> termRules,
+                                       List<ApiDtos.TermRuleView> termViolations) {
+        for (String language : document.targetLanguages()) {
+            List<String> required = PLURAL_CATEGORIES.get(language);
+            if (required == null) {
+                throw ApiException.unprocessable(
+                        "复数段落不支持语言: " + segment.segmentId() + "/" + language);
+            }
+            for (Map.Entry<List<String>, PluralTranslationRow> entry : pluralTranslations.entrySet()) {
+                List<String> k = entry.getKey();
+                if (k.get(0).equals(segment.segmentId()) && k.get(1).equals(language)
+                        && !required.contains(k.get(2))) {
+                    throw ApiException.unprocessable("额外复数类别: " + segment.segmentId() + "/" + language
+                            + "/" + k.get(2));
+                }
+            }
+            for (String category : required) {
+                List<String> categoryKey = List.of(segment.segmentId(), language, category);
+                PluralTranslationRow translation = pluralTranslations.get(categoryKey);
+                if (translation == null) {
+                    throw ApiException.unprocessable(
+                            "缺少复数类别译文: " + segment.segmentId() + "/" + language + "/" + category);
+                }
+                if (translation.sourceVersion() != segment.sourceVersion()) {
+                    throw ApiException.unprocessable("复数类别译文待更新: " + segment.segmentId() + "/" + language
+                            + "/" + category + " 基于源文版本 " + translation.sourceVersion()
+                            + "，当前源文版本 " + segment.sourceVersion());
+                }
+                if (translation.termVersion() != document.termVersion()) {
+                    throw ApiException.unprocessable("复数类别译文术语版本过期: " + segment.segmentId() + "/"
+                            + language + "/" + category + " 绑定术语版本 " + translation.termVersion()
+                            + "，当前术语版本 " + document.termVersion());
+                }
+                PluralApprovalRow approval = pluralApprovals.get(categoryKey);
+                if (approval == null) {
+                    throw ApiException.unprocessable(
+                            "缺少复数类别批准: " + segment.segmentId() + "/" + language + "/" + category);
+                }
+                if (approval.translationVersion() != translation.translationVersion()
+                        || approval.sourceVersion() != segment.sourceVersion()) {
+                    throw ApiException.unprocessable("复数类别批准已失效: " + segment.segmentId() + "/" + language
+                            + "/" + category + "，源文或类别译文版本已改变");
+                }
+                termViolations.addAll(findViolations(
+                        segment.sourceText(), language, translation.content(), termRules));
+            }
+        }
+    }
     /** 生成完整只读快照 JSON：全部段落源文及各语言译文、作者、审核人、版本号与固化的术语版本及规则集。 */
     private String buildSnapshotJson(DocumentRow document, int publishedVersion, List<SegmentRow> segments,
                                      Map<String, TranslationRow> translations,
-                                     Map<String, ApprovalRow> approvals, List<TermRuleRow> termRules) {
+                                     Map<String, ApprovalRow> approvals,
+                                     Map<List<String>, PluralTranslationRow> pluralTranslations,
+                                     Map<List<String>, PluralApprovalRow> pluralApprovals,
+                                     List<TermRuleRow> termRules) {
         Map<String, Object> snapshot = new LinkedHashMap<>();
         snapshot.put("documentId", document.documentId());
         snapshot.put("publishedVersion", publishedVersion);
@@ -372,18 +571,39 @@ public class TranslationService {
             segmentJson.put("segmentId", segment.segmentId());
             segmentJson.put("sourceText", segment.sourceText());
             segmentJson.put("sourceVersion", segment.sourceVersion());
+            segmentJson.put("plural", segment.plural());
             List<Map<String, Object>> translationList = new ArrayList<>();
             for (String language : document.targetLanguages()) {
-                TranslationRow translation = translations.get(key(segment.segmentId(), language));
-                ApprovalRow approval = approvals.get(key(segment.segmentId(), language));
                 Map<String, Object> translationJson = new LinkedHashMap<>();
                 translationJson.put("language", language);
-                translationJson.put("content", translation.content());
-                translationJson.put("author", translation.author());
-                translationJson.put("translationVersion", translation.translationVersion());
-                translationJson.put("sourceVersion", translation.sourceVersion());
-                translationJson.put("termVersion", translation.termVersion());
-                translationJson.put("reviewer", approval.reviewer());
+                if (segment.plural()) {
+                    // 复数段落：按类别名排序冻结各类别文本、源文版本、术语版本与作者/批准人
+                    List<Map<String, Object>> categoryList = new ArrayList<>();
+                    for (String category : PLURAL_CATEGORIES.get(language)) {
+                        List<String> categoryKey = List.of(segment.segmentId(), language, category);
+                        PluralTranslationRow pluralTranslation = pluralTranslations.get(categoryKey);
+                        PluralApprovalRow pluralApproval = pluralApprovals.get(categoryKey);
+                        Map<String, Object> categoryJson = new LinkedHashMap<>();
+                        categoryJson.put("category", category);
+                        categoryJson.put("content", pluralTranslation.content());
+                        categoryJson.put("author", pluralTranslation.author());
+                        categoryJson.put("translationVersion", pluralTranslation.translationVersion());
+                        categoryJson.put("sourceVersion", pluralTranslation.sourceVersion());
+                        categoryJson.put("termVersion", pluralTranslation.termVersion());
+                        categoryJson.put("reviewer", pluralApproval.reviewer());
+                        categoryList.add(categoryJson);
+                    }
+                    translationJson.put("categories", categoryList);
+                } else {
+                    TranslationRow translation = translations.get(key(segment.segmentId(), language));
+                    ApprovalRow approval = approvals.get(key(segment.segmentId(), language));
+                    translationJson.put("content", translation.content());
+                    translationJson.put("author", translation.author());
+                    translationJson.put("translationVersion", translation.translationVersion());
+                    translationJson.put("sourceVersion", translation.sourceVersion());
+                    translationJson.put("termVersion", translation.termVersion());
+                    translationJson.put("reviewer", approval.reviewer());
+                }
                 translationList.add(translationJson);
             }
             segmentJson.put("translations", translationList);

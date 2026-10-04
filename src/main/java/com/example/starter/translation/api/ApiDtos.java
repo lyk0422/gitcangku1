@@ -8,6 +8,7 @@ import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.PositiveOrZero;
 import jakarta.validation.constraints.Size;
 
+import java.util.Comparator;
 import java.util.List;
 
 /**
@@ -18,10 +19,14 @@ public final class ApiDtos {
     private ApiDtos() {
     }
 
-    /** 初始段落输入。 */
+    /** 初始段落输入；plural 缺省为 false（普通段落），true 表示复数类型段落。 */
     public record SegmentInput(
             @NotBlank(message = "segmentId 不能为空") @Size(max = 64) String segmentId,
-            @NotBlank(message = "sourceText 不能为空") String sourceText) {
+            @NotBlank(message = "sourceText 不能为空") String sourceText,
+            Boolean plural) {
+        public SegmentInput {
+            plural = plural != null && plural;
+        }
     }
 
     /** 建文档请求：1~5 种目标语言，可携带初始段落。 */
@@ -32,11 +37,15 @@ public final class ApiDtos {
             @NotNull(message = "segments 不能为空") List<@Valid SegmentInput> segments) {
     }
 
-    /** 增加段落请求。 */
+    /** 增加段落请求；plural 缺省为 false（普通段落），true 表示复数类型段落。 */
     public record AddSegmentRequest(
             @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
             @NotBlank(message = "segmentId 不能为空") @Size(max = 64) String segmentId,
-            @NotBlank(message = "sourceText 不能为空") String sourceText) {
+            @NotBlank(message = "sourceText 不能为空") String sourceText,
+            Boolean plural) {
+        public AddSegmentRequest {
+            plural = plural != null && plural;
+        }
     }
 
     /** 源文修订请求。 */
@@ -80,6 +89,64 @@ public final class ApiDtos {
             List<@Valid TermRuleInput> rules) {
     }
 
+    /** 复数类别输入：类别名与该类别译文正文。 */
+    public record PluralCategoryInput(
+            @NotBlank(message = "category 不能为空") @Size(max = 16) String category,
+            @NotBlank(message = "content 不能为空") String content) {
+    }
+
+    /** 单个复数类别译文提交请求；作者取 X-Actor-Id 请求头。 */
+    public record SubmitPluralCategoryRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @NotBlank(message = "content 不能为空") String content,
+            @Positive(message = "sourceVersion 必须为正数") int sourceVersion) {
+    }
+
+    /**
+     * 复数类别集合提交请求：一次提交同一语言下的若干类别（允许部分集合，仅更新提及的类别）。
+     * 类别集合按名称排序规范化，换序请求视为同参。
+     */
+    public record SubmitPluralCategoriesRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @Positive(message = "sourceVersion 必须为正数") int sourceVersion,
+            @NotNull(message = "categories 不能为空") @Size(min = 1, max = 2, message = "类别集合须为 1~2 项")
+            List<@Valid PluralCategoryInput> categories) {
+        public SubmitPluralCategoriesRequest {
+            if (categories != null) {
+                categories = categories.stream()
+                        .sorted(Comparator.comparing(PluralCategoryInput::category,
+                                Comparator.nullsFirst(String::compareTo)))
+                        .toList();
+            }
+        }
+    }
+
+    /** 复数类别批准请求；审核人取 X-Actor-Id 请求头。 */
+    public record ApprovePluralCategoryRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @Positive(message = "translationVersion 必须为正数") int translationVersion) {
+    }
+
+    /** 单个复数类别译文提交响应。 */
+    public record PluralTranslationResponse(long documentId, String segmentId, String language, String category,
+                                            int translationVersion, int sourceVersion, int termVersion,
+                                            int draftVersion) {
+    }
+
+    /** 复数类别视图：类别名与类别译文版本。 */
+    public record PluralCategoryView(String category, int translationVersion) {
+    }
+
+    /** 复数类别集合提交响应。 */
+    public record PluralCategoriesResponse(long documentId, String segmentId, String language,
+                                           List<PluralCategoryView> categories, int sourceVersion,
+                                           int termVersion, int draftVersion) {
+    }
+
+    /** 复数类别批准响应。 */
+    public record PluralApprovalResponse(long documentId, String segmentId, String language, String category,
+                                         String reviewer, int translationVersion, int sourceVersion) {
+    }
     /** 建文档响应。 */
     public record DocumentResponse(long documentId, int draftVersion, int publishedVersion,
                                    List<String> targetLanguages) {

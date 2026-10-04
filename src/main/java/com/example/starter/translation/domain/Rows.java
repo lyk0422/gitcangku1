@@ -29,8 +29,40 @@ public final class Rows {
      * @param segmentId     文档内唯一段落 ID
      * @param sourceText    源文正文，UTF-8
      * @param sourceVersion 源文版本，从 1 开始，每次源文修订加一
+     * @param plural        是否复数类型段落：true 时译文按复数类别提交，false 为普通段落
      */
-    public record SegmentRow(String segmentId, String sourceText, int sourceVersion) {
+    public record SegmentRow(String segmentId, String sourceText, int sourceVersion, boolean plural) {
+    }
+
+    /**
+     * 复数类别译文：按段落、语言与类别唯一，仅用于复数类型段落；各类别独立保存正文、作者与版本。
+     *
+     * @param segmentId          所属段落 ID
+     * @param language           目标语言码，小写；复数段落仅允许 zh（类别 other）与 en（类别 one、other）
+     * @param category           复数类别名，小写；合法集合由语言决定：zh={other}，en={one,other}
+     * @param content            该类别的译文正文，UTF-8
+     * @param author             该类别译文作者，取提交时 X-Actor-Id；各类别作者可不同
+     * @param sourceVersion      译文所依据的源文版本；提交时必须等于当前源文版本
+     * @param translationVersion 类别译文版本，从 1 开始，每次重新提交该类别加一
+     * @param termVersion        类别译文提交时绑定的术语版本；不等于当前术语版本时视为术语过期
+     */
+    public record PluralTranslationRow(String segmentId, String language, String category, String content,
+                                       String author, int sourceVersion, int translationVersion,
+                                       int termVersion) {
+    }
+
+    /**
+     * 复数类别批准：按段落、语言与类别唯一；源文或类别译文版本改变后先前批准不再有效。
+     *
+     * @param segmentId          所属段落 ID
+     * @param language           目标语言码，小写
+     * @param category           复数类别名，小写
+     * @param reviewer           审核人，取批准时 X-Actor-Id，不得是该类别译文作者
+     * @param sourceVersion      批准时的源文版本，发布校验须等于当前源文版本
+     * @param translationVersion 批准时的类别译文版本，发布校验须等于当前类别译文版本
+     */
+    public record PluralApprovalRow(String segmentId, String language, String category, String reviewer,
+                                    int sourceVersion, int translationVersion) {
     }
 
     /**

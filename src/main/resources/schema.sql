@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS segment (
     segment_id VARCHAR(64) NOT NULL,
     source_text LONGTEXT NOT NULL,
     source_version INT NOT NULL,
+    plural BOOLEAN NOT NULL DEFAULT FALSE,
     PRIMARY KEY (document_id, segment_id)
 );
 COMMENT ON TABLE segment IS '段落：文档内唯一 segmentId，含源文及源文版本';
@@ -29,6 +30,7 @@ COMMENT ON COLUMN segment.document_id IS '所属文档 ID';
 COMMENT ON COLUMN segment.segment_id IS '文档内唯一段落 ID';
 COMMENT ON COLUMN segment.source_text IS '源文正文，UTF-8';
 COMMENT ON COLUMN segment.source_version IS '源文版本，从 1 开始，每次源文修订加一';
+COMMENT ON COLUMN segment.plural IS '是否复数类型段落：TRUE 时译文按复数类别提交，FALSE 为普通段落';
 
 CREATE TABLE IF NOT EXISTS translation (
     document_id BIGINT NOT NULL,
@@ -124,3 +126,49 @@ COMMENT ON COLUMN request_log.request_hash IS '请求参数规范化后的 SHA-2
 COMMENT ON COLUMN request_log.response_status IS '原成功响应的 HTTP 状态码，用于重放';
 COMMENT ON COLUMN request_log.response_body IS '原成功响应体 JSON，用于重放';
 COMMENT ON COLUMN request_log.created_at IS '记录时间，数据库默认时区';
+
+CREATE TABLE IF NOT EXISTS plural_translation (
+    document_id BIGINT NOT NULL,
+    segment_id VARCHAR(64) NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    category VARCHAR(16) NOT NULL,
+    content LONGTEXT NOT NULL,
+    author VARCHAR(128) NOT NULL,
+    source_version INT NOT NULL,
+    translation_version INT NOT NULL,
+    term_version INT NOT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (document_id, segment_id, language, category)
+);
+COMMENT ON TABLE plural_translation IS '复数类别译文：按段落、语言与类别唯一，仅用于 plural=TRUE 的段落；各类别独立保存正文、作者与版本';
+COMMENT ON COLUMN plural_translation.document_id IS '所属文档 ID';
+COMMENT ON COLUMN plural_translation.segment_id IS '所属段落 ID';
+COMMENT ON COLUMN plural_translation.language IS '目标语言码，小写；复数段落仅允许 zh（类别 other）与 en（类别 one、other）';
+COMMENT ON COLUMN plural_translation.category IS '复数类别名，小写；合法集合由语言决定：zh={other}，en={one,other}';
+COMMENT ON COLUMN plural_translation.content IS '该类别的译文正文，UTF-8';
+COMMENT ON COLUMN plural_translation.author IS '该类别译文作者，取提交时 X-Actor-Id；各类别作者可不同';
+COMMENT ON COLUMN plural_translation.source_version IS '译文所依据的源文版本；提交时必须等于当前源文版本，发布时不允许拼接不同源版本的类别';
+COMMENT ON COLUMN plural_translation.translation_version IS '类别译文版本，从 1 开始，每次重新提交该类别加一';
+COMMENT ON COLUMN plural_translation.term_version IS '类别译文提交时绑定的术语版本；不等于当前术语版本时视为术语过期';
+COMMENT ON COLUMN plural_translation.updated_at IS '最近提交时间，数据库默认时区';
+
+CREATE TABLE IF NOT EXISTS plural_approval (
+    document_id BIGINT NOT NULL,
+    segment_id VARCHAR(64) NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    category VARCHAR(16) NOT NULL,
+    reviewer VARCHAR(128) NOT NULL,
+    source_version INT NOT NULL,
+    translation_version INT NOT NULL,
+    approved_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (document_id, segment_id, language, category)
+);
+COMMENT ON TABLE plural_approval IS '复数类别批准：按段落、语言与类别唯一；源文修订使该段全部类别批准失效，类别修订仅使该类别批准失效';
+COMMENT ON COLUMN plural_approval.document_id IS '所属文档 ID';
+COMMENT ON COLUMN plural_approval.segment_id IS '所属段落 ID';
+COMMENT ON COLUMN plural_approval.language IS '目标语言码，小写';
+COMMENT ON COLUMN plural_approval.category IS '复数类别名，小写';
+COMMENT ON COLUMN plural_approval.reviewer IS '审核人，取批准时 X-Actor-Id，不得是该类别译文作者';
+COMMENT ON COLUMN plural_approval.source_version IS '批准时的源文版本，发布校验须等于当前源文版本';
+COMMENT ON COLUMN plural_approval.translation_version IS '批准时的类别译文版本，发布校验须等于当前类别译文版本';
+COMMENT ON COLUMN plural_approval.approved_at IS '批准时间，数据库默认时区';

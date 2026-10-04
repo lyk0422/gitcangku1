@@ -19,7 +19,10 @@ import org.springframework.web.bind.annotation.RestController;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HexFormat;
+import java.util.List;
 
 /**
  * 多语种段落修订与发布快照 REST API。
@@ -92,6 +95,52 @@ public class TranslationController {
                         documentId, segmentId, language, actorId, request))).toResponseEntity();
     }
 
+    /** 单个复数类别译文提交：作者取 X-Actor-Id，类别须属于该语言的合法类别集合（zh={other}，en={one,other}）。 */
+    @PutMapping("/{documentId}/segments/{segmentId}/translations/{language}/categories/{category}")
+    public ResponseEntity<String> submitPluralCategory(@PathVariable long documentId,
+                                                       @PathVariable String segmentId,
+                                                       @PathVariable String language,
+                                                       @PathVariable String category,
+                                                       @RequestHeader("X-Actor-Id") String actorId,
+                                                       @Valid @RequestBody
+                                                       ApiDtos.SubmitPluralCategoryRequest request) {
+        String operation = "PUT /api/documents/" + documentId + "/segments/" + segmentId
+                + "/translations/" + language + "/categories/" + category;
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(200, translationService.submitPluralCategory(
+                        documentId, segmentId, language, category, actorId, request))).toResponseEntity();
+    }
+
+    /** 复数类别集合提交：一次提交同一语言下若干类别；集合按类别名排序规范化，换序视为同参。 */
+    @PutMapping("/{documentId}/segments/{segmentId}/translations/{language}/categories")
+    public ResponseEntity<String> submitPluralCategories(@PathVariable long documentId,
+                                                         @PathVariable String segmentId,
+                                                         @PathVariable String language,
+                                                         @RequestHeader("X-Actor-Id") String actorId,
+                                                         @Valid @RequestBody
+                                                         ApiDtos.SubmitPluralCategoriesRequest request) {
+        String operation = "PUT /api/documents/" + documentId + "/segments/" + segmentId
+                + "/translations/" + language + "/categories";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(200, translationService.submitPluralCategories(
+                        documentId, segmentId, language, actorId, request))).toResponseEntity();
+    }
+
+    /** 复数类别批准：审核人取 X-Actor-Id，不得是该类别作者，须同时匹配当前源文与类别译文版本。 */
+    @PostMapping("/{documentId}/segments/{segmentId}/translations/{language}/categories/{category}/approve")
+    public ResponseEntity<String> approvePluralCategory(@PathVariable long documentId,
+                                                        @PathVariable String segmentId,
+                                                        @PathVariable String language,
+                                                        @PathVariable String category,
+                                                        @RequestHeader("X-Actor-Id") String actorId,
+                                                        @Valid @RequestBody
+                                                        ApiDtos.ApprovePluralCategoryRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/segments/" + segmentId
+                + "/translations/" + language + "/categories/" + category + "/approve";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(200, translationService.approvePluralCategory(
+                        documentId, segmentId, language, category, actorId, request))).toResponseEntity();
+    }
     /** 发布：全部段落全部目标语言均有有效批准且术语校验通过时原子生成只读快照并递增发布版本。 */
     @PostMapping("/{documentId}/publish")
     public ResponseEntity<String> publish(@PathVariable long documentId,
@@ -136,15 +185,18 @@ public class TranslationController {
                 .body(translationService.getRelease(documentId, publishedVersion));
     }
 
-    /** 计算请求摘要：操作（含路径变量）+ 操作者 + 规范化请求体的 SHA-256。 */
+    /**
+     * 计算请求摘要：操作（含路径变量）、操作者与规范化请求体组成结构化 JSON 数组后取 SHA-256，
+     * 避免分隔符拼接碰撞；集合参数在 DTO 构造时已排序规范化，换序请求得到相同摘要。
+     */
     private String hash(String operation, Object... parts) {
         try {
-            StringBuilder canonical = new StringBuilder(operation);
-            for (Object part : parts) {
-                canonical.append('\n').append(objectMapper.writeValueAsString(part));
-            }
+            List<Object> identity = new ArrayList<>();
+            identity.add(operation);
+            identity.addAll(Arrays.asList(parts));
+            String canonical = objectMapper.writeValueAsString(identity);
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            return HexFormat.of().formatHex(digest.digest(canonical.toString().getBytes(StandardCharsets.UTF_8)));
+            return HexFormat.of().formatHex(digest.digest(canonical.getBytes(StandardCharsets.UTF_8)));
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException("SHA-256 不可用", e);
         } catch (Exception e) {
