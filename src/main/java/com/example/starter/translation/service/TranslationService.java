@@ -2,6 +2,7 @@ package com.example.starter.translation.service;
 
 import com.example.starter.translation.api.ApiDtos;
 import com.example.starter.translation.api.ApiException;
+import com.example.starter.translation.domain.Rows.AnnotationRow;
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
@@ -96,6 +97,10 @@ public class TranslationService {
             throw ApiException.unprocessable("译文所依据的源文版本 " + request.sourceVersion()
                     + " 与当前源文版本 " + segment.sourceVersion() + " 不匹配");
         }
+        if (repository.countUnresolvedAnnotations(documentId, segmentId, normalizedLanguage) > 0) {
+            throw ApiException.conflict("存在未解决批注，不能全文替换译文，请使用定点编辑或先解决批注: "
+                    + segmentId + "/" + normalizedLanguage);
+        }
         List<TermRuleRow> termRules = repository.listTermRules(documentId, document.termVersion());
         List<ApiDtos.TermRuleView> violations = findViolations(
                 segment.sourceText(), normalizedLanguage, request.content(), termRules);
@@ -131,6 +136,9 @@ public class TranslationService {
         if (translation.sourceVersion() != segment.sourceVersion()) {
             throw ApiException.unprocessable("译文基于源文版本 " + translation.sourceVersion()
                     + "，当前源文版本 " + segment.sourceVersion() + "，译文待更新，不能批准");
+        }
+        if (repository.countUnresolvedAnnotations(documentId, segmentId, normalizedLanguage) > 0) {
+            throw ApiException.unprocessable("存在未解决批注，不能批准: " + segmentId + "/" + normalizedLanguage);
         }
         repository.upsertApproval(documentId, new ApprovalRow(segmentId, normalizedLanguage, actorId,
                 segment.sourceVersion(), translation.translationVersion()));
@@ -187,6 +195,9 @@ public class TranslationService {
             throw ApiException.conflict("版本冲突：当前草稿版本 " + document.draftVersion()
                     + "、发布版本 " + document.publishedVersion() + "，与期望的 "
                     + request.expectedDraftVersion() + "/" + request.expectedPublishedVersion() + " 不一致");
+        }
+        if (repository.countUnresolvedAnnotations(documentId) > 0) {
+            throw ApiException.unprocessable("存在未解决批注，不能发布: " + documentId);
         }
         List<SegmentRow> segments = repository.listSegments(documentId);
         Map<String, TranslationRow> translations = repository.listTranslations(documentId).stream()
@@ -291,6 +302,148 @@ public class TranslationService {
         return new ApiDtos.TermStatusResponse(documentId, document.termVersion(), statuses);
     }
 
+    /**
+     * 新增批注：绑定当前译文版本（不符 409），一次 1~20 条原子创建；
+     * 区间按码点左闭右开、非空且不越界（不符 400）；创建后当前批准失效。
+     */
+    @Transactional
+    public ApiDtos.CreateAnnotationsResponse createAnnotations(long documentId, String segmentId, String language,
+                                                               String actorId,
+                                                               ApiDtos.CreateAnnotationsRequest request) {
+        lockDocument(documentId);
+        String normalizedLanguage = normalizeLanguage(language);
+        SegmentRow segment = findSegmentOrThrow(documentId, segmentId);
+        TranslationRow translation = findTranslationOrThrow(documentId, segmentId, normalizedLanguage);
+        if (translation.translationVersion() != request.expectedTranslationVersion()) {
+            throw ApiException.conflict("译文版本冲突：当前译文版本 " + translation.translationVersion()
+                    + "，与期望的 " + request.expectedTranslationVersion() + " 不一致");
+        }
+        int length = AnchorMigration.codePointCount(translation.content());
+        List<ApiDtos.AnnotationView> views = new ArrayList<>();
+        for (ApiDtos.AnnotationInput input : request.annotations()) {
+            validateRange(input.start(), input.end(), length, true);
+            String quote = AnchorMigration.substringByCodePoints(translation.content(), input.start(), input.end());
+            long annotationId = repository.insertAnnotation(documentId, segment.segmentId(), normalizedLanguage,
+                    translation.translationVersion(), input.start(), input.end(), quote, input.body(), actorId);
+            views.add(new ApiDtos.AnnotationView(annotationId, AnnotationRow.STATUS_OPEN,
+                    translation.translationVersion(), input.start(), input.end(), quote, input.body(), actorId));
+        }
+        repository.deleteApproval(documentId, segmentId, normalizedLanguage);
+        return new ApiDtos.CreateAnnotationsResponse(documentId, segmentId, normalizedLanguage,
+                translation.translationVersion(), views);
+    }
+
+    /**
+     * 定点编辑：expectedTranslationVersion 必须等于当前译文版本（不符 409）；
+     * 区间 [start, end) 按码点左闭右开、不越界（不符 400），start == end 为纯插入，newText 可为空串表示删除；
+     * 成功后译文版本加一、草稿版本加一、当前批准失效，OPEN 批注按锚点规则平移或孤立。
+     */
+    @Transactional
+    public ApiDtos.EditTranslationResponse editTranslation(long documentId, String segmentId, String language,
+                                                           ApiDtos.EditTranslationRequest request) {
+        DocumentRow document = lockDocument(documentId);
+        String normalizedLanguage = normalizeLanguage(language);
+        findSegmentOrThrow(documentId, segmentId);
+        TranslationRow translation = findTranslationOrThrow(documentId, segmentId, normalizedLanguage);
+        if (translation.translationVersion() != request.expectedTranslationVersion()) {
+            throw ApiException.conflict("译文版本冲突：当前译文版本 " + translation.translationVersion()
+                    + "，与期望的 " + request.expectedTranslationVersion() + " 不一致");
+        }
+        int length = AnchorMigration.codePointCount(translation.content());
+        validateRange(request.start(), request.end(), length, false);
+        String newContent = AnchorMigration.substringByCodePoints(translation.content(), 0, request.start())
+                + request.newText()
+                + AnchorMigration.substringByCodePoints(translation.content(), request.end(), length);
+        int translationVersion = translation.translationVersion() + 1;
+        repository.upsertTranslation(documentId, new TranslationRow(segmentId, normalizedLanguage, newContent,
+                translation.author(), translation.sourceVersion(), translationVersion, translation.termVersion()));
+        int inserted = AnchorMigration.codePointCount(request.newText());
+        int shifted = 0;
+        int orphaned = 0;
+        for (AnnotationRow annotation : repository.listAnnotations(documentId, segmentId, normalizedLanguage)) {
+            if (!AnnotationRow.STATUS_OPEN.equals(annotation.status())) {
+                continue;
+            }
+            AnchorMigration.Result result = AnchorMigration.migrate(annotation.startOffset(),
+                    annotation.endOffset(), request.start(), request.end(), inserted);
+            if (result.orphaned()) {
+                orphaned++;
+                repository.updateAnnotationAnchor(annotation.annotationId(), result.start(), result.end(),
+                        AnnotationRow.STATUS_ORPHAN);
+            } else if (result.start() != annotation.startOffset() || result.end() != annotation.endOffset()) {
+                shifted++;
+                repository.updateAnnotationAnchor(annotation.annotationId(), result.start(), result.end(),
+                        AnnotationRow.STATUS_OPEN);
+            }
+        }
+        repository.deleteApproval(documentId, segmentId, normalizedLanguage);
+        int draftVersion = bumpDraftVersion(document);
+        return new ApiDtos.EditTranslationResponse(documentId, segmentId, normalizedLanguage,
+                translationVersion, draftVersion, shifted, orphaned);
+    }
+
+    /**
+     * 确认解决批注：仅创建人可把 OPEN 或 ORPHAN 置为 RESOLVED（否则 422）；
+     * expectedTranslationVersion 必须等于当前译文版本（不符 409），与编辑、批准同版本原子裁决。
+     */
+    @Transactional
+    public ApiDtos.AnnotationView resolveAnnotation(long documentId, String segmentId, String language,
+                                                    long annotationId, String actorId,
+                                                    ApiDtos.ResolveAnnotationRequest request) {
+        lockDocument(documentId);
+        String normalizedLanguage = normalizeLanguage(language);
+        AnnotationRow annotation = repository.findAnnotation(documentId, segmentId, normalizedLanguage, annotationId)
+                .orElseThrow(() -> ApiException.notFound("批注不存在: " + annotationId));
+        TranslationRow translation = findTranslationOrThrow(documentId, segmentId, normalizedLanguage);
+        if (translation.translationVersion() != request.expectedTranslationVersion()) {
+            throw ApiException.conflict("译文版本冲突：当前译文版本 " + translation.translationVersion()
+                    + "，与期望的 " + request.expectedTranslationVersion() + " 不一致");
+        }
+        if (!annotation.author().equals(actorId)) {
+            throw ApiException.unprocessable("仅批注创建人可确认解决");
+        }
+        if (!annotation.unresolved()) {
+            throw ApiException.unprocessable("批注已解决，不能重复确认: " + annotationId);
+        }
+        repository.resolveAnnotation(annotationId);
+        return toAnnotationView(new AnnotationRow(annotation.annotationId(), annotation.segmentId(),
+                annotation.language(), annotation.translationVersion(), annotation.startOffset(),
+                annotation.endOffset(), annotation.quote(), annotation.body(), annotation.author(),
+                AnnotationRow.STATUS_RESOLVED));
+    }
+
+    /** 查询某译文的全部批注：ORPHAN 不返回锚点区间，仅保留原引用。 */
+    @Transactional(readOnly = true)
+    public ApiDtos.AnnotationListResponse listAnnotations(long documentId, String segmentId, String language) {
+        repository.findDocument(documentId)
+                .orElseThrow(() -> ApiException.notFound("文档不存在: " + documentId));
+        String normalizedLanguage = normalizeLanguage(language);
+        List<ApiDtos.AnnotationView> views = repository
+                .listAnnotations(documentId, segmentId, normalizedLanguage)
+                .stream().map(TranslationService::toAnnotationView).toList();
+        return new ApiDtos.AnnotationListResponse(documentId, segmentId, normalizedLanguage, views);
+    }
+    private TranslationRow findTranslationOrThrow(long documentId, String segmentId, String language) {
+        return repository.findTranslation(documentId, segmentId, language)
+                .orElseThrow(() -> ApiException.notFound("译文不存在: " + segmentId + "/" + language));
+    }
+
+    /** 校验码点区间：requireNonEmpty 用于批注（区间非空），定点编辑允许 start == end 纯插入。 */
+    private static void validateRange(int start, int end, int length, boolean requireNonEmpty) {
+        if (start > end || (requireNonEmpty && start == end) || end > length) {
+            throw ApiException.badRequest("区间越界: [" + start + ", " + end + ")，当前译文长度 "
+                    + length + " 码点");
+        }
+    }
+
+    /** 批注转视图：ORPHAN 不返回锚点区间，仅保留原引用。 */
+    private static ApiDtos.AnnotationView toAnnotationView(AnnotationRow annotation) {
+        boolean orphan = AnnotationRow.STATUS_ORPHAN.equals(annotation.status());
+        return new ApiDtos.AnnotationView(annotation.annotationId(), annotation.status(),
+                annotation.translationVersion(), orphan ? null : annotation.startOffset(),
+                orphan ? null : annotation.endOffset(), annotation.quote(), annotation.body(),
+                annotation.author());
+    }
     private DocumentRow lockDocument(long documentId) {
         return repository.findDocumentForUpdate(documentId)
                 .orElseThrow(() -> ApiException.notFound("文档不存在: " + documentId));

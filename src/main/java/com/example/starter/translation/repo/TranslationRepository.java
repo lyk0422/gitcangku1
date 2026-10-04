@@ -1,5 +1,6 @@
 package com.example.starter.translation.repo;
 
+import com.example.starter.translation.domain.Rows.AnnotationRow;
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
 import com.example.starter.translation.domain.Rows.RequestLogRow;
@@ -45,6 +46,11 @@ public class TranslationRepository {
 
     private static final RowMapper<TermRuleRow> TERM_RULE_MAPPER = (rs, n) -> new TermRuleRow(
             rs.getString("source_term"), rs.getString("language"), rs.getString("required_translation"));
+
+    private static final RowMapper<AnnotationRow> ANNOTATION_MAPPER = (rs, n) -> new AnnotationRow(
+            rs.getLong("annotation_id"), rs.getString("segment_id"), rs.getString("language"),
+            rs.getInt("translation_version"), rs.getInt("start_offset"), rs.getInt("end_offset"),
+            rs.getString("quote"), rs.getString("body"), rs.getString("author"), rs.getString("status"));
 
     private final JdbcTemplate jdbc;
 
@@ -240,5 +246,89 @@ public class TranslationRepository {
     public void insertRequestLog(String requestId, String requestHash, int responseStatus, String responseBody) {
         jdbc.update("INSERT INTO request_log (request_id, request_hash, response_status, response_body) "
                 + "VALUES (?, ?, ?, ?)", requestId, requestHash, responseStatus, responseBody);
+    }
+
+    private static final String ANNOTATION_COLUMNS = "annotation_id, segment_id, language, translation_version, "
+            + "start_offset, end_offset, quote, body, author, status";
+
+    /** 插入批注（初始状态 OPEN）并返回自增批注 ID。 */
+    public long insertAnnotation(long documentId, String segmentId, String language, int translationVersion,
+                                 int startOffset, int endOffset, String quote, String body, String author) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO annotation (document_id, segment_id, language, translation_version, "
+                            + "start_offset, end_offset, quote, body, author, status) "
+                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')",
+                    new String[]{"annotation_id"});
+            ps.setLong(1, documentId);
+            ps.setString(2, segmentId);
+            ps.setString(3, language);
+            ps.setInt(4, translationVersion);
+            ps.setInt(5, startOffset);
+            ps.setInt(6, endOffset);
+            ps.setString(7, quote);
+            ps.setString(8, body);
+            ps.setString(9, author);
+            return ps;
+        }, keyHolder);
+        Number key = keyHolder.getKey();
+        if (key == null) {
+            throw new IllegalStateException("批注创建后未返回自增主键");
+        }
+        return key.longValue();
+    }
+
+    /** 按 ID 查询批注（限定文档、段落与语言，防止跨资源引用）。 */
+    public Optional<AnnotationRow> findAnnotation(long documentId, String segmentId, String language,
+                                                  long annotationId) {
+        List<AnnotationRow> rows = jdbc.query(
+                "SELECT " + ANNOTATION_COLUMNS + " FROM annotation WHERE document_id = ? AND segment_id = ? "
+                        + "AND language = ? AND annotation_id = ?",
+                ANNOTATION_MAPPER, documentId, segmentId, language, annotationId);
+        return rows.stream().findFirst();
+    }
+
+    /** 查询某译文（段落+语言）的全部批注，按批注 ID 升序保证稳定输出。 */
+    public List<AnnotationRow> listAnnotations(long documentId, String segmentId, String language) {
+        return jdbc.query(
+                "SELECT " + ANNOTATION_COLUMNS + " FROM annotation WHERE document_id = ? AND segment_id = ? "
+                        + "AND language = ? ORDER BY annotation_id",
+                ANNOTATION_MAPPER, documentId, segmentId, language);
+    }
+
+    /** 统计某译文未解决批注数（OPEN 或 ORPHAN）。 */
+    public int countUnresolvedAnnotations(long documentId, String segmentId, String language) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM annotation WHERE document_id = ? AND segment_id = ? AND language = ? "
+                        + "AND status IN ('OPEN', 'ORPHAN')",
+                Integer.class, documentId, segmentId, language);
+        return count == null ? 0 : count;
+    }
+
+    /** 统计整个文档未解决批注数（OPEN 或 ORPHAN），用于发布拦截。 */
+    public int countUnresolvedAnnotations(long documentId) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM annotation WHERE document_id = ? AND status IN ('OPEN', 'ORPHAN')",
+                Integer.class, documentId);
+        return count == null ? 0 : count;
+    }
+
+    /** 定点编辑后迁移批注锚点：更新区间与状态（OPEN 平移或转 ORPHAN）。 */
+    public void updateAnnotationAnchor(long annotationId, int startOffset, int endOffset, String status) {
+        jdbc.update("UPDATE annotation SET start_offset = ?, end_offset = ?, status = ? WHERE annotation_id = ?",
+                startOffset, endOffset, status, annotationId);
+    }
+
+    /** 确认解决批注：状态置为 RESOLVED 并记录解决时间。 */
+    public void resolveAnnotation(long annotationId) {
+        jdbc.update("UPDATE annotation SET status = 'RESOLVED', resolved_at = CURRENT_TIMESTAMP "
+                + "WHERE annotation_id = ?", annotationId);
+    }
+
+    /** 删除某译文的批准记录（定点编辑或新增批注使当前批准失效）。 */
+    public void deleteApproval(long documentId, String segmentId, String language) {
+        jdbc.update("DELETE FROM approval WHERE document_id = ? AND segment_id = ? AND language = ?",
+                documentId, segmentId, language);
     }
 }

@@ -82,4 +82,34 @@ public final class Rows {
     public record RequestLogRow(String requestId, String requestHash,
                                 int responseStatus, String responseBody) {
     }
+
+    /**
+     * 审校批注：绑定段落、语言与创建时译文版本的非空锚点区间，随定点编辑迁移或孤立，仅创建人可确认解决。
+     *
+     * @param annotationId       全局唯一批注 ID，自增
+     * @param segmentId          所属段落 ID
+     * @param language           目标语言码，小写
+     * @param translationVersion 批注创建时绑定的译文版本，创建后不改写
+     * @param startOffset        锚点起点，按 Unicode 码点从 0 计数，左闭；孤立后保留最后位置仅供追溯
+     * @param endOffset          锚点终点，按 Unicode 码点从 0 计数，右开；startOffset < endOffset
+     * @param quote              创建时锚点引用的原文，孤立后仅保留该引用，不改写
+     * @param body               审校意见内容，非空
+     * @param author             批注创建人，取创建时 X-Actor-Id，仅创建人可确认解决
+     * @param status             批注状态：OPEN 未解决、ORPHAN 已孤立（锚点失效）、RESOLVED 已解决
+     */
+    public record AnnotationRow(long annotationId, String segmentId, String language,
+                                int translationVersion, int startOffset, int endOffset,
+                                String quote, String body, String author, String status) {
+        /** 未解决状态：OPEN。 */
+        public static final String STATUS_OPEN = "OPEN";
+        /** 未解决状态：ORPHAN，锚点失效仅保留原引用。 */
+        public static final String STATUS_ORPHAN = "ORPHAN";
+        /** 已解决状态：RESOLVED。 */
+        public static final String STATUS_RESOLVED = "RESOLVED";
+
+        /** 是否为未解决批注（OPEN 或 ORPHAN）。 */
+        public boolean unresolved() {
+            return STATUS_OPEN.equals(status) || STATUS_ORPHAN.equals(status);
+        }
+    }
 }

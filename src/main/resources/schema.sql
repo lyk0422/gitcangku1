@@ -124,3 +124,33 @@ COMMENT ON COLUMN request_log.request_hash IS '请求参数规范化后的 SHA-2
 COMMENT ON COLUMN request_log.response_status IS '原成功响应的 HTTP 状态码，用于重放';
 COMMENT ON COLUMN request_log.response_body IS '原成功响应体 JSON，用于重放';
 COMMENT ON COLUMN request_log.created_at IS '记录时间，数据库默认时区';
+
+CREATE TABLE IF NOT EXISTS annotation (
+    annotation_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    document_id BIGINT NOT NULL,
+    segment_id VARCHAR(64) NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    translation_version INT NOT NULL,
+    start_offset INT NOT NULL,
+    end_offset INT NOT NULL,
+    quote LONGTEXT NOT NULL,
+    body VARCHAR(2048) NOT NULL,
+    author VARCHAR(128) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    resolved_at TIMESTAMP NULL
+);
+COMMENT ON TABLE annotation IS '审校批注：绑定段落、语言与创建时译文版本的非空锚点区间，随定点编辑迁移或孤立，仅创建人可确认解决';
+COMMENT ON COLUMN annotation.annotation_id IS '全局唯一批注 ID，自增';
+COMMENT ON COLUMN annotation.document_id IS '所属文档 ID';
+COMMENT ON COLUMN annotation.segment_id IS '所属段落 ID';
+COMMENT ON COLUMN annotation.language IS '目标语言码，小写';
+COMMENT ON COLUMN annotation.translation_version IS '批注创建时绑定的译文版本，创建后不改写';
+COMMENT ON COLUMN annotation.start_offset IS '锚点起点，按 Unicode 码点从 0 计数，左闭；孤立后保留最后位置仅供追溯';
+COMMENT ON COLUMN annotation.end_offset IS '锚点终点，按 Unicode 码点从 0 计数，右开；start_offset < end_offset';
+COMMENT ON COLUMN annotation.quote IS '创建时锚点引用的原文，孤立后仅保留该引用，不改写';
+COMMENT ON COLUMN annotation.body IS '审校意见内容，非空';
+COMMENT ON COLUMN annotation.author IS '批注创建人，取创建时 X-Actor-Id，仅创建人可确认解决';
+COMMENT ON COLUMN annotation.status IS '批注状态：OPEN 未解决、ORPHAN 已孤立（锚点失效）、RESOLVED 已解决';
+COMMENT ON COLUMN annotation.created_at IS '创建时间，数据库默认时区';
+COMMENT ON COLUMN annotation.resolved_at IS '确认解决时间，数据库默认时区；未解决为空';

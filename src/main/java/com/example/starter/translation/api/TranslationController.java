@@ -92,6 +92,51 @@ public class TranslationController {
                         documentId, segmentId, language, actorId, request))).toResponseEntity();
     }
 
+    /** 新增批注：绑定当前译文版本，一次 1~20 条原子创建；创建后当前批准失效。 */
+    @PostMapping("/{documentId}/segments/{segmentId}/translations/{language}/annotations")
+    public ResponseEntity<String> createAnnotations(@PathVariable long documentId, @PathVariable String segmentId,
+                                                    @PathVariable String language,
+                                                    @RequestHeader("X-Actor-Id") String actorId,
+                                                    @Valid @RequestBody ApiDtos.CreateAnnotationsRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/segments/" + segmentId
+                + "/translations/" + language + "/annotations";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(201, translationService.createAnnotations(
+                        documentId, segmentId, language, actorId, request))).toResponseEntity();
+    }
+
+    /** 定点编辑：按码点区间替换译文，译文版本加一，批注锚点迁移或孤立，当前批准失效。 */
+    @PostMapping("/{documentId}/segments/{segmentId}/translations/{language}/edits")
+    public ResponseEntity<String> editTranslation(@PathVariable long documentId, @PathVariable String segmentId,
+                                                  @PathVariable String language,
+                                                  @Valid @RequestBody ApiDtos.EditTranslationRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/segments/" + segmentId
+                + "/translations/" + language + "/edits";
+        return writeExecutor.execute(request.requestId(), hash(operation, request),
+                () -> WriteResult.of(200, translationService.editTranslation(
+                        documentId, segmentId, language, request))).toResponseEntity();
+    }
+
+    /** 确认解决批注：仅创建人可把 OPEN 或 ORPHAN 置为 RESOLVED。 */
+    @PostMapping("/{documentId}/segments/{segmentId}/translations/{language}/annotations/{annotationId}/resolve")
+    public ResponseEntity<String> resolveAnnotation(@PathVariable long documentId, @PathVariable String segmentId,
+                                                    @PathVariable String language, @PathVariable long annotationId,
+                                                    @RequestHeader("X-Actor-Id") String actorId,
+                                                    @Valid @RequestBody ApiDtos.ResolveAnnotationRequest request) {
+        String operation = "POST /api/documents/" + documentId + "/segments/" + segmentId
+                + "/translations/" + language + "/annotations/" + annotationId + "/resolve";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(200, translationService.resolveAnnotation(
+                        documentId, segmentId, language, annotationId, actorId, request))).toResponseEntity();
+    }
+
+    /** 查询某译文的全部批注：ORPHAN 不返回锚点区间，仅保留原引用。 */
+    @GetMapping("/{documentId}/segments/{segmentId}/translations/{language}/annotations")
+    public ResponseEntity<ApiDtos.AnnotationListResponse> listAnnotations(@PathVariable long documentId,
+                                                                          @PathVariable String segmentId,
+                                                                          @PathVariable String language) {
+        return ResponseEntity.ok(translationService.listAnnotations(documentId, segmentId, language));
+    }
     /** 发布：全部段落全部目标语言均有有效批准且术语校验通过时原子生成只读快照并递增发布版本。 */
     @PostMapping("/{documentId}/publish")
     public ResponseEntity<String> publish(@PathVariable long documentId,

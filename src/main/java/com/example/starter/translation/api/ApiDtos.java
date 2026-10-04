@@ -125,6 +125,57 @@ public final class ApiDtos {
     public record TermStatusResponse(long documentId, int termVersion, List<TranslationTermStatus> translations) {
     }
 
+    /** 单条批注输入：非空锚点区间 [start, end)，按 Unicode 码点从 0 计数、左闭右开。 */
+    public record AnnotationInput(
+            @PositiveOrZero(message = "start 不能为负数") int start,
+            @PositiveOrZero(message = "end 不能为负数") int end,
+            @NotBlank(message = "批注内容不能为空") @Size(max = 2048) String body) {
+    }
+
+    /** 新增批注请求：绑定当前译文版本，一次 1~20 条，原子创建。 */
+    public record CreateAnnotationsRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @Positive(message = "expectedTranslationVersion 必须为正数") int expectedTranslationVersion,
+            @NotNull(message = "annotations 不能为空") @Size(min = 1, max = 20, message = "批注一次 1~20 条")
+            List<@Valid AnnotationInput> annotations) {
+    }
+
+    /** 定点编辑请求：按码点区间 [start, end) 替换为 newText；start == end 为纯插入，newText 可为空串表示删除。 */
+    public record EditTranslationRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @Positive(message = "expectedTranslationVersion 必须为正数") int expectedTranslationVersion,
+            @PositiveOrZero(message = "start 不能为负数") int start,
+            @PositiveOrZero(message = "end 不能为负数") int end,
+            @NotNull(message = "newText 不能为 null") String newText) {
+    }
+
+    /** 批注解决请求：仅创建人可把 OPEN 或 ORPHAN 确认 RESOLVED。 */
+    public record ResolveAnnotationRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @Positive(message = "expectedTranslationVersion 必须为正数") int expectedTranslationVersion) {
+    }
+
+    /** 批注视图：ORPHAN 时不返回锚点区间，仅保留原引用 quote。 */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public record AnnotationView(long annotationId, String status, int translationVersion,
+                                 Integer start, Integer end, String quote, String body, String author) {
+    }
+
+    /** 新增批注响应：绑定译文版本与全部新建批注。 */
+    public record CreateAnnotationsResponse(long documentId, String segmentId, String language,
+                                            int translationVersion, List<AnnotationView> annotations) {
+    }
+
+    /** 定点编辑响应：新译文版本、草稿版本及批注迁移结果（平移条数、孤立条数）。 */
+    public record EditTranslationResponse(long documentId, String segmentId, String language,
+                                          int translationVersion, int draftVersion,
+                                          int shiftedAnnotations, int orphanedAnnotations) {
+    }
+
+    /** 批注列表查询响应。 */
+    public record AnnotationListResponse(long documentId, String segmentId, String language,
+                                         List<AnnotationView> annotations) {
+    }
     /** 统一错误响应；violations 仅在术语违规 422 时返回，含全部违规术语。 */
     @JsonInclude(JsonInclude.Include.NON_NULL)
     public record ErrorResponse(String error, String message, List<TermRuleView> violations) {
