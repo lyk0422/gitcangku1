@@ -8,9 +8,10 @@ import java.time.Instant;
  * @param scheduleKey 所属计划业务键
  * @param trainNo     列车编号
  * @param sectionId   区段 ID
+ * @param routeId     可选进路编号，null 表示不参与进路互斥
  * @param startUtc    占用开始（含），UTC
  * @param endUtc      占用结束（不含），UTC
  */
-public record PublishedSlot(String scheduleKey, String trainNo, String sectionId,
+public record PublishedSlot(String scheduleKey, String trainNo, String sectionId, String routeId,
                             Instant startUtc, Instant endUtc) {
 }

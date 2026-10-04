@@ -83,3 +83,42 @@ COMMENT ON TABLE publish_lock IS '发布/改签全局互斥锁，保证并发发
 COMMENT ON COLUMN publish_lock.id IS '锁行 id，固定为 1，发布与改签时 SELECT ... FOR UPDATE 串行化';
 
 MERGE INTO publish_lock KEY(id) VALUES (1);
+
+-- 进路互斥：占用可选进路编号；进路注册表（最多 20 条）、冲突矩阵（版本化）与对称冲突对。
+ALTER TABLE rail_plan_occupancy ADD COLUMN IF NOT EXISTS route_id VARCHAR(64) NULL;
+COMMENT ON COLUMN rail_plan_occupancy.route_id IS '可选进路编号，NULL 表示不参与进路互斥；须引用 rail_route.route_id';
+
+CREATE TABLE IF NOT EXISTS rail_route (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    route_id VARCHAR(64) NOT NULL,
+    created_at BIGINT NOT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT uk_rail_route_route_id UNIQUE (route_id)
+);
+COMMENT ON TABLE rail_route IS '进路注册表，全局最多 20 条；进路自身默认冲突，未声明的不同进路可并行';
+COMMENT ON COLUMN rail_route.id IS '主键';
+COMMENT ON COLUMN rail_route.route_id IS '进路编号，全局唯一';
+COMMENT ON COLUMN rail_route.created_at IS '注册时刻，UTC 毫秒';
+
+CREATE TABLE IF NOT EXISTS rail_route_matrix (
+    id INT NOT NULL,
+    version INT NOT NULL,
+    PRIMARY KEY (id)
+);
+COMMENT ON TABLE rail_route_matrix IS '进路冲突矩阵版本行，单行 id=1，版本从 1 起每次更新加一';
+COMMENT ON COLUMN rail_route_matrix.id IS '行 id，固定为 1';
+COMMENT ON COLUMN rail_route_matrix.version IS '冲突矩阵版本，从 1 递增，更新须带 expectedVersion';
+
+MERGE INTO rail_route_matrix KEY(id) VALUES (1, 1);
+
+CREATE TABLE IF NOT EXISTS rail_route_conflict (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    route_a VARCHAR(64) NOT NULL,
+    route_b VARCHAR(64) NOT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT uk_route_conflict_pair UNIQUE (route_a, route_b)
+);
+COMMENT ON TABLE rail_route_conflict IS '进路对称冲突对，route_a < route_b 规范化存储，语义双向';
+COMMENT ON COLUMN rail_route_conflict.id IS '主键';
+COMMENT ON COLUMN rail_route_conflict.route_a IS '冲突对较小进路编号，关联 rail_route.route_id';
+COMMENT ON COLUMN rail_route_conflict.route_b IS '冲突对较大进路编号，关联 rail_route.route_id';

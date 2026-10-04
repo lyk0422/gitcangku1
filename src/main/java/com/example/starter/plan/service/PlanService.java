@@ -1,5 +1,6 @@
 package com.example.starter.plan.service;
 
+import com.example.starter.plan.model.ConflictPair;
 import com.example.starter.plan.model.DayPlan;
 import com.example.starter.plan.model.Occupancy;
 import com.example.starter.plan.model.PlanStatus;
@@ -7,6 +8,7 @@ import com.example.starter.plan.model.PublishedSlot;
 import com.example.starter.plan.model.RescheduleLink;
 import com.example.starter.plan.repo.IdempotencyRepository;
 import com.example.starter.plan.repo.PlanRepository;
+import com.example.starter.plan.repo.RouteRepository;
 import com.example.starter.plan.web.ApiException;
 import com.example.starter.plan.web.dto.CreatePlanRequest;
 import com.example.starter.plan.web.dto.OccupancyRequest;
@@ -59,13 +61,16 @@ public class PlanService {
     private static final String OP_RESCHEDULE = "RESCHEDULE";
 
     private final PlanRepository planRepo;
+    private final RouteRepository routeRepo;
     private final IdempotencyRepository idemRepo;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate tx;
 
-    public PlanService(PlanRepository planRepo, IdempotencyRepository idemRepo,
+    public PlanService(PlanRepository planRepo, RouteRepository routeRepo,
+                       IdempotencyRepository idemRepo,
                        ObjectMapper objectMapper, PlatformTransactionManager txManager) {
         this.planRepo = planRepo;
+        this.routeRepo = routeRepo;
         this.idemRepo = idemRepo;
         this.objectMapper = objectMapper;
         this.tx = new TransactionTemplate(txManager);
@@ -77,6 +82,7 @@ public class PlanService {
     public PlanResponse createDraft(CreatePlanRequest req) {
         validateOccupancyParams(req.occupancies());
         validateWithinOperationDay(req.occupancies(), req.opDate());
+        validateRoutesExist(req.occupancies());
         String hash = hashCreate(req);
         Optional<PlanResponse> replay = replayIfPresent(OP_CREATE, req.requestKey(), hash);
         if (replay.isPresent()) {
@@ -104,6 +110,7 @@ public class PlanService {
      */
     public PlanResponse replaceOccupancies(String scheduleKey, UpdateOccupanciesRequest req) {
         validateOccupancyParams(req.occupancies());
+        validateRoutesExist(req.occupancies());
         String hash = hashUpdate(scheduleKey, req);
         Optional<PlanResponse> replay = replayIfPresent(OP_UPDATE, req.requestKey(), hash);
         if (replay.isPresent()) {
@@ -160,6 +167,13 @@ public class PlanService {
                 if (!conflicts.isEmpty()) {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "存在时隙冲突，计划保持草稿", conflicts);
+                }
+                // 发布锁内快照冲突矩阵与进路集合，矩阵更新同为持锁事务，不会交错
+                List<Map<String, Object>> routeConflicts =
+                        findRouteConflicts(plan, occupancies, List.of(plan.id()));
+                if (!routeConflicts.isEmpty()) {
+                    throw new ApiException(HttpStatus.CONFLICT, "ROUTE_CONFLICT",
+                            "存在进路互斥冲突，计划保持草稿", routeConflicts);
                 }
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(plan.id(), PlanStatus.PUBLISHED, now);
@@ -260,6 +274,13 @@ public class PlanService {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "新草稿存在时隙冲突，改签未生效", conflicts);
                 }
+                // 旧计划占用已从最终状态移除（排除新旧两计划），自身旧占用不会误阻断
+                List<Map<String, Object>> routeConflicts = findRouteConflicts(newPlan, occupancies,
+                        List.of(newPlan.id(), oldPlan.id()));
+                if (!routeConflicts.isEmpty()) {
+                    throw new ApiException(HttpStatus.CONFLICT, "ROUTE_CONFLICT",
+                            "新草稿存在进路互斥冲突，改签未生效", routeConflicts);
+                }
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(oldPlan.id(), PlanStatus.CANCELLED, now);
                 planRepo.updateStatus(newPlan.id(), PlanStatus.PUBLISHED, now);
@@ -329,7 +350,7 @@ public class PlanService {
     public List<PublishedSlotView> getPublishedSlots(LocalDate opDate, String sectionId) {
         return planRepo.findPublishedSlots(opDate, List.of(sectionId), List.of(-1L)).stream()
                 .map(s -> new PublishedSlotView(s.scheduleKey(), s.trainNo(), s.sectionId(),
-                        s.startUtc(), s.endUtc()))
+                        s.routeId(), s.startUtc(), s.endUtc()))
                 .toList();
     }
 
@@ -339,7 +360,8 @@ public class PlanService {
         DayPlan plan = planRepo.findByKey(scheduleKey)
                 .orElseThrow(() -> notFound(scheduleKey));
         List<OccupancyView> views = planRepo.findOccupancies(plan.id()).stream()
-                .map(o -> new OccupancyView(o.trainNo(), o.sectionId(), o.startUtc(), o.endUtc()))
+                .map(o -> new OccupancyView(o.trainNo(), o.sectionId(), o.routeId(),
+                        o.startUtc(), o.endUtc()))
                 .toList();
         return new PlanResponse(plan.scheduleKey(), plan.opDate(), plan.version(),
                 plan.status().name(), views);
@@ -349,7 +371,8 @@ public class PlanService {
         List<Occupancy> result = new ArrayList<>(requests.size());
         for (int i = 0; i < requests.size(); i++) {
             OccupancyRequest r = requests.get(i);
-            result.add(new Occupancy(0L, planId, i, r.trainNo(), r.sectionId(), r.startUtc(), r.endUtc()));
+            result.add(new Occupancy(0L, planId, i, r.trainNo(), r.sectionId(), r.routeId(),
+                    r.startUtc(), r.endUtc()));
         }
         return result;
     }
@@ -452,6 +475,64 @@ public class PlanService {
         return conflicts;
     }
 
+    /**
+     * 参数级校验：占用引用的进路必须已注册，否则 422。
+     */
+    private void validateRoutesExist(List<OccupancyRequest> occupancies) {
+        for (int i = 0; i < occupancies.size(); i++) {
+            String routeId = occupancies.get(i).routeId();
+            if (routeId != null && !routeRepo.existsRoute(routeId)) {
+                throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "ROUTE_NOT_FOUND",
+                        "第 " + i + " 条占用引用了不存在的进路: " + routeId);
+            }
+        }
+    }
+
+    /**
+     * 与其他已发布计划在冲突进路上的重叠检测（左闭右开，相邻合法）。
+     * 进路自身默认冲突；不同进路仅在冲突对中声明时互斥，未声明可并行。
+     * 与区段无关：不同区段的占用在互斥进路上同样冲突。
+     *
+     * @param excludePlanIds 检测时排除的计划 id（发布为自身；改签为新旧两个计划）
+     */
+    private List<Map<String, Object>> findRouteConflicts(DayPlan plan, List<Occupancy> occupancies,
+                                                         List<Long> excludePlanIds) {
+        List<Occupancy> routed = occupancies.stream()
+                .filter(o -> o.routeId() != null)
+                .toList();
+        if (routed.isEmpty()) {
+            return List.of();
+        }
+        java.util.Set<ConflictPair> pairs = new java.util.HashSet<>(
+                routeRepo.findAllConflictPairs());
+        List<PublishedSlot> published = planRepo.findPublishedRouteSlots(plan.opDate(),
+                excludePlanIds);
+        List<Map<String, Object>> conflicts = new ArrayList<>();
+        for (Occupancy o : routed) {
+            for (PublishedSlot slot : published) {
+                boolean routesConflict = o.routeId().equals(slot.routeId())
+                        || pairs.contains(new ConflictPair(o.routeId(), slot.routeId()));
+                if (!routesConflict) {
+                    continue;
+                }
+                boolean overlap = o.startUtc().isBefore(slot.endUtc())
+                        && slot.startUtc().isBefore(o.endUtc());
+                if (overlap) {
+                    Map<String, Object> detail = new LinkedHashMap<>();
+                    detail.put("type", "ROUTE_CONFLICT");
+                    detail.put("routeId", o.routeId());
+                    detail.put("conflictingRouteId", slot.routeId());
+                    detail.put("scheduleKey", plan.scheduleKey());
+                    detail.put("conflictingScheduleKey", slot.scheduleKey());
+                    detail.put("trainNo", o.trainNo());
+                    detail.put("startUtc", o.startUtc().toString());
+                    detail.put("endUtc", o.endUtc().toString());
+                    conflicts.add(detail);
+                }
+            }
+        }
+        return conflicts;
+    }
     /**
      * 幂等重放：存在记录且参数一致返回首次结果；参数不一致抛 409。
      */
