@@ -14,10 +14,7 @@ import com.example.starter.batch.dto.SubmitTestRequest;
 import com.example.starter.batch.dto.TestResultResponse;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.PlatformTransactionManager;
-import org.springframework.transaction.support.TransactionTemplate;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -56,18 +53,16 @@ public class BatchService {
      */
     private static final String SEP = "\u0000";
 
-    private static final int IDEMPOTENCY_MAX_ATTEMPTS = 3;
-
     private final BatchRepository repo;
-    private final TransactionTemplate tx;
     private final ObjectMapper objectMapper;
+    private final IdempotentExecutor idempotent;
 
     public BatchService(BatchRepository repo,
-                        PlatformTransactionManager transactionManager,
-                        ObjectMapper objectMapper) {
+                        ObjectMapper objectMapper,
+                        IdempotentExecutor idempotent) {
         this.repo = repo;
-        this.tx = new TransactionTemplate(transactionManager);
         this.objectMapper = objectMapper;
+        this.idempotent = idempotent;
     }
 
     /**
@@ -200,6 +195,9 @@ public class BatchService {
                 seq = 2;
                 newStatus = BatchStatus.RELEASED;
             }
+            if (newStatus == BatchStatus.RELEASED) {
+                assertLineClearance(batchKey);
+            }
             repo.insertApproval(new BatchRepository.ApprovalRow(0L, batchKey, req.commandKey(),
                     actor, role.name(), seq, now));
             repo.updateStatus(batchKey, newStatus.name());
@@ -295,23 +293,7 @@ public class BatchService {
      */
     private StoredResponse executeIdempotent(String type, String commandKey, String fingerprint,
                                              Supplier<StoredResponse> action) {
-        for (int attempt = 0; attempt < IDEMPOTENCY_MAX_ATTEMPTS; attempt++) {
-            try {
-                return tx.execute(status -> {
-                    var logged = loggedResponse(type, commandKey, fingerprint);
-                    if (logged.isPresent()) {
-                        return logged.get();
-                    }
-                    StoredResponse response = action.get();
-                    repo.insertCommand(new BatchRepository.CommandRow(type, commandKey, fingerprint,
-                            response.status(), response.body()), now());
-                    return response;
-                });
-            } catch (DuplicateKeyException e) {
-                // 并发同事务键冲突：回滚后重试，读取对方已提交的命令快照或业务结果
-            }
-        }
-        throw ApiException.conflict("命令并发冲突，请重试: " + commandKey);
+        return idempotent.execute(type, commandKey, fingerprint, action);
     }
 
     /**
@@ -319,15 +301,7 @@ public class BatchService {
      */
     private Optional<StoredResponse> loggedResponse(String type, String commandKey,
                                                     String fingerprint) {
-        var existing = repo.findCommand(type, commandKey);
-        if (existing.isEmpty()) {
-            return Optional.empty();
-        }
-        BatchRepository.CommandRow row = existing.get();
-        if (!row.fingerprint().equals(fingerprint)) {
-            throw ApiException.conflict("commandKey 已以不同参数使用: " + commandKey);
-        }
-        return Optional.of(new StoredResponse(row.responseStatus(), row.responseBody()));
+        return idempotent.loggedResponse(type, commandKey, fingerprint);
     }
 
     private boolean allRequiredPassed(String batchKey, List<String> required) {
@@ -574,5 +548,37 @@ public class BatchService {
         return new LineageEntryResponse(row.batchKey(), row.batchNo(),
                 BatchStatus.valueOf(row.status()),
                 recalledAncestor(batchKey, parentOf, recalled).orElse(null));
+    }
+
+    /**
+     * 放行前清洗验证：仅对已上机且存在同线前批的批次生效，未上机批次不受影响。
+     * 冻结（行锁）实际前批；前批自身被召回或处于召回血缘中时一律不得放行；
+     * 前后产品代码不同还须存在针对该实际相邻批次的合格清洗（CONFIRMED，行锁冻结），
+     * 不得沿用其他批次对的清洗。判断在第二批准落定 RELEASED 前执行，原双角色规则不变。
+     */
+    private void assertLineClearance(String batchKey) {
+        var run = repo.findLineRunByBatch(batchKey);
+        if (run.isEmpty() || run.get().prevBatchKey() == null) {
+            return;
+        }
+        String prevKey = run.get().prevBatchKey();
+        BatchRepository.BatchRow prev = repo.findBatchForUpdate(prevKey)
+                .orElseThrow(() -> ApiException.notFound("前一批次不存在: " + prevKey));
+        if (BatchStatus.RECALLED.name().equals(prev.status())) {
+            throw ApiException.unprocessable("前一批次已召回，不得放行: " + prevKey);
+        }
+        Optional<String> recalledAncestor = recalledAncestor(prevKey, childToParent(),
+                new HashSet<>(repo.findRecalledKeys()));
+        if (recalledAncestor.isPresent()) {
+            throw ApiException.unprocessable(
+                    "前一批次 " + prevKey + " 处于召回血缘（祖先 " + recalledAncestor.get() + " 已召回），不得放行");
+        }
+        BatchRepository.BatchRow current = repo.findBatch(batchKey)
+                .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+        if (!prev.productCode().equals(current.productCode())
+                && repo.findConfirmedCleaningForUpdate(prevKey, batchKey).isEmpty()) {
+            throw ApiException.unprocessable(
+                    "前后产品代码不同，缺少针对相邻批次 " + prevKey + " -> " + batchKey + " 的合格清洗，不得放行");
+        }
     }
 }

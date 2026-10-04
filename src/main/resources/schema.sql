@@ -66,3 +66,28 @@ CREATE TABLE IF NOT EXISTS batch_lineage (
     created_at VARCHAR(40) NOT NULL COMMENT '拆分时间，ISO-8601 UTC instant 字符串',
     CONSTRAINT uk_lineage_child UNIQUE (child_key)
 );
+
+-- 生产线加工顺序与批间清洗验证；时间均以 ISO-8601 UTC 字符串存储，空值含义见各列 COMMENT。
+CREATE TABLE IF NOT EXISTS line_run (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键，同时作为登记提交顺序依据',
+    line_code VARCHAR(64) NOT NULL COMMENT '生产线代码，同一生产线内加工顺序连续递增',
+    seq INT NOT NULL COMMENT '加工顺序号，从 1 开始连续递增，禁止插队；由服务端按当前最大顺序加一分配',
+    batch_key VARCHAR(64) NOT NULL COMMENT '本次上机批次业务键；每批全局仅可上机一次，不得挂多条线',
+    prev_batch_key VARCHAR(64) NULL COMMENT '同一生产线上一个批次业务键；首批为 NULL，登记后不可改写',
+    created_at VARCHAR(40) NOT NULL COMMENT '登记时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_line_run_seq UNIQUE (line_code, seq),
+    CONSTRAINT uk_line_run_batch UNIQUE (batch_key)
+);
+
+CREATE TABLE IF NOT EXISTS cleaning_record (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '清洗记录ID，确认时明确引用；记录只增不改写历史',
+    prev_batch_key VARCHAR(64) NOT NULL COMMENT '前批（残留来源）业务键',
+    next_batch_key VARCHAR(64) NOT NULL COMMENT '后批业务键；清洗仅对 (prev, next) 这一实际相邻对有效',
+    residual VARCHAR(32) NOT NULL COMMENT '残留量十进制原文字符串，单位毫克，未舍入；合法范围 0~100、最多 6 位小数',
+    submitted_by VARCHAR(64) NOT NULL COMMENT '清洗提交人标识',
+    status VARCHAR(16) NOT NULL COMMENT '清洗状态：PENDING 待确认 / CONFIRMED 已确认合格 / REJECTED 残留超限不合格（终态）',
+    version INT NOT NULL COMMENT '记录版本，初始 0，每次状态迁移加 1；确认请求须携带相等的期望版本',
+    confirmed_by VARCHAR(64) NULL COMMENT '确认人标识，须为 QUALITY 角色且不同于提交人；未确认为 NULL',
+    created_at VARCHAR(40) NOT NULL COMMENT '提交时间，ISO-8601 UTC instant 字符串',
+    confirmed_at VARCHAR(40) NULL COMMENT '确认时间，ISO-8601 UTC instant 字符串；未确认为 NULL'
+);
