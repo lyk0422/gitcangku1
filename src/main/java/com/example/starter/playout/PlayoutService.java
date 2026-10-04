@@ -1,5 +1,6 @@
 package com.example.starter.playout;
 
+import com.example.starter.playout.PlayoutRepository.AssetRow;
 import com.example.starter.playout.PlayoutRepository.DraftRow;
 import com.example.starter.playout.PlayoutRepository.GrantRow;
 import com.example.starter.playout.PlayoutRepository.OverrideRow;
@@ -16,12 +17,16 @@ import com.example.starter.playout.api.Dtos.CreateEmergencyOverrideRequest;
 import com.example.starter.playout.api.Dtos.CreateGrantRequest;
 import com.example.starter.playout.api.Dtos.DecisionSource;
 import com.example.starter.playout.api.Dtos.DraftResponse;
+import com.example.starter.playout.api.Dtos.EnergyBudgetResponse;
+import com.example.starter.playout.api.Dtos.EnergyContribution;
+import com.example.starter.playout.api.Dtos.EnergyDensityResponse;
 import com.example.starter.playout.api.Dtos.EmergencyOverrideResponse;
 import com.example.starter.playout.api.Dtos.FallbackReason;
 import com.example.starter.playout.api.Dtos.GrantResponse;
 import com.example.starter.playout.api.Dtos.OverrideStatus;
 import com.example.starter.playout.api.Dtos.PlayoutDecisionResponse;
 import com.example.starter.playout.api.Dtos.PublishRequest;
+import com.example.starter.playout.api.Dtos.RegisterEnergyDensityRequest;
 import com.example.starter.playout.api.Dtos.PublishResponse;
 import com.example.starter.playout.api.Dtos.ReplaceDraftRequest;
 import com.example.starter.playout.api.Dtos.SegmentInput;
@@ -31,6 +36,7 @@ import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -41,7 +47,9 @@ import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.TreeMap;
 import java.util.UUID;
 import java.util.function.Supplier;
 
@@ -63,6 +71,7 @@ public class PlayoutService {
     private static final String OP_REVOKE_GRANT = "REVOKE_GRANT";
     private static final String OP_CREATE_OVERRIDE = "CREATE_OVERRIDE";
     private static final String OP_CANCEL_OVERRIDE = "CANCEL_OVERRIDE";
+    private static final String OP_REGISTER_ENERGY_DENSITY = "REGISTER_ENERGY_DENSITY";
 
     /** 紧急插播时长上限（含）：30 分钟，单位毫秒。 */
     private static final long OVERRIDE_MAX_DURATION_MS = 30L * 60L * 1000L;
@@ -220,11 +229,25 @@ public class PlayoutService {
                 GrantRow grant = selectCoveringGrantForUpdate(channelId, segment);
                 grantIds.add(grant.id());
             }
+            // 能量预算：只检查正常编排片段，空档与保底素材密度视为 0，紧急插播不计入。
+            List<EnergyBudget.Segment> budgetSegments = new ArrayList<>();
+            for (SegmentRow segment : segments) {
+                budgetSegments.add(new EnergyBudget.Segment(segment.id(), segment.assetId(),
+                        segment.startMs(), segment.endMs(), densityOf(segment.assetId())));
+            }
+            EnergyBudget.Evaluation evaluation = EnergyBudget.evaluate(budgetSegments);
+            if (evaluation.exceeds()) {
+                throw ApiException.unprocessable("ENERGY_BUDGET_EXCEEDED",
+                        "任意连续 60 秒能量积分超过 300，整份不发布，最大窗口能量 "
+                                + evaluation.maxEnergy().stripTrailingZeros().toPlainString());
+            }
             long newVersion = currentPublished + 1;
             long publicationId;
             try {
                 publicationId = repo.insertPublication(channelId, businessDay,
-                        newVersion, draft.version(), nowMs());
+                        newVersion, draft.version(), nowMs(),
+                        evaluation.windowStartMs(), evaluation.windowEndMs(),
+                        evaluation.maxEnergy());
             } catch (DuplicateKeyException e) {
                 throw ApiException.conflict("PUBLISHED_VERSION_CONFLICT",
                         "发布版本冲突，版本 " + newVersion + " 已存在");
@@ -232,7 +255,8 @@ public class PlayoutService {
             for (int i = 0; i < segments.size(); i++) {
                 SegmentRow segment = segments.get(i);
                 repo.insertPublicationSegment(publicationId, segment.id(), segment.assetId(),
-                        grantIds.get(i), segment.startMs(), segment.endMs());
+                        grantIds.get(i), segment.startMs(), segment.endMs(),
+                        budgetSegments.get(i).energyDensity());
             }
             return new PublishResponse(publicationId, channelId, businessDay.toString(),
                     newVersion, draft.version());
@@ -585,6 +609,87 @@ public class PlayoutService {
         }
     }
 
+    // ---------- 能量预算 ----------
+
+    /**
+     * 登记素材能量密度：0~10、最多 3 位小数，一次性操作，登记后不可修改；未登记素材按 0。
+     * 幂等身份由操作、操作者、资源与全部参数经结构化 JSON 序列化后哈希，避免分隔符碰撞；
+     * 同 requestId 同参数返回首次完整响应，异参数 409，失败不占键。
+     */
+    @Transactional
+    public EnergyDensityResponse registerEnergyDensity(String assetId,
+                                                       RegisterEnergyDensityRequest request) {
+        String hash = structuredHash(OP_REGISTER_ENERGY_DENSITY, Map.of(
+                "operator", request.operator(),
+                "assetId", assetId,
+                "energyDensity", request.energyDensity().stripTrailingZeros().toPlainString()));
+        return idempotent(request.requestId(), OP_REGISTER_ENERGY_DENSITY, hash,
+                EnergyDensityResponse.class, () -> {
+                    AssetRow asset = repo.findAsset(assetId)
+                            .orElseThrow(() -> ApiException.notFound("素材不存在: " + assetId));
+                    if (asset.energyDensity() != null) {
+                        throw ApiException.conflict("ENERGY_DENSITY_ALREADY_REGISTERED",
+                                "素材能量密度已登记，不可修改: " + assetId);
+                    }
+                    int updated = repo.registerEnergyDensity(assetId, request.energyDensity());
+                    if (updated == 0) {
+                        // 并发登记已先提交：条件更新未命中，按已登记冲突处理，不泄露底层异常。
+                        throw ApiException.conflict("ENERGY_DENSITY_ALREADY_REGISTERED",
+                                "素材能量密度已登记，不可修改: " + assetId);
+                    }
+                    return new EnergyDensityResponse(assetId, request.energyDensity(), true);
+                });
+    }
+
+    /**
+     * 查询发布快照的能量预算证据：最大 60 秒滚动窗口区间、最大能量积分及窗口内各片段贡献。
+     * 片段密度取发布时冻结值；紧急插播不计入本预算，响应中明确说明该例外。
+     */
+    @Transactional(readOnly = true)
+    public EnergyBudgetResponse energyBudget(long publicationId) {
+        PublicationRow publication = repo.findPublicationById(publicationId)
+                .orElseThrow(() -> ApiException.notFound("发布快照不存在: " + publicationId));
+        List<EnergyBudget.Segment> segments = repo.findPublicationSegments(publicationId).stream()
+                .map(s -> new EnergyBudget.Segment(s.segmentId(), s.assetId(), s.startMs(),
+                        s.endMs(), s.energyDensity() == null ? BigDecimal.ZERO : s.energyDensity()))
+                .toList();
+        List<EnergyContribution> contributions = List.of();
+        if (publication.maxWindowStartMs() != null) {
+            contributions = EnergyBudget.evaluateWindow(segments, publication.maxWindowStartMs())
+                    .contributions().stream()
+                    .map(c -> new EnergyContribution(c.segmentId(), c.assetId(), c.energyDensity(),
+                            c.overlapMs(), c.energy()))
+                    .toList();
+        }
+        return new EnergyBudgetResponse(publication.id(), publication.channelId(),
+                publication.businessDay().toString(),
+                EnergyBudget.WINDOW_MS / 1000, EnergyBudget.LIMIT,
+                publication.maxWindowStartMs() == null ? null : atMs(publication.maxWindowStartMs()),
+                publication.maxWindowEndMs() == null ? null : atMs(publication.maxWindowEndMs()),
+                publication.maxWindowEnergy() == null ? BigDecimal.ZERO
+                        : publication.maxWindowEnergy(),
+                contributions,
+                true, "紧急插播不计入本预算");
+    }
+
+    /** 读取素材当前能量密度；未登记（NULL）按 0。 */
+    private BigDecimal densityOf(String assetId) {
+        AssetRow asset = repo.findAsset(assetId)
+                .orElseThrow(() -> ApiException.notFound("素材不存在: " + assetId));
+        return asset.energyDensity() == null ? BigDecimal.ZERO : asset.energyDensity();
+    }
+
+    /** 结构化幂等身份：操作名 + 有序参数映射序列化为 JSON 后取 SHA-256，避免分隔符碰撞。 */
+    private String structuredHash(String operation, Map<String, String> params) {
+        try {
+            Map<String, Object> envelope = new TreeMap<>();
+            envelope.put("operation", operation);
+            envelope.put("params", new TreeMap<>(params));
+            return sha256(objectMapper.writeValueAsString(envelope));
+        } catch (Exception e) {
+            throw new IllegalStateException("幂等身份序列化失败", e);
+        }
+    }
     /** 校验后的片段。 */
     private record ValidatedSegment(String id, String assetId, long startMs, long endMs) {
         SegmentResponse toResponse() {

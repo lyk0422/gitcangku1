@@ -5,6 +5,7 @@
 CREATE TABLE IF NOT EXISTS playout_asset (
     id           VARCHAR(64)  NOT NULL COMMENT '素材稳定 ID，客户端指定或系统生成，创建后不变',
     duration_ms  BIGINT       NOT NULL COMMENT '素材时长，单位毫秒，正整数',
+    energy_density DECIMAL(5,3) NULL COMMENT '合成能量密度，0~10 最多 3 位小数；NULL 表示未登记，按 0 参与能量预算；登记后不可修改',
     created_at_ms BIGINT      NOT NULL COMMENT '创建时间，UTC 纪元毫秒',
     PRIMARY KEY (id)
 ) COMMENT = '素材表';
@@ -56,6 +57,9 @@ CREATE TABLE IF NOT EXISTS playout_publication (
     published_version BIGINT      NOT NULL COMMENT '发布版本，每频道+业务日从 1 起递增',
     draft_version     BIGINT      NOT NULL COMMENT '发布时对应的草稿版本',
     created_at_ms     BIGINT      NOT NULL COMMENT '发布时间，UTC 纪元毫秒',
+    max_window_start_ms BIGINT   NULL COMMENT '发布时能量预算最大 60 秒滚动窗口起点（含），UTC 纪元毫秒；无片段时为 NULL',
+    max_window_end_ms   BIGINT   NULL COMMENT '发布时能量预算最大 60 秒滚动窗口终点（不含），UTC 纪元毫秒；无片段时为 NULL',
+    max_window_energy   DECIMAL(12,6) NULL COMMENT '最大滚动窗口能量积分（密度 x 实际播放秒数），预算上限 300；无片段时为 NULL',
     PRIMARY KEY (id),
     UNIQUE KEY uk_publication_version (channel_id, business_day, published_version)
 ) COMMENT = '发布快照表，快照只读，授权撤销不改写历史快照';
@@ -68,13 +72,14 @@ CREATE TABLE IF NOT EXISTS playout_publication_segment (
     grant_id       BIGINT      NOT NULL COMMENT '发布时完整覆盖该片段的授权 ID，播出查询据此实时判定撤销状态',
     start_ms       BIGINT      NOT NULL COMMENT '播出开始（含），UTC 纪元毫秒',
     end_ms         BIGINT      NOT NULL COMMENT '播出结束（不含），UTC 纪元毫秒',
+    energy_density DECIMAL(5,3) NOT NULL DEFAULT 0 COMMENT '发布时冻结的素材能量密度；发布时未登记的素材按 0 冻结',
     PRIMARY KEY (id),
     KEY idx_pub_segment (publication_id)
 ) COMMENT = '发布快照片段表，只读';
 
 CREATE TABLE IF NOT EXISTS playout_request (
     request_id    VARCHAR(64)  NOT NULL COMMENT '幂等请求 ID，客户端生成',
-    operation     VARCHAR(32)  NOT NULL COMMENT '操作类型：REPLACE_DRAFT / PUBLISH / REVOKE_GRANT / CREATE_OVERRIDE / CANCEL_OVERRIDE',
+    operation     VARCHAR(32)  NOT NULL COMMENT '操作类型：REPLACE_DRAFT / PUBLISH / REVOKE_GRANT / CREATE_OVERRIDE / CANCEL_OVERRIDE / REGISTER_ENERGY_DENSITY',
     params_hash   VARCHAR(64)  NOT NULL COMMENT '业务参数（不含 requestId）的 SHA-256，十六进制',
     response_body TEXT         NULL COMMENT '成功时的响应 JSON；失败请求回滚不占用 requestId',
     created_at_ms BIGINT       NOT NULL COMMENT '记录创建时间，UTC 纪元毫秒',

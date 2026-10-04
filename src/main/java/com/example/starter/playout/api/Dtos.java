@@ -1,5 +1,8 @@
 package com.example.starter.playout.api;
 
+import jakarta.validation.constraints.DecimalMax;
+import jakarta.validation.constraints.DecimalMin;
+import jakarta.validation.constraints.Digits;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
@@ -7,6 +10,7 @@ import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.PositiveOrZero;
 
+import java.math.BigDecimal;
 import java.time.OffsetDateTime;
 import java.util.List;
 
@@ -168,6 +172,44 @@ public final class Dtos {
             OffsetDateTime createdAt) {
     }
 
+    /** 登记素材能量密度请求。登记为一次性操作，登记后不可修改；携带 requestId 幂等。 */
+    public record RegisterEnergyDensityRequest(
+            @NotBlank String requestId,
+            @NotBlank String operator,
+            @NotNull @DecimalMin("0") @DecimalMax("10") @Digits(integer = 2, fraction = 3)
+            BigDecimal energyDensity) {
+    }
+
+    /** 素材能量密度登记响应。 */
+    public record EnergyDensityResponse(String assetId, BigDecimal energyDensity, boolean registered) {
+    }
+
+    /**
+     * 频道能量预算查询响应：定位已发布编排的最大 60 秒滚动窗口及各片段贡献。
+     * 紧急插播不计入本预算，emergencyOverridesExcluded 恒为 true 并由 note 明确说明该例外。
+     */
+    public record EnergyBudgetResponse(
+            long publicationId,
+            String channelId,
+            String businessDay,
+            long windowSeconds,
+            BigDecimal budgetLimit,
+            OffsetDateTime maxWindowStart,
+            OffsetDateTime maxWindowEnd,
+            BigDecimal maxWindowEnergy,
+            List<EnergyContribution> contributions,
+            boolean emergencyOverridesExcluded,
+            String note) {
+    }
+
+    /** 最大滚动窗口内单个片段的能量贡献。 */
+    public record EnergyContribution(
+            String segmentId,
+            String assetId,
+            BigDecimal energyDensity,
+            long overlapMs,
+            BigDecimal energy) {
+    }
     /** 统一错误响应体。 */
     public record ErrorResponse(String error, String message) {
     }

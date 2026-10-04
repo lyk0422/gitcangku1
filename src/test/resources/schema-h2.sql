@@ -4,6 +4,7 @@
 CREATE TABLE IF NOT EXISTS playout_asset (
     id            VARCHAR(64) NOT NULL PRIMARY KEY,
     duration_ms   BIGINT      NOT NULL,
+    energy_density DECIMAL(5,3) NULL,
     created_at_ms BIGINT      NOT NULL
 );
 
@@ -51,7 +52,10 @@ CREATE TABLE IF NOT EXISTS playout_publication (
     business_day      DATE        NOT NULL,
     published_version BIGINT      NOT NULL,
     draft_version     BIGINT      NOT NULL,
-    created_at_ms     BIGINT      NOT NULL
+    created_at_ms     BIGINT      NOT NULL,
+    max_window_start_ms BIGINT   NULL,
+    max_window_end_ms   BIGINT   NULL,
+    max_window_energy   DECIMAL(12,6) NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uk_publication_version
     ON playout_publication (channel_id, business_day, published_version);
@@ -63,7 +67,8 @@ CREATE TABLE IF NOT EXISTS playout_publication_segment (
     asset_id       VARCHAR(64) NOT NULL,
     grant_id       BIGINT      NOT NULL,
     start_ms       BIGINT      NOT NULL,
-    end_ms         BIGINT      NOT NULL
+    end_ms         BIGINT      NOT NULL,
+    energy_density DECIMAL(5,3) NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_pub_segment ON playout_publication_segment (publication_id);
 

@@ -9,10 +9,13 @@ import com.example.starter.playout.api.Dtos.CreateEmergencyOverrideRequest;
 import com.example.starter.playout.api.Dtos.CreateGrantRequest;
 import com.example.starter.playout.api.Dtos.DraftResponse;
 import com.example.starter.playout.api.Dtos.EmergencyOverrideResponse;
+import com.example.starter.playout.api.Dtos.EnergyBudgetResponse;
+import com.example.starter.playout.api.Dtos.EnergyDensityResponse;
 import com.example.starter.playout.api.Dtos.GrantResponse;
 import com.example.starter.playout.api.Dtos.CancelEmergencyOverrideRequest;
 import com.example.starter.playout.api.Dtos.PlayoutDecisionResponse;
 import com.example.starter.playout.api.Dtos.PublishRequest;
+import com.example.starter.playout.api.Dtos.RegisterEnergyDensityRequest;
 import com.example.starter.playout.api.Dtos.PublishResponse;
 import com.example.starter.playout.api.Dtos.ReplaceDraftRequest;
 import com.example.starter.playout.api.Dtos.RevokeGrantRequest;
@@ -119,6 +122,19 @@ public class PlayoutController {
         return service.getEmergencyOverride(overrideKey);
     }
 
+    /** 登记素材能量密度（0~10、最多 3 位小数，一次性不可修改，携带 requestId 幂等）。 */
+    @PutMapping("/assets/{assetId}/energy-density")
+    public EnergyDensityResponse registerEnergyDensity(
+            @PathVariable @NotBlank String assetId,
+            @Valid @RequestBody RegisterEnergyDensityRequest request) {
+        return service.registerEnergyDensity(assetId, request);
+    }
+
+    /** 查询发布快照的能量预算：最大 60 秒滚动窗口与各片段贡献；紧急插播不计入本预算。 */
+    @GetMapping("/publications/{publicationId}/energy-budget")
+    public EnergyBudgetResponse energyBudget(@PathVariable long publicationId) {
+        return service.energyBudget(publicationId);
+    }
     private static LocalDate parseBusinessDay(String businessDay) {
         try {
             return LocalDate.parse(businessDay);
