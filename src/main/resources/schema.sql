@@ -59,3 +59,61 @@ CREATE TABLE IF NOT EXISTS conflict_resolution (
     -- 且不可变解决历史必须在任何数据清理/归档场景下继续可查。
     UNIQUE (observation_id, request_id)
 );
+
+-- 未解决冲突状态表：三方合并检出冲突时在独立事务落库（不随 409 回滚），
+-- 合并/裁决/删除成功时同事务清除；用于禁运设置的"存在未解决冲突"判定。
+CREATE TABLE IF NOT EXISTS open_conflict (
+    observation_id VARCHAR(64) NOT NULL COMMENT '观测记录唯一标识',
+    conflict_fields VARCHAR(256) NOT NULL COMMENT '未解决冲突字段名列表（JSON 数组原文，固定顺序 location/reading/note）',
+    base_version INT NOT NULL COMMENT '检出冲突时的基线版本号',
+    current_version INT NOT NULL COMMENT '检出冲突时的当前版本号',
+    request_id VARCHAR(128) NOT NULL COMMENT '检出该冲突的请求标识',
+    detected_at_utc TIMESTAMP NOT NULL COMMENT '冲突检出时刻（UTC）',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录落库时间（服务器时区）',
+    PRIMARY KEY (observation_id)
+);
+
+-- 观测禁运设置表：每簇一行，设置后不可变（不更新、不删除）；重复设置按冲突处理。
+CREATE TABLE IF NOT EXISTS observation_embargo (
+    observation_id VARCHAR(64) NOT NULL COMMENT '观测记录唯一标识',
+    embargo_until_utc TIMESTAMP NOT NULL COMMENT '禁运截止时刻（UTC）；禁运区间左闭右开，到达该时刻即解禁',
+    disclosure_scope VARCHAR(512) NOT NULL COMMENT '披露范围（JSON 数组原文，元素经过去空白、去重、排序，非空）',
+    operator VARCHAR(128) NOT NULL COMMENT '设置禁运的操作者标识',
+    version_at_set INT NOT NULL COMMENT '设置禁运时观测记录的当前版本号',
+    request_id VARCHAR(128) NOT NULL COMMENT '设置禁运的请求标识（requestId）',
+    set_at_utc TIMESTAMP NOT NULL COMMENT '禁运设置时刻（UTC）',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录落库时间（服务器时区）',
+    PRIMARY KEY (observation_id)
+);
+
+-- 披露快照表：禁运到期后首次公开发布生成，每簇一份，不可变、永不更新或删除。
+CREATE TABLE IF NOT EXISTS disclosure_snapshot (
+    observation_id VARCHAR(64) NOT NULL COMMENT '观测记录唯一标识',
+    version INT NOT NULL COMMENT '发布时刻胜出版本号',
+    location VARCHAR(512) NULL COMMENT '发布时刻胜出观测地点快照；删除墓碑为 NULL',
+    reading VARCHAR(64) NULL COMMENT '发布时刻胜出观测读数快照（十进制原文）；删除墓碑为 NULL',
+    note VARCHAR(1024) NULL COMMENT '发布时刻胜出观测备注快照；删除墓碑为 NULL',
+    deleted BOOLEAN NOT NULL COMMENT '发布时刻记录是否为删除墓碑：TRUE 时业务字段无意义',
+    resolutions VARCHAR(4000) NOT NULL COMMENT '发布时刻全部冲突裁决摘要列表（JSON 数组原文，按解决时刻升序）',
+    quality_flags VARCHAR(512) NOT NULL COMMENT '质量标记列表（JSON 数组原文，按字典序排序；空数组表示无标记）',
+    operator VARCHAR(128) NOT NULL COMMENT '执行首次发布的操作者标识',
+    request_id VARCHAR(128) NOT NULL COMMENT '首次发布的请求标识（requestId）',
+    released_at_utc TIMESTAMP NOT NULL COMMENT '首次发布时刻（UTC）',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录落库时间（服务器时区）',
+    PRIMARY KEY (observation_id)
+);
+
+-- 披露附页表：首次发布后的每次更正（合并/裁决/删除）追加一行，不改写首次快照。
+CREATE TABLE IF NOT EXISTS disclosure_appendix (
+    observation_id VARCHAR(64) NOT NULL COMMENT '观测记录唯一标识',
+    seq INT NOT NULL COMMENT '附页序号，每簇从 1 开始单调递增',
+    version INT NOT NULL COMMENT '该附页对应的观测版本号',
+    location VARCHAR(512) NULL COMMENT '该附页观测地点快照；删除墓碑为 NULL',
+    reading VARCHAR(64) NULL COMMENT '该附页观测读数快照（十进制原文）；删除墓碑为 NULL',
+    note VARCHAR(1024) NULL COMMENT '该附页观测备注快照；删除墓碑为 NULL',
+    deleted BOOLEAN NOT NULL COMMENT '该附页是否为删除墓碑：TRUE 时业务字段无意义',
+    source_request_id VARCHAR(128) NOT NULL COMMENT '产生该附页的更正请求标识（requestId）',
+    recorded_at_utc TIMESTAMP NOT NULL COMMENT '附页记录时刻（UTC）',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录落库时间（服务器时区）',
+    PRIMARY KEY (observation_id, seq)
+);

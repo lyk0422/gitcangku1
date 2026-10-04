@@ -50,17 +50,26 @@ public class ObservationService {
     private final ObservationRepository observationRepository;
     private final RequestLogRepository requestLogRepository;
     private final ResolutionRepository resolutionRepository;
+    private final ConflictStateService conflictStateService;
+    private final EmbargoRepository embargoRepository;
+    private final DisclosureRepository disclosureRepository;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public ObservationService(ObservationRepository observationRepository,
                               RequestLogRepository requestLogRepository,
                               ResolutionRepository resolutionRepository,
+                              ConflictStateService conflictStateService,
+                              EmbargoRepository embargoRepository,
+                              DisclosureRepository disclosureRepository,
                               ObjectMapper objectMapper,
                               Clock clock) {
         this.observationRepository = observationRepository;
         this.requestLogRepository = requestLogRepository;
         this.resolutionRepository = resolutionRepository;
+        this.conflictStateService = conflictStateService;
+        this.embargoRepository = embargoRepository;
+        this.disclosureRepository = disclosureRepository;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -128,19 +137,25 @@ public class ObservationService {
                 request.reading(), conflictFields);
         String mergedNote = mergeField("note", base.note(), current.note(), request.note(), conflictFields);
         if (!conflictFields.isEmpty()) {
+            // 冲突状态在独立事务落库：不随本次 409 回滚，供禁运设置判定未解决冲突
+            conflictStateService.recordOpenConflict(observationId, conflictFields,
+                    request.baseVersion(), current.version(), request.requestId());
             throw ApiException.mergeConflict(conflictFields, current.version());
         }
 
         ObservationSnapshot merged = new ObservationSnapshot(observationId, current.version(),
                 mergedLocation, mergedReading, mergedNote, false);
         if (sameContent(merged, current)) {
-            // 合并结果与当前完全相同：返回当前版本，不加版本
+            // 合并结果与当前完全相同：返回当前版本，不加版本；此前的未解决冲突视为已消解
+            conflictStateService.clearOpenConflict(observationId);
             return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(current));
         }
         ObservationSnapshot next = new ObservationSnapshot(observationId, current.version() + 1,
                 mergedLocation, mergedReading, mergedNote, false);
         observationRepository.updateCurrent(next);
         observationRepository.insertVersion(next);
+        conflictStateService.clearOpenConflict(observationId);
+        recordAppendixIfReleased(observationId, next, request.requestId());
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(next));
     }
 
@@ -171,6 +186,8 @@ public class ObservationService {
                 null, null, null, true);
         observationRepository.markDeleted(observationId, tombstone.version());
         observationRepository.insertVersion(tombstone);
+        conflictStateService.clearOpenConflict(observationId);
+        recordAppendixIfReleased(observationId, tombstone, request.requestId());
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(tombstone));
     }
 
@@ -179,6 +196,7 @@ public class ObservationService {
      */
     @Transactional(readOnly = true)
     public ObservationResponse getCurrent(String observationId) {
+        checkPublicVisibility(observationId);
         ObservationSnapshot current = observationRepository.findCurrent(observationId)
                 .orElseThrow(() -> ApiException.notFound("observation not found: " + observationId));
         return ObservationResponse.of(current);
@@ -284,6 +302,13 @@ public class ObservationService {
             return completeResolve(request.requestId(), HttpStatus.OK, resolutionResponseOf(winner));
         }
 
+        conflictStateService.clearOpenConflict(observationId);
+        if (contentChanged) {
+            recordAppendixIfReleased(observationId,
+                    new ObservationSnapshot(observationId, newVersion,
+                            resolvedLocation, resolvedReading, resolvedNote, false),
+                    request.requestId());
+        }
         ObservationSnapshot pointed = contentChanged
                 ? new ObservationSnapshot(observationId, newVersion, resolvedLocation, resolvedReading, resolvedNote, false)
                 : current;
@@ -325,6 +350,7 @@ public class ObservationService {
      */
     @Transactional(readOnly = true)
     public ObservationResponse getVersion(String observationId, int version) {
+        checkPublicVisibility(observationId);
         ObservationSnapshot snapshot = observationRepository.findVersion(observationId, version)
                 .orElseThrow(() -> ApiException.notFound(
                         "version not found: " + observationId + "@" + version));
@@ -624,6 +650,45 @@ public class ObservationService {
         return ResolutionResponse.of(record, pointed, objectMapper);
     }
 
+    /**
+     * 授权证据查询：返回当前内容，不受禁运可见性限制；墓碑只返回删除状态和版本。
+     */
+    @Transactional(readOnly = true)
+    public ObservationResponse getEvidence(String observationId) {
+        ObservationSnapshot current = observationRepository.findCurrent(observationId)
+                .orElseThrow(() -> ApiException.notFound("observation not found: " + observationId));
+        return ObservationResponse.of(current);
+    }
+
+    /**
+     * 公开可见性检查：已设置禁运、当前时刻处于禁运区间（左闭右开，到达截止时刻即解禁）
+     * 且尚未生成披露快照时，公开查询不得返回簇内容，按不存在处理。
+     */
+    private void checkPublicVisibility(String observationId) {
+        Optional<EmbargoRecord> embargo = embargoRepository.find(observationId);
+        if (embargo.isPresent()
+                && Instant.now(clock).isBefore(embargo.get().embargoUntilUtc())
+                && disclosureRepository.findSnapshot(observationId).isEmpty()) {
+            throw ApiException.notFound("observation not found: " + observationId);
+        }
+    }
+
+    /**
+     * 首次发布后的更正进入附页：已生成披露快照时，把本次变更后的版本内容追加为不可变附页；
+     * 未发布时不做任何事。调用方须持有该簇观测行锁（在 merge/delete/resolve 写事务内调用）。
+     */
+    private void recordAppendixIfReleased(String observationId, ObservationSnapshot snapshot,
+                                          String sourceRequestId) {
+        if (disclosureRepository.findSnapshot(observationId).isEmpty()) {
+            return;
+        }
+        int seq = disclosureRepository.nextAppendixSeq(observationId);
+        disclosureRepository.insertAppendix(new AppendixRecord(observationId, seq, snapshot.version(),
+                snapshot.deleted() ? null : snapshot.location(),
+                snapshot.deleted() ? null : snapshot.reading(),
+                snapshot.deleted() ? null : snapshot.note(),
+                snapshot.deleted(), sourceRequestId, Instant.now(clock)));
+    }
     /**
      * 写操作结果：HTTP 状态码与响应体。
      */

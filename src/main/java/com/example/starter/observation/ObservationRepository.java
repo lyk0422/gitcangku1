@@ -102,4 +102,13 @@ public class ObservationRepository {
                 snapshot.observationId(), snapshot.version(), snapshot.location(),
                 snapshot.reading(), snapshot.note(), snapshot.deleted());
     }
+    /**
+     * 读取簇创建时刻（版本 1 快照的生成时间），用于禁运截止时刻不得早于簇创建的校验。
+     */
+    public Optional<java.time.Instant> findCreatedAt(String observationId) {
+        return jdbcTemplate.query(
+                        "SELECT created_at FROM observation_version WHERE observation_id = ? AND version = 1",
+                        (rs, rowNum) -> rs.getTimestamp("created_at").toInstant(), observationId)
+                .stream().findFirst();
+    }
 }

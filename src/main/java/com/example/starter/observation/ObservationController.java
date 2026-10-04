@@ -68,6 +68,13 @@ public class ObservationController {
     }
 
     /**
+     * 授权证据查询：返回当前内容，不受禁运公开可见性限制；墓碑只返回删除状态和版本。
+     */
+    @GetMapping("/{observationId}/evidence")
+    public ObservationResponse getEvidence(@PathVariable String observationId) {
+        return observationService.getEvidence(observationId);
+    }
+    /**
      * 查询指定历史版本；墓碑版本只返回删除状态和版本。
      */
     @GetMapping("/{observationId}/versions/{version}")
