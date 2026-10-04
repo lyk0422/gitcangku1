@@ -64,11 +64,26 @@ public final class Responses {
 
     /**
      * 处置任务视图：blockers 按阻塞事件键排序；doneBy/doneAt 仅 DONE 有值，
-     * cancelledBy/cancelledAt 仅 CANCELLED 有值。
+     * cancelledBy/cancelledAt 仅 CANCELLED 有值。version 为任务乐观锁版本；
+     * requiredEvidenceCategories 为当前必需证据类别（按类别名排序，未设置为为空列表）。
      */
     public record TaskView(String taskKey, String groupCode, String title, String status,
                            List<TaskBlockerView> blockers, String createdBy, Instant createdAt,
-                           String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt) {
+                           String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt,
+                           long version, List<String> requiredEvidenceCategories) {
+    }
+
+    /**
+     * 任务验收证据视图：confirmedBy/confirmedAt 仅 CONFIRMED 有值，
+     * voidedBy/voidedAt 仅 VOID 有值；任务 DONE 后内容与确认人冻结。
+     */
+    public record EvidenceView(String evidenceKey, String category, String note, String status,
+                               String uploadedBy, Instant uploadedAt, String confirmedBy,
+                               Instant confirmedAt, String voidedBy, Instant voidedAt) {
+    }
+
+    /** 任务证据列表视图：evidences 按上传顺序返回。 */
+    public record TaskEvidencesView(String taskKey, List<EvidenceView> evidences) {
     }
 
     /** 按事件分组的任务列表视图：tasks 按创建顺序返回。 */

@@ -83,14 +83,14 @@ class SchemaH2ScriptTest {
 
                 // 处置任务：(incident_id, task_key) 唯一
                 st.execute("INSERT INTO incident_tasks (incident_id, task_key, group_code, title,"
-                        + " status, created_by, created_at, updated_at) VALUES (1,'T-1','G','t',"
-                        + "'OPEN','alice','" + Timestamp.from(now) + "','" + Timestamp.from(now)
-                        + "')");
+                        + " status, version, created_by, created_at, updated_at) VALUES"
+                        + " (1,'T-1','G','t','OPEN',1,'alice','" + Timestamp.from(now) + "','"
+                        + Timestamp.from(now) + "')");
                 boolean duplicateTaskRejected = false;
                 try {
                     st.execute("INSERT INTO incident_tasks (incident_id, task_key, group_code,"
-                            + " title, status, created_by, created_at, updated_at) VALUES"
-                            + " (1,'T-1','G','t2','OPEN','alice','" + Timestamp.from(now) + "','"
+                            + " title, status, version, created_by, created_at, updated_at) VALUES"
+                            + " (1,'T-1','G','t2','OPEN',1,'alice','" + Timestamp.from(now) + "','"
                             + Timestamp.from(now) + "')");
                 } catch (Exception e) {
                     duplicateTaskRejected = true;
@@ -108,6 +108,48 @@ class SchemaH2ScriptTest {
                     duplicateBlockerRejected = true;
                 }
                 assertThat(duplicateBlockerRejected).isTrue();
+
+                // 必需证据类别：(task_id, category) 唯一
+                st.execute("INSERT INTO incident_task_evidence_requirements (task_id, category,"
+                        + " set_by, set_at) VALUES (1,'PHOTO','alice','" + Timestamp.from(now)
+                        + "')");
+                boolean duplicateRequirementRejected = false;
+                try {
+                    st.execute("INSERT INTO incident_task_evidence_requirements (task_id,"
+                            + " category, set_by, set_at) VALUES (1,'PHOTO','alice','"
+                            + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateRequirementRejected = true;
+                }
+                assertThat(duplicateRequirementRejected).isTrue();
+
+                // 验收证据：(task_id, evidence_key) 唯一；作废条件更新不作用于 VOID 终态
+                st.execute("INSERT INTO incident_task_evidences (task_id, evidence_key, category,"
+                        + " note, status, uploaded_by, uploaded_at, created_at, updated_at) VALUES"
+                        + " (1,'EV-1','PHOTO','n','UPLOADED','exec-1','" + Timestamp.from(now)
+                        + "','" + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                boolean duplicateEvidenceRejected = false;
+                try {
+                    st.execute("INSERT INTO incident_task_evidences (task_id, evidence_key,"
+                            + " category, note, status, uploaded_by, uploaded_at, created_at,"
+                            + " updated_at) VALUES (1,'EV-1','READING','n','UPLOADED','exec-1','"
+                            + Timestamp.from(now) + "','" + Timestamp.from(now) + "','"
+                            + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateEvidenceRejected = true;
+                }
+                assertThat(duplicateEvidenceRejected).isTrue();
+                int confirmed = st.executeUpdate("UPDATE incident_task_evidences SET"
+                        + " status='CONFIRMED', confirmed_by='acceptor-1', confirmed_at='"
+                        + Timestamp.from(now) + "' WHERE id = 1 AND status = 'UPLOADED'");
+                assertThat(confirmed).isEqualTo(1);
+                int voided = st.executeUpdate("UPDATE incident_task_evidences SET status='VOID',"
+                        + " voided_by='exec-1', voided_at='" + Timestamp.from(now)
+                        + "' WHERE id = 1 AND status <> 'VOID'");
+                assertThat(voided).isEqualTo(1);
+                int revoid = st.executeUpdate("UPDATE incident_task_evidences SET status='VOID'"
+                        + " WHERE id = 1 AND status <> 'VOID'");
+                assertThat(revoid).isZero();
             }
         }
     }

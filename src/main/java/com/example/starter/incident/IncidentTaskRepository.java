@@ -48,6 +48,7 @@ public class IncidentTaskRepository {
                 rs.getLong("id"), rs.getLong("incident_id"), rs.getString("task_key"),
                 rs.getString("group_code"), rs.getString("title"),
                 TaskStatus.valueOf(rs.getString("status")),
+                rs.getLong("version"),
                 rs.getString("created_by"), rs.getString("done_by"),
                 doneAt == null ? null : doneAt.toInstant(),
                 rs.getString("cancelled_by"),
@@ -70,21 +71,22 @@ public class IncidentTaskRepository {
         jdbc.update(con -> {
             var ps = con.prepareStatement(
                     "INSERT INTO incident_tasks (incident_id, task_key, group_code, title, status,"
-                            + " created_by, done_by, done_at, cancelled_by, cancelled_at,"
-                            + " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                            + " version, created_by, done_by, done_at, cancelled_by, cancelled_at,"
+                            + " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setLong(1, task.incidentId());
             ps.setString(2, task.taskKey());
             ps.setString(3, task.groupCode());
             ps.setString(4, task.title());
             ps.setString(5, task.status().name());
-            ps.setString(6, task.createdBy());
-            ps.setString(7, task.doneBy());
-            ps.setTimestamp(8, task.doneAt() == null ? null : Timestamp.from(task.doneAt()));
-            ps.setString(9, task.cancelledBy());
-            ps.setTimestamp(10, task.cancelledAt() == null ? null : Timestamp.from(task.cancelledAt()));
-            ps.setTimestamp(11, Timestamp.from(task.createdAt()));
-            ps.setTimestamp(12, Timestamp.from(task.updatedAt()));
+            ps.setLong(6, task.version());
+            ps.setString(7, task.createdBy());
+            ps.setString(8, task.doneBy());
+            ps.setTimestamp(9, task.doneAt() == null ? null : Timestamp.from(task.doneAt()));
+            ps.setString(10, task.cancelledBy());
+            ps.setTimestamp(11, task.cancelledAt() == null ? null : Timestamp.from(task.cancelledAt()));
+            ps.setTimestamp(12, Timestamp.from(task.createdAt()));
+            ps.setTimestamp(13, Timestamp.from(task.updatedAt()));
             return ps;
         }, keys);
         return keys.getKey().longValue();
@@ -130,7 +132,7 @@ public class IncidentTaskRepository {
      */
     public void markDone(long id, String actor, Instant at) {
         jdbc.update("UPDATE incident_tasks SET status = 'DONE', done_by = ?, done_at = ?,"
-                        + " updated_at = ? WHERE id = ?",
+                        + " version = version + 1, updated_at = ? WHERE id = ?",
                 actor, Timestamp.from(at), Timestamp.from(at), id);
     }
 
@@ -139,8 +141,16 @@ public class IncidentTaskRepository {
      */
     public void markCancelled(long id, String actor, Instant at) {
         jdbc.update("UPDATE incident_tasks SET status = 'CANCELLED', cancelled_by = ?,"
-                        + " cancelled_at = ?, updated_at = ? WHERE id = ?",
+                        + " cancelled_at = ?, version = version + 1, updated_at = ? WHERE id = ?",
                 actor, Timestamp.from(at), Timestamp.from(at), id);
+    }
+
+    /**
+     * 推进任务乐观锁版本（必需证据类别整体替换时调用），并刷新更新时间。
+     */
+    public void bumpVersion(long id, Instant at) {
+        jdbc.update("UPDATE incident_tasks SET version = version + 1, updated_at = ? WHERE id = ?",
+                Timestamp.from(at), id);
     }
 
     /**

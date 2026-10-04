@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS incident_status_history (
 CREATE TABLE IF NOT EXISTS command_keys (
     id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
     command_key VARCHAR(128) NOT NULL COMMENT '调用方幂等键，全局唯一',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：takeover/transfer_initiate/transfer_accept/action/status/escalation_check/escalation_ack/task_create/task_complete/task_cancel',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：takeover/transfer_initiate/transfer_accept/action/status/escalation_check/escalation_ack/task_create/task_complete/task_cancel/evidence_requirements/evidence_upload/evidence_confirm/evidence_void',
     request_hash VARCHAR(64) NOT NULL COMMENT '规范化请求参数的 SHA-256 摘要，用于同键改参检测',
     response_status INT NULL COMMENT '首次成功的 HTTP 状态码；事务提交前必写入',
     response_body MEDIUMTEXT NULL COMMENT '首次成功响应 JSON，用于同键同参重放',
@@ -79,6 +79,7 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     group_code VARCHAR(64) NOT NULL COMMENT '分组编码，非空',
     title VARCHAR(512) NOT NULL COMMENT '任务标题，非空',
     status VARCHAR(16) NOT NULL COMMENT '状态：OPEN 待处理 / DONE 已完成 / CANCELLED 已取消；仅允许 OPEN→DONE 或 OPEN→CANCELLED，DONE 与 CANCELLED 为终态',
+    version BIGINT NOT NULL COMMENT '任务乐观锁版本：创建为 1，必需证据类别变更与完成/取消各加 1；设置必需类别须提交 expectedTaskVersion 与之相等，否则 409',
     created_by VARCHAR(128) NOT NULL COMMENT '创建人（创建时的当前指挥人）',
     done_by VARCHAR(128) NULL COMMENT '完成人（操作时的当前指挥人）；仅 DONE 有值，否则为空',
     done_at TIMESTAMP(6) NULL COMMENT '完成 UTC 时间；仅 DONE 有值，否则为空',
@@ -100,3 +101,29 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY COMMENT '固定为 1 的单行锁；创建任务时 SELECT ... FOR UPDATE 持有，串行化环检测与写入，保证并发反向依赖最终图无环'
 ) COMMENT='任务依赖图全局锁表';
+CREATE TABLE IF NOT EXISTS incident_task_evidence_requirements (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    task_id BIGINT NOT NULL COMMENT '所属任务 id，关联 incident_tasks.id；仅当前指挥人可对 OPEN 任务设置，每次设置整体替换并推进任务版本',
+    category VARCHAR(64) NOT NULL COMMENT '必需证据类别（如 PHOTO/READING），任务内唯一；每任务 1~5 个',
+    set_by VARCHAR(128) NOT NULL COMMENT '设置人（设置时的当前指挥人）',
+    set_at TIMESTAMP(6) NOT NULL COMMENT '设置 UTC 时间',
+    CONSTRAINT uk_task_evidence_req UNIQUE (task_id, category)
+) COMMENT='任务必需证据类别表';
+
+CREATE TABLE IF NOT EXISTS incident_task_evidences (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    task_id BIGINT NOT NULL COMMENT '所属任务 id，关联 incident_tasks.id；任务完成（DONE）后证据冻结，禁止上传/确认/作废/覆盖',
+    evidence_key VARCHAR(128) NOT NULL COMMENT '证据业务编号，任务内唯一；同号同内容幂等，同号不同内容冲突',
+    category VARCHAR(64) NOT NULL COMMENT '证据类别，由调用方定义（如 PHOTO/READING）',
+    note VARCHAR(1024) NOT NULL COMMENT '证据说明',
+    status VARCHAR(16) NOT NULL COMMENT '状态：UPLOADED 已上传待确认 / CONFIRMED 已确认 / VOID 已作废；仅允许 UPLOADED→CONFIRMED 或 →VOID、CONFIRMED→VOID，VOID 为终态',
+    uploaded_by VARCHAR(128) NOT NULL COMMENT '上传人（执行者，X-Actor-Id）',
+    uploaded_at TIMESTAMP(6) NOT NULL COMMENT '上传 UTC 时间',
+    confirmed_by VARCHAR(128) NULL COMMENT '确认人（验收人，必须与上传人不同）；仅 CONFIRMED 有值，否则为空',
+    confirmed_at TIMESTAMP(6) NULL COMMENT '确认 UTC 时间；仅 CONFIRMED 有值，否则为空',
+    voided_by VARCHAR(128) NULL COMMENT '作废人（上传人或当前指挥人）；仅 VOID 有值，否则为空',
+    voided_at TIMESTAMP(6) NULL COMMENT '作废 UTC 时间；仅 VOID 有值，否则为空',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
+    updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间',
+    CONSTRAINT uk_task_evidence UNIQUE (task_id, evidence_key)
+) COMMENT='任务验收证据表';

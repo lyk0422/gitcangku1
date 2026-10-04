@@ -79,6 +79,7 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     group_code VARCHAR(64) NOT NULL,
     title VARCHAR(512) NOT NULL,
     status VARCHAR(16) NOT NULL,
+    version BIGINT NOT NULL,
     created_by VARCHAR(128) NOT NULL,
     done_by VARCHAR(128) NULL,
     done_at TIMESTAMP(6) NULL,
@@ -99,4 +100,30 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
+);
+CREATE TABLE IF NOT EXISTS incident_task_evidence_requirements (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    task_id BIGINT NOT NULL,
+    category VARCHAR(64) NOT NULL,
+    set_by VARCHAR(128) NOT NULL,
+    set_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_task_evidence_req UNIQUE (task_id, category)
+);
+
+CREATE TABLE IF NOT EXISTS incident_task_evidences (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    task_id BIGINT NOT NULL,
+    evidence_key VARCHAR(128) NOT NULL,
+    category VARCHAR(64) NOT NULL,
+    note VARCHAR(1024) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    uploaded_by VARCHAR(128) NOT NULL,
+    uploaded_at TIMESTAMP(6) NOT NULL,
+    confirmed_by VARCHAR(128) NULL,
+    confirmed_at TIMESTAMP(6) NULL,
+    voided_by VARCHAR(128) NULL,
+    voided_at TIMESTAMP(6) NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_task_evidence UNIQUE (task_id, evidence_key)
 );

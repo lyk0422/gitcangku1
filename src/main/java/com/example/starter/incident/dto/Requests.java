@@ -55,4 +55,25 @@ public final class Requests {
     /** 任务完成/取消请求，操作人由 X-Actor-Id 指定且须为当前指挥人。 */
     public record TaskActionRequest(String commandKey) {
     }
+
+    /**
+     * 必需证据类别设置请求：仅当前指挥人可对 OPEN 任务设置；categories 为 1~5 个
+     * 非空类别（重复按去重处理），每次设置整体替换；expectedTaskVersion 必须与
+     * 任务当前版本相等，否则 409。requestId 为调用方幂等键。
+     */
+    public record EvidenceRequirementRequest(String requestId, List<String> categories,
+                                             Long expectedTaskVersion) {
+    }
+
+    /**
+     * 证据上传请求：evidenceKey 任务内唯一；category、note 非空；
+     * 上传人由 X-Actor-Id 指定（执行者）。requestId 为调用方幂等键。
+     */
+    public record EvidenceUploadRequest(String requestId, String evidenceKey, String category,
+                                        String note) {
+    }
+
+    /** 证据确认/作废请求，操作人由 X-Actor-Id 指定。requestId 为调用方幂等键。 */
+    public record EvidenceActionRequest(String requestId) {
+    }
 }
