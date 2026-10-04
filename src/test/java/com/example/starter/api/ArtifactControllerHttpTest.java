@@ -35,10 +35,14 @@ class ArtifactControllerHttpTest {
 
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM lock_file_entry_capability");
+        jdbcTemplate.update("DELETE FROM lock_file_exclusion");
         jdbcTemplate.update("DELETE FROM lock_file_entry");
         jdbcTemplate.update("DELETE FROM lock_file");
+        jdbcTemplate.update("DELETE FROM artifact_capability");
         jdbcTemplate.update("DELETE FROM artifact_dependency");
         jdbcTemplate.update("DELETE FROM artifact");
+        jdbcTemplate.update("DELETE FROM capability_exclusion");
         jdbcTemplate.update("DELETE FROM idempotent_request");
         jdbcTemplate.update("UPDATE repository_state SET version = 0 WHERE id = 1");
     }
@@ -217,5 +221,143 @@ class ArtifactControllerHttpTest {
                 new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
                 JsonNode.class);
         assertThat(lockOnWithdrawn.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+    }
+
+    // ------------------------------------------------------------------
+    // 能力互斥：HTTP 入口
+    // ------------------------------------------------------------------
+
+    private String registerBodyWithCapabilities(String name, int version,
+                                                List<String> capabilities, Object... dependencies) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("name", name);
+        body.put("version", version);
+        body.put("dependencies", List.of(dependencies));
+        body.put("capabilities", capabilities);
+        return toJson(body);
+    }
+
+    private static String pairBody(String a, String b) {
+        return "{\"capabilityA\":\"" + a + "\",\"capabilityB\":\"" + b + "\"}";
+    }
+
+    @Test
+    void exclusionRuleWorkflowOverHttp() {
+        String rid = UUID.randomUUID().toString();
+        ResponseEntity<JsonNode> added = restTemplate.postForEntity("/api/capability-exclusions",
+                new HttpEntity<>(pairBody("red", "green"), jsonHeaders(rid)), JsonNode.class);
+        assertThat(added.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(added.getBody().path("capabilityA").asText()).isEqualTo("green");
+        assertThat(added.getBody().path("capabilityB").asText()).isEqualTo("red");
+        assertThat(added.getBody().path("active").asBoolean()).isTrue();
+        assertThat(added.getBody().path("repositoryVersion").asLong()).isEqualTo(1L);
+
+        // 同键同参重放：仍 201 且版本不变。
+        ResponseEntity<JsonNode> replay = restTemplate.postForEntity("/api/capability-exclusions",
+                new HttpEntity<>(pairBody("red", "green"), jsonHeaders(rid)), JsonNode.class);
+        assertThat(replay.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(replay.getBody().path("repositoryVersion").asLong()).isEqualTo(1L);
+
+        // 反向登记视为同一对：409。
+        ResponseEntity<JsonNode> duplicate = restTemplate.postForEntity("/api/capability-exclusions",
+                new HttpEntity<>(pairBody("green", "red"), jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(duplicate.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+
+        // 能力相同不互斥：400。
+        ResponseEntity<JsonNode> same = restTemplate.postForEntity("/api/capability-exclusions",
+                new HttpEntity<>(pairBody("red", "red"), jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(same.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+
+        ResponseEntity<JsonNode> list = restTemplate.getForEntity(
+                "/api/capability-exclusions", JsonNode.class);
+        assertThat(list.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(list.getBody()).hasSize(1);
+
+        // 撤销：200 且推进版本；再次撤销 404。
+        ResponseEntity<JsonNode> removed = restTemplate.postForEntity(
+                "/api/capability-exclusions/remove",
+                new HttpEntity<>(pairBody("green", "red"), jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(removed.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(removed.getBody().path("active").asBoolean()).isFalse();
+        assertThat(removed.getBody().path("repositoryVersion").asLong()).isEqualTo(2L);
+
+        ResponseEntity<JsonNode> missing = restTemplate.postForEntity(
+                "/api/capability-exclusions/remove",
+                new HttpEntity<>(pairBody("red", "green"), jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(missing.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+    }
+
+    @Test
+    void sameRequestIdWithDifferentOperatorReturns409() {
+        String rid = UUID.randomUUID().toString();
+        String body = registerBody("app", 1);
+        HttpHeaders alice = jsonHeaders(rid);
+        alice.set("X-Operator", "alice");
+        ResponseEntity<JsonNode> first = restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(body, alice), JsonNode.class);
+        assertThat(first.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+
+        HttpHeaders bob = jsonHeaders(rid);
+        bob.set("X-Operator", "bob");
+        ResponseEntity<JsonNode> conflict = restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(body, bob), JsonNode.class);
+        assertThat(conflict.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+    }
+
+    @Test
+    void capabilityConflictLockBacktracksOverHttp() {
+        // 合成场景：根提供 green，X2 提供 red，X1 提供 blue，red 与 green 互斥。
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBodyWithCapabilities("root", 1, List.of("green"),
+                        dependency("x", 1, 2)), jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBodyWithCapabilities("x", 2, List.of("red")),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBodyWithCapabilities("x", 1, List.of("blue")),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        restTemplate.postForEntity("/api/capability-exclusions",
+                new HttpEntity<>(pairBody("red", "green"), jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+
+        String lockBody = "{\"rootName\":\"root\",\"rootVersion\":1,\"expectedRepositoryVersion\":4}";
+        ResponseEntity<JsonNode> lock = restTemplate.postForEntity("/api/artifacts/locks",
+                new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(lock.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        long lockId = lock.getBody().path("id").asLong();
+        // 回退到 X1 并锁定 blue。
+        assertThat(lock.getBody().path("entries")).hasSize(2);
+        assertThat(lock.getBody().path("entries").get(1).path("name").asText()).isEqualTo("x");
+        assertThat(lock.getBody().path("entries").get(1).path("version").asInt()).isEqualTo(1);
+        assertThat(lock.getBody().path("entries").get(1).path("capabilities").get(0).asText())
+                .isEqualTo("blue");
+        assertThat(lock.getBody().path("exclusions")).hasSize(1);
+        assertThat(lock.getBody().path("exclusions").get(0).path("capabilityA").asText())
+                .isEqualTo("green");
+
+        // 新规则 blue<->green 推进版本到 5：旧锁文件不倒改，新锁定 422。
+        restTemplate.postForEntity("/api/capability-exclusions",
+                new HttpEntity<>(pairBody("blue", "green"), jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        ResponseEntity<JsonNode> oldLock = restTemplate.getForEntity(
+                "/api/artifacts/locks/{id}", JsonNode.class, lockId);
+        assertThat(oldLock.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(oldLock.getBody().path("exclusions")).hasSize(1);
+        assertThat(oldLock.getBody().path("entries").get(1).path("capabilities").get(0).asText())
+                .isEqualTo("blue");
+
+        String staleLockBody = "{\"rootName\":\"root\",\"rootVersion\":1,\"expectedRepositoryVersion\":5}";
+        ResponseEntity<JsonNode> infeasible = restTemplate.postForEntity("/api/artifacts/locks",
+                new HttpEntity<>(staleLockBody, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(infeasible.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+        assertThat(jdbcTemplate.queryForObject("SELECT COUNT(1) FROM lock_file", Integer.class))
+                .isEqualTo(1);
     }
 }

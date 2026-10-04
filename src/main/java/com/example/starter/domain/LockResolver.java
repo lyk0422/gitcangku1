@@ -1,7 +1,10 @@
 package com.example.starter.domain;
 
+import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
 
 /**
@@ -10,6 +13,10 @@ import java.util.TreeMap;
  * <p>规则：根版本固定；其余名称按字典序选择下一个尚未解析的依赖，
  * 候选版本从高到低尝试，遇冲突回退，取首个完整可行结果。
  * 已选制品之间必须互相满足区间约束，因此依赖图存在环时也会被正确校验。
+ *
+ * <p>能力互斥：已选制品（含根）声明的能力集合中，只要同时出现一对
+ * 互斥能力即不可行，同一制品内部声明了两个互斥能力同样不可行；
+ * 冲突时按候选版本降序继续回退，而不是直接判定失败。
  */
 public final class LockResolver {
 
@@ -19,7 +26,7 @@ public final class LockResolver {
     /**
      * 求解锁定组合。
      *
-     * @param snapshot    一致性仓库快照（每名称版本按版本号降序）
+     * @param snapshot    一致性仓库快照（每名称版本按版本号降序，含互斥规则）
      * @param rootName    根制品名称
      * @param rootVersion 根制品精确版本（必须存在且未撤回，由调用方保证）
      * @return 名称 -> 精确版本（名称升序）；全部组合不可行时返回 null
@@ -43,7 +50,11 @@ public final class LockResolver {
         if (!satisfiesChosen(root, chosen)) {
             return null;
         }
-        if (solve(all, chosen)) {
+        // 根自身声明的能力就可能已构成互斥冲突。
+        if (!capabilitiesCompatible(chosen.values(), snapshot.exclusions())) {
+            return null;
+        }
+        if (solve(all, chosen, snapshot.exclusions())) {
             TreeMap<String, Integer> result = new TreeMap<>();
             chosen.forEach((name, artifact) -> result.put(name, artifact.version()));
             return result;
@@ -55,7 +66,8 @@ public final class LockResolver {
      * 递归回溯：选出字典序最小的未解析依赖名称，从高到低尝试候选版本。
      */
     private static boolean solve(Map<String, List<ArtifactVersion>> all,
-                                 TreeMap<String, ArtifactVersion> chosen) {
+                                 TreeMap<String, ArtifactVersion> chosen,
+                                 Set<CapabilityPair> exclusions) {
         // 汇总所有已选制品对“尚未解析名称”的区间约束，取交集。
         String next = null;
         int lo = Integer.MAX_VALUE;
@@ -96,7 +108,8 @@ public final class LockResolver {
                 continue;
             }
             chosen.put(next, candidate);
-            if (solve(all, chosen)) {
+            // 能力互斥：与已选制品合并后的能力集合不得包含任何互斥对。
+            if (capabilitiesCompatible(chosen.values(), exclusions) && solve(all, chosen, exclusions)) {
                 return true;
             }
             chosen.remove(next);
@@ -115,6 +128,26 @@ public final class LockResolver {
                 continue;
             }
             if (selected.version() < dep.minimumVersion() || selected.version() > dep.maximumVersion()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * 校验一组已选制品的能力合集不包含任何互斥对（含同一制品内部自冲突）。
+     */
+    private static boolean capabilitiesCompatible(Collection<ArtifactVersion> artifacts,
+                                                  Set<CapabilityPair> exclusions) {
+        if (exclusions.isEmpty()) {
+            return true;
+        }
+        Set<String> provided = new HashSet<>();
+        for (ArtifactVersion artifact : artifacts) {
+            provided.addAll(artifact.capabilities());
+        }
+        for (CapabilityPair pair : exclusions) {
+            if (provided.contains(pair.first()) && provided.contains(pair.second())) {
                 return false;
             }
         }

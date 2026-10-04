@@ -81,8 +81,62 @@ CREATE TABLE IF NOT EXISTS idempotent_request (
 );
 COMMENT ON TABLE idempotent_request IS '写操作幂等记录，仅保存成功请求；失败不占键';
 COMMENT ON COLUMN idempotent_request.request_id IS '客户端提供的全局唯一请求 ID';
-COMMENT ON COLUMN idempotent_request.operation IS '操作类型：REGISTER_ARTIFACT/WITHDRAW_ARTIFACT/CREATE_LOCK';
+COMMENT ON COLUMN idempotent_request.operation IS '操作类型：REGISTER_ARTIFACT/WITHDRAW_ARTIFACT/CREATE_LOCK/ADD_EXCLUSION/REMOVE_EXCLUSION';
 COMMENT ON COLUMN idempotent_request.request_hash IS '规范化请求参数的 SHA-256 摘要，异参重放用于冲突判定';
 COMMENT ON COLUMN idempotent_request.http_status IS '原成功响应 HTTP 状态码';
 COMMENT ON COLUMN idempotent_request.response_json IS '原成功响应 JSON，重放时原样返回';
 COMMENT ON COLUMN idempotent_request.created_at IS '首次成功提交时间，UTC 时间戳';
+
+-- 能力声明与互斥规则：制品版本可声明 0~3 个能力名（登记后不可改）；
+-- 互斥规则为无序能力对，全库最多 10 对，新增或撤销均推进仓库版本号。
+
+CREATE TABLE IF NOT EXISTS artifact_capability (
+    id           BIGINT AUTO_INCREMENT PRIMARY KEY,
+    artifact_id  BIGINT       NOT NULL,
+    capability   VARCHAR(128) NOT NULL,
+    CONSTRAINT fk_cap_artifact FOREIGN KEY (artifact_id) REFERENCES artifact (id)
+);
+COMMENT ON TABLE artifact_capability IS '制品版本声明的能力名，每个版本 0~3 个，登记后不可改';
+COMMENT ON COLUMN artifact_capability.artifact_id IS '所属制品版本 ID';
+COMMENT ON COLUMN artifact_capability.capability IS '能力名，同一制品版本内唯一';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_cap_artifact ON artifact_capability (artifact_id, capability);
+
+CREATE TABLE IF NOT EXISTS capability_exclusion (
+    id           BIGINT AUTO_INCREMENT PRIMARY KEY,
+    capability_a VARCHAR(128) NOT NULL,
+    capability_b VARCHAR(128) NOT NULL,
+    created_at   TIMESTAMP(6) NOT NULL
+);
+COMMENT ON TABLE capability_exclusion IS '互斥能力对（无序，capability_a 字典序小于 capability_b 规范化存储），全库最多 10 对';
+COMMENT ON COLUMN capability_exclusion.capability_a IS '互斥对中字典序较小的能力名';
+COMMENT ON COLUMN capability_exclusion.capability_b IS '互斥对中字典序较大的能力名';
+COMMENT ON COLUMN capability_exclusion.created_at IS '规则登记时间，UTC 时间戳';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_exclusion_pair ON capability_exclusion (capability_a, capability_b);
+
+CREATE TABLE IF NOT EXISTS lock_file_entry_capability (
+    id         BIGINT AUTO_INCREMENT PRIMARY KEY,
+    entry_id   BIGINT       NOT NULL,
+    capability VARCHAR(128) NOT NULL,
+    CONSTRAINT fk_lec_entry FOREIGN KEY (entry_id) REFERENCES lock_file_entry (id)
+);
+COMMENT ON TABLE lock_file_entry_capability IS '锁文件条目冻结的能力名：锁定成功时从制品快照复制，之后不随仓库变化';
+COMMENT ON COLUMN lock_file_entry_capability.entry_id IS '所属锁文件条目 ID';
+COMMENT ON COLUMN lock_file_entry_capability.capability IS '该条目制品在锁定时声明的能力名';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_lec_entry_cap ON lock_file_entry_capability (entry_id, capability);
+
+CREATE TABLE IF NOT EXISTS lock_file_exclusion (
+    id           BIGINT AUTO_INCREMENT PRIMARY KEY,
+    lock_file_id BIGINT       NOT NULL,
+    capability_a VARCHAR(128) NOT NULL,
+    capability_b VARCHAR(128) NOT NULL,
+    CONSTRAINT fk_lfe_lock FOREIGN KEY (lock_file_id) REFERENCES lock_file (id)
+);
+COMMENT ON TABLE lock_file_exclusion IS '锁文件冻结的互斥规则快照：锁定成功时复制当时的全部规则，新规则不倒改旧锁文件';
+COMMENT ON COLUMN lock_file_exclusion.lock_file_id IS '所属锁文件 ID';
+COMMENT ON COLUMN lock_file_exclusion.capability_a IS '冻结规则中字典序较小的能力名';
+COMMENT ON COLUMN lock_file_exclusion.capability_b IS '冻结规则中字典序较大的能力名';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_lfe_lock_pair ON lock_file_exclusion (lock_file_id, capability_a, capability_b);
