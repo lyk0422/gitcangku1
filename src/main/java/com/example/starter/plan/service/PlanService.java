@@ -5,8 +5,13 @@ import com.example.starter.plan.model.Occupancy;
 import com.example.starter.plan.model.PlanStatus;
 import com.example.starter.plan.model.PublishedSlot;
 import com.example.starter.plan.model.RescheduleLink;
+import com.example.starter.plan.model.SectionProfile;
+import com.example.starter.plan.model.TractionMode;
+import com.example.starter.plan.model.TractionSnapshot;
+import com.example.starter.plan.model.TrainTraction;
 import com.example.starter.plan.repo.IdempotencyRepository;
 import com.example.starter.plan.repo.PlanRepository;
+import com.example.starter.plan.repo.TractionRepository;
 import com.example.starter.plan.web.ApiException;
 import com.example.starter.plan.web.dto.CreatePlanRequest;
 import com.example.starter.plan.web.dto.OccupancyRequest;
@@ -17,6 +22,7 @@ import com.example.starter.plan.web.dto.RescheduleChainItem;
 import com.example.starter.plan.web.dto.RescheduleChainResponse;
 import com.example.starter.plan.web.dto.RescheduleRequest;
 import com.example.starter.plan.web.dto.RescheduleResponse;
+import com.example.starter.plan.web.dto.TractionSnapshotView;
 import com.example.starter.plan.web.dto.UpdateOccupanciesRequest;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.nio.charset.StandardCharsets;
@@ -28,6 +34,7 @@ import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -59,13 +66,16 @@ public class PlanService {
     private static final String OP_RESCHEDULE = "RESCHEDULE";
 
     private final PlanRepository planRepo;
+    private final TractionRepository tractionRepo;
     private final IdempotencyRepository idemRepo;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate tx;
 
-    public PlanService(PlanRepository planRepo, IdempotencyRepository idemRepo,
+    public PlanService(PlanRepository planRepo, TractionRepository tractionRepo,
+                       IdempotencyRepository idemRepo,
                        ObjectMapper objectMapper, PlatformTransactionManager txManager) {
         this.planRepo = planRepo;
+        this.tractionRepo = tractionRepo;
         this.idemRepo = idemRepo;
         this.objectMapper = objectMapper;
         this.tx = new TransactionTemplate(txManager);
@@ -161,8 +171,10 @@ public class PlanService {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "存在时隙冲突，计划保持草稿", conflicts);
                 }
+                List<TractionSnapshot> snapshots = checkTraction(plan.id(), occupancies);
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(plan.id(), PlanStatus.PUBLISHED, now);
+                tractionRepo.insertSnapshots(snapshots);
                 PlanResponse response = loadPlan(scheduleKey);
                 idemRepo.insert(OP_PUBLISH, requestKey, hash, toJson(response), now);
                 return response;
@@ -260,10 +272,12 @@ public class PlanService {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "新草稿存在时隙冲突，改签未生效", conflicts);
                 }
+                List<TractionSnapshot> snapshots = checkTraction(newPlan.id(), occupancies);
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(oldPlan.id(), PlanStatus.CANCELLED, now);
                 planRepo.updateStatus(newPlan.id(), PlanStatus.PUBLISHED, now);
                 planRepo.insertRescheduleLink(oldPlan.id(), newPlan.id(), now);
+                tractionRepo.insertSnapshots(snapshots);
                 RescheduleResponse response = new RescheduleResponse(
                         loadPlan(oldScheduleKey), loadPlan(req.newScheduleKey()));
                 idemRepo.insert(OP_RESCHEDULE, req.requestKey(), hash, toJson(response), now);
@@ -341,8 +355,12 @@ public class PlanService {
         List<OccupancyView> views = planRepo.findOccupancies(plan.id()).stream()
                 .map(o -> new OccupancyView(o.trainNo(), o.sectionId(), o.startUtc(), o.endUtc()))
                 .toList();
+        List<TractionSnapshotView> snapshots = tractionRepo.findSnapshots(plan.id()).stream()
+                .map(s -> new TractionSnapshotView(s.trainNo(), s.tractionMode().name(),
+                        s.sectionId(), s.electrified(), s.dieselAllowed(), s.sectionVersion()))
+                .toList();
         return new PlanResponse(plan.scheduleKey(), plan.opDate(), plan.version(),
-                plan.status().name(), views);
+                plan.status().name(), views, snapshots);
     }
 
     private List<Occupancy> toOccupancies(long planId, List<OccupancyRequest> requests) {
@@ -553,5 +571,58 @@ public class PlanService {
 
     private ApiException conflict(String code, String message) {
         return new ApiException(HttpStatus.CONFLICT, code, message);
+    }
+
+    /**
+     * 牵引适配检查：按占用涉及的全部区段校验，电力车要求全程供电，柴油车要求全程允许柴油。
+     * 档案缺失或任一区段不适配抛 422（明细携带区段号），计划与全部时隙保持不变；
+     * 全部适配时返回发布事务内待冻结的牵引快照（牵引方式与每段档案值、版本）。
+     */
+    private List<TractionSnapshot> checkTraction(long planId, List<Occupancy> occupancies) {
+        Map<String, Optional<TrainTraction>> trains = new HashMap<>();
+        Map<String, Optional<SectionProfile>> sections = new HashMap<>();
+        List<Map<String, Object>> violations = new ArrayList<>();
+        List<TractionSnapshot> snapshots = new ArrayList<>();
+        for (Occupancy o : occupancies) {
+            Optional<TrainTraction> traction = trains.computeIfAbsent(o.trainNo(),
+                    tractionRepo::findTrainTraction);
+            Optional<SectionProfile> profile = sections.computeIfAbsent(o.sectionId(),
+                    tractionRepo::findSectionProfile);
+            if (traction.isEmpty()) {
+                Map<String, Object> detail = new LinkedHashMap<>();
+                detail.put("type", "TRAIN_PROFILE_MISSING");
+                detail.put("trainNo", o.trainNo());
+                violations.add(detail);
+                continue;
+            }
+            if (profile.isEmpty()) {
+                Map<String, Object> detail = new LinkedHashMap<>();
+                detail.put("type", "SECTION_PROFILE_MISSING");
+                detail.put("sectionId", o.sectionId());
+                violations.add(detail);
+                continue;
+            }
+            TractionMode mode = traction.get().tractionMode();
+            SectionProfile section = profile.get();
+            boolean compatible = mode == TractionMode.ELECTRIC
+                    ? section.electrified() : section.dieselAllowed();
+            if (!compatible) {
+                Map<String, Object> detail = new LinkedHashMap<>();
+                detail.put("type", "TRACTION_INCOMPATIBLE");
+                detail.put("trainNo", o.trainNo());
+                detail.put("tractionMode", mode.name());
+                detail.put("sectionId", o.sectionId());
+                violations.add(detail);
+                continue;
+            }
+            snapshots.add(new TractionSnapshot(planId, o.seq(), o.trainNo(), mode,
+                    o.sectionId(), section.electrified(), section.dieselAllowed(),
+                    section.version()));
+        }
+        if (!violations.isEmpty()) {
+            throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "TRACTION_CHECK_FAILED",
+                    "牵引档案缺失或区段不适配，计划保持草稿", violations);
+        }
+        return snapshots;
     }
 }

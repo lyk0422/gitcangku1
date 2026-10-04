@@ -6,6 +6,11 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import com.example.starter.plan.model.TractionMode;
+import com.example.starter.plan.service.TractionService;
+import com.example.starter.plan.web.ApiException;
+import com.example.starter.plan.web.dto.CreateSectionProfileRequest;
+import com.example.starter.plan.web.dto.UpsertTrainTractionRequest;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.time.Instant;
@@ -36,6 +41,9 @@ class PlanRescheduleApiTest {
 
     @Autowired
     private ObjectMapper objectMapper;
+
+    @Autowired
+    private TractionService tractionService;
 
     // ---------- 主流程 ----------
 
@@ -462,9 +470,24 @@ class PlanRescheduleApiTest {
         return instant.toString();
     }
 
-    private static String occ(String train, String section, String startIso, String endIso) {
+    private String occ(String train, String section, String startIso, String endIso) {
+        ensureProfiles(train, section);
         return "{\"trainNo\":\"" + train + "\",\"sectionId\":\"" + section
                 + "\",\"startUtc\":\"" + startIso + "\",\"endUtc\":\"" + endIso + "\"}";
+    }
+
+    /**
+     * 确保列车与区段牵引档案存在：电力车，区段供电且允许柴油，保证既有发布/改签流程合法。
+     */
+    private void ensureProfiles(String trainNo, String sectionId) {
+        tractionService.upsertTrainTraction(trainNo,
+                new UpsertTrainTractionRequest(key("REQ"), "test", TractionMode.ELECTRIC));
+        try {
+            tractionService.createSectionProfile(new CreateSectionProfileRequest(
+                    key("REQ"), "test", sectionId, true, true));
+        } catch (ApiException e) {
+            assertThat(e.code()).isEqualTo("SECTION_PROFILE_EXISTS");
+        }
     }
 
     private static String createBody(String requestKey, String scheduleKey, String... occupancies) {

@@ -2,9 +2,13 @@ package com.example.starter.plan;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.example.starter.plan.model.TractionMode;
 import com.example.starter.plan.service.PlanService;
+import com.example.starter.plan.service.TractionService;
 import com.example.starter.plan.web.ApiException;
 import com.example.starter.plan.web.dto.CreatePlanRequest;
+import com.example.starter.plan.web.dto.CreateSectionProfileRequest;
+import com.example.starter.plan.web.dto.UpsertTrainTractionRequest;
 import com.example.starter.plan.web.dto.OccupancyRequest;
 import com.example.starter.plan.web.dto.RescheduleChainResponse;
 import com.example.starter.plan.web.dto.RescheduleRequest;
@@ -41,6 +45,9 @@ class PlanRescheduleConcurrencyTest {
 
     @Autowired
     private JdbcTemplate jdbc;
+
+    @Autowired
+    private TractionService tractionService;
 
     @Test
     void concurrentRescheduleSameOldPlanOnlyOneSucceeds() throws Exception {
@@ -161,9 +168,24 @@ class PlanRescheduleConcurrencyTest {
     }
 
     private void createDraft(String scheduleKey, String section, int startHour, int endHour) {
+        String trainNo = "G-" + UUID.randomUUID();
+        ensureProfiles(trainNo, section);
         service.createDraft(new CreatePlanRequest(key("REQ"), scheduleKey, DAY,
-                List.of(new OccupancyRequest("G-" + UUID.randomUUID(), section,
-                        at(startHour), at(endHour)))));
+                List.of(new OccupancyRequest(trainNo, section, at(startHour), at(endHour)))));
+    }
+
+    /**
+     * 确保列车与区段牵引档案存在：电力车，区段供电且允许柴油，保证既有发布/改签流程合法。
+     */
+    private void ensureProfiles(String trainNo, String sectionId) {
+        tractionService.upsertTrainTraction(trainNo,
+                new UpsertTrainTractionRequest(key("REQ"), "test", TractionMode.ELECTRIC));
+        try {
+            tractionService.createSectionProfile(new CreateSectionProfileRequest(
+                    key("REQ"), "test", sectionId, true, true));
+        } catch (ApiException e) {
+            assertThat(e.code()).isEqualTo("SECTION_PROFILE_EXISTS");
+        }
     }
 
     private List<Outcome> runConcurrently(List<Callable<Outcome>> tasks) throws Exception {
