@@ -1,7 +1,11 @@
 package com.example.starter.service;
 
 import com.example.starter.api.ApiException;
+import com.example.starter.api.PermitConflictException;
 import com.example.starter.api.dto.MutationResponse;
+import com.example.starter.api.dto.PermitCreateRequest;
+import com.example.starter.api.dto.PermitResult;
+import com.example.starter.api.dto.PermitRevokeRequest;
 import com.example.starter.api.dto.ReviewRequest;
 import com.example.starter.api.dto.ReviewResultDto;
 import com.example.starter.api.dto.RouteCreateRequest;
@@ -12,6 +16,8 @@ import com.example.starter.api.dto.ZoneCreateRequest;
 import com.example.starter.api.dto.ZoneResult;
 import com.example.starter.api.dto.ZoneRevokeRequest;
 import com.example.starter.domain.Geometry;
+import com.example.starter.domain.MovingSeparation;
+import com.example.starter.domain.PermitStatus;
 import com.example.starter.domain.Point;
 import com.example.starter.domain.ReviewConclusion;
 import com.example.starter.domain.ZoneStatus;
@@ -19,6 +25,8 @@ import com.example.starter.repo.AirspaceRepository;
 import com.example.starter.repo.DedupPo;
 import com.example.starter.repo.ReviewPo;
 import com.example.starter.repo.ReviewRepository;
+import com.example.starter.repo.PermitPo;
+import com.example.starter.repo.PermitRepository;
 import com.example.starter.repo.RoutePo;
 import com.example.starter.repo.RouteRepository;
 import com.example.starter.repo.ZonePo;
@@ -64,10 +72,16 @@ public class AirspaceReviewService {
     static final String KIND_ROUTE_CREATE = "ROUTE_CREATE";
     static final String KIND_ROUTE_REPLACE = "ROUTE_REPLACE";
     static final String KIND_REVIEW = "REVIEW";
+    static final String KIND_PERMIT_CREATE = "PERMIT_CREATE";
+    static final String KIND_PERMIT_REVOKE = "PERMIT_REVOKE";
+
+    /** 同时有效的活动许可上限。 */
+    static final int MAX_ACTIVE_PERMITS = 20;
 
     private final AirspaceRepository airspaceRepo;
     private final RouteRepository routeRepo;
     private final ReviewRepository reviewRepo;
+    private final PermitRepository permitRepo;
     private final ObjectMapper objectMapper;
     private final Clock clock;
     private final TransactionTemplate txTemplate;
@@ -75,12 +89,14 @@ public class AirspaceReviewService {
     public AirspaceReviewService(AirspaceRepository airspaceRepo,
                                  RouteRepository routeRepo,
                                  ReviewRepository reviewRepo,
+                                 PermitRepository permitRepo,
                                  ObjectMapper objectMapper,
                                  Clock clock,
                                  PlatformTransactionManager transactionManager) {
         this.airspaceRepo = airspaceRepo;
         this.routeRepo = routeRepo;
         this.reviewRepo = reviewRepo;
+        this.permitRepo = permitRepo;
         this.objectMapper = objectMapper;
         this.clock = clock;
         this.txTemplate = new TransactionTemplate(transactionManager);
@@ -266,7 +282,10 @@ public class AirspaceReviewService {
                     new ApiException(HttpStatus.CONFLICT, "RESOURCE_CONFLICT",
                             "并发资源冲突，请稍后使用相同 requestId 与参数重试"));
         } catch (ApiException api) {
-            if (api.status() == HttpStatus.CONFLICT) {
+            // 409 与 422 都可能是同键并发落败后读到赢家已提交状态的结果
+            // （例如许可申请在协调锁上等待后撞见赢家的冲突许可），需赛后裁决
+            if (api.status() == HttpStatus.CONFLICT
+                    || api.status() == HttpStatus.UNPROCESSABLE_ENTITY) {
                 return resolveAfterRace(requestId, kind, paramHash, api);
             }
             throw api;
@@ -394,5 +413,128 @@ public class AirspaceReviewService {
             return array;
         }
         return node;
+    }
+
+    // ============================ 运动间隔许可 ============================
+
+    /**
+     * 新增两点匀速航线的运动间隔许可。
+     *
+     * <p>与禁飞区创建/撤销共用协调锁：持锁后读取的空域版本、全部有效禁飞区、
+     * 航线版本与全部已提交许可来自同一个一致状态；并发许可申请因此被串行化，
+     * 互相冲突的申请至多有一个能保存。</p>
+     *
+     * <p>距离不足 10 米（恰好 10 米合法）时抛 422 并返回冲突许可 ID，不新增许可；
+     * 轨迹快照在许可时固定，航线后续替换不移动已许可轨迹。</p>
+     */
+    public MutationResponse createPermit(PermitCreateRequest request) {
+        return withIdempotency(request.requestId(), KIND_PERMIT_CREATE, canonicalHash(request), () -> {
+            if (request.startEpochSec() >= request.endEpochSec()) {
+                throw new ApiException(HttpStatus.BAD_REQUEST, "INVALID_PERMIT_INTERVAL",
+                        "有效区间必须满足 startEpochSec < endEpochSec（左闭右开，UTC 整秒）");
+            }
+            // 先锁空域版本行：与任何区域创建/撤销及其他许可审查事务互斥
+            long globalVersion = airspaceRepo.getGlobalVersionForUpdate();
+            // 再锁航线行：与航线替换事务互斥，保证版本号与点列一致
+            RoutePo route = routeRepo.findRouteForUpdate(request.routeId());
+            if (route == null) {
+                throw new ApiException(HttpStatus.NOT_FOUND, "ROUTE_NOT_FOUND",
+                        "航线不存在: " + request.routeId());
+            }
+            if (route.version() != request.routeVersion()) {
+                throw new ApiException(HttpStatus.CONFLICT, "VERSION_CONFLICT",
+                        "航线版本不是当前版本：submitted=" + request.routeVersion()
+                                + ", current=" + route.version());
+            }
+            if (globalVersion != request.airspaceVersion()) {
+                throw new ApiException(HttpStatus.CONFLICT, "VERSION_CONFLICT",
+                        "空域版本不是当前版本：submitted=" + request.airspaceVersion()
+                                + ", current=" + globalVersion);
+            }
+            if (route.points().size() != 2) {
+                throw new ApiException(HttpStatus.BAD_REQUEST, "ROUTE_NOT_TWO_POINT",
+                        "运动间隔许可只支持两点航线，当前点数: " + route.points().size());
+            }
+            // 原禁飞审查：许可轨迹（两点连线）不得命中任何有效禁飞区
+            List<ZonePo> activeZones = airspaceRepo.findActiveZones();
+            Set<String> hits = new TreeSet<>();
+            for (ZonePo zone : activeZones) {
+                if (Geometry.polylineHitsRectangle(route.points(),
+                        zone.xMin(), zone.yMin(), zone.xMax(), zone.yMax())) {
+                    hits.add(zone.zoneId());
+                }
+            }
+            if (!hits.isEmpty()) {
+                throw new ApiException(HttpStatus.CONFLICT, "PERMIT_ZONE_BLOCKED",
+                        "许可航线命中有效禁飞区: " + new ArrayList<>(hits));
+            }
+            if (permitRepo.countActivePermits() >= MAX_ACTIVE_PERMITS) {
+                throw new ApiException(HttpStatus.CONFLICT, "PERMIT_LIMIT_EXCEEDED",
+                        "活动许可已达上限 " + MAX_ACTIVE_PERMITS + " 条");
+            }
+            Point start = route.points().get(0);
+            Point end = route.points().get(1);
+            // 与全部仍有占用的许可在共同有效区间内做解析式最小距离判定
+            Set<String> conflicts = new TreeSet<>();
+            for (PermitPo other : permitRepo.findAllPermits()) {
+                if (!other.hasOccupancy()) {
+                    continue;
+                }
+                if (!MovingSeparation.isSafe(
+                        start.x(), start.y(), end.x(), end.y(),
+                        request.startEpochSec(), request.endEpochSec(),
+                        other.startX(), other.startY(), other.endX(), other.endY(),
+                        other.startEpochSec(), other.effectiveEndEpochSec())) {
+                    conflicts.add(other.permitId());
+                }
+            }
+            if (!conflicts.isEmpty()) {
+                throw new PermitConflictException(new ArrayList<>(conflicts));
+            }
+            String permitId = "pm_" + UUID.randomUUID();
+            PermitPo po = new PermitPo(permitId, request.routeId(), route.version(), globalVersion,
+                    request.startEpochSec(), request.endEpochSec(),
+                    start.x(), start.y(), end.x(), end.y(),
+                    PermitStatus.ACTIVE.name(), null, request.requestId(), nowMillis());
+            permitRepo.insertPermit(po);
+            return new MutationResponse(request.requestId(), false, toPermitResult(po));
+        });
+    }
+
+    /** 撤销许可：释放未来占用，历史轨迹保留；只能撤销一次。 */
+    public MutationResponse revokePermit(PermitRevokeRequest request) {
+        return withIdempotency(request.requestId(), KIND_PERMIT_REVOKE, canonicalHash(request), () -> {
+            PermitPo permit = permitRepo.findPermit(request.permitId());
+            if (permit == null) {
+                throw new ApiException(HttpStatus.NOT_FOUND, "PERMIT_NOT_FOUND",
+                        "许可不存在: " + request.permitId());
+            }
+            long revokedAt = clock.instant().getEpochSecond();
+            // 条件更新兜底并发撤销：0 行说明已被其他事务撤销
+            int updated = permitRepo.markRevoked(request.permitId(), revokedAt);
+            if (updated == 0) {
+                throw new ApiException(HttpStatus.CONFLICT, "PERMIT_ALREADY_REVOKED",
+                        "许可已撤销: " + request.permitId());
+            }
+            return new MutationResponse(request.requestId(), false,
+                    new PermitResult(permit.permitId(), permit.routeId(), permit.routeVersion(),
+                            permit.airspaceVersion(), permit.startEpochSec(), permit.endEpochSec(),
+                            PermitStatus.REVOKED.name(), revokedAt));
+        });
+    }
+
+    /** 按 permitId 查询许可（含已撤销的历史轨迹快照）。 */
+    public PermitResult getPermit(String permitId) {
+        PermitPo po = permitRepo.findPermit(permitId);
+        if (po == null) {
+            throw new ApiException(HttpStatus.NOT_FOUND, "PERMIT_NOT_FOUND",
+                    "许可不存在: " + permitId);
+        }
+        return toPermitResult(po);
+    }
+
+    private static PermitResult toPermitResult(PermitPo po) {
+        return new PermitResult(po.permitId(), po.routeId(), po.routeVersion(), po.airspaceVersion(),
+                po.startEpochSec(), po.endEpochSec(), po.status(), po.revokedEpochSec());
     }
 }

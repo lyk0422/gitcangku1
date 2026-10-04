@@ -67,3 +67,23 @@ CREATE TABLE IF NOT EXISTS request_dedup (
     response_json  CLOB NOT NULL COMMENT '首次成功响应 JSON，重放时原样返回',
     created_at     BIGINT NOT NULL COMMENT '首次成功时间，epoch 毫秒（UTC）'
 ) COMMENT = '写操作幂等去重记录（与业务变更同事务原子提交）';
+
+
+-- 运动间隔许可：引用两点航线的明确版本，在 [start_epoch_sec, end_epoch_sec)（左闭右开，UTC 整秒）
+-- 内沿直线匀速运动；轨迹快照在许可时固定，航线后续替换不移动已许可轨迹
+CREATE TABLE IF NOT EXISTS permit (
+    permit_id         VARCHAR(64) PRIMARY KEY COMMENT '许可唯一标识（不可变）',
+    route_id          VARCHAR(64) NOT NULL COMMENT '引用的航线标识',
+    route_version     INT NOT NULL COMMENT '许可时明确引用的航线版本；航线替换不影响本许可轨迹',
+    airspace_version  BIGINT NOT NULL COMMENT '许可审查通过时的全局空域版本',
+    start_epoch_sec   BIGINT NOT NULL COMMENT '有效起点（含），UTC epoch 整秒',
+    end_epoch_sec     BIGINT NOT NULL COMMENT '有效终点（不含），UTC epoch 整秒，必须大于起点',
+    start_x           DECIMAL(14,3) NOT NULL COMMENT '起点 X 坐标快照，单位米，最多 3 位小数',
+    start_y           DECIMAL(14,3) NOT NULL COMMENT '起点 Y 坐标快照，单位米，最多 3 位小数',
+    end_x             DECIMAL(14,3) NOT NULL COMMENT '终点 X 坐标快照，单位米，最多 3 位小数',
+    end_y             DECIMAL(14,3) NOT NULL COMMENT '终点 Y 坐标快照，单位米，最多 3 位小数',
+    status            VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE 有效；REVOKED 已撤销',
+    revoked_epoch_sec BIGINT NULL COMMENT '撤销生效时刻（UTC epoch 秒）；NULL 表示未撤销；撤销后仅 [start, revoked) 的历史轨迹仍计入占用',
+    request_id        VARCHAR(64) NOT NULL COMMENT '创建许可的写操作请求标识',
+    created_at        BIGINT NOT NULL COMMENT '创建时间，epoch 毫秒（UTC）'
+) COMMENT = '两点匀速航线运动间隔许可（轨迹快照不可变）';

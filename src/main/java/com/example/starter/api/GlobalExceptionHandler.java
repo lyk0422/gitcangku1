@@ -21,6 +21,13 @@ public class GlobalExceptionHandler {
         return ResponseEntity.status(ex.status()).body(body(ex.code(), ex.getMessage()));
     }
 
+    @ExceptionHandler(PermitConflictException.class)
+    public ResponseEntity<Map<String, Object>> handlePermitConflict(PermitConflictException ex) {
+        Map<String, Object> body = body(ex.code(), ex.getMessage());
+        body.put("conflictingPermitIds", ex.conflictingPermitIds());
+        return ResponseEntity.status(ex.status()).body(body);
+    }
+
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ResponseEntity<Map<String, Object>> handleValidation(MethodArgumentNotValidException ex) {
         String message = ex.getBindingResult().getFieldErrors().stream()
