@@ -1,6 +1,9 @@
 package com.example.starter.api;
 
 import com.example.starter.api.dto.MutationResponse;
+import com.example.starter.api.dto.PermitCreateRequest;
+import com.example.starter.api.dto.PermitResultDto;
+import com.example.starter.api.dto.PermitRevokeRequest;
 import com.example.starter.api.dto.ReviewRequest;
 import com.example.starter.api.dto.ReviewResultDto;
 import com.example.starter.api.dto.RouteCreateRequest;
@@ -59,6 +62,24 @@ public class AirspaceReviewController {
     @PostMapping("/reviews")
     public ResponseEntity<MutationResponse> review(@Valid @RequestBody ReviewRequest request) {
         return ResponseEntity.status(HttpStatus.CREATED).body(service.review(request));
+    }
+
+    /** 创建运动间隔许可（两点匀速航线，UTC 整秒起止，左闭右开）。 */
+    @PostMapping("/permits")
+    public ResponseEntity<MutationResponse> createPermit(@Valid @RequestBody PermitCreateRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(service.createPermit(request));
+    }
+
+    /** 撤销运动间隔许可（释放未来占用，历史轨迹保留）。 */
+    @PostMapping("/permits/revoke")
+    public ResponseEntity<MutationResponse> revokePermit(@Valid @RequestBody PermitRevokeRequest request) {
+        return ResponseEntity.ok(service.revokePermit(request));
+    }
+
+    /** 按 permitId 查询许可（含已撤销的历史轨迹与版本证据）。 */
+    @GetMapping("/permits/{permitId}")
+    public PermitResultDto getPermit(@PathVariable String permitId) {
+        return service.getPermit(permitId);
     }
 
     /** 按 reviewId 查询历史审核结果（保留原结论）。 */

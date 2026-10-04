@@ -67,3 +67,22 @@ CREATE TABLE IF NOT EXISTS request_dedup (
     response_json  CLOB NOT NULL COMMENT '首次成功响应 JSON，重放时原样返回',
     created_at     BIGINT NOT NULL COMMENT '首次成功时间，epoch 毫秒（UTC）'
 ) COMMENT = '写操作幂等去重记录（与业务变更同事务原子提交）';
+
+-- 运动间隔许可：引用两点航线版本与 UTC 整秒起止时刻，期间沿两点连线匀速运动；
+-- 任意两条活动许可在共同有效区间（左闭右开）内的最小距离不得小于 10 米
+CREATE TABLE IF NOT EXISTS permit (
+    permit_id          VARCHAR(64) PRIMARY KEY COMMENT '许可唯一标识（不可变）',
+    route_id           VARCHAR(64) NOT NULL COMMENT '引用的航线标识',
+    route_version      INT NOT NULL COMMENT '许可锁定的航线版本；航线后续替换不移动已许可轨迹',
+    operator           VARCHAR(64) NOT NULL COMMENT '申请操作者',
+    airspace_version   BIGINT NOT NULL COMMENT '许可审查时读取的一致空域版本（证据，保存后不改写）',
+    start_epoch_second BIGINT NOT NULL COMMENT '生效起始时刻，UTC epoch 整秒（含）',
+    end_epoch_second   BIGINT NOT NULL COMMENT '生效结束时刻，UTC epoch 整秒（不含），必须大于起始时刻',
+    points_snapshot    VARCHAR(4000) NOT NULL COMMENT '许可时两点不可变快照，格式 x,y;x,y；平面坐标单位米、最多3位小数',
+    status             VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE 占用间隔；REVOKED 已撤销，释放未来占用、历史轨迹保留',
+    request_id         VARCHAR(64) NOT NULL COMMENT '创建许可的写操作请求标识',
+    created_at         BIGINT NOT NULL COMMENT '创建时间，epoch 毫秒（UTC）',
+    revoked_at         BIGINT NULL COMMENT '撤销时间，epoch 毫秒（UTC）；NULL 表示仍有效'
+) COMMENT = '两点匀速航线运动间隔许可';
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_permit_request ON permit (request_id);

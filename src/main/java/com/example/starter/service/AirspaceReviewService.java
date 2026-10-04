@@ -2,6 +2,10 @@ package com.example.starter.service;
 
 import com.example.starter.api.ApiException;
 import com.example.starter.api.dto.MutationResponse;
+import com.example.starter.api.dto.PermitCreateRequest;
+import com.example.starter.api.dto.PermitResult;
+import com.example.starter.api.dto.PermitResultDto;
+import com.example.starter.api.dto.PermitRevokeRequest;
 import com.example.starter.api.dto.ReviewRequest;
 import com.example.starter.api.dto.ReviewResultDto;
 import com.example.starter.api.dto.RouteCreateRequest;
@@ -12,11 +16,15 @@ import com.example.starter.api.dto.ZoneCreateRequest;
 import com.example.starter.api.dto.ZoneResult;
 import com.example.starter.api.dto.ZoneRevokeRequest;
 import com.example.starter.domain.Geometry;
+import com.example.starter.domain.Motion;
+import com.example.starter.domain.PermitStatus;
 import com.example.starter.domain.Point;
 import com.example.starter.domain.ReviewConclusion;
 import com.example.starter.domain.ZoneStatus;
 import com.example.starter.repo.AirspaceRepository;
 import com.example.starter.repo.DedupPo;
+import com.example.starter.repo.PermitPo;
+import com.example.starter.repo.PermitRepository;
 import com.example.starter.repo.ReviewPo;
 import com.example.starter.repo.ReviewRepository;
 import com.example.starter.repo.RoutePo;
@@ -64,10 +72,16 @@ public class AirspaceReviewService {
     static final String KIND_ROUTE_CREATE = "ROUTE_CREATE";
     static final String KIND_ROUTE_REPLACE = "ROUTE_REPLACE";
     static final String KIND_REVIEW = "REVIEW";
+    static final String KIND_PERMIT_CREATE = "PERMIT_CREATE";
+    static final String KIND_PERMIT_REVOKE = "PERMIT_REVOKE";
+
+    /** 活动许可数量上限。 */
+    static final int MAX_ACTIVE_PERMITS = 20;
 
     private final AirspaceRepository airspaceRepo;
     private final RouteRepository routeRepo;
     private final ReviewRepository reviewRepo;
+    private final PermitRepository permitRepo;
     private final ObjectMapper objectMapper;
     private final Clock clock;
     private final TransactionTemplate txTemplate;
@@ -75,12 +89,14 @@ public class AirspaceReviewService {
     public AirspaceReviewService(AirspaceRepository airspaceRepo,
                                  RouteRepository routeRepo,
                                  ReviewRepository reviewRepo,
+                                 PermitRepository permitRepo,
                                  ObjectMapper objectMapper,
                                  Clock clock,
                                  PlatformTransactionManager transactionManager) {
         this.airspaceRepo = airspaceRepo;
         this.routeRepo = routeRepo;
         this.reviewRepo = reviewRepo;
+        this.permitRepo = permitRepo;
         this.objectMapper = objectMapper;
         this.clock = clock;
         this.txTemplate = new TransactionTemplate(transactionManager);
@@ -246,6 +262,132 @@ public class AirspaceReviewService {
         });
     }
 
+    // ============================ 运动间隔许可 ============================
+
+    /**
+     * 创建运动间隔许可：引用两点航线的明确版本与 UTC 整秒起止时刻 [start,end)，
+     * 期间沿两点连线匀速运动。
+     *
+     * <p>事务内先锁空域协调行、再锁航线行（与区域变更、航线替换互斥），
+     * 在一致版本下依次完成：版本与两点校验、原禁飞审查、活动许可上限（20 条）、
+     * 与全部活动许可的间隔审查（共同区间内最小距离不足 10 米返回 422 与冲突许可 ID，
+     * 恰好 10 米合法）。许可与幂等去重记录同一事务原子提交。</p>
+     */
+    public MutationResponse createPermit(PermitCreateRequest request) {
+        return withIdempotency(request.requestId(), KIND_PERMIT_CREATE, canonicalHash(request), () -> {
+            if (request.startEpochSecond() >= request.endEpochSecond()) {
+                throw new ApiException(HttpStatus.BAD_REQUEST, "INVALID_PERMIT_INTERVAL",
+                        "许可起止时刻必须满足 startEpochSecond < endEpochSecond（UTC 整秒，左闭右开）");
+            }
+            // 先锁空域协调行：与区域创建/撤销及其他许可事务互斥，读取一致空域版本
+            long airspaceVersion = airspaceRepo.getGlobalVersionForUpdate();
+            // 再锁航线行：与航线替换互斥，保证版本号与点列一致
+            RoutePo route = routeRepo.findRouteForUpdate(request.routeId());
+            if (route == null) {
+                throw new ApiException(HttpStatus.NOT_FOUND, "ROUTE_NOT_FOUND",
+                        "航线不存在: " + request.routeId());
+            }
+            if (route.version() != request.routeVersion()) {
+                throw new ApiException(HttpStatus.CONFLICT, "VERSION_CONFLICT",
+                        "航线版本不是当前版本：submitted=" + request.routeVersion()
+                                + ", current=" + route.version());
+            }
+            if (route.points().size() != 2) {
+                throw new ApiException(HttpStatus.BAD_REQUEST, "PERMIT_REQUIRES_TWO_POINT_ROUTE",
+                        "运动间隔许可只能引用两点航线，当前航点数: " + route.points().size());
+            }
+            Point a = route.points().get(0);
+            Point b = route.points().get(1);
+            // 原禁飞审查：两点连线不得命中任何有效禁飞区（含边界接触）
+            List<ZonePo> activeZones = airspaceRepo.findActiveZones();
+            Set<String> hits = new TreeSet<>();
+            for (ZonePo zone : activeZones) {
+                if (Geometry.polylineHitsRectangle(route.points(),
+                        zone.xMin(), zone.yMin(), zone.xMax(), zone.yMax())) {
+                    hits.add(zone.zoneId());
+                }
+            }
+            if (!hits.isEmpty()) {
+                throw new ApiException(HttpStatus.CONFLICT, "PERMIT_ROUTE_BLOCKED",
+                        "许可航线命中禁飞区: " + String.join(",", hits));
+            }
+            // 活动许可上限与间隔审查基于同一已提交状态（持锁期间无并发许可变更）
+            List<PermitPo> activePermits = permitRepo.findActivePermits();
+            if (activePermits.size() >= MAX_ACTIVE_PERMITS) {
+                throw new ApiException(HttpStatus.CONFLICT, "PERMIT_LIMIT_EXCEEDED",
+                        "活动许可数量已达上限 " + MAX_ACTIVE_PERMITS);
+            }
+            List<String> conflicts = new ArrayList<>();
+            for (PermitPo other : activePermits) {
+                Point c = other.pointsSnapshot().get(0);
+                Point d = other.pointsSnapshot().get(1);
+                if (Motion.conflicts(a.x(), a.y(), b.x(), b.y(),
+                        request.startEpochSecond(), request.endEpochSecond(),
+                        c.x(), c.y(), d.x(), d.y(),
+                        other.startEpochSecond(), other.endEpochSecond())) {
+                    conflicts.add(other.permitId());
+                }
+            }
+            if (!conflicts.isEmpty()) {
+                throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "PERMIT_SEPARATION_CONFLICT",
+                        "与活动许可的最小间隔不足 10 米: " + String.join(",", conflicts),
+                        List.copyOf(conflicts));
+            }
+            String permitId = "pm_" + UUID.randomUUID();
+            PermitPo po = new PermitPo(permitId, request.routeId(), route.version(),
+                    request.operator(), airspaceVersion,
+                    request.startEpochSecond(), request.endEpochSecond(),
+                    List.of(a, b), PermitStatus.ACTIVE.name(), request.requestId(),
+                    nowMillis(), null);
+            permitRepo.insertPermit(po);
+            return new MutationResponse(request.requestId(), false, toResult(po));
+        });
+    }
+
+    /** 撤销许可：释放未来占用，历史轨迹快照保留不改写。 */
+    public MutationResponse revokePermit(PermitRevokeRequest request) {
+        return withIdempotency(request.requestId(), KIND_PERMIT_REVOKE, canonicalHash(request), () -> {
+            // 与许可创建、区域变更串行化，保证撤销与间隔审查互不交错
+            airspaceRepo.lockCoordRow();
+            PermitPo po = permitRepo.findPermit(request.permitId());
+            if (po == null) {
+                throw new ApiException(HttpStatus.NOT_FOUND, "PERMIT_NOT_FOUND",
+                        "许可不存在: " + request.permitId());
+            }
+            if (PermitStatus.REVOKED.name().equals(po.status())) {
+                throw new ApiException(HttpStatus.CONFLICT, "PERMIT_ALREADY_REVOKED",
+                        "许可已撤销: " + request.permitId());
+            }
+            permitRepo.markRevoked(request.permitId(), nowMillis());
+            return new MutationResponse(request.requestId(), false,
+                    new PermitResult(po.permitId(), po.routeId(), po.routeVersion(),
+                            po.airspaceVersion(), po.operator(),
+                            po.startEpochSecond(), po.endEpochSecond(),
+                            PermitStatus.REVOKED.name()));
+        });
+    }
+
+    /** 按 permitId 查询许可（含已撤销），保留许可时的不可变轨迹与版本证据。 */
+    public PermitResultDto getPermit(String permitId) {
+        PermitPo po = permitRepo.findPermit(permitId);
+        if (po == null) {
+            throw new ApiException(HttpStatus.NOT_FOUND, "PERMIT_NOT_FOUND",
+                    "许可不存在: " + permitId);
+        }
+        List<RoutePointDto> snapshot = new ArrayList<>(po.pointsSnapshot().size());
+        for (Point p : po.pointsSnapshot()) {
+            snapshot.add(new RoutePointDto(p.x(), p.y()));
+        }
+        return new PermitResultDto(po.permitId(), po.routeId(), po.routeVersion(),
+                po.airspaceVersion(), po.operator(), po.startEpochSecond(), po.endEpochSecond(),
+                po.status(), snapshot, po.createdAt(), po.revokedAt());
+    }
+
+    private static PermitResult toResult(PermitPo po) {
+        return new PermitResult(po.permitId(), po.routeId(), po.routeVersion(),
+                po.airspaceVersion(), po.operator(), po.startEpochSecond(), po.endEpochSecond(),
+                po.status());
+    }
     // ============================ 幂等与事务 ============================
 
     /**

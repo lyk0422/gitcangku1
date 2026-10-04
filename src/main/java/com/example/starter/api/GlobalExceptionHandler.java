@@ -18,7 +18,11 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(ApiException.class)
     public ResponseEntity<Map<String, Object>> handleApi(ApiException ex) {
-        return ResponseEntity.status(ex.status()).body(body(ex.code(), ex.getMessage()));
+        Map<String, Object> body = body(ex.code(), ex.getMessage());
+        if (ex.conflictPermitIds() != null) {
+            body.put("conflictPermitIds", ex.conflictPermitIds());
+        }
+        return ResponseEntity.status(ex.status()).body(body);
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)

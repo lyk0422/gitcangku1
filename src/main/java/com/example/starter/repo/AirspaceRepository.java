@@ -84,6 +84,14 @@ public class AirspaceRepository {
     }
 
     /**
+     * 仅对协调锁行做真实更新取得行级排他锁（不读取版本号），
+     * 用于需要与许可创建、区域变更串行化但不需要版本号的场景（如许可撤销）。
+     */
+    public void lockCoordRow() {
+        jdbc.update("UPDATE coord_lock SET touched = touched + 1 WHERE id = 1");
+    }
+
+    /**
      * 原子地将全局空域版本加一并返回新版本。
      * 先更新协调锁行（与审核事务互斥），再推进版本；必须在业务事务内调用，
      * 保证区域变更、版本推进与去重记录原子提交，且不会产生
