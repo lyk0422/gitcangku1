@@ -1,8 +1,10 @@
 package com.example.starter.race.persistence;
 
 import com.example.starter.race.domain.EntryStatus;
+import com.example.starter.race.domain.LapPoint;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
+import com.example.starter.race.domain.RaceType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
@@ -30,6 +32,10 @@ public class RaceRepository {
             new CheckpointTimingRowMapper();
     private static final SnapshotCheckpointRowMapper SNAPSHOT_CHECKPOINT_ROW_MAPPER =
             new SnapshotCheckpointRowMapper();
+    private static final LapTimingRowMapper LAP_TIMING_ROW_MAPPER = new LapTimingRowMapper();
+    private static final LapTimingHistoryRowMapper LAP_TIMING_HISTORY_ROW_MAPPER =
+            new LapTimingHistoryRowMapper();
+    private static final SnapshotLapRowMapper SNAPSHOT_LAP_ROW_MAPPER = new SnapshotLapRowMapper();
 
     private final JdbcTemplate jdbcTemplate;
 
@@ -40,7 +46,7 @@ public class RaceRepository {
     /** 按ID查询赛事。 */
     public Optional<RaceRow> findRace(String raceId) {
         return jdbcTemplate
-                .query("SELECT race_id, version, status, created_at FROM race WHERE race_id = ?",
+                .query("SELECT race_id, version, status, race_type, total_laps, created_at FROM race WHERE race_id = ?",
                         RACE_ROW_MAPPER, raceId)
                 .stream()
                 .findFirst();
@@ -53,7 +59,7 @@ public class RaceRepository {
      */
     public Optional<RaceRow> findRaceForUpdate(String raceId) {
         return jdbcTemplate
-                .query("SELECT race_id, version, status, created_at FROM race WHERE race_id = ? FOR UPDATE",
+                .query("SELECT race_id, version, status, race_type, total_laps, created_at FROM race WHERE race_id = ? FOR UPDATE",
                         RACE_ROW_MAPPER, raceId)
                 .stream()
                 .findFirst();
@@ -212,15 +218,20 @@ public class RaceRepository {
                         entry.coveredCheckpointCount(),
                         missingByBib.getOrDefault(entry.bib(), List.of())))
                 .toList();
+        List<SnapshotLapRow> laps = jdbcTemplate.query(
+                "SELECT race_id, bib, lap_number, point_name, elapsed_millis, timing_id "
+                        + "FROM result_snapshot_lap WHERE race_id = ? "
+                        + "ORDER BY bib, lap_number, point_name",
+                SNAPSHOT_LAP_ROW_MAPPER, raceId);
         return Optional.of(new SnapshotRow(header.raceId(), header.version(), header.sealedAt(),
-                entries, checkpoints));
+                entries, checkpoints, laps));
     }
 
-    /** 新建赛事，初始版本1、状态OPEN。 */
-    public void insertRace(String raceId, long now) {
+    /** 新建赛事，初始版本1、状态OPEN；绕圈赛事固化总圈数。 */
+    public void insertRace(String raceId, RaceType raceType, Integer totalLaps, long now) {
         jdbcTemplate.update(
-                "INSERT INTO race (race_id, version, status, created_at) VALUES (?, 1, 'OPEN', ?)",
-                raceId, now);
+                "INSERT INTO race (race_id, version, status, race_type, total_laps, created_at) " + "VALUES (?, 1, 'OPEN', ?, ?, ?)",
+                raceId, raceType.name(), totalLaps, now);
     }
 
     /** 登记选手；finishTimeMs 为 null 表示计时缺失。 */
@@ -322,6 +333,20 @@ public class RaceRepository {
                     ps.setObject(5, detail.elapsedMillis());
                     ps.setString(6, detail.timingId());
                 });
+        jdbcTemplate.batchUpdate(
+                "INSERT INTO result_snapshot_lap "
+                        + "(race_id, bib, lap_number, point_name, elapsed_millis, timing_id) "
+                        + "VALUES (?, ?, ?, ?, ?, ?)",
+                snapshot.laps(),
+                snapshot.laps().size(),
+                (ps, lap) -> {
+                    ps.setString(1, lap.raceId());
+                    ps.setString(2, lap.bib());
+                    ps.setInt(3, lap.lapNumber());
+                    ps.setString(4, lap.point().name());
+                    ps.setLong(5, lap.elapsedMillis());
+                    ps.setString(6, lap.timingId());
+                });
     }
 
     /** 按请求ID查询幂等记录。 */
@@ -370,10 +395,13 @@ public class RaceRepository {
 
     /** 测试辅助：清空全部业务数据，按外键依赖顺序删除。 */
     public void deleteAllForTesting() {
+        jdbcTemplate.update("DELETE FROM result_snapshot_lap");
         jdbcTemplate.update("DELETE FROM result_snapshot_checkpoint");
         jdbcTemplate.update("DELETE FROM result_snapshot_entry");
         jdbcTemplate.update("DELETE FROM result_snapshot");
         jdbcTemplate.update("DELETE FROM idempotency_record");
+        jdbcTemplate.update("DELETE FROM lap_timing_history");
+        jdbcTemplate.update("DELETE FROM lap_timing");
         jdbcTemplate.update("DELETE FROM checkpoint_timing");
         jdbcTemplate.update("DELETE FROM checkpoint");
         jdbcTemplate.update("DELETE FROM penalty");
@@ -388,6 +416,8 @@ public class RaceRepository {
                     rs.getString("race_id"),
                     rs.getInt("version"),
                     RaceStatus.valueOf(rs.getString("status")),
+                    RaceType.valueOf(rs.getString("race_type")),
+                    (Integer) rs.getObject("total_laps"),
                     rs.getLong("created_at"));
         }
     }
