@@ -1,4 +1,4 @@
--- 软件制品依赖锁定：H2（MODE=MySQL）建表脚本，仅在 JVM 生命周期内保留数据。
+﻿-- 软件制品依赖锁定：H2（MODE=MySQL）建表脚本，仅在 JVM 生命周期内保留数据。
 
 CREATE TABLE IF NOT EXISTS repository_state (
     id      BIGINT       NOT NULL PRIMARY KEY,

@@ -1,6 +1,9 @@
 package com.example.starter.api;
 
 import com.example.starter.api.dto.ArtifactResponse;
+import com.example.starter.api.dto.CapabilityPairView;
+import com.example.starter.api.dto.ExclusionRuleRequest;
+import com.example.starter.api.dto.ExclusionRuleResponse;
 import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
 import com.example.starter.api.dto.RegisterArtifactRequest;
@@ -9,6 +12,7 @@ import jakarta.validation.constraints.Positive;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.validation.annotation.Validated;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -48,6 +52,31 @@ public class ArtifactController {
             @PathVariable String name,
             @PathVariable @Positive int version) {
         return artifactService.withdrawArtifact(requestId, name, version);
+    }
+
+    /** 新增一对互斥能力规则。 */
+    @PostMapping("/exclusions")
+    public ResponseEntity<ExclusionRuleResponse> addExclusion(
+            @RequestHeader("X-Request-Id") String requestId,
+            @RequestHeader(value = "X-Operator", required = false, defaultValue = "") String operator,
+            @Valid @RequestBody ExclusionRuleRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(artifactService.addExclusion(requestId, operator, request));
+    }
+
+    /** 撤销一对互斥能力规则。 */
+    @DeleteMapping("/exclusions")
+    public ExclusionRuleResponse removeExclusion(
+            @RequestHeader("X-Request-Id") String requestId,
+            @RequestHeader(value = "X-Operator", required = false, defaultValue = "") String operator,
+            @Valid @RequestBody ExclusionRuleRequest request) {
+        return artifactService.removeExclusion(requestId, operator, request);
+    }
+
+    /** 查询当前生效的互斥能力规则。 */
+    @GetMapping("/exclusions")
+    public List<CapabilityPairView> listExclusions() {
+        return artifactService.listExclusions();
     }
 
     /** 创建锁文件。 */

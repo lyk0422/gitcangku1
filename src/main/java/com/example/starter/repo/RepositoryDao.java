@@ -1,6 +1,7 @@
 package com.example.starter.repo;
 
 import com.example.starter.domain.ArtifactVersion;
+import com.example.starter.domain.CapabilityPair;
 import com.example.starter.domain.DependencyRange;
 import com.example.starter.domain.RepositorySnapshot;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -14,12 +15,14 @@ import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 /**
- * 仓库数据访问：制品、依赖、锁文件、仓库版本与幂等记录。
+ * 仓库数据访问：制品、依赖、能力、互斥规则、锁文件、仓库版本与幂等记录。
  *
  * <p>所有多语句业务操作均在 Service 层事务内执行；写事务通过
  * {@code SELECT ... FOR UPDATE} 锁定单行仓库版本表实现串行化，
@@ -51,7 +54,7 @@ public class RepositoryDao {
     }
 
     /**
-     * 读取仓库一致性快照：全部制品版本（含撤回，版本号降序）及其依赖。
+     * 读取仓库一致性快照：全部制品版本（含撤回，版本号降序）及其依赖、能力与互斥规则。
      * 须在已持有 repository_state 行锁的事务内调用。
      */
     public RepositorySnapshot loadSnapshot() {
@@ -69,14 +72,31 @@ public class RepositoryDao {
                         Collectors.mapping(d -> new DependencyRange(d.name(), d.minimumVersion(), d.maximumVersion()),
                                 Collectors.toList())));
 
+        List<CapRow> capRows = jdbcTemplate.query(
+                "SELECT artifact_id, capability FROM artifact_capability",
+                (rs, n) -> new CapRow(rs.getLong("artifact_id"), rs.getString("capability")));
+        Map<Long, List<String>> capsByArtifact = capRows.stream()
+                .collect(Collectors.groupingBy(CapRow::artifactId,
+                        Collectors.mapping(CapRow::capability, Collectors.toList())));
+
         Map<String, List<ArtifactVersion>> artifacts = new LinkedHashMap<>();
         for (ArtifactRow row : rows) {
             List<DependencyRange> deps = depsByArtifact.getOrDefault(row.id(), List.of());
+            List<String> caps = capsByArtifact.getOrDefault(row.id(), List.of());
             ArtifactVersion version = new ArtifactVersion(row.id(), row.name(), row.version(),
-                    row.withdrawn(), List.copyOf(deps));
+                    row.withdrawn(), List.copyOf(deps), List.copyOf(caps));
             artifacts.computeIfAbsent(row.name(), k -> new ArrayList<>()).add(version);
         }
-        return new RepositorySnapshot(getRepositoryVersion(), Map.copyOf(artifacts));
+        return new RepositorySnapshot(getRepositoryVersion(), Map.copyOf(artifacts), loadExclusions());
+    }
+
+    /** 读取当前生效的全部互斥能力对（按规范化字典序）。 */
+    public Set<CapabilityPair> loadExclusions() {
+        List<CapabilityPair> pairs = jdbcTemplate.query(
+                "SELECT capability_a, capability_b FROM capability_exclusion "
+                        + "ORDER BY capability_a ASC, capability_b ASC",
+                (rs, n) -> new CapabilityPair(rs.getString("capability_a"), rs.getString("capability_b")));
+        return new LinkedHashSet<>(pairs);
     }
 
     /** name+version 的制品版本是否已存在（含撤回版本）。 */
@@ -128,7 +148,14 @@ public class RepositoryDao {
                 artifactId, name, minimumVersion, maximumVersion);
     }
 
-    /** 读取单个制品版本（含依赖），不存在返回 null。 */
+    /** 为制品版本写入一个能力声明。 */
+    public void insertCapability(long artifactId, String capability) {
+        jdbcTemplate.update(
+                "INSERT INTO artifact_capability (artifact_id, capability) VALUES (?, ?)",
+                artifactId, capability);
+    }
+
+    /** 读取单个制品版本（含依赖与能力），不存在返回 null。 */
     public ArtifactVersion loadArtifact(String name, int version) {
         List<ArtifactRow> rows = jdbcTemplate.query(
                 "SELECT id, name, version, withdrawn FROM artifact WHERE name = ? AND version = ?",
@@ -144,8 +171,11 @@ public class RepositoryDao {
                 (rs, n) -> new DependencyRange(rs.getString("name"),
                         rs.getInt("minimum_version"), rs.getInt("maximum_version")),
                 row.id());
+        List<String> caps = jdbcTemplate.query(
+                "SELECT capability FROM artifact_capability WHERE artifact_id = ? ORDER BY capability ASC",
+                (rs, n) -> rs.getString("capability"), row.id());
         return new ArtifactVersion(row.id(), row.name(), row.version(), row.withdrawn(),
-                List.copyOf(deps));
+                List.copyOf(deps), List.copyOf(caps));
     }
 
     /** 仓库版本号加一，返回加一后的版本号（须在持有行锁时调用）。 */
@@ -161,6 +191,34 @@ public class RepositoryDao {
     public int markWithdrawn(long artifactId) {
         return jdbcTemplate.update(
                 "UPDATE artifact SET withdrawn = 1 WHERE id = ? AND withdrawn = 0", artifactId);
+    }
+    /** 当前互斥能力对数量。 */
+    public int countExclusions() {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM capability_exclusion", Integer.class);
+        return count == null ? 0 : count;
+    }
+
+    /** 指定互斥对是否已存在（入参须已规范化为 first <= second）。 */
+    public boolean exclusionExists(CapabilityPair pair) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM capability_exclusion WHERE capability_a = ? AND capability_b = ?",
+                Integer.class, pair.first(), pair.second());
+        return count != null && count > 0;
+    }
+
+    /** 新增一对互斥能力（入参须已规范化）。 */
+    public void insertExclusion(CapabilityPair pair, Instant createdAt) {
+        jdbcTemplate.update(
+                "INSERT INTO capability_exclusion (capability_a, capability_b, created_at) VALUES (?, ?, ?)",
+                pair.first(), pair.second(), Timestamp.from(createdAt));
+    }
+
+    /** 删除一对互斥能力，返回受影响行数（0 表示不存在）。 */
+    public int deleteExclusion(CapabilityPair pair) {
+        return jdbcTemplate.update(
+                "DELETE FROM capability_exclusion WHERE capability_a = ? AND capability_b = ?",
+                pair.first(), pair.second());
     }
 
     /** 新增锁文件主记录，返回自增主键。 */
@@ -191,6 +249,22 @@ public class RepositoryDao {
         jdbcTemplate.update(
                 "INSERT INTO lock_file_entry (lock_file_id, name, version) VALUES (?, ?, ?)",
                 lockFileId, name, version);
+    }
+
+    /** 冻结锁文件条目在锁定时刻声明的能力。 */
+    public void insertLockEntryCapability(long lockFileId, String entryName, String capability) {
+        jdbcTemplate.update(
+                "INSERT INTO lock_file_entry_capability (lock_file_id, entry_name, capability) "
+                        + "VALUES (?, ?, ?)",
+                lockFileId, entryName, capability);
+    }
+
+    /** 冻结锁定时刻生效的一对互斥规则。 */
+    public void insertLockFileExclusion(long lockFileId, CapabilityPair pair) {
+        jdbcTemplate.update(
+                "INSERT INTO lock_file_exclusion (lock_file_id, capability_a, capability_b) "
+                        + "VALUES (?, ?, ?)",
+                lockFileId, pair.first(), pair.second());
     }
 
     /** 幂等记录视图。 */
@@ -274,9 +348,38 @@ public class RepositoryDao {
                 lockFileId);
     }
 
+    /** 查询某锁文件各条目冻结的能力：条目名 -> 能力列表（能力升序）。 */
+    public Map<String, List<String>> listLockEntryCapabilities(long lockFileId) {
+        List<LockCapRow> rows = jdbcTemplate.query(
+                "SELECT entry_name, capability FROM lock_file_entry_capability "
+                        + "WHERE lock_file_id = ? ORDER BY entry_name ASC, capability ASC",
+                (rs, n) -> new LockCapRow(rs.getString("entry_name"), rs.getString("capability")),
+                lockFileId);
+        Map<String, List<String>> result = new LinkedHashMap<>();
+        for (LockCapRow row : rows) {
+            result.computeIfAbsent(row.entryName(), k -> new ArrayList<>()).add(row.capability());
+        }
+        return result;
+    }
+
+    /** 查询某锁文件冻结的互斥规则快照（按规范化字典序）。 */
+    public List<CapabilityPair> listLockFileExclusions(long lockFileId) {
+        return jdbcTemplate.query(
+                "SELECT capability_a, capability_b FROM lock_file_exclusion "
+                        + "WHERE lock_file_id = ? ORDER BY capability_a ASC, capability_b ASC",
+                (rs, n) -> new CapabilityPair(rs.getString("capability_a"), rs.getString("capability_b")),
+                lockFileId);
+    }
+
     private record ArtifactRow(long id, String name, int version, boolean withdrawn) {
     }
 
     private record DepRow(long artifactId, String name, int minimumVersion, int maximumVersion) {
+    }
+
+    private record CapRow(long artifactId, String capability) {
+    }
+
+    private record LockCapRow(String entryName, String capability) {
     }
 }
