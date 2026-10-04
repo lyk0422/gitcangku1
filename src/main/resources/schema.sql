@@ -112,3 +112,66 @@ COMMENT ON COLUMN idempotent_request.fingerprint IS '请求参数指纹（含路
 COMMENT ON COLUMN idempotent_request.response_status IS '首次成功响应的 HTTP 状态码，重放时原样返回';
 COMMENT ON COLUMN idempotent_request.response_body IS '首次成功响应体 JSON，重放时原样返回';
 COMMENT ON COLUMN idempotent_request.created_at IS '记录时间，Unix 毫秒，UTC';
+
+CREATE TABLE IF NOT EXISTS sample_record (
+    id             BIGINT       NOT NULL AUTO_INCREMENT,
+    experiment_id  VARCHAR(64)  NOT NULL,
+    participant_id VARCHAR(64)  NOT NULL,
+    phase          VARCHAR(8)   NOT NULL,
+    sample_no      VARCHAR(64)  NOT NULL,
+    digest         VARCHAR(128) NOT NULL,
+    collected_at   BIGINT       NOT NULL,
+    supersedes_id  BIGINT,
+    status         VARCHAR(16)  NOT NULL,
+    actor          VARCHAR(64)  NOT NULL,
+    created_at     BIGINT       NOT NULL,
+    CONSTRAINT pk_sample_record PRIMARY KEY (id),
+    CONSTRAINT uq_sample_no UNIQUE (experiment_id, sample_no),
+    CONSTRAINT ck_sample_phase CHECK (phase IN ('PRE', 'POST')),
+    CONSTRAINT ck_sample_status CHECK (status IN ('ACTIVE', 'SUPERSEDED'))
+);
+COMMENT ON TABLE  sample_record IS '盲态样本链记录表；只保存摘要与采集UTC时刻，不保存真实样本；更正追加替代记录并引用最近有效样本';
+COMMENT ON COLUMN sample_record.id IS '样本记录自增主键';
+COMMENT ON COLUMN sample_record.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN sample_record.participant_id IS '合成参与者编号，非真实医疗数据';
+COMMENT ON COLUMN sample_record.phase IS '样本阶段：PRE=干预前；POST=干预后；同一编号不得跨阶段复用';
+COMMENT ON COLUMN sample_record.sample_no IS '样本编号，全实验唯一，不得同时用于不同参与者或不同阶段';
+COMMENT ON COLUMN sample_record.digest IS '样本摘要（合成数据），不保存真实样本内容';
+COMMENT ON COLUMN sample_record.collected_at IS '采集时刻，Unix 毫秒，UTC；锁定时要求 POST 晚于 PRE';
+COMMENT ON COLUMN sample_record.supersedes_id IS '更正时引用的最近有效样本记录主键；NULL 表示该阶段首份登记';
+COMMENT ON COLUMN sample_record.status IS '记录状态：ACTIVE=当前有效；SUPERSEDED=已被更正替代，不参与锁定';
+COMMENT ON COLUMN sample_record.actor IS '提交样本的协调员操作者编号（X-Actor-Id），协调员仅可查本人提交记录';
+COMMENT ON COLUMN sample_record.created_at IS '登记时间，Unix 毫秒，UTC';
+
+CREATE TABLE IF NOT EXISTS sample_pair_lock (
+    id                BIGINT       NOT NULL AUTO_INCREMENT,
+    experiment_id     VARCHAR(64)  NOT NULL,
+    participant_id    VARCHAR(64)  NOT NULL,
+    pair_code         VARCHAR(32)  NOT NULL,
+    pre_sample_id     BIGINT       NOT NULL,
+    post_sample_id    BIGINT       NOT NULL,
+    pre_digest        VARCHAR(128) NOT NULL,
+    post_digest       VARCHAR(128) NOT NULL,
+    pre_collected_at  BIGINT       NOT NULL,
+    post_collected_at BIGINT       NOT NULL,
+    version           INT          NOT NULL,
+    locked_actor      VARCHAR(64)  NOT NULL,
+    locked_at         BIGINT       NOT NULL,
+    CONSTRAINT pk_sample_pair_lock PRIMARY KEY (id),
+    CONSTRAINT uq_pair_lock_participant UNIQUE (experiment_id, participant_id),
+    CONSTRAINT uq_pair_code UNIQUE (pair_code)
+);
+COMMENT ON TABLE  sample_pair_lock IS '样本配对锁定表；每参与者至多一个锁定对，锁定后禁止更正，冻结当时摘要；试验关闭不撤销已锁定对';
+COMMENT ON COLUMN sample_pair_lock.id IS '锁定记录自增主键';
+COMMENT ON COLUMN sample_pair_lock.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN sample_pair_lock.participant_id IS '合成参与者编号；与实验编号联合唯一，保证每参与者至多锁定一次';
+COMMENT ON COLUMN sample_pair_lock.pair_code IS '随机配对码，全局唯一，与参与者编号、盲码、处理代码无对应规律';
+COMMENT ON COLUMN sample_pair_lock.pre_sample_id IS '锁定时最近有效的 PRE 样本记录主键';
+COMMENT ON COLUMN sample_pair_lock.post_sample_id IS '锁定时最近有效的 POST 样本记录主键';
+COMMENT ON COLUMN sample_pair_lock.pre_digest IS '锁定时冻结的 PRE 摘要，之后更正不再影响';
+COMMENT ON COLUMN sample_pair_lock.post_digest IS '锁定时冻结的 POST 摘要，之后更正不再影响';
+COMMENT ON COLUMN sample_pair_lock.pre_collected_at IS '锁定时 PRE 采集时刻，Unix 毫秒，UTC';
+COMMENT ON COLUMN sample_pair_lock.post_collected_at IS '锁定时 POST 采集时刻，Unix 毫秒，UTC；必须晚于 PRE';
+COMMENT ON COLUMN sample_pair_lock.version IS '锁定时的样本链版本号（记录总数），与请求期望版本一致才允许锁定';
+COMMENT ON COLUMN sample_pair_lock.locked_actor IS '执行锁定的协调员操作者编号';
+COMMENT ON COLUMN sample_pair_lock.locked_at IS '锁定时间，Unix 毫秒，UTC';

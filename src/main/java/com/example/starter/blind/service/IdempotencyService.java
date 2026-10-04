@@ -65,11 +65,13 @@ public class IdempotencyService {
     public String fingerprint(String operation, Object params) {
         String json;
         try {
-            json = fingerprintMapper.writeValueAsString(params);
+            // 结构化指纹：操作标识与参数作为独立字段序列化，避免分隔符拼接碰撞。
+            json = fingerprintMapper.writeValueAsString(
+                    java.util.Map.of("operation", operation, "params", params));
         } catch (JsonProcessingException e) {
             throw ApiException.badRequest("请求参数无法序列化");
         }
-        String raw = operation + "|" + json;
+        String raw = json;
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             return HexFormat.of().formatHex(digest.digest(raw.getBytes(StandardCharsets.UTF_8)));

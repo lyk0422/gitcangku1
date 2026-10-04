@@ -9,9 +9,16 @@ import com.example.starter.blind.dto.CreateExperimentRequest;
 import com.example.starter.blind.dto.ExperimentView;
 import com.example.starter.blind.dto.UnblindApplyRequest;
 import com.example.starter.blind.dto.UnblindRequestView;
+import com.example.starter.blind.dto.AnalysisPairView;
+import com.example.starter.blind.dto.SampleChainView;
+import com.example.starter.blind.dto.SampleLockRequest;
+import com.example.starter.blind.dto.SampleLockView;
+import com.example.starter.blind.dto.SampleRecordView;
+import com.example.starter.blind.dto.SampleRegisterRequest;
 import com.example.starter.blind.dto.UnblindResultView;
 import com.example.starter.blind.service.ExperimentService;
 import com.example.starter.blind.service.IdempotencyService;
+import com.example.starter.blind.service.SampleService;
 import com.example.starter.blind.service.UnblindService;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
@@ -24,6 +31,7 @@ import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -40,19 +48,24 @@ public class BlindExperimentController {
     static final String OP_ALLOCATION_WITHDRAW = "allocation.withdraw";
     static final String OP_UNBLIND_APPLY = "unblind.apply";
     static final String OP_UNBLIND_APPROVE = "unblind.approve";
+    static final String OP_SAMPLE_REGISTER = "sample.register";
+    static final String OP_SAMPLE_LOCK = "sample.lock";
 
     private final ExperimentService experimentService;
     private final UnblindService unblindService;
     private final IdempotencyService idempotencyService;
+    private final SampleService sampleService;
     private final ActorContext actorContext;
 
     public BlindExperimentController(ExperimentService experimentService,
                                      UnblindService unblindService,
                                      IdempotencyService idempotencyService,
+                                     SampleService sampleService,
                                      ActorContext actorContext) {
         this.experimentService = experimentService;
         this.unblindService = unblindService;
         this.idempotencyService = idempotencyService;
+        this.sampleService = sampleService;
         this.actorContext = actorContext;
     }
 
@@ -195,6 +208,70 @@ public class BlindExperimentController {
                 RequestTokens.requireId("unblindRequestId", unblindRequestId), actor.actorId());
     }
 
+    // ---------------- 盲态样本链 ----------------
+
+    /** 登记或更正样本（仅 COORDINATOR）：同阶段再次登记即追加替代记录。 */
+    @PostMapping("/experiments/{experimentId}/participants/{participantId}/samples")
+    public ResponseEntity<String> registerSample(
+            @PathVariable String experimentId,
+            @PathVariable String participantId,
+            @Valid @RequestBody SampleRegisterRequest request,
+            @RequestHeader(IdempotencyService.HEADER_REQUEST_ID) String requestId) {
+        Actor actor = requireCoordinator();
+        String expId = RequestTokens.requireId("experimentId", experimentId);
+        String pid = RequestTokens.requireId("participantId", participantId);
+        String reqId = RequestTokens.requireRequestId(requestId);
+        String fingerprint = idempotencyService.fingerprint(OP_SAMPLE_REGISTER,
+                Map.of("experimentId", expId,
+                        "participantId", pid,
+                        "sampleNo", request.sampleNo(),
+                        "phase", request.phase(),
+                        "digest", request.digest(),
+                        "collectedAt", request.collectedAt()));
+        return idempotencyService.runWrite(reqId, OP_SAMPLE_REGISTER, fingerprint, actor,
+                () -> IdempotencyService.WriteOutcome.of(HttpStatus.CREATED.value(),
+                        sampleService.registerSample(expId, pid, request, actor.actorId())));
+    }
+
+    /** 锁定配对（仅 COORDINATOR）：两份齐全、时序合法、期望版本匹配才允许锁定。 */
+    @PostMapping("/experiments/{experimentId}/participants/{participantId}/sample-lock")
+    public ResponseEntity<String> lockPair(
+            @PathVariable String experimentId,
+            @PathVariable String participantId,
+            @Valid @RequestBody SampleLockRequest request,
+            @RequestHeader(IdempotencyService.HEADER_REQUEST_ID) String requestId) {
+        Actor actor = requireCoordinator();
+        String expId = RequestTokens.requireId("experimentId", experimentId);
+        String pid = RequestTokens.requireId("participantId", participantId);
+        String reqId = RequestTokens.requireRequestId(requestId);
+        String fingerprint = idempotencyService.fingerprint(OP_SAMPLE_LOCK,
+                Map.of("experimentId", expId,
+                        "participantId", pid,
+                        "expectedVersion", request.expectedVersion()));
+        return idempotencyService.runWrite(reqId, OP_SAMPLE_LOCK, fingerprint, actor,
+                () -> IdempotencyService.WriteOutcome.of(HttpStatus.CREATED.value(),
+                        sampleService.lockPair(expId, pid, request.expectedVersion(),
+                                actor.actorId())));
+    }
+
+    /** 协调员查询本人提交的样本链；他人提交的参与者返回 404，不泄露存在性。 */
+    @GetMapping("/experiments/{experimentId}/participants/{participantId}/samples")
+    public SampleChainView getOwnSamples(@PathVariable String experimentId,
+                                         @PathVariable String participantId) {
+        Actor actor = requireCoordinator();
+        return sampleService.getOwnChain(
+                RequestTokens.requireId("experimentId", experimentId),
+                RequestTokens.requireId("participantId", participantId),
+                actor.actorId());
+    }
+
+    /** 分析人查询已锁定匿名配对（仅 ANALYST）：只有配对码与两份冻结摘要。 */
+    @GetMapping("/experiments/{experimentId}/analysis/pairs")
+    public List<AnalysisPairView> listAnalysisPairs(@PathVariable String experimentId) {
+        requireAnalyst();
+        return sampleService.listLockedPairs(RequestTokens.requireId("experimentId", experimentId));
+    }
+
     // ---------------- 权限辅助（先于幂等回放执行） ----------------
 
     private Actor requireActor() {
@@ -217,6 +294,13 @@ public class BlindExperimentController {
         Actor actor = requireActor();
         if (!actor.isReviewer()) {
             throw ApiException.forbidden("仅 REVIEWER 可执行该操作");
+        }
+        return actor;
+    }
+    private Actor requireAnalyst() {
+        Actor actor = requireActor();
+        if (!actor.isAnalyst()) {
+            throw ApiException.forbidden("仅 ANALYST 可执行该操作");
         }
         return actor;
     }

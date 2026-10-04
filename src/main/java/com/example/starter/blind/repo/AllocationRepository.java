@@ -119,4 +119,16 @@ public class AllocationRepository {
     public boolean isDuplicateBlindCode(DuplicateKeyException e) {
         return e.getMessage() != null && e.getMessage().contains("uq_allocation_blind_code");
     }
-}
+
+    /**
+     * 行级锁定参与者的分配行，串行化样本更正、退组与配对锁定之间的竞争；
+     * 事务结束时释放。无登记记录时返回 null。
+     */
+    public AllocationRow lockByExperimentAndParticipant(String experimentId, String participantId) {
+        List<AllocationRow> rows = jdbc.query(
+                "SELECT id, experiment_id, participant_id, block_no, seat_no, blind_code, status, "
+                        + "assigned_actor, assigned_at, withdrawn_at "
+                        + "FROM allocation WHERE experiment_id = ? AND participant_id = ? FOR UPDATE",
+                ALLOCATION_MAPPER, experimentId, participantId);
+        return rows.isEmpty() ? null : rows.get(0);
+    }}
