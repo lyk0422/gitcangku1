@@ -136,7 +136,7 @@ public class BlindExperimentController {
     @GetMapping("/experiments/{experimentId}/participants/{participantId}")
     public AllocationView getAllocation(@PathVariable String experimentId,
                                         @PathVariable String participantId) {
-        requireActor();
+        requireNonSupply();
         return experimentService.getAllocation(
                 RequestTokens.requireId("experimentId", experimentId),
                 RequestTokens.requireId("participantId", participantId));
@@ -182,7 +182,7 @@ public class BlindExperimentController {
     /** 查询揭盲申请状态（不含处理代码）；申请人或批准人可查。 */
     @GetMapping("/unblind-requests/{unblindRequestId}")
     public UnblindRequestView getUnblindRequest(@PathVariable String unblindRequestId) {
-        Actor actor = requireActor();
+        Actor actor = requireNonSupply();
         return unblindService.getRequest(
                 RequestTokens.requireId("unblindRequestId", unblindRequestId), actor.actorId());
     }
@@ -190,7 +190,7 @@ public class BlindExperimentController {
     /** 查询揭盲结果：仅申请人本人、已批准后可获得处理代码；其他人 403，未批准 409。 */
     @GetMapping("/unblind-requests/{unblindRequestId}/result")
     public UnblindResultView getUnblindResult(@PathVariable String unblindRequestId) {
-        Actor actor = requireActor();
+        Actor actor = requireNonSupply();
         return unblindService.getResult(
                 RequestTokens.requireId("unblindRequestId", unblindRequestId), actor.actorId());
     }
@@ -201,6 +201,15 @@ public class BlindExperimentController {
         Actor actor = actorContext.get();
         if (actor == null) {
             throw ApiException.unauthorized("缺少操作者身份头");
+        }
+        return actor;
+    }
+
+    /** 普通参与者分配映射与揭盲信息对 SUPPLY 一律关闭。 */
+    private Actor requireNonSupply() {
+        Actor actor = requireActor();
+        if (actor.isSupply()) {
+            throw ApiException.forbidden("SUPPLY 不可读取参与者分配映射或揭盲信息");
         }
         return actor;
     }

@@ -60,16 +60,17 @@ public class IdempotencyService {
     }
 
     /**
-     * 计算请求参数指纹；操作标识、路径参数与请求体均参与。
+     * 计算请求参数指纹；操作标识、路径参数与请求体（含期望版本等全部参数）均参与。
+     * 操作标识与参数作为同一 JSON 对象的结构化字段序列化，避免分隔符拼接碰撞。
      */
     public String fingerprint(String operation, Object params) {
-        String json;
+        String raw;
         try {
-            json = fingerprintMapper.writeValueAsString(params);
+            raw = fingerprintMapper.writeValueAsString(
+                    java.util.Map.of("operation", operation, "params", params));
         } catch (JsonProcessingException e) {
             throw ApiException.badRequest("请求参数无法序列化");
         }
-        String raw = operation + "|" + json;
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             return HexFormat.of().formatHex(digest.digest(raw.getBytes(StandardCharsets.UTF_8)));
