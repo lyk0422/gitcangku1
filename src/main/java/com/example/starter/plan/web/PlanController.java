@@ -5,6 +5,7 @@ import com.example.starter.plan.web.dto.CreatePlanRequest;
 import com.example.starter.plan.web.dto.PlanActionRequest;
 import com.example.starter.plan.web.dto.PlanResponse;
 import com.example.starter.plan.web.dto.PublishedSlotView;
+import com.example.starter.plan.web.dto.RearrangementView;
 import com.example.starter.plan.web.dto.RescheduleChainResponse;
 import com.example.starter.plan.web.dto.RescheduleRequest;
 import com.example.starter.plan.web.dto.RescheduleResponse;
@@ -61,12 +62,12 @@ public class PlanController {
     }
 
     /**
-     * 发布计划，原子校验时隙冲突。
+     * 发布计划，原子校验时隙冲突；违反气象限速时按线路最小间隔整体顺延。
      */
     @PostMapping("/plans/{scheduleKey}/publish")
     public PlanResponse publish(@PathVariable String scheduleKey,
                                 @Valid @RequestBody PlanActionRequest request) {
-        return service.publish(scheduleKey, request.requestKey());
+        return service.publish(scheduleKey, request.requestKey(), request.operator());
     }
 
     /**
@@ -94,6 +95,14 @@ public class PlanController {
     @GetMapping("/plans/{scheduleKey}/reschedule-chain")
     public RescheduleChainResponse getRescheduleChain(@PathVariable String scheduleKey) {
         return service.getRescheduleChain(scheduleKey);
+    }
+
+    /**
+     * 查询计划的限速重排历史（不可变证据），按生成顺序升序。
+     */
+    @GetMapping("/plans/{scheduleKey}/rearrangements")
+    public List<RearrangementView> getRearrangements(@PathVariable String scheduleKey) {
+        return service.getRearrangements(scheduleKey);
     }
 
     /**
