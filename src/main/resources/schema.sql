@@ -12,6 +12,10 @@ CREATE TABLE IF NOT EXISTS leg (
     sealed_manifest CLOB         NULL COMMENT '封舱时的只读装载清单（JSON 数组），未封舱为 NULL',
     arrival_type    VARCHAR(16)  NULL COMMENT '到达确认类型：NULL 未到达，EXACT 精确到达，DIFF 差异到达',
     arrival_actual  CLOB         NULL COMMENT '差异到达实际到达袋号只读快照（JSON 数组），未差异到达为 NULL',
+    leg_kind        VARCHAR(16)  NOT NULL DEFAULT 'CLASSIC' COMMENT '航段类型：CLASSIC 旧航段无舱位概念，HOLD 新类型固定前后两舱（FWD -2 米 / AFT 3 米，各限重 1000 千克）',
+    sealed_total_mass DECIMAL(12,3) NULL COMMENT '封舱冻结的行李总质量（千克，3 位小数），仅 HOLD 航段封舱后非 NULL',
+    sealed_moment   DECIMAL(14,3) NULL COMMENT '封舱冻结的精确纵向力矩（千克·米，未舍入），仅 HOLD 航段封舱后非 NULL',
+    sealed_detail   CLOB         NULL COMMENT '封舱冻结的每件行李质量与舱位快照（JSON 数组），仅 HOLD 航段封舱后非 NULL',
     created_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     PRIMARY KEY (leg_id)
 );
@@ -26,6 +30,7 @@ CREATE TABLE IF NOT EXISTS bag (
     short_leg_id        VARCHAR(64)  NULL COMMENT '短卸缺失航段标识，仅 SHORT_UNLOADED 状态非 NULL',
     short_destination   VARCHAR(64)  NULL COMMENT '短卸应到站点代码，仅 SHORT_UNLOADED 状态非 NULL',
     short_registered_at TIMESTAMP WITH TIME ZONE NULL COMMENT '短卸登记时刻（UTC），仅 SHORT_UNLOADED 状态非 NULL',
+    mass_kg             DECIMAL(10,3) NULL COMMENT '登记后不可变的行李质量（千克，正值，最多 3 位小数）；装载到 HOLD 航段的行李必须有质量，旧航段行李可为 NULL',
     created_at          TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     PRIMARY KEY (bag_tag)
 );
@@ -44,6 +49,7 @@ CREATE TABLE IF NOT EXISTS bag_itinerary (
 CREATE TABLE IF NOT EXISTS load_record (
     bag_tag   VARCHAR(64) NOT NULL COMMENT '行李牌号',
     leg_id    VARCHAR(64) NOT NULL COMMENT '装载到的航段',
+    hold_code VARCHAR(8)  NULL COMMENT '舱位：FWD 前舱（-2 米）/AFT 后舱（3 米），仅 HOLD 航段非 NULL，封舱后不可再变',
     loaded_at TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '装载时间',
     PRIMARY KEY (bag_tag)
 );
@@ -64,7 +70,7 @@ CREATE TABLE IF NOT EXISTS bag_event (
 -- 幂等去重：仅记录成功请求；同 requestId 同参数重放原结果，异参数返回 409
 CREATE TABLE IF NOT EXISTS request_log (
     request_id      VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
-    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER',
+    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER/REHOLD',
     request_hash    VARCHAR(64)  NOT NULL COMMENT '请求参数（不含 requestId）的 SHA-256 摘要',
     response_status INT          NOT NULL COMMENT '原成功响应的 HTTP 状态码',
     response_body   CLOB         NOT NULL COMMENT '原成功响应体（JSON）',

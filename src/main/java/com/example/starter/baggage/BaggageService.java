@@ -1,11 +1,14 @@
 package com.example.starter.baggage;
 
+import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.function.Supplier;
 
@@ -19,6 +22,7 @@ import com.example.starter.baggage.BaggageDtos.ArriveResponse;
 import com.example.starter.baggage.BaggageDtos.BagResponse;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveRequest;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveResponse;
+import com.example.starter.baggage.BaggageDtos.HoldAssignment;
 import com.example.starter.baggage.BaggageDtos.ItineraryItem;
 import com.example.starter.baggage.BaggageDtos.LegDifferenceResponse;
 import com.example.starter.baggage.BaggageDtos.LegResponse;
@@ -29,8 +33,11 @@ import com.example.starter.baggage.BaggageDtos.RecoverRequest;
 import com.example.starter.baggage.BaggageDtos.RecoverResponse;
 import com.example.starter.baggage.BaggageDtos.RegisterBagRequest;
 import com.example.starter.baggage.BaggageDtos.RegisterLegRequest;
+import com.example.starter.baggage.BaggageDtos.ReholdRequest;
+import com.example.starter.baggage.BaggageDtos.ReholdResponse;
 import com.example.starter.baggage.BaggageDtos.SealRequest;
 import com.example.starter.baggage.BaggageDtos.SealResponse;
+import com.example.starter.baggage.BaggageDtos.SealedBagDetail;
 import com.example.starter.baggage.BaggageDtos.ShortItem;
 import com.example.starter.baggage.BaggageDtos.ShortListResponse;
 import com.example.starter.baggage.BaggageDtos.TraceEvent;
@@ -63,16 +70,37 @@ public class BaggageService {
     private static final String EVT_RECOVERED = "RECOVERED";
     private static final String EVT_DELIVERED = "DELIVERED";
 
+    /** 航段类型：旧航段（无舱位概念）。 */
+    private static final String KIND_CLASSIC = "CLASSIC";
+    /** 航段类型：新类型固定前后两舱航段。 */
+    private static final String KIND_HOLD = "HOLD";
+    /** 前舱代码。 */
+    private static final String HOLD_FWD = "FWD";
+    /** 后舱代码。 */
+    private static final String HOLD_AFT = "AFT";
+    /** 前舱纵向位置（米）。 */
+    private static final BigDecimal FWD_POSITION_M = new BigDecimal("-2");
+    /** 后舱纵向位置（米）。 */
+    private static final BigDecimal AFT_POSITION_M = new BigDecimal("3");
+    /** 单舱限重（千克）。 */
+    private static final BigDecimal HOLD_LIMIT_KG = new BigDecimal("1000");
+    /** 重心闭区间下限（米）。 */
+    private static final BigDecimal CG_MIN_M = new BigDecimal("-0.5");
+    /** 重心闭区间上限（米）。 */
+    private static final BigDecimal CG_MAX_M = new BigDecimal("0.5");
+
     private static final RowMapper<LegRow> LEG_MAPPER = (rs, rowNum) -> new LegRow(
             rs.getString("leg_id"), rs.getString("origin"), rs.getString("destination"),
             rs.getString("status"), rs.getInt("version"), rs.getString("sealed_manifest"),
-            rs.getString("arrival_type"), rs.getString("arrival_actual"));
+            rs.getString("arrival_type"), rs.getString("arrival_actual"),
+            rs.getString("leg_kind"), rs.getBigDecimal("sealed_total_mass"),
+            rs.getBigDecimal("sealed_moment"), rs.getString("sealed_detail"));
 
     private static final RowMapper<BagRow> BAG_MAPPER = (rs, rowNum) -> new BagRow(
             rs.getString("bag_tag"), rs.getString("current_location"),
             rs.getInt("next_leg_index"), rs.getString("status"), rs.getString("loaded_leg_id"),
             rs.getString("short_leg_id"), rs.getString("short_destination"),
-            getInstant(rs, "short_registered_at"));
+            getInstant(rs, "short_registered_at"), rs.getBigDecimal("mass_kg"));
 
     private static final RowMapper<ItineraryItem> ITINERARY_MAPPER = (rs, rowNum) -> new ItineraryItem(
             rs.getInt("seq"), rs.getString("leg_id"), rs.getString("origin"), rs.getString("destination"));
@@ -117,18 +145,27 @@ public class BaggageService {
                 request, BagResponse.class, () -> doRegisterBag(request));
     }
 
-    /** 批量装载：整批原子，任一行李不满足则 422 且无一件移动。 */
+    /** 批量装载：整批原子，任一行李不满足则 422 且无一件移动；HOLD 航段须同时给出舱位。 */
     public LoadResponse load(String legId, LoadRequest request) {
-        LoadPayload payload = new LoadPayload(legId, request.expectedVersion(), sortedCopy(request.bagTags()));
+        LoadPayload payload = new LoadPayload(legId, request.operator(), request.expectedVersion(),
+                sortedCopy(request.bagTags()), sortedAssignments(request.holds()));
         return idempotencyService.execute(request.requestId(), "LOAD", 200,
                 payload, LoadResponse.class, () -> doLoad(legId, request));
     }
 
-    /** 封舱：校验版本，保存只读装载清单并转 SEALED；空清单也可封舱。 */
+    /** 封舱：校验版本，保存只读装载清单并转 SEALED；HOLD 航段须总质量为正且重心在闭区间内。 */
     public SealResponse seal(String legId, SealRequest request) {
-        SealPayload payload = new SealPayload(legId, request.expectedVersion());
+        SealPayload payload = new SealPayload(legId, request.operator(), request.expectedVersion());
         return idempotencyService.execute(request.requestId(), "SEAL", 200,
                 payload, SealResponse.class, () -> doSeal(legId, request));
+    }
+
+    /** 批量换舱：仅 OPEN 的 HOLD 航段，按最终全体位置一次性校验舱重，整批原子。 */
+    public ReholdResponse rehold(String legId, ReholdRequest request) {
+        ReholdPayload payload = new ReholdPayload(legId, request.operator(), request.expectedVersion(),
+                sortedAssignments(request.assignments()));
+        return idempotencyService.execute(request.requestId(), "REHOLD", 200,
+                payload, ReholdResponse.class, () -> doRehold(legId, request));
     }
 
     /** 到达确认：实际袋号集合须与封舱清单完全一致，匹配则原子转 ARRIVED 并推进各行李。 */
@@ -169,14 +206,17 @@ public class BaggageService {
         return toBagResponse(bag);
     }
 
-    /** 封舱清单查询：未封舱时返回空清单。 */
+    /** 封舱清单查询：未封舱时返回空清单；HOLD 航段封舱后附冻结的总质量、力矩与单件明细。 */
     public ManifestResponse getManifest(String legId) {
         LegRow leg = findLeg(legId);
         if (leg == null) {
             throw ApiException.notFound("航段不存在: " + legId);
         }
         List<String> manifest = leg.sealedManifest() == null ? List.of() : readJsonList(leg.sealedManifest());
-        return new ManifestResponse(leg.legId(), leg.status(), leg.version(), manifest);
+        List<SealedBagDetail> detail = leg.sealedDetail() == null
+                ? null : readJson(leg.sealedDetail(), SealedBagDetail.class);
+        return new ManifestResponse(leg.legId(), leg.status(), leg.version(), manifest,
+                leg.sealedTotalMass(), leg.sealedMoment(), detail);
     }
 
     /** 航段差异快照查询：返回只读封舱清单、到达类型及差异到达实际集合。 */
@@ -209,10 +249,15 @@ public class BaggageService {
         if (findLeg(request.legId()) != null) {
             throw ApiException.conflict("航段已存在: " + request.legId());
         }
+        String kind = request.kind() == null ? KIND_CLASSIC : request.kind();
+        if (!KIND_CLASSIC.equals(kind) && !KIND_HOLD.equals(kind)) {
+            throw ApiException.unprocessable("未知航段类型: " + kind + "（仅支持 CLASSIC/HOLD）");
+        }
         jdbcTemplate.update(
-                "INSERT INTO leg (leg_id, origin, destination, status, version) VALUES (?, ?, ?, ?, 1)",
-                request.legId(), request.origin(), request.destination(), LEG_OPEN);
-        return new LegResponse(request.legId(), request.origin(), request.destination(), LEG_OPEN, 1);
+                "INSERT INTO leg (leg_id, origin, destination, status, version, leg_kind)"
+                        + " VALUES (?, ?, ?, ?, 1, ?)",
+                request.legId(), request.origin(), request.destination(), LEG_OPEN, kind);
+        return new LegResponse(request.legId(), request.origin(), request.destination(), LEG_OPEN, 1, kind);
     }
 
     private BagResponse doRegisterBag(RegisterBagRequest request) {
@@ -239,8 +284,9 @@ public class BaggageService {
         }
         String startStation = legs.get(0).origin();
         jdbcTemplate.update(
-                "INSERT INTO bag (bag_tag, current_location, next_leg_index, status) VALUES (?, ?, 0, ?)",
-                request.bagTag(), startStation, BAG_IN_TRANSIT);
+                "INSERT INTO bag (bag_tag, current_location, next_leg_index, status, mass_kg)"
+                        + " VALUES (?, ?, 0, ?, ?)",
+                request.bagTag(), startStation, BAG_IN_TRANSIT, request.massKg());
         for (int i = 0; i < legs.size(); i++) {
             LegRow leg = legs.get(i);
             jdbcTemplate.update(
@@ -261,6 +307,8 @@ public class BaggageService {
         if (new HashSet<>(bagTags).size() != bagTags.size()) {
             throw ApiException.unprocessable("批量装载的 bagTag 不得重复");
         }
+        boolean holdLeg = KIND_HOLD.equals(leg.legKind());
+        Map<String, String> assignments = validateHoldAssignments(leg, request.holds(), bagTags, holdLeg);
         List<String> sorted = sortedCopy(bagTags);
         List<BagRow> bags = new ArrayList<>();
         for (String bagTag : sorted) {
@@ -269,10 +317,24 @@ public class BaggageService {
                 throw ApiException.unprocessable("行李不存在: " + bagTag);
             }
             validateLoadable(bag, leg);
+            if (holdLeg && bag.massKg() == null) {
+                throw ApiException.unprocessable(
+                        "行李 " + bagTag + " 未登记质量，不能装载到固定舱位航段");
+            }
             bags.add(bag);
         }
+        if (holdLeg) {
+            Map<String, BigDecimal> holdTotals = currentHoldTotals(legId);
+            for (BagRow bag : bags) {
+                String holdCode = assignments.get(bag.bagTag());
+                holdTotals.merge(holdCode, bag.massKg(), BigDecimal::add);
+            }
+            checkHoldLimits(holdTotals);
+        }
         for (BagRow bag : bags) {
-            jdbcTemplate.update("INSERT INTO load_record (bag_tag, leg_id) VALUES (?, ?)", bag.bagTag(), legId);
+            String holdCode = holdLeg ? assignments.get(bag.bagTag()) : null;
+            jdbcTemplate.update("INSERT INTO load_record (bag_tag, leg_id, hold_code) VALUES (?, ?, ?)",
+                    bag.bagTag(), legId, holdCode);
             jdbcTemplate.update("UPDATE bag SET loaded_leg_id = ? WHERE bag_tag = ?", legId, bag.bagTag());
             insertEvent(bag.bagTag(), EVT_LOADED, legId, leg.origin());
         }
@@ -290,9 +352,82 @@ public class BaggageService {
         List<String> manifest = jdbcTemplate.queryForList(
                 "SELECT bag_tag FROM load_record WHERE leg_id = ? ORDER BY bag_tag", String.class, legId);
         int newVersion = leg.version() + 1;
-        jdbcTemplate.update("UPDATE leg SET status = ?, version = ?, sealed_manifest = ? WHERE leg_id = ?",
-                LEG_SEALED, newVersion, writeJson(manifest), legId);
-        return new SealResponse(legId, LEG_SEALED, newVersion, manifest);
+        if (!KIND_HOLD.equals(leg.legKind())) {
+            jdbcTemplate.update("UPDATE leg SET status = ?, version = ?, sealed_manifest = ? WHERE leg_id = ?",
+                    LEG_SEALED, newVersion, writeJson(manifest), legId);
+            return new SealResponse(legId, LEG_SEALED, newVersion, manifest);
+        }
+        List<SealedBagDetail> detail = loadHoldDetail(legId);
+        BigDecimal totalMass = BigDecimal.ZERO;
+        BigDecimal moment = BigDecimal.ZERO;
+        for (SealedBagDetail item : detail) {
+            totalMass = totalMass.add(item.massKg());
+            moment = moment.add(item.massKg().multiply(BigDecimal.valueOf(item.positionM())));
+        }
+        if (totalMass.signum() <= 0) {
+            throw ApiException.unprocessable("封舱要求舱内行李总质量为正值");
+        }
+        // 交叉相乘比较，不先舍入重心：CG_MIN <= moment/total <= CG_MAX
+        if (moment.compareTo(CG_MIN_M.multiply(totalMass)) < 0
+                || moment.compareTo(CG_MAX_M.multiply(totalMass)) > 0) {
+            throw ApiException.unprocessable(
+                    "重心超限：总质量 " + totalMass + " 千克，力矩 " + moment
+                            + " 千克·米，重心须位于闭区间 [" + CG_MIN_M + ", " + CG_MAX_M + "] 米");
+        }
+        jdbcTemplate.update(
+                "UPDATE leg SET status = ?, version = ?, sealed_manifest = ?, sealed_total_mass = ?,"
+                        + " sealed_moment = ?, sealed_detail = ? WHERE leg_id = ?",
+                LEG_SEALED, newVersion, writeJson(manifest), totalMass, moment,
+                writeJson(detail), legId);
+        return new SealResponse(legId, LEG_SEALED, newVersion, manifest, totalMass, moment);
+    }
+
+    private ReholdResponse doRehold(String legId, ReholdRequest request) {
+        LegRow leg = lockLeg(legId);
+        checkVersion(leg, request.expectedVersion());
+        if (!KIND_HOLD.equals(leg.legKind())) {
+            throw ApiException.unprocessable("旧航段无舱位概念，禁止换舱");
+        }
+        if (!LEG_OPEN.equals(leg.status())) {
+            throw ApiException.unprocessable("航段状态为 " + leg.status() + "，封舱后禁止换舱");
+        }
+        List<HoldAssignment> assignments = request.assignments();
+        Set<String> tags = new HashSet<>();
+        for (HoldAssignment assignment : assignments) {
+            if (!tags.add(assignment.bagTag())) {
+                throw ApiException.unprocessable("批量换舱的 bagTag 不得重复: " + assignment.bagTag());
+            }
+            holdPosition(assignment.holdCode());
+        }
+        Map<String, String> currentHolds = currentHoldMap(legId);
+        Map<String, BigDecimal> masses = currentLoadMasses(legId);
+        for (HoldAssignment assignment : assignments) {
+            if (!currentHolds.containsKey(assignment.bagTag())) {
+                throw ApiException.unprocessable(
+                        "行李 " + assignment.bagTag() + " 未装载到航段 " + legId + "，不能换舱");
+            }
+        }
+        // 按最终全体位置一次性核算舱重：先移除全部换舱行李的旧舱质量，再计入新舱
+        Map<String, BigDecimal> finalTotals = currentHoldTotals(legId);
+        for (HoldAssignment assignment : assignments) {
+            BigDecimal mass = masses.get(assignment.bagTag());
+            finalTotals.merge(currentHolds.get(assignment.bagTag()), mass, BigDecimal::subtract);
+        }
+        List<String> changed = new ArrayList<>();
+        for (HoldAssignment assignment : assignments) {
+            finalTotals.merge(assignment.holdCode(), masses.get(assignment.bagTag()), BigDecimal::add);
+            if (!assignment.holdCode().equals(currentHolds.get(assignment.bagTag()))) {
+                changed.add(assignment.bagTag());
+            }
+        }
+        checkHoldLimits(finalTotals);
+        for (HoldAssignment assignment : assignments) {
+            jdbcTemplate.update("UPDATE load_record SET hold_code = ? WHERE bag_tag = ? AND leg_id = ?",
+                    assignment.holdCode(), assignment.bagTag(), legId);
+        }
+        int newVersion = leg.version() + 1;
+        jdbcTemplate.update("UPDATE leg SET version = ? WHERE leg_id = ?", newVersion, legId);
+        return new ReholdResponse(legId, LEG_OPEN, newVersion, sortedCopy(changed));
     }
 
     private ArriveResponse doArrive(String legId, ArriveRequest request) {
@@ -458,7 +593,8 @@ public class BaggageService {
 
     private static String legSelect(boolean forUpdate) {
         return "SELECT leg_id, origin, destination, status, version, sealed_manifest,"
-                + " arrival_type, arrival_actual FROM leg WHERE leg_id = ?"
+                + " arrival_type, arrival_actual, leg_kind, sealed_total_mass, sealed_moment,"
+                + " sealed_detail FROM leg WHERE leg_id = ?"
                 + (forUpdate ? " FOR UPDATE" : "");
     }
 
@@ -474,8 +610,8 @@ public class BaggageService {
 
     private static String bagSelect(boolean forUpdate) {
         return "SELECT bag_tag, current_location, next_leg_index, status, loaded_leg_id,"
-                + " short_leg_id, short_destination, short_registered_at FROM bag WHERE bag_tag = ?"
-                + (forUpdate ? " FOR UPDATE" : "");
+                + " short_leg_id, short_destination, short_registered_at, mass_kg FROM bag"
+                + " WHERE bag_tag = ?" + (forUpdate ? " FOR UPDATE" : "");
     }
 
     private ItineraryItem nextItinerary(String bagTag, int nextLegIndex) {
@@ -521,7 +657,7 @@ public class BaggageService {
                 bag.status(), bag.loadedLegId(), toItinerary(bag.bagTag()),
                 bag.shortLegId(), bag.shortDestination(),
                 bag.shortRegisteredAt() == null ? null : bag.shortRegisteredAt().toString(),
-                toEvents(bag.bagTag()));
+                bag.massKg(), toEvents(bag.bagTag()));
     }
 
     private static Instant getInstant(java.sql.ResultSet rs, String column) throws java.sql.SQLException {
@@ -533,7 +669,7 @@ public class BaggageService {
         return values.stream().sorted().toList();
     }
 
-    private String writeJson(List<String> values) {
+    private String writeJson(Object values) {
         try {
             return objectMapper.writeValueAsString(values);
         } catch (Exception ex) {
@@ -542,30 +678,158 @@ public class BaggageService {
     }
 
     private List<String> readJsonList(String json) {
+        return readJson(json, String.class);
+    }
+
+    private <T> List<T> readJson(String json, Class<T> elementType) {
         try {
             return objectMapper.readValue(json,
-                    objectMapper.getTypeFactory().constructCollectionType(List.class, String.class));
+                    objectMapper.getTypeFactory().constructCollectionType(List.class, elementType));
         } catch (Exception ex) {
             throw new IllegalStateException("清单反序列化失败", ex);
         }
     }
 
+    /**
+     * 校验装载请求的舱位指派：HOLD 航段必须覆盖全部 bagTag 且无多余指派；
+     * 旧航段不得携带舱位指派。返回 bagTag -> holdCode 映射（旧航段为空 Map）。
+     */
+    private Map<String, String> validateHoldAssignments(LegRow leg, List<HoldAssignment> holds,
+                                                        List<String> bagTags, boolean holdLeg) {
+        if (!holdLeg) {
+            if (holds != null && !holds.isEmpty()) {
+                throw ApiException.unprocessable("旧航段 " + leg.legId() + " 无舱位概念，不得携带舱位指派");
+            }
+            return Map.of();
+        }
+        if (holds == null || holds.isEmpty()) {
+            throw ApiException.unprocessable("固定舱位航段 " + leg.legId() + " 装载必须同时给出舱位");
+        }
+        Map<String, String> assignments = new HashMap<>();
+        for (HoldAssignment hold : holds) {
+            holdPosition(hold.holdCode());
+            if (assignments.putIfAbsent(hold.bagTag(), hold.holdCode()) != null) {
+                throw ApiException.unprocessable("舱位指派的 bagTag 不得重复: " + hold.bagTag());
+            }
+        }
+        for (String bagTag : bagTags) {
+            if (!assignments.containsKey(bagTag)) {
+                throw ApiException.unprocessable("行李 " + bagTag + " 缺少舱位指派");
+            }
+        }
+        for (String tag : assignments.keySet()) {
+            if (!bagTags.contains(tag)) {
+                throw ApiException.unprocessable("舱位指派包含本批之外的行李: " + tag);
+            }
+        }
+        return assignments;
+    }
+
+    /** 舱位纵向位置（米）：FWD -2 / AFT 3，其余代码 422。 */
+    private BigDecimal holdPosition(String holdCode) {
+        return switch (holdCode) {
+            case HOLD_FWD -> FWD_POSITION_M;
+            case HOLD_AFT -> AFT_POSITION_M;
+            default -> throw ApiException.unprocessable(
+                    "未知舱位: " + holdCode + "（仅支持 FWD/AFT）");
+        };
+    }
+
+    /** 当前航段各舱已装总质量（千克）。 */
+    private Map<String, BigDecimal> currentHoldTotals(String legId) {
+        Map<String, BigDecimal> totals = new HashMap<>();
+        totals.put(HOLD_FWD, BigDecimal.ZERO);
+        totals.put(HOLD_AFT, BigDecimal.ZERO);
+        jdbcTemplate.query(
+                "SELECT lr.hold_code, COALESCE(SUM(b.mass_kg), 0) AS total FROM load_record lr"
+                        + " JOIN bag b ON b.bag_tag = lr.bag_tag WHERE lr.leg_id = ?"
+                        + " GROUP BY lr.hold_code",
+                rs -> {
+                    totals.put(rs.getString("hold_code"), rs.getBigDecimal("total"));
+                }, legId);
+        return totals;
+    }
+
+    /** 当前航段每件已装行李的舱位。 */
+    private Map<String, String> currentHoldMap(String legId) {
+        Map<String, String> holds = new HashMap<>();
+        jdbcTemplate.query(
+                "SELECT bag_tag, hold_code FROM load_record WHERE leg_id = ?",
+                rs -> {
+                    holds.put(rs.getString("bag_tag"), rs.getString("hold_code"));
+                }, legId);
+        return holds;
+    }
+
+    /** 当前航段每件已装行李的质量（千克）。 */
+    private Map<String, BigDecimal> currentLoadMasses(String legId) {
+        Map<String, BigDecimal> masses = new HashMap<>();
+        jdbcTemplate.query(
+                "SELECT lr.bag_tag, b.mass_kg FROM load_record lr"
+                        + " JOIN bag b ON b.bag_tag = lr.bag_tag WHERE lr.leg_id = ?",
+                rs -> {
+                    masses.put(rs.getString("bag_tag"), rs.getBigDecimal("mass_kg"));
+                }, legId);
+        return masses;
+    }
+
+    /** 封舱时读取每件已装行李的质量、舱位与纵向位置，用于冻结快照与重心核算。 */
+    private List<SealedBagDetail> loadHoldDetail(String legId) {
+        return jdbcTemplate.query(
+                "SELECT lr.bag_tag, b.mass_kg, lr.hold_code FROM load_record lr"
+                        + " JOIN bag b ON b.bag_tag = lr.bag_tag WHERE lr.leg_id = ?"
+                        + " ORDER BY lr.bag_tag",
+                (rs, rowNum) -> {
+                    String holdCode = rs.getString("hold_code");
+                    return new SealedBagDetail(rs.getString("bag_tag"), rs.getBigDecimal("mass_kg"),
+                            holdCode, holdPosition(holdCode).intValue());
+                }, legId);
+    }
+
+    /** 单舱限重校验：任一舱超过 1000 千克则 422（调用方整批回滚）。 */
+    private void checkHoldLimits(Map<String, BigDecimal> holdTotals) {
+        for (Map.Entry<String, BigDecimal> entry : holdTotals.entrySet()) {
+            if (entry.getValue().compareTo(HOLD_LIMIT_KG) > 0) {
+                throw ApiException.unprocessable(
+                        "舱位 " + entry.getKey() + " 超重：合计 " + entry.getValue()
+                                + " 千克，限重 " + HOLD_LIMIT_KG + " 千克");
+            }
+        }
+    }
+
+    /** 舱位指派按袋号排序，保证幂等摘要对顺序差异不敏感。 */
+    private static List<HoldAssignment> sortedAssignments(List<HoldAssignment> assignments) {
+        if (assignments == null) {
+            return null;
+        }
+        return assignments.stream()
+                .sorted(java.util.Comparator.comparing(HoldAssignment::bagTag))
+                .toList();
+    }
+
     private record LegRow(String legId, String origin, String destination,
                           String status, int version, String sealedManifest,
-                          String arrivalType, String arrivalActual) {
+                          String arrivalType, String arrivalActual, String legKind,
+                          BigDecimal sealedTotalMass, BigDecimal sealedMoment, String sealedDetail) {
     }
 
     private record BagRow(String bagTag, String currentLocation, int nextLegIndex,
                           String status, String loadedLegId, String shortLegId,
-                          String shortDestination, Instant shortRegisteredAt) {
+                          String shortDestination, Instant shortRegisteredAt, BigDecimal massKg) {
     }
 
-    /** 装载幂等摘要参数：bagTags 已排序，顺序差异不视为异参。 */
-    private record LoadPayload(String legId, int expectedVersion, List<String> bagTags) {
+    /** 装载幂等摘要参数：bagTags/holds 已排序，顺序差异不视为异参；含操作者与期望版本。 */
+    private record LoadPayload(String legId, String operator, int expectedVersion,
+                               List<String> bagTags, List<HoldAssignment> holds) {
     }
 
-    /** 封舱幂等摘要参数。 */
-    private record SealPayload(String legId, int expectedVersion) {
+    /** 封舱幂等摘要参数：含操作者与期望版本。 */
+    private record SealPayload(String legId, String operator, int expectedVersion) {
+    }
+
+    /** 换舱幂等摘要参数：assignments 已按袋号排序，含操作者与期望版本。 */
+    private record ReholdPayload(String legId, String operator, int expectedVersion,
+                                 List<HoldAssignment> assignments) {
     }
 
     /** 到达确认幂等摘要参数：bagTags 已排序，顺序差异不视为异参。 */

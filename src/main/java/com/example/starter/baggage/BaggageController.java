@@ -25,6 +25,8 @@ import com.example.starter.baggage.BaggageDtos.RecoverRequest;
 import com.example.starter.baggage.BaggageDtos.RecoverResponse;
 import com.example.starter.baggage.BaggageDtos.RegisterBagRequest;
 import com.example.starter.baggage.BaggageDtos.RegisterLegRequest;
+import com.example.starter.baggage.BaggageDtos.ReholdRequest;
+import com.example.starter.baggage.BaggageDtos.ReholdResponse;
 import com.example.starter.baggage.BaggageDtos.SealRequest;
 import com.example.starter.baggage.BaggageDtos.SealResponse;
 import com.example.starter.baggage.BaggageDtos.ShortListResponse;
@@ -64,6 +66,12 @@ public class BaggageController {
     @PostMapping("/legs/{legId}/seal")
     public SealResponse seal(@PathVariable String legId, @Valid @RequestBody SealRequest request) {
         return baggageService.seal(legId, request);
+    }
+
+    /** 批量换舱：仅 OPEN 的固定舱位航段，按最终全体位置校验舱重，整批原子。 */
+    @PostMapping("/legs/{legId}/rehold")
+    public ReholdResponse rehold(@PathVariable String legId, @Valid @RequestBody ReholdRequest request) {
+        return baggageService.rehold(legId, request);
     }
 
     /** 到达确认：实际袋号集合须与封舱清单完全一致。 */
