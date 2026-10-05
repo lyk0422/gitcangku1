@@ -21,21 +21,26 @@ import com.example.starter.maintenance.api.dto.StatusResponse;
 import com.example.starter.maintenance.domain.Equipment;
 import com.example.starter.maintenance.domain.MaintenanceRecord;
 import com.example.starter.maintenance.domain.Reading;
+import com.example.starter.maintenance.store.ComponentRepository;
 import com.example.starter.maintenance.store.EquipmentRepository;
 
 /**
  * 设备工时保养事务业务服务。写操作流程：设备行锁 → 幂等判定 → 版本校验 → 业务规则 → 变更并版本加一。
  * 去重记录与业务变更同事务提交；任一规则失败抛异常整体回滚。
+ * 读数修订与部件装拆共用设备行锁：被装拆账引用的读数禁止修订，装拆端点读取的必是修订后的最终值。
  */
 @Service
 public class EquipmentTxService {
 
     private final EquipmentRepository repository;
+    private final ComponentRepository componentRepository;
     private final IdempotencyService idempotency;
     private final Clock clock;
 
-    public EquipmentTxService(EquipmentRepository repository, IdempotencyService idempotency, Clock clock) {
+    public EquipmentTxService(EquipmentRepository repository, ComponentRepository componentRepository,
+                              IdempotencyService idempotency, Clock clock) {
         this.repository = repository;
+        this.componentRepository = componentRepository;
         this.idempotency = idempotency;
         this.clock = clock;
     }
@@ -102,6 +107,10 @@ public class EquipmentTxService {
                     if (repository.existsMaintenanceAnchoringReading(equipmentId, readingId)) {
                         throw ApiException.conflict("READING_ANCHORED",
                                 "读数已作为历史保养锚点，不可修订：" + readingId);
+                    }
+                    if (componentRepository.existsUsageOfReading(equipmentId, readingId)) {
+                        throw ApiException.conflict("READING_ANCHORED",
+                                "读数已被部件装拆账引用，不可修订：" + readingId);
                     }
                     checkMonotonic(equipmentId, reading.sampledAt(), req.cumulativeMinutes());
                     int newRevisionNo = reading.revisionNo() + 1;
