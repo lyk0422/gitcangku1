@@ -12,11 +12,13 @@ import org.springframework.jdbc.support.GeneratedKeyHolder;
 import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.stereotype.Repository;
 
+import com.example.starter.calibration.model.CertificateType;
 import com.example.starter.calibration.model.Measurement;
 import com.example.starter.calibration.model.MeasurementStatus;
 
 /**
  * 测量记录持久化。measurement_key 全局唯一作为幂等键；状态流转由放行事务在行锁内完成。
+ * 曲线测量冻结精确分数与相邻节点区间，查询时不得改用新证书。
  */
 @Repository
 public class MeasurementRepository {
@@ -31,7 +33,14 @@ public class MeasurementRepository {
             rs.getBigDecimal("upper_limit"),
             rs.getString("submitted_by"),
             rs.getLong("certificate_id"),
+            CertificateType.valueOf(rs.getString("cert_type")),
             rs.getBigDecimal("computed_value"),
+            rs.getString("computed_num"),
+            rs.getString("computed_den"),
+            rs.getBigDecimal("node_lo_raw"),
+            rs.getBigDecimal("node_lo_corrected"),
+            rs.getBigDecimal("node_hi_raw"),
+            rs.getBigDecimal("node_hi_corrected"),
             rs.getBoolean("passed"),
             MeasurementStatus.valueOf(rs.getString("status")),
             JdbcTimes.fromDb(rs.getObject("created_at", LocalDateTime.class)));
@@ -51,8 +60,10 @@ public class MeasurementRepository {
             PreparedStatement ps = con.prepareStatement(
                     "INSERT INTO measurement "
                             + "(measurement_key, instrument_id, measured_at, raw_reading, lower_limit, upper_limit, "
-                            + "submitted_by, certificate_id, computed_value, passed, status, created_at) "
-                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            + "submitted_by, certificate_id, cert_type, computed_value, computed_num, computed_den, "
+                            + "node_lo_raw, node_lo_corrected, node_hi_raw, node_hi_corrected, "
+                            + "passed, status, created_at) "
+                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, measurement.measurementKey());
             ps.setString(2, measurement.instrumentId());
@@ -62,10 +73,17 @@ public class MeasurementRepository {
             ps.setBigDecimal(6, measurement.upperLimit());
             ps.setString(7, measurement.submittedBy());
             ps.setLong(8, measurement.certificateId());
-            ps.setBigDecimal(9, measurement.computedValue());
-            ps.setBoolean(10, measurement.passed());
-            ps.setString(11, measurement.status().name());
-            ps.setObject(12, JdbcTimes.toDb(measurement.createdAt()));
+            ps.setString(9, measurement.certType().name());
+            ps.setBigDecimal(10, measurement.computedValue());
+            ps.setString(11, measurement.computedNum());
+            ps.setString(12, measurement.computedDen());
+            ps.setBigDecimal(13, measurement.nodeLoRaw());
+            ps.setBigDecimal(14, measurement.nodeLoCorrected());
+            ps.setBigDecimal(15, measurement.nodeHiRaw());
+            ps.setBigDecimal(16, measurement.nodeHiCorrected());
+            ps.setBoolean(17, measurement.passed());
+            ps.setString(18, measurement.status().name());
+            ps.setObject(19, JdbcTimes.toDb(measurement.createdAt()));
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();

@@ -17,11 +17,13 @@ import com.example.starter.calibration.api.dto.MeasurementResponse;
 import com.example.starter.calibration.api.dto.ReleaseRequest;
 import com.example.starter.calibration.api.dto.ReleaseResponse;
 import com.example.starter.calibration.api.dto.SubmitMeasurementRequest;
+import com.example.starter.calibration.service.IdempotencyService;
 import com.example.starter.calibration.service.MeasurementService;
 import com.example.starter.calibration.service.ReleaseService;
 
 /**
  * 测量接口：提交、批量放行、历史明细、当前可用结果查询。
+ * 写入支持 requestId 幂等：同键同参重放首次响应，异参 409，失败不占键。
  */
 @RestController
 @RequestMapping("/api/measurements")
@@ -29,18 +31,25 @@ public class MeasurementController {
 
     private final MeasurementService measurements;
     private final ReleaseService releases;
+    private final IdempotencyService idempotency;
 
-    public MeasurementController(MeasurementService measurements, ReleaseService releases) {
+    public MeasurementController(MeasurementService measurements, ReleaseService releases,
+                                 IdempotencyService idempotency) {
         this.measurements = measurements;
         this.releases = releases;
+        this.idempotency = idempotency;
     }
 
     /**
-     * 提交测量：201；参数非法 400；测量键重复 409；无匹配有效证书 422。
+     * 提交测量：201；参数非法 400；测量键重复 409；无匹配有效证书或读数越出曲线节点区间 422。
      */
     @PostMapping
     public ResponseEntity<MeasurementResponse> submit(@RequestBody SubmitMeasurementRequest request) {
-        return ResponseEntity.status(HttpStatus.CREATED).body(measurements.submit(request));
+        MeasurementResponse body = idempotency.execute(request.requestId(), "MEASUREMENT_SUBMIT",
+                request.submittedBy() == null ? "" : request.submittedBy().trim(),
+                "measurement:" + request.measurementKey(), request, request.expectedVersion(),
+                () -> measurements.submit(request), MeasurementResponse.class);
+        return ResponseEntity.status(HttpStatus.CREATED).body(body);
     }
 
     /**
@@ -50,7 +59,9 @@ public class MeasurementController {
     @PostMapping("/release")
     public ReleaseResponse release(@RequestBody ReleaseRequest request,
                                    @RequestHeader("X-Actor-Id") String actor) {
-        return releases.release(request.keys(), actor);
+        return idempotency.execute(request.requestId(), "MEASUREMENT_RELEASE", actor.trim(),
+                "release", request, request.expectedVersion(),
+                () -> releases.release(request.keys(), actor), ReleaseResponse.class);
     }
 
     /**

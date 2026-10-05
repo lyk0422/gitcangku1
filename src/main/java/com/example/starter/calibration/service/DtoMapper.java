@@ -7,6 +7,8 @@ import com.example.starter.calibration.api.dto.CertificateResponse;
 import com.example.starter.calibration.api.dto.MeasurementResponse;
 import com.example.starter.calibration.api.dto.ReleaseRecordResponse;
 import com.example.starter.calibration.model.Certificate;
+import com.example.starter.calibration.model.CertificateType;
+import com.example.starter.calibration.model.CurveNode;
 import com.example.starter.calibration.model.Measurement;
 import com.example.starter.calibration.model.MeasurementStatus;
 import com.example.starter.calibration.model.ReleaseRecord;
@@ -28,14 +30,22 @@ final class DtoMapper {
         return stripped.toPlainString();
     }
 
-    static CertificateResponse toResponse(Certificate cert) {
+    static CertificateResponse toResponse(Certificate cert, List<CurveNode> nodes) {
+        List<CertificateResponse.NodeResponse> nodeResponses = null;
+        if (cert.certType() == CertificateType.CURVE) {
+            nodeResponses = nodes.stream()
+                    .map(n -> new CertificateResponse.NodeResponse(format(n.raw()), format(n.corrected())))
+                    .toList();
+        }
         return new CertificateResponse(
                 cert.id(),
                 cert.instrumentId(),
                 cert.validFrom(),
                 cert.validTo(),
-                format(cert.a()),
-                format(cert.b()),
+                cert.certType().name(),
+                cert.a() == null ? null : format(cert.a()),
+                cert.b() == null ? null : format(cert.b()),
+                nodeResponses,
                 cert.revoked(),
                 cert.revokedAt(),
                 cert.createdAt());
@@ -44,6 +54,16 @@ final class DtoMapper {
     static MeasurementResponse toResponse(Measurement m, boolean certificateRevoked,
                                           List<ReleaseRecord> releases) {
         boolean usable = m.status() == MeasurementStatus.RELEASED && !certificateRevoked;
+        String computed;
+        MeasurementResponse.FrozenInterval interval = null;
+        if (m.certType() == CertificateType.CURVE) {
+            computed = m.computedNum() + "/" + m.computedDen();
+            interval = new MeasurementResponse.FrozenInterval(
+                    format(m.nodeLoRaw()), format(m.nodeLoCorrected()),
+                    format(m.nodeHiRaw()), format(m.nodeHiCorrected()));
+        } else {
+            computed = format(m.computedValue());
+        }
         return new MeasurementResponse(
                 m.id(),
                 m.measurementKey(),
@@ -54,8 +74,10 @@ final class DtoMapper {
                 format(m.upperLimit()),
                 m.submittedBy(),
                 m.certificateId(),
-                format(m.computedValue()),
+                m.certType().name(),
+                computed,
                 m.displayValue().toPlainString(),
+                interval,
                 m.passed(),
                 m.status().name(),
                 usable,

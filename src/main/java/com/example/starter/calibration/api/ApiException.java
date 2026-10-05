@@ -44,4 +44,9 @@ public class ApiException extends RuntimeException {
     public static ApiException unprocessable(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "NO_MATCHING_CERTIFICATE", message);
     }
+
+    /** 422：读数超出曲线节点闭区间，禁止外推。 */
+    public static ApiException outOfRange(String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "READING_OUT_OF_RANGE", message);
+    }
 }

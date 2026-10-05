@@ -4,6 +4,7 @@ import java.sql.PreparedStatement;
 import java.sql.Statement;
 import java.time.Instant;
 import java.time.LocalDateTime;
+import java.util.List;
 import java.util.Optional;
 
 import org.springframework.dao.DuplicateKeyException;
@@ -14,10 +15,12 @@ import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.stereotype.Repository;
 
 import com.example.starter.calibration.model.Certificate;
+import com.example.starter.calibration.model.CertificateType;
+import com.example.starter.calibration.model.CurveNode;
 
 /**
  * 校准证书持久化。证书创建后不可修改，仅可撤销；
- * 同一仪器的创建通过 instrument_lock 行锁串行化，保证并发下重叠区间最多一张成功。
+ * 同一仪器的创建通过 instrument_lock 行锁串行化，保证并发下重叠区间（不分类型）最多一张成功。
  */
 @Repository
 public class CertificateRepository {
@@ -27,11 +30,17 @@ public class CertificateRepository {
             rs.getString("instrument_id"),
             JdbcTimes.fromDb(rs.getObject("valid_from", LocalDateTime.class)),
             JdbcTimes.fromDb(rs.getObject("valid_to", LocalDateTime.class)),
+            CertificateType.valueOf(rs.getString("cert_type")),
             rs.getBigDecimal("coeff_a"),
             rs.getBigDecimal("offset_b"),
             rs.getBoolean("revoked"),
             JdbcTimes.fromDb(rs.getObject("revoked_at", LocalDateTime.class)),
             JdbcTimes.fromDb(rs.getObject("created_at", LocalDateTime.class)));
+
+    private static final RowMapper<CurveNode> NODE_MAPPER = (rs, rowNum) -> new CurveNode(
+            rs.getInt("seq"),
+            rs.getBigDecimal("raw_value"),
+            rs.getBigDecimal("corrected_value"));
 
     private final JdbcTemplate jdbc;
 
@@ -54,26 +63,50 @@ public class CertificateRepository {
     }
 
     /**
-     * 插入证书并返回生成的证书 ID。
+     * 插入证书并返回生成的证书 ID；CURVE 证书的 a/b 传 null。
      */
-    public long insert(String instrumentId, Instant validFrom, Instant validTo,
+    public long insert(String instrumentId, Instant validFrom, Instant validTo, CertificateType type,
                        java.math.BigDecimal a, java.math.BigDecimal b, Instant createdAt) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
                     "INSERT INTO calibration_certificate "
-                            + "(instrument_id, valid_from, valid_to, coeff_a, offset_b, revoked, created_at) "
-                            + "VALUES (?, ?, ?, ?, ?, FALSE, ?)",
+                            + "(instrument_id, valid_from, valid_to, cert_type, coeff_a, offset_b, revoked, created_at) "
+                            + "VALUES (?, ?, ?, ?, ?, ?, FALSE, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, instrumentId);
             ps.setObject(2, JdbcTimes.toDb(validFrom));
             ps.setObject(3, JdbcTimes.toDb(validTo));
-            ps.setBigDecimal(4, a);
-            ps.setBigDecimal(5, b);
-            ps.setObject(6, JdbcTimes.toDb(createdAt));
+            ps.setString(4, type.name());
+            ps.setBigDecimal(5, a);
+            ps.setBigDecimal(6, b);
+            ps.setObject(7, JdbcTimes.toDb(createdAt));
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();
+    }
+
+    /**
+     * 批量插入曲线证书节点（须在证书插入的同一事务内调用）。
+     */
+    public void insertNodes(long certificateId, List<CurveNode> nodes) {
+        jdbc.batchUpdate("INSERT INTO certificate_node (certificate_id, seq, raw_value, corrected_value) "
+                        + "VALUES (?, ?, ?, ?)",
+                nodes, nodes.size(),
+                (ps, node) -> {
+                    ps.setLong(1, certificateId);
+                    ps.setInt(2, node.seq());
+                    ps.setBigDecimal(3, node.raw());
+                    ps.setBigDecimal(4, node.corrected());
+                });
+    }
+
+    /**
+     * 按证书 ID 查询曲线节点（按序号升序，即原始值严格递增序）。
+     */
+    public List<CurveNode> findNodes(long certificateId) {
+        return jdbc.query("SELECT * FROM certificate_node WHERE certificate_id = ? ORDER BY seq",
+                NODE_MAPPER, certificateId);
     }
 
     /**
@@ -93,7 +126,7 @@ public class CertificateRepository {
     }
 
     /**
-     * 统计同一仪器下与 [from, to) 重叠的未撤销证书数量；相邻区间（端点相接）不算重叠。
+     * 统计同一仪器下与 [from, to) 重叠的未撤销证书数量（不分类型）；相邻区间（端点相接）不算重叠。
      */
     public int countActiveOverlap(String instrumentId, Instant from, Instant to) {
         Integer count = jdbc.queryForObject(

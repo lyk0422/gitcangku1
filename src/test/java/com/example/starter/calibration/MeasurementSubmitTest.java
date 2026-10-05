@@ -31,8 +31,10 @@ class MeasurementSubmitTest {
     void clean() {
         jdbc.update("DELETE FROM release_record");
         jdbc.update("DELETE FROM measurement");
+        jdbc.update("DELETE FROM certificate_node");
         jdbc.update("DELETE FROM calibration_certificate");
         jdbc.update("DELETE FROM instrument_lock");
+        jdbc.update("DELETE FROM idempotency_record");
     }
 
     private void createCert(String instrument, String from, String to, String a, String b) throws Exception {
