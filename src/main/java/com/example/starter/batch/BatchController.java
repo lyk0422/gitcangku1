@@ -5,6 +5,7 @@ import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
 import com.example.starter.batch.dto.LineageEntryResponse;
+import com.example.starter.batch.dto.MergeBatchesRequest;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
@@ -112,6 +113,17 @@ public class BatchController {
     @GetMapping("/{batchKey}/descendants")
     public List<LineageEntryResponse> descendants(@PathVariable String batchKey) {
         return service.listDescendants(batchKey);
+    }
+
+    /**
+     * 合批：2～5 个当前可用的 RELEASED 父批合并为一个全新批次，父批置为 MERGED；
+     * 新批绑定指定声明版本并重新校验所有父物料；X-Actor-Id 为合批操作人。
+     */
+    @PostMapping("/merge")
+    public ResponseEntity<String> merge(
+            @RequestHeader(name = "X-Actor-Id", required = false) String actorId,
+            @Valid @RequestBody MergeBatchesRequest request) {
+        return stored(service.merge(actorId, request));
     }
 
     private ResponseEntity<String> stored(StoredResponse response) {

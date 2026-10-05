@@ -51,6 +51,11 @@ class BatchSplitLineageTest {
         jdbc.update("DELETE FROM test_result");
         jdbc.update("DELETE FROM batch_required_test");
         jdbc.update("DELETE FROM batch_lineage");
+        jdbc.update("DELETE FROM release_snapshot");
+        jdbc.update("DELETE FROM certificate_binding");
+        jdbc.update("DELETE FROM declaration_prefix");
+        jdbc.update("DELETE FROM certificate_declaration");
+        jdbc.update("DELETE FROM batch_merge");
         jdbc.update("DELETE FROM batch");
     }
 
@@ -563,7 +568,7 @@ class BatchSplitLineageTest {
     }
 
     /**
-     * 让批次走完 检验 PASS + 双角色批准 进入 RELEASED。
+     * 让批次走完 检验 PASS + 双角色批准 进入 RELEASED（放行前先确保已绑定合格证声明）。
      */
     private void releaseBatch(String batchKey, String inspector) throws Exception {
         MvcResult history = mockMvc.perform(get("/api/batches/" + batchKey + "/history"))
@@ -572,8 +577,38 @@ class BatchSplitLineageTest {
         for (JsonNode item : node.path("batch").path("requiredTests")) {
             submitTest(batchKey, item.asText(), "PASS", inspector, 201);
         }
+        ensureBound(batchKey);
         approve(batchKey, "qa-" + unique(), "QUALITY", "CK-AQ-" + unique(), 201);
         approve(batchKey, "ops-" + unique(), "OPERATIONS", "CK-AO-" + unique(), 201);
+    }
+
+    /**
+     * 若批次尚未绑定合格证声明（拆分产物会继承父批绑定），则绑定到本测试共享的声明。
+     */
+    private void ensureBound(String batchKey) throws Exception {
+        MvcResult detail = mockMvc.perform(get("/api/batches/" + batchKey + "/certificate"))
+                .andExpect(status().isOk()).andReturn();
+        if (!objectMapper.readTree(detail.getResponse().getContentAsString())
+                .path("binding").isNull()) {
+            return;
+        }
+        // 共享声明每个测试只发布一次（避免同物料同前缀同优先级的重叠校验冲突）
+        MvcResult decl = mockMvc.perform(get("/api/declarations/DECL-SHARED/versions/1"))
+                .andReturn();
+        if (decl.getResponse().getStatus() == 404) {
+            String publish = "{\"commandKey\":\"CK-P-" + unique()
+                    + "\",\"declarationKey\":\"DECL-SHARED\",\"version\":1,"
+                    + "\"materialCode\":\"PROD-1\",\"batchNoPrefixes\":[\"LOT-\"],\"priority\":1,"
+                    + "\"validFrom\":\"2020-01-01T00:00:00Z\",\"validTo\":\"2099-01-01T00:00:00Z\"}";
+            mockMvc.perform(post("/api/declarations").header("X-Actor-Id", "supplier-1")
+                            .contentType(MediaType.APPLICATION_JSON).content(publish))
+                    .andExpect(status().isCreated());
+        }
+        String bind = "{\"commandKey\":\"CK-B-" + unique() + "\",\"bindings\":[{\"batchKey\":\""
+                + batchKey + "\",\"declarationKey\":\"DECL-SHARED\",\"version\":1}]}";
+        mockMvc.perform(post("/api/batches/certificate-bindings").header("X-Actor-Id", "op-1")
+                        .contentType(MediaType.APPLICATION_JSON).content(bind))
+                .andExpect(status().isCreated());
     }
 
     private void submitTest(String batchKey, String item, String result, String inspector,

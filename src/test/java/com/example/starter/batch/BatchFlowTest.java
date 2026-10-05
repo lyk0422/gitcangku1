@@ -50,6 +50,11 @@ class BatchFlowTest {
         jdbc.update("DELETE FROM test_result");
         jdbc.update("DELETE FROM batch_required_test");
         jdbc.update("DELETE FROM batch_lineage");
+        jdbc.update("DELETE FROM release_snapshot");
+        jdbc.update("DELETE FROM certificate_binding");
+        jdbc.update("DELETE FROM declaration_prefix");
+        jdbc.update("DELETE FROM certificate_declaration");
+        jdbc.update("DELETE FROM batch_merge");
         jdbc.update("DELETE FROM batch");
     }
 
@@ -71,6 +76,7 @@ class BatchFlowTest {
         submitTest(batchKey, testReq("TK-3", "无菌", "PASS", "inspect-c"), null, null, 201);
         assertEquals("PENDING_RELEASE", currentStatus(batchKey));
 
+        ensureBound(batchKey);
         approve(batchKey, "qa-1", "QUALITY", "CK-AP-1", 201);
         assertEquals("RELEASE_REVIEW", currentStatus(batchKey));
         approve(batchKey, "ops-1", "OPERATIONS", "CK-AP-2", 201);
@@ -142,6 +148,7 @@ class BatchFlowTest {
         approve(batchKey, "qa-1", "OPERATIONS", "CK-A3", 409);
         assertEquals("RELEASE_REVIEW", currentStatus(batchKey));
 
+        ensureBound(batchKey);
         approve(batchKey, "ops-1", "OPERATIONS", "CK-A4", 201);
         assertEquals("RELEASED", currentStatus(batchKey));
 
@@ -302,6 +309,7 @@ class BatchFlowTest {
                         .contentType(MediaType.APPLICATION_JSON).content(body))
                 .andExpect(status().isConflict());
 
+        ensureBound(batchKey);
         approve(batchKey, "ops", "OPERATIONS", "CK-A2", 201);
         String recallBody = "{\"commandKey\":\"CK-R1\",\"reason\":\"r1\"}";
         mockMvc.perform(post("/api/batches/" + batchKey + "/recall")
@@ -404,6 +412,7 @@ class BatchFlowTest {
         createBatch(batchKey, List.of("t1"), 201);
         submitTest(batchKey, testReq("TK-1", "t1", "PASS", "insp"), null, null, 201);
         approve(batchKey, "qa", "QUALITY", "CK-Q", 201);
+        ensureBound(batchKey);
 
         List<Future<Integer>> results = runConcurrent(
                 () -> callStatus(post("/api/batches/" + batchKey + "/approvals")
@@ -444,6 +453,7 @@ class BatchFlowTest {
         String batchKey = "BK-PERSIST-" + unique();
         createBatch(batchKey, List.of("t1"), 201);
         submitTest(batchKey, testReq("TK-1", "t1", "PASS", "insp"), null, null, 201);
+        ensureBound(batchKey);
         approve(batchKey, "qa", "QUALITY", "CK-A1", 201);
         approve(batchKey, "ops", "OPERATIONS", "CK-A2", 201);
         recall(batchKey, "u", "原因", "CK-R1", 201);
@@ -512,6 +522,35 @@ class BatchFlowTest {
         mockMvc.perform(post("/api/batches")
                         .contentType(MediaType.APPLICATION_JSON).content(createBody(batchKey, items)))
                 .andExpect(status().is(expectedStatus));
+    }
+
+    /**
+     * 若批次尚未绑定合格证声明，则绑定到本测试共享的声明（放行门禁前置条件）。
+     */
+    private void ensureBound(String batchKey) throws Exception {
+        MvcResult detail = mockMvc.perform(get("/api/batches/" + batchKey + "/certificate"))
+                .andExpect(status().isOk()).andReturn();
+        if (!objectMapper.readTree(detail.getResponse().getContentAsString())
+                .path("binding").isNull()) {
+            return;
+        }
+        // 共享声明每个测试只发布一次（避免同物料同前缀同优先级的重叠校验冲突）
+        MvcResult decl = mockMvc.perform(get("/api/declarations/DECL-SHARED/versions/1"))
+                .andReturn();
+        if (decl.getResponse().getStatus() == 404) {
+            String publish = "{\"commandKey\":\"CK-P-" + unique()
+                    + "\",\"declarationKey\":\"DECL-SHARED\",\"version\":1,"
+                    + "\"materialCode\":\"PROD-1\",\"batchNoPrefixes\":[\"LOT-\"],\"priority\":1,"
+                    + "\"validFrom\":\"2020-01-01T00:00:00Z\",\"validTo\":\"2099-01-01T00:00:00Z\"}";
+            mockMvc.perform(post("/api/declarations").header("X-Actor-Id", "supplier-1")
+                            .contentType(MediaType.APPLICATION_JSON).content(publish))
+                    .andExpect(status().isCreated());
+        }
+        String bind = "{\"commandKey\":\"CK-B-" + unique() + "\",\"bindings\":[{\"batchKey\":\""
+                + batchKey + "\",\"declarationKey\":\"DECL-SHARED\",\"version\":1}]}";
+        mockMvc.perform(post("/api/batches/certificate-bindings").header("X-Actor-Id", "op-1")
+                        .contentType(MediaType.APPLICATION_JSON).content(bind))
+                .andExpect(status().isCreated());
     }
 
     private String testReq(String testKey, String item, String result, String inspector) throws Exception {

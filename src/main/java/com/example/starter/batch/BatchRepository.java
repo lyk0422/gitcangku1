@@ -54,6 +54,12 @@ public class BatchRepository {
     public record LineageRow(long id, String parentKey, String childKey, int seq, String createdAt) {
     }
 
+    /**
+     * batch_merge 表行记录：合批父子关系（多父一子），创建后不可改写。
+     */
+    public record MergeRow(long id, String childKey, String parentKey, int seq, String createdAt) {
+    }
+
     private static final RowMapper<BatchRow> BATCH_MAPPER = (rs, n) -> new BatchRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("product_code"),
             rs.getString("batch_no"), rs.getString("produced_at"),
@@ -79,6 +85,10 @@ public class BatchRepository {
 
     private static final RowMapper<LineageRow> LINEAGE_MAPPER = (rs, n) -> new LineageRow(
             rs.getLong("id"), rs.getString("parent_key"), rs.getString("child_key"),
+            rs.getInt("seq"), rs.getString("created_at"));
+
+    private static final RowMapper<MergeRow> MERGE_MAPPER = (rs, n) -> new MergeRow(
+            rs.getLong("id"), rs.getString("child_key"), rs.getString("parent_key"),
             rs.getInt("seq"), rs.getString("created_at"));
 
     private final JdbcTemplate jdbc;
@@ -208,5 +218,19 @@ public class BatchRepository {
     public List<String> findRecalledKeys() {
         return jdbc.queryForList("SELECT batch_key FROM batch WHERE status = 'RECALLED'",
                 String.class);
+    }
+
+    public void insertMerge(MergeRow row) {
+        jdbc.update("INSERT INTO batch_merge (child_key, parent_key, seq, created_at)"
+                        + " VALUES (?, ?, ?, ?)",
+                row.childKey(), row.parentKey(), row.seq(), row.createdAt());
+    }
+
+    /**
+     * 合批产物的父批业务键，按合批请求顺序（稳定排序）。
+     */
+    public List<String> findMergeParents(String childKey) {
+        return jdbc.queryForList("SELECT parent_key FROM batch_merge WHERE child_key = ?"
+                + " ORDER BY seq", String.class, childKey);
     }
 }
