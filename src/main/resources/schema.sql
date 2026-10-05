@@ -22,6 +22,19 @@ CREATE TABLE IF NOT EXISTS consent_record (
     PRIMARY KEY (subject_key, purpose, epoch, record_key)
 ) COMMENT = '授权记录表';
 
+-- 记录版本表：写入产生初版 1，每次更正追加完整新 payload 并使版本加一，旧版本保留
+CREATE TABLE IF NOT EXISTS consent_record_version (
+    subject_key VARCHAR(128) NOT NULL COMMENT '主体标识（合成字符串）',
+    purpose VARCHAR(32) NOT NULL COMMENT '用途：RESEARCH 研究 / PERSONALIZATION 个性化',
+    epoch INT NOT NULL COMMENT '记录所属授权代次',
+    record_key VARCHAR(128) NOT NULL COMMENT '记录键，同一代内唯一',
+    record_version INT NOT NULL COMMENT '记录版本，从 1 开始，每次成功更正加一',
+    payload TEXT NOT NULL COMMENT '该版本的完整记录内容（合成字符串），更正载荷最长 1000 字符',
+    request_id VARCHAR(128) NOT NULL COMMENT '产生本版本的幂等请求标识',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间（服务器时区 Asia/Shanghai）',
+    PRIMARY KEY (subject_key, purpose, epoch, record_key, record_version)
+) COMMENT = '记录版本表';
+
 -- 幂等请求表：成功结果与业务变更同事务保存，失败请求不占用 requestId
 CREATE TABLE IF NOT EXISTS idempotency_request (
     request_id VARCHAR(128) NOT NULL COMMENT '幂等请求标识',

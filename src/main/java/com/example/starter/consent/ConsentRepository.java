@@ -26,6 +26,14 @@ public class ConsentRepository {
             rs.getString("record_key"),
             rs.getString("payload"));
 
+    private static final RowMapper<VersionRow> VERSION_MAPPER = (rs, rowNum) -> new VersionRow(
+            rs.getString("subject_key"),
+            Purpose.valueOf(rs.getString("purpose")),
+            rs.getInt("epoch"),
+            rs.getString("record_key"),
+            rs.getInt("record_version"),
+            rs.getString("payload"));
+
     private final JdbcTemplate jdbc;
 
     public ConsentRepository(JdbcTemplate jdbc) {
@@ -53,6 +61,20 @@ public class ConsentRepository {
      * @param payload    记录内容
      */
     public record RecordRow(String subjectKey, Purpose purpose, int epoch, String recordKey, String payload) {
+    }
+
+    /**
+     * 记录版本行。
+     *
+     * @param subjectKey    主体标识
+     * @param purpose       用途
+     * @param epoch         所属代次
+     * @param recordKey     记录键
+     * @param recordVersion 记录版本，从 1 开始，每次更正加一
+     * @param payload       该版本的完整记录内容
+     */
+    public record VersionRow(String subjectKey, Purpose purpose, int epoch, String recordKey,
+                             int recordVersion, String payload) {
     }
 
     Optional<GrantRow> findGrant(String subjectKey, Purpose purpose, int epoch) {
@@ -102,5 +124,56 @@ public class ConsentRepository {
                 "INSERT INTO consent_record (subject_key, purpose, epoch, record_key, payload, request_id)"
                         + " VALUES (?, ?, ?, ?, ?, ?)",
                 subjectKey, purpose.name(), epoch, recordKey, payload, requestId);
+    }
+
+    /**
+     * 行锁读取授权代次：使更正与撤回、同记录并发更正在同一事务内原子判定。
+     */
+    Optional<GrantRow> findGrantForUpdate(String subjectKey, Purpose purpose, int epoch) {
+        List<GrantRow> rows = jdbc.query(
+                "SELECT subject_key, purpose, epoch, status FROM consent_grant"
+                        + " WHERE subject_key = ? AND purpose = ? AND epoch = ? FOR UPDATE",
+                GRANT_MAPPER, subjectKey, purpose.name(), epoch);
+        return rows.stream().findFirst();
+    }
+
+    Optional<VersionRow> findRecordVersion(String subjectKey, Purpose purpose, int epoch,
+                                           String recordKey, int recordVersion) {
+        List<VersionRow> rows = jdbc.query(
+                "SELECT subject_key, purpose, epoch, record_key, record_version, payload"
+                        + " FROM consent_record_version"
+                        + " WHERE subject_key = ? AND purpose = ? AND epoch = ?"
+                        + " AND record_key = ? AND record_version = ?",
+                VERSION_MAPPER, subjectKey, purpose.name(), epoch, recordKey, recordVersion);
+        return rows.stream().findFirst();
+    }
+
+    Optional<VersionRow> findLatestRecordVersion(String subjectKey, Purpose purpose, int epoch, String recordKey) {
+        List<VersionRow> rows = jdbc.query(
+                "SELECT subject_key, purpose, epoch, record_key, record_version, payload"
+                        + " FROM consent_record_version"
+                        + " WHERE subject_key = ? AND purpose = ? AND epoch = ? AND record_key = ?"
+                        + " ORDER BY record_version DESC LIMIT 1",
+                VERSION_MAPPER, subjectKey, purpose.name(), epoch, recordKey);
+        return rows.stream().findFirst();
+    }
+
+    void insertRecordVersion(String subjectKey, Purpose purpose, int epoch, String recordKey,
+                             int recordVersion, String payload, String requestId) {
+        jdbc.update(
+                "INSERT INTO consent_record_version"
+                        + " (subject_key, purpose, epoch, record_key, record_version, payload, request_id)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                subjectKey, purpose.name(), epoch, recordKey, recordVersion, payload, requestId);
+    }
+
+    /**
+     * 更正提交后同步当前内容：普通读取始终返回当前有效代次的最近版。
+     */
+    void updateRecordPayload(String subjectKey, Purpose purpose, int epoch, String recordKey, String payload) {
+        jdbc.update(
+                "UPDATE consent_record SET payload = ?"
+                        + " WHERE subject_key = ? AND purpose = ? AND epoch = ? AND record_key = ?",
+                payload, subjectKey, purpose.name(), epoch, recordKey);
     }
 }

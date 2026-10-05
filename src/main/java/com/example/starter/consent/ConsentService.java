@@ -1,5 +1,7 @@
 package com.example.starter.consent;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 
 import org.springframework.dao.DuplicateKeyException;
@@ -7,9 +9,12 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import com.example.starter.consent.IdempotencyRepository.IdempotencyRow;
+import com.example.starter.consent.dto.CorrectRecordRequest;
 import com.example.starter.consent.dto.GrantRequest;
 import com.example.starter.consent.dto.GrantResponse;
+import com.example.starter.consent.dto.RecordMetadataResponse;
 import com.example.starter.consent.dto.RecordResponse;
+import com.example.starter.consent.dto.RecordVersionResponse;
 import com.example.starter.consent.dto.RecordWriteRequest;
 import com.example.starter.consent.dto.RevokeRequest;
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -31,10 +36,12 @@ public class ConsentService {
     static final String CODE_RECORD_PAYLOAD_CONFLICT = "RECORD_PAYLOAD_CONFLICT";
     static final String CODE_GRANT_ALREADY_REVOKED = "GRANT_ALREADY_REVOKED";
     static final String CODE_CONSENT_REVOKED = "CONSENT_REVOKED";
+    static final String CODE_RECORD_VERSION_CONFLICT = "RECORD_VERSION_CONFLICT";
 
     private static final String OP_GRANT = "GRANT";
     private static final String OP_WRITE = "WRITE";
     private static final String OP_REVOKE = "REVOKE";
+    private static final String OP_CORRECT = "CORRECT";
 
     private final ConsentRepository consentRepository;
     private final IdempotencyRepository idempotencyRepository;
@@ -118,6 +125,9 @@ public class ConsentService {
         try {
             consentRepository.insertRecord(request.subjectKey(), request.purpose(), latest.epoch(),
                     request.recordKey(), request.payload(), request.requestId());
+            // 写入即产生初版 1，后续更正在此基础上递增
+            consentRepository.insertRecordVersion(request.subjectKey(), request.purpose(), latest.epoch(),
+                    request.recordKey(), 1, request.payload(), request.requestId());
         } catch (DuplicateKeyException concurrent) {
             // 并发写入同一 recordKey：以已提交的记录为准
             ConsentRepository.RecordRow committed = consentRepository.findRecord(
@@ -173,6 +183,95 @@ public class ConsentService {
                 .orElseThrow(() -> ApiException.notFound(CODE_RECORD_NOT_FOUND, "记录不存在"));
     }
 
+    /**
+     * 更正：授权状态先于载荷重放；期望版本与当前版本不符返回 409 且不占请求键；
+     * 新 payload 与当前完全相同则不增版本并返回当前快照；撤回后更正与重放均返回 410。
+     */
+    @Transactional
+    public RecordVersionResponse correct(CorrectRecordRequest request) {
+        // 行锁读取授权代次：更正与撤回、同记录另一更正在同一事务内原子判定
+        ConsentRepository.GrantRow grant = consentRepository
+                .findGrantForUpdate(request.subjectKey(), request.purpose(), request.epoch())
+                .orElseThrow(() -> ApiException.notFound(CODE_GRANT_NOT_FOUND, "授权代次不存在"));
+        if (grant.status() == GrantStatus.REVOKED) {
+            throw ApiException.gone(CODE_CONSENT_REVOKED, "授权已撤回");
+        }
+
+        String fingerprint = structuredFingerprint(OP_CORRECT, request.subjectKey(), request.purpose().name(),
+                String.valueOf(request.epoch()), request.recordKey(), request.payload(),
+                String.valueOf(request.expectedRecordVersion()));
+        Optional<IdempotencyRow> replayed = checkReplay(request.requestId(), fingerprint);
+        if (replayed.isPresent()) {
+            return readSnapshot(replayed.get().responseBody(), RecordVersionResponse.class);
+        }
+
+        consentRepository.findRecord(request.subjectKey(), request.purpose(), request.epoch(), request.recordKey())
+                .orElseThrow(() -> ApiException.notFound(CODE_RECORD_NOT_FOUND, "记录不存在"));
+        ConsentRepository.VersionRow latest = consentRepository
+                .findLatestRecordVersion(request.subjectKey(), request.purpose(), request.epoch(), request.recordKey())
+                .orElseThrow(() -> ApiException.notFound(CODE_RECORD_NOT_FOUND, "记录版本链不存在"));
+        if (latest.recordVersion() != request.expectedRecordVersion()) {
+            // 旧版本不能作为下一次更正基准：版本不符 409，失败不占请求键
+            throw ApiException.conflict(CODE_RECORD_VERSION_CONFLICT, "记录版本与期望版本不一致");
+        }
+
+        RecordVersionResponse response;
+        if (latest.payload().equals(request.payload())) {
+            // 新 payload 与当前完全相同：不增版本，返回当前快照
+            response = toVersionResponse(latest);
+        } else {
+            int nextVersion = latest.recordVersion() + 1;
+            try {
+                consentRepository.insertRecordVersion(request.subjectKey(), request.purpose(), request.epoch(),
+                        request.recordKey(), nextVersion, request.payload(), request.requestId());
+                consentRepository.updateRecordPayload(request.subjectKey(), request.purpose(), request.epoch(),
+                        request.recordKey(), request.payload());
+            } catch (DuplicateKeyException concurrent) {
+                // 并发更正同一记录：以已提交的版本链为准，不泄露唯一键异常
+                ConsentRepository.VersionRow committed = consentRepository.findLatestRecordVersion(
+                                request.subjectKey(), request.purpose(), request.epoch(), request.recordKey())
+                        .orElseThrow(() -> concurrent);
+                if (committed.recordVersion() != nextVersion || !committed.payload().equals(request.payload())) {
+                    throw ApiException.conflict(CODE_RECORD_VERSION_CONFLICT, "记录版本与期望版本不一致");
+                }
+                response = toVersionResponse(committed);
+                storeSuccess(request.requestId(), OP_CORRECT, fingerprint, response);
+                return response;
+            }
+            response = new RecordVersionResponse(request.subjectKey(), request.purpose(), request.epoch(),
+                    request.recordKey(), nextVersion, request.payload());
+        }
+        storeSuccess(request.requestId(), OP_CORRECT, fingerprint, response);
+        return response;
+    }
+
+    /**
+     * 历史读取：必须明确代次与版本，且该代当前有效；撤回后返回 410。
+     */
+    @Transactional(readOnly = true)
+    public RecordVersionResponse readHistory(String subjectKey, Purpose purpose, int epoch,
+                                             String recordKey, int recordVersion) {
+        requireGrantActive(subjectKey, purpose, epoch);
+        return consentRepository.findRecordVersion(subjectKey, purpose, epoch, recordKey, recordVersion)
+                .map(this::toVersionResponse)
+                .orElseThrow(() -> ApiException.notFound(CODE_RECORD_NOT_FOUND, "记录版本不存在"));
+    }
+
+    /**
+     * 元数据查询：只返回代次与版本号，不返回 payload；撤回后仍可查询。
+     */
+    @Transactional(readOnly = true)
+    public RecordMetadataResponse readMetadata(String subjectKey, Purpose purpose, String recordKey) {
+        ConsentRepository.GrantRow latest = consentRepository.findLatestGrant(subjectKey, purpose)
+                .orElseThrow(() -> ApiException.notFound(CODE_GRANT_NOT_FOUND, "授权不存在"));
+        consentRepository.findRecord(subjectKey, purpose, latest.epoch(), recordKey)
+                .orElseThrow(() -> ApiException.notFound(CODE_RECORD_NOT_FOUND, "记录不存在"));
+        ConsentRepository.VersionRow version = consentRepository
+                .findLatestRecordVersion(subjectKey, purpose, latest.epoch(), recordKey)
+                .orElseThrow(() -> ApiException.notFound(CODE_RECORD_NOT_FOUND, "记录版本链不存在"));
+        return new RecordMetadataResponse(subjectKey, purpose, latest.epoch(), recordKey, version.recordVersion());
+    }
+
     private void requireGrantActive(String subjectKey, Purpose purpose, int epoch) {
         ConsentRepository.GrantRow grant = consentRepository.findGrant(subjectKey, purpose, epoch)
                 .orElseThrow(() -> ApiException.notFound(CODE_GRANT_NOT_FOUND, "授权代次不存在"));
@@ -207,6 +306,21 @@ public class ConsentService {
 
     private RecordResponse toResponse(ConsentRepository.RecordRow row) {
         return new RecordResponse(row.subjectKey(), row.purpose(), row.epoch(), row.recordKey(), row.payload());
+    }
+
+    private RecordVersionResponse toVersionResponse(ConsentRepository.VersionRow row) {
+        return new RecordVersionResponse(row.subjectKey(), row.purpose(), row.epoch(), row.recordKey(),
+                row.recordVersion(), row.payload());
+    }
+
+    /**
+     * 结构化参数指纹：以 JSON 数组序列化操作与全部参数，避免分隔符碰撞。
+     */
+    private String structuredFingerprint(String operation, String... params) {
+        List<String> identity = new ArrayList<>(params.length + 1);
+        identity.add(operation);
+        identity.addAll(List.of(params));
+        return writeSnapshot(identity);
     }
 
     private String writeSnapshot(Object response) {

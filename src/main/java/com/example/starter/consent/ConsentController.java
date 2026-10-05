@@ -8,9 +8,12 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import com.example.starter.consent.dto.CorrectRecordRequest;
 import com.example.starter.consent.dto.GrantRequest;
 import com.example.starter.consent.dto.GrantResponse;
+import com.example.starter.consent.dto.RecordMetadataResponse;
 import com.example.starter.consent.dto.RecordResponse;
+import com.example.starter.consent.dto.RecordVersionResponse;
 import com.example.starter.consent.dto.RecordWriteRequest;
 import com.example.starter.consent.dto.RevokeRequest;
 
@@ -51,5 +54,26 @@ public class ConsentController {
                                @RequestParam Purpose purpose,
                                @RequestParam @NotBlank String recordKey) {
         return consentService.read(subjectKey, purpose, recordKey);
+    }
+
+    @PostMapping("/records/corrections")
+    public RecordVersionResponse correct(@Valid @RequestBody CorrectRecordRequest request) {
+        return consentService.correct(request);
+    }
+
+    @GetMapping("/records/history")
+    public RecordVersionResponse readHistory(@RequestParam @NotBlank String subjectKey,
+                                             @RequestParam Purpose purpose,
+                                             @RequestParam int epoch,
+                                             @RequestParam @NotBlank String recordKey,
+                                             @RequestParam int version) {
+        return consentService.readHistory(subjectKey, purpose, epoch, recordKey, version);
+    }
+
+    @GetMapping("/records/metadata")
+    public RecordMetadataResponse readMetadata(@RequestParam @NotBlank String subjectKey,
+                                               @RequestParam Purpose purpose,
+                                               @RequestParam @NotBlank String recordKey) {
+        return consentService.readMetadata(subjectKey, purpose, recordKey);
     }
 }
