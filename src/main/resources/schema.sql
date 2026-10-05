@@ -45,13 +45,15 @@ CREATE TABLE IF NOT EXISTS lock_file (
     root_version       INT          NOT NULL,
     repository_version BIGINT       NOT NULL,
     request_id         VARCHAR(64)  NOT NULL,
+    joint              TINYINT      NOT NULL DEFAULT 0,
     created_at         TIMESTAMP(6) NOT NULL
 );
 COMMENT ON TABLE lock_file IS '锁定文件：一次成功锁定的根、精确依赖集合及读取时的仓库版本';
-COMMENT ON COLUMN lock_file.root_name IS '根制品名称（精确版本，锁定时固定）';
-COMMENT ON COLUMN lock_file.root_version IS '根制品版本号，正整数';
+COMMENT ON COLUMN lock_file.root_name IS '根制品名称（精确版本，锁定时固定）；联合锁存字典序最小根';
+COMMENT ON COLUMN lock_file.root_version IS '根制品版本号，正整数；联合锁存字典序最小根的版本';
 COMMENT ON COLUMN lock_file.repository_version IS '锁定时读取的仓库版本号';
 COMMENT ON COLUMN lock_file.request_id IS '触发锁定的全局唯一请求 ID';
+COMMENT ON COLUMN lock_file.joint IS '锁定类型：0=单根锁定，1=多根联合锁定';
 COMMENT ON COLUMN lock_file.created_at IS '锁定生成时间，UTC 时间戳';
 
 CREATE UNIQUE INDEX IF NOT EXISTS uk_lock_request ON lock_file (request_id);
@@ -71,6 +73,38 @@ COMMENT ON COLUMN lock_file_entry.version IS '被锁定的精确版本号，正�
 
 CREATE UNIQUE INDEX IF NOT EXISTS uk_entry_lock_name ON lock_file_entry (lock_file_id, name);
 
+CREATE TABLE IF NOT EXISTS lock_file_root (
+    id           BIGINT AUTO_INCREMENT PRIMARY KEY,
+    lock_file_id BIGINT       NOT NULL,
+    name         VARCHAR(128) NOT NULL,
+    version      INT          NOT NULL,
+    CONSTRAINT fk_root_lock FOREIGN KEY (lock_file_id) REFERENCES lock_file (id)
+);
+COMMENT ON TABLE lock_file_root IS '锁文件冻结的全部根制品精确版本；单根锁一行，联合锁多行';
+COMMENT ON COLUMN lock_file_root.lock_file_id IS '所属锁文件 ID';
+COMMENT ON COLUMN lock_file_root.name IS '根制品名称，锁文件内唯一';
+COMMENT ON COLUMN lock_file_root.version IS '根制品精确版本号，正整数，锁定时固定不可回退';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_root_lock_name ON lock_file_root (lock_file_id, name);
+
+CREATE TABLE IF NOT EXISTS lock_file_edge (
+    id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+    lock_file_id    BIGINT       NOT NULL,
+    from_name       VARCHAR(128) NOT NULL,
+    to_name         VARCHAR(128) NOT NULL,
+    minimum_version INT          NOT NULL,
+    maximum_version INT          NOT NULL,
+    CONSTRAINT fk_edge_lock FOREIGN KEY (lock_file_id) REFERENCES lock_file (id)
+);
+COMMENT ON TABLE lock_file_edge IS '锁文件冻结的依赖边：锁定时刻被锁制品之间声明的依赖区间，之后撤回或登记不改写';
+COMMENT ON COLUMN lock_file_edge.lock_file_id IS '所属锁文件 ID';
+COMMENT ON COLUMN lock_file_edge.from_name IS '声明依赖的锁定制品名称';
+COMMENT ON COLUMN lock_file_edge.to_name IS '被依赖的锁定制品名称';
+COMMENT ON COLUMN lock_file_edge.minimum_version IS '依赖最低版本（含），正整数';
+COMMENT ON COLUMN lock_file_edge.maximum_version IS '依赖最高版本（含），正整数';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_edge_lock_from_to ON lock_file_edge (lock_file_id, from_name, to_name);
+
 CREATE TABLE IF NOT EXISTS idempotent_request (
     request_id     VARCHAR(64)  NOT NULL PRIMARY KEY,
     operation      VARCHAR(32)  NOT NULL,
@@ -81,7 +115,7 @@ CREATE TABLE IF NOT EXISTS idempotent_request (
 );
 COMMENT ON TABLE idempotent_request IS '写操作幂等记录，仅保存成功请求；失败不占键';
 COMMENT ON COLUMN idempotent_request.request_id IS '客户端提供的全局唯一请求 ID';
-COMMENT ON COLUMN idempotent_request.operation IS '操作类型：REGISTER_ARTIFACT/WITHDRAW_ARTIFACT/CREATE_LOCK';
+COMMENT ON COLUMN idempotent_request.operation IS '操作类型：REGISTER_ARTIFACT/WITHDRAW_ARTIFACT/CREATE_LOCK/CREATE_JOINT_LOCK';
 COMMENT ON COLUMN idempotent_request.request_hash IS '规范化请求参数的 SHA-256 摘要，异参重放用于冲突判定';
 COMMENT ON COLUMN idempotent_request.http_status IS '原成功响应 HTTP 状态码';
 COMMENT ON COLUMN idempotent_request.response_json IS '原成功响应 JSON，重放时原样返回';

@@ -1,6 +1,8 @@
 package com.example.starter.api;
 
 import com.example.starter.api.dto.ArtifactResponse;
+import com.example.starter.api.dto.JointLockFileResponse;
+import com.example.starter.api.dto.JointLockRequest;
 import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
 import com.example.starter.api.dto.RegisterArtifactRequest;
@@ -56,6 +58,27 @@ public class ArtifactController {
             @RequestHeader("X-Request-Id") String requestId,
             @Valid @RequestBody LockRequest request) {
         return ResponseEntity.status(HttpStatus.CREATED).body(artifactService.createLock(requestId, request));
+    }
+
+    /** 创建多根联合锁文件。 */
+    @PostMapping("/locks/joint")
+    public ResponseEntity<JointLockFileResponse> jointLock(
+            @RequestHeader("X-Request-Id") String requestId,
+            @Valid @RequestBody JointLockRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(artifactService.createJointLock(requestId, request));
+    }
+
+    /** 查询全部多根联合锁文件。 */
+    @GetMapping("/locks/joint")
+    public List<JointLockFileResponse> listJointLocks() {
+        return artifactService.listJointLocks();
+    }
+
+    /** 按 ID 查询单个多根联合锁文件。 */
+    @GetMapping("/locks/joint/{id}")
+    public JointLockFileResponse getJointLock(@PathVariable long id) {
+        return artifactService.getJointLock(id);
     }
 
     /** 查询全部历史锁文件。 */

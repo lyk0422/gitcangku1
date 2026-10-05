@@ -163,20 +163,21 @@ public class RepositoryDao {
                 "UPDATE artifact SET withdrawn = 1 WHERE id = ? AND withdrawn = 0", artifactId);
     }
 
-    /** 新增锁文件主记录，返回自增主键。 */
+    /** 新增锁文件主记录，返回自增主键；joint 标记是否为多根联合锁定。 */
     public long insertLockFile(String rootName, int rootVersion, long repositoryVersion,
-                               String requestId, Instant createdAt) {
+                               String requestId, Instant createdAt, boolean joint) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbcTemplate.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO lock_file (root_name, root_version, repository_version, request_id, created_at) "
-                            + "VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO lock_file (root_name, root_version, repository_version, request_id, joint, created_at) "
+                            + "VALUES (?, ?, ?, ?, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, rootName);
             ps.setInt(2, rootVersion);
             ps.setLong(3, repositoryVersion);
             ps.setString(4, requestId);
-            ps.setTimestamp(5, Timestamp.from(createdAt));
+            ps.setInt(5, joint ? 1 : 0);
+            ps.setTimestamp(6, Timestamp.from(createdAt));
             return ps;
         }, keyHolder);
         Number key = keyHolder.getKey();
@@ -184,6 +185,22 @@ public class RepositoryDao {
             throw new IllegalStateException("插入锁文件未获取自增主键");
         }
         return key.longValue();
+    }
+
+    /** 为锁文件写入一条冻结的根制品精确版本。 */
+    public void insertLockRoot(long lockFileId, String name, int version) {
+        jdbcTemplate.update(
+                "INSERT INTO lock_file_root (lock_file_id, name, version) VALUES (?, ?, ?)",
+                lockFileId, name, version);
+    }
+
+    /** 为锁文件写入一条冻结的依赖边。 */
+    public void insertLockEdge(long lockFileId, String fromName, String toName,
+                               int minimumVersion, int maximumVersion) {
+        jdbcTemplate.update(
+                "INSERT INTO lock_file_edge (lock_file_id, from_name, to_name, minimum_version, maximum_version) "
+                        + "VALUES (?, ?, ?, ?, ?)",
+                lockFileId, fromName, toName, minimumVersion, maximumVersion);
     }
 
     /** 新增锁文件精确版本条目。 */
@@ -242,26 +259,74 @@ public class RepositoryDao {
     public record LockEntryRow(long lockFileId, String name, int version) {
     }
 
-    /** 查询全部历史锁文件，按 ID 升序。 */
+    /** 锁文件依赖边行。 */
+    public record LockEdgeRow(long lockFileId, String fromName, String toName,
+                              int minimumVersion, int maximumVersion) {
+    }
+
+    /** 查询全部单根历史锁文件，按 ID 升序。 */
     public List<LockFileRow> listLockFiles() {
         return jdbcTemplate.query(
                 "SELECT id, root_name, root_version, repository_version, created_at "
-                        + "FROM lock_file ORDER BY id ASC",
+                        + "FROM lock_file WHERE joint = 0 ORDER BY id ASC",
                 (rs, n) -> new LockFileRow(rs.getLong("id"), rs.getString("root_name"),
                         rs.getInt("root_version"), rs.getLong("repository_version"),
                         rs.getTimestamp("created_at").toInstant()));
     }
 
-    /** 按主键查询锁文件，不存在返回 null。 */
+    /** 按主键查询单根锁文件，不存在或为联合锁返回 null。 */
     public LockFileRow getLockFile(long id) {
         List<LockFileRow> rows = jdbcTemplate.query(
                 "SELECT id, root_name, root_version, repository_version, created_at "
-                        + "FROM lock_file WHERE id = ?",
+                        + "FROM lock_file WHERE id = ? AND joint = 0",
                 (rs, n) -> new LockFileRow(rs.getLong("id"), rs.getString("root_name"),
                         rs.getInt("root_version"), rs.getLong("repository_version"),
                         rs.getTimestamp("created_at").toInstant()),
                 id);
         return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /** 查询全部多根联合锁文件，按 ID 升序。 */
+    public List<LockFileRow> listJointLockFiles() {
+        return jdbcTemplate.query(
+                "SELECT id, root_name, root_version, repository_version, created_at "
+                        + "FROM lock_file WHERE joint = 1 ORDER BY id ASC",
+                (rs, n) -> new LockFileRow(rs.getLong("id"), rs.getString("root_name"),
+                        rs.getInt("root_version"), rs.getLong("repository_version"),
+                        rs.getTimestamp("created_at").toInstant()));
+    }
+
+    /** 按主键查询多根联合锁文件，不存在或为单根锁返回 null。 */
+    public LockFileRow getJointLockFile(long id) {
+        List<LockFileRow> rows = jdbcTemplate.query(
+                "SELECT id, root_name, root_version, repository_version, created_at "
+                        + "FROM lock_file WHERE id = ? AND joint = 1",
+                (rs, n) -> new LockFileRow(rs.getLong("id"), rs.getString("root_name"),
+                        rs.getInt("root_version"), rs.getLong("repository_version"),
+                        rs.getTimestamp("created_at").toInstant()),
+                id);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /** 查询某锁文件冻结的全部根，按名称升序。 */
+    public List<LockEntryRow> listLockRoots(long lockFileId) {
+        return jdbcTemplate.query(
+                "SELECT lock_file_id, name, version FROM lock_file_root "
+                        + "WHERE lock_file_id = ? ORDER BY name ASC",
+                (rs, n) -> new LockEntryRow(rs.getLong("lock_file_id"),
+                        rs.getString("name"), rs.getInt("version")),
+                lockFileId);
+    }
+
+    /** 查询某锁文件冻结的全部依赖边，按 from_name、to_name 升序。 */
+    public List<LockEdgeRow> listLockEdges(long lockFileId) {
+        return jdbcTemplate.query(
+                "SELECT lock_file_id, from_name, to_name, minimum_version, maximum_version "
+                        + "FROM lock_file_edge WHERE lock_file_id = ? ORDER BY from_name ASC, to_name ASC",
+                (rs, n) -> new LockEdgeRow(rs.getLong("lock_file_id"),
+                        rs.getString("from_name"), rs.getString("to_name"),
+                        rs.getInt("minimum_version"), rs.getInt("maximum_version")),
+                lockFileId);
     }
 
     /** 查询某锁文件的全部条目，按名称升序。 */

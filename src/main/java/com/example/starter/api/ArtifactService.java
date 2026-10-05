@@ -1,6 +1,8 @@
 package com.example.starter.api;
 
 import com.example.starter.api.dto.ArtifactResponse;
+import com.example.starter.api.dto.JointLockFileResponse;
+import com.example.starter.api.dto.JointLockRequest;
 import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
 import com.example.starter.api.dto.RegisterArtifactRequest;
@@ -20,6 +22,15 @@ public interface ArtifactService {
 
     /** 创建锁文件（requestId 幂等）。 */
     LockFileResponse createLock(String requestId, LockRequest request);
+
+    /** 创建多根联合锁文件（requestId 幂等，根集合换序同参）。 */
+    JointLockFileResponse createJointLock(String requestId, JointLockRequest request);
+
+    /** 查询全部多根联合锁文件，根与条目按名称排序。 */
+    List<JointLockFileResponse> listJointLocks();
+
+    /** 按 ID 查询单个多根联合锁文件，不存在返回 null。 */
+    JointLockFileResponse getJointLock(long id);
 
     /** 查询全部历史锁文件，按名称排序返回条目。 */
     List<LockFileResponse> listLocks();

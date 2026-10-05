@@ -52,6 +52,49 @@ public final class LockResolver {
     }
 
     /**
+     * 多根联合求解：全部根版本固定不可回退，区间约束汇合自全部根。
+     *
+     * <p>根可能互为依赖，此时根固定版本必须落在对方声明的区间内；
+     * 非根名称仍按字典序扩展、版本降序回退，取首个完整可行结果。
+     *
+     * @param snapshot 一致性仓库快照（每名称版本按版本号降序）
+     * @param roots    根名称 -> 根精确版本（必须全部存在且未撤回，由调用方保证）
+     * @return 名称 -> 精确版本（名称升序）；全部组合不可行时返回 null
+     */
+    public static Map<String, Integer> resolveJoint(RepositorySnapshot snapshot,
+                                                    Map<String, Integer> roots) {
+        if (roots == null || roots.isEmpty()) {
+            throw new IllegalArgumentException("根集合不能为空");
+        }
+        Map<String, List<ArtifactVersion>> all = snapshot.artifacts();
+        TreeMap<String, ArtifactVersion> chosen = new TreeMap<>();
+        for (Map.Entry<String, Integer> root : roots.entrySet()) {
+            List<ArtifactVersion> candidates = all.get(root.getKey());
+            if (candidates == null) {
+                throw new IllegalArgumentException("根制品不存在: " + root.getKey());
+            }
+            ArtifactVersion fixed = candidates.stream()
+                    .filter(a -> a.version() == root.getValue() && !a.withdrawn())
+                    .findFirst()
+                    .orElseThrow(() -> new IllegalArgumentException(
+                            "根制品版本不存在或已撤回: " + root.getKey() + ":" + root.getValue()));
+            chosen.put(root.getKey(), fixed);
+        }
+        // 根之间（含根自依赖）的区间约束必须互相满足。
+        for (ArtifactVersion fixed : chosen.values()) {
+            if (!satisfiesChosen(fixed, chosen)) {
+                return null;
+            }
+        }
+        if (solve(all, chosen)) {
+            TreeMap<String, Integer> result = new TreeMap<>();
+            chosen.forEach((name, artifact) -> result.put(name, artifact.version()));
+            return result;
+        }
+        return null;
+    }
+
+    /**
      * 递归回溯：选出字典序最小的未解析依赖名称，从高到低尝试候选版本。
      */
     private static boolean solve(Map<String, List<ArtifactVersion>> all,

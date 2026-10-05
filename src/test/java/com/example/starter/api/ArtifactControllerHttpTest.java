@@ -35,6 +35,8 @@ class ArtifactControllerHttpTest {
 
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM lock_file_edge");
+        jdbcTemplate.update("DELETE FROM lock_file_root");
         jdbcTemplate.update("DELETE FROM lock_file_entry");
         jdbcTemplate.update("DELETE FROM lock_file");
         jdbcTemplate.update("DELETE FROM artifact_dependency");
