@@ -1,5 +1,8 @@
 package com.example.starter.consent;
 
+import java.util.LinkedHashSet;
+import java.util.Set;
+
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -12,7 +15,12 @@ import com.example.starter.consent.dto.GrantRequest;
 import com.example.starter.consent.dto.GrantResponse;
 import com.example.starter.consent.dto.RecordResponse;
 import com.example.starter.consent.dto.RecordWriteRequest;
+import com.example.starter.consent.dto.RestrictionReplaceRequest;
+import com.example.starter.consent.dto.RestrictionResponse;
 import com.example.starter.consent.dto.RevokeRequest;
+import com.example.starter.consent.dto.StructuredRecordReadResponse;
+import com.example.starter.consent.dto.StructuredRecordWriteRequest;
+import com.example.starter.consent.dto.StructuredRecordWriteResponse;
 
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
@@ -51,5 +59,40 @@ public class ConsentController {
                                @RequestParam Purpose purpose,
                                @RequestParam @NotBlank String recordKey) {
         return consentService.read(subjectKey, purpose, recordKey);
+    }
+
+    @PostMapping("/structured-records")
+    public StructuredRecordWriteResponse writeStructured(@Valid @RequestBody StructuredRecordWriteRequest request) {
+        return consentService.writeStructured(request);
+    }
+
+    /**
+     * 结构化读取：可选 fields 参数（逗号分隔）指定字段集合；未知字段返回 400，禁止字段不出现。
+     */
+    @GetMapping("/structured-records")
+    public StructuredRecordReadResponse readStructured(@RequestParam @NotBlank String subjectKey,
+                                                       @RequestParam Purpose purpose,
+                                                       @RequestParam @NotBlank String recordKey,
+                                                       @RequestParam(required = false) String fields) {
+        return consentService.readStructured(subjectKey, purpose, recordKey, parseFieldsParam(fields));
+    }
+
+    @PostMapping("/consents/restrictions")
+    public RestrictionResponse replaceRestriction(@Valid @RequestBody RestrictionReplaceRequest request) {
+        return consentService.replaceRestriction(request);
+    }
+
+    private static Set<String> parseFieldsParam(String fields) {
+        if (fields == null || fields.isBlank()) {
+            return null;
+        }
+        Set<String> requested = new LinkedHashSet<>();
+        for (String name : fields.split(",")) {
+            String trimmed = name.trim();
+            if (!trimmed.isEmpty()) {
+                requested.add(trimmed);
+            }
+        }
+        return requested.isEmpty() ? null : requested;
     }
 }

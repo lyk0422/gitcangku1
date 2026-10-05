@@ -29,3 +29,25 @@ CREATE TABLE IF NOT EXISTS idempotency_request (
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (request_id)
 );
+
+CREATE TABLE IF NOT EXISTS structured_record (
+    subject_key VARCHAR(128) NOT NULL,
+    purpose VARCHAR(32) NOT NULL,
+    epoch INT NOT NULL,
+    record_key VARCHAR(128) NOT NULL,
+    fields_json TEXT NOT NULL,
+    request_id VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (subject_key, purpose, epoch, record_key)
+);
+
+CREATE TABLE IF NOT EXISTS field_restriction (
+    subject_key VARCHAR(128) NOT NULL,
+    purpose VARCHAR(32) NOT NULL,
+    epoch INT NOT NULL,
+    version INT NOT NULL,
+    forbidden_fields TEXT NOT NULL,
+    request_id VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (subject_key, purpose, epoch, version)
+);
