@@ -26,6 +26,14 @@ public class ConsentRepository {
             rs.getString("record_key"),
             rs.getString("payload"));
 
+    private static final RowMapper<RecordVersionRow> VERSION_MAPPER = (rs, rowNum) -> new RecordVersionRow(
+            rs.getString("subject_key"),
+            Purpose.valueOf(rs.getString("purpose")),
+            rs.getInt("epoch"),
+            rs.getString("record_key"),
+            rs.getInt("record_version"),
+            rs.getString("payload"));
+
     private final JdbcTemplate jdbc;
 
     public ConsentRepository(JdbcTemplate jdbc) {
@@ -50,15 +58,40 @@ public class ConsentRepository {
      * @param purpose    用途
      * @param epoch      所属代次
      * @param recordKey  记录键
-     * @param payload    记录内容
+     * @param payload    记录初始版本（v1）内容
      */
     public record RecordRow(String subjectKey, Purpose purpose, int epoch, String recordKey, String payload) {
+    }
+
+    /**
+     * 记录版本行：每次写入或更正追加一个完整版本，旧版本保留。
+     *
+     * @param subjectKey    主体标识
+     * @param purpose       用途
+     * @param epoch         所属代次
+     * @param recordKey     记录键
+     * @param recordVersion 记录版本号，从 1 开始递增
+     * @param payload       该版本的完整记录内容
+     */
+    public record RecordVersionRow(String subjectKey, Purpose purpose, int epoch, String recordKey,
+                                   int recordVersion, String payload) {
     }
 
     Optional<GrantRow> findGrant(String subjectKey, Purpose purpose, int epoch) {
         List<GrantRow> rows = jdbc.query(
                 "SELECT subject_key, purpose, epoch, status FROM consent_grant"
                         + " WHERE subject_key = ? AND purpose = ? AND epoch = ?",
+                GRANT_MAPPER, subjectKey, purpose.name(), epoch);
+        return rows.stream().findFirst();
+    }
+
+    /**
+     * 读取授权代次并加行锁（FOR UPDATE），用于更正与撤回的原子判定。
+     */
+    Optional<GrantRow> findGrantForUpdate(String subjectKey, Purpose purpose, int epoch) {
+        List<GrantRow> rows = jdbc.query(
+                "SELECT subject_key, purpose, epoch, status FROM consent_grant"
+                        + " WHERE subject_key = ? AND purpose = ? AND epoch = ? FOR UPDATE",
                 GRANT_MAPPER, subjectKey, purpose.name(), epoch);
         return rows.stream().findFirst();
     }
@@ -102,5 +135,35 @@ public class ConsentRepository {
                 "INSERT INTO consent_record (subject_key, purpose, epoch, record_key, payload, request_id)"
                         + " VALUES (?, ?, ?, ?, ?, ?)",
                 subjectKey, purpose.name(), epoch, recordKey, payload, requestId);
+    }
+
+    Optional<RecordVersionRow> findVersion(String subjectKey, Purpose purpose, int epoch,
+                                           String recordKey, int recordVersion) {
+        List<RecordVersionRow> rows = jdbc.query(
+                "SELECT subject_key, purpose, epoch, record_key, record_version, payload"
+                        + " FROM consent_record_version"
+                        + " WHERE subject_key = ? AND purpose = ? AND epoch = ? AND record_key = ?"
+                        + " AND record_version = ?",
+                VERSION_MAPPER, subjectKey, purpose.name(), epoch, recordKey, recordVersion);
+        return rows.stream().findFirst();
+    }
+
+    Optional<RecordVersionRow> findLatestVersion(String subjectKey, Purpose purpose, int epoch, String recordKey) {
+        List<RecordVersionRow> rows = jdbc.query(
+                "SELECT subject_key, purpose, epoch, record_key, record_version, payload"
+                        + " FROM consent_record_version"
+                        + " WHERE subject_key = ? AND purpose = ? AND epoch = ? AND record_key = ?"
+                        + " ORDER BY record_version DESC LIMIT 1",
+                VERSION_MAPPER, subjectKey, purpose.name(), epoch, recordKey);
+        return rows.stream().findFirst();
+    }
+
+    void insertVersion(String subjectKey, Purpose purpose, int epoch, String recordKey,
+                       int recordVersion, String payload, String requestId) {
+        jdbc.update(
+                "INSERT INTO consent_record_version"
+                        + " (subject_key, purpose, epoch, record_key, record_version, payload, request_id)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                subjectKey, purpose.name(), epoch, recordKey, recordVersion, payload, requestId);
     }
 }

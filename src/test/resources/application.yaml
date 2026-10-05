@@ -1,6 +1,8 @@
 spring:
   datasource:
-    url: jdbc:h2:mem:consent-test;MODE=MySQL;DB_CLOSE_DELAY=-1
+    # 独立命名内存库；不挂 DB_CLOSE_DELAY，连接池随测试上下文关闭后数据库即释放
+    # LOCK_TIMEOUT 放宽以容纳并发测试中的行锁等待
+    url: jdbc:h2:mem:consent-test;MODE=MySQL;LOCK_TIMEOUT=10000
     driver-class-name: org.h2.Driver
     username: sa
     password: ""

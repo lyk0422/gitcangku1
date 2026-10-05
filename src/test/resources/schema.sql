@@ -21,10 +21,22 @@ CREATE TABLE IF NOT EXISTS consent_record (
     PRIMARY KEY (subject_key, purpose, epoch, record_key)
 );
 
+CREATE TABLE IF NOT EXISTS consent_record_version (
+    subject_key VARCHAR(128) NOT NULL,
+    purpose VARCHAR(32) NOT NULL,
+    epoch INT NOT NULL,
+    record_key VARCHAR(128) NOT NULL,
+    record_version INT NOT NULL,
+    payload TEXT NOT NULL,
+    request_id VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (subject_key, purpose, epoch, record_key, record_version)
+);
+
 CREATE TABLE IF NOT EXISTS idempotency_request (
     request_id VARCHAR(128) NOT NULL,
     operation VARCHAR(32) NOT NULL,
-    params_fingerprint VARCHAR(512) NOT NULL,
+    params_fingerprint TEXT NOT NULL,
     response_body TEXT NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (request_id)

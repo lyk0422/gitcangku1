@@ -10,11 +10,14 @@ import org.springframework.web.bind.annotation.RestController;
 
 import com.example.starter.consent.dto.GrantRequest;
 import com.example.starter.consent.dto.GrantResponse;
+import com.example.starter.consent.dto.RecordMetadataResponse;
 import com.example.starter.consent.dto.RecordResponse;
 import com.example.starter.consent.dto.RecordWriteRequest;
+import com.example.starter.consent.dto.RectifyRequest;
 import com.example.starter.consent.dto.RevokeRequest;
 
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
 
 /**
@@ -51,5 +54,26 @@ public class ConsentController {
                                @RequestParam Purpose purpose,
                                @RequestParam @NotBlank String recordKey) {
         return consentService.read(subjectKey, purpose, recordKey);
+    }
+
+    @PostMapping("/records/rectifications")
+    public RecordResponse rectify(@Valid @RequestBody RectifyRequest request) {
+        return consentService.rectify(request);
+    }
+
+    @GetMapping("/records/history")
+    public RecordResponse readHistory(@RequestParam @NotBlank String subjectKey,
+                                      @RequestParam Purpose purpose,
+                                      @RequestParam @Min(1) int epoch,
+                                      @RequestParam @NotBlank String recordKey,
+                                      @RequestParam @Min(1) int version) {
+        return consentService.readHistory(subjectKey, purpose, epoch, recordKey, version);
+    }
+
+    @GetMapping("/records/metadata")
+    public RecordMetadataResponse metadata(@RequestParam @NotBlank String subjectKey,
+                                           @RequestParam Purpose purpose,
+                                           @RequestParam @NotBlank String recordKey) {
+        return consentService.metadata(subjectKey, purpose, recordKey);
     }
 }

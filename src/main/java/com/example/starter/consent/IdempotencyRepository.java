@@ -29,8 +29,8 @@ public class IdempotencyRepository {
      * 幂等请求行。
      *
      * @param requestId         幂等请求标识
-     * @param operation         操作类型：GRANT / WRITE / REVOKE
-     * @param paramsFingerprint 规范化参数指纹，用于检测同 requestId 参数变更
+     * @param operation         操作类型：GRANT / WRITE / REVOKE / RECTIFY
+     * @param paramsFingerprint 规范化参数指纹（结构化 JSON 或分隔拼接），用于检测同 requestId 参数变更
      * @param responseBody      成功响应快照（JSON）
      */
     public record IdempotencyRow(String requestId, String operation, String paramsFingerprint, String responseBody) {
