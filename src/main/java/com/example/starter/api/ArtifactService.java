@@ -3,6 +3,8 @@ package com.example.starter.api;
 import com.example.starter.api.dto.ArtifactResponse;
 import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
+import com.example.starter.api.dto.MultiLockFileResponse;
+import com.example.starter.api.dto.MultiLockRequest;
 import com.example.starter.api.dto.RegisterArtifactRequest;
 
 import java.util.List;
@@ -26,4 +28,13 @@ public interface ArtifactService {
 
     /** 按 ID 查询单个锁文件，不存在返回 null。 */
     LockFileResponse getLock(long id);
+
+    /** 创建多根联合锁文件（requestId 幂等，根集合与顺序无关）。 */
+    MultiLockFileResponse createMultiLock(String requestId, MultiLockRequest request);
+
+    /** 查询全部历史联合锁文件，根与条目均按名称排序。 */
+    List<MultiLockFileResponse> listMultiLocks();
+
+    /** 按 ID 查询单个联合锁文件，不存在返回 null。 */
+    MultiLockFileResponse getMultiLock(long id);
 }

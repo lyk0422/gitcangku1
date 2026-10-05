@@ -6,6 +6,9 @@ import com.example.starter.api.dto.DependencyView;
 import com.example.starter.api.dto.LockEntryResponse;
 import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
+import com.example.starter.api.dto.MultiLockFileResponse;
+import com.example.starter.api.dto.MultiLockRequest;
+import com.example.starter.api.dto.MultiLockRoot;
 import com.example.starter.api.dto.RegisterArtifactRequest;
 import com.example.starter.domain.ArtifactVersion;
 import com.example.starter.domain.DependencyRange;
@@ -15,6 +18,7 @@ import com.example.starter.repo.RepositoryDao;
 import com.example.starter.repo.RepositoryDao.IdempotentRecord;
 import com.example.starter.repo.RepositoryDao.LockEntryRow;
 import com.example.starter.repo.RepositoryDao.LockFileRow;
+import com.example.starter.repo.RepositoryDao.MultiLockFileRow;
 import com.example.starter.support.ApiException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
@@ -49,6 +53,7 @@ public class ArtifactServiceImpl implements ArtifactService {
     private static final String OP_REGISTER = "REGISTER_ARTIFACT";
     private static final String OP_WITHDRAW = "WITHDRAW_ARTIFACT";
     private static final String OP_LOCK = "CREATE_LOCK";
+    private static final String OP_MULTI_LOCK = "CREATE_MULTI_LOCK";
 
     private final RepositoryDao repositoryDao;
     private final TransactionTemplate transactionTemplate;
@@ -114,6 +119,35 @@ public class ArtifactServiceImpl implements ArtifactService {
             throw ApiException.notFound("锁文件不存在: " + id);
         }
         return toLockResponse(row, repositoryDao.listLockEntries(id));
+    }
+
+    @Override
+    public MultiLockFileResponse createMultiLock(String requestId, MultiLockRequest request) {
+        requireRequestId(requestId);
+        Map<String, Integer> roots = validateMultiLockRequest(request);
+        String hash = sha256(OP_MULTI_LOCK + "|" + canonicalMultiLock(roots)
+                + "|" + request.expectedRepositoryVersion());
+        return executeIdempotent(requestId, OP_MULTI_LOCK, hash, 201,
+                () -> doMultiLock(roots, request.expectedRepositoryVersion()),
+                MultiLockFileResponse.class);
+    }
+
+    @Override
+    public List<MultiLockFileResponse> listMultiLocks() {
+        List<MultiLockFileResponse> result = new ArrayList<>();
+        for (MultiLockFileRow row : repositoryDao.listMultiLockFiles()) {
+            result.add(toMultiLockResponse(row));
+        }
+        return result;
+    }
+
+    @Override
+    public MultiLockFileResponse getMultiLock(long id) {
+        MultiLockFileRow row = repositoryDao.getMultiLockFile(id);
+        if (row == null) {
+            throw ApiException.notFound("联合锁文件不存在: " + id);
+        }
+        return toMultiLockResponse(row);
     }
 
     // ------------------------------------------------------------------
@@ -201,6 +235,35 @@ public class ArtifactServiceImpl implements ArtifactService {
         List<LockEntryResponse> entries = new ArrayList<>();
         solution.forEach((n, v) -> entries.add(new LockEntryResponse(n, v)));
         return new LockFileResponse(lockFileId, rootName, rootVersion, currentVersion, now, entries);
+    }
+
+    private MultiLockFileResponse doMultiLock(Map<String, Integer> roots, long expectedVersion) {
+        // 当前事务已在入口持有 repository_state 行锁；此处读取版本号并做乐观校验。
+        long currentVersion = repositoryDao.lockRepositoryState();
+        if (currentVersion != expectedVersion) {
+            throw ApiException.conflict("仓库版本不匹配：expected="
+                    + expectedVersion + ", actual=" + currentVersion);
+        }
+
+        RepositorySnapshot snapshot = repositoryDao.loadSnapshot();
+        Map<String, Integer> solution = LockResolver.resolveMulti(snapshot, roots);
+        if (solution == null) {
+            throw ApiException.unprocessable(
+                    "根缺失、已撤回或不存在满足全部根与依赖区间的共同解，无法联合锁定");
+        }
+
+        Instant now = Instant.now(clock);
+        long lockFileId = repositoryDao.insertMultiLockFile(currentVersion,
+                currentRequestId.get(), now);
+        roots.forEach((n, v) -> repositoryDao.insertMultiLockRoot(lockFileId, n, v));
+        solution.forEach((n, v) -> repositoryDao.insertMultiLockEntry(lockFileId, n, v));
+
+        List<MultiLockRoot> rootViews = new ArrayList<>();
+        roots.forEach((n, v) -> rootViews.add(new MultiLockRoot(n, v)));
+        List<LockEntryResponse> entries = new ArrayList<>();
+        solution.forEach((n, v) -> entries.add(new LockEntryResponse(n, v)));
+        return new MultiLockFileResponse(lockFileId, List.copyOf(rootViews),
+                currentVersion, now, entries);
     }
 
     // ------------------------------------------------------------------
@@ -315,6 +378,54 @@ public class ArtifactServiceImpl implements ArtifactService {
             }
         }
         return List.copyOf(sorted.values());
+    }
+
+    /**
+     * 校验多根请求并返回名称升序的根映射：2～4 个根、名称非空、版本为正、名称互不重复。
+     */
+    private Map<String, Integer> validateMultiLockRequest(MultiLockRequest request) {
+        if (request.roots() == null || request.roots().size() < 2 || request.roots().size() > 4) {
+            throw ApiException.badRequest("联合锁定需要 2～4 个根");
+        }
+        TreeMap<String, Integer> roots = new TreeMap<>();
+        for (MultiLockRoot root : request.roots()) {
+            if (root == null || root.name() == null || root.name().isBlank()) {
+                throw ApiException.badRequest("根名称不能为空");
+            }
+            if (root.version() <= 0) {
+                throw ApiException.badRequest("根版本必须为正整数: " + root.name().trim());
+            }
+            if (roots.put(root.name().trim(), root.version()) != null) {
+                throw ApiException.badRequest("根名称重复: " + root.name().trim());
+            }
+        }
+        return roots;
+    }
+
+    /**
+     * 根集合的规范化摘要：按名称排序后以 JSON 结构化拼接，避免分隔符碰撞；
+     * 根集合换序得到相同摘要，保证换序同参命中幂等重放。
+     */
+    private String canonicalMultiLock(Map<String, Integer> sortedRoots) {
+        List<Map<String, Object>> rootList = new ArrayList<>();
+        sortedRoots.forEach((name, version) -> {
+            Map<String, Object> entry = new TreeMap<>();
+            entry.put("name", name);
+            entry.put("version", version);
+            rootList.add(entry);
+        });
+        return writeJson(Map.of("roots", rootList));
+    }
+
+    private MultiLockFileResponse toMultiLockResponse(MultiLockFileRow row) {
+        List<MultiLockRoot> roots = repositoryDao.listMultiLockRoots(row.id()).stream()
+                .map(r -> new MultiLockRoot(r.name(), r.version()))
+                .toList();
+        List<LockEntryResponse> entries = repositoryDao.listMultiLockEntries(row.id()).stream()
+                .map(e -> new LockEntryResponse(e.name(), e.version()))
+                .toList();
+        return new MultiLockFileResponse(row.id(), roots, row.repositoryVersion(),
+                row.createdAt(), entries);
     }
 
     private LockFileResponse toLockResponse(LockFileRow row, List<LockEntryRow> entries) {

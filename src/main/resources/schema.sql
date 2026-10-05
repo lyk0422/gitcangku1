@@ -71,6 +71,47 @@ COMMENT ON COLUMN lock_file_entry.version IS '被锁定的精确版本号，正�
 
 CREATE UNIQUE INDEX IF NOT EXISTS uk_entry_lock_name ON lock_file_entry (lock_file_id, name);
 
+CREATE TABLE IF NOT EXISTS multi_lock_file (
+    id                 BIGINT AUTO_INCREMENT PRIMARY KEY,
+    repository_version BIGINT       NOT NULL,
+    request_id         VARCHAR(64)  NOT NULL,
+    created_at         TIMESTAMP(6) NOT NULL
+);
+COMMENT ON TABLE multi_lock_file IS '多根联合锁文件：一次联合锁定冻结的全部根、共享依赖及读取时的仓库版本';
+COMMENT ON COLUMN multi_lock_file.repository_version IS '锁定时读取的仓库版本号';
+COMMENT ON COLUMN multi_lock_file.request_id IS '触发联合锁定的全局唯一请求 ID';
+COMMENT ON COLUMN multi_lock_file.created_at IS '联合锁定生成时间，UTC 时间戳';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_multi_lock_request ON multi_lock_file (request_id);
+
+CREATE TABLE IF NOT EXISTS multi_lock_root (
+    id           BIGINT AUTO_INCREMENT PRIMARY KEY,
+    lock_file_id BIGINT       NOT NULL,
+    name         VARCHAR(128) NOT NULL,
+    version      INT          NOT NULL,
+    CONSTRAINT fk_mroot_lock FOREIGN KEY (lock_file_id) REFERENCES multi_lock_file (id)
+);
+COMMENT ON TABLE multi_lock_root IS '联合锁定的根集合：2～4 个不同名称的精确根版本，锁定时固定不可回退';
+COMMENT ON COLUMN multi_lock_root.lock_file_id IS '所属联合锁文件 ID';
+COMMENT ON COLUMN multi_lock_root.name IS '根制品名称，同一锁文件内唯一';
+COMMENT ON COLUMN multi_lock_root.version IS '根制品精确版本号，正整数';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_mroot_lock_name ON multi_lock_root (lock_file_id, name);
+
+CREATE TABLE IF NOT EXISTS multi_lock_entry (
+    id           BIGINT AUTO_INCREMENT PRIMARY KEY,
+    lock_file_id BIGINT       NOT NULL,
+    name         VARCHAR(128) NOT NULL,
+    version      INT          NOT NULL,
+    CONSTRAINT fk_mentry_lock FOREIGN KEY (lock_file_id) REFERENCES multi_lock_file (id)
+);
+COMMENT ON TABLE multi_lock_entry IS '联合锁文件中的精确制品版本（含全部根与共享依赖），每个名称仅一个版本';
+COMMENT ON COLUMN multi_lock_entry.lock_file_id IS '所属联合锁文件 ID';
+COMMENT ON COLUMN multi_lock_entry.name IS '被锁定制品名称';
+COMMENT ON COLUMN multi_lock_entry.version IS '被锁定的精确版本号，正整数';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_mentry_lock_name ON multi_lock_entry (lock_file_id, name);
+
 CREATE TABLE IF NOT EXISTS idempotent_request (
     request_id     VARCHAR(64)  NOT NULL PRIMARY KEY,
     operation      VARCHAR(32)  NOT NULL,
@@ -81,7 +122,7 @@ CREATE TABLE IF NOT EXISTS idempotent_request (
 );
 COMMENT ON TABLE idempotent_request IS '写操作幂等记录，仅保存成功请求；失败不占键';
 COMMENT ON COLUMN idempotent_request.request_id IS '客户端提供的全局唯一请求 ID';
-COMMENT ON COLUMN idempotent_request.operation IS '操作类型：REGISTER_ARTIFACT/WITHDRAW_ARTIFACT/CREATE_LOCK';
+COMMENT ON COLUMN idempotent_request.operation IS '操作类型：REGISTER_ARTIFACT/WITHDRAW_ARTIFACT/CREATE_LOCK/CREATE_MULTI_LOCK';
 COMMENT ON COLUMN idempotent_request.request_hash IS '规范化请求参数的 SHA-256 摘要，异参重放用于冲突判定';
 COMMENT ON COLUMN idempotent_request.http_status IS '原成功响应 HTTP 状态码';
 COMMENT ON COLUMN idempotent_request.response_json IS '原成功响应 JSON，重放时原样返回';

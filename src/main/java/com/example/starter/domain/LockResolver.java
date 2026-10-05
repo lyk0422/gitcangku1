@@ -31,17 +31,42 @@ public final class LockResolver {
         if (rootCandidates == null) {
             throw new IllegalArgumentException("根制品不存在: " + rootName);
         }
-        ArtifactVersion root = rootCandidates.stream()
-                .filter(a -> a.version() == rootVersion && !a.withdrawn())
-                .findFirst()
-                .orElseThrow(() -> new IllegalArgumentException(
-                        "根制品版本不存在或已撤回: " + rootName + ":" + rootVersion));
+        if (rootCandidates.stream().noneMatch(a -> a.version() == rootVersion && !a.withdrawn())) {
+            throw new IllegalArgumentException(
+                    "根制品版本不存在或已撤回: " + rootName + ":" + rootVersion);
+        }
+        return resolveMulti(snapshot, Map.of(rootName, rootVersion));
+    }
 
+    /**
+     * 多根联合求解：全部根版本固定，汇合所有根及后续已选制品的区间约束后回溯求解。
+     *
+     * <p>根也可能出现在其他根的依赖区间中，此时其固定版本必须落在该区间内；
+     * 其余名称仍按字典序展开、版本降序回退，取首个无环完整解。
+     *
+     * @param snapshot 一致性仓库快照（每名称版本按版本号降序）
+     * @param roots    根名称 -> 精确版本（名称互不相同的 2～4 个根）
+     * @return 名称 -> 精确版本（名称升序）；任一根缺失/已撤回或全体无共同解时返回 null
+     */
+    public static Map<String, Integer> resolveMulti(RepositorySnapshot snapshot,
+                                                    Map<String, Integer> roots) {
+        Map<String, List<ArtifactVersion>> all = snapshot.artifacts();
         TreeMap<String, ArtifactVersion> chosen = new TreeMap<>();
-        chosen.put(rootName, root);
-        // 根可能自依赖：固定版本也必须落在自身声明的区间内。
-        if (!satisfiesChosen(root, chosen)) {
-            return null;
+        for (Map.Entry<String, Integer> root : roots.entrySet()) {
+            ArtifactVersion fixed = all.getOrDefault(root.getKey(), List.of()).stream()
+                    .filter(a -> a.version() == root.getValue() && !a.withdrawn())
+                    .findFirst()
+                    .orElse(null);
+            if (fixed == null) {
+                return null;
+            }
+            chosen.put(root.getKey(), fixed);
+        }
+        // 根之间的相互约束（含自依赖）：固定版本必须落在彼此声明的区间内。
+        for (ArtifactVersion root : chosen.values()) {
+            if (!satisfiesChosen(root, chosen)) {
+                return null;
+            }
         }
         if (solve(all, chosen)) {
             TreeMap<String, Integer> result = new TreeMap<>();

@@ -274,6 +274,88 @@ public class RepositoryDao {
                 lockFileId);
     }
 
+    // ------------------------------------------------------------------
+    // 多根联合锁文件
+    // ------------------------------------------------------------------
+
+    /** 联合锁文件列表行：不含根与条目明细。 */
+    public record MultiLockFileRow(long id, long repositoryVersion, Instant createdAt) {
+    }
+
+    /** 新增联合锁文件主记录，返回自增主键。 */
+    public long insertMultiLockFile(long repositoryVersion, String requestId, Instant createdAt) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbcTemplate.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO multi_lock_file (repository_version, request_id, created_at) "
+                            + "VALUES (?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setLong(1, repositoryVersion);
+            ps.setString(2, requestId);
+            ps.setTimestamp(3, Timestamp.from(createdAt));
+            return ps;
+        }, keyHolder);
+        Number key = keyHolder.getKey();
+        if (key == null) {
+            throw new IllegalStateException("插入联合锁文件未获取自增主键");
+        }
+        return key.longValue();
+    }
+
+    /** 为联合锁文件写入一个精确根版本。 */
+    public void insertMultiLockRoot(long lockFileId, String name, int version) {
+        jdbcTemplate.update(
+                "INSERT INTO multi_lock_root (lock_file_id, name, version) VALUES (?, ?, ?)",
+                lockFileId, name, version);
+    }
+
+    /** 为联合锁文件写入一个精确版本条目。 */
+    public void insertMultiLockEntry(long lockFileId, String name, int version) {
+        jdbcTemplate.update(
+                "INSERT INTO multi_lock_entry (lock_file_id, name, version) VALUES (?, ?, ?)",
+                lockFileId, name, version);
+    }
+
+    /** 查询全部历史联合锁文件，按 ID 升序。 */
+    public List<MultiLockFileRow> listMultiLockFiles() {
+        return jdbcTemplate.query(
+                "SELECT id, repository_version, created_at FROM multi_lock_file ORDER BY id ASC",
+                (rs, n) -> new MultiLockFileRow(rs.getLong("id"),
+                        rs.getLong("repository_version"),
+                        rs.getTimestamp("created_at").toInstant()));
+    }
+
+    /** 按主键查询联合锁文件，不存在返回 null。 */
+    public MultiLockFileRow getMultiLockFile(long id) {
+        List<MultiLockFileRow> rows = jdbcTemplate.query(
+                "SELECT id, repository_version, created_at FROM multi_lock_file WHERE id = ?",
+                (rs, n) -> new MultiLockFileRow(rs.getLong("id"),
+                        rs.getLong("repository_version"),
+                        rs.getTimestamp("created_at").toInstant()),
+                id);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /** 查询某联合锁文件的根集合，按名称升序。 */
+    public List<LockEntryRow> listMultiLockRoots(long lockFileId) {
+        return jdbcTemplate.query(
+                "SELECT lock_file_id, name, version FROM multi_lock_root "
+                        + "WHERE lock_file_id = ? ORDER BY name ASC",
+                (rs, n) -> new LockEntryRow(rs.getLong("lock_file_id"),
+                        rs.getString("name"), rs.getInt("version")),
+                lockFileId);
+    }
+
+    /** 查询某联合锁文件的全部条目，按名称升序。 */
+    public List<LockEntryRow> listMultiLockEntries(long lockFileId) {
+        return jdbcTemplate.query(
+                "SELECT lock_file_id, name, version FROM multi_lock_entry "
+                        + "WHERE lock_file_id = ? ORDER BY name ASC",
+                (rs, n) -> new LockEntryRow(rs.getLong("lock_file_id"),
+                        rs.getString("name"), rs.getInt("version")),
+                lockFileId);
+    }
+
     private record ArtifactRow(long id, String name, int version, boolean withdrawn) {
     }
 

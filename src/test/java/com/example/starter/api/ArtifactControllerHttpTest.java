@@ -35,6 +35,9 @@ class ArtifactControllerHttpTest {
 
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM multi_lock_entry");
+        jdbcTemplate.update("DELETE FROM multi_lock_root");
+        jdbcTemplate.update("DELETE FROM multi_lock_file");
         jdbcTemplate.update("DELETE FROM lock_file_entry");
         jdbcTemplate.update("DELETE FROM lock_file");
         jdbcTemplate.update("DELETE FROM artifact_dependency");
@@ -217,5 +220,164 @@ class ArtifactControllerHttpTest {
                 new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
                 JsonNode.class);
         assertThat(lockOnWithdrawn.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+    }
+
+    // ------------------------------------------------------------------
+    // 多根联合锁定 HTTP 入口
+    // ------------------------------------------------------------------
+
+    private void registerViaHttp(String name, int version, Object... dependencies) {
+        ResponseEntity<JsonNode> response = restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody(name, version, dependencies),
+                        jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+    }
+
+    private String multiLockBody(long expectedVersion, String... nameVersions) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        List<Map<String, Object>> roots = new java.util.ArrayList<>();
+        for (String nameVersion : nameVersions) {
+            String[] parts = nameVersion.split(":");
+            Map<String, Object> root = new LinkedHashMap<>();
+            root.put("name", parts[0]);
+            root.put("version", Integer.parseInt(parts[1]));
+            roots.add(root);
+        }
+        body.put("roots", roots);
+        body.put("expectedRepositoryVersion", expectedVersion);
+        return toJson(body);
+    }
+
+    private ResponseEntity<JsonNode> postMultiLock(String body, String requestId) {
+        return restTemplate.postForEntity("/api/artifacts/locks/multi",
+                new HttpEntity<>(body, jsonHeaders(requestId)), JsonNode.class);
+    }
+
+    /** 登记题干合成场景：根A需 X[1,3]，根B需 X[1,2]，X3、X2 均存在；仓库版本推进到 4。 */
+    private void setupSyntheticScenarioViaHttp() {
+        registerViaHttp("a", 1, dependency("x", 1, 3));
+        registerViaHttp("b", 1, dependency("x", 1, 2));
+        registerViaHttp("x", 3);
+        registerViaHttp("x", 2);
+    }
+
+    @Test
+    void multiLockViaHttpReturns201SortedEntriesAndHistoryQueries() {
+        setupSyntheticScenarioViaHttp();
+
+        ResponseEntity<JsonNode> lock = postMultiLock(
+                multiLockBody(4L, "a:1", "b:1"), UUID.randomUUID().toString());
+        assertThat(lock.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        long lockId = lock.getBody().path("id").asLong();
+        assertThat(lock.getBody().path("repositoryVersion").asLong()).isEqualTo(4L);
+        // 根与条目按名称升序；联合锁应选 X2。
+        assertThat(lock.getBody().path("roots")).hasSize(2);
+        assertThat(lock.getBody().path("roots").get(0).path("name").asText()).isEqualTo("a");
+        assertThat(lock.getBody().path("roots").get(1).path("name").asText()).isEqualTo("b");
+        assertThat(lock.getBody().path("entries")).hasSize(3);
+        assertThat(lock.getBody().path("entries").get(2).path("name").asText()).isEqualTo("x");
+        assertThat(lock.getBody().path("entries").get(2).path("version").asInt()).isEqualTo(2);
+
+        ResponseEntity<JsonNode> list = restTemplate.getForEntity(
+                "/api/artifacts/locks/multi", JsonNode.class);
+        assertThat(list.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(list.getBody()).hasSize(1);
+
+        ResponseEntity<JsonNode> one = restTemplate.getForEntity(
+                "/api/artifacts/locks/multi/{id}", JsonNode.class, lockId);
+        assertThat(one.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(one.getBody().path("entries")).hasSize(3);
+
+        ResponseEntity<JsonNode> missing = restTemplate.getForEntity(
+                "/api/artifacts/locks/multi/9999", JsonNode.class);
+        assertThat(missing.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+    }
+
+    @Test
+    void multiLockRootOrderPermutationReplaysFirstResponse() {
+        setupSyntheticScenarioViaHttp();
+        String rid = UUID.randomUUID().toString();
+
+        ResponseEntity<JsonNode> first = postMultiLock(multiLockBody(4L, "a:1", "b:1"), rid);
+        assertThat(first.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        // 根集合换序同参：重放首次完整响应。
+        ResponseEntity<JsonNode> replay = postMultiLock(multiLockBody(4L, "b:1", "a:1"), rid);
+        assertThat(replay.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(replay.getBody().path("id").asLong())
+                .isEqualTo(first.getBody().path("id").asLong());
+        assertThat(replay.getBody().path("createdAt").asText())
+                .isEqualTo(first.getBody().path("createdAt").asText());
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM multi_lock_file", Integer.class)).isEqualTo(1);
+    }
+
+    @Test
+    void multiLockSameRequestIdDifferentRootsReturns409() {
+        setupSyntheticScenarioViaHttp();
+        String rid = UUID.randomUUID().toString();
+        postMultiLock(multiLockBody(4L, "a:1", "b:1"), rid);
+
+        ResponseEntity<JsonNode> conflict = postMultiLock(multiLockBody(4L, "a:1", "x:2"), rid);
+        assertThat(conflict.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+    }
+
+    @Test
+    void multiLockDuplicateRootNameReturns400() {
+        setupSyntheticScenarioViaHttp();
+        // 同名不同根版本 → 400。
+        ResponseEntity<JsonNode> differentVersion = postMultiLock(
+                multiLockBody(4L, "a:1", "a:2"), UUID.randomUUID().toString());
+        assertThat(differentVersion.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        // 重复根（同名同版本）→ 400。
+        ResponseEntity<JsonNode> duplicate = postMultiLock(
+                multiLockBody(4L, "a:1", "a:1"), UUID.randomUUID().toString());
+        assertThat(duplicate.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
+    void multiLockSingleRootReturns400() {
+        setupSyntheticScenarioViaHttp();
+        ResponseEntity<JsonNode> response = postMultiLock(
+                multiLockBody(4L, "a:1"), UUID.randomUUID().toString());
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
+    void multiLockMissingRootReturns422() {
+        setupSyntheticScenarioViaHttp();
+        ResponseEntity<JsonNode> response = postMultiLock(
+                multiLockBody(4L, "a:1", "ghost:1"), UUID.randomUUID().toString());
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM multi_lock_file", Integer.class)).isZero();
+    }
+
+    @Test
+    void multiLockWithdrawnSharedCandidateReturns422() {
+        setupSyntheticScenarioViaHttp();
+        // 撤回 X2 且无 X1 → 整单失败。
+        restTemplate.exchange("/api/artifacts/x/versions/2/withdraw", HttpMethod.POST,
+                new HttpEntity<>("", jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+
+        ResponseEntity<JsonNode> response = postMultiLock(
+                multiLockBody(5L, "a:1", "b:1"), UUID.randomUUID().toString());
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM multi_lock_entry", Integer.class)).isZero();
+    }
+
+    @Test
+    void multiLockStaleRepositoryVersionReturns409() {
+        setupSyntheticScenarioViaHttp();
+        ResponseEntity<JsonNode> response = postMultiLock(
+                multiLockBody(0L, "a:1", "b:1"), UUID.randomUUID().toString());
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+    }
+
+    @Test
+    void multiLockMissingRequestIdReturns400() {
+        ResponseEntity<JsonNode> response = postMultiLock(multiLockBody(0L, "a:1", "b:1"), null);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
     }
 }

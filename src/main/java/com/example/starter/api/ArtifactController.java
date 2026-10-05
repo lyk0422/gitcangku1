@@ -3,6 +3,8 @@ package com.example.starter.api;
 import com.example.starter.api.dto.ArtifactResponse;
 import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
+import com.example.starter.api.dto.MultiLockFileResponse;
+import com.example.starter.api.dto.MultiLockRequest;
 import com.example.starter.api.dto.RegisterArtifactRequest;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Positive;
@@ -68,5 +70,26 @@ public class ArtifactController {
     @GetMapping("/locks/{id}")
     public LockFileResponse getLock(@PathVariable long id) {
         return artifactService.getLock(id);
+    }
+
+    /** 创建多根联合锁文件：2～4 个精确根版本共享一份自洽锁图。 */
+    @PostMapping("/locks/multi")
+    public ResponseEntity<MultiLockFileResponse> lockMulti(
+            @RequestHeader("X-Request-Id") String requestId,
+            @Valid @RequestBody MultiLockRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(artifactService.createMultiLock(requestId, request));
+    }
+
+    /** 查询全部历史联合锁文件。 */
+    @GetMapping("/locks/multi")
+    public List<MultiLockFileResponse> listMultiLocks() {
+        return artifactService.listMultiLocks();
+    }
+
+    /** 按 ID 查询单个联合锁文件。 */
+    @GetMapping("/locks/multi/{id}")
+    public MultiLockFileResponse getMultiLock(@PathVariable long id) {
+        return artifactService.getMultiLock(id);
     }
 }

@@ -4,6 +4,9 @@ import com.example.starter.api.dto.ArtifactResponse;
 import com.example.starter.api.dto.DependencySpec;
 import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
+import com.example.starter.api.dto.MultiLockFileResponse;
+import com.example.starter.api.dto.MultiLockRequest;
+import com.example.starter.api.dto.MultiLockRoot;
 import com.example.starter.api.dto.RegisterArtifactRequest;
 import com.example.starter.support.ApiException;
 import org.junit.jupiter.api.BeforeEach;
@@ -41,6 +44,9 @@ class ArtifactServiceH2Test {
 
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM multi_lock_entry");
+        jdbcTemplate.update("DELETE FROM multi_lock_root");
+        jdbcTemplate.update("DELETE FROM multi_lock_file");
         jdbcTemplate.update("DELETE FROM lock_file_entry");
         jdbcTemplate.update("DELETE FROM lock_file");
         jdbcTemplate.update("DELETE FROM artifact_dependency");
@@ -451,5 +457,263 @@ class ArtifactServiceH2Test {
         assertThat(replay.id()).isEqualTo(first.id());
         assertThat(replay.repositoryVersion()).isEqualTo(2L);
         assertThat(replay.entries()).isEqualTo(first.entries());
+    }
+
+    // ------------------------------------------------------------------
+    // 多根联合锁定
+    // ------------------------------------------------------------------
+
+    private static MultiLockRequest multiLock(long expectedVersion, MultiLockRoot... roots) {
+        return new MultiLockRequest(List.of(roots), expectedVersion);
+    }
+
+    private static MultiLockRoot root(String name, int version) {
+        return new MultiLockRoot(name, version);
+    }
+
+    /** 登记题干合成场景：根A需 X[1,3]，根B需 X[1,2]，X3、X2 均存在，返回仓库版本号。 */
+    private long setupSyntheticScenario() {
+        service.registerArtifact(requestId(), artifact("a", 1, dep("x", 1, 3)));
+        service.registerArtifact(requestId(), artifact("b", 1, dep("x", 1, 2)));
+        service.registerArtifact(requestId(), artifact("x", 3));
+        service.registerArtifact(requestId(), artifact("x", 2));
+        return 4L;
+    }
+
+    @Test
+    void multiLockMergesRootRangesAndFreezesSharedGraph() {
+        long version = setupSyntheticScenario();
+
+        MultiLockFileResponse lock = service.createMultiLock(requestId(),
+                multiLock(version, root("a", 1), root("b", 1)));
+
+        assertThat(lock.repositoryVersion()).isEqualTo(version);
+        assertThat(lock.roots()).containsExactly(root("a", 1), root("b", 1));
+        // 联合锁应选 X2：满足全部根的区间交集，且按名称排序。
+        assertThat(lock.entries()).extracting("name", "version")
+                .containsExactly(tuple("a", 1), tuple("b", 1), tuple("x", 2));
+
+        // 查询：列表与单查一致，根与条目均按名称升序（createdAt 落库为微秒精度，逐字段比对）。
+        assertThat(service.listMultiLocks()).hasSize(1);
+        MultiLockFileResponse queried = service.getMultiLock(lock.id());
+        assertThat(queried.id()).isEqualTo(lock.id());
+        assertThat(queried.roots()).isEqualTo(lock.roots());
+        assertThat(queried.repositoryVersion()).isEqualTo(lock.repositoryVersion());
+        assertThat(queried.entries()).isEqualTo(lock.entries());
+
+        // 后续撤回不改写已冻结的锁文件。
+        service.withdrawArtifact(requestId(), "x", 2);
+        assertThat(service.getMultiLock(lock.id()).entries()).isEqualTo(lock.entries());
+    }
+
+    @Test
+    void multiLockRootOrderPermutationIsSameParamsAndReplays() {
+        long version = setupSyntheticScenario();
+        String rid = requestId();
+
+        MultiLockFileResponse first = service.createMultiLock(rid,
+                multiLock(version, root("a", 1), root("b", 1)));
+        // 根集合换序同参：命中幂等重放，返回首次完整响应。
+        MultiLockFileResponse replay = service.createMultiLock(rid,
+                multiLock(version, root("b", 1), root("a", 1)));
+
+        assertThat(replay).isEqualTo(first);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM multi_lock_file", Integer.class)).isEqualTo(1);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM idempotent_request WHERE operation = 'CREATE_MULTI_LOCK'",
+                Integer.class)).isEqualTo(1);
+    }
+
+    @Test
+    void multiLockSameRequestIdDifferentParamsReturns409() {
+        long version = setupSyntheticScenario();
+        String rid = requestId();
+        service.createMultiLock(rid, multiLock(version, root("a", 1), root("b", 1)));
+
+        assertThatThrownBy(() -> service.createMultiLock(rid,
+                multiLock(version, root("a", 1), root("x", 2))))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(409));
+    }
+
+    @Test
+    void multiLockDuplicateRootNameReturns400() {
+        setupSyntheticScenario();
+        // 同名同版本（重复根）与同名不同版本均 400。
+        assertThatThrownBy(() -> service.createMultiLock(requestId(),
+                multiLock(4L, root("a", 1), root("a", 1))))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(400));
+        assertThatThrownBy(() -> service.createMultiLock(requestId(),
+                multiLock(4L, root("a", 1), root("a", 2))))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(400));
+    }
+
+    @Test
+    void multiLockRootCountOutOfRangeReturns400() {
+        setupSyntheticScenario();
+        assertThatThrownBy(() -> service.createMultiLock(requestId(),
+                multiLock(4L, root("a", 1))))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(400));
+        assertThatThrownBy(() -> service.createMultiLock(requestId(),
+                multiLock(4L, root("a", 1), root("b", 1), root("x", 2),
+                        root("y", 1), root("z", 1))))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(400));
+    }
+
+    @Test
+    void multiLockMissingRootReturns422AndPersistsNothing() {
+        setupSyntheticScenario();
+        assertThatThrownBy(() -> service.createMultiLock(requestId(),
+                multiLock(4L, root("a", 1), root("ghost", 1))))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(422));
+        assertThat(service.listMultiLocks()).isEmpty();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM multi_lock_entry", Integer.class)).isZero();
+    }
+
+    @Test
+    void multiLockWithdrawnRootReturns422() {
+        long version = setupSyntheticScenario();
+        service.withdrawArtifact(requestId(), "b", 1);
+        assertThatThrownBy(() -> service.createMultiLock(requestId(),
+                multiLock(version + 1, root("a", 1), root("b", 1))))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(422));
+        assertThat(service.listMultiLocks()).isEmpty();
+    }
+
+    @Test
+    void multiLockWithdrawnSharedCandidateWithoutFallbackFailsWholeOrder() {
+        // 题干场景：撤回 X2 且无 X1，X3 不满足根B → 整单失败，不保存任何锁条目。
+        long version = setupSyntheticScenario();
+        service.withdrawArtifact(requestId(), "x", 2);
+
+        assertThatThrownBy(() -> service.createMultiLock(requestId(),
+                multiLock(version + 1, root("a", 1), root("b", 1))))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(422));
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM multi_lock_file", Integer.class)).isZero();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM multi_lock_root", Integer.class)).isZero();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM multi_lock_entry", Integer.class)).isZero();
+    }
+
+    @Test
+    void multiLockRootConstrainingAnotherRootIsEnforced() {
+        // 根 b 同时是根 a 的依赖：a1 -> b[2,2]，固定 b:1 不可行。
+        service.registerArtifact(requestId(), artifact("a", 1, dep("b", 2, 2)));
+        service.registerArtifact(requestId(), artifact("b", 2));
+        service.registerArtifact(requestId(), artifact("b", 1));
+
+        assertThatThrownBy(() -> service.createMultiLock(requestId(),
+                multiLock(3L, root("a", 1), root("b", 1))))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(422));
+
+        MultiLockFileResponse lock = service.createMultiLock(requestId(),
+                multiLock(3L, root("a", 1), root("b", 2)));
+        assertThat(lock.entries()).extracting("name", "version")
+                .containsExactly(tuple("a", 1), tuple("b", 2));
+    }
+
+    @Test
+    void multiLockStaleRepositoryVersionReturns409() {
+        setupSyntheticScenario();
+        assertThatThrownBy(() -> service.createMultiLock(requestId(),
+                multiLock(0L, root("a", 1), root("b", 1))))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(409));
+        assertThat(service.listMultiLocks()).isEmpty();
+    }
+
+    @Test
+    void multiLockFailureDoesNotConsumeRequestId() {
+        long version = setupSyntheticScenario();
+        String rid = requestId();
+        // 先失败（撤回 X2 后不可行），失败不占键。
+        service.withdrawArtifact(requestId(), "x", 2);
+        assertThatThrownBy(() -> service.createMultiLock(rid,
+                multiLock(version + 1, root("a", 1), root("b", 1))))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(422));
+
+        // 补齐 X1 后同一 requestId 可用于新的合法请求。
+        service.registerArtifact(requestId(), artifact("x", 1));
+        MultiLockFileResponse lock = service.createMultiLock(rid,
+                multiLock(version + 2, root("a", 1), root("b", 1)));
+        assertThat(lock.entries()).extracting("name", "version")
+                .containsExactly(tuple("a", 1), tuple("b", 1), tuple("x", 1));
+    }
+
+    @Test
+    void multiLockReplayReturnsIdenticalResponse() {
+        long version = setupSyntheticScenario();
+        String rid = requestId();
+        MultiLockRequest request = multiLock(version, root("a", 1), root("b", 1));
+
+        MultiLockFileResponse first = service.createMultiLock(rid, request);
+        MultiLockFileResponse replay = service.createMultiLock(rid, request);
+
+        assertThat(replay).isEqualTo(first);
+        assertThat(replay.createdAt()).isEqualTo(first.createdAt());
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM multi_lock_file", Integer.class)).isEqualTo(1);
+    }
+
+    @Test
+    void multiLockWithdrawConcurrencyResolvesToSingleWinner() throws Exception {
+        // a:1 -> x[1,1]，b:1 -> x[1,1]，x:1；联合锁定与撤回 x:1 并发，必有一方先提交。
+        service.registerArtifact(requestId(), artifact("a", 1, dep("x", 1, 1)));
+        service.registerArtifact(requestId(), artifact("b", 1, dep("x", 1, 1)));
+        service.registerArtifact(requestId(), artifact("x", 1));
+        long versionBefore = 3L;
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        CyclicBarrier barrier = new CyclicBarrier(2);
+        Callable<Object> lockTask = () -> {
+            barrier.await(5, TimeUnit.SECONDS);
+            try {
+                return service.createMultiLock(requestId(),
+                        multiLock(versionBefore, root("a", 1), root("b", 1)));
+            } catch (ApiException e) {
+                return e;
+            }
+        };
+        Callable<Object> withdrawTask = () -> {
+            barrier.await(5, TimeUnit.SECONDS);
+            return service.withdrawArtifact(requestId(), "x", 1);
+        };
+
+        List<Future<Object>> futures = pool.invokeAll(List.of(lockTask, withdrawTask));
+        pool.shutdown();
+        Object lockOutcome = futures.get(0).get(30, TimeUnit.SECONDS);
+        Object withdrawOutcome = futures.get(1).get(30, TimeUnit.SECONDS);
+
+        assertThat(withdrawOutcome).isInstanceOf(ArtifactResponse.class);
+        long finalVersion = jdbcTemplate.queryForObject(
+                "SELECT version FROM repository_state WHERE id = 1", Long.class);
+        assertThat(finalVersion).isEqualTo(versionBefore + 1);
+
+        if (lockOutcome instanceof MultiLockFileResponse lock) {
+            // 锁先提交：撤回不改写锁文件。
+            assertThat(lock.entries()).extracting("name", "version")
+                    .containsExactly(tuple("a", 1), tuple("b", 1), tuple("x", 1));
+            assertThat(service.getMultiLock(lock.id()).entries()).isEqualTo(lock.entries());
+        } else {
+            // 撤回先提交：期望版本过期 409 或根已撤回 422，且无半成品。
+            assertThat(lockOutcome).isInstanceOf(ApiException.class);
+            assertThat(((ApiException) lockOutcome).getStatus()).isIn(409, 422);
+            assertThat(service.listMultiLocks()).isEmpty();
+            assertThat(jdbcTemplate.queryForObject(
+                    "SELECT COUNT(1) FROM multi_lock_entry", Integer.class)).isZero();
+        }
     }
 }

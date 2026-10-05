@@ -183,4 +183,96 @@ class LockResolverTest {
         assertThat(result).isNotNull();
         assertThat(result.keySet()).containsExactly("alib", "root", "zlib");
     }
+
+    // ------------------------------------------------------------------
+    // 多根联合求解
+    // ------------------------------------------------------------------
+
+    @Test
+    void multiRootMergesRangesFromAllRootsAndPicksHighestCommon() {
+        // 题干场景：根A需 X[1,3]，根B需 X[1,2]，X3、X2 均存在 → 共同约束下选 X2。
+        RepositorySnapshot s = snapshot(0,
+                "a", List.of(v(1, dep("x", 1, 3))),
+                "b", List.of(v(1, dep("x", 1, 2))),
+                "x", List.of(v(3), v(2), v(1)));
+        assertThat(LockResolver.resolveMulti(s, Map.of("a", 1, "b", 1)))
+                .isEqualTo(Map.of("a", 1, "b", 1, "x", 2));
+    }
+
+    @Test
+    void multiRootFailsWhenCommonCandidateWithdrawn() {
+        // 题干场景：撤回 X2 且无 X1，X3 不满足根B的 [1,2] → 整单失败。
+        RepositorySnapshot s = snapshot(0,
+                "a", List.of(v(1, dep("x", 1, 3))),
+                "b", List.of(v(1, dep("x", 1, 2))),
+                "x", List.of(v(3), w(2)));
+        assertThat(LockResolver.resolveMulti(s, Map.of("a", 1, "b", 1))).isNull();
+    }
+
+    @Test
+    void multiRootDoesNotPickHighestPerRootIndependently() {
+        // 若分别单根锁定再合并，x 会取 3（仅满足 a）；联合求解必须满足 b 的区间。
+        RepositorySnapshot s = snapshot(0,
+                "a", List.of(v(1, dep("x", 1, 3))),
+                "b", List.of(v(1, dep("x", 2, 2))),
+                "x", List.of(v(3), v(2)));
+        assertThat(LockResolver.resolveMulti(s, Map.of("a", 1, "b", 1)))
+                .isEqualTo(Map.of("a", 1, "b", 1, "x", 2));
+    }
+
+    @Test
+    void multiRootRootCanBeDependencyOfAnotherRoot() {
+        // 根 b 同时是根 a 的依赖：a1 -> b[2,2]，固定 b:2 满足，固定 b:1 不满足。
+        RepositorySnapshot s = snapshot(0,
+                "a", List.of(v(1, dep("b", 2, 2))),
+                "b", List.of(v(2), v(1)));
+        assertThat(LockResolver.resolveMulti(s, Map.of("a", 1, "b", 2)))
+                .isEqualTo(Map.of("a", 1, "b", 2));
+        assertThat(LockResolver.resolveMulti(s, Map.of("a", 1, "b", 1))).isNull();
+    }
+
+    @Test
+    void multiRootMissingOrWithdrawnRootReturnsNull() {
+        RepositorySnapshot s = snapshot(0,
+                "a", List.of(v(1)),
+                "b", List.of(w(1)));
+        assertThat(LockResolver.resolveMulti(s, Map.of("a", 1, "ghost", 1))).isNull();
+        assertThat(LockResolver.resolveMulti(s, Map.of("a", 1, "b", 1))).isNull();
+    }
+
+    @Test
+    void multiRootRootVersionIsFixedWithoutFallback() {
+        // 根 a 固定为 1：即使 a2 存在且其依赖不可行，也不影响；根版本不可回退到 a2。
+        RepositorySnapshot s = snapshot(0,
+                "a", List.of(v(2, dep("x", 5, 5)), v(1, dep("x", 1, 1))),
+                "b", List.of(v(1, dep("x", 1, 1))),
+                "x", List.of(v(1)));
+        assertThat(LockResolver.resolveMulti(s, Map.of("a", 1, "b", 1)))
+                .isEqualTo(Map.of("a", 1, "b", 1, "x", 1));
+    }
+
+    @Test
+    void multiRootRootOrderDoesNotChangeResult() {
+        RepositorySnapshot s = snapshot(0,
+                "a", List.of(v(1, dep("x", 1, 3))),
+                "b", List.of(v(1, dep("x", 1, 2))),
+                "x", List.of(v(3), v(2), v(1)));
+        Map<String, Integer> forward = LockResolver.resolveMulti(s, Map.of("a", 1, "b", 1));
+        Map<String, Integer> reversedInput = new java.util.LinkedHashMap<>();
+        reversedInput.put("b", 1);
+        reversedInput.put("a", 1);
+        assertThat(LockResolver.resolveMulti(s, reversedInput)).isEqualTo(forward);
+    }
+
+    @Test
+    void multiRootSharedDependencyBacktracksAcrossRoots() {
+        // a -> x[1,2]、y[1,1]；b -> x[1,2]；y1 -> x[1,1]；汇合后 x 只能取 1。
+        RepositorySnapshot s = snapshot(0,
+                "a", List.of(v(1, dep("x", 1, 2), dep("y", 1, 1))),
+                "b", List.of(v(1, dep("x", 1, 2))),
+                "x", List.of(v(2), v(1)),
+                "y", List.of(v(1, dep("x", 1, 1))));
+        assertThat(LockResolver.resolveMulti(s, Map.of("a", 1, "b", 1)))
+                .isEqualTo(Map.of("a", 1, "b", 1, "x", 1, "y", 1));
+    }
 }
