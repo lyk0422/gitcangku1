@@ -5,6 +5,7 @@ import com.example.starter.plan.model.Occupancy;
 import com.example.starter.plan.model.PlanStatus;
 import com.example.starter.plan.model.PublishedSlot;
 import com.example.starter.plan.model.RescheduleLink;
+import com.example.starter.plan.model.RoutePlanDetail;
 import java.sql.Date;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
@@ -218,5 +219,39 @@ public class PlanRepository {
      */
     public void acquirePublishLock() {
         jdbc.queryForObject("SELECT id FROM publish_lock WHERE id = 1 FOR UPDATE", Integer.class);
+    }
+
+    /**
+     * 写入寻径发布冻结快照（图版本、起终站、路径区段序列）。
+     */
+    public void insertRouteDetail(RoutePlanDetail detail, long nowMillis) {
+        jdbc.update("INSERT INTO rail_route_plan_detail"
+                        + " (plan_id, graph_version, train_no, from_station, to_station,"
+                        + " depart_utc, arrive_utc, total_minutes, segment_ids, created_at)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                detail.planId(), detail.graphVersion(), detail.trainNo(), detail.fromStation(),
+                detail.toStation(), detail.departUtc().toEpochMilli(),
+                detail.arriveUtc().toEpochMilli(), detail.totalMinutes(), detail.segmentIdsJson(),
+                nowMillis);
+    }
+
+    /**
+     * 按计划 id 查询寻径发布冻结快照；非寻径计划返回空。
+     */
+    public Optional<RoutePlanDetail> findRouteDetail(long planId) {
+        return jdbc.query("SELECT plan_id, graph_version, train_no, from_station, to_station,"
+                        + " depart_utc, arrive_utc, total_minutes, segment_ids"
+                        + " FROM rail_route_plan_detail WHERE plan_id = ?",
+                (rs, n) -> new RoutePlanDetail(
+                        rs.getLong("plan_id"),
+                        rs.getInt("graph_version"),
+                        rs.getString("train_no"),
+                        rs.getString("from_station"),
+                        rs.getString("to_station"),
+                        Instant.ofEpochMilli(rs.getLong("depart_utc")),
+                        Instant.ofEpochMilli(rs.getLong("arrive_utc")),
+                        rs.getInt("total_minutes"),
+                        rs.getString("segment_ids")),
+                planId).stream().findFirst();
     }
 }

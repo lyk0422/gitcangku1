@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS idempotency_record (
 );
 COMMENT ON TABLE idempotency_record IS '写操作幂等记录，仅缓存成功结果，失败不缓存可重试';
 COMMENT ON COLUMN idempotency_record.id IS '主键';
-COMMENT ON COLUMN idempotency_record.op_type IS '操作类型：CREATE / UPDATE / PUBLISH / CANCEL / RESCHEDULE';
+COMMENT ON COLUMN idempotency_record.op_type IS '操作类型：CREATE / UPDATE / PUBLISH / CANCEL / RESCHEDULE / GRAPH_REPLACE / ROUTE_PUBLISH';
 COMMENT ON COLUMN idempotency_record.request_key IS '客户端幂等键，同一操作类型内唯一';
 COMMENT ON COLUMN idempotency_record.request_hash IS '请求参数规范化后的 SHA-256，同键不同参判定 409';
 COMMENT ON COLUMN idempotency_record.response_json IS '首次成功响应快照（JSON），重放原样返回';
@@ -83,3 +83,62 @@ COMMENT ON TABLE publish_lock IS '发布/改签全局互斥锁，保证并发发
 COMMENT ON COLUMN publish_lock.id IS '锁行 id，固定为 1，发布与改签时 SELECT ... FOR UPDATE 串行化';
 
 MERGE INTO publish_lock KEY(id) VALUES (1);
+
+CREATE TABLE IF NOT EXISTS rail_graph_meta (
+    id INT NOT NULL,
+    version INT NOT NULL,
+    updated_at BIGINT NOT NULL,
+    PRIMARY KEY (id)
+);
+COMMENT ON TABLE rail_graph_meta IS '线路图元信息（单行，id 固定为 1），无行表示尚未建图（当前版本视为 0）';
+COMMENT ON COLUMN rail_graph_meta.id IS '行 id，固定为 1';
+COMMENT ON COLUMN rail_graph_meta.version IS '当前线路图版本，从 1 起，图替换成功一次加一';
+COMMENT ON COLUMN rail_graph_meta.updated_at IS '最近替换时刻，UTC 毫秒';
+
+CREATE TABLE IF NOT EXISTS rail_graph_segment (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    graph_version INT NOT NULL,
+    seq INT NOT NULL,
+    segment_id VARCHAR(64) NOT NULL,
+    from_station VARCHAR(64) NOT NULL,
+    to_station VARCHAR(64) NOT NULL,
+    minutes INT NOT NULL,
+    PRIMARY KEY (id)
+);
+COMMENT ON TABLE rail_graph_segment IS '当前版本线路图的有向区段，仅保留最新一版，图替换整体覆盖';
+COMMENT ON COLUMN rail_graph_segment.id IS '主键';
+COMMENT ON COLUMN rail_graph_segment.graph_version IS '所属线路图版本';
+COMMENT ON COLUMN rail_graph_segment.seq IS '区段在提交清单内的序号，从 0 开始，保持提交顺序';
+COMMENT ON COLUMN rail_graph_segment.segment_id IS '区段编号，同一图版本内唯一';
+COMMENT ON COLUMN rail_graph_segment.from_station IS '起点站';
+COMMENT ON COLUMN rail_graph_segment.to_station IS '终点站';
+COMMENT ON COLUMN rail_graph_segment.minutes IS '行驶分钟，正整数';
+CREATE INDEX IF NOT EXISTS idx_rail_graph_segment_version ON rail_graph_segment (graph_version);
+
+CREATE TABLE IF NOT EXISTS rail_route_plan_detail (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    plan_id BIGINT NOT NULL,
+    graph_version INT NOT NULL,
+    train_no VARCHAR(64) NOT NULL,
+    from_station VARCHAR(64) NOT NULL,
+    to_station VARCHAR(64) NOT NULL,
+    depart_utc BIGINT NOT NULL,
+    arrive_utc BIGINT NOT NULL,
+    total_minutes INT NOT NULL,
+    segment_ids VARCHAR(1024) NOT NULL,
+    created_at BIGINT NOT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT uk_route_plan_detail_plan UNIQUE (plan_id)
+);
+COMMENT ON TABLE rail_route_plan_detail IS '寻径发布冻结快照：图版本、起终站与路径区段序列；后续换图不回写旧计划';
+COMMENT ON COLUMN rail_route_plan_detail.id IS '主键';
+COMMENT ON COLUMN rail_route_plan_detail.plan_id IS '所属计划 id，关联 rail_day_plan.id，全表唯一';
+COMMENT ON COLUMN rail_route_plan_detail.graph_version IS '发布时冻结的线路图版本';
+COMMENT ON COLUMN rail_route_plan_detail.train_no IS '列车编号';
+COMMENT ON COLUMN rail_route_plan_detail.from_station IS '起点站';
+COMMENT ON COLUMN rail_route_plan_detail.to_station IS '终点站';
+COMMENT ON COLUMN rail_route_plan_detail.depart_utc IS '出发时刻（UTC 整分钟），UTC 毫秒';
+COMMENT ON COLUMN rail_route_plan_detail.arrive_utc IS '到达时刻，UTC 毫秒';
+COMMENT ON COLUMN rail_route_plan_detail.total_minutes IS '路径总行驶分钟';
+COMMENT ON COLUMN rail_route_plan_detail.segment_ids IS '路径区段编号序列（JSON 数组，按行驶顺序）';
+COMMENT ON COLUMN rail_route_plan_detail.created_at IS '创建时刻，UTC 毫秒';
