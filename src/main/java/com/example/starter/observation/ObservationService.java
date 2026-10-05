@@ -2,6 +2,7 @@ package com.example.starter.observation;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
@@ -50,19 +51,31 @@ public class ObservationService {
     private final ObservationRepository observationRepository;
     private final RequestLogRepository requestLogRepository;
     private final ResolutionRepository resolutionRepository;
+    private final OpenConflictRepository openConflictRepository;
+    private final OpenConflictTracker openConflictTracker;
+    private final EmbargoService embargoService;
     private final ObjectMapper objectMapper;
     private final Clock clock;
+    private final ObservationService self;
 
     public ObservationService(ObservationRepository observationRepository,
                               RequestLogRepository requestLogRepository,
                               ResolutionRepository resolutionRepository,
+                              OpenConflictRepository openConflictRepository,
+                              OpenConflictTracker openConflictTracker,
+                              EmbargoService embargoService,
                               ObjectMapper objectMapper,
-                              Clock clock) {
+                              Clock clock,
+                              @Lazy ObservationService self) {
         this.observationRepository = observationRepository;
         this.requestLogRepository = requestLogRepository;
         this.resolutionRepository = resolutionRepository;
+        this.openConflictRepository = openConflictRepository;
+        this.openConflictTracker = openConflictTracker;
+        this.embargoService = embargoService;
         this.objectMapper = objectMapper;
         this.clock = clock;
+        this.self = self;
     }
 
     /**
@@ -87,7 +100,7 @@ public class ObservationService {
         ObservationSnapshot snapshot = new ObservationSnapshot(request.observationId(), 1,
                 request.location(), request.reading(), request.note(), false);
         try {
-            observationRepository.insertCurrent(snapshot);
+            observationRepository.insertCurrent(snapshot, Instant.now(clock));
         } catch (DuplicateKeyException e) {
             // 并发创建同一 observationId：由主键串行化，后到者按冲突处理
             throw ApiException.conflict("observation already exists: " + request.observationId(), null);
@@ -97,10 +110,27 @@ public class ObservationService {
     }
 
     /**
+     * 离线提交入口：委托事务性合并；合并冲突（409）主事务回滚后，在独立事务中落痕未解决冲突
+     * 状态（供禁运设置校验），随后原样抛出。其余行为与 mergeInternal 一致。
+     */
+    public WriteOutcome merge(String observationId, MergeObservationRequest request) {
+        try {
+            return self.mergeInternal(observationId, request);
+        } catch (ApiException e) {
+            if (e.conflictFields() != null && !e.conflictFields().isEmpty()) {
+                openConflictTracker.recordOpenConflict(observationId, e.conflictFields(),
+                        e.currentVersion() == null ? 0 : e.currentVersion());
+            }
+            throw e;
+        }
+    }
+
+    /**
      * 离线提交：基于 baseVersion 的三方合并。合并结果与当前完全相同则不加版本，否则版本加一。
+     * 成功后清除该簇的未解决冲突状态；若簇已发布，为新版本追加更正附页（首次快照不改写）。
      */
     @Transactional
-    public WriteOutcome merge(String observationId, MergeObservationRequest request) {
+    public WriteOutcome mergeInternal(String observationId, MergeObservationRequest request) {
         String fingerprint = fingerprint("MERGE", observationId, String.valueOf(request.baseVersion()),
                 request.location(), request.reading(), request.note());
         WriteOutcome replayed = checkReplay(request.requestId(), fingerprint);
@@ -135,12 +165,15 @@ public class ObservationService {
                 mergedLocation, mergedReading, mergedNote, false);
         if (sameContent(merged, current)) {
             // 合并结果与当前完全相同：返回当前版本，不加版本
+            openConflictRepository.clear(observationId);
             return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(current));
         }
         ObservationSnapshot next = new ObservationSnapshot(observationId, current.version() + 1,
                 mergedLocation, mergedReading, mergedNote, false);
         observationRepository.updateCurrent(next);
         observationRepository.insertVersion(next);
+        openConflictRepository.clear(observationId);
+        embargoService.appendAddendumIfReleased(next, "MERGE", request.requestId());
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(next));
     }
 
@@ -171,6 +204,8 @@ public class ObservationService {
                 null, null, null, true);
         observationRepository.markDeleted(observationId, tombstone.version());
         observationRepository.insertVersion(tombstone);
+        openConflictRepository.clear(observationId);
+        embargoService.appendAddendumIfReleased(tombstone, "DELETE", request.requestId());
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(tombstone));
     }
 
@@ -287,6 +322,10 @@ public class ObservationService {
         ObservationSnapshot pointed = contentChanged
                 ? new ObservationSnapshot(observationId, newVersion, resolvedLocation, resolvedReading, resolvedNote, false)
                 : current;
+        openConflictRepository.clear(observationId);
+        if (contentChanged) {
+            embargoService.appendAddendumIfReleased(pointed, "RESOLVE", request.requestId());
+        }
         return completeResolve(request.requestId(), HttpStatus.OK,
                 ResolutionResponse.of(record, pointed, objectMapper));
     }

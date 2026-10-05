@@ -68,4 +68,12 @@ public class ApiException extends RuntimeException {
     public static ApiException gone(String message) {
         return new ApiException(HttpStatus.GONE, message, null, null);
     }
+
+    /**
+     * 422：业务规则不满足（禁运截止早于簇创建、披露范围为空、簇存在未解决冲突等），
+     * 消息中携带实际值与要求值（或差额）。
+     */
+    public static ApiException unprocessable(String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, message, null, null);
+    }
 }
