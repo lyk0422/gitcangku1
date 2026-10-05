@@ -18,11 +18,13 @@ import com.example.starter.calibration.model.Certificate;
 import com.example.starter.calibration.model.Measurement;
 import com.example.starter.calibration.model.MeasurementStatus;
 import com.example.starter.calibration.repo.CertificateRepository;
+import com.example.starter.calibration.repo.DifferentialRepository;
 import com.example.starter.calibration.repo.MeasurementRepository;
 import com.example.starter.calibration.repo.ReleaseRepository;
 
 /**
  * 批量放行服务：每批 1～50 条，整批原子生效；任一项不满足条件则整批拒绝（409）并返回各项原因。
+ * 已被差分配对占用的测量必须经差分放行，批量放行同样整批拒绝，不能绕过差分门禁。
  */
 @Service
 public class ReleaseService {
@@ -33,13 +35,16 @@ public class ReleaseService {
     private final MeasurementRepository measurements;
     private final CertificateRepository certificates;
     private final ReleaseRepository releases;
+    private final DifferentialRepository differentials;
 
     public ReleaseService(MeasurementRepository measurements,
                           CertificateRepository certificates,
-                          ReleaseRepository releases) {
+                          ReleaseRepository releases,
+                          DifferentialRepository differentials) {
         this.measurements = measurements;
         this.certificates = certificates;
         this.releases = releases;
+        this.differentials = differentials;
     }
 
     /**
@@ -75,6 +80,9 @@ public class ReleaseService {
             }
             if (!measurement.passed()) {
                 reasons.add("NOT_PASSED");
+            }
+            if (differentials.isOccupied(measurement.id())) {
+                reasons.add("PAIRED_IN_DIFFERENTIAL");
             }
             Certificate cert = certificates.findByIdForUpdate(measurement.certificateId())
                     .orElseThrow(() -> ApiException.conflict("CERTIFICATE_MISSING",

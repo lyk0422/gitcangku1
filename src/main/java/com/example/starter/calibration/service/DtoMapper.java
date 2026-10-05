@@ -4,9 +4,12 @@ import java.math.BigDecimal;
 import java.util.List;
 
 import com.example.starter.calibration.api.dto.CertificateResponse;
+import com.example.starter.calibration.api.dto.DifferentialResponse;
 import com.example.starter.calibration.api.dto.MeasurementResponse;
 import com.example.starter.calibration.api.dto.ReleaseRecordResponse;
 import com.example.starter.calibration.model.Certificate;
+import com.example.starter.calibration.model.Differential;
+import com.example.starter.calibration.model.DifferentialStatus;
 import com.example.starter.calibration.model.Measurement;
 import com.example.starter.calibration.model.MeasurementStatus;
 import com.example.starter.calibration.model.ReleaseRecord;
@@ -65,5 +68,36 @@ final class DtoMapper {
 
     static ReleaseRecordResponse toResponse(ReleaseRecord record) {
         return new ReleaseRecordResponse(record.batchId(), record.releasedBy(), record.releasedAt());
+    }
+
+    static DifferentialResponse toResponse(Differential d, String referenceKey, String dutKey,
+                                           boolean referenceCertRevoked, boolean dutCertRevoked) {
+        boolean usable = d.status() == DifferentialStatus.RELEASED
+                && !referenceCertRevoked && !dutCertRevoked;
+        return new DifferentialResponse(
+                d.id(),
+                d.instrumentId(),
+                d.referenceMeasurementId(),
+                referenceKey,
+                d.dutMeasurementId(),
+                dutKey,
+                d.referenceCertificateId(),
+                d.dutCertificateId(),
+                format(d.referenceValue()),
+                format(d.dutValue()),
+                format(d.diffValue()),
+                d.displayDiff().toPlainString(),
+                format(d.lowerLimit()),
+                format(d.upperLimit()),
+                d.passed(),
+                d.status().name(),
+                usable,
+                d.version(),
+                d.createdBy(),
+                d.createdAt(),
+                d.releasedBy(),
+                d.releasedAt(),
+                d.cancelledBy(),
+                d.cancelledAt());
     }
 }

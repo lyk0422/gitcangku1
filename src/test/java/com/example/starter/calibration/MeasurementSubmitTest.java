@@ -29,6 +29,9 @@ class MeasurementSubmitTest {
 
     @BeforeEach
     void clean() {
+        jdbc.update("DELETE FROM idempotency_record");
+        jdbc.update("DELETE FROM differential_occupation");
+        jdbc.update("DELETE FROM differential_pair");
         jdbc.update("DELETE FROM release_record");
         jdbc.update("DELETE FROM measurement");
         jdbc.update("DELETE FROM calibration_certificate");
