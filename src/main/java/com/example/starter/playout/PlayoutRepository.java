@@ -39,23 +39,36 @@ public class PlayoutRepository {
                            long validFromMs, long validToMs, boolean revoked) {
     }
 
-    /** 草稿行。 */
-    public record DraftRow(String channelId, LocalDate businessDay, long version) {
+    /**
+     * 草稿行。coordType 为 MS（毫秒坐标）或 FRAME（帧坐标）；FRAME 时 frameRateNum/Den 非空，
+     * 帧原点为 business_day 的 Asia/Shanghai 零点。
+     */
+    public record DraftRow(String channelId, LocalDate businessDay, long version,
+                           String coordType, Integer frameRateNum, Integer frameRateDen) {
+        public boolean frameCoord() {
+            return "FRAME".equals(coordType);
+        }
     }
 
-    /** 草稿片段行。 */
-    public record SegmentRow(String id, String assetId, long startMs, long endMs) {
+    /** 草稿片段行；FRAME 片段的 startFrame/endFrame 非空，startMs/endMs 为向下取整的显示值。 */
+    public record SegmentRow(String id, String assetId, long startMs, long endMs,
+                             Long startFrame, Long endFrame) {
     }
 
-    /** 发布快照行。 */
+    /** 发布快照行；FRAME 快照在发布时冻结帧率，帧原点为 business_day 零点。 */
     public record PublicationRow(long id, String channelId, LocalDate businessDay,
-                                 long publishedVersion, long draftVersion) {
+                                 long publishedVersion, long draftVersion,
+                                 String coordType, Integer frameRateNum, Integer frameRateDen) {
+        public boolean frameCoord() {
+            return "FRAME".equals(coordType);
+        }
     }
 
-    /** 发布快照片段行，grantId 为发布时选定的覆盖授权。 */
+    /** 发布快照片段行，grantId 为发布时选定的覆盖授权；FRAME 片段帧号随发布冻结。 */
     public record PublicationSegmentRow(long id, long publicationId, String segmentId,
                                         String assetId, long grantId,
-                                        long startMs, long endMs) {
+                                        long startMs, long endMs,
+                                        Long startFrame, Long endFrame) {
     }
 
     /** 幂等请求记录行；responseBody 为 NULL 表示尚未成功完成（同事务回滚后记录不保留）。 */
@@ -85,21 +98,26 @@ public class PlayoutRepository {
 
     private static final RowMapper<DraftRow> DRAFT_MAPPER = (rs, n) ->
             new DraftRow(rs.getString("channel_id"), rs.getDate("business_day").toLocalDate(),
-                    rs.getLong("version"));
+                    rs.getLong("version"), rs.getString("coord_type"),
+                    (Integer) rs.getObject("frame_rate_num"), (Integer) rs.getObject("frame_rate_den"));
 
     private static final RowMapper<SegmentRow> SEGMENT_MAPPER = (rs, n) ->
             new SegmentRow(rs.getString("id"), rs.getString("asset_id"),
-                    rs.getLong("start_ms"), rs.getLong("end_ms"));
+                    rs.getLong("start_ms"), rs.getLong("end_ms"),
+                    (Long) rs.getObject("start_frame"), (Long) rs.getObject("end_frame"));
 
     private static final RowMapper<PublicationRow> PUBLICATION_MAPPER = (rs, n) ->
             new PublicationRow(rs.getLong("id"), rs.getString("channel_id"),
                     rs.getDate("business_day").toLocalDate(),
-                    rs.getLong("published_version"), rs.getLong("draft_version"));
+                    rs.getLong("published_version"), rs.getLong("draft_version"),
+                    rs.getString("coord_type"),
+                    (Integer) rs.getObject("frame_rate_num"), (Integer) rs.getObject("frame_rate_den"));
 
     private static final RowMapper<PublicationSegmentRow> PUBLICATION_SEGMENT_MAPPER = (rs, n) ->
             new PublicationSegmentRow(rs.getLong("id"), rs.getLong("publication_id"),
                     rs.getString("segment_id"), rs.getString("asset_id"), rs.getLong("grant_id"),
-                    rs.getLong("start_ms"), rs.getLong("end_ms"));
+                    rs.getLong("start_ms"), rs.getLong("end_ms"),
+                    (Long) rs.getObject("start_frame"), (Long) rs.getObject("end_frame"));
 
     private static final RowMapper<RequestRow> REQUEST_MAPPER = (rs, n) ->
             new RequestRow(rs.getString("request_id"), rs.getString("operation"),
@@ -198,23 +216,30 @@ public class PlayoutRepository {
     // ---------- 草稿 ----------
 
     public Optional<DraftRow> findDraft(String channelId, LocalDate businessDay) {
-        return jdbc.query("SELECT channel_id, business_day, version FROM playout_draft"
+        return jdbc.query("SELECT channel_id, business_day, version, coord_type,"
+                        + " frame_rate_num, frame_rate_den FROM playout_draft"
                         + " WHERE channel_id = ? AND business_day = ?",
                 DRAFT_MAPPER, channelId, Date.valueOf(businessDay)).stream().findFirst();
     }
 
-    public void insertDraft(String channelId, LocalDate businessDay, long updatedAtMs) {
-        jdbc.update("INSERT INTO playout_draft (channel_id, business_day, version, updated_at_ms)"
-                        + " VALUES (?, ?, 1, ?)",
-                channelId, Date.valueOf(businessDay), updatedAtMs);
+    public void insertDraft(String channelId, LocalDate businessDay, String coordType,
+                            Integer frameRateNum, Integer frameRateDen, long updatedAtMs) {
+        jdbc.update("INSERT INTO playout_draft (channel_id, business_day, version, coord_type,"
+                        + " frame_rate_num, frame_rate_den, updated_at_ms)"
+                        + " VALUES (?, ?, 1, ?, ?, ?, ?)",
+                channelId, Date.valueOf(businessDay), coordType, frameRateNum, frameRateDen,
+                updatedAtMs);
     }
 
-    /** 乐观锁递增草稿版本；返回受影响行数，0 表示版本冲突或不存在。 */
-    public int bumpDraftVersion(String channelId, LocalDate businessDay,
-                                long expectedVersion, long updatedAtMs) {
-        return jdbc.update("UPDATE playout_draft SET version = version + 1, updated_at_ms = ?"
+    /** 乐观锁递增草稿版本并整份替换坐标类型与帧率；返回受影响行数，0 表示版本冲突或不存在。 */
+    public int bumpDraftVersion(String channelId, LocalDate businessDay, long expectedVersion,
+                                String coordType, Integer frameRateNum, Integer frameRateDen,
+                                long updatedAtMs) {
+        return jdbc.update("UPDATE playout_draft SET version = version + 1, coord_type = ?,"
+                        + " frame_rate_num = ?, frame_rate_den = ?, updated_at_ms = ?"
                         + " WHERE channel_id = ? AND business_day = ? AND version = ?",
-                updatedAtMs, channelId, Date.valueOf(businessDay), expectedVersion);
+                coordType, frameRateNum, frameRateDen, updatedAtMs,
+                channelId, Date.valueOf(businessDay), expectedVersion);
     }
 
     public void deleteDraftSegments(String channelId, LocalDate businessDay) {
@@ -223,15 +248,19 @@ public class PlayoutRepository {
     }
 
     public void insertDraftSegment(String id, String channelId, LocalDate businessDay,
-                                   String assetId, long startMs, long endMs) {
+                                   String assetId, long startMs, long endMs,
+                                   Long startFrame, Long endFrame) {
         jdbc.update("INSERT INTO playout_draft_segment"
-                        + " (id, channel_id, business_day, asset_id, start_ms, end_ms)"
-                        + " VALUES (?, ?, ?, ?, ?, ?)",
-                id, channelId, Date.valueOf(businessDay), assetId, startMs, endMs);
+                        + " (id, channel_id, business_day, asset_id, start_ms, end_ms,"
+                        + "  start_frame, end_frame)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                id, channelId, Date.valueOf(businessDay), assetId, startMs, endMs,
+                startFrame, endFrame);
     }
 
     public List<SegmentRow> findDraftSegments(String channelId, LocalDate businessDay) {
-        return jdbc.query("SELECT id, asset_id, start_ms, end_ms FROM playout_draft_segment"
+        return jdbc.query("SELECT id, asset_id, start_ms, end_ms, start_frame, end_frame"
+                        + " FROM playout_draft_segment"
                         + " WHERE channel_id = ? AND business_day = ? ORDER BY start_ms, id",
                 SEGMENT_MAPPER, channelId, Date.valueOf(businessDay));
     }
@@ -248,34 +277,50 @@ public class PlayoutRepository {
     }
 
     public long insertPublication(String channelId, LocalDate businessDay, long publishedVersion,
-                                  long draftVersion, long createdAtMs) {
+                                  long draftVersion, String coordType,
+                                  Integer frameRateNum, Integer frameRateDen, long createdAtMs) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
                     "INSERT INTO playout_publication"
-                            + " (channel_id, business_day, published_version, draft_version, created_at_ms)"
-                            + " VALUES (?, ?, ?, ?, ?)", Statement.RETURN_GENERATED_KEYS);
+                            + " (channel_id, business_day, published_version, draft_version,"
+                            + "  coord_type, frame_rate_num, frame_rate_den, created_at_ms)"
+                            + " VALUES (?, ?, ?, ?, ?, ?, ?, ?)", Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, channelId);
             ps.setDate(2, Date.valueOf(businessDay));
             ps.setLong(3, publishedVersion);
             ps.setLong(4, draftVersion);
-            ps.setLong(5, createdAtMs);
+            ps.setString(5, coordType);
+            if (frameRateNum == null) {
+                ps.setNull(6, java.sql.Types.INTEGER);
+            } else {
+                ps.setInt(6, frameRateNum);
+            }
+            if (frameRateDen == null) {
+                ps.setNull(7, java.sql.Types.INTEGER);
+            } else {
+                ps.setInt(7, frameRateDen);
+            }
+            ps.setLong(8, createdAtMs);
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();
     }
 
     public void insertPublicationSegment(long publicationId, String segmentId, String assetId,
-                                         long grantId, long startMs, long endMs) {
+                                         long grantId, long startMs, long endMs,
+                                         Long startFrame, Long endFrame) {
         jdbc.update("INSERT INTO playout_publication_segment"
-                        + " (publication_id, segment_id, asset_id, grant_id, start_ms, end_ms)"
-                        + " VALUES (?, ?, ?, ?, ?, ?)",
-                publicationId, segmentId, assetId, grantId, startMs, endMs);
+                        + " (publication_id, segment_id, asset_id, grant_id, start_ms, end_ms,"
+                        + "  start_frame, end_frame)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                publicationId, segmentId, assetId, grantId, startMs, endMs, startFrame, endFrame);
     }
 
     /** 最新一次发布快照。 */
     public Optional<PublicationRow> findLatestPublication(String channelId, LocalDate businessDay) {
-        return jdbc.query("SELECT id, channel_id, business_day, published_version, draft_version"
+        return jdbc.query("SELECT id, channel_id, business_day, published_version, draft_version,"
+                        + " coord_type, frame_rate_num, frame_rate_den"
                         + " FROM playout_publication"
                         + " WHERE channel_id = ? AND business_day = ?"
                         + " ORDER BY published_version DESC LIMIT 1",
@@ -284,11 +329,21 @@ public class PlayoutRepository {
 
     /** 快照中覆盖指定时刻的片段（start <= at < end）。 */
     public Optional<PublicationSegmentRow> findPublicationSegmentAt(long publicationId, long atMs) {
-        return jdbc.query("SELECT id, publication_id, segment_id, asset_id, grant_id, start_ms, end_ms"
+        return jdbc.query("SELECT id, publication_id, segment_id, asset_id, grant_id, start_ms,"
+                        + " end_ms, start_frame, end_frame"
                         + " FROM playout_publication_segment"
                         + " WHERE publication_id = ? AND start_ms <= ? AND end_ms > ?"
                         + " ORDER BY start_ms LIMIT 1",
                 PUBLICATION_SEGMENT_MAPPER, publicationId, atMs, atMs).stream().findFirst();
+    }
+
+    /** 快照的全部片段（按开始时刻升序），用于帧坐标快照的有理数轴选择。 */
+    public List<PublicationSegmentRow> findPublicationSegments(long publicationId) {
+        return jdbc.query("SELECT id, publication_id, segment_id, asset_id, grant_id, start_ms,"
+                        + " end_ms, start_frame, end_frame"
+                        + " FROM playout_publication_segment"
+                        + " WHERE publication_id = ? ORDER BY start_ms, segment_id",
+                PUBLICATION_SEGMENT_MAPPER, publicationId);
     }
 
     // ---------- 幂等请求记录 ----------

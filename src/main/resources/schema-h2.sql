@@ -28,10 +28,13 @@ CREATE INDEX IF NOT EXISTS idx_grant_coverage
     ON playout_grant (channel_id, asset_id, revoked, valid_from_ms, valid_to_ms);
 
 CREATE TABLE IF NOT EXISTS playout_draft (
-    channel_id    VARCHAR(64) NOT NULL,
-    business_day  DATE        NOT NULL,
-    version       BIGINT      NOT NULL,
-    updated_at_ms BIGINT      NOT NULL,
+    channel_id     VARCHAR(64) NOT NULL,
+    business_day   DATE        NOT NULL,
+    version        BIGINT      NOT NULL,
+    coord_type     VARCHAR(8)  NOT NULL DEFAULT 'MS',
+    frame_rate_num INT         NULL,
+    frame_rate_den INT         NULL,
+    updated_at_ms  BIGINT      NOT NULL,
     PRIMARY KEY (channel_id, business_day)
 );
 
@@ -41,7 +44,9 @@ CREATE TABLE IF NOT EXISTS playout_draft_segment (
     business_day DATE        NOT NULL,
     asset_id     VARCHAR(64) NOT NULL,
     start_ms     BIGINT      NOT NULL,
-    end_ms       BIGINT      NOT NULL
+    end_ms       BIGINT      NOT NULL,
+    start_frame  BIGINT      NULL,
+    end_frame    BIGINT      NULL
 );
 CREATE INDEX IF NOT EXISTS idx_draft_segment ON playout_draft_segment (channel_id, business_day);
 
@@ -51,6 +56,9 @@ CREATE TABLE IF NOT EXISTS playout_publication (
     business_day      DATE        NOT NULL,
     published_version BIGINT      NOT NULL,
     draft_version     BIGINT      NOT NULL,
+    coord_type        VARCHAR(8)  NOT NULL DEFAULT 'MS',
+    frame_rate_num    INT         NULL,
+    frame_rate_den    INT         NULL,
     created_at_ms     BIGINT      NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uk_publication_version
@@ -63,7 +71,9 @@ CREATE TABLE IF NOT EXISTS playout_publication_segment (
     asset_id       VARCHAR(64) NOT NULL,
     grant_id       BIGINT      NOT NULL,
     start_ms       BIGINT      NOT NULL,
-    end_ms         BIGINT      NOT NULL
+    end_ms         BIGINT      NOT NULL,
+    start_frame    BIGINT      NULL,
+    end_frame      BIGINT      NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pub_segment ON playout_publication_segment (publication_id);
 

@@ -18,6 +18,7 @@ import com.example.starter.playout.api.Dtos.DecisionSource;
 import com.example.starter.playout.api.Dtos.DraftResponse;
 import com.example.starter.playout.api.Dtos.EmergencyOverrideResponse;
 import com.example.starter.playout.api.Dtos.FallbackReason;
+import com.example.starter.playout.api.Dtos.FrameRateInput;
 import com.example.starter.playout.api.Dtos.GrantResponse;
 import com.example.starter.playout.api.Dtos.OverrideStatus;
 import com.example.starter.playout.api.Dtos.PlayoutDecisionResponse;
@@ -39,6 +40,7 @@ import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
@@ -51,6 +53,11 @@ import java.util.function.Supplier;
  * <p>约定：数据库内时间统一为 UTC 纪元毫秒；API 边界统一为 Asia/Shanghai、毫秒精度 ISO 8601；
  * 业务日为 Asia/Shanghai 日历日。授权区间为左闭右开。所有写操作与幂等去重记录在同一事务提交，
  * 失败整体回滚、不占用 requestId。</p>
+ *
+ * <p>帧时钟草稿：片段以帧号（原点为业务日零点）与帧率（24/1、25/1、30000/1001）给出，
+ * 真实时刻按帧号×分母/分子秒一次性计算，不逐帧累加舍入；重叠、授权覆盖与素材时长校验使用
+ * 真实有理数时刻，毫秒输出仅为向下取整的显示值。发布冻结帧号、帧率与原点；
+ * 播出查询将查询毫秒转换到同一有理数轴后按左闭右开选择片段。</p>
  */
 @Service
 public class PlayoutService {
@@ -150,21 +157,38 @@ public class PlayoutService {
 
     // ---------- 草稿 ----------
 
-    /** 整份替换草稿；携带 expectedDraftVersion（0 表示首次创建），版本不符返回 409 且不改写原草稿。 */
+    /**
+     * 整份替换草稿；携带 expectedDraftVersion（0 表示首次创建），版本不符返回 409 且不改写原草稿。
+     * frameRate 非空时为帧时钟草稿：片段以非负整数帧号给出，原点为业务日 Asia/Shanghai 零点，
+     * 真实时刻按帧号×分母/分子秒一次性计算；同一份草稿不能混用毫秒与帧两种坐标。
+     */
     @Transactional
     public DraftResponse replaceDraft(String channelId, LocalDate businessDay,
                                       ReplaceDraftRequest request) {
         repo.findChannel(channelId)
                 .orElseThrow(() -> ApiException.notFound("频道不存在: " + channelId));
 
-        String hash = sha256(OP_REPLACE_DRAFT + "|" + channelId + "|" + businessDay
-                + "|" + request.expectedDraftVersion() + "|" + canonicalSegments(request.segments()));
+        FrameRate frameRate = request.frameRate() == null ? null
+                : FrameRate.of(request.frameRate().numerator(), request.frameRate().denominator());
+        // 结构化身份：操作、资源、期望版本与全部参数（含帧号与帧率）序列化后哈希，
+        // 避免分隔符碰撞；不同帧号即使显示毫秒相等也不会被当作同参。
+        String hash = structuredHash(OP_REPLACE_DRAFT, channelId, businessDay.toString(),
+                request.expectedDraftVersion(),
+                frameRate == null ? "MS" : "FRAME",
+                frameRate == null ? null : frameRate.numerator(),
+                frameRate == null ? null : frameRate.denominator(),
+                canonicalSegments(request.segments()));
         return idempotent(request.requestId(), OP_REPLACE_DRAFT, hash, DraftResponse.class, () -> {
-            List<ValidatedSegment> segments = validateSegments(channelId, businessDay, request.segments());
+            List<ValidatedSegment> segments = frameRate == null
+                    ? validateMsSegments(channelId, businessDay, request.segments())
+                    : validateFrameSegments(channelId, businessDay, frameRate, request.segments());
+            String coordType = frameRate == null ? "MS" : "FRAME";
+            Integer rateNum = frameRate == null ? null : frameRate.numerator();
+            Integer rateDen = frameRate == null ? null : frameRate.denominator();
             long newVersion;
             if (request.expectedDraftVersion() == 0) {
                 try {
-                    repo.insertDraft(channelId, businessDay, nowMs());
+                    repo.insertDraft(channelId, businessDay, coordType, rateNum, rateDen, nowMs());
                 } catch (DuplicateKeyException e) {
                     throw ApiException.conflict("DRAFT_VERSION_CONFLICT",
                             "草稿已存在，expectedDraftVersion 不能为 0");
@@ -172,7 +196,7 @@ public class PlayoutService {
                 newVersion = 1;
             } else {
                 int updated = repo.bumpDraftVersion(channelId, businessDay,
-                        request.expectedDraftVersion(), nowMs());
+                        request.expectedDraftVersion(), coordType, rateNum, rateDen, nowMs());
                 if (updated == 0) {
                     throw ApiException.conflict("DRAFT_VERSION_CONFLICT",
                             "草稿版本不符，期望 " + request.expectedDraftVersion());
@@ -182,10 +206,13 @@ public class PlayoutService {
             repo.deleteDraftSegments(channelId, businessDay);
             for (ValidatedSegment segment : segments) {
                 repo.insertDraftSegment(segment.id(), channelId, businessDay,
-                        segment.assetId(), segment.startMs(), segment.endMs());
+                        segment.assetId(), segment.startMs(), segment.endMs(),
+                        segment.startFrame(), segment.endFrame());
             }
             return new DraftResponse(channelId, businessDay.toString(), newVersion,
-                    segments.stream().map(ValidatedSegment::toResponse).toList());
+                    segments.stream().map(ValidatedSegment::toResponse).toList(),
+                    frameRate == null ? null
+                            : new FrameRateInput(frameRate.numerator(), frameRate.denominator()));
         });
     }
 
@@ -216,15 +243,20 @@ public class PlayoutService {
                         "发布版本冲突，当前 " + currentPublished);
             }
             List<Long> grantIds = new ArrayList<>();
+            FrameRate frameRate = draft.frameCoord()
+                    ? new FrameRate(draft.frameRateNum(), draft.frameRateDen()) : null;
+            long dayStartMs = businessDay.atStartOfDay(ZONE).toInstant().toEpochMilli();
             for (SegmentRow segment : segments) {
-                GrantRow grant = selectCoveringGrantForUpdate(channelId, segment);
+                GrantRow grant = selectCoveringGrantForUpdate(channelId, segment,
+                        frameRate, dayStartMs);
                 grantIds.add(grant.id());
             }
             long newVersion = currentPublished + 1;
             long publicationId;
             try {
                 publicationId = repo.insertPublication(channelId, businessDay,
-                        newVersion, draft.version(), nowMs());
+                        newVersion, draft.version(), draft.coordType(),
+                        draft.frameRateNum(), draft.frameRateDen(), nowMs());
             } catch (DuplicateKeyException e) {
                 throw ApiException.conflict("PUBLISHED_VERSION_CONFLICT",
                         "发布版本冲突，版本 " + newVersion + " 已存在");
@@ -232,7 +264,8 @@ public class PlayoutService {
             for (int i = 0; i < segments.size(); i++) {
                 SegmentRow segment = segments.get(i);
                 repo.insertPublicationSegment(publicationId, segment.id(), segment.assetId(),
-                        grantIds.get(i), segment.startMs(), segment.endMs());
+                        grantIds.get(i), segment.startMs(), segment.endMs(),
+                        segment.startFrame(), segment.endFrame());
             }
             return new PublishResponse(publicationId, channelId, businessDay.toString(),
                     newVersion, draft.version());
@@ -267,8 +300,9 @@ public class PlayoutService {
             return fallback(channelId, at, channel.fallbackAssetId(),
                     FallbackReason.NO_PUBLISHED_SCHEDULE);
         }
-        Optional<PublicationSegmentRow> segment =
-                repo.findPublicationSegmentAt(publication.get().id(), atMs);
+        Optional<PublicationSegmentRow> segment = publication.get().frameCoord()
+                ? selectFrameSegmentAt(publication.get(), atMs)
+                : repo.findPublicationSegmentAt(publication.get().id(), atMs);
         if (segment.isEmpty()) {
             return fallback(channelId, at, channel.fallbackAssetId(),
                     FallbackReason.GAP);
@@ -430,14 +464,17 @@ public class PlayoutService {
 
     // ---------- 内部方法 ----------
 
-    /** 校验并规范化草稿片段：非空、区间内、不跨日、不重叠、素材存在且被单条未撤销授权完整覆盖。 */
-    private List<ValidatedSegment> validateSegments(String channelId, LocalDate businessDay,
-                                                    List<SegmentInput> inputs) {
+    /** 校验并规范化毫秒草稿片段：非空、区间内、不跨日、不重叠、素材存在且被单条未撤销授权完整覆盖。 */
+    private List<ValidatedSegment> validateMsSegments(String channelId, LocalDate businessDay,
+                                                      List<SegmentInput> inputs) {
         long dayStartMs = businessDay.atStartOfDay(ZONE).toInstant().toEpochMilli();
         long dayEndMs = businessDay.plusDays(1).atStartOfDay(ZONE).toInstant().toEpochMilli();
 
         List<ValidatedSegment> segments = new ArrayList<>();
         for (SegmentInput input : inputs) {
+            if (input.startFrame() != null || input.endFrame() != null) {
+                throw ApiException.badRequest("同一份草稿不能混用毫秒与帧坐标");
+            }
             if (input.start() == null || input.end() == null) {
                 throw ApiException.badRequest("片段开始与结束时间不能为空");
             }
@@ -455,7 +492,7 @@ public class PlayoutService {
             }
             String id = input.id() == null || input.id().isBlank()
                     ? UUID.randomUUID().toString() : input.id();
-            segments.add(new ValidatedSegment(id, input.assetId(), startMs, endMs));
+            segments.add(new ValidatedSegment(id, input.assetId(), startMs, endMs, null, null));
         }
 
         List<ValidatedSegment> sorted = segments.stream()
@@ -483,15 +520,110 @@ public class PlayoutService {
         return segments;
     }
 
-    /** 发布时加行锁选取覆盖授权；不存在或未撤销的覆盖授权时 422 拒绝整次发布。 */
-    private GrantRow selectCoveringGrantForUpdate(String channelId, SegmentRow segment) {
+    /**
+     * 校验并规范化帧时钟草稿片段：帧号为非负整数、结束大于开始、有理数结束不超过一天、
+     * 端点相接合法、不重叠；重叠、授权完整覆盖与素材时长校验均使用真实有理数时刻，
+     * 显示毫秒仅向下取整，短不足一帧的授权不会被显示取整放过。
+     */
+    private List<ValidatedSegment> validateFrameSegments(String channelId, LocalDate businessDay,
+                                                         FrameRate rate, List<SegmentInput> inputs) {
+        long dayStartMs = businessDay.atStartOfDay(ZONE).toInstant().toEpochMilli();
+
+        List<ValidatedSegment> segments = new ArrayList<>();
+        for (SegmentInput input : inputs) {
+            if (input.start() != null || input.end() != null) {
+                throw ApiException.badRequest("同一份草稿不能混用毫秒与帧坐标");
+            }
+            if (input.startFrame() == null || input.endFrame() == null) {
+                throw ApiException.badRequest("帧坐标片段必须给出起止帧号");
+            }
+            if (input.assetId() == null || input.assetId().isBlank()) {
+                throw ApiException.badRequest("片段素材 ID 不能为空");
+            }
+            long startFrame = input.startFrame();
+            long endFrame = input.endFrame();
+            if (startFrame < 0 || endFrame < 0) {
+                throw ApiException.badRequest("帧号必须为非负整数");
+            }
+            if (endFrame <= startFrame) {
+                throw ApiException.badRequest("片段结束帧必须大于开始帧");
+            }
+            if (!rate.withinDay(endFrame)) {
+                throw ApiException.unprocessable("SEGMENT_CROSSES_DAY",
+                        "片段有理数结束超过一天: " + input.id());
+            }
+            String id = input.id() == null || input.id().isBlank()
+                    ? UUID.randomUUID().toString() : input.id();
+            segments.add(new ValidatedSegment(id, input.assetId(),
+                    dayStartMs + rate.floorMs(startFrame),
+                    dayStartMs + rate.floorMs(endFrame),
+                    startFrame, endFrame));
+        }
+
+        List<ValidatedSegment> sorted = segments.stream()
+                .sorted(Comparator.comparingLong(ValidatedSegment::startFrame)
+                        .thenComparing(ValidatedSegment::id))
+                .toList();
+        for (int i = 1; i < sorted.size(); i++) {
+            if (sorted.get(i).startFrame() < sorted.get(i - 1).endFrame()) {
+                throw ApiException.unprocessable("SEGMENT_OVERLAP",
+                        "片段帧区间重叠: " + sorted.get(i - 1).id() + " 与 " + sorted.get(i).id());
+            }
+        }
+
+        for (ValidatedSegment segment : segments) {
+            var asset = repo.findAsset(segment.assetId())
+                    .orElseThrow(() -> ApiException.notFound("素材不存在: " + segment.assetId()));
+            if (!rate.durationWithin(segment.startFrame(), segment.endFrame(), asset.durationMs())) {
+                throw ApiException.unprocessable("SEGMENT_EXCEEDS_ASSET_DURATION",
+                        "片段真实时长超过素材时长: " + segment.id());
+            }
+            // 授权覆盖按真实有理数时刻判定：floor(真实开始)/ceil(真实结束) 为精确预筛边界
+            List<GrantRow> covering = repo.findCoveringGrants(channelId, segment.assetId(),
+                    dayStartMs + rate.floorMs(segment.startFrame()),
+                    dayStartMs + rate.ceilMs(segment.endFrame()));
+            if (covering.isEmpty()) {
+                throw ApiException.unprocessable("NO_COVERING_GRANT",
+                        "片段未被单条有效授权完整覆盖: " + segment.id());
+            }
+        }
+        return segments;
+    }
+
+    /**
+     * 发布时加行锁选取覆盖授权；不存在或未撤销的覆盖授权时 422 拒绝整次发布。
+     * 帧坐标片段按真实有理数时刻判定（floor 开始 / ceil 结束为精确边界）。
+     */
+    private GrantRow selectCoveringGrantForUpdate(String channelId, SegmentRow segment,
+                                                  FrameRate frameRate, long dayStartMs) {
+        long coverStartMs = segment.startMs();
+        long coverEndMs = segment.endMs();
+        if (frameRate != null) {
+            coverStartMs = dayStartMs + frameRate.floorMs(segment.startFrame());
+            coverEndMs = dayStartMs + frameRate.ceilMs(segment.endFrame());
+        }
         List<GrantRow> candidates = repo.findCoveringGrantsForUpdate(channelId, segment.assetId(),
-                segment.startMs(), segment.endMs());
+                coverStartMs, coverEndMs);
         return candidates.stream()
                 .filter(grant -> !grant.revoked())
                 .findFirst()
                 .orElseThrow(() -> ApiException.unprocessable("GRANT_INVALID",
                         "片段授权已失效，发布拒绝: " + segment.id()));
+    }
+
+    /**
+     * 帧坐标快照的片段选择：将查询毫秒转换到同一有理数轴（业务日零点起偏移），
+     * 按左闭右开（真实开始 <= 位置 < 真实结束）精确选择，不使用显示取整值。
+     */
+    private Optional<PublicationSegmentRow> selectFrameSegmentAt(PublicationRow publication,
+                                                                 long atMs) {
+        FrameRate rate = new FrameRate(publication.frameRateNum(), publication.frameRateDen());
+        long dayStartMs = publication.businessDay().atStartOfDay(ZONE).toInstant().toEpochMilli();
+        long posMs = atMs - dayStartMs;
+        return repo.findPublicationSegments(publication.id()).stream()
+                .filter(segment -> rate.realStartLte(segment.startFrame(), posMs)
+                        && rate.realEndGt(segment.endFrame(), posMs))
+                .findFirst();
     }
 
     /**
@@ -541,15 +673,31 @@ public class PlayoutService {
         }
     }
 
-    private static String canonicalSegments(List<SegmentInput> segments) {
-        StringBuilder sb = new StringBuilder();
-        for (SegmentInput s : segments) {
-            sb.append(s.id() == null ? "" : s.id()).append(',')
-                    .append(s.assetId()).append(',')
-                    .append(s.start() == null ? "" : toMs(s.start())).append(',')
-                    .append(s.end() == null ? "" : toMs(s.end())).append(';');
+    /**
+     * 结构化幂等身份：操作、资源、期望版本与全部参数组成有序结构后 JSON 序列化再哈希，
+     * 避免字符串分隔符碰撞；帧号与帧率原样入身份，不同帧号不会因显示毫秒相等被当作同参。
+     */
+    private String structuredHash(Object... identityParts) {
+        try {
+            return sha256(objectMapper.writeValueAsString(Arrays.asList(identityParts)));
+        } catch (Exception e) {
+            throw new IllegalStateException("幂等身份序列化失败", e);
         }
-        return sb.toString();
+    }
+
+    /** 片段参数的结构化表示：保留原始帧号/毫秒，不做显示取整。 */
+    private static List<List<Object>> canonicalSegments(List<SegmentInput> segments) {
+        List<List<Object>> canonical = new ArrayList<>();
+        for (SegmentInput s : segments) {
+            canonical.add(Arrays.asList(
+                    s.id() == null ? "" : s.id(),
+                    s.assetId(),
+                    s.start() == null ? null : toMs(s.start()),
+                    s.end() == null ? null : toMs(s.end()),
+                    s.startFrame(),
+                    s.endFrame()));
+        }
+        return canonical;
     }
 
     private PlayoutDecisionResponse fallback(String channelId, OffsetDateTime at, String assetId,
@@ -585,10 +733,12 @@ public class PlayoutService {
         }
     }
 
-    /** 校验后的片段。 */
-    private record ValidatedSegment(String id, String assetId, long startMs, long endMs) {
+    /** 校验后的片段；帧坐标片段的 startMs/endMs 为真实时刻向下取整的显示值。 */
+    private record ValidatedSegment(String id, String assetId, long startMs, long endMs,
+                                    Long startFrame, Long endFrame) {
         SegmentResponse toResponse() {
-            return new SegmentResponse(id, assetId, atMs(startMs), atMs(endMs));
+            return new SegmentResponse(id, assetId, atMs(startMs), atMs(endMs),
+                    startFrame, endFrame);
         }
     }
 }

@@ -1,5 +1,6 @@
 package com.example.starter.playout.api;
 
+import jakarta.validation.Valid;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
@@ -60,35 +61,54 @@ public final class Dtos {
     public record RevokeGrantRequest(@NotBlank String requestId) {
     }
 
-    /** 草稿片段输入；id 为空时由系统生成。 */
+    /** 帧率输入，分子/分母表示每秒帧数；仅支持 24/1、25/1、30000/1001。 */
+    public record FrameRateInput(
+            @NotNull @Positive Integer numerator,
+            @NotNull @Positive Integer denominator) {
+    }
+
+    /**
+     * 草稿片段输入；id 为空时由系统生成。毫秒坐标使用 start/end；
+     * 帧坐标使用 startFrame/endFrame（非负整数帧号，结束大于开始，原点为业务日零点）。
+     * 同一份草稿只能使用一种坐标。
+     */
     public record SegmentInput(
             String id,
             @NotBlank String assetId,
-            @NotNull OffsetDateTime start,
-            @NotNull OffsetDateTime end) {
+            OffsetDateTime start,
+            OffsetDateTime end,
+            Long startFrame,
+            Long endFrame) {
     }
 
-    /** 整份替换草稿请求。 */
+    /** 整份替换草稿请求；frameRate 非空表示帧时钟草稿，为空表示毫秒草稿。 */
     public record ReplaceDraftRequest(
             @NotBlank String requestId,
             @NotNull @PositiveOrZero Long expectedDraftVersion,
-            @NotNull List<@NotNull SegmentInput> segments) {
+            @NotNull List<@NotNull SegmentInput> segments,
+            @Valid FrameRateInput frameRate) {
     }
 
-    /** 草稿片段响应。 */
+    /**
+     * 草稿片段响应。start/end 为显示用毫秒时刻（帧坐标时为真实时刻向下取整）；
+     * startFrame/endFrame 仅帧坐标草稿非空。
+     */
     public record SegmentResponse(
             String id,
             String assetId,
             OffsetDateTime start,
-            OffsetDateTime end) {
+            OffsetDateTime end,
+            Long startFrame,
+            Long endFrame) {
     }
 
-    /** 草稿响应。 */
+    /** 草稿响应；frameRate 仅帧时钟草稿非空，发布后随快照冻结。 */
     public record DraftResponse(
             String channelId,
             String businessDay,
             long version,
-            List<SegmentResponse> segments) {
+            List<SegmentResponse> segments,
+            FrameRateInput frameRate) {
     }
 
     /** 发布请求。 */

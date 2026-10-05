@@ -31,10 +31,13 @@ CREATE TABLE IF NOT EXISTS playout_grant (
 ) COMMENT = '素材授权表，授权创建后只能撤销';
 
 CREATE TABLE IF NOT EXISTS playout_draft (
-    channel_id    VARCHAR(64) NOT NULL COMMENT '频道 ID',
-    business_day  DATE        NOT NULL COMMENT '业务日，Asia/Shanghai 日历日',
-    version       BIGINT      NOT NULL COMMENT '草稿乐观锁版本，每次整份替换递增，初始为 1',
-    updated_at_ms BIGINT      NOT NULL COMMENT '最近替换时间，UTC 纪元毫秒',
+    channel_id     VARCHAR(64) NOT NULL COMMENT '频道 ID',
+    business_day   DATE        NOT NULL COMMENT '业务日，Asia/Shanghai 日历日',
+    version        BIGINT      NOT NULL COMMENT '草稿乐观锁版本，每次整份替换递增，初始为 1',
+    coord_type     VARCHAR(8)  NOT NULL DEFAULT 'MS' COMMENT '坐标类型：MS 毫秒坐标 / FRAME 帧坐标；同一份草稿只使用一种坐标',
+    frame_rate_num INT         NULL COMMENT '帧率分子（每秒帧数分子），仅 FRAME 草稿非空；仅支持 24/1、25/1、30000/1001',
+    frame_rate_den INT         NULL COMMENT '帧率分母，仅 FRAME 草稿非空；帧原点为业务日 Asia/Shanghai 零点',
+    updated_at_ms  BIGINT      NOT NULL COMMENT '最近替换时间，UTC 纪元毫秒',
     PRIMARY KEY (channel_id, business_day)
 ) COMMENT = '播出草稿表，每个频道+业务日一份';
 
@@ -43,8 +46,10 @@ CREATE TABLE IF NOT EXISTS playout_draft_segment (
     channel_id   VARCHAR(64) NOT NULL COMMENT '所属频道 ID',
     business_day DATE        NOT NULL COMMENT '所属业务日，Asia/Shanghai 日历日',
     asset_id     VARCHAR(64) NOT NULL COMMENT '播出素材 ID',
-    start_ms     BIGINT      NOT NULL COMMENT '播出开始（含），UTC 纪元毫秒，不得跨日',
-    end_ms       BIGINT      NOT NULL COMMENT '播出结束（不含），UTC 纪元毫秒，不得跨日',
+    start_ms     BIGINT      NOT NULL COMMENT '播出开始（含），UTC 纪元毫秒，不得跨日；FRAME 片段为真实开始向下取整的显示值',
+    end_ms       BIGINT      NOT NULL COMMENT '播出结束（不含），UTC 纪元毫秒，不得跨日；FRAME 片段为真实结束向下取整的显示值',
+    start_frame  BIGINT      NULL COMMENT '开始帧号（含），非负整数，仅 FRAME 片段非空；真实时刻=帧号×帧率分母/分子秒',
+    end_frame    BIGINT      NULL COMMENT '结束帧号（不含），仅 FRAME 片段非空；有理数结束不得超过一天',
     PRIMARY KEY (id),
     KEY idx_draft_segment (channel_id, business_day)
 ) COMMENT = '草稿片段表，随草稿整份替换而整体重建';
@@ -52,9 +57,12 @@ CREATE TABLE IF NOT EXISTS playout_draft_segment (
 CREATE TABLE IF NOT EXISTS playout_publication (
     id                BIGINT      NOT NULL AUTO_INCREMENT COMMENT '发布快照自增 ID',
     channel_id        VARCHAR(64) NOT NULL COMMENT '频道 ID',
-    business_day      DATE        NOT NULL COMMENT '业务日，Asia/Shanghai 日历日',
+    business_day      DATE        NOT NULL COMMENT '业务日，Asia/Shanghai 日历日；FRAME 快照的帧原点为该日 Asia/Shanghai 零点',
     published_version BIGINT      NOT NULL COMMENT '发布版本，每频道+业务日从 1 起递增',
     draft_version     BIGINT      NOT NULL COMMENT '发布时对应的草稿版本',
+    coord_type        VARCHAR(8)  NOT NULL DEFAULT 'MS' COMMENT '坐标类型：MS 毫秒坐标 / FRAME 帧坐标，发布时随草稿冻结',
+    frame_rate_num    INT         NULL COMMENT '帧率分子，仅 FRAME 快照非空，发布时冻结',
+    frame_rate_den    INT         NULL COMMENT '帧率分母，仅 FRAME 快照非空，发布时冻结',
     created_at_ms     BIGINT      NOT NULL COMMENT '发布时间，UTC 纪元毫秒',
     PRIMARY KEY (id),
     UNIQUE KEY uk_publication_version (channel_id, business_day, published_version)
@@ -66,8 +74,10 @@ CREATE TABLE IF NOT EXISTS playout_publication_segment (
     segment_id     VARCHAR(64) NOT NULL COMMENT '来源草稿片段 ID',
     asset_id       VARCHAR(64) NOT NULL COMMENT '播出素材 ID',
     grant_id       BIGINT      NOT NULL COMMENT '发布时完整覆盖该片段的授权 ID，播出查询据此实时判定撤销状态',
-    start_ms       BIGINT      NOT NULL COMMENT '播出开始（含），UTC 纪元毫秒',
-    end_ms         BIGINT      NOT NULL COMMENT '播出结束（不含），UTC 纪元毫秒',
+    start_ms       BIGINT      NOT NULL COMMENT '播出开始（含），UTC 纪元毫秒；FRAME 片段为真实开始向下取整的显示值',
+    end_ms         BIGINT      NOT NULL COMMENT '播出结束（不含），UTC 纪元毫秒；FRAME 片段为真实结束向下取整的显示值',
+    start_frame    BIGINT      NULL COMMENT '开始帧号（含），仅 FRAME 片段非空，发布时冻结',
+    end_frame      BIGINT      NULL COMMENT '结束帧号（不含），仅 FRAME 片段非空，发布时冻结',
     PRIMARY KEY (id),
     KEY idx_pub_segment (publication_id)
 ) COMMENT = '发布快照片段表，只读';
