@@ -51,3 +51,50 @@ CREATE TABLE IF NOT EXISTS release_record (
     released_at DATETIME(6) NOT NULL COMMENT '放行时间（UTC）',
     KEY idx_release_measurement (measurement_id)
 ) COMMENT='放行历史';
+
+-- 差分结果：绑定同仪器、采样时刻相差不超过 10 秒的参考/待测两条测量；
+-- 差值=待测校正值-参考校正值，合格判定基于未舍入差值与闭区间限值。
+CREATE TABLE IF NOT EXISTS differential (
+    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY COMMENT '差分记录 ID，自增',
+    differential_key VARCHAR(64) NOT NULL COMMENT '业务差分键，全局唯一',
+    reference_measurement_id BIGINT NOT NULL COMMENT '参考件测量记录 ID',
+    dut_measurement_id BIGINT NOT NULL COMMENT '待测件测量记录 ID',
+    instrument_id VARCHAR(64) NOT NULL COMMENT '仪器 ID（两条测量必须同仪器）',
+    reference_certificate_id BIGINT NOT NULL COMMENT '参考测量提交时固化的证书 ID',
+    dut_certificate_id BIGINT NOT NULL COMMENT '待测测量提交时固化的证书 ID',
+    difference DECIMAL(38,12) NOT NULL COMMENT '未舍入差值=待测校正值-参考校正值，最多 12 位小数',
+    lower_limit DECIMAL(38,6) NOT NULL COMMENT '差分合格下限（闭区间，含端点），最多 6 位小数',
+    upper_limit DECIMAL(38,6) NOT NULL COMMENT '差分合格上限（闭区间，含端点），最多 6 位小数',
+    passed BOOLEAN NOT NULL COMMENT '差分是否合格；基于未舍入差值与闭区间限值判定',
+    status VARCHAR(16) NOT NULL COMMENT '状态：PENDING=待审，RELEASED=已放行，CANCELLED=已取消（记录保留不删除）',
+    created_by VARCHAR(64) NOT NULL COMMENT '创建人（X-Actor-Id）',
+    created_at DATETIME(6) NOT NULL COMMENT '创建时间（UTC）',
+    released_by VARCHAR(64) NULL COMMENT '放行人；未放行时为 NULL',
+    released_at DATETIME(6) NULL COMMENT '放行时间（UTC）；未放行时为 NULL',
+    frozen_reference_value DECIMAL(38,12) NULL COMMENT '放行时冻结的参考校正值（未舍入）；未放行时为 NULL',
+    frozen_dut_value DECIMAL(38,12) NULL COMMENT '放行时冻结的待测校正值（未舍入）；未放行时为 NULL',
+    cancelled_by VARCHAR(64) NULL COMMENT '取消人；未取消时为 NULL',
+    cancelled_at DATETIME(6) NULL COMMENT '取消时间（UTC）；未取消时为 NULL',
+    version BIGINT NOT NULL DEFAULT 0 COMMENT '乐观锁版本，放行/取消时递增',
+    CONSTRAINT uk_differential_key UNIQUE (differential_key),
+    KEY idx_diff_reference (reference_measurement_id),
+    KEY idx_diff_dut (dut_measurement_id)
+) COMMENT='差分结果';
+
+-- 差分配对占用：一条测量至多被一条未取消差分占用；取消时删除占用行释放配对。
+CREATE TABLE IF NOT EXISTS differential_occupation (
+    measurement_id BIGINT NOT NULL PRIMARY KEY COMMENT '被差分占用的测量记录 ID',
+    differential_id BIGINT NOT NULL COMMENT '占用该测量的差分记录 ID',
+    created_at DATETIME(6) NOT NULL COMMENT '占用时间（UTC）',
+    KEY idx_occupation_differential (differential_id)
+) COMMENT='差分配对占用';
+
+-- 写操作幂等去重：与业务写入同事务提交；身份指纹为操作+操作者+资源+全部参数与期望版本的结构化 JSON。
+CREATE TABLE IF NOT EXISTS idempotency_record (
+    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY COMMENT '幂等记录 ID，自增',
+    request_id VARCHAR(64) NOT NULL COMMENT '客户端请求 ID（幂等键）',
+    fingerprint VARCHAR(2048) NOT NULL COMMENT '身份指纹：操作、操作者、资源、全部参数与期望版本的结构化 JSON',
+    response_body TEXT NOT NULL COMMENT '首次成功的完整响应快照（JSON）；占位为空串',
+    created_at DATETIME(6) NOT NULL COMMENT '记录时间（UTC）',
+    CONSTRAINT uk_idempotency_request UNIQUE (request_id)
+) COMMENT='写操作幂等去重记录';

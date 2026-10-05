@@ -1,5 +1,7 @@
 package com.example.starter.calibration.api;
 
+import org.springframework.dao.CannotAcquireLockException;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -26,6 +28,24 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorResponse> handleApi(ApiException ex) {
         return ResponseEntity.status(ex.getStatus())
                 .body(new ErrorResponse(ex.getCode(), ex.getMessage()));
+    }
+
+    /**
+     * 兜底：唯一键冲突不泄露为 500，统一映射为 409。
+     */
+    @ExceptionHandler(DuplicateKeyException.class)
+    public ResponseEntity<ErrorResponse> handleDuplicateKey(DuplicateKeyException ex) {
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(new ErrorResponse("CONFLICT", "唯一键冲突"));
+    }
+
+    /**
+     * 兜底：行锁等待超时/死锁不泄露为 500，统一映射为 409。
+     */
+    @ExceptionHandler(CannotAcquireLockException.class)
+    public ResponseEntity<ErrorResponse> handleLockConflict(CannotAcquireLockException ex) {
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(new ErrorResponse("CONCURRENCY_CONFLICT", "并发写冲突，请重试"));
     }
 
     @ExceptionHandler({

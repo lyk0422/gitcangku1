@@ -88,6 +88,22 @@ public class MeasurementRepository {
     }
 
     /**
+     * 按 ID 查询（不加锁）。
+     */
+    public Optional<Measurement> findById(long id) {
+        return jdbc.query("SELECT * FROM measurement WHERE id = ?", MAPPER, id)
+                .stream().findFirst();
+    }
+
+    /**
+     * 按 ID 查询并加行锁（须在事务内调用），用于差分放行时串行化原测量状态流转。
+     */
+    public Optional<Measurement> findByIdForUpdate(long id) {
+        return jdbc.query("SELECT * FROM measurement WHERE id = ? FOR UPDATE", MAPPER, id)
+                .stream().findFirst();
+    }
+
+    /**
      * 将测量记录置为已放行（须在持有行锁的事务内调用）。
      */
     public void markReleased(long id) {
