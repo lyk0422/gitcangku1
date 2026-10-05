@@ -44,6 +44,7 @@ public class IncidentTaskRepository {
     private static IncidentTask mapTask(ResultSet rs) throws SQLException {
         Timestamp doneAt = rs.getTimestamp("done_at");
         Timestamp cancelledAt = rs.getTimestamp("cancelled_at");
+        String preExpiry = rs.getString("pre_expiry_status");
         return new IncidentTask(
                 rs.getLong("id"), rs.getLong("incident_id"), rs.getString("task_key"),
                 rs.getString("group_code"), rs.getString("title"),
@@ -52,6 +53,7 @@ public class IncidentTaskRepository {
                 doneAt == null ? null : doneAt.toInstant(),
                 rs.getString("cancelled_by"),
                 cancelledAt == null ? null : cancelledAt.toInstant(),
+                preExpiry == null ? null : TaskStatus.valueOf(preExpiry),
                 rs.getTimestamp("created_at").toInstant(),
                 rs.getTimestamp("updated_at").toInstant());
     }
@@ -71,7 +73,8 @@ public class IncidentTaskRepository {
             var ps = con.prepareStatement(
                     "INSERT INTO incident_tasks (incident_id, task_key, group_code, title, status,"
                             + " created_by, done_by, done_at, cancelled_by, cancelled_at,"
-                            + " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                            + " pre_expiry_status, created_at, updated_at)"
+                            + " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setLong(1, task.incidentId());
             ps.setString(2, task.taskKey());
@@ -83,8 +86,9 @@ public class IncidentTaskRepository {
             ps.setTimestamp(8, task.doneAt() == null ? null : Timestamp.from(task.doneAt()));
             ps.setString(9, task.cancelledBy());
             ps.setTimestamp(10, task.cancelledAt() == null ? null : Timestamp.from(task.cancelledAt()));
-            ps.setTimestamp(11, Timestamp.from(task.createdAt()));
-            ps.setTimestamp(12, Timestamp.from(task.updatedAt()));
+            ps.setString(11, task.preExpiryStatus() == null ? null : task.preExpiryStatus().name());
+            ps.setTimestamp(12, Timestamp.from(task.createdAt()));
+            ps.setTimestamp(13, Timestamp.from(task.updatedAt()));
             return ps;
         }, keys);
         return keys.getKey().longValue();
@@ -101,6 +105,15 @@ public class IncidentTaskRepository {
     }
 
     /**
+     * 按主键查询任务，用于资源到期拦截等按 id 定位的场景。
+     */
+    public Optional<IncidentTask> findById(long id) {
+        List<IncidentTask> rows = jdbc.query("SELECT * FROM incident_tasks WHERE id = ?",
+                TASK_MAPPER, id);
+        return rows.stream().findFirst();
+    }
+
+    /**
      * 查询事件全部任务，按创建顺序返回。
      */
     public List<IncidentTask> listByIncident(long incidentId) {
@@ -109,11 +122,13 @@ public class IncidentTaskRepository {
     }
 
     /**
-     * 查询事件仍 OPEN 的任务（解决门禁用），按创建顺序返回。
+     * 查询事件仍未进入终态的任务（OPEN/IN_PROGRESS/AUTHORIZATION_EXPIRED，解决门禁用），
+     * 按创建顺序返回。
      */
-    public List<IncidentTask> listOpenByIncident(long incidentId) {
-        return jdbc.query("SELECT * FROM incident_tasks WHERE incident_id = ? AND status = 'OPEN'"
-                + " ORDER BY id", TASK_MAPPER, incidentId);
+    public List<IncidentTask> listUnfinishedByIncident(long incidentId) {
+        return jdbc.query("SELECT * FROM incident_tasks WHERE incident_id = ? AND status IN"
+                + " ('OPEN','IN_PROGRESS','AUTHORIZATION_EXPIRED') ORDER BY id", TASK_MAPPER,
+                incidentId);
     }
 
     /**
@@ -141,6 +156,40 @@ public class IncidentTaskRepository {
         jdbc.update("UPDATE incident_tasks SET status = 'CANCELLED', cancelled_by = ?,"
                         + " cancelled_at = ?, updated_at = ? WHERE id = ?",
                 actor, Timestamp.from(at), Timestamp.from(at), id);
+    }
+
+    /**
+     * 将 OPEN 任务置为 IN_PROGRESS（开始执行）。
+     */
+    public void markInProgress(long id, Instant at) {
+        jdbc.update("UPDATE incident_tasks SET status = 'IN_PROGRESS', updated_at = ? WHERE id = ?",
+                Timestamp.from(at), id);
+    }
+
+    /**
+     * 将任务置为 AUTHORIZATION_EXPIRED，并固化到期前状态供续期恢复。
+     */
+    public void markAuthorizationExpired(long id, TaskStatus previousStatus, Instant at) {
+        jdbc.update("UPDATE incident_tasks SET status = 'AUTHORIZATION_EXPIRED',"
+                        + " pre_expiry_status = ?, updated_at = ? WHERE id = ?",
+                previousStatus.name(), Timestamp.from(at), id);
+    }
+
+    /**
+     * 续期成功后恢复到期前状态并清空 pre_expiry_status。
+     */
+    public void restoreFromExpiry(long id, TaskStatus restoredStatus, Instant at) {
+        jdbc.update("UPDATE incident_tasks SET status = ?, pre_expiry_status = NULL,"
+                        + " updated_at = ? WHERE id = ?",
+                restoredStatus.name(), Timestamp.from(at), id);
+    }
+
+    /**
+     * 查询任务的直接阻塞事件 id 列表（依赖闭包计算用）。
+     */
+    public List<Long> listBlockingIncidentIds(long taskId) {
+        return jdbc.query("SELECT blocker_incident_id FROM incident_task_blockers WHERE task_id = ?"
+                + " ORDER BY blocker_incident_id", (rs, n) -> rs.getLong(1), taskId);
     }
 
     /**

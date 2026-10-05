@@ -1,18 +1,13 @@
 package com.example.starter.incident;
 
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.EnumSet;
-import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.function.Supplier;
 
 import com.example.starter.incident.dto.Requests.ActionRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
@@ -22,6 +17,8 @@ import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
 import com.example.starter.incident.dto.Requests.TaskActionRequest;
 import com.example.starter.incident.dto.Requests.TaskCreateRequest;
+import com.example.starter.incident.dto.Requests.TaskExecuteRequest;
+import com.example.starter.incident.dto.Requests.TaskStartRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
@@ -35,8 +32,6 @@ import com.example.starter.incident.dto.Responses.TaskBlockerView;
 import com.example.starter.incident.dto.Responses.TaskView;
 import com.example.starter.incident.dto.Responses.TransferView;
 import com.example.starter.incident.dto.Responses.UnfinishedTaskView;
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -51,8 +46,6 @@ import org.springframework.transaction.annotation.Transactional;
  */
 @Service
 public class IncidentService {
-
-    private static final String SEP = "\\u001F";
 
     /** 各严重等级的遏制时限（分钟），等级沿用上报值且不可修改。 */
     private static final Map<String, Long> CONTAINMENT_MINUTES = Map.of(
@@ -71,18 +64,23 @@ public class IncidentService {
     private final IncidentRepository incidents;
     private final EscalationRepository escalations;
     private final IncidentTaskRepository tasks;
-    private final CommandKeyRepository commandKeys;
-    private final ObjectMapper objectMapper;
+    private final TaskResourceRepository resources;
+    private final ResourceEvidenceRepository evidence;
+    private final ResourceExpiryGuard expiryGuard;
+    private final Idempotency idempotency;
     private final Clock clock;
 
     public IncidentService(IncidentRepository incidents, EscalationRepository escalations,
-                           IncidentTaskRepository tasks, CommandKeyRepository commandKeys,
-                           ObjectMapper objectMapper, Clock clock) {
+                           IncidentTaskRepository tasks, TaskResourceRepository resources,
+                           ResourceEvidenceRepository evidence, ResourceExpiryGuard expiryGuard,
+                           Idempotency idempotency, Clock clock) {
         this.incidents = incidents;
         this.escalations = escalations;
         this.tasks = tasks;
-        this.commandKeys = commandKeys;
-        this.objectMapper = objectMapper;
+        this.resources = resources;
+        this.evidence = evidence;
+        this.expiryGuard = expiryGuard;
+        this.idempotency = idempotency;
         this.clock = clock;
     }
 
@@ -126,7 +124,7 @@ public class IncidentService {
     public IncidentView takeover(String incidentKey, String actor, TakeoverRequest req) {
         String commandKey = requireText(req.commandKey(), "commandKey");
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "takeover", hash(incidentKey, actor), IncidentView.class,
+        return idempotency.run(commandKey, "takeover", Idempotency.hash(incidentKey, actor), IncidentView.class,
                 () -> {
                     if (incident.status() != IncidentStatus.REPORTED) {
                         throw ApiException.illegalTransition(
@@ -151,7 +149,7 @@ public class IncidentService {
         String commandKey = requireText(req.commandKey(), "commandKey");
         String toCommander = requireText(req.toCommander(), "toCommander");
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "transfer_initiate", hash(incidentKey, actor, toCommander),
+        return idempotency.run(commandKey, "transfer_initiate", Idempotency.hash(incidentKey, actor, toCommander),
                 TransferView.class, () -> {
                     requireCommander(incident, actor);
                     if (incident.status() == IncidentStatus.RESOLVED
@@ -183,7 +181,7 @@ public class IncidentService {
     public IncidentView acceptTransfer(String incidentKey, String actor, TransferAcceptRequest req) {
         String commandKey = requireText(req.commandKey(), "commandKey");
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "transfer_accept", hash(incidentKey, actor), IncidentView.class,
+        return idempotency.run(commandKey, "transfer_accept", Idempotency.hash(incidentKey, actor), IncidentView.class,
                 () -> {
                     if (incident.status() == IncidentStatus.RESOLVED
                             || incident.status() == IncidentStatus.CLOSED) {
@@ -217,8 +215,8 @@ public class IncidentService {
         }
         Instant occurredAt = req.occurredAt().truncatedTo(ChronoUnit.MICROS);
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "action",
-                hash(incidentKey, actor, actionKey, actionType, note, occurredAt.toString()),
+        return idempotency.run(commandKey, "action",
+                Idempotency.hash(incidentKey, actor, actionKey, actionType, note, occurredAt.toString()),
                 ActionView.class, () -> {
                     requireCommander(incident, actor);
                     if (incident.status() == IncidentStatus.CLOSED) {
@@ -254,7 +252,7 @@ public class IncidentService {
             throw ApiException.badRequest("未知目标状态: " + target);
         }
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "status", hash(incidentKey, actor, target),
+        return idempotency.run(commandKey, "status", Idempotency.hash(incidentKey, actor, target),
                 IncidentView.class, () -> {
                     requireCommander(incident, actor);
                     IncidentStatus next = incident.status().next();
@@ -265,7 +263,7 @@ public class IncidentService {
                     if (targetStatus == IncidentStatus.RESOLVED) {
                         // 解决门禁：全部处置任务进入 DONE/CANCELLED 后才可解决
                         List<UnfinishedTaskView> unfinished = tasks
-                                .listOpenByIncident(incident.id()).stream()
+                                .listUnfinishedByIncident(incident.id()).stream()
                                 .map(t -> new UnfinishedTaskView(t.groupCode(), t.taskKey()))
                                 .toList();
                         if (!unfinished.isEmpty()) {
@@ -295,7 +293,7 @@ public class IncidentService {
     public EscalationHistoryView checkEscalation(String incidentKey, EscalationCheckRequest req) {
         String commandKey = requireText(req.commandKey(), "commandKey");
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "escalation_check", hash(incidentKey),
+        return idempotency.run(commandKey, "escalation_check", Idempotency.hash(incidentKey),
                 EscalationHistoryView.class, () -> {
                     var existing = escalations.findByIncident(incident.id());
                     if (existing.isPresent()) {
@@ -325,7 +323,7 @@ public class IncidentService {
         String commandKey = requireText(req.commandKey(), "commandKey");
         String note = requireText(req.note(), "note");
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "escalation_ack", hash(incidentKey, actor, note),
+        return idempotency.run(commandKey, "escalation_ack", Idempotency.hash(incidentKey, actor, note),
                 EscalationView.class, () -> {
                     requireCommander(incident, actor);
                     Escalation escalation = escalations.findByIncident(incident.id())
@@ -413,8 +411,8 @@ public class IncidentService {
             throw ApiException.badRequest("阻塞事件不能是事件自身: " + incidentKey);
         }
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "task_create",
-                hash(incidentKey, actor, taskKey, groupCode, title, String.join(",", blockerKeys)),
+        return idempotency.run(commandKey, "task_create",
+                Idempotency.hash(incidentKey, actor, taskKey, groupCode, title, String.join(",", blockerKeys)),
                 TaskView.class, () -> {
                     requireCommander(incident, actor);
                     if (incident.status() == IncidentStatus.CLOSED) {
@@ -453,7 +451,7 @@ public class IncidentService {
                     Instant now = now();
                     long taskId = tasks.insert(new IncidentTask(0L, incident.id(), taskKey,
                             groupCode, title, TaskStatus.OPEN, actor, null, null, null, null,
-                            now, now));
+                            null, now, now));
                     for (Incident blocker : blockers) {
                         tasks.insertBlocker(taskId, blocker.id(), now);
                     }
@@ -462,8 +460,10 @@ public class IncidentService {
     }
 
     /**
-     * 完成任务：仅当前指挥人；仅 OPEN 可完成；全部阻塞事件进入
-     * CONTAINED/RESOLVED/CLOSED 后才可完成，否则 409 并返回未解除事件列表。
+     * 完成任务：仅当前指挥人；仅 OPEN/IN_PROGRESS 可完成；全部阻塞事件进入
+     *  CONTAINED/RESOLVED/CLOSED 后才可完成，否则 409 并返回未解除事件列表。
+     * 已分配资源的任务先以注入时钟校验授权未到期：到期任务转入 AUTHORIZATION_EXPIRED
+     * 并固化证据（独立事务提交），本次完成以 409 失败且不占幂等键。
      * DONE/CANCELLED 为终态，重复操作按 commandKey 幂等规则返回首次结果。
      */
     @Transactional
@@ -471,12 +471,17 @@ public class IncidentService {
                                  TaskActionRequest req) {
         String commandKey = requireText(req.commandKey(), "commandKey");
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "task_complete", hash(incidentKey, taskKey, actor),
+        return idempotency.run(commandKey, "task_complete", Idempotency.hash(incidentKey, taskKey, actor),
                 TaskView.class, () -> {
                     requireCommander(incident, actor);
                     IncidentTask task = tasks.findByKey(incident.id(), taskKey)
                             .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
-                    if (task.status() != TaskStatus.OPEN) {
+                    var interception = expiryGuard.interceptIfExpired(task.id(),
+                            TaskExecutionLog.ACTION_COMPLETE, actor);
+                    if (interception.isPresent()) {
+                        throw interception.get();
+                    }
+                    if (task.status() != TaskStatus.OPEN && task.status() != TaskStatus.IN_PROGRESS) {
                         throw ApiException.conflict(
                                 "任务已处于终态 " + task.status() + "，不能完成");
                     }
@@ -485,30 +490,94 @@ public class IncidentService {
                         throw ApiException.conflict("存在未解除阻塞的事件: "
                                 + String.join(",", unresolved), List.copyOf(unresolved));
                     }
-                    tasks.markDone(task.id(), actor, now());
+                    Instant now = now();
+                    tasks.markDone(task.id(), actor, now);
+                    evidence.insertExecutionLog(new TaskExecutionLog(0L, task.id(), incident.id(),
+                            TaskExecutionLog.ACTION_COMPLETE, null, actor, now));
                     return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
                 });
     }
 
     /**
-     * 取消任务：仅当前指挥人；仅 OPEN 可取消；DONE/CANCELLED 为终态，
-     * 重复操作按 commandKey 幂等规则返回首次结果。
+     * 取消任务：仅当前指挥人；OPEN/IN_PROGRESS/AUTHORIZATION_EXPIRED 可取消；
+     * DONE/CANCELLED 为终态，重复操作按 commandKey 幂等规则返回首次结果。
      */
     @Transactional
     public TaskView cancelTask(String incidentKey, String taskKey, String actor,
                                TaskActionRequest req) {
         String commandKey = requireText(req.commandKey(), "commandKey");
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "task_cancel", hash(incidentKey, taskKey, actor),
+        return idempotency.run(commandKey, "task_cancel", Idempotency.hash(incidentKey, taskKey, actor),
                 TaskView.class, () -> {
                     requireCommander(incident, actor);
                     IncidentTask task = tasks.findByKey(incident.id(), taskKey)
                             .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
-                    if (task.status() != TaskStatus.OPEN) {
+                    if (task.status() == TaskStatus.DONE || task.status() == TaskStatus.CANCELLED) {
                         throw ApiException.conflict(
                                 "任务已处于终态 " + task.status() + "，不能取消");
                     }
                     tasks.markCancelled(task.id(), actor, now());
+                    return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
+                });
+    }
+
+    /**
+     * 开始任务：仅当前指挥人；仅 OPEN 可开始，开始后进入 IN_PROGRESS 并追加 START 执行日志。
+     * 已分配资源的任务先以注入时钟校验授权未到期，到期则拦截（409）并固化证据。
+     */
+    @Transactional
+    public TaskView startTask(String incidentKey, String taskKey, String actor,
+                              TaskStartRequest req) {
+        String commandKey = requireText(req.commandKey(), "commandKey");
+        Incident incident = lockIncident(incidentKey);
+        return idempotency.run(commandKey, "task_start", Idempotency.hash(incidentKey, taskKey, actor),
+                TaskView.class, () -> {
+                    requireCommander(incident, actor);
+                    IncidentTask task = tasks.findByKey(incident.id(), taskKey)
+                            .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
+                    var interception = expiryGuard.interceptIfExpired(task.id(),
+                            TaskExecutionLog.ACTION_START, actor);
+                    if (interception.isPresent()) {
+                        throw interception.get();
+                    }
+                    if (task.status() != TaskStatus.OPEN) {
+                        throw ApiException.conflict(
+                                "仅 OPEN 状态可开始，当前状态: " + task.status());
+                    }
+                    Instant now = now();
+                    tasks.markInProgress(task.id(), now);
+                    evidence.insertExecutionLog(new TaskExecutionLog(0L, task.id(), incident.id(),
+                            TaskExecutionLog.ACTION_START, req.note(), actor, now));
+                    return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
+                });
+    }
+
+    /**
+     * 继续执行：仅当前指挥人；仅 IN_PROGRESS 可继续，追加 CONTINUE 执行日志（note 必填）。
+     * 已分配资源的任务先以注入时钟校验授权未到期，到期则拦截（409）并固化证据。
+     */
+    @Transactional
+    public TaskView executeTask(String incidentKey, String taskKey, String actor,
+                                TaskExecuteRequest req) {
+        String commandKey = requireText(req.commandKey(), "commandKey");
+        String note = requireText(req.note(), "note");
+        Incident incident = lockIncident(incidentKey);
+        return idempotency.run(commandKey, "task_execute",
+                Idempotency.hash(incidentKey, taskKey, actor, note), TaskView.class, () -> {
+                    requireCommander(incident, actor);
+                    IncidentTask task = tasks.findByKey(incident.id(), taskKey)
+                            .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
+                    var interception = expiryGuard.interceptIfExpired(task.id(),
+                            TaskExecutionLog.ACTION_CONTINUE, actor);
+                    if (interception.isPresent()) {
+                        throw interception.get();
+                    }
+                    if (task.status() != TaskStatus.IN_PROGRESS) {
+                        throw ApiException.conflict(
+                                "仅 IN_PROGRESS 状态可继续执行，当前状态: " + task.status());
+                    }
+                    evidence.insertExecutionLog(new TaskExecutionLog(0L, task.id(), incident.id(),
+                            TaskExecutionLog.ACTION_CONTINUE, note, actor, now()));
                     return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
                 });
     }
@@ -567,59 +636,6 @@ public class IncidentService {
         return value.strip();
     }
 
-    /**
-     * 幂等执行：同键同参重放首次响应，同键改参 409；并发同键由唯一约束串行化。
-     */
-    private <T> T runIdempotent(String commandKey, String operation, String requestHash,
-                                Class<T> type, Supplier<T> business) {
-        var existing = commandKeys.find(commandKey);
-        if (existing.isPresent()) {
-            return replay(existing.get(), operation, requestHash, type);
-        }
-        try {
-            commandKeys.insertPlaceholder(commandKey, operation, requestHash, now());
-        } catch (DuplicateKeyException e) {
-            var committed = commandKeys.findForUpdate(commandKey)
-                    .orElseThrow(() -> ApiException.conflict("commandKey 处理冲突: " + commandKey));
-            return replay(committed, operation, requestHash, type);
-        }
-        T result = business.get();
-        commandKeys.fillResponse(commandKey, 200, toJson(result));
-        return result;
-    }
-
-    private <T> T replay(CommandKeyRecord record, String operation, String requestHash, Class<T> type) {
-        if (!record.operation().equals(operation) || !record.requestHash().equals(requestHash)) {
-            throw ApiException.conflict("commandKey 已被不同参数的请求使用: " + record.commandKey());
-        }
-        if (record.responseBody() == null) {
-            throw ApiException.conflict("commandKey 正在处理中: " + record.commandKey());
-        }
-        try {
-            return objectMapper.readValue(record.responseBody(), type);
-        } catch (JsonProcessingException e) {
-            throw new IllegalStateException("幂等响应反序列化失败", e);
-        }
-    }
-
-    private String toJson(Object value) {
-        try {
-            return objectMapper.writeValueAsString(value);
-        } catch (JsonProcessingException e) {
-            throw new IllegalStateException("响应序列化失败", e);
-        }
-    }
-
-    private static String hash(String... parts) {
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] out = digest.digest(String.join(SEP, parts).getBytes(StandardCharsets.UTF_8));
-            return HexFormat.of().formatHex(out);
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException(e);
-        }
-    }
-
     private IncidentView toView(Incident incident, String pendingTransferTo) {
         return new IncidentView(incident.incidentKey(), incident.severity(), incident.summary(),
                 incident.reporter(), incident.status().name(), incident.commander(), pendingTransferTo,
@@ -633,15 +649,29 @@ public class IncidentService {
 
     /**
      * 组装任务视图：阻塞状态按目标事件查询时的当前状态计算，不写回依赖任务。
+     * 资源租约信息按当前租约填充；到期状态按注入时钟在查询时判定（读取不改变状态）：
+     * 非终态任务租约到期时，status 显示为 AUTHORIZATION_EXPIRED。
      */
     private TaskView toTaskView(IncidentTask task) {
         List<TaskBlockerView> blockers = incidents.listBlockingIncidents(task.id()).stream()
                 .map(b -> new TaskBlockerView(b.incidentKey(), b.status().name(),
                         UNBLOCKING_STATUSES.contains(b.status())))
                 .toList();
-        return new TaskView(task.taskKey(), task.groupCode(), task.title(), task.status().name(),
+        var assignment = resources.findByTaskId(task.id()).orElse(null);
+        boolean expired = assignment != null && assignment.expiredAt(now());
+        String effectiveStatus = task.status().name();
+        if (expired && task.status() != TaskStatus.DONE && task.status() != TaskStatus.CANCELLED) {
+            effectiveStatus = TaskStatus.AUTHORIZATION_EXPIRED.name();
+        }
+        return new TaskView(task.taskKey(), task.groupCode(), task.title(), effectiveStatus,
                 blockers, task.createdBy(), task.createdAt(), task.doneBy(), task.doneAt(),
-                task.cancelledBy(), task.cancelledAt());
+                task.cancelledBy(), task.cancelledAt(),
+                assignment == null ? null : assignment.resourceKey(),
+                assignment == null ? null : assignment.authorizationVersion(),
+                assignment == null ? null : assignment.assignedBy(),
+                assignment == null ? null : assignment.assignedAt(),
+                assignment == null ? null : assignment.expiresAt(),
+                expired);
     }
 
     private static TransferView toTransferView(IncidentTransfer transfer) {

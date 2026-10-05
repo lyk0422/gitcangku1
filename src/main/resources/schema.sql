@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS incident_status_history (
 CREATE TABLE IF NOT EXISTS command_keys (
     id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
     command_key VARCHAR(128) NOT NULL COMMENT '调用方幂等键，全局唯一',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：takeover/transfer_initiate/transfer_accept/action/status/escalation_check/escalation_ack/task_create/task_complete/task_cancel',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：takeover/transfer_initiate/transfer_accept/action/status/escalation_check/escalation_ack/task_create/task_complete/task_cancel/task_start/task_execute/resource_assign/resource_renew',
     request_hash VARCHAR(64) NOT NULL COMMENT '规范化请求参数的 SHA-256 摘要，用于同键改参检测',
     response_status INT NULL COMMENT '首次成功的 HTTP 状态码；事务提交前必写入',
     response_body MEDIUMTEXT NULL COMMENT '首次成功响应 JSON，用于同键同参重放',
@@ -78,12 +78,13 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     task_key VARCHAR(128) NOT NULL COMMENT '任务业务键，事件内唯一；同键同内容幂等，同键不同内容冲突',
     group_code VARCHAR(64) NOT NULL COMMENT '分组编码，非空',
     title VARCHAR(512) NOT NULL COMMENT '任务标题，非空',
-    status VARCHAR(16) NOT NULL COMMENT '状态：OPEN 待处理 / DONE 已完成 / CANCELLED 已取消；仅允许 OPEN→DONE 或 OPEN→CANCELLED，DONE 与 CANCELLED 为终态',
+    status VARCHAR(24) NOT NULL COMMENT '状态：OPEN 待处理 / IN_PROGRESS 执行中 / DONE 已完成 / CANCELLED 已取消 / AUTHORIZATION_EXPIRED 授权已到期；DONE 与 CANCELLED 为终态',
     created_by VARCHAR(128) NOT NULL COMMENT '创建人（创建时的当前指挥人）',
     done_by VARCHAR(128) NULL COMMENT '完成人（操作时的当前指挥人）；仅 DONE 有值，否则为空',
     done_at TIMESTAMP(6) NULL COMMENT '完成 UTC 时间；仅 DONE 有值，否则为空',
     cancelled_by VARCHAR(128) NULL COMMENT '取消人（操作时的当前指挥人）；仅 CANCELLED 有值，否则为空',
     cancelled_at TIMESTAMP(6) NULL COMMENT '取消 UTC 时间；仅 CANCELLED 有值，否则为空',
+    pre_expiry_status VARCHAR(16) NULL COMMENT '授权到期前的状态（OPEN/IN_PROGRESS），续期后恢复；仅 AUTHORIZATION_EXPIRED 有值，否则为空',
     created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
     updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间',
     CONSTRAINT uk_task_key UNIQUE (incident_id, task_key)
@@ -100,3 +101,45 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY COMMENT '固定为 1 的单行锁；创建任务时 SELECT ... FOR UPDATE 持有，串行化环检测与写入，保证并发反向依赖最终图无环'
 ) COMMENT='任务依赖图全局锁表';
+
+CREATE TABLE IF NOT EXISTS task_resource_assignments (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    task_id BIGINT NOT NULL COMMENT '所属任务 id，关联 incident_tasks.id；每任务至多一条当前租约',
+    incident_id BIGINT NOT NULL COMMENT '所属事件 id，关联 incidents.id（冗余便于按事件查询与锁定）',
+    resource_key VARCHAR(128) NOT NULL COMMENT '资源业务键；同一资源同一时刻至多被一个事件的有效租约占用',
+    authorization_version BIGINT NOT NULL COMMENT '当前授权版本号；续期必须提交严格更大的新版本',
+    assigned_by VARCHAR(128) NOT NULL COMMENT '原分配人（分配时的当前指挥人）；续期人必须与其不同',
+    assigned_at TIMESTAMP(6) NOT NULL COMMENT '分配 UTC 时刻（租约区间起点，左闭）',
+    expires_at TIMESTAMP(6) NOT NULL COMMENT '授权到期 UTC 时刻（租约区间终点，右开）；必须晚于 assigned_at，当前时刻 ≥ expires_at 即视为到期',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
+    updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间',
+    CONSTRAINT uk_assignment_task UNIQUE (task_id)
+) COMMENT='任务资源租约表（每任务当前租约，历史版本见资源授权证据表）';
+
+CREATE TABLE IF NOT EXISTS resource_authorization_events (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键，即证据排序序号',
+    event_type VARCHAR(24) NOT NULL COMMENT '事件类型：ASSIGN 分配 / EXPIRY_DETECTED 到期检测 / RENEW 续期 / EXECUTION_BLOCKED 执行拦截',
+    task_id BIGINT NOT NULL COMMENT '所属任务 id，关联 incident_tasks.id',
+    incident_id BIGINT NOT NULL COMMENT '所属事件 id，关联 incidents.id',
+    task_key VARCHAR(128) NOT NULL COMMENT '任务业务键（冗余固化，后续任务修订不改写证据）',
+    resource_key VARCHAR(128) NOT NULL COMMENT '资源业务键',
+    old_authorization_version BIGINT NULL COMMENT '变更前授权版本；ASSIGN 时为空',
+    new_authorization_version BIGINT NULL COMMENT '变更后授权版本；EXPIRY_DETECTED/EXECUTION_BLOCKED 时为空',
+    actor VARCHAR(128) NOT NULL COMMENT '操作人（分配人/续期人/被拦截的执行操作人）',
+    attempted_action VARCHAR(16) NULL COMMENT '被拦截的执行动作（START/CONTINUE/COMPLETE）；仅 EXECUTION_BLOCKED 有值，否则为空',
+    occurred_at TIMESTAMP(6) NOT NULL COMMENT '发生 UTC 时刻（服务端注入时钟）'
+) COMMENT='资源授权证据表（只增不改，按 id 排序，历史证据不被后续操作覆盖）';
+
+CREATE TABLE IF NOT EXISTS task_execution_logs (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键，即日志排序序号',
+    task_id BIGINT NOT NULL COMMENT '所属任务 id，关联 incident_tasks.id',
+    incident_id BIGINT NOT NULL COMMENT '所属事件 id，关联 incidents.id',
+    action VARCHAR(16) NOT NULL COMMENT '执行动作：START 开始 / CONTINUE 继续执行 / COMPLETE 完成',
+    note VARCHAR(1024) NULL COMMENT '执行说明；START/COMPLETE 可为空，CONTINUE 必填',
+    actor VARCHAR(128) NOT NULL COMMENT '操作人（操作时的当前指挥人）',
+    occurred_at TIMESTAMP(6) NOT NULL COMMENT '发生 UTC 时刻（服务端注入时钟）'
+) COMMENT='任务执行日志表（只增不改，授权到期后已执行日志保留）';
+
+CREATE TABLE IF NOT EXISTS resource_locks (
+    resource_key VARCHAR(128) PRIMARY KEY COMMENT '资源业务键单行锁；分配与续期时 SELECT ... FOR UPDATE 持有，串行化占用校验，保证同一资源并发续期不产生重叠授权'
+) COMMENT='资源占用串行锁表';

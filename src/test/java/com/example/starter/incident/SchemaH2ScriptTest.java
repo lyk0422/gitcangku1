@@ -111,4 +111,89 @@ class SchemaH2ScriptTest {
             }
         }
     }
+
+    @Test
+    void h2Schema_resourceTables_enforceConstraints() throws Exception {
+        String url = "jdbc:h2:mem:schema_h2_resource_check;MODE=MySQL;DATABASE_TO_LOWER=TRUE;"
+                + "DB_CLOSE_DELAY=0";
+        try (Connection con = DriverManager.getConnection(url, "sa", "")) {
+            ScriptUtils.executeSqlScript(con, new ClassPathResource("schema-h2.sql"));
+
+            Instant now = Instant.parse("2026-09-22T00:00:00Z");
+            try (Statement st = con.createStatement()) {
+                st.execute("INSERT INTO incidents (incident_key, severity, summary, reporter,"
+                        + " status, commander, created_at, updated_at) VALUES"
+                        + " ('IK-R','S1','s','r','COMMANDING','alice','" + Timestamp.from(now)
+                        + "','" + Timestamp.from(now) + "')");
+                st.execute("INSERT INTO incident_tasks (incident_id, task_key, group_code, title,"
+                        + " status, created_by, created_at, updated_at) VALUES (1,'T-1','G','t',"
+                        + "'OPEN','alice','" + Timestamp.from(now) + "','" + Timestamp.from(now)
+                        + "')");
+
+                // 资源租约：每任务至多一条当前租约（uk_assignment_task）
+                st.execute("INSERT INTO task_resource_assignments (task_id, incident_id,"
+                        + " resource_key, authorization_version, assigned_by, assigned_at,"
+                        + " expires_at, created_at, updated_at) VALUES (1,1,'RES-1',1,'alice','"
+                        + Timestamp.from(now) + "','" + Timestamp.from(now.plusSeconds(300))
+                        + "','" + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                boolean duplicateAssignmentRejected = false;
+                try {
+                    st.execute("INSERT INTO task_resource_assignments (task_id, incident_id,"
+                            + " resource_key, authorization_version, assigned_by, assigned_at,"
+                            + " expires_at, created_at, updated_at) VALUES (1,1,'RES-2',1,'alice','"
+                            + Timestamp.from(now) + "','" + Timestamp.from(now.plusSeconds(300))
+                            + "','" + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateAssignmentRejected = true;
+                }
+                assertThat(duplicateAssignmentRejected).isTrue();
+
+                // 资源串行锁：resource_key 主键唯一
+                st.execute("INSERT INTO resource_locks (resource_key) VALUES ('RES-1')");
+                boolean duplicateLockRejected = false;
+                try {
+                    st.execute("INSERT INTO resource_locks (resource_key) VALUES ('RES-1')");
+                } catch (Exception e) {
+                    duplicateLockRejected = true;
+                }
+                assertThat(duplicateLockRejected).isTrue();
+
+                // 授权证据：旧/新版本与拦截动作可空，按 id 排序
+                st.execute("INSERT INTO resource_authorization_events (event_type, task_id,"
+                        + " incident_id, task_key, resource_key, old_authorization_version,"
+                        + " new_authorization_version, actor, attempted_action, occurred_at)"
+                        + " VALUES ('ASSIGN',1,1,'T-1','RES-1',NULL,1,'alice',NULL,'"
+                        + Timestamp.from(now) + "')");
+                st.execute("INSERT INTO resource_authorization_events (event_type, task_id,"
+                        + " incident_id, task_key, resource_key, old_authorization_version,"
+                        + " new_authorization_version, actor, attempted_action, occurred_at)"
+                        + " VALUES ('EXECUTION_BLOCKED',1,1,'T-1','RES-1',1,NULL,'alice',"
+                        + "'COMPLETE','" + Timestamp.from(now.plusSeconds(300)) + "')");
+                try (ResultSet rs = st.executeQuery(
+                        "SELECT event_type, old_authorization_version, new_authorization_version,"
+                                + " attempted_action FROM resource_authorization_events"
+                                + " ORDER BY id")) {
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getString("event_type")).isEqualTo("ASSIGN");
+                    assertThat(rs.getObject("old_authorization_version")).isNull();
+                    assertThat(rs.getLong("new_authorization_version")).isEqualTo(1L);
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getString("event_type")).isEqualTo("EXECUTION_BLOCKED");
+                    assertThat(rs.getObject("new_authorization_version")).isNull();
+                    assertThat(rs.getString("attempted_action")).isEqualTo("COMPLETE");
+                }
+
+                // 执行日志：note 可空
+                st.execute("INSERT INTO task_execution_logs (task_id, incident_id, action, note,"
+                        + " actor, occurred_at) VALUES (1,1,'START',NULL,'alice','"
+                        + Timestamp.from(now) + "')");
+                try (ResultSet rs = st.executeQuery(
+                        "SELECT action, note FROM task_execution_logs WHERE task_id = 1")) {
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getString("action")).isEqualTo("START");
+                    assertThat(rs.getString("note")).isNull();
+                }
+            }
+        }
+    }
 }

@@ -77,12 +77,13 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     task_key VARCHAR(128) NOT NULL,
     group_code VARCHAR(64) NOT NULL,
     title VARCHAR(512) NOT NULL,
-    status VARCHAR(16) NOT NULL,
+    status VARCHAR(24) NOT NULL,
     created_by VARCHAR(128) NOT NULL,
     done_by VARCHAR(128) NULL,
     done_at TIMESTAMP(6) NULL,
     cancelled_by VARCHAR(128) NULL,
     cancelled_at TIMESTAMP(6) NULL,
+    pre_expiry_status VARCHAR(16) NULL,
     created_at TIMESTAMP(6) NOT NULL,
     updated_at TIMESTAMP(6) NOT NULL,
     CONSTRAINT uk_task_key UNIQUE (incident_id, task_key)
@@ -98,4 +99,46 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS task_resource_assignments (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    task_id BIGINT NOT NULL,
+    incident_id BIGINT NOT NULL,
+    resource_key VARCHAR(128) NOT NULL,
+    authorization_version BIGINT NOT NULL,
+    assigned_by VARCHAR(128) NOT NULL,
+    assigned_at TIMESTAMP(6) NOT NULL,
+    expires_at TIMESTAMP(6) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_assignment_task UNIQUE (task_id)
+);
+
+CREATE TABLE IF NOT EXISTS resource_authorization_events (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    event_type VARCHAR(24) NOT NULL,
+    task_id BIGINT NOT NULL,
+    incident_id BIGINT NOT NULL,
+    task_key VARCHAR(128) NOT NULL,
+    resource_key VARCHAR(128) NOT NULL,
+    old_authorization_version BIGINT NULL,
+    new_authorization_version BIGINT NULL,
+    actor VARCHAR(128) NOT NULL,
+    attempted_action VARCHAR(16) NULL,
+    occurred_at TIMESTAMP(6) NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS task_execution_logs (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    task_id BIGINT NOT NULL,
+    incident_id BIGINT NOT NULL,
+    action VARCHAR(16) NOT NULL,
+    note VARCHAR(1024) NULL,
+    actor VARCHAR(128) NOT NULL,
+    occurred_at TIMESTAMP(6) NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS resource_locks (
+    resource_key VARCHAR(128) PRIMARY KEY
 );

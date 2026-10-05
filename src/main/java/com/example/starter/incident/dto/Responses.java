@@ -65,10 +65,16 @@ public final class Responses {
     /**
      * 处置任务视图：blockers 按阻塞事件键排序；doneBy/doneAt 仅 DONE 有值，
      * cancelledBy/cancelledAt 仅 CANCELLED 有值。
+     * 资源租约字段（resourceKey/authorizationVersion/assignedBy/assignedAt/expiresAt）
+     * 仅已分配资源的任务有值，否则为 null；authorizationExpired 按查询时时钟计算，
+     * 读取不改变任务状态；status 为按时钟判定的有效状态（租约到期且非终态时
+     * 显示 AUTHORIZATION_EXPIRED）。
      */
     public record TaskView(String taskKey, String groupCode, String title, String status,
                            List<TaskBlockerView> blockers, String createdBy, Instant createdAt,
-                           String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt) {
+                           String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt,
+                           String resourceKey, Long authorizationVersion, String assignedBy,
+                           Instant assignedAt, Instant expiresAt, boolean authorizationExpired) {
     }
 
     /** 按事件分组的任务列表视图：tasks 按创建顺序返回。 */
@@ -77,5 +83,65 @@ public final class Responses {
 
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
+    }
+
+    /**
+     * 资源租约视图：租约区间 [assignedAt, expiresAt) 左闭右开，UTC；
+     * expired 按查询/命令时时钟判定；taskStatus 为任务当前（有效）状态。
+     */
+    public record ResourceAssignmentView(String taskKey, String resourceKey,
+                                         long authorizationVersion, String assignedBy,
+                                         Instant assignedAt, Instant expiresAt, boolean expired,
+                                         String taskStatus) {
+    }
+
+    /**
+     * 资源授权证据视图：oldAuthorizationVersion 仅 ASSIGN 为 null，
+     * newAuthorizationVersion 仅 EXPIRY_DETECTED/EXECUTION_BLOCKED 为 null，
+     * attemptedAction 仅 EXECUTION_BLOCKED 有值；按 id 升序即发生顺序。
+     */
+    public record ResourceEventView(long id, String eventType, String taskKey, String resourceKey,
+                                    Long oldAuthorizationVersion, Long newAuthorizationVersion,
+                                    String actor, String attemptedAction, Instant occurredAt) {
+    }
+
+    /** 任务执行日志视图：note 仅 CONTINUE 必有值。 */
+    public record ExecutionLogView(String action, String note, String actor, Instant occurredAt) {
+    }
+
+    /**
+     * 任务资源明细与历史：current 为当前租约（未分配为 null），events 为授权证据、
+     * executionLogs 为执行日志，均按发生顺序返回；只读，不隐式写入。
+     */
+    public record TaskResourceHistoryView(ResourceAssignmentView current,
+                                          List<ResourceEventView> events,
+                                          List<ExecutionLogView> executionLogs) {
+    }
+
+    /** 续期结果中单个任务的视图：taskStatus 为续期后的任务状态。 */
+    public record RenewedTaskView(String taskKey, String resourceKey, long oldAuthorizationVersion,
+                                  long newAuthorizationVersion, Instant newExpiresAt,
+                                  String taskStatus) {
+    }
+
+    /** 批量续期响应：全部条目校验通过后才统一提交。 */
+    public record RenewalView(String incidentKey, List<RenewedTaskView> renewed) {
+    }
+
+    /**
+     * 资源诊断视图：now 为评估时刻（UTC）；每个租约给出当时是否到期、
+     * 是否仍占用资源（任务非终态且未到期）。只读，不隐式写入。
+     */
+    public record ResourceDiagnosticsView(String incidentKey, Instant now,
+                                          List<ResourceAssignmentView> assignments) {
+    }
+
+    /**
+     * 授权到期拦截错误明细：expiresAt 为租约到期时刻，detectedAt 为按时钟判定的
+     * 检测时刻，attemptedAction 为被拦截的执行动作（实际值/要求值口径）。
+     */
+    public record AuthorizationExpiredDetails(String taskKey, String resourceKey,
+                                              long authorizationVersion, Instant expiresAt,
+                                              Instant detectedAt, String attemptedAction) {
     }
 }

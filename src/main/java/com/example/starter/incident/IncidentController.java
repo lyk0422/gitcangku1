@@ -8,6 +8,8 @@ import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
 import com.example.starter.incident.dto.Requests.TaskActionRequest;
 import com.example.starter.incident.dto.Requests.TaskCreateRequest;
+import com.example.starter.incident.dto.Requests.TaskExecuteRequest;
+import com.example.starter.incident.dto.Requests.TaskStartRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
@@ -187,5 +189,25 @@ public class IncidentController {
                                @RequestHeader("X-Actor-Id") String actor,
                                @RequestBody TaskActionRequest req) {
         return service.cancelTask(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 开始任务（仅当前指挥人；已分配资源时校验授权未到期）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/start")
+    public TaskView startTask(@PathVariable String incidentKey, @PathVariable String taskKey,
+                              @RequestHeader("X-Actor-Id") String actor,
+                              @RequestBody TaskStartRequest req) {
+        return service.startTask(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 继续执行（仅当前指挥人；仅 IN_PROGRESS，追加执行日志；校验授权未到期）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/execute")
+    public TaskView executeTask(@PathVariable String incidentKey, @PathVariable String taskKey,
+                                @RequestHeader("X-Actor-Id") String actor,
+                                @RequestBody TaskExecuteRequest req) {
+        return service.executeTask(incidentKey, taskKey, actor, req);
     }
 }
