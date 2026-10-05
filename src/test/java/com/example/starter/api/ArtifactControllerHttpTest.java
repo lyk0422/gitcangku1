@@ -35,8 +35,11 @@ class ArtifactControllerHttpTest {
 
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM lock_file_exclusion");
+        jdbcTemplate.update("DELETE FROM lock_file_edge");
         jdbcTemplate.update("DELETE FROM lock_file_entry");
         jdbcTemplate.update("DELETE FROM lock_file");
+        jdbcTemplate.update("DELETE FROM artifact_dependency_exclusion");
         jdbcTemplate.update("DELETE FROM artifact_dependency");
         jdbcTemplate.update("DELETE FROM artifact");
         jdbcTemplate.update("DELETE FROM idempotent_request");
@@ -65,6 +68,12 @@ class ArtifactControllerHttpTest {
         dep.put("name", name);
         dep.put("minimumVersion", min);
         dep.put("maximumVersion", max);
+        return dep;
+    }
+
+    private Map<String, Object> dependency(String name, int min, int max, List<String> exclusions) {
+        Map<String, Object> dep = dependency(name, min, max);
+        dep.put("exclusions", exclusions);
         return dep;
     }
 
@@ -165,6 +174,47 @@ class ArtifactControllerHttpTest {
         ResponseEntity<JsonNode> missing = restTemplate.getForEntity(
                 "/api/artifacts/locks/9999", JsonNode.class);
         assertThat(missing.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+    }
+
+    @Test
+    void exclusionWorkflowOverHttpKeepsSharedDependency() {
+        // 合成场景：root -> a（排除 c）、root -> b；a -> c；b -> c。c 必须保留。
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("root", 1,
+                        dependency("a", 1, 1, List.of("c")), dependency("b", 1, 1)),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("a", 1, dependency("c", 1, 1)),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("b", 1, dependency("c", 1, 1)),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("c", 1),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+
+        String lockBody = "{\"rootName\":\"root\",\"rootVersion\":1,\"expectedRepositoryVersion\":4}";
+        ResponseEntity<JsonNode> lock = restTemplate.postForEntity("/api/artifacts/locks",
+                new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(lock.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(lock.getBody().path("entries")).hasSize(4);
+        // 保留边不含 a->c；排除理由记录 root->a 上排除 c 且命中。
+        assertThat(lock.getBody().path("edges")).hasSize(3);
+        JsonNode exclusion = lock.getBody().path("exclusions").get(0);
+        assertThat(exclusion.path("fromName").asText()).isEqualTo("root");
+        assertThat(exclusion.path("toName").asText()).isEqualTo("a");
+        assertThat(exclusion.path("excludedName").asText()).isEqualTo("c");
+        assertThat(exclusion.path("hit").asBoolean()).isTrue();
+    }
+
+    @Test
+    void duplicateExclusionNamesReturn400OverHttp() {
+        String body = registerBody("app", 1, dependency("lib", 1, 1, List.of("c", "c")));
+        ResponseEntity<JsonNode> response = restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(body, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
     }
 
     @Test

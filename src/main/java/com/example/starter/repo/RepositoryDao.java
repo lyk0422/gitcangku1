@@ -61,12 +61,16 @@ public class RepositoryDao {
                         rs.getInt("version"), rs.getInt("withdrawn") == 1));
 
         List<DepRow> depRows = jdbcTemplate.query(
-                "SELECT artifact_id, name, minimum_version, maximum_version FROM artifact_dependency",
-                (rs, n) -> new DepRow(rs.getLong("artifact_id"), rs.getString("name"),
+                "SELECT id, artifact_id, name, minimum_version, maximum_version FROM artifact_dependency",
+                (rs, n) -> new DepRow(rs.getLong("id"), rs.getLong("artifact_id"),
+                        rs.getString("name"),
                         rs.getInt("minimum_version"), rs.getInt("maximum_version")));
+        Map<Long, List<String>> exclusionsByDep = loadExclusionsByDependency();
         Map<Long, List<DependencyRange>> depsByArtifact = depRows.stream()
                 .collect(Collectors.groupingBy(DepRow::artifactId,
-                        Collectors.mapping(d -> new DependencyRange(d.name(), d.minimumVersion(), d.maximumVersion()),
+                        Collectors.mapping(d -> new DependencyRange(d.name(),
+                                        d.minimumVersion(), d.maximumVersion(),
+                                        sortedExclusions(exclusionsByDep.get(d.id()))),
                                 Collectors.toList())));
 
         Map<String, List<ArtifactVersion>> artifacts = new LinkedHashMap<>();
@@ -120,12 +124,32 @@ public class RepositoryDao {
         return key.longValue();
     }
 
-    /** 为制品版本写入一条依赖声明。 */
-    public void insertDependency(long artifactId, String name, int minimumVersion, int maximumVersion) {
+    /** 为制品版本写入一条依赖声明，返回自增主键（供排除行引用）。 */
+    public long insertDependency(long artifactId, String name, int minimumVersion, int maximumVersion) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbcTemplate.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO artifact_dependency (artifact_id, name, minimum_version, maximum_version) "
+                            + "VALUES (?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setLong(1, artifactId);
+            ps.setString(2, name);
+            ps.setInt(3, minimumVersion);
+            ps.setInt(4, maximumVersion);
+            return ps;
+        }, keyHolder);
+        Number key = keyHolder.getKey();
+        if (key == null) {
+            throw new IllegalStateException("插入依赖未获取自增主键");
+        }
+        return key.longValue();
+    }
+
+    /** 为依赖边写入一个路径排除名称。 */
+    public void insertDependencyExclusion(long dependencyId, String excludedName) {
         jdbcTemplate.update(
-                "INSERT INTO artifact_dependency (artifact_id, name, minimum_version, maximum_version) "
-                        + "VALUES (?, ?, ?, ?)",
-                artifactId, name, minimumVersion, maximumVersion);
+                "INSERT INTO artifact_dependency_exclusion (dependency_id, excluded_name) VALUES (?, ?)",
+                dependencyId, excludedName);
     }
 
     /** 读取单个制品版本（含依赖），不存在返回 null。 */
@@ -139,13 +163,37 @@ public class RepositoryDao {
             return null;
         }
         ArtifactRow row = rows.get(0);
-        List<DependencyRange> deps = jdbcTemplate.query(
-                "SELECT name, minimum_version, maximum_version FROM artifact_dependency WHERE artifact_id = ?",
-                (rs, n) -> new DependencyRange(rs.getString("name"),
+        List<DepRow> depRows = jdbcTemplate.query(
+                "SELECT id, artifact_id, name, minimum_version, maximum_version "
+                        + "FROM artifact_dependency WHERE artifact_id = ?",
+                (rs, n) -> new DepRow(rs.getLong("id"), rs.getLong("artifact_id"),
+                        rs.getString("name"),
                         rs.getInt("minimum_version"), rs.getInt("maximum_version")),
                 row.id());
+        Map<Long, List<String>> exclusionsByDep = loadExclusionsByDependency();
+        List<DependencyRange> deps = depRows.stream()
+                .map(d -> new DependencyRange(d.name(), d.minimumVersion(), d.maximumVersion(),
+                        sortedExclusions(exclusionsByDep.get(d.id()))))
+                .toList();
         return new ArtifactVersion(row.id(), row.name(), row.version(), row.withdrawn(),
                 List.copyOf(deps));
+    }
+
+    /** 读取全部依赖边的路径排除，按依赖 ID 分组（须在同事务一致性视图中调用）。 */
+    private Map<Long, List<String>> loadExclusionsByDependency() {
+        List<ExclusionRow> rows = jdbcTemplate.query(
+                "SELECT dependency_id, excluded_name FROM artifact_dependency_exclusion",
+                (rs, n) -> new ExclusionRow(rs.getLong("dependency_id"),
+                        rs.getString("excluded_name")));
+        return rows.stream().collect(Collectors.groupingBy(ExclusionRow::dependencyId,
+                Collectors.mapping(ExclusionRow::excludedName, Collectors.toList())));
+    }
+
+    private static List<String> sortedExclusions(List<String> exclusions) {
+        if (exclusions == null) {
+            return List.of();
+        }
+        return exclusions.stream().sorted().toList();
     }
 
     /** 仓库版本号加一，返回加一后的版本号（须在持有行锁时调用）。 */
@@ -191,6 +239,24 @@ public class RepositoryDao {
         jdbcTemplate.update(
                 "INSERT INTO lock_file_entry (lock_file_id, name, version) VALUES (?, ?, ?)",
                 lockFileId, name, version);
+    }
+
+    /** 新增锁文件实际保留边。 */
+    public void insertLockEdge(long lockFileId, String fromName, int fromVersion,
+                               String toName, int toVersion) {
+        jdbcTemplate.update(
+                "INSERT INTO lock_file_edge (lock_file_id, from_name, from_version, to_name, to_version) "
+                        + "VALUES (?, ?, ?, ?, ?)",
+                lockFileId, fromName, fromVersion, toName, toVersion);
+    }
+
+    /** 新增锁文件路径排除记录。 */
+    public void insertLockExclusion(long lockFileId, String fromName, int fromVersion,
+                                    String toName, String excludedName, boolean hit) {
+        jdbcTemplate.update(
+                "INSERT INTO lock_file_exclusion (lock_file_id, from_name, from_version, to_name, "
+                        + "excluded_name, hit) VALUES (?, ?, ?, ?, ?, ?)",
+                lockFileId, fromName, fromVersion, toName, excludedName, hit ? 1 : 0);
     }
 
     /** 幂等记录视图。 */
@@ -242,6 +308,16 @@ public class RepositoryDao {
     public record LockEntryRow(long lockFileId, String name, int version) {
     }
 
+    /** 锁文件实际保留边行。 */
+    public record LockEdgeRow(long lockFileId, String fromName, int fromVersion,
+                              String toName, int toVersion) {
+    }
+
+    /** 锁文件路径排除记录行。 */
+    public record LockExclusionRow(long lockFileId, String fromName, int fromVersion,
+                                   String toName, String excludedName, boolean hit) {
+    }
+
     /** 查询全部历史锁文件，按 ID 升序。 */
     public List<LockFileRow> listLockFiles() {
         return jdbcTemplate.query(
@@ -274,9 +350,37 @@ public class RepositoryDao {
                 lockFileId);
     }
 
+    /** 查询某锁文件的全部保留边，按源名称、目标名称升序。 */
+    public List<LockEdgeRow> listLockEdges(long lockFileId) {
+        return jdbcTemplate.query(
+                "SELECT lock_file_id, from_name, from_version, to_name, to_version "
+                        + "FROM lock_file_edge WHERE lock_file_id = ? "
+                        + "ORDER BY from_name ASC, from_version ASC, to_name ASC",
+                (rs, n) -> new LockEdgeRow(rs.getLong("lock_file_id"),
+                        rs.getString("from_name"), rs.getInt("from_version"),
+                        rs.getString("to_name"), rs.getInt("to_version")),
+                lockFileId);
+    }
+
+    /** 查询某锁文件的全部路径排除记录，按源名称、目标名称、排除名称升序。 */
+    public List<LockExclusionRow> listLockExclusions(long lockFileId) {
+        return jdbcTemplate.query(
+                "SELECT lock_file_id, from_name, from_version, to_name, excluded_name, hit "
+                        + "FROM lock_file_exclusion WHERE lock_file_id = ? "
+                        + "ORDER BY from_name ASC, to_name ASC, excluded_name ASC",
+                (rs, n) -> new LockExclusionRow(rs.getLong("lock_file_id"),
+                        rs.getString("from_name"), rs.getInt("from_version"),
+                        rs.getString("to_name"), rs.getString("excluded_name"),
+                        rs.getInt("hit") == 1),
+                lockFileId);
+    }
+
     private record ArtifactRow(long id, String name, int version, boolean withdrawn) {
     }
 
-    private record DepRow(long artifactId, String name, int minimumVersion, int maximumVersion) {
+    private record DepRow(long id, long artifactId, String name, int minimumVersion, int maximumVersion) {
+    }
+
+    private record ExclusionRow(long dependencyId, String excludedName) {
     }
 }
