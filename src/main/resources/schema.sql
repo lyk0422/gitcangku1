@@ -39,6 +39,18 @@ COMMENT ON COLUMN artifact_dependency.maximum_version IS '依赖最高版本（�
 
 CREATE UNIQUE INDEX IF NOT EXISTS uk_dep_artifact_name ON artifact_dependency (artifact_id, name);
 
+CREATE TABLE IF NOT EXISTS artifact_dependency_exclusion (
+    id            BIGINT AUTO_INCREMENT PRIMARY KEY,
+    dependency_id BIGINT       NOT NULL,
+    excluded_name VARCHAR(128) NOT NULL,
+    CONSTRAINT fk_excl_dep FOREIGN KEY (dependency_id) REFERENCES artifact_dependency (id)
+);
+COMMENT ON TABLE artifact_dependency_exclusion IS '依赖边上声明的排除名称：经过该边后的子图中忽略同名边，登记后不可改';
+COMMENT ON COLUMN artifact_dependency_exclusion.dependency_id IS '所属依赖边 ID';
+COMMENT ON COLUMN artifact_dependency_exclusion.excluded_name IS '被排除的制品名称，允许未知名称（锁定时记录为未命中）';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_dep_exclusion ON artifact_dependency_exclusion (dependency_id, excluded_name);
+
 CREATE TABLE IF NOT EXISTS lock_file (
     id                 BIGINT AUTO_INCREMENT PRIMARY KEY,
     root_name          VARCHAR(128) NOT NULL,
@@ -70,6 +82,46 @@ COMMENT ON COLUMN lock_file_entry.name IS '被锁定制品名称';
 COMMENT ON COLUMN lock_file_entry.version IS '被锁定的精确版本号，正整数';
 
 CREATE UNIQUE INDEX IF NOT EXISTS uk_entry_lock_name ON lock_file_entry (lock_file_id, name);
+
+CREATE TABLE IF NOT EXISTS lock_file_edge (
+    id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+    lock_file_id    BIGINT       NOT NULL,
+    from_name       VARCHAR(128) NOT NULL,
+    from_version    INT          NOT NULL,
+    to_name         VARCHAR(128) NOT NULL,
+    minimum_version INT          NOT NULL,
+    maximum_version INT          NOT NULL,
+    CONSTRAINT fk_edge_lock FOREIGN KEY (lock_file_id) REFERENCES lock_file (id)
+);
+COMMENT ON TABLE lock_file_edge IS '锁文件实际保留的依赖边：锁定路径上未被排除的区间约束，生成后不改写';
+COMMENT ON COLUMN lock_file_edge.from_name IS '声明依赖的制品名称';
+COMMENT ON COLUMN lock_file_edge.from_version IS '声明依赖的制品精确版本';
+COMMENT ON COLUMN lock_file_edge.to_name IS '依赖目标制品名称';
+COMMENT ON COLUMN lock_file_edge.minimum_version IS '保留区间最低版本（含）';
+COMMENT ON COLUMN lock_file_edge.maximum_version IS '保留区间最高版本（含）';
+
+CREATE INDEX IF NOT EXISTS idx_edge_lock ON lock_file_edge (lock_file_id);
+
+CREATE TABLE IF NOT EXISTS lock_file_exclusion (
+    id            BIGINT AUTO_INCREMENT PRIMARY KEY,
+    lock_file_id  BIGINT       NOT NULL,
+    from_name     VARCHAR(128) NOT NULL,
+    from_version  INT          NOT NULL,
+    to_name       VARCHAR(128) NOT NULL,
+    excluded_name VARCHAR(128) NOT NULL,
+    outcome       VARCHAR(8)   NOT NULL,
+    detail        VARCHAR(512) NOT NULL,
+    CONSTRAINT fk_lock_excl FOREIGN KEY (lock_file_id) REFERENCES lock_file (id)
+);
+COMMENT ON TABLE lock_file_exclusion IS '锁文件的路径排除处置记录：每条已声明排除的理由与结果，生成后不改写';
+COMMENT ON COLUMN lock_file_exclusion.from_name IS '声明排除的边所属制品名称';
+COMMENT ON COLUMN lock_file_exclusion.from_version IS '声明排除的边所属制品精确版本';
+COMMENT ON COLUMN lock_file_exclusion.to_name IS '声明排除的边目标制品名称';
+COMMENT ON COLUMN lock_file_exclusion.excluded_name IS '被排除的制品名称';
+COMMENT ON COLUMN lock_file_exclusion.outcome IS '处置结果：APPLIED=实际忽略了同名边，MISS=未命中';
+COMMENT ON COLUMN lock_file_exclusion.detail IS '人读理由：APPLIED 时列出被忽略的边，MISS 时为未命中';
+
+CREATE INDEX IF NOT EXISTS idx_lock_excl ON lock_file_exclusion (lock_file_id);
 
 CREATE TABLE IF NOT EXISTS idempotent_request (
     request_id     VARCHAR(64)  NOT NULL PRIMARY KEY,

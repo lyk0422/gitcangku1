@@ -46,6 +46,11 @@ class LockResolverTest {
         return new DependencyRange(name, min, max);
     }
 
+    /** 带边级排除名称的依赖。 */
+    private static DependencyRange depx(String name, int min, int max, String... exclusions) {
+        return new DependencyRange(name, min, max, List.of(exclusions));
+    }
+
     @Test
     void resolvesSingleRootWithoutDependencies() {
         RepositorySnapshot s = snapshot(0, "app", List.of(v(1)));
@@ -182,5 +187,143 @@ class LockResolverTest {
         Map<String, Integer> result = LockResolver.resolve(s, "root", 1);
         assertThat(result).isNotNull();
         assertThat(result.keySet()).containsExactly("alib", "root", "zlib");
+    }
+
+    // ------------------------------------------------------------------
+    // 边级排除
+    // ------------------------------------------------------------------
+
+    @Test
+    void exclusionOnOnePathKeepsNameRequiredByAnotherPath() {
+        // 合成根同时依赖 a 和 b：root->a 路径排除 c，root->b 路径仍需要 c，应保留 c。
+        RepositorySnapshot s = snapshot(0,
+                "root", List.of(v(1, depx("a", 1, 1, "c"), dep("b", 1, 1))),
+                "a", List.of(v(1, dep("c", 1, 1))),
+                "b", List.of(v(1, dep("c", 1, 1))),
+                "c", List.of(v(1)));
+
+        LockSolution solution = LockResolver.solve(s, "root", 1);
+        assertThat(solution).isNotNull();
+        assertThat(solution.versions())
+                .containsEntry("root", 1).containsEntry("a", 1)
+                .containsEntry("b", 1).containsEntry("c", 1);
+        // a->c 被排除不出现在保留边中，b->c 保留。
+        assertThat(solution.edges())
+                .noneMatch(e -> e.fromName().equals("a") && e.toName().equals("c"))
+                .anyMatch(e -> e.fromName().equals("b") && e.toName().equals("c"));
+        // 排除记录为 APPLIED 且说明被忽略的边。
+        assertThat(solution.exclusions()).singleElement().satisfies(record -> {
+            assertThat(record.fromName()).isEqualTo("root");
+            assertThat(record.toName()).isEqualTo("a");
+            assertThat(record.excludedName()).isEqualTo("c");
+            assertThat(record.outcome()).isEqualTo("APPLIED");
+            assertThat(record.detail()).contains("a->c");
+        });
+    }
+
+    @Test
+    void nameExcludedOnAllPathsIsNotRequired() {
+        // root->a 排除 c 且 a->c 是唯一指向 c 的边：c 不被要求，即使仓库中不存在 c。
+        RepositorySnapshot s = snapshot(0,
+                "root", List.of(v(1, depx("a", 1, 1, "c"))),
+                "a", List.of(v(1, dep("c", 1, 1))));
+
+        LockSolution solution = LockResolver.solve(s, "root", 1);
+        assertThat(solution).isNotNull();
+        assertThat(solution.versions())
+                .containsExactlyInAnyOrderEntriesOf(Map.of("root", 1, "a", 1));
+        assertThat(solution.edges())
+                .noneMatch(e -> e.toName().equals("c"));
+        assertThat(solution.exclusions()).singleElement().satisfies(record -> {
+            assertThat(record.outcome()).isEqualTo("APPLIED");
+            assertThat(record.detail()).contains("a->c");
+        });
+    }
+
+    @Test
+    void exclusionOfUnknownNameIsRecordedAsMiss() {
+        // 排除未知名称允许，但记录为未命中。
+        RepositorySnapshot s = snapshot(0,
+                "root", List.of(v(1, depx("a", 1, 1, "ghost"))),
+                "a", List.of(v(1)));
+
+        LockSolution solution = LockResolver.solve(s, "root", 1);
+        assertThat(solution).isNotNull();
+        assertThat(solution.exclusions()).singleElement().satisfies(record -> {
+            assertThat(record.excludedName()).isEqualTo("ghost");
+            assertThat(record.outcome()).isEqualTo("MISS");
+            assertThat(record.detail()).isEqualTo("未命中");
+        });
+    }
+
+    @Test
+    void exclusionCannotRemoveTheEdgeTargetItself() {
+        // root->a 声明排除 a：该边目标 a 本身仍被保留。
+        RepositorySnapshot s = snapshot(0,
+                "root", List.of(v(1, depx("a", 1, 1, "a"))),
+                "a", List.of(v(1)));
+
+        LockSolution solution = LockResolver.solve(s, "root", 1);
+        assertThat(solution).isNotNull();
+        assertThat(solution.versions()).containsEntry("a", 1);
+        assertThat(solution.edges())
+                .anyMatch(e -> e.fromName().equals("root") && e.toName().equals("a"));
+    }
+
+    @Test
+    void firstExcludedPathDoesNotMaskLaterUnexcludedPath() {
+        // x 先经 root->p（排除 d）到达，再经 root->q 无排除到达：x->d 仍被保留。
+        RepositorySnapshot s = snapshot(0,
+                "root", List.of(v(1, depx("p", 1, 1, "d"), dep("q", 1, 1))),
+                "p", List.of(v(1, dep("x", 1, 1))),
+                "q", List.of(v(1, dep("x", 1, 1))),
+                "x", List.of(v(1, dep("d", 1, 1))),
+                "d", List.of(v(1)));
+
+        LockSolution solution = LockResolver.solve(s, "root", 1);
+        assertThat(solution).isNotNull();
+        assertThat(solution.versions()).containsEntry("d", 1);
+        assertThat(solution.edges())
+                .anyMatch(e -> e.fromName().equals("x") && e.toName().equals("d"));
+    }
+
+    @Test
+    void excludedEdgeRangeDoesNotConstrainChosenVersion() {
+        // a->c[1,1] 被排除，b->c[2,2] 保留：只能取 c2，且不产生空交集。
+        RepositorySnapshot s = snapshot(0,
+                "root", List.of(v(1, depx("a", 1, 1, "c"), dep("b", 1, 1))),
+                "a", List.of(v(1, dep("c", 1, 1))),
+                "b", List.of(v(1, dep("c", 2, 2))),
+                "c", List.of(v(2), v(1)));
+
+        LockSolution solution = LockResolver.solve(s, "root", 1);
+        assertThat(solution).isNotNull();
+        assertThat(solution.versions()).containsEntry("c", 2);
+    }
+
+    @Test
+    void exclusionPrunesInfeasibleSubgraph() {
+        // root->a 排除 b；a->b 若保留将引入 b->root[9,9] 不可行；排除后整体可解。
+        RepositorySnapshot s = snapshot(0,
+                "root", List.of(v(1, depx("a", 1, 1, "b"))),
+                "a", List.of(v(1, dep("b", 1, 1))),
+                "b", List.of(v(1, dep("root", 9, 9))));
+
+        LockSolution solution = LockResolver.solve(s, "root", 1);
+        assertThat(solution).isNotNull();
+        assertThat(solution.versions())
+                .containsExactlyInAnyOrderEntriesOf(Map.of("root", 1, "a", 1));
+    }
+
+    @Test
+    void retainedPathWithUnsatisfiableRangeStillFails() {
+        // b->c[5,5] 保留但仓库只有 c1：无解。
+        RepositorySnapshot s = snapshot(0,
+                "root", List.of(v(1, depx("a", 1, 1, "c"), dep("b", 1, 1))),
+                "a", List.of(v(1, dep("c", 1, 1))),
+                "b", List.of(v(1, dep("c", 5, 5))),
+                "c", List.of(v(1)));
+
+        assertThat(LockResolver.solve(s, "root", 1)).isNull();
     }
 }

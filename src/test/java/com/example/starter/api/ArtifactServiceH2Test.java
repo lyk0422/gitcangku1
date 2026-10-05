@@ -41,8 +41,11 @@ class ArtifactServiceH2Test {
 
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM lock_file_exclusion");
+        jdbcTemplate.update("DELETE FROM lock_file_edge");
         jdbcTemplate.update("DELETE FROM lock_file_entry");
         jdbcTemplate.update("DELETE FROM lock_file");
+        jdbcTemplate.update("DELETE FROM artifact_dependency_exclusion");
         jdbcTemplate.update("DELETE FROM artifact_dependency");
         jdbcTemplate.update("DELETE FROM artifact");
         jdbcTemplate.update("DELETE FROM idempotent_request");
@@ -59,6 +62,11 @@ class ArtifactServiceH2Test {
 
     private static DependencySpec dep(String name, int min, int max) {
         return new DependencySpec(name, min, max);
+    }
+
+    /** 带边级排除名称的依赖。 */
+    private static DependencySpec depx(String name, int min, int max, String... exclusions) {
+        return new DependencySpec(name, min, max, List.of(exclusions));
     }
 
     // ------------------------------------------------------------------
@@ -451,5 +459,232 @@ class ArtifactServiceH2Test {
         assertThat(replay.id()).isEqualTo(first.id());
         assertThat(replay.repositoryVersion()).isEqualTo(2L);
         assertThat(replay.entries()).isEqualTo(first.entries());
+    }
+
+    // ------------------------------------------------------------------
+    // 边级排除：主流程与失败分支（真实 H2）
+    // ------------------------------------------------------------------
+
+    @Test
+    void pathExclusionKeepsNameRequiredByOtherPathAndWithdrawOfItBreaksLock() {
+        // 合成根同时依赖 a 和 b：root->a 路径排除 c，root->b 路径仍需要 c，应保留 c。
+        service.registerArtifact(requestId(),
+                artifact("root", 1, depx("a", 1, 1, "c"), dep("b", 1, 1)));
+        service.registerArtifact(requestId(), artifact("a", 1, dep("c", 1, 1)));
+        service.registerArtifact(requestId(), artifact("b", 1, dep("c", 1, 1)));
+        service.registerArtifact(requestId(), artifact("c", 1));
+
+        LockFileResponse lock = service.createLock(requestId(), new LockRequest("root", 1, 4L));
+        assertThat(lock.entries()).extracting("name", "version")
+                .containsExactly(tuple("a", 1), tuple("b", 1), tuple("c", 1), tuple("root", 1));
+        // 保留边含 b->c，不含被排除的 a->c。
+        assertThat(lock.edges()).extracting("fromName", "toName")
+                .contains(tuple("root", "a"), tuple("root", "b"), tuple("b", "c"))
+                .doesNotContain(tuple("a", "c"));
+        // 排除理由落库：root->a 排除 c 实际忽略了 a->c。
+        assertThat(lock.exclusions()).singleElement().satisfies(record -> {
+            assertThat(record.fromName()).isEqualTo("root");
+            assertThat(record.toName()).isEqualTo("a");
+            assertThat(record.excludedName()).isEqualTo("c");
+            assertThat(record.outcome()).isEqualTo("APPLIED");
+            assertThat(record.detail()).contains("a->c");
+        });
+        // 历史查询返回相同的边与排除记录。
+        LockFileResponse queried = service.getLock(lock.id());
+        assertThat(queried.entries()).isEqualTo(lock.entries());
+        assertThat(queried.edges()).isEqualTo(lock.edges());
+        assertThat(queried.exclusions()).isEqualTo(lock.exclusions());
+
+        // 撤回唯一的 c 后，b 路径仍需要 c，锁定必须失败且无半锁文件。
+        service.withdrawArtifact(requestId(), "c", 1);
+        assertThatThrownBy(() -> service.createLock(requestId(), new LockRequest("root", 1, 5L)))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(422));
+        assertThat(jdbcTemplate.queryForObject("SELECT COUNT(1) FROM lock_file", Integer.class))
+                .isEqualTo(1);
+    }
+
+    @Test
+    void exclusionOfUnknownNameIsAllowedAndRecordedAsMiss() {
+        service.registerArtifact(requestId(),
+                artifact("root", 1, depx("a", 1, 1, "ghost")));
+        service.registerArtifact(requestId(), artifact("a", 1));
+
+        LockFileResponse lock = service.createLock(requestId(), new LockRequest("root", 1, 2L));
+        assertThat(lock.entries()).extracting("name").containsExactly("a", "root");
+        assertThat(lock.exclusions()).singleElement().satisfies(record -> {
+            assertThat(record.excludedName()).isEqualTo("ghost");
+            assertThat(record.outcome()).isEqualTo("MISS");
+            assertThat(record.detail()).isEqualTo("未命中");
+        });
+        // 未命中记录随锁文件持久化，可经历史查询还原。
+        assertThat(service.getLock(lock.id()).exclusions()).isEqualTo(lock.exclusions());
+    }
+
+    @Test
+    void reorderedExclusionsAreSameParamsAndReplay() {
+        // 排除集合换序同参：同 requestId 重放首次完整响应，不重复登记。
+        String rid = requestId();
+        ArtifactResponse first = service.registerArtifact(rid,
+                artifact("root", 1, depx("a", 1, 1, "x", "y")));
+        ArtifactResponse replay = service.registerArtifact(rid,
+                artifact("root", 1, depx("a", 1, 1, "y", "x")));
+
+        assertThat(replay.repositoryVersion()).isEqualTo(first.repositoryVersion());
+        assertThat(replay.createdAt()).isEqualTo(first.createdAt());
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM artifact", Integer.class)).isEqualTo(1);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM idempotent_request", Integer.class)).isEqualTo(1);
+        // 排除名称落库且升序。
+        assertThat(jdbcTemplate.queryForList(
+                "SELECT excluded_name FROM artifact_dependency_exclusion ORDER BY excluded_name ASC",
+                String.class)).containsExactly("x", "y");
+    }
+
+    @Test
+    void duplicateExclusionNamesReturn400() {
+        assertThatThrownBy(() -> service.registerArtifact(requestId(),
+                artifact("root", 1, depx("a", 1, 1, "x", "x"))))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(400));
+    }
+
+    @Test
+    void moreThanThreeExclusionsReturn400() {
+        assertThatThrownBy(() -> service.registerArtifact(requestId(),
+                artifact("root", 1, depx("a", 1, 1, "w", "x", "y", "z"))))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(400));
+    }
+
+    @Test
+    void infeasibleLockWithExclusionsPersistsNoEdgesOrExclusions() {
+        // b->c[5,5] 保留但仓库只有 c1：422 且不留任何锁文件痕迹。
+        service.registerArtifact(requestId(),
+                artifact("root", 1, depx("a", 1, 1, "c"), dep("b", 1, 1)));
+        service.registerArtifact(requestId(), artifact("a", 1, dep("c", 1, 1)));
+        service.registerArtifact(requestId(), artifact("b", 1, dep("c", 5, 5)));
+        service.registerArtifact(requestId(), artifact("c", 1));
+
+        assertThatThrownBy(() -> service.createLock(requestId(), new LockRequest("root", 1, 4L)))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(422));
+        assertThat(jdbcTemplate.queryForObject("SELECT COUNT(1) FROM lock_file", Integer.class))
+                .isZero();
+        assertThat(jdbcTemplate.queryForObject("SELECT COUNT(1) FROM lock_file_edge", Integer.class))
+                .isZero();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM lock_file_exclusion", Integer.class)).isZero();
+    }
+
+    @Test
+    void lockReplayAndLaterRegistrationsDoNotChangeStoredInterpretation() {
+        service.registerArtifact(requestId(),
+                artifact("root", 1, depx("a", 1, 1, "c"), dep("b", 1, 1)));
+        service.registerArtifact(requestId(), artifact("a", 1, dep("c", 1, 1)));
+        service.registerArtifact(requestId(), artifact("b", 1, dep("c", 1, 2)));
+        service.registerArtifact(requestId(), artifact("c", 1));
+        String rid = requestId();
+        LockFileResponse first = service.createLock(rid, new LockRequest("root", 1, 4L));
+
+        // 后续新增制品推进仓库版本，重放仍返回首次完整响应。
+        service.registerArtifact(requestId(), artifact("c", 2));
+        LockFileResponse replay = service.createLock(rid, new LockRequest("root", 1, 4L));
+        assertThat(replay.id()).isEqualTo(first.id());
+        assertThat(replay.repositoryVersion()).isEqualTo(4L);
+        assertThat(replay.entries()).isEqualTo(first.entries());
+        assertThat(replay.edges()).isEqualTo(first.edges());
+        assertThat(replay.exclusions()).isEqualTo(first.exclusions());
+
+        // 直接查询历史锁文件，保留边与排除理由不变。
+        LockFileResponse queried = service.getLock(first.id());
+        assertThat(queried.entries()).isEqualTo(first.entries());
+        assertThat(queried.edges()).isEqualTo(first.edges());
+        assertThat(queried.exclusions()).isEqualTo(first.exclusions());
+    }
+
+    @Test
+    void sameRequestIdWithDifferentOperatorReturns409() {
+        // 幂等身份含操作者：同键异操作者视为异参。
+        String rid = requestId();
+        service.registerArtifact(rid, "alice", artifact("app", 1));
+        assertThatThrownBy(() -> service.registerArtifact(rid, "bob", artifact("app", 1)))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(409));
+    }
+
+    @Test
+    void sameRequestIdWithSameOperatorAndParamsReplays() {
+        String rid = requestId();
+        ArtifactResponse first = service.registerArtifact(rid, "alice", artifact("app", 1));
+        ArtifactResponse replay = service.registerArtifact(rid, "alice", artifact("app", 1));
+        assertThat(replay.repositoryVersion()).isEqualTo(first.repositoryVersion());
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM artifact", Integer.class)).isEqualTo(1);
+    }
+
+    @Test
+    void separatorLikeCharactersInParamsDoNotCollideIdentity() {
+        // 名称含分隔符样式字符时，结构化身份仍按字段比较：异参 409、同参重放。
+        String rid = requestId();
+        service.registerArtifact(rid, artifact("a|1", 1));
+        assertThatThrownBy(() -> service.registerArtifact(rid, artifact("a", 1)))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(409));
+
+        String rid2 = requestId();
+        ArtifactResponse first = service.registerArtifact(rid2, artifact("b|2", 1));
+        ArtifactResponse replay = service.registerArtifact(rid2, artifact("b|2", 1));
+        assertThat(replay.repositoryVersion()).isEqualTo(first.repositoryVersion());
+    }
+
+    @Test
+    void concurrentLockAndWithdrawWithExclusionResolvesConsistently() throws Exception {
+        // root->a 排除 c、root->b 需要 c；锁定与撤回 c 并发，结果必居其一且状态一致。
+        service.registerArtifact(requestId(),
+                artifact("root", 1, depx("a", 1, 1, "c"), dep("b", 1, 1)));
+        service.registerArtifact(requestId(), artifact("a", 1, dep("c", 1, 1)));
+        service.registerArtifact(requestId(), artifact("b", 1, dep("c", 1, 1)));
+        service.registerArtifact(requestId(), artifact("c", 1));
+        long versionBefore = 4L;
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        CyclicBarrier barrier = new CyclicBarrier(2);
+        Callable<Object> lockTask = () -> {
+            barrier.await(5, TimeUnit.SECONDS);
+            try {
+                return service.createLock(requestId(), new LockRequest("root", 1, versionBefore));
+            } catch (ApiException e) {
+                return e;
+            }
+        };
+        Callable<Object> withdrawTask = () -> {
+            barrier.await(5, TimeUnit.SECONDS);
+            return service.withdrawArtifact(requestId(), "c", 1);
+        };
+        List<Future<Object>> futures = pool.invokeAll(List.of(lockTask, withdrawTask));
+        pool.shutdown();
+        Object lockOutcome = futures.get(0).get(30, TimeUnit.SECONDS);
+        Object withdrawOutcome = futures.get(1).get(30, TimeUnit.SECONDS);
+
+        assertThat(withdrawOutcome).isInstanceOf(ArtifactResponse.class);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT version FROM repository_state WHERE id = 1", Long.class))
+                .isEqualTo(versionBefore + 1);
+        if (lockOutcome instanceof LockFileResponse lock) {
+            // 锁先提交：c 被保留进锁文件，后续撤回不改旧解释。
+            assertThat(lock.entries()).extracting("name").contains("c");
+            LockFileResponse queried = service.getLock(lock.id());
+            assertThat(queried.entries()).isEqualTo(lock.entries());
+            assertThat(queried.edges()).isEqualTo(lock.edges());
+        } else {
+            // 撤回先提交：期望版本过期 409，无半锁文件。
+            assertThat(lockOutcome).isInstanceOf(ApiException.class);
+            assertThat(((ApiException) lockOutcome).getStatus()).isEqualTo(409);
+            assertThat(service.listLocks()).isEmpty();
+            assertThat(jdbcTemplate.queryForObject(
+                    "SELECT COUNT(1) FROM lock_file_edge", Integer.class)).isZero();
+        }
     }
 }

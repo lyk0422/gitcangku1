@@ -35,8 +35,11 @@ class ArtifactControllerHttpTest {
 
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM lock_file_exclusion");
+        jdbcTemplate.update("DELETE FROM lock_file_edge");
         jdbcTemplate.update("DELETE FROM lock_file_entry");
         jdbcTemplate.update("DELETE FROM lock_file");
+        jdbcTemplate.update("DELETE FROM artifact_dependency_exclusion");
         jdbcTemplate.update("DELETE FROM artifact_dependency");
         jdbcTemplate.update("DELETE FROM artifact");
         jdbcTemplate.update("DELETE FROM idempotent_request");
@@ -217,5 +220,99 @@ class ArtifactControllerHttpTest {
                 new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
                 JsonNode.class);
         assertThat(lockOnWithdrawn.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+    }
+
+    // ------------------------------------------------------------------
+    // 边级排除：HTTP 入口
+    // ------------------------------------------------------------------
+
+    @Test
+    void registerWithExclusionsAndLockReturnsEdgesAndExclusionRecords() {
+        // root:1 -> a[1,1]（排除 c）、b[1,1]；a:1 -> c[1,1]；b:1 -> c[1,1]；c:1。
+        Map<String, Object> depA = dependency("a", 1, 1);
+        depA.put("exclusions", List.of("c"));
+        ResponseEntity<JsonNode> registered = restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("root", 1, depA, dependency("b", 1, 1)),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        assertThat(registered.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        // 登记响应回显排除名称。
+        assertThat(registered.getBody().path("dependencies").get(0)
+                .path("exclusions").get(0).asText()).isEqualTo("c");
+
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("a", 1, dependency("c", 1, 1)),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("b", 1, dependency("c", 1, 1)),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("c", 1),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+
+        String lockBody = "{\"rootName\":\"root\",\"rootVersion\":1,\"expectedRepositoryVersion\":4}";
+        ResponseEntity<JsonNode> lock = restTemplate.postForEntity("/api/artifacts/locks",
+                new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(lock.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        JsonNode body = lock.getBody();
+        // c 经 b 路径保留。
+        assertThat(body.path("entries")).hasSize(4);
+
+        // 保留边含 b->c，不含被排除的 a->c。
+        List<String> edgePairs = new java.util.ArrayList<>();
+        body.path("edges").forEach(edge -> edgePairs.add(
+                edge.path("fromName").asText() + "->" + edge.path("toName").asText()));
+        assertThat(edgePairs).contains("root->a", "root->b", "b->c");
+        assertThat(edgePairs).doesNotContain("a->c");
+
+        // 排除理由：root->a 排除 c 为 APPLIED。
+        JsonNode exclusions = body.path("exclusions");
+        assertThat(exclusions).hasSize(1);
+        assertThat(exclusions.get(0).path("excludedName").asText()).isEqualTo("c");
+        assertThat(exclusions.get(0).path("outcome").asText()).isEqualTo("APPLIED");
+        assertThat(exclusions.get(0).path("detail").asText()).contains("a->c");
+
+        // 历史查询同样返回边与排除记录。
+        ResponseEntity<JsonNode> one = restTemplate.getForEntity(
+                "/api/artifacts/locks/{id}", JsonNode.class, body.path("id").asLong());
+        assertThat(one.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(one.getBody().path("edges")).hasSize(body.path("edges").size());
+        assertThat(one.getBody().path("exclusions")).hasSize(1);
+    }
+
+    @Test
+    void duplicateExclusionNamesReturn400ViaHttp() {
+        Map<String, Object> dep = dependency("a", 1, 1);
+        dep.put("exclusions", List.of("x", "x"));
+        ResponseEntity<JsonNode> response = restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("root", 1, dep),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
+    void moreThanThreeExclusionsReturn400ViaHttp() {
+        Map<String, Object> dep = dependency("a", 1, 1);
+        dep.put("exclusions", List.of("w", "x", "y", "z"));
+        ResponseEntity<JsonNode> response = restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("root", 1, dep),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
+    void sameRequestIdDifferentOperatorReturns409ViaHttp() {
+        String rid = UUID.randomUUID().toString();
+        HttpHeaders alice = jsonHeaders(rid);
+        alice.set("X-Operator", "alice");
+        ResponseEntity<JsonNode> first = restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("app", 1), alice), JsonNode.class);
+        assertThat(first.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+
+        HttpHeaders bob = jsonHeaders(rid);
+        bob.set("X-Operator", "bob");
+        ResponseEntity<JsonNode> conflict = restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("app", 1), bob), JsonNode.class);
+        assertThat(conflict.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
     }
 }

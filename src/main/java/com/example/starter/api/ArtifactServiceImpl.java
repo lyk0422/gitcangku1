@@ -3,13 +3,16 @@ package com.example.starter.api;
 import com.example.starter.api.dto.ArtifactResponse;
 import com.example.starter.api.dto.DependencySpec;
 import com.example.starter.api.dto.DependencyView;
+import com.example.starter.api.dto.LockEdgeResponse;
 import com.example.starter.api.dto.LockEntryResponse;
+import com.example.starter.api.dto.LockExclusionResponse;
 import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
 import com.example.starter.api.dto.RegisterArtifactRequest;
 import com.example.starter.domain.ArtifactVersion;
 import com.example.starter.domain.DependencyRange;
 import com.example.starter.domain.LockResolver;
+import com.example.starter.domain.LockSolution;
 import com.example.starter.domain.RepositorySnapshot;
 import com.example.starter.repo.RepositoryDao;
 import com.example.starter.repo.RepositoryDao.IdempotentRecord;
@@ -27,7 +30,9 @@ import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -66,35 +71,51 @@ public class ArtifactServiceImpl implements ArtifactService {
     }
 
     @Override
-    public ArtifactResponse registerArtifact(String requestId, RegisterArtifactRequest request) {
+    public ArtifactResponse registerArtifact(String requestId, String operator,
+                                             RegisterArtifactRequest request) {
         requireRequestId(requestId);
         validateRegisterRequest(request);
-        String hash = sha256(OP_REGISTER + "|" + request.name().trim() + "|" + request.version() + "|"
-                + canonicalDependencies(request));
-        return executeIdempotent(requestId, OP_REGISTER, hash, 201,
+        Map<String, Object> identity = baseIdentity(OP_REGISTER, operator);
+        Map<String, Object> resource = new LinkedHashMap<>();
+        resource.put("name", request.name().trim());
+        resource.put("version", request.version());
+        identity.put("resource", resource);
+        identity.put("parameters", canonicalDependencies(request));
+        return executeIdempotent(requestId, OP_REGISTER, hashIdentity(identity), 201,
                 () -> doRegister(request), ArtifactResponse.class);
     }
 
     @Override
-    public ArtifactResponse withdrawArtifact(String requestId, String name, int version) {
+    public ArtifactResponse withdrawArtifact(String requestId, String operator,
+                                             String name, int version) {
         requireRequestId(requestId);
         if (name == null || name.isBlank()) {
             throw ApiException.badRequest("name 不能为空");
         }
-        String hash = sha256(OP_WITHDRAW + "|" + name.trim() + "|" + version);
-        return executeIdempotent(requestId, OP_WITHDRAW, hash, 200,
+        Map<String, Object> identity = baseIdentity(OP_WITHDRAW, operator);
+        Map<String, Object> resource = new LinkedHashMap<>();
+        resource.put("name", name.trim());
+        resource.put("version", version);
+        identity.put("resource", resource);
+        return executeIdempotent(requestId, OP_WITHDRAW, hashIdentity(identity), 200,
                 () -> doWithdraw(name.trim(), version), ArtifactResponse.class);
     }
 
     @Override
-    public LockFileResponse createLock(String requestId, LockRequest request) {
+    public LockFileResponse createLock(String requestId, String operator, LockRequest request) {
         requireRequestId(requestId);
         if (request.rootName() == null || request.rootName().isBlank()) {
             throw ApiException.badRequest("rootName 不能为空");
         }
-        String hash = sha256(OP_LOCK + "|" + request.rootName().trim() + "|" + request.rootVersion()
-                + "|" + request.expectedRepositoryVersion());
-        return executeIdempotent(requestId, OP_LOCK, hash, 201,
+        Map<String, Object> identity = baseIdentity(OP_LOCK, operator);
+        Map<String, Object> resource = new LinkedHashMap<>();
+        resource.put("rootName", request.rootName().trim());
+        resource.put("rootVersion", request.rootVersion());
+        identity.put("resource", resource);
+        Map<String, Object> parameters = new LinkedHashMap<>();
+        parameters.put("expectedRepositoryVersion", request.expectedRepositoryVersion());
+        identity.put("parameters", parameters);
+        return executeIdempotent(requestId, OP_LOCK, hashIdentity(identity), 201,
                 () -> doLock(request), LockFileResponse.class);
     }
 
@@ -140,8 +161,10 @@ public class ArtifactServiceImpl implements ArtifactService {
         Instant now = Instant.now(clock);
         long artifactId = repositoryDao.insertArtifact(name, version, now);
         for (var dep : request.dependencies()) {
-            repositoryDao.insertDependency(artifactId, dep.name().trim(),
+            long dependencyId = repositoryDao.insertDependency(artifactId, dep.name().trim(),
                     dep.minimumVersion(), dep.maximumVersion());
+            dep.exclusions().stream().map(String::trim).sorted().distinct()
+                    .forEach(excluded -> repositoryDao.insertDependencyExclusion(dependencyId, excluded));
         }
         long repositoryVersion = repositoryDao.incrementRepositoryVersion();
 
@@ -187,7 +210,7 @@ public class ArtifactServiceImpl implements ArtifactService {
         }
 
         RepositorySnapshot snapshot = repositoryDao.loadSnapshot();
-        Map<String, Integer> solution = LockResolver.resolve(snapshot, rootName, rootVersion);
+        LockSolution solution = LockResolver.solve(snapshot, rootName, rootVersion);
         if (solution == null) {
             throw ApiException.unprocessable(
                     "不存在满足全部依赖区间的未撤回版本组合，无法锁定");
@@ -196,11 +219,15 @@ public class ArtifactServiceImpl implements ArtifactService {
         Instant now = Instant.now(clock);
         long lockFileId = repositoryDao.insertLockFile(rootName, rootVersion, currentVersion,
                 currentRequestId.get(), now);
-        solution.forEach((n, v) -> repositoryDao.insertLockEntry(lockFileId, n, v));
+        solution.versions().forEach((n, v) -> repositoryDao.insertLockEntry(lockFileId, n, v));
+        solution.edges().forEach(edge -> repositoryDao.insertLockEdge(lockFileId, edge));
+        solution.exclusions().forEach(record -> repositoryDao.insertLockExclusion(lockFileId, record));
 
         List<LockEntryResponse> entries = new ArrayList<>();
-        solution.forEach((n, v) -> entries.add(new LockEntryResponse(n, v)));
-        return new LockFileResponse(lockFileId, rootName, rootVersion, currentVersion, now, entries);
+        solution.versions().forEach((n, v) -> entries.add(new LockEntryResponse(n, v)));
+        return new LockFileResponse(lockFileId, rootName, rootVersion, currentVersion, now,
+                entries, toEdgeResponses(solution.edges()),
+                toExclusionResponses(solution.exclusions()));
     }
 
     // ------------------------------------------------------------------
@@ -292,15 +319,61 @@ public class ArtifactServiceImpl implements ArtifactService {
             if (!names.add(depName)) {
                 throw ApiException.badRequest("依赖名称重复: " + depName);
             }
+            validateExclusions(depName, dep.exclusions());
         }
     }
 
-    private String canonicalDependencies(RegisterArtifactRequest request) {
+    /** 边级排除校验：最多 3 个、非空、不可重复。 */
+    private void validateExclusions(String depName, List<String> exclusions) {
+        if (exclusions.size() > 3) {
+            throw ApiException.badRequest("依赖 " + depName + " 的排除名称最多 3 个");
+        }
+        Set<String> seen = new HashSet<>();
+        for (String excluded : exclusions) {
+            if (excluded == null || excluded.isBlank()) {
+                throw ApiException.badRequest("依赖 " + depName + " 的排除名称不能为空");
+            }
+            if (!seen.add(excluded.trim())) {
+                throw ApiException.badRequest(
+                        "依赖 " + depName + " 的排除名称重复: " + excluded.trim());
+            }
+        }
+    }
+
+    /**
+     * 规范化依赖参数（用于幂等身份）：按名称排序，排除名称排序去重，
+     * 结构化字段避免分隔符碰撞；排除集合换序视为同参。
+     */
+    private List<Map<String, Object>> canonicalDependencies(RegisterArtifactRequest request) {
         return request.dependencies().stream()
-                .map(d -> d.name().trim() + ":" + d.minimumVersion() + ":" + d.maximumVersion())
-                .sorted()
-                .reduce((a, b) -> a + "," + b)
-                .orElse("");
+                .map(d -> {
+                    Map<String, Object> dep = new LinkedHashMap<>();
+                    dep.put("name", d.name().trim());
+                    dep.put("minimumVersion", d.minimumVersion());
+                    dep.put("maximumVersion", d.maximumVersion());
+                    dep.put("exclusions", d.exclusions().stream()
+                            .map(String::trim).sorted().distinct().toList());
+                    return dep;
+                })
+                .sorted(Comparator.comparing(d -> (String) d.get("name")))
+                .toList();
+    }
+
+    /** 幂等身份基础结构：操作与操作者（缺省视为空串）。 */
+    private Map<String, Object> baseIdentity(String operation, String operator) {
+        Map<String, Object> identity = new LinkedHashMap<>();
+        identity.put("operation", operation);
+        identity.put("operator", operator == null ? "" : operator.trim());
+        return identity;
+    }
+
+    /** 结构化身份序列化为 JSON 后取 SHA-256，避免分隔符碰撞。 */
+    private String hashIdentity(Map<String, Object> identity) {
+        try {
+            return sha256(objectMapper.writeValueAsString(identity));
+        } catch (Exception e) {
+            throw new IllegalStateException("幂等身份序列化失败", e);
+        }
     }
 
     private List<DependencyView> toDependencyViews(List<?> raw) {
@@ -308,10 +381,12 @@ public class ArtifactServiceImpl implements ArtifactService {
         for (Object o : raw) {
             if (o instanceof com.example.starter.api.dto.DependencySpec spec) {
                 sorted.put(spec.name().trim(), new DependencyView(
-                        spec.name().trim(), spec.minimumVersion(), spec.maximumVersion()));
+                        spec.name().trim(), spec.minimumVersion(), spec.maximumVersion(),
+                        spec.exclusions().stream().map(String::trim).sorted().distinct().toList()));
             } else if (o instanceof DependencyRange range) {
                 sorted.put(range.name(), new DependencyView(
-                        range.name(), range.minimumVersion(), range.maximumVersion()));
+                        range.name(), range.minimumVersion(), range.maximumVersion(),
+                        range.exclusions().stream().sorted().distinct().toList()));
             }
         }
         return List.copyOf(sorted.values());
@@ -321,8 +396,30 @@ public class ArtifactServiceImpl implements ArtifactService {
         List<LockEntryResponse> entryViews = entries.stream()
                 .map(e -> new LockEntryResponse(e.name(), e.version()))
                 .toList();
+        List<LockEdgeResponse> edgeViews = repositoryDao.listLockEdges(row.id()).stream()
+                .map(e -> new LockEdgeResponse(e.fromName(), e.fromVersion(), e.toName(),
+                        e.minimumVersion(), e.maximumVersion()))
+                .toList();
+        List<LockExclusionResponse> exclusionViews = repositoryDao.listLockExclusions(row.id()).stream()
+                .map(x -> new LockExclusionResponse(x.fromName(), x.fromVersion(), x.toName(),
+                        x.excludedName(), x.outcome(), x.detail()))
+                .toList();
         return new LockFileResponse(row.id(), row.rootName(), row.rootVersion(),
-                row.repositoryVersion(), row.createdAt(), entryViews);
+                row.repositoryVersion(), row.createdAt(), entryViews, edgeViews, exclusionViews);
+    }
+
+    private List<LockEdgeResponse> toEdgeResponses(List<LockSolution.RetainedEdge> edges) {
+        return edges.stream()
+                .map(e -> new LockEdgeResponse(e.fromName(), e.fromVersion(), e.toName(),
+                        e.minimumVersion(), e.maximumVersion()))
+                .toList();
+    }
+
+    private List<LockExclusionResponse> toExclusionResponses(List<LockSolution.ExclusionRecord> records) {
+        return records.stream()
+                .map(x -> new LockExclusionResponse(x.fromName(), x.fromVersion(), x.toName(),
+                        x.excludedName(), x.outcome(), x.detail()))
+                .toList();
     }
 
     private void requireRequestId(String requestId) {
