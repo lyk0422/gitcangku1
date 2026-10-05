@@ -66,3 +66,42 @@ CREATE TABLE IF NOT EXISTS batch_lineage (
     created_at VARCHAR(40) NOT NULL COMMENT '拆分时间，ISO-8601 UTC instant 字符串',
     CONSTRAINT uk_lineage_child UNIQUE (child_key)
 );
+
+
+-- 配方称量：配方版本、成分百分比、批次配方绑定与称量记录；时间均以 ISO-8601 UTC 字符串存储。
+CREATE TABLE IF NOT EXISTS recipe_version (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    recipe_key VARCHAR(64) NOT NULL COMMENT '配方版本业务键，全局唯一，创建后不可修改',
+    created_at VARCHAR(40) NOT NULL COMMENT '创建时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_recipe_key UNIQUE (recipe_key)
+);
+
+CREATE TABLE IF NOT EXISTS recipe_ingredient (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    recipe_key VARCHAR(64) NOT NULL COMMENT '所属配方版本业务键',
+    ingredient VARCHAR(128) NOT NULL COMMENT '成分名称，同一配方内唯一',
+    percentage DECIMAL(7,4) NOT NULL COMMENT '质量百分比，>0，最多4位小数，同配方合计精确等于100',
+    seq INT NOT NULL COMMENT '成分在创建请求中的顺序，从 1 开始'
+);
+
+CREATE TABLE IF NOT EXISTS batch_recipe_binding (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    batch_key VARCHAR(64) NOT NULL COMMENT '批次业务键，每批次至多绑定一次，绑定后不可修改',
+    recipe_key VARCHAR(64) NOT NULL COMMENT '绑定的不可变配方版本业务键',
+    target_mass DECIMAL(14,6) NOT NULL COMMENT '目标总质量，单位克，>0，最多6位小数',
+    bound_at VARCHAR(40) NOT NULL COMMENT '绑定时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_binding_batch UNIQUE (batch_key)
+);
+
+CREATE TABLE IF NOT EXISTS weighing (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键，同时作为称量链版本与排序依据',
+    batch_key VARCHAR(64) NOT NULL COMMENT '所属批次业务键',
+    request_id VARCHAR(64) NOT NULL COMMENT '写入请求幂等键 requestId；拆分继承记录填拆分命令键',
+    ingredient VARCHAR(128) NOT NULL COMMENT '成分名称，必须属于绑定配方',
+    mass DECIMAL(14,6) NOT NULL COMMENT '称量质量，单位克，>0，最多6位小数',
+    corrects_id BIGINT NULL COMMENT '更正目标称量ID；NULL 表示新增称量或拆分继承',
+    superseded_by BIGINT NULL COMMENT '替代本记录的更正称量ID；NULL 表示当前有效',
+    source VARCHAR(16) NOT NULL COMMENT '来源：MANUAL 人工称量/更正，SPLIT 拆分继承',
+    operator_id VARCHAR(64) NOT NULL COMMENT '操作人标识',
+    created_at VARCHAR(40) NOT NULL COMMENT '记录时间，ISO-8601 UTC instant 字符串'
+);
