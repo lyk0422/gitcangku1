@@ -19,18 +19,30 @@ public class DeviceRepository {
     }
 
     public void insert(Device device) {
-        jdbc.update("INSERT INTO device (device_id, model, current_version, bucket_no) VALUES (?, ?, ?, ?)",
-                device.deviceId(), device.model(), device.currentVersion(), device.bucketNo());
+        jdbc.update("INSERT INTO device (device_id, model, current_version, bucket_no, active_partition)"
+                        + " VALUES (?, ?, ?, ?, ?)",
+                device.deviceId(), device.model(), device.currentVersion(), device.bucketNo(),
+                device.activePartition());
     }
 
     public Optional<Device> findById(String deviceId) {
-        return jdbc.query("SELECT device_id, model, current_version, bucket_no FROM device WHERE device_id = ?",
+        return jdbc.query("SELECT device_id, model, current_version, bucket_no, active_partition"
+                        + " FROM device WHERE device_id = ?",
                 (rs, rowNum) -> new Device(rs.getString("device_id"), rs.getString("model"),
-                        rs.getString("current_version"), rs.getInt("bucket_no")),
+                        rs.getString("current_version"), rs.getInt("bucket_no"),
+                        rs.getString("active_partition")),
                 deviceId).stream().findFirst();
     }
 
     public void updateCurrentVersion(String deviceId, String newVersion) {
         jdbc.update("UPDATE device SET current_version = ? WHERE device_id = ?", newVersion, deviceId);
+    }
+
+    /**
+     * 双分区试启动确认后切换启动分区与当前版本。
+     */
+    public void updateBoot(String deviceId, String activePartition, String currentVersion) {
+        jdbc.update("UPDATE device SET active_partition = ?, current_version = ? WHERE device_id = ?",
+                activePartition, currentVersion, deviceId);
     }
 }

@@ -1,6 +1,7 @@
 package com.example.starter.firmware.repo;
 
 import com.example.starter.firmware.domain.ReceiptResult;
+import com.example.starter.firmware.domain.ReleaseKind;
 import com.example.starter.firmware.domain.ReleaseOrder;
 import com.example.starter.firmware.domain.ReleaseStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -20,14 +21,14 @@ import java.util.Optional;
 public class ReleaseRepository {
 
     private static final RowMapper<ReleaseOrder> MAPPER = (rs, rowNum) -> new ReleaseOrder(
-            rs.getLong("id"), rs.getInt("version"), rs.getString("model"),
-            rs.getString("from_version"), rs.getString("to_version"),
+            rs.getLong("id"), rs.getInt("version"), ReleaseKind.valueOf(rs.getString("kind")),
+            rs.getString("model"), rs.getString("from_version"), rs.getString("to_version"),
             rs.getInt("ratio"), ReleaseStatus.valueOf(rs.getString("status")),
             rs.getInt("sample_floor"), rs.getInt("failure_threshold_percent"),
             rs.getInt("monitor_round"), rs.getInt("round_success"), rs.getInt("round_failed"));
 
-    private static final String COLUMNS = "id, version, model, from_version, to_version, ratio, status,"
-            + " sample_floor, failure_threshold_percent, monitor_round, round_success, round_failed";
+    private static final String COLUMNS = "id, version, kind, model, from_version, to_version, ratio,"
+            + " status, sample_floor, failure_threshold_percent, monitor_round, round_success, round_failed";
 
     private final JdbcTemplate jdbc;
 
@@ -35,22 +36,23 @@ public class ReleaseRepository {
         this.jdbc = jdbc;
     }
 
-    public long insert(String model, String fromVersion, String toVersion, int ratio,
+    public long insert(ReleaseKind kind, String model, String fromVersion, String toVersion, int ratio,
                        int sampleFloor, int failureThresholdPercent) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO release_order (version, model, from_version, to_version, ratio, status,"
-                            + " sample_floor, failure_threshold_percent, monitor_round, active_model)"
-                            + " VALUES (1, ?, ?, ?, ?, 'ACTIVE', ?, ?, 1, ?)",
+                    "INSERT INTO release_order (version, kind, model, from_version, to_version, ratio,"
+                            + " status, sample_floor, failure_threshold_percent, monitor_round, active_model)"
+                            + " VALUES (1, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, 1, ?)",
                     new String[]{"id"});
-            ps.setString(1, model);
-            ps.setString(2, fromVersion);
-            ps.setString(3, toVersion);
-            ps.setInt(4, ratio);
-            ps.setInt(5, sampleFloor);
-            ps.setInt(6, failureThresholdPercent);
-            ps.setString(7, model);
+            ps.setString(1, kind.name());
+            ps.setString(2, model);
+            ps.setString(3, fromVersion);
+            ps.setString(4, toVersion);
+            ps.setInt(5, ratio);
+            ps.setInt(6, sampleFloor);
+            ps.setInt(7, failureThresholdPercent);
+            ps.setString(8, model);
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();
@@ -88,7 +90,7 @@ public class ReleaseRepository {
     }
 
     /**
-     * 当前监控轮次统计加一（成功或失败），调用方必须已持有发布单行锁。
+     * 当前监控轮次统计加一（成功或失败终态），调用方必须已持有发布单行锁。
      */
     public void incrementRoundStats(long id, ReceiptResult result) {
         if (result == ReceiptResult.SUCCESS) {

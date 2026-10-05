@@ -7,6 +7,7 @@ import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.util.Arrays;
 import java.util.function.Supplier;
 
 /**
@@ -81,6 +82,18 @@ public class IdempotencyService {
             return objectMapper.readValue(record.responseBody(), type);
         } catch (Exception e) {
             throw new IllegalStateException("幂等响应反序列化失败", e);
+        }
+    }
+
+    /**
+     * 结构化身份指纹：将操作、操作者、资源及全部参数按 JSON 数组编码，
+     * 避免分隔符拼接触撞；同键异参由指纹不等触发 409。
+     */
+    public String structuredFingerprint(Object... parts) {
+        try {
+            return objectMapper.writeValueAsString(Arrays.asList(parts));
+        } catch (Exception e) {
+            throw new IllegalStateException("幂等指纹序列化失败", e);
         }
     }
 

@@ -1,5 +1,6 @@
 package com.example.starter.firmware.service;
 
+import com.example.starter.firmware.api.CreateDualReleaseRequest;
 import com.example.starter.firmware.api.CreateReleaseRequest;
 import com.example.starter.firmware.api.ExpandReleaseRequest;
 import com.example.starter.firmware.api.MonitorView;
@@ -8,6 +9,7 @@ import com.example.starter.firmware.api.ReleaseHistoryResponse;
 import com.example.starter.firmware.api.ReleaseView;
 import com.example.starter.firmware.api.ResumeRecordView;
 import com.example.starter.firmware.api.ResumeReleaseRequest;
+import com.example.starter.firmware.domain.ReleaseKind;
 import com.example.starter.firmware.domain.ReleaseOrder;
 import com.example.starter.firmware.domain.ReleaseStatus;
 import com.example.starter.firmware.error.ApiException;
@@ -33,17 +35,19 @@ public class ReleaseService {
     private final PauseRecordRepository pauseRecordRepository;
     private final ResumeRecordRepository resumeRecordRepository;
     private final IdempotencyService idempotency;
+    private final TaskService taskService;
     private final Clock clock;
 
     public ReleaseService(ReleaseRepository releaseRepository, TaskRepository taskRepository,
                           PauseRecordRepository pauseRecordRepository,
                           ResumeRecordRepository resumeRecordRepository,
-                          IdempotencyService idempotency, Clock clock) {
+                          IdempotencyService idempotency, TaskService taskService, Clock clock) {
         this.releaseRepository = releaseRepository;
         this.taskRepository = taskRepository;
         this.pauseRecordRepository = pauseRecordRepository;
         this.resumeRecordRepository = resumeRecordRepository;
         this.idempotency = idempotency;
+        this.taskService = taskService;
         this.clock = clock;
     }
 
@@ -59,8 +63,8 @@ public class ReleaseService {
         return idempotency.execute(request.requestId(), "release.create", fingerprint, () -> {
             long id;
             try {
-                id = releaseRepository.insert(request.model(), request.fromVersion(), request.toVersion(),
-                        request.ratio(), sampleFloor, threshold);
+                id = releaseRepository.insert(ReleaseKind.GRAY, request.model(), request.fromVersion(),
+                        request.toVersion(), request.ratio(), sampleFloor, threshold);
             } catch (DuplicateKeyException e) {
                 throw ApiException.conflict("ACTIVE_RELEASE_EXISTS", "型号已存在未终结发布单: " + request.model());
             }
@@ -136,6 +140,7 @@ public class ReleaseService {
      * 当前监控轮次统计（只读，不触发状态变化）。
      */
     public MonitorView monitor(long releaseId) {
+        taskService.settleExpiredTrials(releaseId);
         return MonitorView.of(findOrder(releaseId));
     }
 
@@ -149,6 +154,31 @@ public class ReleaseService {
         var resumes = resumeRecordRepository.findByRelease(releaseId).stream()
                 .map(ResumeRecordView::of).toList();
         return new ReleaseHistoryResponse(releaseId, pauses, resumes);
+    }
+
+    /**
+     * 创建双分区试启动发布单：设备试启动新分区，60 秒内健康确认才正式切换。
+     * 幂等身份包含操作、操作者、型号与全部参数，结构化编码避免分隔符碰撞。
+     */
+    public ReleaseView createDual(CreateDualReleaseRequest request) {
+        if (request.fromVersion().equals(request.toVersion())) {
+            throw ApiException.badRequest("SAME_VERSION", "目标版本必须与来源版本不同");
+        }
+        int sampleFloor = request.effectiveSampleFloor();
+        int threshold = request.effectiveFailureThresholdPercent();
+        String fingerprint = idempotency.structuredFingerprint("release.createDual", request.operator(),
+                request.model(), request.fromVersion(), request.toVersion(), request.ratio(),
+                sampleFloor, threshold);
+        return idempotency.execute(request.requestId(), "release.createDual", fingerprint, () -> {
+            long id;
+            try {
+                id = releaseRepository.insert(ReleaseKind.DUAL_PARTITION, request.model(),
+                        request.fromVersion(), request.toVersion(), request.ratio(), sampleFloor, threshold);
+            } catch (DuplicateKeyException e) {
+                throw ApiException.conflict("ACTIVE_RELEASE_EXISTS", "型号已存在未终结发布单: " + request.model());
+            }
+            return ReleaseView.of(findOrder(id));
+        }, ReleaseView.class);
     }
 
     public ReleaseOrder findOrder(long releaseId) {
