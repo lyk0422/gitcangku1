@@ -50,7 +50,7 @@ public class MeasurementController {
     @PostMapping("/release")
     public ReleaseResponse release(@RequestBody ReleaseRequest request,
                                    @RequestHeader("X-Actor-Id") String actor) {
-        return releases.release(request.keys(), actor);
+        return releases.release(request, actor);
     }
 
     /**

@@ -31,7 +31,10 @@ public class MeasurementRepository {
             rs.getBigDecimal("upper_limit"),
             rs.getString("submitted_by"),
             rs.getLong("certificate_id"),
-            rs.getBigDecimal("computed_value"),
+            rs.getBigDecimal("computed_num").toBigInteger(),
+            rs.getBigDecimal("computed_den").toBigInteger(),
+            rs.getObject("node_lo_index", Integer.class),
+            rs.getObject("node_hi_index", Integer.class),
             rs.getBoolean("passed"),
             MeasurementStatus.valueOf(rs.getString("status")),
             JdbcTimes.fromDb(rs.getObject("created_at", LocalDateTime.class)));
@@ -51,8 +54,9 @@ public class MeasurementRepository {
             PreparedStatement ps = con.prepareStatement(
                     "INSERT INTO measurement "
                             + "(measurement_key, instrument_id, measured_at, raw_reading, lower_limit, upper_limit, "
-                            + "submitted_by, certificate_id, computed_value, passed, status, created_at) "
-                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            + "submitted_by, certificate_id, computed_num, computed_den, "
+                            + "node_lo_index, node_hi_index, passed, status, created_at) "
+                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, measurement.measurementKey());
             ps.setString(2, measurement.instrumentId());
@@ -62,10 +66,21 @@ public class MeasurementRepository {
             ps.setBigDecimal(6, measurement.upperLimit());
             ps.setString(7, measurement.submittedBy());
             ps.setLong(8, measurement.certificateId());
-            ps.setBigDecimal(9, measurement.computedValue());
-            ps.setBoolean(10, measurement.passed());
-            ps.setString(11, measurement.status().name());
-            ps.setObject(12, JdbcTimes.toDb(measurement.createdAt()));
+            ps.setBigDecimal(9, new java.math.BigDecimal(measurement.computedNum()));
+            ps.setBigDecimal(10, new java.math.BigDecimal(measurement.computedDen()));
+            if (measurement.nodeLoIndex() == null) {
+                ps.setNull(11, java.sql.Types.INTEGER);
+            } else {
+                ps.setInt(11, measurement.nodeLoIndex());
+            }
+            if (measurement.nodeHiIndex() == null) {
+                ps.setNull(12, java.sql.Types.INTEGER);
+            } else {
+                ps.setInt(12, measurement.nodeHiIndex());
+            }
+            ps.setBoolean(13, measurement.passed());
+            ps.setString(14, measurement.status().name());
+            ps.setObject(15, JdbcTimes.toDb(measurement.createdAt()));
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();

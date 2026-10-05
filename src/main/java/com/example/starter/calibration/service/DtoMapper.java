@@ -5,8 +5,10 @@ import java.util.List;
 
 import com.example.starter.calibration.api.dto.CertificateResponse;
 import com.example.starter.calibration.api.dto.MeasurementResponse;
+import com.example.starter.calibration.api.dto.NodeResponse;
 import com.example.starter.calibration.api.dto.ReleaseRecordResponse;
 import com.example.starter.calibration.model.Certificate;
+import com.example.starter.calibration.model.CertificateNode;
 import com.example.starter.calibration.model.Measurement;
 import com.example.starter.calibration.model.MeasurementStatus;
 import com.example.starter.calibration.model.ReleaseRecord;
@@ -28,17 +30,23 @@ final class DtoMapper {
         return stripped.toPlainString();
     }
 
-    static CertificateResponse toResponse(Certificate cert) {
+    static CertificateResponse toResponse(Certificate cert, List<CertificateNode> nodes) {
         return new CertificateResponse(
                 cert.id(),
                 cert.instrumentId(),
+                cert.certType().name(),
                 cert.validFrom(),
                 cert.validTo(),
-                format(cert.a()),
-                format(cert.b()),
+                cert.a() == null ? null : format(cert.a()),
+                cert.b() == null ? null : format(cert.b()),
+                nodes == null ? null : nodes.stream().map(DtoMapper::toResponse).toList(),
                 cert.revoked(),
                 cert.revokedAt(),
                 cert.createdAt());
+    }
+
+    static NodeResponse toResponse(CertificateNode node) {
+        return new NodeResponse(format(node.raw()), format(node.corrected()));
     }
 
     static MeasurementResponse toResponse(Measurement m, boolean certificateRevoked,
@@ -54,12 +62,14 @@ final class DtoMapper {
                 format(m.upperLimit()),
                 m.submittedBy(),
                 m.certificateId(),
-                format(m.computedValue()),
+                m.computed().toExactString(),
                 m.displayValue().toPlainString(),
                 m.passed(),
                 m.status().name(),
                 usable,
                 m.createdAt(),
+                m.nodeLoIndex(),
+                m.nodeHiIndex(),
                 releases.stream().map(DtoMapper::toResponse).toList());
     }
 

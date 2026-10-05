@@ -4,8 +4,8 @@ import java.time.Instant;
 import java.util.List;
 
 /**
- * 测量明细响应。computedValue 为未舍入精确值；displayValue 为 HALF_UP 保留 4 位的显示值；
- * usable 表示“当前可用”（已放行且证书未撤销）。
+ * 测量明细响应。computedValue 为精确计算值（有限小数或 "分子/分母" 分数形式）；
+ * displayValue 为 HALF_UP 保留 4 位的显示值；usable 表示"当前可用"（已放行且证书未撤销）。
  *
  * @param id             测量记录 ID
  * @param measurementKey 业务测量键
@@ -16,12 +16,14 @@ import java.util.List;
  * @param upperLimit     合格上限（十进制字符串）
  * @param submittedBy    提交人
  * @param certificateId  匹配到的证书 ID
- * @param computedValue  未舍入计算值（十进制字符串）
+ * @param computedValue  精确计算值（十进制字符串或分数字符串）
  * @param displayValue   显示值，HALF_UP 4 位小数（十进制字符串）
- * @param passed         是否合格（基于未舍入值，含端点）
+ * @param passed         是否合格（基于精确分数，含端点）
  * @param status         状态：PENDING / RELEASED
  * @param usable         当前是否可用（已放行且证书未撤销）
  * @param createdAt      提交时间（UTC）
+ * @param nodeLoIndex    曲线插值区间左节点序号；线性证书为 null
+ * @param nodeHiIndex    曲线插值区间右节点序号；线性证书为 null
  * @param releases       放行历史
  */
 public record MeasurementResponse(
@@ -40,5 +42,7 @@ public record MeasurementResponse(
         String status,
         boolean usable,
         Instant createdAt,
+        Integer nodeLoIndex,
+        Integer nodeHiIndex,
         List<ReleaseRecordResponse> releases) {
 }

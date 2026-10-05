@@ -8,11 +8,11 @@ import java.util.Set;
 import java.util.UUID;
 
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
 import com.example.starter.calibration.api.ApiException;
 import com.example.starter.calibration.api.BatchRejectedException;
 import com.example.starter.calibration.api.ItemFailure;
+import com.example.starter.calibration.api.dto.ReleaseRequest;
 import com.example.starter.calibration.api.dto.ReleaseResponse;
 import com.example.starter.calibration.model.Certificate;
 import com.example.starter.calibration.model.Measurement;
@@ -33,22 +33,33 @@ public class ReleaseService {
     private final MeasurementRepository measurements;
     private final CertificateRepository certificates;
     private final ReleaseRepository releases;
+    private final IdempotencyService idempotency;
 
     public ReleaseService(MeasurementRepository measurements,
                           CertificateRepository certificates,
-                          ReleaseRepository releases) {
+                          ReleaseRepository releases,
+                          IdempotencyService idempotency) {
         this.measurements = measurements;
         this.certificates = certificates;
         this.releases = releases;
+        this.idempotency = idempotency;
     }
 
     /**
-     * 原子批量放行。每条结果必须：处于待放行、判定合格、证书仍有效、放行人不同于提交人。
-     * 行锁按测量键字典序获取，避免并发批次间死锁；证书行锁使撤销与放行按事务提交顺序生效。
+     * 批量放行（幂等入口）。requestId 同键同参重放首次响应，异参 409，失败不占键。
      */
-    @Transactional
-    public ReleaseResponse release(List<String> keys, String actor) {
+    public ReleaseResponse release(ReleaseRequest request, String actor) {
         String releaser = Inputs.requireText(actor, "X-Actor-Id");
+        return idempotency.execute(request.requestId(), "RELEASE", releaser,
+                "measurements", request, request.expectedVersion(),
+                () -> doRelease(request.keys(), releaser), ReleaseResponse.class);
+    }
+
+    /**
+     * 原子批量放行业务实现（在幂等事务内执行）。每条结果必须：处于待放行、判定合格、证书仍有效、
+     * 放行人不同于提交人。行锁按测量键字典序获取，避免并发批次间死锁；证书行锁使撤销与放行按事务提交顺序生效。
+     */
+    private ReleaseResponse doRelease(List<String> keys, String releaser) {
         if (keys == null || keys.isEmpty() || keys.size() > MAX_BATCH_SIZE) {
             throw ApiException.badRequest("批量放行条数必须为 1～" + MAX_BATCH_SIZE);
         }

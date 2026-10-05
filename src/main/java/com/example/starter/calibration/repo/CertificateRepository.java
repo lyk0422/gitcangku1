@@ -14,10 +14,11 @@ import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.stereotype.Repository;
 
 import com.example.starter.calibration.model.Certificate;
+import com.example.starter.calibration.model.CertificateType;
 
 /**
  * 校准证书持久化。证书创建后不可修改，仅可撤销；
- * 同一仪器的创建通过 instrument_lock 行锁串行化，保证并发下重叠区间最多一张成功。
+ * 同一仪器的创建通过 instrument_lock 行锁串行化，保证并发下重叠区间（不分证书类型）最多一张成功。
  */
 @Repository
 public class CertificateRepository {
@@ -25,6 +26,7 @@ public class CertificateRepository {
     private static final RowMapper<Certificate> MAPPER = (rs, rowNum) -> new Certificate(
             rs.getLong("id"),
             rs.getString("instrument_id"),
+            CertificateType.valueOf(rs.getString("cert_type")),
             JdbcTimes.fromDb(rs.getObject("valid_from", LocalDateTime.class)),
             JdbcTimes.fromDb(rs.getObject("valid_to", LocalDateTime.class)),
             rs.getBigDecimal("coeff_a"),
@@ -54,23 +56,32 @@ public class CertificateRepository {
     }
 
     /**
-     * 插入证书并返回生成的证书 ID。
+     * 插入证书并返回生成的证书 ID。CURVE 类型时 a/b 传 null。
      */
-    public long insert(String instrumentId, Instant validFrom, Instant validTo,
+    public long insert(String instrumentId, CertificateType certType, Instant validFrom, Instant validTo,
                        java.math.BigDecimal a, java.math.BigDecimal b, Instant createdAt) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
                     "INSERT INTO calibration_certificate "
-                            + "(instrument_id, valid_from, valid_to, coeff_a, offset_b, revoked, created_at) "
-                            + "VALUES (?, ?, ?, ?, ?, FALSE, ?)",
+                            + "(instrument_id, cert_type, valid_from, valid_to, coeff_a, offset_b, revoked, created_at) "
+                            + "VALUES (?, ?, ?, ?, ?, ?, FALSE, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, instrumentId);
-            ps.setObject(2, JdbcTimes.toDb(validFrom));
-            ps.setObject(3, JdbcTimes.toDb(validTo));
-            ps.setBigDecimal(4, a);
-            ps.setBigDecimal(5, b);
-            ps.setObject(6, JdbcTimes.toDb(createdAt));
+            ps.setString(2, certType.name());
+            ps.setObject(3, JdbcTimes.toDb(validFrom));
+            ps.setObject(4, JdbcTimes.toDb(validTo));
+            if (a == null) {
+                ps.setNull(5, java.sql.Types.DECIMAL);
+            } else {
+                ps.setBigDecimal(5, a);
+            }
+            if (b == null) {
+                ps.setNull(6, java.sql.Types.DECIMAL);
+            } else {
+                ps.setBigDecimal(6, b);
+            }
+            ps.setObject(7, JdbcTimes.toDb(createdAt));
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();
