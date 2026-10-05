@@ -47,6 +47,20 @@ public class ApiException extends RuntimeException {
     }
 
     /**
+     * 403：授权证据查询的操作者不被允许。
+     */
+    public static ApiException forbidden(String message) {
+        return new ApiException(HttpStatus.FORBIDDEN, message, null, null);
+    }
+
+    /**
+     * 422：语义校验失败（禁运截止早于簇创建、披露范围为空、存在未解决冲突、禁运未到期等）。
+     */
+    public static ApiException unprocessable(String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, message, null, null);
+    }
+
+    /**
      * 409：通用冲突（记录已存在、删除版本不匹配、requestId 异参复用）。
      */
     public static ApiException conflict(String message, Integer currentVersion) {

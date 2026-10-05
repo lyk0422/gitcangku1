@@ -60,11 +60,11 @@ public class ObservationController {
     }
 
     /**
-     * 查询当前内容；墓碑只返回删除状态和版本。
+     * 公开查询当前内容；禁运期内只返回禁运标记（不返回簇内容），墓碑只返回删除状态和版本。
      */
     @GetMapping("/{observationId}")
-    public ObservationResponse getCurrent(@PathVariable String observationId) {
-        return observationService.getCurrent(observationId);
+    public PublicObservationView getCurrent(@PathVariable String observationId) {
+        return observationService.getPublic(observationId);
     }
 
     /**

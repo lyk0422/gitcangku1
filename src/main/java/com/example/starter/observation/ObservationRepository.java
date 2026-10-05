@@ -4,6 +4,9 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
 
+import java.sql.Timestamp;
+import java.time.Instant;
+import java.util.Objects;
 import java.util.Optional;
 
 /**
@@ -61,14 +64,28 @@ public class ObservationRepository {
     }
 
     /**
-     * 插入新记录的当前状态（version = 1）。
+     * 插入新记录的当前状态（version = 1），同时记录 UTC 创建时刻（禁运截止校验基准）。
      */
-    public void insertCurrent(ObservationSnapshot snapshot) {
+    public void insertCurrent(ObservationSnapshot snapshot, Instant createdAtUtc) {
         jdbcTemplate.update(
-                "INSERT INTO observation_current (observation_id, location, reading, note, version, deleted, updated_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                "INSERT INTO observation_current (observation_id, location, reading, note, version, deleted, "
+                        + "updated_at, created_at_utc) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)",
                 snapshot.observationId(), snapshot.location(), snapshot.reading(), snapshot.note(),
-                snapshot.version(), snapshot.deleted());
+                snapshot.version(), snapshot.deleted(), Timestamp.from(createdAtUtc));
+    }
+
+    /**
+     * 读取记录的 UTC 创建时刻；记录不存在或创建时刻缺失（历史数据）时返回空。
+     */
+    public Optional<Instant> findCreatedAtUtc(String observationId) {
+        return jdbcTemplate.query(
+                        "SELECT created_at_utc FROM observation_current WHERE observation_id = ?",
+                        (rs, rowNum) -> {
+                            Timestamp createdAtUtc = rs.getTimestamp("created_at_utc");
+                            return createdAtUtc == null ? null : createdAtUtc.toInstant();
+                        },
+                        observationId)
+                .stream().filter(Objects::nonNull).findFirst();
     }
 
     /**

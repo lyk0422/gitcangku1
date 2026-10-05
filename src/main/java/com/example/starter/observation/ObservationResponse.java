@@ -19,7 +19,7 @@ public record ObservationResponse(
         boolean deleted,
         String location,
         String reading,
-        String note) {
+        String note) implements PublicObservationView {
 
     /**
      * 由快照构造响应；墓碑版本自动省略业务字段。

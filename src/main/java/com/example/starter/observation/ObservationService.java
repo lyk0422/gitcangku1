@@ -50,17 +50,29 @@ public class ObservationService {
     private final ObservationRepository observationRepository;
     private final RequestLogRepository requestLogRepository;
     private final ResolutionRepository resolutionRepository;
+    private final EmbargoRepository embargoRepository;
+    private final DisclosureRepository disclosureRepository;
+    private final OpenConflictRepository openConflictRepository;
+    private final OpenConflictRecorder openConflictRecorder;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public ObservationService(ObservationRepository observationRepository,
                               RequestLogRepository requestLogRepository,
                               ResolutionRepository resolutionRepository,
+                              EmbargoRepository embargoRepository,
+                              DisclosureRepository disclosureRepository,
+                              OpenConflictRepository openConflictRepository,
+                              OpenConflictRecorder openConflictRecorder,
                               ObjectMapper objectMapper,
                               Clock clock) {
         this.observationRepository = observationRepository;
         this.requestLogRepository = requestLogRepository;
         this.resolutionRepository = resolutionRepository;
+        this.embargoRepository = embargoRepository;
+        this.disclosureRepository = disclosureRepository;
+        this.openConflictRepository = openConflictRepository;
+        this.openConflictRecorder = openConflictRecorder;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -87,7 +99,7 @@ public class ObservationService {
         ObservationSnapshot snapshot = new ObservationSnapshot(request.observationId(), 1,
                 request.location(), request.reading(), request.note(), false);
         try {
-            observationRepository.insertCurrent(snapshot);
+            observationRepository.insertCurrent(snapshot, Instant.now(clock));
         } catch (DuplicateKeyException e) {
             // 并发创建同一 observationId：由主键串行化，后到者按冲突处理
             throw ApiException.conflict("observation already exists: " + request.observationId(), null);
@@ -128,6 +140,9 @@ public class ObservationService {
                 request.reading(), conflictFields);
         String mergedNote = mergeField("note", base.note(), current.note(), request.note(), conflictFields);
         if (!conflictFields.isEmpty()) {
+            // 未解决冲突属于诊断状态：独立事务登记，业务事务随后整体回滚、不写任何业务部分结果
+            openConflictRecorder.record(new OpenConflictRecord(observationId, List.copyOf(conflictFields),
+                    request.baseVersion(), current.version(), request.requestId(), Instant.now(clock)));
             throw ApiException.mergeConflict(conflictFields, current.version());
         }
 
@@ -141,6 +156,7 @@ public class ObservationService {
                 mergedLocation, mergedReading, mergedNote, false);
         observationRepository.updateCurrent(next);
         observationRepository.insertVersion(next);
+        recordAddendumIfReleased(next, request.requestId(), null);
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(next));
     }
 
@@ -171,6 +187,7 @@ public class ObservationService {
                 null, null, null, true);
         observationRepository.markDeleted(observationId, tombstone.version());
         observationRepository.insertVersion(tombstone);
+        recordAddendumIfReleased(tombstone, request.requestId(), null);
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(tombstone));
     }
 
@@ -182,6 +199,65 @@ public class ObservationService {
         ObservationSnapshot current = observationRepository.findCurrent(observationId)
                 .orElseThrow(() -> ApiException.notFound("observation not found: " + observationId));
         return ObservationResponse.of(current);
+    }
+
+    /**
+     * 公开查询：禁运期内（已设置禁运、未发布且当前时刻早于截止时刻，区间左闭右开）只返回禁运标记，
+     * 不返回任何簇内容；禁运到期或已发布后按正常当前内容返回。只读操作，不改变任何状态。
+     */
+    @Transactional(readOnly = true)
+    public PublicObservationView getPublic(String observationId) {
+        ObservationSnapshot current = observationRepository.findCurrent(observationId)
+                .orElseThrow(() -> ApiException.notFound("observation not found: " + observationId));
+        Optional<EmbargoRecord> embargo = activeEmbargo(observationId);
+        if (embargo.isPresent()) {
+            return new EmbargoedResponse(observationId, true, embargo.get().embargoUntilUtc());
+        }
+        return ObservationResponse.of(current);
+    }
+
+    /**
+     * 授权证据查询：禁运期内仅设置禁运的操作者可查看簇内容，其余操作者返回 403；
+     * 禁运到期、已发布或未设置禁运时与公开查询一致。只读操作，不改变任何状态。
+     */
+    @Transactional(readOnly = true)
+    public ObservationResponse getEvidence(String observationId, String operator) {
+        ObservationSnapshot current = observationRepository.findCurrent(observationId)
+                .orElseThrow(() -> ApiException.notFound("observation not found: " + observationId));
+        Optional<EmbargoRecord> embargo = activeEmbargo(observationId);
+        if (embargo.isPresent() && !embargo.get().operator().equals(operator)) {
+            throw ApiException.forbidden(
+                    "evidence query not authorized for operator on observation: " + observationId);
+        }
+        return ObservationResponse.of(current);
+    }
+
+    /**
+     * 判断观测记录当前是否处于禁运期内：已设置禁运、尚未生成首次披露快照、
+     * 且当前时刻早于截止时刻（左闭右开，到达截止时刻即失效）。
+     */
+    private Optional<EmbargoRecord> activeEmbargo(String observationId) {
+        Optional<EmbargoRecord> embargo = embargoRepository.find(observationId);
+        if (embargo.isEmpty()) {
+            return Optional.empty();
+        }
+        if (disclosureRepository.snapshotExists(observationId)) {
+            return Optional.empty();
+        }
+        if (!Instant.now(clock).isBefore(embargo.get().embargoUntilUtc())) {
+            return Optional.empty();
+        }
+        return embargo;
+    }
+
+    /**
+     * 首次发布后产生的新版本追加一条更正附页（同一事务内）；未发布时不做任何事。
+     * 调用方持有该观测记录的行锁，附页序号在同一观测记录内连续递增。
+     */
+    private void recordAddendumIfReleased(ObservationSnapshot version, String requestId, String operator) {
+        if (disclosureRepository.snapshotExists(version.observationId())) {
+            disclosureRepository.insertAddendum(version, requestId, operator, Instant.now(clock));
+        }
     }
 
     /**
@@ -256,11 +332,17 @@ public class ObservationService {
                 resolvedLocation, resolvedReading, resolvedNote, false);
         boolean contentChanged = !sameContent(merged, current);
         int newVersion = contentChanged ? current.version() + 1 : current.version();
+        ObservationSnapshot next = null;
         if (contentChanged) {
-            ObservationSnapshot next = new ObservationSnapshot(observationId, newVersion,
+            next = new ObservationSnapshot(observationId, newVersion,
                     resolvedLocation, resolvedReading, resolvedNote, false);
             observationRepository.updateCurrent(next);
             observationRepository.insertVersion(next);
+        }
+        // 显式解决成功：清除该观测记录的未解决冲突诊断状态（与解决结果同事务）
+        openConflictRepository.delete(observationId);
+        if (next != null) {
+            recordAddendumIfReleased(next, request.requestId(), request.operator());
         }
 
         ResolutionRecord record = new ResolutionRecord(
