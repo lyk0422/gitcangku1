@@ -40,12 +40,20 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @ActiveProfiles("test")
 class ExposureConcurrencyTest {
 
-    /** 固定时钟：所有并发申请落在同一 UTC 日，预占均保持 RESERVED（不触发到期）。 */
-    static class FixedClock extends Clock {
-        private final Instant fixed;
+    /** 可控时钟：默认固定于 BASE，可按毫秒推进（用于过期回收并发场景）。 */
+    static class MutableClock extends Clock {
+        private volatile Instant instant;
 
-        FixedClock(Instant fixed) {
-            this.fixed = fixed;
+        MutableClock(Instant instant) {
+            this.instant = instant;
+        }
+
+        void setInstant(Instant instant) {
+            this.instant = instant;
+        }
+
+        void advanceMillis(long millis) {
+            this.instant = instant.plusMillis(millis);
         }
 
         @Override
@@ -60,7 +68,7 @@ class ExposureConcurrencyTest {
 
         @Override
         public Instant instant() {
-            return fixed;
+            return instant;
         }
     }
 
@@ -71,8 +79,8 @@ class ExposureConcurrencyTest {
     static class TestClockConfig {
         @org.springframework.context.annotation.Bean
         @org.springframework.context.annotation.Primary
-        Clock fixedClock() {
-            return new FixedClock(BASE);
+        Clock mutableClock() {
+            return new MutableClock(BASE);
         }
     }
 
@@ -80,14 +88,22 @@ class ExposureConcurrencyTest {
     ExposureService service;
     @Autowired
     JdbcTemplate jdbc;
+    @Autowired
+    Clock clock;
+
+    private MutableClock mutableClock() {
+        return (MutableClock) clock;
+    }
 
     @BeforeEach
     void clean() {
         jdbc.update("DELETE FROM idempotency_record");
         jdbc.update("DELETE FROM exposure_reservation");
+        jdbc.update("DELETE FROM visitor_weight_guard");
         jdbc.update("DELETE FROM quota_visitor_ledger");
         jdbc.update("DELETE FROM quota_total_ledger");
         jdbc.update("DELETE FROM campaign");
+        mutableClock().setInstant(BASE);
     }
 
     @AfterAll
@@ -239,5 +255,104 @@ class ExposureConcurrencyTest {
         assertEquals(0, errors.get(), "并发同键重放不应报错");
         assertEquals(1, reservationIds.size(), "业务只执行一次");
         assertEquals(1, service.queryQuota("cap", "visitor-x", DAY).usedVisitor());
+    }
+
+    @Test
+    @DisplayName("同访客跨公告并发申请：共享滚动权重边界，权重和不超过 10")
+    void concurrentCrossCampaignApply_sharedWeightBoundary() throws Exception {
+        // 5 个新类型公告各权重 4：10 上限下恰好允许 2 个成功（4+4<=10，再加 4 即超）
+        for (int i = 0; i < 5; i++) {
+            service.createCampaign(new CreateCampaignRequest(
+                    "req-c-" + i, "wc" + i, 1000, 1000, 4, null));
+        }
+
+        int threads = 25;
+        ExecutorService pool = Executors.newFixedThreadPool(16);
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicInteger success = new AtomicInteger();
+        AtomicInteger rejected = new AtomicInteger();
+
+        for (int i = 0; i < threads; i++) {
+            final int idx = i;
+            pool.submit(() -> {
+                try {
+                    start.await();
+                    service.apply(new ApplyExposureRequest(
+                            "req-w-" + idx, "wc" + (idx % 5), "visitor-shared"));
+                    success.incrementAndGet();
+                } catch (ApiException ex) {
+                    if (ex.getStatus().value() == 429) {
+                        rejected.incrementAndGet();
+                    } else {
+                        throw ex;
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+        }
+        start.countDown();
+        pool.shutdown();
+        assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS), "并发任务应在超时前完成");
+
+        assertEquals(2, success.get(), "权重和不超过 10：恰好 2 个权重 4 申请成功");
+        assertEquals(threads - 2, rejected.get(), "其余请求必须为 429");
+        QuotaResponse quota = service.queryQuota("wc0", "visitor-shared", DAY);
+        assertEquals(8, quota.usedWeight(), "最终窗口权重和必须为 8");
+        assertEquals(2, quota.remainingWeight());
+    }
+
+    @Test
+    @DisplayName("过期回收与并发申请共享权重边界：过期预占不占权重，不超卖")
+    void concurrentApplyWithExpiredReservation_sharedWeightBoundary() throws Exception {
+        // 旧预占权重 5，推进时钟使其过期（60 秒 TTL）；随后并发申请权重 4
+        service.createCampaign(new CreateCampaignRequest("req-old", "wc-old", 1000, 1000, 5, null));
+        ReservationResponse old = service.apply(
+                new ApplyExposureRequest("req-a-old", "wc-old", "visitor-shared"));
+        mutableClock().advanceMillis(61_000L);
+
+        for (int i = 0; i < 5; i++) {
+            service.createCampaign(new CreateCampaignRequest(
+                    "req-c-" + i, "wc" + i, 1000, 1000, 4, null));
+        }
+
+        int threads = 25;
+        ExecutorService pool = Executors.newFixedThreadPool(16);
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicInteger success = new AtomicInteger();
+        AtomicInteger rejected = new AtomicInteger();
+
+        for (int i = 0; i < threads; i++) {
+            final int idx = i;
+            pool.submit(() -> {
+                try {
+                    start.await();
+                    service.apply(new ApplyExposureRequest(
+                            "req-w-" + idx, "wc" + (idx % 5), "visitor-shared"));
+                    success.incrementAndGet();
+                } catch (ApiException ex) {
+                    if (ex.getStatus().value() == 429) {
+                        rejected.incrementAndGet();
+                    } else {
+                        throw ex;
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+        }
+        start.countDown();
+        pool.shutdown();
+        assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS), "并发任务应在超时前完成");
+
+        assertEquals(2, success.get(), "过期预占已释放权重：恰好 2 个权重 4 申请成功");
+        assertEquals(threads - 2, rejected.get(), "其余请求必须为 429");
+
+        // 过期预占的日额度与权重均已释放
+        QuotaResponse oldQuota = service.queryQuota("wc-old", "visitor-shared", DAY);
+        assertEquals(0, oldQuota.usedTotal(), "过期预占的日额度应已释放");
+        assertEquals("EXPIRED", service.getReservation(old.reservationId()).status().name());
+        QuotaResponse quota = service.queryQuota("wc0", "visitor-shared", DAY);
+        assertEquals(8, quota.usedWeight(), "最终窗口权重和必须为 8（不含过期预占）");
     }
 }
