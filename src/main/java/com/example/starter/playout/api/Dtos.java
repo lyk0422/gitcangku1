@@ -60,35 +60,58 @@ public final class Dtos {
     public record RevokeGrantRequest(@NotBlank String requestId) {
     }
 
-    /** 草稿片段输入；id 为空时由系统生成。 */
+    /** 帧率：分子/分母，仅支持 24/1、25/1、30000/1001；原点为 Asia/Shanghai 业务日零点。 */
+    public record FrameRateDto(
+            @NotNull @Positive Integer num,
+            @NotNull @Positive Integer den) {
+    }
+
+    /**
+     * 草稿片段输入；id 为空时由系统生成。毫秒草稿使用 start/end（毫秒精度 ISO 8601）；
+     * 帧时钟草稿使用 startFrame/endFrame（非负整数帧号，结束大于开始，原点为业务日零点）。
+     * 同一份草稿不能混用两种坐标。
+     */
     public record SegmentInput(
             String id,
             @NotBlank String assetId,
-            @NotNull OffsetDateTime start,
-            @NotNull OffsetDateTime end) {
+            OffsetDateTime start,
+            OffsetDateTime end,
+            @PositiveOrZero Long startFrame,
+            @PositiveOrZero Long endFrame) {
     }
 
-    /** 整份替换草稿请求。 */
+    /** 整份替换草稿请求；frameRate 非空时按帧时钟坐标解释 segments，为空时按毫秒坐标。 */
     public record ReplaceDraftRequest(
             @NotBlank String requestId,
             @NotNull @PositiveOrZero Long expectedDraftVersion,
-            @NotNull List<@NotNull SegmentInput> segments) {
+            @NotNull List<@NotNull SegmentInput> segments,
+            FrameRateDto frameRate) {
     }
 
-    /** 草稿片段响应。 */
+    /**
+     * 草稿片段响应。帧时钟片段的 startFrame/endFrame 非空，start/end 为真实有理数时刻
+     * 向下取整后的毫秒显示值（仅显示用）；毫秒片段的 startFrame/endFrame 为 null。
+     */
     public record SegmentResponse(
             String id,
             String assetId,
             OffsetDateTime start,
-            OffsetDateTime end) {
+            OffsetDateTime end,
+            Long startFrame,
+            Long endFrame) {
     }
 
-    /** 草稿响应。 */
+    /**
+     * 草稿响应。timeBase 为 MS（毫秒坐标）或 FRAME（帧时钟坐标）；frameRate 仅 FRAME 时非空，
+     * 帧原点为该业务日 Asia/Shanghai 零点。
+     */
     public record DraftResponse(
             String channelId,
             String businessDay,
             long version,
-            List<SegmentResponse> segments) {
+            List<SegmentResponse> segments,
+            String timeBase,
+            FrameRateDto frameRate) {
     }
 
     /** 发布请求。 */
