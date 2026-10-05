@@ -5,12 +5,14 @@
 CREATE TABLE IF NOT EXISTS equipment (
     equipment_id VARCHAR(64) NOT NULL PRIMARY KEY,
     maintenance_period_minutes BIGINT NOT NULL,
+    equivalent_period_minutes BIGINT NULL,
     version BIGINT NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL
 );
 COMMENT ON TABLE equipment IS '设备主表：每台设备一行';
 COMMENT ON COLUMN equipment.equipment_id IS '设备唯一标识（客户端提供）';
-COMMENT ON COLUMN equipment.maintenance_period_minutes IS '保养周期（分钟），正整数，登记后不可修改';
+COMMENT ON COLUMN equipment.maintenance_period_minutes IS '物理保养周期（分钟），正整数，登记后不可修改';
+COMMENT ON COLUMN equipment.equivalent_period_minutes IS '等效寿命周期（等效分钟），正整数；NULL 表示未启用等效寿命口径';
 COMMENT ON COLUMN equipment.version IS '设备版本号，初始 1；新增读数/修订/完成保养均校验 expectedVersion 并加一';
 COMMENT ON COLUMN equipment.created_at IS '登记时刻（UTC）';
 
@@ -20,6 +22,7 @@ CREATE TABLE IF NOT EXISTS reading (
     reading_id VARCHAR(64) NOT NULL,
     sampled_at TIMESTAMP WITH TIME ZONE NOT NULL,
     cumulative_minutes BIGINT NOT NULL,
+    load_weight VARCHAR(8) NOT NULL DEFAULT 'NORMAL',
     revision_no INT NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL,
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL,
@@ -31,6 +34,7 @@ COMMENT ON COLUMN reading.equipment_id IS '所属设备标识';
 COMMENT ON COLUMN reading.reading_id IS '读数标识，设备内唯一';
 COMMENT ON COLUMN reading.sampled_at IS 'UTC 采样时刻；同设备同一时刻仅允许一条读数';
 COMMENT ON COLUMN reading.cumulative_minutes IS '当前累计工时（分钟），非负整数，随修订更新';
+COMMENT ON COLUMN reading.load_weight IS '负荷权重档位：NORMAL=1、HEAVY=2；历史旧读数默认 NORMAL';
 COMMENT ON COLUMN reading.revision_no IS '当前修订号，初始 1，每次修订加一';
 COMMENT ON COLUMN reading.created_at IS '读数登记时刻（UTC）';
 COMMENT ON COLUMN reading.updated_at IS '最近一次修订时刻（UTC）';
@@ -41,6 +45,7 @@ CREATE TABLE IF NOT EXISTS reading_revision (
     reading_id VARCHAR(64) NOT NULL,
     revision_no INT NOT NULL,
     cumulative_minutes BIGINT NOT NULL,
+    load_weight VARCHAR(8) NOT NULL,
     request_id VARCHAR(128) NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL,
     PRIMARY KEY (equipment_id, reading_id, revision_no)
@@ -50,6 +55,7 @@ COMMENT ON COLUMN reading_revision.equipment_id IS '所属设备标识';
 COMMENT ON COLUMN reading_revision.reading_id IS '读数标识';
 COMMENT ON COLUMN reading_revision.revision_no IS '修订号，从 1 开始递增';
 COMMENT ON COLUMN reading_revision.cumulative_minutes IS '该修订版本的累计工时（分钟）';
+COMMENT ON COLUMN reading_revision.load_weight IS '该修订版本生效时的负荷权重档位（NORMAL/HEAVY）';
 COMMENT ON COLUMN reading_revision.request_id IS '产生该修订的请求 requestId';
 COMMENT ON COLUMN reading_revision.created_at IS '该修订生效时刻（UTC）';
 
@@ -61,6 +67,8 @@ CREATE TABLE IF NOT EXISTS maintenance (
     anchor_revision_no INT NOT NULL,
     anchor_sampled_at TIMESTAMP WITH TIME ZONE NOT NULL,
     anchor_cumulative_minutes BIGINT NOT NULL,
+    latest_reading_id VARCHAR(64) NOT NULL,
+    anchor_equivalent_cumulative_minutes BIGINT NOT NULL,
     request_id VARCHAR(128) NOT NULL,
     completed_at TIMESTAMP WITH TIME ZONE NOT NULL
 );
@@ -72,6 +80,8 @@ COMMENT ON COLUMN maintenance.reading_id IS '锚点读数标识';
 COMMENT ON COLUMN maintenance.anchor_revision_no IS '锚点读数在保养完成时的修订号';
 COMMENT ON COLUMN maintenance.anchor_sampled_at IS '锚点读数的 UTC 采样时刻（快照）';
 COMMENT ON COLUMN maintenance.anchor_cumulative_minutes IS '锚点读数在保养完成时的累计工时快照（分钟）';
+COMMENT ON COLUMN maintenance.latest_reading_id IS '保养完成时刻设备最新读数标识（冻结，后续新增读数不改变）';
+COMMENT ON COLUMN maintenance.anchor_equivalent_cumulative_minutes IS '保养完成时刻的负荷加权等效累计快照（等效分钟，冻结，后续读数/修订不改变）';
 COMMENT ON COLUMN maintenance.request_id IS '完成保养请求的 requestId';
 COMMENT ON COLUMN maintenance.completed_at IS '保养完成登记时刻（UTC）';
 

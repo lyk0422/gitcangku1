@@ -80,7 +80,7 @@ class EquipmentConcurrencyTests {
         CountDownLatch gate = new CountDownLatch(1);
         String body = """
                 {"requestId":"cid-1","expectedVersion":1,"readingId":"r1",
-                 "sampledAt":"2026-01-01T10:00:00Z","cumulativeMinutes":100}
+                 "sampledAt":"2026-01-01T10:00:00Z","cumulativeMinutes":100,"loadWeight":"NORMAL"}
                 """;
         List<Future<MvcResult>> futures = new ArrayList<>();
         for (int i = 0; i < threads; i++) {
@@ -117,11 +117,11 @@ class EquipmentConcurrencyTests {
         register("eq-race", 1000);
         postJson("/api/equipment/eq-race/readings", """
                 {"requestId":"race-r1","expectedVersion":1,"readingId":"r1",
-                 "sampledAt":"2026-01-01T10:00:00Z","cumulativeMinutes":100}
+                 "sampledAt":"2026-01-01T10:00:00Z","cumulativeMinutes":100,"loadWeight":"NORMAL"}
                 """);
         postJson("/api/equipment/eq-race/readings", """
                 {"requestId":"race-r2","expectedVersion":2,"readingId":"r2",
-                 "sampledAt":"2026-01-01T11:00:00Z","cumulativeMinutes":200}
+                 "sampledAt":"2026-01-01T11:00:00Z","cumulativeMinutes":200,"loadWeight":"NORMAL"}
                 """);
 
         CountDownLatch gate = new CountDownLatch(1);
@@ -199,7 +199,7 @@ class EquipmentConcurrencyTests {
                     long version = Long.parseLong(body.replaceAll(".*\"version\":(\\d+).*", "$1"));
                     MvcResult write = postJson("/api/equipment/eq-par/readings", """
                             {"requestId":"par-%d","expectedVersion":%d,"readingId":"r-%d",
-                             "sampledAt":"2026-01-01T1%d:00:00Z","cumulativeMinutes":%d}
+                             "sampledAt":"2026-01-01T1%d:00:00Z","cumulativeMinutes":%d,"loadWeight":"NORMAL"}
                             """.formatted(index, version, index, index, 100L * (index + 1)));
                     if (write.getResponse().getStatus() == 201) {
                         return write;

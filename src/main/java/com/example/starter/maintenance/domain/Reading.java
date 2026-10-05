@@ -9,6 +9,7 @@ import java.time.Instant;
  * @param readingId          读数标识，设备内唯一
  * @param sampledAt          UTC 采样时刻
  * @param cumulativeMinutes  当前累计工时（分钟）
+ * @param loadWeight         负荷权重档位（NORMAL/HEAVY），历史旧读数为 NORMAL
  * @param revisionNo         当前修订号，初始 1
  */
 public record Reading(
@@ -16,5 +17,6 @@ public record Reading(
         String readingId,
         Instant sampledAt,
         long cumulativeMinutes,
+        String loadWeight,
         int revisionNo) {
 }
