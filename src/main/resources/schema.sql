@@ -1,12 +1,15 @@
 -- 公告曝光频控建表脚本；H2 MySQL 兼容模式自动执行，仅使用合成数据。
 
--- 公告表：campaign_id 唯一，额度在创建时固定（每 UTC 日总额度、每访客每日上限）
+-- 公告表：campaign_id 唯一，额度在创建时固定（每 UTC 日总额度、每访客每日上限）；
+-- attention_weight 为新类型公告的固定注意力权重（1~5），NULL 表示旧类型公告不参与滚动权重限制
 CREATE TABLE IF NOT EXISTS campaign (
     campaign_id            VARCHAR(64)  NOT NULL,
     daily_total_cap        INT          NOT NULL,
     per_visitor_daily_cap  INT          NOT NULL,
+    attention_weight       INT,
     created_at_utc         BIGINT       NOT NULL,
-    PRIMARY KEY (campaign_id)
+    PRIMARY KEY (campaign_id),
+    CHECK (attention_weight IS NULL OR attention_weight BETWEEN 1 AND 5)
 );
 
 -- 公告某 UTC 日的总额度账目：used_total 为当前占用数（RESERVED 与 CONFIRMED 合计），单位次
@@ -44,6 +47,13 @@ CREATE INDEX IF NOT EXISTS idx_reservation_campaign_day
     ON exposure_reservation (campaign_id, utc_date, status);
 CREATE INDEX IF NOT EXISTS idx_reservation_expiry
     ON exposure_reservation (campaign_id, status, expires_at_utc);
+
+-- 访客注意力权重锁表：每访客一行，申请新类型公告时 SELECT ... FOR UPDATE 持有，
+-- 使同一访客跨公告的并发申请共享同一滚动权重边界，不能各公告独立超卖
+CREATE TABLE IF NOT EXISTS visitor_weight_lock (
+    visitor_id  VARCHAR(64) NOT NULL,
+    PRIMARY KEY (visitor_id)
+);
 
 -- 写操作幂等记录：request_id 全局唯一，异参重放返回 409，失败不占键
 CREATE TABLE IF NOT EXISTS idempotency_record (

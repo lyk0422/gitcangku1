@@ -8,6 +8,7 @@ import com.example.starter.exposure.repo.IdempotencyRepository;
 import com.example.starter.exposure.repo.IdempotencyRepository.IdempotencyRecord;
 import com.example.starter.exposure.repo.LedgerRepository;
 import com.example.starter.exposure.repo.ReservationRepository;
+import com.example.starter.exposure.repo.WeightRepository;
 import com.example.starter.exposure.web.ApiException;
 import com.example.starter.exposure.web.ApplyExposureRequest;
 import com.example.starter.exposure.web.CampaignResponse;
@@ -23,7 +24,9 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Clock;
 import java.time.LocalDate;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.function.Supplier;
 
@@ -33,11 +36,25 @@ import java.util.function.Supplier;
  * <p>所有写操作以 requestId 为全局幂等键：同键同参重放原成功结果，异参 409；
  * 业务失败随事务回滚，不占幂等键。所有操作与额度查询先结算相关过期预占，
  * 不依赖后台定时器。终态竞争由行锁 + 状态 CAS 保证只允许一个终态。</p>
+ *
+ * <p>新类型公告（attentionWeight 1~5）的申请除原公告日总额、日访客上限外，
+ * 还须通过访客 600 秒滚动窗口权重裁决（窗口内权重和不超过 10）；权重归属时刻
+ * 固定为首次申请时刻，确认不刷新。同一访客的权重边界由 visitor_weight_lock
+ * 行锁跨公告共享，加锁顺序固定为 权重锁 -> 总账 -> 访客账，避免死锁。</p>
  */
 @Service
 public class ExposureServiceImpl implements ExposureService {
 
     static final int RESERVATION_TTL_MILLIS = 60_000;
+
+    /** 滚动权重窗口长度，单位毫秒：归属时刻 &gt; now - 600000 且 &lt;= now。 */
+    static final long WEIGHT_WINDOW_MILLIS = 600_000L;
+
+    /** 滚动窗口长度，单位秒（查询视图展示用）。 */
+    static final int WEIGHT_WINDOW_SECONDS = 600;
+
+    /** 滚动窗口内同一访客跨全部新类型公告的权重上限，单位权重点。 */
+    static final int MAX_WINDOW_WEIGHT = 10;
 
     /** 并发同键竞争时等待胜出事务提交的最大时长。 */
     private static final long IDEMPOTENT_WAIT_MILLIS = 10_000L;
@@ -46,6 +63,7 @@ public class ExposureServiceImpl implements ExposureService {
     private final CampaignRepository campaignRepository;
     private final ReservationRepository reservationRepository;
     private final LedgerRepository ledgerRepository;
+    private final WeightRepository weightRepository;
     private final IdempotencyRepository idempotencyRepository;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate txTemplate;
@@ -54,6 +72,7 @@ public class ExposureServiceImpl implements ExposureService {
                                CampaignRepository campaignRepository,
                                ReservationRepository reservationRepository,
                                LedgerRepository ledgerRepository,
+                               WeightRepository weightRepository,
                                IdempotencyRepository idempotencyRepository,
                                ObjectMapper objectMapper,
                                TransactionTemplate txTemplate) {
@@ -61,6 +80,7 @@ public class ExposureServiceImpl implements ExposureService {
         this.campaignRepository = campaignRepository;
         this.reservationRepository = reservationRepository;
         this.ledgerRepository = ledgerRepository;
+        this.weightRepository = weightRepository;
         this.idempotencyRepository = idempotencyRepository;
         this.objectMapper = objectMapper;
         this.txTemplate = txTemplate;
@@ -68,8 +88,13 @@ public class ExposureServiceImpl implements ExposureService {
 
     @Override
     public CampaignResponse createCampaign(CreateCampaignRequest request) {
-        String fingerprint = request.campaignId() + "|" + request.dailyTotalCap() + "|"
-                + request.perVisitorDailyCap();
+        Map<String, Object> params = new LinkedHashMap<>();
+        params.put("campaignId", request.campaignId());
+        params.put("dailyTotalCap", request.dailyTotalCap());
+        params.put("perVisitorDailyCap", request.perVisitorDailyCap());
+        params.put("attentionWeight", request.attentionWeight());
+        String fingerprint = fingerprint(Operation.CREATE_CAMPAIGN, "system",
+                request.campaignId(), params);
         return runIdempotent(request.requestId(), Operation.CREATE_CAMPAIGN, fingerprint,
                 CampaignResponse.class, () -> {
                     if (campaignRepository.findById(request.campaignId()).isPresent()) {
@@ -80,6 +105,7 @@ public class ExposureServiceImpl implements ExposureService {
                             request.campaignId(),
                             request.dailyTotalCap(),
                             request.perVisitorDailyCap(),
+                            request.attentionWeight(),
                             clock.millis());
                     try {
                         campaignRepository.insert(campaign);
@@ -94,12 +120,23 @@ public class ExposureServiceImpl implements ExposureService {
 
     @Override
     public ReservationResponse apply(ApplyExposureRequest request) {
-        String fingerprint = request.campaignId() + "|" + request.visitorId();
+        Map<String, Object> params = new LinkedHashMap<>();
+        params.put("campaignId", request.campaignId());
+        params.put("visitorId", request.visitorId());
+        String fingerprint = fingerprint(Operation.APPLY, request.visitorId(),
+                request.campaignId(), params);
         return runIdempotent(request.requestId(), Operation.APPLY, fingerprint,
                 ReservationResponse.class, () -> {
                     long now = clock.millis();
                     LocalDate utcDate = LocalDate.now(clock);
                     Campaign campaign = requireCampaign(request.campaignId());
+                    boolean weighted = campaign.attentionWeight() != null;
+
+                    // 新类型公告：先持访客权重锁，跨公告共享同一滚动权重边界
+                    if (weighted) {
+                        weightRepository.ensureLockRow(request.visitorId());
+                        weightRepository.lockVisitor(request.visitorId());
+                    }
 
                     // 先结算该公告相关过期预占并释放额度
                     settleExpired(campaign.campaignId(), now);
@@ -110,10 +147,16 @@ public class ExposureServiceImpl implements ExposureService {
                     int usedTotal = ledgerRepository.lockUsedTotal(campaign.campaignId(), utcDate);
                     int usedVisitor = ledgerRepository.lockUsedVisitor(
                             campaign.campaignId(), request.visitorId(), utcDate);
+                    int usedWeight = weighted
+                            ? weightRepository.sumWindowWeight(
+                                    request.visitorId(), now - WEIGHT_WINDOW_MILLIS, now)
+                            : 0;
 
-                    // 任一额度已满则 429，两个额度均不增加（尚未写入）
+                    // 三重裁决：日总额、日访客上限、滚动权重任一超限即 429，三套账都不增加
                     if (usedTotal + 1 > campaign.dailyTotalCap()
-                            || usedVisitor + 1 > campaign.perVisitorDailyCap()) {
+                            || usedVisitor + 1 > campaign.perVisitorDailyCap()
+                            || (weighted
+                                    && usedWeight + campaign.attentionWeight() > MAX_WINDOW_WEIGHT)) {
                         throw new ApiException(HttpStatus.TOO_MANY_REQUESTS,
                                 "exposure quota exhausted for campaign " + campaign.campaignId());
                     }
@@ -131,20 +174,32 @@ public class ExposureServiceImpl implements ExposureService {
                             now + RESERVATION_TTL_MILLIS,
                             null);
                     reservationRepository.insert(reservation);
-                    return ReservationResponse.from(reservation);
+
+                    // 首次响应冻结申请时刻的三套剩余额度；幂等重放不反映后续变化
+                    Integer remainingWeight = weighted
+                            ? MAX_WINDOW_WEIGHT - usedWeight - campaign.attentionWeight()
+                            : null;
+                    return ReservationResponse.from(reservation,
+                            campaign.dailyTotalCap() - usedTotal - 1,
+                            campaign.perVisitorDailyCap() - usedVisitor - 1,
+                            remainingWeight);
                 });
     }
 
     @Override
     public ReservationResponse confirm(String reservationId, ReservationActionRequest request) {
-        String fingerprint = reservationId;
+        Map<String, Object> params = new LinkedHashMap<>();
+        params.put("reservationId", reservationId);
+        String fingerprint = fingerprint(Operation.CONFIRM, "system", reservationId, params);
         return runIdempotent(request.requestId(), Operation.CONFIRM, fingerprint,
                 ReservationResponse.class, () -> transition(reservationId, true));
     }
 
     @Override
     public ReservationResponse cancel(String reservationId, ReservationActionRequest request) {
-        String fingerprint = reservationId;
+        Map<String, Object> params = new LinkedHashMap<>();
+        params.put("reservationId", reservationId);
+        String fingerprint = fingerprint(Operation.CANCEL, "system", reservationId, params);
         return runIdempotent(request.requestId(), Operation.CANCEL, fingerprint,
                 ReservationResponse.class, () -> transition(reservationId, false));
     }
@@ -171,20 +226,28 @@ public class ExposureServiceImpl implements ExposureService {
             settleExpired(campaignId, now);
 
             int usedTotal = ledgerRepository.getUsedTotal(campaignId, utcDate);
-            if (visitorId == null || visitorId.isBlank()) {
-                return new QuotaResponse(
-                        campaignId, null, utcDate,
-                        campaign.dailyTotalCap(), usedTotal,
-                        campaign.dailyTotalCap() - usedTotal,
-                        null, null, null, now);
+            Integer usedWeight = null;
+            Integer remainingWeight = null;
+            Integer perVisitorDailyCap = null;
+            Integer usedVisitor = null;
+            Integer remainingVisitor = null;
+            if (visitorId != null && !visitorId.isBlank()) {
+                usedVisitor = ledgerRepository.getUsedVisitor(campaignId, visitorId, utcDate);
+                perVisitorDailyCap = campaign.perVisitorDailyCap();
+                remainingVisitor = campaign.perVisitorDailyCap() - usedVisitor;
+                // 滚动权重与每日额度分别展示：权重为访客跨全部新类型公告的窗口占用
+                usedWeight = weightRepository.sumWindowWeight(
+                        visitorId, now - WEIGHT_WINDOW_MILLIS, now);
+                remainingWeight = MAX_WINDOW_WEIGHT - usedWeight;
             }
-            int usedVisitor = ledgerRepository.getUsedVisitor(campaignId, visitorId, utcDate);
             return new QuotaResponse(
                     campaignId, visitorId, utcDate,
                     campaign.dailyTotalCap(), usedTotal,
                     campaign.dailyTotalCap() - usedTotal,
-                    campaign.perVisitorDailyCap(), usedVisitor,
-                    campaign.perVisitorDailyCap() - usedVisitor,
+                    perVisitorDailyCap, usedVisitor, remainingVisitor,
+                    campaign.attentionWeight(),
+                    WEIGHT_WINDOW_SECONDS, MAX_WINDOW_WEIGHT,
+                    usedWeight, remainingWeight,
                     now);
         });
     }
@@ -197,6 +260,22 @@ public class ExposureServiceImpl implements ExposureService {
         APPLY,
         CONFIRM,
         CANCEL
+    }
+
+    /**
+     * 结构化幂等身份：操作、操作者、资源及全部参数以 JSON 对象序列化，
+     * 键值边界由 JSON 结构保证，避免分隔符碰撞。当前资源无乐观版本字段，
+     * expectedVersion 固定为 null；引入版本后由请求携带并纳入比较。
+     */
+    private String fingerprint(Operation operation, String operator, String resource,
+                               Map<String, Object> params) {
+        Map<String, Object> identity = new LinkedHashMap<>();
+        identity.put("operation", operation.name());
+        identity.put("operator", operator);
+        identity.put("resource", resource);
+        identity.put("expectedVersion", null);
+        identity.put("params", params);
+        return writeJson(identity);
     }
 
     /**
@@ -246,6 +325,7 @@ public class ExposureServiceImpl implements ExposureService {
 
     /**
      * 确认/取消状态机。调用前已持幂等键；行锁 + CAS 保证并发只有一个终态。
+     * 取消释放两级日额度；权重随状态流转自动退出窗口求和，无需额外账目。
      *
      * @param isConfirm true=确认，false=取消
      */
@@ -333,12 +413,6 @@ public class ExposureServiceImpl implements ExposureService {
         return campaignRepository.findById(campaignId)
                 .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
                         "campaign not found: " + campaignId));
-    }
-
-    private Reservation requireReservation(String reservationId) {
-        return reservationRepository.findById(reservationId)
-                .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
-                        "reservation not found: " + reservationId));
     }
 
     private String writeJson(Object value) {
