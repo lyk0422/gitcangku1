@@ -2,6 +2,8 @@ package com.example.starter.evidence;
 
 import com.example.starter.evidence.dto.CommandRequest;
 import com.example.starter.evidence.dto.CustodyChainView;
+import com.example.starter.evidence.dto.DoseLedgerView;
+import com.example.starter.evidence.dto.DoseLimitRegisterRequest;
 import com.example.starter.evidence.dto.EvidenceView;
 import com.example.starter.evidence.dto.IntakeRequest;
 import com.example.starter.evidence.dto.LoanCreateRequest;
@@ -129,12 +131,13 @@ public class EvidenceController {
 
     /**
      * 确认归还：仅借出时的保管人；完好回到 SEALED，异常进入 SEAL_BROKEN。
+     * 已登记光照上限且封条完好时须携带剂量段与期望版本；指纹为结构化比较。
      */
     @PostMapping("/{evidenceKey}/loans/return")
     public ResponseEntity<String> returnLoan(@RequestHeader(ACTOR_HEADER) @NotBlank String actorId,
                                              @PathVariable String evidenceKey,
                                              @Valid @RequestBody LoanReturnRequest request) {
-        String hash = idempotencyAdvisor.hash(EvidenceService.OP_LOAN_RETURN, actorId,
+        String hash = idempotencyAdvisor.hashStructured(EvidenceService.OP_LOAN_RETURN, actorId,
                 evidenceKey, request);
         StoredResponse response = idempotencyAdvisor.guard(request.commandKey(), hash,
                 () -> evidenceService.returnLoan(actorId, evidenceKey, request, hash));
@@ -163,6 +166,30 @@ public class EvidenceController {
     @GetMapping("/{evidenceKey}/custody-chain")
     public CustodyChainView custodyChain(@PathVariable String evidenceKey) {
         return evidenceService.custodyChain(evidenceKey);
+    }
+
+    /**
+     * 光照上限首次登记：仅当前保管人，证物须 SEALED，登记后不可变。
+     * 幂等键为 requestId，指纹含操作、操作者、资源、全部参数与期望版本（结构化比较）。
+     */
+    @PostMapping("/{evidenceKey}/dose-limit")
+    public ResponseEntity<String> registerDoseLimit(@RequestHeader(ACTOR_HEADER) @NotBlank String actorId,
+                                                    @PathVariable String evidenceKey,
+                                                    @Valid @RequestBody DoseLimitRegisterRequest request) {
+        String hash = idempotencyAdvisor.hashStructured(EvidenceService.OP_DOSE_LIMIT_REGISTER,
+                actorId, evidenceKey, request);
+        StoredResponse response = idempotencyAdvisor.guard(request.requestId(), hash,
+                () -> evidenceService.registerDoseLimit(actorId, evidenceKey, request, hash));
+        return toEntity(response);
+    }
+
+    /**
+     * 查询光照剂量明细：仅当前保管人可查。
+     */
+    @GetMapping("/{evidenceKey}/dose")
+    public DoseLedgerView doseDetail(@RequestHeader(ACTOR_HEADER) @NotBlank String actorId,
+                                     @PathVariable String evidenceKey) {
+        return evidenceService.doseDetail(actorId, evidenceKey);
     }
 
     private ResponseEntity<String> toEntity(StoredResponse response) {

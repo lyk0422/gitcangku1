@@ -4,6 +4,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
 
+import java.math.BigDecimal;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.LocalDateTime;
@@ -62,18 +63,31 @@ public class LoanRecordRepository {
 
     /**
      * 条件归还：仅当记录仍为 ACTIVE 时写入归还结果与归还时刻，历史不可覆盖。
+     * 已登记上限且封条完好的归还同时冻结当次与累计剂量；其余情况剂量列为 NULL。
      *
      * @return 是否成功归还（false 表示已被并发归还或记录不存在）
      */
-    public boolean completeReturn(long id, boolean sealPassed, String note, LocalDateTime returnedAt) {
+    public boolean completeReturn(long id, boolean sealPassed, String note, LocalDateTime returnedAt,
+                                  BigDecimal doseThisReturn, BigDecimal doseCumulativeAfter) {
         int updated = jdbc.update("""
                         UPDATE loan_record
-                        SET status = ?, seal_passed = ?, return_note = ?, returned_at = ?
+                        SET status = ?, seal_passed = ?, return_note = ?, returned_at = ?,
+                            dose_this_return = ?, dose_cumulative_after = ?
                         WHERE id = ? AND status = ?
                         """,
                 LoanStatus.RETURNED.name(), sealPassed ? 1 : 0, note, returnedAt,
+                doseThisReturn, doseCumulativeAfter,
                 id, LoanStatus.ACTIVE.name());
         return updated == 1;
+    }
+
+    /**
+     * 查询证物已核算剂量的归还记录（按发生顺序），用于剂量明细。
+     */
+    public List<LoanRecord> findDoseReturnsByEvidenceKey(String evidenceKey) {
+        return jdbc.query(
+                "SELECT * FROM loan_record WHERE evidence_key = ? AND dose_this_return IS NOT NULL ORDER BY id",
+                ROW_MAPPER, evidenceKey);
     }
 
     /**
@@ -111,6 +125,8 @@ public class LoanRecordRepository {
                     sealPassed == null ? null : sealPassed == 1,
                     rs.getString("return_note"),
                     rs.getObject("returned_at", LocalDateTime.class),
+                    rs.getBigDecimal("dose_this_return"),
+                    rs.getBigDecimal("dose_cumulative_after"),
                     rs.getObject("created_at", LocalDateTime.class));
         }
     }

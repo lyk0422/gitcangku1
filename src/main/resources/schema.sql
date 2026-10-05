@@ -54,6 +54,8 @@ CREATE TABLE IF NOT EXISTS loan_record (
     seal_passed TINYINT NULL COMMENT '归还封条核验结果：NULL 未归还 / 1 封条完好回到 SEALED / 0 异常进入 SEAL_BROKEN',
     return_note VARCHAR(512) NULL COMMENT '归还说明；NULL 表示未归还',
     returned_at DATETIME(6) NULL COMMENT '实际归还时刻（UTC）；NULL 表示未归还',
+    dose_this_return DECIMAL(38,9) NULL COMMENT '本次归还的光照剂量（勒克斯分钟），归还时冻结；NULL 表示未登记上限或封条异常未核算',
+    dose_cumulative_after DECIMAL(38,9) NULL COMMENT '本次归还后证物累计剂量（勒克斯分钟），归还时冻结；NULL 表示未登记上限或封条异常未核算',
     created_at DATETIME(6) NOT NULL COMMENT '记录创建时间，Asia/Shanghai',
     CONSTRAINT uk_loan_key UNIQUE (loan_key),
     KEY idx_loan_evidence (evidence_key),
@@ -65,10 +67,40 @@ CREATE TABLE IF NOT EXISTS command_log (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     command_key VARCHAR(64) NOT NULL COMMENT '幂等命令键，全局唯一',
     actor_id VARCHAR(64) NOT NULL COMMENT '发起操作人',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN/DOSE_LIMIT_REGISTER',
     request_hash VARCHAR(64) NOT NULL COMMENT '请求参数规范化后的 SHA-256，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行的 HTTP 状态码',
     response_body TEXT NOT NULL COMMENT '首次执行的响应体 JSON，重放时原样返回',
     created_at DATETIME(6) NOT NULL COMMENT '首次执行时间，Asia/Shanghai',
     CONSTRAINT uk_command_key UNIQUE (command_key)
+);
+
+-- 光照剂量账本：每件证物至多一本，随首次登记创建；保管权交接不清账。
+-- 累计剂量精确累加不舍入；达到上限（含等于）置 dose_blocked=1，证物回 SEALED 后新增借出 422，交接不受影响。
+CREATE TABLE IF NOT EXISTS dose_ledger (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    evidence_key VARCHAR(64) NOT NULL COMMENT '关联证物业务键，一证物一本账',
+    limit_lux_min DECIMAL(18,3) NOT NULL COMMENT '不可逆光照上限，单位勒克斯分钟，正值最多3位小数，登记后不可变',
+    cumulative_lux_min DECIMAL(38,9) NOT NULL DEFAULT 0 COMMENT '累计光照剂量，单位勒克斯分钟，精确累加不舍入',
+    dose_blocked TINYINT NOT NULL DEFAULT 0 COMMENT '是否达到上限：1 达到（DOSE_BLOCKED，新增借出 422，交接仍按原规则）/ 0 未达到',
+    registered_by VARCHAR(64) NOT NULL COMMENT '首次登记上限时的保管人',
+    version INT NOT NULL COMMENT '账本版本：登记为 1，每次剂量归还 +1；写操作须携带相等的期望版本',
+    created_at DATETIME(6) NOT NULL COMMENT '账本登记时间，Asia/Shanghai',
+    updated_at DATETIME(6) NOT NULL COMMENT '最近一次剂量变动时间，Asia/Shanghai',
+    CONSTRAINT uk_dose_ledger_evidence UNIQUE (evidence_key)
+);
+
+-- 光照剂量段：归还时按借出区间逐段冻结，只追加、不可变；重放归还不重复写入。
+CREATE TABLE IF NOT EXISTS dose_segment (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    evidence_key VARCHAR(64) NOT NULL COMMENT '关联证物业务键',
+    loan_key VARCHAR(64) NOT NULL COMMENT '关联借出业务键，归还时冻结',
+    segment_no INT NOT NULL COMMENT '段序号，按时间顺序从 1 开始',
+    start_at DATETIME(6) NOT NULL COMMENT '段起始时刻，UTC；首段必须等于实际借出时刻',
+    end_at DATETIME(6) NOT NULL COMMENT '段结束时刻，UTC，须晚于起始；末段必须等于实际归还时刻',
+    illuminance_lux DECIMAL(18,3) NOT NULL COMMENT '照度，单位勒克斯，非负最多3位小数',
+    dose_lux_min DECIMAL(38,9) NOT NULL COMMENT '本段剂量=照度×精确分钟数，单位勒克斯分钟，不舍入',
+    created_at DATETIME(6) NOT NULL COMMENT '记录创建时间，Asia/Shanghai',
+    CONSTRAINT uk_dose_segment_loan UNIQUE (loan_key, segment_no),
+    KEY idx_dose_segment_evidence (evidence_key)
 );

@@ -65,4 +65,26 @@ public class IdempotencyAdvisor {
             throw ApiException.conflict("资源键冲突，目标已存在");
         }
     }
+
+    /**
+     * 计算结构化请求指纹：操作类型、操作人、资源键与请求体作为 JSON 对象的独立字段，
+     * 整体规范化序列化后取 SHA-256；各分量边界由 JSON 结构保证，不存在分隔符碰撞。
+     * 请求体中的全部参数（含期望版本）均进入指纹。
+     */
+    public String hashStructured(String operation, String actorId, String resourceKey, Object request) {
+        try {
+            var node = objectMapper.createObjectNode();
+            node.put("operation", operation);
+            node.put("actorId", actorId == null ? "" : actorId);
+            node.put("resource", resourceKey == null ? "" : resourceKey);
+            node.set("request", objectMapper.valueToTree(request));
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            return HexFormat.of().formatHex(
+                    digest.digest(objectMapper.writeValueAsString(node).getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 不可用", e);
+        } catch (Exception e) {
+            throw new IllegalStateException("请求序列化失败", e);
+        }
+    }
 }
