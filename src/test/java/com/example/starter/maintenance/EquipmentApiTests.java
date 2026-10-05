@@ -60,7 +60,7 @@ class EquipmentApiTests {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {"requestId":"%s","expectedVersion":%d,"readingId":"%s",
-                                 "sampledAt":"%s","cumulativeMinutes":%d}
+                                 "sampledAt":"%s","cumulativeMinutes":%d,"loadType":"NORMAL"}
                                 """.formatted(requestId, expectedVersion, readingId, sampledAt,
                                 cumulativeMinutes)))
                 .andExpect(status().is(expectedStatus));
@@ -353,14 +353,14 @@ class EquipmentApiTests {
 
         MvcResult first = postJson("/api/equipment/eq-idem/readings", """
                 {"requestId":"idem-1","expectedVersion":1,"readingId":"r1",
-                 "sampledAt":"2026-01-01T10:00:00Z","cumulativeMinutes":100}
+                 "sampledAt":"2026-01-01T10:00:00Z","cumulativeMinutes":100,"loadType":"NORMAL"}
                 """);
         assert first.getResponse().getStatus() == 201;
 
         // 同键同参：重放原成功结果，业务效果不重复
         MvcResult replay = postJson("/api/equipment/eq-idem/readings", """
                 {"requestId":"idem-1","expectedVersion":1,"readingId":"r1",
-                 "sampledAt":"2026-01-01T10:00:00Z","cumulativeMinutes":100}
+                 "sampledAt":"2026-01-01T10:00:00Z","cumulativeMinutes":100,"loadType":"NORMAL"}
                 """);
         assert replay.getResponse().getStatus() == 201;
         assert replay.getResponse().getContentAsString()
@@ -375,7 +375,7 @@ class EquipmentApiTests {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {"requestId":"idem-1","expectedVersion":1,"readingId":"r1",
-                                 "sampledAt":"2026-01-01T10:00:00Z","cumulativeMinutes":101}
+                                 "sampledAt":"2026-01-01T10:00:00Z","cumulativeMinutes":101,"loadType":"NORMAL"}
                                 """))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("REQUEST_ID_CONFLICT"));

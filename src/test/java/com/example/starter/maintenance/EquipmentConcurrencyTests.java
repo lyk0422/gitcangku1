@@ -80,7 +80,7 @@ class EquipmentConcurrencyTests {
         CountDownLatch gate = new CountDownLatch(1);
         String body = """
                 {"requestId":"cid-1","expectedVersion":1,"readingId":"r1",
-                 "sampledAt":"2026-01-01T10:00:00Z","cumulativeMinutes":100}
+                 "sampledAt":"2026-01-01T10:00:00Z","cumulativeMinutes":100,"loadType":"NORMAL"}
                 """;
         List<Future<MvcResult>> futures = new ArrayList<>();
         for (int i = 0; i < threads; i++) {
@@ -117,11 +117,11 @@ class EquipmentConcurrencyTests {
         register("eq-race", 1000);
         postJson("/api/equipment/eq-race/readings", """
                 {"requestId":"race-r1","expectedVersion":1,"readingId":"r1",
-                 "sampledAt":"2026-01-01T10:00:00Z","cumulativeMinutes":100}
+                 "sampledAt":"2026-01-01T10:00:00Z","cumulativeMinutes":100,"loadType":"NORMAL"}
                 """);
         postJson("/api/equipment/eq-race/readings", """
                 {"requestId":"race-r2","expectedVersion":2,"readingId":"r2",
-                 "sampledAt":"2026-01-01T11:00:00Z","cumulativeMinutes":200}
+                 "sampledAt":"2026-01-01T11:00:00Z","cumulativeMinutes":200,"loadType":"NORMAL"}
                 """);
 
         CountDownLatch gate = new CountDownLatch(1);
@@ -199,7 +199,7 @@ class EquipmentConcurrencyTests {
                     long version = Long.parseLong(body.replaceAll(".*\"version\":(\\d+).*", "$1"));
                     MvcResult write = postJson("/api/equipment/eq-par/readings", """
                             {"requestId":"par-%d","expectedVersion":%d,"readingId":"r-%d",
-                             "sampledAt":"2026-01-01T1%d:00:00Z","cumulativeMinutes":%d}
+                             "sampledAt":"2026-01-01T1%d:00:00Z","cumulativeMinutes":%d,"loadType":"NORMAL"}
                             """.formatted(index, version, index, index, 100L * (index + 1)));
                     if (write.getResponse().getStatus() == 201) {
                         return write;
@@ -219,5 +219,72 @@ class EquipmentConcurrencyTests {
                 .andExpect(jsonPath("$.length()").value(threads));
         mockMvc.perform(get("/api/equipment/eq-par/status"))
                 .andExpect(jsonPath("$.version").value(1 + threads));
+    }
+
+    /** 并发修订与完成保养（启用等效寿命）：恰有一个成功；保养冻结的等效快照与最终读数状态一致。 */
+    @Test
+    void concurrentReviseVsMaintenance_equivalentSnapshotConsistent() throws Exception {
+        mockMvc.perform(post("/api/equipment")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"requestId":"reg-eqr","equipmentId":"eq-eqr","maintenancePeriodMinutes":100000,
+                                 "equivalentPeriodMinutes":10000}
+                                """))
+                .andExpect(status().isCreated());
+        postJson("/api/equipment/eq-eqr/readings", """
+                {"requestId":"eqr-r1","expectedVersion":1,"readingId":"r1",
+                 "sampledAt":"2026-01-01T10:00:00Z","cumulativeMinutes":100,"loadType":"NORMAL"}
+                """);
+        postJson("/api/equipment/eq-eqr/readings", """
+                {"requestId":"eqr-r2","expectedVersion":2,"readingId":"r2",
+                 "sampledAt":"2026-01-01T11:00:00Z","cumulativeMinutes":150,"loadType":"HEAVY"}
+                """);
+
+        CountDownLatch gate = new CountDownLatch(1);
+        Future<MvcResult> reviseFuture = executor.submit(() -> {
+            gate.await(5, TimeUnit.SECONDS);
+            return postJson("/api/equipment/eq-eqr/readings/r1/revisions", """
+                    {"requestId":"eqr-revise","expectedVersion":3,"cumulativeMinutes":80}
+                    """);
+        });
+        Future<MvcResult> maintenanceFuture = executor.submit(() -> {
+            gate.await(5, TimeUnit.SECONDS);
+            return postJson("/api/equipment/eq-eqr/maintenances", """
+                    {"requestId":"eqr-mnt","expectedVersion":3,"readingId":"r2","anchorRevisionNo":1}
+                    """);
+        });
+        gate.countDown();
+
+        MvcResult revise = reviseFuture.get(15, TimeUnit.SECONDS);
+        MvcResult maintenance = maintenanceFuture.get(15, TimeUnit.SECONDS);
+        int reviseStatus = revise.getResponse().getStatus();
+        int maintenanceStatus = maintenance.getResponse().getStatus();
+
+        // 按设备版本裁决：恰有一个成功
+        assertTrue(
+                (reviseStatus == 201 && maintenanceStatus == 409)
+                        || (reviseStatus == 409 && maintenanceStatus == 201),
+                "修订与保养并发应恰有一个成功，实际：revise=" + reviseStatus
+                        + ", maintenance=" + maintenanceStatus);
+        mockMvc.perform(get("/api/equipment/eq-eqr/status"))
+                .andExpect(jsonPath("$.version").value(4));
+
+        if (maintenanceStatus == 201) {
+            // 保养胜出：读数未被修订，冻结等效快照为修订前的 200（100×1 + 50×2）
+            mockMvc.perform(get("/api/equipment/eq-eqr/maintenances"))
+                    .andExpect(jsonPath("$.length()").value(1))
+                    .andExpect(jsonPath("$[0].anchorCumulativeMinutes").value(150))
+                    .andExpect(jsonPath("$[0].anchorEquivalentMinutes").value(200));
+            mockMvc.perform(get("/api/equipment/eq-eqr/status"))
+                    .andExpect(jsonPath("$.latestCumulativeMinutes").value(150))
+                    .andExpect(jsonPath("$.latestEquivalentMinutes").value(200));
+        } else {
+            // 修订胜出：无保养记录，等效累计按新值重算为 220（80×1 + 70×2）
+            mockMvc.perform(get("/api/equipment/eq-eqr/maintenances"))
+                    .andExpect(jsonPath("$.length()").value(0));
+            mockMvc.perform(get("/api/equipment/eq-eqr/status"))
+                    .andExpect(jsonPath("$.latestCumulativeMinutes").value(150))
+                    .andExpect(jsonPath("$.latestEquivalentMinutes").value(220));
+        }
     }
 }

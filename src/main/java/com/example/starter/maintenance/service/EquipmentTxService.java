@@ -44,14 +44,17 @@ public class EquipmentTxService {
 
     @Transactional
     public EquipmentResponse register(RegisterEquipmentRequest req) {
-        String fingerprint = req.equipmentId() + "|" + req.maintenancePeriodMinutes();
+        String fingerprint = Fingerprints.of("REGISTER_EQUIPMENT", req.operator(),
+                req.equipmentId(), req.maintenancePeriodMinutes(), req.equivalentPeriodMinutes());
         return idempotency.execute(req.requestId(), "REGISTER_EQUIPMENT", fingerprint,
                 EquipmentResponse.class, () -> {
                     if (repository.findEquipment(req.equipmentId()).isPresent()) {
                         throw ApiException.conflict("EQUIPMENT_EXISTS", "设备已存在：" + req.equipmentId());
                     }
-                    repository.insertEquipment(req.equipmentId(), req.maintenancePeriodMinutes(), clock.instant());
-                    return new EquipmentResponse(req.equipmentId(), req.maintenancePeriodMinutes(), 1L);
+                    repository.insertEquipment(req.equipmentId(), req.maintenancePeriodMinutes(),
+                            req.equivalentPeriodMinutes(), clock.instant());
+                    return new EquipmentResponse(req.equipmentId(), req.maintenancePeriodMinutes(),
+                            req.equivalentPeriodMinutes(), 1L);
                 });
     }
 
@@ -60,8 +63,9 @@ public class EquipmentTxService {
     @Transactional
     public ReadingResponse addReading(String equipmentId, AddReadingRequest req) {
         Equipment equipment = lockEquipment(equipmentId);
-        String fingerprint = equipmentId + "|" + req.readingId() + "|" + req.sampledAt()
-                + "|" + req.cumulativeMinutes() + "|" + req.expectedVersion();
+        String fingerprint = Fingerprints.of("ADD_READING", req.operator(), equipmentId,
+                req.readingId(), req.sampledAt().toString(), req.cumulativeMinutes(),
+                req.loadType().name(), req.expectedVersion());
         return idempotency.execute(req.requestId(), "ADD_READING", fingerprint,
                 ReadingResponse.class, () -> {
                     checkVersion(equipment, req.expectedVersion());
@@ -76,13 +80,13 @@ public class EquipmentTxService {
                     Instant now = clock.instant();
                     repository.insertReading(
                             new Reading(equipmentId, req.readingId(), req.sampledAt(),
-                                    req.cumulativeMinutes(), 1),
+                                    req.cumulativeMinutes(), req.loadType(), 1),
                             now);
                     repository.insertRevision(equipmentId, req.readingId(), 1,
                             req.cumulativeMinutes(), req.requestId(), now);
                     repository.incrementVersion(equipmentId);
                     return new ReadingResponse(equipmentId, req.readingId(), req.sampledAt(),
-                            req.cumulativeMinutes(), 1, false, equipment.version() + 1);
+                            req.cumulativeMinutes(), req.loadType(), 1, false, equipment.version() + 1);
                 });
     }
 
@@ -91,8 +95,8 @@ public class EquipmentTxService {
     @Transactional
     public ReadingResponse reviseReading(String equipmentId, String readingId, ReviseReadingRequest req) {
         Equipment equipment = lockEquipment(equipmentId);
-        String fingerprint = equipmentId + "|" + readingId + "|" + req.cumulativeMinutes()
-                + "|" + req.expectedVersion();
+        String fingerprint = Fingerprints.of("REVISE_READING", req.operator(), equipmentId,
+                readingId, req.cumulativeMinutes(), req.expectedVersion());
         return idempotency.execute(req.requestId(), "REVISE_READING", fingerprint,
                 ReadingResponse.class, () -> {
                     checkVersion(equipment, req.expectedVersion());
@@ -112,7 +116,8 @@ public class EquipmentTxService {
                             req.cumulativeMinutes(), req.requestId(), now);
                     repository.incrementVersion(equipmentId);
                     return new ReadingResponse(equipmentId, readingId, reading.sampledAt(),
-                            req.cumulativeMinutes(), newRevisionNo, false, equipment.version() + 1);
+                            req.cumulativeMinutes(), reading.loadType(), newRevisionNo, false,
+                            equipment.version() + 1);
                 });
     }
 
@@ -121,8 +126,8 @@ public class EquipmentTxService {
     @Transactional
     public MaintenanceResponse completeMaintenance(String equipmentId, CompleteMaintenanceRequest req) {
         Equipment equipment = lockEquipment(equipmentId);
-        String fingerprint = equipmentId + "|" + req.readingId() + "|" + req.anchorRevisionNo()
-                + "|" + req.expectedVersion();
+        String fingerprint = Fingerprints.of("COMPLETE_MAINTENANCE", req.operator(), equipmentId,
+                req.readingId(), req.anchorRevisionNo(), req.expectedVersion());
         return idempotency.execute(req.requestId(), "COMPLETE_MAINTENANCE", fingerprint,
                 MaintenanceResponse.class, () -> {
                     checkVersion(equipment, req.expectedVersion());
@@ -139,14 +144,17 @@ public class EquipmentTxService {
                         throw ApiException.unprocessable("ANCHOR_TIME_NOT_LATER",
                                 "保养锚点时间必须晚于上次保养锚点时间");
                     }
+                    // 设备行锁内计算并冻结锚点等效累计：与读数当前值一致，不受并发修订影响
+                    long anchorEquivalent = equivalentCumulativeUpTo(
+                            repository.listReadings(equipmentId), anchor.sampledAt());
                     Instant now = clock.instant();
                     long maintenanceId = repository.insertMaintenance(equipmentId, req.readingId(),
                             req.anchorRevisionNo(), anchor.sampledAt(), anchor.cumulativeMinutes(),
-                            req.requestId(), now);
+                            anchorEquivalent, req.requestId(), now);
                     repository.incrementVersion(equipmentId);
                     return new MaintenanceResponse(maintenanceId, equipmentId, req.readingId(),
                             req.anchorRevisionNo(), anchor.sampledAt(), anchor.cumulativeMinutes(),
-                            now, equipment.version() + 1);
+                            anchorEquivalent, now, equipment.version() + 1);
                 });
     }
 
@@ -156,16 +164,29 @@ public class EquipmentTxService {
     public StatusResponse getStatus(String equipmentId) {
         Equipment equipment = repository.findEquipment(equipmentId)
                 .orElseThrow(() -> equipmentNotFound(equipmentId));
-        Optional<Reading> latest = repository.findLatestReading(equipmentId);
+        List<Reading> readings = repository.listReadings(equipmentId);
+        Optional<Reading> latest = readings.isEmpty()
+                ? Optional.empty() : Optional.of(readings.get(readings.size() - 1));
         Optional<MaintenanceRecord> last = repository.findLastMaintenance(equipmentId);
         long latestCumulative = latest.map(Reading::cumulativeMinutes).orElse(0L);
         long anchorCumulative = last.map(MaintenanceRecord::anchorCumulativeMinutes).orElse(0L);
         long runMinutes = latestCumulative - anchorCumulative;
-        String status = runMinutes >= equipment.maintenancePeriodMinutes() ? "DUE" : "OK";
+        long physicalRemaining = equipment.maintenancePeriodMinutes() - runMinutes;
+        // 等效口径：最新等效累计按当前读数序列实时重算；保养基准取冻结快照，不受后续修订影响
+        long latestEquivalent = latest
+                .map(reading -> equivalentCumulativeUpTo(readings, reading.sampledAt()))
+                .orElse(0L);
+        long anchorEquivalent = last.map(MaintenanceRecord::anchorEquivalentMinutes).orElse(0L);
+        Long equivalentRemaining = equipment.equivalentPeriodMinutes() == null ? null
+                : equipment.equivalentPeriodMinutes() - (latestEquivalent - anchorEquivalent);
+        boolean due = physicalRemaining <= 0
+                || (equivalentRemaining != null && equivalentRemaining <= 0);
         return new StatusResponse(equipmentId, equipment.version(), equipment.maintenancePeriodMinutes(),
-                latest.map(Reading::sampledAt).orElse(null), latestCumulative,
+                equipment.equivalentPeriodMinutes(),
+                latest.map(Reading::sampledAt).orElse(null), latestCumulative, latestEquivalent,
                 last.map(MaintenanceRecord::anchorSampledAt).orElse(null), anchorCumulative,
-                runMinutes, status);
+                anchorEquivalent, runMinutes, physicalRemaining, equivalentRemaining,
+                due ? "DUE" : "OK");
     }
 
     @Transactional(readOnly = true)
@@ -174,7 +195,7 @@ public class EquipmentTxService {
                 .orElseThrow(() -> equipmentNotFound(equipmentId));
         return repository.listReadings(equipmentId).stream()
                 .map(reading -> new ReadingResponse(equipmentId, reading.readingId(), reading.sampledAt(),
-                        reading.cumulativeMinutes(), reading.revisionNo(),
+                        reading.cumulativeMinutes(), reading.loadType(), reading.revisionNo(),
                         repository.existsMaintenanceAnchoringReading(equipmentId, reading.readingId()),
                         equipment.version()))
                 .toList();
@@ -197,7 +218,8 @@ public class EquipmentTxService {
         return repository.listMaintenances(equipmentId).stream()
                 .map(record -> new MaintenanceResponse(record.maintenanceId(), equipmentId,
                         record.readingId(), record.anchorRevisionNo(), record.anchorSampledAt(),
-                        record.anchorCumulativeMinutes(), record.completedAt(), 0L))
+                        record.anchorCumulativeMinutes(), record.anchorEquivalentMinutes(),
+                        record.completedAt(), 0L))
                 .toList();
     }
 
@@ -231,5 +253,24 @@ public class EquipmentTxService {
             throw ApiException.unprocessable("READING_ORDER_VIOLATION",
                     "累计工时大于后一条读数（" + next.get().cumulativeMinutes() + "），违反单调不减约束");
         }
+    }
+
+    /**
+     * 等效累计（等效分钟）：按采样时刻升序，逐区间以 （本读数累计 - 前一累计） × 本读数负荷权重 累加；
+     * 首条读数以 0 为基准。只累计采样时刻不晚于 upToInclusive 的读数。
+     * 修订某读数后，本读数区间与后一条区间的贡献在下次计算时自然按新值重算。
+     */
+    private long equivalentCumulativeUpTo(List<Reading> orderedReadings, Instant upToInclusive) {
+        long equivalent = 0L;
+        long previousCumulative = 0L;
+        for (Reading reading : orderedReadings) {
+            if (reading.sampledAt().isAfter(upToInclusive)) {
+                break;
+            }
+            equivalent += (reading.cumulativeMinutes() - previousCumulative)
+                    * reading.loadType().weight();
+            previousCumulative = reading.cumulativeMinutes();
+        }
+        return equivalent;
     }
 }

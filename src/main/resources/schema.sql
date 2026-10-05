@@ -5,12 +5,14 @@
 CREATE TABLE IF NOT EXISTS equipment (
     equipment_id VARCHAR(64) NOT NULL PRIMARY KEY,
     maintenance_period_minutes BIGINT NOT NULL,
+    equivalent_period_minutes BIGINT NULL,
     version BIGINT NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL
 );
 COMMENT ON TABLE equipment IS '设备主表：每台设备一行';
 COMMENT ON COLUMN equipment.equipment_id IS '设备唯一标识（客户端提供）';
-COMMENT ON COLUMN equipment.maintenance_period_minutes IS '保养周期（分钟），正整数，登记后不可修改';
+COMMENT ON COLUMN equipment.maintenance_period_minutes IS '物理保养周期（分钟），正整数，登记后不可修改';
+COMMENT ON COLUMN equipment.equivalent_period_minutes IS '等效寿命周期（等效分钟），正整数；NULL 表示未启用等效寿命口径';
 COMMENT ON COLUMN equipment.version IS '设备版本号，初始 1；新增读数/修订/完成保养均校验 expectedVersion 并加一';
 COMMENT ON COLUMN equipment.created_at IS '登记时刻（UTC）';
 
@@ -20,6 +22,7 @@ CREATE TABLE IF NOT EXISTS reading (
     reading_id VARCHAR(64) NOT NULL,
     sampled_at TIMESTAMP WITH TIME ZONE NOT NULL,
     cumulative_minutes BIGINT NOT NULL,
+    load_weight INT NOT NULL DEFAULT 1,
     revision_no INT NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL,
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL,
@@ -31,6 +34,7 @@ COMMENT ON COLUMN reading.equipment_id IS '所属设备标识';
 COMMENT ON COLUMN reading.reading_id IS '读数标识，设备内唯一';
 COMMENT ON COLUMN reading.sampled_at IS 'UTC 采样时刻；同设备同一时刻仅允许一条读数';
 COMMENT ON COLUMN reading.cumulative_minutes IS '当前累计工时（分钟），非负整数，随修订更新';
+COMMENT ON COLUMN reading.load_weight IS '负荷权重：1=NORMAL，2=HEAVY；用于相邻区间等效分钟累计，历史读数默认 1';
 COMMENT ON COLUMN reading.revision_no IS '当前修订号，初始 1，每次修订加一';
 COMMENT ON COLUMN reading.created_at IS '读数登记时刻（UTC）';
 COMMENT ON COLUMN reading.updated_at IS '最近一次修订时刻（UTC）';
@@ -61,6 +65,7 @@ CREATE TABLE IF NOT EXISTS maintenance (
     anchor_revision_no INT NOT NULL,
     anchor_sampled_at TIMESTAMP WITH TIME ZONE NOT NULL,
     anchor_cumulative_minutes BIGINT NOT NULL,
+    anchor_equivalent_minutes BIGINT NOT NULL,
     request_id VARCHAR(128) NOT NULL,
     completed_at TIMESTAMP WITH TIME ZONE NOT NULL
 );
@@ -68,10 +73,11 @@ CREATE INDEX IF NOT EXISTS idx_maintenance_equipment ON maintenance (equipment_i
 COMMENT ON TABLE maintenance IS '保养记录：锚点时间须严格晚于上次保养锚点；作为锚点的读数不可再修订';
 COMMENT ON COLUMN maintenance.maintenance_id IS '保养记录自增主键';
 COMMENT ON COLUMN maintenance.equipment_id IS '所属设备标识';
-COMMENT ON COLUMN maintenance.reading_id IS '锚点读数标识';
+COMMENT ON COLUMN maintenance.reading_id IS '锚点读数标识（保养完成时冻结的基准读数）';
 COMMENT ON COLUMN maintenance.anchor_revision_no IS '锚点读数在保养完成时的修订号';
 COMMENT ON COLUMN maintenance.anchor_sampled_at IS '锚点读数的 UTC 采样时刻（快照）';
 COMMENT ON COLUMN maintenance.anchor_cumulative_minutes IS '锚点读数在保养完成时的累计工时快照（分钟）';
+COMMENT ON COLUMN maintenance.anchor_equivalent_minutes IS '锚点读数在保养完成时的等效累计快照（等效分钟），冻结后不受后续读数/修订影响';
 COMMENT ON COLUMN maintenance.request_id IS '完成保养请求的 requestId';
 COMMENT ON COLUMN maintenance.completed_at IS '保养完成登记时刻（UTC）';
 
@@ -86,6 +92,6 @@ CREATE TABLE IF NOT EXISTS idempotency_request (
 COMMENT ON TABLE idempotency_request IS '写操作幂等去重：同键同参重放原成功结果，同键异参返回 409';
 COMMENT ON COLUMN idempotency_request.request_id IS '全局唯一请求标识';
 COMMENT ON COLUMN idempotency_request.operation IS '操作类型（登记设备/新增读数/修订/完成保养）';
-COMMENT ON COLUMN idempotency_request.request_fingerprint IS '业务参数指纹（不含 requestId），用于同键异参判定';
+COMMENT ON COLUMN idempotency_request.request_fingerprint IS '结构化（JSON 数组）请求身份指纹：操作、操作者、资源及全部参数和期望版本，用于同键异参判定';
 COMMENT ON COLUMN idempotency_request.response_body IS '原成功响应报文（JSON），重放时原样返回';
 COMMENT ON COLUMN idempotency_request.created_at IS '首次成功处理时刻（UTC）';

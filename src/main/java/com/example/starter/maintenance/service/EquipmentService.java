@@ -33,7 +33,8 @@ public class EquipmentService {
     }
 
     public EquipmentResponse register(RegisterEquipmentRequest req) {
-        String fingerprint = req.equipmentId() + "|" + req.maintenancePeriodMinutes();
+        String fingerprint = Fingerprints.of("REGISTER_EQUIPMENT", req.operator(),
+                req.equipmentId(), req.maintenancePeriodMinutes(), req.equivalentPeriodMinutes());
         return recoverDuplicateKey(req.requestId(), "REGISTER_EQUIPMENT", fingerprint,
                 EquipmentResponse.class, () -> txService.register(req));
     }
