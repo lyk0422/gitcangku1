@@ -3,11 +3,14 @@ package com.example.starter.water;
 import com.example.starter.water.WaterRepository.AllocationRow;
 import com.example.starter.water.WaterRepository.CommandRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
+import com.example.starter.water.WaterRepository.DeliveryRow;
 import com.example.starter.water.WaterRepository.TransferRow;
 import com.example.starter.water.WaterRepository.WindowRow;
 import com.example.starter.water.dto.Dtos.AllocationResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
+import com.example.starter.water.dto.Dtos.DeliveryResponse;
+import com.example.starter.water.dto.Dtos.DeliverySummaryResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferResponse;
@@ -19,9 +22,12 @@ import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
+import java.time.Clock;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
@@ -40,20 +46,26 @@ public class WaterService {
     static final String STATUS_REQUESTED = "REQUESTED";
     static final String STATUS_APPROVED = "APPROVED";
     static final String STATUS_CANCELLED = "CANCELLED";
+    static final String DELIVERY_IN_TRANSIT = "IN_TRANSIT";
+    static final String DELIVERY_RECEIVED = "RECEIVED";
+    static final String DELIVERY_LOST = "LOST";
 
     private static final long NANOS_PER_SECOND = 1_000_000_000L;
+    private static final long NANOS_PER_MINUTE = 60L * NANOS_PER_SECOND;
     private static final Pattern AMOUNT_PATTERN = Pattern.compile("\\d{1,16}(\\.\\d{1,3})?");
     private static final Pattern KEY_PATTERN = Pattern.compile("[\\w.\\-:]{1,128}");
 
     private final WaterRepository repository;
     private final TransactionTemplate tx;
     private final ObjectMapper objectMapper;
+    private final Clock clock;
 
     public WaterService(WaterRepository repository, PlatformTransactionManager transactionManager,
-                        ObjectMapper objectMapper) {
+                        ObjectMapper objectMapper, Clock clock) {
         this.repository = repository;
         this.tx = new TransactionTemplate(transactionManager);
         this.objectMapper = objectMapper;
+        this.clock = clock;
     }
 
     // ------------------------------------------------------------------
@@ -158,6 +170,11 @@ public class WaterService {
             if (STATUS_CANCELLED.equals(allocation.status())) {
                 throw ApiException.conflict("ALLOCATION_ALREADY_CANCELLED", "申请已取消，不能重复取消");
             }
+            // 在途与已结单量不能被取消释放：存在发出记录的申请禁止取消
+            if (repository.sumDispatchedVolume(allocationKey).signum() > 0) {
+                throw ApiException.conflict("ALLOCATION_HAS_DELIVERIES",
+                        "申请已发出交付单，在途与已结单量不能通过取消释放");
+            }
             repository.updateAllocationStatus(allocation.id(), STATUS_CANCELLED, nowNanos());
             return toAllocationResponse(repository.findAllocationByKey(allocationKey));
         });
@@ -215,6 +232,13 @@ public class WaterService {
             if (lockedSource.heldAmount().compareTo(amount) < 0) {
                 throw ApiException.quotaExceeded("源申请当前持有额度 " + fmt(lockedSource.heldAmount())
                         + " 不足，无法转让 " + fmt(amount));
+            }
+            // 转让后源申请仍须至少覆盖累计发出量：在途与已结单量不能被转让释放
+            BigDecimal dispatched = repository.sumDispatchedVolume(sourceAllocationKey);
+            if (lockedSource.heldAmount().subtract(amount).compareTo(dispatched) < 0) {
+                throw ApiException.quotaExceeded("转让后源申请持有额度 "
+                        + fmt(lockedSource.heldAmount().subtract(amount)) + " 将低于累计发出量 "
+                        + fmt(dispatched) + "，在途与已结单量不能转让");
             }
             long now = nowNanos();
             repository.decrementHeldAmount(lockedSource.id(), amount, now);
@@ -315,6 +339,142 @@ public class WaterService {
         return new HistoryResponse(toWindowResponse(window, active), allocations, curtailments);
     }
 
+    /**
+     * 发出渠段在途交付单：绑定一条 APPROVED 申请，累计发出量不超过该申请当前批准量（持有额度）。
+     * 到水时刻 = 发出时刻 + 旅时；与转让、取消、限供在同一窗口行锁内联合判定，不会超发。
+     * 批准与到水是两个时点：发出仅记在途，不提前记为已交付。
+     */
+    public DeliveryResponse createDelivery(String requestId, String deliveryKey, String allocationKey,
+                                           String volume, String dispatchUtc, Integer transitMinutes,
+                                           Long expectedVersion, String actor) {
+        requireKey("requestId", requestId);
+        requireKey("deliveryKey", deliveryKey);
+        requireKey("allocationKey", allocationKey);
+        requireKey("X-Actor-Id", actor);
+        BigDecimal qty = parseAmount("volume", volume);
+        long dispatchNanos = parseInstant("dispatchUtc", dispatchUtc);
+        if (transitMinutes == null || transitMinutes < 1 || transitMinutes > 120) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "transitMinutes 必须为 1 至 120 的整数");
+        }
+        if (expectedVersion == null) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "expectedVersion 不能为空");
+        }
+        long arrivalNanos = dispatchNanos + transitMinutes.longValue() * NANOS_PER_MINUTE;
+        String params = structuredParams("DELIVERY_CREATE", actor, allocationKey,
+                Map.of("deliveryKey", deliveryKey, "volume", qty.toPlainString(),
+                        "dispatchNanos", dispatchNanos, "transitMinutes", transitMinutes,
+                        "expectedVersion", expectedVersion));
+        return runCommand("DELIVERY_CREATE", requestId, params, DeliveryResponse.class, () -> {
+            if (repository.findDeliveryByKey(deliveryKey) != null) {
+                throw ApiException.conflict("DELIVERY_KEY_REUSED", "deliveryKey 已被使用: " + deliveryKey);
+            }
+            AllocationRow allocation = repository.findAllocationByKey(allocationKey);
+            if (allocation == null) {
+                throw ApiException.notFound("ALLOCATION_NOT_FOUND", "配水申请不存在: " + allocationKey);
+            }
+            // 窗口行锁串行化发出、转让、取消与限供调整；锁内重读申请得到最新状态与持有额度
+            lockWindowOf(allocation);
+            allocation = repository.lockAllocationByKey(allocationKey);
+            if (!STATUS_APPROVED.equals(allocation.status())) {
+                throw ApiException.conflict("ALLOCATION_NOT_APPROVED", "只有 APPROVED 状态的申请可以发出交付单");
+            }
+            if (allocation.version() != expectedVersion) {
+                throw ApiException.conflict("VERSION_CONFLICT",
+                        "申请版本已变更，期望 " + expectedVersion + "，当前 " + allocation.version());
+            }
+            BigDecimal dispatched = repository.sumDispatchedVolume(allocationKey);
+            if (dispatched.add(qty).compareTo(allocation.heldAmount()) > 0) {
+                throw ApiException.quotaExceeded("累计发出量 " + fmt(dispatched.add(qty))
+                        + " 将超过该申请当前批准量 " + fmt(allocation.heldAmount()));
+            }
+            long now = nowNanos();
+            try {
+                repository.insertDelivery(deliveryKey, allocationKey, allocation.windowId(), qty,
+                        dispatchNanos, transitMinutes, arrivalNanos, actor, now);
+            } catch (DuplicateKeyException e) {
+                // 并发复用同一 deliveryKey（换 requestId）：事务回滚，无任何发出记录
+                throw ApiException.conflict("DELIVERY_KEY_REUSED", "deliveryKey 已被使用: " + deliveryKey);
+            }
+            repository.incrementAllocationVersion(allocation.id(), now);
+            return toDeliveryResponse(repository.findDeliveryByKey(deliveryKey));
+        });
+    }
+
+    /**
+     * 到水确认：仅当服务端时钟达到到水时刻后允许，报告 0 至发出量的收到量，差额记损失且不返还额度。
+     * 收到 0 记 LOST，其余记 RECEIVED；到时只开放确认，不自动假定全量收到，已结单不可重复确认。
+     */
+    public DeliveryResponse confirmDelivery(String requestId, String deliveryKey, String receivedVolume,
+                                            Long expectedVersion, String actor) {
+        requireKey("requestId", requestId);
+        requireKey("deliveryKey", deliveryKey);
+        requireKey("X-Actor-Id", actor);
+        BigDecimal received = parseReceivedAmount("receivedVolume", receivedVolume);
+        if (expectedVersion == null) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "expectedVersion 不能为空");
+        }
+        String params = structuredParams("DELIVERY_CONFIRM", actor, deliveryKey,
+                Map.of("receivedVolume", received.toPlainString(), "expectedVersion", expectedVersion));
+        return runCommand("DELIVERY_CONFIRM", requestId, params, DeliveryResponse.class, () -> {
+            DeliveryRow delivery = repository.findDeliveryByKey(deliveryKey);
+            if (delivery == null) {
+                throw ApiException.notFound("DELIVERY_NOT_FOUND", "交付单不存在: " + deliveryKey);
+            }
+            // 与发出、转让、限供在同一窗口行锁内联合判定；锁内重读交付单得到最新状态
+            WindowRow window = repository.lockWindowById(delivery.windowId());
+            if (window == null) {
+                throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + delivery.windowId());
+            }
+            delivery = repository.lockDeliveryByKey(deliveryKey);
+            if (delivery.version() != expectedVersion) {
+                throw ApiException.conflict("VERSION_CONFLICT",
+                        "交付单版本已变更，期望 " + expectedVersion + "，当前 " + delivery.version());
+            }
+            if (!DELIVERY_IN_TRANSIT.equals(delivery.status())) {
+                throw ApiException.conflict("DELIVERY_ALREADY_SETTLED", "交付单已结单，不能重复确认");
+            }
+            long now = toNanos(clock.instant());
+            if (now < delivery.arrivalNanos()) {
+                throw ApiException.conflict("DELIVERY_NOT_ARRIVED",
+                        "服务端时钟尚未到达到水时刻 " + toIso(delivery.arrivalNanos()) + "，不能提前确认");
+            }
+            if (received.compareTo(delivery.volume()) > 0) {
+                throw ApiException.badRequest("INVALID_ARGUMENT",
+                        "收到量不能超过发出量 " + fmt(delivery.volume()));
+            }
+            BigDecimal lost = delivery.volume().subtract(received);
+            String status = received.signum() == 0 ? DELIVERY_LOST : DELIVERY_RECEIVED;
+            repository.settleDelivery(delivery.id(), status, received, lost, now);
+            return toDeliveryResponse(repository.findDeliveryByKey(deliveryKey));
+        });
+    }
+
+    /** 查询申请交付汇总：批准、未发、在途、收到、损失分列，满足 发出 = 在途 + 收到 + 损失。 */
+    public DeliverySummaryResponse getDeliverySummary(String allocationKey) {
+        requireKey("allocationKey", allocationKey);
+        AllocationRow allocation = repository.findAllocationByKey(allocationKey);
+        if (allocation == null) {
+            throw ApiException.notFound("ALLOCATION_NOT_FOUND", "配水申请不存在: " + allocationKey);
+        }
+        List<DeliveryRow> deliveries = repository.listDeliveriesByAllocation(allocationKey);
+        BigDecimal inTransit = BigDecimal.ZERO;
+        BigDecimal received = BigDecimal.ZERO;
+        BigDecimal lost = BigDecimal.ZERO;
+        for (DeliveryRow row : deliveries) {
+            if (DELIVERY_IN_TRANSIT.equals(row.status())) {
+                inTransit = inTransit.add(row.volume());
+            } else {
+                received = received.add(row.receivedVolume());
+                lost = lost.add(row.lostVolume());
+            }
+        }
+        BigDecimal dispatched = inTransit.add(received).add(lost);
+        BigDecimal undispatched = allocation.heldAmount().subtract(dispatched);
+        List<DeliveryResponse> views = deliveries.stream().map(this::toDeliveryResponse).toList();
+        return new DeliverySummaryResponse(allocationKey, allocation.windowId(), fmt(allocation.heldAmount()),
+                fmt(dispatched), fmt(undispatched), fmt(inTransit), fmt(received), fmt(lost), views);
+    }
+
     // ------------------------------------------------------------------
     // 幂等命令框架
     // ------------------------------------------------------------------
@@ -378,7 +538,7 @@ public class WaterService {
 
     private AllocationResponse toAllocationResponse(AllocationRow row) {
         return new AllocationResponse(row.allocationKey(), row.windowId(), row.userId(), fmt(row.amount()),
-                fmt(row.heldAmount()), row.requester(), row.status(),
+                fmt(row.heldAmount()), row.requester(), row.status(), row.version(),
                 toIso(row.createdNanos()), toIso(row.updatedNanos()));
     }
 
@@ -469,5 +629,44 @@ public class WaterService {
         } catch (Exception e) {
             throw new IllegalStateException("响应反序列化失败", e);
         }
+    }
+
+    private DeliveryResponse toDeliveryResponse(DeliveryRow row) {
+        return new DeliveryResponse(row.deliveryKey(), row.allocationKey(), row.windowId(), fmt(row.volume()),
+                toIso(row.dispatchNanos()), row.transitMinutes(), toIso(row.arrivalNanos()),
+                row.receivedVolume() == null ? null : fmt(row.receivedVolume()),
+                row.lostVolume() == null ? null : fmt(row.lostVolume()),
+                row.status(), row.actor(), row.version(), toIso(row.createdNanos()),
+                row.confirmedNanos() == null ? null : toIso(row.confirmedNanos()));
+    }
+
+    /**
+     * 结构化命令身份：操作、操作者、资源与全部参数（含期望版本）序列化为 JSON 对象比较，
+     * 避免分隔符拼接造成的碰撞（如参数值本身含分隔符）。
+     */
+    private String structuredParams(String operation, String actor, String resource, Map<String, ?> extra) {
+        Map<String, Object> identity = new LinkedHashMap<>();
+        identity.put("operation", operation);
+        identity.put("actor", actor);
+        identity.put("resource", resource);
+        identity.putAll(extra);
+        try {
+            return objectMapper.writeValueAsString(identity);
+        } catch (Exception e) {
+            throw new IllegalStateException("命令身份序列化失败", e);
+        }
+    }
+
+    /** 解析收到量：十进制字符串，允许 0（记 LOST），最多 3 位小数。 */
+    static BigDecimal parseReceivedAmount(String field, String value) {
+        if (value == null || value.isBlank()) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", field + " 不能为空");
+        }
+        String trimmed = value.trim();
+        if (!AMOUNT_PATTERN.matcher(trimmed).matches()) {
+            throw ApiException.badRequest("INVALID_ARGUMENT",
+                    field + " 必须为不小于 0 的十进制字符串，最多 3 位小数: " + value);
+        }
+        return new BigDecimal(trimmed);
     }
 }

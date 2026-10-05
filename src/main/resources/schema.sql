@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS allocation (
     status VARCHAR(16) NOT NULL COMMENT '状态：REQUESTED 已申请 / APPROVED 已批准 / CANCELLED 已取消（不可恢复）',
     created_nanos BIGINT NOT NULL COMMENT '创建时间，UTC 纳秒时间戳',
     updated_nanos BIGINT NOT NULL COMMENT '最近状态变更时间，UTC 纳秒时间戳',
+    version BIGINT NOT NULL DEFAULT 0 COMMENT '乐观锁版本号，批准/取消/转让扣减/发出交付时递增，交付单以此做期望版本校验',
     CONSTRAINT uk_allocation_key UNIQUE (allocation_key),
     CONSTRAINT fk_allocation_window FOREIGN KEY (window_id) REFERENCES supply_window (id),
     CONSTRAINT chk_allocation_held CHECK (held_amount >= 0 AND held_amount <= amount)
@@ -49,9 +50,30 @@ CREATE TABLE IF NOT EXISTS transfer (
     CONSTRAINT fk_transfer_window FOREIGN KEY (window_id) REFERENCES supply_window (id)
 ) COMMENT='配水额度转让流水，与源扣减、目标批准同事务提交，创建后不可变，不提供撤销';
 
+CREATE TABLE IF NOT EXISTS delivery (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '在途交付单主键',
+    delivery_key VARCHAR(128) NOT NULL COMMENT '交付业务键，全局唯一；换 requestId 复用返回 409',
+    allocation_key VARCHAR(128) NOT NULL COMMENT '绑定的已批准申请业务键',
+    window_id BIGINT NOT NULL COMMENT '所属供水窗口 ID（冗余自申请，用于窗口行锁串行化）',
+    volume DECIMAL(19,3) NOT NULL COMMENT '发出水量，单位立方米，最多 3 位小数，大于 0',
+    dispatch_nanos BIGINT NOT NULL COMMENT '发出时刻，UTC 纳秒时间戳，由请求指定',
+    transit_minutes INT NOT NULL COMMENT '旅时，单位分钟，1 至 120，创建后不可变',
+    arrival_nanos BIGINT NOT NULL COMMENT '到水时刻 = 发出时刻 + 旅时，UTC 纳秒时间戳',
+    received_volume DECIMAL(19,3) NULL COMMENT '确认收到量，单位立方米，0 至发出量；未确认为 NULL',
+    lost_volume DECIMAL(19,3) NULL COMMENT '损失量 = 发出量 - 收到量，单位立方米；未确认为 NULL，不返还额度',
+    status VARCHAR(16) NOT NULL COMMENT '状态：IN_TRANSIT 在途 / RECEIVED 已收到 / LOST 全部损失；仅确认时流转，不随时间自动结单',
+    actor VARCHAR(128) NOT NULL COMMENT '发出操作人（X-Actor-Id）',
+    version BIGINT NOT NULL DEFAULT 0 COMMENT '乐观锁版本号，确认结单时由 0 递增为 1',
+    created_nanos BIGINT NOT NULL COMMENT '创建时间，UTC 纳秒时间戳',
+    confirmed_nanos BIGINT NULL COMMENT '确认时间，UTC 纳秒时间戳；未确认为 NULL',
+    CONSTRAINT uk_delivery_key UNIQUE (delivery_key),
+    CONSTRAINT fk_delivery_window FOREIGN KEY (window_id) REFERENCES supply_window (id),
+    CONSTRAINT chk_delivery_transit CHECK (transit_minutes >= 1 AND transit_minutes <= 120)
+) COMMENT='渠段在途交付单，绑定一条已批准申请；累计发出量不超过该申请当前批准量';
+
 CREATE TABLE IF NOT EXISTS command_log (
     command_key VARCHAR(128) PRIMARY KEY COMMENT '命令幂等键',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：WINDOW_CREATE/ALLOCATION_SUBMIT/ALLOCATION_APPROVE/ALLOCATION_CANCEL/CURTAILMENT_CREATE/CURTAILMENT_CANCEL/TRANSFER',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：WINDOW_CREATE/ALLOCATION_SUBMIT/ALLOCATION_APPROVE/ALLOCATION_CANCEL/CURTAILMENT_CREATE/CURTAILMENT_CANCEL/TRANSFER/DELIVERY_CREATE/DELIVERY_CONFIRM',
     params VARCHAR(2048) NOT NULL COMMENT '规范化请求参数串，用于同键改参检测',
     response MEDIUMTEXT NULL COMMENT '首次成功响应 JSON；命令事务提交前写入',
     created_nanos BIGINT NOT NULL COMMENT '创建时间，UTC 纳秒时间戳'
