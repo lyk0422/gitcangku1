@@ -2,6 +2,7 @@ package com.example.starter.water;
 
 import com.example.starter.water.WaterRepository.AllocationRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
+import com.example.starter.water.WaterRepository.DeliveryRow;
 import com.example.starter.water.WaterRepository.TransferRow;
 import com.example.starter.water.WaterRepository.WindowRow;
 import org.junit.jupiter.api.Test;
@@ -115,5 +116,49 @@ class PersistenceTests {
         assertEquals(new BigDecimal("3.000"), cancelled.amount());
         assertEquals(0, cancelled.heldAmount().compareTo(BigDecimal.ZERO));
         assertEquals(0, repo.sumApprovedAmount(windowId).compareTo(BigDecimal.ZERO));
+    }
+
+    @Test
+    void deliveryRowsAreReadableFromNewConnection() throws Exception {
+        String url = String.format(URL_TEMPLATE, UUID.randomUUID().toString().substring(0, 8));
+        SimpleDriverDataSource first = new SimpleDriverDataSource(new org.h2.Driver(), url, "sa", "");
+        try (Connection connection = first.getConnection()) {
+            ScriptUtils.executeSqlScript(connection, new ClassPathResource("schema.sql"));
+        }
+        WaterRepository repo1 = new WaterRepository(new JdbcTemplate(first));
+        long windowId = repo1.insertWindow("wk-delivery", "ch-delivery", 1_000L, 2_000L,
+                new BigDecimal("100.000"), 1L);
+        repo1.insertAllocation("ak-delivery", windowId, "user-1", new BigDecimal("50.000"), "alice", 2L);
+        AllocationRow allocation = repo1.findAllocationByKey("ak-delivery");
+        repo1.updateAllocationStatus(allocation.id(), "APPROVED", 3L);
+        // 发出 10、旅时 5 分钟；到水时刻 = 发出 + 300 秒
+        long dispatchNanos = 1_000_000_000_000L;
+        long arrivalNanos = dispatchNanos + 300L * 1_000_000_000L;
+        repo1.insertDelivery("dk-persist", "ak-delivery", windowId, new BigDecimal("10.000"),
+                dispatchNanos, 5, arrivalNanos, "alice", 4L);
+        repo1.touchAllocationForDispatch(allocation.id(), 4L);
+        // 到时确认收到 8、损失 2
+        repo1.confirmDelivery(repo1.findDeliveryByKey("dk-persist").id(), "RECEIVED",
+                new BigDecimal("8.000"), new BigDecimal("2.000"), arrivalNanos);
+
+        // 全新连接与仓储实例重读：交付单状态、版本与申请乐观锁版本保持一致
+        WaterRepository repo2 = new WaterRepository(
+                new JdbcTemplate(new SimpleDriverDataSource(new org.h2.Driver(), url, "sa", "")));
+        DeliveryRow delivery = repo2.findDeliveryByKey("dk-persist");
+        assertNotNull(delivery);
+        assertEquals("ak-delivery", delivery.allocationKey());
+        assertEquals(new BigDecimal("10.000"), delivery.volume());
+        assertEquals(5, delivery.travelMinutes());
+        assertEquals(arrivalNanos, delivery.arrivalNanos());
+        assertEquals("RECEIVED", delivery.status());
+        assertEquals(new BigDecimal("8.000"), delivery.receivedVolume());
+        assertEquals(new BigDecimal("2.000"), delivery.lostVolume());
+        assertEquals(1, delivery.version());
+        assertEquals(new BigDecimal("10.000"), repo2.sumDispatchedByAllocation("ak-delivery"));
+        assertEquals(1, repo2.listDeliveriesByAllocation("ak-delivery").size());
+        // 申请：批准 + 发出两次版本递增，持有额度不随发出/确认变化
+        AllocationRow reloaded = repo2.findAllocationByKey("ak-delivery");
+        assertEquals(2, reloaded.version());
+        assertEquals(new BigDecimal("50.000"), reloaded.heldAmount());
     }
 }

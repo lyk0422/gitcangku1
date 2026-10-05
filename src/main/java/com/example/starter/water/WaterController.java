@@ -3,9 +3,13 @@ package com.example.starter.water;
 import com.example.starter.water.dto.Dtos.AllocationResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
 import com.example.starter.water.dto.Dtos.CommandRequest;
+import com.example.starter.water.dto.Dtos.ConfirmDeliveryRequest;
 import com.example.starter.water.dto.Dtos.CreateWindowRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
+import com.example.starter.water.dto.Dtos.DeliveryResponse;
+import com.example.starter.water.dto.Dtos.DeliverySummaryResponse;
+import com.example.starter.water.dto.Dtos.DispatchDeliveryRequest;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
 import com.example.starter.water.dto.Dtos.SubmitAllocationRequest;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
@@ -102,5 +106,29 @@ public class WaterController {
     @GetMapping("/windows/{windowId}/history")
     public HistoryResponse getHistory(@PathVariable long windowId) {
         return service.getHistory(windowId);
+    }
+
+    /** 发出渠段在途交付单（仅申请人本人，requestId 幂等）。 */
+    @PostMapping("/deliveries")
+    public DeliveryResponse dispatchDelivery(@RequestBody DispatchDeliveryRequest request,
+                                             @RequestHeader("X-Actor-Id") String actor) {
+        return service.dispatchDelivery(request.requestId(), request.deliveryKey(), request.allocationKey(),
+                request.volume(), request.dispatchUtc(), request.travelMinutes(), request.expectedVersion(),
+                actor);
+    }
+
+    /** 到水确认（requestId 幂等，仅服务端时钟达到到水时刻后允许）。 */
+    @PostMapping("/deliveries/{deliveryKey}/confirm")
+    public DeliveryResponse confirmDelivery(@PathVariable String deliveryKey,
+                                            @RequestBody ConfirmDeliveryRequest request,
+                                            @RequestHeader("X-Actor-Id") String actor) {
+        return service.confirmDelivery(request.requestId(), deliveryKey, request.receivedVolume(),
+                request.expectedVersion(), actor);
+    }
+
+    /** 查询申请交付汇总：批准、未发、在途、收到、损失。 */
+    @GetMapping("/allocations/{allocationKey}/deliveries")
+    public DeliverySummaryResponse getDeliverySummary(@PathVariable String allocationKey) {
+        return service.getDeliverySummary(allocationKey);
     }
 }

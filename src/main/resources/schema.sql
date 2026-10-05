@@ -26,9 +26,10 @@ CREATE TABLE IF NOT EXISTS allocation (
     window_id BIGINT NOT NULL COMMENT '所属供水窗口 ID',
     user_id VARCHAR(128) NOT NULL COMMENT '用水户 ID',
     amount DECIMAL(19,3) NOT NULL COMMENT '原申请水量，单位立方米，最多 3 位小数，创建后不可改写',
-    held_amount DECIMAL(19,3) NOT NULL DEFAULT 0 COMMENT '当前持有额度，单位立方米；批准时等于原申请水量，取消时归零，转出时等额扣减',
+    held_amount DECIMAL(19,3) NOT NULL DEFAULT 0 COMMENT '当前持有额度，单位立方米；批准时等于原申请水量，转出时等额扣减，取消时仅保留累计发出量（在途与已结单量不释放）其余归零',
     requester VARCHAR(128) NOT NULL COMMENT '申请人（X-Actor-Id）',
     status VARCHAR(16) NOT NULL COMMENT '状态：REQUESTED 已申请 / APPROVED 已批准 / CANCELLED 已取消（不可恢复）',
+    version BIGINT NOT NULL DEFAULT 0 COMMENT '乐观锁版本，批准/取消/转让/发出交付等状态变更时递增，从 0 开始',
     created_nanos BIGINT NOT NULL COMMENT '创建时间，UTC 纳秒时间戳',
     updated_nanos BIGINT NOT NULL COMMENT '最近状态变更时间，UTC 纳秒时间戳',
     CONSTRAINT uk_allocation_key UNIQUE (allocation_key),
@@ -49,10 +50,30 @@ CREATE TABLE IF NOT EXISTS transfer (
     CONSTRAINT fk_transfer_window FOREIGN KEY (window_id) REFERENCES supply_window (id)
 ) COMMENT='配水额度转让流水，与源扣减、目标批准同事务提交，创建后不可变，不提供撤销';
 
+CREATE TABLE IF NOT EXISTS delivery (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '交付单主键',
+    delivery_key VARCHAR(128) NOT NULL COMMENT '交付单业务键，全局唯一；换 requestId 复用返回 409',
+    allocation_key VARCHAR(128) NOT NULL COMMENT '绑定的配水申请业务键（发出时须为 APPROVED）',
+    window_id BIGINT NOT NULL COMMENT '所属供水窗口 ID',
+    volume DECIMAL(19,3) NOT NULL COMMENT '发出水量，单位立方米，大于 0 且最多 3 位小数',
+    dispatch_nanos BIGINT NOT NULL COMMENT '发出时刻，UTC 纳秒时间戳，由客户端指定',
+    travel_minutes INT NOT NULL COMMENT '旅时，单位分钟，1 至 120，创建后不可变',
+    arrival_nanos BIGINT NOT NULL COMMENT '到水时刻 = 发出时刻 + 旅时，UTC 纳秒时间戳',
+    status VARCHAR(16) NOT NULL COMMENT '状态：IN_TRANSIT 在途 / RECEIVED 已接收 / LOST 全损（收到量为 0）',
+    received_volume DECIMAL(19,3) NULL COMMENT '确认收到水量，单位立方米，0 至发出量；未确认为 NULL',
+    lost_volume DECIMAL(19,3) NULL COMMENT '损失水量 = 发出量 - 收到量，单位立方米；未确认为 NULL；损失不返还可发额度',
+    confirmed_nanos BIGINT NULL COMMENT '到水确认时间（服务端时钟），UTC 纳秒时间戳；未确认为 NULL',
+    version BIGINT NOT NULL DEFAULT 0 COMMENT '乐观锁版本，从 0 开始，确认结单后递增',
+    actor VARCHAR(128) NOT NULL COMMENT '发出操作人（X-Actor-Id）',
+    created_nanos BIGINT NOT NULL COMMENT '创建时间，UTC 纳秒时间戳',
+    CONSTRAINT uk_delivery_key UNIQUE (delivery_key),
+    CONSTRAINT fk_delivery_window FOREIGN KEY (window_id) REFERENCES supply_window (id)
+) COMMENT='渠段在途交付单，到水确认后不可变；发出量 = 在途 + 收到 + 损失';
+
 CREATE TABLE IF NOT EXISTS command_log (
-    command_key VARCHAR(128) PRIMARY KEY COMMENT '命令幂等键',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：WINDOW_CREATE/ALLOCATION_SUBMIT/ALLOCATION_APPROVE/ALLOCATION_CANCEL/CURTAILMENT_CREATE/CURTAILMENT_CANCEL/TRANSFER',
-    params VARCHAR(2048) NOT NULL COMMENT '规范化请求参数串，用于同键改参检测',
+    command_key VARCHAR(128) PRIMARY KEY COMMENT '命令幂等键（新写入接口为 requestId）',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：WINDOW_CREATE/ALLOCATION_SUBMIT/ALLOCATION_APPROVE/ALLOCATION_CANCEL/CURTAILMENT_CREATE/CURTAILMENT_CANCEL/TRANSFER/DELIVERY_DISPATCH/DELIVERY_CONFIRM',
+    params VARCHAR(2048) NOT NULL COMMENT '规范化请求参数（新接口为 JSON 数组，含操作、操作者、资源、全部参数与期望版本），用于同键改参检测',
     response MEDIUMTEXT NULL COMMENT '首次成功响应 JSON；命令事务提交前写入',
     created_nanos BIGINT NOT NULL COMMENT '创建时间，UTC 纳秒时间戳'
 ) COMMENT='命令幂等日志，同键同参重放返回首次结果，同键改参返回 409';
