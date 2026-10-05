@@ -8,8 +8,11 @@ CREATE TABLE IF NOT EXISTS leg (
     origin          VARCHAR(64)  NOT NULL COMMENT '始发站代码',
     destination     VARCHAR(64)  NOT NULL COMMENT '到达站代码',
     status          VARCHAR(16)  NOT NULL DEFAULT 'OPEN' COMMENT '航段状态：OPEN/SEALED/ARRIVED',
+    leg_type        VARCHAR(16)  NOT NULL DEFAULT 'STANDARD' COMMENT '航段类型：STANDARD 普通航段（无舱位与重心约束）/COMPARTMENT 双舱航段（前舱-2米、后舱3米，每舱限重1000千克）',
     version         INT          NOT NULL DEFAULT 1 COMMENT '乐观锁版本，每次状态或装载变更后递增',
     sealed_manifest CLOB         NULL COMMENT '封舱时的只读装载清单（JSON 数组），未封舱为 NULL',
+    sealed_total_mass   DECIMAL(12,3) NULL COMMENT '封舱冻结的行李总质量（千克，精确到0.001），未封舱为 NULL',
+    sealed_total_moment DECIMAL(14,3) NULL COMMENT '封舱冻结的总纵向力矩（千克·米，精确到0.001），未封舱为 NULL',
     arrival_type    VARCHAR(16)  NULL COMMENT '到达确认类型：NULL 未到达，EXACT 精确到达，DIFF 差异到达',
     arrival_actual  CLOB         NULL COMMENT '差异到达实际到达袋号只读快照（JSON 数组），未差异到达为 NULL',
     created_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
@@ -23,6 +26,7 @@ CREATE TABLE IF NOT EXISTS bag (
     next_leg_index      INT          NOT NULL DEFAULT 0 COMMENT '待乘航段在行程中的下标（0 起），等于行程长度表示已完成；短卸不推进',
     status              VARCHAR(16)  NOT NULL DEFAULT 'IN_TRANSIT' COMMENT '行李状态：IN_TRANSIT 在途/SHORT_UNLOADED 短卸待补/RECOVERED 已补到在途/DELIVERED 已交付',
     loaded_leg_id       VARCHAR(64)  NULL COMMENT '当前已装载到的航段，未装载为 NULL',
+    mass_kg             DECIMAL(10,3) NULL COMMENT '行李质量（千克），正值、最多3位小数、登记后不可变；NULL 表示未登记质量，不能装入双舱航段',
     short_leg_id        VARCHAR(64)  NULL COMMENT '短卸缺失航段标识，仅 SHORT_UNLOADED 状态非 NULL',
     short_destination   VARCHAR(64)  NULL COMMENT '短卸应到站点代码，仅 SHORT_UNLOADED 状态非 NULL',
     short_registered_at TIMESTAMP WITH TIME ZONE NULL COMMENT '短卸登记时刻（UTC），仅 SHORT_UNLOADED 状态非 NULL',
@@ -42,10 +46,22 @@ CREATE TABLE IF NOT EXISTS bag_itinerary (
 
 -- 装载明细：bag_tag 为主键，保证一件行李同一时间只在一个航段的装载清单中
 CREATE TABLE IF NOT EXISTS load_record (
-    bag_tag   VARCHAR(64) NOT NULL COMMENT '行李牌号',
-    leg_id    VARCHAR(64) NOT NULL COMMENT '装载到的航段',
-    loaded_at TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '装载时间',
+    bag_tag     VARCHAR(64) NOT NULL COMMENT '行李牌号',
+    leg_id      VARCHAR(64) NOT NULL COMMENT '装载到的航段',
+    compartment VARCHAR(8)  NULL COMMENT '装载舱位：FWD 前舱（纵向位置-2米）/AFT 后舱（纵向位置3米），仅双舱航段非 NULL',
+    loaded_at   TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '装载时间',
     PRIMARY KEY (bag_tag)
+);
+
+-- 封舱逐件冻结快照：封舱成功时写入，之后（含到达、短卸）不再变化，支撑历史重心核对
+CREATE TABLE IF NOT EXISTS seal_item (
+    leg_id      VARCHAR(64)   NOT NULL COMMENT '航段标识',
+    bag_tag     VARCHAR(64)   NOT NULL COMMENT '行李牌号',
+    mass_kg     DECIMAL(12,3) NOT NULL COMMENT '封舱冻结的行李质量（千克，正、最多3位小数）',
+    compartment VARCHAR(8)    NOT NULL COMMENT '封舱冻结的舱位：FWD 前舱/AFT 后舱',
+    position_m  DECIMAL(6,3)  NOT NULL COMMENT '封舱冻结的舱位纵向位置（米，机身为原点，前负后正）',
+    moment_kgm  DECIMAL(14,3) NOT NULL COMMENT '封舱冻结的精确纵向力矩（千克·米）= 质量 × 位置',
+    PRIMARY KEY (leg_id, bag_tag)
 );
 
 -- 行李实际事件流：支撑完整轨迹查询，(bag_tag, seq) 唯一保证每件行李事件顺序不重复
@@ -64,7 +80,7 @@ CREATE TABLE IF NOT EXISTS bag_event (
 -- 幂等去重：仅记录成功请求；同 requestId 同参数重放原结果，异参数返回 409
 CREATE TABLE IF NOT EXISTS request_log (
     request_id      VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
-    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER',
+    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER/MOVE_COMPARTMENT',
     request_hash    VARCHAR(64)  NOT NULL COMMENT '请求参数（不含 requestId）的 SHA-256 摘要',
     response_status INT          NOT NULL COMMENT '原成功响应的 HTTP 状态码',
     response_body   CLOB         NOT NULL COMMENT '原成功响应体（JSON）',

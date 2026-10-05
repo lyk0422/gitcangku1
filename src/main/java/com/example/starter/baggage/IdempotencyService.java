@@ -50,7 +50,8 @@ public class IdempotencyService {
      */
     public <T> T execute(String requestId, String operation, int successStatus,
                          Object payload, Class<T> resultType, Supplier<T> action) {
-        String hash = sha256(writeJson(payload));
+        // 身份 = 操作 + 结构化参数（含操作者、资源、全部参数与期望版本），JSON 序列化避免分隔符碰撞
+        String hash = sha256(writeJson(new IdentityEnvelope(operation, payload)));
         Object lock = locks.computeIfAbsent(requestId, key -> new Object());
         synchronized (lock) {
             try {
@@ -118,5 +119,9 @@ public class IdempotencyService {
     }
 
     private record StoredRequest(String requestHash, String responseBody) {
+    }
+
+    /** 幂等身份信封：操作类型与请求参数的结构化组合，参与摘要计算。 */
+    private record IdentityEnvelope(String operation, Object payload) {
     }
 }

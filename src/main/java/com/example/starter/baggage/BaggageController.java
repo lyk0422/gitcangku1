@@ -14,6 +14,7 @@ import org.springframework.web.bind.annotation.RestController;
 import com.example.starter.baggage.BaggageDtos.ArriveRequest;
 import com.example.starter.baggage.BaggageDtos.ArriveResponse;
 import com.example.starter.baggage.BaggageDtos.BagResponse;
+import com.example.starter.baggage.BaggageDtos.BalanceResponse;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveRequest;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveResponse;
 import com.example.starter.baggage.BaggageDtos.LegDifferenceResponse;
@@ -21,6 +22,8 @@ import com.example.starter.baggage.BaggageDtos.LegResponse;
 import com.example.starter.baggage.BaggageDtos.LoadRequest;
 import com.example.starter.baggage.BaggageDtos.LoadResponse;
 import com.example.starter.baggage.BaggageDtos.ManifestResponse;
+import com.example.starter.baggage.BaggageDtos.MoveCompartmentRequest;
+import com.example.starter.baggage.BaggageDtos.MoveCompartmentResponse;
 import com.example.starter.baggage.BaggageDtos.RecoverRequest;
 import com.example.starter.baggage.BaggageDtos.RecoverResponse;
 import com.example.starter.baggage.BaggageDtos.RegisterBagRequest;
@@ -60,10 +63,23 @@ public class BaggageController {
         return baggageService.load(legId, request);
     }
 
-    /** 封舱：校验版本，保存只读装载清单并转 SEALED。 */
+    /** 封舱：校验版本，保存只读装载清单并转 SEALED；双舱航段校验总质量与重心。 */
     @PostMapping("/legs/{legId}/seal")
     public SealResponse seal(@PathVariable String legId, @Valid @RequestBody SealRequest request) {
         return baggageService.seal(legId, request);
+    }
+
+    /** 批量换舱：仅开放的双舱航段可用，按最终全体位置校验舱重，整批原子。 */
+    @PostMapping("/legs/{legId}/move-compartment")
+    public MoveCompartmentResponse moveCompartment(@PathVariable String legId,
+                                                   @Valid @RequestBody MoveCompartmentRequest request) {
+        return baggageService.moveCompartment(legId, request);
+    }
+
+    /** 航段重心平衡查询：开放时实时计算，封舱后返回冻结快照。 */
+    @GetMapping("/legs/{legId}/balance")
+    public BalanceResponse getBalance(@PathVariable String legId) {
+        return baggageService.getBalance(legId);
     }
 
     /** 到达确认：实际袋号集合须与封舱清单完全一致。 */
