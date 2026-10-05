@@ -45,6 +45,11 @@ class BatchSplitLineageTest {
 
     @BeforeEach
     void cleanTables() {
+        jdbc.update("DELETE FROM request_log");
+        jdbc.update("DELETE FROM weighing");
+        jdbc.update("DELETE FROM batch_recipe_binding");
+        jdbc.update("DELETE FROM recipe_ingredient");
+        jdbc.update("DELETE FROM recipe_version");
         jdbc.update("DELETE FROM command_log");
         jdbc.update("DELETE FROM approval");
         jdbc.update("DELETE FROM recall");

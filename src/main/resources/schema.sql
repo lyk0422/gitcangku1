@@ -57,6 +57,59 @@ CREATE TABLE IF NOT EXISTS command_log (
     CONSTRAINT pk_command_log PRIMARY KEY (command_type, command_key)
 );
 
+-- 配方版本：声明 2～6 种成分的质量百分比，创建后不可修改。
+CREATE TABLE IF NOT EXISTS recipe_version (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    recipe_key VARCHAR(64) NOT NULL COMMENT '配方业务键，与版本号联合唯一',
+    version INT NOT NULL COMMENT '配方版本号，从 1 开始；同一 recipe_key 下不可重复、不可改写',
+    created_at VARCHAR(40) NOT NULL COMMENT '创建时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_recipe_version UNIQUE (recipe_key, version)
+);
+
+CREATE TABLE IF NOT EXISTS recipe_ingredient (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    recipe_key VARCHAR(64) NOT NULL COMMENT '所属配方业务键',
+    recipe_version INT NOT NULL COMMENT '所属配方版本号',
+    ingredient VARCHAR(128) NOT NULL COMMENT '成分名称，同一配方版本内唯一',
+    percentage DECIMAL(12,4) NOT NULL COMMENT '质量百分比，正值、最多 4 位小数；同版本全部成分之和恰为 100',
+    seq INT NOT NULL COMMENT '成分在创建请求中的顺序，从 1 开始'
+);
+
+-- 批次配方绑定：每批至多一条，绑定后不可改写；weighing_version 为称量链乐观版本。
+CREATE TABLE IF NOT EXISTS batch_recipe_binding (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    batch_key VARCHAR(64) NOT NULL COMMENT '所属批次业务键，全局唯一（每批至多绑定一次）',
+    recipe_key VARCHAR(64) NOT NULL COMMENT '绑定的配方业务键，绑定后不可修改',
+    recipe_version INT NOT NULL COMMENT '绑定的配方版本号，绑定后不可修改',
+    target_mass DECIMAL(24,6) NOT NULL COMMENT '目标总质量，单位克，正值、最多 6 位小数',
+    weighing_version INT NOT NULL COMMENT '称量链版本，从 0 开始；每次有效称量/更正后 +1，用于期望版本校验',
+    created_at VARCHAR(40) NOT NULL COMMENT '绑定时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_binding_batch UNIQUE (batch_key)
+);
+
+-- 称量记录：只增不改；更正通过新记录替代旧记录（superseded_by 标记失效），有效链为 superseded_by IS NULL。
+CREATE TABLE IF NOT EXISTS weighing (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键，同时作为称量提交顺序依据',
+    batch_key VARCHAR(64) NOT NULL COMMENT '所属批次业务键',
+    ingredient VARCHAR(128) NOT NULL COMMENT '成分名称，必须属于绑定配方的成分',
+    amount DECIMAL(24,6) NOT NULL COMMENT '称量值（更正记录为替代值），单位克，正值、最多 6 位小数',
+    source VARCHAR(16) NOT NULL COMMENT '来源：MANUAL 人工称量 / CORRECTION 更正 / SPLIT_INHERIT 拆分继承',
+    supersedes_id BIGINT NULL COMMENT '更正时指向被替代的称量记录 id；非更正为 NULL',
+    superseded_by BIGINT NULL COMMENT '被更正记录替代时指向更正记录 id；NULL 表示当前有效',
+    operator_id VARCHAR(64) NOT NULL COMMENT '操作人标识；拆分继承时为拆分请求的操作人',
+    created_at VARCHAR(40) NOT NULL COMMENT '记录时间，ISO-8601 UTC instant 字符串'
+);
+
+-- 新增写请求幂等日志：仅成功请求落键，失败不占键；身份为结构化 JSON，避免分隔符碰撞。
+CREATE TABLE IF NOT EXISTS request_log (
+    request_id VARCHAR(64) NOT NULL COMMENT '请求幂等键，全局唯一；同键同身份重放返回首次响应，同键异身份返回 409',
+    identity_json TEXT NOT NULL COMMENT '结构化身份 JSON：操作、操作者、资源、全部参数与期望版本',
+    response_status INT NOT NULL COMMENT '首次执行成功的 HTTP 状态码',
+    response_body TEXT NOT NULL COMMENT '首次执行成功的响应 JSON 快照',
+    created_at VARCHAR(40) NOT NULL COMMENT '首次执行时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT pk_request_log PRIMARY KEY (request_id)
+);
+
 -- 拆分血缘：仅记录父子追溯关系，不涉及数量分摊；关系创建后不可改写。
 CREATE TABLE IF NOT EXISTS batch_lineage (
     id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键，同时作为拆分关系创建顺序依据',

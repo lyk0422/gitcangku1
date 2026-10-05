@@ -61,13 +61,19 @@ public class BatchService {
     private final BatchRepository repo;
     private final TransactionTemplate tx;
     private final ObjectMapper objectMapper;
+    private final RecipeService recipeService;
+    private final LineageGuard lineageGuard;
 
     public BatchService(BatchRepository repo,
                         PlatformTransactionManager transactionManager,
-                        ObjectMapper objectMapper) {
+                        ObjectMapper objectMapper,
+                        RecipeService recipeService,
+                        LineageGuard lineageGuard) {
         this.repo = repo;
         this.tx = new TransactionTemplate(transactionManager);
         this.objectMapper = objectMapper;
+        this.recipeService = recipeService;
+        this.lineageGuard = lineageGuard;
     }
 
     /**
@@ -176,6 +182,8 @@ public class BatchService {
             if (status != BatchStatus.PENDING_RELEASE && status != BatchStatus.RELEASE_REVIEW) {
                 throw ApiException.conflict("批次状态 " + status + " 不允许批准");
             }
+            // 配方门禁：已绑定配方的批次未达配方时整体 422（给出各成分差额），不允许只批准合格成分
+            recipeService.assertRecipeSatisfied(batchKey);
             boolean actorInspected = repo.findTests(batchKey).stream()
                     .anyMatch(t -> t.inspector().equals(actor));
             if (actorInspected) {
@@ -432,6 +440,7 @@ public class BatchService {
         for (SplitRequest.ChildSpec child : children) {
             parts.add(child.batchKey());
             parts.add(child.batchNo());
+            parts.add(child.mass() == null ? "" : child.mass().stripTrailingZeros().toPlainString());
         }
         String fingerprint = fingerprint(parts.toArray(new String[0]));
         return executeIdempotent(CMD_SPLIT, req.commandKey(), fingerprint, () -> {
@@ -453,6 +462,20 @@ public class BatchService {
                     throw ApiException.conflict("子批 batchKey 已存在: " + childKey);
                 }
             }
+            // 父批已绑定配方：按子批质量比例精确继承各成分有效称量，无法守恒整次 422；
+            // 未绑定配方：子批不得携带 mass
+            var parentBinding = recipeService.findBinding(parentKey);
+            List<Map<String, java.math.BigDecimal>> inheritance = null;
+            if (parentBinding.isPresent()) {
+                inheritance = recipeService.planSplitInheritance(parentBinding.get(), children);
+            } else {
+                for (SplitRequest.ChildSpec child : children) {
+                    if (child.mass() != null) {
+                        throw ApiException.badRequest("父批未绑定配方，子批不应给出 mass: "
+                                + child.batchKey());
+                    }
+                }
+            }
             String now = now();
             List<String> required = repo.findRequiredTests(parentKey);
             List<SplitResponse.SplitChild> childBodies = new ArrayList<>(children.size());
@@ -465,6 +488,10 @@ public class BatchService {
                 }
                 repo.insertLineage(new BatchRepository.LineageRow(0L, parentKey, spec.batchKey(),
                         i + 1, now));
+                if (inheritance != null) {
+                    recipeService.applySplitInheritance(parentBinding.get(), spec.batchKey(),
+                            spec.mass(), inheritance.get(i), "system:split", now);
+                }
                 childBodies.add(new SplitResponse.SplitChild(spec.batchKey(), spec.batchNo(),
                         parent.productCode(), Instant.parse(parent.producedAt()),
                         BatchStatus.QUARANTINED, required, Instant.parse(now)));
@@ -512,12 +539,7 @@ public class BatchService {
      * 若任一级祖先已被召回则抛 422：后代批次禁止新增检验、批准和拆分。
      */
     private void assertNoRecalledAncestor(String batchKey) {
-        Optional<String> recalled = recalledAncestor(batchKey, childToParent(),
-                new HashSet<>(repo.findRecalledKeys()));
-        if (recalled.isPresent()) {
-            throw ApiException.unprocessable(
-                    "祖先批次 " + recalled.get() + " 已召回，禁止新增检验、批准和拆分");
-        }
+        lineageGuard.assertNoRecalledAncestor(batchKey);
     }
 
     /**
