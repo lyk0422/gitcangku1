@@ -156,6 +156,13 @@ public class BatchRepository {
                 row.seq(), row.createdAt());
     }
 
+    /**
+     * 使批次现有批准全部失效（开新测定轮次时调用）：删除批准记录，不留占位。
+     */
+    public void deleteApprovals(String batchKey) {
+        jdbc.update("DELETE FROM approval WHERE batch_key = ?", batchKey);
+    }
+
     public Optional<RecallRow> findRecall(String batchKey) {
         return jdbc.query("SELECT * FROM recall WHERE batch_key = ?", RECALL_MAPPER, batchKey)
                 .stream().findFirst();

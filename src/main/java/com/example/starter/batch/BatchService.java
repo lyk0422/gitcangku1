@@ -2,6 +2,9 @@ package com.example.starter.batch;
 
 import com.example.starter.batch.dto.ApprovalResponse;
 import com.example.starter.batch.dto.ApproveRequest;
+import com.example.starter.batch.dto.AssayReadingEntry;
+import com.example.starter.batch.dto.AssayRoundDetailResponse;
+import com.example.starter.batch.dto.AssayRoundResponse;
 import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
@@ -14,10 +17,7 @@ import com.example.starter.batch.dto.SubmitTestRequest;
 import com.example.starter.batch.dto.TestResultResponse;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.PlatformTransactionManager;
-import org.springframework.transaction.support.TransactionTemplate;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -56,17 +56,18 @@ public class BatchService {
      */
     private static final String SEP = "\u0000";
 
-    private static final int IDEMPOTENCY_MAX_ATTEMPTS = 3;
-
     private final BatchRepository repo;
-    private final TransactionTemplate tx;
+    private final AssayRepository assayRepo;
+    private final IdempotentExecutor idempotent;
     private final ObjectMapper objectMapper;
 
     public BatchService(BatchRepository repo,
-                        PlatformTransactionManager transactionManager,
+                        AssayRepository assayRepo,
+                        IdempotentExecutor idempotent,
                         ObjectMapper objectMapper) {
         this.repo = repo;
-        this.tx = new TransactionTemplate(transactionManager);
+        this.assayRepo = assayRepo;
+        this.idempotent = idempotent;
         this.objectMapper = objectMapper;
     }
 
@@ -130,6 +131,9 @@ public class BatchService {
             if (!required.contains(req.testItem())) {
                 throw ApiException.unprocessable("检验项不属于该批次必做项: " + req.testItem());
             }
+            if (assayRepo.countRounds(batchKey, req.testItem()) > 0) {
+                throw ApiException.conflict("该检验项已建立平行测定轮次，须通过平行测定判定: " + req.testItem());
+            }
             boolean itemAlreadyTested = repo.findTests(batchKey).stream()
                     .anyMatch(t -> t.testItem().equals(req.testItem()));
             if (itemAlreadyTested) {
@@ -177,9 +181,10 @@ public class BatchService {
                 throw ApiException.conflict("批次状态 " + status + " 不允许批准");
             }
             boolean actorInspected = repo.findTests(batchKey).stream()
-                    .anyMatch(t -> t.inspector().equals(actor));
+                    .anyMatch(t -> t.inspector().equals(actor))
+                    || assayRepo.findOperators(batchKey).contains(actor);
             if (actorInspected) {
-                throw ApiException.unprocessable("批准人不得为该批次任一检验结果的检验人: " + actor);
+                throw ApiException.unprocessable("批准人不得为该批次任一检验结果的检验人或测定读数操作员: " + actor);
             }
 
             List<BatchRepository.ApprovalRow> approvals = repo.findApprovals(batchKey);
@@ -286,32 +291,27 @@ public class BatchService {
                 .map(r -> new RecallResponse(r.batchKey(), r.actorId(), r.reason(),
                         BatchStatus.RECALLED, Instant.parse(r.createdAt())))
                 .orElse(null);
-        return new BatchHistoryResponse(toBatchResponse(batch), tests, approvals, recall);
+        List<AssayRoundDetailResponse> assayRounds = assayRepo.findRoundsByBatch(batchKey).stream()
+                .map(round -> new AssayRoundDetailResponse(
+                        new AssayRoundResponse(round.id(), round.batchKey(), round.testItem(),
+                                round.roundNo(), round.meanMin(), round.meanMax(), round.maxRange(),
+                                round.version(), AssayRoundStatus.valueOf(round.status()),
+                                round.createdBy(), Instant.parse(round.createdAt()),
+                                round.sealedAt() == null ? null : Instant.parse(round.sealedAt())),
+                        assayRepo.findReadings(round.id()).stream()
+                                .map(r -> new AssayReadingEntry(r.seq(), r.value(), r.operator(),
+                                        Instant.parse(r.createdAt())))
+                                .toList()))
+                .toList();
+        return new BatchHistoryResponse(toBatchResponse(batch), tests, assayRounds, approvals, recall);
     }
 
     /**
-     * 幂等执行：同事务内先查 command_log，命中则按指纹返回快照或 409；
-     * 未命中执行业务动作并写入快照。并发同键插入冲突时重试，读取已提交结果。
+     * 幂等执行：委托给共享幂等执行器（见 IdempotentExecutor）。
      */
     private StoredResponse executeIdempotent(String type, String commandKey, String fingerprint,
                                              Supplier<StoredResponse> action) {
-        for (int attempt = 0; attempt < IDEMPOTENCY_MAX_ATTEMPTS; attempt++) {
-            try {
-                return tx.execute(status -> {
-                    var logged = loggedResponse(type, commandKey, fingerprint);
-                    if (logged.isPresent()) {
-                        return logged.get();
-                    }
-                    StoredResponse response = action.get();
-                    repo.insertCommand(new BatchRepository.CommandRow(type, commandKey, fingerprint,
-                            response.status(), response.body()), now());
-                    return response;
-                });
-            } catch (DuplicateKeyException e) {
-                // 并发同事务键冲突：回滚后重试，读取对方已提交的命令快照或业务结果
-            }
-        }
-        throw ApiException.conflict("命令并发冲突，请重试: " + commandKey);
+        return idempotent.execute(type, commandKey, fingerprint, action);
     }
 
     /**
@@ -319,25 +319,32 @@ public class BatchService {
      */
     private Optional<StoredResponse> loggedResponse(String type, String commandKey,
                                                     String fingerprint) {
-        var existing = repo.findCommand(type, commandKey);
-        if (existing.isEmpty()) {
-            return Optional.empty();
-        }
-        BatchRepository.CommandRow row = existing.get();
-        if (!row.fingerprint().equals(fingerprint)) {
-            throw ApiException.conflict("commandKey 已以不同参数使用: " + commandKey);
-        }
-        return Optional.of(new StoredResponse(row.responseStatus(), row.responseBody()));
+        return idempotent.loggedResponse(type, commandKey, fingerprint);
     }
 
-    private boolean allRequiredPassed(String batchKey, List<String> required) {
+    boolean allRequiredPassed(String batchKey, List<String> required) {
         Set<String> passed = new HashSet<>();
         for (BatchRepository.TestRow t : repo.findTests(batchKey)) {
             if (TestOutcome.PASS.name().equals(t.outcome())) {
                 passed.add(t.testItem());
             }
         }
+        for (String item : required) {
+            // 平行项：以最新轮次封结判定为准（旧轮合格不能授权新轮）
+            if (!passed.contains(item) && itemPassedByAssay(batchKey, item)) {
+                passed.add(item);
+            }
+        }
         return passed.containsAll(required);
+    }
+
+    /**
+     * 检验项是否经平行测定判定合格：存在轮次且最新轮次为 SEALED_PASS。
+     */
+    private boolean itemPassedByAssay(String batchKey, String testItem) {
+        List<AssayRepository.RoundRow> rounds = assayRepo.findRounds(batchKey, testItem);
+        return !rounds.isEmpty()
+                && AssayRoundStatus.SEALED_PASS.name().equals(rounds.get(rounds.size() - 1).status());
     }
 
     private BatchResponse toBatchResponse(BatchRepository.BatchRow row) {
@@ -511,7 +518,7 @@ public class BatchService {
     /**
      * 若任一级祖先已被召回则抛 422：后代批次禁止新增检验、批准和拆分。
      */
-    private void assertNoRecalledAncestor(String batchKey) {
+    void assertNoRecalledAncestor(String batchKey) {
         Optional<String> recalled = recalledAncestor(batchKey, childToParent(),
                 new HashSet<>(repo.findRecalledKeys()));
         if (recalled.isPresent()) {
