@@ -5,6 +5,7 @@ import com.example.starter.race.api.CheckpointResponse;
 import com.example.starter.race.api.CheckpointsConfigResponse;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
 import com.example.starter.race.api.CreateRaceRequest;
+import com.example.starter.race.api.HandicapFactorResponse;
 import com.example.starter.race.api.MissingCheckpointsResponse;
 import com.example.starter.race.api.RaceResponse;
 import com.example.starter.race.api.RegisterRunnerRequest;
@@ -13,6 +14,7 @@ import com.example.starter.race.api.RevokePenaltyRequest;
 import com.example.starter.race.api.RunnerMissingCheckpointsResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
+import com.example.starter.race.api.SetHandicapFactorRequest;
 import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.api.SubmitTimingRequest;
 import com.example.starter.race.domain.CheckpointRules;
@@ -20,8 +22,10 @@ import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
+import com.example.starter.race.domain.ScoringMode;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
+import com.example.starter.race.persistence.HandicapFactorRow;
 import com.example.starter.race.persistence.IdempotencyRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
@@ -84,19 +88,35 @@ public class RaceServiceImpl implements RaceService {
     @Override
     @Transactional
     public ServiceResult createRace(CreateRaceRequest request) {
+        ScoringMode scoringMode = parseScoringMode(request.scoringMode());
         return withIdempotency(request.requestId(), "CREATE_RACE",
-                orderedParams("raceId", request.raceId()),
+                orderedParams(
+                        "raceId", request.raceId(),
+                        "scoringMode", scoringMode.name()),
                 () -> {
                     long now = clock.millis();
                     try {
-                        repository.insertRace(request.raceId(), now);
+                        repository.insertRace(request.raceId(), scoringMode, now);
                     } catch (DuplicateKeyException ex) {
                         throw new ConflictException("赛事已存在: " + request.raceId());
                     }
                     RaceRow race = repository.findRace(request.raceId()).orElseThrow();
                     return ServiceResult.created(new RaceResponse(
-                            race.raceId(), race.version(), race.status(), race.createdAt()));
+                            race.raceId(), race.version(), race.status(),
+                            race.scoringMode(), race.createdAt()));
                 });
+    }
+
+    /** 解析计分模式：缺省 STANDARD；非法值由控制器层 @Pattern 拦截，服务层再兜底。 */
+    private static ScoringMode parseScoringMode(String scoringMode) {
+        if (scoringMode == null || scoringMode.isBlank()) {
+            return ScoringMode.STANDARD;
+        }
+        try {
+            return ScoringMode.valueOf(scoringMode);
+        } catch (IllegalArgumentException ex) {
+            throw new BadRequestException("未知计分模式: " + scoringMode);
+        }
     }
 
     @Override
@@ -344,6 +364,51 @@ public class RaceServiceImpl implements RaceService {
 
     @Override
     @Transactional
+    public ServiceResult setHandicapFactor(
+            String raceId, String bib, SetHandicapFactorRequest request) {
+        int p = request.p();
+        int q = request.q();
+        if (p < 1 || p > 1000 || q < 1 || q > 1000) {
+            throw new BadRequestException("让分系数 p、q 必须为 1~1000 的正整数");
+        }
+        // 等比例系数（如 2/6 与 1/3）约分后视为同参：摘要、存储与响应统一使用约分值。
+        int gcd = gcd(p, q);
+        int reducedP = p / gcd;
+        int reducedQ = q / gcd;
+        return withIdempotency(request.requestId(), "SET_HANDICAP_FACTOR",
+                orderedParams(
+                        "raceId", raceId,
+                        "bib", bib,
+                        "p", reducedP,
+                        "q", reducedQ,
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    requireRunner(raceId, bib);
+                    if (race.scoringMode() != ScoringMode.HANDICAP) {
+                        throw new BadRequestException(
+                                "非 HANDICAP 赛事不能登记让分系数: " + raceId);
+                    }
+                    bumpVersion(race, request.expectedVersion());
+                    repository.upsertHandicapFactor(raceId, bib, reducedP, reducedQ, clock.millis());
+                    return ServiceResult.ok(new HandicapFactorResponse(
+                            raceId, bib, reducedP, reducedQ, request.expectedVersion() + 1));
+                });
+    }
+
+    private static int gcd(int a, int b) {
+        int x = a;
+        int y = b;
+        while (y != 0) {
+            int rest = x % y;
+            x = y;
+            y = rest;
+        }
+        return x;
+    }
+
+    @Override
+    @Transactional
     public ServiceResult sealRace(String raceId, SealRaceRequest request) {
         return withIdempotency(request.requestId(), "SEAL_RACE",
                 orderedParams(
@@ -359,8 +424,10 @@ public class RaceServiceImpl implements RaceService {
                     List<PenaltyRow> penalties = repository.findPenalties(raceId);
                     List<CheckpointRow> checkpoints = repository.findCheckpoints(raceId);
                     List<CheckpointTimingRow> timings = repository.findAllTimings(raceId);
-                    List<ResultEntry> entries =
-                            ResultCalculator.compute(runners, penalties, checkpoints, timings);
+                    List<HandicapFactorRow> factors = repository.findHandicapFactors(raceId);
+                    List<ResultEntry> entries = ResultCalculator.compute(
+                            runners, penalties, checkpoints, timings,
+                            race.scoringMode(), factors);
 
                     int newVersion = request.expectedVersion() + 1;
                     int updated = repository.sealIfOpenAtVersion(
@@ -372,6 +439,7 @@ public class RaceServiceImpl implements RaceService {
                     List<SnapshotEntryRow> snapshotEntries = new ArrayList<>(entries.size());
                     for (int order = 0; order < entries.size(); order++) {
                         ResultEntry entry = entries.get(order);
+                        // 封榜冻结系数、精确分子分母、展示值与名次，之后不再重排。
                         snapshotEntries.add(new SnapshotEntryRow(
                                 raceId,
                                 entry.bib(),
@@ -383,7 +451,12 @@ public class RaceServiceImpl implements RaceService {
                                 order,
                                 entry.checkpointCount(),
                                 entry.coveredCheckpointCount(),
-                                entry.missingCheckpoints()));
+                                entry.missingCheckpoints(),
+                                entry.factorP(),
+                                entry.factorQ(),
+                                entry.effectiveNum(),
+                                entry.effectiveDen(),
+                                entry.effectiveDisplayMs()));
                     }
                     // 在同一封榜事务内固化每名选手 × 每个检查点的明细，缺失行耗时为 null。
                     List<SnapshotCheckpointRow> snapshotCheckpoints =
@@ -412,7 +485,8 @@ public class RaceServiceImpl implements RaceService {
                 repository.findRunners(raceId),
                 repository.findPenalties(raceId),
                 repository.findCheckpoints(raceId),
-                repository.findAllTimings(raceId));
+                repository.findAllTimings(raceId),
+                repository.findHandicapFactors(raceId));
     }
 
     @Override

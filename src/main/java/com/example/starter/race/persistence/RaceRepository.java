@@ -3,6 +3,8 @@ package com.example.starter.race.persistence;
 import com.example.starter.race.domain.EntryStatus;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
+import com.example.starter.race.domain.ScoringMode;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
@@ -30,6 +32,8 @@ public class RaceRepository {
             new CheckpointTimingRowMapper();
     private static final SnapshotCheckpointRowMapper SNAPSHOT_CHECKPOINT_ROW_MAPPER =
             new SnapshotCheckpointRowMapper();
+    private static final HandicapFactorRowMapper HANDICAP_FACTOR_ROW_MAPPER =
+            new HandicapFactorRowMapper();
 
     private final JdbcTemplate jdbcTemplate;
 
@@ -40,7 +44,8 @@ public class RaceRepository {
     /** 按ID查询赛事。 */
     public Optional<RaceRow> findRace(String raceId) {
         return jdbcTemplate
-                .query("SELECT race_id, version, status, created_at FROM race WHERE race_id = ?",
+                .query("SELECT race_id, version, status, scoring_mode, created_at "
+                                + "FROM race WHERE race_id = ?",
                         RACE_ROW_MAPPER, raceId)
                 .stream()
                 .findFirst();
@@ -53,7 +58,8 @@ public class RaceRepository {
      */
     public Optional<RaceRow> findRaceForUpdate(String raceId) {
         return jdbcTemplate
-                .query("SELECT race_id, version, status, created_at FROM race WHERE race_id = ? FOR UPDATE",
+                .query("SELECT race_id, version, status, scoring_mode, created_at "
+                                + "FROM race WHERE race_id = ? FOR UPDATE",
                         RACE_ROW_MAPPER, raceId)
                 .stream()
                 .findFirst();
@@ -147,6 +153,40 @@ public class RaceRepository {
                 .findFirst();
     }
 
+    /** 查询赛事全部让分系数（按参赛号字典序）；非 HANDICAP 赛事通常为空。 */
+    public List<HandicapFactorRow> findHandicapFactors(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT race_id, bib, p, q, created_at, updated_at "
+                        + "FROM handicap_factor WHERE race_id = ? ORDER BY bib",
+                HANDICAP_FACTOR_ROW_MAPPER, raceId);
+    }
+
+    /**
+     * 登记或修改选手让分系数（p/q 由调用方约分后传入）。
+     * 同赛事写操作已由 race 行锁串行化，先更新、无行再插入即可；
+     * 唯一键兜底并发插入时退化为更新，不向调用方泄露唯一键异常。
+     */
+    public void upsertHandicapFactor(String raceId, String bib, int p, int q, long now) {
+        int updated = jdbcTemplate.update(
+                "UPDATE handicap_factor SET p = ?, q = ?, updated_at = ? "
+                        + "WHERE race_id = ? AND bib = ?",
+                p, q, now, raceId, bib);
+        if (updated > 0) {
+            return;
+        }
+        try {
+            jdbcTemplate.update(
+                    "INSERT INTO handicap_factor (race_id, bib, p, q, created_at, updated_at) "
+                            + "VALUES (?, ?, ?, ?, ?, ?)",
+                    raceId, bib, p, q, now, now);
+        } catch (DuplicateKeyException ex) {
+            jdbcTemplate.update(
+                    "UPDATE handicap_factor SET p = ?, q = ?, updated_at = ? "
+                            + "WHERE race_id = ? AND bib = ?",
+                    p, q, now, raceId, bib);
+        }
+    }
+
     /** 新增选手分段通过记录（全局唯一 timingId 与选手+检查点唯一键由数据库约束保证）。 */
     public void insertTiming(CheckpointTimingRow row) {
         jdbcTemplate.update(
@@ -188,7 +228,8 @@ public class RaceRepository {
         SnapshotRow header = headers.getFirst();
         List<SnapshotEntryRow> entryRows = jdbcTemplate.query(
                 "SELECT race_id, bib, rank_no, status, finish_time_ms, penalty_ms, total_time_ms, "
-                        + "display_order, checkpoint_count, covered_checkpoint_count "
+                        + "display_order, checkpoint_count, covered_checkpoint_count, "
+                        + "factor_p, factor_q, effective_num, effective_den, effective_display_ms "
                         + "FROM result_snapshot_entry WHERE race_id = ? ORDER BY display_order",
                 SNAPSHOT_ENTRY_ROW_MAPPER, raceId);
         List<SnapshotCheckpointRow> checkpoints = jdbcTemplate.query(
@@ -210,17 +251,20 @@ public class RaceRepository {
                         entry.finishTimeMs(), entry.penaltyMs(), entry.totalTimeMs(),
                         entry.displayOrder(), entry.checkpointCount(),
                         entry.coveredCheckpointCount(),
-                        missingByBib.getOrDefault(entry.bib(), List.of())))
+                        missingByBib.getOrDefault(entry.bib(), List.of()),
+                        entry.factorP(), entry.factorQ(),
+                        entry.effectiveNum(), entry.effectiveDen(), entry.effectiveDisplayMs()))
                 .toList();
         return Optional.of(new SnapshotRow(header.raceId(), header.version(), header.sealedAt(),
                 entries, checkpoints));
     }
 
-    /** 新建赛事，初始版本1、状态OPEN。 */
-    public void insertRace(String raceId, long now) {
+    /** 新建赛事，初始版本1、状态OPEN；计分模式创建时选定。 */
+    public void insertRace(String raceId, ScoringMode scoringMode, long now) {
         jdbcTemplate.update(
-                "INSERT INTO race (race_id, version, status, created_at) VALUES (?, 1, 'OPEN', ?)",
-                raceId, now);
+                "INSERT INTO race (race_id, version, status, scoring_mode, created_at) "
+                        + "VALUES (?, 1, 'OPEN', ?, ?)",
+                raceId, scoringMode.name(), now);
     }
 
     /** 登记选手；finishTimeMs 为 null 表示计时缺失。 */
@@ -292,8 +336,9 @@ public class RaceRepository {
         jdbcTemplate.batchUpdate(
                 "INSERT INTO result_snapshot_entry "
                         + "(race_id, bib, rank_no, status, finish_time_ms, penalty_ms, total_time_ms, "
-                        + "display_order, checkpoint_count, covered_checkpoint_count) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        + "display_order, checkpoint_count, covered_checkpoint_count, "
+                        + "factor_p, factor_q, effective_num, effective_den, effective_display_ms) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 snapshot.entries(),
                 snapshot.entries().size(),
                 (ps, entry) -> {
@@ -307,6 +352,11 @@ public class RaceRepository {
                     ps.setInt(8, entry.displayOrder());
                     ps.setInt(9, entry.checkpointCount());
                     ps.setInt(10, entry.coveredCheckpointCount());
+                    ps.setObject(11, entry.factorP());
+                    ps.setObject(12, entry.factorQ());
+                    ps.setObject(13, entry.effectiveNum());
+                    ps.setObject(14, entry.effectiveDen());
+                    ps.setObject(15, entry.effectiveDisplayMs());
                 });
         jdbcTemplate.batchUpdate(
                 "INSERT INTO result_snapshot_checkpoint "
@@ -377,6 +427,7 @@ public class RaceRepository {
         jdbcTemplate.update("DELETE FROM checkpoint_timing");
         jdbcTemplate.update("DELETE FROM checkpoint");
         jdbcTemplate.update("DELETE FROM penalty");
+        jdbcTemplate.update("DELETE FROM handicap_factor");
         jdbcTemplate.update("DELETE FROM runner");
         jdbcTemplate.update("DELETE FROM race");
     }
@@ -388,6 +439,7 @@ public class RaceRepository {
                     rs.getString("race_id"),
                     rs.getInt("version"),
                     RaceStatus.valueOf(rs.getString("status")),
+                    ScoringMode.valueOf(rs.getString("scoring_mode")),
                     rs.getLong("created_at"));
         }
     }
@@ -435,7 +487,25 @@ public class RaceRepository {
                     rs.getInt("display_order"),
                     rs.getInt("checkpoint_count"),
                     rs.getInt("covered_checkpoint_count"),
-                    List.of());
+                    List.of(),
+                    (Integer) rs.getObject("factor_p"),
+                    (Integer) rs.getObject("factor_q"),
+                    (Long) rs.getObject("effective_num"),
+                    (Long) rs.getObject("effective_den"),
+                    (Long) rs.getObject("effective_display_ms"));
+        }
+    }
+
+    private static final class HandicapFactorRowMapper implements RowMapper<HandicapFactorRow> {
+        @Override
+        public HandicapFactorRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new HandicapFactorRow(
+                    rs.getString("race_id"),
+                    rs.getString("bib"),
+                    rs.getInt("p"),
+                    rs.getInt("q"),
+                    rs.getLong("created_at"),
+                    rs.getLong("updated_at"));
         }
     }
 

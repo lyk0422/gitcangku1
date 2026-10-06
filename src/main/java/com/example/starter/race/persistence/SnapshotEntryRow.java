@@ -18,6 +18,11 @@ import java.util.List;
  * @param checkpointCount           赛事检查点总数；未配置检查点为 0
  * @param coveredCheckpointCount    该选手已覆盖检查点数量
  * @param missingCheckpoints        缺失检查点代码，按检查点顺序排列；无缺失时为空列表
+ * @param factorP                   封榜时固化的让分系数分子 p（约分后）；无系数为 null
+ * @param factorQ                   封榜时固化的让分系数分母 q（约分后）；无系数为 null
+ * @param effectiveNum              HANDICAP 有效成绩精确分子（约分后）；未按让分排名为 null
+ * @param effectiveDen              HANDICAP 有效成绩精确分母（约分后）；未按让分排名为 null
+ * @param effectiveDisplayMs        HANDICAP 有效成绩展示值（HALF_UP 整数毫秒）；未按让分排名为 null
  */
 public record SnapshotEntryRow(
         String raceId,
@@ -30,10 +35,15 @@ public record SnapshotEntryRow(
         int displayOrder,
         int checkpointCount,
         int coveredCheckpointCount,
-        List<String> missingCheckpoints
+        List<String> missingCheckpoints,
+        Integer factorP,
+        Integer factorQ,
+        Long effectiveNum,
+        Long effectiveDen,
+        Long effectiveDisplayMs
 ) {
 
-    /** 兼容旧调用的构造器：检查点计数为 0、缺失列表为空。 */
+    /** 兼容旧调用的构造器：检查点计数为 0、缺失列表为空、无让分字段。 */
     public SnapshotEntryRow(
             String raceId,
             String bib,
@@ -44,6 +54,6 @@ public record SnapshotEntryRow(
             Long totalTimeMs,
             int displayOrder) {
         this(raceId, bib, rank, status, finishTimeMs, penaltyMs, totalTimeMs, displayOrder,
-                0, 0, List.of());
+                0, 0, List.of(), null, null, null, null, null);
     }
 }

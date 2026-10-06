@@ -87,6 +87,15 @@ public class RaceController {
         return toResponse(raceService.sealRace(raceId, request));
     }
 
+    /** 登记或修改选手让分系数（仅 HANDICAP 赛事、OPEN 状态）。 */
+    @PostMapping("/{raceId}/runners/{bib}/handicap-factor")
+    public ResponseEntity<Object> setHandicapFactor(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody SetHandicapFactorRequest request) {
+        return toResponse(raceService.setHandicapFactor(raceId, bib, request));
+    }
+
     /** 查询即时成绩（封榜后返回只读快照内容）。 */
     @GetMapping("/{raceId}/results")
     public StandingResponse getResults(@PathVariable String raceId) {

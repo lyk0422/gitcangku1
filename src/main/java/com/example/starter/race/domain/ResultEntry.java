@@ -14,6 +14,11 @@ import java.util.List;
  * @param checkpointCount         赛事配置的检查点总数；未配置检查点的赛事为 0
  * @param coveredCheckpointCount  该选手已有分段记录的检查点数量
  * @param missingCheckpoints      该选手尚未通过的检查点代码，按检查点顺序排列；全部覆盖或无检查点时为空列表
+ * @param factorP                 让分系数分子 p（约分后，1~1000）；非 HANDICAP 赛事或未登记系数为 null
+ * @param factorQ                 让分系数分母 q（约分后，1~1000）；非 HANDICAP 赛事或未登记系数为 null
+ * @param effectiveNum            HANDICAP 有效成绩的精确分子（约分后，毫秒量纲）；未按让分排名为 null
+ * @param effectiveDen            HANDICAP 有效成绩的精确分母（约分后）；未按让分排名为 null
+ * @param effectiveDisplayMs      HANDICAP 有效成绩展示值（精确分数 HALF_UP 到整数毫秒）；未按让分排名为 null
  */
 public record ResultEntry(
         String bib,
@@ -24,10 +29,15 @@ public record ResultEntry(
         Long totalTimeMs,
         int checkpointCount,
         int coveredCheckpointCount,
-        List<String> missingCheckpoints
+        List<String> missingCheckpoints,
+        Integer factorP,
+        Integer factorQ,
+        Long effectiveNum,
+        Long effectiveDen,
+        Long effectiveDisplayMs
 ) {
 
-    /** 未配置检查点赛事使用的兼容构造器：检查点计数均为 0、缺失列表为空。 */
+    /** 未配置检查点赛事使用的兼容构造器：检查点计数均为 0、缺失列表为空、无让分字段。 */
     public ResultEntry(
             String bib,
             Integer rank,
@@ -35,6 +45,23 @@ public record ResultEntry(
             Long finishTimeMs,
             long penaltyMs,
             Long totalTimeMs) {
-        this(bib, rank, status, finishTimeMs, penaltyMs, totalTimeMs, 0, 0, List.of());
+        this(bib, rank, status, finishTimeMs, penaltyMs, totalTimeMs, 0, 0, List.of(),
+                null, null, null, null, null);
+    }
+
+    /** STANDARD 模式构造器：无让分字段。 */
+    public ResultEntry(
+            String bib,
+            Integer rank,
+            EntryStatus status,
+            Long finishTimeMs,
+            long penaltyMs,
+            Long totalTimeMs,
+            int checkpointCount,
+            int coveredCheckpointCount,
+            List<String> missingCheckpoints) {
+        this(bib, rank, status, finishTimeMs, penaltyMs, totalTimeMs,
+                checkpointCount, coveredCheckpointCount, missingCheckpoints,
+                null, null, null, null, null);
     }
 }

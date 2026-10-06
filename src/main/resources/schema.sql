@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS race (
     race_id VARCHAR(64) NOT NULL COMMENT '赛事ID，全局唯一',
     version INT NOT NULL COMMENT '版本号，从1开始，每次写操作加一',
     status VARCHAR(16) NOT NULL COMMENT '赛事状态：OPEN-开放可写，SEALED-已封榜只读',
+    scoring_mode VARCHAR(16) NOT NULL DEFAULT 'STANDARD' COMMENT '计分模式：STANDARD-原始耗时排名，HANDICAP-让分系数排名；创建时选定',
     created_at BIGINT NOT NULL COMMENT '创建时间，Unix毫秒时间戳',
     CONSTRAINT pk_race PRIMARY KEY (race_id)
 );
@@ -20,6 +21,17 @@ CREATE TABLE IF NOT EXISTS runner (
     CONSTRAINT pk_runner PRIMARY KEY (id),
     CONSTRAINT uk_runner_race_bib UNIQUE (race_id, bib),
     CONSTRAINT fk_runner_race FOREIGN KEY (race_id) REFERENCES race (race_id)
+);
+
+CREATE TABLE IF NOT EXISTS handicap_factor (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    bib VARCHAR(64) NOT NULL COMMENT '选手参赛号',
+    p INT NOT NULL COMMENT '让分系数分子（约分后正整数，1~1000）；有效成绩=原始毫秒×p/q+未撤销罚时',
+    q INT NOT NULL COMMENT '让分系数分母（约分后正整数，1~1000）',
+    created_at BIGINT NOT NULL COMMENT '系数首次登记时间，Unix毫秒时间戳',
+    updated_at BIGINT NOT NULL COMMENT '系数最近修改时间，Unix毫秒时间戳',
+    CONSTRAINT pk_handicap_factor PRIMARY KEY (race_id, bib),
+    CONSTRAINT fk_factor_runner FOREIGN KEY (race_id, bib) REFERENCES runner (race_id, bib)
 );
 
 CREATE TABLE IF NOT EXISTS penalty (
@@ -52,6 +64,11 @@ CREATE TABLE IF NOT EXISTS result_snapshot_entry (
     finish_time_ms BIGINT COMMENT '原始完赛耗时（毫秒）；计时缺失为NULL',
     penalty_ms BIGINT NOT NULL COMMENT '生效（未撤销）加时处罚合计毫秒数，无加时为0',
     total_time_ms BIGINT COMMENT '总耗时=原始完赛耗时+生效加时（毫秒）；未排名时为NULL',
+    factor_p INT COMMENT '封榜时固化的让分系数分子p（约分后）；非HANDICAP赛事或未登记系数为NULL',
+    factor_q INT COMMENT '封榜时固化的让分系数分母q（约分后）；非HANDICAP赛事或未登记系数为NULL',
+    effective_num BIGINT COMMENT 'HANDICAP有效成绩精确分子（约分后，毫秒量纲）；未按让分排名为NULL',
+    effective_den BIGINT COMMENT 'HANDICAP有效成绩精确分母（约分后）；未按让分排名为NULL',
+    effective_display_ms BIGINT COMMENT 'HANDICAP有效成绩展示值（精确分数HALF_UP到整数毫秒）；未按让分排名为NULL',
     checkpoint_count INT NOT NULL DEFAULT 0 COMMENT '赛事检查点总数；未配置检查点为0',
     covered_checkpoint_count INT NOT NULL DEFAULT 0 COMMENT '封榜时该选手已覆盖检查点数量；缺失检查点由result_snapshot_checkpoint中elapsed_millis为NULL的行固化',
     display_order INT NOT NULL COMMENT '展示顺序，从0开始：先名次顺序，并列者按参赛号字典序，其余按参赛号字典序',
@@ -97,7 +114,7 @@ CREATE TABLE IF NOT EXISTS result_snapshot_checkpoint (
 
 CREATE TABLE IF NOT EXISTS idempotency_record (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求ID（写操作幂等键）',
-    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE',
+    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE/SET_HANDICAP_FACTOR',
     request_digest CHAR(64) NOT NULL COMMENT '请求参数（requestId除外，含expectedVersion）规范化JSON的SHA-256摘要',
     response_status INT NOT NULL COMMENT '原成功请求的HTTP状态码，重放时原样返回',
     response_body TEXT COMMENT '原成功响应体JSON，重放时原样返回',
