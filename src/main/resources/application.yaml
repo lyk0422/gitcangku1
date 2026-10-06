@@ -15,6 +15,7 @@ spring:
     init:
       mode: always
       schema-locations: classpath:schema.sql
+      data-locations: classpath:data.sql
   jackson:
     time-zone: Asia/Shanghai
   lifecycle:

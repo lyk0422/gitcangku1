@@ -11,7 +11,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * 设备登记、查询与固件拉取。
+ * 设备登记、查询、空间档案维护与固件拉取。
  */
 @RestController
 @RequestMapping("/api/devices")
@@ -33,6 +33,12 @@ public class DeviceController {
     @GetMapping("/{deviceId}")
     public DeviceView get(@PathVariable String deviceId) {
         return deviceService.get(deviceId);
+    }
+
+    @PostMapping("/{deviceId}/space")
+    public DeviceView maintainSpace(@PathVariable String deviceId,
+                                    @Valid @RequestBody MaintainSpaceRequest request) {
+        return deviceService.maintainSpace(deviceId, request);
     }
 
     @PostMapping("/{deviceId}/pull")
