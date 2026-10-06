@@ -59,13 +59,16 @@ public class BatchService {
     private static final int IDEMPOTENCY_MAX_ATTEMPTS = 3;
 
     private final BatchRepository repo;
+    private final SerialBatchRepository serialRepo;
     private final TransactionTemplate tx;
     private final ObjectMapper objectMapper;
 
     public BatchService(BatchRepository repo,
+                        SerialBatchRepository serialRepo,
                         PlatformTransactionManager transactionManager,
                         ObjectMapper objectMapper) {
         this.repo = repo;
+        this.serialRepo = serialRepo;
         this.tx = new TransactionTemplate(transactionManager);
         this.objectMapper = objectMapper;
     }
@@ -387,7 +390,7 @@ public class BatchService {
         }
     }
 
-    private String toJson(Object body) {
+    String toJson(Object body) {
         try {
             return objectMapper.writeValueAsString(body);
         } catch (JsonProcessingException e) {
@@ -395,11 +398,11 @@ public class BatchService {
         }
     }
 
-    private String now() {
+    String now() {
         return Instant.now().toString();
     }
 
-    private String fingerprint(String... parts) {        String canonical = String.join(SEP, parts);
+    String fingerprint(String... parts) {        String canonical = String.join(SEP, parts);
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             byte[] hash = digest.digest(canonical.getBytes(StandardCharsets.UTF_8));
@@ -444,6 +447,10 @@ public class BatchService {
                 return logged.get();
             }
             assertNoRecalledAncestor(parentKey);
+            if (serialRepo.findSerialBatch(parentKey).isPresent()) {
+                throw ApiException.unprocessable(
+                        "序号区间批次不能使用按数量拆批入口，请使用受控拆批入口: " + parentKey);
+            }
             if (!BatchStatus.RELEASED.name().equals(parent.status())) {
                 throw ApiException.conflict(
                         "批次状态 " + parent.status() + " 不允许拆分，仅当前可用的 RELEASED 批次可拆分");
@@ -510,8 +517,9 @@ public class BatchService {
 
     /**
      * 若任一级祖先已被召回则抛 422：后代批次禁止新增检验、批准和拆分。
+     * 包私有：序号区间域（SerialBatchService）共用同一判定。
      */
-    private void assertNoRecalledAncestor(String batchKey) {
+    void assertNoRecalledAncestor(String batchKey) {
         Optional<String> recalled = recalledAncestor(batchKey, childToParent(),
                 new HashSet<>(repo.findRecalledKeys()));
         if (recalled.isPresent()) {
@@ -522,9 +530,10 @@ public class BatchService {
 
     /**
      * 沿父链向上查找最近的被直接召回（RECALLED）祖先；批次自身召回不算祖先召回。
+     * 包私有：序号归属查询共用。
      */
-    private Optional<String> recalledAncestor(String batchKey, Map<String, String> parentOf,
-                                              Set<String> recalled) {
+    Optional<String> recalledAncestor(String batchKey, Map<String, String> parentOf,
+                                      Set<String> recalled) {
         String current = batchKey;
         while (parentOf.containsKey(current)) {
             current = parentOf.get(current);
@@ -537,8 +546,9 @@ public class BatchService {
 
     /**
      * 全部血缘边的 子批→父批 映射；关系不可改写，只增不改。
+     * 包私有：序号归属查询共用。
      */
-    private Map<String, String> childToParent() {
+    Map<String, String> childToParent() {
         Map<String, String> parentOf = new HashMap<>();
         for (BatchRepository.LineageRow row : repo.findAllLineage()) {
             parentOf.put(row.childKey(), row.parentKey());
