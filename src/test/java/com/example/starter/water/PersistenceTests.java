@@ -38,8 +38,8 @@ class PersistenceTests {
         WaterRepository repo1 = new WaterRepository(new JdbcTemplate(first));
         long windowId = repo1.insertWindow("wk-persist", "ch-persist", 1_000L, 2_000L,
                 new BigDecimal("10.000"), 1L);
-        repo1.insertAllocation("ak-source", windowId, "user-1", new BigDecimal("6.000"), "alice", 2L);
-        repo1.insertAllocation("ak-target", windowId, "user-2", new BigDecimal("2.500"), "bob", 3L);
+        repo1.insertAllocation("ak-source", windowId, "user-1", new BigDecimal("6.000"), "alice", null, null, 2L);
+        repo1.insertAllocation("ak-target", windowId, "user-2", new BigDecimal("2.500"), "bob", null, null, 3L);
         AllocationRow source = repo1.findAllocationByKey("ak-source");
         AllocationRow target = repo1.findAllocationByKey("ak-target");
         // 普通批准：源持有额度等于原申请水量
@@ -103,7 +103,7 @@ class PersistenceTests {
         }
         WaterRepository repo = new WaterRepository(new JdbcTemplate(dataSource));
         long windowId = repo.insertWindow("wk-cancel", "ch-cancel", 1L, 2L, new BigDecimal("5"), 1L);
-        repo.insertAllocation("ak-cancel", windowId, "user-1", new BigDecimal("3.000"), "alice", 2L);
+        repo.insertAllocation("ak-cancel", windowId, "user-1", new BigDecimal("3.000"), "alice", null, null, 2L);
         AllocationRow allocation = repo.findAllocationByKey("ak-cancel");
         repo.updateAllocationStatus(allocation.id(), "APPROVED", 3L);
         assertEquals(new BigDecimal("3.000"), repo.sumApprovedAmount(windowId));
@@ -115,5 +115,56 @@ class PersistenceTests {
         assertEquals(new BigDecimal("3.000"), cancelled.amount());
         assertEquals(0, cancelled.heldAmount().compareTo(BigDecimal.ZERO));
         assertEquals(0, repo.sumApprovedAmount(windowId).compareTo(BigDecimal.ZERO));
+    }
+
+    @Test
+    void saltLedgerAndPlotAreReadableFromNewConnection() throws Exception {
+        String url = String.format(URL_TEMPLATE, UUID.randomUUID().toString().substring(0, 8));
+        SimpleDriverDataSource first = new SimpleDriverDataSource(new org.h2.Driver(), url, "sa", "");
+        try (Connection connection = first.getConnection()) {
+            ScriptUtils.executeSqlScript(connection, new ClassPathResource("schema.sql"));
+        }
+        WaterRepository repo1 = new WaterRepository(new JdbcTemplate(first));
+        long plotId = repo1.insertPlot("pk-persist", "farmer-1", 20L, 1L);
+        long windowId = repo1.insertWindow("wk-salt", "ch-salt", 1_000L, 2_000L,
+                new BigDecimal("100.000"), 1L);
+        repo1.insertAllocation("ak-bound", windowId, "farmer-1", new BigDecimal("10.000"), "farmer-1",
+                plotId, new BigDecimal("2.000"), 2L);
+        AllocationRow bound = repo1.findAllocationByKey("ak-bound");
+        assertEquals(0, bound.version());
+        // 批准：版本 +1，持有额度等于原申请水量
+        repo1.updateAllocationStatus(bound.id(), "APPROVED", 3L);
+        // 实灌 4 立方米：版本 +1，账本冻结 8 克
+        repo1.addIrrigatedAmount(bound.id(), new BigDecimal("4.000"), 4L);
+        repo1.insertLedger(plotId, "ak-bound", new BigDecimal("2.000"), new BigDecimal("4.000"),
+                new BigDecimal("8.000000"), new BigDecimal("8.000000"), "farmer-1", 4L);
+        // 取消：持有额度保留已灌 4 立方米，窗口占用不释放已灌部分
+        repo1.updateAllocationStatus(bound.id(), "CANCELLED", 5L);
+
+        // 第二次读取：全新连接与仓储实例，同一 JVM 内数据仍在
+        WaterRepository repo2 = new WaterRepository(
+                new JdbcTemplate(new SimpleDriverDataSource(new org.h2.Driver(), url, "sa", "")));
+        var plot = repo2.findPlotById(plotId);
+        assertNotNull(plot);
+        assertEquals("farmer-1", plot.farmerId());
+        assertEquals(20L, plot.saltLimitGrams());
+
+        AllocationRow cancelled = repo2.findAllocationByKey("ak-bound");
+        assertEquals("CANCELLED", cancelled.status());
+        assertEquals(new BigDecimal("4.000"), cancelled.irrigatedAmount());
+        assertEquals(new BigDecimal("4.000"), cancelled.heldAmount());
+        assertEquals(3, cancelled.version());
+        assertEquals(plotId, cancelled.plotId());
+        assertEquals(new BigDecimal("2.000"), cancelled.concentration());
+        // 已灌 4 立方米继续占用窗口额度
+        assertEquals(new BigDecimal("4.000"), repo2.sumApprovedAmount(windowId));
+
+        var ledger = repo2.listLedger(plotId);
+        assertEquals(1, ledger.size());
+        assertEquals(new BigDecimal("8.000000"), ledger.get(0).saltGrams());
+        assertEquals(new BigDecimal("8.000000"), ledger.get(0).cumulativeGrams());
+        assertEquals(new BigDecimal("2.000"), ledger.get(0).concentration());
+        // 取消后该田块无 APPROVED 申请，预留盐量为零
+        assertEquals(0, repo2.listApprovedByPlot(plotId).size());
     }
 }

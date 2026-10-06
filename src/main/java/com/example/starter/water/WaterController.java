@@ -3,10 +3,15 @@ package com.example.starter.water;
 import com.example.starter.water.dto.Dtos.AllocationResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
 import com.example.starter.water.dto.Dtos.CommandRequest;
+import com.example.starter.water.dto.Dtos.CreatePlotRequest;
 import com.example.starter.water.dto.Dtos.CreateWindowRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.IrrigateRequest;
+import com.example.starter.water.dto.Dtos.IrrigationResponse;
+import com.example.starter.water.dto.Dtos.PlotResponse;
+import com.example.starter.water.dto.Dtos.PlotSaltResponse;
 import com.example.starter.water.dto.Dtos.SubmitAllocationRequest;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferRequest;
@@ -46,7 +51,30 @@ public class WaterController {
     public AllocationResponse submitAllocation(@RequestBody SubmitAllocationRequest request,
                                                @RequestHeader("X-Actor-Id") String actor) {
         return service.submitAllocation(request.commandKey(), request.allocationKey(), request.windowId(),
-                request.userId(), request.amount(), actor);
+                request.userId(), request.amount(), request.plotId(), request.concentration(), actor);
+    }
+
+    /** 创建农户田块（操作人须为农户本人）。 */
+    @PostMapping("/plots")
+    public PlotResponse createPlot(@RequestBody CreatePlotRequest request,
+                                   @RequestHeader("X-Actor-Id") String actor) {
+        return service.createPlot(request.requestId(), request.plotKey(), request.farmerId(),
+                request.saltLimitGrams(), actor);
+    }
+
+    /** 实际灌入：对已批准申请提交正水量，等量预留盐转不可逆实灌。 */
+    @PostMapping("/allocations/{allocationKey}/irrigations")
+    public IrrigationResponse irrigate(@PathVariable String allocationKey,
+                                       @RequestBody IrrigateRequest request,
+                                       @RequestHeader("X-Actor-Id") String actor) {
+        return service.irrigate(request.requestId(), allocationKey, request.volume(),
+                request.expectedVersion(), actor);
+    }
+
+    /** 查询田块盐负荷（累计实灌 + 全部预留 + 账本明细）。 */
+    @GetMapping("/plots/{plotId}/salt")
+    public PlotSaltResponse getPlotSalt(@PathVariable long plotId) {
+        return service.getPlotSalt(plotId);
     }
 
     /** 批准配水申请。 */

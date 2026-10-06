@@ -25,10 +25,21 @@ public class WaterRepository {
                             BigDecimal plannedVolume, long createdNanos) {
     }
 
-    /** 配水申请行；amount 为不可改写的原申请水量，heldAmount 为当前持有额度。 */
+    /** 配水申请行；amount 为不可改写的原申请水量，heldAmount 为当前持有额度，irrigatedAmount 为不可逆实灌水量。 */
     public record AllocationRow(long id, String allocationKey, long windowId, String userId, BigDecimal amount,
                                 BigDecimal heldAmount, String requester, String status,
-                                long createdNanos, long updatedNanos) {
+                                long createdNanos, long updatedNanos,
+                                Long plotId, BigDecimal concentration, BigDecimal irrigatedAmount, long version) {
+    }
+
+    /** 农户田块行；saltLimitGrams 为不可变正整数（克）。 */
+    public record PlotRow(long id, String plotKey, String farmerId, long saltLimitGrams, long createdNanos) {
+    }
+
+    /** 盐负荷账本行，创建后不可变。 */
+    public record LedgerRow(long id, long plotId, String allocationKey, BigDecimal concentration,
+                            BigDecimal volume, BigDecimal saltGrams, BigDecimal cumulativeGrams,
+                            String actor, long createdNanos) {
     }
 
     /** 转让流水行，创建后不可变。 */
@@ -55,11 +66,31 @@ public class WaterRepository {
             rs.getLong("id"), rs.getString("allocation_key"), rs.getLong("window_id"),
             rs.getString("user_id"), rs.getBigDecimal("amount"), rs.getBigDecimal("held_amount"),
             rs.getString("requester"), rs.getString("status"),
-            rs.getLong("created_nanos"), rs.getLong("updated_nanos"));
+            rs.getLong("created_nanos"), rs.getLong("updated_nanos"),
+            rs.getObject("plot_id") == null ? null : rs.getLong("plot_id"),
+            rs.getBigDecimal("concentration"), rs.getBigDecimal("irrigated_amount"),
+            rs.getLong("version"));
 
     private static final String ALLOCATION_SELECT =
             "SELECT id, allocation_key, window_id, user_id, amount, held_amount, requester, status,"
-                    + " created_nanos, updated_nanos";
+                    + " created_nanos, updated_nanos, plot_id, concentration, irrigated_amount, version";
+
+    private static final RowMapper<PlotRow> PLOT_MAPPER = (rs, n) -> new PlotRow(
+            rs.getLong("id"), rs.getString("plot_key"), rs.getString("farmer_id"),
+            rs.getLong("salt_limit_grams"), rs.getLong("created_nanos"));
+
+    private static final String PLOT_SELECT =
+            "SELECT id, plot_key, farmer_id, salt_limit_grams, created_nanos";
+
+    private static final RowMapper<LedgerRow> LEDGER_MAPPER = (rs, n) -> new LedgerRow(
+            rs.getLong("id"), rs.getLong("plot_id"), rs.getString("allocation_key"),
+            rs.getBigDecimal("concentration"), rs.getBigDecimal("volume"),
+            rs.getBigDecimal("salt_grams"), rs.getBigDecimal("cumulative_grams"),
+            rs.getString("actor"), rs.getLong("created_nanos"));
+
+    private static final String LEDGER_SELECT =
+            "SELECT id, plot_id, allocation_key, concentration, volume, salt_grams, cumulative_grams,"
+                    + " actor, created_nanos";
 
     private static final RowMapper<TransferRow> TRANSFER_MAPPER = (rs, n) -> new TransferRow(
             rs.getLong("id"), rs.getString("transfer_key"), rs.getLong("window_id"),
@@ -130,21 +161,29 @@ public class WaterRepository {
         return count != null && count > 0;
     }
 
-    /** 插入申请（初始 REQUESTED）并返回主键。 */
+    /** 插入申请（初始 REQUESTED）并返回主键；plotId/concentration 同时绑定或同时为 null。 */
     public long insertAllocation(String allocationKey, long windowId, String userId, BigDecimal amount,
-                                 String requester, long nowNanos) {
+                                 String requester, Long plotId, BigDecimal concentration, long nowNanos) {
         KeyHolder keys = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO allocation (allocation_key, window_id, user_id, amount, held_amount, requester, status, created_nanos, updated_nanos)"
-                            + " VALUES (?, ?, ?, ?, 0, ?, 'REQUESTED', ?, ?)", Statement.RETURN_GENERATED_KEYS);
+                    "INSERT INTO allocation (allocation_key, window_id, user_id, amount, held_amount, requester,"
+                            + " status, plot_id, concentration, irrigated_amount, version, created_nanos, updated_nanos)"
+                            + " VALUES (?, ?, ?, ?, 0, ?, 'REQUESTED', ?, ?, 0, 0, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, allocationKey);
             ps.setLong(2, windowId);
             ps.setString(3, userId);
             ps.setBigDecimal(4, amount);
             ps.setString(5, requester);
-            ps.setLong(6, nowNanos);
-            ps.setLong(7, nowNanos);
+            if (plotId == null) {
+                ps.setNull(6, java.sql.Types.BIGINT);
+            } else {
+                ps.setLong(6, plotId);
+            }
+            ps.setBigDecimal(7, concentration);
+            ps.setLong(8, nowNanos);
+            ps.setLong(9, nowNanos);
             return ps;
         }, keys);
         return Objects.requireNonNull(keys.getKey()).longValue();
@@ -172,26 +211,38 @@ public class WaterRepository {
     }
 
     /**
-     * 更新申请状态与变更时间，并同步持有额度：批准时持有额度等于原申请水量，取消时归零，
-     * REQUESTED 保持当前持有额度不变。
+     * 更新申请状态与变更时间并递增版本号，同步持有额度：批准时持有额度等于原申请水量，
+     * 取消时保留已实灌部分（仅释放未灌额度），REQUESTED 保持当前持有额度不变。
      */
     public void updateAllocationStatus(long id, String status, long updatedNanos) {
-        jdbc.update("UPDATE allocation SET status = ?, updated_nanos = ?,"
-                + " held_amount = CASE WHEN ? = 'APPROVED' THEN amount WHEN ? = 'CANCELLED' THEN 0"
+        jdbc.update("UPDATE allocation SET status = ?, updated_nanos = ?, version = version + 1,"
+                + " held_amount = CASE WHEN ? = 'APPROVED' THEN amount WHEN ? = 'CANCELLED' THEN irrigated_amount"
                 + " ELSE held_amount END WHERE id = ?",
                 status, updatedNanos, status, status, id);
     }
 
-    /** 转让扣减源持有额度（不得为负由事务内校验保证）并记录变更时间。 */
+    /** 转让扣减源持有额度（不得为负由事务内校验保证），递增版本号并记录变更时间。 */
     public void decrementHeldAmount(long id, BigDecimal delta, long updatedNanos) {
-        jdbc.update("UPDATE allocation SET held_amount = held_amount - ?, updated_nanos = ? WHERE id = ?",
+        jdbc.update("UPDATE allocation SET held_amount = held_amount - ?, version = version + 1,"
+                + " updated_nanos = ? WHERE id = ?",
                 delta, updatedNanos, id);
     }
 
-    /** 窗口当前所有 APPROVED 申请的当前持有额度之和（BigDecimal 精确求和），无则 0。 */
+    /** 实灌入账：累加不可逆实灌水量，递增版本号并记录变更时间。 */
+    public void addIrrigatedAmount(long id, BigDecimal volume, long updatedNanos) {
+        jdbc.update("UPDATE allocation SET irrigated_amount = irrigated_amount + ?, version = version + 1,"
+                + " updated_nanos = ? WHERE id = ?",
+                volume, updatedNanos, id);
+    }
+
+    /**
+     * 窗口当前占用额度之和（BigDecimal 精确求和）：全部 APPROVED 申请的持有额度，
+     * 加上已取消但留有不可逆实灌额度的申请，无则 0。
+     */
     public BigDecimal sumApprovedAmount(long windowId) {
         BigDecimal sum = jdbc.queryForObject(
-                "SELECT COALESCE(SUM(held_amount), 0) FROM allocation WHERE window_id = ? AND status = 'APPROVED'",
+                "SELECT COALESCE(SUM(held_amount), 0) FROM allocation"
+                        + " WHERE window_id = ? AND (status = 'APPROVED' OR held_amount > 0)",
                 BigDecimal.class, windowId);
         return sum == null ? BigDecimal.ZERO : sum;
     }
@@ -303,5 +354,86 @@ public class WaterRepository {
     /** 写回命令首次成功响应。 */
     public void updateCommandResponse(String commandKey, String response) {
         jdbc.update("UPDATE command_log SET response = ? WHERE command_key = ?", response, commandKey);
+    }
+
+    // ------------------------------------------------------------------
+    // 田块与盐负荷账本
+    // ------------------------------------------------------------------
+
+    /** 插入田块并返回自增主键；saltLimitGrams 为不可变正整数（克）。 */
+    public long insertPlot(String plotKey, String farmerId, long saltLimitGrams, long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO plot (plot_key, farmer_id, salt_limit_grams, created_nanos)"
+                            + " VALUES (?, ?, ?, ?)", Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, plotKey);
+            ps.setString(2, farmerId);
+            ps.setLong(3, saltLimitGrams);
+            ps.setLong(4, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 按主键查询田块，不存在返回 null。 */
+    public PlotRow findPlotById(long id) {
+        try {
+            return jdbc.queryForObject(PLOT_SELECT + " FROM plot WHERE id = ?", PLOT_MAPPER, id);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 按主键锁定田块行（FOR UPDATE），用于串行化同一田块的批准与实灌，不存在返回 null。 */
+    public PlotRow lockPlotById(long id) {
+        try {
+            return jdbc.queryForObject(PLOT_SELECT + " FROM plot WHERE id = ? FOR UPDATE", PLOT_MAPPER, id);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 按业务键查询田块，不存在返回 null。 */
+    public PlotRow findPlotByKey(String plotKey) {
+        try {
+            return jdbc.queryForObject(PLOT_SELECT + " FROM plot WHERE plot_key = ?", PLOT_MAPPER, plotKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 田块全部 APPROVED 申请（用于在 Java 侧精确汇总预留盐量），按主键升序。 */
+    public List<AllocationRow> listApprovedByPlot(long plotId) {
+        return jdbc.query(ALLOCATION_SELECT + " FROM allocation WHERE plot_id = ? AND status = 'APPROVED'"
+                + " ORDER BY id", ALLOCATION_MAPPER, plotId);
+    }
+
+    /** 写入盐负荷账本（不可变）并返回主键。 */
+    public long insertLedger(long plotId, String allocationKey, BigDecimal concentration, BigDecimal volume,
+                             BigDecimal saltGrams, BigDecimal cumulativeGrams, String actor, long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO salt_ledger (plot_id, allocation_key, concentration, volume, salt_grams,"
+                            + " cumulative_grams, actor, created_nanos) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setLong(1, plotId);
+            ps.setString(2, allocationKey);
+            ps.setBigDecimal(3, concentration);
+            ps.setBigDecimal(4, volume);
+            ps.setBigDecimal(5, saltGrams);
+            ps.setBigDecimal(6, cumulativeGrams);
+            ps.setString(7, actor);
+            ps.setLong(8, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 田块全部账本条目（不可变），按主键升序；累计盐量在 Java 侧精确求和。 */
+    public List<LedgerRow> listLedger(long plotId) {
+        return jdbc.query(LEDGER_SELECT + " FROM salt_ledger WHERE plot_id = ? ORDER BY id",
+                LEDGER_MAPPER, plotId);
     }
 }

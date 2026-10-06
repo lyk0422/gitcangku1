@@ -37,7 +37,16 @@ public class ApiException extends RuntimeException {
         return new ApiException(HttpStatus.CONFLICT, code, message);
     }
 
+    public static ApiException forbidden(String code, String message) {
+        return new ApiException(HttpStatus.FORBIDDEN, code, message);
+    }
+
     public static ApiException quotaExceeded(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "QUOTA_EXCEEDED", message);
+    }
+
+    /** 422 越限（盐负荷等），携带可区分错误码。 */
+    public static ApiException unprocessable(String code, String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, code, message);
     }
 }

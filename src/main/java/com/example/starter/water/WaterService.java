@@ -3,12 +3,18 @@ package com.example.starter.water;
 import com.example.starter.water.WaterRepository.AllocationRow;
 import com.example.starter.water.WaterRepository.CommandRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
+import com.example.starter.water.WaterRepository.LedgerRow;
+import com.example.starter.water.WaterRepository.PlotRow;
 import com.example.starter.water.WaterRepository.TransferRow;
 import com.example.starter.water.WaterRepository.WindowRow;
 import com.example.starter.water.dto.Dtos.AllocationResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.IrrigationResponse;
+import com.example.starter.water.dto.Dtos.PlotResponse;
+import com.example.starter.water.dto.Dtos.PlotSaltResponse;
+import com.example.starter.water.dto.Dtos.SaltLedgerEntry;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferResponse;
 import com.example.starter.water.dto.Dtos.WindowResponse;
@@ -73,7 +79,7 @@ public class WaterService {
         }
         BigDecimal planned = parseAmount("plannedVolume", plannedVolume);
         String params = "WINDOW_CREATE|" + windowKey + "|" + channelId + "|" + startNanos + "|" + endNanos
-                + "|" + planned.toPlainString();
+                + "|" + fmt(planned);
         return runCommand("WINDOW_CREATE", commandKey, params, WindowResponse.class, () -> {
             if (repository.existsOverlappingWindow(channelId, startNanos, endNanos)) {
                 throw ApiException.conflict("WINDOW_OVERLAP", "同一渠道存在时间重叠的供水窗口");
@@ -84,9 +90,10 @@ public class WaterService {
         });
     }
 
-    /** 提交配水申请，申请人为 actor。 */
+    /** 提交配水申请，申请人为 actor；plotId 与 concentration 同时提供（绑定田块）或同时省略（旧流程）。 */
     public AllocationResponse submitAllocation(String commandKey, String allocationKey, Long windowId,
-                                               String userId, String amount, String actor) {
+                                               String userId, String amount, Long plotId,
+                                               String concentration, String actor) {
         requireKey("commandKey", commandKey);
         requireKey("allocationKey", allocationKey);
         requireKey("userId", userId);
@@ -94,20 +101,34 @@ public class WaterService {
         if (windowId == null) {
             throw ApiException.badRequest("INVALID_ARGUMENT", "windowId 不能为空");
         }
+        if ((plotId == null) != (concentration == null)) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "plotId 与 concentration 必须同时提供或同时省略");
+        }
         BigDecimal qty = parseAmount("amount", amount);
+        BigDecimal conc = concentration == null ? null : parseConcentration("concentration", concentration);
         String params = "ALLOCATION_SUBMIT|" + allocationKey + "|" + windowId + "|" + userId + "|"
-                + qty.toPlainString() + "|" + actor;
+                + fmt(qty) + "|" + actor + "|" + (plotId == null ? "-" : plotId)
+                + "|" + (conc == null ? "-" : fmt(conc));
         return runCommand("ALLOCATION_SUBMIT", commandKey, params, AllocationResponse.class, () -> {
             WindowRow window = repository.lockWindowById(windowId);
             if (window == null) {
                 throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + windowId);
             }
-            long id = repository.insertAllocation(allocationKey, windowId, userId, qty, actor, nowNanos());
+            if (plotId != null) {
+                PlotRow plot = repository.findPlotById(plotId);
+                if (plot == null) {
+                    throw ApiException.notFound("PLOT_NOT_FOUND", "田块不存在: " + plotId);
+                }
+                if (!plot.farmerId().equals(userId)) {
+                    throw ApiException.forbidden("PLOT_OWNER_MISMATCH", "田块不属于用水户: " + userId);
+                }
+            }
+            repository.insertAllocation(allocationKey, windowId, userId, qty, actor, plotId, conc, nowNanos());
             return toAllocationResponse(repository.findAllocationByKey(allocationKey));
         });
     }
 
-    /** 批准申请：加入本申请后已批准总量不得超过当前可用总量，否则 422。 */
+    /** 批准申请：加入本申请后已批准总量不得超过当前可用总量，否则 422；绑定田块时盐预算也不得超限。 */
     public AllocationResponse approveAllocation(String commandKey, String allocationKey) {
         requireKey("commandKey", commandKey);
         requireKey("allocationKey", allocationKey);
@@ -118,6 +139,10 @@ public class WaterService {
                 throw ApiException.notFound("ALLOCATION_NOT_FOUND", "配水申请不存在: " + allocationKey);
             }
             WindowRow window = lockWindowOf(allocation);
+            // 锁顺序：窗口 -> 田块 -> 申请行；田块锁串行化同一田块跨窗口的批准与实灌
+            if (allocation.plotId() != null) {
+                lockPlot(allocation.plotId());
+            }
             // 窗口锁内重读申请，避免与转让/取消并发时使用过期状态与持有额度
             allocation = repository.lockAllocationByKey(allocationKey);
             switch (allocation.status()) {
@@ -133,12 +158,20 @@ public class WaterService {
             if (approved.add(allocation.amount()).compareTo(available) > 0) {
                 throw ApiException.quotaExceeded("批准后将超过当前可用总量 " + fmt(available));
             }
+            if (allocation.plotId() != null) {
+                verifyPlotOwnership(allocation);
+                checkSaltBudget(allocation.plotId(),
+                        allocation.amount().multiply(allocation.concentration()));
+            }
             repository.updateAllocationStatus(allocation.id(), STATUS_APPROVED, nowNanos());
             return toAllocationResponse(repository.findAllocationByKey(allocationKey));
         });
     }
 
-    /** 取消申请：仅申请人本人可取消 REQUESTED/APPROVED，取消不可恢复并立即释放水量。 */
+    /**
+     * 取消申请：仅申请人本人可取消 REQUESTED/APPROVED，取消不可恢复。
+     * 仅释放未灌盐量与相应未灌水额度；已实灌部分留在盐负荷账本且水额度继续占用，不可释放。
+     */
     public AllocationResponse cancelAllocation(String commandKey, String allocationKey, String actor) {
         requireKey("commandKey", commandKey);
         requireKey("allocationKey", allocationKey);
@@ -158,6 +191,7 @@ public class WaterService {
             if (STATUS_CANCELLED.equals(allocation.status())) {
                 throw ApiException.conflict("ALLOCATION_ALREADY_CANCELLED", "申请已取消，不能重复取消");
             }
+            verifyPlotOwnership(allocation);
             repository.updateAllocationStatus(allocation.id(), STATUS_CANCELLED, nowNanos());
             return toAllocationResponse(repository.findAllocationByKey(allocationKey));
         });
@@ -193,6 +227,8 @@ public class WaterService {
             }
             // 先锁窗口行，与普通批准、取消、限供调整按事务提交顺序串行裁决
             lockWindowOf(source);
+            // 再按主键升序锁定两侧田块（如有），与批准、实灌保持一致的锁顺序
+            lockPlotsOf(source, target);
             // 窗口锁内再锁定源/目标申请行，得到最新状态与持有额度
             AllocationRow lockedSource = repository.lockAllocationByKey(sourceAllocationKey);
             AllocationRow lockedTarget = repository.lockAllocationByKey(targetAllocationKey);
@@ -211,10 +247,19 @@ public class WaterService {
             if (lockedSource.userId().equals(lockedTarget.userId())) {
                 throw ApiException.conflict("SAME_USER", "转让双方必须属于不同用水户");
             }
+            // 共同核对两侧农户与田块归属
+            verifyPlotOwnership(lockedSource);
+            verifyPlotOwnership(lockedTarget);
             BigDecimal amount = lockedTarget.amount();
-            if (lockedSource.heldAmount().compareTo(amount) < 0) {
-                throw ApiException.quotaExceeded("源申请当前持有额度 " + fmt(lockedSource.heldAmount())
+            // 已实灌部分不能转让：可转让额度 = 持有额度 - 已实灌水量
+            BigDecimal transferable = lockedSource.heldAmount().subtract(lockedSource.irrigatedAmount());
+            if (transferable.compareTo(amount) < 0) {
+                throw ApiException.quotaExceeded("源申请未灌额度 " + fmt(transferable)
                         + " 不足，无法转让 " + fmt(amount));
+            }
+            // 重新核对目标侧浓度与盐预算，不凭来源总水量推断盐量相同
+            if (lockedTarget.plotId() != null) {
+                checkSaltBudget(lockedTarget.plotId(), amount.multiply(lockedTarget.concentration()));
             }
             long now = nowNanos();
             repository.decrementHeldAmount(lockedSource.id(), amount, now);
@@ -241,11 +286,118 @@ public class WaterService {
         return new TransferListResponse(windowId, transfers);
     }
 
+    /** 创建农户田块：操作人须为农户本人，盐量上限为不可变正整数（克）。 */
+    public PlotResponse createPlot(String requestId, String plotKey, String farmerId,
+                                   Long saltLimitGrams, String actor) {
+        requireKey("requestId", requestId);
+        requireKey("plotKey", plotKey);
+        requireKey("farmerId", farmerId);
+        requireKey("X-Actor-Id", actor);
+        if (saltLimitGrams == null || saltLimitGrams <= 0) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "saltLimitGrams 必须为正整数（单位克）");
+        }
+        if (!farmerId.equals(actor)) {
+            throw ApiException.forbidden("NOT_OWNER", "只能为农户本人创建田块");
+        }
+        String params = "PLOT_CREATE|" + plotKey + "|" + farmerId + "|" + saltLimitGrams + "|" + actor;
+        return runCommand("PLOT_CREATE", requestId, params, PlotResponse.class, () -> {
+            if (repository.findPlotByKey(plotKey) != null) {
+                throw ApiException.conflict("PLOT_KEY_REUSED", "plotKey 已被使用: " + plotKey);
+            }
+            try {
+                repository.insertPlot(plotKey, farmerId, saltLimitGrams, nowNanos());
+            } catch (DuplicateKeyException e) {
+                // 并发同 plotKey：事务回滚，requestId 不被占用
+                throw ApiException.conflict("PLOT_KEY_REUSED", "plotKey 已被使用: " + plotKey);
+            }
+            return toPlotResponse(repository.findPlotByKey(plotKey));
+        });
+    }
+
+    /**
+     * 实际灌入：对已批准申请提交正水量（不超过未灌量 = 持有额度 - 已实灌），
+     * 等量预留盐转为不可逆实灌盐并冻结入账；需携带期望版本，归属错误 403，越限 422。
+     */
+    public IrrigationResponse irrigate(String requestId, String allocationKey, String volume,
+                                       Long expectedVersion, String actor) {
+        requireKey("requestId", requestId);
+        requireKey("allocationKey", allocationKey);
+        requireKey("X-Actor-Id", actor);
+        if (expectedVersion == null) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "expectedVersion 不能为空");
+        }
+        BigDecimal qty = parseAmount("volume", volume);
+        String params = "IRRIGATE|" + allocationKey + "|" + fmt(qty) + "|" + expectedVersion
+                + "|" + actor;
+        return runCommand("IRRIGATE", requestId, params, IrrigationResponse.class, () -> {
+            AllocationRow allocation = repository.findAllocationByKey(allocationKey);
+            if (allocation == null) {
+                throw ApiException.notFound("ALLOCATION_NOT_FOUND", "配水申请不存在: " + allocationKey);
+            }
+            // 锁顺序与批准一致：先田块后申请行
+            if (allocation.plotId() != null) {
+                lockPlot(allocation.plotId());
+            }
+            allocation = repository.lockAllocationByKey(allocationKey);
+            if (!allocation.requester().equals(actor)) {
+                throw ApiException.forbidden("NOT_OWNER", "只有申请人本人可以提交实灌");
+            }
+            if (!STATUS_APPROVED.equals(allocation.status())) {
+                throw ApiException.conflict("ALLOCATION_NOT_APPROVED", "只有 APPROVED 状态的申请可以实灌");
+            }
+            if (allocation.version() != expectedVersion) {
+                throw ApiException.conflict("VERSION_CONFLICT", "期望版本 " + expectedVersion
+                        + " 与当前版本 " + allocation.version() + " 不一致");
+            }
+            BigDecimal unirrigated = allocation.heldAmount().subtract(allocation.irrigatedAmount());
+            if (qty.compareTo(unirrigated) > 0) {
+                throw ApiException.unprocessable("IRRIGATE_EXCEEDS_UNIRRIGATED",
+                        "实灌水量 " + fmt(qty) + " 超过未灌量 " + fmt(unirrigated));
+            }
+            long now = nowNanos();
+            repository.addIrrigatedAmount(allocation.id(), qty, now);
+            BigDecimal salt = null;
+            BigDecimal cumulative = null;
+            if (allocation.plotId() != null) {
+                // 精确乘积，不先舍入；累计在田块锁内求和，冻结入账后不再改变
+                salt = allocation.concentration().multiply(qty);
+                cumulative = cumulativeSalt(allocation.plotId()).add(salt);
+                repository.insertLedger(allocation.plotId(), allocationKey, allocation.concentration(),
+                        qty, salt, cumulative, actor, now);
+            }
+            AllocationRow updated = repository.findAllocationByKey(allocationKey);
+            return new IrrigationResponse(allocationKey, updated.windowId(), fmt(qty),
+                    fmt(updated.irrigatedAmount()),
+                    updated.concentration() == null ? null : fmt(updated.concentration()),
+                    salt == null ? null : fmt(salt),
+                    cumulative == null ? null : fmt(cumulative),
+                    updated.version(), toIso(now));
+        });
+    }
+
+    /** 查询田块盐负荷：累计实灌 + 全部预留 + 不可变账本明细。 */
+    public PlotSaltResponse getPlotSalt(long plotId) {
+        PlotRow plot = repository.findPlotById(plotId);
+        if (plot == null) {
+            throw ApiException.notFound("PLOT_NOT_FOUND", "田块不存在: " + plotId);
+        }
+        BigDecimal cumulative = cumulativeSalt(plotId);
+        BigDecimal reserved = reservedSalt(plotId);
+        BigDecimal remaining = BigDecimal.valueOf(plot.saltLimitGrams()).subtract(cumulative).subtract(reserved);
+        List<SaltLedgerEntry> ledger = repository.listLedger(plotId).stream()
+                .map(row -> new SaltLedgerEntry(row.allocationKey(), fmt(row.concentration()),
+                        fmt(row.volume()), fmt(row.saltGrams()), fmt(row.cumulativeGrams()),
+                        row.actor(), toIso(row.createdNanos())))
+                .toList();
+        return new PlotSaltResponse(plot.id(), plot.plotKey(), plot.farmerId(), plot.saltLimitGrams(),
+                fmt(cumulative), fmt(reserved), fmt(remaining), ledger);
+    }
+
     /** 创建限供：仅当当前已批准总量不超过拟定限供水量时允许。 */
     public CurtailmentResponse createCurtailment(String commandKey, long windowId, String volume) {
         requireKey("commandKey", commandKey);
         BigDecimal qty = parseAmount("volume", volume);
-        String params = "CURTAILMENT_CREATE|" + windowId + "|" + qty.toPlainString();
+        String params = "CURTAILMENT_CREATE|" + windowId + "|" + fmt(qty);
         return runCommand("CURTAILMENT_CREATE", commandKey, params, CurtailmentResponse.class, () -> {
             WindowRow window = repository.lockWindowById(windowId);
             if (window == null) {
@@ -364,6 +516,80 @@ public class WaterService {
         return window;
     }
 
+    /** 锁定田块行（FOR UPDATE），串行化同一田块的盐预算核对与实灌入账。 */
+    private PlotRow lockPlot(long plotId) {
+        PlotRow plot = repository.lockPlotById(plotId);
+        if (plot == null) {
+            throw ApiException.notFound("PLOT_NOT_FOUND", "田块不存在: " + plotId);
+        }
+        return plot;
+    }
+
+    /** 按主键升序锁定两侧申请绑定的田块（如有），避免死锁。 */
+    private void lockPlotsOf(AllocationRow source, AllocationRow target) {
+        if (source.plotId() == null && target.plotId() == null) {
+            return;
+        }
+        if (source.plotId() != null && source.plotId().equals(target.plotId())) {
+            lockPlot(source.plotId());
+            return;
+        }
+        Long first = source.plotId() == null ? target.plotId()
+                : target.plotId() == null ? source.plotId()
+                : source.plotId() < target.plotId() ? source.plotId() : target.plotId();
+        Long second = first.equals(source.plotId()) ? target.plotId() : source.plotId();
+        lockPlot(first);
+        if (second != null) {
+            lockPlot(second);
+        }
+    }
+
+    /** 共同核对农户与田块归属：绑定田块的申请，其用水户必须等于田块所属农户，否则 403。 */
+    private void verifyPlotOwnership(AllocationRow allocation) {
+        if (allocation.plotId() == null) {
+            return;
+        }
+        PlotRow plot = repository.findPlotById(allocation.plotId());
+        if (plot == null) {
+            throw ApiException.notFound("PLOT_NOT_FOUND", "田块不存在: " + allocation.plotId());
+        }
+        if (!plot.farmerId().equals(allocation.userId())) {
+            throw ApiException.forbidden("PLOT_OWNER_MISMATCH",
+                    "田块 " + allocation.plotId() + " 不属于用水户 " + allocation.userId());
+        }
+    }
+
+    /** 田块累计实灌盐量（账本精确求和，克）。 */
+    private BigDecimal cumulativeSalt(long plotId) {
+        BigDecimal sum = BigDecimal.ZERO;
+        for (LedgerRow row : repository.listLedger(plotId)) {
+            sum = sum.add(row.saltGrams());
+        }
+        return sum;
+    }
+
+    /** 田块全部预留盐量：APPROVED 申请的未灌水量 × 各自浓度，精确求和（克）。 */
+    private BigDecimal reservedSalt(long plotId) {
+        BigDecimal sum = BigDecimal.ZERO;
+        for (AllocationRow row : repository.listApprovedByPlot(plotId)) {
+            sum = sum.add(row.heldAmount().subtract(row.irrigatedAmount()).multiply(row.concentration()));
+        }
+        return sum;
+    }
+
+    /** 盐预算核对：累计实灌 + 全部预留 + 本次新增预留 不得超过田块上限，否则 422。 */
+    private void checkSaltBudget(long plotId, BigDecimal additionalReserved) {
+        PlotRow plot = repository.findPlotById(plotId);
+        if (plot == null) {
+            throw ApiException.notFound("PLOT_NOT_FOUND", "田块不存在: " + plotId);
+        }
+        BigDecimal total = cumulativeSalt(plotId).add(reservedSalt(plotId)).add(additionalReserved);
+        if (total.compareTo(BigDecimal.valueOf(plot.saltLimitGrams())) > 0) {
+            throw ApiException.unprocessable("SALT_LIMIT_EXCEEDED",
+                    "盐负荷 " + fmt(total) + " 克将超过田块上限 " + plot.saltLimitGrams() + " 克");
+        }
+    }
+
     private BigDecimal availableTotal(WindowRow window) {
         CurtailmentRow active = repository.findActiveCurtailment(window.id());
         return active != null ? active.volume() : window.plannedVolume();
@@ -379,7 +605,14 @@ public class WaterService {
     private AllocationResponse toAllocationResponse(AllocationRow row) {
         return new AllocationResponse(row.allocationKey(), row.windowId(), row.userId(), fmt(row.amount()),
                 fmt(row.heldAmount()), row.requester(), row.status(),
-                toIso(row.createdNanos()), toIso(row.updatedNanos()));
+                toIso(row.createdNanos()), toIso(row.updatedNanos()),
+                row.plotId(), row.concentration() == null ? null : fmt(row.concentration()),
+                fmt(row.irrigatedAmount()), row.version());
+    }
+
+    private PlotResponse toPlotResponse(PlotRow row) {
+        return new PlotResponse(row.id(), row.plotKey(), row.farmerId(), row.saltLimitGrams(),
+                toIso(row.createdNanos()));
     }
 
     private TransferResponse toTransferResponse(TransferRow row) {
@@ -437,6 +670,19 @@ public class WaterService {
             throw ApiException.badRequest("INVALID_ARGUMENT", field + " 必须大于 0");
         }
         return amount;
+    }
+
+    /** 解析浓度：非负十进制字符串（允许 0），最多 3 位小数，单位克每立方米。 */
+    static BigDecimal parseConcentration(String field, String value) {
+        if (value == null || value.isBlank()) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", field + " 不能为空");
+        }
+        String trimmed = value.trim();
+        if (!AMOUNT_PATTERN.matcher(trimmed).matches()) {
+            throw ApiException.badRequest("INVALID_ARGUMENT",
+                    field + " 必须为非负十进制字符串，最多 3 位小数: " + value);
+        }
+        return new BigDecimal(trimmed);
     }
 
     static void requireKey(String field, String value) {
