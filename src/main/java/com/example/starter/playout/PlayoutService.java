@@ -7,6 +7,7 @@ import com.example.starter.playout.PlayoutRepository.PublicationRow;
 import com.example.starter.playout.PlayoutRepository.PublicationSegmentRow;
 import com.example.starter.playout.PlayoutRepository.RequestRow;
 import com.example.starter.playout.PlayoutRepository.SegmentRow;
+import com.example.starter.playout.PlayoutRepository.TransitionRow;
 import com.example.starter.playout.api.ApiException;
 import com.example.starter.playout.api.Dtos.AssetResponse;
 import com.example.starter.playout.api.Dtos.ChannelResponse;
@@ -19,6 +20,8 @@ import com.example.starter.playout.api.Dtos.DraftResponse;
 import com.example.starter.playout.api.Dtos.EmergencyOverrideResponse;
 import com.example.starter.playout.api.Dtos.FallbackReason;
 import com.example.starter.playout.api.Dtos.GrantResponse;
+import com.example.starter.playout.api.Dtos.MixDecision;
+import com.example.starter.playout.api.Dtos.MixSegment;
 import com.example.starter.playout.api.Dtos.OverrideStatus;
 import com.example.starter.playout.api.Dtos.PlayoutDecisionResponse;
 import com.example.starter.playout.api.Dtos.PublishRequest;
@@ -26,6 +29,8 @@ import com.example.starter.playout.api.Dtos.PublishResponse;
 import com.example.starter.playout.api.Dtos.ReplaceDraftRequest;
 import com.example.starter.playout.api.Dtos.SegmentInput;
 import com.example.starter.playout.api.Dtos.SegmentResponse;
+import com.example.starter.playout.api.Dtos.TransitionInput;
+import com.example.starter.playout.api.Dtos.TransitionResponse;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
@@ -40,7 +45,10 @@ import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.function.Supplier;
@@ -66,6 +74,9 @@ public class PlayoutService {
 
     /** 紧急插播时长上限（含）：30 分钟，单位毫秒。 */
     private static final long OVERRIDE_MAX_DURATION_MS = 30L * 60L * 1000L;
+
+    /** 交叉淡化时长上限（含）：10 秒，单位毫秒。 */
+    private static final long CROSSFADE_MAX_FADE_MS = 10_000L;
 
     private final PlayoutRepository repo;
     private final ObjectMapper objectMapper;
@@ -158,9 +169,11 @@ public class PlayoutService {
                 .orElseThrow(() -> ApiException.notFound("频道不存在: " + channelId));
 
         String hash = sha256(OP_REPLACE_DRAFT + "|" + channelId + "|" + businessDay
-                + "|" + request.expectedDraftVersion() + "|" + canonicalSegments(request.segments()));
+                + "|" + canonicalDraftParams(request));
         return idempotent(request.requestId(), OP_REPLACE_DRAFT, hash, DraftResponse.class, () -> {
             List<ValidatedSegment> segments = validateSegments(channelId, businessDay, request.segments());
+            List<ValidatedTransition> transitions = validateTransitions(request.transitions(), segments);
+            validateSegmentGrants(channelId, segments);
             long newVersion;
             if (request.expectedDraftVersion() == 0) {
                 try {
@@ -180,12 +193,18 @@ public class PlayoutService {
                 newVersion = request.expectedDraftVersion() + 1;
             }
             repo.deleteDraftSegments(channelId, businessDay);
+            repo.deleteDraftTransitions(channelId, businessDay);
             for (ValidatedSegment segment : segments) {
                 repo.insertDraftSegment(segment.id(), channelId, businessDay,
                         segment.assetId(), segment.startMs(), segment.endMs());
             }
+            for (ValidatedTransition transition : transitions) {
+                repo.insertDraftTransition(transition.id(), channelId, businessDay,
+                        transition.fromSegmentId(), transition.toSegmentId(), transition.fadeMs());
+            }
             return new DraftResponse(channelId, businessDay.toString(), newVersion,
-                    segments.stream().map(ValidatedSegment::toResponse).toList());
+                    segments.stream().map(ValidatedSegment::toResponse).toList(),
+                    transitions.stream().map(ValidatedTransition::toResponse).toList());
         });
     }
 
@@ -234,6 +253,11 @@ public class PlayoutService {
                 repo.insertPublicationSegment(publicationId, segment.id(), segment.assetId(),
                         grantIds.get(i), segment.startMs(), segment.endMs());
             }
+            // 交叉淡化随发布冻结进快照，历史不因草稿后续替换而重算
+            for (TransitionRow transition : repo.findDraftTransitions(channelId, businessDay)) {
+                repo.insertPublicationTransition(publicationId, transition.fromSegmentId(),
+                        transition.toSegmentId(), transition.fadeMs());
+            }
             return new PublishResponse(publicationId, channelId, businessDay.toString(),
                     newVersion, draft.version());
         });
@@ -257,7 +281,7 @@ public class PlayoutService {
         if (override.isPresent()) {
             OverrideRow hit = override.get();
             return new PlayoutDecisionResponse(channelId, at, hit.assetId(),
-                    DecisionSource.EMERGENCY, null, null, null, hit.overrideKey());
+                    DecisionSource.EMERGENCY, null, null, null, hit.overrideKey(), null);
         }
 
         LocalDate businessDay = at.atZoneSameInstant(ZONE).toLocalDate();
@@ -266,6 +290,12 @@ public class PlayoutService {
         if (publication.isEmpty()) {
             return fallback(channelId, at, channel.fallbackAssetId(),
                     FallbackReason.NO_PUBLISHED_SCHEDULE);
+        }
+        // 交叉淡化重叠区优先于单片段判定：重叠区内必须给出整组混音决策
+        Optional<PlayoutDecisionResponse> mix =
+                mixDecisionAt(channelId, at, atMs, publication.get(), channel.fallbackAssetId());
+        if (mix.isPresent()) {
+            return mix.get();
         }
         Optional<PublicationSegmentRow> segment =
                 repo.findPublicationSegmentAt(publication.get().id(), atMs);
@@ -281,11 +311,57 @@ public class PlayoutService {
             return new PlayoutDecisionResponse(channelId, at, channel.fallbackAssetId(),
                     DecisionSource.FALLBACK,
                     FallbackReason.GRANT_REVOKED,
-                    publication.get().id(), hit.segmentId(), null);
+                    publication.get().id(), hit.segmentId(), null, null);
         }
         return new PlayoutDecisionResponse(channelId, at, hit.assetId(),
                 DecisionSource.PROGRAM, null,
-                publication.get().id(), hit.segmentId(), null);
+                publication.get().id(), hit.segmentId(), null, null);
+    }
+
+    /**
+     * 时刻落在某条已发布交叉淡化的重叠区 [后片段开始, 前片段结束) 时，返回整组混音决策：
+     * 重叠进度 u 从 0（左端）线性趋近 1（右端），前素材增益 1-u、后素材增益 u。
+     * 任一重叠素材的发布授权已撤销时，整组回退频道保底素材（CROSSFADE_GRANT_REVOKED），
+     * 不能只播另一条。不在任何重叠区时返回空。
+     */
+    private Optional<PlayoutDecisionResponse> mixDecisionAt(String channelId, OffsetDateTime at,
+                                                            long atMs, PublicationRow publication,
+                                                            String fallbackAssetId) {
+        List<TransitionRow> transitions = repo.findPublicationTransitions(publication.id());
+        for (TransitionRow transition : transitions) {
+            PublicationSegmentRow next = repo.findPublicationSegmentBySegmentId(
+                    publication.id(), transition.toSegmentId())
+                    .orElseThrow(() -> ApiException.unprocessable("SNAPSHOT_INCOMPLETE",
+                            "发布快照缺少淡化后片段: " + transition.toSegmentId()));
+            PublicationSegmentRow prev = repo.findPublicationSegmentBySegmentId(
+                    publication.id(), transition.fromSegmentId())
+                    .orElseThrow(() -> ApiException.unprocessable("SNAPSHOT_INCOMPLETE",
+                            "发布快照缺少淡化前片段: " + transition.fromSegmentId()));
+            long overlapStartMs = next.startMs();
+            long overlapEndMs = prev.endMs();
+            if (atMs < overlapStartMs || atMs >= overlapEndMs) {
+                continue;
+            }
+            GrantRow prevGrant = repo.findGrant(prev.grantId())
+                    .orElseThrow(() -> ApiException.unprocessable("SNAPSHOT_INCOMPLETE",
+                            "发布快照引用的授权不存在: " + prev.grantId()));
+            GrantRow nextGrant = repo.findGrant(next.grantId())
+                    .orElseThrow(() -> ApiException.unprocessable("SNAPSHOT_INCOMPLETE",
+                            "发布快照引用的授权不存在: " + next.grantId()));
+            if (prevGrant.revoked() || nextGrant.revoked()) {
+                return Optional.of(new PlayoutDecisionResponse(channelId, at, fallbackAssetId,
+                        DecisionSource.FALLBACK, FallbackReason.CROSSFADE_GRANT_REVOKED,
+                        publication.id(), null, null, null));
+            }
+            double u = (double) (atMs - overlapStartMs) / (double) transition.fadeMs();
+            MixDecision mix = new MixDecision(
+                    new MixSegment(prev.segmentId(), prev.assetId(), prev.grantId(), 1.0 - u),
+                    new MixSegment(next.segmentId(), next.assetId(), next.grantId(), u),
+                    u);
+            return Optional.of(new PlayoutDecisionResponse(channelId, at, null,
+                    DecisionSource.MIX, null, publication.id(), null, null, mix));
+        }
+        return Optional.empty();
     }
 
     /**
@@ -430,7 +506,7 @@ public class PlayoutService {
 
     // ---------- 内部方法 ----------
 
-    /** 校验并规范化草稿片段：非空、区间内、不跨日、不重叠、素材存在且被单条未撤销授权完整覆盖。 */
+    /** 校验并规范化草稿片段基础字段：非空、终点大于起点、不跨日；重叠规则见 validateTransitions。 */
     private List<ValidatedSegment> validateSegments(String channelId, LocalDate businessDay,
                                                     List<SegmentInput> inputs) {
         long dayStartMs = businessDay.atStartOfDay(ZONE).toInstant().toEpochMilli();
@@ -457,18 +533,120 @@ public class PlayoutService {
                     ? UUID.randomUUID().toString() : input.id();
             segments.add(new ValidatedSegment(id, input.assetId(), startMs, endMs));
         }
+        return segments;
+    }
+
+    /**
+     * 校验交叉淡化并检查片段重叠规则：普通草稿（无淡化声明）保持任意片段不得重叠；
+     * 声明淡化时要求前后片段在时间上相邻、后一片段开始 = 前一片段结束 - 淡化时长、
+     * 淡化时长 0~10 秒且不超过两片段任一时长、任意时刻不得三片段同时存在；
+     * 参与淡化的片段时长必须等于已登记素材的整秒时长。
+     */
+    private List<ValidatedTransition> validateTransitions(List<TransitionInput> inputs,
+                                                          List<ValidatedSegment> segments) {
+        List<TransitionInput> declared = inputs == null ? List.of() : inputs;
+        Map<String, ValidatedSegment> byId = new HashMap<>();
+        for (ValidatedSegment segment : segments) {
+            byId.put(segment.id(), segment);
+        }
+
+        List<ValidatedTransition> transitions = new ArrayList<>();
+        Map<String, ValidatedTransition> byNextId = new HashMap<>();
+        for (TransitionInput input : declared) {
+            if (input.fromSegmentId() == null || input.fromSegmentId().isBlank()
+                    || input.toSegmentId() == null || input.toSegmentId().isBlank()
+                    || input.durationMs() == null) {
+                throw ApiException.badRequest("淡化的前后片段与时长不能为空");
+            }
+            ValidatedSegment prev = byId.get(input.fromSegmentId());
+            ValidatedSegment next = byId.get(input.toSegmentId());
+            if (prev == null || next == null) {
+                throw ApiException.badRequest("淡化引用的片段不在本草稿中: "
+                        + input.fromSegmentId() + " -> " + input.toSegmentId());
+            }
+            if (prev.id().equals(next.id())) {
+                throw ApiException.badRequest("淡化前后片段不能相同: " + prev.id());
+            }
+            long fadeMs = input.durationMs();
+            if (fadeMs < 0 || fadeMs > CROSSFADE_MAX_FADE_MS) {
+                throw ApiException.unprocessable("CROSSFADE_TOO_LONG",
+                        "淡化时长须在 0~10000 毫秒之间: " + fadeMs);
+            }
+            if (byNextId.containsKey(next.id())) {
+                throw ApiException.badRequest("同一片段被重复声明为淡化后片段: " + next.id());
+            }
+            String id = input.id() == null || input.id().isBlank()
+                    ? UUID.randomUUID().toString() : input.id();
+            ValidatedTransition transition =
+                    new ValidatedTransition(id, prev.id(), next.id(), fadeMs);
+            transitions.add(transition);
+            byNextId.put(next.id(), transition);
+        }
 
         List<ValidatedSegment> sorted = segments.stream()
                 .sorted(Comparator.comparingLong(ValidatedSegment::startMs)
                         .thenComparing(ValidatedSegment::id))
                 .toList();
-        for (int i = 1; i < sorted.size(); i++) {
-            if (sorted.get(i).startMs() < sorted.get(i - 1).endMs()) {
-                throw ApiException.unprocessable("SEGMENT_OVERLAP",
-                        "片段时间重叠: " + sorted.get(i - 1).id() + " 与 " + sorted.get(i).id());
+        long maxEndBeforePrev = Long.MIN_VALUE;
+        for (int i = 0; i < sorted.size(); i++) {
+            ValidatedSegment current = sorted.get(i);
+            if (i >= 2 && current.startMs() < maxEndBeforePrev) {
+                throw ApiException.unprocessable("CROSSFADE_TRIPLE_OVERLAP",
+                        "任意时刻不得有三个片段同时存在: " + current.id());
+            }
+            ValidatedTransition incoming = byNextId.get(current.id());
+            if (i == 0) {
+                if (incoming != null) {
+                    throw ApiException.unprocessable("TRANSITION_NOT_ADJACENT",
+                            "淡化前片段不是后片段的时间前驱: " + incoming.fromSegmentId()
+                                    + " -> " + incoming.toSegmentId());
+                }
+            } else {
+                ValidatedSegment predecessor = sorted.get(i - 1);
+                if (incoming != null && !incoming.fromSegmentId().equals(predecessor.id())) {
+                    throw ApiException.unprocessable("TRANSITION_NOT_ADJACENT",
+                            "淡化前片段不是后片段的时间前驱: " + incoming.fromSegmentId()
+                                    + " -> " + incoming.toSegmentId());
+                }
+                if (incoming != null) {
+                    if (current.startMs() != predecessor.endMs() - incoming.fadeMs()) {
+                        throw ApiException.unprocessable("CROSSFADE_TIMING_MISMATCH",
+                                "后一片段开始须等于前一片段结束减淡化时长: " + incoming.toSegmentId());
+                    }
+                    if (incoming.fadeMs() > predecessor.durationMs()
+                            || incoming.fadeMs() > current.durationMs()) {
+                        throw ApiException.unprocessable("CROSSFADE_TOO_LONG",
+                                "淡化时长不得超过两片段任一时长: " + incoming.toSegmentId());
+                    }
+                } else if (current.startMs() < predecessor.endMs()) {
+                    throw ApiException.unprocessable("SEGMENT_OVERLAP",
+                            "片段时间重叠且未声明交叉淡化: " + predecessor.id() + " 与 " + current.id());
+                }
+                maxEndBeforePrev = Math.max(maxEndBeforePrev, predecessor.endMs());
             }
         }
 
+        // 混音草稿：参与淡化的片段时长取已登记素材的整秒时长
+        for (ValidatedTransition transition : transitions) {
+            for (String segmentId : List.of(transition.fromSegmentId(), transition.toSegmentId())) {
+                ValidatedSegment segment = byId.get(segmentId);
+                var asset = repo.findAsset(segment.assetId())
+                        .orElseThrow(() -> ApiException.notFound("素材不存在: " + segment.assetId()));
+                if (asset.durationMs() % 1000 != 0) {
+                    throw ApiException.unprocessable("ASSET_DURATION_NOT_WHOLE_SECONDS",
+                            "参与淡化的素材时长须为整秒: " + segment.assetId());
+                }
+                if (segment.durationMs() != asset.durationMs()) {
+                    throw ApiException.unprocessable("SEGMENT_DURATION_MISMATCH",
+                            "参与淡化的片段时长须等于素材登记时长: " + segmentId);
+                }
+            }
+        }
+        return transitions;
+    }
+
+    /** 校验片段素材存在且被单条未撤销授权完整覆盖（覆盖含淡化重叠区在内的完整实际播放区间）。 */
+    private void validateSegmentGrants(String channelId, List<ValidatedSegment> segments) {
         for (ValidatedSegment segment : segments) {
             if (repo.findAsset(segment.assetId()).isEmpty()) {
                 throw ApiException.notFound("素材不存在: " + segment.assetId());
@@ -480,7 +658,6 @@ public class PlayoutService {
                         "片段未被单条有效授权完整覆盖: " + segment.id());
             }
         }
-        return segments;
     }
 
     /** 发布时加行锁选取覆盖授权；不存在或未撤销的覆盖授权时 422 拒绝整次发布。 */
@@ -541,21 +718,45 @@ public class PlayoutService {
         }
     }
 
-    private static String canonicalSegments(List<SegmentInput> segments) {
-        StringBuilder sb = new StringBuilder();
-        for (SegmentInput s : segments) {
-            sb.append(s.id() == null ? "" : s.id()).append(',')
-                    .append(s.assetId()).append(',')
-                    .append(s.start() == null ? "" : toMs(s.start())).append(',')
-                    .append(s.end() == null ? "" : toMs(s.end())).append(';');
+    /**
+     * 草稿参数的结构化规范化形式（JSON）：包含期望版本、片段与淡化全部参数，
+     * 用于幂等参数哈希，避免分隔符拼接造成参数碰撞。
+     */
+    private String canonicalDraftParams(ReplaceDraftRequest request) {
+        Map<String, Object> params = new LinkedHashMap<>();
+        params.put("expectedDraftVersion", request.expectedDraftVersion());
+        List<Map<String, Object>> segmentParams = new ArrayList<>();
+        for (SegmentInput segment : request.segments()) {
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.put("id", segment.id());
+            item.put("assetId", segment.assetId());
+            item.put("startMs", segment.start() == null ? null : toMs(segment.start()));
+            item.put("endMs", segment.end() == null ? null : toMs(segment.end()));
+            segmentParams.add(item);
         }
-        return sb.toString();
+        params.put("segments", segmentParams);
+        List<Map<String, Object>> transitionParams = new ArrayList<>();
+        for (TransitionInput transition
+                : request.transitions() == null ? List.<TransitionInput>of() : request.transitions()) {
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.put("id", transition.id());
+            item.put("fromSegmentId", transition.fromSegmentId());
+            item.put("toSegmentId", transition.toSegmentId());
+            item.put("durationMs", transition.durationMs());
+            transitionParams.add(item);
+        }
+        params.put("transitions", transitionParams);
+        try {
+            return objectMapper.writeValueAsString(params);
+        } catch (Exception e) {
+            throw new IllegalStateException("草稿参数序列化失败", e);
+        }
     }
 
     private PlayoutDecisionResponse fallback(String channelId, OffsetDateTime at, String assetId,
                                              FallbackReason reason) {
         return new PlayoutDecisionResponse(channelId, at, assetId,
-                DecisionSource.FALLBACK, reason, null, null, null);
+                DecisionSource.FALLBACK, reason, null, null, null, null);
     }
 
     private static long toMs(OffsetDateTime time) {
@@ -587,8 +788,20 @@ public class PlayoutService {
 
     /** 校验后的片段。 */
     private record ValidatedSegment(String id, String assetId, long startMs, long endMs) {
+        long durationMs() {
+            return endMs - startMs;
+        }
+
         SegmentResponse toResponse() {
             return new SegmentResponse(id, assetId, atMs(startMs), atMs(endMs));
+        }
+    }
+
+    /** 校验后的交叉淡化。 */
+    private record ValidatedTransition(String id, String fromSegmentId, String toSegmentId,
+                                       long fadeMs) {
+        TransitionResponse toResponse() {
+            return new TransitionResponse(id, fromSegmentId, toSegmentId, fadeMs);
         }
     }
 }

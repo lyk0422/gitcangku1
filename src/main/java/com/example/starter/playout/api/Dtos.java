@@ -68,11 +68,20 @@ public final class Dtos {
             @NotNull OffsetDateTime end) {
     }
 
-    /** 整份替换草稿请求。 */
+    /** 交叉淡化输入：fromSegmentId 淡出、toSegmentId 淡入；durationMs 为淡化时长，单位毫秒，0~10000。 */
+    public record TransitionInput(
+            String id,
+            @NotBlank String fromSegmentId,
+            @NotBlank String toSegmentId,
+            @NotNull @PositiveOrZero @Max(10000) Long durationMs) {
+    }
+
+    /** 整份替换草稿请求；transitions 为空（或缺省）时为普通无重叠草稿。 */
     public record ReplaceDraftRequest(
             @NotBlank String requestId,
             @NotNull @PositiveOrZero Long expectedDraftVersion,
-            @NotNull List<@NotNull SegmentInput> segments) {
+            @NotNull List<@NotNull SegmentInput> segments,
+            List<@NotNull TransitionInput> transitions) {
     }
 
     /** 草稿片段响应。 */
@@ -83,12 +92,21 @@ public final class Dtos {
             OffsetDateTime end) {
     }
 
+    /** 交叉淡化响应。 */
+    public record TransitionResponse(
+            String id,
+            String fromSegmentId,
+            String toSegmentId,
+            long durationMs) {
+    }
+
     /** 草稿响应。 */
     public record DraftResponse(
             String channelId,
             String businessDay,
             long version,
-            List<SegmentResponse> segments) {
+            List<SegmentResponse> segments,
+            List<TransitionResponse> transitions) {
     }
 
     /** 发布请求。 */
@@ -107,17 +125,35 @@ public final class Dtos {
             long draftVersion) {
     }
 
-    /** 播出决定来源：EMERGENCY 命中紧急插播，PROGRAM 命中节目片段，FALLBACK 返回保底素材。 */
+    /** 播出决定来源：EMERGENCY 命中紧急插播，PROGRAM 命中节目片段，MIX 命中交叉淡化重叠区，FALLBACK 返回保底素材。 */
     public enum DecisionSource {
-        EMERGENCY, PROGRAM, FALLBACK
+        EMERGENCY, PROGRAM, MIX, FALLBACK
     }
 
-    /** 保底原因：无已发布编排 / 处于空档 / 覆盖片段的授权已撤销。 */
+    /** 保底原因：无已发布编排 / 处于空档 / 覆盖片段的授权已撤销 / 交叉淡化重叠区任一素材授权已撤销（整组回退）。 */
     public enum FallbackReason {
-        NO_PUBLISHED_SCHEDULE, GAP, GRANT_REVOKED
+        NO_PUBLISHED_SCHEDULE, GAP, GRANT_REVOKED, CROSSFADE_GRANT_REVOKED
     }
 
-    /** 播出决定响应；source 为 FALLBACK 时 reason 非空；source 为 EMERGENCY 时 overrideKey 非空。 */
+    /** 混音决策中单个素材的增益；grantId 为发布时冻结的授权。 */
+    public record MixSegment(
+            String segmentId,
+            String assetId,
+            long grantId,
+            double gain) {
+    }
+
+    /**
+     * 交叉淡化混音决策：progress 为重叠进度 u（左端 0，趋近右端趋近 1）；
+     * 前素材增益 1-u，后素材增益 u；右端之后仅后素材播出（PROGRAM）。
+     */
+    public record MixDecision(
+            MixSegment previous,
+            MixSegment next,
+            double progress) {
+    }
+
+    /** 播出决定响应；source 为 FALLBACK 时 reason 非空；source 为 EMERGENCY 时 overrideKey 非空；source 为 MIX 时 mix 非空且 assetId 为空。 */
     public record PlayoutDecisionResponse(
             String channelId,
             OffsetDateTime at,
@@ -126,7 +162,8 @@ public final class Dtos {
             FallbackReason reason,
             Long publicationId,
             String segmentId,
-            String overrideKey) {
+            String overrideKey,
+            MixDecision mix) {
     }
 
     /** 紧急插播状态：创建即 ACTIVE，取消后为 CANCELLED，均为终态语义（ACTIVE 只能转为 CANCELLED）。 */

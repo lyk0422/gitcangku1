@@ -45,6 +45,17 @@ CREATE TABLE IF NOT EXISTS playout_draft_segment (
 );
 CREATE INDEX IF NOT EXISTS idx_draft_segment ON playout_draft_segment (channel_id, business_day);
 
+CREATE TABLE IF NOT EXISTS playout_draft_transition (
+    id              VARCHAR(64) NOT NULL PRIMARY KEY,
+    channel_id      VARCHAR(64) NOT NULL,
+    business_day    DATE        NOT NULL,
+    from_segment_id VARCHAR(64) NOT NULL,
+    to_segment_id   VARCHAR(64) NOT NULL,
+    fade_ms         BIGINT      NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_draft_transition
+    ON playout_draft_transition (channel_id, business_day);
+
 CREATE TABLE IF NOT EXISTS playout_publication (
     id                BIGINT      NOT NULL AUTO_INCREMENT PRIMARY KEY,
     channel_id        VARCHAR(64) NOT NULL,
@@ -66,6 +77,16 @@ CREATE TABLE IF NOT EXISTS playout_publication_segment (
     end_ms         BIGINT      NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pub_segment ON playout_publication_segment (publication_id);
+
+CREATE TABLE IF NOT EXISTS playout_publication_transition (
+    id              BIGINT      NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    publication_id  BIGINT      NOT NULL,
+    from_segment_id VARCHAR(64) NOT NULL,
+    to_segment_id   VARCHAR(64) NOT NULL,
+    fade_ms         BIGINT      NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pub_transition
+    ON playout_publication_transition (publication_id);
 
 CREATE TABLE IF NOT EXISTS playout_request (
     request_id    VARCHAR(64) NOT NULL PRIMARY KEY,

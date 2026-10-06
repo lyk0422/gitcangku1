@@ -49,6 +49,17 @@ CREATE TABLE IF NOT EXISTS playout_draft_segment (
     KEY idx_draft_segment (channel_id, business_day)
 ) COMMENT = '草稿片段表，随草稿整份替换而整体重建';
 
+CREATE TABLE IF NOT EXISTS playout_draft_transition (
+    id              VARCHAR(64) NOT NULL COMMENT '淡化 ID，客户端指定或系统生成',
+    channel_id      VARCHAR(64) NOT NULL COMMENT '所属频道 ID',
+    business_day    DATE        NOT NULL COMMENT '所属业务日，Asia/Shanghai 日历日',
+    from_segment_id VARCHAR(64) NOT NULL COMMENT '前一片段 ID（淡出方）',
+    to_segment_id   VARCHAR(64) NOT NULL COMMENT '后一片段 ID（淡入方）',
+    fade_ms         BIGINT      NOT NULL COMMENT '交叉淡化时长，单位毫秒，0~10000 且不超过两素材任一时长',
+    PRIMARY KEY (id),
+    KEY idx_draft_transition (channel_id, business_day)
+) COMMENT = '草稿交叉淡化表，随草稿整份替换而整体重建；后一片段开始 = 前一片段结束 - 淡化时长';
+
 CREATE TABLE IF NOT EXISTS playout_publication (
     id                BIGINT      NOT NULL AUTO_INCREMENT COMMENT '发布快照自增 ID',
     channel_id        VARCHAR(64) NOT NULL COMMENT '频道 ID',
@@ -71,6 +82,16 @@ CREATE TABLE IF NOT EXISTS playout_publication_segment (
     PRIMARY KEY (id),
     KEY idx_pub_segment (publication_id)
 ) COMMENT = '发布快照片段表，只读';
+
+CREATE TABLE IF NOT EXISTS playout_publication_transition (
+    id              BIGINT      NOT NULL AUTO_INCREMENT COMMENT '快照淡化自增 ID',
+    publication_id  BIGINT      NOT NULL COMMENT '所属发布快照 ID',
+    from_segment_id VARCHAR(64) NOT NULL COMMENT '前一片段 ID（淡出方）',
+    to_segment_id   VARCHAR(64) NOT NULL COMMENT '后一片段 ID（淡入方）',
+    fade_ms         BIGINT      NOT NULL COMMENT '交叉淡化时长，单位毫秒，发布时冻结',
+    PRIMARY KEY (id),
+    KEY idx_pub_transition (publication_id)
+) COMMENT = '发布快照交叉淡化表，只读，发布时从草稿复制并冻结';
 
 CREATE TABLE IF NOT EXISTS playout_request (
     request_id    VARCHAR(64)  NOT NULL COMMENT '幂等请求 ID，客户端生成',

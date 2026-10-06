@@ -73,6 +73,10 @@ public class PlayoutRepository {
         }
     }
 
+    /** 交叉淡化行（草稿与发布快照共用结构）：fromSegmentId 淡出、toSegmentId 淡入。 */
+    public record TransitionRow(String fromSegmentId, String toSegmentId, long fadeMs) {
+    }
+
     private static final RowMapper<AssetRow> ASSET_MAPPER = (rs, n) ->
             new AssetRow(rs.getString("id"), rs.getLong("duration_ms"));
 
@@ -112,6 +116,10 @@ public class PlayoutRepository {
                     rs.getDate("business_day").toLocalDate(), rs.getString("status"),
                     rs.getString("cancel_request_id"),
                     (Long) rs.getObject("cancelled_at_ms"), rs.getLong("created_at_ms"));
+
+    private static final RowMapper<TransitionRow> TRANSITION_MAPPER = (rs, n) ->
+            new TransitionRow(rs.getString("from_segment_id"), rs.getString("to_segment_id"),
+                    rs.getLong("fade_ms"));
 
     // ---------- 素材 ----------
 
@@ -380,5 +388,52 @@ public class PlayoutRepository {
                         + " SET status = 'CANCELLED', cancel_request_id = ?, cancelled_at_ms = ?"
                         + " WHERE override_key = ? AND status = 'ACTIVE'",
                 cancelRequestId, cancelledAtMs, overrideKey);
+    }
+
+    // ---------- 交叉淡化 ----------
+
+    public void insertDraftTransition(String id, String channelId, LocalDate businessDay,
+                                      String fromSegmentId, String toSegmentId, long fadeMs) {
+        jdbc.update("INSERT INTO playout_draft_transition"
+                        + " (id, channel_id, business_day, from_segment_id, to_segment_id, fade_ms)"
+                        + " VALUES (?, ?, ?, ?, ?, ?)",
+                id, channelId, Date.valueOf(businessDay), fromSegmentId, toSegmentId, fadeMs);
+    }
+
+    public void deleteDraftTransitions(String channelId, LocalDate businessDay) {
+        jdbc.update("DELETE FROM playout_draft_transition WHERE channel_id = ? AND business_day = ?",
+                channelId, Date.valueOf(businessDay));
+    }
+
+    public List<TransitionRow> findDraftTransitions(String channelId, LocalDate businessDay) {
+        return jdbc.query("SELECT from_segment_id, to_segment_id, fade_ms"
+                        + " FROM playout_draft_transition"
+                        + " WHERE channel_id = ? AND business_day = ? ORDER BY from_segment_id, to_segment_id",
+                TRANSITION_MAPPER, channelId, Date.valueOf(businessDay));
+    }
+
+    public void insertPublicationTransition(long publicationId, String fromSegmentId,
+                                            String toSegmentId, long fadeMs) {
+        jdbc.update("INSERT INTO playout_publication_transition"
+                        + " (publication_id, from_segment_id, to_segment_id, fade_ms)"
+                        + " VALUES (?, ?, ?, ?)",
+                publicationId, fromSegmentId, toSegmentId, fadeMs);
+    }
+
+    /** 快照中的全部交叉淡化（发布时冻结，播出查询据此判定重叠区）。 */
+    public List<TransitionRow> findPublicationTransitions(long publicationId) {
+        return jdbc.query("SELECT from_segment_id, to_segment_id, fade_ms"
+                        + " FROM playout_publication_transition"
+                        + " WHERE publication_id = ? ORDER BY from_segment_id, to_segment_id",
+                TRANSITION_MAPPER, publicationId);
+    }
+
+    /** 快照中按片段 ID 查询片段。 */
+    public Optional<PublicationSegmentRow> findPublicationSegmentBySegmentId(long publicationId,
+                                                                             String segmentId) {
+        return jdbc.query("SELECT id, publication_id, segment_id, asset_id, grant_id, start_ms, end_ms"
+                        + " FROM playout_publication_segment"
+                        + " WHERE publication_id = ? AND segment_id = ?",
+                PUBLICATION_SEGMENT_MAPPER, publicationId, segmentId).stream().findFirst();
     }
 }
