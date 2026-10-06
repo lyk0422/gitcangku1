@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS request_log (
     fingerprint VARCHAR(128) NOT NULL COMMENT '请求操作与参数的指纹，同键异参时判定 409',
     operation VARCHAR(32) NOT NULL COMMENT '操作类型：CREATE / MERGE / DELETE / RESOLVE',
     response_status INT NULL COMMENT '成功响应的 HTTP 状态码；提交过程中暂为 NULL',
-    response_body VARCHAR(4000) NULL COMMENT '成功响应体（JSON 原文），用于同键同参重放；提交过程中暂为 NULL',
+    response_body VARCHAR(12000) NULL COMMENT '成功响应体（JSON 原文），用于同键同参重放；提交过程中暂为 NULL',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '请求记录创建时间（服务器时区）',
     PRIMARY KEY (request_id)
 );
@@ -58,4 +58,47 @@ CREATE TABLE IF NOT EXISTS conflict_resolution (
     -- 不设置指向 observation_current 的外键：观测记录删除仅置墓碑（当前行保留），
     -- 且不可变解决历史必须在任何数据清理/归档场景下继续可查。
     UNIQUE (observation_id, request_id)
+);
+
+-- 分钟观测当前状态表：新类型观测，每条记录一行，version 从 1 开始单调递增。
+-- 业务字段（站号/时刻/读数）在删除墓碑时置 NULL，释放 (station_id, minute_utc) 唯一槽位。
+CREATE TABLE IF NOT EXISTS minute_observation_current (
+    observation_id VARCHAR(64) NOT NULL COMMENT '分钟观测记录唯一标识',
+    station_id VARCHAR(64) NULL COMMENT '站号（可编辑字段，参与三方合并）；删除墓碑为 NULL',
+    minute_utc TIMESTAMP NULL COMMENT '观测时刻（UTC 整分钟，秒与更小单位必须为 0；可编辑字段，参与三方合并）；删除墓碑为 NULL',
+    reading VARCHAR(64) NULL COMMENT '观测读数，十进制字符串，最多三位小数，比较按数值（可编辑字段）；删除墓碑为 NULL',
+    version INT NOT NULL COMMENT '当前版本号，从 1 开始',
+    deleted BOOLEAN NOT NULL DEFAULT FALSE COMMENT '是否已删除：TRUE 表示当前状态为删除墓碑',
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近一次变更时间（服务器时区）',
+    PRIMARY KEY (observation_id),
+    -- 同站同分钟唯一；墓碑行业务字段为 NULL，不占用槽位（H2/MySQL 唯一索引均允许多个 NULL）。
+    UNIQUE (station_id, minute_utc)
+);
+
+-- 分钟观测版本快照表：每次成功变更（创建/合并/删除）追加一行完整快照，历史永不删除。
+CREATE TABLE IF NOT EXISTS minute_observation_version (
+    observation_id VARCHAR(64) NOT NULL COMMENT '分钟观测记录唯一标识',
+    version INT NOT NULL COMMENT '版本号，从 1 开始，与 minute_observation_current.version 对应',
+    station_id VARCHAR(64) NULL COMMENT '该版本站号快照；删除墓碑版本为 NULL',
+    minute_utc TIMESTAMP NULL COMMENT '该版本观测时刻快照（UTC 整分钟）；删除墓碑版本为 NULL',
+    reading VARCHAR(64) NULL COMMENT '该版本观测读数快照（十进制字符串原文）；删除墓碑版本为 NULL',
+    deleted BOOLEAN NOT NULL COMMENT '该版本是否为删除墓碑：TRUE 时业务字段无意义',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '该版本生成时间（服务器时区）',
+    PRIMARY KEY (observation_id, version)
+);
+
+-- 持续越限区间分析表：生成时冻结全部引用快照、阈值与区间结果，不可变、永不更新。
+CREATE TABLE IF NOT EXISTS excursion_analysis (
+    analysis_id VARCHAR(64) NOT NULL COMMENT '分析记录唯一标识（服务端生成）',
+    request_id VARCHAR(128) NOT NULL COMMENT '生成该分析的请求标识（requestId），全局唯一',
+    operator VARCHAR(128) NOT NULL COMMENT '提交分析的操作者标识（非空）',
+    station_id VARCHAR(64) NOT NULL COMMENT '引用观测的共同站号（不同站号拒绝 400）',
+    threshold VARCHAR(64) NOT NULL COMMENT '越限阈值 H（十进制原文，最多三位小数，比较按数值；严格大于才算越限）',
+    consecutive_minutes INT NOT NULL COMMENT '连续越限分钟数 N，取值 2 至 5',
+    references_json VARCHAR(4000) NOT NULL COMMENT '冻结的引用集合快照（JSON 数组：observationId/version/minuteUtc/reading，按时刻升序）',
+    intervals_json VARCHAR(2000) NOT NULL COMMENT '冻结的越限区间结果（JSON 数组：startUtc/endUtc，左闭右开，UTC）',
+    created_at_utc TIMESTAMP NOT NULL COMMENT '分析生成时刻（UTC）',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录落库时间（服务器时区）',
+    PRIMARY KEY (analysis_id),
+    UNIQUE (request_id)
 );
