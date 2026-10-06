@@ -4,8 +4,11 @@ import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.function.Supplier;
 
@@ -16,6 +19,9 @@ import org.springframework.stereotype.Service;
 
 import com.example.starter.baggage.BaggageDtos.ArriveRequest;
 import com.example.starter.baggage.BaggageDtos.ArriveResponse;
+import com.example.starter.baggage.BaggageDtos.ArrangeItem;
+import com.example.starter.baggage.BaggageDtos.ArrangeRequest;
+import com.example.starter.baggage.BaggageDtos.ArrangeResponse;
 import com.example.starter.baggage.BaggageDtos.BagResponse;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveRequest;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveResponse;
@@ -33,7 +39,11 @@ import com.example.starter.baggage.BaggageDtos.SealRequest;
 import com.example.starter.baggage.BaggageDtos.SealResponse;
 import com.example.starter.baggage.BaggageDtos.ShortItem;
 import com.example.starter.baggage.BaggageDtos.ShortListResponse;
+import com.example.starter.baggage.BaggageDtos.StackViewResponse;
 import com.example.starter.baggage.BaggageDtos.TraceEvent;
+import com.example.starter.baggage.BaggageDtos.WeightProfileCreateRequest;
+import com.example.starter.baggage.BaggageDtos.WeightProfileResponse;
+import com.example.starter.baggage.BaggageDtos.WeightProfileUpdateRequest;
 
 /**
  * 联程行李装载交接核心业务：航段/行李登记、批量装载、封舱、精确/差异到达、补到与查询。
@@ -66,7 +76,7 @@ public class BaggageService {
     private static final RowMapper<LegRow> LEG_MAPPER = (rs, rowNum) -> new LegRow(
             rs.getString("leg_id"), rs.getString("origin"), rs.getString("destination"),
             rs.getString("status"), rs.getInt("version"), rs.getString("sealed_manifest"),
-            rs.getString("arrival_type"), rs.getString("arrival_actual"));
+            rs.getString("sealed_stack"), rs.getString("arrival_type"), rs.getString("arrival_actual"));
 
     private static final RowMapper<BagRow> BAG_MAPPER = (rs, rowNum) -> new BagRow(
             rs.getString("bag_tag"), rs.getString("current_location"),
@@ -158,6 +168,59 @@ public class BaggageService {
     public RecoverResponse recover(RecoverRequest request) {
         return idempotencyService.execute(request.requestId(), "RECOVER", 200,
                 request, RecoverResponse.class, () -> doRecover(request));
+    }
+
+    /** 创建重量档案：自重正整数克、承压非负整数克，版本从 1 起。 */
+    public WeightProfileResponse createWeightProfile(String bagTag, WeightProfileCreateRequest request) {
+        WeightCreatePayload payload = new WeightCreatePayload(
+                bagTag, request.weightGrams(), request.maxLoadGrams());
+        return idempotencyService.execute(request.requestId(), "CREATE_WEIGHT", 201,
+                payload, WeightProfileResponse.class, () -> doCreateWeightProfile(bagTag, request));
+    }
+
+    /**
+     * 修改重量档案：expectedVersion 乐观锁，冲突 409；已装载行李修改后若令当前堆栈超压则 409；
+     * 航段已封舱时重量档案冻结，修改已装行李档案 409。
+     */
+    public WeightProfileResponse updateWeightProfile(String bagTag, WeightProfileUpdateRequest request) {
+        WeightUpdatePayload payload = new WeightUpdatePayload(
+                bagTag, request.weightGrams(), request.maxLoadGrams(), request.expectedVersion());
+        return idempotencyService.execute(request.requestId(), "UPDATE_WEIGHT", 200,
+                payload, WeightProfileResponse.class, () -> doUpdateWeightProfile(bagTag, request));
+    }
+
+    /** 重量档案查询。 */
+    public WeightProfileResponse getWeightProfile(String bagTag) {
+        if (findBag(bagTag) == null) {
+            throw ApiException.notFound("行李不存在: " + bagTag);
+        }
+        WeightRow profile = findWeight(bagTag);
+        if (profile == null) {
+            throw ApiException.notFound("重量档案不存在: " + bagTag);
+        }
+        return toWeightResponse(profile);
+    }
+
+    /**
+     * 堆叠排舱：声明舱内完整后态（装载、卸载、换层一次生效），核验通过才落库；
+     * 层号空洞、重复或承压超限 422，原清单不变；已封舱禁止新排堆栈。
+     */
+    public ArrangeResponse arrange(String legId, ArrangeRequest request) {
+        ArrangePayload payload = new ArrangePayload(
+                legId, request.expectedVersion(), normalizeItems(request.items()));
+        return idempotencyService.execute(request.requestId(), "ARRANGE", 200,
+                payload, ArrangeResponse.class, () -> doArrange(legId, request));
+    }
+
+    /** 舱内堆叠视图：未封舱返回当前层序，封舱后返回冻结的封舱快照。 */
+    public StackViewResponse getStacks(String legId) {
+        LegRow leg = findLeg(legId);
+        if (leg == null) {
+            throw ApiException.notFound("航段不存在: " + legId);
+        }
+        List<ArrangeItem> items = leg.sealedStack() == null
+                ? currentStackItems(legId) : readStackItems(leg.sealedStack());
+        return new StackViewResponse(leg.legId(), leg.status(), leg.version(), items);
     }
 
     /** 行李完整轨迹查询。 */
@@ -289,9 +352,12 @@ public class BaggageService {
         }
         List<String> manifest = jdbcTemplate.queryForList(
                 "SELECT bag_tag FROM load_record WHERE leg_id = ? ORDER BY bag_tag", String.class, legId);
+        // 封舱冻结当前堆叠层序与各层载荷：快照只读保存，历史不漂移
+        List<ArrangeItem> stackSnapshot = currentStackItems(legId);
         int newVersion = leg.version() + 1;
-        jdbcTemplate.update("UPDATE leg SET status = ?, version = ?, sealed_manifest = ? WHERE leg_id = ?",
-                LEG_SEALED, newVersion, writeJson(manifest), legId);
+        jdbcTemplate.update(
+                "UPDATE leg SET status = ?, version = ?, sealed_manifest = ?, sealed_stack = ? WHERE leg_id = ?",
+                LEG_SEALED, newVersion, writeJson(manifest), writeJson(stackSnapshot), legId);
         return new SealResponse(legId, LEG_SEALED, newVersion, manifest);
     }
 
@@ -400,6 +466,233 @@ public class BaggageService {
                 nextIndex, request.missingLegId());
     }
 
+    private WeightProfileResponse doCreateWeightProfile(String bagTag, WeightProfileCreateRequest request) {
+        if (findBag(bagTag) == null) {
+            throw ApiException.notFound("行李不存在: " + bagTag);
+        }
+        if (findWeight(bagTag) != null) {
+            throw ApiException.conflict("重量档案已存在: " + bagTag);
+        }
+        jdbcTemplate.update(
+                "INSERT INTO bag_weight (bag_tag, weight_grams, max_load_grams, version) VALUES (?, ?, ?, 1)",
+                bagTag, request.weightGrams(), request.maxLoadGrams());
+        return new WeightProfileResponse(bagTag, request.weightGrams(), request.maxLoadGrams(), 1);
+    }
+
+    private WeightProfileResponse doUpdateWeightProfile(String bagTag, WeightProfileUpdateRequest request) {
+        BagRow bag = findBag(bagTag);
+        if (bag == null) {
+            throw ApiException.notFound("行李不存在: " + bagTag);
+        }
+        // 与封舱/排舱串行：先持航段行锁再持行李行锁，与装载链路锁序一致
+        LegRow loadedLeg = bag.loadedLegId() == null ? null : lockLeg(bag.loadedLegId());
+        bag = lockBag(bagTag);
+        WeightRow profile = findWeight(bagTag);
+        if (profile == null) {
+            throw ApiException.notFound("重量档案不存在: " + bagTag);
+        }
+        if (profile.version() != request.expectedVersion()) {
+            throw ApiException.conflict(
+                    "重量档案版本冲突: 期望 " + request.expectedVersion() + "，当前 " + profile.version());
+        }
+        if (bag.loadedLegId() != null) {
+            if (loadedLeg == null || !loadedLeg.legId().equals(bag.loadedLegId())) {
+                throw ApiException.conflict("行李 " + bagTag + " 装载状态发生变化，请重试");
+            }
+            if (!LEG_OPEN.equals(loadedLeg.status())) {
+                throw ApiException.conflict(
+                        "航段 " + loadedLeg.legId() + " 已封舱，已装行李重量档案冻结，禁止修改");
+            }
+            ensureStackPressureAfterWeightChange(loadedLeg.legId(), bagTag,
+                    request.weightGrams(), request.maxLoadGrams());
+        }
+        int newVersion = profile.version() + 1;
+        jdbcTemplate.update(
+                "UPDATE bag_weight SET weight_grams = ?, max_load_grams = ?, version = ? WHERE bag_tag = ?",
+                request.weightGrams(), request.maxLoadGrams(), newVersion, bagTag);
+        return new WeightProfileResponse(bagTag, request.weightGrams(), request.maxLoadGrams(), newVersion);
+    }
+
+    private ArrangeResponse doArrange(String legId, ArrangeRequest request) {
+        LegRow leg = lockLeg(legId);
+        checkVersion(leg, request.expectedVersion());
+        if (!LEG_OPEN.equals(leg.status())) {
+            throw ApiException.unprocessable(
+                    "航段状态为 " + leg.status() + "，已封舱禁止新排堆栈");
+        }
+        List<ArrangeItem> items = request.items();
+        Set<String> seen = new HashSet<>();
+        for (ArrangeItem item : items) {
+            if (!seen.add(item.bagTag())) {
+                throw ApiException.unprocessable("排舱行李不得重复: " + item.bagTag());
+            }
+        }
+        Map<Integer, List<ArrangeItem>> byStack = new HashMap<>();
+        for (ArrangeItem item : items) {
+            byStack.computeIfAbsent(item.stackNo(), key -> new ArrayList<>()).add(item);
+        }
+        // 层号核验：同堆栈从底部 1 起连续，空洞或重复整次拒绝
+        for (Map.Entry<Integer, List<ArrangeItem>> entry : byStack.entrySet()) {
+            List<ArrangeItem> stack = entry.getValue().stream()
+                    .sorted(Comparator.comparingInt(ArrangeItem::layer)).toList();
+            for (int i = 0; i < stack.size(); i++) {
+                if (stack.get(i).layer() != i + 1) {
+                    throw ApiException.unprocessable(
+                            "堆栈 " + entry.getKey() + " 层号须从底部 1 起连续，存在空洞或重复");
+                }
+            }
+        }
+        // 行李资格与重量档案核验：全部通过才允许落库
+        Map<String, WeightRow> weights = new HashMap<>();
+        List<String> sortedTags = items.stream().map(ArrangeItem::bagTag).sorted().toList();
+        for (String bagTag : sortedTags) {
+            BagRow bag = lockBag(bagTag);
+            if (bag == null) {
+                throw ApiException.unprocessable("行李不存在: " + bagTag);
+            }
+            validateArrangeable(bag, leg);
+            WeightRow weight = findWeight(bagTag);
+            if (weight == null) {
+                throw ApiException.unprocessable("行李 " + bagTag + " 缺少重量档案，无法排舱");
+            }
+            weights.put(bagTag, weight);
+        }
+        // 承压核验：每件行李上方全部行李重量之和不得超过其承压，零承压只能在顶层
+        for (List<ArrangeItem> stack : byStack.values()) {
+            List<StackEntry> entries = stack.stream()
+                    .map(item -> {
+                        WeightRow weight = weights.get(item.bagTag());
+                        return new StackEntry(item.bagTag(), item.layer(),
+                                weight.weightGrams(), weight.maxLoadGrams());
+                    })
+                    .sorted(Comparator.comparingInt(StackEntry::layer))
+                    .toList();
+            String violation = stackPressureViolation(entries);
+            if (violation != null) {
+                throw ApiException.unprocessable(violation);
+            }
+        }
+        // 完整后态落库：清单外原在舱行李卸载，保留者改层，新增者装载
+        List<String> current = jdbcTemplate.queryForList(
+                "SELECT bag_tag FROM load_record WHERE leg_id = ?", String.class, legId);
+        for (String bagTag : current) {
+            if (!seen.contains(bagTag)) {
+                jdbcTemplate.update("DELETE FROM load_record WHERE bag_tag = ?", bagTag);
+                jdbcTemplate.update("UPDATE bag SET loaded_leg_id = NULL WHERE bag_tag = ?", bagTag);
+            }
+        }
+        for (ArrangeItem item : items) {
+            if (current.contains(item.bagTag())) {
+                jdbcTemplate.update(
+                        "UPDATE load_record SET stack_no = ?, layer_no = ? WHERE bag_tag = ?",
+                        item.stackNo(), item.layer(), item.bagTag());
+            } else {
+                jdbcTemplate.update(
+                        "INSERT INTO load_record (bag_tag, leg_id, stack_no, layer_no) VALUES (?, ?, ?, ?)",
+                        item.bagTag(), legId, item.stackNo(), item.layer());
+                jdbcTemplate.update("UPDATE bag SET loaded_leg_id = ? WHERE bag_tag = ?",
+                        legId, item.bagTag());
+                insertEvent(item.bagTag(), EVT_LOADED, legId, leg.origin());
+            }
+        }
+        int newVersion = leg.version() + 1;
+        jdbcTemplate.update("UPDATE leg SET version = ? WHERE leg_id = ?", newVersion, legId);
+        return new ArrangeResponse(legId, LEG_OPEN, newVersion, normalizeItems(items));
+    }
+
+    /** 排舱资格：短卸须先补到；已装载到他段、待乘航段不符、不在始发站均 422。 */
+    private void validateArrangeable(BagRow bag, LegRow leg) {
+        if (BAG_SHORT_UNLOADED.equals(bag.status())) {
+            throw ApiException.unprocessable(
+                    "行李 " + bag.bagTag() + " 处于短卸状态，须先补到才能装载后续航段");
+        }
+        if (bag.loadedLegId() != null && !bag.loadedLegId().equals(leg.legId())) {
+            throw ApiException.unprocessable("行李 " + bag.bagTag() + " 已装载到航段 " + bag.loadedLegId());
+        }
+        ItineraryItem next = nextItinerary(bag.bagTag(), bag.nextLegIndex());
+        if (next == null) {
+            throw ApiException.unprocessable("行李 " + bag.bagTag() + " 已完成全部行程");
+        }
+        if (!next.legId().equals(leg.legId())) {
+            throw ApiException.unprocessable(
+                    "行李 " + bag.bagTag() + " 当前待乘航段为 " + next.legId() + "，不能装载到 " + leg.legId());
+        }
+        if (!bag.currentLocation().equals(leg.origin())) {
+            throw ApiException.unprocessable("行李 " + bag.bagTag() + " 不在航段始发站 " + leg.origin());
+        }
+    }
+
+    /** 已装载行李重量修改后的堆栈复验：超压则 409，原档案不变。 */
+    private void ensureStackPressureAfterWeightChange(String legId, String bagTag,
+                                                      int newWeightGrams, int newMaxLoadGrams) {
+        List<Integer> stacks = jdbcTemplate.queryForList(
+                "SELECT stack_no FROM load_record WHERE bag_tag = ? AND stack_no IS NOT NULL",
+                Integer.class, bagTag);
+        if (stacks.isEmpty()) {
+            return;
+        }
+        List<StackEntry> entries = new ArrayList<>();
+        jdbcTemplate.query(
+                "SELECT lr.bag_tag, lr.layer_no, bw.weight_grams, bw.max_load_grams"
+                        + " FROM load_record lr JOIN bag_weight bw ON bw.bag_tag = lr.bag_tag"
+                        + " WHERE lr.leg_id = ? AND lr.stack_no = ?",
+                rs -> {
+                    String tag = rs.getString("bag_tag");
+                    int weight = tag.equals(bagTag) ? newWeightGrams : rs.getInt("weight_grams");
+                    int maxLoad = tag.equals(bagTag) ? newMaxLoadGrams : rs.getInt("max_load_grams");
+                    entries.add(new StackEntry(tag, rs.getInt("layer_no"), weight, maxLoad));
+                }, legId, stacks.get(0));
+        entries.sort(Comparator.comparingInt(StackEntry::layer));
+        String violation = stackPressureViolation(entries);
+        if (violation != null) {
+            throw ApiException.conflict("修改后" + violation);
+        }
+    }
+
+    /** 单堆栈承压核验：entries 按层号升序，返回超限描述，未超限返回 null。 */
+    private static String stackPressureViolation(List<StackEntry> stack) {
+        long above = 0;
+        for (int i = stack.size() - 1; i >= 0; i--) {
+            StackEntry entry = stack.get(i);
+            if (above > entry.maxLoadGrams()) {
+                return "行李 " + entry.bagTag() + " 上方重量 " + above
+                        + " 克超过其承压 " + entry.maxLoadGrams() + " 克";
+            }
+            above += entry.weightGrams();
+        }
+        return null;
+    }
+
+    /** 当前舱内已排层序（仅含已指定堆栈位置的装载记录），按堆栈号、层号升序。 */
+    private List<ArrangeItem> currentStackItems(String legId) {
+        return jdbcTemplate.query(
+                "SELECT bag_tag, stack_no, layer_no FROM load_record"
+                        + " WHERE leg_id = ? AND stack_no IS NOT NULL ORDER BY stack_no, layer_no",
+                (rs, rowNum) -> new ArrangeItem(rs.getString("bag_tag"),
+                        rs.getInt("stack_no"), rs.getInt("layer_no")), legId);
+    }
+
+    private WeightRow findWeight(String bagTag) {
+        List<WeightRow> rows = jdbcTemplate.query(
+                "SELECT bag_tag, weight_grams, max_load_grams, version FROM bag_weight WHERE bag_tag = ?",
+                (rs, rowNum) -> new WeightRow(rs.getString("bag_tag"), rs.getInt("weight_grams"),
+                        rs.getInt("max_load_grams"), rs.getInt("version")), bagTag);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    private static WeightProfileResponse toWeightResponse(WeightRow profile) {
+        return new WeightProfileResponse(profile.bagTag(), profile.weightGrams(),
+                profile.maxLoadGrams(), profile.version());
+    }
+
+    /** 排舱明细规范化：按堆栈号、层号升序，顺序差异不视为异参。 */
+    private static List<ArrangeItem> normalizeItems(List<ArrangeItem> items) {
+        return items.stream()
+                .sorted(Comparator.comparingInt(ArrangeItem::stackNo)
+                        .thenComparingInt(ArrangeItem::layer))
+                .toList();
+    }
+
     /** 实际到达行李的统一推进：移动到到达站、推进待乘索引，完成行程者交付。 */
     private void advanceArrivedBag(BagRow bag, String destination, String legId) {
         int nextIndex = bag.nextLegIndex() + 1;
@@ -457,7 +750,7 @@ public class BaggageService {
     }
 
     private static String legSelect(boolean forUpdate) {
-        return "SELECT leg_id, origin, destination, status, version, sealed_manifest,"
+        return "SELECT leg_id, origin, destination, status, version, sealed_manifest, sealed_stack,"
                 + " arrival_type, arrival_actual FROM leg WHERE leg_id = ?"
                 + (forUpdate ? " FOR UPDATE" : "");
     }
@@ -533,9 +826,9 @@ public class BaggageService {
         return values.stream().sorted().toList();
     }
 
-    private String writeJson(List<String> values) {
+    private String writeJson(Object value) {
         try {
-            return objectMapper.writeValueAsString(values);
+            return objectMapper.writeValueAsString(value);
         } catch (Exception ex) {
             throw new IllegalStateException("清单序列化失败", ex);
         }
@@ -550,8 +843,17 @@ public class BaggageService {
         }
     }
 
+    private List<ArrangeItem> readStackItems(String json) {
+        try {
+            return objectMapper.readValue(json,
+                    objectMapper.getTypeFactory().constructCollectionType(List.class, ArrangeItem.class));
+        } catch (Exception ex) {
+            throw new IllegalStateException("层序快照反序列化失败", ex);
+        }
+    }
+
     private record LegRow(String legId, String origin, String destination,
-                          String status, int version, String sealedManifest,
+                          String status, int version, String sealedManifest, String sealedStack,
                           String arrivalType, String arrivalActual) {
     }
 
@@ -574,5 +876,26 @@ public class BaggageService {
 
     /** 差异到达幂等摘要参数：bagTags 已排序，顺序差异不视为异参。 */
     private record DifferenceArrivePayload(String legId, int expectedVersion, List<String> bagTags) {
+    }
+
+    /** 重量档案行。 */
+    private record WeightRow(String bagTag, int weightGrams, int maxLoadGrams, int version) {
+    }
+
+    /** 堆栈承压核验条目。 */
+    private record StackEntry(String bagTag, int layer, int weightGrams, int maxLoadGrams) {
+    }
+
+    /** 创建重量档案幂等摘要参数。 */
+    private record WeightCreatePayload(String bagTag, int weightGrams, int maxLoadGrams) {
+    }
+
+    /** 修改重量档案幂等摘要参数。 */
+    private record WeightUpdatePayload(String bagTag, int weightGrams, int maxLoadGrams,
+                                       int expectedVersion) {
+    }
+
+    /** 排舱幂等摘要参数：items 已按堆栈号、层号排序，顺序差异不视为异参。 */
+    private record ArrangePayload(String legId, int expectedVersion, List<ArrangeItem> items) {
     }
 }

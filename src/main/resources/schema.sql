@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS leg (
     status          VARCHAR(16)  NOT NULL DEFAULT 'OPEN' COMMENT '航段状态：OPEN/SEALED/ARRIVED',
     version         INT          NOT NULL DEFAULT 1 COMMENT '乐观锁版本，每次状态或装载变更后递增',
     sealed_manifest CLOB         NULL COMMENT '封舱时的只读装载清单（JSON 数组），未封舱为 NULL',
+    sealed_stack    CLOB         NULL COMMENT '封舱时的只读堆叠层序快照（JSON 数组，元素含 bagTag/stackNo/layer），未封舱为 NULL',
     arrival_type    VARCHAR(16)  NULL COMMENT '到达确认类型：NULL 未到达，EXACT 精确到达，DIFF 差异到达',
     arrival_actual  CLOB         NULL COMMENT '差异到达实际到达袋号只读快照（JSON 数组），未差异到达为 NULL',
     created_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
@@ -44,7 +45,19 @@ CREATE TABLE IF NOT EXISTS bag_itinerary (
 CREATE TABLE IF NOT EXISTS load_record (
     bag_tag   VARCHAR(64) NOT NULL COMMENT '行李牌号',
     leg_id    VARCHAR(64) NOT NULL COMMENT '装载到的航段',
+    stack_no  INT         NULL COMMENT '舱内堆栈号（正整数），未参与堆叠排舱为 NULL',
+    layer_no  INT         NULL COMMENT '堆栈内层号，从底部 1 起连续递增，未参与堆叠排舱为 NULL',
     loaded_at TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '装载时间',
+    PRIMARY KEY (bag_tag)
+);
+
+-- 行李重量档案：自重与可承上方重量均为整数克；version 从 1 起，每次修改递增
+CREATE TABLE IF NOT EXISTS bag_weight (
+    bag_tag        VARCHAR(64) NOT NULL COMMENT '行李牌号，全局唯一',
+    weight_grams   INT         NOT NULL COMMENT '行李自重，单位克，正整数',
+    max_load_grams INT         NOT NULL COMMENT '可承上方重量，单位克，非负整数；0 表示只能位于堆栈顶层',
+    version        INT         NOT NULL DEFAULT 1 COMMENT '重量档案版本，从 1 起，每次修改递增',
+    created_at     TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     PRIMARY KEY (bag_tag)
 );
 
@@ -64,7 +77,7 @@ CREATE TABLE IF NOT EXISTS bag_event (
 -- 幂等去重：仅记录成功请求；同 requestId 同参数重放原结果，异参数返回 409
 CREATE TABLE IF NOT EXISTS request_log (
     request_id      VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
-    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER',
+    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER/CREATE_WEIGHT/UPDATE_WEIGHT/ARRANGE',
     request_hash    VARCHAR(64)  NOT NULL COMMENT '请求参数（不含 requestId）的 SHA-256 摘要',
     response_status INT          NOT NULL COMMENT '原成功响应的 HTTP 状态码',
     response_body   CLOB         NOT NULL COMMENT '原成功响应体（JSON）',

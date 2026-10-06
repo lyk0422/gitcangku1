@@ -7,10 +7,13 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import com.example.starter.baggage.BaggageDtos.ArrangeRequest;
+import com.example.starter.baggage.BaggageDtos.ArrangeResponse;
 import com.example.starter.baggage.BaggageDtos.ArriveRequest;
 import com.example.starter.baggage.BaggageDtos.ArriveResponse;
 import com.example.starter.baggage.BaggageDtos.BagResponse;
@@ -28,6 +31,10 @@ import com.example.starter.baggage.BaggageDtos.RegisterLegRequest;
 import com.example.starter.baggage.BaggageDtos.SealRequest;
 import com.example.starter.baggage.BaggageDtos.SealResponse;
 import com.example.starter.baggage.BaggageDtos.ShortListResponse;
+import com.example.starter.baggage.BaggageDtos.StackViewResponse;
+import com.example.starter.baggage.BaggageDtos.WeightProfileCreateRequest;
+import com.example.starter.baggage.BaggageDtos.WeightProfileResponse;
+import com.example.starter.baggage.BaggageDtos.WeightProfileUpdateRequest;
 
 /**
  * 联程行李装载交接 REST 入口。
@@ -107,5 +114,39 @@ public class BaggageController {
     @GetMapping("/bags/short-unloaded")
     public ShortListResponse listShortUnloaded() {
         return baggageService.listShortUnloaded();
+    }
+
+    /** 创建重量档案：自重正整数克、承压非负整数克，版本从 1 起。 */
+    @PostMapping("/bags/{bagTag}/weight")
+    public ResponseEntity<WeightProfileResponse> createWeightProfile(
+            @PathVariable String bagTag, @Valid @RequestBody WeightProfileCreateRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(baggageService.createWeightProfile(bagTag, request));
+    }
+
+    /** 修改重量档案：expectedVersion 乐观锁；已装载超压或封舱后修改均 409。 */
+    @PutMapping("/bags/{bagTag}/weight")
+    public WeightProfileResponse updateWeightProfile(
+            @PathVariable String bagTag, @Valid @RequestBody WeightProfileUpdateRequest request) {
+        return baggageService.updateWeightProfile(bagTag, request);
+    }
+
+    /** 重量档案查询。 */
+    @GetMapping("/bags/{bagTag}/weight")
+    public WeightProfileResponse getWeightProfile(@PathVariable String bagTag) {
+        return baggageService.getWeightProfile(bagTag);
+    }
+
+    /** 堆叠排舱：声明舱内完整后态，层号空洞、重复或承压超限 422，原清单不变。 */
+    @PostMapping("/legs/{legId}/arrange")
+    public ArrangeResponse arrange(@PathVariable String legId,
+                                   @Valid @RequestBody ArrangeRequest request) {
+        return baggageService.arrange(legId, request);
+    }
+
+    /** 舱内堆叠视图：未封舱返回当前层序，封舱后返回冻结快照。 */
+    @GetMapping("/legs/{legId}/stacks")
+    public StackViewResponse getStacks(@PathVariable String legId) {
+        return baggageService.getStacks(legId);
     }
 }

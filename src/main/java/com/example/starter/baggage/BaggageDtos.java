@@ -2,8 +2,11 @@ package com.example.starter.baggage;
 
 import java.util.List;
 
+import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Positive;
+import jakarta.validation.constraints.PositiveOrZero;
 import jakarta.validation.constraints.Size;
 
 /**
@@ -124,5 +127,55 @@ public final class BaggageDtos {
 
     /** 未补到清单响应。 */
     public record ShortListResponse(List<ShortItem> shortUnloaded) {
+    }
+
+    /** 创建重量档案请求：自重正整数克、可承上方重量非负整数克，初始版本 1。 */
+    public record WeightProfileCreateRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotNull(message = "weightGrams 不能为空")
+            @Positive(message = "自重必须为正整数克") Integer weightGrams,
+            @NotNull(message = "maxLoadGrams 不能为空")
+            @PositiveOrZero(message = "可承上方重量必须为非负整数克") Integer maxLoadGrams) {
+    }
+
+    /** 修改重量档案请求：expectedVersion 做乐观锁校验。 */
+    public record WeightProfileUpdateRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotNull(message = "weightGrams 不能为空")
+            @Positive(message = "自重必须为正整数克") Integer weightGrams,
+            @NotNull(message = "maxLoadGrams 不能为空")
+            @PositiveOrZero(message = "可承上方重量必须为非负整数克") Integer maxLoadGrams,
+            @NotNull(message = "expectedVersion 不能为空") Integer expectedVersion) {
+    }
+
+    /** 重量档案响应。 */
+    public record WeightProfileResponse(String bagTag, int weightGrams, int maxLoadGrams, int version) {
+    }
+
+    /** 堆叠排舱明细项：stackNo 为舱内堆栈号，layer 为层号（从底部 1 起连续）。 */
+    public record ArrangeItem(
+            @NotBlank(message = "bagTag 不能为空") String bagTag,
+            @NotNull(message = "stackNo 不能为空")
+            @Positive(message = "堆栈号必须为正整数") Integer stackNo,
+            @NotNull(message = "layer 不能为空")
+            @Positive(message = "层号必须为正整数") Integer layer) {
+    }
+
+    /**
+     * 堆叠排舱请求：声明舱内完整后态，items 之外的原在舱行李视为卸载；
+     * 同堆栈层号须从 1 起连续且每件一层，承压超限整次拒绝。
+     */
+    public record ArrangeRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotNull(message = "expectedVersion 不能为空") Integer expectedVersion,
+            @NotNull(message = "items 不能为空") List<@Valid ArrangeItem> items) {
+    }
+
+    /** 堆叠排舱响应：items 按堆栈号、层号升序。 */
+    public record ArrangeResponse(String legId, String status, int version, List<ArrangeItem> items) {
+    }
+
+    /** 舱内堆叠视图：未封舱返回当前层序，封舱后返回冻结快照。 */
+    public record StackViewResponse(String legId, String status, int version, List<ArrangeItem> items) {
     }
 }
