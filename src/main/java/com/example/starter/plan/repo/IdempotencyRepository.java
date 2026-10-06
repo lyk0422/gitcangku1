@@ -36,6 +36,16 @@ public class IdempotencyRepository {
     }
 
     /**
+     * 按全局幂等键查询记录（不限操作类型），用于全局 requestId 去重。
+     */
+    public Optional<Record> findByKey(String requestKey) {
+        return jdbc.query("SELECT request_hash, response_json FROM idempotency_record"
+                        + " WHERE request_key = ?",
+                (rs, n) -> new Record(rs.getString("request_hash"), rs.getString("response_json")),
+                requestKey).stream().findFirst();
+    }
+
+    /**
      * 写入幂等记录；同键冲突时抛出 DuplicateKeyException 由上层裁决。
      */
     public void insert(String opType, String requestKey, String requestHash, String responseJson,

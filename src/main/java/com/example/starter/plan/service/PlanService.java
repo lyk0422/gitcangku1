@@ -45,6 +45,10 @@ import org.springframework.transaction.support.TransactionTemplate;
  * <p>并发与幂等约定：写操作按 (操作类型, requestKey) 幂等，同键同参重放返回首次成功结果，
  * 同键不同参返回 409；发布与改签经全局发布锁串行化，同一计划的更新/发布/取消/改签经行锁按事务提交顺序生效；
  * 仅成功结果写入幂等记录，失败（含 422 时隙冲突）不缓存、可修正后重试。
+ *
+ * <p>供电预算：已绑定变电所的区段占用按声明功率（千瓦）参与预算裁决，
+ * 发布/改签在发布锁内将全部已发布及候选占用合并为恒定时间片逐片累计，
+ * 任一片超限则 422 且整次不写任何占用；裁决通过即冻结功率快照，历史不漂移。
  */
 @Service
 public class PlanService {
@@ -60,13 +64,16 @@ public class PlanService {
 
     private final PlanRepository planRepo;
     private final IdempotencyRepository idemRepo;
+    private final PowerBudgetService powerBudget;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate tx;
 
     public PlanService(PlanRepository planRepo, IdempotencyRepository idemRepo,
+                       PowerBudgetService powerBudget,
                        ObjectMapper objectMapper, PlatformTransactionManager txManager) {
         this.planRepo = planRepo;
         this.idemRepo = idemRepo;
+        this.powerBudget = powerBudget;
         this.objectMapper = objectMapper;
         this.tx = new TransactionTemplate(txManager);
     }
@@ -157,12 +164,15 @@ public class PlanService {
                 List<Map<String, Object>> conflicts = new ArrayList<>();
                 conflicts.addAll(findTrainOverlaps(scheduleKey, occupancies));
                 conflicts.addAll(findSectionConflicts(plan, occupancies, List.of(plan.id())));
+                conflicts.addAll(powerBudget.findViolations(plan.opDate(), occupancies,
+                        List.of(plan.id())));
                 if (!conflicts.isEmpty()) {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "存在时隙冲突，计划保持草稿", conflicts);
                 }
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(plan.id(), PlanStatus.PUBLISHED, now);
+                powerBudget.freezeSnapshots(plan.id(), occupancies);
                 PlanResponse response = loadPlan(scheduleKey);
                 idemRepo.insert(OP_PUBLISH, requestKey, hash, toJson(response), now);
                 return response;
@@ -183,6 +193,7 @@ public class PlanService {
         }
         try {
             return tx.execute(status -> {
+                planRepo.acquirePublishLock();
                 DayPlan plan = planRepo.findByKeyForUpdate(scheduleKey)
                         .orElseThrow(() -> notFound(scheduleKey));
                 if (plan.status() != PlanStatus.PUBLISHED) {
@@ -256,6 +267,9 @@ public class PlanService {
                 // 仅排除旧计划与自身占用，第三方已发布计划照常参与冲突裁决
                 conflicts.addAll(findSectionConflicts(newPlan, occupancies,
                         List.of(newPlan.id(), oldPlan.id())));
+                // 功率预算按移除旧计划、加入完整新计划后的集合校验，自身旧占用不重复计
+                conflicts.addAll(powerBudget.findViolations(newPlan.opDate(), occupancies,
+                        List.of(newPlan.id(), oldPlan.id())));
                 if (!conflicts.isEmpty()) {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "新草稿存在时隙冲突，改签未生效", conflicts);
@@ -264,6 +278,7 @@ public class PlanService {
                 planRepo.updateStatus(oldPlan.id(), PlanStatus.CANCELLED, now);
                 planRepo.updateStatus(newPlan.id(), PlanStatus.PUBLISHED, now);
                 planRepo.insertRescheduleLink(oldPlan.id(), newPlan.id(), now);
+                powerBudget.freezeSnapshots(newPlan.id(), occupancies);
                 RescheduleResponse response = new RescheduleResponse(
                         loadPlan(oldScheduleKey), loadPlan(req.newScheduleKey()));
                 idemRepo.insert(OP_RESCHEDULE, req.requestKey(), hash, toJson(response), now);
@@ -339,7 +354,8 @@ public class PlanService {
         DayPlan plan = planRepo.findByKey(scheduleKey)
                 .orElseThrow(() -> notFound(scheduleKey));
         List<OccupancyView> views = planRepo.findOccupancies(plan.id()).stream()
-                .map(o -> new OccupancyView(o.trainNo(), o.sectionId(), o.startUtc(), o.endUtc()))
+                .map(o -> new OccupancyView(o.trainNo(), o.sectionId(), o.startUtc(), o.endUtc(),
+                        o.powerKw()))
                 .toList();
         return new PlanResponse(plan.scheduleKey(), plan.opDate(), plan.version(),
                 plan.status().name(), views);
@@ -349,7 +365,8 @@ public class PlanService {
         List<Occupancy> result = new ArrayList<>(requests.size());
         for (int i = 0; i < requests.size(); i++) {
             OccupancyRequest r = requests.get(i);
-            result.add(new Occupancy(0L, planId, i, r.trainNo(), r.sectionId(), r.startUtc(), r.endUtc()));
+            result.add(new Occupancy(0L, planId, i, r.trainNo(), r.sectionId(), r.startUtc(),
+                    r.endUtc(), r.powerKwOrZero()));
         }
         return result;
     }
@@ -507,7 +524,8 @@ public class PlanService {
     private void appendOccupancies(StringBuilder sb, List<OccupancyRequest> occupancies) {
         for (OccupancyRequest o : occupancies) {
             sb.append('\n').append(o.trainNo()).append('|').append(o.sectionId()).append('|')
-                    .append(o.startUtc().toEpochMilli()).append('|').append(o.endUtc().toEpochMilli());
+                    .append(o.startUtc().toEpochMilli()).append('|').append(o.endUtc().toEpochMilli())
+                    .append('|').append(o.powerKwOrZero());
         }
     }
 

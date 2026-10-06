@@ -41,7 +41,8 @@ public class PlanRepository {
             rs.getString("train_no"),
             rs.getString("section_id"),
             Instant.ofEpochMilli(rs.getLong("start_utc")),
-            Instant.ofEpochMilli(rs.getLong("end_utc")));
+            Instant.ofEpochMilli(rs.getLong("end_utc")),
+            rs.getInt("power_kw"));
 
     private static final RowMapper<RescheduleLink> LINK_MAPPER = (rs, n) -> new RescheduleLink(
             rs.getLong("id"),
@@ -115,8 +116,8 @@ public class PlanRepository {
      */
     public void insertOccupancies(long planId, List<Occupancy> occupancies) {
         jdbc.batchUpdate(
-                "INSERT INTO rail_plan_occupancy (plan_id, seq, train_no, section_id, start_utc, end_utc)"
-                        + " VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO rail_plan_occupancy (plan_id, seq, train_no, section_id, start_utc,"
+                        + " end_utc, power_kw) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 occupancies, occupancies.size(),
                 (ps, o) -> {
                     ps.setLong(1, planId);
@@ -125,6 +126,7 @@ public class PlanRepository {
                     ps.setString(4, o.sectionId());
                     ps.setLong(5, o.startUtc().toEpochMilli());
                     ps.setLong(6, o.endUtc().toEpochMilli());
+                    ps.setInt(7, o.powerKw());
                 });
     }
 
@@ -132,8 +134,8 @@ public class PlanRepository {
      * 查询计划占用，按计划内序号升序。
      */
     public List<Occupancy> findOccupancies(long planId) {
-        return jdbc.query("SELECT id, plan_id, seq, train_no, section_id, start_utc, end_utc"
-                        + " FROM rail_plan_occupancy WHERE plan_id = ? ORDER BY seq",
+        return jdbc.query("SELECT id, plan_id, seq, train_no, section_id, start_utc, end_utc,"
+                        + " power_kw FROM rail_plan_occupancy WHERE plan_id = ? ORDER BY seq",
                 OCCUPANCY_MAPPER, planId);
     }
 
