@@ -14,13 +14,18 @@ import org.springframework.web.bind.annotation.RestController;
 import com.example.starter.baggage.BaggageDtos.ArriveRequest;
 import com.example.starter.baggage.BaggageDtos.ArriveResponse;
 import com.example.starter.baggage.BaggageDtos.BagResponse;
+import com.example.starter.baggage.BaggageDtos.DequeueRequest;
+import com.example.starter.baggage.BaggageDtos.DequeueResponse;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveRequest;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveResponse;
+import com.example.starter.baggage.BaggageDtos.EnqueueRequest;
+import com.example.starter.baggage.BaggageDtos.EnqueueResponse;
 import com.example.starter.baggage.BaggageDtos.LegDifferenceResponse;
 import com.example.starter.baggage.BaggageDtos.LegResponse;
 import com.example.starter.baggage.BaggageDtos.LoadRequest;
 import com.example.starter.baggage.BaggageDtos.LoadResponse;
 import com.example.starter.baggage.BaggageDtos.ManifestResponse;
+import com.example.starter.baggage.BaggageDtos.QueueViewResponse;
 import com.example.starter.baggage.BaggageDtos.RecoverRequest;
 import com.example.starter.baggage.BaggageDtos.RecoverResponse;
 import com.example.starter.baggage.BaggageDtos.RegisterBagRequest;
@@ -28,6 +33,8 @@ import com.example.starter.baggage.BaggageDtos.RegisterLegRequest;
 import com.example.starter.baggage.BaggageDtos.SealRequest;
 import com.example.starter.baggage.BaggageDtos.SealResponse;
 import com.example.starter.baggage.BaggageDtos.ShortListResponse;
+import com.example.starter.baggage.BaggageDtos.WithdrawRequest;
+import com.example.starter.baggage.BaggageDtos.WithdrawResponse;
 
 /**
  * 联程行李装载交接 REST 入口。
@@ -107,5 +114,32 @@ public class BaggageController {
     @GetMapping("/bags/short-unloaded")
     public ShortListResponse listShortUnloaded() {
         return baggageService.listShortUnloaded();
+    }
+
+    /** 入队：绑定 1~5 件当前可装行李，按给定顺序分配递增序号。 */
+    @PostMapping("/legs/{legId}/queue/enqueue")
+    public EnqueueResponse enqueue(@PathVariable String legId,
+                                   @Valid @RequestBody EnqueueRequest request) {
+        return baggageService.enqueue(legId, request);
+    }
+
+    /** 出队：取队列最前面 count 件有效成员整批装载，冻结出队序号与装载响应。 */
+    @PostMapping("/legs/{legId}/queue/dequeue")
+    public DequeueResponse dequeue(@PathVariable String legId,
+                                   @Valid @RequestBody DequeueRequest request) {
+        return baggageService.dequeue(legId, request);
+    }
+
+    /** 撤队：撤销一件有效待出队成员，序号保留不重用；已出队不可撤。 */
+    @PostMapping("/legs/{legId}/queue/withdraw")
+    public WithdrawResponse withdraw(@PathVariable String legId,
+                                     @Valid @RequestBody WithdrawRequest request) {
+        return baggageService.withdraw(legId, request);
+    }
+
+    /** 队列视图：含全部历史成员，按序号升序。 */
+    @GetMapping("/legs/{legId}/queue")
+    public QueueViewResponse getQueue(@PathVariable String legId) {
+        return baggageService.getQueue(legId);
     }
 }

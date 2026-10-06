@@ -2,6 +2,8 @@ package com.example.starter.baggage;
 
 import java.util.List;
 
+import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Size;
@@ -65,6 +67,31 @@ public final class BaggageDtos {
             @NotBlank(message = "actualStation 不能为空") String actualStation) {
     }
 
+    /** 入队请求：1~5 件当前可装行李，按给定顺序分配递增序号。 */
+    public record EnqueueRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotBlank(message = "operator 不能为空") String operator,
+            @NotNull(message = "bagTags 不能为空")
+            @Size(min = 1, max = 5, message = "单次入队数量必须为 1~5") List<@NotBlank(message = "bagTag 不能为空") String> bagTags) {
+    }
+
+    /** 出队请求：取队列最前面 count 件有效成员整批装载。 */
+    public record DequeueRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotBlank(message = "operator 不能为空") String operator,
+            @NotNull(message = "expectedQueueVersion 不能为空") Integer expectedQueueVersion,
+            @NotNull(message = "count 不能为空")
+            @Min(value = 1, message = "出队数量必须为正整数")
+            @Max(value = 5, message = "单次出队数量最多 5") Integer count) {
+    }
+
+    /** 撤队请求：撤销一件有效待出队成员，序号保留不重用。 */
+    public record WithdrawRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotBlank(message = "operator 不能为空") String operator,
+            @NotBlank(message = "bagTag 不能为空") String bagTag) {
+    }
+
     /** 航段响应。 */
     public record LegResponse(String legId, String origin, String destination,
                               String status, int version) {
@@ -124,5 +151,26 @@ public final class BaggageDtos {
 
     /** 未补到清单响应。 */
     public record ShortListResponse(List<ShortItem> shortUnloaded) {
+    }
+
+    /** 队列成员视图：序号为冻结历史，status 为 WAITING/WITHDRAWN/DEQUEUED。 */
+    public record QueueEntryView(int seq, String bagTag, String status) {
+    }
+
+    /** 入队响应：entries 按请求给定顺序携带新分配的序号。 */
+    public record EnqueueResponse(String legId, int queueVersion, List<QueueEntryView> entries) {
+    }
+
+    /** 出队响应：dequeued 冻结本次出队序号，load 为完整装载响应。 */
+    public record DequeueResponse(String legId, int queueVersion,
+                                  List<QueueEntryView> dequeued, LoadResponse load) {
+    }
+
+    /** 撤队响应：withdrawn 为被撤销成员，序号保留不重用。 */
+    public record WithdrawResponse(String legId, int queueVersion, QueueEntryView withdrawn) {
+    }
+
+    /** 队列视图：含全部历史成员（含已撤/已出队），按序号升序。 */
+    public record QueueViewResponse(String legId, int queueVersion, List<QueueEntryView> entries) {
     }
 }

@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS leg (
     destination     VARCHAR(64)  NOT NULL COMMENT '到达站代码',
     status          VARCHAR(16)  NOT NULL DEFAULT 'OPEN' COMMENT '航段状态：OPEN/SEALED/ARRIVED',
     version         INT          NOT NULL DEFAULT 1 COMMENT '乐观锁版本，每次状态或装载变更后递增',
+    queue_version   INT          NOT NULL DEFAULT 1 COMMENT '待装队列版本，初始 1，入队/撤队/出队成功各加一；大于 1 表示已启用队列装载',
     sealed_manifest CLOB         NULL COMMENT '封舱时的只读装载清单（JSON 数组），未封舱为 NULL',
     arrival_type    VARCHAR(16)  NULL COMMENT '到达确认类型：NULL 未到达，EXACT 精确到达，DIFF 差异到达',
     arrival_actual  CLOB         NULL COMMENT '差异到达实际到达袋号只读快照（JSON 数组），未差异到达为 NULL',
@@ -61,10 +62,24 @@ CREATE TABLE IF NOT EXISTS bag_event (
     UNIQUE (bag_tag, seq)
 );
 
+-- 待装队列成员：单道输送线有序待装队列，序号只增不重排不重用，成员不物理删除
+CREATE TABLE IF NOT EXISTS load_queue_entry (
+    id         BIGINT AUTO_INCREMENT NOT NULL COMMENT '队列成员自增主键',
+    leg_id     VARCHAR(64)  NOT NULL COMMENT '所属航段标识',
+    seq        INT          NOT NULL COMMENT '队内序号，按入队请求给定顺序递增分配；撤队/出队后保留历史，不重排不重用',
+    bag_tag    VARCHAR(64)  NOT NULL COMMENT '行李牌号；同航段至多一个 WAITING 有效位置',
+    status     VARCHAR(16)  NOT NULL DEFAULT 'WAITING' COMMENT '队列状态：WAITING 有效待出队/WITHDRAWN 已撤队/DEQUEUED 已出队装载',
+    operator   VARCHAR(64)  NOT NULL COMMENT '最近一次状态变更的操作者（入队/撤队/出队），非空',
+    created_at TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '入队时间',
+    updated_at TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近状态变更时间',
+    PRIMARY KEY (id),
+    UNIQUE (leg_id, seq)
+);
+
 -- 幂等去重：仅记录成功请求；同 requestId 同参数重放原结果，异参数返回 409
 CREATE TABLE IF NOT EXISTS request_log (
     request_id      VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
-    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER',
+    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER/ENQUEUE/DEQUEUE/WITHDRAW',
     request_hash    VARCHAR(64)  NOT NULL COMMENT '请求参数（不含 requestId）的 SHA-256 摘要',
     response_status INT          NOT NULL COMMENT '原成功响应的 HTTP 状态码',
     response_body   CLOB         NOT NULL COMMENT '原成功响应体（JSON）',
