@@ -3,6 +3,11 @@ package com.example.starter.evidence;
 import com.example.starter.error.ApiException;
 import com.example.starter.evidence.dto.CommandRequest;
 import com.example.starter.evidence.dto.CustodyChainView;
+import com.example.starter.evidence.dto.DoseCapRegisterRequest;
+import com.example.starter.evidence.dto.DoseLedgerView;
+import com.example.starter.evidence.dto.DoseReturnView;
+import com.example.starter.evidence.dto.DoseSegmentRequest;
+import com.example.starter.evidence.dto.DoseSegmentView;
 import com.example.starter.evidence.dto.EvidenceView;
 import com.example.starter.evidence.dto.InspectionView;
 import com.example.starter.evidence.dto.IntakeRequest;
@@ -16,6 +21,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.math.BigDecimal;
+import java.math.MathContext;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
@@ -35,6 +42,7 @@ public class EvidenceService {
     static final String OP_SEAL_INSPECTION = "SEAL_INSPECTION";
     static final String OP_LOAN_BORROW = "LOAN_BORROW";
     static final String OP_LOAN_RETURN = "LOAN_RETURN";
+    static final String OP_DOSE_CAP_REGISTER = "DOSE_CAP_REGISTER";
 
     /**
      * 借出最长期限：72 小时。
@@ -46,6 +54,9 @@ public class EvidenceService {
     private final SealInspectionRepository inspectionRepository;
     private final LoanRecordRepository loanRepository;
     private final CommandLogRepository commandLogRepository;
+    private final DoseAccountRepository doseAccountRepository;
+    private final DoseReturnRepository doseReturnRepository;
+    private final DoseSegmentRepository doseSegmentRepository;
     private final ObjectMapper objectMapper;
     private final EvidenceClock clock;
 
@@ -54,6 +65,9 @@ public class EvidenceService {
                            SealInspectionRepository inspectionRepository,
                            LoanRecordRepository loanRepository,
                            CommandLogRepository commandLogRepository,
+                           DoseAccountRepository doseAccountRepository,
+                           DoseReturnRepository doseReturnRepository,
+                           DoseSegmentRepository doseSegmentRepository,
                            ObjectMapper objectMapper,
                            EvidenceClock clock) {
         this.evidenceRepository = evidenceRepository;
@@ -61,6 +75,9 @@ public class EvidenceService {
         this.inspectionRepository = inspectionRepository;
         this.loanRepository = loanRepository;
         this.commandLogRepository = commandLogRepository;
+        this.doseAccountRepository = doseAccountRepository;
+        this.doseReturnRepository = doseReturnRepository;
+        this.doseSegmentRepository = doseSegmentRepository;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -247,6 +264,13 @@ public class EvidenceService {
         if (evidence.status() == EvidenceStatus.BORROWED) {
             throw ApiException.conflict("证物已存在未归还借出: " + evidenceKey);
         }
+        // 已登记上限且累计剂量达到上限：证物虽为 SEALED 也视为 DOSE_BLOCKED，禁止新增借出。
+        doseAccountRepository.findByEvidenceKey(evidenceKey)
+                .filter(DoseAccount::doseBlocked)
+                .ifPresent(account -> {
+                    throw ApiException.unprocessable(
+                            "DOSE_BLOCKED: 累计光照剂量已达上限，禁止借出: " + evidenceKey);
+                });
         LocalDateTime nowUtc = clock.nowUtc();
         if (!request.dueAt().isAfter(nowUtc)) {
             throw ApiException.badRequest("应还时刻须晚于服务端当前时刻");
@@ -303,8 +327,35 @@ public class EvidenceService {
             throw ApiException.conflict("借出记录与证物当前未归还借出不一致: " + request.loanKey());
         }
         LocalDateTime nowUtc = clock.nowUtc();
+        // 封条完好且已登记剂量上限：先锁定账本并校验剂量段，非法或缺段直接 400，不归还、不记剂量；
+        // 封条异常走原 SEAL_BROKEN 流程，不核算剂量；未登记上限的借出不受剂量规则影响。
+        DoseAccount doseAccount = null;
+        DoseCalculator.DoseComputation dose = null;
+        if (request.sealIntact()) {
+            Optional<DoseAccount> account = doseAccountRepository.findByEvidenceKeyForUpdate(evidenceKey);
+            if (account.isPresent()) {
+                doseAccount = account.get();
+                dose = DoseCalculator.validateAndCompute(request.segments(), loan.loanAt(), nowUtc);
+            }
+        }
         if (!loanRepository.completeReturn(loan.id(), request.sealIntact(), request.note(), nowUtc)) {
             throw ApiException.conflict("借出已被并发归还: " + request.loanKey());
+        }
+        if (doseAccount != null) {
+            // 超限归还也必须成功保存实际剂量：累计只增不减，历史冻结当次与累计值。
+            BigDecimal newCumulative = doseAccount.cumulativeLuxMinutes()
+                    .add(dose.totalDose(), MathContext.DECIMAL128);
+            LocalDateTime now = LocalDateTime.now();
+            for (int i = 0; i < dose.sortedSegments().size(); i++) {
+                DoseSegmentRequest segment = dose.sortedSegments().get(i);
+                doseSegmentRepository.insert(evidenceKey, loan.loanKey(), i + 1,
+                        segment.startAt(), segment.endAt(), segment.lux(),
+                        dose.segmentDoses().get(i), now);
+            }
+            doseReturnRepository.insert(evidenceKey, loan.loanKey(), dose.totalDose(),
+                    newCumulative, now);
+            doseAccountRepository.addDose(evidenceKey, newCumulative,
+                    doseAccount.version() + 1, now);
         }
         inspectionRepository.insert(evidenceKey, actorId, request.sealIntact(), request.note(),
                 LocalDateTime.now());
@@ -349,6 +400,54 @@ public class EvidenceService {
         List<InspectionView> inspections = inspectionRepository.findByEvidenceKey(evidenceKey)
                 .stream().map(this::toView).toList();
         return new CustodyChainView(toView(evidence), transfers, loans, inspections);
+    }
+
+    /**
+     * 首次登记剂量上限：仅当前保管人，证物须为 SEALED，上限登记后不可变。
+     * 权限检查先于幂等重放；期望版本必须为0（账本尚不存在）。
+     * 登记后归还须携带剂量段，累计剂量达到上限后新增借出按 DOSE_BLOCKED 拒绝。
+     */
+    @Transactional
+    public StoredResponse registerDoseCap(String actorId, String evidenceKey,
+                                          DoseCapRegisterRequest request, String requestHash) {
+        Evidence evidence = lockEvidence(evidenceKey);
+        // 权限先于重放：保管权变化后，原保管人的重放不再命中首次结果。
+        requireCustodian(evidence, actorId);
+        Optional<StoredResponse> replay = checkReplay(request.requestId(), requestHash);
+        if (replay.isPresent()) {
+            return replay.get();
+        }
+        requireSealIntact(evidence);
+        if (evidence.status() != EvidenceStatus.SEALED) {
+            throw ApiException.conflict("仅 SEALED 证物可登记剂量上限: " + evidenceKey);
+        }
+        if (doseAccountRepository.findByEvidenceKey(evidenceKey).isPresent()) {
+            throw ApiException.conflict("剂量上限已登记，不可变: " + evidenceKey);
+        }
+        if (request.expectedVersion() != 0) {
+            throw ApiException.conflict("期望版本不匹配: 首次登记期望版本须为0");
+        }
+        LocalDateTime now = LocalDateTime.now();
+        doseAccountRepository.insert(evidenceKey, request.capLuxMinutes(), actorId, now);
+        DoseAccount account = doseAccountRepository.findByEvidenceKey(evidenceKey).orElseThrow();
+        return record(request.requestId(), OP_DOSE_CAP_REGISTER, actorId, requestHash,
+                201, toLedgerView(account, List.of()));
+    }
+
+    /**
+     * 查询剂量账本明细：仅当前保管人可查（权限先于一切），
+     * 历史冻结各次归还的照度、区间、当次与累计剂量；显示值 HALF_UP 四位，不参与判定。
+     */
+    @Transactional(readOnly = true)
+    public DoseLedgerView doseLedger(String actorId, String evidenceKey) {
+        Evidence evidence = evidenceRepository.findByKey(evidenceKey)
+                .orElseThrow(() -> ApiException.notFound("证物不存在: " + evidenceKey));
+        requireCustodian(evidence, actorId);
+        DoseAccount account = doseAccountRepository.findByEvidenceKey(evidenceKey)
+                .orElseThrow(() -> ApiException.notFound("证物未登记剂量账本: " + evidenceKey));
+        List<DoseReturnView> returns = doseReturnRepository.findByEvidenceKey(evidenceKey)
+                .stream().map(this::toView).toList();
+        return toLedgerView(account, returns);
     }
 
     private Evidence lockEvidence(String evidenceKey) {
@@ -424,5 +523,24 @@ public class EvidenceService {
         return new LoanView(loan.loanKey(), loan.evidenceKey(), loan.custodianId(),
                 loan.borrowerId(), loan.purpose(), loan.loanAt(), loan.dueAt(), loan.status(),
                 overdue, loan.sealPassed(), loan.returnNote(), loan.returnedAt());
+    }
+
+    private DoseLedgerView toLedgerView(DoseAccount account, List<DoseReturnView> returns) {
+        return new DoseLedgerView(account.evidenceKey(), account.capLuxMinutes(),
+                account.cumulativeLuxMinutes(), DoseCalculator.display(account.cumulativeLuxMinutes()),
+                account.doseBlocked(), account.version(), account.registeredBy(), returns);
+    }
+
+    private DoseReturnView toView(DoseReturnRecord record) {
+        List<DoseSegmentView> segments = doseSegmentRepository.findByLoanKey(record.loanKey())
+                .stream().map(this::toView).toList();
+        return new DoseReturnView(record.loanKey(), record.doseLuxMinutes(),
+                DoseCalculator.display(record.doseLuxMinutes()), record.cumulativeLuxMinutes(),
+                DoseCalculator.display(record.cumulativeLuxMinutes()), segments, record.createdAt());
+    }
+
+    private DoseSegmentView toView(DoseSegment segment) {
+        return new DoseSegmentView(segment.seq(), segment.startAt(), segment.endAt(), segment.lux(),
+                segment.doseLuxMinutes(), DoseCalculator.display(segment.doseLuxMinutes()));
     }
 }

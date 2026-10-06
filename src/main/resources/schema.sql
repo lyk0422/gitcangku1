@@ -60,12 +60,52 @@ CREATE TABLE IF NOT EXISTS loan_record (
     KEY idx_loan_borrower_status (borrower_id, status)
 );
 
+-- 剂量账本：每件证物至多一本；上限首次登记后不可变，累计剂量只增不减，保管权交接不清账。
+CREATE TABLE IF NOT EXISTS dose_account (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    evidence_key VARCHAR(64) NOT NULL COMMENT '关联证物业务键，全局唯一（每件证物至多一本剂量账）',
+    cap_lux_minutes DECIMAL(19,3) NOT NULL COMMENT '不可逆光照上限，单位勒克斯分钟，正值最多3位小数，首次登记后不可变',
+    cumulative_lux_minutes DECIMAL(38,18) NOT NULL COMMENT '累计剂量，单位勒克斯分钟，照度乘精确分钟累加，不舍入',
+    version INT NOT NULL COMMENT '账本版本：登记上限为1，每次剂量归还+1，用于期望版本校验',
+    registered_by VARCHAR(64) NOT NULL COMMENT '登记上限时的当前保管人',
+    created_at DATETIME(6) NOT NULL COMMENT '账本创建时间，Asia/Shanghai',
+    updated_at DATETIME(6) NOT NULL COMMENT '最近一次累计剂量变更时间，Asia/Shanghai',
+    CONSTRAINT uk_dose_account_evidence UNIQUE (evidence_key)
+);
+
+-- 剂量归还记录：只追加；每次封条完好的归还（已登记上限的证物）冻结当次与归还后累计剂量。
+CREATE TABLE IF NOT EXISTS dose_return (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    evidence_key VARCHAR(64) NOT NULL COMMENT '关联证物业务键',
+    loan_key VARCHAR(64) NOT NULL COMMENT '本次归还对应的借出业务键，一笔借出至多一条剂量归还',
+    dose_lux_minutes DECIMAL(38,18) NOT NULL COMMENT '当次归还剂量，单位勒克斯分钟，各段剂量之和，不舍入',
+    cumulative_lux_minutes DECIMAL(38,18) NOT NULL COMMENT '归还后累计剂量，单位勒克斯分钟，历史冻结不随后续操作变化',
+    created_at DATETIME(6) NOT NULL COMMENT '记录创建时间，Asia/Shanghai',
+    CONSTRAINT uk_dose_return_loan UNIQUE (loan_key),
+    KEY idx_dose_return_evidence (evidence_key)
+);
+
+-- 剂量段：只追加、不可变；一次归还1至20段，区间互不重叠且完整覆盖实际借出至归还。
+CREATE TABLE IF NOT EXISTS dose_segment (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    evidence_key VARCHAR(64) NOT NULL COMMENT '关联证物业务键',
+    loan_key VARCHAR(64) NOT NULL COMMENT '本次归还对应的借出业务键',
+    seq INT NOT NULL COMMENT '段序号，从1开始按时间顺序排列',
+    start_at DATETIME(6) NOT NULL COMMENT '段区间起点（UTC，含）',
+    end_at DATETIME(6) NOT NULL COMMENT '段区间终点（UTC，不含），须晚于起点',
+    lux DECIMAL(19,3) NOT NULL COMMENT '照度，单位勒克斯，非负，最多3位小数',
+    dose_lux_minutes DECIMAL(38,18) NOT NULL COMMENT '本段剂量=照度×精确分钟，单位勒克斯分钟，不舍入',
+    created_at DATETIME(6) NOT NULL COMMENT '记录创建时间，Asia/Shanghai',
+    KEY idx_dose_segment_evidence (evidence_key),
+    KEY idx_dose_segment_loan (loan_key)
+);
+
 -- 幂等命令日志：command_key 全局唯一；同键同参重放返回首次结果，同键改参返回 409。
 CREATE TABLE IF NOT EXISTS command_log (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     command_key VARCHAR(64) NOT NULL COMMENT '幂等命令键，全局唯一',
     actor_id VARCHAR(64) NOT NULL COMMENT '发起操作人',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN/DOSE_CAP_REGISTER',
     request_hash VARCHAR(64) NOT NULL COMMENT '请求参数规范化后的 SHA-256，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行的 HTTP 状态码',
     response_body TEXT NOT NULL COMMENT '首次执行的响应体 JSON，重放时原样返回',

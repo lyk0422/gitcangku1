@@ -2,6 +2,8 @@ package com.example.starter.evidence;
 
 import com.example.starter.evidence.dto.CommandRequest;
 import com.example.starter.evidence.dto.CustodyChainView;
+import com.example.starter.evidence.dto.DoseCapRegisterRequest;
+import com.example.starter.evidence.dto.DoseLedgerView;
 import com.example.starter.evidence.dto.EvidenceView;
 import com.example.starter.evidence.dto.IntakeRequest;
 import com.example.starter.evidence.dto.LoanCreateRequest;
@@ -163,6 +165,30 @@ public class EvidenceController {
     @GetMapping("/{evidenceKey}/custody-chain")
     public CustodyChainView custodyChain(@PathVariable String evidenceKey) {
         return evidenceService.custodyChain(evidenceKey);
+    }
+
+    /**
+     * 首次登记剂量上限：仅当前保管人，证物须 SEALED，登记后不可变。
+     * 幂等身份含操作、操作者、资源及全部参数和期望版本，结构化比较避免分隔符碰撞。
+     */
+    @PostMapping("/{evidenceKey}/dose-cap")
+    public ResponseEntity<String> registerDoseCap(@RequestHeader(ACTOR_HEADER) @NotBlank String actorId,
+                                                  @PathVariable String evidenceKey,
+                                                  @Valid @RequestBody DoseCapRegisterRequest request) {
+        String hash = idempotencyAdvisor.hashStructured(EvidenceService.OP_DOSE_CAP_REGISTER,
+                actorId, evidenceKey, request);
+        StoredResponse response = idempotencyAdvisor.guard(request.requestId(), hash,
+                () -> evidenceService.registerDoseCap(actorId, evidenceKey, request, hash));
+        return toEntity(response);
+    }
+
+    /**
+     * 查询剂量账本明细：仅当前保管人可查（权限先于重放）。
+     */
+    @GetMapping("/{evidenceKey}/dose-ledger")
+    public DoseLedgerView doseLedger(@RequestHeader(ACTOR_HEADER) @NotBlank String actorId,
+                                     @PathVariable String evidenceKey) {
+        return evidenceService.doseLedger(actorId, evidenceKey);
     }
 
     private ResponseEntity<String> toEntity(StoredResponse response) {
