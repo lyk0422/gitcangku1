@@ -5,6 +5,7 @@ import com.example.starter.race.api.CheckpointResponse;
 import com.example.starter.race.api.CheckpointsConfigResponse;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
 import com.example.starter.race.api.CreateRaceRequest;
+import com.example.starter.race.api.HandicapFactorResponse;
 import com.example.starter.race.api.MissingCheckpointsResponse;
 import com.example.starter.race.api.RaceResponse;
 import com.example.starter.race.api.RegisterRunnerRequest;
@@ -13,13 +14,17 @@ import com.example.starter.race.api.RevokePenaltyRequest;
 import com.example.starter.race.api.RunnerMissingCheckpointsResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
+import com.example.starter.race.api.SelectScoringModeRequest;
 import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.api.SubmitTimingRequest;
+import com.example.starter.race.api.UpsertHandicapFactorRequest;
 import com.example.starter.race.domain.CheckpointRules;
+import com.example.starter.race.domain.HandicapScore;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
+import com.example.starter.race.domain.ScoringMode;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
 import com.example.starter.race.persistence.IdempotencyRow;
@@ -95,7 +100,8 @@ public class RaceServiceImpl implements RaceService {
                     }
                     RaceRow race = repository.findRace(request.raceId()).orElseThrow();
                     return ServiceResult.created(new RaceResponse(
-                            race.raceId(), race.version(), race.status(), race.createdAt()));
+                            race.raceId(), race.version(), race.status(),
+                            race.scoringMode(), race.createdAt()));
                 });
     }
 
@@ -360,7 +366,8 @@ public class RaceServiceImpl implements RaceService {
                     List<CheckpointRow> checkpoints = repository.findCheckpoints(raceId);
                     List<CheckpointTimingRow> timings = repository.findAllTimings(raceId);
                     List<ResultEntry> entries =
-                            ResultCalculator.compute(runners, penalties, checkpoints, timings);
+                            ResultCalculator.compute(race.scoringMode(),
+                                    runners, penalties, checkpoints, timings);
 
                     int newVersion = request.expectedVersion() + 1;
                     int updated = repository.sealIfOpenAtVersion(
@@ -383,15 +390,19 @@ public class RaceServiceImpl implements RaceService {
                                 order,
                                 entry.checkpointCount(),
                                 entry.coveredCheckpointCount(),
-                                entry.missingCheckpoints()));
+                                entry.missingCheckpoints(),
+                                entry.factorP(),
+                                entry.factorQ(),
+                                entry.scoreNumerator(),
+                                entry.scoreDenominator()));
                     }
                     // 在同一封榜事务内固化每名选手 × 每个检查点的明细，缺失行耗时为 null。
                     List<SnapshotCheckpointRow> snapshotCheckpoints =
                             buildSnapshotCheckpoints(raceId, runners, checkpoints, timings);
-                    repository.insertSnapshot(new SnapshotRow(raceId, newVersion, now,
-                            snapshotEntries, snapshotCheckpoints));
+                    repository.insertSnapshot(new SnapshotRow(raceId, newVersion,
+                            race.scoringMode(), now, snapshotEntries, snapshotCheckpoints));
                     return ServiceResult.ok(new StandingResponse(
-                            raceId, newVersion, RaceStatus.SEALED, now,
+                            raceId, newVersion, RaceStatus.SEALED, race.scoringMode(), now,
                             snapshotEntries.stream().map(ResponseMapper::toEntryResponse).toList()));
                 });
     }
@@ -496,6 +507,92 @@ public class RaceServiceImpl implements RaceService {
         SnapshotRow snapshot = repository.findSnapshot(raceId)
                 .orElseThrow(() -> new NotFoundException("赛事尚未封榜: " + raceId));
         return ResponseMapper.snapshotStanding(snapshot);
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult selectScoringMode(String raceId, SelectScoringModeRequest request) {
+        return withIdempotency(request.requestId(), "SELECT_SCORING_MODE",
+                orderedParams(
+                        "raceId", raceId,
+                        "mode", request.mode(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    ScoringMode mode = parseScoringMode(request.mode());
+                    if (mode != ScoringMode.HANDICAP) {
+                        throw new BadRequestException("仅支持选择 HANDICAP 计分模式: " + request.mode());
+                    }
+                    if (race.scoringMode() == ScoringMode.HANDICAP) {
+                        throw new ConflictException("赛事已选择 HANDICAP 计分模式: " + raceId);
+                    }
+                    // 首次计时前才可选择：已有完赛耗时或分段记录即视为计时已开始。
+                    if (repository.countTimedRunners(raceId) > 0
+                            || repository.countTimings(raceId) > 0) {
+                        throw new ConflictException("赛事已开始计时，不能再选择计分模式: " + raceId);
+                    }
+                    bumpVersion(race, request.expectedVersion());
+                    int updated = repository.selectHandicapMode(raceId);
+                    if (updated == 0) {
+                        throw new ConflictException("赛事已选择 HANDICAP 计分模式: " + raceId);
+                    }
+                    RaceRow refreshed = repository.findRace(raceId).orElseThrow();
+                    return ServiceResult.ok(new RaceResponse(
+                            refreshed.raceId(), refreshed.version(), refreshed.status(),
+                            refreshed.scoringMode(), refreshed.createdAt()));
+                });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult upsertHandicapFactor(
+            String raceId, String bib, UpsertHandicapFactorRequest request) {
+        // 等比例系数按约分后的值参与幂等摘要：2/6 与 1/3 视为同参。
+        Integer digestP = request.p();
+        Integer digestQ = request.q();
+        if (request.p() != null && request.q() != null && request.p() > 0 && request.q() > 0) {
+            int[] reduced = HandicapScore.reduceFactor(request.p(), request.q());
+            digestP = reduced[0];
+            digestQ = reduced[1];
+        }
+        return withIdempotency(request.requestId(), "UPSERT_HANDICAP_FACTOR",
+                orderedParams(
+                        "raceId", raceId,
+                        "bib", bib,
+                        "p", digestP,
+                        "q", digestQ,
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    if (race.scoringMode() != ScoringMode.HANDICAP) {
+                        throw new ConflictException("赛事未选择 HANDICAP 计分模式: " + raceId);
+                    }
+                    requireRunner(raceId, bib);
+                    if (request.p() == null || request.q() == null
+                            || request.p() < 1 || request.p() > 1000
+                            || request.q() < 1 || request.q() > 1000) {
+                        throw new BadRequestException("让分系数 p、q 必须为 1~1000 的正整数");
+                    }
+                    int[] reduced = HandicapScore.reduceFactor(request.p(), request.q());
+                    long now = clock.millis();
+                    bumpVersion(race, request.expectedVersion());
+                    int updated = repository.upsertHandicapFactor(
+                            raceId, bib, reduced[0], reduced[1], now);
+                    if (updated == 0) {
+                        throw new NotFoundException("选手不存在: " + bib);
+                    }
+                    return ServiceResult.ok(new HandicapFactorResponse(
+                            raceId, bib, reduced[0], reduced[1],
+                            request.expectedVersion() + 1));
+                });
+    }
+
+    private static ScoringMode parseScoringMode(String mode) {
+        try {
+            return ScoringMode.valueOf(mode);
+        } catch (IllegalArgumentException ex) {
+            throw new BadRequestException("未知计分模式: " + mode);
+        }
     }
 
     /**

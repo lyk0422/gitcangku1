@@ -10,13 +10,17 @@ import java.util.List;
  *
  * @param bib                    参赛号
  * @param rank                   名次（并列同名次并跳号）；非 RANKED 为 null
- * @param status                RANKED / UNTIMED / MISSING_CHECKPOINT / DISQUALIFIED
+ * @param status                RANKED / UNTIMED / MISSING_CHECKPOINT / MISSING_FACTOR / DISQUALIFIED
  * @param finishTimeMs          原始完赛耗时毫秒；计时缺失为 null
  * @param penaltyMs             生效加时合计毫秒数
- * @param totalTimeMs           总耗时毫秒；未排名为 null
+ * @param totalTimeMs           总耗时展示值毫秒（让分赛为精确分数 HALF_UP 舍入值）；未排名为 null
  * @param checkpointCount       赛事检查点总数；未配置检查点为 0
  * @param coveredCheckpointCount 该选手已覆盖检查点数量
  * @param missingCheckpoints    缺失检查点代码，按检查点顺序排列；无缺失为空列表
+ * @param factorP               让分系数分子 p（约分后）；非让分赛或未登记为 null
+ * @param factorQ               让分系数分母 q（约分后）；非让分赛或未登记为 null
+ * @param scoreNumerator        让分赛精确有效成绩分子（约分后）；仅让分赛 RANKED 条目非 null
+ * @param scoreDenominator      让分赛精确有效成绩分母（约分后）；仅让分赛 RANKED 条目非 null
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public record ResultEntryResponse(
@@ -28,6 +32,10 @@ public record ResultEntryResponse(
         Long totalTimeMs,
         int checkpointCount,
         int coveredCheckpointCount,
-        List<String> missingCheckpoints
+        List<String> missingCheckpoints,
+        Integer factorP,
+        Integer factorQ,
+        Long scoreNumerator,
+        Long scoreDenominator
 ) {
 }

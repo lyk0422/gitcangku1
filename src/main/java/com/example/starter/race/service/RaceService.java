@@ -9,8 +9,10 @@ import com.example.starter.race.api.RevokePenaltyRequest;
 import com.example.starter.race.api.MissingCheckpointsResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
+import com.example.starter.race.api.SelectScoringModeRequest;
 import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.api.SubmitTimingRequest;
+import com.example.starter.race.api.UpsertHandicapFactorRequest;
 
 /**
  * 赛事成绩封榜应用服务；每个写方法在单个数据库事务内完成
@@ -47,6 +49,19 @@ public interface RaceService {
 
     /** 封榜：校验版本并原子保存只读成绩快照（含每名选手分段明细与缺失检查点）。 */
     ServiceResult sealRace(String raceId, SealRaceRequest request);
+
+    /**
+     * 选择计分模式：仅 OPEN 且首次计时前（无任何完赛耗时与分段记录）可选择 HANDICAP，
+     * 选择后不可更改，成功后赛事版本加一。
+     */
+    ServiceResult selectScoringMode(String raceId, SelectScoringModeRequest request);
+
+    /**
+     * 登记或修改选手让分系数：仅 OPEN 的 HANDICAP 赛事可写，p/q 为 1~1000 正整数，
+     * 存储与幂等比较均按约分后的值，成功后赛事版本加一。
+     */
+    ServiceResult upsertHandicapFactor(
+            String raceId, String bib, UpsertHandicapFactorRequest request);
 
     /** 查询即时成绩（OPEN 实时计算；SEALED 返回封榜快照）。 */
     StandingResponse getResults(String raceId);

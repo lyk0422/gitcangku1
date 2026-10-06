@@ -13,11 +13,15 @@ import java.util.List;
  * @param status                    成绩状态
  * @param finishTimeMs              原始完赛耗时（毫秒）；计时缺失为 null
  * @param penaltyMs                 生效加时合计毫秒数
- * @param totalTimeMs               总耗时毫秒数；未排名为 null
+ * @param totalTimeMs               总耗时展示值毫秒数（让分赛为 HALF_UP 舍入值）；未排名为 null
  * @param displayOrder              展示顺序，从0开始
  * @param checkpointCount           赛事检查点总数；未配置检查点为 0
  * @param coveredCheckpointCount    该选手已覆盖检查点数量
  * @param missingCheckpoints        缺失检查点代码，按检查点顺序排列；无缺失时为空列表
+ * @param factorP                   封榜时冻结的让分系数分子 p（约分后）；非让分赛或未登记为 null
+ * @param factorQ                   封榜时冻结的让分系数分母 q（约分后）；非让分赛或未登记为 null
+ * @param scoreNumerator            封榜时冻结的精确有效成绩分子（约分后）；非让分赛或未排名为 null
+ * @param scoreDenominator          封榜时冻结的精确有效成绩分母（约分后）；非让分赛或未排名为 null
  */
 public record SnapshotEntryRow(
         String raceId,
@@ -30,10 +34,14 @@ public record SnapshotEntryRow(
         int displayOrder,
         int checkpointCount,
         int coveredCheckpointCount,
-        List<String> missingCheckpoints
+        List<String> missingCheckpoints,
+        Integer factorP,
+        Integer factorQ,
+        Long scoreNumerator,
+        Long scoreDenominator
 ) {
 
-    /** 兼容旧调用的构造器：检查点计数为 0、缺失列表为空。 */
+    /** 标准计分赛事的兼容构造器：无让分冻结字段。 */
     public SnapshotEntryRow(
             String raceId,
             String bib,
@@ -42,8 +50,12 @@ public record SnapshotEntryRow(
             Long finishTimeMs,
             long penaltyMs,
             Long totalTimeMs,
-            int displayOrder) {
+            int displayOrder,
+            int checkpointCount,
+            int coveredCheckpointCount,
+            List<String> missingCheckpoints) {
         this(raceId, bib, rank, status, finishTimeMs, penaltyMs, totalTimeMs, displayOrder,
-                0, 0, List.of());
+                checkpointCount, coveredCheckpointCount, missingCheckpoints,
+                null, null, null, null);
     }
 }

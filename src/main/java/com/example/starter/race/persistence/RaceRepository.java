@@ -3,6 +3,7 @@ package com.example.starter.race.persistence;
 import com.example.starter.race.domain.EntryStatus;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
+import com.example.starter.race.domain.ScoringMode;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
@@ -40,7 +41,8 @@ public class RaceRepository {
     /** 按ID查询赛事。 */
     public Optional<RaceRow> findRace(String raceId) {
         return jdbcTemplate
-                .query("SELECT race_id, version, status, created_at FROM race WHERE race_id = ?",
+                .query("SELECT race_id, version, status, scoring_mode, created_at "
+                                + "FROM race WHERE race_id = ?",
                         RACE_ROW_MAPPER, raceId)
                 .stream()
                 .findFirst();
@@ -53,7 +55,8 @@ public class RaceRepository {
      */
     public Optional<RaceRow> findRaceForUpdate(String raceId) {
         return jdbcTemplate
-                .query("SELECT race_id, version, status, created_at FROM race WHERE race_id = ? FOR UPDATE",
+                .query("SELECT race_id, version, status, scoring_mode, created_at "
+                                + "FROM race WHERE race_id = ? FOR UPDATE",
                         RACE_ROW_MAPPER, raceId)
                 .stream()
                 .findFirst();
@@ -62,7 +65,7 @@ public class RaceRepository {
     /** 查询赛事下全部选手，按参赛号字典序排列。 */
     public List<RunnerRow> findRunners(String raceId) {
         return jdbcTemplate.query(
-                "SELECT id, race_id, bib, finish_time_ms, created_at, updated_at "
+                "SELECT id, race_id, bib, finish_time_ms, factor_p, factor_q, created_at, updated_at "
                         + "FROM runner WHERE race_id = ? ORDER BY bib",
                 RUNNER_ROW_MAPPER, raceId);
     }
@@ -70,11 +73,19 @@ public class RaceRepository {
     /** 按赛事与参赛号查询选手。 */
     public Optional<RunnerRow> findRunner(String raceId, String bib) {
         return jdbcTemplate
-                .query("SELECT id, race_id, bib, finish_time_ms, created_at, updated_at "
+                .query("SELECT id, race_id, bib, finish_time_ms, factor_p, factor_q, created_at, updated_at "
                                 + "FROM runner WHERE race_id = ? AND bib = ?",
                         RUNNER_ROW_MAPPER, raceId, bib)
                 .stream()
                 .findFirst();
+    }
+
+    /** 统计赛事下已有完赛耗时的选手数（用于“首次计时前才可选择计分模式”）。 */
+    public int countTimedRunners(String raceId) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM runner WHERE race_id = ? AND finish_time_ms IS NOT NULL",
+                Integer.class, raceId);
+        return count == null ? 0 : count;
     }
 
     /** 查询赛事下全部处罚（含已撤销），按新增时间与处罚ID排列。 */
@@ -175,11 +186,13 @@ public class RaceRepository {
     /** 查询封榜快照（含全部条目与分段明细）；未封榜返回 empty。 */
     public Optional<SnapshotRow> findSnapshot(String raceId) {
         List<SnapshotRow> headers = jdbcTemplate.query(
-                "SELECT race_id, version, sealed_at FROM result_snapshot WHERE race_id = ?",
+                "SELECT race_id, version, scoring_mode, sealed_at FROM result_snapshot WHERE race_id = ?",
                 (rs, rowNum) -> new SnapshotRow(
                         rs.getString("race_id"),
                         rs.getInt("version"),
+                        ScoringMode.valueOf(rs.getString("scoring_mode")),
                         rs.getLong("sealed_at"),
+                        List.of(),
                         List.of()),
                 raceId);
         if (headers.isEmpty()) {
@@ -188,6 +201,7 @@ public class RaceRepository {
         SnapshotRow header = headers.getFirst();
         List<SnapshotEntryRow> entryRows = jdbcTemplate.query(
                 "SELECT race_id, bib, rank_no, status, finish_time_ms, penalty_ms, total_time_ms, "
+                        + "factor_p, factor_q, score_num, score_den, "
                         + "display_order, checkpoint_count, covered_checkpoint_count "
                         + "FROM result_snapshot_entry WHERE race_id = ? ORDER BY display_order",
                 SNAPSHOT_ENTRY_ROW_MAPPER, raceId);
@@ -210,20 +224,23 @@ public class RaceRepository {
                         entry.finishTimeMs(), entry.penaltyMs(), entry.totalTimeMs(),
                         entry.displayOrder(), entry.checkpointCount(),
                         entry.coveredCheckpointCount(),
-                        missingByBib.getOrDefault(entry.bib(), List.of())))
+                        missingByBib.getOrDefault(entry.bib(), List.of()),
+                        entry.factorP(), entry.factorQ(),
+                        entry.scoreNumerator(), entry.scoreDenominator()))
                 .toList();
-        return Optional.of(new SnapshotRow(header.raceId(), header.version(), header.sealedAt(),
-                entries, checkpoints));
+        return Optional.of(new SnapshotRow(header.raceId(), header.version(),
+                header.scoringMode(), header.sealedAt(), entries, checkpoints));
     }
 
-    /** 新建赛事，初始版本1、状态OPEN。 */
+    /** 新建赛事，初始版本1、状态OPEN、标准计分模式。 */
     public void insertRace(String raceId, long now) {
         jdbcTemplate.update(
-                "INSERT INTO race (race_id, version, status, created_at) VALUES (?, 1, 'OPEN', ?)",
+                "INSERT INTO race (race_id, version, status, scoring_mode, created_at) "
+                        + "VALUES (?, 1, 'OPEN', 'STANDARD', ?)",
                 raceId, now);
     }
 
-    /** 登记选手；finishTimeMs 为 null 表示计时缺失。 */
+    /** 登记选手；finishTimeMs 为 null 表示计时缺失，让分系数初始未登记。 */
     public void insertRunner(String raceId, String bib, Long finishTimeMs, long now) {
         jdbcTemplate.update(
                 "INSERT INTO runner (race_id, bib, finish_time_ms, created_at, updated_at) "
@@ -236,6 +253,22 @@ public class RaceRepository {
         return jdbcTemplate.update(
                 "UPDATE runner SET finish_time_ms = ?, updated_at = ? WHERE race_id = ? AND bib = ?",
                 finishTimeMs, now, raceId, bib);
+    }
+
+    /** 将赛事计分模式转为 HANDICAP；仅当前为 STANDARD 时生效，返回受影响行数。 */
+    public int selectHandicapMode(String raceId) {
+        return jdbcTemplate.update(
+                "UPDATE race SET scoring_mode = 'HANDICAP' "
+                        + "WHERE race_id = ? AND scoring_mode = 'STANDARD'",
+                raceId);
+    }
+
+    /** 登记或修改选手让分系数（存储约分后的 p/q）；返回受影响行数（0 表示选手不存在）。 */
+    public int upsertHandicapFactor(String raceId, String bib, int factorP, int factorQ, long now) {
+        return jdbcTemplate.update(
+                "UPDATE runner SET factor_p = ?, factor_q = ?, updated_at = ? "
+                        + "WHERE race_id = ? AND bib = ?",
+                factorP, factorQ, now, raceId, bib);
     }
 
     /** 新增处罚（不可覆盖历史）。 */
@@ -287,13 +320,16 @@ public class RaceRepository {
     /** 原子写入封榜快照头表、全部条目以及每名选手的分段明细。 */
     public void insertSnapshot(SnapshotRow snapshot) {
         jdbcTemplate.update(
-                "INSERT INTO result_snapshot (race_id, version, sealed_at) VALUES (?, ?, ?)",
-                snapshot.raceId(), snapshot.version(), snapshot.sealedAt());
+                "INSERT INTO result_snapshot (race_id, version, scoring_mode, sealed_at) "
+                        + "VALUES (?, ?, ?, ?)",
+                snapshot.raceId(), snapshot.version(), snapshot.scoringMode().name(),
+                snapshot.sealedAt());
         jdbcTemplate.batchUpdate(
                 "INSERT INTO result_snapshot_entry "
                         + "(race_id, bib, rank_no, status, finish_time_ms, penalty_ms, total_time_ms, "
+                        + "factor_p, factor_q, score_num, score_den, "
                         + "display_order, checkpoint_count, covered_checkpoint_count) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 snapshot.entries(),
                 snapshot.entries().size(),
                 (ps, entry) -> {
@@ -304,9 +340,13 @@ public class RaceRepository {
                     ps.setObject(5, entry.finishTimeMs());
                     ps.setLong(6, entry.penaltyMs());
                     ps.setObject(7, entry.totalTimeMs());
-                    ps.setInt(8, entry.displayOrder());
-                    ps.setInt(9, entry.checkpointCount());
-                    ps.setInt(10, entry.coveredCheckpointCount());
+                    ps.setObject(8, entry.factorP());
+                    ps.setObject(9, entry.factorQ());
+                    ps.setObject(10, entry.scoreNumerator());
+                    ps.setObject(11, entry.scoreDenominator());
+                    ps.setInt(12, entry.displayOrder());
+                    ps.setInt(13, entry.checkpointCount());
+                    ps.setInt(14, entry.coveredCheckpointCount());
                 });
         jdbcTemplate.batchUpdate(
                 "INSERT INTO result_snapshot_checkpoint "
@@ -388,6 +428,7 @@ public class RaceRepository {
                     rs.getString("race_id"),
                     rs.getInt("version"),
                     RaceStatus.valueOf(rs.getString("status")),
+                    ScoringMode.valueOf(rs.getString("scoring_mode")),
                     rs.getLong("created_at"));
         }
     }
@@ -401,6 +442,8 @@ public class RaceRepository {
                     rs.getString("race_id"),
                     rs.getString("bib"),
                     finishTimeMs,
+                    (Integer) rs.getObject("factor_p"),
+                    (Integer) rs.getObject("factor_q"),
                     rs.getLong("created_at"),
                     rs.getLong("updated_at"));
         }
@@ -435,7 +478,11 @@ public class RaceRepository {
                     rs.getInt("display_order"),
                     rs.getInt("checkpoint_count"),
                     rs.getInt("covered_checkpoint_count"),
-                    List.of());
+                    List.of(),
+                    (Integer) rs.getObject("factor_p"),
+                    (Integer) rs.getObject("factor_q"),
+                    (Long) rs.getObject("score_num"),
+                    (Long) rs.getObject("score_den"));
         }
     }
 
