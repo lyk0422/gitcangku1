@@ -35,6 +35,12 @@ public class DeviceController {
         return deviceService.get(deviceId);
     }
 
+    @PostMapping("/{deviceId}/space")
+    public DeviceView updateSpace(@PathVariable String deviceId,
+                                  @Valid @RequestBody UpdateDeviceSpaceRequest request) {
+        return deviceService.updateSpace(deviceId, request);
+    }
+
     @PostMapping("/{deviceId}/pull")
     public PullResponse pull(@PathVariable String deviceId, @Valid @RequestBody RequestIdBody request) {
         return taskService.pull(deviceId, request.requestId());

@@ -23,10 +23,12 @@ public class TaskRepository {
         String firstResult = rs.getString("first_result");
         return new RolloutTask(rs.getLong("id"), rs.getLong("release_id"), rs.getString("device_id"),
                 TaskStatus.valueOf(rs.getString("status")),
-                firstResult == null ? null : ReceiptResult.valueOf(firstResult));
+                firstResult == null ? null : ReceiptResult.valueOf(firstResult),
+                rs.getObject("reserved_bytes", Long.class), rs.getObject("peak_bytes", Long.class));
     };
 
-    private static final String COLUMNS = "id, release_id, device_id, status, first_result";
+    private static final String COLUMNS = "id, release_id, device_id, status, first_result,"
+            + " reserved_bytes, peak_bytes";
 
     private final JdbcTemplate jdbc;
 
@@ -34,14 +36,22 @@ public class TaskRepository {
         this.jdbc = jdbc;
     }
 
-    public long insert(long releaseId, String deviceId) {
+    public long insert(long releaseId, String deviceId, Long reservedBytes, Long peakBytes) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO rollout_task (release_id, device_id, status) VALUES (?, ?, 'PENDING')",
+                    "INSERT INTO rollout_task (release_id, device_id, status, reserved_bytes, peak_bytes)"
+                            + " VALUES (?, ?, 'PENDING', ?, ?)",
                     new String[]{"id"});
             ps.setLong(1, releaseId);
             ps.setString(2, deviceId);
+            if (reservedBytes == null) {
+                ps.setNull(3, java.sql.Types.BIGINT);
+                ps.setNull(4, java.sql.Types.BIGINT);
+            } else {
+                ps.setLong(3, reservedBytes);
+                ps.setLong(4, peakBytes);
+            }
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();
@@ -86,5 +96,24 @@ public class TaskRepository {
                 "SELECT COUNT(*) FROM rollout_task WHERE release_id = ? AND device_id = ?",
                 Long.class, releaseId, deviceId);
         return count == null ? 0 : count;
+    }
+
+    /**
+     * 设备当前活跃暂存预留字节数（全部 PENDING 任务的预留之和），无预留在旧模式下为 0。
+     */
+    public long sumActiveReservedBytes(String deviceId) {
+        Long sum = jdbc.queryForObject(
+                "SELECT COALESCE(SUM(reserved_bytes), 0) FROM rollout_task"
+                        + " WHERE device_id = ? AND status = 'PENDING'",
+                Long.class, deviceId);
+        return sum == null ? 0 : sum;
+    }
+
+    /**
+     * 设备全部未终结（PENDING）任务；同设备至多一项活跃暂存。
+     */
+    public List<RolloutTask> findPendingByDevice(String deviceId) {
+        return jdbc.query("SELECT " + COLUMNS + " FROM rollout_task WHERE device_id = ? AND status = 'PENDING'"
+                + " ORDER BY id", MAPPER, deviceId);
     }
 }

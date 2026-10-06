@@ -5,6 +5,9 @@ CREATE TABLE IF NOT EXISTS device (
   model VARCHAR(64) NOT NULL COMMENT '设备型号，登记后不可修改',
   current_version VARCHAR(64) NOT NULL COMMENT '设备当前固件版本',
   bucket_no INT NOT NULL COMMENT '灰度分桶号，取值0~99，登记后不可修改',
+  total_space_bytes BIGINT NULL COMMENT '总空间字节数，正整数；NULL为旧模式，不做暂存空间核验',
+  current_image_bytes BIGINT NULL COMMENT '当前镜像字节数，不超过总空间；NULL为旧模式',
+  space_version INT NULL COMMENT '空间档案版本，从1开始，维护与首次任务终结加一；NULL为旧模式',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '登记时间',
   PRIMARY KEY (device_id)
 ) COMMENT='设备登记表';
@@ -23,6 +26,8 @@ CREATE TABLE IF NOT EXISTS release_order (
   round_success INT NOT NULL DEFAULT 0 COMMENT '当前监控轮次内首次进入SUCCESS的任务数，重复回执不重复计数',
   round_failed INT NOT NULL DEFAULT 0 COMMENT '当前监控轮次内首次进入FAILED的任务数，重复回执不重复计数',
   active_model VARCHAR(64) NULL COMMENT 'ACTIVE或PAUSED时等于model，取消后置NULL；用于同型号至多一张未终结发布单的唯一约束',
+  package_bytes BIGINT NULL COMMENT '压缩包字节数，正整数；NULL为旧模式，领取不做暂存空间核验',
+  image_bytes BIGINT NULL COMMENT '解包镜像字节数，正整数；NULL为旧模式',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
   PRIMARY KEY (id)
@@ -36,6 +41,8 @@ CREATE TABLE IF NOT EXISTS rollout_task (
   device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
   status VARCHAR(16) NOT NULL COMMENT 'PENDING待回执；SUCCESS成功；FAILED失败；CANCELLED已取消',
   first_result VARCHAR(16) NULL COMMENT '首次回执结果（SUCCESS/FAILED），未回执为NULL',
+  reserved_bytes BIGINT NULL COMMENT '暂存预留字节数（压缩包+新镜像），PENDING期间占用，任务终结时释放；旧模式为NULL',
+  peak_bytes BIGINT NULL COMMENT '领取时峰值字节数（当时旧镜像+包+新镜像），历史快照不漂移；旧模式为NULL',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
   PRIMARY KEY (id),
@@ -66,7 +73,7 @@ CREATE TABLE IF NOT EXISTS release_resume_record (
 CREATE TABLE IF NOT EXISTS idempotency_record (
   request_id VARCHAR(64) NOT NULL COMMENT '全局唯一请求ID',
   api VARCHAR(64) NOT NULL COMMENT '接口标识',
-  fingerprint VARCHAR(256) NOT NULL COMMENT '请求参数指纹，同键异参返回409',
+  fingerprint VARCHAR(512) NOT NULL COMMENT '请求参数指纹（JSON数组结构化序列化，避免分隔符碰撞），同键异参返回409',
   response_body CLOB NOT NULL COMMENT '成功响应快照（JSON），用于同键同参重放',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   PRIMARY KEY (request_id)

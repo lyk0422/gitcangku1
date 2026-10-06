@@ -15,8 +15,18 @@ package com.example.starter.firmware.domain;
  * @param monitorRound            当前监控轮次，从1开始，人工恢复后加一
  * @param roundSuccess            当前监控轮次内首次进入 SUCCESS 的任务数
  * @param roundFailed             当前监控轮次内首次进入 FAILED 的任务数
+ * @param packageBytes            压缩包字节数，正整数；NULL 为旧模式，不做暂存空间核验
+ * @param imageBytes              解包镜像字节数，正整数；NULL 为旧模式
  */
 public record ReleaseOrder(long id, int version, String model, String fromVersion, String toVersion,
                            int ratio, ReleaseStatus status, int sampleFloor, int failureThresholdPercent,
-                           int monitorRound, int roundSuccess, int roundFailed) {
+                           int monitorRound, int roundSuccess, int roundFailed,
+                           Long packageBytes, Long imageBytes) {
+
+    /**
+     * 是否登记了容量字段。旧发布无容量字段，保留原模式。
+     */
+    public boolean spaceTracked() {
+        return packageBytes != null;
+    }
 }

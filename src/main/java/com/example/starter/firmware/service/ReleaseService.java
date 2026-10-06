@@ -8,9 +8,13 @@ import com.example.starter.firmware.api.ReleaseHistoryResponse;
 import com.example.starter.firmware.api.ReleaseView;
 import com.example.starter.firmware.api.ResumeRecordView;
 import com.example.starter.firmware.api.ResumeReleaseRequest;
+import com.example.starter.firmware.domain.Device;
 import com.example.starter.firmware.domain.ReleaseOrder;
 import com.example.starter.firmware.domain.ReleaseStatus;
+import com.example.starter.firmware.domain.RolloutTask;
+import com.example.starter.firmware.domain.TaskStatus;
 import com.example.starter.firmware.error.ApiException;
+import com.example.starter.firmware.repo.DeviceRepository;
 import com.example.starter.firmware.repo.PauseRecordRepository;
 import com.example.starter.firmware.repo.ReleaseRepository;
 import com.example.starter.firmware.repo.ResumeRecordRepository;
@@ -20,27 +24,32 @@ import org.springframework.stereotype.Service;
 
 import java.time.Clock;
 import java.time.Instant;
+import java.util.Comparator;
+import java.util.List;
 
 /**
  * 发布单生命周期：创建（版本从1开始）、扩量（版本校验+只增不减）、失败率自动暂停、
- * 人工恢复（版本加一并开启新监控轮次）、取消（未终结任务转 CANCELLED）。
+ * 人工恢复（版本加一并开启新监控轮次）、取消（未终结任务转 CANCELLED 并释放全部未终结暂存）。
  */
 @Service
 public class ReleaseService {
 
     private final ReleaseRepository releaseRepository;
     private final TaskRepository taskRepository;
+    private final DeviceRepository deviceRepository;
     private final PauseRecordRepository pauseRecordRepository;
     private final ResumeRecordRepository resumeRecordRepository;
     private final IdempotencyService idempotency;
     private final Clock clock;
 
     public ReleaseService(ReleaseRepository releaseRepository, TaskRepository taskRepository,
+                          DeviceRepository deviceRepository,
                           PauseRecordRepository pauseRecordRepository,
                           ResumeRecordRepository resumeRecordRepository,
                           IdempotencyService idempotency, Clock clock) {
         this.releaseRepository = releaseRepository;
         this.taskRepository = taskRepository;
+        this.deviceRepository = deviceRepository;
         this.pauseRecordRepository = pauseRecordRepository;
         this.resumeRecordRepository = resumeRecordRepository;
         this.idempotency = idempotency;
@@ -51,16 +60,21 @@ public class ReleaseService {
         if (request.fromVersion().equals(request.toVersion())) {
             throw ApiException.badRequest("SAME_VERSION", "目标版本必须与来源版本不同");
         }
+        if ((request.packageBytes() == null) != (request.imageBytes() == null)) {
+            throw ApiException.badRequest("SPACE_FIELDS_INCOMPLETE",
+                    "packageBytes 与 imageBytes 必须同时提供或同时省略");
+        }
         int sampleFloor = request.effectiveSampleFloor();
         int threshold = request.effectiveFailureThresholdPercent();
-        String fingerprint = String.join("|", "release.create", request.model(), request.fromVersion(),
-                request.toVersion(), String.valueOf(request.ratio()), String.valueOf(sampleFloor),
-                String.valueOf(threshold));
+        String fingerprint = Fingerprints.of("release.create", request.model(), request.fromVersion(),
+                request.toVersion(), request.ratio(), sampleFloor, threshold,
+                request.packageBytes(), request.imageBytes());
         return idempotency.execute(request.requestId(), "release.create", fingerprint, () -> {
             long id;
             try {
                 id = releaseRepository.insert(request.model(), request.fromVersion(), request.toVersion(),
-                        request.ratio(), sampleFloor, threshold);
+                        request.ratio(), sampleFloor, threshold,
+                        request.packageBytes(), request.imageBytes());
             } catch (DuplicateKeyException e) {
                 throw ApiException.conflict("ACTIVE_RELEASE_EXISTS", "型号已存在未终结发布单: " + request.model());
             }
@@ -69,8 +83,8 @@ public class ReleaseService {
     }
 
     public ReleaseView expand(long releaseId, ExpandReleaseRequest request) {
-        String fingerprint = String.join("|", "release.expand", String.valueOf(releaseId),
-                String.valueOf(request.expectedVersion()), String.valueOf(request.ratio()));
+        String fingerprint = Fingerprints.of("release.expand", releaseId,
+                request.expectedVersion(), request.ratio());
         return idempotency.execute(request.requestId(), "release.expand", fingerprint, () -> {
             ReleaseOrder order = releaseRepository.findByIdForUpdate(releaseId)
                     .orElseThrow(() -> ApiException.notFound("RELEASE_NOT_FOUND", "发布单不存在: " + releaseId));
@@ -95,8 +109,8 @@ public class ReleaseService {
      * 与取消并发时按行锁提交顺序决定唯一结果：取消先提交则恢复 409。
      */
     public ReleaseView resume(long releaseId, ResumeReleaseRequest request) {
-        String fingerprint = String.join("|", "release.resume", String.valueOf(releaseId),
-                String.valueOf(request.expectedVersion()), request.reason());
+        String fingerprint = Fingerprints.of("release.resume", releaseId,
+                request.expectedVersion(), request.reason());
         return idempotency.execute(request.requestId(), "release.resume", fingerprint, () -> {
             ReleaseOrder order = releaseRepository.findByIdForUpdate(releaseId)
                     .orElseThrow(() -> ApiException.notFound("RELEASE_NOT_FOUND", "发布单不存在: " + releaseId));
@@ -119,13 +133,25 @@ public class ReleaseService {
         }, ReleaseView.class);
     }
 
+    /**
+     * 取消：未终结任务转 CANCELLED；空间模式下逐台设备在设备空间行锁内释放暂存预留，
+     * 旧镜像不变，空间档案版本加一。设备按 ID 排序加锁，与回执形成一致提交顺序。
+     */
     public ReleaseView cancel(long releaseId, String requestId) {
-        String fingerprint = String.join("|", "release.cancel", String.valueOf(releaseId));
+        String fingerprint = Fingerprints.of("release.cancel", releaseId);
         return idempotency.execute(requestId, "release.cancel", fingerprint, () -> {
             ReleaseOrder order = releaseRepository.findByIdForUpdate(releaseId)
                     .orElseThrow(() -> ApiException.notFound("RELEASE_NOT_FOUND", "发布单不存在: " + releaseId));
             if (order.status() == ReleaseStatus.ACTIVE || order.status() == ReleaseStatus.PAUSED) {
                 releaseRepository.cancel(releaseId);
+                List<RolloutTask> pendings = taskRepository.findByRelease(releaseId, TaskStatus.PENDING);
+                if (order.spaceTracked()) {
+                    pendings.stream()
+                            .map(RolloutTask::deviceId)
+                            .distinct()
+                            .sorted(Comparator.naturalOrder())
+                            .forEach(this::releaseStagingIfTracked);
+                }
                 taskRepository.cancelPendingByRelease(releaseId);
             }
             return ReleaseView.of(findOrder(releaseId));
@@ -154,5 +180,16 @@ public class ReleaseService {
     public ReleaseOrder findOrder(long releaseId) {
         return releaseRepository.findById(releaseId)
                 .orElseThrow(() -> ApiException.notFound("RELEASE_NOT_FOUND", "发布单不存在: " + releaseId));
+    }
+
+    /**
+     * 取消时释放单台设备的未终结暂存：仅登记了空间档案的设备档案版本加一，旧镜像不变。
+     */
+    private void releaseStagingIfTracked(String deviceId) {
+        Device device = deviceRepository.findByIdForUpdate(deviceId)
+                .orElseThrow(() -> new IllegalStateException("任务设备不存在: " + deviceId));
+        if (device.spaceTracked()) {
+            deviceRepository.releaseStaging(deviceId);
+        }
     }
 }
