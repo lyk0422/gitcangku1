@@ -55,4 +55,28 @@ public final class Requests {
     /** 任务完成/取消请求，操作人由 X-Actor-Id 指定且须为当前指挥人。 */
     public record TaskActionRequest(String commandKey) {
     }
+
+    /**
+     * 风险模型初始化请求：initialRisk 为初始风险 R（1~1000 整数），
+     * residualLimit 为允许残余上限 L（非负且小于 R）；仅首次可设置，requestId 幂等。
+     */
+    public record RiskModelInitRequest(String requestId, Integer initialRisk, Integer residualLimit) {
+    }
+
+    /**
+     * 屏障登记请求：taskKey 须为本事件 OPEN 任务；
+     * reduceP/reduceQ 为削减率 p/q（0&lt;=p&lt;=q，p、q 均不超 1000，q&gt;=1）；requestId 幂等。
+     */
+    public record BarrierRegisterRequest(String requestId, String barrierKey, String taskKey,
+                                         Integer reduceP, Integer reduceQ) {
+    }
+
+    /** 屏障修改请求：expectedVersion 须等于当前模型版本，成功版本加一；requestId 幂等。 */
+    public record BarrierUpdateRequest(String requestId, Integer reduceP, Integer reduceQ,
+                                       Long expectedVersion) {
+    }
+
+    /** 屏障撤销请求：expectedVersion 须等于当前模型版本，成功版本加一；requestId 幂等。 */
+    public record BarrierRevokeRequest(String requestId, Long expectedVersion) {
+    }
 }

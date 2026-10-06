@@ -78,4 +78,31 @@ public final class Responses {
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
     }
+
+    /**
+     * 屏障视图：taskStatus 为查询时绑定任务的当前状态；
+     * effective 表示任务 DONE 且屏障未撤销，即当前计入残余削减。
+     */
+    public record BarrierView(String barrierKey, String taskKey, String taskStatus,
+                              int reduceP, int reduceQ, boolean revoked, boolean effective) {
+    }
+
+    /** 遏制冻结屏障快照视图：taskStatus 为遏制时刻的任务状态，之后不回改。 */
+    public record ContainmentBarrierView(String barrierKey, String taskKey, String taskStatus,
+                                         int reduceP, int reduceQ) {
+    }
+
+    /** 遏制冻结依据视图：residual 为冻结残余的精确分数（分子/分母，不舍入）。 */
+    public record ContainmentSnapshotView(Instant containedAt, String residual,
+                                          List<ContainmentBarrierView> barriers) {
+    }
+
+    /**
+     * 风险模型视图：residual 为当前残余的精确分数（分子/分母，不舍入）；
+     * residualWithinLimit 表示当前残余是否不大于 L；containment 仅进入 CONTAINED 后有值。
+     */
+    public record RiskModelView(String incidentKey, int initialRisk, int residualLimit, long version,
+                                String residual, boolean residualWithinLimit,
+                                List<BarrierView> barriers, ContainmentSnapshotView containment) {
+    }
 }

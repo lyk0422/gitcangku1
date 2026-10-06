@@ -72,16 +72,19 @@ public class IncidentService {
     private final EscalationRepository escalations;
     private final IncidentTaskRepository tasks;
     private final CommandKeyRepository commandKeys;
+    private final RiskModelService riskModels;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public IncidentService(IncidentRepository incidents, EscalationRepository escalations,
                            IncidentTaskRepository tasks, CommandKeyRepository commandKeys,
+                           RiskModelService riskModels,
                            ObjectMapper objectMapper, Clock clock) {
         this.incidents = incidents;
         this.escalations = escalations;
         this.tasks = tasks;
         this.commandKeys = commandKeys;
+        this.riskModels = riskModels;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -262,6 +265,10 @@ public class IncidentService {
                         throw ApiException.illegalTransition(
                                 "不允许从 " + incident.status() + " 流转到 " + targetStatus);
                     }
+                    if (targetStatus == IncidentStatus.CONTAINED) {
+                        // 残余风险门禁：模型存在时残余须不大于 L（精确有理数比较），否则 422
+                        riskModels.assertContainable(incident.id());
+                    }
                     if (targetStatus == IncidentStatus.RESOLVED) {
                         // 解决门禁：全部处置任务进入 DONE/CANCELLED 后才可解决
                         List<UnfinishedTaskView> unfinished = tasks
@@ -279,6 +286,8 @@ public class IncidentService {
                             incident.status(), targetStatus, actor, now));
                     if (targetStatus == IncidentStatus.CONTAINED) {
                         escalations.cancelOpenForIncident(incident.id(), now);
+                        // 遏制冻结：有效屏障身份、比率与任务状态定格，之后合法加强不回改
+                        riskModels.freezeContainment(incident.id(), now);
                     }
                     return toView(incidents.findByKey(incidentKey).orElseThrow(), null);
                 });

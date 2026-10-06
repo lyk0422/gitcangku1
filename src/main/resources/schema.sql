@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS incident_status_history (
 CREATE TABLE IF NOT EXISTS command_keys (
     id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
     command_key VARCHAR(128) NOT NULL COMMENT '调用方幂等键，全局唯一',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：takeover/transfer_initiate/transfer_accept/action/status/escalation_check/escalation_ack/task_create/task_complete/task_cancel',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：takeover/transfer_initiate/transfer_accept/action/status/escalation_check/escalation_ack/task_create/task_complete/task_cancel/risk_init/barrier_register/barrier_update/barrier_revoke',
     request_hash VARCHAR(64) NOT NULL COMMENT '规范化请求参数的 SHA-256 摘要，用于同键改参检测',
     response_status INT NULL COMMENT '首次成功的 HTTP 状态码；事务提交前必写入',
     response_body MEDIUMTEXT NULL COMMENT '首次成功响应 JSON，用于同键同参重放',
@@ -100,3 +100,41 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY COMMENT '固定为 1 的单行锁；创建任务时 SELECT ... FOR UPDATE 持有，串行化环检测与写入，保证并发反向依赖最终图无环'
 ) COMMENT='任务依赖图全局锁表';
+
+CREATE TABLE IF NOT EXISTS incident_risk_models (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    incident_id BIGINT NOT NULL COMMENT '所属事件 id，关联 incidents.id；每事件至多一条风险模型',
+    initial_risk INT NOT NULL COMMENT '初始风险 R，1~1000 整数，由当前指挥首次设置',
+    residual_limit INT NOT NULL COMMENT '允许残余上限 L，非负整数且小于 R',
+    version INT NOT NULL COMMENT '模型版本：初始化置 1，屏障登记/修改/撤销每次成功加一；修改与撤销须携带期望版本',
+    contained_at TIMESTAMP(6) NULL COMMENT '遏制 UTC 时刻；仅进入 CONTAINED 时写入，否则为空',
+    frozen_residual_num BIGINT NULL COMMENT '遏制冻结残余的精确分数分子；仅 CONTAINED 后有值，之后合法加强不回改',
+    frozen_residual_den BIGINT NULL COMMENT '遏制冻结残余的精确分数分母；仅 CONTAINED 后有值',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
+    updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间',
+    CONSTRAINT uk_risk_model_incident UNIQUE (incident_id)
+) COMMENT='事件残余风险模型表（合成模型，不连接真实安全设备）';
+
+CREATE TABLE IF NOT EXISTS incident_risk_barriers (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    model_id BIGINT NOT NULL COMMENT '所属风险模型 id，关联 incident_risk_models.id',
+    barrier_key VARCHAR(128) NOT NULL COMMENT '屏障业务键，模型内唯一',
+    task_key VARCHAR(128) NOT NULL COMMENT '绑定的处置任务键（登记时须为 OPEN），关联同事件 incident_tasks.task_key',
+    reduce_p INT NOT NULL COMMENT '削减率分子 p，0<=p<=q 且不超过 1000',
+    reduce_q INT NOT NULL COMMENT '削减率分母 q，正整数且不超过 1000',
+    revoked BOOLEAN NOT NULL COMMENT '是否已撤销；仅任务 DONE 且未撤销的屏障计入残余削减；未撤销屏障每事件至多 5 个',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
+    updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间',
+    CONSTRAINT uk_risk_barrier_key UNIQUE (model_id, barrier_key)
+) COMMENT='残余风险防护屏障表';
+
+CREATE TABLE IF NOT EXISTS incident_containment_barriers (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    model_id BIGINT NOT NULL COMMENT '所属风险模型 id，关联 incident_risk_models.id',
+    barrier_key VARCHAR(128) NOT NULL COMMENT '冻结的屏障业务键',
+    task_key VARCHAR(128) NOT NULL COMMENT '冻结的绑定任务键',
+    task_status VARCHAR(16) NOT NULL COMMENT '遏制时刻的任务状态（有效屏障恒为 DONE）',
+    reduce_p INT NOT NULL COMMENT '冻结的削减率分子 p',
+    reduce_q INT NOT NULL COMMENT '冻结的削减率分母 q',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '冻结写入 UTC 时间'
+) COMMENT='遏制冻结屏障快照表（遏制决策的历史依据，之后不回改）';
