@@ -219,4 +219,41 @@ public class PlanRepository {
     public void acquirePublishLock() {
         jdbc.queryForObject("SELECT id FROM publish_lock WHERE id = 1 FOR UPDATE", Integer.class);
     }
+
+    /**
+     * 已发布计划中引用某列车/区段的占用关联（计划业务键 + 列车 + 区段），
+     * 用于档案更新前核验所有已发布计划在完整后态下仍合法。
+     *
+     * @param scheduleKey 已发布计划业务键
+     * @param trainNo     占用列车编号
+     * @param sectionId   占用区段 ID
+     */
+    public record PublishedAxleRef(String scheduleKey, String trainNo, String sectionId) {
+    }
+
+    /**
+     * 查询引用了指定列车的所有已发布计划占用关联（去重）。
+     */
+    public List<PublishedAxleRef> findPublishedAxleRefsByTrain(String trainNo) {
+        return jdbc.query("SELECT DISTINCT p.schedule_key, o.train_no, o.section_id"
+                        + " FROM rail_plan_occupancy o JOIN rail_day_plan p ON p.id = o.plan_id"
+                        + " WHERE p.status = 'PUBLISHED' AND o.train_no = ?"
+                        + " ORDER BY p.schedule_key, o.section_id",
+                (rs, n) -> new PublishedAxleRef(rs.getString("schedule_key"),
+                        rs.getString("train_no"), rs.getString("section_id")),
+                trainNo);
+    }
+
+    /**
+     * 查询引用了指定区段的所有已发布计划占用关联（去重）。
+     */
+    public List<PublishedAxleRef> findPublishedAxleRefsBySection(String sectionId) {
+        return jdbc.query("SELECT DISTINCT p.schedule_key, o.train_no, o.section_id"
+                        + " FROM rail_plan_occupancy o JOIN rail_day_plan p ON p.id = o.plan_id"
+                        + " WHERE p.status = 'PUBLISHED' AND o.section_id = ?"
+                        + " ORDER BY p.schedule_key, o.train_no",
+                (rs, n) -> new PublishedAxleRef(rs.getString("schedule_key"),
+                        rs.getString("train_no"), rs.getString("section_id")),
+                sectionId);
+    }
 }

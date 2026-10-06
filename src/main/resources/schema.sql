@@ -44,7 +44,7 @@ CREATE INDEX IF NOT EXISTS idx_rail_plan_occupancy_section ON rail_plan_occupanc
 
 CREATE TABLE IF NOT EXISTS idempotency_record (
     id BIGINT NOT NULL AUTO_INCREMENT,
-    op_type VARCHAR(16) NOT NULL,
+    op_type VARCHAR(32) NOT NULL,
     request_key VARCHAR(128) NOT NULL,
     request_hash CHAR(64) NOT NULL,
     response_json CLOB NOT NULL,
@@ -52,9 +52,10 @@ CREATE TABLE IF NOT EXISTS idempotency_record (
     PRIMARY KEY (id),
     CONSTRAINT uk_idempotency_op_key UNIQUE (op_type, request_key)
 );
+-- op_type 取值含 TRAIN_AXLE_CREATE / TRAIN_AXLE_UPDATE / SECTION_LIMIT_CREATE / SECTION_LIMIT_UPDATE
 COMMENT ON TABLE idempotency_record IS '写操作幂等记录，仅缓存成功结果，失败不缓存可重试';
 COMMENT ON COLUMN idempotency_record.id IS '主键';
-COMMENT ON COLUMN idempotency_record.op_type IS '操作类型：CREATE / UPDATE / PUBLISH / CANCEL / RESCHEDULE';
+COMMENT ON COLUMN idempotency_record.op_type IS '操作类型：CREATE / UPDATE / PUBLISH / CANCEL / RESCHEDULE / TRAIN_AXLE_CREATE / TRAIN_AXLE_UPDATE / SECTION_LIMIT_CREATE / SECTION_LIMIT_UPDATE';
 COMMENT ON COLUMN idempotency_record.request_key IS '客户端幂等键，同一操作类型内唯一';
 COMMENT ON COLUMN idempotency_record.request_hash IS '请求参数规范化后的 SHA-256，同键不同参判定 409';
 COMMENT ON COLUMN idempotency_record.response_json IS '首次成功响应快照（JSON），重放原样返回';
@@ -83,3 +84,69 @@ COMMENT ON TABLE publish_lock IS '发布/改签全局互斥锁，保证并发发
 COMMENT ON COLUMN publish_lock.id IS '锁行 id，固定为 1，发布与改签时 SELECT ... FOR UPDATE 串行化';
 
 MERGE INTO publish_lock KEY(id) VALUES (1);
+
+CREATE TABLE IF NOT EXISTS rail_train_axle_profile (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    train_no VARCHAR(64) NOT NULL,
+    version INT NOT NULL,
+    axle_weights_json VARCHAR(512) NOT NULL,
+    created_at BIGINT NOT NULL,
+    updated_at BIGINT NOT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT uk_train_axle_profile_train UNIQUE (train_no)
+);
+COMMENT ON TABLE rail_train_axle_profile IS '列车有序轴重档案，2至16轴，每轴正整数千克，顺序即轴序';
+COMMENT ON COLUMN rail_train_axle_profile.id IS '主键';
+COMMENT ON COLUMN rail_train_axle_profile.train_no IS '列车编号，全局唯一';
+COMMENT ON COLUMN rail_train_axle_profile.version IS '档案版本，从 1 起，每次成功更新加一';
+COMMENT ON COLUMN rail_train_axle_profile.axle_weights_json IS '有序轴重列表（JSON 数组，单位千克，正整数），轴序换位视为改参';
+COMMENT ON COLUMN rail_train_axle_profile.created_at IS '创建时刻，UTC 毫秒';
+COMMENT ON COLUMN rail_train_axle_profile.updated_at IS '最近变更时刻，UTC 毫秒';
+
+CREATE TABLE IF NOT EXISTS rail_section_limit_profile (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    section_id VARCHAR(64) NOT NULL,
+    version INT NOT NULL,
+    single_axle_limit_kg BIGINT NOT NULL,
+    window3_limit_kg BIGINT NOT NULL,
+    created_at BIGINT NOT NULL,
+    updated_at BIGINT NOT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT uk_section_limit_profile_section UNIQUE (section_id)
+);
+COMMENT ON TABLE rail_section_limit_profile IS '区段轴重限值档案：单轴上限与任意连续 3 轴总重上限';
+COMMENT ON COLUMN rail_section_limit_profile.id IS '主键';
+COMMENT ON COLUMN rail_section_limit_profile.section_id IS '区段 ID，全局唯一';
+COMMENT ON COLUMN rail_section_limit_profile.version IS '档案版本，从 1 起，每次成功更新加一';
+COMMENT ON COLUMN rail_section_limit_profile.single_axle_limit_kg IS '单轴上限，单位千克，正数';
+COMMENT ON COLUMN rail_section_limit_profile.window3_limit_kg IS '任意连续 3 轴总重上限，单位千克，正数；少于 3 轴的列车不检查该项';
+COMMENT ON COLUMN rail_section_limit_profile.created_at IS '创建时刻，UTC 毫秒';
+COMMENT ON COLUMN rail_section_limit_profile.updated_at IS '最近变更时刻，UTC 毫秒';
+
+CREATE TABLE IF NOT EXISTS rail_plan_axle_snapshot (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    plan_id BIGINT NOT NULL,
+    occ_seq INT NOT NULL,
+    train_no VARCHAR(64) NOT NULL,
+    section_id VARCHAR(64) NOT NULL,
+    axle_weights_json VARCHAR(512) NOT NULL,
+    train_profile_version INT NOT NULL,
+    section_profile_version INT NOT NULL,
+    single_axle_limit_kg BIGINT NOT NULL,
+    window3_limit_kg BIGINT NOT NULL,
+    created_at BIGINT NOT NULL,
+    PRIMARY KEY (id)
+);
+COMMENT ON TABLE rail_plan_axle_snapshot IS '发布时冻结的轴重包络快照：当时轴序列、各区段限值与档案版本；后续合法修改不改写历史';
+COMMENT ON COLUMN rail_plan_axle_snapshot.id IS '主键';
+COMMENT ON COLUMN rail_plan_axle_snapshot.plan_id IS '所属计划 id，关联 rail_day_plan.id';
+COMMENT ON COLUMN rail_plan_axle_snapshot.occ_seq IS '对应占用在计划内的序号，关联 rail_plan_occupancy.seq';
+COMMENT ON COLUMN rail_plan_axle_snapshot.train_no IS '列车编号（发布当时）';
+COMMENT ON COLUMN rail_plan_axle_snapshot.section_id IS '区段 ID（发布当时）';
+COMMENT ON COLUMN rail_plan_axle_snapshot.axle_weights_json IS '发布当时冻结的有序轴重列表（JSON 数组，单位千克）';
+COMMENT ON COLUMN rail_plan_axle_snapshot.train_profile_version IS '发布当时列车轴重档案版本';
+COMMENT ON COLUMN rail_plan_axle_snapshot.section_profile_version IS '发布当时区段限值档案版本';
+COMMENT ON COLUMN rail_plan_axle_snapshot.single_axle_limit_kg IS '发布当时冻结的单轴上限，单位千克';
+COMMENT ON COLUMN rail_plan_axle_snapshot.window3_limit_kg IS '发布当时冻结的连续 3 轴总重上限，单位千克';
+COMMENT ON COLUMN rail_plan_axle_snapshot.created_at IS '快照创建时刻，UTC 毫秒';
+CREATE INDEX IF NOT EXISTS idx_rail_plan_axle_snapshot_plan ON rail_plan_axle_snapshot (plan_id);

@@ -2,12 +2,15 @@ package com.example.starter.plan;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.example.starter.plan.service.AxleEnvelopeService;
 import com.example.starter.plan.service.PlanService;
 import com.example.starter.plan.web.ApiException;
 import com.example.starter.plan.web.dto.CreatePlanRequest;
 import com.example.starter.plan.web.dto.OccupancyRequest;
 import com.example.starter.plan.web.dto.PlanResponse;
 import com.example.starter.plan.web.dto.PublishedSlotView;
+import com.example.starter.plan.web.dto.SectionLimitProfileCreateRequest;
+import com.example.starter.plan.web.dto.TrainAxleProfileCreateRequest;
 import com.example.starter.plan.web.dto.UpdateOccupanciesRequest;
 import java.time.Instant;
 import java.time.LocalDate;
@@ -39,6 +42,9 @@ class PlanConcurrencyTest {
 
     @Autowired
     private PlanService service;
+
+    @Autowired
+    private AxleEnvelopeService axleService;
 
     @Autowired
     private JdbcTemplate jdbc;
@@ -189,6 +195,24 @@ class PlanConcurrencyTest {
                 List.of(occ(section, startHour, endHour))));
     }
 
+    /** 构造占用并确保其列车与区段档案已登记（缺失则登记默认合成档案）。 */
+    private OccupancyRequest occ(String section, int startHour, int endHour) {
+        String trainNo = "G-" + UUID.randomUUID();
+        try {
+            axleService.getTrainProfile(trainNo);
+        } catch (ApiException e) {
+            axleService.createTrainProfile(new TrainAxleProfileCreateRequest(
+                    key("RID"), "tester", trainNo, List.of(4000, 4000)));
+        }
+        try {
+            axleService.getSectionProfile(section);
+        } catch (ApiException e) {
+            axleService.createSectionProfile(new SectionLimitProfileCreateRequest(
+                    key("RID"), "tester", section, 10000L, 18000L));
+        }
+        return new OccupancyRequest(trainNo, section, at(startHour), at(endHour));
+    }
+
     private List<Outcome> runConcurrently(List<Callable<Outcome>> tasks) throws Exception {
         ExecutorService pool = Executors.newFixedThreadPool(tasks.size());
         CountDownLatch ready = new CountDownLatch(tasks.size());
@@ -207,11 +231,6 @@ class PlanConcurrencyTest {
         }
         pool.shutdown();
         return outcomes;
-    }
-
-    private static OccupancyRequest occ(String section, int startHour, int endHour) {
-        return new OccupancyRequest("G-" + UUID.randomUUID(), section,
-                at(startHour), at(endHour));
     }
 
     private static Instant at(int hour) {

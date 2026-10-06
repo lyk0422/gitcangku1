@@ -2,12 +2,15 @@ package com.example.starter.plan;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.example.starter.plan.service.AxleEnvelopeService;
 import com.example.starter.plan.service.PlanService;
 import com.example.starter.plan.web.ApiException;
 import com.example.starter.plan.web.dto.CreatePlanRequest;
 import com.example.starter.plan.web.dto.OccupancyRequest;
 import com.example.starter.plan.web.dto.RescheduleChainResponse;
 import com.example.starter.plan.web.dto.RescheduleRequest;
+import com.example.starter.plan.web.dto.SectionLimitProfileCreateRequest;
+import com.example.starter.plan.web.dto.TrainAxleProfileCreateRequest;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
@@ -38,6 +41,9 @@ class PlanRescheduleConcurrencyTest {
 
     @Autowired
     private PlanService service;
+
+    @Autowired
+    private AxleEnvelopeService axleService;
 
     @Autowired
     private JdbcTemplate jdbc;
@@ -161,8 +167,21 @@ class PlanRescheduleConcurrencyTest {
     }
 
     private void createDraft(String scheduleKey, String section, int startHour, int endHour) {
+        String trainNo = "G-" + UUID.randomUUID();
+        try {
+            axleService.getTrainProfile(trainNo);
+        } catch (ApiException e) {
+            axleService.createTrainProfile(new TrainAxleProfileCreateRequest(
+                    key("RID"), "tester", trainNo, List.of(4000, 4000)));
+        }
+        try {
+            axleService.getSectionProfile(section);
+        } catch (ApiException e) {
+            axleService.createSectionProfile(new SectionLimitProfileCreateRequest(
+                    key("RID"), "tester", section, 10000L, 18000L));
+        }
         service.createDraft(new CreatePlanRequest(key("REQ"), scheduleKey, DAY,
-                List.of(new OccupancyRequest("G-" + UUID.randomUUID(), section,
+                List.of(new OccupancyRequest(trainNo, section,
                         at(startHour), at(endHour)))));
     }
 

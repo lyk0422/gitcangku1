@@ -291,10 +291,13 @@ class PlanApiTest {
                 .andExpect(status().isOk()).andReturn();
         assertThat(read(detail).get("status").asText()).isEqualTo("DRAFT");
 
+        // 修正后占用落在已登记限值档案的区段上，同键重发成功
+        String fixedSection = key("SEC");
+        ensureSectionProfile(fixedSection);
         mvc.perform(put("/api/v1/plans/{key}/occupancies", scheduleKey)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(updateBody(key("REQ"), 1,
-                                occ("G1", key("SEC"), iso(8), iso(9)))))
+                                occ("G1", fixedSection, iso(8), iso(9)))))
                 .andExpect(status().isOk());
         mvc.perform(post("/api/v1/plans/{key}/publish", scheduleKey)
                         .contentType(MediaType.APPLICATION_JSON).content(actionBody(publishKey)))
@@ -405,9 +408,42 @@ class PlanApiTest {
     // ---------- 辅助 ----------
 
     private void createPlan(String scheduleKey, String... occupancies) throws Exception {
+        for (String occJson : occupancies) {
+            JsonNode occ = objectMapper.readTree(occJson);
+            ensureTrainProfile(occ.get("trainNo").asText());
+            ensureSectionProfile(occ.get("sectionId").asText());
+        }
         mvc.perform(post("/api/v1/plans").contentType(MediaType.APPLICATION_JSON)
                         .content(createBody(key("REQ"), scheduleKey, occupancies)))
                 .andExpect(status().isCreated());
+    }
+
+    /** 若列车轴重档案缺失则登记默认合成档案（2 轴各 4000kg），已存在则跳过。 */
+    private void ensureTrainProfile(String trainNo) throws Exception {
+        int status = mvc.perform(get("/api/v1/train-axle-profiles/{trainNo}", trainNo))
+                .andReturn().getResponse().getStatus();
+        if (status == 404) {
+            mvc.perform(post("/api/v1/train-axle-profiles")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content("{\"requestId\":\"" + key("RID") + "\",\"operator\":\"tester\""
+                                    + ",\"trainNo\":\"" + trainNo
+                                    + "\",\"axleWeightsKg\":[4000,4000]}"))
+                    .andExpect(status().isCreated());
+        }
+    }
+
+    /** 若区段限值档案缺失则登记默认合成档案（单轴 10t、连续 3 轴 18t），已存在则跳过。 */
+    private void ensureSectionProfile(String sectionId) throws Exception {
+        int status = mvc.perform(get("/api/v1/section-limit-profiles/{sectionId}", sectionId))
+                .andReturn().getResponse().getStatus();
+        if (status == 404) {
+            mvc.perform(post("/api/v1/section-limit-profiles")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content("{\"requestId\":\"" + key("RID") + "\",\"operator\":\"tester\""
+                                    + ",\"sectionId\":\"" + sectionId
+                                    + "\",\"singleAxleLimitKg\":10000,\"window3LimitKg\":18000}"))
+                    .andExpect(status().isCreated());
+        }
     }
 
     private void publishPlan(String scheduleKey, String requestKey) throws Exception {
