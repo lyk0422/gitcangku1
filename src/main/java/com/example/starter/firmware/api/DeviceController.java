@@ -1,6 +1,7 @@
 package com.example.starter.firmware.api;
 
 import com.example.starter.firmware.service.DeviceService;
+import com.example.starter.firmware.service.DualTaskService;
 import com.example.starter.firmware.service.TaskService;
 import jakarta.validation.Valid;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -11,7 +12,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * 设备登记、查询与固件拉取。
+ * 设备登记、查询与固件拉取（含双分区试启动任务拉取与启动分区查询）。
  */
 @RestController
 @RequestMapping("/api/devices")
@@ -19,10 +20,13 @@ public class DeviceController {
 
     private final DeviceService deviceService;
     private final TaskService taskService;
+    private final DualTaskService dualTaskService;
 
-    public DeviceController(DeviceService deviceService, TaskService taskService) {
+    public DeviceController(DeviceService deviceService, TaskService taskService,
+                            DualTaskService dualTaskService) {
         this.deviceService = deviceService;
         this.taskService = taskService;
+        this.dualTaskService = dualTaskService;
     }
 
     @PostMapping
@@ -38,5 +42,16 @@ public class DeviceController {
     @PostMapping("/{deviceId}/pull")
     public PullResponse pull(@PathVariable String deviceId, @Valid @RequestBody RequestIdBody request) {
         return taskService.pull(deviceId, request.requestId());
+    }
+
+    @PostMapping("/{deviceId}/dual-pull")
+    public DualPullResponse dualPull(@PathVariable String deviceId,
+                                     @Valid @RequestBody DualPullRequest request) {
+        return dualTaskService.pull(deviceId, request);
+    }
+
+    @GetMapping("/{deviceId}/boot")
+    public BootStateView boot(@PathVariable String deviceId) {
+        return dualTaskService.bootView(deviceId);
     }
 }

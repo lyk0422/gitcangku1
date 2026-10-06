@@ -66,8 +66,49 @@ CREATE TABLE IF NOT EXISTS release_resume_record (
 CREATE TABLE IF NOT EXISTS idempotency_record (
   request_id VARCHAR(64) NOT NULL COMMENT '全局唯一请求ID',
   api VARCHAR(64) NOT NULL COMMENT '接口标识',
-  fingerprint VARCHAR(256) NOT NULL COMMENT '请求参数指纹，同键异参返回409',
+  fingerprint VARCHAR(512) NOT NULL COMMENT '请求参数指纹（结构化JSON），同键异参返回409',
   response_body CLOB NOT NULL COMMENT '成功响应快照（JSON），用于同键同参重放',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   PRIMARY KEY (request_id)
 ) COMMENT='写操作幂等去重记录，失败不占键';
+
+CREATE TABLE IF NOT EXISTS device_boot_state (
+  device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
+  current_partition VARCHAR(1) NOT NULL COMMENT '当前启动分区：A或B；无记录时视为A',
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
+  PRIMARY KEY (device_id)
+) COMMENT='设备启动分区状态，仅双分区任务正式切换（COMMITTED）后翻转';
+
+CREATE TABLE IF NOT EXISTS dual_release (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '双分区发布单ID',
+  version INT NOT NULL COMMENT '发布单版本号，从1开始，暂停成功加一',
+  model VARCHAR(64) NOT NULL COMMENT '目标设备型号',
+  target_version VARCHAR(64) NOT NULL COMMENT '目标固件版本，健康确认通过后切换',
+  status VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE投放中，PAUSED已暂停（禁止新试启动，不撤销已有TRIAL的健康确认）',
+  committed_count INT NOT NULL DEFAULT 0 COMMENT '首次进入COMMITTED的任务数，每任务只计一次',
+  rolled_back_count INT NOT NULL DEFAULT 0 COMMENT '首次进入ROLLED_BACK的任务数（含失败与到期），每任务只计一次',
+  active_model VARCHAR(64) NULL COMMENT 'ACTIVE或PAUSED时等于model；用于同型号至多一张未终结双分区发布单的唯一约束',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
+  PRIMARY KEY (id)
+) COMMENT='双分区试启动发布单';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_dual_release_active_model ON dual_release (active_model);
+
+CREATE TABLE IF NOT EXISTS dual_task (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '任务ID，回滚后重试产生新ID',
+  release_id BIGINT NOT NULL COMMENT '所属双分区发布单ID',
+  device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
+  status VARCHAR(16) NOT NULL COMMENT 'PENDING待试启动；TRIAL试启动中；COMMITTED已正式切换（终态）；ROLLED_BACK已回滚（终态）',
+  target_partition VARCHAR(1) NULL COMMENT '目标分区（非当前分区），试启动回执时冻结，之后不可改',
+  target_version VARCHAR(64) NULL COMMENT '目标版本，试启动回执时冻结，之后不可改',
+  trial_started_at_utc VARCHAR(40) NULL COMMENT '服务端记录的UTC试启动时刻，ISO-8601（如2026-10-06T07:00:00Z），未试启动为NULL',
+  settled_at_utc VARCHAR(40) NULL COMMENT '进入终态的UTC时刻，ISO-8601，未终结为NULL',
+  rollback_reason VARCHAR(16) NULL COMMENT '回滚原因：EXPIRED到期未确认，FAILED设备上报失败；未回滚为NULL',
+  active_device VARCHAR(64) NULL COMMENT 'PENDING/TRIAL时等于device_id，终结后置NULL；用于同发布单同设备至多一条未终结任务',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
+  PRIMARY KEY (id)
+) COMMENT='双分区试启动任务，60秒内未健康确认即回滚';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_dual_task_active ON dual_task (release_id, active_device);
