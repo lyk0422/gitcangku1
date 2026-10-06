@@ -59,27 +59,48 @@ public class BatchService {
     private static final int IDEMPOTENCY_MAX_ATTEMPTS = 3;
 
     private final BatchRepository repo;
+    private final RecipeService recipeService;
     private final TransactionTemplate tx;
     private final ObjectMapper objectMapper;
 
     public BatchService(BatchRepository repo,
+                        RecipeService recipeService,
                         PlatformTransactionManager transactionManager,
                         ObjectMapper objectMapper) {
         this.repo = repo;
+        this.recipeService = recipeService;
         this.tx = new TransactionTemplate(transactionManager);
         this.objectMapper = objectMapper;
     }
 
     /**
      * 创建批次：初始状态 QUARANTINED；batchKey 全局唯一，重复返回 409。
+     * 可同时绑定不可变配方版本与目标总质量（单位克，最多 6 位小数的正值）；
+     * recipeKey 与 targetMassG 必须同时提供或同时缺省，只给其一返回 400。
      */
     public StoredResponse createBatch(CreateBatchRequest req) {
         List<String> items = req.requiredTests().stream().map(String::trim).toList();
         if (new HashSet<>(items).size() != items.size()) {
             throw ApiException.badRequest("requiredTests 存在重复检验项");
         }
+        boolean bindRecipe = req.recipeKey() != null && !req.recipeKey().isBlank();
+        if (bindRecipe != (req.targetMassG() != null)) {
+            throw ApiException.badRequest("recipeKey 与 targetMassG 必须同时提供或同时缺省");
+        }
+        if (bindRecipe) {
+            if (req.targetMassG().scale() > 6) {
+                throw ApiException.badRequest(
+                        "targetMassG 最多 6 位小数: " + req.targetMassG().toPlainString());
+            }
+            if (req.targetMassG().compareTo(java.math.BigDecimal.ZERO) <= 0) {
+                throw ApiException.badRequest(
+                        "targetMassG 必须为正值: " + req.targetMassG().toPlainString());
+            }
+        }
         String fingerprint = fingerprint("create", req.batchKey(), req.productCode(), req.batchNo(),
-                req.producedAt().toString(), String.join(SEP, items));
+                req.producedAt().toString(), String.join(SEP, items),
+                bindRecipe ? req.recipeKey().trim() : "",
+                bindRecipe ? req.targetMassG().toPlainString() : "");
         return executeIdempotent(CMD_CREATE, req.commandKey(), fingerprint, () -> {
             repo.findBatch(req.batchKey()).ifPresent(b -> {
                 throw ApiException.conflict("batchKey 已存在: " + req.batchKey());
@@ -90,8 +111,14 @@ public class BatchService {
             for (int i = 0; i < items.size(); i++) {
                 repo.insertRequiredTest(req.batchKey(), items.get(i), i + 1);
             }
+            if (bindRecipe) {
+                recipeService.bindRecipe(req.batchKey(), req.recipeKey().trim(),
+                        req.targetMassG(), now);
+            }
             BatchResponse body = new BatchResponse(req.batchKey(), req.productCode(), req.batchNo(),
-                    req.producedAt(), BatchStatus.QUARANTINED, items, Instant.parse(now));
+                    req.producedAt(), BatchStatus.QUARANTINED, items, Instant.parse(now),
+                    bindRecipe ? req.recipeKey().trim() : null,
+                    bindRecipe ? req.targetMassG().toPlainString() : null);
             return new StoredResponse(201, toJson(body));
         });
     }
@@ -181,6 +208,9 @@ public class BatchService {
             if (actorInspected) {
                 throw ApiException.unprocessable("批准人不得为该批次任一检验结果的检验人: " + actor);
             }
+            // 配方门禁：绑定配方的批次必须投料达配方才允许批准放行，
+            // 不达配方返回 422 并给出各成分差额，不允许只批准合格成分
+            recipeService.assertRecipeSatisfied(batchKey);
 
             List<BatchRepository.ApprovalRow> approvals = repo.findApprovals(batchKey);
             String now = now();
@@ -341,9 +371,12 @@ public class BatchService {
     }
 
     private BatchResponse toBatchResponse(BatchRepository.BatchRow row) {
+        var binding = recipeService.findBinding(row.batchKey());
         return new BatchResponse(row.batchKey(), row.productCode(), row.batchNo(),
                 Instant.parse(row.producedAt()), BatchStatus.valueOf(row.status()),
-                repo.findRequiredTests(row.batchKey()), Instant.parse(row.createdAt()));
+                repo.findRequiredTests(row.batchKey()), Instant.parse(row.createdAt()),
+                binding.map(RecipeRepository.BatchRecipeRow::recipeKey).orElse(null),
+                binding.map(RecipeRepository.BatchRecipeRow::targetMassG).orElse(null));
     }
 
     private TestResultResponse toTestResponse(BatchRepository.TestRow row, String batchStatus) {
@@ -418,6 +451,8 @@ public class BatchService {
      * 拆分：仅当前可用的 RELEASED 批次可一次拆成 2～5 个全新子批。
      * 子批继承产品编码、生产 UTC 时间与必做检验项，初始 QUARANTINED，
      * 不继承检验或批准记录；父批置为 SPLIT 不再可用。
+     * 父批绑定配方时：每个子批必须给出目标总质量，按子批质量占父批目标的比例精确继承
+     * 父批各成分有效称量；子批合计不等于父批目标或任一成分无法在 6 位小数内守恒时 422。
      * 创建全部子批、血缘关系与父批状态在同一事务提交；任一子批键已存在或重复，整次 409 且父批不变。
      */
     public StoredResponse split(String parentKey, SplitRequest req) {
@@ -426,12 +461,25 @@ public class BatchService {
         if (new HashSet<>(childKeys).size() != childKeys.size()) {
             throw ApiException.conflict("子批 batchKey 在请求内重复");
         }
+        for (SplitRequest.ChildSpec child : children) {
+            if (child.targetMassG() != null) {
+                if (child.targetMassG().scale() > 6) {
+                    throw ApiException.badRequest("子批 targetMassG 最多 6 位小数: "
+                            + child.targetMassG().toPlainString());
+                }
+                if (child.targetMassG().compareTo(java.math.BigDecimal.ZERO) <= 0) {
+                    throw ApiException.badRequest("子批 targetMassG 必须为正值: "
+                            + child.targetMassG().toPlainString());
+                }
+            }
+        }
         List<String> parts = new ArrayList<>();
         parts.add("split");
         parts.add(parentKey);
         for (SplitRequest.ChildSpec child : children) {
             parts.add(child.batchKey());
             parts.add(child.batchNo());
+            parts.add(child.targetMassG() == null ? "" : child.targetMassG().toPlainString());
         }
         String fingerprint = fingerprint(parts.toArray(new String[0]));
         return executeIdempotent(CMD_SPLIT, req.commandKey(), fingerprint, () -> {
@@ -453,6 +501,27 @@ public class BatchService {
                     throw ApiException.conflict("子批 batchKey 已存在: " + childKey);
                 }
             }
+            // 配方绑定批次：子批目标质量齐全且守恒才能拆分，继承计划在父批行锁内计算
+            var binding = recipeService.findBinding(parentKey);
+            Map<String, Map<String, java.math.BigDecimal>> inheritance = null;
+            if (binding.isPresent()) {
+                List<java.math.BigDecimal> targets = new ArrayList<>(children.size());
+                for (SplitRequest.ChildSpec child : children) {
+                    if (child.targetMassG() == null) {
+                        throw ApiException.badRequest(
+                                "父批已绑定配方，子批必须提供 targetMassG: " + child.batchKey());
+                    }
+                    targets.add(child.targetMassG());
+                }
+                inheritance = recipeService.planInheritance(parentKey, childKeys, targets);
+            } else {
+                for (SplitRequest.ChildSpec child : children) {
+                    if (child.targetMassG() != null) {
+                        throw ApiException.badRequest(
+                                "父批未绑定配方，子批不得提供 targetMassG: " + child.batchKey());
+                    }
+                }
+            }
             String now = now();
             List<String> required = repo.findRequiredTests(parentKey);
             List<SplitResponse.SplitChild> childBodies = new ArrayList<>(children.size());
@@ -465,9 +534,15 @@ public class BatchService {
                 }
                 repo.insertLineage(new BatchRepository.LineageRow(0L, parentKey, spec.batchKey(),
                         i + 1, now));
+                if (inheritance != null) {
+                    recipeService.insertInheritedWeighings(spec.batchKey(), binding.get().recipeKey(),
+                            spec.targetMassG(), inheritance.get(spec.batchKey()),
+                            req.commandKey(), now);
+                }
                 childBodies.add(new SplitResponse.SplitChild(spec.batchKey(), spec.batchNo(),
                         parent.productCode(), Instant.parse(parent.producedAt()),
-                        BatchStatus.QUARANTINED, required, Instant.parse(now)));
+                        BatchStatus.QUARANTINED, required, Instant.parse(now),
+                        spec.targetMassG() == null ? null : spec.targetMassG().toPlainString()));
             }
             repo.updateStatus(parentKey, BatchStatus.SPLIT.name());
             SplitResponse body = new SplitResponse(parentKey, BatchStatus.SPLIT, childBodies,

@@ -17,7 +17,7 @@ public record SplitResponse(
 ) {
 
     /**
-     * 拆分产生的子批概要。
+     * 拆分产生的子批概要。targetMassG 为子批目标总质量（单位克），父批未绑定配方时为 null。
      */
     public record SplitChild(
             String batchKey,
@@ -26,7 +26,8 @@ public record SplitResponse(
             Instant producedAt,
             BatchStatus status,
             List<String> requiredTests,
-            Instant createdAt
+            Instant createdAt,
+            String targetMassG
     ) {
     }
 }

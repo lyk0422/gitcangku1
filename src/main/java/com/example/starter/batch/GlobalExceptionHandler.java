@@ -22,6 +22,16 @@ public class GlobalExceptionHandler {
                 .body(new ErrorResponse(ex.code(), ex.getMessage()));
     }
 
+    /**
+     * 配方门禁未通过：422 并携带全部成分差额，不允许只批准合格成分。
+     */
+    @ExceptionHandler(RecipeGateException.class)
+    public ResponseEntity<RecipeGateErrorResponse> handleRecipeGate(RecipeGateException ex) {
+        return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
+                .body(new RecipeGateErrorResponse("RECIPE_NOT_SATISFIED", ex.getMessage(),
+                        ex.differences()));
+    }
+
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ResponseEntity<ErrorResponse> handleValidation(MethodArgumentNotValidException ex) {
         String message = ex.getBindingResult().getFieldErrors().stream()

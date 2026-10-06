@@ -7,6 +7,7 @@ import java.util.List;
 
 /**
  * 批次概要响应。producedAt/createdAt 为 UTC instant。
+ * recipeKey/targetMassG 为配方绑定信息（targetMassG 单位克），未绑定时为 null。
  */
 public record BatchResponse(
         String batchKey,
@@ -15,6 +16,8 @@ public record BatchResponse(
         Instant producedAt,
         BatchStatus status,
         List<String> requiredTests,
-        Instant createdAt
+        Instant createdAt,
+        String recipeKey,
+        String targetMassG
 ) {
 }
