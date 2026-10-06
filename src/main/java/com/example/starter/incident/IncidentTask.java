@@ -6,6 +6,7 @@ import java.time.Instant;
  * 处置任务实体，对应 incident_tasks 表。
  * (incidentId, taskKey) 唯一，同键同内容幂等，同键不同内容冲突；
  * 每事件至多 20 个任务。doneBy/doneAt 仅 DONE 有值，cancelledBy/cancelledAt 仅 CANCELLED 有值。
+ * version 新增为 1，安排变更、开始、完成、取消每次成功加一（撤销安排不加）。
  * 时间均为 UTC。
  */
 public record IncidentTask(
@@ -20,6 +21,7 @@ public record IncidentTask(
         Instant doneAt,
         String cancelledBy,
         Instant cancelledAt,
+        int version,
         Instant createdAt,
         Instant updatedAt) {
 

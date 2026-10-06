@@ -64,11 +64,29 @@ public final class Responses {
 
     /**
      * 处置任务视图：blockers 按阻塞事件键排序；doneBy/doneAt 仅 DONE 有值，
-     * cancelledBy/cancelledAt 仅 CANCELLED 有值。
+     * cancelledBy/cancelledAt 仅 CANCELLED 有值；version 为任务版本（新增为 1，
+     * 安排变更、开始、完成、取消每次成功加一）；schedule 为当前执行时段安排，无则 null。
      */
     public record TaskView(String taskKey, String groupCode, String title, String status,
                            List<TaskBlockerView> blockers, String createdBy, Instant createdAt,
-                           String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt) {
+                           String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt,
+                           int version, TaskScheduleView schedule) {
+    }
+
+    /**
+     * 执行时段安排视图：startAt/endAt 为 UTC 整分钟左闭右开时段；
+     * status 为 SCHEDULED/STARTED/REVOKED；startedAt 仅 STARTED 有值。
+     */
+    public record TaskScheduleView(String assignee, Instant startAt, Instant endAt,
+                                   String status, Instant startedAt) {
+    }
+
+    /**
+     * 安排约束违反明细（422）：rule 为 REST（相邻休息不足 30 分钟）或 DAILY_LIMIT
+     * （UTC 日作业总量超 480 分钟）；date 为违反发生的 UTC 日期；
+     * minutes 为差额：REST 为休息不足分钟数，DAILY_LIMIT 为超出分钟数。
+     */
+    public record ScheduleViolationView(String rule, String date, long minutes) {
     }
 
     /** 按事件分组的任务列表视图：tasks 按创建顺序返回。 */

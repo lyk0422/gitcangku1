@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     done_at TIMESTAMP(6) NULL COMMENT '完成 UTC 时间；仅 DONE 有值，否则为空',
     cancelled_by VARCHAR(128) NULL COMMENT '取消人（操作时的当前指挥人）；仅 CANCELLED 有值，否则为空',
     cancelled_at TIMESTAMP(6) NULL COMMENT '取消 UTC 时间；仅 CANCELLED 有值，否则为空',
+    version INT NOT NULL COMMENT '任务版本：新增为 1，安排变更、开始、完成、取消每次成功加一；安排/开始/撤销入口以 expectedTaskVersion 做乐观并发校验',
     created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
     updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间',
     CONSTRAINT uk_task_key UNIQUE (incident_id, task_key)
@@ -100,3 +101,20 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY COMMENT '固定为 1 的单行锁；创建任务时 SELECT ... FOR UPDATE 持有，串行化环检测与写入，保证并发反向依赖最终图无环'
 ) COMMENT='任务依赖图全局锁表';
+
+CREATE TABLE IF NOT EXISTS incident_task_schedules (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    task_id BIGINT NOT NULL COMMENT '所属任务 id，关联 incident_tasks.id；每任务至多一条安排，替换为整行更新',
+    assignee VARCHAR(128) NOT NULL COMMENT '执行人员标识（合成人员，不另建人员表）；跨事件按该标识核对休息与日上限',
+    start_at TIMESTAMP(6) NOT NULL COMMENT '执行时段开始 UTC，整分钟对齐，左闭',
+    end_at TIMESTAMP(6) NOT NULL COMMENT '执行时段结束 UTC，整分钟对齐，右开；长度 1~240 分钟',
+    status VARCHAR(16) NOT NULL COMMENT '状态：SCHEDULED 已安排未开始 / STARTED 已开始（完成或取消后仍保留作业量）/ REVOKED 已撤销（不再计入休息与日上限）',
+    started_at TIMESTAMP(6) NULL COMMENT '开始 UTC 时刻（服务端 Clock）；仅 STARTED 有值，否则为空',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
+    updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间',
+    CONSTRAINT uk_schedule_task UNIQUE (task_id)
+) COMMENT='处置任务执行时段安排表';
+
+CREATE TABLE IF NOT EXISTS duty_person_lock (
+    assignee VARCHAR(128) PRIMARY KEY COMMENT '执行人员标识；安排变更/撤销/取消时 SELECT ... FOR UPDATE 持有，串行化同人员的休息与日上限校验'
+) COMMENT='执行人员安排并发锁表';

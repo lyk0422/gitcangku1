@@ -83,14 +83,14 @@ class SchemaH2ScriptTest {
 
                 // 处置任务：(incident_id, task_key) 唯一
                 st.execute("INSERT INTO incident_tasks (incident_id, task_key, group_code, title,"
-                        + " status, created_by, created_at, updated_at) VALUES (1,'T-1','G','t',"
-                        + "'OPEN','alice','" + Timestamp.from(now) + "','" + Timestamp.from(now)
-                        + "')");
+                        + " status, created_by, version, created_at, updated_at) VALUES (1,'T-1',"
+                        + "'G','t','OPEN','alice',1,'" + Timestamp.from(now) + "','"
+                        + Timestamp.from(now) + "')");
                 boolean duplicateTaskRejected = false;
                 try {
                     st.execute("INSERT INTO incident_tasks (incident_id, task_key, group_code,"
-                            + " title, status, created_by, created_at, updated_at) VALUES"
-                            + " (1,'T-1','G','t2','OPEN','alice','" + Timestamp.from(now) + "','"
+                            + " title, status, created_by, version, created_at, updated_at) VALUES"
+                            + " (1,'T-1','G','t2','OPEN','alice',1,'" + Timestamp.from(now) + "','"
                             + Timestamp.from(now) + "')");
                 } catch (Exception e) {
                     duplicateTaskRejected = true;
@@ -108,6 +108,24 @@ class SchemaH2ScriptTest {
                     duplicateBlockerRejected = true;
                 }
                 assertThat(duplicateBlockerRejected).isTrue();
+
+                // 执行安排：每任务至多一条（uk_schedule_task）
+                st.execute("INSERT INTO incident_task_schedules (task_id, assignee, start_at,"
+                        + " end_at, status, started_at, created_at, updated_at) VALUES (1,"
+                        + "'worker-1','" + Timestamp.from(now) + "','"
+                        + Timestamp.from(now.plusSeconds(3600)) + "','SCHEDULED',NULL,'"
+                        + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                boolean duplicateScheduleRejected = false;
+                try {
+                    st.execute("INSERT INTO incident_task_schedules (task_id, assignee, start_at,"
+                            + " end_at, status, started_at, created_at, updated_at) VALUES (1,"
+                            + "'worker-2','" + Timestamp.from(now) + "','"
+                            + Timestamp.from(now.plusSeconds(3600)) + "','SCHEDULED',NULL,'"
+                            + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateScheduleRejected = true;
+                }
+                assertThat(duplicateScheduleRejected).isTrue();
             }
         }
     }

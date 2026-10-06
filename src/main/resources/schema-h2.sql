@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     done_at TIMESTAMP(6) NULL,
     cancelled_by VARCHAR(128) NULL,
     cancelled_at TIMESTAMP(6) NULL,
+    version INT NOT NULL,
     created_at TIMESTAMP(6) NOT NULL,
     updated_at TIMESTAMP(6) NOT NULL,
     CONSTRAINT uk_task_key UNIQUE (incident_id, task_key)
@@ -99,4 +100,21 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS incident_task_schedules (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    task_id BIGINT NOT NULL,
+    assignee VARCHAR(128) NOT NULL,
+    start_at TIMESTAMP(6) NOT NULL,
+    end_at TIMESTAMP(6) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    started_at TIMESTAMP(6) NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_schedule_task UNIQUE (task_id)
+);
+
+CREATE TABLE IF NOT EXISTS duty_person_lock (
+    assignee VARCHAR(128) PRIMARY KEY
 );

@@ -8,6 +8,9 @@ import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
 import com.example.starter.incident.dto.Requests.TaskActionRequest;
 import com.example.starter.incident.dto.Requests.TaskCreateRequest;
+import com.example.starter.incident.dto.Requests.TaskScheduleRequest;
+import com.example.starter.incident.dto.Requests.TaskScheduleRevokeRequest;
+import com.example.starter.incident.dto.Requests.TaskStartRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
@@ -187,5 +190,35 @@ public class IncidentController {
                                @RequestHeader("X-Actor-Id") String actor,
                                @RequestBody TaskActionRequest req) {
         return service.cancelTask(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 安排执行时段（仅当前指挥人；仅 OPEN 任务，创建或替换，带 expectedTaskVersion）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/schedule")
+    public TaskView scheduleTask(@PathVariable String incidentKey, @PathVariable String taskKey,
+                                 @RequestHeader("X-Actor-Id") String actor,
+                                 @RequestBody TaskScheduleRequest req) {
+        return service.scheduleTask(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 开始执行（仅当前指挥人；服务端 Clock 校验处于安排区间且原依赖已满足）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/start")
+    public TaskView startTask(@PathVariable String incidentKey, @PathVariable String taskKey,
+                              @RequestHeader("X-Actor-Id") String actor,
+                              @RequestBody TaskStartRequest req) {
+        return service.startTask(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 撤销执行安排（仅当前指挥人；仅未开始安排可撤销）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/schedule/revoke")
+    public TaskView revokeSchedule(@PathVariable String incidentKey, @PathVariable String taskKey,
+                                   @RequestHeader("X-Actor-Id") String actor,
+                                   @RequestBody TaskScheduleRevokeRequest req) {
+        return service.revokeSchedule(incidentKey, taskKey, actor, req);
     }
 }
