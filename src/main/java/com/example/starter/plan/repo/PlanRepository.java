@@ -5,6 +5,7 @@ import com.example.starter.plan.model.Occupancy;
 import com.example.starter.plan.model.PlanStatus;
 import com.example.starter.plan.model.PublishedSlot;
 import com.example.starter.plan.model.RescheduleLink;
+import com.example.starter.plan.model.RouteLeg;
 import java.sql.Date;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
@@ -218,5 +219,47 @@ public class PlanRepository {
      */
     public void acquirePublishLock() {
         jdbc.queryForObject("SELECT id FROM publish_lock WHERE id = 1 FOR UPDATE", Integer.class);
+    }
+
+    /**
+     * 写入寻径发布计划冻结的路径段（不可变，一个计划仅一条路径）。
+     */
+    public void insertRouteLegs(List<RouteLeg> legs) {
+        jdbc.batchUpdate(
+                "INSERT INTO rail_plan_route (plan_id, graph_version, seq, section_id,"
+                        + " from_station, to_station, travel_minutes, start_utc, end_utc)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                legs, legs.size(),
+                (ps, leg) -> {
+                    ps.setLong(1, leg.planId());
+                    ps.setInt(2, leg.graphVersion());
+                    ps.setInt(3, leg.seq());
+                    ps.setString(4, leg.sectionId());
+                    ps.setString(5, leg.fromStation());
+                    ps.setString(6, leg.toStation());
+                    ps.setInt(7, leg.travelMinutes());
+                    ps.setLong(8, leg.startUtc().toEpochMilli());
+                    ps.setLong(9, leg.endUtc().toEpochMilli());
+                });
+    }
+
+    /**
+     * 查询寻径发布计划冻结的路径段，按路径顺序。
+     */
+    public List<RouteLeg> findRouteLegs(long planId) {
+        return jdbc.query("SELECT plan_id, graph_version, seq, section_id, from_station,"
+                        + " to_station, travel_minutes, start_utc, end_utc"
+                        + " FROM rail_plan_route WHERE plan_id = ? ORDER BY seq",
+                (rs, n) -> new RouteLeg(
+                        rs.getLong("plan_id"),
+                        rs.getInt("graph_version"),
+                        rs.getInt("seq"),
+                        rs.getString("section_id"),
+                        rs.getString("from_station"),
+                        rs.getString("to_station"),
+                        rs.getInt("travel_minutes"),
+                        Instant.ofEpochMilli(rs.getLong("start_utc")),
+                        Instant.ofEpochMilli(rs.getLong("end_utc"))),
+                planId);
     }
 }

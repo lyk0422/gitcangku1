@@ -174,6 +174,7 @@ public class PlanService {
 
     /**
      * 取消已发布计划：时隙立即释放，历史计划与占用保留不改写。
+     * 与寻径、发布、图替换共用全局发布锁，取同一一致视图。
      */
     public PlanResponse cancel(String scheduleKey, String requestKey) {
         String hash = hashAction(OP_CANCEL, scheduleKey);
@@ -183,6 +184,7 @@ public class PlanService {
         }
         try {
             return tx.execute(status -> {
+                planRepo.acquirePublishLock();
                 DayPlan plan = planRepo.findByKeyForUpdate(scheduleKey)
                         .orElseThrow(() -> notFound(scheduleKey));
                 if (plan.status() != PlanStatus.PUBLISHED) {
