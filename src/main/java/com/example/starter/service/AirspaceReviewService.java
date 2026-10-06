@@ -2,18 +2,28 @@ package com.example.starter.service;
 
 import com.example.starter.api.ApiException;
 import com.example.starter.api.dto.MutationResponse;
+import com.example.starter.api.dto.CoverageIntervalDto;
+import com.example.starter.api.dto.LinkGapDto;
 import com.example.starter.api.dto.ReviewRequest;
 import com.example.starter.api.dto.ReviewResultDto;
 import com.example.starter.api.dto.RouteCreateRequest;
 import com.example.starter.api.dto.RoutePointDto;
 import com.example.starter.api.dto.RouteReplaceRequest;
 import com.example.starter.api.dto.RouteResult;
+import com.example.starter.api.dto.SegmentLinkDto;
+import com.example.starter.api.dto.SegmentUnionDto;
 import com.example.starter.api.dto.ZoneCreateRequest;
 import com.example.starter.api.dto.ZoneResult;
 import com.example.starter.api.dto.ZoneRevokeRequest;
+import com.example.starter.domain.CoverageInterval;
 import com.example.starter.domain.Geometry;
+import com.example.starter.domain.LinkAssessment;
+import com.example.starter.domain.LinkCoverageEvaluator;
+import com.example.starter.domain.LinkGap;
 import com.example.starter.domain.Point;
 import com.example.starter.domain.ReviewConclusion;
+import com.example.starter.domain.SegmentLink;
+import com.example.starter.domain.SegmentUnion;
 import com.example.starter.domain.ZoneStatus;
 import com.example.starter.repo.AirspaceRepository;
 import com.example.starter.repo.DedupPo;
@@ -128,26 +138,30 @@ public class AirspaceReviewService {
 
     // ============================ 航线 ============================
 
-    /** 创建航线（初始版本 1）。 */
+    /** 创建航线（初始版本 1）；可携带每段通信档案。 */
     public MutationResponse createRoute(RouteCreateRequest request) {
         return withIdempotency(request.requestId(), KIND_ROUTE_CREATE, canonicalHash(request), () -> {
             List<Point> points = toPoints(request.points());
             validatePointsDistinct(points);
+            List<SegmentLink> segments = toSegments(request.segments(), points.size(),
+                    request.operator());
             if (routeRepo.findRoute(request.routeId()) != null) {
                 throw new ApiException(HttpStatus.CONFLICT, "ROUTE_ALREADY_EXISTS",
                         "航线已存在: " + request.routeId());
             }
-            routeRepo.insertRoute(request.routeId(), points);
+            routeRepo.insertRoute(request.routeId(), points, segments);
             return new MutationResponse(request.requestId(), false,
                     new RouteResult(request.routeId(), 1));
         });
     }
 
-    /** 替换航线点列，expectedVersion 不匹配返回 409；成功版本加一。 */
+    /** 替换航线点列与通信档案，expectedVersion 不匹配返回 409；成功版本加一。 */
     public MutationResponse replaceRoute(RouteReplaceRequest request) {
         return withIdempotency(request.requestId(), KIND_ROUTE_REPLACE, canonicalHash(request), () -> {
             List<Point> points = toPoints(request.points());
             validatePointsDistinct(points);
+            List<SegmentLink> segments = toSegments(request.segments(), points.size(),
+                    request.operator());
             RoutePo route = routeRepo.findRoute(request.routeId());
             if (route == null) {
                 throw new ApiException(HttpStatus.NOT_FOUND, "ROUTE_NOT_FOUND",
@@ -166,7 +180,11 @@ public class AirspaceReviewService {
                         "航线版本已变化，请使用最新 expectedVersion 重试");
             }
             routeRepo.deletePoints(request.routeId());
+            routeRepo.deleteSegments(request.routeId());
             routeRepo.insertPoints(request.routeId(), points);
+            if (segments != null) {
+                routeRepo.insertSegments(request.routeId(), segments);
+            }
             return new MutationResponse(request.requestId(), false,
                     new RouteResult(request.routeId(), request.expectedVersion() + 1));
         });
@@ -204,12 +222,24 @@ public class AirspaceReviewService {
                     hits.add(zone.zoneId());
                 }
             }
-            String conclusion = hits.isEmpty()
-                    ? ReviewConclusion.CLEAR.name()
-                    : ReviewConclusion.BLOCKED.name();
+            // 通信覆盖审查：仅对携带通信档案的航线版本适用；旧无档案航线不评估
+            LinkAssessment assessment = route.segments() != null
+                    ? LinkCoverageEvaluator.evaluate(route.segments())
+                    : null;
+            // 禁飞命中仍阻断，通信结论不替代它；否则连续失联严格超限才 LINK_BLOCKED
+            String conclusion;
+            if (!hits.isEmpty()) {
+                conclusion = ReviewConclusion.BLOCKED.name();
+            } else if (assessment != null && assessment.anyLossExceedsLimit()) {
+                conclusion = ReviewConclusion.LINK_BLOCKED.name();
+            } else {
+                conclusion = ReviewConclusion.CLEAR.name();
+            }
             String reviewId = "rv_" + UUID.randomUUID();
             ReviewPo po = new ReviewPo(reviewId, request.routeId(), route.version(), globalVersion,
                     conclusion, new ArrayList<>(hits), List.copyOf(route.points()),
+                    assessment != null ? assessment.union() : List.of(),
+                    assessment != null ? assessment.gaps() : List.of(),
                     request.requestId(), nowMillis());
             reviewRepo.insertReview(po);
             return new MutationResponse(request.requestId(), false, toDto(po, conclusion, true));
@@ -340,13 +370,80 @@ public class AirspaceReviewService {
                 "航线至少需要两个不同的点");
     }
 
+    /**
+     * 校验并转换每段通信档案；segments 为 null 表示无通信档案（旧式航线，返回 null）。
+     * 携带档案时：操作者必须非空；段数必须等于航点数减一；每段行驶毫秒为正整数；
+     * 每段覆盖区间最多 10 条，区间反向或越出 [0,10000] 返回 400；空覆盖合法（全段失联）。
+     */
+    private static List<SegmentLink> toSegments(List<SegmentLinkDto> dtos, int pointCount,
+                                                String operator) {
+        if (dtos == null) {
+            return null;
+        }
+        if (operator == null || operator.isBlank()) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "OPERATOR_REQUIRED",
+                    "登记通信档案的写请求必须携带非空操作者");
+        }
+        if (dtos.size() != pointCount - 1) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "SEGMENT_COUNT_MISMATCH",
+                    "航段数必须等于航点数减一：segments=" + dtos.size()
+                            + ", 期望=" + (pointCount - 1));
+        }
+        List<SegmentLink> segments = new ArrayList<>(dtos.size());
+        for (int i = 0; i < dtos.size(); i++) {
+            SegmentLinkDto dto = dtos.get(i);
+            if (dto == null || dto.durationMs() == null || dto.durationMs() <= 0) {
+                throw new ApiException(HttpStatus.BAD_REQUEST, "INVALID_SEGMENT_DURATION",
+                        "航段 " + i + " 行驶时长必须为正整数毫秒");
+            }
+            List<CoverageIntervalDto> covDtos = dto.coverage() == null
+                    ? List.of() : dto.coverage();
+            if (covDtos.size() > 10) {
+                throw new ApiException(HttpStatus.BAD_REQUEST, "COVERAGE_INTERVAL_LIMIT",
+                        "航段 " + i + " 覆盖区间最多 10 条: " + covDtos.size());
+            }
+            List<CoverageInterval> coverage = new ArrayList<>(covDtos.size());
+            for (CoverageIntervalDto c : covDtos) {
+                if (c == null || c.from() == null || c.to() == null) {
+                    throw new ApiException(HttpStatus.BAD_REQUEST, "INVALID_COVERAGE_INTERVAL",
+                            "航段 " + i + " 覆盖区间端点不能为空");
+                }
+                if (c.from() < 0 || c.to() > LinkAssessment.SCALE) {
+                    throw new ApiException(HttpStatus.BAD_REQUEST, "COVERAGE_INTERVAL_OUT_OF_RANGE",
+                            "航段 " + i + " 覆盖区间越出位置刻度 [0,10000]: ["
+                                    + c.from() + "," + c.to() + "]");
+                }
+                if (c.from() > c.to()) {
+                    throw new ApiException(HttpStatus.BAD_REQUEST, "COVERAGE_INTERVAL_REVERSED",
+                            "航段 " + i + " 覆盖区间反向: [" + c.from() + "," + c.to() + "]");
+                }
+                coverage.add(new CoverageInterval(c.from(), c.to()));
+            }
+            segments.add(new SegmentLink(dto.durationMs(), List.copyOf(coverage)));
+        }
+        return List.copyOf(segments);
+    }
+
     private static ReviewResultDto toDto(ReviewPo po, String conclusion, Boolean current) {
         List<RoutePointDto> snapshot = new ArrayList<>(po.pointsSnapshot().size());
         for (Point p : po.pointsSnapshot()) {
             snapshot.add(new RoutePointDto(p.x(), p.y()));
         }
+        List<SegmentUnionDto> union = new ArrayList<>(po.linkUnion().size());
+        for (SegmentUnion segment : po.linkUnion()) {
+            List<CoverageIntervalDto> intervals = new ArrayList<>(segment.intervals().size());
+            for (CoverageInterval iv : segment.intervals()) {
+                intervals.add(new CoverageIntervalDto(iv.from(), iv.to()));
+            }
+            union.add(new SegmentUnionDto(segment.segmentIndex(), List.copyOf(intervals)));
+        }
+        List<LinkGapDto> gaps = new ArrayList<>(po.linkGaps().size());
+        for (LinkGap gap : po.linkGaps()) {
+            gaps.add(new LinkGapDto(gap.fromSegment(), gap.toSegment(), gap.lossMillisText()));
+        }
         return new ReviewResultDto(po.reviewId(), po.routeId(), po.routeVersion(),
-                po.airspaceVersion(), conclusion, List.copyOf(po.hitZoneIds()), snapshot, current);
+                po.airspaceVersion(), conclusion, List.copyOf(po.hitZoneIds()), snapshot,
+                List.copyOf(union), List.copyOf(gaps), current);
     }
 
     private long nowMillis() {

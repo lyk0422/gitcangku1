@@ -1,6 +1,9 @@
 package com.example.starter.repo;
 
+import com.example.starter.domain.CoverageInterval;
+import com.example.starter.domain.LinkGap;
 import com.example.starter.domain.Point;
+import com.example.starter.domain.SegmentUnion;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
@@ -11,7 +14,9 @@ import java.util.List;
 
 /**
  * 审核结果与幂等去重数据访问。
- * 点快照以 "x,y;x,y" 文本保存，命中 zoneId 以逗号拼接，均为不可变内容。
+ * 点快照以 "x,y;x,y" 文本保存，命中 zoneId 以逗号拼接；
+ * 覆盖并集以 "seq:from-to,from-to;..."、失联区间以 "fromSeg&gt;toSeg:lossTickMillis;..."
+ * 文本保存，均为不可变内容。
  */
 @Repository
 public class ReviewRepository {
@@ -22,6 +27,10 @@ public class ReviewRepository {
         this.jdbc = jdbc;
     }
 
+    private static final String REVIEW_COLUMNS =
+            "review_id, route_id, route_version, airspace_version, conclusion, "
+                    + "hit_zone_ids, points_snapshot, link_union, link_gaps, request_id, created_at";
+
     private static final RowMapper<ReviewPo> REVIEW_MAPPER = (rs, n) -> new ReviewPo(
             rs.getString("review_id"),
             rs.getString("route_id"),
@@ -30,24 +39,22 @@ public class ReviewRepository {
             rs.getString("conclusion"),
             decodeZoneIds(rs.getString("hit_zone_ids")),
             decodePoints(rs.getString("points_snapshot")),
+            decodeUnion(rs.getString("link_union")),
+            decodeGaps(rs.getString("link_gaps")),
             rs.getString("request_id"),
             rs.getLong("created_at"));
 
     /** 按 reviewId 查询不可变审核记录，不存在返回 null。 */
     public ReviewPo findReview(String reviewId) {
         return jdbc.query(
-                "SELECT review_id, route_id, route_version, airspace_version, conclusion, "
-                        + "hit_zone_ids, points_snapshot, request_id, created_at "
-                        + "FROM review WHERE review_id = ?",
+                "SELECT " + REVIEW_COLUMNS + " FROM review WHERE review_id = ?",
                 REVIEW_MAPPER, reviewId).stream().findFirst().orElse(null);
     }
 
     /** 查询某航线最新的一条审核记录（按创建时间、reviewId 倒序），没有返回 null。 */
     public ReviewPo findLatestReview(String routeId) {
         return jdbc.query(
-                "SELECT review_id, route_id, route_version, airspace_version, conclusion, "
-                        + "hit_zone_ids, points_snapshot, request_id, created_at "
-                        + "FROM review WHERE route_id = ? "
+                "SELECT " + REVIEW_COLUMNS + " FROM review WHERE route_id = ? "
                         + "ORDER BY created_at DESC, review_id DESC LIMIT 1",
                 REVIEW_MAPPER, routeId).stream().findFirst().orElse(null);
     }
@@ -56,10 +63,11 @@ public class ReviewRepository {
     public void insertReview(ReviewPo po) {
         jdbc.update("INSERT INTO review "
                         + "(review_id, route_id, route_version, airspace_version, conclusion, "
-                        + "hit_zone_ids, points_snapshot, request_id, created_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        + "hit_zone_ids, points_snapshot, link_union, link_gaps, request_id, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 po.reviewId(), po.routeId(), po.routeVersion(), po.airspaceVersion(),
                 po.conclusion(), encodeZoneIds(po.hitZoneIds()), encodePoints(po.pointsSnapshot()),
+                encodeUnion(po.linkUnion()), encodeGaps(po.linkGaps()),
                 po.requestId(), po.createdAt());
     }
 
@@ -117,5 +125,75 @@ public class ReviewRepository {
             return new ArrayList<>();
         }
         return new ArrayList<>(Arrays.asList(text.split(",")));
+    }
+
+    /** 覆盖并集编码："seq:from-to,from-to;..."；全段无覆盖的段为 "seq:"；空列表编码为空串。 */
+    public static String encodeUnion(List<SegmentUnion> union) {
+        StringBuilder sb = new StringBuilder();
+        for (SegmentUnion segment : union) {
+            if (sb.length() > 0) {
+                sb.append(';');
+            }
+            sb.append(segment.segmentIndex()).append(':');
+            for (int i = 0; i < segment.intervals().size(); i++) {
+                if (i > 0) {
+                    sb.append(',');
+                }
+                sb.append(segment.intervals().get(i).from())
+                        .append('-').append(segment.intervals().get(i).to());
+            }
+        }
+        return sb.toString();
+    }
+
+    /** 覆盖并集解码，空串返回空列表。 */
+    public static List<SegmentUnion> decodeUnion(String text) {
+        List<SegmentUnion> union = new ArrayList<>();
+        if (text != null && !text.isEmpty()) {
+            for (String segment : text.split(";")) {
+                int colon = segment.indexOf(':');
+                int seq = Integer.parseInt(segment.substring(0, colon));
+                List<CoverageInterval> intervals = new ArrayList<>();
+                String rest = segment.substring(colon + 1);
+                if (!rest.isEmpty()) {
+                    for (String pair : rest.split(",")) {
+                        String[] ft = pair.split("-");
+                        intervals.add(new CoverageInterval(
+                                Integer.parseInt(ft[0]), Integer.parseInt(ft[1])));
+                    }
+                }
+                union.add(new SegmentUnion(seq, intervals));
+            }
+        }
+        return union;
+    }
+
+    /** 连续失联区间编码："fromSeg&gt;toSeg:lossTickMillis;..."；空列表编码为空串。 */
+    public static String encodeGaps(List<LinkGap> gaps) {
+        StringBuilder sb = new StringBuilder();
+        for (LinkGap gap : gaps) {
+            if (sb.length() > 0) {
+                sb.append(';');
+            }
+            sb.append(gap.fromSegment()).append('>').append(gap.toSegment())
+                    .append(':').append(gap.lossTickMillis());
+        }
+        return sb.toString();
+    }
+
+    /** 连续失联区间解码，空串返回空列表。 */
+    public static List<LinkGap> decodeGaps(String text) {
+        List<LinkGap> gaps = new ArrayList<>();
+        if (text != null && !text.isEmpty()) {
+            for (String item : text.split(";")) {
+                int arrow = item.indexOf('>');
+                int colon = item.indexOf(':');
+                gaps.add(new LinkGap(
+                        Integer.parseInt(item.substring(0, arrow)),
+                        Integer.parseInt(item.substring(arrow + 1, colon)),
+                        Long.parseLong(item.substring(colon + 1))));
+            }
+        }
+        return gaps;
     }
 }
